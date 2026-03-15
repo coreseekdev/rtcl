@@ -1,0 +1,38 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+**/*.beam
+**/*.crate
+
+# IDE
+/.idea/
+/.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+/tmp/
+*.tmp
+*.temp
+
+# Documentation
+*.md
+!README.md
+!Agent.md
+!Claude.md
+!Cargo.toml
+
+# Task output files
+tasks/*.output
+
+# Coverage
+/coverage/
+*.profraw
+*.profdata
+
+# Dependencies
+vendor/

@@ -1,0 +1,16 @@
+[package]
+name = "rtcl-expect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Expect-style process automation for rtcl"
+keywords = ["expect", "automation", "process", "tcl"]
+
+[dependencies]
+rtcl-core = { path = "../rtcl-core", optional = true }
+thiserror = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enable Tcl integration
+tcl-commands = ["dep:rtcl-core", "dep:thiserror"]

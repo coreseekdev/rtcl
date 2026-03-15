@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rtcl-core",
+    "crates/rtcl-cli",
+    "crates/rtcl-expect",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/rtcl"
+description = "A lightweight Tcl-compatible scripting language in Rust"
+authors = ["rtcl contributors"]
+rust-version = "1.70"
+
+[workspace.dependencies]
+rtcl-core = { path = "crates/rtcl-core" }
+rtcl-expect = { path = "crates/rtcl-expect" }
+
+# no-std compatible dependencies
+hashbrown = "0.14"
+smallvec = { version = "1.13", default-features = false }
+spin = "0.9"
+
+# std dependencies
+indexmap = "2.2"
+thiserror = "1.0"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+rustyline = "14.0"
+colored = "2.1"
+
+[profile.release]
+opt-level = "s"      # Optimize for size
+lto = true           # Link-time optimization
+codegen-units = 1    # Better optimization
+panic = "abort"      # Smaller binary
+strip = true         # Strip symbols
+
+[profile.dev]
+opt-level = 0

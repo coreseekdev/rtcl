@@ -1,0 +1,25 @@
+[package]
+name = "rtcl-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line interface for rtcl"
+
+[[bin]]
+name = "rtcl"
+path = "src/main.rs"
+
+[dependencies]
+rtcl-core.workspace = true
+clap.workspace = true
+rustyline.workspace = true
+colored.workspace = true
+anyhow.workspace = true
+
+[features]
+default = []
+expect = ["rtcl-expect"]
+
+[dependencies.rtcl-expect]
+workspace = true
+optional = true

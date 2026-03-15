@@ -1,0 +1,31 @@
+[package]
+name = "rtcl-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core library for rtcl - lightweight Tcl interpreter (no-std compatible)"
+keywords = ["tcl", "scripting", "interpreter", "no-std", "embedded"]
+categories = ["parser-implementations", "embedded", "command-line-interface"]
+
+[dependencies]
+hashbrown.workspace = true
+smallvec.workspace = true
+
+[dependencies.spin]
+workspace = true
+optional = true
+
+[features]
+default = ["std"]
+std = []
+alloc = ["smallvec/const_new", "hashbrown/default"]
+# For embedded/no-std targets
+embedded = ["alloc", "dep:spin"]
+# Enable extra diagnostics
+debug = []
+
+[dev-dependencies]
+
+[[test]]
+name = "tcl_compatibility"
+path = "tests/tcl_compatibility.rs"

@@ -1,5 +1,6 @@
 //! rtcl - A lightweight Tcl-compatible scripting language
 
+use annotate_snippets::{Level, Renderer, Snippet};
 use clap::Parser;
 use colored::Colorize;
 use rtcl_core::Interp;
@@ -44,7 +45,9 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("{}: {}", "Error".red(), e);
+        if !e.is_empty() {
+            eprintln!("{}: {}", "Error".red(), e);
+        }
         std::process::exit(1);
     }
 }
@@ -58,7 +61,12 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
     let script = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read file '{}': {}", path.display(), e))?;
 
-    // Restore original script name after execution
+    // Pre-parse for rich diagnostics on syntax errors
+    if let Err(e) = rtcl_parser::parse(&script) {
+        report_parse_error(&e, &script, Some(&path.to_string_lossy()));
+        return Err(String::new());
+    }
+
     let result = interp.eval(&script);
 
     if let Err(e) = result {
@@ -74,6 +82,12 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
 
 fn run_command(cmd: &str, quiet: bool) -> Result<(), String> {
     let mut interp = Interp::new();
+
+    // Pre-parse for rich diagnostics on syntax errors
+    if let Err(e) = rtcl_parser::parse(cmd) {
+        report_parse_error(&e, cmd, None);
+        return Err(String::new());
+    }
 
     let result = interp.eval(cmd)
         .map_err(|e| e.to_string())?;
@@ -130,7 +144,11 @@ fn run_repl(quiet: bool) -> Result<(), String> {
                     _ => {}
                 }
 
-                // Evaluate
+                // Evaluate — pre-parse for rich diagnostics
+                if let Err(e) = rtcl_parser::parse(line) {
+                    report_parse_error(&e, line, None);
+                    continue;
+                }
                 match interp.eval(line) {
                     Ok(result) => {
                         if !result.is_empty() {
@@ -163,6 +181,26 @@ fn run_repl(quiet: bool) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Render a parse error using rustc-style annotated snippets.
+fn report_parse_error(err: &rtcl_parser::ParseError, source: &str, filename: Option<&str>) {
+    let origin = filename.unwrap_or("<input>");
+
+    // Build a 1-byte span at the error offset (or end of source)
+    let offset = err.offset.min(source.len());
+    let span_end = if offset < source.len() { offset + 1 } else { offset };
+
+    let message = Level::Error.title(&err.message).snippet(
+        Snippet::source(source)
+            .line_start(1)
+            .origin(origin)
+            .fold(true)
+            .annotation(Level::Error.span(offset..span_end).label(&err.message)),
+    );
+
+    let renderer = Renderer::styled();
+    eprintln!("{}", renderer.render(message));
 }
 
 fn print_banner() {

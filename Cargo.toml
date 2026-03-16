@@ -35,10 +35,7 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 rustyline = "14.0"
 colored = "2.1"
-
-# parser generator
-pest = "2.7"
-pest_derive = "2.7"
+annotate-snippets = "0.11"
 
 [profile.release]
 opt-level = "s"      # Optimize for size

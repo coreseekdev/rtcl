@@ -90,6 +90,7 @@ fn parse_braced_word(cur: &mut Cursor) -> ParseResult<Word> {
         message: "missing close-brace".into(),
         line: err_line,
         column: 0,
+        offset: cur.pos,
     })
 }
 
@@ -146,6 +147,7 @@ fn parse_quoted_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word> 
         message: "missing \"".into(),
         line: err_line,
         column: 0,
+        offset: cur.pos,
     })
 }
 
@@ -350,6 +352,7 @@ pub fn parse_cmd_sub(cur: &mut Cursor, _bracket_term: bool) -> ParseResult<Strin
         message: "missing close-bracket".into(),
         line: err_line,
         column: 0,
+        offset: cur.pos,
     })
 }
 
@@ -387,6 +390,7 @@ fn skip_braced(cur: &mut Cursor) -> ParseResult<()> {
             message: "missing close-brace".into(),
             line: err_line,
             column: 0,
+            offset: cur.pos,
         })
     } else {
         Ok(())
@@ -421,5 +425,6 @@ fn skip_quoted_in_cmd(cur: &mut Cursor) -> ParseResult<()> {
         message: "missing \"".into(),
         line: err_line,
         column: 0,
+        offset: cur.pos,
     })
 }

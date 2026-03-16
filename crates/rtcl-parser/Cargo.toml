@@ -3,14 +3,8 @@ name = "rtcl-parser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Tcl parser for rtcl — hand-written recursive descent with optional PEG backend"
+description = "Tcl parser for rtcl — hand-written recursive descent"
 keywords = ["tcl", "parser", "scripting"]
 categories = ["parser-implementations"]
 
-[features]
-default = []
-pest-parser = ["dep:pest", "dep:pest_derive"]
-
 [dependencies]
-pest = { workspace = true, optional = true }
-pest_derive = { workspace = true, optional = true }

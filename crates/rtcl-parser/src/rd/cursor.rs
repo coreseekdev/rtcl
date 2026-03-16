@@ -136,6 +136,7 @@ impl<'a> Cursor<'a> {
             message: msg.into(),
             line: self.line,
             column: 0,
+            offset: self.pos,
         }
     }
 }

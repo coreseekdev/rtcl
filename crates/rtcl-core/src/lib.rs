@@ -1,6 +1,12 @@
 //! # rtcl-core
 //!
-//! A lightweight, no-std compatible Tcl interpreter core.
+//! Tcl interpreter core — integrates `rtcl-parser` and `rtcl-vm`.
+//!
+//! ## Crate organisation
+//!
+//! - [`rtcl_parser`] — pest-based Tcl parser (AST types)
+//! - [`rtcl_vm`]     — bytecode compiler & VM (opcode definitions)
+//! - `rtcl-core`     — interpreter, command implementations, value type
 //!
 //! ## Features
 //!
@@ -21,6 +27,7 @@ pub mod parser;
 pub mod interp;
 pub mod command;
 pub mod types;
+pub mod vm;
 
 // Re-exports for convenience
 pub use error::{Error, Result};
@@ -29,6 +36,10 @@ pub use interp::Interp;
 pub use parser::parse;
 pub use command::CommandFunc;
 
+// Re-export sub-crates so downstream can access them via rtcl_core
+pub use rtcl_parser;
+pub use rtcl_vm;
+
 /// Prelude module for common imports
 pub mod prelude {
     pub use crate::error::{Error, Result};
@@ -36,6 +47,7 @@ pub mod prelude {
     pub use crate::interp::Interp;
     pub use crate::parser::parse;
     pub use crate::types::*;
+    pub use rtcl_vm::{ByteCode, Compiler, OpCode};
 }
 
 /// Library version
@@ -44,6 +56,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(feature = "std")]
 mod platform {
     use std::collections::HashMap as Map;
+    #[allow(dead_code)]
     pub type HashMap<K, V> = Map<K, V>;
 }
 

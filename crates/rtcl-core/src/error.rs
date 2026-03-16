@@ -72,6 +72,8 @@ pub enum ErrorCode {
     Timeout = 4,
     /// IO error (when std is available)
     Io = 5,
+    /// Not found
+    NotFound = 6,
 }
 
 /// Control flow types

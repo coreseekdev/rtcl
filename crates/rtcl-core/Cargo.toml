@@ -3,27 +3,17 @@ name = "rtcl-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Core library for rtcl - lightweight Tcl interpreter (no-std compatible)"
-keywords = ["tcl", "scripting", "interpreter", "no-std", "embedded"]
+description = "Core library for rtcl - lightweight Tcl interpreter"
+keywords = ["tcl", "scripting", "interpreter", "embedded"]
 categories = ["parser-implementations", "embedded", "command-line-interface"]
 
 [dependencies]
 hashbrown.workspace = true
 smallvec.workspace = true
+rtcl-parser.workspace = true
+rtcl-vm.workspace = true
 
 [dependencies.spin]
-workspace = true
-optional = true
-
-[dependencies.pest]
-workspace = true
-optional = true
-
-[dependencies.pest_derive]
-workspace = true
-optional = true
-
-[build-dependencies.pest_derive]
 workspace = true
 optional = true
 
@@ -35,7 +25,5 @@ alloc = ["smallvec/const_new", "hashbrown/default"]
 embedded = ["alloc", "dep:spin"]
 # Enable extra diagnostics
 debug = []
-# Use pest-based parser (requires std, experimental)
-pest-parser = ["dep:pest", "dep:pest_derive"]
 
 [dev-dependencies]

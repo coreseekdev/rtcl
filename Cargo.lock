@@ -431,8 +431,8 @@ name = "rtcl-core"
 version = "0.1.0"
 dependencies = [
  "hashbrown",
- "pest",
- "pest_derive",
+ "rtcl-parser",
+ "rtcl-vm",
  "smallvec",
  "spin",
 ]
@@ -443,6 +443,23 @@ version = "0.1.0"
 dependencies = [
  "rtcl-core",
  "thiserror",
+]
+
+[[package]]
+name = "rtcl-parser"
+version = "0.1.0"
+dependencies = [
+ "pest",
+ "pest_derive",
+]
+
+[[package]]
+name = "rtcl-vm"
+version = "0.1.0"
+dependencies = [
+ "hashbrown",
+ "rtcl-parser",
+ "smallvec",
 ]
 
 [[package]]

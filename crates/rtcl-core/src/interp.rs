@@ -68,9 +68,11 @@ impl Interp {
         self.register_builtin("while", Self::cmd_while);
         self.register_builtin("for", Self::cmd_for);
         self.register_builtin("foreach", Self::cmd_foreach);
+        self.register_builtin("switch", Self::cmd_switch);
         self.register_builtin("break", Self::cmd_break);
         self.register_builtin("continue", Self::cmd_continue);
         self.register_builtin("return", Self::cmd_return);
+        self.register_builtin("exit", Self::cmd_exit);
         self.register_builtin("proc", Self::cmd_proc);
         self.register_builtin("expr", Self::cmd_expr);
         self.register_builtin("string", Self::cmd_string);
@@ -78,17 +80,33 @@ impl Interp {
         self.register_builtin("llength", Self::cmd_llength);
         self.register_builtin("lindex", Self::cmd_lindex);
         self.register_builtin("lappend", Self::cmd_lappend);
+        self.register_builtin("lrange", Self::cmd_lrange);
+        self.register_builtin("lsearch", Self::cmd_lsearch);
+        self.register_builtin("lsort", Self::cmd_lsort);
+        self.register_builtin("linsert", Self::cmd_linsert);
+        self.register_builtin("lreplace", Self::cmd_lreplace);
+        self.register_builtin("lassign", Self::cmd_lassign);
+        self.register_builtin("lrepeat", Self::cmd_lrepeat);
+        self.register_builtin("lreverse", Self::cmd_lreverse);
         self.register_builtin("concat", Self::cmd_concat);
         self.register_builtin("append", Self::cmd_append);
+        self.register_builtin("split", Self::cmd_split);
+        self.register_builtin("join", Self::cmd_join);
+        self.register_builtin("subst", Self::cmd_subst);
         self.register_builtin("incr", Self::cmd_incr);
         self.register_builtin("catch", Self::cmd_catch);
         self.register_builtin("error", Self::cmd_error);
         self.register_builtin("global", Self::cmd_global);
+        self.register_builtin("upvar", Self::cmd_upvar);
         self.register_builtin("unset", Self::cmd_unset);
         self.register_builtin("info", Self::cmd_info);
         self.register_builtin("rename", Self::cmd_rename);
         self.register_builtin("eval", Self::cmd_eval);
         self.register_builtin("uplevel", Self::cmd_uplevel);
+        self.register_builtin("dict", Self::cmd_dict);
+        self.register_builtin("array", Self::cmd_array);
+        #[cfg(feature = "std")]
+        self.register_builtin("source", Self::cmd_source);
     }
 
     /// Register a built-in command
@@ -1012,6 +1030,858 @@ impl Interp {
 
         interp.eval(&script)
     }
+
+    /// switch command - multi-branch conditional
+    fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 3 {
+            return Err(Error::wrong_args_with_usage("switch", 3, args.len(), "?options? string pattern body ?pattern body ...?"));
+        }
+
+        let mut i = 1;
+        let mut exact_match = false;
+
+        // Parse options
+        while i < args.len() && args[i].as_str().starts_with('-') {
+            match args[i].as_str() {
+                "-exact" => { exact_match = true; i += 1; }
+                "-glob" => { exact_match = false; i += 1; }
+                "-regexp" => {
+                    return Err(Error::runtime("regexp mode not supported", crate::error::ErrorCode::InvalidOp));
+                }
+                "--" => { i += 1; break; }
+                _ => break,
+            }
+        }
+
+        if i >= args.len() {
+            return Err(Error::wrong_args("switch", 3, args.len()));
+        }
+
+        let string = args[i].as_str();
+        i += 1;
+
+        // Handle single body argument (list of patterns/bodies)
+        let patterns: Vec<(String, String)>;
+        if args.len() - i == 1 {
+            // Parse pattern/body pairs from list
+            let list = args[i].as_list().unwrap_or_default();
+            if list.len() % 2 != 0 {
+                return Err(Error::runtime("switch list must have even number of elements", crate::error::ErrorCode::InvalidOp));
+            }
+            patterns = list.chunks(2)
+                .map(|chunk| (chunk[0].as_str().to_string(), chunk[1].as_str().to_string()))
+                .collect();
+        } else {
+            // Pattern/body pairs as arguments
+            if (args.len() - i) % 2 != 0 {
+                return Err(Error::runtime("switch must have even number of pattern/body pairs", crate::error::ErrorCode::InvalidOp));
+            }
+            patterns = args[i..].chunks(2)
+                .map(|chunk| (chunk[0].as_str().to_string(), chunk[1].as_str().to_string()))
+                .collect();
+        }
+
+        // Find matching pattern
+        for (pattern, body) in &patterns {
+            let matches = if pattern == "default" {
+                true
+            } else if exact_match {
+                string == pattern
+            } else {
+                glob_match(pattern, string)
+            };
+
+            if matches {
+                if body == "-" {
+                    // Fall through to next body
+                    continue;
+                }
+                return interp.eval(body);
+            }
+        }
+
+        Ok(Value::empty())
+    }
+
+    /// exit command
+    fn cmd_exit(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        let code = if args.len() > 1 {
+            args[1].as_int().unwrap_or(0) as i32
+        } else {
+            0
+        };
+        Err(Error::exit(Some(code)))
+    }
+
+    /// upvar command - create variable link (simplified)
+    fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 3 {
+            return Err(Error::wrong_args_with_usage("upvar", 3, args.len(), "level otherVar myVar ?otherVar myVar ...?"));
+        }
+
+        // Simplified: just copy the variable value
+        // In a full implementation, this would create actual references
+        let mut i = 1;
+
+        // Skip level specifier if present
+        if args.len() > 3 && args[1].as_str().parse::<i32>().is_ok() {
+            i += 1;
+        }
+
+        // Process var pairs
+        while i + 1 < args.len() {
+            let other_var = args[i].as_str();
+            let my_var = args[i + 1].as_str();
+
+            if let Ok(value) = interp.get_var(other_var) {
+                interp.set_var(my_var, value.clone())?;
+            }
+            i += 2;
+        }
+
+        Ok(Value::empty())
+    }
+
+    /// source command - load and execute a script file
+    #[cfg(feature = "std")]
+    fn cmd_source(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::wrong_args("source", 2, args.len()));
+        }
+
+        let filename = args[1].as_str();
+        let content = std::fs::read_to_string(filename)
+            .map_err(|e| Error::runtime(
+                format!("can't read file \"{}\": {}", filename, e),
+                crate::error::ErrorCode::Io
+            ))?;
+
+        interp.eval(&content)
+    }
+
+    /// lrange command - get a range of list elements
+    fn cmd_lrange(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() != 4 {
+            return Err(Error::wrong_args_with_usage("lrange", 4, args.len(), "list first last"));
+        }
+
+        let list = args[1].as_list().unwrap_or_default();
+        let first = args[2].as_int().unwrap_or(0) as usize;
+        let last = args[3].as_str();
+
+        let end = if last == "end" {
+            list.len().saturating_sub(1)
+        } else if last.starts_with("end-") {
+            let offset: usize = last[4..].parse().unwrap_or(0);
+            list.len().saturating_sub(1 + offset)
+        } else if last.starts_with("end+") {
+            let offset: usize = last[4..].parse().unwrap_or(0);
+            (list.len().saturating_sub(1)).saturating_add(offset).min(list.len().saturating_sub(1))
+        } else {
+            last.parse::<usize>().unwrap_or(0)
+        };
+
+        if first <= end && first < list.len() {
+            let result: Vec<Value> = list[first..=end.min(list.len() - 1)].to_vec();
+            Ok(Value::from_list(&result))
+        } else {
+            Ok(Value::empty())
+        }
+    }
+
+    /// lsearch command - search for element in list
+    fn cmd_lsearch(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 3 {
+            return Err(Error::wrong_args_with_usage("lsearch", 3, args.len(), "?options? list pattern"));
+        }
+
+        let mut i = 1;
+        let mut exact = false;
+        let mut all = false;
+        let mut inline = false;
+        let mut not_match = false;
+
+        // Parse options
+        while i < args.len() && args[i].as_str().starts_with('-') {
+            match args[i].as_str() {
+                "-exact" => { exact = true; i += 1; }
+                "-glob" => { exact = false; i += 1; }
+                "-all" => { all = true; i += 1; }
+                "-inline" => { inline = true; i += 1; }
+                "-not" => { not_match = true; i += 1; }
+                "--" => { i += 1; break; }
+                _ => break,
+            }
+        }
+
+        if i + 1 >= args.len() {
+            return Err(Error::wrong_args("lsearch", 3, args.len()));
+        }
+
+        let list = args[i].as_list().unwrap_or_default();
+        let pattern = args[i + 1].as_str();
+
+        let matches: Vec<(usize, &Value)> = list.iter().enumerate()
+            .filter(|(_, v)| {
+                let m = if exact {
+                    v.as_str() == pattern
+                } else {
+                    glob_match(pattern, v.as_str())
+                };
+                if not_match { !m } else { m }
+            })
+            .collect();
+
+        if inline {
+            let result: Vec<Value> = matches.iter().map(|(_, v)| (*v).clone()).collect();
+            Ok(Value::from_list(&result))
+        } else if all {
+            let result: Vec<Value> = matches.iter().map(|(idx, _)| Value::from_int(*idx as i64)).collect();
+            Ok(Value::from_list(&result))
+        } else {
+            Ok(Value::from_int(matches.first().map(|(idx, _)| *idx as i64).unwrap_or(-1)))
+        }
+    }
+
+    /// lsort command - sort a list
+    fn cmd_lsort(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 {
+            return Err(Error::wrong_args_with_usage("lsort", 2, args.len(), "?options? list"));
+        }
+
+        let mut i = 1;
+        let mut decreasing = false;
+        let mut unique = false;
+        let mut nocase = false;
+
+        // Parse options
+        while i < args.len() && args[i].as_str().starts_with('-') {
+            match args[i].as_str() {
+                "-decreasing" => { decreasing = true; i += 1; }
+                "-increasing" => { decreasing = false; i += 1; }
+                "-unique" => { unique = true; i += 1; }
+                "-nocase" => { nocase = true; i += 1; }
+                "-ascii" | "-dictionary" | "-integer" | "-real" => { i += 1; }
+                "--" => { i += 1; break; }
+                _ => break,
+            }
+        }
+
+        if i >= args.len() {
+            return Err(Error::wrong_args("lsort", 2, args.len()));
+        }
+
+        let mut list = args[i].as_list().unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+
+        list.sort_by(|a, b| {
+            let (a_str, b_str) = if nocase {
+                (a.as_str().to_lowercase(), b.as_str().to_lowercase())
+            } else {
+                (a.as_str().to_string(), b.as_str().to_string())
+            };
+
+            let cmp = a_str.cmp(&b_str);
+            if decreasing { cmp.reverse() } else { cmp }
+        });
+
+        if unique {
+            list.retain(|v| seen.insert(v.as_str().to_string()));
+        }
+
+        Ok(Value::from_list(&list))
+    }
+
+    /// linsert command - insert elements into list
+    fn cmd_linsert(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 3 {
+            return Err(Error::wrong_args_with_usage("linsert", 3, args.len(), "list index ?element ...?"));
+        }
+
+            let list = args[1].as_list().unwrap_or_default();
+        let index = args[2].as_int().unwrap_or(0) as usize;
+        let index = index.min(list.len());
+
+        let elements: Vec<Value> = args[3..].to_vec();
+        let mut result = Vec::with_capacity(list.len() + elements.len());
+        result.extend(list[..index].iter().cloned());
+        result.extend(elements);
+        result.extend(list[index..].iter().cloned());
+
+        Ok(Value::from_list(&result))
+    }
+
+    /// lreplace command - replace elements in list
+    fn cmd_lreplace(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 4 {
+            return Err(Error::wrong_args_with_usage("lreplace", 4, args.len(), "list first last ?element ...?"));
+        }
+
+        let list = args[1].as_list().unwrap_or_default();
+        let first = args[2].as_int().unwrap_or(0) as usize;
+        let last_str = args[3].as_str();
+
+        let last = if last_str == "end" {
+            list.len().saturating_sub(1)
+        } else if last_str.starts_with("end-") {
+            let offset: usize = last_str[4..].parse().unwrap_or(0);
+            list.len().saturating_sub(1 + offset)
+        } else {
+            last_str.parse::<usize>().unwrap_or(0)
+        };
+
+        let first = first.min(list.len());
+        let last = last.min(list.len().saturating_sub(1));
+
+        let mut result = Vec::with_capacity(list.len());
+        result.extend(list[..first].iter().cloned());
+        result.extend(args[4..].iter().cloned());
+        if last + 1 < list.len() {
+            result.extend(list[last + 1..].iter().cloned());
+        }
+
+        Ok(Value::from_list(&result))
+    }
+
+    /// lassign command - assign list values to variables
+    fn cmd_lassign(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 3 {
+            return Err(Error::wrong_args_with_usage("lassign", 3, args.len(), "list varname ?varname ...?"));
+        }
+
+        let list = args[1].as_list().unwrap_or_default();
+        let vars: Vec<&str> = args[2..].iter().map(|v| v.as_str()).collect();
+
+        for (i, var) in vars.iter().enumerate() {
+            let value = list.get(i).cloned().unwrap_or_else(Value::empty);
+            interp.set_var(var, value)?;
+        }
+
+        // Return remaining elements
+        if list.len() > vars.len() {
+            Ok(Value::from_list(&list[vars.len()..]))
+        } else {
+            Ok(Value::empty())
+        }
+    }
+
+    /// lrepeat command - create list by repeating elements
+    fn cmd_lrepeat(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 {
+            return Err(Error::wrong_args_with_usage("lrepeat", 2, args.len(), "count ?element ...?"));
+        }
+
+        let count = args[1].as_int().unwrap_or(0) as usize;
+        let elements: Vec<Value> = args[2..].to_vec();
+
+        if elements.is_empty() {
+            return Ok(Value::empty());
+        }
+
+        let mut result = Vec::with_capacity(count * elements.len());
+        for _ in 0..count {
+            result.extend(elements.iter().cloned());
+        }
+
+        Ok(Value::from_list(&result))
+    }
+
+    /// lreverse command - reverse a list
+    fn cmd_lreverse(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::wrong_args("lreverse", 2, args.len()));
+        }
+
+        let mut list = args[1].as_list().unwrap_or_default();
+        list.reverse();
+        Ok(Value::from_list(&list))
+    }
+
+    /// split command - split string into list
+    fn cmd_split(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(Error::wrong_args_with_usage("split", 2, args.len(), "string ?splitChars?"));
+        }
+
+        let string = args[1].as_str();
+
+        if args.len() == 2 {
+            // Default: split on whitespace
+            let result: Vec<Value> = string.split_whitespace()
+                .map(|s| Value::from_str(s))
+                .collect();
+            Ok(Value::from_list(&result))
+        } else {
+            let split_chars = args[2].as_str();
+            if split_chars.is_empty() {
+                // Split into individual characters
+                let result: Vec<Value> = string.chars()
+                    .map(|c| Value::from_str(&c.to_string()))
+                    .collect();
+                Ok(Value::from_list(&result))
+            } else {
+                // Split on any of the characters
+                let result: Vec<Value> = string.split(|c| split_chars.contains(c))
+                    .map(|s| Value::from_str(s))
+                    .collect();
+                Ok(Value::from_list(&result))
+            }
+        }
+    }
+
+    /// join command - join list into string
+    fn cmd_join(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(Error::wrong_args_with_usage("join", 2, args.len(), "list ?joinString?"));
+        }
+
+        let list = args[1].as_list().unwrap_or_default();
+        let sep = if args.len() == 3 { args[2].as_str() } else { " " };
+
+        let result: String = list.iter()
+            .map(|v| v.as_str())
+            .collect::<Vec<&str>>()
+            .join(sep);
+
+        Ok(Value::from_str(&result))
+    }
+
+    /// subst command - perform substitutions
+    fn cmd_subst(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 {
+            return Err(Error::wrong_args_with_usage("subst", 2, args.len(), "?-no?-?backs? string"));
+        }
+
+        let mut i = 1;
+        let mut no_backslashes = false;
+        let mut no_commands = false;
+        let mut no_variables = false;
+
+        // Parse options
+        while i < args.len() && args[i].as_str().starts_with('-') {
+            match args[i].as_str() {
+                "-nobackslashes" => { no_backslashes = true; i += 1; }
+                "-nocommands" => { no_commands = true; i += 1; }
+                "-novariables" => { no_variables = true; i += 1; }
+                "--" => { i += 1; break; }
+                _ => break,
+            }
+        }
+
+        if i >= args.len() {
+            return Err(Error::wrong_args("subst", 2, args.len()));
+        }
+
+        let string = args[i].as_str();
+        let mut result = String::new();
+        let mut chars = string.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if !no_backslashes => {
+                    if let Some(&next) = chars.peek() {
+                        match next {
+                            'n' => { result.push('\n'); chars.next(); }
+                            't' => { result.push('\t'); chars.next(); }
+                            'r' => { result.push('\r'); chars.next(); }
+                            '\\' => { result.push('\\'); chars.next(); }
+                            '$' => { result.push('$'); chars.next(); }
+                            '[' => { result.push('['); chars.next(); }
+                            _ => { result.push(c); }
+                        }
+                    } else {
+                        result.push(c);
+                    }
+                }
+                '$' if !no_variables => {
+                    // Parse variable name
+                    let mut var_name = String::new();
+                    if let Some(&'{') = chars.peek() {
+                        chars.next(); // consume {
+                        while let Some(&ch) = chars.peek() {
+                            if ch == '}' {
+                                chars.next();
+                                break;
+                            }
+                            var_name.push(ch);
+                            chars.next();
+                        }
+                    } else {
+                        while let Some(&ch) = chars.peek() {
+                            if ch.is_alphanumeric() || ch == '_' {
+                                var_name.push(ch);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if let Ok(value) = interp.get_var(&var_name) {
+                        result.push_str(value.as_str());
+                    }
+                }
+                '[' if !no_commands => {
+                    // Find matching ]
+                    let mut depth = 1;
+                    let mut cmd = String::new();
+                    while let Some(ch) = chars.next() {
+                        if ch == '[' { depth += 1; }
+                        else if ch == ']' { depth -= 1; if depth == 0 { break; } }
+                        cmd.push(ch);
+                    }
+                    let value = interp.eval(&cmd)?;
+                    result.push_str(value.as_str());
+                }
+                _ => { result.push(c); }
+            }
+        }
+
+        Ok(Value::from_str(&result))
+    }
+
+    /// dict command - dictionary operations
+    fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 {
+            return Err(Error::wrong_args("dict", 2, args.len()));
+        }
+
+        let subcmd = args[1].as_str();
+
+        match subcmd {
+            "create" => {
+                // Create a dict from key-value pairs
+                if (args.len() - 2) % 2 != 0 {
+                    return Err(Error::runtime("dict create requires even number of arguments", crate::error::ErrorCode::InvalidOp));
+                }
+                let mut dict = Vec::new();
+                let mut i = 2;
+                while i + 1 < args.len() {
+                    dict.push(args[i].clone());
+                    dict.push(args[i + 1].clone());
+                    i += 2;
+                }
+                Ok(Value::from_list(&dict))
+            }
+            "get" => {
+                if args.len() < 3 {
+                    return Err(Error::wrong_args_with_usage("dict get", 3, args.len(), "dictVar ?key ...?"));
+                }
+                let dict = interp.get_var(args[2].as_str())
+                    .ok()
+                    .and_then(|v| v.as_list())
+                    .unwrap_or_default();
+                let keys: Vec<&str> = args[3..].iter().map(|v| v.as_str()).collect();
+
+                let mut current = dict;
+                for key in &keys {
+                    let mut found = false;
+                    let mut i = 0;
+                    while i + 1 < current.len() {
+                        if current[i].as_str() == *key {
+                            if keys.last() == Some(key) {
+                                return Ok(current[i + 1].clone());
+                            } else {
+                                current = current[i + 1].as_list().unwrap_or_default();
+                                found = true;
+                                break;
+                            }
+                        }
+                        i += 2;
+                    }
+                    if !found {
+                        return Err(Error::runtime(
+                            format!("key \"{}\" not known in dictionary", key),
+                            crate::error::ErrorCode::InvalidOp
+                        ));
+                    }
+                }
+                Ok(Value::from_list(&current))
+            }
+            "set" => {
+                if args.len() < 5 {
+                    return Err(Error::wrong_args_with_usage("dict set", 5, args.len(), "dictVar key ?key ...? value"));
+                }
+                let var_name = args[2].as_str();
+                let value = args.last().cloned().unwrap_or_else(Value::empty);
+                let keys: Vec<&str> = args[3..args.len()-1].iter().map(|v| v.as_str()).collect();
+
+                let dict = interp.get_var(var_name)
+                    .ok()
+                    .and_then(|v| v.as_list())
+                    .unwrap_or_default();
+
+                let result = dict_set(dict, &keys, value);
+                interp.set_var(var_name, result)
+            }
+            "unset" => {
+                if args.len() < 4 {
+                    return Err(Error::wrong_args_with_usage("dict unset", 4, args.len(), "dictVar key ?key ...?"));
+                }
+                let var_name = args[2].as_str();
+                let keys: Vec<&str> = args[3..].iter().map(|v| v.as_str()).collect();
+
+                let dict = interp.get_var(var_name)
+                    .ok()
+                    .and_then(|v| v.as_list())
+                    .unwrap_or_default();
+
+                let result = dict_unset(dict, &keys);
+                interp.set_var(var_name, result)
+            }
+            "keys" => {
+                if args.len() < 3 {
+                    return Err(Error::wrong_args_with_usage("dict keys", 3, args.len(), "dictVar ?pattern?"));
+                }
+                let dict = interp.get_var(args[2].as_str())
+                    .ok()
+                    .and_then(|v| v.as_list())
+                    .unwrap_or_default();
+
+                let pattern = if args.len() > 3 { args[3].as_str() } else { "*" };
+
+                let keys: Vec<Value> = dict.chunks(2)
+                    .filter_map(|chunk| chunk.first())
+                    .filter(|k| glob_match(pattern, k.as_str()))
+                    .cloned()
+                    .collect();
+
+                Ok(Value::from_list(&keys))
+            }
+            "values" => {
+                if args.len() < 3 {
+                    return Err(Error::wrong_args_with_usage("dict values", 3, args.len(), "dictVar"));
+                }
+                let dict = interp.get_var(args[2].as_str())
+                    .ok()
+                    .and_then(|v| v.as_list())
+                    .unwrap_or_default();
+
+                let values: Vec<Value> = dict.chunks(2)
+                    .filter_map(|chunk| chunk.get(1))
+                    .cloned()
+                    .collect();
+
+                Ok(Value::from_list(&values))
+            }
+            "haskey" => {
+                if args.len() < 4 {
+                    return Err(Error::wrong_args_with_usage("dict haskey", 4, args.len(), "dictVar key"));
+                }
+                let dict = interp.get_var(args[2].as_str())
+                    .ok()
+                    .and_then(|v| v.as_list())
+                    .unwrap_or_default();
+                let key = args[3].as_str();
+
+                let has_key = dict.chunks(2)
+                    .any(|chunk| chunk.first().map(|k| k.as_str() == key).unwrap_or(false));
+
+                Ok(Value::from_bool(has_key))
+            }
+            "size" => {
+                if args.len() < 3 {
+                    return Err(Error::wrong_args_with_usage("dict size", 3, args.len(), "dictVar"));
+                }
+                let dict = interp.get_var(args[2].as_str())
+                    .ok()
+                    .and_then(|v| v.as_list())
+                    .unwrap_or_default();
+
+                Ok(Value::from_int((dict.len() / 2) as i64))
+            }
+            "exists" => {
+                if args.len() < 4 {
+                    return Err(Error::wrong_args_with_usage("dict exists", 4, args.len(), "dictVar key ?key ...?"));
+                }
+                let dict = interp.get_var(args[2].as_str())
+                    .ok()
+                    .and_then(|v| v.as_list())
+                    .unwrap_or_default();
+                let keys: Vec<&str> = args[3..].iter().map(|v| v.as_str()).collect();
+
+                let result = dict_exists(&dict, &keys);
+                Ok(Value::from_bool(result))
+            }
+            "append" => {
+                if args.len() < 5 {
+                    return Err(Error::wrong_args_with_usage("dict append", 5, args.len(), "dictVar key ?key ...? value"));
+                }
+                let var_name = args[2].as_str();
+                let value = args.last().cloned().unwrap_or_else(Value::empty);
+                let keys: Vec<&str> = args[3..args.len()-1].iter().map(|v| v.as_str()).collect();
+
+                let dict = interp.get_var(var_name)
+                    .ok()
+                    .and_then(|v| v.as_list())
+                    .unwrap_or_default();
+
+                // Get current value and append
+                let current = dict_get_value(&dict, &keys).unwrap_or_default();
+                let mut new_val = current.as_str().to_string();
+                new_val.push_str(value.as_str());
+
+                let result = dict_set(dict, &keys, Value::from_str(&new_val));
+                interp.set_var(var_name, result)
+            }
+            "for" => {
+                if args.len() < 5 {
+                    return Err(Error::wrong_args_with_usage("dict for", 5, args.len(), "{keyVar valueVar} dictVar body"));
+                }
+                let vars = args[2].as_list().unwrap_or_default();
+                let key_var = vars.get(0).map(|v| v.as_str()).unwrap_or("key");
+                let val_var = vars.get(1).map(|v| v.as_str()).unwrap_or("value");
+                let dict = interp.get_var(args[3].as_str())
+                    .ok()
+                    .and_then(|v| v.as_list())
+                    .unwrap_or_default();
+                let body = args[4].as_str();
+
+                let mut result = Value::empty();
+                let mut i = 0;
+                while i + 1 < dict.len() {
+                    interp.set_var(key_var, dict[i].clone())?;
+                    interp.set_var(val_var, dict[i + 1].clone())?;
+
+                    match interp.eval(body) {
+                        Ok(v) => result = v,
+                        Err(e) => {
+                            if e.is_break() { break; }
+                            if e.is_continue() { i += 2; continue; }
+                            return Err(e);
+                        }
+                    }
+                    i += 2;
+                }
+                Ok(result)
+            }
+            _ => Err(Error::runtime(
+                format!("unknown dict subcommand: {}", subcmd),
+                crate::error::ErrorCode::InvalidOp,
+            )),
+        }
+    }
+
+    /// array command - array operations
+    fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 3 {
+            return Err(Error::wrong_args("array", 3, args.len()));
+        }
+
+        let subcmd = args[1].as_str();
+        let array_name = args[2].as_str();
+
+        match subcmd {
+            "exists" => {
+                // Check if array exists (any element with this name)
+                let prefix = format!("{}(", array_name);
+                let exists = interp.vars.keys().any(|k| k.starts_with(&prefix));
+                Ok(Value::from_bool(exists))
+            }
+            "get" => {
+                let pattern = if args.len() > 3 { args[3].as_str() } else { "*" };
+                let prefix = format!("{}(", array_name);
+
+                let result: Vec<Value> = interp.vars.iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .filter(|(k, _)| {
+                        // Extract index and match pattern
+                        if let Some(end) = k.rfind(')') {
+                            let idx = &k[prefix.len()..end];
+                            glob_match(pattern, idx)
+                        } else {
+                            false
+                        }
+                    })
+                    .flat_map(|(k, v)| {
+                        // Return index and value pairs
+                        if let Some(end) = k.rfind(')') {
+                            let idx = &k[prefix.len()..end];
+                            vec![Value::from_str(idx), v.clone()]
+                        } else {
+                            vec![]
+                        }
+                    })
+                    .collect();
+
+                Ok(Value::from_list(&result))
+            }
+            "set" => {
+                if args.len() < 4 {
+                    return Err(Error::wrong_args_with_usage("array set", 4, args.len(), "arrayName list"));
+                }
+                let list = args[3].as_list().unwrap_or_default();
+
+                if list.len() % 2 != 0 {
+                    return Err(Error::runtime("list must have even number of elements", crate::error::ErrorCode::InvalidOp));
+                }
+
+                let mut i = 0;
+                while i + 1 < list.len() {
+                    let key = list[i].as_str();
+                    let value = &list[i + 1];
+                    let full_key = format!("{}({})", array_name, key);
+                    interp.vars.insert(full_key, value.clone());
+                    i += 2;
+                }
+
+                Ok(Value::empty())
+            }
+            "names" => {
+                let pattern = if args.len() > 3 { args[3].as_str() } else { "*" };
+                let prefix = format!("{}(", array_name);
+
+                let names: Vec<Value> = interp.vars.keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .filter_map(|k| {
+                        if let Some(end) = k.rfind(')') {
+                            let idx = &k[prefix.len()..end];
+                            if glob_match(pattern, idx) {
+                                Some(Value::from_str(idx))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                Ok(Value::from_list(&names))
+            }
+            "size" => {
+                let prefix = format!("{}(", array_name);
+                let count = interp.vars.keys().filter(|k| k.starts_with(&prefix)).count();
+                Ok(Value::from_int(count as i64))
+            }
+            "unset" => {
+                let pattern = if args.len() > 3 { args[3].as_str() } else { "*" };
+                let prefix = format!("{}(", array_name);
+
+                let keys_to_remove: Vec<String> = interp.vars.keys()
+                    .filter(|k| k.starts_with(&prefix))
+                    .filter(|k| {
+                        if let Some(end) = k.rfind(')') {
+                            let idx = &k[prefix.len()..end];
+                            glob_match(pattern, idx)
+                        } else {
+                            false
+                        }
+                    })
+                    .cloned()
+                    .collect();
+
+                for key in keys_to_remove {
+                    interp.vars.remove(&key);
+                }
+
+                Ok(Value::empty())
+            }
+            _ => Err(Error::runtime(
+                format!("unknown array subcommand: {}", subcmd),
+                crate::error::ErrorCode::InvalidOp,
+            )),
+        }
+    }
 }
 
 /// Split an array reference into (array_name, index)
@@ -1052,6 +1922,110 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     }
 
     match_helper(&pattern, &text)
+}
+
+// Dict helper functions
+fn dict_set(mut dict: Vec<Value>, keys: &[&str], value: Value) -> Value {
+    if keys.is_empty() {
+        return Value::from_list(&dict);
+    }
+
+    let key = keys[0];
+    let mut found = false;
+
+    let mut i = 0;
+    while i + 1 < dict.len() {
+        if dict[i].as_str() == key {
+            if keys.len() == 1 {
+                dict[i + 1] = value.clone();
+            } else {
+                let sub_dict = dict[i + 1].as_list().unwrap_or_default();
+                dict[i + 1] = dict_set(sub_dict, &keys[1..], value.clone());
+            }
+            found = true;
+            break;
+        }
+        i += 2;
+    }
+
+    if !found {
+        if keys.len() == 1 {
+            dict.push(Value::from_str(key));
+            dict.push(value);
+        } else {
+            let sub_dict = dict_set(vec![], &keys[1..], value);
+            dict.push(Value::from_str(key));
+            dict.push(sub_dict);
+        }
+    }
+
+    Value::from_list(&dict)
+}
+
+fn dict_unset(mut dict: Vec<Value>, keys: &[&str]) -> Value {
+    if keys.is_empty() {
+        return Value::from_list(&dict);
+    }
+
+    let key = keys[0];
+    let mut i = 0;
+    while i + 1 < dict.len() {
+        if dict[i].as_str() == key {
+            if keys.len() == 1 {
+                dict.remove(i + 1);
+                dict.remove(i);
+            } else {
+                let sub_dict = dict[i + 1].as_list().unwrap_or_default();
+                dict[i + 1] = dict_unset(sub_dict, &keys[1..]);
+            }
+            break;
+        }
+        i += 2;
+    }
+
+    Value::from_list(&dict)
+}
+
+fn dict_get_value(dict: &[Value], keys: &[&str]) -> Option<Value> {
+    if keys.is_empty() {
+        return None;
+    }
+
+    let key = keys[0];
+    let mut i = 0;
+    while i + 1 < dict.len() {
+        if dict[i].as_str() == key {
+            if keys.len() == 1 {
+                return Some(dict[i + 1].clone());
+            } else {
+                let sub_dict = dict[i + 1].as_list().unwrap_or_default();
+                return dict_get_value(&sub_dict, &keys[1..]);
+            }
+        }
+        i += 2;
+    }
+    None
+}
+
+fn dict_exists(dict: &[Value], keys: &[&str]) -> bool {
+    if keys.is_empty() {
+        return false;
+    }
+
+    let key = keys[0];
+    let mut i = 0;
+    while i + 1 < dict.len() {
+        if dict[i].as_str() == key {
+            if keys.len() == 1 {
+                return true;
+            } else {
+                let sub_dict = dict[i + 1].as_list().unwrap_or_default();
+                return dict_exists(&sub_dict, &keys[1..]);
+            }
+        }
+        i += 2;
+    }
+    false
 }
 
 #[cfg(test)]

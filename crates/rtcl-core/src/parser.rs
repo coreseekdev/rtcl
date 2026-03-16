@@ -252,7 +252,11 @@ impl Parser {
                     bracket_depth -= 1;
                     if bracket_depth > 0 {
                         cmd.push(ch);
+                        self.advance();
                     }
+                    // Don't advance if this is the final closing bracket
+                    // The expect(']') below will consume it
+                    continue;
                 }
                 '\\' => {
                     cmd.push(ch);
@@ -321,7 +325,8 @@ impl Parser {
             }
         }
 
-        // The closing '}' has already been consumed
+        // Consume the closing '}'
+        self.expect('}')?;
         Ok(result)
     }
 

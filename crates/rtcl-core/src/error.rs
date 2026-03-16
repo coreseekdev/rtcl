@@ -81,6 +81,7 @@ pub enum ControlFlow {
     Break,
     Continue,
     Error,
+    Exit,
 }
 
 impl Error {
@@ -168,6 +169,14 @@ impl Error {
         }
     }
 
+    /// Create an exit control flow
+    pub fn exit(code: Option<i32>) -> Self {
+        Error::ControlFlow {
+            kind: ControlFlow::Exit,
+            value: code.map(|c| c.to_string()),
+        }
+    }
+
     /// Check if this is a control flow error
     pub fn is_control_flow(&self) -> bool {
         matches!(self, Error::ControlFlow { .. })
@@ -186,6 +195,11 @@ impl Error {
     /// Check if this is a continue
     pub fn is_continue(&self) -> bool {
         matches!(self, Error::ControlFlow { kind: ControlFlow::Continue, .. })
+    }
+
+    /// Check if this is an exit
+    pub fn is_exit(&self) -> bool {
+        matches!(self, Error::ControlFlow { kind: ControlFlow::Exit, .. })
     }
 
     /// Get error code (for Tcl compatibility)
@@ -243,6 +257,7 @@ impl fmt::Display for Error {
                     ControlFlow::Break => write!(f, "break"),
                     ControlFlow::Continue => write!(f, "continue"),
                     ControlFlow::Error => write!(f, "error"),
+                    ControlFlow::Exit => write!(f, "exit"),
                 }?;
                 if let Some(v) = value {
                     write!(f, " with value: {}", v)?;

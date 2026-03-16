@@ -25,7 +25,3 @@ embedded = ["alloc", "dep:spin"]
 debug = []
 
 [dev-dependencies]
-
-[[test]]
-name = "tcl_compatibility"
-path = "tests/tcl_compatibility.rs"

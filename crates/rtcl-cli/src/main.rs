@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use colored::Colorize;
-use rtcl_core::{Interp, Value};
+use rtcl_core::Interp;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{CompletionType, Config, EditMode, Editor};
@@ -203,7 +203,7 @@ fn print_help() {
     println!();
 }
 
-fn show_vars(interp: &Interp) {
+fn show_vars(_interp: &Interp) {
     // This would require exposing variable iteration
     println!("(Variable listing not yet implemented)");
 }

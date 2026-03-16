@@ -436,7 +436,14 @@ impl<'a> ExprParser<'a> {
                     return Err(Error::wrong_args("abs()", 1, args.len()));
                 }
                 match args[0].as_float() {
-                    Some(n) => Ok(Value::from_float(n.abs())),
+                    Some(n) => {
+                        let result = n.abs();
+                        if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
+                            Ok(Value::from_int(result as i64))
+                        } else {
+                            Ok(Value::from_float(result))
+                        }
+                    }
                     None => Err(Error::type_mismatch("number", "non-numeric value")),
                 }
             }
@@ -499,7 +506,14 @@ impl<'a> ExprParser<'a> {
                     return Err(Error::wrong_args("pow()", 2, args.len()));
                 }
                 match (args[0].as_float(), args[1].as_float()) {
-                    (Some(a), Some(b)) => Ok(Value::from_float(a.powf(b))),
+                    (Some(a), Some(b)) => {
+                        let result = a.powf(b);
+                        if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
+                            Ok(Value::from_int(result as i64))
+                        } else {
+                            Ok(Value::from_float(result))
+                        }
+                    }
                     _ => Err(Error::type_mismatch("number", "non-numeric value")),
                 }
             }

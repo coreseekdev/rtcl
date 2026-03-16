@@ -128,20 +128,18 @@ fn test_array_index_with_newline() {
 }
 
 /// Unclosed array index: `$a(foo` with no `)`.
-/// rd: VarRef("a(foo") — includes unclosed index.
-/// PEG: Concat([VarRef("a"), Literal("(foo")]) — stops at `(`.
+/// With backtracking: `$a` is VarRef, `(foo` is literal text.
 #[test]
 fn test_array_unclosed_index_bare() {
     let cmds = parse("set x $a(foo").unwrap();
     match &cmds[0].words[2] {
-        Word::VarRef(name) => {
-            assert!(name.starts_with("a("), "should be array ref: {:?}", name);
-        }
         Word::Concat(parts) => {
             assert!(parts.iter().any(|w| matches!(w, Word::VarRef(n) if n == "a")),
                 "should contain VarRef(a): {:?}", parts);
+            assert!(parts.iter().any(|w| matches!(w, Word::Literal(s) if s.contains("(foo"))),
+                "should contain literal (foo: {:?}", parts);
         }
-        w => panic!("expected VarRef or Concat, got {:?}", w),
+        w => panic!("expected Concat with VarRef+Literal, got {:?}", w),
     }
 }
 
@@ -155,4 +153,91 @@ fn test_utf8_variable_name() {
         Word::VarRef(name) => assert_eq!(name, "变量"),
         w => panic!("expected VarRef(变量), got {:?}", w),
     }
+}
+
+// --- $[expr] sugar (jimtcl extension) ---
+
+/// `$[1+2]` → ExprSugar("1+2").
+#[test]
+fn test_expr_sugar_basic() {
+    let cmds = parse("set x $[1+2]").unwrap();
+    match &cmds[0].words[2] {
+        Word::ExprSugar(e) => assert_eq!(e, "1+2"),
+        w => panic!("expected ExprSugar, got {:?}", w),
+    }
+}
+
+/// `$[expr]` sugar in quoted string.
+#[test]
+fn test_expr_sugar_in_quoted() {
+    let cmds = parse("set x \"val=$[1+2]\"").unwrap();
+    match &cmds[0].words[2] {
+        Word::Concat(parts) => {
+            assert!(parts.iter().any(|w| matches!(w, Word::ExprSugar(e) if e == "1+2")),
+                "should contain ExprSugar: {:?}", parts);
+        }
+        w => panic!("expected Concat with ExprSugar, got {:?}", w),
+    }
+}
+
+/// `$[]` — empty expr sugar.
+#[test]
+fn test_expr_sugar_empty() {
+    let cmds = parse("set x $[]").unwrap();
+    match &cmds[0].words[2] {
+        Word::ExprSugar(e) => assert_eq!(e, ""),
+        w => panic!("expected ExprSugar, got {:?}", w),
+    }
+}
+
+/// `$[cmd arg]` — expr sugar with spaces.
+#[test]
+fn test_expr_sugar_with_spaces() {
+    let cmds = parse("set x $[$a + $b]").unwrap();
+    match &cmds[0].words[2] {
+        Word::ExprSugar(e) => assert_eq!(e, "$a + $b"),
+        w => panic!("expected ExprSugar, got {:?}", w),
+    }
+}
+
+// --- Paren backtracking ---
+
+/// Unclosed paren in quoted context: `"$a(foo"`.
+#[test]
+fn test_unclosed_paren_quoted() {
+    let cmds = parse("set x \"$a(foo\"").unwrap();
+    match &cmds[0].words[2] {
+        Word::Concat(parts) => {
+            assert!(parts.iter().any(|w| matches!(w, Word::VarRef(n) if n == "a")),
+                "should contain VarRef(a): {:?}", parts);
+            assert!(parts.iter().any(|w| matches!(w, Word::Literal(s) if s.contains("(foo"))),
+                "should contain literal (foo: {:?}", parts);
+        }
+        w => panic!("expected Concat, got {:?}", w),
+    }
+}
+
+/// Unbalanced nested paren: `$a(b(c)d` — backtrack to after last `)`.
+#[test]
+fn test_unbalanced_nested_paren_backtrack() {
+    let cmds = parse("set x $a(b(c)d").unwrap();
+    // jimtcl backtracks to after last ')': $a(b(c) is dict sugar, d is literal
+    match &cmds[0].words[2] {
+        Word::Concat(parts) => {
+            assert!(parts.iter().any(|w| matches!(w, Word::VarRef(n) if n.starts_with("a("))),
+                "should contain VarRef(a(...)): {:?}", parts);
+            assert!(parts.iter().any(|w| matches!(w, Word::Literal(s) if s == "d")),
+                "should contain literal d: {:?}", parts);
+        }
+        w => panic!("expected Concat, got {:?}", w),
+    }
+}
+
+/// Unclosed paren doesn't consume newline: `$a(foo\nset y 1`.
+#[test]
+fn test_unclosed_paren_doesnt_eat_newline() {
+    let cmds = parse("set x $a(foo\nset y 1").unwrap();
+    // Without backtracking, the paren would consume the newline and "set y 1".
+    // With backtracking, $a is just a VarRef and (foo is literal for the first command.
+    assert_eq!(cmds.len(), 2, "should be 2 commands: {:?}", cmds);
 }

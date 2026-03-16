@@ -400,6 +400,7 @@ impl Interp {
                 Ok(Value::from_str(&result))
             }
             Word::Expand(inner) => self.eval_word(inner),
+            Word::ExprSugar(expr) => self.eval_expr(expr),
         }
     }
 

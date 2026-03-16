@@ -105,40 +105,40 @@ fn test_parse_1_18_cmd_var_bare() {
     }
 }
 
-/// parse-1.19: Lone dollar sign in quotes `"6$[set y]"` → `6$1`
+/// parse-1.19: `"6$[set y]"` → with $[expr] sugar, `$[set y]` is ExprSugar
 #[test]
 fn test_parse_1_19_orphan_dollar_in_quotes() {
     let cmds = parse(r#"set x "6$[set y]""#).unwrap();
     assert_eq!(cmds[0].words.len(), 3);
     match &cmds[0].words[2] {
         Word::Concat(parts) => {
-            // Should be: Literal("6$") or Literal("6") + Literal("$") + CommandSub("set y")
-            let has_dollar = parts.iter().any(|p| match p {
-                Word::Literal(s) => s.contains('$'),
+            // Should be: Literal("6") + ExprSugar("set y")
+            let has_6 = parts.iter().any(|p| match p {
+                Word::Literal(s) => s.contains('6'),
                 _ => false,
             });
-            let has_cmd = parts.iter().any(|p| matches!(p, Word::CommandSub(_)));
-            assert!(has_dollar, "should contain literal $, got {:?}", parts);
-            assert!(has_cmd, "should contain cmd sub, got {:?}", parts);
+            let has_expr = parts.iter().any(|p| matches!(p, Word::ExprSugar(_)));
+            assert!(has_6, "should contain literal 6, got {:?}", parts);
+            assert!(has_expr, "should contain ExprSugar, got {:?}", parts);
         }
         w => panic!("expected concat, got {:?}", w),
     }
 }
 
-/// parse-1.20: Lone dollar sign in bare context `6$[set y]`
+/// parse-1.20: `6$[set y]` in bare context → with $[expr] sugar
 #[test]
 fn test_parse_1_20_orphan_dollar_bare() {
     let cmds = parse("set x 6$[set y]").unwrap();
     assert_eq!(cmds[0].words.len(), 3);
     match &cmds[0].words[2] {
         Word::Concat(parts) => {
-            let has_dollar = parts.iter().any(|p| match p {
-                Word::Literal(s) => s.contains('$'),
+            let has_6 = parts.iter().any(|p| match p {
+                Word::Literal(s) => s.contains('6'),
                 _ => false,
             });
-            let has_cmd = parts.iter().any(|p| matches!(p, Word::CommandSub(_)));
-            assert!(has_dollar, "should contain literal $, got {:?}", parts);
-            assert!(has_cmd, "should contain cmd sub, got {:?}", parts);
+            let has_expr = parts.iter().any(|p| matches!(p, Word::ExprSugar(_)));
+            assert!(has_6, "should contain literal 6, got {:?}", parts);
+            assert!(has_expr, "should contain ExprSugar, got {:?}", parts);
         }
         w => panic!("expected concat, got {:?}", w),
     }

@@ -152,6 +152,11 @@ impl Compiler {
                 self.compile_word(inner, line);
                 self.bytecode.emit(OpCode::ExpandList, line);
             }
+            Word::ExprSugar(expr) => {
+                let idx = self.bytecode.add_const(expr);
+                self.bytecode.emit(OpCode::PushConst(idx), line);
+                self.bytecode.emit(OpCode::EvalExpr, line);
+            }
         }
     }
 

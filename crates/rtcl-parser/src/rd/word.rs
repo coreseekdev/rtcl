@@ -204,7 +204,11 @@ fn parse_dollar(cur: &mut Cursor, tokens: &mut Tokens, _bracket_term: bool) -> P
     debug_assert!(cur.is(b'$'));
     cur.advance(); // skip '$'
 
-    if cur.is(b'{') {
+    if cur.is(b'[') {
+        // $[...] expr sugar (jimtcl extension): evaluate content as expression
+        let cmd_text = parse_cmd_sub(cur, _bracket_term)?;
+        tokens.push(Word::ExprSugar(cmd_text));
+    } else if cur.is(b'{') {
         // ${var_name}
         cur.advance(); // skip '{'
         let start = cur.pos;
@@ -218,8 +222,11 @@ fn parse_dollar(cur: &mut Cursor, tokens: &mut Tokens, _bracket_term: bool) -> P
         cur.advance(); // skip '}'
 
         if cur.is(b'(') {
-            let idx = parse_var_index(cur)?;
-            tokens.push(Word::VarRef(format!("{}({})", name, idx)));
+            if let Some(idx) = try_parse_var_index(cur) {
+                tokens.push(Word::VarRef(format!("{}({})", name, idx)));
+            } else {
+                tokens.push(Word::VarRef(name));
+            }
         } else {
             tokens.push(Word::VarRef(name));
         }
@@ -239,8 +246,11 @@ fn parse_dollar(cur: &mut Cursor, tokens: &mut Tokens, _bracket_term: bool) -> P
         let name = cur.slice(start).to_string();
 
         if cur.is(b'(') {
-            let idx = parse_var_index(cur)?;
-            tokens.push(Word::VarRef(format!("{}({})", name, idx)));
+            if let Some(idx) = try_parse_var_index(cur) {
+                tokens.push(Word::VarRef(format!("{}({})", name, idx)));
+            } else {
+                tokens.push(Word::VarRef(name));
+            }
         } else {
             tokens.push(Word::VarRef(name));
         }
@@ -252,12 +262,24 @@ fn parse_dollar(cur: &mut Cursor, tokens: &mut Tokens, _bracket_term: bool) -> P
     Ok(())
 }
 
-/// Parse an array index: `(...)` with nested parens and escape support.
-fn parse_var_index(cur: &mut Cursor) -> ParseResult<String> {
+/// Try to parse an array index: `(...)`.
+///
+/// Returns `Some(index)` if a matching `)` was found.
+/// If no `)` is found, restores the cursor to before `(` and returns `None`.
+/// If parens are nested but unbalanced, backtracks to after the last `)` found
+/// (jimtcl-compatible behavior).
+fn try_parse_var_index(cur: &mut Cursor) -> Option<String> {
     debug_assert!(cur.is(b'('));
+    let save_pos = cur.pos;
+    let save_line = cur.line;
     cur.advance(); // skip '('
     let mut depth: u32 = 1;
-    let start = cur.pos;
+    let content_start = cur.pos;
+
+    // Track state right after the last ')' encountered at any depth
+    let mut last_close_end: Option<usize> = None; // position of ')'
+    let mut last_close_after_pos: Option<usize> = None;
+    let mut last_close_after_line: Option<usize> = None;
 
     while !cur.at_end() && depth > 0 {
         match cur.peek().unwrap() {
@@ -268,11 +290,15 @@ fn parse_var_index(cur: &mut Cursor) -> ParseResult<String> {
             b')' => {
                 depth -= 1;
                 if depth == 0 {
-                    let idx = cur.slice(start).to_string();
+                    let idx = cur.slice(content_start).to_string();
                     cur.advance(); // skip closing ')'
-                    return Ok(idx);
+                    return Some(idx);
                 }
-                cur.advance();
+                let close_pos = cur.pos; // position of ')'
+                cur.advance(); // advance past ')'
+                last_close_end = Some(close_pos);
+                last_close_after_pos = Some(cur.pos);
+                last_close_after_line = Some(cur.line);
             }
             b'\\' => {
                 cur.advance(); // skip '\'
@@ -286,7 +312,20 @@ fn parse_var_index(cur: &mut Cursor) -> ParseResult<String> {
         }
     }
 
-    Ok(cur.slice(start).to_string())
+    // Unbalanced: backtrack
+    if let Some(close_pos) = last_close_end {
+        // Found at least one ')' but nesting didn't balance.
+        // Backtrack to just after the last ')' found.
+        let idx = cur.input[content_start..close_pos].to_string();
+        cur.pos = last_close_after_pos.unwrap();
+        cur.line = last_close_after_line.unwrap();
+        return Some(idx);
+    }
+
+    // No ')' found at all — not an array index. Restore cursor.
+    cur.pos = save_pos;
+    cur.line = save_line;
+    None
 }
 
 // ---------------------------------------------------------------------------

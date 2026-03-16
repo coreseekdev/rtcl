@@ -34,6 +34,8 @@ pub enum Word {
     Concat(Vec<Word>),
     /// Expand syntax: `{*}word` — expands the word as multiple arguments.
     Expand(Box<Word>),
+    /// Expression sugar: `$[expr]` — evaluate content as expression (jimtcl extension).
+    ExprSugar(String),
 }
 
 impl fmt::Display for Word {
@@ -49,6 +51,7 @@ impl fmt::Display for Word {
                 Ok(())
             }
             Word::Expand(inner) => write!(f, "{{*}}{}", inner),
+            Word::ExprSugar(e) => write!(f, "$[{}]", e),
         }
     }
 }

@@ -194,6 +194,7 @@ fn parse_word(pair: Pair<Rule>) -> Option<Word> {
             let content = extract_cmd_sub_str(inner);
             Some(Word::CommandSub(content))
         }
+        Rule::orphan_dollar => Some(Word::Literal("$".to_string())),
         Rule::bare => {
             let text = process_bare(inner.as_str());
             Some(Word::Literal(text))
@@ -213,7 +214,7 @@ fn parse_expand(pair: Pair<Rule>) -> Option<Word> {
     None
 }
 
-/// Parse a composite word (mixed bare text + var_ref + cmd_sub).
+/// Parse a composite word (mixed bare text + var_ref + cmd_sub + orphan_dollar).
 fn parse_composite(pair: Pair<Rule>) -> Vec<Word> {
     let mut parts = Vec::new();
     for inner in pair.into_inner() {
@@ -223,6 +224,9 @@ fn parse_composite(pair: Pair<Rule>) -> Vec<Word> {
             }
             Rule::cmd_sub => {
                 parts.push(Word::CommandSub(extract_cmd_sub_str(inner)));
+            }
+            Rule::orphan_dollar => {
+                parts.push(Word::Literal("$".to_string()));
             }
             Rule::bare => {
                 parts.push(Word::Literal(process_bare(inner.as_str())));
@@ -291,6 +295,9 @@ fn parse_quoted(pair: Pair<Rule>) -> Vec<Word> {
                     }
                 }
             }
+            Rule::orphan_dollar => {
+                literal.push('$');
+            }
             Rule::quoted_char => {
                 literal.push_str(inner.as_str());
             }
@@ -326,24 +333,13 @@ fn extract_var_name(pair: Pair<Rule>) -> String {
 }
 
 fn extract_index(pair: Pair<Rule>) -> String {
-    let mut result = String::new();
-    for inner in pair.into_inner() {
-        match inner.as_rule() {
-            Rule::index => {
-                result.push('(');
-                result.push_str(&extract_index(inner));
-                result.push(')');
-            }
-            Rule::index_char => {
-                result.push_str(inner.as_str());
-            }
-            Rule::index_escape => {
-                result.push_str(inner.as_str());
-            }
-            _ => {}
-        }
+    // index is atomic (@{ }), so pair.as_str() is the raw text including outer ( )
+    let raw = pair.as_str();
+    if raw.starts_with('(') && raw.ends_with(')') {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw.to_string()
     }
-    result
 }
 
 /// Extract command substitution content using `pair.as_str()` and stripping
@@ -429,7 +425,6 @@ fn process_bare(s: &str) -> String {
 }
 
 /// Process a `\X` escape sequence and return the resulting character.
-/// Returns `'\0'` as a sentinel for line continuations that produce no output.
 fn process_escape(s: &str) -> Option<char> {
     if !s.starts_with('\\') || s.len() < 2 {
         return s.chars().next();
@@ -453,7 +448,7 @@ fn process_escape(s: &str) -> Option<char> {
         '#' => Some('#'),
         ' ' => Some(' '),
         ';' => Some(';'),
-        '\n' => Some('\0'), // line continuation sentinel
+        '\n' => Some(' '), // line continuation → single space
         'x' => {
             let hex: String = chars[2..]
                 .iter()
@@ -560,6 +555,436 @@ mod tests {
         match &cmds[0].words[1] {
             Word::Expand(_) => {}
             _ => panic!("expected expand"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // jimtcl parse.test alignment tests
+    // -----------------------------------------------------------------------
+
+    /// parse-1.1: Quoted closing bracket  `"]"` → length 1 literal
+    #[test]
+    fn test_parse_1_1_quoted_closing_bracket() {
+        // `set x [string length "]"]`
+        // The `"]"` inside [..] is a quoted string containing `]`
+        let cmds = parse(r#"set x [string length "]"]"#).unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        // word 2 is cmd_sub
+        match &cmds[0].words[2] {
+            Word::CommandSub(cmd) => assert_eq!(cmd, r#"string length "]""#),
+            w => panic!("expected cmd_sub, got {:?}", w),
+        }
+    }
+
+    /// parse-1.2: Quoted opening bracket via escape `"\["`
+    #[test]
+    fn test_parse_1_2_quoted_escaped_bracket() {
+        let cmds = parse(r#"set x [string length "\["]"#).unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::CommandSub(cmd) => assert_eq!(cmd, r#"string length "\[""#),
+            w => panic!("expected cmd_sub, got {:?}", w),
+        }
+    }
+
+    /// parse-1.3: Quoted open brace via escape `"\{"`
+    #[test]
+    fn test_parse_1_3_quoted_escaped_brace() {
+        let cmds = parse(r#"set x [string length "\{"]"#).unwrap();
+        match &cmds[0].words[2] {
+            Word::CommandSub(cmd) => assert_eq!(cmd, r#"string length "\{""#),
+            w => panic!("expected cmd_sub, got {:?}", w),
+        }
+    }
+
+    /// parse-1.5: Braced bracket `{]}`
+    #[test]
+    fn test_parse_1_5_braced_bracket() {
+        let cmds = parse(r#"set x [string length {]}]"#).unwrap();
+        match &cmds[0].words[2] {
+            Word::CommandSub(cmd) => assert_eq!(cmd, "string length {]}"),
+            w => panic!("expected cmd_sub, got {:?}", w),
+        }
+    }
+
+    /// parse-1.9: Backslash newline (line continuation)
+    #[test]
+    fn test_parse_1_9_backslash_newline() {
+        let cmds = parse("set x 123;\\\nset y 456").unwrap();
+        // `set x 123` ; `\ + newline` is line continuation → `set y 456`
+        assert!(cmds.len() >= 2, "should have at least 2 commands, got {:?}", cmds);
+    }
+
+    /// parse-1.10: Backslash newline in quotes → space
+    #[test]
+    fn test_parse_1_10_backslash_newline_in_quotes() {
+        let cmds = parse("set x \"abc\\\ndef\"").unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "abc def"),
+            Word::Concat(parts) => {
+                let text: String = parts.iter().map(|p| match p {
+                    Word::Literal(s) => s.as_str(),
+                    _ => "",
+                }).collect();
+                assert_eq!(text, "abc def");
+            }
+            w => panic!("expected literal 'abc def', got {:?}", w),
+        }
+    }
+
+    /// parse-1.17: Command and var in quotes
+    #[test]
+    fn test_parse_1_17_cmd_var_in_quotes() {
+        let cmds = parse(r#"set x "[set z 2][set y]""#).unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[0], Word::CommandSub(_)));
+                assert!(matches!(&parts[1], Word::CommandSub(_)));
+            }
+            w => panic!("expected concat with 2 cmd subs, got {:?}", w),
+        }
+    }
+
+    /// parse-1.18: Command and var in bare context
+    #[test]
+    fn test_parse_1_18_cmd_var_bare() {
+        let cmds = parse("set x [set z 2][set y]").unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[0], Word::CommandSub(_)));
+                assert!(matches!(&parts[1], Word::CommandSub(_)));
+            }
+            w => panic!("expected concat with 2 cmd subs, got {:?}", w),
+        }
+    }
+
+    /// parse-1.19: Lone dollar sign in quotes `"6$[set y]"` → `6$1`
+    #[test]
+    fn test_parse_1_19_orphan_dollar_in_quotes() {
+        let cmds = parse(r#"set x "6$[set y]""#).unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                // Should be: Literal("6$") or Literal("6") + Literal("$") + CommandSub("set y")
+                let has_dollar = parts.iter().any(|p| match p {
+                    Word::Literal(s) => s.contains('$'),
+                    _ => false,
+                });
+                let has_cmd = parts.iter().any(|p| matches!(p, Word::CommandSub(_)));
+                assert!(has_dollar, "should contain literal $, got {:?}", parts);
+                assert!(has_cmd, "should contain cmd sub, got {:?}", parts);
+            }
+            w => panic!("expected concat, got {:?}", w),
+        }
+    }
+
+    /// parse-1.20: Lone dollar sign in bare context `6$[set y]`
+    #[test]
+    fn test_parse_1_20_orphan_dollar_bare() {
+        let cmds = parse("set x 6$[set y]").unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                let has_dollar = parts.iter().any(|p| match p {
+                    Word::Literal(s) => s.contains('$'),
+                    _ => false,
+                });
+                let has_cmd = parts.iter().any(|p| matches!(p, Word::CommandSub(_)));
+                assert!(has_dollar, "should contain literal $, got {:?}", parts);
+                assert!(has_cmd, "should contain cmd sub, got {:?}", parts);
+            }
+            w => panic!("expected concat, got {:?}", w),
+        }
+    }
+
+    /// parse-1.21: Comment handling
+    #[test]
+    fn test_parse_1_21_comment() {
+        let src = "set y 1\n# A comment on a line\nset x 2";
+        let cmds = parse(src).unwrap();
+        assert_eq!(cmds.len(), 2, "comment should not be a command: {:?}", cmds);
+    }
+
+    /// parse-1.22: # char in non-command position  
+    #[test]
+    fn test_parse_1_22_hash_in_word() {
+        let cmds = parse("append y #").unwrap();
+        assert_eq!(cmds[0].words.len(), 3, "# should be a word, not a comment: {:?}", cmds);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "#"),
+            w => panic!("expected literal '#', got {:?}", w),
+        }
+    }
+
+    /// parse-1.23: newline in command substitution
+    #[test]
+    fn test_parse_1_23_newline_in_cmd_sub() {
+        let cmds = parse("set x [incr y\nincr z]").unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::CommandSub(cmd) => {
+                assert!(cmd.contains("incr y") && cmd.contains("incr z"),
+                    "cmd sub should contain both commands: {:?}", cmd);
+            }
+            w => panic!("expected cmd_sub, got {:?}", w),
+        }
+    }
+
+    /// parse-1.24: semicolon in command substitution
+    #[test]
+    fn test_parse_1_24_semicolon_in_cmd_sub() {
+        let cmds = parse("set x [list a; list b c; list d e f]").unwrap();
+        match &cmds[0].words[2] {
+            Word::CommandSub(cmd) => {
+                assert!(cmd.contains("list a") && cmd.contains("list d e f"),
+                    "cmd sub should contain commands: {:?}", cmd);
+            }
+            w => panic!("expected cmd_sub, got {:?}", w),
+        }
+    }
+
+    /// parse-1.26: newline in braced var name
+    #[test]
+    fn test_parse_1_26_newline_in_braced_var() {
+        let cmds = parse("set x ${a\nb}").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => assert_eq!(name, "a\nb"),
+            w => panic!("expected var_ref 'a\\nb', got {:?}", w),
+        }
+    }
+
+    /// parse-1.31: Backslash newline in bare context
+    #[test]
+    fn test_parse_1_31_backslash_newline_bare() {
+        let cmds = parse("list abc\\\n\t123").unwrap();
+        // `abc\<newline>\t123` → `abc` is first word with escape producing space,
+        // then `123` could be part of same word or next word depending on parsing
+        assert!(!cmds.is_empty());
+    }
+
+    /// parse-1.33: Upper case hex escapes
+    #[test]
+    fn test_parse_1_33_hex_escapes() {
+        let cmds = parse("list \\x4A \\x4F \\x3C").unwrap();
+        match &cmds[0].words[1] {
+            Word::Literal(s) => assert_eq!(s, "J"),
+            w => panic!("expected 'J', got {:?}", w),
+        }
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "O"),
+            w => panic!("expected 'O', got {:?}", w),
+        }
+        match &cmds[0].words[3] {
+            Word::Literal(s) => assert_eq!(s, "<"),
+            w => panic!("expected '<', got {:?}", w),
+        }
+    }
+
+    /// parse-1.34: Octal escapes
+    #[test]
+    fn test_parse_1_34_octal_escapes() {
+        let cmds = parse("list \\112 \\117 \\074").unwrap();
+        match &cmds[0].words[1] {
+            Word::Literal(s) => assert_eq!(s, "J"),
+            w => panic!("expected 'J', got {:?}", w),
+        }
+    }
+
+    /// parse-1.35: Invalid hex escape
+    #[test]
+    fn test_parse_1_35_invalid_hex_escape() {
+        let cmds = parse("list \\xZZ").unwrap();
+        match &cmds[0].words[1] {
+            Word::Literal(s) => assert_eq!(s, "xZZ"),
+            w => panic!("expected 'xZZ', got {:?}", w),
+        }
+    }
+
+    /// parse-1.38: Invalid unicode escape
+    #[test]
+    fn test_parse_1_38_invalid_unicode_escape() {
+        let cmds = parse("list \\ux").unwrap();
+        match &cmds[0].words[1] {
+            Word::Literal(s) => assert_eq!(s, "ux"),
+            w => panic!("expected 'ux', got {:?}", w),
+        }
+    }
+
+    /// parse-1.39: Octal escape followed by invalid
+    #[test]
+    fn test_parse_1_39_octal_then_char() {
+        let cmds = parse("list \\76x").unwrap();
+        match &cmds[0].words[1] {
+            Word::Literal(s) => assert_eq!(s, ">x"),
+            w => panic!("expected '>x', got {:?}", w),
+        }
+    }
+
+    /// parse-1.47-1.50: Backslash newline in quotes with whitespace
+    #[test]
+    fn test_parse_1_47_backslash_newline_in_quotes_spaces() {
+        let cmds = parse("set x \"abc\\\n      def\"").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "abc def"),
+            Word::Concat(parts) => {
+                let text: String = parts.iter().map(|p| match p {
+                    Word::Literal(s) => s.as_str(),
+                    _ => "",
+                }).collect();
+                assert_eq!(text, "abc def");
+            }
+            w => panic!("expected 'abc def', got {:?}", w),
+        }
+    }
+
+    /// parse-1.62: Quoted orphan dollar sign at end `"x$"`
+    #[test]
+    fn test_parse_1_62_quoted_orphan_dollar_end() {
+        let cmds = parse(r#"set x "x$""#).unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                // "x" + "$"
+                let text: String = parts.iter().map(|p| match p {
+                    Word::Literal(s) => s.as_str(),
+                    _ => "",
+                }).collect();
+                assert_eq!(text, "x$");
+            }
+            Word::Literal(s) => assert_eq!(s, "x$"),
+            w => panic!("expected 'x$', got {:?}", w),
+        }
+    }
+
+    /// parse-1.63: Unquoted orphan dollar sign at end `x$`
+    #[test]
+    fn test_parse_1_63_unquoted_orphan_dollar_end() {
+        let cmds = parse("set x x$").unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                let text: String = parts.iter().map(|p| match p {
+                    Word::Literal(s) => s.as_str(),
+                    _ => "",
+                }).collect();
+                assert_eq!(text, "x$");
+            }
+            Word::Literal(s) => assert_eq!(s, "x$"),
+            w => panic!("expected 'x$', got {:?}", w),
+        }
+    }
+
+    /// parse-1.64: Backslash in comment (line continuation)
+    #[test]
+    fn test_parse_1_64_backslash_in_comment() {
+        let src = "set x 0\n# comment \\\nincr x\nincr x";
+        let cmds = parse(src).unwrap();
+        // The `\` at end of comment continues the comment to next line
+        // So `incr x` after `\<newline>` is part of the comment
+        // Only the second `incr x` is a real command
+        // Commands: set x 0, incr x (the second one)
+        assert_eq!(cmds.len(), 2, "backslash-newline should continue comment: {:?}", cmds);
+    }
+
+    /// parse-1.65: Double backslash in comment (NOT line continuation)
+    #[test]
+    fn test_parse_1_65_double_backslash_in_comment() {
+        let src = "set x 0\n# comment \\\\\nincr x\nincr x";
+        let cmds = parse(src).unwrap();
+        // `\\` means escaped backslash, so newline ends the comment
+        // Both `incr x` lines are commands
+        // Commands: set x 0, incr x, incr x
+        assert_eq!(cmds.len(), 3, "double backslash should not continue comment: {:?}", cmds);
+    }
+
+    /// Inline comment after semicolon
+    #[test]
+    fn test_inline_comment_after_semicolon() {
+        let src = "set x 1 ;# this is a comment\nset y 2";
+        let cmds = parse(src).unwrap();
+        assert_eq!(cmds.len(), 2, "inline comment should be ignored: {:?}", cmds);
+    }
+
+    /// parse-1.8: Dict/array sugar with command sub in index
+    #[test]
+    fn test_parse_1_8_cmd_sub_in_array_index() {
+        let cmds = parse("set x $a([set y b])").unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => {
+                assert!(name.starts_with("a("), "var name should start with 'a(': {}", name);
+                assert!(name.contains("[set y b]"), "index should contain cmd sub text: {}", name);
+            }
+            w => panic!("expected var_ref with array index, got {:?}", w),
+        }
+    }
+
+    /// parse-1.27: Backslash escape in array index
+    #[test]
+    fn test_parse_1_27_escape_in_array_index() {
+        let cmds = parse("set x $a(b\\x55d)").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => {
+                assert!(name.starts_with("a("), "should be array access: {}", name);
+            }
+            w => panic!("expected var_ref, got {:?}", w),
+        }
+    }
+
+    /// parse-1.28: Nested dict sugar
+    #[test]
+    fn test_parse_1_28_nested_dict_sugar() {
+        let cmds = parse("set x $b($a(V))").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => {
+                assert!(name.starts_with("b("), "should be array access on b: {}", name);
+                assert!(name.contains("$a(V)") || name.contains("a(V)"),
+                    "should contain nested access: {}", name);
+            }
+            w => panic!("expected var_ref, got {:?}", w),
+        }
+    }
+
+    /// Standalone $ as a word
+    #[test]
+    fn test_standalone_dollar() {
+        let cmds = parse("puts $").unwrap();
+        assert_eq!(cmds[0].words.len(), 2);
+        match &cmds[0].words[1] {
+            Word::Literal(s) => assert_eq!(s, "$"),
+            w => panic!("expected literal '$', got {:?}", w),
+        }
+    }
+
+    /// $$ (two orphan dollars)
+    #[test]
+    fn test_double_dollar() {
+        let cmds = parse("puts $$").unwrap();
+        assert_eq!(cmds[0].words.len(), 2);
+        match &cmds[0].words[1] {
+            Word::Concat(parts) => {
+                let text: String = parts.iter().map(|p| match p {
+                    Word::Literal(s) => s.as_str(),
+                    _ => "",
+                }).collect();
+                assert_eq!(text, "$$");
+            }
+            w => panic!("expected '$$', got {:?}", w),
+        }
+    }
+
+    /// Composite: namespace qualified variable
+    #[test]
+    fn test_namespace_var() {
+        let cmds = parse("puts $::foo::bar").unwrap();
+        match &cmds[0].words[1] {
+            Word::VarRef(name) => assert_eq!(name, "::foo::bar"),
+            w => panic!("expected var_ref '::foo::bar', got {:?}", w),
         }
     }
 }

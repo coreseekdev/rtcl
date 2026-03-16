@@ -4,12 +4,15 @@
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\x0c" }
 NEWLINE = _{ "\n" }
-COMMENT = _{ "#" ~ (!NEWLINE ~ ANY)* }
+
+// Comment: # at command position, with backslash-newline continuation
+// (In Tcl, # only starts a comment at the beginning of a command)
+comment = _{ "#" ~ ("\\" ~ ANY | !"\\" ~ !NEWLINE ~ ANY)* }
 
 // Program is a sequence of commands separated by newlines or semicolons
 program = _{ SOI ~ script ~ EOI }
 script = _{ command_or_sep* }
-command_or_sep = _{ command | separator }
+command_or_sep = _{ comment | command | separator }
 separator = _{ (NEWLINE | ";")+ }
 
 // A command is words separated by whitespace
@@ -30,6 +33,7 @@ word = {
     composite |    // mixed: $a-$b, foo${x}bar, etc.
     var_ref |      // $var or ${var}
     cmd_sub |      // [cmd...]
+    orphan_dollar | // lone $ not followed by valid var chars
     bare           // bare word
 }
 
@@ -40,7 +44,7 @@ composite = ${
     composite_part ~ composite_part+
 }
 composite_part = _{
-    var_ref | cmd_sub | bare
+    var_ref | cmd_sub | orphan_dollar | bare
 }
 
 // Expand syntax: {*}word - jimtcl's argument expansion
@@ -68,6 +72,7 @@ quoted_content = _{
     var_ref |          // $var or ${var}
     cmd_sub |          // [cmd]
     escape |           // Escape sequences
+    orphan_dollar |    // Lone $ not followed by valid var chars
     quoted_char        // Regular character
 }
 quoted_char = @{
@@ -88,7 +93,7 @@ var_ref = {
 }
 // Braced variable name can contain almost any character except }
 // Also tracks newlines for line counting
-braced_var_name = _{
+braced_var_name = @{
     braced_var_name_char+
 }
 braced_var_name_char = _{
@@ -114,7 +119,8 @@ UnicodeChar = _{
 }
 // Array index with nested parentheses and escape support
 // Reference: jimtcl JimParseVar - supports backslash escapes in index
-index = _{ "(" ~ index_content* ~ ")" }
+// Atomic to prevent WHITESPACE skipping inside index text
+index = @{ "(" ~ index_content* ~ ")" }
 index_content = _{
     index |              // Nested parentheses
     index_escape |       // Backslash escape
@@ -151,13 +157,18 @@ cmd_char = _{
     (!"[") ~ (!"]") ~ (!"{") ~ (!"}") ~ (!"\"") ~ ANY
 }
 
+// Orphan dollar sign - $ not followed by valid variable name chars
+// In jimtcl, a lone $ is treated as a literal character
+// This rule is tried AFTER var_ref, so it only matches when var_ref fails
+orphan_dollar = @{ "$" }
+
 // Bare word - no special starting characters, handles escapes
 // Reference: jimtcl JimParseStr
 bare = @{
     (escape | bare_char)+
 }
 bare_char = _{
-    !WHITESPACE ~ !NEWLINE ~ !";" ~ !"}" ~ !"{" ~ !"$" ~ !"[" ~ !"\\" ~ !"#" ~ ANY
+    !WHITESPACE ~ !NEWLINE ~ !";" ~ !"}" ~ !"{" ~ !"$" ~ !"[" ~ !"\\" ~ ANY
 }
 
 // Escape sequences

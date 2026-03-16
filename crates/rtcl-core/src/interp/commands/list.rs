@@ -1,8 +1,9 @@
 //! List commands: list, llength, lindex, lappend, lrange, lsearch, lsort,
-//! linsert, lreplace, lassign, lrepeat, lreverse, concat, split, join.
+//! linsert, lreplace, lassign, lrepeat, lreverse, concat, split, join, lmap.
 
 use crate::error::{Error, Result};
 use crate::interp::{glob_match, Interp};
+use crate::types::parse_index;
 use crate::value::Value;
 
 pub fn cmd_list(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -22,11 +23,10 @@ pub fn cmd_lindex(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args("lindex", 3, args.len()));
     }
     let list = args[1].as_list().unwrap_or_default();
-    let idx: usize = args[2].as_int().unwrap_or(-1) as usize;
-    if idx < list.len() {
-        Ok(list[idx].clone())
-    } else {
-        Ok(Value::empty())
+    let idx = parse_index(args[2].as_str(), list.len());
+    match idx {
+        Some(i) if i < list.len() => Ok(list[i].clone()),
+        _ => Ok(Value::empty()),
     }
 }
 
@@ -52,20 +52,8 @@ pub fn cmd_lrange(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args_with_usage("lrange", 4, args.len(), "list first last"));
     }
     let list = args[1].as_list().unwrap_or_default();
-    let first = args[2].as_int().unwrap_or(0) as usize;
-    let last = args[3].as_str();
-
-    let end = if last == "end" {
-        list.len().saturating_sub(1)
-    } else if last.starts_with("end-") {
-        let offset: usize = last[4..].parse().unwrap_or(0);
-        list.len().saturating_sub(1 + offset)
-    } else if last.starts_with("end+") {
-        let offset: usize = last[4..].parse().unwrap_or(0);
-        (list.len().saturating_sub(1)).saturating_add(offset).min(list.len().saturating_sub(1))
-    } else {
-        last.parse::<usize>().unwrap_or(0)
-    };
+    let first = parse_index(args[2].as_str(), list.len()).unwrap_or(0);
+    let end = parse_index(args[3].as_str(), list.len()).unwrap_or(0);
 
     if first <= end && first < list.len() {
         let result: Vec<Value> = list[first..=end.min(list.len() - 1)].to_vec();
@@ -180,7 +168,7 @@ pub fn cmd_linsert(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args_with_usage("linsert", 3, args.len(), "list index ?element ...?"));
     }
     let list = args[1].as_list().unwrap_or_default();
-    let index = args[2].as_int().unwrap_or(0) as usize;
+    let index = parse_index(args[2].as_str(), list.len()).unwrap_or(list.len());
     let index = index.min(list.len());
     let elements: Vec<Value> = args[3..].to_vec();
     let mut result = Vec::with_capacity(list.len() + elements.len());
@@ -195,20 +183,8 @@ pub fn cmd_lreplace(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args_with_usage("lreplace", 4, args.len(), "list first last ?element ...?"));
     }
     let list = args[1].as_list().unwrap_or_default();
-    let first = args[2].as_int().unwrap_or(0) as usize;
-    let last_str = args[3].as_str();
-
-    let last = if last_str == "end" {
-        list.len().saturating_sub(1)
-    } else if last_str.starts_with("end-") {
-        let offset: usize = last_str[4..].parse().unwrap_or(0);
-        list.len().saturating_sub(1 + offset)
-    } else {
-        last_str.parse::<usize>().unwrap_or(0)
-    };
-
-    let first = first.min(list.len());
-    let last = last.min(list.len().saturating_sub(1));
+    let first = parse_index(args[2].as_str(), list.len()).unwrap_or(0).min(list.len());
+    let last = parse_index(args[3].as_str(), list.len()).unwrap_or(0).min(list.len().saturating_sub(1));
 
     let mut result = Vec::with_capacity(list.len());
     result.extend(list[..first].iter().cloned());
@@ -301,4 +277,61 @@ pub fn cmd_join(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let sep = if args.len() == 3 { args[2].as_str() } else { " " };
     let result: String = list.iter().map(|v| v.as_str()).collect::<Vec<&str>>().join(sep);
     Ok(Value::from_str(&result))
+}
+
+/// lmap — Like foreach but collects body results into a list.
+/// Usage: lmap varList list ?varList list ...? body
+pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 4 || args.len() % 2 != 0 {
+        return Err(Error::wrong_args_with_usage(
+            "lmap", 4, args.len(),
+            "varList list ?varList list ...? body",
+        ));
+    }
+
+    let body = args[args.len() - 1].as_str();
+    let mut collected: Vec<Value> = Vec::new();
+
+    struct VarGroup {
+        vars: Vec<String>,
+        data: Vec<Value>,
+    }
+    let mut groups: Vec<VarGroup> = Vec::new();
+    let mut i = 1;
+    while i < args.len() - 1 {
+        let var_list = args[i].as_list().unwrap_or_else(|| vec![args[i].clone()]);
+        let vars: Vec<String> = var_list.iter().map(|v| v.as_str().to_string()).collect();
+        let data = args[i + 1].as_list().unwrap_or_default();
+        groups.push(VarGroup { vars, data });
+        i += 2;
+    }
+
+    let max_iters = groups.iter()
+        .map(|g| {
+            let n = g.vars.len().max(1);
+            (g.data.len() + n - 1) / n
+        })
+        .max()
+        .unwrap_or(0);
+
+    for idx in 0..max_iters {
+        for g in &groups {
+            let n = g.vars.len();
+            for (vi, var) in g.vars.iter().enumerate() {
+                let data_idx = idx * n + vi;
+                let value = g.data.get(data_idx).cloned().unwrap_or_else(Value::empty);
+                interp.set_var(var, value)?;
+            }
+        }
+        match interp.eval(body) {
+            Ok(v) => collected.push(v),
+            Err(e) => {
+                if e.is_break() { break; }
+                if e.is_continue() { continue; }
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(Value::from_list(&collected))
 }

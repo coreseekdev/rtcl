@@ -19,6 +19,7 @@ command = { word+ }
 // - expand: {*}word - expands the word as multiple arguments (jimtcl feature)
 // - braced: {text} - no substitution inside, handles nested braces
 // - quoted: "text" - $ and [] substitution inside
+// - composite: mixed bare text with $var and [cmd] substitution
 // - var_ref: $var or ${var} or $var(index)
 // - cmd_sub: [cmd...]
 // - bare: bare word with escape handling
@@ -26,9 +27,20 @@ word = {
     expand |       // {*} expand syntax
     braced |       // {text} - no substitution inside
     quoted |       // "text" - $ and [] substitution inside
+    composite |    // mixed: $a-$b, foo${x}bar, etc.
     var_ref |      // $var or ${var}
     cmd_sub |      // [cmd...]
     bare           // bare word
+}
+
+// Composite word: bare text mixed with variable/command substitution.
+// Must have at least 2 parts (otherwise it's just a var_ref, cmd_sub, or bare).
+// Compound-atomic ($) to prevent implicit WHITESPACE consumption between parts.
+composite = ${
+    composite_part ~ composite_part+
+}
+composite_part = _{
+    var_ref | cmd_sub | bare
 }
 
 // Expand syntax: {*}word - jimtcl's argument expansion
@@ -51,15 +63,15 @@ braced_escape = _{ "\\" ~ NEWLINE ~ WHITESPACE* }
 
 // Quoted string - allows substitution
 // Reference: jimtcl JimParseQuote / JimParseSubQuote
-quoted = { "\"" ~ quoted_content* ~ "\"" }
+quoted = ${ "\"" ~ quoted_content* ~ "\"" }
 quoted_content = _{
     var_ref |          // $var or ${var}
     cmd_sub |          // [cmd]
     escape |           // Escape sequences
     quoted_char        // Regular character
 }
-quoted_char = _{
-    (!"\"") ~ (!"$") ~ (!"[") ~ (!"\\") ~ ANY
+quoted_char = @{
+    ((!"\"") ~ (!"$") ~ (!"[") ~ (!"\\") ~ ANY)+
 }
 
 // Variable reference

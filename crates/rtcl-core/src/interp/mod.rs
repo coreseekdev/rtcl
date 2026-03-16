@@ -106,6 +106,7 @@ impl Interp {
         self.register_builtin("concat", list::cmd_concat);
         self.register_builtin("split", list::cmd_split);
         self.register_builtin("join", list::cmd_join);
+        self.register_builtin("lmap", list::cmd_lmap);
 
         // Misc
         self.register_builtin("append", misc::cmd_append);

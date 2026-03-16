@@ -176,6 +176,16 @@ fn parse_word(pair: Pair<Rule>) -> Option<Word> {
                 Some(Word::Concat(parts))
             }
         }
+        Rule::composite => {
+            let parts = parse_composite(inner);
+            if parts.is_empty() {
+                Some(Word::Literal(String::new()))
+            } else if parts.len() == 1 {
+                parts.into_iter().next()
+            } else {
+                Some(Word::Concat(parts))
+            }
+        }
         Rule::var_ref => {
             let name = extract_var_name(inner);
             Some(Word::VarRef(name))
@@ -201,6 +211,26 @@ fn parse_expand(pair: Pair<Rule>) -> Option<Word> {
         }
     }
     None
+}
+
+/// Parse a composite word (mixed bare text + var_ref + cmd_sub).
+fn parse_composite(pair: Pair<Rule>) -> Vec<Word> {
+    let mut parts = Vec::new();
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::var_ref => {
+                parts.push(Word::VarRef(extract_var_name(inner)));
+            }
+            Rule::cmd_sub => {
+                parts.push(Word::CommandSub(extract_cmd_sub_str(inner)));
+            }
+            Rule::bare => {
+                parts.push(Word::Literal(process_bare(inner.as_str())));
+            }
+            _ => {}
+        }
+    }
+    parts
 }
 
 /// Extract braced content by using `pair.as_str()` and stripping the outer

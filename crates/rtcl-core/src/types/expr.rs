@@ -1,6 +1,10 @@
 //! Tcl expression evaluator
 //!
-//! Supports arithmetic, comparison, and logical operations
+//! Supports arithmetic, comparison, logical, bitwise, ternary, and string operations.
+//! Operator precedence (lowest to highest):
+//!   ternary `?:`, `||`, `&&`, `|`, `^`, `&`,
+//!   `==` `!=` `eq` `ne` `in` `ni`, `<` `<=` `>` `>=`, `<<` `>>`,
+//!   `+` `-`, `*` `/` `%`, `**`, unary `- + ! ~`
 
 use crate::error::{Error, Result};
 use crate::interp::Interp;
@@ -9,7 +13,8 @@ use crate::value::Value;
 /// Evaluate a Tcl expression
 pub fn eval_expr(interp: &mut Interp, expr: &str) -> Result<Value> {
     let mut parser = ExprParser::new(expr, interp);
-    parser.parse_or()
+    let result = parser.parse_ternary()?;
+    Ok(result)
 }
 
 /// Expression parser
@@ -28,40 +33,144 @@ impl<'a> ExprParser<'a> {
         }
     }
 
-    /// Parse or expression (lowest precedence)
+    /// Ternary `?:` — lowest precedence
+    fn parse_ternary(&mut self) -> Result<Value> {
+        let cond = self.parse_or()?;
+        self.skip_whitespace();
+        if self.match_op("?") {
+            let then_val = self.parse_ternary()?;
+            self.expect(":")?;
+            let else_val = self.parse_ternary()?;
+            if cond.is_true() {
+                Ok(then_val)
+            } else {
+                Ok(else_val)
+            }
+        } else {
+            Ok(cond)
+        }
+    }
+
+    /// Logical OR `||`
     fn parse_or(&mut self) -> Result<Value> {
         let mut left = self.parse_and()?;
-
         while self.match_op("||") {
             let right = self.parse_and()?;
             left = Value::from_bool(left.is_true() || right.is_true());
         }
-
         Ok(left)
     }
 
-    /// Parse and expression
+    /// Logical AND `&&`
     fn parse_and(&mut self) -> Result<Value> {
-        let mut left = self.parse_comparison()?;
-
+        let mut left = self.parse_bitor()?;
         while self.match_op("&&") {
-            let right = self.parse_comparison()?;
+            let right = self.parse_bitor()?;
             left = Value::from_bool(left.is_true() && right.is_true());
         }
-
         Ok(left)
     }
 
-    /// Parse comparison expression
-    fn parse_comparison(&mut self) -> Result<Value> {
-        let mut left = self.parse_additive()?;
-
+    /// Bitwise OR `|`
+    fn parse_bitor(&mut self) -> Result<Value> {
+        let mut left = self.parse_bitxor()?;
         loop {
-            let op = if self.match_op("==") {
-                "=="
+            self.skip_whitespace();
+            // Match `|` but not `||`
+            if self.peek() == '|' && self.peek_at(1) != '|' {
+                self.advance();
+                let right = self.parse_bitxor()?;
+                let a = self.as_int_val(&left)?;
+                let b = self.as_int_val(&right)?;
+                left = Value::from_int(a | b);
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    /// Bitwise XOR `^`
+    fn parse_bitxor(&mut self) -> Result<Value> {
+        let mut left = self.parse_bitand()?;
+        loop {
+            self.skip_whitespace();
+            if self.peek() == '^' {
+                self.advance();
+                let right = self.parse_bitand()?;
+                let a = self.as_int_val(&left)?;
+                let b = self.as_int_val(&right)?;
+                left = Value::from_int(a ^ b);
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    /// Bitwise AND `&`
+    fn parse_bitand(&mut self) -> Result<Value> {
+        let mut left = self.parse_equality()?;
+        loop {
+            self.skip_whitespace();
+            // Match `&` but not `&&`
+            if self.peek() == '&' && self.peek_at(1) != '&' {
+                self.advance();
+                let right = self.parse_equality()?;
+                let a = self.as_int_val(&left)?;
+                let b = self.as_int_val(&right)?;
+                left = Value::from_int(a & b);
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    /// Equality: `==`, `!=`, `eq`, `ne`, `in`, `ni`
+    fn parse_equality(&mut self) -> Result<Value> {
+        let mut left = self.parse_relational()?;
+        loop {
+            if self.match_op("==") {
+                let right = self.parse_relational()?;
+                left = match (left.as_float(), right.as_float()) {
+                    (Some(a), Some(b)) => Value::from_bool((a - b).abs() < f64::EPSILON),
+                    _ => Value::from_bool(left.as_str() == right.as_str()),
+                };
             } else if self.match_op("!=") {
-                "!="
-            } else if self.match_op("<=") {
+                let right = self.parse_relational()?;
+                left = match (left.as_float(), right.as_float()) {
+                    (Some(a), Some(b)) => Value::from_bool((a - b).abs() >= f64::EPSILON),
+                    _ => Value::from_bool(left.as_str() != right.as_str()),
+                };
+            } else if self.match_word_op("eq") {
+                let right = self.parse_relational()?;
+                left = Value::from_bool(left.as_str() == right.as_str());
+            } else if self.match_word_op("ne") {
+                let right = self.parse_relational()?;
+                left = Value::from_bool(left.as_str() != right.as_str());
+            } else if self.match_word_op("in") {
+                let right = self.parse_relational()?;
+                let items = right.as_list().unwrap_or_default();
+                let found = items.iter().any(|v| v.as_str() == left.as_str());
+                left = Value::from_bool(found);
+            } else if self.match_word_op("ni") {
+                let right = self.parse_relational()?;
+                let items = right.as_list().unwrap_or_default();
+                let found = items.iter().any(|v| v.as_str() == left.as_str());
+                left = Value::from_bool(!found);
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    /// Relational: `<`, `<=`, `>`, `>=`
+    fn parse_relational(&mut self) -> Result<Value> {
+        let mut left = self.parse_shift()?;
+        loop {
+            let op = if self.match_op("<=") {
                 "<="
             } else if self.match_op(">=") {
                 ">="
@@ -69,163 +178,164 @@ impl<'a> ExprParser<'a> {
                 "<"
             } else if self.match_op(">") {
                 ">"
-            } else if self.match_op("eq") {
-                "eq"
-            } else if self.match_op("ne") {
-                "ne"
             } else {
                 break;
             };
-
-            let right = self.parse_additive()?;
-
-            left = match op {
-                "==" => {
-                    // Try numeric comparison first
-                    match (left.as_float(), right.as_float()) {
-                        (Some(a), Some(b)) => Value::from_bool((a - b).abs() < f64::EPSILON),
-                        _ => Value::from_bool(left.as_str() == right.as_str()),
-                    }
-                }
-                "!=" => {
-                    match (left.as_float(), right.as_float()) {
-                        (Some(a), Some(b)) => Value::from_bool((a - b).abs() >= f64::EPSILON),
-                        _ => Value::from_bool(left.as_str() != right.as_str()),
-                    }
-                }
-                "<=" => {
-                    match (left.as_float(), right.as_float()) {
-                        (Some(a), Some(b)) => Value::from_bool(a <= b),
-                        _ => Value::from_bool(left.as_str() <= right.as_str()),
-                    }
-                }
-                ">=" => {
-                    match (left.as_float(), right.as_float()) {
-                        (Some(a), Some(b)) => Value::from_bool(a >= b),
-                        _ => Value::from_bool(left.as_str() >= right.as_str()),
-                    }
-                }
-                "<" => {
-                    match (left.as_float(), right.as_float()) {
-                        (Some(a), Some(b)) => Value::from_bool(a < b),
-                        _ => Value::from_bool(left.as_str() < right.as_str()),
-                    }
-                }
-                ">" => {
-                    match (left.as_float(), right.as_float()) {
-                        (Some(a), Some(b)) => Value::from_bool(a > b),
-                        _ => Value::from_bool(left.as_str() > right.as_str()),
-                    }
-                }
-                "eq" => Value::from_bool(left.as_str() == right.as_str()),
-                "ne" => Value::from_bool(left.as_str() != right.as_str()),
-                _ => break,
+            let right = self.parse_shift()?;
+            left = match (left.as_float(), right.as_float()) {
+                (Some(a), Some(b)) => Value::from_bool(match op {
+                    "<" => a < b,
+                    ">" => a > b,
+                    "<=" => a <= b,
+                    ">=" => a >= b,
+                    _ => false,
+                }),
+                _ => Value::from_bool(match op {
+                    "<" => left.as_str() < right.as_str(),
+                    ">" => left.as_str() > right.as_str(),
+                    "<=" => left.as_str() <= right.as_str(),
+                    ">=" => left.as_str() >= right.as_str(),
+                    _ => false,
+                }),
             };
         }
-
         Ok(left)
     }
 
-    /// Parse additive expression (+, -)
+    /// Shift: `<<`, `>>`
+    fn parse_shift(&mut self) -> Result<Value> {
+        let mut left = self.parse_additive()?;
+        loop {
+            if self.match_op("<<") {
+                let right = self.parse_additive()?;
+                let a = self.as_int_val(&left)?;
+                let b = self.as_int_val(&right)?;
+                left = Value::from_int(a << (b & 63));
+            } else if self.match_op(">>") {
+                let right = self.parse_additive()?;
+                let a = self.as_int_val(&left)?;
+                let b = self.as_int_val(&right)?;
+                left = Value::from_int(a >> (b & 63));
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    /// Additive: `+`, `-`
     fn parse_additive(&mut self) -> Result<Value> {
         let mut left = self.parse_multiplicative()?;
-
         loop {
-            let op = if self.match_op("+") {
-                '+'
-            } else if self.match_op("-") {
-                '-'
+            self.skip_whitespace();
+            if self.peek() == '+' {
+                self.advance();
+                let right = self.parse_multiplicative()?;
+                left = self.numeric_binop(&left, &right, '+' )?;
+            } else if self.peek() == '-' {
+                // Distinguish unary minus from binary minus.
+                // Binary minus: there must have been a value on the left.
+                self.advance();
+                let right = self.parse_multiplicative()?;
+                left = self.numeric_binop(&left, &right, '-')?;
             } else {
                 break;
-            };
-
-            let right = self.parse_multiplicative()?;
-
-            left = match (left.as_float(), right.as_float()) {
-                (Some(a), Some(b)) => {
-                    let result = if op == '+' { a + b } else { a - b };
-                    if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
-                        Value::from_int(result as i64)
-                    } else {
-                        Value::from_float(result)
-                    }
-                }
-                _ => {
-                    return Err(Error::type_mismatch("number", "non-numeric value"));
-                }
-            };
+            }
         }
-
         Ok(left)
     }
 
-    /// Parse multiplicative expression (*, /, %)
+    /// Multiplicative: `*`, `/`, `%`
     fn parse_multiplicative(&mut self) -> Result<Value> {
-        let mut left = self.parse_unary()?;
-
+        let mut left = self.parse_power()?;
         loop {
-            let op = if self.match_op("*") {
-                '*'
-            } else if self.match_op("/") {
-                '/'
-            } else if self.match_op("%") {
-                '%'
+            self.skip_whitespace();
+            if self.peek() == '*' && self.peek_at(1) != '*' {
+                self.advance();
+                let right = self.parse_power()?;
+                left = self.numeric_binop(&left, &right, '*')?;
+            } else if self.peek() == '/' {
+                self.advance();
+                let right = self.parse_power()?;
+                match (left.as_float(), right.as_float()) {
+                    (Some(_), Some(b)) if b == 0.0 => return Err(Error::DivisionByZero),
+                    _ => {}
+                }
+                left = self.numeric_binop(&left, &right, '/')?;
+            } else if self.peek() == '%' {
+                self.advance();
+                let right = self.parse_power()?;
+                let a = self.as_int_val(&left)?;
+                let b = self.as_int_val(&right)?;
+                if b == 0 { return Err(Error::DivisionByZero); }
+                left = Value::from_int(a % b);
             } else {
                 break;
-            };
-
-            let right = self.parse_unary()?;
-
-            left = match (left.as_float(), right.as_float()) {
-                (Some(a), Some(b)) => {
-                    if b == 0.0 {
-                        return Err(Error::DivisionByZero);
-                    }
-                    let result = match op {
-                        '*' => a * b,
-                        '/' => a / b,
-                        '%' => (a as i64 % b as i64) as f64,
-                        _ => break,
-                    };
-                    if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
-                        Value::from_int(result as i64)
-                    } else {
-                        Value::from_float(result)
-                    }
-                }
-                _ => {
-                    return Err(Error::type_mismatch("number", "non-numeric value"));
-                }
-            };
+            }
         }
-
         Ok(left)
     }
 
-    /// Parse unary expression (!, -, +)
+    /// Power: `**` (right-associative)
+    fn parse_power(&mut self) -> Result<Value> {
+        let base = self.parse_unary()?;
+        if self.match_op("**") {
+            let exp = self.parse_power()?; // right-associative: recurse
+            match (base.as_float(), exp.as_float()) {
+                (Some(a), Some(b)) => {
+                    let result = a.powf(b);
+                    if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
+                        Ok(Value::from_int(result as i64))
+                    } else {
+                        Ok(Value::from_float(result))
+                    }
+                }
+                _ => Err(Error::type_mismatch("number", "non-numeric value")),
+            }
+        } else {
+            Ok(base)
+        }
+    }
+
+    /// Unary: `!`, `-`, `+`, `~`
     fn parse_unary(&mut self) -> Result<Value> {
+        self.skip_whitespace();
         if self.match_op("!") {
             let val = self.parse_unary()?;
             return Ok(Value::from_bool(!val.is_true()));
         }
-
-        if self.match_op("-") {
+        if self.peek() == '~' {
+            self.advance();
             let val = self.parse_unary()?;
-            match val.as_float() {
-                Some(n) => {
-                    if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
-                        return Ok(Value::from_int(-(n as i64)));
-                    }
-                    return Ok(Value::from_float(-n));
-                }
-                None => return Err(Error::type_mismatch("number", "non-numeric value")),
-            }
+            let n = self.as_int_val(&val)?;
+            return Ok(Value::from_int(!n));
         }
-
+        if self.peek() == '-' && !self.is_at_end() {
+            // Only unary minus if we're at the start of unary context
+            // (The additive parser handles binary minus)
+            let saved = self.pos;
+            self.advance();
+            // Check if next char can start an expression
+            self.skip_whitespace();
+            if self.is_digit() || self.peek() == '(' || self.peek() == '$' || self.peek() == '[' || self.peek() == '.' {
+                let val = self.parse_unary()?;
+                return match val.as_float() {
+                    Some(n) => {
+                        if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
+                            Ok(Value::from_int(-(n as i64)))
+                        } else {
+                            Ok(Value::from_float(-n))
+                        }
+                    }
+                    None => Err(Error::type_mismatch("number", "non-numeric value")),
+                };
+            }
+            // Not unary minus, restore
+            self.pos = saved;
+        }
         if self.match_op("+") {
             return self.parse_unary();
         }
-
         self.parse_primary()
     }
 
@@ -235,14 +345,14 @@ impl<'a> ExprParser<'a> {
 
         // Parenthesized expression
         if self.match_op("(") {
-            let val = self.parse_or()?;
+            let val = self.parse_ternary()?;
             self.expect(")")?;
             return Ok(val);
         }
 
         // Command substitution
         if self.peek() == '[' {
-            self.advance(); // consume [
+            self.advance();
             let mut cmd = String::new();
             let mut depth = 1;
             while !self.is_at_end() && depth > 0 {
@@ -259,14 +369,23 @@ impl<'a> ExprParser<'a> {
                     cmd.push(c);
                 }
             }
-            // Execute the command
             return self.interp.eval(&cmd);
         }
 
         // Variable reference
         if self.peek() == '$' {
             self.advance();
-            let name = self.parse_identifier();
+            if self.peek() == '{' {
+                // ${varname}
+                self.advance();
+                let mut name = String::new();
+                while !self.is_at_end() && self.peek() != '}' {
+                    name.push(self.advance());
+                }
+                if !self.is_at_end() { self.advance(); } // consume '}'
+                return self.interp.get_var(&name).cloned();
+            }
+            let name = self.parse_var_name();
             return self.interp.get_var(&name).cloned();
         }
 
@@ -316,11 +435,12 @@ impl<'a> ExprParser<'a> {
         Ok(Value::from_str(&ident))
     }
 
-    /// Parse a number
+    // -- Number / string / identifier parsing --------------------------------
+
     fn parse_number(&mut self) -> Result<Value> {
         let mut s = String::new();
 
-        // Handle hex
+        // Handle hex / binary / octal
         if self.peek() == '0' && self.pos + 1 < self.chars.len() {
             let next = self.chars[self.pos + 1];
             if next == 'x' || next == 'X' {
@@ -349,19 +469,15 @@ impl<'a> ExprParser<'a> {
             }
         }
 
-        // Decimal number
         while self.is_digit() {
             s.push(self.advance());
         }
-
         if self.peek() == '.' {
             s.push(self.advance());
             while self.is_digit() {
                 s.push(self.advance());
             }
         }
-
-        // Exponent
         if self.peek() == 'e' || self.peek() == 'E' {
             s.push(self.advance());
             if self.peek() == '+' || self.peek() == '-' {
@@ -379,30 +495,37 @@ impl<'a> ExprParser<'a> {
         }
     }
 
-    /// Parse a string literal
     fn parse_string(&mut self) -> Result<Value> {
         let quote = self.advance();
         let mut s = String::new();
+        let close = if quote == '{' { '}' } else { quote };
+        let mut depth = if quote == '{' { 1i32 } else { 0 };
 
-        while !self.is_at_end() && self.peek() != quote {
-            if quote == '"' && self.peek() == '\\' {
-                self.advance();
-                if !self.is_at_end() {
-                    s.push(self.parse_escape_char());
+        while !self.is_at_end() {
+            if quote == '{' {
+                let c = self.peek();
+                if c == '{' { depth += 1; }
+                if c == '}' {
+                    depth -= 1;
+                    if depth == 0 { self.advance(); break; }
                 }
-            } else {
                 s.push(self.advance());
+            } else {
+                if self.peek() == close { self.advance(); break; }
+                if self.peek() == '\\' {
+                    self.advance();
+                    if !self.is_at_end() {
+                        s.push(self.parse_escape_char());
+                    }
+                } else {
+                    s.push(self.advance());
+                }
             }
-        }
-
-        if !self.is_at_end() {
-            self.advance(); // Closing quote
         }
 
         Ok(Value::from_str(&s))
     }
 
-    /// Parse an escape character
     fn parse_escape_char(&mut self) -> char {
         match self.advance() {
             'n' => '\n',
@@ -414,7 +537,6 @@ impl<'a> ExprParser<'a> {
         }
     }
 
-    /// Parse an identifier
     fn parse_identifier(&mut self) -> String {
         let mut s = String::new();
         while !self.is_at_end() {
@@ -428,122 +550,137 @@ impl<'a> ExprParser<'a> {
         s
     }
 
-    /// Parse a function call
-    fn parse_function_call(&mut self, name: &str) -> Result<Value> {
-        self.expect("(")?;
-
-        let mut args = Vec::new();
-        loop {
-            self.skip_whitespace();
-            if self.peek() == ')' {
+    /// Parse a variable name after `$`.
+    fn parse_var_name(&mut self) -> String {
+        let mut s = String::new();
+        while !self.is_at_end() {
+            let c = self.peek();
+            if c.is_alphanumeric() || c == '_' || c == ':' {
+                s.push(self.advance());
+            } else if c == '(' {
+                // Array reference: name(index)
+                s.push(self.advance());
+                while !self.is_at_end() && self.peek() != ')' {
+                    s.push(self.advance());
+                }
+                if !self.is_at_end() {
+                    s.push(self.advance()); // consume ')'
+                }
                 break;
-            }
-
-            let arg = self.parse_or()?;
-            args.push(arg);
-
-            self.skip_whitespace();
-            if self.peek() == ',' {
-                self.advance();
             } else {
                 break;
             }
         }
+        s
+    }
 
+    // -- Function calls ------------------------------------------------------
+
+    fn parse_function_call(&mut self, name: &str) -> Result<Value> {
+        self.expect("(")?;
+        let mut args = Vec::new();
+        loop {
+            self.skip_whitespace();
+            if self.peek() == ')' { break; }
+            let arg = self.parse_ternary()?;
+            args.push(arg);
+            self.skip_whitespace();
+            if self.peek() == ',' { self.advance(); } else { break; }
+        }
         self.expect(")")?;
 
-        // Built-in functions
         match name {
             "abs" => {
-                if args.len() != 1 {
-                    return Err(Error::wrong_args("abs()", 1, args.len()));
-                }
+                self.require_args(name, 1, args.len())?;
                 match args[0].as_float() {
-                    Some(n) => {
-                        let result = n.abs();
-                        if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
-                            Ok(Value::from_int(result as i64))
-                        } else {
-                            Ok(Value::from_float(result))
-                        }
-                    }
+                    Some(n) => Ok(self.float_or_int(n.abs())),
                     None => Err(Error::type_mismatch("number", "non-numeric value")),
                 }
             }
-            "int" => {
-                if args.len() != 1 {
-                    return Err(Error::wrong_args("int()", 1, args.len()));
+            "int" | "entier" => {
+                self.require_args(name, 1, args.len())?;
+                match args[0].as_float() {
+                    Some(n) => Ok(Value::from_int(n as i64)),
+                    None => Err(Error::type_mismatch("number", "non-numeric value")),
                 }
+            }
+            "wide" => {
+                self.require_args(name, 1, args.len())?;
                 match args[0].as_float() {
                     Some(n) => Ok(Value::from_int(n as i64)),
                     None => Err(Error::type_mismatch("number", "non-numeric value")),
                 }
             }
             "double" => {
-                if args.len() != 1 {
-                    return Err(Error::wrong_args("double()", 1, args.len()));
-                }
+                self.require_args(name, 1, args.len())?;
                 match args[0].as_float() {
                     Some(n) => Ok(Value::from_float(n)),
                     None => Err(Error::type_mismatch("number", "non-numeric value")),
                 }
             }
+            "bool" => {
+                self.require_args(name, 1, args.len())?;
+                Ok(Value::from_bool(args[0].is_true()))
+            }
             "round" => {
-                if args.len() != 1 {
-                    return Err(Error::wrong_args("round()", 1, args.len()));
-                }
+                self.require_args(name, 1, args.len())?;
                 match args[0].as_float() {
                     Some(n) => Ok(Value::from_int(n.round() as i64)),
                     None => Err(Error::type_mismatch("number", "non-numeric value")),
                 }
             }
             "floor" => {
-                if args.len() != 1 {
-                    return Err(Error::wrong_args("floor()", 1, args.len()));
-                }
+                self.require_args(name, 1, args.len())?;
                 match args[0].as_float() {
                     Some(n) => Ok(Value::from_int(n.floor() as i64)),
                     None => Err(Error::type_mismatch("number", "non-numeric value")),
                 }
             }
             "ceil" => {
-                if args.len() != 1 {
-                    return Err(Error::wrong_args("ceil()", 1, args.len()));
-                }
+                self.require_args(name, 1, args.len())?;
                 match args[0].as_float() {
                     Some(n) => Ok(Value::from_int(n.ceil() as i64)),
                     None => Err(Error::type_mismatch("number", "non-numeric value")),
                 }
             }
             "sqrt" => {
-                if args.len() != 1 {
-                    return Err(Error::wrong_args("sqrt()", 1, args.len()));
-                }
+                self.require_args(name, 1, args.len())?;
                 match args[0].as_float() {
                     Some(n) => Ok(Value::from_float(n.sqrt())),
                     None => Err(Error::type_mismatch("number", "non-numeric value")),
                 }
             }
             "pow" => {
-                if args.len() != 2 {
-                    return Err(Error::wrong_args("pow()", 2, args.len()));
-                }
+                self.require_args(name, 2, args.len())?;
                 match (args[0].as_float(), args[1].as_float()) {
-                    (Some(a), Some(b)) => {
-                        let result = a.powf(b);
-                        if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
-                            Ok(Value::from_int(result as i64))
-                        } else {
-                            Ok(Value::from_float(result))
-                        }
-                    }
+                    (Some(a), Some(b)) => Ok(self.float_or_int(a.powf(b))),
                     _ => Err(Error::type_mismatch("number", "non-numeric value")),
                 }
             }
-            "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "log" | "log10" | "exp" => {
-                if args.len() != 1 {
-                    return Err(Error::wrong_args(&format!("{}()", name), 1, args.len()));
+            "fmod" => {
+                self.require_args(name, 2, args.len())?;
+                match (args[0].as_float(), args[1].as_float()) {
+                    (Some(a), Some(b)) => Ok(Value::from_float(a % b)),
+                    _ => Err(Error::type_mismatch("number", "non-numeric value")),
                 }
+            }
+            "atan2" => {
+                self.require_args(name, 2, args.len())?;
+                match (args[0].as_float(), args[1].as_float()) {
+                    (Some(a), Some(b)) => Ok(Value::from_float(a.atan2(b))),
+                    _ => Err(Error::type_mismatch("number", "non-numeric value")),
+                }
+            }
+            "hypot" => {
+                self.require_args(name, 2, args.len())?;
+                match (args[0].as_float(), args[1].as_float()) {
+                    (Some(a), Some(b)) => Ok(Value::from_float(a.hypot(b))),
+                    _ => Err(Error::type_mismatch("number", "non-numeric value")),
+                }
+            }
+            "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "log" | "log10" | "exp"
+            | "sinh" | "cosh" | "tanh" => {
+                self.require_args(name, 1, args.len())?;
                 match args[0].as_float() {
                     Some(n) => {
                         let result = match name {
@@ -556,6 +693,9 @@ impl<'a> ExprParser<'a> {
                             "log" => n.ln(),
                             "log10" => n.log10(),
                             "exp" => n.exp(),
+                            "sinh" => n.sinh(),
+                            "cosh" => n.cosh(),
+                            "tanh" => n.tanh(),
                             _ => n,
                         };
                         Ok(Value::from_float(result))
@@ -567,30 +707,52 @@ impl<'a> ExprParser<'a> {
                 if args.is_empty() {
                     return Err(Error::wrong_args(&format!("{}()", name), 1, args.len()));
                 }
-                let nums: Vec<f64> = args.iter()
-                    .filter_map(|v| v.as_float())
+                let nums: std::result::Result<Vec<f64>, _> = args.iter()
+                    .map(|v| v.as_float().ok_or_else(|| Error::type_mismatch("number", "non-numeric value")))
                     .collect();
-                if nums.len() != args.len() {
-                    return Err(Error::type_mismatch("number", "non-numeric value"));
-                }
+                let nums = nums?;
                 let result = if name == "min" {
                     nums.into_iter().fold(f64::INFINITY, f64::min)
                 } else {
                     nums.into_iter().fold(f64::NEG_INFINITY, f64::max)
                 };
-                Ok(Value::from_float(result))
+                Ok(self.float_or_int(result))
+            }
+            "rand" => {
+                // Simple pseudo-random: not cryptographic, but sufficient for Tcl compat
+                // Use a linear congruential generator seeded from the address of interp
+                let seed = (self.interp as *const Interp as usize) ^ self.pos;
+                let val = ((seed.wrapping_mul(6364136223846793005).wrapping_add(1)) as f64)
+                    / (usize::MAX as f64);
+                Ok(Value::from_float(val.abs() % 1.0))
+            }
+            "srand" => {
+                self.require_args(name, 1, args.len())?;
+                // srand is mostly a no-op in our simple implementation
+                Ok(Value::empty())
+            }
+            "isqrt" => {
+                self.require_args(name, 1, args.len())?;
+                match args[0].as_float() {
+                    Some(n) if n >= 0.0 => Ok(Value::from_int((n.sqrt()) as i64)),
+                    _ => Err(Error::runtime("domain error: argument not in valid range", crate::error::ErrorCode::InvalidOp)),
+                }
             }
             _ => Err(Error::runtime(
-                format!("unknown function: {}", name),
+                format!("unknown math function \"{}\"", name),
                 crate::error::ErrorCode::InvalidOp,
             )),
         }
     }
 
-    // Helper methods
+    // -- Helpers -------------------------------------------------------------
 
     fn peek(&self) -> char {
         self.chars.get(self.pos).copied().unwrap_or('\0')
+    }
+
+    fn peek_at(&self, offset: usize) -> char {
+        self.chars.get(self.pos + offset).copied().unwrap_or('\0')
     }
 
     fn advance(&mut self) -> char {
@@ -609,6 +771,7 @@ impl<'a> ExprParser<'a> {
         }
     }
 
+    /// Match a symbol operator (does not check word boundaries).
     fn match_op(&mut self, op: &str) -> bool {
         self.skip_whitespace();
         let op_chars: Vec<char> = op.chars().collect();
@@ -617,6 +780,25 @@ impl<'a> ExprParser<'a> {
             if slice == op {
                 self.pos += op_chars.len();
                 return true;
+            }
+        }
+        false
+    }
+
+    /// Match a word operator (requires non-alphanumeric boundary after it).
+    fn match_word_op(&mut self, op: &str) -> bool {
+        self.skip_whitespace();
+        let op_chars: Vec<char> = op.chars().collect();
+        let end = self.pos + op_chars.len();
+        if end <= self.chars.len() {
+            let slice: String = self.chars[self.pos..end].iter().collect();
+            if slice == op {
+                // Check boundary: next char must not be alphanumeric or '_'
+                let next = self.chars.get(end).copied().unwrap_or('\0');
+                if !next.is_alphanumeric() && next != '_' {
+                    self.pos = end;
+                    return true;
+                }
             }
         }
         false
@@ -641,6 +823,49 @@ impl<'a> ExprParser<'a> {
     fn is_hex_digit(&self) -> bool {
         let c = self.peek();
         c.is_ascii_digit() || ('a'..='f').contains(&c) || ('A'..='F').contains(&c)
+    }
+
+    /// Convert a Value to i64, returning an error if not numeric.
+    fn as_int_val(&self, v: &Value) -> Result<i64> {
+        v.as_int().or_else(|| v.as_float().map(|f| f as i64))
+            .ok_or_else(|| Error::type_mismatch("integer", v.as_str()))
+    }
+
+    /// Numeric binary operation, returning int when possible.
+    fn numeric_binop(&self, left: &Value, right: &Value, op: char) -> Result<Value> {
+        match (left.as_float(), right.as_float()) {
+            (Some(a), Some(b)) => {
+                let result = match op {
+                    '+' => a + b,
+                    '-' => a - b,
+                    '*' => a * b,
+                    '/' => {
+                        if b == 0.0 { return Err(Error::DivisionByZero); }
+                        a / b
+                    }
+                    _ => return Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
+                };
+                Ok(self.float_or_int(result))
+            }
+            _ => Err(Error::type_mismatch("number", "non-numeric value")),
+        }
+    }
+
+    /// Return int if the float has no fractional part and fits in i64.
+    fn float_or_int(&self, f: f64) -> Value {
+        if f.fract() == 0.0 && f.abs() < i64::MAX as f64 {
+            Value::from_int(f as i64)
+        } else {
+            Value::from_float(f)
+        }
+    }
+
+    fn require_args(&self, name: &str, expected: usize, actual: usize) -> Result<()> {
+        if actual != expected {
+            Err(Error::wrong_args(&format!("{}()", name), expected, actual))
+        } else {
+            Ok(())
+        }
     }
 }
 

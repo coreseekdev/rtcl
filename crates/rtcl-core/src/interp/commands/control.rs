@@ -118,28 +118,46 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 4 || args.len() % 2 != 0 {
         return Err(Error::wrong_args_with_usage(
             "foreach", 4, args.len(),
-            "varname list body ?varname list body ...?",
+            "varList list ?varList list ...? body",
         ));
     }
 
     let body = args[args.len() - 1].as_str();
     let mut result = Value::empty();
 
-    let mut var_lists: Vec<(&str, Vec<Value>)> = Vec::new();
+    // Collect (var_names, data_list) pairs
+    // var_names is a list: single var "x" or multi-var "{a b c}"
+    struct VarGroup {
+        vars: Vec<String>,
+        data: Vec<Value>,
+    }
+    let mut groups: Vec<VarGroup> = Vec::new();
     let mut i = 1;
     while i < args.len() - 1 {
-        let var = args[i].as_str();
-        let list = args[i + 1].as_list().unwrap_or_default();
-        var_lists.push((var, list));
+        let var_list = args[i].as_list().unwrap_or_else(|| vec![args[i].clone()]);
+        let vars: Vec<String> = var_list.iter().map(|v| v.as_str().to_string()).collect();
+        let data = args[i + 1].as_list().unwrap_or_default();
+        groups.push(VarGroup { vars, data });
         i += 2;
     }
 
-    let max_len = var_lists.iter().map(|(_, l)| l.len()).max().unwrap_or(0);
+    // Compute max iterations: for each group, ceil(data.len() / vars.len())
+    let max_iters = groups.iter()
+        .map(|g| {
+            let n = g.vars.len().max(1);
+            (g.data.len() + n - 1) / n
+        })
+        .max()
+        .unwrap_or(0);
 
-    for idx in 0..max_len {
-        for (var, list) in &var_lists {
-            let value = list.get(idx).cloned().unwrap_or_else(Value::empty);
-            interp.set_var(var, value)?;
+    for idx in 0..max_iters {
+        for g in &groups {
+            let n = g.vars.len();
+            for (vi, var) in g.vars.iter().enumerate() {
+                let data_idx = idx * n + vi;
+                let value = g.data.get(data_idx).cloned().unwrap_or_else(Value::empty);
+                interp.set_var(var, value)?;
+            }
         }
         match interp.eval(body) {
             Ok(v) => result = v,

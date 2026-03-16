@@ -26,16 +26,15 @@ pub mod types;
 pub use error::{Error, Result};
 pub use value::Value;
 pub use interp::Interp;
-pub use parser::Parser;
-pub use command::Command;
+pub use parser::parse;
+pub use command::CommandFunc;
 
 /// Prelude module for common imports
 pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::value::Value;
     pub use crate::interp::Interp;
-    pub use crate::parser::Parser;
-    pub use crate::command::Command;
+    pub use crate::parser::parse;
     pub use crate::types::*;
 }
 

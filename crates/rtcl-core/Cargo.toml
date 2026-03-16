@@ -15,6 +15,18 @@ smallvec.workspace = true
 workspace = true
 optional = true
 
+[dependencies.pest]
+workspace = true
+optional = true
+
+[dependencies.pest_derive]
+workspace = true
+optional = true
+
+[build-dependencies.pest_derive]
+workspace = true
+optional = true
+
 [features]
 default = ["std"]
 std = []
@@ -23,5 +35,7 @@ alloc = ["smallvec/const_new", "hashbrown/default"]
 embedded = ["alloc", "dep:spin"]
 # Enable extra diagnostics
 debug = []
+# Use pest-based parser (requires std, experimental)
+pest-parser = ["dep:pest", "dep:pest_derive"]
 
 [dev-dependencies]

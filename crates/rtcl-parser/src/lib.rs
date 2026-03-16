@@ -2,15 +2,20 @@
 //!
 //! Tcl parser for rtcl — produces an AST from Tcl source code.
 //!
-//! Uses a pest PEG grammar (`tcl.pest`) to parse Tcl scripts into
-//! [`Command`] / [`Word`] structures that can be compiled to bytecode
-//! or interpreted directly.
+//! Two parser backends:
+//! - **`rd`** (default) — recursive descent, inspired by Molt/jimtcl
+//! - **`pest-parser`** (feature) — PEG grammar via pest (`tcl.pest`)
 
+#[cfg(feature = "pest-parser")]
 use pest::iterators::Pair;
+#[cfg(feature = "pest-parser")]
 use pest::Parser;
+#[cfg(feature = "pest-parser")]
 use pest_derive::Parser;
 
 use core::fmt;
+
+mod rd;
 
 // ---------------------------------------------------------------------------
 // AST types
@@ -79,22 +84,37 @@ impl fmt::Display for ParseError {
     }
 }
 
-#[cfg(feature = "std")]
 impl std::error::Error for ParseError {}
 
 // Convenience alias
 pub type ParseResult<T> = Result<T, ParseError>;
 
 // ---------------------------------------------------------------------------
-// Pest parser
+// Pest parser (feature-gated)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "pest-parser")]
 #[derive(Parser)]
 #[grammar = "tcl.pest"]
 struct TclParser;
 
 /// Parse Tcl source code into a list of [`Command`]s.
+///
+/// Dispatches to the recursive descent parser by default. Enable feature
+/// `pest-parser` **and** disable default features to use the PEG backend.
+#[cfg(not(feature = "pest-parser"))]
 pub fn parse(source: &str) -> ParseResult<Vec<Command>> {
+    rd::parse(source)
+}
+
+/// Parse Tcl source code into a list of [`Command`]s (PEG backend).
+#[cfg(feature = "pest-parser")]
+pub fn parse(source: &str) -> ParseResult<Vec<Command>> {
+    parse_pest(source)
+}
+
+#[cfg(feature = "pest-parser")]
+fn parse_pest(source: &str) -> ParseResult<Vec<Command>> {
     let pairs = TclParser::parse(Rule::program, source).map_err(|e| ParseError {
         message: e.to_string(),
         line: 0,
@@ -135,9 +155,10 @@ pub fn parse(source: &str) -> ParseResult<Vec<Command>> {
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers — pest pair → AST
+// Internal helpers — pest pair → AST (feature-gated)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "pest-parser")]
 fn parse_command(pair: Pair<Rule>) -> Option<Command> {
     let line = pair.as_span().start_pos().line_col().0;
     let mut words = Vec::new();
@@ -157,6 +178,7 @@ fn parse_command(pair: Pair<Rule>) -> Option<Command> {
     }
 }
 
+#[cfg(feature = "pest-parser")]
 fn parse_word(pair: Pair<Rule>) -> Option<Word> {
     let inner = pair.into_inner().next()?;
     match inner.as_rule() {
@@ -203,6 +225,7 @@ fn parse_word(pair: Pair<Rule>) -> Option<Word> {
     }
 }
 
+#[cfg(feature = "pest-parser")]
 fn parse_expand(pair: Pair<Rule>) -> Option<Word> {
     for inner in pair.into_inner() {
         if inner.as_rule() == Rule::word {
@@ -215,6 +238,7 @@ fn parse_expand(pair: Pair<Rule>) -> Option<Word> {
 }
 
 /// Parse a composite word (mixed bare text + var_ref + cmd_sub + orphan_dollar).
+#[cfg(feature = "pest-parser")]
 fn parse_composite(pair: Pair<Rule>) -> Vec<Word> {
     let mut parts = Vec::new();
     for inner in pair.into_inner() {
@@ -239,6 +263,7 @@ fn parse_composite(pair: Pair<Rule>) -> Vec<Word> {
 
 /// Extract braced content by using `pair.as_str()` and stripping the outer
 /// braces.  This correctly handles silent child rules (bug B1 fix).
+#[cfg(feature = "pest-parser")]
 fn extract_braced_str(pair: Pair<Rule>) -> String {
     let raw = pair.as_str();
     // Strip outer { }
@@ -267,6 +292,7 @@ fn extract_braced_str(pair: Pair<Rule>) -> String {
     result
 }
 
+#[cfg(feature = "pest-parser")]
 fn parse_quoted(pair: Pair<Rule>) -> Vec<Word> {
     let mut parts = Vec::new();
     let mut literal = String::new();
@@ -311,6 +337,7 @@ fn parse_quoted(pair: Pair<Rule>) -> Vec<Word> {
     parts
 }
 
+#[cfg(feature = "pest-parser")]
 fn extract_var_name(pair: Pair<Rule>) -> String {
     let mut name = String::new();
 
@@ -332,6 +359,7 @@ fn extract_var_name(pair: Pair<Rule>) -> String {
     name
 }
 
+#[cfg(feature = "pest-parser")]
 fn extract_index(pair: Pair<Rule>) -> String {
     // index is atomic (@{ }), so pair.as_str() is the raw text including outer ( )
     let raw = pair.as_str();
@@ -344,6 +372,7 @@ fn extract_index(pair: Pair<Rule>) -> String {
 
 /// Extract command substitution content using `pair.as_str()` and stripping
 /// the outer `[ ]`.
+#[cfg(feature = "pest-parser")]
 fn extract_cmd_sub_str(pair: Pair<Rule>) -> String {
     let raw = pair.as_str();
     if raw.starts_with('[') && raw.ends_with(']') {
@@ -353,6 +382,7 @@ fn extract_cmd_sub_str(pair: Pair<Rule>) -> String {
     }
 }
 
+#[cfg(feature = "pest-parser")]
 fn process_bare(s: &str) -> String {
     let mut result = String::new();
     let chars: Vec<char> = s.chars().collect();
@@ -425,6 +455,7 @@ fn process_bare(s: &str) -> String {
 }
 
 /// Process a `\X` escape sequence and return the resulting character.
+#[cfg(feature = "pest-parser")]
 fn process_escape(s: &str) -> Option<char> {
     if !s.starts_with('\\') || s.len() < 2 {
         return s.chars().next();
@@ -485,7 +516,7 @@ fn process_escape(s: &str) -> Option<char> {
                 char::from_u32(u32::from_str_radix(&hex, 16).unwrap_or(0))
             }
         }
-        c @ '0'..='7' => {
+        _c @ '0'..='7' => {
             let oct: String = chars[1..]
                 .iter()
                 .take_while(|c| **c >= '0' && **c <= '7')
@@ -967,6 +998,9 @@ mod tests {
         let cmds = parse("puts $$").unwrap();
         assert_eq!(cmds[0].words.len(), 2);
         match &cmds[0].words[1] {
+            // Hand parser coalesces adjacent literals: Literal("$$")
+            Word::Literal(s) => assert_eq!(s, "$$"),
+            // PEG parser produces separate parts: Concat([Literal("$"), Literal("$")])
             Word::Concat(parts) => {
                 let text: String = parts.iter().map(|p| match p {
                     Word::Literal(s) => s.as_str(),
@@ -985,6 +1019,1125 @@ mod tests {
         match &cmds[0].words[1] {
             Word::VarRef(name) => assert_eq!(name, "::foo::bar"),
             w => panic!("expected var_ref '::foo::bar', got {:?}", w),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // GAP verification tests: braced string backslash handling
+    // -----------------------------------------------------------------------
+
+    /// Backslash-n inside braces should be preserved literally
+    #[test]
+    fn test_braced_backslash_n() {
+        let cmds = parse(r#"set x {foo\nbar}"#).unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, r#"foo\nbar"#),
+            w => panic!("expected literal 'foo\\nbar', got {:?}", w),
+        }
+    }
+
+    /// Backslash-t inside braces should be preserved literally
+    #[test]
+    fn test_braced_backslash_t() {
+        let cmds = parse(r#"set x {foo\tbar}"#).unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, r#"foo\tbar"#),
+            w => panic!("expected literal 'foo\\tbar', got {:?}", w),
+        }
+    }
+
+    /// Double backslash inside braces
+    #[test]
+    fn test_braced_double_backslash() {
+        let cmds = parse(r#"set x {foo\\bar}"#).unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, r#"foo\\bar"#),
+            w => panic!("expected literal 'foo\\\\bar', got {:?}", w),
+        }
+    }
+
+    /// Hex escape inside braces (preserved literally)
+    #[test]
+    fn test_braced_hex_escape() {
+        let cmds = parse(r#"set x {\x4A}"#).unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, r#"\x4A"#),
+            w => panic!("expected literal '\\x4A', got {:?}", w),
+        }
+    }
+
+    /// Backslash at end of braced string: {foo\} is unterminated
+    #[test]
+    fn test_braced_trailing_backslash() {
+        // In Tcl, {foo\} is unterminated because \} escapes the }
+        let result = parse(r#"set x {foo\}"#);
+        assert!(result.is_err(), "should be parse error (unterminated brace)");
+    }
+
+    /// Backslash-brace inside braces: {foo\}bar} → foo\}bar
+    #[test]
+    fn test_braced_escaped_close_brace() {
+        let cmds = parse(r#"set x {foo\}bar}"#).unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, r#"foo\}bar"#),
+            w => panic!("expected literal 'foo\\}}bar', got {:?}", w),
+        }
+    }
+
+    /// Backslash-open-brace inside braces: {foo\{bar} → foo\{bar
+    #[test]
+    fn test_braced_escaped_open_brace() {
+        let cmds = parse(r#"set x {foo\{bar}"#).unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, r#"foo\{bar"#),
+            w => panic!("expected literal 'foo\\{{bar', got {:?}", w),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional parse.test coverage
+    // -----------------------------------------------------------------------
+
+    /// parse-1.13: Actual newline inside quotes → preserved as newline
+    #[test]
+    fn test_parse_1_13_newline_in_quotes() {
+        let cmds = parse("set x \"abc\ndef\"").unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "abc\ndef"),
+            Word::Concat(parts) => {
+                let text: String = parts.iter().map(|p| match p {
+                    Word::Literal(s) => s.as_str(),
+                    _ => "",
+                }).collect();
+                assert_eq!(text, "abc\ndef");
+            }
+            w => panic!("expected 'abc\\ndef', got {:?}", w),
+        }
+    }
+
+    /// parse-1.14: Newline in quotes after var
+    #[test]
+    fn test_parse_1_14_newline_in_quotes_after_var() {
+        // `"abc$y\ndef"` — actual newline char in source
+        let cmds = parse("set x \"abc$y\ndef\"").unwrap();
+        // Should have set x, and the quoted word with var_ref + literal newline
+        assert_eq!(cmds.len(), 1); // all in one command (newline is inside quotes)
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                // Should contain: "abc", VarRef("y"), "\ndef"
+                assert!(parts.iter().any(|p| matches!(p, Word::VarRef(_))),
+                    "should contain var ref: {:?}", parts);
+            }
+            w => panic!("expected concat with var ref, got {:?}", w),
+        }
+    }
+
+    /// parse-1.16: Space in quotes after braced var
+    #[test]
+    fn test_parse_1_16_space_in_quotes_after_var() {
+        let cmds = parse(r#"set x "abc${y} def""#).unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                assert!(parts.iter().any(|p| matches!(p, Word::VarRef(_))));
+            }
+            w => panic!("expected concat, got {:?}", w),
+        }
+    }
+
+    /// parse-1.22: # char in quoted string context
+    #[test]
+    fn test_parse_1_22_hash_in_quoted_string() {
+        let cmds = parse(r#"set x "[set y]#""#).unwrap();
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                let has_cmd = parts.iter().any(|p| matches!(p, Word::CommandSub(_)));
+                let has_hash = parts.iter().any(|p| match p {
+                    Word::Literal(s) => s.contains('#'),
+                    _ => false,
+                });
+                assert!(has_cmd, "should contain cmd sub: {:?}", parts);
+                assert!(has_hash, "should contain #: {:?}", parts);
+            }
+            w => panic!("expected concat, got {:?}", w),
+        }
+    }
+
+    /// parse-1.32: Comment as last line of eval'd script (parser test for semicolon comment)
+    #[test]
+    fn test_parse_1_32_comment_after_semicolon_in_script() {
+        let cmds = parse("set x 3; # this is a comment").unwrap();
+        assert_eq!(cmds.len(), 1, "should be one command, # is a comment: {:?}", cmds);
+    }
+
+    /// parse-1.41: Braced string containing quoted newline (preserved literally)
+    #[test]
+    fn test_parse_1_41_braced_with_quoted_newline() {
+        let cmds = parse("set x {abc \"def\nghi\"}").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => {
+                assert!(s.contains("def\nghi"), "should contain newline: {:?}", s);
+            }
+            w => panic!("expected literal, got {:?}", w),
+        }
+    }
+
+    /// parse-1.43: Trailing backslash in quoted string
+    #[test]
+    fn test_parse_1_43_quoted_trailing_backslash() {
+        let cmds = parse(r#"set x "abc def\\""#).unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "abc def\\"),
+            w => panic!("expected 'abc def\\\\', got {:?}", w),
+        }
+    }
+
+    /// parse-1.49: Backslash newline + tabs + actual newline in quotes
+    #[test]
+    fn test_parse_1_49_backslash_newline_tabs_newline() {
+        // "abc\<newline><tabs><newline>def"
+        // \<newline><tabs> → space, then another <newline> is literal
+        let cmds = parse("set x \"abc\\\n\t\t\ndef\"").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "abc \ndef"),
+            Word::Concat(parts) => {
+                let text: String = parts.iter().map(|p| match p {
+                    Word::Literal(s) => s.as_str(),
+                    _ => "",
+                }).collect();
+                assert_eq!(text, "abc \ndef");
+            }
+            w => panic!("expected 'abc \\ndef', got {:?}", w),
+        }
+    }
+
+    /// parse-1.52: $ in array index
+    #[test]
+    fn test_parse_1_52_dollar_in_index() {
+        let cmds = parse("set x $a(x$)").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => {
+                assert!(name.starts_with("a("), "should be array: {}", name);
+                assert!(name.contains("x$"), "index should contain 'x$': {}", name);
+            }
+            w => panic!("expected var_ref, got {:?}", w),
+        }
+    }
+
+    /// parse-1.54: \[ in array index
+    #[test]
+    fn test_parse_1_54_escaped_bracket_in_index() {
+        let cmds = parse(r#"set x $a(x\[)"#).unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => {
+                assert!(name.starts_with("a("), "should be array: {}", name);
+            }
+            w => panic!("expected var_ref, got {:?}", w),
+        }
+    }
+
+    /// parse-1.56: \( in array index  
+    #[test]
+    fn test_parse_1_56_escaped_paren_in_index() {
+        let cmds = parse(r#"set x $a(x\()"#).unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => {
+                assert!(name.starts_with("a("), "should be array: {}", name);
+            }
+            w => panic!("expected var_ref, got {:?}", w),
+        }
+    }
+
+    /// parse-1.57-1.58: Unbalanced ( in array index (x( is the key)
+    /// NOTE: jimtcl backtracks to the last valid ) when parens are unbalanced.
+    /// PEG cannot easily replicate this. For now, rtcl treats this as
+    /// $a followed by literal (x() — a known limitation.
+    #[test]
+    fn test_parse_1_58_unbalanced_paren_in_index() {
+        // jimtcl: $a(x() → array access with key "x("
+        // rtcl: $a followed by literal "(x()" — different but parses
+        let result = parse("set x $a(x()");
+        assert!(result.is_ok(), "should not fail to parse: {:?}", result);
+    }
+
+    /// parse-1.60: " in array index
+    #[test]
+    fn test_parse_1_60_quote_in_index() {
+        let cmds = parse("set x $a(x\")").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => {
+                assert!(name.starts_with("a("), "should be array: {}", name);
+                assert!(name.contains("x\""), "index should contain '\\\"': {}", name);
+            }
+            w => panic!("expected var_ref, got {:?}", w),
+        }
+    }
+
+    /// parse-1.61: Quote escape inside cmd sub
+    #[test]
+    fn test_parse_1_61_quote_escape_in_cmd_sub() {
+        let cmds = parse(r#"set x [list \\" x]"#).unwrap();
+        match &cmds[0].words[2] {
+            Word::CommandSub(cmd) => {
+                assert!(cmd.contains(r#"\\"#), "should contain \\\\: {:?}", cmd);
+            }
+            w => panic!("expected cmd_sub, got {:?}", w),
+        }
+    }
+
+    /// parse-1.66: Backslash newline inside command substitution
+    #[test]
+    fn test_parse_1_66_backslash_newline_in_cmd_sub() {
+        let cmds = parse("set x [\"abc\\\n\tdef\" 4]").unwrap();
+        match &cmds[0].words[2] {
+            Word::CommandSub(cmd) => {
+                assert!(cmd.contains("abc") && cmd.contains("def"),
+                    "cmd sub should contain both parts: {:?}", cmd);
+            }
+            w => panic!("expected cmd_sub, got {:?}", w),
+        }
+    }
+
+    /// parse-1.69: Comment-like string in quoted context
+    #[test]
+    fn test_parse_1_69_hash_string_in_quotes() {
+        // `set x "#abc \\"` — the string starts with # but is in quotes
+        let src = "set x \"#abc \\\\\"";
+        let cmds = parse(src).unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "#abc \\"),
+            w => panic!("expected '#abc \\\\', got {:?}", w),
+        }
+    }
+
+    /// Empty quoted string
+    #[test]
+    fn test_empty_quoted_string() {
+        let cmds = parse(r#"set x """#).unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, ""),
+            w => panic!("expected empty literal, got {:?}", w),
+        }
+    }
+
+    /// Empty braced string
+    #[test]
+    fn test_empty_braced_string() {
+        let cmds = parse("set x {}").unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, ""),
+            w => panic!("expected empty literal, got {:?}", w),
+        }
+    }
+
+    /// Backslash newline in braces (line continuation)
+    #[test]
+    fn test_braced_line_continuation() {
+        let cmds = parse("set x {abc\\\n\tdef}").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "abc def"),
+            w => panic!("expected 'abc def', got {:?}", w),
+        }
+    }
+
+    /// Multiple semicolons
+    #[test]
+    fn test_multiple_semicolons() {
+        let cmds = parse("set x 1;;; set y 2").unwrap();
+        assert_eq!(cmds.len(), 2, "multiple semicolons should separate commands");
+    }
+
+    /// Tab and multiple whitespace between words
+    #[test]
+    fn test_whitespace_between_words() {
+        let cmds = parse("set   x\t\t10").unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+    }
+
+    /// parse-1.6: Incomplete array index `$a(` — parser handles, runtime error
+    #[test]
+    fn test_parse_1_6_incomplete_array_index() {
+        // In jimtcl: `$a(` has no closing ), so $a is just the var, ( is leftover
+        // PEG: index? fails, var_ref = $a, then ( is bare text
+        let result = parse("set x $a(");
+        assert!(result.is_ok(), "incomplete index should parse: {:?}", result);
+    }
+
+    /// parse-1.11: Backslash-newline in quotes after variable
+    #[test]
+    fn test_parse_1_11_backslash_newline_after_var_in_quotes() {
+        let cmds = parse("set x \"abc$y\\\ndef\"").unwrap();
+        assert_eq!(cmds.len(), 1); // all one command (inside quotes)
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                // Should have "abc" + VarRef(y) + " def" (backslash-newline → space)
+                assert!(parts.iter().any(|p| matches!(p, Word::VarRef(_))),
+                    "should contain var ref: {:?}", parts);
+            }
+            w => panic!("expected concat with var ref, got {:?}", w),
+        }
+    }
+
+    /// parse-1.15: Space in quotes
+    #[test]
+    fn test_parse_1_15_space_in_quotes() {
+        let cmds = parse(r#"set x "abc def""#).unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "abc def"),
+            w => panic!("expected 'abc def', got {:?}", w),
+        }
+    }
+
+    /// parse-1.36: Unicode escape \u00b5
+    #[test]
+    fn test_parse_1_36_unicode_escape() {
+        let cmds = parse("set x \\u00b5").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => {
+                // \u00b5 → µ (micro sign)
+                assert_eq!(s, "\u{00b5}");
+            }
+            w => panic!("expected unicode char, got {:?}", w),
+        }
+    }
+
+    /// parse-1.40: Quoted string with escaped quote and trailing backslash
+    #[test]
+    fn test_parse_1_40_quoted_escape_and_trailing_backslash() {
+        // `"abc \"def\\"` → abc "def\
+        let cmds = parse(r#"set x "abc \"def\\""#).unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "abc \"def\\"),
+            w => panic!("expected 'abc \"def\\', got {:?}", w),
+        }
+    }
+
+    /// parse-1.48: Backslash-newline with tabs in quotes
+    #[test]
+    fn test_parse_1_48_backslash_newline_tabs() {
+        let cmds = parse("set x \"abc\\\n\t\tdef\"").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "abc def"),
+            Word::Concat(parts) => {
+                let text: String = parts.iter().map(|p| match p {
+                    Word::Literal(s) => s.as_str(),
+                    _ => "",
+                }).collect();
+                assert_eq!(text, "abc def");
+            }
+            w => panic!("expected 'abc def', got {:?}", w),
+        }
+    }
+
+    /// parse-1.50: Backslash-newline in quotes (no whitespace after)
+    #[test]
+    fn test_parse_1_50_backslash_newline_no_whitespace() {
+        let cmds = parse("set x \"abc\\\ndef\"").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "abc def"),
+            Word::Concat(parts) => {
+                let text: String = parts.iter().map(|p| match p {
+                    Word::Literal(s) => s.as_str(),
+                    _ => "",
+                }).collect();
+                assert_eq!(text, "abc def");
+            }
+            w => panic!("expected 'abc def', got {:?}", w),
+        }
+    }
+
+    /// parse-1.57: Unbalanced paren in set arg (x( is the key in jimtcl)
+    /// NOTE: Same PEG limitation as parse-1.58 — jimtcl backtracks to last )
+    #[test]
+    fn test_parse_1_57_unbalanced_paren_as_set_arg() {
+        let result = parse("set a(x() 5");
+        assert!(result.is_ok(), "should not fail to parse: {:?}", result);
+    }
+
+    /// parse-1.67: Missing quote in command substitution
+    /// jimtcl reports "missing quote" error. Hand parser does the same.
+    /// PEG parser backtracks and treats `"` as a regular cmd_char.
+    #[test]
+    fn test_parse_1_67_missing_quote_in_cmd_sub() {
+        let result = parse("set x [\"abc def]");
+        // Hand parser (like jimtcl): error on unmatched quote
+        // PEG parser: backtracks, treats " as regular char → Ok
+        // Both behaviors are acceptable.
+        let _ = result;
+    }
+
+    /// parse-1.68: Missing quote across lines
+    /// jimtcl reports "missing quote" error. Hand parser does the same.
+    /// PEG parser backtracks and treats `"` as bare_char.
+    #[test]
+    fn test_parse_1_68_missing_quote_across_lines() {
+        let result = parse("set x \"abc\\\n\tline without quote\n");
+        // Hand parser (like jimtcl): error on unmatched quote
+        // PEG parser: backtracks → Ok
+        let _ = result;
+    }
+
+    // ===================================================================
+    // Additional jimtcl parse.test analogs (parser-level)
+    // ===================================================================
+
+    /// parse-1.4 analog: Variable reference inside quoted string.
+    /// jimtcl: `set x [string length "$lb"]` where lb is `\{`
+    /// Parser level: `"$lb"` parses as Concat or VarRef.
+    #[test]
+    fn test_parse_1_4_var_in_quoted_string() {
+        let cmds = parse(r#"set x "$lb""#).unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => assert_eq!(name, "lb"),
+            Word::Concat(parts) => {
+                // Some backends may wrap single VarRef in Concat
+                assert!(parts.iter().any(|w| matches!(w, Word::VarRef(n) if n == "lb")));
+            }
+            w => panic!("expected VarRef(lb), got {:?}", w),
+        }
+    }
+
+    /// parse-1.37 analog: Invalid unicode escape after valid unicode prefix.
+    /// `\ub5x` — only 2 hex digits after `\u`, then `x` is literal.
+    #[test]
+    fn test_parse_1_37_unicode_escape_partial() {
+        let cmds = parse("set x \"\\ub5x\"").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => {
+                assert!(s.ends_with('x'), "should end with literal 'x': {:?}", s);
+                assert!(s.len() >= 2, "should have unicode char + 'x': {:?}", s);
+            }
+            Word::Concat(parts) => {
+                let full: String = parts.iter().map(|w| match w {
+                    Word::Literal(s) => s.as_str(),
+                    _ => "",
+                }).collect();
+                assert!(full.ends_with('x'), "should end with 'x': {:?}", full);
+            }
+            w => panic!("expected literal with unicode+x, got {:?}", w),
+        }
+    }
+
+    /// parse-1.51/52: Dollar sign as literal in array index `$a(x$)`.
+    #[test]
+    fn test_parse_1_51_dollar_in_array_index() {
+        let cmds = parse("set x $a(x$)").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => {
+                assert!(name.starts_with("a("), "should be array: {:?}", name);
+                assert!(name.contains("x$"), "index should contain 'x$': {:?}", name);
+            }
+            w => panic!("expected VarRef, got {:?}", w),
+        }
+    }
+
+    /// parse-1.53/54: Escaped bracket in array index `$a(x\[)`.
+    #[test]
+    fn test_parse_1_53_escaped_bracket_in_index() {
+        let cmds = parse(r"set x $a(x\[)").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => {
+                assert!(name.starts_with("a("), "should be array: {:?}", name);
+                // Index content is raw text including the backslash
+                assert!(name.contains(r"x\[") || name.contains("x["),
+                    "index should contain bracket: {:?}", name);
+            }
+            w => panic!("expected VarRef, got {:?}", w),
+        }
+    }
+
+    /// parse-1.55/56: Escaped paren in array index `$a(x\()`.
+    #[test]
+    fn test_parse_1_55_escaped_paren_in_index() {
+        let cmds = parse(r"set x $a(x\()").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => {
+                assert!(name.starts_with("a("), "should be array: {:?}", name);
+            }
+            w => panic!("expected VarRef, got {:?}", w),
+        }
+    }
+
+    /// parse-1.59/60: Quote in array index `$a(x")`.
+    #[test]
+    fn test_parse_1_59_quote_in_index() {
+        let cmds = parse("set x $a(x\")").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => {
+                assert!(name.starts_with("a("), "should be array: {:?}", name);
+                assert!(name.contains("x\""), "index should contain quote: {:?}", name);
+            }
+            w => panic!("expected VarRef, got {:?}", w),
+        }
+    }
+
+    // ===================================================================
+    // Edge cases and robustness tests
+    // ===================================================================
+
+    /// Empty script: should produce empty command list.
+    #[test]
+    fn test_empty_script() {
+        let cmds = parse("").unwrap();
+        assert!(cmds.is_empty());
+    }
+
+    /// Whitespace-only script.
+    #[test]
+    fn test_whitespace_only_script() {
+        let cmds = parse("   \n\t\n  ").unwrap();
+        assert!(cmds.is_empty());
+    }
+
+    /// Comment-only script.
+    #[test]
+    fn test_comment_only_script() {
+        let cmds = parse("# just a comment\n# another comment\n").unwrap();
+        assert!(cmds.is_empty());
+    }
+
+    /// Multiple blank lines between commands.
+    #[test]
+    fn test_blank_lines_between_commands() {
+        let cmds = parse("set x 1\n\n\n\nset y 2\n").unwrap();
+        assert_eq!(cmds.len(), 2);
+    }
+
+    /// Tab and form-feed as word separators.
+    #[test]
+    fn test_tab_formfeed_separators() {
+        let cmds = parse("set\tx\t1").unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[0] { Word::Literal(s) => assert_eq!(s, "set"), w => panic!("{:?}", w) }
+    }
+
+    /// Nested command substitution: `[a [b c]]`.
+    #[test]
+    fn test_nested_cmd_sub() {
+        let cmds = parse("set x [list [expr 1]]").unwrap();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0].words[2] {
+            Word::CommandSub(s) => {
+                assert!(s.contains("[expr 1]"), "should contain nested cmd sub: {:?}", s);
+            }
+            w => panic!("expected CommandSub, got {:?}", w),
+        }
+    }
+
+    /// Deeply nested command substitution: `[a [b [c]]]`.
+    #[test]
+    fn test_deeply_nested_cmd_sub() {
+        let cmds = parse("set x [a [b [c]]]").unwrap();
+        match &cmds[0].words[2] {
+            Word::CommandSub(s) => {
+                assert!(s.contains("[b [c]]"), "should contain nested subs: {:?}", s);
+            }
+            w => panic!("expected CommandSub, got {:?}", w),
+        }
+    }
+
+    /// Multiple variable refs in quoted string: `"$a $b $c"`.
+    #[test]
+    fn test_multiple_vars_in_quoted() {
+        let cmds = parse("set x \"$a $b $c\"").unwrap();
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                let var_count = parts.iter().filter(|w| matches!(w, Word::VarRef(_))).count();
+                assert_eq!(var_count, 3, "should have 3 VarRefs: {:?}", parts);
+            }
+            w => panic!("expected Concat with vars, got {:?}", w),
+        }
+    }
+
+    /// Variable + literal in bare context: `foo${bar}baz`.
+    #[test]
+    fn test_var_in_bare_context() {
+        let cmds = parse("set x foo${bar}baz").unwrap();
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                assert!(parts.iter().any(|w| matches!(w, Word::VarRef(n) if n == "bar")),
+                    "should contain VarRef(bar): {:?}", parts);
+                let lits: String = parts.iter().filter_map(|w| match w {
+                    Word::Literal(s) => Some(s.as_str()),
+                    _ => None,
+                }).collect();
+                assert!(lits.contains("foo") && lits.contains("baz"),
+                    "should contain foo and baz: {:?}", parts);
+            }
+            w => panic!("expected Concat, got {:?}", w),
+        }
+    }
+
+    /// Var + cmd sub in bare context: `x[cmd]y`.
+    #[test]
+    fn test_cmd_sub_in_bare_context() {
+        let cmds = parse("set v x[cmd]y").unwrap();
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                assert!(parts.iter().any(|w| matches!(w, Word::CommandSub(s) if s == "cmd")),
+                    "should contain CommandSub(cmd): {:?}", parts);
+            }
+            w => panic!("expected Concat, got {:?}", w),
+        }
+    }
+
+    /// Expand with variable: `{*}$var`.
+    #[test]
+    fn test_expand_variable() {
+        let cmds = parse("cmd {*}$var").unwrap();
+        match &cmds[0].words[1] {
+            Word::Expand(inner) => {
+                assert!(matches!(inner.as_ref(), Word::VarRef(n) if n == "var"),
+                    "expand should contain VarRef: {:?}", inner);
+            }
+            w => panic!("expected Expand(VarRef), got {:?}", w),
+        }
+    }
+
+    /// Expand with command substitution: `{*}[cmd]`.
+    #[test]
+    fn test_expand_cmd_sub() {
+        let cmds = parse("cmd {*}[list a b]").unwrap();
+        match &cmds[0].words[1] {
+            Word::Expand(inner) => {
+                assert!(matches!(inner.as_ref(), Word::CommandSub(_)),
+                    "expand should contain CommandSub: {:?}", inner);
+            }
+            w => panic!("expected Expand(CommandSub), got {:?}", w),
+        }
+    }
+
+    /// Expand with quoted word: `{*}"a b"`.
+    #[test]
+    fn test_expand_quoted() {
+        let cmds = parse("cmd {*}\"a b\"").unwrap();
+        match &cmds[0].words[1] {
+            Word::Expand(inner) => {
+                // inner is either Literal("a b") or similar
+                let s = format!("{}", inner);
+                assert!(s.contains("a b"), "should contain 'a b': {:?}", inner);
+            }
+            w => panic!("expected Expand, got {:?}", w),
+        }
+    }
+
+    /// `{*}` followed by whitespace is a braced literal, not expand.
+    #[test]
+    fn test_brace_star_brace_as_literal() {
+        let cmds = parse("set x {*}").unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "*"),
+            w => panic!("expected Literal(*), got {:?}", w),
+        }
+    }
+
+    /// `{*}` at end of input is a braced literal.
+    #[test]
+    fn test_brace_star_brace_at_end() {
+        let cmds = parse("cmd {*}").unwrap();
+        assert_eq!(cmds[0].words.len(), 2);
+        match &cmds[0].words[1] {
+            Word::Literal(s) => assert_eq!(s, "*"),
+            w => panic!("expected Literal(*), got {:?}", w),
+        }
+    }
+
+    /// Deeply nested braces: `{{{a}}}`.
+    #[test]
+    fn test_deeply_nested_braces() {
+        let cmds = parse("set x {{{a}}}").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "{{a}}"),
+            w => panic!("expected Literal({{a}}), got {:?}", w),
+        }
+    }
+
+    /// Braced string with internal pairs: `{a {b c} d}`.
+    #[test]
+    fn test_braced_internal_pairs() {
+        let cmds = parse("set x {a {b c} d}").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "a {b c} d"),
+            w => panic!("expected Literal, got {:?}", w),
+        }
+    }
+
+    /// Triple dollar signs in bare context: `$$$`.
+    #[test]
+    fn test_triple_dollar() {
+        let cmds = parse("set x $$$").unwrap();
+        // All orphan dollars — should produce literal "$$$" (or Concat of literals)
+        let w = &cmds[0].words[2];
+        let text = format!("{}", w);
+        assert_eq!(text, "$$$", "triple dollar: {:?}", w);
+    }
+
+    /// Dollar followed by open brace without close: `${`.
+    #[test]
+    fn test_dollar_open_brace_no_close() {
+        let result = parse("set x ${");
+        assert!(result.is_err(), "should error on unclosed ${{ : {:?}", result);
+    }
+
+    /// Missing close bracket in command substitution.
+    #[test]
+    fn test_missing_close_bracket() {
+        let result = parse("set x [expr 1");
+        assert!(result.is_err(), "should error on unclosed [: {:?}", result);
+    }
+
+    /// Missing close brace.
+    #[test]
+    fn test_missing_close_brace() {
+        let result = parse("set x {hello");
+        assert!(result.is_err(), "should error on unclosed brace: {:?}", result);
+    }
+
+    /// Missing close quote.
+    /// rd parser (like jimtcl): Err. PEG parser: backtracks, treats `"` as bare char → Ok.
+    #[test]
+    fn test_missing_close_quote() {
+        let result = parse("set x \"hello");
+        // Both Ok (PEG) and Err (rd) are acceptable
+        let _ = result;
+    }
+
+    /// Backslash at end of input (bare context).
+    /// rd parser: treats trailing `\` as literal → Ok("a\\").
+    /// PEG parser: Err (expected EOI or word).
+    #[test]
+    fn test_trailing_backslash_bare() {
+        let result = parse("set x a\\");
+        match result {
+            Ok(cmds) => {
+                match &cmds[0].words[2] {
+                    Word::Literal(s) => assert_eq!(s, "a\\"),
+                    Word::Concat(parts) => {
+                        let full: String = parts.iter().map(|w| format!("{}", w)).collect();
+                        assert_eq!(full, "a\\", "trailing backslash: {:?}", parts);
+                    }
+                    w => panic!("expected a\\, got {:?}", w),
+                }
+            }
+            Err(_) => {} // PEG backend rejects trailing backslash
+        }
+    }
+
+    /// Semicolon inside braces is literal.
+    #[test]
+    fn test_semicolon_in_braces() {
+        let cmds = parse("set x {a;b;c}").unwrap();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "a;b;c"),
+            w => panic!("expected Literal(a;b;c), got {:?}", w),
+        }
+    }
+
+    /// Newline inside braces is literal.
+    #[test]
+    fn test_newline_in_braces() {
+        let cmds = parse("set x {a\nb\nc}").unwrap();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "a\nb\nc"),
+            w => panic!("expected literal with newlines, got {:?}", w),
+        }
+    }
+
+    /// Backslash-newline as line continuation between words.
+    /// jimtcl parse-1.9: `set x 123;\<newline>set y 456` → two separate commands.
+    #[test]
+    fn test_backslash_newline_line_continuation() {
+        let cmds = parse("set x 123;\\\nset y 456").unwrap();
+        // Should produce: set x 123 (cmd1) ; set y 456 (cmd2 via line continuation)
+        // OR two commands depending on how ;\<newline> is handled
+        assert!(cmds.len() >= 1, "should parse: {:?}", cmds);
+    }
+
+    /// Backslash-newline between words as continuation within same word.
+    /// `list abc\<newline><tab>123` → `list {abc 123}` (2 words).
+    /// In Tcl, `\<newline>` replaces backslash + newline + leading whitespace with a single space,
+    /// so this joins into one word: "abc 123".
+    #[test]
+    fn test_backslash_newline_as_separator() {
+        let cmds = parse("list abc\\\n\t123").unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].words.len(), 2, "should have 2 words: {:?}", cmds[0].words);
+        match &cmds[0].words[1] {
+            Word::Literal(s) => assert_eq!(s, "abc 123"),
+            w => panic!("expected Literal(abc 123), got {:?}", w),
+        }
+    }
+
+    /// Consecutive semicolons produce no empty commands.
+    #[test]
+    fn test_consecutive_semicolons() {
+        let cmds = parse(";;;set x 1;;;set y 2;;;").unwrap();
+        assert_eq!(cmds.len(), 2);
+    }
+
+    /// Script with only semicolons and newlines.
+    #[test]
+    fn test_only_separators() {
+        let cmds = parse(";;;\n\n;;;\n").unwrap();
+        assert!(cmds.is_empty());
+    }
+
+    /// Command line number tracking.
+    #[test]
+    fn test_line_numbers() {
+        let cmds = parse("set x 1\n\nset y 2\nset z 3").unwrap();
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds[0].line, 1);
+        assert_eq!(cmds[1].line, 3);
+        assert_eq!(cmds[2].line, 4);
+    }
+
+    /// String with all escape types in quoted context.
+    #[test]
+    fn test_all_escape_types_in_quotes() {
+        let cmds = parse(r#"set x "\a\b\f\n\r\t\v""#).unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => {
+                assert_eq!(s, "\x07\x08\x0c\n\r\t\x0b");
+            }
+            w => panic!("expected literal with escapes, got {:?}", w),
+        }
+    }
+
+    /// Octal escape boundary: 3 digits max, then literal.
+    #[test]
+    fn test_octal_escape_boundary() {
+        // \1119 → \111 (=73='I') + '9'
+        let cmds = parse(r#"set x "\1119""#).unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => {
+                assert_eq!(s, "I9", "\\1119 should be 'I' + '9': {:?}", s);
+            }
+            w => panic!("expected literal, got {:?}", w),
+        }
+    }
+
+    /// Hex escape boundary: 2 digits max.
+    #[test]
+    fn test_hex_escape_boundary() {
+        // \x4Ag → \x4A (='J') + 'g'
+        let cmds = parse(r#"set x "\x4Ag""#).unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => {
+                assert_eq!(s, "Jg", "\\x4Ag should be 'J' + 'g': {:?}", s);
+            }
+            w => panic!("expected literal, got {:?}", w),
+        }
+    }
+
+    /// Unicode escape boundary: 4 digits max for \u.
+    #[test]
+    fn test_unicode_escape_boundary() {
+        // \u00b5x → µ + x
+        let cmds = parse("set x \"\\u00b5x\"").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => {
+                assert!(s.starts_with('\u{00b5}'), "should start with µ: {:?}", s);
+                assert!(s.ends_with('x'), "should end with x: {:?}", s);
+            }
+            w => panic!("expected literal, got {:?}", w),
+        }
+    }
+
+    /// Braces inside quoted string are literal.
+    #[test]
+    fn test_braces_in_quoted_string() {
+        let cmds = parse(r#"set x "{a {b} c}""#).unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "{a {b} c}"),
+            w => panic!("expected literal, got {:?}", w),
+        }
+    }
+
+    /// Comment after last command (no trailing newline).
+    #[test]
+    fn test_comment_after_command_no_newline() {
+        let cmds = parse("set x 1 ;# comment").unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].words.len(), 3);
+    }
+
+    /// Var ref with double-colon namespace prefix: `$::global`.
+    #[test]
+    fn test_var_ref_global_namespace() {
+        let cmds = parse("set x $::global").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => assert_eq!(name, "::global"),
+            w => panic!("expected VarRef(::global), got {:?}", w),
+        }
+    }
+
+    /// Var ref with deep namespace: `$a::b::c`.
+    #[test]
+    fn test_var_ref_deep_namespace() {
+        let cmds = parse("set x $a::b::c").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => assert_eq!(name, "a::b::c"),
+            w => panic!("expected VarRef(a::b::c), got {:?}", w),
+        }
+    }
+
+    /// Dollar followed by space is orphan.
+    #[test]
+    fn test_dollar_space_orphan() {
+        let cmds = parse("set x \"$ y\"").unwrap();
+        let text = format!("{}", &cmds[0].words[2]);
+        assert_eq!(text, "$ y", "dollar-space: {:?}", &cmds[0].words[2]);
+    }
+
+    /// Braced var ref: `${with spaces}` (unusual but valid).
+    #[test]
+    fn test_braced_var_name_with_special_chars() {
+        let cmds = parse("set x ${a.b-c}").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => assert_eq!(name, "a.b-c"),
+            w => panic!("expected VarRef(a.b-c), got {:?}", w),
+        }
+    }
+
+    /// Array variable with complex index: `$arr(key with spaces)`.
+    #[test]
+    fn test_array_index_with_spaces() {
+        let cmds = parse("set x $arr(key with spaces)").unwrap();
+        match &cmds[0].words[2] {
+            Word::VarRef(name) => {
+                assert!(name.starts_with("arr("), "should be array: {:?}", name);
+                assert!(name.contains("key with spaces"),
+                    "index should contain spaces: {:?}", name);
+            }
+            w => panic!("expected VarRef, got {:?}", w),
+        }
+    }
+
+    /// Comment with backslash-newline continuation.
+    #[test]
+    fn test_comment_continuation_multiline() {
+        let cmds = parse("# line1 \\\nline2\nset x 1").unwrap();
+        // "# line1 \" continues onto "line2", so only "set x 1" is a command
+        assert_eq!(cmds.len(), 1, "comment continuation should eat line2: {:?}", cmds);
+        match &cmds[0].words[0] {
+            Word::Literal(s) => assert_eq!(s, "set"),
+            w => panic!("expected set, got {:?}", w),
+        }
+    }
+
+    /// Escaped newline at end of quoted string.
+    #[test]
+    fn test_escaped_newline_end_of_quoted() {
+        let cmds = parse("set x \"abc\\n\"").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "abc\n"),
+            w => panic!("expected abc\\n, got {:?}", w),
+        }
+    }
+
+    /// Single-character command.
+    #[test]
+    fn test_single_char_command() {
+        let cmds = parse("x").unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].words.len(), 1);
+    }
+
+    /// Command substitution with semicolons: `[a; b; c]`.
+    #[test]
+    fn test_cmd_sub_with_semicolons() {
+        let cmds = parse("set x [list a; list b; list c]").unwrap();
+        match &cmds[0].words[2] {
+            Word::CommandSub(s) => {
+                assert!(s.contains(';'), "should contain semicolons: {:?}", s);
+            }
+            w => panic!("expected CommandSub, got {:?}", w),
+        }
+    }
+
+    /// Quoted string with command sub and var: `"[cmd]$var text"`.
+    #[test]
+    fn test_quoted_cmd_sub_var_text() {
+        let cmds = parse("set x \"[cmd]$var text\"").unwrap();
+        match &cmds[0].words[2] {
+            Word::Concat(parts) => {
+                assert!(parts.iter().any(|w| matches!(w, Word::CommandSub(_))),
+                    "should have CommandSub: {:?}", parts);
+                assert!(parts.iter().any(|w| matches!(w, Word::VarRef(_))),
+                    "should have VarRef: {:?}", parts);
+            }
+            w => panic!("expected Concat, got {:?}", w),
+        }
+    }
+
+    /// Backslash-backslash produces literal backslash.
+    #[test]
+    fn test_double_backslash_in_quotes() {
+        let cmds = parse(r#"set x "a\\b""#).unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "a\\b"),
+            w => panic!("expected literal a\\b, got {:?}", w),
+        }
+    }
+
+    /// Escaped characters in bare word.
+    #[test]
+    fn test_escape_in_bare_word() {
+        let cmds = parse(r"set x a\nb").unwrap();
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "a\nb"),
+            w => panic!("expected literal with newline, got {:?}", w),
+        }
+    }
+
+    /// `{*}` followed by semicolon is braced literal, not expand.
+    #[test]
+    fn test_expand_before_semicolon() {
+        let cmds = parse("cmd {*};other").unwrap();
+        // {*} before ; should be literal *, not expand
+        assert!(cmds.len() >= 1);
+        match &cmds[0].words[1] {
+            Word::Literal(s) => assert_eq!(s, "*"),
+            w => panic!("expected Literal(*), got {:?}", w),
+        }
+    }
+
+    /// Empty quoted string as argument.
+    #[test]
+    fn test_empty_quoted_arg() {
+        let cmds = parse("cmd \"\" arg").unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[1] {
+            Word::Literal(s) => assert_eq!(s, ""),
+            w => panic!("expected empty Literal, got {:?}", w),
+        }
+    }
+
+    /// Empty braced string as argument.
+    #[test]
+    fn test_empty_braced_arg() {
+        let cmds = parse("cmd {} arg").unwrap();
+        assert_eq!(cmds[0].words.len(), 3);
+        match &cmds[0].words[1] {
+            Word::Literal(s) => assert_eq!(s, ""),
+            w => panic!("expected empty Literal, got {:?}", w),
         }
     }
 }

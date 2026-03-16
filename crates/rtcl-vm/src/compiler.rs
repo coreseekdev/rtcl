@@ -307,7 +307,7 @@ impl Compiler {
 
     /// `incr varName ?increment?`
     fn compile_incr(&mut self, cmd: &Command) {
-        let line = cmd.line as u32;
+        let _line = cmd.line as u32;
         // Fall back to generic for now — can be optimised later with
         // LoadGlobal + PushInt + Add + StoreGlobal.
         self.compile_generic_command(cmd);

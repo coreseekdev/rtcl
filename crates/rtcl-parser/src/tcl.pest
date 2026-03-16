@@ -56,6 +56,7 @@ braced = { "{" ~ braced_content* ~ "}" }
 braced_content = _{
     braced |           // Nested braced strings
     braced_escape |    // Backslash followed by newline (line continuation in braces)
+    braced_backslash | // Backslash followed by any non-newline char (preserved literally)
     braced_char        // Regular character
 }
 braced_char = _{
@@ -64,6 +65,11 @@ braced_char = _{
 // In braced strings, \ followed by newline and whitespace is a line continuation
 // The backslash-newline-whitespace sequence is replaced with a single space
 braced_escape = _{ "\\" ~ NEWLINE ~ WHITESPACE* }
+// In braced strings, \ followed by any non-newline char is preserved literally
+// (including the backslash itself)
+braced_backslash = _{ "\\" ~ !NEWLINE ~ ANY }
+// Lone backslash at end of braced string (no following char before })  
+// Note: This is technically a trailing backslash, preserved as-is
 
 // Quoted string - allows substitution
 // Reference: jimtcl JimParseQuote / JimParseSubQuote
@@ -133,29 +139,49 @@ index_char = _{
 
 // Command substitution - supports nested brackets, braces, and quotes
 // Reference: jimtcl JimParseCmd / JimParseSubCmd
+// The first element after [ can be a quoted string (word-start position)
 cmd_sub = {
-    "[" ~ cmd_content* ~ "]"
+    "[" ~ (cmd_quoted | cmd_content)* ~ "]"
 }
+// Command substitution content: track balanced brackets, braces, quotes, escapes.
+// This is opaque text re-parsed at eval time. We need enough structure to find
+// the matching ].
+//
+// Key: " only starts a quote at word boundaries (jimtcl's startofword).
+// We approximate this: after [, whitespace, ;, or newline, " starts a quote.
+// Mid-word " is treated as a regular character.
 cmd_content = _{
-    cmd_sub |         // Nested command sub [cmd1 [cmd2]]
-    cmd_braced |      // Braced string inside { }
-    cmd_quoted |      // Quoted string inside " "
-    cmd_char          // Regular character
+    cmd_sub |         // Nested [...]
+    cmd_braced |      // Braced {...}
+    cmd_escape |      // \X — consumes 2 chars, prevents \] from closing
+    cmd_sep_quote |   // word-boundary " at start → quoted string
+    cmd_char          // regular character (includes mid-word ")
 }
 cmd_braced = _{ "{" ~ cmd_braced_content* ~ "}" }
 cmd_braced_content = _{
     cmd_braced |
-    (!"{") ~ (!"}") ~ ANY
+    cmd_braced_escape |
+    (!"{") ~ (!"}") ~ (!"\\") ~ ANY
 }
+cmd_braced_escape = _{ "\\" ~ ANY }
+// A quoted string that starts at a word boundary (preceded by separators).
+// We consume the separator + quote as a unit.
+cmd_sep_quote = _{
+    cmd_separator+ ~ "\"" ~ cmd_quoted_content* ~ "\""
+}
+// For the first word after [, we handle it in cmd_sub directly
 cmd_quoted = _{ "\"" ~ cmd_quoted_content* ~ "\"" }
 cmd_quoted_content = _{
     cmd_escape |
-    (!"\"") ~ ANY
+    (!"\"") ~ (!"\\") ~ ANY
 }
 cmd_escape = _{ "\\" ~ ANY }
+// Regular char: not [ ] { } \ but CAN be "
 cmd_char = _{
-    (!"[") ~ (!"]") ~ (!"{") ~ (!"}") ~ (!"\"") ~ ANY
+    (!"[") ~ (!"]") ~ (!"{") ~ (!"}") ~ (!"\\") ~ ANY
 }
+// Separators within cmd_sub: whitespace, newlines, semicolons
+cmd_separator = _{ WHITESPACE | NEWLINE | ";" }
 
 // Orphan dollar sign - $ not followed by valid variable name chars
 // In jimtcl, a lone $ is treated as a literal character

@@ -1,0 +1,98 @@
+# Tests for list commands - extracted from jimtcl list.test
+source [file dirname [info script]]/rtcl_test.tcl
+
+puts "Testing list commands..."
+
+test list-1.1 {basic list} {
+    llength {a b c}
+} {3}
+
+test list-1.2 {empty list} {
+    llength {}
+} {0}
+
+test list-2.1 {lindex first} {
+    lindex {a b c} 0
+} {a}
+
+test list-2.2 {lindex middle} {
+    lindex {a b c} 1
+} {b}
+
+test list-2.3 {lindex last} {
+    lindex {a b c} 2
+} {c}
+
+test list-2.4 {lindex out of range} {
+    lindex {a b c} 5
+} {}
+
+test list-2.5 {lindex negative} {
+    lindex {a b c} -1
+} {}
+
+test list-3.1 {lappend single} {
+    set lst {a b}
+    lappend lst c
+    set lst
+} {a b c}
+
+test list-3.2 {lappend multiple} {
+    set lst {a}
+    lappend lst b c d
+    set lst
+} {a b c d}
+
+test list-4.1 {lrange basic} {
+    lrange {a b c d e} 1 3
+} {b c d}
+
+test list-4.2 {lrange to end} {
+    lrange {a b c d e} 2 end
+} {c d e}
+
+test list-4.3 {lrange from start} {
+    lrange {a b c d e} 0 2
+} {a b c}
+
+test list-5.1 {lsearch found} {
+    lsearch {a b c} b
+} {1}
+
+test list-5.2 {lsearch not found} {
+    lsearch {a b c} d
+} {-1}
+
+test list-6.1 {lsort basic} {
+    lsort {c a b}
+} {a b c}
+
+test list-6.2 {lsort numbers} {
+    lsort {3 1 2}
+} {1 2 3}
+
+test list-7.1 {concat basic} {
+    concat {a b} {c d}
+} {a b c d}
+
+test list-8.1 {linsert at start} {
+    linsert {b c} 0 a
+} {a b c}
+
+test list-8.2 {linsert in middle} {
+    linsert {a c} 1 b
+} {a b c}
+
+test list-8.3 {linsert at end} {
+    linsert {a b} 2 c
+} {a b c}
+
+test list-9.1 {lreplace middle} {
+    lreplace {a b c d} 1 2 x
+} {a x d}
+
+test list-9.2 {lreplace delete} {
+    lreplace {a b c d} 1 2
+} {a d}
+
+testreport

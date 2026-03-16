@@ -52,11 +52,18 @@ fn main() {
 fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
     let mut interp = Interp::new();
 
+    // Set script name for info script command
+    interp.set_script_name(&path.to_string_lossy());
+
     let script = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read file '{}': {}", path.display(), e))?;
 
-    interp.eval(&script)
-        .map_err(|e| e.to_string())?;
+    // Restore original script name after execution
+    let result = interp.eval(&script);
+
+    if let Err(e) = result {
+        return Err(e.to_string());
+    }
 
     if !quiet {
         println!("Script executed successfully");

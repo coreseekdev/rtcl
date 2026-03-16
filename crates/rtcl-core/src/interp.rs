@@ -34,6 +34,9 @@ pub struct Interp {
     max_call_depth: usize,
     /// Last result
     result: Value,
+    /// Current script name (for info script)
+    #[cfg(feature = "std")]
+    script_name: String,
 }
 
 impl Default for Interp {
@@ -52,6 +55,8 @@ impl Interp {
             call_depth: 0,
             max_call_depth: 1000,
             result: Value::empty(),
+            #[cfg(feature = "std")]
+            script_name: String::new(),
         };
 
         // Register built-in commands
@@ -107,6 +112,12 @@ impl Interp {
         self.register_builtin("array", Self::cmd_array);
         #[cfg(feature = "std")]
         self.register_builtin("source", Self::cmd_source);
+        #[cfg(feature = "std")]
+        self.register_builtin("file", Self::cmd_file);
+        #[cfg(feature = "std")]
+        self.register_builtin("format", Self::cmd_format);
+        #[cfg(feature = "std")]
+        self.register_builtin("glob", Self::cmd_glob);
     }
 
     /// Register a built-in command
@@ -185,6 +196,17 @@ impl Interp {
         &self.result
     }
 
+    /// Set the current script name (for info script)
+    #[cfg(feature = "std")]
+    pub fn set_script_name(&mut self, name: &str) {
+        self.script_name = name.to_string();
+    }
+
+    /// Get the script name
+    pub fn script_name(&self) -> &str {
+        &self.script_name
+    }
+
     /// Evaluate a string of Tcl code
     pub fn eval(&mut self, script: &str) -> Result<Value> {
         let commands = parser::parse(script)?;
@@ -261,8 +283,16 @@ impl Interp {
         // Clone params to avoid borrow issues
         let params = proc.params.clone();
 
-        // Bind parameters to arguments
-        for (i, param) in params.iter().enumerate() {
+        // Check if last param is 'args' for variadic support
+        let has_args = params.last().map(|p| p.as_str()) == Some("args");
+        let regular_params = if has_args {
+            &params[..params.len() - 1]
+        } else {
+            &params[..]
+        };
+
+        // Bind regular parameters to arguments
+        for (i, param) in regular_params.iter().enumerate() {
             let value = if i + 1 < args.len() {
                 args[i + 1].clone()
             } else {
@@ -278,6 +308,40 @@ impl Interp {
 
             // Set new value
             self.vars.insert(param.clone(), value);
+        }
+
+        // If 'args' parameter exists, collect remaining arguments as a list
+        if has_args {
+            let remaining_start = regular_params.len() + 1;
+            let remaining_args: Vec<&Value> = if remaining_start < args.len() {
+                args[remaining_start..].iter().collect()
+            } else {
+                Vec::new()
+            };
+
+            // Build list string
+            let list_str: String = remaining_args.iter()
+                .map(|v| {
+                    let s = v.as_str();
+                    // Simple quoting - if contains space or is empty, wrap in braces
+                    if s.is_empty() || s.contains(' ') || s.contains('\t') || s.contains('\n') {
+                        format!("{{{}}}", s)
+                    } else {
+                        s.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            // Save old value of 'args' if it exists
+            if let Some(old) = self.vars.get("args") {
+                saved_vars.push(("args".to_string(), Some(old.clone())));
+            } else {
+                saved_vars.push(("args".to_string(), None));
+            }
+
+            // Set 'args' to the list of remaining arguments
+            self.vars.insert("args".to_string(), Value::from_str(&list_str));
         }
 
         // Execute the body
@@ -522,8 +586,20 @@ impl Interp {
                 }
             }
 
-            // Execute next
-            interp.eval(next)?;
+            // Execute next - also handle break/continue here
+            match interp.eval(next) {
+                Ok(_) => {}
+                Err(e) => {
+                    if e.is_break() {
+                        break;
+                    }
+                    if e.is_continue() {
+                        // Continue to next iteration
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
         }
 
         Ok(result)
@@ -872,13 +948,25 @@ impl Interp {
                 if let Some(var) = result_var {
                     interp.set_var(var, v)?;
                 }
+                // TCL_OK = 0
                 Ok(Value::from_int(0))
             }
             Err(e) => {
                 if let Some(var) = result_var {
                     interp.set_var(var, Value::from_str(&e.to_string()))?;
                 }
-                Ok(Value::from_int(e.code() as i64))
+                // Map to Tcl return codes:
+                // TCL_ERROR = 1, TCL_RETURN = 2, TCL_BREAK = 3, TCL_CONTINUE = 4
+                let code = if e.is_return() {
+                    2
+                } else if e.is_break() {
+                    3
+                } else if e.is_continue() {
+                    4
+                } else {
+                    1 // TCL_ERROR for all other errors
+                };
+                Ok(Value::from_int(code))
             }
         }
     }
@@ -951,26 +1039,66 @@ impl Interp {
                     .collect();
                 Ok(Value::from_list(&cmds))
             }
+            "procs" => {
+                let pattern = if args.len() > 2 {
+                    args[2].as_str()
+                } else {
+                    "*"
+                };
+                let procs: Vec<Value> = interp.procs.keys()
+                    .filter(|k| glob_match(pattern, k))
+                    .map(|k| Value::from_str(k))
+                    .collect();
+                Ok(Value::from_list(&procs))
+            }
             "level" => Ok(Value::from_int(0)), // Simple implementation
             "body" => {
                 if args.len() != 3 {
                     return Err(Error::wrong_args("info body", 3, args.len()));
                 }
-                // Would need to track proc bodies
-                Ok(Value::empty())
+                let name = args[2].as_str();
+                if let Some(proc) = interp.procs.get(name) {
+                    Ok(Value::from_str(&proc.body))
+                } else {
+                    Ok(Value::empty())
+                }
             }
             "args" => {
                 if args.len() != 3 {
                     return Err(Error::wrong_args("info args", 3, args.len()));
                 }
-                // Would need to track proc args
-                Ok(Value::empty())
+                let name = args[2].as_str();
+                if let Some(proc) = interp.procs.get(name) {
+                    Ok(Value::from_list(&proc.params.iter().map(|p| Value::from_str(p)).collect::<Vec<_>>()))
+                } else {
+                    Ok(Value::empty())
+                }
+            }
+            "script" => {
+                #[cfg(feature = "std")]
+                {
+                    Ok(Value::from_str(&interp.script_name))
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    Ok(Value::empty())
+                }
             }
             "version" => Ok(Value::from_str(crate::VERSION)),
+            "nameofexecutable" => {
+                #[cfg(feature = "std")]
+                {
+                    Ok(Value::from_str(""))
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    Ok(Value::empty())
+                }
+            }
             _ => Err(Error::runtime(
                 format!("unknown info subcommand: {}", subcmd),
                 crate::error::ErrorCode::InvalidOp,
-            )),
+            ))
         }
     }
 
@@ -1015,13 +1143,28 @@ impl Interp {
 
     /// uplevel command
     fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-        // Simplified uplevel - just evaluates in current scope
+        // uplevel ?level? arg ?arg ...?
+        // Simplified uplevel - just evaluates in current scope (level is ignored)
         if args.len() < 2 {
             return Err(Error::wrong_args("uplevel", 2, args.len()));
         }
 
+        // Determine if first arg is a level specification
+        // Level can be: #N (absolute), N (relative), or omitted (default 1)
+        let start_idx = if args.len() > 2 {
+            let first = args[1].as_str();
+            // Check if it looks like a level: starts with # or is a number
+            if first.starts_with('#') || first.chars().all(|c| c.is_ascii_digit() || c == '-') {
+                2 // Skip the level argument
+            } else {
+                1 // No level, start from first arg
+            }
+        } else {
+            1
+        };
+
         let mut script = String::new();
-        for arg in &args[1..] {
+        for arg in &args[start_idx..] {
             if !script.is_empty() {
                 script.push(' ');
             }
@@ -1156,7 +1299,16 @@ impl Interp {
                 crate::error::ErrorCode::Io
             ))?;
 
-        interp.eval(&content)
+        // Save old script name and set new one
+        let old_script = interp.script_name.clone();
+        interp.script_name = filename.to_string();
+
+        let result = interp.eval(&content);
+
+        // Restore old script name
+        interp.script_name = old_script;
+
+        result
     }
 
     /// lrange command - get a range of list elements
@@ -1881,6 +2033,221 @@ impl Interp {
                 crate::error::ErrorCode::InvalidOp,
             )),
         }
+    }
+
+    /// file command - file operations
+    #[cfg(feature = "std")]
+    fn cmd_file(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 3 {
+            return Err(Error::wrong_args("file", 3, args.len()));
+        }
+
+        let subcmd = args[1].as_str();
+        let path = args[2].as_str();
+
+        match subcmd {
+            "dirname" => {
+                let path = std::path::Path::new(path);
+                let parent = path.parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.to_string_lossy().to_string());
+                Ok(Value::from_str(&parent))
+            }
+            "tail" => {
+                let name = std::path::Path::new(path).file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                Ok(Value::from_str(&name))
+            }
+            "join" => {
+                let mut result = std::path::PathBuf::new();
+                for arg in &args[2..] {
+                    result.push(arg.as_str());
+                }
+                Ok(Value::from_str(&result.to_string_lossy()))
+            }
+            "exists" => {
+                Ok(Value::from_bool(std::path::Path::new(path).exists()))
+            }
+            "readable" => {
+                Ok(Value::from_bool(std::path::Path::new(path).exists())) // Simplified
+            }
+            "writable" => {
+                Ok(Value::from_bool(true)) // Simplified
+            }
+            "isfile" => {
+                Ok(Value::from_bool(std::path::Path::new(path).is_file()))
+            }
+            "isdirectory" => {
+                Ok(Value::from_bool(std::path::Path::new(path).is_dir()))
+            }
+            "extension" => {
+                let ext = std::path::Path::new(path).extension()
+                    .map(|e| format!(".{}", e.to_string_lossy()))
+                    .unwrap_or_default();
+                Ok(Value::from_str(&ext))
+            }
+            "rootname" => {
+                let path = std::path::Path::new(path);
+                let stem = path.file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let parent = path.parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if parent.is_empty() {
+                    Ok(Value::from_str(&stem))
+                } else {
+                    Ok(Value::from_str(&format!("{}/{}", parent, stem)))
+                }
+            }
+            _ => Err(Error::runtime(
+                format!("unknown file subcommand: {}", subcmd),
+                crate::error::ErrorCode::InvalidOp,
+            )),
+        }
+    }
+
+    /// format command - string formatting
+    #[cfg(feature = "std")]
+    fn cmd_format(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 {
+            return Err(Error::wrong_args("format", 2, args.len()));
+        }
+
+        let format_str = args[1].as_str();
+        let format_args: Vec<&str> = args[2..].iter().map(|v| v.as_str()).collect();
+
+        // Simple format implementation
+        let mut result = String::new();
+        let mut chars = format_str.chars().peekable();
+        let mut arg_idx = 0;
+
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                let next = chars.peek();
+                match next {
+                    Some('s') => {
+                        chars.next();
+                        if arg_idx < format_args.len() {
+                            result.push_str(format_args[arg_idx]);
+                            arg_idx += 1;
+                        }
+                    }
+                    Some('d') | Some('i') => {
+                        chars.next();
+                        if arg_idx < format_args.len() {
+                            let val: i64 = format_args[arg_idx].parse().unwrap_or(0);
+                            result.push_str(&val.to_string());
+                            arg_idx += 1;
+                        }
+                    }
+                    Some('f') => {
+                        chars.next();
+                        if arg_idx < format_args.len() {
+                            let val: f64 = format_args[arg_idx].parse().unwrap_or(0.0);
+                            result.push_str(&val.to_string());
+                            arg_idx += 1;
+                        }
+                    }
+                    Some('x') => {
+                        chars.next();
+                        if arg_idx < format_args.len() {
+                            let val: i64 = format_args[arg_idx].parse().unwrap_or(0);
+                            result.push_str(&format!("{:x}", val));
+                            arg_idx += 1;
+                        }
+                    }
+                    Some('X') => {
+                        chars.next();
+                        if arg_idx < format_args.len() {
+                            let val: i64 = format_args[arg_idx].parse().unwrap_or(0);
+                            result.push_str(&format!("{:X}", val));
+                            arg_idx += 1;
+                        }
+                    }
+                    Some('c') => {
+                        chars.next();
+                        if arg_idx < format_args.len() {
+                            let val: u8 = format_args[arg_idx].parse().unwrap_or(0);
+                            if val > 0 {
+                                result.push(val as char);
+                            }
+                            arg_idx += 1;
+                        }
+                    }
+                    Some('%') => {
+                        chars.next();
+                        result.push('%');
+                    }
+                    _ => {
+                        result.push(c);
+                    }
+                }
+            } else {
+                result.push(c);
+            }
+        }
+
+        Ok(Value::from_str(&result))
+    }
+
+    /// glob command - file pattern matching
+    #[cfg(feature = "std")]
+    fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 {
+            return Err(Error::wrong_args("glob", 2, args.len()));
+        }
+
+        let mut i = 1;
+        let mut directory = ".";
+
+        // Parse options
+        while i < args.len() && args[i].as_str().starts_with('-') {
+            match args[i].as_str() {
+                "-directory" => {
+                    i += 1;
+                    if i < args.len() {
+                        directory = args[i].as_str();
+                    }
+                    i += 1;
+                }
+                "-nocomplain" => {
+                    i += 1;
+                }
+                "--" => {
+                    i += 1;
+                    break;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+
+        // Collect patterns
+        let patterns: Vec<&str> = args[i..].iter().map(|v| v.as_str()).collect();
+
+        let mut result = Vec::new();
+        let dir = std::path::Path::new(directory);
+
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                for pattern in &patterns {
+                    if glob_match(pattern, &name) {
+                        let full_path = if directory == "." {
+                            name.clone()
+                        } else {
+                            format!("{}/{}", directory, name)
+                        };
+                        result.push(Value::from_str(&full_path));
+                    }
+                }
+            }
+        }
+
+        Ok(Value::from_list(&result))
     }
 }
 

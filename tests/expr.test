@@ -1,0 +1,88 @@
+# Tests for expr command - extracted from jimtcl expr.test
+source [file dirname [info script]]/rtcl_test.tcl
+
+puts "Testing expr..."
+
+test expr-1.1 {basic arithmetic} {
+    expr 1 + 2
+} {3}
+
+test expr-1.2 {operator precedence} {
+    expr 2 + 3 * 4
+} {14}
+
+test expr-1.3 {parentheses} {
+    expr (2 + 3) * 4
+} {20}
+
+test expr-1.4 {division} {
+    expr 15 / 3
+} {5}
+
+test expr-1.5 {modulo} {
+    expr 17 % 5
+} {2}
+
+test expr-2.1 {comparison less than} {
+    expr 1 < 2
+} {1}
+
+test expr-2.2 {comparison greater than} {
+    expr 2 > 1
+} {1}
+
+test expr-2.3 {comparison equal} {
+    expr 1 == 1
+} {1}
+
+test expr-2.4 {comparison not equal} {
+    expr 1 != 2
+} {1}
+
+test expr-2.5 {string equal} {
+    expr {"abc" eq "abc"}
+} {1}
+
+test expr-2.6 {string not equal} {
+    expr {"abc" ne "def"}
+} {1}
+
+test expr-3.1 {logical and} {
+    expr 1 && 1
+} {1}
+
+test expr-3.2 {logical and false} {
+    expr 1 && 0
+} {0}
+
+test expr-3.3 {logical or} {
+    expr 0 || 1
+} {1}
+
+test expr-3.4 {logical not} {
+    expr !0
+} {1}
+
+test expr-4.1 {abs function} {
+    expr abs(-5)
+} {5}
+
+test expr-4.2 {sqrt function} {
+    expr sqrt(16)
+} {4.0}
+
+test expr-4.3 {pow function} {
+    expr pow(2, 3)
+} {8}
+
+test expr-4.4 {min function} {
+    expr min(3, 1, 2)
+} {1.0}
+
+test expr-4.5 {max function} {
+    expr max(3, 1, 2)
+} {3.0}
+
+# Note: ternary operator ?: is not supported in rtcl
+
+testreport

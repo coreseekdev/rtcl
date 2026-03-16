@@ -240,6 +240,29 @@ impl<'a> ExprParser<'a> {
             return Ok(val);
         }
 
+        // Command substitution
+        if self.peek() == '[' {
+            self.advance(); // consume [
+            let mut cmd = String::new();
+            let mut depth = 1;
+            while !self.is_at_end() && depth > 0 {
+                let c = self.advance();
+                if c == '[' {
+                    depth += 1;
+                    cmd.push(c);
+                } else if c == ']' {
+                    depth -= 1;
+                    if depth > 0 {
+                        cmd.push(c);
+                    }
+                } else {
+                    cmd.push(c);
+                }
+            }
+            // Execute the command
+            return self.interp.eval(&cmd);
+        }
+
         // Variable reference
         if self.peek() == '$' {
             self.advance();

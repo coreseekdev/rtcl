@@ -679,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_ecall() {
+    fn test_compile_call_string() {
         let bc = Compiler::compile_script("string length hello").unwrap();
         let ops = bc.ops();
         assert!(ops.iter().any(|o| matches!(o, OpCode::Call { .. })));

@@ -159,13 +159,6 @@ impl CmdId {
     }
 }
 
-// Backward-compatible aliases so existing code that references the old
-// names still compiles.  These will be removed in a future cleanup pass.
-#[doc(hidden)]
-pub type StdCmdId = CmdId;
-#[doc(hidden)]
-pub type ExtCmdId = CmdId;
-
 // ---------------------------------------------------------------------------
 // OpCode — the instruction set
 // ---------------------------------------------------------------------------

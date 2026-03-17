@@ -173,7 +173,7 @@ impl Interp {
         self.commands.contains_key(name)
     }
 
-    // -- ECall / SysCall dispatch (by numeric ID) ----------------------------
+    // -- Call dispatch (by numeric CmdId) ------------------------------------
 
     /// Map a `CmdId` (u16) to the corresponding command function.
     fn resolve_cmd(&self, cmd_id: u16) -> Option<CommandFunc> {

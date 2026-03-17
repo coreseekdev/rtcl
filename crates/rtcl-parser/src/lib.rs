@@ -30,7 +30,7 @@ pub mod validate;
 
 // Re-exports
 pub use opcode::OpCode;
-pub use opcode::{CmdId, StdCmdId, ExtCmdId};
+pub use opcode::CmdId;
 pub use bytecode::ByteCode;
 pub use compiler::Compiler;
 

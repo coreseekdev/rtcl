@@ -8,5 +8,5 @@ keywords = ["tcl", "vm", "bytecode", "interpreter"]
 categories = ["parser-implementations"]
 
 [dependencies]
-rtcl-parser.workspace = true
+rtcl-ir.workspace = true
 smallvec.workspace = true

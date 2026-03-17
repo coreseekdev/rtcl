@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/rtcl-ir",
     "crates/rtcl-parser",
     "crates/rtcl-vm",
     "crates/rtcl-core",
@@ -18,6 +19,7 @@ authors = ["rtcl contributors"]
 rust-version = "1.70"
 
 [workspace.dependencies]
+rtcl-ir = { path = "crates/rtcl-ir" }
 rtcl-parser = { path = "crates/rtcl-parser" }
 rtcl-vm = { path = "crates/rtcl-vm" }
 rtcl-core = { path = "crates/rtcl-core" }

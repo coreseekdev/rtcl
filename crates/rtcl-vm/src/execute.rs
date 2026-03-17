@@ -12,7 +12,7 @@
 use crate::context::VmContext;
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
-use rtcl_parser::{ByteCode, OpCode};
+use rtcl_ir::{ByteCode, OpCode};
 
 /// Active-loop descriptor pushed by `LoopEnter`, popped by `LoopExit`.
 struct ActiveLoop {

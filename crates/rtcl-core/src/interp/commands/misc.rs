@@ -3,7 +3,7 @@
 use crate::error::{Error, Result};
 use crate::interp::Interp;
 use crate::value::Value;
-use rtcl_vm::Compiler;
+use rtcl_parser::Compiler;
 
 pub fn cmd_set(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     match args.len() {

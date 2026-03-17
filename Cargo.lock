@@ -370,14 +370,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtcl-ir"
+version = "0.1.0"
+
+[[package]]
 name = "rtcl-parser"
 version = "0.1.0"
+dependencies = [
+ "rtcl-ir",
+]
 
 [[package]]
 name = "rtcl-vm"
 version = "0.1.0"
 dependencies = [
- "rtcl-parser",
+ "rtcl-ir",
  "smallvec",
 ]
 

@@ -8,13 +8,14 @@
 //! - [`VmContext`] — trait abstracting the interpreter for the VM
 //! - [`execute`] — runs [`ByteCode`] against a [`VmContext`]
 //!
-//! Bytecode definitions ([`OpCode`], [`ByteCode`]) and the [`Compiler`]
-//! live in [`rtcl_parser`].
+//! Bytecode definitions ([`OpCode`], [`ByteCode`]) live in [`rtcl_ir`].
+//! The [`Compiler`] lives in [`rtcl_parser`].
 //!
 //! ## Usage
 //!
 //! ```ignore
-//! use rtcl_parser::{Compiler, ByteCode, OpCode};
+//! use rtcl_ir::{ByteCode, OpCode};
+//! use rtcl_parser::Compiler;
 //! use rtcl_vm::{Value, execute, VmContext};
 //!
 //! // Compile a script
@@ -34,6 +35,6 @@ pub use value::Value;
 pub use context::VmContext;
 pub use execute::execute;
 
-// Re-export bytecode types from rtcl-parser for convenience
-pub use rtcl_parser::{ByteCode, Compiler, OpCode};
+// Re-export IR types from rtcl-ir for convenience
+pub use rtcl_ir::{ByteCode, OpCode, CmdId};
 

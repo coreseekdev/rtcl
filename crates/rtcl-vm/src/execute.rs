@@ -1,14 +1,24 @@
 //! VM execution engine — runs compiled [`ByteCode`] via a [`VmContext`].
 //!
-//! The VM maintains a value stack and a program counter, and dispatches
-//! opcodes in a loop.  Commands that cannot be compiled (dynamic names,
-//! user procs) are handled by calling back into the interpreter through
-//! the [`VmContext`] trait.
+//! The VM maintains:
+//! - A value **stack**
+//! - A **program counter** (PC)
+//! - A **loop stack** for `break`/`continue` resolution
+//!
+//! Control-flow commands (if/while/for) are executed as native jump+loop
+//! opcodes.  Standard and extension commands are dispatched via `ecall` /
+//! `syscall` on the [`VmContext`] (no HashMap lookup).
 
 use crate::context::VmContext;
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
 use rtcl_parser::{ByteCode, OpCode};
+
+/// Active-loop descriptor pushed by `LoopEnter`, popped by `LoopExit`.
+struct ActiveLoop {
+    continue_pc: u32,
+    break_pc: u32,
+}
 
 /// Execute a compiled [`ByteCode`] block using the given [`VmContext`].
 ///
@@ -18,6 +28,7 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
     let ops = code.ops();
     let mut pc: usize = 0;
     let mut stack: Vec<Value> = Vec::with_capacity(32);
+    let mut loops: Vec<ActiveLoop> = Vec::new();
 
     while pc < ops.len() {
         let op = &ops[pc];
@@ -45,6 +56,16 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             }
 
             // ── Variables ───────────────────────────────────────────
+            OpCode::LoadVar(idx) => {
+                let name = code.get_const(*idx).unwrap_or("");
+                let val = ctx.get_var(name)?;
+                stack.push(val);
+            }
+            OpCode::StoreVar(idx) => {
+                let val = stack.last().cloned().unwrap_or_else(Value::empty);
+                let name = code.get_const(*idx).unwrap_or("");
+                ctx.set_var(name, val)?;
+            }
             OpCode::LoadLocal(slot) => {
                 let name = code.locals().get(*slot as usize).map(|s| s.as_str()).unwrap_or("");
                 stack.push(ctx.get_var(name).unwrap_or_else(|_| Value::empty()));
@@ -54,62 +75,46 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                 let name = code.locals().get(*slot as usize).map(|s| s.as_str()).unwrap_or("");
                 ctx.set_var(name, val)?;
             }
-            OpCode::LoadGlobal(idx) => {
-                let name = code.get_const(*idx).unwrap_or("");
-                let val = ctx.get_var(name)?;
-                stack.push(val);
-            }
-            OpCode::StoreGlobal(idx) => {
-                let val = stack.last().cloned().unwrap_or_else(Value::empty);
-                let name = code.get_const(*idx).unwrap_or("");
-                ctx.set_var(name, val)?;
-            }
-            OpCode::LoadArray(name_idx) => {
+            OpCode::LoadArrayElem(name_idx) => {
                 let index_val = stack.pop().unwrap_or_else(Value::empty);
                 let name = code.get_const(*name_idx).unwrap_or("");
                 let full = format!("{}({})", name, index_val.as_str());
                 let val = ctx.get_var(&full)?;
                 stack.push(val);
             }
-            OpCode::StoreArray(name_idx) => {
+            OpCode::StoreArrayElem(name_idx) => {
                 let index_val = stack.pop().unwrap_or_else(Value::empty);
                 let val = stack.last().cloned().unwrap_or_else(Value::empty);
                 let name = code.get_const(*name_idx).unwrap_or("");
                 let full = format!("{}({})", name, index_val.as_str());
                 ctx.set_var(&full, val)?;
             }
+            OpCode::IncrVar(idx, amount) => {
+                let name = code.get_const(*idx).unwrap_or("");
+                let new_val = ctx.incr_var(name, *amount)?;
+                stack.push(new_val);
+            }
+            OpCode::AppendVar(idx) => {
+                let append_val = stack.pop().unwrap_or_else(Value::empty);
+                let name = code.get_const(*idx).unwrap_or("");
+                let new_val = ctx.append_var(name, append_val.as_str())?;
+                stack.push(new_val);
+            }
             OpCode::UnsetVar(idx) => {
                 let name = code.get_const(*idx).unwrap_or("");
-                ctx.unset_var(name).ok(); // ignore if not found
+                ctx.unset_var(name).ok();
+            }
+            OpCode::VarExists(idx) => {
+                let name = code.get_const(*idx).unwrap_or("");
+                stack.push(Value::from_bool(ctx.var_exists(name)));
             }
 
-            // ── Command invocation ──────────────────────────────────
-            OpCode::InvokeBuiltin { cmd_id: _, argc } => {
-                let n = *argc as usize;
-                if stack.len() < n {
-                    return Err(Error::runtime("stack underflow", ErrorCode::Generic));
-                }
-                let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
-                let result = ctx.invoke_command(&args)?;
-                stack.push(result);
+            // ── Scope ───────────────────────────────────────────────
+            OpCode::PushFrame(_) | OpCode::PopFrame => {
+                // Scope management is handled at the Interp level for now.
             }
-            OpCode::InvokeProc { proc_id: _, argc } => {
-                let n = *argc as usize;
-                if stack.len() < n {
-                    return Err(Error::runtime("stack underflow", ErrorCode::Generic));
-                }
-                let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
-                let result = ctx.invoke_command(&args)?;
-                stack.push(result);
-            }
-            OpCode::InvokeDynamic { argc } => {
-                let n = *argc as usize;
-                if stack.len() < n {
-                    return Err(Error::runtime("stack underflow", ErrorCode::Generic));
-                }
-                let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
-                let result = ctx.invoke_command(&args)?;
-                stack.push(result);
+            OpCode::UpVar { .. } | OpCode::Global(_) => {
+                // Handled at the Interp level for now.
             }
 
             // ── Control flow ────────────────────────────────────────
@@ -128,18 +133,46 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                     pc = *target as usize;
                 }
             }
+
+            // ── Loop management ─────────────────────────────────────
+            OpCode::LoopEnter { cont, brk } => {
+                loops.push(ActiveLoop {
+                    continue_pc: *cont,
+                    break_pc: *brk,
+                });
+            }
+            OpCode::LoopExit => {
+                loops.pop();
+            }
+            OpCode::Break => {
+                if let Some(active) = loops.last() {
+                    pc = active.break_pc as usize;
+                } else {
+                    return Err(Error::brk());
+                }
+            }
+            OpCode::Continue => {
+                if let Some(active) = loops.last() {
+                    pc = active.continue_pc as usize;
+                } else {
+                    return Err(Error::cont());
+                }
+            }
+
+            // ── Return / exit ───────────────────────────────────────
             OpCode::Return => {
                 let val = stack.pop().unwrap_or_else(Value::empty);
                 return Err(Error::ret(Some(val.as_str().to_string())));
             }
-            OpCode::Break => {
-                return Err(Error::brk());
+            OpCode::ReturnCode(code) => {
+                let val = stack.pop().unwrap_or_else(Value::empty);
+                return Err(Error::return_with_code(
+                    *code,
+                    Some(val.as_str().to_string()),
+                ));
             }
-            OpCode::Continue => {
-                return Err(Error::cont());
-            }
-            OpCode::EnterScope | OpCode::LeaveScope => {
-                // Scope management is handled at the Interp level for now.
+            OpCode::Exit(code) => {
+                return Err(Error::exit(Some(*code)));
             }
 
             // ── Arithmetic ──────────────────────────────────────────
@@ -248,6 +281,11 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                 let idx = index.as_int().unwrap_or(-1) as usize;
                 stack.push(items.get(idx).cloned().unwrap_or_else(Value::empty));
             }
+            OpCode::ListLength => {
+                let list_val = stack.pop().unwrap_or_else(Value::empty);
+                let len = list_val.as_list().map(|l| l.len()).unwrap_or(0);
+                stack.push(Value::from_int(len as i64));
+            }
             OpCode::StrLen => {
                 let s = stack.pop().unwrap_or_else(Value::empty);
                 stack.push(Value::from_int(s.as_str().len() as i64));
@@ -263,40 +301,6 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                     stack.push(Value::empty());
                 }
             }
-
-            // ── Special ─────────────────────────────────────────────
-            OpCode::EvalScript => {
-                let script = stack.pop().unwrap_or_else(Value::empty);
-                let result = ctx.eval_script(script.as_str())?;
-                stack.push(result);
-            }
-            OpCode::EvalExpr => {
-                let expr = stack.pop().unwrap_or_else(Value::empty);
-                let result = ctx.eval_expr(expr.as_str())?;
-                stack.push(result);
-            }
-            OpCode::CatchStart(target) => {
-                let catch_end = *target as usize;
-                let result = execute_catch_block(ctx, code, &mut pc, catch_end, &mut stack);
-                match result {
-                    Ok(()) => {
-                        // No error — push code 0
-                        stack.push(Value::from_int(0));
-                    }
-                    Err(e) => {
-                        // Error — push error message, then code 1
-                        stack.push(Value::from_str(&e.to_string()));
-                        stack.push(Value::from_int(1));
-                        pc = catch_end;
-                    }
-                }
-            }
-            OpCode::CatchEnd => {
-                // Handled by CatchStart logic; if we reach here normally, just continue.
-            }
-            OpCode::Line(_) => {
-                // Line annotation — no-op at runtime.
-            }
             OpCode::ExpandList => {
                 let list_val = stack.pop().unwrap_or_else(Value::empty);
                 if let Some(items) = list_val.as_list() {
@@ -307,11 +311,97 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                     stack.push(list_val);
                 }
             }
+
+            // ── Command calls ───────────────────────────────────────
+            OpCode::ECall { cmd_id, argc } => {
+                let n = *argc as usize;
+                if stack.len() < n {
+                    return Err(Error::runtime("stack underflow", ErrorCode::Generic));
+                }
+                let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
+                let result = ctx.ecall(*cmd_id, &args)?;
+                stack.push(result);
+            }
+            OpCode::SysCall { cmd_id, argc } => {
+                let n = *argc as usize;
+                if stack.len() < n {
+                    return Err(Error::runtime("stack underflow", ErrorCode::Generic));
+                }
+                let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
+                let result = ctx.syscall(*cmd_id, &args)?;
+                stack.push(result);
+            }
+            OpCode::DynCall { argc } => {
+                let n = *argc as usize;
+                if stack.len() < n {
+                    return Err(Error::runtime("stack underflow", ErrorCode::Generic));
+                }
+                let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
+                let result = ctx.invoke_command(&args)?;
+                stack.push(result);
+            }
+            OpCode::CallProc { proc_id: _, argc } => {
+                let n = *argc as usize;
+                if stack.len() < n {
+                    return Err(Error::runtime("stack underflow", ErrorCode::Generic));
+                }
+                let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
+                let result = ctx.invoke_command(&args)?;
+                stack.push(result);
+            }
+
+            // ── Special ─────────────────────────────────────────────
+            OpCode::EvalScript => {
+                let script = stack.pop().unwrap_or_else(Value::empty);
+                match ctx.eval_script(script.as_str()) {
+                    Ok(val) => stack.push(val),
+                    Err(e) if e.is_break() => {
+                        // Break from within a dynamically evaluated script
+                        if let Some(active) = loops.last() {
+                            pc = active.break_pc as usize;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                    Err(e) if e.is_continue() => {
+                        if let Some(active) = loops.last() {
+                            pc = active.continue_pc as usize;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            OpCode::EvalExpr => {
+                let expr = stack.pop().unwrap_or_else(Value::empty);
+                let result = ctx.eval_expr(expr.as_str())?;
+                stack.push(result);
+            }
+            OpCode::CatchStart(target) => {
+                let catch_end = *target as usize;
+                let result = execute_catch_block(ctx, code, &mut pc, catch_end, &mut stack, &mut loops);
+                match result {
+                    Ok(()) => {
+                        stack.push(Value::from_int(0));
+                    }
+                    Err(e) => {
+                        stack.push(Value::from_str(&e.to_string()));
+                        stack.push(Value::from_int(1));
+                        pc = catch_end;
+                    }
+                }
+            }
+            OpCode::CatchEnd => {
+                // Handled by CatchStart logic.
+            }
+
+            // ── Debug ───────────────────────────────────────────────
+            OpCode::Line(_) => {}
             OpCode::Nop => {}
         }
     }
 
-    // Return the value on top of the stack (or empty).
     Ok(stack.pop().unwrap_or_else(Value::empty))
 }
 
@@ -319,7 +409,6 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Pop one integer from the stack.
 fn pop_int(stack: &mut Vec<Value>) -> Result<i64> {
     let val = stack.pop().unwrap_or_else(Value::empty);
     val.as_int().ok_or_else(|| {
@@ -327,7 +416,6 @@ fn pop_int(stack: &mut Vec<Value>) -> Result<i64> {
     })
 }
 
-/// Binary integer arithmetic: pop two, apply `f`, push result.
 fn binary_arith(stack: &mut Vec<Value>, f: impl FnOnce(i64, i64) -> i64) -> Result<()> {
     let b = pop_int(stack)?;
     let a = pop_int(stack)?;
@@ -335,7 +423,6 @@ fn binary_arith(stack: &mut Vec<Value>, f: impl FnOnce(i64, i64) -> i64) -> Resu
     Ok(())
 }
 
-/// Binary integer comparison: pop two, apply `f`, push bool.
 fn binary_cmp(stack: &mut Vec<Value>, f: impl FnOnce(i64, i64) -> bool) -> Result<()> {
     let b = pop_int(stack)?;
     let a = pop_int(stack)?;
@@ -343,14 +430,14 @@ fn binary_cmp(stack: &mut Vec<Value>, f: impl FnOnce(i64, i64) -> bool) -> Resul
     Ok(())
 }
 
-/// Execute instructions between a CatchStart and its matching CatchEnd,
-/// capturing any errors.
+/// Execute instructions between a CatchStart and its matching CatchEnd.
 fn execute_catch_block(
     ctx: &mut dyn VmContext,
     code: &ByteCode,
     pc: &mut usize,
     catch_end: usize,
     stack: &mut Vec<Value>,
+    loops: &mut Vec<ActiveLoop>,
 ) -> Result<()> {
     let ops = code.ops();
     while *pc < ops.len() && *pc < catch_end {
@@ -380,17 +467,33 @@ fn execute_catch_block(
             OpCode::PushInt(n) => stack.push(Value::from_int(*n)),
             OpCode::Pop => { stack.pop(); }
             OpCode::Line(_) | OpCode::Nop => {}
-            OpCode::InvokeDynamic { argc } => {
+            OpCode::DynCall { argc } => {
                 let n = *argc as usize;
                 let args: Vec<Value> = stack.drain(stack.len().saturating_sub(n)..).collect();
                 let result = ctx.invoke_command(&args)?;
                 stack.push(result);
             }
+            OpCode::ECall { cmd_id, argc } => {
+                let n = *argc as usize;
+                let args: Vec<Value> = stack.drain(stack.len().saturating_sub(n)..).collect();
+                let result = ctx.ecall(*cmd_id, &args)?;
+                stack.push(result);
+            }
+            OpCode::SysCall { cmd_id, argc } => {
+                let n = *argc as usize;
+                let args: Vec<Value> = stack.drain(stack.len().saturating_sub(n)..).collect();
+                let result = ctx.syscall(*cmd_id, &args)?;
+                stack.push(result);
+            }
+            OpCode::LoopEnter { cont, brk } => {
+                loops.push(ActiveLoop {
+                    continue_pc: *cont,
+                    break_pc: *brk,
+                });
+            }
+            OpCode::LoopExit => { loops.pop(); }
             _ => {
-                // For other opcodes inside catch, fall back to eval
-                // by re-winding pc and running the main execute loop.
-                // This is a simplification; a full implementation would
-                // handle all opcodes here.
+                // For other opcodes inside catch, simplified handling.
             }
         }
     }

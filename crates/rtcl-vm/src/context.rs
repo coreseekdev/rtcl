@@ -23,14 +23,32 @@ pub trait VmContext {
     /// variables that do not exist.
     fn unset_var(&mut self, name: &str) -> Result<()>;
 
+    /// Check if a variable exists.
+    fn var_exists(&self, name: &str) -> bool;
+
+    /// Increment a variable by `amount`, returning the new value.
+    fn incr_var(&mut self, name: &str, amount: i64) -> Result<Value>;
+
+    /// Append `value` to the named variable, returning the new value.
+    fn append_var(&mut self, name: &str, value: &str) -> Result<Value>;
+
     /// Evaluate a Tcl script and return the result.
     fn eval_script(&mut self, script: &str) -> Result<Value>;
 
     /// Evaluate a Tcl expression (like `expr {…}`) and return the result.
     fn eval_expr(&mut self, expr: &str) -> Result<Value>;
 
-    /// Invoke a command.  `args[0]` is the command name; the remaining
-    /// elements are its arguments.  The implementation should look up
-    /// user-defined procs and built-in commands.
+    /// Invoke a command by its arguments.  `args[0]` is the command name;
+    /// the remaining elements are its arguments.
     fn invoke_command(&mut self, args: &[Value]) -> Result<Value>;
+
+    /// **ECall** — invoke a standard/language command by numeric ID.
+    ///
+    /// `cmd_id` corresponds to a [`StdCmdId`](rtcl_parser::StdCmdId).
+    fn ecall(&mut self, cmd_id: u16, args: &[Value]) -> Result<Value>;
+
+    /// **SysCall** — invoke an extension/platform command by numeric ID.
+    ///
+    /// `cmd_id` corresponds to a [`ExtCmdId`](rtcl_parser::ExtCmdId).
+    fn syscall(&mut self, cmd_id: u16, args: &[Value]) -> Result<Value>;
 }

@@ -76,6 +76,17 @@ impl ByteCode {
         }
     }
 
+    /// Patch a `LoopEnter` instruction's continue and break targets.
+    pub fn patch_loop(&mut self, idx: usize, cont: u32, brk: u32) {
+        match &mut self.ops[idx] {
+            OpCode::LoopEnter { cont: c, brk: b } => {
+                *c = cont;
+                *b = brk;
+            }
+            _ => panic!("patch_loop on non-LoopEnter instruction at {}", idx),
+        }
+    }
+
     /// Number of emitted instructions.
     pub fn len(&self) -> usize {
         self.ops.len()

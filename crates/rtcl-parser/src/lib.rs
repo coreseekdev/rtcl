@@ -26,9 +26,11 @@ mod rd;
 pub mod opcode;
 pub mod bytecode;
 pub mod compiler;
+pub mod validate;
 
 // Re-exports
 pub use opcode::OpCode;
+pub use opcode::{StdCmdId, ExtCmdId};
 pub use bytecode::ByteCode;
 pub use compiler::Compiler;
 

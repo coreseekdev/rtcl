@@ -10,7 +10,7 @@ use crate::command::{CommandFunc, CommandCategory};
 use crate::error::{Error, Result};
 use crate::parser::{self, Command, Word};
 use crate::value::Value;
-use rtcl_parser::{ByteCode, Compiler};
+use rtcl_parser::{ByteCode, Compiler, StdCmdId, ExtCmdId};
 use rtcl_vm::VmContext;
 
 #[cfg(feature = "std")]
@@ -171,6 +171,78 @@ impl Interp {
 
     pub fn command_exists(&self, name: &str) -> bool {
         self.commands.contains_key(name)
+    }
+
+    // -- ECall / SysCall dispatch (by numeric ID) ----------------------------
+
+    /// Map a `StdCmdId` (u16) to the corresponding command function.
+    fn resolve_ecall(&self, cmd_id: u16) -> Option<CommandFunc> {
+        use commands::*;
+        Some(match cmd_id {
+            x if x == StdCmdId::Foreach   as u16 => control::cmd_foreach,
+            x if x == StdCmdId::Switch    as u16 => control::cmd_switch,
+            x if x == StdCmdId::Try       as u16 => control::cmd_try,
+            x if x == StdCmdId::Catch     as u16 => control::cmd_catch,
+            x if x == StdCmdId::Proc      as u16 => proc::cmd_proc,
+            x if x == StdCmdId::Rename    as u16 => proc::cmd_rename,
+            x if x == StdCmdId::Eval      as u16 => proc::cmd_eval,
+            x if x == StdCmdId::Apply     as u16 => proc::cmd_apply,
+            x if x == StdCmdId::Uplevel   as u16 => proc::cmd_uplevel,
+            x if x == StdCmdId::Upvar     as u16 => proc::cmd_upvar,
+            x if x == StdCmdId::Global    as u16 => proc::cmd_global,
+            x if x == StdCmdId::Unset     as u16 => misc::cmd_unset,
+            x if x == StdCmdId::Subst     as u16 => misc::cmd_subst,
+            x if x == StdCmdId::Info      as u16 => misc::cmd_info,
+            x if x == StdCmdId::Error     as u16 => control::cmd_error,
+            x if x == StdCmdId::Tailcall  as u16 => control::cmd_tailcall,
+            x if x == StdCmdId::Append    as u16 => misc::cmd_append,
+            x if x == StdCmdId::StringCmd as u16 => string_cmds::cmd_string,
+            x if x == StdCmdId::List      as u16 => list::cmd_list,
+            x if x == StdCmdId::Llength   as u16 => list::cmd_llength,
+            x if x == StdCmdId::Lindex    as u16 => list::cmd_lindex,
+            x if x == StdCmdId::Lappend   as u16 => list::cmd_lappend,
+            x if x == StdCmdId::Lrange    as u16 => list::cmd_lrange,
+            x if x == StdCmdId::Lsearch   as u16 => list::cmd_lsearch,
+            x if x == StdCmdId::Lsort     as u16 => list::cmd_lsort,
+            x if x == StdCmdId::Linsert   as u16 => list::cmd_linsert,
+            x if x == StdCmdId::Lreplace  as u16 => list::cmd_lreplace,
+            x if x == StdCmdId::Lassign   as u16 => list::cmd_lassign,
+            x if x == StdCmdId::Lrepeat   as u16 => list::cmd_lrepeat,
+            x if x == StdCmdId::Lreverse  as u16 => list::cmd_lreverse,
+            x if x == StdCmdId::Concat    as u16 => list::cmd_concat,
+            x if x == StdCmdId::Split     as u16 => list::cmd_split,
+            x if x == StdCmdId::Join      as u16 => list::cmd_join,
+            x if x == StdCmdId::Lmap      as u16 => list::cmd_lmap,
+            x if x == StdCmdId::Lset      as u16 => list::cmd_lset,
+            x if x == StdCmdId::Dict      as u16 => dict::cmd_dict,
+            x if x == StdCmdId::Array     as u16 => array::cmd_array,
+            x if x == StdCmdId::Format    as u16 => io::cmd_format,
+            x if x == StdCmdId::Scan      as u16 => misc::cmd_scan,
+            x if x == StdCmdId::Range     as u16 => control::cmd_range,
+            x if x == StdCmdId::Time      as u16 => control::cmd_time,
+            x if x == StdCmdId::Timerate  as u16 => control::cmd_timerate,
+            _ => return None,
+        })
+    }
+
+    /// Map an `ExtCmdId` (u16) to the corresponding command function.
+    fn resolve_syscall(&self, cmd_id: u16) -> Option<CommandFunc> {
+        use commands::*;
+        Some(match cmd_id {
+            x if x == ExtCmdId::Puts        as u16 => io::cmd_puts,
+            x if x == ExtCmdId::Disassemble as u16 => misc::cmd_disassemble,
+            #[cfg(feature = "std")]
+            x if x == ExtCmdId::Source as u16 => io::cmd_source,
+            #[cfg(feature = "std")]
+            x if x == ExtCmdId::File   as u16 => io::cmd_file,
+            #[cfg(feature = "std")]
+            x if x == ExtCmdId::Glob   as u16 => io::cmd_glob,
+            #[cfg(feature = "std")]
+            x if x == ExtCmdId::Regexp as u16 => regexp_cmds::cmd_regexp,
+            #[cfg(feature = "std")]
+            x if x == ExtCmdId::Regsub as u16 => regexp_cmds::cmd_regsub,
+            _ => return None,
+        })
     }
 
     /// Return the category for a command, if it exists.
@@ -465,6 +537,29 @@ impl VmContext for Interp {
         Interp::unset_var(self, name)
     }
 
+    fn var_exists(&self, name: &str) -> bool {
+        Interp::var_exists(self, name)
+    }
+
+    fn incr_var(&mut self, name: &str, amount: i64) -> Result<Value> {
+        let current = self.vars.get(name).cloned().unwrap_or_else(|| Value::from_int(0));
+        let int_val = current.as_int().ok_or_else(|| {
+            Error::type_mismatch("integer", current.as_str())
+        })?;
+        let new_val = Value::from_int(int_val + amount);
+        self.vars.insert(name.to_string(), new_val.clone());
+        Ok(new_val)
+    }
+
+    fn append_var(&mut self, name: &str, value: &str) -> Result<Value> {
+        let current = self.vars.get(name).cloned().unwrap_or_else(Value::empty);
+        let mut s = current.as_str().to_string();
+        s.push_str(value);
+        let new_val = Value::from_str(&s);
+        self.vars.insert(name.to_string(), new_val.clone());
+        Ok(new_val)
+    }
+
     fn eval_script(&mut self, script: &str) -> Result<Value> {
         self.eval(script)
     }
@@ -493,6 +588,38 @@ impl VmContext for Interp {
         }
 
         Err(Error::invalid_command(cmd_name))
+    }
+
+    fn ecall(&mut self, cmd_id: u16, args: &[Value]) -> Result<Value> {
+        let func = self.resolve_ecall(cmd_id);
+        match func {
+            Some(f) => {
+                self.call_depth += 1;
+                let result = f(self, args);
+                self.call_depth -= 1;
+                result
+            }
+            None => Err(Error::runtime(
+                format!("unknown ecall id {}", cmd_id),
+                crate::error::ErrorCode::Generic,
+            )),
+        }
+    }
+
+    fn syscall(&mut self, cmd_id: u16, args: &[Value]) -> Result<Value> {
+        let func = self.resolve_syscall(cmd_id);
+        match func {
+            Some(f) => {
+                self.call_depth += 1;
+                let result = f(self, args);
+                self.call_depth -= 1;
+                result
+            }
+            None => Err(Error::runtime(
+                format!("unknown syscall id {}", cmd_id),
+                crate::error::ErrorCode::Generic,
+            )),
+        }
     }
 }
 

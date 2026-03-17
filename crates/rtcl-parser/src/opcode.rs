@@ -177,6 +177,9 @@ pub enum OpCode {
     /// Push a small integer literal.
     PushInt(i64),
 
+    /// Push a floating-point literal.
+    PushFloat(f64),
+
     /// Push boolean `true` (integer 1).
     PushTrue,
 
@@ -412,6 +415,7 @@ impl fmt::Display for OpCode {
             OpCode::PushConst(idx) => write!(f, "PUSH_CONST {}", idx),
             OpCode::PushEmpty => write!(f, "PUSH_EMPTY"),
             OpCode::PushInt(n) => write!(f, "PUSH_INT {}", n),
+            OpCode::PushFloat(n) => write!(f, "PUSH_FLOAT {}", n),
             OpCode::PushTrue => write!(f, "PUSH_TRUE"),
             OpCode::PushFalse => write!(f, "PUSH_FALSE"),
             OpCode::Pop => write!(f, "POP"),

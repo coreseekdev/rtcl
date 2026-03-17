@@ -46,6 +46,9 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             OpCode::PushInt(n) => {
                 stack.push(Value::from_int(*n));
             }
+            OpCode::PushFloat(n) => {
+                stack.push(Value::from_float(*n));
+            }
             OpCode::PushTrue => {
                 stack.push(Value::from_bool(true));
             }
@@ -187,14 +190,22 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             }
 
             // ── Arithmetic ──────────────────────────────────────────
-            OpCode::Add => { binary_arith(&mut stack, |a, b| a + b)?; }
-            OpCode::Sub => { binary_arith(&mut stack, |a, b| a - b)?; }
-            OpCode::Mul => { binary_arith(&mut stack, |a, b| a * b)?; }
+            OpCode::Add => { numeric_arith(&mut stack, |a, b| a + b, |a, b| a + b)?; }
+            OpCode::Sub => { numeric_arith(&mut stack, |a, b| a - b, |a, b| a - b)?; }
+            OpCode::Mul => { numeric_arith(&mut stack, |a, b| a * b, |a, b| a * b)?; }
             OpCode::Div => {
-                let b = pop_int(&mut stack)?;
-                let a = pop_int(&mut stack)?;
-                if b == 0 { return Err(Error::DivisionByZero); }
-                stack.push(Value::from_int(a / b));
+                let (a, b) = pop_numeric_pair(&mut stack)?;
+                match (a, b) {
+                    (Num::Int(a), Num::Int(b)) => {
+                        if b == 0 { return Err(Error::DivisionByZero); }
+                        stack.push(Value::from_int(a / b));
+                    }
+                    _ => {
+                        let (af, bf) = (a.as_f64(), b.as_f64());
+                        if bf == 0.0 { return Err(Error::DivisionByZero); }
+                        stack.push(float_or_int(af / bf));
+                    }
+                }
             }
             OpCode::Mod => {
                 let b = pop_int(&mut stack)?;
@@ -203,22 +214,38 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                 stack.push(Value::from_int(a % b));
             }
             OpCode::Pow => {
-                let b = pop_int(&mut stack)?;
-                let a = pop_int(&mut stack)?;
-                stack.push(Value::from_int(a.wrapping_pow(b as u32)));
+                let (a, b) = pop_numeric_pair(&mut stack)?;
+                match (a, b) {
+                    (Num::Int(a), Num::Int(b)) => {
+                        if b >= 0 {
+                            stack.push(Value::from_int(a.wrapping_pow(b as u32)));
+                        } else {
+                            stack.push(float_or_int((a as f64).powf(b as f64)));
+                        }
+                    }
+                    _ => {
+                        stack.push(float_or_int(a.as_f64().powf(b.as_f64())));
+                    }
+                }
             }
             OpCode::Neg => {
-                let a = pop_int(&mut stack)?;
-                stack.push(Value::from_int(-a));
+                let val = stack.pop().unwrap_or_else(Value::empty);
+                if let Some(n) = val.as_int() {
+                    stack.push(Value::from_int(-n));
+                } else if let Some(f) = val.as_float() {
+                    stack.push(float_or_int(-f));
+                } else {
+                    return Err(Error::type_mismatch("number", val.as_str()));
+                }
             }
 
             // ── Comparison ──────────────────────────────────────────
-            OpCode::Eq => { binary_cmp(&mut stack, |a, b| a == b)?; }
-            OpCode::Ne => { binary_cmp(&mut stack, |a, b| a != b)?; }
-            OpCode::Lt => { binary_cmp(&mut stack, |a, b| a < b)?; }
-            OpCode::Gt => { binary_cmp(&mut stack, |a, b| a > b)?; }
-            OpCode::Le => { binary_cmp(&mut stack, |a, b| a <= b)?; }
-            OpCode::Ge => { binary_cmp(&mut stack, |a, b| a >= b)?; }
+            OpCode::Eq => { numeric_cmp(&mut stack, |a, b| a == b, |a, b| (a - b).abs() < f64::EPSILON)?; }
+            OpCode::Ne => { numeric_cmp(&mut stack, |a, b| a != b, |a, b| (a - b).abs() >= f64::EPSILON)?; }
+            OpCode::Lt => { numeric_cmp(&mut stack, |a, b| a < b, |a, b| a < b)?; }
+            OpCode::Gt => { numeric_cmp(&mut stack, |a, b| a > b, |a, b| a > b)?; }
+            OpCode::Le => { numeric_cmp(&mut stack, |a, b| a <= b, |a, b| a <= b)?; }
+            OpCode::Ge => { numeric_cmp(&mut stack, |a, b| a >= b, |a, b| a >= b)?; }
             OpCode::StrEq => {
                 let b = stack.pop().unwrap_or_else(Value::empty);
                 let a = stack.pop().unwrap_or_else(Value::empty);
@@ -438,6 +465,39 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// A numeric value — either integer or float.
+#[derive(Clone, Copy)]
+enum Num {
+    Int(i64),
+    Float(f64),
+}
+
+impl Num {
+    fn as_f64(self) -> f64 {
+        match self {
+            Num::Int(n) => n as f64,
+            Num::Float(n) => n,
+        }
+    }
+}
+
+fn pop_num(stack: &mut Vec<Value>) -> Result<Num> {
+    let val = stack.pop().unwrap_or_else(Value::empty);
+    if let Some(n) = val.as_int() {
+        Ok(Num::Int(n))
+    } else if let Some(f) = val.as_float() {
+        Ok(Num::Float(f))
+    } else {
+        Err(Error::type_mismatch("number", val.as_str()))
+    }
+}
+
+fn pop_numeric_pair(stack: &mut Vec<Value>) -> Result<(Num, Num)> {
+    let b = pop_num(stack)?;
+    let a = pop_num(stack)?;
+    Ok((a, b))
+}
+
 fn pop_int(stack: &mut Vec<Value>) -> Result<i64> {
     let val = stack.pop().unwrap_or_else(Value::empty);
     val.as_int().ok_or_else(|| {
@@ -445,17 +505,48 @@ fn pop_int(stack: &mut Vec<Value>) -> Result<i64> {
     })
 }
 
+/// Float-or-int: return int if result is a whole number, float otherwise.
+fn float_or_int(f: f64) -> Value {
+    if f.fract() == 0.0 && f.abs() < i64::MAX as f64 {
+        Value::from_int(f as i64)
+    } else {
+        Value::from_float(f)
+    }
+}
+
+/// Numeric arithmetic: integer fast path, float fallback.
+fn numeric_arith(
+    stack: &mut Vec<Value>,
+    int_op: impl FnOnce(i64, i64) -> i64,
+    float_op: impl FnOnce(f64, f64) -> f64,
+) -> Result<()> {
+    let (a, b) = pop_numeric_pair(stack)?;
+    match (a, b) {
+        (Num::Int(a), Num::Int(b)) => stack.push(Value::from_int(int_op(a, b))),
+        _ => stack.push(float_or_int(float_op(a.as_f64(), b.as_f64()))),
+    }
+    Ok(())
+}
+
+/// Numeric comparison: integer fast path, float fallback.
+fn numeric_cmp(
+    stack: &mut Vec<Value>,
+    int_op: impl FnOnce(i64, i64) -> bool,
+    float_op: impl FnOnce(f64, f64) -> bool,
+) -> Result<()> {
+    let (a, b) = pop_numeric_pair(stack)?;
+    let result = match (a, b) {
+        (Num::Int(a), Num::Int(b)) => int_op(a, b),
+        _ => float_op(a.as_f64(), b.as_f64()),
+    };
+    stack.push(Value::from_bool(result));
+    Ok(())
+}
+
 fn binary_arith(stack: &mut Vec<Value>, f: impl FnOnce(i64, i64) -> i64) -> Result<()> {
     let b = pop_int(stack)?;
     let a = pop_int(stack)?;
     stack.push(Value::from_int(f(a, b)));
-    Ok(())
-}
-
-fn binary_cmp(stack: &mut Vec<Value>, f: impl FnOnce(i64, i64) -> bool) -> Result<()> {
-    let b = pop_int(stack)?;
-    let a = pop_int(stack)?;
-    stack.push(Value::from_bool(f(a, b)));
     Ok(())
 }
 
@@ -494,6 +585,7 @@ fn execute_catch_block(
             }
             OpCode::PushEmpty => stack.push(Value::empty()),
             OpCode::PushInt(n) => stack.push(Value::from_int(*n)),
+            OpCode::PushFloat(n) => stack.push(Value::from_float(*n)),
             OpCode::Pop => { stack.pop(); }
             OpCode::Line(_) | OpCode::Nop => {}
             OpCode::DynCall { argc } => {

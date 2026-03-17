@@ -55,18 +55,28 @@ impl<'a> ExprParser<'a> {
     fn parse_or(&mut self) -> Result<Value> {
         let mut left = self.parse_and()?;
         while self.match_op("||") {
-            let right = self.parse_and()?;
-            left = Value::from_bool(left.is_true() || right.is_true());
+            if left.is_true() {
+                // Short-circuit: skip parsing the RHS but consume the tokens
+                self.skip_or_operand()?;
+            } else {
+                let right = self.parse_and()?;
+                left = Value::from_bool(right.is_true());
+            }
         }
         Ok(left)
     }
 
-    /// Logical AND `&&`
+    /// Logical AND `&&` (short-circuit)
     fn parse_and(&mut self) -> Result<Value> {
         let mut left = self.parse_bitor()?;
         while self.match_op("&&") {
-            let right = self.parse_bitor()?;
-            left = Value::from_bool(left.is_true() && right.is_true());
+            if !left.is_true() {
+                // Short-circuit: skip parsing the RHS but consume the tokens
+                self.skip_and_operand()?;
+            } else {
+                let right = self.parse_bitor()?;
+                left = Value::from_bool(right.is_true());
+            }
         }
         Ok(left)
     }
@@ -866,6 +876,101 @@ impl<'a> ExprParser<'a> {
         } else {
             Ok(())
         }
+    }
+
+    /// Skip one `parse_and` level operand without evaluating.
+    /// Used for `||` short-circuit when LHS is true.
+    /// Stops at: end, `||` at depth 0, `?` at depth 0.
+    fn skip_or_operand(&mut self) -> Result<()> {
+        self.skip_balanced(&["||", "?"])
+    }
+
+    /// Skip one `parse_bitor` level operand without evaluating.
+    /// Used for `&&` short-circuit when LHS is false.
+    /// Stops at: end, `&&` at depth 0, `||` at depth 0, `?` at depth 0.
+    fn skip_and_operand(&mut self) -> Result<()> {
+        self.skip_balanced(&["&&", "||", "?"])
+    }
+
+    /// Consume characters, respecting balanced delimiters, until we reach
+    /// one of the `stop_ops` at nesting depth 0 or end of input.
+    /// Does NOT consume the stop operator itself.
+    fn skip_balanced(&mut self, stop_ops: &[&str]) -> Result<()> {
+        let mut depth: i32 = 0; // parenthesis depth
+
+        loop {
+            self.skip_whitespace();
+            if self.is_at_end() {
+                break;
+            }
+
+            // Check for stop operators at depth 0
+            if depth == 0 {
+                for op in stop_ops {
+                    let op_len = op.len();
+                    if self.pos + op_len <= self.chars.len() {
+                        let slice: String = self.chars[self.pos..self.pos + op_len].iter().collect();
+                        if slice == *op {
+                            return Ok(()); // don't consume the stop op
+                        }
+                    }
+                }
+            }
+
+            let c = self.peek();
+            match c {
+                '(' => { self.advance(); depth += 1; }
+                ')' => {
+                    if depth <= 0 {
+                        break; // unmatched — let caller handle
+                    }
+                    self.advance();
+                    depth -= 1;
+                }
+                '[' => {
+                    // Command substitution — skip balanced brackets
+                    self.advance();
+                    let mut bdepth = 1;
+                    while !self.is_at_end() && bdepth > 0 {
+                        match self.advance() {
+                            '[' => bdepth += 1,
+                            ']' => bdepth -= 1,
+                            '\\' => { self.advance(); } // skip escaped char
+                            _ => {}
+                        }
+                    }
+                }
+                '"' => {
+                    // String literal — skip to closing quote
+                    self.advance();
+                    while !self.is_at_end() && self.peek() != '"' {
+                        if self.peek() == '\\' {
+                            self.advance(); // skip escape char
+                        }
+                        self.advance();
+                    }
+                    if !self.is_at_end() {
+                        self.advance(); // closing quote
+                    }
+                }
+                '{' => {
+                    // Braced string — skip balanced braces
+                    self.advance();
+                    let mut bdepth = 1;
+                    while !self.is_at_end() && bdepth > 0 {
+                        match self.advance() {
+                            '{' => bdepth += 1,
+                            '}' => bdepth -= 1,
+                            '\\' => { self.advance(); }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => { self.advance(); }
+            }
+        }
+
+        Ok(())
     }
 }
 

@@ -272,22 +272,40 @@ impl<'a> ExprCodegen<'a> {
 
     // -- Precedence levels (lowest to highest) --
 
-    /// Logical OR `||`
+    /// Logical OR `||` (short-circuit)
+    ///
+    /// Emits: LHS → Dup → JumpTrue(end) → Pop → RHS → end:
+    /// If LHS is true, skip RHS and keep LHS on stack.
     fn parse_or(&mut self) -> CResult {
         self.parse_and()?;
         while self.match_tok(&Token::Or) {
+            // Dup LHS, test it — if true, skip RHS
+            self.bytecode.emit(OpCode::Dup, self.line);
+            let jump_idx = self.bytecode.emit(OpCode::JumpTrue(0), self.line);
+            // LHS was false — pop it, evaluate RHS
+            self.bytecode.emit(OpCode::Pop, self.line);
             self.parse_and()?;
-            self.bytecode.emit(OpCode::Or, self.line);
+            let end = self.bytecode.current_offset();
+            self.bytecode.patch_jump(jump_idx, end);
         }
         Ok(())
     }
 
-    /// Logical AND `&&`
+    /// Logical AND `&&` (short-circuit)
+    ///
+    /// Emits: LHS → Dup → JumpFalse(end) → Pop → RHS → end:
+    /// If LHS is false, skip RHS and keep LHS on stack.
     fn parse_and(&mut self) -> CResult {
         self.parse_bitor()?;
         while self.match_tok(&Token::And) {
+            // Dup LHS, test it — if false, skip RHS
+            self.bytecode.emit(OpCode::Dup, self.line);
+            let jump_idx = self.bytecode.emit(OpCode::JumpFalse(0), self.line);
+            // LHS was true — pop it, evaluate RHS
+            self.bytecode.emit(OpCode::Pop, self.line);
             self.parse_bitor()?;
-            self.bytecode.emit(OpCode::And, self.line);
+            let end = self.bytecode.current_offset();
+            self.bytecode.patch_jump(jump_idx, end);
         }
         Ok(())
     }
@@ -461,9 +479,10 @@ impl<'a> ExprCodegen<'a> {
                 self.bytecode.emit(OpCode::PushInt(n), self.line);
                 Ok(())
             }
-            Some(Token::Float(_)) => {
-                // Float not supported in VM integer arithmetic — bail
-                Err(())
+            Some(Token::Float(n)) => {
+                let n = *n;
+                self.bytecode.emit(OpCode::PushFloat(n), self.line);
+                Ok(())
             }
             Some(Token::Var(name)) => {
                 let name = name.clone();
@@ -527,7 +546,9 @@ mod tests {
         let ops = compile_expr("$x > 0 && $y < 10").unwrap();
         assert!(ops.iter().any(|o| matches!(o, OpCode::Gt)));
         assert!(ops.iter().any(|o| matches!(o, OpCode::Lt)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::And)));
+        // Short-circuit: Dup + JumpFalse instead of And
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Dup)));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::JumpFalse(_))));
     }
 
     #[test]
@@ -628,6 +649,94 @@ mod tests {
         let ops = compile_expr("$i >= 0 && $i < $n").unwrap();
         assert!(ops.iter().any(|o| matches!(o, OpCode::Ge)));
         assert!(ops.iter().any(|o| matches!(o, OpCode::Lt)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::And)));
+        // Short-circuit: Dup + JumpFalse instead of And
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Dup)));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::JumpFalse(_))));
+    }
+
+    #[test]
+    fn short_circuit_or() {
+        let ops = compile_expr("$x || $y").unwrap();
+        // Short-circuit: Dup + JumpTrue
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Dup)));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::JumpTrue(_))));
+    }
+
+    #[test]
+    fn float_literal() {
+        let ops = compile_expr("$x > 1.5").unwrap();
+        assert!(ops.iter().any(|o| matches!(o, OpCode::PushFloat(_))));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Gt)));
+    }
+
+    #[test]
+    fn float_arithmetic() {
+        let ops = compile_expr("$x + 2.5").unwrap();
+        assert!(ops.iter().any(|o| matches!(o, OpCode::PushFloat(_))));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Add)));
+    }
+
+    // -- Constant folding tests (applied via ByteCode::peephole()) --
+
+    fn compile_expr_with_peephole(expr: &str) -> Option<Vec<OpCode>> {
+        let mut bc = ByteCode::new();
+        if try_compile_expr(&mut bc, expr, 1) {
+            bc.peephole();
+            Some(bc.ops().to_vec())
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn fold_add() {
+        let ops = compile_expr_with_peephole("2 + 3").unwrap();
+        assert_eq!(ops, vec![OpCode::PushInt(5)]);
+    }
+
+    #[test]
+    fn fold_mul() {
+        let ops = compile_expr_with_peephole("6 * 7").unwrap();
+        assert_eq!(ops, vec![OpCode::PushInt(42)]);
+    }
+
+    #[test]
+    fn fold_comparison_true() {
+        let ops = compile_expr_with_peephole("10 > 5").unwrap();
+        assert_eq!(ops, vec![OpCode::PushTrue]);
+    }
+
+    #[test]
+    fn fold_comparison_false() {
+        let ops = compile_expr_with_peephole("3 > 5").unwrap();
+        assert_eq!(ops, vec![OpCode::PushFalse]);
+    }
+
+    #[test]
+    fn fold_chain() {
+        // (2 + 3) * 4 → should fold to PushInt(5) * PushInt(4) → PushInt(20)
+        let ops = compile_expr_with_peephole("(2 + 3) * 4").unwrap();
+        assert_eq!(ops, vec![OpCode::PushInt(20)]);
+    }
+
+    #[test]
+    fn fold_bitwise() {
+        let ops = compile_expr_with_peephole("0xFF & 0x0F").unwrap();
+        assert_eq!(ops, vec![OpCode::PushInt(15)]);
+    }
+
+    #[test]
+    fn nop_stripping() {
+        // After peephole, no Nop should remain
+        let ops = compile_expr_with_peephole("2 + 3").unwrap();
+        assert!(!ops.iter().any(|o| matches!(o, OpCode::Nop)));
+    }
+
+    #[test]
+    fn double_negation_eliminated() {
+        let ops = compile_expr_with_peephole("!!$x").unwrap();
+        // Double negation should be eliminated — only LoadVar remains
+        assert!(ops.iter().any(|o| matches!(o, OpCode::LoadVar(_))));
+        assert!(!ops.iter().any(|o| matches!(o, OpCode::Not)));
     }
 }

@@ -7,6 +7,12 @@
 use crate::opcode::OpCode;
 use core::fmt;
 
+/// Result of a constant-folding operation.
+enum FoldResult {
+    Int(i64),
+    Bool(bool),
+}
+
 /// Compiled bytecode for a single compilation unit (script / proc body).
 #[derive(Debug, Clone)]
 pub struct ByteCode {
@@ -138,15 +144,80 @@ impl ByteCode {
 
     /// Run a peephole optimization pass on the bytecode.
     ///
-    /// Patterns:
+    /// Patterns (2-op):
     /// - `StoreVar(x) + Pop` → `StoreVarPop(x)` + `Nop`
-    /// - `PushInt(0)` (as boolean) → `PushFalse`  (when followed by JumpTrue/JumpFalse)
-    /// - `PushInt(1)` (as boolean) → `PushTrue`   (when followed by JumpTrue/JumpFalse)
+    /// - `PushInt(0/1)` before `JumpTrue/JumpFalse` → `PushFalse/PushTrue`
+    /// - `Not + Not` → `Nop + Nop` (double negation elimination)
+    ///
+    /// Patterns (3-op constant folding):
+    /// - `PushInt(a) + PushInt(b) + ArithOp` → `PushInt(result)` + `Nop + Nop`
+    /// - `PushInt(a) + PushInt(b) + CmpOp` → `PushTrue/PushFalse` + `Nop + Nop`
+    ///
+    /// Runs iteratively until no further changes are made.
     pub fn peephole(&mut self) {
+        // Iterate: fold → strip nops → fold again (for chained constant expressions)
+        for _ in 0..8 {
+            let changed = self.peephole_pass();
+            self.strip_nops();
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    /// Single round of pattern matching. Returns `true` if any change was made.
+    fn peephole_pass(&mut self) -> bool {
         let len = self.ops.len();
         if len < 2 {
-            return;
+            return false;
         }
+        let mut changed = false;
+
+        // --- 3-op constant folding ---
+        if len >= 3 {
+            let mut i = 0;
+            while i + 2 < len {
+                if let (OpCode::PushInt(a), OpCode::PushInt(b)) = (&self.ops[i], &self.ops[i + 1]) {
+                    let a = *a;
+                    let b = *b;
+                    let folded = match &self.ops[i + 2] {
+                        OpCode::Add => Some(FoldResult::Int(a.wrapping_add(b))),
+                        OpCode::Sub => Some(FoldResult::Int(a.wrapping_sub(b))),
+                        OpCode::Mul => Some(FoldResult::Int(a.wrapping_mul(b))),
+                        OpCode::Div if b != 0 => Some(FoldResult::Int(a / b)),
+                        OpCode::Mod if b != 0 => Some(FoldResult::Int(a % b)),
+                        OpCode::Pow => Some(FoldResult::Int(a.wrapping_pow(b as u32))),
+                        OpCode::Eq  => Some(FoldResult::Bool(a == b)),
+                        OpCode::Ne  => Some(FoldResult::Bool(a != b)),
+                        OpCode::Lt  => Some(FoldResult::Bool(a < b)),
+                        OpCode::Gt  => Some(FoldResult::Bool(a > b)),
+                        OpCode::Le  => Some(FoldResult::Bool(a <= b)),
+                        OpCode::Ge  => Some(FoldResult::Bool(a >= b)),
+                        OpCode::BitAnd => Some(FoldResult::Int(a & b)),
+                        OpCode::BitOr  => Some(FoldResult::Int(a | b)),
+                        OpCode::BitXor => Some(FoldResult::Int(a ^ b)),
+                        OpCode::Shl => Some(FoldResult::Int(a.wrapping_shl((b & 63) as u32))),
+                        OpCode::Shr => Some(FoldResult::Int(a.wrapping_shr((b & 63) as u32))),
+                        _ => None,
+                    };
+                    if let Some(result) = folded {
+                        match result {
+                            FoldResult::Int(n) => self.ops[i] = OpCode::PushInt(n),
+                            FoldResult::Bool(true) => self.ops[i] = OpCode::PushTrue,
+                            FoldResult::Bool(false) => self.ops[i] = OpCode::PushFalse,
+                        }
+                        self.ops[i + 1] = OpCode::Nop;
+                        self.ops[i + 2] = OpCode::Nop;
+                        changed = true;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+
+        // --- 2-op patterns ---
+        let len = self.ops.len();
         let mut i = 0;
         while i + 1 < len {
             match (&self.ops[i], &self.ops[i + 1]) {
@@ -155,23 +226,100 @@ impl ByteCode {
                     let idx = *idx;
                     self.ops[i] = OpCode::StoreVarPop(idx);
                     self.ops[i + 1] = OpCode::Nop;
+                    changed = true;
                     i += 2;
                 }
-                // PushInt(1) before JumpFalse → PushTrue
+                // PushInt(1) before JumpFalse/JumpTrue → PushTrue
                 (OpCode::PushInt(1), OpCode::JumpFalse(_) | OpCode::JumpTrue(_)) => {
                     self.ops[i] = OpCode::PushTrue;
+                    changed = true;
                     i += 1;
                 }
-                // PushInt(0) before JumpFalse → PushFalse
+                // PushInt(0) before JumpFalse/JumpTrue → PushFalse
                 (OpCode::PushInt(0), OpCode::JumpFalse(_) | OpCode::JumpTrue(_)) => {
                     self.ops[i] = OpCode::PushFalse;
+                    changed = true;
                     i += 1;
+                }
+                // Double negation elimination
+                (OpCode::Not, OpCode::Not) => {
+                    self.ops[i] = OpCode::Nop;
+                    self.ops[i + 1] = OpCode::Nop;
+                    changed = true;
+                    i += 2;
                 }
                 _ => {
                     i += 1;
                 }
             }
         }
+
+        changed
+    }
+
+    /// Remove all `Nop` instructions, adjusting jump targets accordingly.
+    fn strip_nops(&mut self) {
+        let len = self.ops.len();
+        if len == 0 {
+            return;
+        }
+
+        // Build a mapping: old_index → new_index
+        let mut new_index = vec![0u32; len];
+        let mut offset = 0u32;
+        for i in 0..len {
+            new_index[i] = offset;
+            if !matches!(self.ops[i], OpCode::Nop) {
+                offset += 1;
+            }
+        }
+        let new_len = offset as usize;
+        if new_len == len {
+            return; // nothing to strip
+        }
+
+        // Remap jump targets
+        // Jump targets point to instruction indices — map them through new_index.
+        // If a jump target pointed at a Nop, map it to the next real instruction.
+        // Build a "forward" table: for any old index, what's the next non-Nop new index?
+        let mut forward = vec![new_len as u32; len + 1];
+        // Process backwards so forward[i] is the new index of the first non-Nop at or after old i.
+        {
+            let mut next = new_len as u32;
+            for i in (0..len).rev() {
+                if !matches!(self.ops[i], OpCode::Nop) {
+                    next = new_index[i];
+                }
+                forward[i] = next;
+            }
+            forward[len] = new_len as u32;
+        }
+
+        for op in self.ops.iter_mut() {
+            match op {
+                OpCode::Jump(t) => *t = forward[*t as usize],
+                OpCode::JumpTrue(t) => *t = forward[*t as usize],
+                OpCode::JumpFalse(t) => *t = forward[*t as usize],
+                OpCode::LoopEnter { cont, brk } => {
+                    *cont = forward[*cont as usize];
+                    *brk = forward[*brk as usize];
+                }
+                OpCode::CatchStart(t) => *t = forward[*t as usize],
+                _ => {}
+            }
+        }
+
+        // Compact ops and line_map
+        let mut write = 0;
+        for read in 0..len {
+            if !matches!(self.ops[read], OpCode::Nop) {
+                self.ops[write] = self.ops[read].clone();
+                self.line_map[write] = self.line_map[read];
+                write += 1;
+            }
+        }
+        self.ops.truncate(new_len);
+        self.line_map.truncate(new_len);
     }
 }
 

@@ -42,6 +42,7 @@ pub fn validate(code: &ByteCode) -> Vec<ValidationError> {
             OpCode::PushConst(idx)
             | OpCode::LoadVar(idx)
             | OpCode::StoreVar(idx)
+            | OpCode::StoreVarPop(idx)
             | OpCode::LoadArrayElem(idx)
             | OpCode::StoreArrayElem(idx)
             | OpCode::AppendVar(idx)

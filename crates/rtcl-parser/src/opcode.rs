@@ -7,9 +7,9 @@
 //!   return, break/continue).  These are executed directly by the VM dispatch
 //!   loop with no interpreter callback.
 //!
-//! - **ECall / SysCall** — invoke a *known* command by numeric ID.
-//!   `ECall` is for standard library commands that are always available;
-//!   `SysCall` is for extension / platform-dependent commands.  The VM
+//! - **Call** — invoke a *known* command by numeric ID.  The command ID
+//!   space is split into two ranges: `0..127` for standard library commands
+//!   and `128..` for extension / platform-dependent commands.  The VM
 //!   dispatches through a function-pointer table (no HashMap lookup).
 //!
 //! - **DynCall** — invoke a command whose name is on the stack.  Used when
@@ -24,17 +24,21 @@
 use core::fmt;
 
 // ---------------------------------------------------------------------------
-// Command-ID enumerations — shared between compiler and VM
+// Command-ID enumeration — shared between compiler and VM
 // ---------------------------------------------------------------------------
 
-/// Numeric IDs for *standard library* commands dispatched via `ECall`.
+/// Unified command IDs for built-in commands dispatched via `Call`.
 ///
-/// The ordering here defines the index into the standard command table that
-/// the interpreter builds at startup.  **Do not reorder** existing entries
-/// without updating the interpreter's registration code.
+/// IDs `0..127` are standard library commands (always available).
+/// IDs `128..` are extension / platform commands (may be gated by features).
+///
+/// **Do not reorder** existing entries without updating the interpreter's
+/// registration code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
-pub enum StdCmdId {
+pub enum CmdId {
+    // === Standard library (0..127) ==========================================
+
     // -- Language commands (complex, still need interp callback) --------------
     Foreach   =  0,
     Switch    =  1,
@@ -79,76 +83,70 @@ pub enum StdCmdId {
     Range     = 54,
     Time      = 55,
     Timerate  = 56,
+
+    // === Extension / platform (128..) =======================================
+    Puts        = 128,
+    Source      = 129,
+    File        = 130,
+    Glob        = 131,
+    Regexp      = 132,
+    Regsub      = 133,
+    Disassemble = 134,
 }
 
-/// Numeric IDs for *extension / platform* commands dispatched via `SysCall`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u16)]
-pub enum ExtCmdId {
-    Puts        = 0,
-    Source      = 1,
-    File        = 2,
-    Glob        = 3,
-    Regexp      = 4,
-    Regsub      = 5,
-    Disassemble = 6,
-}
-
-impl StdCmdId {
-    /// Try to map a command name to its standard-library ID.
-    pub fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "foreach"   => Self::Foreach,
-            "switch"    => Self::Switch,
-            "try"       => Self::Try,
-            "catch"     => Self::Catch,
-            "proc"      => Self::Proc,
-            "rename"    => Self::Rename,
-            "eval"      => Self::Eval,
-            "apply"     => Self::Apply,
-            "uplevel"   => Self::Uplevel,
-            "upvar"     => Self::Upvar,
-            "global"    => Self::Global,
-            "unset"     => Self::Unset,
-            "subst"     => Self::Subst,
-            "info"      => Self::Info,
-            "error"     => Self::Error,
-            "tailcall"  => Self::Tailcall,
-            "append"    => Self::Append,
-            "string"    => Self::StringCmd,
-            "list"      => Self::List,
-            "llength"   => Self::Llength,
-            "lindex"    => Self::Lindex,
-            "lappend"   => Self::Lappend,
-            "lrange"    => Self::Lrange,
-            "lsearch"   => Self::Lsearch,
-            "lsort"     => Self::Lsort,
-            "linsert"   => Self::Linsert,
-            "lreplace"  => Self::Lreplace,
-            "lassign"   => Self::Lassign,
-            "lrepeat"   => Self::Lrepeat,
-            "lreverse"  => Self::Lreverse,
-            "concat"    => Self::Concat,
-            "split"     => Self::Split,
-            "join"      => Self::Join,
-            "lmap"      => Self::Lmap,
-            "lset"      => Self::Lset,
-            "dict"      => Self::Dict,
-            "array"     => Self::Array,
-            "format"    => Self::Format,
-            "scan"      => Self::Scan,
-            "range"     => Self::Range,
-            "time"      => Self::Time,
-            "timerate"  => Self::Timerate,
-            _ => return None,
-        })
+impl CmdId {
+    /// Whether this ID refers to an extension / platform command (ID >= 128).
+    pub fn is_extension(self) -> bool {
+        (self as u16) >= 128
     }
-}
 
-impl ExtCmdId {
-    /// Try to map a command name to its extension-command ID.
+    /// Try to map a command name to its numeric ID.
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
+            // -- Standard library ---
+            "foreach"     => Self::Foreach,
+            "switch"      => Self::Switch,
+            "try"         => Self::Try,
+            "catch"       => Self::Catch,
+            "proc"        => Self::Proc,
+            "rename"      => Self::Rename,
+            "eval"        => Self::Eval,
+            "apply"       => Self::Apply,
+            "uplevel"     => Self::Uplevel,
+            "upvar"       => Self::Upvar,
+            "global"      => Self::Global,
+            "unset"       => Self::Unset,
+            "subst"       => Self::Subst,
+            "info"        => Self::Info,
+            "error"       => Self::Error,
+            "tailcall"    => Self::Tailcall,
+            "append"      => Self::Append,
+            "string"      => Self::StringCmd,
+            "list"        => Self::List,
+            "llength"     => Self::Llength,
+            "lindex"      => Self::Lindex,
+            "lappend"     => Self::Lappend,
+            "lrange"      => Self::Lrange,
+            "lsearch"     => Self::Lsearch,
+            "lsort"       => Self::Lsort,
+            "linsert"     => Self::Linsert,
+            "lreplace"    => Self::Lreplace,
+            "lassign"     => Self::Lassign,
+            "lrepeat"     => Self::Lrepeat,
+            "lreverse"    => Self::Lreverse,
+            "concat"      => Self::Concat,
+            "split"       => Self::Split,
+            "join"        => Self::Join,
+            "lmap"        => Self::Lmap,
+            "lset"        => Self::Lset,
+            "dict"        => Self::Dict,
+            "array"       => Self::Array,
+            "format"      => Self::Format,
+            "scan"        => Self::Scan,
+            "range"       => Self::Range,
+            "time"        => Self::Time,
+            "timerate"    => Self::Timerate,
+            // -- Extension / platform ---
             "puts"        => Self::Puts,
             "source"      => Self::Source,
             "file"        => Self::File,
@@ -160,6 +158,13 @@ impl ExtCmdId {
         })
     }
 }
+
+// Backward-compatible aliases so existing code that references the old
+// names still compiles.  These will be removed in a future cleanup pass.
+#[doc(hidden)]
+pub type StdCmdId = CmdId;
+#[doc(hidden)]
+pub type ExtCmdId = CmdId;
 
 // ---------------------------------------------------------------------------
 // OpCode — the instruction set
@@ -179,6 +184,12 @@ pub enum OpCode {
     /// Push a small integer literal.
     PushInt(i64),
 
+    /// Push boolean `true` (integer 1).
+    PushTrue,
+
+    /// Push boolean `false` (integer 0).
+    PushFalse,
+
     /// Pop and discard TOS.
     Pop,
 
@@ -196,6 +207,10 @@ pub enum OpCode {
 
     /// Store TOS into a variable by name.  Leaves the value on the stack.
     StoreVar(u16),
+
+    /// Store TOS into a variable by name and **pop** the value (discard).
+    /// Used when the result of `set` is not needed.
+    StoreVarPop(u16),
 
     /// Load from a call-frame slot (local variable, fast path).
     LoadLocal(u16),
@@ -345,27 +360,34 @@ pub enum OpCode {
     /// Expand TOS as a list — pushes individual elements.
     ExpandList,
 
-    // ── Command calls (three tiers) ─────────────────────────────────────────
+    // ── Command calls ───────────────────────────────────────────────────────
 
-    /// **ECall** — call a standard / language command by numeric ID.
+    /// **Call** — invoke a built-in command by numeric [`CmdId`].
     ///
-    /// `cmd_id` indexes the interpreter's standard command table (see
-    /// [`StdCmdId`]).  `argc` arguments (including the command name itself)
-    /// are on the stack.
-    ECall { cmd_id: u16, argc: u16 },
+    /// `cmd_id` indexes the interpreter's unified command table.
+    /// `argc` arguments (including the command name itself) are on the stack.
+    Call { cmd_id: u16, argc: u16 },
 
-    /// **SysCall** — call an extension / platform command by numeric ID.
-    ///
-    /// `cmd_id` indexes the extension command table (see [`ExtCmdId`]).
-    SysCall { cmd_id: u16, argc: u16 },
+    /// **CallExpand** — like `Call`, but the argument list may contain
+    /// `{*}` expanded elements.  `argc` is the *compile-time* word count;
+    /// the actual argument count is determined at runtime by tracking
+    /// preceding `ExpandList` ops.
+    CallExpand { cmd_id: u16, argc: u16 },
 
     /// **DynCall** — dynamic command invocation.
     ///
     /// The command name is the *first* of `argc` values on the stack.
     DynCall { argc: u16 },
 
+    /// **DynCallExpand** — dynamic call with `{*}` expansion.
+    DynCallExpand { argc: u16 },
+
     /// Call a user-defined proc by ID.
     CallProc { proc_id: u16, argc: u16 },
+
+    /// Tail-call a user-defined proc — reuses the current call frame
+    /// instead of pushing a new one.
+    TailCallProc { proc_id: u16, argc: u16 },
 
     // ── Special ─────────────────────────────────────────────────────────────
 
@@ -397,12 +419,15 @@ impl fmt::Display for OpCode {
             OpCode::PushConst(idx) => write!(f, "PUSH_CONST {}", idx),
             OpCode::PushEmpty => write!(f, "PUSH_EMPTY"),
             OpCode::PushInt(n) => write!(f, "PUSH_INT {}", n),
+            OpCode::PushTrue => write!(f, "PUSH_TRUE"),
+            OpCode::PushFalse => write!(f, "PUSH_FALSE"),
             OpCode::Pop => write!(f, "POP"),
             OpCode::Dup => write!(f, "DUP"),
 
             // Variables
             OpCode::LoadVar(idx) => write!(f, "LOAD_VAR {}", idx),
             OpCode::StoreVar(idx) => write!(f, "STORE_VAR {}", idx),
+            OpCode::StoreVarPop(idx) => write!(f, "STORE_VAR_POP {}", idx),
             OpCode::LoadLocal(slot) => write!(f, "LOAD_LOCAL {}", slot),
             OpCode::StoreLocal(slot) => write!(f, "STORE_LOCAL {}", slot),
             OpCode::LoadArrayElem(idx) => write!(f, "LOAD_ARRAY_ELEM {}", idx),
@@ -481,15 +506,19 @@ impl fmt::Display for OpCode {
             OpCode::ExpandList => write!(f, "EXPAND_LIST"),
 
             // Command calls
-            OpCode::ECall { cmd_id, argc } => {
-                write!(f, "ECALL cmd={} argc={}", cmd_id, argc)
+            OpCode::Call { cmd_id, argc } => {
+                write!(f, "CALL cmd={} argc={}", cmd_id, argc)
             }
-            OpCode::SysCall { cmd_id, argc } => {
-                write!(f, "SYSCALL cmd={} argc={}", cmd_id, argc)
+            OpCode::CallExpand { cmd_id, argc } => {
+                write!(f, "CALL_EXPAND cmd={} argc={}", cmd_id, argc)
             }
             OpCode::DynCall { argc } => write!(f, "DYNCALL argc={}", argc),
+            OpCode::DynCallExpand { argc } => write!(f, "DYNCALL_EXPAND argc={}", argc),
             OpCode::CallProc { proc_id, argc } => {
                 write!(f, "CALL_PROC proc={} argc={}", proc_id, argc)
+            }
+            OpCode::TailCallProc { proc_id, argc } => {
+                write!(f, "TAIL_CALL_PROC proc={} argc={}", proc_id, argc)
             }
 
             // Special

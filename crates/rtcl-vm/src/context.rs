@@ -42,13 +42,8 @@ pub trait VmContext {
     /// the remaining elements are its arguments.
     fn invoke_command(&mut self, args: &[Value]) -> Result<Value>;
 
-    /// **ECall** — invoke a standard/language command by numeric ID.
+    /// **Call** — invoke a built-in command by numeric ID.
     ///
-    /// `cmd_id` corresponds to a [`StdCmdId`](rtcl_parser::StdCmdId).
-    fn ecall(&mut self, cmd_id: u16, args: &[Value]) -> Result<Value>;
-
-    /// **SysCall** — invoke an extension/platform command by numeric ID.
-    ///
-    /// `cmd_id` corresponds to a [`ExtCmdId`](rtcl_parser::ExtCmdId).
-    fn syscall(&mut self, cmd_id: u16, args: &[Value]) -> Result<Value>;
+    /// `cmd_id` corresponds to a [`CmdId`](rtcl_parser::CmdId).
+    fn call(&mut self, cmd_id: u16, args: &[Value]) -> Result<Value>;
 }

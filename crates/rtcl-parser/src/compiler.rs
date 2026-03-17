@@ -8,19 +8,16 @@
 //!    if-branches are compiled **inline** (the body string is parsed and
 //!    compiled recursively), eliminating per-iteration reparsing.
 //!
-//! 2. **Standard and language library commands** (e.g. `string`, `list`,
-//!    `foreach`, `proc`, …) are compiled to `ECall { cmd_id, argc }`.
-//!    The `cmd_id` comes from [`StdCmdId`]; the VM dispatches through a
-//!    function-pointer table.
+//! 2. **Known built-in commands** (e.g. `string`, `list`, `foreach`,
+//!    `proc`, `puts`, …) are compiled to `Call { cmd_id, argc }`.
+//!    The `cmd_id` comes from [`CmdId`]; the VM dispatches through a
+//!    unified function-pointer table.
 //!
-//! 3. **Extension / platform commands** (`puts`, `file`, `regexp`, …) are
-//!    compiled to `SysCall { cmd_id, argc }`.
-//!
-//! 4. **Unknown / dynamic commands** fall back to `DynCall { argc }`.
+//! 3. **Unknown / dynamic commands** fall back to `DynCall { argc }`.
 
 use crate::{Command, Word};
 use crate::bytecode::ByteCode;
-use crate::opcode::{OpCode, StdCmdId, ExtCmdId};
+use crate::opcode::{OpCode, CmdId};
 
 // ---------------------------------------------------------------------------
 // Loop context — tracks the active loop during compilation so that `break`
@@ -104,21 +101,16 @@ impl Compiler {
                 "return" => return self.compile_return(cmd),
                 "exit" => return self.compile_exit(cmd),
 
-                // ── Tier 2: ECall (standard / language library) ─────────
-                _ if StdCmdId::from_name(name).is_some() => {
-                    return self.compile_ecall(cmd, name);
-                }
-
-                // ── Tier 3: SysCall (extension / platform) ─────────────
-                _ if ExtCmdId::from_name(name).is_some() => {
-                    return self.compile_syscall(cmd, name);
+                // ── Tier 2: Call (known built-in command) ───────────────
+                _ if CmdId::from_name(name).is_some() => {
+                    return self.compile_call(cmd, name);
                 }
 
                 _ => {}
             }
         }
 
-        // ── Tier 4: DynCall (unknown / dynamic) ────────────────────────
+        // ── Tier 3: DynCall (unknown / dynamic) ────────────────────────
         self.compile_dyncall(cmd);
     }
 
@@ -423,8 +415,8 @@ impl Compiler {
                     if let Ok(n) = s.parse::<i64>() {
                         n
                     } else {
-                        // Dynamic increment amount — fall back to ECall
-                        return self.compile_ecall_by_id(cmd, StdCmdId::Append as u16, line);
+                        // Dynamic increment amount — fall back to Call
+                        return self.compile_call_by_id(cmd, CmdId::Append as u16, line);
                     }
                 } else {
                     // Dynamic expression for increment
@@ -450,8 +442,8 @@ impl Compiler {
             // `return value` — common case
             if let Word::Literal(s) = &cmd.words[1] {
                 if s == "-code" || s == "-level" {
-                    // Has options — use ECall for full return handling
-                    return self.compile_ecall_by_id(cmd, StdCmdId::Eval as u16, line);
+                    // Has options — use Call for full return handling
+                    return self.compile_call_by_id(cmd, CmdId::Eval as u16, line);
                 }
             }
             self.compile_word(&cmd.words[1], line);
@@ -525,64 +517,59 @@ impl Compiler {
     }
 
     // -----------------------------------------------------------------------
-    // Tier 2 & 3 — ECall / SysCall
+    // Tier 2 — Call (known built-in command, unified dispatch)
     // -----------------------------------------------------------------------
 
-    /// Compile as an ECall (standard / language library command).
-    fn compile_ecall(&mut self, cmd: &Command, name: &str) {
+    /// Compile as a Call (known built-in command by [`CmdId`]).
+    fn compile_call(&mut self, cmd: &Command, name: &str) {
         let line = cmd.line as u32;
-        let cmd_id = StdCmdId::from_name(name).unwrap() as u16;
-        self.compile_ecall_by_id(cmd, cmd_id, line);
+        let cmd_id = CmdId::from_name(name).unwrap() as u16;
+        self.compile_call_by_id(cmd, cmd_id, line);
     }
 
-    fn compile_ecall_by_id(&mut self, cmd: &Command, cmd_id: u16, line: u32) {
+    fn compile_call_by_id(&mut self, cmd: &Command, cmd_id: u16, line: u32) {
         let argc = cmd.words.len() as u16;
+        let mut has_expand = false;
         for word in &cmd.words {
             match word {
                 Word::Expand(inner) => {
+                    has_expand = true;
                     self.compile_word(inner, line);
                     self.bytecode.emit(OpCode::ExpandList, line);
                 }
                 _ => self.compile_word(word, line),
             }
         }
-        self.bytecode.emit(OpCode::ECall { cmd_id, argc }, line);
-    }
-
-    /// Compile as a SysCall (extension / platform command).
-    fn compile_syscall(&mut self, cmd: &Command, name: &str) {
-        let line = cmd.line as u32;
-        let cmd_id = ExtCmdId::from_name(name).unwrap() as u16;
-        let argc = cmd.words.len() as u16;
-        for word in &cmd.words {
-            match word {
-                Word::Expand(inner) => {
-                    self.compile_word(inner, line);
-                    self.bytecode.emit(OpCode::ExpandList, line);
-                }
-                _ => self.compile_word(word, line),
-            }
+        if has_expand {
+            self.bytecode.emit(OpCode::CallExpand { cmd_id, argc }, line);
+        } else {
+            self.bytecode.emit(OpCode::Call { cmd_id, argc }, line);
         }
-        self.bytecode.emit(OpCode::SysCall { cmd_id, argc }, line);
     }
 
     // -----------------------------------------------------------------------
-    // Tier 4 — DynCall (fully dynamic)
+    // Tier 3 — DynCall (fully dynamic)
     // -----------------------------------------------------------------------
 
     fn compile_dyncall(&mut self, cmd: &Command) {
         let line = cmd.line as u32;
         let argc = cmd.words.len() as u16;
+        let mut has_expand = false;
         for word in &cmd.words {
             match word {
                 Word::Expand(inner) => {
+                    has_expand = true;
                     self.compile_word(inner, line);
                     self.bytecode.emit(OpCode::ExpandList, line);
                 }
                 _ => self.compile_word(word, line),
             }
         }
-        self.bytecode.emit(OpCode::DynCall { argc }, line);
+        if has_expand {
+            self.bytecode.emit(OpCode::DynCallExpand { argc }, line);
+        } else {
+            self.bytecode.emit(OpCode::DynCall { argc }, line);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -654,10 +641,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_puts_syscall() {
+    fn test_compile_puts_call() {
         let bc = Compiler::compile_script("puts hello").unwrap();
         let ops = bc.ops();
-        assert!(ops.iter().any(|o| matches!(o, OpCode::SysCall { .. })));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Call { .. })));
     }
 
     #[test]
@@ -686,16 +673,16 @@ mod tests {
         let bc = Compiler::compile_script("if {1} { puts yes } else { puts no }").unwrap();
         let ops = bc.ops();
         assert!(ops.iter().any(|o| matches!(o, OpCode::JumpFalse(_))));
-        // Bodies should be compiled inline (SysCall for puts)
-        let syscall_count = ops.iter().filter(|o| matches!(o, OpCode::SysCall { .. })).count();
-        assert_eq!(syscall_count, 2, "expected 2 SysCall for puts yes / puts no");
+        // Bodies should be compiled inline (Call for puts)
+        let call_count = ops.iter().filter(|o| matches!(o, OpCode::Call { .. })).count();
+        assert_eq!(call_count, 2, "expected 2 Call for puts yes / puts no");
     }
 
     #[test]
     fn test_compile_ecall() {
         let bc = Compiler::compile_script("string length hello").unwrap();
         let ops = bc.ops();
-        assert!(ops.iter().any(|o| matches!(o, OpCode::ECall { .. })));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Call { .. })));
     }
 
     #[test]

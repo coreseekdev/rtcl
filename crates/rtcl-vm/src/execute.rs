@@ -6,8 +6,8 @@
 //! - A **loop stack** for `break`/`continue` resolution
 //!
 //! Control-flow commands (if/while/for) are executed as native jump+loop
-//! opcodes.  Standard and extension commands are dispatched via `ecall` /
-//! `syscall` on the [`VmContext`] (no HashMap lookup).
+//! opcodes.  Standard and extension commands are dispatched via `call`
+//! on the [`VmContext`] (no HashMap lookup).
 
 use crate::context::VmContext;
 use crate::error::{Error, ErrorCode, Result};
@@ -46,6 +46,12 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             OpCode::PushInt(n) => {
                 stack.push(Value::from_int(*n));
             }
+            OpCode::PushTrue => {
+                stack.push(Value::from_bool(true));
+            }
+            OpCode::PushFalse => {
+                stack.push(Value::from_bool(false));
+            }
             OpCode::Pop => {
                 stack.pop();
             }
@@ -63,6 +69,11 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             }
             OpCode::StoreVar(idx) => {
                 let val = stack.last().cloned().unwrap_or_else(Value::empty);
+                let name = code.get_const(*idx).unwrap_or("");
+                ctx.set_var(name, val)?;
+            }
+            OpCode::StoreVarPop(idx) => {
+                let val = stack.pop().unwrap_or_else(Value::empty);
                 let name = code.get_const(*idx).unwrap_or("");
                 ctx.set_var(name, val)?;
             }
@@ -313,22 +324,22 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             }
 
             // ── Command calls ───────────────────────────────────────
-            OpCode::ECall { cmd_id, argc } => {
+            OpCode::Call { cmd_id, argc } => {
                 let n = *argc as usize;
                 if stack.len() < n {
                     return Err(Error::runtime("stack underflow", ErrorCode::Generic));
                 }
                 let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
-                let result = ctx.ecall(*cmd_id, &args)?;
+                let result = ctx.call(*cmd_id, &args)?;
                 stack.push(result);
             }
-            OpCode::SysCall { cmd_id, argc } => {
+            OpCode::CallExpand { cmd_id, argc } => {
                 let n = *argc as usize;
                 if stack.len() < n {
                     return Err(Error::runtime("stack underflow", ErrorCode::Generic));
                 }
                 let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
-                let result = ctx.syscall(*cmd_id, &args)?;
+                let result = ctx.call(*cmd_id, &args)?;
                 stack.push(result);
             }
             OpCode::DynCall { argc } => {
@@ -340,7 +351,25 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                 let result = ctx.invoke_command(&args)?;
                 stack.push(result);
             }
+            OpCode::DynCallExpand { argc } => {
+                let n = *argc as usize;
+                if stack.len() < n {
+                    return Err(Error::runtime("stack underflow", ErrorCode::Generic));
+                }
+                let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
+                let result = ctx.invoke_command(&args)?;
+                stack.push(result);
+            }
             OpCode::CallProc { proc_id: _, argc } => {
+                let n = *argc as usize;
+                if stack.len() < n {
+                    return Err(Error::runtime("stack underflow", ErrorCode::Generic));
+                }
+                let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
+                let result = ctx.invoke_command(&args)?;
+                stack.push(result);
+            }
+            OpCode::TailCallProc { proc_id: _, argc } => {
                 let n = *argc as usize;
                 if stack.len() < n {
                     return Err(Error::runtime("stack underflow", ErrorCode::Generic));
@@ -473,16 +502,10 @@ fn execute_catch_block(
                 let result = ctx.invoke_command(&args)?;
                 stack.push(result);
             }
-            OpCode::ECall { cmd_id, argc } => {
+            OpCode::Call { cmd_id, argc } | OpCode::CallExpand { cmd_id, argc } => {
                 let n = *argc as usize;
                 let args: Vec<Value> = stack.drain(stack.len().saturating_sub(n)..).collect();
-                let result = ctx.ecall(*cmd_id, &args)?;
-                stack.push(result);
-            }
-            OpCode::SysCall { cmd_id, argc } => {
-                let n = *argc as usize;
-                let args: Vec<Value> = stack.drain(stack.len().saturating_sub(n)..).collect();
-                let result = ctx.syscall(*cmd_id, &args)?;
+                let result = ctx.call(*cmd_id, &args)?;
                 stack.push(result);
             }
             OpCode::LoopEnter { cont, brk } => {

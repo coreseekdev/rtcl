@@ -77,6 +77,10 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "range",     func: loops::cmd_range,        cat: Standard, cmd_id: Some(CmdId::Range     as u16) },
     CmdEntry { name: "time",      func: loops::cmd_time,         cat: Standard, cmd_id: Some(CmdId::Time      as u16) },
     CmdEntry { name: "timerate",  func: loops::cmd_timerate,     cat: Standard, cmd_id: Some(CmdId::Timerate  as u16) },
+    CmdEntry { name: "clock",     func: clock::cmd_clock,        cat: Standard, cmd_id: Some(CmdId::Clock    as u16) },
+    CmdEntry { name: "package",   func: package::cmd_package,    cat: Standard, cmd_id: Some(CmdId::Package  as u16) },
+    CmdEntry { name: "namespace", func: namespace::cmd_namespace, cat: Language,  cmd_id: Some(CmdId::Namespace as u16) },
+    CmdEntry { name: "variable",  func: namespace::cmd_variable,  cat: Language,  cmd_id: Some(CmdId::Variable as u16) },
     // ── Extension commands (always available) ──────────────────────────────
     CmdEntry { name: "puts",        func: io::cmd_puts,           cat: Extension, cmd_id: Some(CmdId::Puts        as u16) },
     CmdEntry { name: "disassemble", func: misc::cmd_disassemble,  cat: Extension, cmd_id: Some(CmdId::Disassemble as u16) },
@@ -90,6 +94,17 @@ static CMD_TABLE_STD: &[CmdEntry] = &[
     CmdEntry { name: "glob",    func: io::cmd_glob,              cat: Extension, cmd_id: Some(CmdId::Glob   as u16) },
     CmdEntry { name: "regexp",  func: regexp_cmds::cmd_regexp,   cat: Extension, cmd_id: Some(CmdId::Regexp as u16) },
     CmdEntry { name: "regsub",  func: regexp_cmds::cmd_regsub,   cat: Extension, cmd_id: Some(CmdId::Regsub as u16) },
+    CmdEntry { name: "open",   func: chan_io::cmd_open,          cat: Extension, cmd_id: Some(CmdId::Open   as u16) },
+    CmdEntry { name: "close",  func: chan_io::cmd_close,         cat: Extension, cmd_id: Some(CmdId::Close  as u16) },
+    CmdEntry { name: "read",   func: chan_io::cmd_read,          cat: Extension, cmd_id: Some(CmdId::Read   as u16) },
+    CmdEntry { name: "gets",   func: chan_io::cmd_gets,          cat: Extension, cmd_id: Some(CmdId::Gets   as u16) },
+    CmdEntry { name: "seek",   func: chan_io::cmd_seek,          cat: Extension, cmd_id: Some(CmdId::Seek   as u16) },
+    CmdEntry { name: "tell",   func: chan_io::cmd_tell,          cat: Extension, cmd_id: Some(CmdId::Tell   as u16) },
+    CmdEntry { name: "eof",    func: chan_io::cmd_eof,           cat: Extension, cmd_id: Some(CmdId::Eof    as u16) },
+    CmdEntry { name: "flush",  func: chan_io::cmd_flush,         cat: Extension, cmd_id: Some(CmdId::Flush  as u16) },
+    CmdEntry { name: "fconfigure", func: chan_io::cmd_fconfigure, cat: Extension, cmd_id: Some(CmdId::Fconfigure as u16) },
+    CmdEntry { name: "pid",    func: chan_io::cmd_pid,           cat: Extension, cmd_id: Some(CmdId::Pid    as u16) },
+    CmdEntry { name: "exec",   func: exec_cmd::cmd_exec,        cat: Extension, cmd_id: Some(CmdId::Exec   as u16) },
 ];
 
 impl Interp {

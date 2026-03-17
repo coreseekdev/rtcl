@@ -115,7 +115,14 @@ impl Interp {
             Err(e) => {
                 if e.is_return() {
                     match &e {
-                        Error::ControlFlow { level, value, .. } => {
+                        Error::ControlFlow { level, value, error_info, error_code, .. } => {
+                            // Propagate -errorinfo / -errorcode to global variables
+                            if let Some(info) = error_info {
+                                self.globals.insert("errorInfo".to_string(), Value::from_str(info));
+                            }
+                            if let Some(code) = error_code {
+                                self.globals.insert("errorCode".to_string(), Value::from_str(code));
+                            }
                             let val_str = value.clone().unwrap_or_default();
                             match *level {
                                 0 => {

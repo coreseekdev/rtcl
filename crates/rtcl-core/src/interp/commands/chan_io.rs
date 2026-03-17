@@ -1,0 +1,258 @@
+//! Channel I/O commands: open, close, read, gets, seek, tell, eof, flush, fconfigure, pid.
+
+use crate::error::{Error, Result};
+use crate::interp::Interp;
+use crate::value::Value;
+
+fn io_err(msg: std::io::Error) -> Error {
+    Error::runtime(msg.to_string(), crate::error::ErrorCode::Io)
+}
+
+fn io_err_str(msg: impl std::fmt::Display) -> Error {
+    Error::runtime(msg.to_string(), crate::error::ErrorCode::Io)
+}
+
+// ---------- open ----------
+
+pub fn cmd_open(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(Error::wrong_args_with_usage(
+            "open", 2, args.len(),
+            "open fileName ?access?",
+        ));
+    }
+    let path = args[1].as_str();
+    let mode = if args.len() >= 3 { args[2].as_str() } else { "r" };
+
+    // Pipe channel: open |command ?mode?
+    if let Some(cmd_str) = path.strip_prefix('|') {
+        return open_pipe(interp, cmd_str.trim(), mode);
+    }
+
+    let id = interp.channels.open_file(path, mode).map_err(|e| {
+        io_err_str(format!("couldn't open \"{}\": {}", path, e))
+    })?;
+    Ok(Value::from_str(&id))
+}
+
+fn open_pipe(interp: &mut Interp, cmd_str: &str, mode: &str) -> Result<Value> {
+    let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err(io_err_str("empty pipe command"));
+    }
+
+    let mut child_cmd = std::process::Command::new(parts[0]);
+    child_cmd.args(&parts[1..]);
+
+    match mode {
+        "r" => {
+            child_cmd.stdout(std::process::Stdio::piped());
+        }
+        "w" => {
+            child_cmd.stdin(std::process::Stdio::piped());
+        }
+        "r+" | "w+" => {
+            child_cmd.stdin(std::process::Stdio::piped());
+            child_cmd.stdout(std::process::Stdio::piped());
+        }
+        _ => {
+            child_cmd.stdout(std::process::Stdio::piped());
+        }
+    }
+
+    let child = child_cmd.spawn().map_err(|e| {
+        io_err_str(format!("couldn't execute \"{}\": {}", cmd_str, e))
+    })?;
+
+    let pipe = crate::channel::PipeChannel::new(child);
+    let pid = pipe.pid();
+    let id = format!("file{}", pid);
+    interp.channels.register(id.clone(), Box::new(pipe));
+    Ok(Value::from_str(&id))
+}
+
+// ---------- close ----------
+
+pub fn cmd_close(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::wrong_args_with_usage("close", 2, args.len(), "close channelId"));
+    }
+    let id = args[1].as_str();
+    interp.channels.close(id).map_err(io_err)?;
+    Ok(Value::empty())
+}
+
+// ---------- read ----------
+
+pub fn cmd_read(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(Error::wrong_args_with_usage("read", 2, args.len(), "read channelId ?numBytes?"));
+    }
+
+    let mut i = 1;
+    let nonewline = if args[i].as_str() == "-nonewline" {
+        i += 1;
+        true
+    } else {
+        false
+    };
+
+    if i >= args.len() {
+        return Err(Error::wrong_args_with_usage("read", 2, args.len(), "read ?-nonewline? channelId ?numBytes?"));
+    }
+
+    let chan_id = args[i].as_str();
+    let ch = interp.channels.get_mut(chan_id)
+        .ok_or_else(|| io_err_str(format!("can not find channel named \"{}\"", chan_id)))?;
+
+    if i + 1 < args.len() {
+        // read channelId numBytes
+        let count = args[i + 1].as_int().ok_or_else(|| {
+            Error::runtime(format!("expected integer but got \"{}\"", args[i + 1].as_str()), crate::error::ErrorCode::Generic)
+        })? as usize;
+        let s = ch.read_chars(count).map_err(io_err)?;
+        Ok(Value::from_str(&s))
+    } else {
+        // read channelId  (read all)
+        let mut s = ch.read_all().map_err(io_err)?;
+        if nonewline && s.ends_with('\n') {
+            s.pop();
+            if s.ends_with('\r') { s.pop(); }
+        }
+        Ok(Value::from_str(&s))
+    }
+}
+
+// ---------- gets ----------
+
+pub fn cmd_gets(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(Error::wrong_args_with_usage("gets", 2, args.len(), "gets channelId ?varName?"));
+    }
+    let chan_id = args[1].as_str();
+
+    let ch = interp.channels.get_mut(chan_id)
+        .ok_or_else(|| io_err_str(format!("can not find channel named \"{}\"", chan_id)))?;
+
+    let line = ch.read_line().map_err(io_err)?;
+
+    if args.len() == 3 {
+        // gets channelId varName → store line in var, return byte count
+        let var_name = args[2].as_str();
+        match line {
+            Some(ref s) => {
+                let len = s.len() as i64;
+                interp.set_var(var_name, Value::from_str(s))?;
+                Ok(Value::from_int(len))
+            }
+            None => {
+                interp.set_var(var_name, Value::from_str(""))?;
+                Ok(Value::from_int(-1))
+            }
+        }
+    } else {
+        // gets channelId → return the line
+        Ok(Value::from_str(line.as_deref().unwrap_or("")))
+    }
+}
+
+// ---------- seek ----------
+
+pub fn cmd_seek(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 3 || args.len() > 4 {
+        return Err(Error::wrong_args_with_usage("seek", 3, args.len(), "seek channelId offset ?origin?"));
+    }
+    let chan_id = args[1].as_str();
+    let offset = args[2].as_int().ok_or_else(|| {
+        Error::runtime(format!("expected integer but got \"{}\"", args[2].as_str()), crate::error::ErrorCode::Generic)
+    })?;
+    let origin = if args.len() == 4 {
+        match args[3].as_str() {
+            "start" => std::io::SeekFrom::Start(offset as u64),
+            "current" => std::io::SeekFrom::Current(offset),
+            "end" => std::io::SeekFrom::End(offset),
+            other => return Err(Error::runtime(
+                format!("bad origin \"{}\": must be start, current, or end", other),
+                crate::error::ErrorCode::InvalidOp,
+            )),
+        }
+    } else {
+        std::io::SeekFrom::Start(offset as u64)
+    };
+
+    let ch = interp.channels.get_mut(chan_id)
+        .ok_or_else(|| io_err_str(format!("can not find channel named \"{}\"", chan_id)))?;
+    ch.seek(offset, origin).map_err(io_err)?;
+    Ok(Value::empty())
+}
+
+// ---------- tell ----------
+
+pub fn cmd_tell(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::wrong_args_with_usage("tell", 2, args.len(), "tell channelId"));
+    }
+    let chan_id = args[1].as_str();
+    let ch = interp.channels.get_mut(chan_id)
+        .ok_or_else(|| io_err_str(format!("can not find channel named \"{}\"", chan_id)))?;
+    let pos = ch.tell().map_err(io_err)?;
+    Ok(Value::from_int(pos as i64))
+}
+
+// ---------- eof ----------
+
+pub fn cmd_eof(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::wrong_args_with_usage("eof", 2, args.len(), "eof channelId"));
+    }
+    let chan_id = args[1].as_str();
+    let ch = interp.channels.get_mut(chan_id)
+        .ok_or_else(|| io_err_str(format!("can not find channel named \"{}\"", chan_id)))?;
+    Ok(Value::from_bool(ch.eof()))
+}
+
+// ---------- flush ----------
+
+pub fn cmd_flush(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::wrong_args_with_usage("flush", 2, args.len(), "flush channelId"));
+    }
+    let chan_id = args[1].as_str();
+    let ch = interp.channels.get_mut(chan_id)
+        .ok_or_else(|| io_err_str(format!("can not find channel named \"{}\"", chan_id)))?;
+    ch.flush().map_err(io_err)?;
+    Ok(Value::empty())
+}
+
+// ---------- fconfigure ----------
+
+pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::wrong_args_with_usage("fconfigure", 2, args.len(), "fconfigure channelId ?optName? ?value? ..."));
+    }
+    let _chan_id = args[1].as_str();
+
+    // Verify the channel exists
+    if interp.channels.get_mut(args[1].as_str()).is_none() {
+        return Err(io_err_str(format!("can not find channel named \"{}\"", args[1].as_str())));
+    }
+
+    // Minimal implementation: accept and ignore options for now
+    // TODO: implement -translation, -encoding, -buffering, -blocking
+    Ok(Value::empty())
+}
+
+// ---------- pid ----------
+
+pub fn cmd_pid(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() == 1 {
+        // pid — return current process ID
+        Ok(Value::from_int(std::process::id() as i64))
+    } else if args.len() == 2 {
+        // pid channelId — return PID of pipe channel
+        // For now, return empty (would need downcast to PipeChannel)
+        Ok(Value::empty())
+    } else {
+        Err(Error::wrong_args_with_usage("pid", 1, args.len(), "pid ?channelId?"))
+    }
+}

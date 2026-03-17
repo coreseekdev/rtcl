@@ -74,9 +74,18 @@ pub struct Interp {
     pub(crate) result: Value,
     /// Bytecode cache — keyed by script source.
     pub(crate) code_cache: HashMap<String, ByteCode>,
+    /// Package registry: name → version string.
+    pub(crate) packages: HashMap<String, String>,
+    /// Current namespace ("::") at the global level.
+    pub(crate) current_namespace: String,
+    /// Known namespaces ("::" always present).
+    pub(crate) namespaces: HashMap<String, commands::namespace::NamespaceInfo>,
     /// Current script name (for info script).
     #[cfg(feature = "std")]
     pub(crate) script_name: String,
+    /// Channel table (stdin/stdout/stderr + opened files/pipes).
+    #[cfg(feature = "std")]
+    pub(crate) channels: crate::channel::ChannelTable,
 }
 
 impl Default for Interp {
@@ -98,11 +107,86 @@ impl Interp {
             max_call_depth: 1000,
             result: Value::empty(),
             code_cache: HashMap::new(),
+            packages: HashMap::new(),
+            current_namespace: "::".to_string(),
+            namespaces: {
+                let mut ns = HashMap::new();
+                ns.insert("::".to_string(), commands::namespace::NamespaceInfo::default());
+                ns
+            },
             #[cfg(feature = "std")]
             script_name: String::new(),
+            #[cfg(feature = "std")]
+            channels: crate::channel::ChannelTable::new(),
         };
         interp.register_builtins();
+        interp.init_special_vars();
         interp
+    }
+
+    /// Populate special global variables (`$env`, `$tcl_platform`, etc.).
+    fn init_special_vars(&mut self) {
+        // --- $env array (mirror OS environment) ---
+        #[cfg(feature = "std")]
+        for (key, val) in std::env::vars() {
+            let full = format!("env({})", key);
+            self.globals.insert(full, Value::from_str(&val));
+        }
+        #[cfg(feature = "std")]
+        if !self.globals.contains_key("env") {
+            self.globals.insert("env".to_string(), Value::empty());
+        }
+
+        // --- $tcl_platform array ---
+        self.globals.insert("tcl_platform(engine)".to_string(), Value::from_str("rtcl"));
+        self.globals.insert(
+            "tcl_platform(os)".to_string(),
+            Value::from_str(std::env::consts::OS),
+        );
+        self.globals.insert(
+            "tcl_platform(platform)".to_string(),
+            Value::from_str(if cfg!(unix) { "unix" } else if cfg!(windows) { "windows" } else { "unknown" }),
+        );
+        self.globals.insert(
+            "tcl_platform(machine)".to_string(),
+            Value::from_str(std::env::consts::ARCH),
+        );
+        self.globals.insert(
+            "tcl_platform(osVersion)".to_string(),
+            Value::from_str(""),
+        );
+        self.globals.insert(
+            "tcl_platform(byteOrder)".to_string(),
+            Value::from_str(if cfg!(target_endian = "little") { "littleEndian" } else { "bigEndian" }),
+        );
+        self.globals.insert(
+            "tcl_platform(wordSize)".to_string(),
+            Value::from_int(std::mem::size_of::<usize>() as i64),
+        );
+        self.globals.insert(
+            "tcl_platform(pointerSize)".to_string(),
+            Value::from_int(std::mem::size_of::<*const ()>() as i64),
+        );
+        self.globals.insert("tcl_platform".to_string(), Value::empty());
+
+        // --- $argv0, $argv, $argc (empty defaults — cli layer overrides) ---
+        self.globals.insert("argv0".to_string(), Value::from_str(""));
+        self.globals.insert("argv".to_string(), Value::from_str(""));
+        self.globals.insert("argc".to_string(), Value::from_int(0));
+
+        // --- $tcl_interactive ---
+        self.globals.insert("tcl_interactive".to_string(), Value::from_int(0));
+
+        // --- $errorCode, $errorInfo (empty until an error occurs) ---
+        self.globals.insert("errorCode".to_string(), Value::from_str("NONE"));
+        self.globals.insert("errorInfo".to_string(), Value::from_str(""));
+
+        // --- $auto_path (empty list — package system can populate later) ---
+        self.globals.insert("auto_path".to_string(), Value::from_str(""));
+
+        // --- $tcl_version, $tcl_patchLevel ---
+        self.globals.insert("tcl_version".to_string(), Value::from_str("8.6"));
+        self.globals.insert("tcl_patchLevel".to_string(), Value::from_str("8.6.0-rtcl"));
     }
 
     /// Whether we are inside a procedure scope.

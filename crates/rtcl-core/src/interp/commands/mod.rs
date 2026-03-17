@@ -10,3 +10,10 @@ pub mod proc;
 pub mod io;
 pub mod misc;
 pub mod regexp_cmds;
+pub mod clock;
+pub mod package;
+#[cfg(feature = "std")]
+pub mod chan_io;
+#[cfg(feature = "std")]
+pub mod exec_cmd;
+pub mod namespace;

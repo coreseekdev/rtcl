@@ -55,6 +55,10 @@ pub enum Error {
         value: Option<String>,
         /// Tcl return code: 0=ok, 1=error, 2=return, 3=break, 4=continue
         level: i32,
+        /// Optional `-errorinfo` string (for stack trace).
+        error_info: Option<String>,
+        /// Optional `-errorcode` list (e.g. "POSIX ENOENT {no such file}").
+        error_code: Option<String>,
     },
 
     /// Tail-call request — signals that `tailcall` wants the
@@ -162,6 +166,8 @@ impl Error {
             kind: ControlFlow::Return,
             value,
             level: 0,
+            error_info: None,
+            error_code: None,
         }
     }
 
@@ -172,6 +178,24 @@ impl Error {
             kind: ControlFlow::Return,
             value,
             level: code,
+            error_info: None,
+            error_code: None,
+        }
+    }
+
+    /// Create a return with full options (for `return -code -errorinfo -errorcode`).
+    pub fn return_with_options(
+        code: i32,
+        value: Option<String>,
+        error_info: Option<String>,
+        error_code: Option<String>,
+    ) -> Self {
+        Error::ControlFlow {
+            kind: ControlFlow::Return,
+            value,
+            level: code,
+            error_info,
+            error_code,
         }
     }
 
@@ -181,6 +205,8 @@ impl Error {
             kind: ControlFlow::Break,
             value: None,
             level: 0,
+            error_info: None,
+            error_code: None,
         }
     }
 
@@ -190,6 +216,8 @@ impl Error {
             kind: ControlFlow::Continue,
             value: None,
             level: 0,
+            error_info: None,
+            error_code: None,
         }
     }
 
@@ -199,6 +227,8 @@ impl Error {
             kind: ControlFlow::Exit,
             value: code.map(|c| c.to_string()),
             level: 0,
+            error_info: None,
+            error_code: None,
         }
     }
 
@@ -228,6 +258,8 @@ impl Error {
             kind: ControlFlow::Error,
             value: Some(msg),
             level: 1,
+            error_info: None,
+            error_code: None,
         }
     }
 

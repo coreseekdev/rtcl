@@ -163,9 +163,11 @@ pub fn cmd_continue(_interp: &mut Interp, _args: &[Value]) -> Result<Value> {
 }
 
 pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    // Parse options: return ?-code code? ?-level level? ?value?
+    // Parse options: return ?-code code? ?-level level? ?-errorinfo info? ?-errorcode code? ?value?
     let mut code: Option<i32> = None;
     let mut _level: i32 = 1; // default level
+    let mut error_info: Option<String> = None;
+    let mut error_code: Option<String> = None;
     let mut i = 1;
 
     while i < args.len() {
@@ -208,6 +210,26 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 )
             })?;
             i += 1;
+        } else if arg == "-errorinfo" {
+            i += 1;
+            if i >= args.len() {
+                return Err(Error::runtime(
+                    "missing value for -errorinfo option",
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+            error_info = Some(args[i].as_str().to_string());
+            i += 1;
+        } else if arg == "-errorcode" {
+            i += 1;
+            if i >= args.len() {
+                return Err(Error::runtime(
+                    "missing value for -errorcode option",
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+            error_code = Some(args[i].as_str().to_string());
+            i += 1;
         } else {
             break;
         }
@@ -220,8 +242,14 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
 
     match code {
-        Some(c) => Err(Error::return_with_code(c, value)),
-        None => Err(Error::ret(value)),
+        Some(c) => Err(Error::return_with_options(c, value, error_info, error_code)),
+        None => {
+            if error_info.is_some() || error_code.is_some() {
+                Err(Error::return_with_options(0, value, error_info, error_code))
+            } else {
+                Err(Error::ret(value))
+            }
+        }
     }
 }
 

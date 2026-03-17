@@ -9,7 +9,15 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args_with_usage("proc", 4, args.len(), "name argList body"));
     }
 
-    let name = args[1].as_str().to_string();
+    let raw_name = args[1].as_str();
+    // Qualify the proc name if we're inside a namespace context
+    let name = if raw_name.starts_with("::") {
+        raw_name.to_string()
+    } else if interp.current_namespace != "::" {
+        super::namespace::qualify(&interp.current_namespace, raw_name)
+    } else {
+        raw_name.to_string()
+    };
     let params = args[2].as_list().unwrap_or_default();
     let body = args[3].as_str().to_string();
 

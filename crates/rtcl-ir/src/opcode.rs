@@ -83,6 +83,8 @@ pub enum CmdId {
     Range     = 54,
     Time      = 55,
     Timerate  = 56,
+    Clock     = 57,
+    Package   = 58,
 
     // === Extension / platform (128..) =======================================
     Puts        = 128,
@@ -92,6 +94,19 @@ pub enum CmdId {
     Regexp      = 132,
     Regsub      = 133,
     Disassemble = 134,
+    Open        = 135,
+    Close       = 136,
+    Read        = 137,
+    Gets        = 138,
+    Seek        = 139,
+    Tell        = 140,
+    Eof         = 141,
+    Flush       = 142,
+    Fconfigure  = 143,
+    Pid         = 144,
+    Exec        = 145,
+    Namespace   = 59,
+    Variable    = 60,
 }
 
 impl CmdId {
@@ -146,6 +161,8 @@ impl CmdId {
             "range"       => Self::Range,
             "time"        => Self::Time,
             "timerate"    => Self::Timerate,
+            "clock"       => Self::Clock,
+            "package"     => Self::Package,
             // -- Extension / platform ---
             "puts"        => Self::Puts,
             "source"      => Self::Source,
@@ -154,6 +171,19 @@ impl CmdId {
             "regexp"      => Self::Regexp,
             "regsub"      => Self::Regsub,
             "disassemble" => Self::Disassemble,
+            "open"        => Self::Open,
+            "close"       => Self::Close,
+            "read"        => Self::Read,
+            "gets"        => Self::Gets,
+            "seek"        => Self::Seek,
+            "tell"        => Self::Tell,
+            "eof"         => Self::Eof,
+            "flush"       => Self::Flush,
+            "fconfigure"  => Self::Fconfigure,
+            "pid"         => Self::Pid,
+            "exec"        => Self::Exec,
+            "namespace"   => Self::Namespace,
+            "variable"    => Self::Variable,
             _ => return None,
         })
     }

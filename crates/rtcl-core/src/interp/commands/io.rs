@@ -7,43 +7,63 @@ use crate::value::Value;
 // ---------- puts ----------
 
 #[cfg(feature = "std")]
-pub fn cmd_puts(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    // puts ?-nonewline? ?channelId? string
+    let mut nonewline = false;
+    let mut chan_id = "stdout";
+    let msg;
+
     match args.len() {
         2 => {
-            println!("{}", args[1].as_str());
-            Ok(Value::empty())
+            msg = args[1].as_str();
         }
         3 => {
-            let flag = args[1].as_str();
-            let msg = args[2].as_str();
-            if flag == "-nonewline" || flag == "stdout" || flag == "stderr" {
-                if flag == "-nonewline" {
-                    print!("{}", msg);
-                } else if flag == "stderr" {
-                    eprintln!("{}", msg);
-                } else {
-                    println!("{}", msg);
-                }
-                Ok(Value::empty())
+            let first = args[1].as_str();
+            if first == "-nonewline" {
+                nonewline = true;
+                msg = args[2].as_str();
             } else {
-                // treat as channel + data
-                println!("{}", msg);
-                Ok(Value::empty())
+                // first is channelId
+                chan_id = first;
+                msg = args[2].as_str();
             }
         }
         4 => {
-            let flag = args[1].as_str();
-            let _chan = args[2].as_str();
-            let msg = args[3].as_str();
-            if flag == "-nonewline" {
-                print!("{}", msg);
+            if args[1].as_str() == "-nonewline" {
+                nonewline = true;
+                chan_id = args[2].as_str();
             } else {
-                println!("{}", msg);
+                chan_id = args[1].as_str();
             }
-            Ok(Value::empty())
+            msg = args[3].as_str();
         }
-        _ => Err(Error::wrong_args_with_usage("puts", 2, args.len(), "?-nonewline? ?channelId? string")),
+        _ => return Err(Error::wrong_args_with_usage("puts", 2, args.len(), "?-nonewline? ?channelId? string")),
     }
+
+    let ch = interp.channels.get_mut(chan_id)
+        .ok_or_else(|| Error::runtime(
+            format!("can not find channel named \"{}\"", chan_id),
+            crate::error::ErrorCode::Io,
+        ))?;
+
+    ch.write_str(msg).map_err(|e| Error::runtime(
+        format!("error writing \"{}\": {}", chan_id, e),
+        crate::error::ErrorCode::Io,
+    ))?;
+
+    if !nonewline {
+        ch.write_str("\n").map_err(|e| Error::runtime(
+            format!("error writing \"{}\": {}", chan_id, e),
+            crate::error::ErrorCode::Io,
+        ))?;
+    }
+
+    ch.flush().map_err(|e| Error::runtime(
+        format!("error flushing \"{}\": {}", chan_id, e),
+        crate::error::ErrorCode::Io,
+    ))?;
+
+    Ok(Value::empty())
 }
 
 #[cfg(not(feature = "std"))]

@@ -27,6 +27,8 @@ pub mod parser;
 pub mod interp;
 pub mod command;
 pub mod types;
+#[cfg(feature = "std")]
+pub mod channel;
 
 // Re-exports for convenience
 pub use error::{Error, Result};

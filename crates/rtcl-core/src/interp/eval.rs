@@ -65,13 +65,37 @@ impl Interp {
 
         let cmd_name = args[0].as_str();
 
-        // User-defined procs first
-        if let Some(proc_def) = self.procs.get(cmd_name).cloned() {
+        // Namespace-aware command lookup:
+        // 1. Try the name as-is (handles fully-qualified "::ns::cmd" and global commands)
+        // 2. If in a non-global namespace, try qualifying the name in the current namespace
+        // 3. Fall back to global unqualified name
+
+        // User-defined procs
+        let proc_def = self.procs.get(cmd_name).cloned().or_else(|| {
+            if self.current_namespace != "::" && !cmd_name.starts_with("::") {
+                let qualified = crate::interp::commands::namespace::qualify(
+                    &self.current_namespace, cmd_name,
+                );
+                self.procs.get(&qualified).cloned()
+            } else {
+                None
+            }
+        });
+        if let Some(proc_def) = proc_def {
             return self.call_proc(&proc_def, &args);
         }
 
         // Built-in commands
-        let func = self.commands.get(cmd_name).cloned();
+        let func = self.commands.get(cmd_name).cloned().or_else(|| {
+            if self.current_namespace != "::" && !cmd_name.starts_with("::") {
+                let qualified = crate::interp::commands::namespace::qualify(
+                    &self.current_namespace, cmd_name,
+                );
+                self.commands.get(&qualified).cloned()
+            } else {
+                None
+            }
+        });
         match func {
             Some(f) => {
                 self.call_depth += 1;

@@ -221,6 +221,15 @@ impl Compiler {
             let false_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
             i += 1;
 
+            // Skip optional "then" keyword
+            if i < cmd.words.len() {
+                if let Word::Literal(kw) = &cmd.words[i] {
+                    if kw == "then" {
+                        i += 1;
+                    }
+                }
+            }
+
             // Compile the then-body
             if i < cmd.words.len() {
                 self.compile_body_word(&cmd.words[i], line);

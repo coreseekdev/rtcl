@@ -13,24 +13,43 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let expr = args[1].as_str();
     let cond = interp.eval_expr(expr)?;
 
-    if cond.is_true() {
-        return interp.eval(args[2].as_str());
+    // Skip optional "then" keyword after the condition
+    let mut i = 2;
+    if i < args.len() && args[i].as_str() == "then" {
+        i += 1;
     }
 
-    let mut i = 3;
+    if i >= args.len() {
+        return Err(Error::wrong_args("if", i + 1, args.len()));
+    }
+
+    if cond.is_true() {
+        return interp.eval(args[i].as_str());
+    }
+    i += 1;
+
     while i < args.len() {
         let word = args[i].as_str();
         match word {
             "elseif" => {
-                if i + 2 >= args.len() {
+                i += 1;
+                if i >= args.len() {
                     return Err(Error::wrong_args("elseif", 2, args.len() - i));
                 }
-                let expr = args[i + 1].as_str();
+                let expr = args[i].as_str();
                 let cond = interp.eval_expr(expr)?;
-                if cond.is_true() {
-                    return interp.eval(args[i + 2].as_str());
+                i += 1;
+                // Skip optional "then" keyword
+                if i < args.len() && args[i].as_str() == "then" {
+                    i += 1;
                 }
-                i += 3;
+                if i >= args.len() {
+                    return Err(Error::wrong_args("elseif", 3, 0));
+                }
+                if cond.is_true() {
+                    return interp.eval(args[i].as_str());
+                }
+                i += 1;
             }
             "else" => {
                 if i + 1 >= args.len() {

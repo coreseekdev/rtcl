@@ -6,7 +6,7 @@
 
 pub mod commands;
 
-use crate::command::CommandFunc;
+use crate::command::{CommandFunc, CommandCategory};
 use crate::error::{Error, Result};
 use crate::parser::{self, Command, Word};
 use crate::value::Value;
@@ -32,6 +32,8 @@ pub struct Interp {
     pub(crate) vars: HashMap<String, Value>,
     /// Commands (built-in and registered).
     pub(crate) commands: HashMap<String, CommandFunc>,
+    /// Command category metadata.
+    pub(crate) command_categories: HashMap<String, CommandCategory>,
     /// User-defined procedures.
     pub(crate) procs: HashMap<String, ProcDef>,
     /// Call stack depth (for recursion limit).
@@ -59,6 +61,7 @@ impl Interp {
         let mut interp = Interp {
             vars: HashMap::new(),
             commands: HashMap::new(),
+            command_categories: HashMap::new(),
             procs: HashMap::new(),
             call_depth: 0,
             max_call_depth: 1000,
@@ -74,101 +77,105 @@ impl Interp {
     /// Register all built-in commands.
     fn register_builtins(&mut self) {
         use commands::*;
+        use CommandCategory::*;
 
-        // Core
-        self.register_builtin("set", misc::cmd_set);
-        self.register_builtin("puts", io::cmd_puts);
-        self.register_builtin("if", control::cmd_if);
-        self.register_builtin("while", control::cmd_while);
-        self.register_builtin("for", control::cmd_for);
-        self.register_builtin("foreach", control::cmd_foreach);
-        self.register_builtin("switch", control::cmd_switch);
-        self.register_builtin("break", control::cmd_break);
-        self.register_builtin("continue", control::cmd_continue);
-        self.register_builtin("return", control::cmd_return);
-        self.register_builtin("exit", control::cmd_exit);
-        self.register_builtin("proc", proc::cmd_proc);
-        self.register_builtin("expr", misc::cmd_expr);
-        self.register_builtin("string", string_cmds::cmd_string);
+        // -- Language builtins: core Tcl language primitives ------------------
+        self.register_categorized("set", misc::cmd_set, Language);
+        self.register_categorized("if", control::cmd_if, Language);
+        self.register_categorized("while", control::cmd_while, Language);
+        self.register_categorized("for", control::cmd_for, Language);
+        self.register_categorized("foreach", control::cmd_foreach, Language);
+        self.register_categorized("switch", control::cmd_switch, Language);
+        self.register_categorized("break", control::cmd_break, Language);
+        self.register_categorized("continue", control::cmd_continue, Language);
+        self.register_categorized("return", control::cmd_return, Language);
+        self.register_categorized("exit", control::cmd_exit, Language);
+        self.register_categorized("proc", proc::cmd_proc, Language);
+        self.register_categorized("rename", proc::cmd_rename, Language);
+        self.register_categorized("eval", proc::cmd_eval, Language);
+        self.register_categorized("apply", proc::cmd_apply, Language);
+        self.register_categorized("uplevel", proc::cmd_uplevel, Language);
+        self.register_categorized("upvar", proc::cmd_upvar, Language);
+        self.register_categorized("global", proc::cmd_global, Language);
+        self.register_categorized("unset", misc::cmd_unset, Language);
+        self.register_categorized("expr", misc::cmd_expr, Language);
+        self.register_categorized("catch", control::cmd_catch, Language);
+        self.register_categorized("error", control::cmd_error, Language);
+        self.register_categorized("try", control::cmd_try, Language);
+        self.register_categorized("tailcall", control::cmd_tailcall, Language);
+        self.register_categorized("subst", misc::cmd_subst, Language);
+        self.register_categorized("incr", misc::cmd_incr, Language);
+        self.register_categorized("append", misc::cmd_append, Language);
+        self.register_categorized("info", misc::cmd_info, Language);
 
-        // List
-        self.register_builtin("list", list::cmd_list);
-        self.register_builtin("llength", list::cmd_llength);
-        self.register_builtin("lindex", list::cmd_lindex);
-        self.register_builtin("lappend", list::cmd_lappend);
-        self.register_builtin("lrange", list::cmd_lrange);
-        self.register_builtin("lsearch", list::cmd_lsearch);
-        self.register_builtin("lsort", list::cmd_lsort);
-        self.register_builtin("linsert", list::cmd_linsert);
-        self.register_builtin("lreplace", list::cmd_lreplace);
-        self.register_builtin("lassign", list::cmd_lassign);
-        self.register_builtin("lrepeat", list::cmd_lrepeat);
-        self.register_builtin("lreverse", list::cmd_lreverse);
-        self.register_builtin("concat", list::cmd_concat);
-        self.register_builtin("split", list::cmd_split);
-        self.register_builtin("join", list::cmd_join);
-        self.register_builtin("lmap", list::cmd_lmap);
-        self.register_builtin("lset", list::cmd_lset);
+        // -- Standard library: data manipulation commands ---------------------
+        self.register_categorized("string", string_cmds::cmd_string, Standard);
+        self.register_categorized("list", list::cmd_list, Standard);
+        self.register_categorized("llength", list::cmd_llength, Standard);
+        self.register_categorized("lindex", list::cmd_lindex, Standard);
+        self.register_categorized("lappend", list::cmd_lappend, Standard);
+        self.register_categorized("lrange", list::cmd_lrange, Standard);
+        self.register_categorized("lsearch", list::cmd_lsearch, Standard);
+        self.register_categorized("lsort", list::cmd_lsort, Standard);
+        self.register_categorized("linsert", list::cmd_linsert, Standard);
+        self.register_categorized("lreplace", list::cmd_lreplace, Standard);
+        self.register_categorized("lassign", list::cmd_lassign, Standard);
+        self.register_categorized("lrepeat", list::cmd_lrepeat, Standard);
+        self.register_categorized("lreverse", list::cmd_lreverse, Standard);
+        self.register_categorized("concat", list::cmd_concat, Standard);
+        self.register_categorized("split", list::cmd_split, Standard);
+        self.register_categorized("join", list::cmd_join, Standard);
+        self.register_categorized("lmap", list::cmd_lmap, Standard);
+        self.register_categorized("lset", list::cmd_lset, Standard);
+        self.register_categorized("dict", dict::cmd_dict, Standard);
+        self.register_categorized("array", array::cmd_array, Standard);
+        self.register_categorized("format", io::cmd_format, Standard);
+        self.register_categorized("scan", misc::cmd_scan, Standard);
+        self.register_categorized("range", control::cmd_range, Standard);
+        self.register_categorized("time", control::cmd_time, Standard);
+        self.register_categorized("timerate", control::cmd_timerate, Standard);
 
-        // Misc
-        self.register_builtin("append", misc::cmd_append);
-        self.register_builtin("subst", misc::cmd_subst);
-        self.register_builtin("incr", misc::cmd_incr);
-        self.register_builtin("catch", control::cmd_catch);
-        self.register_builtin("error", control::cmd_error);
-        self.register_builtin("try", control::cmd_try);
-        self.register_builtin("tailcall", control::cmd_tailcall);
-        self.register_builtin("time", control::cmd_time);
-        self.register_builtin("timerate", control::cmd_timerate);
-        self.register_builtin("range", control::cmd_range);
-        self.register_builtin("global", proc::cmd_global);
-        self.register_builtin("upvar", proc::cmd_upvar);
-        self.register_builtin("unset", misc::cmd_unset);
-        self.register_builtin("info", misc::cmd_info);
-        self.register_builtin("rename", proc::cmd_rename);
-        self.register_builtin("eval", proc::cmd_eval);
-        self.register_builtin("apply", proc::cmd_apply);
-        self.register_builtin("uplevel", proc::cmd_uplevel);
-        self.register_builtin("disassemble", misc::cmd_disassemble);
-        self.register_builtin("scan", misc::cmd_scan);
+        // -- Extension: platform / optional commands -------------------------
+        self.register_categorized("puts", io::cmd_puts, Extension);
+        self.register_categorized("disassemble", misc::cmd_disassemble, Extension);
 
-        // Dict / Array
-        self.register_builtin("dict", dict::cmd_dict);
-        self.register_builtin("array", array::cmd_array);
-
-        // Format (no-std compatible)
-        self.register_builtin("format", io::cmd_format);
-
-        // std-only
         #[cfg(feature = "std")]
         {
-            self.register_builtin("source", io::cmd_source);
-            self.register_builtin("file", io::cmd_file);
-            self.register_builtin("glob", io::cmd_glob);
-            self.register_builtin("regexp", regexp_cmds::cmd_regexp);
-            self.register_builtin("regsub", regexp_cmds::cmd_regsub);
+            self.register_categorized("source", io::cmd_source, Extension);
+            self.register_categorized("file", io::cmd_file, Extension);
+            self.register_categorized("glob", io::cmd_glob, Extension);
+            self.register_categorized("regexp", regexp_cmds::cmd_regexp, Extension);
+            self.register_categorized("regsub", regexp_cmds::cmd_regsub, Extension);
         }
     }
 
     // -- Command registration ------------------------------------------------
 
-    fn register_builtin(&mut self, name: &str, func: CommandFunc) {
+    fn register_categorized(&mut self, name: &str, func: CommandFunc, cat: CommandCategory) {
         self.commands.insert(name.to_string(), func);
+        self.command_categories.insert(name.to_string(), cat);
     }
 
+    /// Register an external command (always categorised as Extension).
     pub fn register_command(&mut self, name: &str, func: CommandFunc) {
-        self.commands.insert(name.to_string(), func);
+        self.register_categorized(name, func, CommandCategory::Extension);
     }
 
     pub fn delete_command(&mut self, name: &str) -> Result<()> {
         if self.commands.remove(name).is_none() {
             return Err(Error::invalid_command(name));
         }
+        self.command_categories.remove(name);
         Ok(())
     }
 
     pub fn command_exists(&self, name: &str) -> bool {
         self.commands.contains_key(name)
+    }
+
+    /// Return the category for a command, if it exists.
+    pub fn command_category(&self, name: &str) -> Option<CommandCategory> {
+        self.command_categories.get(name).copied()
     }
 
     // -- Variable access -----------------------------------------------------

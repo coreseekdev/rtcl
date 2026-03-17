@@ -177,6 +177,14 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
         "level" => Ok(Value::from_int(interp.call_depth as i64)),
+        "complete" => {
+            if args.len() != 3 {
+                return Err(Error::wrong_args("info complete", 3, args.len()));
+            }
+            Ok(Value::from_bool(rtcl_parser::is_complete(args[2].as_str())))
+        }
+        #[cfg(feature = "std")]
+        "script" => Ok(Value::from_str(interp.script_name())),
         _ => Err(Error::runtime(
             format!("unknown info subcommand: {}", subcmd),
             crate::error::ErrorCode::InvalidOp,

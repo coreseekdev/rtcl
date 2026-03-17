@@ -1,4 +1,20 @@
-//! Command registration and types
+//! Command registration, categories, and types.
+//!
+//! Commands are divided into three categories:
+//!
+//! - **Language** — core Tcl language primitives that are inseparable from the
+//!   interpreter semantics (`set`, `if`, `while`, `proc`, `return`, …).
+//!   These *cannot* be meaningfully removed.
+//!
+//! - **Standard** — data-manipulation commands that ship with every Tcl
+//!   distribution (`string`, `list`, `dict`, `expr`, `format`, …).
+//!   They do not affect the interpreter's control-flow machinery and could
+//!   technically be implemented as an extension library, but they are so
+//!   universally expected that they are registered by default.
+//!
+//! - **Extension** — platform-dependent or optional commands that may be
+//!   omitted in constrained environments (`puts`, `source`, `file`, `glob`,
+//!   `regexp`/`regsub`, `disassemble`, …).
 
 use crate::error::Result;
 use crate::interp::Interp;
@@ -7,56 +23,32 @@ use crate::value::Value;
 /// Command function type
 pub type CommandFunc = fn(&mut Interp, &[Value]) -> Result<Value>;
 
-/// Built-in command marker
-pub trait BuiltinCmd {
-    fn name(&self) -> &'static str;
-    fn execute(&self, interp: &mut Interp, args: &[Value]) -> Result<Value>;
+/// Category describing how tightly a command is bound to the language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommandCategory {
+    /// Core language primitives — inseparable from the interpreter.
+    Language,
+    /// Standard library — shipped by default, can theoretically be external.
+    Standard,
+    /// Extension / platform — optional, can be omitted in no-std / embedded.
+    Extension,
 }
 
-/// Command trait for custom commands
-pub trait Command: Send + Sync {
-    /// Get the command name
-    fn name(&self) -> &str;
-
-    /// Execute the command
-    fn execute(&self, interp: &mut Interp, args: &[Value]) -> Result<Value>;
-
-    /// Get help text
-    fn help(&self) -> Option<&str> {
-        None
+impl core::fmt::Display for CommandCategory {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CommandCategory::Language => write!(f, "language"),
+            CommandCategory::Standard => write!(f, "standard"),
+            CommandCategory::Extension => write!(f, "extension"),
+        }
     }
 }
 
-/// Information about a command
+/// Information about a registered command (name + category).
 #[derive(Debug, Clone)]
 pub struct CommandInfo {
     /// Command name
     pub name: String,
-    /// Number of arguments (None for variable)
-    pub min_args: usize,
-    pub max_args: Option<usize>,
-    /// Help text
-    pub help: Option<String>,
-}
-
-impl CommandInfo {
-    pub fn new(name: impl Into<String>) -> Self {
-        CommandInfo {
-            name: name.into(),
-            min_args: 0,
-            max_args: None,
-            help: None,
-        }
-    }
-
-    pub fn args(mut self, min: usize, max: impl Into<Option<usize>>) -> Self {
-        self.min_args = min;
-        self.max_args = max.into();
-        self
-    }
-
-    pub fn help(mut self, help: impl Into<String>) -> Self {
-        self.help = Some(help.into());
-        self
-    }
+    /// Category
+    pub category: CommandCategory,
 }

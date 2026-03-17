@@ -27,6 +27,7 @@ pub mod opcode;
 pub mod bytecode;
 pub mod compiler;
 pub mod validate;
+pub mod expr_compile;
 
 // Re-exports
 pub use opcode::OpCode;

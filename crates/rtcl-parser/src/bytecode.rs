@@ -135,6 +135,44 @@ impl ByteCode {
     pub fn line_at(&self, idx: usize) -> u32 {
         self.line_map.get(idx).copied().unwrap_or(0)
     }
+
+    /// Run a peephole optimization pass on the bytecode.
+    ///
+    /// Patterns:
+    /// - `StoreVar(x) + Pop` → `StoreVarPop(x)` + `Nop`
+    /// - `PushInt(0)` (as boolean) → `PushFalse`  (when followed by JumpTrue/JumpFalse)
+    /// - `PushInt(1)` (as boolean) → `PushTrue`   (when followed by JumpTrue/JumpFalse)
+    pub fn peephole(&mut self) {
+        let len = self.ops.len();
+        if len < 2 {
+            return;
+        }
+        let mut i = 0;
+        while i + 1 < len {
+            match (&self.ops[i], &self.ops[i + 1]) {
+                // StoreVar(x) + Pop → StoreVarPop(x)
+                (OpCode::StoreVar(idx), OpCode::Pop) => {
+                    let idx = *idx;
+                    self.ops[i] = OpCode::StoreVarPop(idx);
+                    self.ops[i + 1] = OpCode::Nop;
+                    i += 2;
+                }
+                // PushInt(1) before JumpFalse → PushTrue
+                (OpCode::PushInt(1), OpCode::JumpFalse(_) | OpCode::JumpTrue(_)) => {
+                    self.ops[i] = OpCode::PushTrue;
+                    i += 1;
+                }
+                // PushInt(0) before JumpFalse → PushFalse
+                (OpCode::PushInt(0), OpCode::JumpFalse(_) | OpCode::JumpTrue(_)) => {
+                    self.ops[i] = OpCode::PushFalse;
+                    i += 1;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+    }
 }
 
 impl Default for ByteCode {

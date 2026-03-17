@@ -48,6 +48,7 @@ impl Compiler {
             loops: Vec::new(),
         };
         c.compile_commands(commands);
+        c.bytecode.peephole();
         c.bytecode
     }
 
@@ -608,9 +609,18 @@ impl Compiler {
     }
 
     /// Compile a word that is an expression — evaluates via `eval_expr`.
+    ///
+    /// For `Word::Literal` expressions that contain only variables, integers,
+    /// and basic operators, compiles to native comparison/arithmetic opcodes.
+    /// Falls back to `PushConst + EvalExpr` for complex expressions.
     fn compile_expr_word(&mut self, word: &Word, line: u32) {
         match word {
             Word::Literal(s) => {
+                // Try inline compilation first
+                if crate::expr_compile::try_compile_expr(&mut self.bytecode, s, line) {
+                    return;
+                }
+                // Fallback: runtime eval
                 let idx = self.bytecode.add_const(s);
                 self.bytecode.emit(OpCode::PushConst(idx), line);
                 self.bytecode.emit(OpCode::EvalExpr, line);
@@ -656,8 +666,10 @@ mod tests {
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopExit)));
         // Body is compiled inline — incr becomes IncrVar
         assert!(ops.iter().any(|o| matches!(o, OpCode::IncrVar(_, 1))));
-        // Condition still uses EvalExpr (for now)
-        assert!(ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
+        // Condition is compiled inline — LoadVar + PushInt(10) + Lt
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Lt)));
+        // Should NOT have EvalExpr (expression was compiled inline)
+        assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
     }
 
     #[test]

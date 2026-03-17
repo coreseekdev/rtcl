@@ -51,6 +51,7 @@ impl Value {
     }
 
     /// Create a value from a string
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         Value {
             string: SmallVec::from_slice(s.as_bytes()),

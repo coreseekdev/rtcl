@@ -75,18 +75,15 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     let mut i = 1;
-    let mut exact_match = false;
+    #[derive(PartialEq)]
+    enum MatchMode { Exact, Glob, Regexp }
+    let mut mode = MatchMode::Glob;
 
     while i < args.len() && args[i].as_str().starts_with('-') {
         match args[i].as_str() {
-            "-exact" => { exact_match = true; i += 1; }
-            "-glob" => { exact_match = false; i += 1; }
-            "-regexp" => {
-                return Err(Error::runtime(
-                    "regexp mode not supported",
-                    crate::error::ErrorCode::InvalidOp,
-                ));
-            }
+            "-exact" => { mode = MatchMode::Exact; i += 1; }
+            "-glob" => { mode = MatchMode::Glob; i += 1; }
+            "-regexp" => { mode = MatchMode::Regexp; i += 1; }
             "--" => { i += 1; break; }
             _ => break,
         }
@@ -99,39 +96,54 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let string = args[i].as_str();
     i += 1;
 
-    let patterns: Vec<(String, String)>;
-    if args.len() - i == 1 {
+    let patterns: Vec<(String, String)> = if args.len() - i == 1 {
         let list = args[i].as_list().unwrap_or_default();
-        if list.len() % 2 != 0 {
+        if !list.len().is_multiple_of(2) {
             return Err(Error::runtime(
                 "switch list must have even number of elements",
                 crate::error::ErrorCode::InvalidOp,
             ));
         }
-        patterns = list
+        list
             .chunks(2)
             .map(|chunk| (chunk[0].as_str().to_string(), chunk[1].as_str().to_string()))
-            .collect();
+            .collect()
     } else {
-        if (args.len() - i) % 2 != 0 {
+        if !(args.len() - i).is_multiple_of(2) {
             return Err(Error::runtime(
                 "switch must have even number of pattern/body pairs",
                 crate::error::ErrorCode::InvalidOp,
             ));
         }
-        patterns = args[i..]
+        args[i..]
             .chunks(2)
             .map(|chunk| (chunk[0].as_str().to_string(), chunk[1].as_str().to_string()))
-            .collect();
-    }
+            .collect()
+    };
 
     for (pattern, body) in &patterns {
         let matches = if pattern == "default" {
             true
-        } else if exact_match {
-            string == pattern
         } else {
-            super::super::glob_match(pattern, string)
+            match mode {
+                MatchMode::Exact => string == pattern,
+                MatchMode::Glob => super::super::glob_match(pattern, string),
+                MatchMode::Regexp => {
+                    #[cfg(feature = "std")]
+                    {
+                        regex::Regex::new(pattern)
+                            .map(|re| re.is_match(string))
+                            .unwrap_or(false)
+                    }
+                    #[cfg(not(feature = "std"))]
+                    {
+                        return Err(Error::runtime(
+                            "switch -regexp requires std feature",
+                            crate::error::ErrorCode::InvalidOp,
+                        ));
+                    }
+                }
+            }
         };
         if matches {
             if body == "-" { continue; }
@@ -357,26 +369,16 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     // Execute finally script if present
-    let finally_result = if let Some(script) = finally_script {
-        let r = interp.eval(script);
-        if r.is_err() {
-            // Finally error replaces the original error
-            return r;
-        }
-        Some(r)
-    } else {
-        None
-    };
+    if let Some(script) = finally_script {
+        interp.eval(script)?;
+    }
 
     // Determine the final result
     if let Some(hr) = handler_result {
         // Handler was executed — its result is the return value
         hr
-    } else if finally_result.is_some() {
-        // No handler matched, finally ran OK — re-raise original error/result
-        body_result
     } else {
-        // No handler, no finally — re-raise original
+        // No handler matched — re-raise original error/result
         body_result
     }
 }
@@ -384,7 +386,7 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// `tailcall command ?arg ...?`
 /// Replaces the current proc invocation with a call to the given command.
 /// Simplified implementation: evaluates and returns via return control flow.
-pub fn cmd_tailcall(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_tailcall(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage(
             "tailcall",

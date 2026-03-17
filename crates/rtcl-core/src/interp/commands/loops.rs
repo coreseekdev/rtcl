@@ -72,7 +72,7 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() < 4 || args.len() % 2 != 0 {
+    if args.len() < 4 || !args.len().is_multiple_of(2) {
         return Err(Error::wrong_args_with_usage(
             "foreach", 4, args.len(),
             "varList list ?varList list ...? body",
@@ -102,7 +102,7 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let max_iters = groups.iter()
         .map(|g| {
             let n = g.vars.len().max(1);
-            (g.data.len() + n - 1) / n
+            g.data.len().div_ceil(n)
         })
         .max()
         .unwrap_or(0);

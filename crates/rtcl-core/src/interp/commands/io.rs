@@ -185,73 +185,262 @@ pub fn cmd_format(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let fmt = args[1].as_str();
     let mut result = String::new();
     let mut arg_idx = 2;
-    let mut chars = fmt.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '%' {
-            if let Some(spec) = chars.next() {
-                match spec {
-                    '%' => result.push('%'),
-                    's' => {
-                        if arg_idx < args.len() {
-                            result.push_str(args[arg_idx].as_str());
-                            arg_idx += 1;
-                        }
-                    }
-                    'd' | 'i' => {
-                        if arg_idx < args.len() {
-                            let v = args[arg_idx].as_int().unwrap_or(0);
-                            result.push_str(&v.to_string());
-                            arg_idx += 1;
-                        }
-                    }
-                    'f' => {
-                        if arg_idx < args.len() {
-                            let v = args[arg_idx].as_float().unwrap_or(0.0);
-                            result.push_str(&format!("{:.6}", v));
-                            arg_idx += 1;
-                        }
-                    }
-                    'x' => {
-                        if arg_idx < args.len() {
-                            let v = args[arg_idx].as_int().unwrap_or(0);
-                            result.push_str(&format!("{:x}", v));
-                            arg_idx += 1;
-                        }
-                    }
-                    'X' => {
-                        if arg_idx < args.len() {
-                            let v = args[arg_idx].as_int().unwrap_or(0);
-                            result.push_str(&format!("{:X}", v));
-                            arg_idx += 1;
-                        }
-                    }
-                    'o' => {
-                        if arg_idx < args.len() {
-                            let v = args[arg_idx].as_int().unwrap_or(0);
-                            result.push_str(&format!("{:o}", v));
-                            arg_idx += 1;
-                        }
-                    }
-                    'c' => {
-                        if arg_idx < args.len() {
-                            let v = args[arg_idx].as_int().unwrap_or(0) as u32;
-                            if let Some(c) = char::from_u32(v) {
-                                result.push(c);
-                            }
-                            arg_idx += 1;
-                        }
-                    }
-                    _ => {
-                        result.push('%');
-                        result.push(spec);
-                    }
+    let bytes = fmt.as_bytes();
+    let len = bytes.len();
+    let mut pos = 0;
+
+    while pos < len {
+        if bytes[pos] != b'%' {
+            result.push(bytes[pos] as char);
+            pos += 1;
+            continue;
+        }
+        pos += 1; // skip '%'
+        if pos >= len { break; }
+
+        // %%
+        if bytes[pos] == b'%' {
+            result.push('%');
+            pos += 1;
+            continue;
+        }
+
+        // Parse flags: - + 0 space #
+        let mut flag_minus = false;
+        let mut flag_plus = false;
+        let mut flag_zero = false;
+        let mut flag_space = false;
+        let mut flag_hash = false;
+        loop {
+            if pos >= len { break; }
+            match bytes[pos] {
+                b'-' => { flag_minus = true; pos += 1; }
+                b'+' => { flag_plus = true; pos += 1; }
+                b'0' => { flag_zero = true; pos += 1; }
+                b' ' => { flag_space = true; pos += 1; }
+                b'#' => { flag_hash = true; pos += 1; }
+                _ => break,
+            }
+        }
+
+        // Parse width (number or *)
+        let width: Option<usize> = if pos < len && bytes[pos] == b'*' {
+            pos += 1;
+            if arg_idx < args.len() {
+                let w = args[arg_idx].as_int().unwrap_or(0);
+                arg_idx += 1;
+                Some(w.unsigned_abs() as usize)
+            } else {
+                None
+            }
+        } else {
+            let start = pos;
+            while pos < len && bytes[pos].is_ascii_digit() { pos += 1; }
+            if pos > start {
+                Some(core::str::from_utf8(&bytes[start..pos]).unwrap_or("0").parse().unwrap_or(0))
+            } else {
+                None
+            }
+        };
+
+        // Parse precision: .number or .*
+        let precision: Option<usize> = if pos < len && bytes[pos] == b'.' {
+            pos += 1;
+            if pos < len && bytes[pos] == b'*' {
+                pos += 1;
+                if arg_idx < args.len() {
+                    let p = args[arg_idx].as_int().unwrap_or(0);
+                    arg_idx += 1;
+                    Some(p.max(0) as usize)
+                } else {
+                    Some(0)
+                }
+            } else {
+                let start = pos;
+                while pos < len && bytes[pos].is_ascii_digit() { pos += 1; }
+                if pos > start {
+                    Some(core::str::from_utf8(&bytes[start..pos]).unwrap_or("0").parse().unwrap_or(0))
+                } else {
+                    Some(0)
                 }
             }
         } else {
-            result.push(ch);
+            None
+        };
+
+        // Skip length modifiers (l, h, ll, etc.)
+        while pos < len && matches!(bytes[pos], b'l' | b'h' | b'L') { pos += 1; }
+
+        if pos >= len { break; }
+        let spec = bytes[pos] as char;
+        pos += 1;
+
+        if arg_idx >= args.len() && spec != '%' {
+            return Err(Error::runtime(
+                "not enough arguments for all format specifiers",
+                crate::error::ErrorCode::Generic,
+            ));
+        }
+
+        let formatted = match spec {
+            's' => {
+                let s = args[arg_idx].as_str().to_string();
+                arg_idx += 1;
+                if let Some(prec) = precision {
+                    if prec < s.len() { s[..prec].to_string() } else { s }
+                } else { s }
+            }
+            'd' | 'i' => {
+                let v = args[arg_idx].as_int().unwrap_or(0);
+                arg_idx += 1;
+                format_int(v, 10, false, flag_plus, flag_space, flag_hash)
+            }
+            'u' => {
+                let v = args[arg_idx].as_int().unwrap_or(0) as u64;
+                arg_idx += 1;
+                v.to_string()
+            }
+            'x' => {
+                let v = args[arg_idx].as_int().unwrap_or(0);
+                arg_idx += 1;
+                let s = format!("{:x}", v);
+                if flag_hash { format!("0x{}", s) } else { s }
+            }
+            'X' => {
+                let v = args[arg_idx].as_int().unwrap_or(0);
+                arg_idx += 1;
+                let s = format!("{:X}", v);
+                if flag_hash { format!("0X{}", s) } else { s }
+            }
+            'o' => {
+                let v = args[arg_idx].as_int().unwrap_or(0);
+                arg_idx += 1;
+                let s = format!("{:o}", v);
+                if flag_hash && !s.starts_with('0') { format!("0{}", s) } else { s }
+            }
+            'b' => {
+                let v = args[arg_idx].as_int().unwrap_or(0);
+                arg_idx += 1;
+                format!("{:b}", v)
+            }
+            'f' => {
+                let v = args[arg_idx].as_float().unwrap_or(0.0);
+                arg_idx += 1;
+                let prec = precision.unwrap_or(6);
+                let s = format!("{:.*}", prec, v.abs());
+                apply_sign(v, &s, flag_plus, flag_space)
+            }
+            'e' => {
+                let v = args[arg_idx].as_float().unwrap_or(0.0);
+                arg_idx += 1;
+                let prec = precision.unwrap_or(6);
+                let s = format_exp(v.abs(), prec, false);
+                apply_sign(v, &s, flag_plus, flag_space)
+            }
+            'E' => {
+                let v = args[arg_idx].as_float().unwrap_or(0.0);
+                arg_idx += 1;
+                let prec = precision.unwrap_or(6);
+                let s = format_exp(v.abs(), prec, true);
+                apply_sign(v, &s, flag_plus, flag_space)
+            }
+            'g' => {
+                let v = args[arg_idx].as_float().unwrap_or(0.0);
+                arg_idx += 1;
+                let prec = precision.unwrap_or(6).max(1);
+                let s = format_g(v.abs(), prec, false);
+                apply_sign(v, &s, flag_plus, flag_space)
+            }
+            'G' => {
+                let v = args[arg_idx].as_float().unwrap_or(0.0);
+                arg_idx += 1;
+                let prec = precision.unwrap_or(6).max(1);
+                let s = format_g(v.abs(), prec, true);
+                apply_sign(v, &s, flag_plus, flag_space)
+            }
+            'c' => {
+                let v = args[arg_idx].as_int().unwrap_or(0) as u32;
+                arg_idx += 1;
+                char::from_u32(v).map_or(String::new(), |c| c.to_string())
+            }
+            _ => {
+                format!("%{}", spec)
+            }
+        };
+
+        // Apply width and alignment
+        let w = width.unwrap_or(0);
+        if w > formatted.len() {
+            let pad = w - formatted.len();
+            let fill = if flag_zero && !flag_minus && !matches!(spec, 's' | 'c') { '0' } else { ' ' };
+            if flag_minus {
+                result.push_str(&formatted);
+                for _ in 0..pad { result.push(' '); }
+            } else if fill == '0' && (formatted.starts_with('-') || formatted.starts_with('+') || formatted.starts_with(' ')) {
+                // Pad zeros after sign
+                let (sign, rest) = formatted.split_at(1);
+                result.push_str(sign);
+                for _ in 0..pad { result.push('0'); }
+                result.push_str(rest);
+            } else {
+                for _ in 0..pad { result.push(fill); }
+                result.push_str(&formatted);
+            }
+        } else {
+            result.push_str(&formatted);
         }
     }
     Ok(Value::from_str(&result))
+}
+
+fn format_int(v: i64, _base: u32, _upper: bool, plus: bool, space: bool, _hash: bool) -> String {
+    if v >= 0 {
+        if plus { format!("+{}", v) }
+        else if space { format!(" {}", v) }
+        else { v.to_string() }
+    } else {
+        v.to_string()
+    }
+}
+
+fn apply_sign(v: f64, abs_str: &str, plus: bool, space: bool) -> String {
+    if v.is_sign_negative() && v != 0.0 {
+        format!("-{}", abs_str)
+    } else if plus {
+        format!("+{}", abs_str)
+    } else if space {
+        format!(" {}", abs_str)
+    } else {
+        abs_str.to_string()
+    }
+}
+
+fn format_exp(v: f64, prec: usize, upper: bool) -> String {
+    let e_char = if upper { 'E' } else { 'e' };
+    if v == 0.0 {
+        return format!("{:.*}{}{}", prec, 0.0_f64, e_char, "+00");
+    }
+    let exp = v.abs().log10().floor() as i32;
+    let mantissa = v / 10.0_f64.powi(exp);
+    format!("{:.*}{}{:+03}", prec, mantissa, e_char, exp)
+}
+
+fn format_g(v: f64, prec: usize, upper: bool) -> String {
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let exp = v.abs().log10().floor() as i32;
+    if exp < -4 || exp >= prec as i32 {
+        format_exp(v, prec.saturating_sub(1), upper)
+    } else {
+        // Trim trailing zeros
+        let s = format!("{:.*}", prec.saturating_sub(1).max(0), v);
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s
+        }
+    }
 }
 
 // ---------- glob (file pattern matching) ----------

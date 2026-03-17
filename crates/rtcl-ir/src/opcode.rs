@@ -359,6 +359,10 @@ pub enum OpCode {
     /// Expand TOS as a list — pushes individual elements.
     ExpandList,
 
+    /// Mark the current stack depth before pushing args for a `{*}` call.
+    /// Used by `CallExpand`/`DynCallExpand` to determine actual argc.
+    ExpandMark,
+
     // ── Command calls ───────────────────────────────────────────────────────
 
     /// **Call** — invoke a built-in command by numeric [`CmdId`].
@@ -505,6 +509,7 @@ impl fmt::Display for OpCode {
             OpCode::StrLen => write!(f, "STR_LEN"),
             OpCode::StrIndex => write!(f, "STR_INDEX"),
             OpCode::ExpandList => write!(f, "EXPAND_LIST"),
+            OpCode::ExpandMark => write!(f, "EXPAND_MARK"),
 
             // Command calls
             OpCode::Call { cmd_id, argc } => {

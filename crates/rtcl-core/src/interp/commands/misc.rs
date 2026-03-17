@@ -70,12 +70,13 @@ pub fn cmd_unset(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
     for arg in &args[start..] {
         let name = arg.as_str();
-        if interp.vars.remove(name).is_none() && !nocomplain {
+        if !interp.var_exists(name) && !nocomplain {
             return Err(Error::runtime(
                 format!("can't unset \"{}\": no such variable", name),
                 crate::error::ErrorCode::NotFound,
             ));
         }
+        let _ = interp.unset_var(name);
     }
     Ok(Value::empty())
 }
@@ -123,12 +124,12 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::wrong_args("info exists", 3, args.len()));
             }
             let name = args[2].as_str();
-            Ok(Value::from_bool(interp.vars.contains_key(name)))
+            Ok(Value::from_bool(interp.var_exists(name)))
         }
         "vars" => {
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
             let mut vars: Vec<Value> = interp
-                .vars
+                .scope_vars()
                 .keys()
                 .filter(|name| {
                     pattern
@@ -141,10 +142,9 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::from_list(&vars))
         }
         "globals" => {
-            // Same as vars in our flat model
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
             let mut vars: Vec<Value> = interp
-                .vars
+                .globals
                 .keys()
                 .filter(|name| {
                     pattern
@@ -189,7 +189,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ))
             }
         }
-        "level" => Ok(Value::from_int(interp.call_depth as i64)),
+        "level" => Ok(Value::from_int(interp.frames.len() as i64)),
         "complete" => {
             if args.len() != 3 {
                 return Err(Error::wrong_args("info complete", 3, args.len()));
@@ -326,8 +326,8 @@ pub fn cmd_disassemble(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let script = args[1].as_str();
     let code = Compiler::compile_script(script)
-        .map_err(|e| Error::syntax(&e.to_string(), 0, 0))?;
-    Ok(Value::from_str(&format!("{}", code)))
+        .map_err(|e| Error::syntax(e.to_string(), 0, 0))?;
+    Ok(Value::from_str(&code.to_string()))
 }
 
 /// `scan string format ?varName ...?`

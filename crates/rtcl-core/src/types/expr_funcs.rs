@@ -14,7 +14,7 @@ pub(crate) fn float_or_int(f: f64) -> Value {
 
 fn require_args(name: &str, expected: usize, actual: usize) -> Result<()> {
     if actual != expected {
-        Err(Error::wrong_args(&format!("{}()", name), expected, actual))
+        Err(Error::wrong_args(format!("{name}()"), expected, actual))
     } else {
         Ok(())
     }
@@ -140,7 +140,7 @@ pub(super) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
         }
         "min" | "max" => {
             if args.is_empty() {
-                return Err(Error::wrong_args(&format!("{}()", name), 1, args.len()));
+                return Err(Error::wrong_args(format!("{}()", name), 1, args.len()));
             }
             let nums: std::result::Result<Vec<f64>, _> = args.iter()
                 .map(|v| v.as_float().ok_or_else(|| Error::type_mismatch("number", "non-numeric value")))

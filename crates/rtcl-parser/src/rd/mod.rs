@@ -41,11 +41,8 @@ fn parse_script(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Vec<Command
 /// Skip whitespace (including newlines), semicolons, and comments between commands.
 fn skip_command_separators(cur: &mut Cursor) {
     loop {
-        loop {
-            match cur.peek() {
-                Some(b' ' | b'\t' | b'\r' | 0x0c | b'\n' | b';') => cur.advance(),
-                _ => break,
-            }
+        while let Some(b' ' | b'\t' | b'\r' | 0x0c | b'\n' | b';') = cur.peek() {
+            cur.advance();
         }
         if cur.is(b'#') {
             skip_comment(cur);

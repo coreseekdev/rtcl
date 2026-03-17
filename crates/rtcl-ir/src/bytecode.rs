@@ -14,7 +14,7 @@ enum FoldResult {
 }
 
 /// Compiled bytecode for a single compilation unit (script / proc body).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ByteCode {
     /// String constant pool — referenced by `PushConst`, `LoadGlobal`, etc.
     constants: Vec<String>,
@@ -29,12 +29,7 @@ pub struct ByteCode {
 impl ByteCode {
     /// Create a new, empty [`ByteCode`].
     pub fn new() -> Self {
-        ByteCode {
-            constants: Vec::new(),
-            ops: Vec::new(),
-            locals: Vec::new(),
-            line_map: Vec::new(),
-        }
+        Self::default()
     }
 
     // -- constant pool -------------------------------------------------------
@@ -292,8 +287,8 @@ impl ByteCode {
         // Build a mapping: old_index → new_index
         let mut new_index = vec![0u32; len];
         let mut offset = 0u32;
-        for i in 0..len {
-            new_index[i] = offset;
+        for (i, idx) in new_index.iter_mut().enumerate() {
+            *idx = offset;
             if !matches!(self.ops[i], OpCode::Nop) {
                 offset += 1;
             }

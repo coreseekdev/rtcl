@@ -18,7 +18,7 @@ impl Interp {
             cached.clone()
         } else {
             let compiled = Compiler::compile_script(script)
-                .map_err(|e| Error::syntax(&e.to_string(), 0, 0))?;
+                .map_err(|e| Error::syntax(e.to_string(), 0, 0))?;
             self.code_cache.insert(script.to_string(), compiled.clone());
             compiled
         };

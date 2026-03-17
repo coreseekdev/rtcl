@@ -267,9 +267,8 @@ impl<'a> ExprParser<'a> {
             } else if self.peek() == '/' {
                 self.advance();
                 let right = self.parse_power()?;
-                match (left.as_float(), right.as_float()) {
-                    (Some(_), Some(b)) if b == 0.0 => return Err(Error::DivisionByZero),
-                    _ => {}
+                if let (Some(_), Some(0.0)) = (left.as_float(), right.as_float()) {
+                    return Err(Error::DivisionByZero);
                 }
                 left = self.numeric_binop(&left, &right, '/')?;
             } else if self.peek() == '%' {

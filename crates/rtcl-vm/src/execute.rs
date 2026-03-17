@@ -29,6 +29,7 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
     let mut pc: usize = 0;
     let mut stack: Vec<Value> = Vec::with_capacity(32);
     let mut loops: Vec<ActiveLoop> = Vec::new();
+    let mut expand_mark: usize = 0;
 
     while pc < ops.len() {
         let op = &ops[pc];
@@ -353,6 +354,9 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                     stack.push(list_val);
                 }
             }
+            OpCode::ExpandMark => {
+                expand_mark = stack.len();
+            }
 
             // ── Command calls ───────────────────────────────────────
             OpCode::Call { cmd_id, argc } => {
@@ -364,12 +368,12 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                 let result = ctx.call(*cmd_id, &args)?;
                 stack.push(result);
             }
-            OpCode::CallExpand { cmd_id, argc } => {
-                let n = *argc as usize;
-                if stack.len() < n {
-                    return Err(Error::runtime("stack underflow", ErrorCode::Generic));
-                }
-                let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
+            OpCode::CallExpand { cmd_id, .. } => {
+                // argc is the compile-time word count; actual count determined
+                // by the ExpandMark saved before the arguments.
+                let n = stack.len() - expand_mark;
+                let args: Vec<Value> = stack.drain(expand_mark..).collect();
+                debug_assert_eq!(args.len(), n);
                 let result = ctx.call(*cmd_id, &args)?;
                 stack.push(result);
             }
@@ -382,12 +386,10 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                 let result = ctx.invoke_command(&args)?;
                 stack.push(result);
             }
-            OpCode::DynCallExpand { argc } => {
-                let n = *argc as usize;
-                if stack.len() < n {
-                    return Err(Error::runtime("stack underflow", ErrorCode::Generic));
-                }
-                let args: Vec<Value> = stack.drain(stack.len() - n..).collect();
+            OpCode::DynCallExpand { .. } => {
+                let n = stack.len() - expand_mark;
+                let args: Vec<Value> = stack.drain(expand_mark..).collect();
+                debug_assert_eq!(args.len(), n);
                 let result = ctx.invoke_command(&args)?;
                 stack.push(result);
             }

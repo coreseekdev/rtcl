@@ -38,10 +38,28 @@ pub(crate) struct ProcDef {
     pub body: String,
 }
 
+/// A link from a local variable name to a variable in another scope.
+#[derive(Debug, Clone)]
+pub(crate) enum UpvarLink {
+    /// Link to `globals[name]`.
+    Global(String),
+    /// Link to `frames[frame_index].locals[name]`.
+    Frame { frame_index: usize, var_name: String },
+}
+
+/// A procedure call frame.
+#[derive(Debug, Clone)]
+pub(crate) struct CallFrame {
+    pub locals: HashMap<String, Value>,
+    pub upvars: HashMap<String, UpvarLink>,
+}
+
 /// Tcl interpreter.
 pub struct Interp {
     /// Variables (global scope).
-    pub(crate) vars: HashMap<String, Value>,
+    pub(crate) globals: HashMap<String, Value>,
+    /// Procedure call frames (empty at global level).
+    pub(crate) frames: Vec<CallFrame>,
     /// Commands (built-in and registered).
     pub(crate) commands: HashMap<String, CommandFunc>,
     /// Command category metadata.
@@ -71,7 +89,8 @@ impl Interp {
     /// Create a new interpreter.
     pub fn new() -> Self {
         let mut interp = Interp {
-            vars: HashMap::new(),
+            globals: HashMap::new(),
+            frames: Vec::new(),
             commands: HashMap::new(),
             command_categories: HashMap::new(),
             procs: HashMap::new(),
@@ -84,6 +103,22 @@ impl Interp {
         };
         interp.register_builtins();
         interp
+    }
+
+    /// Whether we are inside a procedure scope.
+    #[allow(dead_code)]
+    pub(crate) fn in_proc(&self) -> bool {
+        !self.frames.is_empty()
+    }
+
+    /// Reference to variable storage for the current scope (for iteration).
+    /// Does NOT follow upvar links.
+    pub(crate) fn scope_vars(&self) -> &HashMap<String, Value> {
+        if let Some(frame) = self.frames.last() {
+            &frame.locals
+        } else {
+            &self.globals
+        }
     }
 }
 

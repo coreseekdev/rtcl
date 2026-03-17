@@ -147,7 +147,7 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             };
             let mapping = args[idx].as_list().unwrap_or_default();
             let input = args[idx + 1].as_str();
-            if mapping.len() % 2 != 0 {
+            if !mapping.len().is_multiple_of(2) {
                 return Err(Error::runtime("char map list unbalanced", crate::error::ErrorCode::InvalidOp));
             }
             let pairs: Vec<(String, String)> = mapping
@@ -233,7 +233,7 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "upper" => !test_val.is_empty() && test_val.chars().all(|c| c.is_uppercase()),
                 "lower" => !test_val.is_empty() && test_val.chars().all(|c| c.is_lowercase()),
                 "space" => !test_val.is_empty() && test_val.chars().all(|c| c.is_whitespace()),
-                "ascii" => !test_val.is_empty() && test_val.chars().all(|c| c.is_ascii()),
+                "ascii" => !test_val.is_empty() && test_val.is_ascii(),
                 "print" => !test_val.is_empty() && test_val.chars().all(|c| !c.is_control()),
                 "control" => !test_val.is_empty() && test_val.chars().all(|c| c.is_control()),
                 "xdigit" => !test_val.is_empty() && test_val.chars().all(|c| c.is_ascii_hexdigit()),

@@ -18,7 +18,7 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::wrong_args("array set", 4, args.len()));
             }
             let list = args[3].as_list().unwrap_or_default();
-            if list.len() % 2 != 0 {
+            if !list.len().is_multiple_of(2) {
                 return Err(Error::runtime(
                     "list must have an even number of elements",
                     crate::error::ErrorCode::InvalidOp,
@@ -35,7 +35,7 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let mut result: Vec<Value> = Vec::new();
             let prefix = format!("{}(", array_name);
             let vars: Vec<(String, Value)> = interp
-                .vars
+                .scope_vars()
                 .iter()
                 .filter_map(|(k, v)| {
                     if k.starts_with(&prefix) && k.ends_with(')') {
@@ -64,7 +64,7 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let pattern = if args.len() > 3 { Some(args[3].as_str()) } else { None };
             let prefix = format!("{}(", array_name);
             let names: Vec<Value> = interp
-                .vars
+                .scope_vars()
                 .keys()
                 .filter_map(|k| {
                     if k.starts_with(&prefix) && k.ends_with(')') {
@@ -88,7 +88,7 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "size" => {
             let prefix = format!("{}(", array_name);
             let count = interp
-                .vars
+                .scope_vars()
                 .keys()
                 .filter(|k| k.starts_with(&prefix) && k.ends_with(')'))
                 .count();
@@ -97,7 +97,7 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "exists" => {
             let prefix = format!("{}(", array_name);
             let exists = interp
-                .vars
+                .scope_vars()
                 .keys()
                 .any(|k| k.starts_with(&prefix) && k.ends_with(')'));
             Ok(Value::from_bool(exists))
@@ -106,7 +106,7 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let prefix = format!("{}(", array_name);
             let pattern = if args.len() > 3 { Some(args[3].as_str()) } else { None };
             let keys_to_remove: Vec<String> = interp
-                .vars
+                .scope_vars()
                 .keys()
                 .filter(|k| {
                     if k.starts_with(&prefix) && k.ends_with(')') {
@@ -123,7 +123,7 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .cloned()
                 .collect();
             for k in keys_to_remove {
-                interp.vars.remove(&k);
+                let _ = interp.unset_var(&k);
             }
             Ok(Value::empty())
         }

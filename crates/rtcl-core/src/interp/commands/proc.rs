@@ -1,7 +1,7 @@
 //! Procedure-related commands: proc, eval, uplevel, upvar, global, rename.
 
 use crate::error::{Error, Result};
-use crate::interp::{Interp, ProcDef};
+use crate::interp::{Interp, ProcDef, UpvarLink};
 use crate::value::Value;
 
 pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -115,29 +115,37 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args("uplevel", 2, args.len()));
     }
 
-    let (level, script_start) = if args.len() > 2 && args[1].as_str().starts_with('#') {
-        (0usize, 2usize)
+    let (num_to_pop, script_start) = if args.len() > 2 && args[1].as_str().starts_with('#') {
+        // #0 → global level: pop ALL frames
+        (interp.frames.len(), 2usize)
     } else if args.len() > 2 {
         match args[1].as_int() {
-            Some(n) => (n as usize, 2usize),
-            None => (1usize, 1usize),
+            Some(n) => {
+                let n = (n as usize).min(interp.frames.len());
+                (n, 2usize)
+            }
+            None => (1usize.min(interp.frames.len()), 1usize),
         }
     } else {
-        (1usize, 1usize)
+        (1usize.min(interp.frames.len()), 1usize)
     };
 
-    let _ = level; // TODO: implement proper call-frame uplevel
-
-    if args.len() - script_start == 1 {
-        interp.eval(args[script_start].as_str())
+    let script = if args.len() - script_start == 1 {
+        args[script_start].as_str().to_string()
     } else {
-        let script: String = args[script_start..]
+        args[script_start..]
             .iter()
             .map(|a| a.as_str())
             .collect::<Vec<&str>>()
-            .join(" ");
-        interp.eval(&script)
-    }
+            .join(" ")
+    };
+
+    // Pop the top N frames, eval in the target scope, then restore.
+    let split_point = interp.frames.len() - num_to_pop;
+    let saved_frames: Vec<_> = interp.frames.split_off(split_point);
+    let result = interp.eval(&script);
+    interp.frames.extend(saved_frames);
+    result
 }
 
 pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -145,25 +153,43 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args_with_usage("upvar", 3, args.len(), "?level? otherVar localVar ?otherVar localVar ...?"));
     }
 
-    let (start, _level) = if args.len() > 3 && args[1].as_str().starts_with('#') {
-        (2usize, 0usize)
+    // If not inside a proc, upvar is a no-op
+    if interp.frames.is_empty() {
+        return Ok(Value::empty());
+    }
+
+    let (start, is_global, level) = if args.len() > 3 && args[1].as_str().starts_with('#') {
+        (2usize, true, 0usize)
     } else if args.len() > 3 {
         match args[1].as_int() {
-            Some(n) => (2usize, n as usize),
-            None => (1usize, 1usize),
+            Some(n) => (2usize, false, n as usize),
+            None => (1usize, false, 1usize),
         }
     } else {
-        (1usize, 1usize)
+        (1usize, false, 1usize)
     };
 
-    // Simple implementation: link variables by copying
+    let current_idx = interp.frames.len() - 1;
+
+    // Determine the target scope
+    let target_frame = if is_global || level > current_idx {
+        None // Links to globals
+    } else {
+        Some(current_idx - level)
+    };
+
+    // Create upvar links
     let mut i = start;
     while i + 1 < args.len() {
-        let other_var = args[i].as_str();
-        let local_var = args[i + 1].as_str();
-        if let Ok(val) = interp.get_var(other_var).cloned() {
-            interp.set_var(local_var, val)?;
-        }
+        let other_var = args[i].as_str().to_string();
+        let local_var = args[i + 1].as_str().to_string();
+
+        let link = match target_frame {
+            None => UpvarLink::Global(other_var),
+            Some(fi) => UpvarLink::Frame { frame_index: fi, var_name: other_var },
+        };
+
+        interp.frames[current_idx].upvars.insert(local_var, link);
         i += 2;
     }
 
@@ -175,13 +201,20 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args("global", 2, args.len()));
     }
 
-    // Flat variable model — all variables are global already, so this is a no-op
-    // except for ensuring variables exist.
+    // At global level, global is a no-op
+    if interp.frames.is_empty() {
+        return Ok(Value::empty());
+    }
+
+    let current_idx = interp.frames.len() - 1;
+
     for arg in &args[1..] {
-        let name = arg.as_str();
-        if interp.get_var(name).is_err() {
-            interp.set_var(name, Value::empty())?;
-        }
+        let name = arg.as_str().to_string();
+        // Create a link from local "name" to globals["name"]
+        interp.frames[current_idx].upvars.insert(
+            name.clone(),
+            UpvarLink::Global(name),
+        );
     }
 
     Ok(Value::empty())

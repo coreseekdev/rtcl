@@ -1,96 +1,117 @@
-//! Command registry — built-in registration and CmdId dispatch.
+//! Command registry — single-source command table, built-in registration, and
+//! CmdId dispatch.
 
 use super::Interp;
 use crate::command::{CommandFunc, CommandCategory};
 use crate::error::{Error, Result};
 use rtcl_parser::CmdId;
 
+use super::commands::*;
+use CommandCategory::*;
+
+/// A row in the master command table.
+struct CmdEntry {
+    name: &'static str,
+    func: CommandFunc,
+    cat: CommandCategory,
+    /// `Some(id)` when the compiler can emit `Call(CmdId)` for this command.
+    cmd_id: Option<u16>,
+}
+
+/// Master command table — single source of truth for built-in commands.
+/// Both `register_builtins()` and `resolve_cmd()` are derived from this table.
+/// Commands that use native VM opcodes (set, if, while, for, break, continue,
+/// return, exit, expr, incr) have `cmd_id: None`.
+static CMD_TABLE: &[CmdEntry] = &[
+    // ── Language builtins ──────────────────────────────────────────────────
+    CmdEntry { name: "set",       func: misc::cmd_set,          cat: Language, cmd_id: None },
+    CmdEntry { name: "if",        func: control::cmd_if,        cat: Language, cmd_id: None },
+    CmdEntry { name: "while",     func: loops::cmd_while,       cat: Language, cmd_id: None },
+    CmdEntry { name: "for",       func: loops::cmd_for,         cat: Language, cmd_id: None },
+    CmdEntry { name: "break",     func: control::cmd_break,     cat: Language, cmd_id: None },
+    CmdEntry { name: "continue",  func: control::cmd_continue,  cat: Language, cmd_id: None },
+    CmdEntry { name: "return",    func: control::cmd_return,    cat: Language, cmd_id: None },
+    CmdEntry { name: "exit",      func: control::cmd_exit,      cat: Language, cmd_id: None },
+    CmdEntry { name: "expr",      func: misc::cmd_expr,         cat: Language, cmd_id: None },
+    CmdEntry { name: "incr",      func: misc::cmd_incr,         cat: Language, cmd_id: None },
+    CmdEntry { name: "foreach",   func: loops::cmd_foreach,     cat: Language, cmd_id: Some(CmdId::Foreach  as u16) },
+    CmdEntry { name: "switch",    func: control::cmd_switch,    cat: Language, cmd_id: Some(CmdId::Switch   as u16) },
+    CmdEntry { name: "try",       func: control::cmd_try,       cat: Language, cmd_id: Some(CmdId::Try      as u16) },
+    CmdEntry { name: "catch",     func: control::cmd_catch,     cat: Language, cmd_id: Some(CmdId::Catch    as u16) },
+    CmdEntry { name: "proc",      func: proc::cmd_proc,         cat: Language, cmd_id: Some(CmdId::Proc     as u16) },
+    CmdEntry { name: "rename",    func: proc::cmd_rename,       cat: Language, cmd_id: Some(CmdId::Rename   as u16) },
+    CmdEntry { name: "eval",      func: proc::cmd_eval,         cat: Language, cmd_id: Some(CmdId::Eval     as u16) },
+    CmdEntry { name: "apply",     func: proc::cmd_apply,        cat: Language, cmd_id: Some(CmdId::Apply    as u16) },
+    CmdEntry { name: "uplevel",   func: proc::cmd_uplevel,      cat: Language, cmd_id: Some(CmdId::Uplevel  as u16) },
+    CmdEntry { name: "upvar",     func: proc::cmd_upvar,        cat: Language, cmd_id: Some(CmdId::Upvar    as u16) },
+    CmdEntry { name: "global",    func: proc::cmd_global,       cat: Language, cmd_id: Some(CmdId::Global   as u16) },
+    CmdEntry { name: "unset",     func: misc::cmd_unset,        cat: Language, cmd_id: Some(CmdId::Unset    as u16) },
+    CmdEntry { name: "subst",     func: misc::cmd_subst,        cat: Language, cmd_id: Some(CmdId::Subst    as u16) },
+    CmdEntry { name: "info",      func: misc::cmd_info,         cat: Language, cmd_id: Some(CmdId::Info     as u16) },
+    CmdEntry { name: "error",     func: control::cmd_error,     cat: Language, cmd_id: Some(CmdId::Error    as u16) },
+    CmdEntry { name: "tailcall",  func: control::cmd_tailcall,  cat: Language, cmd_id: Some(CmdId::Tailcall as u16) },
+    CmdEntry { name: "append",    func: misc::cmd_append,       cat: Language, cmd_id: Some(CmdId::Append   as u16) },
+    // ── Standard library ───────────────────────────────────────────────────
+    CmdEntry { name: "string",    func: string_cmds::cmd_string, cat: Standard, cmd_id: Some(CmdId::StringCmd as u16) },
+    CmdEntry { name: "list",      func: list::cmd_list,          cat: Standard, cmd_id: Some(CmdId::List      as u16) },
+    CmdEntry { name: "llength",   func: list::cmd_llength,       cat: Standard, cmd_id: Some(CmdId::Llength   as u16) },
+    CmdEntry { name: "lindex",    func: list::cmd_lindex,        cat: Standard, cmd_id: Some(CmdId::Lindex    as u16) },
+    CmdEntry { name: "lappend",   func: list::cmd_lappend,       cat: Standard, cmd_id: Some(CmdId::Lappend   as u16) },
+    CmdEntry { name: "lrange",    func: list::cmd_lrange,        cat: Standard, cmd_id: Some(CmdId::Lrange    as u16) },
+    CmdEntry { name: "lsearch",   func: list::cmd_lsearch,       cat: Standard, cmd_id: Some(CmdId::Lsearch   as u16) },
+    CmdEntry { name: "lsort",     func: list::cmd_lsort,         cat: Standard, cmd_id: Some(CmdId::Lsort     as u16) },
+    CmdEntry { name: "linsert",   func: list::cmd_linsert,       cat: Standard, cmd_id: Some(CmdId::Linsert   as u16) },
+    CmdEntry { name: "lreplace",  func: list::cmd_lreplace,      cat: Standard, cmd_id: Some(CmdId::Lreplace  as u16) },
+    CmdEntry { name: "lassign",   func: list::cmd_lassign,       cat: Standard, cmd_id: Some(CmdId::Lassign   as u16) },
+    CmdEntry { name: "lrepeat",   func: list::cmd_lrepeat,       cat: Standard, cmd_id: Some(CmdId::Lrepeat   as u16) },
+    CmdEntry { name: "lreverse",  func: list::cmd_lreverse,      cat: Standard, cmd_id: Some(CmdId::Lreverse  as u16) },
+    CmdEntry { name: "concat",    func: list::cmd_concat,        cat: Standard, cmd_id: Some(CmdId::Concat    as u16) },
+    CmdEntry { name: "split",     func: list::cmd_split,         cat: Standard, cmd_id: Some(CmdId::Split     as u16) },
+    CmdEntry { name: "join",      func: list::cmd_join,          cat: Standard, cmd_id: Some(CmdId::Join      as u16) },
+    CmdEntry { name: "lmap",      func: list::cmd_lmap,          cat: Standard, cmd_id: Some(CmdId::Lmap      as u16) },
+    CmdEntry { name: "lset",      func: list::cmd_lset,          cat: Standard, cmd_id: Some(CmdId::Lset      as u16) },
+    CmdEntry { name: "dict",      func: dict::cmd_dict,          cat: Standard, cmd_id: Some(CmdId::Dict      as u16) },
+    CmdEntry { name: "array",     func: array::cmd_array,        cat: Standard, cmd_id: Some(CmdId::Array     as u16) },
+    CmdEntry { name: "format",    func: io::cmd_format,          cat: Standard, cmd_id: Some(CmdId::Format    as u16) },
+    CmdEntry { name: "scan",      func: misc::cmd_scan,          cat: Standard, cmd_id: Some(CmdId::Scan      as u16) },
+    CmdEntry { name: "range",     func: loops::cmd_range,        cat: Standard, cmd_id: Some(CmdId::Range     as u16) },
+    CmdEntry { name: "time",      func: loops::cmd_time,         cat: Standard, cmd_id: Some(CmdId::Time      as u16) },
+    CmdEntry { name: "timerate",  func: loops::cmd_timerate,     cat: Standard, cmd_id: Some(CmdId::Timerate  as u16) },
+    // ── Extension commands (always available) ──────────────────────────────
+    CmdEntry { name: "puts",        func: io::cmd_puts,           cat: Extension, cmd_id: Some(CmdId::Puts        as u16) },
+    CmdEntry { name: "disassemble", func: misc::cmd_disassemble,  cat: Extension, cmd_id: Some(CmdId::Disassemble as u16) },
+];
+
+/// Extension commands gated behind `feature = "std"`.
+#[cfg(feature = "std")]
+static CMD_TABLE_STD: &[CmdEntry] = &[
+    CmdEntry { name: "source",  func: io::cmd_source,            cat: Extension, cmd_id: Some(CmdId::Source as u16) },
+    CmdEntry { name: "file",    func: io::cmd_file,              cat: Extension, cmd_id: Some(CmdId::File   as u16) },
+    CmdEntry { name: "glob",    func: io::cmd_glob,              cat: Extension, cmd_id: Some(CmdId::Glob   as u16) },
+    CmdEntry { name: "regexp",  func: regexp_cmds::cmd_regexp,   cat: Extension, cmd_id: Some(CmdId::Regexp as u16) },
+    CmdEntry { name: "regsub",  func: regexp_cmds::cmd_regsub,   cat: Extension, cmd_id: Some(CmdId::Regsub as u16) },
+];
+
 impl Interp {
-    /// Register all built-in commands.
+    /// Register all built-in commands from the master table.
     pub(super) fn register_builtins(&mut self) {
-        use super::commands::*;
-        use CommandCategory::*;
-
-        // -- Language builtins: core Tcl language primitives ------------------
-        self.register_categorized("set", misc::cmd_set, Language);
-        self.register_categorized("if", control::cmd_if, Language);
-        self.register_categorized("while", loops::cmd_while, Language);
-        self.register_categorized("for", loops::cmd_for, Language);
-        self.register_categorized("foreach", loops::cmd_foreach, Language);
-        self.register_categorized("switch", control::cmd_switch, Language);
-        self.register_categorized("break", control::cmd_break, Language);
-        self.register_categorized("continue", control::cmd_continue, Language);
-        self.register_categorized("return", control::cmd_return, Language);
-        self.register_categorized("exit", control::cmd_exit, Language);
-        self.register_categorized("proc", proc::cmd_proc, Language);
-        self.register_categorized("rename", proc::cmd_rename, Language);
-        self.register_categorized("eval", proc::cmd_eval, Language);
-        self.register_categorized("apply", proc::cmd_apply, Language);
-        self.register_categorized("uplevel", proc::cmd_uplevel, Language);
-        self.register_categorized("upvar", proc::cmd_upvar, Language);
-        self.register_categorized("global", proc::cmd_global, Language);
-        self.register_categorized("unset", misc::cmd_unset, Language);
-        self.register_categorized("expr", misc::cmd_expr, Language);
-        self.register_categorized("catch", control::cmd_catch, Language);
-        self.register_categorized("error", control::cmd_error, Language);
-        self.register_categorized("try", control::cmd_try, Language);
-        self.register_categorized("tailcall", control::cmd_tailcall, Language);
-        self.register_categorized("subst", misc::cmd_subst, Language);
-        self.register_categorized("incr", misc::cmd_incr, Language);
-        self.register_categorized("append", misc::cmd_append, Language);
-        self.register_categorized("info", misc::cmd_info, Language);
-
-        // -- Standard library: data manipulation commands ---------------------
-        self.register_categorized("string", string_cmds::cmd_string, Standard);
-        self.register_categorized("list", list::cmd_list, Standard);
-        self.register_categorized("llength", list::cmd_llength, Standard);
-        self.register_categorized("lindex", list::cmd_lindex, Standard);
-        self.register_categorized("lappend", list::cmd_lappend, Standard);
-        self.register_categorized("lrange", list::cmd_lrange, Standard);
-        self.register_categorized("lsearch", list::cmd_lsearch, Standard);
-        self.register_categorized("lsort", list::cmd_lsort, Standard);
-        self.register_categorized("linsert", list::cmd_linsert, Standard);
-        self.register_categorized("lreplace", list::cmd_lreplace, Standard);
-        self.register_categorized("lassign", list::cmd_lassign, Standard);
-        self.register_categorized("lrepeat", list::cmd_lrepeat, Standard);
-        self.register_categorized("lreverse", list::cmd_lreverse, Standard);
-        self.register_categorized("concat", list::cmd_concat, Standard);
-        self.register_categorized("split", list::cmd_split, Standard);
-        self.register_categorized("join", list::cmd_join, Standard);
-        self.register_categorized("lmap", list::cmd_lmap, Standard);
-        self.register_categorized("lset", list::cmd_lset, Standard);
-        self.register_categorized("dict", dict::cmd_dict, Standard);
-        self.register_categorized("array", array::cmd_array, Standard);
-        self.register_categorized("format", io::cmd_format, Standard);
-        self.register_categorized("scan", misc::cmd_scan, Standard);
-        self.register_categorized("range", loops::cmd_range, Standard);
-        self.register_categorized("time", loops::cmd_time, Standard);
-        self.register_categorized("timerate", loops::cmd_timerate, Standard);
-
-        // -- Extension: platform / optional commands -------------------------
-        self.register_categorized("puts", io::cmd_puts, Extension);
-        self.register_categorized("disassemble", misc::cmd_disassemble, Extension);
-
+        for entry in CMD_TABLE {
+            self.commands.insert(entry.name.to_string(), entry.func);
+            self.command_categories.insert(entry.name.to_string(), entry.cat);
+        }
         #[cfg(feature = "std")]
-        {
-            self.register_categorized("source", io::cmd_source, Extension);
-            self.register_categorized("file", io::cmd_file, Extension);
-            self.register_categorized("glob", io::cmd_glob, Extension);
-            self.register_categorized("regexp", regexp_cmds::cmd_regexp, Extension);
-            self.register_categorized("regsub", regexp_cmds::cmd_regsub, Extension);
+        for entry in CMD_TABLE_STD {
+            self.commands.insert(entry.name.to_string(), entry.func);
+            self.command_categories.insert(entry.name.to_string(), entry.cat);
         }
     }
 
     // -- Command registration ------------------------------------------------
 
-    fn register_categorized(&mut self, name: &str, func: CommandFunc, cat: CommandCategory) {
-        self.commands.insert(name.to_string(), func);
-        self.command_categories.insert(name.to_string(), cat);
-    }
-
     /// Register an external command (always categorised as Extension).
     pub fn register_command(&mut self, name: &str, func: CommandFunc) {
-        self.register_categorized(name, func, CommandCategory::Extension);
+        self.commands.insert(name.to_string(), func);
+        self.command_categories.insert(name.to_string(), CommandCategory::Extension);
     }
 
     pub fn delete_command(&mut self, name: &str) -> Result<()> {
@@ -108,67 +129,20 @@ impl Interp {
     // -- Call dispatch (by numeric CmdId) ------------------------------------
 
     /// Map a `CmdId` (u16) to the corresponding command function.
+    /// Derived from the same master table as `register_builtins()`.
     pub(crate) fn resolve_cmd(&self, cmd_id: u16) -> Option<CommandFunc> {
-        use super::commands::*;
-        Some(match cmd_id {
-            // -- Language commands (standard) --
-            x if x == CmdId::Foreach   as u16 => loops::cmd_foreach,
-            x if x == CmdId::Switch    as u16 => control::cmd_switch,
-            x if x == CmdId::Try       as u16 => control::cmd_try,
-            x if x == CmdId::Catch     as u16 => control::cmd_catch,
-            x if x == CmdId::Proc      as u16 => proc::cmd_proc,
-            x if x == CmdId::Rename    as u16 => proc::cmd_rename,
-            x if x == CmdId::Eval      as u16 => proc::cmd_eval,
-            x if x == CmdId::Apply     as u16 => proc::cmd_apply,
-            x if x == CmdId::Uplevel   as u16 => proc::cmd_uplevel,
-            x if x == CmdId::Upvar     as u16 => proc::cmd_upvar,
-            x if x == CmdId::Global    as u16 => proc::cmd_global,
-            x if x == CmdId::Unset     as u16 => misc::cmd_unset,
-            x if x == CmdId::Subst     as u16 => misc::cmd_subst,
-            x if x == CmdId::Info      as u16 => misc::cmd_info,
-            x if x == CmdId::Error     as u16 => control::cmd_error,
-            x if x == CmdId::Tailcall  as u16 => control::cmd_tailcall,
-            x if x == CmdId::Append    as u16 => misc::cmd_append,
-            x if x == CmdId::StringCmd as u16 => string_cmds::cmd_string,
-            x if x == CmdId::List      as u16 => list::cmd_list,
-            x if x == CmdId::Llength   as u16 => list::cmd_llength,
-            x if x == CmdId::Lindex    as u16 => list::cmd_lindex,
-            x if x == CmdId::Lappend   as u16 => list::cmd_lappend,
-            x if x == CmdId::Lrange    as u16 => list::cmd_lrange,
-            x if x == CmdId::Lsearch   as u16 => list::cmd_lsearch,
-            x if x == CmdId::Lsort     as u16 => list::cmd_lsort,
-            x if x == CmdId::Linsert   as u16 => list::cmd_linsert,
-            x if x == CmdId::Lreplace  as u16 => list::cmd_lreplace,
-            x if x == CmdId::Lassign   as u16 => list::cmd_lassign,
-            x if x == CmdId::Lrepeat   as u16 => list::cmd_lrepeat,
-            x if x == CmdId::Lreverse  as u16 => list::cmd_lreverse,
-            x if x == CmdId::Concat    as u16 => list::cmd_concat,
-            x if x == CmdId::Split     as u16 => list::cmd_split,
-            x if x == CmdId::Join      as u16 => list::cmd_join,
-            x if x == CmdId::Lmap      as u16 => list::cmd_lmap,
-            x if x == CmdId::Lset      as u16 => list::cmd_lset,
-            x if x == CmdId::Dict      as u16 => dict::cmd_dict,
-            x if x == CmdId::Array     as u16 => array::cmd_array,
-            x if x == CmdId::Format    as u16 => io::cmd_format,
-            x if x == CmdId::Scan      as u16 => misc::cmd_scan,
-            x if x == CmdId::Range     as u16 => loops::cmd_range,
-            x if x == CmdId::Time      as u16 => loops::cmd_time,
-            x if x == CmdId::Timerate  as u16 => loops::cmd_timerate,
-            // -- Extension commands --
-            x if x == CmdId::Puts        as u16 => io::cmd_puts,
-            x if x == CmdId::Disassemble as u16 => misc::cmd_disassemble,
-            #[cfg(feature = "std")]
-            x if x == CmdId::Source as u16 => io::cmd_source,
-            #[cfg(feature = "std")]
-            x if x == CmdId::File   as u16 => io::cmd_file,
-            #[cfg(feature = "std")]
-            x if x == CmdId::Glob   as u16 => io::cmd_glob,
-            #[cfg(feature = "std")]
-            x if x == CmdId::Regexp as u16 => regexp_cmds::cmd_regexp,
-            #[cfg(feature = "std")]
-            x if x == CmdId::Regsub as u16 => regexp_cmds::cmd_regsub,
-            _ => return None,
-        })
+        for entry in CMD_TABLE {
+            if entry.cmd_id == Some(cmd_id) {
+                return Some(entry.func);
+            }
+        }
+        #[cfg(feature = "std")]
+        for entry in CMD_TABLE_STD {
+            if entry.cmd_id == Some(cmd_id) {
+                return Some(entry.func);
+            }
+        }
+        None
     }
 
     /// Return the category for a command, if it exists.

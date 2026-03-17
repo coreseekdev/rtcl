@@ -1,8 +1,14 @@
 //! Procedure call and tail-call optimisation for [`Interp`].
 
-use super::{Interp, ProcDef};
+use super::{CallFrame, Interp, ProcDef};
 use crate::error::{Error, Result};
 use crate::value::Value;
+
+#[cfg(feature = "std")]
+use std::collections::HashMap;
+
+#[cfg(all(not(feature = "std"), feature = "alloc"))]
+use alloc::collections::BTreeMap as HashMap;
 
 impl Interp {
     /// Call a user-defined procedure.
@@ -20,9 +26,20 @@ impl Interp {
 
         self.call_depth += 1;
 
+        // Push a new call frame
+        self.frames.push(CallFrame {
+            locals: HashMap::new(),
+            upvars: HashMap::new(),
+        });
+
         let final_result = loop {
-            // ── Bind parameters ────────────────────────────────────
-            let mut saved_vars = Vec::new();
+            // ── Bind parameters into current frame ─────────────────
+            {
+                let frame = self.frames.last_mut().unwrap();
+                frame.locals.clear();
+                frame.upvars.clear();
+            }
+
             let has_args = current_params.last().map(|(p, _)| p.as_str()) == Some("args");
 
             let regular_params = if has_args {
@@ -39,12 +56,7 @@ impl Interp {
                 } else {
                     Value::empty()
                 };
-                if let Some(old) = self.vars.get(param.as_str()) {
-                    saved_vars.push((param.clone(), Some(old.clone())));
-                } else {
-                    saved_vars.push((param.clone(), None));
-                }
-                self.vars.insert(param.clone(), value);
+                self.frames.last_mut().unwrap().locals.insert(param.clone(), value);
             }
 
             if has_args {
@@ -66,25 +78,11 @@ impl Interp {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
-                if let Some(old) = self.vars.get("args") {
-                    saved_vars.push(("args".to_string(), Some(old.clone())));
-                } else {
-                    saved_vars.push(("args".to_string(), None));
-                }
-                self.vars.insert("args".to_string(), Value::from_str(&list_str));
+                self.frames.last_mut().unwrap().locals.insert("args".to_string(), Value::from_str(&list_str));
             }
 
             // ── Execute body ───────────────────────────────────────
             let result = self.eval(&current_body);
-
-            // ── Restore variables ──────────────────────────────────
-            for (param, old_value) in saved_vars {
-                if let Some(v) = old_value {
-                    self.vars.insert(param, v);
-                } else {
-                    self.vars.remove(&param);
-                }
-            }
 
             // ── Check for tail-call signal ─────────────────────────
             match result {
@@ -108,6 +106,8 @@ impl Interp {
             }
         };
 
+        // Pop the frame
+        self.frames.pop();
         self.call_depth -= 1;
 
         match final_result {

@@ -23,21 +23,27 @@ impl VmContext for Interp {
     }
 
     fn incr_var(&mut self, name: &str, amount: i64) -> Result<Value> {
-        let current = self.vars.get(name).cloned().unwrap_or_else(|| Value::from_int(0));
+        let current = match Interp::get_var(self, name) {
+            Ok(v) => v.clone(),
+            Err(_) => Value::from_int(0),
+        };
         let int_val = current.as_int().ok_or_else(|| {
             Error::type_mismatch("integer", current.as_str())
         })?;
         let new_val = Value::from_int(int_val + amount);
-        self.vars.insert(name.to_string(), new_val.clone());
+        Interp::set_var(self, name, new_val.clone())?;
         Ok(new_val)
     }
 
     fn append_var(&mut self, name: &str, value: &str) -> Result<Value> {
-        let current = self.vars.get(name).cloned().unwrap_or_else(Value::empty);
+        let current = match Interp::get_var(self, name) {
+            Ok(v) => v.clone(),
+            Err(_) => Value::empty(),
+        };
         let mut s = current.as_str().to_string();
         s.push_str(value);
         let new_val = Value::from_str(&s);
-        self.vars.insert(name.to_string(), new_val.clone());
+        Interp::set_var(self, name, new_val.clone())?;
         Ok(new_val)
     }
 

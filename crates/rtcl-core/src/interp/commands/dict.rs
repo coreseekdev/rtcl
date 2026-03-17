@@ -7,7 +7,7 @@ use crate::value::Value;
 /// Parse a string as a dict (flat key-value list).
 fn parse_dict(s: &str) -> Result<Vec<(String, String)>> {
     let list = Value::from_str(s).as_list().unwrap_or_default();
-    if list.len() % 2 != 0 {
+    if !list.len().is_multiple_of(2) {
         return Err(Error::runtime(
             "missing value to go with key",
             crate::error::ErrorCode::InvalidOp,
@@ -36,7 +36,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let subcmd = args[1].as_str();
     match subcmd {
         "create" => {
-            if (args.len() - 2) % 2 != 0 {
+            if !(args.len() - 2).is_multiple_of(2) {
                 return Err(Error::runtime(
                     "wrong # args: dict create requires key value pairs",
                     crate::error::ErrorCode::InvalidOp,
@@ -179,8 +179,8 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "merge" => {
             let mut entries: Vec<(String, String)> = Vec::new();
-            for i in 2..args.len() {
-                let new_entries = parse_dict(args[i].as_str())?;
+            for arg in &args[2..] {
+                let new_entries = parse_dict(arg.as_str())?;
                 for (k, v) in new_entries {
                     if let Some(pos) = entries.iter().position(|(ek, _)| *ek == k) {
                         entries[pos].1 = v;
@@ -197,7 +197,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let mut entries = parse_dict(args[2].as_str())?;
             let pairs: Vec<&Value> = args[3..].iter().collect();
-            if pairs.len() % 2 != 0 {
+            if !pairs.len().is_multiple_of(2) {
                 return Err(Error::runtime(
                     "wrong # args: must be key value pairs",
                     crate::error::ErrorCode::InvalidOp,
@@ -338,7 +338,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 if let Some(v) = old {
                     let _ = interp.set_var(&k, v);
                 } else {
-                    interp.vars.remove(&k);
+                    let _ = interp.unset_var(&k);
                 }
             }
 

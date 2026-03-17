@@ -26,6 +26,7 @@ use crate::opcode::{OpCode, CmdId};
 
 struct LoopCtx {
     /// Index of the `LoopEnter` instruction (to be patched later).
+    #[allow(dead_code)]
     enter_idx: usize,
     /// PC of the continue target (loop condition re-check, or "next" step).
     continue_target: u32,
@@ -525,11 +526,15 @@ impl Compiler {
 
     fn compile_call_by_id(&mut self, cmd: &Command, cmd_id: u16, line: u32) {
         let argc = cmd.words.len() as u16;
-        let mut has_expand = false;
+        let has_expand = cmd.words.iter().any(|w| matches!(w, Word::Expand(_)));
+
+        if has_expand {
+            self.bytecode.emit(OpCode::ExpandMark, line);
+        }
+
         for word in &cmd.words {
             match word {
                 Word::Expand(inner) => {
-                    has_expand = true;
                     self.compile_word(inner, line);
                     self.bytecode.emit(OpCode::ExpandList, line);
                 }
@@ -550,11 +555,15 @@ impl Compiler {
     fn compile_dyncall(&mut self, cmd: &Command) {
         let line = cmd.line as u32;
         let argc = cmd.words.len() as u16;
-        let mut has_expand = false;
+        let has_expand = cmd.words.iter().any(|w| matches!(w, Word::Expand(_)));
+
+        if has_expand {
+            self.bytecode.emit(OpCode::ExpandMark, line);
+        }
+
         for word in &cmd.words {
             match word {
                 Word::Expand(inner) => {
-                    has_expand = true;
                     self.compile_word(inner, line);
                     self.bytecode.emit(OpCode::ExpandList, line);
                 }

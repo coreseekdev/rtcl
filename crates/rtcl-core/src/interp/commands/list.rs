@@ -337,8 +337,10 @@ pub fn cmd_lreverse(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 pub fn cmd_concat(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut result = String::new();
     for arg in &args[1..] {
+        let trimmed = arg.as_str().trim();
+        if trimmed.is_empty() { continue; }
         if !result.is_empty() { result.push(' '); }
-        result.push_str(arg.as_str());
+        result.push_str(trimmed);
     }
     Ok(Value::from_str(&result))
 }
@@ -349,7 +351,7 @@ pub fn cmd_split(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let string = args[1].as_str();
     if args.len() == 2 {
-        let result: Vec<Value> = string.split_whitespace().map(|s| Value::from_str(s)).collect();
+        let result: Vec<Value> = string.split_whitespace().map(Value::from_str).collect();
         Ok(Value::from_list(&result))
     } else {
         let split_chars = args[2].as_str();
@@ -359,7 +361,7 @@ pub fn cmd_split(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         } else {
             let result: Vec<Value> = string
                 .split(|c| split_chars.contains(c))
-                .map(|s| Value::from_str(s))
+                .map(Value::from_str)
                 .collect();
             Ok(Value::from_list(&result))
         }
@@ -379,7 +381,7 @@ pub fn cmd_join(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// lmap — Like foreach but collects body results into a list.
 /// Usage: lmap varList list ?varList list ...? body
 pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() < 4 || args.len() % 2 != 0 {
+    if args.len() < 4 || !args.len().is_multiple_of(2) {
         return Err(Error::wrong_args_with_usage(
             "lmap", 4, args.len(),
             "varList list ?varList list ...? body",
@@ -406,7 +408,7 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let max_iters = groups.iter()
         .map(|g| {
             let n = g.vars.len().max(1);
-            (g.data.len() + n - 1) / n
+            g.data.len().div_ceil(n)
         })
         .max()
         .unwrap_or(0);
@@ -462,26 +464,59 @@ pub fn cmd_lset(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let indices: Vec<&Value> = args[2..args.len() - 1].iter().collect();
 
     if indices.len() == 1 {
-        let idx_str = indices[0].as_str();
-        let len = list.len();
-        let idx = resolve_index(idx_str, len)?;
-        if idx >= len {
-            return Err(Error::runtime(
-                format!("list index out of range"),
-                crate::error::ErrorCode::Generic,
-            ));
+        // Check if the single index is actually a list of indices
+        let idx_list = indices[0].as_list().unwrap_or_default();
+        if idx_list.len() > 1 {
+            // Treat as nested indices: lset var {0 1} value
+            let result = lset_nested(&list, &idx_list, value)?;
+            interp.set_var(var_name, result.clone())?;
+            Ok(result)
+        } else {
+            let idx_str = indices[0].as_str();
+            let len = list.len();
+            let idx = resolve_index(idx_str, len)?;
+            if idx >= len {
+                return Err(Error::runtime(
+                    "list index out of range",
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+            list[idx] = value.clone();
+            let result = Value::from_list(&list);
+            interp.set_var(var_name, result.clone())?;
+            Ok(result)
         }
-        list[idx] = value.clone();
-        let result = Value::from_list(&list);
+    } else {
+        // Multiple separate index args: lset var i1 i2 ... value
+        let idx_values: Vec<Value> = indices.iter().map(|v| (*v).clone()).collect();
+        let result = lset_nested(&list, &idx_values, value)?;
         interp.set_var(var_name, result.clone())?;
         Ok(result)
-    } else {
-        // Nested indices — only handle single index for now
+    }
+}
+
+/// Recursively set a nested element in a list.
+fn lset_nested(list: &[Value], indices: &[Value], value: &Value) -> Result<Value> {
+    if indices.is_empty() {
+        return Ok(value.clone());
+    }
+    let idx_str = indices[0].as_str();
+    let len = list.len();
+    let idx = resolve_index(idx_str, len)?;
+    if idx >= len {
         return Err(Error::runtime(
-            "nested lset indices not yet supported",
+            "list index out of range".to_string(),
             crate::error::ErrorCode::Generic,
         ));
     }
+    let mut new_list = list.to_vec();
+    if indices.len() == 1 {
+        new_list[idx] = value.clone();
+    } else {
+        let sub_list = new_list[idx].as_list().unwrap_or_default();
+        new_list[idx] = lset_nested(&sub_list, &indices[1..], value)?;
+    }
+    Ok(Value::from_list(&new_list))
 }
 
 fn resolve_index(idx_str: &str, len: usize) -> Result<usize> {

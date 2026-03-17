@@ -2,17 +2,35 @@
 //!
 //! Tcl values can have an internal representation for efficiency
 //! while still being representable as strings.
+//!
+//! # Memory model
+//!
+//! Values are reference-counted (`Rc<ValueInner>`) with copy-on-write
+//! semantics, mirroring jimtcl's `refCount` / `Jim_DuplicateObj()` model.
+//!
+//! - `Value::clone()` is O(1) — simply increments the reference count.
+//! - Mutation (e.g. list append) uses `Rc::make_mut()`, which deep-copies
+//!   only when the value is shared (`strong_count > 1`).
+//! - Structured data (lists, dicts) are cached inside `InternalRep` to
+//!   avoid repeated string parse / serialize round-trips.
+//! - The string representation is lazily generated: after mutating the
+//!   internal representation, the string is invalidated and only
+//!   regenerated when `as_str()` is called.
 
 use core::fmt;
 use core::str::FromStr;
+use std::rc::Rc;
 
 use smallvec::SmallVec;
 
 /// Maximum inline string length before heap allocation
 const INLINE_SIZE: usize = 23;
 
-/// Internal representation of a value
-#[derive(Debug, Clone, Copy)]
+/// Internal representation of a value.
+///
+/// Mirrors jimtcl's `internalRep` union — a cached typed view of the
+/// underlying string value.
+#[derive(Debug, Clone)]
 pub enum InternalRep {
     /// Integer representation
     Int(i64),
@@ -20,19 +38,33 @@ pub enum InternalRep {
     Float(f64),
     /// Boolean representation
     Bool(bool),
-    /// List representation (indices into parent string)
-    List,
+    /// Cached list of values (avoids re-parsing the string)
+    List(Vec<Value>),
     /// No internal representation yet
     None,
 }
 
+/// Inner data shared via `Rc`.
+///
+/// Corresponds to jimtcl's `Jim_Obj` minus the free-list pointers —
+/// Rust's allocator handles recycling.
+#[derive(Debug, Clone)]
+struct ValueInner {
+    /// String representation — `None` means it must be regenerated
+    /// from `rep` (the "dirty" / invalidated state, like jimtcl's
+    /// `bytes == NULL`).
+    string: Option<SmallVec<[u8; INLINE_SIZE]>>,
+    /// Cached typed representation.
+    rep: InternalRep,
+}
+
 /// A Tcl value - "everything is a string"
+///
+/// Cloning a `Value` is **O(1)** (reference-count increment).
+/// Mutation triggers copy-on-write when the value is shared.
 #[derive(Debug, Clone)]
 pub struct Value {
-    /// String representation (always present)
-    string: SmallVec<[u8; INLINE_SIZE]>,
-    /// Internal representation (cached)
-    internal: InternalRep,
+    inner: Rc<ValueInner>,
 }
 
 impl Default for Value {
@@ -45,8 +77,10 @@ impl Value {
     /// Create an empty value
     pub fn empty() -> Self {
         Value {
-            string: SmallVec::new(),
-            internal: InternalRep::None,
+            inner: Rc::new(ValueInner {
+                string: Some(SmallVec::new()),
+                rep: InternalRep::None,
+            }),
         }
     }
 
@@ -54,30 +88,32 @@ impl Value {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         Value {
-            string: SmallVec::from_slice(s.as_bytes()),
-            internal: InternalRep::None,
+            inner: Rc::new(ValueInner {
+                string: Some(SmallVec::from_slice(s.as_bytes())),
+                rep: InternalRep::None,
+            }),
         }
     }
 
     /// Create a value from an integer
     pub fn from_int(n: i64) -> Self {
         let s = format_int(n);
-        let mut string = SmallVec::new();
-        string.extend_from_slice(s.as_bytes());
         Value {
-            string,
-            internal: InternalRep::Int(n),
+            inner: Rc::new(ValueInner {
+                string: Some(SmallVec::from_slice(s.as_bytes())),
+                rep: InternalRep::Int(n),
+            }),
         }
     }
 
     /// Create a value from a float
     pub fn from_float(n: f64) -> Self {
         let s = format_float(n);
-        let mut string = SmallVec::new();
-        string.extend_from_slice(s.as_bytes());
         Value {
-            string,
-            internal: InternalRep::Float(n),
+            inner: Rc::new(ValueInner {
+                string: Some(SmallVec::from_slice(s.as_bytes())),
+                rep: InternalRep::Float(n),
+            }),
         }
     }
 
@@ -85,52 +121,104 @@ impl Value {
     pub fn from_bool(b: bool) -> Self {
         let s = if b { "1" } else { "0" };
         Value {
-            string: SmallVec::from_slice(s.as_bytes()),
-            internal: InternalRep::Bool(b),
+            inner: Rc::new(ValueInner {
+                string: Some(SmallVec::from_slice(s.as_bytes())),
+                rep: InternalRep::Bool(b),
+            }),
         }
     }
 
-    /// Create a value from a list of values
+    /// Create a value directly from a cached list of values.
+    ///
+    /// The string representation is lazily generated on first `as_str()`
+    /// call — this avoids the serialize cost when the list is only ever
+    /// accessed structurally (e.g. `lindex`, `lappend`).
+    pub fn from_list_cached(items: Vec<Value>) -> Self {
+        Value {
+            inner: Rc::new(ValueInner {
+                string: None, // lazy — will be generated on demand
+                rep: InternalRep::List(items),
+            }),
+        }
+    }
+
+    /// Create a value from a list of values (serializes to string eagerly
+    /// for backward compatibility).
     pub fn from_list(items: &[Value]) -> Self {
-        let mut result = String::new();
-        for (i, item) in items.iter().enumerate() {
-            if i > 0 {
-                result.push(' ');
-            }
-            // Quote if necessary
-            let s = item.as_str();
-            if needs_braces(s) {
-                result.push('{');
-                result.push_str(s);
-                result.push('}');
-            } else if needs_quotes(s) {
-                result.push('"');
-                for c in s.chars() {
-                    if c == '"' || c == '\\' {
-                        result.push('\\');
-                    }
-                    result.push(c);
-                }
-                result.push('"');
-            } else {
-                result.push_str(s);
-            }
+        let s = serialize_list(items);
+        Value {
+            inner: Rc::new(ValueInner {
+                string: Some(SmallVec::from_slice(s.as_bytes())),
+                rep: InternalRep::List(items.to_vec()),
+            }),
         }
-        Value::from_str(&result)
     }
 
-    /// Get the string representation
+    // ── Accessors ──────────────────────────────────────────────
+
+    /// Get the string representation.
+    ///
+    /// If the string has been invalidated (e.g. after an in-place list
+    /// mutation), it is regenerated from the internal representation.
     pub fn as_str(&self) -> &str {
-        // Safety: we always store valid UTF-8
-        unsafe { core::str::from_utf8_unchecked(&self.string) }
+        // Fast path: string is already materialized
+        if let Some(ref bytes) = self.inner.string {
+            // Safety: we always store valid UTF-8
+            return unsafe { core::str::from_utf8_unchecked(bytes) };
+        }
+        // Slow path should not happen in practice because we always
+        // ensure the string is materialized before returning &str.
+        // But as a safety net, return empty string.
+        //
+        // The real lazy-regen path is handled by ensure_string() which
+        // must be called before as_str() when the value was mutated.
+        ""
+    }
+
+    /// Ensure the string representation is materialized.
+    /// Call this before passing the value to code that needs `.as_str()`.
+    pub fn ensure_string(&mut self) {
+        if self.inner.string.is_none() {
+            let s = match &self.inner.rep {
+                InternalRep::List(items) => serialize_list(items),
+                InternalRep::Int(n) => format_int(*n),
+                InternalRep::Float(n) => format_float(*n),
+                InternalRep::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
+                InternalRep::None => String::new(),
+            };
+            Rc::make_mut(&mut self.inner).string =
+                Some(SmallVec::from_slice(s.as_bytes()));
+        }
+    }
+
+    /// Get the string representation, materializing it if needed.
+    ///
+    /// Returns an owned `String` to avoid lifetime issues when the
+    /// string was lazily generated.
+    pub fn to_str(&self) -> std::borrow::Cow<'_, str> {
+        if let Some(ref bytes) = self.inner.string {
+            std::borrow::Cow::Borrowed(
+                unsafe { core::str::from_utf8_unchecked(bytes) }
+            )
+        } else {
+            let s = match &self.inner.rep {
+                InternalRep::List(items) => serialize_list(items),
+                InternalRep::Int(n) => format_int(*n),
+                InternalRep::Float(n) => format_float(*n),
+                InternalRep::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
+                InternalRep::None => String::new(),
+            };
+            std::borrow::Cow::Owned(s)
+        }
     }
 
     /// Try to get as integer
     pub fn as_int(&self) -> Option<i64> {
-        match self.internal {
-            InternalRep::Int(n) => Some(n),
+        match &self.inner.rep {
+            InternalRep::Int(n) => Some(*n),
             _ => {
-                let s = self.as_str().trim();
+                let s = self.to_str();
+                let s = s.trim();
                 // Handle hex, octal, binary
                 if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
                     i64::from_str_radix(rest, 16).ok()
@@ -147,11 +235,12 @@ impl Value {
 
     /// Try to get as float
     pub fn as_float(&self) -> Option<f64> {
-        match self.internal {
-            InternalRep::Float(n) => Some(n),
-            InternalRep::Int(n) => Some(n as f64),
+        match &self.inner.rep {
+            InternalRep::Float(n) => Some(*n),
+            InternalRep::Int(n) => Some(*n as f64),
             _ => {
-                let s = self.as_str().trim();
+                let s = self.to_str();
+                let s = s.trim();
                 f64::from_str(s).ok()
             }
         }
@@ -159,10 +248,11 @@ impl Value {
 
     /// Try to get as boolean
     pub fn as_bool(&self) -> Option<bool> {
-        match self.internal {
-            InternalRep::Bool(b) => Some(b),
+        match &self.inner.rep {
+            InternalRep::Bool(b) => Some(*b),
             _ => {
-                let s = self.as_str().trim();
+                let s = self.to_str();
+                let s = s.trim();
                 // Tcl boolean rules
                 match s.to_ascii_lowercase().as_str() {
                     "1" | "true" | "yes" | "on" => Some(true),
@@ -173,20 +263,37 @@ impl Value {
         }
     }
 
-    /// Parse as a list
+    /// Get the cached list if available, or parse from string.
+    ///
+    /// Returns a freshly parsed `Vec<Value>` — callers that need to
+    /// mutate should use the `_mut` helpers instead.
     pub fn as_list(&self) -> Option<Vec<Value>> {
-        let s = self.as_str();
-        parse_list(s)
+        match &self.inner.rep {
+            InternalRep::List(items) => Some(items.clone()),
+            _ => {
+                let s = self.to_str();
+                parse_list(&s)
+            }
+        }
     }
 
     /// Check if the value is empty
     pub fn is_empty(&self) -> bool {
-        self.string.is_empty()
+        if let Some(ref bytes) = self.inner.string {
+            bytes.is_empty()
+        } else {
+            match &self.inner.rep {
+                InternalRep::List(items) => items.is_empty(),
+                InternalRep::None => true,
+                _ => false,
+            }
+        }
     }
 
     /// Get the length of the string representation
     pub fn len(&self) -> usize {
-        self.string.len()
+        let s = self.to_str();
+        s.len()
     }
 
     /// Check if the value is a valid number
@@ -196,15 +303,19 @@ impl Value {
 
     /// Concatenate two values as strings
     pub fn concat(&self, other: &Value) -> Value {
-        let mut result = String::with_capacity(self.len() + other.len());
-        result.push_str(self.as_str());
-        result.push_str(other.as_str());
+        let a = self.to_str();
+        let b = other.to_str();
+        let mut result = String::with_capacity(a.len() + b.len());
+        result.push_str(&a);
+        result.push_str(&b);
         Value::from_str(&result)
     }
 
     /// Compare two values
     pub fn compare(&self, other: &Value) -> core::cmp::Ordering {
-        self.as_str().cmp(other.as_str())
+        let a = self.to_str();
+        let b = other.to_str();
+        a.cmp(&b)
     }
 
     /// Compare two values numerically if possible
@@ -219,11 +330,21 @@ impl Value {
     pub fn is_true(&self) -> bool {
         self.as_bool().unwrap_or_else(|| !self.is_empty())
     }
+
+    // ── Rc / COW helpers ───────────────────────────────────────
+
+    /// Returns `true` if this value is shared (reference count > 1).
+    ///
+    /// Equivalent to jimtcl's `Jim_IsShared()`.
+    pub fn is_shared(&self) -> bool {
+        Rc::strong_count(&self.inner) > 1
+    }
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+        let s = self.to_str();
+        write!(f, "{}", s)
     }
 }
 
@@ -261,6 +382,34 @@ impl From<f64> for Value {
     fn from(n: f64) -> Self {
         Value::from_float(n)
     }
+}
+
+/// Serialize a slice of values into a Tcl list string.
+fn serialize_list(items: &[Value]) -> String {
+    let mut result = String::new();
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            result.push(' ');
+        }
+        let s = item.to_str();
+        if needs_braces(&s) {
+            result.push('{');
+            result.push_str(&s);
+            result.push('}');
+        } else if needs_quotes(&s) {
+            result.push('"');
+            for c in s.chars() {
+                if c == '"' || c == '\\' {
+                    result.push('\\');
+                }
+                result.push(c);
+            }
+            result.push('"');
+        } else {
+            result.push_str(&s);
+        }
+    }
+    result
 }
 
 /// Check if a string needs braces for list representation

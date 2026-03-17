@@ -40,6 +40,10 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                 let s = code.get_const(*idx).unwrap_or("");
                 stack.push(Value::from_str(s));
             }
+            OpCode::PushConstWide(idx) => {
+                let s = code.get_const_wide(*idx).unwrap_or("");
+                stack.push(Value::from_str(s));
+            }
             OpCode::PushEmpty => {
                 stack.push(Value::empty());
             }
@@ -434,22 +438,13 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                 let result = ctx.eval_expr(expr.as_str())?;
                 stack.push(result);
             }
-            OpCode::CatchStart(target) => {
-                let catch_end = *target as usize;
-                let result = execute_catch_block(ctx, code, &mut pc, catch_end, &mut stack, &mut loops);
-                match result {
-                    Ok(()) => {
-                        stack.push(Value::from_int(0));
-                    }
-                    Err(e) => {
-                        stack.push(Value::from_str(&e.to_string()));
-                        stack.push(Value::from_int(1));
-                        pc = catch_end;
-                    }
-                }
+            OpCode::CatchStart(_target) => {
+                // Currently unused — `catch` is implemented as a command
+                // (cmd_catch) and not yet compiled inline.  CatchStart/CatchEnd
+                // opcodes are reserved for future inline catch compilation.
             }
             OpCode::CatchEnd => {
-                // Handled by CatchStart logic.
+                // See CatchStart above.
             }
 
             // ── Debug ───────────────────────────────────────────────
@@ -550,67 +545,4 @@ fn binary_arith(stack: &mut Vec<Value>, f: impl FnOnce(i64, i64) -> i64) -> Resu
     Ok(())
 }
 
-/// Execute instructions between a CatchStart and its matching CatchEnd.
-fn execute_catch_block(
-    ctx: &mut dyn VmContext,
-    code: &ByteCode,
-    pc: &mut usize,
-    catch_end: usize,
-    stack: &mut Vec<Value>,
-    loops: &mut Vec<ActiveLoop>,
-) -> Result<()> {
-    let ops = code.ops();
-    while *pc < ops.len() && *pc < catch_end {
-        if matches!(ops[*pc], OpCode::CatchEnd) {
-            *pc += 1;
-            return Ok(());
-        }
-        let op = &ops[*pc];
-        *pc += 1;
 
-        match op {
-            OpCode::EvalScript => {
-                let script = stack.pop().unwrap_or_else(Value::empty);
-                let result = ctx.eval_script(script.as_str())?;
-                stack.push(result);
-            }
-            OpCode::EvalExpr => {
-                let expr = stack.pop().unwrap_or_else(Value::empty);
-                let result = ctx.eval_expr(expr.as_str())?;
-                stack.push(result);
-            }
-            OpCode::PushConst(idx) => {
-                let s = code.get_const(*idx).unwrap_or("");
-                stack.push(Value::from_str(s));
-            }
-            OpCode::PushEmpty => stack.push(Value::empty()),
-            OpCode::PushInt(n) => stack.push(Value::from_int(*n)),
-            OpCode::PushFloat(n) => stack.push(Value::from_float(*n)),
-            OpCode::Pop => { stack.pop(); }
-            OpCode::Line(_) | OpCode::Nop => {}
-            OpCode::DynCall { argc } => {
-                let n = *argc as usize;
-                let args: Vec<Value> = stack.drain(stack.len().saturating_sub(n)..).collect();
-                let result = ctx.invoke_command(&args)?;
-                stack.push(result);
-            }
-            OpCode::Call { cmd_id, argc } | OpCode::CallExpand { cmd_id, argc } => {
-                let n = *argc as usize;
-                let args: Vec<Value> = stack.drain(stack.len().saturating_sub(n)..).collect();
-                let result = ctx.call(*cmd_id, &args)?;
-                stack.push(result);
-            }
-            OpCode::LoopEnter { cont, brk } => {
-                loops.push(ActiveLoop {
-                    continue_pc: *cont,
-                    break_pc: *brk,
-                });
-            }
-            OpCode::LoopExit => { loops.pop(); }
-            _ => {
-                // For other opcodes inside catch, simplified handling.
-            }
-        }
-    }
-    Ok(())
-}

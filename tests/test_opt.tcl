@@ -42,4 +42,42 @@ set r8 [expr {1 || (0 && 10 / 0)}]
 puts "mixed_sc: $r8"
 # expected: 1
 
+# --- Tail call optimization ---
+# factorial via tailcall — should NOT overflow the stack
+proc fact_iter {n acc} {
+    if {$n <= 1} {
+        return $acc
+    }
+    tailcall fact_iter [expr {$n - 1}] [expr {$n * $acc}]
+}
+set r9 [fact_iter 10 1]
+puts "tco_fact: $r9"
+# expected: 3628800
+
+# mutual tail-call: even/odd
+proc tc_even {n} {
+    if {$n == 0} { return 1 }
+    tailcall tc_odd [expr {$n - 1}]
+}
+proc tc_odd {n} {
+    if {$n == 0} { return 0 }
+    tailcall tc_even [expr {$n - 1}]
+}
+set r10 [tc_even 100]
+puts "tco_even: $r10"
+# expected: 1
+
+set r11 [tc_odd 99]
+puts "tco_odd: $r11"
+# expected: 1
+
+# deep tailcall — would overflow without TCO
+proc countdown {n} {
+    if {$n <= 0} { return done }
+    tailcall countdown [expr {$n - 1}]
+}
+set r12 [countdown 5000]
+puts "tco_deep: $r12"
+# expected: done (no stack overflow)
+
 puts "all tests done"

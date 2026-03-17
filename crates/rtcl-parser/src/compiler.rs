@@ -127,8 +127,7 @@ impl Compiler {
                 } else if let Ok(n) = s.parse::<i64>() {
                     self.bytecode.emit(OpCode::PushInt(n), line);
                 } else {
-                    let idx = self.bytecode.add_const(s);
-                    self.bytecode.emit(OpCode::PushConst(idx), line);
+                    self.bytecode.emit_push_const(s, line);
                 }
             }
             Word::VarRef(name) => {
@@ -136,8 +135,7 @@ impl Compiler {
                 self.bytecode.emit(OpCode::LoadVar(idx), line);
             }
             Word::CommandSub(script) => {
-                let idx = self.bytecode.add_const(script);
-                self.bytecode.emit(OpCode::PushConst(idx), line);
+                self.bytecode.emit_push_const(script, line);
                 self.bytecode.emit(OpCode::EvalScript, line);
             }
             Word::Concat(parts) => {
@@ -152,8 +150,7 @@ impl Compiler {
                 self.bytecode.emit(OpCode::ExpandList, line);
             }
             Word::ExprSugar(expr) => {
-                let idx = self.bytecode.add_const(expr);
-                self.bytecode.emit(OpCode::PushConst(idx), line);
+                self.bytecode.emit_push_const(expr, line);
                 self.bytecode.emit(OpCode::EvalExpr, line);
             }
         }
@@ -211,12 +208,10 @@ impl Compiler {
                             break;
                         }
                         "then" => {
-                            // skip optional 'then' keyword
+                            // skip optional 'then' keyword — NOT a branch,
+                            // just advance past it and continue the loop
                             i += 1;
-                            if i < cmd.words.len() {
-                                self.compile_body_inline(&cmd.words[i], line);
-                            }
-                            break;
+                            continue;
                         }
                         _ => {
                             // implicit else body
@@ -416,8 +411,8 @@ impl Compiler {
                     if let Ok(n) = s.parse::<i64>() {
                         n
                     } else {
-                        // Dynamic increment amount — fall back to Call
-                        return self.compile_call_by_id(cmd, CmdId::Append as u16, line);
+                        // Dynamic increment amount — fall back to DynCall
+                        return self.compile_dyncall(cmd);
                     }
                 } else {
                     // Dynamic expression for increment
@@ -595,8 +590,7 @@ impl Compiler {
                     }
                 } else {
                     // Parse failed — fall back to dynamic eval
-                    let idx = self.bytecode.add_const(s);
-                    self.bytecode.emit(OpCode::PushConst(idx), line);
+                    self.bytecode.emit_push_const(s, line);
                     self.bytecode.emit(OpCode::EvalScript, line);
                 }
             }
@@ -621,8 +615,7 @@ impl Compiler {
                     return;
                 }
                 // Fallback: runtime eval
-                let idx = self.bytecode.add_const(s);
-                self.bytecode.emit(OpCode::PushConst(idx), line);
+                self.bytecode.emit_push_const(s, line);
                 self.bytecode.emit(OpCode::EvalExpr, line);
             }
             _ => {
@@ -741,5 +734,20 @@ mod tests {
         // "hello" and "puts" should each appear only once in the constant pool
         let hello_count = bc.constants().iter().filter(|c| *c == "hello").count();
         assert_eq!(hello_count, 1);
+    }
+
+    #[test]
+    fn test_push_const_wide() {
+        // Verify emit_push_const uses PushConst for small indices
+        let mut bc = crate::ByteCode::new();
+        bc.emit_push_const("hello", 1);
+        assert!(matches!(bc.ops()[0], OpCode::PushConst(0)));
+        assert_eq!(bc.get_const(0), Some("hello"));
+
+        // Verify add_const_wide returns correct wide index
+        let mut bc2 = crate::ByteCode::new();
+        let idx = bc2.add_const_wide("test");
+        assert_eq!(idx, 0);
+        assert_eq!(bc2.get_const_wide(0), Some("test"));
     }
 }

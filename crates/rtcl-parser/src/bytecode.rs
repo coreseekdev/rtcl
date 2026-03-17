@@ -41,18 +41,41 @@ impl ByteCode {
 
     /// Add a string to the constant pool and return its index.
     /// If the string already exists, reuse the existing index.
+    /// Returns `u16` for backward compatibility (panics if pool > u16::MAX).
     pub fn add_const(&mut self, s: &str) -> u16 {
+        let idx = self.add_const_wide(s);
+        idx as u16
+    }
+
+    /// Add a string to the constant pool and return its wide (u32) index.
+    /// If the string already exists, reuse the existing index.
+    pub fn add_const_wide(&mut self, s: &str) -> u32 {
         if let Some(idx) = self.constants.iter().position(|c| c == s) {
-            idx as u16
+            idx as u32
         } else {
-            let idx = self.constants.len() as u16;
+            let idx = self.constants.len() as u32;
             self.constants.push(s.to_string());
             idx
         }
     }
 
+    /// Emit a `PushConst` or `PushConstWide` instruction for the given string.
+    pub fn emit_push_const(&mut self, s: &str, line: u32) -> usize {
+        let idx = self.add_const_wide(s);
+        if idx <= u16::MAX as u32 {
+            self.emit(OpCode::PushConst(idx as u16), line)
+        } else {
+            self.emit(OpCode::PushConstWide(idx), line)
+        }
+    }
+
     /// Look up a constant by index.
     pub fn get_const(&self, idx: u16) -> Option<&str> {
+        self.constants.get(idx as usize).map(|s| s.as_str())
+    }
+
+    /// Look up a constant by wide index.
+    pub fn get_const_wide(&self, idx: u32) -> Option<&str> {
         self.constants.get(idx as usize).map(|s| s.as_str())
     }
 
@@ -186,7 +209,9 @@ impl ByteCode {
                         OpCode::Mul => Some(FoldResult::Int(a.wrapping_mul(b))),
                         OpCode::Div if b != 0 => Some(FoldResult::Int(a / b)),
                         OpCode::Mod if b != 0 => Some(FoldResult::Int(a % b)),
-                        OpCode::Pow => Some(FoldResult::Int(a.wrapping_pow(b as u32))),
+                        OpCode::Pow if b >= 0 && b <= u32::MAX as i64 => {
+                            Some(FoldResult::Int(a.wrapping_pow(b as u32)))
+                        }
                         OpCode::Eq  => Some(FoldResult::Bool(a == b)),
                         OpCode::Ne  => Some(FoldResult::Bool(a != b)),
                         OpCode::Lt  => Some(FoldResult::Bool(a < b)),

@@ -57,6 +57,13 @@ pub enum Error {
         level: i32,
     },
 
+    /// Tail-call request — signals that `tailcall` wants the
+    /// current proc frame to be replaced with a new command.
+    /// `args[0]` is the command name, `args[1..]` are arguments.
+    TailCall {
+        args: Vec<String>,
+    },
+
     /// Custom error with message
     Msg(String),
 }
@@ -195,6 +202,26 @@ impl Error {
         }
     }
 
+    /// Create a tail-call signal.
+    /// `args[0]` is the target command name; the rest are its arguments.
+    pub fn tail_call(args: Vec<String>) -> Self {
+        Error::TailCall { args }
+    }
+
+    /// Check if this is a tail-call request.
+    pub fn is_tail_call(&self) -> bool {
+        matches!(self, Error::TailCall { .. })
+    }
+
+    /// Consume the error and return the tail-call arguments,
+    /// or `None` if this is not a `TailCall`.
+    pub fn into_tail_call_args(self) -> Option<Vec<String>> {
+        match self {
+            Error::TailCall { args } => Some(args),
+            _ => None,
+        }
+    }
+
     /// Create an error control flow (for `return -code error`)
     pub fn error_flow(msg: String) -> Self {
         Error::ControlFlow {
@@ -252,6 +279,7 @@ impl Error {
             Error::TypeMismatch { .. } => -5,
             Error::DivisionByZero => -6,
             Error::ControlFlow { kind, .. } => *kind as i32,
+            Error::TailCall { .. } => -7,
             Error::Msg(_) => -99,
         }
     }
@@ -302,6 +330,9 @@ impl fmt::Display for Error {
                     write!(f, " with value: {}", v)?;
                 }
                 Ok(())
+            }
+            Error::TailCall { args } => {
+                write!(f, "tailcall {}", args.join(" "))
             }
             Error::Msg(s) => write!(f, "{}", s),
         }

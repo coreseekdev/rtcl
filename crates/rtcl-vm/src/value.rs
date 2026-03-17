@@ -342,7 +342,12 @@ fn parse_list_element(chars: &[char], start: usize) -> Option<(String, usize)> {
                         }
                     }
                     '\\' => {
-                        if i + 1 < chars.len() {
+                        // In braced strings, only \{ and \} affect brace
+                        // counting — the backslash itself is always preserved.
+                        result.push('\\');
+                        if i + 1 < chars.len()
+                            && (chars[i + 1] == '{' || chars[i + 1] == '}')
+                        {
                             i += 1;
                             result.push(chars[i]);
                         }

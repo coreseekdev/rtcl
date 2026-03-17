@@ -35,11 +35,24 @@ pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let var_name = args[1].as_str();
     let amount = if args.len() == 3 {
-        args[2].as_int().unwrap_or(1)
+        args[2].as_int().ok_or_else(|| {
+            Error::runtime(
+                format!("expected integer but got \"{}\"", args[2].as_str()),
+                crate::error::ErrorCode::Generic,
+            )
+        })?
     } else {
         1
     };
-    let current = interp.get_var(var_name).ok().and_then(|v| v.as_int()).unwrap_or(0);
+    let current = match interp.get_var(var_name) {
+        Ok(v) => v.as_int().ok_or_else(|| {
+            Error::runtime(
+                format!("expected integer but got \"{}\"", v.as_str()),
+                crate::error::ErrorCode::Generic,
+            )
+        })?,
+        Err(_) => 0, // Tcl: incr on non-existent var starts at 0
+    };
     let new_val = Value::from_int(current + amount);
     interp.set_var(var_name, new_val)
 }

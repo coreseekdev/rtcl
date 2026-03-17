@@ -33,6 +33,7 @@ pub fn validate(code: &ByteCode) -> Vec<ValidationError> {
     let ops = code.ops();
     let len = ops.len();
     let pool_size = code.constants().len() as u16;
+    let pool_size_wide = code.constants().len() as u32;
     let mut errors = Vec::new();
     let mut loop_depth: i32 = 0;
 
@@ -55,6 +56,17 @@ pub fn validate(code: &ByteCode) -> Vec<ValidationError> {
                         message: format!(
                             "constant pool index {} out of range (pool size {})",
                             idx, pool_size,
+                        ),
+                    });
+                }
+            }
+            OpCode::PushConstWide(idx) => {
+                if *idx >= pool_size_wide {
+                    errors.push(ValidationError {
+                        pc,
+                        message: format!(
+                            "wide constant pool index {} out of range (pool size {})",
+                            idx, pool_size_wide,
                         ),
                     });
                 }

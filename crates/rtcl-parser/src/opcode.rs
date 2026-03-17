@@ -171,6 +171,9 @@ pub enum OpCode {
     /// Push a constant from the constant pool.
     PushConst(u16),
 
+    /// Push a constant from the constant pool (wide index for large pools).
+    PushConstWide(u32),
+
     /// Push the empty string.
     PushEmpty,
 
@@ -412,8 +415,7 @@ impl fmt::Display for OpCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             // Stack
-            OpCode::PushConst(idx) => write!(f, "PUSH_CONST {}", idx),
-            OpCode::PushEmpty => write!(f, "PUSH_EMPTY"),
+            OpCode::PushConst(idx) => write!(f, "PUSH_CONST {}", idx),            OpCode::PushConstWide(idx) => write!(f, "PUSH_CONST_WIDE [{}]", idx),            OpCode::PushEmpty => write!(f, "PUSH_EMPTY"),
             OpCode::PushInt(n) => write!(f, "PUSH_INT {}", n),
             OpCode::PushFloat(n) => write!(f, "PUSH_FLOAT {}", n),
             OpCode::PushTrue => write!(f, "PUSH_TRUE"),

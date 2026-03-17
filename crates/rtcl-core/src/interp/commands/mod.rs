@@ -1,6 +1,7 @@
 //! Command implementations, split by category.
 
 pub mod control;
+pub mod loops;
 pub mod string_cmds;
 pub mod list;
 pub mod dict;

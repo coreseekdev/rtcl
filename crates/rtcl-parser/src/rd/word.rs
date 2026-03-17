@@ -254,12 +254,64 @@ fn parse_dollar(cur: &mut Cursor, tokens: &mut Tokens, _bracket_term: bool) -> P
         } else {
             tokens.push(Word::VarRef(name));
         }
+    } else if cur.is(b'(') {
+        // $(...) expr sugar (jimtcl default): evaluate content as expression
+        // Only when $ is NOT followed by a variable name char
+        if let Some(expr) = try_parse_expr_sugar(cur) {
+            tokens.push(Word::ExprSugar(expr));
+        } else {
+            // No closing ')' found — treat $ as orphan
+            tokens.push_char('$');
+        }
     } else {
         // Orphan $: not followed by valid var name char
         tokens.push_char('$');
     }
 
     Ok(())
+}
+
+/// Try to parse `$(expr)` sugar: when `$` is followed by `(`, parse balanced
+/// parens and return the expression content. Returns `None` if no closing `)` found.
+fn try_parse_expr_sugar(cur: &mut Cursor) -> Option<String> {
+    debug_assert!(cur.is(b'('));
+    let save_pos = cur.pos;
+    let save_line = cur.line;
+    cur.advance(); // skip '('
+    let content_start = cur.pos;
+    let mut depth: u32 = 1;
+
+    while !cur.at_end() && depth > 0 {
+        match cur.peek().unwrap() {
+            b'(' => {
+                depth += 1;
+                cur.advance();
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let expr = cur.slice(content_start).to_string();
+                    cur.advance(); // skip closing ')'
+                    return Some(expr);
+                }
+                cur.advance();
+            }
+            b'\\' => {
+                cur.advance();
+                if !cur.at_end() {
+                    cur.advance();
+                }
+            }
+            _ => {
+                cur.advance();
+            }
+        }
+    }
+
+    // No balanced close — restore cursor
+    cur.pos = save_pos;
+    cur.line = save_line;
+    None
 }
 
 /// Try to parse an array index: `(...)`.

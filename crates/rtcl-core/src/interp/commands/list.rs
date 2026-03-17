@@ -117,7 +117,7 @@ pub fn cmd_lsearch(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
-pub fn cmd_lsort(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_lsort(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage("lsort", 2, args.len(), "?options? list"));
     }
@@ -126,14 +126,41 @@ pub fn cmd_lsort(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut decreasing = false;
     let mut unique = false;
     let mut nocase = false;
+    let mut sort_type = SortType::Ascii;
+    let mut command: Option<String> = None;
+    let mut index: Option<String> = None;
 
-    while i < args.len() && args[i].as_str().starts_with('-') {
+    while i < args.len() - 1 && args[i].as_str().starts_with('-') {
         match args[i].as_str() {
             "-decreasing" => { decreasing = true; i += 1; }
             "-increasing" => { decreasing = false; i += 1; }
             "-unique" => { unique = true; i += 1; }
             "-nocase" => { nocase = true; i += 1; }
-            "-ascii" | "-dictionary" | "-integer" | "-real" => { i += 1; }
+            "-ascii" | "-dictionary" => { sort_type = SortType::Ascii; i += 1; }
+            "-integer" => { sort_type = SortType::Integer; i += 1; }
+            "-real" => { sort_type = SortType::Real; i += 1; }
+            "-command" => {
+                i += 1;
+                if i >= args.len() - 1 {
+                    return Err(Error::runtime(
+                        "missing value for -command",
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+                command = Some(args[i].as_str().to_string());
+                i += 1;
+            }
+            "-index" => {
+                i += 1;
+                if i >= args.len() - 1 {
+                    return Err(Error::runtime(
+                        "missing value for -index",
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+                index = Some(args[i].as_str().to_string());
+                i += 1;
+            }
             "--" => { i += 1; break; }
             _ => break,
         }
@@ -144,23 +171,93 @@ pub fn cmd_lsort(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     let mut list = args[i].as_list().unwrap_or_default();
-    let mut seen = std::collections::HashSet::new();
 
-    list.sort_by(|a, b| {
-        let (a_str, b_str) = if nocase {
-            (a.as_str().to_lowercase(), b.as_str().to_lowercase())
+    // Helper: extract sort key from element (for -index)
+    let get_key = |elem: &Value| -> Value {
+        if let Some(ref idx) = index {
+            let sub = elem.as_list().unwrap_or_else(|| vec![elem.clone()]);
+            let idx_num: usize = if idx == "end" {
+                sub.len().saturating_sub(1)
+            } else if let Some(rest) = idx.strip_prefix("end-") {
+                sub.len().saturating_sub(1 + rest.parse::<usize>().unwrap_or(0))
+            } else {
+                idx.parse().unwrap_or(0)
+            };
+            sub.get(idx_num).cloned().unwrap_or_else(Value::empty)
         } else {
-            (a.as_str().to_string(), b.as_str().to_string())
-        };
-        let cmp = a_str.cmp(&b_str);
-        if decreasing { cmp.reverse() } else { cmp }
-    });
+            elem.clone()
+        }
+    };
+
+    if let Some(ref cmd_name) = command {
+        // -command: use a Tcl proc for comparison
+        let cmd = cmd_name.clone();
+        let mut err: Option<Error> = None;
+        list.sort_by(|a, b| {
+            if err.is_some() {
+                return std::cmp::Ordering::Equal;
+            }
+            let ka = get_key(a);
+            let kb = get_key(b);
+            let script = format!("{} {} {}", cmd,
+                crate::value::tcl_quote(ka.as_str()),
+                crate::value::tcl_quote(kb.as_str()),
+            );
+            match interp.eval(&script) {
+                Ok(v) => {
+                    let n = v.as_int().unwrap_or(0);
+                    let cmp = n.cmp(&0);
+                    if decreasing { cmp.reverse() } else { cmp }
+                }
+                Err(e) => {
+                    err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+    } else {
+        list.sort_by(|a, b| {
+            let ka = get_key(a);
+            let kb = get_key(b);
+            let cmp = match sort_type {
+                SortType::Integer => {
+                    let ai = ka.as_int().unwrap_or(0);
+                    let bi = kb.as_int().unwrap_or(0);
+                    ai.cmp(&bi)
+                }
+                SortType::Real => {
+                    let af = ka.as_str().parse::<f64>().unwrap_or(0.0);
+                    let bf = kb.as_str().parse::<f64>().unwrap_or(0.0);
+                    af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
+                }
+                SortType::Ascii => {
+                    if nocase {
+                        ka.as_str().to_lowercase().cmp(&kb.as_str().to_lowercase())
+                    } else {
+                        ka.as_str().cmp(kb.as_str())
+                    }
+                }
+            };
+            if decreasing { cmp.reverse() } else { cmp }
+        });
+    }
 
     if unique {
+        let mut seen = std::collections::HashSet::new();
         list.retain(|v| seen.insert(v.as_str().to_string()));
     }
 
     Ok(Value::from_list(&list))
+}
+
+#[derive(Clone, Copy)]
+enum SortType {
+    Ascii,
+    Integer,
+    Real,
 }
 
 pub fn cmd_linsert(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -334,4 +431,80 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     Ok(Value::from_list(&collected))
+}
+
+/// lset varName ?index ...? value
+/// Set an element in a list variable.
+pub fn cmd_lset(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 3 {
+        return Err(Error::wrong_args_with_usage(
+            "lset",
+            3,
+            args.len(),
+            "varName ?index ...? value",
+        ));
+    }
+
+    let var_name = args[1].as_str();
+    let value = &args[args.len() - 1];
+
+    let current = interp.get_var(var_name)?.clone();
+    let mut list = current.as_list().unwrap_or_default();
+
+    if args.len() == 3 {
+        // lset var value — replace entire list with value
+        interp.set_var(var_name, value.clone())?;
+        return Ok(value.clone());
+    }
+
+    // Single index case: lset var index value
+    // Multi-index: lset var i1 i2 ... value (nested lists)
+    let indices: Vec<&Value> = args[2..args.len() - 1].iter().collect();
+
+    if indices.len() == 1 {
+        let idx_str = indices[0].as_str();
+        let len = list.len();
+        let idx = resolve_index(idx_str, len)?;
+        if idx >= len {
+            return Err(Error::runtime(
+                format!("list index out of range"),
+                crate::error::ErrorCode::Generic,
+            ));
+        }
+        list[idx] = value.clone();
+        let result = Value::from_list(&list);
+        interp.set_var(var_name, result.clone())?;
+        Ok(result)
+    } else {
+        // Nested indices — only handle single index for now
+        return Err(Error::runtime(
+            "nested lset indices not yet supported",
+            crate::error::ErrorCode::Generic,
+        ));
+    }
+}
+
+fn resolve_index(idx_str: &str, len: usize) -> Result<usize> {
+    if idx_str == "end" {
+        if len == 0 {
+            return Err(Error::runtime("list index out of range", crate::error::ErrorCode::Generic));
+        }
+        return Ok(len - 1);
+    }
+    if let Some(rest) = idx_str.strip_prefix("end-") {
+        let n: usize = rest.parse().map_err(|_| {
+            Error::runtime(format!("bad index \"{}\"", idx_str), crate::error::ErrorCode::Generic)
+        })?;
+        if n >= len {
+            return Err(Error::runtime("list index out of range", crate::error::ErrorCode::Generic));
+        }
+        return Ok(len - 1 - n);
+    }
+    let idx: i64 = idx_str.parse().map_err(|_| {
+        Error::runtime(format!("bad index \"{}\"", idx_str), crate::error::ErrorCode::Generic)
+    })?;
+    if idx < 0 {
+        return Err(Error::runtime("list index out of range", crate::error::ErrorCode::Generic));
+    }
+    Ok(idx as usize)
 }

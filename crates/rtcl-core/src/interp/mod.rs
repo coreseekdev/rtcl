@@ -107,6 +107,7 @@ impl Interp {
         self.register_builtin("split", list::cmd_split);
         self.register_builtin("join", list::cmd_join);
         self.register_builtin("lmap", list::cmd_lmap);
+        self.register_builtin("lset", list::cmd_lset);
 
         // Misc
         self.register_builtin("append", misc::cmd_append);
@@ -114,14 +115,21 @@ impl Interp {
         self.register_builtin("incr", misc::cmd_incr);
         self.register_builtin("catch", control::cmd_catch);
         self.register_builtin("error", control::cmd_error);
+        self.register_builtin("try", control::cmd_try);
+        self.register_builtin("tailcall", control::cmd_tailcall);
+        self.register_builtin("time", control::cmd_time);
+        self.register_builtin("timerate", control::cmd_timerate);
+        self.register_builtin("range", control::cmd_range);
         self.register_builtin("global", proc::cmd_global);
         self.register_builtin("upvar", proc::cmd_upvar);
         self.register_builtin("unset", misc::cmd_unset);
         self.register_builtin("info", misc::cmd_info);
         self.register_builtin("rename", proc::cmd_rename);
         self.register_builtin("eval", proc::cmd_eval);
+        self.register_builtin("apply", proc::cmd_apply);
         self.register_builtin("uplevel", proc::cmd_uplevel);
         self.register_builtin("disassemble", misc::cmd_disassemble);
+        self.register_builtin("scan", misc::cmd_scan);
 
         // Dict / Array
         self.register_builtin("dict", dict::cmd_dict);
@@ -136,6 +144,8 @@ impl Interp {
             self.register_builtin("source", io::cmd_source);
             self.register_builtin("file", io::cmd_file);
             self.register_builtin("glob", io::cmd_glob);
+            self.register_builtin("regexp", regexp_cmds::cmd_regexp);
+            self.register_builtin("regsub", regexp_cmds::cmd_regsub);
         }
     }
 
@@ -373,10 +383,30 @@ impl Interp {
             Ok(v) => Ok(v),
             Err(e) => {
                 if e.is_return() {
-                    if let Error::ControlFlow { value: Some(v), .. } = e {
-                        Ok(Value::from_str(&v))
-                    } else {
-                        Ok(Value::empty())
+                    match &e {
+                        Error::ControlFlow { level, value, .. } => {
+                            let val_str = value.clone().unwrap_or_default();
+                            match *level {
+                                0 => {
+                                    // Plain return (level=0 means just return the value)
+                                    Ok(Value::from_str(&val_str))
+                                }
+                                1 => {
+                                    // return -code error "msg" → propagate as error
+                                    Err(Error::Msg(val_str))
+                                }
+                                3 => {
+                                    // return -code break
+                                    Err(Error::brk())
+                                }
+                                4 => {
+                                    // return -code continue
+                                    Err(Error::cont())
+                                }
+                                _ => Ok(Value::from_str(&val_str)),
+                            }
+                        }
+                        _ => Ok(Value::empty()),
                     }
                 } else {
                     Err(e)

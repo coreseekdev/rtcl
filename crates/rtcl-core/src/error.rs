@@ -53,6 +53,8 @@ pub enum Error {
     ControlFlow {
         kind: ControlFlow,
         value: Option<String>,
+        /// Tcl return code: 0=ok, 1=error, 2=return, 3=break, 4=continue
+        level: i32,
     },
 
     /// Custom error with message
@@ -152,6 +154,17 @@ impl Error {
         Error::ControlFlow {
             kind: ControlFlow::Return,
             value,
+            level: 0,
+        }
+    }
+
+    /// Create a return with explicit code (for `return -code`)
+    /// Always uses Return kind so proc boundary catches it, but level carries the target code.
+    pub fn return_with_code(code: i32, value: Option<String>) -> Self {
+        Error::ControlFlow {
+            kind: ControlFlow::Return,
+            value,
+            level: code,
         }
     }
 
@@ -160,6 +173,7 @@ impl Error {
         Error::ControlFlow {
             kind: ControlFlow::Break,
             value: None,
+            level: 0,
         }
     }
 
@@ -168,6 +182,7 @@ impl Error {
         Error::ControlFlow {
             kind: ControlFlow::Continue,
             value: None,
+            level: 0,
         }
     }
 
@@ -176,6 +191,28 @@ impl Error {
         Error::ControlFlow {
             kind: ControlFlow::Exit,
             value: code.map(|c| c.to_string()),
+            level: 0,
+        }
+    }
+
+    /// Create an error control flow (for `return -code error`)
+    pub fn error_flow(msg: String) -> Self {
+        Error::ControlFlow {
+            kind: ControlFlow::Error,
+            value: Some(msg),
+            level: 1,
+        }
+    }
+
+    /// Get the Tcl return code for this error
+    pub fn return_code(&self) -> i32 {
+        match self {
+            Error::ControlFlow { kind: ControlFlow::Return, .. } => 2,
+            Error::ControlFlow { kind: ControlFlow::Break, .. } => 3,
+            Error::ControlFlow { kind: ControlFlow::Continue, .. } => 4,
+            Error::ControlFlow { kind: ControlFlow::Exit, .. } => 5,
+            Error::ControlFlow { kind: ControlFlow::Error, .. } => 1,
+            _ => 1, // all other errors are code 1
         }
     }
 
@@ -253,7 +290,7 @@ impl fmt::Display for Error {
             Error::DivisionByZero => {
                 write!(f, "divide by zero")
             }
-            Error::ControlFlow { kind, value } => {
+            Error::ControlFlow { kind, value, .. } => {
                 match kind {
                     ControlFlow::Return => write!(f, "return"),
                     ControlFlow::Break => write!(f, "break"),

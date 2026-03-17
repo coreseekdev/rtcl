@@ -441,3 +441,15 @@ mod tests {
         assert_eq!(list[1].as_str(), "c d");
     }
 }
+
+/// Quote a string for safe use as a Tcl word in a command.
+/// Uses braces when the string contains special chars.
+pub fn tcl_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "{}".to_string();
+    }
+    if !needs_braces(s) {
+        return s.to_string();
+    }
+    format!("{{{}}}", s)
+}

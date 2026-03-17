@@ -308,3 +308,218 @@ pub fn cmd_disassemble(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         .map_err(|e| Error::syntax(&e.to_string(), 0, 0))?;
     Ok(Value::from_str(&format!("{}", code)))
 }
+
+/// `scan string format ?varName ...?`
+///
+/// Parses `string` according to `format` (subset of C sscanf).
+/// If varNames are given, stores results and returns count of conversions.
+/// If no varNames, returns a list of converted values.
+pub fn cmd_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 3 {
+        return Err(Error::wrong_args_with_usage(
+            "scan",
+            3,
+            args.len(),
+            "string format ?varName ...?",
+        ));
+    }
+
+    let input = args[1].as_str();
+    let format = args[2].as_str();
+    let has_vars = args.len() > 3;
+
+    let mut results: Vec<String> = Vec::new();
+    let mut input_pos = 0;
+    let fmt_bytes = format.as_bytes();
+    let mut fmt_pos = 0;
+
+    while fmt_pos < fmt_bytes.len() {
+        if fmt_bytes[fmt_pos] == b'%' {
+            fmt_pos += 1;
+            if fmt_pos >= fmt_bytes.len() {
+                break;
+            }
+
+            // Handle %%
+            if fmt_bytes[fmt_pos] == b'%' {
+                if input_pos < input.len() && input.as_bytes()[input_pos] == b'%' {
+                    input_pos += 1;
+                }
+                fmt_pos += 1;
+                continue;
+            }
+
+            // Check for suppress flag *
+            let suppress = fmt_bytes[fmt_pos] == b'*';
+            if suppress {
+                fmt_pos += 1;
+            }
+
+            // Optional width
+            let mut width: Option<usize> = None;
+            let width_start = fmt_pos;
+            while fmt_pos < fmt_bytes.len() && fmt_bytes[fmt_pos].is_ascii_digit() {
+                fmt_pos += 1;
+            }
+            if fmt_pos > width_start {
+                width = format[width_start..fmt_pos].parse().ok();
+            }
+
+            if fmt_pos >= fmt_bytes.len() {
+                break;
+            }
+
+            let spec = fmt_bytes[fmt_pos];
+            fmt_pos += 1;
+
+            let inp = &input[input_pos..];
+
+            match spec {
+                b'd' | b'i' => {
+                    // Skip whitespace
+                    let trimmed = inp.trim_start();
+                    input_pos += inp.len() - trimmed.len();
+                    let max = width.unwrap_or(trimmed.len());
+                    let s = &trimmed[..max.min(trimmed.len())];
+                    let end = s.find(|c: char| !c.is_ascii_digit() && c != '-' && c != '+')
+                        .unwrap_or(s.len());
+                    if end == 0 {
+                        break;
+                    }
+                    let num_str = &s[..end];
+                    if !suppress {
+                        results.push(num_str.to_string());
+                    }
+                    input_pos += end;
+                }
+                b'x' | b'X' => {
+                    let trimmed = inp.trim_start();
+                    input_pos += inp.len() - trimmed.len();
+                    let s = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X"))
+                        .unwrap_or(trimmed);
+                    if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
+                        input_pos += 2;
+                    }
+                    let max = width.unwrap_or(s.len());
+                    let end = s[..max.min(s.len())].find(|c: char| !c.is_ascii_hexdigit())
+                        .unwrap_or(max.min(s.len()));
+                    if end == 0 {
+                        break;
+                    }
+                    let val = i64::from_str_radix(&s[..end], 16).unwrap_or(0);
+                    if !suppress {
+                        results.push(val.to_string());
+                    }
+                    input_pos += end;
+                }
+                b'o' => {
+                    let trimmed = inp.trim_start();
+                    input_pos += inp.len() - trimmed.len();
+                    let max = width.unwrap_or(trimmed.len());
+                    let end = trimmed[..max.min(trimmed.len())]
+                        .find(|c: char| !('0'..='7').contains(&c))
+                        .unwrap_or(max.min(trimmed.len()));
+                    if end == 0 {
+                        break;
+                    }
+                    let val = i64::from_str_radix(&trimmed[..end], 8).unwrap_or(0);
+                    if !suppress {
+                        results.push(val.to_string());
+                    }
+                    input_pos += end;
+                }
+                b'f' | b'e' | b'g' => {
+                    let trimmed = inp.trim_start();
+                    input_pos += inp.len() - trimmed.len();
+                    let max = width.unwrap_or(trimmed.len());
+                    let s = &trimmed[..max.min(trimmed.len())];
+                    let end = s.find(|c: char| {
+                        !c.is_ascii_digit() && c != '.' && c != '-' && c != '+' && c != 'e' && c != 'E'
+                    }).unwrap_or(s.len());
+                    if end == 0 {
+                        break;
+                    }
+                    if !suppress {
+                        results.push(s[..end].to_string());
+                    }
+                    input_pos += end;
+                }
+                b's' => {
+                    let trimmed = inp.trim_start();
+                    input_pos += inp.len() - trimmed.len();
+                    let max = width.unwrap_or(trimmed.len());
+                    let s = &trimmed[..max.min(trimmed.len())];
+                    let end = s.find(|c: char| c.is_whitespace()).unwrap_or(s.len());
+                    if end == 0 {
+                        break;
+                    }
+                    if !suppress {
+                        results.push(s[..end].to_string());
+                    }
+                    input_pos += end;
+                }
+                b'c' => {
+                    if inp.is_empty() {
+                        break;
+                    }
+                    let ch = inp.chars().next().unwrap();
+                    if !suppress {
+                        results.push((ch as u32).to_string());
+                    }
+                    input_pos += ch.len_utf8();
+                }
+                b'n' => {
+                    if !suppress {
+                        results.push(input_pos.to_string());
+                    }
+                }
+                _ => {
+                    return Err(Error::runtime(
+                        format!("bad scan conversion character '{}'", spec as char),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+            }
+        } else if fmt_bytes[fmt_pos].is_ascii_whitespace() {
+            // Whitespace in format matches any whitespace in input
+            fmt_pos += 1;
+            while input_pos < input.len() && input.as_bytes()[input_pos].is_ascii_whitespace() {
+                input_pos += 1;
+            }
+        } else {
+            // Literal match
+            if input_pos < input.len() && input.as_bytes()[input_pos] == fmt_bytes[fmt_pos] {
+                input_pos += 1;
+                fmt_pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    if has_vars {
+        // Store in variables, return count
+        let mut count = 0;
+        for (idx, var_arg) in args[3..].iter().enumerate() {
+            if let Some(val) = results.get(idx) {
+                interp.set_var(var_arg.as_str(), Value::from_str(val))?;
+                count += 1;
+            }
+        }
+        Ok(Value::from_int(count))
+    } else {
+        // Return as list
+        let list_str = results
+            .iter()
+            .map(|s| {
+                if s.is_empty() || s.contains(' ') {
+                    format!("{{{}}}", s)
+                } else {
+                    s.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(Value::from_str(&list_str))
+    }
+}

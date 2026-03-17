@@ -8,3 +8,4 @@ pub mod array;
 pub mod proc;
 pub mod io;
 pub mod misc;
+pub mod regexp_cmds;

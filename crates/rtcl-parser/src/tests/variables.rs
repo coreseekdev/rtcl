@@ -59,13 +59,15 @@ fn test_multiple_orphan_dollars_quoted() {
     assert_eq!(text, "$ $ $");
 }
 
-/// Dollar + open-paren without varname: `$(`.
+/// Dollar + open-paren without varname: `$(expr)` is expression sugar.
 #[test]
 fn test_dollar_open_paren_no_varname() {
     let cmds = parse("set x $(abc)").unwrap();
-    // $ is orphan, (abc) is part of bare text
-    let text = format!("{}", &cmds[0].words[2]);
-    assert_eq!(text, "$(abc)");
+    // $(abc) is expression sugar (jimtcl default)
+    match &cmds[0].words[2] {
+        Word::ExprSugar(expr) => assert_eq!(expr, "abc"),
+        w => panic!("expected ExprSugar(abc), got {:?}", w),
+    }
 }
 
 /// `${name}(index)` — braced var name with array index.
@@ -198,6 +200,80 @@ fn test_expr_sugar_with_spaces() {
         Word::ExprSugar(e) => assert_eq!(e, "$a + $b"),
         w => panic!("expected ExprSugar, got {:?}", w),
     }
+}
+
+// --- $(expr) sugar (jimtcl default) ---
+
+/// `$(2)` — simple numeric expr sugar.
+#[test]
+fn test_paren_expr_sugar_numeric() {
+    let cmds = parse("set x $(2)").unwrap();
+    match &cmds[0].words[2] {
+        Word::ExprSugar(e) => assert_eq!(e, "2"),
+        w => panic!("expected ExprSugar(2), got {:?}", w),
+    }
+}
+
+/// `$(-3)` — negative number.
+#[test]
+fn test_paren_expr_sugar_negative() {
+    let cmds = parse("set x $(-3)").unwrap();
+    match &cmds[0].words[2] {
+        Word::ExprSugar(e) => assert_eq!(e, "-3"),
+        w => panic!("expected ExprSugar(-3), got {:?}", w),
+    }
+}
+
+/// `$(!0)` — logical not.
+#[test]
+fn test_paren_expr_sugar_not() {
+    let cmds = parse("set x $(!0)").unwrap();
+    match &cmds[0].words[2] {
+        Word::ExprSugar(e) => assert_eq!(e, "!0"),
+        w => panic!("expected ExprSugar(!0), got {:?}", w),
+    }
+}
+
+/// `$(6 * 7 + 2)` — arithmetic.
+#[test]
+fn test_paren_expr_sugar_arithmetic() {
+    let cmds = parse("set x $(6 * 7 + 2)").unwrap();
+    match &cmds[0].words[2] {
+        Word::ExprSugar(e) => assert_eq!(e, "6 * 7 + 2"),
+        w => panic!("expected ExprSugar, got {:?}", w),
+    }
+}
+
+/// `$(expr)` in quoted string.
+#[test]
+fn test_paren_expr_sugar_in_quoted() {
+    let cmds = parse("set x \"val=$(1+2)\"").unwrap();
+    match &cmds[0].words[2] {
+        Word::Concat(parts) => {
+            assert!(parts.iter().any(|w| matches!(w, Word::ExprSugar(e) if e == "1+2")),
+                "should contain ExprSugar: {:?}", parts);
+        }
+        w => panic!("expected Concat with ExprSugar, got {:?}", w),
+    }
+}
+
+/// `$()` — empty paren expr sugar.
+#[test]
+fn test_paren_expr_sugar_empty() {
+    let cmds = parse("set x $()").unwrap();
+    match &cmds[0].words[2] {
+        Word::ExprSugar(e) => assert_eq!(e, ""),
+        w => panic!("expected ExprSugar, got {:?}", w),
+    }
+}
+
+/// `$(` with no closing paren — orphan $.
+#[test]
+fn test_paren_expr_sugar_unclosed() {
+    let cmds = parse("set x $(abc").unwrap();
+    // No matching ')' → $ is orphan, (abc is literal
+    let text = format!("{}", &cmds[0].words[2]);
+    assert_eq!(text, "$(abc");
 }
 
 // --- Paren backtracking ---

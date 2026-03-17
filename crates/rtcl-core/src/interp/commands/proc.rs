@@ -52,6 +52,64 @@ pub fn cmd_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
+/// apply lambdaExpr ?arg ...?
+/// lambdaExpr is a two-element list: {params body}
+pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::wrong_args_with_usage(
+            "apply",
+            2,
+            args.len(),
+            "lambdaExpr ?arg ...?",
+        ));
+    }
+
+    let lambda = args[1].as_list().ok_or_else(|| {
+        Error::runtime(
+            "can't interpret lambda as a list",
+            crate::error::ErrorCode::Generic,
+        )
+    })?;
+
+    if lambda.len() < 2 {
+        return Err(Error::runtime(
+            "can't interpret lambda as {params body}: must have exactly 2 elements",
+            crate::error::ErrorCode::Generic,
+        ));
+    }
+
+    let param_list = lambda[0].as_list().unwrap_or_default();
+    let body = lambda[1].as_str().to_string();
+
+    // Build param defaults (same logic as cmd_proc)
+    let mut defaults: Vec<(String, Option<String>)> = Vec::new();
+    for param in &param_list {
+        let parts = param.as_list().unwrap_or_else(|| vec![param.clone()]);
+        if parts.len() == 2 {
+            defaults.push((
+                parts[0].as_str().to_string(),
+                Some(parts[1].as_str().to_string()),
+            ));
+        } else {
+            defaults.push((parts[0].as_str().to_string(), None));
+        }
+    }
+
+    let proc_def = ProcDef {
+        params: defaults,
+        body,
+    };
+
+    // Create args for call_proc: [name, arg1, arg2, ...]
+    // We use a synthetic name "apply lambdaExpr"
+    let mut call_args = vec![Value::from_str("apply")];
+    for arg in &args[2..] {
+        call_args.push(arg.clone());
+    }
+
+    interp.call_proc(&proc_def, &call_args)
+}
+
 pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args("uplevel", 2, args.len()));

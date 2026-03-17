@@ -1,7 +1,7 @@
 //! Dict commands: dict create/get/set/exists/unset/keys/values/size/for/merge/replace etc.
 
 use crate::error::{Error, Result};
-use crate::interp::Interp;
+use crate::interp::{glob_match, Interp};
 use crate::value::Value;
 
 /// Parse a string as a dict (flat key-value list).
@@ -122,7 +122,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let pattern = if args.len() == 4 { Some(args[3].as_str()) } else { None };
             let keys: Vec<Value> = entries
                 .iter()
-                .filter(|(k, _)| pattern.is_none() || super::super::glob_match(pattern.unwrap(), k))
+                .filter(|(k, _)| pattern.is_none() || glob_match(pattern.unwrap(), k))
                 .map(|(k, _)| Value::from_str(k))
                 .collect();
             Ok(Value::from_list(&keys))
@@ -135,7 +135,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let pattern = if args.len() == 4 { Some(args[3].as_str()) } else { None };
             let values: Vec<Value> = entries
                 .iter()
-                .filter(|(_, v)| pattern.is_none() || super::super::glob_match(pattern.unwrap(), v))
+                .filter(|(_, v)| pattern.is_none() || glob_match(pattern.unwrap(), v))
                 .map(|(_, v)| Value::from_str(v))
                 .collect();
             Ok(Value::from_list(&values))
@@ -248,6 +248,208 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let result = Value::from_str(&dict_to_string(&entries));
             interp.set_var(var_name, result.clone())
+        }
+        "lappend" => {
+            // dict lappend dictVariable key ?value ...?
+            if args.len() < 4 {
+                return Err(Error::wrong_args_with_usage("dict lappend", 4, args.len(), "dictVariable key ?value ...?"));
+            }
+            let var_name = args[2].as_str();
+            let key = args[3].as_str().to_string();
+            let dict_str = interp.get_var(var_name).ok().map(|v| v.as_str().to_string()).unwrap_or_default();
+            let mut entries = parse_dict(&dict_str)?;
+            let cur_val = entries.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone()).unwrap_or_default();
+            let mut list = if cur_val.is_empty() {
+                Vec::new()
+            } else {
+                Value::from_str(&cur_val).as_list().unwrap_or_default()
+            };
+            for v in &args[4..] {
+                list.push(v.clone());
+            }
+            let new_val = Value::from_list(&list);
+            if let Some(pos) = entries.iter().position(|(k, _)| *k == key) {
+                entries[pos].1 = new_val.as_str().to_string();
+            } else {
+                entries.push((key, new_val.as_str().to_string()));
+            }
+            let result = Value::from_str(&dict_to_string(&entries));
+            interp.set_var(var_name, result.clone())
+        }
+        "remove" => {
+            // dict remove dict ?key ...?
+            if args.len() < 3 {
+                return Err(Error::wrong_args_with_usage("dict remove", 3, args.len(), "dictionary ?key ...?"));
+            }
+            let dict_str = args[2].as_str();
+            let mut entries = parse_dict(dict_str)?;
+            for key_arg in &args[3..] {
+                let key = key_arg.as_str();
+                entries.retain(|(k, _)| k != key);
+            }
+            Ok(Value::from_str(&dict_to_string(&entries)))
+        }
+        "with" => {
+            // dict with dictVariable ?key ...? body
+            if args.len() < 4 {
+                return Err(Error::wrong_args_with_usage("dict with", 4, args.len(), "dictVariable ?key ...? body"));
+            }
+            let var_name = args[2].as_str();
+            let body = args[args.len() - 1].as_str();
+
+            // Navigate to nested dict if keys provided
+            let dict_val = interp.get_var(var_name)?.clone();
+            let mut dict_str = dict_val.as_str().to_string();
+
+            let keys: Vec<&str> = args[3..args.len() - 1].iter().map(|a| a.as_str()).collect();
+            for key in &keys {
+                let entries = parse_dict(&dict_str)?;
+                dict_str = entries.iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+            }
+
+            let entries = parse_dict(&dict_str)?;
+
+            // Set dict keys as variables
+            let saved: Vec<(String, Option<Value>)> = entries.iter().map(|(k, _)| {
+                let old = interp.get_var(k).ok().cloned();
+                (k.clone(), old)
+            }).collect();
+
+            for (k, v) in &entries {
+                interp.set_var(k, Value::from_str(v))?;
+            }
+
+            // Execute body
+            let result = interp.eval(body);
+
+            // Read back variables and update dict
+            let mut new_entries: Vec<(String, String)> = Vec::new();
+            for (k, _) in &entries {
+                if let Ok(v) = interp.get_var(k) {
+                    new_entries.push((k.clone(), v.as_str().to_string()));
+                }
+            }
+
+            // Restore saved variables
+            for (k, old) in saved {
+                if let Some(v) = old {
+                    let _ = interp.set_var(&k, v);
+                } else {
+                    interp.vars.remove(&k);
+                }
+            }
+
+            // Update the dict variable
+            let new_dict = dict_to_string(&new_entries);
+            if keys.is_empty() {
+                interp.set_var(var_name, Value::from_str(&new_dict))?;
+            }
+            // TODO: handle nested key path update
+
+            result
+        }
+        "filter" => {
+            // dict filter dict key pattern
+            // dict filter dict value pattern
+            // dict filter dict script {keyVar valueVar} script
+            if args.len() < 5 {
+                return Err(Error::wrong_args_with_usage("dict filter", 5, args.len(), "dictionary filterType ..."));
+            }
+            let dict_str = args[2].as_str();
+            let filter_type = args[3].as_str();
+            let entries = parse_dict(dict_str)?;
+
+            match filter_type {
+                "key" => {
+                    let pattern = args[4].as_str();
+                    let filtered: Vec<(String, String)> = entries.into_iter()
+                        .filter(|(k, _)| glob_match(pattern, k))
+                        .collect();
+                    Ok(Value::from_str(&dict_to_string(&filtered)))
+                }
+                "value" => {
+                    let pattern = args[4].as_str();
+                    let filtered: Vec<(String, String)> = entries.into_iter()
+                        .filter(|(_, v)| glob_match(pattern, v))
+                        .collect();
+                    Ok(Value::from_str(&dict_to_string(&filtered)))
+                }
+                "script" => {
+                    if args.len() < 6 {
+                        return Err(Error::wrong_args_with_usage("dict filter", 6, args.len(), "dictionary script {keyVar valueVar} script"));
+                    }
+                    let var_list = args[4].as_list().unwrap_or_default();
+                    if var_list.len() != 2 {
+                        return Err(Error::runtime(
+                            "must have exactly two variable names",
+                            crate::error::ErrorCode::Generic,
+                        ));
+                    }
+                    let key_var = var_list[0].as_str().to_string();
+                    let val_var = var_list[1].as_str().to_string();
+                    let script = args[5].as_str();
+                    let mut filtered = Vec::new();
+                    for (k, v) in &entries {
+                        interp.set_var(&key_var, Value::from_str(k))?;
+                        interp.set_var(&val_var, Value::from_str(v))?;
+                        let result = interp.eval(script)?;
+                        if result.is_true() {
+                            filtered.push((k.clone(), v.clone()));
+                        }
+                    }
+                    Ok(Value::from_str(&dict_to_string(&filtered)))
+                }
+                _ => Err(Error::runtime(
+                    format!("unknown filter type \"{}\": must be key, value, or script", filter_type),
+                    crate::error::ErrorCode::Generic,
+                )),
+            }
+        }
+        "map" => {
+            // dict map {keyVar valueVar} dictionary body
+            if args.len() != 5 {
+                return Err(Error::wrong_args_with_usage("dict map", 5, args.len(), "{keyVar valueVar} dictionary body"));
+            }
+            let var_list = args[2].as_list().unwrap_or_default();
+            if var_list.len() != 2 {
+                return Err(Error::runtime(
+                    "must have exactly two variable names",
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+            let key_var = var_list[0].as_str().to_string();
+            let val_var = var_list[1].as_str().to_string();
+            let dict_str = args[3].as_str();
+            let body = args[4].as_str();
+            let entries = parse_dict(dict_str)?;
+            let mut result_entries = Vec::new();
+            for (k, v) in &entries {
+                interp.set_var(&key_var, Value::from_str(k))?;
+                interp.set_var(&val_var, Value::from_str(v))?;
+                match interp.eval(body) {
+                    Ok(new_v) => {
+                        result_entries.push((k.clone(), new_v.as_str().to_string()));
+                    }
+                    Err(e) => {
+                        if e.is_break() { break; }
+                        if e.is_continue() { continue; }
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(Value::from_str(&dict_to_string(&result_entries)))
+        }
+        "info" => {
+            // dict info dictionary — return diagnostic info
+            if args.len() != 3 {
+                return Err(Error::wrong_args_with_usage("dict info", 3, args.len(), "dictionary"));
+            }
+            let dict_str = args[2].as_str();
+            let entries = parse_dict(dict_str)?;
+            Ok(Value::from_str(&format!("{} entries in dict", entries.len())))
         }
         _ => Err(Error::runtime(
             format!("unknown dict subcommand: {}", subcmd),

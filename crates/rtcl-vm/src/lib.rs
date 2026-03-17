@@ -1,31 +1,39 @@
 //! # rtcl-vm
 //!
-//! Bytecode virtual machine for rtcl.
+//! Bytecode execution engine and shared types for rtcl.
 //!
 //! This crate provides:
-//! - [`OpCode`] — the instruction set
-//! - [`ByteCode`] — compiled bytecode (constants + instructions)
-//! - [`Compiler`] — compiles [`rtcl_parser::Command`] AST to [`ByteCode`]
-//! - [`Vm`] — executes [`ByteCode`]
+//! - [`Value`] — the Tcl value type ("everything is a string")
+//! - [`Error`] / [`Result`] — error types shared across crates
+//! - [`VmContext`] — trait abstracting the interpreter for the VM
+//! - [`execute`] — runs [`ByteCode`] against a [`VmContext`]
+//!
+//! Bytecode definitions ([`OpCode`], [`ByteCode`]) and the [`Compiler`]
+//! live in [`rtcl_parser`].
 //!
 //! ## Usage
 //!
 //! ```ignore
-//! use rtcl_parser::parse;
-//! use rtcl_vm::{Compiler, ByteCode, OpCode};
+//! use rtcl_parser::{Compiler, ByteCode, OpCode};
+//! use rtcl_vm::{Value, execute, VmContext};
 //!
-//! let ast = parse("set x 10").unwrap();
-//! let bytecode = Compiler::compile(&ast);
-//! // Inspect opcodes
-//! for (i, op) in bytecode.ops().iter().enumerate() {
-//!     println!("{:04}: {:?}", i, op);
-//! }
+//! // Compile a script
+//! let bytecode = Compiler::compile_script("set x 10").unwrap();
+//!
+//! // Execute using a VmContext implementation
+//! let result = execute(&mut my_interp, &bytecode).unwrap();
 //! ```
 
-pub mod opcode;
-pub mod compiler;
-pub mod bytecode;
+pub mod error;
+pub mod value;
+pub mod context;
+pub mod execute;
 
-pub use opcode::OpCode;
-pub use bytecode::ByteCode;
-pub use compiler::Compiler;
+pub use error::{Error, Result, ErrorCode, ControlFlow};
+pub use value::Value;
+pub use context::VmContext;
+pub use execute::execute;
+
+// Re-export bytecode types from rtcl-parser for convenience
+pub use rtcl_parser::{ByteCode, Compiler, OpCode};
+

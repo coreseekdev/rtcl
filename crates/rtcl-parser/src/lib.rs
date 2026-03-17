@@ -1,12 +1,36 @@
 //! # rtcl-parser
 //!
-//! Tcl parser for rtcl — produces an AST from Tcl source code.
+//! Tcl parser and compiler for rtcl.
 //!
-//! Uses a recursive descent parser inspired by Molt/jimtcl.
+//! This crate takes Tcl source code and produces either an AST
+//! ([`Command`]/[`Word`]) or compiled [`ByteCode`] (via [`Compiler`]).
+//!
+//! ## Usage
+//!
+//! ```ignore
+//! use rtcl_parser::{parse, Compiler, ByteCode, OpCode};
+//!
+//! // Parse to AST
+//! let ast = parse("set x 10").unwrap();
+//!
+//! // Or compile directly to bytecode
+//! let bytecode = Compiler::compile_script("set x 10").unwrap();
+//! for (i, op) in bytecode.ops().iter().enumerate() {
+//!     println!("{:04}: {:?}", i, op);
+//! }
+//! ```
 
 use core::fmt;
 
 mod rd;
+pub mod opcode;
+pub mod bytecode;
+pub mod compiler;
+
+// Re-exports
+pub use opcode::OpCode;
+pub use bytecode::ByteCode;
+pub use compiler::Compiler;
 
 // ---------------------------------------------------------------------------
 // AST types

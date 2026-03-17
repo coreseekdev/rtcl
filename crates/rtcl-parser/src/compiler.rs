@@ -1,4 +1,4 @@
-//! Compiler — transforms a [`rtcl_parser`] AST into [`ByteCode`].
+//! Compiler — transforms a [`crate`] AST into [`ByteCode`].
 //!
 //! The compiler performs a single forward pass over the command list:
 //!
@@ -7,7 +7,7 @@
 //!    get specialised code generation that avoids dynamic dispatch.
 //! 3. Everything else falls back to `InvokeDynamic`.
 
-use rtcl_parser::{Command, Word};
+use crate::{Command, Word};
 
 use crate::bytecode::ByteCode;
 use crate::opcode::OpCode;
@@ -28,8 +28,8 @@ impl Compiler {
     }
 
     /// Compile a Tcl source string in one step (parse + compile).
-    pub fn compile_script(source: &str) -> Result<ByteCode, rtcl_parser::ParseError> {
-        let commands = rtcl_parser::parse(source)?;
+    pub fn compile_script(source: &str) -> Result<ByteCode, crate::ParseError> {
+        let commands = crate::parse(source)?;
         Ok(Self::compile(&commands))
     }
 

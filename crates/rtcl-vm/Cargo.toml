@@ -3,11 +3,10 @@ name = "rtcl-vm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Bytecode VM for rtcl - compiles Tcl AST to opcodes and executes them"
+description = "Bytecode execution engine and shared types for rtcl"
 keywords = ["tcl", "vm", "bytecode", "interpreter"]
 categories = ["parser-implementations"]
 
 [dependencies]
 rtcl-parser.workspace = true
 smallvec.workspace = true
-hashbrown.workspace = true

@@ -8,8 +8,6 @@ keywords = ["tcl", "scripting", "interpreter", "embedded"]
 categories = ["parser-implementations", "embedded", "command-line-interface"]
 
 [dependencies]
-hashbrown.workspace = true
-smallvec.workspace = true
 rtcl-parser.workspace = true
 rtcl-vm.workspace = true
 
@@ -24,7 +22,7 @@ optional = true
 [features]
 default = ["std"]
 std = ["dep:regex"]
-alloc = ["smallvec/const_new", "hashbrown/default"]
+alloc = []
 # For embedded/no-std targets
 embedded = ["alloc", "dep:spin"]
 # Enable extra diagnostics

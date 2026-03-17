@@ -4,9 +4,9 @@
 //!
 //! ## Crate organisation
 //!
-//! - [`rtcl_parser`] — pest-based Tcl parser (AST types)
-//! - [`rtcl_vm`]     — bytecode compiler & VM (opcode definitions)
-//! - `rtcl-core`     — interpreter, command implementations, value type
+//! - [`rtcl_parser`] — parser & compiler (AST types, bytecode, opcodes)
+//! - [`rtcl_vm`]     — execution engine & shared types (Value, Error, VmContext)
+//! - `rtcl-core`     — interpreter, command implementations, expression evaluator
 //!
 //! ## Features
 //!
@@ -20,14 +20,13 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-// Core modules
+// Core modules — error and value re-export from rtcl-vm
 pub mod error;
 pub mod value;
 pub mod parser;
 pub mod interp;
 pub mod command;
 pub mod types;
-pub mod vm;
 
 // Re-exports for convenience
 pub use error::{Error, Result};
@@ -47,7 +46,8 @@ pub mod prelude {
     pub use crate::interp::Interp;
     pub use crate::parser::parse;
     pub use crate::types::*;
-    pub use rtcl_vm::{ByteCode, Compiler, OpCode};
+    pub use rtcl_parser::{ByteCode, Compiler, OpCode};
+    pub use rtcl_vm::VmContext;
 }
 
 /// Library version

@@ -10,7 +10,8 @@ use crate::command::CommandFunc;
 use crate::error::{Error, Result};
 use crate::parser::{self, Command, Word};
 use crate::value::Value;
-use rtcl_vm::{ByteCode, Compiler};
+use rtcl_parser::{ByteCode, Compiler};
+use rtcl_vm::VmContext;
 
 #[cfg(feature = "std")]
 use std::collections::HashMap;
@@ -244,7 +245,7 @@ impl Interp {
             self.code_cache.insert(script.to_string(), compiled.clone());
             compiled
         };
-        crate::vm::execute(self, &code)
+        rtcl_vm::execute(self, &code)
     }
 
     pub fn eval_commands(&mut self, commands: &[Command]) -> Result<Value> {
@@ -437,6 +438,54 @@ impl Interp {
     /// Evaluate an expression.
     pub fn eval_expr(&mut self, expr: &str) -> Result<Value> {
         crate::types::expr::eval_expr(self, expr)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VmContext implementation — bridges the VM executor and the interpreter
+// ---------------------------------------------------------------------------
+
+impl VmContext for Interp {
+    fn get_var(&self, name: &str) -> Result<Value> {
+        Interp::get_var(self, name).cloned()
+    }
+
+    fn set_var(&mut self, name: &str, value: Value) -> Result<Value> {
+        Interp::set_var(self, name, value)
+    }
+
+    fn unset_var(&mut self, name: &str) -> Result<()> {
+        Interp::unset_var(self, name)
+    }
+
+    fn eval_script(&mut self, script: &str) -> Result<Value> {
+        self.eval(script)
+    }
+
+    fn eval_expr(&mut self, expr: &str) -> Result<Value> {
+        Interp::eval_expr(self, expr)
+    }
+
+    fn invoke_command(&mut self, args: &[Value]) -> Result<Value> {
+        if args.is_empty() {
+            return Ok(Value::empty());
+        }
+        let cmd_name = args[0].as_str();
+
+        // Try user-defined procs first
+        if let Some(proc_def) = self.procs.get(cmd_name).cloned() {
+            return self.call_proc(&proc_def, args);
+        }
+
+        // Built-in commands
+        if let Some(f) = self.commands.get(cmd_name).cloned() {
+            self.call_depth += 1;
+            let result = f(self, args);
+            self.call_depth -= 1;
+            return result;
+        }
+
+        Err(Error::invalid_command(cmd_name))
     }
 }
 

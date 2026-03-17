@@ -85,7 +85,7 @@ pub struct Interp {
     pub(crate) script_name: String,
     /// Channel table (stdin/stdout/stderr + opened files/pipes).
     #[cfg(feature = "std")]
-    pub(crate) channels: crate::channel::ChannelTable,
+    pub channels: crate::channel::ChannelTable,
 }
 
 impl Default for Interp {

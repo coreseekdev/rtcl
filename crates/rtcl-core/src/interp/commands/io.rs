@@ -46,13 +46,13 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             crate::error::ErrorCode::Io,
         ))?;
 
-    ch.write_str(msg).map_err(|e| Error::runtime(
+    crate::channel::channel_write_str(ch.as_mut(), msg).map_err(|e| Error::runtime(
         format!("error writing \"{}\": {}", chan_id, e),
         crate::error::ErrorCode::Io,
     ))?;
 
     if !nonewline {
-        ch.write_str("\n").map_err(|e| Error::runtime(
+        crate::channel::channel_write_str(ch.as_mut(), "\n").map_err(|e| Error::runtime(
             format!("error writing \"{}\": {}", chan_id, e),
             crate::error::ErrorCode::Io,
         ))?;

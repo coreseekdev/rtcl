@@ -110,7 +110,7 @@ pub fn cmd_read(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let count = args[i + 1].as_int().ok_or_else(|| {
             Error::runtime(format!("expected integer but got \"{}\"", args[i + 1].as_str()), crate::error::ErrorCode::Generic)
         })? as usize;
-        let s = ch.read_chars(count).map_err(io_err)?;
+        let s = crate::channel::channel_read_chars(ch.as_mut(), count).map_err(io_err)?;
         Ok(Value::from_str(&s))
     } else {
         // read channelId  (read all)
@@ -182,7 +182,7 @@ pub fn cmd_seek(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let ch = interp.channels.get_mut(chan_id)
         .ok_or_else(|| io_err_str(format!("can not find channel named \"{}\"", chan_id)))?;
-    ch.seek(offset, origin).map_err(io_err)?;
+    ch.seek(origin).map_err(io_err)?;
     Ok(Value::empty())
 }
 
@@ -230,28 +230,142 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage("fconfigure", 2, args.len(), "fconfigure channelId ?optName? ?value? ..."));
     }
-    let _chan_id = args[1].as_str();
+    let chan_id = args[1].as_str();
 
     // Verify the channel exists
-    if interp.channels.get_mut(args[1].as_str()).is_none() {
-        return Err(io_err_str(format!("can not find channel named \"{}\"", args[1].as_str())));
+    if !interp.channels.contains(chan_id) {
+        return Err(io_err_str(format!("can not find channel named \"{}\"", chan_id)));
     }
 
-    // Minimal implementation: accept and ignore options for now
-    // TODO: implement -translation, -encoding, -buffering, -blocking
+    if args.len() == 2 {
+        // Query all options
+        let cfg = interp.channels.config(chan_id).cloned().unwrap_or_default();
+        let translation = match cfg.translation {
+            crate::channel::TranslationMode::Auto => "auto",
+            crate::channel::TranslationMode::Lf => "lf",
+            crate::channel::TranslationMode::CrLf => "crlf",
+            crate::channel::TranslationMode::Cr => "cr",
+            crate::channel::TranslationMode::Binary => "binary",
+        };
+        let buffering = match cfg.buffering {
+            crate::channel::Buffering::Full => "full",
+            crate::channel::Buffering::Line => "line",
+            crate::channel::Buffering::None => "none",
+        };
+        let blocking = if cfg.blocking { "1" } else { "0" };
+        let result = format!(
+            "-blocking {} -buffering {} -buffersize {} -encoding {} -translation {}",
+            blocking, buffering, cfg.buffer_size, cfg.encoding, translation,
+        );
+        return Ok(Value::from_str(&result));
+    }
+
+    if args.len() == 3 {
+        // Query a single option
+        let opt = args[2].as_str();
+        let cfg = interp.channels.config(chan_id).cloned().unwrap_or_default();
+        let val = match opt {
+            "-blocking" => if cfg.blocking { "1" } else { "0" }.to_string(),
+            "-buffering" => match cfg.buffering {
+                crate::channel::Buffering::Full => "full",
+                crate::channel::Buffering::Line => "line",
+                crate::channel::Buffering::None => "none",
+            }.to_string(),
+            "-buffersize" => cfg.buffer_size.to_string(),
+            "-encoding" => cfg.encoding.clone(),
+            "-translation" => match cfg.translation {
+                crate::channel::TranslationMode::Auto => "auto",
+                crate::channel::TranslationMode::Lf => "lf",
+                crate::channel::TranslationMode::CrLf => "crlf",
+                crate::channel::TranslationMode::Cr => "cr",
+                crate::channel::TranslationMode::Binary => "binary",
+            }.to_string(),
+            _ => return Err(Error::runtime(
+                format!("bad option \"{}\": should be -blocking, -buffering, -buffersize, -encoding, or -translation", opt),
+                crate::error::ErrorCode::InvalidOp,
+            )),
+        };
+        return Ok(Value::from_str(&val));
+    }
+
+    // Set options: pairs of -option value
+    let mut i = 2;
+    while i + 1 < args.len() {
+        let opt = args[i].as_str();
+        let val = args[i + 1].as_str();
+        let cfg = interp.channels.config_mut(chan_id)
+            .ok_or_else(|| io_err_str(format!("can not find channel named \"{}\"", chan_id)))?;
+        match opt {
+            "-blocking" => {
+                cfg.blocking = val == "1" || val == "true" || val == "yes";
+            }
+            "-buffering" => {
+                cfg.buffering = match val {
+                    "full" => crate::channel::Buffering::Full,
+                    "line" => crate::channel::Buffering::Line,
+                    "none" => crate::channel::Buffering::None,
+                    _ => return Err(Error::runtime(
+                        "bad value for -buffering: must be one of full, line, or none".to_string(),
+                        crate::error::ErrorCode::InvalidOp,
+                    )),
+                };
+            }
+            "-buffersize" => {
+                let size: usize = val.parse().map_err(|_| Error::runtime(
+                    format!("expected integer but got \"{}\"", val),
+                    crate::error::ErrorCode::Generic,
+                ))?;
+                cfg.buffer_size = size;
+            }
+            "-encoding" => {
+                cfg.encoding = val.to_string();
+            }
+            "-translation" => {
+                cfg.translation = match val {
+                    "auto" => crate::channel::TranslationMode::Auto,
+                    "lf" => crate::channel::TranslationMode::Lf,
+                    "crlf" => crate::channel::TranslationMode::CrLf,
+                    "cr" => crate::channel::TranslationMode::Cr,
+                    "binary" => crate::channel::TranslationMode::Binary,
+                    _ => return Err(Error::runtime(
+                        "bad value for -translation: must be one of auto, lf, crlf, cr, or binary".to_string(),
+                        crate::error::ErrorCode::InvalidOp,
+                    )),
+                };
+            }
+            _ => return Err(Error::runtime(
+                format!("bad option \"{}\": should be -blocking, -buffering, -buffersize, -encoding, or -translation", opt),
+                crate::error::ErrorCode::InvalidOp,
+            )),
+        }
+        i += 2;
+    }
+
     Ok(Value::empty())
 }
 
 // ---------- pid ----------
 
-pub fn cmd_pid(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_pid(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() == 1 {
         // pid — return current process ID
         Ok(Value::from_int(std::process::id() as i64))
     } else if args.len() == 2 {
         // pid channelId — return PID of pipe channel
-        // For now, return empty (would need downcast to PipeChannel)
-        Ok(Value::empty())
+        let chan_id = args[1].as_str();
+        let ch = interp.channels.get_mut(chan_id)
+            .ok_or_else(|| io_err_str(format!("can not find channel named \"{}\"", chan_id)))?;
+        // Try to check if it's a pipe channel via channel_type
+        if ch.channel_type() == "pipe" {
+            // For pipe channels we cannot downcast through Box<dyn Channel>,
+            // but we know PipeChannel stores the child. We return the process
+            // pid as a list (Tcl convention: pid returns a list of pids).
+            // Since we can't downcast easily, return empty for now.
+            // TODO: add a pid() method to Channel trait if needed.
+            Ok(Value::empty())
+        } else {
+            Ok(Value::empty())
+        }
     } else {
         Err(Error::wrong_args_with_usage("pid", 1, args.len(), "pid ?channelId?"))
     }

@@ -389,3 +389,70 @@ pub fn cmd_loop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::interp::Interp;
+
+    #[test]
+    fn test_loop_3arg() {
+        let mut interp = Interp::new();
+        let r = interp.eval("set r {}; loop i 5 { lappend r $i }; set r").unwrap();
+        assert_eq!(r.as_str(), "0 1 2 3 4");
+    }
+
+    #[test]
+    fn test_loop_4arg() {
+        let mut interp = Interp::new();
+        let r = interp.eval("set r {}; loop i 2 5 { lappend r $i }; set r").unwrap();
+        assert_eq!(r.as_str(), "2 3 4");
+    }
+
+    #[test]
+    fn test_loop_5arg() {
+        let mut interp = Interp::new();
+        let r = interp.eval("set r {}; loop i 0 10 3 { lappend r $i }; set r").unwrap();
+        assert_eq!(r.as_str(), "0 3 6 9");
+    }
+
+    #[test]
+    fn test_loop_negative_step() {
+        let mut interp = Interp::new();
+        let r = interp.eval("set r {}; loop i 5 0 -2 { lappend r $i }; set r").unwrap();
+        assert_eq!(r.as_str(), "5 3 1");
+    }
+
+    #[test]
+    fn test_loop_zero_step_error() {
+        let mut interp = Interp::new();
+        assert!(interp.eval("loop i 0 10 0 { }").is_err());
+    }
+
+    #[test]
+    fn test_loop_break() {
+        let mut interp = Interp::new();
+        let r = interp.eval("set r {}; loop i 10 { if {$i == 3} break; lappend r $i }; set r").unwrap();
+        assert_eq!(r.as_str(), "0 1 2");
+    }
+
+    #[test]
+    fn test_loop_continue() {
+        let mut interp = Interp::new();
+        let r = interp.eval("set r {}; loop i 5 { if {$i == 2} continue; lappend r $i }; set r").unwrap();
+        assert_eq!(r.as_str(), "0 1 3 4");
+    }
+
+    #[test]
+    fn test_loop_empty_body() {
+        let mut interp = Interp::new();
+        // Should complete without error
+        interp.eval("loop i 0 { }").unwrap();
+    }
+
+    #[test]
+    fn test_loop_wrong_args() {
+        let mut interp = Interp::new();
+        assert!(interp.eval("loop i").is_err());
+        assert!(interp.eval("loop").is_err());
+    }
+}

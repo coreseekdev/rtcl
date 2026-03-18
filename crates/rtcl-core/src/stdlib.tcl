@@ -64,29 +64,9 @@ proc curry {args} {
 
 # ── loop ────────────────────────────────────────────────────────────────
 
-# loop — Enhanced for loop (jimtcl C command, Tcl fallback).
-# loop var first limit ?increment? body
-proc loop {var first limit args} {
-    if {[llength $args] == 1} {
-        set body [lindex $args 0]
-        set incr 1
-    } elseif {[llength $args] == 2} {
-        set incr [lindex $args 0]
-        set body [lindex $args 1]
-    } else {
-        return -code error "wrong # args: should be \"loop var first limit ?increment? body\""
-    }
-    upvar $var i
-    if {$incr > 0} {
-        for {set i $first} {$i < $limit} {incr i $incr} {
-            uplevel 1 $body
-        }
-    } else {
-        for {set i $first} {$i > $limit} {incr i $incr} {
-            uplevel 1 $body
-        }
-    }
-}
+# loop — Enhanced for loop. Now implemented natively in Rust (loops.rs).
+# Signature: loop var ?first? limit ?increment? body
+# The native implementation supports the 3-arg form (loop var limit body).
 
 # ── dict update / dict getdef ───────────────────────────────────────────
 

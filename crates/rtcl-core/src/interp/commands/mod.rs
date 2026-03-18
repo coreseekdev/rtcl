@@ -13,6 +13,7 @@ pub mod misc;
 pub mod regexp_cmds;
 #[cfg(feature = "clock")]
 pub mod clock;
+#[cfg(feature = "package")]
 pub mod package;
 #[cfg(feature = "io")]
 pub mod chan_io;

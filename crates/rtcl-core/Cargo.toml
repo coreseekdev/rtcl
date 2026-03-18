@@ -24,7 +24,7 @@ default = ["rtcl_std"]
 # Rust standard library (disable for no_std targets)
 std = []
 # Tcl standard library — all extensions combined
-rtcl_std = ["file", "io", "exec", "clock", "regexp", "env", "signal"]
+rtcl_std = ["file", "io", "exec", "clock", "regexp", "env", "signal", "package"]
 # Individual Tcl extensions (each implies Rust std)
 file = ["std"]                    # file, cd, pwd, glob, readdir, source
 io = ["std"]                      # channel I/O: open, close, read, gets, seek, tell, eof, flush, fconfigure, pid
@@ -32,6 +32,7 @@ exec = ["std"]                    # exec, wait
 clock = ["std"]                   # clock seconds/clicks/format/scan
 regexp = ["std", "dep:regex"]     # regexp, regsub
 env = ["std"]                     # $env array from OS environment
+package = ["file"]                # package provide/require/names/forget
 signal = ["std"]                  # kill, sleep
 # For embedded/no-std targets
 alloc = []

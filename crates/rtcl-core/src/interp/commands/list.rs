@@ -605,3 +605,47 @@ pub fn cmd_lsubst(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let elements = Value::from_str(&substituted).as_list().unwrap_or_default();
     Ok(Value::from_list(&elements))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::interp::Interp;
+
+    #[test]
+    fn test_lsubst_simple() {
+        let mut interp = Interp::new();
+        let r = interp.eval("lsubst {a b c}").unwrap();
+        assert_eq!(r.as_str(), "a b c");
+    }
+
+    #[test]
+    fn test_lsubst_variable() {
+        let mut interp = Interp::new();
+        interp.eval("set x hello").unwrap();
+        let r = interp.eval("lsubst {$x world}").unwrap();
+        assert_eq!(r.as_str(), "hello world");
+    }
+
+    #[test]
+    fn test_lsubst_novariables() {
+        let mut interp = Interp::new();
+        interp.eval("set x hello").unwrap();
+        let r = interp.eval("lsubst -novariables {$x world}").unwrap();
+        // $x should not be substituted
+        let list = r.as_list().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].as_str(), "$x");
+        assert_eq!(list[1].as_str(), "world");
+    }
+
+    #[test]
+    fn test_lsubst_no_args_error() {
+        let mut interp = Interp::new();
+        assert!(interp.eval("lsubst").is_err());
+    }
+
+    #[test]
+    fn test_lsubst_bad_option() {
+        let mut interp = Interp::new();
+        assert!(interp.eval("lsubst -badopt {a b}").is_err());
+    }
+}

@@ -624,4 +624,51 @@ mod tests {
         let result = interp.eval("collect").unwrap();
         assert_eq!(result.as_str(), "0");
     }
+
+    // ── taint / untaint tests ────────────────────────────────────
+    #[test]
+    fn test_taint_untaint() {
+        let mut interp = Interp::new();
+        interp.eval("set x hello").unwrap();
+        interp.eval("taint x").unwrap();
+        assert!(interp.tainted_vars.contains_key("x"));
+        interp.eval("untaint x").unwrap();
+        assert!(!interp.tainted_vars.contains_key("x"));
+    }
+
+    #[test]
+    fn test_taint_nonexistent_var() {
+        let mut interp = Interp::new();
+        assert!(interp.eval("taint nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_untaint_not_tainted() {
+        let mut interp = Interp::new();
+        // untaint on a non-tainted var is a no-op, not an error
+        interp.eval("untaint whatever").unwrap();
+    }
+
+    #[test]
+    fn test_taint_wrong_args() {
+        let mut interp = Interp::new();
+        assert!(interp.eval("taint").is_err());
+        assert!(interp.eval("taint a b").is_err());
+        assert!(interp.eval("untaint").is_err());
+        assert!(interp.eval("untaint a b").is_err());
+    }
+
+    #[test]
+    fn test_debug_tainted_integration() {
+        let mut interp = Interp::new();
+        interp.eval("set a 1").unwrap();
+        interp.eval("set b 2").unwrap();
+        interp.eval("taint a").unwrap();
+        interp.eval("taint b").unwrap();
+        let r = interp.eval("debug tainted").unwrap();
+        assert_eq!(r.as_str(), "a b");
+        interp.eval("untaint a").unwrap();
+        let r2 = interp.eval("debug tainted").unwrap();
+        assert_eq!(r2.as_str(), "b");
+    }
 }

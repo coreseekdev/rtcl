@@ -118,8 +118,8 @@ static CMD_TABLE_CLOCK: &[CmdEntry] = &[
     CmdEntry { name: "clock",     func: clock::cmd_clock,        cat: Standard, cmd_id: Some(CmdId::Clock    as u16) },
 ];
 
-/// Package system (always available — pure data for provide/names/forget;
-/// `require` auto-load needs `std` at runtime but fails gracefully without it).
+/// Package system — gated behind `feature = "package"` (implies `file`).
+#[cfg(feature = "package")]
 static CMD_TABLE_PKG: &[CmdEntry] = &[
     CmdEntry { name: "package",   func: package::cmd_package,    cat: Standard, cmd_id: Some(CmdId::Package  as u16) },
 ];
@@ -184,6 +184,7 @@ impl Interp {
             self.commands.insert(entry.name.to_string(), entry.func);
             self.command_categories.insert(entry.name.to_string(), entry.cat);
         }
+        #[cfg(feature = "package")]
         for entry in CMD_TABLE_PKG {
             self.commands.insert(entry.name.to_string(), entry.func);
             self.command_categories.insert(entry.name.to_string(), entry.cat);
@@ -275,6 +276,12 @@ impl Interp {
         }
         #[cfg(feature = "regexp")]
         for entry in CMD_TABLE_REGEXP {
+            if entry.cmd_id == Some(cmd_id) {
+                return Some(entry.func);
+            }
+        }
+        #[cfg(feature = "package")]
+        for entry in CMD_TABLE_PKG {
             if entry.cmd_id == Some(cmd_id) {
                 return Some(entry.func);
             }

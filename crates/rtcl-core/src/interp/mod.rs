@@ -79,6 +79,7 @@ pub struct Interp {
     /// Bytecode cache — keyed by script source.
     pub(crate) code_cache: HashMap<String, ByteCode>,
     /// Package registry: name → version string.
+    #[cfg(feature = "package")]
     pub(crate) packages: HashMap<String, String>,
     /// Current namespace ("::") at the global level.
     pub(crate) current_namespace: String,
@@ -123,6 +124,7 @@ impl Interp {
             max_call_depth: 1000,
             result: Value::empty(),
             code_cache: HashMap::new(),
+            #[cfg(feature = "package")]
             packages: HashMap::new(),
             current_namespace: "::".to_string(),
             namespaces: {

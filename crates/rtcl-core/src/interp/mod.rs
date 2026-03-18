@@ -98,6 +98,10 @@ pub struct Interp {
     pub(crate) next_ref_id: u64,
     /// Saved command definitions for upcall support.
     pub(crate) saved_commands: HashMap<String, commands::introspect::SavedCommand>,
+    /// Set of tainted variable names.
+    pub(crate) tainted_vars: HashMap<String, bool>,
+    /// Execution trace callback script (xtrace). Empty = disabled.
+    pub(crate) xtrace_callback: String,
 }
 
 impl Default for Interp {
@@ -134,6 +138,8 @@ impl Interp {
             references: HashMap::new(),
             next_ref_id: 0,
             saved_commands: HashMap::new(),
+            tainted_vars: HashMap::new(),
+            xtrace_callback: String::new(),
         };
         interp.register_builtins();
         interp.init_special_vars();

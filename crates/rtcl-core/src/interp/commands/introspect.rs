@@ -504,6 +504,30 @@ pub(crate) enum SavedCommand {
     Builtin(crate::command::CommandFunc),
 }
 
+// ---------- taint / untaint ----------
+
+/// `taint varName` — Mark a variable as tainted (untrusted input).
+pub fn cmd_taint(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::wrong_args_with_usage("taint", 2, args.len(), "varName"));
+    }
+    let name = args[1].as_str().to_string();
+    // Verify variable exists
+    interp.get_var(&name)?;
+    interp.tainted_vars.insert(name, true);
+    Ok(Value::empty())
+}
+
+/// `untaint varName` — Clear the taint flag on a variable.
+pub fn cmd_untaint(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::wrong_args_with_usage("untaint", 2, args.len(), "varName"));
+    }
+    let name = args[1].as_str().to_string();
+    interp.tainted_vars.remove(&name);
+    Ok(Value::empty())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::interp::Interp;

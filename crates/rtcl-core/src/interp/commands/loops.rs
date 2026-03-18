@@ -288,3 +288,104 @@ pub fn cmd_range(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     Ok(Value::from_list(&result))
 }
+
+/// `loop var ?first? limit ?incr? body` — Numeric for-loop (jimtcl extension).
+///
+/// Forms:
+///   loop var limit body          — var goes from 0 to limit-1, step 1
+///   loop var first limit body    — var goes from first to limit-1, step 1
+///   loop var first limit incr body — var goes from first towards limit, step incr
+pub fn cmd_loop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let (var, mut i, limit, step, body) = match args.len() {
+        // loop var limit body
+        4 => {
+            let var = args[1].as_str().to_string();
+            let limit = args[2].as_int().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected integer but got \"{}\"", args[2].as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+            (var, 0i64, limit, 1i64, args[3].as_str().to_string())
+        }
+        // loop var first limit body
+        5 => {
+            let var = args[1].as_str().to_string();
+            let first = args[2].as_int().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected integer but got \"{}\"", args[2].as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+            let limit = args[3].as_int().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected integer but got \"{}\"", args[3].as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+            (var, first, limit, 1i64, args[4].as_str().to_string())
+        }
+        // loop var first limit incr body
+        6 => {
+            let var = args[1].as_str().to_string();
+            let first = args[2].as_int().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected integer but got \"{}\"", args[2].as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+            let limit = args[3].as_int().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected integer but got \"{}\"", args[3].as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+            let step = args[4].as_int().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected integer but got \"{}\"", args[4].as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+            if step == 0 {
+                return Err(Error::runtime(
+                    "step cannot be zero",
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+            (var, first, limit, step, args[5].as_str().to_string())
+        }
+        _ => {
+            return Err(Error::wrong_args_with_usage(
+                "loop",
+                4,
+                args.len(),
+                "var ?first? limit ?incr? body",
+            ));
+        }
+    };
+
+    let mut result = Value::empty();
+
+    loop {
+        let done = if step > 0 { i >= limit } else { i <= limit };
+        if done {
+            break;
+        }
+        interp.set_var(&var, Value::from_int(i))?;
+        match interp.eval(&body) {
+            Ok(v) => result = v,
+            Err(e) => {
+                if e.is_break() {
+                    break;
+                }
+                if e.is_continue() {
+                    i += step;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+        i += step;
+    }
+    Ok(result)
+}

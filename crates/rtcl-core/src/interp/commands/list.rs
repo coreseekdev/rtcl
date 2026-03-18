@@ -543,3 +543,65 @@ fn resolve_index(idx_str: &str, len: usize) -> Result<usize> {
     }
     Ok(idx as usize)
 }
+
+/// `lsubst ?-command? ?-variable? ?-nobackslashes? ?-nocommands? ?-novariables? string` —
+/// Perform substitution like `subst` but split the result into a proper Tcl list.
+///
+/// This is the jimtcl extension: parse a string with substitutions and return the result as a list.
+pub fn cmd_lsubst(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::wrong_args_with_usage(
+            "lsubst",
+            2,
+            args.len(),
+            "?-nobackslashes? ?-nocommands? ?-novariables? string",
+        ));
+    }
+
+    // Parse flags
+    let mut no_backslashes = false;
+    let mut no_commands = false;
+    let mut no_variables = false;
+    let mut string_idx = 1;
+
+    while string_idx < args.len() - 1 {
+        match args[string_idx].as_str() {
+            "-nobackslashes" => no_backslashes = true,
+            "-nocommands" => no_commands = true,
+            "-novariables" => no_variables = true,
+            other => {
+                return Err(Error::runtime(
+                    format!("bad option \"{}\": must be -nobackslashes, -nocommands, or -novariables", other),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+        }
+        string_idx += 1;
+    }
+
+    let input = args[string_idx].as_str();
+
+    // Perform substitution respecting flags
+    let substituted = if no_backslashes && no_commands && no_variables {
+        // No substitution at all
+        input.to_string()
+    } else {
+        // Build a subst call with appropriate flags
+        let mut subst_args = vec![Value::from_str("subst")];
+        if no_backslashes {
+            subst_args.push(Value::from_str("-nobackslashes"));
+        }
+        if no_commands {
+            subst_args.push(Value::from_str("-nocommands"));
+        }
+        if no_variables {
+            subst_args.push(Value::from_str("-novariables"));
+        }
+        subst_args.push(Value::from_str(input));
+        super::misc::cmd_subst(interp, &subst_args)?.as_str().to_string()
+    };
+
+    // Split result into a list
+    let elements = Value::from_str(&substituted).as_list().unwrap_or_default();
+    Ok(Value::from_list(&elements))
+}

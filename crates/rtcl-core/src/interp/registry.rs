@@ -97,6 +97,19 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "stacktrace", func: introspect::cmd_stacktrace, cat: Language,  cmd_id: None },
     CmdEntry { name: "pack",       func: introspect::cmd_pack,       cat: Standard,  cmd_id: None },
     CmdEntry { name: "unpack",     func: introspect::cmd_unpack,     cat: Standard,  cmd_id: None },
+    // ── Arithmetic operator commands (jimtcl core) ─────────────────────────
+    CmdEntry { name: "+",         func: misc::cmd_add,              cat: Standard,  cmd_id: None },
+    CmdEntry { name: "-",         func: misc::cmd_sub,              cat: Standard,  cmd_id: None },
+    CmdEntry { name: "*",         func: misc::cmd_mul,              cat: Standard,  cmd_id: None },
+    CmdEntry { name: "/",         func: misc::cmd_div,              cat: Standard,  cmd_id: None },
+    // ── Additional jimtcl core commands ────────────────────────────────────
+    CmdEntry { name: "loop",      func: loops::cmd_loop,            cat: Language,  cmd_id: None },
+    CmdEntry { name: "lsubst",    func: list::cmd_lsubst,           cat: Standard,  cmd_id: None },
+    CmdEntry { name: "rand",      func: misc::cmd_rand,             cat: Standard,  cmd_id: None },
+    CmdEntry { name: "debug",     func: misc::cmd_debug,            cat: Extension, cmd_id: None },
+    CmdEntry { name: "xtrace",    func: misc::cmd_xtrace,           cat: Extension, cmd_id: None },
+    CmdEntry { name: "taint",     func: introspect::cmd_taint,      cat: Extension, cmd_id: None },
+    CmdEntry { name: "untaint",   func: introspect::cmd_untaint,    cat: Extension, cmd_id: None },
 ];
 
 /// Commands gated behind `feature = "clock"`.
@@ -158,6 +171,12 @@ static CMD_TABLE_SIGNAL: &[CmdEntry] = &[
     CmdEntry { name: "kill",  func: os::cmd_kill,  cat: Extension, cmd_id: None },
 ];
 
+/// Environment variable command gated behind `feature = "env"`.
+#[cfg(feature = "env")]
+static CMD_TABLE_ENV: &[CmdEntry] = &[
+    CmdEntry { name: "env", func: misc::cmd_env, cat: Standard, cmd_id: None },
+];
+
 impl Interp {
     /// Register all built-in commands from the master table.
     pub(super) fn register_builtins(&mut self) {
@@ -196,6 +215,11 @@ impl Interp {
         }
         #[cfg(feature = "signal")]
         for entry in CMD_TABLE_SIGNAL {
+            self.commands.insert(entry.name.to_string(), entry.func);
+            self.command_categories.insert(entry.name.to_string(), entry.cat);
+        }
+        #[cfg(feature = "env")]
+        for entry in CMD_TABLE_ENV {
             self.commands.insert(entry.name.to_string(), entry.func);
             self.command_categories.insert(entry.name.to_string(), entry.cat);
         }

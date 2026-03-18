@@ -13,6 +13,395 @@ fn hostname_get() -> String {
         .unwrap_or_else(|_| "localhost".to_string())
 }
 
+// ---------- Arithmetic operator commands: +, -, *, / ----------
+
+/// `+ ?number ...?` — Sum all arguments (0 if none).
+pub fn cmd_add(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let mut int_sum: i64 = 0;
+    let mut use_float = false;
+    let mut float_sum: f64 = 0.0;
+
+    for arg in &args[1..] {
+        if use_float {
+            float_sum += arg.as_float().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected number but got \"{}\"", arg.as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+        } else if let Some(i) = arg.as_int() {
+            int_sum += i;
+        } else if let Some(f) = arg.as_float() {
+            use_float = true;
+            float_sum = int_sum as f64 + f;
+        } else {
+            return Err(Error::runtime(
+                format!("expected number but got \"{}\"", arg.as_str()),
+                crate::error::ErrorCode::Generic,
+            ));
+        }
+    }
+    if use_float {
+        Ok(Value::from_float(float_sum))
+    } else {
+        Ok(Value::from_int(int_sum))
+    }
+}
+
+/// `* ?number ...?` — Multiply all arguments (1 if none).
+pub fn cmd_mul(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let mut int_prod: i64 = 1;
+    let mut use_float = false;
+    let mut float_prod: f64 = 1.0;
+
+    for arg in &args[1..] {
+        if use_float {
+            float_prod *= arg.as_float().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected number but got \"{}\"", arg.as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+        } else if let Some(i) = arg.as_int() {
+            int_prod *= i;
+        } else if let Some(f) = arg.as_float() {
+            use_float = true;
+            float_prod = int_prod as f64 * f;
+        } else {
+            return Err(Error::runtime(
+                format!("expected number but got \"{}\"", arg.as_str()),
+                crate::error::ErrorCode::Generic,
+            ));
+        }
+    }
+    if use_float {
+        Ok(Value::from_float(float_prod))
+    } else {
+        Ok(Value::from_int(int_prod))
+    }
+}
+
+/// `- number ?number ...?` — Unary negation (1 arg) or subtract remaining from first.
+pub fn cmd_sub(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::wrong_args_with_usage("-", 2, args.len(), "number ?number ...?"));
+    }
+
+    if args.len() == 2 {
+        // Unary negation
+        if let Some(i) = args[1].as_int() {
+            return Ok(Value::from_int(-i));
+        }
+        if let Some(f) = args[1].as_float() {
+            return Ok(Value::from_float(-f));
+        }
+        return Err(Error::runtime(
+            format!("expected number but got \"{}\"", args[1].as_str()),
+            crate::error::ErrorCode::Generic,
+        ));
+    }
+
+    // Multi-arg: subtract from first
+    let mut use_float = false;
+    let mut int_val: i64 = 0;
+    let mut float_val: f64 = 0.0;
+
+    if let Some(i) = args[1].as_int() {
+        int_val = i;
+    } else if let Some(f) = args[1].as_float() {
+        use_float = true;
+        float_val = f;
+    } else {
+        return Err(Error::runtime(
+            format!("expected number but got \"{}\"", args[1].as_str()),
+            crate::error::ErrorCode::Generic,
+        ));
+    }
+
+    for arg in &args[2..] {
+        if use_float {
+            float_val -= arg.as_float().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected number but got \"{}\"", arg.as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+        } else if let Some(i) = arg.as_int() {
+            int_val -= i;
+        } else if let Some(f) = arg.as_float() {
+            use_float = true;
+            float_val = int_val as f64 - f;
+        } else {
+            return Err(Error::runtime(
+                format!("expected number but got \"{}\"", arg.as_str()),
+                crate::error::ErrorCode::Generic,
+            ));
+        }
+    }
+    if use_float {
+        Ok(Value::from_float(float_val))
+    } else {
+        Ok(Value::from_int(int_val))
+    }
+}
+
+/// `/ number ?number ...?` — Reciprocal (1 arg) or divide first by remaining.
+pub fn cmd_div(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::wrong_args_with_usage("/", 2, args.len(), "number ?number ...?"));
+    }
+
+    if args.len() == 2 {
+        // Reciprocal: 1/x
+        let f = args[1].as_float().ok_or_else(|| {
+            Error::runtime(
+                format!("expected number but got \"{}\"", args[1].as_str()),
+                crate::error::ErrorCode::Generic,
+            )
+        })?;
+        if f == 0.0 {
+            return Err(Error::runtime("Division by zero", crate::error::ErrorCode::Generic));
+        }
+        return Ok(Value::from_float(1.0 / f));
+    }
+
+    // Multi-arg: divide first by remaining
+    let mut use_float = false;
+    let mut int_val: i64 = 0;
+    let mut float_val: f64 = 0.0;
+
+    if let Some(i) = args[1].as_int() {
+        int_val = i;
+    } else if let Some(f) = args[1].as_float() {
+        use_float = true;
+        float_val = f;
+    } else {
+        return Err(Error::runtime(
+            format!("expected number but got \"{}\"", args[1].as_str()),
+            crate::error::ErrorCode::Generic,
+        ));
+    }
+
+    for arg in &args[2..] {
+        if use_float {
+            let d = arg.as_float().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected number but got \"{}\"", arg.as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+            if d == 0.0 {
+                return Err(Error::runtime("Division by zero", crate::error::ErrorCode::Generic));
+            }
+            float_val /= d;
+        } else if let Some(d) = arg.as_int() {
+            if d == 0 {
+                return Err(Error::runtime("Division by zero", crate::error::ErrorCode::Generic));
+            }
+            int_val /= d;
+        } else if let Some(d) = arg.as_float() {
+            if d == 0.0 {
+                return Err(Error::runtime("Division by zero", crate::error::ErrorCode::Generic));
+            }
+            use_float = true;
+            float_val = int_val as f64 / d;
+        } else {
+            return Err(Error::runtime(
+                format!("expected number but got \"{}\"", arg.as_str()),
+                crate::error::ErrorCode::Generic,
+            ));
+        }
+    }
+    if use_float {
+        Ok(Value::from_float(float_val))
+    } else {
+        Ok(Value::from_int(int_val))
+    }
+}
+
+// ---------- env ----------
+
+/// `env ?varName? ?default?` — Read environment variables.
+#[cfg(feature = "env")]
+pub fn cmd_env(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    match args.len() {
+        1 => {
+            // Return flat list of all env vars: key val key val ...
+            let mut list = Vec::new();
+            for (k, v) in std::env::vars() {
+                list.push(Value::from_str(&k));
+                list.push(Value::from_str(&v));
+            }
+            Ok(Value::from_list(&list))
+        }
+        2 => {
+            let key = args[1].as_str();
+            match std::env::var(key) {
+                Ok(val) => Ok(Value::from_str(&val)),
+                Err(_) => Err(Error::runtime(
+                    format!("environment variable \"{}\" does not exist", key),
+                    crate::error::ErrorCode::NotFound,
+                )),
+            }
+        }
+        3 => {
+            let key = args[1].as_str();
+            match std::env::var(key) {
+                Ok(val) => Ok(Value::from_str(&val)),
+                Err(_) => Ok(args[2].clone()), // default
+            }
+        }
+        _ => Err(Error::wrong_args_with_usage("env", 1, args.len(), "?varName? ?default?")),
+    }
+}
+
+// ---------- rand ----------
+
+/// `rand ?min? ?max?` — Generate random integer.
+pub fn cmd_rand(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let (min, max) = match args.len() {
+        1 => (0i64, i64::MAX),
+        2 => {
+            let m = args[1].as_int().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected integer but got \"{}\"", args[1].as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+            (0, m)
+        }
+        3 => {
+            let lo = args[1].as_int().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected integer but got \"{}\"", args[1].as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+            let hi = args[2].as_int().ok_or_else(|| {
+                Error::runtime(
+                    format!("expected integer but got \"{}\"", args[2].as_str()),
+                    crate::error::ErrorCode::Generic,
+                )
+            })?;
+            (lo, hi)
+        }
+        _ => return Err(Error::wrong_args_with_usage("rand", 1, args.len(), "?min? ?max?")),
+    };
+    if max < min {
+        return Err(Error::runtime(
+            "Invalid arguments (max < min)",
+            crate::error::ErrorCode::Generic,
+        ));
+    }
+    let len = (max - min) as u64;
+    if len == 0 {
+        return Ok(Value::from_int(min));
+    }
+    // Simple PRNG using system time as seed (no external dep)
+    let r = simple_random(len);
+    Ok(Value::from_int(min + r as i64))
+}
+
+/// Simple pseudo-random number in [0, range) using time-based entropy.
+fn simple_random(range: u64) -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static STATE: AtomicU64 = AtomicU64::new(0);
+
+    // Seed from time on first call
+    let mut s = STATE.load(Ordering::Relaxed);
+    if s == 0 {
+        #[cfg(feature = "std")]
+        {
+            s = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(12345678);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            s = 6364136223846793005; // fixed seed for no_std
+        }
+    }
+    // xorshift64
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    STATE.store(s, Ordering::Relaxed);
+    s % range
+}
+
+// ---------- debug ----------
+
+/// `debug subcommand ?arg ...?` — Interpreter debug introspection.
+pub fn cmd_debug(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::wrong_args_with_usage("debug", 2, args.len(), "subcommand ?arg ...?"));
+    }
+    let sub = args[1].as_str();
+    match sub {
+        "refcount" => {
+            // Always 1 for rtcl (Rust ownership model)
+            Ok(Value::from_int(1))
+        }
+        "objcount" => {
+            // Return 0 — Rust manages memory, no free-list
+            Ok(Value::from_int(0))
+        }
+        "invstr" => {
+            // No-op — Rust strings are immutable
+            Ok(Value::empty())
+        }
+        "scriptlen" => {
+            if args.len() != 3 {
+                return Err(Error::wrong_args_with_usage("debug scriptlen", 3, args.len(), "script"));
+            }
+            let compiled = rtcl_parser::Compiler::compile_script(args[2].as_str())
+                .map_err(|e| Error::runtime(e.to_string(), crate::error::ErrorCode::Generic))?;
+            Ok(Value::from_int(compiled.ops().len() as i64))
+        }
+        "exprlen" => {
+            if args.len() != 3 {
+                return Err(Error::wrong_args_with_usage("debug exprlen", 3, args.len(), "expression"));
+            }
+            let expr_script = format!("expr {{{}}}", args[2].as_str());
+            let compiled = rtcl_parser::Compiler::compile_script(&expr_script)
+                .map_err(|e| Error::runtime(e.to_string(), crate::error::ErrorCode::Generic))?;
+            Ok(Value::from_int(compiled.ops().len() as i64))
+        }
+        "show" => {
+            if args.len() != 3 {
+                return Err(Error::wrong_args_with_usage("debug show", 3, args.len(), "object"));
+            }
+            let v = &args[2];
+            let detail = format!("type=string, len={}, value={}", v.as_str().len(), v.as_str());
+            Ok(Value::from_str(&detail))
+        }
+        "tainted" => {
+            // List tainted variable names
+            let mut names: Vec<Value> = interp.tainted_vars.keys()
+                .map(|k| Value::from_str(k))
+                .collect();
+            names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            Ok(Value::from_list(&names))
+        }
+        _ => Err(Error::runtime(
+            format!("unknown debug subcommand \"{}\": must be refcount, objcount, invstr, scriptlen, exprlen, show, or tainted", sub),
+            crate::error::ErrorCode::Generic,
+        )),
+    }
+}
+
+// ---------- xtrace ----------
+
+/// `xtrace callback` — Set/clear execution trace callback. Empty string disables.
+pub fn cmd_xtrace(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::wrong_args_with_usage("xtrace", 2, args.len(), "callback"));
+    }
+    interp.xtrace_callback = args[1].as_str().to_string();
+    Ok(Value::empty())
+}
+
 pub fn cmd_set(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     match args.len() {
         2 => interp.get_var(args[1].as_str()).cloned(),

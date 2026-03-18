@@ -81,7 +81,7 @@ fn pkg_require(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     // Try to auto-load from $auto_path
-    #[cfg(feature = "std")]
+    #[cfg(feature = "file")]
     {
         let auto_path = interp.globals.get("auto_path")
             .map(|v| v.as_str().to_string())

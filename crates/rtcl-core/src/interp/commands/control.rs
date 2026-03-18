@@ -131,16 +131,16 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     MatchMode::Exact => string == pattern,
                     MatchMode::Glob => super::super::glob_match(pattern, string),
                     MatchMode::Regexp => {
-                        #[cfg(feature = "std")]
+                        #[cfg(feature = "regexp")]
                         {
                             regex::Regex::new(pattern)
                                 .map(|re| re.is_match(string))
                                 .unwrap_or(false)
                         }
-                        #[cfg(not(feature = "std"))]
+                        #[cfg(not(feature = "regexp"))]
                         {
                             return Err(Error::runtime(
-                                "switch -regexp requires std feature",
+                                "switch -regexp requires 'regexp' feature",
                                 crate::error::ErrorCode::InvalidOp,
                             ));
                         }

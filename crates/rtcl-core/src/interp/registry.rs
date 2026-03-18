@@ -77,8 +77,6 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "range",     func: loops::cmd_range,        cat: Standard, cmd_id: Some(CmdId::Range     as u16) },
     CmdEntry { name: "time",      func: loops::cmd_time,         cat: Standard, cmd_id: Some(CmdId::Time      as u16) },
     CmdEntry { name: "timerate",  func: loops::cmd_timerate,     cat: Standard, cmd_id: Some(CmdId::Timerate  as u16) },
-    CmdEntry { name: "clock",     func: clock::cmd_clock,        cat: Standard, cmd_id: Some(CmdId::Clock    as u16) },
-    CmdEntry { name: "package",   func: package::cmd_package,    cat: Standard, cmd_id: Some(CmdId::Package  as u16) },
     CmdEntry { name: "namespace", func: namespace::cmd_namespace, cat: Language,  cmd_id: Some(CmdId::Namespace as u16) },
     CmdEntry { name: "variable",  func: namespace::cmd_variable,  cat: Language,  cmd_id: Some(CmdId::Variable as u16) },
     // ── Extension commands (always available) ──────────────────────────────
@@ -101,31 +99,63 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "unpack",     func: introspect::cmd_unpack,     cat: Standard,  cmd_id: None },
 ];
 
-/// Extension commands gated behind `feature = "std"`.
-#[cfg(feature = "std")]
-static CMD_TABLE_STD: &[CmdEntry] = &[
-    CmdEntry { name: "source",  func: io::cmd_source,            cat: Extension, cmd_id: Some(CmdId::Source as u16) },
-    CmdEntry { name: "file",    func: io::cmd_file,              cat: Extension, cmd_id: Some(CmdId::File   as u16) },
-    CmdEntry { name: "glob",    func: io::cmd_glob,              cat: Extension, cmd_id: Some(CmdId::Glob   as u16) },
-    CmdEntry { name: "regexp",  func: regexp_cmds::cmd_regexp,   cat: Extension, cmd_id: Some(CmdId::Regexp as u16) },
-    CmdEntry { name: "regsub",  func: regexp_cmds::cmd_regsub,   cat: Extension, cmd_id: Some(CmdId::Regsub as u16) },
-    CmdEntry { name: "open",   func: chan_io::cmd_open,          cat: Extension, cmd_id: Some(CmdId::Open   as u16) },
-    CmdEntry { name: "close",  func: chan_io::cmd_close,         cat: Extension, cmd_id: Some(CmdId::Close  as u16) },
-    CmdEntry { name: "read",   func: chan_io::cmd_read,          cat: Extension, cmd_id: Some(CmdId::Read   as u16) },
-    CmdEntry { name: "gets",   func: chan_io::cmd_gets,          cat: Extension, cmd_id: Some(CmdId::Gets   as u16) },
-    CmdEntry { name: "seek",   func: chan_io::cmd_seek,          cat: Extension, cmd_id: Some(CmdId::Seek   as u16) },
-    CmdEntry { name: "tell",   func: chan_io::cmd_tell,          cat: Extension, cmd_id: Some(CmdId::Tell   as u16) },
-    CmdEntry { name: "eof",    func: chan_io::cmd_eof,           cat: Extension, cmd_id: Some(CmdId::Eof    as u16) },
-    CmdEntry { name: "flush",  func: chan_io::cmd_flush,         cat: Extension, cmd_id: Some(CmdId::Flush  as u16) },
-    CmdEntry { name: "fconfigure", func: chan_io::cmd_fconfigure, cat: Extension, cmd_id: Some(CmdId::Fconfigure as u16) },
-    CmdEntry { name: "pid",    func: chan_io::cmd_pid,           cat: Extension, cmd_id: Some(CmdId::Pid    as u16) },
-    CmdEntry { name: "exec",   func: exec_cmd::cmd_exec,        cat: Extension, cmd_id: Some(CmdId::Exec   as u16) },
-    CmdEntry { name: "cd",     func: os::cmd_cd,                cat: Extension, cmd_id: None },
-    CmdEntry { name: "pwd",    func: os::cmd_pwd,               cat: Extension, cmd_id: None },
-    CmdEntry { name: "sleep",  func: os::cmd_sleep,             cat: Extension, cmd_id: None },
-    CmdEntry { name: "readdir", func: os::cmd_readdir,          cat: Extension, cmd_id: None },
-    CmdEntry { name: "kill",   func: os::cmd_kill,              cat: Extension, cmd_id: None },
-    CmdEntry { name: "wait",   func: os::cmd_wait,              cat: Extension, cmd_id: None },
+/// Commands gated behind `feature = "clock"`.
+#[cfg(feature = "clock")]
+static CMD_TABLE_CLOCK: &[CmdEntry] = &[
+    CmdEntry { name: "clock",     func: clock::cmd_clock,        cat: Standard, cmd_id: Some(CmdId::Clock    as u16) },
+];
+
+/// Package system (always available — pure data for provide/names/forget;
+/// `require` auto-load needs `std` at runtime but fails gracefully without it).
+static CMD_TABLE_PKG: &[CmdEntry] = &[
+    CmdEntry { name: "package",   func: package::cmd_package,    cat: Standard, cmd_id: Some(CmdId::Package  as u16) },
+];
+
+/// File system commands gated behind `feature = "file"`.
+#[cfg(feature = "file")]
+static CMD_TABLE_FILE: &[CmdEntry] = &[
+    CmdEntry { name: "source",  func: io::cmd_source,   cat: Extension, cmd_id: Some(CmdId::Source as u16) },
+    CmdEntry { name: "file",    func: io::cmd_file,     cat: Extension, cmd_id: Some(CmdId::File   as u16) },
+    CmdEntry { name: "glob",    func: io::cmd_glob,     cat: Extension, cmd_id: Some(CmdId::Glob   as u16) },
+    CmdEntry { name: "cd",      func: os::cmd_cd,       cat: Extension, cmd_id: None },
+    CmdEntry { name: "pwd",     func: os::cmd_pwd,      cat: Extension, cmd_id: None },
+    CmdEntry { name: "readdir", func: os::cmd_readdir,  cat: Extension, cmd_id: None },
+];
+
+/// Channel I/O commands gated behind `feature = "io"`.
+#[cfg(feature = "io")]
+static CMD_TABLE_IO: &[CmdEntry] = &[
+    CmdEntry { name: "open",        func: chan_io::cmd_open,        cat: Extension, cmd_id: Some(CmdId::Open   as u16) },
+    CmdEntry { name: "close",       func: chan_io::cmd_close,       cat: Extension, cmd_id: Some(CmdId::Close  as u16) },
+    CmdEntry { name: "read",        func: chan_io::cmd_read,        cat: Extension, cmd_id: Some(CmdId::Read   as u16) },
+    CmdEntry { name: "gets",        func: chan_io::cmd_gets,        cat: Extension, cmd_id: Some(CmdId::Gets   as u16) },
+    CmdEntry { name: "seek",        func: chan_io::cmd_seek,        cat: Extension, cmd_id: Some(CmdId::Seek   as u16) },
+    CmdEntry { name: "tell",        func: chan_io::cmd_tell,        cat: Extension, cmd_id: Some(CmdId::Tell   as u16) },
+    CmdEntry { name: "eof",         func: chan_io::cmd_eof,         cat: Extension, cmd_id: Some(CmdId::Eof    as u16) },
+    CmdEntry { name: "flush",       func: chan_io::cmd_flush,       cat: Extension, cmd_id: Some(CmdId::Flush  as u16) },
+    CmdEntry { name: "fconfigure",  func: chan_io::cmd_fconfigure,  cat: Extension, cmd_id: Some(CmdId::Fconfigure as u16) },
+    CmdEntry { name: "pid",         func: chan_io::cmd_pid,         cat: Extension, cmd_id: Some(CmdId::Pid    as u16) },
+];
+
+/// Process execution commands gated behind `feature = "exec"`.
+#[cfg(feature = "exec")]
+static CMD_TABLE_EXEC: &[CmdEntry] = &[
+    CmdEntry { name: "exec",  func: exec_cmd::cmd_exec, cat: Extension, cmd_id: Some(CmdId::Exec as u16) },
+    CmdEntry { name: "wait",  func: os::cmd_wait,       cat: Extension, cmd_id: None },
+];
+
+/// Regular expression commands gated behind `feature = "regexp"`.
+#[cfg(feature = "regexp")]
+static CMD_TABLE_REGEXP: &[CmdEntry] = &[
+    CmdEntry { name: "regexp", func: regexp_cmds::cmd_regexp, cat: Extension, cmd_id: Some(CmdId::Regexp as u16) },
+    CmdEntry { name: "regsub", func: regexp_cmds::cmd_regsub, cat: Extension, cmd_id: Some(CmdId::Regsub as u16) },
+];
+
+/// Signal/process control commands gated behind `feature = "signal"`.
+#[cfg(feature = "signal")]
+static CMD_TABLE_SIGNAL: &[CmdEntry] = &[
+    CmdEntry { name: "sleep", func: os::cmd_sleep, cat: Extension, cmd_id: None },
+    CmdEntry { name: "kill",  func: os::cmd_kill,  cat: Extension, cmd_id: None },
 ];
 
 impl Interp {
@@ -135,8 +165,37 @@ impl Interp {
             self.commands.insert(entry.name.to_string(), entry.func);
             self.command_categories.insert(entry.name.to_string(), entry.cat);
         }
-        #[cfg(feature = "std")]
-        for entry in CMD_TABLE_STD {
+        for entry in CMD_TABLE_PKG {
+            self.commands.insert(entry.name.to_string(), entry.func);
+            self.command_categories.insert(entry.name.to_string(), entry.cat);
+        }
+        #[cfg(feature = "clock")]
+        for entry in CMD_TABLE_CLOCK {
+            self.commands.insert(entry.name.to_string(), entry.func);
+            self.command_categories.insert(entry.name.to_string(), entry.cat);
+        }
+        #[cfg(feature = "file")]
+        for entry in CMD_TABLE_FILE {
+            self.commands.insert(entry.name.to_string(), entry.func);
+            self.command_categories.insert(entry.name.to_string(), entry.cat);
+        }
+        #[cfg(feature = "io")]
+        for entry in CMD_TABLE_IO {
+            self.commands.insert(entry.name.to_string(), entry.func);
+            self.command_categories.insert(entry.name.to_string(), entry.cat);
+        }
+        #[cfg(feature = "exec")]
+        for entry in CMD_TABLE_EXEC {
+            self.commands.insert(entry.name.to_string(), entry.func);
+            self.command_categories.insert(entry.name.to_string(), entry.cat);
+        }
+        #[cfg(feature = "regexp")]
+        for entry in CMD_TABLE_REGEXP {
+            self.commands.insert(entry.name.to_string(), entry.func);
+            self.command_categories.insert(entry.name.to_string(), entry.cat);
+        }
+        #[cfg(feature = "signal")]
+        for entry in CMD_TABLE_SIGNAL {
             self.commands.insert(entry.name.to_string(), entry.func);
             self.command_categories.insert(entry.name.to_string(), entry.cat);
         }
@@ -172,8 +231,26 @@ impl Interp {
                 return Some(entry.func);
             }
         }
-        #[cfg(feature = "std")]
-        for entry in CMD_TABLE_STD {
+        #[cfg(feature = "file")]
+        for entry in CMD_TABLE_FILE {
+            if entry.cmd_id == Some(cmd_id) {
+                return Some(entry.func);
+            }
+        }
+        #[cfg(feature = "io")]
+        for entry in CMD_TABLE_IO {
+            if entry.cmd_id == Some(cmd_id) {
+                return Some(entry.func);
+            }
+        }
+        #[cfg(feature = "exec")]
+        for entry in CMD_TABLE_EXEC {
+            if entry.cmd_id == Some(cmd_id) {
+                return Some(entry.func);
+            }
+        }
+        #[cfg(feature = "regexp")]
+        for entry in CMD_TABLE_REGEXP {
             if entry.cmd_id == Some(cmd_id) {
                 return Some(entry.func);
             }

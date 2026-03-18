@@ -4,14 +4,12 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::interp::Interp;
 use crate::value::Value;
 
-#[cfg(feature = "std")]
 use regex::Regex;
 
 /// `regexp ?switches? exp string ?matchVar? ?subMatchVar ...?`
 ///
 /// Returns 1 if the regular expression matches, 0 otherwise.
 /// If match variables are provided, stores the matched text.
-#[cfg(feature = "std")]
 pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::wrong_args_with_usage(
@@ -128,7 +126,6 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// `regsub ?switches? exp string subSpec ?varName?`
 ///
 /// Substitutes regex matches. Returns the substituted string or count.
-#[cfg(feature = "std")]
 pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 4 {
         return Err(Error::wrong_args_with_usage(
@@ -209,7 +206,6 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 /// Convert Tcl substitution spec to regex replacement syntax.
 /// `\0` or `&` → `$0`, `\1` → `$1`, etc.
-#[cfg(feature = "std")]
 fn tcl_sub_to_regex(spec: &str) -> String {
     let mut result = String::new();
     let chars: Vec<char> = spec.chars().collect();

@@ -152,12 +152,12 @@ impl Interp {
     /// Populate special global variables (`$env`, `$tcl_platform`, etc.).
     fn init_special_vars(&mut self) {
         // --- $env array (mirror OS environment) ---
-        #[cfg(feature = "std")]
+        #[cfg(feature = "env")]
         for (key, val) in std::env::vars() {
             let full = format!("env({})", key);
             self.globals.insert(full, Value::from_str(&val));
         }
-        #[cfg(feature = "std")]
+        #[cfg(feature = "env")]
         if !self.globals.contains_key("env") {
             self.globals.insert("env".to_string(), Value::empty());
         }

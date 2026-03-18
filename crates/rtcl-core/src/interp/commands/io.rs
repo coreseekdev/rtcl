@@ -74,7 +74,7 @@ pub fn cmd_puts(_interp: &mut Interp, _args: &[Value]) -> Result<Value> {
 
 // ---------- source ----------
 
-#[cfg(feature = "std")]
+#[cfg(feature = "file")]
 pub fn cmd_source(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(Error::wrong_args("source", 2, args.len()));
@@ -89,17 +89,17 @@ pub fn cmd_source(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     interp.eval(&contents)
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "file"))]
 pub fn cmd_source(_interp: &mut Interp, _args: &[Value]) -> Result<Value> {
     Err(Error::runtime(
-        "source: not available in no-std mode",
+        "source: not available without 'file' feature",
         crate::error::ErrorCode::InvalidOp,
     ))
 }
 
 // ---------- file ----------
 
-#[cfg(feature = "std")]
+#[cfg(feature = "file")]
 pub fn cmd_file(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::wrong_args("file", 3, args.len()));
@@ -188,10 +188,10 @@ pub fn cmd_file(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "file"))]
 pub fn cmd_file(_interp: &mut Interp, _args: &[Value]) -> Result<Value> {
     Err(Error::runtime(
-        "file: not available in no-std mode",
+        "file: not available without 'file' feature",
         crate::error::ErrorCode::InvalidOp,
     ))
 }
@@ -465,7 +465,7 @@ fn format_g(v: f64, prec: usize, upper: bool) -> String {
 
 // ---------- glob (file pattern matching) ----------
 
-#[cfg(feature = "std")]
+#[cfg(feature = "file")]
 pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args("glob", 2, args.len()));
@@ -519,10 +519,10 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::from_list(&results))
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(not(feature = "file"))]
 pub fn cmd_glob(_interp: &mut Interp, _args: &[Value]) -> Result<Value> {
     Err(Error::runtime(
-        "glob: not available in no-std mode",
+        "glob: not available without 'file' feature",
         crate::error::ErrorCode::InvalidOp,
     ))
 }

@@ -6,7 +6,7 @@ use crate::value::Value;
 
 // ---------- cd ----------
 
-#[cfg(feature = "std")]
+#[cfg(feature = "file")]
 pub fn cmd_cd(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let dir = match args.len() {
         1 => {
@@ -29,7 +29,7 @@ pub fn cmd_cd(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 // ---------- pwd ----------
 
-#[cfg(feature = "std")]
+#[cfg(feature = "file")]
 pub fn cmd_pwd(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::wrong_args("pwd", 1, args.len()));
@@ -42,7 +42,7 @@ pub fn cmd_pwd(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 // ---------- sleep ----------
 
-#[cfg(feature = "std")]
+#[cfg(feature = "signal")]
 pub fn cmd_sleep(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(Error::wrong_args_with_usage("sleep", 2, args.len(), "seconds"));
@@ -64,7 +64,7 @@ pub fn cmd_sleep(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 // ---------- readdir ----------
 
-#[cfg(feature = "std")]
+#[cfg(feature = "file")]
 pub fn cmd_readdir(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(Error::wrong_args_with_usage("readdir", 2, args.len(), "?-nocomplain? dirPath"));
@@ -105,7 +105,7 @@ pub fn cmd_readdir(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 // ---------- kill ----------
 
-#[cfg(feature = "std")]
+#[cfg(feature = "signal")]
 pub fn cmd_kill(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // kill ?signal? pid
     match args.len() {
@@ -124,7 +124,7 @@ pub fn cmd_kill(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "signal", feature = "exec"))]
 fn parse_pid(s: &str) -> Result<u32> {
     s.parse::<u32>().map_err(|_| {
         Error::runtime(
@@ -134,7 +134,7 @@ fn parse_pid(s: &str) -> Result<u32> {
     })
 }
 
-#[cfg(all(feature = "std", unix))]
+#[cfg(all(feature = "signal", unix))]
 fn kill_process(pid: u32, signal: &str) -> Result<Value> {
     let sig_num = match signal.to_uppercase().as_str() {
         "SIGTERM" | "TERM" | "15" => "15",
@@ -165,7 +165,7 @@ fn kill_process(pid: u32, signal: &str) -> Result<Value> {
     Ok(Value::empty())
 }
 
-#[cfg(all(feature = "std", not(unix)))]
+#[cfg(all(feature = "signal", not(unix)))]
 fn kill_process(pid: u32, signal: &str) -> Result<Value> {
     // On Windows, only SIGTERM (TerminateProcess) is meaningful
     match signal.to_uppercase().as_str() {
@@ -206,7 +206,7 @@ fn kill_process(pid: u32, signal: &str) -> Result<Value> {
 
 // ---------- wait ----------
 
-#[cfg(feature = "std")]
+#[cfg(feature = "exec")]
 pub fn cmd_wait(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // wait ?-nohang? pid
     if args.len() < 2 || args.len() > 3 {
@@ -224,7 +224,7 @@ pub fn cmd_wait(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     wait_process(pid, nohang)
 }
 
-#[cfg(all(feature = "std", unix))]
+#[cfg(all(feature = "exec", unix))]
 fn wait_process(pid: u32, nohang: bool) -> Result<Value> {
     // Use /proc or waitpid via shell
     // Simple approach: poll with `kill -0` and then check exit status
@@ -249,7 +249,7 @@ fn wait_process(pid: u32, nohang: bool) -> Result<Value> {
     }
 }
 
-#[cfg(all(feature = "std", not(unix)))]
+#[cfg(all(feature = "exec", not(unix)))]
 fn wait_process(pid: u32, _nohang: bool) -> Result<Value> {
     // On Windows, waitpid is not directly available.
     // Return a stub result — proper implementation would need WaitForSingleObject.

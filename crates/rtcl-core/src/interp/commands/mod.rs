@@ -9,14 +9,16 @@ pub mod array;
 pub mod proc;
 pub mod io;
 pub mod misc;
+#[cfg(feature = "regexp")]
 pub mod regexp_cmds;
+#[cfg(feature = "clock")]
 pub mod clock;
 pub mod package;
-#[cfg(feature = "std")]
+#[cfg(feature = "io")]
 pub mod chan_io;
-#[cfg(feature = "std")]
+#[cfg(feature = "exec")]
 pub mod exec_cmd;
 pub mod namespace;
-#[cfg(feature = "std")]
+#[cfg(any(feature = "file", feature = "signal", feature = "exec"))]
 pub mod os;
 pub mod introspect;

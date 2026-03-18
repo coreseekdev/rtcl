@@ -100,32 +100,76 @@ pub fn cmd_source(_interp: &mut Interp, _args: &[Value]) -> Result<Value> {
 // ---------- file ----------
 
 #[cfg(feature = "file")]
-pub fn cmd_file(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() < 3 {
-        return Err(Error::wrong_args("file", 3, args.len()));
+pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::wrong_args_with_usage(
+            "file", 2, args.len(),
+            "subcommand ?arg ...?",
+        ));
     }
 
     let subcmd = args[1].as_str();
+
+    // Subcommands that need no path argument
+    match subcmd {
+        "tempfile" => return file_tempfile(args),
+        "separator" | "sep" => {
+            return Ok(Value::from_str(std::path::MAIN_SEPARATOR_STR));
+        }
+        _ => {}
+    }
+
+    // All other subcommands need at least one path argument
+    if args.len() < 3 {
+        return Err(Error::wrong_args_with_usage(
+            "file", 3, args.len(),
+            &format!("{} name ?arg ...?", subcmd),
+        ));
+    }
+
     let path = args[2].as_str();
 
     match subcmd {
+        // ── existence / type checks ─────────────────────────────────
         "exists" => Ok(Value::from_bool(std::path::Path::new(path).exists())),
         "isfile" => Ok(Value::from_bool(std::path::Path::new(path).is_file())),
         "isdirectory" => Ok(Value::from_bool(std::path::Path::new(path).is_dir())),
-        "size" => {
-            let meta = std::fs::metadata(path).map_err(|e| {
+        "readable" => Ok(Value::from_bool(file_access(path, AccessCheck::Read))),
+        "writable" => Ok(Value::from_bool(file_access(path, AccessCheck::Write))),
+        "executable" => Ok(Value::from_bool(file_access(path, AccessCheck::Exec))),
+        "owned" => {
+            // Approximate: check if the file exists and we can read its metadata.
+            // A full implementation would compare uid, but that requires libc.
+            Ok(Value::from_bool(std::fs::metadata(path).is_ok()))
+        }
+        "type" => {
+            let meta = std::fs::symlink_metadata(path).map_err(|e| {
                 Error::runtime(
-                    format!("could not stat \"{}\": {}", path, e),
+                    format!("could not read \"{}\": {}", path, e),
                     crate::error::ErrorCode::Io,
                 )
             })?;
-            Ok(Value::from_int(meta.len() as i64))
+            let ft = meta.file_type();
+            let t = if ft.is_symlink() {
+                "link"
+            } else if ft.is_dir() {
+                "directory"
+            } else if ft.is_file() {
+                "file"
+            } else {
+                "file" // character/block special etc. — fallback
+            };
+            Ok(Value::from_str(t))
         }
+
+        // ── path manipulation ───────────────────────────────────────
         "extension" => {
+            // jimtcl returns extension WITH the dot: ".txt"
             let p = std::path::Path::new(path);
-            Ok(Value::from_str(
-                p.extension().and_then(|s| s.to_str()).unwrap_or(""),
-            ))
+            match p.extension().and_then(|s| s.to_str()) {
+                Some(ext) => Ok(Value::from_str(&format!(".{}", ext))),
+                None => Ok(Value::from_str("")),
+            }
         }
         "tail" => {
             let p = std::path::Path::new(path);
@@ -152,39 +196,354 @@ pub fn cmd_file(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Ok(Value::from_str(stem))
             }
         }
+        "split" => {
+            let p = std::path::Path::new(path);
+            let parts: Vec<Value> = p.components()
+                .map(|c| Value::from_str(c.as_os_str().to_str().unwrap_or("")))
+                .collect();
+            Ok(Value::from_list(&parts))
+        }
         "join" => {
             let result: Vec<&str> = args[2..].iter().map(|a| a.as_str()).collect();
             let joined: std::path::PathBuf = result.iter().collect();
             Ok(Value::from_str(joined.to_str().unwrap_or("")))
         }
-        "delete" => {
-            if std::path::Path::new(path).is_dir() {
-                std::fs::remove_dir_all(path).ok();
+        "normalize" => {
+            let p = std::fs::canonicalize(path).unwrap_or_else(|_| {
+                std::path::PathBuf::from(path)
+            });
+            Ok(Value::from_str(&p.to_string_lossy()))
+        }
+
+        // ── metadata ────────────────────────────────────────────────
+        "size" => {
+            let meta = std::fs::metadata(path).map_err(|e| {
+                Error::runtime(
+                    format!("could not stat \"{}\": {}", path, e),
+                    crate::error::ErrorCode::Io,
+                )
+            })?;
+            Ok(Value::from_int(meta.len() as i64))
+        }
+        "atime" => {
+            let meta = std::fs::metadata(path).map_err(|e| {
+                Error::runtime(
+                    format!("could not stat \"{}\": {}", path, e),
+                    crate::error::ErrorCode::Io,
+                )
+            })?;
+            let t = meta.accessed().map_err(|e| {
+                Error::runtime(format!("could not get atime: {}", e), crate::error::ErrorCode::Io)
+            })?;
+            let secs = t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default().as_secs();
+            Ok(Value::from_int(secs as i64))
+        }
+        "mtime" => {
+            let meta = std::fs::metadata(path).map_err(|e| {
+                Error::runtime(
+                    format!("could not stat \"{}\": {}", path, e),
+                    crate::error::ErrorCode::Io,
+                )
+            })?;
+            let t = meta.modified().map_err(|e| {
+                Error::runtime(format!("could not get mtime: {}", e), crate::error::ErrorCode::Io)
+            })?;
+            let secs = t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default().as_secs();
+            Ok(Value::from_int(secs as i64))
+        }
+        "stat" | "lstat" => {
+            // file stat name varName / file lstat name varName
+            if args.len() < 4 {
+                return Err(Error::wrong_args_with_usage(
+                    "file", 4, args.len(),
+                    &format!("{} name varName", subcmd),
+                ));
+            }
+            let var_name = args[3].as_str();
+            let meta = if subcmd == "lstat" {
+                std::fs::symlink_metadata(path)
             } else {
-                std::fs::remove_file(path).ok();
+                std::fs::metadata(path)
+            };
+            let meta = meta.map_err(|e| {
+                Error::runtime(
+                    format!("could not stat \"{}\": {}", path, e),
+                    crate::error::ErrorCode::Io,
+                )
+            })?;
+            let size = meta.len() as i64;
+            let mtime = meta.modified().ok()
+                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64).unwrap_or(0);
+            let atime = meta.accessed().ok()
+                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64).unwrap_or(0);
+            let ft = meta.file_type();
+            let ftype = if ft.is_symlink() { "link" }
+                else if ft.is_dir() { "directory" }
+                else { "file" };
+
+            interp.set_var(&format!("{}(size)", var_name), Value::from_int(size))?;
+            interp.set_var(&format!("{}(mtime)", var_name), Value::from_int(mtime))?;
+            interp.set_var(&format!("{}(atime)", var_name), Value::from_int(atime))?;
+            interp.set_var(&format!("{}(type)", var_name), Value::from_str(ftype))?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                interp.set_var(&format!("{}(dev)", var_name), Value::from_int(meta.dev() as i64))?;
+                interp.set_var(&format!("{}(ino)", var_name), Value::from_int(meta.ino() as i64))?;
+                interp.set_var(&format!("{}(nlink)", var_name), Value::from_int(meta.nlink() as i64))?;
+                interp.set_var(&format!("{}(uid)", var_name), Value::from_int(meta.uid() as i64))?;
+                interp.set_var(&format!("{}(gid)", var_name), Value::from_int(meta.gid() as i64))?;
+                interp.set_var(&format!("{}(mode)", var_name), Value::from_int(meta.mode() as i64))?;
+            }
+            Ok(Value::empty())
+        }
+        "readlink" => {
+            let target = std::fs::read_link(path).map_err(|e| {
+                Error::runtime(
+                    format!("could not readlink \"{}\": {}", path, e),
+                    crate::error::ErrorCode::Io,
+                )
+            })?;
+            Ok(Value::from_str(&target.to_string_lossy()))
+        }
+
+        // ── file operations ─────────────────────────────────────────
+        "delete" => {
+            // file delete ?-force? ?--? path ...
+            let mut force = false;
+            let mut start = 2;
+            while start < args.len() {
+                match args[start].as_str() {
+                    "-force" | "--force" => { force = true; start += 1; }
+                    "--" => { start += 1; break; }
+                    _ => break,
+                }
+            }
+            for j in start..args.len() {
+                let p = args[j].as_str();
+                let pp = std::path::Path::new(p);
+                if pp.is_dir() {
+                    if force {
+                        std::fs::remove_dir_all(p).ok();
+                    } else {
+                        std::fs::remove_dir(p).map_err(|e| {
+                            Error::runtime(
+                                format!("error deleting \"{}\": {}", p, e),
+                                crate::error::ErrorCode::Io,
+                            )
+                        })?;
+                    }
+                } else if pp.exists() {
+                    std::fs::remove_file(p).map_err(|e| {
+                        Error::runtime(
+                            format!("error deleting \"{}\": {}", p, e),
+                            crate::error::ErrorCode::Io,
+                        )
+                    })?;
+                }
             }
             Ok(Value::empty())
         }
         "mkdir" => {
-            std::fs::create_dir_all(path).map_err(|e| {
-                Error::runtime(format!("couldn't create directory \"{}\": {}", path, e), crate::error::ErrorCode::Io)
-            })?;
+            for j in 2..args.len() {
+                let p = args[j].as_str();
+                std::fs::create_dir_all(p).map_err(|e| {
+                    Error::runtime(
+                        format!("couldn't create directory \"{}\": {}", p, e),
+                        crate::error::ErrorCode::Io,
+                    )
+                })?;
+            }
             Ok(Value::empty())
         }
         "rename" => {
-            if args.len() != 4 {
-                return Err(Error::wrong_args("file rename", 4, args.len()));
+            // file rename ?-force? source target
+            let mut force = false;
+            let mut start = 2;
+            while start < args.len() {
+                match args[start].as_str() {
+                    "-force" | "--force" => { force = true; start += 1; }
+                    "--" => { start += 1; break; }
+                    _ => break,
+                }
             }
-            let new_path = args[3].as_str();
-            std::fs::rename(path, new_path).map_err(|e| {
-                Error::runtime(format!("couldn't rename \"{}\": {}", path, e), crate::error::ErrorCode::Io)
+            if args.len() - start != 2 {
+                return Err(Error::wrong_args_with_usage(
+                    "file rename", 4, args.len(), "?-force? source target",
+                ));
+            }
+            let src = args[start].as_str();
+            let dst = args[start + 1].as_str();
+            if !force && std::path::Path::new(dst).exists() {
+                return Err(Error::runtime(
+                    format!("error renaming \"{}\": target exists", src),
+                    crate::error::ErrorCode::Io,
+                ));
+            }
+            std::fs::rename(src, dst).map_err(|e| {
+                Error::runtime(
+                    format!("couldn't rename \"{}\": {}", src, e),
+                    crate::error::ErrorCode::Io,
+                )
             })?;
             Ok(Value::empty())
         }
+        "copy" => {
+            // file copy ?-force? source target
+            let mut force = false;
+            let mut start = 2;
+            while start < args.len() {
+                match args[start].as_str() {
+                    "-force" | "--force" => { force = true; start += 1; }
+                    "--" => { start += 1; break; }
+                    _ => break,
+                }
+            }
+            if args.len() - start != 2 {
+                return Err(Error::wrong_args_with_usage(
+                    "file copy", 4, args.len(), "?-force? source target",
+                ));
+            }
+            let src = args[start].as_str();
+            let dst = args[start + 1].as_str();
+            if !force && std::path::Path::new(dst).exists() {
+                return Err(Error::runtime(
+                    format!("error copying \"{}\": target exists", src),
+                    crate::error::ErrorCode::Io,
+                ));
+            }
+            std::fs::copy(src, dst).map_err(|e| {
+                Error::runtime(
+                    format!("couldn't copy \"{}\": {}", src, e),
+                    crate::error::ErrorCode::Io,
+                )
+            })?;
+            Ok(Value::empty())
+        }
+        "link" => {
+            // file link ?-hard|-symbolic? newname target
+            let mut link_type = "hard";
+            let mut start = 2;
+            if start < args.len() && args[start].as_str().starts_with('-') {
+                match args[start].as_str() {
+                    "-hard" => { link_type = "hard"; start += 1; }
+                    "-symbolic" | "-sym" => { link_type = "symbolic"; start += 1; }
+                    _ => {}
+                }
+            }
+            if args.len() - start != 2 {
+                return Err(Error::wrong_args_with_usage(
+                    "file link", 4, args.len(), "?-hard|-symbolic? newname target",
+                ));
+            }
+            let new_name = args[start].as_str();
+            let target = args[start + 1].as_str();
+            if link_type == "symbolic" {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, new_name).map_err(|e| {
+                    Error::runtime(
+                        format!("couldn't create link \"{}\": {}", new_name, e),
+                        crate::error::ErrorCode::Io,
+                    )
+                })?;
+                #[cfg(windows)]
+                {
+                    if std::path::Path::new(target).is_dir() {
+                        std::os::windows::fs::symlink_dir(target, new_name)
+                    } else {
+                        std::os::windows::fs::symlink_file(target, new_name)
+                    }.map_err(|e| {
+                        Error::runtime(
+                            format!("couldn't create link \"{}\": {}", new_name, e),
+                            crate::error::ErrorCode::Io,
+                        )
+                    })?;
+                }
+            } else {
+                std::fs::hard_link(target, new_name).map_err(|e| {
+                    Error::runtime(
+                        format!("couldn't create link \"{}\": {}", new_name, e),
+                        crate::error::ErrorCode::Io,
+                    )
+                })?;
+            }
+            Ok(Value::empty())
+        }
+
         _ => Err(Error::runtime(
-            format!("unknown file subcommand: {}", subcmd),
+            format!(
+                "bad option \"{}\": must be atime, copy, delete, dirname, \
+                 executable, exists, extension, isdirectory, isfile, join, \
+                 link, lstat, mkdir, mtime, normalize, owned, readable, \
+                 readlink, rename, rootname, separator, size, split, stat, \
+                 tail, tempfile, type, or writable",
+                subcmd
+            ),
             crate::error::ErrorCode::InvalidOp,
         )),
+    }
+}
+
+/// Create a temporary file, return its path.
+#[cfg(feature = "file")]
+fn file_tempfile(args: &[Value]) -> Result<Value> {
+    let prefix = if args.len() >= 3 { args[2].as_str() } else { "tcl" };
+    let dir = std::env::temp_dir();
+    // Simple approach: use timestamp-based name
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let name = format!("{}{}", prefix, stamp);
+    let path = dir.join(name);
+    std::fs::File::create(&path).map_err(|e| {
+        Error::runtime(
+            format!("couldn't create temp file: {}", e),
+            crate::error::ErrorCode::Io,
+        )
+    })?;
+    Ok(Value::from_str(&path.to_string_lossy()))
+}
+
+enum AccessCheck { Read, Write, Exec }
+
+#[cfg(feature = "file")]
+fn file_access(path: &str, check: AccessCheck) -> bool {
+    let p = std::path::Path::new(path);
+    if !p.exists() { return false; }
+    match check {
+        AccessCheck::Read => {
+            // Try opening for read
+            std::fs::File::open(path).is_ok()
+        }
+        AccessCheck::Write => {
+            // Check if metadata says read-only
+            std::fs::metadata(path)
+                .map(|m| !m.permissions().readonly())
+                .unwrap_or(false)
+        }
+        AccessCheck::Exec => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(path)
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                // On Windows, check common executable extensions
+                let ext = std::path::Path::new(path)
+                    .extension().and_then(|s| s.to_str())
+                    .unwrap_or("").to_lowercase();
+                matches!(ext.as_str(), "exe" | "bat" | "cmd" | "com")
+            }
+        }
     }
 }
 

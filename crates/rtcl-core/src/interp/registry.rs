@@ -157,15 +157,15 @@ static CMD_TABLE_IO: &[CmdEntry] = &[
 /// Process execution commands gated behind `feature = "exec"`.
 #[cfg(feature = "exec")]
 static CMD_TABLE_EXEC: &[CmdEntry] = &[
-    CmdEntry { name: "exec",  func: exec_cmd::cmd_exec, cat: Extension, cmd_id: Some(CmdId::Exec as u16), usage: "?-ignorestderr? ?--? arg ?arg ...?", help: "Execute a system command" },
-    CmdEntry { name: "wait",  func: os::cmd_wait,       cat: Extension, cmd_id: None,                     usage: "?-nohang? pid",  help: "Wait for a process" },
+    CmdEntry { name: "exec",  func: exec_cmd::cmd_exec, cat: Extension, cmd_id: Some(CmdId::Exec as u16), usage: "?-ignorestderr? ?-keepnewline? ?--? arg ?arg ...?", help: "Execute a system command with I/O redirections" },
+    CmdEntry { name: "wait",  func: os::cmd_wait,       cat: Extension, cmd_id: None,                     usage: "?-nohang? ?pid?",  help: "Wait for a process" },
 ];
 
 /// Regular expression commands gated behind `feature = "regexp"`.
 #[cfg(feature = "regexp")]
 static CMD_TABLE_REGEXP: &[CmdEntry] = &[
-    CmdEntry { name: "regexp", func: regexp_cmds::cmd_regexp, cat: Extension, cmd_id: Some(CmdId::Regexp as u16), usage: "?options? exp string ?matchVar? ?subMatchVar ...?", help: "Regular expression matching" },
-    CmdEntry { name: "regsub", func: regexp_cmds::cmd_regsub, cat: Extension, cmd_id: Some(CmdId::Regsub as u16), usage: "?options? exp string subSpec ?varName?", help: "Regular expression substitution" },
+    CmdEntry { name: "regexp", func: regexp_cmds::cmd_regexp, cat: Extension, cmd_id: Some(CmdId::Regexp as u16), usage: "?-nocase? ?-all? ?-inline? ?-indices? ?-expanded? ?-line? ?-start offset? ?--? exp string ?matchVar? ?subMatchVar ...?", help: "Regular expression matching" },
+    CmdEntry { name: "regsub", func: regexp_cmds::cmd_regsub, cat: Extension, cmd_id: Some(CmdId::Regsub as u16), usage: "?-nocase? ?-all? ?-expanded? ?-line? ?-start offset? ?-command? ?--? exp string subSpec ?varName?", help: "Regular expression substitution" },
 ];
 
 /// Signal/process control commands gated behind `feature = "signal"`.

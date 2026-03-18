@@ -351,20 +351,16 @@ pub fn cmd_pid(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // pid — return current process ID
         Ok(Value::from_int(std::process::id() as i64))
     } else if args.len() == 2 {
-        // pid channelId — return PID of pipe channel
+        // pid channelId — return PID(s) of pipe channel as a list
         let chan_id = args[1].as_str();
         let ch = interp.channels.get_mut(chan_id)
             .ok_or_else(|| io_err_str(format!("can not find channel named \"{}\"", chan_id)))?;
-        // Try to check if it's a pipe channel via channel_type
-        if ch.channel_type() == "pipe" {
-            // For pipe channels we cannot downcast through Box<dyn Channel>,
-            // but we know PipeChannel stores the child. We return the process
-            // pid as a list (Tcl convention: pid returns a list of pids).
-            // Since we can't downcast easily, return empty for now.
-            // TODO: add a pid() method to Channel trait if needed.
+        let pids = ch.pids();
+        if pids.is_empty() {
             Ok(Value::empty())
         } else {
-            Ok(Value::empty())
+            let pid_strs: Vec<Value> = pids.iter().map(|p| Value::from_int(*p as i64)).collect();
+            Ok(Value::from_list(&pid_strs))
         }
     } else {
         Err(Error::wrong_args_with_usage("pid", 1, args.len(), "pid ?channelId?"))

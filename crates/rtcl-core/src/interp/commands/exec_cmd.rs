@@ -19,7 +19,7 @@ fn exec_err_str(msg: impl std::fmt::Display) -> Error {
 }
 
 /// `exec ?-ignorestderr? ?-keepnewline? ?--? cmd ?arg ...? ?| cmd ...? ?redirections?`
-pub fn cmd_exec(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage(
             "exec", 2, args.len(), "exec ?switches? arg ?arg ...?",
@@ -105,6 +105,11 @@ pub fn cmd_exec(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 if i + 1 >= args.len() { return Err(exec_err_str("can't specify \"2>>\" as last word in command")); }
                 stderr_redirect = Some(StderrRedirect::Append(args[i + 1].as_str().to_string()));
                 i += 2;
+            }
+            "2>@1" => {
+                // Redirect stderr to stdout (merge)
+                stderr_redirect = Some(StderrRedirect::ToStdout);
+                i += 1;
             }
             ">&" | ">>&" => {
                 if i + 1 >= args.len() { return Err(exec_err_str(format!("can't specify \"{}\" as last word in command", token))); }
@@ -216,6 +221,10 @@ pub fn cmd_exec(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     })?;
                     cmd.stderr(f);
                 }
+                Some(StderrRedirect::ToStdout) => {
+                    // 2>@1 — merge stderr into stdout pipe
+                    cmd.stderr(Stdio::piped()); // We'll read it separately and merge
+                }
                 None if ignore_stderr => {
                     cmd.stderr(Stdio::null());
                 }
@@ -266,6 +275,7 @@ pub fn cmd_exec(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // Collect output from the last child
     let last = children.last_mut().unwrap();
+    let last_pid = last.id();
     let mut stdout_data = String::new();
     if let Some(ref mut stdout) = last.stdout {
         stdout.read_to_string(&mut stdout_data).map_err(exec_err)?;
@@ -274,6 +284,12 @@ pub fn cmd_exec(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut stderr_data = String::new();
     if let Some(ref mut stderr) = last.stderr {
         stderr.read_to_string(&mut stderr_data).map_err(exec_err)?;
+    }
+
+    // 2>@1: merge stderr into stdout
+    if matches!(stderr_redirect, Some(StderrRedirect::ToStdout)) {
+        stdout_data.push_str(&stderr_data);
+        stderr_data.clear();
     }
 
     // Wait for all children
@@ -302,6 +318,10 @@ pub fn cmd_exec(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     if any_error {
+        // Set $::errorCode like jimtcl: {CHILDSTATUS pid exitCode}
+        let error_code = format!("CHILDSTATUS {} {}", last_pid, exit_code);
+        let _ = interp.set_var("::errorCode", Value::from_str(&error_code));
+
         let mut msg = stderr_data.clone();
         if msg.is_empty() {
             msg = format!("child process exited abnormally (exit code {})", exit_code);
@@ -312,6 +332,9 @@ pub fn cmd_exec(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             ErrorCode::Generic,
         ));
     }
+
+    // Set $::errorCode to NONE on success
+    let _ = interp.set_var("::errorCode", Value::from_str("NONE"));
 
     if !stderr_data.is_empty() && !ignore_stderr {
         // Tcl convention: non-zero stderr with zero exit = emit to stderr but still succeed
@@ -336,4 +359,5 @@ enum OutputRedirect {
 enum StderrRedirect {
     Truncate(String),
     Append(String),
+    ToStdout,
 }

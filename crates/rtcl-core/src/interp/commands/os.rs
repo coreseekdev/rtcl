@@ -208,20 +208,29 @@ fn kill_process(pid: u32, signal: &str) -> Result<Value> {
 
 #[cfg(feature = "exec")]
 pub fn cmd_wait(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    // wait ?-nohang? pid
-    if args.len() < 2 || args.len() > 3 {
-        return Err(Error::wrong_args_with_usage("wait", 2, args.len(), "?-nohang? pid"));
+    // wait ?-nohang? ?pid?
+    if args.len() > 3 {
+        return Err(Error::wrong_args_with_usage("wait", 1, args.len(), "?-nohang? ?pid?"));
     }
-    let (nohang, pid_str) = if args.len() == 3 {
-        if args[1].as_str() != "-nohang" {
-            return Err(Error::wrong_args_with_usage("wait", 2, args.len(), "?-nohang? pid"));
+    let mut nohang = false;
+    let mut pid_val: Option<u32> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-nohang" => { nohang = true; i += 1; }
+            s => {
+                pid_val = Some(parse_pid(s)?);
+                i += 1;
+            }
         }
-        (true, args[2].as_str())
-    } else {
-        (false, args[1].as_str())
-    };
-    let pid = parse_pid(pid_str)?;
-    wait_process(pid, nohang)
+    }
+    match pid_val {
+        Some(pid) => wait_process(pid, nohang),
+        None => {
+            // No pid: return NONE (no detached children to reap in our model)
+            Ok(Value::from_str("0 NONE 0"))
+        }
+    }
 }
 
 #[cfg(all(feature = "exec", unix))]

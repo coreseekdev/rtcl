@@ -38,6 +38,8 @@ pub trait Channel: Send {
     fn is_writable(&self) -> bool;
     fn configure(&mut self, _cfg: &ChannelConfig) {}
     fn channel_type(&self) -> &'static str;
+    /// Return associated process IDs (for pipe channels). Empty list for non-pipe channels.
+    fn pids(&self) -> Vec<u32> { vec![] }
 }
 
 /// Extension: write a full string, delegates to `write_bytes`.
@@ -537,6 +539,7 @@ impl Channel for PipeChannel {
     fn is_readable(&self) -> bool { self.reader.is_some() }
     fn is_writable(&self) -> bool { self.writer.is_some() }
     fn channel_type(&self) -> &'static str { "pipe" }
+    fn pids(&self) -> Vec<u32> { vec![self.child.id()] }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

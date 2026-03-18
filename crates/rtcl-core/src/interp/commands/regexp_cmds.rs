@@ -428,3 +428,361 @@ pub fn cmd_regsub(_interp: &mut Interp, _args: &[Value]) -> Result<Value> {
         ErrorCode::Generic,
     ))
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(all(test, feature = "regexp"))]
+mod tests {
+    use crate::interp::Interp;
+
+    // ── basic regexp tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_regexp_basic_match() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regexp {hello} {hello world}").unwrap();
+        assert_eq!(result.as_str(), "1");
+    }
+
+    #[test]
+    fn test_regexp_basic_no_match() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regexp {bye} {hello world}").unwrap();
+        assert_eq!(result.as_str(), "0");
+    }
+
+    #[test]
+    fn test_regexp_capture() {
+        let mut interp = Interp::new();
+        interp.eval("regexp {(\\d+)} {abc123def} match num").unwrap();
+        let m = interp.get_var("match").unwrap();
+        let n = interp.get_var("num").unwrap();
+        assert_eq!(m.as_str(), "123");
+        assert_eq!(n.as_str(), "123");
+    }
+
+    // ── regexp -nocase tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_regexp_nocase() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regexp -nocase {HELLO} {hello world}").unwrap();
+        assert_eq!(result.as_str(), "1");
+    }
+
+    // ── regexp -all tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_regexp_all_count() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regexp -all {\\d} {a1b2c3}").unwrap();
+        assert_eq!(result.as_str(), "3");
+    }
+
+    #[test]
+    fn test_regexp_all_with_vars() {
+        let mut interp = Interp::new();
+        interp.eval("regexp -all {(\\d)} {a1b2c3} match digit").unwrap();
+        // Vars should be set to last match
+        let d = interp.eval("set digit").unwrap();
+        assert_eq!(d.as_str(), "3");
+    }
+
+    // ── regexp -inline tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_regexp_inline() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regexp -inline {(\\d+)} {abc123def}").unwrap();
+        assert_eq!(result.as_str(), "123 123");
+    }
+
+    #[test]
+    fn test_regexp_inline_all() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regexp -all -inline {\\d} {a1b2c3}").unwrap();
+        // Should return list of all matches
+        assert!(result.as_str().contains('1'));
+        assert!(result.as_str().contains('2'));
+        assert!(result.as_str().contains('3'));
+    }
+
+    // ── regexp -indices tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_regexp_indices() {
+        let mut interp = Interp::new();
+        interp.eval("regexp -indices {(\\d+)} {abc123def} match num").unwrap();
+        let m = interp.eval("set match").unwrap();
+        // Match "123" is at indices 3-5 (0-indexed, inclusive)
+        assert_eq!(m.as_str(), "3 5");
+    }
+
+    #[test]
+    fn test_regexp_indices_no_match() {
+        let mut interp = Interp::new();
+        interp.eval("regexp -indices {(x)} {abc} m n").unwrap();
+        let n = interp.eval("set n").unwrap();
+        assert_eq!(n.as_str(), "-1 -1");
+    }
+
+    #[test]
+    fn test_regexp_indices_inline() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regexp -indices -inline {(\\d+)} {abc123def}").unwrap();
+        // Should return index pairs
+        assert_eq!(result.as_str(), "{3 5} {3 5}");
+    }
+
+    // ── regexp -start tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_regexp_start() {
+        let mut interp = Interp::new();
+        // Search from position 2 onwards
+        let result = interp.eval("regexp -start 2 {a} {xaax}").unwrap();
+        assert_eq!(result.as_str(), "1");
+    }
+
+    #[test]
+    fn test_regexp_start_skip_first() {
+        let mut interp = Interp::new();
+        // Find first 'a' starting from position 2
+        interp.eval("regexp -start 2 -indices {a} {a1a2} m").unwrap();
+        let idx = interp.eval("set m").unwrap();
+        // First 'a' is at 0, second is at 2, so with start=2 we get index 2
+        assert_eq!(idx.as_str(), "2 2");
+    }
+
+    // ── regexp -expanded tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_regexp_expanded() {
+        let mut interp = Interp::new();
+        // In expanded mode, whitespace and comments are ignored
+        let result = interp.eval("regexp -expanded { a  b } {ab}").unwrap();
+        assert_eq!(result.as_str(), "1");
+    }
+
+    // ── regexp -line tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_regexp_line_multiline() {
+        let mut interp = Interp::new();
+        // -line makes ^ and $ match line boundaries
+        let result = interp.eval("regexp -line {^world} {hello\nworld}").unwrap();
+        assert_eq!(result.as_str(), "1");
+    }
+
+    // ── basic regsub tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_regsub_basic() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regsub {world} {hello world} {Tcl}").unwrap();
+        assert_eq!(result.as_str(), "hello Tcl");
+    }
+
+    #[test]
+    fn test_regsub_with_var() {
+        let mut interp = Interp::new();
+        let count = interp.eval("regsub {o} {hello world} {0} result").unwrap();
+        let r = interp.eval("set result").unwrap();
+        assert_eq!(count.as_str(), "1"); // Only first occurrence
+        assert_eq!(r.as_str(), "hell0 world");
+    }
+
+    #[test]
+    fn test_regsub_all() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regsub -all {o} {hello world} {0}").unwrap();
+        assert_eq!(result.as_str(), "hell0 w0rld");
+    }
+
+    #[test]
+    fn test_regsub_nocase() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regsub -nocase {HELLO} {hello world} {bye}").unwrap();
+        assert_eq!(result.as_str(), "bye world");
+    }
+
+    // ── regsub -start tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_regsub_start() {
+        let mut interp = Interp::new();
+        // Replace 'a' only starting from position 2
+        let result = interp.eval("regsub -start 2 {a} {aaa} {b}").unwrap();
+        // Prefix "aa" + replace from index 2 onwards
+        assert_eq!(result.as_str(), "aab");
+    }
+
+    // ── regsub -expanded tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_regsub_expanded() {
+        let mut interp = Interp::new();
+        // -expanded ignores whitespace in pattern, so "  a  " becomes "a"
+        let result = interp.eval("regsub -expanded { a } {bab} {c}").unwrap();
+        assert_eq!(result.as_str(), "bcb");
+    }
+
+    #[test]
+    fn test_regsub_expanded_pattern() {
+        let mut interp = Interp::new();
+        // -expanded ignores whitespace in pattern
+        let result = interp.eval("regsub -expanded { x } {axb} {X}").unwrap();
+        assert_eq!(result.as_str(), "aXb");
+    }
+
+    // ── regsub -command tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_regsub_command() {
+        let mut interp = Interp::new();
+        // Use a proc to transform matches — without -all, only first match replaced
+        interp.eval("proc double s { return [string cat $s $s] }").unwrap();
+        let result = interp.eval("regsub -command {\\d+} {a12b34} double").unwrap();
+        assert_eq!(result.as_str(), "a1212b34");
+    }
+
+    #[test]
+    fn test_regsub_command_all() {
+        let mut interp = Interp::new();
+        interp.eval("proc up s { string toupper $s }").unwrap();
+        let result = interp.eval("regsub -all -command {[a-z]} {abc} up").unwrap();
+        assert_eq!(result.as_str(), "ABC");
+    }
+
+    // ── regsub backreference tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_regsub_backreference() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regsub {(\\w+)} {hello} {<\\1>}").unwrap();
+        assert_eq!(result.as_str(), "<hello>");
+    }
+
+    #[test]
+    fn test_regsub_ampersand() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regsub {\\w+} {hello} {[&]}").unwrap();
+        assert_eq!(result.as_str(), "[hello]");
+    }
+
+    // ── error handling tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_regexp_bad_switch() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regexp -badswitch {a} {a}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_regsub_bad_switch() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regsub -badswitch {a} {a} {b}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_regexp_inline_with_vars_error() {
+        let mut interp = Interp::new();
+        // -inline with match variables should be an error
+        let result = interp.eval("regexp -inline {a} {abc} m");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_regexp_missing_start_arg() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regexp -start {a} {abc}");
+        assert!(result.is_err());
+    }
+
+    // ── regexp -- end-of-switches tests ────────────────────────────────────────
+
+    #[test]
+    fn test_regexp_end_of_switches() {
+        let mut interp = Interp::new();
+        // Pattern starts with '-', must use -- to signal end of switches
+        let result = interp.eval("regexp -- {-test} {this-test works}").unwrap();
+        assert_eq!(result.as_str(), "1");
+    }
+
+    // ── regexp -all -inline -indices combined ──────────────────────────────────
+
+    #[test]
+    fn test_regexp_all_inline_indices() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regexp -all -inline -indices {\\d+} {a12b345c}").unwrap();
+        // Two matches: "12" at 1-2, "345" at 4-6
+        assert!(result.as_str().contains("1 2"));
+        assert!(result.as_str().contains("4 6"));
+    }
+
+    // ── regexp with no match sets vars empty ───────────────────────────────────
+
+    #[test]
+    fn test_regexp_no_match_sets_empty_vars() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regexp {zzzz} {abc} m").unwrap();
+        assert_eq!(result.as_str(), "0");
+        let m = interp.eval("set m").unwrap();
+        assert_eq!(m.as_str(), "");
+    }
+
+    // ── regsub -all with var sets count ────────────────────────────────────────
+
+    #[test]
+    fn test_regsub_all_with_var_returns_count() {
+        let mut interp = Interp::new();
+        let count = interp.eval("regsub -all {o} {foo oof} {0} result").unwrap();
+        assert_eq!(count.as_str(), "4"); // foo has 2 o's, oof has 2
+        let r = interp.eval("set result").unwrap();
+        assert_eq!(r.as_str(), "f00 00f");
+    }
+
+    // ── regsub -start -all combined ────────────────────────────────────────────
+
+    #[test]
+    fn test_regsub_start_all() {
+        let mut interp = Interp::new();
+        // Replace all 'a' starting from position 2
+        let result = interp.eval("regsub -all -start 2 {a} {aaaa} {x}").unwrap();
+        // prefix "aa" + replace from index 2: "aa" -> "xx"
+        assert_eq!(result.as_str(), "aaxx");
+    }
+
+    // ── regsub -command -all with capture groups ──────────────────────────────
+
+    #[test]
+    fn test_regsub_command_all_captures() {
+        let mut interp = Interp::new();
+        interp.eval("proc double s { return [string cat $s $s] }").unwrap();
+        let result = interp.eval("regsub -all -command {\\d+} {a12b34} double").unwrap();
+        assert_eq!(result.as_str(), "a1212b3434");
+    }
+
+    // ── regsub no match returns original ──────────────────────────────────────
+
+    #[test]
+    fn test_regsub_no_match() {
+        let mut interp = Interp::new();
+        let result = interp.eval("regsub {zzz} {hello} {xxx}").unwrap();
+        assert_eq!(result.as_str(), "hello");
+    }
+
+    // ── regsub -line mode ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_regsub_line() {
+        let mut interp = Interp::new();
+        // -line mode: ^ should match beginning of each line
+        let result = interp.eval("regsub -all -line {^x} {x1\nx2\nx3} {y}").unwrap();
+        assert_eq!(result.as_str(), "y1\ny2\ny3");
+    }
+}

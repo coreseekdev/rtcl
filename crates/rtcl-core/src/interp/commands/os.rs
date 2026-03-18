@@ -331,4 +331,33 @@ mod tests {
         // Verify we moved somewhere
         assert!(!after.is_empty());
     }
+
+    // ── wait command tests ─────────────────────────────────────────────────────
+
+    #[cfg(feature = "exec")]
+    #[test]
+    fn test_wait_no_args() {
+        let mut interp = Interp::new();
+        // wait without pid should return "0 NONE 0"
+        let result = interp.eval("wait").unwrap();
+        assert_eq!(result.as_str(), "0 NONE 0");
+    }
+
+    #[cfg(feature = "exec")]
+    #[test]
+    fn test_wait_nohang_no_args() {
+        let mut interp = Interp::new();
+        let result = interp.eval("wait -nohang").unwrap();
+        assert_eq!(result.as_str(), "0 NONE 0");
+    }
+
+    // ── pid command tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pid_current() {
+        let mut interp = Interp::new();
+        let result = interp.eval("pid").unwrap();
+        let pid: u32 = result.as_str().parse().unwrap();
+        assert!(pid > 0);
+    }
 }

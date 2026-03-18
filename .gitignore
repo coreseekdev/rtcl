@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+/.claude/
 **/*.rs.bk
 **/*.beam
 **/*.crate
@@ -7,6 +8,7 @@
 # IDE
 /.idea/
 /.vscode/
+/.claude/
 *.swp
 *.swo
 

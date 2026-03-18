@@ -366,3 +366,201 @@ pub fn cmd_pid(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         Err(Error::wrong_args_with_usage("pid", 1, args.len(), "pid ?channelId?"))
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(all(test, feature = "io"))]
+mod tests {
+    use crate::interp::Interp;
+    use crate::value::Value;
+
+    // ── pid tests ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pid_no_args_returns_current() {
+        let mut interp = Interp::new();
+        let result = interp.eval("pid").unwrap();
+        let pid: u32 = result.as_str().parse().unwrap();
+        assert_eq!(pid, std::process::id());
+    }
+
+    #[test]
+    fn test_pid_stdout_returns_empty() {
+        let mut interp = Interp::new();
+        // stdout is not a pipe channel, so pid should return empty
+        let result = interp.eval("pid stdout").unwrap();
+        assert_eq!(result.as_str(), "");
+    }
+
+    #[test]
+    fn test_pid_stdin_returns_empty() {
+        let mut interp = Interp::new();
+        let result = interp.eval("pid stdin").unwrap();
+        assert_eq!(result.as_str(), "");
+    }
+
+    #[test]
+    fn test_pid_nonexistent_channel() {
+        let mut interp = Interp::new();
+        let result = interp.eval("pid nosuch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pid_too_many_args() {
+        let mut interp = Interp::new();
+        let result = interp.eval("pid a b");
+        assert!(result.is_err());
+    }
+
+    // ── fconfigure tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fconfigure_query_all() {
+        let mut interp = Interp::new();
+        let result = interp.eval("fconfigure stdout").unwrap();
+        let s = result.as_str();
+        assert!(s.contains("-blocking"));
+        assert!(s.contains("-buffering"));
+        assert!(s.contains("-buffersize"));
+        assert!(s.contains("-encoding"));
+        assert!(s.contains("-translation"));
+    }
+
+    #[test]
+    fn test_fconfigure_query_single() {
+        let mut interp = Interp::new();
+        let result = interp.eval("fconfigure stdout -buffering").unwrap();
+        let val = result.as_str();
+        assert!(val == "full" || val == "line" || val == "none");
+    }
+
+    #[test]
+    fn test_fconfigure_set_buffering() {
+        let mut interp = Interp::new();
+        interp.eval("fconfigure stdout -buffering none").unwrap();
+        let result = interp.eval("fconfigure stdout -buffering").unwrap();
+        assert_eq!(result.as_str(), "none");
+        // Restore
+        interp.eval("fconfigure stdout -buffering line").unwrap();
+    }
+
+    #[test]
+    fn test_fconfigure_set_translation() {
+        let mut interp = Interp::new();
+        interp.eval("fconfigure stdout -translation lf").unwrap();
+        let result = interp.eval("fconfigure stdout -translation").unwrap();
+        assert_eq!(result.as_str(), "lf");
+    }
+
+    #[test]
+    fn test_fconfigure_set_encoding() {
+        let mut interp = Interp::new();
+        interp.eval("fconfigure stdout -encoding utf-8").unwrap();
+        let result = interp.eval("fconfigure stdout -encoding").unwrap();
+        assert_eq!(result.as_str(), "utf-8");
+    }
+
+    #[test]
+    fn test_fconfigure_set_blocking() {
+        let mut interp = Interp::new();
+        interp.eval("fconfigure stdout -blocking 0").unwrap();
+        let result = interp.eval("fconfigure stdout -blocking").unwrap();
+        assert_eq!(result.as_str(), "0");
+        // Restore
+        interp.eval("fconfigure stdout -blocking 1").unwrap();
+    }
+
+    #[test]
+    fn test_fconfigure_bad_option() {
+        let mut interp = Interp::new();
+        let result = interp.eval("fconfigure stdout -nosuchoption");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fconfigure_bad_channel() {
+        let mut interp = Interp::new();
+        let result = interp.eval("fconfigure nosuch");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fconfigure_bad_buffering_value() {
+        let mut interp = Interp::new();
+        let result = interp.eval("fconfigure stdout -buffering invalid");
+        assert!(result.is_err());
+    }
+
+    // ── open / close / eof tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_open_read_close() {
+        let mut interp = Interp::new();
+        let path = std::env::temp_dir().join(format!("rtcl_chanio_{}", std::process::id()));
+        std::fs::write(&path, b"hello\nworld\n").unwrap();
+        interp.set_var("_p", Value::from_str(&path.to_string_lossy())).unwrap();
+        interp.eval("set f [open $_p r]").unwrap();
+        let line = interp.eval("gets $f").unwrap();
+        assert_eq!(line.as_str(), "hello");
+        let line2 = interp.eval("gets $f").unwrap();
+        assert_eq!(line2.as_str(), "world");
+        interp.eval("close $f").unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_open_write_close() {
+        let mut interp = Interp::new();
+        let path = std::env::temp_dir().join(format!("rtcl_chanio_w_{}", std::process::id()));
+        interp.set_var("_p", Value::from_str(&path.to_string_lossy())).unwrap();
+        interp.eval("set f [open $_p w]").unwrap();
+        interp.eval("puts $f {written by test}").unwrap();
+        interp.eval("close $f").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("written by test"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_eof_on_file() {
+        let mut interp = Interp::new();
+        let path = std::env::temp_dir().join(format!("rtcl_chanio_eof_{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        interp.set_var("_p", Value::from_str(&path.to_string_lossy())).unwrap();
+        interp.eval("set f [open $_p r]").unwrap();
+        // Read all content
+        interp.eval("read $f").unwrap();
+        let eof = interp.eval("eof $f").unwrap();
+        assert_eq!(eof.as_str(), "1");
+        interp.eval("close $f").unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── seek / tell tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_seek_tell() {
+        let mut interp = Interp::new();
+        let path = std::env::temp_dir().join(format!("rtcl_chanio_seek_{}", std::process::id()));
+        std::fs::write(&path, b"abcdef").unwrap();
+        interp.set_var("_p", Value::from_str(&path.to_string_lossy())).unwrap();
+        interp.eval("set f [open $_p r]").unwrap();
+        interp.eval("seek $f 3").unwrap();
+        let pos = interp.eval("tell $f").unwrap();
+        assert_eq!(pos.as_str(), "3");
+        interp.eval("close $f").unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── flush on stdout ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_flush_stdout() {
+        let mut interp = Interp::new();
+        // flush stdout should not error
+        interp.eval("flush stdout").unwrap();
+    }
+}

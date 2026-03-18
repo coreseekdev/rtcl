@@ -361,3 +361,204 @@ enum StderrRedirect {
     Append(String),
     ToStdout,
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(all(test, feature = "exec"))]
+mod tests {
+    use crate::interp::Interp;
+
+    // ── basic exec tests ───────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_echo() {
+        let mut interp = Interp::new();
+        let result = interp.eval("exec echo hello").unwrap();
+        assert_eq!(result.as_str().trim(), "hello");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_exec_echo() {
+        let mut interp = Interp::new();
+        // On Windows, use cmd /c echo
+        let result = interp.eval("exec cmd /c echo hello").unwrap();
+        assert_eq!(result.as_str().trim(), "hello");
+    }
+
+    // ── exec 2>@1 redirect tests ───────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_stderr_to_stdout() {
+        let mut interp = Interp::new();
+        // Use 2>@1 to merge stderr into stdout
+        // sh -c "echo out; echo err >&2" writes "out" to stdout and "err" to stderr
+        let result = interp.eval("exec sh -c {echo out; echo err >&2} 2>@1").unwrap();
+        let output = result.as_str();
+        assert!(output.contains("out"));
+        assert!(output.contains("err"));
+    }
+
+    // ── exec errorCode tests ───────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_errorcode_on_success() {
+        let mut interp = Interp::new();
+        interp.eval("exec true").unwrap();
+        let ec = interp.eval("$::errorCode").unwrap();
+        assert_eq!(ec.as_str(), "NONE");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_errorcode_on_failure() {
+        let mut interp = Interp::new();
+        // false exits with code 1
+        let _ = interp.eval("exec false");
+        let ec = interp.eval("$::errorCode").unwrap();
+        // Should be something like "CHILDSTATUS <pid> 1"
+        assert!(ec.as_str().starts_with("CHILDSTATUS"));
+        assert!(ec.as_str().ends_with("1"));
+    }
+
+    // ── exec -keepnewline tests ────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_keepnewline() {
+        let mut interp = Interp::new();
+        let result = interp.eval("exec -keepnewline echo hello").unwrap();
+        assert!(result.as_str().ends_with('\n'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_no_keepnewline() {
+        let mut interp = Interp::new();
+        let result = interp.eval("exec echo hello").unwrap();
+        assert!(!result.as_str().ends_with('\n'));
+    }
+
+    // ── exec -ignorestderr tests ───────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_ignorestderr() {
+        let mut interp = Interp::new();
+        // With -ignorestderr, stderr goes to the terminal, not captured
+        let result = interp.eval("exec -ignorestderr sh -c {echo out; echo err >&2}");
+        // Should succeed (no error for stderr output)
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().as_str().trim(), "out");
+    }
+
+    // ── exec -- end-of-switches tests ──────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_double_dash() {
+        let mut interp = Interp::new();
+        // -- signals end of switches, allowing command names starting with -
+        let result = interp.eval("exec -- echo hello").unwrap();
+        assert_eq!(result.as_str().trim(), "hello");
+    }
+
+    // ── exec bad switch test ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_exec_bad_switch() {
+        let mut interp = Interp::new();
+        let result = interp.eval("exec -badswitch echo hello");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("bad switch"));
+    }
+
+    // ── exec pipe tests ────────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_pipe() {
+        let mut interp = Interp::new();
+        let result = interp.eval("exec echo {hello world} | tr a-z A-Z").unwrap();
+        assert_eq!(result.as_str().trim(), "HELLO WORLD");
+    }
+
+    // ── exec input redirect << tests ───────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_input_string() {
+        let mut interp = Interp::new();
+        let result = interp.eval("exec cat << {hello from string}").unwrap();
+        assert_eq!(result.as_str(), "hello from string");
+    }
+
+    // ── exec output redirect > tests ───────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_output_redirect_file() {
+        let mut interp = Interp::new();
+        let path = std::env::temp_dir().join(format!("rtcl_exec_redir_{}", std::process::id()));
+        interp.set_var("_f", crate::value::Value::from_str(&path.to_string_lossy())).unwrap();
+        interp.eval("exec echo {redirected output} > $_f").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("redirected output"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── exec 2> stderr redirect tests ──────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_stderr_redirect_file() {
+        let mut interp = Interp::new();
+        let path = std::env::temp_dir().join(format!("rtcl_exec_stderr_{}", std::process::id()));
+        interp.set_var("_f", crate::value::Value::from_str(&path.to_string_lossy())).unwrap();
+        interp.eval("exec sh -c {echo err >&2} 2> $_f").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("err"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── exec errorCode pid extraction ──────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_exec_errorcode_has_pid() {
+        let mut interp = Interp::new();
+        let _ = interp.eval("exec sh -c {exit 42}");
+        let ec = interp.eval("$::errorCode").unwrap();
+        let parts: Vec<&str> = ec.as_str().split_whitespace().collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "CHILDSTATUS");
+        // parts[1] should be a numeric pid
+        let pid: u32 = parts[1].parse().unwrap();
+        assert!(pid > 0);
+        assert_eq!(parts[2], "42");
+    }
+
+    // ── exec no command test ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_exec_no_args() {
+        let mut interp = Interp::new();
+        let result = interp.eval("exec");
+        assert!(result.is_err());
+    }
+
+    // ── exec nonexistent command ───────────────────────────────────────────────
+
+    #[test]
+    fn test_exec_nonexistent_command() {
+        let mut interp = Interp::new();
+        let result = interp.eval("exec this_command_does_not_exist_xyz123");
+        assert!(result.is_err());
+    }
+}

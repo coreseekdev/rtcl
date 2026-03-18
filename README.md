@@ -184,4 +184,4 @@ interp.eval("set x 42").unwrap();
 
 ## License
 
-MIT OR Apache-2.0
+BSD 2-Clause License (same as jimtcl)

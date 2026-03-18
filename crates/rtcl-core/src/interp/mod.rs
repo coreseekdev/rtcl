@@ -21,7 +21,7 @@ mod util;
 // Re-export utilities so command modules can reach them via `super::super::glob_match`
 pub(crate) use util::{split_array_ref, glob_match};
 
-use crate::command::{CommandFunc, CommandCategory};
+use crate::command::{CommandFunc, CommandCategory, CommandMeta};
 use crate::value::Value;
 use rtcl_parser::ByteCode;
 
@@ -68,6 +68,8 @@ pub struct Interp {
     pub(crate) commands: HashMap<String, CommandFunc>,
     /// Command category metadata.
     pub(crate) command_categories: HashMap<String, CommandCategory>,
+    /// Command metadata (usage + help) for built-in and registered commands.
+    pub(crate) command_meta: HashMap<String, CommandMeta>,
     /// User-defined procedures.
     pub(crate) procs: HashMap<String, ProcDef>,
     /// Call stack depth (for recursion limit).
@@ -119,6 +121,7 @@ impl Interp {
             frames: Vec::new(),
             commands: HashMap::new(),
             command_categories: HashMap::new(),
+            command_meta: HashMap::new(),
             procs: HashMap::new(),
             call_depth: 0,
             max_call_depth: 1000,

@@ -238,8 +238,16 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // Rename in builtins
     if let Some(func) = interp.commands.remove(&old_name) {
+        let cat = interp.command_categories.remove(&old_name);
+        let meta = interp.command_meta.remove(&old_name);
         if !new_name.is_empty() {
-            interp.commands.insert(new_name, func);
+            interp.commands.insert(new_name.clone(), func);
+            if let Some(c) = cat {
+                interp.command_categories.insert(new_name.clone(), c);
+            }
+            if let Some(m) = meta {
+                interp.command_meta.insert(new_name, m);
+            }
         }
         return Ok(Value::empty());
     }

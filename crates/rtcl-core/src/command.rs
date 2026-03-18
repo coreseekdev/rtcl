@@ -52,3 +52,14 @@ pub struct CommandInfo {
     /// Category
     pub category: CommandCategory,
 }
+
+/// Metadata for a command — usage signature and help text.
+///
+/// Used by `info usage` and `info help` subcommands.
+#[derive(Debug, Clone)]
+pub struct CommandMeta {
+    /// Usage signature, e.g. `"lsort ?-option ...? list"`.
+    pub usage: &'static str,
+    /// One-line help summary, e.g. `"Sort a list"`.
+    pub help: &'static str,
+}

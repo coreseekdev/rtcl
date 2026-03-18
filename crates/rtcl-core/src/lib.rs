@@ -35,7 +35,7 @@ pub use error::{Error, Result};
 pub use value::Value;
 pub use interp::Interp;
 pub use parser::parse;
-pub use command::CommandFunc;
+pub use command::{CommandFunc, CommandMeta};
 
 // Re-export sub-crates so downstream can access them via rtcl_core
 pub use rtcl_parser;

@@ -688,6 +688,42 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             Ok(Value::from_list(&names))
         }
+        "usage" => {
+            if args.len() != 3 {
+                return Err(Error::wrong_args("info usage", 3, args.len()));
+            }
+            let name = args[2].as_str();
+            match interp.command_usage(name) {
+                Some(usage) => {
+                    let full = if usage.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{} {}", name, usage)
+                    };
+                    Ok(Value::from_str(&full))
+                }
+                None => Err(Error::runtime(
+                    format!("invalid command name \"{}\"", name),
+                    crate::error::ErrorCode::NotFound,
+                )),
+            }
+        }
+        "help" => {
+            if args.len() != 3 {
+                return Err(Error::wrong_args("info help", 3, args.len()));
+            }
+            let name = args[2].as_str();
+            match interp.command_help(name) {
+                Some(help) if !help.is_empty() => Ok(Value::from_str(&help)),
+                Some(_) => Ok(Value::from_str(
+                    &format!("No help available for command \"{}\"", name)
+                )),
+                None => Err(Error::runtime(
+                    format!("invalid command name \"{}\"", name),
+                    crate::error::ErrorCode::NotFound,
+                )),
+            }
+        }
         _ => Err(Error::runtime(
             format!("unknown info subcommand: {}", subcmd),
             crate::error::ErrorCode::InvalidOp,
@@ -1038,6 +1074,7 @@ pub fn cmd_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use crate::interp::Interp;
+    use crate::Value;
 
     // ── + ────────────────────────────────────────────────────────
     #[test]
@@ -1269,5 +1306,156 @@ mod tests {
         let mut interp = Interp::new();
         assert!(interp.eval("xtrace").is_err());
         assert!(interp.eval("xtrace a b").is_err());
+    }
+
+    // -- info usage / info help tests ----------------------------------------
+
+    #[test]
+    fn test_info_usage_builtin() {
+        let mut interp = Interp::new();
+        let r = interp.eval("info usage set").unwrap();
+        assert_eq!(r.as_str(), "set varName ?value?");
+    }
+
+    #[test]
+    fn test_info_usage_builtin_lsort() {
+        let mut interp = Interp::new();
+        let r = interp.eval("info usage lsort").unwrap();
+        assert_eq!(r.as_str(), "lsort ?options? list");
+    }
+
+    #[test]
+    fn test_info_usage_proc_simple() {
+        let mut interp = Interp::new();
+        interp.eval("proc myfunc {a b} { return ok }").unwrap();
+        let r = interp.eval("info usage myfunc").unwrap();
+        assert_eq!(r.as_str(), "myfunc a b");
+    }
+
+    #[test]
+    fn test_info_usage_proc_defaults() {
+        let mut interp = Interp::new();
+        interp.eval("proc greet {name {greeting hello}} { return ok }").unwrap();
+        let r = interp.eval("info usage greet").unwrap();
+        assert_eq!(r.as_str(), "greet name ?greeting?");
+    }
+
+    #[test]
+    fn test_info_usage_proc_args() {
+        let mut interp = Interp::new();
+        interp.eval("proc varfn {x args} { return ok }").unwrap();
+        let r = interp.eval("info usage varfn").unwrap();
+        assert_eq!(r.as_str(), "varfn x ?arg ...?");
+    }
+
+    #[test]
+    fn test_info_usage_not_found() {
+        let mut interp = Interp::new();
+        assert!(interp.eval("info usage nosuchcommand").is_err());
+    }
+
+    #[test]
+    fn test_info_usage_wrong_args() {
+        let mut interp = Interp::new();
+        assert!(interp.eval("info usage").is_err());
+        assert!(interp.eval("info usage a b").is_err());
+    }
+
+    #[test]
+    fn test_info_help_builtin() {
+        let mut interp = Interp::new();
+        let r = interp.eval("info help set").unwrap();
+        assert_eq!(r.as_str(), "Read or write a variable");
+    }
+
+    #[test]
+    fn test_info_help_builtin_lsort() {
+        let mut interp = Interp::new();
+        let r = interp.eval("info help lsort").unwrap();
+        assert_eq!(r.as_str(), "Sort a list");
+    }
+
+    #[test]
+    fn test_info_help_proc_no_meta() {
+        let mut interp = Interp::new();
+        interp.eval("proc myfn {} { return ok }").unwrap();
+        let r = interp.eval("info help myfn").unwrap();
+        assert_eq!(r.as_str(), "No help available for command \"myfn\"");
+    }
+
+    #[test]
+    fn test_info_help_not_found() {
+        let mut interp = Interp::new();
+        assert!(interp.eval("info help nosuchcommand").is_err());
+    }
+
+    #[test]
+    fn test_info_help_wrong_args() {
+        let mut interp = Interp::new();
+        assert!(interp.eval("info help").is_err());
+        assert!(interp.eval("info help a b").is_err());
+    }
+
+    #[test]
+    fn test_register_command_with_meta() {
+        use crate::command::CommandMeta;
+
+        fn cmd_custom(_interp: &mut Interp, _args: &[Value]) -> crate::Result<Value> {
+            Ok(Value::from_str("custom"))
+        }
+
+        let mut interp = Interp::new();
+        interp.register_command_with_meta(
+            "mycmd",
+            cmd_custom,
+            CommandMeta { usage: "arg1 ?arg2?", help: "A custom command" },
+        );
+
+        let r = interp.eval("info usage mycmd").unwrap();
+        assert_eq!(r.as_str(), "mycmd arg1 ?arg2?");
+
+        let r = interp.eval("info help mycmd").unwrap();
+        assert_eq!(r.as_str(), "A custom command");
+
+        // Verify the command itself works
+        let r = interp.eval("mycmd").unwrap();
+        assert_eq!(r.as_str(), "custom");
+    }
+
+    #[test]
+    fn test_delete_command_clears_meta() {
+        use crate::command::CommandMeta;
+
+        fn cmd_tmp(_interp: &mut Interp, _args: &[Value]) -> crate::Result<Value> {
+            Ok(Value::from_str("tmp"))
+        }
+
+        let mut interp = Interp::new();
+        interp.register_command_with_meta(
+            "tmpcmd",
+            cmd_tmp,
+            CommandMeta { usage: "x", help: "Temporary" },
+        );
+
+        // Metadata accessible before delete
+        assert!(interp.eval("info usage tmpcmd").is_ok());
+        // Delete the command
+        interp.eval("rename tmpcmd {}").unwrap();
+        // Metadata gone after delete
+        assert!(interp.eval("info usage tmpcmd").is_err());
+    }
+
+    #[test]
+    fn test_command_usage_api() {
+        let interp = Interp::new();
+        assert_eq!(interp.command_usage("set"), Some("varName ?value?".to_string()));
+        assert_eq!(interp.command_usage("nosuch"), None);
+    }
+
+    #[test]
+    fn test_command_help_api() {
+        let interp = Interp::new();
+        assert_eq!(interp.command_help("set"), Some("Read or write a variable".to_string()));
+        assert_eq!(interp.command_help("nosuch"), None);
     }
 }

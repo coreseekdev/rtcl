@@ -137,7 +137,7 @@ impl<'a> ExprParser<'a> {
         Ok(left)
     }
 
-    /// Equality: `==`, `!=`, `eq`, `ne`, `in`, `ni`
+    /// Equality: `==`, `!=`, `eq`, `ne`, `in`, `ni`, `lt`, `gt`, `le`, `ge`, `=*`, `=~`
     fn parse_equality(&mut self) -> Result<Value> {
         let mut left = self.parse_relational()?;
         loop {
@@ -153,6 +153,30 @@ impl<'a> ExprParser<'a> {
                     (Some(a), Some(b)) => Value::from_bool((a - b).abs() >= f64::EPSILON),
                     _ => Value::from_bool(left.as_str() != right.as_str()),
                 };
+            } else if self.match_op("=*") {
+                // Glob match: left =* pattern
+                let right = self.parse_relational()?;
+                left = Value::from_bool(
+                    crate::interp::glob_match(right.as_str(), left.as_str()),
+                );
+            } else if self.match_op("=~") {
+                // Regexp match: left =~ pattern
+                let right = self.parse_relational()?;
+                #[cfg(feature = "regexp")]
+                {
+                    let matched = regex::Regex::new(right.as_str())
+                        .map(|re| re.is_match(left.as_str()))
+                        .unwrap_or(false);
+                    left = Value::from_bool(matched);
+                }
+                #[cfg(not(feature = "regexp"))]
+                {
+                    let _ = right;
+                    return Err(Error::runtime(
+                        "=~ operator requires 'regexp' feature",
+                        crate::error::ErrorCode::InvalidOp,
+                    ));
+                }
             } else if self.match_word_op("eq") {
                 let right = self.parse_relational()?;
                 left = Value::from_bool(left.as_str() == right.as_str());
@@ -169,6 +193,18 @@ impl<'a> ExprParser<'a> {
                 let items = right.as_list().unwrap_or_default();
                 let found = items.iter().any(|v| v.as_str() == left.as_str());
                 left = Value::from_bool(!found);
+            } else if self.match_word_op("lt") {
+                let right = self.parse_relational()?;
+                left = Value::from_bool(left.as_str() < right.as_str());
+            } else if self.match_word_op("gt") {
+                let right = self.parse_relational()?;
+                left = Value::from_bool(left.as_str() > right.as_str());
+            } else if self.match_word_op("le") {
+                let right = self.parse_relational()?;
+                left = Value::from_bool(left.as_str() <= right.as_str());
+            } else if self.match_word_op("ge") {
+                let right = self.parse_relational()?;
+                left = Value::from_bool(left.as_str() >= right.as_str());
             } else {
                 break;
             }
@@ -212,15 +248,31 @@ impl<'a> ExprParser<'a> {
         Ok(left)
     }
 
-    /// Shift: `<<`, `>>`
+    /// Shift: `<<`, `>>`, `<<<`, `>>>`
     fn parse_shift(&mut self) -> Result<Value> {
         let mut left = self.parse_additive()?;
         loop {
-            if self.match_op("<<") {
+            if self.match_op("<<<") {
+                let right = self.parse_additive()?;
+                let a = self.as_int_val(&left)? as u64;
+                let b = self.as_int_val(&right)? as u32;
+                let bits = 64u32;
+                let shift = b % bits;
+                let rotated = if shift == 0 { a } else { (a << shift) | (a >> (bits - shift)) };
+                left = Value::from_int(rotated as i64);
+            } else if self.match_op("<<") {
                 let right = self.parse_additive()?;
                 let a = self.as_int_val(&left)?;
                 let b = self.as_int_val(&right)?;
                 left = Value::from_int(a << (b & 63));
+            } else if self.match_op(">>>") {
+                let right = self.parse_additive()?;
+                let a = self.as_int_val(&left)? as u64;
+                let b = self.as_int_val(&right)? as u32;
+                let bits = 64u32;
+                let shift = b % bits;
+                let rotated = if shift == 0 { a } else { (a >> shift) | (a << (bits - shift)) };
+                left = Value::from_int(rotated as i64);
             } else if self.match_op(">>") {
                 let right = self.parse_additive()?;
                 let a = self.as_int_val(&left)?;
@@ -810,48 +862,5 @@ impl<'a> ExprParser<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_arithmetic() {
-        let mut interp = Interp::new();
-        assert_eq!(eval_expr(&mut interp, "1 + 2").unwrap().as_int(), Some(3));
-        assert_eq!(eval_expr(&mut interp, "10 - 3").unwrap().as_int(), Some(7));
-        assert_eq!(eval_expr(&mut interp, "4 * 5").unwrap().as_int(), Some(20));
-        assert_eq!(eval_expr(&mut interp, "15 / 3").unwrap().as_int(), Some(5));
-    }
-
-    #[test]
-    fn test_comparison() {
-        let mut interp = Interp::new();
-        assert_eq!(eval_expr(&mut interp, "1 < 2").unwrap().as_bool(), Some(true));
-        assert_eq!(eval_expr(&mut interp, "2 > 1").unwrap().as_bool(), Some(true));
-        assert_eq!(eval_expr(&mut interp, "1 == 1").unwrap().as_bool(), Some(true));
-        assert_eq!(eval_expr(&mut interp, "1 != 2").unwrap().as_bool(), Some(true));
-    }
-
-    #[test]
-    fn test_logical() {
-        let mut interp = Interp::new();
-        assert_eq!(eval_expr(&mut interp, "1 && 1").unwrap().as_bool(), Some(true));
-        assert_eq!(eval_expr(&mut interp, "1 && 0").unwrap().as_bool(), Some(false));
-        assert_eq!(eval_expr(&mut interp, "0 || 1").unwrap().as_bool(), Some(true));
-        assert_eq!(eval_expr(&mut interp, "!0").unwrap().as_bool(), Some(true));
-    }
-
-    #[test]
-    fn test_functions() {
-        let mut interp = Interp::new();
-        assert_eq!(eval_expr(&mut interp, "abs(-5)").unwrap().as_int(), Some(5));
-        assert_eq!(eval_expr(&mut interp, "sqrt(16)").unwrap().as_float(), Some(4.0));
-        assert_eq!(eval_expr(&mut interp, "pow(2, 3)").unwrap().as_int(), Some(8));
-    }
-
-    #[test]
-    fn test_variables() {
-        let mut interp = Interp::new();
-        interp.set_var("x", Value::from_int(10)).unwrap();
-        assert_eq!(eval_expr(&mut interp, "$x + 5").unwrap().as_int(), Some(15));
-    }
-}
+#[path = "expr_tests.rs"]
+mod tests;

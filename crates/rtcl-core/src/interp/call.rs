@@ -12,7 +12,7 @@ use alloc::collections::BTreeMap as HashMap;
 
 impl Interp {
     /// Call a user-defined procedure.
-    pub(crate) fn call_proc(&mut self, proc_def: &ProcDef, args: &[Value]) -> Result<Value> {
+    pub(crate) fn call_proc(&mut self, proc_def: &ProcDef, args: &[Value], proc_name: &str) -> Result<Value> {
         if self.call_depth > self.max_call_depth {
             return Err(Error::runtime(
                 "maximum recursion depth exceeded",
@@ -23,6 +23,8 @@ impl Interp {
         let mut current_params = proc_def.params.clone();
         let mut current_body = proc_def.body.clone();
         let mut current_args: Vec<Value> = args.to_vec();
+        let mut current_statics: HashMap<String, Value> = proc_def.statics.clone();
+        let mut current_proc_name = proc_name.to_string();
 
         self.call_depth += 1;
 
@@ -83,18 +85,40 @@ impl Interp {
                 self.frames.last_mut().unwrap().locals.insert("args".to_string(), Value::from_str(&list_str));
             }
 
+            // ── Inject static variables into the frame ─────────────
+            for (sname, sval) in &current_statics {
+                self.frames.last_mut().unwrap().locals.insert(sname.clone(), sval.clone());
+            }
+
             // ── Execute body ───────────────────────────────────────
             let result = self.eval(&current_body);
 
             // ── Check for tail-call signal ─────────────────────────
             match result {
                 Err(e) if e.is_tail_call() => {
+                    // Write back statics before switching to tail-call target
+                    if !current_statics.is_empty() {
+                        if let Some(frame) = self.frames.last() {
+                            let snames: Vec<String> = current_statics.keys().cloned().collect();
+                            for sname in &snames {
+                                if let Some(val) = frame.locals.get(sname) {
+                                    current_statics.insert(sname.clone(), val.clone());
+                                }
+                            }
+                        }
+                        if let Some(pdef) = self.procs.get_mut(&current_proc_name) {
+                            pdef.statics.clone_from(&current_statics);
+                        }
+                        current_statics = HashMap::new();
+                    }
                     let tc_args = e.into_tail_call_args().unwrap();
                     let cmd_name = &tc_args[0];
                     if let Some(new_proc) = self.procs.get(cmd_name).cloned() {
                         // Tail-call to another proc — reuse the frame (no depth increase)
                         current_params = new_proc.params;
                         current_body = new_proc.body;
+                        current_statics = new_proc.statics;
+                        current_proc_name = cmd_name.clone();
                         current_args = tc_args.into_iter().map(|s| Value::from_str(&s)).collect();
                         continue;
                     } else {
@@ -107,6 +131,21 @@ impl Interp {
                 other => break other,
             }
         };
+
+        // Write back static variables to the proc definition
+        if !current_statics.is_empty() {
+            if let Some(frame) = self.frames.last() {
+                let mut updated = current_statics;
+                for sname in updated.keys().cloned().collect::<Vec<_>>() {
+                    if let Some(val) = frame.locals.get(&sname) {
+                        updated.insert(sname, val.clone());
+                    }
+                }
+                if let Some(pdef) = self.procs.get_mut(&current_proc_name) {
+                    pdef.statics = updated;
+                }
+            }
+        }
 
         // Execute deferred scripts (from `defer` command) in reverse order
         if let Some(frame) = self.frames.last() {

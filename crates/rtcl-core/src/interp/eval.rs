@@ -71,18 +71,19 @@ impl Interp {
         // 3. Fall back to global unqualified name
 
         // User-defined procs
-        let proc_def = self.procs.get(cmd_name).cloned().or_else(|| {
-            if self.current_namespace != "::" && !cmd_name.starts_with("::") {
-                let qualified = crate::interp::commands::namespace::qualify(
-                    &self.current_namespace, cmd_name,
-                );
-                self.procs.get(&qualified).cloned()
-            } else {
-                None
-            }
-        });
-        if let Some(proc_def) = proc_def {
-            return self.call_proc(&proc_def, &args);
+        let proc_lookup = self.procs.get(cmd_name).cloned().map(|p| (p, cmd_name.to_string()))
+            .or_else(|| {
+                if self.current_namespace != "::" && !cmd_name.starts_with("::") {
+                    let qualified = crate::interp::commands::namespace::qualify(
+                        &self.current_namespace, cmd_name,
+                    );
+                    self.procs.get(&qualified).cloned().map(|p| (p, qualified))
+                } else {
+                    None
+                }
+            });
+        if let Some((proc_def, resolved_name)) = proc_lookup {
+            return self.call_proc(&proc_def, &args, &resolved_name);
         }
 
         // Built-in commands

@@ -76,23 +76,40 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() < 4 {
                 return Err(Error::wrong_args("string equal", 4, args.len()));
             }
-            // Handle -nocase option
-            let (nocase, s1, s2) = parse_string_opts(args)?;
-            if nocase {
-                Ok(Value::from_bool(s1.to_lowercase() == s2.to_lowercase()))
+            let (nocase, length, s1, s2) = parse_string_opts(args)?;
+            let (a, b) = if let Some(n) = length {
+                let n = n as usize;
+                (
+                    s1.chars().take(n).collect::<String>(),
+                    s2.chars().take(n).collect::<String>(),
+                )
             } else {
-                Ok(Value::from_bool(s1 == s2))
+                (s1, s2)
+            };
+            if nocase {
+                Ok(Value::from_bool(a.to_lowercase() == b.to_lowercase()))
+            } else {
+                Ok(Value::from_bool(a == b))
             }
         }
         "compare" => {
             if args.len() < 4 {
                 return Err(Error::wrong_args("string compare", 4, args.len()));
             }
-            let (nocase, s1, s2) = parse_string_opts(args)?;
-            let cmp = if nocase {
-                s1.to_lowercase().cmp(&s2.to_lowercase())
+            let (nocase, length, s1, s2) = parse_string_opts(args)?;
+            let (a, b) = if let Some(n) = length {
+                let n = n as usize;
+                (
+                    s1.chars().take(n).collect::<String>(),
+                    s2.chars().take(n).collect::<String>(),
+                )
             } else {
-                s1.cmp(&s2)
+                (s1, s2)
+            };
+            let cmp = if nocase {
+                a.to_lowercase().cmp(&b.to_lowercase())
+            } else {
+                a.cmp(&b)
             };
             Ok(Value::from_int(match cmp {
                 std::cmp::Ordering::Less => -1,
@@ -105,7 +122,7 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::wrong_args("string match", 4, args.len()));
             }
             // -nocase support
-            let (nocase, pattern, text) = parse_string_opts(args)?;
+            let (nocase, _length, pattern, text) = parse_string_opts(args)?;
             if nocase {
                 Ok(Value::from_bool(glob_match(&pattern.to_lowercase(), &text.to_lowercase())))
             } else {
@@ -255,6 +272,55 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             Ok(Value::from_str(&result))
         }
+        "byterange" => {
+            if args.len() != 5 {
+                return Err(Error::wrong_args_with_usage(
+                    "string byterange", 5, args.len(), "string first last",
+                ));
+            }
+            let bytes = str_val.as_bytes();
+            let len = bytes.len();
+            let first = parse_index(args[3].as_str(), len).unwrap_or(0);
+            let last = parse_index(args[4].as_str(), len)
+                .unwrap_or(len.saturating_sub(1));
+            if first <= last && first < len {
+                let end = (last + 1).min(len);
+                let s = String::from_utf8_lossy(&bytes[first..end]);
+                Ok(Value::from_str(&s))
+            } else {
+                Ok(Value::empty())
+            }
+        }
+        "wordstart" => {
+            if args.len() != 4 {
+                return Err(Error::wrong_args_with_usage(
+                    "string wordstart", 4, args.len(), "string charIndex",
+                ));
+            }
+            let chars: Vec<char> = str_val.chars().collect();
+            let len = chars.len();
+            let idx = parse_index(args[3].as_str(), len).unwrap_or(0).min(len.saturating_sub(1));
+            let mut start = idx;
+            while start > 0 && is_word_char(chars[start - 1]) {
+                start -= 1;
+            }
+            Ok(Value::from_int(start as i64))
+        }
+        "wordend" => {
+            if args.len() != 4 {
+                return Err(Error::wrong_args_with_usage(
+                    "string wordend", 4, args.len(), "string charIndex",
+                ));
+            }
+            let chars: Vec<char> = str_val.chars().collect();
+            let len = chars.len();
+            let idx = parse_index(args[3].as_str(), len).unwrap_or(0).min(len.saturating_sub(1));
+            let mut end = idx;
+            while end < len && is_word_char(chars[end]) {
+                end += 1;
+            }
+            Ok(Value::from_int(end as i64))
+        }
         _ => Err(Error::runtime(
             format!("unknown string subcommand: {}", subcmd),
             crate::error::ErrorCode::InvalidOp,
@@ -262,13 +328,30 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
-/// Parse -nocase option and return (nocase, str1, str2) for string equal/compare/match.
-fn parse_string_opts(args: &[Value]) -> Result<(bool, String, String)> {
+/// Parse -nocase / -length N / -- options and return (nocase, length, str1, str2).
+fn parse_string_opts(args: &[Value]) -> Result<(bool, Option<i64>, String, String)> {
     let mut i = 2;
     let mut nocase = false;
+    let mut length: Option<i64> = None;
     while i < args.len() && args[i].as_str().starts_with('-') {
         match args[i].as_str() {
             "-nocase" => { nocase = true; i += 1; }
+            "-length" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(Error::runtime(
+                        "missing value for -length",
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+                length = Some(args[i].as_int().ok_or_else(|| {
+                    Error::runtime(
+                        format!("expected integer but got \"{}\"", args[i].as_str()),
+                        crate::error::ErrorCode::Generic,
+                    )
+                })?);
+                i += 1;
+            }
             "--" => { i += 1; break; }
             _ => break,
         }
@@ -276,5 +359,104 @@ fn parse_string_opts(args: &[Value]) -> Result<(bool, String, String)> {
     if i + 1 >= args.len() {
         return Err(Error::wrong_args("string", 4, args.len()));
     }
-    Ok((nocase, args[i].as_str().to_string(), args[i + 1].as_str().to_string()))
+    Ok((nocase, length, args[i].as_str().to_string(), args[i + 1].as_str().to_string()))
+}
+
+/// A word character: alphanumeric or underscore (jimtcl convention).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::interp::Interp;
+
+    // -- string equal -length --
+
+    #[test]
+    fn test_string_equal_length() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"string equal -length 3 "abcdef" "abcxyz""#).unwrap();
+        assert_eq!(r.as_str(), "1");
+    }
+
+    #[test]
+    fn test_string_equal_length_nocase() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"string equal -nocase -length 3 "ABCdef" "abcxyz""#).unwrap();
+        assert_eq!(r.as_str(), "1");
+    }
+
+    #[test]
+    fn test_string_equal_length_mismatch() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"string equal -length 4 "abcdef" "abcxyz""#).unwrap();
+        assert_eq!(r.as_str(), "0");
+    }
+
+    // -- string compare -length --
+
+    #[test]
+    fn test_string_compare_length() {
+        let mut interp = Interp::new();
+        // First 2 chars of "abc" and "abd" are both "ab" → equal
+        let r = interp.eval(r#"string compare -length 2 "abc" "abd""#).unwrap();
+        assert_eq!(r.as_str(), "0");
+        // First 3 chars differ: "abc" < "abd"
+        let r2 = interp.eval(r#"string compare -length 3 "abc" "abd""#).unwrap();
+        assert_eq!(r2.as_str(), "-1");
+    }
+
+    #[test]
+    fn test_string_compare_nocase_length() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"string compare -nocase -length 5 "Hello World" "HELLO THERE""#).unwrap();
+        assert_eq!(r.as_str(), "0");
+    }
+
+    // -- string byterange --
+
+    #[test]
+    fn test_string_byterange() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"string byterange "hello" 0 2"#).unwrap();
+        assert_eq!(r.as_str(), "hel");
+    }
+
+    #[test]
+    fn test_string_byterange_end() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"string byterange "hello" 2 end"#).unwrap();
+        assert_eq!(r.as_str(), "llo");
+    }
+
+    // -- string wordstart / wordend --
+
+    #[test]
+    fn test_string_wordstart() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"string wordstart "hello world foo" 6"#).unwrap();
+        assert_eq!(r.as_str(), "6");
+    }
+
+    #[test]
+    fn test_string_wordstart_at_word_begin() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"string wordstart "hello world" 0"#).unwrap();
+        assert_eq!(r.as_str(), "0");
+    }
+
+    #[test]
+    fn test_string_wordend() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"string wordend "hello world foo" 6"#).unwrap();
+        assert_eq!(r.as_str(), "11");
+    }
+
+    #[test]
+    fn test_string_wordend_at_end() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"string wordend "hello" 0"#).unwrap();
+        assert_eq!(r.as_str(), "5");
+    }
 }

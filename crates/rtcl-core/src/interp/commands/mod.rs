@@ -4,6 +4,7 @@ pub mod control;
 pub mod loops;
 pub mod string_cmds;
 pub mod list;
+pub mod list_sort;
 pub mod dict;
 pub mod array;
 pub mod proc;

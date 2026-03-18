@@ -36,6 +36,8 @@ use alloc::collections::BTreeMap as HashMap;
 pub(crate) struct ProcDef {
     pub params: Vec<(String, Option<String>)>,
     pub body: String,
+    /// Static variables: persist across calls. Key = var name, value = current value.
+    pub statics: HashMap<String, Value>,
 }
 
 /// A link from a local variable name to a variable in another scope.

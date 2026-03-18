@@ -204,7 +204,18 @@ impl Error {
         Error::ControlFlow {
             kind: ControlFlow::Break,
             value: None,
-            level: 0,
+            level: 1,
+            error_info: None,
+            error_code: None,
+        }
+    }
+
+    /// Create a multi-level break: `break N` breaks out of N nested loops.
+    pub fn brk_level(n: i32) -> Self {
+        Error::ControlFlow {
+            kind: ControlFlow::Break,
+            value: None,
+            level: n,
             error_info: None,
             error_code: None,
         }
@@ -215,7 +226,18 @@ impl Error {
         Error::ControlFlow {
             kind: ControlFlow::Continue,
             value: None,
-            level: 0,
+            level: 1,
+            error_info: None,
+            error_code: None,
+        }
+    }
+
+    /// Create a multi-level continue: `continue N` skips N nested loops.
+    pub fn cont_level(n: i32) -> Self {
+        Error::ControlFlow {
+            kind: ControlFlow::Continue,
+            value: None,
+            level: n,
             error_info: None,
             error_code: None,
         }
@@ -293,6 +315,27 @@ impl Error {
     /// Check if this is a continue
     pub fn is_continue(&self) -> bool {
         matches!(self, Error::ControlFlow { kind: ControlFlow::Continue, .. })
+    }
+
+    /// For break/continue: get the loop level (number of remaining loops to exit).
+    /// Returns 1 for a simple break/continue; >1 for multi-level.
+    pub fn loop_level(&self) -> i32 {
+        match self {
+            Error::ControlFlow { kind: ControlFlow::Break | ControlFlow::Continue, level, .. } => {
+                if *level <= 0 { 1 } else { *level }
+            }
+            _ => 1,
+        }
+    }
+
+    /// Return a copy with the loop level decremented by 1 (for propagation).
+    pub fn with_decremented_loop_level(self) -> Self {
+        match self {
+            Error::ControlFlow { kind, value, level, error_info, error_code } => {
+                Error::ControlFlow { kind, value, level: level - 1, error_info, error_code }
+            }
+            other => other,
+        }
     }
 
     /// Check if this is an exit

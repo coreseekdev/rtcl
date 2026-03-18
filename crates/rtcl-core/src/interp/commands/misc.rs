@@ -724,6 +724,120 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 )),
             }
         }
+        "frame" => {
+            // info frame ?level? — return call frame details as a dict-style list
+            let depth = interp.frames.len();
+            let level = if args.len() > 2 {
+                let n = args[2].as_int().ok_or_else(|| {
+                    Error::runtime(
+                        format!("expected integer but got \"{}\"", args[2].as_str()),
+                        crate::error::ErrorCode::Generic,
+                    )
+                })?;
+                if n < 0 {
+                    // Negative: relative to current frame
+                    let abs = (depth as i64 + n) as usize;
+                    if abs >= depth {
+                        return Err(Error::runtime(
+                            "bad level",
+                            crate::error::ErrorCode::Generic,
+                        ));
+                    }
+                    abs
+                } else {
+                    let abs = n as usize;
+                    if abs >= depth {
+                        return Err(Error::runtime(
+                            "bad level",
+                            crate::error::ErrorCode::Generic,
+                        ));
+                    }
+                    abs
+                }
+            } else {
+                if depth == 0 {
+                    // At global level
+                    return Ok(Value::from_str("type source level 0 cmd {}"));
+                }
+                depth - 1
+            };
+            let vars: Vec<String> = if let Some(frame) = interp.frames.get(level) {
+                frame.locals.keys().cloned().collect()
+            } else {
+                Vec::new()
+            };
+            let var_list = vars.join(" ");
+            let result = format!("type proc level {} cmd {{}} locals {{{}}}", level, var_list);
+            Ok(Value::from_str(&result))
+        }
+        "stacktrace" => {
+            // info stacktrace — reuse the stacktrace command logic
+            let depth = interp.frames.len();
+            let mut entries = Vec::new();
+            for i in (0..depth).rev() {
+                let frame_info = format!("frame{}", i);
+                entries.push(Value::from_str(&frame_info));
+                entries.push(Value::from_str(""));
+                entries.push(Value::from_int(0));
+            }
+            Ok(Value::from_list(&entries))
+        }
+        "references" => {
+            // info references — list active reference IDs
+            let mut refs: Vec<Value> = interp.references.keys()
+                .map(|k| Value::from_str(k))
+                .collect();
+            refs.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            Ok(Value::from_list(&refs))
+        }
+        "tainted" => {
+            // info tainted ?pattern? — list tainted variable names
+            let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
+            let mut vars: Vec<Value> = interp.tainted_vars.keys()
+                .filter(|name| {
+                    pattern.map(|p| super::super::glob_match(p, name)).unwrap_or(true)
+                })
+                .map(|name| Value::from_str(name))
+                .collect();
+            vars.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            Ok(Value::from_list(&vars))
+        }
+        "statics" => {
+            // info statics procName — list static variables as {name value ...}
+            if args.len() != 3 {
+                return Err(Error::wrong_args("info statics", 3, args.len()));
+            }
+            let name = args[2].as_str();
+            let proc_def = interp.procs.get(name).ok_or_else(|| {
+                Error::runtime(
+                    format!("\"{}\" isn't a procedure", name),
+                    crate::error::ErrorCode::NotFound,
+                )
+            })?;
+            let mut entries: Vec<Value> = Vec::new();
+            let mut keys: Vec<&String> = proc_def.statics.keys().collect();
+            keys.sort();
+            for k in keys {
+                entries.push(Value::from_str(k));
+                entries.push(proc_def.statics[k].clone());
+            }
+            Ok(Value::from_list(&entries))
+        }
+        "source" => {
+            // info source cmdName — return definition source location
+            if args.len() != 3 {
+                return Err(Error::wrong_args("info source", 3, args.len()));
+            }
+            let name = args[2].as_str();
+            if !interp.procs.contains_key(name) && !interp.commands.contains_key(name) {
+                return Err(Error::runtime(
+                    format!("invalid command name \"{}\"", name),
+                    crate::error::ErrorCode::NotFound,
+                ));
+            }
+            // Source tracking will be enhanced when proc records file/line
+            Ok(Value::from_str(""))
+        }
         _ => Err(Error::runtime(
             format!("unknown info subcommand: {}", subcmd),
             crate::error::ErrorCode::InvalidOp,
@@ -1072,390 +1186,5 @@ pub fn cmd_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::interp::Interp;
-    use crate::Value;
-
-    // ── + ────────────────────────────────────────────────────────
-    #[test]
-    fn test_add_no_args() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.eval("+").unwrap().as_str(), "0");
-    }
-
-    #[test]
-    fn test_add_integers() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.eval("+ 1 2 3").unwrap().as_str(), "6");
-    }
-
-    #[test]
-    fn test_add_floats() {
-        let mut interp = Interp::new();
-        let r = interp.eval("+ 1 2.5 3").unwrap();
-        assert_eq!(r.as_float(), Some(6.5));
-    }
-
-    #[test]
-    fn test_add_single() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.eval("+ 42").unwrap().as_str(), "42");
-    }
-
-    #[test]
-    fn test_add_non_number() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("+ 1 abc").is_err());
-    }
-
-    // ── - ────────────────────────────────────────────────────────
-    #[test]
-    fn test_sub_negate() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.eval("- 5").unwrap().as_str(), "-5");
-    }
-
-    #[test]
-    fn test_sub_negate_float() {
-        let mut interp = Interp::new();
-        let r = interp.eval("- 3.14").unwrap();
-        assert_eq!(r.as_float(), Some(-3.14));
-    }
-
-    #[test]
-    fn test_sub_multi() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.eval("- 10 3").unwrap().as_str(), "7");
-    }
-
-    #[test]
-    fn test_sub_multi_chain() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.eval("- 100 20 30").unwrap().as_str(), "50");
-    }
-
-    #[test]
-    fn test_sub_no_args_error() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("-").is_err());
-    }
-
-    // ── * ────────────────────────────────────────────────────────
-    #[test]
-    fn test_mul_no_args() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.eval("*").unwrap().as_str(), "1");
-    }
-
-    #[test]
-    fn test_mul_integers() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.eval("* 2 3 4").unwrap().as_str(), "24");
-    }
-
-    #[test]
-    fn test_mul_float_promotion() {
-        let mut interp = Interp::new();
-        let r = interp.eval("* 2 1.5").unwrap();
-        assert_eq!(r.as_float(), Some(3.0));
-    }
-
-    // ── / ────────────────────────────────────────────────────────
-    #[test]
-    fn test_div_reciprocal() {
-        let mut interp = Interp::new();
-        let r = interp.eval("/ 4.0").unwrap();
-        assert_eq!(r.as_float(), Some(0.25));
-    }
-
-    #[test]
-    fn test_div_integer() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.eval("/ 12 3").unwrap().as_str(), "4");
-    }
-
-    #[test]
-    fn test_div_chain() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.eval("/ 120 2 3").unwrap().as_str(), "20");
-    }
-
-    #[test]
-    fn test_div_by_zero() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("/ 10 0").is_err());
-    }
-
-    #[test]
-    fn test_div_by_zero_float() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("/ 10.0 0.0").is_err());
-    }
-
-    #[test]
-    fn test_div_reciprocal_zero() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("/ 0.0").is_err());
-    }
-
-    #[test]
-    fn test_div_no_args_error() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("/").is_err());
-    }
-
-    // ── env ──────────────────────────────────────────────────────
-    #[cfg(feature = "env")]
-    #[test]
-    fn test_env_list_all() {
-        let mut interp = Interp::new();
-        let r = interp.eval("env").unwrap();
-        // Should return a non-empty flat list
-        assert!(!r.as_str().is_empty());
-    }
-
-    #[cfg(feature = "env")]
-    #[test]
-    fn test_env_get_with_default() {
-        let mut interp = Interp::new();
-        let r = interp.eval("env RTCL_NONEXISTENT_VAR fallback").unwrap();
-        assert_eq!(r.as_str(), "fallback");
-    }
-
-    #[cfg(feature = "env")]
-    #[test]
-    fn test_env_missing_error() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("env RTCL_NONEXISTENT_VAR").is_err());
-    }
-
-    // ── rand ─────────────────────────────────────────────────────
-    #[test]
-    fn test_rand_no_args() {
-        let mut interp = Interp::new();
-        let r = interp.eval("rand").unwrap();
-        assert!(r.as_int().is_some());
-    }
-
-    #[test]
-    fn test_rand_max() {
-        let mut interp = Interp::new();
-        let r = interp.eval("rand 10").unwrap();
-        let v = r.as_int().unwrap();
-        assert!((0..10).contains(&v));
-    }
-
-    #[test]
-    fn test_rand_min_max() {
-        let mut interp = Interp::new();
-        let r = interp.eval("rand 5 10").unwrap();
-        let v = r.as_int().unwrap();
-        assert!((5..10).contains(&v));
-    }
-
-    #[test]
-    fn test_rand_invalid_range() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("rand 10 5").is_err());
-    }
-
-    // ── debug ────────────────────────────────────────────────────
-    #[test]
-    fn test_debug_refcount() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.eval("debug refcount x").unwrap().as_str(), "1");
-    }
-
-    #[test]
-    fn test_debug_objcount() {
-        let mut interp = Interp::new();
-        assert_eq!(interp.eval("debug objcount").unwrap().as_str(), "0");
-    }
-
-    #[test]
-    fn test_debug_scriptlen() {
-        let mut interp = Interp::new();
-        let r = interp.eval("debug scriptlen {set x 1}").unwrap();
-        assert!(r.as_int().unwrap() > 0);
-    }
-
-    #[test]
-    fn test_debug_unknown_sub() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("debug bogus").is_err());
-    }
-
-    #[test]
-    fn test_debug_no_args() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("debug").is_err());
-    }
-
-    // ── xtrace ───────────────────────────────────────────────────
-    #[test]
-    fn test_xtrace_set_clear() {
-        let mut interp = Interp::new();
-        interp.eval("xtrace mycallback").unwrap();
-        assert_eq!(interp.xtrace_callback, "mycallback");
-        interp.eval("xtrace {}").unwrap();
-        assert_eq!(interp.xtrace_callback, "");
-    }
-
-    #[test]
-    fn test_xtrace_wrong_args() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("xtrace").is_err());
-        assert!(interp.eval("xtrace a b").is_err());
-    }
-
-    // -- info usage / info help tests ----------------------------------------
-
-    #[test]
-    fn test_info_usage_builtin() {
-        let mut interp = Interp::new();
-        let r = interp.eval("info usage set").unwrap();
-        assert_eq!(r.as_str(), "set varName ?value?");
-    }
-
-    #[test]
-    fn test_info_usage_builtin_lsort() {
-        let mut interp = Interp::new();
-        let r = interp.eval("info usage lsort").unwrap();
-        assert_eq!(r.as_str(), "lsort ?options? list");
-    }
-
-    #[test]
-    fn test_info_usage_proc_simple() {
-        let mut interp = Interp::new();
-        interp.eval("proc myfunc {a b} { return ok }").unwrap();
-        let r = interp.eval("info usage myfunc").unwrap();
-        assert_eq!(r.as_str(), "myfunc a b");
-    }
-
-    #[test]
-    fn test_info_usage_proc_defaults() {
-        let mut interp = Interp::new();
-        interp.eval("proc greet {name {greeting hello}} { return ok }").unwrap();
-        let r = interp.eval("info usage greet").unwrap();
-        assert_eq!(r.as_str(), "greet name ?greeting?");
-    }
-
-    #[test]
-    fn test_info_usage_proc_args() {
-        let mut interp = Interp::new();
-        interp.eval("proc varfn {x args} { return ok }").unwrap();
-        let r = interp.eval("info usage varfn").unwrap();
-        assert_eq!(r.as_str(), "varfn x ?arg ...?");
-    }
-
-    #[test]
-    fn test_info_usage_not_found() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("info usage nosuchcommand").is_err());
-    }
-
-    #[test]
-    fn test_info_usage_wrong_args() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("info usage").is_err());
-        assert!(interp.eval("info usage a b").is_err());
-    }
-
-    #[test]
-    fn test_info_help_builtin() {
-        let mut interp = Interp::new();
-        let r = interp.eval("info help set").unwrap();
-        assert_eq!(r.as_str(), "Read or write a variable");
-    }
-
-    #[test]
-    fn test_info_help_builtin_lsort() {
-        let mut interp = Interp::new();
-        let r = interp.eval("info help lsort").unwrap();
-        assert_eq!(r.as_str(), "Sort a list");
-    }
-
-    #[test]
-    fn test_info_help_proc_no_meta() {
-        let mut interp = Interp::new();
-        interp.eval("proc myfn {} { return ok }").unwrap();
-        let r = interp.eval("info help myfn").unwrap();
-        assert_eq!(r.as_str(), "No help available for command \"myfn\"");
-    }
-
-    #[test]
-    fn test_info_help_not_found() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("info help nosuchcommand").is_err());
-    }
-
-    #[test]
-    fn test_info_help_wrong_args() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("info help").is_err());
-        assert!(interp.eval("info help a b").is_err());
-    }
-
-    #[test]
-    fn test_register_command_with_meta() {
-        use crate::command::CommandMeta;
-
-        fn cmd_custom(_interp: &mut Interp, _args: &[Value]) -> crate::Result<Value> {
-            Ok(Value::from_str("custom"))
-        }
-
-        let mut interp = Interp::new();
-        interp.register_command_with_meta(
-            "mycmd",
-            cmd_custom,
-            CommandMeta { usage: "arg1 ?arg2?", help: "A custom command" },
-        );
-
-        let r = interp.eval("info usage mycmd").unwrap();
-        assert_eq!(r.as_str(), "mycmd arg1 ?arg2?");
-
-        let r = interp.eval("info help mycmd").unwrap();
-        assert_eq!(r.as_str(), "A custom command");
-
-        // Verify the command itself works
-        let r = interp.eval("mycmd").unwrap();
-        assert_eq!(r.as_str(), "custom");
-    }
-
-    #[test]
-    fn test_delete_command_clears_meta() {
-        use crate::command::CommandMeta;
-
-        fn cmd_tmp(_interp: &mut Interp, _args: &[Value]) -> crate::Result<Value> {
-            Ok(Value::from_str("tmp"))
-        }
-
-        let mut interp = Interp::new();
-        interp.register_command_with_meta(
-            "tmpcmd",
-            cmd_tmp,
-            CommandMeta { usage: "x", help: "Temporary" },
-        );
-
-        // Metadata accessible before delete
-        assert!(interp.eval("info usage tmpcmd").is_ok());
-        // Delete the command
-        interp.eval("rename tmpcmd {}").unwrap();
-        // Metadata gone after delete
-        assert!(interp.eval("info usage tmpcmd").is_err());
-    }
-
-    #[test]
-    fn test_command_usage_api() {
-        let interp = Interp::new();
-        assert_eq!(interp.command_usage("set"), Some("varName ?value?".to_string()));
-        assert_eq!(interp.command_usage("nosuch"), None);
-    }
-
-    #[test]
-    fn test_command_help_api() {
-        let interp = Interp::new();
-        assert_eq!(interp.command_help("set"), Some("Read or write a variable".to_string()));
-        assert_eq!(interp.command_help("nosuch"), None);
-    }
-}
+#[path = "misc_tests.rs"]
+mod tests;

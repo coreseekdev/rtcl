@@ -84,7 +84,7 @@ fn alias_dispatch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // Look up target: first check procs, then builtins
     if let Some(proc_def) = interp.procs.get(&info.target).cloned() {
-        interp.call_proc(&proc_def, &full_args)
+        interp.call_proc(&proc_def, &full_args, &info.target)
     } else if let Some(f) = interp.commands.get(&info.target).cloned() {
         f(interp, &full_args)
     } else {
@@ -108,7 +108,7 @@ pub fn cmd_local(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let cmd_name = cmd_args[0].as_str();
 
         if let Some(proc_def) = interp.procs.get(cmd_name).cloned() {
-            interp.call_proc(&proc_def, &cmd_args)?
+            interp.call_proc(&proc_def, &cmd_args, cmd_name)?
         } else if let Some(f) = interp.commands.get(cmd_name).cloned() {
             f(interp, &cmd_args)?
         } else {
@@ -141,7 +141,7 @@ pub fn cmd_upcall(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let saved = interp.saved_commands.get(name).cloned();
     match saved {
         Some(SavedCommand::Proc(proc_def)) => {
-            interp.call_proc(&proc_def, args)
+            interp.call_proc(&proc_def, args, name)
         }
         Some(SavedCommand::Builtin(f)) => f(interp, args),
         None => Err(Error::runtime(

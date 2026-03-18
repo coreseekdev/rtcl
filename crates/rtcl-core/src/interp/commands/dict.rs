@@ -451,6 +451,84 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let entries = parse_dict(dict_str)?;
             Ok(Value::from_str(&format!("{} entries in dict", entries.len())))
         }
+        "getwithdefault" => {
+            // dict getwithdefault dictionary ?key ...? key default
+            if args.len() < 5 {
+                return Err(Error::wrong_args_with_usage(
+                    "dict getwithdefault", 5, args.len(),
+                    "dictionary ?key ...? key default",
+                ));
+            }
+            let default = &args[args.len() - 1];
+            let dict_val = &args[2];
+            let keys = &args[3..args.len() - 1];
+            // Walk nested dicts
+            let mut current = dict_val.as_str().to_string();
+            for key in keys {
+                let entries = parse_dict(&current)?;
+                match entries.iter().find(|(k, _)| k == key.as_str()) {
+                    Some((_, v)) => current = v.clone(),
+                    None => return Ok(default.clone()),
+                }
+            }
+            Ok(Value::from_str(&current))
+        }
+        "update" => {
+            // dict update dictVariable key varName ?key varName ...? body
+            if args.len() < 5 || (args.len() - 3) % 2 == 0 {
+                return Err(Error::wrong_args_with_usage(
+                    "dict update", 5, args.len(),
+                    "dictVariable key varName ?key varName ...? body",
+                ));
+            }
+            let var_name = args[2].as_str().to_string();
+            let body = args[args.len() - 1].as_str().to_string();
+            let pairs: Vec<(String, String)> = args[3..args.len() - 1]
+                .chunks(2)
+                .map(|c| (c[0].as_str().to_string(), c[1].as_str().to_string()))
+                .collect();
+
+            // Read current dict
+            let dict_str = interp.get_var(&var_name)
+                .ok().map(|v| v.as_str().to_string())
+                .unwrap_or_default();
+            let entries = parse_dict(&dict_str)?;
+
+            // Set local variables from dict keys
+            for (key, local_var) in &pairs {
+                if let Some((_, v)) = entries.iter().find(|(k, _)| k == key) {
+                    interp.set_var(local_var, Value::from_str(v))?;
+                }
+            }
+
+            // Execute body
+            let result = interp.eval(&body);
+
+            // Write back from local variables to dict
+            if interp.get_var(&var_name).is_ok() {
+                let mut new_entries = parse_dict(
+                    &interp.get_var(&var_name)
+                        .ok().map(|v| v.as_str().to_string())
+                        .unwrap_or_default(),
+                )?;
+                for (key, local_var) in &pairs {
+                    if let Ok(val) = interp.get_var(local_var) {
+                        // Update or add
+                        if let Some(pos) = new_entries.iter().position(|(k, _)| k == key) {
+                            new_entries[pos].1 = val.as_str().to_string();
+                        } else {
+                            new_entries.push((key.clone(), val.as_str().to_string()));
+                        }
+                    } else {
+                        // Variable unset → remove key
+                        new_entries.retain(|(k, _)| k != key);
+                    }
+                }
+                interp.set_var(&var_name, Value::from_str(&dict_to_string(&new_entries)))?;
+            }
+
+            result
+        }
         _ => {
             // Fallback: check for a proc named "dict $subcmd" (jimtcl pattern)
             let multi_name = format!("dict {}", subcmd);
@@ -458,7 +536,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // Build args: ["dict subcmd", original_args_after_subcmd...]
                 let mut new_args = vec![Value::from_str(&multi_name)];
                 new_args.extend_from_slice(&args[2..]);
-                return interp.call_proc(&proc_def, &new_args);
+                return interp.call_proc(&proc_def, &new_args, &multi_name);
             }
             Err(Error::runtime(
                 format!("unknown dict subcommand: {}", subcmd),
@@ -492,4 +570,60 @@ fn dict_set_nested(dict_str: &str, keys: &[&str], value: &str) -> Result<String>
         }
     }
     Ok(dict_to_string(&entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::interp::Interp;
+
+    #[test]
+    fn test_dict_getwithdefault_found() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"dict getwithdefault {a 1 b 2} a "default""#).unwrap();
+        assert_eq!(r.as_str(), "1");
+    }
+
+    #[test]
+    fn test_dict_getwithdefault_not_found() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"dict getwithdefault {a 1 b 2} c "default""#).unwrap();
+        assert_eq!(r.as_str(), "default");
+    }
+
+    #[test]
+    fn test_dict_getwithdefault_nested() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"dict getwithdefault {a {x 10 y 20} b 2} a y "nope""#).unwrap();
+        assert_eq!(r.as_str(), "20");
+    }
+
+    #[test]
+    fn test_dict_update_basic() {
+        let mut interp = Interp::new();
+        interp.eval(r#"set d [dict create name "Jim" age 30]"#).unwrap();
+        interp.eval(r#"dict update d name n age a { set n "Updated"; set a 31 }"#).unwrap();
+        // Check that both keys are updated
+        let r2 = interp.eval("dict get $d name").unwrap();
+        assert_eq!(r2.as_str(), "Updated");
+        let r3 = interp.eval("dict get $d age").unwrap();
+        assert_eq!(r3.as_str(), "31");
+    }
+
+    #[test]
+    fn test_dict_update_return_body() {
+        let mut interp = Interp::new();
+        interp.eval(r#"set d {x 10}"#).unwrap();
+        let r = interp.eval(r#"dict update d x v { expr {$v + 5} }"#).unwrap();
+        assert_eq!(r.as_str(), "15");
+    }
+
+    #[test]
+    fn test_dict_getdef_tcl() {
+        // Test the Tcl-level getdef (defined in stdlib.tcl)
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"dict getdef {a 1 b 2} c "fallback""#).unwrap();
+        assert_eq!(r.as_str(), "fallback");
+        let r2 = interp.eval(r#"dict getdef {a 1 b 2} a "fallback""#).unwrap();
+        assert_eq!(r2.as_str(), "1");
+    }
 }

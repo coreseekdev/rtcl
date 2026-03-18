@@ -4,9 +4,19 @@ use crate::error::{Error, Result};
 use crate::interp::{Interp, ProcDef, UpvarLink};
 use crate::value::Value;
 
+#[cfg(not(feature = "embedded"))]
+use std::collections::HashMap;
+
+#[cfg(feature = "embedded")]
+use alloc::collections::BTreeMap as HashMap;
+
 pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() != 4 {
-        return Err(Error::wrong_args_with_usage("proc", 4, args.len(), "name argList body"));
+    // 3-arg form: proc name argList body
+    // 4-arg form: proc name argList statics body  (jimtcl-compatible)
+    if args.len() < 4 || args.len() > 5 {
+        return Err(Error::wrong_args_with_usage(
+            "proc", 4, args.len(), "name argList ?statics? body",
+        ));
     }
 
     let raw_name = args[1].as_str();
@@ -18,8 +28,17 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     } else {
         raw_name.to_string()
     };
-    let params = args[2].as_list().unwrap_or_default();
-    let body = args[3].as_str().to_string();
+
+    let (param_arg, statics_arg, body_arg) = if args.len() == 5 {
+        // 4-arg form: proc name argList statics body
+        (&args[2], Some(&args[3]), &args[4])
+    } else {
+        // 3-arg form: proc name argList body
+        (&args[2], None, &args[3])
+    };
+
+    let params = param_arg.as_list().unwrap_or_default();
+    let body = body_arg.as_str().to_string();
 
     let mut defaults: Vec<(String, Option<String>)> = Vec::new();
     for param in &params {
@@ -34,9 +53,26 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
+    // Parse statics list: each element is {varName ?initialValue?}
+    let mut statics = HashMap::new();
+    if let Some(statics_val) = statics_arg {
+        let static_list = statics_val.as_list().unwrap_or_default();
+        for item in &static_list {
+            let parts = item.as_list().unwrap_or_else(|| vec![item.clone()]);
+            let var_name = parts[0].as_str().to_string();
+            let init_val = if parts.len() >= 2 {
+                Value::from_str(parts[1].as_str())
+            } else {
+                Value::empty()
+            };
+            statics.insert(var_name, init_val);
+        }
+    }
+
     let proc_def = ProcDef {
         params: defaults,
         body,
+        statics,
     };
 
     interp.procs.insert(name, proc_def);
@@ -106,6 +142,7 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let proc_def = ProcDef {
         params: defaults,
         body,
+        statics: HashMap::new(),
     };
 
     // Create args for call_proc: [name, arg1, arg2, ...]
@@ -115,7 +152,7 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         call_args.push(arg.clone());
     }
 
-    interp.call_proc(&proc_def, &call_args)
+    interp.call_proc(&proc_def, &call_args, "apply")
 }
 
 pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -264,4 +301,72 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         format!("can't rename: command \"{}\" not found", old_name),
         crate::error::ErrorCode::NotFound,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::interp::Interp;
+
+    #[test]
+    fn test_proc_statics_counter() {
+        let mut interp = Interp::new();
+        interp.eval("proc counter {} {{count 0}} { incr count; return $count }").unwrap();
+        assert_eq!(interp.eval("counter").unwrap().as_str(), "1");
+        assert_eq!(interp.eval("counter").unwrap().as_str(), "2");
+        assert_eq!(interp.eval("counter").unwrap().as_str(), "3");
+    }
+
+    #[test]
+    fn test_proc_statics_multiple() {
+        let mut interp = Interp::new();
+        interp.eval("proc accum {val} {{sum 0} {n 0}} { incr n; set sum [expr {$sum + $val}]; return \"$sum $n\" }").unwrap();
+        assert_eq!(interp.eval("accum 10").unwrap().as_str(), "10 1");
+        assert_eq!(interp.eval("accum 20").unwrap().as_str(), "30 2");
+        assert_eq!(interp.eval("accum 5").unwrap().as_str(), "35 3");
+    }
+
+    #[test]
+    fn test_proc_statics_default_empty() {
+        let mut interp = Interp::new();
+        // Static with no initial value defaults to empty string
+        interp.eval("proc setter {} {x} { if {$x eq {}} { set x hello }; return $x }").unwrap();
+        assert_eq!(interp.eval("setter").unwrap().as_str(), "hello");
+        assert_eq!(interp.eval("setter").unwrap().as_str(), "hello");
+    }
+
+    #[test]
+    fn test_proc_statics_persists_across_calls() {
+        let mut interp = Interp::new();
+        interp.eval("proc tracker {} {{items {}}} { append items x; return $items }").unwrap();
+        assert_eq!(interp.eval("tracker").unwrap().as_str(), "x");
+        assert_eq!(interp.eval("tracker").unwrap().as_str(), "xx");
+        assert_eq!(interp.eval("tracker").unwrap().as_str(), "xxx");
+    }
+
+    #[test]
+    fn test_proc_statics_with_args() {
+        let mut interp = Interp::new();
+        interp.eval("proc add_to {val} {{total 0}} { set total [expr {$total + $val}]; return $total }").unwrap();
+        assert_eq!(interp.eval("add_to 5").unwrap().as_str(), "5");
+        assert_eq!(interp.eval("add_to 3").unwrap().as_str(), "8");
+        assert_eq!(interp.eval("add_to 2").unwrap().as_str(), "10");
+    }
+
+    #[test]
+    fn test_proc_no_statics_unchanged() {
+        // Standard 3-arg proc still works
+        let mut interp = Interp::new();
+        interp.eval("proc double {x} { expr {$x * 2} }").unwrap();
+        assert_eq!(interp.eval("double 5").unwrap().as_str(), "10");
+    }
+
+    #[test]
+    fn test_info_statics_shows_values() {
+        let mut interp = Interp::new();
+        interp.eval("proc counter {} {{count 0}} { incr count; return $count }").unwrap();
+        interp.eval("counter").unwrap();
+        interp.eval("counter").unwrap();
+        let r = interp.eval("info statics counter").unwrap();
+        assert_eq!(r.as_str(), "count 2");
+    }
 }

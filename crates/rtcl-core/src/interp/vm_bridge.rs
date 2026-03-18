@@ -63,7 +63,7 @@ impl VmContext for Interp {
 
         // Try user-defined procs first
         if let Some(proc_def) = self.procs.get(cmd_name).cloned() {
-            return self.call_proc(&proc_def, args);
+            return self.call_proc(&proc_def, args, cmd_name);
         }
 
         // Built-in commands

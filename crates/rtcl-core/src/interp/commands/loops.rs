@@ -21,8 +21,14 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         match interp.eval(body) {
             Ok(v) => result = v,
             Err(e) => {
-                if e.is_break() { break; }
-                if e.is_continue() { continue; }
+                if e.is_break() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    break;
+                }
+                if e.is_continue() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    continue;
+                }
                 return Err(e);
             }
         }
@@ -52,8 +58,14 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         match interp.eval(body) {
             Ok(v) => result = v,
             Err(e) => {
-                if e.is_break() { break; }
-                if e.is_continue() { /* fall through to next */ }
+                if e.is_break() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    break;
+                }
+                if e.is_continue() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    /* fall through to next */
+                }
                 else { return Err(e); }
             }
         }
@@ -61,8 +73,13 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         match interp.eval(next) {
             Ok(_) => {}
             Err(e) => {
-                if e.is_break() { break; }
-                if e.is_continue() { }
+                if e.is_break() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    break;
+                }
+                if e.is_continue() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                }
                 else { return Err(e); }
             }
         }
@@ -119,8 +136,14 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         match interp.eval(body) {
             Ok(v) => result = v,
             Err(e) => {
-                if e.is_break() { break; }
-                if e.is_continue() { continue; }
+                if e.is_break() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    break;
+                }
+                if e.is_continue() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    continue;
+                }
                 return Err(e);
             }
         }
@@ -376,9 +399,11 @@ pub fn cmd_loop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(v) => result = v,
             Err(e) => {
                 if e.is_break() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
                     break;
                 }
                 if e.is_continue() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
                     i += step;
                     continue;
                 }
@@ -454,5 +479,114 @@ mod tests {
         let mut interp = Interp::new();
         assert!(interp.eval("loop i").is_err());
         assert!(interp.eval("loop").is_err());
+    }
+
+    // -- Multi-level break/continue tests --
+
+    #[test]
+    fn test_break_2_nested_for() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"
+            set result ""
+            for {set i 0} {$i < 3} {incr i} {
+                for {set j 0} {$j < 3} {incr j} {
+                    if {$j == 1} { break 2 }
+                    append result "$i$j "
+                }
+            }
+            set result
+        "#).unwrap();
+        assert_eq!(r.as_str(), "00 ");
+    }
+
+    #[test]
+    fn test_continue_2_nested_for() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"
+            set result ""
+            for {set i 0} {$i < 3} {incr i} {
+                for {set j 0} {$j < 3} {incr j} {
+                    if {$j == 1} { continue 2 }
+                    append result "$i$j "
+                }
+            }
+            set result
+        "#).unwrap();
+        assert_eq!(r.as_str(), "00 10 20 ");
+    }
+
+    #[test]
+    fn test_break_1_same_as_break() {
+        let mut interp = Interp::new();
+        let r = interp.eval("set r {}; loop i 5 { if {$i == 2} {break 1}; lappend r $i }; set r").unwrap();
+        assert_eq!(r.as_str(), "0 1");
+    }
+
+    #[test]
+    fn test_break_bad_level() {
+        let mut interp = Interp::new();
+        assert!(interp.eval("break 0").is_err());
+        assert!(interp.eval("break -1").is_err());
+        assert!(interp.eval("break abc").is_err());
+    }
+
+    #[test]
+    fn test_continue_bad_level() {
+        let mut interp = Interp::new();
+        assert!(interp.eval("for {set i 0} {$i<1} {incr i} { continue 0 }").is_err());
+    }
+
+    #[test]
+    fn test_break_3_triple_nested() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"
+            set result ""
+            for {set i 0} {$i < 2} {incr i} {
+                for {set j 0} {$j < 2} {incr j} {
+                    for {set k 0} {$k < 2} {incr k} {
+                        if {$k == 1} { break 3 }
+                        append result "$i$j$k "
+                    }
+                }
+            }
+            set result
+        "#).unwrap();
+        assert_eq!(r.as_str(), "000 ");
+    }
+
+    #[test]
+    fn test_break_2_while() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"
+            set result ""
+            set i 0
+            while {$i < 3} {
+                set j 0
+                while {$j < 3} {
+                    if {$j == 1} { break 2 }
+                    append result "$i$j "
+                    incr j
+                }
+                incr i
+            }
+            set result
+        "#).unwrap();
+        assert_eq!(r.as_str(), "00 ");
+    }
+
+    #[test]
+    fn test_break_2_foreach() {
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"
+            set result ""
+            foreach i {a b c} {
+                foreach j {1 2 3} {
+                    if {$j == 2} { break 2 }
+                    append result "$i$j "
+                }
+            }
+            set result
+        "#).unwrap();
+        assert_eq!(r.as_str(), "a1 ");
     }
 }

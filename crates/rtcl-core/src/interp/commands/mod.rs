@@ -24,3 +24,7 @@ pub mod namespace;
 #[cfg(any(feature = "file", feature = "signal", feature = "exec"))]
 pub mod os;
 pub mod introspect;
+#[cfg(feature = "std")]
+pub mod event;
+#[cfg(feature = "std")]
+pub mod interp_cmd;

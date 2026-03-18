@@ -257,3 +257,11 @@ proc json::encode {value {schema str}} {
 proc json::decode {json} {
     return -code error "json::decode requires native implementation"
 }
+
+# ── popen (jimtcl tclcompat.tcl) ────────────────────────────────────────
+
+# popen — Open a pipe to/from a command.
+# Uses the native `open |command ?mode?` pipe channel support.
+proc popen {cmd {mode "r"}} {
+    open |$cmd $mode
+}

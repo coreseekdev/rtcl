@@ -107,6 +107,32 @@ pub struct Interp {
     pub(crate) tainted_vars: HashMap<String, bool>,
     /// Execution trace callback script (xtrace). Empty = disabled.
     pub(crate) xtrace_callback: String,
+    /// Event queue for `after`/`vwait`/`update`.
+    #[cfg(feature = "std")]
+    pub(crate) event_queue: Vec<TimedEvent>,
+    /// Next event ID counter for `after` scheduling.
+    #[cfg(feature = "std")]
+    pub(crate) next_event_id: u64,
+    /// Child interpreter table for `interp` command.
+    #[cfg(feature = "std")]
+    pub(crate) child_interps: HashMap<String, Box<Interp>>,
+    /// Next child interpreter ID counter.
+    #[cfg(feature = "std")]
+    pub(crate) next_interp_id: u64,
+}
+
+/// A scheduled time event (for `after ms script`).
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+pub(crate) struct TimedEvent {
+    /// Unique event ID.
+    pub id: u64,
+    /// Absolute fire time (milliseconds since process start, from `Instant`).
+    pub fire_at_ms: u64,
+    /// Script to evaluate when the event fires.
+    pub script: String,
+    /// Whether this is an idle event (`after idle`).
+    pub is_idle: bool,
 }
 
 impl Default for Interp {
@@ -147,6 +173,14 @@ impl Interp {
             saved_commands: HashMap::new(),
             tainted_vars: HashMap::new(),
             xtrace_callback: String::new(),
+            #[cfg(feature = "std")]
+            event_queue: Vec::new(),
+            #[cfg(feature = "std")]
+            next_event_id: 1,
+            #[cfg(feature = "std")]
+            child_interps: HashMap::new(),
+            #[cfg(feature = "std")]
+            next_interp_id: 1,
         };
         interp.register_builtins();
         interp.init_special_vars();

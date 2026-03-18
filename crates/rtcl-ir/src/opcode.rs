@@ -107,6 +107,10 @@ pub enum CmdId {
     Exec        = 145,
     Namespace   = 59,
     Variable    = 60,
+    After       = 61,
+    Vwait       = 62,
+    Update      = 63,
+    InterpCmd   = 64,
 }
 
 impl CmdId {
@@ -184,6 +188,10 @@ impl CmdId {
             "exec"        => Self::Exec,
             "namespace"   => Self::Namespace,
             "variable"    => Self::Variable,
+            "after"       => Self::After,
+            "vwait"       => Self::Vwait,
+            "update"      => Self::Update,
+            "interp"      => Self::InterpCmd,
             _ => return None,
         })
     }

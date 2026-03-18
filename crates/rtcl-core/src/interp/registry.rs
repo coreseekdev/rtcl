@@ -181,6 +181,15 @@ static CMD_TABLE_ENV: &[CmdEntry] = &[
     CmdEntry { name: "env", func: misc::cmd_env, cat: Standard, cmd_id: None, usage: "varName ?value?", help: "Read or write environment variables" },
 ];
 
+/// Event loop commands gated behind `feature = "std"`.
+#[cfg(feature = "std")]
+static CMD_TABLE_EVENT: &[CmdEntry] = &[
+    CmdEntry { name: "after",   func: event::cmd_after,   cat: Extension, cmd_id: Some(CmdId::After  as u16), usage: "option ?arg ...?",    help: "Schedule or sleep" },
+    CmdEntry { name: "vwait",   func: event::cmd_vwait,   cat: Extension, cmd_id: Some(CmdId::Vwait  as u16), usage: "varName",             help: "Wait for variable change" },
+    CmdEntry { name: "update",  func: event::cmd_update,  cat: Extension, cmd_id: Some(CmdId::Update as u16), usage: "?idletasks?",         help: "Process pending events" },
+    CmdEntry { name: "interp",  func: interp_cmd::cmd_interp, cat: Extension, cmd_id: Some(CmdId::InterpCmd as u16), usage: "", help: "Create a child interpreter" },
+];
+
 impl Interp {
     /// Insert a `CmdEntry` into the interpreter tables.
     fn register_entry(&mut self, entry: &CmdEntry) {
@@ -227,6 +236,10 @@ impl Interp {
         }
         #[cfg(feature = "env")]
         for entry in CMD_TABLE_ENV {
+            self.register_entry(entry);
+        }
+        #[cfg(feature = "std")]
+        for entry in CMD_TABLE_EVENT {
             self.register_entry(entry);
         }
     }
@@ -343,6 +356,12 @@ impl Interp {
         }
         #[cfg(feature = "package")]
         for entry in CMD_TABLE_PKG {
+            if entry.cmd_id == Some(cmd_id) {
+                return Some(entry.func);
+            }
+        }
+        #[cfg(feature = "std")]
+        for entry in CMD_TABLE_EVENT {
             if entry.cmd_id == Some(cmd_id) {
                 return Some(entry.func);
             }

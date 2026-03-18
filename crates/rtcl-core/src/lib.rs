@@ -15,9 +15,9 @@
 //! - `embedded` - Enable embedded mode with spin locks
 //! - `debug` - Enable extra diagnostics
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(feature = "embedded", no_std)]
 
-#[cfg(feature = "alloc")]
+#[cfg(feature = "embedded")]
 extern crate alloc;
 
 // Core modules — error and value re-export from rtcl-vm
@@ -55,14 +55,14 @@ pub mod prelude {
 /// Library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[cfg(feature = "std")]
+#[cfg(not(feature = "embedded"))]
 mod platform {
     use std::collections::HashMap as Map;
     #[allow(dead_code)]
     pub type HashMap<K, V> = Map<K, V>;
 }
 
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
+#[cfg(feature = "embedded")]
 mod platform {
     use alloc::collections::BTreeMap;
     pub type HashMap<K, V> = BTreeMap<K, V>;

@@ -5,7 +5,10 @@
       "Bash(git add:*)",
       "Bash(ls:*)",
       "Bash(cargo check:*)",
-      "Bash(git restore:*)"
+      "Bash(git restore:*)",
+      "Bash(git remote add origin:*)",
+      "Bash(git push:*)",
+      "Bash(rustup target list:*)"
     ]
   }
 }

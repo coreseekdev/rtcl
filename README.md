@@ -1,13 +1,14 @@
 # rtcl - A Lightweight Tcl-Compatible Scripting Language
 
-A minimal, no-std compatible Tcl interpreter implemented in Rust.
+A minimal, cross-platform Tcl interpreter implemented in Rust.
 
 ## Features
 
 - **Lightweight**: Designed for embedded systems and resource-constrained environments
-- **No-std Compatible**: Core library works in `no_std` environments with `alloc`
+- **Cross-Platform**: Runs on native, wasm32-unknown-unknown, and wasm32-wasip1 targets
 - **Tcl Compatible**: Supports familiar Tcl syntax and commands
 - **Expect Support**: Process automation capabilities similar to classic `expect`
+- **Embedded Ready**: Optional `embedded` feature for `no_std` environments with `alloc`
 
 ## Quick Start
 
@@ -124,13 +125,44 @@ proc.send_line("mypassword")?;
 ```
 rtcl/
 ├── crates/
-│   ├── rtcl-core/      # Core interpreter (no-std compatible)
+│   ├── rtcl-core/      # Core interpreter (cross-platform, wasm/wasi compatible)
 │   ├── rtcl-cli/       # Command-line interface
 │   └── rtcl-expect/    # Expect-style process automation
 └── tasks/             # Task files for development
 ```
 
-## No-std Usage
+## Platform Support
+
+| Target | Status |
+|--------|--------|
+| Native (Linux, macOS, Windows) | ✅ Supported |
+| wasm32-unknown-unknown | ✅ Supported |
+| wasm32-wasip1 | ✅ Supported |
+
+### Usage on WebAssembly
+
+```toml
+# Cargo.toml
+[dependencies]
+rtcl-core = { version = "0.1", default-features = false }
+```
+
+```rust
+use rtcl_core::{Interp, Value};
+
+let mut interp = Interp::new();
+interp.eval("set x 42").unwrap();
+```
+
+### Embedded / No-std Usage
+
+For `no_std` environments with `alloc`:
+
+```toml
+# Cargo.toml
+[dependencies]
+rtcl-core = { version = "0.1", default-features = false, features = ["embedded"] }
+```
 
 ```rust
 #![no_std]

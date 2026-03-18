@@ -4,10 +4,10 @@ use super::{CallFrame, Interp, ProcDef};
 use crate::error::{Error, Result};
 use crate::value::Value;
 
-#[cfg(feature = "std")]
+#[cfg(not(feature = "embedded"))]
 use std::collections::HashMap;
 
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
+#[cfg(feature = "embedded")]
 use alloc::collections::BTreeMap as HashMap;
 
 impl Interp {

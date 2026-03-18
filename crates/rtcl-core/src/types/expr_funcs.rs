@@ -154,8 +154,8 @@ pub(super) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
             Ok(float_or_int(result))
         }
         "rand" => {
-            let val = ((rand_seed.wrapping_mul(6364136223846793005).wrapping_add(1)) as f64)
-                / (usize::MAX as f64);
+            let val = ((rand_seed as u64).wrapping_mul(6364136223846793005u64).wrapping_add(1) as f64)
+                / (u64::MAX as f64);
             Ok(Value::from_float(val.abs() % 1.0))
         }
         "srand" => {

@@ -25,10 +25,10 @@ use crate::command::{CommandFunc, CommandCategory, CommandMeta};
 use crate::value::Value;
 use rtcl_parser::ByteCode;
 
-#[cfg(feature = "std")]
+#[cfg(not(feature = "embedded"))]
 use std::collections::HashMap;
 
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
+#[cfg(feature = "embedded")]
 use alloc::collections::BTreeMap as HashMap;
 
 /// A procedure definition.

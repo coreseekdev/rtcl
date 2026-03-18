@@ -21,7 +21,7 @@ optional = true
 
 [features]
 default = ["rtcl_std"]
-# Rust standard library (disable for no_std targets)
+# OS-level platform features (time, hostname, channels, filesystem)
 std = []
 # Tcl standard library — all extensions combined
 rtcl_std = ["file", "io", "exec", "clock", "regexp", "env", "signal", "package"]

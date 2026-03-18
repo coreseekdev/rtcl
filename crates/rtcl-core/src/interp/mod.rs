@@ -52,6 +52,10 @@ pub(crate) enum UpvarLink {
 pub(crate) struct CallFrame {
     pub locals: HashMap<String, Value>,
     pub upvars: HashMap<String, UpvarLink>,
+    /// Commands created by `local` — deleted when this frame exits.
+    pub local_procs: Vec<String>,
+    /// Scripts registered by `defer` — executed in reverse order on frame exit.
+    pub deferred_scripts: Vec<String>,
 }
 
 /// Tcl interpreter.
@@ -86,6 +90,14 @@ pub struct Interp {
     /// Channel table (stdin/stdout/stderr + opened files/pipes).
     #[cfg(feature = "std")]
     pub channels: crate::channel::ChannelTable,
+    /// Alias definitions (name → target + prefix args).
+    pub(crate) aliases: HashMap<String, commands::introspect::AliasInfo>,
+    /// Reference table for ref/getref/setref.
+    pub(crate) references: HashMap<String, commands::introspect::RefInfo>,
+    /// Next reference ID counter.
+    pub(crate) next_ref_id: u64,
+    /// Saved command definitions for upcall support.
+    pub(crate) saved_commands: HashMap<String, commands::introspect::SavedCommand>,
 }
 
 impl Default for Interp {
@@ -118,10 +130,23 @@ impl Interp {
             script_name: String::new(),
             #[cfg(feature = "std")]
             channels: crate::channel::ChannelTable::new(),
+            aliases: HashMap::new(),
+            references: HashMap::new(),
+            next_ref_id: 0,
+            saved_commands: HashMap::new(),
         };
         interp.register_builtins();
         interp.init_special_vars();
+        interp.load_stdlib();
         interp
+    }
+
+    /// Load the Tcl-level standard library (embedded at compile time).
+    fn load_stdlib(&mut self) {
+        const STDLIB_TCL: &str = include_str!("../stdlib.tcl");
+        if let Err(e) = self.eval(STDLIB_TCL) {
+            panic!("stdlib.tcl failed to load: {e}");
+        }
     }
 
     /// Populate special global variables (`$env`, `$tcl_platform`, etc.).
@@ -280,5 +305,255 @@ mod tests {
             .unwrap();
         let result = interp.eval("tc_even 100").unwrap();
         assert_eq!(result.as_str(), "1");
+    }
+
+    // --- stdlib.tcl tests ---
+
+    #[test]
+    fn test_stdlib_throw_error() {
+        let mut interp = Interp::new();
+        let err = interp.eval("throw error {something broke}").unwrap_err();
+        assert!(err.to_string().contains("something broke"));
+    }
+
+    #[test]
+    fn test_stdlib_throw_ok() {
+        let mut interp = Interp::new();
+        let result = interp.eval("throw ok hello").unwrap();
+        assert_eq!(result.as_str(), "hello");
+    }
+
+    #[test]
+    fn test_stdlib_throw_catch() {
+        let mut interp = Interp::new();
+        let result = interp
+            .eval("catch {throw error oops} msg; set msg")
+            .unwrap();
+        assert_eq!(result.as_str(), "oops");
+    }
+
+    #[test]
+    fn test_stdlib_parray() {
+        let mut interp = Interp::new();
+        // parray writes to stdout; just verify it doesn't error
+        interp.eval("array set x {a 1 b 2 c 3}").unwrap();
+        interp.eval("parray x").unwrap();
+    }
+
+    // --- Phase 5B stdlib tests ---
+
+    #[test]
+    fn test_stdlib_function() {
+        let mut interp = Interp::new();
+        let result = interp.eval("function hello").unwrap();
+        assert_eq!(result.as_str(), "hello");
+    }
+
+    #[test]
+    fn test_stdlib_lambda() {
+        let mut interp = Interp::new();
+        let result = interp.eval(r#"
+            set f [lambda {x} { expr {$x * 2} }]
+            $f 21
+        "#).unwrap();
+        assert_eq!(result.as_str(), "42");
+    }
+
+    #[test]
+    fn test_stdlib_curry() {
+        let mut interp = Interp::new();
+        let result = interp.eval(r#"
+            set add5 [curry expr 5 +]
+            $add5 10
+        "#).unwrap();
+        assert_eq!(result.as_str(), "15");
+    }
+
+    #[test]
+    fn test_stdlib_loop() {
+        let mut interp = Interp::new();
+        interp.eval(r#"
+            set sum 0
+            loop i 1 6 {
+                incr sum $i
+            }
+        "#).unwrap();
+        let result = interp.eval("set sum").unwrap();
+        assert_eq!(result.as_str(), "15");
+    }
+
+    #[test]
+    fn test_stdlib_loop_with_step() {
+        let mut interp = Interp::new();
+        interp.eval(r#"
+            set vals {}
+            loop i 0 10 2 {
+                lappend vals $i
+            }
+        "#).unwrap();
+        let result = interp.eval("set vals").unwrap();
+        assert_eq!(result.as_str(), "0 2 4 6 8");
+    }
+
+    #[test]
+    fn test_stdlib_dict_getdef() {
+        let mut interp = Interp::new();
+        let result = interp.eval(r#"
+            set d [dict create a 1 b 2]
+            dict getdef $d c 99
+        "#).unwrap();
+        assert_eq!(result.as_str(), "99");
+    }
+
+    #[test]
+    fn test_stdlib_dict_getdef_exists() {
+        let mut interp = Interp::new();
+        let result = interp.eval(r#"
+            set d [dict create a 1 b 2]
+            dict getdef $d a 99
+        "#).unwrap();
+        assert_eq!(result.as_str(), "1");
+    }
+
+    #[test]
+    fn test_stdlib_ensemble() {
+        let mut interp = Interp::new();
+        interp.eval(r#"
+            proc {myns add} {a b} { expr {$a + $b} }
+            proc {myns mul} {a b} { expr {$a * $b} }
+            ensemble myns
+        "#).unwrap();
+        let result = interp.eval("myns add 3 4").unwrap();
+        assert_eq!(result.as_str(), "7");
+        let result = interp.eval("myns mul 3 4").unwrap();
+        assert_eq!(result.as_str(), "12");
+    }
+
+    #[test]
+    fn test_stdlib_fileevent_shim() {
+        let mut interp = Interp::new();
+        // fileevent is a shim that just tailcalls its args
+        // We just verify it doesn't error when called with a known command
+        let result = interp.eval("fileevent set x 42").unwrap();
+        assert_eq!(result.as_str(), "42");
+    }
+
+    #[test]
+    fn test_stdlib_json_encode_string() {
+        let mut interp = Interp::new();
+        let result = interp.eval(r#"json::encode "hello world""#).unwrap();
+        assert_eq!(result.as_str(), "\"hello world\"");
+    }
+
+    #[test]
+    fn test_stdlib_json_encode_num() {
+        let mut interp = Interp::new();
+        let result = interp.eval("json::encode 42 num").unwrap();
+        assert_eq!(result.as_str(), "42");
+    }
+
+    #[test]
+    fn test_stdlib_error_info() {
+        let mut interp = Interp::new();
+        let result = interp.eval(r#"errorInfo "something failed""#).unwrap();
+        assert!(result.as_str().contains("something failed"));
+    }
+
+    #[test]
+    fn test_stdlib_namespace_inscope() {
+        let mut interp = Interp::new();
+        interp.eval(r#"
+            namespace eval foo {
+                proc bar {} { return "in foo" }
+            }
+        "#).unwrap();
+        let result = interp.eval("namespace inscope foo bar").unwrap();
+        assert_eq!(result.as_str(), "in foo");
+    }
+
+    // --- Variable names with special characters ---
+
+    #[test]
+    fn test_var_braced_path_slash() {
+        let mut interp = Interp::new();
+        interp.eval(r#"set {path/file.exe} "hello""#).unwrap();
+        let result = interp.eval("set {path/file.exe}").unwrap();
+        assert_eq!(result.as_str(), "hello");
+        // Also verify ${} deref syntax in a proc
+        interp.eval("proc getit {} { global {path/file.exe}; set x ${path/file.exe} }").unwrap();
+        let result = interp.eval("getit").unwrap();
+        assert_eq!(result.as_str(), "hello");
+    }
+
+    #[test]
+    fn test_var_braced_absolute_path() {
+        let mut interp = Interp::new();
+        interp.eval(r#"set {/usr/local/bin/prog} "world""#).unwrap();
+        interp.eval("proc getit {} { global {/usr/local/bin/prog}; set x ${/usr/local/bin/prog} }").unwrap();
+        let result = interp.eval("getit").unwrap();
+        assert_eq!(result.as_str(), "world");
+    }
+
+    #[test]
+    fn test_var_braced_dots() {
+        let mut interp = Interp::new();
+        interp.eval(r#"set {config.server.host} "localhost""#).unwrap();
+        interp.eval("proc getit {} { global {config.server.host}; set x ${config.server.host} }").unwrap();
+        let result = interp.eval("getit").unwrap();
+        assert_eq!(result.as_str(), "localhost");
+    }
+
+    #[test]
+    fn test_var_bare_dot_boundary() {
+        let mut interp = Interp::new();
+        // $foo.bar should be $foo + ".bar", not variable "foo.bar"
+        interp.eval("set foo test").unwrap();
+        interp.eval("proc getit {} { global foo; set x $foo.bar }").unwrap();
+        let result = interp.eval("getit").unwrap();
+        assert_eq!(result.as_str(), "test.bar");
+    }
+
+    #[test]
+    fn test_var_braced_with_suffix() {
+        let mut interp = Interp::new();
+        interp.eval(r#"set {a.b} "test""#).unwrap();
+        interp.eval("proc getit {} { global {a.b}; set x ${a.b}.x }").unwrap();
+        let result = interp.eval("getit").unwrap();
+        assert_eq!(result.as_str(), "test.x");
+    }
+
+    #[test]
+    fn test_var_braced_in_string() {
+        let mut interp = Interp::new();
+        interp.eval(r#"set {path/file.exe} "/bin/ls""#).unwrap();
+        interp.eval(r#"proc getit {} { global {path/file.exe}; set x "exe=${path/file.exe}" }"#).unwrap();
+        let result = interp.eval("getit").unwrap();
+        assert_eq!(result.as_str(), "exe=/bin/ls");
+    }
+
+    #[test]
+    fn test_var_array_dot_slash_key() {
+        let mut interp = Interp::new();
+        interp.eval(r#"set arr(a.b/c) "value""#).unwrap();
+        let result = interp.eval("set arr(a.b/c)").unwrap();
+        assert_eq!(result.as_str(), "value");
+    }
+
+    #[test]
+    fn test_stdlib_defer() {
+        let mut interp = Interp::new();
+        interp.eval(r#"
+            set log {}
+            proc cleanup {} {
+                global log
+                defer {global log; lappend log "deferred1"}
+                defer {global log; lappend log "deferred2"}
+                lappend log "body"
+            }
+            cleanup
+        "#).unwrap();
+        let result = interp.eval("set log").unwrap();
+        // defer runs in reverse order on proc exit
+        assert_eq!(result.as_str(), "body deferred2 deferred1");
     }
 }

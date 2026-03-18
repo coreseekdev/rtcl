@@ -267,6 +267,76 @@ fn test_paren_expr_sugar_empty() {
     }
 }
 
+// --- Braced variable names with special characters ---
+
+/// `${path/file.exe}` — slashes in variable name.
+#[test]
+fn test_braced_var_with_slashes() {
+    let cmds = parse("set x ${path/file.exe}").unwrap();
+    match &cmds[0].words[2] {
+        Word::VarRef(name) => assert_eq!(name, "path/file.exe"),
+        w => panic!("expected VarRef(path/file.exe), got {:?}", w),
+    }
+}
+
+/// `${/usr/local/bin/prog}` — absolute path as variable name.
+#[test]
+fn test_braced_var_absolute_path() {
+    let cmds = parse("set x ${/usr/local/bin/prog}").unwrap();
+    match &cmds[0].words[2] {
+        Word::VarRef(name) => assert_eq!(name, "/usr/local/bin/prog"),
+        w => panic!("expected VarRef(/usr/local/bin/prog), got {:?}", w),
+    }
+}
+
+/// `${config.server.host}` — dots in variable name.
+#[test]
+fn test_braced_var_with_dots() {
+    let cmds = parse("set x ${config.server.host}").unwrap();
+    match &cmds[0].words[2] {
+        Word::VarRef(name) => assert_eq!(name, "config.server.host"),
+        w => panic!("expected VarRef(config.server.host), got {:?}", w),
+    }
+}
+
+/// `$foo.bar` — dot is NOT a varname char, so this is `$foo` + `.bar`.
+#[test]
+fn test_bare_var_dot_boundary() {
+    let cmds = parse("puts $foo.bar").unwrap();
+    // Should be a Concat of VarRef("foo") + Literal(".bar")
+    match &cmds[0].words[1] {
+        Word::Concat(parts) => {
+            match &parts[0] {
+                Word::VarRef(name) => assert_eq!(name, "foo"),
+                w => panic!("expected VarRef(foo), got {:?}", w),
+            }
+        }
+        Word::VarRef(name) => {
+            // If the parser treats the whole word as varref, it should only be "foo"
+            assert_eq!(name, "foo");
+        }
+        w => panic!("expected Concat or VarRef, got {:?}", w),
+    }
+}
+
+/// `${a.b}.x` — braced var + literal suffix.
+#[test]
+fn test_braced_var_with_suffix() {
+    let cmds = parse("puts ${a.b}.x").unwrap();
+    match &cmds[0].words[1] {
+        Word::Concat(parts) => {
+            match &parts[0] {
+                Word::VarRef(name) => assert_eq!(name, "a.b"),
+                w => panic!("expected VarRef(a.b), got {:?}", w),
+            }
+            // Rest should contain ".x"
+            let rest: String = parts[1..].iter().map(|w| format!("{}", w)).collect();
+            assert_eq!(rest, ".x");
+        }
+        w => panic!("expected Concat, got {:?}", w),
+    }
+}
+
 /// `$(` with no closing paren — orphan $.
 #[test]
 fn test_paren_expr_sugar_unclosed() {

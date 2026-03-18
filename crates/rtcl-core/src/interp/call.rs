@@ -30,6 +30,8 @@ impl Interp {
         self.frames.push(CallFrame {
             locals: HashMap::new(),
             upvars: HashMap::new(),
+            local_procs: Vec::new(),
+            deferred_scripts: Vec::new(),
         });
 
         let final_result = loop {
@@ -105,6 +107,24 @@ impl Interp {
                 other => break other,
             }
         };
+
+        // Execute deferred scripts (from `defer` command) in reverse order
+        if let Some(frame) = self.frames.last() {
+            let scripts: Vec<String> = frame.deferred_scripts.clone();
+            for script in scripts.iter().rev() {
+                let _ = self.eval(script);
+            }
+        }
+
+        // Clean up local procs (created by `local` command)
+        if let Some(frame) = self.frames.last() {
+            let procs_to_delete: Vec<String> = frame.local_procs.clone();
+            for name in &procs_to_delete {
+                self.procs.remove(name);
+                self.commands.remove(name);
+                self.aliases.remove(name);
+            }
+        }
 
         // Pop the frame
         self.frames.pop();

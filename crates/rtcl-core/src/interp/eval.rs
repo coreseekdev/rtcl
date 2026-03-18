@@ -103,7 +103,26 @@ impl Interp {
                 self.call_depth -= 1;
                 result
             }
-            None => Err(Error::invalid_command(cmd_name)),
+            None => {
+                // Try "unknown" handler (if defined as a proc or command)
+                if cmd_name != "unknown" {
+                    let has_unknown = self.procs.contains_key("unknown")
+                        || self.commands.contains_key("unknown");
+                    if has_unknown {
+                        let mut unknown_args = vec![Value::from_str("unknown")];
+                        unknown_args.extend(args.iter().cloned());
+                        // Recurse through eval_command to dispatch "unknown"
+                        let unknown_cmd = crate::parser::Command {
+                            words: unknown_args.iter().map(|v| {
+                                crate::parser::Word::Literal(v.as_str().to_string())
+                            }).collect(),
+                            line: 0,
+                        };
+                        return self.eval_command(&unknown_cmd);
+                    }
+                }
+                Err(Error::invalid_command(cmd_name))
+            }
         }
     }
 

@@ -84,6 +84,21 @@ static CMD_TABLE: &[CmdEntry] = &[
     // ── Extension commands (always available) ──────────────────────────────
     CmdEntry { name: "puts",        func: io::cmd_puts,           cat: Extension, cmd_id: Some(CmdId::Puts        as u16) },
     CmdEntry { name: "disassemble", func: misc::cmd_disassemble,  cat: Extension, cmd_id: Some(CmdId::Disassemble as u16) },
+    // ── Introspection commands ─────────────────────────────────────────────
+    CmdEntry { name: "exists",     func: introspect::cmd_exists,     cat: Language,  cmd_id: None },
+    CmdEntry { name: "alias",      func: introspect::cmd_alias,      cat: Language,  cmd_id: None },
+    CmdEntry { name: "local",      func: introspect::cmd_local,      cat: Language,  cmd_id: None },
+    CmdEntry { name: "upcall",     func: introspect::cmd_upcall,     cat: Language,  cmd_id: None },
+    CmdEntry { name: "unknown",    func: introspect::cmd_unknown,    cat: Language,  cmd_id: None },
+    CmdEntry { name: "defer",      func: introspect::cmd_defer,      cat: Language,  cmd_id: None },
+    CmdEntry { name: "ref",        func: introspect::cmd_ref,        cat: Language,  cmd_id: None },
+    CmdEntry { name: "getref",     func: introspect::cmd_getref,     cat: Language,  cmd_id: None },
+    CmdEntry { name: "setref",     func: introspect::cmd_setref,     cat: Language,  cmd_id: None },
+    CmdEntry { name: "collect",    func: introspect::cmd_collect,    cat: Language,  cmd_id: None },
+    CmdEntry { name: "finalize",   func: introspect::cmd_finalize,   cat: Language,  cmd_id: None },
+    CmdEntry { name: "stacktrace", func: introspect::cmd_stacktrace, cat: Language,  cmd_id: None },
+    CmdEntry { name: "pack",       func: introspect::cmd_pack,       cat: Standard,  cmd_id: None },
+    CmdEntry { name: "unpack",     func: introspect::cmd_unpack,     cat: Standard,  cmd_id: None },
 ];
 
 /// Extension commands gated behind `feature = "std"`.
@@ -105,6 +120,12 @@ static CMD_TABLE_STD: &[CmdEntry] = &[
     CmdEntry { name: "fconfigure", func: chan_io::cmd_fconfigure, cat: Extension, cmd_id: Some(CmdId::Fconfigure as u16) },
     CmdEntry { name: "pid",    func: chan_io::cmd_pid,           cat: Extension, cmd_id: Some(CmdId::Pid    as u16) },
     CmdEntry { name: "exec",   func: exec_cmd::cmd_exec,        cat: Extension, cmd_id: Some(CmdId::Exec   as u16) },
+    CmdEntry { name: "cd",     func: os::cmd_cd,                cat: Extension, cmd_id: None },
+    CmdEntry { name: "pwd",    func: os::cmd_pwd,               cat: Extension, cmd_id: None },
+    CmdEntry { name: "sleep",  func: os::cmd_sleep,             cat: Extension, cmd_id: None },
+    CmdEntry { name: "readdir", func: os::cmd_readdir,          cat: Extension, cmd_id: None },
+    CmdEntry { name: "kill",   func: os::cmd_kill,              cat: Extension, cmd_id: None },
+    CmdEntry { name: "wait",   func: os::cmd_wait,              cat: Extension, cmd_id: None },
 ];
 
 impl Interp {

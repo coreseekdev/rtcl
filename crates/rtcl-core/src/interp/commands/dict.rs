@@ -451,10 +451,20 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let entries = parse_dict(dict_str)?;
             Ok(Value::from_str(&format!("{} entries in dict", entries.len())))
         }
-        _ => Err(Error::runtime(
-            format!("unknown dict subcommand: {}", subcmd),
-            crate::error::ErrorCode::InvalidOp,
-        )),
+        _ => {
+            // Fallback: check for a proc named "dict $subcmd" (jimtcl pattern)
+            let multi_name = format!("dict {}", subcmd);
+            if let Some(proc_def) = interp.procs.get(&multi_name).cloned() {
+                // Build args: ["dict subcmd", original_args_after_subcmd...]
+                let mut new_args = vec![Value::from_str(&multi_name)];
+                new_args.extend_from_slice(&args[2..]);
+                return interp.call_proc(&proc_def, &new_args);
+            }
+            Err(Error::runtime(
+                format!("unknown dict subcommand: {}", subcmd),
+                crate::error::ErrorCode::InvalidOp,
+            ))
+        }
     }
 }
 

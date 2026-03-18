@@ -5,6 +5,14 @@ use crate::interp::Interp;
 use crate::value::Value;
 use rtcl_parser::Compiler;
 
+/// Get the hostname (cross-platform via environment variables).
+#[cfg(feature = "std")]
+fn hostname_get() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "localhost".to_string())
+}
+
 pub fn cmd_set(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     match args.len() {
         2 => interp.get_var(args[1].as_str()).cloned(),
@@ -198,6 +206,99 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         #[cfg(feature = "std")]
         "script" => Ok(Value::from_str(interp.script_name())),
+        "locals" => {
+            let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
+            if let Some(frame) = interp.frames.last() {
+                let mut vars: Vec<Value> = frame.locals.keys()
+                    .filter(|name| {
+                        pattern.map(|p| super::super::glob_match(p, name)).unwrap_or(true)
+                    })
+                    .map(|name| Value::from_str(name))
+                    .collect();
+                vars.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                Ok(Value::from_list(&vars))
+            } else {
+                Ok(Value::from_str(""))
+            }
+        }
+        #[cfg(feature = "std")]
+        "channels" => {
+            let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
+            let mut chans: Vec<Value> = interp.channels.channel_names()
+                .into_iter()
+                .filter(|name| {
+                    pattern.map(|p| super::super::glob_match(p, name)).unwrap_or(true)
+                })
+                .map(Value::from_str)
+                .collect();
+            chans.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            Ok(Value::from_list(&chans))
+        }
+        "version" => Ok(Value::from_str("8.6")),
+        "patchlevel" => Ok(Value::from_str("8.6.0-rtcl")),
+        "hostname" => {
+            #[cfg(feature = "std")]
+            {
+                let name = hostname_get();
+                Ok(Value::from_str(&name))
+            }
+            #[cfg(not(feature = "std"))]
+            Ok(Value::from_str("localhost"))
+        }
+        "nameofexecutable" => {
+            #[cfg(feature = "std")]
+            {
+                let exe = std::env::current_exe()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                Ok(Value::from_str(&exe))
+            }
+            #[cfg(not(feature = "std"))]
+            Ok(Value::from_str(""))
+        }
+        "returncodes" => {
+            if args.len() == 3 {
+                // info returncodes code → name
+                let code = args[2].as_int().unwrap_or(-1);
+                let name = match code {
+                    0 => "ok",
+                    1 => "error",
+                    2 => "return",
+                    3 => "break",
+                    4 => "continue",
+                    _ => "unknown",
+                };
+                Ok(Value::from_str(name))
+            } else {
+                // info returncodes → list
+                Ok(Value::from_str("ok error return break continue"))
+            }
+        }
+        "alias" => {
+            if args.len() != 3 {
+                return Err(Error::wrong_args("info alias", 3, args.len()));
+            }
+            let name = args[2].as_str();
+            if let Some(info) = interp.aliases.get(name) {
+                let mut parts = vec![Value::from_str(&info.target)];
+                for a in &info.prefix_args {
+                    parts.push(Value::from_str(a));
+                }
+                Ok(Value::from_list(&parts))
+            } else {
+                Err(Error::runtime(
+                    format!("\"{}\" is not an alias", name),
+                    crate::error::ErrorCode::NotFound,
+                ))
+            }
+        }
+        "aliases" => {
+            let mut names: Vec<Value> = interp.aliases.keys()
+                .map(|name| Value::from_str(name))
+                .collect();
+            names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            Ok(Value::from_list(&names))
+        }
         _ => Err(Error::runtime(
             format!("unknown info subcommand: {}", subcmd),
             crate::error::ErrorCode::InvalidOp,

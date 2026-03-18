@@ -17,3 +17,6 @@ pub mod chan_io;
 #[cfg(feature = "std")]
 pub mod exec_cmd;
 pub mod namespace;
+#[cfg(feature = "std")]
+pub mod os;
+pub mod introspect;

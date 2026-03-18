@@ -121,31 +121,37 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             .collect()
     };
 
+    let mut matched = false;
     for (pattern, body) in &patterns {
-        let matches = if pattern == "default" {
-            true
-        } else {
-            match mode {
-                MatchMode::Exact => string == pattern,
-                MatchMode::Glob => super::super::glob_match(pattern, string),
-                MatchMode::Regexp => {
-                    #[cfg(feature = "std")]
-                    {
-                        regex::Regex::new(pattern)
-                            .map(|re| re.is_match(string))
-                            .unwrap_or(false)
-                    }
-                    #[cfg(not(feature = "std"))]
-                    {
-                        return Err(Error::runtime(
-                            "switch -regexp requires std feature",
-                            crate::error::ErrorCode::InvalidOp,
-                        ));
+        if !matched {
+            let matches = if pattern == "default" {
+                true
+            } else {
+                match mode {
+                    MatchMode::Exact => string == pattern,
+                    MatchMode::Glob => super::super::glob_match(pattern, string),
+                    MatchMode::Regexp => {
+                        #[cfg(feature = "std")]
+                        {
+                            regex::Regex::new(pattern)
+                                .map(|re| re.is_match(string))
+                                .unwrap_or(false)
+                        }
+                        #[cfg(not(feature = "std"))]
+                        {
+                            return Err(Error::runtime(
+                                "switch -regexp requires std feature",
+                                crate::error::ErrorCode::InvalidOp,
+                            ));
+                        }
                     }
                 }
+            };
+            if matches {
+                matched = true;
             }
-        };
-        if matches {
+        }
+        if matched {
             if body == "-" { continue; }
             return interp.eval(body);
         }

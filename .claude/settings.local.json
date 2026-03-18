@@ -3,7 +3,9 @@
     "allow": [
       "Skill(commit)",
       "Bash(git add:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(cargo check:*)",
+      "Bash(git restore:*)"
     ]
   }
 }

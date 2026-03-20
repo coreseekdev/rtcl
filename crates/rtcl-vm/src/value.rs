@@ -21,6 +21,7 @@ use core::fmt;
 use core::str::FromStr;
 use std::rc::Rc;
 
+use indexmap::IndexMap;
 use smallvec::SmallVec;
 
 /// Maximum inline string length before heap allocation
@@ -40,8 +41,10 @@ pub enum InternalRep {
     Bool(bool),
     /// Cached list of values (avoids re-parsing the string)
     List(Vec<Value>),
-    /// Cached dict of key-value pairs (avoids re-parsing the string)
-    Dict(Vec<(Value, Value)>),
+    /// Cached dict — insertion-ordered map with O(1) key lookup.
+    /// Uses `String` keys (Tcl's "everything is a string" model) and
+    /// preserves insertion order (required by Tcl dict semantics).
+    Dict(IndexMap<String, Value>),
     /// No internal representation yet
     None,
 }
@@ -147,7 +150,7 @@ impl Value {
     /// Create a value directly from a cached dict.
     ///
     /// The string representation is lazily generated on first `as_str()`.
-    pub fn from_dict_cached(entries: Vec<(Value, Value)>) -> Self {
+    pub fn from_dict_cached(entries: IndexMap<String, Value>) -> Self {
         Value {
             inner: Rc::new(ValueInner {
                 string: None,
@@ -156,13 +159,16 @@ impl Value {
         }
     }
 
-    /// Create a value from dict entries (serializes to string eagerly).
-    pub fn from_dict(entries: &[(Value, Value)]) -> Self {
-        let s = serialize_dict(entries);
+    /// Create a dict value from key-value pairs.
+    pub fn from_dict_pairs(pairs: &[(Value, Value)]) -> Self {
+        let mut map = IndexMap::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            map.insert(k.as_str().to_string(), v.clone());
+        }
         Value {
             inner: Rc::new(ValueInner {
-                string: Some(SmallVec::from_slice(s.as_bytes())),
-                rep: InternalRep::Dict(entries.to_vec()),
+                string: None,
+                rep: InternalRep::Dict(map),
             }),
         }
     }
@@ -206,7 +212,7 @@ impl Value {
         if self.inner.string.is_none() {
             let s = match &self.inner.rep {
                 InternalRep::List(items) => serialize_list(items),
-                InternalRep::Dict(entries) => serialize_dict(entries),
+                InternalRep::Dict(map) => serialize_dict(map),
                 InternalRep::Int(n) => format_int(*n),
                 InternalRep::Float(n) => format_float(*n),
                 InternalRep::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
@@ -229,7 +235,7 @@ impl Value {
         } else {
             let s = match &self.inner.rep {
                 InternalRep::List(items) => serialize_list(items),
-                InternalRep::Dict(entries) => serialize_dict(entries),
+                InternalRep::Dict(map) => serialize_dict(map),
                 InternalRep::Int(n) => format_int(*n),
                 InternalRep::Float(n) => format_float(*n),
                 InternalRep::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
@@ -297,8 +303,8 @@ impl Value {
     pub fn as_list(&self) -> Option<Vec<Value>> {
         match &self.inner.rep {
             InternalRep::List(items) => Some(items.clone()),
-            InternalRep::Dict(entries) => {
-                Some(entries.iter().flat_map(|(k, v)| [k.clone(), v.clone()]).collect())
+            InternalRep::Dict(map) => {
+                Some(map.iter().flat_map(|(k, v)| [Value::from_str(k), v.clone()]).collect())
             }
             _ => {
                 let s = self.to_str();
@@ -311,18 +317,50 @@ impl Value {
     ///
     /// Returns cached pairs when the internal rep is already `Dict`,
     /// otherwise parses from the string/list representation.
-    pub fn as_dict(&self) -> Option<Vec<(Value, Value)>> {
+    /// Get a reference to the dict's IndexMap if the internal rep is Dict.
+    /// Zero-copy — does not clone.
+    pub fn as_dict_ref(&self) -> Option<&IndexMap<String, Value>> {
         match &self.inner.rep {
-            InternalRep::Dict(entries) => Some(entries.clone()),
+            InternalRep::Dict(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    /// Get a mutable reference to the dict's IndexMap (COW).
+    pub fn as_dict_mut(&mut self) -> Option<&mut IndexMap<String, Value>> {
+        // Only if already a Dict
+        if !matches!(&self.inner.rep, InternalRep::Dict(_)) {
+            return None;
+        }
+        let inner = Rc::make_mut(&mut self.inner);
+        inner.string = None; // invalidate string
+        match &mut inner.rep {
+            InternalRep::Dict(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    /// Parse or return a dict as an owned IndexMap.
+    pub fn as_dict(&self) -> Option<IndexMap<String, Value>> {
+        match &self.inner.rep {
+            InternalRep::Dict(map) => Some(map.clone()),
             InternalRep::List(items) => {
                 if items.len() % 2 != 0 { return None; }
-                Some(items.chunks(2).map(|c| (c[0].clone(), c[1].clone())).collect())
+                let mut map = IndexMap::with_capacity(items.len() / 2);
+                for c in items.chunks(2) {
+                    map.insert(c[0].as_str().to_string(), c[1].clone());
+                }
+                Some(map)
             }
             _ => {
                 let s = self.to_str();
                 let list = parse_list(&s)?;
                 if list.len() % 2 != 0 { return None; }
-                Some(list.chunks(2).map(|c| (c[0].clone(), c[1].clone())).collect())
+                let mut map = IndexMap::with_capacity(list.len() / 2);
+                for c in list.chunks(2) {
+                    map.insert(c[0].as_str().to_string(), c[1].clone());
+                }
+                Some(map)
             }
         }
     }
@@ -334,7 +372,7 @@ impl Value {
         } else {
             match &self.inner.rep {
                 InternalRep::List(items) => items.is_empty(),
-                InternalRep::Dict(entries) => entries.is_empty(),
+                InternalRep::Dict(map) => map.is_empty(),
                 InternalRep::None => true,
                 _ => false,
             }
@@ -436,10 +474,10 @@ impl From<f64> for Value {
 }
 
 /// Serialize dict entries into a Tcl list string (key1 val1 key2 val2 ...).
-fn serialize_dict(entries: &[(Value, Value)]) -> String {
-    let items: Vec<Value> = entries
+fn serialize_dict(map: &IndexMap<String, Value>) -> String {
+    let items: Vec<Value> = map
         .iter()
-        .flat_map(|(k, v)| [k.clone(), v.clone()])
+        .flat_map(|(k, v)| [Value::from_str(k), v.clone()])
         .collect();
     serialize_list(&items)
 }

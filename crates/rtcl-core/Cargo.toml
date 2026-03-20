@@ -10,6 +10,7 @@ categories = ["parser-implementations", "embedded", "command-line-interface"]
 [dependencies]
 rtcl-parser.workspace = true
 rtcl-vm.workspace = true
+indexmap.workspace = true
 
 [dependencies.regex]
 workspace = true

@@ -10,3 +10,4 @@ categories = ["parser-implementations"]
 [dependencies]
 rtcl-ir.workspace = true
 smallvec.workspace = true
+indexmap.workspace = true

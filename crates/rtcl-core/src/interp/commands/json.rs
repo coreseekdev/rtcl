@@ -63,7 +63,7 @@ pub fn cmd_json_decode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::runtime("empty JSON string", ErrorCode::InvalidOp));
     }
 
-    let mut parser = JsonParser::new(json_str);
+    let mut parser = JsonParser::new(json_str, schema_mode);
     let (value, schema) = parser.parse_root(&null_value, index_mode)?;
 
     if schema_mode {
@@ -82,12 +82,12 @@ pub fn cmd_json_encode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let value = &args[start];
     let schema_str = if args.len() > start + 1 {
-        args[start + 1].as_str().to_string()
+        args[start + 1].as_str()
     } else {
-        "str".to_string()
+        "str"
     };
 
-    let schema = parse_schema(&schema_str);
+    let schema = parse_schema(schema_str);
     let mut buf = String::new();
     encode_value(value, &schema, &mut buf)?;
     Ok(Value::from_str(&buf))
@@ -100,11 +100,18 @@ pub fn cmd_json_encode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 struct JsonParser<'a> {
     input: &'a [u8],
     pos: usize,
+    build_schema: bool,
 }
 
 impl<'a> JsonParser<'a> {
-    fn new(s: &'a str) -> Self {
-        JsonParser { input: s.as_bytes(), pos: 0 }
+    fn new(s: &'a str, build_schema: bool) -> Self {
+        JsonParser { input: s.as_bytes(), pos: 0, build_schema }
+    }
+
+    /// Return a schema string only when schema mode is active; empty otherwise.
+    #[inline]
+    fn schema(&self, s: &str) -> String {
+        if self.build_schema { s.to_string() } else { String::new() }
     }
 
     fn skip_ws(&mut self) {
@@ -139,7 +146,7 @@ impl<'a> JsonParser<'a> {
             Some(b'[') => self.parse_array(null_val, index_mode),
             Some(b'"') => {
                 let s = self.parse_string()?;
-                Ok((Value::from_str(&s), "str".to_string()))
+                Ok((Value::from_str(&s), self.schema("str")))
             }
             Some(b't') => self.parse_literal("true", "true", "bool"),
             Some(b'f') => self.parse_literal("false", "false", "bool"),
@@ -165,12 +172,12 @@ impl<'a> JsonParser<'a> {
     fn parse_object(&mut self, null_val: &str, index_mode: bool) -> Result<(Value, String)> {
         self.expect(b'{')?;
         let mut entries = DictMap::ordered();
-        let mut schema_parts: Vec<String> = Vec::new();
+        let mut schema_parts: Vec<String> = if self.build_schema { Vec::new() } else { Vec::new() };
 
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
-            return Ok((Value::from_dict_cached(entries), "obj".to_string()));
+            return Ok((Value::from_dict_cached(entries), self.schema("obj")));
         }
 
         loop {
@@ -179,9 +186,11 @@ impl<'a> JsonParser<'a> {
             self.skip_ws();
             self.expect(b':')?;
             let (val, val_schema) = self.parse_value(null_val, index_mode)?;
-            entries.insert(key.clone(), val);
-            schema_parts.push(key);
-            schema_parts.push(val_schema);
+            if self.build_schema {
+                schema_parts.push(key.clone());
+                schema_parts.push(val_schema);
+            }
+            entries.insert(key, val);
 
             self.skip_ws();
             match self.peek() {
@@ -192,7 +201,9 @@ impl<'a> JsonParser<'a> {
             }
         }
 
-        let schema = if schema_parts.is_empty() {
+        let schema = if !self.build_schema {
+            String::new()
+        } else if schema_parts.is_empty() {
             "obj".to_string()
         } else {
             let mut s = String::from("obj");
@@ -215,22 +226,24 @@ impl<'a> JsonParser<'a> {
     fn parse_array(&mut self, null_val: &str, index_mode: bool) -> Result<(Value, String)> {
         self.expect(b'[')?;
         let mut items: Vec<Value> = Vec::new();
-        let mut schemas: Vec<String> = Vec::new();
+        let mut schemas: Vec<String> = if self.build_schema { Vec::new() } else { Vec::new() };
 
         self.skip_ws();
         if self.peek() == Some(b']') {
             self.pos += 1;
             return if index_mode {
-                Ok((Value::from_dict_cached(DictMap::ordered()), "list".to_string()))
+                Ok((Value::from_dict_cached(DictMap::ordered()), self.schema("list")))
             } else {
-                Ok((Value::from_list_cached(vec![]), "list".to_string()))
+                Ok((Value::from_list_cached(vec![]), self.schema("list")))
             };
         }
 
         loop {
             let (val, val_schema) = self.parse_value(null_val, index_mode)?;
             items.push(val);
-            schemas.push(val_schema);
+            if self.build_schema {
+                schemas.push(val_schema);
+            }
 
             self.skip_ws();
             match self.peek() {
@@ -241,8 +254,10 @@ impl<'a> JsonParser<'a> {
             }
         }
 
-        // Determine schema
-        let schema = if schemas.is_empty() {
+        // Determine schema (only when requested)
+        let schema = if !self.build_schema {
+            String::new()
+        } else if schemas.is_empty() {
             "list".to_string()
         } else {
             let first = &schemas[0];
@@ -252,7 +267,6 @@ impl<'a> JsonParser<'a> {
             {
                 format!("list {}", first)
             } else {
-                // Mixed
                 let mut s = String::from("mixed");
                 for sch in &schemas {
                     s.push(' ');
@@ -269,7 +283,6 @@ impl<'a> JsonParser<'a> {
         };
 
         if index_mode {
-            // Convert array to dict with integer keys
             let mut dict = DictMap::ordered_with_capacity(items.len());
             for (idx, val) in items.into_iter().enumerate() {
                 dict.insert(idx.to_string(), val);
@@ -319,17 +332,36 @@ impl<'a> JsonParser<'a> {
                                 {
                                     self.pos += 2;
                                     let low = self.parse_hex4()?;
-                                    if (0xDC00..=0xDFFF).contains(&low) {
-                                        let combined = 0x10000
-                                            + ((cp as u32 - 0xD800) << 10)
-                                            + (low as u32 - 0xDC00);
-                                        if let Some(c) = char::from_u32(combined) {
-                                            s.push(c);
-                                        }
+                                    if !(0xDC00..=0xDFFF).contains(&low) {
+                                        return Err(Error::runtime(
+                                            format!("invalid surrogate pair: \\u{:04X}\\u{:04X}", cp, low),
+                                            ErrorCode::InvalidOp));
                                     }
+                                    let combined = 0x10000
+                                        + ((cp as u32 - 0xD800) << 10)
+                                        + (low as u32 - 0xDC00);
+                                    match char::from_u32(combined) {
+                                        Some(c) => s.push(c),
+                                        None => return Err(Error::runtime(
+                                            format!("invalid unicode codepoint U+{:X}", combined),
+                                            ErrorCode::InvalidOp)),
+                                    }
+                                } else {
+                                    return Err(Error::runtime(
+                                        format!("lone high surrogate \\u{:04X}", cp),
+                                        ErrorCode::InvalidOp));
                                 }
-                            } else if let Some(c) = char::from_u32(cp as u32) {
-                                s.push(c);
+                            } else if (0xDC00..=0xDFFF).contains(&cp) {
+                                return Err(Error::runtime(
+                                    format!("lone low surrogate \\u{:04X}", cp),
+                                    ErrorCode::InvalidOp));
+                            } else {
+                                match char::from_u32(cp as u32) {
+                                    Some(c) => s.push(c),
+                                    None => return Err(Error::runtime(
+                                        format!("invalid unicode codepoint U+{:04X}", cp),
+                                        ErrorCode::InvalidOp)),
+                                }
                             }
                             continue; // Don't advance pos again
                         }
@@ -338,9 +370,23 @@ impl<'a> JsonParser<'a> {
                     self.pos += 1;
                 }
                 _ => {
-                    // UTF-8 passthrough
-                    s.push(b as char);
-                    self.pos += 1;
+                    // UTF-8 passthrough — handle multi-byte sequences correctly
+                    if b < 0x80 {
+                        s.push(b as char);
+                        self.pos += 1;
+                    } else {
+                        let seq_len = if b & 0xE0 == 0xC0 { 2 }
+                            else if b & 0xF0 == 0xE0 { 3 }
+                            else if b & 0xF8 == 0xF0 { 4 }
+                            else { 1 };
+                        let end = (self.pos + seq_len).min(self.input.len());
+                        match std::str::from_utf8(&self.input[self.pos..end]) {
+                            Ok(ch) => s.push_str(ch),
+                            Err(_) => return Err(Error::runtime(
+                                "invalid UTF-8 in JSON string", ErrorCode::InvalidOp)),
+                        }
+                        self.pos = end;
+                    }
                 }
             }
         }
@@ -402,7 +448,7 @@ impl<'a> JsonParser<'a> {
             .map_err(|_| Error::runtime("invalid JSON number", ErrorCode::InvalidOp))?;
 
         // Preserve original representation (jimtcl compat)
-        Ok((Value::from_str(num_str), "num".to_string()))
+        Ok((Value::from_str(num_str), self.schema("num")))
     }
 
     fn parse_literal(&mut self, expected: &str, tcl_value: &str, schema: &str) -> Result<(Value, String)> {
@@ -413,7 +459,7 @@ impl<'a> JsonParser<'a> {
             return Err(Error::runtime("invalid JSON string", ErrorCode::InvalidOp));
         }
         self.pos += eb.len();
-        Ok((Value::from_str(tcl_value), schema.to_string()))
+        Ok((Value::from_str(tcl_value), self.schema(schema)))
     }
 
     fn expect(&mut self, byte: u8) -> Result<()> {
@@ -537,14 +583,13 @@ fn split_tcl_words(s: &str) -> Vec<String> {
 
 fn encode_value(value: &Value, schema: &Schema, buf: &mut String) -> Result<()> {
     match schema {
-        Schema::Str => encode_string(value.as_str(), buf),
-        Schema::Num => encode_num(value.as_str(), buf),
-        Schema::Bool => encode_bool(value, buf),
+        Schema::Str => { encode_string(value.as_str(), buf); Ok(()) }
+        Schema::Num => { encode_num(value.as_str(), buf); Ok(()) }
+        Schema::Bool => { encode_bool(value, buf); Ok(()) }
         Schema::Obj(fields) => encode_object(value, fields, buf),
         Schema::List(elem_schema) => encode_list(value, elem_schema, buf),
         Schema::Mixed(schemas) => encode_mixed(value, schemas, buf),
     }
-    Ok(())
 }
 
 fn encode_string(s: &str, buf: &mut String) {
@@ -586,26 +631,26 @@ fn encode_bool(value: &Value, buf: &mut String) {
     }
 }
 
-fn encode_object(value: &Value, fields: &[(String, Schema)], buf: &mut String) {
-    let items = value.as_list().unwrap_or_default();
-    // Parse as dict pairs
-    let mut dict = DictMap::ordered();
-    for chunk in items.chunks(2) {
-        if chunk.len() == 2 {
-            dict.insert(chunk[0].as_str().to_string(), chunk[1].clone());
+fn encode_object(value: &Value, fields: &[(String, Schema)], buf: &mut String) -> Result<()> {
+    // Try as_dict first (zero-copy if internal rep is already Dict)
+    let dict = match value.as_dict() {
+        Some(d) => d,
+        None => {
+            // Fallback: parse as list of key-value pairs
+            let items = value.as_list().unwrap_or_default();
+            let mut d = DictMap::ordered_with_capacity(items.len() / 2);
+            for chunk in items.chunks(2) {
+                if chunk.len() == 2 {
+                    d.insert(chunk[0].as_str().to_string(), chunk[1].clone());
+                }
+            }
+            d
         }
-    }
+    };
 
-    // Also try as_dict directly
-    if dict.is_empty() {
-        if let Some(d) = value.as_dict() {
-            dict = d;
-        }
-    }
-
-    // Sort keys alphabetically (jimtcl compat)
-    let mut sorted_keys: Vec<String> = dict.keys().map(|k| k.clone()).collect();
-    sorted_keys.sort();
+    // Sort keys alphabetically for deterministic output
+    let mut sorted_keys: Vec<&String> = dict.keys().collect();
+    sorted_keys.sort_unstable();
 
     // Build field lookup for named schemas
     let mut field_map = std::collections::HashMap::new();
@@ -630,31 +675,34 @@ fn encode_object(value: &Value, fields: &[(String, Schema)], buf: &mut String) {
                 .copied()
                 .or(wildcard_schema)
                 .unwrap_or(&Schema::Str);
-            let _ = encode_value(val, schema, buf);
+            encode_value(val, schema, buf)?;
         }
     }
     buf.push('}');
+    Ok(())
 }
 
-fn encode_list(value: &Value, elem_schema: &Schema, buf: &mut String) {
+fn encode_list(value: &Value, elem_schema: &Schema, buf: &mut String) -> Result<()> {
     let items = value.as_list().unwrap_or_default();
     buf.push('[');
     for (i, item) in items.iter().enumerate() {
         if i > 0 { buf.push_str(", "); }
-        let _ = encode_value(item, elem_schema, buf);
+        encode_value(item, elem_schema, buf)?;
     }
     buf.push(']');
+    Ok(())
 }
 
-fn encode_mixed(value: &Value, schemas: &[Schema], buf: &mut String) {
+fn encode_mixed(value: &Value, schemas: &[Schema], buf: &mut String) -> Result<()> {
     let items = value.as_list().unwrap_or_default();
     buf.push('[');
     for (i, item) in items.iter().enumerate() {
         if i > 0 { buf.push_str(", "); }
         let schema = schemas.get(i).unwrap_or(&Schema::Str);
-        let _ = encode_value(item, schema, buf);
+        encode_value(item, schema, buf)?;
     }
     buf.push(']');
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1012,6 +1060,26 @@ mod tests {
         let r = decode(&mut interp, r#"{"emoji":"\uD83D\uDE00"}"#).unwrap();
         interp.set_var("d", r).unwrap();
         assert_eq!(interp.eval("dict get $d emoji").unwrap().as_str(), "😀");
+    }
+
+    #[test]
+    fn test_decode_lone_surrogate_error() {
+        let mut interp = Interp::new();
+        // Lone high surrogate without low pair
+        assert!(decode(&mut interp, r#"{"x":"\uD83D"}"#).is_err());
+        // Lone low surrogate
+        assert!(decode(&mut interp, r#"{"x":"\uDE00"}"#).is_err());
+        // High surrogate followed by non-surrogate
+        assert!(decode(&mut interp, r#"{"x":"\uD83D\u0041"}"#).is_err());
+    }
+
+    #[test]
+    fn test_decode_utf8_multibyte() {
+        let mut interp = Interp::new();
+        // CJK characters directly embedded in JSON (multi-byte UTF-8)
+        let r = decode(&mut interp, r#"{"name":"你好世界"}"#).unwrap();
+        interp.set_var("d", r).unwrap();
+        assert_eq!(interp.eval("dict get $d name").unwrap().as_str(), "你好世界");
     }
 
     // ── Complex nested structure ───────────────────────────────

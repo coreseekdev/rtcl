@@ -3,6 +3,8 @@
 use core::fmt;
 use core::result;
 
+use crate::value::Value;
+
 /// Result type alias for rtcl operations
 pub type Result<T> = result::Result<T, Error>;
 
@@ -52,7 +54,7 @@ pub enum Error {
     /// Control flow (return, break, continue)
     ControlFlow {
         kind: ControlFlow,
-        value: Option<String>,
+        value: Option<Value>,
         /// Tcl return code: 0=ok, 1=error, 2=return, 3=break, 4=continue
         level: i32,
         /// Optional `-errorinfo` string (for stack trace).
@@ -161,7 +163,7 @@ impl Error {
     }
 
     /// Create a return control flow
-    pub fn ret(value: Option<String>) -> Self {
+    pub fn ret(value: Option<Value>) -> Self {
         Error::ControlFlow {
             kind: ControlFlow::Return,
             value,
@@ -173,7 +175,7 @@ impl Error {
 
     /// Create a return with explicit code (for `return -code`)
     /// Always uses Return kind so proc boundary catches it, but level carries the target code.
-    pub fn return_with_code(code: i32, value: Option<String>) -> Self {
+    pub fn return_with_code(code: i32, value: Option<Value>) -> Self {
         Error::ControlFlow {
             kind: ControlFlow::Return,
             value,
@@ -186,7 +188,7 @@ impl Error {
     /// Create a return with full options (for `return -code -errorinfo -errorcode`).
     pub fn return_with_options(
         code: i32,
-        value: Option<String>,
+        value: Option<Value>,
         error_info: Option<String>,
         error_code: Option<String>,
     ) -> Self {
@@ -247,7 +249,7 @@ impl Error {
     pub fn exit(code: Option<i32>) -> Self {
         Error::ControlFlow {
             kind: ControlFlow::Exit,
-            value: code.map(|c| c.to_string()),
+            value: code.map(|c| Value::from_int(c as i64)),
             level: 0,
             error_info: None,
             error_code: None,
@@ -278,7 +280,7 @@ impl Error {
     pub fn error_flow(msg: String) -> Self {
         Error::ControlFlow {
             kind: ControlFlow::Error,
-            value: Some(msg),
+            value: Some(Value::from_str(&msg)),
             level: 1,
             error_info: None,
             error_code: None,
@@ -402,7 +404,7 @@ impl fmt::Display for Error {
                     ControlFlow::Exit => write!(f, "exit"),
                 }?;
                 if let Some(v) = value {
-                    write!(f, " with value: {}", v)?;
+                    write!(f, " with value: {}", v.as_str())?;
                 }
                 Ok(())
             }

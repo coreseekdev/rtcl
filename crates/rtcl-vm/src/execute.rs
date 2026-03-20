@@ -181,13 +181,13 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             // ── Return / exit ───────────────────────────────────────
             OpCode::Return => {
                 let val = stack.pop().unwrap_or_else(Value::empty);
-                return Err(Error::ret(Some(val.as_str().to_string())));
+                return Err(Error::ret(Some(val)));
             }
             OpCode::ReturnCode(code) => {
                 let val = stack.pop().unwrap_or_else(Value::empty);
                 return Err(Error::return_with_code(
                     *code,
-                    Some(val.as_str().to_string()),
+                    Some(val),
                 ));
             }
             OpCode::Exit(code) => {

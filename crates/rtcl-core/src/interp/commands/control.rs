@@ -278,7 +278,7 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     let value = if i < args.len() {
-        Some(args[i].as_str().to_string())
+        Some(args[i].clone())
     } else {
         None
     };
@@ -356,7 +356,7 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         Err(e) => {
             let code = e.return_code();
             let msg = match e {
-                Error::ControlFlow { value: Some(v), .. } => v.clone(),
+                Error::ControlFlow { value: Some(v), .. } => v.as_str().to_string(),
                 Error::ControlFlow { value: None, .. } => String::new(),
                 _ => e.to_string(),
             };

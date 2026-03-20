@@ -182,15 +182,15 @@ impl Interp {
                             if let Some(code) = error_code {
                                 self.globals.insert("errorCode".to_string(), Value::from_str(code));
                             }
-                            let val_str = value.clone().unwrap_or_default();
+                            let val = value.clone().unwrap_or_default();
                             match *level {
                                 0 => {
                                     // Plain return (level=0 means just return the value)
-                                    Ok(Value::from_str(&val_str))
+                                    Ok(val)
                                 }
                                 1 => {
                                     // return -code error "msg" → propagate as error
-                                    Err(Error::Msg(val_str))
+                                    Err(Error::Msg(val.as_str().to_string()))
                                 }
                                 3 => {
                                     // return -code break
@@ -200,7 +200,7 @@ impl Interp {
                                     // return -code continue
                                     Err(Error::cont())
                                 }
-                                _ => Ok(Value::from_str(&val_str)),
+                                _ => Ok(val),
                             }
                         }
                         _ => Ok(Value::empty()),

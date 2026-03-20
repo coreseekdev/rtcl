@@ -5,11 +5,11 @@
 //!
 //! # Memory model
 //!
-//! Values are reference-counted (`Rc<ValueInner>`) with copy-on-write
+//! Values are reference-counted (`Arc<ValueInner>`) with copy-on-write
 //! semantics, mirroring jimtcl's `refCount` / `Jim_DuplicateObj()` model.
 //!
 //! - `Value::clone()` is O(1) — simply increments the reference count.
-//! - Mutation (e.g. list append) uses `Rc::make_mut()`, which deep-copies
+//! - Mutation (e.g. list append) uses `Arc::make_mut()`, which deep-copies
 //!   only when the value is shared (`strong_count > 1`).
 //! - Structured data (lists, dicts) are cached inside `InternalRep` to
 //!   avoid repeated string parse / serialize round-trips.
@@ -19,9 +19,8 @@
 
 use core::fmt;
 use core::str::FromStr;
-use std::cell::OnceCell;
+use std::sync::{OnceLock, LazyLock, Arc};
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use indexmap::IndexMap;
 use smallvec::SmallVec;
@@ -227,16 +226,16 @@ impl<'a> Iterator for DictValues<'a> {
     }
 }
 
-/// Inner data shared via `Rc`.
+/// Inner data shared via `Arc`.
 ///
 /// Corresponds to jimtcl's `Jim_Obj` minus the free-list pointers —
 /// Rust's allocator handles recycling.
 #[derive(Debug, Clone)]
 struct ValueInner {
-    /// String representation — lazily materialized via `OnceCell`.
+    /// String representation — lazily materialized via `OnceLock`.
     /// Empty cell means it will be generated on first `as_str()` access
     /// from `rep` (like jimtcl's `bytes == NULL`).
-    string: OnceCell<SmallVec<[u8; INLINE_SIZE]>>,
+    string: OnceLock<SmallVec<[u8; INLINE_SIZE]>>,
     /// Cached typed representation.
     rep: InternalRep,
 }
@@ -247,8 +246,50 @@ struct ValueInner {
 /// Mutation triggers copy-on-write when the value is shared.
 #[derive(Debug, Clone)]
 pub struct Value {
-    inner: Rc<ValueInner>,
+    inner: Arc<ValueInner>,
 }
+
+// ── Cached singletons ──────────────────────────────────────────
+//
+// The VM's hottest paths (`PushEmpty`, `PushBool`, integer loop counters)
+// create the same values millions of times.  By caching them as process-
+// wide `Arc` singletons we eliminate per-use `Arc::new` + `OnceLock::from`
+// overhead entirely — `Value::clone()` becomes a single atomic increment.
+
+static CACHED_EMPTY: LazyLock<Arc<ValueInner>> = LazyLock::new(|| {
+    Arc::new(ValueInner {
+        string: OnceLock::from(SmallVec::new()),
+        rep: InternalRep::None,
+    })
+});
+
+static CACHED_BOOL_TRUE: LazyLock<Arc<ValueInner>> = LazyLock::new(|| {
+    Arc::new(ValueInner {
+        string: OnceLock::from(SmallVec::from_slice(b"1")),
+        rep: InternalRep::Bool(true),
+    })
+});
+
+static CACHED_BOOL_FALSE: LazyLock<Arc<ValueInner>> = LazyLock::new(|| {
+    Arc::new(ValueInner {
+        string: OnceLock::from(SmallVec::from_slice(b"0")),
+        rep: InternalRep::Bool(false),
+    })
+});
+
+/// Cached small integers [0, 256) — covers loop counters, return codes,
+/// list indices, and most Tcl numeric constants.
+const SMALL_INT_CACHE_SIZE: usize = 256;
+static CACHED_INTS: LazyLock<Vec<Arc<ValueInner>>> = LazyLock::new(|| {
+    (0..SMALL_INT_CACHE_SIZE as i64)
+        .map(|n| {
+            Arc::new(ValueInner {
+                string: OnceLock::from(SmallVec::from_slice(format_int(n).as_bytes())),
+                rep: InternalRep::Int(n),
+            })
+        })
+        .collect()
+});
 
 impl Default for Value {
     fn default() -> Self {
@@ -260,10 +301,7 @@ impl Value {
     /// Create an empty value
     pub fn empty() -> Self {
         Value {
-            inner: Rc::new(ValueInner {
-                string: OnceCell::from(SmallVec::new()),
-                rep: InternalRep::None,
-            }),
+            inner: Arc::clone(&CACHED_EMPTY),
         }
     }
 
@@ -271,8 +309,8 @@ impl Value {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         Value {
-            inner: Rc::new(ValueInner {
-                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
+            inner: Arc::new(ValueInner {
+                string: OnceLock::from(SmallVec::from_slice(s.as_bytes())),
                 rep: InternalRep::None,
             }),
         }
@@ -280,10 +318,16 @@ impl Value {
 
     /// Create a value from an integer
     pub fn from_int(n: i64) -> Self {
+        // Fast path: use cached singleton for small non-negative integers
+        if n >= 0 && (n as usize) < SMALL_INT_CACHE_SIZE {
+            return Value {
+                inner: Arc::clone(&CACHED_INTS[n as usize]),
+            };
+        }
         let s = format_int(n);
         Value {
-            inner: Rc::new(ValueInner {
-                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
+            inner: Arc::new(ValueInner {
+                string: OnceLock::from(SmallVec::from_slice(s.as_bytes())),
                 rep: InternalRep::Int(n),
             }),
         }
@@ -293,8 +337,8 @@ impl Value {
     pub fn from_float(n: f64) -> Self {
         let s = format_float(n);
         Value {
-            inner: Rc::new(ValueInner {
-                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
+            inner: Arc::new(ValueInner {
+                string: OnceLock::from(SmallVec::from_slice(s.as_bytes())),
                 rep: InternalRep::Float(n),
             }),
         }
@@ -302,12 +346,8 @@ impl Value {
 
     /// Create a value from a boolean
     pub fn from_bool(b: bool) -> Self {
-        let s = if b { "1" } else { "0" };
         Value {
-            inner: Rc::new(ValueInner {
-                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
-                rep: InternalRep::Bool(b),
-            }),
+            inner: Arc::clone(if b { &CACHED_BOOL_TRUE } else { &CACHED_BOOL_FALSE }),
         }
     }
 
@@ -318,8 +358,8 @@ impl Value {
     /// accessed structurally (e.g. `lindex`, `lappend`).
     pub fn from_list_cached(items: Vec<Value>) -> Self {
         Value {
-            inner: Rc::new(ValueInner {
-                string: OnceCell::new(), // lazy — generated on first as_str()
+            inner: Arc::new(ValueInner {
+                string: OnceLock::new(), // lazy — generated on first as_str()
                 rep: InternalRep::List(items),
             }),
         }
@@ -330,8 +370,8 @@ impl Value {
     /// The string representation is lazily generated on first `as_str()`.
     pub fn from_dict_cached(entries: DictMap) -> Self {
         Value {
-            inner: Rc::new(ValueInner {
-                string: OnceCell::new(),
+            inner: Arc::new(ValueInner {
+                string: OnceLock::new(),
                 rep: InternalRep::Dict(entries),
             }),
         }
@@ -344,8 +384,8 @@ impl Value {
             map.insert(k.as_str().to_string(), v.clone());
         }
         Value {
-            inner: Rc::new(ValueInner {
-                string: OnceCell::new(),
+            inner: Arc::new(ValueInner {
+                string: OnceLock::new(),
                 rep: InternalRep::Dict(DictMap::Ordered(map)),
             }),
         }
@@ -356,8 +396,8 @@ impl Value {
     pub fn from_list(items: &[Value]) -> Self {
         let s = serialize_list(items);
         Value {
-            inner: Rc::new(ValueInner {
-                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
+            inner: Arc::new(ValueInner {
+                string: OnceLock::from(SmallVec::from_slice(s.as_bytes())),
                 rep: InternalRep::List(items.to_vec()),
             }),
         }
@@ -368,7 +408,7 @@ impl Value {
     /// Get the string representation.
     ///
     /// If the string has not been materialized yet (lazy value), it is
-    /// auto-generated from the internal representation via `OnceCell`.
+    /// auto-generated from the internal representation via `OnceLock`.
     pub fn as_str(&self) -> &str {
         let bytes = self.inner.string.get_or_init(|| {
             match &self.inner.rep {
@@ -391,13 +431,13 @@ impl Value {
     }
 
     /// Ensure the string representation is materialized.
-    /// With `OnceCell`, `as_str()` auto-materializes, so this is now a convenience.
+    /// With `OnceLock`, `as_str()` auto-materializes, so this is now a convenience.
     pub fn ensure_string(&mut self) {
         let _ = self.as_str();
     }
 
     /// Get the string representation, materializing it if needed.
-    /// Now simply delegates to `as_str()` since `OnceCell` handles lazy init.
+    /// Now simply delegates to `as_str()` since `OnceLock` handles lazy init.
     pub fn to_str(&self) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Borrowed(self.as_str())
     }
@@ -484,8 +524,8 @@ impl Value {
         if !matches!(&self.inner.rep, InternalRep::Dict(_)) {
             return None;
         }
-        let inner = Rc::make_mut(&mut self.inner);
-        inner.string = OnceCell::new(); // invalidate string
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.string = OnceLock::new(); // invalidate string
         match &mut inner.rep {
             InternalRep::Dict(map) => Some(map),
             _ => None,
@@ -598,13 +638,44 @@ impl Value {
         self.as_bool().unwrap_or_else(|| !self.is_empty())
     }
 
+    // ── Type introspection (mirrors jimtcl's typePtr) ──────────
+
+    /// Return the name of the current internal representation type.
+    ///
+    /// Mirrors jimtcl's `typePtr->name` — answers "what type **is** this
+    /// value right now?" without triggering any conversion.
+    ///
+    /// Possible return values: `"string"`, `"int"`, `"float"`, `"bool"`,
+    /// `"list"`, `"dict"`.
+    pub fn type_name(&self) -> &'static str {
+        match &self.inner.rep {
+            InternalRep::None => "string",
+            InternalRep::Int(_) => "int",
+            InternalRep::Float(_) => "float",
+            InternalRep::Bool(_) => "bool",
+            InternalRep::List(_) => "list",
+            InternalRep::Dict(_) => "dict",
+        }
+    }
+
+    /// Borrow the list **only** if the internal rep is already `List`.
+    ///
+    /// Unlike `as_list()` this never parses a string into a list,
+    /// mirroring the semantics of `as_dict_ref()`.
+    pub fn as_list_ref(&self) -> Option<&[Value]> {
+        match &self.inner.rep {
+            InternalRep::List(items) => Some(items.as_slice()),
+            _ => None,
+        }
+    }
+
     // ── Rc / COW helpers ───────────────────────────────────────
 
     /// Returns `true` if this value is shared (reference count > 1).
     ///
     /// Equivalent to jimtcl's `Jim_IsShared()`.
     pub fn is_shared(&self) -> bool {
-        Rc::strong_count(&self.inner) > 1
+        Arc::strong_count(&self.inner) > 1
     }
 }
 

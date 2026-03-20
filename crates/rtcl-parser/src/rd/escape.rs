@@ -1,55 +1,46 @@
 //! Backslash escape processing.
 
 use super::cursor::Cursor;
+use super::token::Token;
 
 /// Process a backslash escape at the cursor. Consumes the `\` and the escape
 /// sequence, returns the substituted character.
 pub fn backslash_subst(cur: &mut Cursor) -> char {
-    debug_assert!(cur.is(b'\\'));
+    debug_assert!(cur.is(Token::Backslash));
     cur.advance(); // skip '\'
 
     match cur.peek() {
-        None => '\\',
-        Some(b'a') => { cur.advance(); '\x07' }
-        Some(b'b') => { cur.advance(); '\x08' }
-        Some(b'f') => { cur.advance(); '\x0c' }
-        Some(b'n') => { cur.advance(); '\n' }
-        Some(b'r') => { cur.advance(); '\r' }
-        Some(b't') => { cur.advance(); '\t' }
-        Some(b'v') => { cur.advance(); '\x0b' }
-        Some(b'\r') => {
-            // CRLF line continuation: \<cr><lf><whitespace> → single space
-            cur.advance(); // skip '\r'
-            if cur.is(b'\n') { cur.advance(); } // skip '\n' if present
-            while let Some(b) = cur.peek() {
-                if b == b' ' || b == b'\t' {
-                    cur.advance();
-                } else {
-                    break;
-                }
-            }
-            ' '
-        }
-        Some(b'\n') => {
-            // LF line continuation: \<newline><whitespace> → single space
+        Token::Eof => '\\',
+        Token::Other('a') => { cur.advance(); '\x07' }
+        Token::Other('b') => { cur.advance(); '\x08' }
+        Token::Other('f') => { cur.advance(); '\x0c' }
+        Token::Other('n') => { cur.advance(); '\n' }
+        Token::Other('r') => { cur.advance(); '\r' }
+        Token::Other('t') => { cur.advance(); '\t' }
+        Token::Other('v') => { cur.advance(); '\x0b' }
+        Token::Newline => {
+            // Line continuation: \<newline><whitespace> → single space
+            // The tokenizer normalizes \r\n to Newline, so we just handle Newline
             cur.advance(); // skip newline
-            while let Some(b) = cur.peek() {
-                if b == b' ' || b == b'\t' {
-                    cur.advance();
-                } else {
-                    break;
-                }
+            while cur.peek().is_line_whitespace() || cur.peek() == Token::Whitespace {
+                cur.advance();
             }
             ' '
         }
-        Some(b'x') => {
+        Token::Other('x') => {
             cur.advance(); // skip 'x'
-            let start = cur.pos;
+            let start = cur.pos();
             let mut count = 0;
             while count < 2 {
-                match cur.peek() {
-                    Some(b) if b.is_ascii_hexdigit() => { cur.advance(); count += 1; }
+                let ch = match cur.peek() {
+                    Token::Other(c) => c,
                     _ => break,
+                };
+                if ch.is_ascii_hexdigit() {
+                    cur.advance();
+                    count += 1;
+                } else {
+                    break;
                 }
             }
             if count == 0 {
@@ -59,14 +50,20 @@ pub fn backslash_subst(cur: &mut Cursor) -> char {
                 u8::from_str_radix(hex, 16).map(|v| v as char).unwrap_or('x')
             }
         }
-        Some(b'u') => {
+        Token::Other('u') => {
             cur.advance(); // skip 'u'
-            let start = cur.pos;
+            let start = cur.pos();
             let mut count = 0;
             while count < 4 {
-                match cur.peek() {
-                    Some(b) if b.is_ascii_hexdigit() => { cur.advance(); count += 1; }
+                let ch = match cur.peek() {
+                    Token::Other(c) => c,
                     _ => break,
+                };
+                if ch.is_ascii_hexdigit() {
+                    cur.advance();
+                    count += 1;
+                } else {
+                    break;
                 }
             }
             if count == 0 {
@@ -79,14 +76,20 @@ pub fn backslash_subst(cur: &mut Cursor) -> char {
                     .unwrap_or('u')
             }
         }
-        Some(b'U') => {
+        Token::Other('U') => {
             cur.advance(); // skip 'U'
-            let start = cur.pos;
+            let start = cur.pos();
             let mut count = 0;
             while count < 8 {
-                match cur.peek() {
-                    Some(b) if b.is_ascii_hexdigit() => { cur.advance(); count += 1; }
+                let ch = match cur.peek() {
+                    Token::Other(c) => c,
                     _ => break,
+                };
+                if ch.is_ascii_hexdigit() {
+                    cur.advance();
+                    count += 1;
+                } else {
+                    break;
                 }
             }
             if count == 0 {
@@ -99,20 +102,22 @@ pub fn backslash_subst(cur: &mut Cursor) -> char {
                     .unwrap_or('U')
             }
         }
-        Some(b @ b'0'..=b'7') => {
-            let _ = b;
-            let start = cur.pos;
+        Token::Other(c) if c.is_ascii_digit() && c <= '7' => {
+            let start = cur.pos();
             let mut count = 0;
             while count < 3 {
                 match cur.peek() {
-                    Some(b'0'..=b'7') => { cur.advance(); count += 1; }
+                    Token::Other(d) if d.is_ascii_digit() && d <= '7' => {
+                        cur.advance();
+                        count += 1;
+                    }
                     _ => break,
                 }
             }
             let oct = cur.slice(start);
             u8::from_str_radix(oct, 8).map(|v| v as char).unwrap_or('\0')
         }
-        Some(_) => {
+        _ => {
             // Unknown escape: return the character literally
             cur.advance_char().unwrap_or('\\')
         }

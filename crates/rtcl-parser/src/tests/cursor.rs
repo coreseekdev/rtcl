@@ -267,3 +267,148 @@ set d [expr $a + 1]
     assert_eq!(cmds[2].line, 4);
     assert_eq!(cmds[3].line, 5);
 }
+
+// --- CRLF / CR newline handling tests ---
+
+/// Full CRLF script: all separators are \r\n.
+#[test]
+fn test_crlf_full_script() {
+    let cmds = parse("set a 1\r\nset b 2\r\nset c 3\r\n").unwrap();
+    assert_eq!(cmds.len(), 3);
+    assert_eq!(cmds[0].line, 1);
+    assert_eq!(cmds[1].line, 2);
+    assert_eq!(cmds[2].line, 3);
+    match &cmds[0].words[2] {
+        Word::Literal(s) => assert_eq!(s, "1"),
+        w => panic!("expected literal, got {:?}", w),
+    }
+}
+
+/// Mixed line endings in one script: \n, \r\n, \r.
+#[test]
+fn test_mixed_line_endings() {
+    // \n separates cmd 1-2, \r\n separates cmd 2-3, \r is whitespace within cmd 3
+    let cmds = parse("set a 1\nset b 2\r\nset\rc 3").unwrap();
+    assert_eq!(cmds.len(), 3);
+    assert_eq!(cmds[0].line, 1);
+    assert_eq!(cmds[1].line, 2);
+    assert_eq!(cmds[2].line, 3);
+    // Standalone \r is whitespace, so "set\rc 3" is 3 words
+    assert_eq!(cmds[2].words.len(), 3);
+}
+
+/// Backslash-CRLF continuation between words.
+#[test]
+fn test_bsnl_crlf_between_words() {
+    let cmds = parse("set \\\r\n  x \\\r\n  1").unwrap();
+    assert_eq!(cmds[0].words.len(), 3, "should be 3 words: {:?}", cmds[0].words);
+    match &cmds[0].words[2] {
+        Word::Literal(s) => assert_eq!(s, "1"),
+        w => panic!("expected literal '1', got {:?}", w),
+    }
+}
+
+/// Comment terminated by CRLF.
+#[test]
+fn test_comment_crlf_terminated() {
+    let cmds = parse("# comment\r\nset x 1").unwrap();
+    assert_eq!(cmds.len(), 1);
+    match &cmds[0].words[0] {
+        Word::Literal(s) => assert_eq!(s, "set"),
+        w => panic!("expected 'set', got {:?}", w),
+    }
+}
+
+/// Comment with backslash-CRLF continuation.
+#[test]
+fn test_comment_bsnl_crlf_continuation() {
+    let cmds = parse("# comment \\\r\ncontinued\r\nset x 1").unwrap();
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(cmds[0].line, 3);
+}
+
+/// CRLF inside braced word preserved as literal content.
+#[test]
+fn test_crlf_in_braces() {
+    let cmds = parse("set x {line1\r\nline2}").unwrap();
+    match &cmds[0].words[2] {
+        Word::Literal(s) => {
+            // Braced content preserves raw content including \r\n
+            assert!(s.contains("\r\n"), "braced should preserve CRLF: {:?}", s);
+        }
+        w => panic!("expected literal, got {:?}", w),
+    }
+}
+
+/// CRLF inside quoted word preserved.
+#[test]
+fn test_crlf_in_quoted() {
+    let cmds = parse("set x \"line1\r\nline2\"").unwrap();
+    match &cmds[0].words[2] {
+        Word::Literal(s) => {
+            assert!(s.contains("\r\n"), "quoted should preserve CRLF: {:?}", s);
+        }
+        w => panic!("expected literal, got {:?}", w),
+    }
+}
+
+/// Backslash-CRLF in quoted word becomes space.
+#[test]
+fn test_bsnl_crlf_in_quoted() {
+    let cmds = parse("set x \"abc\\\r\n  def\"").unwrap();
+    match &cmds[0].words[2] {
+        Word::Literal(s) => assert_eq!(s, "abc def"),
+        w => panic!("expected 'abc def', got {:?}", w),
+    }
+}
+
+/// Backslash-CRLF in braced word becomes space.
+#[test]
+fn test_bsnl_crlf_in_braces() {
+    let cmds = parse("set x {abc\\\r\n  def}").unwrap();
+    match &cmds[0].words[2] {
+        Word::Literal(s) => assert_eq!(s, "abc def"),
+        w => panic!("expected 'abc def', got {:?}", w),
+    }
+}
+
+/// Standalone \r is word separator (whitespace), not command terminator.
+#[test]
+fn test_standalone_cr_not_command_end() {
+    // \r between words is whitespace — should NOT split commands
+    let cmds = parse("set\ra\r1").unwrap();
+    assert_eq!(cmds.len(), 1, "\\r should be whitespace, not newline");
+    assert_eq!(cmds[0].words.len(), 3);
+}
+
+/// Standalone \r in sequence with other whitespace.
+#[test]
+fn test_standalone_cr_mixed_whitespace() {
+    let cmds = parse("set \r \t a \r 1").unwrap();
+    assert_eq!(cmds.len(), 1);
+    assert_eq!(cmds[0].words.len(), 3);
+}
+
+/// CRLF terminates command substitution inner script.
+#[test]
+fn test_crlf_in_cmd_sub() {
+    let cmds = parse("set x [set a 1\r\nset b 2]").unwrap();
+    assert_eq!(cmds.len(), 1);
+    match &cmds[0].words[2] {
+        Word::CommandSub(s) => {
+            assert!(s.contains("\r\n"), "cmd sub should preserve raw content: {:?}", s);
+        }
+        w => panic!("expected CommandSub, got {:?}", w),
+    }
+}
+
+/// Line tracking with mixed CRLF and LF.
+#[test]
+fn test_line_tracking_mixed_crlf_lf() {
+    let cmds = parse("set a 1\r\nset b 2\nset c 3\r\nset d 4").unwrap();
+    assert_eq!(cmds.len(), 4);
+    assert_eq!(cmds[0].line, 1);
+    assert_eq!(cmds[1].line, 2);
+    assert_eq!(cmds[2].line, 3);
+    assert_eq!(cmds[3].line, 4);
+}

@@ -2,6 +2,7 @@
 
 use crate::{ParseError, ParseResult, Word};
 use super::cursor::Cursor;
+use super::token::Token;
 use super::escape::{backslash_subst, process_braced_backslash_newline};
 use super::tokens::Tokens;
 
@@ -11,15 +12,20 @@ use super::tokens::Tokens;
 
 pub fn parse_next_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word> {
     match cur.peek() {
-        Some(b'{') => {
+        Token::LeftBrace => {
             // Check for {*} expand syntax
-            if cur.rest().starts_with("{*}") {
-                let after = cur.bytes.get(cur.pos + 3).copied();
+            // We need to look at the raw string to detect "{*}"
+            let rest = cur.rest();
+            if rest.starts_with("{*}") {
+                let after = rest.get(3..).and_then(|s| s.chars().next());
                 // {*} followed by non-whitespace and not end = expand
-                if after.is_some()
-                    && !matches!(after, Some(b' ' | b'\t' | b'\n' | b'\r' | b';'))
-                    && !(bracket_term && after == Some(b']'))
-                {
+                let is_expand = match after {
+                    None => false,
+                    Some(c) => {
+                        !c.is_whitespace() && c != ';' && !(bracket_term && c == ']')
+                    }
+                };
+                if is_expand {
                     cur.advance(); // {
                     cur.advance(); // *
                     cur.advance(); // }
@@ -29,7 +35,7 @@ pub fn parse_next_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word
             }
             parse_braced_word(cur)
         }
-        Some(b'"') => parse_quoted_word(cur, bracket_term),
+        Token::DoubleQuote => parse_quoted_word(cur, bracket_term),
         _ => parse_bare_word(cur, bracket_term),
     }
 }
@@ -39,46 +45,33 @@ pub fn parse_next_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word
 // ---------------------------------------------------------------------------
 
 fn parse_braced_word(cur: &mut Cursor) -> ParseResult<Word> {
-    debug_assert!(cur.is(b'{'));
-    let err_line = cur.line;
+    debug_assert!(cur.is(Token::LeftBrace));
+    let err_line = cur.line();
     cur.advance(); // skip '{'
     let mut depth: u32 = 1;
-    let mut text = String::new();
-    let mut start = cur.pos;
+    let start = cur.pos();
 
     while !cur.at_end() {
-        match cur.peek().unwrap() {
-            b'{' => {
+        match cur.peek() {
+            Token::LeftBrace => {
                 depth += 1;
                 cur.advance();
             }
-            b'}' => {
+            Token::RightBrace => {
                 depth -= 1;
                 if depth == 0 {
-                    text.push_str(cur.slice(start));
+                    let text = cur.slice(start);
                     cur.advance(); // skip closing '}'
-                    let processed = process_braced_backslash_newline(&text);
+                    let processed = process_braced_backslash_newline(text);
                     return Ok(Word::Literal(processed));
                 }
                 cur.advance();
             }
-            b'\\' => {
-                text.push_str(cur.slice(start));
+            Token::Backslash => {
                 cur.advance(); // skip '\'
-                if let Some(ch) = cur.peek() {
-                    if ch == b'\n' {
-                        text.push('\\');
-                        text.push('\n');
-                        cur.advance();
-                    } else {
-                        text.push('\\');
-                        let c = cur.advance_char().unwrap_or('\\');
-                        text.push(c);
-                    }
-                } else {
-                    text.push('\\');
+                if !cur.at_end() {
+                    cur.advance(); // skip next token (prevents \{ or \} from affecting depth)
                 }
-                start = cur.pos;
             }
             _ => {
                 cur.advance();
@@ -90,7 +83,7 @@ fn parse_braced_word(cur: &mut Cursor) -> ParseResult<Word> {
         message: "missing close-brace".into(),
         line: err_line,
         column: 0,
-        offset: cur.pos,
+        offset: cur.pos(),
     })
 }
 
@@ -99,43 +92,43 @@ fn parse_braced_word(cur: &mut Cursor) -> ParseResult<Word> {
 // ---------------------------------------------------------------------------
 
 fn parse_quoted_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word> {
-    debug_assert!(cur.is(b'"'));
-    let err_line = cur.line;
+    debug_assert!(cur.is(Token::DoubleQuote));
+    let err_line = cur.line();
     cur.advance(); // skip opening '"'
 
     let mut tokens = Tokens::new();
-    let mut start = cur.pos;
+    let mut start = cur.pos();
 
     while !cur.at_end() {
-        match cur.peek().unwrap() {
-            b'"' => {
-                if start != cur.pos {
+        match cur.peek() {
+            Token::DoubleQuote => {
+                if cur.pos() != start {
                     tokens.push_str(cur.slice(start));
                 }
                 cur.advance(); // skip closing '"'
                 return Ok(tokens.take());
             }
-            b'[' => {
-                if start != cur.pos {
+            Token::LeftBracket => {
+                if cur.pos() != start {
                     tokens.push_str(cur.slice(start));
                 }
                 let cmd_text = parse_cmd_sub(cur, bracket_term)?;
                 tokens.push(Word::CommandSub(cmd_text));
-                start = cur.pos;
+                start = cur.pos();
             }
-            b'$' => {
-                if start != cur.pos {
+            Token::Dollar => {
+                if cur.pos() != start {
                     tokens.push_str(cur.slice(start));
                 }
                 parse_dollar(cur, &mut tokens, bracket_term)?;
-                start = cur.pos;
+                start = cur.pos();
             }
-            b'\\' => {
-                if start != cur.pos {
+            Token::Backslash => {
+                if cur.pos() != start {
                     tokens.push_str(cur.slice(start));
                 }
                 tokens.push_char(backslash_subst(cur));
-                start = cur.pos;
+                start = cur.pos();
             }
             _ => {
                 cur.advance();
@@ -147,7 +140,7 @@ fn parse_quoted_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word> 
         message: "missing \"".into(),
         line: err_line,
         column: 0,
-        offset: cur.pos,
+        offset: cur.pos(),
     })
 }
 
@@ -157,31 +150,31 @@ fn parse_quoted_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word> 
 
 fn parse_bare_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word> {
     let mut tokens = Tokens::new();
-    let mut start = cur.pos;
+    let mut start = cur.pos();
 
     while !cur.at_end_of_command(bracket_term) && !cur.next_is_line_white() {
-        match cur.peek().unwrap() {
-            b'[' => {
-                if start != cur.pos {
+        match cur.peek() {
+            Token::LeftBracket => {
+                if cur.pos() != start {
                     tokens.push_str(cur.slice(start));
                 }
                 let cmd_text = parse_cmd_sub(cur, bracket_term)?;
                 tokens.push(Word::CommandSub(cmd_text));
-                start = cur.pos;
+                start = cur.pos();
             }
-            b'$' => {
-                if start != cur.pos {
+            Token::Dollar => {
+                if cur.pos() != start {
                     tokens.push_str(cur.slice(start));
                 }
                 parse_dollar(cur, &mut tokens, bracket_term)?;
-                start = cur.pos;
+                start = cur.pos();
             }
-            b'\\' => {
-                if start != cur.pos {
+            Token::Backslash => {
+                if cur.pos() != start {
                     tokens.push_str(cur.slice(start));
                 }
                 tokens.push_char(backslash_subst(cur));
-                start = cur.pos;
+                start = cur.pos();
             }
             _ => {
                 cur.advance();
@@ -189,7 +182,7 @@ fn parse_bare_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word> {
         }
     }
 
-    if start != cur.pos {
+    if cur.pos() != start {
         tokens.push_str(cur.slice(start));
     }
 
@@ -201,71 +194,84 @@ fn parse_bare_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word> {
 // ---------------------------------------------------------------------------
 
 fn parse_dollar(cur: &mut Cursor, tokens: &mut Tokens, _bracket_term: bool) -> ParseResult<()> {
-    debug_assert!(cur.is(b'$'));
+    debug_assert!(cur.is(Token::Dollar));
     cur.advance(); // skip '$'
 
-    if cur.is(b'[') {
-        // $[...] expr sugar (jimtcl extension): evaluate content as expression
-        let cmd_text = parse_cmd_sub(cur, _bracket_term)?;
-        tokens.push(Word::ExprSugar(cmd_text));
-    } else if cur.is(b'{') {
-        // ${var_name}
-        cur.advance(); // skip '{'
-        let start = cur.pos;
-        while !cur.at_end() && !cur.is(b'}') {
-            cur.advance();
+    match cur.peek() {
+        Token::LeftBracket => {
+            // $[...] expr sugar (jimtcl extension): evaluate content as expression
+            let cmd_text = parse_cmd_sub(cur, _bracket_term)?;
+            tokens.push(Word::ExprSugar(cmd_text));
         }
-        if cur.at_end() {
-            return Err(cur.error("missing close-brace for variable name"));
-        }
-        let name = cur.slice(start).to_string();
-        cur.advance(); // skip '}'
-
-        if cur.is(b'(') {
-            if let Some(idx) = try_parse_var_index(cur) {
-                tokens.push(Word::VarRef(format!("{}({})", name, idx)));
-            } else {
-                tokens.push(Word::VarRef(name));
+        Token::LeftBrace => {
+            // ${var_name}
+            cur.advance(); // skip '{'
+            let start = cur.pos();
+            while !cur.at_end() && !cur.is(Token::RightBrace) {
+                cur.advance();
             }
-        } else {
-            tokens.push(Word::VarRef(name));
-        }
-    } else if cur.next_is_varname_start() {
-        // $name or $name(index) or $ns::name
-        let start = cur.pos;
-        loop {
-            match cur.peek() {
-                Some(b) if Cursor::is_varname_char(b) => cur.advance(),
-                Some(b':') if cur.peek_at(1) == Some(b':') => {
-                    cur.advance();
-                    cur.advance();
+            if cur.at_end() {
+                return Err(cur.error("missing close-brace for variable name"));
+            }
+            let name = cur.slice(start).to_string();
+            cur.advance(); // skip '}'
+
+            if cur.is(Token::LeftParen) {
+                if let Some(idx) = try_parse_var_index(cur) {
+                    tokens.push(Word::VarRef(format!("{}({})", name, idx)));
+                } else {
+                    tokens.push(Word::VarRef(name));
                 }
-                _ => break,
-            }
-        }
-        let name = cur.slice(start).to_string();
-
-        if cur.is(b'(') {
-            if let Some(idx) = try_parse_var_index(cur) {
-                tokens.push(Word::VarRef(format!("{}({})", name, idx)));
             } else {
                 tokens.push(Word::VarRef(name));
             }
-        } else {
-            tokens.push(Word::VarRef(name));
         }
-    } else if cur.is(b'(') {
-        // $(...) expr sugar (jimtcl default): evaluate content as expression
-        // Only when $ is NOT followed by a variable name char
-        if let Some(expr) = try_parse_expr_sugar(cur) {
-            tokens.push(Word::ExprSugar(expr));
-        } else {
-            // No closing ')' found — treat $ as orphan
-            tokens.push_char('$');
+        Token::LeftParen => {
+            // $(...) expr sugar (jimtcl default): evaluate content as expression
+            // Only when $ is NOT followed by a variable name char
+            if let Some(expr) = try_parse_expr_sugar(cur) {
+                tokens.push(Word::ExprSugar(expr));
+            } else {
+                // No closing ')' found — treat $ as orphan
+                tokens.push_char('$');
+            }
         }
-    } else {
-        // Orphan $: not followed by valid var name char
-        tokens.push_char('$');
+        t => {
+            let is_var_start = match t {
+                Token::Other(c) if c.is_ascii_alphanumeric() || c == '_' => true,
+                Token::Colon if cur.peek_at(1) == Token::Colon => true,
+                Token::Other(c) if (c as u32) >= 0x80 => true,
+                _ => false,
+            };
+            if is_var_start {
+                // $name or $name(index) or $ns::name
+                let start = cur.pos();
+                loop {
+                    match cur.peek() {
+                        Token::Other(c) if Cursor::is_varname_char(c) => cur.advance(),
+                        Token::Colon if cur.peek_at(1) == Token::Colon => {
+                            cur.advance();
+                            cur.advance();
+                        }
+                        _ => break,
+                    }
+                }
+                let name = cur.slice(start).to_string();
+
+                if cur.is(Token::LeftParen) {
+                    if let Some(idx) = try_parse_var_index(cur) {
+                        tokens.push(Word::VarRef(format!("{}({})", name, idx)));
+                    } else {
+                        tokens.push(Word::VarRef(name));
+                    }
+                } else {
+                    tokens.push(Word::VarRef(name));
+                }
+            } else {
+                // Orphan $: not followed by valid var name char
+                tokens.push_char('$');
+            }
+        }
     }
 
     Ok(())
@@ -274,20 +280,19 @@ fn parse_dollar(cur: &mut Cursor, tokens: &mut Tokens, _bracket_term: bool) -> P
 /// Try to parse `$(expr)` sugar: when `$` is followed by `(`, parse balanced
 /// parens and return the expression content. Returns `None` if no closing `)` found.
 fn try_parse_expr_sugar(cur: &mut Cursor) -> Option<String> {
-    debug_assert!(cur.is(b'('));
-    let save_pos = cur.pos;
-    let save_line = cur.line;
+    debug_assert!(cur.is(Token::LeftParen));
+    let save = cur.checkpoint();
     cur.advance(); // skip '('
-    let content_start = cur.pos;
+    let content_start = cur.pos();
     let mut depth: u32 = 1;
 
     while !cur.at_end() && depth > 0 {
-        match cur.peek().unwrap() {
-            b'(' => {
+        match cur.peek() {
+            Token::LeftParen => {
                 depth += 1;
                 cur.advance();
             }
-            b')' => {
+            Token::RightParen => {
                 depth -= 1;
                 if depth == 0 {
                     let expr = cur.slice(content_start).to_string();
@@ -296,7 +301,7 @@ fn try_parse_expr_sugar(cur: &mut Cursor) -> Option<String> {
                 }
                 cur.advance();
             }
-            b'\\' => {
+            Token::Backslash => {
                 cur.advance();
                 if !cur.at_end() {
                     cur.advance();
@@ -309,8 +314,7 @@ fn try_parse_expr_sugar(cur: &mut Cursor) -> Option<String> {
     }
 
     // No balanced close — restore cursor
-    cur.pos = save_pos;
-    cur.line = save_line;
+    cur.restore(save);
     None
 }
 
@@ -321,38 +325,35 @@ fn try_parse_expr_sugar(cur: &mut Cursor) -> Option<String> {
 /// If parens are nested but unbalanced, backtracks to after the last `)` found
 /// (jimtcl-compatible behavior).
 fn try_parse_var_index(cur: &mut Cursor) -> Option<String> {
-    debug_assert!(cur.is(b'('));
-    let save_pos = cur.pos;
-    let save_line = cur.line;
+    debug_assert!(cur.is(Token::LeftParen));
+    let save = cur.checkpoint();
     cur.advance(); // skip '('
     let mut depth: u32 = 1;
-    let content_start = cur.pos;
+    let content_start = cur.pos();
 
     // Track state right after the last ')' encountered at any depth
-    let mut last_close_end: Option<usize> = None; // position of ')'
-    let mut last_close_after_pos: Option<usize> = None;
-    let mut last_close_after_line: Option<usize> = None;
+    let mut last_close_end: Option<usize> = None;
+    let mut last_close_checkpoint: Option<super::cursor::CursorCheckpoint> = None;
 
     while !cur.at_end() && depth > 0 {
-        match cur.peek().unwrap() {
-            b'(' => {
+        match cur.peek() {
+            Token::LeftParen => {
                 depth += 1;
                 cur.advance();
             }
-            b')' => {
+            Token::RightParen => {
                 depth -= 1;
                 if depth == 0 {
                     let idx = cur.slice(content_start).to_string();
                     cur.advance(); // skip closing ')'
                     return Some(idx);
                 }
-                let close_pos = cur.pos; // position of ')'
+                let close_pos = cur.pos();
                 cur.advance(); // advance past ')'
                 last_close_end = Some(close_pos);
-                last_close_after_pos = Some(cur.pos);
-                last_close_after_line = Some(cur.line);
+                last_close_checkpoint = Some(cur.checkpoint());
             }
-            b'\\' => {
+            Token::Backslash => {
                 cur.advance(); // skip '\'
                 if !cur.at_end() {
                     cur.advance(); // skip escaped char
@@ -368,15 +369,15 @@ fn try_parse_var_index(cur: &mut Cursor) -> Option<String> {
     if let Some(close_pos) = last_close_end {
         // Found at least one ')' but nesting didn't balance.
         // Backtrack to just after the last ')' found.
-        let idx = cur.input[content_start..close_pos].to_string();
-        cur.pos = last_close_after_pos.unwrap();
-        cur.line = last_close_after_line.unwrap();
+        let idx = cur.slice_range(content_start, close_pos).to_string();
+        if let Some(cp) = last_close_checkpoint {
+            cur.restore(cp);
+        }
         return Some(idx);
     }
 
     // No ')' found at all — not an array index. Restore cursor.
-    cur.pos = save_pos;
-    cur.line = save_line;
+    cur.restore(save);
     None
 }
 
@@ -389,21 +390,21 @@ fn try_parse_var_index(cur: &mut Cursor) -> Option<String> {
 /// Uses jimtcl-style `startofword` tracking so that `"` and `{` only
 /// trigger sub-parsing when they appear at word boundaries.
 pub fn parse_cmd_sub(cur: &mut Cursor, _bracket_term: bool) -> ParseResult<String> {
-    debug_assert!(cur.is(b'['));
-    let err_line = cur.line;
+    debug_assert!(cur.is(Token::LeftBracket));
+    let err_line = cur.line();
     cur.advance(); // skip '['
-    let start = cur.pos;
+    let start = cur.pos();
     let mut depth: u32 = 1;
     let mut startofword = true;
 
     while !cur.at_end() && depth > 0 {
-        match cur.peek().unwrap() {
-            b'[' => {
+        match cur.peek() {
+            Token::LeftBracket => {
                 depth += 1;
                 startofword = true;
                 cur.advance();
             }
-            b']' => {
+            Token::RightBracket => {
                 depth -= 1;
                 if depth == 0 {
                     let content = cur.slice(start).to_string();
@@ -413,19 +414,19 @@ pub fn parse_cmd_sub(cur: &mut Cursor, _bracket_term: bool) -> ParseResult<Strin
                 startofword = false;
                 cur.advance();
             }
-            b'{' if startofword => {
+            Token::LeftBrace if startofword => {
                 skip_braced(cur)?;
                 startofword = false;
             }
-            b'"' if startofword => {
+            Token::DoubleQuote if startofword => {
                 skip_quoted_in_cmd(cur)?;
                 startofword = false;
             }
-            b' ' | b'\t' | b'\n' | b'\r' | b';' => {
+            Token::Whitespace | Token::CarriageReturn | Token::Newline | Token::Semicolon => {
                 startofword = true;
                 cur.advance();
             }
-            b'\\' => {
+            Token::Backslash => {
                 cur.advance(); // skip '\'
                 if !cur.at_end() {
                     cur.advance(); // skip escaped char
@@ -443,28 +444,28 @@ pub fn parse_cmd_sub(cur: &mut Cursor, _bracket_term: bool) -> ParseResult<Strin
         message: "missing close-bracket".into(),
         line: err_line,
         column: 0,
-        offset: cur.pos,
+        offset: cur.pos(),
     })
 }
 
 /// Skip a `{...}` block inside command substitution (find matching `}`).
 fn skip_braced(cur: &mut Cursor) -> ParseResult<()> {
-    debug_assert!(cur.is(b'{'));
-    let err_line = cur.line;
+    debug_assert!(cur.is(Token::LeftBrace));
+    let err_line = cur.line();
     cur.advance();
     let mut depth: u32 = 1;
 
     while !cur.at_end() && depth > 0 {
-        match cur.peek().unwrap() {
-            b'{' => {
+        match cur.peek() {
+            Token::LeftBrace => {
                 depth += 1;
                 cur.advance();
             }
-            b'}' => {
+            Token::RightBrace => {
                 depth -= 1;
                 cur.advance();
             }
-            b'\\' => {
+            Token::Backslash => {
                 cur.advance();
                 if !cur.at_end() {
                     cur.advance();
@@ -481,7 +482,7 @@ fn skip_braced(cur: &mut Cursor) -> ParseResult<()> {
             message: "missing close-brace".into(),
             line: err_line,
             column: 0,
-            offset: cur.pos,
+            offset: cur.pos(),
         })
     } else {
         Ok(())
@@ -490,17 +491,17 @@ fn skip_braced(cur: &mut Cursor) -> ParseResult<()> {
 
 /// Skip a `"..."` string inside command substitution (find matching `"`).
 fn skip_quoted_in_cmd(cur: &mut Cursor) -> ParseResult<()> {
-    debug_assert!(cur.is(b'"'));
-    let err_line = cur.line;
+    debug_assert!(cur.is(Token::DoubleQuote));
+    let err_line = cur.line();
     cur.advance(); // skip opening '"'
 
     while !cur.at_end() {
-        match cur.peek().unwrap() {
-            b'"' => {
+        match cur.peek() {
+            Token::DoubleQuote => {
                 cur.advance();
                 return Ok(());
             }
-            b'\\' => {
+            Token::Backslash => {
                 cur.advance();
                 if !cur.at_end() {
                     cur.advance();
@@ -516,6 +517,6 @@ fn skip_quoted_in_cmd(cur: &mut Cursor) -> ParseResult<()> {
         message: "missing \"".into(),
         line: err_line,
         column: 0,
-        offset: cur.pos,
+        offset: cur.pos(),
     })
 }

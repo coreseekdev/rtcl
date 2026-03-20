@@ -40,6 +40,8 @@ pub enum InternalRep {
     Bool(bool),
     /// Cached list of values (avoids re-parsing the string)
     List(Vec<Value>),
+    /// Cached dict of key-value pairs (avoids re-parsing the string)
+    Dict(Vec<(Value, Value)>),
     /// No internal representation yet
     None,
 }
@@ -142,6 +144,29 @@ impl Value {
         }
     }
 
+    /// Create a value directly from a cached dict.
+    ///
+    /// The string representation is lazily generated on first `as_str()`.
+    pub fn from_dict_cached(entries: Vec<(Value, Value)>) -> Self {
+        Value {
+            inner: Rc::new(ValueInner {
+                string: None,
+                rep: InternalRep::Dict(entries),
+            }),
+        }
+    }
+
+    /// Create a value from dict entries (serializes to string eagerly).
+    pub fn from_dict(entries: &[(Value, Value)]) -> Self {
+        let s = serialize_dict(entries);
+        Value {
+            inner: Rc::new(ValueInner {
+                string: Some(SmallVec::from_slice(s.as_bytes())),
+                rep: InternalRep::Dict(entries.to_vec()),
+            }),
+        }
+    }
+
     /// Create a value from a list of values (serializes to string eagerly
     /// for backward compatibility).
     pub fn from_list(items: &[Value]) -> Self {
@@ -181,6 +206,7 @@ impl Value {
         if self.inner.string.is_none() {
             let s = match &self.inner.rep {
                 InternalRep::List(items) => serialize_list(items),
+                InternalRep::Dict(entries) => serialize_dict(entries),
                 InternalRep::Int(n) => format_int(*n),
                 InternalRep::Float(n) => format_float(*n),
                 InternalRep::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
@@ -203,6 +229,7 @@ impl Value {
         } else {
             let s = match &self.inner.rep {
                 InternalRep::List(items) => serialize_list(items),
+                InternalRep::Dict(entries) => serialize_dict(entries),
                 InternalRep::Int(n) => format_int(*n),
                 InternalRep::Float(n) => format_float(*n),
                 InternalRep::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
@@ -270,9 +297,32 @@ impl Value {
     pub fn as_list(&self) -> Option<Vec<Value>> {
         match &self.inner.rep {
             InternalRep::List(items) => Some(items.clone()),
+            InternalRep::Dict(entries) => {
+                Some(entries.iter().flat_map(|(k, v)| [k.clone(), v.clone()]).collect())
+            }
             _ => {
                 let s = self.to_str();
                 parse_list(&s)
+            }
+        }
+    }
+
+    /// Get the value as a dict (ordered key-value pairs).
+    ///
+    /// Returns cached pairs when the internal rep is already `Dict`,
+    /// otherwise parses from the string/list representation.
+    pub fn as_dict(&self) -> Option<Vec<(Value, Value)>> {
+        match &self.inner.rep {
+            InternalRep::Dict(entries) => Some(entries.clone()),
+            InternalRep::List(items) => {
+                if items.len() % 2 != 0 { return None; }
+                Some(items.chunks(2).map(|c| (c[0].clone(), c[1].clone())).collect())
+            }
+            _ => {
+                let s = self.to_str();
+                let list = parse_list(&s)?;
+                if list.len() % 2 != 0 { return None; }
+                Some(list.chunks(2).map(|c| (c[0].clone(), c[1].clone())).collect())
             }
         }
     }
@@ -284,6 +334,7 @@ impl Value {
         } else {
             match &self.inner.rep {
                 InternalRep::List(items) => items.is_empty(),
+                InternalRep::Dict(entries) => entries.is_empty(),
                 InternalRep::None => true,
                 _ => false,
             }
@@ -382,6 +433,15 @@ impl From<f64> for Value {
     fn from(n: f64) -> Self {
         Value::from_float(n)
     }
+}
+
+/// Serialize dict entries into a Tcl list string (key1 val1 key2 val2 ...).
+fn serialize_dict(entries: &[(Value, Value)]) -> String {
+    let items: Vec<Value> = entries
+        .iter()
+        .flat_map(|(k, v)| [k.clone(), v.clone()])
+        .collect();
+    serialize_list(&items)
 }
 
 /// Serialize a slice of values into a Tcl list string.

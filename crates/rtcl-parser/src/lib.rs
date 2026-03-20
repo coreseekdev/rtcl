@@ -50,7 +50,7 @@ pub struct Command {
 }
 
 /// A word in a Tcl command.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Word {
     /// Literal string — no substitution.
     Literal(String),
@@ -121,6 +121,9 @@ pub type ParseResult<T> = Result<T, ParseError>;
 pub fn parse(source: &str) -> ParseResult<Vec<Command>> {
     rd::parse(source)
 }
+
+// Re-export token types from rd module
+pub use rd::token::{Token, Tokenizer};
 
 /// Check whether `source` is a complete Tcl script (balanced braces, quotes,
 /// and brackets).  Returns `true` if the script can be parsed without needing

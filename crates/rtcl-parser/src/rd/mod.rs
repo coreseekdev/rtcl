@@ -6,12 +6,16 @@
 
 mod cursor;
 mod escape;
+pub mod token;  // Public for re-export in lib.rs
 mod tokens;
 mod word;
 
 use crate::{Command, ParseResult};
 use cursor::Cursor;
 use word::parse_next_word;
+
+// Re-export Token for use within the crate
+pub use token::Token;
 
 /// Parse Tcl source code into a list of [`Command`]s.
 pub fn parse(source: &str) -> ParseResult<Vec<Command>> {
@@ -25,7 +29,7 @@ fn parse_script(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Vec<Command
     loop {
         skip_command_separators(cur);
 
-        if cur.at_end() || (bracket_term && cur.is(b']')) {
+        if cur.at_end() || (bracket_term && cur.is(Token::RightBracket)) {
             break;
         }
 
@@ -41,10 +45,10 @@ fn parse_script(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Vec<Command
 /// Skip whitespace (including newlines), semicolons, and comments between commands.
 fn skip_command_separators(cur: &mut Cursor) {
     loop {
-        while let Some(b' ' | b'\t' | b'\r' | 0x0c | b'\n' | b';') = cur.peek() {
+        while cur.peek().is_any_whitespace() || cur.is(Token::Semicolon) {
             cur.advance();
         }
-        if cur.is(b'#') {
+        if cur.is(Token::Hash) {
             skip_comment(cur);
         } else {
             break;
@@ -53,29 +57,21 @@ fn skip_command_separators(cur: &mut Cursor) {
 }
 
 /// Skip a comment line. `#` at command position, with `\<newline>` continuation.
-/// Supports both LF and CRLF line endings.
+/// The tokenizer normalizes line endings, so we just look for Token::Newline.
 fn skip_comment(cur: &mut Cursor) {
-    debug_assert!(cur.is(b'#'));
+    debug_assert!(cur.is(Token::Hash));
     cur.advance(); // skip '#'
     loop {
         match cur.peek() {
-            None => break,
-            Some(b'\r') => {
-                cur.advance();
-                if cur.is(b'\n') { cur.advance(); } // CRLF
-                break;
-            }
-            Some(b'\n') => {
+            Token::Eof => break,
+            Token::Newline => {
                 cur.advance();
                 break;
             }
-            Some(b'\\') => {
+            Token::Backslash => {
                 cur.advance(); // skip '\'
-                // Handle CRLF continuation
-                if cur.is(b'\r') {
-                    cur.advance();
-                    if cur.is(b'\n') { cur.advance(); }
-                } else if cur.is(b'\n') {
+                // Check for line continuation
+                if cur.peek() == Token::Newline {
                     cur.advance(); // continuation: comment extends to next line
                 } else if !cur.at_end() {
                     cur.advance(); // skip the char after backslash
@@ -89,7 +85,7 @@ fn skip_comment(cur: &mut Cursor) {
 }
 
 fn parse_command(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Command> {
-    let line = cur.line;
+    let line = cur.line();
     let mut words = Vec::new();
 
     while !cur.at_end_of_command(bracket_term) {
@@ -98,13 +94,11 @@ fn parse_command(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Command> {
     }
 
     // Consume the command terminator (newline or semicolon) — but NOT `]`
-    // Handle both LF and CRLF line endings.
+    // The tokenizer has already normalized line endings.
     match cur.peek() {
-        Some(b'\r') => {
+        Token::Newline | Token::Semicolon => {
             cur.advance();
-            if cur.is(b'\n') { cur.advance(); }
         }
-        Some(b'\n') | Some(b';') => cur.advance(),
         _ => {}
     }
 

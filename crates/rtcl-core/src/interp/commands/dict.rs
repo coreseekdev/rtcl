@@ -4,28 +4,17 @@ use crate::error::{Error, Result};
 use crate::interp::{glob_match, Interp};
 use crate::value::Value;
 
-/// Parse a string as a dict (flat key-value list).
-fn parse_dict(s: &str) -> Result<Vec<(String, String)>> {
-    let list = Value::from_str(s).as_list().unwrap_or_default();
-    if !list.len().is_multiple_of(2) {
-        return Err(Error::runtime(
+/// Parse a value as a dict (ordered key-value pairs).
+///
+/// Returns the cached `Dict` representation when available, otherwise
+/// parses from the string/list representation.
+fn parse_dict(val: &Value) -> Result<Vec<(Value, Value)>> {
+    val.as_dict().ok_or_else(|| {
+        Error::runtime(
             "missing value to go with key",
             crate::error::ErrorCode::InvalidOp,
-        ));
-    }
-    Ok(list
-        .chunks(2)
-        .map(|c| (c[0].as_str().to_string(), c[1].as_str().to_string()))
-        .collect())
-}
-
-/// Serialise dict entries back to a flat Tcl list string.
-fn dict_to_string(entries: &[(String, String)]) -> String {
-    let vals: Vec<Value> = entries
-        .iter()
-        .flat_map(|(k, v)| vec![Value::from_str(k), Value::from_str(v)])
-        .collect();
-    Value::from_list(&vals).as_str().to_string()
+        )
+    })
 }
 
 pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -42,29 +31,29 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     crate::error::ErrorCode::InvalidOp,
                 ));
             }
-            let entries: Vec<(String, String)> = args[2..]
+            let entries: Vec<(Value, Value)> = args[2..]
                 .chunks(2)
-                .map(|c| (c[0].as_str().to_string(), c[1].as_str().to_string()))
+                .map(|c| (c[0].clone(), c[1].clone()))
                 .collect();
-            Ok(Value::from_str(&dict_to_string(&entries)))
+            Ok(Value::from_dict_cached(entries))
         }
         "get" => {
             if args.len() < 3 {
                 return Err(Error::wrong_args("dict get", 3, args.len()));
             }
-            let entries = parse_dict(args[2].as_str())?;
+            let entries = parse_dict(&args[2])?;
             if args.len() == 3 {
                 return Ok(args[2].clone());
             }
             let key = args[3].as_str();
             for (k, v) in &entries {
-                if k == key {
+                if k.as_str() == key {
                     if args.len() > 4 {
                         let sub_entries = parse_dict(v)?;
                         let sub_key = args[4].as_str();
                         for (sk, sv) in &sub_entries {
-                            if sk == sub_key {
-                                return Ok(Value::from_str(sv));
+                            if sk.as_str() == sub_key {
+                                return Ok(sv.clone());
                             }
                         }
                         return Err(Error::runtime(
@@ -72,7 +61,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                             crate::error::ErrorCode::NotFound,
                         ));
                     }
-                    return Ok(Value::from_str(v));
+                    return Ok(v.clone());
                 }
             }
             Err(Error::runtime(
@@ -85,12 +74,13 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::wrong_args_with_usage("dict set", 5, args.len(), "dictVariable key ?key ...? value"));
             }
             let var_name = args[2].as_str();
-            let value = args[args.len() - 1].as_str().to_string();
+            let value = args[args.len() - 1].clone();
             let keys: Vec<&str> = args[3..args.len() - 1].iter().map(|v| v.as_str()).collect();
 
-            let dict_str = interp.get_var(var_name).ok().map(|v| v.as_str().to_string()).unwrap_or_default();
-            let result = dict_set_nested(&dict_str, &keys, &value)?;
-            let result_val = Value::from_str(&result);
+            let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
+            let entries = parse_dict(&dict_val).unwrap_or_default();
+            let new_entries = dict_set_nested(entries, &keys, value)?;
+            let result_val = Value::from_dict_cached(new_entries);
             interp.set_var(var_name, result_val.clone())
         }
         "unset" => {
@@ -99,31 +89,31 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let var_name = args[2].as_str();
             let key = args[3].as_str();
-            let dict_str = interp.get_var(var_name).ok().map(|v| v.as_str().to_string()).unwrap_or_default();
-            let mut entries = parse_dict(&dict_str)?;
-            entries.retain(|(k, _)| k != key);
-            let result = Value::from_str(&dict_to_string(&entries));
+            let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
+            let mut entries = parse_dict(&dict_val)?;
+            entries.retain(|(k, _)| k.as_str() != key);
+            let result = Value::from_dict_cached(entries);
             interp.set_var(var_name, result.clone())
         }
         "exists" => {
             if args.len() < 4 {
                 return Err(Error::wrong_args("dict exists", 4, args.len()));
             }
-            let entries = parse_dict(args[2].as_str())?;
+            let entries = parse_dict(&args[2])?;
             let key = args[3].as_str();
-            let exists = entries.iter().any(|(k, _)| k == key);
+            let exists = entries.iter().any(|(k, _)| k.as_str() == key);
             Ok(Value::from_bool(exists))
         }
         "keys" => {
             if args.len() < 3 || args.len() > 4 {
                 return Err(Error::wrong_args("dict keys", 3, args.len()));
             }
-            let entries = parse_dict(args[2].as_str())?;
+            let entries = parse_dict(&args[2])?;
             let pattern = if args.len() == 4 { Some(args[3].as_str()) } else { None };
             let keys: Vec<Value> = entries
                 .iter()
-                .filter(|(k, _)| pattern.is_none() || glob_match(pattern.unwrap(), k))
-                .map(|(k, _)| Value::from_str(k))
+                .filter(|(k, _)| pattern.is_none() || glob_match(pattern.unwrap(), k.as_str()))
+                .map(|(k, _)| k.clone())
                 .collect();
             Ok(Value::from_list(&keys))
         }
@@ -131,12 +121,12 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() < 3 || args.len() > 4 {
                 return Err(Error::wrong_args("dict values", 3, args.len()));
             }
-            let entries = parse_dict(args[2].as_str())?;
+            let entries = parse_dict(&args[2])?;
             let pattern = if args.len() == 4 { Some(args[3].as_str()) } else { None };
             let values: Vec<Value> = entries
                 .iter()
-                .filter(|(_, v)| pattern.is_none() || glob_match(pattern.unwrap(), v))
-                .map(|(_, v)| Value::from_str(v))
+                .filter(|(_, v)| pattern.is_none() || glob_match(pattern.unwrap(), v.as_str()))
+                .map(|(_, v)| v.clone())
                 .collect();
             Ok(Value::from_list(&values))
         }
@@ -144,7 +134,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() != 3 {
                 return Err(Error::wrong_args("dict size", 3, args.len()));
             }
-            let entries = parse_dict(args[2].as_str())?;
+            let entries = parse_dict(&args[2])?;
             Ok(Value::from_int(entries.len() as i64))
         }
         "for" => {
@@ -160,12 +150,12 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let key_var = var_list[0].as_str().to_string();
             let val_var = var_list[1].as_str().to_string();
-            let entries = parse_dict(args[3].as_str())?;
+            let entries = parse_dict(&args[3])?;
             let body = args[4].as_str();
             let mut result = Value::empty();
             for (k, v) in &entries {
-                interp.set_var(&key_var, Value::from_str(k))?;
-                interp.set_var(&val_var, Value::from_str(v))?;
+                interp.set_var(&key_var, k.clone())?;
+                interp.set_var(&val_var, v.clone())?;
                 match interp.eval(body) {
                     Ok(v) => result = v,
                     Err(e) => {
@@ -178,24 +168,24 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(result)
         }
         "merge" => {
-            let mut entries: Vec<(String, String)> = Vec::new();
+            let mut entries: Vec<(Value, Value)> = Vec::new();
             for arg in &args[2..] {
-                let new_entries = parse_dict(arg.as_str())?;
+                let new_entries = parse_dict(arg)?;
                 for (k, v) in new_entries {
-                    if let Some(pos) = entries.iter().position(|(ek, _)| *ek == k) {
+                    if let Some(pos) = entries.iter().position(|(ek, _)| ek.as_str() == k.as_str()) {
                         entries[pos].1 = v;
                     } else {
                         entries.push((k, v));
                     }
                 }
             }
-            Ok(Value::from_str(&dict_to_string(&entries)))
+            Ok(Value::from_dict_cached(entries))
         }
         "replace" => {
             if args.len() < 3 {
                 return Err(Error::wrong_args("dict replace", 3, args.len()));
             }
-            let mut entries = parse_dict(args[2].as_str())?;
+            let mut entries = parse_dict(&args[2])?;
             let pairs: Vec<&Value> = args[3..].iter().collect();
             if !pairs.len().is_multiple_of(2) {
                 return Err(Error::runtime(
@@ -204,31 +194,33 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             for chunk in pairs.chunks(2) {
-                let k = chunk[0].as_str().to_string();
-                let v = chunk[1].as_str().to_string();
-                if let Some(pos) = entries.iter().position(|(ek, _)| *ek == k) {
-                    entries[pos].1 = v;
+                let k = chunk[0];
+                let v = chunk[1];
+                if let Some(pos) = entries.iter().position(|(ek, _)| ek.as_str() == k.as_str()) {
+                    entries[pos].1 = v.clone();
                 } else {
-                    entries.push((k, v));
+                    entries.push((k.clone(), v.clone()));
                 }
             }
-            Ok(Value::from_str(&dict_to_string(&entries)))
+            Ok(Value::from_dict_cached(entries))
         }
         "append" => {
             if args.len() < 4 {
                 return Err(Error::wrong_args("dict append", 4, args.len()));
             }
             let var_name = args[2].as_str();
-            let key = args[3].as_str().to_string();
+            let key = args[3].as_str();
             let append_val = if args.len() > 4 { args[4].as_str() } else { "" };
-            let dict_str = interp.get_var(var_name).ok().map(|v| v.as_str().to_string()).unwrap_or_default();
-            let mut entries = parse_dict(&dict_str)?;
-            if let Some(pos) = entries.iter().position(|(k, _)| *k == key) {
-                entries[pos].1.push_str(append_val);
+            let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
+            let mut entries = parse_dict(&dict_val)?;
+            if let Some(pos) = entries.iter().position(|(k, _)| k.as_str() == key) {
+                let mut s = entries[pos].1.as_str().to_string();
+                s.push_str(append_val);
+                entries[pos].1 = Value::from_str(&s);
             } else {
-                entries.push((key, append_val.to_string()));
+                entries.push((Value::from_str(key), Value::from_str(append_val)));
             }
-            let result = Value::from_str(&dict_to_string(&entries));
+            let result = Value::from_dict_cached(entries);
             interp.set_var(var_name, result.clone())
         }
         "incr" => {
@@ -236,17 +228,17 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::wrong_args_with_usage("dict incr", 4, args.len(), "dictVariable key ?increment?"));
             }
             let var_name = args[2].as_str();
-            let key = args[3].as_str().to_string();
+            let key = args[3].as_str();
             let incr = if args.len() == 5 { args[4].as_int().unwrap_or(1) } else { 1 };
-            let dict_str = interp.get_var(var_name).ok().map(|v| v.as_str().to_string()).unwrap_or_default();
-            let mut entries = parse_dict(&dict_str)?;
-            if let Some(pos) = entries.iter().position(|(k, _)| *k == key) {
-                let cur: i64 = entries[pos].1.parse().unwrap_or(0);
-                entries[pos].1 = (cur + incr).to_string();
+            let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
+            let mut entries = parse_dict(&dict_val)?;
+            if let Some(pos) = entries.iter().position(|(k, _)| k.as_str() == key) {
+                let cur = entries[pos].1.as_int().unwrap_or(0);
+                entries[pos].1 = Value::from_int(cur + incr);
             } else {
-                entries.push((key, incr.to_string()));
+                entries.push((Value::from_str(key), Value::from_int(incr)));
             }
-            let result = Value::from_str(&dict_to_string(&entries));
+            let result = Value::from_dict_cached(entries);
             interp.set_var(var_name, result.clone())
         }
         "lappend" => {
@@ -255,25 +247,25 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::wrong_args_with_usage("dict lappend", 4, args.len(), "dictVariable key ?value ...?"));
             }
             let var_name = args[2].as_str();
-            let key = args[3].as_str().to_string();
-            let dict_str = interp.get_var(var_name).ok().map(|v| v.as_str().to_string()).unwrap_or_default();
-            let mut entries = parse_dict(&dict_str)?;
-            let cur_val = entries.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone()).unwrap_or_default();
+            let key = args[3].as_str();
+            let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
+            let mut entries = parse_dict(&dict_val)?;
+            let cur_val = entries.iter().find(|(k, _)| k.as_str() == key).map(|(_, v)| v.clone()).unwrap_or_default();
             let mut list = if cur_val.is_empty() {
                 Vec::new()
             } else {
-                Value::from_str(&cur_val).as_list().unwrap_or_default()
+                cur_val.as_list().unwrap_or_default()
             };
             for v in &args[4..] {
                 list.push(v.clone());
             }
             let new_val = Value::from_list(&list);
-            if let Some(pos) = entries.iter().position(|(k, _)| *k == key) {
-                entries[pos].1 = new_val.as_str().to_string();
+            if let Some(pos) = entries.iter().position(|(k, _)| k.as_str() == key) {
+                entries[pos].1 = new_val;
             } else {
-                entries.push((key, new_val.as_str().to_string()));
+                entries.push((Value::from_str(key), new_val));
             }
-            let result = Value::from_str(&dict_to_string(&entries));
+            let result = Value::from_dict_cached(entries);
             interp.set_var(var_name, result.clone())
         }
         "remove" => {
@@ -281,13 +273,12 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() < 3 {
                 return Err(Error::wrong_args_with_usage("dict remove", 3, args.len(), "dictionary ?key ...?"));
             }
-            let dict_str = args[2].as_str();
-            let mut entries = parse_dict(dict_str)?;
+            let mut entries = parse_dict(&args[2])?;
             for key_arg in &args[3..] {
                 let key = key_arg.as_str();
-                entries.retain(|(k, _)| k != key);
+                entries.retain(|(k, _)| k.as_str() != key);
             }
-            Ok(Value::from_str(&dict_to_string(&entries)))
+            Ok(Value::from_dict_cached(entries))
         }
         "with" => {
             // dict with dictVariable ?key ...? body
@@ -299,37 +290,38 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
             // Navigate to nested dict if keys provided
             let dict_val = interp.get_var(var_name)?.clone();
-            let mut dict_str = dict_val.as_str().to_string();
+            let mut current = dict_val;
 
             let keys: Vec<&str> = args[3..args.len() - 1].iter().map(|a| a.as_str()).collect();
             for key in &keys {
-                let entries = parse_dict(&dict_str)?;
-                dict_str = entries.iter()
-                    .find(|(k, _)| k == key)
+                let entries = parse_dict(&current)?;
+                current = entries.iter()
+                    .find(|(k, _)| k.as_str() == *key)
                     .map(|(_, v)| v.clone())
                     .unwrap_or_default();
             }
 
-            let entries = parse_dict(&dict_str)?;
+            let entries = parse_dict(&current)?;
 
             // Set dict keys as variables
             let saved: Vec<(String, Option<Value>)> = entries.iter().map(|(k, _)| {
-                let old = interp.get_var(k).ok().cloned();
-                (k.clone(), old)
+                let key = k.as_str().to_string();
+                let old = interp.get_var(&key).ok().cloned();
+                (key, old)
             }).collect();
 
             for (k, v) in &entries {
-                interp.set_var(k, Value::from_str(v))?;
+                interp.set_var(k.as_str(), v.clone())?;
             }
 
             // Execute body
             let result = interp.eval(body);
 
             // Read back variables and update dict
-            let mut new_entries: Vec<(String, String)> = Vec::new();
+            let mut new_entries: Vec<(Value, Value)> = Vec::new();
             for (k, _) in &entries {
-                if let Ok(v) = interp.get_var(k) {
-                    new_entries.push((k.clone(), v.as_str().to_string()));
+                if let Ok(v) = interp.get_var(k.as_str()) {
+                    new_entries.push((k.clone(), v.clone()));
                 }
             }
 
@@ -343,9 +335,8 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
 
             // Update the dict variable
-            let new_dict = dict_to_string(&new_entries);
             if keys.is_empty() {
-                interp.set_var(var_name, Value::from_str(&new_dict))?;
+                interp.set_var(var_name, Value::from_dict_cached(new_entries))?;
             }
             // TODO: handle nested key path update
 
@@ -358,24 +349,23 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() < 5 {
                 return Err(Error::wrong_args_with_usage("dict filter", 5, args.len(), "dictionary filterType ..."));
             }
-            let dict_str = args[2].as_str();
             let filter_type = args[3].as_str();
-            let entries = parse_dict(dict_str)?;
+            let entries = parse_dict(&args[2])?;
 
             match filter_type {
                 "key" => {
                     let pattern = args[4].as_str();
-                    let filtered: Vec<(String, String)> = entries.into_iter()
-                        .filter(|(k, _)| glob_match(pattern, k))
+                    let filtered: Vec<(Value, Value)> = entries.into_iter()
+                        .filter(|(k, _)| glob_match(pattern, k.as_str()))
                         .collect();
-                    Ok(Value::from_str(&dict_to_string(&filtered)))
+                    Ok(Value::from_dict_cached(filtered))
                 }
                 "value" => {
                     let pattern = args[4].as_str();
-                    let filtered: Vec<(String, String)> = entries.into_iter()
-                        .filter(|(_, v)| glob_match(pattern, v))
+                    let filtered: Vec<(Value, Value)> = entries.into_iter()
+                        .filter(|(_, v)| glob_match(pattern, v.as_str()))
                         .collect();
-                    Ok(Value::from_str(&dict_to_string(&filtered)))
+                    Ok(Value::from_dict_cached(filtered))
                 }
                 "script" => {
                     if args.len() < 6 {
@@ -393,14 +383,14 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     let script = args[5].as_str();
                     let mut filtered = Vec::new();
                     for (k, v) in &entries {
-                        interp.set_var(&key_var, Value::from_str(k))?;
-                        interp.set_var(&val_var, Value::from_str(v))?;
+                        interp.set_var(&key_var, k.clone())?;
+                        interp.set_var(&val_var, v.clone())?;
                         let result = interp.eval(script)?;
                         if result.is_true() {
                             filtered.push((k.clone(), v.clone()));
                         }
                     }
-                    Ok(Value::from_str(&dict_to_string(&filtered)))
+                    Ok(Value::from_dict_cached(filtered))
                 }
                 _ => Err(Error::runtime(
                     format!("unknown filter type \"{}\": must be key, value, or script", filter_type),
@@ -422,16 +412,15 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let key_var = var_list[0].as_str().to_string();
             let val_var = var_list[1].as_str().to_string();
-            let dict_str = args[3].as_str();
             let body = args[4].as_str();
-            let entries = parse_dict(dict_str)?;
+            let entries = parse_dict(&args[3])?;
             let mut result_entries = Vec::new();
             for (k, v) in &entries {
-                interp.set_var(&key_var, Value::from_str(k))?;
-                interp.set_var(&val_var, Value::from_str(v))?;
+                interp.set_var(&key_var, k.clone())?;
+                interp.set_var(&val_var, v.clone())?;
                 match interp.eval(body) {
                     Ok(new_v) => {
-                        result_entries.push((k.clone(), new_v.as_str().to_string()));
+                        result_entries.push((k.clone(), new_v));
                     }
                     Err(e) => {
                         if e.is_break() { break; }
@@ -440,15 +429,14 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     }
                 }
             }
-            Ok(Value::from_str(&dict_to_string(&result_entries)))
+            Ok(Value::from_dict_cached(result_entries))
         }
         "info" => {
             // dict info dictionary — return diagnostic info
             if args.len() != 3 {
                 return Err(Error::wrong_args_with_usage("dict info", 3, args.len(), "dictionary"));
             }
-            let dict_str = args[2].as_str();
-            let entries = parse_dict(dict_str)?;
+            let entries = parse_dict(&args[2])?;
             Ok(Value::from_str(&format!("{} entries in dict", entries.len())))
         }
         "getwithdefault" => {
@@ -460,18 +448,17 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let default = &args[args.len() - 1];
-            let dict_val = &args[2];
+            let mut current = args[2].clone();
             let keys = &args[3..args.len() - 1];
             // Walk nested dicts
-            let mut current = dict_val.as_str().to_string();
             for key in keys {
                 let entries = parse_dict(&current)?;
-                match entries.iter().find(|(k, _)| k == key.as_str()) {
+                match entries.iter().find(|(k, _)| k.as_str() == key.as_str()) {
                     Some((_, v)) => current = v.clone(),
                     None => return Ok(default.clone()),
                 }
             }
-            Ok(Value::from_str(&current))
+            Ok(current)
         }
         "update" => {
             // dict update dictVariable key varName ?key varName ...? body
@@ -489,15 +476,13 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .collect();
 
             // Read current dict
-            let dict_str = interp.get_var(&var_name)
-                .ok().map(|v| v.as_str().to_string())
-                .unwrap_or_default();
-            let entries = parse_dict(&dict_str)?;
+            let dict_val = interp.get_var(&var_name).ok().cloned().unwrap_or_default();
+            let entries = parse_dict(&dict_val)?;
 
             // Set local variables from dict keys
             for (key, local_var) in &pairs {
-                if let Some((_, v)) = entries.iter().find(|(k, _)| k == key) {
-                    interp.set_var(local_var, Value::from_str(v))?;
+                if let Some((_, v)) = entries.iter().find(|(k, _)| k.as_str() == key.as_str()) {
+                    interp.set_var(local_var, v.clone())?;
                 }
             }
 
@@ -506,25 +491,22 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
             // Write back from local variables to dict
             if interp.get_var(&var_name).is_ok() {
-                let mut new_entries = parse_dict(
-                    &interp.get_var(&var_name)
-                        .ok().map(|v| v.as_str().to_string())
-                        .unwrap_or_default(),
-                )?;
+                let cur_val = interp.get_var(&var_name).ok().cloned().unwrap_or_default();
+                let mut new_entries = parse_dict(&cur_val)?;
                 for (key, local_var) in &pairs {
                     if let Ok(val) = interp.get_var(local_var) {
                         // Update or add
-                        if let Some(pos) = new_entries.iter().position(|(k, _)| k == key) {
-                            new_entries[pos].1 = val.as_str().to_string();
+                        if let Some(pos) = new_entries.iter().position(|(k, _)| k.as_str() == key.as_str()) {
+                            new_entries[pos].1 = val.clone();
                         } else {
-                            new_entries.push((key.clone(), val.as_str().to_string()));
+                            new_entries.push((Value::from_str(key), val.clone()));
                         }
                     } else {
                         // Variable unset → remove key
-                        new_entries.retain(|(k, _)| k != key);
+                        new_entries.retain(|(k, _)| k.as_str() != key.as_str());
                     }
                 }
-                interp.set_var(&var_name, Value::from_str(&dict_to_string(&new_entries)))?;
+                interp.set_var(&var_name, Value::from_dict_cached(new_entries))?;
             }
 
             result
@@ -546,30 +528,31 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
-fn dict_set_nested(dict_str: &str, keys: &[&str], value: &str) -> Result<String> {
-    let mut entries = parse_dict(dict_str)?;
+fn dict_set_nested(mut entries: Vec<(Value, Value)>, keys: &[&str], value: Value) -> Result<Vec<(Value, Value)>> {
     if keys.len() == 1 {
-        let key = keys[0].to_string();
-        if let Some(pos) = entries.iter().position(|(k, _)| *k == key) {
-            entries[pos].1 = value.to_string();
+        let key = keys[0];
+        if let Some(pos) = entries.iter().position(|(k, _)| k.as_str() == key) {
+            entries[pos].1 = value;
         } else {
-            entries.push((key, value.to_string()));
+            entries.push((Value::from_str(key), value));
         }
     } else {
-        let key = keys[0].to_string();
-        let sub_dict = entries
+        let key = keys[0];
+        let sub_val = entries
             .iter()
-            .find(|(k, _)| *k == key)
+            .find(|(k, _)| k.as_str() == key)
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
-        let new_sub = dict_set_nested(&sub_dict, &keys[1..], value)?;
-        if let Some(pos) = entries.iter().position(|(k, _)| *k == key) {
+        let sub_entries = parse_dict(&sub_val).unwrap_or_default();
+        let new_sub_entries = dict_set_nested(sub_entries, &keys[1..], value)?;
+        let new_sub = Value::from_dict_cached(new_sub_entries);
+        if let Some(pos) = entries.iter().position(|(k, _)| k.as_str() == key) {
             entries[pos].1 = new_sub;
         } else {
-            entries.push((key, new_sub));
+            entries.push((Value::from_str(key), new_sub));
         }
     }
-    Ok(dict_to_string(&entries))
+    Ok(entries)
 }
 
 #[cfg(test)]

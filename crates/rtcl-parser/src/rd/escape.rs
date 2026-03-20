@@ -17,8 +17,21 @@ pub fn backslash_subst(cur: &mut Cursor) -> char {
         Some(b'r') => { cur.advance(); '\r' }
         Some(b't') => { cur.advance(); '\t' }
         Some(b'v') => { cur.advance(); '\x0b' }
+        Some(b'\r') => {
+            // CRLF line continuation: \<cr><lf><whitespace> → single space
+            cur.advance(); // skip '\r'
+            if cur.is(b'\n') { cur.advance(); } // skip '\n' if present
+            while let Some(b) = cur.peek() {
+                if b == b' ' || b == b'\t' {
+                    cur.advance();
+                } else {
+                    break;
+                }
+            }
+            ' '
+        }
         Some(b'\n') => {
-            // line continuation: \<newline><whitespace> → single space
+            // LF line continuation: \<newline><whitespace> → single space
             cur.advance(); // skip newline
             while let Some(b) = cur.peek() {
                 if b == b' ' || b == b'\t' {
@@ -107,23 +120,37 @@ pub fn backslash_subst(cur: &mut Cursor) -> char {
 }
 
 /// Handle `\<newline><whitespace>` → single space inside braced content.
+/// Supports both LF (\n) and CRLF (\r\n) line endings.
 pub fn process_braced_backslash_newline(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-            // backslash-newline-whitespace → single space
-            i += 2;
-            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
-                i += 1;
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            // Check for CRLF: \r\n
+            if bytes[i + 1] == b'\r' && i + 2 < bytes.len() && bytes[i + 2] == b'\n' {
+                // backslash-CRLF-whitespace → single space
+                i += 3;
+                while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                    i += 1;
+                }
+                result.push(' ');
+                continue;
             }
-            result.push(' ');
-        } else {
-            let ch = s[i..].chars().next().unwrap();
-            result.push(ch);
-            i += ch.len_utf8();
+            // Check for LF: \n
+            if bytes[i + 1] == b'\n' {
+                // backslash-newline-whitespace → single space
+                i += 2;
+                while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                    i += 1;
+                }
+                result.push(' ');
+                continue;
+            }
         }
+        let ch = s[i..].chars().next().unwrap();
+        result.push(ch);
+        i += ch.len_utf8();
     }
     result
 }

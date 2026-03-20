@@ -82,10 +82,12 @@ impl<'a> Cursor<'a> {
         while let Some(b) = self.peek() {
             match b {
                 b' ' | b'\t' | b'\r' | 0x0c => self.advance(),
-                b'\\' if self.peek_at(1) == Some(b'\n') => {
+                b'\\' if self.peek_at(1) == Some(b'\n') || self.peek_at(1) == Some(b'\r') => {
                     // backslash-newline: line continuation is whitespace
+                    // Handle both LF and CRLF line endings
                     self.advance(); // '\'
-                    self.advance(); // '\n'
+                    if self.is(b'\r') { self.advance(); } // '\r' (CRLF)
+                    if self.is(b'\n') { self.advance(); } // '\n'
                     // consume trailing whitespace after continuation
                     while let Some(b) = self.peek() {
                         if b == b' ' || b == b'\t' {
@@ -101,10 +103,11 @@ impl<'a> Cursor<'a> {
     }
 
     /// At end of command? (newline, semicolon, end-of-input, or `]` if in bracket mode)
+    /// Supports both LF and CRLF line endings.
     pub fn at_end_of_command(&self, bracket_term: bool) -> bool {
         match self.peek() {
             None => true,
-            Some(b'\n') | Some(b';') => true,
+            Some(b'\n') | Some(b'\r') | Some(b';') => true,
             Some(b']') if bracket_term => true,
             _ => false,
         }

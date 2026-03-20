@@ -53,19 +53,29 @@ fn skip_command_separators(cur: &mut Cursor) {
 }
 
 /// Skip a comment line. `#` at command position, with `\<newline>` continuation.
+/// Supports both LF and CRLF line endings.
 fn skip_comment(cur: &mut Cursor) {
     debug_assert!(cur.is(b'#'));
     cur.advance(); // skip '#'
     loop {
         match cur.peek() {
             None => break,
+            Some(b'\r') => {
+                cur.advance();
+                if cur.is(b'\n') { cur.advance(); } // CRLF
+                break;
+            }
             Some(b'\n') => {
                 cur.advance();
                 break;
             }
             Some(b'\\') => {
                 cur.advance(); // skip '\'
-                if cur.is(b'\n') {
+                // Handle CRLF continuation
+                if cur.is(b'\r') {
+                    cur.advance();
+                    if cur.is(b'\n') { cur.advance(); }
+                } else if cur.is(b'\n') {
                     cur.advance(); // continuation: comment extends to next line
                 } else if !cur.at_end() {
                     cur.advance(); // skip the char after backslash
@@ -88,7 +98,12 @@ fn parse_command(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Command> {
     }
 
     // Consume the command terminator (newline or semicolon) — but NOT `]`
+    // Handle both LF and CRLF line endings.
     match cur.peek() {
+        Some(b'\r') => {
+            cur.advance();
+            if cur.is(b'\n') { cur.advance(); }
+        }
         Some(b'\n') | Some(b';') => cur.advance(),
         _ => {}
     }

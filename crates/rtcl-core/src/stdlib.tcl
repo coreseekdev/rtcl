@@ -217,46 +217,10 @@ proc {namespace inscope} {ns args} {
     tailcall namespace eval $ns $args
 }
 
-# ── json::encode ─────────────────────────────────────────────────────────
+# ── json::encode / json::decode ──────────────────────────────────────────
 
-# json::encode — Simple Tcl-level JSON encoder.
-# jimtcl: jsonencode.tcl (simplified version)
-# Defined as global procs with :: in their name for direct lookup.
-proc json::encode {value {schema str}} {
-    switch -- $schema {
-        str {
-            # Escape backslash and double-quote for JSON.
-            # Note: We use string map with list-generated mappings to avoid
-            # backslash-escape issues in the list parser.
-            set value [string map [list \\ \\\\ \" \\\"] $value]
-            return "\"$value\""
-        }
-        num - int - bool {
-            return $value
-        }
-        list {
-            set items {}
-            foreach item $value {
-                lappend items [json::encode $item]
-            }
-            return "\[[join $items ,]\]"
-        }
-        dict - obj {
-            set pairs {}
-            dict for {k v} $value {
-                lappend pairs "[json::encode $k]:[json::encode $v]"
-            }
-            return "\{[join $pairs ,]\}"
-        }
-        default {
-            return [json::encode $value str]
-        }
-    }
-}
-
-proc json::decode {json} {
-    return -code error "json::decode requires native implementation"
-}
+# Now implemented natively in Rust (commands/json.rs).
+# Registered as: json::decode, json::encode, json (ensemble).
 
 # ── popen (jimtcl tclcompat.tcl) ────────────────────────────────────────
 

@@ -1,13 +1,32 @@
 //! Dict commands: dict create/get/set/exists/unset/keys/values/size/for/merge/replace etc.
+//!
+//! Performance notes:
+//! - Read-only operations (get, exists, keys, values, size, info, getwithdefault)
+//!   use `borrow_dict()` which returns `Cow<DictMap>` — zero-copy when the value
+//!   already has a Dict internal rep.
+//! - Mutating operations (set, unset, append, incr, lappend) clone on demand.
+//! - `dict create` supports `-ordered` (default) and `-unordered` flags.
+
+use std::borrow::Cow;
 
 use crate::error::{Error, Result};
 use crate::interp::{glob_match, Interp};
-use crate::value::Value;
-use indexmap::IndexMap;
+use crate::value::{DictMap, Value};
 
-/// Parse a value as a dict, returning a cloned IndexMap (for mutation).
-fn parse_dict(val: &Value) -> Result<IndexMap<String, Value>> {
+/// Parse a value as a dict, returning an owned DictMap (for mutation).
+fn parse_dict(val: &Value) -> Result<DictMap> {
     val.as_dict().ok_or_else(|| {
+        Error::runtime(
+            "missing value to go with key",
+            crate::error::ErrorCode::InvalidOp,
+        )
+    })
+}
+
+/// Borrow a value as a dict without cloning when possible.
+/// Returns `Cow::Borrowed` for zero-copy access to cached dicts.
+fn borrow_dict(val: &Value) -> Result<Cow<'_, DictMap>> {
+    val.as_dict_cow().ok_or_else(|| {
         Error::runtime(
             "missing value to go with key",
             crate::error::ErrorCode::InvalidOp,
@@ -22,16 +41,34 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let subcmd = args[1].as_str();
     match subcmd {
-        // ── dict create ?key value ...? ────────────────────────
+        // ── dict create ?-ordered|-unordered? ?key value ...? ──
         "create" => {
-            if (args.len() - 2) % 2 != 0 {
+            let mut start = 2;
+            let mut ordered = true;
+            if args.len() > 2 {
+                match args[2].as_str() {
+                    "-unordered" => {
+                        ordered = false;
+                        start = 3;
+                    }
+                    "-ordered" => {
+                        start = 3;
+                    }
+                    _ => {}
+                }
+            }
+            if (args.len() - start) % 2 != 0 {
                 return Err(Error::runtime(
                     "wrong # args: dict create requires key value pairs",
                     crate::error::ErrorCode::InvalidOp,
                 ));
             }
-            let mut entries = IndexMap::with_capacity((args.len() - 2) / 2);
-            for c in args[2..].chunks(2) {
+            let mut entries = if ordered {
+                DictMap::ordered_with_capacity((args.len() - start) / 2)
+            } else {
+                DictMap::unordered_with_capacity((args.len() - start) / 2)
+            };
+            for c in args[start..].chunks(2) {
                 entries.insert(c[0].as_str().to_string(), c[1].clone());
             }
             Ok(Value::from_dict_cached(entries))
@@ -45,10 +82,23 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() == 3 {
                 return Ok(args[2].clone());
             }
+            // Single-key fast path: zero-copy via borrow
+            if args.len() == 4 {
+                let entries = borrow_dict(&args[2])?;
+                let key = args[3].as_str();
+                return match entries.get(key) {
+                    Some(v) => Ok(v.clone()),
+                    None => Err(Error::runtime(
+                        format!("key \"{}\" not known in dictionary", key),
+                        crate::error::ErrorCode::NotFound,
+                    )),
+                };
+            }
+            // Multi-key: must clone intermediate dicts
             let mut current = args[2].clone();
             for key_arg in &args[3..] {
                 let key = key_arg.as_str();
-                let entries = parse_dict(&current)?;
+                let entries = borrow_dict(&current)?;
                 match entries.get(key) {
                     Some(v) => current = v.clone(),
                     None => {
@@ -99,10 +149,8 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
             let mut entries = parse_dict(&dict_val)?;
             if args.len() == 4 {
-                // Single key — remove directly
                 entries.shift_remove(args[3].as_str());
             } else {
-                // Nested unset
                 let keys: Vec<&str> = args[3..].iter().map(|v| v.as_str()).collect();
                 dict_unset_nested(&mut entries, &keys)?;
             }
@@ -115,10 +163,19 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() < 4 {
                 return Err(Error::wrong_args("dict exists", 4, args.len()));
             }
+            // Single-key fast path: zero-copy
+            if args.len() == 4 {
+                let entries = borrow_dict(&args[2]);
+                let key = args[3].as_str();
+                return Ok(Value::from_bool(
+                    entries.map_or(false, |e| e.contains_key(key)),
+                ));
+            }
+            // Multi-key: walk nested dicts
             let mut current = args[2].clone();
             for key_arg in &args[3..] {
                 let key = key_arg.as_str();
-                match current.as_dict() {
+                match current.as_dict_cow() {
                     Some(entries) => match entries.get(key) {
                         Some(v) => current = v.clone(),
                         None => return Ok(Value::from_bool(false)),
@@ -134,7 +191,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() < 3 || args.len() > 4 {
                 return Err(Error::wrong_args("dict keys", 3, args.len()));
             }
-            let entries = parse_dict(&args[2])?;
+            let entries = borrow_dict(&args[2])?;
             let pattern = if args.len() == 4 {
                 Some(args[3].as_str())
             } else {
@@ -145,7 +202,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .filter(|k| pattern.is_none() || glob_match(pattern.unwrap(), k))
                 .map(|k| Value::from_str(k))
                 .collect();
-            Ok(Value::from_list(&keys))
+            Ok(Value::from_list_cached(keys))
         }
 
         // ── dict values dictionary ?pattern? ───────────────────
@@ -153,7 +210,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() < 3 || args.len() > 4 {
                 return Err(Error::wrong_args("dict values", 3, args.len()));
             }
-            let entries = parse_dict(&args[2])?;
+            let entries = borrow_dict(&args[2])?;
             let pattern = if args.len() == 4 {
                 Some(args[3].as_str())
             } else {
@@ -164,7 +221,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .filter(|v| pattern.is_none() || glob_match(pattern.unwrap(), v.as_str()))
                 .cloned()
                 .collect();
-            Ok(Value::from_list(&values))
+            Ok(Value::from_list_cached(values))
         }
 
         // ── dict size dictionary ───────────────────────────────
@@ -172,7 +229,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() != 3 {
                 return Err(Error::wrong_args("dict size", 3, args.len()));
             }
-            let entries = parse_dict(&args[2])?;
+            let entries = borrow_dict(&args[2])?;
             Ok(Value::from_int(entries.len() as i64))
         }
 
@@ -195,6 +252,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let key_var = var_list[0].as_str().to_string();
             let val_var = var_list[1].as_str().to_string();
+            // Clone the dict: body evaluation may modify variables
             let entries = parse_dict(&args[3])?;
             let body = args[4].as_str();
             let mut result = Value::empty();
@@ -219,10 +277,15 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
         // ── dict merge ?dictionary ...? ────────────────────────
         "merge" => {
-            let mut entries = IndexMap::new();
+            let mut entries = DictMap::ordered();
             for arg in &args[2..] {
                 let new_entries = parse_dict(arg)?;
-                entries.extend(new_entries);
+                // Inherit ordering from the first dict that has entries
+                if entries.is_empty() && !new_entries.is_empty() {
+                    entries = new_entries;
+                } else {
+                    entries.extend(new_entries);
+                }
             }
             Ok(Value::from_dict_cached(entries))
         }
@@ -322,7 +385,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             for v in &args[4..] {
                 list.push(v.clone());
             }
-            let new_val = Value::from_list(&list);
+            let new_val = Value::from_list_cached(list);
             entries.insert(key.to_string(), new_val);
             let result = Value::from_dict_cached(entries);
             interp.set_var(var_name, result)
@@ -358,7 +421,6 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let var_name = args[2].as_str();
             let body = args[args.len() - 1].as_str();
 
-            // Navigate to nested dict if keys provided
             let dict_val = interp.get_var(var_name)?.clone();
             let mut current = dict_val;
             let keys: Vec<&str> = args[3..args.len() - 1]
@@ -372,7 +434,6 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
             let entries = parse_dict(&current)?;
 
-            // Save current variables and set dict keys as variables
             let saved: Vec<(String, Option<Value>)> = entries
                 .keys()
                 .map(|k| {
@@ -387,15 +448,13 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
             let result = interp.eval(body);
 
-            // Read back variables and update dict
-            let mut new_entries = IndexMap::with_capacity(entries.len());
+            let mut new_entries = entries.empty_like(entries.len());
             for k in entries.keys() {
                 if let Ok(v) = interp.get_var(k) {
                     new_entries.insert(k.clone(), v.clone());
                 }
             }
 
-            // Restore saved variables
             for (k, old) in saved {
                 if let Some(v) = old {
                     let _ = interp.set_var(&k, v);
@@ -423,22 +482,25 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let filter_type = args[3].as_str();
             let entries = parse_dict(&args[2])?;
+            let ordered = entries.is_ordered();
 
             match filter_type {
                 "key" => {
                     let pattern = args[4].as_str();
-                    let filtered: IndexMap<String, Value> = entries
-                        .into_iter()
-                        .filter(|(k, _)| glob_match(pattern, k))
-                        .collect();
+                    let filtered = DictMap::from_iter_with_order(
+                        ordered,
+                        entries.into_iter().filter(|(k, _)| glob_match(pattern, k)),
+                    );
                     Ok(Value::from_dict_cached(filtered))
                 }
                 "value" => {
                     let pattern = args[4].as_str();
-                    let filtered: IndexMap<String, Value> = entries
-                        .into_iter()
-                        .filter(|(_, v)| glob_match(pattern, v.as_str()))
-                        .collect();
+                    let filtered = DictMap::from_iter_with_order(
+                        ordered,
+                        entries
+                            .into_iter()
+                            .filter(|(_, v)| glob_match(pattern, v.as_str())),
+                    );
                     Ok(Value::from_dict_cached(filtered))
                 }
                 "script" => {
@@ -460,7 +522,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     let key_var = var_list[0].as_str().to_string();
                     let val_var = var_list[1].as_str().to_string();
                     let script = args[5].as_str();
-                    let mut filtered = IndexMap::new();
+                    let mut filtered = entries.empty_like(0);
                     for (k, v) in &entries {
                         interp.set_var(&key_var, Value::from_str(k))?;
                         interp.set_var(&val_var, v.clone())?;
@@ -514,7 +576,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let val_var = var_list[1].as_str().to_string();
             let entries = parse_dict(&args[3])?;
             let body = args[4].as_str();
-            let mut result_entries = IndexMap::with_capacity(entries.len());
+            let mut result_entries = entries.empty_like(entries.len());
             for (k, v) in &entries {
                 interp.set_var(&key_var, Value::from_str(k))?;
                 interp.set_var(&val_var, v.clone())?;
@@ -546,10 +608,12 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dictionary",
                 ));
             }
-            let entries = parse_dict(&args[2])?;
+            let entries = borrow_dict(&args[2])?;
+            let kind = if entries.is_ordered() { "ordered" } else { "unordered" };
             Ok(Value::from_str(&format!(
-                "{} entries in dict",
-                entries.len()
+                "{} entries in {} dict",
+                entries.len(),
+                kind,
             )))
         }
 
@@ -567,7 +631,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let mut current = args[2].clone();
             let keys = &args[3..args.len() - 1];
             for key in keys {
-                let entries = parse_dict(&current)?;
+                let entries = borrow_dict(&current)?;
                 match entries.get(key.as_str()) {
                     Some(v) => current = v.clone(),
                     None => return Ok(default.clone()),
@@ -596,7 +660,6 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let dict_val = interp.get_var(&var_name).ok().cloned().unwrap_or_default();
             let entries = parse_dict(&dict_val).unwrap_or_default();
 
-            // Set local variables from dict keys
             for (key, local_var) in &pairs {
                 if let Some(v) = entries.get(key.as_str()) {
                     interp.set_var(local_var, v.clone())?;
@@ -605,7 +668,6 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
             let result = interp.eval(&body);
 
-            // Write back from local variables to dict
             if interp.get_var(&var_name).is_ok() {
                 let cur_val = interp.get_var(&var_name).ok().cloned().unwrap_or_default();
                 let mut new_entries = parse_dict(&cur_val).unwrap_or_default();
@@ -641,10 +703,10 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 // ── Helpers ────────────────────────────────────────────────────
 
 fn dict_set_nested(
-    mut entries: IndexMap<String, Value>,
+    mut entries: DictMap,
     keys: &[&str],
     value: Value,
-) -> Result<IndexMap<String, Value>> {
+) -> Result<DictMap> {
     if keys.len() == 1 {
         entries.insert(keys[0].to_string(), value);
     } else {
@@ -657,7 +719,7 @@ fn dict_set_nested(
     Ok(entries)
 }
 
-fn dict_unset_nested(entries: &mut IndexMap<String, Value>, keys: &[&str]) -> Result<()> {
+fn dict_unset_nested(entries: &mut DictMap, keys: &[&str]) -> Result<()> {
     if keys.len() == 1 {
         entries.shift_remove(keys[0]);
     } else {
@@ -677,18 +739,17 @@ fn dict_unset_nested(entries: &mut IndexMap<String, Value>, keys: &[&str]) -> Re
 mod tests {
     use crate::interp::Interp;
 
+    // ── Ordered dict tests ─────────────────────────────────────
+
     #[test]
     fn test_dict_create_and_get() {
         let mut interp = Interp::new();
-        let r = interp.eval("dict create a 1 b 2").unwrap();
         assert_eq!(interp.eval("dict get {a 1 b 2} a").unwrap().as_str(), "1");
         assert_eq!(interp.eval("dict get {a 1 b 2} b").unwrap().as_str(), "2");
-        // round-trip: dict create returns a dict, dict get reads it
-        let r2 = interp
+        let r = interp
             .eval("dict get [dict create x 10 y 20] y")
             .unwrap();
-        assert_eq!(r2.as_str(), "20");
-        let _ = r;
+        assert_eq!(r.as_str(), "20");
     }
 
     #[test]
@@ -702,57 +763,52 @@ mod tests {
     #[test]
     fn test_dict_exists() {
         let mut interp = Interp::new();
-        let r = interp.eval("dict exists {a 1 b 2} a").unwrap();
-        assert_eq!(r.as_str(), "1");
-        let r2 = interp.eval("dict exists {a 1 b 2} c").unwrap();
-        assert_eq!(r2.as_str(), "0");
+        assert_eq!(interp.eval("dict exists {a 1 b 2} a").unwrap().as_str(), "1");
+        assert_eq!(interp.eval("dict exists {a 1 b 2} c").unwrap().as_str(), "0");
     }
 
     #[test]
     fn test_dict_keys_values() {
         let mut interp = Interp::new();
-        let r = interp.eval("dict keys {a 1 b 2 c 3}").unwrap();
-        assert_eq!(r.as_str(), "a b c");
-        let r2 = interp.eval("dict values {a 1 b 2 c 3}").unwrap();
-        assert_eq!(r2.as_str(), "1 2 3");
+        assert_eq!(interp.eval("dict keys {a 1 b 2 c 3}").unwrap().as_str(), "a b c");
+        assert_eq!(interp.eval("dict values {a 1 b 2 c 3}").unwrap().as_str(), "1 2 3");
     }
 
     #[test]
     fn test_dict_size() {
         let mut interp = Interp::new();
-        let r = interp.eval("dict size {a 1 b 2 c 3}").unwrap();
-        assert_eq!(r.as_str(), "3");
+        assert_eq!(interp.eval("dict size {a 1 b 2 c 3}").unwrap().as_str(), "3");
     }
 
     #[test]
     fn test_dict_remove() {
         let mut interp = Interp::new();
-        let r = interp
-            .eval("dict get [dict remove {a 1 b 2 c 3} b] a")
-            .unwrap();
-        assert_eq!(r.as_str(), "1");
-        let r2 = interp
-            .eval("dict size [dict remove {a 1 b 2 c 3} b]")
-            .unwrap();
-        assert_eq!(r2.as_str(), "2");
+        assert_eq!(
+            interp.eval("dict get [dict remove {a 1 b 2 c 3} b] a").unwrap().as_str(),
+            "1"
+        );
+        assert_eq!(
+            interp.eval("dict size [dict remove {a 1 b 2 c 3} b]").unwrap().as_str(),
+            "2"
+        );
     }
 
     #[test]
     fn test_dict_merge() {
         let mut interp = Interp::new();
-        let r = interp
-            .eval("dict get [dict merge {a 1 b 2} {c 3 d 4}] c")
-            .unwrap();
-        assert_eq!(r.as_str(), "3");
+        assert_eq!(
+            interp.eval("dict get [dict merge {a 1 b 2} {c 3 d 4}] c").unwrap().as_str(),
+            "3"
+        );
     }
 
     #[test]
     fn test_dict_replace() {
         let mut interp = Interp::new();
-        let r = interp
-            .eval("dict get [dict replace {a 1 b 2} b 99] b")
-            .unwrap();
-        assert_eq!(r.as_str(), "99");
+        assert_eq!(
+            interp.eval("dict get [dict replace {a 1 b 2} b 99] b").unwrap().as_str(),
+            "99"
+        );
     }
 
     #[test]
@@ -760,109 +816,90 @@ mod tests {
         let mut interp = Interp::new();
         interp.eval("set d [dict create count 5]").unwrap();
         interp.eval("dict incr d count").unwrap();
-        let r = interp.eval("dict get $d count").unwrap();
-        assert_eq!(r.as_str(), "6");
+        assert_eq!(interp.eval("dict get $d count").unwrap().as_str(), "6");
     }
 
     #[test]
     fn test_dict_for_basic() {
         let mut interp = Interp::new();
         interp.eval("set result {}").unwrap();
-        interp
-            .eval("dict for {k v} {a 1 b 2} { lappend result $k=$v }")
-            .unwrap();
-        let r = interp.eval("set result").unwrap();
-        assert_eq!(r.as_str(), "a=1 b=2");
+        interp.eval("dict for {k v} {a 1 b 2} { lappend result $k=$v }").unwrap();
+        assert_eq!(interp.eval("set result").unwrap().as_str(), "a=1 b=2");
     }
 
     #[test]
     fn test_dict_getwithdefault_found() {
         let mut interp = Interp::new();
-        let r = interp
-            .eval(r#"dict getwithdefault {a 1 b 2} a "default""#)
-            .unwrap();
-        assert_eq!(r.as_str(), "1");
+        assert_eq!(
+            interp.eval(r#"dict getwithdefault {a 1 b 2} a "default""#).unwrap().as_str(),
+            "1"
+        );
     }
 
     #[test]
     fn test_dict_getwithdefault_not_found() {
         let mut interp = Interp::new();
-        let r = interp
-            .eval(r#"dict getwithdefault {a 1 b 2} c "default""#)
-            .unwrap();
-        assert_eq!(r.as_str(), "default");
+        assert_eq!(
+            interp.eval(r#"dict getwithdefault {a 1 b 2} c "default""#).unwrap().as_str(),
+            "default"
+        );
     }
 
     #[test]
     fn test_dict_getwithdefault_nested() {
         let mut interp = Interp::new();
-        let r = interp
-            .eval(r#"dict getwithdefault {a {x 10 y 20} b 2} a y "nope""#)
-            .unwrap();
-        assert_eq!(r.as_str(), "20");
+        assert_eq!(
+            interp.eval(r#"dict getwithdefault {a {x 10 y 20} b 2} a y "nope""#).unwrap().as_str(),
+            "20"
+        );
     }
 
     #[test]
     fn test_dict_update_basic() {
         let mut interp = Interp::new();
-        interp
-            .eval(r#"set d [dict create name "Jim" age 30]"#)
-            .unwrap();
-        interp
-            .eval(r#"dict update d name n age a { set n "Updated"; set a 31 }"#)
-            .unwrap();
-        let r2 = interp.eval("dict get $d name").unwrap();
-        assert_eq!(r2.as_str(), "Updated");
-        let r3 = interp.eval("dict get $d age").unwrap();
-        assert_eq!(r3.as_str(), "31");
+        interp.eval(r#"set d [dict create name "Jim" age 30]"#).unwrap();
+        interp.eval(r#"dict update d name n age a { set n "Updated"; set a 31 }"#).unwrap();
+        assert_eq!(interp.eval("dict get $d name").unwrap().as_str(), "Updated");
+        assert_eq!(interp.eval("dict get $d age").unwrap().as_str(), "31");
     }
 
     #[test]
     fn test_dict_update_return_body() {
         let mut interp = Interp::new();
         interp.eval(r#"set d {x 10}"#).unwrap();
-        let r = interp
-            .eval(r#"dict update d x v { expr {$v + 5} }"#)
-            .unwrap();
+        let r = interp.eval(r#"dict update d x v { expr {$v + 5} }"#).unwrap();
         assert_eq!(r.as_str(), "15");
     }
 
     #[test]
     fn test_dict_getdef_tcl() {
         let mut interp = Interp::new();
-        let r = interp
-            .eval(r#"dict getdef {a 1 b 2} c "fallback""#)
-            .unwrap();
-        assert_eq!(r.as_str(), "fallback");
-        let r2 = interp
-            .eval(r#"dict getdef {a 1 b 2} a "fallback""#)
-            .unwrap();
-        assert_eq!(r2.as_str(), "1");
+        assert_eq!(
+            interp.eval(r#"dict getdef {a 1 b 2} c "fallback""#).unwrap().as_str(),
+            "fallback"
+        );
+        assert_eq!(
+            interp.eval(r#"dict getdef {a 1 b 2} a "fallback""#).unwrap().as_str(),
+            "1"
+        );
     }
 
     #[test]
     fn test_dict_filter_key() {
         let mut interp = Interp::new();
-        let r = interp
-            .eval("dict keys [dict filter {abc 1 abd 2 xyz 3} key ab*]")
-            .unwrap();
-        assert_eq!(r.as_str(), "abc abd");
+        assert_eq!(
+            interp.eval("dict keys [dict filter {abc 1 abd 2 xyz 3} key ab*]").unwrap().as_str(),
+            "abc abd"
+        );
     }
 
     #[test]
     fn test_dict_map_basic() {
         let mut interp = Interp::new();
-        let r = interp
-            .eval("dict get [dict map {k v} {a 1 b 2} { expr {$v * 10} }] b")
-            .unwrap();
-        assert_eq!(r.as_str(), "20");
-    }
-
-    #[test]
-    fn test_dict_preserves_insertion_order() {
-        let mut interp = Interp::new();
-        let r = interp.eval("dict keys [dict create z 1 a 2 m 3]").unwrap();
-        assert_eq!(r.as_str(), "z a m");
+        assert_eq!(
+            interp.eval("dict get [dict map {k v} {a 1 b 2} { expr {$v * 10} }] b").unwrap().as_str(),
+            "20"
+        );
     }
 
     #[test]
@@ -870,7 +907,219 @@ mod tests {
         let mut interp = Interp::new();
         interp.eval("set d [dict create]").unwrap();
         interp.eval("dict set d a b 42").unwrap();
-        let r = interp.eval("dict get $d a b").unwrap();
-        assert_eq!(r.as_str(), "42");
+        assert_eq!(interp.eval("dict get $d a b").unwrap().as_str(), "42");
+    }
+
+    // ── Ordered-specific tests ─────────────────────────────────
+
+    #[test]
+    fn test_dict_preserves_insertion_order() {
+        let mut interp = Interp::new();
+        assert_eq!(
+            interp.eval("dict keys [dict create z 1 a 2 m 3]").unwrap().as_str(),
+            "z a m"
+        );
+    }
+
+    #[test]
+    fn test_dict_ordered_explicit_flag() {
+        let mut interp = Interp::new();
+        assert_eq!(
+            interp.eval("dict keys [dict create -ordered z 1 a 2 m 3]").unwrap().as_str(),
+            "z a m"
+        );
+    }
+
+    #[test]
+    fn test_dict_ordered_for_preserves_order() {
+        let mut interp = Interp::new();
+        interp.eval("set result {}").unwrap();
+        interp.eval("dict for {k v} [dict create z 1 a 2 m 3] { lappend result $k }").unwrap();
+        assert_eq!(interp.eval("set result").unwrap().as_str(), "z a m");
+    }
+
+    #[test]
+    fn test_dict_ordered_replace_preserves_order() {
+        let mut interp = Interp::new();
+        // Replace existing key — order should remain
+        let r = interp.eval("dict keys [dict replace [dict create z 1 a 2 m 3] a 99]").unwrap();
+        assert_eq!(r.as_str(), "z a m");
+    }
+
+    #[test]
+    fn test_dict_ordered_merge_preserves_order() {
+        let mut interp = Interp::new();
+        let r = interp
+            .eval("dict keys [dict merge [dict create z 1 a 2] [dict create m 3 b 4]]")
+            .unwrap();
+        assert_eq!(r.as_str(), "z a m b");
+    }
+
+    #[test]
+    fn test_dict_ordered_remove_preserves_order() {
+        let mut interp = Interp::new();
+        let r = interp
+            .eval("dict keys [dict remove [dict create z 1 a 2 m 3] a]")
+            .unwrap();
+        assert_eq!(r.as_str(), "z m");
+    }
+
+    #[test]
+    fn test_dict_ordered_filter_preserves_order() {
+        let mut interp = Interp::new();
+        let r = interp
+            .eval("dict keys [dict filter [dict create bz 1 aa 2 ba 3 ab 4] key a*]")
+            .unwrap();
+        assert_eq!(r.as_str(), "aa ab");
+    }
+
+    #[test]
+    fn test_dict_ordered_map_preserves_order() {
+        let mut interp = Interp::new();
+        let r = interp
+            .eval("dict keys [dict map {k v} [dict create z 1 a 2 m 3] { expr {$v * 10} }]")
+            .unwrap();
+        assert_eq!(r.as_str(), "z a m");
+    }
+
+    #[test]
+    fn test_dict_ordered_set_preserves_existing_order() {
+        let mut interp = Interp::new();
+        interp.eval("set d [dict create z 1 a 2 m 3]").unwrap();
+        interp.eval("dict set d a 99").unwrap();
+        assert_eq!(interp.eval("dict keys $d").unwrap().as_str(), "z a m");
+        assert_eq!(interp.eval("dict get $d a").unwrap().as_str(), "99");
+    }
+
+    // ── Unordered dict tests ───────────────────────────────────
+
+    #[test]
+    fn test_dict_unordered_create() {
+        let mut interp = Interp::new();
+        // Create unordered — all keys/values should be present (order not guaranteed)
+        interp.eval("set d [dict create -unordered a 1 b 2 c 3]").unwrap();
+        assert_eq!(interp.eval("dict size $d").unwrap().as_str(), "3");
+        assert_eq!(interp.eval("dict get $d a").unwrap().as_str(), "1");
+        assert_eq!(interp.eval("dict get $d b").unwrap().as_str(), "2");
+        assert_eq!(interp.eval("dict get $d c").unwrap().as_str(), "3");
+    }
+
+    #[test]
+    fn test_dict_unordered_set_get() {
+        let mut interp = Interp::new();
+        interp.eval("set d [dict create -unordered]").unwrap();
+        interp.eval("dict set d x 10").unwrap();
+        interp.eval("dict set d y 20").unwrap();
+        assert_eq!(interp.eval("dict get $d x").unwrap().as_str(), "10");
+        assert_eq!(interp.eval("dict get $d y").unwrap().as_str(), "20");
+        assert_eq!(interp.eval("dict size $d").unwrap().as_str(), "2");
+    }
+
+    #[test]
+    fn test_dict_unordered_exists() {
+        let mut interp = Interp::new();
+        interp.eval("set d [dict create -unordered a 1 b 2]").unwrap();
+        assert_eq!(interp.eval("dict exists $d a").unwrap().as_str(), "1");
+        assert_eq!(interp.eval("dict exists $d c").unwrap().as_str(), "0");
+    }
+
+    #[test]
+    fn test_dict_unordered_remove() {
+        let mut interp = Interp::new();
+        interp.eval("set d [dict create -unordered a 1 b 2 c 3]").unwrap();
+        let r = interp.eval("dict size [dict remove $d b]").unwrap();
+        assert_eq!(r.as_str(), "2");
+        assert_eq!(
+            interp.eval("dict exists [dict remove $d b] b").unwrap().as_str(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn test_dict_unordered_incr() {
+        let mut interp = Interp::new();
+        interp.eval("set d [dict create -unordered count 5]").unwrap();
+        interp.eval("dict incr d count 3").unwrap();
+        assert_eq!(interp.eval("dict get $d count").unwrap().as_str(), "8");
+    }
+
+    #[test]
+    fn test_dict_unordered_replace() {
+        let mut interp = Interp::new();
+        interp.eval("set d [dict create -unordered a 1 b 2]").unwrap();
+        let r = interp.eval("dict get [dict replace $d b 99] b").unwrap();
+        assert_eq!(r.as_str(), "99");
+    }
+
+    #[test]
+    fn test_dict_unordered_for() {
+        let mut interp = Interp::new();
+        interp.eval("set d [dict create -unordered x 10 y 20]").unwrap();
+        interp.eval("set total 0").unwrap();
+        interp.eval("dict for {k v} $d { set total [expr {$total + $v}] }").unwrap();
+        assert_eq!(interp.eval("set total").unwrap().as_str(), "30");
+    }
+
+    #[test]
+    fn test_dict_unordered_merge() {
+        let mut interp = Interp::new();
+        interp.eval("set a [dict create -unordered x 1 y 2]").unwrap();
+        interp.eval("set b [dict create -unordered z 3]").unwrap();
+        let r = interp.eval("dict size [dict merge $a $b]").unwrap();
+        assert_eq!(r.as_str(), "3");
+    }
+
+    #[test]
+    fn test_dict_unordered_filter_key() {
+        let mut interp = Interp::new();
+        interp.eval("set d [dict create -unordered ab 1 ac 2 ba 3]").unwrap();
+        let r = interp.eval("dict size [dict filter $d key a*]").unwrap();
+        assert_eq!(r.as_str(), "2");
+    }
+
+    #[test]
+    fn test_dict_unordered_info() {
+        let mut interp = Interp::new();
+        interp.eval("set d [dict create -unordered a 1 b 2]").unwrap();
+        let r = interp.eval("dict info $d").unwrap();
+        assert!(r.as_str().contains("unordered"));
+        assert!(r.as_str().contains("2 entries"));
+    }
+
+    #[test]
+    fn test_dict_ordered_info() {
+        let mut interp = Interp::new();
+        let r = interp.eval("dict info {a 1 b 2}").unwrap();
+        assert!(r.as_str().contains("ordered"));
+        assert!(r.as_str().contains("2 entries"));
+    }
+
+    #[test]
+    fn test_dict_unordered_keys_values_contain_all() {
+        let mut interp = Interp::new();
+        interp.eval("set d [dict create -unordered x 10 y 20 z 30]").unwrap();
+        // We can't assert order, but we can assert all values are present
+        let keys = interp.eval("dict keys $d").unwrap();
+        let keys_str = keys.as_str();
+        assert!(keys_str.contains("x"));
+        assert!(keys_str.contains("y"));
+        assert!(keys_str.contains("z"));
+        let vals = interp.eval("dict values $d").unwrap();
+        let vals_str = vals.as_str();
+        assert!(vals_str.contains("10"));
+        assert!(vals_str.contains("20"));
+        assert!(vals_str.contains("30"));
+    }
+
+    #[test]
+    fn test_dict_unordered_serialization_roundtrip() {
+        let mut interp = Interp::new();
+        interp.eval("set d [dict create -unordered a 1 b 2 c 3]").unwrap();
+        // Serialize to string, then parse back — all keys should survive
+        interp.eval("set s [set d]").unwrap();
+        assert_eq!(interp.eval("dict size $s").unwrap().as_str(), "3");
+        assert_eq!(interp.eval("dict get $s a").unwrap().as_str(), "1");
+        assert_eq!(interp.eval("dict get $s b").unwrap().as_str(), "2");
+        assert_eq!(interp.eval("dict get $s c").unwrap().as_str(), "3");
     }
 }

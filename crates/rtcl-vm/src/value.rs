@@ -19,6 +19,8 @@
 
 use core::fmt;
 use core::str::FromStr;
+use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
@@ -41,12 +43,188 @@ pub enum InternalRep {
     Bool(bool),
     /// Cached list of values (avoids re-parsing the string)
     List(Vec<Value>),
-    /// Cached dict — insertion-ordered map with O(1) key lookup.
-    /// Uses `String` keys (Tcl's "everything is a string" model) and
-    /// preserves insertion order (required by Tcl dict semantics).
-    Dict(IndexMap<String, Value>),
+    /// Cached dict — supports both ordered (insertion-order) and unordered modes.
+    Dict(DictMap),
     /// No internal representation yet
     None,
+}
+
+// ── DictMap ────────────────────────────────────────────────────
+
+/// Dictionary map supporting both ordered (insertion-order) and unordered modes.
+///
+/// - `Ordered`: backed by `IndexMap`, preserves insertion order (standard Tcl dict semantics)
+/// - `Unordered`: backed by `HashMap`, no order guarantee (faster for large dicts)
+#[derive(Debug, Clone)]
+pub enum DictMap {
+    Ordered(IndexMap<String, Value>),
+    Unordered(HashMap<String, Value>),
+}
+
+impl Default for DictMap {
+    fn default() -> Self { DictMap::Ordered(IndexMap::new()) }
+}
+
+impl DictMap {
+    pub fn ordered() -> Self { DictMap::Ordered(IndexMap::new()) }
+    pub fn unordered() -> Self { DictMap::Unordered(HashMap::new()) }
+
+    pub fn ordered_with_capacity(cap: usize) -> Self {
+        DictMap::Ordered(IndexMap::with_capacity(cap))
+    }
+    pub fn unordered_with_capacity(cap: usize) -> Self {
+        DictMap::Unordered(HashMap::with_capacity(cap))
+    }
+
+    pub fn is_ordered(&self) -> bool { matches!(self, DictMap::Ordered(_)) }
+
+    /// Build a new DictMap with the given ordering mode from an iterator.
+    pub fn from_iter_with_order<I>(ordered: bool, iter: I) -> Self
+    where
+        I: IntoIterator<Item = (String, Value)>,
+    {
+        if ordered {
+            DictMap::Ordered(iter.into_iter().collect())
+        } else {
+            DictMap::Unordered(iter.into_iter().collect())
+        }
+    }
+
+    /// Create an empty DictMap matching the ordering mode of `self`.
+    pub fn empty_like(&self, capacity: usize) -> Self {
+        if self.is_ordered() {
+            DictMap::ordered_with_capacity(capacity)
+        } else {
+            DictMap::unordered_with_capacity(capacity)
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        match self { DictMap::Ordered(m) => m.get(key), DictMap::Unordered(m) => m.get(key) }
+    }
+
+    pub fn insert(&mut self, key: String, value: Value) -> Option<Value> {
+        match self { DictMap::Ordered(m) => m.insert(key, value), DictMap::Unordered(m) => m.insert(key, value) }
+    }
+
+    /// Remove a key (preserves order for ordered maps).
+    pub fn shift_remove(&mut self, key: &str) -> Option<Value> {
+        match self { DictMap::Ordered(m) => m.shift_remove(key), DictMap::Unordered(m) => m.remove(key) }
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        match self { DictMap::Ordered(m) => m.contains_key(key), DictMap::Unordered(m) => m.contains_key(key) }
+    }
+
+    pub fn len(&self) -> usize {
+        match self { DictMap::Ordered(m) => m.len(), DictMap::Unordered(m) => m.len() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self { DictMap::Ordered(m) => m.is_empty(), DictMap::Unordered(m) => m.is_empty() }
+    }
+
+    pub fn keys(&self) -> DictKeys<'_> {
+        match self {
+            DictMap::Ordered(m) => DictKeys::Ordered(m.keys()),
+            DictMap::Unordered(m) => DictKeys::Unordered(m.keys()),
+        }
+    }
+
+    pub fn values(&self) -> DictValues<'_> {
+        match self {
+            DictMap::Ordered(m) => DictValues::Ordered(m.values()),
+            DictMap::Unordered(m) => DictValues::Unordered(m.values()),
+        }
+    }
+
+    pub fn iter(&self) -> DictIter<'_> {
+        match self {
+            DictMap::Ordered(m) => DictIter::Ordered(m.iter()),
+            DictMap::Unordered(m) => DictIter::Unordered(m.iter()),
+        }
+    }
+}
+
+impl Extend<(String, Value)> for DictMap {
+    fn extend<I: IntoIterator<Item = (String, Value)>>(&mut self, iter: I) {
+        match self { DictMap::Ordered(m) => m.extend(iter), DictMap::Unordered(m) => m.extend(iter) }
+    }
+}
+
+impl IntoIterator for DictMap {
+    type Item = (String, Value);
+    type IntoIter = DictIntoIter;
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            DictMap::Ordered(m) => DictIntoIter::Ordered(m.into_iter()),
+            DictMap::Unordered(m) => DictIntoIter::Unordered(m.into_iter()),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a DictMap {
+    type Item = (&'a String, &'a Value);
+    type IntoIter = DictIter<'a>;
+    fn into_iter(self) -> Self::IntoIter { self.iter() }
+}
+
+// ── Iterator types ─────────────────────────────────────────────
+
+pub enum DictIter<'a> {
+    Ordered(indexmap::map::Iter<'a, String, Value>),
+    Unordered(std::collections::hash_map::Iter<'a, String, Value>),
+}
+impl<'a> Iterator for DictIter<'a> {
+    type Item = (&'a String, &'a Value);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self { DictIter::Ordered(i) => i.next(), DictIter::Unordered(i) => i.next() }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self { DictIter::Ordered(i) => i.size_hint(), DictIter::Unordered(i) => i.size_hint() }
+    }
+}
+
+pub enum DictIntoIter {
+    Ordered(indexmap::map::IntoIter<String, Value>),
+    Unordered(std::collections::hash_map::IntoIter<String, Value>),
+}
+impl Iterator for DictIntoIter {
+    type Item = (String, Value);
+    fn next(&mut self) -> Option<Self::Item> {
+        match self { DictIntoIter::Ordered(i) => i.next(), DictIntoIter::Unordered(i) => i.next() }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self { DictIntoIter::Ordered(i) => i.size_hint(), DictIntoIter::Unordered(i) => i.size_hint() }
+    }
+}
+
+pub enum DictKeys<'a> {
+    Ordered(indexmap::map::Keys<'a, String, Value>),
+    Unordered(std::collections::hash_map::Keys<'a, String, Value>),
+}
+impl<'a> Iterator for DictKeys<'a> {
+    type Item = &'a String;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self { DictKeys::Ordered(i) => i.next(), DictKeys::Unordered(i) => i.next() }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self { DictKeys::Ordered(i) => i.size_hint(), DictKeys::Unordered(i) => i.size_hint() }
+    }
+}
+
+pub enum DictValues<'a> {
+    Ordered(indexmap::map::Values<'a, String, Value>),
+    Unordered(std::collections::hash_map::Values<'a, String, Value>),
+}
+impl<'a> Iterator for DictValues<'a> {
+    type Item = &'a Value;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self { DictValues::Ordered(i) => i.next(), DictValues::Unordered(i) => i.next() }
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self { DictValues::Ordered(i) => i.size_hint(), DictValues::Unordered(i) => i.size_hint() }
+    }
 }
 
 /// Inner data shared via `Rc`.
@@ -55,10 +233,10 @@ pub enum InternalRep {
 /// Rust's allocator handles recycling.
 #[derive(Debug, Clone)]
 struct ValueInner {
-    /// String representation — `None` means it must be regenerated
-    /// from `rep` (the "dirty" / invalidated state, like jimtcl's
-    /// `bytes == NULL`).
-    string: Option<SmallVec<[u8; INLINE_SIZE]>>,
+    /// String representation — lazily materialized via `OnceCell`.
+    /// Empty cell means it will be generated on first `as_str()` access
+    /// from `rep` (like jimtcl's `bytes == NULL`).
+    string: OnceCell<SmallVec<[u8; INLINE_SIZE]>>,
     /// Cached typed representation.
     rep: InternalRep,
 }
@@ -83,7 +261,7 @@ impl Value {
     pub fn empty() -> Self {
         Value {
             inner: Rc::new(ValueInner {
-                string: Some(SmallVec::new()),
+                string: OnceCell::from(SmallVec::new()),
                 rep: InternalRep::None,
             }),
         }
@@ -94,7 +272,7 @@ impl Value {
     pub fn from_str(s: &str) -> Self {
         Value {
             inner: Rc::new(ValueInner {
-                string: Some(SmallVec::from_slice(s.as_bytes())),
+                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
                 rep: InternalRep::None,
             }),
         }
@@ -105,7 +283,7 @@ impl Value {
         let s = format_int(n);
         Value {
             inner: Rc::new(ValueInner {
-                string: Some(SmallVec::from_slice(s.as_bytes())),
+                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
                 rep: InternalRep::Int(n),
             }),
         }
@@ -116,7 +294,7 @@ impl Value {
         let s = format_float(n);
         Value {
             inner: Rc::new(ValueInner {
-                string: Some(SmallVec::from_slice(s.as_bytes())),
+                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
                 rep: InternalRep::Float(n),
             }),
         }
@@ -127,7 +305,7 @@ impl Value {
         let s = if b { "1" } else { "0" };
         Value {
             inner: Rc::new(ValueInner {
-                string: Some(SmallVec::from_slice(s.as_bytes())),
+                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
                 rep: InternalRep::Bool(b),
             }),
         }
@@ -141,7 +319,7 @@ impl Value {
     pub fn from_list_cached(items: Vec<Value>) -> Self {
         Value {
             inner: Rc::new(ValueInner {
-                string: None, // lazy — will be generated on demand
+                string: OnceCell::new(), // lazy — generated on first as_str()
                 rep: InternalRep::List(items),
             }),
         }
@@ -150,16 +328,16 @@ impl Value {
     /// Create a value directly from a cached dict.
     ///
     /// The string representation is lazily generated on first `as_str()`.
-    pub fn from_dict_cached(entries: IndexMap<String, Value>) -> Self {
+    pub fn from_dict_cached(entries: DictMap) -> Self {
         Value {
             inner: Rc::new(ValueInner {
-                string: None,
+                string: OnceCell::new(),
                 rep: InternalRep::Dict(entries),
             }),
         }
     }
 
-    /// Create a dict value from key-value pairs.
+    /// Create a dict value from key-value pairs (ordered).
     pub fn from_dict_pairs(pairs: &[(Value, Value)]) -> Self {
         let mut map = IndexMap::with_capacity(pairs.len());
         for (k, v) in pairs {
@@ -167,8 +345,8 @@ impl Value {
         }
         Value {
             inner: Rc::new(ValueInner {
-                string: None,
-                rep: InternalRep::Dict(map),
+                string: OnceCell::new(),
+                rep: InternalRep::Dict(DictMap::Ordered(map)),
             }),
         }
     }
@@ -179,7 +357,7 @@ impl Value {
         let s = serialize_list(items);
         Value {
             inner: Rc::new(ValueInner {
-                string: Some(SmallVec::from_slice(s.as_bytes())),
+                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
                 rep: InternalRep::List(items.to_vec()),
             }),
         }
@@ -189,60 +367,39 @@ impl Value {
 
     /// Get the string representation.
     ///
-    /// If the string has been invalidated (e.g. after an in-place list
-    /// mutation), it is regenerated from the internal representation.
+    /// If the string has not been materialized yet (lazy value), it is
+    /// auto-generated from the internal representation via `OnceCell`.
     pub fn as_str(&self) -> &str {
-        // Fast path: string is already materialized
-        if let Some(ref bytes) = self.inner.string {
-            // Safety: we always store valid UTF-8
-            return unsafe { core::str::from_utf8_unchecked(bytes) };
-        }
-        // Slow path should not happen in practice because we always
-        // ensure the string is materialized before returning &str.
-        // But as a safety net, return empty string.
-        //
-        // The real lazy-regen path is handled by ensure_string() which
-        // must be called before as_str() when the value was mutated.
-        ""
+        let bytes = self.inner.string.get_or_init(|| {
+            match &self.inner.rep {
+                InternalRep::List(items) => {
+                    SmallVec::from_slice(serialize_list(items).as_bytes())
+                }
+                InternalRep::Dict(map) => {
+                    SmallVec::from_slice(serialize_dict(map).as_bytes())
+                }
+                InternalRep::Int(n) => SmallVec::from_slice(format_int(*n).as_bytes()),
+                InternalRep::Float(n) => SmallVec::from_slice(format_float(*n).as_bytes()),
+                InternalRep::Bool(b) => {
+                    SmallVec::from_slice(if *b { b"1" } else { b"0" })
+                }
+                InternalRep::None => SmallVec::new(),
+            }
+        });
+        // Safety: we always store valid UTF-8
+        unsafe { core::str::from_utf8_unchecked(bytes) }
     }
 
     /// Ensure the string representation is materialized.
-    /// Call this before passing the value to code that needs `.as_str()`.
+    /// With `OnceCell`, `as_str()` auto-materializes, so this is now a convenience.
     pub fn ensure_string(&mut self) {
-        if self.inner.string.is_none() {
-            let s = match &self.inner.rep {
-                InternalRep::List(items) => serialize_list(items),
-                InternalRep::Dict(map) => serialize_dict(map),
-                InternalRep::Int(n) => format_int(*n),
-                InternalRep::Float(n) => format_float(*n),
-                InternalRep::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
-                InternalRep::None => String::new(),
-            };
-            Rc::make_mut(&mut self.inner).string =
-                Some(SmallVec::from_slice(s.as_bytes()));
-        }
+        let _ = self.as_str();
     }
 
     /// Get the string representation, materializing it if needed.
-    ///
-    /// Returns an owned `String` to avoid lifetime issues when the
-    /// string was lazily generated.
+    /// Now simply delegates to `as_str()` since `OnceCell` handles lazy init.
     pub fn to_str(&self) -> std::borrow::Cow<'_, str> {
-        if let Some(ref bytes) = self.inner.string {
-            std::borrow::Cow::Borrowed(
-                unsafe { core::str::from_utf8_unchecked(bytes) }
-            )
-        } else {
-            let s = match &self.inner.rep {
-                InternalRep::List(items) => serialize_list(items),
-                InternalRep::Dict(map) => serialize_dict(map),
-                InternalRep::Int(n) => format_int(*n),
-                InternalRep::Float(n) => format_float(*n),
-                InternalRep::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
-                InternalRep::None => String::new(),
-            };
-            std::borrow::Cow::Owned(s)
-        }
+        std::borrow::Cow::Borrowed(self.as_str())
     }
 
     /// Try to get as integer
@@ -313,40 +470,35 @@ impl Value {
         }
     }
 
-    /// Get the value as a dict (ordered key-value pairs).
-    ///
-    /// Returns cached pairs when the internal rep is already `Dict`,
-    /// otherwise parses from the string/list representation.
-    /// Get a reference to the dict's IndexMap if the internal rep is Dict.
+    /// Get a reference to the dict's DictMap if the internal rep is Dict.
     /// Zero-copy — does not clone.
-    pub fn as_dict_ref(&self) -> Option<&IndexMap<String, Value>> {
+    pub fn as_dict_ref(&self) -> Option<&DictMap> {
         match &self.inner.rep {
             InternalRep::Dict(map) => Some(map),
             _ => None,
         }
     }
 
-    /// Get a mutable reference to the dict's IndexMap (COW).
-    pub fn as_dict_mut(&mut self) -> Option<&mut IndexMap<String, Value>> {
-        // Only if already a Dict
+    /// Get a mutable reference to the dict's DictMap (COW).
+    pub fn as_dict_mut(&mut self) -> Option<&mut DictMap> {
         if !matches!(&self.inner.rep, InternalRep::Dict(_)) {
             return None;
         }
         let inner = Rc::make_mut(&mut self.inner);
-        inner.string = None; // invalidate string
+        inner.string = OnceCell::new(); // invalidate string
         match &mut inner.rep {
             InternalRep::Dict(map) => Some(map),
             _ => None,
         }
     }
 
-    /// Parse or return a dict as an owned IndexMap.
-    pub fn as_dict(&self) -> Option<IndexMap<String, Value>> {
+    /// Parse or return a dict as an owned DictMap.
+    pub fn as_dict(&self) -> Option<DictMap> {
         match &self.inner.rep {
             InternalRep::Dict(map) => Some(map.clone()),
             InternalRep::List(items) => {
                 if items.len() % 2 != 0 { return None; }
-                let mut map = IndexMap::with_capacity(items.len() / 2);
+                let mut map = DictMap::ordered_with_capacity(items.len() / 2);
                 for c in items.chunks(2) {
                     map.insert(c[0].as_str().to_string(), c[1].clone());
                 }
@@ -356,7 +508,7 @@ impl Value {
                 let s = self.to_str();
                 let list = parse_list(&s)?;
                 if list.len() % 2 != 0 { return None; }
-                let mut map = IndexMap::with_capacity(list.len() / 2);
+                let mut map = DictMap::ordered_with_capacity(list.len() / 2);
                 for c in list.chunks(2) {
                     map.insert(c[0].as_str().to_string(), c[1].clone());
                 }
@@ -365,9 +517,35 @@ impl Value {
         }
     }
 
+    /// Borrow the dict without cloning when the internal rep is already Dict.
+    /// Returns `Cow::Borrowed` for zero-copy access, `Cow::Owned` when parsing is needed.
+    pub fn as_dict_cow(&self) -> Option<std::borrow::Cow<'_, DictMap>> {
+        match &self.inner.rep {
+            InternalRep::Dict(map) => Some(std::borrow::Cow::Borrowed(map)),
+            InternalRep::List(items) => {
+                if items.len() % 2 != 0 { return None; }
+                let mut map = DictMap::ordered_with_capacity(items.len() / 2);
+                for c in items.chunks(2) {
+                    map.insert(c[0].as_str().to_string(), c[1].clone());
+                }
+                Some(std::borrow::Cow::Owned(map))
+            }
+            _ => {
+                let s = self.to_str();
+                let list = parse_list(&s)?;
+                if list.len() % 2 != 0 { return None; }
+                let mut map = DictMap::ordered_with_capacity(list.len() / 2);
+                for c in list.chunks(2) {
+                    map.insert(c[0].as_str().to_string(), c[1].clone());
+                }
+                Some(std::borrow::Cow::Owned(map))
+            }
+        }
+    }
+
     /// Check if the value is empty
     pub fn is_empty(&self) -> bool {
-        if let Some(ref bytes) = self.inner.string {
+        if let Some(bytes) = self.inner.string.get() {
             bytes.is_empty()
         } else {
             match &self.inner.rep {
@@ -474,7 +652,7 @@ impl From<f64> for Value {
 }
 
 /// Serialize dict entries into a Tcl list string (key1 val1 key2 val2 ...).
-fn serialize_dict(map: &IndexMap<String, Value>) -> String {
+fn serialize_dict(map: &DictMap) -> String {
     let items: Vec<Value> = map
         .iter()
         .flat_map(|(k, v)| [Value::from_str(k), v.clone()])

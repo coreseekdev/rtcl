@@ -12,6 +12,10 @@ rtcl-parser.workspace = true
 rtcl-vm.workspace = true
 indexmap.workspace = true
 
+[dependencies.glob]
+workspace = true
+optional = true
+
 [dependencies.regex]
 workspace = true
 optional = true
@@ -27,7 +31,7 @@ std = []
 # Tcl standard library — all extensions combined
 rtcl_std = ["file", "io", "exec", "clock", "regexp", "env", "signal", "package"]
 # Individual Tcl extensions (each implies Rust std)
-file = ["std"]                    # file, cd, pwd, glob, readdir, source
+file = ["std", "dep:glob"]        # file, cd, pwd, glob, readdir, source
 io = ["std"]                      # channel I/O: open, close, read, gets, seek, tell, eof, flush, fconfigure, pid
 exec = ["std"]                    # exec, wait
 clock = ["std"]                   # clock seconds/clicks/format/scan

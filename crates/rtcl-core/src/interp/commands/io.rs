@@ -1,7 +1,7 @@
 //! I/O and file commands: puts, source, file, format, glob.
 
 use crate::error::{Error, Result};
-use crate::interp::{glob_match, Interp};
+use crate::interp::Interp;
 use crate::value::Value;
 
 // ---------- puts ----------
@@ -832,7 +832,8 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let mut i = 1;
     let mut nocomplain = false;
-    let mut directory = None;
+    let mut directory: Option<String> = None;
+    let mut types: Option<String> = None;
 
     while i < args.len() && args[i].as_str().starts_with('-') {
         match args[i].as_str() {
@@ -845,6 +846,14 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     return Err(Error::wrong_args("glob", 2, args.len()));
                 }
             }
+            "-types" | "-type" => {
+                if i + 1 < args.len() {
+                    types = Some(args[i + 1].as_str().to_ascii_lowercase());
+                    i += 2;
+                } else {
+                    return Err(Error::wrong_args("glob", 2, args.len()));
+                }
+            }
             "--" => { i += 1; break; }
             _ => break,
         }
@@ -852,19 +861,42 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let mut results: Vec<Value> = Vec::new();
     for j in i..args.len() {
-        let pattern = args[j].as_str();
-        let search_dir = directory.as_deref().unwrap_or(".");
-        if let Ok(entries) = std::fs::read_dir(search_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if glob_match(pattern, &name) {
-                    if let Some(ref dir) = directory {
-                        results.push(Value::from_str(&format!("{}/{}", dir, name)));
-                    } else {
-                        results.push(Value::from_str(&name));
-                    }
-                }
+        let raw_pattern = args[j].as_str();
+
+        // Build the full pattern: prepend -directory when given.
+        let full_pattern = match &directory {
+            Some(dir) => format!("{}/{}", dir, raw_pattern),
+            None => raw_pattern.to_string(),
+        };
+
+        // Delegate to the `glob` crate which handles `**` recursion,
+        // `[...]` character classes, `{a,b}` alternation, etc.
+        let paths = glob::glob(&full_pattern).map_err(|e| {
+            Error::runtime(
+                &format!("bad glob pattern \"{}\": {}", full_pattern, e),
+                crate::error::ErrorCode::Generic,
+            )
+        })?;
+
+        for entry in paths {
+            let path = entry.map_err(|e| {
+                Error::runtime(
+                    &format!("glob: {}", e),
+                    crate::error::ErrorCode::Io,
+                )
+            })?;
+
+            // Apply -types filter if requested.
+            if let Some(ref ty) = types {
+                let dominated = ty.contains('d') || ty.contains("directory");
+                let file_only = ty.contains('f') || (ty.contains("file") && !ty.contains("directory"));
+                if dominated && !path.is_dir() { continue; }
+                if file_only && !path.is_file() { continue; }
             }
+
+            // Normalise to forward slashes for cross-platform consistency.
+            let s = path.to_string_lossy().replace('\\', "/");
+            results.push(Value::from_str(&s));
         }
     }
 
@@ -875,7 +907,7 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         ));
     }
 
-    Ok(Value::from_list(&results))
+    Ok(Value::from_list_cached(results))
 }
 
 #[cfg(not(feature = "file"))]
@@ -1398,5 +1430,60 @@ mod tests {
         let ts: i64 = atime.as_str().parse().unwrap();
         assert!(ts > 0);
         cleanup(&path);
+    }
+
+    // ── glob tests ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_glob_star() {
+        let dir = make_temp_dir();
+        std::fs::File::create(dir.join("alpha.txt")).unwrap();
+        std::fs::File::create(dir.join("beta.txt")).unwrap();
+        std::fs::File::create(dir.join("gamma.rs")).unwrap();
+        let mut interp = Interp::new();
+        let dstr = dir.to_string_lossy().replace('\\', "/");
+        let result = interp.eval(&format!("glob -directory {{{}}} -- *.txt", dstr)).unwrap();
+        let items = result.as_list().unwrap();
+        assert_eq!(items.len(), 2);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_glob_double_star_recursive() {
+        let dir = make_temp_dir();
+        let sub = dir.join("sub");
+        let sub2 = sub.join("deep");
+        std::fs::create_dir_all(&sub2).unwrap();
+        std::fs::File::create(dir.join("top.rs")).unwrap();
+        std::fs::File::create(sub.join("mid.rs")).unwrap();
+        std::fs::File::create(sub2.join("low.rs")).unwrap();
+        std::fs::File::create(sub2.join("low.txt")).unwrap();
+        let mut interp = Interp::new();
+        let dstr = dir.to_string_lossy().replace('\\', "/");
+        let result = interp.eval(&format!("glob -nocomplain -directory {{{}}} -- **/*.rs", dstr)).unwrap();
+        let items = result.as_list().unwrap();
+        // ** matches zero-or-more directories, so all 3 .rs files are found
+        assert_eq!(items.len(), 3, "got: {:?}", items.iter().map(|v| v.as_str()).collect::<Vec<_>>());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_glob_nocomplain_empty() {
+        let dir = make_temp_dir();
+        let mut interp = Interp::new();
+        let dstr = dir.to_string_lossy().replace('\\', "/");
+        let result = interp.eval(&format!("glob -nocomplain -directory {{{}}} -- *.nonexistent", dstr)).unwrap();
+        assert_eq!(result.as_str(), "");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_glob_error_no_match() {
+        let dir = make_temp_dir();
+        let mut interp = Interp::new();
+        let dstr = dir.to_string_lossy().replace('\\', "/");
+        let result = interp.eval(&format!("glob -directory {{{}}} -- *.nonexistent", dstr));
+        assert!(result.is_err());
+        cleanup(&dir);
     }
 }

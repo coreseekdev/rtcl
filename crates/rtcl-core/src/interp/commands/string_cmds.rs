@@ -133,13 +133,15 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() < 4 {
                 return Err(Error::wrong_args("string first", 4, args.len()));
             }
-            let needle = args[3].as_str();
+            // string first needleString haystackString ?startIndex?
+            let needle = args[2].as_str();
+            let haystack = args[3].as_str();
             let start = if args.len() > 4 {
-                parse_index(args[4].as_str(), str_val.len()).unwrap_or(0)
+                parse_index(args[4].as_str(), haystack.len()).unwrap_or(0)
             } else {
                 0
             };
-            let pos = str_val[start..]
+            let pos = haystack[start..]
                 .find(needle)
                 .map(|i| (i + start) as i64)
                 .unwrap_or(-1);
@@ -149,8 +151,10 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() < 4 {
                 return Err(Error::wrong_args("string last", 4, args.len()));
             }
-            let needle = args[3].as_str();
-            let pos = str_val.rfind(needle).map(|i| i as i64).unwrap_or(-1);
+            // string last needleString haystackString ?lastIndex?
+            let needle = args[2].as_str();
+            let haystack = args[3].as_str();
+            let pos = haystack.rfind(needle).map(|i| i as i64).unwrap_or(-1);
             Ok(Value::from_int(pos))
         }
         "map" => {

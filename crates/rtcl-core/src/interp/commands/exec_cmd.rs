@@ -410,7 +410,7 @@ mod tests {
     fn test_exec_errorcode_on_success() {
         let mut interp = Interp::new();
         interp.eval("exec true").unwrap();
-        let ec = interp.eval("$::errorCode").unwrap();
+        let ec = interp.get_var("::errorCode").unwrap();
         assert_eq!(ec.as_str(), "NONE");
     }
 
@@ -420,7 +420,7 @@ mod tests {
         let mut interp = Interp::new();
         // false exits with code 1
         let _ = interp.eval("exec false");
-        let ec = interp.eval("$::errorCode").unwrap();
+        let ec = interp.get_var("::errorCode").unwrap();
         // Should be something like "CHILDSTATUS <pid> 1"
         assert!(ec.as_str().starts_with("CHILDSTATUS"));
         assert!(ec.as_str().ends_with("1"));
@@ -534,7 +534,7 @@ mod tests {
     fn test_exec_errorcode_has_pid() {
         let mut interp = Interp::new();
         let _ = interp.eval("exec sh -c {exit 42}");
-        let ec = interp.eval("$::errorCode").unwrap();
+        let ec = interp.get_var("::errorCode").unwrap();
         let parts: Vec<&str> = ec.as_str().split_whitespace().collect();
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0], "CHILDSTATUS");

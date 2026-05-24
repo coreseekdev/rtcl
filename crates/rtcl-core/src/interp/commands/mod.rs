@@ -10,7 +10,7 @@ pub mod array;
 pub mod proc;
 pub mod io;
 pub mod misc;
-#[cfg(feature = "regexp")]
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 pub mod regexp_cmds;
 #[cfg(feature = "clock")]
 pub mod clock;

@@ -7,6 +7,7 @@ members = [
     "crates/rtcl-core",
     "crates/rtcl-cli",
     "crates/rtcl-expect",
+    "crates/rtcl-wasm",
 ]
 
 [workspace.package]
@@ -40,6 +41,7 @@ rustyline = "14.0"
 colored = "2.1"
 annotate-snippets = "0.11"
 regex = "1"
+regex-lite = "0.1"
 
 [profile.release]
 opt-level = "s"      # Optimize for size

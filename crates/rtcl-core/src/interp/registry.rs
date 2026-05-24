@@ -165,8 +165,8 @@ static CMD_TABLE_EXEC: &[CmdEntry] = &[
     CmdEntry { name: "wait",  func: os::cmd_wait,       cat: Extension, cmd_id: None,                     usage: "?-nohang? ?pid?",  help: "Wait for a process" },
 ];
 
-/// Regular expression commands gated behind `feature = "regexp"`.
-#[cfg(feature = "regexp")]
+/// Regular expression commands gated behind `feature = "regexp"` or `feature = "regexp-lite"`.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 static CMD_TABLE_REGEXP: &[CmdEntry] = &[
     CmdEntry { name: "regexp", func: regexp_cmds::cmd_regexp, cat: Extension, cmd_id: Some(CmdId::Regexp as u16), usage: "?-nocase? ?-all? ?-inline? ?-indices? ?-expanded? ?-line? ?-start offset? ?--? exp string ?matchVar? ?subMatchVar ...?", help: "Regular expression matching" },
     CmdEntry { name: "regsub", func: regexp_cmds::cmd_regsub, cat: Extension, cmd_id: Some(CmdId::Regsub as u16), usage: "?-nocase? ?-all? ?-expanded? ?-line? ?-start offset? ?-command? ?--? exp string subSpec ?varName?", help: "Regular expression substitution" },
@@ -230,7 +230,7 @@ impl Interp {
         for entry in CMD_TABLE_EXEC {
             self.register_entry(entry);
         }
-        #[cfg(feature = "regexp")]
+        #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
         for entry in CMD_TABLE_REGEXP {
             self.register_entry(entry);
         }
@@ -352,7 +352,7 @@ impl Interp {
                 return Some(entry.func);
             }
         }
-        #[cfg(feature = "regexp")]
+        #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
         for entry in CMD_TABLE_REGEXP {
             if entry.cmd_id == Some(cmd_id) {
                 return Some(entry.func);

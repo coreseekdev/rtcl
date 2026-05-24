@@ -4,7 +4,10 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::interp::Interp;
 use crate::value::Value;
 
+#[cfg(feature = "regexp")]
 use regex::Regex;
+#[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
+use regex_lite::Regex;
 
 /// Build regex pattern string from flags.
 fn build_pattern(pattern: &str, nocase: bool, expanded: bool, line: bool) -> String {
@@ -207,7 +210,8 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// Set match variables from captures.
 fn set_match_vars(
     interp: &mut Interp,
-    caps: &regex::Captures,
+    #[cfg(feature = "regexp")] caps: &regex::Captures,
+    #[cfg(all(feature = "regexp-lite", not(feature = "regexp")))] caps: &regex_lite::Captures,
     var_args: &[Value],
     indices: bool,
     byte_start: usize,

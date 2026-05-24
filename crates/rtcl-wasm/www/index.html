@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>rtcl-wasm 测试</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+        h1 { padding: 8px 16px; background: #16213e; font-size: 14px; color: #64ffda; border-bottom: 1px solid #333; }
+        .main { display: flex; flex: 1; overflow: hidden; }
+        .editor { flex: 1; display: flex; flex-direction: column; border-right: 1px solid #333; }
+        .output { flex: 1; display: flex; flex-direction: column; }
+        .toolbar { padding: 6px 12px; background: #16213e; border-bottom: 1px solid #333; display: flex; gap: 8px; align-items: center; }
+        button { background: #0f3460; color: #e0e0e0; border: 1px solid #444; padding: 4px 16px; cursor: pointer; font-family: monospace; font-size: 13px; }
+        button:hover { background: #1a5276; }
+        textarea { flex: 1; background: #0d1117; color: #c9d1d9; border: none; padding: 12px; font-family: monospace; font-size: 13px; resize: none; outline: none; tab-size: 4; }
+        pre { flex: 1; background: #0d1117; color: #8b949e; padding: 12px; overflow: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; }
+        .status { padding: 4px 12px; background: #16213e; font-size: 12px; color: #888; border-top: 1px solid #333; }
+        .error { color: #f85149; }
+        .success { color: #3fb950; }
+    </style>
+</head>
+<body>
+    <h1>rtcl-wasm REPL</h1>
+    <div class="main">
+        <div class="editor">
+            <div class="toolbar">
+                <button id="run">Run</button>
+                <button id="clear">Clear</button>
+                <span style="flex:1"></span>
+                <span id="status">Loading WASM...</span>
+            </div>
+            <textarea id="input" spellcheck="false" placeholder="输入 Tcl 脚本...">set x 42
+puts "x = $x"
+regexp {(\w+) (\w+)} "Hello World" full first last
+puts "$full | $first | $last"</textarea>
+        </div>
+        <div class="output">
+            <div class="toolbar">Output</div>
+            <pre id="output"></pre>
+        </div>
+    </div>
+    <script type="module">
+        import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+
+        const input = document.getElementById('input');
+        const output = document.getElementById('output');
+        const status = document.getElementById('status');
+        const runBtn = document.getElementById('run');
+        const clearBtn = document.getElementById('clear');
+
+        let rtcl;
+
+        function log(msg, cls) {
+            const span = document.createElement('span');
+            span.textContent = msg + '\n';
+            if (cls) span.className = cls;
+            output.appendChild(span);
+            output.scrollTop = output.scrollHeight;
+        }
+
+        async function initWasm() {
+            try {
+                await init();
+                rtcl = new RtclHandle();
+
+                // 注册 puts → console.log + 输出面板
+                rtcl.register_command("__puts", (msg) => {
+                    console.log(msg);
+                    log(msg);
+                    return "";
+                });
+
+                // 重命名 puts，用 __puts 替代
+                rtcl.exec('rename puts _puts');
+                rtcl.exec('proc puts {args} { set msg [join $args]; __puts $msg }');
+
+                status.textContent = 'Ready';
+                status.className = 'success';
+                log("rtcl-wasm initialized");
+            } catch (e) {
+                status.textContent = 'Error: ' + e;
+                status.className = 'error';
+                log("Failed to init: " + e, 'error');
+            }
+        }
+
+        function runCode() {
+            if (!rtcl) return;
+            const code = input.value;
+            log("% " + code.split('\n')[0] + (code.split('\n').length > 1 ? ' ...' : ''));
+            try {
+                const result = rtcl.exec(code);
+                if (result) log(result, 'success');
+            } catch (e) {
+                log("Error: " + (e.message || e), 'error');
+            }
+        }
+
+        runBtn.addEventListener('click', runCode);
+        clearBtn.addEventListener('click', () => { output.textContent = ''; });
+
+        // Ctrl+Enter 执行
+        input.addEventListener('keydown', (e) => {
+            if (e.ctrlKey && e.key === 'Enter') {
+                e.preventDefault();
+                runCode();
+            }
+        });
+
+        initWasm();
+    </script>
+</body>
+</html>

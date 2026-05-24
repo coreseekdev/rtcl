@@ -20,6 +20,10 @@ optional = true
 workspace = true
 optional = true
 
+[dependencies.regex-lite]
+workspace = true
+optional = true
+
 [dependencies.spin]
 workspace = true
 optional = true
@@ -36,6 +40,7 @@ io = ["std"]                      # channel I/O: open, close, read, gets, seek, 
 exec = ["std"]                    # exec, wait
 clock = ["std"]                   # clock seconds/clicks/format/scan
 regexp = ["std", "dep:regex"]     # regexp, regsub
+regexp-lite = ["std", "dep:regex-lite"]  # regexp, regsub (smaller WASM binary)
 env = ["std"]                     # $env array from OS environment
 package = ["file"]                # package provide/require/names/forget
 signal = ["std"]                  # kill, sleep

@@ -1,0 +1,23 @@
+# list commands
+set l [list a b c]
+puts [llength $l]
+puts [lindex $l 0]
+puts [lindex $l end]
+puts [lindex $l end-1]
+puts [lrange $l 0 1]
+puts [lappend l d e]
+puts $l
+puts [llength $l]
+puts [lsearch $l c]
+puts [lsearch $l zzz]
+puts [lsort {3 1 2}]
+puts [lsort {b a c}]
+puts [join {a b c} ","]
+puts [split "a,b,c" ","]
+puts [lreverse {1 2 3}]
+puts [lrepeat 3 x]
+puts [concat {1 2} {3 4}]
+puts [llength [list]]
+puts [lindex {a {b c} d} 1]
+set nested {{1 2} {3 4}}
+puts [lindex $nested 1 0]

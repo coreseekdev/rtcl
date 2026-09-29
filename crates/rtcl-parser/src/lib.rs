@@ -22,7 +22,7 @@
 
 use core::fmt;
 
-mod rd;
+pub mod rd;
 pub mod opcode;
 pub mod bytecode;
 pub mod compiler;

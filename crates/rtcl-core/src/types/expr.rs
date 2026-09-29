@@ -329,7 +329,7 @@ impl<'a> ExprParser<'a> {
                 let a = self.as_int_val(&left)?;
                 let b = self.as_int_val(&right)?;
                 if b == 0 { return Err(Error::DivisionByZero); }
-                left = Value::from_int(a % b);
+                left = Value::from_int(floor_mod(a, b));
             } else {
                 break;
             }
@@ -740,8 +740,22 @@ impl<'a> ExprParser<'a> {
             .ok_or_else(|| Error::type_mismatch("integer", v.as_str()))
     }
 
-    /// Numeric binary operation, returning int when possible.
+    /// Numeric binary operation. Integer operands use integer arithmetic
+    /// (Tcl semantics: `/` is floor division, result is int); if either side
+    /// is float, compute in f64.
     fn numeric_binop(&self, left: &Value, right: &Value, op: char) -> Result<Value> {
+        if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
+            return match op {
+                '+' => Ok(Value::from_int(a.wrapping_add(b))),
+                '-' => Ok(Value::from_int(a.wrapping_sub(b))),
+                '*' => Ok(Value::from_int(a.wrapping_mul(b))),
+                '/' => {
+                    if b == 0 { return Err(Error::DivisionByZero); }
+                    Ok(Value::from_int(floor_div(a, b)))
+                }
+                _ => Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
+            };
+        }
         match (left.as_float(), right.as_float()) {
             (Some(a), Some(b)) => {
                 let result = match op {
@@ -764,7 +778,6 @@ impl<'a> ExprParser<'a> {
     fn float_or_int(&self, f: f64) -> Value {
         super::expr_funcs::float_or_int(f)
     }
-
     /// Skip one `parse_and` level operand without evaluating.
     /// Used for `||` short-circuit when LHS is true.
     /// Stops at: end, `||` at depth 0, `?` at depth 0.
@@ -864,3 +877,17 @@ impl<'a> ExprParser<'a> {
 #[cfg(test)]
 #[path = "expr_tests.rs"]
 mod tests;
+
+/// Tcl integer division: floor semantics (rounds toward negative infinity),
+/// so `-10 / 3 == -4`. Precondition: `b != 0`.
+pub(crate) fn floor_div(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    if (a % b != 0) && ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+/// Tcl integer modulo: result takes the sign of the divisor,
+/// so `-10 % 3 == 2` and `10 % -3 == -2`. Precondition: `b != 0`.
+pub(crate) fn floor_mod(a: i64, b: i64) -> i64 {
+    let r = a % b;
+    if r != 0 && ((r < 0) != (b < 0)) { r + b } else { r }
+}

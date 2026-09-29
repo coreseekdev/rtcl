@@ -307,11 +307,15 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let script = args[1].as_str();
     let result_var = if args.len() > 2 { Some(args[2].as_str()) } else { None };
+    let opts_var = if args.len() > 3 { Some(args[3].as_str()) } else { None };
 
     match interp.eval(script) {
         Ok(v) => {
             if let Some(var) = result_var {
                 interp.set_var(var, v)?;
+            }
+            if let Some(ov) = opts_var {
+                interp.set_var(ov, return_options_dict(0, 1))?;
             }
             Ok(Value::from_int(0))
         }
@@ -323,9 +327,19 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             else if e.is_break() { 3 }
             else if e.is_continue() { 4 }
             else { 1 };
+            if let Some(ov) = opts_var {
+                let level = if e.is_return() { 0 } else { 1 };
+                interp.set_var(ov, return_options_dict(code, level))?;
+            }
             Ok(Value::from_int(code))
         }
     }
+}
+
+/// Minimal Tcl return-options dict: `-code` and `-level` are the keys
+/// real scripts consult (e.g. `dict get $opts -code`).
+fn return_options_dict(code: i64, level: i64) -> Value {
+    Value::from_str(&format!("-code {} -level {}", code, level))
 }
 
 pub fn cmd_error(_interp: &mut Interp, args: &[Value]) -> Result<Value> {

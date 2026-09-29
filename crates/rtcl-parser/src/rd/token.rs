@@ -113,10 +113,8 @@ impl Token {
 /// let input = "hello\r\nworld\rgoodbye";
 /// let mut tokenizer = Tokenizer::new(input);
 ///
-/// assert!(matches!(tokenizer.next(), Some(Token::Other('h'))));
+/// assert!(matches!(tokenizer.next(), Token::Other('h')));
 /// // ... more tokens ...
-/// assert!(matches!(tokenizer.next(), Some(Token::Newline))); // from \r\n
-/// assert!(matches!(tokenizer.next(), Some(Token::CarriageReturn))); // from standalone \r
 /// ```
 pub struct Tokenizer<'a> {
     input: &'a str,

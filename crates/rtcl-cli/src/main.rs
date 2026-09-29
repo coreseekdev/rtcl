@@ -73,9 +73,7 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
         return Err(e.to_string());
     }
 
-    if !quiet {
-        println!("Script executed successfully");
-    }
+    let _ = quiet;
 
     Ok(())
 }

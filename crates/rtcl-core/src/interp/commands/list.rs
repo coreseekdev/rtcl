@@ -23,12 +23,22 @@ pub fn cmd_lindex(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::wrong_args("lindex", 3, args.len()));
     }
-    let list = args[1].as_list().unwrap_or_default();
-    let idx = parse_index(args[2].as_str(), list.len());
-    match idx {
-        Some(i) if i < list.len() => Ok(list[i].clone()),
-        _ => Ok(Value::empty()),
+    let mut current = args[1].clone();
+    // Tcl: lindex list i j k ... descends into nested lists.
+    // A single index argument may itself be a list of indices.
+    let indices: Vec<Value> = if args.len() == 3 {
+        args[2].as_list().unwrap_or_else(|| vec![args[2].clone()])
+    } else {
+        args[2..].to_vec()
+    };
+    for idx_val in &indices {
+        let list = current.as_list().unwrap_or_default();
+        match parse_index(idx_val.as_str(), list.len()) {
+            Some(i) if i < list.len() => current = list[i].clone(),
+            _ => return Ok(Value::empty()),
+        }
     }
+    Ok(current)
 }
 
 pub fn cmd_lappend(interp: &mut Interp, args: &[Value]) -> Result<Value> {

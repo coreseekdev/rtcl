@@ -251,11 +251,11 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if pi == n - 1 && pattern == "default" {
             // TIP #75: reaching the default arm with -matchvar/-indexvar
             // set stores empty lists (switch-11.4: x becomes {}).
-            if let Some(name) = &matchvar {
-                let _ = interp.set_var(name, Value::empty());
-            }
             if let Some(name) = &indexvar {
-                let _ = interp.set_var(name, Value::empty());
+                interp.set_var(name, Value::empty())?;
+            }
+            if let Some(name) = &matchvar {
+                interp.set_var(name, Value::empty())?;
             }
             return interp.eval(body);
         }
@@ -349,12 +349,8 @@ fn set_regexp_match_vars(
         Err(_) => return Ok(()),
     };
     if let Some(caps) = re.captures(haystack) {
-        if let Some(name) = matchvar {
-            let items: Vec<Value> = (0..caps.len())
-                .map(|g| Value::from_str(caps.get(g).map(|m| m.as_str()).unwrap_or("")))
-                .collect();
-            let _ = interp.set_var(name, Value::from_list(&items));
-        }
+        // tclsh writes the indices list first, then the matches list — a
+        // failing second write leaves the first one in place (switch-13.6).
         if let Some(name) = indexvar {
             let items: Vec<Value> = (0..caps.len())
                 .map(|g| match caps.get(g) {
@@ -362,7 +358,13 @@ fn set_regexp_match_vars(
                     None => Value::from_str("-1 -1"),
                 })
                 .collect();
-            let _ = interp.set_var(name, Value::from_list(&items));
+            interp.set_var(name, Value::from_list(&items))?;
+        }
+        if let Some(name) = matchvar {
+            let items: Vec<Value> = (0..caps.len())
+                .map(|g| Value::from_str(caps.get(g).map(|m| m.as_str()).unwrap_or("")))
+                .collect();
+            interp.set_var(name, Value::from_list(&items))?;
         }
     }
     Ok(())

@@ -1,0 +1,6 @@
+catch {unset --} m; puts "unset: $m"
+catch {variable a b c} m2; puts "variable: $m2"
+catch {cd a b} m3; puts "cd: $m3"
+catch {update a b} m4; puts "update: $m4"
+catch {pid a b} m5; puts "pid: $m5"
+catch {global} m6; puts "global0: <$m6>"

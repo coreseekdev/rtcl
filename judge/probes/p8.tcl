@@ -1,0 +1,7 @@
+set r [catch {set v "ab"[expr {1+1}]} m]; puts "bracket-after-quote: $r $m"
+set r [catch {set v "ab"$x} m]; puts "dollar-after-quote: $r $m"
+set r [catch {set v {a}[expr {1}]} m]; puts "bracket-after-brace: $r $m"
+set r [catch {set v {a}"b"} m]; puts "quote-after-brace: $r $m"
+set r [catch {set v "a"{b}} m]; puts "brace-after-quote: $r $m"
+set r [catch {set v x"y"} m]; puts "quote-mid-bare: $r $m"
+set r [catch {set v x{y}z} m]; puts "brace-mid-bare: $r $m"

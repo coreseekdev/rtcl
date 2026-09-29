@@ -1,0 +1,6 @@
+puts "toupper abcdef 2 end+5: [string toupper abcdef 2 end+5]"
+puts "toupper abcdef -1 2: [string toupper abcdef -1 2]"
+puts "toupper abcdef -1: [string toupper abcdef -1]"
+puts "toupper abcdef 0: [string toupper abcdef 0]"
+puts "toupper abcdef 2 1: [string toupper abcdef 2 1]"
+puts "toupper éé 1: [string toupper éé 1]"

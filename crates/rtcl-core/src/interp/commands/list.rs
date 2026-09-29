@@ -9,23 +9,24 @@ use crate::value::{is_tcl_space, Value};
 /// Build an error whose message survives `catch` verbatim (the interp
 /// stores `e.to_string()` into the result variable, and `Error::Msg`
 /// displays as exactly the payload).
-fn tcl_err(msg: impl Into<String>) -> Error {
+pub(crate) fn tcl_err(msg: impl Into<String>) -> Error {
     Error::Msg(msg.into())
 }
 
 /// Tcl's wrong-#-args error text: `wrong # args: should be "name usage"`.
-fn wrong_args(name: &str, usage: &str) -> Error {
+#[allow(dead_code)]
+pub(crate) fn wrong_args(name: &str, usage: &str) -> Error {
     tcl_err(format!("wrong # args: should be \"{} {}\"", name, usage))
 }
 
 /// Mirror Tcl setting `::errorCode` at the point an error is raised.
-fn set_error_code(interp: &mut Interp, code: &str) {
+pub(crate) fn set_error_code(interp: &mut Interp, code: &str) {
     interp.globals.insert("errorCode".to_string(), Value::from_str(code));
 }
 
 /// Parse a command argument as a list; malformed lists raise Tcl's error
 /// (`unmatched open brace in list` etc.) with the matching `::errorCode`.
-fn strict_list(interp: &mut Interp, v: &Value) -> Result<Vec<Value>> {
+pub(crate) fn strict_list(interp: &mut Interp, v: &Value) -> Result<Vec<Value>> {
     v.as_list_strict().map_err(|e| {
         set_error_code(interp, e.code);
         tcl_err(e.message)
@@ -35,7 +36,7 @@ fn strict_list(interp: &mut Interp, v: &Value) -> Result<Vec<Value>> {
 /// Tcl's bad-index error (`TCL VALUE INDEX`), including the
 /// "(looks like invalid octal number)" hint Tcl appends when the index
 /// resembles a malformed legacy octal literal (TclCheckBadOctal).
-fn bad_index(interp: &mut Interp, idx: &str) -> Error {
+pub(crate) fn bad_index(interp: &mut Interp, idx: &str) -> Error {
     set_error_code(interp, "TCL VALUE INDEX");
     let mut msg = format!(
         "bad index \"{}\": must be integer?[+-]integer? or end?[+-]integer?",
@@ -60,14 +61,14 @@ fn looks_like_bad_octal(s: &str) -> bool {
 }
 
 /// Tcl's whitespace set (also the list element separators).
-fn trim_tcl_space(s: &str) -> &str {
+pub(crate) fn trim_tcl_space(s: &str) -> &str {
     s.trim_matches(|c: char| is_tcl_space(c as u8))
 }
 
 /// Scan a Tcl integer at the start of `s` (TclParseNumber integer rules:
 /// optional sign; `0x`/`0b`/`0o` radix prefixes; a leading `0` followed by
 /// more characters selects legacy octal). Returns (value, bytes consumed).
-fn scan_tcl_int(s: &str) -> Option<(i64, usize)> {
+pub(crate) fn scan_tcl_int(s: &str) -> Option<(i64, usize)> {
     let b = s.as_bytes();
     let mut i = 0;
     let mut neg = false;
@@ -102,7 +103,7 @@ fn scan_tcl_int(s: &str) -> Option<(i64, usize)> {
 }
 
 /// Tcl_GetInt semantics: the whole (whitespace-trimmed) string is an integer.
-fn tcl_get_int(s: &str) -> Option<i64> {
+pub(crate) fn tcl_get_int(s: &str) -> Option<i64> {
     let t = trim_tcl_space(s);
     let (v, used) = scan_tcl_int(t)?;
     if used == t.len() { Some(v) } else { None }
@@ -112,7 +113,7 @@ fn tcl_get_int(s: &str) -> Option<i64> {
 /// resolving `end` against `len`. The result may be negative or >= len;
 /// callers clamp or report out-of-range as appropriate.
 /// Mirrors Tcl 8.6's TclGetIntForIndex.
-fn parse_tcl_index(s: &str, len: usize) -> Option<i64> {
+pub(crate) fn parse_tcl_index(s: &str, len: usize) -> Option<i64> {
     // 1. Plain integer.
     if let Some(v) = tcl_get_int(s) {
         return Some(v);

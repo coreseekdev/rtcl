@@ -31,6 +31,12 @@ use std::collections::HashMap;
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeMap as HashMap;
 
+#[cfg(not(feature = "embedded"))]
+use std::collections::HashSet;
+
+#[cfg(feature = "embedded")]
+use alloc::collections::BTreeSet as HashSet;
+
 /// A procedure definition.
 #[derive(Debug, Clone)]
 pub(crate) struct ProcDef {
@@ -53,17 +59,56 @@ pub(crate) enum UpvarLink {
 #[derive(Debug, Clone)]
 pub(crate) struct CallFrame {
     pub locals: HashMap<String, Value>,
+    /// Names in `locals` that are arrays (scalar/array distinction).
+    pub array_locals: HashSet<String>,
     pub upvars: HashMap<String, UpvarLink>,
+    /// Namespace the running proc was defined in (tclsh: `namespace current`
+    /// inside the proc resolves here).  Variable *reads* do NOT fall back to
+    /// this namespace — only locals, upvar/`variable` links, and `::`-qualified
+    /// names are visible in a proc frame.
+    pub ns: Option<String>,
     /// Commands created by `local` — deleted when this frame exits.
     pub local_procs: Vec<String>,
     /// Scripts registered by `defer` — executed in reverse order on frame exit.
     pub deferred_scripts: Vec<String>,
 }
 
+/// One live `array startsearch` iteration over an array's element names.
+/// A snapshot of the element set plus the array's mutation stamp: any
+/// element added or removed (tclsh semantics) invalidates the search.
+pub(crate) struct ArraySearch {
+    /// Allocation counter value (smallest free at startsearch time).
+    pub id: i64,
+    /// Rendered identifier, e.g. `s-1-a` — includes the array name as given.
+    pub rendered: String,
+    /// Remaining element names, in snapshot order.
+    pub elements: Vec<String>,
+    /// Snapshot of the array's stamp when the search started.
+    pub stamp: u64,
+}
+
+/// Per-array search table: tclsh's monotonic search counter (reset when the
+/// last search goes away) plus the live searches.
+pub(crate) struct ArraySearchList {
+    pub ctr: i64,
+    pub active: Vec<ArraySearch>,
+}
+
+/// One registered `trace add variable` callback: canonical ops (sorted
+/// array/read/unset/write) plus the script invoked with `name1 name2 op`
+/// appended.
+#[derive(Clone)]
+pub(crate) struct VarTrace {
+    pub ops: Vec<String>,
+    pub script: String,
+}
+
 /// Tcl interpreter.
 pub struct Interp {
     /// Variables (global scope).
     pub(crate) globals: HashMap<String, Value>,
+    /// Names in `globals` that are arrays (scalar/array distinction).
+    pub(crate) array_globals: HashSet<String>,
     /// Procedure call frames (empty at global level).
     pub(crate) frames: Vec<CallFrame>,
     /// Commands (built-in and registered).
@@ -89,6 +134,20 @@ pub struct Interp {
     pub(crate) current_namespace: String,
     /// Known namespaces ("::" always present).
     pub(crate) namespaces: HashMap<String, commands::namespace::NamespaceInfo>,
+    /// Live array searches keyed by the owning scope's stamp key.
+    pub(crate) array_searches: HashMap<String, ArraySearchList>,
+    /// Mutation counters per array (element-set changes invalidate searches).
+    pub(crate) array_stamps: HashMap<String, u64>,
+    /// Whole-variable traces keyed by the owning scope's stamp key.
+    pub(crate) var_traces: HashMap<String, Vec<VarTrace>>,
+    /// Element-specific traces: stamp key → element name → traces.
+    pub(crate) elem_traces: HashMap<String, HashMap<String, Vec<VarTrace>>>,
+    /// Elements that exist only to carry a trace (traced but never set).
+    pub(crate) trace_phantoms: HashMap<String, std::collections::HashSet<String>>,
+    /// `trace add command` registrations (stored; rename/delete traces).
+    pub(crate) cmd_traces: HashMap<String, Vec<(Vec<String>, String)>>,
+    /// `trace add execution` registrations (stored; enter/leave traces).
+    pub(crate) exec_traces: HashMap<String, Vec<(Vec<String>, String)>>,
     /// Current script name (for info script).
     #[cfg(feature = "std")]
     pub(crate) script_name: String,
@@ -146,6 +205,14 @@ impl Interp {
     pub fn new() -> Self {
         let mut interp = Interp {
             globals: HashMap::new(),
+            array_globals: HashSet::new(),
+            array_searches: HashMap::new(),
+            array_stamps: HashMap::new(),
+            var_traces: HashMap::new(),
+            elem_traces: HashMap::new(),
+            trace_phantoms: HashMap::new(),
+            cmd_traces: HashMap::new(),
+            exec_traces: HashMap::new(),
             frames: Vec::new(),
             commands: HashMap::new(),
             command_categories: HashMap::new(),
@@ -240,6 +307,8 @@ impl Interp {
             Value::from_int(std::mem::size_of::<*const ()>() as i64),
         );
         self.globals.insert("tcl_platform".to_string(), Value::empty());
+        self.array_globals.insert("tcl_platform".to_string());
+        self.array_globals.insert("env".to_string());
 
         // --- $argv0, $argv, $argc (empty defaults — cli layer overrides) ---
         self.globals.insert("argv0".to_string(), Value::from_str(""));

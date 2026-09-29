@@ -404,7 +404,7 @@ pub fn cmd_xtrace(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_set(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     match args.len() {
-        2 => interp.get_var(args[1].as_str()).cloned(),
+        2 => interp.read_var(args[1].as_str()),
         3 => interp.set_var(args[1].as_str(), args[2].clone()),
         _ => Err(Error::wrong_args("set", 2, args.len())),
     }
@@ -448,34 +448,106 @@ pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 crate::error::ErrorCode::Generic,
             )
         })?,
-        Err(_) => 0, // Tcl: incr on non-existent var starts at 0
+        Err(e) => {
+            // Tcl: incr on a non-existent variable starts at 0, but a
+            // scalar/array type conflict propagates as a read error.
+            if interp.var_exists(var_name) {
+                return Err(e);
+            }
+            // Element-of-scalar also conflicts even though `info exists`
+            // reports 0 for the element itself.
+            if crate::interp::vars::is_type_conflict(&e) {
+                return Err(e);
+            }
+            0
+        }
     };
     let new_val = Value::from_int(current + amount);
     interp.set_var(var_name, new_val)
 }
 
 pub fn cmd_unset(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    // tclsh: zero names is a no-op (set-old-7.2), not an error.
     if args.len() < 2 {
-        return Err(Error::wrong_args("unset", 2, args.len()));
+        return Ok(Value::empty());
     }
     let mut nocomplain = false;
-    let start = if args[1].as_str() == "-nocomplain" {
+    let mut start = if args[1].as_str() == "-nocomplain" {
         nocomplain = true;
         2
     } else {
         1
     };
+    // Optional end-of-options marker (set-old-7.14/7.15): `unset --`
+    // alone unsets nothing; `unset -- --` unsets the variable "--".
+    if start < args.len() && args[start].as_str() == "--" {
+        start += 1;
+    }
     for arg in &args[start..] {
         let name = arg.as_str();
-        if !interp.var_exists(name) && !nocomplain {
-            return Err(Error::runtime(
-                format!("can't unset \"{}\": no such variable", name),
-                crate::error::ErrorCode::NotFound,
-            ));
+        if let Err(e) = interp.unset_var(name) {
+            if !nocomplain {
+                return Err(e);
+            }
         }
-        let _ = interp.unset_var(name);
     }
     Ok(Value::empty())
+}
+
+/// Glob-match a name against a pattern, tolerant of a leading `::` on
+/// either side: tclsh's `info commands test_ns_basic::*` still finds
+/// `::test_ns_basic::p`. Output keeps the stored name unchanged.
+fn matches_qualified_glob(pattern: &str, name: &str) -> bool {
+    let p = pattern.strip_prefix("::").unwrap_or(pattern);
+    let n = name.strip_prefix("::").unwrap_or(name);
+    super::super::glob_match(p, n)
+}
+
+/// tclsh's `info` subcommand list, in the order it prints on an
+/// unknown-or-ambiguous error.
+const INFO_CANONICAL_SUBCMDS: &[&str] = &[
+    "args", "body", "class", "cmdcount", "commands", "complete", "coroutine", "default",
+    "errorstack", "exists", "frame", "functions", "globals", "hostname", "level", "library",
+    "loaded", "locals", "nameofexecutable", "object", "patchlevel", "procs", "script",
+    "sharedlibextension", "tclversion", "vars",
+];
+
+/// Resolve an `info` subcommand word: exact matches win (including the
+/// jimtflavored extras rtcl supports), otherwise a unique prefix of
+/// tclsh's canonical set resolves; anything else is tclsh's
+/// unknown-or-ambiguous error.
+fn resolve_info_subcmd(sub_raw: &str) -> Result<String> {
+    const EXACT_KNOWN: &[&str] = &[
+        "args", "body", "commands", "complete", "exists", "globals", "hostname", "level",
+        "locals", "nameofexecutable", "patchlevel", "procs", "script", "vars", "alias",
+        "aliases", "channels", "version", "help", "returncodes", "usage", "frame",
+        "stacktrace", "references", "tainted", "statics", "source",
+    ];
+    if EXACT_KNOWN.contains(&sub_raw) {
+        return Ok(sub_raw.to_string());
+    }
+    let matches: Vec<&str> = INFO_CANONICAL_SUBCMDS
+        .iter()
+        .copied()
+        .filter(|s| s.starts_with(sub_raw))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok((*one).to_string()),
+        _ => {
+            let list = INFO_CANONICAL_SUBCMDS.join(", ").replacen(
+                ", vars",
+                ", or vars",
+                1,
+            );
+            Err(Error::runtime(
+                format!(
+                    "unknown or ambiguous subcommand \"{}\": must be {}",
+                    sub_raw, list
+                ),
+                crate::error::ErrorCode::NotFound,
+            ))
+        }
+    }
 }
 
 pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -483,8 +555,8 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args("info", 2, args.len()));
     }
 
-    let subcmd = args[1].as_str();
-    match subcmd {
+    let subcmd = resolve_info_subcmd(args[1].as_str())?;
+    match subcmd.as_str() {
         "commands" => {
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
             let mut cmds: Vec<Value> = interp
@@ -493,7 +565,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .chain(interp.procs.keys())
                 .filter(|name| {
                     pattern
-                        .map(|p| super::super::glob_match(p, name))
+                        .map(|p| matches_qualified_glob(p, name))
                         .unwrap_or(true)
                 })
                 .map(|name| Value::from_str(name))
@@ -508,7 +580,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .keys()
                 .filter(|name| {
                     pattern
-                        .map(|p| super::super::glob_match(p, name))
+                        .map(|p| matches_qualified_glob(p, name))
                         .unwrap_or(true)
                 })
                 .map(|name| Value::from_str(name))
@@ -520,31 +592,49 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() != 3 {
                 return Err(Error::wrong_args("info exists", 3, args.len()));
             }
-            let name = args[2].as_str();
-            Ok(Value::from_bool(interp.var_exists(name)))
+            let name = args[2].as_str().to_string();
+            Ok(Value::from_bool(interp.exists_firing(&name)))
         }
         "vars" => {
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
+            // A leading "::" in the pattern is scope qualification, not part
+            // of the stored (canonical) key — but it does ask for qualified
+            // results (tclsh: `info vars ::err*` → `::errorCode ...`).
+            let (match_pat, qualified) = match pattern {
+                Some(p) => (Some(p.strip_prefix("::").unwrap_or(p)), p.starts_with("::")),
+                None => (None, false),
+            };
             let mut vars: Vec<Value> = interp
                 .scope_vars()
                 .keys()
                 .filter(|name| {
-                    pattern
+                    match_pat
                         .map(|p| super::super::glob_match(p, name))
                         .unwrap_or(true)
                 })
-                .map(|name| Value::from_str(name))
+                .map(|name| {
+                    // Namespace variables are always reported qualified.
+                    if qualified || name.contains("::") {
+                        Value::from_str(&format!("::{}", name))
+                    } else {
+                        Value::from_str(name)
+                    }
+                })
                 .collect();
             vars.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             Ok(Value::from_list(&vars))
         }
         "globals" => {
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
+            let match_pat = pattern.map(|p| p.strip_prefix("::").unwrap_or(p));
             let mut vars: Vec<Value> = interp
                 .globals
                 .keys()
+                // Namespace variables are not globals (tclsh: `info globals
+                // q::*` on a namespace var returns empty).
+                .filter(|name| !name.contains("::"))
                 .filter(|name| {
-                    pattern
+                    match_pat
                         .map(|p| super::super::glob_match(p, name))
                         .unwrap_or(true)
                 })
@@ -951,6 +1041,11 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args("append", 2, args.len()));
     }
     let var_name = args[1].as_str();
+    // tclsh: `append var` with no values is a pure read — a missing
+    // variable errors instead of being created.
+    if args.len() == 2 {
+        return interp.get_var(var_name).cloned();
+    }
     let mut current = interp.get_var(var_name).ok().map(|v| v.as_str().to_string()).unwrap_or_default();
     for arg in &args[2..] {
         current.push_str(arg.as_str());

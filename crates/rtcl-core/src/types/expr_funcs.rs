@@ -5,6 +5,15 @@ use core::cmp::Ordering;
 use crate::error::{Error, Result};
 use crate::value::Value;
 
+/// tclsh math-domain failure: `domain error: argument not in valid range`
+/// with errorCode `ARITH DOMAIN {...}`.
+pub(crate) fn domain_error() -> Error {
+    Error::runtime(
+        "domain error: argument not in valid range",
+        crate::error::ErrorCode::Generic,
+    )
+}
+
 /// Format a double the way Tcl 8.6 stringifies one: shortest round-trip
 /// decimal digits, fixed notation when the decimal exponent of the leading
 /// digit is in `[-4, 16]` (appending `.0` when the digits would otherwise
@@ -138,6 +147,14 @@ pub(crate) fn not_operand(v: &Value) -> Result<bool> {
 /// int/double pair is compared exactly; two doubles use IEEE comparison.
 /// Returns `None` when either operand is non-numeric (caller falls back to
 /// string comparison).
+/// Both operands numeric and at least one NaN — Tcl: every comparison
+/// is false except `!=` (expr-22.9: NaN == NaN -> 0).
+pub(crate) fn nan_pair(a: &Value, b: &Value) -> bool {
+    let numeric = |v: &Value| v.as_int().is_some() || v.as_float().is_some();
+    let nan = |v: &Value| v.as_float().map(|f| f.is_nan()).unwrap_or(false);
+    numeric(a) && numeric(b) && (nan(a) || nan(b))
+}
+
 pub(crate) fn numeric_cmp(a: &Value, b: &Value) -> Option<Ordering> {
     match (a.as_int(), b.as_int()) {
         (Some(x), Some(y)) => Some(x.cmp(&y)),
@@ -184,7 +201,7 @@ fn require_args(name: &str, expected: usize, actual: usize) -> Result<()> {
 /// Evaluate a built-in math function by name.
 ///
 /// `rand_seed` is used only for `rand()` — caller provides a unique value.
-pub(super) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> Result<Value> {
+pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> Result<Value> {
     match name {
         "abs" => {
             require_args(name, 1, args.len())?;
@@ -249,13 +266,17 @@ pub(super) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
         "sqrt" => {
             require_args(name, 1, args.len())?;
             match args[0].as_float() {
-                Some(n) => Ok(float_value(n.sqrt())),
+                Some(n) if n >= 0.0 => Ok(float_value(n.sqrt())),
+                Some(_) => Err(domain_error()),
                 None => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         }
         "pow" => {
             require_args(name, 2, args.len())?;
             match (args[0].as_float(), args[1].as_float()) {
+                // tclsh: negative base with a non-integer exponent is a
+                // domain error (integer exponents are exact).
+                (Some(a), Some(b)) if a < 0.0 && b.fract() != 0.0 => Err(domain_error()),
                 (Some(a), Some(b)) => Ok(float_value(a.powf(b))),
                 _ => Err(Error::type_mismatch("number", "non-numeric value")),
             }
@@ -263,6 +284,7 @@ pub(super) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
         "fmod" => {
             require_args(name, 2, args.len())?;
             match (args[0].as_float(), args[1].as_float()) {
+                (Some(_), Some(b)) if b == 0.0 => Err(domain_error()),
                 (Some(a), Some(b)) => Ok(float_value(a % b)),
                 _ => Err(Error::type_mismatch("number", "non-numeric value")),
             }
@@ -286,6 +308,15 @@ pub(super) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
             require_args(name, 1, args.len())?;
             match args[0].as_float() {
                 Some(n) => {
+                    // tclsh domain rules: log/log10 reject negatives
+                    // (zero → -Inf is fine), asin/acos reject |x| > 1.
+                    match name {
+                        "log" | "log10" if n < 0.0 => return Err(domain_error()),
+                        "asin" | "acos" if !(-1.0..=1.0).contains(&n) => {
+                            return Err(domain_error())
+                        }
+                        _ => {}
+                    }
                     let result = match name {
                         "sin" => n.sin(),
                         "cos" => n.cos(),
@@ -337,10 +368,28 @@ pub(super) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
             Ok(Value::empty())
         }
         "isqrt" => {
-            require_args(name, 1, args.len())?;
+            if args.len() > 1 {
+                return Err(Error::runtime(
+                    format!("too many arguments for math function \"{}\"", name),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+            if args.len() < 1 {
+                return Err(Error::runtime(
+                    format!("too few arguments for math function \"{}\"", name),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
             match args[0].as_float() {
                 Some(n) if n >= 0.0 => Ok(Value::from_int((n.sqrt()) as i64)),
-                _ => Err(Error::runtime("domain error: argument not in valid range", crate::error::ErrorCode::InvalidOp)),
+                Some(_) => Err(Error::runtime(
+                    "square root of negative argument",
+                    crate::error::ErrorCode::InvalidOp,
+                )),
+                None => Err(Error::runtime(
+                    format!("expected number but got \"{}\"", args[0].as_str()),
+                    crate::error::ErrorCode::Generic,
+                )),
             }
         }
         _ => Err(Error::runtime(

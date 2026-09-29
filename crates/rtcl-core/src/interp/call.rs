@@ -10,9 +10,18 @@ use std::collections::HashMap;
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeMap as HashMap;
 
+#[cfg(not(feature = "embedded"))]
+use std::collections::HashSet;
+
+#[cfg(feature = "embedded")]
+use alloc::collections::BTreeSet as HashSet;
+
 impl Interp {
     /// Call a user-defined procedure.
-    pub(crate) fn call_proc(&mut self, proc_def: &ProcDef, args: &[Value], proc_name: &str) -> Result<Value> {
+    ///
+    /// `ns_override` pins the frame's namespace for `apply {p b ::ns}`
+    /// (the lambda runs in `::ns` regardless of its synthetic name).
+    pub(crate) fn call_proc(&mut self, proc_def: &ProcDef, args: &[Value], proc_name: &str, ns_override: Option<String>) -> Result<Value> {
         if self.call_depth > self.max_call_depth {
             return Err(Error::runtime(
                 "maximum recursion depth exceeded",
@@ -25,22 +34,37 @@ impl Interp {
         let mut current_args: Vec<Value> = args.to_vec();
         let mut current_statics: HashMap<String, Value> = proc_def.statics.clone();
         let mut current_proc_name = proc_name.to_string();
+        let mut ns_override = ns_override;
 
         self.call_depth += 1;
+
+        // A proc executes in the namespace where it was defined (the
+        // qualifiers of its registered name), not the caller's namespace.
+        let prev_namespace = self.current_namespace.clone();
 
         // Push a new call frame
         self.frames.push(CallFrame {
             locals: HashMap::new(),
+            array_locals: HashSet::new(),
             upvars: HashMap::new(),
+            ns: None,
             local_procs: Vec::new(),
             deferred_scripts: Vec::new(),
         });
 
         let final_result = loop {
-            // ── Bind parameters into current frame ─────────────────
+            // ── Enter the definition namespace (also on tail-call switch) ──
+            // The override (apply's ::ns element) applies to the first frame
+            // only; tail-call targets recompute from their own names.
             {
+                let def_ns = ns_override
+                    .take()
+                    .unwrap_or_else(|| ns_of_qualified(&current_proc_name));
+                self.current_namespace = def_ns.clone();
                 let frame = self.frames.last_mut().unwrap();
+                frame.ns = Some(def_ns);
                 frame.locals.clear();
+                frame.array_locals.clear();
                 frame.upvars.clear();
             }
 
@@ -208,8 +232,15 @@ impl Interp {
             }
         }
 
-        // Pop the frame
+        // Pop the frame and leave the definition namespace
         self.frames.pop();
+        // Frame-local trace tables keyed F{idx}:... must not leak into the
+        // next call that reuses this frame index.
+        let fkey = format!("F{}:", self.frames.len());
+        self.var_traces.retain(|k, _| !k.starts_with(&fkey));
+        self.elem_traces.retain(|k, _| !k.starts_with(&fkey));
+        self.trace_phantoms.retain(|k, _| !k.starts_with(&fkey));
+        self.current_namespace = prev_namespace;
         self.call_depth -= 1;
 
         match final_result {
@@ -220,10 +251,10 @@ impl Interp {
                         Error::ControlFlow { level, value, error_info, error_code, .. } => {
                             // Propagate -errorinfo / -errorcode to global variables
                             if let Some(info) = error_info {
-                                self.globals.insert("errorInfo".to_string(), Value::from_str(info));
+                                let _ = self.set_var("::errorInfo", Value::from_str(info));
                             }
                             if let Some(code) = error_code {
-                                self.globals.insert("errorCode".to_string(), Value::from_str(code));
+                                let _ = self.set_var("::errorCode", Value::from_str(code));
                             }
                             let val = value.clone().unwrap_or_default();
                             match *level {
@@ -272,7 +303,7 @@ impl Interp {
             self.call_depth += 1;
             let result = f(self, args);
             self.call_depth -= 1;
-            result
+            self.fill_wrong_args(cmd_name, result)
         } else {
             // Fallback: build script string and eval
             let script: String = args
@@ -289,5 +320,15 @@ impl Interp {
                 .join(" ");
             self.eval(&script)
         }
+    }
+}
+
+/// The namespace part of a qualified proc name: `::foo::p` → `::foo`,
+/// `::p` → `::`, bare `p` → `::`.
+fn ns_of_qualified(name: &str) -> String {
+    match name.rfind("::") {
+        Some(0) => "::".to_string(),
+        Some(pos) => format!("::{}", name[..pos].trim_start_matches("::")),
+        None => "::".to_string(),
     }
 }

@@ -86,3 +86,31 @@ fn test_braced_backslash_cr_not_continuation() {
         w => panic!("expected literal, got {:?}", w),
     }
 }
+
+#[test]
+fn test_trailing_garbage_after_close_quote_errors() {
+    // tclsh: `set v "ab"cd` -> extra characters after close-quote
+    let err = crate::parse("set v \"ab\"cd").unwrap_err();
+    assert_eq!(err.message, "extra characters after close-quote");
+}
+
+#[test]
+fn test_trailing_garbage_after_close_brace_errors() {
+    // tclsh: `expr {1}junk` -> extra characters after close-brace
+    let err = crate::parse("expr {1}junk").unwrap_err();
+    assert_eq!(err.message, "extra characters after close-brace");
+}
+
+#[test]
+fn test_no_garbage_after_delimiters_still_parses() {
+    // Whitespace/;/]/end after the closer are all fine; mid-bare quotes
+    // and braces stay literal.
+    for src in [
+        "set v \"ab\" ; set w {a} ; set y x\"y\"z",
+        "set v [string cat {a}]",
+        "set v \"ab\"",
+        "set v {a}",
+    ] {
+        assert!(crate::parse(src).is_ok(), "should parse: {}", src);
+    }
+}

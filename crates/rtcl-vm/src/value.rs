@@ -449,15 +449,32 @@ impl Value {
             _ => {
                 let s = self.to_str();
                 let s = s.trim();
-                // Handle hex, octal, binary
-                if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                // Handle hex, octal, binary — with optional sign
+                // (`-0x1234` -> -4660, Tcl signed radix literals).
+                let (neg, body) = match s.strip_prefix('-') {
+                    Some(r) => (true, r),
+                    None => (false, s.strip_prefix('+').unwrap_or(s)),
+                };
+                let radix_parse = if let Some(rest) =
+                    body.strip_prefix("0x").or_else(|| body.strip_prefix("0X"))
+                {
                     i64::from_str_radix(rest, 16).ok()
-                } else if let Some(rest) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
+                } else if let Some(rest) =
+                    body.strip_prefix("0o").or_else(|| body.strip_prefix("0O"))
+                {
                     i64::from_str_radix(rest, 8).ok()
-                } else if let Some(rest) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+                } else if let Some(rest) =
+                    body.strip_prefix("0b").or_else(|| body.strip_prefix("0B"))
+                {
                     i64::from_str_radix(rest, 2).ok()
                 } else {
-                    i64::from_str(s).ok()
+                    // Plain decimal: parse the original text (sign included).
+                    return i64::from_str(s).ok();
+                };
+                if neg {
+                    radix_parse.map(|n| n.wrapping_neg())
+                } else {
+                    radix_parse
                 }
             }
         }
@@ -471,6 +488,13 @@ impl Value {
             _ => {
                 let s = self.to_str();
                 let s = s.trim();
+                // Tcl accepts Inf / -Inf / NaN (any case) as numeric strings.
+                match s.to_ascii_lowercase().as_str() {
+                    "inf" | "infinity" => return Some(f64::INFINITY),
+                    "-inf" | "-infinity" => return Some(f64::NEG_INFINITY),
+                    "nan" => return Some(f64::NAN),
+                    _ => {}
+                }
                 f64::from_str(s).ok()
             }
         }
@@ -1236,6 +1260,14 @@ fn format_int(n: i64) -> String {
 
 /// Format a float for Tcl
 fn format_float(n: f64) -> String {
+    // tclsh renders non-finite floats as Inf / -Inf / NaN, not Rust's
+    // lowercase "inf"/"NaN".
+    if n.is_infinite() {
+        return if n > 0.0 { "Inf".to_string() } else { "-Inf".to_string() };
+    }
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
     if n.fract() == 0.0 && n.abs() < 1e15 {
         format!("{:.1}", n)
     } else {

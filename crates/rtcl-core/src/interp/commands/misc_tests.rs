@@ -239,14 +239,14 @@ fn test_xtrace_wrong_args() {
 fn test_info_usage_builtin() {
     let mut interp = Interp::new();
     let r = interp.eval("info usage set").unwrap();
-    assert_eq!(r.as_str(), "set varName ?value?");
+    assert_eq!(r.as_str(), "set varName ?newValue?");
 }
 
 #[test]
 fn test_info_usage_builtin_lsort() {
     let mut interp = Interp::new();
     let r = interp.eval("info usage lsort").unwrap();
-    assert_eq!(r.as_str(), "lsort ?options? list");
+    assert_eq!(r.as_str(), "lsort ?-option value ...? list");
 }
 
 #[test]
@@ -486,7 +486,7 @@ fn test_delete_command_clears_meta() {
 #[test]
 fn test_command_usage_api() {
     let interp = Interp::new();
-    assert_eq!(interp.command_usage("set"), Some("varName ?value?".to_string()));
+    assert_eq!(interp.command_usage("set"), Some("varName ?newValue?".to_string()));
     assert_eq!(interp.command_usage("nosuch"), None);
 }
 
@@ -495,4 +495,211 @@ fn test_command_help_api() {
     let interp = Interp::new();
     assert_eq!(interp.command_help("set"), Some("Read or write a variable".to_string()));
     assert_eq!(interp.command_help("nosuch"), None);
+}
+
+// -- info vars / info globals with namespace-qualified variables
+//    (tclsh 8.6.17: patterns match without the leading "::", results are
+//    reported qualified when the pattern was qualified or the variable
+//    lives in a namespace; `info globals` never lists namespace vars) --
+
+#[test]
+fn test_info_vars_qualified_pattern() {
+    let mut interp = Interp::new();
+    assert_eq!(
+        interp
+            .eval("namespace eval n { variable v 1 }; info vars ::n::*")
+            .unwrap()
+            .as_str(),
+        "::n::v"
+    );
+}
+
+#[test]
+fn test_info_vars_unqualified_pattern_namespaced_result() {
+    let mut interp = Interp::new();
+    assert_eq!(
+        interp
+            .eval("namespace eval n { variable v 1 }; info vars n::*")
+            .unwrap()
+            .as_str(),
+        "::n::v"
+    );
+}
+
+#[test]
+fn test_info_vars_global_via_qualified_pattern() {
+    let mut interp = Interp::new();
+    assert_eq!(
+        interp
+            .eval("set errorCode NONE; info vars ::err*")
+            .unwrap()
+            .as_str(),
+        "::errorCode ::errorInfo"
+    );
+}
+
+#[test]
+fn test_info_globals_excludes_namespace_vars() {
+    let mut interp = Interp::new();
+    assert_eq!(
+        interp
+            .eval("namespace eval q { variable loc 1 }; info globals q::*")
+            .unwrap()
+            .as_str(),
+        ""
+    );
+    assert_eq!(
+        interp
+            .eval("set errorCode NONE; info globals ::err*")
+            .unwrap()
+            .as_str(),
+        "errorCode errorInfo"
+    );
+}
+
+#[test]
+fn test_variable_without_value_creates_nothing() {
+    let mut interp = Interp::new();
+    assert_eq!(
+        interp
+            .eval("set two 2; namespace eval nsv { variable two }; info exists nsv::two")
+            .unwrap()
+            .as_str(),
+        "0"
+    );
+}
+
+// -- wrong-args messages carry the registry usage text (tclsh 8.6.17
+//    prints `wrong # args: should be "cmd usage..."` for every builtin;
+//    rtcl used to print the generic `cmd N args`) --
+
+#[test]
+fn test_wrong_args_uses_registry_usage() {
+    let cases: Vec<(&str, String)> = vec![
+        ("catch {set} m; set m", r#"wrong # args: should be "set varName ?newValue?""#.to_string()),
+        ("catch {append} m; set m", r#"wrong # args: should be "append varName ?value ...?""#.to_string()),
+        ("catch {dict} m; set m", r#"wrong # args: should be "dict subcommand ?arg ...?""#.to_string()),
+        ("catch {catch} m; set m", r#"wrong # args: should be "catch script ?resultVarName? ?optionVarName?""#.to_string()),
+    ];
+    for (script, expected) in cases {
+        let mut interp = Interp::new();
+        let got = interp.eval(script).unwrap().as_str().to_string();
+        assert_eq!(got, expected, "script: {}", script);
+    }
+}
+
+// ── append with no values (tclsh 8.6.17) ─────────────────────
+
+#[test]
+fn test_append_no_values_on_missing_errors() {
+    // tclsh: `append x` with no values reads x; missing → error
+    let mut interp = Interp::new();
+    let e = interp
+        .eval("unset -nocomplain x; append x")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(e, "can't read \"x\": no such variable");
+}
+
+#[test]
+fn test_append_no_values_returns_current() {
+    let mut interp = Interp::new();
+    assert_eq!(interp.eval("set x 5; append x").unwrap().as_str(), "5");
+}
+
+// ── foreach varlist validation (tclsh 8.6.17) ────────────────
+
+#[test]
+fn test_foreach_empty_varlist_errors() {
+    let mut interp = Interp::new();
+    let e = interp
+        .eval("proc foo {} { foreach {} x { error \"reached body\" } }; catch {foo} m; set m")
+        .unwrap()
+        .as_str()
+        .to_string();
+    assert_eq!(e, "foreach varlist is empty");
+}
+
+// ── syntax error messages are bare (tclsh 8.6.17) ────────────
+
+#[test]
+fn test_missing_close_bracket_message_is_bare() {
+    let mut interp = Interp::new();
+    let e = interp.eval("set x [foo").unwrap_err().to_string();
+    assert_eq!(e, "missing close-bracket");
+}
+
+#[test]
+fn test_missing_close_brace_message_is_bare() {
+    let mut interp = Interp::new();
+    let e = interp.eval("set x {foo").unwrap_err().to_string();
+    assert_eq!(e, "missing close-brace");
+}
+
+// ── info subcommand unique-prefix resolution (tclsh 8.6.17) ──
+
+#[test]
+fn test_info_subcommand_prefix() {
+    let mut interp = Interp::new();
+    // `info a` resolves to args
+    assert_eq!(
+        interp
+            .eval("proc t1 {{a default1} {bbb default2}} {return x}; info a t1")
+            .unwrap()
+            .as_str(),
+        "a bbb"
+    );
+}
+
+#[test]
+fn test_info_subcommand_ambiguous_message() {
+    let mut interp = Interp::new();
+    let e = interp.eval("info com").unwrap_err().to_string();
+    assert_eq!(
+        e,
+        "unknown or ambiguous subcommand \"com\": must be args, body, class, cmdcount, commands, complete, coroutine, default, errorstack, exists, frame, functions, globals, hostname, level, library, loaded, locals, nameofexecutable, object, patchlevel, procs, script, sharedlibextension, tclversion, or vars"
+    );
+}
+
+#[test]
+fn test_info_commands_ns_pattern() {
+    // tclsh: pattern "test_ns_basic::*" finds ::test_ns_basic::p
+    let mut interp = Interp::new();
+    let r = interp
+        .eval("namespace eval test_ns_basic {proc p {} {return 1}}; info commands test_ns_basic::*")
+        .unwrap()
+        .as_str()
+        .to_string();
+    assert_eq!(r, "::test_ns_basic::p");
+}
+
+// ── expr nan literal (tclsh 8.6.17) ──────────────────────────
+
+#[test]
+fn test_expr_bare_nan_is_domain_error() {
+    let mut interp = Interp::new();
+    let e = interp.eval("catch {expr nan} m; list $m [set ::errorCode]").unwrap();
+    assert_eq!(
+        e.as_str(),
+        "{domain error: argument not in valid range} {ARITH DOMAIN {domain error: argument not in valid range}}"
+    );
+}
+
+#[test]
+fn test_expr_inf_literal_still_works() {
+    let mut interp = Interp::new();
+    assert_eq!(interp.eval("expr inf").unwrap().as_str(), "Inf");
+    assert_eq!(interp.eval("expr -inf").unwrap().as_str(), "-Inf");
+}
+
+// ── binary scan x* consumes all remaining bytes ──────────────
+
+#[test]
+fn test_scan_x_star_skips_to_end() {
+    // tclsh: a3x*a3 on "abcdefg" → second a3 has no bytes left, arg2 unset
+    let mut interp = Interp::new();
+    let r = interp
+        .eval("unset -nocomplain a1 a2; set a2 zz; list [binary scan abcdefg a3x*a3 a1 a2] $a1 $a2")
+        .unwrap();
+    assert_eq!(r.as_str(), "1 abc zz");
 }

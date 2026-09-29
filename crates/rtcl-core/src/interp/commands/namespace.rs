@@ -11,6 +11,11 @@ use crate::value::Value;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NamespaceInfo {
     pub export_patterns: Vec<String>,
+    /// Variables declared in this namespace (canonical flat keys, no
+    /// leading `::`).  A bare `variable x` registers the name without
+    /// creating storage — `namespace which -variable x` still resolves it,
+    /// while `info exists` stays 0 (tclsh 8.6.17).
+    pub variables: std::collections::HashSet<String>,
 }
 
 // ── namespace command ──────────────────────────────────────────────────
@@ -52,6 +57,18 @@ pub fn cmd_namespace(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
+/// Canonical flat key for a namespace-qualified *variable*: `qualify()`
+/// yields `::ns::name`, but variable slots live in `Interp::globals`
+/// alongside plain globals (`errorCode`, ...) keyed without the leading
+/// `::` — matching the normalization `set ::ns::v` goes through in
+/// `vars.rs`.
+fn var_key(qualified: &str) -> String {
+    qualified
+        .strip_prefix("::")
+        .unwrap_or(qualified)
+        .to_string()
+}
+
 /// `variable ?name ?value? ...?`
 pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
@@ -65,19 +82,22 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut i = 1;
     while i < args.len() {
         let raw_name = args[i].as_str();
-        let qualified = qualify(&ns, raw_name);
+        let qualified = var_key(&qualify(&ns, raw_name));
 
-        // If an initial value is provided, set it
+        // If an initial value is provided, set it.  A bare `variable name`
+        // declares the link without creating the variable (tclsh:
+        // `namespace eval n {variable v}; info exists n::v` → 0).
         if i + 1 < args.len() {
             let val = args[i + 1].clone();
             interp.globals.insert(qualified.clone(), val);
             i += 2;
         } else {
-            // Ensure the variable exists (even if empty)
-            if !interp.globals.contains_key(&qualified) {
-                interp.globals.insert(qualified.clone(), Value::empty());
-            }
             i += 1;
+        }
+
+        // Register the name in the namespace's variable table either way.
+        if let Some(info) = interp.namespaces.get_mut(&ns) {
+            info.variables.insert(qualified.clone());
         }
 
         // If we're inside a proc, create an upvar link from the local
@@ -147,12 +167,18 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // Remove the namespace and all children
         let prefix = format!("{}::", qualified);
         interp.namespaces.retain(|k, _| k != &qualified && !k.starts_with(&prefix));
+        // ...and any names its ancestors declared pointing into it
+        if let Some(parent) = interp.namespaces.get_mut("::") {
+            let child_prefix = var_key(&prefix);
+            parent.variables.retain(|v| !v.starts_with(&child_prefix));
+        }
 
         // Remove procs defined in this namespace
         interp.procs.retain(|k, _| k != &qualified && !k.starts_with(&prefix));
 
-        // Remove namespace-scoped global variables
-        interp.globals.retain(|k, _| !k.starts_with(&prefix));
+        // Remove namespace-scoped global variables (flat keys, no leading ::)
+        let var_prefix = var_key(&prefix);
+        interp.globals.retain(|k, _| !k.starts_with(&var_prefix));
     }
     Ok(Value::empty())
 }
@@ -170,9 +196,26 @@ fn ns_exists(interp: &Interp, args: &[Value]) -> Result<Value> {
 }
 
 /// `namespace parent ?namespace?`
+/// Validate that a named namespace exists, returning its qualified name.
+/// tclsh: `namespace "xyzzy" not found in "::"` names the argument as
+/// given plus the namespace it was resolved against.
+fn require_ns(interp: &Interp, raw: &str) -> Result<String> {
+    let qualified = qualify(&interp.current_namespace, raw);
+    if !interp.namespaces.contains_key(&qualified) {
+        return Err(Error::runtime(
+            format!(
+                "namespace \"{}\" not found in \"{}\"",
+                raw, interp.current_namespace
+            ),
+            ErrorCode::NotFound,
+        ));
+    }
+    Ok(qualified)
+}
+
 fn ns_parent(interp: &Interp, args: &[Value]) -> Result<Value> {
     let ns = if args.len() >= 3 {
-        qualify(&interp.current_namespace, args[2].as_str())
+        require_ns(interp, args[2].as_str())?
     } else {
         interp.current_namespace.clone()
     };
@@ -189,7 +232,7 @@ fn ns_parent(interp: &Interp, args: &[Value]) -> Result<Value> {
 /// `namespace children ?namespace? ?pattern?`
 fn ns_children(interp: &Interp, args: &[Value]) -> Result<Value> {
     let ns = if args.len() >= 3 {
-        qualify(&interp.current_namespace, args[2].as_str())
+        require_ns(interp, args[2].as_str())?
     } else {
         interp.current_namespace.clone()
     };
@@ -278,7 +321,13 @@ fn ns_which(interp: &Interp, args: &[Value]) -> Result<Value> {
             }
         }
         "variable" => {
-            if interp.globals.contains_key(&qualified) {
+            let key = var_key(&qualified);
+            let declared = interp
+                .namespaces
+                .get(&interp.current_namespace)
+                .map(|info| info.variables.contains(&key))
+                .unwrap_or(false);
+            if interp.globals.contains_key(&key) || declared {
                 Ok(Value::from_str(&qualified))
             } else if interp.globals.contains_key(name) {
                 Ok(Value::from_str(&qualify("::", name)))
@@ -411,6 +460,8 @@ fn ns_inscope(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "namespace inscope name arg ?arg ...?",
         ));
     }
+    // Unlike `namespace eval`, inscope requires the namespace to exist.
+    require_ns(interp, args[2].as_str())?;
     // inscope is like eval but with extra args appended
     ns_eval(interp, args)
 }
@@ -506,5 +557,153 @@ fn ensure_namespace(
             path = format!("{}::{}", path, part);
         }
         namespaces.entry(path.clone()).or_default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::interp::Interp;
+
+    fn eval(script: &str) -> String {
+        let mut interp = Interp::new();
+        interp.eval(script).unwrap().as_str().to_string()
+    }
+
+    fn eval_err(script: &str) -> String {
+        let mut interp = Interp::new();
+        interp.eval(script).unwrap_err().to_string()
+    }
+
+    // -- namespace variables share one flat key space with globals
+    //    (tclsh 8.6.17: `variable v` in `namespace eval n` stores n::v,
+    //    and `set ::n::v` from anywhere resolves to the same slot) --
+
+    #[test]
+    fn test_ns_variable_readable_as_qualified_global() {
+        assert_eq!(eval("namespace eval n { variable v 5 }; set ::n::v"), "5");
+    }
+
+    #[test]
+    fn test_ns_variable_readable_from_ns_scope() {
+        assert_eq!(
+            eval("namespace eval n { variable v 5 }; namespace eval n { set ::n::v }"),
+            "5"
+        );
+    }
+
+    #[test]
+    fn test_ns_delete_removes_ns_variables() {
+        assert_eq!(
+            eval("namespace eval n { variable w 6 }; namespace delete n; info exists ::n::w"),
+            "0"
+        );
+    }
+
+    #[test]
+    fn test_ns_which_finds_ns_variable() {
+        assert_eq!(
+            eval("namespace eval m { variable v 7 }; namespace which -variable ::m::v"),
+            "::m::v"
+        );
+    }
+
+    #[test]
+    fn test_ns_which_finds_declared_but_unset_variable() {
+        // tclsh 8.6.17: a bare `variable x` registers the name in the
+        // namespace's variable table — `namespace which -variable` resolves
+        // it even though `info exists` is still 0.
+        assert_eq!(
+            eval("namespace eval n { variable martha; namespace which -variable martha }"),
+            "::n::martha"
+        );
+    }
+    // -- procs execute in their definition namespace (tclsh 8.6.17) --
+
+    #[test]
+    fn test_proc_runs_in_definition_namespace() {
+        assert_eq!(
+            eval("namespace eval foo {proc p {} {namespace current}}; foo::p"),
+            "::foo"
+        );
+    }
+
+    // -- Tcl scoping: a proc frame sees ONLY locals, upvar/variable links,
+    //    and `::`-qualified names.  No fallback to the definition
+    //    namespace's variables or to globals (tclsh 8.6.17: both
+    //    `proc foo::p {} {return $v}` and `proc p {} {return $x}` raise
+    //    "can't read" even with `variable v` / `set x` visible outside) --
+
+    #[test]
+    fn test_proc_cannot_read_global_without_declaration() {
+        let mut interp = Interp::new();
+        interp.eval("set x 40; proc p {} {return $x}").unwrap();
+        let err = interp.eval("p").unwrap_err().to_string();
+        assert!(err.contains("can't read \"x\""), "{err}");
+    }
+
+    #[test]
+    fn test_proc_cannot_read_ns_variable_without_declaration() {
+        let mut interp = Interp::new();
+        interp
+            .eval("namespace eval foo {variable v 5}; proc foo::p {} {return $v}")
+            .unwrap();
+        let err = interp.eval("foo::p").unwrap_err().to_string();
+        assert!(err.contains("can't read \"v\""), "{err}");
+    }
+
+    #[test]
+    fn test_proc_variable_declaration_links_ns_var() {
+        assert_eq!(
+            eval(
+                "namespace eval foo {variable v 5}; proc foo::p {} {variable v; return $v}; foo::p"
+            ),
+            "5"
+        );
+    }
+
+    #[test]
+    fn test_qualified_proc_callable_unqualified() {
+        assert_eq!(
+            eval("namespace eval foo {proc p {} {return 42}}; foo::p"),
+            "42"
+        );
+    }
+
+    #[test]
+    fn test_proc_at_global_sees_definition_ns_qualified() {
+        // tclsh: `proc test_ns_basic::cmd` defined at global scope runs in
+        // ::test_ns_basic — the definition namespace always renders with a
+        // leading `::`.
+        assert_eq!(
+            eval("namespace eval test_ns_basic {}; proc test_ns_basic::cmd {} {namespace current}; test_ns_basic::cmd"),
+            "::test_ns_basic"
+        );
+    }
+
+    // -- namespace existence validation (tclsh 8.6.17) --
+
+    #[test]
+    fn test_ns_children_parent_inscope_require_existing() {
+        assert_eq!(
+            eval_err("namespace children xyzzy"),
+            "namespace \"xyzzy\" not found in \"::\""
+        );
+        assert_eq!(
+            eval_err("namespace parent xyzzy"),
+            "namespace \"xyzzy\" not found in \"::\""
+        );
+        assert_eq!(
+            eval_err("namespace inscope xyzzy {set a 1}"),
+            "namespace \"xyzzy\" not found in \"::\""
+        );
+    }
+
+    #[test]
+    fn test_ns_code_does_not_validate() {
+        // tclsh: namespace code works even for nonexistent namespaces
+        assert_eq!(
+            eval("namespace code xyzzy::sub"),
+            "::namespace inscope :: xyzzy::sub"
+        );
     }
 }

@@ -33,10 +33,31 @@ pub fn parse_next_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word
                     return Ok(Word::Expand(Box::new(inner)));
                 }
             }
-            parse_braced_word(cur)
+            let w = parse_braced_word(cur)?;
+            check_no_trailing_garbage(cur, bracket_term, "close-brace")?;
+            Ok(w)
         }
-        Token::DoubleQuote => parse_quoted_word(cur, bracket_term),
+        Token::DoubleQuote => {
+            let w = parse_quoted_word(cur, bracket_term)?;
+            check_no_trailing_garbage(cur, bracket_term, "close-quote")?;
+            Ok(w)
+        }
         _ => parse_bare_word(cur, bracket_term),
+    }
+}
+
+/// Tcl forbids concatenating anything onto a word that began with `"` or
+/// `{`: after the closer only whitespace, `;`, newline, `]` or EOF may
+/// follow (`set v "ab"cd` -> "extra characters after close-quote").
+fn check_no_trailing_garbage(
+    cur: &Cursor,
+    bracket_term: bool,
+    closer: &str,
+) -> ParseResult<()> {
+    if cur.at_end_of_command(bracket_term) || cur.next_is_line_white() {
+        Ok(())
+    } else {
+        Err(cur.error(format!("extra characters after {}", closer)))
     }
 }
 

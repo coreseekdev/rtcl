@@ -127,20 +127,42 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let lambda = args[1].as_list().ok_or_else(|| {
         Error::runtime(
-            "can't interpret lambda as a list",
+            format!(
+                "can't interpret \"{}\" as a lambda expression",
+                args[1].as_str()
+            ),
             crate::error::ErrorCode::Generic,
         )
     })?;
 
-    if lambda.len() < 2 {
+    if lambda.len() < 2 || lambda.len() > 3 {
         return Err(Error::runtime(
-            "can't interpret lambda as {params body}: must have exactly 2 elements",
+            format!(
+                "can't interpret \"{}\" as a lambda expression",
+                args[1].as_str()
+            ),
             crate::error::ErrorCode::Generic,
         ));
     }
 
     let param_list = lambda[0].as_list().unwrap_or_default();
     let body = lambda[1].as_str().to_string();
+
+    // Optional third element: namespace in which the lambda body runs
+    // (tclsh: `apply {{args} {body} ::ns}` — must already exist).
+    let ns_override = if lambda.len() == 3 {
+        let qualified =
+            super::namespace::qualify(&interp.current_namespace, lambda[2].as_str());
+        if !interp.namespaces.contains_key(&qualified) {
+            return Err(Error::runtime(
+                format!("namespace \"{}\" not found", qualified),
+                crate::error::ErrorCode::NotFound,
+            ));
+        }
+        Some(qualified)
+    } else {
+        None
+    };
 
     // Build param defaults (same logic as cmd_proc)
     let defaults = parse_param_specs(&param_list)?;
@@ -158,7 +180,7 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         call_args.push(arg.clone());
     }
 
-    interp.call_proc(&proc_def, &call_args, "apply lambdaExpr")
+    interp.call_proc(&proc_def, &call_args, "apply lambdaExpr", ns_override)
 }
 
 pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -279,34 +301,98 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let old_name = args[1].as_str().to_string();
     let new_name = args[2].as_str().to_string();
 
+    // Command names resolve through the same fallback chain dispatch uses:
+    // exact, namespace-qualified, then `::`-prefixed (tclsh: `rename
+    // nb::pp nb::qq` finds the proc registered as `::nb::pp`).
+    let old_key = resolve_command_key(interp, &old_name)
+        .ok_or_else(|| {
+            // tclsh: can't rename "name": command doesn't exist
+            Error::runtime(
+                format!("can't rename \"{}\": command doesn't exist", old_name),
+                crate::error::ErrorCode::NotFound,
+            )
+        })?;
+    let new_key = if new_name.is_empty() {
+        String::new()
+    } else if new_name.starts_with("::") {
+        new_name.clone()
+    } else if interp.current_namespace != "::" {
+        super::namespace::qualify(&interp.current_namespace, &new_name)
+    } else {
+        new_name.clone()
+    };
+
     // Rename in builtins
-    if let Some(func) = interp.commands.remove(&old_name) {
-        let cat = interp.command_categories.remove(&old_name);
-        let meta = interp.command_meta.remove(&old_name);
-        if !new_name.is_empty() {
-            interp.commands.insert(new_name.clone(), func);
+    if let Some(func) = interp.commands.remove(&old_key) {
+        let cat = interp.command_categories.remove(&old_key);
+        let meta = interp.command_meta.remove(&old_key);
+        if !new_key.is_empty() {
+            interp.commands.insert(new_key.clone(), func);
             if let Some(c) = cat {
-                interp.command_categories.insert(new_name.clone(), c);
+                interp.command_categories.insert(new_key.clone(), c);
             }
             if let Some(m) = meta {
-                interp.command_meta.insert(new_name, m);
+                interp.command_meta.insert(new_key.clone(), m);
             }
         }
+        finish_cmd_rename(interp, &old_key, &new_key, &old_name, &new_name);
         return Ok(Value::empty());
     }
 
     // Rename in procs
-    if let Some(proc_def) = interp.procs.remove(&old_name) {
-        if !new_name.is_empty() {
-            interp.procs.insert(new_name, proc_def);
+    if let Some(proc_def) = interp.procs.remove(&old_key) {
+        if !new_key.is_empty() {
+            interp.procs.insert(new_key.clone(), proc_def);
         }
+        finish_cmd_rename(interp, &old_key, &new_key, &old_name, &new_name);
         return Ok(Value::empty());
     }
 
     Err(Error::runtime(
-        format!("can't rename: command \"{}\" not found", old_name),
+        format!("can't rename \"{}\": command doesn't exist", old_name),
         crate::error::ErrorCode::NotFound,
     ))
+}
+
+/// Post-rename bookkeeping shared by the builtin and proc paths: move
+/// command traces to the new key, then fire rename/delete traces
+/// (tclsh fires them after the operation; callback errors are
+/// background errors and never fail the rename).
+fn finish_cmd_rename(
+    interp: &mut Interp,
+    old_key: &str,
+    new_key: &str,
+    old_name: &str,
+    new_name: &str,
+) {
+    if new_key.is_empty() {
+        interp.fire_cmd_traces(old_key, old_name, "", "delete");
+    } else {
+        interp.rekey_cmd_traces(old_key, new_key);
+        interp.fire_cmd_traces(new_key, old_name, new_name, "rename");
+    }
+}
+
+/// Resolve a command name to its registered key, mirroring dispatch's
+/// fallback chain (exact → namespace-qualified → `::`-prefixed).
+pub(crate) fn resolve_command_key(interp: &Interp, name: &str) -> Option<String> {
+    if interp.procs.contains_key(name) || interp.commands.contains_key(name) {
+        return Some(name.to_string());
+    }
+    if interp.current_namespace != "::" && !name.starts_with("::") {
+        let qualified =
+            super::namespace::qualify(&interp.current_namespace, name);
+        if interp.procs.contains_key(&qualified) || interp.commands.contains_key(&qualified) {
+            return Some(qualified);
+        }
+    }
+    if !name.starts_with("::") && name.contains("::") {
+        let qualified = format!("::{}", name);
+        if interp.procs.contains_key(&qualified) || interp.commands.contains_key(&qualified) {
+            return Some(qualified);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -374,5 +460,126 @@ mod tests {
         interp.eval("counter").unwrap();
         let r = interp.eval("info statics counter").unwrap();
         assert_eq!(r.as_str(), "count 2");
+    }
+}
+
+#[cfg(test)]
+mod apply_rename_tests {
+    use crate::interp::Interp;
+
+    // -- apply lambdaExpr shapes (tclsh 8.6.17) --
+
+    #[test]
+    fn test_apply_non_lambda_message() {
+        let mut interp = Interp::new();
+        let e = interp.eval("apply xx").unwrap_err().to_string();
+        assert_eq!(e, "can't interpret \"xx\" as a lambda expression");
+    }
+
+    #[test]
+    fn test_apply_one_element_lambda_message() {
+        let mut interp = Interp::new();
+        let e = interp.eval("apply {x}").unwrap_err().to_string();
+        assert_eq!(e, "can't interpret \"x\" as a lambda expression");
+    }
+
+    #[test]
+    fn test_apply_four_element_lambda_message() {
+        let mut interp = Interp::new();
+        let e = interp
+            .eval(r#"apply {{a} {set a} ::NN extra} 1"#)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "can't interpret \"{a} {set a} ::NN extra\" as a lambda expression"
+        );
+    }
+
+    // -- apply namespace element --
+
+    #[test]
+    fn test_apply_runs_in_named_namespace() {
+        let mut interp = Interp::new();
+        assert_eq!(
+            interp
+                .eval("namespace eval NN10 {}; apply {{} {namespace current} ::NN10}")
+                .unwrap()
+                .as_str(),
+            "::NN10"
+        );
+        // relative name qualifies against the current namespace
+        assert_eq!(
+            interp
+                .eval("namespace eval NN13 {}; apply {{} {namespace current} NN13}")
+                .unwrap()
+                .as_str(),
+            "::NN13"
+        );
+    }
+
+    #[test]
+    fn test_apply_ns_resolves_procs_of_that_ns() {
+        let mut interp = Interp::new();
+        assert_eq!(
+            interp
+                .eval("namespace eval NN11 {proc helper {} {return H}}; apply {{} {helper} ::NN11}")
+                .unwrap()
+                .as_str(),
+            "H"
+        );
+    }
+
+    #[test]
+    fn test_apply_ns_must_exist() {
+        let mut interp = Interp::new();
+        let e = interp
+            .eval(r#"apply [list x {set x 1} ::NONEXIST::FOR::SURE] x"#)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, "namespace \"::NONEXIST::FOR::SURE\" not found");
+        let e2 = interp
+            .eval("apply {{a} {set a} NOPE} 1")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e2, "namespace \"::NOPE\" not found");
+    }
+
+    // -- rename of namespace-qualified procs --
+
+    #[test]
+    fn test_rename_qualified_proc() {
+        // tclsh: rename test_ns_basic::p test_ns_basic::q works
+        let mut interp = Interp::new();
+        assert_eq!(
+            interp
+                .eval("namespace eval nb {proc pp {} {return 1}}; rename nb::pp nb::qq; nb::qq")
+                .unwrap()
+                .as_str(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn test_rename_qualified_delete() {
+        let mut interp = Interp::new();
+        let r = interp
+            .eval("namespace eval nb2 {proc pp {} {return 1}}; rename nb2::pp {}; info procs nb2::*")
+            .unwrap()
+            .as_str()
+            .to_string();
+        assert_eq!(r, "");
+    }
+
+    #[test]
+    fn test_rename_missing_message() {
+        // tclsh: can't rename "name": command doesn't exist
+        let mut interp = Interp::new();
+        let e = interp
+            .eval("catch {rename nosuch::cmd other} m; set m")
+            .unwrap()
+            .as_str()
+            .to_string();
+        assert_eq!(e, "can't rename \"nosuch::cmd\": command doesn't exist");
     }
 }

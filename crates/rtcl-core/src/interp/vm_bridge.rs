@@ -5,6 +5,28 @@ use crate::error::{Error, Result};
 use crate::value::Value;
 use rtcl_vm::VmContext;
 
+impl Interp {
+    /// Tcl renders every arity error with the command's usage text; fill it
+    /// in from the registry when a builtin raised a bare WrongNumArgs
+    /// (tclsh prints `should be "set varName ?newValue?"`, never
+    /// `set 2 args`).
+    pub(crate) fn fill_wrong_args(&self, cmd_name: &str, result: Result<Value>) -> Result<Value> {
+        match result {
+            Err(Error::WrongNumArgs { command, expected, actual, usage: None }) => {
+                let usage = self.command_meta.get(cmd_name).and_then(|meta| {
+                    if meta.usage.is_empty() {
+                        None
+                    } else {
+                        Some(meta.usage.to_string())
+                    }
+                });
+                Err(Error::WrongNumArgs { command, expected, actual, usage })
+            }
+            other => other,
+        }
+    }
+}
+
 impl VmContext for Interp {
     fn get_var(&self, name: &str) -> Result<Value> {
         Interp::get_var(self, name).cloned()
@@ -23,16 +45,7 @@ impl VmContext for Interp {
     }
 
     fn incr_var(&mut self, name: &str, amount: i64) -> Result<Value> {
-        let current = match Interp::get_var(self, name) {
-            Ok(v) => v.clone(),
-            Err(_) => Value::from_int(0),
-        };
-        let int_val = current.as_int().ok_or_else(|| {
-            Error::type_mismatch("integer", current.as_str())
-        })?;
-        let new_val = Value::from_int(int_val + amount);
-        Interp::set_var(self, name, new_val.clone())?;
-        Ok(new_val)
+        Interp::incr_var(self, name, amount)
     }
 
     fn append_var(&mut self, name: &str, value: &str) -> Result<Value> {
@@ -63,7 +76,7 @@ impl VmContext for Interp {
 
         // Try user-defined procs first
         if let Some(proc_def) = self.procs.get(cmd_name).cloned() {
-            return self.call_proc(&proc_def, args, cmd_name);
+            return self.call_proc(&proc_def, args, cmd_name, None);
         }
 
         // Built-in commands
@@ -71,7 +84,7 @@ impl VmContext for Interp {
             self.call_depth += 1;
             let result = f(self, args);
             self.call_depth -= 1;
-            return result;
+            return self.fill_wrong_args(cmd_name, result);
         }
 
         Err(Error::invalid_command(cmd_name))
@@ -84,7 +97,8 @@ impl VmContext for Interp {
                 self.call_depth += 1;
                 let result = f(self, args);
                 self.call_depth -= 1;
-                result
+                let name = args.first().map(|a| a.as_str()).unwrap_or("");
+                self.fill_wrong_args(name, result)
             }
             None => Err(Error::runtime(
                 format!("unknown command id {}", cmd_id),

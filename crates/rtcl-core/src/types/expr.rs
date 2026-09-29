@@ -89,6 +89,8 @@ impl<'a> ExprParser<'a> {
             if super::expr_funcs::strict_bool(&left)? {
                 // Short-circuit: skip parsing the RHS but consume the tokens
                 self.skip_or_operand()?;
+                // Tcl: the result is always a boolean, never the operand.
+                left = Value::from_bool(true);
             } else {
                 let right = self.parse_and()?;
                 left = Value::from_bool(super::expr_funcs::strict_bool(&right)?);
@@ -104,6 +106,7 @@ impl<'a> ExprParser<'a> {
             if !super::expr_funcs::strict_bool(&left)? {
                 // Short-circuit: skip parsing the RHS but consume the tokens
                 self.skip_and_operand()?;
+                left = Value::from_bool(false);
             } else {
                 let right = self.parse_bitor()?;
                 left = Value::from_bool(super::expr_funcs::strict_bool(&right)?);
@@ -174,6 +177,11 @@ impl<'a> ExprParser<'a> {
         loop {
             if self.match_op("==") {
                 let right = self.parse_relational()?;
+                // NaN compares unequal to everything (expr-22.9).
+                if super::expr_funcs::nan_pair(&left, &right) {
+                    left = Value::from_bool(false);
+                    continue;
+                }
                 // Exact numeric comparison when both operands are numeric
                 // (int pairs compare as i64, no EPSILON tolerance);
                 // string comparison otherwise.
@@ -183,6 +191,10 @@ impl<'a> ExprParser<'a> {
                 };
             } else if self.match_op("!=") {
                 let right = self.parse_relational()?;
+                if super::expr_funcs::nan_pair(&left, &right) {
+                    left = Value::from_bool(true);
+                    continue;
+                }
                 left = match super::expr_funcs::numeric_cmp(&left, &right) {
                     Some(ord) => Value::from_bool(ord != core::cmp::Ordering::Equal),
                     None => Value::from_bool(left.as_str() != right.as_str()),
@@ -263,6 +275,11 @@ impl<'a> ExprParser<'a> {
             };
             let right = self.parse_shift()?;
             use core::cmp::Ordering;
+            // NaN: every relational comparison is false.
+            if super::expr_funcs::nan_pair(&left, &right) {
+                left = Value::from_bool(false);
+                continue;
+            }
             left = match super::expr_funcs::numeric_cmp(&left, &right) {
                 Some(ord) => Value::from_bool(match op {
                     "<" => ord == Ordering::Less,
@@ -430,7 +447,29 @@ impl<'a> ExprParser<'a> {
             self.advance();
             // Check if next char can start an expression
             self.skip_whitespace();
-            if self.is_digit() || self.peek() == '(' || self.peek() == '$' || self.peek() == '[' || self.peek() == '.' {
+            // Alphabetic covers numeric identifiers like `inf` (`expr -inf`);
+            // +/- chain into further unary signs (`expr --5` -> 5).
+            if self.is_digit()
+                || self.peek() == '('
+                || self.peek() == '$'
+                || self.peek() == '['
+                || self.peek() == '.'
+                || self.peek() == '-'
+                || self.peek() == '+'
+                || self.peek().is_ascii_alphabetic()
+            {
+                // tclsh: -9223372036854775808 is a valid integer literal
+                // (the digits alone overflow, the sign rescues them).
+                if self.chars[self.pos..].iter().take(19).collect::<String>() == "9223372036854775808"
+                    && !self
+                        .chars
+                        .get(self.pos + 19)
+                        .map(|c| c.is_ascii_digit() || *c == '.')
+                        .unwrap_or(false)
+                {
+                    self.pos += 19;
+                    return Ok(Value::from_int(i64::MIN));
+                }
                 let val = self.parse_unary()?;
                 // Integer operands stay integers (-2 -> -2); float operands
                 // stay floats (-2.0 -> -2.0).
@@ -511,10 +550,12 @@ impl<'a> ExprParser<'a> {
             return self.parse_function_call(&ident);
         }
 
-        // Check for boolean literals
+        // Boolean literals keep their string form (`expr false` renders
+        // "false", expr-21.1); operators coerce via strict_bool.
         match ident.to_ascii_lowercase().as_str() {
-            "true" | "yes" | "on" => return Ok(Value::from_bool(true)),
-            "false" | "no" | "off" => return Ok(Value::from_bool(false)),
+            "true" | "yes" | "on" | "false" | "no" | "off" => {
+                return Ok(Value::from_str(&ident))
+            }
             _ => {}
         }
 
@@ -528,6 +569,11 @@ impl<'a> ExprParser<'a> {
             return Ok(Value::from_int(n));
         }
         if let Ok(n) = ident.parse::<f64>() {
+            if n.is_nan() {
+                // tclsh: a bare `nan` operand is a domain error — NaN is
+                // only reachable via the nan() function.
+                return Err(super::expr_funcs::domain_error());
+            }
             return Ok(Value::from_float(n));
         }
 
@@ -579,14 +625,26 @@ impl<'a> ExprParser<'a> {
             }
         }
         if self.peek() == 'e' || self.peek() == 'E' {
-            s.push(self.advance());
+            // Lookahead: `e` only belongs to the number when digits (or a
+            // sign then digits) follow — `3eq2` must stop at `3`.
+            let save = self.pos;
+            self.advance();
+            let mut exp = String::new();
+            exp.push(self.chars[self.pos - 1]);
             if self.peek() == '+' || self.peek() == '-' {
-                s.push(self.advance());
+                exp.push(self.advance());
             }
-            while self.is_digit() {
-                s.push(self.advance());
+            if self.is_digit() {
+                s.push_str(&exp);
+                while self.is_digit() {
+                    s.push(self.advance());
+                }
+            } else {
+                self.pos = save;
             }
         }
+
+        self.check_number_trail(&s)?;
 
         if s.contains('.') || s.contains('e') || s.contains('E') {
             Ok(super::expr_funcs::float_value(s.parse().unwrap_or(0.0)))
@@ -600,6 +658,43 @@ impl<'a> ExprParser<'a> {
                 )),
             }
         }
+    }
+
+    /// tclsh: letters glued to a number are only legal as the word
+    /// operators `eq`/`ne`/`in` followed by a digit-led operand
+    /// (`3eq2`); any other digit-led alnum run is an invalid bareword
+    /// (`3x2`, `3e`, `5mod3`, `3lt2`).  Rewinds to just after the digits
+    /// so operator matching sees `eq`.
+    fn check_number_trail(&mut self, prefix: &str) -> Result<()> {
+        if !self.peek().is_ascii_alphabetic() {
+            return Ok(());
+        }
+        let run_start = self.pos;
+        while self.peek().is_ascii_alphanumeric() || self.peek() == '_' {
+            self.advance();
+        }
+        let run: String = self.chars[run_start..self.pos].iter().collect();
+        let word_op = run == "eq" || run == "ne" || run == "in";
+        let glued = (run.starts_with("eq") || run.starts_with("ne") || run.starts_with("in"))
+            && run
+                .as_bytes()
+                .get(2)
+                .map(|b| b.is_ascii_digit() || *b == b'.')
+                .unwrap_or(false);
+        if word_op || glued {
+            self.pos = run_start;
+            return Ok(());
+        }
+        let whole: String = self.chars.iter().collect();
+        let bare = format!("{}{}", prefix, run);
+        Err(Error::runtime(
+            format!(
+                "invalid bareword \"{bw}\"\nin expression \"{w}\";\nshould be \"${bw}\" or \"{{{bw}}}\" or \"{bw}(...)\" or ...",
+                bw = bare,
+                w = whole
+            ),
+            crate::error::ErrorCode::Generic,
+        ))
     }
 
     /// Collect the body of a `[...]` command substitution (the leading `[`
@@ -633,6 +728,15 @@ impl<'a> ExprParser<'a> {
         while !self.is_at_end() {
             if quote == '{' {
                 let c = self.peek();
+                if c == '\\' {
+                    // Backslash sequences stay literal inside braces, but an
+                    // escaped brace does not participate in balancing.
+                    s.push(self.advance());
+                    if !self.is_at_end() {
+                        s.push(self.advance());
+                    }
+                    continue;
+                }
                 if c == '{' { depth += 1; }
                 if c == '}' {
                     depth -= 1;
@@ -794,7 +898,10 @@ impl<'a> ExprParser<'a> {
         false
     }
 
-    /// Match a word operator (requires non-alphanumeric boundary after it).
+    /// Match a word operator (requires non-alphanumeric boundary after
+    /// it).  Exception: a number immediately followed by eq/ne/in
+    /// (`3eq2`, validated by `check_number_trail`) still lexes as
+    /// operator + digit-led operand, tclsh-style.
     fn match_word_op(&mut self, op: &str) -> bool {
         self.skip_whitespace();
         let op_chars: Vec<char> = op.chars().collect();
@@ -802,9 +909,15 @@ impl<'a> ExprParser<'a> {
         if end <= self.chars.len() {
             let slice: String = self.chars[self.pos..end].iter().collect();
             if slice == op {
-                // Check boundary: next char must not be alphanumeric or '_'
+                let prev = if self.pos > 0 {
+                    self.chars[self.pos - 1]
+                } else {
+                    '\0'
+                };
+                // Check boundary: next char must not be alphanumeric or '_',
+                // unless we are glued to a preceding digit (`3eq2`).
                 let next = self.chars.get(end).copied().unwrap_or('\0');
-                if !next.is_alphanumeric() && next != '_' {
+                if (!next.is_alphanumeric() && next != '_') || prev.is_ascii_digit() {
                     self.pos = end;
                     return true;
                 }

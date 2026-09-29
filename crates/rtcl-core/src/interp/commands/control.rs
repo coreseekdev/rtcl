@@ -28,7 +28,7 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         )));
     }
 
-    if cond.is_true() {
+    if crate::types::expr_funcs::strict_bool(&cond)? {
         return interp.eval(args[i].as_str());
     }
     i += 1;
@@ -56,7 +56,7 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         args[i - 1].as_str()
                     )));
                 }
-                if cond.is_true() {
+                if crate::types::expr_funcs::strict_bool(&cond)? {
                     return interp.eval(args[i].as_str());
                 }
                 i += 1;
@@ -96,12 +96,14 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     #[derive(PartialEq)]
     enum MatchMode { Exact, Glob, Regexp }
     let mut mode = MatchMode::Glob;
+    let mut nocase = false;
 
     while i < args.len() && args[i].as_str().starts_with('-') {
         match args[i].as_str() {
             "-exact" => { mode = MatchMode::Exact; i += 1; }
             "-glob" => { mode = MatchMode::Glob; i += 1; }
             "-regexp" => { mode = MatchMode::Regexp; i += 1; }
+            "-nocase" => { nocase = true; i += 1; }
             "--" => { i += 1; break; }
             opt => {
                 return Err(Error::runtime(
@@ -161,40 +163,56 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             .collect()
     };
 
-    let mut matched = false;
+    // tclsh: `default` bodies never shadow earlier patterns — they are
+    // remembered (the LAST one wins) and run only if every pattern fails.
+    let mut default_body: Option<String> = None;
+    let haystack = if nocase {
+        string.to_ascii_lowercase()
+    } else {
+        string.to_string()
+    };
     for (pattern, body) in &patterns {
-        if !matched {
-            let matches = if pattern == "default" {
-                true
-            } else {
-                match mode {
-                    MatchMode::Exact => string == pattern,
-                    MatchMode::Glob => super::super::glob_match(pattern, string),
-                    MatchMode::Regexp => {
-                        #[cfg(feature = "regexp")]
-                        {
-                            regex::Regex::new(pattern)
-                                .map(|re| re.is_match(string))
-                                .unwrap_or(false)
-                        }
-                        #[cfg(not(feature = "regexp"))]
-                        {
-                            return Err(Error::runtime(
-                                "switch -regexp requires 'regexp' feature",
-                                crate::error::ErrorCode::InvalidOp,
-                            ));
-                        }
-                    }
-                }
-            };
-            if matches {
-                matched = true;
-            }
+        if pattern == "default" {
+            default_body = Some(body.clone());
+            continue;
         }
-        if matched {
+        let pattern = if nocase {
+            pattern.to_ascii_lowercase()
+        } else {
+            pattern.clone()
+        };
+        let matches = match mode {
+            MatchMode::Exact => haystack == pattern,
+            MatchMode::Glob => super::super::glob_match(&pattern, &haystack),
+            MatchMode::Regexp => {
+                #[cfg(feature = "regexp")]
+                {
+                    let pat = if nocase {
+                        format!("(?i){}", pattern)
+                    } else {
+                        pattern
+                    };
+                    regex::Regex::new(&pat)
+                        .map(|re| re.is_match(&haystack))
+                        .unwrap_or(false)
+                }
+                #[cfg(not(feature = "regexp"))]
+                {
+                    let _ = nocase;
+                    return Err(Error::runtime(
+                        "switch -regexp requires 'regexp' feature",
+                        crate::error::ErrorCode::InvalidOp,
+                    ));
+                }
+            }
+        };
+        if matches {
             if body == "-" { continue; }
             return interp.eval(body);
         }
+    }
+    if let Some(body) = default_body {
+        return interp.eval(&body);
     }
 
     Ok(Value::empty())
@@ -372,7 +390,7 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.set_var(var, v)?;
             }
             if let Some(ov) = opts_var {
-                interp.set_var(ov, return_options_dict(0, 1))?;
+                interp.set_var(ov, return_options_dict(0, 0))?;
             }
             Ok(Value::from_int(0))
         }
@@ -387,6 +405,15 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             else if e.is_break() { 3 }
             else if e.is_continue() { 4 }
             else { 1 };
+            // Tcl writes ::errorCode at raise time for arithmetic errors
+            // (ARITH DIVZERO / ARITH DOMAIN); other codes come from their
+            // own raise sites and must not be clobbered here.
+            if code == 1 {
+                let tec = e.tcl_error_code();
+                if tec.starts_with("ARITH ") {
+                    let _ = interp.set_var("::errorCode", Value::from_str(&tec));
+                }
+            }
             if let Some(ov) = opts_var {
                 let level = if e.is_return() { 0 } else { 1 };
                 let opts = if code == 1 {
@@ -440,7 +467,7 @@ fn error_info_for(err: &Error, script: &str) -> String {
     format!("{}\n    {}\n\"{}\"", err.message_text(), how, script)
 }
 
-pub fn cmd_error(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 4 {
         return Err(Error::wrong_args_with_usage(
             "error",
@@ -452,6 +479,13 @@ pub fn cmd_error(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let msg = args[1].as_str().to_string();
     let error_info = args.get(2).map(|v| v.as_str().to_string());
     let error_code = args.get(3).map(|v| v.as_str().to_string());
+    // Tcl writes the globals at raise time: errorCode is NONE unless the
+    // caller supplies one, errorInfo only when supplied.
+    let code = error_code.clone().unwrap_or_else(|| "NONE".to_string());
+    let _ = interp.set_var("::errorCode", Value::from_str(&code));
+    if let Some(info) = &error_info {
+        let _ = interp.set_var("::errorInfo", Value::from_str(info));
+    }
     if error_info.is_none() && error_code.is_none() {
         return Err(Error::Msg(msg));
     }
@@ -591,4 +625,54 @@ pub fn cmd_tailcall(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         .map(|a| a.as_str().to_string())
         .collect();
     Err(Error::tail_call(tc_args))
+}
+
+#[cfg(test)]
+mod switch_tests {
+    use crate::interp::Interp;
+
+    fn ev(script: &str) -> String {
+        let mut interp = Interp::new();
+        interp.eval(script).unwrap().as_str().to_string()
+    }
+
+    #[test]
+    fn test_switch_nocase() {
+        // tclsh: -nocase folds pattern and string (switch-1.8..1.10).
+        assert_eq!(
+            ev("switch -nocase b a {subst 1} b {subst 2} c {subst 3} default {subst 4}"),
+            "2"
+        );
+        assert_eq!(
+            ev("switch -nocase B a {subst 1} b {subst 2} c {subst 3} default {subst 4}"),
+            "2"
+        );
+        assert_eq!(
+            ev("switch -nocase b a {subst 1} B {subst 2} c {subst 3} default {subst 4}"),
+            "2"
+        );
+    }
+
+    #[test]
+    fn test_switch_default_last_wins_after_all_patterns() {
+        // tclsh (switch-1.7): default bodies never shadow earlier patterns;
+        // with several defaults the LAST one fires only after all fail.
+        assert_eq!(
+            ev("switch x a {subst 1} default {subst 2} c {subst 3} default {subst 4}"),
+            "4"
+        );
+        assert_eq!(
+            ev("switch c a {subst 1} default {subst 2} c {subst 3} default {subst 4}"),
+            "3"
+        );
+        assert_eq!(ev("switch z a {subst 1} default {subst 2}"), "2");
+    }
+
+    #[test]
+    fn test_switch_nocase_glob() {
+        assert_eq!(
+            ev("switch -nocase -glob hello HE* {set r one} Hell* {set r two} default {set r three}"),
+            "one"
+        );
+    }
 }

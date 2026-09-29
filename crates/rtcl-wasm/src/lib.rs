@@ -49,3 +49,47 @@ impl RtclHandle {
         Ok(())
     }
 }
+
+/// Native-side API (not exported to JS — this impl block deliberately carries
+/// no `#[wasm_bindgen]`). Gives Rust hosts the same power the crate uses
+/// internally in `RtclHandle::new()` — registering native `CommandFunc`s —
+/// plus full interpreter configuration, so a host embedding rtcl does not
+/// need to maintain a parallel binding stack.
+impl RtclHandle {
+    /// Direct access to the underlying interpreter, e.g.
+    /// `handle.interp().register_command("my.cmd", my_cmd_func)`.
+    pub fn interp(&mut self) -> &mut Interp {
+        &mut self.interp
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use rtcl_core::Value;
+
+    #[test]
+    fn native_host_can_register_rust_commands() {
+        let mut handle = RtclHandle::new().expect("handle");
+        handle
+            .interp()
+            .register_command("hj_double", |_interp, args| {
+                let n = args[1].as_int().unwrap_or(0);
+                Ok(Value::from_int(n * 2))
+            });
+        assert_eq!(handle.exec("hj_double 21").expect("exec"), "42");
+    }
+
+    #[test]
+    fn native_registration_is_isolated_from_js_bridge() {
+        let mut handle = RtclHandle::new().expect("handle");
+        handle
+            .interp()
+            .register_command("mk", |_interp, args| {
+                Ok(Value::from_str(&format!("native<{}>", args[1].as_str())))
+            });
+        assert_eq!(handle.exec("mk x").expect("exec"), "native<x>");
+        // _js_dispatch (registered internally) still present.
+        assert!(handle.exec("info commands _js_dispatch").expect("exec").contains("_js_dispatch"));
+    }
+}

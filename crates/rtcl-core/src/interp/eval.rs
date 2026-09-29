@@ -81,9 +81,18 @@ impl Interp {
                 } else {
                     None
                 }
+            })
+            .or_else(|| {
+                // `foo::p` at global scope is the fully-qualified `::foo::p`
+                if !cmd_name.starts_with("::") && cmd_name.contains("::") {
+                    let qualified = format!("::{}", cmd_name);
+                    self.procs.get(&qualified).cloned().map(|p| (p, qualified))
+                } else {
+                    None
+                }
             });
         if let Some((proc_def, resolved_name)) = proc_lookup {
-            return self.call_proc(&proc_def, &args, &resolved_name);
+            return self.call_proc(&proc_def, &args, &resolved_name, None);
         }
 
         // Built-in commands
@@ -96,15 +105,34 @@ impl Interp {
             } else {
                 None
             }
+        }).or_else(|| {
+            if !cmd_name.starts_with("::") && cmd_name.contains("::") {
+                self.commands.get(&format!("::{}", cmd_name)).cloned()
+            } else {
+                None
+            }
         });
         match func {
             Some(f) => {
                 self.call_depth += 1;
                 let result = f(self, &args);
                 self.call_depth -= 1;
-                result
+                self.fill_wrong_args(cmd_name, result)
             }
             None => {
+                // Expr functions double as commands: `::tcl::mathfunc::abs -0`
+                // (expr-38.5). The tail after tcl::mathfunc:: is the function.
+                let mf = cmd_name
+                    .strip_prefix("::tcl::mathfunc::")
+                    .or_else(|| cmd_name.strip_prefix("tcl::mathfunc::"));
+                if let Some(fname) = mf {
+                    let seed = self.call_depth;
+                    return crate::types::expr_funcs::call_math_func(
+                        fname,
+                        args[1..].to_vec(),
+                        seed,
+                    );
+                }
                 // Try "unknown" handler (if defined as a proc or command)
                 if cmd_name != "unknown" {
                     let has_unknown = self.procs.contains_key("unknown")
@@ -131,7 +159,7 @@ impl Interp {
     pub(crate) fn eval_word(&mut self, word: &Word) -> Result<Value> {
         match word {
             Word::Literal(s) => Ok(Value::from_str(s)),
-            Word::VarRef(name) => self.get_var(name).cloned(),
+            Word::VarRef(name) => self.read_var(name),
             Word::CommandSub(cmd) => self.eval(cmd),
             Word::Concat(parts) => {
                 let mut result = String::new();

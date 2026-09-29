@@ -690,7 +690,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if let Some(proc_def) = interp.procs.get(&multi_name).cloned() {
                 let mut new_args = vec![Value::from_str(&multi_name)];
                 new_args.extend_from_slice(&args[2..]);
-                return interp.call_proc(&proc_def, &new_args, &multi_name);
+                return interp.call_proc(&proc_def, &new_args, &multi_name, None);
             }
             Err(Error::runtime(
                 format!("unknown dict subcommand: {}", subcmd),

@@ -6,7 +6,7 @@ use crate::value::Value;
 
 pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
-        return Err(Error::wrong_args_with_usage("while", 3, args.len(), "test body"));
+        return Err(Error::wrong_args_with_usage("while", 3, args.len(), "test command"));
     }
 
     let test = args[1].as_str();
@@ -14,7 +14,7 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     loop {
         let cond = interp.eval_expr(test)?;
-        if !cond.is_true() {
+        if !crate::types::expr_funcs::strict_bool(&cond)? {
             break;
         }
         match interp.eval(body) {
@@ -39,7 +39,7 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 5 {
-        return Err(Error::wrong_args_with_usage("for", 5, args.len(), "start test next body"));
+        return Err(Error::wrong_args_with_usage("for", 5, args.len(), "start test next command"));
     }
 
     let start = args[1].as_str();
@@ -51,7 +51,7 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     loop {
         let cond = interp.eval_expr(test)?;
-        if !cond.is_true() { break; }
+        if !crate::types::expr_funcs::strict_bool(&cond)? { break; }
 
         match interp.eval(body) {
             Ok(_) => {}
@@ -91,7 +91,7 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 4 || !args.len().is_multiple_of(2) {
         return Err(Error::wrong_args_with_usage(
             "foreach", 4, args.len(),
-            "varList list ?varList list ...? body",
+            "varList list ?varList list ...? command",
         ));
     }
 
@@ -108,6 +108,13 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     while i < args.len() - 1 {
         let var_list = args[i].as_list().unwrap_or_else(|| vec![args[i].clone()]);
         let vars: Vec<String> = var_list.iter().map(|v| v.as_str().to_string()).collect();
+        // tclsh: an empty varlist is an error, not zero iterations.
+        if vars.is_empty() {
+            return Err(Error::runtime(
+                "foreach varlist is empty",
+                crate::error::ErrorCode::Generic,
+            ));
+        }
         let data = args[i + 1].as_list().unwrap_or_default();
         groups.push(VarGroup { vars, data });
         i += 2;
@@ -160,7 +167,7 @@ pub fn cmd_time(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "time",
             2,
             args.len(),
-            "script ?count?",
+            "command ?count?",
         ));
     }
 

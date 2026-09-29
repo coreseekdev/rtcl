@@ -389,6 +389,9 @@ impl Error {
         match self {
             Error::ControlFlow { error_code: Some(c), .. } => c.clone(),
             Error::DivisionByZero => "ARITH DIVZERO {divide by zero}".to_string(),
+            Error::Runtime { message, .. } if message.starts_with("domain error") => {
+                "ARITH DOMAIN {domain error: argument not in valid range}".to_string()
+            }
             Error::InvalidCommand { name } => {
                 format!("TCL LOOKUP COMMAND {}", crate::value::tcl_quote(name))
             }
@@ -406,8 +409,9 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Syntax { message, line, column } => {
-                write!(f, "syntax error at {}:{}: {}", line, column, message)
+            Error::Syntax { message, .. } => {
+                // tclsh renders parser errors bare ("missing close-bracket").
+                write!(f, "{}", message)
             }
             Error::Runtime { message, .. } => {
                 write!(f, "{}", message)

@@ -36,7 +36,7 @@ fn borrow_dict(val: &Value) -> Result<Cow<'_, DictMap>> {
 
 pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(Error::wrong_args("dict", 2, args.len()));
+        return Err(Error::wrong_args_with_usage("dict", 2, args.len(), "subcommand ?arg ...?"));
     }
 
     let subcmd = args[1].as_str();
@@ -58,9 +58,11 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
             }
             if (args.len() - start) % 2 != 0 {
-                return Err(Error::runtime(
-                    "wrong # args: dict create requires key value pairs",
-                    crate::error::ErrorCode::InvalidOp,
+                return Err(Error::wrong_args_with_usage(
+                    "dict create",
+                    2,
+                    args.len(),
+                    "?key value ...?",
                 ));
             }
             let mut entries = if ordered {
@@ -77,7 +79,9 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // ── dict get dictionary ?key ...? ──────────────────────
         "get" => {
             if args.len() < 3 {
-                return Err(Error::wrong_args("dict get", 3, args.len()));
+                return Err(Error::wrong_args_with_usage(
+                    "dict get", 3, args.len(), "dictionary ?key ...?",
+                ));
             }
             if args.len() == 3 {
                 return Ok(args[2].clone());
@@ -119,7 +123,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dict set",
                     5,
                     args.len(),
-                    "dictVariable key ?key ...? value",
+                    "dictVarName key ?key ...? value",
                 ));
             }
             let var_name = args[2].as_str();
@@ -142,7 +146,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dict unset",
                     4,
                     args.len(),
-                    "dictVariable key ?key ...?",
+                    "dictVarName key ?key ...?",
                 ));
             }
             let var_name = args[2].as_str();
@@ -161,7 +165,9 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // ── dict exists dictionary key ?key ...? ───────────────
         "exists" => {
             if args.len() < 4 {
-                return Err(Error::wrong_args("dict exists", 4, args.len()));
+                return Err(Error::wrong_args_with_usage(
+                    "dict exists", 4, args.len(), "dictionary key ?key ...?",
+                ));
             }
             // Single-key fast path: zero-copy
             if args.len() == 4 {
@@ -189,7 +195,9 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // ── dict keys dictionary ?pattern? ─────────────────────
         "keys" => {
             if args.len() < 3 || args.len() > 4 {
-                return Err(Error::wrong_args("dict keys", 3, args.len()));
+                return Err(Error::wrong_args_with_usage(
+                    "dict keys", 3, args.len(), "dictionary ?pattern?",
+                ));
             }
             let entries = borrow_dict(&args[2])?;
             let pattern = if args.len() == 4 {
@@ -208,7 +216,9 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // ── dict values dictionary ?pattern? ───────────────────
         "values" => {
             if args.len() < 3 || args.len() > 4 {
-                return Err(Error::wrong_args("dict values", 3, args.len()));
+                return Err(Error::wrong_args_with_usage(
+                    "dict values", 3, args.len(), "dictionary ?pattern?",
+                ));
             }
             let entries = borrow_dict(&args[2])?;
             let pattern = if args.len() == 4 {
@@ -227,7 +237,9 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // ── dict size dictionary ───────────────────────────────
         "size" => {
             if args.len() != 3 {
-                return Err(Error::wrong_args("dict size", 3, args.len()));
+                return Err(Error::wrong_args_with_usage(
+                    "dict size", 3, args.len(), "dictionary",
+                ));
             }
             let entries = borrow_dict(&args[2])?;
             Ok(Value::from_int(entries.len() as i64))
@@ -240,7 +252,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dict for",
                     5,
                     args.len(),
-                    "{keyVar valueVar} dictionary body",
+                    "{keyVarName valueVarName} dictionary script",
                 ));
             }
             let var_list = args[2].as_list().unwrap_or_default();
@@ -293,12 +305,16 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // ── dict replace dictionary ?key value ...? ────────────
         "replace" => {
             if args.len() < 3 {
-                return Err(Error::wrong_args("dict replace", 3, args.len()));
+                return Err(Error::wrong_args_with_usage(
+                    "dict replace", 3, args.len(), "dictionary ?key value ...?",
+                ));
             }
             if (args.len() - 3) % 2 != 0 {
-                return Err(Error::runtime(
-                    "wrong # args: must be key value pairs",
-                    crate::error::ErrorCode::InvalidOp,
+                return Err(Error::wrong_args_with_usage(
+                    "dict replace",
+                    3,
+                    args.len(),
+                    "dictionary ?key value ...?",
                 ));
             }
             let mut entries = parse_dict(&args[2])?;
@@ -315,7 +331,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dict append",
                     4,
                     args.len(),
-                    "dictVariable key ?string ...?",
+                    "dictVarName key ?value ...?",
                 ));
             }
             let var_name = args[2].as_str();
@@ -369,7 +385,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dict lappend",
                     4,
                     args.len(),
-                    "dictVariable key ?value ...?",
+                    "dictVarName key ?value ...?",
                 ));
             }
             let var_name = args[2].as_str();
@@ -477,7 +493,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dict filter",
                     5,
                     args.len(),
-                    "dictionary filterType ...",
+                    "dictionary filterType ?arg ...?",
                 ));
             }
             let filter_type = args[3].as_str();
@@ -509,7 +525,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                             "dict filter",
                             6,
                             args.len(),
-                            "dictionary script {keyVar valueVar} script",
+                            "dictionary script {keyVarName valueVarName} filterScript",
                         ));
                     }
                     let var_list = args[4].as_list().unwrap_or_default();
@@ -562,7 +578,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dict map",
                     5,
                     args.len(),
-                    "{keyVar valueVar} dictionary body",
+                    "{keyVarName valueVarName} dictionary script",
                 ));
             }
             let var_list = args[2].as_list().unwrap_or_default();

@@ -519,34 +519,42 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
         // ── dict filter dictionary filterType ... ──────────────
         "filter" => {
-            if args.len() < 5 {
+            if args.len() < 4 {
                 return Err(Error::wrong_args_with_usage(
                     "dict filter",
-                    5,
+                    4,
                     args.len(),
                     "dictionary filterType ?arg ...?",
                 ));
             }
-            let filter_type = args[3].as_str();
+            // The dictionary string is parsed before the filter type is
+            // examined (dict-17.5: odd list beats everything else).
             let entries = parse_dict(&args[2])?;
             let ordered = entries.is_ordered();
+            let filter_type = args[3].as_str();
 
             match filter_type {
                 "key" => {
-                    let pattern = args[4].as_str();
-                    let filtered = DictMap::from_iter_with_order(
-                        ordered,
-                        entries.into_iter().filter(|(k, _)| glob_match(pattern, k)),
-                    );
-                    Ok(Value::from_dict_cached(filtered))
-                }
-                "value" => {
-                    let pattern = args[4].as_str();
+                    // Zero or more patterns; a key matching ANY is kept
+                    // (dict-17.4: no patterns -> empty result).
+                    let patterns: Vec<String> =
+                        args[4..].iter().map(|a| a.as_str().to_string()).collect();
                     let filtered = DictMap::from_iter_with_order(
                         ordered,
                         entries
                             .into_iter()
-                            .filter(|(_, v)| glob_match(pattern, v.as_str())),
+                            .filter(|(k, _)| patterns.iter().any(|p| glob_match(p, k))),
+                    );
+                    Ok(Value::from_dict_cached(filtered))
+                }
+                "value" => {
+                    let patterns: Vec<String> =
+                        args[4..].iter().map(|a| a.as_str().to_string()).collect();
+                    let filtered = DictMap::from_iter_with_order(
+                        ordered,
+                        entries.into_iter().filter(|(_, v)| {
+                            patterns.iter().any(|p| glob_match(p, v.as_str()))
+                        }),
                     );
                     Ok(Value::from_dict_cached(filtered))
                 }
@@ -559,7 +567,8 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                             "dictionary script {keyVarName valueVarName} filterScript",
                         ));
                     }
-                    let var_list = args[4].as_list().unwrap_or_default();
+                    let var_list =
+                        super::list::strict_list(interp, &args[4])?;
                     if var_list.len() != 2 {
                         return Err(Error::runtime(
                             "must have exactly two variable names",
@@ -575,7 +584,9 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         interp.set_var(&val_var, v.clone())?;
                         match interp.eval(script) {
                             Ok(r) => {
-                                if r.is_true() {
+                                // tclsh requires a boolean body result
+                                // ("expected boolean value but got ...").
+                                if crate::types::expr_funcs::strict_bool(&r)? {
                                     filtered.insert(k.clone(), v.clone());
                                 }
                             }
@@ -594,7 +605,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 _ => Err(Error::runtime(
                     format!(
-                        "bad filterType \"{}\": must be key, value, or script",
+                        "bad filterType \"{}\": must be key, script, or value",
                         filter_type
                     ),
                     crate::error::ErrorCode::InvalidOp,
@@ -612,7 +623,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "{keyVarName valueVarName} dictionary script",
                 ));
             }
-            let var_list = args[2].as_list().unwrap_or_default();
+            let var_list = super::list::strict_list(interp, &args[2])?;
             if var_list.len() != 2 {
                 return Err(Error::runtime(
                     "must have exactly two variable names",
@@ -1022,6 +1033,70 @@ mod tests {
         assert_eq!(
             interp.eval("dict keys [dict filter {abc 1 abd 2 xyz 3} key ab*]").unwrap().as_str(),
             "abc abd"
+        );
+    }
+
+    #[test]
+    fn test_dict_filter_zero_patterns_empty() {
+        // dict-17.4: key/value with no patterns yields nothing (no usage error).
+        let mut interp = Interp::new();
+        assert_eq!(
+            interp.eval("dict filter {a b c d} key").unwrap().as_str(),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_dict_filter_parses_dict_before_type() {
+        // dict-17.5: an odd dictionary beats every other error, even a bad type.
+        let mut interp = Interp::new();
+        let e = interp.eval("dict filter {a b c} key").unwrap_err();
+        assert!(e.to_string().contains("missing value to go with key"));
+        let e = interp.eval("dict filter {a b c} JUNK").unwrap_err();
+        assert!(e.to_string().contains("missing value to go with key"));
+        let e = interp.eval("dict filter {a b} JUNK").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "bad filterType \"JUNK\": must be key, script, or value"
+        );
+    }
+
+    #[test]
+    fn test_dict_filter_multi_pattern_or() {
+        let mut interp = Interp::new();
+        assert_eq!(
+            interp
+                .eval("dict keys [dict filter {abc 1 abd 2 xyz 3} key xy* ab*]")
+                .unwrap()
+                .as_str(),
+            "abc abd xyz"
+        );
+    }
+
+    #[test]
+    fn test_dict_filter_script_varlist_strict() {
+        // dict-17.20: a malformed varlist is a strict list parse error.
+        let mut interp = Interp::new();
+        let e = interp
+            .eval("dict filter {a b} script \\{k v {expr 1}")
+            .unwrap_err();
+        assert!(e.to_string().contains("unmatched open brace in list"));
+        let e = interp
+            .eval("dict map \\{k {a 1} {set x 1}")
+            .unwrap_err();
+        assert!(e.to_string().contains("unmatched open brace in list"));
+    }
+
+    #[test]
+    fn test_dict_filter_script_requires_boolean() {
+        // dict-17.29: a non-boolean body result is an error, not a keep.
+        let mut interp = Interp::new();
+        let e = interp
+            .eval("dict filter {a 1 b 2} script {k v} {list $k $v}")
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "expected boolean value but got \"a 1\""
         );
     }
 

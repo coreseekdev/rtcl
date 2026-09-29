@@ -1,0 +1,124 @@
+-- allium: 3
+-- control-flow.allium
+-- Behaviour spec: Tcl completion codes and their propagation —
+-- return / break / continue / catch / error / try, and loop results.
+-- Oracle: tclsh 8.6.17.
+--
+-- Numeric codes: ok=0, error=1, return=2, break=3, continue=4.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── loop results ──────────────────────────────────────────────────
+
+rule LoopsReturnEmptyString {
+    -- while, for and foreach always produce the empty string as their
+    -- result, regardless of the last body evaluation.
+    when: Evaluates("while {$i < 2} {incr i}    -- with i = 0")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- same for: for {set i 0} {$i < 2} {incr i} {set i}
+    -- same for: foreach x {a b} {set x}
+}
+
+rule BreakExitsInnermostLoop {
+    -- break terminates the innermost enclosing loop; the loop then
+    -- completes ok with the empty string.
+    when: Evaluates("catch break")
+    ensures: completion.code = ok
+    ensures: completion.value = "3"
+}
+
+rule BreakOutsideLoopIsError {
+    when: Evaluates("break    -- at top level")
+    ensures: completion.code = error
+    -- oracle message: invoked "break" outside of a loop
+}
+
+rule ContinueSkipsToNextIteration {
+    when: Evaluates("catch continue")
+    ensures: completion.code = ok
+    ensures: completion.value = "4"
+    -- break/continue carry an empty result value
+    -- probe: catch {break} msg; set msg  =>  ""
+}
+
+-- ── return ────────────────────────────────────────────────────────
+
+rule ReturnInProcBecomesOkAtBoundary {
+    -- A plain `return v` inside a proc completes the proc call with
+    -- code ok and value v.
+    when: Evaluates("f    -- with proc f {} {return hi}")
+    ensures: completion.code = ok
+    ensures: completion.value = "hi"
+}
+
+rule ReturnCodeErrorPropagatesAsError {
+    -- return -code error v makes the proc call fail with message v.
+    when: Evaluates("catch {f} msg; set msg    -- with proc f {} {return -code error oops}")
+    ensures: completion.code = ok
+    ensures: completion.value = "oops"
+}
+
+rule ReturnCodeOptionIsHonoured {
+    -- return -code break / -code continue behave as break/continue at
+    -- the enclosing loop; return -code return propagates a return
+    -- completion to the caller (level counting applies).
+    when: Evaluates("f    -- with proc f {} {return -code return inner}")
+    ensures: completion.code = return
+    -- probe: proc f {} {return -code return inner}; puts [f] => "" (at top level)
+}
+
+rule ReturnLevelOptionIsHonoured {
+    -- -level N shifts the completion up N extra levels; it must not be
+    -- silently ignored.
+    when: Evaluates("return -level 0 -code ok v    -- inside a proc")
+    ensures: completion.code = ok
+    ensures: completion.value = "v"
+}
+
+-- ── catch ─────────────────────────────────────────────────────────
+
+rule CatchReturnsNumericCode {
+    when: Evaluates("catch {error boom}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- ok script => 0, return => 2, break => 3, continue => 4
+}
+
+rule CatchResultVarGetsPayload {
+    -- The result variable receives the completion's payload: the result
+    -- value on ok, the message on error, the return value on return,
+    -- and the empty string on break/continue.
+    when: Evaluates("catch {return hi} msg; set msg")
+    ensures: completion.code = ok
+    ensures: completion.value = "hi"
+    -- probe: catch {error boom} msg; set msg => boom
+    -- probe: catch {break} msg; set msg => ""
+}
+
+rule CatchOptionsDict {
+    -- The options variable receives a dict with at least
+    -- -code (numeric completion code), -level (0 for ok/return,
+    -- 1 for error), and for errors -errorinfo and -errorcode.
+    when: Evaluates("catch {list a} res opts; set opts")
+    ensures: completion.code = ok
+    ensures: completion.value = "-code 0 -level 0"
+    -- probe: catch {error x} res opts; dict get $opts -errorinfo => x\n while executing...
+}
+
+rule ErrorCommandProducesErrorCompletion {
+    when: Evaluates("error boom")
+    ensures: completion.code = error
+    ensures: completion.value = "boom"
+}
+
+rule TryHandlersMatchOnCompletionCode {
+    when: Evaluates("try {error boom} on error msg {set msg}")
+    ensures: completion.code = ok
+    ensures: completion.value = "boom"
+    -- finally scripts always run; an unmatched completion re-propagates
+}

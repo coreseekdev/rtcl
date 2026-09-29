@@ -25,18 +25,17 @@ if [ ! -x "$RTCL" ]; then
 fi
 
 pass=0; fail=0; skip=0; failed=()
-for f in judge/corpus/${1:+${1}.tcl}; do :; done 2>/dev/null
-files=$(ls judge/corpus/${1:-*}.tcl 2>/dev/null || true)
+files=$(find judge/corpus -name "$(basename "${1:-*}").tcl" | sort)
 [ -z "$files" ] && { echo "judge: no corpus files matched" >&2; exit 2; }
 
 for f in $files; do
-    name=$(basename "$f" .tcl)
+    name=${f#judge/corpus/}; name=${name%.tcl}
     # Skip marker: a first-line comment `# judge: skip` for known-divergent cases
     if head -1 "$f" | grep -q '^# judge: skip'; then
         skip=$((skip+1)); continue
     fi
-    o_out=$("$ORACLE" "$f" 2>&1); o_code=$?
-    r_out=$("$RTCL" -f "$f" 2>&1); r_code=$?
+    o_out=$(timeout 15 "$ORACLE" "$f" 2>&1); o_code=$?
+    r_out=$(timeout 15 "$RTCL" -f "$f" 2>&1); r_code=$?
     if [ "$o_out" = "$r_out" ] && [ "$o_code" = "$r_code" ]; then
         pass=$((pass+1))
     else

@@ -1,0 +1,104 @@
+-- allium: 3
+-- variables.allium
+-- Behaviour spec: variable scoping in Tcl — proc frames, global, upvar,
+-- namespaces, arrays. Oracle: tclsh 8.6.17.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── proc argument binding ─────────────────────────────────────────
+
+rule ProcMissingArgumentErrors {
+    -- Calling a proc with fewer arguments than required (non-defaulted)
+    -- parameters is a wrong-#-args error; the parameter is never
+    -- silently bound to the empty string.
+    when: Evaluates("f 1    -- with proc f {a b} {...}")
+    ensures: completion.code = error
+    -- oracle message: wrong # args: should be "f a b"
+    -- probe: proc f {a b} {return $b}; f 1
+}
+
+rule ProcExtraArgumentErrors {
+    -- Calling a proc with more arguments than parameters (and no args
+    -- varargs parameter) is a wrong-#-args error.
+    when: Evaluates("f 1 2    -- with proc f {a} {...}")
+    ensures: completion.code = error
+    -- oracle message: wrong # args: should be "f a"
+}
+
+rule ProcDefaultParameterFillsMissing {
+    when: Evaluates("f 1    -- with proc f {a {b 9}} {return $b}")
+    ensures: completion.code = ok
+    ensures: completion.value = "9"
+}
+
+rule ProcArgsCollectsRemainderAsList {
+    -- A trailing parameter named `args` collects all remaining actual
+    -- arguments as a proper list (round-trippable via llength/lindex).
+    when: Evaluates("f \"a b\" c    -- with proc f args {return [llength $args]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+    -- probe: proc f args {return $args}; puts [f "a}b" c] => a\}b c
+}
+
+-- ── scoping ───────────────────────────────────────────────────────
+
+rule ProcVariablesAreLocal {
+    -- set inside a proc creates a local; it is invisible outside.
+    when: Evaluates("info exists x    -- after: proc f {} {set x 5}; f")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+}
+
+rule GlobalLinksLocalToGlobal {
+    when: Evaluates("set x    -- after: set x 1; proc f {} {global x; set x 2}; f")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+}
+
+rule UpvarLinksToCallerFrame {
+    -- upvar 1 links a local name to a variable in the caller's frame.
+    when: Evaluates("set g    -- after: proc f {} {upvar 1 g l; set l 42}; set g 0; f")
+    ensures: completion.code = ok
+    ensures: completion.value = "42"
+}
+
+rule UplevelBeyondStackIsError {
+    -- uplevel with a level above the current call stack is an error,
+    -- never a silent evaluation in the current scope.
+    when: Evaluates("uplevel 1 {set q 9}    -- at top level")
+    ensures: completion.code = error
+    -- oracle message: bad level "1"
+}
+
+rule ArrayElementsAreVariables {
+    when: Evaluates("set a(1)    -- after: set a(1) x")
+    ensures: completion.code = ok
+    ensures: completion.value = "x"
+}
+
+-- ── namespaces ────────────────────────────────────────────────────
+
+rule NamespaceEvalQualifiesVariables {
+    -- set inside `namespace eval foo` writes ::foo::x, not ::x.
+    when: Evaluates("set ::foo::x    -- after: namespace eval foo {set x 1}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule ProcExecutesInDefinitionNamespace {
+    -- A proc defined inside `namespace eval foo` observes
+    -- [namespace current] = ::foo when called, regardless of caller.
+    when: Evaluates("foo::p    -- after: namespace eval foo {proc p {} {namespace current}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "::foo"
+}
+
+rule NamespaceVariableCommandLinksNamespaceVar {
+    when: Evaluates("set ::foo::v    -- after: namespace eval foo {variable v 7}")
+    ensures: completion.code = ok
+    ensures: completion.value = "7"
+}

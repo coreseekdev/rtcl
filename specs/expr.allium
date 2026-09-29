@@ -1,0 +1,165 @@
+-- allium: 3
+-- expr.allium
+-- Behaviour spec: Tcl expression evaluation (`expr`, and the expression
+-- arguments of if/while/for). Oracle: tclsh 8.6.17.
+--
+-- Scope: numeric type rules, operator semantics, substitutions, errors.
+-- Each rule states one observable claim; comments carry the exact probe
+-- scripts used for weed checks (see DIVERGENCES.md).
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── Numeric typing ────────────────────────────────────────────────
+
+rule ExprIntArithmeticStaysInteger {
+    -- + - * on two integer operands produce an integer result.
+    when: Evaluates("expr {7 / 2}")
+    ensures: completion.code = ok
+    ensures: completion.value = "3"
+    -- probe: puts [expr {7 / 2}]
+}
+
+rule ExprIntDivisionFloors {
+    -- Integer division rounds toward negative infinity, not toward zero.
+    when: Evaluates("expr {-7 / 2}")
+    ensures: completion.code = ok
+    ensures: completion.value = "-4"
+    -- probe: puts [expr {-7 / 2}]
+}
+
+rule ExprIntModuloTakesDivisorSign {
+    -- a % b has the sign of b; consistent with floor division.
+    when: Evaluates("expr {-7 % 3}")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+    -- also: expr {7 % -3} => -2
+}
+
+rule ExprMixedFloatResultStaysFloat {
+    -- If any operand is a double, arithmetic produces a double, and a
+    -- double result stringifies with a decimal point even when integral.
+    when: Evaluates("expr {10.0 / 5}")
+    ensures: completion.code = ok
+    ensures: completion.value = "2.0"
+    -- also: expr {2.0 ** 3} => 8.0 ; expr {min(2.0, 3)} => 2.0
+}
+
+rule ExprDivisionByZeroErrors {
+    when: Evaluates("expr {1 / 0}")
+    ensures: completion.code = error
+    ensures: completion.value = "divide by zero"
+    -- float divide by zero errors too: expr {1.0 / 0.0}
+}
+
+rule ExprIntegersAreArbitraryPrecision {
+    -- Tcl integers are bignums: 64-bit overflow must not wrap.
+    when: Evaluates("expr {9223372036854775807 + 1}")
+    ensures: completion.code = ok
+    ensures: completion.value = "9223372036854775808"
+}
+
+rule ExprLegacyOctalLiteral {
+    -- A leading 0 (followed by digits) denotes octal, like 0o.
+    when: Evaluates("expr {010}")
+    ensures: completion.code = ok
+    ensures: completion.value = "8"
+    -- 0x / 0o / 0b prefixes are also supported.
+}
+
+-- ── Comparisons ───────────────────────────────────────────────────
+
+rule ExprNumericEqualityIsExact {
+    -- == on two numeric operands compares exact numeric values;
+    -- there is no epsilon tolerance.
+    when: Evaluates("expr {0.1 + 0.2 == 0.3}")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+}
+
+rule ExprEqualityNoFloatPrecisionLoss {
+    -- Integers beyond 2^53 compare exactly; conversion through double
+    -- must not make distinct integers equal.
+    when: Evaluates("expr {9007199254740993 == 9007199254740992}")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+}
+
+rule ExprEqualityFallsBackToString {
+    -- If either operand of == / != is non-numeric, compare as strings.
+    when: Evaluates("expr {\"abc\" == \"abc\"}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+-- ── Bitwise and shift operators ───────────────────────────────────
+
+rule ExprBitwiseRequiresIntegers {
+    -- | & ^ % and shifts reject floating-point operands.
+    when: Evaluates("expr {1 | 2.5}")
+    ensures: completion.code = error
+    -- oracle message: can't use floating-point value as operand of "|"
+    -- also: expr {10 % 3.0} errors the same way
+}
+
+rule ExprNegativeShiftErrors {
+    when: Evaluates("expr {1 >> -1}")
+    ensures: completion.code = error
+    -- oracle message: negative shift argument
+}
+
+-- ── Boolean coercion ──────────────────────────────────────────────
+
+rule ExprBooleanCoercion {
+    -- Valid booleans: 0/1, true/false, yes/no, on/off (any unique
+    -- abbreviation, any case), and any numeric value (0.0 is false,
+    -- nonzero is true). Anything else is an error.
+    when: Evaluates("expr {0.0 ? 1 : 0}")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- also: expr {!0.0} => 1
+    -- error case: if {abc} {...} => error "expected boolean value"
+}
+
+rule ExprLogicalShortCircuit {
+    -- && and || never evaluate the right operand when the left decides.
+    when: Evaluates("expr {0 && [error boom]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- also: expr {1 || [error boom]} => 1
+}
+
+rule ExprTernaryEvaluatesOnlyTakenBranch {
+    when: Evaluates("expr {1 ? 2 : [error boom]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+}
+
+-- ── Words and substitution inside expressions ─────────────────────
+
+rule ExprBarewordErrors {
+    -- A bare word that is not a recognised literal is an error,
+    -- never an implicit string.
+    when: Evaluates("expr {abc}")
+    ensures: completion.code = error
+    -- oracle message starts: invalid bareword "abc"
+}
+
+rule ExprDoubleQuotedWordsSubstitute {
+    -- "..." words inside an expression perform $ and [] substitution;
+    -- {...} words do not.
+    when: Evaluates("expr {\" $x\"}    -- with variable x = world")
+    ensures: completion.code = ok
+    ensures: completion.value = " world"
+    -- probe: set x world; puts [expr {" $x"}]
+}
+
+rule ExprMalformedListOperandErrors {
+    -- in / ni parse the right operand as a list; a malformed list errors.
+    when: Evaluates("expr {\"a\" in \"{\"}")
+    ensures: completion.code = error
+    -- oracle: unmatched open brace in list
+}

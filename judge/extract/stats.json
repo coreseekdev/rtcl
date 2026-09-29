@@ -1,0 +1,1200 @@
+{
+ "per_file": {
+  "aaa_exit": {},
+  "abstractlist": {
+   "found": 33,
+   "skip-opt-constraints": 7,
+   "skip-shape": 26
+  },
+  "append": {
+   "found": 52,
+   "extracted": 26,
+   "skip-result-subst": 12,
+   "skip-opt-constraints": 3,
+   "skip-opt-cleanup": 1,
+   "skip-opt-setup": 10,
+   "verify-dropped": 3,
+   "kept": 23
+  },
+  "appendComp": {
+   "found": 48,
+   "skip-opt-setup": 11,
+   "extracted": 24,
+   "skip-result-subst": 8,
+   "skip-opt-constraints": 5,
+   "verify-dropped": 0,
+   "kept": 24
+  },
+  "apply": {
+   "found": 44,
+   "extracted": 27,
+   "skip-opt-cleanup": 4,
+   "skip-blacklist": 8,
+   "skip-opt-constraints": 4,
+   "skip-opt-setup": 1,
+   "verify-dropped": 10,
+   "kept": 17
+  },
+  "assemble": {
+   "found": 279,
+   "skip-shape": 268,
+   "skip-name": 1,
+   "skip-opt-match": 3,
+   "skip-opt-cleanup": 1,
+   "extracted": 6,
+   "unparseable-cmd": 2,
+   "verify-dropped": 5,
+   "kept": 1
+  },
+  "assocd": {
+   "found": 11,
+   "skip-shape": 8,
+   "skip-opt-constraints": 3
+  },
+  "async": {
+   "found": 12,
+   "skip-shape": 9,
+   "skip-opt-constraints": 3
+  },
+  "autoMkindex": {
+   "found": 11,
+   "skip-blacklist": 3,
+   "skip-opt-setup": 7,
+   "skip-opt-constraints": 1
+  },
+  "basic": {
+   "found": 65,
+   "skip-blacklist": 9,
+   "skip-shape": 35,
+   "extracted": 10,
+   "skip-opt-setup": 4,
+   "skip-opt-cleanup": 2,
+   "skip-opt-constraints": 5,
+   "verify-dropped": 1,
+   "kept": 9
+  },
+  "bigdata": {
+   "found": 8,
+   "skip-opt-constraints": 8
+  },
+  "binary": {
+   "found": 751,
+   "extracted": 332,
+   "skip-opt-match": 24,
+   "skip-result-subst": 109,
+   "skip-shape": 222,
+   "skip-opt-setup": 44,
+   "skip-opt-constraints": 19,
+   "skip-returncodes": 1,
+   "verify-dropped": 4,
+   "kept": 328
+  },
+  "brodnik": {},
+  "chan": {
+   "found": 42,
+   "skip-result-subst": 23,
+   "skip-opt-match": 1,
+   "skip-opt-setup": 7,
+   "extracted": 8,
+   "skip-opt-constraints": 1,
+   "skip-opt-cleanup": 2,
+   "verify-dropped": 1,
+   "kept": 7
+  },
+  "chanio": {},
+  "clock-ivm": {},
+  "clock-no-tzdata": {},
+  "clock": {
+   "found": 8658,
+   "skip-opt-setup": 17,
+   "skip-result-subst": 118,
+   "skip-blacklist": 7678,
+   "skip-opt-errorCode": 3,
+   "skip-shape": 804,
+   "extracted": 3,
+   "unparseable-cmd": 63,
+   "skip-opt-cleanup": 10,
+   "skip-opt-constraints": 15,
+   "skip-opt-match": 10,
+   "verify-dropped": 3,
+   "kept": 0
+  },
+  "cmdAH": {
+   "found": 290,
+   "extracted": 16,
+   "skip-blacklist": 65,
+   "skip-opt-setup": 29,
+   "skip-opt-constraints": 41,
+   "skip-opt-match": 7,
+   "skip-shape": 123,
+   "skip-result-subst": 6,
+   "skip-opt-cleanup": 3,
+   "verify-dropped": 4,
+   "kept": 12
+  },
+  "cmdIL": {
+   "found": 168,
+   "extracted": 136,
+   "skip-opt-setup": 5,
+   "skip-result-subst": 14,
+   "skip-opt-cleanup": 5,
+   "skip-shape": 2,
+   "skip-opt-constraints": 5,
+   "skip-returncodes": 1,
+   "verify-dropped": 25,
+   "kept": 111
+  },
+  "cmdInfo": {
+   "found": 12,
+   "skip-shape": 12
+  },
+  "cmdMZ": {},
+  "compExpr-old": {
+   "found": 184,
+   "extracted": 133,
+   "skip-opt-match": 48,
+   "skip-shape": 3,
+   "verify-dropped": 14,
+   "kept": 119
+  },
+  "compExpr": {
+   "found": 82,
+   "extracted": 34,
+   "skip-opt-match": 18,
+   "skip-opt-setup": 27,
+   "skip-blacklist": 1,
+   "skip-opt-constraints": 2,
+   "verify-dropped": 0,
+   "kept": 34
+  },
+  "compile": {
+   "found": 117,
+   "skip-opt-setup": 36,
+   "extracted": 43,
+   "unparseable-cmd": 2,
+   "skip-opt-match": 22,
+   "skip-opt-constraints": 3,
+   "skip-opt-cleanup": 3,
+   "skip-shape": 2,
+   "skip-blacklist": 1,
+   "skip-result-subst": 7,
+   "verify-dropped": 4,
+   "kept": 39
+  },
+  "concat": {
+   "found": 9,
+   "extracted": 8,
+   "skip-result-subst": 1,
+   "verify-dropped": 0,
+   "kept": 8
+  },
+  "config": {
+   "found": 9,
+   "skip-opt-match": 1,
+   "extracted": 8,
+   "verify-dropped": 0,
+   "kept": 8
+  },
+  "coroutine": {
+   "found": 82,
+   "skip-opt-setup": 38,
+   "skip-opt-cleanup": 21,
+   "skip-blacklist": 20,
+   "skip-opt-constraints": 3
+  },
+  "dcall": {
+   "found": 6,
+   "skip-shape": 6
+  },
+  "dict": {
+   "found": 375,
+   "extracted": 257,
+   "skip-opt-match": 3,
+   "skip-opt-cleanup": 83,
+   "skip-shape": 1,
+   "skip-opt-errorCode": 2,
+   "skip-opt-setup": 14,
+   "skip-opt-constraints": 5,
+   "skip-returncodes": 9,
+   "skip-result-subst": 1,
+   "verify-dropped": 48,
+   "kept": 209
+  },
+  "dstring": {
+   "found": 46,
+   "skip-opt-constraints": 46
+  },
+  "encoding": {
+   "found": 27,
+   "skip-opt-constraints": 8,
+   "skip-result-subst": 8,
+   "skip-opt-setup": 2,
+   "skip-blacklist": 8,
+   "skip-opt-cleanup": 1
+  },
+  "env": {
+   "found": 32,
+   "skip-opt-setup": 15,
+   "skip-opt-constraints": 15,
+   "extracted": 1,
+   "skip-blacklist": 1,
+   "verify-dropped": 1,
+   "kept": 0
+  },
+  "error": {},
+  "eval": {
+   "found": 12,
+   "extracted": 11,
+   "skip-result-subst": 1,
+   "verify-dropped": 0,
+   "kept": 11
+  },
+  "event": {
+   "found": 65,
+   "skip-opt-constraints": 25,
+   "skip-opt-setup": 11,
+   "skip-opt-match": 7,
+   "skip-opt-cleanup": 7,
+   "skip-blacklist": 8,
+   "skip-shape": 7
+  },
+  "exec": {
+   "found": 112,
+   "skip-shape": 56,
+   "skip-opt-constraints": 51,
+   "skip-blacklist": 2,
+   "skip-opt-setup": 2,
+   "skip-result-subst": 1
+  },
+  "execute": {
+   "found": 157,
+   "extracted": 46,
+   "skip-shape": 77,
+   "skip-opt-setup": 27,
+   "skip-opt-cleanup": 6,
+   "skip-opt-constraints": 1,
+   "verify-dropped": 0,
+   "kept": 46
+  },
+  "expr-old": {
+   "found": 461,
+   "extracted": 382,
+   "skip-result-subst": 7,
+   "skip-opt-match": 34,
+   "skip-shape": 27,
+   "skip-blacklist": 4,
+   "skip-opt-constraints": 7,
+   "verify-dropped": 40,
+   "kept": 342
+  },
+  "expr": {
+   "found": 1883,
+   "extracted": 621,
+   "skip-opt-match": 68,
+   "skip-shape": 1163,
+   "skip-result-subst": 23,
+   "unparseable-cmd": 1,
+   "skip-opt-constraints": 6,
+   "skip-blacklist": 1,
+   "skip-opt-setup": 1,
+   "verify-dropped": 158,
+   "kept": 463
+  },
+  "fCmd": {
+   "found": 306,
+   "skip-opt-constraints": 258,
+   "skip-opt-setup": 21,
+   "skip-blacklist": 15,
+   "skip-shape": 2,
+   "skip-result-subst": 5,
+   "skip-opt-match": 5
+  },
+  "fileName": {
+   "found": 305,
+   "skip-shape": 178,
+   "skip-opt-setup": 13,
+   "skip-opt-constraints": 50,
+   "skip-blacklist": 43,
+   "skip-result-subst": 16,
+   "skip-opt-cleanup": 1,
+   "skip-opt-match": 4,
+   "unparseable-cmd": 1
+  },
+  "fileSystem": {},
+  "fileSystemEncoding": {},
+  "for-old": {
+   "found": 9,
+   "extracted": 9,
+   "verify-dropped": 0,
+   "kept": 9
+  },
+  "for": {
+   "found": 88,
+   "extracted": 49,
+   "skip-opt-match": 8,
+   "skip-blacklist": 4,
+   "skip-opt-cleanup": 1,
+   "skip-result-subst": 2,
+   "skip-shape": 24,
+   "verify-dropped": 1,
+   "kept": 48
+  },
+  "foreach": {
+   "found": 43,
+   "extracted": 39,
+   "skip-result-subst": 1,
+   "skip-opt-cleanup": 1,
+   "skip-opt-setup": 2,
+   "verify-dropped": 12,
+   "kept": 27
+  },
+  "format": {
+   "found": 159,
+   "extracted": 116,
+   "skip-result-subst": 19,
+   "skip-shape": 19,
+   "skip-opt-constraints": 2,
+   "skip-returncodes": 1,
+   "skip-opt-match": 2,
+   "verify-dropped": 18,
+   "kept": 98
+  },
+  "get": {
+   "found": 23,
+   "skip-shape": 17,
+   "extracted": 6,
+   "verify-dropped": 2,
+   "kept": 4
+  },
+  "grapheme": {},
+  "history": {
+   "found": 62,
+   "skip-shape": 53,
+   "skip-opt-constraints": 9
+  },
+  "http": {
+   "found": 75,
+   "skip-name": 75
+  },
+  "http11": {
+   "found": 49,
+   "skip-name": 49
+  },
+  "httpPipeline": {},
+  "httpProxy": {
+   "found": 50,
+   "skip-name": 50
+  },
+  "httpcookie": {
+   "found": 60,
+   "skip-shape": 6,
+   "skip-opt-constraints": 54
+  },
+  "icu": {},
+  "idna": {
+   "found": 101,
+   "extracted": 86,
+   "skip-result-subst": 14,
+   "skip-blacklist": 1,
+   "verify-dropped": 86,
+   "kept": 0
+  },
+  "if-old": {
+   "found": 33,
+   "extracted": 32,
+   "skip-blacklist": 1,
+   "verify-dropped": 0,
+   "kept": 32
+  },
+  "if": {
+   "found": 73,
+   "extracted": 3,
+   "skip-opt-cleanup": 25,
+   "skip-opt-setup": 45,
+   "verify-dropped": 0,
+   "kept": 3
+  },
+  "incr-old": {
+   "found": 14,
+   "extracted": 13,
+   "skip-opt-match": 1,
+   "verify-dropped": 1,
+   "kept": 12
+  },
+  "incr": {
+   "found": 69,
+   "extracted": 51,
+   "skip-opt-setup": 10,
+   "skip-opt-match": 4,
+   "skip-opt-cleanup": 3,
+   "skip-result-subst": 1,
+   "verify-dropped": 3,
+   "kept": 48
+  },
+  "indexObj": {
+   "found": 65,
+   "skip-shape": 61,
+   "skip-opt-constraints": 4
+  },
+  "info": {
+   "found": 287,
+   "extracted": 117,
+   "skip-opt-cleanup": 92,
+   "skip-blacklist": 12,
+   "skip-opt-setup": 39,
+   "skip-shape": 7,
+   "skip-opt-constraints": 9,
+   "skip-result-subst": 7,
+   "skip-opt-match": 4,
+   "unparseable-cmd": 4,
+   "verify-dropped": 63,
+   "kept": 54
+  },
+  "init": {
+   "found": 11,
+   "skip-opt-setup": 3,
+   "extracted": 8,
+   "unparseable-cmd": 1,
+   "verify-dropped": 0,
+   "kept": 8
+  },
+  "interp": {
+   "found": 373,
+   "skip-blacklist": 219,
+   "skip-result-subst": 12,
+   "skip-opt-setup": 78,
+   "skip-opt-match": 5,
+   "extracted": 9,
+   "skip-opt-cleanup": 31,
+   "skip-shape": 8,
+   "skip-opt-constraints": 9,
+   "skip-returncodes": 2,
+   "verify-dropped": 9,
+   "kept": 0
+  },
+  "io": {},
+  "ioCmd": {
+   "found": 369,
+   "skip-blacklist": 56,
+   "extracted": 43,
+   "skip-opt-setup": 35,
+   "skip-opt-cleanup": 4,
+   "skip-opt-constraints": 102,
+   "skip-shape": 17,
+   "skip-opt-match": 108,
+   "skip-result-subst": 4,
+   "verify-dropped": 18,
+   "kept": 25
+  },
+  "ioTrans": {
+   "found": 106,
+   "extracted": 3,
+   "skip-opt-match": 1,
+   "skip-opt-setup": 44,
+   "skip-opt-cleanup": 21,
+   "skip-opt-constraints": 37,
+   "verify-dropped": 0,
+   "kept": 3
+  },
+  "iogt": {},
+  "join": {
+   "found": 10,
+   "extracted": 10,
+   "verify-dropped": 0,
+   "kept": 10
+  },
+  "lfilter": {
+   "found": 26,
+   "extracted": 26,
+   "verify-dropped": 26,
+   "kept": 0
+  },
+  "lindex": {
+   "found": 84,
+   "skip-shape": 22,
+   "skip-opt-constraints": 15,
+   "extracted": 36,
+   "skip-result-subst": 4,
+   "skip-opt-match": 6,
+   "skip-opt-setup": 1,
+   "verify-dropped": 1,
+   "kept": 35
+  },
+  "link": {
+   "found": 77,
+   "skip-shape": 4,
+   "skip-opt-constraints": 73
+  },
+  "linsert": {
+   "found": 28,
+   "extracted": 24,
+   "skip-result-subst": 4,
+   "verify-dropped": 0,
+   "kept": 24
+  },
+  "list": {
+   "found": 36,
+   "extracted": 17,
+   "skip-body-subst": 7,
+   "skip-result-subst": 12,
+   "verify-dropped": 1,
+   "kept": 16
+  },
+  "listObj": {
+   "found": 49,
+   "skip-shape": 7,
+   "extracted": 41,
+   "skip-result-subst": 1,
+   "unparseable-cmd": 1,
+   "verify-dropped": 0,
+   "kept": 41
+  },
+  "listRep": {
+   "found": 231,
+   "skip-opt-constraints": 227,
+   "extracted": 2,
+   "skip-result-subst": 2,
+   "verify-dropped": 2,
+   "kept": 0
+  },
+  "listTypes": {},
+  "llength": {
+   "found": 6,
+   "extracted": 6,
+   "verify-dropped": 0,
+   "kept": 6
+  },
+  "lmap": {
+   "found": 66,
+   "extracted": 56,
+   "skip-opt-setup": 7,
+   "skip-opt-cleanup": 3,
+   "verify-dropped": 0,
+   "kept": 56
+  },
+  "load": {
+   "found": 30,
+   "skip-blacklist": 8,
+   "skip-shape": 15,
+   "skip-opt-constraints": 7
+  },
+  "lpop": {
+   "found": 38,
+   "extracted": 30,
+   "skip-opt-match": 4,
+   "skip-opt-constraints": 4,
+   "verify-dropped": 30,
+   "kept": 0
+  },
+  "lrange": {
+   "found": 38,
+   "extracted": 22,
+   "skip-result-subst": 10,
+   "skip-opt-constraints": 2,
+   "skip-opt-match": 4,
+   "verify-dropped": 0,
+   "kept": 22
+  },
+  "lrepeat": {
+   "found": 12,
+   "skip-shape": 7,
+   "skip-opt-constraints": 1,
+   "extracted": 4,
+   "verify-dropped": 0,
+   "kept": 4
+  },
+  "lreplace": {
+   "found": 123,
+   "extracted": 117,
+   "skip-returncodes": 4,
+   "skip-result-subst": 2,
+   "verify-dropped": 60,
+   "kept": 57
+  },
+  "lsearch": {
+   "found": 165,
+   "extracted": 133,
+   "skip-result-subst": 27,
+   "skip-opt-setup": 4,
+   "skip-returncodes": 1,
+   "verify-dropped": 52,
+   "kept": 81
+  },
+  "lseq": {
+   "found": 145,
+   "skip-returncodes": 10,
+   "extracted": 50,
+   "skip-opt-cleanup": 35,
+   "skip-shape": 15,
+   "skip-result-subst": 4,
+   "skip-opt-constraints": 28,
+   "skip-opt-match": 3,
+   "verify-dropped": 50,
+   "kept": 0
+  },
+  "lset": {
+   "found": 89,
+   "skip-shape": 88,
+   "skip-opt-constraints": 1
+  },
+  "lsetComp": {
+   "found": 19,
+   "skip-result-subst": 17,
+   "extracted": 2,
+   "verify-dropped": 2,
+   "kept": 0
+  },
+  "macOSXFCmd": {
+   "found": 14,
+   "skip-shape": 14
+  },
+  "macOSXLoad": {},
+  "main": {},
+  "mathfunc": {
+   "found": 98,
+   "extracted": 88,
+   "skip-opt-match": 10,
+   "verify-dropped": 88,
+   "kept": 0
+  },
+  "mathop": {
+   "found": 110,
+   "extracted": 90,
+   "skip-result-subst": 20,
+   "verify-dropped": 90,
+   "kept": 0
+  },
+  "misc": {
+   "found": 2,
+   "extracted": 1,
+   "skip-result-subst": 1,
+   "verify-dropped": 0,
+   "kept": 1
+  },
+  "msgcat": {},
+  "mutex": {},
+  "namespace-old": {
+   "found": 126,
+   "extracted": 121,
+   "skip-result-subst": 1,
+   "skip-opt-setup": 3,
+   "skip-blacklist": 1,
+   "verify-dropped": 27,
+   "kept": 94
+  },
+  "namespace": {
+   "found": 314,
+   "extracted": 169,
+   "skip-opt-setup": 99,
+   "skip-result-subst": 5,
+   "skip-blacklist": 6,
+   "skip-opt-cleanup": 30,
+   "skip-opt-match": 2,
+   "skip-opt-constraints": 2,
+   "skip-shape": 1,
+   "unparseable-cmd": 1,
+   "verify-dropped": 5,
+   "kept": 164
+  },
+  "notify": {
+   "found": 23,
+   "skip-opt-constraints": 23
+  },
+  "nre": {
+   "found": 29,
+   "skip-opt-constraints": 24,
+   "skip-opt-setup": 3,
+   "skip-opt-cleanup": 2
+  },
+  "obj": {
+   "found": 84,
+   "skip-shape": 81,
+   "extracted": 3,
+   "verify-dropped": 2,
+   "kept": 1
+  },
+  "oo": {
+   "found": 388,
+   "skip-blacklist": 3,
+   "skip-opt-constraints": 14,
+   "skip-shape": 2,
+   "skip-opt-setup": 277,
+   "skip-result-subst": 8,
+   "extracted": 59,
+   "skip-returncodes": 6,
+   "skip-opt-cleanup": 19,
+   "verify-dropped": 31,
+   "kept": 28
+  },
+  "ooNext2": {
+   "found": 52,
+   "skip-opt-setup": 37,
+   "extracted": 8,
+   "skip-opt-constraints": 5,
+   "unparseable-cmd": 10,
+   "skip-opt-cleanup": 2,
+   "verify-dropped": 0,
+   "kept": 8
+  },
+  "ooProp": {
+   "found": 59,
+   "skip-opt-setup": 59
+  },
+  "ooUtil": {
+   "found": 33,
+   "skip-opt-setup": 31,
+   "skip-opt-cleanup": 2
+  },
+  "opt": {
+   "found": 31,
+   "skip-result-subst": 1,
+   "extracted": 30,
+   "verify-dropped": 30,
+   "kept": 0
+  },
+  "package": {
+   "unparseable-cmd": 1
+  },
+  "parse": {},
+  "parseExpr": {
+   "found": 286,
+   "skip-shape": 146,
+   "skip-opt-constraints": 73,
+   "skip-opt-match": 3,
+   "extracted": 52,
+   "skip-result-subst": 12,
+   "verify-dropped": 1,
+   "kept": 51
+  },
+  "parseOld": {
+   "found": 96,
+   "extracted": 82,
+   "skip-result-subst": 13,
+   "skip-blacklist": 1,
+   "verify-dropped": 22,
+   "kept": 60
+  },
+  "pid": {
+   "found": 5,
+   "skip-shape": 3,
+   "skip-opt-constraints": 2
+  },
+  "pkgMkIndex": {
+   "found": 27,
+   "skip-result-subst": 7,
+   "extracted": 11,
+   "skip-opt-errorOutput": 1,
+   "skip-shape": 8,
+   "verify-dropped": 11,
+   "kept": 0
+  },
+  "platform": {},
+  "proc-old": {
+   "found": 74,
+   "extracted": 68,
+   "skip-opt-match": 2,
+   "skip-blacklist": 4,
+   "verify-dropped": 20,
+   "kept": 48
+  },
+  "proc": {
+   "found": 38,
+   "skip-opt-setup": 16,
+   "skip-opt-cleanup": 7,
+   "extracted": 5,
+   "skip-opt-constraints": 8,
+   "skip-shape": 1,
+   "skip-blacklist": 1,
+   "verify-dropped": 0,
+   "kept": 5
+  },
+  "process": {
+   "found": 18,
+   "extracted": 5,
+   "skip-opt-match": 1,
+   "skip-opt-cleanup": 9,
+   "skip-opt-setup": 2,
+   "skip-opt-constraints": 1,
+   "verify-dropped": 5,
+   "kept": 0
+  },
+  "pwd": {
+   "found": 3,
+   "extracted": 1,
+   "skip-blacklist": 1,
+   "skip-result-subst": 1,
+   "verify-dropped": 0,
+   "kept": 1
+  },
+  "range": {},
+  "reg": {
+   "found": 47,
+   "extracted": 32,
+   "skip-shape": 13,
+   "skip-opt-cleanup": 2,
+   "verify-dropped": 1,
+   "kept": 31
+  },
+  "regexp": {
+   "found": 257,
+   "extracted": 214,
+   "skip-result-subst": 33,
+   "skip-opt-setup": 4,
+   "skip-shape": 5,
+   "skip-opt-constraints": 1,
+   "verify-dropped": 17,
+   "kept": 197
+  },
+  "regexpComp": {
+   "found": 153,
+   "extracted": 141,
+   "skip-result-subst": 10,
+   "skip-shape": 1,
+   "skip-opt-constraints": 1,
+   "verify-dropped": 112,
+   "kept": 29
+  },
+  "registry": {
+   "found": 126,
+   "skip-shape": 4,
+   "skip-opt-constraints": 122
+  },
+  "rename": {
+   "found": 19,
+   "extracted": 7,
+   "skip-opt-setup": 3,
+   "skip-shape": 8,
+   "skip-opt-cleanup": 1,
+   "verify-dropped": 3,
+   "kept": 4
+  },
+  "resolver": {
+   "found": 10,
+   "skip-opt-constraints": 10
+  },
+  "result": {
+   "found": 26,
+   "skip-shape": 19,
+   "skip-opt-constraints": 3,
+   "skip-opt-setup": 1,
+   "extracted": 1,
+   "skip-opt-match": 2,
+   "verify-dropped": 0,
+   "kept": 1
+  },
+  "safe-stock": {
+   "found": 11,
+   "skip-opt-setup": 8,
+   "skip-opt-constraints": 3
+  },
+  "safe-stock86": {},
+  "safe-zipfs": {},
+  "safe": {
+   "found": 155,
+   "skip-blacklist": 8,
+   "skip-opt-setup": 89,
+   "skip-opt-constraints": 53,
+   "skip-shape": 2,
+   "extracted": 1,
+   "skip-opt-cleanup": 2,
+   "verify-dropped": 1,
+   "kept": 0
+  },
+  "scan": {
+   "found": 185,
+   "extracted": 110,
+   "skip-opt-setup": 73,
+   "skip-opt-constraints": 1,
+   "skip-opt-match": 1,
+   "verify-dropped": 4,
+   "kept": 106
+  },
+  "security": {
+   "found": 1,
+   "extracted": 1,
+   "verify-dropped": 1,
+   "kept": 0
+  },
+  "set-old": {
+   "found": 153,
+   "extracted": 149,
+   "skip-blacklist": 2,
+   "skip-result-subst": 2,
+   "verify-dropped": 13,
+   "kept": 136
+  },
+  "set": {
+   "found": 64,
+   "extracted": 45,
+   "skip-opt-setup": 15,
+   "skip-result-subst": 1,
+   "skip-opt-match": 2,
+   "skip-opt-constraints": 1,
+   "verify-dropped": 0,
+   "kept": 45
+  },
+  "socket": {
+   "found": 30,
+   "skip-opt-constraints": 30
+  },
+  "source": {},
+  "split": {
+   "found": 18,
+   "extracted": 14,
+   "skip-result-subst": 4,
+   "verify-dropped": 0,
+   "kept": 14
+  },
+  "stack": {
+   "found": 3,
+   "skip-blacklist": 3
+  },
+  "string": {},
+  "stringObj": {
+   "found": 85,
+   "skip-shape": 85
+  },
+  "subst": {
+   "found": 71,
+   "extracted": 61,
+   "skip-shape": 1,
+   "skip-result-subst": 2,
+   "skip-opt-setup": 3,
+   "skip-blacklist": 3,
+   "skip-opt-match": 1,
+   "verify-dropped": 17,
+   "kept": 44
+  },
+  "switch": {
+   "found": 143,
+   "extracted": 139,
+   "skip-result-subst": 4,
+   "unparseable-cmd": 1,
+   "verify-dropped": 42,
+   "kept": 97
+  },
+  "tailcall": {
+   "found": 40,
+   "skip-opt-constraints": 11,
+   "skip-opt-cleanup": 7,
+   "skip-opt-match": 1,
+   "skip-opt-setup": 10,
+   "skip-returncodes": 6,
+   "extracted": 5,
+   "verify-dropped": 2,
+   "kept": 3
+  },
+  "tcltest": {},
+  "thread": {
+   "found": 52,
+   "skip-shape": 26,
+   "skip-opt-constraints": 26
+  },
+  "timer": {
+   "found": 136,
+   "skip-opt-setup": 63,
+   "skip-blacklist": 23,
+   "extracted": 25,
+   "skip-result-subst": 8,
+   "skip-opt-cleanup": 8,
+   "skip-opt-constraints": 7,
+   "skip-opt-match": 2,
+   "verify-dropped": 25,
+   "kept": 0
+  },
+  "tm": {
+   "found": 21,
+   "extracted": 5,
+   "skip-result-subst": 3,
+   "skip-opt-setup": 13,
+   "verify-dropped": 0,
+   "kept": 5
+  },
+  "trace": {
+   "found": 234,
+   "extracted": 183,
+   "skip-opt-cleanup": 1,
+   "skip-blacklist": 11,
+   "skip-result-subst": 11,
+   "skip-opt-constraints": 3,
+   "skip-opt-setup": 11,
+   "skip-shape": 14,
+   "verify-dropped": 116,
+   "kept": 67
+  },
+  "unicodeNormalize": {},
+  "unicodeProperties": {},
+  "unixFCmd": {
+   "found": 44,
+   "skip-opt-constraints": 32,
+   "skip-shape": 12
+  },
+  "unixFile": {
+   "found": 7,
+   "skip-shape": 7
+  },
+  "unixForkEvent": {
+   "found": 1,
+   "skip-opt-constraints": 1
+  },
+  "unixInit": {
+   "found": 8,
+   "skip-shape": 5,
+   "skip-opt-constraints": 3
+  },
+  "unixNotfy": {
+   "found": 4,
+   "skip-opt-constraints": 4
+  },
+  "unknown": {
+   "found": 7,
+   "extracted": 6,
+   "skip-result-subst": 1,
+   "verify-dropped": 5,
+   "kept": 1
+  },
+  "unload": {
+   "found": 27,
+   "skip-blacklist": 7,
+   "skip-shape": 4,
+   "skip-opt-constraints": 16
+  },
+  "uplevel": {
+   "found": 57,
+   "extracted": 52,
+   "skip-opt-setup": 4,
+   "skip-opt-cleanup": 1,
+   "verify-dropped": 20,
+   "kept": 32
+  },
+  "upvar": {
+   "found": 70,
+   "extracted": 35,
+   "skip-blacklist": 7,
+   "skip-opt-cleanup": 11,
+   "skip-opt-setup": 9,
+   "skip-shape": 8,
+   "verify-dropped": 0,
+   "kept": 35
+  },
+  "utf": {
+   "found": 326,
+   "skip-shape": 232,
+   "extracted": 83,
+   "skip-result-subst": 9,
+   "skip-opt-cleanup": 1,
+   "skip-opt-constraints": 1,
+   "verify-dropped": 20,
+   "kept": 63
+  },
+  "utfext": {},
+  "util": {
+   "found": 331,
+   "skip-result-subst": 5,
+   "extracted": 137,
+   "skip-blacklist": 1,
+   "skip-shape": 152,
+   "skip-opt-match": 34,
+   "unparseable-cmd": 131,
+   "skip-opt-constraints": 2,
+   "verify-dropped": 69,
+   "kept": 68
+  },
+  "var": {
+   "found": 221,
+   "skip-opt-setup": 94,
+   "extracted": 101,
+   "skip-opt-constraints": 17,
+   "skip-shape": 4,
+   "skip-result-subst": 2,
+   "skip-opt-match": 2,
+   "skip-blacklist": 1,
+   "verify-dropped": 64,
+   "kept": 37
+  },
+  "while-old": {
+   "found": 15,
+   "extracted": 14,
+   "skip-blacklist": 1,
+   "verify-dropped": 1,
+   "kept": 13
+  },
+  "while": {
+   "found": 46,
+   "extracted": 5,
+   "skip-opt-cleanup": 39,
+   "skip-opt-setup": 2,
+   "verify-dropped": 2,
+   "kept": 3
+  },
+  "winConsole": {
+   "found": 25,
+   "skip-opt-constraints": 23,
+   "skip-name": 2
+  },
+  "winDde": {
+   "found": 50,
+   "skip-shape": 1,
+   "skip-opt-constraints": 49
+  },
+  "winFCmd": {
+   "found": 174,
+   "skip-opt-constraints": 171,
+   "skip-shape": 3
+  },
+  "winFile": {
+   "found": 11,
+   "skip-opt-constraints": 10,
+   "skip-shape": 1
+  },
+  "winNotify": {
+   "found": 14,
+   "skip-shape": 14
+  },
+  "winPipe": {
+   "found": 56,
+   "skip-shape": 49,
+   "skip-opt-constraints": 7
+  },
+  "winTime": {
+   "found": 3,
+   "skip-shape": 3
+  },
+  "word": {
+   "found": 55,
+   "extracted": 50,
+   "skip-returncodes": 5,
+   "verify-dropped": 4,
+   "kept": 46
+  },
+  "zipfs": {
+   "found": 38,
+   "skip-opt-constraints": 38
+  },
+  "zlib": {
+   "found": 74,
+   "skip-opt-constraints": 59,
+   "skip-shape": 14,
+   "skip-opt-setup": 1
+  }
+ },
+ "total": {
+  "found": 23759,
+  "skip-opt-constraints": 2041,
+  "skip-shape": 4344,
+  "extracted": 5701,
+  "skip-result-subst": 667,
+  "skip-opt-cleanup": 510,
+  "skip-opt-setup": 1540,
+  "verify-dropped": 1629,
+  "kept": 4072,
+  "skip-blacklist": 8252,
+  "skip-name": 177,
+  "skip-opt-match": 468,
+  "unparseable-cmd": 219,
+  "skip-returncodes": 46,
+  "skip-opt-errorCode": 5,
+  "skip-body-subst": 7,
+  "skip-opt-errorOutput": 1
+ }
+}

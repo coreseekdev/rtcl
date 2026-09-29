@@ -1,0 +1,31 @@
+-- allium: 3
+-- interp.allium
+-- Shared vocabulary for the rtcl behaviour specs.
+--
+-- Scope: observable semantics of evaluating Tcl 8.6 scripts, as defined by
+-- the oracle implementation (system tclsh 8.6.17). All sibling specs state
+-- claims about what an interpreter must observably do, not how rtcl is built.
+-- Excludes: I/O channels, event loop, encodings, packages, Tk, performance.
+
+entity Completion {
+    -- Every evaluation of a script (or expression) ends in exactly one
+    -- completion. This is Tcl's fundamental result contract.
+    code: ok | error | return | break | continue
+    -- For ok: the result value. For error: the error message.
+    -- For return: the payload value. For break/continue: empty.
+    value: String
+}
+
+entity Script {
+    -- A Tcl script as presented to the interpreter.
+    text: String
+}
+
+surface Interpreter {
+    -- The boundary under specification: a caller hands the interpreter
+    -- a script and observes the completion.
+    facing _: Script
+
+    provides:
+        Evaluates(script)
+}

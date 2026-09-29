@@ -1,0 +1,91 @@
+-- allium: 3
+-- string.allium
+-- Behaviour spec: Tcl string commands. Oracle: tclsh 8.6.17.
+--
+-- Indices in Tcl strings are character (Unicode code point) indices,
+-- never byte offsets.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+rule StringIndicesAreCharacterBased {
+    -- string index / range / first / last count characters, not bytes.
+    when: Evaluates("string first y héy")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+    -- also: string index héllo 1 => é ; string length héllo => 5
+}
+
+rule StringFirstLastReturnMinusOneWhenAbsent {
+    when: Evaluates("string first z hello")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1"
+    -- argument order: string first needleString haystackString ?startIndex?
+}
+
+rule StringTotitleOnlyFirstCharacter {
+    -- totitle capitalises the first character of the whole string and
+    -- lowercases the rest; it is not per-word capitalisation.
+    when: Evaluates("string totitle \"hello world\"")
+    ensures: completion.code = ok
+    ensures: completion.value = "Hello world"
+}
+
+rule StringRepeatNegativeCountIsEmpty {
+    -- A negative repeat count yields the empty string, not an error.
+    when: Evaluates("string repeat ab -1")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+rule StringIsBooleanAcceptsAbbreviations {
+    -- Boolean strings accept any unique prefix: tru, fals, y, n, of...
+    when: Evaluates("string is boolean tru")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- also: string is boolean 2 => 1 (any nonzero number is true)
+}
+
+rule StringIsIntegerAcceptsWhitespaceAndHex {
+    when: Evaluates("string is integer \" 42\"")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- also: string is integer 0x10 => 1
+}
+
+rule StringIsListRejectsMalformed {
+    when: Evaluates("string is list \"{\"")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+}
+
+rule StringTrimRemovesCharSetFromBothEnds {
+    when: Evaluates("string trim \"xxhixx\" x")
+    ensures: completion.code = ok
+    ensures: completion.value = "hi"
+    -- default trim set is whitespace
+}
+
+rule StringMatchIsGlob {
+    when: Evaluates("string match a*c abc")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule StringMapUsesEarliestLongestLeftmost {
+    -- map scans left to right; at each position the first mapping pair
+    -- whose key matches is applied; keys are never matched inside output.
+    when: Evaluates("string map {a b} aaa")
+    ensures: completion.code = ok
+    ensures: completion.value = "bbb"
+}
+
+rule StringEqualAndCompare {
+    when: Evaluates("string equal -length 2 abc abd")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- compare returns -1/0/1; both support -nocase and -length
+}

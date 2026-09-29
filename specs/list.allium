@@ -1,0 +1,141 @@
+-- allium: 3
+-- list.allium
+-- Behaviour spec: Tcl list values and list commands
+-- (list, llength, lindex, lrange, lset, lsort, lsearch, concat/split/join).
+-- Oracle: tclsh 8.6.17.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── List as a string format ───────────────────────────────────────
+
+rule ListCanonicalQuotingRoundTrips {
+    -- `list` produces a string from which `lindex` recovers each original
+    -- element exactly, for arbitrary element contents (empty, spaces,
+    -- unmatched braces, backslashes, quotes).
+    when: Evaluates("lindex [list $x] 0    -- for any x")
+    ensures: completion.code = ok
+    ensures: completion.value = x
+    -- probe: puts [list "a}b"]  =>  a\}b   (backslash form, not "{a}b}")
+    -- probe: set l [list "a}b"]; puts [llength [string range $l 0 end]] => 1
+}
+
+rule MalformedListIsAnError {
+    -- Commands that parse a list reject malformed list strings
+    -- (unbalanced braces/quotes); they never silently treat them as
+    -- empty or partially parsed lists.
+    when: Evaluates("llength \"{\"")
+    ensures: completion.code = error
+    -- oracle message: unmatched open brace in list
+    -- applies to: llength, lindex, lrange, lsort, lsearch, lappend,
+    --   foreach, lmap, join, string is list, expr in/ni operands
+    -- probe: puts [string is list "{"] => 0
+    -- probe: set x "{"; lappend x a => error
+    -- probe: foreach x "{" {} => error
+}
+
+-- ── lindex / lrange ───────────────────────────────────────────────
+
+rule LindexWithoutIndexReturnsWholeList {
+    when: Evaluates("lindex {a b}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b"
+}
+
+rule LindexOutOfRangeIsEmpty {
+    when: Evaluates("lindex {a b} 5")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- end and end-N index forms are supported everywhere an index appears
+}
+
+rule LindexMultipleIndicesDescend {
+    -- lindex list i j ... descends into nested sublists.
+    when: Evaluates("lindex {{a b} {c d}} 1 0")
+    ensures: completion.code = ok
+    ensures: completion.value = "c"
+}
+
+rule LrangeIsInclusive {
+    when: Evaluates("lrange {a b c} 1 end")
+    ensures: completion.code = ok
+    ensures: completion.value = "b c"
+    -- first > last, or first past the end, yields the empty list
+}
+
+rule LsetOutOfRangeErrors {
+    when: Evaluates("lset l 5 x    -- with l = {a b c}")
+    ensures: completion.code = error
+    -- oracle message: list index out of range
+}
+
+-- ── lsort / lsearch ───────────────────────────────────────────────
+
+rule LsortDefaultIsAscendingAscii {
+    when: Evaluates("lsort {b A a}")
+    ensures: completion.code = ok
+    ensures: completion.value = "A a b"
+}
+
+rule LsortIntegerValidatesElements {
+    -- -integer and -real reject elements that do not parse as such.
+    when: Evaluates("lsort -integer {a 1}")
+    ensures: completion.code = error
+    -- oracle message: expected integer but got "a"
+    -- also: lsort -real {x 1.5} => error: expected floating-point number...
+}
+
+rule LsortUniqueUsesComparisonKey {
+    -- -unique removes duplicates according to the active comparison
+    -- (so -nocase makes "a" and "A" duplicates); among equal elements
+    -- the last one is kept.
+    when: Evaluates("lsort -unique -nocase {a A b}")
+    ensures: completion.code = ok
+    ensures: completion.value = "A b"
+}
+
+rule LsortDictionaryComparesNumericRuns {
+    when: Evaluates("lsort -dictionary {a10 a2 a1}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a1 a2 a10"
+}
+
+rule LsearchDefaultGlobReturnsIndex {
+    when: Evaluates("lsearch {a b c} b")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- -1 when not found; -all returns all matching indices;
+    -- -inline returns elements instead of indices
+}
+
+-- ── append-style commands ─────────────────────────────────────────
+
+rule LappendCreatesMissingVariable {
+    -- lappend to an unset variable creates it.
+    when: Evaluates("lappend fresh a b")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b"
+}
+
+rule ConcatJoinsWithSingleSpaces {
+    -- concat flattens its arguments, trimming leading/trailing
+    -- whitespace of each and joining with single spaces.
+    when: Evaluates("concat {a b} {  c  } {}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b c"
+}
+
+rule SplitProducesEmptyFields {
+    when: Evaluates("split \"a,b,,c\" ,")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b {} c"
+}
+
+rule JoinUsesSeparator {
+    when: Evaluates("join {a b} -")
+    ensures: completion.code = ok
+    ensures: completion.value = "a-b"
+}

@@ -6,8 +6,10 @@ use crate::interp::Interp;
 use crate::value::Value;
 
 pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() < 3 {
-        return Err(Error::wrong_args("if", 3, args.len()));
+    if args.len() < 2 {
+        return Err(Error::wrong_args_msg(
+            "wrong # args: no expression after \"if\" argument",
+        ));
     }
 
     let expr = args[1].as_str();
@@ -20,7 +22,10 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     if i >= args.len() {
-        return Err(Error::wrong_args("if", i + 1, args.len()));
+        return Err(Error::wrong_args_msg(format!(
+            "wrong # args: no script following \"{}\" argument",
+            args[i - 1].as_str()
+        )));
     }
 
     if cond.is_true() {
@@ -34,7 +39,9 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "elseif" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err(Error::wrong_args("elseif", 2, args.len() - i));
+                    return Err(Error::wrong_args_msg(
+                        "wrong # args: no expression after \"elseif\" argument",
+                    ));
                 }
                 let expr = args[i].as_str();
                 let cond = interp.eval_expr(expr)?;
@@ -44,7 +51,10 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     i += 1;
                 }
                 if i >= args.len() {
-                    return Err(Error::wrong_args("elseif", 3, 0));
+                    return Err(Error::wrong_args_msg(format!(
+                        "wrong # args: no script following \"{}\" argument",
+                        args[i - 1].as_str()
+                    )));
                 }
                 if cond.is_true() {
                     return interp.eval(args[i].as_str());
@@ -53,7 +63,14 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             "else" => {
                 if i + 1 >= args.len() {
-                    return Err(Error::wrong_args("else", 1, args.len() - i));
+                    return Err(Error::wrong_args_msg(
+                        "wrong # args: no script following \"else\" argument",
+                    ));
+                }
+                if i + 1 != args.len() - 1 {
+                    return Err(Error::wrong_args_msg(
+                        "wrong # args: extra words after \"else\" clause in \"if\" command",
+                    ));
                 }
                 return interp.eval(args[i + 1].as_str());
             }
@@ -67,10 +84,11 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    const SWITCH_USAGE: &str = "?-option ...? string ?pattern body ...? ?default body?";
     if args.len() < 3 {
         return Err(Error::wrong_args_with_usage(
             "switch", 3, args.len(),
-            "?options? string pattern body ?pattern body ...?",
+            SWITCH_USAGE,
         ));
     }
 
@@ -85,12 +103,23 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "-glob" => { mode = MatchMode::Glob; i += 1; }
             "-regexp" => { mode = MatchMode::Regexp; i += 1; }
             "--" => { i += 1; break; }
-            _ => break,
+            opt => {
+                return Err(Error::runtime(
+                    format!(
+                        "bad option \"{}\": must be -exact, -glob, -indexvar, -matchvar, -nocase, -regexp, or --",
+                        opt
+                    ),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
         }
     }
 
     if i >= args.len() {
-        return Err(Error::wrong_args("switch", 3, args.len()));
+        return Err(Error::wrong_args_with_usage(
+            "switch", 3, args.len(),
+            SWITCH_USAGE,
+        ));
     }
 
     let string = args[i].as_str();
@@ -98,9 +127,14 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let patterns: Vec<(String, String)> = if args.len() - i == 1 {
         let list = args[i].as_list().unwrap_or_default();
+        if list.is_empty() {
+            return Err(Error::wrong_args_msg(
+                "wrong # args: should be \"switch ?-option ...? string {?pattern body ...? ?default body?}\"",
+            ));
+        }
         if !list.len().is_multiple_of(2) {
             return Err(Error::runtime(
-                "switch list must have even number of elements",
+                "extra switch pattern with no body",
                 crate::error::ErrorCode::InvalidOp,
             ));
         }
@@ -109,9 +143,15 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             .map(|chunk| (chunk[0].as_str().to_string(), chunk[1].as_str().to_string()))
             .collect()
     } else {
+        if args.len() == i {
+            return Err(Error::wrong_args_with_usage(
+                "switch", 3, args.len(),
+                SWITCH_USAGE,
+            ));
+        }
         if !(args.len() - i).is_multiple_of(2) {
             return Err(Error::runtime(
-                "switch must have even number of pattern/body pairs",
+                "extra switch pattern with no body",
                 crate::error::ErrorCode::InvalidOp,
             ));
         }
@@ -162,7 +202,7 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_break(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() > 2 {
-        return Err(Error::wrong_args_with_usage("break", 1, args.len(), "?level?"));
+        return Err(Error::wrong_args_with_usage("break", 1, args.len(), ""));
     }
     if args.len() == 2 {
         let n = args[1].as_int().ok_or_else(|| {
@@ -184,7 +224,7 @@ pub fn cmd_break(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_continue(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() > 2 {
-        return Err(Error::wrong_args_with_usage("continue", 1, args.len(), "?level?"));
+        return Err(Error::wrong_args_with_usage("continue", 1, args.len(), ""));
     }
     if args.len() == 2 {
         let n = args[1].as_int().ok_or_else(|| {
@@ -296,13 +336,30 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 pub fn cmd_exit(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    let code = if args.len() > 1 { args[1].as_int().unwrap_or(0) as i32 } else { 0 };
+    if args.len() > 2 {
+        return Err(Error::wrong_args_with_usage("exit", 1, args.len(), "?returnCode?"));
+    }
+    let code = if args.len() > 1 {
+        args[1].as_int().ok_or_else(|| {
+            Error::runtime(
+                format!("expected integer but got \"{}\"", args[1].as_str()),
+                crate::error::ErrorCode::Generic,
+            )
+        })? as i32
+    } else {
+        0
+    };
     Err(Error::exit(Some(code)))
 }
 
 pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() < 2 {
-        return Err(Error::wrong_args("catch", 2, args.len()));
+    if args.len() < 2 || args.len() > 4 {
+        return Err(Error::wrong_args_with_usage(
+            "catch",
+            2,
+            args.len(),
+            "script ?resultVarName? ?optionVarName?",
+        ));
     }
 
     let script = args[1].as_str();
@@ -324,12 +381,7 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // Tcl: the result variable receives the result payload itself,
                 // not a rendering of the error (e.g. `return hi` → "hi",
                 // `break` → "").
-                let msg = match &e {
-                    Error::ControlFlow { value: Some(v), .. } => v.as_str().to_string(),
-                    Error::ControlFlow { value: None, .. } => String::new(),
-                    _ => e.to_string(),
-                };
-                interp.set_var(var, Value::from_str(&msg))?;
+                interp.set_var(var, Value::from_str(&e.message_text()))?;
             }
             let code = if e.is_return() { 2 }
             else if e.is_break() { 3 }
@@ -337,7 +389,13 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             else { 1 };
             if let Some(ov) = opts_var {
                 let level = if e.is_return() { 0 } else { 1 };
-                interp.set_var(ov, return_options_dict(code, level))?;
+                let opts = if code == 1 {
+                    // Tcl error completions carry -errorcode and -errorinfo.
+                    error_options_dict(1, 0, &e, script)
+                } else {
+                    return_options_dict(code, level)
+                };
+                interp.set_var(ov, opts)?;
             }
             Ok(Value::from_int(code))
         }
@@ -350,11 +408,60 @@ fn return_options_dict(code: i64, level: i64) -> Value {
     Value::from_str(&format!("-code {} -level {}", code, level))
 }
 
-pub fn cmd_error(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() < 2 {
-        return Err(Error::wrong_args("error", 2, args.len()));
+/// Tcl return-options dict for an error completion: adds `-errorcode`
+/// and `-errorinfo` next to `-code`/`-level`.
+fn error_options_dict(code: i64, level: i64, err: &Error, script: &str) -> Value {
+    let error_code = err.tcl_error_code();
+    let error_info = error_info_for(err, script);
+    Value::from_str(&format!(
+        "-code {} -level {} -errorcode {} -errorinfo {}",
+        code,
+        level,
+        crate::value::tcl_quote(&error_code),
+        crate::value::tcl_quote(&error_info),
+    ))
+}
+
+/// Build Tcl-style `-errorinfo`: an explicitly supplied `-errorinfo`
+/// (from `error msg info` or `return -errorinfo`) is used verbatim;
+/// otherwise synthesize the message plus a `while executing` /
+/// `invoked from within` line quoting the failing script.
+fn error_info_for(err: &Error, script: &str) -> String {
+    if let Error::ControlFlow { error_info: Some(info), .. } = err {
+        if !info.is_empty() {
+            return info.clone();
+        }
     }
-    Err(Error::Msg(args[1].as_str().to_string()))
+    let how = if matches!(err, Error::DivisionByZero) {
+        "invoked from within"
+    } else {
+        "while executing"
+    };
+    format!("{}\n    {}\n\"{}\"", err.message_text(), how, script)
+}
+
+pub fn cmd_error(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(Error::wrong_args_with_usage(
+            "error",
+            2,
+            args.len(),
+            "message ?errorInfo? ?errorCode?",
+        ));
+    }
+    let msg = args[1].as_str().to_string();
+    let error_info = args.get(2).map(|v| v.as_str().to_string());
+    let error_code = args.get(3).map(|v| v.as_str().to_string());
+    if error_info.is_none() && error_code.is_none() {
+        return Err(Error::Msg(msg));
+    }
+    Err(Error::ControlFlow {
+        kind: crate::error::ControlFlow::Error,
+        value: Some(Value::from_str(&msg)),
+        level: 1,
+        error_info,
+        error_code,
+    })
 }
 
 /// try body ?on code varList script? ... ?finally script?
@@ -364,7 +471,7 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "try",
             2,
             args.len(),
-            "body ?on code varList script? ... ?finally script?",
+            "body ?handler ...? ?finally script?",
         ));
     }
 
@@ -375,15 +482,7 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Determine the exit code and result value
     let (exit_code, result_value) = match &body_result {
         Ok(v) => (0i32, v.as_str().to_string()),
-        Err(e) => {
-            let code = e.return_code();
-            let msg = match e {
-                Error::ControlFlow { value: Some(v), .. } => v.as_str().to_string(),
-                Error::ControlFlow { value: None, .. } => String::new(),
-                _ => e.to_string(),
-            };
-            (code, msg)
-        }
+        Err(e) => (e.return_code(), e.message_text()),
     };
 
     // Parse on/finally handlers
@@ -397,11 +496,8 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "on" => {
                 // on code varList script
                 if i + 3 >= args.len() {
-                    return Err(Error::wrong_args_with_usage(
-                        "try",
-                        4,
-                        args.len() - i,
-                        "on code varList script",
+                    return Err(Error::wrong_args_msg(
+                        "wrong # args to on clause: must be \"... on code variableList script\"",
                     ));
                 }
                 let code_spec = args[i + 1].as_str();
@@ -430,9 +526,13 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     }
                     if let Some(opts_var) = vars.get(1) {
                         if !opts_var.is_empty() {
-                            // Build opts dict: -code N -level 0
-                            let opts = format!("-code {} -level 0", exit_code);
-                            interp.set_var(opts_var, Value::from_str(&opts))?;
+                            let opts = match &body_result {
+                                Err(e) if exit_code == 1 => {
+                                    error_options_dict(exit_code as i64, 0, e, body)
+                                }
+                                _ => return_options_dict(exit_code as i64, 0),
+                            };
+                            interp.set_var(opts_var, opts)?;
                         }
                     }
                     handler_result = Some(interp.eval(handler_body));
@@ -441,11 +541,8 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             "finally" => {
                 if i + 1 >= args.len() {
-                    return Err(Error::wrong_args_with_usage(
-                        "try",
-                        2,
-                        args.len() - i,
-                        "finally script",
+                    return Err(Error::wrong_args_msg(
+                        "wrong # args to finally clause: must be \"... finally script\"",
                     ));
                 }
                 finally_script = Some(args[i + 1].as_str());
@@ -453,7 +550,7 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             _ => {
                 return Err(Error::runtime(
-                    format!("bad handler \"{}\": must be on, trap, or finally", keyword),
+                    format!("bad handler type \"{}\": must be finally, on, or trap", keyword),
                     crate::error::ErrorCode::Generic,
                 ));
             }

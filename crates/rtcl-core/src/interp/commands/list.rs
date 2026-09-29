@@ -4,38 +4,192 @@
 
 use crate::error::{Error, Result};
 use crate::interp::Interp;
-use crate::types::parse_index;
-use crate::value::Value;
+use crate::value::{is_tcl_space, Value};
+
+/// Build an error whose message survives `catch` verbatim (the interp
+/// stores `e.to_string()` into the result variable, and `Error::Msg`
+/// displays as exactly the payload).
+fn tcl_err(msg: impl Into<String>) -> Error {
+    Error::Msg(msg.into())
+}
+
+/// Tcl's wrong-#-args error text: `wrong # args: should be "name usage"`.
+fn wrong_args(name: &str, usage: &str) -> Error {
+    tcl_err(format!("wrong # args: should be \"{} {}\"", name, usage))
+}
+
+/// Mirror Tcl setting `::errorCode` at the point an error is raised.
+fn set_error_code(interp: &mut Interp, code: &str) {
+    interp.globals.insert("errorCode".to_string(), Value::from_str(code));
+}
+
+/// Parse a command argument as a list; malformed lists raise Tcl's error
+/// (`unmatched open brace in list` etc.) with the matching `::errorCode`.
+fn strict_list(interp: &mut Interp, v: &Value) -> Result<Vec<Value>> {
+    v.as_list_strict().map_err(|e| {
+        set_error_code(interp, e.code);
+        tcl_err(e.message)
+    })
+}
+
+/// Tcl's bad-index error (`TCL VALUE INDEX`), including the
+/// "(looks like invalid octal number)" hint Tcl appends when the index
+/// resembles a malformed legacy octal literal (TclCheckBadOctal).
+fn bad_index(interp: &mut Interp, idx: &str) -> Error {
+    set_error_code(interp, "TCL VALUE INDEX");
+    let mut msg = format!(
+        "bad index \"{}\": must be integer?[+-]integer? or end?[+-]integer?",
+        idx
+    );
+    let check = idx.strip_prefix("end-").unwrap_or(idx);
+    if looks_like_bad_octal(check) {
+        msg.push_str(" (looks like invalid octal number)");
+    }
+    tcl_err(msg)
+}
+
+/// TclCheckBadOctal: optional whitespace/sign, then `0` (or `0o`) followed
+/// by nothing but decimal digits — i.e. a plausible legacy-octal attempt.
+fn looks_like_bad_octal(s: &str) -> bool {
+    let t = trim_tcl_space(s);
+    let t = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let Some(t) = t.strip_prefix('0') else { return false };
+    let t = t.strip_prefix(['o', 'O']).unwrap_or(t);
+    let t = t.trim_end_matches(|c: char| is_tcl_space(c as u8));
+    !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Tcl's whitespace set (also the list element separators).
+fn trim_tcl_space(s: &str) -> &str {
+    s.trim_matches(|c: char| is_tcl_space(c as u8))
+}
+
+/// Scan a Tcl integer at the start of `s` (TclParseNumber integer rules:
+/// optional sign; `0x`/`0b`/`0o` radix prefixes; a leading `0` followed by
+/// more characters selects legacy octal). Returns (value, bytes consumed).
+fn scan_tcl_int(s: &str) -> Option<(i64, usize)> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut neg = false;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        neg = b[i] == b'-';
+        i += 1;
+    }
+    let (radix, start) = if b.len() - i >= 2 && b[i] == b'0' && matches!(b[i + 1], b'x' | b'X') {
+        (16, i + 2)
+    } else if b.len() - i >= 2 && b[i] == b'0' && matches!(b[i + 1], b'b' | b'B') {
+        (2, i + 2)
+    } else if b.len() - i >= 2 && b[i] == b'0' && matches!(b[i + 1], b'o' | b'O') {
+        (8, i + 2)
+    } else if i < b.len() && b[i] == b'0' && i + 1 < b.len() {
+        (8, i + 1)
+    } else {
+        (10, i)
+    };
+    let mut n = start;
+    while n < b.len() && (b[n] as char).is_digit(radix) {
+        n += 1;
+    }
+    if n == start {
+        // A bare leading `0` is the value zero, even in octal position.
+        if radix == 8 && start == i + 1 {
+            return Some((0, i + 1));
+        }
+        return None;
+    }
+    let val = i64::from_str_radix(&s[start..n], radix).ok()?;
+    Some((if neg { -val } else { val }, n))
+}
+
+/// Tcl_GetInt semantics: the whole (whitespace-trimmed) string is an integer.
+fn tcl_get_int(s: &str) -> Option<i64> {
+    let t = trim_tcl_space(s);
+    let (v, used) = scan_tcl_int(t)?;
+    if used == t.len() { Some(v) } else { None }
+}
+
+/// Parse a Tcl index (`integer?[+-]integer?` or `end?[+-]integer?`),
+/// resolving `end` against `len`. The result may be negative or >= len;
+/// callers clamp or report out-of-range as appropriate.
+/// Mirrors Tcl 8.6's TclGetIntForIndex.
+fn parse_tcl_index(s: &str, len: usize) -> Option<i64> {
+    // 1. Plain integer.
+    if let Some(v) = tcl_get_int(s) {
+        return Some(v);
+    }
+    // 2. end?[+-]integer? — no leading whitespace allowed before "end".
+    if let Some(rest) = s.strip_prefix("end") {
+        if rest.is_empty() {
+            return Some(len as i64 - 1);
+        }
+        let rb = rest.as_bytes();
+        if rb.len() >= 2 && (rb[0] == b'+' || rb[0] == b'-') && !is_tcl_space(rb[1]) {
+            if let Some(off) = tcl_get_int(&rest[1..]) {
+                let off = if rb[0] == b'-' { -off } else { off };
+                return Some(len as i64 - 1 + off);
+            }
+        }
+        return None;
+    }
+    // 3. integer[+-]integer — leading whitespace allowed before the number.
+    let t = trim_tcl_space(s);
+    let (first, used) = scan_tcl_int(t)?;
+    let rest = &t[used..];
+    let sign = *rest.as_bytes().first()?;
+    if sign != b'+' && sign != b'-' {
+        return None;
+    }
+    if rest.len() < 2 || is_tcl_space(rest.as_bytes()[1]) {
+        return None;
+    }
+    let second = tcl_get_int(&rest[1..])?;
+    Some(if sign == b'+' { first + second } else { first - second })
+}
 
 pub fn cmd_list(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::from_list(&args[1..]))
 }
 
-pub fn cmd_llength(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_llength(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::wrong_args("llength", 2, args.len()));
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("llength", "list"));
     }
-    let list = args[1].as_list().unwrap_or_default();
+    let list = strict_list(interp, &args[1])?;
     Ok(Value::from_int(list.len() as i64))
 }
 
-pub fn cmd_lindex(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() < 3 {
-        return Err(Error::wrong_args("lindex", 3, args.len()));
+pub fn cmd_lindex(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lindex", "list ?index ...?"));
+    }
+    // Tcl: with no index, the list is returned unparsed.
+    if args.len() == 2 {
+        return Ok(args[1].clone());
     }
     let mut current = args[1].clone();
     // Tcl: lindex list i j k ... descends into nested lists.
-    // A single index argument may itself be a list of indices.
+    // A single index argument is itself parsed as a list of indices;
+    // a malformed one is treated as a single index string.
     let indices: Vec<Value> = if args.len() == 3 {
-        args[2].as_list().unwrap_or_else(|| vec![args[2].clone()])
+        match args[2].as_list() {
+            Some(l) => l,
+            None => vec![args[2].clone()],
+        }
     } else {
         args[2..].to_vec()
     };
     for idx_val in &indices {
-        let list = current.as_list().unwrap_or_default();
-        match parse_index(idx_val.as_str(), list.len()) {
-            Some(i) if i < list.len() => current = list[i].clone(),
-            _ => return Ok(Value::empty()),
+        let list = strict_list(interp, &current)?;
+        let idx_str = idx_val.as_str();
+        let len = list.len();
+        match parse_tcl_index(idx_str, len) {
+            Some(raw) if raw >= 0 && (raw as usize) < len => {
+                current = list[raw as usize].clone();
+            }
+            Some(_) => return Ok(Value::empty()),
+            None => return Err(bad_index(interp, idx_str)),
         }
     }
     Ok(current)
@@ -43,14 +197,17 @@ pub fn cmd_lindex(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_lappend(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(Error::wrong_args("lappend", 2, args.len()));
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lappend", "varName ?value ...?"));
     }
     let var_name = args[1].as_str();
-    let mut list = interp
-        .get_var(var_name)
-        .ok()
-        .and_then(|v| v.as_list())
-        .unwrap_or_default();
+    let mut list = match interp.get_var(var_name) {
+        Ok(v) => {
+            let v = v.clone();
+            strict_list(interp, &v)?
+        }
+        Err(_) => Vec::new(),
+    };
     for arg in &args[2..] {
         list.push(arg.clone());
     }
@@ -58,29 +215,48 @@ pub fn cmd_lappend(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     interp.set_var(var_name, result.clone())
 }
 
-pub fn cmd_lrange(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_lrange(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 4 {
-        return Err(Error::wrong_args_with_usage("lrange", 4, args.len(), "list first last"));
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lrange", "list first last"));
     }
-    let list = args[1].as_list().unwrap_or_default();
-    let first = parse_index(args[2].as_str(), list.len()).unwrap_or(0);
-    let end = parse_index(args[3].as_str(), list.len()).unwrap_or(0);
+    let list = strict_list(interp, &args[1])?;
+    let len = list.len();
+    let first_raw = match parse_tcl_index(args[2].as_str(), len) {
+        Some(r) => r,
+        None => return Err(bad_index(interp, args[2].as_str())),
+    };
+    let last_raw = match parse_tcl_index(args[3].as_str(), len) {
+        Some(r) => r,
+        None => return Err(bad_index(interp, args[3].as_str())),
+    };
 
-    if first <= end && first < list.len() {
-        let result: Vec<Value> = list[first..=end.min(list.len() - 1)].to_vec();
+    // Tcl clamps: first < 0 → 0; last >= len → len-1; empty when the
+    // resulting range is backwards or starts past the end.
+    let first = first_raw.max(0);
+    let last = last_raw.min(len as i64 - 1);
+    if first <= last && first < len as i64 {
+        let result: Vec<Value> = list[first as usize..=last as usize].to_vec();
         Ok(Value::from_list(&result))
     } else {
         Ok(Value::empty())
     }
 }
 
-pub fn cmd_linsert(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_linsert(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
-        return Err(Error::wrong_args_with_usage("linsert", 3, args.len(), "list index ?element ...?"));
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("linsert", "list index ?element ...?"));
     }
-    let list = args[1].as_list().unwrap_or_default();
-    let index = parse_index(args[2].as_str(), list.len()).unwrap_or(list.len());
-    let index = index.min(list.len());
+    let list = strict_list(interp, &args[1])?;
+    let len = list.len();
+    // Tcl resolves the index against len+1 (`end` means "after the last
+    // element") and clamps into [0, len].
+    let raw = match parse_tcl_index(args[2].as_str(), len + 1) {
+        Some(r) => r,
+        None => return Err(bad_index(interp, args[2].as_str())),
+    };
+    let index = raw.clamp(0, len as i64) as usize;
     let elements: Vec<Value> = args[3..].to_vec();
     let mut result = Vec::with_capacity(list.len() + elements.len());
     result.extend(list[..index].iter().cloned());
@@ -89,28 +265,44 @@ pub fn cmd_linsert(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::from_list(&result))
 }
 
-pub fn cmd_lreplace(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_lreplace(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 4 {
-        return Err(Error::wrong_args_with_usage("lreplace", 4, args.len(), "list first last ?element ...?"));
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lreplace", "list first last ?element ...?"));
     }
-    let list = args[1].as_list().unwrap_or_default();
-    let first = parse_index(args[2].as_str(), list.len()).unwrap_or(0).min(list.len());
-    let last = parse_index(args[3].as_str(), list.len()).unwrap_or(0).min(list.len().saturating_sub(1));
+    let list = strict_list(interp, &args[1])?;
+    let len = list.len();
+    let first_raw = match parse_tcl_index(args[2].as_str(), len) {
+        Some(r) => r,
+        None => return Err(bad_index(interp, args[2].as_str())),
+    };
+    let last_raw = match parse_tcl_index(args[3].as_str(), len) {
+        Some(r) => r,
+        None => return Err(bad_index(interp, args[3].as_str())),
+    };
 
-    let mut result = Vec::with_capacity(list.len());
+    // Tcl clamps first into [0, len] and last into [-inf, len-1];
+    // last < first is a pure insertion at `first`.
+    let first = first_raw.clamp(0, len as i64) as usize;
+    let last = last_raw.min(len as i64 - 1);
+
+    let mut result = Vec::with_capacity(list.len() + args.len() - 4);
     result.extend(list[..first].iter().cloned());
     result.extend(args[4..].iter().cloned());
-    if last + 1 < list.len() {
-        result.extend(list[last + 1..].iter().cloned());
+    if last >= first as i64 {
+        result.extend(list[(last + 1) as usize..].iter().cloned());
+    } else {
+        result.extend(list[first..].iter().cloned());
     }
     Ok(Value::from_list(&result))
 }
 
 pub fn cmd_lassign(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() < 3 {
-        return Err(Error::wrong_args_with_usage("lassign", 3, args.len(), "list varname ?varname ...?"));
+    if args.len() < 2 {
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lassign", "list ?varName ...?"));
     }
-    let list = args[1].as_list().unwrap_or_default();
+    let list = strict_list(interp, &args[1])?;
     let vars: Vec<&str> = args[2..].iter().map(|v| v.as_str()).collect();
     for (i, var) in vars.iter().enumerate() {
         let value = list.get(i).cloned().unwrap_or_else(Value::empty);
@@ -123,11 +315,27 @@ pub fn cmd_lassign(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
-pub fn cmd_lrepeat(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_lrepeat(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(Error::wrong_args_with_usage("lrepeat", 2, args.len(), "count ?element ...?"));
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lrepeat", "count ?value ...?"));
     }
-    let count = args[1].as_int().unwrap_or(0) as usize;
+    let count = match args[1].as_int() {
+        Some(n) => n,
+        None => {
+            return Err(tcl_err(format!(
+                "expected integer but got \"{}\"",
+                args[1].as_str()
+            )));
+        }
+    };
+    if count < 0 {
+        return Err(tcl_err(format!(
+            "bad count \"{}\": must be integer >= 0",
+            args[1].as_str()
+        )));
+    }
+    let count = count as usize;
     let elements: Vec<Value> = args[2..].to_vec();
     if elements.is_empty() {
         return Ok(Value::empty());
@@ -139,11 +347,12 @@ pub fn cmd_lrepeat(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::from_list(&result))
 }
 
-pub fn cmd_lreverse(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_lreverse(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::wrong_args("lreverse", 2, args.len()));
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lreverse", "list"));
     }
-    let mut list = args[1].as_list().unwrap_or_default();
+    let mut list = strict_list(interp, &args[1])?;
     list.reverse();
     Ok(Value::from_list(&list))
 }
@@ -159,34 +368,35 @@ pub fn cmd_concat(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::from_str(&result))
 }
 
-pub fn cmd_split(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_split(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(Error::wrong_args_with_usage("split", 2, args.len(), "string ?splitChars?"));
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("split", "string ?splitChars?"));
     }
     let string = args[1].as_str();
-    if args.len() == 2 {
-        let result: Vec<Value> = string.split_whitespace().map(Value::from_str).collect();
-        Ok(Value::from_list(&result))
-    } else {
-        let split_chars = args[2].as_str();
-        if split_chars.is_empty() {
-            let result: Vec<Value> = string.chars().map(|c| Value::from_str(&c.to_string())).collect();
-            Ok(Value::from_list(&result))
-        } else {
-            let result: Vec<Value> = string
-                .split(|c| split_chars.contains(c))
-                .map(Value::from_str)
-                .collect();
-            Ok(Value::from_list(&result))
-        }
+    if string.is_empty() {
+        return Ok(Value::empty());
     }
+    let split_chars = if args.len() == 3 { args[2].as_str() } else { " \t\n\r" };
+    let result: Vec<Value> = if split_chars.is_empty() {
+        string.chars().map(|c| Value::from_str(&c.to_string())).collect()
+    } else {
+        // Tcl splits on each splitChars byte individually, producing
+        // empty fields for adjacent separators.
+        string
+            .split(|c| split_chars.contains(c))
+            .map(Value::from_str)
+            .collect()
+    };
+    Ok(Value::from_list(&result))
 }
 
-pub fn cmd_join(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_join(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(Error::wrong_args_with_usage("join", 2, args.len(), "list ?joinString?"));
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("join", "list ?joinString?"));
     }
-    let list = args[1].as_list().unwrap_or_default();
+    let list = strict_list(interp, &args[1])?;
     let sep = if args.len() == 3 { args[2].as_str() } else { " " };
     let result: String = list.iter().map(|v| v.as_str()).collect::<Vec<&str>>().join(sep);
     Ok(Value::from_str(&result))
@@ -196,10 +406,8 @@ pub fn cmd_join(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// Usage: lmap varList list ?varList list ...? body
 pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 4 || !args.len().is_multiple_of(2) {
-        return Err(Error::wrong_args_with_usage(
-            "lmap", 4, args.len(),
-            "varList list ?varList list ...? body",
-        ));
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lmap", "varList list ?varList list ...? command"));
     }
 
     let body = args[args.len() - 1].as_str();
@@ -212,9 +420,13 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut groups: Vec<VarGroup> = Vec::new();
     let mut i = 1;
     while i < args.len() - 1 {
-        let var_list = args[i].as_list().unwrap_or_else(|| vec![args[i].clone()]);
+        let var_list = strict_list(interp, &args[i])?;
+        if var_list.is_empty() {
+            set_error_code(interp, "TCL OPERATION LMAP NEEDVARS");
+            return Err(tcl_err("lmap varlist is empty"));
+        }
         let vars: Vec<String> = var_list.iter().map(|v| v.as_str().to_string()).collect();
-        let data = args[i + 1].as_list().unwrap_or_default();
+        let data = strict_list(interp, &args[i + 1])?;
         groups.push(VarGroup { vars, data });
         i += 2;
     }
@@ -253,109 +465,85 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// Set an element in a list variable.
 pub fn cmd_lset(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
-        return Err(Error::wrong_args_with_usage(
-            "lset",
-            3,
-            args.len(),
-            "varName ?index ...? value",
-        ));
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lset", "listVar ?index? ?index ...? value"));
     }
 
     let var_name = args[1].as_str();
-    let value = &args[args.len() - 1];
+    let value = args[args.len() - 1].clone();
 
+    // The variable must exist even when it is replaced wholesale.
     let current = interp.get_var(var_name)?.clone();
-    let mut list = current.as_list().unwrap_or_default();
 
     if args.len() == 3 {
         // lset var value — replace entire list with value
         interp.set_var(var_name, value.clone())?;
-        return Ok(value.clone());
+        return Ok(value);
     }
 
     // Single index case: lset var index value
     // Multi-index: lset var i1 i2 ... value (nested lists)
-    let indices: Vec<&Value> = args[2..args.len() - 1].iter().collect();
-
-    if indices.len() == 1 {
-        // Check if the single index is actually a list of indices
-        let idx_list = indices[0].as_list().unwrap_or_default();
-        if idx_list.len() > 1 {
-            // Treat as nested indices: lset var {0 1} value
-            let result = lset_nested(&list, &idx_list, value)?;
-            interp.set_var(var_name, result.clone())?;
-            Ok(result)
-        } else {
-            let idx_str = indices[0].as_str();
-            let len = list.len();
-            let idx = resolve_index(idx_str, len)?;
-            if idx >= len {
-                return Err(Error::runtime(
-                    "list index out of range",
-                    crate::error::ErrorCode::Generic,
-                ));
-            }
-            list[idx] = value.clone();
-            let result = Value::from_list(&list);
-            interp.set_var(var_name, result.clone())?;
-            Ok(result)
+    // A single index argument is itself parsed as a list of indices;
+    // a malformed one is treated as a single index string.
+    let indices: Vec<Value> = if args.len() == 4 {
+        match args[2].as_list() {
+            Some(l) => l,
+            None => vec![args[2].clone()],
         }
     } else {
-        // Multiple separate index args: lset var i1 i2 ... value
-        let idx_values: Vec<Value> = indices.iter().map(|v| (*v).clone()).collect();
-        let result = lset_nested(&list, &idx_values, value)?;
-        interp.set_var(var_name, result.clone())?;
-        Ok(result)
+        args[2..args.len() - 1].to_vec()
+    };
+
+    if indices.is_empty() {
+        // lset var {} value — replace the whole variable
+        interp.set_var(var_name, value.clone())?;
+        return Ok(value);
     }
+
+    let list = strict_list(interp, &current)?;
+    let result = lset_nested(interp, &list, &indices, &value)?;
+    interp.set_var(var_name, result.clone())?;
+    Ok(result)
 }
 
 /// Recursively set a nested element in a list.
-fn lset_nested(list: &[Value], indices: &[Value], value: &Value) -> Result<Value> {
+fn lset_nested(interp: &mut Interp, list: &[Value], indices: &[Value], value: &Value) -> Result<Value> {
     if indices.is_empty() {
         return Ok(value.clone());
     }
     let idx_str = indices[0].as_str();
     let len = list.len();
-    let idx = resolve_index(idx_str, len)?;
-    if idx >= len {
-        return Err(Error::runtime(
-            "list index out of range".to_string(),
-            crate::error::ErrorCode::Generic,
-        ));
+    let raw = match parse_tcl_index(idx_str, len) {
+        Some(r) => r,
+        None => return Err(bad_index(interp, idx_str)),
+    };
+    // Tcl allows idx == len: the list grows by one element.
+    if raw < 0 || raw > len as i64 {
+        set_error_code(interp, "TCL OPERATION LSET BADINDEX");
+        return Err(tcl_err("list index out of range"));
     }
+    let idx = raw as usize;
     let mut new_list = list.to_vec();
     if indices.len() == 1 {
-        new_list[idx] = value.clone();
+        if idx == len {
+            new_list.push(value.clone());
+        } else {
+            new_list[idx] = value.clone();
+        }
     } else {
-        let sub_list = new_list[idx].as_list().unwrap_or_default();
-        new_list[idx] = lset_nested(&sub_list, &indices[1..], value)?;
+        let sub_list = if idx == len {
+            Vec::new()
+        } else {
+            strict_list(interp, &new_list[idx])?
+        };
+        let new_sub = lset_nested(interp, &sub_list, &indices[1..], value)?;
+        if idx == len {
+            new_list.push(new_sub);
+        } else {
+            new_list[idx] = new_sub;
+        }
     }
     Ok(Value::from_list(&new_list))
-}
-
-fn resolve_index(idx_str: &str, len: usize) -> Result<usize> {
-    if idx_str == "end" {
-        if len == 0 {
-            return Err(Error::runtime("list index out of range", crate::error::ErrorCode::Generic));
-        }
-        return Ok(len - 1);
-    }
-    if let Some(rest) = idx_str.strip_prefix("end-") {
-        let n: usize = rest.parse().map_err(|_| {
-            Error::runtime(format!("bad index \"{}\"", idx_str), crate::error::ErrorCode::Generic)
-        })?;
-        if n >= len {
-            return Err(Error::runtime("list index out of range", crate::error::ErrorCode::Generic));
-        }
-        return Ok(len - 1 - n);
-    }
-    let idx: i64 = idx_str.parse().map_err(|_| {
-        Error::runtime(format!("bad index \"{}\"", idx_str), crate::error::ErrorCode::Generic)
-    })?;
-    if idx < 0 {
-        return Err(Error::runtime("list index out of range", crate::error::ErrorCode::Generic));
-    }
-    Ok(idx as usize)
 }
 
 /// `lsubst ?-command? ?-variable? ?-nobackslashes? ?-nocommands? ?-novariables? string` —

@@ -510,6 +510,21 @@ impl Value {
         }
     }
 
+    /// Like `as_list()`, but malformed list strings yield Tcl's parse
+    /// error (message + `::errorCode`) instead of `None`.
+    pub fn as_list_strict(&self) -> std::result::Result<Vec<Value>, ListParseError> {
+        match &self.inner.rep {
+            InternalRep::List(items) => Ok(items.clone()),
+            InternalRep::Dict(map) => {
+                Ok(map.iter().flat_map(|(k, v)| [Value::from_str(k), v.clone()]).collect())
+            }
+            _ => {
+                let s = self.to_str();
+                parse_list_full(&s)
+            }
+        }
+    }
+
     /// Get a reference to the dict's DictMap if the internal rep is Dict.
     /// Zero-copy — does not clone.
     pub fn as_dict_ref(&self) -> Option<&DictMap> {
@@ -732,31 +747,166 @@ fn serialize_dict(map: &DictMap) -> String {
 }
 
 /// Serialize a slice of values into a Tcl list string.
+///
+/// This is a faithful port of Tcl 8.6's `TclScanElement` /
+/// `TclConvertElement` / `Tcl_Merge` (generic/tclUtil.c, COMPAT=1): each
+/// element is emitted verbatim, brace-quoted, or backslash-escaped
+/// according to its contents; elements are joined with single spaces; a
+/// leading `#` is quoted only for the first element.
 fn serialize_list(items: &[Value]) -> String {
-    let mut result = String::new();
+    let mut out: Vec<u8> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         if i > 0 {
-            result.push(' ');
+            out.push(b' ');
         }
-        let s = item.to_str();
-        if needs_braces(&s) {
-            result.push('{');
-            result.push_str(&s);
-            result.push('}');
-        } else if needs_quotes(&s) {
-            result.push('"');
-            for c in s.chars() {
-                if c == '"' || c == '\\' {
-                    result.push('\\');
+        convert_element(&mut out, item.as_str().as_bytes(), i == 0);
+    }
+    // Safe: item strings are valid UTF-8, we only insert ASCII bytes and
+    // never split a multi-byte sequence.
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// Tcl's list whitespace: the only bytes that separate list elements.
+pub fn is_tcl_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// How a list element must be quoted (mirrors Tcl's CONVERT_* flags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConvMode {
+    /// No quoting needed.
+    None,
+    /// Enclose in braces.
+    Brace,
+    /// Backslash-escape every special character (including braces).
+    Escape,
+    /// Backslash-escape specials except braces (historical Tcl mode used
+    /// when quoting is needed solely due to `]` or `"`).
+    Mask,
+}
+
+/// Port of Tcl's `TclScanElement`: decide how `s` must be quoted.
+fn scan_element(s: &[u8]) -> ConvMode {
+    if s.is_empty() {
+        return ConvMode::Brace;
+    }
+    let mut forbid_none = false;
+    let mut require_escape = false;
+    let mut prefer_escape = false;
+    let mut prefer_brace = false;
+    let mut nesting: i64 = 0;
+
+    if s[0] == b'{' || s[0] == b'"' {
+        // Leading character would be misread as list syntax.
+        forbid_none = true;
+        prefer_brace = true;
+    }
+
+    let mut i = 0;
+    while i < s.len() {
+        match s[i] {
+            b'{' => nesting += 1,
+            b'}' => {
+                nesting -= 1;
+                if nesting < 0 {
+                    require_escape = true;
                 }
-                result.push(c);
             }
-            result.push('"');
+            b']' | b'"' => {
+                forbid_none = true;
+                prefer_escape = true;
+            }
+            b'[' | b'$' | b';' => {
+                forbid_none = true;
+                prefer_brace = true;
+            }
+            b'\\' => {
+                if i + 1 == s.len() {
+                    // Final backslash cannot be brace-quoted.
+                    require_escape = true;
+                } else if s[i + 1] == b'\n' {
+                    // Backslash-newline cannot be brace-quoted.
+                    require_escape = true;
+                    i += 1;
+                } else if matches!(s[i + 1], b'{' | b'}' | b'\\') {
+                    i += 1;
+                }
+                forbid_none = true;
+                prefer_brace = true;
+            }
+            c if is_tcl_space(c) => {
+                forbid_none = true;
+                prefer_brace = true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if nesting != 0 {
+        require_escape = true;
+    }
+    if require_escape {
+        ConvMode::Escape
+    } else if forbid_none {
+        if prefer_escape && !prefer_brace {
+            ConvMode::Mask
         } else {
-            result.push_str(&s);
+            ConvMode::Brace
+        }
+    } else {
+        ConvMode::None
+    }
+}
+
+/// Port of Tcl's `TclConvertElement`: append the list representation of
+/// `s` to `out`. `quote_hash` mirrors `!TCL_DONT_QUOTE_HASH` (only true
+/// for the first element of a list).
+fn convert_element(out: &mut Vec<u8>, s: &[u8], quote_hash: bool) {
+    if s.is_empty() {
+        out.extend_from_slice(b"{}");
+        return;
+    }
+    let mut mode = scan_element(s);
+    let mut start = 0;
+    if quote_hash && s[0] == b'#' {
+        if mode == ConvMode::Escape {
+            out.extend_from_slice(b"\\#");
+            start = 1;
+        } else {
+            mode = ConvMode::Brace;
         }
     }
-    result
+    match mode {
+        ConvMode::None => out.extend_from_slice(&s[start..]),
+        ConvMode::Brace => {
+            out.push(b'{');
+            out.extend_from_slice(&s[start..]);
+            out.push(b'}');
+        }
+        ConvMode::Escape | ConvMode::Mask => {
+            for &b in &s[start..] {
+                match b {
+                    b']' | b'[' | b'$' | b';' | b' ' | b'\\' | b'"' => {
+                        out.push(b'\\');
+                        out.push(b);
+                    }
+                    b'{' | b'}' => {
+                        if mode == ConvMode::Escape {
+                            out.push(b'\\');
+                        }
+                        out.push(b);
+                    }
+                    0x0c => out.extend_from_slice(b"\\f"),
+                    b'\n' => out.extend_from_slice(b"\\n"),
+                    b'\r' => out.extend_from_slice(b"\\r"),
+                    b'\t' => out.extend_from_slice(b"\\t"),
+                    0x0b => out.extend_from_slice(b"\\v"),
+                    _ => out.push(b),
+                }
+            }
+        }
+    }
 }
 
 /// Check if a string needs braces for list representation
@@ -783,101 +933,300 @@ fn needs_braces(s: &str) -> bool {
     brace_depth != 0
 }
 
-/// Check if a string needs quotes for list representation
-fn needs_quotes(s: &str) -> bool {
-    s.contains('"') || s.contains('\\')
+/// Parse a string as a Tcl list. Returns `None` for malformed lists
+/// (unbalanced braces/quotes, junk after a braced or quoted element).
+fn parse_list(s: &str) -> Option<Vec<Value>> {
+    parse_list_full(s).ok()
 }
 
-/// Parse a string as a Tcl list
-fn parse_list(s: &str) -> Option<Vec<Value>> {
-    let mut result = Vec::new();
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
+/// Error produced when parsing a malformed Tcl list string.
+///
+/// `message` matches Tcl 8.6's error text (e.g. "unmatched open brace in
+/// list"); `code` is the corresponding `::errorCode` value
+/// (e.g. "TCL VALUE LIST BRACE").
+#[derive(Debug, Clone)]
+pub struct ListParseError {
+    pub message: String,
+    pub code: &'static str,
+}
 
-    while i < chars.len() {
-        // Skip whitespace
-        while i < chars.len() && chars[i].is_whitespace() {
+/// Parse a string as a Tcl list, reporting Tcl's error on malformed input.
+///
+/// This is a port of Tcl 8.6's `FindElement` (generic/tclUtil.c): elements
+/// are separated by ASCII whitespace; braced elements keep their contents
+/// verbatim (backslashes only affect brace counting); quoted and bare
+/// elements undergo backslash substitution (`TclCopyAndCollapse`).
+pub fn parse_list_full(s: &str) -> std::result::Result<Vec<Value>, ListParseError> {
+    let b = s.as_bytes();
+    let mut result = Vec::new();
+    let mut i = 0;
+    loop {
+        while i < b.len() && is_tcl_space(b[i]) {
             i += 1;
         }
-        if i >= chars.len() {
+        if i >= b.len() {
             break;
         }
-
-        // Parse element
-        let (elem, new_i) = parse_list_element(&chars, i)?;
+        let (elem, next) = find_element(s, i)?;
         result.push(Value::from_str(&elem));
-        i = new_i;
+        i = next;
     }
-
-    Some(result)
+    Ok(result)
 }
 
-/// Parse a single list element
-fn parse_list_element(chars: &[char], start: usize) -> Option<(String, usize)> {
-    let mut i = start;
-    let mut result = String::new();
-
-    if i >= chars.len() {
-        return None;
+fn junk_error(s: &str, i: usize, kind: &str) -> ListParseError {
+    // Tcl reports up to 20 bytes of the offending text.
+    let b = s.as_bytes();
+    let mut j = i;
+    while j < b.len() && !is_tcl_space(b[j]) && j < i + 20 {
+        j += 1;
     }
+    while !s.is_char_boundary(j) {
+        j -= 1;
+    }
+    ListParseError {
+        message: format!(
+            "list element in {} followed by \"{}\" instead of space",
+            kind,
+            &s[i..j]
+        ),
+        code: "TCL VALUE LIST JUNK",
+    }
+}
 
-    match chars[i] {
-        '{' => {
-            // Braced element
-            i += 1;
-            let mut brace_depth = 1;
-            while i < chars.len() && brace_depth > 0 {
-                match chars[i] {
-                    '{' => {
-                        brace_depth += 1;
-                        result.push('{');
-                    }
-                    '}' => {
-                        brace_depth -= 1;
-                        if brace_depth > 0 {
-                            result.push('}');
-                        }
-                    }
-                    '\\' => {
-                        // In braced strings, only \{ and \} affect brace
-                        // counting — the backslash itself is always preserved.
-                        result.push('\\');
-                        if i + 1 < chars.len()
-                            && (chars[i + 1] == '{' || chars[i + 1] == '}')
-                        {
-                            i += 1;
-                            result.push(chars[i]);
-                        }
-                    }
-                    c => result.push(c),
-                }
-                i += 1;
-            }
-        }
-        '"' => {
-            // Quoted element
-            i += 1;
-            while i < chars.len() && chars[i] != '"' {
-                if chars[i] == '\\' && i + 1 < chars.len() {
+/// Locate the list element starting at byte `start` (which must not be
+/// whitespace). Returns the element value and the position just past any
+/// whitespace following the element.
+fn find_element(s: &str, start: usize) -> std::result::Result<(String, usize), ListParseError> {
+    let b = s.as_bytes();
+    let mut i = start;
+
+    if b[i] == b'{' {
+        // Braced element: contents are literal; backslashes only matter
+        // for brace counting.
+        i += 1;
+        let elem_start = i;
+        let mut depth = 1i32;
+        while i < b.len() {
+            match b[i] {
+                b'{' => {
+                    depth += 1;
                     i += 1;
                 }
-                result.push(chars[i]);
-                i += 1;
-            }
-            if i < chars.len() {
-                i += 1; // Skip closing quote
+                b'}' => {
+                    depth -= 1;
+                    i += 1;
+                    if depth == 0 {
+                        if i >= b.len() || is_tcl_space(b[i]) {
+                            let mut j = i;
+                            while j < b.len() && is_tcl_space(b[j]) {
+                                j += 1;
+                            }
+                            return Ok((s[elem_start..i - 1].to_string(), j));
+                        }
+                        return Err(junk_error(s, i, "braces"));
+                    }
+                }
+                b'\\' => {
+                    let (n, _) = scan_backslash(s, i);
+                    i += n;
+                }
+                _ => i += 1,
             }
         }
-        _ => {
-            // Unquoted element
-            while i < chars.len() && !chars[i].is_whitespace() {
-                result.push(chars[i]);
-                i += 1;
-            }
-        }
+        return Err(ListParseError {
+            message: "unmatched open brace in list".to_string(),
+            code: "TCL VALUE LIST BRACE",
+        });
     }
 
-    Some((result, i))
+    if b[i] == b'"' {
+        // Quoted element: backslash substitution applies.
+        i += 1;
+        let elem_start = i;
+        let mut has_backslash = false;
+        while i < b.len() {
+            match b[i] {
+                b'"' => {
+                    let raw = &s[elem_start..i];
+                    i += 1;
+                    if i >= b.len() || is_tcl_space(b[i]) {
+                        let mut j = i;
+                        while j < b.len() && is_tcl_space(b[j]) {
+                            j += 1;
+                        }
+                        let v = if has_backslash { collapse(raw) } else { raw.to_string() };
+                        return Ok((v, j));
+                    }
+                    return Err(junk_error(s, i, "quotes"));
+                }
+                b'\\' => {
+                    has_backslash = true;
+                    let (n, _) = scan_backslash(s, i);
+                    i += n;
+                }
+                _ => i += 1,
+            }
+        }
+        return Err(ListParseError {
+            message: "unmatched open quote in list".to_string(),
+            code: "TCL VALUE LIST QUOTE",
+        });
+    }
+
+    // Bare element: ends at whitespace; backslash substitution applies.
+    let elem_start = i;
+    let mut has_backslash = false;
+    while i < b.len() && !is_tcl_space(b[i]) {
+        if b[i] == b'\\' {
+            has_backslash = true;
+            let (n, _) = scan_backslash(s, i);
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
+    let raw = &s[elem_start..i];
+    let v = if has_backslash { collapse(raw) } else { raw.to_string() };
+    Ok((v, i))
+}
+
+/// Substitute all backslash sequences in `s` (Tcl's `TclCopyAndCollapse`).
+fn collapse(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            let (n, rep) = scan_backslash(s, i);
+            out.push_str(&rep);
+            i += n;
+        } else {
+            let ch_len = utf8_len(b[i]);
+            out.push_str(&s[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    out
+}
+
+/// Length in bytes of the UTF-8 sequence starting with byte `b`.
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >= 0xf0 {
+        4
+    } else if b >= 0xe0 {
+        3
+    } else {
+        2
+    }
+}
+
+/// Scan the backslash sequence starting at `s[i]` (which must be `\\`),
+/// following Tcl's `TclParseBackslash` rules. Returns the number of bytes
+/// consumed (including the backslash) and the substituted text.
+fn scan_backslash(s: &str, i: usize) -> (usize, String) {
+    let b = s.as_bytes();
+    debug_assert!(b[i] == b'\\');
+    if i + 1 >= b.len() {
+        // Lone trailing backslash stays a backslash.
+        return (1, "\\".to_string());
+    }
+    let c = b[i + 1];
+    match c {
+        b'a' => (2, "\x07".to_string()),
+        b'b' => (2, "\x08".to_string()),
+        b'f' => (2, "\x0c".to_string()),
+        b'n' => (2, "\n".to_string()),
+        b'r' => (2, "\r".to_string()),
+        b't' => (2, "\t".to_string()),
+        b'v' => (2, "\x0b".to_string()),
+        b'x' => {
+            let mut val: u32 = 0;
+            let mut n = 0;
+            while n < 2 && i + 2 + n < b.len() && (b[i + 2 + n] as char).is_ascii_hexdigit() {
+                val = val * 16 + (b[i + 2 + n] as char).to_digit(16).unwrap_or(0);
+                n += 1;
+            }
+            if n == 0 {
+                (2, "x".to_string())
+            } else {
+                let ch = char::from_u32(val & 0xff).unwrap_or('\u{fffd}');
+                (2 + n, ch.to_string())
+            }
+        }
+        b'u' | b'U' => {
+            let max_digits = if c == b'u' { 4 } else { 8 };
+            let mut val: u32 = 0;
+            let mut n = 0;
+            while n < max_digits && i + 2 + n < b.len() && (b[i + 2 + n] as char).is_ascii_hexdigit()
+            {
+                val = val
+                    .saturating_mul(16)
+                    .saturating_add((b[i + 2 + n] as char).to_digit(16).unwrap_or(0));
+                n += 1;
+            }
+            if n == 0 {
+                return (2, (c as char).to_string());
+            }
+            // Combine a \u high surrogate with a following \u low surrogate.
+            if c == b'u'
+                && n == 4
+                && (0xd800..0xdc00).contains(&val)
+                && i + 2 + n + 1 < b.len()
+                && b[i + 2 + n] == b'\\'
+                && b[i + 2 + n + 1] == b'u'
+            {
+                let lo_start = i + 2 + n + 2;
+                let mut low: u32 = 0;
+                let mut m = 0;
+                while m < 4 && lo_start + m < b.len() && (b[lo_start + m] as char).is_ascii_hexdigit()
+                {
+                    low = low * 16 + (b[lo_start + m] as char).to_digit(16).unwrap_or(0);
+                    m += 1;
+                }
+                if m == 4 && (0xdc00..0xe000).contains(&low) {
+                    let combined = ((val & 0x3ff) << 10 | (low & 0x3ff)) + 0x10000;
+                    let ch = char::from_u32(combined).unwrap_or('\u{fffd}');
+                    return (2 + n + 2 + m, ch.to_string());
+                }
+            }
+            if (0xd800..0xe000).contains(&val) {
+                return (2 + n, '\u{fffd}'.to_string());
+            }
+            let ch = char::from_u32(val).unwrap_or('\u{fffd}');
+            (2 + n, ch.to_string())
+        }
+        b'0'..=b'7' => {
+            let mut val: u32 = (c - b'0') as u32;
+            let mut n = 1;
+            while n < 3 && i + 1 + n < b.len() && matches!(b[i + 1 + n], b'0'..=b'7') {
+                // Tcl only takes a third octal digit when the value stays < 256.
+                if n == 2 && val >= 0x20 {
+                    break;
+                }
+                val = val * 8 + (b[i + 1 + n] - b'0') as u32;
+                n += 1;
+            }
+            let ch = char::from_u32(val & 0xff).unwrap_or('\u{fffd}');
+            (1 + n, ch.to_string())
+        }
+        b'\n' => {
+            // Backslash-newline and following spaces/tabs collapse to one space.
+            let mut j = i + 2;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            (j - i, " ".to_string())
+        }
+        _ => {
+            // Unknown escape: the backslash quotes the following character.
+            let ch_len = utf8_len(c);
+            let end = (i + 1 + ch_len).min(b.len());
+            (1 + (end - (i + 1)), s[i + 1..end].to_string())
+        }
+    }
 }
 
 /// Format an integer for Tcl
@@ -947,5 +1296,101 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].as_str(), "a b");
         assert_eq!(list[1].as_str(), "c d");
+    }
+
+    #[test]
+    fn test_serialize_matches_tcl() {
+        // Oracle outputs from tclsh 8.6.17 `list`.
+        let cases: &[(&[&str], &str)] = &[
+            (&["a}b"], "a\\}b"),
+            (&["a{b"], "a\\{b"),
+            (&["a{b}c"], "a{b}c"),
+            (&["a{b}c{d"], "a\\{b\\}c\\{d"),
+            (&["a b"], "{a b}"),
+            (&["a\nb"], "{a\nb}"),
+            (&[""], "{}"),
+            (&["\\"], "\\\\"),
+            (&["\\n"], "{\\n}"),
+            (&["a\"b"], "a\\\"b"),
+            (&["a]b"], "a\\]b"),
+            (&["a[b"], "{a[b}"),
+            (&["a$b"], "{a$b}"),
+            (&["a;b"], "{a;b}"),
+            (&["{"], "\\{"),
+            (&["}"], "\\}"),
+            (&["#foo"], "{#foo}"),
+            (&["a", "#foo"], "a #foo"),
+            (&["#", "#"], "{#} #"),
+            (&["#{"], "\\#\\{"),
+            (&["a", "#{"], "a #\\{"),
+            (&["\""], "{\"}"),
+            (&["a] b"], "{a] b}"),
+            (&["{a}"], "{{a}}"),
+            (&["a\x0bb"], "{a\x0bb}"),
+        ];
+        for (items, expected) in cases {
+            let vals: Vec<Value> = items.iter().map(|s| Value::from_str(s)).collect();
+            assert_eq!(serialize_list(&vals), *expected, "items: {:?}", items);
+        }
+    }
+
+    #[test]
+    fn test_list_round_trip() {
+        let items = [
+            "a}b", "{a}", "", "\\", "\\n", "a\nb", "\u{0}x", "#hash",
+            "a\"b", " lead", "trail ", "x{y}z", "中", "\u{1} ",
+        ];
+        for item in items {
+            let list = Value::from_list(&[Value::from_str(item)]);
+            let parsed = list.as_list().unwrap();
+            assert_eq!(parsed.len(), 1, "serialized: {}", list.as_str());
+            assert_eq!(parsed[0].as_str(), item, "serialized: {}", list.as_str());
+        }
+    }
+
+    #[test]
+    fn test_parse_malformed_lists() {
+        assert!(Value::from_str("{").as_list().is_none());
+        assert!(Value::from_str("a {b").as_list().is_none());
+        assert!(Value::from_str("\"abc").as_list().is_none());
+        assert!(Value::from_str("{a}b").as_list().is_none());
+        assert!(Value::from_str("\"a\"b").as_list().is_none());
+        let err = Value::from_str("{").as_list_strict().unwrap_err();
+        assert_eq!(err.message, "unmatched open brace in list");
+        assert_eq!(err.code, "TCL VALUE LIST BRACE");
+        let err = Value::from_str("\"a").as_list_strict().unwrap_err();
+        assert_eq!(err.message, "unmatched open quote in list");
+        let err = Value::from_str("{a}b").as_list_strict().unwrap_err();
+        assert_eq!(err.message, "list element in braces followed by \"b\" instead of space");
+        assert_eq!(err.code, "TCL VALUE LIST JUNK");
+    }
+
+    #[test]
+    fn test_parse_backslash_collapse() {
+        let v = Value::from_str("a\\}b");
+        let list = v.as_list().unwrap();
+        assert_eq!(list[0].as_str(), "a}b");
+        let v = Value::from_str("a\\nb");
+        assert_eq!(v.as_list().unwrap()[0].as_str(), "a\nb");
+        let v = Value::from_str("a\\x41b");
+        assert_eq!(v.as_list().unwrap()[0].as_str(), "aAb");
+        let v = Value::from_str("q\\q");
+        assert_eq!(v.as_list().unwrap()[0].as_str(), "qq");
+        // Trailing backslash in a bare element is kept.
+        let v = Value::from_str("a\\");
+        assert_eq!(v.as_list().unwrap()[0].as_str(), "a\\");
+        // Backslash-newline folds to a single space.
+        let v = Value::from_str("a\\\n  b");
+        assert_eq!(v.as_list().unwrap()[0].as_str(), "a b");
+    }
+
+    #[test]
+    fn test_parse_braced_literal_backslashes() {
+        // Inside braces, backslashes are literal (only affect brace counting).
+        let v = Value::from_str("{a\\}b}");
+        let list = v.as_list().unwrap();
+        assert_eq!(list[0].as_str(), "a\\}b");
+        // `{\}` is an unmatched brace: the \} does not close the element.
+        assert!(Value::from_str("{\\}").as_list().is_none());
     }
 }

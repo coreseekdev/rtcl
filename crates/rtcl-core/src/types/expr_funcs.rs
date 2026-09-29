@@ -1,15 +1,176 @@
 //! Math function evaluation for the Tcl expression parser.
 
+use core::cmp::Ordering;
+
 use crate::error::{Error, Result};
 use crate::value::Value;
 
-/// Return int if the float has no fractional part and fits in i64.
-pub(crate) fn float_or_int(f: f64) -> Value {
-    if f.fract() == 0.0 && f.abs() < i64::MAX as f64 {
-        Value::from_int(f as i64)
-    } else {
-        Value::from_float(f)
+/// Format a double the way Tcl 8.6 stringifies one: shortest round-trip
+/// decimal digits, fixed notation when the decimal exponent of the leading
+/// digit is in `[-4, 16]` (appending `.0` when the digits would otherwise
+/// read as an integer), scientific notation (`1.5e+300`, `5e-324`,
+/// `1e+17`) outside that range.
+///
+/// This lives here (not in rtcl-vm's `value.rs`) so expression results
+/// match tclsh 8.6 byte-for-byte without changing the shared formatter.
+pub(crate) fn format_tcl_float(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".to_string();
     }
+    if f.is_infinite() {
+        return if f < 0.0 { "-Inf".to_string() } else { "Inf".to_string() };
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
+    }
+    // Rust's LowerExp yields the shortest round-trip decimal as "d[.ddd]e<exp>".
+    let sci = format!("{:e}", f.abs());
+    let (mantissa, exp_str) = match sci.split_once('e') {
+        Some(parts) => parts,
+        None => return sci,
+    };
+    let exp10: i32 = exp_str.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let n = digits.len() as i32;
+
+    let mut out = String::new();
+    if f < 0.0 {
+        out.push('-');
+    }
+    if (-4..=16).contains(&exp10) {
+        if exp10 >= n - 1 {
+            // Integral value: digits left-padded to the decimal point, then ".0"
+            out.push_str(&digits);
+            for _ in 0..(exp10 - (n - 1)) {
+                out.push('0');
+            }
+            out.push_str(".0");
+        } else if exp10 >= 0 {
+            let split = (exp10 + 1) as usize;
+            out.push_str(&digits[..split]);
+            out.push('.');
+            out.push_str(&digits[split..]);
+        } else {
+            out.push_str("0.");
+            for _ in 0..(-exp10 - 1) {
+                out.push('0');
+            }
+            out.push_str(&digits);
+        }
+    } else {
+        out.push_str(&digits[..1]);
+        if n > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        out.push(if exp10 < 0 { '-' } else { '+' });
+        out.push_str(&exp10.unsigned_abs().to_string());
+    }
+    out
+}
+
+/// A float `Value` carrying Tcl's canonical string form. Used for every
+/// float produced by the expression evaluator so results stringify exactly
+/// like tclsh (rtcl-vm's `Value::from_float` uses a different layout).
+pub(crate) fn float_value(f: f64) -> Value {
+    Value::from_str(&format_tcl_float(f))
+}
+
+/// Tcl boolean word parsing: case-insensitive, any unique-prefix
+/// abbreviation of true/false/yes/no/on/off. Returns `None` for ambiguous
+/// ("o" — on/off) or unrecognized strings.
+fn bool_from_string(s: &str) -> Option<bool> {
+    let lower = s.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    let mut candidates = ["true", "false", "yes", "no", "on", "off"]
+        .iter()
+        .filter(|word| word.starts_with(lower.as_str()));
+    let first = *candidates.next()?;
+    if candidates.next().is_some() {
+        return None; // ambiguous prefix
+    }
+    Some(matches!(first, "true" | "yes" | "on"))
+}
+
+/// Tcl boolean coercion (`Tcl_GetBooleanFromObj`): any numeric value is a
+/// valid boolean (zero, including 0.0, is false); otherwise the string
+/// must be a boolean word or unambiguous abbreviation. Anything else is an
+/// error, as in `while {$x}` with x="foo".
+pub(crate) fn strict_bool(v: &Value) -> Result<bool> {
+    if let Some(i) = v.as_int() {
+        return Ok(i != 0);
+    }
+    if let Some(f) = v.as_float() {
+        return Ok(f != 0.0);
+    }
+    if let Some(b) = bool_from_string(v.as_str()) {
+        return Ok(b);
+    }
+    Err(Error::Msg(format!(
+        "expected boolean value but got \"{}\"",
+        v.as_str()
+    )))
+}
+
+/// Operand coercion for unary `!`: accepts the same values as
+/// [`strict_bool`], but Tcl reports a different message for a
+/// non-numeric, non-boolean operand of `!`.
+pub(crate) fn not_operand(v: &Value) -> Result<bool> {
+    if let Some(i) = v.as_int() {
+        return Ok(i != 0);
+    }
+    if let Some(f) = v.as_float() {
+        return Ok(f != 0.0);
+    }
+    if let Some(b) = bool_from_string(v.as_str()) {
+        return Ok(b);
+    }
+    Err(Error::Msg(
+        "can't use non-numeric string as operand of \"!\"".to_string(),
+    ))
+}
+
+/// Numeric comparison following Tcl rules: if both operands parse as
+/// integers, compare as i64 (no precision loss through double); a mixed
+/// int/double pair is compared exactly; two doubles use IEEE comparison.
+/// Returns `None` when either operand is non-numeric (caller falls back to
+/// string comparison).
+pub(crate) fn numeric_cmp(a: &Value, b: &Value) -> Option<Ordering> {
+    match (a.as_int(), b.as_int()) {
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
+        (Some(x), None) => b.as_float().and_then(|y| cmp_int_float(x, y)),
+        (None, Some(y)) => a
+            .as_float()
+            .and_then(|x| cmp_int_float(y, x).map(Ordering::reverse)),
+        (None, None) => match (a.as_float(), b.as_float()) {
+            (Some(x), Some(y)) => x.partial_cmp(&y),
+            _ => None,
+        },
+    }
+}
+
+/// Exact comparison of an i64 against an f64 without rounding the integer
+/// to double (which would conflate e.g. 2^53+1 with 2^53).
+fn cmp_int_float(i: i64, f: f64) -> Option<Ordering> {
+    if f.is_nan() {
+        return None;
+    }
+    const TWO63: f64 = 9223372036854775808.0; // 2^63
+    if f >= TWO63 {
+        return Some(Ordering::Less);
+    }
+    if f < -TWO63 {
+        return Some(Ordering::Greater);
+    }
+    // |f| < 2^63, so its truncation is exactly representable as i64.
+    let fi = f.trunc() as i64;
+    Some(match i.cmp(&fi) {
+        Ordering::Equal => 0.0f64.partial_cmp(&f.fract()).unwrap_or(Ordering::Equal),
+        ord => ord,
+    })
 }
 
 fn require_args(name: &str, expected: usize, actual: usize) -> Result<()> {
@@ -27,8 +188,15 @@ pub(super) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
     match name {
         "abs" => {
             require_args(name, 1, args.len())?;
+            if let Some(i) = args[0].as_int() {
+                // i64::MIN: Tcl widens abs to bignum; we promote to double
+                return Ok(match i.checked_abs() {
+                    Some(r) => Value::from_int(r),
+                    None => float_value(-(i as f64)),
+                });
+            }
             match args[0].as_float() {
-                Some(n) => Ok(float_or_int(n.abs())),
+                Some(n) => Ok(float_value(n.abs())),
                 None => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         }
@@ -49,13 +217,13 @@ pub(super) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
         "double" => {
             require_args(name, 1, args.len())?;
             match args[0].as_float() {
-                Some(n) => Ok(Value::from_float(n)),
+                Some(n) => Ok(float_value(n)),
                 None => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         }
         "bool" => {
             require_args(name, 1, args.len())?;
-            Ok(Value::from_bool(args[0].is_true()))
+            Ok(Value::from_bool(strict_bool(&args[0])?))
         }
         "round" => {
             require_args(name, 1, args.len())?;
@@ -67,49 +235,49 @@ pub(super) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
         "floor" => {
             require_args(name, 1, args.len())?;
             match args[0].as_float() {
-                Some(n) => Ok(Value::from_int(n.floor() as i64)),
+                Some(n) => Ok(float_value(n.floor())),
                 None => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         }
         "ceil" => {
             require_args(name, 1, args.len())?;
             match args[0].as_float() {
-                Some(n) => Ok(Value::from_int(n.ceil() as i64)),
+                Some(n) => Ok(float_value(n.ceil())),
                 None => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         }
         "sqrt" => {
             require_args(name, 1, args.len())?;
             match args[0].as_float() {
-                Some(n) => Ok(Value::from_float(n.sqrt())),
+                Some(n) => Ok(float_value(n.sqrt())),
                 None => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         }
         "pow" => {
             require_args(name, 2, args.len())?;
             match (args[0].as_float(), args[1].as_float()) {
-                (Some(a), Some(b)) => Ok(float_or_int(a.powf(b))),
+                (Some(a), Some(b)) => Ok(float_value(a.powf(b))),
                 _ => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         }
         "fmod" => {
             require_args(name, 2, args.len())?;
             match (args[0].as_float(), args[1].as_float()) {
-                (Some(a), Some(b)) => Ok(Value::from_float(a % b)),
+                (Some(a), Some(b)) => Ok(float_value(a % b)),
                 _ => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         }
         "atan2" => {
             require_args(name, 2, args.len())?;
             match (args[0].as_float(), args[1].as_float()) {
-                (Some(a), Some(b)) => Ok(Value::from_float(a.atan2(b))),
+                (Some(a), Some(b)) => Ok(float_value(a.atan2(b))),
                 _ => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         }
         "hypot" => {
             require_args(name, 2, args.len())?;
             match (args[0].as_float(), args[1].as_float()) {
-                (Some(a), Some(b)) => Ok(Value::from_float(a.hypot(b))),
+                (Some(a), Some(b)) => Ok(float_value(a.hypot(b))),
                 _ => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         }
@@ -133,7 +301,7 @@ pub(super) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
                         "tanh" => n.tanh(),
                         _ => n,
                     };
-                    Ok(Value::from_float(result))
+                    Ok(float_value(result))
                 }
                 None => Err(Error::type_mismatch("number", "non-numeric value")),
             }
@@ -142,21 +310,27 @@ pub(super) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
             if args.is_empty() {
                 return Err(Error::wrong_args(format!("{}()", name), 1, args.len()));
             }
-            let nums: std::result::Result<Vec<f64>, _> = args.iter()
-                .map(|v| v.as_float().ok_or_else(|| Error::type_mismatch("number", "non-numeric value")))
-                .collect();
-            let nums = nums?;
-            let result = if name == "min" {
-                nums.into_iter().fold(f64::INFINITY, f64::min)
-            } else {
-                nums.into_iter().fold(f64::NEG_INFINITY, f64::max)
-            };
-            Ok(float_or_int(result))
+            // Tcl returns the winning operand itself, preserving its type:
+            // min(2.0, 3) => 2.0 but min(2, 3.0) => 2.
+            let mut best = args[0].clone();
+            for v in &args[1..] {
+                let ord = numeric_cmp(v, &best)
+                    .ok_or_else(|| Error::type_mismatch("number", "non-numeric value"))?;
+                let take = if name == "min" {
+                    ord == Ordering::Less
+                } else {
+                    ord == Ordering::Greater
+                };
+                if take {
+                    best = v.clone();
+                }
+            }
+            Ok(best)
         }
         "rand" => {
             let val = ((rand_seed as u64).wrapping_mul(6364136223846793005u64).wrapping_add(1) as f64)
                 / (u64::MAX as f64);
-            Ok(Value::from_float(val.abs() % 1.0))
+            Ok(float_value(val.abs() % 1.0))
         }
         "srand" => {
             require_args(name, 1, args.len())?;

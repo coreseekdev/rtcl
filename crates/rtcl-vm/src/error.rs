@@ -37,6 +37,11 @@ pub enum Error {
         usage: Option<String>,
     },
 
+    /// Wrong-args error whose message is already in Tcl's exact format,
+    /// for commands whose arity errors are not of the
+    /// `wrong # args: should be "cmd arg ..."` form (e.g. `if` clauses).
+    WrongArgsMsg(String),
+
     /// Variable not found
     VarNotFound {
         name: String,
@@ -147,6 +152,12 @@ impl Error {
             actual,
             usage: Some(usage.into()),
         }
+    }
+
+    /// Create a wrong-args error with a pre-formatted Tcl message
+    /// (for arity errors that are not of the `should be "cmd arg ..."` form).
+    pub fn wrong_args_msg(msg: impl Into<String>) -> Self {
+        Error::WrongArgsMsg(msg.into())
     }
 
     /// Create a variable not found error
@@ -352,12 +363,42 @@ impl Error {
             Error::Runtime { code, .. } => *code as i32,
             Error::InvalidCommand { .. } => -2,
             Error::WrongNumArgs { .. } => -3,
+            Error::WrongArgsMsg(_) => -3,
             Error::VarNotFound { .. } => -4,
             Error::TypeMismatch { .. } => -5,
             Error::DivisionByZero => -6,
             Error::ControlFlow { kind, .. } => *kind as i32,
             Error::TailCall { .. } => -7,
             Error::Msg(_) => -99,
+        }
+    }
+
+    /// The payload a Tcl script should see for this error — what `catch`'s
+    /// result variable receives (e.g. `return hi` → `hi`, `break` → ``).
+    pub fn message_text(&self) -> String {
+        match self {
+            Error::ControlFlow { value: Some(v), .. } => v.as_str().to_string(),
+            Error::ControlFlow { value: None, .. } => String::new(),
+            other => other.to_string(),
+        }
+    }
+
+    /// Tcl `-errorcode` list for this error (e.g. `NONE`,
+    /// `ARITH DIVZERO {divide by zero}`).
+    pub fn tcl_error_code(&self) -> String {
+        match self {
+            Error::ControlFlow { error_code: Some(c), .. } => c.clone(),
+            Error::DivisionByZero => "ARITH DIVZERO {divide by zero}".to_string(),
+            Error::InvalidCommand { name } => {
+                format!("TCL LOOKUP COMMAND {}", crate::value::tcl_quote(name))
+            }
+            Error::VarNotFound { name } => {
+                format!("TCL LOOKUP VARNAME {}", crate::value::tcl_quote(name))
+            }
+            Error::WrongNumArgs { .. } | Error::WrongArgsMsg(_) => {
+                "TCL WRONGARGS".to_string()
+            }
+            _ => "NONE".to_string(),
         }
     }
 }
@@ -368,24 +409,28 @@ impl fmt::Display for Error {
             Error::Syntax { message, line, column } => {
                 write!(f, "syntax error at {}:{}: {}", line, column, message)
             }
-            Error::Runtime { message, code } => {
-                write!(f, "runtime error (code {}): {}", *code as i32, message)
+            Error::Runtime { message, .. } => {
+                write!(f, "{}", message)
             }
             Error::InvalidCommand { name } => {
                 write!(f, "invalid command name \"{}\"", name)
             }
-            Error::WrongNumArgs { command, expected, actual, usage } => {
-                write!(
-                    f,
-                    "wrong # args: should be \"{} {}\"",
-                    command,
-                    usage.as_deref().unwrap_or(&format!("{} args", expected))
-                )?;
-                if usage.is_some() {
-                    write!(f, "\n  expected {} arguments, got {}", expected, actual)?;
+            Error::WrongNumArgs { command, expected, usage, .. } => {
+                // Tcl renders arity errors as a single line:
+                //   wrong # args: should be "cmd arg ..."
+                match usage {
+                    Some(u) if u.is_empty() => {
+                        write!(f, "wrong # args: should be \"{}\"", command)
+                    }
+                    Some(u) => {
+                        write!(f, "wrong # args: should be \"{} {}\"", command, u)
+                    }
+                    None => {
+                        write!(f, "wrong # args: should be \"{} {} args\"", command, expected)
+                    }
                 }
-                Ok(())
             }
+            Error::WrongArgsMsg(message) => write!(f, "{}", message),
             Error::VarNotFound { name } => {
                 write!(f, "can't read \"{}\": no such variable", name)
             }
@@ -397,12 +442,18 @@ impl fmt::Display for Error {
             }
             Error::ControlFlow { kind, value, .. } => {
                 match kind {
-                    ControlFlow::Return => write!(f, "return"),
-                    ControlFlow::Break => write!(f, "break"),
-                    ControlFlow::Continue => write!(f, "continue"),
-                    ControlFlow::Error => write!(f, "error"),
-                    ControlFlow::Exit => write!(f, "exit"),
-                }?;
+                    ControlFlow::Return => write!(f, "return")?,
+                    ControlFlow::Break => write!(f, "break")?,
+                    ControlFlow::Continue => write!(f, "continue")?,
+                    // An error flow's message is its value (like the `error` command).
+                    ControlFlow::Error => {
+                        if let Some(v) = value {
+                            return write!(f, "{}", v.as_str());
+                        }
+                        write!(f, "error")?;
+                    }
+                    ControlFlow::Exit => write!(f, "exit")?,
+                }
                 if let Some(v) = value {
                     write!(f, " with value: {}", v.as_str())?;
                 }

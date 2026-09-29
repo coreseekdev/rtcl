@@ -32,7 +32,8 @@ fn test_functions() {
     let mut interp = Interp::new();
     assert_eq!(eval_expr(&mut interp, "abs(-5)").unwrap().as_int(), Some(5));
     assert_eq!(eval_expr(&mut interp, "sqrt(16)").unwrap().as_float(), Some(4.0));
-    assert_eq!(eval_expr(&mut interp, "pow(2, 3)").unwrap().as_int(), Some(8));
+    // Tcl's pow() always returns a double: pow(2,3) => 8.0
+    assert_eq!(eval_expr(&mut interp, "pow(2, 3)").unwrap().as_str(), "8.0");
 }
 
 #[test]

@@ -232,8 +232,15 @@ impl Interp {
                                     Ok(val)
                                 }
                                 1 => {
-                                    // return -code error "msg" → propagate as error
-                                    Err(Error::Msg(val.as_str().to_string()))
+                                    // return -code error "msg" → propagate as error,
+                                    // preserving any -errorinfo / -errorcode options.
+                                    Err(Error::ControlFlow {
+                                        kind: crate::error::ControlFlow::Error,
+                                        value: Some(val),
+                                        level: 1,
+                                        error_info: error_info.clone(),
+                                        error_code: error_code.clone(),
+                                    })
                                 }
                                 3 => {
                                     // return -code break

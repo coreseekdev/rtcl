@@ -14,7 +14,33 @@ use crate::value::Value;
 pub fn eval_expr(interp: &mut Interp, expr: &str) -> Result<Value> {
     let mut parser = ExprParser::new(expr, interp);
     let result = parser.parse_ternary()?;
-    Ok(result)
+    Ok(canonicalize_result(result))
+}
+
+/// Tcl: when the result of an expression is a string that looks like a
+/// number, it is converted to the number's canonical form — `expr {$x}`
+/// with x="1e15" yields `1000000000000000.0`, `" 1"` yields `1`, `0x10`
+/// yields `16`. Non-numeric strings pass through unchanged. (Numeric
+/// *operators* convert their operands individually; `eq`/`ne` keep
+/// comparing the original strings.)
+fn canonicalize_result(v: Value) -> Value {
+    if v.type_name() != "string" {
+        return v;
+    }
+    if let Some(i) = v.as_int() {
+        return Value::from_int(i);
+    }
+    // A plain decimal integer beyond i64 is a Tcl bignum; keep its exact
+    // text rather than degrading it to a rounded double (E4).
+    let t = v.as_str().trim();
+    let digits = t.strip_prefix(['-', '+']).unwrap_or(t);
+    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+        return v;
+    }
+    if let Some(f) = v.as_float() {
+        return super::expr_funcs::float_value(f);
+    }
+    v
 }
 
 /// Expression parser
@@ -39,7 +65,7 @@ impl<'a> ExprParser<'a> {
         let cond = self.parse_or()?;
         self.skip_whitespace();
         if self.match_op("?") {
-            if cond.is_true() {
+            if super::expr_funcs::strict_bool(&cond)? {
                 let then_val = self.parse_ternary()?;
                 self.expect(":")?;
                 // Skip the untaken else-branch without evaluating it
@@ -60,12 +86,12 @@ impl<'a> ExprParser<'a> {
     fn parse_or(&mut self) -> Result<Value> {
         let mut left = self.parse_and()?;
         while self.match_op("||") {
-            if left.is_true() {
+            if super::expr_funcs::strict_bool(&left)? {
                 // Short-circuit: skip parsing the RHS but consume the tokens
                 self.skip_or_operand()?;
             } else {
                 let right = self.parse_and()?;
-                left = Value::from_bool(right.is_true());
+                left = Value::from_bool(super::expr_funcs::strict_bool(&right)?);
             }
         }
         Ok(left)
@@ -75,12 +101,12 @@ impl<'a> ExprParser<'a> {
     fn parse_and(&mut self) -> Result<Value> {
         let mut left = self.parse_bitor()?;
         while self.match_op("&&") {
-            if !left.is_true() {
+            if !super::expr_funcs::strict_bool(&left)? {
                 // Short-circuit: skip parsing the RHS but consume the tokens
                 self.skip_and_operand()?;
             } else {
                 let right = self.parse_bitor()?;
-                left = Value::from_bool(right.is_true());
+                left = Value::from_bool(super::expr_funcs::strict_bool(&right)?);
             }
         }
         Ok(left)
@@ -148,15 +174,18 @@ impl<'a> ExprParser<'a> {
         loop {
             if self.match_op("==") {
                 let right = self.parse_relational()?;
-                left = match (left.as_float(), right.as_float()) {
-                    (Some(a), Some(b)) => Value::from_bool((a - b).abs() < f64::EPSILON),
-                    _ => Value::from_bool(left.as_str() == right.as_str()),
+                // Exact numeric comparison when both operands are numeric
+                // (int pairs compare as i64, no EPSILON tolerance);
+                // string comparison otherwise.
+                left = match super::expr_funcs::numeric_cmp(&left, &right) {
+                    Some(ord) => Value::from_bool(ord == core::cmp::Ordering::Equal),
+                    None => Value::from_bool(left.as_str() == right.as_str()),
                 };
             } else if self.match_op("!=") {
                 let right = self.parse_relational()?;
-                left = match (left.as_float(), right.as_float()) {
-                    (Some(a), Some(b)) => Value::from_bool((a - b).abs() >= f64::EPSILON),
-                    _ => Value::from_bool(left.as_str() != right.as_str()),
+                left = match super::expr_funcs::numeric_cmp(&left, &right) {
+                    Some(ord) => Value::from_bool(ord != core::cmp::Ordering::Equal),
+                    None => Value::from_bool(left.as_str() != right.as_str()),
                 };
             } else if self.match_op("=*") {
                 // Glob match: left =* pattern
@@ -233,15 +262,16 @@ impl<'a> ExprParser<'a> {
                 break;
             };
             let right = self.parse_shift()?;
-            left = match (left.as_float(), right.as_float()) {
-                (Some(a), Some(b)) => Value::from_bool(match op {
-                    "<" => a < b,
-                    ">" => a > b,
-                    "<=" => a <= b,
-                    ">=" => a >= b,
+            use core::cmp::Ordering;
+            left = match super::expr_funcs::numeric_cmp(&left, &right) {
+                Some(ord) => Value::from_bool(match op {
+                    "<" => ord == Ordering::Less,
+                    ">" => ord == Ordering::Greater,
+                    "<=" => ord != Ordering::Greater,
+                    ">=" => ord != Ordering::Less,
                     _ => false,
                 }),
-                _ => Value::from_bool(match op {
+                None => Value::from_bool(match op {
                     "<" => left.as_str() < right.as_str(),
                     ">" => left.as_str() > right.as_str(),
                     "<=" => left.as_str() <= right.as_str(),
@@ -334,7 +364,8 @@ impl<'a> ExprParser<'a> {
                 let a = self.as_int_val(&left)?;
                 let b = self.as_int_val(&right)?;
                 if b == 0 { return Err(Error::DivisionByZero); }
-                left = Value::from_int(floor_mod(a, b));
+                // i64::MIN % -1 would overflow in Rust; the result is 0
+                left = Value::from_int(if a == i64::MIN && b == -1 { 0 } else { floor_mod(a, b) });
             } else {
                 break;
             }
@@ -347,15 +378,31 @@ impl<'a> ExprParser<'a> {
         let base = self.parse_unary()?;
         if self.match_op("**") {
             let exp = self.parse_power()?; // right-associative: recurse
-            match (base.as_float(), exp.as_float()) {
-                (Some(a), Some(b)) => {
-                    let result = a.powf(b);
-                    if result.fract() == 0.0 && result.abs() < i64::MAX as f64 {
-                        Ok(Value::from_int(result as i64))
-                    } else {
-                        Ok(Value::from_float(result))
+            // Tcl: two integer operands use integer exponentiation.
+            if let (Some(a), Some(b)) = (base.as_int(), exp.as_int()) {
+                if b < 0 {
+                    // Integer pow with negative exponent collapses to 0,
+                    // except for the units 1/-1; 0**negative is an error.
+                    return match a {
+                        0 => Err(Error::Msg(
+                            "exponentiation of zero by negative power".to_string(),
+                        )),
+                        1 => Ok(Value::from_int(1)),
+                        -1 => Ok(Value::from_int(if b % 2 == 0 { 1 } else { -1 })),
+                        _ => Ok(Value::from_int(0)),
+                    };
+                }
+                if b <= u32::MAX as i64 {
+                    if let Some(r) = a.checked_pow(b as u32) {
+                        return Ok(Value::from_int(r));
                     }
                 }
+                // Overflow (or absurdly large exponent): Tcl widens to
+                // bignum; we promote to double instead (E4).
+                return Ok(super::expr_funcs::float_value((a as f64).powf(b as f64)));
+            }
+            match (base.as_float(), exp.as_float()) {
+                (Some(a), Some(b)) => Ok(super::expr_funcs::float_value(a.powf(b))),
                 _ => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         } else {
@@ -368,7 +415,7 @@ impl<'a> ExprParser<'a> {
         self.skip_whitespace();
         if self.match_op("!") {
             let val = self.parse_unary()?;
-            return Ok(Value::from_bool(!val.is_true()));
+            return Ok(Value::from_bool(!super::expr_funcs::not_operand(&val)?));
         }
         if self.peek() == '~' {
             self.advance();
@@ -385,14 +432,16 @@ impl<'a> ExprParser<'a> {
             self.skip_whitespace();
             if self.is_digit() || self.peek() == '(' || self.peek() == '$' || self.peek() == '[' || self.peek() == '.' {
                 let val = self.parse_unary()?;
+                // Integer operands stay integers (-2 -> -2); float operands
+                // stay floats (-2.0 -> -2.0).
+                if let Some(i) = val.as_int() {
+                    return Ok(match i.checked_neg() {
+                        Some(r) => Value::from_int(r),
+                        None => super::expr_funcs::float_value(-(i as f64)),
+                    });
+                }
                 return match val.as_float() {
-                    Some(n) => {
-                        if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
-                            Ok(Value::from_int(-(n as i64)))
-                        } else {
-                            Ok(Value::from_float(-n))
-                        }
-                    }
+                    Some(n) => Ok(super::expr_funcs::float_value(-n)),
                     None => Err(Error::type_mismatch("number", "non-numeric value")),
                 };
             }
@@ -540,9 +589,16 @@ impl<'a> ExprParser<'a> {
         }
 
         if s.contains('.') || s.contains('e') || s.contains('E') {
-            Ok(Value::from_float(s.parse().unwrap_or(0.0)))
+            Ok(super::expr_funcs::float_value(s.parse().unwrap_or(0.0)))
         } else {
-            Ok(Value::from_int(s.parse().unwrap_or(0)))
+            match s.parse::<i64>() {
+                Ok(n) => Ok(Value::from_int(n)),
+                // Tcl widens oversized integer literals to bignum; we
+                // promote to double instead (E4).
+                Err(_) => Ok(super::expr_funcs::float_value(
+                    s.parse().unwrap_or(f64::INFINITY),
+                )),
+            }
         }
     }
 
@@ -785,16 +841,32 @@ impl<'a> ExprParser<'a> {
     }
 
     /// Numeric binary operation. Integer operands use integer arithmetic
-    /// (Tcl semantics: `/` is floor division, result is int); if either side
-    /// is float, compute in f64.
+    /// (Tcl semantics: `/` is floor division, result is int); on i64
+    /// overflow the operation is promoted to double (Tcl widens to bignum;
+    /// rtcl has no bignum — see E4 in specs/DIVERGENCES.md). If either side
+    /// is float, compute in f64 and the result stays a float.
     fn numeric_binop(&self, left: &Value, right: &Value, op: char) -> Result<Value> {
         if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
+            let promoted = |f: f64| super::expr_funcs::float_value(f);
             return match op {
-                '+' => Ok(Value::from_int(a.wrapping_add(b))),
-                '-' => Ok(Value::from_int(a.wrapping_sub(b))),
-                '*' => Ok(Value::from_int(a.wrapping_mul(b))),
+                '+' => Ok(match a.checked_add(b) {
+                    Some(r) => Value::from_int(r),
+                    None => promoted(a as f64 + b as f64),
+                }),
+                '-' => Ok(match a.checked_sub(b) {
+                    Some(r) => Value::from_int(r),
+                    None => promoted(a as f64 - b as f64),
+                }),
+                '*' => Ok(match a.checked_mul(b) {
+                    Some(r) => Value::from_int(r),
+                    None => promoted(a as f64 * b as f64),
+                }),
                 '/' => {
                     if b == 0 { return Err(Error::DivisionByZero); }
+                    // i64::MIN / -1 overflows in Rust; Tcl widens to bignum
+                    if a == i64::MIN && b == -1 {
+                        return Ok(promoted(-(a as f64)));
+                    }
                     Ok(Value::from_int(floor_div(a, b)))
                 }
                 _ => Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
@@ -812,15 +884,10 @@ impl<'a> ExprParser<'a> {
                     }
                     _ => return Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
                 };
-                Ok(self.float_or_int(result))
+                Ok(super::expr_funcs::float_value(result))
             }
             _ => Err(Error::type_mismatch("number", "non-numeric value")),
         }
-    }
-
-    /// Return int if the float has no fractional part and fits in i64.
-    fn float_or_int(&self, f: f64) -> Value {
-        super::expr_funcs::float_or_int(f)
     }
     /// Skip one `parse_and` level operand without evaluating.
     /// Used for `||` short-circuit when LHS is true.

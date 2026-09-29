@@ -14,6 +14,36 @@ use crate::interp::{glob_match, Interp};
 use crate::value::{DictMap, Value};
 
 /// Parse a value as a dict, returning an owned DictMap (for mutation).
+/// Apply `dict with` write-back updates at the end of a (possibly nested)
+/// key path: descend `path` through nested dicts, then set each mapped key
+/// to the variable's present value (or remove keys whose variable was
+/// unset).
+fn dict_with_writeback(
+    interp: &Interp,
+    val: &Value,
+    path: &[&str],
+    mapped: &DictMap,
+) -> Result<Value> {
+    let mut entries = parse_dict(val)?;
+    if path.is_empty() {
+        for k in mapped.keys() {
+            match interp.get_var(k) {
+                Ok(v) => {
+                    entries.insert(k.clone(), v.clone());
+                }
+                Err(_) => {
+                    entries.shift_remove(k);
+                }
+            }
+        }
+    } else {
+        let child = entries.get(path[0]).cloned().unwrap_or_default();
+        let new_child = dict_with_writeback(interp, &child, &path[1..], mapped)?;
+        entries.insert(path[0].to_string(), new_child);
+    }
+    Ok(Value::from_dict_cached(entries))
+}
+
 fn parse_dict(val: &Value) -> Result<DictMap> {
     val.as_dict().ok_or_else(|| {
         Error::runtime(
@@ -437,50 +467,51 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let var_name = args[2].as_str();
             let body = args[args.len() - 1].as_str();
 
-            let dict_val = interp.get_var(var_name)?.clone();
-            let mut current = dict_val;
+            let mut current = interp.get_var(var_name)?.clone();
             let keys: Vec<&str> = args[3..args.len() - 1]
                 .iter()
                 .map(|a| a.as_str())
                 .collect();
             for key in &keys {
                 let entries = parse_dict(&current)?;
-                current = entries.get(*key).cloned().unwrap_or_default();
+                match entries.get(key) {
+                    Some(v) => current = v.clone(),
+                    None => {
+                        return Err(Error::runtime(
+                            format!("key \"{}\" not known in dictionary", key),
+                            crate::error::ErrorCode::Generic,
+                        ));
+                    }
+                }
             }
 
             let entries = parse_dict(&current)?;
-
-            let saved: Vec<(String, Option<Value>)> = entries
-                .keys()
-                .map(|k| {
-                    let old = interp.get_var(k).ok().cloned();
-                    (k.clone(), old)
-                })
-                .collect();
 
             for (k, v) in &entries {
                 interp.set_var(k, v.clone())?;
             }
 
             let result = interp.eval(body);
-
-            let mut new_entries = entries.empty_like(entries.len());
-            for k in entries.keys() {
-                if let Ok(v) = interp.get_var(k) {
-                    new_entries.insert(k.clone(), v.clone());
+            // tclsh leaves the mapped variables in place on error and does
+            // not write the dict back; break/continue still write back.
+            match &result {
+                Err(Error::ControlFlow { kind, .. }) => {
+                    if *kind == crate::error::ControlFlow::Error {
+                        return result;
+                    }
                 }
+                Err(_) => return result,
+                Ok(_) => {}
             }
 
-            for (k, old) in saved {
-                if let Some(v) = old {
-                    let _ = interp.set_var(&k, v);
-                } else {
-                    let _ = interp.unset_var(&k);
-                }
-            }
-
-            if keys.is_empty() {
-                interp.set_var(var_name, Value::from_dict_cached(new_entries))?;
+            // Write-back updates the variable's CURRENT dict (mid-body
+            // `dict set d ...` survives, dict-22.12): mapped keys take the
+            // variables' present values, deleted variables remove their
+            // keys. A variable deleted mid-body stays deleted. Nested key
+            // paths write back through the chain (dict-22.16).
+            if let Ok(var_now) = interp.get_var(var_name) {
+                let fresh = dict_with_writeback(interp, var_now, &keys, &entries)?;
+                interp.set_var(var_name, fresh)?;
             }
 
             result
@@ -756,6 +787,91 @@ mod tests {
     use crate::interp::Interp;
 
     // ── Ordered dict tests ─────────────────────────────────────
+
+    // ── dict with (tclsh 8.6 semantics, corpus dict-22.x) ──────
+
+    #[test]
+    fn test_dict_with_writeback_updates_current_dict() {
+        let mut interp = Interp::new();
+        // 22.12: mid-body `dict set d c 3` survives the write-back; the
+        // unset mapped variable removes its key; set vars take new values.
+        let r = interp
+            .eval(r#"set d {a 1 b 2}
+                list [dict with d {
+                    set a $b
+                    unset b
+                    dict set d c 3
+                    list ok
+                }] $d"#)
+            .unwrap();
+        assert_eq!(r.as_str(), "ok {a 2 c 3}");
+    }
+
+    #[test]
+    fn test_dict_with_break_writes_back() {
+        let mut interp = Interp::new();
+        // 22.14: break mid-body still writes back the mapped vars.
+        let r = interp
+            .eval(r#"set d {a 1 b 2}
+                foreach x {1 2 3} {
+                    dict with d {
+                        incr a $b
+                        if {$x == 2} break
+                    }
+                    unset a b
+                }
+                list $a $b $x $d"#)
+            .unwrap();
+        assert_eq!(r.as_str(), "5 2 2 {a 5 b 2}");
+    }
+
+    #[test]
+    fn test_dict_with_nested_key_path() {
+        let mut interp = Interp::new();
+        // 22.16: nested path writes back through the chain.
+        let r = interp
+            .eval(r#"set d {p {q {a 1 b 2}}}
+                dict with d p q {
+                    set a $b.$a
+                }
+                set d"#)
+            .unwrap();
+        assert_eq!(r.as_str(), "p {q {a 2.1 b 2}}");
+        // A path key that does not exist is an error.
+        assert_eq!(
+            interp
+                .eval("catch {dict with d nope {zz}} m; set m")
+                .unwrap()
+                .as_str(),
+            "key \"nope\" not known in dictionary"
+        );
+    }
+
+    #[test]
+    fn test_dict_with_vars_persist_no_restore() {
+        let mut interp = Interp::new();
+        // 22.20: empty body — the mapped variables remain afterwards.
+        let r = interp
+            .eval(r#"apply {d {
+                dict with d {
+                }
+                return $a,$b
+            }} {a 1 b 2}"#)
+            .unwrap();
+        assert_eq!(r.as_str(), "1,2");
+    }
+
+    #[test]
+    fn test_dict_with_error_no_writeback() {
+        let mut interp = Interp::new();
+        // Body error: variables stay mapped, dict not written back.
+        let r = interp
+            .eval(r#"set d {a 1 b 2}
+                catch {dict with d {error boom}}
+                list [info exists a] $d"#)
+            .unwrap();
+        assert_eq!(r.as_str(), "1 {a 1 b 2}");
+    }
 
     #[test]
     fn test_dict_create_and_get() {

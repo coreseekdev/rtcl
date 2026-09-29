@@ -184,6 +184,19 @@ impl Error {
         }
     }
 
+    /// Create a `return -level N`: negative encodes the explicit level as
+    /// −(N+1) so it cannot collide with the -code completion codes and so
+    /// −1 (i.e. `-level 0`) can be recognized by script boundaries.
+    pub fn ret_level(level: i32, value: Option<Value>) -> Self {
+        Error::ControlFlow {
+            kind: ControlFlow::Return,
+            value,
+            level: -(level + 1),
+            error_info: None,
+            error_code: None,
+        }
+    }
+
     /// Create a return with explicit code (for `return -code`)
     /// Always uses Return kind so proc boundary catches it, but level carries the target code.
     pub fn return_with_code(code: i32, value: Option<Value>) -> Self {

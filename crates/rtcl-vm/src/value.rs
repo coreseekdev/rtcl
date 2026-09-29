@@ -981,6 +981,18 @@ pub struct ListParseError {
 /// verbatim (backslashes only affect brace counting); quoted and bare
 /// elements undergo backslash substitution (`TclCopyAndCollapse`).
 pub fn parse_list_full(s: &str) -> std::result::Result<Vec<Value>, ListParseError> {
+    parse_elements(s, false)
+}
+
+/// Parse a string as a Tcl dictionary's element sequence, reporting Tcl's
+/// dict-specific error texts and errorCodes. `tclDictObj.c` shares the
+/// list element scanner but says "dict element in braces followed by ..."
+/// and raises TCL VALUE DICTIONARY JUNK/BRACE/QUOTE.
+pub fn parse_dict_full(s: &str) -> std::result::Result<Vec<Value>, ListParseError> {
+    parse_elements(s, true)
+}
+
+fn parse_elements(s: &str, dict: bool) -> std::result::Result<Vec<Value>, ListParseError> {
     let b = s.as_bytes();
     let mut result = Vec::new();
     let mut i = 0;
@@ -991,14 +1003,14 @@ pub fn parse_list_full(s: &str) -> std::result::Result<Vec<Value>, ListParseErro
         if i >= b.len() {
             break;
         }
-        let (elem, next) = find_element(s, i)?;
+        let (elem, next) = find_element(s, i, dict)?;
         result.push(Value::from_str(&elem));
         i = next;
     }
     Ok(result)
 }
 
-fn junk_error(s: &str, i: usize, kind: &str) -> ListParseError {
+fn junk_error(s: &str, i: usize, kind: &str, dict: bool) -> ListParseError {
     // Tcl reports up to 20 bytes of the offending text.
     let b = s.as_bytes();
     let mut j = i;
@@ -1008,20 +1020,30 @@ fn junk_error(s: &str, i: usize, kind: &str) -> ListParseError {
     while !s.is_char_boundary(j) {
         j -= 1;
     }
+    let (what, code) = if dict {
+        ("dict", "TCL VALUE DICTIONARY JUNK")
+    } else {
+        ("list", "TCL VALUE LIST JUNK")
+    };
     ListParseError {
         message: format!(
-            "list element in {} followed by \"{}\" instead of space",
+            "{} element in {} followed by \"{}\" instead of space",
+            what,
             kind,
             &s[i..j]
         ),
-        code: "TCL VALUE LIST JUNK",
+        code,
     }
 }
 
 /// Locate the list element starting at byte `start` (which must not be
 /// whitespace). Returns the element value and the position just past any
 /// whitespace following the element.
-fn find_element(s: &str, start: usize) -> std::result::Result<(String, usize), ListParseError> {
+fn find_element(
+    s: &str,
+    start: usize,
+    dict: bool,
+) -> std::result::Result<(String, usize), ListParseError> {
     let b = s.as_bytes();
     let mut i = start;
 
@@ -1048,7 +1070,7 @@ fn find_element(s: &str, start: usize) -> std::result::Result<(String, usize), L
                             }
                             return Ok((s[elem_start..i - 1].to_string(), j));
                         }
-                        return Err(junk_error(s, i, "braces"));
+                        return Err(junk_error(s, i, "braces", dict));
                     }
                 }
                 b'\\' => {
@@ -1058,9 +1080,16 @@ fn find_element(s: &str, start: usize) -> std::result::Result<(String, usize), L
                 _ => i += 1,
             }
         }
-        return Err(ListParseError {
-            message: "unmatched open brace in list".to_string(),
-            code: "TCL VALUE LIST BRACE",
+        return Err(if dict {
+            ListParseError {
+                message: "unmatched open brace in dict".to_string(),
+                code: "TCL VALUE DICTIONARY BRACE",
+            }
+        } else {
+            ListParseError {
+                message: "unmatched open brace in list".to_string(),
+                code: "TCL VALUE LIST BRACE",
+            }
         });
     }
 
@@ -1082,7 +1111,7 @@ fn find_element(s: &str, start: usize) -> std::result::Result<(String, usize), L
                         let v = if has_backslash { collapse(raw) } else { raw.to_string() };
                         return Ok((v, j));
                     }
-                    return Err(junk_error(s, i, "quotes"));
+                    return Err(junk_error(s, i, "quotes", dict));
                 }
                 b'\\' => {
                     has_backslash = true;
@@ -1092,9 +1121,16 @@ fn find_element(s: &str, start: usize) -> std::result::Result<(String, usize), L
                 _ => i += 1,
             }
         }
-        return Err(ListParseError {
-            message: "unmatched open quote in list".to_string(),
-            code: "TCL VALUE LIST QUOTE",
+        return Err(if dict {
+            ListParseError {
+                message: "unmatched open quote in dict".to_string(),
+                code: "TCL VALUE DICTIONARY QUOTE",
+            }
+        } else {
+            ListParseError {
+                message: "unmatched open quote in list".to_string(),
+                code: "TCL VALUE LIST QUOTE",
+            }
         });
     }
 

@@ -426,6 +426,33 @@ pub fn cmd_expr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     interp.eval_expr(&expr_str)
 }
 
+/// `tcl::mathop::+ ?value ...?`: fold operands with expr's numeric `+`
+/// (ints stay ints, overflow promotes to double, any float forces float).
+pub fn cmd_mathop_plus(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let _ = interp;
+    let mut acc = Value::from_int(0);
+    for arg in &args[1..] {
+        acc = mathop_add(&acc, arg)?;
+    }
+    Ok(acc)
+}
+
+fn mathop_add(a: &Value, b: &Value) -> Result<Value> {
+    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+        return Ok(match x.checked_add(y) {
+            Some(r) => Value::from_int(r),
+            None => crate::types::expr_funcs::float_value(x as f64 + y as f64),
+        });
+    }
+    if let (Some(x), Some(y)) = (a.as_float().or(a.as_int().map(|i| i as f64)), b.as_float().or(b.as_int().map(|i| i as f64))) {
+        return Ok(crate::types::expr_funcs::float_value(x + y));
+    }
+    Err(Error::runtime(
+        format!("can't use non-numeric string as operand of \"+\""),
+        crate::error::ErrorCode::InvalidOp,
+    ))
+}
+
 pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(Error::wrong_args("incr", 2, args.len()));

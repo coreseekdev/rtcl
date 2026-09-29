@@ -24,7 +24,7 @@ fn dict_with_writeback(
     path: &[&str],
     mapped: &DictMap,
 ) -> Result<Value> {
-    let mut entries = parse_dict(val)?;
+    let mut entries = parse_dict_raw(val).map_err(|e| super::list::tcl_err(e.msg))?;
     if path.is_empty() {
         for k in mapped.keys() {
             match interp.get_var(k) {
@@ -44,24 +44,64 @@ fn dict_with_writeback(
     Ok(Value::from_dict_cached(entries))
 }
 
-fn parse_dict(val: &Value) -> Result<DictMap> {
-    val.as_dict().ok_or_else(|| {
-        Error::runtime(
-            "missing value to go with key",
-            crate::error::ErrorCode::InvalidOp,
-        )
+/// A failed dict parse: Tcl's message plus the `::errorCode` tail that
+/// tclDictObj.c raises with it.
+struct DictParseFail {
+    msg: String,
+    code: &'static str,
+}
+
+/// Parse without touching the interp: used by nested re-parses whose
+/// error paths only need the message.
+fn parse_dict_raw(val: &Value) -> std::result::Result<DictMap, DictParseFail> {
+    match val.as_dict() {
+        Some(m) => Ok(m),
+        None => {
+            // Strict re-parse so malformed strings report the dict-specific
+            // texts ("dict element in braces followed by ...") and
+            // DICTIONARY errorCodes instead of the list ones.
+            let list = crate::value::parse_dict_full(&val.to_str()).map_err(|e| DictParseFail {
+                msg: e.message,
+                code: e.code,
+            })?;
+            if list.len() % 2 != 0 {
+                return Err(DictParseFail {
+                    msg: "missing value to go with key".to_string(),
+                    code: "TCL VALUE DICTIONARY",
+                });
+            }
+            let mut map = DictMap::ordered_with_capacity(list.len() / 2);
+            for c in list.chunks(2) {
+                map.insert(c[0].as_str().to_string(), c[1].clone());
+            }
+            Ok(map)
+        }
+    }
+}
+
+/// Parse a value as a dict, mirroring Tcl's `::errorCode` on failure
+/// (raise-time global plus the `-errorcode` carried in the error itself
+/// so `catch ... -> opt` reports it, as `error msg info code` does).
+fn parse_dict(interp: &mut Interp, val: &Value) -> Result<DictMap> {
+    parse_dict_raw(val).map_err(|e| {
+        super::list::set_error_code(interp, e.code);
+        Error::ControlFlow {
+            kind: crate::error::ControlFlow::Error,
+            value: Some(Value::from_str(&e.msg)),
+            level: 1,
+            error_info: None,
+            error_code: Some(e.code.to_string()),
+        }
     })
 }
 
 /// Borrow a value as a dict without cloning when possible.
 /// Returns `Cow::Borrowed` for zero-copy access to cached dicts.
-fn borrow_dict(val: &Value) -> Result<Cow<'_, DictMap>> {
-    val.as_dict_cow().ok_or_else(|| {
-        Error::runtime(
-            "missing value to go with key",
-            crate::error::ErrorCode::InvalidOp,
-        )
-    })
+fn borrow_dict<'a>(interp: &mut Interp, val: &'a Value) -> Result<Cow<'a, DictMap>> {
+    match val.as_dict_cow() {
+        Some(cow) => Ok(cow),
+        None => Ok(std::borrow::Cow::Owned(parse_dict(interp, val)?)),
+    }
 }
 
 pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -118,7 +158,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             // Single-key fast path: zero-copy via borrow
             if args.len() == 4 {
-                let entries = borrow_dict(&args[2])?;
+                let entries = borrow_dict(interp, &args[2])?;
                 let key = args[3].as_str();
                 return match entries.get(key) {
                     Some(v) => Ok(v.clone()),
@@ -132,7 +172,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let mut current = args[2].clone();
             for key_arg in &args[3..] {
                 let key = key_arg.as_str();
-                let entries = borrow_dict(&current)?;
+                let entries = borrow_dict(interp, &current)?;
                 match entries.get(key) {
                     Some(v) => current = v.clone(),
                     None => {
@@ -163,7 +203,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .map(|v| v.as_str())
                 .collect();
             let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
-            let entries = parse_dict(&dict_val).unwrap_or_default();
+            let entries = parse_dict(interp, &dict_val)?;
             let new_entries = dict_set_nested(entries, &keys, value)?;
             let result_val = Value::from_dict_cached(new_entries);
             interp.set_var(var_name, result_val)
@@ -181,7 +221,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let var_name = args[2].as_str();
             let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
-            let mut entries = parse_dict(&dict_val)?;
+            let mut entries = parse_dict(interp, &dict_val)?;
             if args.len() == 4 {
                 entries.shift_remove(args[3].as_str());
             } else {
@@ -201,7 +241,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             // Single-key fast path: zero-copy
             if args.len() == 4 {
-                let entries = borrow_dict(&args[2]);
+                let entries = borrow_dict(interp, &args[2]);
                 let key = args[3].as_str();
                 return Ok(Value::from_bool(
                     entries.map_or(false, |e| e.contains_key(key)),
@@ -229,7 +269,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dict keys", 3, args.len(), "dictionary ?pattern?",
                 ));
             }
-            let entries = borrow_dict(&args[2])?;
+            let entries = borrow_dict(interp, &args[2])?;
             let pattern = if args.len() == 4 {
                 Some(args[3].as_str())
             } else {
@@ -250,7 +290,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dict values", 3, args.len(), "dictionary ?pattern?",
                 ));
             }
-            let entries = borrow_dict(&args[2])?;
+            let entries = borrow_dict(interp, &args[2])?;
             let pattern = if args.len() == 4 {
                 Some(args[3].as_str())
             } else {
@@ -271,7 +311,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dict size", 3, args.len(), "dictionary",
                 ));
             }
-            let entries = borrow_dict(&args[2])?;
+            let entries = borrow_dict(interp, &args[2])?;
             Ok(Value::from_int(entries.len() as i64))
         }
 
@@ -285,7 +325,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "{keyVarName valueVarName} dictionary script",
                 ));
             }
-            let var_list = args[2].as_list().unwrap_or_default();
+            let var_list = super::list::strict_list(interp, &args[2])?;
             if var_list.len() != 2 {
                 return Err(Error::runtime(
                     "must have exactly two variable names",
@@ -295,13 +335,13 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let key_var = var_list[0].as_str().to_string();
             let val_var = var_list[1].as_str().to_string();
             // Clone the dict: body evaluation may modify variables
-            let entries = parse_dict(&args[3])?;
+            let entries = parse_dict(interp, &args[3])?;
             let body = args[4].as_str();
             let mut result = Value::empty();
             for (k, v) in &entries {
                 interp.set_var(&key_var, Value::from_str(k))?;
                 interp.set_var(&val_var, v.clone())?;
-                match interp.eval(body) {
+                match demote_level0_return(interp.eval(body)) {
                     Ok(r) => result = r,
                     Err(e) => {
                         if e.is_break() {
@@ -319,15 +359,26 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
         // ── dict merge ?dictionary ...? ────────────────────────
         "merge" => {
-            let mut entries = DictMap::ordered();
-            for arg in &args[2..] {
-                let new_entries = parse_dict(arg)?;
-                // Inherit ordering from the first dict that has entries
-                if entries.is_empty() && !new_entries.is_empty() {
-                    entries = new_entries;
-                } else {
-                    entries.extend(new_entries);
-                }
+            // tclsh seeds the result with a duplicate of the first
+            // dictionary; the duplicate only becomes observable (keeps the
+            // original string representation, spaces and all) when no
+            // later dict inserts anything. Any non-empty later dict — even
+            // one whose entries duplicate existing pairs (dict-20.23) —
+            // invalidates the string rep and forces a rebuild.
+            let first = if args.len() > 2 {
+                Some(parse_dict(interp, &args[2])?)
+            } else {
+                None
+            };
+            let mut entries = first.clone().unwrap_or_else(DictMap::ordered);
+            let mut touched = false;
+            for arg in args.get(3..).unwrap_or(&[]) {
+                let new_entries = parse_dict(interp, arg)?;
+                touched = touched || !new_entries.is_empty();
+                entries.extend(new_entries);
+            }
+            if first.is_some() && !touched {
+                return Ok(args[2].clone());
             }
             Ok(Value::from_dict_cached(entries))
         }
@@ -347,7 +398,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dictionary ?key value ...?",
                 ));
             }
-            let mut entries = parse_dict(&args[2])?;
+            let mut entries = parse_dict(interp, &args[2])?;
             for chunk in args[3..].chunks(2) {
                 entries.insert(chunk[0].as_str().to_string(), chunk[1].clone());
             }
@@ -367,7 +418,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let var_name = args[2].as_str();
             let key = args[3].as_str();
             let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
-            let mut entries = parse_dict(&dict_val).unwrap_or_default();
+            let mut entries = parse_dict(interp, &dict_val)?;
             let cur = entries
                 .get(key)
                 .map(|v| v.as_str().to_string())
@@ -401,7 +452,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 1
             };
             let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
-            let mut entries = parse_dict(&dict_val).unwrap_or_default();
+            let mut entries = parse_dict(interp, &dict_val)?;
             let cur = entries.get(key).and_then(|v| v.as_int()).unwrap_or(0);
             entries.insert(key.to_string(), Value::from_int(cur + incr));
             let result = Value::from_dict_cached(entries);
@@ -421,7 +472,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let var_name = args[2].as_str();
             let key = args[3].as_str();
             let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
-            let mut entries = parse_dict(&dict_val).unwrap_or_default();
+            let mut entries = parse_dict(interp, &dict_val)?;
             let cur_val = entries.get(key).cloned().unwrap_or_default();
             let mut list = if cur_val.is_empty() {
                 Vec::new()
@@ -447,7 +498,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dictionary ?key ...?",
                 ));
             }
-            let mut entries = parse_dict(&args[2])?;
+            let mut entries = parse_dict(interp, &args[2])?;
             for key_arg in &args[3..] {
                 entries.shift_remove(key_arg.as_str());
             }
@@ -473,7 +524,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .map(|a| a.as_str())
                 .collect();
             for key in &keys {
-                let entries = parse_dict(&current)?;
+                let entries = parse_dict(interp, &current)?;
                 match entries.get(key) {
                     Some(v) => current = v.clone(),
                     None => {
@@ -485,13 +536,13 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
             }
 
-            let entries = parse_dict(&current)?;
+            let entries = parse_dict(interp, &current)?;
 
             for (k, v) in &entries {
                 interp.set_var(k, v.clone())?;
             }
 
-            let result = interp.eval(body);
+            let result = demote_level0_return(interp.eval(body));
             // tclsh leaves the mapped variables in place on error and does
             // not write the dict back; break/continue still write back.
             match &result {
@@ -529,7 +580,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             // The dictionary string is parsed before the filter type is
             // examined (dict-17.5: odd list beats everything else).
-            let entries = parse_dict(&args[2])?;
+            let entries = parse_dict(interp, &args[2])?;
             let ordered = entries.is_ordered();
             let filter_type = args[3].as_str();
 
@@ -582,7 +633,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     for (k, v) in &entries {
                         interp.set_var(&key_var, Value::from_str(k))?;
                         interp.set_var(&val_var, v.clone())?;
-                        match interp.eval(script) {
+                        match demote_level0_return(interp.eval(script)) {
                             Ok(r) => {
                                 // tclsh requires a boolean body result
                                 // ("expected boolean value but got ...").
@@ -632,13 +683,13 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let key_var = var_list[0].as_str().to_string();
             let val_var = var_list[1].as_str().to_string();
-            let entries = parse_dict(&args[3])?;
+            let entries = parse_dict(interp, &args[3])?;
             let body = args[4].as_str();
             let mut result_entries = entries.empty_like(entries.len());
             for (k, v) in &entries {
                 interp.set_var(&key_var, Value::from_str(k))?;
                 interp.set_var(&val_var, v.clone())?;
-                match interp.eval(body) {
+                match demote_level0_return(interp.eval(body)) {
                     Ok(new_v) => {
                         result_entries.insert(k.clone(), new_v);
                     }
@@ -666,7 +717,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dictionary",
                 ));
             }
-            let entries = borrow_dict(&args[2])?;
+            let entries = borrow_dict(interp, &args[2])?;
             let kind = if entries.is_ordered() { "ordered" } else { "unordered" };
             Ok(Value::from_str(&format!(
                 "{} entries in {} dict",
@@ -689,7 +740,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let mut current = args[2].clone();
             let keys = &args[3..args.len() - 1];
             for key in keys {
-                let entries = borrow_dict(&current)?;
+                let entries = borrow_dict(interp, &current)?;
                 match entries.get(key.as_str()) {
                     Some(v) => current = v.clone(),
                     None => return Ok(default.clone()),
@@ -716,7 +767,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .collect();
 
             let dict_val = interp.get_var(&var_name).ok().cloned().unwrap_or_default();
-            let entries = parse_dict(&dict_val).unwrap_or_default();
+            let entries = parse_dict(interp, &dict_val)?;
 
             for (key, local_var) in &pairs {
                 if let Some(v) = entries.get(key.as_str()) {
@@ -728,7 +779,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
             if interp.get_var(&var_name).is_ok() {
                 let cur_val = interp.get_var(&var_name).ok().cloned().unwrap_or_default();
-                let mut new_entries = parse_dict(&cur_val).unwrap_or_default();
+                let mut new_entries = parse_dict(interp, &cur_val)?;
                 for (key, local_var) in &pairs {
                     if let Ok(val) = interp.get_var(local_var) {
                         new_entries.insert(key.clone(), val.clone());
@@ -770,7 +821,7 @@ fn dict_set_nested(
     } else {
         let key = keys[0];
         let sub_val = entries.get(key).cloned().unwrap_or_default();
-        let sub_entries = parse_dict(&sub_val).unwrap_or_default();
+        let sub_entries = parse_dict_raw(&sub_val).map_err(|e| super::list::tcl_err(e.msg))?;
         let new_sub_entries = dict_set_nested(sub_entries, &keys[1..], value)?;
         entries.insert(key.to_string(), Value::from_dict_cached(new_sub_entries));
     }
@@ -782,13 +833,79 @@ fn dict_unset_nested(entries: &mut DictMap, keys: &[&str]) -> Result<()> {
         entries.shift_remove(keys[0]);
     } else {
         let key = keys[0];
-        if let Some(sub_val) = entries.get(key).cloned() {
-            let mut sub_entries = parse_dict(&sub_val)?;
-            dict_unset_nested(&mut sub_entries, &keys[1..])?;
-            entries.insert(key.to_string(), Value::from_dict_cached(sub_entries));
-        }
+        // A missing key along the path is an error ("key "c" not known in
+        // dictionary"); a present key whose value is not a dict fails in
+        // the recursive parse below (dict-16.14/16.15).
+        let sub_val = entries.get(key).cloned().ok_or_else(|| not_known(key))?;
+        let mut sub_entries = parse_dict_raw(&sub_val).map_err(|e| super::list::tcl_err(e.msg))?;
+        dict_unset_nested(&mut sub_entries, &keys[1..])?;
+        entries.insert(key.to_string(), Value::from_dict_cached(sub_entries));
     }
     Ok(())
+}
+
+/// A `return -level 0` ends the current *script* with its value: command
+/// bodies see a normal completion carrying that value (tclsh converts
+/// TCL_RETURN with level 0 at the script boundary; cmd_return encodes
+/// explicit `-level 0` as level −1). Plain `return` and `-level N ≥ 1`
+/// keep propagating.
+fn demote_level0_return(r: Result<Value>) -> Result<Value> {
+    match r {
+        Err(Error::ControlFlow {
+            kind: crate::error::ControlFlow::Return,
+            level: -1,
+            value,
+            ..
+        }) => Ok(value.unwrap_or_default()),
+        other => other,
+    }
+}
+
+/// `tcl::dict::<sub>` ensemble commands: dispatch to `dict <sub> ...`
+/// with the invoked name preserved for error messages.
+macro_rules! dict_ensemble {
+    ($($fn_name:ident => $sub:literal),* $(,)?) => { $(
+        pub fn $fn_name(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+            let mut full: Vec<Value> = Vec::with_capacity(args.len() + 1);
+            if let Some(first) = args.first() {
+                full.push(first.clone());
+            }
+            full.push(Value::from_str($sub));
+            full.extend_from_slice(&args[1..]);
+            cmd_dict(interp, &full)
+        }
+    )* };
+}
+
+dict_ensemble! {
+    cmd_dict_ens_append => "append",
+    cmd_dict_ens_create => "create",
+    cmd_dict_ens_exists => "exists",
+    cmd_dict_ens_filter => "filter",
+    cmd_dict_ens_for => "for",
+    cmd_dict_ens_get => "get",
+    cmd_dict_ens_incr => "incr",
+    cmd_dict_ens_info => "info",
+    cmd_dict_ens_keys => "keys",
+    cmd_dict_ens_lappend => "lappend",
+    cmd_dict_ens_map => "map",
+    cmd_dict_ens_merge => "merge",
+    cmd_dict_ens_remove => "remove",
+    cmd_dict_ens_replace => "replace",
+    cmd_dict_ens_set => "set",
+    cmd_dict_ens_size => "size",
+    cmd_dict_ens_unset => "unset",
+    cmd_dict_ens_update => "update",
+    cmd_dict_ens_values => "values",
+    cmd_dict_ens_with => "with",
+}
+
+/// Tcl's `key "X" not known in dictionary`.
+fn not_known(key: &str) -> Error {
+    Error::runtime(
+        format!("key \"{}\" not known in dictionary", key),
+        crate::error::ErrorCode::NotFound,
+    )
 }
 
 // ── Tests ──────────────────────────────────────────────────────
@@ -1034,6 +1151,140 @@ mod tests {
             interp.eval("dict keys [dict filter {abc 1 abd 2 xyz 3} key ab*]").unwrap().as_str(),
             "abc abd"
         );
+    }
+
+    #[test]
+    fn test_dict_parse_junk_errors() {
+        // dict-4.14/4.15: tclDictObj.c's dict-specific element errors.
+        let mut interp = Interp::new();
+        let e = interp.eval("dict replace { a b {}c d }").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "dict element in braces followed by \"c\" instead of space"
+        );
+        let e = interp.eval("dict replace { a b \"\"c d }").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "dict element in quotes followed by \"c\" instead of space"
+        );
+        let e = interp.eval(r#"dict replace " a b \"c d ""#).unwrap_err();
+        assert_eq!(e.to_string(), "unmatched open quote in dict");
+        let e = interp.eval("dict replace \"{\"").unwrap_err();
+        assert_eq!(e.to_string(), "unmatched open brace in dict");
+    }
+
+    #[test]
+    fn test_dict_parse_junk_errorcode() {
+        // dict-4.14a/4.16a: DICTIONARY JUNK / QUOTE errorCodes.
+        let mut interp = Interp::new();
+        let r = interp
+            .eval("catch {dict replace { a b {}c d }} -> opt; dict get $opt -errorcode")
+            .unwrap();
+        assert_eq!(r.as_str(), "TCL VALUE DICTIONARY JUNK");
+        let r = interp
+            .eval(r#"catch {dict replace " a b \"c d "} -> opt; dict get $opt -errorcode"#)
+            .unwrap();
+        assert_eq!(r.as_str(), "TCL VALUE DICTIONARY QUOTE");
+    }
+
+    #[test]
+    fn test_dict_merge_no_args() {
+        // `dict merge` with no dictionaries is an empty dict.
+        let mut interp = Interp::new();
+        assert_eq!(interp.eval("dict merge").unwrap().as_str(), "");
+    }
+
+    #[test]
+    fn test_dict_merge_preserves_first_string() {
+        // dict-20.21/20.22: merging without additions returns the first
+        // dictionary unchanged, spaces and all.
+        let mut interp = Interp::new();
+        assert_eq!(
+            interp.eval("dict merge { a b c d }").unwrap().as_str(),
+            " a b c d "
+        );
+        assert_eq!(
+            interp.eval("dict merge { a b c d } {}").unwrap().as_str(),
+            " a b c d "
+        );
+        // Adding keys rebuilds the string rep.
+        assert_eq!(
+            interp.eval("dict merge { a b c d } { e f }").unwrap().as_str(),
+            "a b c d e f"
+        );
+        // An empty first dict yields the rebuilt result.
+        assert_eq!(
+            interp.eval("dict merge {} { a b c d }").unwrap().as_str(),
+            "a b c d"
+        );
+    }
+
+    #[test]
+    fn test_dict_unset_missing_path_key() {
+        // dict-16.15: a missing key along a multi-key unset path errors;
+        // a single missing key is a no-op.
+        let mut interp = Interp::new();
+        interp.eval("set d {a b}").unwrap();
+        let e = interp.eval("dict unset d c d").unwrap_err();
+        assert_eq!(e.to_string(), "key \"c\" not known in dictionary");
+        let r = interp.eval("dict unset d c").unwrap();
+        assert_eq!(r.as_str(), "a b");
+    }
+
+    #[test]
+    fn test_dict_for_varlist_strict() {
+        // dict-14.7: the varlist is parsed as a strict list, before the dict.
+        let mut interp = Interp::new();
+        let e = interp.eval("dict for \"\\{x\" x x").unwrap_err();
+        assert!(e.to_string().contains("unmatched open brace in list"));
+    }
+
+    #[test]
+    fn test_return_level0_in_command_bodies() {
+        // dict-24.22: `return -level 0` completes the body with its value
+        // instead of unwinding; a plain return still propagates.
+        let mut interp = Interp::new();
+        let r = interp
+            .eval("dict map {k v} {a 1 b 2} {return -level 0 \"$k,$v\"}")
+            .unwrap();
+        assert_eq!(r.as_str(), "a a,1 b b,2");
+        let r = interp
+            .eval("apply {{} {dict map {k v} {a 1} {return -level 0 X}}}")
+            .unwrap();
+        assert_eq!(r.as_str(), "a X");
+        // plain return in a body propagates to the proc boundary
+        let r = interp
+            .eval("apply {{} {dict map {k v} {a 1} {return X}}} ")
+            .unwrap();
+        assert_eq!(r.as_str(), "X");
+        // return -level 0 inside a caught script is a normal completion
+        let r = interp.eval("catch {return -level 0 xyz} m; set m").unwrap();
+        assert_eq!(r.as_str(), "xyz");
+    }
+
+    #[test]
+    fn test_tcl_dict_ensemble() {
+        // dict-23.3/23.5: tcl::dict::lappend / tcl::dict::incr.
+        let mut interp = Interp::new();
+        let r = interp
+            .eval("apply {{} {tcl::dict::lappend foo bar [format baz]}}")
+            .unwrap();
+        assert_eq!(r.as_str(), "bar baz");
+        let r = interp
+            .eval("apply {{} {tcl::dict::incr foo2 [format bar]}}")
+            .unwrap();
+        assert_eq!(r.as_str(), "bar 1");
+    }
+
+    #[test]
+    fn test_tcl_mathop_plus() {
+        // dict-24.24: tcl::mathop::+ folds with expr semantics.
+        let mut interp = Interp::new();
+        assert_eq!(interp.eval("tcl::mathop::+ 1 2 3").unwrap().as_str(), "6");
+        assert_eq!(interp.eval("tcl::mathop::+").unwrap().as_str(), "0");
+        assert_eq!(interp.eval("tcl::mathop::+ {*}[list 1 2]").unwrap().as_str(), "3");
+        let e = interp.eval("tcl::mathop::+ abc").unwrap_err();
+        assert!(e.to_string().contains("can't use non-numeric string"));
     }
 
     #[test]

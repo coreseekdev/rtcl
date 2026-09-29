@@ -429,7 +429,8 @@ pub fn cmd_continue(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Parse options: return ?-code code? ?-level level? ?-errorinfo info? ?-errorcode code? ?value?
     let mut code: Option<i32> = None;
-    let mut _level: i32 = 1; // default level
+    let mut level: i32 = 1; // default level
+    let mut level_given = false;
     let mut error_info: Option<String> = None;
     let mut error_code: Option<String> = None;
     let mut i = 1;
@@ -467,12 +468,13 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     crate::error::ErrorCode::Generic,
                 ));
             }
-            _level = args[i].as_str().parse::<i32>().map_err(|_| {
+            level = args[i].as_str().parse::<i32>().map_err(|_| {
                 Error::runtime(
                     format!("bad -level value \"{}\"", args[i].as_str()),
                     crate::error::ErrorCode::Generic,
                 )
             })?;
+            level_given = true;
             i += 1;
         } else if arg == "-errorinfo" {
             i += 1;
@@ -510,6 +512,12 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         None => {
             if error_info.is_some() || error_code.is_some() {
                 Err(Error::return_with_options(0, value, error_info, error_code))
+            } else if level_given {
+                // Explicit -level: encoded as -(N+1) so script boundaries
+                // can distinguish `return -level 0` (ends the current
+                // script, level −1) from a plain return (level 0 = leave
+                // the enclosing proc).
+                Err(Error::ret_level(level, value))
             } else {
                 Err(Error::ret(value))
             }
@@ -548,7 +556,18 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let result_var = if args.len() > 2 { Some(args[2].as_str()) } else { None };
     let opts_var = if args.len() > 3 { Some(args[3].as_str()) } else { None };
 
-    match interp.eval(script) {
+    // `return -level 0` (encoded level −1) ends the caught *script*
+    // itself: catch sees a normal completion carrying the value.
+    let caught = match interp.eval(script) {
+        Err(Error::ControlFlow {
+            kind: crate::error::ControlFlow::Return,
+            level: -1,
+            value,
+            ..
+        }) => Ok(value.unwrap_or_default()),
+        other => other,
+    };
+    match caught {
         Ok(v) => {
             if let Some(var) = result_var {
                 interp.set_var(var, v)?;

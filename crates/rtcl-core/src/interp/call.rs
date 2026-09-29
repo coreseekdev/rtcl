@@ -262,6 +262,12 @@ impl Interp {
                                     // Plain return (level=0 means just return the value)
                                     Ok(val)
                                 }
+                                n if n < 0 => {
+                                    // Explicit -level N encoded as -(N+1): any of
+                                    // these leaves this proc with its value
+                                    // (rtcl has no multi-level proc return).
+                                    Ok(val)
+                                }
                                 1 => {
                                     // return -code error "msg" → propagate as error,
                                     // preserving any -errorinfo / -errorcode options.

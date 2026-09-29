@@ -127,6 +127,33 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "json::encode", func: json::cmd_json_encode,    cat: Extension, cmd_id: None, usage: "value ?schema?",             help: "Encode Tcl value to JSON" },
 ];
 
+
+/// `tcl::dict::*` ensemble (tclsh exposes every dict subcommand under the
+/// tcl::dict namespace) plus the tcl::mathop operators the corpus uses.
+static CMD_TABLE_ENSEMBLE: &[CmdEntry] = &[
+    CmdEntry { name: "tcl::dict::append", func: dict::cmd_dict_ens_append, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::create", func: dict::cmd_dict_ens_create, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::exists", func: dict::cmd_dict_ens_exists, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::filter", func: dict::cmd_dict_ens_filter, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::for", func: dict::cmd_dict_ens_for, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::get", func: dict::cmd_dict_ens_get, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::incr", func: dict::cmd_dict_ens_incr, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::info", func: dict::cmd_dict_ens_info, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::keys", func: dict::cmd_dict_ens_keys, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::lappend", func: dict::cmd_dict_ens_lappend, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::map", func: dict::cmd_dict_ens_map, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::merge", func: dict::cmd_dict_ens_merge, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::remove", func: dict::cmd_dict_ens_remove, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::replace", func: dict::cmd_dict_ens_replace, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::set", func: dict::cmd_dict_ens_set, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::size", func: dict::cmd_dict_ens_size, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::unset", func: dict::cmd_dict_ens_unset, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::update", func: dict::cmd_dict_ens_update, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::values", func: dict::cmd_dict_ens_values, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::dict::with", func: dict::cmd_dict_ens_with, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
+    CmdEntry { name: "tcl::mathop::+", func: misc::cmd_mathop_plus, cat: Standard, cmd_id: None, usage: "?value ...?", help: "Sum values (expr +)" },
+];
+
 /// Commands gated behind `feature = "clock"`.
 #[cfg(feature = "clock")]
 static CMD_TABLE_CLOCK: &[CmdEntry] = &[
@@ -251,6 +278,9 @@ impl Interp {
         }
         #[cfg(feature = "std")]
         for entry in CMD_TABLE_EVENT {
+            self.register_entry(entry);
+        }
+        for entry in CMD_TABLE_ENSEMBLE {
             self.register_entry(entry);
         }
     }

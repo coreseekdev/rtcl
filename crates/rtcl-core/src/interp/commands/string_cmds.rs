@@ -19,19 +19,16 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "tolower" => Ok(Value::from_str(&str_val.to_lowercase())),
         "toupper" => Ok(Value::from_str(&str_val.to_uppercase())),
         "totitle" => {
-            let mut result = String::with_capacity(str_val.len());
-            let mut capitalize_next = true;
-            for c in str_val.chars() {
-                if capitalize_next {
-                    result.extend(c.to_uppercase());
-                    capitalize_next = false;
-                } else {
-                    result.extend(c.to_lowercase());
+            let mut chars = str_val.chars();
+            let result = match chars.next() {
+                Some(first) => {
+                    let mut s = String::new();
+                    s.push(to_titlecase(first));
+                    s.push_str(&chars.as_str().to_lowercase());
+                    s
                 }
-                if c.is_whitespace() {
-                    capitalize_next = true;
-                }
-            }
+                None => String::new(),
+            };
             Ok(Value::from_str(&result))
         }
         "trim" => {
@@ -136,14 +133,14 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // string first needleString haystackString ?startIndex?
             let needle = args[2].as_str();
             let haystack = args[3].as_str();
+            let hchars: Vec<char> = haystack.chars().collect();
             let start = if args.len() > 4 {
-                parse_index(args[4].as_str(), haystack.len()).unwrap_or(0)
+                parse_index(args[4].as_str(), hchars.len()).unwrap_or(0)
             } else {
                 0
             };
-            let pos = haystack[start..]
-                .find(needle)
-                .map(|i| (i + start) as i64)
+            let pos = find_chars(&hchars, needle, start)
+                .map(|i| i as i64)
                 .unwrap_or(-1);
             Ok(Value::from_int(pos))
         }
@@ -154,7 +151,23 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // string last needleString haystackString ?lastIndex?
             let needle = args[2].as_str();
             let haystack = args[3].as_str();
-            let pos = haystack.rfind(needle).map(|i| i as i64).unwrap_or(-1);
+            let hchars: Vec<char> = haystack.chars().collect();
+            // A match must end at or before lastIndex (default: end of string).
+            let last = if args.len() > 4 {
+                match parse_index(args[4].as_str(), hchars.len()) {
+                    Some(i) => i,
+                    // Negative index: no character is at or before it.
+                    None if args[4].as_str().trim().parse::<i64>().is_ok_and(|n| n < 0) => {
+                        return Ok(Value::from_int(-1));
+                    }
+                    None => hchars.len().saturating_sub(1),
+                }
+            } else {
+                hchars.len().saturating_sub(1)
+            };
+            let pos = rfind_chars(&hchars, needle, last)
+                .map(|i| i as i64)
+                .unwrap_or(-1);
             Ok(Value::from_int(pos))
         }
         "map" => {
@@ -207,7 +220,7 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let count = args[3].as_int().unwrap_or(0);
             if count < 0 {
-                return Err(Error::runtime("bad count", crate::error::ErrorCode::InvalidOp));
+                return Ok(Value::empty());
             }
             Ok(Value::from_str(&str_val.repeat(count as usize)))
         }
@@ -242,12 +255,9 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let class = str_val; // args[2]
             let test_val = args[args.len() - 1].as_str();
             let result = match class {
-                "integer" | "int" | "wideinteger" => test_val.parse::<i64>().is_ok(),
+                "integer" | "int" | "wideinteger" => is_tcl_integer(test_val),
                 "double" | "real" => test_val.parse::<f64>().is_ok(),
-                "boolean" | "bool" | "true" | "false" => {
-                    matches!(test_val.to_lowercase().as_str(),
-                        "1" | "0" | "true" | "false" | "yes" | "no" | "on" | "off")
-                }
+                "boolean" | "bool" | "true" | "false" => is_tcl_boolean(test_val),
                 "alpha" => !test_val.is_empty() && test_val.chars().all(|c| c.is_alphabetic()),
                 "alnum" => !test_val.is_empty() && test_val.chars().all(|c| c.is_alphanumeric()),
                 "digit" => !test_val.is_empty() && test_val.chars().all(|c| c.is_ascii_digit()),
@@ -369,6 +379,96 @@ fn parse_string_opts(args: &[Value]) -> Result<(bool, Option<i64>, String, Strin
 /// A word character: alphanumeric or underscore (jimtcl convention).
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Find the first occurrence of `needle` in `haystack` at or after char index
+/// `start`. Returns the char index of the match. An empty needle never matches
+/// (Tcl returns -1).
+fn find_chars(haystack: &[char], needle: &str, start: usize) -> Option<usize> {
+    let nchars: Vec<char> = needle.chars().collect();
+    if nchars.is_empty() || start >= haystack.len() || nchars.len() > haystack.len() {
+        return None;
+    }
+    (start..=haystack.len() - nchars.len()).find(|&i| haystack[i..i + nchars.len()] == nchars[..])
+}
+
+/// Find the last occurrence of `needle` in `haystack` that ends at or before
+/// char index `last`. Returns the char index of the match start.
+fn rfind_chars(haystack: &[char], needle: &str, last: usize) -> Option<usize> {
+    let nchars: Vec<char> = needle.chars().collect();
+    if nchars.is_empty() || nchars.len() > haystack.len() {
+        return None;
+    }
+    let max_start = (last + 1).min(haystack.len()).checked_sub(nchars.len())?;
+    (0..=max_start)
+        .rev()
+        .find(|&i| haystack[i..i + nchars.len()] == nchars[..])
+}
+
+/// Tcl titlecase: simple (1:1) uppercase mapping, with digraphs mapped to
+/// their titlecase form. Characters whose uppercase expands to multiple
+/// chars (ß, ﬀ, ...) are left unchanged, matching Tcl's simple case tables.
+fn to_titlecase(c: char) -> char {
+    let mut up = c.to_uppercase();
+    match (up.next(), up.next()) {
+        (Some(u), None) => match u {
+            'Ǳ' => 'ǲ',
+            'Ǆ' => 'ǅ',
+            'Ǉ' => 'ǈ',
+            'Ǌ' => 'ǋ',
+            _ => u,
+        },
+        _ => c,
+    }
+}
+
+/// Tcl boolean: 0/1 or an unambiguous prefix of true/false/yes/no/on/off
+/// (case-insensitive).
+fn is_tcl_boolean(s: &str) -> bool {
+    if s == "0" || s == "1" {
+        return true;
+    }
+    if s.is_empty() {
+        return false;
+    }
+    let lower = s.to_lowercase();
+    const WORDS: [&str; 6] = ["true", "false", "yes", "no", "on", "off"];
+    WORDS.iter().filter(|w| w.starts_with(lower.as_str())).count() == 1
+}
+
+/// Tcl integer syntax: optional ASCII whitespace, optional sign, then decimal,
+/// legacy octal (`010`), or 0x/0b/0o-prefixed digits; value must fit in i64.
+fn is_tcl_integer(s: &str) -> bool {
+    let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    if t.is_empty() {
+        return false;
+    }
+    let (neg, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if digits.is_empty() {
+        return false;
+    }
+    let (base, digits) = if let Some(rest) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        (16, rest)
+    } else if let Some(rest) = digits.strip_prefix("0b").or_else(|| digits.strip_prefix("0B")) {
+        (2, rest)
+    } else if let Some(rest) = digits.strip_prefix("0o").or_else(|| digits.strip_prefix("0O")) {
+        (8, rest)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, digits)
+    } else {
+        (10, digits)
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(base)) {
+        return false;
+    }
+    match u64::from_str_radix(digits, base) {
+        Ok(mag) if !neg => mag <= i64::MAX as u64,
+        Ok(mag) => mag <= (i64::MAX as u64) + 1,
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]

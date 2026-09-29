@@ -71,9 +71,9 @@ fn test_glob_match_op() {
 #[test]
 fn test_regexp_match_op() {
     let mut interp = Interp::new();
-    assert_eq!(eval_expr(&mut interp, r#""abc" =~ "^[a-z]+$""#).unwrap().as_bool(), Some(true));
-    assert_eq!(eval_expr(&mut interp, r#""123" =~ "^[a-z]+$""#).unwrap().as_bool(), Some(false));
-    assert_eq!(eval_expr(&mut interp, r#""hello123" =~ "\\d+""#).unwrap().as_bool(), Some(true));
+    assert_eq!(eval_expr(&mut interp, r#""abc" =~ {^[a-z]+$}"#).unwrap().as_bool(), Some(true));
+    assert_eq!(eval_expr(&mut interp, r#""123" =~ {^[a-z]+$}"#).unwrap().as_bool(), Some(false));
+    assert_eq!(eval_expr(&mut interp, r#""hello123" =~ {\d+}"#).unwrap().as_bool(), Some(true));
 }
 
 // -- Rotate operators: <<<, >>> --

@@ -10,6 +10,34 @@ use std::collections::HashMap;
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeMap as HashMap;
 
+/// Parse a proc/lambda parameter list into (name, default) pairs.
+/// Tcl validates the specifiers at definition time:
+/// `{}` → "argument with no name", `{a b c}` → "too many fields ...".
+fn parse_param_specs(params: &[Value]) -> Result<Vec<(String, Option<String>)>> {
+    let mut specs: Vec<(String, Option<String>)> = Vec::new();
+    for param in params {
+        let parts = param.as_list().unwrap_or_else(|| vec![param.clone()]);
+        if parts.is_empty() {
+            return Err(Error::Msg("argument with no name".to_string()));
+        }
+        if parts.len() > 2 {
+            return Err(Error::Msg(format!(
+                "too many fields in argument specifier \"{}\"",
+                param.as_str()
+            )));
+        }
+        if parts.len() == 2 {
+            specs.push((
+                parts[0].as_str().to_string(),
+                Some(parts[1].as_str().to_string()),
+            ));
+        } else {
+            specs.push((parts[0].as_str().to_string(), None));
+        }
+    }
+    Ok(specs)
+}
+
 pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // 3-arg form: proc name argList body
     // 4-arg form: proc name argList statics body  (jimtcl-compatible)
@@ -40,18 +68,7 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let params = param_arg.as_list().unwrap_or_default();
     let body = body_arg.as_str().to_string();
 
-    let mut defaults: Vec<(String, Option<String>)> = Vec::new();
-    for param in &params {
-        let parts = param.as_list().unwrap_or_else(|| vec![param.clone()]);
-        if parts.len() == 2 {
-            defaults.push((
-                parts[0].as_str().to_string(),
-                Some(parts[1].as_str().to_string()),
-            ));
-        } else {
-            defaults.push((parts[0].as_str().to_string(), None));
-        }
-    }
+    let defaults = parse_param_specs(&params)?;
 
     // Parse statics list: each element is {varName ?initialValue?}
     let mut statics = HashMap::new();
@@ -126,18 +143,7 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let body = lambda[1].as_str().to_string();
 
     // Build param defaults (same logic as cmd_proc)
-    let mut defaults: Vec<(String, Option<String>)> = Vec::new();
-    for param in &param_list {
-        let parts = param.as_list().unwrap_or_else(|| vec![param.clone()]);
-        if parts.len() == 2 {
-            defaults.push((
-                parts[0].as_str().to_string(),
-                Some(parts[1].as_str().to_string()),
-            ));
-        } else {
-            defaults.push((parts[0].as_str().to_string(), None));
-        }
-    }
+    let defaults = parse_param_specs(&param_list)?;
 
     let proc_def = ProcDef {
         params: defaults,
@@ -146,13 +152,13 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
 
     // Create args for call_proc: [name, arg1, arg2, ...]
-    // We use a synthetic name "apply lambdaExpr"
+    // The proc name renders in arity errors as "apply lambdaExpr" (Tcl-compatible).
     let mut call_args = vec![Value::from_str("apply")];
     for arg in &args[2..] {
         call_args.push(arg.clone());
     }
 
-    interp.call_proc(&proc_def, &call_args, "apply")
+    interp.call_proc(&proc_def, &call_args, "apply lambdaExpr")
 }
 
 pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {

@@ -52,6 +52,49 @@ impl Interp {
                 &current_params[..]
             };
 
+            // ── Arity check (Tcl: wrong # args) ────────────────────
+            // Tcl binds positionally: any parameter left without an
+            // argument must have a default (or be the trailing `args`).
+            {
+                let num_args = current_args.len().saturating_sub(1);
+                let mut arity_ok = has_args || num_args <= regular_params.len();
+                if arity_ok {
+                    for (i, (_, d)) in regular_params.iter().enumerate() {
+                        if i >= num_args && d.is_none() {
+                            arity_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !arity_ok {
+                    // Tcl list-quotes the command name ("{}", "{a b  c}")
+                    // but appends parameter descriptors verbatim ("?arg ...?").
+                    let name_word = if current_proc_name == "apply lambdaExpr" {
+                        // Synthetic apply frame: Tcl renders this prefix literally.
+                        current_proc_name.clone()
+                    } else {
+                        crate::value::tcl_quote(&current_proc_name)
+                    };
+                    let mut usage = name_word;
+                    for (i, (p, d)) in current_params.iter().enumerate() {
+                        usage.push(' ');
+                        if has_args && i == current_params.len() - 1 {
+                            usage.push_str("?arg ...?");
+                        } else if d.is_some() {
+                            usage.push('?');
+                            usage.push_str(p);
+                            usage.push('?');
+                        } else {
+                            usage.push_str(p);
+                        }
+                    }
+                    break Err(Error::Msg(format!(
+                        "wrong # args: should be \"{}\"",
+                        usage
+                    )));
+                }
+            }
+
             for (i, (param, default)) in regular_params.iter().enumerate() {
                 let value = if i + 1 < current_args.len() {
                     current_args[i + 1].clone()

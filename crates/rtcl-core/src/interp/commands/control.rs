@@ -321,7 +321,15 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         Err(e) => {
             if let Some(var) = result_var {
-                interp.set_var(var, Value::from_str(&e.to_string()))?;
+                // Tcl: the result variable receives the result payload itself,
+                // not a rendering of the error (e.g. `return hi` → "hi",
+                // `break` → "").
+                let msg = match &e {
+                    Error::ControlFlow { value: Some(v), .. } => v.as_str().to_string(),
+                    Error::ControlFlow { value: None, .. } => String::new(),
+                    _ => e.to_string(),
+                };
+                interp.set_var(var, Value::from_str(&msg))?;
             }
             let code = if e.is_return() { 2 }
             else if e.is_break() { 3 }

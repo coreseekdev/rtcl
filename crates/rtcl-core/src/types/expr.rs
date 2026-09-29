@@ -33,18 +33,23 @@ impl<'a> ExprParser<'a> {
         }
     }
 
-    /// Ternary `?:` — lowest precedence
+    /// Ternary `?:` — lowest precedence. Lazy: only the taken branch is
+    /// evaluated; the other branch is skipped without side effects.
     fn parse_ternary(&mut self) -> Result<Value> {
         let cond = self.parse_or()?;
         self.skip_whitespace();
         if self.match_op("?") {
-            let then_val = self.parse_ternary()?;
-            self.expect(":")?;
-            let else_val = self.parse_ternary()?;
             if cond.is_true() {
+                let then_val = self.parse_ternary()?;
+                self.expect(":")?;
+                // Skip the untaken else-branch without evaluating it
+                self.skip_ternary_operand()?;
                 Ok(then_val)
             } else {
-                Ok(else_val)
+                // Skip the untaken then-branch up to the ':'
+                self.skip_ternary_operand()?;
+                self.expect(":")?;
+                self.parse_ternary()
             }
         } else {
             Ok(cond)
@@ -414,22 +419,7 @@ impl<'a> ExprParser<'a> {
         // Command substitution
         if self.peek() == '[' {
             self.advance();
-            let mut cmd = String::new();
-            let mut depth = 1;
-            while !self.is_at_end() && depth > 0 {
-                let c = self.advance();
-                if c == '[' {
-                    depth += 1;
-                    cmd.push(c);
-                } else if c == ']' {
-                    depth -= 1;
-                    if depth > 0 {
-                        cmd.push(c);
-                    }
-                } else {
-                    cmd.push(c);
-                }
-            }
+            let cmd = self.collect_bracket_command();
             return self.interp.eval(&cmd);
         }
 
@@ -556,6 +546,28 @@ impl<'a> ExprParser<'a> {
         }
     }
 
+    /// Collect the body of a `[...]` command substitution (the leading `[`
+    /// is already consumed). Returns the script between balanced brackets.
+    fn collect_bracket_command(&mut self) -> String {
+        let mut cmd = String::new();
+        let mut depth = 1;
+        while !self.is_at_end() && depth > 0 {
+            let c = self.advance();
+            if c == '[' {
+                depth += 1;
+                cmd.push(c);
+            } else if c == ']' {
+                depth -= 1;
+                if depth > 0 {
+                    cmd.push(c);
+                }
+            } else {
+                cmd.push(c);
+            }
+        }
+        cmd
+    }
+
     fn parse_string(&mut self) -> Result<Value> {
         let quote = self.advance();
         let mut s = String::new();
@@ -572,14 +584,46 @@ impl<'a> ExprParser<'a> {
                 }
                 s.push(self.advance());
             } else {
-                if self.peek() == close { self.advance(); break; }
-                if self.peek() == '\\' {
-                    self.advance();
-                    if !self.is_at_end() {
-                        s.push(self.parse_escape_char());
+                // Double-quoted word: perform $ / [] / backslash substitution
+                match self.peek() {
+                    c if c == close => { self.advance(); break; }
+                    '\\' => {
+                        self.advance();
+                        if !self.is_at_end() {
+                            s.push(self.parse_escape_char());
+                        }
                     }
-                } else {
-                    s.push(self.advance());
+                    '$' => {
+                        self.advance();
+                        let name = if self.peek() == '{' {
+                            // ${varname}
+                            self.advance();
+                            let mut name = String::new();
+                            while !self.is_at_end() && self.peek() != '}' {
+                                name.push(self.advance());
+                            }
+                            if !self.is_at_end() { self.advance(); } // consume '}'
+                            name
+                        } else {
+                            self.parse_var_name()
+                        };
+                        if name.is_empty() {
+                            // "$" with no variable name is a literal dollar sign
+                            s.push('$');
+                        } else {
+                            let val = self.interp.get_var(&name).cloned()?;
+                            s.push_str(val.as_str());
+                        }
+                    }
+                    '[' => {
+                        self.advance();
+                        let cmd = self.collect_bracket_command();
+                        let val = self.interp.eval(&cmd)?;
+                        s.push_str(val.as_str());
+                    }
+                    _ => {
+                        s.push(self.advance());
+                    }
                 }
             }
         }
@@ -790,6 +834,110 @@ impl<'a> ExprParser<'a> {
     /// Stops at: end, `&&` at depth 0, `||` at depth 0, `?` at depth 0.
     fn skip_and_operand(&mut self) -> Result<()> {
         self.skip_balanced(&["&&", "||", "?"])
+    }
+
+    /// Skip one ternary-level operand without evaluating it.
+    /// Used for `?:` lazy evaluation of the untaken branch.
+    /// Stops (without consuming) at: a top-level `:` (the then/else
+    /// separator of this or an enclosing ternary), `)` or `,` at depth 0
+    /// (enclosing paren group or function argument list), or end of input.
+    /// Nested `?...:` pairs encountered while skipping are tracked so their
+    /// `:` is not mistaken for the enclosing separator. A `:` that is part
+    /// of a `::` namespace qualifier is never a stop token.
+    fn skip_ternary_operand(&mut self) -> Result<()> {
+        let mut depth: i32 = 0;         // parenthesis depth
+        let mut ternary_depth: i32 = 0; // nested ?: opened while skipping
+
+        loop {
+            self.skip_whitespace();
+            if self.is_at_end() {
+                break;
+            }
+
+            if depth == 0 {
+                match self.peek() {
+                    '?' => {
+                        self.advance();
+                        ternary_depth += 1;
+                        continue;
+                    }
+                    ':' if !self.is_scoped_colon() => {
+                        if ternary_depth > 0 {
+                            self.advance();
+                            ternary_depth -= 1;
+                            continue;
+                        }
+                        // A top-level ':' closes an outer ternary branch
+                        // (then-separator or the else of an enclosing `?:`);
+                        // leave it for the caller's expect(":").
+                        return Ok(());
+                    }
+                    ')' | ',' => return Ok(()),
+                    _ => {}
+                }
+            }
+
+            let c = self.peek();
+            match c {
+                '(' => { self.advance(); depth += 1; }
+                ')' => {
+                    if depth <= 0 {
+                        break; // unmatched — let caller handle
+                    }
+                    self.advance();
+                    depth -= 1;
+                }
+                '[' => {
+                    // Command substitution — skip balanced brackets
+                    self.advance();
+                    let mut bdepth = 1;
+                    while !self.is_at_end() && bdepth > 0 {
+                        match self.advance() {
+                            '[' => bdepth += 1,
+                            ']' => bdepth -= 1,
+                            '\\' => { self.advance(); } // skip escaped char
+                            _ => {}
+                        }
+                    }
+                }
+                '"' => {
+                    // String literal — skip to closing quote
+                    self.advance();
+                    while !self.is_at_end() && self.peek() != '"' {
+                        if self.peek() == '\\' {
+                            self.advance(); // skip escape char
+                        }
+                        self.advance();
+                    }
+                    if !self.is_at_end() {
+                        self.advance(); // closing quote
+                    }
+                }
+                '{' => {
+                    // Braced string — skip balanced braces
+                    self.advance();
+                    let mut bdepth = 1;
+                    while !self.is_at_end() && bdepth > 0 {
+                        match self.advance() {
+                            '{' => bdepth += 1,
+                            '}' => bdepth -= 1,
+                            '\\' => { self.advance(); }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => { self.advance(); }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// True if the `:` at the cursor is part of a `::` namespace qualifier
+    /// (e.g. inside `$::ns::var` or `::ns::func(...)`) rather than the
+    /// ternary else separator.
+    fn is_scoped_colon(&self) -> bool {
+        self.peek_at(1) == ':' || (self.pos > 0 && self.chars[self.pos - 1] == ':')
     }
 
     /// Consume characters, respecting balanced delimiters, until we reach

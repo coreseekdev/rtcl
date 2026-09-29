@@ -11,7 +11,6 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let test = args[1].as_str();
     let body = args[2].as_str();
-    let mut result = Value::empty();
 
     loop {
         let cond = interp.eval_expr(test)?;
@@ -19,7 +18,7 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             break;
         }
         match interp.eval(body) {
-            Ok(v) => result = v,
+            Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
                     if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
@@ -34,7 +33,8 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
-    Ok(result)
+    // Tcl: loop commands always return the empty string
+    Ok(Value::empty())
 }
 
 pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -49,14 +49,12 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     interp.eval(start)?;
 
-    let mut result = Value::empty();
-
     loop {
         let cond = interp.eval_expr(test)?;
         if !cond.is_true() { break; }
 
         match interp.eval(body) {
-            Ok(v) => result = v,
+            Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
                     if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
@@ -85,7 +83,8 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
-    Ok(result)
+    // Tcl: loop commands always return the empty string
+    Ok(Value::empty())
 }
 
 pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -97,7 +96,6 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     let body = args[args.len() - 1].as_str();
-    let mut result = Value::empty();
 
     // Collect (var_names, data_list) pairs
     // var_names is a list: single var "x" or multi-var "{a b c}"
@@ -134,7 +132,7 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
         match interp.eval(body) {
-            Ok(v) => result = v,
+            Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
                     if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
@@ -149,7 +147,8 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
-    Ok(result)
+    // Tcl: loop commands always return the empty string
+    Ok(Value::empty())
 }
 
 /// `time script ?count?`

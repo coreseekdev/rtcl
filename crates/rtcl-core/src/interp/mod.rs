@@ -102,6 +102,10 @@ pub(crate) struct CallFrame {
     /// `info level 0` for this frame: the invocation words as dispatched
     /// (as-typed command name + evaluated arguments), list-rendered.
     pub level0: String,
+    /// How many `namespace eval`s were open when this frame was created —
+    /// reconstructs the tclsh varFrame chain (proc frames and ns-eval
+    /// scopes interleave) for `uplevel` level arithmetic.
+    pub ns_depth: usize,
 }
 
 /// One live `array startsearch` iteration over an array's element names.
@@ -209,6 +213,10 @@ pub struct Interp {
     /// source text, one entry per live `namespace eval` (tclsh's
     /// namespace-eval varFrame is visible to `info level 0`).
     pub(crate) ns_level0: Vec<String>,
+    /// The qualified namespace of each live `namespace eval`, parallel to
+    /// [`Interp::ns_level0`] — uplevel's scope chain needs the target's
+    /// namespace, not just its level-0 text.
+    pub(crate) ns_stack: Vec<String>,
     /// Set when a word's error came from a command substitution (the
     /// nested eval already logged its frames; the enclosing command logs
     /// none and marks [`Interp::err_pending_top`] instead).
@@ -290,6 +298,7 @@ impl Interp {
             err_from_subst: false,
             err_pending_top: None,
             ns_level0: Vec::new(),
+            ns_stack: Vec::new(),
             frames: Vec::new(),
             commands: HashMap::new(),
             command_categories: HashMap::new(),

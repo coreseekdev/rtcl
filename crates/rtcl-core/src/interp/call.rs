@@ -52,6 +52,7 @@ impl Interp {
             local_procs: Vec::new(),
             deferred_scripts: Vec::new(),
             level0: String::new(),
+            ns_depth: self.ns_level0.len(),
         });
 
         let final_result = loop {

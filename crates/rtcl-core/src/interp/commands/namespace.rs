@@ -214,9 +214,11 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // (25.9), and its exit appends
     // `(in namespace eval "<qualified>" script line N)` on error (25.6).
     interp.ns_level0.push(interp.cur_cmd_text.clone());
+    interp.ns_stack.push(qualified.clone());
     let prev = std::mem::replace(&mut interp.current_namespace, qualified.clone());
     let result = interp.eval(&body);
     interp.current_namespace = prev;
+    interp.ns_stack.pop();
     interp.ns_level0.pop();
     if let Err(e) = &result {
         if interp.err_is_error(e) {

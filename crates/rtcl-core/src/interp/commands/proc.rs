@@ -211,21 +211,8 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args("uplevel", 2, args.len()));
     }
 
-    let (num_to_pop, script_start) = if args.len() > 2 && args[1].as_str().starts_with('#') {
-        // #0 → global level: pop ALL frames
-        (interp.frames.len(), 2usize)
-    } else if args.len() > 2 {
-        match args[1].as_int() {
-            Some(n) => {
-                let n = (n as usize).min(interp.frames.len());
-                (n, 2usize)
-            }
-            None => (1usize.min(interp.frames.len()), 1usize),
-        }
-    } else {
-        (1usize.min(interp.frames.len()), 1usize)
-    };
-
+    let explicit_global = args.len() > 2 && args[1].as_str().starts_with('#');
+    let script_start = if args.len() > 2 { 2usize } else { 1usize };
     let script = if args.len() - script_start == 1 {
         args[script_start].as_str().to_string()
     } else {
@@ -236,33 +223,101 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             .join(" ")
     };
 
-    // Pop the top N frames, eval in the target scope, then restore.
-    let split_point = interp.frames.len() - num_to_pop;
-    let explicit_global = args.len() > 2 && args[1].as_str().starts_with('#');
-    let saved_frames: Vec<_> = interp.frames.split_off(split_point);
-    // The target runs in the namespace ACTIVE at that level (tclsh
-    // 8.6.17): the remaining caller frame's namespace, or — when every
-    // frame is popped — the namespace the outermost popped frame was
-    // invoked in (the enclosing `namespace eval` context).  An explicit
-    // `#0` is the absolute global level and always uses `::`.
-    let saved_ns = interp.current_namespace.clone();
-    let target_ns = if explicit_global {
-        "::".to_string()
-    } else if let Some(f) = interp.frames.last() {
-        f.ns.clone().unwrap_or_else(|| "::".to_string())
+    // tclsh counts every varFrame — proc frames AND open `namespace
+    // eval`s — as one level.  Rebuild that chain (bottom→top) from the
+    // proc frames' `ns_depth` markers and the live ns-eval stack:
+    // [ns evals below frame 0] frame 0 [ns evals between 0 and 1] …
+    let scopes_total = interp.frames.len() + interp.ns_stack.len();
+    let (num_to_pop_frames, ns_trim, target_ns) = if explicit_global {
+        // `#N` names the absolute Nth scope above the global level
+        // (#0 = the global scope itself); past the top: bad level.
+        let lvl_text = args[1].as_str();
+        let n: usize = lvl_text[1..].parse().unwrap_or(0);
+        if n == 0 {
+            (interp.frames.len(), 0usize, "::".to_string())
+        } else if n - 1 >= scopes_total {
+            return Err(Error::Msg(format!("bad level \"{}\"", lvl_text)));
+        } else {
+            uplevel_resolve(interp, n - 1)
+        }
     } else {
-        saved_frames
-            .last()
-            .and_then(|f| f.call_ns.clone())
-            .unwrap_or_else(|| "::".to_string())
+        let n = match args.len() > 2 {
+            true => args[1].as_int().unwrap_or(1).max(0) as usize,
+            false => 1,
+        };
+        // Target scope index (bottom→top); `uplevel 1` is one scope OUT
+        // from the innermost.  Past the top: bad level (uplevel-4.2).
+        if n > scopes_total {
+            return Err(Error::Msg(format!(
+                "bad level \"{}\"",
+                args[1].as_str()
+            )));
+        }
+        let target = scopes_total as isize - n as isize - 1;
+        if target < 0 {
+            (interp.frames.len(), 0usize, "::".to_string())
+        } else {
+            uplevel_resolve(interp, target as usize)
+        }
     };
+
+    // Pop proc frames and trim ns evals down to the target scope, eval,
+    // then restore everything.
+    let split_point = interp.frames.len() - num_to_pop_frames;
+    let saved_frames: Vec<_> = interp.frames.split_off(split_point);
+    let saved_ns_stack: Vec<_> = interp.ns_stack.split_off(ns_trim);
+    let saved_l0: Vec<_> = interp.ns_level0.split_off(ns_trim);
+    let saved_ns = interp.current_namespace.clone();
     interp.current_namespace = target_ns;
     let result = eval_tagged(interp, &script, "uplevel");
     interp.current_namespace = saved_ns;
+    interp.ns_level0.extend(saved_l0);
+    interp.ns_stack.extend(saved_ns_stack);
     interp.frames.extend(saved_frames);
     result
 }
 
+/// Locate the scope at chain index `target` (bottom→top over interleaved
+/// proc frames and open `namespace eval`s): returns the proc-frame split
+/// point or the ns-eval stack position plus the scope's namespace.
+fn uplevel_resolve(interp: &Interp, target: usize) -> (usize, usize, String) {
+    let mut idx = target;
+    let mut split: Option<usize> = None;
+    let mut ns_at: Option<usize> = None;
+    for (i, f) in interp.frames.iter().enumerate() {
+        let below = f.ns_depth.min(interp.ns_stack.len());
+        if idx < below {
+            // An ns eval below this frame
+            ns_at = Some(idx);
+            break;
+        }
+        idx -= below;
+        if idx == 0 {
+            split = Some(i);
+            break;
+        }
+        idx -= 1;
+    }
+    if split.is_none() && ns_at.is_none() && idx < interp.ns_stack.len() {
+        // The ns evals above the outermost frame (or all of them at
+        // global level)
+        ns_at = Some(idx);
+    }
+    match (split, ns_at) {
+        (Some(fi), _) => {
+            let depth = interp.frames[fi].ns_depth.min(interp.ns_stack.len());
+            let ns = interp.frames[fi]
+                .ns
+                .clone()
+                .unwrap_or_else(|| "::".to_string());
+            // Frames strictly above the target pop; `uplevel 0` stays in
+            // the running frame.
+            (interp.frames.len() - fi - 1, depth, ns)
+        }
+        (None, Some(k)) => (interp.frames.len(), k, interp.ns_stack[k].clone()),
+        (None, None) => (interp.frames.len(), 0, "::".to_string()),
+    }
+}
 pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::wrong_args_with_usage("upvar", 3, args.len(), "?level? otherVar localVar ?otherVar localVar ...?"));

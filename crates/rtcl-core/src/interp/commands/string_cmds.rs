@@ -1,8 +1,8 @@
 //! String commands: string subcommands.
 
 use crate::error::{Error, Result};
+use crate::interp::commands::list::{bad_index, parse_tcl_index, tcl_get_int};
 use crate::interp::{glob_match, Interp};
-use crate::types::parse_index;
 use crate::value::Value;
 
 pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -48,11 +48,21 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::wrong_args("string range", 5, args.len()));
             }
             let chars: Vec<char> = str_val.chars().collect();
-            let len = chars.len();
-            let start = parse_index(args[3].as_str(), len).unwrap_or(0);
-            let end = parse_index(args[4].as_str(), len).unwrap_or(len.saturating_sub(1));
+            let len = chars.len() as i64;
+            let start_raw = match parse_tcl_index(args[3].as_str(), chars.len()) {
+                Some(v) => v,
+                None => return Err(bad_index(_interp, args[3].as_str())),
+            };
+            let end_raw = match parse_tcl_index(args[4].as_str(), chars.len()) {
+                Some(v) => v,
+                None => return Err(bad_index(_interp, args[4].as_str())),
+            };
+            // Tcl clamps: start < 0 → 0; end >= len → len-1; empty when
+            // the range is backwards or starts past the end.
+            let start = start_raw.max(0);
+            let end = end_raw.min(len - 1);
             if start <= end && start < len {
-                let s: String = chars[start..=end.min(len - 1)].iter().collect();
+                let s: String = chars[start as usize..=end as usize].iter().collect();
                 Ok(Value::from_str(&s))
             } else {
                 Ok(Value::empty())
@@ -64,9 +74,12 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let chars: Vec<char> = str_val.chars().collect();
             let len = chars.len();
-            match parse_index(args[3].as_str(), len) {
-                Some(idx) if idx < len => Ok(Value::from_str(&chars[idx].to_string())),
-                _ => Ok(Value::empty()),
+            match parse_tcl_index(args[3].as_str(), len) {
+                Some(idx) if idx >= 0 && (idx as usize) < len => {
+                    Ok(Value::from_str(&chars[idx as usize].to_string()))
+                }
+                Some(_) => Ok(Value::empty()),
+                None => Err(bad_index(_interp, args[3].as_str())),
             }
         }
         "equal" => {
@@ -135,7 +148,10 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let haystack = args[3].as_str();
             let hchars: Vec<char> = haystack.chars().collect();
             let start = if args.len() > 4 {
-                parse_index(args[4].as_str(), hchars.len()).unwrap_or(0)
+                match parse_tcl_index(args[4].as_str(), hchars.len()) {
+                    Some(v) => v.max(0) as usize,
+                    None => return Err(bad_index(_interp, args[4].as_str())),
+                }
             } else {
                 0
             };
@@ -154,13 +170,11 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let hchars: Vec<char> = haystack.chars().collect();
             // A match must end at or before lastIndex (default: end of string).
             let last = if args.len() > 4 {
-                match parse_index(args[4].as_str(), hchars.len()) {
-                    Some(i) => i,
+                match parse_tcl_index(args[4].as_str(), hchars.len()) {
                     // Negative index: no character is at or before it.
-                    None if args[4].as_str().trim().parse::<i64>().is_ok_and(|n| n < 0) => {
-                        return Ok(Value::from_int(-1));
-                    }
-                    None => hchars.len().saturating_sub(1),
+                    Some(i) if i < 0 => return Ok(Value::from_int(-1)),
+                    Some(i) => (i as usize).min(hchars.len().saturating_sub(1)),
+                    None => return Err(bad_index(_interp, args[4].as_str())),
                 }
             } else {
                 hchars.len().saturating_sub(1)
@@ -218,7 +232,18 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() != 4 {
                 return Err(Error::wrong_args("string repeat", 4, args.len()));
             }
-            let count = args[3].as_int().unwrap_or(0);
+            // Tcl_GetInt semantics — a single (trimmed) integer literal,
+            // no `int+int` chains: `string repeat ab 1+2` errors with
+            // `expected integer but got "1+2"` (probed).
+            let count = match tcl_get_int(args[3].as_str()) {
+                Some(n) => n,
+                None => {
+                    return Err(Error::runtime(
+                        format!("expected integer but got \"{}\"", args[3].as_str()),
+                        crate::error::ErrorCode::InvalidOp,
+                    ))
+                }
+            };
             if count < 0 {
                 return Ok(Value::empty());
             }
@@ -232,17 +257,25 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::wrong_args_with_usage("string replace", 5, args.len(), "string first last ?newString?"));
             }
             let chars: Vec<char> = str_val.chars().collect();
-            let len = chars.len();
-            let first = parse_index(args[3].as_str(), len).unwrap_or(0);
-            let last = parse_index(args[4].as_str(), len).unwrap_or(len.saturating_sub(1));
+            let len = chars.len() as i64;
+            let first_raw = match parse_tcl_index(args[3].as_str(), chars.len()) {
+                Some(v) => v,
+                None => return Err(bad_index(_interp, args[3].as_str())),
+            };
+            let last_raw = match parse_tcl_index(args[4].as_str(), chars.len()) {
+                Some(v) => v,
+                None => return Err(bad_index(_interp, args[4].as_str())),
+            };
+            let first = first_raw.max(0);
+            let last = last_raw.min(len - 1);
             let new_str = if args.len() > 5 { args[5].as_str() } else { "" };
             if first > last || first >= len {
                 return Ok(Value::from_str(str_val));
             }
-            let mut result: String = chars[..first].iter().collect();
+            let mut result: String = chars[..first as usize].iter().collect();
             result.push_str(new_str);
             if last + 1 < len {
-                result.extend(&chars[last + 1..]);
+                result.extend(&chars[(last + 1) as usize..]);
             }
             Ok(Value::from_str(&result))
         }
@@ -293,13 +326,20 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let bytes = str_val.as_bytes();
-            let len = bytes.len();
-            let first = parse_index(args[3].as_str(), len).unwrap_or(0);
-            let last = parse_index(args[4].as_str(), len)
-                .unwrap_or(len.saturating_sub(1));
+            let len = bytes.len() as i64;
+            let first_raw = match parse_tcl_index(args[3].as_str(), bytes.len()) {
+                Some(v) => v,
+                None => return Err(bad_index(_interp, args[3].as_str())),
+            };
+            let last_raw = match parse_tcl_index(args[4].as_str(), bytes.len()) {
+                Some(v) => v,
+                None => return Err(bad_index(_interp, args[4].as_str())),
+            };
+            let first = first_raw.max(0);
+            let last = last_raw.min(len - 1);
             if first <= last && first < len {
                 let end = (last + 1).min(len);
-                let s = String::from_utf8_lossy(&bytes[first..end]);
+                let s = String::from_utf8_lossy(&bytes[first as usize..end as usize]);
                 Ok(Value::from_str(&s))
             } else {
                 Ok(Value::empty())
@@ -313,7 +353,10 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let chars: Vec<char> = str_val.chars().collect();
             let len = chars.len();
-            let idx = parse_index(args[3].as_str(), len).unwrap_or(0).min(len.saturating_sub(1));
+            let idx = match parse_tcl_index(args[3].as_str(), len) {
+                Some(v) => v.max(0).min(len as i64 - 1).max(0) as usize,
+                None => return Err(bad_index(_interp, args[3].as_str())),
+            };
             let mut start = idx;
             while start > 0 && is_word_char(chars[start - 1]) {
                 start -= 1;
@@ -328,7 +371,10 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let chars: Vec<char> = str_val.chars().collect();
             let len = chars.len();
-            let idx = parse_index(args[3].as_str(), len).unwrap_or(0).min(len.saturating_sub(1));
+            let idx = match parse_tcl_index(args[3].as_str(), len) {
+                Some(v) => v.max(0).min(len as i64 - 1).max(0) as usize,
+                None => return Err(bad_index(_interp, args[3].as_str())),
+            };
             let mut end = idx;
             while end < len && is_word_char(chars[end]) {
                 end += 1;

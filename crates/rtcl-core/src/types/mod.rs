@@ -4,7 +4,5 @@ pub(crate) mod bignum;
 pub mod expr;
 pub(crate) mod expr_check;
 pub(crate) mod expr_funcs;
-pub mod index;
 
 pub use expr::eval_expr;
-pub use index::parse_index;

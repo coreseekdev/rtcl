@@ -112,39 +112,43 @@ pub(crate) fn tcl_get_int(s: &str) -> Option<i64> {
 /// Parse a Tcl index (`integer?[+-]integer?` or `end?[+-]integer?`),
 /// resolving `end` against `len`. The result may be negative or >= len;
 /// callers clamp or report out-of-range as appropriate.
-/// Mirrors Tcl 8.6's TclGetIntForIndex.
+/// Mirrors Tcl 8.6's TclGetIntForIndex (probed on 8.6.17): at most two
+/// terms with no internal whitespace, each term's magnitude bounded by
+/// 2^32-1 (`4294967295` accepted, `4294967296` rejected), and the sum
+/// wraps to C `int` — `end+4294967295` on an 8-char string is index 6,
+/// and `-4294967295` is index 1.
 pub(crate) fn parse_tcl_index(s: &str, len: usize) -> Option<i64> {
-    // 1. Plain integer.
-    if let Some(v) = tcl_get_int(s) {
-        return Some(v);
-    }
-    // 2. end?[+-]integer? — no leading whitespace allowed before "end".
-    if let Some(rest) = s.strip_prefix("end") {
-        if rest.is_empty() {
-            return Some(len as i64 - 1);
-        }
-        let rb = rest.as_bytes();
-        if rb.len() >= 2 && (rb[0] == b'+' || rb[0] == b'-') && !is_tcl_space(rb[1]) {
-            if let Some(off) = tcl_get_int(&rest[1..]) {
-                let off = if rb[0] == b'-' { -off } else { off };
-                return Some(len as i64 - 1 + off);
-            }
-        }
-        return None;
-    }
-    // 3. integer[+-]integer — leading whitespace allowed before the number.
+    const MAX_TERM: i64 = 4294967295; // 2^32 - 1
     let t = trim_tcl_space(s);
-    let (first, used) = scan_tcl_int(t)?;
-    let rest = &t[used..];
-    let sign = *rest.as_bytes().first()?;
-    if sign != b'+' && sign != b'-' {
+    // 1. "end" or a leading integer (leading whitespace already trimmed).
+    let (base, rest) = if let Some(rest) = t.strip_prefix("end") {
+        (len as i64 - 1, rest)
+    } else {
+        let (v, used) = scan_tcl_int(t)?;
+        if v.unsigned_abs() > MAX_TERM as u64 {
+            return None;
+        }
+        (v, &t[used..])
+    };
+    if rest.is_empty() {
+        return Some(wrap_i32(base));
+    }
+    // 2. Optional second term: an operator with no whitespace before the
+    //    number, whose value keeps its own sign (`-1--2` is 1, `1++1` is 2).
+    let rb = rest.as_bytes();
+    if rb.len() < 2 || (rb[0] != b'+' && rb[0] != b'-') || is_tcl_space(rb[1]) {
         return None;
     }
-    if rest.len() < 2 || is_tcl_space(rest.as_bytes()[1]) {
+    let off = tcl_get_int(&rest[1..])?;
+    if off.unsigned_abs() > MAX_TERM as u64 {
         return None;
     }
-    let second = tcl_get_int(&rest[1..])?;
-    Some(if sign == b'+' { first + second } else { first - second })
+    Some(wrap_i32(if rb[0] == b'+' { base + off } else { base - off }))
+}
+
+/// C `int` wraparound, which Tcl index arithmetic is subject to.
+fn wrap_i32(v: i64) -> i64 {
+    v as i32 as i64
 }
 
 pub fn cmd_list(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -359,14 +363,43 @@ pub fn cmd_lreverse(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 pub fn cmd_concat(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    // Tcl_Concat joins the *string reps* of the arguments, stripping
+    // leading/trailing whitespace — but a trailing whitespace run whose
+    // last char is backslash-escaped stays, so `{b\   }` trims to `b\ `
+    // (util-4.2) while `b\\   ` trims to `b\\` (util-4.3).  No list
+    // parsing, no re-escaping (probed: `{"x y"}` keeps its quotes,
+    // `{a$b}` keeps the dollar, `a {b{c}` is not validated).
     let mut result = String::new();
     for arg in &args[1..] {
-        let trimmed = arg.as_str().trim();
-        if trimmed.is_empty() { continue; }
-        if !result.is_empty() { result.push(' '); }
+        let trimmed = concat_trim(arg.as_str());
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !result.is_empty() {
+            result.push(' ');
+        }
         result.push_str(trimmed);
     }
     Ok(Value::from_str(&result))
+}
+
+/// Strip leading Tcl whitespace; strip trailing whitespace but stop as
+/// soon as the whitespace char being removed has a backslash before it
+/// (an escaped space is element content, not a separator).
+fn concat_trim(s: &str) -> &str {
+    let b = s.as_bytes();
+    let mut start = 0;
+    while start < b.len() && is_tcl_space(b[start]) {
+        start += 1;
+    }
+    let mut end = b.len();
+    while end > start && is_tcl_space(b[end - 1]) {
+        if end >= 2 && b[end - 2] == b'\\' {
+            break;
+        }
+        end -= 1;
+    }
+    &s[start..end]
 }
 
 pub fn cmd_split(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -612,6 +645,95 @@ pub fn cmd_lsubst(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use crate::interp::Interp;
+    use super::{concat_trim, parse_tcl_index};
+
+    // --- parse_tcl_index: Tcl 8.6 index grammar (all values probed) ---
+
+    fn idx(s: &str, len: usize) -> Option<i64> {
+        parse_tcl_index(s, len)
+    }
+
+    #[test]
+    fn index_plain_and_prefixed() {
+        assert_eq!(idx("0", 5), Some(0));
+        assert_eq!(idx("3", 5), Some(3));
+        assert_eq!(idx(" 3 ", 5), Some(3)); // surrounding whitespace ok
+        assert_eq!(idx("0x0", 5), Some(0));
+        assert_eq!(idx("-0x0", 5), Some(0));
+        assert_eq!(idx("01", 5), Some(1)); // legacy octal
+        assert_eq!(idx("007", 8), Some(7));
+        assert_eq!(idx("0b10", 8), Some(2));
+        assert_eq!(idx("0o3", 8), Some(3));
+        assert_eq!(idx("+1", 5), Some(1));
+        assert_eq!(idx("-1", 5), Some(-1));
+    }
+
+    #[test]
+    fn index_chains() {
+        // Exactly two terms; the second keeps its own sign.
+        assert_eq!(idx("0+0", 8), Some(0));
+        assert_eq!(idx("1+1", 8), Some(2));
+        assert_eq!(idx("1-1", 8), Some(0));
+        assert_eq!(idx("1++1", 8), Some(2));
+        assert_eq!(idx("-1+2", 8), Some(1));
+        assert_eq!(idx("-1--2", 8), Some(1));
+        assert_eq!(idx("end+-1", 4), Some(2));
+        assert_eq!(idx("end--1", 4), Some(4)); // past the end; caller clamps
+        assert_eq!(idx("end+1", 4), Some(4));
+        assert_eq!(idx("end-1", 4), Some(2));
+        // Internal whitespace is rejected, chains of 3 terms too.
+        assert_eq!(idx("1 + 1", 8), None);
+        assert_eq!(idx(" 1+ 1 ", 8), None);
+        assert_eq!(idx("1+1+1", 8), None);
+        assert_eq!(idx("end - 1", 8), None);
+        assert_eq!(idx("1+", 8), None);
+        assert_eq!(idx("++1", 8), None);
+        assert_eq!(idx("x+1", 8), None);
+        assert_eq!(idx("end1", 8), None);
+        assert_eq!(idx("END", 8), None);
+        assert_eq!(idx("", 8), None);
+    }
+
+    #[test]
+    fn index_malformed_octal() {
+        // These still parse nothing; the caller's bad_index() adds the
+        // "(looks like invalid octal number)" hint for them.
+        assert_eq!(idx("008", 8), None);
+        assert_eq!(idx("08", 8), None);
+        assert_eq!(idx("+008", 8), None);
+        assert_eq!(idx("0x", 8), None);
+        assert_eq!(idx("0b2", 8), None);
+        assert_eq!(idx("1.5", 8), None);
+    }
+
+    #[test]
+    fn index_32bit_bounds_and_wrap() {
+        // Term magnitude must stay under 2^32; the sum wraps to C int.
+        assert_eq!(idx("4294967295", 8), Some(-1)); // wraps, out of range
+        assert_eq!(idx("4294967296", 8), None);
+        assert_eq!(idx("-4294967295", 8), Some(1)); // wraps to index 1
+        assert_eq!(idx("-4294967296", 8), None);
+        assert_eq!(idx("9223372036854775807", 8), None);
+        assert_eq!(idx("9223372036854775807+1", 8), None);
+        assert_eq!(idx("2147483647+1", 8), Some(-2147483648));
+        assert_eq!(idx("end+4294967295", 8), Some(6)); // (7 + 4294967295) as i32
+        assert_eq!(idx("4294967295-4294967295", 8), Some(0));
+    }
+
+    // --- concat_trim: Tcl_Concat's backslash-aware whitespace trim ---
+
+    #[test]
+    fn concat_trim_escapes() {
+        assert_eq!(concat_trim("a b"), "a b");
+        assert_eq!(concat_trim("  x  "), "x");
+        assert_eq!(concat_trim("b\\ "), "b\\ "); // escaped space is kept
+        assert_eq!(concat_trim("b\\   "), "b\\ "); // util-4.2
+        // util-4.3: the escaped backslash's trailing space survives too —
+        // tclsh's `a b\\  c` has two spaces before `c`.
+        assert_eq!(concat_trim("b\\\\   "), "b\\\\ ");
+        assert_eq!(concat_trim("x\\\\ "), "x\\\\ "); // probed round 5
+        assert_eq!(concat_trim("   "), "");
+    }
 
     #[test]
     fn test_lsubst_simple() {

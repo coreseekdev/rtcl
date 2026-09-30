@@ -29,7 +29,7 @@ fn regex_escape(s: &str) -> String {
 /// `(?s)`), `-linestop` restores Rust's plain behavior, and
 /// `-lineanchor`/`-line` make `^`/`$` match at line boundaries (`(?m)`).
 /// A leading `***=` makes the rest of the pattern a literal string.
-fn build_pattern(
+pub(crate) fn build_pattern(
     pattern: &str,
     nocase: bool,
     expanded: bool,

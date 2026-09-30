@@ -328,24 +328,69 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Ok(Value::empty());
     }
 
-    let (start, is_global, level) = if args.len() > 3 && args[1].as_str().starts_with('#') {
-        (2usize, true, 0usize)
-    } else if args.len() > 3 {
-        match args[1].as_int() {
-            Some(n) => (2usize, false, n as usize),
-            None => (1usize, false, 1usize),
+    let (start, level_arg) = if args.len() > 3 {
+        let t = args[1].as_str();
+        // A leading integer (or `#N`) is a level; anything else starts
+        // the var pairs (`upvar a x1 b x2` = two links at level 1).
+        if t.starts_with('#') || t.parse::<i64>().is_ok() {
+            (2usize, Some(t.to_string()))
+        } else {
+            (1usize, None)
         }
     } else {
-        (1usize, false, 1usize)
+        (1usize, None)
     };
 
     let current_idx = interp.frames.len() - 1;
 
-    // Determine the target scope
-    let target_frame = if is_global || level > current_idx {
-        None // Links to globals
-    } else {
-        Some(current_idx - level)
+    // Determine the target scope over the tclsh varFrame chain (proc
+    // frames + open namespace evals, one level each).
+    let scopes_total = interp.frames.len() + interp.ns_stack.len();
+    let target: UpvarTarget = match level_arg.as_deref() {
+        None => {
+            // No level: upvar 1 — the caller's scope.  One scope out
+            // from the innermost.
+            let t = scopes_total as isize - 2;
+            if t < 0 {
+                let ns = interp.frames[current_idx]
+                    .call_ns
+                    .clone()
+                    .unwrap_or_else(|| "::".to_string());
+                UpvarTarget::Ns(ns)
+            } else {
+                upvar_target(interp, t as usize)
+            }
+        }
+        Some(lt) if lt.starts_with('#') => {
+            // `#N` = absolute Nth scope above global; #0 = global itself.
+            let n: usize = lt[1..].parse().unwrap_or(0);
+            if n == 0 {
+                UpvarTarget::GlobalNs
+            } else if n - 1 >= scopes_total {
+                return Err(Error::Msg(format!("bad level \"{}\"", lt)));
+            } else {
+                upvar_target(interp, n - 1)
+            }
+        }
+        Some(lt) => {
+            let level: usize = lt.parse().unwrap_or(1);
+            if level > scopes_total {
+                return Err(Error::Msg(format!("bad level \"{}\"", lt)));
+            }
+            let t = scopes_total as isize - level as isize - 1;
+            if t < 0 {
+                // Fell off every scope: the CALLER's namespace context
+                // (var-15.1: `namespace eval test A ...` + `upvar $name`
+                // lands in ::test, not the proc's own ns).
+                let ns = interp.frames[current_idx]
+                    .call_ns
+                    .clone()
+                    .unwrap_or_else(|| "::".to_string());
+                UpvarTarget::Ns(ns)
+            } else {
+                upvar_target(interp, t as usize)
+            }
+        }
     };
 
     // Create upvar links
@@ -354,20 +399,15 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let other_var = args[i].as_str().to_string();
         let local_var = args[i + 1].as_str().to_string();
 
-        let link = match target_frame {
-            // `upvar #0` names the true global namespace's variable;
-            // a numeric level falling off the proc-frame chain names the
-            // CALLER's scope (var-15.1: `namespace eval test A ...` +
-            // `upvar $name` lands in ::test, not the proc's own ns).
-            None if is_global => UpvarLink::Global(other_var),
-            None => {
-                let ns = interp.frames[current_idx]
-                    .call_ns
-                    .clone()
-                    .unwrap_or_else(|| interp.current_namespace.clone());
-                UpvarLink::Global(interp.canonical_global_in(&ns, &other_var))
+        let link = match &target {
+            UpvarTarget::GlobalNs => UpvarLink::Global(other_var),
+            UpvarTarget::Ns(ns) => {
+                UpvarLink::Global(interp.canonical_global_in(ns, &other_var))
             }
-            Some(fi) => UpvarLink::Frame { frame_index: fi, var_name: other_var },
+            UpvarTarget::Frame(fi) => UpvarLink::Frame {
+                frame_index: *fi,
+                var_name: other_var,
+            },
         };
 
         interp.frames[current_idx].upvars.insert(local_var, link);
@@ -375,6 +415,37 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     Ok(Value::empty())
+}
+
+/// Which scope an `upvar` level names.
+enum UpvarTarget {
+    /// The true global namespace (`upvar #0`, fell off everything).
+    GlobalNs,
+    /// An open `namespace eval`'s (or fallen-off caller's) variable table.
+    Ns(String),
+    /// A proc frame by absolute index.
+    Frame(usize),
+}
+
+/// Map a scope-chain index (bottom→top) to its upvar target.
+fn upvar_target(interp: &Interp, target: usize) -> UpvarTarget {
+    let mut idx = target;
+    for (i, f) in interp.frames.iter().enumerate() {
+        let below = f.ns_depth.min(interp.ns_stack.len());
+        if idx < below {
+            return UpvarTarget::Ns(interp.ns_stack[idx].clone());
+        }
+        idx -= below;
+        if idx == 0 {
+            return UpvarTarget::Frame(i);
+        }
+        idx -= 1;
+    }
+    if idx < interp.ns_stack.len() {
+        UpvarTarget::Ns(interp.ns_stack[idx].clone())
+    } else {
+        UpvarTarget::GlobalNs
+    }
 }
 
 pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {

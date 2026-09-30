@@ -268,7 +268,7 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if let Some(name) = &matchvar {
                 interp.set_var(name, Value::empty())?;
             }
-            return eval_switch_body(interp, body);
+            return eval_switch_body(interp, pattern, body);
         }
 
         let matched = match mode {
@@ -308,29 +308,23 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             while patterns[j].1 == "-" {
                 j += 1;
             }
-            return eval_switch_body(interp, &patterns[j].1);
+            return eval_switch_body(interp, &patterns[j].0, &patterns[j].1);
         }
     }
 
     Ok(Value::empty())
 }
 
-/// Evaluate a matched `switch` arm body.  tclsh's switch runs arms through
-/// an internal `eval` (F4): a body error gains `("eval" body line N)` plus
-/// an `eval {body}` frame, and no frame names the switch command itself.
-fn eval_switch_body(interp: &mut Interp, body: &str) -> Result<Value> {
+/// Evaluate a matched `switch` arm body.  A body error gains the
+/// `("<pattern>" arm line N)` construct-exit frame, then the switch
+/// command's own harness frame appends normally (probed on tclsh
+/// 8.6.17, switch-4.1/4.5).
+fn eval_switch_body(interp: &mut Interp, pattern: &str, body: &str) -> Result<Value> {
     let r = interp.eval(body);
     if let Err(e) = &r {
         if interp.err_is_error(e) {
-            interp.err_exit_frame("\"eval\" body");
-            if let Some(info) = &mut interp.err_info {
-                info.push_str(&format!(
-                    "\n    invoked from within\n\"eval {{{}}}\"",
-                    body
-                ));
-            }
+            interp.err_exit_frame(&format!("\"{}\" arm", pattern));
         }
-        interp.err_fresh = true;
     }
     r
 }

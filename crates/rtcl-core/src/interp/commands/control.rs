@@ -5,6 +5,17 @@ use crate::error::{Error, Result};
 use crate::interp::Interp;
 use crate::value::Value;
 
+/// Evaluate an `if`/`while` body script.  tclsh compiles these constructs
+/// inline: a body error propagates framelessly (F2/N8 — no frame names the
+/// `if`/`while` command itself), so mark the next harness append suppressed.
+fn eval_transparent_body(interp: &mut Interp, script: &str) -> Result<Value> {
+    let r = interp.eval(script);
+    if r.is_err() {
+        interp.err_fresh = true;
+    }
+    r
+}
+
 pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_msg(
@@ -29,7 +40,7 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     if crate::types::expr_funcs::strict_bool(&cond)? {
-        return interp.eval(args[i].as_str());
+        return eval_transparent_body(interp, args[i].as_str());
     }
     i += 1;
 
@@ -57,7 +68,7 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     )));
                 }
                 if crate::types::expr_funcs::strict_bool(&cond)? {
-                    return interp.eval(args[i].as_str());
+                    return eval_transparent_body(interp, args[i].as_str());
                 }
                 i += 1;
             }
@@ -72,10 +83,10 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         "wrong # args: extra words after \"else\" clause in \"if\" command",
                     ));
                 }
-                return interp.eval(args[i + 1].as_str());
+                return eval_transparent_body(interp, args[i + 1].as_str());
             }
             _ => {
-                return interp.eval(word);
+                return eval_transparent_body(interp, word);
             }
         }
     }
@@ -257,7 +268,7 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if let Some(name) = &matchvar {
                 interp.set_var(name, Value::empty())?;
             }
-            return interp.eval(body);
+            return eval_switch_body(interp, body);
         }
 
         let matched = match mode {
@@ -297,11 +308,31 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             while patterns[j].1 == "-" {
                 j += 1;
             }
-            return interp.eval(&patterns[j].1);
+            return eval_switch_body(interp, &patterns[j].1);
         }
     }
 
     Ok(Value::empty())
+}
+
+/// Evaluate a matched `switch` arm body.  tclsh's switch runs arms through
+/// an internal `eval` (F4): a body error gains `("eval" body line N)` plus
+/// an `eval {body}` frame, and no frame names the switch command itself.
+fn eval_switch_body(interp: &mut Interp, body: &str) -> Result<Value> {
+    let r = interp.eval(body);
+    if let Err(e) = &r {
+        if interp.err_is_error(e) {
+            interp.err_exit_frame("\"eval\" body");
+            if let Some(info) = &mut interp.err_info {
+                info.push_str(&format!(
+                    "\n    invoked from within\n\"eval {{{}}}\"",
+                    body
+                ));
+            }
+        }
+        interp.err_fresh = true;
+    }
+    r
 }
 
 /// Odd arm count error; when the arms were split from a single list
@@ -588,6 +619,20 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             else if e.is_break() { 3 }
             else if e.is_continue() { 4 }
             else { 1 };
+            // Tcl writes ::errorInfo (the frames accumulated while the
+            // error propagated from its raise site to this catch) and
+            // ::errorCode as soon as the error is caught.
+            let accumulated = if interp.err_is_error(&e) {
+                interp.err_info.take()
+            } else {
+                None
+            };
+            interp.err_fresh = false;
+            // The catch consumed the propagation — no deferred
+            // enclosing-command frame can reach the top-level report.
+            interp.err_pending_top = None;
+            let error_info = accumulated.unwrap_or_else(|| e.message_text());
+            let _ = interp.set_var("::errorInfo", Value::from_str(&error_info));
             // Tcl writes ::errorCode at raise time for arithmetic errors
             // (ARITH DIVZERO / ARITH DOMAIN); other codes come from their
             // own raise sites and must not be clobbered here.
@@ -601,7 +646,7 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 let level = if e.is_return() { 0 } else { 1 };
                 let opts = if code == 1 {
                     // Tcl error completions carry -errorcode and -errorinfo.
-                    error_options_dict(1, 0, &e, script)
+                    error_options_dict(1, 0, &e, script, &error_info)
                 } else {
                     return_options_dict(code, level)
                 };
@@ -620,34 +665,15 @@ fn return_options_dict(code: i64, level: i64) -> Value {
 
 /// Tcl return-options dict for an error completion: adds `-errorcode`
 /// and `-errorinfo` next to `-code`/`-level`.
-fn error_options_dict(code: i64, level: i64, err: &Error, script: &str) -> Value {
+fn error_options_dict(code: i64, level: i64, err: &Error, script: &str, accumulated: &str) -> Value {
     let error_code = err.tcl_error_code();
-    let error_info = error_info_for(err, script);
     Value::from_str(&format!(
         "-code {} -level {} -errorcode {} -errorinfo {}",
         code,
         level,
         crate::value::tcl_quote(&error_code),
-        crate::value::tcl_quote(&error_info),
+        crate::value::tcl_quote(accumulated),
     ))
-}
-
-/// Build Tcl-style `-errorinfo`: an explicitly supplied `-errorinfo`
-/// (from `error msg info` or `return -errorinfo`) is used verbatim;
-/// otherwise synthesize the message plus a `while executing` /
-/// `invoked from within` line quoting the failing script.
-fn error_info_for(err: &Error, script: &str) -> String {
-    if let Error::ControlFlow { error_info: Some(info), .. } = err {
-        if !info.is_empty() {
-            return info.clone();
-        }
-    }
-    let how = if matches!(err, Error::DivisionByZero) {
-        "invoked from within"
-    } else {
-        "while executing"
-    };
-    format!("{}\n    {}\n\"{}\"", err.message_text(), how, script)
 }
 
 pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -666,8 +692,16 @@ pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // caller supplies one, errorInfo only when supplied.
     let code = error_code.clone().unwrap_or_else(|| "NONE".to_string());
     let _ = interp.set_var("::errorCode", Value::from_str(&code));
+    // A non-empty info argument REPLACES the accumulated errorInfo and
+    // suppresses the next harness frame (25.7: the `while executing
+    // "error ..."` frame is absent).  Without info the error behaves like
+    // any failing command (N5).
     if let Some(info) = &error_info {
-        let _ = interp.set_var("::errorInfo", Value::from_str(info));
+        if !info.is_empty() {
+            interp.err_info = Some(info.clone());
+            interp.err_fresh = true;
+            interp.err_pending_top = None;
+        }
     }
     if error_info.is_none() && error_code.is_none() {
         return Err(Error::Msg(msg));
@@ -695,6 +729,15 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Execute the body
     let body = args[1].as_str();
     let body_result = interp.eval(body);
+    // try swallows body errors: consume the accumulated errorInfo the
+    // same way catch does (writes ::errorInfo, resets the accumulator).
+    if let Err(e) = &body_result {
+        if interp.err_is_error(e) {
+            let info = interp.err_info.take().unwrap_or_else(|| e.message_text());
+            let _ = interp.set_var("::errorInfo", Value::from_str(&info));
+        }
+        interp.err_fresh = false;
+    }
 
     // Determine the exit code and result value
     let (exit_code, result_value) = match &body_result {
@@ -745,7 +788,11 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         if !opts_var.is_empty() {
                             let opts = match &body_result {
                                 Err(e) if exit_code == 1 => {
-                                    error_options_dict(exit_code as i64, 0, e, body)
+                                    let accumulated = interp
+                                        .get_var("::errorInfo")
+                                        .map(|v| v.as_str().to_string())
+                                        .unwrap_or_default();
+                                    error_options_dict(exit_code as i64, 0, e, body, &accumulated)
                                 }
                                 _ => return_options_dict(exit_code as i64, 0),
                             };

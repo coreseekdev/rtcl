@@ -12,6 +12,67 @@ impl Interp {
         self.eval_commands(&commands)
     }
 
+    /// Run `script` with errorInfo accumulation isolated: internal
+    /// side-evals (deferred scripts, trace callbacks, package indexes)
+    /// must not append frames to an error propagating through the caller.
+    pub(crate) fn eval_isolated(&mut self, script: &str) -> Result<Value> {
+        let saved_info = self.err_info.take();
+        let saved_fresh = std::mem::take(&mut self.err_fresh);
+        let saved_subst = std::mem::take(&mut self.err_from_subst);
+        let saved_pending = self.err_pending_top.take();
+        let r = self.eval(script);
+        self.err_info = saved_info;
+        self.err_fresh = saved_fresh;
+        self.err_from_subst = saved_subst;
+        self.err_pending_top = saved_pending;
+        r
+    }
+
+    /// Script-harness frame append after a dispatched command returned an
+    /// error (tclsh's TclEvalEx logging): the first append starts the
+    /// accumulated info with the message and `while executing`; later
+    /// appends add `invoked from within`.  `fresh` suppresses exactly one
+    /// append.  Non-error completions (return/break/continue/exit) never
+    /// reach this.
+    pub(crate) fn err_harness_frame(&mut self, msg: &str, text: &str, line: usize) {
+        match (&mut self.err_info, self.err_fresh) {
+            (Some(_), true) => {
+                self.err_fresh = false;
+            }
+            (Some(info), false) => {
+                info.push_str(&format!("\n    invoked from within\n\"{}\"", text));
+            }
+            (None, _) => {
+                self.err_info = Some(format!(
+                    "{}\n    while executing\n\"{}\"",
+                    msg, text
+                ));
+            }
+        }
+        self.err_line = line;
+        // A normal harness log means the substitution boundary's
+        // deferred enclosing-command frame was superseded (tclsh's
+        // ERR_ALREADY_LOGGED is consumed by one level).
+        self.err_pending_top = None;
+    }
+
+    /// Construct-exit frame append — `(procedure "x" line N)`,
+    /// `(in namespace eval "::n" script line N)`, `("uplevel" body line
+    /// N)`, `(file "p" line N)`: pass the tag without the `line N` tail.
+    /// No-op when no error info is accumulating.
+    pub(crate) fn err_exit_frame(&mut self, tag: &str) {
+        if let Some(info) = &mut self.err_info {
+            info.push_str(&format!("\n    ({} line {})", tag, self.err_line));
+        }
+    }
+
+    /// Does this error participate in errorInfo frame accumulation?
+    /// Control-flow completions (return/break/continue/exit, tail-call
+    /// requests) propagate framelessly.
+    pub(crate) fn err_is_error(&self, e: &Error) -> bool {
+        !(e.is_return() || e.is_break() || e.is_continue() || e.is_exit() || e.is_tail_call())
+    }
+
     /// Compile a script to bytecode (caching it) and execute via the VM.
     pub fn eval_compiled(&mut self, script: &str) -> Result<Value> {
         let code = if let Some(cached) = self.code_cache.get(script) {
@@ -45,11 +106,33 @@ impl Interp {
             ));
         }
 
-        // Evaluate all words, handling {*} expand
+        // Evaluate all words, handling {*} expand.  A failure here
+        // propagates frameless when it came from a command substitution
+        // (the nested eval already logged; the enclosing command's frame
+        // is deferred to the top-level report), but a plain variable-read
+        // or word-parse failure logs this command's frame (tclsh:
+        // `lindex $q [boomq]` with $q unset shows "lindex $q [boomq]").
         let mut args = Vec::with_capacity(cmd.words.len());
         for word in &cmd.words {
-            if let Word::Expand(inner) = word {
-                let value = self.eval_word(inner)?;
+            let value = match self.eval_word(word) {
+                Ok(v) => v,
+                Err(e) => {
+                    if self.err_is_error(&e) {
+                        if std::mem::take(&mut self.err_from_subst) {
+                            self.err_pending_top = Some(cmd.text.clone());
+                            // The construct-exit tags report the
+                            // enclosing command's line, not the
+                            // substitution-internal line.
+                            self.err_line = cmd.line;
+                        } else {
+                            let msg = e.message_text();
+                            self.err_harness_frame(&msg, &cmd.text, cmd.line);
+                        }
+                    }
+                    return Err(e);
+                }
+            };
+            if let Word::Expand(_) = word {
                 if let Some(items) = value.as_list() {
                     for item in items {
                         args.push(item);
@@ -58,12 +141,21 @@ impl Interp {
                     args.push(value);
                 }
             } else {
-                let value = self.eval_word(word)?;
                 args.push(value);
             }
         }
 
-        self.dispatch_values(&args)
+        // Expose the invocation for constructs that need the raw source
+        // (`info level 0` inside `namespace eval`).
+        self.cur_cmd_text = cmd.text.clone();
+        let r = self.dispatch_values(&args);
+        if let Err(e) = &r {
+            if self.err_is_error(e) {
+                let msg = e.message_text();
+                self.err_harness_frame(&msg, &cmd.text, cmd.line);
+            }
+        }
+        r
     }
 
     /// Dispatch an already-evaluated argument vector: procs, ensembles,
@@ -133,6 +225,16 @@ impl Interp {
                 } else {
                     None
                 }
+            })
+            .or_else(|| {
+                // `::pp` — an absolute simple name reaches the global
+                // namespace's bare-keyed proc (tclsh: `::pp q r` calls pp).
+                // The frame name is as invoked (tclsh `(procedure "::pp")`).
+                if cmd_name.starts_with("::") && !cmd_name[2..].contains("::") {
+                    let bare = &cmd_name[2..];
+                    return self.procs.get(bare).cloned().map(|p| (p, cmd_name.to_string()));
+                }
+                None
             });
         if let Some((proc_def, resolved_name)) = proc_lookup {
             return self.call_proc(&proc_def, &args, &resolved_name, None);
@@ -236,29 +338,21 @@ impl Interp {
                         return self.dispatch_values(&call);
                     }
                 }
-                // Try "unknown" handler (if defined as a proc or command);
+                // Try "unknown" handler (if defined as a proc or ensemble);
                 // the rename dance of namespace-52.6 keeps it under either
-                // the bare or the `::`-qualified key.
+                // the bare or the `::`-qualified key.  tclsh dispatches the
+                // handler INLINE (no harness frame naming "unknown ...") and
+                // with the qualified word `::unknown` — the original
+                // command's frame comes from the outer harness.
                 if cmd_name != "unknown" {
-                    let unknown_key = ["unknown", "::unknown"]
-                        .iter()
-                        .copied()
-                        .find(|k| {
-                            self.procs.contains_key(*k)
-                                || self.commands.contains_key(*k)
-                                || self.ensembles.contains_key(*k)
-                        });
-                    if let Some(uk) = unknown_key {
-                        let mut unknown_args = vec![Value::from_str(uk)];
+                    let has_unknown = self.procs.contains_key("unknown")
+                        || self.procs.contains_key("::unknown")
+                        || self.ensembles.contains_key("unknown")
+                        || self.ensembles.contains_key("::unknown");
+                    if has_unknown {
+                        let mut unknown_args = vec![Value::from_str("::unknown")];
                         unknown_args.extend(args.iter().cloned());
-                        // Recurse through eval_command to dispatch "unknown"
-                        let unknown_cmd = crate::parser::Command {
-                            words: unknown_args.iter().map(|v| {
-                                crate::parser::Word::Literal(v.as_str().to_string())
-                            }).collect(),
-                            line: 0,
-                        };
-                        return self.eval_command(&unknown_cmd);
+                        return self.dispatch_values(&unknown_args);
                     }
                 }
                 Err(Error::invalid_command(cmd_name))
@@ -266,12 +360,43 @@ impl Interp {
         }
     }
 
+    /// Full uncaught-error report for the `-f`/`-c` top level: the
+    /// accumulated errorInfo plus the `(file "..." line N)` frame tclsh
+    /// appends as the script unwinds, or the bare message when no frames
+    /// accumulated.  Prints verbatim on stderr (tclsh-compatible).
+    pub fn error_report(&mut self, e: &Error, file: &str) -> String {
+        if self.err_is_error(e) {
+            let tag = format!("file \"{}\"", file);
+            // A word-substitution error that escaped every enclosing
+            // construct frameless gets its enclosing command's frame
+            // here (tclsh logs it at the top level, after the skip).
+            if let Some(text) = self.err_pending_top.take() {
+                if let Some(info) = &mut self.err_info {
+                    info.push_str(&format!("\n    invoked from within\n\"{}\"", text));
+                }
+            }
+            self.err_exit_frame(&tag);
+            if let Some(info) = self.err_info.take() {
+                return info;
+            }
+        }
+        e.to_string()
+    }
+
     /// Evaluate a word to get its value.
     pub(crate) fn eval_word(&mut self, word: &Word) -> Result<Value> {
         match word {
             Word::Literal(s) => Ok(Value::from_str(s)),
             Word::VarRef(name) => self.read_var(name),
-            Word::CommandSub(cmd) => self.eval(cmd),
+            Word::CommandSub(cmd) => match self.eval(cmd) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    // Mark the boundary: the enclosing command must not
+                    // log its own frame (the nested eval just did).
+                    self.err_from_subst = true;
+                    Err(e)
+                }
+            },
             Word::Concat(parts) => {
                 let mut result = String::new();
                 for part in parts {

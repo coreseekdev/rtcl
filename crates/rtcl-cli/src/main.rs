@@ -70,7 +70,11 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
     let result = interp.eval(&script);
 
     if let Err(e) = result {
-        return Err(e.to_string());
+        // tclsh prints the full accumulated errorInfo (message + frames +
+        // `(file ...)` tail) verbatim on stderr.
+        let report = interp.error_report(&e, &path.to_string_lossy());
+        eprintln!("{}", report);
+        std::process::exit(1);
     }
 
     let _ = quiet;

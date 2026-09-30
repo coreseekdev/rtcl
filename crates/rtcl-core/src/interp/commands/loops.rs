@@ -28,6 +28,9 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
                     continue;
                 }
+                // tclsh compiles while inline: a body error names no frame
+                // for the while command itself (N8).
+                interp.err_fresh = true;
                 return Err(e);
             }
         }
@@ -64,7 +67,11 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
                     /* fall through to next */
                 }
-                else { return Err(e); }
+                else {
+                    // tclsh compiles for inline like while: frameless.
+                    interp.err_fresh = true;
+                    return Err(e);
+                }
             }
         }
 
@@ -78,7 +85,10 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 if e.is_continue() {
                     if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
                 }
-                else { return Err(e); }
+                else {
+                    interp.err_fresh = true;
+                    return Err(e);
+                }
             }
         }
     }
@@ -149,6 +159,9 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
                     continue;
                 }
+                // Unlike compiled while/for, foreach keeps its own command
+                // frame and adds `("foreach" body line N)` (F1).
+                interp.err_exit_frame("\"foreach\" body");
                 return Err(e);
             }
         }

@@ -288,7 +288,7 @@ fn process_events(interp: &mut Interp, idle_only: bool) -> Result<usize> {
         fired += 1;
 
         // Execute the script, ignoring errors (like jimtcl's bgerror handling)
-        let _ = interp.eval(&ev.script);
+        let _ = interp.eval_isolated(&ev.script);
     }
 
     Ok(fired)

@@ -299,7 +299,7 @@ impl Interp {
         let (oldq, newq) = (qual(old), qual(new));
         for s in scripts.into_iter().rev() {
             let cmd = format!("{} {} {} {}", s, q(&oldq), q(&newq), op);
-            let _ = self.eval(&cmd);
+            let _ = self.eval_isolated(&cmd);
         }
         if op == "delete" {
             self.cmd_traces.remove(key);

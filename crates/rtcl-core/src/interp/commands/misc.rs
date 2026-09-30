@@ -13,6 +13,45 @@ fn hostname_get() -> String {
         .unwrap_or_else(|_| "localhost".to_string())
 }
 
+/// Resolve a user-typed proc name to its registry key, mirroring the
+/// dispatch lookup (as-typed, current namespace, `::`-qualify, global
+/// fallback, `::`-bare).  `info body`/`args`/`statics` accept relative
+/// names like `test_ns_simple::test` (namespace-old-2.9).
+pub(crate) fn resolve_proc_key(interp: &Interp, name: &str) -> Option<String> {
+    let has = |i: &Interp, k: &str| i.procs.contains_key(k);
+    if has(interp, name) {
+        return Some(name.to_string());
+    }
+    if interp.current_namespace != "::" && !name.starts_with("::") {
+        let qualified = super::namespace::qualify(&interp.current_namespace, name);
+        if has(interp, &qualified) {
+            return Some(qualified);
+        }
+    }
+    if !name.starts_with("::") && name.contains("::") {
+        let qualified = format!("::{}", name);
+        if has(interp, &qualified) {
+            return Some(qualified);
+        }
+    }
+    if name.contains("::") {
+        let norm = super::namespace::normalise(name);
+        if norm != name && has(interp, &norm) {
+            return Some(norm);
+        }
+    }
+    if !name.starts_with("::") {
+        let qualified = format!("::{}", name);
+        if has(interp, &qualified) {
+            return Some(qualified);
+        }
+    }
+    if name.starts_with("::") && !name[2..].contains("::") && has(interp, &name[2..]) {
+        return Some(name[2..].to_string());
+    }
+    None
+}
+
 // ---------- Arithmetic operator commands: +, -, *, / ----------
 
 /// `+ ?number ...?` — Sum all arguments (0 if none).
@@ -754,21 +793,54 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Some(p) => (Some(p.strip_prefix("::").unwrap_or(p)), p.starts_with("::")),
                 None => (None, false),
             };
+            // At namespace scope the namespace's own variables report
+            // relative (tclsh: inside `namespace eval nn`, `info vars`
+            // lists `zz`, not `::nn::zz` — var-1.14); variables of child
+            // namespaces are not listed at all.
+            let ns_prefix = if interp.frames.is_empty() && interp.current_namespace != "::" {
+                Some(format!("{}::", &interp.current_namespace[2..]))
+            } else {
+                None
+            };
             let mut vars: Vec<Value> = interp
                 .scope_vars()
                 .keys()
-                .filter(|name| {
-                    match_pat
-                        .map(|p| super::super::glob_match(p, name))
-                        .unwrap_or(true)
-                })
-                .map(|name| {
-                    // Namespace variables are always reported qualified.
-                    if qualified || name.contains("::") {
-                        Value::from_str(&format!("::{}", name))
-                    } else {
-                        Value::from_str(name)
+                .filter_map(|name| {
+                    let rel = match &ns_prefix {
+                        Some(pfx) => match name.strip_prefix(pfx.as_str()) {
+                            // This namespace's own variable: report the
+                            // tail.  Plain globals pass through; other
+                            // namespaces' (incl. child) vars are skipped.
+                            Some(rest) if !rest.contains("::") => rest,
+                            None if !name.contains("::") => name.as_str(),
+                            _ => return None,
+                        },
+                        None => name.as_str(),
+                    };
+                    if let Some(p) = match_pat {
+                        // A `::`-bearing pattern can name the variable by
+                        // its stored key (1.11: `info vars
+                        // [namespace current]::*` inside the namespace).
+                        let hit = super::super::glob_match(p, rel)
+                            || (p.contains("::")
+                                && (super::super::glob_match(p, name)
+                                    || super::super::glob_match(
+                                        p, &format!("::{}", name),
+                                    )));
+                        if !hit {
+                            return None;
+                        }
                     }
+                    // Report qualified when the pattern asked for it, or
+                    // when the variable belongs to another namespace
+                    // (`info vars n::*` at global → `::n::v`).
+                    if qualified || (name.contains("::") && ns_prefix.is_none()) {
+                        if ns_prefix.is_some() && !name.contains("::") {
+                            return Some(Value::from_str(rel));
+                        }
+                        return Some(Value::from_str(&format!("::{}", name)));
+                    }
+                    Some(Value::from_str(rel))
                 })
                 .collect();
             vars.sort_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -798,8 +870,8 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::wrong_args("info body", 3, args.len()));
             }
             let name = args[2].as_str();
-            if let Some(proc_def) = interp.procs.get(name) {
-                Ok(Value::from_str(&proc_def.body))
+            if let Some(key) = resolve_proc_key(interp, name) {
+                Ok(Value::from_str(&interp.procs[&key].body))
             } else {
                 Err(Error::runtime(
                     format!("\"{}\" isn't a procedure", name),
@@ -812,7 +884,8 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::wrong_args("info args", 3, args.len()));
             }
             let name = args[2].as_str();
-            if let Some(proc_def) = interp.procs.get(name) {
+            if let Some(key) = resolve_proc_key(interp, name) {
+                let proc_def = &interp.procs[&key];
                 let arg_names: Vec<Value> = proc_def
                     .params
                     .iter()
@@ -826,7 +899,40 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ))
             }
         }
-        "level" => Ok(Value::from_int(interp.frames.len() as i64)),
+        "level" => {
+            if args.len() == 2 {
+                return Ok(Value::from_int(interp.frames.len() as i64));
+            }
+            let n = args[2].as_int().ok_or_else(|| {
+                Error::runtime(format!("bad level \"{}\"", args[2].as_str()),
+                    crate::error::ErrorCode::Generic)
+            })?;
+            if n == 0 {
+                // `info level 0`: the innermost active frame's invocation —
+                // a proc's as-dispatched words (47.1: `::ns::a b c`) or the
+                // `namespace eval` command's source (25.9).  At the bare
+                // global level there is no frame: `bad level "0"`.
+                if let Some(frame) = interp.frames.last() {
+                    if !frame.level0.is_empty() {
+                        return Ok(Value::from_str(&frame.level0));
+                    }
+                }
+                if let Some(l0) = interp.ns_level0.last() {
+                    return Ok(Value::from_str(l0));
+                }
+                Err(Error::runtime("bad level \"0\"", crate::error::ErrorCode::Generic))
+            } else if n > 0 {
+                let depth = interp.frames.len();
+                let idx = depth.checked_sub(n as usize).ok_or_else(|| {
+                    Error::runtime(format!("bad level \"{}\"", n),
+                        crate::error::ErrorCode::Generic)
+                })?;
+                Ok(Value::from_str(&interp.frames[idx].level0))
+            } else {
+                Err(Error::runtime(format!("bad level \"{}\"", n),
+                    crate::error::ErrorCode::Generic))
+            }
+        }
         "complete" => {
             if args.len() != 3 {
                 return Err(Error::wrong_args("info complete", 3, args.len()));
@@ -1048,12 +1154,13 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::wrong_args("info statics", 3, args.len()));
             }
             let name = args[2].as_str();
-            let proc_def = interp.procs.get(name).ok_or_else(|| {
+            let key = resolve_proc_key(interp, name).ok_or_else(|| {
                 Error::runtime(
                     format!("\"{}\" isn't a procedure", name),
                     crate::error::ErrorCode::NotFound,
                 )
             })?;
+            let proc_def = &interp.procs[&key];
             let mut entries: Vec<Value> = Vec::new();
             let mut keys: Vec<&String> = proc_def.statics.keys().collect();
             keys.sort();

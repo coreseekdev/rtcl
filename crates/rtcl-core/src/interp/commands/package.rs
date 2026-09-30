@@ -92,7 +92,7 @@ fn pkg_require(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     let pkgindex = format!("{}/pkgIndex.tcl", dir.as_str());
                     if std::path::Path::new(&pkgindex).exists() {
                         // Source the pkgIndex.tcl (it may call `package provide`)
-                        let _ = interp.eval(&format!("source {{{}}}", pkgindex));
+                        let _ = interp.eval_isolated(&format!("source {{{}}}", pkgindex));
                         // Check if now available
                         if let Some(v) = interp.packages.get(name) {
                             return Ok(Value::from_str(v));

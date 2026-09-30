@@ -103,15 +103,28 @@ pub fn cmd_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     if args.len() == 2 {
-        interp.eval(args[1].as_str())
+        eval_tagged(interp, args[1].as_str(), "eval")
     } else {
         let script: String = args[1..]
             .iter()
             .map(|a| a.as_str())
             .collect::<Vec<&str>>()
             .join(" ");
-        interp.eval(&script)
+        eval_tagged(interp, &script, "eval")
     }
+}
+
+/// Evaluate a nested script for `eval`/`uplevel`: a body error gains the
+/// construct's exit frame — `("eval" body line N)` (F3) / `("uplevel"
+/// body line N)` (N1) — before the enclosing harness names the command.
+fn eval_tagged(interp: &mut Interp, script: &str, tag: &str) -> Result<Value> {
+    let r = interp.eval(script);
+    if let Err(e) = &r {
+        if interp.err_is_error(e) {
+            interp.err_exit_frame(&format!("\"{}\" body", tag));
+        }
+    }
+    r
 }
 
 /// apply lambdaExpr ?arg ...?
@@ -181,7 +194,16 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         call_args.push(arg.clone());
     }
 
-    interp.call_proc(&proc_def, &call_args, "apply lambdaExpr", ns_override)
+    let r = interp.call_proc(&proc_def, &call_args, "apply lambdaExpr", ns_override);
+    if let Err(e) = &r {
+        if interp.err_is_error(e) {
+            // F5: `(lambda term "{} {boomap}" line N)` — the lambda TERM's
+            // value renders in the tag.
+            let tag = format!("lambda term \"{}\"", args[1].as_str());
+            interp.err_exit_frame(&tag);
+        }
+    }
+    r
 }
 
 pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -235,7 +257,7 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             .unwrap_or_else(|| "::".to_string())
     };
     interp.current_namespace = target_ns;
-    let result = interp.eval(&script);
+    let result = eval_tagged(interp, &script, "uplevel");
     interp.current_namespace = saved_ns;
     interp.frames.extend(saved_frames);
     result
@@ -278,7 +300,18 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let local_var = args[i + 1].as_str().to_string();
 
         let link = match target_frame {
-            None => UpvarLink::Global(other_var),
+            // `upvar #0` names the true global namespace's variable;
+            // a numeric level falling off the proc-frame chain names the
+            // CALLER's scope (var-15.1: `namespace eval test A ...` +
+            // `upvar $name` lands in ::test, not the proc's own ns).
+            None if is_global => UpvarLink::Global(other_var),
+            None => {
+                let ns = interp.frames[current_idx]
+                    .call_ns
+                    .clone()
+                    .unwrap_or_else(|| interp.current_namespace.clone());
+                UpvarLink::Global(interp.canonical_global_in(&ns, &other_var))
+            }
             Some(fi) => UpvarLink::Frame { frame_index: fi, var_name: other_var },
         };
 

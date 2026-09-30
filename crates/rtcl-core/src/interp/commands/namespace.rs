@@ -209,10 +209,21 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             .join(" ")
     };
 
-    // Push namespace context
-    let prev = std::mem::replace(&mut interp.current_namespace, qualified);
+    // Push namespace context.  tclsh's namespace eval pushes a varFrame
+    // visible to `info level 0` as the ns-eval command's source text
+    // (25.9), and its exit appends
+    // `(in namespace eval "<qualified>" script line N)` on error (25.6).
+    interp.ns_level0.push(interp.cur_cmd_text.clone());
+    let prev = std::mem::replace(&mut interp.current_namespace, qualified.clone());
     let result = interp.eval(&body);
     interp.current_namespace = prev;
+    interp.ns_level0.pop();
+    if let Err(e) = &result {
+        if interp.err_is_error(e) {
+            let tag = format!("in namespace eval \"{}\" script", qualified);
+            interp.err_exit_frame(&tag);
+        }
+    }
     result
 }
 
@@ -1183,6 +1194,17 @@ fn ens_run(
     interp.dispatch_values(call)
 }
 
+/// Seed the errorInfo for the bad-completion errors raised at the
+/// `-unknown` handler site (47.4): a fresh info — message plus the
+/// `result of ensemble unknown subcommand handler: <call>` tag — that the
+/// enclosing harness then appends `invoked from within` to.
+fn ens_tag_handler_error(interp: &mut Interp, msg: &str, call_text: &str) {
+    interp.err_info = Some(format!(
+        "{}\n    result of ensemble unknown subcommand handler: {}",
+        msg, call_text
+    ));
+}
+
 /// Ensemble command dispatch: `ens sub ?args...?`.
 pub(crate) fn dispatch_ensemble(
     interp: &mut Interp,
@@ -1225,11 +1247,30 @@ pub(crate) fn dispatch_ensemble(
     if let Some(handler) = def.unknown.clone() {
         let mut call: Vec<Value> =
             handler.iter().map(|w| Value::from_str(w.as_str())).collect();
-        call.push(Value::from_str(ens_key));
+        // The handler sees the ensemble's fully-qualified name (47.2:
+        // `ns spong` at global passes `::ns` to `::ns::Magic`).
+        let ens_display = if ens_key.starts_with("::") {
+            ens_key.to_string()
+        } else {
+            qualify(&interp.current_namespace, ens_key)
+        };
+        call.push(Value::from_str(&ens_display));
         call.push(Value::from_str(sub));
         call.extend(rest[1..].iter().cloned());
+        // tclsh logs the handler invocation as a real frame: the call text
+        // (argv joined) plus the `(ensemble unknown subcommand handler)` tag.
+        let call_text = call
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
         let handler_result = match interp.dispatch_values(&call) {
             Err(e) if e.is_break() => {
+                ens_tag_handler_error(
+                    interp,
+                    "unknown subcommand handler returned bad code: break",
+                    &call_text,
+                );
                 return Err(Error::runtime(
                     "unknown subcommand handler returned bad code: break"
                         .to_string(),
@@ -1237,13 +1278,28 @@ pub(crate) fn dispatch_ensemble(
                 ));
             }
             Err(e) if e.is_continue() => {
+                ens_tag_handler_error(
+                    interp,
+                    "unknown subcommand handler returned bad code: continue",
+                    &call_text,
+                );
                 return Err(Error::runtime(
                     "unknown subcommand handler returned bad code: continue"
                         .to_string(),
                     ErrorCode::InvalidOp,
                 ));
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                if interp.err_is_error(&e) {
+                    if let Some(info) = &mut interp.err_info {
+                        info.push_str(&format!(
+                            "\n    invoked from within\n\"{}\"\n    (ensemble unknown subcommand handler)",
+                            call_text
+                        ));
+                    }
+                }
+                return Err(e);
+            }
             Ok(v) => v,
         };
         // Retry the subcommand lookup once (the handler may have defined
@@ -1266,15 +1322,27 @@ pub(crate) fn dispatch_ensemble(
         }
         // Retry failed: dispatch the handler's returned prefix, or report
         // the (refreshed) miss.
-        if let Some(prefix) = handler_result.as_list() {
-            if !prefix.is_empty() {
-                let mut call: Vec<Value> = prefix.to_vec();
+        match handler_result.as_list_strict() {
+            Ok(prefix) if !prefix.is_empty() => {
+                let mut call: Vec<Value> = prefix.clone();
                 call.extend(params.iter().cloned());
                 call.extend(rest[1..].iter().cloned());
                 return ens_run(interp, &def.namespace, &call);
             }
+            Ok(_) => {
+                return Err(ens_miss_error(interp, &def, sub));
+            }
+            Err(e) => {
+                // The handler's result must parse as a list; unparseable
+                // results error here (47.6: `return "\{"` → unmatched
+                // open brace).
+                interp.err_info = Some(format!(
+                    "{}\n    while parsing result of ensemble unknown subcommand handler",
+                    e.message
+                ));
+                return Err(Error::Msg(e.message.to_string()));
+            }
         }
-        return Err(ens_miss_error(interp, &def, sub));
     }
 
     Err(ens_miss_error(interp, &def, sub))

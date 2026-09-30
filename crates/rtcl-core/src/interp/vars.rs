@@ -205,16 +205,30 @@ impl Interp {
         Some(key)
     }
 
-    /// Canonical key for a `::`-containing variable name reached at the
-    /// global frame level: a relative qualified name resolves against the
-    /// current namespace (`set b::c` inside `namespace eval n` stores
-    /// `n::b::c`) and colon runs collapse.  Plain names pass through.
-    fn canonical_global(&self, name: &str) -> String {
-        if !name.contains("::") {
+    /// Canonical key for a variable name reached at the global frame
+    /// level: a name (plain or relative-qualified) inside a namespace is
+    /// that namespace's variable (`set x` in `namespace eval n` writes
+    /// `n::x`, visible as `set n::x` — namespace-old-5.5); colon runs
+    /// collapse.  Plain names concatenate verbatim (a single `:` is a
+    /// name character — var-1.14); names at the global level pass
+    /// through.
+    pub(crate) fn canonical_global(&self, name: &str) -> String {
+        self.canonical_global_in(&self.current_namespace.clone(), name)
+    }
+
+    /// [`Interp::canonical_global`] against an explicit namespace (the
+    /// caller's context — a proc's own `current_namespace` is its
+    /// definition namespace, not the `namespace eval` it was called
+    /// from).
+    pub(crate) fn canonical_global_in(&self, ns: &str, name: &str) -> String {
+        if ns == "::" {
             return name.to_string();
         }
-        let qualified =
-            super::commands::namespace::qualify(&self.current_namespace, name);
+        let qualified = if name.contains("::") {
+            super::commands::namespace::qualify(ns, name)
+        } else {
+            format!("{}::{}", ns, name)
+        };
         qualified.strip_prefix("::").unwrap_or(&qualified).to_string()
     }
 
@@ -250,7 +264,7 @@ impl Interp {
             // bare-declared (valueless) name stops the chain: reads fail
             // rather than falling through to the global variable.
             if self.current_namespace != "::" {
-                let key = format!("{}::{}", &self.current_namespace[2..], name);
+                let key = self.canonical_global(name);
                 if let Some(v) = self.globals.get(key.as_str()) {
                     return Some(v);
                 }
@@ -279,14 +293,10 @@ impl Interp {
             return;
         }
         if self.frames.is_empty() {
-            // A `variable`-declared name stores into the namespace's own
-            // variable, not the global one (tclsh: `variable x`; `set x 9`
-            // writes ::ns::x and leaves ::x alone).
-            let key = if self.current_namespace != "::" && self.ns_var_declared(name) {
-                format!("{}::{}", &self.current_namespace[2..], name)
-            } else {
-                self.canonical_global(name)
-            };
+            // Inside a namespace every write lands in that namespace's
+            // own variable (tclsh: `set x 9` in `namespace eval n` writes
+            // ::n::x; `variable`-declared names behave the same way).
+            let key = self.canonical_global(name);
             self.globals.insert(key, value);
             return;
         }
@@ -314,11 +324,7 @@ impl Interp {
             return;
         }
         if self.frames.is_empty() {
-            let key = if self.current_namespace != "::" && self.ns_var_declared(name) {
-                format!("{}::{}", &self.current_namespace[2..], name)
-            } else {
-                self.canonical_global(name)
-            };
+            let key = self.canonical_global(name);
             self.globals.remove(key.as_str());
             // Unsetting also forgets the `variable` declaration (tclsh:
             // `namespace which -variable` afterwards is empty and reads

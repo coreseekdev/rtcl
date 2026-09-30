@@ -51,6 +51,7 @@ impl Interp {
             call_ns: Some(prev_namespace.clone()),
             local_procs: Vec::new(),
             deferred_scripts: Vec::new(),
+            level0: String::new(),
         });
 
         let final_result = loop {
@@ -67,6 +68,10 @@ impl Interp {
                 frame.locals.clear();
                 frame.array_locals.clear();
                 frame.upvars.clear();
+                // `info level 0` shows the invocation as dispatched: the
+                // as-typed command word plus the evaluated arguments
+                // (tclsh 47.1: `ns a b c` → `::ns::a b c`).
+                frame.level0 = Value::from_list(&current_args.to_vec()).as_str().to_string();
             }
 
             let has_args = current_params.last().map(|(p, _)| p.as_str()) == Some("args");
@@ -200,6 +205,17 @@ impl Interp {
             }
         };
 
+        // `(procedure "name" line N)` frame when the body errored — the
+        // line is the erroring command's line within the body, recorded by
+        // the body's script harness.  Lambda bodies (apply) get the
+        // `(lambda term ...)` tag from cmd_apply instead.
+        if let Err(e) = &final_result {
+            if self.err_is_error(e) && current_proc_name != "apply lambdaExpr" {
+                let tag = format!("procedure \"{}\"", current_proc_name);
+                self.err_exit_frame(&tag);
+            }
+        }
+
         // Write back static variables to the proc definition
         if !current_statics.is_empty() {
             if let Some(frame) = self.frames.last() {
@@ -219,7 +235,7 @@ impl Interp {
         if let Some(frame) = self.frames.last() {
             let scripts: Vec<String> = frame.deferred_scripts.clone();
             for script in scripts.iter().rev() {
-                let _ = self.eval(script);
+                let _ = self.eval_isolated(script);
             }
         }
 

@@ -86,10 +86,14 @@ fn skip_comment(cur: &mut Cursor) {
 
 fn parse_command(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Command> {
     let line = cur.line();
+    let start = cur.pos();
     let mut words = Vec::new();
+    let mut word_srcs = Vec::new();
 
     while !cur.at_end_of_command(bracket_term) {
+        let wstart = cur.pos();
         words.push(parse_next_word(cur, bracket_term)?);
+        word_srcs.push(cur.slice_range(wstart, cur.pos()).to_string());
         cur.skip_line_whitespace();
     }
 
@@ -102,5 +106,13 @@ fn parse_command(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Command> {
         _ => {}
     }
 
-    Ok(Command { words, line })
+    // Source text as tclsh quotes it in errorInfo frames: the range as
+    // written (leading whitespace already skipped by the separator skip),
+    // with one trailing terminator stripped.
+    let mut text = cur.slice_range(start, cur.pos()).to_string();
+    if text.ends_with('\n') || text.ends_with(';') {
+        text.pop();
+    }
+
+    Ok(Command { words, line, text, word_srcs })
 }

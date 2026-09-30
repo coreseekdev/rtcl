@@ -99,6 +99,9 @@ pub(crate) struct CallFrame {
     pub local_procs: Vec<String>,
     /// Scripts registered by `defer` — executed in reverse order on frame exit.
     pub deferred_scripts: Vec<String>,
+    /// `info level 0` for this frame: the invocation words as dispatched
+    /// (as-typed command name + evaluated arguments), list-rendered.
+    pub level0: String,
 }
 
 /// One live `array startsearch` iteration over an array's element names.
@@ -185,6 +188,36 @@ pub struct Interp {
     pub(crate) cmd_traces: HashMap<String, Vec<(Vec<String>, String)>>,
     /// `trace add execution` registrations (stored; enter/leave traces).
     pub(crate) exec_traces: HashMap<String, Vec<(Vec<String>, String)>>,
+    /// Accumulated `errorInfo` of the error currently propagating
+    /// (message + `while executing` / `invoked from within` frames).
+    /// `None` when no error is in flight; consumed by `catch`.
+    pub(crate) err_info: Option<String>,
+    /// Suppress the next script-harness frame append — the erroring
+    /// command already wrote errorInfo itself (`error msg info`) or
+    /// propagates framelessly (`while`/`if` bodies, tclsh's inlined loop
+    /// instructions).
+    pub(crate) err_fresh: bool,
+    /// Line of the last erroring command recorded by a script harness;
+    /// consumed by `(procedure ... line N)`, `(in namespace eval ...
+    /// script line N)`, `("uplevel" body line N)`, `(file ... line N)`.
+    pub(crate) err_line: usize,
+    /// Source text of the command currently dispatching, for constructs
+    /// that need the raw invocation (`info level 0` inside
+    /// `namespace eval`).
+    pub(crate) cur_cmd_text: String,
+    /// `info level 0` inside `namespace eval`: the ns-eval command's
+    /// source text, one entry per live `namespace eval` (tclsh's
+    /// namespace-eval varFrame is visible to `info level 0`).
+    pub(crate) ns_level0: Vec<String>,
+    /// Set when a word's error came from a command substitution (the
+    /// nested eval already logged its frames; the enclosing command logs
+    /// none and marks [`Interp::err_pending_top`] instead).
+    pub(crate) err_from_subst: bool,
+    /// Source of the outermost command whose word substitution errored,
+    /// waiting to see if the error escapes uncaught — the top-level
+    /// report then adds `invoked from within "<text>"` (tclsh logs the
+    /// enclosing command only when nothing else consumed the log).
+    pub(crate) err_pending_top: Option<String>,
     /// Current script name (for info script).
     #[cfg(feature = "std")]
     pub(crate) script_name: String,
@@ -250,6 +283,13 @@ impl Interp {
             trace_phantoms: HashMap::new(),
             cmd_traces: HashMap::new(),
             exec_traces: HashMap::new(),
+            err_info: None,
+            err_fresh: false,
+            err_line: 1,
+            cur_cmd_text: String::new(),
+            err_from_subst: false,
+            err_pending_top: None,
+            ns_level0: Vec::new(),
             frames: Vec::new(),
             commands: HashMap::new(),
             command_categories: HashMap::new(),

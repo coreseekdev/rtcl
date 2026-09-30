@@ -1,0 +1,6 @@
+puts "cmd-abs0: [::tcl::mathfunc::abs -0]"
+puts "cmd-abs3: [::tcl::mathfunc::abs -3]"
+puts "cmd-abs00: [::tcl::mathfunc::abs -0.0]"
+puts "cmd-absx0: [::tcl::mathfunc::abs 0x0]"
+puts "expr-abs0: [expr {abs(-0)}]"
+puts "cmd-absw: [::tcl::mathfunc::abs -9223372036854775808]"

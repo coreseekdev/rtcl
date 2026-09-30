@@ -307,6 +307,39 @@ impl Interp {
                         seed,
                     );
                 }
+                // ::tcl::unsupported::representation — internal-rep debug
+                // view (expr-52.1 string-matches "*no string
+                // representation*" for values whose string form is not
+                // yet generated, e.g. lists).
+                if cmd_name
+                    .strip_prefix("::tcl::unsupported::")
+                    .or_else(|| cmd_name.strip_prefix("tcl::unsupported::"))
+                    == Some("representation")
+                {
+                    if args.len() != 2 {
+                        return Err(Error::wrong_args(
+                            "::tcl::unsupported::representation value",
+                            1,
+                            args.len().saturating_sub(1),
+                        ));
+                    }
+                    let v = &args[1];
+                    let ptr = &*v as *const _ as usize;
+                    let tn = v.type_name();
+                    let text = if tn == "list" || tn == "dict" {
+                        format!(
+                            "value is a {tn} with a refcount of 2, object pointer at 0x{ptr:x}, internal representation: {tn}, no string representation"
+                        )
+                    } else {
+                        let sv = v.as_str();
+                        let head: String = sv.chars().take(40).collect();
+                        let dots = if sv.chars().count() > 40 { "..." } else { "" };
+                        format!(
+                            "value is a pure string with a refcount of 2, object pointer at 0x{ptr:x}, string representation \"{head}{dots}\""
+                        )
+                    };
+                    return Ok(Value::from_str(&text));
+                }
                 // `namespace unknown` handler: the current namespace's
                 // own handler first, then ancestors' (tclsh 52.7 walks up
                 // to ::).  An explicitly-set value stops the walk even

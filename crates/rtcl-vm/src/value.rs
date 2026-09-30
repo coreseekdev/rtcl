@@ -467,6 +467,17 @@ impl Value {
                     body.strip_prefix("0b").or_else(|| body.strip_prefix("0B"))
                 {
                     i64::from_str_radix(rest, 2).ok()
+                } else if body.len() > 1 && body.starts_with('0') {
+                    // Legacy octal: `017` is 15 (tclsh); a digit 8/9 makes
+                    // the text not-an-integer (`expr 018` errors).
+                    let digits = &body[1..];
+                    if digits.bytes().all(|d| (b'0'..=b'7').contains(&d)) {
+                        return u64::from_str_radix(digits, 8)
+                            .ok()
+                            .map(|n| n as i64)
+                            .map(|n| if neg { n.wrapping_neg() } else { n });
+                    }
+                    None
                 } else {
                     // Plain decimal: parse the original text (sign included).
                     return i64::from_str(s).ok();
@@ -501,18 +512,35 @@ impl Value {
     }
 
     /// Try to get as boolean
+    ///
+    /// Tcl rules (TclGetBooleanFromObj): any numeric value coerces by
+    /// zero-ness (2.5 → true, 0x10 → true, 00 → false); otherwise the
+    /// string must be an unambiguous prefix of true/false/yes/no/on/off
+    /// (`t`, `ye`, `of` are valid; `o` alone is ambiguous → None).
     pub fn as_bool(&self) -> Option<bool> {
         match &self.inner.rep {
             InternalRep::Bool(b) => Some(*b),
             _ => {
+                if let Some(i) = self.as_int() {
+                    return Some(i != 0);
+                }
+                if let Some(f) = self.as_float() {
+                    return if f.is_nan() { None } else { Some(f != 0.0) };
+                }
                 let s = self.to_str();
                 let s = s.trim();
-                // Tcl boolean rules
-                match s.to_ascii_lowercase().as_str() {
-                    "1" | "true" | "yes" | "on" => Some(true),
-                    "0" | "false" | "no" | "off" => Some(false),
-                    _ => None,
+                if s.is_empty() {
+                    return None;
                 }
+                let lower = s.to_ascii_lowercase();
+                let mut candidates = ["true", "false", "yes", "no", "on", "off"]
+                    .iter()
+                    .filter(|word| word.starts_with(lower.as_str()));
+                let first = *candidates.next()?;
+                if candidates.next().is_some() {
+                    return None; // ambiguous prefix ("o")
+                }
+                Some(matches!(first, "true" | "yes" | "on"))
             }
         }
     }

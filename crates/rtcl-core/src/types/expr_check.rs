@@ -465,8 +465,10 @@ impl<'a> Checker<'a> {
         if j < self.e.len() && self.e[j] == b'(' {
             return BarewordResolve::Function;
         }
-        let low = word.to_ascii_lowercase();
-        if matches!(low.as_str(), "true" | "false" | "yes" | "no" | "on" | "off") {
+        // Boolean words, including tclsh's unique-prefix abbreviations
+        // (`expr bool(y)` — expr-31.0.4.0; "o" alone stays invalid because
+        // it prefixes both "on" and "off").
+        if crate::types::expr_funcs::bool_from_string(&word).is_some() {
             return BarewordResolve::Bool;
         }
         let d = if word.len() >= LIMIT { "..." } else { "" };

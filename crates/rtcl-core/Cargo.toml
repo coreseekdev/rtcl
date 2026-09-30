@@ -12,6 +12,10 @@ rtcl-parser.workspace = true
 rtcl-vm.workspace = true
 indexmap.workspace = true
 
+num-bigint.workspace = true
+num-traits.workspace = true
+num-integer.workspace = true
+
 [dependencies.glob]
 workspace = true
 optional = true

@@ -24,7 +24,7 @@ pub fn eval_expr(interp: &mut Interp, expr: &str) -> Result<Value> {
     }
     let mut parser = ExprParser::new(expr, interp);
     let result = parser.parse_ternary()?;
-    Ok(canonicalize_result(result))
+    canonicalize_result(result)
 }
 
 /// Tcl: when the result of an expression is a string that looks like a
@@ -33,24 +33,29 @@ pub fn eval_expr(interp: &mut Interp, expr: &str) -> Result<Value> {
 /// yields `16`. Non-numeric strings pass through unchanged. (Numeric
 /// *operators* convert their operands individually; `eq`/`ne` keep
 /// comparing the original strings.)
-fn canonicalize_result(v: Value) -> Value {
+fn canonicalize_result(v: Value) -> Result<Value> {
     if v.type_name() != "string" {
-        return v;
+        return Ok(v);
     }
     if let Some(i) = v.as_int() {
-        return Value::from_int(i);
+        return Ok(Value::from_int(i));
     }
     // A plain decimal integer beyond i64 is a Tcl bignum; keep its exact
     // text rather than degrading it to a rounded double (E4).
     let t = v.as_str().trim();
     let digits = t.strip_prefix(['-', '+']).unwrap_or(t);
     if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-        return v;
+        return Ok(v);
     }
     if let Some(f) = v.as_float() {
-        return super::expr_funcs::float_value(f);
+        // A string that parses to NaN cannot canonicalize — tclsh raises
+        // a domain error (`expr {"nan"}` / bareword nan, probed bn7).
+        if f.is_nan() {
+            return Err(super::expr_funcs::domain_error());
+        }
+        return Ok(super::expr_funcs::float_value(f));
     }
-    v
+    Ok(v)
 }
 
 /// Expression parser
@@ -58,6 +63,10 @@ struct ExprParser<'a> {
     chars: Vec<char>,
     pos: usize,
     interp: &'a mut Interp,
+    /// Depth of math-function argument lists: a bare `nan` is accepted as
+    /// a string literal inside them (`expr int(NaN)` errors inside int(),
+    /// while a top-level `expr nan` is a domain error).
+    func_arg_depth: u32,
 }
 
 impl<'a> ExprParser<'a> {
@@ -66,6 +75,7 @@ impl<'a> ExprParser<'a> {
             chars: expr.chars().collect(),
             pos: 0,
             interp,
+            func_arg_depth: 0,
         }
     }
 
@@ -134,9 +144,7 @@ impl<'a> ExprParser<'a> {
             if self.peek() == '|' && self.peek_at(1) != '|' {
                 self.advance();
                 let right = self.parse_bitxor()?;
-                let a = self.as_int_val(&left)?;
-                let b = self.as_int_val(&right)?;
-                left = Value::from_int(a | b);
+                left = self.int_bitop(&left, &right, '|')?;
             } else {
                 break;
             }
@@ -152,9 +160,7 @@ impl<'a> ExprParser<'a> {
             if self.peek() == '^' {
                 self.advance();
                 let right = self.parse_bitand()?;
-                let a = self.as_int_val(&left)?;
-                let b = self.as_int_val(&right)?;
-                left = Value::from_int(a ^ b);
+                left = self.int_bitop(&left, &right, '^')?;
             } else {
                 break;
             }
@@ -171,9 +177,7 @@ impl<'a> ExprParser<'a> {
             if self.peek() == '&' && self.peek_at(1) != '&' {
                 self.advance();
                 let right = self.parse_equality()?;
-                let a = self.as_int_val(&left)?;
-                let b = self.as_int_val(&right)?;
-                left = Value::from_int(a & b);
+                left = self.int_bitop(&left, &right, '&')?;
             } else {
                 break;
             }
@@ -310,7 +314,14 @@ impl<'a> ExprParser<'a> {
         Ok(left)
     }
 
-    /// Shift: `<<`, `>>`, `<<<`, `>>>`
+    /// Shift: `<<`, `>>` (Tcl) plus rtcl extensions `<<<`, `>>>` (rotates).
+    ///
+    /// Tcl semantics (tclsh 8.6.17): a negative shift count errors with
+    /// "negative shift argument"; `<<` widens to bignum when the result
+    /// overflows i64 (`1 << 63` is the positive bignum 2^63); `>>` is an
+    /// arithmetic shift that saturates past the width (`-1 >> 64` is -1);
+    /// shift counts so large the result exceeds the bignum range error
+    /// with "integer value too large to represent".
     fn parse_shift(&mut self) -> Result<Value> {
         let mut left = self.parse_additive()?;
         loop {
@@ -322,11 +333,6 @@ impl<'a> ExprParser<'a> {
                 let shift = b % bits;
                 let rotated = if shift == 0 { a } else { (a << shift) | (a >> (bits - shift)) };
                 left = Value::from_int(rotated as i64);
-            } else if self.match_op("<<") {
-                let right = self.parse_additive()?;
-                let a = self.as_int_val(&left)?;
-                let b = self.as_int_val(&right)?;
-                left = Value::from_int(a << (b & 63));
             } else if self.match_op(">>>") {
                 let right = self.parse_additive()?;
                 let a = self.as_int_val(&left)? as u64;
@@ -335,16 +341,89 @@ impl<'a> ExprParser<'a> {
                 let shift = b % bits;
                 let rotated = if shift == 0 { a } else { (a >> shift) | (a << (bits - shift)) };
                 left = Value::from_int(rotated as i64);
-            } else if self.match_op(">>") {
+            } else if self.match_op("<<") || self.match_op(">>") {
+                let shl = self.chars[self.pos - 1] == '<';
                 let right = self.parse_additive()?;
-                let a = self.as_int_val(&left)?;
-                let b = self.as_int_val(&right)?;
-                left = Value::from_int(a >> (b & 63));
+                left = self.int_shift(&left, &right, shl)?;
             } else {
                 break;
             }
         }
         Ok(left)
+    }
+
+    /// One `<<`/`>>` operation with Tcl's bignum-widening semantics.
+    fn int_shift(&self, left: &Value, right: &Value, shl: bool) -> Result<Value> {
+        use num_traits::Signed;
+        use super::bignum::{int_rep, to_value, IntRep};
+        let op = if shl { "<<" } else { ">>" };
+        // tclsh shift operands must be integers: a float operand errors
+        // with the operator named, separately from other non-numeric
+        // strings (`1.5 << 2` vs `"abc" << 1`).
+        let int_operand = |v: &Value| -> Result<i64> {
+            if let Some(i) = v.as_int() {
+                return Ok(i);
+            }
+            if v.as_float().is_some() {
+                return Err(Error::Msg(format!(
+                    "can't use floating-point value as operand of \"{op}\""
+                )));
+            }
+            Err(Error::Msg(format!(
+                "can't use non-numeric string as operand of \"{op}\""
+            )))
+        };
+        if int_rep(left).is_none() {
+            int_operand(left)?;
+        }
+        let count = int_operand(right)?;
+        if count < 0 {
+            return Err(Error::Msg("negative shift argument".to_string()));
+        }
+        // Bignum cap: results wider than ~2^27 bits exceed tclsh's
+        // bignum range ("integer value too large to represent", probed
+        // with `1 << 0x8000000000000000`).
+        if shl && count > 1 << 27 {
+            return Err(Error::Msg(
+                "integer value too large to represent".to_string(),
+            ));
+        }
+        match int_rep(left) {
+            Some(IntRep::I64(a)) if !shl && count >= 64 => {
+                Ok(Value::from_int(if a < 0 { -1 } else { 0 }))
+            }
+            Some(IntRep::Big(b)) => {
+                let shifted = if shl {
+                    b << (count as usize)
+                } else if count as u64 >= b.bits() as u64 {
+                    // Saturate without building a 2^count denominator.
+                    if b.is_negative() {
+                        num_bigint::BigInt::from(-1)
+                    } else {
+                        num_bigint::BigInt::from(0)
+                    }
+                } else {
+                    b >> (count as usize)
+                };
+                Ok(to_value(IntRep::Big(shifted)))
+            }
+            Some(IntRep::I64(a)) if shl => {
+                let wide = ((a as u64) << (count as u32)) as i64;
+                if count < 64 && (wide >> count) == a {
+                    Ok(Value::from_int(wide))
+                } else {
+                    // Overflow: widen to an exact bignum (1 << 63 is
+                    // 9223372036854775808, not i64::MIN).
+                    Ok(to_value(IntRep::Big(
+                        num_bigint::BigInt::from(a) << (count as usize),
+                    )))
+                }
+            }
+            Some(IntRep::I64(a)) => Ok(Value::from_int(a >> (count as u32))),
+            None => Err(Error::Msg(format!(
+                "can't use non-numeric string as operand of \"{op}\""
+            ))),
+        }
     }
 
     /// Additive: `+`, `-`
@@ -381,18 +460,11 @@ impl<'a> ExprParser<'a> {
             } else if self.peek() == '/' {
                 self.advance();
                 let right = self.parse_power()?;
-                if let (Some(_), Some(0.0)) = (left.as_float(), right.as_float()) {
-                    return Err(Error::DivisionByZero);
-                }
                 left = self.numeric_binop(&left, &right, '/')?;
             } else if self.peek() == '%' {
                 self.advance();
                 let right = self.parse_power()?;
-                let a = self.as_int_val(&left)?;
-                let b = self.as_int_val(&right)?;
-                if b == 0 { return Err(Error::DivisionByZero); }
-                // i64::MIN % -1 would overflow in Rust; the result is 0
-                left = Value::from_int(if a == i64::MIN && b == -1 { 0 } else { floor_mod(a, b) });
+                left = self.int_mod(&left, &right)?;
             } else {
                 break;
             }
@@ -413,7 +485,8 @@ impl<'a> ExprParser<'a> {
                     0 if b < 0 => Err(Error::Msg(
                         "exponentiation of zero by negative power".to_string(),
                     )),
-                    0 => Ok(Value::from_int(0)),
+                    // 0**0 is 1 (expr-23.15).
+                    0 => Ok(Value::from_int(1)),
                     1 => Ok(Value::from_int(1)),
                     -1 => Ok(Value::from_int(if b % 2 == 0 { 1 } else { -1 })),
                     // Integer base with negative exponent yields 0
@@ -424,11 +497,14 @@ impl<'a> ExprParser<'a> {
                     _ if b >= 1 << 28 => Err(Error::Msg("exponent too large".to_string())),
                     _ => match a.checked_pow(b as u32) {
                         Some(r) => Ok(Value::from_int(r)),
-                        // Overflow: Tcl widens to bignum; we promote to
-                        // double instead (E4).
-                        None => {
-                            Ok(super::expr_funcs::float_value((a as f64).powf(b as f64)))
-                        }
+                        // Overflow widens to an exact bignum (expr-23.48:
+                        // 2**81 is 2417851639229258349412352).
+                        None => Ok(super::bignum::to_value(
+                            super::bignum::IntRep::Big(
+                                num_bigint::BigInt::from(a)
+                                    .pow(b as u32),
+                            ),
+                        )),
                     },
                 };
             }
@@ -459,6 +535,12 @@ impl<'a> ExprParser<'a> {
         if self.peek() == '~' {
             self.advance();
             let val = self.parse_unary()?;
+            if let Some(rep) = super::bignum::int_rep(&val) {
+                // ~x is -x-1 in two's complement (~2^63 is -9223372036854775809).
+                return Ok(super::bignum::to_value(super::bignum::IntRep::Big(
+                    -rep.to_big() - num_bigint::BigInt::from(1),
+                )));
+            }
             let n = self.as_int_val(&val)?;
             return Ok(Value::from_int(!n));
         }
@@ -495,10 +577,17 @@ impl<'a> ExprParser<'a> {
                 let val = self.parse_unary()?;
                 // Integer operands stay integers (-2 -> -2); float operands
                 // stay floats (-2.0 -> -2.0).
-                if let Some(i) = val.as_int() {
-                    return Ok(match i.checked_neg() {
-                        Some(r) => Value::from_int(r),
-                        None => super::expr_funcs::float_value(-(i as f64)),
+                if let Some(rep) = super::bignum::int_rep(&val) {
+                    return Ok(match rep {
+                        super::bignum::IntRep::I64(i) => match i.checked_neg() {
+                            Some(r) => Value::from_int(r),
+                            None => super::bignum::to_value(super::bignum::IntRep::Big(
+                                num_bigint::BigInt::from(2i8).pow(63u32),
+                            )),
+                        },
+                        big => super::bignum::to_value(super::bignum::IntRep::Big(
+                            -big.to_big(),
+                        )),
                     });
                 }
                 return match val.as_float() {
@@ -574,11 +663,11 @@ impl<'a> ExprParser<'a> {
 
         // Boolean literals keep their string form (`expr false` renders
         // "false", expr-21.1); operators coerce via strict_bool.
-        match ident.to_ascii_lowercase().as_str() {
-            "true" | "yes" | "on" | "false" | "no" | "off" => {
-                return Ok(Value::from_str(&ident))
-            }
-            _ => {}
+        // Boolean literals keep their string form, including tclsh's
+        // unique-prefix abbreviations (`expr bool(y)` lexes y as a bool
+        // constant, expr-31.0.4.0; `expr {t}` renders "t").
+        if super::expr_funcs::bool_from_string(&ident).is_some() {
+            return Ok(Value::from_str(&ident));
         }
 
         // Try as variable
@@ -592,9 +681,10 @@ impl<'a> ExprParser<'a> {
         }
         if let Ok(n) = ident.parse::<f64>() {
             if n.is_nan() {
-                // tclsh: a bare `nan` operand is a domain error — NaN is
-                // only reachable via the nan() function.
-                return Err(super::expr_funcs::domain_error());
+                // A bareword nan is a string value in tclsh: `expr nan`
+                // domain-errors at canonicalization, `nan + 0` reports the
+                // operand error, `int(nan)` reports the NaN error.
+                return Ok(Value::from_str(&ident));
             }
             return Ok(Value::from_float(n));
         }
@@ -608,7 +698,11 @@ impl<'a> ExprParser<'a> {
     fn parse_number(&mut self) -> Result<Value> {
         let mut s = String::new();
 
-        // Handle hex / binary / octal
+        // Handle hex / binary / octal (0x / 0b / 0o) and legacy octal.
+        // In-range radix literals keep their original text (expr's `eq`
+        // compares the raw string: `01eq1` is false, expr-8.17) while the
+        // top-level result canonicalizes to decimal; oversized literals
+        // widen to exact bignums rendered in decimal (expr-43.11).
         if self.peek() == '0' && self.pos + 1 < self.chars.len() {
             let next = self.chars[self.pos + 1];
             if next == 'x' || next == 'X' {
@@ -617,7 +711,7 @@ impl<'a> ExprParser<'a> {
                 while self.is_hex_digit() {
                     s.push(self.advance());
                 }
-                return Ok(Value::from_int(i64::from_str_radix(&s[2..], 16).unwrap_or(0)));
+                return self.radix_literal(&s, 16, &s[2..]);
             }
             if next == 'b' || next == 'B' {
                 s.push(self.advance());
@@ -625,7 +719,7 @@ impl<'a> ExprParser<'a> {
                 while self.peek() == '0' || self.peek() == '1' {
                     s.push(self.advance());
                 }
-                return Ok(Value::from_int(i64::from_str_radix(&s[2..], 2).unwrap_or(0)));
+                return self.radix_literal(&s, 2, &s[2..]);
             }
             if next == 'o' || next == 'O' {
                 s.push(self.advance());
@@ -633,7 +727,23 @@ impl<'a> ExprParser<'a> {
                 while self.peek() >= '0' && self.peek() <= '7' {
                     s.push(self.advance());
                 }
-                return Ok(Value::from_int(i64::from_str_radix(&s[2..], 8).unwrap_or(0)));
+                return self.radix_literal(&s, 8, &s[2..]);
+            }
+            if next.is_ascii_digit() {
+                // Legacy octal: `017` is 15; a digit 8/9 makes the whole
+                // token an invalid bareword with tclsh's octal hint.
+                s.push(self.advance());
+                while self.peek() >= '0' && self.peek() <= '7' {
+                    s.push(self.advance());
+                }
+                if self.peek() == '8' || self.peek() == '9' {
+                    // The whole digit run belongs to the offending token.
+                    while self.is_digit() {
+                        s.push(self.advance());
+                    }
+                    return Err(self.invalid_octal_error(&s));
+                }
+                return self.radix_literal(&s, 8, &s[1..]);
             }
         }
 
@@ -673,13 +783,38 @@ impl<'a> ExprParser<'a> {
         } else {
             match s.parse::<i64>() {
                 Ok(n) => Ok(Value::from_int(n)),
-                // Tcl widens oversized integer literals to bignum; we
-                // promote to double instead (E4).
-                Err(_) => Ok(super::expr_funcs::float_value(
-                    s.parse().unwrap_or(f64::INFINITY),
-                )),
+                // Tcl widens oversized integer literals to exact bignums.
+                Err(_) => match num_bigint::BigInt::parse_bytes(s.as_bytes(), 10) {
+                    // Bignum values carry the canonical decimal string.
+                    Some(_) => Ok(Value::from_str(&s)),
+                    None => Ok(super::expr_funcs::float_value(f64::INFINITY)),
+                },
             }
         }
+    }
+
+    /// Resolve a radix literal (`0x…`/`0b…`/`0o…`/legacy octal) of the
+    /// given text whose digits start at `body`.  In-range values keep the
+    /// raw text (string rep is preserved for `eq`; the top-level result
+    /// still canonicalizes); oversized values widen to an exact bignum in
+    /// decimal form.
+    fn radix_literal(&mut self, s: &str, radix: u32, body: &str) -> Result<Value> {
+        if i64::from_str_radix(body, radix).is_ok() {
+            return Ok(Value::from_str(s));
+        }
+        match num_bigint::BigInt::parse_bytes(body.as_bytes(), radix) {
+            Some(big) => Ok(Value::from_str(&big.to_string())),
+            None => Ok(super::expr_funcs::float_value(f64::INFINITY)),
+        }
+    }
+
+    /// tclsh's invalid-octal bareword error, e.g. for `expr 018`:
+    /// `invalid bareword "018" ... or ... (invalid octal number?)`.
+    fn invalid_octal_error(&self, token: &str) -> Error {
+        let expr: String = self.chars.iter().collect();
+        Error::Msg(format!(
+            "invalid bareword \"{token}\"\nin expression \"{expr}\";\nshould be \"${token}\" or \"{{{token}}}\" or \"{token}(...)\" or ... (invalid octal number?)"
+        ))
     }
 
     /// tclsh: letters glued to a number are only legal as the word
@@ -813,13 +948,60 @@ impl<'a> ExprParser<'a> {
         Ok(Value::from_str(&s))
     }
 
+    /// Tcl backslash substitution inside double-quoted expr strings
+    /// (tclsh: `expr {"\374" eq "\xFC"}` — both are ü, expr-8.13).
     fn parse_escape_char(&mut self) -> char {
         match self.advance() {
             'n' => '\n',
             't' => '\t',
             'r' => '\r',
+            'f' => '\u{0c}',
+            'v' => '\u{0b}',
+            'b' => '\u{08}',
+            'a' => '\u{07}',
             '\\' => '\\',
             '"' => '"',
+            'x' => {
+                // \xHH — all hex digits consumed, last two used.
+                let mut val: u32 = 0;
+                let mut count = 0;
+                while count < 8 && self.is_hex_digit() {
+                    let d = self.advance().to_digit(16).unwrap_or(0);
+                    val = val * 16 + d;
+                    count += 1;
+                }
+                if count == 0 {
+                    'x'
+                } else {
+                    char::from_u32(val & 0xff).unwrap_or('\u{fffd}')
+                }
+            }
+            'u' => {
+                // \uHHHH — up to four hex digits.
+                let mut val: u32 = 0;
+                let mut count = 0;
+                while count < 4 && self.is_hex_digit() {
+                    let d = self.advance().to_digit(16).unwrap_or(0);
+                    val = val * 16 + d;
+                    count += 1;
+                }
+                if count == 0 {
+                    'u'
+                } else {
+                    char::from_u32(val).unwrap_or('\u{fffd}')
+                }
+            }
+            c if ('0'..='7').contains(&c) => {
+                // \NNN — up to three octal digits, the first consumed.
+                let mut val = c.to_digit(8).unwrap_or(0);
+                let mut count = 1;
+                while count < 3 && ('0'..='7').contains(&self.peek()) {
+                    val = val * 8 + self.advance().to_digit(8).unwrap_or(0);
+                    count += 1;
+                }
+                char::from_u32(val & 0xff).unwrap_or('\u{fffd}')
+            }
+            '\n' => ' ',
             c => c,
         }
     }
@@ -866,14 +1048,20 @@ impl<'a> ExprParser<'a> {
     fn parse_function_call(&mut self, name: &str) -> Result<Value> {
         self.expect("(")?;
         let mut args = Vec::new();
-        loop {
-            self.skip_whitespace();
-            if self.peek() == ')' { break; }
-            let arg = self.parse_ternary()?;
-            args.push(arg);
-            self.skip_whitespace();
-            if self.peek() == ',' { self.advance(); } else { break; }
-        }
+        self.func_arg_depth += 1;
+        let parsed = (|| -> Result<()> {
+            loop {
+                self.skip_whitespace();
+                if self.peek() == ')' { break; }
+                let arg = self.parse_ternary()?;
+                args.push(arg);
+                self.skip_whitespace();
+                if self.peek() == ',' { self.advance(); } else { break; }
+            }
+            Ok(())
+        })();
+        self.func_arg_depth -= 1;
+        parsed?;
         self.expect(")")?;
 
         let rand_seed = (self.interp as *const Interp as usize) ^ self.pos;
@@ -969,7 +1157,88 @@ impl<'a> ExprParser<'a> {
         c.is_ascii_digit() || ('a'..='f').contains(&c) || ('A'..='F').contains(&c)
     }
 
-    /// Convert a Value to i64, returning an error if not numeric.
+    /// Bitwise op on exact integers; bignum operands use two's-complement
+    /// BigInt ops (`-2 & 0xff` is 254).  Non-integer operands keep the
+    /// legacy float-truncation path.
+    fn int_bitop(&self, left: &Value, right: &Value, op: char) -> Result<Value> {
+        if let (Some(ia), Some(ib)) = (
+            super::bignum::int_rep(left),
+            super::bignum::int_rep(right),
+        ) {
+            use num_bigint::BigInt;
+            let (a, b) = (ia.to_big(), ib.to_big());
+            return Ok(super::bignum::to_value(super::bignum::IntRep::Big(
+                match op {
+                    '|' => a | b,
+                    '^' => a ^ b,
+                    _ => a & b,
+                },
+            )));
+        }
+        // Non-int operands: tclsh rejects floats and other non-numeric
+        // strings with the operator in the message.
+        let int_operand = |v: &Value| -> Result<i64> {
+            if let Some(i) = v.as_int() {
+                return Ok(i);
+            }
+            if v.as_float().is_some() {
+                return Err(Error::Msg(format!(
+                    "can't use floating-point value as operand of \"{op}\""
+                )));
+            }
+            Err(Error::Msg(format!(
+                "can't use non-numeric string as operand of \"{op}\""
+            )))
+        };
+        let a = int_operand(left)?;
+        let b = int_operand(right)?;
+        Ok(Value::from_int(match op {
+            '|' => a | b,
+            '^' => a ^ b,
+            _ => a & b,
+        }))
+    }
+
+    /// `%` with Tcl floor semantics; bignum operands stay exact.
+    fn int_mod(&self, left: &Value, right: &Value) -> Result<Value> {
+        use super::bignum::{floor_mod as big_mod, int_rep, to_value, IntRep};
+        if let (Some(ia), Some(ib)) = (int_rep(left), int_rep(right)) {
+            if ib.is_zero() {
+                return Err(Error::DivisionByZero);
+            }
+            if let (IntRep::I64(a), IntRep::I64(b)) = (&ia, &ib) {
+                // i64::MIN % -1 would overflow in Rust; the result is 0
+                if !(*a == i64::MIN && *b == -1) {
+                    return Ok(Value::from_int(floor_mod(*a, *b)));
+                }
+                return Ok(Value::from_int(0));
+            }
+            return Ok(to_value(IntRep::Big(big_mod(&ia.to_big(), &ib.to_big()))));
+        }
+        // Non-int operands: tclsh distinguishes a float operand
+        // (`1.5 % 2` → can't use floating-point value as operand of "%")
+        // from any other non-numeric one (`true % 2` → can't use
+        // non-numeric string as operand of "%").
+        let int_operand = |v: &Value| -> Result<i64> {
+            if let Some(i) = v.as_int() {
+                return Ok(i);
+            }
+            if v.as_float().is_some() {
+                return Err(Error::Msg(
+                    "can't use floating-point value as operand of \"%\"".to_string(),
+                ));
+            }
+            Err(Error::Msg(
+                "can't use non-numeric string as operand of \"%\"".to_string(),
+            ))
+        };
+        let a = int_operand(left)?;
+        let b = int_operand(right)?;
+        if b == 0 { return Err(Error::DivisionByZero); }
+        Ok(Value::from_int(if a == i64::MIN && b == -1 { 0 } else { floor_mod(a, b) }))
+    }
+
+    /// Convert `Value` to i64, returning an error if not numeric.
     fn as_int_val(&self, v: &Value) -> Result<i64> {
         v.as_int().or_else(|| v.as_float().map(|f| f as i64))
             .ok_or_else(|| Error::type_mismatch("integer", v.as_str()))
@@ -977,32 +1246,63 @@ impl<'a> ExprParser<'a> {
 
     /// Numeric binary operation. Integer operands use integer arithmetic
     /// (Tcl semantics: `/` is floor division, result is int); on i64
-    /// overflow the operation is promoted to double (Tcl widens to bignum;
-    /// rtcl has no bignum — see E4 in specs/DIVERGENCES.md). If either side
-    /// is float, compute in f64 and the result stays a float.
+    /// overflow the operation widens to an exact bignum (`9223372036854775807
+    /// + 1` is 9223372036854775808, tclsh-style). If either side is float,
+    /// compute in f64 and the result stays a float.
     fn numeric_binop(&self, left: &Value, right: &Value, op: char) -> Result<Value> {
-        if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-            let promoted = |f: f64| super::expr_funcs::float_value(f);
-            return match op {
-                '+' => Ok(match a.checked_add(b) {
-                    Some(r) => Value::from_int(r),
-                    None => promoted(a as f64 + b as f64),
-                }),
-                '-' => Ok(match a.checked_sub(b) {
-                    Some(r) => Value::from_int(r),
-                    None => promoted(a as f64 - b as f64),
-                }),
-                '*' => Ok(match a.checked_mul(b) {
-                    Some(r) => Value::from_int(r),
-                    None => promoted(a as f64 * b as f64),
-                }),
-                '/' => {
-                    if b == 0 { return Err(Error::DivisionByZero); }
-                    // i64::MIN / -1 overflows in Rust; Tcl widens to bignum
-                    if a == i64::MIN && b == -1 {
-                        return Ok(promoted(-(a as f64)));
+        use num_bigint::BigInt;
+        use num_integer::Integer;
+        use super::bignum::{floor_div as big_div, int_rep, to_value, IntRep};
+        // NaN operands can't take part in arithmetic (`"nan" + 0` →
+        // can't use non-numeric floating-point value as operand of "+").
+        if left.as_float().map_or(false, |f| f.is_nan())
+            || right.as_float().map_or(false, |f| f.is_nan())
+        {
+            return Err(Error::Msg(format!(
+                "can't use non-numeric floating-point value as operand of \"{op}\""
+            )));
+        }
+        if let (Some(ia), Some(ib)) = (int_rep(left), int_rep(right)) {
+            if let (IntRep::I64(a), IntRep::I64(b)) = (&ia, &ib) {
+                let widen = |x: BigInt| Ok(to_value(IntRep::Big(x)));
+                let (ba, bb) = (ia.to_big(), ib.to_big());
+                return match op {
+                    '+' => match a.checked_add(*b) {
+                        Some(r) => Ok(Value::from_int(r)),
+                        None => widen(ba + bb),
+                    },
+                    '-' => match a.checked_sub(*b) {
+                        Some(r) => Ok(Value::from_int(r)),
+                        None => widen(ba - bb),
+                    },
+                    '*' => match a.checked_mul(*b) {
+                        Some(r) => Ok(Value::from_int(r)),
+                        None => widen(ba * bb),
+                    },
+                    '/' => {
+                        if *b == 0 {
+                            return Err(Error::DivisionByZero);
+                        }
+                        // i64::MIN / -1 overflows in Rust; Tcl widens to bignum
+                        if *a == i64::MIN && *b == -1 {
+                            return widen(ba.div_floor(&bb));
+                        }
+                        Ok(Value::from_int(floor_div(*a, *b)))
                     }
-                    Ok(Value::from_int(floor_div(a, b)))
+                    _ => Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
+                };
+            }
+            // At least one bignum operand: exact BigInt arithmetic.
+            let (ba, bb) = (ia.to_big(), ib.to_big());
+            return match op {
+                '+' => Ok(to_value(IntRep::Big(ba + bb))),
+                '-' => Ok(to_value(IntRep::Big(ba - bb))),
+                '*' => Ok(to_value(IntRep::Big(ba * bb))),
+                '/' => {
+                    if ib.is_zero() {
+                        return Err(Error::DivisionByZero);
+                    }
+                    Ok(to_value(IntRep::Big(big_div(&ba, &bb))))
                 }
                 _ => Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
             };
@@ -1014,14 +1314,22 @@ impl<'a> ExprParser<'a> {
                     '-' => a - b,
                     '*' => a * b,
                     '/' => {
-                        if b == 0.0 { return Err(Error::DivisionByZero); }
+                        // tclsh follows IEEE here: x/0.0 is ±Inf (5/0.0 →
+                        // Inf, 1.0/-0.0 → -Inf); only a zero dividend gives
+                        // the NaN result tclsh refuses to build — 0/0.0 →
+                        // "domain error: argument not in valid range".
+                        if b == 0.0 && a == 0.0 {
+                            return Err(super::expr_funcs::domain_error());
+                        }
                         a / b
                     }
                     _ => return Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
                 };
                 Ok(super::expr_funcs::float_value(result))
             }
-            _ => Err(Error::type_mismatch("number", "non-numeric value")),
+            _ => Err(Error::Msg(format!(
+                "can't use non-numeric string as operand of \"{op}\""
+            ))),
         }
     }
     /// Skip one `parse_and` level operand without evaluating.

@@ -1,5 +1,6 @@
 //! Math function evaluation for the Tcl expression parser.
 
+use num_traits::Signed;
 use core::cmp::Ordering;
 
 use crate::error::{Error, Result};
@@ -83,13 +84,16 @@ pub(crate) fn format_tcl_float(f: f64) -> String {
 /// float produced by the expression evaluator so results stringify exactly
 /// like tclsh (rtcl-vm's `Value::from_float` uses a different layout).
 pub(crate) fn float_value(f: f64) -> Value {
-    Value::from_str(&format_tcl_float(f))
+    // Float-typed (not a string): tclsh's expr results are double objects,
+    // so canonicalization skips them (`expr {0.0/0.0}` prints NaN while
+    // `expr {"nan"}` — a *string* result — domain-errors).
+    Value::from_float(f)
 }
 
 /// Tcl boolean word parsing: case-insensitive, any unique-prefix
 /// abbreviation of true/false/yes/no/on/off. Returns `None` for ambiguous
 /// ("o" — on/off) or unrecognized strings.
-fn bool_from_string(s: &str) -> Option<bool> {
+pub(crate) fn bool_from_string(s: &str) -> Option<bool> {
     let lower = s.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return None;
@@ -156,16 +160,118 @@ pub(crate) fn nan_pair(a: &Value, b: &Value) -> bool {
 }
 
 pub(crate) fn numeric_cmp(a: &Value, b: &Value) -> Option<Ordering> {
-    match (a.as_int(), b.as_int()) {
-        (Some(x), Some(y)) => Some(x.cmp(&y)),
-        (Some(x), None) => b.as_float().and_then(|y| cmp_int_float(x, y)),
+    use super::bignum::{cmp_rep_float, int_rep};
+    match (int_rep(a), int_rep(b)) {
+        (Some(x), Some(y)) => Some(x.to_big().cmp(&y.to_big())),
+        (Some(x), None) => b.as_float().and_then(|y| cmp_rep_float(&x, y)),
         (None, Some(y)) => a
             .as_float()
-            .and_then(|x| cmp_int_float(y, x).map(Ordering::reverse)),
+            .and_then(|x| cmp_rep_float(&y, x).map(Ordering::reverse)),
         (None, None) => match (a.as_float(), b.as_float()) {
             (Some(x), Some(y)) => x.partial_cmp(&y),
             _ => None,
         },
+    }
+}
+
+/// `abs()`: tclsh's ExprAbsCmd returns its argument **unchanged** when the
+/// value is already non-negative (`::tcl::mathfunc::abs { \t0x0}` renders
+/// " \t0x0", `abs 1e-324` renders "1e-324"), canonical only for negatives
+/// (probed).  NaN is an error.
+fn abs_value(v: &Value) -> Result<Value> {
+    use super::bignum::{to_value, IntRep};
+    // A non-negative argument comes back *unchanged* (`abs 0x0` is "0x0",
+    // `abs " 5"` is " 5") — except a minus-signed zero, which canonicalizes
+    // (`abs -0` is 0, `abs -0x0` is 0, `abs -00` is 0).
+    let signed_zero = v.as_str().trim_start().starts_with('-');
+    if let Some(rep) = super::bignum::int_rep(v) {
+        return match rep {
+            IntRep::I64(i) if i > 0 => Ok(v.clone()),
+            IntRep::I64(0) if !signed_zero => Ok(v.clone()),
+            IntRep::I64(i) => Ok(Value::from_int(match i.checked_abs() {
+                Some(r) => r,
+                None => {
+                    return Ok(to_value(IntRep::Big(
+                        num_bigint::BigInt::from(2i8).pow(63u32),
+                    )))
+                }
+            })),
+            IntRep::Big(b) if !b.is_negative() && !signed_zero => Ok(v.clone()),
+            IntRep::Big(b) => Ok(to_value(IntRep::Big(-b))),
+        };
+    }
+    match v.as_float() {
+        Some(d) if d.is_nan() => Err(Error::Msg(
+            "floating point value is Not a Number".to_string(),
+        )),
+        Some(d) if d < 0.0 => Ok(float_value(-d)),
+        // -0.0 canonicalizes to +0.0; anything else keeps its string.
+        Some(d) if d == 0.0 && d.is_sign_negative() => Ok(float_value(0.0)),
+        Some(_) => Ok(v.clone()),
+        None => Err(Error::Msg(format!(
+            "expected number but got \"{}\"",
+            v.as_str()
+        ))),
+    }
+}
+
+/// Shared `int()`/`entier()`/`wide()` body.  NaN and infinities error
+/// ("integer value too large to represent" / "floating point value is
+/// Not a Number"); doubles truncate toward zero exactly; `wrap` takes the
+/// low 64 bits of the exact integer, otherwise bignums survive.
+fn int_or_entier(v: &Value, keep_big: bool) -> Result<Value> {
+    use super::bignum::{big_from_f64, to_i64_wrap, to_value, IntRep};
+    if let Some(rep) = super::bignum::int_rep(v) {
+        return Ok(match rep {
+            IntRep::I64(i) => Value::from_int(i),
+            big => {
+                if keep_big {
+                    to_value(big)
+                } else {
+                    Value::from_int(to_i64_wrap(&big.to_big()))
+                }
+            }
+        });
+    }
+    match v.as_float() {
+        Some(n) if n.is_nan() => Err(Error::Msg(
+            "floating point value is Not a Number".to_string(),
+        )),
+        Some(n) if n.is_infinite() => Err(Error::Msg(
+            "integer value too large to represent".to_string(),
+        )),
+        Some(n) => {
+            let t = n.trunc();
+            if t >= -(2f64.powi(63)) && t < 2f64.powi(63) {
+                Ok(Value::from_int(t as i64))
+            } else {
+                let b = big_from_f64(t).ok_or_else(|| {
+                    Error::Msg("integer value too large to represent".to_string())
+                })?;
+                Ok(if keep_big {
+                    to_value(IntRep::Big(b))
+                } else {
+                    Value::from_int(to_i64_wrap(&b))
+                })
+            }
+        }
+        None => Err(Error::Msg(format!(
+            "expected number but got \"{}\"",
+            v.as_str()
+        ))),
+    }
+}
+
+/// Integral result of a float argument: i64 when it fits, exact bignum
+/// otherwise (round(1e22) is 10000000000000000000000).
+fn float_result(t: f64) -> Result<Value> {
+    use super::bignum::{big_from_f64, to_value, IntRep};
+    if t >= -(2f64.powi(63)) && t < 2f64.powi(63) {
+        Ok(Value::from_int(t as i64))
+    } else {
+        let b = big_from_f64(t)
+            .ok_or_else(|| Error::Msg("integer value too large to represent".to_string()))?;
+        Ok(to_value(IntRep::Big(b)))
     }
 }
 
@@ -191,8 +297,14 @@ fn cmp_int_float(i: i64, f: f64) -> Option<Ordering> {
 }
 
 fn require_args(name: &str, expected: usize, actual: usize) -> Result<()> {
-    if actual != expected {
-        Err(Error::wrong_args(format!("{name}()"), expected, actual))
+    if actual < expected {
+        Err(Error::Msg(format!(
+            "not enough arguments for math function \"{name}\""
+        )))
+    } else if actual > expected {
+        Err(Error::Msg(format!(
+            "too many arguments for math function \"{name}\""
+        )))
     } else {
         Ok(())
     }
@@ -205,35 +317,36 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
     match name {
         "abs" => {
             require_args(name, 1, args.len())?;
-            if let Some(i) = args[0].as_int() {
-                // i64::MIN: Tcl widens abs to bignum; we promote to double
-                return Ok(match i.checked_abs() {
-                    Some(r) => Value::from_int(r),
-                    None => float_value(-(i as f64)),
-                });
-            }
-            match args[0].as_float() {
-                Some(n) => Ok(float_value(n.abs())),
-                None => Err(Error::type_mismatch("number", "non-numeric value")),
-            }
+            abs_value(&args[0])
         }
-        "int" | "entier" => {
+        // int() truncates toward zero and WRAPS to the low 64 bits of the
+        // exact integer (probed: int(1e22) is 1864712049423024128,
+        // int(9223372036854775808) is -9223372036854775808); out-of-range
+        // infinities error.  entier() is the same truncation but keeps
+        // bignum precision (entier(1e+22) is 10000000000000000000000).
+        "int" => {
             require_args(name, 1, args.len())?;
-            match args[0].as_float() {
-                Some(n) => Ok(Value::from_int(n as i64)),
-                None => Err(Error::type_mismatch("number", "non-numeric value")),
-            }
+            int_or_entier(&args[0], false)
+        }
+        "entier" => {
+            require_args(name, 1, args.len())?;
+            int_or_entier(&args[0], true)
         }
         "wide" => {
             require_args(name, 1, args.len())?;
-            match args[0].as_float() {
-                Some(n) => Ok(Value::from_int(n as i64)),
-                None => Err(Error::type_mismatch("number", "non-numeric value")),
-            }
+            int_or_entier(&args[0], false)
         }
         "double" => {
             require_args(name, 1, args.len())?;
+            if let Some(rep) = super::bignum::int_rep(&args[0]) {
+                if let super::bignum::IntRep::Big(b) = rep {
+                    return Ok(float_value(super::bignum::to_f64(&b)));
+                }
+            }
             match args[0].as_float() {
+                Some(n) if n.is_nan() => Err(Error::Msg(
+                    "floating point value is Not a Number".to_string(),
+                )),
                 Some(n) => Ok(float_value(n)),
                 None => Err(Error::type_mismatch("number", "non-numeric value")),
             }
@@ -242,10 +355,15 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
             require_args(name, 1, args.len())?;
             Ok(Value::from_bool(strict_bool(&args[0])?))
         }
+        // round() keeps bignum precision for out-of-range doubles
+        // (round(9.2233720368547758e+018) is 9223372036854775808, expr-46.5).
         "round" => {
             require_args(name, 1, args.len())?;
+            if let Some(rep) = super::bignum::int_rep(&args[0]) {
+                return Ok(super::bignum::to_value(rep));
+            }
             match args[0].as_float() {
-                Some(n) => Ok(Value::from_int(n.round() as i64)),
+                Some(n) => float_result(n.round()),
                 None => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         }
@@ -376,9 +494,37 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
             }
             if args.len() < 1 {
                 return Err(Error::runtime(
-                    format!("too few arguments for math function \"{}\"", name),
+                    format!("not enough arguments for math function \"{}\"", name),
                     crate::error::ErrorCode::Generic,
                 ));
+            }
+            if let Some(rep) = super::bignum::int_rep(&args[0]) {
+                let neg = match &rep {
+                    super::bignum::IntRep::I64(i) => *i < 0,
+                    super::bignum::IntRep::Big(b) => b.is_negative(),
+                };
+                if neg {
+                    return Err(Error::runtime(
+                        "square root of negative argument",
+                        crate::error::ErrorCode::InvalidOp,
+                    ));
+                }
+                let r = match rep {
+                    super::bignum::IntRep::I64(i) => {
+                        let mut g = (i as f64).sqrt() as i64;
+                        while g > 0 && g.checked_mul(g).map_or(true, |g2| g2 > i) {
+                            g -= 1;
+                        }
+                        while g.checked_add(1).and_then(|g1| g1.checked_mul(g1)).map_or(false, |g2| g2 <= i) {
+                            g += 1;
+                        }
+                        g
+                    }
+                    super::bignum::IntRep::Big(b) => {
+                        i64::try_from(super::bignum::isqrt(&b)).unwrap_or(i64::MAX)
+                    }
+                };
+                return Ok(Value::from_int(r));
             }
             match args[0].as_float() {
                 Some(n) if n >= 0.0 => Ok(Value::from_int((n.sqrt()) as i64)),

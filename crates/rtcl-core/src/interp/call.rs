@@ -48,6 +48,7 @@ impl Interp {
             array_locals: HashSet::new(),
             upvars: HashMap::new(),
             ns: None,
+            call_ns: Some(prev_namespace.clone()),
             local_procs: Vec::new(),
             deferred_scripts: Vec::new(),
         });

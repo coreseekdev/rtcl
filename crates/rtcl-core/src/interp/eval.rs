@@ -70,7 +70,8 @@ impl Interp {
         // 2. If in a non-global namespace, try qualifying the name in the current namespace
         // 3. Fall back to global unqualified name
 
-        // User-defined procs
+        // User-defined procs (including `namespace import` aliases, which
+        // dispatch to the origin's *current* body and namespace)
         let proc_lookup = self.procs.get(cmd_name).cloned().map(|p| (p, cmd_name.to_string()))
             .or_else(|| {
                 if self.current_namespace != "::" && !cmd_name.starts_with("::") {
@@ -90,6 +91,27 @@ impl Interp {
                 } else {
                     None
                 }
+            })
+            .or_else(|| {
+                // Import aliases: follow the chain to the origin so the
+                // proc runs in its definition namespace with its current
+                // body (tclsh: redefining the source is visible).
+                let found = crate::interp::commands::namespace::lookup_command_key(
+                    self, cmd_name,
+                )?;
+                let origin = crate::interp::commands::namespace::origin_of(self, &found)?;
+                self.procs.get(&origin).cloned().map(|p| (p, origin))
+            })
+            .or_else(|| {
+                // Colon runs collapse in command names too: `p1:::g`
+                // dispatches to the proc registered as `::p1::g`.
+                if cmd_name.contains("::") {
+                    let norm = crate::interp::commands::namespace::normalise(cmd_name);
+                    if norm != cmd_name {
+                        return self.procs.get(&norm).cloned().map(|p| (p, norm));
+                    }
+                }
+                None
             });
         if let Some((proc_def, resolved_name)) = proc_lookup {
             return self.call_proc(&proc_def, &args, &resolved_name, None);
@@ -111,6 +133,25 @@ impl Interp {
             } else {
                 None
             }
+        }).or_else(|| {
+            // `::set` — a `::`-qualified builtin resolves through its
+            // unqualified registration key (tclsh 8.6.17)
+            if cmd_name.starts_with("::") {
+                let stripped = cmd_name.trim_start_matches(':');
+                if !stripped.contains("::") {
+                    return self.commands.get(stripped).cloned();
+                }
+            }
+            None
+        }).or_else(|| {
+            // Colon runs collapse in builtin names as well.
+            if cmd_name.contains("::") {
+                let norm = crate::interp::commands::namespace::normalise(cmd_name);
+                if norm != cmd_name {
+                    return self.commands.get(&norm).cloned();
+                }
+            }
+            None
         });
         match func {
             Some(f) => {

@@ -48,10 +48,11 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     let raw_name = args[1].as_str();
-    // Qualify the proc name if we're inside a namespace context
-    let name = if raw_name.starts_with("::") {
-        raw_name.to_string()
-    } else if interp.current_namespace != "::" {
+    // Qualify the proc name if it names a namespace path or we're inside a
+    // namespace context — `proc e1::cmd` at global and `namespace eval e1
+    // {proc cmd}` must land on the SAME registered key (`::e1::cmd`,
+    // tclsh), otherwise redefinition splits into two commands.
+    let name = if raw_name.contains("::") || interp.current_namespace != "::" {
         super::namespace::qualify(&interp.current_namespace, raw_name)
     } else {
         raw_name.to_string()
@@ -215,8 +216,27 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // Pop the top N frames, eval in the target scope, then restore.
     let split_point = interp.frames.len() - num_to_pop;
+    let explicit_global = args.len() > 2 && args[1].as_str().starts_with('#');
     let saved_frames: Vec<_> = interp.frames.split_off(split_point);
+    // The target runs in the namespace ACTIVE at that level (tclsh
+    // 8.6.17): the remaining caller frame's namespace, or — when every
+    // frame is popped — the namespace the outermost popped frame was
+    // invoked in (the enclosing `namespace eval` context).  An explicit
+    // `#0` is the absolute global level and always uses `::`.
+    let saved_ns = interp.current_namespace.clone();
+    let target_ns = if explicit_global {
+        "::".to_string()
+    } else if let Some(f) = interp.frames.last() {
+        f.ns.clone().unwrap_or_else(|| "::".to_string())
+    } else {
+        saved_frames
+            .last()
+            .and_then(|f| f.call_ns.clone())
+            .unwrap_or_else(|| "::".to_string())
+    };
+    interp.current_namespace = target_ns;
     let result = interp.eval(&script);
+    interp.current_namespace = saved_ns;
     interp.frames.extend(saved_frames);
     result
 }
@@ -390,6 +410,15 @@ pub(crate) fn resolve_command_key(interp: &Interp, name: &str) -> Option<String>
         let qualified = format!("::{}", name);
         if interp.procs.contains_key(&qualified) || interp.commands.contains_key(&qualified) {
             return Some(qualified);
+        }
+    }
+    // Colon runs collapse in command names: `p1:::g` names `::p1::g`.
+    if name.contains("::") {
+        let norm = super::namespace::normalise(name);
+        if norm != name
+            && (interp.procs.contains_key(&norm) || interp.commands.contains_key(&norm))
+        {
+            return Some(norm);
         }
     }
     None

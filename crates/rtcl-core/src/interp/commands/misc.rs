@@ -590,6 +590,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .commands
                 .keys()
                 .chain(interp.procs.keys())
+                .chain(interp.import_aliases.keys())
                 .filter(|name| {
                     pattern
                         .map(|p| matches_qualified_glob(p, name))
@@ -602,15 +603,20 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "procs" => {
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
+            let matches = |name: &str| {
+                pattern
+                    .map(|p| matches_qualified_glob(p, name))
+                    .unwrap_or(true)
+            };
+            // Import aliases count as procs (tclsh: `namespace import`
+            // creates a command visible to `info procs`).
             let mut names: Vec<Value> = interp
                 .procs
                 .keys()
-                .filter(|name| {
-                    pattern
-                        .map(|p| matches_qualified_glob(p, name))
-                        .unwrap_or(true)
-                })
-                .map(|name| Value::from_str(name))
+                .map(|s| s.as_str())
+                .chain(interp.import_aliases.keys().map(|s| s.as_str()))
+                .filter(|name| matches(name))
+                .map(Value::from_str)
                 .collect();
             names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             Ok(Value::from_list(&names))

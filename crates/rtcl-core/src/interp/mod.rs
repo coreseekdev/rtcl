@@ -67,6 +67,11 @@ pub(crate) struct CallFrame {
     /// this namespace — only locals, upvar/`variable` links, and `::`-qualified
     /// names are visible in a proc frame.
     pub ns: Option<String>,
+    /// Namespace active at CALL time — the context of the caller's script
+    /// (e.g. the body of a `namespace eval` this proc was invoked from).
+    /// `uplevel` relative levels target this context when the caller is
+    /// not a proc frame (tclsh 8.6.17).
+    pub call_ns: Option<String>,
     /// Commands created by `local` — deleted when this frame exits.
     pub local_procs: Vec<String>,
     /// Scripts registered by `defer` — executed in reverse order on frame exit.
@@ -134,6 +139,13 @@ pub struct Interp {
     pub(crate) current_namespace: String,
     /// Known namespaces ("::" always present).
     pub(crate) namespaces: HashMap<String, commands::namespace::NamespaceInfo>,
+    /// `namespace import` aliases: fully-qualified alias name → the fully
+    /// qualified name of the original command.  Aliases stay separate from
+    /// `procs` so the origin's *current* body always dispatches (tclsh
+    /// semantics: redefining the source proc is visible through the alias).
+    pub(crate) import_aliases: HashMap<String, String>,
+    /// Per-namespace `namespace unknown` handler scripts (raw, as given).
+    pub(crate) ns_unknown: HashMap<String, String>,
     /// Live array searches keyed by the owning scope's stamp key.
     pub(crate) array_searches: HashMap<String, ArraySearchList>,
     /// Mutation counters per array (element-set changes invalidate searches).
@@ -230,6 +242,8 @@ impl Interp {
                 ns.insert("::".to_string(), commands::namespace::NamespaceInfo::default());
                 ns
             },
+            import_aliases: HashMap::new(),
+            ns_unknown: HashMap::new(),
             #[cfg(feature = "std")]
             script_name: String::new(),
             #[cfg(feature = "std")]

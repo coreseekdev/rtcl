@@ -54,7 +54,7 @@ impl Interp {
     /// Resolve the owning scope of a variable name (upvar links followed).
     pub(crate) fn resolve_loc(&self, name: &str) -> VarLoc {
         if let Some(gname) = Self::split_global(name) {
-            return VarLoc::Global(gname.to_string());
+            return VarLoc::Global(gname);
         }
         if let Some(frame) = self.frames.last() {
             if let Some(link) = frame.upvars.get(name) {
@@ -67,7 +67,7 @@ impl Interp {
             }
             return VarLoc::Frame(self.frames.len() - 1, name.to_string());
         }
-        VarLoc::Global(name.to_string())
+        VarLoc::Global(self.canonical_global(name))
     }
 
     /// Is the variable at `loc` an array?  (Authoritative registry; the
@@ -187,18 +187,33 @@ impl Interp {
     /// Returns `Some(&Value)` if found.
     /// A leading `::` qualifies a variable as global regardless of the
     /// current call frame (Tcl namespace-qualified variable access).
-    fn split_global(name: &str) -> Option<&str> {
+    fn split_global(name: &str) -> Option<String> {
         let rest = name.strip_prefix("::")?;
         if rest.is_empty() {
-            None
-        } else {
-            Some(rest)
+            return None;
         }
+        // Colon runs collapse: `set ::a::::b` and `set ::a::b` are the same
+        // variable (tclsh 8.6.17).  Single colons are name characters.
+        let norm = super::commands::namespace::normalise(rest);
+        Some(norm.strip_prefix("::").unwrap_or(&norm).to_string())
+    }
+
+    /// Canonical key for a `::`-containing variable name reached at the
+    /// global frame level: a relative qualified name resolves against the
+    /// current namespace (`set b::c` inside `namespace eval n` stores
+    /// `n::b::c`) and colon runs collapse.  Plain names pass through.
+    fn canonical_global(&self, name: &str) -> String {
+        if !name.contains("::") {
+            return name.to_string();
+        }
+        let qualified =
+            super::commands::namespace::qualify(&self.current_namespace, name);
+        qualified.strip_prefix("::").unwrap_or(&qualified).to_string()
     }
 
     fn resolve_var(&self, name: &str) -> Option<&Value> {
         if let Some(gname) = Self::split_global(name) {
-            return self.globals.get(gname);
+            return self.globals.get(gname.as_str());
         }
         if let Some(frame) = self.frames.last() {
             if let Some(link) = frame.upvars.get(name) {
@@ -212,6 +227,17 @@ impl Interp {
             }
             frame.locals.get(name)
         } else {
+            // Outside procs an unqualified name resolves in the current
+            // namespace first, then the global namespace (tclsh 8.6.17:
+            // `set v` inside `namespace eval n` reads a `variable`-declared
+            // variable; plain global names still resolve).  Plain `set`/
+            // `unset` at that level always operate on the global table.
+            if self.current_namespace != "::" {
+                let key = format!("{}::{}", &self.current_namespace[2..], name);
+                if let Some(v) = self.globals.get(key.as_str()) {
+                    return Some(v);
+                }
+            }
             self.globals.get(name)
         }
     }
@@ -219,11 +245,12 @@ impl Interp {
     /// Set a variable in the current scope, following upvar links.
     fn store_var(&mut self, name: &str, value: Value) {
         if let Some(gname) = Self::split_global(name) {
-            self.globals.insert(gname.to_string(), value);
+            self.globals.insert(gname, value);
             return;
         }
         if self.frames.is_empty() {
-            self.globals.insert(name.to_string(), value);
+            let key = self.canonical_global(name);
+            self.globals.insert(key, value);
             return;
         }
         let frame_idx = self.frames.len() - 1;
@@ -246,11 +273,12 @@ impl Interp {
     /// Remove a variable from the current scope, following upvar links.
     fn remove_var(&mut self, name: &str) {
         if let Some(gname) = Self::split_global(name) {
-            self.globals.remove(gname);
+            self.globals.remove(gname.as_str());
             return;
         }
         if self.frames.is_empty() {
-            self.globals.remove(name);
+            let key = self.canonical_global(name);
+            self.globals.remove(key.as_str());
             return;
         }
         let frame_idx = self.frames.len() - 1;
@@ -274,7 +302,23 @@ impl Interp {
 
     pub fn get_var(&self, name: &str) -> Result<&Value> {
         if let Some((array_name, index)) = split_array_ref(name) {
-            let loc = self.resolve_loc(array_name);
+            let mut loc = self.resolve_loc(array_name);
+            if !self.loc_is_array(&loc)
+                && self.frames.is_empty()
+                && self.current_namespace != "::"
+                && !array_name.contains("::")
+            {
+                // Unqualified array read outside procs: the current
+                // namespace's `variable`-declared array shadows the global.
+                let alt = VarLoc::Global(format!(
+                    "{}::{}",
+                    &self.current_namespace[2..],
+                    array_name
+                ));
+                if self.loc_is_array(&alt) {
+                    loc = alt;
+                }
+            }
             if self.loc_is_array(&loc) {
                 let key = loc.element_key(index);
                 self.loc_get(&loc, &key).ok_or_else(|| {
@@ -457,7 +501,21 @@ impl Interp {
 
     pub fn var_exists(&self, name: &str) -> bool {
         if let Some((array_name, index)) = split_array_ref(name) {
-            let loc = self.resolve_loc(array_name);
+            let mut loc = self.resolve_loc(array_name);
+            if !self.loc_is_array(&loc)
+                && self.frames.is_empty()
+                && self.current_namespace != "::"
+                && !array_name.contains("::")
+            {
+                let alt = VarLoc::Global(format!(
+                    "{}::{}",
+                    &self.current_namespace[2..],
+                    array_name
+                ));
+                if self.loc_is_array(&alt) {
+                    loc = alt;
+                }
+            }
             if self.loc_is_array(&loc) {
                 let key = loc.element_key(index);
                 self.loc_get(&loc, &key).is_some()

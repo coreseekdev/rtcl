@@ -397,29 +397,41 @@ impl<'a> ExprParser<'a> {
             let exp = self.parse_power()?; // right-associative: recurse
             // Tcl: two integer operands use integer exponentiation.
             if let (Some(a), Some(b)) = (base.as_int(), exp.as_int()) {
-                if b < 0 {
-                    // Integer pow with negative exponent collapses to 0,
-                    // except for the units 1/-1; 0**negative is an error.
-                    return match a {
-                        0 => Err(Error::Msg(
-                            "exponentiation of zero by negative power".to_string(),
-                        )),
-                        1 => Ok(Value::from_int(1)),
-                        -1 => Ok(Value::from_int(if b % 2 == 0 { 1 } else { -1 })),
-                        _ => Ok(Value::from_int(0)),
-                    };
-                }
-                if b <= u32::MAX as i64 {
-                    if let Some(r) = a.checked_pow(b as u32) {
-                        return Ok(Value::from_int(r));
-                    }
-                }
-                // Overflow (or absurdly large exponent): Tcl widens to
-                // bignum; we promote to double instead (E4).
-                return Ok(super::expr_funcs::float_value((a as f64).powf(b as f64)));
+                return match a {
+                    // Units short-circuit before any range check — tclsh
+                    // computes 1**268435456 and (-1)**268435456 instantly.
+                    0 if b < 0 => Err(Error::Msg(
+                        "exponentiation of zero by negative power".to_string(),
+                    )),
+                    0 => Ok(Value::from_int(0)),
+                    1 => Ok(Value::from_int(1)),
+                    -1 => Ok(Value::from_int(if b % 2 == 0 { 1 } else { -1 })),
+                    // Integer base with negative exponent yields 0
+                    // (tclsh: `expr {2**-1}` → 0).
+                    _ if b < 0 => Ok(Value::from_int(0)),
+                    // tclsh refuses to build numbers of ≥ 2**28 bits
+                    // (expr-23.54.12: 3**268435456 → "exponent too large").
+                    _ if b >= 1 << 28 => Err(Error::Msg("exponent too large".to_string())),
+                    _ => match a.checked_pow(b as u32) {
+                        Some(r) => Ok(Value::from_int(r)),
+                        // Overflow: Tcl widens to bignum; we promote to
+                        // double instead (E4).
+                        None => {
+                            Ok(super::expr_funcs::float_value((a as f64).powf(b as f64)))
+                        }
+                    },
+                };
             }
             match (base.as_float(), exp.as_float()) {
-                (Some(a), Some(b)) => Ok(super::expr_funcs::float_value(a.powf(b))),
+                (Some(a), Some(b)) => {
+                    if a == 0.0 && b < 0.0 {
+                        // 0.0**-1 / 0**-1.0 error like the integer form.
+                        return Err(Error::Msg(
+                            "exponentiation of zero by negative power".to_string(),
+                        ));
+                    }
+                    Ok(super::expr_funcs::float_value(a.powf(b)))
+                }
                 _ => Err(Error::type_mismatch("number", "non-numeric value")),
             }
         } else {

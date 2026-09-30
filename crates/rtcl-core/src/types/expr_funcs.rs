@@ -338,17 +338,23 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
         }
         "double" => {
             require_args(name, 1, args.len())?;
+            // Integer literals of any syntax convert exactly
+            // (double(0x7fffffffffffffff) is 9.223372036854776e+18).
             if let Some(rep) = super::bignum::int_rep(&args[0]) {
-                if let super::bignum::IntRep::Big(b) = rep {
-                    return Ok(float_value(super::bignum::to_f64(&b)));
-                }
+                return Ok(float_value(match rep {
+                    super::bignum::IntRep::Big(b) => super::bignum::to_f64(&b),
+                    super::bignum::IntRep::I64(i) => i as f64,
+                }));
             }
             match args[0].as_float() {
                 Some(n) if n.is_nan() => Err(Error::Msg(
                     "floating point value is Not a Number".to_string(),
                 )),
                 Some(n) => Ok(float_value(n)),
-                None => Err(Error::type_mismatch("number", "non-numeric value")),
+                None => Err(Error::Msg(format!(
+                    "expected number but got \"{}\"",
+                    args[0].as_str()
+                ))),
             }
         }
         "bool" => {
@@ -383,10 +389,22 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
         }
         "sqrt" => {
             require_args(name, 1, args.len())?;
+            // Bignum operands take the sqrt of the true value, then round
+            // (sqrt(10**616) is 1e+308, expr-50.1).
+            if let Some(rep) = super::bignum::int_rep(&args[0]) {
+                let b = rep.to_big();
+                if b.is_negative() {
+                    return Err(domain_error());
+                }
+                return Ok(float_value(super::bignum::sqrt_to_f64(&b)));
+            }
             match args[0].as_float() {
                 Some(n) if n >= 0.0 => Ok(float_value(n.sqrt())),
                 Some(_) => Err(domain_error()),
-                None => Err(Error::type_mismatch("number", "non-numeric value")),
+                None => Err(Error::Msg(format!(
+                    "expected number but got \"{}\"",
+                    args[0].as_str()
+                ))),
             }
         }
         "pow" => {
@@ -521,7 +539,15 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
                         g
                     }
                     super::bignum::IntRep::Big(b) => {
-                        i64::try_from(super::bignum::isqrt(&b)).unwrap_or(i64::MAX)
+                        // isqrt of a big number stays a bignum
+                        // (isqrt(2**2048+1) is 2**1024, expr-47.12).
+                        let r = super::bignum::isqrt(&b);
+                        return match i64::try_from(r.clone()) {
+                            Ok(i) => Ok(Value::from_int(i)),
+                            Err(_) => Ok(super::bignum::to_value(
+                                super::bignum::IntRep::Big(r),
+                            )),
+                        };
                     }
                 };
                 return Ok(Value::from_int(r));

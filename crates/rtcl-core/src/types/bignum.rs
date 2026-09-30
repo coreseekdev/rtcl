@@ -172,6 +172,31 @@ pub fn isqrt(x: &BigInt) -> BigInt {
     r
 }
 
+/// Nearest-double square root of a bignum.  tclsh takes the sqrt of the
+/// *true* value and converts only afterwards — `sqrt(10**616)` is
+/// `1e+308` and `sqrt(10**617)` is `Inf`, even though `double(10**616)`
+/// itself is already `Inf` — so saturating the operand first would give
+/// wrong results.  Truncating to the top 64 bits loses relative precision
+/// below 2^-63; the sqrt halves that, far under the 2^-53 rounding
+/// granularity, so the scaled result rounds like the exact one.
+pub fn sqrt_to_f64(b: &BigInt) -> f64 {
+    use num_traits::{One, ToPrimitive};
+    if b.is_zero() {
+        return 0.0;
+    }
+    let bits = b.bits() as u64;
+    let shift = bits.saturating_sub(64);
+    let top = (b >> (shift as usize)).to_u64().unwrap_or(u64::MAX) as f64;
+    // Fold one factor of 2 into the mantissa when the exponent is odd so
+    // the scale stays a clean power of 4.
+    let (mant, exp) = if shift % 2 == 0 {
+        (top, shift / 2)
+    } else {
+        (top * 2.0, (shift - 1) / 2)
+    };
+    mant.sqrt() * 2f64.powi(exp as i32)
+}
+
 /// Exact comparison of an integer rep against a double.
 pub fn cmp_rep_float(a: &IntRep, f: f64) -> Option<core::cmp::Ordering> {
     use core::cmp::Ordering;

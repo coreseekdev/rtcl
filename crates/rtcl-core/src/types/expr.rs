@@ -376,7 +376,19 @@ impl<'a> ExprParser<'a> {
         if int_rep(left).is_none() {
             int_operand(left)?;
         }
-        let count = int_operand(right)?;
+        // Count: i64 fast path; a bignum count behaves like an unbounded
+        // one (>> saturates below, << errors above — `-0x8000000000000001
+        // >> 0x8000000000000000` is -1, expr-48.1).
+        let count = match int_rep(right) {
+            Some(IntRep::I64(c)) => c,
+            Some(big) => {
+                if big.to_big().is_negative() {
+                    return Err(Error::Msg("negative shift argument".to_string()));
+                }
+                i64::MAX
+            }
+            None => int_operand(right)?,
+        };
         if count < 0 {
             return Err(Error::Msg("negative shift argument".to_string()));
         }
@@ -485,8 +497,9 @@ impl<'a> ExprParser<'a> {
                     0 if b < 0 => Err(Error::Msg(
                         "exponentiation of zero by negative power".to_string(),
                     )),
-                    // 0**0 is 1 (expr-23.15).
-                    0 => Ok(Value::from_int(1)),
+                    // 0**0 is 1 (expr-23.15); 0**n is 0 (expr-23.14).
+                    0 if b == 0 => Ok(Value::from_int(1)),
+                    0 => Ok(Value::from_int(0)),
                     1 => Ok(Value::from_int(1)),
                     -1 => Ok(Value::from_int(if b % 2 == 0 { 1 } else { -1 })),
                     // Integer base with negative exponent yields 0

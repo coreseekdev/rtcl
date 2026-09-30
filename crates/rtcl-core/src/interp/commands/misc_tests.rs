@@ -703,3 +703,194 @@ fn test_scan_x_star_skips_to_end() {
         .unwrap();
     assert_eq!(r.as_str(), "1 abc zz");
 }
+
+// ── scan: tclsh 8.6.17 parity (probed in judge/probes/scan_*.tcl) ──
+
+#[test]
+fn test_scan_validator_errors_and_codes() {
+    let mut interp = Interp::new();
+    // trailing '%' → bad conversion character NUL
+    let r = interp
+        .eval(r#"catch {scan abc {%}} m; list $m"#)
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        format!("{{bad scan conversion character \"\u{0}\"}}")
+    );
+    // %c with width
+    let r = interp
+        .eval("catch {scan abc {%2c} v} m; list $m [set ::errorCode]")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "{field width may not be specified in %c conversion} {TCL FORMAT BADWIDTH}"
+    );
+    // size modifier forbidden on %c/%n/%s/%[
+    let r = interp
+        .eval("catch {scan 5 %zn v} m; list $m [set ::errorCode]")
+        .unwrap()
+    ;
+    // %z is a bad conversion character in 8.6 (z/t arrived in 9.0)
+    assert_eq!(
+        r.as_str(),
+        "{bad scan conversion character \"z\"} {TCL FORMAT BADTYPE}"
+    );
+    let r = interp
+        .eval("catch {scan 5 %ln v} m; list $m [set ::errorCode]")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "{field size modifier may not be specified in %n conversion} {TCL FORMAT BADSIZE}"
+    );
+    // %h is allowed everywhere
+    assert_eq!(interp.eval("scan abc %hc v; set v").unwrap().as_str(), "97");
+    // too many vars
+    let r = interp
+        .eval("catch {scan 5 %d a b} m; list $m [set ::errorCode]")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "{variable is not assigned by any conversion specifiers} {TCL FORMAT UNASSIGNED}"
+    );
+    // %*1$d: suppressed specs skip the XPG parse, '$' becomes a bad type
+    let r = interp
+        .eval(r#"catch {scan 5 {%*1$d} a} m; set m"#)
+        .unwrap();
+    assert_eq!(r.as_str(), "bad scan conversion character \"$\"");
+    // valid pure-XPG form succeeds
+    let r = interp
+        .eval(r#"catch {scan 55 {%1$d %2$d} a b} m; list $m $a [info exists b]"#)
+        .unwrap();
+    assert_eq!(r.as_str(), "1 55 0");
+    // digits-without-$ after an XPG spec -> mixing error
+    let r = interp
+        .eval("catch {scan 5 {%1$d %2} a b} m; list $m [set ::errorCode]")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "{cannot mix \"%\" and \"%n$\" conversion specifiers} {TCL FORMAT MIXEDSPECTYPES}"
+    );
+}
+
+#[test]
+fn test_scan_integer_semantics() {
+    let mut interp = Interp::new();
+    // u64 wrap then sign-apply
+    assert_eq!(
+        interp.eval("scan ffffffffffffffff %x").unwrap().as_str(),
+        "-1"
+    );
+    assert_eq!(
+        interp.eval("scan -ffffffffffffffff %x").unwrap().as_str(),
+        "1"
+    );
+    assert_eq!(
+        interp
+            .eval("scan fffffffffffffffff %x")
+            .unwrap()
+            .as_str(),
+        "9223372036854775807"
+    );
+    // decimal saturation
+    assert_eq!(
+        interp
+            .eval("scan 99999999999999999999 %d")
+            .unwrap()
+            .as_str(),
+        "9223372036854775807"
+    );
+    // %d stops at underscore, no 32-bit clamp
+    assert_eq!(interp.eval("scan 1_000 %d").unwrap().as_str(), "1");
+    assert_eq!(interp.eval("scan 2147483648 %d").unwrap().as_str(), "2147483648");
+    // %i: 0x hex, leading-0 octal, no 0b/0o; junk prefix accepts the "0"
+    assert_eq!(interp.eval("scan 0x1f %i").unwrap().as_str(), "31");
+    assert_eq!(interp.eval("scan 010 %i").unwrap().as_str(), "8");
+    assert_eq!(interp.eval("scan 018 %i").unwrap().as_str(), "1");
+    assert_eq!(interp.eval("scan 0b101 %i").unwrap().as_str(), "0");
+    // consumed length via %n
+    assert_eq!(
+        interp
+            .eval("scan 0b101 %i%n v n; list $v $n")
+            .unwrap()
+            .as_str(),
+        "0 1"
+    );
+    // %o: no prefixes; %b: 0b prefix
+    assert_eq!(interp.eval("scan 0x12 %o").unwrap().as_str(), "0");
+    assert_eq!(interp.eval("scan 0b101 %b").unwrap().as_str(), "5");
+    assert_eq!(interp.eval("scan 1012 %b").unwrap().as_str(), "5");
+    // %u reports the u64 reinterpretation
+    assert_eq!(
+        interp.eval("scan -1 %u").unwrap().as_str(),
+        "18446744073709551615"
+    );
+    // width 0 means unlimited
+    assert_eq!(
+        interp
+            .eval("scan abcdef %0s%n v n; list $v $n")
+            .unwrap()
+            .as_str(),
+        "abcdef 6"
+    );
+}
+
+#[test]
+fn test_scan_float_semantics() {
+    let mut interp = Interp::new();
+    assert_eq!(interp.eval("scan 12e %f").unwrap().as_str(), "12.0");
+    assert_eq!(interp.eval("scan .5 %f").unwrap().as_str(), "0.5");
+    assert_eq!(interp.eval("scan 3. %f").unwrap().as_str(), "3.0");
+    // inf accepted, always 3 chars; nan accepted by the parser but
+    // refused by scan (no conversion counted, nothing consumed)
+    assert_eq!(interp.eval("scan inf %f").unwrap().as_str(), "Inf");
+    assert_eq!(interp.eval("scan -Infinity %f").unwrap().as_str(), "-Inf");
+    assert_eq!(interp.eval("scan infX %f%n v n; set n").unwrap().as_str(), "3");
+    interp.eval("unset -nocomplain nv nn").unwrap();
+    assert_eq!(
+        interp
+            .eval("catch {scan NaN %f%n nv nn} r; list $r [info exists nv]")
+            .unwrap()
+            .as_str(),
+        "0 0"
+    );
+    // underflow only when the failed parse reached end of input
+    assert_eq!(interp.eval("scan na %f").unwrap().as_str(), "");
+    assert_eq!(
+        interp
+            .eval("catch {scan n %f v} r")
+            .unwrap()
+            .as_str(),
+        "0"
+    );
+    // partial inf/nan fails quietly
+    assert_eq!(interp.eval("scan iNx %f").unwrap().as_str(), "{}");
+}
+
+#[test]
+fn test_scan_result_shapes() {
+    let mut interp = Interp::new();
+    // underflow with no conversions: -1 / empty list
+    assert_eq!(interp.eval("scan {} %c v").unwrap().as_str(), "-1");
+    assert_eq!(interp.eval("scan abc %d").unwrap().as_str(), "{}");
+    // list mode pads with {}
+    assert_eq!(
+        interp.eval("scan 12 %d%d").unwrap().as_str(),
+        "12 {}"
+    );
+    // set-no-match stops quietly
+    assert_eq!(
+        interp
+            .eval("catch {scan ab {%[%]} x} r; list $r")
+            .unwrap()
+            .as_str(),
+        "0"
+    );
+    // %n counts even after a suppressed conversion
+    assert_eq!(
+        interp
+            .eval("scan abc {%*s%n} b; list $b")
+            .unwrap()
+            .as_str(),
+        "3"
+    );
+}

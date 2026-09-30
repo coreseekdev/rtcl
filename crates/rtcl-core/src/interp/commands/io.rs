@@ -557,7 +557,54 @@ pub fn cmd_file(_interp: &mut Interp, _args: &[Value]) -> Result<Value> {
 
 // ---------- format ----------
 
-pub fn cmd_format(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+/// Tcl_GetDoubleFromObj for format arguments: integers widen, floats
+/// pass through, a NaN double is a hard error ("floating point value is
+/// Not a Number", TCL VALUE DOUBLE NAN), anything else is
+/// "expected floating-point number but got ...".
+fn fmt_double_arg(interp: &mut Interp, args: &[Value], arg_idx: &mut usize) -> Result<f64> {
+    let v = &args[*arg_idx];
+    *arg_idx += 1;
+    if let Some(i) = v.as_int() {
+        return Ok(i as f64);
+    }
+    match v.as_float() {
+        Some(f) if f.is_nan() => {
+            super::list::set_error_code(interp, "TCL VALUE DOUBLE NAN");
+            Err(Error::ControlFlow {
+                kind: crate::error::ControlFlow::Error,
+                value: Some(Value::from_str("floating point value is Not a Number")),
+                level: 1,
+                error_info: None,
+                error_code: Some("TCL VALUE DOUBLE NAN".to_string()),
+            })
+        }
+        Some(f) => Ok(f),
+        None => {
+            super::list::set_error_code(interp, "TCL VALUE NUMBER");
+            let msg = format!("expected floating-point number but got \"{}\"", v.as_str());
+            Err(Error::ControlFlow {
+                kind: crate::error::ControlFlow::Error,
+                value: Some(Value::from_str(&msg)),
+                level: 1,
+                error_info: None,
+                error_code: Some("TCL VALUE NUMBER".to_string()),
+            })
+        }
+    }
+}
+
+/// Render ±inf the way tclsh's format does: case follows the conversion
+/// character, sign kept, precision ignored.
+fn inf_text(_neg: bool, upper: bool) -> String {
+    // Unsigned word; apply_sign adds '-' for negative values.
+    if upper {
+        "INF".to_string()
+    } else {
+        "inf".to_string()
+    }
+}
+
+pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args("format", 2, args.len()));
     }
@@ -703,38 +750,48 @@ pub fn cmd_format(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 format!("{:b}", v)
             }
             'f' => {
-                let v = args[arg_idx].as_float().unwrap_or(0.0);
-                arg_idx += 1;
-                let prec = precision.unwrap_or(6);
-                let s = format!("{:.*}", prec, v.abs());
+                let v = fmt_double_arg(interp, args, &mut arg_idx)?;
+                let s = if v.is_infinite() {
+                    inf_text(v.is_sign_negative(), false)
+                } else {
+                    format!("{:.*}", precision.unwrap_or(6), v.abs())
+                };
                 apply_sign(v, &s, flag_plus, flag_space)
             }
             'e' => {
-                let v = args[arg_idx].as_float().unwrap_or(0.0);
-                arg_idx += 1;
-                let prec = precision.unwrap_or(6);
-                let s = format_exp(v.abs(), prec, false);
+                let v = fmt_double_arg(interp, args, &mut arg_idx)?;
+                let s = if v.is_infinite() {
+                    inf_text(v.is_sign_negative(), false)
+                } else {
+                    format_exp(v.abs(), precision.unwrap_or(6), false)
+                };
                 apply_sign(v, &s, flag_plus, flag_space)
             }
             'E' => {
-                let v = args[arg_idx].as_float().unwrap_or(0.0);
-                arg_idx += 1;
-                let prec = precision.unwrap_or(6);
-                let s = format_exp(v.abs(), prec, true);
+                let v = fmt_double_arg(interp, args, &mut arg_idx)?;
+                let s = if v.is_infinite() {
+                    inf_text(v.is_sign_negative(), true)
+                } else {
+                    format_exp(v.abs(), precision.unwrap_or(6), true)
+                };
                 apply_sign(v, &s, flag_plus, flag_space)
             }
             'g' => {
-                let v = args[arg_idx].as_float().unwrap_or(0.0);
-                arg_idx += 1;
-                let prec = precision.unwrap_or(6).max(1);
-                let s = format_g(v.abs(), prec, false);
+                let v = fmt_double_arg(interp, args, &mut arg_idx)?;
+                let s = if v.is_infinite() {
+                    inf_text(v.is_sign_negative(), false)
+                } else {
+                    format_g(v.abs(), precision.unwrap_or(6).max(1), false, flag_hash)
+                };
                 apply_sign(v, &s, flag_plus, flag_space)
             }
             'G' => {
-                let v = args[arg_idx].as_float().unwrap_or(0.0);
-                arg_idx += 1;
-                let prec = precision.unwrap_or(6).max(1);
-                let s = format_g(v.abs(), prec, true);
+                let v = fmt_double_arg(interp, args, &mut arg_idx)?;
+                let s = if v.is_infinite() {
+                    inf_text(v.is_sign_negative(), true)
+                } else {
+                    format_g(v.abs(), precision.unwrap_or(6).max(1), true, flag_hash)
+                };
                 apply_sign(v, &s, flag_plus, flag_space)
             }
             'c' => {
@@ -751,7 +808,16 @@ pub fn cmd_format(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let w = width.unwrap_or(0);
         if w > formatted.len() {
             let pad = w - formatted.len();
-            let fill = if flag_zero && !flag_minus && !matches!(spec, 's' | 'c') { '0' } else { ' ' };
+            let fill = if flag_zero
+                && !flag_minus
+                && !matches!(spec, 's' | 'c')
+                && !formatted.contains("inf")
+                && !formatted.contains("INF")
+            {
+                '0'
+            } else {
+                ' '
+            };
             if flag_minus {
                 result.push_str(&formatted);
                 for _ in 0..pad { result.push(' '); }
@@ -783,7 +849,7 @@ fn format_int(v: i64, _base: u32, _upper: bool, plus: bool, space: bool, _hash: 
 }
 
 fn apply_sign(v: f64, abs_str: &str, plus: bool, space: bool) -> String {
-    if v.is_sign_negative() && v != 0.0 {
+    if v.is_sign_negative() {
         format!("-{}", abs_str)
     } else if plus {
         format!("+{}", abs_str)
@@ -795,29 +861,93 @@ fn apply_sign(v: f64, abs_str: &str, plus: bool, space: bool) -> String {
 }
 
 fn format_exp(v: f64, prec: usize, upper: bool) -> String {
+    // Rust's {:.*e} is correctly rounded; reassemble with C's exponent
+    // layout (sign always present, at least two digits).
+    let s = format!("{:.*e}", prec, v);
+    let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
+    let expn: i32 = exp.parse().unwrap_or(0);
     let e_char = if upper { 'E' } else { 'e' };
-    if v == 0.0 {
-        return format!("{:.*}{}{}", prec, 0.0_f64, e_char, "+00");
+    let mut out = String::with_capacity(mant.len() + 5);
+    out.push_str(mant);
+    out.push(e_char);
+    if expn < 0 {
+        out.push('-');
+    } else {
+        out.push('+');
     }
-    let exp = v.abs().log10().floor() as i32;
-    let mantissa = v / 10.0_f64.powi(exp);
-    format!("{:.*}{}{:+03}", prec, mantissa, e_char, exp)
+    let a = expn.unsigned_abs();
+    if a < 10 {
+        out.push('0');
+    }
+    out.push_str(&a.to_string());
+    out
 }
 
-fn format_g(v: f64, prec: usize, upper: bool) -> String {
-    if v == 0.0 {
-        return "0".to_string();
-    }
-    let exp = v.abs().log10().floor() as i32;
-    if exp < -4 || exp >= prec as i32 {
-        format_exp(v, prec.saturating_sub(1), upper)
-    } else {
-        // Trim trailing zeros
-        let s = format!("{:.*}", prec.saturating_sub(1).max(0), v);
-        if s.contains('.') {
-            s.trim_end_matches('0').trim_end_matches('.').to_string()
+/// Drop trailing zeros from the fraction of a %g result (and a trailing
+/// bare '.') unless the caller asked for '#' (keep them).
+fn trim_g_fraction(s: String) -> String {
+    if let Some(pos) = s.find(['e', 'E']) {
+        let (mant, exp) = s.split_at(pos);
+        if let Some(dot) = mant.find('.') {
+            let trimmed = mant.trim_end_matches('0');
+            let trimmed = trimmed.strip_suffix('.').unwrap_or(trimmed);
+            let mut out = String::with_capacity(mant.len() + exp.len());
+            out.push_str(trimmed);
+            out.push_str(exp);
+            out
         } else {
             s
+        }
+    } else if s.contains('.') {
+        let trimmed = s.trim_end_matches('0');
+        trimmed.strip_suffix('.').unwrap_or(trimmed).to_string()
+    } else {
+        s
+    }
+}
+
+/// C99 %g: style chosen from the %e exponent X of the value (precision
+/// prec-1): %f style with precision prec-1-X when -4 <= X < prec, %e
+/// style with precision prec-1 otherwise; trailing fraction zeros dropped
+/// unless '#'.
+fn format_g(v: f64, prec: usize, upper: bool, hash: bool) -> String {
+    if v == 0.0 {
+        // Zero never gets the trailing-zero trim (nothing to trim) but the
+        // '#' flag keeps a fraction of prec-1 zeros.
+        if hash {
+            let mut s = String::from("0.");
+            for _ in 0..prec.saturating_sub(1) {
+                s.push('0');
+            }
+            s
+        } else {
+            "0".to_string()
+        }
+    } else {
+        let s_e = format!("{:.*e}", prec.saturating_sub(1), v);
+        let exp: i32 = s_e
+            .split_once('e')
+            .and_then(|(_, e)| e.parse().ok())
+            .unwrap_or(0);
+        if exp < -4 || exp >= prec as i32 {
+            let s = format_exp(v, prec.saturating_sub(1), upper);
+            if hash {
+                s
+            } else {
+                trim_g_fraction(s)
+            }
+        } else {
+            let fp = (prec as i32 - 1 - exp).max(0) as usize;
+            let s = format!("{:.*}", fp, v);
+            if hash {
+                if s.contains('.') {
+                    s
+                } else {
+                    format!("{}.", s)
+                }
+            } else {
+                trim_g_fraction(s)
+            }
         }
     }
 }

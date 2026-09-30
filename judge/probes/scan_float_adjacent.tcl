@@ -1,0 +1,5 @@
+puts A:[scan {1 2} {%f%f}]
+puts B:[scan {1 2 3} {%e %d %f}]
+puts C:[scan {1 2} {%f%s}]
+puts D:[scan 12 {%d%d}]
+puts E:[scan {1 2} {%e%e}]

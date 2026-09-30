@@ -1304,11 +1304,60 @@ fn format_float(n: f64) -> String {
     if n.is_nan() {
         return "NaN".to_string();
     }
-    if n.fract() == 0.0 && n.abs() < 1e15 {
-        format!("{:.1}", n)
-    } else {
-        format!("{}", n)
+    // tclsh (8.6.17, verified): shortest round-trip digits, laid out in
+    // fixed notation when the decimal exponent is in -4..=16, exponent
+    // form otherwise ("1e+17", "1e-5" — exponent without leading zeros);
+    // integral fixed values keep a trailing ".0".
+    let e = format!("{:e}", n); // shortest repr, e.g. "-6.02e23"
+    let (mant, exp_str) = e.split_once('e').unwrap();
+    let exp: i32 = exp_str.parse().unwrap_or(0);
+    let neg = mant.starts_with('-');
+    let mant = mant.trim_start_matches('-');
+    let mut digits: String = mant.chars().filter(|c| *c != '.').collect();
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
     }
+    if digits.is_empty() {
+        digits.push('0');
+    }
+    let mut body = String::new();
+    if (-4..=16).contains(&exp) {
+        let nd = digits.len() as i32;
+        if exp >= nd - 1 {
+            body.push_str(&digits);
+            for _ in 0..(exp - (nd - 1)) {
+                body.push('0');
+            }
+            body.push_str(".0");
+        } else if exp >= 0 {
+            body.push_str(&digits[..(exp + 1) as usize]);
+            body.push('.');
+            body.push_str(&digits[(exp + 1) as usize..]);
+        } else {
+            body.push_str("0.");
+            for _ in 0..(-exp - 1) {
+                body.push('0');
+            }
+            body.push_str(&digits);
+        }
+    } else {
+        body.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            body.push('.');
+            body.push_str(&digits[1..]);
+        }
+        body.push('e');
+        if exp < 0 {
+            body.push('-');
+        } else {
+            body.push('+');
+        }
+        body.push_str(&exp.abs().to_string());
+    }
+    if neg {
+        body.insert(0, '-');
+    }
+    body
 }
 
 /// Quote a string for safe use as a Tcl word in a command.

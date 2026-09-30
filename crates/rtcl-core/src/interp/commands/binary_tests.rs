@@ -32,8 +32,9 @@ fn test_format_A_pads_with_spaces() {
 }
 
 #[test]
-fn test_format_a_default_count_is_whole_string() {
-    assert_eq!(eval("binary scan [binary format a ab] H* h; set h"), "6162");
+fn test_format_a_default_count_is_one() {
+    // tclsh 8.6.17: an omitted count for a/A in format means ONE character.
+    assert_eq!(eval("binary scan [binary format a ab] H* h; set h"), "61");
 }
 
 #[test]
@@ -328,7 +329,8 @@ fn test_scan_a_stops_at_count() {
 
 #[test]
 fn test_scan_A_strips_trailing_ws_only_with_star() {
-    assert_eq!(eval(r#"binary scan "ab\t  " A* v; set v"#), "ab");
+    // A strips trailing spaces (and NULs) but not tabs (tclsh 8.6.17)
+    assert_eq!(eval(r#"binary scan "ab\t  " A* v; set v"#), "ab\t");
     assert_eq!(eval(r#"binary scan "ab\t  " A3 v; set v"#), "ab\t");
 }
 
@@ -456,8 +458,8 @@ fn test_decode_hex() {
 
 #[test]
 fn test_decode_hex_odd_pads_low_nibble() {
-    // tclsh: abc → ab 0c
-    assert_eq!(eval("binary scan [binary decode hex abc] H* h; set h"), "ab0c");
+    // tclsh: the odd trailing nibble is dropped
+    assert_eq!(eval("binary scan [binary decode hex abc] H* h; set h"), "ab");
 }
 
 #[test]

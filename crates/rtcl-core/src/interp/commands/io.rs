@@ -645,6 +645,81 @@ fn parse_tcl_int_strict(s: &str) -> Option<i64> {
     })
 }
 
+/// Extended Tcl integer parse for the `l`-size conversions: same grammar as
+/// `parse_tcl_int_strict`, but the magnitude accumulates in u128 so values
+/// beyond 64 bits (which tclsh holds as bignums) survive.  Returns the sign
+/// and magnitude; values wider than 128 bits wrap.
+fn parse_tcl_int_ext(s: &str) -> Option<(bool, u128)> {
+    let s = s.trim();
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let (digits, radix): (&str, u32) =
+        if let Some(r) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            if r.is_empty() { return None; }
+            (r, 16)
+        } else if let Some(r) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+            if r.is_empty() { return None; }
+            (r, 2)
+        } else if let Some(r) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+            if r.is_empty() { return None; }
+            (r, 8)
+        } else if body.len() > 1 && body.starts_with('0') {
+            (&body[1..], 8)
+        } else {
+            (body, 10)
+        };
+    let mut mag: u128 = 0;
+    for c in digits.bytes() {
+        let d = (c as char).to_digit(radix)?;
+        mag = mag.wrapping_mul(radix as u128).wrapping_add(d as u128);
+    }
+    Some((neg, mag))
+}
+
+/// Format an integer conversion (`l` size) whose magnitude does not fit in
+/// i64: tclsh renders the bignum decimal directly.  Sign/flag handling
+/// mirrors `format_int`.
+fn format_bignum_int(neg: bool, mag: u128, plus: bool, space: bool) -> String {
+    let mut s = mag.to_string();
+    if neg {
+        s.insert(0, '-');
+    } else if plus {
+        s.insert(0, '+');
+    } else if space {
+        s.insert(0, ' ');
+    }
+    s
+}
+
+/// Result of the wide (`l`-size) integer parse: an in-range value renders
+/// exactly like the 64-bit path; a bignum renders from its magnitude.
+enum BigOrLit {
+    Lit(i64),
+    Big(bool, u128),
+}
+
+/// Parse for `l`-size conversions: values that fit i64 render identically
+/// to `%d`; larger magnitudes (tclsh bignums) keep full precision.
+fn parse_tcl_int_l(s: &str) -> Option<BigOrLit> {
+    let (neg, mag) = parse_tcl_int_ext(s)?;
+    let fits = if neg {
+        mag <= (i64::MAX as u128) + 1
+    } else {
+        mag <= i64::MAX as u128
+    };
+    if fits {
+        let v = if neg { ((mag as u64).wrapping_neg()) as i64 } else { mag as i64 };
+        Some(BigOrLit::Lit(v))
+    } else {
+        Some(BigOrLit::Big(neg, mag))
+    }
+}
+
 /// Upper bound for widths/precisions from the format string or '*' args.
 /// C saturates at INT_MAX and then really allocates that many bytes; the
 /// corpus never exercises widths beyond double digits, so rtcl caps at
@@ -687,6 +762,17 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     macro_rules! int_arg {
         ($arg:expr) => {
             match parse_tcl_int_strict($arg.as_str()) {
+                Some(v) => v,
+                None => {
+                    let msg = format!("expected integer but got \"{}\"", $arg.as_str());
+                    return fmt_err!(msg, "TCL VALUE NUMBER");
+                }
+            }
+        };
+    }
+    macro_rules! int_l_arg {
+        ($arg:expr) => {
+            match parse_tcl_int_l($arg.as_str()) {
                 Some(v) => v,
                 None => {
                     let msg = format!("expected integer but got \"{}\"", $arg.as_str());
@@ -864,10 +950,12 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // Size modifiers: one 'h' or a run of 'l's; anything further is
         // treated as the conversion character.
         let mut size_h = false;
+        let mut size_l = false;
         if pos < len && bytes[pos] == b'l' {
             while pos < len && bytes[pos] == b'l' {
                 pos += 1;
             }
+            size_l = true;
         } else if pos < len && bytes[pos] == b'h' {
             size_h = true;
             pos += 1;
@@ -979,50 +1067,85 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 None => arg.as_str().to_string(),
             },
             'd' | 'i' => {
-                let mut v = int_arg!(arg);
-                if size_h {
-                    v = (v as i16) as i64;
+                if size_l {
+                    match int_l_arg!(arg) {
+                        BigOrLit::Lit(v) => {
+                            format_int(v, 10, false, flag_plus, flag_space, flag_hash)
+                        }
+                        BigOrLit::Big(neg, mag) => {
+                            format_bignum_int(neg, mag, flag_plus, flag_space)
+                        }
+                    }
+                } else {
+                    let mut v = int_arg!(arg);
+                    if size_h {
+                        v = (v as i16) as i64;
+                    }
+                    format_int(v, 10, false, flag_plus, flag_space, flag_hash)
                 }
-                format_int(v, 10, false, flag_plus, flag_space, flag_hash)
             }
             'u' => {
-                let v = int_arg!(arg);
-                let v = if size_h { (v as u16) as u64 } else { v as u64 };
-                v.to_string()
+                if size_l {
+                    match int_l_arg!(arg) {
+                        BigOrLit::Lit(v) => (v as u64).to_string(),
+                        BigOrLit::Big(false, mag) => mag.to_string(),
+                        BigOrLit::Big(true, mag) => format!("-{}", mag),
+                    }
+                } else {
+                    let v = int_arg!(arg);
+                    let v = if size_h { (v as u16) as u64 } else { v as u64 };
+                    v.to_string()
+                }
             }
             'x' => {
-                let v = int_arg!(arg);
-                let s = if size_h {
-                    format!("{:x}", v as u16)
+                let s = if size_l {
+                    match int_l_arg!(arg) {
+                        BigOrLit::Lit(v) => format!("{:x}", v),
+                        BigOrLit::Big(false, mag) => format!("{:x}", mag),
+                        BigOrLit::Big(true, mag) => format!("-{:x}", mag),
+                    }
                 } else {
-                    format!("{:x}", v)
+                    let v = int_arg!(arg);
+                    if size_h { format!("{:x}", v as u16) } else { format!("{:x}", v) }
                 };
                 if flag_hash { format!("0x{}", s) } else { s }
             }
             'X' => {
-                let v = int_arg!(arg);
-                let s = if size_h {
-                    format!("{:X}", v as u16)
+                let s = if size_l {
+                    match int_l_arg!(arg) {
+                        BigOrLit::Lit(v) => format!("{:X}", v),
+                        BigOrLit::Big(false, mag) => format!("{:X}", mag),
+                        BigOrLit::Big(true, mag) => format!("-{:X}", mag),
+                    }
                 } else {
-                    format!("{:X}", v)
+                    let v = int_arg!(arg);
+                    if size_h { format!("{:X}", v as u16) } else { format!("{:X}", v) }
                 };
                 if flag_hash { format!("0X{}", s) } else { s }
             }
             'o' => {
-                let v = int_arg!(arg);
-                let s = if size_h {
-                    format!("{:o}", v as u16)
+                let s = if size_l {
+                    match int_l_arg!(arg) {
+                        BigOrLit::Lit(v) => format!("{:o}", v),
+                        BigOrLit::Big(false, mag) => format!("{:o}", mag),
+                        BigOrLit::Big(true, mag) => format!("-{:o}", mag),
+                    }
                 } else {
-                    format!("{:o}", v)
+                    let v = int_arg!(arg);
+                    if size_h { format!("{:o}", v as u16) } else { format!("{:o}", v) }
                 };
                 if flag_hash && !s.starts_with('0') { format!("0{}", s) } else { s }
             }
             'b' => {
-                let v = int_arg!(arg);
-                let s = if size_h {
-                    format!("{:b}", v as u16)
+                let s = if size_l {
+                    match int_l_arg!(arg) {
+                        BigOrLit::Lit(v) => format!("{:b}", v),
+                        BigOrLit::Big(false, mag) => format!("{:b}", mag),
+                        BigOrLit::Big(true, mag) => format!("-{:b}", mag),
+                    }
                 } else {
-                    format!("{:b}", v)
+                    let v = int_arg!(arg);
+                    if size_h { format!("{:b}", v as u16) } else { format!("{:b}", v) }
                 };
                 if flag_hash { format!("0b{}", s) } else { s }
             }

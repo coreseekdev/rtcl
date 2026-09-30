@@ -4,10 +4,19 @@
 //! character (the character's low byte), and a byte string renders as one
 //! character per byte (latin-1 style).  This keeps `binary format`/`scan`
 //! results round-trippable through ordinary string values.
+//!
+//! Field parsing and the per-field semantics port tclBinary.c (GetFormatSpec,
+//! BinaryFormatCmd, BinaryScanCmd); encode/decode port BinaryEncode64/Uu and
+//! BinaryDecodeHex/64/Uu, including option-pair parsing, strict mode, and
+//! error message/position details verified against tclsh 8.6.17.
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::interp::Interp;
 use crate::value::Value;
+
+/// Maximum Tcl value size; larger format results are refused (8.6.17:
+/// "max size for a Tcl value (2147483647 bytes) exceeded").
+const MAXOBJ: usize = 2147483647;
 
 // ── string ↔ bytes ─────────────────────────────────────────────────────
 
@@ -23,6 +32,18 @@ fn bytes_to_string(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| char::from_u32(b as u32).unwrap()).collect()
 }
 
+/// Tcl's isspace set (TclIsSpaceProc).
+fn is_tcl_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+fn max_size_err() -> Error {
+    Error::runtime(
+        "max size for a Tcl value (2147483647 bytes) exceeded",
+        ErrorCode::Generic,
+    )
+}
+
 // ── field spec parsing ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
@@ -34,47 +55,52 @@ struct Field {
     unsigned: bool,
 }
 
-/// Parse a format string into fields.  Grammar: letter, optional `u`
-/// modifier, optional decimal count (`@` requires a count).
+/// Valid field specifier characters (tclsh 8.6 — no `C`).
+const FIELD_CHARS: &[u8] = b"aAbBhHcsStiInWwmqQdfrRxX@";
+
+/// Parse a format string into fields — port of GetFormatSpec: fields are
+/// separated by spaces; each is a letter, optional `u` modifier, then
+/// either `*` or a decimal count.  `@` requires a count (`@*` ok).
 fn parse_fields(fmt: &str) -> Result<Vec<Field>> {
+    let bytes = fmt.as_bytes();
     let mut fields = Vec::new();
-    let chars: Vec<char> = fmt.chars().collect();
     let mut i = 0;
-    while i < chars.len() {
-        let ch = chars[i];
-        if !(ch == '@' || ch.is_ascii_alphabetic()) {
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b' ' {
+            i += 1;
+            continue;
+        }
+        if !FIELD_CHARS.contains(&ch) {
             return Err(Error::runtime(
-                format!("bad field specifier \"{}\"", ch),
+                format!("bad field specifier \"{}\"", ch as char),
                 ErrorCode::Generic,
             ));
         }
-        if !matches!(ch, 'a'|'A'|'b'|'B'|'h'|'H'|'c'|'s'|'S'|'t'|'i'|'I'|'n'|'w'|'W'|'m'|'q'|'Q'|'d'|'f'|'r'|'R'|'x'|'X'|'@') {
-            return Err(Error::runtime(
-                format!("bad field specifier \"{}\"", ch),
-                ErrorCode::Generic,
-            ));
-        }
-        let mut field = Field { ch: ch as u8, count: None, star: false, unsigned: false };
         i += 1;
-        if i < chars.len() && chars[i] == 'u' && field.ch != b'@' {
+        let mut field = Field { ch, count: None, star: false, unsigned: false };
+        if i < bytes.len() && bytes[i] == b'u' && ch != b'@' {
             field.unsigned = true;
             i += 1;
         }
-        if i < chars.len() && chars[i] == '*' {
+        if i < bytes.len() && bytes[i] == b'*' {
             field.star = true;
             i += 1;
+        } else {
+            let mut count: usize = 0;
+            let mut have_count = false;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                count = count
+                    .saturating_mul(10)
+                    .saturating_add((bytes[i] - b'0') as usize);
+                have_count = true;
+                i += 1;
+            }
+            if have_count {
+                field.count = Some(count);
+            }
         }
-        let mut count: usize = 0;
-        let mut have_count = false;
-        while i < chars.len() && chars[i].is_ascii_digit() {
-            count = count * 10 + (chars[i] as u8 - b'0') as usize;
-            have_count = true;
-            i += 1;
-        }
-        if have_count {
-            field.count = Some(count);
-        }
-        if field.ch == b'@' && field.count.is_none() {
+        if ch == b'@' && !field.star && field.count.is_none() {
             return Err(Error::runtime(
                 "missing count for \"@\" field specifier",
                 ErrorCode::Generic,
@@ -83,6 +109,15 @@ fn parse_fields(fmt: &str) -> Result<Vec<Field>> {
         fields.push(field);
     }
     Ok(fields)
+}
+
+fn int_size(ch: u8) -> usize {
+    match ch {
+        b'c' => 1,
+        b's' | b'S' | b't' => 2,
+        b'i' | b'I' | b'n' => 4,
+        _ => 8,
+    }
 }
 
 // ── command dispatch ───────────────────────────────────────────────────
@@ -132,6 +167,27 @@ fn not_enough_args() -> Error {
     )
 }
 
+fn expected_int(v: &Value) -> Error {
+    Error::runtime(
+        format!("expected integer but got \"{}\"", v.as_str()),
+        ErrorCode::Generic,
+    )
+}
+
+fn expected_float(v: &Value) -> Error {
+    Error::runtime(
+        format!("expected floating-point number but got \"{}\"", v.as_str()),
+        ErrorCode::Generic,
+    )
+}
+
+fn list_count_mismatch() -> Error {
+    Error::runtime(
+        "number of elements in list does not match count",
+        ErrorCode::Generic,
+    )
+}
+
 fn binary_format(args: &[Value]) -> Result<Value> {
     if args.is_empty() {
         return Err(Error::wrong_args_with_usage(
@@ -142,6 +198,9 @@ fn binary_format(args: &[Value]) -> Result<Value> {
     let fields = parse_fields(args[0].as_str())?;
     let mut out: Vec<u8> = Vec::new();
     let mut pos: usize = 0;
+    // High-water mark of `pos`, consulted by `X`/`@` (maxPos in tclBinary.c;
+    // it is only refreshed on entry to those two cases).
+    let mut max_pos: usize = 0;
     let mut argi: usize = 1;
 
     for f in &fields {
@@ -150,7 +209,10 @@ fn binary_format(args: &[Value]) -> Result<Value> {
                 let arg = args.get(argi).ok_or_else(not_enough_args)?;
                 argi += 1;
                 let chars: Vec<char> = arg.as_str().chars().collect();
-                let count = f.count.unwrap_or(chars.len());
+                let count = if f.star { chars.len() } else { f.count.unwrap_or(1) };
+                if pos.saturating_add(count) > MAXOBJ {
+                    return Err(max_size_err());
+                }
                 let pad = if f.ch == b'a' { 0u8 } else { b' ' };
                 let bytes: Vec<u8> = (0..count)
                     .map(|k| chars.get(k).map(|&c| c as u32 as u8).unwrap_or(pad))
@@ -165,6 +227,9 @@ fn binary_format(args: &[Value]) -> Result<Value> {
                 let chars: Vec<char> = src.chars().collect();
                 let count = if f.star { chars.len() } else { f.count.unwrap_or(8) };
                 let need = count.div_ceil(8);
+                if pos.saturating_add(need) > MAXOBJ {
+                    return Err(max_size_err());
+                }
                 let mut bytes = vec![0u8; need];
                 for k in 0..count {
                     let bit_val = match chars.get(k) {
@@ -195,6 +260,9 @@ fn binary_format(args: &[Value]) -> Result<Value> {
                 let src = arg.as_str();
                 let chars: Vec<char> = src.chars().collect();
                 let count = if f.star { chars.len() } else { f.count.unwrap_or(2) };
+                if pos.saturating_add(count.div_ceil(2)) > MAXOBJ {
+                    return Err(max_size_err());
+                }
                 let mut nibbles = Vec::with_capacity(count);
                 for k in 0..count {
                     let v = match chars.get(k) {
@@ -232,32 +300,43 @@ fn binary_format(args: &[Value]) -> Result<Value> {
                 pos += bytes.len();
             }
             b'x' => {
+                if f.star {
+                    return Err(Error::runtime(
+                        "cannot use \"*\" in format string with \"x\"",
+                        ErrorCode::Generic,
+                    ));
+                }
                 let n = f.count.unwrap_or(1);
-                write_at(&mut out, pos, &vec![0u8; n]);
+                if pos.saturating_add(n) > MAXOBJ {
+                    return Err(max_size_err());
+                }
+                if pos + n > out.len() {
+                    out.resize(pos + n, 0);
+                }
                 pos += n;
             }
-            b'X' => pos = pos.saturating_sub(f.count.unwrap_or(1)),
-            b'@' => pos = f.count.unwrap_or(0),
-            b'c' | b's' | b'S' | b't' | b'i' | b'I' | b'n' | b'w' | b'W' | b'm' => {
-                let size: usize = match f.ch {
-                    b'c' => 1,
-                    b's' | b'S' | b't' => 2,
-                    b'i' | b'I' | b'n' => 4,
-                    _ => 8,
-                };
-                let big_endian = matches!(f.ch, b'S' | b'I' | b'W');
-                let count = f.count.unwrap_or(1);
-                if count == 0 {
-                    args.get(argi).ok_or_else(not_enough_args)?;
-                    argi += 1;
-                    continue;
-                }
-                let values = if f.star {
-                    format_star_ints(args, &mut argi)?
+            b'X' => {
+                max_pos = max_pos.max(pos);
+                let n = f.count.unwrap_or(1);
+                if f.star || n > pos {
+                    pos = 0;
                 } else {
-                    format_int_args(args, &mut argi, count)?
-                };
-                let mut bytes = Vec::with_capacity(size * values.len());
+                    pos -= n;
+                }
+            }
+            b'@' => {
+                max_pos = max_pos.max(pos);
+                pos = if f.star { max_pos } else { f.count.unwrap_or(0) };
+            }
+            b'c' | b's' | b'S' | b't' | b'i' | b'I' | b'n' | b'w' | b'W' | b'm' => {
+                let size = int_size(f.ch);
+                let big_endian = matches!(f.ch, b'S' | b'I' | b'W');
+                let values = format_int_values(args, &mut argi, f)?;
+                let total = size.saturating_mul(values.len());
+                if pos.saturating_add(total) > MAXOBJ {
+                    return Err(max_size_err());
+                }
+                let mut bytes = Vec::with_capacity(total);
                 for v in values {
                     let v = v as u64;
                     for k in 0..size {
@@ -271,20 +350,30 @@ fn binary_format(args: &[Value]) -> Result<Value> {
             b'q' | b'Q' | b'd' | b'f' | b'r' | b'R' => {
                 let size: usize = if matches!(f.ch, b'd' | b'q' | b'Q') { 8 } else { 4 };
                 let big_endian = matches!(f.ch, b'Q' | b'R');
-                let count = f.count.unwrap_or(1);
-                if count == 0 {
-                    args.get(argi).ok_or_else(not_enough_args)?;
-                    argi += 1;
-                    continue;
+                let values = format_float_values(args, &mut argi, f)?;
+                let total = size.saturating_mul(values.len());
+                if pos.saturating_add(total) > MAXOBJ {
+                    return Err(max_size_err());
                 }
-                let values = if f.star {
-                    format_star_floats(args, &mut argi)?
-                } else {
-                    format_float_args(args, &mut argi, count)?
-                };
-                let mut bytes = Vec::with_capacity(size * values.len());
+                let mut bytes = Vec::with_capacity(total);
                 for v in values {
-                    let bits = if size == 8 { v.to_bits() } else { (v as f32).to_bits() as u64 };
+                    // tclsh clamps 4-byte fields to ±FLT_MAX (even ±Inf);
+                    // a plain cast would overflow to Inf.
+                    let bits = if size == 8 {
+                        v.to_bits()
+                    } else {
+                        let fmax = f32::MAX as f64;
+                        let f = if v.is_nan() {
+                            f32::NAN
+                        } else if v > fmax {
+                            f32::MAX
+                        } else if v < -fmax {
+                            -f32::MAX
+                        } else {
+                            v as f32
+                        };
+                        f.to_bits() as u64
+                    };
                     for k in 0..size {
                         let shift = if big_endian { 8 * (size - 1 - k) } else { 8 * k };
                         bytes.push(((bits >> shift) & 0xff) as u8);
@@ -307,103 +396,39 @@ fn write_at(out: &mut Vec<u8>, pos: usize, bytes: &[u8]) {
     out[pos..pos + bytes.len()].copy_from_slice(bytes);
 }
 
-/// Collect `count` integer values starting at `*argi` (scalar for count 1,
-/// exact-length list for count > 1).
-fn format_int_args(args: &[Value], argi: &mut usize, count: usize) -> Result<Vec<i64>> {
+/// Select the value(s) a numeric format field consumes.  Without a count the
+/// argument itself is the single scalar; with a count (or `*`) the argument
+/// is a list — a short list is an error, extra elements are ignored.
+fn select_numeric_args(
+    args: &[Value],
+    argi: &mut usize,
+    f: &Field,
+) -> Result<Vec<Value>> {
     let arg = args.get(*argi).ok_or_else(not_enough_args)?;
     *argi += 1;
-    if count == 1 {
-        return Ok(vec![arg.as_int().ok_or_else(|| {
-            Error::runtime(
-                format!("expected integer but got \"{}\"", arg.as_str()),
-                ErrorCode::Generic,
-            )
-        })?]);
+    if f.count.is_none() && !f.star {
+        return Ok(vec![arg.clone()]);
     }
     let list = arg.as_list().ok_or_else(list_count_mismatch)?;
-    if list.len() != count {
+    let count = if f.star { list.len() } else { f.count.unwrap_or(0) };
+    if list.len() < count {
         return Err(list_count_mismatch());
     }
-    list.iter()
-        .map(|v| {
-            v.as_int().ok_or_else(|| {
-                Error::runtime(
-                    format!("expected integer but got \"{}\"", v.as_str()),
-                    ErrorCode::Generic,
-                )
-            })
-        })
-        .collect()
+    Ok(list.into_iter().take(count).collect())
 }
 
-fn format_float_args(args: &[Value], argi: &mut usize, count: usize) -> Result<Vec<f64>> {
-    let arg = args.get(*argi).ok_or_else(not_enough_args)?;
-    *argi += 1;
-    if count == 1 {
-        return Ok(vec![arg.as_float().ok_or_else(|| {
-            Error::runtime(
-                format!("expected floating-point number but got \"{}\"", arg.as_str()),
-                ErrorCode::Generic,
-            )
-        })?]);
-    }
-    let list = arg.as_list().ok_or_else(list_count_mismatch)?;
-    if list.len() != count {
-        return Err(list_count_mismatch());
-    }
-    list.iter()
-        .map(|v| {
-            v.as_float().ok_or_else(|| {
-                Error::runtime(
-                    format!("expected floating-point number but got \"{}\"", v.as_str()),
-                    ErrorCode::Generic,
-                )
-            })
-        })
-        .collect()
-}
-
-/// Collect ALL elements of the list argument (count `*`).
-fn format_star_ints(args: &[Value], argi: &mut usize) -> Result<Vec<i64>> {
-    let arg = args.get(*argi).ok_or_else(not_enough_args)?;
-    *argi += 1;
-    arg.as_list()
-        .ok_or_else(list_count_mismatch)?
+fn format_int_values(args: &[Value], argi: &mut usize, f: &Field) -> Result<Vec<i64>> {
+    select_numeric_args(args, argi, f)?
         .iter()
-        .map(|v| {
-            v.as_int().ok_or_else(|| {
-                Error::runtime(
-                    format!("expected integer but got \"{}\"", v.as_str()),
-                    ErrorCode::Generic,
-                )
-            })
-        })
+        .map(|v| v.as_int().ok_or_else(|| expected_int(v)))
         .collect()
 }
 
-/// Collect ALL elements of the list argument as floats (count `*`).
-fn format_star_floats(args: &[Value], argi: &mut usize) -> Result<Vec<f64>> {
-    let arg = args.get(*argi).ok_or_else(not_enough_args)?;
-    *argi += 1;
-    arg.as_list()
-        .ok_or_else(list_count_mismatch)?
+fn format_float_values(args: &[Value], argi: &mut usize, f: &Field) -> Result<Vec<f64>> {
+    select_numeric_args(args, argi, f)?
         .iter()
-        .map(|v| {
-            v.as_float().ok_or_else(|| {
-                Error::runtime(
-                    format!("expected floating-point number but got \"{}\"", v.as_str()),
-                    ErrorCode::Generic,
-                )
-            })
-        })
+        .map(|v| v.as_float().ok_or_else(|| expected_float(v)))
         .collect()
-}
-
-fn list_count_mismatch() -> Error {
-    Error::runtime(
-        "number of elements in list does not match count",
-        ErrorCode::Generic,
-    )
 }
 
 // ── scan ───────────────────────────────────────────────────────────────
@@ -416,7 +441,7 @@ fn binary_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         ));
     }
     let fields = parse_fields(args[1].as_str())?;
-    let mut data = string_to_bytes(args[0].as_str());
+    let data = string_to_bytes(args[0].as_str());
     let mut pos: usize = 0;
     let mut var_i: usize = 2;
     let mut sets: i64 = 0;
@@ -424,30 +449,42 @@ fn binary_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     for f in &fields {
         match f.ch {
             b'x' => {
-                // tclsh: `x*` skips all remaining bytes; a bare `x` skips 1.
-                pos += if f.star {
-                    data.len() - pos
+                let n = if f.star { usize::MAX } else { f.count.unwrap_or(1) };
+                if f.star || n > data.len() - pos {
+                    pos = data.len();
                 } else {
-                    f.count.unwrap_or(1)
+                    pos += n;
+                }
+            }
+            b'X' => {
+                let n = if f.star { usize::MAX } else { f.count.unwrap_or(1) };
+                if f.star || n > pos {
+                    pos = 0;
+                } else {
+                    pos -= n;
+                }
+            }
+            b'@' => {
+                pos = if f.star {
+                    data.len()
+                } else {
+                    f.count.unwrap_or(0).min(data.len())
                 };
             }
-            b'X' => pos = pos.saturating_sub(f.count.unwrap_or(1)),
-            b'@' => {
-                pos = f.count.unwrap_or(0);
-                if pos > data.len() {
-                    data.resize(pos, 0);
-                }
-            }
             b'a' | b'A' => {
-                let count = f.count.unwrap_or_else(|| data.len().saturating_sub(pos));
-                if pos + count > data.len() {
-                    continue; // incomplete: variable untouched
+                let name =
+                    args.get(var_i).ok_or_else(not_enough_args)?.as_str().to_string();
+                let count = if f.star { data.len() - pos } else { f.count.unwrap_or(1) };
+                if count > data.len() - pos {
+                    break; // short data: scanning stops, variable untouched
                 }
-                let mut s = bytes_to_string(&data[pos..pos + count]);
-                if f.ch == b'A' && f.count.is_none() {
-                    s.truncate(s.trim_end().len());
+                let mut size = count;
+                if f.ch == b'A' {
+                    while size > 0 && matches!(data[pos + size - 1], 0 | b' ') {
+                        size -= 1;
+                    }
                 }
-                let name = args.get(var_i).ok_or_else(not_enough_args)?.as_str().to_string();
+                let s = bytes_to_string(&data[pos..pos + size]);
                 interp.set_var(&name, Value::from_str(&s))?;
                 sets += 1;
                 var_i += 1;
@@ -456,10 +493,15 @@ fn binary_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             b'b' | b'B' => {
                 // tclsh scan: an absent count reads ONE bit (unlike format,
                 // which writes 8 by default).
-                let count = if f.star { (data.len() - pos) * 8 } else { f.count.unwrap_or(1) };
-                let need = count.div_ceil(8);
-                if pos + need > data.len() {
-                    continue;
+                let name =
+                    args.get(var_i).ok_or_else(not_enough_args)?.as_str().to_string();
+                let count = if f.star {
+                    (data.len() - pos) * 8
+                } else {
+                    f.count.unwrap_or(1)
+                };
+                if count > (data.len() - pos) * 8 {
+                    break;
                 }
                 let mut s = String::with_capacity(count);
                 for k in 0..count {
@@ -471,18 +513,22 @@ fn binary_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     };
                     s.push(if bit == 1 { '1' } else { '0' });
                 }
-                let name = args.get(var_i).ok_or_else(not_enough_args)?.as_str().to_string();
                 interp.set_var(&name, Value::from_str(&s))?;
                 sets += 1;
                 var_i += 1;
-                pos += need;
+                pos += count.div_ceil(8);
             }
             b'h' | b'H' => {
                 // tclsh scan: an absent count reads ONE nibble.
-                let count = if f.star { (data.len() - pos) * 2 } else { f.count.unwrap_or(1) };
-                let need = count.div_ceil(2);
-                if pos + need > data.len() {
-                    continue;
+                let name =
+                    args.get(var_i).ok_or_else(not_enough_args)?.as_str().to_string();
+                let count = if f.star {
+                    (data.len() - pos) * 2
+                } else {
+                    f.count.unwrap_or(1)
+                };
+                if count > (data.len() - pos) * 2 {
+                    break;
                 }
                 let mut s = String::with_capacity(count);
                 for k in 0..count {
@@ -496,27 +542,23 @@ fn binary_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     };
                     s.push(char::from_digit(nib as u32, 16).unwrap());
                 }
-                let name = args.get(var_i).ok_or_else(not_enough_args)?.as_str().to_string();
                 interp.set_var(&name, Value::from_str(&s))?;
                 sets += 1;
                 var_i += 1;
-                pos += need;
+                pos += count.div_ceil(2);
             }
             b'c' | b's' | b'S' | b't' | b'i' | b'I' | b'n' | b'w' | b'W' | b'm' => {
-                let size: usize = match f.ch {
-                    b'c' => 1,
-                    b's' | b'S' | b't' => 2,
-                    b'i' | b'I' | b'n' => 4,
-                    _ => 8,
-                };
+                let size = int_size(f.ch);
                 let big_endian = matches!(f.ch, b'S' | b'I' | b'W');
+                let name =
+                    args.get(var_i).ok_or_else(not_enough_args)?.as_str().to_string();
                 let count = if f.star {
                     (data.len() - pos) / size
                 } else {
                     f.count.unwrap_or(1)
                 };
-                if pos + size * count > data.len() {
-                    continue;
+                if data.len() - pos < count.saturating_mul(size) {
+                    break;
                 }
                 let mut values: Vec<Value> = Vec::with_capacity(count);
                 for g in 0..count {
@@ -547,8 +589,8 @@ fn binary_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     };
                     values.push(Value::from_int(out));
                 }
-                let name = args.get(var_i).ok_or_else(not_enough_args)?.as_str().to_string();
-                let val = if count == 1 { values.remove(0) } else { Value::from_list(&values) };
+                let val =
+                    if count == 1 { values.remove(0) } else { Value::from_list(&values) };
                 interp.set_var(&name, val)?;
                 sets += 1;
                 var_i += 1;
@@ -557,13 +599,15 @@ fn binary_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             b'q' | b'Q' | b'd' | b'f' | b'r' | b'R' => {
                 let size: usize = if matches!(f.ch, b'd' | b'q' | b'Q') { 8 } else { 4 };
                 let big_endian = matches!(f.ch, b'Q' | b'R');
+                let name =
+                    args.get(var_i).ok_or_else(not_enough_args)?.as_str().to_string();
                 let count = if f.star {
                     (data.len() - pos) / size
                 } else {
                     f.count.unwrap_or(1)
                 };
-                if pos + size * count > data.len() {
-                    continue;
+                if data.len() - pos < count.saturating_mul(size) {
+                    break;
                 }
                 let mut values: Vec<Value> = Vec::with_capacity(count);
                 for g in 0..count {
@@ -584,8 +628,8 @@ fn binary_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     };
                     values.push(Value::from_float(v));
                 }
-                let name = args.get(var_i).ok_or_else(not_enough_args)?.as_str().to_string();
-                let val = if count == 1 { values.remove(0) } else { Value::from_list(&values) };
+                let val =
+                    if count == 1 { values.remove(0) } else { Value::from_list(&values) };
                 interp.set_var(&name, val)?;
                 sets += 1;
                 var_i += 1;
@@ -633,99 +677,132 @@ fn binary_encode(args: &[Value]) -> Result<Value> {
             Ok(Value::from_str(&s))
         }
         "base64" => {
-            const USAGE: &str =
-                "encode base64 ?-maxlen len? ?-wrapchar char? data";
-            let mut maxlen: usize = 0;
-            let mut wrapchar = "\n".to_string();
-            let mut i = 1;
-            while i < args.len() {
-                let a = args[i].as_str();
-                if let Some(opt) = a.strip_prefix('-') {
-                    match resolve_prefix(opt, &["maxlen", "wrapchar"]) {
-                        Some("maxlen") => {
-                            i += 1;
-                            maxlen = args
-                                .get(i)
-                                .and_then(|v| v.as_int())
-                                .ok_or_else(|| {
-                                    Error::runtime(
-                                        format!(
-                                            "expected integer but got \"{}\"",
-                                            args.get(i)
-                                                .map(|v| v.as_str())
-                                                .unwrap_or("")
-                                        ),
-                                        ErrorCode::Generic,
-                                    )
-                                })? as usize;
-                        }
-                        Some("wrapchar") => {
-                            i += 1;
-                            wrapchar = args
-                                .get(i)
-                                .map(|v| v.as_str().to_string())
-                                .ok_or_else(|| {
-                                    Error::runtime(
-                                        "missing wrapchar argument",
-                                        ErrorCode::Generic,
-                                    )
-                                })?;
-                        }
-                        _ => {
-                            return Err(Error::runtime(
-                                format!(
-                                    "bad option \"{}\": must be -maxlen or -wrapchar",
-                                    a
-                                ),
-                                ErrorCode::Generic,
-                            ));
-                        }
-                    }
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            if args.len() - i != 1 {
+            if args.len() < 2 || args.len() % 2 != 0 {
                 return Err(Error::wrong_args_with_usage(
-                    "binary", i + 1, args.len(), USAGE,
+                    "binary", 2, args.len(),
+                    "encode base64 ?-maxlen len? ?-wrapchar char? data",
                 ));
             }
-            let data = string_to_bytes(args[i].as_str());
+            let (maxlen, wrapchar) = parse_encode_opts(args, false)?;
+            let data = string_to_bytes(args[args.len() - 1].as_str());
             let encoded = base64_encode(&data);
             Ok(Value::from_str(&wrap_encoded(&encoded, maxlen, &wrapchar)))
         }
         _ => {
             // uuencode
-            if args.len() != 2 {
+            if args.len() < 2 || args.len() % 2 != 0 {
                 return Err(Error::wrong_args_with_usage(
                     "binary", 2, args.len(),
-                    "encode uuencode data",
+                    "encode uuencode ?-maxlen len? ?-wrapchar char? data",
                 ));
             }
-            let data = string_to_bytes(args[1].as_str());
+            let (line_length, wrapchar) = parse_encode_opts(args, true)?;
+            // Bytes of raw data encoded per line (line_length includes the
+            // leading count character).
+            let raw_len = (line_length - 1) * 3 / 4;
+            let data = string_to_bytes(args[args.len() - 1].as_str());
             let mut out = String::new();
-            for chunk in data.chunks(45) {
-                let n = chunk.len();
-                out.push(uu_char(n as u64));
-                let groups = (n * 8).div_ceil(6);
-                for g in 0..groups {
-                    let mut v: u64 = 0;
-                    for b in 0..6 {
-                        let bit_idx = g * 6 + b;
-                        v <<= 1;
-                        if bit_idx < n * 8 {
-                            let byte = chunk[bit_idx / 8];
-                            v |= ((byte >> (7 - (bit_idx % 8))) & 1) as u64;
-                        }
+            let mut offset = 0;
+            while offset < data.len() {
+                let line_bytes = raw_len.min(data.len() - offset);
+                out.push(uu_char(line_bytes as u64));
+                let mut n: u64 = 0;
+                let mut bits = 0u32;
+                for _ in 0..line_bytes {
+                    n = (n << 8) | data[offset] as u64;
+                    offset += 1;
+                    bits += 8;
+                    while bits > 6 {
+                        bits -= 6;
+                        out.push(uu_char((n >> bits) & 0x3F));
                     }
-                    out.push(uu_char(v));
                 }
-                out.push('\n');
+                if bits > 0 {
+                    out.push(uu_char(((n << 8) >> (bits + 2)) & 0x3F));
+                }
+                out.push_str(&wrapchar);
             }
             Ok(Value::from_str(&out))
         }
     }
+}
+
+/// Parse `-maxlen`/`-wrapchar` option pairs (exact option names, per
+/// tclBinary.c BinaryEncode64/Uu).  For base64 the length is a count of
+/// encoded characters per line (negative → error); for uuencode it is the
+/// total line length including the count character, restricted to 5..85 and
+/// snapped to 5, 9, 13 …, and the wrapchar may only contain \t \v \f \r \n.
+fn parse_encode_opts(args: &[Value], uu: bool) -> Result<(usize, String)> {
+    let mut maxlen: i64 = if uu { 61 } else { 0 };
+    let mut wrapchar = "\n".to_string();
+    let mut i = 1;
+    while i < args.len() - 1 {
+        match args[i].as_str() {
+            "-maxlen" => {
+                let v = args
+                    .get(i + 1)
+                    .and_then(|v| v.as_int())
+                    .ok_or_else(|| {
+                        Error::runtime(
+                            format!(
+                                "expected integer but got \"{}\"",
+                                args.get(i + 1).map(|v| v.as_str()).unwrap_or("")
+                            ),
+                            ErrorCode::Generic,
+                        )
+                    })?;
+                if uu {
+                    if !(5..=85).contains(&v) {
+                        return Err(Error::runtime(
+                            "line length out of range",
+                            ErrorCode::Generic,
+                        ));
+                    }
+                    maxlen = ((v - 1) & !3) + 1;
+                } else {
+                    if v < 0 {
+                        return Err(Error::runtime(
+                            "line length out of range",
+                            ErrorCode::Generic,
+                        ));
+                    }
+                    maxlen = v;
+                }
+            }
+            "-wrapchar" => {
+                wrapchar = args
+                    .get(i + 1)
+                    .map(|v| v.as_str().to_string())
+                    .ok_or_else(|| {
+                        Error::runtime("missing wrapchar argument", ErrorCode::Generic)
+                    })?;
+                if uu
+                    && !wrapchar
+                        .chars()
+                        .all(|c| matches!(c, '\t' | '\u{b}' | '\u{c}' | '\r' | '\n'))
+                {
+                    return Err(Error::runtime(
+                        "invalid wrapchar; will defeat decoding",
+                        ErrorCode::Generic,
+                    ));
+                }
+            }
+            other => {
+                return Err(Error::runtime(
+                    format!(
+                        "bad option \"{}\": must be -maxlen or -wrapchar",
+                        other
+                    ),
+                    ErrorCode::Generic,
+                ));
+            }
+        }
+        i += 2;
+    }
+    if !uu && wrapchar.is_empty() {
+        maxlen = 0;
+    }
+    Ok((maxlen as usize, wrapchar))
 }
 
 /// uuencode alphabet: value + 0x20, with 0 rendered as '`' (0x60).
@@ -787,123 +864,249 @@ fn binary_decode(args: &[Value]) -> Result<Value> {
                 ErrorCode::Generic,
             )
         })?;
-    let cmd = format!("binary decode {}", sub);
-    let usage = match sub {
-        "hex" => "decode hex ?options? data",
-        "base64" => "decode base64 ?options? data",
-        _ => "decode uuencode ?options? data",
-    };
-    if args.len() != 2 {
+    if args.len() < 2 || args.len() > 3 {
         return Err(Error::wrong_args_with_usage(
-            &cmd, 2, args.len(), usage,
+            "binary", 2, args.len(),
+            &format!("decode {} ?options? data", sub),
         ));
     }
-    let input = args[1].as_str();
+    let mut strict = false;
+    for a in &args[1..args.len() - 1] {
+        match a.as_str() {
+            "-strict" => strict = true,
+            other => {
+                return Err(Error::runtime(
+                    format!("bad option \"{}\": must be -strict", other),
+                    ErrorCode::Generic,
+                ));
+            }
+        }
+    }
+    let input = args[args.len() - 1].as_str();
     let bytes = match sub {
-        "hex" => decode_hex(input)?,
-        "base64" => decode_base64(input),
-        _ => decode_uuencode(input)?,
+        "hex" => decode_hex(input, strict)?,
+        "base64" => decode_base64(input, strict)?,
+        _ => decode_uuencode(input, strict)?,
     };
     Ok(Value::from_str(&bytes_to_string(&bytes)))
 }
 
-fn decode_hex(input: &str) -> Result<Vec<u8>> {
-    let mut nibbles: Vec<u8> = Vec::with_capacity(input.len());
-    for (i, c) in input.chars().enumerate() {
-        match c.to_digit(16) {
-            Some(d) => nibbles.push(d as u8),
-            None => {
-                return Err(Error::runtime(
-                    format!("invalid hexadecimal digit \"{}\" at position {}", c, i),
-                    ErrorCode::Generic,
-                ));
+fn invalid_hex_digit(c: u8, pos: usize) -> Error {
+    Error::runtime(
+        format!(
+            "invalid hexadecimal digit \"{}\" at position {}",
+            c as char, pos
+        ),
+        ErrorCode::Generic,
+    )
+}
+
+fn invalid_char(kind: &str, c: u8, pos: usize) -> Error {
+    Error::runtime(
+        format!("invalid {} character \"{}\" at position {}", kind, c as char, pos),
+        ErrorCode::Generic,
+    )
+}
+
+/// Hex decode: whitespace is skipped, hex digit pairs become bytes, and a
+/// trailing lone nibble is dropped (even with -strict; tclsh 8.6.17).
+fn decode_hex(input: &str, strict: bool) -> Result<Vec<u8>> {
+    let data = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(data.len() / 2 + 1);
+    let mut i = 0;
+    let mut cut = 0usize;
+    while i < data.len() {
+        let mut value: u8 = 0;
+        let mut nib = 0;
+        while nib < 2 {
+            if i >= data.len() {
+                value <<= 4;
+                break;
             }
+            let c = data[i];
+            i += 1;
+            if !(c as char).is_ascii_hexdigit() {
+                if strict || !is_tcl_space(c) {
+                    return Err(invalid_hex_digit(c, i - 1));
+                }
+                continue; // whitespace does not count toward the pair
+            }
+            value = value.wrapping_shl(4) | (c as char).to_digit(16).unwrap() as u8;
+            nib += 1;
         }
+        if nib < 2 {
+            cut += 1;
+        }
+        out.push(value);
     }
-    let mut out = Vec::with_capacity(nibbles.len().div_ceil(2));
-    let mut k = 0;
-    while k + 1 < nibbles.len() {
-        out.push((nibbles[k] << 4) | nibbles[k + 1]);
-        k += 2;
-    }
-    if k < nibbles.len() {
-        out.push(nibbles[k]);
-    }
+    let keep = out.len().saturating_sub(cut);
+    out.truncate(keep);
     Ok(out)
 }
 
-fn decode_base64(input: &str) -> Vec<u8> {
-    // tclsh silently skips whitespace, '=', and any other non-alphabet char.
-    let mut vals: Vec<u8> = Vec::new();
-    for c in input.chars() {
-        let v = match c {
-            'A'..='Z' => c as u32 - 'A' as u32,
-            'a'..='z' => c as u32 - 'a' as u32 + 26,
-            '0'..='9' => c as u32 - '0' as u32 + 52,
-            '+' => 62,
-            '/' => 63,
-            _ => continue,
-        } as u8;
-        vals.push(v);
+/// Base64 decode — port of BinaryDecode64: groups of four alphabet chars;
+/// `=` only cuts within the final group; in non-strict mode any other
+/// character (and padding oddities) is skipped.
+fn decode_base64(input: &str, strict: bool) -> Result<Vec<u8>> {
+    let data = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(data.len() * 3 / 4 + 3);
+    let mut pos = 0;
+    let mut cut = 0usize;
+    while pos < data.len() {
+        let mut value: u32 = 0;
+        let mut i = 0;
+        while i < 4 {
+            let c: u8;
+            if pos < data.len() {
+                c = data[pos];
+                pos += 1;
+            } else if i > 1 {
+                c = b'=';
+            } else {
+                // Input ends 1–2 chars into the group.
+                if strict {
+                    return Err(invalid_char("base64", data[data.len() - 1], data.len() - 1));
+                }
+                cut += 3;
+                break;
+            }
+            if cut > 0 {
+                if c == b'=' && i > 1 {
+                    value <<= 6;
+                    cut += 1;
+                } else if !strict {
+                    i -= 1;
+                } else {
+                    return Err(invalid_char("base64", c, pos - 1));
+                }
+            } else if c.is_ascii_uppercase() {
+                value = (value << 6) | (c - b'A') as u32;
+            } else if c.is_ascii_lowercase() {
+                value = (value << 6) | (c - b'a') as u32 + 26;
+            } else if c.is_ascii_digit() {
+                value = (value << 6) | (c - b'0') as u32 + 52;
+            } else if c == b'+' {
+                value = (value << 6) | 0x3E;
+            } else if c == b'/' {
+                value = (value << 6) | 0x3F;
+            } else if c == b'=' && (!strict || i > 1) {
+                value <<= 6;
+                if i > 0 {
+                    cut += 1;
+                }
+            } else if strict {
+                return Err(invalid_char("base64", c, pos - 1));
+            } else {
+                i -= 1;
+            }
+            i += 1;
+        }
+        out.push((value >> 16) as u8);
+        out.push((value >> 8) as u8);
+        out.push(value as u8);
+        if cut > 0 && pos < data.len() && strict {
+            return Err(invalid_char("base64", data[pos], pos));
+        }
     }
-    let mut out = Vec::with_capacity(vals.len() * 3 / 4);
-    let mut k = 0;
-    while k + 1 < vals.len() {
-        let have = (vals.len() - k).min(4);
-        let mut n: u32 = vals[k] as u32;
-        for j in 1..4 {
-            n = (n << 6) | *vals.get(k + j).unwrap_or(&0) as u32;
-        }
-        out.push((n >> 16) as u8);
-        if have > 2 {
-            out.push((n >> 8) as u8);
-        }
-        if have > 3 {
-            out.push(n as u8);
-        }
-        k += 4;
-    }
-    out
+    let keep = out.len().saturating_sub(cut);
+    out.truncate(keep);
+    Ok(out)
 }
 
-fn decode_uuencode(input: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    for line in input.split('\n') {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if line.is_empty() {
-            continue;
+/// Uuencode decode — port of BinaryDecodeUu.  Each line starts with a
+/// length character (value (c-32)&0x3F, chars 0x20..=0x60 valid); group
+/// characters beyond the input act as zero bytes, so short trailing groups
+/// decode the bytes they still can.  Without -strict invalid characters are
+/// skipped; with -strict they are errors, and a newline inside a group (or
+/// a line that ends short) is "short uuencode data".
+fn decode_uuencode(input: &str, strict: bool) -> Result<Vec<u8>> {
+    let data = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(data.len() * 3 / 4 + 3);
+    let mut pos = 0;
+    let mut line_len: i64 = -1;
+    let group_val = |b: u8| -> u32 { (((b as i32) - 32) & 0x3F) as u32 };
+
+    'outer: while pos < data.len() {
+        let mut d = [0u8; 4];
+        if line_len < 0 {
+            // Read the line length character.
+            let c = loop {
+                if pos >= data.len() {
+                    break 'outer;
+                }
+                let c = data[pos];
+                pos += 1;
+                if !(32..=96).contains(&c) {
+                    if strict || !is_tcl_space(c) {
+                        return Err(invalid_char("uuencode", c, pos - 1));
+                    }
+                    continue;
+                }
+                break c;
+            };
+            line_len = i64::from(((c as i32) - 32) & 0x3F);
         }
-        let chars: Vec<char> = line.chars().collect();
-        let len = ((chars[0] as u32).wrapping_sub(0x20) & 0x3f) as usize;
-        let mut vals: Vec<u8> = Vec::with_capacity(chars.len().saturating_sub(1));
-        for (i, &c) in chars.iter().enumerate().skip(1) {
-            let u = (c as u32).wrapping_sub(0x20);
-            if u > 0x3f {
-                return Err(Error::runtime(
-                    format!("invalid uuencode character \"{}\" at position {}", c, i - 1),
-                    ErrorCode::Generic,
-                ));
+        // Read one four-character grouping.
+        let mut i = 0;
+        while i < 4 {
+            if pos >= data.len() {
+                break;
             }
-            vals.push(u as u8);
+            let c = data[pos];
+            pos += 1;
+            d[i] = c;
+            if (32..=96).contains(&c) {
+                i += 1;
+                continue;
+            }
+            if strict {
+                if !is_tcl_space(c) {
+                    return Err(invalid_char("uuencode", c, pos - 1));
+                }
+                if c == b'\n' {
+                    return Err(Error::runtime(
+                        "short uuencode data",
+                        ErrorCode::Generic,
+                    ));
+                }
+            }
+            // invalid char skipped: d[i] is rewritten by the next char
         }
-        let need = len.div_ceil(3) * 4;
-        if vals.len() < need {
-            return Err(Error::runtime(
-                "uuencode line is truncated",
-                ErrorCode::Generic,
-            ));
-        }
-        for g in 0..len.div_ceil(3) {
-            let n: u32 = ((vals[g * 4] as u32) << 18)
-                | ((vals[g * 4 + 1] as u32) << 12)
-                | ((vals[g * 4 + 2] as u32) << 6)
-                | (vals[g * 4 + 3] as u32);
-            for b in 0..3 {
-                if g * 3 + b < len {
-                    out.push((n >> (16 - 8 * b)) as u8);
+        // Translate the grouping into up to three bytes.
+        if line_len > 0 {
+            out.push((group_val(d[0]) << 2 | group_val(d[1]) >> 4) as u8);
+            line_len -= 1;
+            if line_len > 0 {
+                out.push((group_val(d[1]) << 4 | group_val(d[2]) >> 2) as u8);
+                line_len -= 1;
+                if line_len > 0 {
+                    out.push((group_val(d[2]) << 6 | group_val(d[3])) as u8);
+                    line_len -= 1;
                 }
             }
         }
+        // At the end of a line, skip until a newline (a valid character
+        // rewinds and starts the next line — newline-less concatenation).
+        if line_len == 0 && pos < data.len() {
+            line_len = -1;
+            while pos < data.len() {
+                let c = data[pos];
+                pos += 1;
+                if c == b'\n' {
+                    break;
+                }
+                if (32..=96).contains(&c) {
+                    pos -= 1;
+                    break;
+                }
+                if strict || !is_tcl_space(c) {
+                    return Err(invalid_char("uuencode", c, pos - 1));
+                }
+            }
+        }
+    }
+    if line_len > 0 && strict {
+        return Err(Error::runtime("short uuencode data", ErrorCode::Generic));
     }
     Ok(out)
 }

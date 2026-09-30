@@ -561,9 +561,7 @@ pub fn cmd_file(_interp: &mut Interp, _args: &[Value]) -> Result<Value> {
 /// pass through, a NaN double is a hard error ("floating point value is
 /// Not a Number", TCL VALUE DOUBLE NAN), anything else is
 /// "expected floating-point number but got ...".
-fn fmt_double_arg(interp: &mut Interp, args: &[Value], arg_idx: &mut usize) -> Result<f64> {
-    let v = &args[*arg_idx];
-    *arg_idx += 1;
+fn fmt_double_value(interp: &mut Interp, v: &Value) -> Result<f64> {
     if let Some(i) = v.as_int() {
         return Ok(i as f64);
     }
@@ -604,231 +602,517 @@ fn inf_text(_neg: bool, upper: bool) -> String {
     }
 }
 
+/// Strict Tcl integer parse for format conversions: after trimming
+/// whitespace the whole string must be a valid Tcl integer -- optional
+/// sign, then 0x/0b/0o radix forms, legacy leading-0 octal, or decimal.
+/// No underscores, no floats. Out-of-range magnitudes keep the low 64
+/// bits (tclsh wraps); the sign is applied in u64 space before the
+/// i64 reinterpret, so -0xffffffffffffffff formats as +1.
+fn parse_tcl_int_strict(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let (digits, radix): (&str, u32) =
+        if let Some(r) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            if r.is_empty() { return None; }
+            (r, 16)
+        } else if let Some(r) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+            if r.is_empty() { return None; }
+            (r, 2)
+        } else if let Some(r) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+            if r.is_empty() { return None; }
+            (r, 8)
+        } else if body.len() > 1 && body.starts_with('0') {
+            // Legacy leading-0 octal: "017"; "08" fails the digit check.
+            (&body[1..], 8)
+        } else {
+            (body, 10)
+        };
+    let mut mag: u64 = 0;
+    for c in digits.bytes() {
+        let d = (c as char).to_digit(radix)?;
+        mag = mag.wrapping_mul(radix as u64).wrapping_add(d as u64);
+    }
+    Some(if neg {
+        (mag.wrapping_neg()) as i64
+    } else {
+        mag as i64
+    })
+}
+
+/// Upper bound for widths/precisions from the format string or '*' args.
+/// C saturates at INT_MAX and then really allocates that many bytes; the
+/// corpus never exercises widths beyond double digits, so rtcl caps at
+/// 1<<20 to keep a runaway "%99999999999d" from exhausting memory.
+const FMT_WIDTH_CAP: usize = 1 << 20;
+
+/// Parse a width/precision digit run, saturating at FMT_WIDTH_CAP.
+fn parse_capped_digits(s: &str) -> usize {
+    match s.parse::<u64>() {
+        Ok(v) => v.min(FMT_WIDTH_CAP as u64) as usize,
+        Err(_) => FMT_WIDTH_CAP,
+    }
+}
+
 pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args("format", 2, args.len()));
     }
     let fmt = args[1].as_str();
     let mut result = String::new();
-    let mut arg_idx = 2;
+    let mut arg_idx = 2usize;
+    let mut seen_xpg = false;
+    let mut seen_seq = false;
     let bytes = fmt.as_bytes();
     let len = bytes.len();
-    let mut pos = 0;
+    let mut pos = 0usize;
+
+    macro_rules! fmt_err {
+        ($msg:expr, $code:expr) => {{
+            super::list::set_error_code(interp, $code);
+            Err(Error::ControlFlow {
+                kind: crate::error::ControlFlow::Error,
+                value: Some(Value::from_str(&$msg)),
+                level: 1,
+                error_info: None,
+                error_code: Some($code.to_string()),
+            })
+        }};
+    }
+    macro_rules! int_arg {
+        ($arg:expr) => {
+            match parse_tcl_int_strict($arg.as_str()) {
+                Some(v) => v,
+                None => {
+                    let msg = format!("expected integer but got \"{}\"", $arg.as_str());
+                    return fmt_err!(msg, "TCL VALUE NUMBER");
+                }
+            }
+        };
+    }
+    macro_rules! int_star_arg {
+        ($arg:expr) => {
+            match parse_tcl_int_strict($arg.as_str()) {
+                Some(v) => v,
+                None => {
+                    let msg = format!("expected integer but got \"{}\"", $arg.as_str());
+                    return fmt_err!(msg, "TCL VALUE INTEGER");
+                }
+            }
+        };
+    }
+    macro_rules! not_enough {
+        () => {
+            return fmt_err!(
+                "not enough arguments for all format specifiers",
+                "TCL FORMAT FIELDVARMISMATCH"
+            );
+        };
+    }
+    macro_rules! mixing {
+        () => {
+            return fmt_err!(
+                "cannot mix \"%\" and \"%n$\" conversion specifiers",
+                "TCL FORMAT MIXEDSPECTYPES"
+            );
+        };
+    }
 
     while pos < len {
         if bytes[pos] != b'%' {
-            result.push(bytes[pos] as char);
-            pos += 1;
+            // Copy literal text up to the next '%' (UTF-8 safe).
+            let next = fmt[pos..].find('%').map_or(len, |off| pos + off);
+            result.push_str(&fmt[pos..next]);
+            pos = next;
             continue;
         }
-        pos += 1; // skip '%'
-        if pos >= len { break; }
-
-        // %%
+        pos += 1;
+        if pos >= len {
+            // A trailing bare '%' still reserves an argument for the
+            // pending conversion before tclsh complains.
+            if arg_idx >= args.len() {
+                not_enough!();
+            }
+            return fmt_err!(
+                "format string ended in middle of field specifier",
+                "TCL FORMAT INCOMPLETE"
+            );
+        }
         if bytes[pos] == b'%' {
             result.push('%');
             pos += 1;
             continue;
         }
 
-        // Parse flags: - + 0 space #
+        // Flags (only before the width).
         let mut flag_minus = false;
         let mut flag_plus = false;
         let mut flag_zero = false;
         let mut flag_space = false;
         let mut flag_hash = false;
-        loop {
-            if pos >= len { break; }
-            match bytes[pos] {
-                b'-' => { flag_minus = true; pos += 1; }
-                b'+' => { flag_plus = true; pos += 1; }
-                b'0' => { flag_zero = true; pos += 1; }
-                b' ' => { flag_space = true; pos += 1; }
-                b'#' => { flag_hash = true; pos += 1; }
-                _ => break,
+        macro_rules! parse_flags {
+            () => {
+                loop {
+                    match bytes.get(pos) {
+                        Some(b'-') => { flag_minus = true; pos += 1; }
+                        Some(b'+') => { flag_plus = true; pos += 1; }
+                        // A '0' directly followed by '$' starts the XPG
+                        // index ("%0$d"), not the zero flag.
+                        Some(b'0') if bytes.get(pos + 1) == Some(&b'$') => break,
+                        Some(b'0') => { flag_zero = true; pos += 1; }
+                        Some(b' ') => { flag_space = true; pos += 1; }
+                        Some(b'#') => { flag_hash = true; pos += 1; }
+                        _ => break,
+                    }
+                }
+            };
+        }
+        parse_flags!();
+
+        // Width: digits (possibly the XPG "%n$" index) or '*'.
+        let mut xpg: Option<usize> = None;
+        let mut width: Option<usize> = None;
+        let mut star_width = false;
+        let mut star_prec = false;
+        let start = pos;
+        while pos < len && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        if pos > start {
+            if pos < len && bytes[pos] == b'$' {
+                pos += 1;
+                xpg = Some(
+                    core::str::from_utf8(&bytes[start..pos - 1])
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(0),
+                );
+                if seen_seq {
+                    mixing!();
+                }
+                seen_xpg = true;
+                // Flags may follow the XPG index ("%1$+d").
+                parse_flags!();
+            } else {
+                width = Some(parse_capped_digits(
+                    core::str::from_utf8(&bytes[start..pos]).unwrap_or("0"),
+                ));
+            }
+        }
+        if xpg.is_some() && width.is_none() {
+            // A width digit run may follow the XPG index ("%2$5d").
+            let wstart = pos;
+            while pos < len && bytes[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            if pos > wstart {
+                width = Some(parse_capped_digits(
+                    core::str::from_utf8(&bytes[wstart..pos]).unwrap_or("0"),
+                ));
+            }
+        }
+        if width.is_none() && pos < len && bytes[pos] == b'*' {
+            pos += 1;
+            star_width = true;
+            if xpg.is_none() {
+                if seen_xpg {
+                    mixing!();
+                }
+                seen_seq = true;
+            }
+            // A digit run after '*' is consumed and discarded; a '$'
+            // after it falls through to the conversion-char check.
+            while pos < len && bytes[pos].is_ascii_digit() {
+                pos += 1;
             }
         }
 
-        // Parse width (number or *)
-        let width: Option<usize> = if pos < len && bytes[pos] == b'*' {
-            pos += 1;
-            if arg_idx < args.len() {
-                let w = args[arg_idx].as_int().unwrap_or(0);
-                arg_idx += 1;
-                Some(w.unsigned_abs() as usize)
-            } else {
-                None
-            }
-        } else {
-            let start = pos;
-            while pos < len && bytes[pos].is_ascii_digit() { pos += 1; }
-            if pos > start {
-                Some(core::str::from_utf8(&bytes[start..pos]).unwrap_or("0").parse().unwrap_or(0))
-            } else {
-                None
-            }
-        };
-
-        // Parse precision: .number or .*
-        let precision: Option<usize> = if pos < len && bytes[pos] == b'.' {
+        // Precision: '.' then digits (empty run -> 0) or '*'.
+        let mut precision: Option<usize> = None;
+        if pos < len && bytes[pos] == b'.' {
             pos += 1;
             if pos < len && bytes[pos] == b'*' {
                 pos += 1;
-                if arg_idx < args.len() {
-                    let p = args[arg_idx].as_int().unwrap_or(0);
-                    arg_idx += 1;
-                    Some(p.max(0) as usize)
-                } else {
-                    Some(0)
+                star_prec = true;
+                if xpg.is_none() {
+                    if seen_xpg {
+                        mixing!();
+                    }
+                    seen_seq = true;
+                }
+                while pos < len && bytes[pos].is_ascii_digit() {
+                    pos += 1;
                 }
             } else {
-                let start = pos;
-                while pos < len && bytes[pos].is_ascii_digit() { pos += 1; }
-                if pos > start {
-                    Some(core::str::from_utf8(&bytes[start..pos]).unwrap_or("0").parse().unwrap_or(0))
-                } else {
-                    Some(0)
+                let pstart = pos;
+                while pos < len && bytes[pos].is_ascii_digit() {
+                    pos += 1;
                 }
+                precision = Some(if pos > pstart {
+                    parse_capped_digits(core::str::from_utf8(&bytes[pstart..pos]).unwrap_or("0"))
+                } else {
+                    0
+                });
             }
-        } else {
-            None
-        };
-
-        // Skip length modifiers (l, h, ll, etc.)
-        while pos < len && matches!(bytes[pos], b'l' | b'h' | b'L') { pos += 1; }
-
-        if pos >= len { break; }
-        let spec = bytes[pos] as char;
-        pos += 1;
-
-        if arg_idx >= args.len() && spec != '%' {
-            return Err(Error::runtime(
-                "not enough arguments for all format specifiers",
-                crate::error::ErrorCode::Generic,
-            ));
         }
 
-        let formatted = match spec {
-            's' => {
-                let s = args[arg_idx].as_str().to_string();
-                arg_idx += 1;
-                if let Some(prec) = precision {
-                    if prec < s.len() { s[..prec].to_string() } else { s }
-                } else { s }
+        // Size modifiers: one 'h' or a run of 'l's; anything further is
+        // treated as the conversion character.
+        let mut size_h = false;
+        if pos < len && bytes[pos] == b'l' {
+            while pos < len && bytes[pos] == b'l' {
+                pos += 1;
             }
-            'd' | 'i' => {
-                let v = args[arg_idx].as_int().unwrap_or(0);
+        } else if pos < len && bytes[pos] == b'h' {
+            size_h = true;
+            pos += 1;
+        }
+
+        // Conversion character.
+        if pos >= len {
+            if arg_idx >= args.len() {
+                not_enough!();
+            }
+            return fmt_err!(
+                "format string ended in middle of field specifier",
+                "TCL FORMAT INCOMPLETE"
+            );
+        }
+        let ch = fmt[pos..].chars().next().unwrap();
+        pos += ch.len_utf8();
+
+        // Argument selection, tclsh-style: sequential specs consume
+        // arg_idx as they go; an XPG spec re-indexes as argvIndex = n-1
+        // and any star width/precision consumes argv[argvIndex++] before
+        // the value is taken.
+        let arg: &Value;
+        match xpg {
+            Some(n) => {
+                // Availability (index in range) is checked before the
+                // conversion character is validated ("%5%" with no args
+                // -> not enough; with args -> bad field specifier).
+                if n < 1 || n - 1 >= args.len().saturating_sub(2) {
+                    return fmt_err!("\"%n$\" argument index out of range", "TCL FORMAT INDEXRANGE");
+                }
+                if !matches!(
+                    ch,
+                    'd' | 'i' | 'u' | 'b' | 'o' | 'x' | 'X' | 'c' | 's' | 'e' | 'E' | 'f'
+                        | 'g' | 'G'
+                ) {
+                    let msg = format!("bad field specifier \"{}\"", ch);
+                    return fmt_err!(msg, "TCL FORMAT BADTYPE");
+                }
+                let mut idx = n - 1;
+                if star_width {
+                    let w = int_star_arg!(args[idx + 2]);
+                    if w < 0 {
+                        flag_minus = true;
+                        width = Some((w.unsigned_abs() as usize).min(FMT_WIDTH_CAP));
+                    } else {
+                        width = Some((w as usize).min(FMT_WIDTH_CAP));
+                    }
+                    idx += 1;
+                }
+                if star_prec {
+                    let pv = int_star_arg!(args[idx + 2]);
+                    precision = Some((pv.max(0) as usize).min(FMT_WIDTH_CAP));
+                    idx += 1;
+                }
+                if idx >= args.len() - 2 {
+                    return fmt_err!("\"%n$\" argument index out of range", "TCL FORMAT INDEXRANGE");
+                }
+                arg = &args[idx + 2];
+            }
+            None => {
+                if seen_xpg {
+                    mixing!();
+                }
+                if arg_idx >= args.len() {
+                    not_enough!();
+                }
+                if !matches!(
+                    ch,
+                    'd' | 'i' | 'u' | 'b' | 'o' | 'x' | 'X' | 'c' | 's' | 'e' | 'E' | 'f'
+                        | 'g' | 'G'
+                ) {
+                    let msg = format!("bad field specifier \"{}\"", ch);
+                    return fmt_err!(msg, "TCL FORMAT BADTYPE");
+                }
+                if star_width {
+                    if arg_idx >= args.len() {
+                        not_enough!();
+                    }
+                    let w = int_star_arg!(args[arg_idx]);
+                    arg_idx += 1;
+                    if w < 0 {
+                        flag_minus = true;
+                        width = Some((w.unsigned_abs() as usize).min(FMT_WIDTH_CAP));
+                    } else {
+                        width = Some((w as usize).min(FMT_WIDTH_CAP));
+                    }
+                }
+                if star_prec {
+                    if arg_idx >= args.len() {
+                        not_enough!();
+                    }
+                    let pv = int_star_arg!(args[arg_idx]);
+                    arg_idx += 1;
+                    precision = Some((pv.max(0) as usize).min(FMT_WIDTH_CAP));
+                }
+                if arg_idx >= args.len() {
+                    not_enough!();
+                }
+                arg = &args[arg_idx];
                 arg_idx += 1;
+                seen_seq = true;
+            }
+        }
+
+        let formatted = match ch {
+            's' => match precision {
+                Some(p) => arg.as_str().chars().take(p).collect::<String>(),
+                None => arg.as_str().to_string(),
+            },
+            'd' | 'i' => {
+                let mut v = int_arg!(arg);
+                if size_h {
+                    v = (v as i16) as i64;
+                }
                 format_int(v, 10, false, flag_plus, flag_space, flag_hash)
             }
             'u' => {
-                let v = args[arg_idx].as_int().unwrap_or(0) as u64;
-                arg_idx += 1;
+                let v = int_arg!(arg);
+                let v = if size_h { (v as u16) as u64 } else { v as u64 };
                 v.to_string()
             }
             'x' => {
-                let v = args[arg_idx].as_int().unwrap_or(0);
-                arg_idx += 1;
-                let s = format!("{:x}", v);
+                let v = int_arg!(arg);
+                let s = if size_h {
+                    format!("{:x}", v as u16)
+                } else {
+                    format!("{:x}", v)
+                };
                 if flag_hash { format!("0x{}", s) } else { s }
             }
             'X' => {
-                let v = args[arg_idx].as_int().unwrap_or(0);
-                arg_idx += 1;
-                let s = format!("{:X}", v);
+                let v = int_arg!(arg);
+                let s = if size_h {
+                    format!("{:X}", v as u16)
+                } else {
+                    format!("{:X}", v)
+                };
                 if flag_hash { format!("0X{}", s) } else { s }
             }
             'o' => {
-                let v = args[arg_idx].as_int().unwrap_or(0);
-                arg_idx += 1;
-                let s = format!("{:o}", v);
+                let v = int_arg!(arg);
+                let s = if size_h {
+                    format!("{:o}", v as u16)
+                } else {
+                    format!("{:o}", v)
+                };
                 if flag_hash && !s.starts_with('0') { format!("0{}", s) } else { s }
             }
             'b' => {
-                let v = args[arg_idx].as_int().unwrap_or(0);
-                arg_idx += 1;
-                format!("{:b}", v)
-            }
-            'f' => {
-                let v = fmt_double_arg(interp, args, &mut arg_idx)?;
-                let s = if v.is_infinite() {
-                    inf_text(v.is_sign_negative(), false)
+                let v = int_arg!(arg);
+                let s = if size_h {
+                    format!("{:b}", v as u16)
                 } else {
-                    format!("{:.*}", precision.unwrap_or(6), v.abs())
+                    format!("{:b}", v)
                 };
-                apply_sign(v, &s, flag_plus, flag_space)
-            }
-            'e' => {
-                let v = fmt_double_arg(interp, args, &mut arg_idx)?;
-                let s = if v.is_infinite() {
-                    inf_text(v.is_sign_negative(), false)
-                } else {
-                    format_exp(v.abs(), precision.unwrap_or(6), false)
-                };
-                apply_sign(v, &s, flag_plus, flag_space)
-            }
-            'E' => {
-                let v = fmt_double_arg(interp, args, &mut arg_idx)?;
-                let s = if v.is_infinite() {
-                    inf_text(v.is_sign_negative(), true)
-                } else {
-                    format_exp(v.abs(), precision.unwrap_or(6), true)
-                };
-                apply_sign(v, &s, flag_plus, flag_space)
-            }
-            'g' => {
-                let v = fmt_double_arg(interp, args, &mut arg_idx)?;
-                let s = if v.is_infinite() {
-                    inf_text(v.is_sign_negative(), false)
-                } else {
-                    format_g(v.abs(), precision.unwrap_or(6).max(1), false, flag_hash)
-                };
-                apply_sign(v, &s, flag_plus, flag_space)
-            }
-            'G' => {
-                let v = fmt_double_arg(interp, args, &mut arg_idx)?;
-                let s = if v.is_infinite() {
-                    inf_text(v.is_sign_negative(), true)
-                } else {
-                    format_g(v.abs(), precision.unwrap_or(6).max(1), true, flag_hash)
-                };
-                apply_sign(v, &s, flag_plus, flag_space)
+                if flag_hash { format!("0b{}", s) } else { s }
             }
             'c' => {
-                let v = args[arg_idx].as_int().unwrap_or(0) as u32;
-                arg_idx += 1;
-                char::from_u32(v).map_or(String::new(), |c| c.to_string())
+                let v = int_arg!(arg);
+                let cp = if size_h { v as u16 as u32 } else { v as u32 };
+                char::from_u32(cp).unwrap_or('\u{FFFD}').to_string()
             }
-            _ => {
-                format!("%{}", spec)
+            'f' => {
+                let v = fmt_double_value(interp, arg)?;
+                let prec = precision.unwrap_or(6);
+                let s = if v.is_infinite() {
+                    inf_text(v.is_sign_negative(), false)
+                } else {
+                    let mut s = format!("{:.*}", prec, v.abs());
+                    if flag_hash && prec == 0 {
+                        s.push('.');
+                    }
+                    s
+                };
+                apply_sign(v, &s, flag_plus, flag_space)
             }
+            'e' | 'E' => {
+                let v = fmt_double_value(interp, arg)?;
+                let upper = ch == 'E';
+                let s = if v.is_infinite() {
+                    inf_text(v.is_sign_negative(), upper)
+                } else {
+                    format_exp(v.abs(), precision.unwrap_or(6), upper, flag_hash)
+                };
+                apply_sign(v, &s, flag_plus, flag_space)
+            }
+            'g' | 'G' => {
+                let v = fmt_double_value(interp, arg)?;
+                let upper = ch == 'G';
+                let s = if v.is_infinite() {
+                    inf_text(v.is_sign_negative(), upper)
+                } else {
+                    format_g(v.abs(), precision.unwrap_or(6).max(1), upper, flag_hash)
+                };
+                apply_sign(v, &s, flag_plus, flag_space)
+            }
+            _ => unreachable!(),
         };
 
-        // Apply width and alignment
+        // Width padding, by characters. Observed tclsh matrix: with '0'
+        // and no infinity, integers zero-fill right (sign first, '-'
+        // ignored), strings/chars zero-fill left when '-' is present
+        // (right otherwise), and floats zero-fill right unless '-' is
+        // given (then left-justify with spaces). Without '0' or for
+        // infinity results the fill is spaces.
         let w = width.unwrap_or(0);
-        if w > formatted.len() {
-            let pad = w - formatted.len();
-            let fill = if flag_zero
-                && !flag_minus
-                && !matches!(spec, 's' | 'c')
-                && !formatted.contains("inf")
-                && !formatted.contains("INF")
-            {
-                '0'
-            } else {
-                ' '
-            };
-            if flag_minus {
+        let disp = formatted.chars().count();
+        if w > disp {
+            let pad = w - disp;
+            let is_str = matches!(ch, 's' | 'c');
+            let is_float = matches!(ch, 'f' | 'e' | 'E' | 'g' | 'G');
+            let is_inf = formatted.contains("inf") || formatted.contains("INF");
+            let zero_left = is_str && flag_minus;
+            if flag_zero && !is_inf && !(is_float && flag_minus) {
+                if zero_left {
+                    result.push_str(&formatted);
+                    for _ in 0..pad {
+                        result.push('0');
+                    }
+                } else if formatted.starts_with('-')
+                    || formatted.starts_with('+')
+                    || formatted.starts_with(' ')
+                {
+                    let (sign, rest) = formatted.split_at(1);
+                    result.push_str(sign);
+                    for _ in 0..pad {
+                        result.push('0');
+                    }
+                    result.push_str(rest);
+                } else {
+                    for _ in 0..pad {
+                        result.push('0');
+                    }
+                    result.push_str(&formatted);
+                }
+            } else if flag_minus {
                 result.push_str(&formatted);
-                for _ in 0..pad { result.push(' '); }
-            } else if fill == '0' && (formatted.starts_with('-') || formatted.starts_with('+') || formatted.starts_with(' ')) {
-                // Pad zeros after sign
-                let (sign, rest) = formatted.split_at(1);
-                result.push_str(sign);
-                for _ in 0..pad { result.push('0'); }
-                result.push_str(rest);
+                for _ in 0..pad {
+                    result.push(' ');
+                }
             } else {
-                for _ in 0..pad { result.push(fill); }
+                for _ in 0..pad {
+                    result.push(' ');
+                }
                 result.push_str(&formatted);
             }
         } else {
@@ -860,15 +1144,19 @@ fn apply_sign(v: f64, abs_str: &str, plus: bool, space: bool) -> String {
     }
 }
 
-fn format_exp(v: f64, prec: usize, upper: bool) -> String {
+fn format_exp(v: f64, prec: usize, upper: bool, hash: bool) -> String {
     // Rust's {:.*e} is correctly rounded; reassemble with C's exponent
-    // layout (sign always present, at least two digits).
+    // layout (sign always present, at least two digits). '#' keeps the
+    // decimal point even when the precision is 0 ("1.e+01").
     let s = format!("{:.*e}", prec, v);
     let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
     let expn: i32 = exp.parse().unwrap_or(0);
     let e_char = if upper { 'E' } else { 'e' };
-    let mut out = String::with_capacity(mant.len() + 5);
+    let mut out = String::with_capacity(mant.len() + 6);
     out.push_str(mant);
+    if hash && !mant.contains('.') {
+        out.push('.');
+    }
     out.push(e_char);
     if expn < 0 {
         out.push('-');
@@ -930,7 +1218,7 @@ fn format_g(v: f64, prec: usize, upper: bool, hash: bool) -> String {
             .and_then(|(_, e)| e.parse().ok())
             .unwrap_or(0);
         if exp < -4 || exp >= prec as i32 {
-            let s = format_exp(v, prec.saturating_sub(1), upper);
+            let s = format_exp(v, prec.saturating_sub(1), upper, hash);
             if hash {
                 s
             } else {

@@ -1,0 +1,5 @@
+puts "4.11: [format "%-020f %020f" -9.99996 -9.99996]"
+puts "4.13: [format "%.0f %#.0f" -9.99996 9.99996]"
+puts "15.4: [format %05c 61]"
+puts "11.4: [format {%2$d %1$d} 4 5]"
+puts "11.8: [format {%1$d %d} 4 5]"

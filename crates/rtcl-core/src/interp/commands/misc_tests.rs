@@ -894,3 +894,316 @@ fn test_scan_result_shapes() {
         "3"
     );
 }
+
+#[test]
+fn test_format_strict_errors() {
+    let mut interp = Interp::new();
+    // strict integer argument
+    let r = interp
+        .eval("catch {format %d 2a} m; list $m [set ::errorCode]")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "{expected integer but got \"2a\"} {TCL VALUE NUMBER}"
+    );
+    // * width from args must be an integer (TCL VALUE INTEGER)
+    let r = interp
+        .eval("catch {format %*d x 3} m; list $m [set ::errorCode]")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "{expected integer but got \"x\"} {TCL VALUE INTEGER}"
+    );
+    // *.*: precision arg also strict
+    let r = interp
+        .eval("catch {format %*.*f 2 xyz 3} m; list $m")
+        .unwrap();
+    assert_eq!(r.as_str(), "{expected integer but got \"xyz\"}");
+    // bad conversion char
+    let r = interp
+        .eval("catch {format %q x} m; list $m [set ::errorCode]")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "{bad field specifier \"q\"} {TCL FORMAT BADTYPE}"
+    );
+    // '-' after '.' is a bad field specifier
+    let r = interp
+        .eval(r#"catch {format "a%.-2sa" foobarbaz} m; set m"#)
+        .unwrap();
+    assert_eq!(r.as_str(), "bad field specifier \"-\"");
+    // flags after width are a bad field specifier
+    let r = interp
+        .eval("catch {format {%5-d} 42} m; set m")
+        .unwrap();
+    assert_eq!(r.as_str(), "bad field specifier \"-\"");
+    // trailing % with no args left -> not enough arguments
+    let r = interp
+        .eval("catch {format ab%} m; list $m [set ::errorCode]")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "{not enough arguments for all format specifiers} {TCL FORMAT FIELDVARMISMATCH}"
+    );
+    // trailing % with args available -> ended in middle
+    let r = interp
+        .eval("catch {format ab% 12} m; list $m [set ::errorCode]")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "{format string ended in middle of field specifier} {TCL FORMAT INCOMPLETE}"
+    );
+    // %l with an arg -> ended in middle
+    let r = interp
+        .eval("catch {format %l 5} m; set m")
+        .unwrap();
+    assert_eq!(r.as_str(), "format string ended in middle of field specifier");
+    // %5% mid-string -> bad field specifier "%"
+    let r = interp
+        .eval("catch {format {%5%} x} m; set m")
+        .unwrap();
+    assert_eq!(r.as_str(), "bad field specifier \"%\"");
+    // mixing sequential and XPG
+    let r = interp
+        .eval("catch {format {%d %1$d} 1 2} m; list $m [set ::errorCode]")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "{cannot mix \"%\" and \"%n$\" conversion specifiers} {TCL FORMAT MIXEDSPECTYPES}"
+    );
+    // XPG index out of range (message has a literal n)
+    let r = interp
+        .eval("catch {format {%5$d} x} m; list $m [set ::errorCode]")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "{\"%n$\" argument index out of range} {TCL FORMAT INDEXRANGE}"
+    );
+    // strict integer grammar: 08 is invalid octal
+    let r = interp
+        .eval("catch {format %d 08} m; set m")
+        .unwrap();
+    assert_eq!(r.as_str(), "expected integer but got \"08\"");
+}
+
+#[test]
+fn test_format_h_modifier_and_xpg() {
+    let mut interp = Interp::new();
+    // h truncates to 16 bits
+    assert_eq!(interp.eval("format %hd 0xffff").unwrap().as_str(), "-1");
+    assert_eq!(interp.eval("format %hd 0x10000").unwrap().as_str(), "0");
+    assert_eq!(interp.eval("format %hx -2").unwrap().as_str(), "fffe");
+    assert_eq!(interp.eval("format %hu 70000").unwrap().as_str(), "4464");
+    assert_eq!(interp.eval("format %hd -65536").unwrap().as_str(), "0");
+    // l/ll are no-ops
+    assert_eq!(interp.eval("format %ld 5").unwrap().as_str(), "5");
+    assert_eq!(interp.eval("format %lld 5").unwrap().as_str(), "5");
+    // %hs is allowed in format
+    assert_eq!(interp.eval("format {%hs} ab").unwrap().as_str(), "ab");
+    // XPG positional args
+    assert_eq!(
+        interp.eval("format {%2$s-%1$s} a b").unwrap().as_str(),
+        "b-a"
+    );
+    assert_eq!(
+        interp.eval("format {%2$d %1$x} 10 20").unwrap().as_str(),
+        "20 a"
+    );
+    // same arg twice is fine
+    assert_eq!(
+        interp.eval("format {%1$d %1$d} 5").unwrap().as_str(),
+        "5 5"
+    );
+    // flags and width combine with XPG
+    assert_eq!(
+        interp.eval("format {%1$+d} 5").unwrap().as_str(),
+        "+5"
+    );
+    assert_eq!(
+        interp.eval("format {%2$5d} 1 2").unwrap().as_str(),
+        "    2"
+    );
+    // star after XPG -> bad field specifier "$"
+    let r = interp
+        .eval("catch {format {%1$*2$d} 42 6} m; set m")
+        .unwrap();
+    assert_eq!(r.as_str(), "bad field specifier \"$\"");
+}
+
+#[test]
+fn test_format_wrap_and_padding() {
+    let mut interp = Interp::new();
+    // bignum wraps mod 2^64 then reinterprets
+    assert_eq!(
+        interp
+            .eval("format %d 99999999999999999999")
+            .unwrap()
+            .as_str(),
+        "7766279631452241919"
+    );
+    assert_eq!(
+        interp
+            .eval("format %d -9223372036854775809")
+            .unwrap()
+            .as_str(),
+        "9223372036854775807"
+    );
+    assert_eq!(
+        interp
+            .eval("format %d 9223372036854775808")
+            .unwrap()
+            .as_str(),
+        "-9223372036854775808"
+    );
+    // Tcl integer grammar
+    assert_eq!(interp.eval("format %d 017").unwrap().as_str(), "15");
+    assert_eq!(interp.eval("format %d 0b101").unwrap().as_str(), "5");
+    assert_eq!(interp.eval("format %d 0o17").unwrap().as_str(), "15");
+    assert_eq!(interp.eval("format %d { 12}").unwrap().as_str(), "12");
+    // negative star width = left justify
+    assert_eq!(
+        interp.eval("format {%*d} -5 42").unwrap().as_str(),
+        "42   "
+    );
+    // negative star precision = 0
+    assert_eq!(
+        interp.eval("format {%.*f} -2 3.14159").unwrap().as_str(),
+        "3"
+    );
+    // 0 flag pads s and c with zeros, even with '-'
+    assert_eq!(interp.eval("format %05s a").unwrap().as_str(), "0000a");
+    assert_eq!(interp.eval("format {%-05s} ab").unwrap().as_str(), "ab000");
+    assert_eq!(interp.eval("format %05c 61").unwrap().as_str(), "0000=");
+    // %#b prefix
+    assert_eq!(interp.eval("format {%#b} 5").unwrap().as_str(), "0b101");
+    // hash keeps the point at precision 0
+    assert_eq!(interp.eval("format {%#.0f} 9.5").unwrap().as_str(), "10.");
+    assert_eq!(interp.eval("format {%#.0e} 9.5").unwrap().as_str(), "1.e+01");
+    // width pads by characters, not bytes
+    assert_eq!(
+        interp.eval("format {%4s} éé").unwrap().as_str(),
+        "  éé"
+    );
+    // precision truncates strings by characters
+    assert_eq!(
+        interp.eval("format {%.2s} ééé").unwrap().as_str(),
+        "éé"
+    );
+}
+
+#[test]
+fn test_format_xpg_cursor_and_star() {
+    let mut interp = Interp::new();
+    // XPG n$ is an offset from the sequential cursor; star widths feed
+    // the sequential stream. "%1$*d 6 42" -> width 6 from star, value
+    // 42 from cursor+1-1.
+    assert_eq!(
+        interp.eval("format {%1$*d} 6 42").unwrap().as_str(),
+        "    42"
+    );
+    // star then xpg is mixing, xpg-then-star-in-spec is not
+    let r = interp
+        .eval("catch {format {%*d %1$d} 6 42} m; set m")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "cannot mix \"%\" and \"%n$\" conversion specifiers"
+    );
+    let r = interp
+        .eval("catch {format {%1$d %*d} 42 6 99} m; set m")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "cannot mix \"%\" and \"%n$\" conversion specifiers"
+    );
+    // xpg index out of range is checked against cursor+n
+    let r = interp
+        .eval("catch {format {%5$*d} 6 42} m; set m")
+        .unwrap();
+    assert_eq!(r.as_str(), "\"%n$\" argument index out of range");
+    // %5$ with 5 args is valid and lands on the last one
+    let r = interp
+        .eval("catch {format {%5$d} a b c d e} m; set m")
+        .unwrap();
+    assert_eq!(r.as_str(), "expected integer but got \"e\"");
+    // digits after '*' are consumed and discarded
+    assert_eq!(
+        interp.eval("format {%*5d} 6 42").unwrap().as_str(),
+        "    42"
+    );
+    assert_eq!(
+        interp.eval("format {%*05d} 6 42").unwrap().as_str(),
+        "    42"
+    );
+    // zero flag before star
+    assert_eq!(
+        interp.eval("format {%0*d} 6 42").unwrap().as_str(),
+        "000042"
+    );
+    // '.' with no digits is precision 0
+    assert_eq!(interp.eval("format {%.d} 5").unwrap().as_str(), "5");
+    assert_eq!(interp.eval("format {%.f} 3.14159").unwrap().as_str(), "3");
+    // invalid conversion char: not-enough wins when no args remain
+    let r = interp
+        .eval("catch {format %q} m; set m")
+        .unwrap();
+    assert_eq!(r.as_str(), "not enough arguments for all format specifiers");
+    // ...with args available the bad specifier fires
+    let r = interp
+        .eval("catch {format {%5%} a b c d e} m; set m")
+        .unwrap();
+    assert_eq!(r.as_str(), "bad field specifier \"%\"");
+}
+
+#[test]
+fn test_format_xpg_zero_index_and_caps() {
+    let mut interp = Interp::new();
+    // %0$ parses as an XPG index (not the zero flag) and is out of range
+    let r = interp
+        .eval("catch {format {%0$d} 4} m; set m")
+        .unwrap();
+    assert_eq!(r.as_str(), "\"%n$\" argument index out of range");
+    // ...including after a valid XPG spec (no spurious mixing error)
+    let r = interp
+        .eval("catch {format {%2$d %0$d} 4 5 6} m; set m")
+        .unwrap();
+    assert_eq!(r.as_str(), "\"%n$\" argument index out of range");
+    // %0$ + zero flag still works ("%02$d" -> zero flag + xpg 2)
+    assert_eq!(interp.eval("format {%2$03d} 4 5").unwrap().as_str(), "005");
+    // float + 0 + no minus zero-fills right; with minus left-justifies
+    assert_eq!(
+        interp
+            .eval("format %020f -9.99996")
+            .unwrap()
+            .as_str(),
+        "-000000000009.999960"
+    );
+    assert_eq!(
+        interp
+            .eval(r#"format "%-020f" -9.99996"#)
+            .unwrap()
+            .as_str(),
+        "-9.999960           "
+    );
+    // ints + 0 ignore '-': right zero-fill, sign first
+    assert_eq!(
+        interp.eval("format %-020d -9").unwrap().as_str(),
+        "-0000000000000000009"
+    );
+    // XPG argvIndex model: star width consumes argv[n-1], value argv[n]
+    assert_eq!(
+        interp.eval("format {%2$*d %3$d} 1 10 4").unwrap().as_str(),
+        "         4 4"
+    );
+    assert_eq!(
+        interp
+            .eval("format {%2$.*s %4$d} 1 5 abcdefghijklmnop 44")
+            .unwrap()
+            .as_str(),
+        "abcde 44"
+    );
+    let r = interp
+        .eval(r#"set c [catch {format {%2$*d} 4 5 6} m]; list $c $m"#)
+        .unwrap();
+    assert_eq!(r.as_str(), "0 {    6}");
+}

@@ -1,0 +1,5 @@
+puts "a: [format %-020d -9]"
+puts "b: [format %-05c 65]"
+puts "c: [format %-05x 255]"
+puts "d: [format %0-5d 42]"
+puts "e: [format {%2$-6d} 4 5]"

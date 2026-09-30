@@ -63,6 +63,16 @@ impl Interp {
             }
         }
 
+        self.dispatch_values(&args)
+    }
+
+    /// Dispatch an already-evaluated argument vector: procs, ensembles,
+    /// builtins, expr functions, then unknown handlers.  This is the tail
+    /// of [`eval_command`] shared with ensemble/unknown re-dispatch.
+    pub(crate) fn dispatch_values(&mut self, args: &[Value]) -> Result<Value> {
+        if args.is_empty() {
+            return Ok(Value::empty());
+        }
         let cmd_name = args[0].as_str();
 
         // Namespace-aware command lookup:
@@ -93,6 +103,24 @@ impl Interp {
                 }
             })
             .or_else(|| {
+                // Ancestor namespaces: a command inherited from an
+                // enclosing namespace resolves unqualified (tclsh 52.2:
+                // ::bar::jim::test sees ::bar's `foo`).
+                let mut anc = self.current_namespace.clone();
+                loop {
+                    if anc == "::" {
+                        return None;
+                    }
+                    anc = crate::interp::commands::namespace::parent_of(&anc);
+                    let q = crate::interp::commands::namespace::qualify(
+                        &anc, cmd_name,
+                    );
+                    if let Some(p) = self.procs.get(&q).cloned() {
+                        return Some((p, q));
+                    }
+                }
+            })
+            .or_else(|| {
                 // Import aliases: follow the chain to the origin so the
                 // proc runs in its definition namespace with its current
                 // body (tclsh: redefining the source is visible).
@@ -115,6 +143,16 @@ impl Interp {
             });
         if let Some((proc_def, resolved_name)) = proc_lookup {
             return self.call_proc(&proc_def, &args, &resolved_name, None);
+        }
+
+        // Namespace ensembles: the command itself, or an import alias
+        // whose origin chain lands on one.
+        if let Some((ens_key, ens_def)) =
+            crate::interp::commands::namespace::find_ensemble(self, cmd_name)
+        {
+            return crate::interp::commands::namespace::dispatch_ensemble(
+                self, &ens_key, ens_def, &args,
+            );
         }
 
         // Built-in commands
@@ -173,6 +211,37 @@ impl Interp {
                         args[1..].to_vec(),
                         seed,
                     );
+                }
+                // `namespace unknown` handler: the current namespace's
+                // own handler first, then ancestors' (tclsh 52.7 walks up
+                // to ::).  An explicitly-set value stops the walk even
+                // when it parses to an empty prefix.
+                if cmd_name != "unknown" {
+                    let mut anc = self.current_namespace.clone();
+                    let handler = loop {
+                        if let Some(v) = self.ns_unknown.get(&anc) {
+                            let words: Vec<String> =
+                                crate::value::Value::from_str(v.as_str())
+                                    .as_list()
+                                    .map(|l| {
+                                        l.iter().map(|w| w.as_str().to_string()).collect()
+                                    })
+                                    .unwrap_or_default();
+                            break if words.is_empty() { None } else { Some(words) };
+                        }
+                        if anc == "::" {
+                            break None;
+                        }
+                        anc = crate::interp::commands::namespace::parent_of(&anc);
+                    };
+                    if let Some(words) = handler {
+                        let mut call: Vec<Value> = words
+                            .iter()
+                            .map(|w| Value::from_str(w.as_str()))
+                            .collect();
+                        call.extend(args.iter().cloned());
+                        return self.dispatch_values(&call);
+                    }
                 }
                 // Try "unknown" handler (if defined as a proc or command)
                 if cmd_name != "unknown" {

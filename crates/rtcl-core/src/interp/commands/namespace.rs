@@ -251,6 +251,11 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             !alias.starts_with(&prefix) && !origin.starts_with(&prefix)
         });
         interp.ns_unknown.retain(|k, _| k != &qualified && !k.starts_with(&prefix));
+        // Ensembles registered in (or under) the tree; an ensemble whose
+        // BACKING namespace goes away goes too.
+        interp.ensembles.retain(|k, def| {
+            !k.starts_with(&prefix) && !def.namespace.starts_with(&prefix)
+        });
     }
     Ok(Value::empty())
 }
@@ -723,11 +728,30 @@ fn ns_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::empty())
 }
 
+const ENS_SUBCOMMANDS: [&str; 3] = ["configure", "create", "exists"];
+
+fn resolve_ensemble_subcmd(sub: &str) -> Result<&'static str> {
+    if let Some(exact) = ENS_SUBCOMMANDS.iter().find(|s| **s == sub) {
+        return Ok(exact);
+    }
+    let matches: Vec<&str> = ENS_SUBCOMMANDS
+        .iter()
+        .filter(|s| s.starts_with(sub))
+        .copied()
+        .collect();
+    if matches.len() == 1 {
+        return Ok(matches[0]);
+    }
+    Err(Error::runtime(
+        format!(
+            "bad subcommand \"{}\": must be configure, create, or exists",
+            sub
+        ),
+        ErrorCode::InvalidOp,
+    ))
+}
+
 /// `namespace ensemble subcommand ?arg ...?`
-///
-/// Full ensemble dispatch is not implemented yet; the argument errors
-/// match tclsh so bare/abbreviated forms behave (real ensembles follow in
-/// a later batch).
 fn ns_ensemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::wrong_args_with_usage(
@@ -735,13 +759,639 @@ fn ns_ensemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "subcommand ?arg ...?",
         ));
     }
-    Err(Error::runtime(
-        format!(
-            "bad subcommand \"{}\": must be configure, create, or exists",
-            args[2].as_str()
-        ),
+    match resolve_ensemble_subcmd(args[2].as_str())? {
+        "configure" => ens_configure(interp, &args[3..]),
+        "create" => ens_create(interp, &args[3..]),
+        "exists" => {
+            let mut out = Vec::new();
+            for a in &args[3..] {
+                out.push(Value::from_bool(
+                    find_ensemble_key(interp, a.as_str()).is_some(),
+                ));
+            }
+            Ok(Value::from_list(&out))
+        }
+        _ => unreachable!("resolve_ensemble_subcmd validated"),
+    }
+}
+
+/// Options accepted by `namespace ensemble create` (tclsh order in the
+/// bad-option message).
+const ENS_CREATE_OPTIONS: [&str; 6] = [
+    "-command", "-map", "-parameters", "-prefixes", "-subcommands", "-unknown",
+];
+
+/// Parse a boolean option value (`-prefixes 0`).
+fn ens_bool(v: &Value, opt: &str) -> Result<bool> {
+    let s = v.as_str();
+    if let Some(n) = v.as_int() {
+        return Ok(n != 0);
+    }
+    match s {
+        "true" | "yes" | "on" => Ok(true),
+        "false" | "no" | "off" => Ok(false),
+        _ => Err(Error::runtime(
+            format!(
+                "expected boolean value but got \"{}\" for \"{}\"",
+                s, opt
+            ),
+            ErrorCode::Generic,
+        )),
+    }
+}
+
+/// Parse a `-map` value: pairs of subcommand → implementation prefix.
+/// The implementation prefix's FIRST word is qualified against the
+/// backing namespace at set time (tclsh: `-map {b b}` reads back as
+/// `{b ::b}`); remaining words stay as typed.
+fn parse_ens_map(
+    interp: &Interp,
+    ns: &str,
+    v: &Value,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let _ = ns;
+    let items = v
+        .as_list()
+        .ok_or_else(|| Error::runtime("missing value to go with key".to_string(), ErrorCode::InvalidOp))?;
+    if items.len() % 2 != 0 {
+        return Err(Error::runtime(
+            "missing value to go with key".to_string(),
+            ErrorCode::InvalidOp,
+        ));
+    }
+    let mut map = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        let sub = items[i].as_str().to_string();
+        let impl_val = &items[i + 1];
+        let words: Vec<String> = impl_val
+            .as_list()
+            .unwrap_or_else(|| vec![impl_val.clone()])
+            .iter()
+            .map(|w| w.as_str().to_string())
+            .collect();
+        if words.is_empty() {
+            return Err(Error::runtime(
+                "ensemble subcommand implementations must be non-empty lists"
+                    .to_string(),
+                ErrorCode::InvalidOp,
+            ));
+        }
+        // The implementation prefix's first word qualifies against the
+        // namespace current AT SET TIME (tclsh: `-map {b b}` configured
+        // at global reads back `{b ::b}`; inside the namespace it reads
+        // `{b ::ns::b}`).
+        let first = if words[0].starts_with("::") {
+            words[0].clone()
+        } else {
+            qualify(&interp.current_namespace, &words[0])
+        };
+        let mut resolved = vec![first];
+        resolved.extend_from_slice(&words[1..]);
+        map.push((sub, resolved));
+        i += 2;
+    }
+    Ok(map)
+}
+
+/// `namespace ensemble create ?option value ...?` — registers the current
+/// namespace as an ensemble command (`-command name` overrides the name).
+fn ens_create(interp: &mut Interp, opts: &[Value]) -> Result<Value> {
+    if opts.len() % 2 != 0 {
+        return Err(Error::wrong_args_with_usage(
+            "namespace ensemble create", 2, opts.len() + 2,
+            "?option value ...?",
+        ));
+    }
+    let ns = interp.current_namespace.clone();
+    let mut name = ns.clone();
+    let mut def = crate::interp::EnsembleDef {
+        namespace: ns.clone(),
+        map: Vec::new(),
+        prefixes: true,
+        subcommands: None,
+        unknown: None,
+        parameters: Vec::new(),
+    };
+    let mut i = 0;
+    while i < opts.len() {
+        let opt = opts[i].as_str();
+        let val = &opts[i + 1];
+        match opt {
+            "-command" => name = qualify(&ns, val.as_str()),
+            "-map" => def.map = parse_ens_map(interp, &ns, val)?,
+            "-parameters" => {
+                def.parameters = val
+                    .as_list()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| s.as_str().to_string())
+                    .collect();
+            }
+            "-prefixes" => def.prefixes = ens_bool(val, opt)?,
+            "-subcommands" => {
+                def.subcommands = Some(
+                    val.as_list()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|s| s.as_str().to_string())
+                        .collect(),
+                );
+            }
+            "-unknown" => {
+                def.unknown = Some(
+                    val.as_list()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|s| s.as_str().to_string())
+                        .collect(),
+                );
+            }
+            other => {
+                let list: Vec<&str> = ENS_CREATE_OPTIONS.iter().copied().collect();
+                return Err(Error::runtime(
+                    format!(
+                        "bad option \"{}\": must be {}",
+                        other,
+                        join_or(&list)
+                    ),
+                    ErrorCode::InvalidOp,
+                ));
+            }
+        }
+        i += 2;
+    }
+    interp.ensembles.insert(name, def);
+    Ok(Value::empty())
+}
+
+/// [`find_ensemble_key`] plus a clone of the ensemble's definition, for
+/// dispatch.
+pub(crate) fn find_ensemble(
+    interp: &Interp,
+    name: &str,
+) -> Option<(String, crate::interp::EnsembleDef)> {
+    let key = find_ensemble_key(interp, name)?;
+    let def = interp.ensembles.get(&key)?.clone();
+    Some((key, def))
+}
+
+/// Resolve an ensemble command name the way dispatch does (exact,
+/// namespace-qualified, `::`-prefixed, colon-run normalise, then through
+/// import-alias origin chains).
+pub(crate) fn find_ensemble_key(interp: &Interp, name: &str) -> Option<String> {
+    let cur = &interp.current_namespace;
+    let mut try_keys: Vec<String> = vec![name.to_string()];
+    if cur != "::" && !name.starts_with("::") {
+        try_keys.push(qualify(cur, name));
+    }
+    if !name.starts_with("::") {
+        // A relative name from the global level names `::name`.
+        try_keys.push(format!("::{}", name));
+    }
+    if name.contains("::") {
+        let norm = normalise(name);
+        if norm != name {
+            try_keys.push(norm);
+        }
+    }
+    for k in &try_keys {
+        if interp.ensembles.contains_key(k) {
+            return Some(k.clone());
+        }
+    }
+    // Import alias pointing at an ensemble
+    if let Some(found) = lookup_command_key(interp, name) {
+        if let Some(origin) = origin_of(interp, &found) {
+            if interp.ensembles.contains_key(&origin) {
+                return Some(origin);
+            }
+        }
+    }
+    None
+}
+
+/// The ensemble's candidate subcommands: `-subcommands` when configured,
+/// otherwise the backing namespace's exported commands (procs and import
+/// aliases one level under the namespace matching its export patterns).
+fn ens_candidates(interp: &Interp, def: &crate::interp::EnsembleDef) -> Vec<String> {
+    if let Some(subs) = &def.subcommands {
+        return subs.clone();
+    }
+    let exports = interp
+        .namespaces
+        .get(&def.namespace)
+        .map(|info| info.export_patterns.clone())
+        .unwrap_or_default();
+    let prefix = ns_child_prefix(&def.namespace);
+    let mut names: Vec<String> = interp
+        .procs
+        .keys()
+        .map(|s| s.as_str())
+        .chain(interp.import_aliases.keys().map(|s| s.as_str()))
+        .filter_map(|k| {
+            k.strip_prefix(&prefix)
+                .filter(|rest| !rest.contains("::"))
+                .filter(|rest| {
+                    exports
+                        .iter()
+                        .any(|e| crate::interp::glob_match(e, rest))
+                })
+                .map(|rest| rest.to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Resolve `sub` against an ensemble: exact map key, exact candidate, then
+/// (when prefixes are on) a unique prefix over map keys + candidates.
+/// `Ok(Some(words))` = implementation prefix; `Ok(None)` = no match.
+/// `Err` = ambiguous prefix (tclsh lists only the matching candidates).
+fn ens_resolve(
+    interp: &Interp,
+    def: &crate::interp::EnsembleDef,
+    sub: &str,
+) -> Result<Option<Vec<String>>> {
+    if let Some((_, words)) = def.map.iter().find(|(k, _)| k == sub) {
+        return Ok(Some(words.clone()));
+    }
+    let candidates = ens_candidates(interp, def);
+    let exported_hit = candidates.iter().any(|c| c == sub);
+    if exported_hit {
+        return Ok(Some(vec![qualify(&def.namespace, sub)]));
+    }
+    if def.prefixes {
+        // Prefix pool: map keys first, then the candidates.
+        let mut pool: Vec<String> =
+            def.map.iter().map(|(k, _)| k.clone()).collect();
+        for c in &candidates {
+            if !pool.contains(c) {
+                pool.push(c.clone());
+            }
+        }
+        let matches: Vec<&String> =
+            pool.iter().filter(|s| s.starts_with(sub)).collect();
+        if matches.len() == 1 {
+            let m = matches[0];
+            if let Some((_, words)) = def.map.iter().find(|(k, _)| k == m) {
+                return Ok(Some(words.clone()));
+            }
+            return Ok(Some(vec![qualify(&def.namespace, m)]));
+        }
+        if matches.len() > 1 {
+            let listed: Vec<&str> =
+                matches.iter().map(|s| s.as_str()).collect();
+            return Err(Error::runtime(
+                format!(
+                    "unknown or ambiguous subcommand \"{}\": must be {}",
+                    sub,
+                    join_or(&listed)
+                ),
+                ErrorCode::InvalidOp,
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// The no-match error for `sub` (candidates listed in tclsh's format).
+fn ens_miss_error(
+    interp: &Interp,
+    def: &crate::interp::EnsembleDef,
+    sub: &str,
+) -> Error {
+    let mut candidates = ens_candidates(interp, def);
+    // Map keys are candidates too (tclsh: `-map {a a}` + miss lists `a`).
+    for (k, _) in &def.map {
+        if !candidates.contains(k) {
+            candidates.push(k.clone());
+        }
+    }
+    if let Some(subs) = &def.subcommands {
+        if subs.is_empty() || candidates.is_empty() {
+            // fall through to the same wording as below
+        }
+    }
+    if candidates.is_empty() {
+        return Error::runtime(
+            format!(
+                "unknown subcommand \"{}\": namespace {} does not export any commands",
+                sub, def.namespace
+            ),
+            ErrorCode::InvalidOp,
+        );
+    }
+    let listed: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+    let word = if def.prefixes {
+        "unknown or ambiguous subcommand"
+    } else {
+        "unknown subcommand"
+    };
+    Error::runtime(
+        format!("{} \"{}\": must be {}", word, sub, join_or(&listed)),
         ErrorCode::InvalidOp,
-    ))
+    )
+}
+
+/// Run `call` (a resolved command word list) in the ensemble's backing
+/// namespace.
+fn ens_run(
+    interp: &mut Interp,
+    ns: &str,
+    call: &[Value],
+) -> Result<Value> {
+    let saved = interp.current_namespace.clone();
+    interp.current_namespace = ns.to_string();
+    let r = interp.dispatch_values(call);
+    interp.current_namespace = saved;
+    r
+}
+
+/// Ensemble command dispatch: `ens sub ?args...?`.
+pub(crate) fn dispatch_ensemble(
+    interp: &mut Interp,
+    ens_key: &str,
+    def: crate::interp::EnsembleDef,
+    args: &[Value],
+) -> Result<Value> {
+    let words = &args[1..];
+    // `-parameters`: that many leading words are ALWAYS parameter values
+    // (kept so at least one word remains for the subcommand).
+    let nparams = def
+        .parameters
+        .len()
+        .min(words.len().saturating_sub(1));
+    let (params, rest) = words.split_at(nparams);
+    if rest.is_empty() {
+        return Err(Error::wrong_args_with_usage(
+            ens_key, 2, args.len(), "subcommand ?arg ...?",
+        ));
+    }
+    let sub = rest[0].as_str();
+
+    match ens_resolve(interp, &def, sub) {
+        Err(e) => return Err(e),
+        Ok(Some(impl_words)) => {
+            let mut call: Vec<Value> = impl_words
+                .iter()
+                .map(|w| Value::from_str(w.as_str()))
+                .collect();
+            call.extend(params.iter().cloned());
+            call.extend(rest[1..].iter().cloned());
+            return ens_run(interp, &def.namespace, &call);
+        }
+        Ok(None) => {}
+    }
+
+    // No match: run the `-unknown` handler when configured.  The handler
+    // gets (ensemble, subcommand, args...); its return value is a command
+    // prefix used when the retry still doesn't find the subcommand.
+    if let Some(handler) = def.unknown.clone() {
+        let mut call: Vec<Value> =
+            handler.iter().map(|w| Value::from_str(w.as_str())).collect();
+        call.push(Value::from_str(ens_key));
+        call.push(Value::from_str(sub));
+        call.extend(rest[1..].iter().cloned());
+        let handler_result = match interp.dispatch_values(&call) {
+            Err(e) if e.is_break() => {
+                return Err(Error::runtime(
+                    "unknown subcommand handler returned bad code: break"
+                        .to_string(),
+                    ErrorCode::InvalidOp,
+                ));
+            }
+            Err(e) if e.is_continue() => {
+                return Err(Error::runtime(
+                    "unknown subcommand handler returned bad code: continue"
+                        .to_string(),
+                    ErrorCode::InvalidOp,
+                ));
+            }
+            Err(e) => return Err(e),
+            Ok(v) => v,
+        };
+        // Retry the subcommand lookup once (the handler may have defined
+        // implementations); refresh the definition first.
+        let def2 = interp.ensembles.get(ens_key).cloned();
+        if let Some(def2) = def2 {
+            match ens_resolve(interp, &def2, sub) {
+                Err(e) => return Err(e),
+                Ok(Some(impl_words)) => {
+                    let mut call: Vec<Value> = impl_words
+                        .iter()
+                        .map(|w| Value::from_str(w.as_str()))
+                        .collect();
+                    call.extend(params.iter().cloned());
+                    call.extend(rest[1..].iter().cloned());
+                    return ens_run(interp, &def2.namespace, &call);
+                }
+                Ok(None) => {}
+            }
+        }
+        // Retry failed: dispatch the handler's returned prefix, or report
+        // the (refreshed) miss.
+        if let Some(prefix) = handler_result.as_list() {
+            if !prefix.is_empty() {
+                let mut call: Vec<Value> = prefix.to_vec();
+                call.extend(params.iter().cloned());
+                call.extend(rest[1..].iter().cloned());
+                return ens_run(interp, &def.namespace, &call);
+            }
+        }
+        return Err(ens_miss_error(interp, &def, sub));
+    }
+
+    Err(ens_miss_error(interp, &def, sub))
+}
+
+/// `namespace ensemble configure ensemble ?-option value ...?`
+fn ens_configure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Err(Error::wrong_args_with_usage(
+            "namespace ensemble configure", 3, args.len() + 3,
+            "cmdname ?-option value ...? ?arg ...?",
+        ));
+    }
+    let typed = args[0].as_str().to_string();
+    let key = find_ensemble_key(interp, &typed).ok_or_else(|| {
+        if command_exists(interp, &typed) {
+            Error::runtime(
+                format!("\"{}\" is not an ensemble command", typed),
+                ErrorCode::InvalidOp,
+            )
+        } else {
+            Error::runtime(
+                format!("unknown command \"{}\"", typed),
+                ErrorCode::NotFound,
+            )
+        }
+    })?;
+    // Commands that exist as procs/builtins/aliases but not ensembles.
+    if args.len() == 1 {
+        // Full option list, tclsh's fixed order.
+        let def = interp.ensembles.get(&key).unwrap();
+        let map_items: Vec<Value> = def
+            .map
+            .iter()
+            .flat_map(|(k, words)| {
+                let mut v = vec![Value::from_str(k)];
+                v.push(Value::from_list(
+                    &words.iter().map(|w| Value::from_str(w.as_str())).collect::<Vec<_>>(),
+                ));
+                v
+            })
+            .collect();
+        let unknown = Value::from_list(
+            &def.unknown
+                .as_ref()
+                .map(|u| u.iter().map(|w| Value::from_str(w.as_str())).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+        let subcmds = Value::from_list(
+            &def.subcommands
+                .as_ref()
+                .map(|u| u.iter().map(|w| Value::from_str(w.as_str())).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+        return Ok(Value::from_list(&[
+            Value::from_str("-map"),
+            Value::from_list(&map_items),
+            Value::from_str("-namespace"),
+            Value::from_str(&def.namespace),
+            Value::from_str("-parameters"),
+            Value::from_list(&def.parameters.iter().map(|w| Value::from_str(w.as_str())).collect::<Vec<_>>()),
+            Value::from_str("-prefixes"),
+            Value::from_bool(def.prefixes),
+            Value::from_str("-subcommands"),
+            subcmds,
+            Value::from_str("-unknown"),
+            unknown,
+        ]));
+    }
+    let mut i = 1;
+    while i < args.len() {
+        let opt = args[i].as_str();
+        let get_only = opt == "-namespace";
+        if i + 1 >= args.len() || get_only {
+            // GET
+            let def = interp.ensembles.get(&key).unwrap();
+            return match opt {
+                "-map" => {
+                    let items: Vec<Value> = def
+                        .map
+                        .iter()
+                        .flat_map(|(k, words)| {
+                            let mut v = vec![Value::from_str(k)];
+                            v.push(Value::from_list(
+                                &words
+                                    .iter()
+                                    .map(|w| Value::from_str(w.as_str()))
+                                    .collect::<Vec<_>>(),
+                            ));
+                            v
+                        })
+                        .collect();
+                    Ok(Value::from_list(&items))
+                }
+                "-namespace" => Ok(Value::from_str(&def.namespace)),
+                "-parameters" => Ok(Value::from_list(
+                    &def.parameters.iter().map(|w| Value::from_str(w.as_str())).collect::<Vec<_>>(),
+                )),
+                "-prefixes" => Ok(Value::from_bool(def.prefixes)),
+                "-subcommands" => Ok(Value::from_list(
+                    &def.subcommands
+                        .as_ref()
+                        .map(|u| {
+                            u.iter().map(|w| Value::from_str(w.as_str())).collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                )),
+                "-unknown" => Ok(Value::from_list(
+                    &def.unknown
+                        .as_ref()
+                        .map(|u| {
+                            u.iter().map(|w| Value::from_str(w.as_str())).collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                )),
+                other => {
+                    let mut list: Vec<&str> =
+                        ENS_CREATE_OPTIONS.iter().copied().collect();
+                    list.push("-namespace");
+                    Err(Error::runtime(
+                        format!(
+                            "bad option \"{}\": must be {}",
+                            other,
+                            join_or(&list)
+                        ),
+                        ErrorCode::InvalidOp,
+                    ))
+                }
+            };
+        }
+        let val = &args[i + 1];
+        match opt {
+            "-map" => {
+                let ns = interp.ensembles.get(&key).unwrap().namespace.clone();
+                let parsed = parse_ens_map(interp, &ns, val)?;
+                interp.ensembles.get_mut(&key).unwrap().map = parsed;
+            }
+            _ => {
+                let def = interp.ensembles.get_mut(&key).unwrap();
+                match opt {
+                "-parameters" => {
+                    def.parameters = val
+                        .as_list()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|s| s.as_str().to_string())
+                        .collect();
+                }
+                "-prefixes" => def.prefixes = ens_bool(val, opt)?,
+                "-subcommands" => {
+                    def.subcommands = Some(
+                        val.as_list()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|s| s.as_str().to_string())
+                            .collect(),
+                    );
+                }
+                "-unknown" => {
+                    def.unknown = Some(
+                        val.as_list()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|s| s.as_str().to_string())
+                            .collect(),
+                    );
+                }
+                    other => {
+                        let mut list: Vec<&str> =
+                            ENS_CREATE_OPTIONS.iter().copied().collect();
+                        list.push("-namespace");
+                        return Err(Error::runtime(
+                            format!(
+                                "bad option \"{}\": must be {}",
+                                other,
+                                join_or(&list)
+                            ),
+                            ErrorCode::InvalidOp,
+                        ));
+                    }
+                }
+            }
+        }
+        i += 2;
+    }
+    Ok(Value::empty())
+}
+
+/// Does `name` resolve to any command (proc, builtin, alias) right now?
+fn command_exists(interp: &Interp, name: &str) -> bool {
+    lookup_command_key(interp, name).is_some()
 }
 
 // ── helper functions ───────────────────────────────────────────────────
@@ -792,6 +1442,16 @@ pub(crate) fn normalise(name: &str) -> String {
         return "::".to_string();
     }
     format!("::{}", parts.join("::"))
+}
+
+/// Parent namespace of a `::`-qualified name (`::a::b` → `::a`,
+/// `::a` → `::`).
+pub(crate) fn parent_of(ns: &str) -> String {
+    match ns.rfind("::") {
+        Some(0) => "::".to_string(),
+        Some(i) => ns[..i].to_string(),
+        None => "::".to_string(),
+    }
 }
 
 /// Prefix under which the direct children of `ns` are registered.

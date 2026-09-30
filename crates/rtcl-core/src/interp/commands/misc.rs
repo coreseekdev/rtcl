@@ -521,13 +521,156 @@ pub fn cmd_unset(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::empty())
 }
 
-/// Glob-match a name against a pattern, tolerant of a leading `::` on
-/// either side: tclsh's `info commands test_ns_basic::*` still finds
-/// `::test_ns_basic::p`. Output keeps the stored name unchanged.
-fn matches_qualified_glob(pattern: &str, name: &str) -> bool {
-    let p = pattern.strip_prefix("::").unwrap_or(pattern);
-    let n = name.strip_prefix("::").unwrap_or(name);
-    super::super::glob_match(p, n)
+/// A command key's namespace and simple name: bare keys live in `::`,
+/// qualified keys split at their last `::` (`::e1::c1` → `::e1`, `c1`).
+fn split_key_ns(key: &str) -> (String, String) {
+    match key.strip_prefix("::") {
+        Some(rest) => match rest.rfind("::") {
+            None => ("::".to_string(), rest.to_string()),
+            Some(i) => (format!("::{}", &rest[..i]), rest[i + 2..].to_string()),
+        },
+        None => ("::".to_string(), key.to_string()),
+    }
+}
+
+/// The full (leading-`::`) form of a command key, as tclsh's
+/// `Tcl_GetCommandFullName` renders it when the pattern names a namespace.
+fn full_key(key: &str) -> String {
+    if key.starts_with("::") {
+        key.to_string()
+    } else {
+        format!("::{}", key)
+    }
+}
+
+/// Resolve an `info commands` pattern the way tclsh's
+/// `TclGetNamespaceForQualName` does: walk each `::`-terminated qualifier as
+/// a child of the current namespace (absolute patterns start at `::`); the
+/// remainder after the last separator is the simple pattern. Returns `None`
+/// when a qualifier namespace doesn't exist — tclsh then lists nothing.
+/// `(effective_ns, simple_pattern, specific_ns_in_pattern)`.
+fn resolve_info_pattern(interp: &Interp, pat: &str) -> Option<(String, Option<String>, bool)> {
+    let mut ns = if pat.starts_with("::") {
+        "::".to_string()
+    } else {
+        interp.current_namespace.clone()
+    };
+    let mut rest = pat.trim_start_matches(':');
+    loop {
+        if rest.is_empty() {
+            // Pattern ended with a separator (or was empty): the simple
+            // name is the empty string.
+            return Some((ns, Some(String::new()), pat.contains("::")));
+        }
+        match rest.find("::") {
+            Some(i) => {
+                let comp = &rest[..i];
+                let child = if ns == "::" {
+                    format!("::{}", comp)
+                } else {
+                    format!("{}::{}", ns, comp)
+                };
+                let child = super::namespace::normalise(&child);
+                if interp.namespaces.contains_key(&child) {
+                    ns = child;
+                } else {
+                    return None;
+                }
+                rest = rest[i + 2..].trim_start_matches(':');
+            }
+            None => {
+                return Some((
+                    ns,
+                    Some(rest.to_string()),
+                    pat.contains("::"),
+                ));
+            }
+        }
+    }
+}
+
+/// `info commands ?pattern?` — a faithful port of tclsh's
+/// `InfoCommandsCmd`: list the effective namespace's own commands (matching
+/// the simple pattern), rendered fully-qualified when the pattern contains
+/// `::` and unqualified otherwise; non-global effective namespaces also
+/// merge in non-hidden global commands.
+fn list_commands(interp: &Interp, pattern: Option<&str>) -> Result<Value> {
+    list_commands_in(interp, pattern, true, true)
+}
+
+/// Core of `info commands`/`info procs` listing; `builtins` controls whether
+/// the builtin command table participates, `merge_globals` whether a
+/// non-global effective namespace also lists unhidden global commands.
+fn list_commands_in(
+    interp: &Interp,
+    pattern: Option<&str>,
+    builtins: bool,
+    merge_globals: bool,
+) -> Result<Value> {
+    let (eff, simple, specific) = match pattern {
+        None => (interp.current_namespace.clone(), None, false),
+        Some(p) => match resolve_info_pattern(interp, p) {
+            None => return Ok(Value::from_list(&[])),
+            Some(pi) => pi,
+        },
+    };
+
+    // Every command, keyed as stored: builtins, procs, import aliases and
+    // ensembles.
+    let mut keys: Vec<&str> = interp
+        .procs
+        .keys()
+        .map(|s| s.as_str())
+        .chain(interp.import_aliases.keys().map(|s| s.as_str()))
+        .chain(interp.ensembles.keys().map(|s| s.as_str()))
+        .collect();
+    if builtins {
+        keys.extend(interp.commands.keys().map(|s| s.as_str()));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for key in &keys {
+        let (ns, tail) = split_key_ns(key);
+        if ns != eff {
+            continue;
+        }
+        if let Some(sp) = &simple {
+            if !super::super::glob_match(sp, &tail) {
+                continue;
+            }
+        }
+        if seen.insert(tail.clone()) {
+            let rendered = if specific {
+                full_key(key)
+            } else {
+                tail.clone()
+            };
+            out.push(Value::from_str(&rendered));
+        }
+    }
+    // Non-global effective namespace, unqualified pattern: merge in global
+    // commands that aren't hidden by a local one.
+    if merge_globals && eff != "::" && !specific {
+        for key in &keys {
+            let (ns, tail) = split_key_ns(key);
+            if ns != "::" {
+                continue;
+            }
+            if let Some(sp) = &simple {
+                if !super::super::glob_match(sp, &tail) {
+                    continue;
+                }
+            }
+            if seen.insert(tail.clone()) {
+                out.push(Value::from_str(&tail));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    Ok(Value::from_list(&out))
 }
 
 /// tclsh's `info` subcommand list, in the order it prints on an
@@ -586,40 +729,14 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     match subcmd.as_str() {
         "commands" => {
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
-            let mut cmds: Vec<Value> = interp
-                .commands
-                .keys()
-                .chain(interp.procs.keys())
-                .chain(interp.import_aliases.keys())
-                .filter(|name| {
-                    pattern
-                        .map(|p| matches_qualified_glob(p, name))
-                        .unwrap_or(true)
-                })
-                .map(|name| Value::from_str(name))
-                .collect();
-            cmds.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-            Ok(Value::from_list(&cmds))
+            list_commands(interp, pattern)
         }
         "procs" => {
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
-            let matches = |name: &str| {
-                pattern
-                    .map(|p| matches_qualified_glob(p, name))
-                    .unwrap_or(true)
-            };
-            // Import aliases count as procs (tclsh: `namespace import`
-            // creates a command visible to `info procs`).
-            let mut names: Vec<Value> = interp
-                .procs
-                .keys()
-                .map(|s| s.as_str())
-                .chain(interp.import_aliases.keys().map(|s| s.as_str()))
-                .filter(|name| matches(name))
-                .map(Value::from_str)
-                .collect();
-            names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-            Ok(Value::from_list(&names))
+            // Import aliases count as procs (tclsh's TclGetOriginalCommand
+            // check); unlike `info commands`, `info procs` never merges in
+            // the global namespace's procs.
+            list_commands_in(interp, pattern, false, false)
         }
         "exists" => {
             if args.len() != 3 {

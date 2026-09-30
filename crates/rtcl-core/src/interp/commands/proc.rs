@@ -364,6 +364,17 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if !new_key.is_empty() {
             interp.procs.insert(new_key.clone(), proc_def);
         }
+        move_alias_origins(interp, &old_key, &new_key);
+        finish_cmd_rename(interp, &old_key, &new_key, &old_name, &new_name);
+        return Ok(Value::empty());
+    }
+
+    // Rename a namespace ensemble command
+    if let Some(def) = interp.ensembles.remove(&old_key) {
+        if !new_key.is_empty() {
+            interp.ensembles.insert(new_key.clone(), def);
+        }
+        move_alias_origins(interp, &old_key, &new_key);
         finish_cmd_rename(interp, &old_key, &new_key, &old_name, &new_name);
         return Ok(Value::empty());
     }
@@ -391,6 +402,26 @@ fn finish_cmd_rename(
         interp.rekey_cmd_traces(old_key, new_key);
         interp.fire_cmd_traces(new_key, old_name, new_name, "rename");
     }
+}
+
+/// Import aliases follow renames of their origin (tclsh 48.2: renaming
+/// `foo::bar` keeps the imported `bar` dispatching).
+fn move_alias_origins(interp: &mut Interp, old_key: &str, new_key: &str) {
+    if old_key == new_key {
+        return;
+    }
+    let moved: Vec<(String, String)> = interp
+        .import_aliases
+        .iter()
+        .filter(|(_, origin)| origin.as_str() == old_key)
+        .map(|(a, _)| (a.clone(), new_key.to_string()))
+        .collect();
+    for (alias, origin) in moved {
+        interp.import_aliases.insert(alias, origin);
+    }
+    // An ensemble renaming onto/away from an alias-resolved key is handled
+    // by find_ensemble_key's alias chain at dispatch time.
+    let _ = new_key;
 }
 
 /// Resolve a command name to its registered key, mirroring dispatch's
@@ -421,7 +452,16 @@ pub(crate) fn resolve_command_key(interp: &Interp, name: &str) -> Option<String>
             return Some(norm);
         }
     }
-    None
+    // Namespace ensembles resolve like commands for rename.
+    let mut keys: Vec<String> = vec![name.to_string()];
+    if interp.current_namespace != "::" && !name.starts_with("::") {
+        keys.push(super::namespace::qualify(&interp.current_namespace, name));
+    }
+    if !name.starts_with("::") && name.contains("::") {
+        keys.push(format!("::{}", name));
+    }
+    keys.into_iter()
+        .find(|k| interp.ensembles.contains_key(k))
 }
 
 #[cfg(test)]

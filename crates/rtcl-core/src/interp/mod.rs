@@ -55,6 +55,29 @@ pub(crate) enum UpvarLink {
     Frame { frame_index: usize, var_name: String },
 }
 
+/// A live `namespace ensemble` — the ensemble command's dispatch table
+/// (tclsh 8.6.17).  Keyed in `Interp::ensembles` by the ensemble's
+/// registered command name (canonical, `::`-prefixed).
+#[derive(Debug, Clone)]
+pub(crate) struct EnsembleDef {
+    /// Backing namespace the ensemble was created in (configure
+    /// -namespace; subcommand implementations resolve here).
+    pub namespace: String,
+    /// `-map`: subcommand → implementation command prefix (the prefix's
+    /// first word is qualified against the backing namespace at set time).
+    pub map: Vec<(String, Vec<String>)>,
+    /// `-prefixes`: unique-prefix subcommand matching (default on).
+    pub prefixes: bool,
+    /// `-subcommands`: explicit candidate list overriding the namespace's
+    /// exports (None = use the exports).
+    pub subcommands: Option<Vec<String>>,
+    /// `-unknown`: handler command prefix, stored as typed.
+    pub unknown: Option<Vec<String>>,
+    /// `-parameters` names — that many leading words are always consumed
+    /// as parameter values and prepended to the impl's args.
+    pub parameters: Vec<String>,
+}
+
 /// A procedure call frame.
 #[derive(Debug, Clone)]
 pub(crate) struct CallFrame {
@@ -146,6 +169,8 @@ pub struct Interp {
     pub(crate) import_aliases: HashMap<String, String>,
     /// Per-namespace `namespace unknown` handler scripts (raw, as given).
     pub(crate) ns_unknown: HashMap<String, String>,
+    /// Live `namespace ensemble`s keyed by registered command name.
+    pub(crate) ensembles: HashMap<String, EnsembleDef>,
     /// Live array searches keyed by the owning scope's stamp key.
     pub(crate) array_searches: HashMap<String, ArraySearchList>,
     /// Mutation counters per array (element-set changes invalidate searches).
@@ -244,6 +269,7 @@ impl Interp {
             },
             import_aliases: HashMap::new(),
             ns_unknown: HashMap::new(),
+            ensembles: HashMap::new(),
             #[cfg(feature = "std")]
             script_name: String::new(),
             #[cfg(feature = "std")]

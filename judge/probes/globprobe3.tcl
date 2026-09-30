@@ -1,0 +1,19 @@
+proc t {p s} {if {[catch {string match $p $s} m]} {puts "ERR: $m"} else {puts "$p vs $s => $m"}}
+t {[\]]z} {]z}
+t {[x]]z} {]z}
+t {[x]]z} {xz}
+t {[]z} {]z}
+t {[a]]z} {az}
+t {[a]]z} {]z}
+t {[a\]b]z} {]z}
+t {[a\]b]z} {az}
+t {[a\]b]z} {bz}
+t {[a\\]z} {az}
+t {[a-z} {az}
+t {[ab} {ab}
+t {[^a]} {^}
+t {a[b} {ab}
+t {[a-b]c} {ac}
+t {[b-a]c} {ac}
+t {[b-a]c} {bc}
+puts [info patchlevel]

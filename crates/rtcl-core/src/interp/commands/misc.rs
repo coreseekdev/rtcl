@@ -1203,10 +1203,20 @@ pub fn cmd_subst(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut i = 1;
 
     while i < args.len() - 1 {
-        match args[i].as_str() {
-            "-nobackslashes" => nobackslashes = true,
-            "-nocommands" => nocommands = true,
-            "-novariables" => novariables = true,
+        // tclsh accepts unambiguous prefixes (-nov, -nob, -noc).
+        let a = args[i].as_str();
+        let flag = |full: &str| a.len() > 1 && full.starts_with(a);
+        let (m_nob, m_noc, m_nov) = (
+            flag("-nobackslashes"),
+            flag("-nocommands"),
+            flag("-novariables"),
+        );
+        match m_nob as u8 + m_noc as u8 + m_nov as u8 {
+            1 => {
+                nobackslashes |= m_nob;
+                nocommands |= m_noc;
+                novariables |= m_nov;
+            }
             _ => break,
         }
         i += 1;
@@ -1222,66 +1232,84 @@ pub fn cmd_subst(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         match ch {
             '\\' if !nobackslashes && ci + 1 < chars.len() => {
                 ci += 1;
-                match chars[ci] {
-                    'n' => result.push('\n'),
-                    't' => result.push('\t'),
-                    'r' => result.push('\r'),
-                    '\\' => result.push('\\'),
-                    other => { result.push('\\'); result.push(other); }
-                }
-                ci += 1;
+                result.push_str(&subst_escape(&chars, &mut ci));
             }
             '$' if !novariables && ci + 1 < chars.len() => {
                 ci += 1;
-                let mut var_name = String::new();
-                if ci < chars.len() && chars[ci] == '{' {
-                    ci += 1;
-                    while ci < chars.len() && chars[ci] != '}' {
-                        var_name.push(chars[ci]);
-                        ci += 1;
-                    }
-                    if ci < chars.len() { ci += 1; } // skip '}'
-                } else {
-                    while ci < chars.len() && (chars[ci].is_alphanumeric() || chars[ci] == '_') {
-                        var_name.push(chars[ci]);
-                        ci += 1;
-                    }
-                    // Check for array ref
-                    if ci < chars.len() && chars[ci] == '(' {
-                        var_name.push('(');
-                        ci += 1;
-                        while ci < chars.len() && chars[ci] != ')' {
-                            var_name.push(chars[ci]);
-                            ci += 1;
-                        }
-                        if ci < chars.len() {
-                            var_name.push(')');
-                            ci += 1;
-                        }
-                    }
-                }
-                if let Ok(val) = interp.get_var(&var_name) {
-                    result.push_str(val.as_str());
-                } else {
+                // tclsh: a `$` not followed by a name stays literal; an
+                // unset variable is an ERROR (subst-6.1), never a
+                // literal passthrough.
+                let var_name = scan_var_name(&chars, &mut ci);
+                if var_name.is_empty() {
                     result.push('$');
-                    result.push_str(&var_name);
+                } else if ci < chars.len() && chars[ci] == '(' {
+                    // Array reference: the index takes word-level
+                    // substitutions, and a `return`/`break`/`continue`
+                    // inside it aborts the read (subst-8.9/10.6/11.6).
+                    ci += 1;
+                    let mut index = String::new();
+                    let mut skip_read = false;
+                    while ci < chars.len() && chars[ci] != ')' {
+                        match chars[ci] {
+                            '[' => {
+                                ci += 1;
+                                match run_bracket_script(
+                                    interp,
+                                    &chars,
+                                    &mut ci,
+                                    nobackslashes,
+                                )? {
+                                    SubstOutcome::Done(s) => index.push_str(&s),
+                                    SubstOutcome::Returned(s) => {
+                                        result.push_str(&s);
+                                        skip_read = true;
+                                        break;
+                                    }
+                                    SubstOutcome::Break => {
+                                        return Ok(Value::from_str(&result))
+                                    }
+                                    SubstOutcome::Continue => {
+                                        skip_read = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            '\\' if !nobackslashes && ci + 1 < chars.len() => {
+                                ci += 1;
+                                index.push_str(&subst_escape(&chars, &mut ci));
+                            }
+                            c => {
+                                index.push(c);
+                                ci += 1;
+                            }
+                        }
+                    }
+                    if ci < chars.len() {
+                        ci += 1; // past ')'
+                    }
+                    if !skip_read {
+                        let full = format!("{}({})", var_name, index);
+                        let val = interp.get_var(&full)?;
+                        result.push_str(val.as_str());
+                    }
+                } else {
+                    let val = interp.get_var(&var_name)?;
+                    result.push_str(val.as_str());
                 }
             }
             '[' if !nocommands => {
                 ci += 1;
-                let mut depth = 1;
-                let mut cmd = String::new();
-                while ci < chars.len() && depth > 0 {
-                    if chars[ci] == '[' { depth += 1; }
-                    else if chars[ci] == ']' {
-                        depth -= 1;
-                        if depth == 0 { ci += 1; break; }
+                match run_bracket_script(interp, &chars, &mut ci, nobackslashes)? {
+                    SubstOutcome::Done(s) | SubstOutcome::Returned(s) => {
+                        result.push_str(&s)
                     }
-                    cmd.push(chars[ci]);
-                    ci += 1;
+                    // `break` stops subst with what it has so far
+                    // (subst-10.1: "foo ").
+                    SubstOutcome::Break => return Ok(Value::from_str(&result)),
+                    // `continue` skips the rest of the bracketed script
+                    // (subst-11.1: "foo  bar").
+                    SubstOutcome::Continue => {}
                 }
-                let val = interp.eval(&cmd)?;
-                result.push_str(val.as_str());
             }
             _ => {
                 result.push(ch);
@@ -1291,6 +1319,306 @@ pub fn cmd_subst(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     Ok(Value::from_str(&result))
+}
+
+/// Decode one backslash escape in a subst template; `ci` points at the
+/// character following the backslash and advances past the escape.
+/// Mirrors the parser's rules: `\n`-style shorthands, `\xHH` (all hex
+/// digits, low 8 bits), `\uHHHH`, 1-3 octal digits, and
+/// backslash-newline collapsing to a single space.
+fn subst_escape(chars: &[char], ci: &mut usize) -> String {
+    let c = chars[*ci];
+    let simple = match c {
+        'n' => Some('\n'),
+        't' => Some('\t'),
+        'r' => Some('\r'),
+        'f' => Some('\u{000C}'),
+        'v' => Some('\u{000B}'),
+        'b' => Some('\u{0008}'),
+        'a' => Some('\u{0007}'),
+        '\\' => Some('\\'),
+        '"' => Some('"'),
+        _ => None,
+    };
+    if let Some(ch) = simple {
+        *ci += 1;
+        return ch.to_string();
+    }
+    match c {
+        'x' => {
+            *ci += 1;
+            let mut v: u32 = 0;
+            let mut n = 0;
+            while *ci < chars.len() && n < 8 {
+                match chars[*ci].to_digit(16) {
+                    Some(d) => { v = v * 16 + d; *ci += 1; n += 1; }
+                    None => break,
+                }
+            }
+            if n == 0 {
+                "x".to_string()
+            } else {
+                char::from_u32(v & 0xff).unwrap_or('\u{FFFD}').to_string()
+            }
+        }
+        'u' => {
+            *ci += 1;
+            let mut v: u32 = 0;
+            let mut n = 0;
+            while *ci < chars.len() && n < 4 {
+                match chars[*ci].to_digit(16) {
+                    Some(d) => { v = v * 16 + d; *ci += 1; n += 1; }
+                    None => break,
+                }
+            }
+            if n == 0 {
+                "u".to_string()
+            } else {
+                char::from_u32(v).unwrap_or('\u{FFFD}').to_string()
+            }
+        }
+        '0'..='7' => {
+            let mut v: u32 = 0;
+            let mut n = 0;
+            while *ci < chars.len() && n < 3 {
+                match chars[*ci].to_digit(8) {
+                    Some(d) => { v = v * 8 + d; *ci += 1; n += 1; }
+                    None => break,
+                }
+            }
+            char::from_u32(v & 0xff).unwrap_or('\u{FFFD}').to_string()
+        }
+        '\n' => {
+            *ci += 1;
+            while *ci < chars.len() && (chars[*ci] == ' ' || chars[*ci] == '\t') {
+                *ci += 1;
+            }
+            " ".to_string()
+        }
+        other => {
+            *ci += 1;
+            other.to_string()
+        }
+    }
+}
+
+/// What a bracketed script did for the surrounding subst.
+enum SubstOutcome {
+    /// Ran through the closing `]` — the accumulated output.
+    Done(String),
+    /// An inner `return` — its value is the substitution result.
+    Returned(String),
+    Break,
+    Continue,
+}
+
+/// Run one `[`-bracketed command script for subst: commands are parsed
+/// one at a time and evaluated as each terminator is seen, so
+/// `subst "\[incr x;"` still increments x before the missing
+/// close-bracket error (subst-12.3) while `subst {[set a 1}` runs
+/// nothing (subst-5.5).  `return` aborts the remaining script, its
+/// value is the substitution result (subst-8.1) — and the remainder
+/// must still PARSE (`subst {foo [return {x} ; set a {}"" ; stuff]
+/// bar}` is a parse error, subst-8.7).
+fn run_bracket_script(
+    interp: &mut Interp,
+    chars: &[char],
+    ci: &mut usize,
+    nobackslashes: bool,
+) -> Result<SubstOutcome> {
+    let mut result = String::new();
+    loop {
+        let mut cmd = String::new();
+        let mut brace = 0i32;
+        let mut bdepth = 0i32;
+        let mut quote = false;
+        let mut close = false;
+        let mut terminated = false;
+        while *ci < chars.len() {
+            let c = chars[*ci];
+            if quote {
+                if c == '\\' && !nobackslashes && *ci + 1 < chars.len() {
+                    cmd.push(c);
+                    cmd.push(chars[*ci + 1]);
+                    *ci += 2;
+                    continue;
+                }
+                if c == '"' {
+                    quote = false;
+                }
+                cmd.push(c);
+                *ci += 1;
+                continue;
+            }
+            if brace > 0 {
+                // Inside a braced word everything is literal except the
+                // brace nesting itself.
+                match c {
+                    '{' => brace += 1,
+                    '}' => brace -= 1,
+                    _ => {}
+                }
+                cmd.push(c);
+                *ci += 1;
+                continue;
+            }
+            match c {
+                '\\' if !nobackslashes && *ci + 1 < chars.len() => {
+                    cmd.push(c);
+                    cmd.push(chars[*ci + 1]);
+                    *ci += 2;
+                }
+                '"' => { quote = true; cmd.push(c); *ci += 1; }
+                '{' => { brace = 1; cmd.push(c); *ci += 1; }
+                '[' => { bdepth += 1; cmd.push(c); *ci += 1; }
+                ']' if bdepth > 0 => { bdepth -= 1; cmd.push(c); *ci += 1; }
+                ']' => {
+                    *ci += 1;
+                    close = true;
+                    terminated = true;
+                    break;
+                }
+                ';' | '\n' => {
+                    *ci += 1;
+                    terminated = true;
+                    break;
+                }
+                _ => { cmd.push(c); *ci += 1; }
+            }
+        }
+        if terminated && !cmd.trim().is_empty() {
+            match interp.eval(&cmd) {
+                Ok(v) => result.push_str(v.as_str()),
+                Err(Error::ControlFlow {
+                    kind: crate::error::ControlFlow::Return,
+                    ref value,
+                    ..
+                }) => {
+                    let vtext = value
+                        .as_ref()
+                        .map(|v| v.as_str().to_string())
+                        .unwrap_or_default();
+                    if !close {
+                        check_bracket_tail(chars, ci, nobackslashes)?;
+                    }
+                    return Ok(SubstOutcome::Returned(vtext));
+                }
+                Err(Error::ControlFlow {
+                    kind: crate::error::ControlFlow::Break,
+                    ..
+                }) => return Ok(SubstOutcome::Break),
+                Err(Error::ControlFlow {
+                    kind: crate::error::ControlFlow::Continue,
+                    ..
+                }) => {
+                    if !close {
+                        check_bracket_tail(chars, ci, nobackslashes)?;
+                    }
+                    return Ok(SubstOutcome::Continue);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if close {
+            return Ok(SubstOutcome::Done(result));
+        }
+        if !terminated {
+            return Err(Error::Msg("missing close-bracket".to_string()));
+        }
+        // Terminated by `;`/newline — the next command of the same
+        // bracket follows.
+    }
+}
+
+/// Consume the remainder of a bracketed script after `return` or
+/// `continue` aborts it — not evaluated, but it must still parse
+/// (`set a {}""` surfaces "extra characters after close-brace",
+/// subst-8.7).
+fn check_bracket_tail(chars: &[char], ci: &mut usize, nobackslashes: bool) -> Result<()> {
+    let mut rest = String::new();
+    let mut brace = 0i32;
+    let mut bdepth = 0i32;
+    let mut quote = false;
+    while *ci < chars.len() {
+        let c = chars[*ci];
+        if quote {
+            if c == '\\' && !nobackslashes && *ci + 1 < chars.len() {
+                rest.push(c);
+                rest.push(chars[*ci + 1]);
+                *ci += 2;
+                continue;
+            }
+            if c == '"' {
+                quote = false;
+            }
+            rest.push(c);
+            *ci += 1;
+            continue;
+        }
+        if brace > 0 {
+            match c {
+                '{' => brace += 1,
+                '}' => brace -= 1,
+                _ => {}
+            }
+            rest.push(c);
+            *ci += 1;
+            continue;
+        }
+        match c {
+            '\\' if !nobackslashes && *ci + 1 < chars.len() => {
+                rest.push(c);
+                rest.push(chars[*ci + 1]);
+                *ci += 2;
+            }
+            '"' => { quote = true; rest.push(c); *ci += 1; }
+            '{' => { brace = 1; rest.push(c); *ci += 1; }
+            '[' => { bdepth += 1; rest.push(c); *ci += 1; }
+            ']' if bdepth > 0 => { bdepth -= 1; rest.push(c); *ci += 1; }
+            ']' => {
+                *ci += 1;
+                if let Err(pe) = rtcl_parser::parse(rest.trim_end()) {
+                    return Err(Error::Msg(pe.message));
+                }
+                return Ok(());
+            }
+            _ => { rest.push(c); *ci += 1; }
+        }
+    }
+    Err(Error::Msg("missing close-bracket".to_string()))
+}
+
+/// `$name`, `${any text}`, `$::ns::name` — returns the variable name;
+/// an empty result leaves the `$` literal.  Name characters follow the
+/// parser's rule: ASCII alphanumerics, `_`, and non-ASCII letters
+/// (symbols like `→` never join).  The array index is handled by the
+/// caller since it needs command substitution.
+fn scan_var_name(chars: &[char], ci: &mut usize) -> String {
+    let mut name = String::new();
+    if chars[*ci] == '{' {
+        *ci += 1;
+        while *ci < chars.len() && chars[*ci] != '}' {
+            name.push(chars[*ci]);
+            *ci += 1;
+        }
+        if *ci < chars.len() {
+            *ci += 1; // skip '}'
+        }
+        return name;
+    }
+    while *ci < chars.len() {
+        let c = chars[*ci];
+        if c == ':' && *ci + 1 < chars.len() && chars[*ci + 1] == ':' {
+            name.push_str("::");
+            *ci += 2;
+        } else if c.is_ascii_alphanumeric() || c == '_' || c.is_alphabetic() {
+            name.push(c);
+            *ci += 1;
+        } else {
+            break;
+        }
+    }
+    name
 }
 
 pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {

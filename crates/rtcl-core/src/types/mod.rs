@@ -1,6 +1,7 @@
 //! Type definitions and utilities
 
 pub mod expr;
+pub(crate) mod expr_check;
 pub(crate) mod expr_funcs;
 pub mod index;
 

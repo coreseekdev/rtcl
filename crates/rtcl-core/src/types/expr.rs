@@ -12,6 +12,16 @@ use crate::value::Value;
 
 /// Evaluate a Tcl expression
 pub fn eval_expr(interp: &mut Interp, expr: &str) -> Result<Value> {
+    // tclsh's parser rejects malformed expressions before any
+    // evaluation; run the same syntax pre-pass and log its errorInfo
+    // frame the way the C parser does (ERR_ALREADY_LOGGED: the harness
+    // continues the accumulated info with `invoked from within`).
+    if let Err(msg) = super::expr_check::check_expr(expr) {
+        interp.err_info =
+            Some(format!("{}\n{}", msg, super::expr_check::parsing_frame(expr)));
+        interp.err_fresh = false;
+        return Err(Error::Msg(msg));
+    }
     let mut parser = ExprParser::new(expr, interp);
     let result = parser.parse_ternary()?;
     Ok(canonicalize_result(result))

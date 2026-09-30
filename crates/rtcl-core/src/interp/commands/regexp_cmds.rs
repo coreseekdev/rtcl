@@ -135,6 +135,59 @@ pub(crate) fn engine_group_count(eng: &Engine, pattern: &str) -> usize {
     }
 }
 
+/// regexp-lite build (small-WASM path): single regex_lite engine, no
+/// backtracking fallback — a pattern regex_lite refuses is a compile
+/// error, mirroring the pre-dual-engine lite behavior.
+#[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
+pub(crate) struct Engine {
+    re: regex_lite::Regex,
+    anch: Option<regex_lite::Regex>,
+}
+
+#[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
+pub(crate) fn compile_engine(
+    pattern: &str,
+    nocase: bool,
+    expanded: bool,
+    lineanchor: bool,
+    linestop: bool,
+) -> std::result::Result<Engine, String> {
+    let built = build_pattern(pattern, nocase, expanded, lineanchor, linestop);
+    let re = regex_lite::Regex::new(&built).map_err(|e| e.to_string())?;
+    let anch = if has_string_anchor(pattern) {
+        Some(
+            regex_lite::Regex::new(&built.replace("\\A", "^"))
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    Ok(Engine { re, anch })
+}
+
+/// Attempt one match at char index `p` of `full_string`; returns capture
+/// ranges in full-string byte offsets, group 0 first.
+#[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
+pub(crate) fn engine_attempt(eng: &Engine, full_string: &str, p: usize) -> Option<GroupRanges> {
+    match &eng.anch {
+        Some(ra) => {
+            let off = char_to_byte(full_string, p);
+            regex_caps_at(ra, &full_string[off..], 0).map(|groups| {
+                groups
+                    .into_iter()
+                    .map(|g| g.map(|(s, e)| (s + off, e + off)))
+                    .collect()
+            })
+        }
+        None => regex_caps_at(&eng.re, full_string, char_to_byte(full_string, p)),
+    }
+}
+
+#[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
+pub(crate) fn engine_group_count(_eng: &Engine, pattern: &str) -> usize {
+    count_groups(pattern)
+}
+
 /// Parse a `-start` index with Tcl's index grammar
 /// (`integer?[+-]integer?` or `end?[+-]integer?`).  tclsh resolves
 /// `end` to the string *length* here (not length-1), so `-start end-1`

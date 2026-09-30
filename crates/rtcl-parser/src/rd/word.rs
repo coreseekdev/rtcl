@@ -261,7 +261,7 @@ fn parse_dollar(cur: &mut Cursor, tokens: &mut Tokens, _bracket_term: bool) -> P
             let is_var_start = match t {
                 Token::Other(c) if c.is_ascii_alphanumeric() || c == '_' => true,
                 Token::Colon if cur.peek_at(1) == Token::Colon => true,
-                Token::Other(c) if (c as u32) >= 0x80 => true,
+                Token::Other(c) if c.is_alphabetic() => true,
                 _ => false,
             };
             if is_var_start {

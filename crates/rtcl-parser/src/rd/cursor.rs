@@ -178,14 +178,19 @@ impl<'a> Cursor<'a> {
         match self.current {
             Token::Other(c) if c.is_ascii_alphanumeric() || c == '_' => true,
             Token::Colon if self.peek_at(1) == Token::Colon => true,
-            Token::Other(c) if (c as u32) >= 0x80 => true,
+            Token::Other(c) if c.is_alphabetic() => true,
             _ => false,
         }
     }
 
     /// Is `ch` a valid variable-name character?
+    ///
+    /// Non-ASCII letters (CJK etc.) extend rtcl beyond tclsh, whose bare
+    /// `$` scan is ASCII-only — but only *letters*: absorbing non-ASCII
+    /// symbols (`$ak→` reading the name as `ak→`) breaks standard Tcl
+    /// scripts that paste `$var` against arrows / full-width punctuation.
     pub fn is_varname_char(ch: char) -> bool {
-        ch.is_ascii_alphanumeric() || ch == '_' || (ch as u32) >= 0x80
+        ch.is_ascii_alphanumeric() || ch == '_' || ch.is_alphabetic()
     }
 
     /// Make a parse error at the current position.

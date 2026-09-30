@@ -15,6 +15,7 @@
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::interp::Interp;
+use crate::interp::commands::proc::move_alias_origins;
 use crate::value::Value;
 
 /// Metadata for a single namespace.
@@ -567,6 +568,23 @@ fn ns_import(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let cur = interp.current_namespace.clone();
 
+    // `namespace import` with no patterns lists this namespace's
+    // imported commands (namespace-old-9.5).
+    if i >= args.len() {
+        let prefix = ns_child_prefix(&cur);
+        let mut names: Vec<String> = interp
+            .import_aliases
+            .keys()
+            .filter_map(|k| k.strip_prefix(prefix.as_str()))
+            .filter(|r| !r.contains("::"))
+            .map(|s| s.to_string())
+            .collect();
+        names.sort();
+        return Ok(Value::from_list(
+            &names.iter().map(|s| Value::from_str(s)).collect::<Vec<_>>(),
+        ));
+    }
+
     for pat in &args[i..] {
         let p = pat.as_str();
         if p.is_empty() {
@@ -629,24 +647,72 @@ fn ns_import(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             .map(|k| (ns_tail_str(k).to_string(), k.clone()))
             .collect();
 
-        for (short_name, full_name) in matching {
-            let target = qualify(&cur, &short_name);
+        // First pass: classify each candidate without mutating — tclsh
+        // reports the first conflict before binding anything, so a failed
+        // import leaves no partial aliases behind (namespace-old-9.15:
+        // `can't import command "cmd1": already exists` imports no cmd2).
+        let mut binds: Vec<(String, String)> = Vec::new();
+        let mut removes: Vec<String> = Vec::new();
+        let mut conflict: Option<String> = None;
+        for (short_name, full_name) in &matching {
+            let target = qualify(&cur, short_name);
             if let Some(existing) = interp.import_aliases.get(&target) {
-                if existing == &full_name {
+                if existing == full_name {
                     continue; // re-import of the same origin: silent
                 }
                 if !force {
-                    return Err(Error::runtime(
-                        format!("can't import command \"{}\": already exists", short_name),
-                        ErrorCode::InvalidOp,
-                    ));
+                    conflict = Some(short_name.clone());
+                    break;
                 }
-            } else if interp.procs.contains_key(&target) && !force {
-                return Err(Error::runtime(
-                    format!("can't import command \"{}\": already exists", short_name),
-                    ErrorCode::InvalidOp,
-                ));
+                removes.push(target.clone());
+                binds.push((target, full_name.clone()));
+                continue;
             }
+            // An existing command of that name in the target namespace
+            // conflicts.  Procs defined at global scope are keyed by their
+            // as-typed name ("cmd1", not "::cmd1").
+            let at_global = cur == "::";
+            let bare = target.trim_start_matches("::").to_string();
+            let proc_hit = interp.procs.contains_key(&target)
+                || (at_global && interp.procs.contains_key(&bare));
+            let ens_hit = interp.ensembles.contains_key(&target)
+                || (at_global && interp.ensembles.contains_key(&bare));
+            // Importing over a builtin conflicts too (unknown is not a
+            // command tclsh has pre-defined, so it never conflicts).
+            let builtin_hit = at_global
+                && bare != "unknown"
+                && interp.commands.contains_key(&bare);
+            if proc_hit || ens_hit || builtin_hit {
+                if !force {
+                    conflict = Some(short_name.clone());
+                    break;
+                }
+                // -force replaces the existing binding.  Replacing a proc
+                // (or ensemble) deletes it — and aliases re-imported from
+                // it; builtin replacements keep the builtin registered
+                // (dispatch finds builtins first; no corpus case imports
+                // over one).
+                removes.push(target.clone());
+                if at_global && bare != target {
+                    removes.push(bare.clone());
+                }
+                binds.push((target, full_name.clone()));
+                continue;
+            }
+            binds.push((target, full_name.clone()));
+        }
+        if let Some(name) = conflict {
+            return Err(Error::runtime(
+                format!("can't import command \"{}\": already exists", name),
+                ErrorCode::InvalidOp,
+            ));
+        }
+        for key in removes {
+            interp.procs.remove(&key);
+            interp.ensembles.remove(&key);
+            move_alias_origins(interp, &key, "");
+        }
+        for (target, full_name) in binds {
             interp.import_aliases.insert(target, full_name);
         }
     }

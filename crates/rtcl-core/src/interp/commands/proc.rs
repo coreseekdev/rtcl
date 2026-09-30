@@ -547,7 +547,22 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             } else {
                 format!("::{}", new_key)
             };
-            interp.import_aliases.insert(new_alias_key, origin);
+            interp.import_aliases.insert(new_alias_key.clone(), origin);
+            // Aliases imported *from* this alias track the origin command,
+            // not its name, so they follow the rename.
+            let moved: Vec<String> = interp
+                .import_aliases
+                .iter()
+                .filter(|(_, o)| o.as_str() == old_key)
+                .map(|(a, _)| a.clone())
+                .collect();
+            for dep in moved {
+                interp.import_aliases.insert(dep, new_alias_key.clone());
+            }
+        } else {
+            // Deleting the alias deletes its dependent re-imports too
+            // (namespace-old-9.18).
+            move_alias_origins(interp, &old_key, "");
         }
         return Ok(Value::empty());
     }
@@ -579,28 +594,45 @@ fn finish_cmd_rename(
 
 /// Import aliases follow renames of their origin (tclsh 48.2: renaming
 /// `foo::bar` keeps the imported `bar` dispatching).
-fn move_alias_origins(interp: &mut Interp, old_key: &str, new_key: &str) {
+pub(crate) fn move_alias_origins(interp: &mut Interp, old_key: &str, new_key: &str) {
     if old_key == new_key {
         return;
     }
-    let moved: Vec<String> = interp
-        .import_aliases
-        .iter()
-        .filter(|(_, origin)| origin.as_str() == old_key)
-        .map(|(a, _)| a.clone())
-        .collect();
-    for alias in moved {
+    if new_key.is_empty() {
         // Deleting the origin deletes the imported alias with it (48.2:
-        // `rename foo::bar2 {}` → exist spong = 0).
-        if new_key.is_empty() {
-            interp.import_aliases.remove(&alias);
-        } else {
+        // `rename foo::bar2 {}` → exist spong = 0) — and transitively,
+        // aliases imported *from* that alias (namespace-old-9.18:
+        // renaming `test_ns_import::cmd1` {} removes the global `::cmd1`
+        // and `test_ns_import_use::cmd1` re-imports of it).
+        let mut removed_keys: Vec<String> = vec![old_key.to_string()];
+        loop {
+            let doomed: Vec<String> = interp
+                .import_aliases
+                .iter()
+                .filter(|(_, origin)| removed_keys.iter().any(|k| origin == &k))
+                .map(|(a, _)| a.clone())
+                .collect();
+            if doomed.is_empty() {
+                break;
+            }
+            for alias in &doomed {
+                interp.import_aliases.remove(alias);
+                removed_keys.push(alias.clone());
+            }
+        }
+    } else {
+        let moved: Vec<String> = interp
+            .import_aliases
+            .iter()
+            .filter(|(_, origin)| origin.as_str() == old_key)
+            .map(|(a, _)| a.clone())
+            .collect();
+        for alias in moved {
             interp.import_aliases.insert(alias, new_key.to_string());
         }
     }
     // An ensemble renaming onto/away from an alias-resolved key is handled
     // by find_ensemble_key's alias chain at dispatch time.
-    let _ = new_key;
 }
 
 /// Resolve a command name to its registered key, mirroring dispatch's

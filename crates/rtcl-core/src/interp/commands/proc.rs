@@ -379,6 +379,20 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Ok(Value::empty());
     }
 
+    // Rename an import alias: the alias entry itself moves (the origin
+    // keeps its key; alias-table keys are always fully qualified).
+    if let Some(origin) = interp.import_aliases.remove(&old_key) {
+        if !new_key.is_empty() {
+            let new_alias_key = if new_key.starts_with("::") {
+                new_key.clone()
+            } else {
+                format!("::{}", new_key)
+            };
+            interp.import_aliases.insert(new_alias_key, origin);
+        }
+        return Ok(Value::empty());
+    }
+
     Err(Error::runtime(
         format!("can't rename \"{}\": command doesn't exist", old_name),
         crate::error::ErrorCode::NotFound,
@@ -410,14 +424,20 @@ fn move_alias_origins(interp: &mut Interp, old_key: &str, new_key: &str) {
     if old_key == new_key {
         return;
     }
-    let moved: Vec<(String, String)> = interp
+    let moved: Vec<String> = interp
         .import_aliases
         .iter()
         .filter(|(_, origin)| origin.as_str() == old_key)
-        .map(|(a, _)| (a.clone(), new_key.to_string()))
+        .map(|(a, _)| a.clone())
         .collect();
-    for (alias, origin) in moved {
-        interp.import_aliases.insert(alias, origin);
+    for alias in moved {
+        // Deleting the origin deletes the imported alias with it (48.2:
+        // `rename foo::bar2 {}` → exist spong = 0).
+        if new_key.is_empty() {
+            interp.import_aliases.remove(&alias);
+        } else {
+            interp.import_aliases.insert(alias, new_key.to_string());
+        }
     }
     // An ensemble renaming onto/away from an alias-resolved key is handled
     // by find_ensemble_key's alias chain at dispatch time.
@@ -468,11 +488,27 @@ pub(crate) fn resolve_command_key(interp: &Interp, name: &str) -> Option<String>
     if interp.current_namespace != "::" && !name.starts_with("::") {
         keys.push(super::namespace::qualify(&interp.current_namespace, name));
     }
-    if !name.starts_with("::") && name.contains("::") {
+    if !name.starts_with("::") {
+        // A relative name from the global level names `::name`
+        // (ensembles created with `-command ::foo`, renamed as `foo`).
         keys.push(format!("::{}", name));
     }
-    keys.into_iter()
-        .find(|k| interp.ensembles.contains_key(k))
+    if let Some(k) = keys.into_iter().find(|k| interp.ensembles.contains_key(k)) {
+        return Some(k);
+    }
+    // Import aliases are real commands: renaming one moves the alias
+    // itself, not the origin (48.2).
+    let alias_key = if name.starts_with("::") {
+        name.to_string()
+    } else if interp.current_namespace != "::" {
+        super::namespace::qualify(&interp.current_namespace, name)
+    } else {
+        format!("::{}", name)
+    };
+    if interp.import_aliases.contains_key(&alias_key) {
+        return Some(alias_key);
+    }
+    None
 }
 
 #[cfg(test)]

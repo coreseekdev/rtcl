@@ -146,13 +146,15 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // If an initial value is provided, set it.  A bare `variable name`
         // declares the link without creating the variable (tclsh:
         // `namespace eval n {variable v}; info exists n::v` → 0).
-        if i + 1 < args.len() {
+        let init_value = if i + 1 < args.len() {
             let val = args[i + 1].clone();
             interp.globals.insert(qualified.clone(), val);
             i += 2;
+            Some(args[i - 1].clone())
         } else {
             i += 1;
-        }
+            None
+        };
 
         // Register the name in the namespace's variable table either way.
         if let Some(info) = interp.namespaces.get_mut(&ns) {
@@ -160,14 +162,20 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
 
         // If we're inside a proc, create an upvar link from the local
-        // name to the namespace-qualified global name.
+        // name to the namespace-qualified global name.  An initial value
+        // also seeds a real local: the tclsh link is a refcounted shared
+        // Var, so the local keeps the value even if the namespace (and its
+        // variable) is deleted while the proc runs (46.8).
         if !interp.frames.is_empty() {
             let local_name = ns_tail_str(raw_name).to_string();
             let frame_idx = interp.frames.len() - 1;
             interp.frames[frame_idx].upvars.insert(
-                local_name,
+                local_name.clone(),
                 crate::interp::UpvarLink::Global(qualified),
             );
+            if let Some(val) = init_value {
+                interp.frames[frame_idx].locals.insert(local_name, val);
+            }
         }
     }
     Ok(Value::empty())
@@ -1002,7 +1010,15 @@ pub(crate) fn find_ensemble_key(interp: &Interp, name: &str) -> Option<String> {
     if name.contains("::") {
         let norm = normalise(name);
         if norm != name {
-            try_keys.push(norm);
+            try_keys.push(norm.clone());
+        }
+        // An absolute simple name (`::ns`, or a colon run like `::::n1`
+        // that normalises to one) reaches an ensemble registered under the
+        // bare tail in the parent namespace (ensemble create's default).
+        if let Some(bare) = norm.strip_prefix("::") {
+            if !bare.contains("::") {
+                try_keys.push(bare.to_string());
+            }
         }
     }
     for k in &try_keys {
@@ -1154,18 +1170,17 @@ fn ens_miss_error(
     )
 }
 
-/// Run `call` (a resolved command word list) in the ensemble's backing
-/// namespace.
+/// Run `call` (a resolved command word list).  tclsh's EnsembleInvoke
+/// evaluates the implementation with TCL_EVAL_INVOKE — the *caller's*
+/// namespace context, no switch to the backing namespace (46.7: the impl
+/// `::namespace delete ns` must resolve `ns` where the caller resolves it).
 fn ens_run(
     interp: &mut Interp,
     ns: &str,
     call: &[Value],
 ) -> Result<Value> {
-    let saved = interp.current_namespace.clone();
-    interp.current_namespace = ns.to_string();
-    let r = interp.dispatch_values(call);
-    interp.current_namespace = saved;
-    r
+    let _ = ns;
+    interp.dispatch_values(call)
 }
 
 /// Ensemble command dispatch: `ens sub ?args...?`.
@@ -1274,7 +1289,25 @@ fn ens_configure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         ));
     }
     let typed = args[0].as_str().to_string();
-    let key = find_ensemble_key(interp, &typed).ok_or_else(|| {
+    // The ensemble command name — or the name of its backing namespace
+    // (45.1: `namespace ensemble configure ::ns` inside `ns` names the
+    // namespace whose attached ensemble is meant).
+    let key = find_ensemble_key(interp, &typed)
+        .or_else(|| {
+            let ns = if typed.starts_with("::") {
+                normalise(&typed)
+            } else if interp.current_namespace == "::" {
+                format!("::{}", typed)
+            } else {
+                qualify(&interp.current_namespace, &typed)
+            };
+            interp
+                .ensembles
+                .iter()
+                .find(|(_, def)| def.namespace == ns)
+                .map(|(k, _)| k.clone())
+        })
+        .ok_or_else(|| {
         if command_exists(interp, &typed) {
             Error::runtime(
                 format!("\"{}\" is not an ensemble command", typed),

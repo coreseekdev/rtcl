@@ -225,7 +225,15 @@ impl Interp {
         if let Some(frame) = self.frames.last() {
             if let Some(link) = frame.upvars.get(name) {
                 return match link {
-                    UpvarLink::Global(gname) => self.globals.get(gname.as_str()),
+                    // A `variable`-linked name whose namespace variable was
+                    // deleted mid-proc still reads the local copy the
+                    // `variable` command seeded (tclsh: the linked Var is
+                    // refcounted; 46.8 `info exist x` → 1 after
+                    // `namespace delete [namespace current]`).
+                    UpvarLink::Global(gname) => self
+                        .globals
+                        .get(gname.as_str())
+                        .or_else(|| frame.locals.get(name)),
                     UpvarLink::Frame { frame_index, var_name } => {
                         self.frames.get(*frame_index)
                             .and_then(|f| f.locals.get(var_name.as_str()))

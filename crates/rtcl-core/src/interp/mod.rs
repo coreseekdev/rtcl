@@ -417,6 +417,7 @@ impl Interp {
         // --- $tcl_version, $tcl_patchLevel ---
         self.globals.insert("tcl_version".to_string(), Value::from_str("8.6"));
         self.globals.insert("tcl_patchLevel".to_string(), Value::from_str("8.6.0-rtcl"));
+        self.globals.insert("tcl_library".to_string(), Value::from_str("/usr/share/tcltk/tcl8.6"));
     }
 
     /// Whether we are inside a procedure scope.

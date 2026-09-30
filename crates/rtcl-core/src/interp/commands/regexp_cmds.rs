@@ -48,6 +48,93 @@ pub(crate) fn build_pattern(
     format!("{}{}", prefix, pattern)
 }
 
+/// The dual regex engine: the `regex` crate is the fast path; patterns it
+/// refuses (backreferences, look-around, `\m\M\y\Y`, `(?b)` BRE mode,
+/// literal braces) fall back to the hand-rolled backtracking engine in
+/// [`super::regexp_bt`], which implements Tcl ARE semantics.
+#[cfg(feature = "regexp")]
+pub(crate) enum Engine {
+    Fast {
+        re: regex::Regex,
+        anch: Option<regex::Regex>,
+    },
+    Full(super::regexp_bt::BtProg),
+}
+
+/// Compile with the fast engine first; on a compile error, retry with the
+/// backtracking engine. The reported error is the fast engine's.
+#[cfg(feature = "regexp")]
+pub(crate) fn compile_engine(
+    pattern: &str,
+    nocase: bool,
+    expanded: bool,
+    lineanchor: bool,
+    linestop: bool,
+) -> std::result::Result<Engine, String> {
+    let built = build_pattern(pattern, nocase, expanded, lineanchor, linestop);
+    match regex::Regex::new(&built) {
+        Err(fe) => super::regexp_bt::bt_compile(pattern, nocase, expanded, lineanchor, linestop)
+            .map(Engine::Full)
+            .map_err(|_| fe.to_string()),
+        Ok(re) => {
+            let anch = if has_string_anchor(pattern) {
+                Some(
+                    regex::Regex::new(&built.replace("\\A", "^"))
+                        .map_err(|e| e.to_string())?,
+                )
+            } else {
+                None
+            };
+            Ok(Engine::Fast { re, anch })
+        }
+    }
+}
+
+/// Attempt one match at char index `p` of `full_string`; returns capture
+/// ranges in full-string byte offsets, group 0 first.
+#[cfg(feature = "regexp")]
+pub(crate) fn engine_attempt(eng: &Engine, full_string: &str, p: usize) -> Option<GroupRanges> {
+    match eng {
+        Engine::Full(prog) => {
+            let off = char_to_byte(full_string, p);
+            super::regexp_bt::bt_caps_at(prog, &full_string[off..]).map(|groups| {
+                groups
+                    .into_iter()
+                    .map(|g| g.map(|(s, e)| (s + off, e + off)))
+                    .collect()
+            })
+        }
+        Engine::Fast { re, anch } => match anch {
+            Some(ra) => {
+                let off = char_to_byte(full_string, p);
+                regex_caps_at(ra, &full_string[off..], 0).map(|groups| {
+                    groups
+                        .into_iter()
+                        .map(|g| g.map(|(s, e)| (s + off, e + off)))
+                        .collect()
+                })
+            }
+            None => regex_caps_at(re, full_string, char_to_byte(full_string, p)),
+        },
+    }
+}
+
+#[cfg(feature = "regexp")]
+pub(crate) fn engine_is_match(eng: &Engine, s: &str) -> bool {
+    match eng {
+        Engine::Fast { re, .. } => re.is_match(s),
+        Engine::Full(p) => super::regexp_bt::bt_is_match(p, s),
+    }
+}
+
+#[cfg(feature = "regexp")]
+pub(crate) fn engine_group_count(eng: &Engine, pattern: &str) -> usize {
+    match eng {
+        Engine::Fast { .. } => count_groups(pattern),
+        Engine::Full(p) => p.ngroups,
+    }
+}
+
 /// Parse a `-start` index with Tcl's index grammar
 /// (`integer?[+-]integer?` or `end?[+-]integer?`).  tclsh resolves
 /// `end` to the string *length* here (not length-1), so `-start end-1`
@@ -304,13 +391,13 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // -about: report {numGroups flags} without needing a string.
     if about {
-        let built = build_pattern(pattern_str, nocase, expanded, lineanchor, linestop);
-        Regex::new(&built).map_err(|e| {
-            Error::runtime(
-                format!("couldn't compile regular expression pattern: {}", e),
-                ErrorCode::Generic,
-            )
-        })?;
+        let eng = compile_engine(pattern_str, nocase, expanded, lineanchor, linestop)
+            .map_err(|e| {
+                Error::runtime(
+                    format!("couldn't compile regular expression pattern: {}", e),
+                    ErrorCode::Generic,
+                )
+            })?;
         let nongreedy = pattern_is_nongreedy(pattern_str);
         let mut flags: Vec<&str> = Vec::new();
         if pattern_is_nonposix(pattern_str, nongreedy) {
@@ -324,7 +411,7 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         return Ok(Value::from_str(&format!(
             "{} {{{}}}",
-            count_groups(pattern_str),
+            engine_group_count(&eng, pattern_str),
             flags.join(" ")
         )));
     }
@@ -351,38 +438,14 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         None => 0,
     };
 
-    let built = build_pattern(pattern_str, nocase, expanded, lineanchor, linestop);
-    let re = Regex::new(&built).map_err(|e| {
+    let eng = compile_engine(pattern_str, nocase, expanded, lineanchor, linestop).map_err(|e| {
         Error::runtime(
             format!("couldn't compile regular expression pattern: {}", e),
             ErrorCode::Generic,
         )
     })?;
-    let re_anch = if has_string_anchor(pattern_str) {
-        Some(Regex::new(&built.replace("\\A", "^")).map_err(|e| {
-            Error::runtime(
-                format!("couldn't compile regular expression pattern: {}", e),
-                ErrorCode::Generic,
-            )
-        })?)
-    } else {
-        None
-    };
 
-    let attempt = |p: usize| -> Option<GroupRanges> {
-        match &re_anch {
-            Some(ra) => {
-                let off = char_to_byte(full_string, p);
-                regex_caps_at(ra, &full_string[off..], 0).map(|groups| {
-                    groups
-                        .into_iter()
-                        .map(|g| g.map(|(s, e)| (s + off, e + off)))
-                        .collect()
-                })
-            }
-            None => regex_caps_at(&re, full_string, char_to_byte(full_string, p)),
-        }
-    };
+    let attempt = |p: usize| -> Option<GroupRanges> { engine_attempt(&eng, full_string, p) };
     let matches = collect_matches(full_string, attempt, char_len, char_start, all);
 
     // Build a per-match list element: the group's text, or its
@@ -537,47 +600,30 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
     let byte_start = char_to_byte(full_string, char_start);
 
-    let built = build_pattern(pattern_str, nocase, expanded, lineanchor, linestop);
-    let re = Regex::new(&built).map_err(|e| {
+    let eng = compile_engine(pattern_str, nocase, expanded, lineanchor, linestop).map_err(|e| {
         Error::runtime(
             format!("couldn't compile regular expression pattern: {}", e),
             ErrorCode::Generic,
         )
     })?;
-    let re_anch = if has_string_anchor(pattern_str) {
-        Some(Regex::new(&built.replace("\\A", "^")).map_err(|e| {
-            Error::runtime(
-                format!("couldn't compile regular expression pattern: {}", e),
-                ErrorCode::Generic,
-            )
-        })?)
-    } else {
-        None
-    };
 
     if command_mode {
         // -command: evaluate sub_spec as command prefix for each match
         // (rtcl extension; not exercised under -start by the corpus).
-        let prefix = &full_string[..byte_start];
-        let string = &full_string[byte_start..];
-        let mut result = String::from(prefix);
+        let attempt = |p: usize| -> Option<GroupRanges> { engine_attempt(&eng, full_string, p) };
+        let matches = collect_matches(full_string, attempt, char_len, char_start, all);
+        let mut result = String::from(&full_string[..byte_start]);
+        let mut last = byte_start;
         let mut count = 0i64;
-        let mut last_end = 0;
 
-        let captures: Vec<_> = if all {
-            re.captures_iter(string).collect()
-        } else {
-            re.captures(string).into_iter().collect()
-        };
-
-        for caps in &captures {
-            let full_match = caps.get(0).unwrap();
-            result.push_str(&string[last_end..full_match.start()]);
+        for groups in &matches {
+            let Some((bs, be)) = groups[0] else { continue };
+            result.push_str(&full_string[last..bs]);
 
             // Build command: subSpec fullMatch capture1 capture2 ...
             let mut cmd_str = sub_spec.to_string();
-            for j in 0..caps.len() {
-                let m = caps.get(j).map(|m| m.as_str()).unwrap_or("");
+            for j in 0..groups.len() {
+                let m = groups[j].map(|(s, e)| &full_string[s..e]).unwrap_or("");
                 cmd_str.push(' ');
                 // Quote the argument for Tcl eval
                 cmd_str.push('{');
@@ -586,10 +632,10 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let replacement = interp.eval(&cmd_str)?;
             result.push_str(replacement.as_str());
-            last_end = full_match.end();
+            last = be;
             count += 1;
         }
-        result.push_str(&string[last_end..]);
+        result.push_str(&full_string[last..]);
 
         if let Some(var) = var_name {
             interp.set_var(var, Value::from_str(&result))?;
@@ -601,20 +647,7 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Standard mode: Tcl substitution spec applied to the matches the
     // -start/-all scan yields.  regsub assigns varName unconditionally,
     // even when nothing is replaced.
-    let attempt = |p: usize| -> Option<GroupRanges> {
-        match &re_anch {
-            Some(ra) => {
-                let off = char_to_byte(full_string, p);
-                regex_caps_at(ra, &full_string[off..], 0).map(|groups| {
-                    groups
-                        .into_iter()
-                        .map(|g| g.map(|(s, e)| (s + off, e + off)))
-                        .collect()
-                })
-            }
-            None => regex_caps_at(&re, full_string, char_to_byte(full_string, p)),
-        }
-    };
+    let attempt = |p: usize| -> Option<GroupRanges> { engine_attempt(&eng, full_string, p) };
     let matches = collect_matches(full_string, attempt, char_len, char_start, all);
 
     let mut result = String::from(&full_string[..byte_start]);

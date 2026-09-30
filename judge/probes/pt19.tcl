@@ -1,0 +1,1 @@
+puts [catch {lsearch -subindices -index end {{1 a}} a} m]; puts $m; puts [catch {lsearch -subindices -all -index end {{1 a}} a} m]; puts $m; puts [catch {lsearch -subindices -index {0 0} {{{x x} {x b} {a d}} {{a c} {a b} {a a}}} a} m]; puts $m

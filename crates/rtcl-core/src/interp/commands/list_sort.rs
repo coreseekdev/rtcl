@@ -238,15 +238,18 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     // Compile the regexp before the list parse (tclsh does this to avoid
-    // shimmering between the regexp and list reps).
+    // shimmering between the regexp and list reps). Uses the dual engine:
+    // fast `regex` crate first, backtracking fallback for patterns the
+    // fast engine rejects.
     let pat_val = &args[args.len() - 1];
     #[cfg(feature = "regexp")]
     let re = if mode == Mode::Regexp {
-        let pat =
-            super::regexp_cmds::build_pattern(pat_val.as_str(), nocase, false, false, false);
-        Some(regex::Regex::new(&pat).map_err(|e| {
-            tcl_err(format!("couldn't compile regular expression pattern: {}", e))
-        })?)
+        Some(
+            super::regexp_cmds::compile_engine(pat_val.as_str(), nocase, false, false, false)
+                .map_err(|e| {
+                    tcl_err(format!("couldn't compile regular expression pattern: {}", e))
+                })?,
+        )
     } else {
         None
     };
@@ -449,7 +452,11 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     Mode::Regexp => {
                         #[cfg(feature = "regexp")]
                         {
-                            re.as_ref().map(|r| r.is_match(item.as_str())).unwrap_or(false)
+                            re.as_ref()
+                                .map(|eng| {
+                                    super::regexp_cmds::engine_is_match(eng, item.as_str())
+                                })
+                                .unwrap_or(false)
                         }
                         #[cfg(not(feature = "regexp"))]
                         {

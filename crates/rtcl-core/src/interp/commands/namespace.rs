@@ -135,7 +135,13 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut i = 1;
     while i < args.len() {
         let raw_name = args[i].as_str();
-        let qualified = var_key(&qualify(&ns, raw_name));
+        // An empty variable name survives qualification: `variable {}` in
+        // namespace n declares n's variable named "" (key `n::`).
+        let qualified = if raw_name.is_empty() && ns != "::" {
+            var_key(&format!("{}::", ns))
+        } else {
+            var_key(&qualify(&ns, raw_name))
+        };
 
         // If an initial value is provided, set it.  A bare `variable name`
         // declares the link without creating the variable (tclsh:
@@ -254,7 +260,9 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // Ensembles registered in (or under) the tree; an ensemble whose
         // BACKING namespace goes away goes too.
         interp.ensembles.retain(|k, def| {
-            !k.starts_with(&prefix) && !def.namespace.starts_with(&prefix)
+            !k.starts_with(&prefix)
+                && def.namespace != qualified
+                && !def.namespace.starts_with(&prefix)
         });
     }
     Ok(Value::empty())
@@ -470,6 +478,13 @@ fn ns_code(interp: &Interp, args: &[Value]) -> Result<Value> {
             "arg",
         ));
     }
+    // An already-scoped value passes through unchanged — deliberately
+    // unforgiving, only [::namespace code]'s own output style qualifies
+    // (tclsh bug 3202171).
+    let arg = args[2].as_str();
+    if arg.starts_with("::namespace inscope ") && arg.len() > 20 {
+        return Ok(args[2].clone());
+    }
     Ok(Value::from_list(&[
         Value::from_str("::namespace"),
         Value::from_str("inscope"),
@@ -575,12 +590,15 @@ fn ns_import(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // Candidates: the source's own procs plus its imported aliases —
         // an imported command re-exported by the source (`namespace
         // export *`) is imported as a NEW alias on the ultimate origin
-        // (tclsh 8.6.17 namespace-22.1 chain).
+        // (tclsh 8.6.17 namespace-22.1 chain).  Ensemble commands import
+        // too (48.1: `namespace import foo::bar` where bar is an ensemble).
         let proc_keys: Vec<String> = interp.procs.keys().cloned().collect();
         let alias_keys: Vec<String> = interp.import_aliases.keys().cloned().collect();
+        let ens_keys: Vec<String> = interp.ensembles.keys().cloned().collect();
         let matching: Vec<(String, String)> = proc_keys
             .iter()
             .chain(alias_keys.iter())
+            .chain(ens_keys.iter())
             .filter(|k| {
                 k.strip_prefix(&prefix)
                     .filter(|rest| !rest.contains("::") && crate::interp::glob_match(&tail, rest))
@@ -781,6 +799,24 @@ const ENS_CREATE_OPTIONS: [&str; 6] = [
     "-command", "-map", "-parameters", "-prefixes", "-subcommands", "-unknown",
 ];
 
+/// Resolve an ensemble option by exact match or unique prefix (tclsh:
+/// `-subcomm` selects `-subcommands`).  `None` = no match or ambiguous.
+fn resolve_ens_opt(opt: &str) -> Option<&'static str> {
+    if let Some(exact) = ENS_CREATE_OPTIONS.iter().find(|o| **o == opt) {
+        return Some(exact);
+    }
+    let matches: Vec<&'static str> = ENS_CREATE_OPTIONS
+        .iter()
+        .copied()
+        .filter(|o| o.starts_with(opt))
+        .collect();
+    if matches.len() == 1 {
+        Some(matches[0])
+    } else {
+        None
+    }
+}
+
 /// Parse a boolean option value (`-prefixes 0`).
 fn ens_bool(v: &Value, opt: &str) -> Result<bool> {
     let s = v.as_str();
@@ -864,7 +900,18 @@ fn ens_create(interp: &mut Interp, opts: &[Value]) -> Result<Value> {
         ));
     }
     let ns = interp.current_namespace.clone();
-    let mut name = ns.clone();
+    // The ensemble command is named after the namespace and lives in its
+    // PARENT (tclsh: `namespace eval ns {namespace ensemble create}` yields
+    // the command `ns`, callable from the parent level).
+    let mut name = if ns == "::" {
+        ns.clone()
+    } else {
+        let tail = ns.rsplit("::").next().unwrap_or("").to_string();
+        match parent_of(&ns) {
+            p if p == "::" => tail,
+            p => format!("{}::{}", p, tail),
+        }
+    };
     let mut def = crate::interp::EnsembleDef {
         namespace: ns.clone(),
         map: Vec::new(),
@@ -875,8 +922,21 @@ fn ens_create(interp: &mut Interp, opts: &[Value]) -> Result<Value> {
     };
     let mut i = 0;
     while i < opts.len() {
-        let opt = opts[i].as_str();
         let val = &opts[i + 1];
+        let opt = match resolve_ens_opt(opts[i].as_str()) {
+            Some(o) => o,
+            None => {
+                let list: Vec<&str> = ENS_CREATE_OPTIONS.iter().copied().collect();
+                return Err(Error::runtime(
+                    format!(
+                        "bad option \"{}\": must be {}",
+                        opts[i].as_str(),
+                        join_or(&list)
+                    ),
+                    ErrorCode::InvalidOp,
+                ));
+            }
+        };
         match opt {
             "-command" => name = qualify(&ns, val.as_str()),
             "-map" => def.map = parse_ens_map(interp, &ns, val)?,
@@ -907,17 +967,7 @@ fn ens_create(interp: &mut Interp, opts: &[Value]) -> Result<Value> {
                         .collect(),
                 );
             }
-            other => {
-                let list: Vec<&str> = ENS_CREATE_OPTIONS.iter().copied().collect();
-                return Err(Error::runtime(
-                    format!(
-                        "bad option \"{}\": must be {}",
-                        other,
-                        join_or(&list)
-                    ),
-                    ErrorCode::InvalidOp,
-                ));
-            }
+            _ => unreachable!(),
         }
         i += 2;
     }
@@ -977,6 +1027,15 @@ pub(crate) fn find_ensemble_key(interp: &Interp, name: &str) -> Option<String> {
 fn ens_candidates(interp: &Interp, def: &crate::interp::EnsembleDef) -> Vec<String> {
     if let Some(subs) = &def.subcommands {
         return subs.clone();
+    }
+    if !def.map.is_empty() {
+        // A non-empty -map defines the subcommand set by itself (tclsh
+        // 43.1: with `-map {a x1 b x2}` a miss lists "a, or b", not the
+        // exported procs).
+        let mut keys: Vec<String> = def.map.iter().map(|(k, _)| k.clone()).collect();
+        keys.sort();
+        keys.dedup();
+        return keys;
     }
     let exports = interp
         .namespaces
@@ -1272,7 +1331,26 @@ fn ens_configure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let mut i = 1;
     while i < args.len() {
-        let opt = args[i].as_str();
+        // Configure accepts the create options (plus get-only -namespace)
+        // by exact name or unique prefix.
+        let raw = args[i].as_str();
+        let opt = {
+            let mut pool: Vec<&'static str> = ENS_CREATE_OPTIONS.to_vec();
+            pool.push("-namespace");
+            match pool.iter().find(|o| **o == raw).copied().or_else(|| {
+                let m: Vec<&'static str> =
+                    pool.iter().copied().filter(|o| o.starts_with(raw)).collect();
+                if m.len() == 1 { Some(m[0]) } else { None }
+            }) {
+                Some(o) => o,
+                None => {
+                    return Err(Error::runtime(
+                        format!("bad option \"{}\": must be {}", raw, join_or(&pool)),
+                        ErrorCode::InvalidOp,
+                    ));
+                }
+            }
+        };
         let get_only = opt == "-namespace";
         if i + 1 >= args.len() || get_only {
             // GET

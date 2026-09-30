@@ -452,6 +452,17 @@ pub(crate) fn resolve_command_key(interp: &Interp, name: &str) -> Option<String>
             return Some(norm);
         }
     }
+    // A `::`-qualified simple name in the global namespace: builtins and
+    // global procs are keyed unqualified (`rename ::unknown ...`, 52.6).
+    if name.starts_with("::") && !name[2..].contains("::") {
+        let bare = &name[2..];
+        if interp.procs.contains_key(bare)
+            || interp.commands.contains_key(bare)
+            || interp.ensembles.contains_key(bare)
+        {
+            return Some(bare.to_string());
+        }
+    }
     // Namespace ensembles resolve like commands for rename.
     let mut keys: Vec<String> = vec![name.to_string()];
     if interp.current_namespace != "::" && !name.starts_with("::") {

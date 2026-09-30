@@ -103,24 +103,6 @@ impl Interp {
                 }
             })
             .or_else(|| {
-                // Ancestor namespaces: a command inherited from an
-                // enclosing namespace resolves unqualified (tclsh 52.2:
-                // ::bar::jim::test sees ::bar's `foo`).
-                let mut anc = self.current_namespace.clone();
-                loop {
-                    if anc == "::" {
-                        return None;
-                    }
-                    anc = crate::interp::commands::namespace::parent_of(&anc);
-                    let q = crate::interp::commands::namespace::qualify(
-                        &anc, cmd_name,
-                    );
-                    if let Some(p) = self.procs.get(&q).cloned() {
-                        return Some((p, q));
-                    }
-                }
-            })
-            .or_else(|| {
                 // Import aliases: follow the chain to the origin so the
                 // proc runs in its definition namespace with its current
                 // body (tclsh: redefining the source is visible).
@@ -140,6 +122,17 @@ impl Interp {
                     }
                 }
                 None
+            })
+            .or_else(|| {
+                // Global fallback: after the current namespace misses, an
+                // unqualified name reaches the global namespace's `::name`
+                // proc (tclsh 52.2: `foo` inside ::bar::jim finds ::foo).
+                if !cmd_name.starts_with("::") {
+                    let qualified = format!("::{}", cmd_name);
+                    self.procs.get(&qualified).cloned().map(|p| (p, qualified))
+                } else {
+                    None
+                }
             });
         if let Some((proc_def, resolved_name)) = proc_lookup {
             return self.call_proc(&proc_def, &args, &resolved_name, None);
@@ -243,12 +236,20 @@ impl Interp {
                         return self.dispatch_values(&call);
                     }
                 }
-                // Try "unknown" handler (if defined as a proc or command)
+                // Try "unknown" handler (if defined as a proc or command);
+                // the rename dance of namespace-52.6 keeps it under either
+                // the bare or the `::`-qualified key.
                 if cmd_name != "unknown" {
-                    let has_unknown = self.procs.contains_key("unknown")
-                        || self.commands.contains_key("unknown");
-                    if has_unknown {
-                        let mut unknown_args = vec![Value::from_str("unknown")];
+                    let unknown_key = ["unknown", "::unknown"]
+                        .iter()
+                        .copied()
+                        .find(|k| {
+                            self.procs.contains_key(*k)
+                                || self.commands.contains_key(*k)
+                                || self.ensembles.contains_key(*k)
+                        });
+                    if let Some(uk) = unknown_key {
+                        let mut unknown_args = vec![Value::from_str(uk)];
                         unknown_args.extend(args.iter().cloned());
                         // Recurse through eval_command to dispatch "unknown"
                         let unknown_cmd = crate::parser::Command {

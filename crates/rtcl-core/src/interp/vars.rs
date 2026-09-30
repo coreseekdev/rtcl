@@ -195,7 +195,14 @@ impl Interp {
         // Colon runs collapse: `set ::a::::b` and `set ::a::b` are the same
         // variable (tclsh 8.6.17).  Single colons are name characters.
         let norm = super::commands::namespace::normalise(rest);
-        Some(norm.strip_prefix("::").unwrap_or(&norm).to_string())
+        let mut key = norm.strip_prefix("::").unwrap_or(&norm).to_string();
+        if rest.ends_with(':') {
+            // A trailing `::` names the EMPTY variable in that namespace
+            // (`set ns::` reads ns's variable named ""); normalise would
+            // otherwise swallow it.
+            key.push_str("::");
+        }
+        Some(key)
     }
 
     /// Canonical key for a `::`-containing variable name reached at the
@@ -231,15 +238,30 @@ impl Interp {
             // namespace first, then the global namespace (tclsh 8.6.17:
             // `set v` inside `namespace eval n` reads a `variable`-declared
             // variable; plain global names still resolve).  Plain `set`/
-            // `unset` at that level always operate on the global table.
+            // `unset` at that level always operate on the global table.  A
+            // bare-declared (valueless) name stops the chain: reads fail
+            // rather than falling through to the global variable.
             if self.current_namespace != "::" {
                 let key = format!("{}::{}", &self.current_namespace[2..], name);
                 if let Some(v) = self.globals.get(key.as_str()) {
                     return Some(v);
                 }
+                if self.ns_var_declared(name) {
+                    return None;
+                }
             }
             self.globals.get(name)
         }
+    }
+
+    /// Is `name` (plain, no `::`) declared by the current namespace's
+    /// `variable` command?
+    fn ns_var_declared(&self, name: &str) -> bool {
+        let key = format!("{}::{}", &self.current_namespace[2..], name);
+        self.namespaces
+            .get(&self.current_namespace)
+            .map(|info| info.variables.contains(&key))
+            .unwrap_or(false)
     }
 
     /// Set a variable in the current scope, following upvar links.
@@ -249,7 +271,14 @@ impl Interp {
             return;
         }
         if self.frames.is_empty() {
-            let key = self.canonical_global(name);
+            // A `variable`-declared name stores into the namespace's own
+            // variable, not the global one (tclsh: `variable x`; `set x 9`
+            // writes ::ns::x and leaves ::x alone).
+            let key = if self.current_namespace != "::" && self.ns_var_declared(name) {
+                format!("{}::{}", &self.current_namespace[2..], name)
+            } else {
+                self.canonical_global(name)
+            };
             self.globals.insert(key, value);
             return;
         }
@@ -277,8 +306,18 @@ impl Interp {
             return;
         }
         if self.frames.is_empty() {
-            let key = self.canonical_global(name);
+            let key = if self.current_namespace != "::" && self.ns_var_declared(name) {
+                format!("{}::{}", &self.current_namespace[2..], name)
+            } else {
+                self.canonical_global(name)
+            };
             self.globals.remove(key.as_str());
+            // Unsetting also forgets the `variable` declaration (tclsh:
+            // `namespace which -variable` afterwards is empty and reads
+            // fall through to the global namespace again).
+            if let Some(info) = self.namespaces.get_mut(&self.current_namespace) {
+                info.variables.remove(&key);
+            }
             return;
         }
         let frame_idx = self.frames.len() - 1;
@@ -489,6 +528,12 @@ impl Interp {
                 self.var_traces.remove(&sk);
                 self.elem_traces.remove(&sk);
                 self.trace_phantoms.remove(&sk);
+                Ok(())
+            } else if self.current_namespace != "::" && self.ns_var_declared(&given) {
+                // `variable`-declared but valueless (or declared with the
+                // value living in the namespace's own slot): unset removes
+                // the declaration and succeeds (tclsh 8.6.17).
+                self.remove_var(&given);
                 Ok(())
             } else {
                 Err(Error::runtime(

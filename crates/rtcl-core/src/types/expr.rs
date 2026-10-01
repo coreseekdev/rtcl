@@ -1041,7 +1041,27 @@ impl<'a> ExprParser<'a> {
                 if count == 0 {
                     'u'
                 } else {
-                    char::from_u32(val).unwrap_or('\u{fffd}')
+                    Self::escape_char_value(val)
+                }
+            }
+            'U' => {
+                // \UHHHHHHHH — up to eight hex digits (tclParse.c ParseHex):
+                // stop consuming once the accumulator exceeds 0x10FFF; the
+                // remaining digits stay in the string as literal characters.
+                let mut val: u32 = 0;
+                let mut count = 0;
+                while count < 8 && self.is_hex_digit() {
+                    if val > 0x10FFF {
+                        break;
+                    }
+                    let d = self.advance().to_digit(16).unwrap_or(0);
+                    val = val * 16 + d;
+                    count += 1;
+                }
+                if count == 0 {
+                    'U'
+                } else {
+                    Self::escape_char_value(val)
                 }
             }
             c if ('0'..='7').contains(&c) => {
@@ -1056,6 +1076,19 @@ impl<'a> ExprParser<'a> {
             }
             '\n' => ' ',
             c => c,
+        }
+    }
+
+    /// Encode a \u/\U value. tclsh's default 8.6 build (TCL_UTF_MAX < 4)
+    /// clamps values above 0xFFFF to U+FFFD; surrogates are clamped too
+    /// (tclsh keeps them internally, but they never survive a round-trip
+    /// through a script), so "\UD842" and "\uD842" compare equal, as in
+    /// tclsh.
+    fn escape_char_value(value: u32) -> char {
+        if value > 0xFFFF || (0xD800..=0xDFFF).contains(&value) {
+            '\u{fffd}'
+        } else {
+            char::from_u32(value).unwrap_or('\u{fffd}')
         }
     }
 

@@ -1443,6 +1443,10 @@ fn ens_miss_error(
             ErrorCode::InvalidOp,
         );
     }
+    // tclsh lists the candidates sorted, whatever order -subcommands
+    // declared them in (tm.tcl's {add remove list} → "add, list, or
+    // remove").
+    candidates.sort();
     let listed: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
     let word = if def.prefixes {
         "unknown or ambiguous subcommand"

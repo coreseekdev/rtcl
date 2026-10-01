@@ -282,3 +282,97 @@ proc auto_qualify {cmd namespace} {
         return [list ${namespace}::$cmd ::$cmd]
     }
 }
+
+# ::tcl::tm — Tcl Modules (port of tcl 8.6 library/tm.tcl, trimmed to the
+# command surface rtcl exposes; the corpus pins path/roots existence, the
+# ensemble dispatch errors, and add/remove-with-no-args being silent no-ops
+# — tm-1.1..2.1).
+#
+# tclsh loads tm.tcl lazily through the auto_loader: a fresh interpreter
+# has NO ::tcl::tm commands and `catch {::tcl::tm::path}` triggers the
+# load (then the catch swallows the no-subcommand error).  rtcl has no
+# filesystem auto_load, so the suite is defined eagerly — every corpus
+# case observes only the post-load state.
+namespace eval ::tcl::tm {
+    # Default search paths for modules.  rtcl is self-contained (wasm):
+    # none.
+    variable paths {}
+
+    # The regex pattern a file name has to match to make it a Tcl Module.
+    # (Kept for shape parity; used only by the package-unknown handler,
+    # which rtcl does not install.)
+    variable pkgpattern {^([_[:alpha:]][:_[:alnum:]]*)-([[:digit:]].*)[.]tm$}
+
+    # Export the public API (tclsh: ensemble on `path` with exactly the
+    # add/remove/list subcommands; `path foo` → "unknown or ambiguous
+    # subcommand \"foo\": must be add, list, or remove").
+    namespace export path
+    namespace ensemble create -command path -subcommands {add remove list}
+}
+
+# ::tcl::tm::add — prepend module search paths (PART OF THE ::tcl::tm::path
+# ENSEMBLE).  A path already on the list, or empty, is silently ignored; a
+# path that is an ancestor/descendant of an existing one errors.
+proc ::tcl::tm::add {args} {
+    variable paths
+
+    set newpaths $paths
+    foreach p $args {
+        if {($p eq "") || ($p in $newpaths)} {
+            # Ignore any path which is empty or already on the list.
+            continue
+        }
+
+        # Search for paths which are subdirectories of the new one: the
+        # new path must not be an ancestor of an existing one.
+        set pos [lsearch -glob $newpaths ${p}/*]
+        if {$pos >= 0} {
+            return -code error \
+                "$p is ancestor of existing module path [lindex $newpaths $pos]."
+        }
+
+        # Existing paths which are ancestors of the new one.
+        foreach ep $newpaths {
+            if {[string match ${ep}/* $p]} {
+                return -code error \
+                    "$p is subdirectory of existing module path $ep."
+            }
+        }
+
+        set newpaths [linsert $newpaths 0 $p]
+    }
+
+    set paths $newpaths
+    return
+}
+
+# ::tcl::tm::remove — drop paths from the list (PART OF THE
+# ::tcl::tm::path ENSEMBLE); silently ignores unknown paths.
+proc ::tcl::tm::remove {args} {
+    variable paths
+
+    foreach p $args {
+        set pos [lsearch -exact $paths $p]
+        if {$pos >= 0} {
+            set paths [lreplace $paths $pos $pos]
+        }
+    }
+}
+
+# ::tcl::tm::list — the search path (PART OF THE ::tcl::tm::path ENSEMBLE).
+proc ::tcl::tm::list {} {
+    variable paths
+    return  $paths
+}
+
+# ::tcl::tm::roots — derive module search paths from root directories
+# (tclsh: for each root, tcl$major/{major.n, ..., site-tcl} added via
+# `path add`).  Only the command's existence is pinned (tm-2.1); the
+# filesystem walk is inert here.
+proc ::tcl::tm::roots {paths} {
+    foreach pa $paths {
+        set p [file join $pa tcl8]
+        path add $p
+    }
+    return
+}

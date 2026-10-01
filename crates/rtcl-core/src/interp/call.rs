@@ -58,6 +58,9 @@ impl Interp {
         // A proc executes in the namespace where it was defined (the
         // qualifiers of its registered name), not the caller's namespace.
         let prev_namespace = self.current_namespace.clone();
+        // Apply's one-shot `info level 0` word (consumed even when the
+        // arity check fails, so it can't leak into a later call).
+        let level0_override = self.frame_level0_args.take();
 
         // Push a new call frame
         self.frames.push(CallFrame {
@@ -89,8 +92,14 @@ impl Interp {
                 frame.upvars.clear();
                 // `info level 0` shows the invocation as dispatched: the
                 // as-typed command word plus the evaluated arguments
-                // (tclsh 47.1: `ns a b c` → `::ns::a b c`).
-                frame.level0 = Value::from_list(&current_args.to_vec()).as_str().to_string();
+                // (tclsh 47.1: `ns a b c` → `::ns::a b c`).  `apply`
+                // overrides with `apply {<term>} <args...>`.
+                frame.level0 = match &level0_override {
+                    Some(l0) => Value::from_list(l0).as_str().to_string(),
+                    None => {
+                        Value::from_list(&current_args.to_vec()).as_str().to_string()
+                    }
+                };
             }
 
             let has_args = current_params.last().map(|(p, _)| p.as_str()) == Some("args");

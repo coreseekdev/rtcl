@@ -13,20 +13,37 @@ use std::collections::HashMap;
 use alloc::collections::BTreeMap as HashMap;
 
 /// Parse a proc/lambda parameter list into (name, default) pairs.
-/// Tcl validates the specifiers at definition time:
-/// `{}` → "argument with no name", `{a b c}` → "too many fields ...".
+/// Tcl validates the specifiers at definition time, per parameter, in
+/// this order (probed on 8.6.17): too many fields → contains `::` →
+/// contains `(` → empty (`a::b(1)` reports "not a simple name", not
+/// "array element").
 fn parse_param_specs(params: &[Value]) -> Result<Vec<(String, Option<String>)>> {
     let mut specs: Vec<(String, Option<String>)> = Vec::new();
     for param in params {
         let parts = param.as_list().unwrap_or_else(|| vec![param.clone()]);
-        if parts.is_empty() {
-            return Err(Error::Msg("argument with no name".to_string()));
-        }
         if parts.len() > 2 {
             return Err(Error::Msg(format!(
                 "too many fields in argument specifier \"{}\"",
                 param.as_str()
             )));
+        }
+        if !parts.is_empty() {
+            let name = parts[0].as_str();
+            if name.contains("::") {
+                return Err(Error::Msg(format!(
+                    "formal parameter \"{}\" is not a simple name",
+                    name
+                )));
+            }
+            if name.contains('(') {
+                return Err(Error::Msg(format!(
+                    "formal parameter \"{}\" is an array element",
+                    name
+                )));
+            }
+        }
+        if parts.is_empty() {
+            return Err(Error::Msg("argument with no name".to_string()));
         }
         if parts.len() == 2 {
             specs.push((
@@ -71,7 +88,20 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let params = param_arg.as_list().unwrap_or_default();
     let body = body_arg.as_str().to_string();
 
-    let defaults = parse_param_specs(&params)?;
+    // Definition-time parameter errors carry a `(creating proc "name")`
+    // frame: pre-seed errorInfo so the harness logs the `proc` command
+    // as `invoked from within` (tclsh ERR_ALREADY_LOGGED).
+    let defaults = match parse_param_specs(&params) {
+        Ok(d) => d,
+        Err(e) => {
+            interp.err_info = Some(format!(
+                "{}\n    (creating proc \"{}\")",
+                e,
+                args[1].as_str()
+            ));
+            return Err(e);
+        }
+    };
 
     // Parse statics list: each element is {varName ?initialValue?}
     let mut statics = HashMap::new();
@@ -190,8 +220,21 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         None
     };
 
-    // Build param defaults (same logic as cmd_proc)
-    let defaults = parse_param_specs(&param_list)?;
+    // Build param defaults (same logic as cmd_proc).  Parse errors carry
+    // a `(parsing lambda expression "<term>")` frame between the message
+    // and the caller's harness frame: pre-seed errorInfo so the harness
+    // logs the command as `invoked from within` (tclsh ERR_ALREADY_LOGGED).
+    let defaults = match parse_param_specs(&param_list) {
+        Ok(d) => d,
+        Err(e) => {
+            interp.err_info = Some(format!(
+                "{}\n    (parsing lambda expression \"{}\")",
+                e,
+                args[1].as_str()
+            ));
+            return Err(e);
+        }
+    };
 
     let proc_def = ProcDef {
         params: defaults,
@@ -205,6 +248,12 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     for arg in &args[2..] {
         call_args.push(arg.clone());
     }
+
+    // `info level 0` inside the lambda shows `apply {<term>} <args...>`:
+    // the term as ONE list element (brace-wrapped) plus the arguments.
+    let mut level0 = vec![Value::from_str("apply"), args[1].clone()];
+    level0.extend(args[2..].iter().cloned());
+    interp.frame_level0_args = Some(level0);
 
     let r = interp.call_proc(&proc_def, &call_args, "apply lambdaExpr", ns_override);
     if let Err(e) = &r {

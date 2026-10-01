@@ -855,6 +855,14 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .scope_vars()
                 .keys()
                 .filter_map(|name| {
+                    // Bare `info vars` at the global level lists only true
+                    // globals — namespace variables are invisible there
+                    // (`uplevel #0 {info vars}` == `info globals`,
+                    // namespace-old-7.4/7.7).  A pattern re-enables
+                    // qualified matching below.
+                    if ns_prefix.is_none() && match_pat.is_none() && name.contains("::") {
+                        return None;
+                    }
                     let rel = match &ns_prefix {
                         Some(pfx) => match name.strip_prefix(pfx.as_str()) {
                             // This namespace's own variable: report the

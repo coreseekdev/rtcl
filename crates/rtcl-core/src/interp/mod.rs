@@ -321,6 +321,10 @@ pub struct Interp {
     /// Next child interpreter ID counter.
     #[cfg(feature = "std")]
     pub(crate) next_interp_id: u64,
+    /// One-shot level-0 word override for the next `call_proc` frame
+    /// (`apply` renders `info level 0` as `apply {<term>} <args...>`,
+    /// which the plain arg-list form can't express).
+    pub(crate) frame_level0_args: Option<Vec<Value>>,
     /// TclOO object-system state (`oo::` commands, objects, classes).
     pub(crate) oo: commands::oo::OoState,
     /// Reflected channels created by `chan create`, keyed by handle
@@ -420,6 +424,7 @@ impl Interp {
             child_interps: HashMap::new(),
             #[cfg(feature = "std")]
             next_interp_id: 1,
+            frame_level0_args: None,
             oo: commands::oo::OoState::default(),
             #[cfg(feature = "io")]
             reflected: HashMap::new(),

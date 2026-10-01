@@ -434,7 +434,25 @@ impl Interp {
     pub(crate) fn eval_word(&mut self, word: &Word) -> Result<Value> {
         match word {
             Word::Literal(s) => Ok(Value::from_str(s)),
-            Word::VarRef(name) => self.read_var(name),
+            Word::VarRef(name) => {
+                // $a(index): the index text takes full word-level
+                // substitutions before the read — tclsh evaluates
+                // `[winfo name $zz]` even when the array itself is
+                // missing (misc-1.1), and an index error masks the
+                // array lookup entirely.
+                if let Some(open) = name.find('(') {
+                    if name.ends_with(')') {
+                        let raw = &name[open + 1..name.len() - 1];
+                        if raw.contains('$') || raw.contains('[') || raw.contains('\\') {
+                            let argv = [Value::from_str("subst"), Value::from_str(raw)];
+                            let idx = crate::interp::commands::misc::cmd_subst(self, &argv)?;
+                            let full = format!("{}({})", &name[..open], idx.as_str());
+                            return self.read_var(&full);
+                        }
+                    }
+                }
+                self.read_var(name)
+            }
             Word::CommandSub(cmd) => match self.eval(cmd) {
                 Ok(v) => Ok(v),
                 Err(e) => {

@@ -519,6 +519,17 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     crate::error::ErrorCode::Generic,
                 ));
             }
+            // tclsh validates the value as a list before installing it
+            // as errorCode (result-6.3).
+            if args[i].as_list_strict().is_err() {
+                return Err(Error::runtime(
+                    format!(
+                        "bad -errorcode value: expected a list but got \"{}\"",
+                        args[i].as_str()
+                    ),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
             error_code = Some(args[i].as_str().to_string());
             i += 1;
         } else {

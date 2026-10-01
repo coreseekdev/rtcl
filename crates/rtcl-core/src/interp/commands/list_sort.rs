@@ -756,8 +756,10 @@ fn utf_casecmp(a: &str, b: &str) -> i64 {
     loop {
         match (ia.next(), ib.next()) {
             (None, None) => return 0,
-            (None, Some(y)) => return -(y as i64),
-            (Some(x), None) => return x as i64,
+            // Any remaining character sorts above end-of-string — even a
+            // NUL (`cmdIL-4.37`: `a\0a` follows `a`).
+            (None, Some(_)) => return -1,
+            (Some(_), None) => return 1,
             (Some(x), Some(y)) => {
                 if x != y {
                     return x as i64 - y as i64;
@@ -854,7 +856,16 @@ fn dict_compare(l: &str, r: &str) -> i64 {
         } else {
             // At least one string is exhausted: byte compare at the NULs.
             let diff = at(lb, li) as i64 - at(rb, ri) as i64;
-            return if diff == 0 { secondary } else { diff };
+            if diff != 0 {
+                return diff;
+            }
+            // Both sit on a NUL (real or pad): the longer string sorts
+            // last (`a` precedes `a\0a`, cmdIL-4.37).
+            return match (lb.len() - li).cmp(&(rb.len() - ri)) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => secondary,
+                std::cmp::Ordering::Greater => 1,
+            };
         }
     }
 }

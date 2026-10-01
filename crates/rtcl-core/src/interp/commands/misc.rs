@@ -499,16 +499,8 @@ pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args("incr", 2, args.len()));
     }
     let var_name = args[1].as_str();
-    let amount = if args.len() == 3 {
-        args[2].as_int().ok_or_else(|| {
-            Error::runtime(
-                format!("expected integer but got \"{}\"", args[2].as_str()),
-                crate::error::ErrorCode::Generic,
-            )
-        })?
-    } else {
-        1
-    };
+    // tclsh reads the variable first: a bad value there wins over a bad
+    // increment (`incr x 1a` with x="1a" carries no increment frame).
     let current = match interp.get_var(var_name) {
         Ok(v) => v.as_int().ok_or_else(|| {
             Error::runtime(
@@ -529,6 +521,24 @@ pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             0
         }
+    };
+    let amount = if args.len() == 3 {
+        match args[2].as_int() {
+            Some(n) => n,
+            None => {
+                let msg = format!("expected integer but got \"{}\"", args[2].as_str());
+                // tclsh frames the failed increment parse between the
+                // message and the invoking command's harness frame —
+                // no line number (`incr-old-2.5`).
+                interp.err_info = Some(msg.clone());
+                if let Some(info) = &mut interp.err_info {
+                    info.push_str("\n    (reading increment)");
+                }
+                return Err(Error::runtime(msg, crate::error::ErrorCode::Generic));
+            }
+        }
+    } else {
+        1
     };
     let new_val = Value::from_int(current + amount);
     interp.set_var(var_name, new_val)

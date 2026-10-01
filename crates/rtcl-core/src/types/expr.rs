@@ -573,6 +573,8 @@ impl<'a> ExprParser<'a> {
                 || self.peek() == '.'
                 || self.peek() == '-'
                 || self.peek() == '+'
+                || self.peek() == '~'
+                || self.peek() == '!'
                 || self.peek().is_ascii_alphabetic()
             {
                 // tclsh: -9223372036854775808 is a valid integer literal
@@ -744,19 +746,57 @@ impl<'a> ExprParser<'a> {
             }
             if next.is_ascii_digit() {
                 // Legacy octal: `017` is 15; a digit 8/9 makes the whole
-                // token an invalid bareword with tclsh's octal hint.
+                // token an invalid bareword with tclsh's octal hint —
+                // unless a decimal continuation follows (`028.1` is 28.1,
+                // `08e2` is 800.0, `085.` is 85.0), in which case the
+                // whole token is a double.
+                let octal_start = self.pos;
                 s.push(self.advance());
                 while self.peek() >= '0' && self.peek() <= '7' {
                     s.push(self.advance());
                 }
-                if self.peek() == '8' || self.peek() == '9' {
+                let hit89 = self.peek() == '8' || self.peek() == '9';
+                // Lookahead without consuming: digits, optional `.`+digits,
+                // optional exponent.  A decimal continuation makes the
+                // whole token a double regardless of a valid octal prefix
+                // (`077.5` is 77.5, `028.1` is 28.1, `08e2` is 800.0,
+                // `085.` is 85.0).
+                let mut j = self.pos;
+                let mut saw_dot = false;
+                let mut saw_exp = false;
+                while j < self.chars.len() && self.chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j < self.chars.len() && self.chars[j] == '.' {
+                    saw_dot = true;
+                    j += 1;
+                    while j < self.chars.len() && self.chars[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                }
+                if j < self.chars.len() && (self.chars[j] == 'e' || self.chars[j] == 'E') {
+                    let mut k = j + 1;
+                    if k < self.chars.len() && (self.chars[k] == '+' || self.chars[k] == '-') {
+                        k += 1;
+                    }
+                    if k < self.chars.len() && self.chars[k].is_ascii_digit() {
+                        saw_exp = true;
+                    }
+                }
+                if saw_dot || saw_exp {
+                    // Fall through to the decimal scanner below, from the
+                    // token start.
+                    self.pos = octal_start;
+                    s.clear();
+                } else if hit89 {
                     // The whole digit run belongs to the offending token.
                     while self.is_digit() {
                         s.push(self.advance());
                     }
                     return Err(self.invalid_octal_error(&s));
+                } else {
+                    return self.radix_literal(&s, 8, &s[1..]);
                 }
-                return self.radix_literal(&s, 8, &s[1..]);
             }
         }
 

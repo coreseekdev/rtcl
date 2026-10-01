@@ -123,26 +123,67 @@ fn var_key(qualified: &str) -> String {
         .to_string()
 }
 
+/// The local alias `variable`/`global` creates: everything after the last
+/// run of two or more colons (`a::b:c` → `b:c`, `ns::` → the empty name).
+/// Single colons are name characters.
+pub(crate) fn split_var_tail(name: &str) -> &str {
+    match name.rfind("::") {
+        None => name,
+        Some(i) => &name[i + 2..],
+    }
+}
+
 /// `variable ?name ?value? ...?`
 pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(Error::wrong_args_with_usage(
-            "variable", 2, args.len(),
-            "?name value...? name ?value?",
-        ));
+        // Bare `variable` is a no-op (var-7.16, var-7.17).
+        return Ok(Value::empty());
     }
 
     let ns = interp.current_namespace.clone();
     let mut i = 1;
     while i < args.len() {
         let raw_name = args[i].as_str();
-        // An empty variable name survives qualification: `variable {}` in
-        // namespace n declares n's variable named "" (key `n::`).
-        let qualified = if raw_name.is_empty() && ns != "::" {
-            var_key(&format!("{}::", ns))
+        // Flat key: normalise collapses colon runs, but a TRAILING run
+        // names the empty variable in that namespace, so it is restored
+        // (`variable test_ns_var::` declares test_ns_var's "" variable —
+        // var-7.12; `variable :` is a plain name — var-7.13).
+        let qualified = if raw_name.is_empty() {
+            if ns == "::" {
+                String::new()
+            } else {
+                var_key(&format!("{}::", ns))
+            }
         } else {
-            var_key(&qualify(&ns, raw_name))
+            let mut key = var_key(&qualify(&ns, raw_name));
+            if raw_name.ends_with(':') && !key.ends_with(':') {
+                key.push_str("::");
+            }
+            key
         };
+
+        // The variable's namespace must exist (`can't define "<as-typed>":
+        // parent namespace doesn't exist` — var-7.7, var-1.11's family).
+        let ns_part = if raw_name.is_empty() {
+            ns.clone()
+        } else if raw_name.ends_with("::") {
+            normalise(&format!("::{}", &qualified))
+        } else {
+            parent_of(&normalise(&format!("::{}", &qualified)))
+        };
+        if ns_part != "::" && !interp.namespaces.contains_key(&ns_part) {
+            crate::interp::commands::list::set_error_code(
+                interp,
+                &format!("TCL LOOKUP VARNAME {}", raw_name),
+            );
+            return Err(Error::runtime(
+                format!(
+                    "can't define \"{}\": parent namespace doesn't exist",
+                    raw_name
+                ),
+                ErrorCode::Generic,
+            ));
+        }
 
         // If an initial value is provided, set it.  A bare `variable name`
         // declares the link without creating the variable (tclsh:
@@ -157,8 +198,8 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             None
         };
 
-        // Register the name in the namespace's variable table either way.
-        if let Some(info) = interp.namespaces.get_mut(&ns) {
+        // Register the name in the OWNING namespace's variable table.
+        if let Some(info) = interp.namespaces.get_mut(&ns_part) {
             info.variables.insert(qualified.clone());
         }
 
@@ -167,14 +208,46 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // also seeds a real local: the tclsh link is a refcounted shared
         // Var, so the local keeps the value even if the namespace (and its
         // variable) is deleted while the proc runs (46.8).
-        if !interp.frames.is_empty() {
-            let local_name = ns_tail_str(raw_name).to_string();
+        if interp.frames.is_empty() {
+            // At eval level tclsh's `variable` links the ns-eval varFrame
+            // to the namespace Var: the variable stays readable for the
+            // rest of the body even if the namespace deletes itself
+            // (var-1.16/1.17).  Model the link as a bare-name redirect +
+            // keep-alive marker (dropped when this `namespace eval`
+            // exits).
+            if !raw_name.contains("::") {
+                let existing = interp
+                    .flat_aliases
+                    .iter_mut()
+                    .find(|(k, _)| *k == raw_name);
+                match existing {
+                    Some((_, t)) => *t = qualified.clone(),
+                    None => interp
+                        .flat_aliases
+                        .push((raw_name.to_string(), qualified.clone())),
+                }
+                if !interp.ns_variable_links.iter().any(|x| x == &qualified) {
+                    interp.ns_variable_links.push(qualified.clone());
+                }
+            }
+        } else {
+            let local_name = split_var_tail(raw_name).to_string();
             let frame_idx = interp.frames.len() - 1;
             interp.frames[frame_idx].upvars.insert(
                 local_name.clone(),
-                crate::interp::UpvarLink::Global(qualified),
+                crate::interp::UpvarLink::Global(qualified.clone()),
             );
-            if let Some(val) = init_value {
+            // The alias name is in the proc's variable table (tclsh's
+            // `info vars` lists linked variables — var-7.12's `{{}}`,
+            // var-7.13's `:`): seed a placeholder when a copy exists to
+            // mirror (an initial value, or the namespace variable is
+            // already set).  A bare declaration of a not-yet-set variable
+            // stays invisible (tclsh: `info exists` → 0).
+            let seeded = match &init_value {
+                Some(val) => Some(val.clone()),
+                None => interp.globals.get(&qualified).map(|v| v.clone()),
+            };
+            if let Some(val) = seeded {
                 interp.frames[frame_idx].locals.insert(local_name, val);
             }
         }
@@ -216,11 +289,36 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // `(in namespace eval "<qualified>" script line N)` on error (25.6).
     interp.ns_level0.push(interp.cur_cmd_text.clone());
     interp.ns_stack.push(qualified.clone());
+    // Marks for the eval-level variable links this body creates — they
+    // die with it (tclsh's ns-eval varFrame pops).
     let prev = std::mem::replace(&mut interp.current_namespace, qualified.clone());
     let result = interp.eval(&body);
     interp.current_namespace = prev;
     interp.ns_stack.pop();
     interp.ns_level0.pop();
+    // Drop the variable links that belong to THIS namespace's variable
+    // table: `variable`-declared bare-name links (transient — created for
+    // this body) and any kept-alive variables of a self-deleted
+    // namespace.  `upvar` links persist with the namespace itself
+    // (tclsh: upvar inside `namespace eval` links the namespace's own
+    // variable — var-3.10's `set foo::bar` still redirects afterwards).
+    let flat_prefix = var_key(&format!("{}::", qualified));
+    if !flat_prefix.is_empty() {
+        interp.flat_aliases.retain(|(k, t)| {
+            !(t.starts_with(&flat_prefix) && !k.contains("::"))
+        });
+        interp.ns_variable_links.retain(|t| !t.starts_with(&flat_prefix));
+        interp.dead_flat.retain(|k| !k.starts_with(&flat_prefix));
+        let mut i = 0;
+        while i < interp.ns_eval_keep.len() {
+            if interp.ns_eval_keep[i].starts_with(&flat_prefix) {
+                let key = interp.ns_eval_keep.swap_remove(i);
+                interp.globals.remove(&key);
+            } else {
+                i += 1;
+            }
+        }
+    }
     if let Err(e) = &result {
         if interp.err_is_error(e) {
             let tag = format!("in namespace eval \"{}\" script", qualified);
@@ -267,12 +365,106 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             parent.variables.retain(|v| !v.starts_with(&child_prefix));
         }
 
-        // Remove procs defined in this namespace
-        interp.procs.retain(|k, _| k != &qualified && !k.starts_with(&prefix));
+        // The *initiating* frame keeps the deleted name as its current
+        // namespace until it exits (tclsh: after
+        // `namespace delete [namespace current]`, `namespace current`
+        // still reports the deleted namespace both in the eval body and in
+        // a proc frame; `namespace exists` is 0 for it).  Only the delete
+        // trace callbacks below run fresh in `::` (34.4/34.5).
+        let inside = interp.current_namespace == qualified
+            || interp.current_namespace.starts_with(&prefix);
 
-        // Remove namespace-scoped global variables (flat keys, no leading ::)
         let var_prefix = var_key(&prefix);
-        interp.globals.retain(|k, _| !k.starts_with(&var_prefix));
+
+        // Aliases pointing into the dying tree go dead first: reads keep
+        // the seeded local copy, writes error (var-1.15/1.16).
+        interp.deaden_links_under(&var_prefix);
+
+        // ── Variables go first (tclsh order) ──
+        // Each variable is removed BEFORE its unset trace fires, and the
+        // not-yet-processed variables are still visible to `info vars`
+        // during the callback (18.4's count).  Element keys collapse into
+        // their base (tclsh unsets the whole Var once).
+        let mut bases: Vec<String> = Vec::new();
+        for k in interp.globals.keys() {
+            if !k.starts_with(&var_prefix) {
+                continue;
+            }
+            let base = match k.find('(') {
+                Some(i) => k[..i].to_string(),
+                None => k.clone(),
+            };
+            if !bases.contains(&base) {
+                bases.push(base);
+            }
+        }
+        bases.sort();
+        let mut kept: Vec<String> = Vec::new();
+        for base in bases {
+            // A `variable`-declared (at eval level) variable outlives the
+            // namespace deletion for the rest of the declaring body
+            // (var-1.16/1.17 read it after the self-delete).
+            if interp.ns_variable_links.iter().any(|x| *x == base) {
+                interp.ns_eval_keep.push(base.clone());
+                kept.push(base);
+                continue;
+            }
+            let elem_prefix = format!("{}(", base);
+            let keys: Vec<String> = interp
+                .globals
+                .keys()
+                .filter(|k| *k == &base || k.starts_with(&elem_prefix))
+                .cloned()
+                .collect();
+            for k in keys {
+                interp.globals.remove(&k);
+            }
+            interp.array_globals.remove(&base);
+            // Unset traces fire after the removal; a callback's `set` into
+            // the deleted namespace fails its parent-namespace check
+            // (18.4's catch=1) and cannot resurrect the variable.
+            let _ = interp.fire_traces(&format!("::{}", base), None, "unset");
+        }
+        // Trace registrations and searches living under the tree die with
+        // it.
+        let stamp_prefix = format!("G:{}", var_prefix);
+        interp.var_traces.retain(|k, _| !k.starts_with(&stamp_prefix));
+        interp.elem_traces.retain(|k, _| !k.starts_with(&stamp_prefix));
+        interp.trace_phantoms.retain(|k, _| !k.starts_with(&stamp_prefix));
+        interp.array_searches.retain(|k, _| !k.starts_with(&stamp_prefix));
+        interp.array_stamps.retain(|k, _| !k.starts_with(&stamp_prefix));
+
+        // ── Command delete traces ──
+        // When the deletion was initiated from OUTSIDE the tree the
+        // namespace still resolves during the trace (`namespace which
+        // -command` finds the command — 34.4); from inside, the commands
+        // are already gone (`namespace which` is empty — 34.5).
+        let mut dead_procs: Vec<String> = interp
+            .procs
+            .keys()
+            .filter(|k| *k == &qualified || k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        dead_procs.sort();
+        if inside {
+            interp.procs.retain(|k, _| k != &qualified && !k.starts_with(&prefix));
+        }
+        let saved_ns = Some(std::mem::replace(&mut interp.current_namespace, "::".to_string()));
+        for key in &dead_procs {
+            interp.fire_cmd_traces(key, key, "", "delete");
+        }
+        if let Some(ns) = saved_ns {
+            interp.current_namespace = ns;
+        }
+        if !inside {
+            interp.procs.retain(|k, _| k != &qualified && !k.starts_with(&prefix));
+        }
+
+        // Remove namespace-scoped global variables (flat keys, no leading
+        // ::), except the ones a live variable link keeps alive.
+        interp
+            .globals
+            .retain(|k, _| !k.starts_with(&var_prefix) || kept.iter().any(|b| b == k));
 
         // Remove import aliases defined in, or pointing into, the tree.
         interp.import_aliases.retain(|alias, origin| {
@@ -759,7 +951,10 @@ fn ns_forget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 /// `namespace inscope name arg ?arg...?` — the namespace must already
-/// exist.
+/// exist.  With a single `arg` tclsh evaluates it verbatim as a script;
+/// with several, each *extra* argument becomes one word of the script
+/// (a `{}` extra argument stays one empty word: `inscope ns cb a {} b`
+/// calls `cb` with 3 args; `{a b}` stays one word).
 fn ns_inscope(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 4 {
         return Err(Error::wrong_args_with_usage(
@@ -768,7 +963,18 @@ fn ns_inscope(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         ));
     }
     require_ns(interp, args[2].as_str())?;
-    ns_eval(interp, args)
+    let mut script = args[3].as_str().to_string();
+    for a in &args[4..] {
+        script.push(' ');
+        script.push_str(Value::from_list(&[a.clone()]).as_str());
+    }
+    let sub = [
+        args[0].clone(),
+        args[1].clone(),
+        args[2].clone(),
+        Value::from_str(&script),
+    ];
+    ns_eval(interp, &sub)
 }
 
 /// `namespace path ?pathList?` — stub.
@@ -1975,9 +2181,12 @@ mod tests {
             "::tnsB::foo"
         );
         assert_eq!(eval("namespace eval m1 {}; namespace exists :::m1:::"), "1");
+        // Colon runs collapse for NAMESPACES, but `variable` still demands
+        // an existing parent (tclsh 8.6.17: `variable w:::x 9` in q errors
+        // `can't define "w:::x": parent namespace doesn't exist`).
         assert_eq!(
-            eval("namespace eval q {variable w:::x 9}; set ::q::w::x"),
-            "9"
+            eval_err("namespace eval q {variable w:::x 9}"),
+            "can't define \"w:::x\": parent namespace doesn't exist"
         );
         assert_eq!(eval("namespace tail a::::b"), "b");
         assert_eq!(eval("namespace qualifiers a::::b"), "a");

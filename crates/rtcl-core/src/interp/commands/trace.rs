@@ -5,7 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::interp::commands::list;
-use crate::interp::VarTrace;
+use crate::interp::{ExecStepCtx, ExecTrace, VarTrace};
 use crate::interp::Interp;
 use crate::value::Value;
 
@@ -219,8 +219,19 @@ fn info_variable(interp: &mut Interp, rest: &[Value]) -> Result<Value> {
     Ok(Value::from_list(&out))
 }
 
-/// Shared storage handling for command/execution traces. Command traces
-/// require the command to exist (`unknown command "X"`, trace-19.0.1).
+/// Shared storage handling for command/execution traces. Both require the
+/// command to exist (`unknown command "X"` — trace-19.0.1, trace-28.8,
+/// trace-28.9).
+fn stored_command_key(interp: &Interp, name: &str) -> Result<String> {
+    match super::proc::resolve_command_key(interp, name) {
+        Some(k) => Ok(k),
+        None => Err(Error::runtime(
+            format!("unknown command \"{}\"", name),
+            crate::error::ErrorCode::NotFound,
+        )),
+    }
+}
+
 fn store_trace(
     interp: &mut Interp,
     table: &mut HashMap<String, Vec<(Vec<String>, String)>>,
@@ -239,36 +250,173 @@ fn store_trace(
     let name = rest[0].as_str().to_string();
     let ops = parse_ops(interp, &rest[1], vocab)?;
     let script = rest[2].as_str().to_string();
-    let key = if ty == "command" {
-        // Resolve through the namespace chain (bare `x` inside
-        // `namespace eval ns` → `ns::x`); missing → error (trace-19.0.1).
-        match super::proc::resolve_command_key(interp, &name) {
-            Some(k) => k,
-            None => {
-                return Err(Error::runtime(
-                    format!("unknown command \"{}\"", name),
-                    crate::error::ErrorCode::NotFound,
-                ))
-            }
-        }
-    } else {
-        name.clone()
-    };
+    let key = stored_command_key(interp, &name)?;
     table.entry(key).or_default().push((ops, script));
+    Ok(Value::empty())
+}
+
+fn store_exec_trace(
+    interp: &mut Interp,
+    table: &mut HashMap<String, Vec<ExecTrace>>,
+    ty: &str,
+    vocab: &[&str],
+    rest: &[Value],
+) -> Result<Value> {
+    if rest.len() != 3 {
+        return Err(Error::wrong_args_with_usage(
+            format!("trace add {}", ty).as_str(),
+            4,
+            rest.len() + 1,
+            "name opList command",
+        ));
+    }
+    let name = rest[0].as_str().to_string();
+    let ops = parse_ops(interp, &rest[1], vocab)?;
+    let script = rest[2].as_str().to_string();
+    let key = stored_command_key(interp, &name)?;
+    let id = interp.next_exec_trace_id();
+    table.entry(key).or_default().push(ExecTrace { id, ops, script });
     Ok(Value::empty())
 }
 
 use std::collections::HashMap;
 
 impl Interp {
+    pub(crate) fn next_exec_trace_id(&mut self) -> u64 {
+        self.exec_trace_ids += 1;
+        self.exec_trace_ids
+    }
+
     /// Move command traces when their command is renamed; an empty
-    /// `new_key` (delete) drops them.
+    /// `new_key` (delete) drops them.  Execution traces follow the same
+    /// rename.
     pub(crate) fn rekey_cmd_traces(&mut self, old_key: &str, new_key: &str) {
         if let Some(v) = self.cmd_traces.remove(old_key) {
             if !new_key.is_empty() {
                 self.cmd_traces.entry(new_key.to_string()).or_default().extend(v);
             }
         }
+        if let Some(v) = self.exec_traces.remove(old_key) {
+            if !new_key.is_empty() {
+                self.exec_traces.entry(new_key.to_string()).or_default().extend(v);
+            }
+        }
+    }
+
+    /// `proc` redefinition silently drops the old command's stored
+    /// traces (tclsh: delete+create, no rename trace fires).
+    pub(crate) fn wipe_cmd_exec_traces(&mut self, key: &str) {
+        self.cmd_traces.remove(key);
+        self.exec_traces.remove(key);
+    }
+
+    /// Fire one batch of execution-trace records by id (most-recent
+    /// first).  `extra` carries the op-specific middle arguments (result /
+    /// code for leave-style ops).  When `propagate` is set the callback's
+    /// error aborts the traced command; otherwise the error is discarded
+    /// and the errored record is auto-removed (tclsh 8.6.17).
+    fn exec_fire_ids(
+        &mut self,
+        key: &str,
+        ids: &[u64],
+        cmdtext: &str,
+        op: &str,
+        extra: &[&str],
+        propagate: bool,
+    ) -> Result<()> {
+        let records: Vec<(u64, String)> = match self.exec_traces.get(key) {
+            Some(v) => v
+                .iter()
+                .filter(|t| ids.contains(&t.id) && t.ops.iter().any(|o| o == op))
+                .map(|t| (t.id, t.script.clone()))
+                .collect(),
+            None => return Ok(()),
+        };
+        let q = |v: &str| Value::from_list(&[Value::from_str(v)]).as_str().to_string();
+        for (id, script) in records.into_iter().rev() {
+            let mut cmd = format!("{} {}", script, q(cmdtext));
+            for e in extra {
+                cmd.push(' ');
+                cmd.push_str(&q(e));
+            }
+            cmd.push(' ');
+            cmd.push_str(op);
+            self.exec_step_running += 1;
+            let r = self.eval_isolated(&cmd);
+            self.exec_step_running -= 1;
+            if let Err(e) = r {
+                if propagate {
+                    return Err(e);
+                }
+                // Errored trace record is removed (tclsh).
+                if let Some(v) = self.exec_traces.get_mut(key) {
+                    v.retain(|t| t.id != id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fire the `enter` execution traces for `key`; the callback's error
+    /// replaces the command's own invocation (trace-40.1).
+    pub(crate) fn exec_fire_enter(&mut self, key: &str, cmdtext: &str) -> Result<()> {
+        if self.exec_step_running > 0 || self.exec_traces.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<u64> = match self.exec_traces.get(key) {
+            Some(v) => v.iter().map(|t| t.id).collect(),
+            None => return Ok(()),
+        };
+        self.exec_fire_ids(key, &ids, cmdtext, "enter", &[], true)
+    }
+
+    /// Fire the `leave` execution traces for `key`; errors are background
+    /// errors (discarded; errored record removed).
+    pub(crate) fn exec_fire_leave(&mut self, key: &str, cmdtext: &str, code: &str, result: &str) {
+        if self.exec_step_running > 0 || self.exec_traces.is_empty() {
+            return;
+        }
+        let ids: Vec<u64> = match self.exec_traces.get(key) {
+            Some(v) => v.iter().map(|t| t.id).collect(),
+            None => return,
+        };
+        let _ = self.exec_fire_ids(key, &ids, cmdtext, "leave", &[code, result], false);
+    }
+
+    /// Enterstep half of a command about to dispatch inside a traced
+    /// proc's body: snapshot the caller's enterstep/leavestep records,
+    /// fire enterstep (errors discarded).  `None` when nothing can fire —
+    /// no step bookkeeping needed.
+    pub(crate) fn exec_step_begin(&mut self, args: &[Value]) -> Option<ExecStepCtx> {
+        if self.exec_step_running > 0 || self.exec_traces.is_empty() {
+            return None;
+        }
+        let key = self.exec_step_stack.last()?.clone();
+        let snapshot: Vec<u64> = match self.exec_traces.get(&key) {
+            Some(v) => v.iter().map(|t| t.id).collect(),
+            None => return None,
+        };
+        let cmdtext = Value::from_list(args).as_str().to_string();
+        let _ = self.exec_fire_ids(&key, &snapshot, &cmdtext, "enterstep", &[], false);
+        Some(ExecStepCtx { key, cmdtext, snapshot })
+    }
+
+    /// Leavestep half: fire the snapshot's records that are *still
+    /// registered* under the caller's key (trace-34.1: a record removed
+    /// and re-added inside the enterstep callback must NOT fire — identity
+    /// is the registration, not the tuple).
+    pub(crate) fn exec_step_end(&mut self, ctx: &ExecStepCtx, code: &str, result: &str) {
+        if self.exec_step_running > 0 {
+            return;
+        }
+        let _ = self.exec_fire_ids(
+            &ctx.key,
+            &ctx.snapshot,
+            &ctx.cmdtext,
+            "leavestep",
+            &[code, result],
+            false,
+        );
     }
 
     /// Fire command traces for `op` ("rename" | "delete"): each callback
@@ -332,7 +480,7 @@ pub fn cmd_trace(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 "execution" => {
                     let mut t = std::mem::take(&mut interp.exec_traces);
-                    let r = store_trace(interp, &mut t, "execution", EXEC_OPS, &args[3..]);
+                    let r = store_exec_trace(interp, &mut t, "execution", EXEC_OPS, &args[3..]);
                     interp.exec_traces = t;
                     r
                 }
@@ -358,7 +506,7 @@ pub fn cmd_trace(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 "execution" => {
                     let mut t = std::mem::take(&mut interp.exec_traces);
-                    let r = remove_stored(interp, &mut t, EXEC_OPS, &args[3..], "execution");
+                    let r = remove_exec_trace(interp, &mut t, EXEC_OPS, &args[3..], "execution");
                     interp.exec_traces = t;
                     r
                 }
@@ -379,7 +527,7 @@ pub fn cmd_trace(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 "execution" => {
                     let t = std::mem::take(&mut interp.exec_traces);
-                    let r = info_stored(interp, &t, &args[3..]);
+                    let r = info_exec_trace(interp, &t, &args[3..]);
                     interp.exec_traces = t;
                     r
                 }
@@ -412,11 +560,36 @@ fn remove_stored(
     let name = rest[0].as_str().to_string();
     let ops = parse_ops(interp, &rest[1], vocab)?;
     let script = rest[2].as_str().to_string();
-    // Mirror the store-time key resolution; fall back to the raw name
-    // when the command no longer exists.
-    let key = super::proc::resolve_command_key(interp, &name).unwrap_or_else(|| name.clone());
+    // Mirror the store-time key resolution; a missing command errors
+    // (trace-27.2, trace-27.3).
+    let key = stored_command_key(interp, &name)?;
     if let Some(v) = table.get_mut(&key) {
         v.retain(|(o, s)| *o != ops || *s != script);
+    }
+    Ok(Value::empty())
+}
+
+fn remove_exec_trace(
+    interp: &mut Interp,
+    table: &mut HashMap<String, Vec<ExecTrace>>,
+    vocab: &[&str],
+    rest: &[Value],
+    ty: &str,
+) -> Result<Value> {
+    if rest.len() != 3 {
+        return Err(Error::wrong_args_with_usage(
+            format!("trace remove {}", ty).as_str(),
+            4,
+            rest.len() + 1,
+            "name opList command",
+        ));
+    }
+    let name = rest[0].as_str().to_string();
+    let ops = parse_ops(interp, &rest[1], vocab)?;
+    let script = rest[2].as_str().to_string();
+    let key = stored_command_key(interp, &name)?;
+    if let Some(v) = table.get_mut(&key) {
+        v.retain(|t| t.ops != ops || t.script != script);
     }
     Ok(Value::empty())
 }
@@ -436,12 +609,41 @@ fn info_stored(
     }
     let name = rest[0].as_str();
     let mut out: Vec<Value> = Vec::new();
-    let key = super::proc::resolve_command_key(interp, name).unwrap_or_else(|| name.to_string());
+    // A missing command errors (trace-27.3 shape).
+    let key = stored_command_key(interp, name)?;
     if let Some(v) = table.get(&key) {
         for (ops, script) in v {
             out.push(Value::from_list(&[
                 Value::from_str(&ops.join(" ")),
                 Value::from_str(script),
+            ]));
+        }
+    }
+    let _ = interp;
+    Ok(Value::from_list(&out))
+}
+
+fn info_exec_trace(
+    interp: &mut Interp,
+    table: &HashMap<String, Vec<ExecTrace>>,
+    rest: &[Value],
+) -> Result<Value> {
+    if rest.len() != 1 {
+        return Err(Error::wrong_args_with_usage(
+            "trace info",
+            3,
+            rest.len() + 1,
+            "name",
+        ));
+    }
+    let name = rest[0].as_str();
+    let mut out: Vec<Value> = Vec::new();
+    let key = stored_command_key(interp, name)?;
+    if let Some(v) = table.get(&key) {
+        for t in v {
+            out.push(Value::from_list(&[
+                Value::from_str(&t.ops.join(" ")),
+                Value::from_str(&t.script),
             ]));
         }
     }
@@ -533,6 +735,10 @@ fn legacy_trace(interp: &mut Interp, sub: &str, rest: &[Value]) -> Result<Value>
 #[cfg(test)]
 mod tests {
     use crate::interp::Interp;
+
+    fn eval_err(script: &str) -> String {
+        Interp::new().eval(script).unwrap_err().to_string()
+    }
 
     #[test]
     fn test_trace_add_info_remove() {
@@ -691,6 +897,9 @@ mod tests {
     fn cmd_traces_follow_rename() {
         // Traces attach to the command record: rename foo bar, then
         // renaming bar again still fires; info moves to the new name.
+        // (tclsh 8.6.17: `trace info command` on a name that no longer
+        // resolves — renamed away or never defined — is
+        // `unknown command "<as-typed>"`.)
         let mut interp = Interp::new();
         let r = interp
             .eval(
@@ -698,14 +907,15 @@ mod tests {
                  proc foo {} {}; \
                  trace add command foo rename {append ::log R;#}; \
                  rename foo bar; rename bar baz; \
-                 list $log [trace info command baz] [trace info command foo]"
+                 list $log [trace info command baz]"
             )
             .unwrap()
             .as_str()
             .to_string();
+        assert_eq!(r, "RR {{rename {append ::log R;#}}}");
         assert_eq!(
-            r,
-            "RR {{rename {append ::log R;#}}} {}"
+            eval_err("trace info command neverexisted"),
+            "unknown command \"neverexisted\""
         );
     }
 

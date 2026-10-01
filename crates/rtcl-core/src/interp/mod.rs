@@ -53,6 +53,11 @@ pub(crate) enum UpvarLink {
     Global(String),
     /// Link to `frames[frame_index].locals[name]`.
     Frame { frame_index: usize, var_name: String },
+    /// The link's target was destroyed by a `namespace delete` (or the
+    /// containing array was unset) while the alias was live.  Reads keep
+    /// working against the alias's seeded local copy; writes error
+    /// (tclsh 8.6.17).  `array` distinguishes the two error messages.
+    Dead { array: bool, target: String },
 }
 
 /// A live `namespace ensemble` — the ensemble command's dispatch table
@@ -138,6 +143,29 @@ pub(crate) struct VarTrace {
     pub script: String,
 }
 
+/// One registered `trace add execution` callback: identity (tclsh's
+/// TraceObservation record — `trace remove` matches the *registration*, so a
+/// remove+re-add is a different record even if byte-identical), canonical ops
+/// (sorted enter/leave/enterstep/leavestep) plus the script invoked with the
+/// command text and op appended.
+#[derive(Clone)]
+pub(crate) struct ExecTrace {
+    pub id: u64,
+    pub ops: Vec<String>,
+    pub script: String,
+}
+
+/// Enterstep bookkeeping for one dispatching command (see
+/// [`Interp::exec_step_begin`], implemented in `commands::trace`).
+pub(crate) struct ExecStepCtx {
+    /// Resolved key of the enclosing proc.
+    pub key: String,
+    /// The command's words, list-rendered (tclsh's substituted text).
+    pub cmdtext: String,
+    /// Ids of the caller's step records at enterstep time.
+    pub snapshot: Vec<u64>,
+}
+
 /// Tcl interpreter.
 pub struct Interp {
     /// Variables (global scope).
@@ -190,8 +218,35 @@ pub struct Interp {
     pub(crate) trace_phantoms: HashMap<String, std::collections::HashSet<String>>,
     /// `trace add command` registrations (stored; rename/delete traces).
     pub(crate) cmd_traces: HashMap<String, Vec<(Vec<String>, String)>>,
-    /// `trace add execution` registrations (stored; enter/leave traces).
-    pub(crate) exec_traces: HashMap<String, Vec<(Vec<String>, String)>>,
+    /// `trace add execution` registrations (stored; enter/leave/step traces).
+    pub(crate) exec_traces: HashMap<String, Vec<ExecTrace>>,
+    /// Identity counter for [`ExecTrace`] records.
+    pub(crate) exec_trace_ids: u64,
+    /// Resolved command keys of the procs currently executing (innermost
+    /// last) — execution `enterstep` traces resolve the *caller* command
+    /// through this stack.
+    pub(crate) exec_step_stack: Vec<String>,
+    /// > 0 while an execution-trace callback itself is running (its inner
+    /// commands do not re-trigger step traces — tclsh suppresses them).
+    pub(crate) exec_step_running: u32,
+    /// Eval-level (no call frame) variable aliases created by `upvar` /
+    /// `variable`: canonical local flat key → canonical target flat key.
+    /// At the global level tclsh's `upvar`/`variable` link two variables;
+    /// rtcl's flat global table models that with this redirect.  A Vec so
+    /// `namespace eval` can truncate to its entry mark on exit.
+    pub(crate) flat_aliases: Vec<(String, String)>,
+    /// Eval-level aliases whose target was deleted (namespace removal):
+    /// reads keep the redirect, writes error.
+    pub(crate) dead_flat: Vec<String>,
+    /// Flat keys of variables a `variable` command declared at eval level
+    /// (tclsh: the ns-eval varFrame holds a reference, so a namespace that
+    /// deletes ITSELF leaves the declared variable readable for the rest
+    /// of the body — var-1.16/1.17's `set result` after the self-delete).
+    pub(crate) ns_variable_links: Vec<String>,
+    /// Namespace variables kept alive past `namespace delete` because a
+    /// live variable link still references them; dropped when the
+    /// declaring `namespace eval` exits.
+    pub(crate) ns_eval_keep: Vec<String>,
     /// Accumulated `errorInfo` of the error currently propagating
     /// (message + `while executing` / `invoked from within` frames).
     /// `None` when no error is in flight; consumed by `catch`.
@@ -291,6 +346,13 @@ impl Interp {
             trace_phantoms: HashMap::new(),
             cmd_traces: HashMap::new(),
             exec_traces: HashMap::new(),
+            exec_trace_ids: 0,
+            exec_step_stack: Vec::new(),
+            exec_step_running: 0,
+            flat_aliases: Vec::new(),
+            dead_flat: Vec::new(),
+            ns_variable_links: Vec::new(),
+            ns_eval_keep: Vec::new(),
             err_info: None,
             err_fresh: false,
             err_line: 1,

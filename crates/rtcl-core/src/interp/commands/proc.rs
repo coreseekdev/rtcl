@@ -93,6 +93,16 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         statics,
     };
 
+    // Redefining a command is a silent delete+create (tclsh 8.6.17): no
+    // rename/delete trace fires and the old command's stored traces are
+    // dropped (trace-19.5, trace-20.3.1).
+    if interp.procs.contains_key(&name)
+        || interp.commands.contains_key(&name)
+        || interp.ensembles.contains_key(&name)
+        || interp.import_aliases.contains_key(&name)
+    {
+        interp.wipe_cmd_exec_traces(&name);
+    }
     interp.procs.insert(name, proc_def);
     Ok(Value::empty())
 }
@@ -323,8 +333,76 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args_with_usage("upvar", 3, args.len(), "?level? otherVar localVar ?otherVar localVar ...?"));
     }
 
-    // If not inside a proc, upvar is a no-op
+    // At the global level (no call frames) upvar still links two
+    // variables — the level arithmetic runs over the open `namespace
+    // eval`s only, and the link is an eval-level flat alias (var-3.10:
+    // `namespace eval {} { variable bar 0; namespace eval foo upvar bar
+    // bar }` links foo::bar → bar).
     if interp.frames.is_empty() {
+        let (start, level_arg) = if args.len() > 3 {
+            let t = args[1].as_str();
+            if t.starts_with('#') || t.parse::<i64>().is_ok() {
+                (2usize, Some(t.to_string()))
+            } else {
+                (1usize, None)
+            }
+        } else {
+            (1usize, None)
+        };
+        let scopes_total = interp.ns_stack.len();
+        let target_ns: String = match level_arg.as_deref() {
+            // Default level 1: one scope out from the innermost.
+            None => {
+                let t = scopes_total as isize - 2;
+                if t < 0 {
+                    "::".to_string()
+                } else {
+                    interp.ns_stack[t as usize].clone()
+                }
+            }
+            Some(lt) if lt.starts_with('#') => {
+                let n: usize = lt[1..].parse().unwrap_or(0);
+                if n == 0 {
+                    "::".to_string()
+                } else if n - 1 >= scopes_total {
+                    return Err(Error::Msg(format!("bad level \"{}\"", lt)));
+                } else {
+                    interp.ns_stack[n - 1].clone()
+                }
+            }
+            Some(lt) => {
+                let level: usize = lt.parse().unwrap_or(1);
+                if level > scopes_total + 1 {
+                    return Err(Error::Msg(format!("bad level \"{}\"", lt)));
+                }
+                let t = scopes_total as isize - level as isize - 1;
+                if t < 0 {
+                    "::".to_string()
+                } else {
+                    interp.ns_stack[t as usize].clone()
+                }
+            }
+        };
+        let mut i = start;
+        while i + 1 < args.len() {
+            let other_var = args[i].as_str();
+            let local_var = args[i + 1].as_str();
+            let target_key = if target_ns == "::" {
+                other_var.to_string()
+            } else {
+                interp.canonical_global_in(&target_ns, other_var)
+            };
+            let alias_key = interp.canonical_global(local_var);
+            match interp
+                .flat_aliases
+                .iter_mut()
+                .find(|(k, _)| *k == alias_key)
+            {
+                Some((_, t)) => *t = target_key,
+                None => interp.flat_aliases.push((alias_key, target_key)),
+            }
+            i += 2;
+        }
         return Ok(Value::empty());
     }
 
@@ -400,17 +478,35 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let local_var = args[i + 1].as_str().to_string();
 
         let link = match &target {
-            UpvarTarget::GlobalNs => UpvarLink::Global(other_var),
+            UpvarTarget::GlobalNs => UpvarLink::Global(other_var.clone()),
             UpvarTarget::Ns(ns) => {
                 UpvarLink::Global(interp.canonical_global_in(ns, &other_var))
             }
             UpvarTarget::Frame(fi) => UpvarLink::Frame {
                 frame_index: *fi,
-                var_name: other_var,
+                var_name: other_var.clone(),
             },
         };
 
-        interp.frames[current_idx].upvars.insert(local_var, link);
+        interp.frames[current_idx].upvars.insert(local_var.clone(), link);
+        // The linked name is in the proc's variable table (tclsh `info
+        // vars` lists it): mirror the current value when one exists;
+        // reads/writes still go through the link.
+        let mirror: Option<Value> = match &target {
+            UpvarTarget::GlobalNs => interp.globals.get(&other_var).cloned(),
+            UpvarTarget::Ns(ns) => {
+                let key = interp.canonical_global_in(ns, &other_var);
+                interp.globals.get(&key).cloned()
+            }
+            UpvarTarget::Frame(fi) => interp
+                .frames
+                .get(*fi)
+                .and_then(|f| f.locals.get(&other_var))
+                .cloned(),
+        };
+        if let Some(v) = mirror {
+            interp.frames[current_idx].locals.insert(local_var, v);
+        }
         i += 2;
     }
 
@@ -450,7 +546,8 @@ fn upvar_target(interp: &Interp, target: usize) -> UpvarTarget {
 
 pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(Error::wrong_args("global", 2, args.len()));
+        // Bare `global` is a no-op (var-6.5, var-6.6).
+        return Ok(Value::empty());
     }
 
     // At global level, global is a no-op
@@ -461,12 +558,28 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let current_idx = interp.frames.len() - 1;
 
     for arg in &args[1..] {
-        let name = arg.as_str().to_string();
-        // Create a link from local "name" to globals["name"]
+        let name = arg.as_str();
+        // Every `global` name resolves against the TRUE global namespace:
+        // `::`-qualified targets normalise exactly like `set` does (colon
+        // runs collapse, a trailing run survives — var-6.3's
+        // `global ::test_ns_var::test_ns_nested::` links the empty-named
+        // variable), plain names are verbatim.
+        let target =
+            crate::interp::Interp::global_key(name).unwrap_or_else(|| name.to_string());
+        // The local alias is the tail after the last `::` run
+        // (`global a::b` binds `b` — tclsh), `ns::` binds the empty name.
+        let local = super::namespace::split_var_tail(name).to_string();
         interp.frames[current_idx].upvars.insert(
-            name.clone(),
-            UpvarLink::Global(name),
+            local.clone(),
+            UpvarLink::Global(target.clone()),
         );
+        // The linked name lives in the proc's variable table (tclsh's
+        // `info vars` lists it) — mirror the current value when one
+        // exists; reads/writes still go through the link.
+        if let Some(v) = interp.globals.get(&target) {
+            let v = v.clone();
+            interp.frames[current_idx].locals.insert(local, v);
+        }
     }
 
     Ok(Value::empty())

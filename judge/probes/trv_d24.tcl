@@ -1,0 +1,8 @@
+puts "1: [namespace eval :::m1::: {namespace current}]"
+puts "2: [namespace eval m1 {}; namespace exists :::m1:::]"
+puts "3: [namespace tail a::::b]"
+puts "4: [namespace qualifiers a::::b]"
+puts "5: [namespace qualifiers :::x::y:::]"
+puts "6: [namespace tail :::x::y:::]"
+puts "7: [namespace qualifiers ::]"
+puts "8: [catch {namespace eval q {variable w:::x 9}} m] m=$m"

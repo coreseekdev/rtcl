@@ -36,6 +36,23 @@ impl Interp {
         let mut current_proc_name = proc_name.to_string();
         let mut ns_override = ns_override;
 
+        // Execution traces (tclsh 8.6.17): `enter` fires before the frame
+        // exists and its callback's error REPLACES this invocation
+        // (trace-40.1); `leave` fires after the frame is gone.  The
+        // resolved key doubles as this frame's enterstep context (the
+        // body's commands resolve their enterstep traces through it).
+        let exec_key = super::commands::proc::resolve_command_key(self, proc_name)
+            .unwrap_or_else(|| proc_name.to_string());
+        let exec_cmdtext = if self.exec_traces.is_empty() {
+            String::new()
+        } else {
+            Value::from_list(args).as_str().to_string()
+        };
+        if !self.exec_traces.is_empty() {
+            self.exec_fire_enter(&exec_key, &exec_cmdtext)?;
+        }
+        self.exec_step_stack.push(exec_key.clone());
+
         self.call_depth += 1;
 
         // A proc executes in the namespace where it was defined (the
@@ -186,14 +203,22 @@ impl Interp {
                         current_statics = HashMap::new();
                     }
                     let tc_args = e.into_tail_call_args().unwrap();
-                    let cmd_name = &tc_args[0];
-                    if let Some(new_proc) = self.procs.get(cmd_name).cloned() {
+                    let cmd_name = tc_args[0].clone();
+                    if let Some(new_proc) = self.procs.get(&cmd_name).cloned() {
                         // Tail-call to another proc — reuse the frame (no depth increase)
                         current_params = new_proc.params;
                         current_body = new_proc.body;
                         current_statics = new_proc.statics;
                         current_proc_name = cmd_name.clone();
                         current_args = tc_args.into_iter().map(|s| Value::from_str(&s)).collect();
+                        // The reused frame's enterstep context now names the
+                        // tail-call target (corpus-free: no extra enter/leave
+                        // fires for the switched-to command).
+                        let new_key = super::commands::proc::resolve_command_key(self, &cmd_name)
+                            .unwrap_or_else(|| cmd_name.clone());
+                        if let Some(top) = self.exec_step_stack.last_mut() {
+                            *top = new_key;
+                        }
                         continue;
                     } else {
                         // Target is a built-in — evaluate and return
@@ -260,6 +285,22 @@ impl Interp {
         self.trace_phantoms.retain(|k, _| !k.starts_with(&fkey));
         self.current_namespace = prev_namespace;
         self.call_depth -= 1;
+
+        // Execution traces: the frame is gone; `leave` fires with the
+        // completion code and result (errors are background errors).
+        self.exec_step_stack.pop();
+        if !self.exec_traces.is_empty() {
+            let pair = match &final_result {
+                Ok(v) => Some(("0", v.as_str().to_string())),
+                Err(e) if self.err_is_error(e) => {
+                    Some(("1", e.message_text().to_string()))
+                }
+                _ => None,
+            };
+            if let Some((code, res)) = pair {
+                self.exec_fire_leave(&exec_key, &exec_cmdtext, code, &res);
+            }
+        }
 
         match final_result {
             Ok(v) => Ok(v),

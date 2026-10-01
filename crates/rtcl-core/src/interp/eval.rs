@@ -148,7 +148,26 @@ impl Interp {
         // Expose the invocation for constructs that need the raw source
         // (`info level 0` inside `namespace eval`).
         self.cur_cmd_text = cmd.text.clone();
+        // Execution enterstep/leavestep traces (tclsh 8.6.17): fire
+        // against the enclosing traced proc, if any.  enterstep runs
+        // before dispatch; leavestep after, with the completion code and
+        // result (trace-28.6).  Control-flow completions (return/break/
+        // continue) skip the step end.
+        let step = self.exec_step_begin(&args);
         let r = self.dispatch_values(&args);
+        if let Some(ctx) = step {
+            match &r {
+                Ok(v) => {
+                    let res = v.as_str().to_string();
+                    self.exec_step_end(&ctx, "0", &res);
+                }
+                Err(e) if self.err_is_error(e) => {
+                    let msg = e.message_text().to_string();
+                    self.exec_step_end(&ctx, "1", &msg);
+                }
+                _ => {}
+            }
+        }
         if let Err(e) = &r {
             if self.err_is_error(e) {
                 let msg = e.message_text();

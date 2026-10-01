@@ -54,20 +54,62 @@ impl Interp {
     /// Resolve the owning scope of a variable name (upvar links followed).
     pub(crate) fn resolve_loc(&self, name: &str) -> VarLoc {
         if let Some(gname) = Self::split_global(name) {
-            return VarLoc::Global(gname);
+            return VarLoc::Global(self.redirect_flat(gname));
         }
         if let Some(frame) = self.frames.last() {
             if let Some(link) = frame.upvars.get(name) {
                 return match link {
-                    UpvarLink::Global(gname) => VarLoc::Global(gname.clone()),
+                    UpvarLink::Global(gname) => {
+                        VarLoc::Global(self.redirect_flat(gname.clone()))
+                    }
                     UpvarLink::Frame { frame_index, var_name } => {
                         VarLoc::Frame(*frame_index, var_name.clone())
+                    }
+                    // A dead link reads (and exists) against the alias's
+                    // seeded local copy; writes are rejected in set_var.
+                    UpvarLink::Dead { .. } => {
+                        VarLoc::Frame(self.frames.len() - 1, name.to_string())
                     }
                 };
             }
             return VarLoc::Frame(self.frames.len() - 1, name.to_string());
         }
-        VarLoc::Global(self.canonical_global(name))
+        VarLoc::Global(self.redirect_flat(self.canonical_global(name)))
+    }
+
+    /// Follow an eval-level `upvar` alias (global level): the alias's flat
+    /// key maps to the target's flat key.
+    fn redirect_flat(&self, key: String) -> String {
+        for (k, t) in &self.flat_aliases {
+            if *k == key {
+                return t.clone();
+            }
+        }
+        key
+    }
+
+    /// Dead-link write check (tclsh 8.6.17): only WRITES through an alias
+    /// whose target was destroyed error; reads/`info exists`/unset keep the
+    /// pre-deletion behavior against the seeded local copy.  Returns
+    /// `Some(is_element_error)` when the write must fail.
+    fn dead_link_error(&self, name: &str) -> Option<bool> {
+        let base = match name.find('(') {
+            Some(i) => &name[..i],
+            None => name,
+        };
+        if let Some(frame) = self.frames.last() {
+            match frame.upvars.get(base) {
+                Some(UpvarLink::Dead { array, .. }) => Some(*array),
+                _ => None,
+            }
+        } else {
+            let key = self.canonical_global(base);
+            if self.dead_flat.iter().any(|k| *k == key) {
+                Some(false)
+            } else {
+                None
+            }
+        }
     }
 
     /// Is the variable at `loc` an array?  (Authoritative registry; the
@@ -216,6 +258,12 @@ impl Interp {
         self.canonical_global_in(&self.current_namespace.clone(), name)
     }
 
+    /// [`Self::split_global`] for callers outside `vars.rs` (`global`'s
+    /// link targets follow the same normalization as `set`).
+    pub(crate) fn global_key(name: &str) -> Option<String> {
+        Self::split_global(name)
+    }
+
     /// [`Interp::canonical_global`] against an explicit namespace (the
     /// caller's context — a proc's own `current_namespace` is its
     /// definition namespace, not the `namespace eval` it was called
@@ -234,7 +282,7 @@ impl Interp {
 
     fn resolve_var(&self, name: &str) -> Option<&Value> {
         if let Some(gname) = Self::split_global(name) {
-            return self.globals.get(gname.as_str());
+            return self.globals.get(self.redirect_flat(gname).as_str());
         }
         if let Some(frame) = self.frames.last() {
             if let Some(link) = frame.upvars.get(name) {
@@ -246,12 +294,16 @@ impl Interp {
                     // `namespace delete [namespace current]`).
                     UpvarLink::Global(gname) => self
                         .globals
-                        .get(gname.as_str())
+                        .get(self.redirect_flat(gname.clone()).as_str())
                         .or_else(|| frame.locals.get(name)),
                     UpvarLink::Frame { frame_index, var_name } => {
                         self.frames.get(*frame_index)
                             .and_then(|f| f.locals.get(var_name.as_str()))
                     }
+                    UpvarLink::Dead { target, .. } => self
+                        .globals
+                        .get(target.as_str())
+                        .or_else(|| frame.locals.get(name)),
                 };
             }
             frame.locals.get(name)
@@ -264,7 +316,7 @@ impl Interp {
             // bare-declared (valueless) name stops the chain: reads fail
             // rather than falling through to the global variable.
             if self.current_namespace != "::" {
-                let key = self.canonical_global(name);
+                let key = self.redirect_flat(self.canonical_global(name));
                 if let Some(v) = self.globals.get(key.as_str()) {
                     return Some(v);
                 }
@@ -272,7 +324,7 @@ impl Interp {
                     return None;
                 }
             }
-            self.globals.get(name)
+            self.globals.get(self.redirect_flat(name.to_string()).as_str())
         }
     }
 
@@ -289,6 +341,7 @@ impl Interp {
     /// Set a variable in the current scope, following upvar links.
     fn store_var(&mut self, name: &str, value: Value) {
         if let Some(gname) = Self::split_global(name) {
+            let gname = self.redirect_flat(gname);
             self.globals.insert(gname, value);
             return;
         }
@@ -296,7 +349,7 @@ impl Interp {
             // Inside a namespace every write lands in that namespace's
             // own variable (tclsh: `set x 9` in `namespace eval n` writes
             // ::n::x; `variable`-declared names behave the same way).
-            let key = self.canonical_global(name);
+            let key = self.redirect_flat(self.canonical_global(name));
             self.globals.insert(key, value);
             return;
         }
@@ -304,12 +357,17 @@ impl Interp {
         if let Some(link) = self.frames[frame_idx].upvars.get(name).cloned() {
             match link {
                 UpvarLink::Global(gname) => {
-                    self.globals.insert(gname, value);
+                    self.globals.insert(self.redirect_flat(gname), value);
                 }
                 UpvarLink::Frame { frame_index, var_name } => {
                     if let Some(f) = self.frames.get_mut(frame_index) {
                         f.locals.insert(var_name, value);
                     }
+                }
+                // Writes through dead links error in set_var before
+                // reaching here; keep the write local for safety.
+                UpvarLink::Dead { .. } => {
+                    self.frames[frame_idx].locals.insert(name.to_string(), value);
                 }
             }
         } else {
@@ -320,11 +378,12 @@ impl Interp {
     /// Remove a variable from the current scope, following upvar links.
     fn remove_var(&mut self, name: &str) {
         if let Some(gname) = Self::split_global(name) {
+            let gname = self.redirect_flat(gname);
             self.globals.remove(gname.as_str());
             return;
         }
         if self.frames.is_empty() {
-            let key = self.canonical_global(name);
+            let key = self.redirect_flat(self.canonical_global(name));
             self.globals.remove(key.as_str());
             // Unsetting also forgets the `variable` declaration (tclsh:
             // `namespace which -variable` afterwards is empty and reads
@@ -338,12 +397,18 @@ impl Interp {
         if let Some(link) = self.frames[frame_idx].upvars.get(name).cloned() {
             match link {
                 UpvarLink::Global(gname) => {
-                    self.globals.remove(&gname);
+                    let gname = self.redirect_flat(gname);
+                    self.globals.remove(gname.as_str());
                 }
                 UpvarLink::Frame { frame_index, var_name } => {
                     if let Some(f) = self.frames.get_mut(frame_index) {
                         f.locals.remove(&var_name);
                     }
+                }
+                // Unset through a dead alias keeps its pre-deletion
+                // behavior (removes the seeded local copy).
+                UpvarLink::Dead { .. } => {
+                    self.frames[frame_idx].locals.remove(name);
                 }
             }
         } else {
@@ -400,10 +465,13 @@ impl Interp {
         }
     }
 
-    /// tclsh: a WRITE to a namespace-qualified variable requires every
-    /// namespace on the path to exist (`can't set "bogus::x": parent
-    /// namespace doesn't exist`, errorCode TCL LOOKUP VARNAME). Reads,
-    /// `info exists`, and unset stay plain misses.
+    /// tclsh: a WRITE to a namespace-qualified variable requires the
+    /// variable's namespace to exist (`can't set "bogus::x": parent
+    /// namespace doesn't exist`, errorCode TCL LOOKUP VARNAME).  A trailing
+    /// colon run names the EMPTY variable in that namespace — the namespace
+    /// to check is then the qualifiers part itself (`set ::pns::` is legal,
+    /// `set ::nope2::` is not — var-1.12).  Reads, `info exists`, and unset
+    /// stay plain misses.
     pub(crate) fn check_parent_ns(&mut self, name: &str) -> Result<()> {
         let var = match name.find('(') {
             Some(i) => &name[..i],
@@ -413,16 +481,20 @@ impl Interp {
             return Ok(());
         }
         let full = super::commands::namespace::qualify(&self.current_namespace, var);
-        let parent_ns = match full.rsplit_once("::") {
-            Some((p, leaf)) if !leaf.is_empty() => {
-                if p.is_empty() || p == "::" {
-                    return Ok(()); // root always exists
-                }
-                Self::normalise_ns(p)
+        if full == "::" {
+            return Ok(());
+        }
+        // Trailing run: the variable itself lives in `full`; otherwise the
+        // variable lives in full's parent.
+        let ns_to_check = if var.ends_with(':') {
+            full
+        } else {
+            match full.rsplit_once("::") {
+                Some((p, leaf)) if !leaf.is_empty() => Self::normalise_ns(p),
+                _ => return Ok(()),
             }
-            _ => return Ok(()),
         };
-        if self.namespaces.contains_key(&parent_ns) {
+        if ns_to_check == "::" || self.namespaces.contains_key(&ns_to_check) {
             return Ok(());
         }
         crate::interp::commands::list::set_error_code(
@@ -436,6 +508,19 @@ impl Interp {
     }
 
     pub fn set_var(&mut self, name: &str, value: Value) -> Result<Value> {
+        // A write through an alias whose target namespace/array was
+        // destroyed errors (var-1.15/1.16/1.17); reads keep working.
+        if let Some(elem) = self.dead_link_error(name) {
+            let what = if elem {
+                "element in deleted array"
+            } else {
+                "variable in deleted namespace"
+            };
+            return Err(Error::runtime(
+                format!("can't set \"{}\": upvar refers to {}", name, what),
+                ErrorCode::Generic,
+            ));
+        }
         self.check_parent_ns(name)?;
         if let Some((array_name, index)) = split_array_ref(name) {
             let base = array_name.to_string();
@@ -524,6 +609,10 @@ impl Interp {
             let loc = self.resolve_loc(name);
             if self.loc_is_array(&loc) {
                 self.loc_remove_array(&loc);
+                // Element aliases into this array now error on write
+                // (var-1.17: `upvar 0 arr(1) foo; unset arr; set foo(3)` →
+                // "element in deleted array").
+                self.deaden_element_links(&loc);
                 // Whole-array unset kills its searches and stamp. Unset
                 // traces fire after the deletion, so drop the tables after
                 // firing them.
@@ -550,6 +639,13 @@ impl Interp {
                 self.remove_var(&given);
                 Ok(())
             } else {
+                // tclsh deletes a missing variable's trace records too
+                // (`unset` on an untraced-existence variable still wipes
+                // its registrations — trace-14.17/14.19/33.1).
+                let sk = stamp_key(&loc);
+                self.var_traces.remove(&sk);
+                self.elem_traces.remove(&sk);
+                self.trace_phantoms.remove(&sk);
                 Err(Error::runtime(
                     format!("can't unset \"{}\": no such variable", name),
                     ErrorCode::NotFound,
@@ -669,16 +765,85 @@ impl Interp {
         self.bump_stamp(&loc);
     }
 
+    /// Mark every upvar alias pointing INTO the array at `loc` (any
+    /// element of it) dead: writes through those aliases now error with
+    /// "upvar refers to element in deleted array" (var-1.17).
+    fn deaden_element_links(&mut self, loc: &VarLoc) {
+        let (scope_idx, base) = match loc {
+            VarLoc::Global(n) => (None, n.clone()),
+            VarLoc::Frame(i, n) => (Some(*i), n.clone()),
+        };
+        let elem_prefix = format!("{}(", base);
+        for f in self.frames.iter_mut() {
+            for link in f.upvars.values_mut() {
+                match link {
+                    UpvarLink::Frame { frame_index, var_name }
+                        if Some(*frame_index) == scope_idx
+                            && var_name.starts_with(&elem_prefix) =>
+                    {
+                        *link = UpvarLink::Dead {
+                            array: true,
+                            target: var_name.clone(),
+                        };
+                    }
+                    UpvarLink::Global(g) if scope_idx.is_none() && g.starts_with(&elem_prefix) => {
+                        *link = UpvarLink::Dead {
+                            array: true,
+                            target: g.clone(),
+                        };
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// `namespace delete <prefix>`: every alias (frame upvar or eval-level
+    /// flat alias) whose target lives under the deleted namespace turns
+    /// dead — reads keep the seeded copy, writes error (var-1.15/1.16).
+    /// Variables a `variable` command declared at eval level are exempt:
+    /// the declaring scope still references them.
+    pub(crate) fn deaden_links_under(&mut self, var_prefix: &str) {
+        let aliases: Vec<(String, String)> = self.flat_aliases.clone();
+        for (k, t) in aliases {
+            if t.starts_with(var_prefix) && !self.ns_variable_links.iter().any(|x| *x == t) {
+                self.dead_flat.push(k);
+            }
+        }
+        // Aliases living IN the deleted namespace's variable table die
+        // with it (an `upvar` inside `namespace eval ns` links ns's own
+        // variable).
+        self.flat_aliases.retain(|(k, _)| !k.starts_with(var_prefix));
+        for f in self.frames.iter_mut() {
+            for link in f.upvars.values_mut() {
+                if let UpvarLink::Global(g) = link {
+                    if g.starts_with(var_prefix) {
+                        *link = UpvarLink::Dead {
+                            array: false,
+                            target: g.clone(),
+                        };
+                    }
+                }
+            }
+        }
+    }
+
     /// Read a variable, firing read traces the way tclsh does: scalar
     /// reads fire even when the variable is missing; element reads fire
-    /// only when the element exists (set-old-9.x, trace-1.8).
+    /// when the element exists OR the array itself exists — a missing
+    /// element read on a live array fires the whole-var read trace, whose
+    /// callback may create the element (trace-1.7).  No fire when the
+    /// array is missing or the base is a scalar (trace-1.8).
     pub fn read_var(&mut self, name: &str) -> Result<Value> {
         let (base, idx) = match split_array_ref(name) {
             Some((b, i)) => (b.to_string(), Some(i.to_string())),
             None => (name.to_string(), None),
         };
-        let found = self.get_var(name).is_ok();
-        if idx.is_none() || found {
+        let fire = match &idx {
+            None => true,
+            Some(_) => self.is_array_semantic(&base),
+        };
+        if fire {
             if let Err(e) = self.fire_traces(&base, idx.as_deref(), "read") {
                 return Err(Error::runtime(
                     format!("can't read \"{}\": {}", name, e),
@@ -696,7 +861,11 @@ impl Interp {
             Some((b, i)) => (b.to_string(), Some(i.to_string())),
             None => (name.to_string(), None),
         };
-        if idx.is_none() || self.var_exists(name) {
+        let fire = match &idx {
+            None => true,
+            Some(_) => self.is_array_semantic(&base),
+        };
+        if fire {
             let _ = self.fire_traces(&base, idx.as_deref(), "read");
         }
         self.var_exists(name)

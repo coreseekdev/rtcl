@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::interp::{Interp, ProcDef, UpvarLink};
 use crate::value::Value;
 
-use super::list::{set_error_code, tcl_get_int};
+use super::list::{set_error_code, strict_list, tcl_get_int};
 
 #[cfg(not(feature = "embedded"))]
 use std::collections::HashMap;
@@ -42,10 +42,12 @@ fn parse_param_specs(params: &[Value]) -> Result<Vec<(String, Option<String>)>> 
 
 pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // 3-arg form: proc name argList body
-    // 4-arg form: proc name argList statics body  (jimtcl-compatible)
+    // 4-arg form: proc name argList statics body  (jimtcl-compatible
+    // extension kept for compatibility; the arity error still quotes
+    // tclsh 8.6's standard usage — proc-old-5.1..5.3).
     if args.len() < 4 || args.len() > 5 {
         return Err(Error::wrong_args_with_usage(
-            "proc", 4, args.len(), "name argList ?statics? body",
+            "proc", 4, args.len(), "name args body",
         ));
     }
 
@@ -68,10 +70,21 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         (&args[2], None, &args[3])
     };
 
-    let params = param_arg.as_list().unwrap_or_default();
+    // The argument list is split with Tcl_SplitList: a malformed list
+    // (`proc t {a` …) errors at definition time with the list-parse
+    // message and `TCL VALUE LIST …` errorCode (proc-old-5.4).
+    let params = strict_list(interp, param_arg)?;
     let body = body_arg.as_str().to_string();
 
-    let defaults = parse_param_specs(&params)?;
+    // Tcl raises `TCL OPERATION PROC FORMALARGUMENTFORMAT` for malformed
+    // per-argument specifiers (proc-old-5.5..5.7).
+    let defaults = parse_param_specs(&params).map_err(|e| {
+        if let Error::Msg(m) = &e {
+            set_error_code(interp, "TCL OPERATION PROC FORMALARGUMENTFORMAT");
+            return Error::Msg(m.clone());
+        }
+        e
+    })?;
 
     // Parse statics list: each element is {varName ?initialValue?}
     let mut statics = HashMap::new();

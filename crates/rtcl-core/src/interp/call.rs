@@ -254,6 +254,30 @@ impl Interp {
             }
         };
 
+        // A break/continue that escaped the body had no enclosing loop to
+        // stop it: tclsh converts it to an error at the proc boundary
+        // (proc-old-5.14/5.15) — a caller's loop never sees it.  The
+        // conversion happens where the loop instructions are absent, so no
+        // command position is logged for it: errorInfo starts with the bare
+        // message and the `(procedure "p" line 1)` frame reports line 1
+        // (the interp's error line stays at its reset value), with
+        // errorCode `TCL RESULT UNEXPECTED`.
+        let final_result = match final_result {
+            Err(e) if e.is_break() || e.is_continue() => {
+                let msg = if e.is_break() {
+                    "invoked \"break\" outside of a loop"
+                } else {
+                    "invoked \"continue\" outside of a loop"
+                };
+                self.err_info = Some(msg.to_string());
+                self.err_fresh = false;
+                self.err_line = 1;
+                super::commands::list::set_error_code(self, "TCL RESULT UNEXPECTED");
+                Err(Error::Msg(msg.to_string()))
+            }
+            other => other,
+        };
+
         // `(procedure "name" line N)` frame when the body errored — the
         // line is the erroring command's line within the body, recorded by
         // the body's script harness.  Lambda bodies (apply) get the
@@ -296,6 +320,40 @@ impl Interp {
                 self.commands.remove(name);
                 self.aliases.remove(name);
             }
+        }
+
+        // Frame teardown (tclsh): the proc's locals die with the frame —
+        // on any completion, error unwinds included — and `unset` traces
+        // registered on them fire then, after the values are gone
+        // (proc-old-5.16: the trace fires while the body's error is
+        // propagating out, and a trace error stays a background error that
+        // leaves the in-flight errorInfo untouched).  Whole-array traces
+        // fire once for the array; element-only registrations do not.
+        let teardown_prefix = format!("F{}:", self.frames.len() - 1);
+        let traced: Vec<String> = self
+            .var_traces
+            .keys()
+            .filter(|k| k.starts_with(&teardown_prefix))
+            .map(|k| k[teardown_prefix.len()..].to_string())
+            .collect();
+        if !traced.is_empty() {
+            if let Some(frame) = self.frames.last_mut() {
+                frame.locals.clear();
+                frame.array_locals.clear();
+            }
+            // Trace callbacks must not disturb the error (if any) that is
+            // unwinding through this frame.
+            let saved_info = self.err_info.take();
+            let saved_fresh = std::mem::take(&mut self.err_fresh);
+            let saved_raised = std::mem::take(&mut self.err_code_raised);
+            let saved_pending = self.err_pending_top.take();
+            for name in traced {
+                let _ = self.fire_traces(&name, None, "unset");
+            }
+            self.err_info = saved_info;
+            self.err_fresh = saved_fresh;
+            self.err_code_raised = saved_raised;
+            self.err_pending_top = saved_pending;
         }
 
         // Pop the frame and leave the definition namespace
@@ -363,12 +421,28 @@ impl Interp {
                                     })
                                 }
                                 3 => {
-                                    // return -code break
-                                    Err(Error::brk())
+                                    // return -code break: the break that
+                                    // reaches the caller carries the
+                                    // return's value (tclsh: `return -code
+                                    // break x` in a proc → `catch r` m=x).
+                                    Err(Error::ControlFlow {
+                                        kind: crate::error::ControlFlow::Break,
+                                        value: Some(val),
+                                        level: 1,
+                                        error_info: None,
+                                        error_code: None,
+                                    })
                                 }
                                 4 => {
-                                    // return -code continue
-                                    Err(Error::cont())
+                                    // return -code continue: value carried
+                                    // the same way.
+                                    Err(Error::ControlFlow {
+                                        kind: crate::error::ControlFlow::Continue,
+                                        value: Some(val),
+                                        level: 1,
+                                        error_info: None,
+                                        error_code: None,
+                                    })
                                 }
                                 _ => Ok(val),
                             }

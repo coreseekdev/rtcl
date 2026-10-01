@@ -12,12 +12,31 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let test = args[1].as_str();
     let body = args[2].as_str();
 
+    // tclsh compiles the body inline against one absolute line table, so a
+    // body command's `(procedure ... line N)` reports its line in the
+    // enclosing script, not within the body text (proc-old-5.16: the error
+    // sits on the line after `while {…} {`).  When the body word is a
+    // verbatim braced/quoted literal its lines are relative to the while
+    // command's own line: rebase the eval offset for the body's duration.
+    // A body that came from a variable keeps the unshifted numbering (its
+    // origin is unknowable; tclsh in that case also numbers from 1).
+    let saved_offset = interp.line_offset;
+    let body_offset = match interp.body_is_verbatim_script(2, body) {
+        Some(extra) => Some(saved_offset + interp.cur_cmd_line.max(1) - 1 + extra),
+        None => None,
+    };
+
     loop {
         let cond = interp.eval_expr(test)?;
         if !crate::types::expr_funcs::strict_bool(&cond)? {
             break;
         }
-        match interp.eval(body) {
+        if let Some(off) = body_offset {
+            interp.line_offset = off;
+        }
+        let r = interp.eval(body);
+        interp.line_offset = saved_offset;
+        match r {
             Ok(_) => {}
             Err(e) => {
                 if e.is_break() {

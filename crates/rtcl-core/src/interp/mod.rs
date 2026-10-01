@@ -270,6 +270,19 @@ pub struct Interp {
     /// consumed by `(procedure ... line N)`, `(in namespace eval ...
     /// script line N)`, `("uplevel" body line N)`, `(file ... line N)`.
     pub(crate) err_line: usize,
+    /// Newlines between the enclosing script's first line and the script
+    /// currently being evaluated by a construct that re-evals a word of
+    /// its own source (`while`/`for`/`foreach` bodies): a body command's
+    /// parse-relative line + this offset is the line within the enclosing
+    /// script, which is what `(procedure ... line N)` must report (tclsh
+    /// keeps one absolute line table).  0 at script level.
+    pub(crate) line_offset: usize,
+    /// Line of the command currently dispatching (parse-relative).
+    pub(crate) cur_cmd_line: usize,
+    /// Raw source of each word of the command currently dispatching,
+    /// aligned with its arguments — braced/quoted script words carry their
+    /// delimiters, letting constructs recover their body's line offset.
+    pub(crate) cur_cmd_word_srcs: Vec<String>,
     /// Source text of the command currently dispatching, for constructs
     /// that need the raw invocation (`info level 0` inside
     /// `namespace eval`).
@@ -377,6 +390,9 @@ impl Interp {
             err_fresh: false,
             err_code_raised: false,
             err_line: 1,
+            line_offset: 0,
+            cur_cmd_line: 0,
+            cur_cmd_word_srcs: Vec::new(),
             cur_cmd_text: String::new(),
             err_from_subst: false,
             err_pending_top: None,

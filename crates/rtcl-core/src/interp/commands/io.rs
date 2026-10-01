@@ -1,5 +1,6 @@
 //! I/O and file commands: puts, source, file, format, glob.
 
+use super::chan_io;
 use crate::error::{Error, Result};
 use crate::interp::Interp;
 use crate::value::Value;
@@ -40,23 +41,38 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         _ => return Err(Error::wrong_args_with_usage("puts", 2, args.len(), "?-nonewline? ?channelId? string")),
     }
 
+    if !interp.channels.contains(chan_id) {
+        return Err(chan_io::chan_not_found(interp, chan_id));
+    }
+
+    // Reflected channels (chan create) write through their handler script.
+    if chan_io::reflected_write(interp, chan_id, msg)? {
+        if !nonewline {
+            chan_io::reflected_write(interp, chan_id, "\n")?;
+        }
+        return Ok(Value::empty());
+    }
+    // Channel transforms (chan push) filter bytes through their handler.
+    let out = match chan_io::transform_write(interp, chan_id, msg)? {
+        Some(data) => data,
+        None => msg.to_string(),
+    };
+    let newline = if nonewline { String::new() } else { "\n".to_string() };
+    let out = if newline.is_empty() { out } else { format!("{}{}", out, newline) };
+
     let ch = interp.channels.get_mut(chan_id)
         .ok_or_else(|| Error::runtime(
             format!("can not find channel named \"{}\"", chan_id),
             crate::error::ErrorCode::Io,
         ))?;
+    if !ch.is_writable() {
+        return Err(chan_io::not_opened(interp, chan_id, false));
+    }
 
-    crate::channel::channel_write_str(ch.as_mut(), msg).map_err(|e| Error::runtime(
+    crate::channel::channel_write_str(ch.as_mut(), &out).map_err(|e| Error::runtime(
         format!("error writing \"{}\": {}", chan_id, e),
         crate::error::ErrorCode::Io,
     ))?;
-
-    if !nonewline {
-        crate::channel::channel_write_str(ch.as_mut(), "\n").map_err(|e| Error::runtime(
-            format!("error writing \"{}\": {}", chan_id, e),
-            crate::error::ErrorCode::Io,
-        ))?;
-    }
 
     ch.flush().map_err(|e| Error::runtime(
         format!("error flushing \"{}\": {}", chan_id, e),

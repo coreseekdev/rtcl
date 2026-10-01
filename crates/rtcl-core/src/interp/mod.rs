@@ -323,6 +323,14 @@ pub struct Interp {
     pub(crate) next_interp_id: u64,
     /// TclOO object-system state (`oo::` commands, objects, classes).
     pub(crate) oo: commands::oo::OoState,
+    /// Reflected channels created by `chan create`, keyed by handle
+    /// (`rc0`, `rc1`, ...). Reads/writes route through the handler script.
+    #[cfg(feature = "io")]
+    pub(crate) reflected: HashMap<String, commands::chan_io::ReflectedChannel>,
+    /// Transforms pushed with `chan push`, keyed by the channel handle they
+    /// wrap.
+    #[cfg(feature = "io")]
+    pub(crate) transforms: HashMap<String, commands::chan_io::ChannelTransform>,
 }
 
 /// A scheduled time event (for `after ms script`).
@@ -413,6 +421,10 @@ impl Interp {
             #[cfg(feature = "std")]
             next_interp_id: 1,
             oo: commands::oo::OoState::default(),
+            #[cfg(feature = "io")]
+            reflected: HashMap::new(),
+            #[cfg(feature = "io")]
+            transforms: HashMap::new(),
         };
         commands::oo::init(&mut interp);
         interp.register_builtins();

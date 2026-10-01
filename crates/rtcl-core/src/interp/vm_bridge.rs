@@ -87,7 +87,15 @@ impl VmContext for Interp {
             return self.fill_wrong_args(cmd_name, result);
         }
 
-        Err(Error::invalid_command(cmd_name))
+        // An unknown command raises a fresh `TCL LOOKUP COMMAND` errorCode
+        // (tclsh: `set errorCode` after `nosuchcmd` → `TCL LOOKUP COMMAND
+        // nosuchcmd`).
+        let name = cmd_name.to_string();
+        super::commands::list::set_error_code(
+            self,
+            &format!("TCL LOOKUP COMMAND {}", name),
+        );
+        Err(Error::invalid_command(name))
     }
 
     fn call(&mut self, cmd_id: u16, args: &[Value]) -> Result<Value> {

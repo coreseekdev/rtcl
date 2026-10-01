@@ -713,6 +713,54 @@ impl Interp {
         stamp_key(&self.resolve_loc(name))
     }
 
+    /// Locate the scope that owns the array `name` refers to, following
+    /// upvar links to the ultimate owner: returns `(frame_index, base)`
+    /// where `frame_index = None` means the global table and `base` is
+    /// the array's key there (`upvar a x` at eval level names the
+    /// aliased target, ns-qualified).  Callers enumerate elements with
+    /// `base(`-prefixed keys in the returned table.
+    pub(crate) fn array_owner(&self, name: &str) -> (Option<usize>, String) {
+        let mut scope: Option<usize> = self.frames.last().map(|_| self.frames.len() - 1);
+        let mut base = match scope {
+            Some(_) => name.to_string(),
+            None => self.canonical_global(name),
+        };
+        // Follow upvar links transitively (with a hop bound so a link
+        // cycle can't spin).
+        for _ in 0..=self.frames.len() {
+            let next = match scope {
+                Some(fi) => self
+                    .frames
+                    .get(fi)
+                    .and_then(|f| f.upvars.get(base.as_str()))
+                    .cloned(),
+                None => self
+                    .flat_aliases
+                    .iter()
+                    .find(|(k, _)| *k == base)
+                    .map(|(_, t)| UpvarLink::Global(t.clone())),
+            };
+            match next {
+                Some(UpvarLink::Global(g)) => {
+                    scope = None;
+                    base = g;
+                }
+                Some(UpvarLink::Frame {
+                    frame_index,
+                    var_name,
+                }) => {
+                    scope = Some(frame_index);
+                    base = var_name;
+                }
+                // A dead link terminates the chain (var-1.17 semantics:
+                // the alias stands on its own seeded copy).
+                Some(UpvarLink::Dead { .. }) => break,
+                None => break,
+            }
+        }
+        (scope, base)
+    }
+
     /// Fire variable traces for `op` on (base, elem). Callback scripts run
     /// in the current scope with `name1 name2 op` appended (tclsh passes
     /// name2 as an empty string for whole-variable ops).

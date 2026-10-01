@@ -70,13 +70,18 @@ fn test_dollar_open_paren_no_varname() {
     }
 }
 
-/// `${name}(index)` — braced var name with array index.
+/// `${name}(index)` — a braced var name never takes array-element
+/// syntax: tclsh substitutes `${arr}` and keeps `(idx)` as literal text
+/// (`set arr x; set x(5) q; set y ${arr}(5)` → y is "x(5)").
 #[test]
 fn test_braced_var_with_array_index() {
     let cmds = parse("set x ${arr}(idx)").unwrap();
     match &cmds[0].words[2] {
-        Word::VarRef(name) => assert_eq!(name, "arr(idx)"),
-        w => panic!("expected VarRef(arr(idx)), got {:?}", w),
+        Word::Concat(parts) => {
+            assert_eq!(parts[0], Word::VarRef("arr".to_string()));
+            assert_eq!(parts[1], Word::Literal("(idx)".to_string()));
+        }
+        w => panic!("expected Concat([VarRef(arr), Literal((idx))]), got {:?}", w),
     }
 }
 

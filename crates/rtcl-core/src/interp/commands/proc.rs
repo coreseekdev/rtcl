@@ -4,6 +4,8 @@ use crate::error::{Error, Result};
 use crate::interp::{Interp, ProcDef, UpvarLink};
 use crate::value::Value;
 
+use super::list::{set_error_code, tcl_get_int};
+
 #[cfg(not(feature = "embedded"))]
 use std::collections::HashMap;
 
@@ -216,13 +218,130 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     r
 }
 
+/// A parsed `upvar`/`uplevel` level word.  `#N` is absolute (chain index
+/// above the global scope), plain integers are relative to the innermost
+/// scope.  The original word is kept for `bad level` messages.
+enum LevelSpec {
+    Rel(i64, String),
+    Abs(usize, String),
+}
+
+/// A word is a level candidate iff its first char is `#`, `+`, `-` or a
+/// digit (tclsh's TclGetLevelFromArg inspects the first byte only:
+/// `uplevel .2 {}` runs `.2 {}` as the script).
+fn level_shaped(w: &str) -> bool {
+    matches!(
+        w.as_bytes().first(),
+        Some(b'#') | Some(b'+') | Some(b'-') | Some(b'0'..=b'9')
+    )
+}
+
+/// The stricter shape `upvar` requires at the true global level: `#`
+/// (with anything after it), a digit, or a sign followed by a digit.
+/// A word that fails this is NOT a level there — `upvar a x y` and
+/// `upvar - x y` fall back to pairs at the default level (bad level
+/// "1"), while `upvar 0x x y` and `upvar 1.5 x y` error as-typed.
+fn level_shaped_global(w: &str) -> bool {
+    let b = w.as_bytes();
+    match b.first() {
+        Some(b'#') => true,
+        Some(b'0'..=b'9') => true,
+        Some(b'+') | Some(b'-') => matches!(b.get(1), Some(b'0'..=b'9')),
+        _ => false,
+    }
+}
+
+/// Parse a level word with Tcl's integer grammar (`#-1` and `#0.2` fail,
+/// `#010` is octal 8, `+2` is relative 2).  Failure yields the word
+/// verbatim for the error message.
+fn parse_level(spec: &str) -> std::result::Result<LevelSpec, String> {
+    if let Some(rest) = spec.strip_prefix('#') {
+        return match tcl_get_int(rest) {
+            Some(n) if n >= 0 => Ok(LevelSpec::Abs(n as usize, spec.to_string())),
+            _ => Err(spec.to_string()),
+        };
+    }
+    match tcl_get_int(spec) {
+        Some(n) => Ok(LevelSpec::Rel(n, spec.to_string())),
+        None => Err(spec.to_string()),
+    }
+}
+
+/// Tcl's `bad level` error with its `TCL LOOKUP LEVEL <word>` errorCode.
+fn bad_level(interp: &mut Interp, spec: &str) -> Error {
+    set_error_code(interp, &format!("TCL LOOKUP LEVEL {}", spec));
+    Error::Msg(format!("bad level \"{}\"", spec))
+}
+
 pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(Error::wrong_args("uplevel", 2, args.len()));
+        return Err(Error::wrong_args_with_usage(
+            "uplevel",
+            2,
+            args.len(),
+            "?level? command ?arg ...?",
+        ));
     }
 
-    let explicit_global = args.len() > 2 && args[1].as_str().starts_with('#');
-    let script_start = if args.len() > 2 { 2usize } else { 1usize };
+    // The level word is present iff args[1] merely LOOKS like a level —
+    // shape only, no arity check (`uplevel .2 {}` executes ".2 {}").
+    let has_level = level_shaped(args[1].as_str());
+    let spec = if has_level {
+        match parse_level(args[1].as_str()) {
+            Ok(s) => s,
+            Err(w) => return Err(bad_level(interp, &w)),
+        }
+    } else {
+        LevelSpec::Rel(1, "1".to_string())
+    };
+    let script_start = if has_level { 2usize } else { 1usize };
+
+    // tclsh counts every varFrame — proc frames AND open `namespace
+    // eval`s — as one level.  Rebuild that chain (bottom→top) from the
+    // proc frames' `ns_depth` markers and the live ns-eval stack:
+    // [ns evals below frame 0] frame 0 [ns evals between 0 and 1] …
+    let scopes_total = interp.frames.len() + interp.ns_stack.len();
+    let (num_to_pop_frames, ns_trim, target_ns) = match &spec {
+        LevelSpec::Abs(n, word) => {
+            // `#N` names the absolute Nth scope above the global level
+            // (#0 = the global scope itself); past the top: bad level.
+            if *n == 0 {
+                (interp.frames.len(), 0usize, "::".to_string())
+            } else if n - 1 >= scopes_total {
+                return Err(bad_level(interp, word));
+            } else {
+                uplevel_resolve(interp, n - 1)
+            }
+        }
+        LevelSpec::Rel(n, word) => {
+            // Relative levels count OUT from the innermost scope; past
+            // the top: bad level.  Negative levels report the decimal
+            // magnitude (`uplevel -1` at global → bad level "1").
+            let m = n.unsigned_abs() as usize;
+            if m > scopes_total {
+                let shown = if *n < 0 { m.to_string() } else { word.clone() };
+                return Err(bad_level(interp, &shown));
+            }
+            let target = scopes_total as isize - m as isize - 1;
+            if target < 0 {
+                (interp.frames.len(), 0usize, "::".to_string())
+            } else {
+                uplevel_resolve(interp, target as usize)
+            }
+        }
+    };
+
+    // Range resolution precedes the empty-command arity check
+    // (`uplevel 9` at global → bad level, not wrong # args).
+    if script_start >= args.len() {
+        return Err(Error::wrong_args_with_usage(
+            "uplevel",
+            2,
+            args.len(),
+            "?level? command ?arg ...?",
+        ));
+    }
+
     let script = if args.len() - script_start == 1 {
         args[script_start].as_str().to_string()
     } else {
@@ -231,44 +350,6 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             .map(|a| a.as_str())
             .collect::<Vec<&str>>()
             .join(" ")
-    };
-
-    // tclsh counts every varFrame — proc frames AND open `namespace
-    // eval`s — as one level.  Rebuild that chain (bottom→top) from the
-    // proc frames' `ns_depth` markers and the live ns-eval stack:
-    // [ns evals below frame 0] frame 0 [ns evals between 0 and 1] …
-    let scopes_total = interp.frames.len() + interp.ns_stack.len();
-    let (num_to_pop_frames, ns_trim, target_ns) = if explicit_global {
-        // `#N` names the absolute Nth scope above the global level
-        // (#0 = the global scope itself); past the top: bad level.
-        let lvl_text = args[1].as_str();
-        let n: usize = lvl_text[1..].parse().unwrap_or(0);
-        if n == 0 {
-            (interp.frames.len(), 0usize, "::".to_string())
-        } else if n - 1 >= scopes_total {
-            return Err(Error::Msg(format!("bad level \"{}\"", lvl_text)));
-        } else {
-            uplevel_resolve(interp, n - 1)
-        }
-    } else {
-        let n = match args.len() > 2 {
-            true => args[1].as_int().unwrap_or(1).max(0) as usize,
-            false => 1,
-        };
-        // Target scope index (bottom→top); `uplevel 1` is one scope OUT
-        // from the innermost.  Past the top: bad level (uplevel-4.2).
-        if n > scopes_total {
-            return Err(Error::Msg(format!(
-                "bad level \"{}\"",
-                args[1].as_str()
-            )));
-        }
-        let target = scopes_total as isize - n as isize - 1;
-        if target < 0 {
-            (interp.frames.len(), 0usize, "::".to_string())
-        } else {
-            uplevel_resolve(interp, target as usize)
-        }
     };
 
     // Pop proc frames and trim ns evals down to the target scope, eval,
@@ -333,55 +414,68 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args_with_usage("upvar", 3, args.len(), "?level? otherVar localVar ?otherVar localVar ...?"));
     }
 
-    // At the global level (no call frames) upvar still links two
-    // variables — the level arithmetic runs over the open `namespace
-    // eval`s only, and the link is an eval-level flat alias (var-3.10:
-    // `namespace eval {} { variable bar 0; namespace eval foo upvar bar
-    // bar }` links foo::bar → bar).
-    if interp.frames.is_empty() {
-        let (start, level_arg) = if args.len() > 3 {
-            let t = args[1].as_str();
-            if t.starts_with('#') || t.parse::<i64>().is_ok() {
-                (2usize, Some(t.to_string()))
+    // Level-word detection: PARITY decides everywhere — an even argument
+    // count nominates args[1] as the level, an odd count makes it the
+    // first otherVar (`upvar 0 x` at global is the pair ("0", "x")).  A
+    // nominated word parses STRICTLY inside any enclosing scope (`upvar
+    // a b c` → bad level "a"); at the TRUE global level (no frames, no
+    // ns evals) a word that doesn't look like a level falls back to
+    // pairs at the default level instead (`upvar a x y` → bad level
+    // "1", but `upvar 0x x y` → bad level "0x").
+    let has_level = if args.len() % 2 == 0 {
+        !interp.frames.is_empty()
+            || !interp.ns_stack.is_empty()
+            || level_shaped_global(args[1].as_str())
+    } else {
+        false
+    };
+    let spec = if has_level {
+        match parse_level(args[1].as_str()) {
+            Ok(s) => s,
+            Err(w) => return Err(bad_level(interp, &w)),
+        }
+    } else {
+        LevelSpec::Rel(1, "1".to_string())
+    };
+    let start = if has_level { 2usize } else { 1usize };
+    if start >= args.len() {
+        return Err(Error::wrong_args_with_usage("upvar", 3, args.len(), "?level? otherVar localVar ?otherVar localVar ...?"));
+    }
+
+    let scopes_total = interp.frames.len() + interp.ns_stack.len();
+    let scope: TargetScope = match &spec {
+        LevelSpec::Abs(n, word) => {
+            if *n == 0 {
+                TargetScope::Global
+            } else if n - 1 >= scopes_total {
+                return Err(bad_level(interp, word));
             } else {
-                (1usize, None)
+                TargetScope::Idx(n - 1)
             }
-        } else {
-            (1usize, None)
-        };
-        let scopes_total = interp.ns_stack.len();
-        let target_ns: String = match level_arg.as_deref() {
-            // Default level 1: one scope out from the innermost.
-            None => {
-                let t = scopes_total as isize - 2;
-                if t < 0 {
-                    "::".to_string()
-                } else {
-                    interp.ns_stack[t as usize].clone()
-                }
+        }
+        LevelSpec::Rel(n, word) => {
+            let m = n.unsigned_abs() as usize;
+            if m > scopes_total {
+                let shown = if *n < 0 { m.to_string() } else { word.clone() };
+                return Err(bad_level(interp, &shown));
             }
-            Some(lt) if lt.starts_with('#') => {
-                let n: usize = lt[1..].parse().unwrap_or(0);
-                if n == 0 {
-                    "::".to_string()
-                } else if n - 1 >= scopes_total {
-                    return Err(Error::Msg(format!("bad level \"{}\"", lt)));
-                } else {
-                    interp.ns_stack[n - 1].clone()
-                }
+            let t = scopes_total as isize - m as isize - 1;
+            if t < 0 {
+                TargetScope::Bottom
+            } else {
+                TargetScope::Idx(t as usize)
             }
-            Some(lt) => {
-                let level: usize = lt.parse().unwrap_or(1);
-                if level > scopes_total + 1 {
-                    return Err(Error::Msg(format!("bad level \"{}\"", lt)));
-                }
-                let t = scopes_total as isize - level as isize - 1;
-                if t < 0 {
-                    "::".to_string()
-                } else {
-                    interp.ns_stack[t as usize].clone()
-                }
-            }
+        }
+    };
+
+    // At the global level (no call frames) upvar still links two
+    // variables — the link is an eval-level flat alias (var-3.10:
+    // `namespace eval {} { variable bar 0; namespace eval foo { upvar
+    // bar bar } }` links foo::bar → bar).
+    if interp.frames.is_empty() {
+        let target_ns = match scope {
+            TargetScope::Global | TargetScope::Bottom => "::".to_string(),
+            TargetScope::Idx(k) => interp.ns_stack[k].clone(),
         };
         let mut i = start;
         while i + 1 < args.len() {
@@ -393,6 +487,15 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.canonical_global_in(&target_ns, other_var)
             };
             let alias_key = interp.canonical_global(local_var);
+            // Level 0 at the global level names the current scope
+            // itself: `upvar 0 zz zz` is a self-reference (tclsh
+            // 8.6.17).
+            if target_key == alias_key {
+                set_error_code(interp, "TCL UPVAR SELF");
+                return Err(Error::Msg(
+                    "can't upvar from variable to itself".to_string(),
+                ));
+            }
             match interp
                 .flat_aliases
                 .iter_mut()
@@ -406,69 +509,23 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Ok(Value::empty());
     }
 
-    let (start, level_arg) = if args.len() > 3 {
-        let t = args[1].as_str();
-        // A leading integer (or `#N`) is a level; anything else starts
-        // the var pairs (`upvar a x1 b x2` = two links at level 1).
-        if t.starts_with('#') || t.parse::<i64>().is_ok() {
-            (2usize, Some(t.to_string()))
-        } else {
-            (1usize, None)
-        }
-    } else {
-        (1usize, None)
-    };
-
     let current_idx = interp.frames.len() - 1;
 
-    // Determine the target scope over the tclsh varFrame chain (proc
-    // frames + open namespace evals, one level each).
-    let scopes_total = interp.frames.len() + interp.ns_stack.len();
-    let target: UpvarTarget = match level_arg.as_deref() {
-        None => {
-            // No level: upvar 1 — the caller's scope.  One scope out
-            // from the innermost.
-            let t = scopes_total as isize - 2;
-            if t < 0 {
-                let ns = interp.frames[current_idx]
-                    .call_ns
-                    .clone()
-                    .unwrap_or_else(|| "::".to_string());
-                UpvarTarget::Ns(ns)
-            } else {
-                upvar_target(interp, t as usize)
-            }
+    // Map the scope to the upvar target over the tclsh varFrame chain
+    // (proc frames + open namespace evals, one level each).
+    let target: UpvarTarget = match scope {
+        TargetScope::Global => UpvarTarget::GlobalNs,
+        TargetScope::Bottom => {
+            // Fell off every scope: the CALLER's namespace context
+            // (var-15.1: `namespace eval test A ...` + `upvar $name`
+            // lands in ::test, not the proc's own ns).
+            let ns = interp.frames[current_idx]
+                .call_ns
+                .clone()
+                .unwrap_or_else(|| "::".to_string());
+            UpvarTarget::Ns(ns)
         }
-        Some(lt) if lt.starts_with('#') => {
-            // `#N` = absolute Nth scope above global; #0 = global itself.
-            let n: usize = lt[1..].parse().unwrap_or(0);
-            if n == 0 {
-                UpvarTarget::GlobalNs
-            } else if n - 1 >= scopes_total {
-                return Err(Error::Msg(format!("bad level \"{}\"", lt)));
-            } else {
-                upvar_target(interp, n - 1)
-            }
-        }
-        Some(lt) => {
-            let level: usize = lt.parse().unwrap_or(1);
-            if level > scopes_total {
-                return Err(Error::Msg(format!("bad level \"{}\"", lt)));
-            }
-            let t = scopes_total as isize - level as isize - 1;
-            if t < 0 {
-                // Fell off every scope: the CALLER's namespace context
-                // (var-15.1: `namespace eval test A ...` + `upvar $name`
-                // lands in ::test, not the proc's own ns).
-                let ns = interp.frames[current_idx]
-                    .call_ns
-                    .clone()
-                    .unwrap_or_else(|| "::".to_string());
-                UpvarTarget::Ns(ns)
-            } else {
-                upvar_target(interp, t as usize)
-            }
-        }
+        TargetScope::Idx(k) => upvar_target(interp, k),
     };
 
     // Create upvar links
@@ -477,7 +534,11 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let other_var = args[i].as_str().to_string();
         let local_var = args[i + 1].as_str().to_string();
 
-        let link = match &target {
+        // Resolve the named variable through any existing upvar links in
+        // the target scope, so aliasing an alias lands on the ULTIMATE
+        // target (upvar-4.2: p3 aliases p2's alias of p1's local;
+        // upvar-8.5: the reverse link closes a cycle onto itself).
+        let mut link = match &target {
             UpvarTarget::GlobalNs => UpvarLink::Global(other_var.clone()),
             UpvarTarget::Ns(ns) => {
                 UpvarLink::Global(interp.canonical_global_in(ns, &other_var))
@@ -487,30 +548,98 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 var_name: other_var.clone(),
             },
         };
-
-        interp.frames[current_idx].upvars.insert(local_var.clone(), link);
-        // The linked name is in the proc's variable table (tclsh `info
-        // vars` lists it): mirror the current value when one exists;
-        // reads/writes still go through the link.
-        let mirror: Option<Value> = match &target {
-            UpvarTarget::GlobalNs => interp.globals.get(&other_var).cloned(),
-            UpvarTarget::Ns(ns) => {
-                let key = interp.canonical_global_in(ns, &other_var);
-                interp.globals.get(&key).cloned()
+        for _ in 0..=interp.frames.len() {
+            let next = match &link {
+                UpvarLink::Frame { frame_index, var_name } => interp
+                    .frames
+                    .get(*frame_index)
+                    .and_then(|f| f.upvars.get(var_name.as_str()))
+                    .cloned(),
+                UpvarLink::Global(_) | UpvarLink::Dead { .. } => None,
+            };
+            match next {
+                Some(l) => link = l,
+                None => break,
             }
-            UpvarTarget::Frame(fi) => interp
+        }
+
+        // Self-reference, direct or through a link chain.
+        if let UpvarLink::Frame { frame_index, var_name } = &link {
+            if *frame_index == current_idx && *var_name == local_var {
+                set_error_code(interp, "TCL UPVAR SELF");
+                return Err(Error::Msg(
+                    "can't upvar from variable to itself".to_string(),
+                ));
+            }
+        }
+
+        // A traced variable can't be turned into an alias (upvar-8.7).
+        // Whole-var traces only: an element trace (`trace add variable
+        // a(1) ...`) marks `a` as an existing array instead, so the
+        // exists check below reports it (probed on 8.6.17).
+        let trace_key = format!("F{}:{}", current_idx, local_var);
+        if interp.var_traces.contains_key(&trace_key) {
+            set_error_code(interp, "TCL UPVAR TRACED");
+            return Err(Error::Msg(format!(
+                "variable \"{}\" has traces: can't use for upvar",
+                local_var
+            )));
+        }
+
+        // An existing local that is not itself an alias blocks the link;
+        // replacing an existing alias is silent (upvar-6.1 re-links `x`
+        // once per loop iteration).
+        let has_link = interp.frames[current_idx].upvars.contains_key(&local_var);
+        if !has_link
+            && (interp.frames[current_idx].locals.contains_key(&local_var)
+                || interp
+                    .frames[current_idx]
+                    .array_locals
+                    .contains(&local_var))
+        {
+            set_error_code(interp, "TCL UPVAR EXISTS");
+            return Err(Error::Msg(format!(
+                "variable \"{}\" already exists",
+                local_var
+            )));
+        }
+
+        interp.frames[current_idx]
+            .upvars
+            .insert(local_var.clone(), link.clone());
+        // The linked name is in the proc's variable table (tclsh `info
+        // vars` lists it): mirror the current value of the ULTIMATE
+        // target when one exists; reads/writes still go through the
+        // link.
+        let mirror: Option<Value> = match &link {
+            UpvarLink::Global(gname) => interp.globals.get(gname).cloned(),
+            UpvarLink::Frame { frame_index, var_name } => interp
                 .frames
-                .get(*fi)
-                .and_then(|f| f.locals.get(&other_var))
+                .get(*frame_index)
+                .and_then(|f| f.locals.get(var_name.as_str()))
                 .cloned(),
+            UpvarLink::Dead { .. } => None,
         };
         if let Some(v) = mirror {
             interp.frames[current_idx].locals.insert(local_var, v);
+        } else {
+            interp.frames[current_idx].locals.remove(&local_var);
         }
         i += 2;
     }
 
     Ok(Value::empty())
+}
+
+/// Which scope an `upvar` level names at the top of the chain.
+enum TargetScope {
+    /// Fell off every scope: the caller's namespace context inside a
+    /// proc, the true global namespace at eval level.
+    Bottom,
+    /// The true global namespace (`upvar #0`).
+    Global,
+    /// A scope-chain index (bottom→top over frames + ns evals).
+    Idx(usize),
 }
 
 /// Which scope an `upvar` level names.

@@ -255,9 +255,15 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let pattern = if args.len() > 3 { Some(args[3].as_str()) } else { None };
             let mut result: Vec<Value> = Vec::new();
-            let prefix = format!("{}(", array_name);
-            let vars: Vec<(String, Value)> = interp
-                .scope_vars()
+            // Resolve through upvar links to the owning table (`upvar a
+            // x; array get x` lists the target's elements).
+            let (owner_fi, base) = interp.array_owner(array_name);
+            let prefix = format!("{}(", base);
+            let table = match owner_fi {
+                Some(i) => &interp.frames[i].locals,
+                None => &interp.globals,
+            };
+            let vars: Vec<(String, Value)> = table
                 .iter()
                 .filter_map(|(k, v)| {
                     if k.starts_with(&prefix) && k.ends_with(')') {
@@ -321,7 +327,10 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 let name = array_name.to_string();
                 let _ = interp.fire_traces(&name, None, "array");
             }
-            let prefix = format!("{}(", array_name);
+            let prefix = format!(
+                "{}(",
+                interp.array_owner(array_name).1
+            );
             let matches_elem = |elem: &str| -> bool {
                 match pattern {
                     None => true,
@@ -348,8 +357,12 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     },
                 }
             };
-            let names: Vec<Value> = interp
-                .scope_vars()
+            let (owner_fi, _) = interp.array_owner(array_name);
+            let table = match owner_fi {
+                Some(i) => &interp.frames[i].locals,
+                None => &interp.globals,
+            };
+            let names: Vec<Value> = table
                 .keys()
                 .filter_map(|k| {
                     if k.starts_with(&prefix) && k.ends_with(')') {
@@ -370,9 +383,13 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() != 3 {
                 return Err(usage("array", "size", "arrayName"));
             }
-            let prefix = format!("{}(", array_name);
-            let count = interp
-                .scope_vars()
+            let (owner_fi, base) = interp.array_owner(array_name);
+            let prefix = format!("{}(", base);
+            let table = match owner_fi {
+                Some(i) => &interp.frames[i].locals,
+                None => &interp.globals,
+            };
+            let count = table
                 .keys()
                 .filter(|k| k.starts_with(&prefix) && k.ends_with(')'))
                 .count();
@@ -384,21 +401,30 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             // Semantic check: an array stays alive after its last element
             // is unset (registry marker), a scalar is not an array.
+            let (owner_fi, base) = interp.array_owner(array_name);
+            let prefix = format!("{}(", base);
+            let table = match owner_fi {
+                Some(i) => &interp.frames[i].locals,
+                None => &interp.globals,
+            };
             let exists = interp.is_array_semantic(array_name)
-                || interp
-                    .scope_vars()
+                || table
                     .keys()
-                    .any(|k| k.starts_with(&format!("{}(", array_name)) && k.ends_with(')'));
+                    .any(|k| k.starts_with(&prefix) && k.ends_with(')'));
             Ok(Value::from_bool(exists))
         }
         "unset" => {
             if args.len() < 3 || args.len() > 4 {
                 return Err(usage("array", "unset", "arrayName ?pattern?"));
             }
-            let prefix = format!("{}(", array_name);
+            let (owner_fi, base) = interp.array_owner(array_name);
+            let prefix = format!("{}(", base);
             let pattern = if args.len() > 3 { Some(args[3].as_str()) } else { None };
-            let keys_to_remove: Vec<String> = interp
-                .scope_vars()
+            let table = match owner_fi {
+                Some(i) => &interp.frames[i].locals,
+                None => &interp.globals,
+            };
+            let keys_to_remove: Vec<String> = table
                 .keys()
                 .filter(|k| {
                     if k.starts_with(&prefix) && k.ends_with(')') {

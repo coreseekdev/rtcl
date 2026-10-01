@@ -425,7 +425,15 @@ impl Interp {
                         return self.dispatch_values(&unknown_args);
                     }
                 }
-                Err(Error::invalid_command(cmd_name))
+                // An unknown command raises a fresh `TCL LOOKUP COMMAND`
+                // errorCode (tclsh: `set errorCode` after `nosuchcmd` →
+                // `TCL LOOKUP COMMAND nosuchcmd`).
+                let name = cmd_name.to_string();
+                super::commands::list::set_error_code(
+                    self,
+                    &format!("TCL LOOKUP COMMAND {}", name),
+                );
+                Err(Error::invalid_command(name))
             }
         }
     }

@@ -237,15 +237,11 @@ fn parse_dollar(cur: &mut Cursor, tokens: &mut Tokens, _bracket_term: bool) -> P
             let name = cur.slice(start).to_string();
             cur.advance(); // skip '}'
 
-            if cur.is(Token::LeftParen) {
-                if let Some(idx) = try_parse_var_index(cur) {
-                    tokens.push(Word::VarRef(format!("{}({})", name, idx)));
-                } else {
-                    tokens.push(Word::VarRef(name));
-                }
-            } else {
-                tokens.push(Word::VarRef(name));
-            }
+            // A braced name NEVER takes array-element syntax: in tclsh
+            // `${arrayname}($name)` substitutes the name and the
+            // parenthesized tail stays literal text (parray prints
+            // "x(a)" that way) — terminate at the `}` unconditionally.
+            tokens.push(Word::VarRef(name));
         }
         Token::LeftParen => {
             // $(...) expr sugar (jimtcl default): evaluate content as expression

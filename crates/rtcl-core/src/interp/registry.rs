@@ -152,6 +152,10 @@ static CMD_TABLE_ENSEMBLE: &[CmdEntry] = &[
     CmdEntry { name: "tcl::dict::values", func: dict::cmd_dict_ens_values, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
     CmdEntry { name: "tcl::dict::with", func: dict::cmd_dict_ens_with, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
     CmdEntry { name: "tcl::mathop::+", func: misc::cmd_mathop_plus, cat: Standard, cmd_id: None, usage: "?value ...?", help: "Sum values (expr +)" },
+    // ::tcl::pkgconfig — build-configuration query (tclPkgConfig.c parity);
+    // keyed absolute so `::tcl::pkgconfig` resolves directly and the
+    // relative `tcl::pkgconfig` falls through the `::`+name lookup.
+    CmdEntry { name: "::tcl::pkgconfig", func: misc::cmd_pkgconfig, cat: Standard, cmd_id: None, usage: "subcommand ?arg ...?", help: "Query Tcl build configuration" },
 ];
 
 /// Commands gated behind `feature = "clock"`.

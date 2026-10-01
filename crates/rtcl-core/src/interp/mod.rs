@@ -635,6 +635,104 @@ mod tests {
         interp.eval("parray x").unwrap();
     }
 
+    // --- auto_qualify (stdlib.tcl, tclsh 8.6 init.tcl parity / gen_init) ---
+
+    #[test]
+    fn test_auto_qualify_manpage_examples() {
+        let mut interp = Interp::new();
+        let cases = [
+            ("::foo::bar ::blue", "::foo::bar"),
+            ("::global ::sub", "global"),
+            ("nocolons ::", "nocolons"),
+            ("nocolons ::sub", "::sub::nocolons nocolons"),
+            ("foo::bar ::", "::foo::bar"),
+            ("foo::bar ::sub", "::sub::foo::bar ::foo::bar"),
+            (":::foo::::bar ::blue", "::foo::bar"),
+            (":::foo ::bar", "foo"),
+        ];
+        for (call, want) in cases {
+            let got = interp
+                .eval(&format!("auto_qualify {call}"))
+                .unwrap()
+                .as_str()
+                .to_string();
+            assert_eq!(got, want, "auto_qualify {call}");
+        }
+    }
+
+    // --- ::tcl::pkgconfig (misc.rs, tclPkgConfig.c parity / gen_config) ---
+
+    #[test]
+    fn test_pkgconfig_surface() {
+        let mut interp = Interp::new();
+        assert_eq!(
+            interp
+                .eval("llength [::tcl::pkgconfig list]")
+                .unwrap()
+                .as_str(),
+            "18"
+        );
+        assert_eq!(
+            interp
+                .eval("::tcl::pkgconfig get bindir,install")
+                .unwrap()
+                .as_str(),
+            "/usr/bin"
+        );
+        assert_eq!(
+            interp
+                .eval("catch {::tcl::pkgconfig get foo} m; set ::errorCode")
+                .unwrap()
+                .as_str(),
+            "TCL LOOKUP CONFIG foo"
+        );
+    }
+
+    #[test]
+    fn test_pkgconfig_arity_and_subcommand_errors() {
+        let mut interp = Interp::new();
+        let cases = [
+            (
+                "catch {::tcl::pkgconfig} m; set m",
+                "wrong # args: should be \"::tcl::pkgconfig subcommand ?arg?\"",
+            ),
+            (
+                "catch {::tcl::pkgconfig foo} m; set m",
+                "bad subcommand \"foo\": must be get or list",
+            ),
+            (
+                "catch {::tcl::pkgconfig foo} m; set ::errorCode",
+                "TCL LOOKUP INDEX subcommand foo",
+            ),
+            (
+                "catch {::tcl::pkgconfig list foo} m; set m",
+                "wrong # args: should be \"::tcl::pkgconfig list\"",
+            ),
+            (
+                "catch {::tcl::pkgconfig get} m; set m",
+                "wrong # args: should be \"::tcl::pkgconfig get key\"",
+            ),
+            (
+                "catch {::tcl::pkgconfig get foo bar} m; set m",
+                "wrong # args: should be \"::tcl::pkgconfig subcommand ?arg?\"",
+            ),
+            // Prefix resolution + ambiguity (Tcl_GetIndexFromObj semantics).
+            ("llength [::tcl::pkgconfig l]", "18"),
+            (
+                "catch {::tcl::pkgconfig \"\"} m; set m",
+                "ambiguous subcommand \"\": must be get or list",
+            ),
+            (
+                "catch {::tcl::pkgconfig \"\"} m; set ::errorCode",
+                "TCL LOOKUP INDEX subcommand {}",
+            ),
+        ];
+        for (script, want) in cases {
+            let got = interp.eval(script).unwrap().as_str().to_string();
+            assert_eq!(got, want, "script: {script}");
+        }
+    }
+
     // --- Phase 5B stdlib tests ---
 
     #[test]

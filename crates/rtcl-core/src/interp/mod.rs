@@ -266,6 +266,14 @@ pub struct Interp {
     /// Next child interpreter ID counter.
     #[cfg(feature = "std")]
     pub(crate) next_interp_id: u64,
+    /// Reflected channels created by `chan create`, keyed by handle
+    /// (`rc0`, `rc1`, ...). Reads/writes route through the handler script.
+    #[cfg(feature = "io")]
+    pub(crate) reflected: HashMap<String, commands::chan_io::ReflectedChannel>,
+    /// Transforms pushed with `chan push`, keyed by the channel handle they
+    /// wrap.
+    #[cfg(feature = "io")]
+    pub(crate) transforms: HashMap<String, commands::chan_io::ChannelTransform>,
 }
 
 /// A scheduled time event (for `after ms script`).
@@ -348,6 +356,10 @@ impl Interp {
             child_interps: HashMap::new(),
             #[cfg(feature = "std")]
             next_interp_id: 1,
+            #[cfg(feature = "io")]
+            reflected: HashMap::new(),
+            #[cfg(feature = "io")]
+            transforms: HashMap::new(),
         };
         interp.register_builtins();
         interp.init_special_vars();

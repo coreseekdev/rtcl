@@ -189,6 +189,8 @@ static CMD_TABLE_IO: &[CmdEntry] = &[
     CmdEntry { name: "eof",         func: chan_io::cmd_eof,         cat: Extension, cmd_id: Some(CmdId::Eof    as u16),        usage: "channelId",              help: "Check for end of file" },
     CmdEntry { name: "flush",       func: chan_io::cmd_flush,       cat: Extension, cmd_id: Some(CmdId::Flush  as u16),        usage: "channelId",              help: "Flush channel output" },
     CmdEntry { name: "fconfigure",  func: chan_io::cmd_fconfigure,  cat: Extension, cmd_id: Some(CmdId::Fconfigure as u16),    usage: "channelId ?-option value ...?", help: "Configure channel options" },
+    CmdEntry { name: "fblocked",    func: chan_io::cmd_fblocked,    cat: Extension, cmd_id: None,                              usage: "channelId",              help: "Check whether input data is buffered" },
+    CmdEntry { name: "chan",        func: chan_io::cmd_chan,        cat: Extension, cmd_id: None,                              usage: "subcommand ?arg ...?",   help: "Channel operations (ensemble)" },
     CmdEntry { name: "pid",         func: chan_io::cmd_pid,         cat: Extension, cmd_id: Some(CmdId::Pid    as u16),        usage: "?channelId?",            help: "Get process ID" },
 ];
 

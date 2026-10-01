@@ -36,6 +36,11 @@ pub trait Channel: Send {
     fn close(self: Box<Self>) -> io::Result<()>;
     fn is_readable(&self) -> bool;
     fn is_writable(&self) -> bool;
+    /// Truncate a seekable, writable channel (`chan truncate`). The default
+    /// implementation reports the operation as unsupported.
+    fn set_length(&mut self, _len: u64) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "channel is not truncatable"))
+    }
     fn configure(&mut self, _cfg: &ChannelConfig) {}
     fn channel_type(&self) -> &'static str;
     /// Return associated process IDs (for pipe channels). Empty list for non-pipe channels.
@@ -100,6 +105,11 @@ pub struct ChannelConfig {
     pub buffer_size: usize,
     pub blocking: bool,
     pub encoding: String,
+    /// Input end-of-file character (`fconfigure -eofchar`), if set.
+    /// Tcl only allows non-NUL ASCII characters here.
+    pub eofchar_in: Option<char>,
+    /// Output end-of-file character (`fconfigure -eofchar`), if set.
+    pub eofchar_out: Option<char>,
 }
 
 impl Default for ChannelConfig {
@@ -110,6 +120,8 @@ impl Default for ChannelConfig {
             buffer_size: 4096,
             blocking: true,
             encoding: "utf-8".to_string(),
+            eofchar_in: None,
+            eofchar_out: None,
         }
     }
 }
@@ -123,6 +135,13 @@ pub struct ChannelTable {
     channels: HashMap<ChannelId, Box<dyn Channel>>,
     configs: HashMap<ChannelId, ChannelConfig>,
     next_id: u32,
+    /// Registration order of live channels (`chan names` is not sorted —
+    /// tclsh reports channels in creation order).
+    order: Vec<ChannelId>,
+    /// Counter for reflected channel handles (`chan create` → `rc0`, `rc1`, ...).
+    refl_counter: u32,
+    /// Counter for transform handles (`chan push` → `rt0`, `rt1`, ...).
+    trans_counter: u32,
 }
 
 impl Default for ChannelTable {
@@ -137,7 +156,13 @@ impl ChannelTable {
             channels: HashMap::new(),
             configs: HashMap::new(),
             next_id: 1,
+            order: Vec::new(),
+            refl_counter: 0,
+            trans_counter: 0,
         };
+        table.track("stdin".to_string());
+        table.track("stdout".to_string());
+        table.track("stderr".to_string());
         table.channels.insert("stdin".to_string(), Box::new(OsStdin::new()));
         table.channels.insert("stdout".to_string(), Box::new(OsStdout));
         table.channels.insert("stderr".to_string(), Box::new(OsStderr));
@@ -146,6 +171,17 @@ impl ChannelTable {
         table.configs.insert("stdout".to_string(), ChannelConfig { buffering: Buffering::Line, ..Default::default() });
         table.configs.insert("stderr".to_string(), ChannelConfig { buffering: Buffering::None, ..Default::default() });
         table
+    }
+
+    /// Record `id` in registration order (no-op when already tracked).
+    fn track(&mut self, id: ChannelId) {
+        if !self.order.iter().any(|e| e == &id) {
+            self.order.push(id);
+        }
+    }
+
+    fn untrack(&mut self, id: &str) {
+        self.order.retain(|e| e != id);
     }
 
     pub fn open_file(&mut self, path: &str, mode: &str) -> io::Result<ChannelId> {
@@ -183,14 +219,25 @@ impl ChannelTable {
         };
         let id = format!("file{}", self.next_id);
         self.next_id += 1;
+        self.track(id.clone());
         self.channels.insert(id.clone(), file);
-        self.configs.insert(id.clone(), ChannelConfig::default());
+        // tclsh reports a file channel's translation resolved to the
+        // platform default ("lf" on Unix), not "auto".
+        self.configs.insert(id.clone(), ChannelConfig {
+            translation: if cfg!(windows) {
+                crate::channel::TranslationMode::CrLf
+            } else {
+                crate::channel::TranslationMode::Lf
+            },
+            ..ChannelConfig::default()
+        });
         Ok(id)
     }
 
     /// Register a channel with a specific ID (used for pipe channels from exec).
     pub fn register(&mut self, id: ChannelId, channel: Box<dyn Channel>) {
         self.configs.entry(id.clone()).or_default();
+        self.track(id.clone());
         self.channels.insert(id, channel);
     }
 
@@ -202,12 +249,31 @@ impl ChannelTable {
         id
     }
 
+    /// Next handle name for a reflected channel (`chan create`): `rc0`, `rc1`, ...
+    pub fn alloc_reflected_name(&mut self) -> ChannelId {
+        let id = format!("rc{}", self.refl_counter);
+        self.refl_counter += 1;
+        id
+    }
+
+    /// Next handle name for a transform (`chan push`): `rt0`, `rt1`, ...
+    pub fn alloc_transform_name(&mut self) -> ChannelId {
+        let id = format!("rt{}", self.trans_counter);
+        self.trans_counter += 1;
+        id
+    }
+
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Box<dyn Channel>> {
         self.channels.get_mut(id)
     }
 
+    pub fn get(&self, id: &str) -> Option<&Box<dyn Channel>> {
+        self.channels.get(id)
+    }
+
     pub fn close(&mut self, id: &str) -> io::Result<()> {
         self.configs.remove(id);
+        self.untrack(id);
         match self.channels.remove(id) {
             Some(ch) => ch.close(),
             None => Err(io::Error::new(
@@ -217,8 +283,20 @@ impl ChannelTable {
         }
     }
 
+    /// Remove a channel without invoking its close handler (used to swap in
+    /// a transformed channel stack).
+    pub fn take(&mut self, id: &str) -> Option<Box<dyn Channel>> {
+        self.configs.remove(id);
+        self.untrack(id);
+        self.channels.remove(id)
+    }
+
     pub fn channel_names(&self) -> Vec<&str> {
-        self.channels.keys().map(|s| s.as_str()).collect()
+        self.order
+            .iter()
+            .filter(|id| self.channels.contains_key(id.as_str()))
+            .map(|id| id.as_str())
+            .collect()
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -237,16 +315,19 @@ impl ChannelTable {
 
     /// Replace stdin with a custom channel (for embedders / testing).
     pub fn set_stdin(&mut self, channel: Box<dyn Channel>) {
+        self.track("stdin".to_string());
         self.channels.insert("stdin".to_string(), channel);
     }
 
     /// Replace stdout with a custom channel (for embedders / testing).
     pub fn set_stdout(&mut self, channel: Box<dyn Channel>) {
+        self.track("stdout".to_string());
         self.channels.insert("stdout".to_string(), channel);
     }
 
     /// Replace stderr with a custom channel (for embedders / testing).
     pub fn set_stderr(&mut self, channel: Box<dyn Channel>) {
+        self.track("stderr".to_string());
         self.channels.insert("stderr".to_string(), channel);
     }
 }
@@ -452,6 +533,15 @@ impl Channel for FileChannel {
     fn is_writable(&self) -> bool {
         !matches!(self.mode, FileMode::Read(_))
     }
+    fn set_length(&mut self, len: u64) -> io::Result<()> {
+        match &mut self.mode {
+            FileMode::Write(f) => f.set_len(len),
+            FileMode::ReadWrite(r) => r.get_mut().set_len(len),
+            FileMode::Read(_) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied, "channel wasn't opened for writing",
+            )),
+        }
+    }
     fn channel_type(&self) -> &'static str { "file" }
 }
 
@@ -625,6 +715,177 @@ impl Channel for MemoryInputPipe {
     fn is_readable(&self) -> bool { true }
     fn is_writable(&self) -> bool { false }
     fn channel_type(&self) -> &'static str { "memory" }
+}
+
+// ══════════════════════════════════════════════════════
+//  PipePair — connected in-memory pipe (`chan pipe`)
+// ══════════════════════════════════════════════════════
+
+/// Shared buffer behind a `chan pipe` pair.
+struct PipeShared {
+    buf: Mutex<Vec<u8>>,
+    /// Cleared when the write end is closed — after that, reads at the end
+    /// of the buffer report EOF.
+    open: std::sync::atomic::AtomicBool,
+}
+
+impl PipeShared {
+    fn new() -> Arc<Self> {
+        Arc::new(PipeShared {
+            buf: Mutex::new(Vec::new()),
+            open: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+}
+
+/// Read end of a `chan pipe` pair.
+pub struct PipeReaderEnd {
+    shared: Arc<PipeShared>,
+    pos: usize,
+}
+
+/// Write end of a `chan pipe` pair.
+pub struct PipeWriterEnd {
+    shared: Arc<PipeShared>,
+}
+
+/// Create a connected `chan pipe` pair: (read end, write end).
+pub fn pipe_pair() -> (PipeReaderEnd, PipeWriterEnd) {
+    let shared = PipeShared::new();
+    (
+        PipeReaderEnd { shared: shared.clone(), pos: 0 },
+        PipeWriterEnd { shared },
+    )
+}
+
+impl Channel for PipeReaderEnd {
+    fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut inner = self.shared.buf.lock().map_err(|_| io::Error::other("lock poisoned"))?;
+        let avail = inner.len().saturating_sub(self.pos);
+        if avail == 0 {
+            // Nothing buffered (or the write end closed): report EOF. The
+            // single-threaded interpreter has no way to block for data.
+            return Ok(0);
+        }
+        let n = buf.len().min(avail);
+        buf[..n].copy_from_slice(&inner[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+    fn read_line(&mut self) -> io::Result<Option<String>> {
+        let mut byte = [0u8; 1];
+        let mut line = Vec::new();
+        loop {
+            let n = self.read_bytes(&mut byte)?;
+            if n == 0 {
+                break;
+            }
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        if line.is_empty() {
+            return Ok(None);
+        }
+        let mut s = String::from_utf8_lossy(&line).into_owned();
+        strip_eol(&mut s);
+        Ok(Some(s))
+    }
+    fn read_all(&mut self) -> io::Result<String> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            let n = self.read_bytes(&mut byte)?;
+            if n == 0 {
+                break;
+            }
+            out.push(byte[0]);
+        }
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+    fn write_bytes(&mut self, _data: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "pipe read end is not writable"))
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn seek(&mut self, _whence: io::SeekFrom) -> io::Result<u64> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "pipe is not seekable"))
+    }
+    fn tell(&mut self) -> io::Result<u64> { Ok(self.pos as u64) }
+    fn eof(&self) -> bool {
+        !self.shared.open.load(std::sync::atomic::Ordering::SeqCst)
+            && self.pos >= self.shared.buf.lock().map(|b| b.len()).unwrap_or(0)
+    }
+    fn close(self: Box<Self>) -> io::Result<()> { Ok(()) }
+    fn is_readable(&self) -> bool { true }
+    fn is_writable(&self) -> bool { false }
+    fn channel_type(&self) -> &'static str { "pipe" }
+}
+
+impl Channel for PipeWriterEnd {
+    fn read_bytes(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "pipe write end is not readable"))
+    }
+    fn read_line(&mut self) -> io::Result<Option<String>> {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "pipe write end is not readable"))
+    }
+    fn read_all(&mut self) -> io::Result<String> {
+        Err(io::Error::new(io::ErrorKind::PermissionDenied, "pipe write end is not readable"))
+    }
+    fn write_bytes(&mut self, data: &[u8]) -> io::Result<usize> {
+        let mut inner = self.shared.buf.lock().map_err(|_| io::Error::other("lock poisoned"))?;
+        inner.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn seek(&mut self, _whence: io::SeekFrom) -> io::Result<u64> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "pipe is not seekable"))
+    }
+    fn tell(&mut self) -> io::Result<u64> {
+        let inner = self.shared.buf.lock().map_err(|_| io::Error::other("lock poisoned"))?;
+        Ok(inner.len() as u64)
+    }
+    fn eof(&self) -> bool { false }
+    fn close(self: Box<Self>) -> io::Result<()> {
+        self.shared.open.store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn is_readable(&self) -> bool { false }
+    fn is_writable(&self) -> bool { true }
+    fn channel_type(&self) -> &'static str { "pipe" }
+}
+
+// ══════════════════════════════════════════════════════
+//  PlaceholderChannel — handle for reflected channels (chan create)
+// ══════════════════════════════════════════════════════
+
+/// Placeholder channel registered for a reflected channel. Actual I/O is
+/// routed through the handler script by the command layer; this object only
+/// carries the direction flags and keeps the handle alive in the table.
+pub struct PlaceholderChannel {
+    readable: bool,
+    writable: bool,
+}
+
+impl PlaceholderChannel {
+    pub fn new(readable: bool, writable: bool) -> Self {
+        PlaceholderChannel { readable, writable }
+    }
+}
+
+impl Channel for PlaceholderChannel {
+    fn read_bytes(&mut self, _buf: &mut [u8]) -> io::Result<usize> { Ok(0) }
+    fn read_line(&mut self) -> io::Result<Option<String>> { Ok(None) }
+    fn read_all(&mut self) -> io::Result<String> { Ok(String::new()) }
+    fn write_bytes(&mut self, data: &[u8]) -> io::Result<usize> { Ok(data.len()) }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn seek(&mut self, _whence: io::SeekFrom) -> io::Result<u64> { Ok(0) }
+    fn tell(&mut self) -> io::Result<u64> { Ok(0) }
+    fn eof(&self) -> bool { true }
+    fn close(self: Box<Self>) -> io::Result<()> { Ok(()) }
+    fn is_readable(&self) -> bool { self.readable }
+    fn is_writable(&self) -> bool { self.writable }
+    fn channel_type(&self) -> &'static str { "reflected" }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

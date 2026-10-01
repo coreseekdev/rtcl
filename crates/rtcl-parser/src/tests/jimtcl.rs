@@ -772,13 +772,13 @@ fn test_whitespace_between_words() {
     assert_eq!(cmds[0].words.len(), 3);
 }
 
-/// parse-1.6: Incomplete array index `$a(` — parser handles, runtime error
+/// parse-1.6: Incomplete array index `$a(` — tclsh parity wins over
+/// jimtcl's fallback: the closer scan happens at PARSE time and errors
+/// `missing )` (parseOld-10.14).
 #[test]
 fn test_parse_1_6_incomplete_array_index() {
-    // In jimtcl: `$a(` has no closing ), so $a is just the var, ( is leftover
-    // PEG: index? fails, var_ref = $a, then ( is bare text
-    let result = parse("set x $a(");
-    assert!(result.is_ok(), "incomplete index should parse: {:?}", result);
+    let err = parse("set x $a(").unwrap_err();
+    assert_eq!(err.message, "missing )");
 }
 
 /// parse-1.11: Backslash-newline in quotes after variable

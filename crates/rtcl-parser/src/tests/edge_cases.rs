@@ -286,18 +286,21 @@ fn test_backslash_newline_line_continuation() {
     assert!(cmds.len() >= 1, "should parse: {:?}", cmds);
 }
 
-/// Backslash-newline between words as continuation within same word.
-/// `list abc\<newline><tab>123` → `list {abc 123}` (2 words).
-/// In Tcl, `\<newline>` replaces backslash + newline + leading whitespace with a single space,
-/// so this joins into one word: "abc 123".
+/// Backslash-newline after a bare word ENDS the word (tclsh 8.6.17:
+/// `eval "list a b\<NL>c d"` → {a b c d}, parseOld-7.10 — the
+/// continuation is a word separator, not an intra-word space).
 #[test]
 fn test_backslash_newline_as_separator() {
     let cmds = parse("list abc\\\n\t123").unwrap();
     assert_eq!(cmds.len(), 1);
-    assert_eq!(cmds[0].words.len(), 2, "should have 2 words: {:?}", cmds[0].words);
+    assert_eq!(cmds[0].words.len(), 3, "should have 3 words: {:?}", cmds[0].words);
     match &cmds[0].words[1] {
-        Word::Literal(s) => assert_eq!(s, "abc 123"),
-        w => panic!("expected Literal(abc 123), got {:?}", w),
+        Word::Literal(s) => assert_eq!(s, "abc"),
+        w => panic!("expected Literal(abc), got {:?}", w),
+    }
+    match &cmds[0].words[2] {
+        Word::Literal(s) => assert_eq!(s, "123"),
+        w => panic!("expected Literal(123), got {:?}", w),
     }
 }
 

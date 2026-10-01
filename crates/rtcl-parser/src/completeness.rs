@@ -116,7 +116,23 @@ pub fn is_complete(source: &str) -> bool {
             }
             b'\\' => {
                 i += 1;
-                if i < bytes.len() { i += 1; }
+                if i < bytes.len() {
+                    let was_newline = bytes[i] == b'\n'
+                        || (bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n');
+                    i += 1;
+                    // A backslash-newline at (effectively) end of input
+                    // leaves the command open — the parser needs the next
+                    // line to know whether the command continues
+                    // (parseOld-15.2: `info complete "abc\<NL>"` → 0).
+                    if was_newline {
+                        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                            i += 1;
+                        }
+                        if i >= bytes.len() {
+                            return false;
+                        }
+                    }
+                }
             }
             _ => { i += 1; }
         }

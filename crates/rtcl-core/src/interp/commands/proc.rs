@@ -173,6 +173,19 @@ fn eval_tagged(interp: &mut Interp, script: &str, tag: &str) -> Result<Value> {
     let r = interp.eval(script);
     if let Err(e) = &r {
         if interp.err_is_error(e) {
+            if interp.err_info.is_none() {
+                if let Error::Syntax { .. } = e {
+                    // A parse failure inside eval/uplevel has no parsed
+                    // command to name: tclsh logs the SCRIPT text itself
+                    // as the failing "command", with TclMaxLogLength
+                    // truncation (parseOld-10.14).
+                    interp.err_info = Some(format!(
+                        "{}\n    while executing\n\"{}\"",
+                        e,
+                        crate::interp::eval::tcl_log_excerpt(script)
+                    ));
+                }
+            }
             interp.err_exit_frame(&format!("\"{}\" body", tag));
         }
     }
@@ -813,13 +826,24 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         })?;
     let new_key = if new_name.is_empty() {
         String::new()
-    } else if new_name.starts_with("::") {
-        new_name.clone()
-    } else if interp.current_namespace != "::" {
+    } else if new_name.contains("::") || interp.current_namespace != "::" {
+        // Namespace-qualified targets store fully-qualified, exactly like
+        // `proc` definition does (basic-18.6: `rename q test_ns_basic::p`
+        // must land on the key the ns-first dispatch — and the namespace
+        // deletion sweep — looks up: ::test_ns_basic::p).
         super::namespace::qualify(&interp.current_namespace, &new_name)
     } else {
         new_name.clone()
     };
+
+    // Renaming into a namespace creates it, including intermediates
+    // (tclsh probed: `rename q deep::nest::p` → `namespace exists
+    // deep::nest` = 1).
+    if !new_key.is_empty() && new_key.contains("::") {
+        let cut = new_key.rfind("::").unwrap();
+        let ns = if cut == 0 { "::" } else { &new_key[..cut] };
+        super::namespace::ensure_namespace(&mut interp.namespaces, ns);
+    }
 
     // Rename in builtins
     if let Some(func) = interp.commands.remove(&old_key) {

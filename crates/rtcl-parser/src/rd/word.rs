@@ -56,6 +56,10 @@ fn check_no_trailing_garbage(
 ) -> ParseResult<()> {
     if cur.at_end_of_command(bracket_term) || cur.next_is_line_white() {
         Ok(())
+    } else if cur.is(Token::Backslash) && cur.peek_at(1) == Token::Newline {
+        // A line continuation right after the closer is whitespace
+        // (parseOld-7.11: `eval "list a \"b c\"\<NL>d e"` → {a {b c} d e}).
+        Ok(())
     } else {
         Err(cur.error(format!("extra characters after {}", closer)))
     }
@@ -191,6 +195,24 @@ fn parse_bare_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word> {
                 start = cur.pos();
             }
             Token::Backslash => {
+                // tclsh: a backslash-newline inside a BARE word ends the
+                // word (it is a word separator, not a space): `eval "list
+                // a b\<NL>c d"` yields {a b c d} (parseOld-7.10).  Inside
+                // quotes it stays a continuation space.
+                if cur.peek_at(1) == Token::Newline {
+                    if cur.pos() != start {
+                        tokens.push_str(cur.slice(start));
+                        backslash_subst(cur);
+                        return Ok(tokens.take());
+                    }
+                    // Nothing accumulated: the continuation is pure
+                    // whitespace at the word's start — consume it and keep
+                    // scanning so no empty word materializes (tclsh
+                    // `list \<NL>b` → just "b").
+                    backslash_subst(cur);
+                    start = cur.pos();
+                    continue;
+                }
                 if cur.pos() != start {
                     tokens.push_str(cur.slice(start));
                 }
@@ -245,12 +267,15 @@ fn parse_dollar(cur: &mut Cursor, tokens: &mut Tokens, _bracket_term: bool) -> P
         }
         Token::LeftParen => {
             // $(...) expr sugar (jimtcl default): evaluate content as expression
-            // Only when $ is NOT followed by a variable name char
-            if let Some(expr) = try_parse_expr_sugar(cur) {
-                tokens.push(Word::ExprSugar(expr));
-            } else {
+            // Only when $ is NOT followed by a variable name char.  An EMPTY
+            // `$()` is standard Tcl: the variable literally named "()" —
+            // `can't read "()": no such variable` (parseOld-5.12) — so the
+            // sugar only applies to non-empty content.
+            match try_parse_expr_sugar(cur) {
+                Some(expr) if !expr.is_empty() => tokens.push(Word::ExprSugar(expr)),
+                Some(_) => tokens.push(Word::VarRef("()".to_string())),
                 // No closing ')' found — treat $ as orphan
-                tokens.push_char('$');
+                None => tokens.push_char('$'),
             }
         }
         t => {
@@ -279,7 +304,11 @@ fn parse_dollar(cur: &mut Cursor, tokens: &mut Tokens, _bracket_term: bool) -> P
                     if let Some(idx) = try_parse_var_index(cur) {
                         tokens.push(Word::VarRef(format!("{}({})", name, idx)));
                     } else {
-                        tokens.push(Word::VarRef(name));
+                        // tclsh scans for the closing `)` at PARSE time,
+                        // before any variable lookup: `$x000...(` with no
+                        // closer is a syntax error, not a read of the
+                        // prefix name (parseOld-10.14).
+                        return Err(cur.error("missing )"));
                     }
                 } else {
                     tokens.push(Word::VarRef(name));

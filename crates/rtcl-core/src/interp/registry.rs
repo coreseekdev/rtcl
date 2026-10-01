@@ -156,6 +156,9 @@ static CMD_TABLE_ENSEMBLE: &[CmdEntry] = &[
     // keyed absolute so `::tcl::pkgconfig` resolves directly and the
     // relative `tcl::pkgconfig` falls through the `::`+name lookup.
     CmdEntry { name: "::tcl::pkgconfig", func: misc::cmd_pkgconfig, cat: Standard, cmd_id: None, usage: "subcommand ?arg ...?", help: "Query Tcl build configuration" },
+    // ::tcl::unsupported::assemble — tclsh 8.6's bytecode assembler
+    // (assemble-52.1 exception-range pattern; stack-machine interpreter).
+    CmdEntry { name: "::tcl::unsupported::assemble", func: misc::cmd_assemble, cat: Extension, cmd_id: None, usage: "bytecodeList", help: "Assemble and execute bytecode instructions" },
 ];
 
 /// Commands gated behind `feature = "clock"`.

@@ -1836,6 +1836,236 @@ pub fn cmd_disassemble(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::from_str(&code.to_string()))
 }
 
+// ── ::tcl::unsupported::assemble ────────────────────────────────────
+//
+// A stack-machine interpreter for tclsh 8.6's assembler.  The corpus
+// pins the exception-range pattern of assemble-52.1 (six nested
+// beginCatch/push/invokeStk/jump/label/endCatch sequences) plus the
+// assembler's own error strings, all probed against tclsh 8.6.17
+// (judge/probes/unsupported_assemble.tcl).  Opcodes outside the
+// implemented subset error with tclsh's exact candidate list.
+
+/// tclsh's exact `bad instruction` candidate list (sorted, as ensemble
+/// lists are), captured verbatim from 8.6.17.
+const ASSEMBLE_OPCODES: &str = "push, add, append, appendArray, appendArrayStk, appendStk, arrayExistsImm, arrayExistsStk, arrayMakeImm, arrayMakeStk, beginCatch, bitand, bitnot, bitor, bitxor, clockRead, concat, concatStk, coroName, currentNamespace, dictAppend, dictExists, dictExpand, dictGet, dictIncrImm, dictLappend, dictRecombineStk, dictRecombineImm, dictSet, dictUnset, div, dup, endCatch, eq, eval, evalStk, exist, existArray, existArrayStk, existStk, expon, expr, exprStk, ge, gt, incr, incrArray, incrArrayImm, incrArrayStk, incrArrayStkImm, incrImm, incrStk, incrStkImm, infoLevelArgs, infoLevelNumber, invokeStk, jump, jump4, jumpFalse, jumpFalse4, jumpTable, jumpTrue, jumpTrue4, label, land, lappend, lappendArray, lappendArrayStk, lappendList, lappendListArray, lappendListArrayStk, lappendListStk, lappendStk, le, lindexMulti, list, listConcat, listIn, listIndex, listIndexImm, listLength, listNotIn, load, loadArray, loadArrayStk, loadStk, lor, lsetFlat, lsetList, lshift, lt, mod, mult, neq, nop, not, nsupvar, numericType, originCmd, over, pop, pushReturnCode, pushReturnOpts, pushResult, regexp, resolveCmd, reverse, rshift, store, storeArray, storeArrayStk, storeStk, strcaseLower, strcaseTitle, strcaseUpper, strcmp, strcat, streq, strfind, strindex, strlen, strmap, strmatch, strneq, strrange, strreplace, strrfind, strtrim, strtrimLeft, strtrimRight, sub, tclooClass, tclooIsObject, tclooNamespace, tclooSelf, tryCvtToBoolean, tryCvtToNumeric, uminus, unset, unsetArray, unsetArrayStk, unsetStk, uplus, upvar, variable, verifyDict, or yield";
+
+enum AsmIns {
+    Push(Value),
+    Pop,
+    Nop,
+    Invoke(usize),
+    Jump(usize),
+    BeginCatch(usize),
+    EndCatch,
+    Label,
+}
+
+/// One instruction in first-pass form: label references still by name.
+enum RawAsmIns {
+    Push(Value),
+    Pop,
+    Nop,
+    Invoke(usize),
+    Jump(String),
+    BeginCatch(String),
+    EndCatch,
+    Label(String),
+}
+
+fn assemble_operand(interp: &mut Interp, word: &crate::parser::Word) -> Result<String> {
+    match word {
+        crate::parser::Word::Literal(s) => Ok(s.clone()),
+        _ => {
+            // Non-literal operands substitute at assemble time.
+            Ok(interp.eval_word(word)?.as_str().to_string())
+        }
+    }
+}
+
+pub fn cmd_assemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::wrong_args_with_usage(
+            "::tcl::unsupported::assemble",
+            2,
+            args.len(),
+            "bytecodeList",
+        ));
+    }
+    let script = args[1].as_str().to_string();
+    let commands = crate::parser::parse(&script)?;
+
+    let mut raw: Vec<RawAsmIns> = Vec::new();
+    for cmd in &commands {
+        let arity = cmd.words.len();
+        let op = match &cmd.words[0] {
+            crate::parser::Word::Literal(s) => s.clone(),
+            _ => interp.eval_word(&cmd.words[0])?.as_str().to_string(),
+        };
+        match op.as_str() {
+            "push" => {
+                if arity != 2 {
+                    return Err(Error::wrong_args_with_usage(
+                        "push", 2, arity, "value",
+                    ));
+                }
+                // push stores the word's VALUE (literal text for literal
+                // words).
+                let v = interp.eval_word(&cmd.words[1])?;
+                raw.push(RawAsmIns::Push(v));
+            }
+            "pop" => raw.push(RawAsmIns::Pop),
+            "nop" => raw.push(RawAsmIns::Nop),
+            "invokeStk" => {
+                if arity != 2 {
+                    return Err(Error::wrong_args_with_usage(
+                        "invokeStk", 2, arity, "invokeStk count",
+                    ));
+                }
+                let text = assemble_operand(interp, &cmd.words[1])?;
+                let n = tcl_get_int(&text).ok_or_else(|| {
+                    Error::runtime(
+                        format!("expected integer but got \"{}\"", text),
+                        crate::error::ErrorCode::Generic,
+                    )
+                })?;
+                raw.push(RawAsmIns::Invoke(n as usize));
+            }
+            "jump" | "jump4" => {
+                if arity != 2 {
+                    return Err(Error::wrong_args_with_usage(
+                        "jump", 2, arity, "jump label",
+                    ));
+                }
+                raw.push(RawAsmIns::Jump(assemble_operand(interp, &cmd.words[1])?));
+            }
+            "beginCatch" => {
+                if arity != 2 {
+                    return Err(Error::wrong_args_with_usage(
+                        "beginCatch", 2, arity, "beginCatch label",
+                    ));
+                }
+                raw.push(RawAsmIns::BeginCatch(assemble_operand(
+                    interp,
+                    &cmd.words[1],
+                )?));
+            }
+            "endCatch" => raw.push(RawAsmIns::EndCatch),
+            "label" => {
+                if arity != 2 {
+                    return Err(Error::wrong_args_with_usage(
+                        "label", 2, arity, "label name",
+                    ));
+                }
+                raw.push(RawAsmIns::Label(assemble_operand(interp, &cmd.words[1])?));
+            }
+            other => {
+                set_error_code(interp, "TCL OPERATION ASSEMBLE BADINSTR");
+                return Err(Error::runtime(
+                    format!(
+                        "bad instruction \"{}\": must be {}",
+                        other, ASSEMBLE_OPCODES
+                    ),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+        }
+    }
+
+    // Second pass: resolve labels to instruction indices.
+    let mut labels: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, ins) in raw.iter().enumerate() {
+        if let RawAsmIns::Label(name) = ins {
+            labels.insert(name.clone(), i);
+        }
+    }
+    let resolve = |name: &str| -> Result<usize> {
+        labels.get(name).copied().ok_or_else(|| {
+            Error::runtime(
+                format!("unknown label \"{}\"", name),
+                crate::error::ErrorCode::NotFound,
+            )
+        })
+    };
+    let mut code: Vec<AsmIns> = Vec::with_capacity(raw.len());
+    for ins in raw {
+        code.push(match ins {
+            RawAsmIns::Push(v) => AsmIns::Push(v),
+            RawAsmIns::Pop => AsmIns::Pop,
+            RawAsmIns::Nop => AsmIns::Nop,
+            RawAsmIns::Invoke(n) => AsmIns::Invoke(n),
+            RawAsmIns::Jump(name) => AsmIns::Jump(resolve(&name)?),
+            RawAsmIns::BeginCatch(name) => AsmIns::BeginCatch(resolve(&name)?),
+            RawAsmIns::EndCatch => AsmIns::EndCatch,
+            RawAsmIns::Label(_) => AsmIns::Label,
+        });
+    }
+
+    // Execute.
+    let mut stack: Vec<Value> = Vec::new();
+    // Catch frames: (handler pc, operand-stack depth at beginCatch).
+    let mut catches: Vec<(usize, usize)> = Vec::new();
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let cur = pc;
+        pc += 1;
+        match &code[cur] {
+            AsmIns::Push(v) => stack.push(v.clone()),
+            AsmIns::Pop => {
+                if stack.pop().is_none() {
+                    return Err(Error::runtime(
+                        "stack underflow".to_string(),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+            }
+            AsmIns::Nop | AsmIns::Label => {}
+            AsmIns::Jump(target) => pc = *target,
+            AsmIns::BeginCatch(handler) => catches.push((*handler, stack.len())),
+            AsmIns::EndCatch => {
+                catches.pop();
+            }
+            AsmIns::Invoke(n) => {
+                if stack.len() < *n {
+                    return Err(Error::runtime(
+                        "stack underflow".to_string(),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+                let split = stack.len() - n;
+                let call: Vec<Value> = stack.drain(split..).collect();
+                match interp.dispatch_values(&call) {
+                    Ok(v) => stack.push(v),
+                    Err(e) => {
+                        if !interp.err_is_error(&e) {
+                            return Err(e);
+                        }
+                        // An exception unwinds to the innermost active
+                        // range: resume at its label with the stack back
+                        // at the depth where the range began.  The catch
+                        // consumes the error (nothing leaks into
+                        // errorInfo from inside the assembled program).
+                        match catches.pop() {
+                            Some((handler, depth)) => {
+                                stack.truncate(depth);
+                                pc = handler;
+                            }
+                            None => return Err(e),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match stack.len() {
+        0 => Ok(Value::empty()),
+        1 => Ok(stack.remove(0)),
+        n => Err(Error::runtime(
+            format!("stack is unbalanced on exit from the code (depth={})", n),
+            crate::error::ErrorCode::Generic,
+        )),
+    }
+}
+
 /// `scan string format ?varName ...?`
 ///
 /// Parses `string` according to `format` (subset of C sscanf).

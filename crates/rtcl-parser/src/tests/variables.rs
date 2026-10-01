@@ -134,20 +134,13 @@ fn test_array_index_with_newline() {
     }
 }
 
-/// Unclosed array index: `$a(foo` with no `)`.
-/// With backtracking: `$a` is VarRef, `(foo` is literal text.
+/// Unclosed array index: `$a(foo` with no `)` is a parse error —
+/// tclsh scans for the closing paren at PARSE time, before any variable
+/// lookup (parseOld-10.14: `missing )`).
 #[test]
 fn test_array_unclosed_index_bare() {
-    let cmds = parse("set x $a(foo").unwrap();
-    match &cmds[0].words[2] {
-        Word::Concat(parts) => {
-            assert!(parts.iter().any(|w| matches!(w, Word::VarRef(n) if n == "a")),
-                "should contain VarRef(a): {:?}", parts);
-            assert!(parts.iter().any(|w| matches!(w, Word::Literal(s) if s.contains("(foo"))),
-                "should contain literal (foo: {:?}", parts);
-        }
-        w => panic!("expected Concat with VarRef+Literal, got {:?}", w),
-    }
+    let err = parse("set x $a(foo").unwrap_err();
+    assert_eq!(err.message, "missing )");
 }
 
 // --- Unicode content ---
@@ -262,13 +255,20 @@ fn test_paren_expr_sugar_in_quoted() {
     }
 }
 
-/// `$()` — empty paren expr sugar.
+/// `$()` — empty parens are standard Tcl: the variable literally named
+/// "()" (parseOld-5.12: `set b a$()` → `can't read "()": no such
+/// variable`); only non-empty `$(expr)` gets jimtcl expr sugar.
 #[test]
 fn test_paren_expr_sugar_empty() {
     let cmds = parse("set x $()").unwrap();
     match &cmds[0].words[2] {
-        Word::ExprSugar(e) => assert_eq!(e, ""),
-        w => panic!("expected ExprSugar, got {:?}", w),
+        Word::Concat(parts) => assert!(
+            parts.iter().any(|w| matches!(w, Word::VarRef(n) if n == "()")),
+            "expected VarRef(()), got {:?}",
+            parts
+        ),
+        Word::VarRef(n) => assert_eq!(n, "()"),
+        w => panic!("expected VarRef(()), got {:?}", w),
     }
 }
 
@@ -351,28 +351,22 @@ fn test_paren_expr_sugar_unclosed() {
     assert_eq!(text, "$(abc");
 }
 
-// --- Paren backtracking ---
+// --- Paren scanning (tclsh parity: unclosed `(` is `missing )`) ---
 
-/// Unclosed paren in quoted context: `"$a(foo"`.
+/// Unclosed paren in quoted context: `"$a(foo"` errors `missing )`
+/// (tclsh scans for the closer at parse time, parseOld-10.14).
 #[test]
 fn test_unclosed_paren_quoted() {
-    let cmds = parse("set x \"$a(foo\"").unwrap();
-    match &cmds[0].words[2] {
-        Word::Concat(parts) => {
-            assert!(parts.iter().any(|w| matches!(w, Word::VarRef(n) if n == "a")),
-                "should contain VarRef(a): {:?}", parts);
-            assert!(parts.iter().any(|w| matches!(w, Word::Literal(s) if s.contains("(foo"))),
-                "should contain literal (foo: {:?}", parts);
-        }
-        w => panic!("expected Concat, got {:?}", w),
-    }
+    let err = parse("set x \"$a(foo\"").unwrap_err();
+    assert_eq!(err.message, "missing )");
 }
 
-/// Unbalanced nested paren: `$a(b(c)d` — backtrack to after last `)`.
+/// Nested paren: `$a(b(c)d` — the FIRST `)` closes the index (tclsh
+/// scans without nesting: `set a(b(c) 7; set x $a(b(c)d` → "7d",
+/// probed on 8.6.17), leaving `d` literal.
 #[test]
 fn test_unbalanced_nested_paren_backtrack() {
     let cmds = parse("set x $a(b(c)d").unwrap();
-    // jimtcl backtracks to after last ')': $a(b(c) is dict sugar, d is literal
     match &cmds[0].words[2] {
         Word::Concat(parts) => {
             assert!(parts.iter().any(|w| matches!(w, Word::VarRef(n) if n.starts_with("a("))),
@@ -384,11 +378,10 @@ fn test_unbalanced_nested_paren_backtrack() {
     }
 }
 
-/// Unclosed paren doesn't consume newline: `$a(foo\nset y 1`.
+/// Unclosed paren doesn't consume newline: `$a(foo\nset y 1` still
+/// errors `missing )` — the scan runs to EOF (tclsh-probed).
 #[test]
 fn test_unclosed_paren_doesnt_eat_newline() {
-    let cmds = parse("set x $a(foo\nset y 1").unwrap();
-    // Without backtracking, the paren would consume the newline and "set y 1".
-    // With backtracking, $a is just a VarRef and (foo is literal for the first command.
-    assert_eq!(cmds.len(), 2, "should be 2 commands: {:?}", cmds);
+    let err = parse("set x $a(foo\nset y 1").unwrap_err();
+    assert_eq!(err.message, "missing )");
 }

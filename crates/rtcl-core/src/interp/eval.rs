@@ -6,6 +6,21 @@ use crate::parser::{self, Command, Word};
 use crate::value::Value;
 use rtcl_parser::Compiler;
 
+/// tclsh's TclMaxLogLength: the command/script excerpt logged in errorInfo
+/// is capped at `min(max(len,100),150)` — so anything longer than 150
+/// characters renders as its first 150 chars + `...` (parseOld-10.14).
+pub(crate) fn tcl_log_excerpt(text: &str) -> String {
+    let len = text.chars().count();
+    let cap = std::cmp::min(std::cmp::max(len, 100), 150);
+    if len > cap {
+        let mut s: String = text.chars().take(cap).collect();
+        s.push_str("...");
+        s
+    } else {
+        text.to_string()
+    }
+}
+
 impl Interp {
     pub fn eval(&mut self, script: &str) -> Result<Value> {
         let commands = parser::parse(script)?;
@@ -42,13 +57,17 @@ impl Interp {
                 self.err_fresh = false;
             }
             (Some(info), false) => {
-                info.push_str(&format!("\n    invoked from within\n\"{}\"", text));
+                info.push_str(&format!(
+                    "\n    invoked from within\n\"{}\"",
+                    tcl_log_excerpt(text)
+                ));
                 self.err_line = line;
             }
             (None, _) => {
                 self.err_info = Some(format!(
                     "{}\n    while executing\n\"{}\"",
-                    msg, text
+                    msg,
+                    tcl_log_excerpt(text)
                 ));
                 self.err_line = line;
             }
@@ -495,7 +514,10 @@ impl Interp {
             // here (tclsh logs it at the top level, after the skip).
             if let Some(text) = self.err_pending_top.take() {
                 if let Some(info) = &mut self.err_info {
-                    info.push_str(&format!("\n    invoked from within\n\"{}\"", text));
+                    info.push_str(&format!(
+                        "\n    invoked from within\n\"{}\"",
+                        tcl_log_excerpt(&text)
+                    ));
                 }
             }
             self.err_exit_frame(&tag);

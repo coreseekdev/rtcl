@@ -74,8 +74,20 @@ impl VmContext for Interp {
         }
         let cmd_name = args[0].as_str();
 
-        // Try user-defined procs first
-        if let Some(proc_def) = self.procs.get(cmd_name).cloned() {
+        // Try user-defined procs first.  A simple name inside a
+        // namespace resolves there before any bare-keyed global proc
+        // (tclsh lookup order — mirrors eval.rs dispatch).
+        let proc_def = if self.current_namespace != "::"
+            && !cmd_name.starts_with("::")
+            && !cmd_name.contains("::")
+        {
+            let qualified = super::commands::namespace::qualify(&self.current_namespace, cmd_name);
+            self.procs.get(&qualified).cloned()
+                .or_else(|| self.procs.get(cmd_name).cloned())
+        } else {
+            self.procs.get(cmd_name).cloned()
+        };
+        if let Some(proc_def) = proc_def {
             return self.call_proc(&proc_def, args, cmd_name, None);
         }
 

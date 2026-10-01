@@ -391,16 +391,15 @@ impl Value {
         }
     }
 
-    /// Create a value from a list of values (serializes to string eagerly
-    /// for backward compatibility).
+    /// Create a value from a list of values.
+    ///
+    /// The string form is generated lazily on first `as_str()` — eagerly
+    /// materializing it here retains every parent's serialization forever
+    /// in deeply nested lists (`set x [list $x {}]` grew to 24 GB RSS
+    /// because each level kept its own full-length string; tclsh keeps
+    /// the object tree structural and never stringifies, obj-32.1).
     pub fn from_list(items: &[Value]) -> Self {
-        let s = serialize_list(items);
-        Value {
-            inner: Rc::new(ValueInner {
-                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
-                rep: InternalRep::List(items.to_vec()),
-            }),
-        }
+        Self::from_list_cached(items.to_vec())
     }
 
     // ── Accessors ──────────────────────────────────────────────

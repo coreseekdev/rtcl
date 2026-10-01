@@ -197,7 +197,22 @@ impl Interp {
 
         // User-defined procs (including `namespace import` aliases, which
         // dispatch to the origin's *current* body and namespace)
-        let proc_lookup = self.procs.get(cmd_name).cloned().map(|p| (p, cmd_name.to_string()))
+        let proc_lookup = if self.current_namespace != "::"
+            && !cmd_name.starts_with("::")
+            && !cmd_name.contains("::")
+        {
+            // A simple name inside a namespace resolves THERE first:
+            // global procs registered under bare keys must not preempt
+            // the namespace-local one (tclsh: `p` inside ::tns calls
+            // ::tns::p, with a global ::p only the fallback).
+            let qualified = crate::interp::commands::namespace::qualify(
+                &self.current_namespace, cmd_name,
+            );
+            self.procs.get(&qualified).cloned().map(|p| (p, qualified))
+                .or_else(|| self.procs.get(cmd_name).cloned().map(|p| (p, cmd_name.to_string())))
+        } else {
+            self.procs.get(cmd_name).cloned().map(|p| (p, cmd_name.to_string()))
+        }
             .or_else(|| {
                 if self.current_namespace != "::" && !cmd_name.starts_with("::") {
                     let qualified = crate::interp::commands::namespace::qualify(

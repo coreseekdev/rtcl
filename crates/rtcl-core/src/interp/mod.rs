@@ -266,6 +266,8 @@ pub struct Interp {
     /// Next child interpreter ID counter.
     #[cfg(feature = "std")]
     pub(crate) next_interp_id: u64,
+    /// TclOO object-system state (`oo::` commands, objects, classes).
+    pub(crate) oo: commands::oo::OoState,
 }
 
 /// A scheduled time event (for `after ms script`).
@@ -348,7 +350,9 @@ impl Interp {
             child_interps: HashMap::new(),
             #[cfg(feature = "std")]
             next_interp_id: 1,
+            oo: commands::oo::OoState::default(),
         };
+        commands::oo::init(&mut interp);
         interp.register_builtins();
         interp.init_special_vars();
         interp.load_stdlib();

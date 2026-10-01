@@ -52,7 +52,7 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "global",    func: proc::cmd_global,       cat: Language, cmd_id: Some(CmdId::Global   as u16),     usage: "varName ?varName ...?",            help: "Access global variables" },
     CmdEntry { name: "unset",     func: misc::cmd_unset,        cat: Language, cmd_id: Some(CmdId::Unset    as u16),     usage: "?-nocomplain? ?--? varName ?varName ...?", help: "Delete variables" },
     CmdEntry { name: "subst",     func: misc::cmd_subst,        cat: Language, cmd_id: Some(CmdId::Subst    as u16),     usage: "?-nobackslashes? ?-nocommands? ?-novariables? string", help: "Perform substitutions" },
-    CmdEntry { name: "info",      func: misc::cmd_info,         cat: Language, cmd_id: Some(CmdId::Info     as u16),     usage: "subcommand ?arg ...?",             help: "Interpreter introspection" },
+    CmdEntry { name: "info",      func: oo::cmd_info_entry,         cat: Language, cmd_id: Some(CmdId::Info     as u16),     usage: "subcommand ?arg ...?",             help: "Interpreter introspection" },
     CmdEntry { name: "error",     func: control::cmd_error,     cat: Language, cmd_id: Some(CmdId::Error    as u16),     usage: "message ?errorInfo? ?errorCode?",            help: "Raise an error" },
     CmdEntry { name: "tailcall",  func: control::cmd_tailcall,  cat: Language, cmd_id: Some(CmdId::Tailcall as u16),     usage: "command ?arg ...?",                help: "Tail call optimisation" },
     CmdEntry { name: "append",    func: misc::cmd_append,       cat: Language, cmd_id: Some(CmdId::Append   as u16),     usage: "varName ?value ...?",              help: "Append to a variable" },
@@ -88,7 +88,7 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "time",      func: loops::cmd_time,         cat: Standard, cmd_id: Some(CmdId::Time      as u16),   usage: "command ?count?",                   help: "Measure script execution time" },
     CmdEntry { name: "trace",     func: trace::cmd_trace,        cat: Standard, cmd_id: None, usage: "option ?arg ...?", help: "Register variable/command/execution traces" },
     CmdEntry { name: "timerate",  func: loops::cmd_timerate,     cat: Standard, cmd_id: Some(CmdId::Timerate  as u16),   usage: "?-direct? ?-calibrate? ?-overhead double? command ?time ?max-count??",            help: "Measure script throughput" },
-    CmdEntry { name: "namespace", func: namespace::cmd_namespace, cat: Language,  cmd_id: Some(CmdId::Namespace as u16),  usage: "subcommand ?arg ...?",             help: "Namespace operations" },
+    CmdEntry { name: "namespace", func: oo::cmd_namespace_entry, cat: Language,  cmd_id: Some(CmdId::Namespace as u16),  usage: "subcommand ?arg ...?",             help: "Namespace operations" },
     CmdEntry { name: "variable",  func: namespace::cmd_variable,  cat: Language,  cmd_id: Some(CmdId::Variable as u16),  usage: "?name value ...? name ?value?",    help: "Declare namespace variable" },
     // ── Extension commands (always available) ──────────────────────────────
     CmdEntry { name: "puts",        func: io::cmd_puts,           cat: Extension, cmd_id: Some(CmdId::Puts        as u16), usage: "?-nonewline? ?channelId? string", help: "Output a string" },

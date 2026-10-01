@@ -22,6 +22,7 @@ pub(crate) fn wrong_args(name: &str, usage: &str) -> Error {
 /// Mirror Tcl setting `::errorCode` at the point an error is raised.
 pub(crate) fn set_error_code(interp: &mut Interp, code: &str) {
     interp.globals.insert("errorCode".to_string(), Value::from_str(code));
+    interp.err_code_raised = true;
 }
 
 /// Parse a command argument as a list; malformed lists raise Tcl's error

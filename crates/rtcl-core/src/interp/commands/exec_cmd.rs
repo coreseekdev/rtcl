@@ -321,6 +321,7 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // Set $::errorCode like jimtcl: {CHILDSTATUS pid exitCode}
         let error_code = format!("CHILDSTATUS {} {}", last_pid, exit_code);
         let _ = interp.set_var("::errorCode", Value::from_str(&error_code));
+        interp.err_code_raised = true;
 
         let mut msg = stderr_data.clone();
         if msg.is_empty() {

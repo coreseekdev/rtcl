@@ -614,13 +614,23 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::from_int(0))
         }
         Err(e) => {
+            // A `tailcall` completion caught here: the deferred command
+            // stays armed on the frame marker and fires at frame exit;
+            // the completion itself reports as a `return` (code 2) with
+            // an empty value (tailcall-12.3b1).
+            let is_tc = e.is_tail_call();
             if let Some(var) = result_var {
                 // Tcl: the result variable receives the result payload itself,
                 // not a rendering of the error (e.g. `return hi` → "hi",
                 // `break` → "").
-                interp.set_var(var, Value::from_str(&e.message_text()))?;
+                let payload = if is_tc {
+                    Value::empty()
+                } else {
+                    Value::from_str(&e.message_text())
+                };
+                interp.set_var(var, payload)?;
             }
-            let code = if e.is_return() { 2 }
+            let code = if e.is_return() || is_tc { 2 }
             else if e.is_break() { 3 }
             else if e.is_continue() { 4 }
             else { 1 };
@@ -638,13 +648,22 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             interp.err_pending_top = None;
             let error_info = accumulated.unwrap_or_else(|| e.message_text());
             let _ = interp.set_var("::errorInfo", Value::from_str(&error_info));
-            // Tcl writes ::errorCode at raise time for arithmetic errors
-            // (ARITH DIVZERO / ARITH DOMAIN); other codes come from their
-            // own raise sites and must not be clobbered here.
+            // ::errorCode: a raise site that installed it (scan formats,
+            // exec CHILDSTATUS, `error`, `return -errorcode`) wins;
+            // otherwise the error variant derives it (TCL WRONGARGS,
+            // ARITH DIVZERO, TCL LOOKUP ...) — tclsh resets the code for
+            // every new error (rename-3.1).
             if code == 1 {
-                let tec = e.tcl_error_code();
-                if tec.starts_with("ARITH ") {
-                    let _ = interp.set_var("::errorCode", Value::from_str(&tec));
+                if interp.err_code_raised {
+                    interp.err_code_raised = false;
+                } else {
+                    // Derived codes: wrong-args and arithmetic only —
+                    // tclsh leaves plain var/command lookup errors at
+                    // NONE (vars.rs unit test).
+                    let tec = e.tcl_error_code();
+                    if tec == "TCL WRONGARGS" || tec.starts_with("ARITH ") {
+                        let _ = interp.set_var("::errorCode", Value::from_str(&tec));
+                    }
                 }
             }
             if let Some(ov) = opts_var {
@@ -697,6 +716,7 @@ pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // caller supplies one, errorInfo only when supplied.
     let code = error_code.clone().unwrap_or_else(|| "NONE".to_string());
     let _ = interp.set_var("::errorCode", Value::from_str(&code));
+    interp.err_code_raised = true;
     // A non-empty info argument REPLACES the accumulated errorInfo and
     // suppresses the next harness frame (25.7: the `while executing
     // "error ..."` frame is absent).  Without info the error behaves like
@@ -844,21 +864,26 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// `tailcall command ?arg ...?`
 /// Replaces the current proc invocation with a call to the given command.
 /// Simplified implementation: evaluates and returns via return control flow.
-pub fn cmd_tailcall(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() < 2 {
-        return Err(Error::wrong_args_with_usage(
-            "tailcall",
-            2,
-            args.len(),
-            "command ?arg ...?",
+pub fn cmd_tailcall(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    // tclsh: tailcall outside any proc/lambda/method frame is an error.
+    if interp.frames.is_empty() {
+        return Err(Error::runtime(
+            "tailcall can only be called from a proc, lambda or method",
+            crate::error::ErrorCode::Generic,
         ));
     }
 
-    // Signal a tail-call: collect arg strings for TCO re-dispatch in call_proc
+    // Signal a tail-call: collect arg strings for TCO re-dispatch in
+    // call_proc.  `tailcall` with no command defers an empty invocation —
+    // the frame yields the empty completion value.
     let tc_args: Vec<String> = args[1..]
         .iter()
         .map(|a| a.as_str().to_string())
         .collect();
+    // Arm the frame marker: a catch consuming the completion still lets
+    // the deferred command fire at frame exit, and a later tailcall in
+    // the same frame overwrites it (tailcall-12.3).
+    interp.frames.last_mut().unwrap().tailcall = Some(tc_args.clone());
     Err(Error::tail_call(tc_args))
 }
 

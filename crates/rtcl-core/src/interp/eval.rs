@@ -165,6 +165,10 @@ impl Interp {
         if args.is_empty() {
             return Ok(Value::empty());
         }
+        // A fresh dispatch starts a fresh error: raise-site ::errorCode
+        // installs (scan formats, exec, `error`) mark this flag, and a
+        // `catch` later decides preserve-vs-derive from it.
+        self.err_code_raised = false;
         let cmd_name = args[0].as_str();
 
         // Namespace-aware command lookup:

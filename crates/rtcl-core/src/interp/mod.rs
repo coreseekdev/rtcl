@@ -99,6 +99,11 @@ pub(crate) struct CallFrame {
     pub local_procs: Vec<String>,
     /// Scripts registered by `defer` — executed in reverse order on frame exit.
     pub deferred_scripts: Vec<String>,
+    /// Deferred `tailcall` command, armed by the `tailcall` builtin and
+    /// fired at frame exit — kept on the frame (not just the completion
+    /// error) so a `catch` consuming the completion still lets it fire,
+    /// and a second `tailcall` overwrites it (tclsh tailcall-12.3).
+    pub tailcall: Option<Vec<String>>,
     /// `info level 0` for this frame: the invocation words as dispatched
     /// (as-typed command name + evaluated arguments), list-rendered.
     pub level0: String,
@@ -201,6 +206,11 @@ pub struct Interp {
     /// propagates framelessly (`while`/`if` bodies, tclsh's inlined loop
     /// instructions).
     pub(crate) err_fresh: bool,
+    /// Set when the raise site of the in-flight error installed
+    /// ::errorCode itself (scan formats, exec CHILDSTATUS, `error`,
+    /// `return -errorcode`); a `catch` must then preserve it instead of
+    /// deriving the code from the error variant.
+    pub(crate) err_code_raised: bool,
     /// Line of the last erroring command recorded by a script harness;
     /// consumed by `(procedure ... line N)`, `(in namespace eval ...
     /// script line N)`, `("uplevel" body line N)`, `(file ... line N)`.
@@ -293,6 +303,7 @@ impl Interp {
             exec_traces: HashMap::new(),
             err_info: None,
             err_fresh: false,
+            err_code_raised: false,
             err_line: 1,
             cur_cmd_text: String::new(),
             err_from_subst: false,

@@ -51,6 +51,7 @@ impl Interp {
             call_ns: Some(prev_namespace.clone()),
             local_procs: Vec::new(),
             deferred_scripts: Vec::new(),
+            tailcall: None,
             level0: String::new(),
             ns_depth: self.ns_level0.len(),
         });
@@ -165,7 +166,21 @@ impl Interp {
             }
 
             // ── Execute body ───────────────────────────────────────
-            let result = self.eval(&current_body);
+            let mut result = self.eval(&current_body);
+
+            // A tailcall whose completion an inner catch consumed leaves
+            // the frame marker armed: it still fires at body end and
+            // replaces the result (tclsh tailcall-12.3a1:
+            // `catch [list tailcall foo]; tailcall` → {}).
+            if !matches!(&result, Err(e) if e.is_tail_call()) {
+                if let Some(frame) = self.frames.last_mut() {
+                    if let Some(tc_args) = frame.tailcall.take() {
+                        if !tc_args.is_empty() {
+                            result = Err(Error::tail_call(tc_args));
+                        }
+                    }
+                }
+            }
 
             // ── Check for tail-call signal ─────────────────────────
             match result {
@@ -185,7 +200,15 @@ impl Interp {
                         }
                         current_statics = HashMap::new();
                     }
-                    let tc_args = e.into_tail_call_args().unwrap();
+                    let tc_args = match self.frames.last_mut().unwrap().tailcall.take() {
+                        Some(a) => a,
+                        None => e.into_tail_call_args().unwrap(),
+                    };
+                    if tc_args.is_empty() {
+                        // `tailcall` with no command: the frame yields the
+                        // empty completion value.
+                        break Ok(Value::empty());
+                    }
                     let cmd_name = &tc_args[0];
                     if let Some(new_proc) = self.procs.get(cmd_name).cloned() {
                         // Tail-call to another proc — reuse the frame (no depth increase)
@@ -273,6 +296,7 @@ impl Interp {
                             }
                             if let Some(code) = error_code {
                                 let _ = self.set_var("::errorCode", Value::from_str(code));
+                                self.err_code_raised = true;
                             }
                             let val = value.clone().unwrap_or_default();
                             match *level {

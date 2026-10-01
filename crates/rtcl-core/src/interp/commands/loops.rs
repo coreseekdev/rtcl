@@ -4,6 +4,9 @@ use crate::error::{Error, Result};
 use crate::interp::Interp;
 use crate::value::Value;
 
+use super::dict::demote_level0_return;
+use super::list::{set_error_code, strict_list, tcl_err};
+
 pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
         return Err(Error::wrong_args_with_usage("while", 3, args.len(), "test command"));
@@ -17,7 +20,7 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if !crate::types::expr_funcs::strict_bool(&cond)? {
             break;
         }
-        match interp.eval(body) {
+        match demote_level0_return(interp.eval(body)) {
             Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
@@ -50,13 +53,13 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let next = args[3].as_str();
     let body = args[4].as_str();
 
-    interp.eval(start)?;
+    demote_level0_return(interp.eval(start))?;
 
     loop {
         let cond = interp.eval_expr(test)?;
         if !crate::types::expr_funcs::strict_bool(&cond)? { break; }
 
-        match interp.eval(body) {
+        match demote_level0_return(interp.eval(body)) {
             Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
@@ -75,15 +78,22 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
 
-        match interp.eval(next) {
+        match demote_level0_return(interp.eval(next)) {
             Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
+                    // `break` in the next script ends the loop (for-8.1).
                     if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
                     break;
                 }
                 if e.is_continue() {
+                    // Unlike a body continue, a `continue` raised by the
+                    // next script escapes the `for` itself: tclsh's
+                    // compiled next script has no in-loop continue target
+                    // (for-8.2..for-8.12 — the enclosing loop sees the
+                    // continue).
                     if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    return Err(e);
                 }
                 else {
                     interp.err_fresh = true;
@@ -116,16 +126,16 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut groups: Vec<VarGroup> = Vec::new();
     let mut i = 1;
     while i < args.len() - 1 {
-        let var_list = args[i].as_list().unwrap_or_else(|| vec![args[i].clone()]);
+        // tclsh parses each varlist/list strictly — malformed elements
+        // raise the list scanner's error (foreach-1.12/1.13).
+        let var_list = strict_list(interp, &args[i])?;
         let vars: Vec<String> = var_list.iter().map(|v| v.as_str().to_string()).collect();
         // tclsh: an empty varlist is an error, not zero iterations.
         if vars.is_empty() {
-            return Err(Error::runtime(
-                "foreach varlist is empty",
-                crate::error::ErrorCode::Generic,
-            ));
+            set_error_code(interp, "TCL OPERATION FOREACH NEEDVARS");
+            return Err(tcl_err("foreach varlist is empty"));
         }
-        let data = args[i + 1].as_list().unwrap_or_default();
+        let data = strict_list(interp, &args[i + 1])?;
         groups.push(VarGroup { vars, data });
         i += 2;
     }
@@ -145,10 +155,29 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             for (vi, var) in g.vars.iter().enumerate() {
                 let data_idx = idx * n + vi;
                 let value = g.data.get(data_idx).cloned().unwrap_or_else(Value::empty);
-                interp.set_var(var, value)?;
+                if let Err(e) = interp.set_var(var, value) {
+                    // Tcl's compiled foreach appends a dedicated frame
+                    // between the message and the enclosing command's
+                    // frame when a loop-variable write fails
+                    // (foreach-1.14: `(setting foreach loop variable "a")`),
+                    // and installs TCL WRITE VARNAME as ::errorCode.
+                    if interp.err_is_error(&e) {
+                        set_error_code(interp, "TCL WRITE VARNAME");
+                        if interp.err_info.is_none() {
+                            interp.err_info = Some(e.message_text());
+                        }
+                        if let Some(info) = &mut interp.err_info {
+                            info.push_str(&format!(
+                                "\n    (setting foreach loop variable \"{}\")",
+                                var
+                            ));
+                        }
+                    }
+                    return Err(e);
+                }
             }
         }
-        match interp.eval(body) {
+        match demote_level0_return(interp.eval(body)) {
             Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
@@ -500,112 +529,99 @@ mod tests {
         assert!(interp.eval("loop").is_err());
     }
 
-    // -- Multi-level break/continue tests --
+    // -- Tcl 8.6 break/continue semantics --
 
     #[test]
-    fn test_break_2_nested_for() {
+    fn test_break_no_args() {
+        // `break` takes no arguments in Tcl 8.6 (for-3.1).
+        let mut interp = Interp::new();
+        let e = interp.eval("break foo").unwrap_err();
+        assert_eq!(e.to_string(), "wrong # args: should be \"break\"");
+        assert!(interp.eval("break 2").is_err());
+    }
+
+    #[test]
+    fn test_continue_no_args() {
+        // `continue` takes no arguments in Tcl 8.6 (for-2.1).
+        let mut interp = Interp::new();
+        let e = interp.eval("continue foo").unwrap_err();
+        assert_eq!(e.to_string(), "wrong # args: should be \"continue\"");
+        assert!(interp.eval("continue 2").is_err());
+    }
+
+    #[test]
+    fn test_break_in_next_script_ends_loop() {
         let mut interp = Interp::new();
         let r = interp.eval(r#"
-            set result ""
-            for {set i 0} {$i < 3} {incr i} {
-                for {set j 0} {$j < 3} {incr j} {
-                    if {$j == 1} { break 2 }
-                    append result "$i$j "
-                }
-            }
-            set result
+            set log {}
+            for {set i 0} {$i < 5} {incr i; break} { lappend log $i }
+            list [llength $log] $i
         "#).unwrap();
-        assert_eq!(r.as_str(), "00 ");
+        // one body run (i=0), then incr i → 1 and the loop ends
+        assert_eq!(r.as_str(), "1 1");
     }
 
     #[test]
-    fn test_continue_2_nested_for() {
+    fn test_continue_in_next_script_escapes_for() {
+        // Tcl's compiled `for` gives the next script no in-loop continue
+        // target: the continue escapes to the enclosing loop (for-8.12).
         let mut interp = Interp::new();
         let r = interp.eval(r#"
-            set result ""
-            for {set i 0} {$i < 3} {incr i} {
-                for {set j 0} {$j < 3} {incr j} {
-                    if {$j == 1} { continue 2 }
-                    append result "$i$j "
-                }
-            }
-            set result
-        "#).unwrap();
-        assert_eq!(r.as_str(), "00 10 20 ");
-    }
-
-    #[test]
-    fn test_break_1_same_as_break() {
-        let mut interp = Interp::new();
-        let r = interp.eval("set r {}; loop i 5 { if {$i == 2} {break 1}; lappend r $i }; set r").unwrap();
-        assert_eq!(r.as_str(), "0 1");
-    }
-
-    #[test]
-    fn test_break_bad_level() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("break 0").is_err());
-        assert!(interp.eval("break -1").is_err());
-        assert!(interp.eval("break abc").is_err());
-    }
-
-    #[test]
-    fn test_continue_bad_level() {
-        let mut interp = Interp::new();
-        assert!(interp.eval("for {set i 0} {$i<1} {incr i} { continue 0 }").is_err());
-    }
-
-    #[test]
-    fn test_break_3_triple_nested() {
-        let mut interp = Interp::new();
-        let r = interp.eval(r#"
-            set result ""
-            for {set i 0} {$i < 2} {incr i} {
-                for {set j 0} {$j < 2} {incr j} {
-                    for {set k 0} {$k < 2} {incr k} {
-                        if {$k == 1} { break 3 }
-                        append result "$i$j$k "
+            apply {{} {
+                for {set k 0} {$k < 3} {incr k} {
+                    set j 0
+                    for {set i 0} {$i < 5} {incr i;continue} {
+                        incr j
                     }
+                    incr i
                 }
-            }
-            set result
+                list $i $j $k
+            }}
         "#).unwrap();
-        assert_eq!(r.as_str(), "000 ");
+        assert_eq!(r.as_str(), "1 1 3");
     }
 
     #[test]
-    fn test_break_2_while() {
+    fn test_return_level0_in_for_body_is_normal() {
+        // `return -level 0` completes the body script normally: the loop
+        // keeps iterating (tclsh loops forever on `while {1} {return -level 0}`).
         let mut interp = Interp::new();
         let r = interp.eval(r#"
-            set result ""
-            set i 0
-            while {$i < 3} {
-                set j 0
-                while {$j < 3} {
-                    if {$j == 1} { break 2 }
-                    append result "$i$j "
-                    incr j
-                }
-                incr i
-            }
-            set result
+            proc p {} { for {set i 0} {$i<3} {incr i} { return -level 0 $i } ; list after $i }
+            p
         "#).unwrap();
-        assert_eq!(r.as_str(), "00 ");
+        assert_eq!(r.as_str(), "after 3");
     }
 
     #[test]
-    fn test_break_2_foreach() {
+    fn test_foreach_malformed_list_error() {
+        // Strict list parsing on both the varlist and the data list
+        // (foreach-1.12/1.13).
         let mut interp = Interp::new();
         let r = interp.eval(r#"
-            set result ""
-            foreach i {a b c} {
-                foreach j {1 2 3} {
-                    if {$j == 2} { break 2 }
-                    append result "$i$j "
-                }
-            }
-            set result
+            catch {foreach a {{1 2}3} {}} m
+            list $m $::errorCode
         "#).unwrap();
-        assert_eq!(r.as_str(), "a1 ");
+        assert_eq!(
+            r.as_str(),
+            "{list element in braces followed by \"3\" instead of space} {TCL VALUE LIST JUNK}"
+        );
+    }
+
+    #[test]
+    fn test_foreach_set_array_var_error_info() {
+        // Failing to write a loop variable frames the write site
+        // (foreach-1.14).
+        let mut interp = Interp::new();
+        let r = interp.eval(r#"
+            unset -nocomplain a
+            set a(0) 44
+            catch {foreach a {1 2 3} {}} m
+            list $m $::errorCode $::errorInfo
+        "#).unwrap();
+        assert_eq!(
+            r.as_str(),
+            "{can't set \"a\": variable is array} {TCL WRITE VARNAME} {can't set \"a\": variable is array\n    (setting foreach loop variable \"a\")\n    invoked from within\n\"foreach a {1 2 3} {}\"}"
+        );
     }
 }

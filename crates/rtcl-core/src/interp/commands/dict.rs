@@ -849,7 +849,7 @@ fn dict_unset_nested(entries: &mut DictMap, keys: &[&str]) -> Result<()> {
 /// TCL_RETURN with level 0 at the script boundary; cmd_return encodes
 /// explicit `-level 0` as level −1). Plain `return` and `-level N ≥ 1`
 /// keep propagating.
-fn demote_level0_return(r: Result<Value>) -> Result<Value> {
+pub(crate) fn demote_level0_return(r: Result<Value>) -> Result<Value> {
     match r {
         Err(Error::ControlFlow {
             kind: crate::error::ControlFlow::Return,

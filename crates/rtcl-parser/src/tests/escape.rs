@@ -32,29 +32,28 @@ fn test_escape_big_unicode_no_digits() {
     }
 }
 
-/// \U with 8 hex digits producing valid codepoint.
+/// \U with 8 hex digits producing an astral codepoint: tclsh's default 8.6
+/// build (TCL_UTF_MAX < 4) clamps values above 0xFFFF to U+FFFD — verified
+/// against tclsh 8.6.17 (`\U0001F600` is U+FFFD, not the emoji).
 #[test]
 fn test_escape_big_unicode_8_digits() {
-    // \U0001f600 = 😀
     let cmds = parse("set x \"\\U0001f600\"").unwrap();
     match &cmds[0].words[2] {
-        Word::Literal(s) => assert_eq!(s, "\u{1f600}"),
-        w => panic!("expected 😀, got {:?}", w),
+        Word::Literal(s) => assert_eq!(s, "\u{fffd}"),
+        w => panic!("expected U+FFFD, got {:?}", w),
     }
 }
 
-/// \U with 8 digits but invalid codepoint.
-/// rd: fallback to literal 'U'. PEG: may produce empty string.
+/// \UFFFFFFFF: ParseHex (tclParse.c) stops consuming digits once the
+/// accumulator exceeds 0x10FFF, so only 5 digits are eaten — the value
+/// clamps to U+FFFD and the remaining "FFF" stays in the stream as
+/// literal characters (probed: tclsh gives U+FFFD + "FFF").
 #[test]
 fn test_escape_big_unicode_invalid_codepoint() {
-    // \UFFFFFFFF is not a valid char
     let cmds = parse("set x \"\\UFFFFFFFF\"").unwrap();
     match &cmds[0].words[2] {
-        Word::Literal(s) => {
-            // rd: "U", PEG: "" — both acceptable
-            assert!(s == "U" || s.is_empty(), "got: {:?}", s);
-        }
-        w => panic!("expected Literal, got {:?}", w),
+        Word::Literal(s) => assert_eq!(s, "\u{fffd}FFF"),
+        w => panic!("expected U+FFFD + \"FFF\", got {:?}", w),
     }
 }
 

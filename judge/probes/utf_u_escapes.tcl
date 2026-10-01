@@ -1,0 +1,59 @@
+set ch {
+  \u1040
+  \uABF0
+  \u021F
+  \u0220
+  \u037F
+  \u052F
+  \uFBC1
+  \u0120
+  \u00AD
+  \u0605
+  \u061C
+  \u180E
+  \u2066
+  \uFEFF
+  \u1680
+  \u202F
+  \u200B
+  \u2060
+  \u203F
+  \u2040
+  \u2054
+  \uFE33
+  \uFE4D
+  \uFF3F
+  \u0085
+  \u2028
+  \u2029
+  \u00A0
+  \u0009
+  \u0020
+  \u0030
+  \u0041
+  \u0061
+  \u005F
+  \u00B7
+  \u002E
+  \u002D
+  \u0300
+  \u0483
+  \u0591
+  \u0660
+  \u0030
+  \u03FF
+  \u0531
+  \u0561
+  \u10A0
+  \u2D00
+  \u1C90
+  \u10D0
+  \u1E9E
+  \u17F4
+  \u0188
+}
+foreach esc {d w s D W S} {
+  set out {}
+  foreach c $ch { lappend out [regexp "^\\$esc" $c] }
+  puts "esc:$esc $out"
+}

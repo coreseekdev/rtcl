@@ -408,45 +408,18 @@ fn set_regexp_match_vars(
 }
 
 pub fn cmd_break(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() > 2 {
+    // Tcl 8.6 `break` takes no arguments — any argument is an arity
+    // error (`break foo` / `break 2` → wrong # args, for-3.1).
+    if args.len() != 1 {
         return Err(Error::wrong_args_with_usage("break", 1, args.len(), ""));
-    }
-    if args.len() == 2 {
-        let n = args[1].as_int().ok_or_else(|| {
-            Error::runtime(
-                format!("expected integer but got \"{}\"", args[1].as_str()),
-                crate::error::ErrorCode::Generic,
-            )
-        })? as i32;
-        if n <= 0 {
-            return Err(Error::runtime(
-                "bad level: must be > 0",
-                crate::error::ErrorCode::Generic,
-            ));
-        }
-        return Err(Error::brk_level(n));
     }
     Err(Error::brk())
 }
 
 pub fn cmd_continue(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() > 2 {
+    // Tcl 8.6 `continue` takes no arguments (for-2.1).
+    if args.len() != 1 {
         return Err(Error::wrong_args_with_usage("continue", 1, args.len(), ""));
-    }
-    if args.len() == 2 {
-        let n = args[1].as_int().ok_or_else(|| {
-            Error::runtime(
-                format!("expected integer but got \"{}\"", args[1].as_str()),
-                crate::error::ErrorCode::Generic,
-            )
-        })? as i32;
-        if n <= 0 {
-            return Err(Error::runtime(
-                "bad level: must be > 0",
-                crate::error::ErrorCode::Generic,
-            ));
-        }
-        return Err(Error::cont_level(n));
     }
     Err(Error::cont())
 }

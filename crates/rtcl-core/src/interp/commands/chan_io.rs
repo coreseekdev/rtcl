@@ -28,7 +28,8 @@ pub(crate) fn chan_not_found(interp: &mut Interp, id: &str) -> Error {
 
 /// Tcl's direction mismatch failure: the channel exists but is not open
 /// for the requested access. No ::errorCode (tclsh leaves it at NONE).
-pub(crate) fn not_opened(id: &str, reading: bool) -> Error {
+pub(crate) fn not_opened(interp: &mut Interp, id: &str, reading: bool) -> Error {
+    super::list::set_error_code(interp, "NONE");
     Error::runtime(
         format!(
             "channel \"{}\" wasn't opened for {}",
@@ -216,7 +217,7 @@ pub fn cmd_read(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let ch = interp.channels.get_mut(chan_id).unwrap();
 
     if !ch.is_readable() {
-        return Err(not_opened(chan_id, true));
+        return Err(not_opened(interp, chan_id, true));
     }
 
     if let Some(count) = count {
@@ -274,7 +275,7 @@ pub fn cmd_gets(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let ch = interp.channels.get_mut(chan_id).unwrap();
 
     if !ch.is_readable() {
-        return Err(not_opened(chan_id, true));
+        return Err(not_opened(interp, chan_id, true));
     }
 
     let line = ch.read_line().map_err(io_err)?;
@@ -388,7 +389,7 @@ pub fn cmd_flush(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let ch = interp.channels.get_mut(chan_id).unwrap();
     if !ch.is_writable() {
-        return Err(not_opened(chan_id, false));
+        return Err(not_opened(interp, chan_id, false));
     }
     ch.flush().map_err(io_err)?;
     Ok(Value::empty())
@@ -410,7 +411,7 @@ pub fn cmd_fblocked(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let ch = interp.channels.get_mut(chan_id).unwrap();
     if !ch.is_readable() {
-        return Err(not_opened(chan_id, true));
+        return Err(not_opened(interp, chan_id, true));
     }
     // Reads are synchronous/blocking, so a channel is only "blocked" while
     // a non-blocking read left data pending — never the case here.
@@ -432,35 +433,43 @@ const FCONFIGURE_OPTIONS: &[&str] = &[
 /// Render an `-eofchar` query the way Tcl does: single-access channels
 /// report a one-element list, read/write channels a two-element list.
 fn eofchar_query(ch_read: bool, ch_write: bool, in_c: Option<char>, out_c: Option<char>) -> Value {
+    // Tcl renders a single-access query as a one-element list, so an
+    // unset character shows up as the braced empty string "{}".
     let v = |c: Option<char>| match c {
         Some(c) => Value::from_str(&c.to_string()),
         None => Value::from_str(""),
     };
+    let quoted = |c: Option<char>| match c {
+        Some(c) => Value::from_str(&c.to_string()),
+        None => Value::from_str("{}"),
+    };
     if ch_read && ch_write {
         Value::from_list(&[v(in_c), v(out_c)])
     } else if ch_read {
-        v(in_c)
+        quoted(in_c)
     } else {
-        v(out_c)
+        quoted(out_c)
     }
 }
 
 /// Validate one `-eofchar` element: Tcl allows a single non-NUL ASCII char.
-fn eofchar_element(val: &str) -> std::result::Result<Option<char>, Error> {
+fn eofchar_element(interp: &mut Interp, val: &str) -> std::result::Result<Option<char>, Error> {
     let mut chars = val.chars();
     match (chars.next(), chars.next()) {
         (None, _) => Ok(None),
         (Some(c), None) if c != '\0' && (c as u32) <= 0x7f => Ok(Some(c)),
-        _ => Err(Error::runtime(
-            "bad value for -eofchar: must be non-NUL ASCII character",
-            crate::error::ErrorCode::InvalidOp,
-        )),
+        _ => {
+            super::list::set_error_code(interp, "NONE");
+            Err(super::list::tcl_err(
+                "bad value for -eofchar: must be non-NUL ASCII character",
+            ))
+        }
     }
 }
 
 pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(Error::wrong_args_with_usage("fconfigure", 2, args.len(), "fconfigure channelId ?optName? ?value? ..."));
+        return Err(Error::wrong_args_with_usage("fconfigure", 2, args.len(), "channelId ?-option value ...?"));
     }
     let chan_id = args[1].as_str();
 
@@ -503,13 +512,12 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let opt = match resolve_prefix(FCONFIGURE_OPTIONS, args[2].as_str()) {
             Ok(o) => o,
             Err(()) => {
-                return Err(Error::runtime(
-                    format!(
-                        "bad option \"{}\": should be one of -blocking, -buffering, -buffersize, -encoding, -eofchar, or -translation",
-                        args[2].as_str()
-                    ),
-                    crate::error::ErrorCode::InvalidOp,
-                ))
+                // Tcl's fconfigure does not attach an errorCode here.
+                super::list::set_error_code(interp, "NONE");
+                return Err(super::list::tcl_err(format!(
+                    "bad option \"{}\": should be one of -blocking, -buffering, -buffersize, -encoding, -eofchar, or -translation",
+                    args[2].as_str()
+                )));
             }
         };
         let cfg = interp.channels.config(chan_id).cloned().unwrap_or_default();
@@ -540,7 +548,7 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if (args.len() - 2) % 2 != 0 {
         return Err(Error::wrong_args_with_usage(
             "fconfigure", 2, args.len(),
-            "fconfigure channelId ?-option value ...?",
+            "channelId ?-option value ...?",
         ));
     }
 
@@ -549,29 +557,63 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let opt = match resolve_prefix(FCONFIGURE_OPTIONS, args[i].as_str()) {
             Ok(o) => o,
             Err(()) => {
-                return Err(Error::runtime(
-                    format!(
-                        "bad option \"{}\": should be one of -blocking, -buffering, -buffersize, -encoding, -eofchar, or -translation",
-                        args[i].as_str()
-                    ),
-                    crate::error::ErrorCode::InvalidOp,
-                ))
+                super::list::set_error_code(interp, "NONE");
+                return Err(super::list::tcl_err(format!(
+                    "bad option \"{}\": should be one of -blocking, -buffering, -buffersize, -encoding, -eofchar, or -translation",
+                    args[i].as_str()
+                )));
             }
         };
         let val = args[i + 1].as_str();
         if !interp.channels.contains(chan_id) {
                 return Err(chan_not_found(interp, chan_id));
             }
+        // -eofchar is validated before the config borrow so its errors can
+        // install their own errorCode. Either a single character (both
+        // directions) or a two-element list {readChar writeChar}; an empty
+        // value (or list of empties) clears the setting.
+        let eof_pair: Option<(Option<char>, Option<char>)> = if opt == "-eofchar" {
+            let elems = match Value::from_str(val).as_list_strict() {
+                Ok(e) => e,
+                Err(e) => {
+                    super::list::set_error_code(interp, e.code);
+                    return Err(Error::runtime(
+                        e.message.clone(),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+            };
+            Some(match elems.len() {
+                0 => (None, None),
+                1 => {
+                    let c = eofchar_element(interp, elems[0].as_str())?;
+                    (c, c)
+                }
+                2 => (
+                    eofchar_element(interp, elems[0].as_str())?,
+                    eofchar_element(interp, elems[1].as_str())?,
+                ),
+                _ => {
+                    super::list::set_error_code(interp, "NONE");
+                    return Err(super::list::tcl_err(
+                        "bad value for -eofchar: should be a list of zero, one, or two elements",
+                    ));
+                }
+            })
+        } else {
+            None
+        };
 let cfg = interp.channels.config_mut(chan_id).unwrap();
         match opt {
             "-blocking" => {
                 cfg.blocking = match Value::from_str(val).as_bool() {
                     Some(b) => b,
                     None => {
-                        return Err(Error::runtime(
-                            format!("expected boolean value but got \"{}\"", val),
-                            crate::error::ErrorCode::Generic,
-                        ))
+                        super::list::set_error_code(interp, "TCL VALUE BOOLEAN");
+                        return Err(super::list::tcl_err(format!(
+                            "expected boolean value but got \"{}\"",
+                            val
+                        )));
                     }
                 };
             }
@@ -580,53 +622,34 @@ let cfg = interp.channels.config_mut(chan_id).unwrap();
                     "full" => crate::channel::Buffering::Full,
                     "line" => crate::channel::Buffering::Line,
                     "none" => crate::channel::Buffering::None,
-                    _ => return Err(Error::runtime(
-                        "bad value for -buffering: must be one of full, line, or none".to_string(),
-                        crate::error::ErrorCode::InvalidOp,
-                    )),
+                    _ => {
+                        super::list::set_error_code(interp, "NONE");
+                        return Err(super::list::tcl_err(
+                            "bad value for -buffering: must be one of full, line, or none",
+                        ));
+                    }
                 };
             }
             "-buffersize" => {
-                let size: i64 = val.parse().map_err(|_| Error::runtime(
-                    format!("expected integer but got \"{}\"", val),
-                    crate::error::ErrorCode::Generic,
-                ))?;
-                cfg.buffer_size = size.max(0) as usize;
+                let size: i64 = match val.parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        super::list::set_error_code(interp, "TCL VALUE INTEGER");
+                        return Err(super::list::tcl_err(format!(
+                            "expected integer but got \"{}\"",
+                            val
+                        )));
+                    }
+                };
+                // Tcl clamps the buffer size to a minimum of one byte.
+                cfg.buffer_size = size.max(1) as usize;
             }
             "-encoding" => {
                 cfg.encoding = val.to_string();
             }
             "-eofchar" => {
-                // Either a single character (both directions) or a
-                // two-element list {readChar writeChar}. An empty value
-                // (or list of empties) clears the setting.
-                let elems = match Value::from_str(val).as_list_strict() {
-                    Ok(e) => e,
-                    Err(e) => {
-                        super::list::set_error_code(interp, e.code);
-                        return Err(Error::runtime(
-                            e.message.clone(),
-                            crate::error::ErrorCode::Generic,
-                        ));
-                    }
-                };
-                let (in_c, out_c) = match elems.len() {
-                    0 => (None, None),
-                    1 => {
-                        let c = eofchar_element(elems[0].as_str())?;
-                        (c, c)
-                    }
-                    2 => (
-                        eofchar_element(elems[0].as_str())?,
-                        eofchar_element(elems[1].as_str())?,
-                    ),
-                    _ => {
-                        return Err(Error::runtime(
-                            "bad value for -eofchar: should be a list of zero, one, or two elements",
-                            crate::error::ErrorCode::InvalidOp,
-                        ))
-                    }
-                };
+                // Validated above, before the config was borrowed.
+                let (in_c, out_c) = eof_pair.unwrap();
                 cfg.eofchar_in = in_c;
                 cfg.eofchar_out = out_c;
             }
@@ -643,10 +666,12 @@ let cfg = interp.channels.config_mut(chan_id).unwrap();
                     "crlf" => crate::channel::TranslationMode::CrLf,
                     "cr" => crate::channel::TranslationMode::Cr,
                     "binary" => crate::channel::TranslationMode::Binary,
-                    _ => return Err(Error::runtime(
-                        "bad value for -translation: must be one of auto, binary, cr, lf, crlf, or platform".to_string(),
-                        crate::error::ErrorCode::InvalidOp,
-                    )),
+                    _ => {
+                        super::list::set_error_code(interp, "NONE");
+                        return Err(super::list::tcl_err(
+                            "bad value for -translation: must be one of auto, binary, cr, lf, crlf, or platform",
+                        ));
+                    }
                 };
             }
             _ => unreachable!(),
@@ -815,13 +840,23 @@ pub fn cmd_chan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     };
 
-    // Subcommands that delegate to the standalone commands: rebuild the
-    // argument vector with the standalone command's name at index 0 so
-    // arity errors report the same usage text.
+    // Subcommand arity is validated here with the `chan ...` usage text
+    // (tclsh's ensembles report their own usage, not the delegated
+    // command's), then the work is delegated to the standalone command.
+    let rest = &args[2..];
+    let n = rest.len();
+    macro_rules! wrong_usage {
+        ($usage:expr) => {
+            return Err(Error::wrong_args_msg(format!(
+                "wrong # args: should be \"{}\"",
+                $usage
+            )))
+        };
+    }
     macro_rules! delegate {
         ($func:expr, $name:expr) => {{
             let mut new_args: Vec<Value> = vec![Value::from_str($name)];
-            for a in &args[2..] {
+            for a in rest {
                 new_args.push(a.clone());
             }
             ($func)(interp, &new_args)
@@ -829,39 +864,198 @@ pub fn cmd_chan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     match resolved {
-        "blocked" => delegate!(cmd_fblocked, "fblocked"),
-        "close" => delegate!(cmd_close, "close"),
-        "configure" => delegate!(cmd_fconfigure, "fconfigure"),
-        "eof" => delegate!(cmd_eof, "eof"),
-        "flush" => delegate!(cmd_flush, "flush"),
-        "gets" => delegate!(cmd_gets, "gets"),
-        "read" => delegate!(cmd_read, "read"),
-        "seek" => delegate!(cmd_seek, "seek"),
-        "tell" => delegate!(cmd_tell, "tell"),
-        "puts" => delegate!(super::io::cmd_puts, "puts"),
-        "names" => chan_names(interp, &args[2..]),
-        "pending" => chan_pending(interp, &args[2..]),
-        "create" => chan_create(interp, &args[2..]),
-        "push" => chan_push(interp, &args[2..]),
-        "pipe" => chan_pipe(interp, &args[2..]),
-        "copy" => chan_copy(interp, &args[2..]),
-        "truncate" => chan_truncate(interp, &args[2..]),
-        "pop" => chan_pop(interp, &args[2..]),
-        // `chan event`/`chan postevent` drive the event loop's channel
-        // watchers; with synchronous channels there is nothing to watch.
+        "blocked" => {
+            if n != 1 {
+                wrong_usage!("chan blocked channelId");
+            }
+            delegate!(cmd_fblocked, "fblocked")
+        }
+        "close" => {
+            if n != 1 && n != 2 {
+                wrong_usage!("chan close channelId ?direction?");
+            }
+            let id = rest[0].as_str().to_string();
+            if !interp.channels.contains(&id) {
+                return Err(chan_not_found(interp, &id));
+            }
+            if n == 2 {
+                let dir = rest[1].as_str();
+                let which = match resolve_prefix(&["read", "write"], dir) {
+                    Ok(w) => w,
+                    Err(()) => {
+                        super::list::set_error_code(
+                            interp,
+                            &format!(
+                                "TCL LOOKUP INDEX direction {}",
+                                crate::value::tcl_quote(dir)
+                            ),
+                        );
+                        return Err(Error::runtime(
+                            format!("bad direction \"{}\": must be read or write", dir),
+                            crate::error::ErrorCode::Io,
+                        ));
+                    }
+                };
+                let (supported, both) = {
+                    let ch = interp.channels.get(&id).unwrap();
+                    match which {
+                        "read" => (ch.is_readable(), ch.is_writable()),
+                        _ => (ch.is_writable(), ch.is_readable()),
+                    }
+                };
+                if !supported || both {
+                    // Tcl refuses half-closes it cannot perform: a side that
+                    // is not open, or (on bidirectional channels) either side
+                    // -- the latter failing with an empty message.
+                    super::list::set_error_code(interp, "NONE");
+                    let msg = if !supported {
+                        format!(
+                            "Half-close of {}-side not possible, side not opened or already closed",
+                            which
+                        )
+                    } else {
+                        String::new()
+                    };
+                    return Err(super::list::tcl_err(msg));
+                }
+                // Half-closing the only open direction closes the channel.
+                let mut new_args: Vec<Value> = vec![Value::from_str("close")];
+                new_args.push(rest[0].clone());
+                return (cmd_close)(interp, &new_args);
+            }
+            delegate!(cmd_close, "close")
+        }
+        "configure" => {
+            // n == 1 queries everything, n == 2 queries one option, and any
+            // larger count must be whole ?-option value? pairs.
+            if n == 0 || (n >= 3 && (n - 1) % 2 != 0) {
+                wrong_usage!("chan configure channelId ?-option value ...?");
+            }
+            delegate!(cmd_fconfigure, "fconfigure")
+        }
+        "copy" => chan_copy(interp, rest),
+        "create" => {
+            if n != 2 {
+                wrong_usage!("chan create mode cmdprefix");
+            }
+            chan_create(interp, rest)
+        }
+        "eof" => {
+            if n != 1 {
+                wrong_usage!("chan eof channelId");
+            }
+            delegate!(cmd_eof, "eof")
+        }
+        // Event watchers only fire from the event loop; with synchronous
+        // channels the script is simply remembered (never scheduled).
         "event" => {
-            if args.len() < 3 {
-                return Err(Error::wrong_args_msg(
-                    "wrong # args: should be \"chan event channelId event ?script?\"".to_string(),
+            if n != 2 && n != 3 {
+                wrong_usage!("chan event channelId event ?script?");
+            }
+            let event = rest[1].as_str();
+            if resolve_prefix(&["readable", "writable"], event).is_err() {
+                interp.globals.insert(
+                    "errorCode".to_string(),
+                    Value::from_str(&format!(
+                        "TCL LOOKUP INDEX {{event name}} {}",
+                        crate::value::tcl_quote(event)
+                    )),
+                );
+                interp.err_code_raised = true;
+                return Err(Error::runtime(
+                    format!("bad event name \"{}\": must be readable or writable", event),
+                    crate::error::ErrorCode::Io,
                 ));
             }
-            let _ = interp;
             Ok(Value::empty())
         }
-        "postevent" => {
-            let chan_id = if args.len() >= 3 { args[2].as_str() } else { "" };
-            Err(chan_not_found_reflected(interp, chan_id))
+        "flush" => {
+            if n != 1 {
+                wrong_usage!("chan flush channelId");
+            }
+            delegate!(cmd_flush, "flush")
         }
+        "gets" => {
+            if n != 1 && n != 2 {
+                wrong_usage!("chan gets channelId ?varName?");
+            }
+            delegate!(cmd_gets, "gets")
+        }
+        "names" => {
+            if n > 1 {
+                wrong_usage!("chan names ?pattern?");
+            }
+            chan_names(interp, rest)
+        }
+        "pending" => {
+            if n != 2 {
+                wrong_usage!("chan pending mode channelId");
+            }
+            chan_pending(interp, rest)
+        }
+        "pipe" => {
+            if n != 0 {
+                // tclsh renders this usage with an empty tail: "chan pipe ".
+                wrong_usage!("chan pipe ");
+            }
+            chan_pipe(interp, rest)
+        }
+        "pop" => {
+            if n != 1 {
+                wrong_usage!("chan pop channel");
+            }
+            chan_pop(interp, rest)
+        }
+        "postevent" => {
+            if n != 2 {
+                wrong_usage!("chan postevent channel eventspec");
+            }
+            Err(chan_not_found_reflected(interp, rest[0].as_str()))
+        }
+        "push" => {
+            if n != 2 {
+                wrong_usage!("chan push channel cmdprefix");
+            }
+            chan_push(interp, rest)
+        }
+        "puts" => {
+            let ok = match n {
+                1 | 2 => true,
+                3 => rest[0].as_str() == "-nonewline",
+                _ => false,
+            };
+            if !ok {
+                wrong_usage!("chan puts ?-nonewline? ?channelId? string");
+            }
+            delegate!(super::io::cmd_puts, "puts")
+        }
+        "read" => {
+            let ok = match n {
+                1 | 2 => true,
+                3 => rest[0].as_str() == "-nonewline",
+                _ => false,
+            };
+            if !ok {
+                return Err(Error::wrong_args_msg(
+                    "wrong # args: should be \"chan read channelId ?numChars?\" or \"chan read ?-nonewline? channelId\""
+                        .to_string(),
+                ));
+            }
+            delegate!(cmd_read, "read")
+        }
+        "seek" => {
+            if n != 2 && n != 3 {
+                wrong_usage!("chan seek channelId offset ?origin?");
+            }
+            delegate!(cmd_seek, "seek")
+        }
+        "tell" => {
+            if n != 1 {
+                wrong_usage!("chan tell channelId");
+            }
+            delegate!(cmd_tell, "tell")
+        }
+        "truncate" => chan_truncate(interp, rest),
         _ => unreachable!(),
     }
 }
@@ -1097,44 +1291,91 @@ fn chan_pipe(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::from_str(&format!("{} {}", rid, wid)))
 }
 
-/// `chan copy ?-size n? from to` — synchronous copy of readable → writable.
+/// `chan copy input output ?-size size? ?-command callback?` -- synchronous
+/// copy from a readable channel to a writable one. Options are matched the
+/// way tclsh does: any prefix of "-size"/"-command" is accepted, and junk
+/// at the option position is a wrong-args (or bad-option) error.
 fn chan_copy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let wrong_args = || {
+        Error::wrong_args_msg(
+            "wrong # args: should be \"chan copy input output ?-size size? ?-command callback?\""
+                .to_string(),
+        )
+    };
+    if args.len() < 2 || args.len() > 6 {
+        return Err(wrong_args());
+    }
+    let is_opt = |tok: &str, long: &str| {
+        !tok.is_empty() && tok.len() <= long.len() && &long[..tok.len()] == tok
+    };
     let mut size: Option<i64> = None;
-    let mut idx = 0;
-    if args.first().map(|v| v.as_str() == "-size").unwrap_or(false) {
-        if args.len() < 2 {
-            return Err(Error::wrong_args_msg(
-                "wrong # args: should be \"chan copy ?-size size? fromChan toChan\"".to_string(),
+    let mut command: Option<Value> = None;
+    let mut i = 2;
+    while i < args.len() {
+        let tok = args[i].as_str();
+        if is_opt(tok, "-size") {
+            if i + 1 >= args.len() {
+                return Err(wrong_args());
+            }
+            match args[i + 1].as_int() {
+                Some(v) => size = Some(v),
+                None => {
+                    super::list::set_error_code(interp, "TCL VALUE NUMBER");
+                    return Err(super::list::tcl_err(format!(
+                        "expected integer but got \"{}\"",
+                        args[i + 1].as_str()
+                    )));
+                }
+            }
+        } else if is_opt(tok, "-command") {
+            if i + 1 >= args.len() {
+                return Err(wrong_args());
+            }
+            // Accepted for syntax parity; the copy below runs synchronously.
+            command = Some(args[i + 1].clone());
+        } else {
+            break;
+        }
+        i += 2;
+    }
+    if i < args.len() {
+        if args.len() - i == 2 {
+            super::list::set_error_code(
+                interp,
+                &format!("TCL LOOKUP INDEX option {}", crate::value::tcl_quote(args[i].as_str())),
+            );
+            return Err(Error::runtime(
+                format!(
+                    "bad option \"{}\": must be -size or -command",
+                    args[i].as_str()
+                ),
+                crate::error::ErrorCode::NotFound,
             ));
         }
-        size = args[1].as_int();
-        idx = 2;
+        return Err(wrong_args());
     }
-    if args.len() - idx != 2 {
-        return Err(Error::wrong_args_msg(
-            "wrong # args: should be \"chan copy ?-size size? fromChan toChan\"".to_string(),
-        ));
-    }
-    let from = args[idx].as_str().to_string();
-    let to = args[idx + 1].as_str().to_string();
+    let from = args[0].as_str().to_string();
+    let to = args[1].as_str().to_string();
 
     // Source must be readable, target must be writable.
+    if !interp.channels.contains(&from) {
+        return Err(chan_not_found(interp, &from));
+    }
     if !interp.channels.get(&from).map(|ch| ch.is_readable()).unwrap_or(false) {
-        return Err(match interp.channels.get(&from) {
-            Some(_) => not_opened(&from, true),
-            None => chan_not_found(interp, &from),
-        });
+        return Err(not_opened(interp, &from, true));
+    }
+    if !interp.channels.contains(&to) {
+        return Err(chan_not_found(interp, &to));
     }
     if !interp.channels.get(&to).map(|ch| ch.is_writable()).unwrap_or(false) {
-        return Err(match interp.channels.get(&to) {
-            Some(_) => not_opened(&to, false),
-            None => chan_not_found(interp, &to),
-        });
+        return Err(not_opened(interp, &to, false));
     }
+    // A negative -size means "no limit" in tclsh.
+    let limit = size.filter(|s| *s >= 0);
 
     let mut copied: i64 = 0;
     loop {
-        let want = size.map(|s| (s - copied).min(4096).max(0) as usize).unwrap_or(4096);
+        let want = limit.map(|s| (s - copied).min(4096).max(0) as usize).unwrap_or(4096);
         if want == 0 {
             break;
         }
@@ -1165,6 +1406,9 @@ fn chan_copy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         copied += n;
     }
+    if command.is_some() {
+        return Ok(Value::empty());
+    }
     Ok(Value::from_int(copied))
 }
 
@@ -1190,7 +1434,7 @@ let ch = interp.channels.get_mut(chan_id).unwrap();
     }
     let ch = interp.channels.get_mut(chan_id).unwrap();
     if !ch.is_writable() {
-        return Err(not_opened(chan_id, false));
+        return Err(not_opened(interp, chan_id, false));
     }
     ch.set_length(length).map_err(io_err)?;
     Ok(Value::empty())
@@ -1216,7 +1460,7 @@ fn reflected_read(interp: &mut Interp, chan_id: &str, count: Option<i64>) -> Res
         None => return Ok(None),
     };
     if !info.modes.iter().any(|m| m == "read") || !info.methods.iter().any(|m| m == "read") {
-        return Err(not_opened(chan_id, true));
+        return Err(not_opened(interp, chan_id, true));
     }
     let want = count.unwrap_or(4096).max(0).to_string();
     let data = invoke_handler(interp, &info.prefix, &["read", &info.handle, &want])?;
@@ -1244,7 +1488,7 @@ pub(crate) fn reflected_write(interp: &mut Interp, chan_id: &str, data: &str) ->
         return Ok(false);
     };
     if !info.modes.iter().any(|m| m == "write") || !info.methods.iter().any(|m| m == "write") {
-        return Err(not_opened(chan_id, false));
+        return Err(not_opened(interp, chan_id, false));
     }
     invoke_handler(interp, &info.prefix, &["write", &info.handle, data])?;
     Ok(true)

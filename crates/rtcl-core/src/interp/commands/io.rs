@@ -66,7 +66,7 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             crate::error::ErrorCode::Io,
         ))?;
     if !ch.is_writable() {
-        return Err(chan_io::not_opened(chan_id, false));
+        return Err(chan_io::not_opened(interp, chan_id, false));
     }
 
     crate::channel::channel_write_str(ch.as_mut(), &out).map_err(|e| Error::runtime(

@@ -211,6 +211,16 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // pair list, so the parent-namespace error wins over a
             // malformed list.
             interp.check_parent_ns(array_name)?;
+            // An alias to an ELEMENT is a scalar slot: `array set` errors
+            // even with an empty pair list (set-old-8.38.3, probed: the
+            // upvar creates the container but not the element, and the
+            // element slot is not an array).
+            if interp.resolves_to_element(array_name) {
+                return Err(Error::runtime(
+                    format!("can't array set \"{}\": variable isn't array", array_name),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
             let list = super::list::strict_list(interp, &args[3])?;
             if !list.len().is_multiple_of(2) {
                 return Err(Error::runtime(
@@ -346,9 +356,17 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     Some(pat) => match mode {
                         "exact" => elem == pat,
                         "regexp" => {
+                            // Route through the shared engine: the regex
+                            // crate has no backreferences, so {^(.)\1}
+                            // compiled as an error here and every element
+                            // was dropped (set-old-8.52.1) while the
+                            // regexp command matched it fine via the
+                            // backtracking engine.
                             #[cfg(feature = "regexp")]
                             {
-                                Regex::new(pat).map(|re| re.is_match(elem)).unwrap_or(false)
+                                super::regexp_cmds::compile_engine(pat, false, false, false, false)
+                                    .map(|eng| super::regexp_cmds::engine_is_match(&eng, elem))
+                                    .unwrap_or(false)
                             }
                             #[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
                             {

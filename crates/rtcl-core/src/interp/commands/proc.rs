@@ -546,6 +546,14 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.canonical_global_in(&target_ns, other_var)
             };
             let alias_key = interp.canonical_global(local_var);
+            // Same container creation as the frame path: an element link
+            // makes the ARRAY exist (`upvar 0 a(e) x` → array exists a).
+            if let Some(paren) = target_key.find('(') {
+                let base = &target_key[..paren];
+                if !interp.is_array_semantic(base) && !interp.var_exists(base) {
+                    let _ = interp.mark_array(base);
+                }
+            }
             // Level 0 at the global level names the current scope
             // itself: `upvar 0 zz zz` is a self-reference (tclsh
             // 8.6.17).
@@ -666,6 +674,17 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         interp.frames[current_idx]
             .upvars
             .insert(local_var.clone(), link.clone());
+        // Linking to an ELEMENT of a missing array still creates the
+        // array container (not the element) in tclsh (probed:
+        // `upvar 0 a(e) x` → `array exists a` = 1, `info exists x` = 0).
+        if let UpvarLink::Global(gname) = &link {
+            if let Some(paren) = gname.find('(') {
+                let base = &gname[..paren];
+                if !interp.is_array_semantic(base) && !interp.var_exists(base) {
+                    let _ = interp.mark_array(base);
+                }
+            }
+        }
         // The linked name is in the proc's variable table (tclsh `info
         // vars` lists it): mirror the current value of the ULTIMATE
         // target when one exists; reads/writes still go through the

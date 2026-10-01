@@ -389,6 +389,62 @@ impl Interp {
         }
     }
 
+    /// Does `name` resolve (through upvar/flat aliases) to an ELEMENT slot
+    /// rather than an array base?  A link whose target keeps the `a(e)`
+    /// shape addresses a scalar element even though the written name has
+    /// no parentheses (set-old-8.38.3: `upvar 0 a(e) x; array set x {}`
+    /// → "variable isn't array").
+    pub(crate) fn resolves_to_element(&self, name: &str) -> bool {
+        if name.contains('(') {
+            return true;
+        }
+        if let Some(frame) = self.frames.last() {
+            match frame.upvars.get(name) {
+                Some(UpvarLink::Global(g)) => g.contains('('),
+                _ => false,
+            }
+        } else {
+            self.flat_aliases
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, t)| t.contains('('))
+                .unwrap_or(false)
+        }
+    }
+
+    /// Drop the seeded mirror copies for every frame's alias to a scalar
+    /// global that was just unset, KEEPING the links (set-old-7.7..7.9
+    /// probed semantics: after the target's deletion a `global` link
+    /// dangles — reads/`info exists` see nothing (7.7), but a WRITE
+    /// through the still-live link recreates the global, visible outside
+    /// (7.8/7.9) — so only the stale seed must go, not the link).
+    fn drop_global_seeds(&mut self, key: &str) {
+        for f in self.frames.iter_mut() {
+            let dead: Vec<String> = f
+                .upvars
+                .iter()
+                .filter_map(|(n, l)| match l {
+                    UpvarLink::Global(g) => {
+                        // Mirror resolve_loc's redirect so aliased flat
+                        // keys (global-level `upvar`) compare equal too.
+                        let flat = self
+                            .flat_aliases
+                            .iter()
+                            .find(|(k, _)| k == g)
+                            .map(|(_, t)| t.as_str())
+                            .unwrap_or(g);
+                        (flat == key).then(|| n.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            for n in dead {
+                f.locals.remove(&n);
+                f.array_locals.remove(&n);
+            }
+        }
+    }
+
     /// Remove a variable from the current scope, following upvar links.
     fn remove_var(&mut self, name: &str) {
         if let Some(gname) = Self::split_global(name) {
@@ -640,6 +696,13 @@ impl Interp {
                 Ok(())
             } else if self.loc_base_exists(&loc) {
                 self.remove_var(name);
+                // set-old-7.7..7.9: removing the target retires every
+                // frame's seeded mirror (stale reads) while the links
+                // stay live so writes recreate the global.
+                if let VarLoc::Global(k) = &loc {
+                    let k = k.clone();
+                    self.drop_global_seeds(&k);
+                }
                 let sk = stamp_key(&loc);
                 let _ = self.fire_traces(&given, None, "unset");
                 self.var_traces.remove(&sk);

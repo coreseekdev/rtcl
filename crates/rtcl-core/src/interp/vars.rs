@@ -174,6 +174,12 @@ impl Interp {
 
     /// Mark the variable at `loc` as an array.
     fn loc_mark_array(&mut self, loc: &VarLoc) {
+        // Container generation bump (see loc_remove_array): recreation
+        // counts as a container change for in-flight `array get` reads.
+        *self
+            .array_generations
+            .entry(stamp_key(loc))
+            .or_insert(0) += 1;
         match loc {
             VarLoc::Global(n) => {
                 self.array_globals.insert(n.clone());
@@ -189,6 +195,7 @@ impl Interp {
     /// Remove an entire array: all element keys, the array marker, and the
     /// base key (tclsh: `unset arr` kills the array itself).
     fn loc_remove_array(&mut self, loc: &VarLoc) {
+        // (generation bump at the end of this function)
         let prefix = format!("{}(", loc.base_name());
         match loc {
             VarLoc::Global(_) => {
@@ -222,6 +229,13 @@ impl Interp {
                 }
             }
         }
+        // Container generation bump: a destroyed array's snapshot entries
+        // are invisible to an in-flight `array get` even when a callback
+        // recreates same-named elements (tclsh holds the old Var).
+        *self
+            .array_generations
+            .entry(stamp_key(loc))
+            .or_insert(0) += 1;
     }
 
 
@@ -767,24 +781,7 @@ impl Interp {
     pub(crate) fn fire_traces(&mut self, base: &str, elem: Option<&str>, op: &str) -> Result<()> {
         let key = self.array_stamp_key(base);
         let mut scripts: Vec<String> = Vec::new();
-        if let Some(trs) = self.var_traces.get(&key) {
-            for t in trs {
-                if t.ops.iter().any(|o| o == op) {
-                    scripts.push(t.script.clone());
-                }
-            }
-        }
-        if let Some(e) = elem {
-            if let Some(map) = self.elem_traces.get(&key) {
-                if let Some(trs) = map.get(e) {
-                    for t in trs {
-                        if t.ops.iter().any(|o| o == op) {
-                            scripts.push(t.script.clone());
-                        }
-                    }
-                }
-            }
-        }
+        let scripts = self.collect_trace_scripts(&key, elem, op);
         for s in scripts.into_iter().rev() {
             // Most-recent-registered fires first (tclsh prepends to the
             // trace list: T2 T1 for two write traces). The script string
@@ -797,6 +794,93 @@ impl Interp {
             self.eval(&cmd)?;
         }
         Ok(())
+    }
+
+    /// Trace scripts registered for `op` on (base-key `key`, optional
+    /// element): whole-var traces first, then the element's own.
+    fn collect_trace_scripts(
+        &self,
+        key: &str,
+        elem: Option<&str>,
+        op: &str,
+    ) -> Vec<String> {
+        let mut scripts: Vec<String> = Vec::new();
+        if let Some(trs) = self.var_traces.get(key) {
+            for t in trs {
+                if t.ops.iter().any(|o| o == op) {
+                    scripts.push(t.script.clone());
+                }
+            }
+        }
+        if let Some(e) = elem {
+            if let Some(map) = self.elem_traces.get(key) {
+                if let Some(trs) = map.get(e) {
+                    for t in trs {
+                        if t.ops.iter().any(|o| o == op) {
+                            scripts.push(t.script.clone());
+                        }
+                    }
+                }
+            }
+        }
+        scripts
+    }
+
+    /// Read one element for `array get`: fire its read traces one script
+    /// at a time (pt1: `array get x` fires `{x a read} {x b read}`) with
+    /// tclsh's interleaved checks (probes P1-P7, trace-1.11..14):
+    ///  - the array container gone right after a script → the whole get
+    ///    aborts `can't read "base(elem)": no such variable` and later
+    ///    traces never run (1.13/1.14: the set-foo trace after unset-x
+    ///    never fires, x stays gone);
+    ///  - the container destroyed AND recreated by the callbacks (fresh
+    ///    base-key value) → the snapshot element is skipped even when a
+    ///    same-named element exists again (P2: recreated `bar 9` invisible);
+    ///  - a callback error is swallowed and skips the element (P6:
+    ///    `error BOOM` trace → get returns {}) without firing the rest;
+    ///  - otherwise the element's CURRENT value is used (P5: trace set
+    ///    `bar 5` → get shows 5), a simply-unset element is skipped (P1).
+    pub(crate) fn array_get_element(
+        &mut self,
+        owner_fi: Option<usize>,
+        base: &str,
+        elem: &str,
+    ) -> std::result::Result<Option<Value>, Error> {
+        let key = self.array_stamp_key(base);
+        let gen0 = self.array_generations.get(&key).copied();
+        let alive = |t: &Self| match owner_fi {
+            Some(i) => t.frames.get(i).map(|f| f.locals.contains_key(base)),
+            None => Some(t.globals.contains_key(base)),
+        };
+        let scripts = self.collect_trace_scripts(&key, Some(elem), "read");
+        let q = |v: &str| Value::from_list(&[Value::from_str(v)]).as_str().to_string();
+        let mut recreated = false;
+        for s in scripts.into_iter().rev() {
+            let cmd = format!("{} {} {} {}", s, q(base), q(elem), "read");
+            if self.eval(&cmd).is_err() {
+                return Ok(None);
+            }
+            match alive(self) {
+                None | Some(false) => {
+                    return Err(Error::runtime(
+                        format!("can't read \"{}({})\": no such variable", base, elem),
+                        ErrorCode::Generic,
+                    ));
+                }
+                Some(true) => {}
+            }
+            if self.array_generations.get(&key).copied() != gen0 {
+                recreated = true;
+            }
+        }
+        if recreated {
+            return Ok(None);
+        }
+        let ekey = format!("{}({})", base, elem);
+        Ok(match owner_fi {
+            Some(i) => self.frames.get(i).and_then(|f| f.locals.get(&ekey)).cloned(),
+            None => self.globals.get(&ekey).cloned(),
+        })
     }
 
     /// A trace on an element was satisfied: the element now has a real

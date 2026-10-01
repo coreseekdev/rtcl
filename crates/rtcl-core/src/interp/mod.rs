@@ -215,6 +215,10 @@ pub struct Interp {
     pub(crate) array_searches: HashMap<String, ArraySearchList>,
     /// Mutation counters per array (element-set changes invalidate searches).
     pub(crate) array_stamps: HashMap<String, u64>,
+    /// Container-generation counters per array, bumped on array-level
+    /// create/destroy only (`array get` uses them to spot a callback that
+    /// destroyed and recreated the array — snapshot elements then skip).
+    pub(crate) array_generations: HashMap<String, u64>,
     /// Whole-variable traces keyed by the owning scope's stamp key.
     pub(crate) var_traces: HashMap<String, Vec<VarTrace>>,
     /// Element-specific traces: stamp key → element name → traces.
@@ -365,6 +369,7 @@ impl Interp {
             array_globals: HashSet::new(),
             array_searches: HashMap::new(),
             array_stamps: HashMap::new(),
+            array_generations: HashMap::new(),
             var_traces: HashMap::new(),
             elem_traces: HashMap::new(),
             trace_phantoms: HashMap::new(),

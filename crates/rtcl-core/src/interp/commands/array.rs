@@ -263,28 +263,37 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Some(i) => &interp.frames[i].locals,
                 None => &interp.globals,
             };
-            let vars: Vec<(String, Value)> = table
-                .iter()
-                .filter_map(|(k, v)| {
+            // Element-name snapshot: callbacks that add elements during
+            // the get don't join this enumeration (trace-1.11: the read
+            // trace's `set x(foo) 1` never shows up in the same get).
+            let vars: Vec<String> = table
+                .keys()
+                .filter_map(|k| {
                     if k.starts_with(&prefix) && k.ends_with(')') {
                         let elem = &k[prefix.len()..k.len() - 1];
-                        if let Some(pat) = pattern {
-                            if glob_match(pat, elem) {
-                                Some((elem.to_string(), v.clone()))
-                            } else {
-                                None
-                            }
-                        } else {
-                            Some((elem.to_string(), v.clone()))
+                        match pattern {
+                            Some(pat) if glob_match(pat, elem) => Some(elem.to_string()),
+                            Some(_) => None,
+                            None => Some(elem.to_string()),
                         }
                     } else {
                         None
                     }
                 })
                 .collect();
-            for (elem, val) in vars {
-                result.push(Value::from_str(&elem));
-                result.push(val);
+            for elem in vars {
+                // Each element is read through the traced access path —
+                // per-element read traces fire with tclsh's interleaved
+                // abort/skip semantics (`array names`/`array size` read
+                // no values and fire none).
+                match interp.array_get_element(owner_fi, &base, &elem) {
+                    Ok(Some(val)) => {
+                        result.push(Value::from_str(&elem));
+                        result.push(val);
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(e),
+                }
             }
             Ok(Value::from_list(&result))
         }

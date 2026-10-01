@@ -842,6 +842,15 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Some(p) => (Some(p.strip_prefix("::").unwrap_or(p)), p.starts_with("::")),
                 None => (None, false),
             };
+            // A `::`-qualified pattern searches the namespace/global table
+            // even from inside a proc (tclsh trace-18.4: a proc's
+            // `info vars ::ref::*` lists ::ref's variables — the frame's
+            // locals never carry a qualified name).
+            let source = if qualified {
+                &interp.globals
+            } else {
+                interp.scope_vars()
+            };
             // At namespace scope the namespace's own variables report
             // relative (tclsh: inside `namespace eval nn`, `info vars`
             // lists `zz`, not `::nn::zz` — var-1.14); variables of child
@@ -851,8 +860,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             } else {
                 None
             };
-            let mut vars: Vec<Value> = interp
-                .scope_vars()
+            let mut vars: Vec<Value> = source
                 .keys()
                 .filter_map(|name| {
                     // Bare `info vars` at the global level lists only true

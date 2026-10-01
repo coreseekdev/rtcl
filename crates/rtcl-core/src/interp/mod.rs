@@ -11,6 +11,7 @@
 //! - [`commands`] submodules: individual command implementations
 
 pub mod commands;
+pub mod unicode;
 mod registry;
 mod vars;
 mod eval;

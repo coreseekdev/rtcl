@@ -52,54 +52,16 @@ pub fn backslash_subst(cur: &mut Cursor) -> char {
         }
         Token::Other('u') => {
             cur.advance(); // skip 'u'
-            let start = cur.pos();
-            let mut count = 0;
-            while count < 4 {
-                let ch = match cur.peek() {
-                    Token::Other(c) => c,
-                    _ => break,
-                };
-                if ch.is_ascii_hexdigit() {
-                    cur.advance();
-                    count += 1;
-                } else {
-                    break;
-                }
-            }
-            if count == 0 {
-                'u'
-            } else {
-                let hex = cur.slice(start);
-                u32::from_str_radix(hex, 16)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .unwrap_or('u')
+            match parse_hex(cur, 4) {
+                Some(value) => escape_char(value),
+                None => 'u',
             }
         }
         Token::Other('U') => {
             cur.advance(); // skip 'U'
-            let start = cur.pos();
-            let mut count = 0;
-            while count < 8 {
-                let ch = match cur.peek() {
-                    Token::Other(c) => c,
-                    _ => break,
-                };
-                if ch.is_ascii_hexdigit() {
-                    cur.advance();
-                    count += 1;
-                } else {
-                    break;
-                }
-            }
-            if count == 0 {
-                'U'
-            } else {
-                let hex = cur.slice(start);
-                u32::from_str_radix(hex, 16)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .unwrap_or('U')
+            match parse_hex(cur, 8) {
+                Some(value) => escape_char(value),
+                None => 'U',
             }
         }
         Token::Other(c) if c.is_ascii_digit() && c <= '7' => {
@@ -121,6 +83,50 @@ pub fn backslash_subst(cur: &mut Cursor) -> char {
             // Unknown escape: return the character literally
             cur.advance_char().unwrap_or('\\')
         }
+    }
+}
+
+/// ParseHex (tclParse.c): consume up to `max` hex digits, stopping early once
+/// the accumulator exceeds 0x10FFF — digits past that stay in the stream and
+/// surface as literal characters ("\UFFFFFFFF" is U+FFFD followed by "FFF",
+/// "\U00110000" is U+FFFD followed by "0"). Returns None when no hex digit
+/// was consumed (the escape letter is then returned literally).
+fn parse_hex(cur: &mut Cursor, max: usize) -> Option<u32> {
+    let mut result = 0u32;
+    let mut count = 0;
+    while count < max {
+        let ch = match cur.peek() {
+            Token::Other(c) => c,
+            _ => break,
+        };
+        let digit = match ch.to_digit(16) {
+            Some(d) => d,
+            None => break,
+        };
+        if result > 0x10FFF {
+            break;
+        }
+        cur.advance();
+        result = (result << 4) | digit;
+        count += 1;
+    }
+    if count == 0 {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+/// Encode a \u/\U value. tclsh's default 8.6 build (TCL_UTF_MAX < 4) clamps
+/// values above 0xFFFF to U+FFFD, and Rust chars cannot hold unpaired
+/// surrogates at all (tclsh keeps them internally, but they never survive a
+/// round-trip through a script), so both become U+FFFD. This makes
+/// "\UD842" and "\uD842" compare equal, as in tclsh.
+fn escape_char(value: u32) -> char {
+    if value > 0xFFFF || (0xD800..=0xDFFF).contains(&value) {
+        '\u{FFFD}'
+    } else {
+        char::from_u32(value).unwrap_or('\u{FFFD}')
     }
 }
 

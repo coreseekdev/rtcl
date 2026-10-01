@@ -61,6 +61,41 @@ pub(crate) enum Engine {
     Full(super::regexp_bt::BtProg),
 }
 
+/// Does the pattern use constructs whose membership follows tclsh's Unicode
+/// category tables? POSIX `[[:class:]]` bracket classes are ASCII-only in the
+/// `regex` crate but Unicode-aware in Tcl, and `\w`/`\W`/`\s`/`\S` disagree
+/// with Tcl's tables on marks, format chars and connector punctuation —
+/// such patterns are routed to the backtracking engine, which shares
+/// `crate::interp::unicode` with `string is`.
+#[cfg(feature = "regexp")]
+fn uses_tcl_unicode_classes(pat: &str) -> bool {
+    let b = pat.as_bytes();
+    let (mut in_class, mut i) = (false, 0);
+    while i < b.len() {
+        match b[i] {
+            b'\\' if i + 1 < b.len() => {
+                match b[i + 1] {
+                    // `\\w` is a literal backslash + `w`, not the class.
+                    b'\\' => i += 2,
+                    b'w' | b'W' | b's' | b'S' => return true,
+                    _ => i += 2,
+                }
+            }
+            b'[' => {
+                in_class = true;
+                i += 1;
+            }
+            b':' if in_class && i >= 2 && b[i - 1] == b'[' => return true, // [[:class:]]
+            b']' => {
+                in_class = false;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// Compile with the fast engine first; on a compile error, retry with the
 /// backtracking engine. The reported error is the fast engine's.
 #[cfg(feature = "regexp")]
@@ -71,6 +106,11 @@ pub(crate) fn compile_engine(
     lineanchor: bool,
     linestop: bool,
 ) -> std::result::Result<Engine, String> {
+    // Tcl-Unicode class semantics live only in the backtracking engine.
+    if uses_tcl_unicode_classes(pattern) {
+        return super::regexp_bt::bt_compile(pattern, nocase, expanded, lineanchor, linestop)
+            .map(Engine::Full);
+    }
     let built = build_pattern(pattern, nocase, expanded, lineanchor, linestop);
     match regex::Regex::new(&built) {
         Err(fe) => super::regexp_bt::bt_compile(pattern, nocase, expanded, lineanchor, linestop)

@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::interp::commands::list::{bad_index, parse_tcl_index, tcl_get_int};
+use crate::interp::unicode;
 use crate::interp::{glob_match, Interp};
 use crate::value::Value;
 
@@ -19,12 +20,25 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "tolower" => Ok(Value::from_str(&str_val.to_lowercase())),
         "toupper" => Ok(Value::from_str(&str_val.to_uppercase())),
         "totitle" => {
+            // Tcl_UtfToTitle (tclUtf.c): title-case the first character,
+            // lowercase the rest — with one explicit exception: Georgian
+            // Mtavruli (U+1C90..U+1CBF) are left untouched in the tail
+            // ("Special exception for Georgian Asomtavruli chars, no
+            // titlecase"), even though `string tolower` maps them to
+            // Mkhedruli.
             let mut chars = str_val.chars();
             let result = match chars.next() {
                 Some(first) => {
                     let mut s = String::new();
                     s.push(to_titlecase(first));
-                    s.push_str(&chars.as_str().to_lowercase());
+                    for c in chars.as_str().chars() {
+                        // Georgian Mtavruli: exempt from tail lowercasing.
+                        if ('\u{1C90}'..='\u{1CBF}').contains(&c) {
+                            s.push(c);
+                        } else {
+                            s.push(to_lower_simple(c));
+                        }
+                    }
                     s
                 }
                 None => String::new(),
@@ -291,18 +305,20 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "integer" | "int" | "wideinteger" => is_tcl_integer(test_val),
                 "double" | "real" => test_val.parse::<f64>().is_ok(),
                 "boolean" | "bool" | "true" | "false" => is_tcl_boolean(test_val),
-                "alpha" => !test_val.is_empty() && test_val.chars().all(|c| c.is_alphabetic()),
-                "alnum" => !test_val.is_empty() && test_val.chars().all(|c| c.is_alphanumeric()),
-                "digit" => !test_val.is_empty() && test_val.chars().all(|c| c.is_ascii_digit()),
+                // Unicode classes follow tclsh's category tables (see
+                // interp::unicode): digit is any Nd, control is Cc|Cf, etc.
+                "alpha" => !test_val.is_empty() && test_val.chars().all(|c| unicode::is_alpha(c)),
+                "alnum" => !test_val.is_empty() && test_val.chars().all(|c| unicode::is_alnum(c)),
+                "digit" => !test_val.is_empty() && test_val.chars().all(|c| unicode::is_digit(c)),
                 "upper" => !test_val.is_empty() && test_val.chars().all(|c| c.is_uppercase()),
                 "lower" => !test_val.is_empty() && test_val.chars().all(|c| c.is_lowercase()),
-                "space" => !test_val.is_empty() && test_val.chars().all(|c| c.is_whitespace()),
+                "space" => !test_val.is_empty() && test_val.chars().all(|c| unicode::is_space(c)),
                 "ascii" => !test_val.is_empty() && test_val.is_ascii(),
-                "print" => !test_val.is_empty() && test_val.chars().all(|c| !c.is_control()),
-                "control" => !test_val.is_empty() && test_val.chars().all(|c| c.is_control()),
+                "print" => !test_val.is_empty() && test_val.chars().all(|c| unicode::is_print(c)),
+                "control" => !test_val.is_empty() && test_val.chars().all(|c| unicode::is_control(c)),
                 "xdigit" => !test_val.is_empty() && test_val.chars().all(|c| c.is_ascii_hexdigit()),
-                "graph" => !test_val.is_empty() && test_val.chars().all(|c| !c.is_whitespace() && !c.is_control()),
-                "punct" => !test_val.is_empty() && test_val.chars().all(|c| c.is_ascii_punctuation()),
+                "graph" => !test_val.is_empty() && test_val.chars().all(|c| unicode::is_graph(c)),
+                "punct" => !test_val.is_empty() && test_val.chars().all(|c| unicode::is_punct(c)),
                 "list" => Value::from_str(test_val).as_list().is_some(),
                 _ => return Err(Error::runtime(
                     format!("bad class \"{}\": must be alnum, alpha, ascii, boolean, control, digit, double, graph, integer, list, lower, print, punct, space, upper, wideinteger, or xdigit", class),
@@ -451,13 +467,31 @@ fn rfind_chars(haystack: &[char], needle: &str, last: usize) -> Option<usize> {
         .find(|&i| haystack[i..i + nchars.len()] == nchars[..])
 }
 
-/// Tcl titlecase: simple (1:1) uppercase mapping, with digraphs mapped to
-/// their titlecase form. Characters whose uppercase expands to multiple
-/// chars (ß, ﬀ, ...) are left unchanged, matching Tcl's simple case tables.
+/// Tcl titlecase (UCS4ToTitle, tclUtf.c): only Ll characters with a simple
+/// (1:1) uppercase move; Lu and Lt characters are already "titled", and
+/// characters whose uppercase expands to multiple chars (ß, ﬀ, ...) have no
+/// entry in Tcl's table, so they stay. Georgian Mkhedruli (U+10D0..U+10FF)
+/// carry Tcl's special case mode 0x7: `string toupper` maps them to Mtavruli
+/// but their titlecase is themselves.
 fn to_titlecase(c: char) -> char {
+    // The uppercase paired digraphs (ǄǇǊǱ, table mode 0x3) titlecase to the
+    // following title form (+1), even though they are Lu and all other Lu
+    // characters are returned unchanged.
+    match c {
+        'Ǆ' => return 'ǅ',
+        'Ǉ' => return 'ǈ',
+        'Ǌ' => return 'ǋ',
+        'Ǳ' => return 'ǲ',
+        _ => {}
+    }
+    if ('\u{10D0}'..='\u{10FF}').contains(&c) || !unicode::is_ll(c) {
+        return c;
+    }
     let mut up = c.to_uppercase();
     match (up.next(), up.next()) {
         (Some(u), None) => match u {
+            // Digraph letters: Tcl's titlecase is the following title form
+            // (ǳ→ǲ, ǆ→ǅ, ǉ→ǈ, ǌ→ǋ), not the plain capital digraph.
             'Ǳ' => 'ǲ',
             'Ǆ' => 'ǅ',
             'Ǉ' => 'ǈ',
@@ -466,6 +500,13 @@ fn to_titlecase(c: char) -> char {
         },
         _ => c,
     }
+}
+
+/// Tcl's simple per-character lowercase (TclUCS4ToLower): the first char of
+/// the (possibly full) mapping is the simple mapping in every current
+/// Unicode case-expansion (e.g. U+0130 -> "i\u{307}", simple U+0069).
+fn to_lower_simple(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
 }
 
 /// Tcl boolean: 0/1 or an unambiguous prefix of true/false/yes/no/on/off

@@ -8,6 +8,8 @@
 //! preference order (matching what the fast engine produces for the
 //! patterns both accept).
 
+use crate::interp::unicode;
+
 /// Character-class predicate.
 #[derive(Clone)]
 enum Pred {
@@ -38,22 +40,24 @@ impl Pred {
             Pred::Range(a, b) => {
                 (*a..=*b).contains(&c) || (nocase && (*a..=*b).contains(&lower_var(c)))
             }
-            Pred::Digit => c.is_ascii_digit(),
-            Pred::NotDigit => !c.is_ascii_digit(),
-            Pred::Word => is_word(c),
-            Pred::NotWord => !is_word(c),
-            Pred::Space => matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'),
-            Pred::NotSpace => !matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'),
-            Pred::Alpha => c.is_alphabetic(),
-            Pred::Alnum => c.is_alphanumeric(),
+            // Class membership follows tclsh's Unicode category tables
+            // (see crate::interp::unicode), not Rust's char predicates.
+            Pred::Digit => unicode::is_digit(c),
+            Pred::NotDigit => !unicode::is_digit(c),
+            Pred::Word => unicode::is_word(c),
+            Pred::NotWord => !unicode::is_word(c),
+            Pred::Space => unicode::is_space(c),
+            Pred::NotSpace => !unicode::is_space(c),
+            Pred::Alpha => unicode::is_alpha(c),
+            Pred::Alnum => unicode::is_alnum(c),
             Pred::Upper => c.is_uppercase(),
             Pred::Lower => c.is_lowercase(),
-            Pred::XDigit => c.is_ascii_hexdigit(),
-            Pred::Punct => c.is_ascii_punctuation(),
-            Pred::Print => !c.is_control(),
-            Pred::Graph => !c.is_control() && !c.is_whitespace(),
-            Pred::Cntrl => c.is_control(),
-            Pred::Blank => c == ' ' || c == '\t',
+            Pred::XDigit => unicode::is_xdigit(c),
+            Pred::Punct => unicode::is_punct(c),
+            Pred::Print => unicode::is_print_re(c),
+            Pred::Graph => unicode::is_graph(c),
+            Pred::Cntrl => unicode::is_control(c),
+            Pred::Blank => unicode::is_blank(c),
         }
     }
 }
@@ -68,7 +72,7 @@ fn lower_var(c: char) -> char {
 }
 
 fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+    unicode::is_word(c)
 }
 
 enum Node {

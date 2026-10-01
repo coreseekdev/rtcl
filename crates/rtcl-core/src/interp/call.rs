@@ -389,10 +389,10 @@ impl Interp {
                 if e.is_return() {
                     match &e {
                         Error::ControlFlow { level, value, error_info, error_code, .. } => {
-                            // Propagate -errorinfo / -errorcode to global variables
-                            if let Some(info) = error_info {
-                                let _ = self.set_var("::errorInfo", Value::from_str(info));
-                            }
+                            // Propagate -errorcode to the global variable;
+                            // -errorinfo only rides along with an actual
+                            // error completion (a `return -code ok
+                            // -errorinfo ...` leaves ::errorInfo alone).
                             if let Some(code) = error_code {
                                 let _ = self.set_var("::errorCode", Value::from_str(code));
                                 self.err_code_raised = true;
@@ -412,6 +412,17 @@ impl Interp {
                                 1 => {
                                     // return -code error "msg" → propagate as error,
                                     // preserving any -errorinfo / -errorcode options.
+                                    // A -errorinfo option REPLACES the auto-built
+                                    // `msg\n    while executing` base of the
+                                    // errorInfo (tclsh TclProcessReturn); the
+                                    // enclosing-command frames still append to it.
+                                    if let Some(info) = error_info {
+                                        self.err_info = Some(info.clone());
+                                        self.err_fresh = false;
+                                    }
+                                    if let Some(info) = error_info {
+                                        let _ = self.set_var("::errorInfo", Value::from_str(info));
+                                    }
                                     Err(Error::ControlFlow {
                                         kind: crate::error::ControlFlow::Error,
                                         value: Some(val),

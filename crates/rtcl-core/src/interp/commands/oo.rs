@@ -1907,23 +1907,34 @@ fn class_methods_listing(interp: &Interp, key: &str, all: bool, private: bool) -
 /// through to the `::oo::object` core `unknown` dispatcher, which tclsh
 /// reports as owner `::oo::object` with kind `{core method: "unknown"}`;
 /// likewise core dispatchers report `{core method: "destroy"}` &c.
-fn call_chain_item(kind: &str, name: &str, owner: &str, def: Option<&MethodDef>) -> Value {
-    let owner_kind = match def {
-        Some(MethodDef { kind: MethodKind::Builtin(b), .. }) => {
-            format!("{{core method: \"{}\"}}", b)
-        }
-        _ => "method".to_string(),
-    };
+fn call_chain_item(kind: &str, name: &str, owner: &str, detail: &str) -> Value {
     Value::from_list(&[
         Value::from_str(kind),
         Value::from_str(name),
         Value::from_str(owner),
-        Value::from_str(&owner_kind),
+        // tclsh appends the raw string (`core method: "destroy"`); the
+        // braces seen in `puts` output are the enclosing list's quoting,
+        // so they must NOT be part of the element value.
+        Value::from_str(detail),
     ])
 }
 
+/// The 4th descriptor word for a chain entry: `method` for Tcl/forward
+/// bodies, `core method: "B"` for a core behaviour B.
+fn call_entry_detail(def: &MethodDef) -> String {
+    match &def.kind {
+        MethodKind::Builtin(b) => format!("core method: \"{}\"", b),
+        _ => "method".to_string(),
+    }
+}
+
 fn call_unknown_item() -> Value {
-    call_chain_item("unknown", "unknown", "::oo::object", None)
+    call_chain_item(
+        "unknown",
+        "unknown",
+        "::oo::object",
+        "core method: \"unknown\"",
+    )
 }
 
 fn owner_word(owner: &Owner) -> String {
@@ -2036,11 +2047,21 @@ fn call_chain_desc(interp: &Interp, key: &str, method: &str, class_instance: boo
     let mut items: Vec<Value> = Vec::new();
     for fname in call_filter_names(interp, key, class_instance) {
         if let Some(e) = chain_of(&fname).first() {
-            items.push(call_chain_item("filter", &fname, &owner_word(&e.owner), Some(&e.def)));
+            items.push(call_chain_item(
+                "filter",
+                &fname,
+                &owner_word(&e.owner),
+                &call_entry_detail(&e.def),
+            ));
         }
     }
     match chain_of(method).first() {
-        Some(e) => items.push(call_chain_item("method", method, &owner_word(&e.owner), Some(&e.def))),
+        Some(e) => items.push(call_chain_item(
+            "method",
+            method,
+            &owner_word(&e.owner),
+            &call_entry_detail(&e.def),
+        )),
         None => items.push(call_unknown_item()),
     }
     Value::from_list(&items)
@@ -2214,7 +2235,12 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let typed = args[3].as_str();
-            let key = resolve_object_arg(interp, typed)?;
+            let key = resolve_object_key(interp, typed).ok_or_else(|| {
+                // tclsh pairs the message with errorCode
+                // `TCL LOOKUP OBJECT <name>`.
+                super::list::set_error_code(interp, &format!("TCL LOOKUP OBJECT {}", typed));
+                does_not_refer(true, typed)
+            })?;
             Ok(call_chain_desc(interp, &key, args[4].as_str(), false))
         }
         // definition / forward / methodtype are not modelled; report them
@@ -2359,9 +2385,14 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let typed = args[3].as_str();
-            let key =
-                resolve_object_key(interp, typed).ok_or_else(|| does_not_refer(true, typed))?;
+            let key = resolve_object_key(interp, typed).ok_or_else(|| {
+                super::list::set_error_code(interp, &format!("TCL LOOKUP OBJECT {}", typed));
+                does_not_refer(true, typed)
+            })?;
             if !interp.oo.classes.contains_key(&key) {
+                // Not-a-class: `TCL LOOKUP CLASS <name>` accompanies the
+                // message.
+                super::list::set_error_code(interp, &format!("TCL LOOKUP CLASS {}", typed));
                 return Err(Error::Msg(format!("\"{}\" is not a class", typed)));
             }
             Ok(call_chain_desc(interp, &key, args[4].as_str(), true))

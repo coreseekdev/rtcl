@@ -508,7 +508,13 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             Ok(())
         }
-        expand(&args[1..1 + num_option_words], &mut opts)?;
+        expand(&args[1..1 + num_option_words], &mut opts).map_err(|e| {
+            // A malformed -options value is a RESULT-family error
+            // (tclsh: `return -options {-code} x` → TCL RESULT
+            // ILLEGAL_OPTIONS).
+            set_error_code(_interp, "TCL RESULT ILLEGAL_OPTIONS");
+            e
+        })?;
     }
 
     let get = |name: &str| -> Option<&Value> {
@@ -524,12 +530,20 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "return" => 2,
             "break" => 3,
             "continue" => 4,
-            _ => c.parse::<i32>().map_err(|_| {
-                Error::runtime(
-                    format!("bad completion code \"{}\": must be ok, error, return, break, continue, or an integer", c),
-                    crate::error::ErrorCode::Generic,
-                )
-            })?,
+            // Integers go through Tcl's integer parser (hex `0x2` and
+            // 64-bit words accepted) and truncate to the C int the
+            // completion code travels in (`3000000000` → -1294967296);
+            // anything else is a TCL RESULT ILLEGAL_CODE error.
+            _ => match super::list::tcl_get_int(c) {
+                Some(v) => v as i32,
+                None => {
+                    set_error_code(_interp, "TCL RESULT ILLEGAL_CODE");
+                    return Err(Error::runtime(
+                        format!("bad completion code \"{}\": must be ok, error, return, break, continue, or an integer", c),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+            },
         });
     }
 
@@ -572,6 +586,7 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // tclsh validates the value as a list before installing it
         // as errorCode (result-6.3).
         if v.as_list_strict().is_err() {
+            set_error_code(_interp, "TCL RESULT ILLEGAL_ERRORCODE");
             return Err(Error::runtime(
                 format!(
                     "bad -errorcode value: expected a list but got \"{}\"",
@@ -686,8 +701,14 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // The catch consumed the propagation — no deferred
             // enclosing-command frame can reach the top-level report.
             interp.err_pending_top = None;
+            // Only an ERROR completion touches ::errorInfo — a caught
+            // break/continue/plain-return leaves whatever is in there
+            // alone (tclsh: catching `return -code break x` does not
+            // clobber a previously accumulated errorInfo).
             let error_info = accumulated.unwrap_or_else(|| e.message_text());
-            let _ = interp.set_var("::errorInfo", Value::from_str(&error_info));
+            if interp.err_is_error(&e) {
+                let _ = interp.set_var("::errorInfo", Value::from_str(&error_info));
+            }
             // ::errorCode: a raise site that installed it (scan formats,
             // exec CHILDSTATUS, `error`, `return -errorcode`) wins;
             // otherwise the error variant derives it (TCL WRONGARGS,

@@ -5,7 +5,7 @@ use crate::interp::Interp;
 use crate::value::Value;
 use rtcl_parser::Compiler;
 
-use super::list::{set_error_code, tcl_get_int};
+use super::list::{set_error_code, tcl_err, tcl_get_int};
 
 /// Get the hostname (cross-platform via environment variables).
 #[cfg(feature = "std")]
@@ -1873,7 +1873,7 @@ struct ScanSpec {
 
 fn scan_err(msg: &str, code: &str, interp: &mut Interp) -> Error {
     super::list::set_error_code(interp, code);
-    super::list::tcl_err(msg.to_string())
+    tcl_err(msg.to_string())
 }
 
 /// tclScan.c ValidateFormat: check the format and compute how many result
@@ -2784,6 +2784,148 @@ fn acc_signed(s: &[char], start: usize, limit: usize, base: u32) -> NumScan {
         return NumScan::Fail(i);
     }
     NumScan::Ok(finish_u64(mag, ovf, neg), i - start)
+}
+
+// ── ::tcl::pkgconfig ────────────────────────────────────────────────────
+
+/// Build-configuration table for `::tcl::pkgconfig` (tclPkgConfig.c).
+/// Key order and values mirror the reference oracle build (tclsh 8.6.17,
+/// Debian) so `pkgconfig list` / `get` render byte-identically; the corpus
+/// pins determinism only, byte-parity is the target. Keys are looked up
+/// case-sensitively (tclsh: `get LIST` → key not known).
+const PKG_CONFIG: &[(&str, &str)] = &[
+    ("debug", "0"),
+    ("threaded", "1"),
+    ("profiled", "0"),
+    ("64bit", "0"),
+    ("optimized", "1"),
+    ("mem_debug", "0"),
+    ("compile_debug", "0"),
+    ("compile_stats", "0"),
+    ("libdir,runtime", "/usr/lib/x86_64-linux-gnu"),
+    ("bindir,runtime", "/usr/bin"),
+    ("scriptdir,runtime", "/usr/share/tcltk/tcl8.6"),
+    ("includedir,runtime", "/usr/include/tcl8.6"),
+    ("docdir,runtime", "/usr/share/man"),
+    ("libdir,install", "/usr/lib/x86_64-linux-gnu"),
+    ("bindir,install", "/usr/bin"),
+    ("scriptdir,install", "/usr/share/tcltk/tcl8.6"),
+    ("includedir,install", "/usr/include/tcl8.6"),
+    ("docdir,install", "/usr/share/man"),
+];
+
+/// `::tcl::pkgconfig subcommand ?arg ...?` — build-configuration query.
+/// Decoded from tclsh 8.6.17 (probes in judge/probes/pkgconfig_probe.tcl):
+/// - usage messages embed the *invoked* spelling (`objv[0]`): unqualified
+///   `tcl::pkgconfig` reports `should be "tcl::pkgconfig ..."`.
+/// - subcommand resolution is Tcl_GetIndexFromObj-style: exact, else unique
+///   prefix (`ge`→get, `l`→list); empty string is ambiguous ("g" vs "l"
+///   both match → `ambiguous subcommand`); case-sensitive (`GET`/`LIST`
+///   fail as `bad subcommand`).
+/// - arity table (both subcommands fold overflow onto the generic usage):
+///   no subcommand → `subcommand ?arg?`; `list` +1 extra → `cmd list`,
+///   +≥2 → generic; `get` +0 → `cmd get key`, +≥2 → generic.
+/// - unknown key → `key not known` + `TCL LOOKUP CONFIG <key>`
+///   (case-sensitive); lookup failures carry `TCL LOOKUP INDEX`/`CONFIG`
+///   built as proper lists so empty/space elements brace (tclsh renders
+///   `subcommand {}` / `CONFIG {a b}`).
+pub fn cmd_pkgconfig(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let invoked = args[0].as_str();
+    if args.len() < 2 {
+        return Err(pkgconfig_wrong(
+            interp,
+            format!("wrong # args: should be \"{invoked} subcommand ?arg?\""),
+        ));
+    }
+    let sub = args[1].as_str();
+    match pkgconfig_resolve_sub(sub) {
+        Ok("list") => match args.len() {
+            2 => {
+                let keys: Vec<Value> = PKG_CONFIG
+                    .iter()
+                    .map(|(k, _)| Value::from_str(k))
+                    .collect();
+                Ok(Value::from_list(&keys))
+            }
+            3 => Err(pkgconfig_wrong(
+                interp,
+                format!("wrong # args: should be \"{invoked} list\""),
+            )),
+            // Overflow folds back onto the ensemble-level usage.
+            _ => Err(pkgconfig_wrong(
+                interp,
+                format!("wrong # args: should be \"{invoked} subcommand ?arg?\""),
+            )),
+        },
+        // Only "get" remains — resolve_sub yields "get"/"list" exclusively.
+        Ok(_) => match args.len() {
+            2 => Err(pkgconfig_wrong(
+                interp,
+                format!("wrong # args: should be \"{invoked} get key\""),
+            )),
+            3 => {
+                let key = args[2].as_str();
+                match PKG_CONFIG.iter().find(|(k, _)| *k == key) {
+                    Some((_, val)) => Ok(Value::from_str(val)),
+                    None => {
+                        set_error_code(interp, &pkgconfig_code(&["TCL", "LOOKUP", "CONFIG", key]));
+                        Err(tcl_err("key not known"))
+                    }
+                }
+            }
+            _ => Err(pkgconfig_wrong(
+                interp,
+                format!("wrong # args: should be \"{invoked} subcommand ?arg?\""),
+            )),
+        },
+        Err(ambiguous) => {
+            let verb = if ambiguous { "ambiguous" } else { "bad" };
+            set_error_code(
+                interp,
+                &pkgconfig_code(&["TCL", "LOOKUP", "INDEX", "subcommand", sub]),
+            );
+            Err(tcl_err(format!(
+                "{verb} subcommand \"{sub}\": must be get or list"
+            )))
+        }
+    }
+}
+
+/// Resolve the pkgconfig subcommand Tcl_GetIndexFromObj-style: exact match
+/// first, else unique non-empty prefix. `None` = no match; `Some(true)` =
+/// ambiguous prefix (only the empty string, "g"/"l" leave nothing shared).
+fn pkgconfig_resolve_sub(sub: &str) -> core::result::Result<&'static str, bool> {
+    const SUBS: [&str; 2] = ["get", "list"];
+    if let Some(found) = SUBS.iter().find(|s| **s == sub) {
+        return Ok(found);
+    }
+    // Empty string prefix-matches every entry (tclsh: `pkgconfig ""` →
+    // ambiguous subcommand).
+    let matches: Vec<&str> = SUBS
+        .iter()
+        .copied()
+        .filter(|s| s.starts_with(sub))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [] => Err(false),
+        _ => Err(true),
+    }
+}
+
+/// Render a `TCL LOOKUP ...` errorCode as a list string so
+/// empty/brace-needing elements render like tclsh (`subcommand {}`,
+/// `CONFIG {a b}`).
+fn pkgconfig_code(parts: &[&str]) -> String {
+    Value::from_list(&parts.iter().map(|p| Value::from_str(p)).collect::<Vec<_>>())
+        .as_str()
+        .to_string()
+}
+
+/// Wrong-args failure for pkgconfig: message as decoded + `TCL WRONGARGS`.
+fn pkgconfig_wrong(interp: &mut Interp, msg: String) -> Error {
+    set_error_code(interp, "TCL WRONGARGS");
+    tcl_err(msg)
 }
 
 #[cfg(test)]

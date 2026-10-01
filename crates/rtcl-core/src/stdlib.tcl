@@ -229,3 +229,56 @@ proc {namespace inscope} {ns args} {
 proc popen {cmd {mode "r"}} {
     open |$cmd $mode
 }
+
+# ── auto_qualify (tclsh 8.6 init.tcl, verbatim port) ────────────────────
+
+# auto_qualify — Fully-qualified command-name candidates for auto lookup.
+# Decoded semantics (tclsh 8.6.17, gen_init-1.x):
+#   1. Runs of >=2 colons collapse to `::`; n = substitution count
+#      (`:::foo::::bar` -> `::foo::bar`, n=2).
+#   2. Leading `::` names: n>1 returns the normalized name alone
+#      (already global-qualified); n<=1 returns the tail after `::`
+#      (`::global` -> `global` — a bare global name needs no candidates).
+#   3. Unqualified names: n=0 (no separators) -> current-namespace
+#      candidate + bare name (skipped when the namespace IS `::`);
+#      n>0 -> current-namespace candidate + `::`-qualified global
+#      candidate (plain `::$cmd` when the namespace IS `::`).
+# Ported from tcl/library/init.tcl (Tcl 8.6) — auto_load/unknown rely on
+# this exact candidate list.
+proc auto_qualify {cmd namespace} {
+    # count separators and clean them up
+    # (making sure that foo:::::bar will be treated as foo::bar)
+    set n [regsub -all {::+} $cmd :: cmd]
+
+    # Ignore namespace if the name starts with ::
+    # Handle special case of only leading ::
+
+    if {[string match ::* $cmd]} {
+        if {$n > 1} {
+            # (::foo::bar , *) -> ::foo::bar
+            return [list $cmd]
+        } else {
+            # (::global , *) -> global
+            return [list [string range $cmd 2 end]]
+        }
+    }
+
+    # Potentially returning 2 elements to try  :
+    # (if the current namespace is not the global one)
+
+    if {$n == 0} {
+        if {$namespace eq "::"} {
+            # (nocolons , ::) -> nocolons
+            return [list $cmd]
+        } else {
+            # (nocolons , ::sub) -> ::sub::nocolons nocolons
+            return [list ${namespace}::$cmd $cmd]
+        }
+    } elseif {$namespace eq "::"} {
+        # (foo::bar , ::) -> ::foo::bar
+        return [list ::$cmd]
+    } else {
+        # (foo::bar , ::sub) -> ::sub::foo::bar ::foo::bar
+        return [list ${namespace}::$cmd ::$cmd]
+    }
+}

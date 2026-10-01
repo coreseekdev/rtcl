@@ -5,6 +5,8 @@ use crate::interp::Interp;
 use crate::value::Value;
 use rtcl_parser::Compiler;
 
+use super::list::{set_error_code, tcl_get_int};
+
 /// Get the hostname (cross-platform via environment variables).
 #[cfg(feature = "std")]
 fn hostname_get() -> String {
@@ -714,6 +716,14 @@ fn list_commands_in(
 
 /// tclsh's `info` subcommand list, in the order it prints on an
 /// unknown-or-ambiguous error.
+/// The expr math functions, in tclsh 8.6.17's `Tcl_ListMathFuncs` table
+/// order (deterministic per build) — `info functions` lists them.
+const EXPR_MATH_FUNCTIONS: &[&str] = &[
+    "round", "wide", "sqrt", "sin", "log10", "double", "hypot", "atan", "bool", "rand",
+    "abs", "acos", "atan2", "entier", "srand", "sinh", "log", "floor", "tanh", "tan",
+    "isqrt", "int", "asin", "min", "ceil", "cos", "cosh", "exp", "max", "pow", "fmod",
+];
+
 const INFO_CANONICAL_SUBCMDS: &[&str] = &[
     "args", "body", "class", "cmdcount", "commands", "complete", "coroutine", "default",
     "errorstack", "exists", "frame", "functions", "globals", "hostname", "level", "library",
@@ -767,10 +777,26 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let subcmd = resolve_info_subcmd(args[1].as_str())?;
     match subcmd.as_str() {
         "commands" => {
+            if args.len() > 3 {
+                return Err(Error::wrong_args_with_usage(
+                    "info commands",
+                    1,
+                    args.len(),
+                    "?pattern?",
+                ));
+            }
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
             list_commands(interp, pattern)
         }
         "procs" => {
+            if args.len() > 3 {
+                return Err(Error::wrong_args_with_usage(
+                    "info procs",
+                    1,
+                    args.len(),
+                    "?pattern?",
+                ));
+            }
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
             // Import aliases count as procs (tclsh's TclGetOriginalCommand
             // check); unlike `info commands`, `info procs` never merges in
@@ -779,12 +805,25 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "exists" => {
             if args.len() != 3 {
-                return Err(Error::wrong_args("info exists", 3, args.len()));
+                return Err(Error::wrong_args_with_usage(
+                    "info exists",
+                    2,
+                    args.len(),
+                    "varName",
+                ));
             }
             let name = args[2].as_str().to_string();
             Ok(Value::from_bool(interp.exists_firing(&name)))
         }
         "vars" => {
+            if args.len() > 3 {
+                return Err(Error::wrong_args_with_usage(
+                    "info vars",
+                    1,
+                    args.len(),
+                    "?pattern?",
+                ));
+            }
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
             // A leading "::" in the pattern is scope qualification, not part
             // of the stored (canonical) key — but it does ask for qualified
@@ -847,6 +886,14 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::from_list(&vars))
         }
         "globals" => {
+            if args.len() > 3 {
+                return Err(Error::wrong_args_with_usage(
+                    "info globals",
+                    1,
+                    args.len(),
+                    "?pattern?",
+                ));
+            }
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
             let match_pat = pattern.map(|p| p.strip_prefix("::").unwrap_or(p));
             let mut vars: Vec<Value> = interp
@@ -881,7 +928,12 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "args" => {
             if args.len() != 3 {
-                return Err(Error::wrong_args("info args", 3, args.len()));
+                return Err(Error::wrong_args_with_usage(
+                    "info args",
+                    2,
+                    args.len(),
+                    "procname",
+                ));
             }
             let name = args[2].as_str();
             if let Some(key) = resolve_proc_key(interp, name) {
@@ -899,49 +951,157 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ))
             }
         }
+        "default" => {
+            if args.len() != 5 {
+                return Err(Error::wrong_args_with_usage(
+                    "info default",
+                    3,
+                    args.len(),
+                    "procname arg varname",
+                ));
+            }
+            let name = args[2].as_str();
+            let Some(key) = resolve_proc_key(interp, name) else {
+                set_error_code(interp, &format!("TCL LOOKUP PROCEDURE {}", name));
+                return Err(Error::runtime(
+                    format!("\"{}\" isn't a procedure", name),
+                    crate::error::ErrorCode::NotFound,
+                ));
+            };
+            let pname = args[3].as_str().to_string();
+            let param = interp.procs[&key]
+                .params
+                .iter()
+                .find(|(n, _)| n.as_str() == pname)
+                .map(|(_, d)| d.clone());
+            let Some(param) = param else {
+                set_error_code(interp, &format!("TCL LOOKUP ARGUMENT {}", pname));
+                return Err(Error::runtime(
+                    format!(
+                        "procedure \"{}\" doesn't have an argument \"{}\"",
+                        name, pname
+                    ),
+                    crate::error::ErrorCode::Generic,
+                ));
+            };
+            // The varname is written in the caller's (current) scope; a
+            // parameter without a default leaves it set to "".
+            let value = match &param {
+                Some(d) => Value::from_str(d),
+                None => Value::from_str(""),
+            };
+            interp.set_var(args[4].as_str(), value)?;
+            Ok(Value::from_bool(param.is_some()))
+        }
+        "functions" => {
+            if args.len() > 3 {
+                return Err(Error::wrong_args_with_usage(
+                    "info functions",
+                    1,
+                    args.len(),
+                    "?pattern?",
+                ));
+            }
+            let names: Vec<Value> = EXPR_MATH_FUNCTIONS
+                .iter()
+                .filter(|f| {
+                    args.len() < 3 || super::super::glob_match(args[2].as_str(), f)
+                })
+                .map(|f| Value::from_str(f))
+                .collect();
+            Ok(Value::from_list(&names))
+        }
+        "tclversion" => {
+            if args.len() != 2 {
+                return Err(Error::wrong_args_msg(
+                    "wrong # args: should be \"info tclversion\"",
+                ));
+            }
+            Ok(interp.globals["tcl_version"].clone())
+        }
         "level" => {
+            if args.len() > 3 {
+                return Err(Error::wrong_args_with_usage(
+                    "info level",
+                    1,
+                    args.len(),
+                    "?number?",
+                ));
+            }
             if args.len() == 2 {
-                return Ok(Value::from_int(interp.frames.len() as i64));
+                // tclsh's level count includes live `namespace eval`
+                // varFrames as well as proc calls (`namespace eval x
+                // {info level}` → 1).
+                let depth = interp.frames.len() + interp.ns_level0.len();
+                return Ok(Value::from_int(depth as i64));
             }
-            let n = args[2].as_int().ok_or_else(|| {
-                Error::runtime(format!("bad level \"{}\"", args[2].as_str()),
-                    crate::error::ErrorCode::Generic)
+            let raw = args[2].as_str();
+            let n = tcl_get_int(raw).ok_or_else(|| {
+                Error::runtime(
+                    format!("expected integer but got \"{}\"", raw),
+                    crate::error::ErrorCode::Generic,
+                )
             })?;
-            if n == 0 {
-                // `info level 0`: the innermost active frame's invocation —
-                // a proc's as-dispatched words (47.1: `::ns::a b c`) or the
-                // `namespace eval` command's source (25.9).  At the bare
-                // global level there is no frame: `bad level "0"`.
-                if let Some(frame) = interp.frames.last() {
-                    if !frame.level0.is_empty() {
-                        return Ok(Value::from_str(&frame.level0));
-                    }
-                }
-                if let Some(l0) = interp.ns_level0.last() {
-                    return Ok(Value::from_str(l0));
-                }
-                Err(Error::runtime("bad level \"0\"", crate::error::ErrorCode::Generic))
-            } else if n > 0 {
-                let depth = interp.frames.len();
-                let idx = depth.checked_sub(n as usize).ok_or_else(|| {
-                    Error::runtime(format!("bad level \"{}\"", n),
-                        crate::error::ErrorCode::Generic)
-                })?;
-                Ok(Value::from_str(&interp.frames[idx].level0))
+            let depth = (interp.frames.len() + interp.ns_level0.len()) as i64;
+            // Resolve n to a 1-based position: positive is absolute;
+            // negative counts back from the current level; 0 is the
+            // current level itself.  At the bare global level (depth 0)
+            // every explicit number is out of range.
+            let pos = if n > 0 {
+                n
+            } else if n == 0 {
+                depth
             } else {
-                Err(Error::runtime(format!("bad level \"{}\"", n),
-                    crate::error::ErrorCode::Generic))
+                depth + n
+            };
+            if pos < 1 || pos > depth {
+                return Err(Error::runtime(
+                    format!("bad level \"{}\"", raw),
+                    crate::error::ErrorCode::Generic,
+                ));
             }
+            // Rebuild the combined chronological stack: proc frames
+            // interleave with the namespace evals that enclose them —
+            // each frame's ns_depth marks how many were live at its push
+            // (`info level N` yields the proc's invocation words, 47.1,
+            // or the ns-eval command's source, 25.9).
+            let mut entries: Vec<&str> = Vec::with_capacity(depth as usize);
+            let mut consumed = 0usize;
+            for f in &interp.frames {
+                while consumed < f.ns_depth && consumed < interp.ns_level0.len() {
+                    entries.push(&interp.ns_level0[consumed]);
+                    consumed += 1;
+                }
+                entries.push(&f.level0);
+            }
+            while consumed < interp.ns_level0.len() {
+                entries.push(&interp.ns_level0[consumed]);
+                consumed += 1;
+            }
+            Ok(Value::from_str(entries[(pos - 1) as usize]))
         }
         "complete" => {
             if args.len() != 3 {
-                return Err(Error::wrong_args("info complete", 3, args.len()));
+                return Err(Error::wrong_args_with_usage(
+                    "info complete",
+                    2,
+                    args.len(),
+                    "command",
+                ));
             }
             Ok(Value::from_bool(rtcl_parser::is_complete(args[2].as_str())))
         }
         #[cfg(feature = "std")]
         "script" => Ok(Value::from_str(interp.script_name())),
         "locals" => {
+            if args.len() > 3 {
+                return Err(Error::wrong_args_with_usage(
+                    "info locals",
+                    1,
+                    args.len(),
+                    "?pattern?",
+                ));
+            }
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
             if let Some(frame) = interp.frames.last() {
                 let mut vars: Vec<Value> = frame.locals.keys()

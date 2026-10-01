@@ -5,6 +5,8 @@ use crate::error::{Error, Result};
 use crate::interp::Interp;
 use crate::value::Value;
 
+use super::list::set_error_code;
+
 /// Evaluate an `if`/`while` body script.  tclsh compiles these constructs
 /// inline: a body error propagates framelessly (F2/N8 — no frame names the
 /// `if`/`while` command itself), so mark the next harness append suppressed.
@@ -425,110 +427,163 @@ pub fn cmd_continue(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    // Parse options: return ?-code code? ?-level level? ?-errorinfo info? ?-errorcode code? ?value?
-    let mut code: Option<i32> = None;
-    let mut level: i32 = 1; // default level
-    let mut level_given = false;
-    let mut error_info: Option<String> = None;
-    let mut error_code: Option<String> = None;
-    let mut i = 1;
-
-    while i < args.len() {
-        let arg = args[i].as_str();
-        if arg == "-code" {
-            i += 1;
-            if i >= args.len() {
-                return Err(Error::runtime(
-                    "missing value for -code option",
-                    crate::error::ErrorCode::Generic,
-                ));
-            }
-            let code_arg = args[i].as_str();
-            code = Some(match code_arg {
-                "ok" => 0,
-                "error" => 1,
-                "return" => 2,
-                "break" => 3,
-                "continue" => 4,
-                _ => code_arg.parse::<i32>().map_err(|_| {
-                    Error::runtime(
-                        format!("bad completion code \"{}\": must be ok, error, return, break, continue, or an integer", code_arg),
-                        crate::error::ErrorCode::Generic,
-                    )
-                })?,
-            });
-            i += 1;
-        } else if arg == "-level" {
-            i += 1;
-            if i >= args.len() {
-                return Err(Error::runtime(
-                    "missing value for -level option",
-                    crate::error::ErrorCode::Generic,
-                ));
-            }
-            level = args[i].as_str().parse::<i32>().map_err(|_| {
-                Error::runtime(
-                    format!("bad -level value \"{}\"", args[i].as_str()),
-                    crate::error::ErrorCode::Generic,
-                )
-            })?;
-            level_given = true;
-            i += 1;
-        } else if arg == "-errorinfo" {
-            i += 1;
-            if i >= args.len() {
-                return Err(Error::runtime(
-                    "missing value for -errorinfo option",
-                    crate::error::ErrorCode::Generic,
-                ));
-            }
-            error_info = Some(args[i].as_str().to_string());
-            i += 1;
-        } else if arg == "-errorcode" {
-            i += 1;
-            if i >= args.len() {
-                return Err(Error::runtime(
-                    "missing value for -errorcode option",
-                    crate::error::ErrorCode::Generic,
-                ));
-            }
-            // tclsh validates the value as a list before installing it
-            // as errorCode (result-6.3).
-            if args[i].as_list_strict().is_err() {
-                return Err(Error::runtime(
-                    format!(
-                        "bad -errorcode value: expected a list but got \"{}\"",
-                        args[i].as_str()
-                    ),
-                    crate::error::ErrorCode::Generic,
-                ));
-            }
-            error_code = Some(args[i].as_str().to_string());
-            i += 1;
-        } else {
-            break;
-        }
-    }
-
-    let value = if i < args.len() {
-        Some(args[i].clone())
+    // Tcl 8.6 Tcl_ReturnObjCmd: "An even number of words means an explicit
+    // result argument is present" — objc counts the `return` word itself,
+    // and the leading option words are consumed as key/value pairs.
+    // UNKNOWN KEYS ARE IGNORED (tclsh stores them in the return-options
+    // dict where nothing reads them back), so `return -badOption foo
+    // message` completes with a plain TCL_RETURN carrying "message"
+    // (proc-old-7.15).  Only the values of recognised options are
+    // validated (TclMergeReturnOptions).
+    let objc = args.len();
+    let explicit_result = objc % 2 == 0;
+    let num_option_words = objc - 1 - usize::from(explicit_result);
+    let result = if explicit_result {
+        Some(args[objc - 1].clone())
     } else {
         None
     };
 
+    // Options are merged in word order — a later pair overwrites an
+    // earlier one, and `-options {dict}` expands in place (recursively).
+    let mut opts: Vec<(String, Value)> = Vec::new();
+    {
+        fn expand(words: &[Value], opts: &mut Vec<(String, Value)>) -> Result<()> {
+            let mut i = 0;
+            // Callers pass even-length word lists (numOptionWords, or a
+            // validated dictionary), so each iteration consumes a pair.
+            while i < words.len() {
+                let key = words[i].as_str().to_string();
+                if key == "-options" {
+                    // The value must be a dictionary (even-length list).
+                    let dict = match words[i + 1].as_list_strict() {
+                        Ok(d) if d.len() % 2 == 0 => d,
+                        _ => {
+                            return Err(Error::runtime(
+                                format!(
+                                    "expected dict but got \"{}\"",
+                                    words[i + 1].as_str()
+                                ),
+                                crate::error::ErrorCode::Generic,
+                            ));
+                        }
+                    };
+                    expand(&dict, opts)?;
+                } else {
+                    let val = words[i + 1].clone();
+                    if let Some(slot) = opts.iter_mut().find(|(k, _)| *k == key) {
+                        slot.1 = val;
+                    } else {
+                        opts.push((key, val));
+                    }
+                }
+                i += 2;
+            }
+            Ok(())
+        }
+        expand(&args[1..1 + num_option_words], &mut opts).map_err(|e| {
+            // A malformed -options value is a RESULT-family error
+            // (tclsh: `return -options {-code} x` → TCL RESULT
+            // ILLEGAL_OPTIONS).
+            set_error_code(_interp, "TCL RESULT ILLEGAL_OPTIONS");
+            e
+        })?;
+    }
+
+    let get = |name: &str| -> Option<&Value> {
+        opts.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    };
+
+    let mut code: Option<i32> = None;
+    if let Some(v) = get("-code") {
+        let c = v.as_str();
+        code = Some(match c {
+            "ok" => 0,
+            "error" => 1,
+            "return" => 2,
+            "break" => 3,
+            "continue" => 4,
+            // Integers go through Tcl's integer parser (hex `0x2` and
+            // 64-bit words accepted) and truncate to the C int the
+            // completion code travels in (`3000000000` → -1294967296);
+            // anything else is a TCL RESULT ILLEGAL_CODE error.
+            _ => match super::list::tcl_get_int(c) {
+                Some(v) => v as i32,
+                None => {
+                    set_error_code(_interp, "TCL RESULT ILLEGAL_CODE");
+                    return Err(Error::runtime(
+                        format!("bad completion code \"{}\": must be ok, error, return, break, continue, or an integer", c),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+            },
+        });
+    }
+
+    let mut level: i32 = 1; // default level
+    let mut level_given = false;
+    if let Some(v) = get("-level") {
+        level = v.as_str().parse::<i32>().map_err(|_| {
+            set_error_code(
+                _interp,
+                "TCL RESULT ILLEGAL_LEVEL",
+            );
+            Error::runtime(
+                format!(
+                    "bad -level value: expected non-negative integer but got \"{}\"",
+                    v.as_str()
+                ),
+                crate::error::ErrorCode::Generic,
+            )
+        })?;
+        if level < 0 {
+            set_error_code(_interp, "TCL RESULT ILLEGAL_LEVEL");
+            return Err(Error::runtime(
+                format!(
+                    "bad -level value: expected non-negative integer but got \"{}\"",
+                    v.as_str()
+                ),
+                crate::error::ErrorCode::Generic,
+            ));
+        }
+        level_given = true;
+    }
+
+    let mut error_info: Option<String> = None;
+    if let Some(v) = get("-errorinfo") {
+        error_info = Some(v.as_str().to_string());
+    }
+
+    let mut error_code: Option<String> = None;
+    if let Some(v) = get("-errorcode") {
+        // tclsh validates the value as a list before installing it
+        // as errorCode (result-6.3).
+        if v.as_list_strict().is_err() {
+            set_error_code(_interp, "TCL RESULT ILLEGAL_ERRORCODE");
+            return Err(Error::runtime(
+                format!(
+                    "bad -errorcode value: expected a list but got \"{}\"",
+                    v.as_str()
+                ),
+                crate::error::ErrorCode::Generic,
+            ));
+        }
+        error_code = Some(v.as_str().to_string());
+    }
+
     match code {
-        Some(c) => Err(Error::return_with_options(c, value, error_info, error_code)),
+        Some(c) => Err(Error::return_with_options(c, result, error_info, error_code)),
         None => {
             if error_info.is_some() || error_code.is_some() {
-                Err(Error::return_with_options(0, value, error_info, error_code))
+                Err(Error::return_with_options(0, result, error_info, error_code))
             } else if level_given {
                 // Explicit -level: encoded as -(N+1) so script boundaries
                 // can distinguish `return -level 0` (ends the current
                 // script, level −1) from a plain return (level 0 = leave
                 // the enclosing proc).
-                Err(Error::ret_level(level, value))
+                Err(Error::ret_level(level, result))
             } else {
-                Err(Error::ret(value))
+                Err(Error::ret(result))
             }
         }
     }
@@ -619,8 +674,14 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // The catch consumed the propagation — no deferred
             // enclosing-command frame can reach the top-level report.
             interp.err_pending_top = None;
+            // Only an ERROR completion touches ::errorInfo — a caught
+            // break/continue/plain-return leaves whatever is in there
+            // alone (tclsh: catching `return -code break x` does not
+            // clobber a previously accumulated errorInfo).
             let error_info = accumulated.unwrap_or_else(|| e.message_text());
-            let _ = interp.set_var("::errorInfo", Value::from_str(&error_info));
+            if interp.err_is_error(&e) {
+                let _ = interp.set_var("::errorInfo", Value::from_str(&error_info));
+            }
             // ::errorCode: a raise site that installed it (scan formats,
             // exec CHILDSTATUS, `error`, `return -errorcode`) wins;
             // otherwise the error variant derives it (TCL WRONGARGS,

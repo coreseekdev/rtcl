@@ -32,8 +32,10 @@ impl Interp {
     /// error (tclsh's TclEvalEx logging): the first append starts the
     /// accumulated info with the message and `while executing`; later
     /// appends add `invoked from within`.  `fresh` suppresses exactly one
-    /// append.  Non-error completions (return/break/continue/exit) never
-    /// reach this.
+    /// append — and leaves `err_line` alone, since the suppressed frame's
+    /// command never errored (tclsh's errorLine stays at the innermost
+    /// failing command, not the frameless construct that re-raised it).
+    /// Non-error completions (return/break/continue/exit) never reach this.
     pub(crate) fn err_harness_frame(&mut self, msg: &str, text: &str, line: usize) {
         match (&mut self.err_info, self.err_fresh) {
             (Some(_), true) => {
@@ -41,15 +43,16 @@ impl Interp {
             }
             (Some(info), false) => {
                 info.push_str(&format!("\n    invoked from within\n\"{}\"", text));
+                self.err_line = line;
             }
             (None, _) => {
                 self.err_info = Some(format!(
                     "{}\n    while executing\n\"{}\"",
                     msg, text
                 ));
+                self.err_line = line;
             }
         }
-        self.err_line = line;
         // A normal harness log means the substitution boundary's
         // deferred enclosing-command frame was superseded (tclsh's
         // ERR_ALREADY_LOGGED is consumed by one level).
@@ -71,6 +74,27 @@ impl Interp {
     /// requests) propagate framelessly.
     pub(crate) fn err_is_error(&self, e: &Error) -> bool {
         !(e.is_return() || e.is_break() || e.is_continue() || e.is_exit() || e.is_tail_call())
+    }
+
+    /// Confirms that word `idx` of the command currently dispatching is
+    /// the given script verbatim (a braced or quoted literal): `Some(0)`
+    /// — the body starts on the delimiter's line, so the word carries no
+    /// extra newline offset — or `None` when the word source is something
+    /// else (variable, concat, `{*}`) and the body's true line origin is
+    /// unknowable.  Lets loop constructs map their bodies' parse-relative
+    /// command lines onto the enclosing script's absolute lines, the way
+    /// tclsh's single bytecode line table does.
+    pub(crate) fn body_is_verbatim_script(&self, idx: usize, script: &str) -> Option<usize> {
+        let src = self.cur_cmd_word_srcs.get(idx)?;
+        let inner = src
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .or_else(|| src.strip_prefix('"').and_then(|s| s.strip_suffix('"')))?;
+        if inner == script {
+            Some(0)
+        } else {
+            None
+        }
     }
 
     /// Compile a script to bytecode (caching it) and execute via the VM.
@@ -123,10 +147,10 @@ impl Interp {
                             // The construct-exit tags report the
                             // enclosing command's line, not the
                             // substitution-internal line.
-                            self.err_line = cmd.line;
+                            self.err_line = cmd.line + self.line_offset;
                         } else {
                             let msg = e.message_text();
-                            self.err_harness_frame(&msg, &cmd.text, cmd.line);
+                            self.err_harness_frame(&msg, &cmd.text, cmd.line + self.line_offset);
                         }
                     }
                     return Err(e);
@@ -146,8 +170,11 @@ impl Interp {
         }
 
         // Expose the invocation for constructs that need the raw source
-        // (`info level 0` inside `namespace eval`).
-        self.cur_cmd_text = cmd.text.clone();
+        // (`info level 0` inside `namespace eval`) and its position/word
+        // sources (loop constructs recover their body's line offset).
+        let saved_text = std::mem::replace(&mut self.cur_cmd_text, cmd.text.clone());
+        let saved_line = std::mem::replace(&mut self.cur_cmd_line, cmd.line);
+        let saved_srcs = std::mem::replace(&mut self.cur_cmd_word_srcs, cmd.word_srcs.clone());
         // Execution enterstep/leavestep traces (tclsh 8.6.17): fire
         // against the enclosing traced proc, if any.  enterstep runs
         // before dispatch; leavestep after, with the completion code and
@@ -171,9 +198,12 @@ impl Interp {
         if let Err(e) = &r {
             if self.err_is_error(e) {
                 let msg = e.message_text();
-                self.err_harness_frame(&msg, &cmd.text, cmd.line);
+                self.err_harness_frame(&msg, &cmd.text, cmd.line + self.line_offset);
             }
         }
+        self.cur_cmd_text = saved_text;
+        self.cur_cmd_line = saved_line;
+        self.cur_cmd_word_srcs = saved_srcs;
         r
     }
 

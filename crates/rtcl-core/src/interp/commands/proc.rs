@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::interp::{Interp, ProcDef, UpvarLink};
 use crate::value::Value;
 
-use super::list::{set_error_code, tcl_get_int};
+use super::list::{set_error_code, strict_list, tcl_get_int};
 
 #[cfg(not(feature = "embedded"))]
 use std::collections::HashMap;
@@ -59,10 +59,12 @@ fn parse_param_specs(params: &[Value]) -> Result<Vec<(String, Option<String>)>> 
 
 pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // 3-arg form: proc name argList body
-    // 4-arg form: proc name argList statics body  (jimtcl-compatible)
+    // 4-arg form: proc name argList statics body  (jimtcl-compatible
+    // extension kept for compatibility; the arity error still quotes
+    // tclsh 8.6's standard usage — proc-old-5.1..5.3).
     if args.len() < 4 || args.len() > 5 {
         return Err(Error::wrong_args_with_usage(
-            "proc", 4, args.len(), "name argList ?statics? body",
+            "proc", 4, args.len(), "name args body",
         ));
     }
 
@@ -85,15 +87,23 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         (&args[2], None, &args[3])
     };
 
-    let params = param_arg.as_list().unwrap_or_default();
+    // The argument list is split with Tcl_SplitList: a malformed list
+    // (`proc t {a` …) errors at definition time with the list-parse
+    // message and `TCL VALUE LIST …` errorCode (proc-old-5.4).
+    let params = strict_list(interp, param_arg)?;
     let body = body_arg.as_str().to_string();
 
     // Definition-time parameter errors carry a `(creating proc "name")`
     // frame: pre-seed errorInfo so the harness logs the `proc` command
-    // as `invoked from within` (tclsh ERR_ALREADY_LOGGED).
+    // as `invoked from within` (tclsh ERR_ALREADY_LOGGED). Malformed
+    // per-argument specifiers also raise
+    // `TCL OPERATION PROC FORMALARGUMENTFORMAT` (proc-old-5.5..5.7).
     let defaults = match parse_param_specs(&params) {
         Ok(d) => d,
         Err(e) => {
+            if let Error::Msg(_) = &e {
+                set_error_code(interp, "TCL OPERATION PROC FORMALARGUMENTFORMAT");
+            }
             interp.err_info = Some(format!(
                 "{}\n    (creating proc \"{}\")",
                 e,

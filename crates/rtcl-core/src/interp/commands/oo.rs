@@ -1898,6 +1898,175 @@ fn class_methods_listing(interp: &Interp, key: &str, all: bool, private: bool) -
     Value::from_list(&names.iter().map(|n| Value::from_str(n)).collect::<Vec<_>>())
 }
 
+/// One `{call kind method owner kind}` element of an `info object call` /
+/// `info class call` chain (tclsh 8.6 oo-call-1.x/2.x).  rtcl stores
+/// `filter` declarations without executing them, but the descriptor still
+/// lists them: each declared filter contributes a `filter` entry naming
+/// the class that defines the filter method, followed by the `method`
+/// entry for the method itself.  A name with no exported definition falls
+/// through to the `::oo::object` core `unknown` dispatcher, which tclsh
+/// reports as owner `::oo::object` with kind `{core method: "unknown"}`;
+/// likewise core dispatchers report `{core method: "destroy"}` &c.
+fn call_chain_item(kind: &str, name: &str, owner: &str, detail: &str) -> Value {
+    Value::from_list(&[
+        Value::from_str(kind),
+        Value::from_str(name),
+        Value::from_str(owner),
+        // tclsh appends the raw string (`core method: "destroy"`); the
+        // braces seen in `puts` output are the enclosing list's quoting,
+        // so they must NOT be part of the element value.
+        Value::from_str(detail),
+    ])
+}
+
+/// The 4th descriptor word for a chain entry: `method` for Tcl/forward
+/// bodies, `core method: "B"` for a core behaviour B.
+fn call_entry_detail(def: &MethodDef) -> String {
+    match &def.kind {
+        MethodKind::Builtin(b) => format!("core method: \"{}\"", b),
+        _ => "method".to_string(),
+    }
+}
+
+fn call_unknown_item() -> Value {
+    call_chain_item(
+        "unknown",
+        "unknown",
+        "::oo::object",
+        "core method: \"unknown\"",
+    )
+}
+
+fn owner_word(owner: &Owner) -> String {
+    match owner {
+        Owner::Object => "object".to_string(),
+        Owner::Class(c) => c.clone(),
+    }
+}
+
+/// Instance-method chain of class `key` (`info class call`): the class's
+/// own mixins, then the superclass chain with each class's mixins
+/// interleaved — the walk instances use minus the per-object tables.
+/// `unexport` hiding applies (an unexported name resolves to nothing).
+fn class_call_chain(interp: &Interp, key: &str, method: &str) -> Vec<ChainEntry> {
+    let mut out: Vec<ChainEntry> = Vec::new();
+    let mut hidden: HashSet<String> = HashSet::new();
+    if let Some(cls) = interp.oo.classes.get(key) {
+        for m in &cls.mixins {
+            for c in linearize(interp, m) {
+                push_class_entry(interp, &c, method, false, &mut hidden, &mut out);
+            }
+        }
+    }
+    for c in linearize(interp, key) {
+        let mixins = interp.oo.classes.get(&c).map(|x| x.mixins.clone()).unwrap_or_default();
+        for mx in &mixins {
+            for c2 in linearize(interp, mx) {
+                push_class_entry(interp, &c2, method, false, &mut hidden, &mut out);
+            }
+        }
+        push_class_entry(interp, &c, method, false, &mut hidden, &mut out);
+    }
+    out
+}
+
+/// `filter` names that apply to method calls on `key`, in the order the
+/// chain walks the declaring classes (declaration order within a class).
+fn call_filter_names(interp: &Interp, key: &str, class_instance: bool) -> Vec<String> {
+    fn add_chain(interp: &Interp, class: &str, order: &mut Vec<String>) {
+        for c in linearize(interp, class) {
+            if !order.iter().any(|x| *x == c) {
+                order.push(c);
+            }
+        }
+    }
+    let mut order: Vec<String> = Vec::new();
+    if class_instance {
+        if let Some(cls) = interp.oo.classes.get(key) {
+            for m in &cls.mixins {
+                add_chain(interp, m, &mut order);
+            }
+        }
+        for c in linearize(interp, key) {
+            for mx in interp.oo.classes.get(&c).map(|x| x.mixins.clone()).unwrap_or_default() {
+                add_chain(interp, &mx, &mut order);
+            }
+            if !order.iter().any(|x| x == &c) {
+                order.push(c);
+            }
+        }
+    } else if let Some(obj) = interp.oo.objects.get(key) {
+        for m in &obj.mixins {
+            add_chain(interp, m, &mut order);
+        }
+        for c in linearize(interp, &obj.class) {
+            for mx in interp.oo.classes.get(&c).map(|x| x.mixins.clone()).unwrap_or_default() {
+                add_chain(interp, &mx, &mut order);
+            }
+            if !order.iter().any(|x| x == &c) {
+                order.push(c);
+            }
+        }
+    } else if let Some(cls) = interp.oo.classes.get(key) {
+        for m in &cls.obj_mixins {
+            add_chain(interp, m, &mut order);
+        }
+        for c in linearize(interp, "::oo::class") {
+            for mx in interp.oo.classes.get(&c).map(|x| x.mixins.clone()).unwrap_or_default() {
+                add_chain(interp, &mx, &mut order);
+            }
+            if !order.iter().any(|x| x == &c) {
+                order.push(c);
+            }
+        }
+    }
+    let mut names: Vec<String> = Vec::new();
+    for c in order {
+        if let Some(cls) = interp.oo.classes.get(&c) {
+            for f in &cls.filters {
+                if !names.contains(f) {
+                    names.push(f.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// The full `info object call` / `info class call` descriptor list for
+/// `method` as seen from `key` (`class_instance` selects the instance
+/// chain of a class over the class-as-object chain).
+fn call_chain_desc(interp: &Interp, key: &str, method: &str, class_instance: bool) -> Value {
+    let chain_of = |name: &str| -> Vec<ChainEntry> {
+        if class_instance {
+            class_call_chain(interp, key, name)
+        } else {
+            build_chain(interp, key, name, false)
+        }
+    };
+    let mut items: Vec<Value> = Vec::new();
+    for fname in call_filter_names(interp, key, class_instance) {
+        if let Some(e) = chain_of(&fname).first() {
+            items.push(call_chain_item(
+                "filter",
+                &fname,
+                &owner_word(&e.owner),
+                &call_entry_detail(&e.def),
+            ));
+        }
+    }
+    match chain_of(method).first() {
+        Some(e) => items.push(call_chain_item(
+            "method",
+            method,
+            &owner_word(&e.owner),
+            &call_entry_detail(&e.def),
+        )),
+        None => items.push(call_unknown_item()),
+    }
+    Value::from_list(&items)
+}
+
 fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::wrong_args_with_usage(
@@ -2052,8 +2221,30 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             };
             Ok(Value::from_bool(result))
         }
-        // call / definition / filters / forward / methodtype are not
-        // modelled; report them the way an unresolvable word reports.
+        "call" => {
+            // tclsh 8.6 `info object call objName methodName`: exactly two
+            // arguments, and the arity error names that usage before any
+            // object lookup happens (oo-call-1.14..1.16).  An unresolvable
+            // name is "does not refer to an object" (oo-call-1.17).
+            if args.len() != 5 {
+                return Err(Error::wrong_args_with_usage(
+                    "info object call",
+                    3,
+                    args.len(),
+                    "objName methodName",
+                ));
+            }
+            let typed = args[3].as_str();
+            let key = resolve_object_key(interp, typed).ok_or_else(|| {
+                // tclsh pairs the message with errorCode
+                // `TCL LOOKUP OBJECT <name>`.
+                super::list::set_error_code(interp, &format!("TCL LOOKUP OBJECT {}", typed));
+                does_not_refer(true, typed)
+            })?;
+            Ok(call_chain_desc(interp, &key, args[4].as_str(), false))
+        }
+        // definition / forward / methodtype are not modelled; report them
+        // the way an unresolvable word reports.
         _ => Err(unknown_sub_error(word, OBJECT_SUBCMDS)),
     }
 }
@@ -2178,6 +2369,33 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 _ => vec![],
             };
             Ok(Value::from_list(&items.iter().map(|v| Value::from_str(v)).collect::<Vec<_>>()))
+        }
+        "call" => {
+            // tclsh 8.6 `info class call className methodName` (oo-call-2.8..2.10).
+            // The name is resolved as an *object* first — an unknown name
+            // says "does not refer to an object" (oo-call-2.11), and an
+            // object that is not a class says `is not a class` — both
+            // before any method lookup.
+            if args.len() != 5 {
+                return Err(Error::wrong_args_with_usage(
+                    "info class call",
+                    3,
+                    args.len(),
+                    "className methodName",
+                ));
+            }
+            let typed = args[3].as_str();
+            let key = resolve_object_key(interp, typed).ok_or_else(|| {
+                super::list::set_error_code(interp, &format!("TCL LOOKUP OBJECT {}", typed));
+                does_not_refer(true, typed)
+            })?;
+            if !interp.oo.classes.contains_key(&key) {
+                // Not-a-class: `TCL LOOKUP CLASS <name>` accompanies the
+                // message.
+                super::list::set_error_code(interp, &format!("TCL LOOKUP CLASS {}", typed));
+                return Err(Error::Msg(format!("\"{}\" is not a class", typed)));
+            }
+            Ok(call_chain_desc(interp, &key, args[4].as_str(), true))
         }
         _ => Err(unknown_sub_error(word, CLASS_SUBCMDS)),
     }

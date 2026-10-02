@@ -44,13 +44,34 @@ impl Interp {
                 if script.len() <= PARSE_CACHE_MAX_SCRIPT {
                     if self.parse_cache.len() >= PARSE_CACHE_MAX {
                         self.parse_cache.clear();
+                        self.bytecode_cache.clear();
                     }
                     // Key shares the unit's source allocation (one Rc clone).
                     self.parse_cache.insert(Rc::clone(&rc.source), Rc::clone(&rc));
+                    // Compiled once per cached text; the executor reproduces
+                    // the tree-walk's frames, so the op loop is
+                    // interchangeable with `eval_commands`.  Compiled units
+                    // with non-whitelisted ops carry `fallback` and are
+                    // cached anyway (the check is per call — a Tier1 shadow
+                    // bump must keep taking effect on cached code).
+                    let code = Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands);
+                    self.bytecode_cache.insert(Rc::clone(&rc.source), Rc::new(code));
                 }
                 rc
             }
         };
+        // Bytecode fast path — the same gate as proc bodies (Site A).
+        if script.len() <= PARSE_CACHE_MAX_SCRIPT {
+            if let Some(code) = self.bytecode_cache.get(script) {
+                if !code.fallback
+                    && code.epoch == self.tier1_epoch
+                    && super::vm_exec::bytecode_applicable(self)
+                {
+                    let code = Rc::clone(code);
+                    return super::vm_exec::exec_bytecode(self, &code);
+                }
+            }
+        }
         self.eval_commands(&unit)
     }
 
@@ -605,25 +626,7 @@ impl Interp {
     pub(crate) fn eval_word(&mut self, word: &Word) -> Result<Value> {
         match word {
             Word::Literal(s) => Ok(Value::from_str(s)),
-            Word::VarRef(name) => {
-                // $a(index): the index text takes full word-level
-                // substitutions before the read — tclsh evaluates
-                // `[winfo name $zz]` even when the array itself is
-                // missing (misc-1.1), and an index error masks the
-                // array lookup entirely.
-                if let Some(open) = name.find('(') {
-                    if name.ends_with(')') {
-                        let raw = &name[open + 1..name.len() - 1];
-                        if raw.contains('$') || raw.contains('[') || raw.contains('\\') {
-                            let argv = [Value::from_str("subst"), Value::from_str(raw)];
-                            let idx = crate::interp::commands::misc::cmd_subst(self, &argv)?;
-                            let full = format!("{}({})", &name[..open], idx.as_str());
-                            return self.read_var(&full);
-                        }
-                    }
-                }
-                self.read_var(name)
-            }
+            Word::VarRef(name) => self.eval_var_ref(name),
             Word::CommandSub(cmd) => match self.eval(cmd) {
                 Ok(v) => Ok(v),
                 Err(e) => {
@@ -649,6 +652,28 @@ impl Interp {
     /// Evaluate an expression.
     pub fn eval_expr(&mut self, expr: &str) -> Result<Value> {
         crate::types::expr::eval_expr(self, expr)
+    }
+
+    /// Read the variable a `$name` word refers to.  Shared by
+    /// [`Interp::eval_word`] and the bytecode executor's `LoadVar`.
+    pub(crate) fn eval_var_ref(&mut self, name: &str) -> Result<Value> {
+        // $a(index): the index text takes full word-level
+        // substitutions before the read — tclsh evaluates
+        // `[winfo name $zz]` even when the array itself is
+        // missing (misc-1.1), and an index error masks the
+        // array lookup entirely.
+        if let Some(open) = name.find('(') {
+            if name.ends_with(')') {
+                let raw = &name[open + 1..name.len() - 1];
+                if raw.contains('$') || raw.contains('[') || raw.contains('\\') {
+                    let argv = [Value::from_str("subst"), Value::from_str(raw)];
+                    let idx = crate::interp::commands::misc::cmd_subst(self, &argv)?;
+                    let full = format!("{}({})", &name[..open], idx.as_str());
+                    return self.read_var(&full);
+                }
+            }
+        }
+        self.read_var(name)
     }
 }
 

@@ -17,6 +17,7 @@ mod vars;
 mod eval;
 mod call;
 mod vm_bridge;
+mod vm_exec;
 mod util;
 
 // Re-export utilities so command modules can reach them via `super::super::glob_match`
@@ -51,6 +52,12 @@ pub(crate) struct ProcDef {
     pub body: String,
     /// Static variables: persist across calls. Key = var name, value = current value.
     pub statics: HashMap<String, Value>,
+    /// Body compiled once at definition time (named `proc` only; apply
+    /// lambdas and OO synthetics stay on the tree-walk, which their
+    /// per-construction lifetime would otherwise recompile per call).
+    /// `None` = the body does not parse (the tree-walk reproduces the
+    /// parse error per call, exactly like an uncached parse).
+    pub compiled: Option<Rc<ByteCode>>,
 }
 
 /// A link from a local variable name to a variable in another scope.
@@ -204,6 +211,13 @@ pub struct Interp {
     /// call/iteration (procs, loops) skip re-tokenization.  Entries are
     /// bounded (see `eval`) — wasm32 is a target.
     pub(crate) parse_cache: HashMap<Rc<str>, Rc<rtcl_parser::ScriptUnit>>,
+    /// Compiled-form cache: script text → bytecode (keyed by the same
+    /// shared source allocation as [`Interp::parse_cache`]).  Compiled
+    /// once per cached text; the executor reproduces the tree-walk's
+    /// frames exactly (see `vm_exec`), so a cached unit running op-by-op
+    /// is interchangeable with the AST walk.  Bound and cleared together
+    /// with the parse cache (see `eval`).
+    pub(crate) bytecode_cache: HashMap<Rc<str>, Rc<rtcl_parser::ByteCode>>,
     /// `check_expr` verdict memo: expr text → `Err(msg)` on syntax error,
     /// `Ok(())` when clean (see `types::expr::eval_expr`).  Pure function
     /// of the text; loop conditions re-check every iteration.
@@ -259,6 +273,15 @@ pub struct Interp {
     /// > 0 while an execution-trace callback itself is running (its inner
     /// commands do not re-trigger step traces — tclsh suppresses them).
     pub(crate) exec_step_running: u32,
+    /// Shadow epoch for compiled proc bodies: bumped whenever a command
+    /// whose *leaf* name matches one of the inline-folded Tier1 commands
+    /// (`set`, `if`, `while`, `for`, `expr`, `incr`, `return`, `exit`,
+    /// `break`, `continue`) gains, loses, or changes its binding.  Those
+    /// folds bypass dispatch, so code compiled under an older epoch must
+    /// fall back to the dynamically-resolving tree-walk (namespace-41.1:
+    /// `test` compiled `set ::g 0` inline, then `proc set` shadowed it —
+    /// tclsh re-resolves and so must we).
+    pub(crate) tier1_epoch: u64,
     /// Eval-level (no call frame) variable aliases created by `upvar` /
     /// `variable`: canonical local flat key → canonical target flat key.
     /// At the global level tclsh's `upvar`/`variable` link two variables;
@@ -422,6 +445,7 @@ impl Interp {
             exec_trace_ids: 0,
             exec_step_stack: Vec::new(),
             exec_step_running: 0,
+            tier1_epoch: 0,
             flat_aliases: Vec::new(),
             dead_flat: Vec::new(),
             ns_variable_links: Vec::new(),
@@ -445,6 +469,7 @@ impl Interp {
             command_meta: HashMap::new(),
             procs: HashMap::new(),
             parse_cache: HashMap::new(),
+            bytecode_cache: HashMap::new(),
             expr_check_cache: HashMap::new(),
             call_depth: 0,
             max_call_depth: 1000,

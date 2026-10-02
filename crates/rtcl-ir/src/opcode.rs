@@ -456,6 +456,14 @@ pub enum OpCode {
     /// per-command bookkeeping).
     BeginCmd(u32),
 
+    /// Enters an inline body reached by a *taken* jump (an `if`'s else
+    /// body).  Every other inline body is entered by a not-taken
+    /// `JumpFalse`/`JumpTrue`, which the executor uses to track which
+    /// construct's body a failing op belongs to: body errors propagate
+    /// frameless (the construct logs no errorInfo frame of its own),
+    /// condition errors append the construct's frame.
+    BodyMark,
+
     /// No operation.
     Nop,
 }
@@ -581,6 +589,7 @@ impl fmt::Display for OpCode {
             // Debug
             OpCode::Line(n) => write!(f, "LINE {}", n),
             OpCode::BeginCmd(site) => write!(f, "BEGIN_CMD {}", site),
+            OpCode::BodyMark => write!(f, "BODY_MARK"),
             OpCode::Nop => write!(f, "NOP"),
         }
     }

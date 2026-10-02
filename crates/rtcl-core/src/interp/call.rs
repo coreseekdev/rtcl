@@ -33,6 +33,7 @@ impl Interp {
 
         let mut current_params = proc_def.params.clone();
         let mut current_body = proc_def.body.clone();
+        let mut current_compiled = proc_def.compiled.clone();
         let mut current_args: Vec<Value> = args.to_vec();
         let mut current_statics: HashMap<String, Value> = proc_def.statics.clone();
         let mut current_proc_name = proc_name.to_string();
@@ -197,7 +198,22 @@ impl Interp {
             }
 
             // ── Execute body ───────────────────────────────────────
-            let mut result = self.eval(&current_body);
+            // A named proc's body compiled once at `proc` time runs
+            // op-by-op here — same errors, same frames, no per-call
+            // re-parse.  Everything else (non-parsing bodies, trace-
+            // observed frames, `RTCL_NO_BYTECODE`, non-whitelisted ops,
+            // a Tier1 command shadowed since compilation) stays on the
+            // tree-walk.
+            let mut result = match &current_compiled {
+                Some(code)
+                    if !code.fallback
+                        && code.epoch == self.tier1_epoch
+                        && super::vm_exec::bytecode_applicable(self) =>
+                {
+                    super::vm_exec::exec_bytecode(self, code)
+                }
+                _ => self.eval(&current_body),
+            };
 
             // A tailcall whose completion an inner catch consumed leaves
             // the frame marker armed: it still fires at body end and
@@ -245,6 +261,7 @@ impl Interp {
                         // Tail-call to another proc — reuse the frame (no depth increase)
                         current_params = new_proc.params.clone();
                         current_body = new_proc.body.clone();
+                        current_compiled = new_proc.compiled.clone();
                         current_statics = new_proc.statics.clone();
                         current_proc_name = cmd_name.clone();
                         current_args = tc_args.into_iter().map(|s| Value::from_str(&s)).collect();
@@ -330,6 +347,7 @@ impl Interp {
         if let Some(frame) = self.frames.last() {
             let procs_to_delete: Vec<String> = frame.local_procs.clone();
             for name in &procs_to_delete {
+                super::vm_exec::note_tier1_mutation(self, name);
                 self.procs.remove(name);
                 self.commands.remove(name);
                 self.aliases.remove(name);

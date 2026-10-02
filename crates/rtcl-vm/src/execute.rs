@@ -454,6 +454,8 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             // Site bookkeeping is the caller's job (it owns the site
             // table); the executor itself treats this as a marker.
             OpCode::BeginCmd(_) => {}
+            // Body-region tracking is the interpreter executor's job.
+            OpCode::BodyMark => {}
             OpCode::Nop => {}
         }
     }

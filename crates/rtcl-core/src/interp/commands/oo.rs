@@ -238,7 +238,7 @@ pub(crate) fn init(interp: &mut Interp) {
             super::super::Rc::new(ProcDef {
                 params: vec![("args".to_string(), None)],
                 body,
-                statics: HashMap::new(),
+                statics: HashMap::new(), compiled: None,
             }),
         );
     }
@@ -662,7 +662,7 @@ fn exec_chain_entry(
                 vec![(method.to_string(), None)];
             params.extend(entry.def.params.iter().cloned());
             let proc_def =
-                ProcDef { params, body, statics: HashMap::new() };
+                ProcDef { params, body, statics: HashMap::new(), compiled: None };
 
             let mut args: Vec<Value> =
                 vec![Value::from_str(typed), Value::from_str(method)];
@@ -916,6 +916,7 @@ fn attach_ns_commands(interp: &mut Interp, key: &str, ns: &str) {
 
 /// Remove everything a create/new (or destroy) attached for `key`.
 fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
+    super::super::vm_exec::note_tier1_mutation(interp, key);
     interp.commands.remove(key);
     interp.command_categories.remove(key);
     interp.command_meta.remove(key);
@@ -974,6 +975,7 @@ fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
 /// object also gets its bare key (`::foo` is callable as `foo` from the
 /// global namespace — tclsh command lookup reaches `::name` unqualified).
 fn attach_object(interp: &mut Interp, key: &str, ns: &str) {
+    super::super::vm_exec::note_tier1_mutation(interp, key);
     register_object_command(interp, key, cmd_oo_object);
     if parent_of(key) == "::" {
         let bare = key.trim_start_matches(':');
@@ -1064,7 +1066,7 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
                 .map(|c| c.variables.clone())
                 .unwrap_or_default();
             let body = format!("{}{}", link_prefix(&vars, &ctor.params), ctor.body);
-            let proc_def = ProcDef { params, body, statics: HashMap::new() };
+            let proc_def = ProcDef { params, body, statics: HashMap::new(), compiled: None };
             let mut args: Vec<Value> =
                 vec![Value::from_str(&name_typed), Value::from_str("constructor")];
             args.extend_from_slice(&rest[1..]);
@@ -1106,7 +1108,7 @@ fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value]) -> Result<Value>
             .map(|c| c.variables.clone())
             .unwrap_or_default();
         let body = format!("{}{}", link_prefix(&vars, &ctor.params), ctor.body);
-        let proc_def = ProcDef { params, body, statics: HashMap::new() };
+        let proc_def = ProcDef { params, body, statics: HashMap::new(), compiled: None };
         let typed = name.clone();
         let mut args: Vec<Value> = vec![Value::from_str(&typed), Value::from_str("constructor")];
         args.extend_from_slice(rest);
@@ -1238,7 +1240,7 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
             let proc_def = ProcDef {
                 params: vec![("destructor".to_string(), None)],
                 body,
-                statics: HashMap::new(),
+                statics: HashMap::new(), compiled: None,
             };
             let args = vec![Value::from_str(key), Value::from_str("destructor")];
             interp.oo.active.push(ActiveMethod {

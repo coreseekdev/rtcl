@@ -45,10 +45,20 @@ impl SrcSpan {
 /// bodies), and each word's raw source (braced bodies keep delimiters, so
 /// loop constructs can recover a body's line offset).  Spans resolve
 /// against [`ByteCode::source`].
+///
+/// The three line fields mirror the tree-walk's bookkeeping exactly:
+/// `line` is the unit-absolute line (harness frames add the ambient
+/// offset captured at unit entry), `line_rel` is the text-relative line
+/// the AST carried (`cur_cmd_line` parity — loop constructs read it to
+/// rebase their bodies), and `line_delta` is what `line_offset` must be
+/// installed as while this command dispatches (0 at unit top level, the
+/// body's base line inside an inline-compiled body).
 #[derive(Debug, Clone)]
 pub struct CmdSite {
     pub text: SrcSpan,
     pub line: u32,
+    pub line_rel: u32,
+    pub line_delta: u32,
     pub word_srcs: Rc<Vec<SrcSpan>>,
 }
 
@@ -72,6 +82,13 @@ pub struct ByteCode {
     /// changing semantics (unusual `if` shapes, `return` options, …).
     /// The consumer must fall back to AST evaluation for the whole unit.
     pub fallback: bool,
+    /// The producer's shadow epoch at compile time (rtcl-core: any
+    /// command whose leaf name matches an inline-folded Tier1 command —
+    /// `set`, `if`, `while`, … — bumps it).  A consumer must only run
+    /// code whose epoch is current: the folds bypass dispatch, so a
+    /// later `proc set {...}` in any namespace must send the body back
+    /// to the dynamically-resolving tree-walk (namespace-41.1).
+    pub epoch: u64,
 }
 
 impl Default for ByteCode {
@@ -84,6 +101,7 @@ impl Default for ByteCode {
             sites: Vec::new(),
             source: Rc::from(""),
             fallback: false,
+            epoch: 0,
         }
     }
 }
@@ -288,8 +306,18 @@ impl ByteCode {
                         OpCode::BitAnd => Some(FoldResult::Int(a & b)),
                         OpCode::BitOr  => Some(FoldResult::Int(a | b)),
                         OpCode::BitXor => Some(FoldResult::Int(a ^ b)),
+                        // checked_shl only validates the COUNT (Rust:
+                        // shifts are defined wrapping); a positive shift
+                        // can still overflow i64, and the runtime widens
+                        // to bignum — fold only when the result fits
+                        // (expr-24.10: 500000000000000<<28).
                         OpCode::Shl if (0..64).contains(&b) => {
-                            a.checked_shl(b as u32).map(FoldResult::Int)
+                            let fits = if a >= 0 {
+                                b == 0 || a <= (i64::MAX >> b)
+                            } else {
+                                b == 0 || a >= (i64::MIN >> b)
+                            };
+                            if fits { Some(FoldResult::Int(a << b)) } else { None }
                         }
                         // Arithmetic >> saturates past the width, matching Tcl
                         OpCode::Shr if b >= 64 => {

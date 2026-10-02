@@ -67,6 +67,28 @@ impl Compiler {
         c.compile_commands(commands);
         c.bytecode.peephole();
         c.bytecode.source = source;
+        c.bytecode.fallback = !c.bytecode.ops().iter().all(|op| matches!(op,
+            OpCode::PushConst(_) | OpCode::PushConstWide(_) | OpCode::PushEmpty
+            | OpCode::PushInt(_) | OpCode::PushFloat(_) | OpCode::PushTrue | OpCode::PushFalse
+            | OpCode::Pop | OpCode::Dup
+            | OpCode::LoadVar(_) | OpCode::StoreVar(_) | OpCode::StoreVarPop(_)
+            | OpCode::IncrVar(_, _)
+            | OpCode::Concat(_) | OpCode::ExpandList | OpCode::ExpandMark
+            | OpCode::Jump(_) | OpCode::JumpTrue(_) | OpCode::JumpFalse(_)
+            | OpCode::LoopEnter { .. } | OpCode::LoopExit | OpCode::Break | OpCode::Continue
+            | OpCode::Return | OpCode::Exit(_)
+            | OpCode::EvalScript | OpCode::EvalExpr
+            | OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Pow
+            | OpCode::Neg
+            | OpCode::Eq | OpCode::Ne | OpCode::Lt | OpCode::Gt | OpCode::Le | OpCode::Ge
+            | OpCode::StrEq | OpCode::StrNe
+            | OpCode::Not
+            | OpCode::BitAnd | OpCode::BitOr | OpCode::BitXor | OpCode::BitNot
+            | OpCode::Shl | OpCode::Shr
+            | OpCode::BeginCmd(_) | OpCode::BodyMark
+            | OpCode::Call { .. } | OpCode::CallExpand { .. }
+            | OpCode::DynCall { .. } | OpCode::DynCallExpand { .. }
+        ));
         c.bytecode
     }
 
@@ -122,6 +144,8 @@ impl Compiler {
         self.bytecode.sites.push(CmdSite {
             text: SrcSpan { start: cmd.text.start + base, end: cmd.text.end + base },
             line,
+            line_rel: cmd.line as u32,
+            line_delta: self.line_base,
             word_srcs,
         });
         self.bytecode.emit(OpCode::BeginCmd(site_idx), line);
@@ -138,7 +162,10 @@ impl Compiler {
                 "set" if cmd.words.len() == 2 => return self.compile_set_get(cmd),
                 "if" => return self.compile_if(cmd),
                 "while" if cmd.words.len() == 3 => return self.compile_while(cmd),
-                "for" if cmd.words.len() == 5 => return self.compile_for(cmd),
+                // `for` is not folded: its compiled loop would send a
+                // `continue` in the *next* script back to the next step,
+                // while tclsh's (and rtcl's cmd_for's) next-script continue
+                // escapes the loop entirely (for-8.2..for-8.12).
                 "expr" => return self.compile_expr(cmd),
                 "incr" if cmd.words.len() >= 2 => return self.compile_incr(cmd),
                 "break" if cmd.words.len() == 1 => {
@@ -297,6 +324,19 @@ impl Compiler {
             }
         }
 
+        // Every arm body must inline verbatim; otherwise the real `if`
+        // evaluates them (transparent-body error framing and all).
+        for (_, body_idx) in &arms {
+            if !self.body_inlinable(cmd, *body_idx) {
+                return self.compile_dyncall(cmd);
+            }
+        }
+        if let Some(bi) = else_body {
+            if !self.body_inlinable(cmd, bi) {
+                return self.compile_dyncall(cmd);
+            }
+        }
+
         let line = self.abs_line(cmd);
         let mut end_jumps = Vec::new();
         for (expr_idx, body_idx) in &arms {
@@ -309,7 +349,18 @@ impl Compiler {
             self.bytecode.patch_jump(false_jump, here);
         }
         match else_body {
-            Some(bi) => self.compile_body_inline(&cmd.words[bi], cmd, bi),
+            Some(bi) => {
+                // The else body is entered by a *taken* jump (the last
+                // arm's JumpFalse lands here), so the executor can't use
+                // its not-taken rule to open the body region — mark it.
+                // The trailing Jump gives the region the uniform plain-Jump
+                // terminator every other inline body has.
+                self.bytecode.emit(OpCode::BodyMark, line);
+                self.compile_body_inline(&cmd.words[bi], cmd, bi);
+                let skip = self.bytecode.emit(OpCode::Jump(0), line);
+                let end = self.bytecode.current_offset();
+                self.bytecode.patch_jump(skip, end);
+            }
             // No else: the false path must still leave a value on the stack
             None => {
                 self.bytecode.emit(OpCode::PushEmpty, line);
@@ -322,7 +373,21 @@ impl Compiler {
     }
 
     /// `while test body`
+    ///
+    /// Compiled inline only when the body is a braced verbatim literal
+    /// that parses (the hot case); any other shape dispatches the real
+    /// `while`, whose per-iteration eval — including its line-offset
+    /// rebasing and frameless body errors — is the exact tree-walk
+    /// semantics the executor's ops cannot express for opaque bodies.
     fn compile_while(&mut self, cmd: &Command) {
+        // The condition word must be a verbatim literal: tclsh substitutes
+        // the argument ONCE at dispatch, then re-evaluates the *result*
+        // every iteration (compile-7.1: `while [expr {$i < 3}] {...}` runs
+        // on the substituted "1" forever).  An inline EvalScript of a
+        // substitution word would re-substitute per iteration.
+        if !self.body_inlinable(cmd, 2) || !matches!(cmd.words[1], Word::Literal(_)) {
+            return self.compile_dyncall(cmd);
+        }
         let line = self.abs_line(cmd);
 
         // Emit LoopEnter (targets patched later)
@@ -349,7 +414,7 @@ impl Compiler {
         self.compile_expr_word(&cmd.words[1], line);
         let exit_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
 
-        // Compile the body inline
+        // Compile the body inline (pre-checked above)
         self.compile_body_inline(&cmd.words[2], cmd, 2);
         self.bytecode.emit(OpCode::Pop, line); // discard body result
 
@@ -373,67 +438,6 @@ impl Compiler {
         }
 
         // While returns empty on normal exit
-        self.bytecode.emit(OpCode::PushEmpty, line);
-    }
-
-    /// `for start test next body`
-    fn compile_for(&mut self, cmd: &Command) {
-        let line = self.abs_line(cmd);
-
-        // Compile "start" inline
-        self.compile_body_inline(&cmd.words[1], cmd, 1);
-        self.bytecode.emit(OpCode::Pop, line); // discard init result
-
-        // Emit LoopEnter (targets patched later)
-        let loop_enter = self.bytecode.emit(
-            OpCode::LoopEnter { cont: 0, brk: 0 },
-            line,
-        );
-
-        self.loops.push(LoopCtx {
-            enter_idx: loop_enter,
-            continue_target: 0,
-            break_patches: Vec::new(),
-        });
-
-        let condition_pc = self.bytecode.current_offset();
-
-        // Compile "test"
-        self.compile_expr_word(&cmd.words[2], line);
-        let exit_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
-
-        // Compile "body" inline
-        self.compile_body_inline(&cmd.words[4], cmd, 4);
-        self.bytecode.emit(OpCode::Pop, line); // discard body result
-
-        // Continue target = start of "next" step
-        let next_pc = self.bytecode.current_offset();
-        if let Some(lctx) = self.loops.last_mut() {
-            lctx.continue_target = next_pc;
-        }
-
-        // Compile "next" inline
-        self.compile_body_inline(&cmd.words[3], cmd, 3);
-        self.bytecode.emit(OpCode::Pop, line); // discard next result
-
-        // Jump back to condition
-        self.bytecode.emit(OpCode::Jump(condition_pc), line);
-
-        // Break target = here
-        let after_loop = self.bytecode.current_offset();
-        self.bytecode.patch_jump(exit_jump, after_loop);
-
-        // Emit LoopExit
-        self.bytecode.emit(OpCode::LoopExit, line);
-
-        // Patch LoopEnter with actual targets
-        self.bytecode.patch_loop(loop_enter, next_pc, after_loop);
-
-        let lctx = self.loops.pop().unwrap();
-        for patch_idx in lctx.break_patches {
-            self.bytecode.patch_jump(patch_idx, after_loop);
-        }
-
         self.bytecode.emit(OpCode::PushEmpty, line);
     }
 
@@ -600,6 +604,21 @@ impl Compiler {
     // Body / expression compilation helpers
     // -----------------------------------------------------------------------
 
+    /// Can this body word be compiled inline?  True for empty literals and
+    /// for braced verbatim literals whose text parses — the shapes the
+    /// executor reproduces exactly.  Everything else keeps the construct on
+    /// the DynCall path (`cmd_while`/`cmd_if` evaluate the value with the
+    /// full tree-walk semantics, including transparent-body error framing).
+    fn body_inlinable(&self, cmd: &Command, idx: usize) -> bool {
+        match &cmd.words[idx] {
+            Word::Literal(s) => {
+                s.is_empty()
+                    || (self.is_verbatim_braced(cmd, idx, s) && crate::parse(s).is_ok())
+            }
+            _ => false,
+        }
+    }
+
     /// Compile a word that represents a script body **inline**.
     ///
     /// For braced `Word::Literal` bodies (the common case) the body value is
@@ -608,10 +627,8 @@ impl Compiler {
     /// enclosing unit ([`Compiler::span_base`]/[`Compiler::line_base`]),
     /// keeping every emitted site pointing into the one shared source.
     ///
-    /// Quoted or computed bodies carry a value that differs from their
-    /// source slice; those (and bodies that fail to parse) fall back to
-    /// `EvalScript`, which evaluates the value at runtime with the exact
-    /// tree-walk semantics (including its error frames).
+    /// Callers gate with [`Compiler::body_inlinable`]; non-verbatim bodies
+    /// fall back to `EvalScript` here only defensively.
     fn compile_body_inline(&mut self, word: &Word, cmd: &Command, word_idx: usize) {
         if let Word::Literal(s) = word {
             if s.is_empty() {
@@ -737,11 +754,15 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_for_inline() {
+    fn test_compile_for_dyncall() {
+        // `for` is deliberately not folded: its compiled loop would send a
+        // `continue` in the next script back to the next step, while tclsh's
+        // next-script continue escapes the loop (for-8.2..for-8.12).  The
+        // real cmd_for runs via DynCall instead.
         let bc = Compiler::compile_script("for {set i 0} {$i < 10} {incr i} { set x $i }").unwrap();
         let ops = bc.ops();
-        assert!(ops.iter().any(|o| matches!(o, OpCode::LoopEnter { .. })));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::LoopExit)));
+        assert!(!ops.iter().any(|o| matches!(o, OpCode::LoopEnter { .. })));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::DynCall { .. })));
     }
 
     #[test]

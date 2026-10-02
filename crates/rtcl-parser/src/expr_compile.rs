@@ -15,6 +15,13 @@ use crate::opcode::OpCode;
 /// Returns `true` if the expression was successfully compiled inline.
 /// Returns `false` if the expression is too complex — caller should
 /// fall back to `PushConst + EvalExpr`.
+///
+/// `&&`/`||` are deliberately NOT compiled: the tree-walk normalises their
+/// result to `1`/`0` regardless of the selected operand (tclsh), which a
+/// stack-shaped short-circuit cannot express without extra result-conversion
+/// ops — and their internal jumps would also collide with the executor's
+/// not-taken-jump body-entry tracking.  `parse_bitor` stops at `&&`/`||`,
+/// leaving tokens unconsumed → `false`.
 pub fn try_compile_expr(bytecode: &mut ByteCode, expr: &str, line: u32) -> bool {
     let tokens = match tokenize(expr) {
         Some(t) => t,
@@ -23,8 +30,25 @@ pub fn try_compile_expr(bytecode: &mut ByteCode, expr: &str, line: u32) -> bool 
     if tokens.is_empty() {
         return false;
     }
+    // eq/ne compare operands as *strings as written*: a numeric literal
+    // token lost its raw text at tokenization (`01` became Int(1)), so
+    // any expression mixing the two would compare "1" where tclsh
+    // compares "01" (expr-8.17).  Such expressions stay on the runtime
+    // evaluator, which keeps literal text.
+    let has_numeric = tokens.iter().any(|t| matches!(t, Token::Int(_) | Token::Float(_)));
+    let has_strcmp = tokens.iter().any(|t| matches!(t, Token::StrEq | Token::StrNe));
+    if has_numeric && has_strcmp {
+        return false;
+    }
+    // A bare operand (`expr {$a}`) is not a passthrough: tclsh converts a
+    // numeric-looking string to its number ("0o00123" → 83,
+    // compExpr-1.4).  Single-token expressions stay on the runtime
+    // evaluator, which owns that conversion.
+    if tokens.len() == 1 {
+        return false;
+    }
     let mut parser = ExprCodegen { bytecode, tokens: &tokens, pos: 0, line };
-    if parser.parse_or().is_err() {
+    if parser.parse_bitor().is_err() {
         return false;
     }
     // Must have consumed all tokens
@@ -204,10 +228,10 @@ fn tokenize(expr: &str) -> Option<Vec<Token>> {
             match word.as_str() {
                 "eq" => { tokens.push(Token::StrEq); continue; }
                 "ne" => { tokens.push(Token::StrNe); continue; }
-                // "true"/"false" as boolean literals
-                "true" => { tokens.push(Token::Int(1)); continue; }
-                "false" => { tokens.push(Token::Int(0)); continue; }
-                // Function calls, "in"/"ni", etc — bail out
+                // Boolean keywords, function calls, "in"/"ni", etc — bail
+                // out.  `expr true` must evaluate to the STRING "true"
+                // (the runtime evaluator preserves it; an Int(1) token
+                // would render "1").
                 _ => return None,
             }
         }
@@ -271,44 +295,6 @@ impl<'a> ExprCodegen<'a> {
     }
 
     // -- Precedence levels (lowest to highest) --
-
-    /// Logical OR `||` (short-circuit)
-    ///
-    /// Emits: LHS → Dup → JumpTrue(end) → Pop → RHS → end:
-    /// If LHS is true, skip RHS and keep LHS on stack.
-    fn parse_or(&mut self) -> CResult {
-        self.parse_and()?;
-        while self.match_tok(&Token::Or) {
-            // Dup LHS, test it — if true, skip RHS
-            self.bytecode.emit(OpCode::Dup, self.line);
-            let jump_idx = self.bytecode.emit(OpCode::JumpTrue(0), self.line);
-            // LHS was false — pop it, evaluate RHS
-            self.bytecode.emit(OpCode::Pop, self.line);
-            self.parse_and()?;
-            let end = self.bytecode.current_offset();
-            self.bytecode.patch_jump(jump_idx, end);
-        }
-        Ok(())
-    }
-
-    /// Logical AND `&&` (short-circuit)
-    ///
-    /// Emits: LHS → Dup → JumpFalse(end) → Pop → RHS → end:
-    /// If LHS is false, skip RHS and keep LHS on stack.
-    fn parse_and(&mut self) -> CResult {
-        self.parse_bitor()?;
-        while self.match_tok(&Token::And) {
-            // Dup LHS, test it — if false, skip RHS
-            self.bytecode.emit(OpCode::Dup, self.line);
-            let jump_idx = self.bytecode.emit(OpCode::JumpFalse(0), self.line);
-            // LHS was true — pop it, evaluate RHS
-            self.bytecode.emit(OpCode::Pop, self.line);
-            self.parse_bitor()?;
-            let end = self.bytecode.current_offset();
-            self.bytecode.patch_jump(jump_idx, end);
-        }
-        Ok(())
-    }
 
     /// Bitwise OR `|`
     fn parse_bitor(&mut self) -> CResult {
@@ -457,7 +443,11 @@ impl<'a> ExprCodegen<'a> {
             self.bytecode.emit(OpCode::Neg, self.line);
             Ok(())
         } else if self.match_tok(&Token::Plus) {
-            self.parse_unary()
+            // tclsh's unary plus FORCES numeric interpretation
+            // (execute-7.26: `+ $x` on a hex string yields decimal) — a
+            // passthrough would return the raw string.  No plus op exists
+            // in the ISA: fall back to the runtime evaluator.
+            Err(())
         } else if self.match_tok(&Token::Not) {
             self.parse_unary()?;
             self.bytecode.emit(OpCode::Not, self.line);
@@ -491,7 +481,7 @@ impl<'a> ExprCodegen<'a> {
                 Ok(())
             }
             Some(Token::LParen) => {
-                self.parse_or()?;
+                self.parse_bitor()?;
                 if !self.match_tok(&Token::RParen) {
                     return Err(());
                 }
@@ -542,13 +532,12 @@ mod tests {
     }
 
     #[test]
-    fn logical_and() {
-        let ops = compile_expr("$x > 0 && $y < 10").unwrap();
-        assert!(ops.iter().any(|o| matches!(o, OpCode::Gt)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::Lt)));
-        // Short-circuit: Dup + JumpFalse instead of And
-        assert!(ops.iter().any(|o| matches!(o, OpCode::Dup)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::JumpFalse(_))));
+    fn logical_and_not_compiled() {
+        // && / || stay uncompiled: their Tcl result is a normalized 1/0
+        // (not the selected operand) and their internal jumps would break
+        // the executor's body-entry tracking.
+        assert!(compile_expr("$x > 0 && $y < 10").is_none());
+        assert!(compile_expr("$x || $y").is_none());
     }
 
     #[test]
@@ -580,8 +569,11 @@ mod tests {
 
     #[test]
     fn single_constant() {
-        let ops = compile_expr("1").unwrap();
-        assert_eq!(ops, vec![OpCode::PushInt(1)]);
+        // Bare operands stay on the runtime evaluator: tclsh converts a
+        // numeric-looking string (`expr {$a}` with $a = "0o00123" → 83,
+        // compExpr-1.4), which the passthrough push would not do.
+        assert!(compile_expr("1").is_none());
+        assert!(compile_expr("$x").is_none());
     }
 
     #[test]
@@ -626,10 +618,24 @@ mod tests {
 
     #[test]
     fn boolean_keywords() {
-        let ops = compile_expr("true").unwrap();
-        assert_eq!(ops, vec![OpCode::PushInt(1)]);
-        let ops = compile_expr("false").unwrap();
-        assert_eq!(ops, vec![OpCode::PushInt(0)]);
+        // `expr true` must keep evaluating to the string "true" — the
+        // compiled path has no boolean tokens (an Int(1) would render
+        // "1"), so the expression falls back to the runtime evaluator.
+        assert!(compile_expr("true").is_none());
+        assert!(compile_expr("false").is_none());
+    }
+
+    #[test]
+    fn strcmp_with_numeric_literal_not_compiled() {
+        // eq/ne compare operands as written: `01 eq 1` is "01" vs "1"
+        // (0), but tokenization normalized 01 → Int(1) ("1" vs "1" → 1).
+        // The whole expression stays on the runtime evaluator.
+        assert!(compile_expr("01 eq 1").is_none());
+        assert!(compile_expr("01eq1").is_none());
+        assert!(compile_expr("$x eq 02").is_none());
+        // String/var-only eq stays compiled.
+        // (string literals aren't tokenized at all — var/var eq compiles)
+        assert!(compile_expr("$s eq $t").is_some());
     }
 
     #[test]
@@ -646,20 +652,10 @@ mod tests {
 
     #[test]
     fn complex_expr() {
-        let ops = compile_expr("$i >= 0 && $i < $n").unwrap();
+        // `||` is not compiled, but the bare comparison still is.
+        assert!(compile_expr("$i >= 0 || $i < $n").is_none());
+        let ops = compile_expr("$i >= 0").unwrap();
         assert!(ops.iter().any(|o| matches!(o, OpCode::Ge)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::Lt)));
-        // Short-circuit: Dup + JumpFalse instead of And
-        assert!(ops.iter().any(|o| matches!(o, OpCode::Dup)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::JumpFalse(_))));
-    }
-
-    #[test]
-    fn short_circuit_or() {
-        let ops = compile_expr("$x || $y").unwrap();
-        // Short-circuit: Dup + JumpTrue
-        assert!(ops.iter().any(|o| matches!(o, OpCode::Dup)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::JumpTrue(_))));
     }
 
     #[test]

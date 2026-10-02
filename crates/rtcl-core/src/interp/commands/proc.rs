@@ -129,10 +129,12 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
+    let compiled = super::super::vm_exec::compile_proc_body(&body, interp.tier1_epoch);
     let proc_def = ProcDef {
         params: defaults,
         body,
         statics,
+        compiled,
     };
 
     // Redefining a command is a silent delete+create (tclsh 8.6.17): no
@@ -145,6 +147,9 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     {
         interp.wipe_cmd_exec_traces(&name);
     }
+    // A proc named like an inline-folded Tier1 command (`proc set {...}`)
+    // invalidates every compiled body that folded that command.
+    super::super::vm_exec::note_tier1_mutation(interp, &name);
     interp.procs.insert(name, super::super::Rc::new(proc_def));
     Ok(Value::empty())
 }
@@ -263,6 +268,7 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         params: defaults,
         body,
         statics: HashMap::new(),
+        compiled: None,
     };
 
     // Create args for call_proc: [name, arg1, arg2, ...]
@@ -843,6 +849,14 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let cut = new_key.rfind("::").unwrap();
         let ns = if cut == 0 { "::" } else { &new_key[..cut] };
         super::namespace::ensure_namespace(&mut interp.namespaces, ns);
+    }
+
+    // A rename touching a Tier1-named command — either end — invalidates
+    // compiled bodies (the old binding's fold may now be shadowed, or a
+    // shadow just went away; the bump only costs those bodies the VM).
+    super::super::vm_exec::note_tier1_mutation(interp, &old_key);
+    if !new_key.is_empty() {
+        super::super::vm_exec::note_tier1_mutation(interp, &new_key);
     }
 
     // Rename in builtins

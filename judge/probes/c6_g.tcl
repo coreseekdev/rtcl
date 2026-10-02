@@ -1,0 +1,5 @@
+catch {expr 01eq1} r; puts "8.17: $r"
+catch {expr 500000000000000<<28} r; puts "24.10: $r"
+catch {expr 7244019458077122840<<1} r; puts "24.12: $r"
+catch {expr 1%(1<<63)} r; puts "32.3: $r"
+catch {expr true} r; puts "21.2: $r"

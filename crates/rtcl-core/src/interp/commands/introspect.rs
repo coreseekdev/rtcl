@@ -54,6 +54,7 @@ pub fn cmd_alias(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let prefix_args: Vec<String> = args[3..].iter().map(|a| a.as_str().to_string()).collect();
 
     // Store the alias definition
+    super::super::vm_exec::note_tier1_mutation(interp, &new_name);
     interp.aliases.insert(new_name.clone(), AliasInfo {
         target: target_cmd,
         prefix_args,

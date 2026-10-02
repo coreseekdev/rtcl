@@ -480,6 +480,9 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 && def.namespace != qualified
                 && !def.namespace.starts_with(&prefix)
         });
+        // The dying tree may have held a Tier1-named command — a coarse
+        // sweep bump is cheaper than enumerating what just went away.
+        super::super::vm_exec::note_tier1_sweep(interp);
     }
     Ok(Value::empty())
 }
@@ -902,11 +905,13 @@ fn ns_import(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             ));
         }
         for key in removes {
+            super::super::vm_exec::note_tier1_mutation(interp, &key);
             interp.procs.remove(&key);
             interp.ensembles.remove(&key);
             move_alias_origins(interp, &key, "");
         }
         for (target, full_name) in binds {
+            super::super::vm_exec::note_tier1_mutation(interp, &target);
             interp.import_aliases.insert(target, full_name);
         }
     }
@@ -948,6 +953,7 @@ fn ns_forget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .is_some();
             !(in_cur && from_src)
         });
+        super::super::vm_exec::note_tier1_sweep(interp);
     }
     Ok(Value::empty())
 }

@@ -202,6 +202,10 @@ pub struct Interp {
     /// call/iteration (procs, loops) skip re-tokenization.  Entries are
     /// bounded (see `eval`) — wasm32 is a target.
     pub(crate) parse_cache: HashMap<String, Rc<Vec<rtcl_parser::Command>>>,
+    /// `check_expr` verdict memo: expr text → `Err(msg)` on syntax error,
+    /// `Ok(())` when clean (see `types::expr::eval_expr`).  Pure function
+    /// of the text; loop conditions re-check every iteration.
+    pub(crate) expr_check_cache: HashMap<String, Result<(), String>>,
     /// Call stack depth (for recursion limit).
     pub(crate) call_depth: usize,
     /// Maximum call depth.
@@ -433,6 +437,7 @@ impl Interp {
             command_meta: HashMap::new(),
             procs: HashMap::new(),
             parse_cache: HashMap::new(),
+            expr_check_cache: HashMap::new(),
             call_depth: 0,
             max_call_depth: 1000,
             result: Value::empty(),

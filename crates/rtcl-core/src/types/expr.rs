@@ -16,7 +16,28 @@ pub fn eval_expr(interp: &mut Interp, expr: &str) -> Result<Value> {
     // evaluation; run the same syntax pre-pass and log its errorInfo
     // frame the way the C parser does (ERR_ALREADY_LOGGED: the harness
     // continues the accumulated info with `invoked from within`).
-    if let Err(msg) = super::expr_check::check_expr(expr) {
+    //
+    // check_expr is a pure function of the text (a tclCompExpr.c port
+    // that only inspects syntax), and loop conditions re-run it every
+    // iteration — memoize the verdict.  Failures are memoized too: the
+    // message is deterministic; the err_info frame is rebuilt per call
+    // exactly as before.
+    const EXPR_CHECK_CACHE_MAX: usize = 4096;
+    const EXPR_CHECK_CACHE_MAX_EXPR: usize = 65_536;
+    let verdict = match interp.expr_check_cache.get(expr) {
+        Some(v) => v.clone(),
+        None => {
+            let v = super::expr_check::check_expr(expr);
+            if expr.len() <= EXPR_CHECK_CACHE_MAX_EXPR {
+                if interp.expr_check_cache.len() >= EXPR_CHECK_CACHE_MAX {
+                    interp.expr_check_cache.clear();
+                }
+                interp.expr_check_cache.insert(expr.to_string(), v.clone());
+            }
+            v
+        }
+    };
+    if let Err(msg) = verdict {
         interp.err_info =
             Some(format!("{}\n{}", msg, super::expr_check::parsing_frame(expr)));
         interp.err_fresh = false;

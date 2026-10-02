@@ -22,6 +22,7 @@ extern crate alloc;
 
 // Core modules — error and value re-export from rtcl-vm
 pub mod error;
+pub mod host;
 pub mod value;
 pub mod parser;
 pub mod interp;

@@ -9,6 +9,7 @@ use regex::Regex;
 #[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
 use regex_lite::Regex;
 
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 /// Escape regex metacharacters (for Tcl's `***=` literal prefix).
 fn regex_escape(s: &str) -> String {
     let mut out = String::new();
@@ -29,6 +30,7 @@ fn regex_escape(s: &str) -> String {
 /// `(?s)`), `-linestop` restores Rust's plain behavior, and
 /// `-lineanchor`/`-line` make `^`/`$` match at line boundaries (`(?m)`).
 /// A leading `***=` makes the rest of the pattern a literal string.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 pub(crate) fn build_pattern(
     pattern: &str,
     nocase: bool,
@@ -232,6 +234,7 @@ pub(crate) fn engine_group_count(_eng: &Engine, pattern: &str) -> usize {
 /// (`integer?[+-]integer?` or `end?[+-]integer?`).  tclsh resolves
 /// `end` to the string *length* here (not length-1), so `-start end-1`
 /// points at the last character.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 fn parse_start_index(s: &str, len: usize) -> std::result::Result<usize, String> {
     let bad = || {
         format!(
@@ -268,6 +271,7 @@ fn parse_start_index(s: &str, len: usize) -> std::result::Result<usize, String> 
     Ok(idx.max(0) as usize)
 }
 
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 /// Byte offset of char index `ci` (clamped to the string length).
 fn char_to_byte(s: &str, ci: usize) -> usize {
     s.char_indices()
@@ -276,6 +280,7 @@ fn char_to_byte(s: &str, ci: usize) -> usize {
         .unwrap_or(s.len())
 }
 
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 /// Char index of byte offset `bi` (which must lie on a char boundary).
 fn byte_to_char(s: &str, bi: usize) -> usize {
     s[..bi].chars().count()
@@ -283,6 +288,7 @@ fn byte_to_char(s: &str, bi: usize) -> usize {
 
 /// Captured groups of one match as byte ranges into the haystack the
 /// search ran on; `None` for groups that did not participate.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 type GroupRanges = Vec<Option<(usize, usize)>>;
 
 #[cfg(feature = "regexp")]
@@ -296,6 +302,7 @@ fn regex_caps_at(re: &Regex, text: &str, start: usize) -> Option<GroupRanges> {
         .map(|caps| (0..caps.len()).map(|j| caps.get(j).map(|m| (m.start(), m.end()))).collect())
 }
 
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 /// Does the pattern use `\A` outside a character class?  Tcl binds
 /// `\A` to the -start offset (the virtual string start), which the
 /// engine models by searching a slice with `\A` rewritten to `^`.
@@ -328,6 +335,7 @@ fn has_string_anchor(pat: &str) -> bool {
 /// relative to `full`.  `^`/`$` keep their true-string meaning (the
 /// closure uses `captures_at`), while `\A` binds to each scan start
 /// (the closure searches a slice).
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 fn collect_matches(
     full: &str,
     mut attempt: impl FnMut(usize) -> Option<GroupRanges>,
@@ -367,6 +375,7 @@ fn collect_matches(
     out
 }
 
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 /// Count capturing groups for `-about`: unescaped `(` outside classes
 /// that does not start a `(?` construct.
 fn count_groups(pat: &str) -> usize {
@@ -389,6 +398,7 @@ fn count_groups(pat: &str) -> usize {
     n
 }
 
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 /// Non-greedy quantifier present (`+?` `*?` `??` `}?`)?
 fn pattern_is_nongreedy(pat: &str) -> bool {
     let b = pat.as_bytes();
@@ -402,6 +412,7 @@ fn pattern_is_nongreedy(pat: &str) -> bool {
 
 /// Constructs POSIX ERE cannot express (Perl classes like `\d`,
 /// lookaround, `(?` groups)?  Non-greedy quantifiers count too.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 fn pattern_is_nonposix(pat: &str, nongreedy: bool) -> bool {
     if nongreedy {
         return true;
@@ -429,6 +440,7 @@ fn pattern_is_nonposix(pat: &str, nongreedy: bool) -> bool {
 ///
 /// Returns 1 if the regular expression matches, 0 otherwise.
 /// If match variables are provided, stores the matched text.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     const USAGE: &str =
         "wrong # args: should be \"regexp ?-option ...? exp string ?matchVar? ?subMatchVar ...?\"";
@@ -594,6 +606,7 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 /// Set match variables from collected group ranges.
 fn set_match_var_groups(
     interp: &mut Interp,
@@ -633,6 +646,7 @@ fn set_match_var_groups(
 /// `regsub ?switches? exp string subSpec ?varName?`
 ///
 /// Substitutes regex matches. Returns the substituted string or count.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     const USAGE: &str =
         "wrong # args: should be \"regsub ?-option ...? exp string subSpec ?varName?\"";
@@ -765,6 +779,7 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// Expand a Tcl regsub substitution spec against one match's groups:
 /// `&`/`\0` → whole match, `\1`–`\9` → submatch, `\&`/`\\` → literal,
 /// `\X` (other) → the backslash is retained before X.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 fn expand_sub_spec(out: &mut String, spec: &str, groups: &GroupRanges, full: &str) {
     let group_text = |n: usize| -> &str {
         groups

@@ -1,95 +1,47 @@
-//! A write-only channel that forwards `puts` output to a JavaScript callback.
+//! JS 实现的宿主控制台：把 `puts` 输出转发给 JavaScript 回调。
 
-use std::io;
 use wasm_bindgen::prelude::*;
-use rtcl_core::channel::Channel;
+use rtcl_core::host::HostConsole;
 use crate::js_command::js_error_message;
 
-/// Write-only stdout replacement backed by a JS callback.
+/// 以 JS 回调为落点的 [`HostConsole`] 实现。
 ///
-/// Bytes are buffered and converted to a string on flush, so a `puts`
-/// invocation reaches the callback as one complete UTF-8 chunk.
+/// 每次 `puts` 触发一次回调（含行尾换行，-nonewline 时不带）；回调抛
+/// 异常则转成 `Err`，`puts` 报 `error writing "stdout": <消息>`。
 ///
 /// # Safety
-/// `Send` is required by `Channel`, but `js_sys::Function` is not `Send`.
-/// WASM runs single-threaded and the handle is only used from the JS thread,
-/// so sharing the callback across a `Send` bound is sound in practice.
-pub struct JsOutputChannel {
+/// `Send` 由 `HostConsole` 要求，而 `js_sys::Function` 不是 `Send`。
+/// WASM 单线程运行，句柄只从 JS 线程使用，跨 `Send` 界共享回调在实践中
+/// 是可靠的。
+pub struct JsConsole {
     callback: js_sys::Function,
-    buf: Vec<u8>,
 }
 
-// SAFETY: single-threaded WASM — see doc comment above.
-unsafe impl Send for JsOutputChannel {}
+// SAFETY: 单线程 WASM —— 见上方 doc 注释。
+unsafe impl Send for JsConsole {}
 
-impl JsOutputChannel {
+impl JsConsole {
     pub fn new(callback: js_sys::Function) -> Self {
-        JsOutputChannel { callback, buf: Vec::new() }
+        JsConsole { callback }
     }
 
-    fn emit(&mut self) -> io::Result<()> {
-        if self.buf.is_empty() {
-            return Ok(());
-        }
-        let s = String::from_utf8_lossy(&self.buf).into_owned();
-        self.buf.clear();
+    fn write(&self, s: &str) -> Result<(), String> {
         self.callback
-            .call1(&JsValue::NULL, &JsValue::from_str(&s))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, js_error_message(&e)))?;
-        Ok(())
+            .call1(&JsValue::NULL, &JsValue::from_str(s))
+            .map(|_| ())
+            .map_err(|e| js_error_message(&e))
     }
 }
 
-impl Channel for JsOutputChannel {
-    fn read_bytes(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-        Err(io::Error::new(io::ErrorKind::PermissionDenied, "channel \"stdout\" wasn't opened for reading"))
+impl HostConsole for JsConsole {
+    fn write_stdout(&self, s: &str) -> Result<(), String> {
+        self.write(s)
     }
 
-    fn read_line(&mut self) -> io::Result<Option<String>> {
-        Err(io::Error::new(io::ErrorKind::PermissionDenied, "channel \"stdout\" wasn't opened for reading"))
-    }
-
-    fn read_all(&mut self) -> io::Result<String> {
-        Err(io::Error::new(io::ErrorKind::PermissionDenied, "channel \"stdout\" wasn't opened for reading"))
-    }
-
-    fn write_bytes(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(data);
-        Ok(data.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.emit()
-    }
-
-    fn seek(&mut self, _whence: io::SeekFrom) -> io::Result<u64> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "stdout is not seekable"))
-    }
-
-    fn tell(&mut self) -> io::Result<u64> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "stdout is not seekable"))
-    }
-
-    fn eof(&self) -> bool {
-        false
-    }
-
-    fn close(self: Box<Self>) -> io::Result<()> {
-        // Flush any buffered bytes before the channel goes away.
-        let mut this = *self;
-        this.emit()?;
+    // 与既有 wasm 行为一致：stderr 保持静默（原生 wasm 的 stdio 落点
+    // 本身也是无声丢弃）。需要 stderr 分流时给 HostConsole 增补第二个
+    // 回调即可。
+    fn write_stderr(&self, _s: &str) -> Result<(), String> {
         Ok(())
-    }
-
-    fn is_readable(&self) -> bool {
-        false
-    }
-
-    fn is_writable(&self) -> bool {
-        true
-    }
-
-    fn channel_type(&self) -> &'static str {
-        "js-output"
     }
 }

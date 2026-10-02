@@ -315,6 +315,9 @@ pub struct Interp {
     /// Channel table (stdin/stdout/stderr + opened files/pipes).
     #[cfg(feature = "std")]
     pub channels: crate::channel::ChannelTable,
+    /// 宿主控制台服务：无 `io` 特性构建里 `puts` 的 stdout/stderr 落点
+    /// （原生 stdio，或 wasm 宿主注入的 JS 实现）。
+    pub(crate) console: Box<dyn crate::host::HostConsole>,
     /// Alias definitions (name → target + prefix args).
     pub(crate) aliases: HashMap<String, commands::introspect::AliasInfo>,
     /// Reference table for ref/getref/setref.
@@ -432,6 +435,13 @@ impl Interp {
             script_name: String::new(),
             #[cfg(feature = "std")]
             channels: crate::channel::ChannelTable::new(),
+            console: {
+                #[cfg(feature = "std")]
+                let c: Box<dyn crate::host::HostConsole> = Box::new(crate::host::NativeConsole);
+                #[cfg(not(feature = "std"))]
+                let c: Box<dyn crate::host::HostConsole> = Box::new(crate::host::NullConsole);
+                c
+            },
             aliases: HashMap::new(),
             references: HashMap::new(),
             next_ref_id: 0,
@@ -466,6 +476,12 @@ impl Interp {
         if let Err(e) = self.eval(STDLIB_TCL) {
             panic!("stdlib.tcl failed to load: {e}");
         }
+    }
+
+    /// 注入宿主控制台实现（wasm 宿主由此把 `puts` 的输出接到 JS 回调；
+    /// 原生构建默认已是 [`crate::host::NativeConsole`]，无需调用）。
+    pub fn set_console(&mut self, console: Box<dyn crate::host::HostConsole>) {
+        self.console = console;
     }
 
     /// Populate special global variables (`$env`, `$tcl_platform`, etc.).

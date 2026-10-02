@@ -1,5 +1,6 @@
 //! I/O and file commands: puts, source, file, format, glob.
 
+#[cfg(feature = "io")]
 use super::chan_io;
 use crate::error::{Error, Result};
 use crate::interp::Interp;
@@ -41,45 +42,103 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         _ => return Err(Error::wrong_args_with_usage("puts", 2, args.len(), "?-nonewline? ?channelId? string")),
     }
 
-    if !interp.channels.contains(chan_id) {
-        return Err(chan_io::chan_not_found(interp, chan_id));
-    }
-
-    // Reflected channels (chan create) write through their handler script.
-    if chan_io::reflected_write(interp, chan_id, msg)? {
-        if !nonewline {
-            chan_io::reflected_write(interp, chan_id, "\n")?;
+    // ── 非 io 构建：宿主控制台路径 ─────────────────────────────────
+    // stdout/stderr 走 HostConsole 服务（原生 stdio，或 wasm 宿主经
+    // set_console 注入的 JS 实现）；stdin 不可写；其余通道视为不存在。
+    #[cfg(all(feature = "std", not(feature = "io")))]
+    {
+        let newline = if nonewline { "" } else { "\n" };
+        let out = format!("{}{}", msg, newline);
+        match chan_id {
+            "stdout" => interp.console.write_stdout(&out).map_err(|e| {
+                Error::runtime(
+                    format!("error writing \"stdout\": {}", e),
+                    crate::error::ErrorCode::Io,
+                )
+            })?,
+            "stderr" => interp.console.write_stderr(&out).map_err(|e| {
+                Error::runtime(
+                    format!("error writing \"stderr\": {}", e),
+                    crate::error::ErrorCode::Io,
+                )
+            })?,
+            "stdin" => return Err(puts_not_opened(interp, chan_id, false)),
+            _ => return Err(puts_chan_not_found(interp, chan_id)),
         }
         return Ok(Value::empty());
     }
-    // Channel transforms (chan push) filter bytes through their handler.
-    let out = match chan_io::transform_write(interp, chan_id, msg)? {
-        Some(data) => data,
-        None => msg.to_string(),
-    };
-    let newline = if nonewline { String::new() } else { "\n".to_string() };
-    let out = if newline.is_empty() { out } else { format!("{}{}", out, newline) };
 
-    let ch = interp.channels.get_mut(chan_id)
-        .ok_or_else(|| Error::runtime(
-            format!("can not find channel named \"{}\"", chan_id),
+    // ── io 构建：完整通道栈（反射通道、变换、缓冲与 flush）──────
+    #[cfg(feature = "io")]
+    {
+        if !interp.channels.contains(chan_id) {
+            return Err(chan_io::chan_not_found(interp, chan_id));
+        }
+
+        // Reflected channels (chan create) write through their handler script.
+        if chan_io::reflected_write(interp, chan_id, msg)? {
+            if !nonewline {
+                chan_io::reflected_write(interp, chan_id, "\n")?;
+            }
+            return Ok(Value::empty());
+        }
+        // Channel transforms (chan push) filter bytes through their handler.
+        let out = match chan_io::transform_write(interp, chan_id, msg)? {
+            Some(data) => data,
+            None => msg.to_string(),
+        };
+        let newline = if nonewline { String::new() } else { "\n".to_string() };
+        let out = if newline.is_empty() { out } else { format!("{}{}", out, newline) };
+
+        let ch = interp.channels.get_mut(chan_id)
+            .ok_or_else(|| Error::runtime(
+                format!("can not find channel named \"{}\"", chan_id),
+                crate::error::ErrorCode::Io,
+            ))?;
+        if !ch.is_writable() {
+            return Err(chan_io::not_opened(interp, chan_id, false));
+        }
+
+        crate::channel::channel_write_str(ch.as_mut(), &out).map_err(|e| Error::runtime(
+            format!("error writing \"{}\": {}", chan_id, e),
             crate::error::ErrorCode::Io,
         ))?;
-    if !ch.is_writable() {
-        return Err(chan_io::not_opened(interp, chan_id, false));
+
+        ch.flush().map_err(|e| Error::runtime(
+            format!("error flushing \"{}\": {}", chan_id, e),
+            crate::error::ErrorCode::Io,
+        ))?;
+
+        Ok(Value::empty())
     }
+}
 
-    crate::channel::channel_write_str(ch.as_mut(), &out).map_err(|e| Error::runtime(
-        format!("error writing \"{}\": {}", chan_id, e),
+/// 非 io 构建的通道缺失错误（与 chan_io::chan_not_found 同一 tclsh
+/// 消息与 ::errorCode 形状；那个助手在 io 特性下）。
+#[cfg(all(feature = "std", not(feature = "io")))]
+fn puts_chan_not_found(interp: &mut Interp, id: &str) -> Error {
+    super::list::set_error_code(
+        interp,
+        &format!("TCL LOOKUP CHANNEL {}", crate::value::tcl_quote(id)),
+    );
+    Error::runtime(
+        format!("can not find channel named \"{}\"", id),
         crate::error::ErrorCode::Io,
-    ))?;
+    )
+}
 
-    ch.flush().map_err(|e| Error::runtime(
-        format!("error flushing \"{}\": {}", chan_id, e),
+/// 非 io 构建的通道方向错误（与 chan_io::not_opened 同形）。
+#[cfg(all(feature = "std", not(feature = "io")))]
+fn puts_not_opened(interp: &mut Interp, id: &str, reading: bool) -> Error {
+    super::list::set_error_code(interp, "NONE");
+    Error::runtime(
+        format!(
+            "channel \"{}\" wasn't opened for {}",
+            id,
+            if reading { "reading" } else { "writing" }
+        ),
         crate::error::ErrorCode::Io,
-    ))?;
-
-    Ok(Value::empty())
+    )
 }
 
 #[cfg(not(feature = "std"))]

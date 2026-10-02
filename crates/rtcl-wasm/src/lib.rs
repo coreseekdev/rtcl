@@ -42,10 +42,12 @@ impl RtclHandle {
     }
 
     /// Route `puts` (stdout) output to a JavaScript callback.
+    ///
+    /// 注入 rtcl-core 的 `HostConsole` 宿主控制台服务：无 `io` 特性构建
+    /// 下 `puts` 的 stdout/stderr 都经该 trait 落到 JS。
     pub fn set_output_handler(&mut self, callback: js_sys::Function) -> Result<(), JsValue> {
         self.interp
-            .channels
-            .set_stdout(Box::new(output::JsOutputChannel::new(callback)));
+            .set_console(Box::new(output::JsConsole::new(callback)));
         Ok(())
     }
 }

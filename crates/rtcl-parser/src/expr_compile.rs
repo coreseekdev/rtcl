@@ -739,4 +739,45 @@ mod tests {
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoadVar(_))));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::Not)));
     }
+
+    // -- Folding only when exact: Tcl widens i64 overflow to bignum,
+    //    floors / and %, errors on negative shifts.  Those expressions
+    //    must stay UNFOLDED so runtime expr_ops computes the semantics.
+
+    #[test]
+    fn no_fold_on_overflow() {
+        // i64::MAX + 1 widens to a bignum at runtime — must not wrap-fold
+        let ops = compile_expr_with_peephole("9223372036854775807 + 1").unwrap();
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Add)));
+        let ops = compile_expr_with_peephole("0 - 9223372036854775807 - 2").unwrap();
+        assert!(ops.iter().filter(|o| matches!(o, OpCode::Sub)).count() >= 1);
+    }
+
+    #[test]
+    fn no_fold_negative_div_mod() {
+        // Floor division: -7/2 is -4 (not Rust's truncating -3)
+        let ops = compile_expr_with_peephole("-7 / 2").unwrap();
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Div)));
+        // Mod sign follows the dividend
+        let ops = compile_expr_with_peephole("-7 % 2").unwrap();
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Mod)));
+    }
+
+    #[test]
+    fn no_fold_negative_shift() {
+        // Negative shift counts error at runtime — must not mask-fold
+        let ops = compile_expr_with_peephole("1 << -1").unwrap();
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Shl)));
+        let ops = compile_expr_with_peephole("1 >> -1").unwrap();
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Shr)));
+    }
+
+    #[test]
+    fn fold_positive_div_mod() {
+        // a≥0, b>0: floor == trunc, fold applies
+        let ops = compile_expr_with_peephole("7 / 2").unwrap();
+        assert_eq!(ops, vec![OpCode::PushInt(3)]);
+        let ops = compile_expr_with_peephole("7 % 2").unwrap();
+        assert_eq!(ops, vec![OpCode::PushInt(1)]);
+    }
 }

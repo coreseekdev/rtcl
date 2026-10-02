@@ -192,6 +192,13 @@ impl ByteCode {
         let mut changed = false;
 
         // --- 3-op constant folding ---
+        //
+        // Fold ONLY when the folded result is exactly what runtime
+        // evaluation would produce: Tcl widens i64 overflow to bignum,
+        // floors `/`/`%` (== trunc only in the a≥0, b>0 domain), errors
+        // on negative shift counts, and errors on huge exponents.  When
+        // a fold doesn't apply, leave the ops — the executor's shared
+        // expr_ops helpers compute the exact semantics.
         if len >= 3 {
             let mut i = 0;
             while i + 2 < len {
@@ -199,13 +206,16 @@ impl ByteCode {
                     let a = *a;
                     let b = *b;
                     let folded = match &self.ops[i + 2] {
-                        OpCode::Add => Some(FoldResult::Int(a.wrapping_add(b))),
-                        OpCode::Sub => Some(FoldResult::Int(a.wrapping_sub(b))),
-                        OpCode::Mul => Some(FoldResult::Int(a.wrapping_mul(b))),
-                        OpCode::Div if b != 0 => Some(FoldResult::Int(a / b)),
-                        OpCode::Mod if b != 0 => Some(FoldResult::Int(a % b)),
-                        OpCode::Pow if b >= 0 && b <= u32::MAX as i64 => {
-                            Some(FoldResult::Int(a.wrapping_pow(b as u32)))
+                        OpCode::Add => a.checked_add(b).map(FoldResult::Int),
+                        OpCode::Sub => a.checked_sub(b).map(FoldResult::Int),
+                        OpCode::Mul => a.checked_mul(b).map(FoldResult::Int),
+                        // Floor division == truncating only for a≥0, b>0
+                        OpCode::Div if a >= 0 && b > 0 => Some(FoldResult::Int(a / b)),
+                        OpCode::Mod if a >= 0 && b > 0 => Some(FoldResult::Int(a % b)),
+                        // checked_pow matches runtime exactly (unit cases
+                        // included); huge exponents error at runtime.
+                        OpCode::Pow if (0..(1 << 28)).contains(&b) => {
+                            a.checked_pow(b as u32).map(FoldResult::Int)
                         }
                         OpCode::Eq  => Some(FoldResult::Bool(a == b)),
                         OpCode::Ne  => Some(FoldResult::Bool(a != b)),
@@ -216,8 +226,14 @@ impl ByteCode {
                         OpCode::BitAnd => Some(FoldResult::Int(a & b)),
                         OpCode::BitOr  => Some(FoldResult::Int(a | b)),
                         OpCode::BitXor => Some(FoldResult::Int(a ^ b)),
-                        OpCode::Shl => Some(FoldResult::Int(a.wrapping_shl((b & 63) as u32))),
-                        OpCode::Shr => Some(FoldResult::Int(a.wrapping_shr((b & 63) as u32))),
+                        OpCode::Shl if (0..64).contains(&b) => {
+                            a.checked_shl(b as u32).map(FoldResult::Int)
+                        }
+                        // Arithmetic >> saturates past the width, matching Tcl
+                        OpCode::Shr if b >= 64 => {
+                            Some(FoldResult::Int(if a < 0 { -1 } else { 0 }))
+                        }
+                        OpCode::Shr if b >= 0 => Some(FoldResult::Int(a >> b)),
                         _ => None,
                     };
                     if let Some(result) = folded {

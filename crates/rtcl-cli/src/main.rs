@@ -61,12 +61,6 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
     let script = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read file '{}': {}", path.display(), e))?;
 
-    // Pre-parse for rich diagnostics on syntax errors
-    if let Err(e) = rtcl_parser::parse(&script) {
-        report_parse_error(&e, &script, Some(&path.to_string_lossy()));
-        return Err(String::new());
-    }
-
     let result = interp.eval(&script);
 
     if let Err(e) = result {
@@ -84,12 +78,6 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
 
 fn run_command(cmd: &str, quiet: bool) -> Result<(), String> {
     let mut interp = Interp::new();
-
-    // Pre-parse for rich diagnostics on syntax errors
-    if let Err(e) = rtcl_parser::parse(cmd) {
-        report_parse_error(&e, cmd, None);
-        return Err(String::new());
-    }
 
     let result = interp.eval(cmd)
         .map_err(|e| e.to_string())?;

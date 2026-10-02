@@ -245,10 +245,8 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     #[cfg(feature = "regexp")]
     let re = if mode == Mode::Regexp {
         Some(
-            super::regexp_cmds::compile_engine(pat_val.as_str(), nocase, false, false, false)
-                .map_err(|e| {
-                    tcl_err(format!("couldn't compile regular expression pattern: {}", e))
-                })?,
+            super::regexp_cmds::compile_engine_tc(interp, pat_val.as_str(), nocase, false, false, false)
+                .map_err(tcl_err)?,
         )
     } else {
         None

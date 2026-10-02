@@ -605,6 +605,11 @@ impl Interp {
                     self.bump_stamp(&loc);
                 }
             } else if self.loc_base_exists(&loc) {
+                let base = name.split('(').next().unwrap_or(name);
+                crate::interp::commands::list::set_error_code(
+                    self,
+                    &format!("TCL LOOKUP VARNAME {}", base),
+                );
                 return Err(Error::runtime(
                     format!("can't set \"{}\": variable isn't array", name),
                     ErrorCode::Generic,
@@ -658,17 +663,29 @@ impl Interp {
                     let _ = self.fire_traces(&base, Some(&idx), "unset");
                     Ok(())
                 } else {
+                    crate::interp::commands::list::set_error_code(
+                        self,
+                        &format!("TCL LOOKUP ELEMENT {}", idx),
+                    );
                     Err(Error::runtime(
                         format!("can't unset \"{}\": no such element in array", name),
                         ErrorCode::NotFound,
                     ))
                 }
             } else if self.loc_base_exists(&loc) {
+                crate::interp::commands::list::set_error_code(
+                    self,
+                    &format!("TCL LOOKUP VARNAME {}", base),
+                );
                 return Err(Error::runtime(
                     format!("can't unset \"{}\": variable isn't array", name),
                     ErrorCode::Generic,
                 ));
             } else {
+                crate::interp::commands::list::set_error_code(
+                    self,
+                    &format!("TCL LOOKUP VARNAME {}", base),
+                );
                 return Err(Error::runtime(
                     format!("can't unset \"{}\": no such variable", name),
                     ErrorCode::NotFound,
@@ -723,6 +740,10 @@ impl Interp {
                 self.var_traces.remove(&sk);
                 self.elem_traces.remove(&sk);
                 self.trace_phantoms.remove(&sk);
+                crate::interp::commands::list::set_error_code(
+                    self,
+                    &format!("TCL LOOKUP VARNAME {}", name),
+                );
                 Err(Error::runtime(
                     format!("can't unset \"{}\": no such variable", name),
                     ErrorCode::NotFound,
@@ -925,6 +946,7 @@ impl Interp {
             }
             match alive(self) {
                 None | Some(false) => {
+                    crate::interp::commands::list::set_error_code(self, "TCL READ VARNAME");
                     return Err(Error::runtime(
                         format!("can't read \"{}({})\": no such variable", base, elem),
                         ErrorCode::Generic,
@@ -1444,7 +1466,16 @@ mod tests {
 
     #[test]
     fn test_no_errorcode_write_for_plain_lookup_errors() {
-        // tclsh: a missing variable/command does not set an ARITH errorCode.
-        assert_eq!(interp_eval("catch {set nosuchvar} m; set ::errorCode"), "NONE");
+        // tclsh: a missing variable read stamps `TCL LOOKUP VARNAME` (no
+        // ARITH code); a missing variable WRITE doesn't exist (set
+        // creates), and a wholly fresh interp has no errorCode at all.
+        assert_eq!(
+            interp_eval("catch {set nosuchvar} m; set ::errorCode"),
+            "TCL LOOKUP VARNAME nosuchvar"
+        );
+        assert_eq!(
+            interp_eval("set created 5; catch {set ::errorCode} m; set m"),
+            "can't read \"::errorCode\": no such variable"
+        );
     }
 }

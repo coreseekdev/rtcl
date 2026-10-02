@@ -108,7 +108,9 @@ fn parse_braced_word(cur: &mut Cursor) -> ParseResult<Word> {
         message: "missing close-brace".into(),
         line: err_line,
         column: 0,
-        offset: cur.pos(),
+        // tclsh logs the partial command THROUGH the unclosed opener
+        // (`set x {`) — report the opener's offset, not scan end.
+        offset: start - 1,
     })
 }
 
@@ -123,6 +125,7 @@ fn parse_quoted_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word> 
 
     let mut tokens = Tokens::new();
     let mut start = cur.pos();
+    let opener = start - 1;
 
     while !cur.at_end() {
         match cur.peek() {
@@ -165,7 +168,8 @@ fn parse_quoted_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word> 
         message: "missing \"".into(),
         line: err_line,
         column: 0,
-        offset: cur.pos(),
+        // tclsh logs the partial command through the opening quote.
+        offset: opener,
     })
 }
 
@@ -490,7 +494,8 @@ pub fn parse_cmd_sub(cur: &mut Cursor, _bracket_term: bool) -> ParseResult<Strin
         message: "missing close-bracket".into(),
         line: err_line,
         column: 0,
-        offset: cur.pos(),
+        // tclsh logs the partial command through the `[`.
+        offset: start - 1,
     })
 }
 

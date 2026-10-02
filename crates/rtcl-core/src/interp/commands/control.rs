@@ -685,19 +685,21 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // ::errorCode: a raise site that installed it (scan formats,
             // exec CHILDSTATUS, `error`, `return -errorcode`) wins;
             // otherwise the error variant derives it (TCL WRONGARGS,
-            // ARITH DIVZERO, TCL LOOKUP ...) — tclsh resets the code for
-            // every new error (rename-3.1).
+            // ARITH DIVZERO) and plain errors reset the var to NONE —
+            // tclsh resets the code for every new error (rename-3.1) and
+            // the var always exists after an error (fresh interp:
+            // `info exists errorCode` → 0 until then).
             if code == 1 {
                 if interp.err_code_raised {
                     interp.err_code_raised = false;
                 } else {
-                    // Derived codes: wrong-args and arithmetic only —
-                    // tclsh leaves plain var/command lookup errors at
-                    // NONE (vars.rs unit test).
+                    // Derived codes: tclsh stamps a code on every error —
+                    // wrong-args (TCL WRONGARGS), arithmetic (ARITH ...),
+                    // var lookups (TCL LOOKUP/READ VARNAME), unknown
+                    // commands (TCL LOOKUP COMMAND); plain errors reset
+                    // the var to NONE.
                     let tec = e.tcl_error_code();
-                    if tec == "TCL WRONGARGS" || tec.starts_with("ARITH ") {
-                        let _ = interp.set_var("::errorCode", Value::from_str(&tec));
-                    }
+                    let _ = interp.set_var("::errorCode", Value::from_str(&tec));
                 }
             }
             if let Some(ov) = opts_var {

@@ -146,6 +146,9 @@ impl Interp {
                             usage.push_str(p);
                         }
                     }
+                    // tclsh stamps errorCode `TCL WRONGARGS` on proc
+                    // arity errors, like builtin wrong-#-args errors.
+                    super::commands::list::set_error_code(self, "TCL WRONGARGS");
                     break Err(Error::Msg(format!(
                         "wrong # args: should be \"{}\"",
                         usage

@@ -25,6 +25,242 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
+/// Quantifier-arrival state for the ARE scan: a quantifier must follow an
+/// operand; `?` right after a quantifier is its lazy marker.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+#[derive(PartialEq, Clone, Copy)]
+enum ArePrev {
+    None,
+    Operand,
+    Quant,
+    Lazy,
+}
+
+/// Left-to-right Tcl-ARE compile-time validation: `Some((REG code,
+/// message))` for patterns tclsh's regexp compiler rejects before
+/// matching — `regexp {a**} x` → "quantifier operand invalid"
+/// (REG_BADRPT), `{a{2,1}}` → REG_BADBR, `{a\}` → REG_EESCAPE, `{[[:foo:]]}`
+/// → REG_ECTYPE, unbalanced `(`/`[` → REG_EPAREN/REG_EBRACK.  rtcl's
+/// engines alone are more lenient and would silently accept some of
+/// these.  Only the six rejection classes are detected; everything else
+/// keeps the engines' own behavior.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+pub(crate) fn validate_are(pattern: &str) -> Option<(&'static str, String)> {
+    const POSIX_CLASSES: &[&str] = &[
+        "alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space",
+        "upper", "word", "xdigit", "<", ">",
+    ];
+    let b = pattern.as_bytes();
+    // Tcl's `***=` literal prefix: everything after it is literal text —
+    // no ARE syntax to validate (regexp-1.8: `regexp -- "***=o"`).
+    if b.starts_with(b"***=") {
+        return None;
+    }
+    let mut i = 0usize;
+    let mut prev = ArePrev::None;
+    let mut depth = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => {
+                if i + 1 >= b.len() {
+                    return Some((
+                        "REG_EESCAPE",
+                        "invalid escape \\ sequence".to_string(),
+                    ));
+                }
+                // Alphanumeric escapes must be ones Tcl's ARE knows
+                // (`\Q..\E` quoting is Perl-only — tclsh rejects it);
+                // punctuation escapes are literal.
+                let esc = b[i + 1];
+                if esc.is_ascii_alphanumeric() && !esc.is_ascii_digit() && !b"dDsSwWbBAZzmMyYCNceNntrfvUux".contains(&esc)
+                {
+                    return Some((
+                        "REG_EESCAPE",
+                        "invalid escape \\ sequence".to_string(),
+                    ));
+                }
+                i += 2;
+                prev = ArePrev::Operand;
+            }
+            b'[' => {
+                // Bracket expression: scan to its `]` (a leading `]`,
+                // after optional `^`, is a literal), validating
+                // [:class:] runs along the way.
+                let mut j = i + 1;
+                if j < b.len() && b[j] == b'^' {
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b']' {
+                    j += 1;
+                }
+                let mut closed = false;
+                while j < b.len() {
+                    if b[j] == b']' {
+                        closed = true;
+                        j += 1;
+                        break;
+                    }
+                    if b[j] == b'[' && j + 1 < b.len() && b[j + 1] == b':' {
+                        if let Some(rel) = b[j + 2..].windows(2).position(|w| w == b":]") {
+                            let name = String::from_utf8_lossy(&b[j + 2..j + 2 + rel]);
+                            if !POSIX_CLASSES.contains(&name.as_ref()) {
+                                return Some((
+                                    "REG_ECTYPE",
+                                    "invalid character class".to_string(),
+                                ));
+                            }
+                            j += 2 + rel + 2;
+                            continue;
+                        }
+                    }
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                if !closed {
+                    return Some((
+                        "REG_EBRACK",
+                        "brackets [] not balanced".to_string(),
+                    ));
+                }
+                i = j;
+                prev = ArePrev::Operand;
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+                prev = ArePrev::None;
+            }
+            b')' => {
+                if depth == 0 {
+                    return Some((
+                        "REG_EPAREN",
+                        "parentheses () not balanced".to_string(),
+                    ));
+                }
+                depth -= 1;
+                i += 1;
+                prev = ArePrev::Operand;
+            }
+            b'*' | b'+' => match prev {
+                ArePrev::Operand => {
+                    prev = ArePrev::Quant;
+                    i += 1;
+                }
+                _ => {
+                    return Some((
+                        "REG_BADRPT",
+                        "quantifier operand invalid".to_string(),
+                    ))
+                }
+            },
+            b'?' => match prev {
+                ArePrev::Operand => {
+                    prev = ArePrev::Quant;
+                    i += 1;
+                }
+                ArePrev::Quant => {
+                    prev = ArePrev::Lazy;
+                    i += 1;
+                }
+                // `(?:`, `(?i`, `(?=` — group syntax, not a quantifier.
+                ArePrev::None if i > 0 && b[i - 1] == b'(' => {
+                    i += if i + 1 < b.len() && b[i + 1] == b':' { 2 } else { 1 };
+                    continue;
+                }
+                _ => {
+                    return Some((
+                        "REG_BADRPT",
+                        "quantifier operand invalid".to_string(),
+                    ))
+                }
+            },
+            b'{' if prev == ArePrev::Operand => {
+                // Bound `{m}` `{m,}` `{m,n}` `{,n}`: well-formed bounds
+                // with m > n are rejected; malformed braces are literals.
+                let mut j = i + 1;
+                let mut m: usize = 0;
+                let mut m_len = 0usize;
+                while j < b.len() && b[j].is_ascii_digit() {
+                    m = m * 10 + (b[j] - b'0') as usize;
+                    j += 1;
+                    m_len += 1;
+                }
+                let mut n: Option<usize> = None;
+                let mut well_formed = m_len > 0;
+                if j < b.len() && b[j] == b',' {
+                    well_formed = true;
+                    let mut k = j + 1;
+                    let mut nv: usize = 0;
+                    let mut n_len = 0usize;
+                    while k < b.len() && b[k].is_ascii_digit() {
+                        nv = nv * 10 + (b[k] - b'0') as usize;
+                        k += 1;
+                        n_len += 1;
+                    }
+                    if n_len > 0 {
+                        n = Some(nv);
+                    }
+                    j = k;
+                }
+                if well_formed && j < b.len() && b[j] == b'}' {
+                    if let Some(nv) = n {
+                        if m > nv {
+                            return Some((
+                                "REG_BADBR",
+                                "invalid repetition count(s)".to_string(),
+                            ));
+                        }
+                    }
+                    i = j + 1;
+                    prev = ArePrev::Quant;
+                } else {
+                    i += 1;
+                    prev = ArePrev::Operand;
+                }
+            }
+            b'|' => {
+                i += 1;
+                prev = ArePrev::None;
+            }
+            // Anchors and literal characters are operands (lenient: a
+            // quantifier on an anchor keeps today's engine behavior).
+            _ => {
+                i += 1;
+                prev = ArePrev::Operand;
+            }
+        }
+    }
+    if depth > 0 {
+        return Some((
+            "REG_EPAREN",
+            "parentheses () not balanced".to_string(),
+        ));
+    }
+    None
+}
+
+/// `compile_engine` plus tclsh's compile-failure contract: an ARE the
+/// validator rejects yields exactly tclsh's message ("couldn't compile
+/// regular expression pattern: ...") and a `REGEXP REG_* {...}`
+/// errorCode.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+pub(crate) fn compile_engine_tc(
+    interp: &mut Interp,
+    pattern: &str,
+    nocase: bool,
+    expanded: bool,
+    lineanchor: bool,
+    linestop: bool,
+) -> std::result::Result<Engine, String> {
+    if let Some((code, msg)) = validate_are(pattern) {
+        super::list::set_error_code(interp, &format!("REGEXP {} {{{}}}", code, msg));
+        return Err(format!(
+            "couldn't compile regular expression pattern: {}",
+            msg
+        ));
+    }
+    compile_engine(pattern, nocase, expanded, lineanchor, linestop)
+}
+
 /// Build regex pattern string from flags.  Tcl's newline sensitivity
 /// differs from Rust's defaults: by default `.` matches newline (Rust's
 /// `(?s)`), `-linestop` restores Rust's plain behavior, and
@@ -496,13 +732,8 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // -about: report {numGroups flags} without needing a string.
     if about {
-        let eng = compile_engine(pattern_str, nocase, expanded, lineanchor, linestop)
-            .map_err(|e| {
-                Error::runtime(
-                    format!("couldn't compile regular expression pattern: {}", e),
-                    ErrorCode::Generic,
-                )
-            })?;
+        let eng = compile_engine_tc(interp, pattern_str, nocase, expanded, lineanchor, linestop)
+            .map_err(|e| Error::runtime(e, ErrorCode::Generic))?;
         let nongreedy = pattern_is_nongreedy(pattern_str);
         let mut flags: Vec<&str> = Vec::new();
         if pattern_is_nonposix(pattern_str, nongreedy) {
@@ -543,12 +774,8 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         None => 0,
     };
 
-    let eng = compile_engine(pattern_str, nocase, expanded, lineanchor, linestop).map_err(|e| {
-        Error::runtime(
-            format!("couldn't compile regular expression pattern: {}", e),
-            ErrorCode::Generic,
-        )
-    })?;
+    let eng = compile_engine_tc(interp, pattern_str, nocase, expanded, lineanchor, linestop)
+        .map_err(|e| Error::runtime(e, ErrorCode::Generic))?;
 
     let attempt = |p: usize| -> Option<GroupRanges> { engine_attempt(&eng, full_string, p) };
     let matches = collect_matches(full_string, attempt, char_len, char_start, all);
@@ -707,12 +934,8 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
     let byte_start = char_to_byte(full_string, char_start);
 
-    let eng = compile_engine(pattern_str, nocase, expanded, lineanchor, linestop).map_err(|e| {
-        Error::runtime(
-            format!("couldn't compile regular expression pattern: {}", e),
-            ErrorCode::Generic,
-        )
-    })?;
+    let eng = compile_engine_tc(interp, pattern_str, nocase, expanded, lineanchor, linestop)
+        .map_err(|e| Error::runtime(e, ErrorCode::Generic))?;
 
     if command_mode {
         // -command: evaluate sub_spec as command prefix for each match

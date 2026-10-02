@@ -405,11 +405,30 @@ impl Error {
             Error::Runtime { message, .. } if message.starts_with("domain error") => {
                 "ARITH DOMAIN {domain error: argument not in valid range}".to_string()
             }
+            Error::Runtime { message, .. } if message.starts_with("can't read \"") => {
+                // tclsh read errors: a missing element in an existing
+                // array is bare `TCL READ VARNAME` (no name); a read
+                // against a non-array (`$b(0)`) or an array read as a
+                // scalar blames `TCL LOOKUP VARNAME` with the base name.
+                if message.contains("no such element in array") {
+                    "TCL READ VARNAME".to_string()
+                } else if let Some(q0) = message.find('"') {
+                    let rest = &message[q0 + 1..];
+                    let name = rest.split('"').next().unwrap_or(rest);
+                    let base = name.split('(').next().unwrap_or(name);
+                    format!("TCL LOOKUP VARNAME {}", base)
+                } else {
+                    "NONE".to_string()
+                }
+            }
             Error::InvalidCommand { name } => {
                 format!("TCL LOOKUP COMMAND {}", crate::value::tcl_quote(name))
             }
             Error::VarNotFound { name } => {
-                format!("TCL LOOKUP VARNAME {}", crate::value::tcl_quote(name))
+                // An element read of a wholly-missing array (`$zz(5)`)
+                // blames the base name: `TCL LOOKUP VARNAME zz`.
+                let base = name.split('(').next().unwrap_or(name);
+                format!("TCL LOOKUP VARNAME {}", crate::value::tcl_quote(base))
             }
             Error::WrongNumArgs { .. } | Error::WrongArgsMsg(_) => {
                 "TCL WRONGARGS".to_string()

@@ -539,8 +539,8 @@ impl Interp {
         // --- $tcl_interactive ---
         self.globals.insert("tcl_interactive".to_string(), Value::from_int(0));
 
-        // --- $errorCode, $errorInfo (empty until an error occurs) ---
-        self.globals.insert("errorCode".to_string(), Value::from_str("NONE"));
+        // --- $errorInfo (empty until an error occurs); $errorCode does
+        // not exist until an error sets it (tclsh: info exists → 0) ---
         self.globals.insert("errorInfo".to_string(), Value::from_str(""));
 
         // --- $auto_path (empty list — package system can populate later) ---

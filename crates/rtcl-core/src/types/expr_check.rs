@@ -230,6 +230,7 @@ pub fn check_expr(expr: &str) -> Result<(), String> {
             match c.resolve_bareword(start, scanned) {
                 BarewordResolve::Function => Lx::Function,
                 BarewordResolve::Bool => Lx::BoolLit,
+                BarewordResolve::Numeric => Lx::Number,
                 BarewordResolve::Error(msg) => return Err(msg),
             }
         } else {
@@ -370,6 +371,7 @@ pub fn check_expr(expr: &str) -> Result<(), String> {
 enum BarewordResolve {
     Function,
     Bool,
+    Numeric,
     Error(String),
 }
 
@@ -454,7 +456,9 @@ impl<'a> Checker<'a> {
     }
 
     /// Resolve a BAREWORD lexeme at `start`: FUNCTION if followed (over
-    /// whitespace) by `(`, BOOL if a boolean word, else the
+    /// whitespace) by `(`, BOOL if a boolean word, NUMERIC if the word
+    /// parses fully as a number (tclsh: `expr inf` → Inf, `expr nan` →
+    /// NaN — letter-led numbers; `Influence` is no number), else the
     /// invalid-bareword error.
     fn resolve_bareword(&self, start: usize, scanned: usize) -> BarewordResolve {
         let word = self.slice(start, start + scanned);
@@ -470,6 +474,11 @@ impl<'a> Checker<'a> {
         // it prefixes both "on" and "off").
         if crate::types::expr_funcs::bool_from_string(&word).is_some() {
             return BarewordResolve::Bool;
+        }
+        if let Some((len, _)) = scan_number(word.as_bytes()) {
+            if len == word.len() {
+                return BarewordResolve::Numeric;
+            }
         }
         let d = if word.len() >= LIMIT { "..." } else { "" };
         let w = &word[..word.len().min(HEAD)];
@@ -570,32 +579,40 @@ impl<'a> Checker<'a> {
                     }
                 }
                 // Number or bareword, with TclParseNumber's join rule.
-                if let Some((len, dbl)) = scan_number(rest) {
-                    let end = start + len;
-                    if end >= n || !is_bareword(e[end]) {
-                        return Ok((Lx::Number, len, start));
-                    }
-                    // A number followed directly by bareword characters.
-                    // A double-looking token made only of bareword
-                    // characters stays one number (`inf` inside
-                    // `Influence`); a number whose tail is a word
-                    // operator stays a number (`1eq1`); everything else
-                    // joins into a single bareword.
-                    if dbl && e[start..end].iter().all(|&ch| is_bareword(ch)) {
-                        return Ok((Lx::Number, len, start));
-                    }
-                    if matches!(
-                        probe_lexeme(&e[end..]),
-                        Some(Lx::Streq)
-                            | Some(Lx::Strneq)
-                            | Some(Lx::In)
-                            | Some(Lx::Ni)
-                            | Some(Lx::StrLt)
-                            | Some(Lx::StrLe)
-                            | Some(Lx::StrGt)
-                            | Some(Lx::StrGe)
-                    ) {
-                        return Ok((Lx::Number, len, start));
+                // Only digits/dot start a number scan — letter-led words
+                // (`inf`, `nan`, `info`, `Influence`) are barewords, with
+                // full-numeric words resolved later (resolve_bareword).
+                if b.is_ascii_digit() || b == b'.' {
+                    if let Some((len, dbl)) = scan_number(rest) {
+                        let end = start + len;
+                        if end >= n || !is_bareword(e[end]) {
+                            return Ok((Lx::Number, len, start));
+                        }
+                        // A number followed directly by bareword
+                        // characters.  A number whose tail is a word
+                        // operator stays a number (`3eq2` → 0); a
+                        // double-like token ends at the number and its
+                        // tail scans as its own bareword (`1.8x` blames
+                        // "x", `1.p` blames "p", `0x1.8p3` splits at the
+                        // dot — `missing operator` there); an int plus a
+                        // non-operator tail re-joins into one bareword
+                        // (`5x` blames "5x").
+                        if matches!(
+                            probe_lexeme(&e[end..]),
+                            Some(Lx::Streq)
+                                | Some(Lx::Strneq)
+                                | Some(Lx::In)
+                                | Some(Lx::Ni)
+                                | Some(Lx::StrLt)
+                                | Some(Lx::StrLe)
+                                | Some(Lx::StrGt)
+                                | Some(Lx::StrGe)
+                        ) {
+                            return Ok((Lx::Number, len, start));
+                        }
+                        if dbl {
+                            return Ok((Lx::Number, len, start));
+                        }
                     }
                 }
                 if !is_bareword(b) || b == b'_' {

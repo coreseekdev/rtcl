@@ -23,8 +23,38 @@ pub(crate) fn tcl_log_excerpt(text: &str) -> String {
 
 impl Interp {
     pub fn eval(&mut self, script: &str) -> Result<Value> {
-        let commands = parser::parse(script)?;
+        let commands = match rtcl_parser::parse(script) {
+            Ok(commands) => commands,
+            Err(pe) => return Err(self.seed_parse_error(script, &pe)),
+        };
         self.eval_commands(&commands)
+    }
+
+    /// Parse-failure → tclsh errorInfo seeding: the logged frame is the
+    /// failing command's text from its first character through the
+    /// offending delimiter (tclsh logs the partially-consumed command,
+    /// e.g. `set x $a(` for an unclosed array subscript), then the usual
+    /// `(file ...)` exit frame is appended at the top level.  The returned
+    /// Error stays message-only — a catch'd nested parse error is bare
+    /// (tclsh: `catch {set x $a(} m` → `m` = `missing )`).
+    fn seed_parse_error(&mut self, script: &str, pe: &rtcl_parser::ParseError) -> Error {
+        if self.err_info.is_none() {
+            let mut end = (pe.offset + 1).min(script.len());
+            while end > 0 && !script.is_char_boundary(end) {
+                end -= 1;
+            }
+            let start = script[..end]
+                .rfind(|c| c == '\n' || c == ';')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            self.err_info = Some(format!(
+                "{}\n    while executing\n\"{}\"",
+                pe.message,
+                tcl_log_excerpt(&script[start..end])
+            ));
+            self.err_line = pe.line;
+        }
+        Error::syntax(&pe.message, pe.line, pe.column)
     }
 
     /// Run `script` with errorInfo accumulation isolated: internal

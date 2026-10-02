@@ -572,15 +572,19 @@ pub fn cmd_unset(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::empty())
 }
 
-/// A command key's namespace and simple name: bare keys live in `::`,
-/// qualified keys split at their last `::` (`::e1::c1` → `::e1`, `c1`).
+/// A command key's namespace and simple name: keys split at their last
+/// `::` (`::e1::c1` → `::e1`, `c1`; `tcl::mathop::+` → `::tcl::mathop`,
+/// `+`), unqualified keys live in `::`.
 fn split_key_ns(key: &str) -> (String, String) {
     match key.strip_prefix("::") {
         Some(rest) => match rest.rfind("::") {
             None => ("::".to_string(), rest.to_string()),
             Some(i) => (format!("::{}", &rest[..i]), rest[i + 2..].to_string()),
         },
-        None => ("::".to_string(), key.to_string()),
+        None => match key.rfind("::") {
+            Some(i) => (format!("::{}", &key[..i]), key[i + 2..].to_string()),
+            None => ("::".to_string(), key.to_string()),
+        },
     }
 }
 

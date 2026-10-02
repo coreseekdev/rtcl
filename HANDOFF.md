@@ -1,6 +1,6 @@
 # rtcl 工程 Handoff — 多轮修正 → JIT 全任务交接
 
-> 最后更新：2026-10-02（Round 2 完成后，Round 3 进行中）
+> 最后更新：2026-10-02（修正轮已收敛 99.9%，JIT 阶段启动）
 > 用途：任一 agent 读本文件即可接管全部剩余工作，无需对话历史。
 
 ## 0. 项目与仓库
@@ -34,31 +34,20 @@
 
 ## 3. 当前状态（burndown）
 
-- judge：**文件级 20/87，case 级 2346/4072 = 57.6%**（fail 1712，died 14）。
-- 已完成 Round 1（commit `86c1d3b`）与 Round 2（commit `9d27ddb`），修复清单见各自 commit message 与 DIVERGENCES.md 的 [FIXED] 标注。
+- judge：**文件级 87/87 全绿，case 级 4067/4072 = 99.9%**（fail 5，全部在 gen_namespace-old 的 namespace/lsort/variable/proc 边缘组合，died 0）。
+- 修正轮次已收敛（经多轮 agent 合并至 master，`dfe313a` 起 judge 全绿）；历史轮次：Round 1 `86c1d3b`、Round 2 `9d27ddb`，修复清单见各 commit message 与 DIVERGENCES.md 的 [FIXED] 标注（28 条）。
+- 剩余 5 个 case 级失败：namespace-old 边缘语义，低优先，记录备查即可。
+- **下一阶段 = JIT（§5），从 M0 启动。**
 - 历史裁决：
   - **Rc vs Arc**：保持 Rc（wasm 单线程模型；`2257f20` 的静默回退恰好正确）。多 worker 场景每 worker 一个 Interp，不共享。
   - **Value 类型已统一**：rtcl-core 只是 re-export rtcl-vm，无需合并。
   - **bignum 不引入**：整数溢出提升为 f64（与 Tcl bignum 的残留差异已记录在 DIVERGENCES.md）。
 
-## 4. 待办：修正轮次（收敛循环）
+## 4. 修正轮次：已收敛
 
-### Round 3（进行中，三个并行域，prompt 全文在 §6）
+判据达成：judge 文件级 87/87 全绿、case 级 99.9%、无未修复的 semantic-error 级分歧。剩余 5 个 case 为 namespace-old 边缘组合，记录备查、不再追修。
 
-1. **控制流域残留**（agent-13，文件：loops.rs + control.rs）：
-   - E9 残留：while/for/if 条件判定从 `Value::is_true()` 改调 `crate::types::expr_funcs::strict_bool`（pub(crate)，Round 2 已就绪）→ `while {$x}` (x="foo") 应报 `expected boolean value but got "foo"`（judge gen_while-old-4.5 目前死循环撞超时）。
-   - C3：catch options dict 的 `-level` 各分支对齐（ok → `-code 0 -level 0`；return/break/continue → `-code 2/3/4 -level 0`；tclsh 探测为准）。
-   - usage 用词：while/for/foreach 的 wrong-args 中 `body` → Tcl 原文 `command`。
-2. **lsort 排序域**（agent-14，文件：list_sort.rs）：L4/L5，全选项探测（-ascii/-integer/-real/-nocase/-dictionary/-index/-indices/-stride/-command、stability、错误消息原文）；比较复用 expr_funcs 的精确数值比较，禁用 EPSILON 容差。
-3. **字符串域残留**（agent-15，文件：string_cmds.rs）：`string is <class> {}` 非 -strict 空串返回 1 + -strict 标志接线；toupper/tolower 改 1:1 简单映射（ß 不变）；is digit 等 class 的 Unicode/ASCII 范围探测；totitle 格鲁吉亚字母（成本高可跳过并注明）；本文件内 usage 字符串保真。
-
-### Round 3+ 收敛循环（每轮重复）
-
-1. 跑 `./judge/run.sh` + `python3 judge/extract/burndown.py` 取最新 burndown。
-2. 从 BURNDOWN.md 按命令聚类取 top 失败桶，按文件互斥原则切 2–3 个并行域派发 coder agent（模板见 §6）。
-3. 每轮验证：`cargo test --workspace` 全绿、judge 无回退、提交推送。
-4. **收敛判据**：DIVERGENCES.md 无未修复的 semantic-error；case 级 pass ≥ 85%；剩余失败全部是明确的 missing-feature（binary/namespace/apply/oo/regexp 高级特性等，各是独立里程碑）。
-5. **已知的 missing-feature 级大项（不属于修正轮，单列里程碑）**：`binary` 命令（328/328 全挂）、namespace 接线（V4/V5：namespace eval 写到全局、非全限定调用失效）、apply/oo、regexp 完整特性、`-errorstack`/`-errorline`、跨 proc 错误栈帧定位（需 eval 层跟踪）。
+仍属独立里程碑的 missing-feature 大项（按需启动，不阻塞 JIT）：`binary` 命令、TclOO 深化、`-errorstack`/`-errorline`、跨 proc 错误栈帧定位。
 
 ## 5. 待办：JIT（修正收敛后启动）
 

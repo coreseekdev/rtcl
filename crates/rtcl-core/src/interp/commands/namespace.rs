@@ -1282,40 +1282,51 @@ pub(crate) fn find_ensemble(
 /// Resolve an ensemble command name the way dispatch does (exact,
 /// namespace-qualified, `::`-prefixed, colon-run normalise, then through
 /// import-alias origin chains).
+///
+/// Keys are probed one at a time (not collected into a Vec first): this
+/// runs on EVERY dispatch that misses the proc table, so the common case
+/// (a builtin — no ensemble anywhere) must not allocate five candidate
+/// `String`s per command.
 pub(crate) fn find_ensemble_key(interp: &Interp, name: &str) -> Option<String> {
     let cur = &interp.current_namespace;
-    let mut try_keys: Vec<String> = vec![name.to_string()];
+    if interp.ensembles.contains_key(name) {
+        return Some(name.to_string());
+    }
     if cur != "::" && !name.starts_with("::") {
-        try_keys.push(qualify(cur, name));
+        let qualified = qualify(cur, name);
+        if interp.ensembles.contains_key(&qualified) {
+            return Some(qualified);
+        }
     }
     if !name.starts_with("::") {
         // A relative name from the global level names `::name`.
-        try_keys.push(format!("::{}", name));
+        let global = format!("::{}", name);
+        if interp.ensembles.contains_key(&global) {
+            return Some(global);
+        }
     }
     if name.contains("::") {
         let norm = normalise(name);
-        if norm != name {
-            try_keys.push(norm.clone());
+        if norm != name && interp.ensembles.contains_key(&norm) {
+            return Some(norm);
         }
         // An absolute simple name (`::ns`, or a colon run like `::::n1`
         // that normalises to one) reaches an ensemble registered under the
         // bare tail in the parent namespace (ensemble create's default).
+        // Probed even when normalise is the identity (`::ens` → `ens`).
         if let Some(bare) = norm.strip_prefix("::") {
-            if !bare.contains("::") {
-                try_keys.push(bare.to_string());
+            if !bare.contains("::") && interp.ensembles.contains_key(bare) {
+                return Some(bare.to_string());
             }
         }
     }
-    for k in &try_keys {
-        if interp.ensembles.contains_key(k) {
-            return Some(k.clone());
-        }
-    }
-    // Import alias pointing at an ensemble
-    if let Some(found) = lookup_command_key(interp, name) {
-        if let Some(origin) = origin_of(interp, &found) {
-            if interp.ensembles.contains_key(&origin) {
-                return Some(origin);
+    // Import alias pointing at an ensemble (nothing to chase without aliases)
+    if !interp.import_aliases.is_empty() {
+        if let Some(found) = lookup_command_key(interp, name) {
+            if let Some(origin) = origin_of(interp, &found) {
+                if interp.ensembles.contains_key(&origin) {
+                    return Some(origin);
+                }
             }
         }
     }

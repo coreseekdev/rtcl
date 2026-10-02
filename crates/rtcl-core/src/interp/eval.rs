@@ -338,6 +338,16 @@ impl Interp {
                 // Import aliases: follow the chain to the origin so the
                 // proc runs in its definition namespace with its current
                 // body (tclsh: redefining the source is visible).
+                //
+                // Fast path: with no aliases registered, `origin_of`
+                // returns keys the arms above already probed (qualified,
+                // bare, `::name`, `::`-simple) — so this arm is always a
+                // miss and the qualify()/probe storm it costs would be
+                // paid by every builtin dispatch (`set`, `incr`, `expr`
+                // all miss the proc table).  Skip it outright.
+                if self.import_aliases.is_empty() {
+                    return None;
+                }
                 let found = crate::interp::commands::namespace::lookup_command_key(
                     self, cmd_name,
                 )?;

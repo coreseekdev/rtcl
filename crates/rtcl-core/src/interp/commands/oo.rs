@@ -235,11 +235,11 @@ pub(crate) fn init(interp: &mut Interp) {
         let body = format!("::tcl::oo::def {} {{*}}$args", word);
         interp.procs.insert(
             key,
-            ProcDef {
+            super::super::Rc::new(ProcDef {
                 params: vec![("args".to_string(), None)],
                 body,
                 statics: HashMap::new(),
-            },
+            }),
         );
     }
 }

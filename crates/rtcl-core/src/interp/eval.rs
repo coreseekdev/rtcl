@@ -1,6 +1,6 @@
 //! Evaluation methods on [`Interp`] — script parsing and word expansion.
 
-use super::Interp;
+use super::{Interp, Rc};
 use crate::error::{Error, Result};
 use crate::parser::{self, Command, Word};
 use crate::value::Value;
@@ -23,9 +23,32 @@ pub(crate) fn tcl_log_excerpt(text: &str) -> String {
 
 impl Interp {
     pub fn eval(&mut self, script: &str) -> Result<Value> {
-        let commands = match rtcl_parser::parse(script) {
-            Ok(commands) => commands,
-            Err(pe) => return Err(self.seed_parse_error(script, &pe)),
+        // Parse-tree cache: parsing is a pure function of the text, so a
+        // cached tree is interchangeable with a fresh parse — substitutions
+        // all happen after parse, and the AST retains each command's
+        // line/text/word_srcs (loop line-rebasing and `info level 0` are
+        // unaffected).  Hot bodies (procs, loop iterations, catch/try) then
+        // skip re-tokenization entirely.  Failures are never cached.
+        // Entries are bounded: wasm32 is a target and one-shot scripts
+        // (source files, trace callbacks) must not grow it unboundedly.
+        const PARSE_CACHE_MAX: usize = 1024;
+        const PARSE_CACHE_MAX_SCRIPT: usize = 262_144;
+        let cached = self.parse_cache.get(script).cloned();
+        let commands = match cached {
+            Some(rc) => rc,
+            None => {
+                let rc = match rtcl_parser::parse(script) {
+                    Ok(commands) => Rc::new(commands),
+                    Err(pe) => return Err(self.seed_parse_error(script, &pe)),
+                };
+                if script.len() <= PARSE_CACHE_MAX_SCRIPT {
+                    if self.parse_cache.len() >= PARSE_CACHE_MAX {
+                        self.parse_cache.clear();
+                    }
+                    self.parse_cache.insert(script.to_string(), Rc::clone(&rc));
+                }
+                rc
+            }
         };
         self.eval_commands(&commands)
     }

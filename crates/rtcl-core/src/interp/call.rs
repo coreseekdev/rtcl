@@ -16,6 +16,8 @@ use std::collections::HashSet;
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeSet as HashSet;
 
+use super::Rc;
+
 impl Interp {
     /// Call a user-defined procedure.
     ///
@@ -225,7 +227,7 @@ impl Interp {
                             }
                         }
                         if let Some(pdef) = self.procs.get_mut(&current_proc_name) {
-                            pdef.statics.clone_from(&current_statics);
+                            Rc::make_mut(pdef).statics.clone_from(&current_statics);
                         }
                         current_statics = HashMap::new();
                     }
@@ -241,9 +243,9 @@ impl Interp {
                     let cmd_name = tc_args[0].clone();
                     if let Some(new_proc) = self.procs.get(&cmd_name).cloned() {
                         // Tail-call to another proc — reuse the frame (no depth increase)
-                        current_params = new_proc.params;
-                        current_body = new_proc.body;
-                        current_statics = new_proc.statics;
+                        current_params = new_proc.params.clone();
+                        current_body = new_proc.body.clone();
+                        current_statics = new_proc.statics.clone();
                         current_proc_name = cmd_name.clone();
                         current_args = tc_args.into_iter().map(|s| Value::from_str(&s)).collect();
                         // The reused frame's enterstep context now names the
@@ -311,7 +313,7 @@ impl Interp {
                     }
                 }
                 if let Some(pdef) = self.procs.get_mut(&current_proc_name) {
-                    pdef.statics = updated;
+                    Rc::make_mut(pdef).statics = updated;
                 }
             }
         }

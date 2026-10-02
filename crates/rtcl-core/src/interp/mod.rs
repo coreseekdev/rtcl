@@ -38,6 +38,12 @@ use std::collections::HashSet;
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeSet as HashSet;
 
+#[cfg(not(feature = "embedded"))]
+use std::rc::Rc;
+
+#[cfg(feature = "embedded")]
+use alloc::rc::Rc;
+
 /// A procedure definition.
 #[derive(Debug, Clone)]
 pub(crate) struct ProcDef {
@@ -186,8 +192,16 @@ pub struct Interp {
     pub(crate) command_categories: HashMap<String, CommandCategory>,
     /// Command metadata (usage + help) for built-in and registered commands.
     pub(crate) command_meta: HashMap<String, CommandMeta>,
-    /// User-defined procedures.
-    pub(crate) procs: HashMap<String, ProcDef>,
+    /// User-defined procedures.  `Rc` so per-call dispatch clones a
+    /// reference (params + body + statics are NOT copied per call);
+    /// statics write-back goes through `Rc::make_mut`.
+    pub(crate) procs: HashMap<String, Rc<ProcDef>>,
+    /// Parse-tree cache: script text → AST.  Parsing is a pure function
+    /// of the text (substitution happens after parse), so a cached tree
+    /// is interchangeable with a fresh parse; bodies re-evaluated per
+    /// call/iteration (procs, loops) skip re-tokenization.  Entries are
+    /// bounded (see `eval`) — wasm32 is a target.
+    pub(crate) parse_cache: HashMap<String, Rc<Vec<rtcl_parser::Command>>>,
     /// Call stack depth (for recursion limit).
     pub(crate) call_depth: usize,
     /// Maximum call depth.
@@ -416,6 +430,7 @@ impl Interp {
             command_categories: HashMap::new(),
             command_meta: HashMap::new(),
             procs: HashMap::new(),
+            parse_cache: HashMap::new(),
             call_depth: 0,
             max_call_depth: 1000,
             result: Value::empty(),

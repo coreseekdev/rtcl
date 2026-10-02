@@ -145,7 +145,7 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     {
         interp.wipe_cmd_exec_traces(&name);
     }
-    interp.procs.insert(name, proc_def);
+    interp.procs.insert(name, super::super::Rc::new(proc_def));
     Ok(Value::empty())
 }
 

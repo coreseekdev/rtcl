@@ -1,0 +1,129 @@
+# rtcl 工程 Handoff — 多轮修正 → JIT 全任务交接
+
+> 最后更新：2026-10-02（Round 2 完成后，Round 3 进行中）
+> 用途：任一 agent 读本文件即可接管全部剩余工作，无需对话历史。
+
+## 0. 项目与仓库
+
+- 仓库：`git@github.com:coreseekdev/rtcl.git`，本地 checkout `/home/nzinfo/src.note/rtcl`，分支 `master`。
+- 定位：Rust 实现的 Tcl 解释器（jimtcl 血统的轻量定位），target = native + **wasm32-unknown-unknown（预期主路径）** + wasm32-wasip1 + embedded no_std。
+- crate 结构：`rtcl-parser`（递归下降解析 + ByteCode 编译）、`rtcl-ir`（OpCode 三层：primitive / `Call(CmdId)` 0..127 stdlib 128+ 扩展 / `DynCall`）、`rtcl-vm`（execute.rs dispatch 循环 + `VmContext` trait + Value/Error 唯一实现）、`rtcl-core`（Interp + 内建命令，`value.rs`/`error.rs` 只是 re-export）、`rtcl-cli`、`rtcl-wasm`、`rtcl-expect`。
+- Tcl 官方源码（行为 oracle 的测试语料）：`/home/nzinfo/src.note/rtcl/.refer/tcl`（已 gitignore；如被删重新 `git clone --depth 1 https://github.com/tcltk/tcl.git .refer/tcl`）。
+- 系统 oracle：`/usr/bin/tclsh` = Tcl 8.6.17。**一切语义以 tclsh 实测为准，不凭记忆。**
+
+## 1. 基础设施（已建，勿重建）
+
+| 资产 | 路径 | 用法 |
+|---|---|---|
+| judge parity harness | `judge/run.sh` | `./judge/run.sh`（全量）/ `-v <name>`（单文件带 diff）。递归 corpus/ 子目录，15s timeout/文件 |
+| 手写语料 | `judge/corpus/*.tcl` | 10 个，全绿 |
+| 官方测试集语料 | `judge/corpus/gen/gen_*.tcl` | 77 文件 / 4072 case，由提取器生成 |
+| 提取器 | `judge/extract/extract.py` | 保守提取 tcltest 用例，oracle 自验证；勿轻易改协议 |
+| burndown 报表 | `judge/extract/burndown.py` → `judge/BURNDOWN.md` | 生成物，不入 git |
+| allium 行为规格 | `specs/*.allium` | 6 域：interp/expr/list/string/variables/control-flow |
+| 分歧清单 | `specs/DIVERGENCES.md` | 格式：行为声明 \| Tcl 8.6 \| rtcl \| 复现脚本 \| 严重度；修复后标 `[FIXED YYYY-MM-DD]` |
+| 对拍探针 | `specs/probe.sh` | stdin 逐行 Tcl 片段，自动 tclsh vs rtcl diff |
+| 性能基线 | `bench/run.sh` → `bench/BASELINE.md` | rtcl vs tclsh best-of-5；基线：循环/数据结构密集慢 4–16×，string_build 1.5× |
+| 单测 | `cargo test --workspace` | ~746 个，必须保持全绿 |
+
+## 2. 方法论（两条 skill 的硬规则）
+
+- **code-migration**（`~/.claude/skills/code-migration/`）：judge 先行，任何重构/优化不许改变 judge 判据；失败三次即规则 bug（停手改规则，不修实例）；进度报 burndown 数字不报散文。
+- **allium**（`~/.agents/skills/allium/`）：spec 只写可观察行为；分歧必须实际运行佐证；distill（从代码提取 spec）→ weed（spec vs 实现分歧）循环。
+- **修复纪律**：以 tclsh 实测为最高裁判；最小侵入；不顺手重构；不引入新依赖（rtcl 是嵌入式定位）；子任务不 git commit，由协调者统一提交推送；并行 agent 严格文件互斥。
+
+## 3. 当前状态（burndown）
+
+- judge：**文件级 20/87，case 级 2346/4072 = 57.6%**（fail 1712，died 14）。
+- 已完成 Round 1（commit `86c1d3b`）与 Round 2（commit `9d27ddb`），修复清单见各自 commit message 与 DIVERGENCES.md 的 [FIXED] 标注。
+- 历史裁决：
+  - **Rc vs Arc**：保持 Rc（wasm 单线程模型；`2257f20` 的静默回退恰好正确）。多 worker 场景每 worker 一个 Interp，不共享。
+  - **Value 类型已统一**：rtcl-core 只是 re-export rtcl-vm，无需合并。
+  - **bignum 不引入**：整数溢出提升为 f64（与 Tcl bignum 的残留差异已记录在 DIVERGENCES.md）。
+
+## 4. 待办：修正轮次（收敛循环）
+
+### Round 3（进行中，三个并行域，prompt 全文在 §6）
+
+1. **控制流域残留**（agent-13，文件：loops.rs + control.rs）：
+   - E9 残留：while/for/if 条件判定从 `Value::is_true()` 改调 `crate::types::expr_funcs::strict_bool`（pub(crate)，Round 2 已就绪）→ `while {$x}` (x="foo") 应报 `expected boolean value but got "foo"`（judge gen_while-old-4.5 目前死循环撞超时）。
+   - C3：catch options dict 的 `-level` 各分支对齐（ok → `-code 0 -level 0`；return/break/continue → `-code 2/3/4 -level 0`；tclsh 探测为准）。
+   - usage 用词：while/for/foreach 的 wrong-args 中 `body` → Tcl 原文 `command`。
+2. **lsort 排序域**（agent-14，文件：list_sort.rs）：L4/L5，全选项探测（-ascii/-integer/-real/-nocase/-dictionary/-index/-indices/-stride/-command、stability、错误消息原文）；比较复用 expr_funcs 的精确数值比较，禁用 EPSILON 容差。
+3. **字符串域残留**（agent-15，文件：string_cmds.rs）：`string is <class> {}` 非 -strict 空串返回 1 + -strict 标志接线；toupper/tolower 改 1:1 简单映射（ß 不变）；is digit 等 class 的 Unicode/ASCII 范围探测；totitle 格鲁吉亚字母（成本高可跳过并注明）；本文件内 usage 字符串保真。
+
+### Round 3+ 收敛循环（每轮重复）
+
+1. 跑 `./judge/run.sh` + `python3 judge/extract/burndown.py` 取最新 burndown。
+2. 从 BURNDOWN.md 按命令聚类取 top 失败桶，按文件互斥原则切 2–3 个并行域派发 coder agent（模板见 §6）。
+3. 每轮验证：`cargo test --workspace` 全绿、judge 无回退、提交推送。
+4. **收敛判据**：DIVERGENCES.md 无未修复的 semantic-error；case 级 pass ≥ 85%；剩余失败全部是明确的 missing-feature（binary/namespace/apply/oo/regexp 高级特性等，各是独立里程碑）。
+5. **已知的 missing-feature 级大项（不属于修正轮，单列里程碑）**：`binary` 命令（328/328 全挂）、namespace 接线（V4/V5：namespace eval 写到全局、非全限定调用失效）、apply/oo、regexp 完整特性、`-errorstack`/`-errorline`、跨 proc 错误栈帧定位（需 eval 层跟踪）。
+
+## 5. 待办：JIT（修正收敛后启动）
+
+目标：rtcl compile Tcl → wasm module → 实例化执行。**预期路径 = wasm32-unknown-unknown + js-sys `new WebAssembly.Module(bytes)` 同步实例化**（<4KB 模块；per-proc 模块足够小）。
+
+### 架构裁决（已讨论定案）
+
+- **从 rtcl-ir OpCode 出发，不从源码出发**：JIT 是 ByteCode 的第二个消费者（与 rtcl-vm 并列）。primitive opcodes → wasm 原生指令；`Call(CmdId)` → import 调用宿主 `rtcl_cmd_call(id, args, argc)`；`DynCall`/`EvalScript`/`uplevel` → 回调 VmContext 同解释器路径。
+- **粒度 = per-proc module**（Mono jiterpreter 模式）：实例化亚毫秒，失效 = 丢弃单实例。
+- **跨边界值表示 = u32 handle + 运行时侧 `Vec<Value>` arena**；不 import 主实例线性内存（wasm-bindgen 内存导出方案脆弱）。native 侧（wasmtime crate 嵌入）可考虑 externref，后期优化。
+- **快车道 = expr Int**：`InternalRep::Int` 守卫 + i64 直接运算，守卫失败回退 runtime call。收益集中在数值循环（基线显示 4–16× 差距就在这类负载）；字符串/列表密集负载收益有限（1.2–2×），靠后或不 JIT。
+- **失效 = epoch 计数器**：registry.rs 加 epoch（rename/proc redefine/trace 时 bump），JIT 入口一次内存读守卫，失败回解释器。不用反向指针表。
+- **错误传播沿用 Tcl result code**（i32 返回 + out-param），不用 wasm exception。
+- **平台 feature gate**：`rtcl-jit` crate + `jit-wasm`（js-sys 路径）/ `jit-native`（wasmtime 嵌入）两个 feature；wasip1/embedded no_std 永远解释执行。
+- **正确性门 = 三向差分**：tclsh vs rtcl-interp vs rtcl-jit 跑同一 judge 语料（judge/run.sh 加 `--engine jit` 档），外加随机脚本 fuzz。
+- **发射器**：`wasm-encoder` crate（Bytecode Alliance，纯 Rust 可编译进 wasm）。不用 Binaryen（C++ 编译进 wasm 体积大）。
+
+### JIT 里程碑
+
+- **M0**：`rtcl-jit` crate 骨架 + wasm-encoder 发射最小 module（空 proc round-trip：编译→实例化→调用→拿回结果），双 feature 编译通过。验收：单元测试 + wasm32-unknown-unknown 构建绿。
+- **M1**：expr Int 快车道——`expr` bytecode 子集（PushInt/算术/比较/跳转）编译为 wasm i64 指令，InternalRep 守卫。验收：judge 三向差分全绿 + `bench/cases/arith_loop.tcl` 提速 ≥3×。
+- **M2**：proc body + primitive ops（变量经 handle arena）。验收：proc_fib.tcl 提速。
+- **M3**：epoch 失效守卫 + rename/redefine 风暴 fuzz。
+- **M4**：热点 tier-up（proc 调用计数 ~50 阈值）+ 与解释器的无缝回落。
+- 每里程碑 gate：judge 三向全绿 + bench 不回退 + 单测绿。
+
+### 参考先例
+
+Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直接对标）；tclquadcode（Tcl 官方 LLVM JIT 实验，已停滞，其停滞原因 = 语义角落难题集中在 trace/unknown/ensemble，不在代码生成）；CheerpJ。
+
+## 6. 并行 agent 派发模板（code-migration 纪律）
+
+每个并行域的 prompt 必须包含：
+
+```
+你在 rtcl 项目（/home/nzinfo/src.note/rtcl，Rust 实现的 Tcl 解释器）做多轮缺陷修正的 Round N。
+
+## 共同上下文
+- 构建：cargo build --release -p rtcl-cli；快速验证：./target/release/rtcl -c '<script>'；
+  oracle：echo '<script>' | tclsh（Tcl 8.6.17），一切语义以 tclsh 实测为准。
+- 分歧清单：specs/DIVERGENCES.md（[FIXED] 条目别动）；行为规格 specs/*.allium。
+- judge：./judge/run.sh；当前基线见 §3（修复前重新跑一遍取实时基线）。
+  不要在并行构建负载下跑 judge（15s timeout 会抖动；先 cargo test 再 judge）。
+- 硬约束：只许修改分配给你的文件；不许 git commit；不多修分配外条目；
+  修好后 DIVERGENCES.md 标注 [FIXED <当日日期>]；cargo test --workspace 保持全绿；
+  单测断言依赖旧错误行为且新行为才正确的，更新断言并在报告中说明。
+- 原则：最小侵入；不顺手重构；不引入新依赖。
+
+## 你的任务
+<具体条目 + 分配文件清单 + 复现脚本位置>
+
+## 返回
+每条修正的根因一句话 + 修改位置 path:line + 验证证据（前后输出对比）
++ 单测/judge 结果 + 未解决条目及原因。
+```
+
+文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
+
+## 7. 提交规约
+
+- 每轮修正一个 commit，message 格式：`fix: Round N divergence burndown — <主题>`，正文列条目，尾部署名 `Co-Authored-By: Claude <noreply@anthropic.com>`。
+- 提交前必跑：`cargo test --workspace`（全绿）+ `./judge/run.sh`（无回退）。
+- `git push origin HEAD`（master，已配置 ssh）。
+- `.refer/`、`judge/BURNDOWN.md` 以外的新资产都可入库。
+
+## 8. 本文件维护
+
+每完成一轮修正或一个 JIT 里程碑：更新 §3 的数字、§4/§5 的完成状态、补充新裁决。handoff 文件自身入库（`HANDOFF.md` 在仓库根）。

@@ -6,6 +6,7 @@
 
 use crate::opcode::OpCode;
 use core::fmt;
+use std::rc::Rc;
 
 /// Result of a constant-folding operation.
 enum FoldResult {
@@ -13,8 +14,46 @@ enum FoldResult {
     Bool(bool),
 }
 
+/// Byte span into a compilation unit's source text (see [`ByteCode::source`]).
+/// Copy-only; resolving to `&str` is `span.slice(&code.source)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SrcSpan {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl SrcSpan {
+    #[inline]
+    pub fn slice<'a>(&self, src: &'a str) -> &'a str {
+        &src[self.start as usize..self.end as usize]
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        (self.end - self.start) as usize
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+}
+
+/// Source site of one compiled command — what the interpreter's errorInfo
+/// harness needs per dispatched command: the command's text as written,
+/// its line (already rebased to the unit's absolute numbering for inline
+/// bodies), and each word's raw source (braced bodies keep delimiters, so
+/// loop constructs can recover a body's line offset).  Spans resolve
+/// against [`ByteCode::source`].
+#[derive(Debug, Clone)]
+pub struct CmdSite {
+    pub text: SrcSpan,
+    pub line: u32,
+    pub word_srcs: Rc<Vec<SrcSpan>>,
+}
+
 /// Compiled bytecode for a single compilation unit (script / proc body).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ByteCode {
     /// String constant pool — referenced by `PushConst`, `LoadGlobal`, etc.
     constants: Vec<String>,
@@ -24,6 +63,29 @@ pub struct ByteCode {
     locals: Vec<String>,
     /// Source line corresponding to each instruction (parallel to `ops`).
     line_map: Vec<u32>,
+    /// Per-command source sites, referenced by `BeginCmd(site_idx)`.
+    pub sites: Vec<CmdSite>,
+    /// The compilation unit's source text — `sites` spans point into it;
+    /// the executor installs it as the "current command" source.
+    pub source: Rc<str>,
+    /// Set when the compiler met a construct it cannot compile without
+    /// changing semantics (unusual `if` shapes, `return` options, …).
+    /// The consumer must fall back to AST evaluation for the whole unit.
+    pub fallback: bool,
+}
+
+impl Default for ByteCode {
+    fn default() -> Self {
+        Self {
+            constants: Vec::new(),
+            ops: Vec::new(),
+            locals: Vec::new(),
+            line_map: Vec::new(),
+            sites: Vec::new(),
+            source: Rc::from(""),
+            fallback: false,
+        }
+    }
 }
 
 impl ByteCode {

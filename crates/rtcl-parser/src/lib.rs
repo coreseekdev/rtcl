@@ -46,28 +46,8 @@ pub use compiler::Compiler;
 /// `source` (`span.slice(&unit.source)`), so the interpreter's
 /// per-dispatch save/restore of "current command" state is plain moves /
 /// refcount bumps on the one shared source — no per-command heap copies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SrcSpan {
-    pub start: u32,
-    pub end: u32,
-}
-
-impl SrcSpan {
-    #[inline]
-    pub fn slice<'a>(&self, src: &'a str) -> &'a str {
-        &src[self.start as usize..self.end as usize]
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        (self.end - self.start) as usize
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.start == self.end
-    }
-}
+/// Defined in `rtcl-ir` so [`ByteCode`] sites can share the type.
+pub use rtcl_ir::SrcSpan;
 
 /// A parsed script: the command list plus the source text the spans of
 /// each [`Command`] (`text`, `word_srcs`) point into.  Keeping the two

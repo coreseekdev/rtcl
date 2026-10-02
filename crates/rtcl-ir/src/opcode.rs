@@ -449,6 +449,13 @@ pub enum OpCode {
     /// Source-line annotation (for error messages).
     Line(u32),
 
+    /// Start of one compiled command — operand indexes
+    /// [`ByteCode::sites`](crate::ByteCode::sites); the executor loads the
+    /// site's text/line/word source spans as the "current command" context
+    /// for errorInfo and introspection (replacing the tree-walk path's
+    /// per-command bookkeeping).
+    BeginCmd(u32),
+
     /// No operation.
     Nop,
 }
@@ -573,6 +580,7 @@ impl fmt::Display for OpCode {
 
             // Debug
             OpCode::Line(n) => write!(f, "LINE {}", n),
+            OpCode::BeginCmd(site) => write!(f, "BEGIN_CMD {}", site),
             OpCode::Nop => write!(f, "NOP"),
         }
     }

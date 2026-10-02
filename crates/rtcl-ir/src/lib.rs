@@ -15,4 +15,4 @@ pub mod opcode;
 pub mod bytecode;
 
 pub use opcode::{OpCode, CmdId};
-pub use bytecode::ByteCode;
+pub use bytecode::{ByteCode, CmdSite, SrcSpan};

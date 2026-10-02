@@ -16,8 +16,9 @@
 //! 3. **Unknown / dynamic commands** fall back to `DynCall { argc }`.
 
 use crate::{Command, Word};
-use crate::bytecode::ByteCode;
+use crate::bytecode::{ByteCode, CmdSite, SrcSpan};
 use crate::opcode::{OpCode, CmdId};
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // Loop context — tracks the active loop during compilation so that `break`
@@ -39,24 +40,46 @@ pub struct Compiler {
     bytecode: ByteCode,
     /// Stack of active loops (innermost at the end).
     loops: Vec<LoopCtx>,
+    /// The compilation unit's source text — every emitted [`CmdSite`] span
+    /// points into it.  Inline-compiled bodies rebase their (body-relative)
+    /// spans by [`Compiler::span_base`] so all sites share this one string.
+    source: Rc<str>,
+    /// Delta added to the AST spans of the text currently being compiled
+    /// (0 at unit top level; body-value start offset inside a braced body).
+    span_base: u32,
+    /// Line number of the current text's first line (1-based Tcl lines;
+    /// 0 at top level).  Absolute line = `line_base + command.line`.
+    line_base: u32,
 }
 
 impl Compiler {
-    /// Compile a list of parsed commands into [`ByteCode`].
-    pub fn compile(commands: &[Command]) -> ByteCode {
+    /// Compile a parsed unit together with its source text.  `commands`
+    /// spans must point into `source` (as [`crate::ScriptUnit::parse`]
+    /// produces).  Sites referencing the source are emitted per command.
+    pub fn compile_unit(source: Rc<str>, commands: &[Command]) -> ByteCode {
         let mut c = Compiler {
             bytecode: ByteCode::new(),
             loops: Vec::new(),
+            source: Rc::clone(&source),
+            span_base: 0,
+            line_base: 0,
         };
         c.compile_commands(commands);
         c.bytecode.peephole();
+        c.bytecode.source = source;
         c.bytecode
+    }
+
+    /// Compile a list of parsed commands into [`ByteCode`] (no source —
+    /// sites carry empty spans).  Prefer [`Compiler::compile_unit`].
+    pub fn compile(commands: &[Command]) -> ByteCode {
+        Self::compile_unit(Rc::from(""), commands)
     }
 
     /// Compile a Tcl source string in one step (parse + compile).
     pub fn compile_script(source: &str) -> Result<ByteCode, crate::ParseError> {
         let commands = crate::parse(source)?;
-        Ok(Self::compile(&commands))
+        Ok(Self::compile_unit(Rc::from(source), &commands))
     }
 
     // -----------------------------------------------------------------------
@@ -78,10 +101,36 @@ impl Compiler {
             return;
         }
 
-        let line = cmd.line as u32;
-        self.bytecode.emit(OpCode::Line(line), line);
+        let line = self.line_base + cmd.line as u32;
+
+        // Record the command's source site and open its dispatch context —
+        // the executor installs `sites[idx]` (text/line/word spans) as the
+        // "current command" for errorInfo, replacing the tree-walk path's
+        // per-command bookkeeping.
+        let site_idx = self.bytecode.sites.len() as u32;
+        let base = self.span_base;
+        let word_srcs = if base == 0 {
+            Rc::clone(&cmd.word_srcs)
+        } else {
+            Rc::new(
+                cmd.word_srcs
+                    .iter()
+                    .map(|s| SrcSpan { start: s.start + base, end: s.end + base })
+                    .collect(),
+            )
+        };
+        self.bytecode.sites.push(CmdSite {
+            text: SrcSpan { start: cmd.text.start + base, end: cmd.text.end + base },
+            line,
+            word_srcs,
+        });
+        self.bytecode.emit(OpCode::BeginCmd(site_idx), line);
 
         // --- Specialised codegen for known commands (first word is literal) --
+        // Shapes the compiler cannot express exactly degrade to Tier-2/3
+        // dispatch of the real builtin (exact semantics over coverage).
+        // Tier-1 folding assumes the name still resolves to the builtin at
+        // runtime; the executor guards that with its invalidation epoch.
         if let Word::Literal(name) = &cmd.words[0] {
             match name.as_str() {
                 // ── Tier 1: compiled to native opcodes ──────────────────
@@ -116,6 +165,12 @@ impl Compiler {
         self.compile_dyncall(cmd);
     }
 
+    /// Absolute (unit-relative) 1-based line of `cmd`, accounting for any
+    /// inline body being compiled.
+    fn abs_line(&self, cmd: &Command) -> u32 {
+        self.line_base + cmd.line as u32
+    }
+
     // -----------------------------------------------------------------------
     // Word compilation
     // -----------------------------------------------------------------------
@@ -126,7 +181,14 @@ impl Compiler {
                 if s.is_empty() {
                     self.bytecode.emit(OpCode::PushEmpty, line);
                 } else if let Ok(n) = s.parse::<i64>() {
-                    self.bytecode.emit(OpCode::PushInt(n), line);
+                    // PushInt(n) renders as `n.to_string()`, so only fold
+                    // canonical decimal literals — `007` must stay "007",
+                    // `+5` stays "+5" (tclsh set/return are string-exact).
+                    if n.to_string() == *s {
+                        self.bytecode.emit(OpCode::PushInt(n), line);
+                    } else {
+                        self.bytecode.emit_push_const(s, line);
+                    }
                 } else {
                     self.bytecode.emit_push_const(s, line);
                 }
@@ -163,21 +225,20 @@ impl Compiler {
 
     /// `set varName value`
     fn compile_set(&mut self, cmd: &Command) {
-        let line = cmd.line as u32;
-        self.compile_word(&cmd.words[2], line);
+        let line = self.abs_line(cmd);
         if let Word::Literal(name) = &cmd.words[1] {
+            self.compile_word(&cmd.words[2], line);
             let idx = self.bytecode.add_const(name);
             self.bytecode.emit(OpCode::StoreVar(idx), line);
         } else {
-            // Dynamic var name — fall back to DynCall
-            self.bytecode.emit(OpCode::Pop, line);
+            // Dynamic var name — dispatch the real `set`
             self.compile_dyncall(cmd);
         }
     }
 
     /// `set varName` (read-only form)
     fn compile_set_get(&mut self, cmd: &Command) {
-        let line = cmd.line as u32;
+        let line = self.abs_line(cmd);
         if let Word::Literal(name) = &cmd.words[1] {
             let idx = self.bytecode.add_const(name);
             self.bytecode.emit(OpCode::LoadVar(idx), line);
@@ -186,83 +247,74 @@ impl Compiler {
         }
     }
 
-    /// `if expr body ?elseif expr body ...? ?else body?`
+    /// `if expr ?then? body ?elseif expr ?then? body ...? ?else? ?body?`
+    ///
+    /// Compiled inline only when the word sequence matches the Tcl grammar
+    /// exactly; any other shape (dangling `elseif`/`else`, unknown or
+    /// dynamic keyword, missing bodies, words after the else body) is
+    /// dispatched as a DynCall of the real `if` — tclsh's behavior for
+    /// malformed `if` is a command-level arity/syntax error, which only
+    /// `cmd_if` reproduces.  (The tree-walk path's old "implicit else"
+    /// reading of unknown keywords was a deliberate divergence from tcl.)
     fn compile_if(&mut self, cmd: &Command) {
-        let line = cmd.line as u32;
-        let mut end_jumps = Vec::new();
-        let mut i = 1;
-
-        while i < cmd.words.len() {
-            if i > 1 {
-                // "elseif" or "else" keyword
-                if let Word::Literal(kw) = &cmd.words[i] {
-                    match kw.as_str() {
-                        "elseif" => {
-                            i += 1;
-                        }
-                        "else" => {
-                            // Compile the else body inline
-                            i += 1;
-                            if i < cmd.words.len() {
-                                self.compile_body_inline(&cmd.words[i], line);
-                            }
-                            break;
-                        }
-                        "then" => {
-                            // skip optional 'then' keyword — NOT a branch,
-                            // just advance past it and continue the loop
-                            i += 1;
-                            continue;
-                        }
-                        _ => {
-                            // implicit else body
-                            self.compile_body_inline(&cmd.words[i], line);
-                            break;
-                        }
+        // Structural validation: collect (expr_idx, body_idx) arms and an
+        // optional else-body index.  Any deviation → DynCall.
+        let n = cmd.words.len();
+        let mut arms: Vec<(usize, usize)> = Vec::new();
+        let mut else_body: Option<usize> = None;
+        let mut i = 1usize;
+        loop {
+            if i >= n {
+                return self.compile_dyncall(cmd); // dangling keyword / no args
+            }
+            let expr_idx = i;
+            i += 1;
+            if let Some(Word::Literal(kw)) = cmd.words.get(i) {
+                if kw == "then" {
+                    i += 1;
+                }
+            }
+            if i >= n {
+                return self.compile_dyncall(cmd); // condition without body
+            }
+            let body_idx = i;
+            arms.push((expr_idx, body_idx));
+            i += 1;
+            match cmd.words.get(i) {
+                None => break, // no else — false path pushes empty below
+                Some(Word::Literal(kw)) if kw == "elseif" => {
+                    i += 1;
+                }
+                Some(Word::Literal(kw)) if kw == "else" => {
+                    i += 1;
+                    if i + 1 != n {
+                        return self.compile_dyncall(cmd); // missing body / trailing words
                     }
-                } else {
+                    else_body = Some(i);
                     break;
                 }
+                Some(_) => return self.compile_dyncall(cmd), // not a keyword
             }
+        }
 
-            if i + 1 >= cmd.words.len() {
-                break;
-            }
-
-            // Compile the condition
-            self.compile_expr_word(&cmd.words[i], line);
+        let line = self.abs_line(cmd);
+        let mut end_jumps = Vec::new();
+        for (expr_idx, body_idx) in &arms {
+            self.compile_expr_word(&cmd.words[*expr_idx], line);
             let false_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
-            i += 1;
-
-            // Skip optional "then" keyword
-            if i < cmd.words.len() {
-                if let Word::Literal(kw) = &cmd.words[i] {
-                    if kw == "then" {
-                        i += 1;
-                    }
-                }
-            }
-
-            // Compile the then-body inline
-            if i < cmd.words.len() {
-                self.compile_body_inline(&cmd.words[i], line);
-            }
-            i += 1;
-
+            self.compile_body_inline(&cmd.words[*body_idx], cmd, *body_idx);
             let end_jump = self.bytecode.emit(OpCode::Jump(0), line);
             end_jumps.push(end_jump);
-
-            // Patch false jump to here
             let here = self.bytecode.current_offset();
             self.bytecode.patch_jump(false_jump, here);
         }
-
-        // If no branch was taken, push empty
-        if end_jumps.is_empty() {
-            // Simple if with no else: if condition was false, push empty
+        match else_body {
+            Some(bi) => self.compile_body_inline(&cmd.words[bi], cmd, bi),
+            // No else: the false path must still leave a value on the stack
+            None => {
+                self.bytecode.emit(OpCode::PushEmpty, line);
+            }
         }
-
-        // All end-jumps converge here
         let end = self.bytecode.current_offset();
         for j in end_jumps {
             self.bytecode.patch_jump(j, end);
@@ -271,7 +323,7 @@ impl Compiler {
 
     /// `while test body`
     fn compile_while(&mut self, cmd: &Command) {
-        let line = cmd.line as u32;
+        let line = self.abs_line(cmd);
 
         // Emit LoopEnter (targets patched later)
         let loop_enter = self.bytecode.emit(
@@ -298,7 +350,7 @@ impl Compiler {
         let exit_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
 
         // Compile the body inline
-        self.compile_body_inline(&cmd.words[2], line);
+        self.compile_body_inline(&cmd.words[2], cmd, 2);
         self.bytecode.emit(OpCode::Pop, line); // discard body result
 
         // Jump back to loop start
@@ -326,10 +378,10 @@ impl Compiler {
 
     /// `for start test next body`
     fn compile_for(&mut self, cmd: &Command) {
-        let line = cmd.line as u32;
+        let line = self.abs_line(cmd);
 
         // Compile "start" inline
-        self.compile_body_inline(&cmd.words[1], line);
+        self.compile_body_inline(&cmd.words[1], cmd, 1);
         self.bytecode.emit(OpCode::Pop, line); // discard init result
 
         // Emit LoopEnter (targets patched later)
@@ -351,7 +403,7 @@ impl Compiler {
         let exit_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
 
         // Compile "body" inline
-        self.compile_body_inline(&cmd.words[4], line);
+        self.compile_body_inline(&cmd.words[4], cmd, 4);
         self.bytecode.emit(OpCode::Pop, line); // discard body result
 
         // Continue target = start of "next" step
@@ -361,7 +413,7 @@ impl Compiler {
         }
 
         // Compile "next" inline
-        self.compile_body_inline(&cmd.words[3], line);
+        self.compile_body_inline(&cmd.words[3], cmd, 3);
         self.bytecode.emit(OpCode::Pop, line); // discard next result
 
         // Jump back to condition
@@ -386,37 +438,37 @@ impl Compiler {
     }
 
     /// `expr ...`
+    ///
+    /// Only the single-argument form is folded (`expr $e`); multi-argument
+    /// `expr a + b` joins its words with a space separator (cmd_expr), which
+    /// `Concat` does not reproduce — dispatch the real `expr` instead.
     fn compile_expr(&mut self, cmd: &Command) {
-        let line = cmd.line as u32;
         if cmd.words.len() == 2 {
+            let line = self.abs_line(cmd);
             self.compile_expr_word(&cmd.words[1], line);
         } else {
-            for word in &cmd.words[1..] {
-                self.compile_word(word, line);
-            }
-            let n = (cmd.words.len() - 1) as u16;
-            if n > 1 {
-                self.bytecode.emit(OpCode::Concat(n), line);
-            }
-            self.bytecode.emit(OpCode::EvalExpr, line);
+            self.compile_dyncall(cmd);
         }
     }
 
     /// `incr varName ?increment?`
     fn compile_incr(&mut self, cmd: &Command) {
-        let line = cmd.line as u32;
+        let line = self.abs_line(cmd);
+        if cmd.words.len() > 3 {
+            return self.compile_dyncall(cmd); // too many args — cmd_incr errors
+        }
         if let Word::Literal(var_name) = &cmd.words[1] {
             let name_idx = self.bytecode.add_const(var_name);
-            let amount = if cmd.words.len() >= 3 {
+            let amount = if cmd.words.len() == 3 {
                 if let Word::Literal(s) = &cmd.words[2] {
-                    if let Ok(n) = s.parse::<i64>() {
-                        n
-                    } else {
-                        // Dynamic increment amount — fall back to DynCall
-                        return self.compile_dyncall(cmd);
+                    // Round-trip gate: `incr x 007` must add 7 (octal),
+                    // `incr x +1` renders "+1" — fold only canonical ints.
+                    match s.parse::<i64>() {
+                        Ok(n) if n.to_string() == *s => n,
+                        _ => return self.compile_dyncall(cmd),
                     }
                 } else {
-                    // Dynamic expression for increment
+                    // Dynamic increment amount — dispatch the real `incr`
                     return self.compile_dyncall(cmd);
                 }
             } else {
@@ -429,80 +481,47 @@ impl Compiler {
     }
 
     /// `return ?-code code? ?-level level? ?value?`
+    ///
+    /// Only plain `return` / `return value` become the `Return` op; every
+    /// option-bearing shape dispatches the real `return` — cmd_return's
+    /// `-code`/`-level` semantics (level stripping, catch interaction) are
+    /// far subtler than a `ReturnCode` opcode can express.
     fn compile_return(&mut self, cmd: &Command) {
-        let line = cmd.line as u32;
+        let line = self.abs_line(cmd);
         if cmd.words.len() == 1 {
             // Plain `return`
             self.bytecode.emit(OpCode::PushEmpty, line);
             self.bytecode.emit(OpCode::Return, line);
         } else if cmd.words.len() == 2 {
-            // `return value` — common case
+            // `return value` — unless the value is an option word
+            // (`return -code` with a missing value must reach cmd_return
+            // to produce its exact error).
             if let Word::Literal(s) = &cmd.words[1] {
-                if s == "-code" || s == "-level" {
-                    // Has options — use Call for full return handling
-                    return self.compile_call_by_id(cmd, CmdId::Eval as u16, line);
+                if s.starts_with('-') {
+                    return self.compile_dyncall(cmd);
                 }
             }
             self.compile_word(&cmd.words[1], line);
             self.bytecode.emit(OpCode::Return, line);
         } else {
-            // Complex return with options — parse -code/-level
-            let mut has_code = false;
-            let mut code_val: Option<i32> = None;
-            let mut i = 1;
-            while i < cmd.words.len() {
-                if let Word::Literal(s) = &cmd.words[i] {
-                    if s == "-code" && i + 1 < cmd.words.len() {
-                        has_code = true;
-                        if let Word::Literal(cv) = &cmd.words[i + 1] {
-                            code_val = match cv.as_str() {
-                                "ok" => Some(0),
-                                "error" => Some(1),
-                                "return" => Some(2),
-                                "break" => Some(3),
-                                "continue" => Some(4),
-                                _ => cv.parse::<i32>().ok(),
-                            };
-                        }
-                        i += 2;
-                        continue;
-                    } else if s == "-level" {
-                        i += 2; // skip -level and its value
-                        continue;
-                    }
-                }
-                break;
-            }
-            // Remaining arg = value
-            if i < cmd.words.len() {
-                self.compile_word(&cmd.words[i], line);
-            } else {
-                self.bytecode.emit(OpCode::PushEmpty, line);
-            }
-            if has_code {
-                if let Some(c) = code_val {
-                    self.bytecode.emit(OpCode::ReturnCode(c), line);
-                } else {
-                    // Dynamic code — fall back to DynCall
-                    self.bytecode.emit(OpCode::Pop, line);
-                    self.compile_dyncall(cmd);
-                }
-            } else {
-                self.bytecode.emit(OpCode::Return, line);
-            }
+            self.compile_dyncall(cmd);
         }
     }
 
     /// `exit ?code?`
     fn compile_exit(&mut self, cmd: &Command) {
-        let line = cmd.line as u32;
+        let line = self.abs_line(cmd);
         if cmd.words.len() <= 2 {
+            // Round-trip gate: tcl_get_int accepts `exit 0x2` (2) and
+            // `exit 010` (8); Exit(b) is the raw process code.  Fold only
+            // canonical decimal literals.
             let code = if cmd.words.len() == 2 {
-                if let Word::Literal(s) = &cmd.words[1] {
-                    s.parse::<i32>().unwrap_or(0)
-                } else {
-                    // Dynamic exit code — fall back
-                    return self.compile_dyncall(cmd);
+                match &cmd.words[1] {
+                    Word::Literal(s) => match s.parse::<i32>() {
+                        Ok(n) if n.to_string() == *s => n,
+                        _ => return self.compile_dyncall(cmd),
+                    },
+                    _ => return self.compile_dyncall(cmd),
                 }
             } else {
                 0
@@ -519,7 +538,7 @@ impl Compiler {
 
     /// Compile as a Call (known built-in command by [`CmdId`]).
     fn compile_call(&mut self, cmd: &Command, name: &str) {
-        let line = cmd.line as u32;
+        let line = self.abs_line(cmd);
         let cmd_id = CmdId::from_name(name).unwrap() as u16;
         self.compile_call_by_id(cmd, cmd_id, line);
     }
@@ -553,7 +572,7 @@ impl Compiler {
     // -----------------------------------------------------------------------
 
     fn compile_dyncall(&mut self, cmd: &Command) {
-        let line = cmd.line as u32;
+        let line = self.abs_line(cmd);
         let argc = cmd.words.len() as u16;
         let has_expand = cmd.words.iter().any(|w| matches!(w, Word::Expand(_)));
 
@@ -583,31 +602,68 @@ impl Compiler {
 
     /// Compile a word that represents a script body **inline**.
     ///
-    /// For `Word::Literal` bodies (the common brace-quoted case), the
-    /// string is parsed into commands and compiled recursively — the body
-    /// runs as native opcodes instead of being re-parsed at runtime.
+    /// For braced `Word::Literal` bodies (the common case) the body value is
+    /// verbatim — identical to its source text between the braces — so it is
+    /// parsed and compiled recursively with spans/lines rebased into the
+    /// enclosing unit ([`Compiler::span_base`]/[`Compiler::line_base`]),
+    /// keeping every emitted site pointing into the one shared source.
     ///
-    /// For dynamic bodies, falls back to `EvalScript`.
-    fn compile_body_inline(&mut self, word: &Word, line: u32) {
-        match word {
-            Word::Literal(s) => {
+    /// Quoted or computed bodies carry a value that differs from their
+    /// source slice; those (and bodies that fail to parse) fall back to
+    /// `EvalScript`, which evaluates the value at runtime with the exact
+    /// tree-walk semantics (including its error frames).
+    fn compile_body_inline(&mut self, word: &Word, cmd: &Command, word_idx: usize) {
+        if let Word::Literal(s) = word {
+            if s.is_empty() {
+                self.bytecode.emit(OpCode::PushEmpty, self.abs_line(cmd));
+                return;
+            }
+            if self.is_verbatim_braced(cmd, word_idx, s) {
                 if let Ok(commands) = crate::parse(s) {
                     if commands.is_empty() {
-                        self.bytecode.emit(OpCode::PushEmpty, line);
+                        self.bytecode.emit(OpCode::PushEmpty, self.abs_line(cmd));
                     } else {
+                        // Rebase into the unit: the body value starts just
+                        // after the opening brace; its first line is the
+                        // source line holding that byte.
+                        let body_start =
+                            self.span_base + cmd.word_srcs[word_idx].start + 1;
+                        let saved = (self.span_base, self.line_base);
+                        self.span_base = body_start;
+                        self.line_base = count_lines(&self.source, body_start as usize);
                         self.compile_commands(&commands);
+                        self.span_base = saved.0;
+                        self.line_base = saved.1;
                     }
-                } else {
-                    // Parse failed — fall back to dynamic eval
-                    self.bytecode.emit_push_const(s, line);
-                    self.bytecode.emit(OpCode::EvalScript, line);
+                    return;
                 }
+                // Parse failed — runtime eval reproduces the exact parse
+                // error and its errorInfo frames.
             }
-            _ => {
-                // Dynamic body — must eval at runtime
-                self.compile_word(word, line);
-                self.bytecode.emit(OpCode::EvalScript, line);
+        }
+        // Dynamic / non-verbatim / unparseable body — eval at runtime.
+        let line = self.abs_line(cmd);
+        self.compile_word(word, line);
+        self.bytecode.emit(OpCode::EvalScript, line);
+    }
+
+    /// True when `cmd.words[word_idx]` was written as a braced literal whose
+    /// value equals its source text minus the braces — the condition under
+    /// which body spans can be rebased into the enclosing unit.
+    fn is_verbatim_braced(&self, cmd: &Command, word_idx: usize, value: &str) -> bool {
+        match cmd.word_srcs.get(word_idx) {
+            Some(ws) => {
+                let abs = SrcSpan {
+                    start: ws.start + self.span_base,
+                    end: ws.end + self.span_base,
+                };
+                let src = abs.slice(&self.source);
+                src.len() >= 2
+                    && src.starts_with('{')
+                    && src.ends_with('}')
+                    && &src[1..src.len() - 1] == value
             }
+            None => false,
         }
     }
 
@@ -633,6 +689,12 @@ impl Compiler {
             }
         }
     }
+}
+
+/// Number of newlines before byte offset `off` — the 0-based index of the
+/// line holding `off` (Tcl lines are 1-based, so the line number is this + 1).
+fn count_lines(src: &str, off: usize) -> u32 {
+    src.as_bytes()[..off].iter().filter(|&&b| b == b'\n').count() as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -758,5 +820,162 @@ mod tests {
         let idx = bc2.add_const_wide("test");
         assert_eq!(idx, 0);
         assert_eq!(bc2.get_const_wide(0), Some("test"));
+    }
+
+    // -- exactness gates ----------------------------------------------------
+
+    #[test]
+    fn test_if_no_else_pushes_empty() {
+        // `if 0 { set y 1 }` — false path must leave a value on the stack.
+        let bc = Compiler::compile_script("if 0 { set y 1 }").unwrap();
+        let ops = bc.ops();
+        assert!(ops.iter().any(|o| matches!(o, OpCode::JumpFalse(_))));
+        // The converge region after the arm's Jump pushes a value.
+        let jump_pos = ops.iter().position(|o| matches!(o, OpCode::Jump(_))).unwrap();
+        assert!(
+            ops[jump_pos + 1..].iter().any(|o| matches!(o, OpCode::PushEmpty)),
+            "expected PushEmpty after the then-arm Jump"
+        );
+    }
+
+    #[test]
+    fn test_if_implicit_else_degrades_to_dyncall() {
+        // tclsh does NOT read an unknown word as an implicit else body.
+        let bc = Compiler::compile_script("if 1 { puts a } { puts b }").unwrap();
+        assert!(bc.ops().iter().any(|o| matches!(o, OpCode::DynCall { .. })));
+        assert!(!bc.ops().iter().any(|o| matches!(o, OpCode::JumpFalse(_))));
+    }
+
+    #[test]
+    fn test_if_dangling_else_degrades_to_dyncall() {
+        let bc = Compiler::compile_script("if 1 { puts a } else").unwrap();
+        assert!(bc.ops().iter().any(|o| matches!(o, OpCode::DynCall { .. })));
+    }
+
+    #[test]
+    fn test_if_trailing_words_after_else_degrade_to_dyncall() {
+        let bc = Compiler::compile_script("if 1 { puts a } else { puts b } { puts c }").unwrap();
+        assert!(bc.ops().iter().any(|o| matches!(o, OpCode::DynCall { .. })));
+    }
+
+    #[test]
+    fn test_if_dangling_elseif_degrades_to_dyncall() {
+        let bc = Compiler::compile_script("if 0 { puts a } elseif").unwrap();
+        assert!(bc.ops().iter().any(|o| matches!(o, OpCode::DynCall { .. })));
+    }
+
+    #[test]
+    fn test_if_then_keyword_compiles() {
+        let bc = Compiler::compile_script("if 1 then { puts a } else { puts b }").unwrap();
+        let ops = bc.ops();
+        assert!(ops.iter().any(|o| matches!(o, OpCode::JumpFalse(_))));
+        assert!(!ops.iter().any(|o| matches!(o, OpCode::DynCall { .. })));
+    }
+
+    #[test]
+    fn test_if_dynamic_keyword_degrades_to_dyncall() {
+        // `$kw` could substitute to "else" at runtime — only the real
+        // command handles that.
+        let bc = Compiler::compile_script("if 0 { puts a } $kw { puts b }").unwrap();
+        assert!(bc.ops().iter().any(|o| matches!(o, OpCode::DynCall { .. })));
+    }
+
+    #[test]
+    fn test_return_options_degrade_to_dyncall() {
+        for src in ["return -code error foo", "return -code", "return -level 2 x"] {
+            let bc = Compiler::compile_script(src).unwrap();
+            assert!(
+                bc.ops().iter().any(|o| matches!(o, OpCode::DynCall { .. })),
+                "{src} should dispatch the real return"
+            );
+            assert!(
+                !bc.ops().iter().any(|o| matches!(o, OpCode::Return)),
+                "{src} must not use the Return op"
+            );
+        }
+    }
+
+    #[test]
+    fn test_exit_literal_gates() {
+        let bc = Compiler::compile_script("exit 2").unwrap();
+        assert!(bc.ops().iter().any(|o| matches!(o, OpCode::Exit(2))));
+
+        // Non-canonical integer forms reach cmd_exit (tcl_get_int: 0x2 → 2,
+        // 010 → 8, and an empty/unparseable code has its own error).
+        for src in ["exit 0x2", "exit 010", "exit +2"] {
+            let bc = Compiler::compile_script(src).unwrap();
+            assert!(
+                !bc.ops().iter().any(|o| matches!(o, OpCode::Exit(_))),
+                "{src} must not fold the exit code"
+            );
+        }
+    }
+
+    #[test]
+    fn test_incr_literal_gates() {
+        let bc = Compiler::compile_script("incr x 2").unwrap();
+        assert!(bc.ops().iter().any(|o| matches!(o, OpCode::IncrVar(_, 2))));
+
+        // 007 is octal 7 to tcl_get_int — must not fold as decimal 7.
+        let bc = Compiler::compile_script("incr x 007").unwrap();
+        assert!(!bc.ops().iter().any(|o| matches!(o, OpCode::IncrVar(_, _))));
+    }
+
+    #[test]
+    fn test_non_canonical_int_literal_stays_const() {
+        let bc = Compiler::compile_script("set x 007").unwrap();
+        assert!(
+            !bc.ops().iter().any(|o| matches!(o, OpCode::PushInt(_))),
+            "007 must not become PushInt(7)"
+        );
+        let bc = Compiler::compile_script("set x +5").unwrap();
+        assert!(
+            !bc.ops().iter().any(|o| matches!(o, OpCode::PushInt(_))),
+            "+5 must not become PushInt(5)"
+        );
+        let bc = Compiler::compile_script("set x 10").unwrap();
+        assert!(bc.ops().iter().any(|o| matches!(o, OpCode::PushInt(10))));
+    }
+
+    #[test]
+    fn test_multi_word_expr_degrades_to_dyncall() {
+        // `expr 1 + 2` joins with spaces (cmd_expr); Concat has no separator.
+        let bc = Compiler::compile_script("expr 1 + 2").unwrap();
+        assert!(bc.ops().iter().any(|o| matches!(o, OpCode::DynCall { .. })));
+        let bc = Compiler::compile_script("expr {1 + 2}").unwrap();
+        assert!(!bc.ops().iter().any(|o| matches!(o, OpCode::DynCall { .. })));
+    }
+
+    // -- sites ---------------------------------------------------------------
+
+    #[test]
+    fn test_sites_emitted_per_command() {
+        let src = "set x 10\nputs $x";
+        let bc = Compiler::compile_script(src).unwrap();
+        assert_eq!(bc.sites.len(), 2);
+        assert_eq!(bc.sites[0].line, 1);
+        assert_eq!(bc.sites[1].line, 2);
+        assert_eq!(bc.sites[0].text.slice(&bc.source), "set x 10");
+        assert_eq!(bc.sites[1].text.slice(&bc.source), "puts $x");
+        // Word spans are shared (base 0) and slice against the unit source.
+        assert_eq!(bc.sites[0].word_srcs[0].slice(&bc.source), "set");
+    }
+
+    #[test]
+    fn test_inline_body_spans_rebased() {
+        let src = "while {$i < 2} {\n  incr i\n}";
+        let bc = Compiler::compile_script(src).unwrap();
+        // The inlined `incr i` command's site must point back into the unit
+        // source at its original position, with the original line number.
+        let incr_site = bc
+            .sites
+            .iter()
+            .find(|s| s.text.slice(&bc.source) == "incr i")
+            .expect("incr site with unit-resolvable text");
+        assert_eq!(incr_site.line, 2);
+        assert_eq!(incr_site.word_srcs[0].slice(&bc.source), "incr");
+        // The while command's own site keeps its top-level identity.
+        assert_eq!(bc.sites[0].line, 1);
+        assert_eq!(bc.sites[0].text.slice(&bc.source), "while {$i < 2} {\n  incr i\n}");
     }
 }

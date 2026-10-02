@@ -451,6 +451,9 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
 
             // ── Debug ───────────────────────────────────────────────
             OpCode::Line(_) => {}
+            // Site bookkeeping is the caller's job (it owns the site
+            // table); the executor itself treats this as a marker.
+            OpCode::BeginCmd(_) => {}
             OpCode::Nop => {}
         }
     }

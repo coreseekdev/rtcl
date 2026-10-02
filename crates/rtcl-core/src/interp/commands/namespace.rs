@@ -287,7 +287,9 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // visible to `info level 0` as the ns-eval command's source text
     // (25.9), and its exit appends
     // `(in namespace eval "<qualified>" script line N)` on error (25.6).
-    interp.ns_level0.push(interp.cur_cmd_text.to_string());
+    interp
+        .ns_level0
+        .push(interp.cur_cmd_text.slice(&interp.cur_source).to_string());
     interp.ns_stack.push(qualified.clone());
     // Marks for the eval-level variable links this body creates — they
     // die with it (tclsh's ns-eval varFrame pops).

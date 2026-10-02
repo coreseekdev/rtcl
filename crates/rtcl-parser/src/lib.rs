@@ -40,6 +40,56 @@ pub use compiler::Compiler;
 // AST types
 // ---------------------------------------------------------------------------
 
+/// Byte span into the source text a [`Command`] was parsed from.
+///
+/// Spans are Copy: resolving to `&str` needs the owning [`ScriptUnit`]'s
+/// `source` (`span.slice(&unit.source)`), so the interpreter's
+/// per-dispatch save/restore of "current command" state is plain moves /
+/// refcount bumps on the one shared source — no per-command heap copies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SrcSpan {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl SrcSpan {
+    #[inline]
+    pub fn slice<'a>(&self, src: &'a str) -> &'a str {
+        &src[self.start as usize..self.end as usize]
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        (self.end - self.start) as usize
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+}
+
+/// A parsed script: the command list plus the source text the spans of
+/// each [`Command`] (`text`, `word_srcs`) point into.  Keeping the two
+/// together lets the AST carry `offset + size` instead of string copies —
+/// the whole unit is one `String` + one `Vec<Command>` (quickjs keeps
+/// function source the same way).
+#[derive(Debug, Clone)]
+pub struct ScriptUnit {
+    pub source: std::rc::Rc<str>,
+    pub commands: Vec<Command>,
+}
+
+impl ScriptUnit {
+    /// Parse `script`, keeping the source alive for span resolution.
+    pub fn parse(script: &str) -> Result<Self, ParseError> {
+        Ok(ScriptUnit {
+            source: std::rc::Rc::from(script),
+            commands: parse(script)?,
+        })
+    }
+}
+
 /// A parsed Tcl command (one line / semicolon-separated unit).
 #[derive(Debug, Clone)]
 pub struct Command {
@@ -47,16 +97,15 @@ pub struct Command {
     pub words: Vec<Word>,
     /// Source line number (1-based).
     pub line: usize,
-    /// The command's source text as written (leading whitespace skipped,
-    /// one trailing terminator `\n`/`;` stripped) — tclsh errorInfo frames
-    /// quote this verbatim (`while executing "set a 1 "`).  `Rc<str>` so
-    /// the per-dispatch save/restore of the interpreter's "current
-    /// command" state is a refcount bump, not a heap copy.
-    pub text: std::rc::Rc<str>,
-    /// Raw source of each word, aligned with `words` (braced words keep
-    /// their braces) — used for `eval`-style errorInfo frames.  `Rc` for
-    /// the same reason as `text`.
-    pub word_srcs: std::rc::Rc<Vec<String>>,
+    /// Byte span of the command's source text as written (leading
+    /// whitespace skipped, one trailing terminator `\n`/`;` stripped at
+    /// parse time by adjusting `end`) — tclsh errorInfo frames quote this
+    /// verbatim (`while executing "set a 1 "`).
+    pub text: SrcSpan,
+    /// Byte span of each word's raw source, aligned with `words` (braced
+    /// words keep their braces) — used for `eval`-style errorInfo frames
+    /// and loop-body line rebasing.
+    pub word_srcs: std::rc::Rc<Vec<SrcSpan>>,
 }
 
 /// A word in a Tcl command.

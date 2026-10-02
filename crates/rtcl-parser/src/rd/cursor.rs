@@ -100,6 +100,12 @@ impl<'a> Cursor<'a> {
         &self.input[start..end]
     }
 
+    /// Raw byte at an absolute offset (callers stay on char boundaries).
+    #[inline]
+    pub fn byte(&self, i: usize) -> u8 {
+        self.input.as_bytes()[i]
+    }
+
     /// Byte offset where the current token starts.
     #[inline]
     pub fn pos(&self) -> usize {

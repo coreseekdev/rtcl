@@ -196,12 +196,14 @@ pub struct Interp {
     /// reference (params + body + statics are NOT copied per call);
     /// statics write-back goes through `Rc::make_mut`.
     pub(crate) procs: HashMap<String, Rc<ProcDef>>,
-    /// Parse-tree cache: script text → AST.  Parsing is a pure function
-    /// of the text (substitution happens after parse), so a cached tree
-    /// is interchangeable with a fresh parse; bodies re-evaluated per
+    /// Parse-tree cache: script text → AST (with the source text the
+    /// commands' spans point into; the key `Rc<str>` shares the unit's
+    /// source allocation).  Parsing is a pure function of the text
+    /// (substitution happens after parse), so a cached tree is
+    /// interchangeable with a fresh parse; bodies re-evaluated per
     /// call/iteration (procs, loops) skip re-tokenization.  Entries are
     /// bounded (see `eval`) — wasm32 is a target.
-    pub(crate) parse_cache: HashMap<String, Rc<Vec<rtcl_parser::Command>>>,
+    pub(crate) parse_cache: HashMap<Rc<str>, Rc<rtcl_parser::ScriptUnit>>,
     /// `check_expr` verdict memo: expr text → `Err(msg)` on syntax error,
     /// `Ok(())` when clean (see `types::expr::eval_expr`).  Pure function
     /// of the text; loop conditions re-check every iteration.
@@ -305,13 +307,18 @@ pub struct Interp {
     /// Raw source of each word of the command currently dispatching,
     /// aligned with its arguments — braced/quoted script words carry their
     /// delimiters, letting constructs recover their body's line offset.
-    /// `Rc` (shared with the cached parse tree): save/restore per dispatch
-    /// is a refcount bump.
-    pub(crate) cur_cmd_word_srcs: Rc<Vec<String>>,
+    /// Spans resolve through [`Interp::cur_source`]; `Rc` (shared with the
+    /// cached parse tree) so save/restore per dispatch is a refcount bump.
+    pub(crate) cur_cmd_word_srcs: Rc<Vec<rtcl_parser::SrcSpan>>,
     /// Source text of the command currently dispatching, for constructs
     /// that need the raw invocation (`info level 0` inside
-    /// `namespace eval`).  `Rc<str>` shared with the parse tree.
-    pub(crate) cur_cmd_text: Rc<str>,
+    /// `namespace eval`).  Span into [`Interp::cur_source`].
+    pub(crate) cur_cmd_text: rtcl_parser::SrcSpan,
+    /// Source text of the script unit the currently dispatching command
+    /// was parsed from — [`Interp::cur_cmd_text`] and
+    /// [`Interp::cur_cmd_word_srcs`] are spans into it.  Shared with the
+    /// parse cache: swapping it per dispatch is a refcount bump.
+    pub(crate) cur_source: Rc<str>,
     /// `info level 0` inside `namespace eval`: the ns-eval command's
     /// source text, one entry per live `namespace eval` (tclsh's
     /// namespace-eval varFrame is visible to `info level 0`).
@@ -426,7 +433,8 @@ impl Interp {
             line_offset: 0,
             cur_cmd_line: 0,
             cur_cmd_word_srcs: Rc::new(Vec::new()),
-            cur_cmd_text: Rc::from(""),
+            cur_cmd_text: rtcl_parser::SrcSpan { start: 0, end: 0 },
+            cur_source: Rc::from(""),
             err_from_subst: false,
             err_pending_top: None,
             ns_level0: Vec::new(),

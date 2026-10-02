@@ -10,7 +10,7 @@ pub mod token;  // Public for re-export in lib.rs
 mod tokens;
 mod word;
 
-use crate::{Command, ParseResult};
+use crate::{Command, ParseResult, SrcSpan};
 use cursor::Cursor;
 use word::parse_next_word;
 
@@ -93,7 +93,7 @@ fn parse_command(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Command> {
     while !cur.at_end_of_command(bracket_term) {
         let wstart = cur.pos();
         words.push(parse_next_word(cur, bracket_term)?);
-        word_srcs.push(cur.slice_range(wstart, cur.pos()).to_string());
+        word_srcs.push(SrcSpan { start: wstart as u32, end: cur.pos() as u32 });
         cur.skip_line_whitespace();
     }
 
@@ -108,11 +108,20 @@ fn parse_command(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Command> {
 
     // Source text as tclsh quotes it in errorInfo frames: the range as
     // written (leading whitespace already skipped by the separator skip),
-    // with one trailing terminator stripped.
-    let mut text = cur.slice_range(start, cur.pos()).to_string();
-    if text.ends_with('\n') || text.ends_with(';') {
-        text.pop();
+    // with one trailing terminator stripped.  Offsets only — consumers
+    // slice the owning ScriptUnit's source.
+    let mut end = cur.pos();
+    if end > start {
+        let last = cur.byte(end - 1);
+        if last == b'\n' || last == b';' {
+            end -= 1;
+        }
     }
 
-    Ok(Command { words, line, text: text.into(), word_srcs: std::rc::Rc::new(word_srcs) })
+    Ok(Command {
+        words,
+        line,
+        text: SrcSpan { start: start as u32, end: end as u32 },
+        word_srcs: std::rc::Rc::new(word_srcs),
+    })
 }

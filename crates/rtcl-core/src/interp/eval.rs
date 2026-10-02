@@ -2,7 +2,7 @@
 
 use super::{Interp, Rc};
 use crate::error::{Error, Result};
-use crate::parser::{self, Command, Word};
+use crate::parser::{Command, Word};
 use crate::value::Value;
 use rtcl_parser::Compiler;
 
@@ -34,23 +34,24 @@ impl Interp {
         const PARSE_CACHE_MAX: usize = 1024;
         const PARSE_CACHE_MAX_SCRIPT: usize = 262_144;
         let cached = self.parse_cache.get(script).cloned();
-        let commands = match cached {
+        let unit = match cached {
             Some(rc) => rc,
             None => {
-                let rc = match rtcl_parser::parse(script) {
-                    Ok(commands) => Rc::new(commands),
+                let rc = match rtcl_parser::ScriptUnit::parse(script) {
+                    Ok(unit) => Rc::new(unit),
                     Err(pe) => return Err(self.seed_parse_error(script, &pe)),
                 };
                 if script.len() <= PARSE_CACHE_MAX_SCRIPT {
                     if self.parse_cache.len() >= PARSE_CACHE_MAX {
                         self.parse_cache.clear();
                     }
-                    self.parse_cache.insert(script.to_string(), Rc::clone(&rc));
+                    // Key shares the unit's source allocation (one Rc clone).
+                    self.parse_cache.insert(Rc::clone(&rc.source), Rc::clone(&rc));
                 }
                 rc
             }
         };
-        self.eval_commands(&commands)
+        self.eval_commands(&unit)
     }
 
     /// Parse-failure → tclsh errorInfo seeding: the logged frame is the
@@ -157,7 +158,8 @@ impl Interp {
     /// command lines onto the enclosing script's absolute lines, the way
     /// tclsh's single bytecode line table does.
     pub(crate) fn body_is_verbatim_script(&self, idx: usize, script: &str) -> Option<usize> {
-        let src = self.cur_cmd_word_srcs.get(idx)?;
+        let span = self.cur_cmd_word_srcs.get(idx)?;
+        let src = span.slice(&self.cur_source);
         let inner = src
             .strip_prefix('{')
             .and_then(|s| s.strip_suffix('}'))
@@ -182,16 +184,16 @@ impl Interp {
         rtcl_vm::execute(self, &code)
     }
 
-    pub fn eval_commands(&mut self, commands: &[Command]) -> Result<Value> {
+    pub fn eval_commands(&mut self, unit: &rtcl_parser::ScriptUnit) -> Result<Value> {
         let mut result = Value::empty();
-        for cmd in commands {
-            result = self.eval_command(cmd)?;
+        for cmd in &unit.commands {
+            result = self.eval_command(unit, cmd)?;
         }
         self.result = result.clone();
         Ok(result)
     }
 
-    fn eval_command(&mut self, cmd: &Command) -> Result<Value> {
+    fn eval_command(&mut self, unit: &rtcl_parser::ScriptUnit, cmd: &Command) -> Result<Value> {
         if cmd.words.is_empty() {
             return Ok(Value::empty());
         }
@@ -215,14 +217,18 @@ impl Interp {
                 Err(e) => {
                     if self.err_is_error(&e) {
                         if std::mem::take(&mut self.err_from_subst) {
-                            self.err_pending_top = Some(cmd.text.clone());
+                            self.err_pending_top = Some(Rc::from(cmd.text.slice(&unit.source)));
                             // The construct-exit tags report the
                             // enclosing command's line, not the
                             // substitution-internal line.
                             self.err_line = cmd.line + self.line_offset;
                         } else {
                             let msg = e.message_text();
-                            self.err_harness_frame(&msg, &cmd.text, cmd.line + self.line_offset);
+                            self.err_harness_frame(
+                                &msg,
+                                cmd.text.slice(&unit.source),
+                                cmd.line + self.line_offset,
+                            );
                         }
                     }
                     return Err(e);
@@ -244,7 +250,10 @@ impl Interp {
         // Expose the invocation for constructs that need the raw source
         // (`info level 0` inside `namespace eval`) and its position/word
         // sources (loop constructs recover their body's line offset).
-        let saved_text = std::mem::replace(&mut self.cur_cmd_text, cmd.text.clone());
+        // Nested evals swap these out, so each dispatch saves/restores —
+        // the source is one refcount bump, the spans plain copies.
+        let saved_source = std::mem::replace(&mut self.cur_source, Rc::clone(&unit.source));
+        let saved_text = std::mem::replace(&mut self.cur_cmd_text, cmd.text);
         let saved_line = std::mem::replace(&mut self.cur_cmd_line, cmd.line);
         let saved_srcs = std::mem::replace(&mut self.cur_cmd_word_srcs, cmd.word_srcs.clone());
         // Execution enterstep/leavestep traces (tclsh 8.6.17): fire
@@ -270,9 +279,10 @@ impl Interp {
         if let Err(e) = &r {
             if self.err_is_error(e) {
                 let msg = e.message_text();
-                self.err_harness_frame(&msg, &cmd.text, cmd.line + self.line_offset);
+                self.err_harness_frame(&msg, cmd.text.slice(&unit.source), cmd.line + self.line_offset);
             }
         }
+        self.cur_source = saved_source;
         self.cur_cmd_text = saved_text;
         self.cur_cmd_line = saved_line;
         self.cur_cmd_word_srcs = saved_srcs;

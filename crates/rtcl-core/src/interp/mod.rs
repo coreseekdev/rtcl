@@ -301,11 +301,13 @@ pub struct Interp {
     /// Raw source of each word of the command currently dispatching,
     /// aligned with its arguments — braced/quoted script words carry their
     /// delimiters, letting constructs recover their body's line offset.
-    pub(crate) cur_cmd_word_srcs: Vec<String>,
+    /// `Rc` (shared with the cached parse tree): save/restore per dispatch
+    /// is a refcount bump.
+    pub(crate) cur_cmd_word_srcs: Rc<Vec<String>>,
     /// Source text of the command currently dispatching, for constructs
     /// that need the raw invocation (`info level 0` inside
-    /// `namespace eval`).
-    pub(crate) cur_cmd_text: String,
+    /// `namespace eval`).  `Rc<str>` shared with the parse tree.
+    pub(crate) cur_cmd_text: Rc<str>,
     /// `info level 0` inside `namespace eval`: the ns-eval command's
     /// source text, one entry per live `namespace eval` (tclsh's
     /// namespace-eval varFrame is visible to `info level 0`).
@@ -322,7 +324,7 @@ pub struct Interp {
     /// waiting to see if the error escapes uncaught — the top-level
     /// report then adds `invoked from within "<text>"` (tclsh logs the
     /// enclosing command only when nothing else consumed the log).
-    pub(crate) err_pending_top: Option<String>,
+    pub(crate) err_pending_top: Option<Rc<str>>,
     /// Current script name (for info script).
     #[cfg(feature = "std")]
     pub(crate) script_name: String,
@@ -419,8 +421,8 @@ impl Interp {
             err_line: 1,
             line_offset: 0,
             cur_cmd_line: 0,
-            cur_cmd_word_srcs: Vec::new(),
-            cur_cmd_text: String::new(),
+            cur_cmd_word_srcs: Rc::new(Vec::new()),
+            cur_cmd_text: Rc::from(""),
             err_from_subst: false,
             err_pending_top: None,
             ns_level0: Vec::new(),

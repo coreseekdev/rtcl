@@ -49,11 +49,14 @@ pub struct Command {
     pub line: usize,
     /// The command's source text as written (leading whitespace skipped,
     /// one trailing terminator `\n`/`;` stripped) — tclsh errorInfo frames
-    /// quote this verbatim (`while executing "set a 1 "`).
-    pub text: String,
+    /// quote this verbatim (`while executing "set a 1 "`).  `Rc<str>` so
+    /// the per-dispatch save/restore of the interpreter's "current
+    /// command" state is a refcount bump, not a heap copy.
+    pub text: std::rc::Rc<str>,
     /// Raw source of each word, aligned with `words` (braced words keep
-    /// their braces) — used for `eval`-style errorInfo frames.
-    pub word_srcs: Vec<String>,
+    /// their braces) — used for `eval`-style errorInfo frames.  `Rc` for
+    /// the same reason as `text`.
+    pub word_srcs: std::rc::Rc<Vec<String>>,
 }
 
 /// A word in a Tcl command.

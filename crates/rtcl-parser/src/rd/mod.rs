@@ -114,5 +114,5 @@ fn parse_command(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Command> {
         text.pop();
     }
 
-    Ok(Command { words, line, text, word_srcs })
+    Ok(Command { words, line, text: text.into(), word_srcs: std::rc::Rc::new(word_srcs) })
 }

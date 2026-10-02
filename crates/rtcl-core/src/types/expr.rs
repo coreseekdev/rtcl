@@ -7,6 +7,7 @@
 //!   `+` `-`, `*` `/` `%`, `**`, unary `- + ! ~`
 
 use crate::error::{Error, Result};
+use super::expr_ops;
 use crate::interp::Interp;
 use crate::value::Value;
 
@@ -165,7 +166,7 @@ impl<'a> ExprParser<'a> {
             if self.peek() == '|' && self.peek_at(1) != '|' {
                 self.advance();
                 let right = self.parse_bitxor()?;
-                left = self.int_bitop(&left, &right, '|')?;
+                left = expr_ops::int_bitop(&left, &right, '|')?;
             } else {
                 break;
             }
@@ -181,7 +182,7 @@ impl<'a> ExprParser<'a> {
             if self.peek() == '^' {
                 self.advance();
                 let right = self.parse_bitand()?;
-                left = self.int_bitop(&left, &right, '^')?;
+                left = expr_ops::int_bitop(&left, &right, '^')?;
             } else {
                 break;
             }
@@ -198,7 +199,7 @@ impl<'a> ExprParser<'a> {
             if self.peek() == '&' && self.peek_at(1) != '&' {
                 self.advance();
                 let right = self.parse_equality()?;
-                left = self.int_bitop(&left, &right, '&')?;
+                left = expr_ops::int_bitop(&left, &right, '&')?;
             } else {
                 break;
             }
@@ -212,28 +213,10 @@ impl<'a> ExprParser<'a> {
         loop {
             if self.match_op("==") {
                 let right = self.parse_relational()?;
-                // NaN compares unequal to everything (expr-22.9).
-                if super::expr_funcs::nan_pair(&left, &right) {
-                    left = Value::from_bool(false);
-                    continue;
-                }
-                // Exact numeric comparison when both operands are numeric
-                // (int pairs compare as i64, no EPSILON tolerance);
-                // string comparison otherwise.
-                left = match super::expr_funcs::numeric_cmp(&left, &right) {
-                    Some(ord) => Value::from_bool(ord == core::cmp::Ordering::Equal),
-                    None => Value::from_bool(left.as_str() == right.as_str()),
-                };
+                left = expr_ops::op_eq(&left, &right);
             } else if self.match_op("!=") {
                 let right = self.parse_relational()?;
-                if super::expr_funcs::nan_pair(&left, &right) {
-                    left = Value::from_bool(true);
-                    continue;
-                }
-                left = match super::expr_funcs::numeric_cmp(&left, &right) {
-                    Some(ord) => Value::from_bool(ord != core::cmp::Ordering::Equal),
-                    None => Value::from_bool(left.as_str() != right.as_str()),
-                };
+                left = expr_ops::op_ne(&left, &right);
             } else if self.match_op("=*") {
                 // Glob match: left =* pattern
                 let right = self.parse_relational()?;
@@ -309,28 +292,7 @@ impl<'a> ExprParser<'a> {
                 break;
             };
             let right = self.parse_shift()?;
-            use core::cmp::Ordering;
-            // NaN: every relational comparison is false.
-            if super::expr_funcs::nan_pair(&left, &right) {
-                left = Value::from_bool(false);
-                continue;
-            }
-            left = match super::expr_funcs::numeric_cmp(&left, &right) {
-                Some(ord) => Value::from_bool(match op {
-                    "<" => ord == Ordering::Less,
-                    ">" => ord == Ordering::Greater,
-                    "<=" => ord != Ordering::Greater,
-                    ">=" => ord != Ordering::Less,
-                    _ => false,
-                }),
-                None => Value::from_bool(match op {
-                    "<" => left.as_str() < right.as_str(),
-                    ">" => left.as_str() > right.as_str(),
-                    "<=" => left.as_str() <= right.as_str(),
-                    ">=" => left.as_str() >= right.as_str(),
-                    _ => false,
-                }),
-            };
+            left = expr_ops::op_rel(&left, &right, op);
         }
         Ok(left)
     }
@@ -348,16 +310,16 @@ impl<'a> ExprParser<'a> {
         loop {
             if self.match_op("<<<") {
                 let right = self.parse_additive()?;
-                let a = self.as_int_val(&left)? as u64;
-                let b = self.as_int_val(&right)? as u32;
+                let a = expr_ops::as_int_val(&left)? as u64;
+                let b = expr_ops::as_int_val(&right)? as u32;
                 let bits = 64u32;
                 let shift = b % bits;
                 let rotated = if shift == 0 { a } else { (a << shift) | (a >> (bits - shift)) };
                 left = Value::from_int(rotated as i64);
             } else if self.match_op(">>>") {
                 let right = self.parse_additive()?;
-                let a = self.as_int_val(&left)? as u64;
-                let b = self.as_int_val(&right)? as u32;
+                let a = expr_ops::as_int_val(&left)? as u64;
+                let b = expr_ops::as_int_val(&right)? as u32;
                 let bits = 64u32;
                 let shift = b % bits;
                 let rotated = if shift == 0 { a } else { (a >> shift) | (a << (bits - shift)) };
@@ -365,98 +327,12 @@ impl<'a> ExprParser<'a> {
             } else if self.match_op("<<") || self.match_op(">>") {
                 let shl = self.chars[self.pos - 1] == '<';
                 let right = self.parse_additive()?;
-                left = self.int_shift(&left, &right, shl)?;
+                left = expr_ops::int_shift(&left, &right, shl)?;
             } else {
                 break;
             }
         }
         Ok(left)
-    }
-
-    /// One `<<`/`>>` operation with Tcl's bignum-widening semantics.
-    fn int_shift(&self, left: &Value, right: &Value, shl: bool) -> Result<Value> {
-        use num_traits::Signed;
-        use super::bignum::{int_rep, to_value, IntRep};
-        let op = if shl { "<<" } else { ">>" };
-        // tclsh shift operands must be integers: a float operand errors
-        // with the operator named, separately from other non-numeric
-        // strings (`1.5 << 2` vs `"abc" << 1`).
-        let int_operand = |v: &Value| -> Result<i64> {
-            if let Some(i) = v.as_int() {
-                return Ok(i);
-            }
-            if v.as_float().is_some() {
-                return Err(Error::Msg(format!(
-                    "can't use floating-point value as operand of \"{op}\""
-                )));
-            }
-            Err(Error::Msg(format!(
-                "can't use non-numeric string as operand of \"{op}\""
-            )))
-        };
-        if int_rep(left).is_none() {
-            int_operand(left)?;
-        }
-        // Count: i64 fast path; a bignum count behaves like an unbounded
-        // one (>> saturates below, << errors above — `-0x8000000000000001
-        // >> 0x8000000000000000` is -1, expr-48.1).
-        let count = match int_rep(right) {
-            Some(IntRep::I64(c)) => c,
-            Some(big) => {
-                if big.to_big().is_negative() {
-                    return Err(Error::Msg("negative shift argument".to_string()));
-                }
-                i64::MAX
-            }
-            None => int_operand(right)?,
-        };
-        if count < 0 {
-            return Err(Error::Msg("negative shift argument".to_string()));
-        }
-        // Bignum cap: results wider than ~2^27 bits exceed tclsh's
-        // bignum range ("integer value too large to represent", probed
-        // with `1 << 0x8000000000000000`).
-        if shl && count > 1 << 27 {
-            return Err(Error::Msg(
-                "integer value too large to represent".to_string(),
-            ));
-        }
-        match int_rep(left) {
-            Some(IntRep::I64(a)) if !shl && count >= 64 => {
-                Ok(Value::from_int(if a < 0 { -1 } else { 0 }))
-            }
-            Some(IntRep::Big(b)) => {
-                let shifted = if shl {
-                    b << (count as usize)
-                } else if count as u64 >= b.bits() as u64 {
-                    // Saturate without building a 2^count denominator.
-                    if b.is_negative() {
-                        num_bigint::BigInt::from(-1)
-                    } else {
-                        num_bigint::BigInt::from(0)
-                    }
-                } else {
-                    b >> (count as usize)
-                };
-                Ok(to_value(IntRep::Big(shifted)))
-            }
-            Some(IntRep::I64(a)) if shl => {
-                let wide = ((a as u64) << (count as u32)) as i64;
-                if count < 64 && (wide >> count) == a {
-                    Ok(Value::from_int(wide))
-                } else {
-                    // Overflow: widen to an exact bignum (1 << 63 is
-                    // 9223372036854775808, not i64::MIN).
-                    Ok(to_value(IntRep::Big(
-                        num_bigint::BigInt::from(a) << (count as usize),
-                    )))
-                }
-            }
-            Some(IntRep::I64(a)) => Ok(Value::from_int(a >> (count as u32))),
-            None => Err(Error::Msg(format!(
-                "can't use non-numeric string as operand of \"{op}\""
-            ))),
-        }
     }
 
     /// Additive: `+`, `-`
@@ -467,13 +343,13 @@ impl<'a> ExprParser<'a> {
             if self.peek() == '+' {
                 self.advance();
                 let right = self.parse_multiplicative()?;
-                left = self.numeric_binop(&left, &right, '+' )?;
+                left = expr_ops::numeric_binop(&left, &right, '+' )?;
             } else if self.peek() == '-' {
                 // Distinguish unary minus from binary minus.
                 // Binary minus: there must have been a value on the left.
                 self.advance();
                 let right = self.parse_multiplicative()?;
-                left = self.numeric_binop(&left, &right, '-')?;
+                left = expr_ops::numeric_binop(&left, &right, '-')?;
             } else {
                 break;
             }
@@ -489,15 +365,15 @@ impl<'a> ExprParser<'a> {
             if self.peek() == '*' && self.peek_at(1) != '*' {
                 self.advance();
                 let right = self.parse_power()?;
-                left = self.numeric_binop(&left, &right, '*')?;
+                left = expr_ops::numeric_binop(&left, &right, '*')?;
             } else if self.peek() == '/' {
                 self.advance();
                 let right = self.parse_power()?;
-                left = self.numeric_binop(&left, &right, '/')?;
+                left = expr_ops::numeric_binop(&left, &right, '/')?;
             } else if self.peek() == '%' {
                 self.advance();
                 let right = self.parse_power()?;
-                left = self.int_mod(&left, &right)?;
+                left = expr_ops::int_mod(&left, &right)?;
             } else {
                 break;
             }
@@ -510,50 +386,7 @@ impl<'a> ExprParser<'a> {
         let base = self.parse_unary()?;
         if self.match_op("**") {
             let exp = self.parse_power()?; // right-associative: recurse
-            // Tcl: two integer operands use integer exponentiation.
-            if let (Some(a), Some(b)) = (base.as_int(), exp.as_int()) {
-                return match a {
-                    // Units short-circuit before any range check — tclsh
-                    // computes 1**268435456 and (-1)**268435456 instantly.
-                    0 if b < 0 => Err(Error::Msg(
-                        "exponentiation of zero by negative power".to_string(),
-                    )),
-                    // 0**0 is 1 (expr-23.15); 0**n is 0 (expr-23.14).
-                    0 if b == 0 => Ok(Value::from_int(1)),
-                    0 => Ok(Value::from_int(0)),
-                    1 => Ok(Value::from_int(1)),
-                    -1 => Ok(Value::from_int(if b % 2 == 0 { 1 } else { -1 })),
-                    // Integer base with negative exponent yields 0
-                    // (tclsh: `expr {2**-1}` → 0).
-                    _ if b < 0 => Ok(Value::from_int(0)),
-                    // tclsh refuses to build numbers of ≥ 2**28 bits
-                    // (expr-23.54.12: 3**268435456 → "exponent too large").
-                    _ if b >= 1 << 28 => Err(Error::Msg("exponent too large".to_string())),
-                    _ => match a.checked_pow(b as u32) {
-                        Some(r) => Ok(Value::from_int(r)),
-                        // Overflow widens to an exact bignum (expr-23.48:
-                        // 2**81 is 2417851639229258349412352).
-                        None => Ok(super::bignum::to_value(
-                            super::bignum::IntRep::Big(
-                                num_bigint::BigInt::from(a)
-                                    .pow(b as u32),
-                            ),
-                        )),
-                    },
-                };
-            }
-            match (base.as_float(), exp.as_float()) {
-                (Some(a), Some(b)) => {
-                    if a == 0.0 && b < 0.0 {
-                        // 0.0**-1 / 0**-1.0 error like the integer form.
-                        return Err(Error::Msg(
-                            "exponentiation of zero by negative power".to_string(),
-                        ));
-                    }
-                    Ok(super::expr_funcs::float_value(a.powf(b)))
-                }
-                _ => Err(Error::type_mismatch("number", "non-numeric value")),
-            }
+            expr_ops::op_pow(base, exp)
         } else {
             Ok(base)
         }
@@ -564,19 +397,12 @@ impl<'a> ExprParser<'a> {
         self.skip_whitespace();
         if self.match_op("!") {
             let val = self.parse_unary()?;
-            return Ok(Value::from_bool(!super::expr_funcs::not_operand(&val)?));
+            return expr_ops::op_not(&val);
         }
         if self.peek() == '~' {
             self.advance();
             let val = self.parse_unary()?;
-            if let Some(rep) = super::bignum::int_rep(&val) {
-                // ~x is -x-1 in two's complement (~2^63 is -9223372036854775809).
-                return Ok(super::bignum::to_value(super::bignum::IntRep::Big(
-                    -rep.to_big() - num_bigint::BigInt::from(1),
-                )));
-            }
-            let n = self.as_int_val(&val)?;
-            return Ok(Value::from_int(!n));
+            return expr_ops::op_bitnot(&val);
         }
         if self.peek() == '-' && !self.is_at_end() {
             // Only unary minus if we're at the start of unary context
@@ -613,23 +439,7 @@ impl<'a> ExprParser<'a> {
                 let val = self.parse_unary()?;
                 // Integer operands stay integers (-2 -> -2); float operands
                 // stay floats (-2.0 -> -2.0).
-                if let Some(rep) = super::bignum::int_rep(&val) {
-                    return Ok(match rep {
-                        super::bignum::IntRep::I64(i) => match i.checked_neg() {
-                            Some(r) => Value::from_int(r),
-                            None => super::bignum::to_value(super::bignum::IntRep::Big(
-                                num_bigint::BigInt::from(2i8).pow(63u32),
-                            )),
-                        },
-                        big => super::bignum::to_value(super::bignum::IntRep::Big(
-                            -big.to_big(),
-                        )),
-                    });
-                }
-                return match val.as_float() {
-                    Some(n) => Ok(super::expr_funcs::float_value(-n)),
-                    None => Err(Error::type_mismatch("number", "non-numeric value")),
-                };
+                return expr_ops::op_neg(&val);
             }
             // Not unary minus, restore
             self.pos = saved;
@@ -1267,178 +1077,6 @@ impl<'a> ExprParser<'a> {
     /// Bitwise op on exact integers; bignum operands use two's-complement
     /// BigInt ops (`-2 & 0xff` is 254).  Non-integer operands keep the
     /// legacy float-truncation path.
-    fn int_bitop(&self, left: &Value, right: &Value, op: char) -> Result<Value> {
-        if let (Some(ia), Some(ib)) = (
-            super::bignum::int_rep(left),
-            super::bignum::int_rep(right),
-        ) {
-            use num_bigint::BigInt;
-            let (a, b) = (ia.to_big(), ib.to_big());
-            return Ok(super::bignum::to_value(super::bignum::IntRep::Big(
-                match op {
-                    '|' => a | b,
-                    '^' => a ^ b,
-                    _ => a & b,
-                },
-            )));
-        }
-        // Non-int operands: tclsh rejects floats and other non-numeric
-        // strings with the operator in the message.
-        let int_operand = |v: &Value| -> Result<i64> {
-            if let Some(i) = v.as_int() {
-                return Ok(i);
-            }
-            if v.as_float().is_some() {
-                return Err(Error::Msg(format!(
-                    "can't use floating-point value as operand of \"{op}\""
-                )));
-            }
-            Err(Error::Msg(format!(
-                "can't use non-numeric string as operand of \"{op}\""
-            )))
-        };
-        let a = int_operand(left)?;
-        let b = int_operand(right)?;
-        Ok(Value::from_int(match op {
-            '|' => a | b,
-            '^' => a ^ b,
-            _ => a & b,
-        }))
-    }
-
-    /// `%` with Tcl floor semantics; bignum operands stay exact.
-    fn int_mod(&self, left: &Value, right: &Value) -> Result<Value> {
-        use super::bignum::{floor_mod as big_mod, int_rep, to_value, IntRep};
-        if let (Some(ia), Some(ib)) = (int_rep(left), int_rep(right)) {
-            if ib.is_zero() {
-                return Err(Error::DivisionByZero);
-            }
-            if let (IntRep::I64(a), IntRep::I64(b)) = (&ia, &ib) {
-                // i64::MIN % -1 would overflow in Rust; the result is 0
-                if !(*a == i64::MIN && *b == -1) {
-                    return Ok(Value::from_int(floor_mod(*a, *b)));
-                }
-                return Ok(Value::from_int(0));
-            }
-            return Ok(to_value(IntRep::Big(big_mod(&ia.to_big(), &ib.to_big()))));
-        }
-        // Non-int operands: tclsh distinguishes a float operand
-        // (`1.5 % 2` → can't use floating-point value as operand of "%")
-        // from any other non-numeric one (`true % 2` → can't use
-        // non-numeric string as operand of "%").
-        let int_operand = |v: &Value| -> Result<i64> {
-            if let Some(i) = v.as_int() {
-                return Ok(i);
-            }
-            if v.as_float().is_some() {
-                return Err(Error::Msg(
-                    "can't use floating-point value as operand of \"%\"".to_string(),
-                ));
-            }
-            Err(Error::Msg(
-                "can't use non-numeric string as operand of \"%\"".to_string(),
-            ))
-        };
-        let a = int_operand(left)?;
-        let b = int_operand(right)?;
-        if b == 0 { return Err(Error::DivisionByZero); }
-        Ok(Value::from_int(if a == i64::MIN && b == -1 { 0 } else { floor_mod(a, b) }))
-    }
-
-    /// Convert `Value` to i64, returning an error if not numeric.
-    fn as_int_val(&self, v: &Value) -> Result<i64> {
-        v.as_int().or_else(|| v.as_float().map(|f| f as i64))
-            .ok_or_else(|| Error::type_mismatch("integer", v.as_str()))
-    }
-
-    /// Numeric binary operation. Integer operands use integer arithmetic
-    /// (Tcl semantics: `/` is floor division, result is int); on i64
-    /// overflow the operation widens to an exact bignum (`9223372036854775807
-    /// + 1` is 9223372036854775808, tclsh-style). If either side is float,
-    /// compute in f64 and the result stays a float.
-    fn numeric_binop(&self, left: &Value, right: &Value, op: char) -> Result<Value> {
-        use num_bigint::BigInt;
-        use num_integer::Integer;
-        use super::bignum::{floor_div as big_div, int_rep, to_value, IntRep};
-        // NaN operands can't take part in arithmetic (`"nan" + 0` →
-        // can't use non-numeric floating-point value as operand of "+").
-        if left.as_float().map_or(false, |f| f.is_nan())
-            || right.as_float().map_or(false, |f| f.is_nan())
-        {
-            return Err(Error::Msg(format!(
-                "can't use non-numeric floating-point value as operand of \"{op}\""
-            )));
-        }
-        if let (Some(ia), Some(ib)) = (int_rep(left), int_rep(right)) {
-            if let (IntRep::I64(a), IntRep::I64(b)) = (&ia, &ib) {
-                let widen = |x: BigInt| Ok(to_value(IntRep::Big(x)));
-                let (ba, bb) = (ia.to_big(), ib.to_big());
-                return match op {
-                    '+' => match a.checked_add(*b) {
-                        Some(r) => Ok(Value::from_int(r)),
-                        None => widen(ba + bb),
-                    },
-                    '-' => match a.checked_sub(*b) {
-                        Some(r) => Ok(Value::from_int(r)),
-                        None => widen(ba - bb),
-                    },
-                    '*' => match a.checked_mul(*b) {
-                        Some(r) => Ok(Value::from_int(r)),
-                        None => widen(ba * bb),
-                    },
-                    '/' => {
-                        if *b == 0 {
-                            return Err(Error::DivisionByZero);
-                        }
-                        // i64::MIN / -1 overflows in Rust; Tcl widens to bignum
-                        if *a == i64::MIN && *b == -1 {
-                            return widen(ba.div_floor(&bb));
-                        }
-                        Ok(Value::from_int(floor_div(*a, *b)))
-                    }
-                    _ => Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
-                };
-            }
-            // At least one bignum operand: exact BigInt arithmetic.
-            let (ba, bb) = (ia.to_big(), ib.to_big());
-            return match op {
-                '+' => Ok(to_value(IntRep::Big(ba + bb))),
-                '-' => Ok(to_value(IntRep::Big(ba - bb))),
-                '*' => Ok(to_value(IntRep::Big(ba * bb))),
-                '/' => {
-                    if ib.is_zero() {
-                        return Err(Error::DivisionByZero);
-                    }
-                    Ok(to_value(IntRep::Big(big_div(&ba, &bb))))
-                }
-                _ => Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
-            };
-        }
-        match (left.as_float(), right.as_float()) {
-            (Some(a), Some(b)) => {
-                let result = match op {
-                    '+' => a + b,
-                    '-' => a - b,
-                    '*' => a * b,
-                    '/' => {
-                        // tclsh follows IEEE here: x/0.0 is ±Inf (5/0.0 →
-                        // Inf, 1.0/-0.0 → -Inf); only a zero dividend gives
-                        // the NaN result tclsh refuses to build — 0/0.0 →
-                        // "domain error: argument not in valid range".
-                        if b == 0.0 && a == 0.0 {
-                            return Err(super::expr_funcs::domain_error());
-                        }
-                        a / b
-                    }
-                    _ => return Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
-                };
-                Ok(super::expr_funcs::float_value(result))
-            }
-            _ => Err(Error::Msg(format!(
-                "can't use non-numeric string as operand of \"{op}\""
-            ))),
-        }
-    }
     /// Skip one `parse_and` level operand without evaluating.
     /// Used for `||` short-circuit when LHS is true.
     /// Stops at: end, `||` at depth 0, `?` at depth 0.

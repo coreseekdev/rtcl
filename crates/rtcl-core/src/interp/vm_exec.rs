@@ -110,17 +110,24 @@ struct LoopFrame {
 /// NOT frameless) — it records which command's word the bracket belongs
 /// to, so an error crossing it defers that command's frame to the top
 /// level (the tree-walk's `eval_word` CommandSub boundary).
+///
+/// `Expr` marks an inlined `[...]` *operand of a compiled expression*
+/// (`expr {[fib $n] + 1}`): eval_expr's bracket runs a plain nested eval
+/// that sets no `err_from_subst`, so an error crossing it makes the
+/// expression-owning command **append** its harness frame instead of
+/// deferring.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Region {
     Body(usize),
     Next(usize),
     Sub(usize),
+    Expr(usize),
 }
 
 impl Region {
     fn site(self) -> usize {
         match self {
-            Region::Body(s) | Region::Next(s) | Region::Sub(s) => s,
+            Region::Body(s) | Region::Next(s) | Region::Sub(s) | Region::Expr(s) => s,
         }
     }
 }
@@ -190,21 +197,35 @@ fn loop_signal(st: &mut VmState, e: Error) -> Result<()> {
 }
 
 
-/// Deferred frames for the inlined `[...]` regions an error crosses on
-/// its way out of the unit (the tree-walk's `eval_word` CommandSub
-/// boundary): pop the region stack and defer each bracket-owning
-/// command's frame to the top level — body/next regions crossed add
+/// Deferred/appended frames for the inlined `[...]` regions an error
+/// crosses on its way out of the unit: pop the region stack — a word
+/// bracket (`Sub`) defers its owning command's frame to the top level
+/// (the tree-walk's `eval_word` CommandSub boundary, outermost deferral
+/// winning); an expression operand (`Expr`) APPENDS its owning command's
+/// harness frame (eval_expr's bracket is a plain nested eval that marks
+/// no `err_from_subst` — the command's frame is logged; err_harness_
+/// frame's fresh-suppression branch reproduces the transparent-body
+/// case, `expr {[if {1} {error x}]}`).  Body/next regions crossed add
 /// nothing (their constructs log no frames of their own, the err_fresh
-/// suppression), and the outermost bracket's deferral wins, exactly like
-/// nested `err_pending_top` overwrites.
-fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState) {
+/// suppression).
+fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error) {
     while let Some(region) = st.bodies.last().copied() {
         st.bodies.pop();
-        if let Region::Sub(site_idx) = region {
-            let site = &code.sites[site_idx];
-            let text = site.text.slice(&code.source);
-            interp.err_pending_top = Some(Rc::from(text));
-            interp.err_line = st.entry_offset + site.line as usize;
+        match region {
+            Region::Sub(site_idx) => {
+                let site = &code.sites[site_idx];
+                let text = site.text.slice(&code.source);
+                interp.err_pending_top = Some(Rc::from(text));
+                interp.err_line = st.entry_offset + site.line as usize;
+            }
+            Region::Expr(site_idx) => {
+                let site = &code.sites[site_idx];
+                let text = site.text.slice(&code.source);
+                let line = st.entry_offset + site.line as usize;
+                let msg = e.message_text();
+                interp.err_harness_frame(&msg, text, line);
+            }
+            Region::Body(_) | Region::Next(_) => {}
         }
     }
 }
@@ -285,7 +306,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, entry_offset: usize) -> Resu
                 .last()
                 .is_some_and(|r| r.site() == st.cur_site)
             {
-                unwind_subs(interp, code, &mut st);
+                unwind_subs(interp, code, &mut st, &e);
                 return Err(e);
             }
             // Everything else appends this command's harness frame —
@@ -303,10 +324,11 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, entry_offset: usize) -> Resu
                 interp.err_harness_frame(&msg, text, line);
             }
             // The error then crosses every still-open inlined `[...]`
-            // region: each bracket-owning command defers its frame to the
-            // top level (the tree-walk's CommandSub word boundary), the
-            // outermost deferral winning.
-            unwind_subs(interp, code, &mut st);
+            // region: each word-bracket-owning command defers its frame to
+            // the top level (the tree-walk's CommandSub word boundary, the
+            // outermost deferral winning); each expression-operand owner
+            // appends its harness frame.
+            unwind_subs(interp, code, &mut st, &e);
             return Err(e);
         }
     };
@@ -550,6 +572,9 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         }
         OpCode::SubMark => {
             st.bodies.push(Region::Sub(st.cur_site));
+        }
+        OpCode::ExprMark => {
+            st.bodies.push(Region::Expr(st.cur_site));
         }
         OpCode::SubEnd => {
             st.bodies.pop();
@@ -836,6 +861,69 @@ mod sub_inline_tests {
             interp.err_pending_top.as_deref(),
             Some("set x [string length [nosuch a]]")
         );
+    }
+
+    #[test]
+    fn test_expr_inline_values() {
+        // Brackets as expression operands compile inline — values agree
+        // with the tree-walk, including nesting and the fib recursion.
+        assert_eq!(ev("set a [expr {[expr {6 * 7}] + 1}]; set a"), "43");
+        assert_eq!(ev("proc f x { expr {$x + 10} }; set d [expr {[f 5] + [f 6]}]; set d"), "31");
+        assert_eq!(ev("proc f x { expr {$x + 10} }; set e [expr {-[f 6]}]; set e"), "-16");
+        assert_eq!(
+            ev("proc h {} { list 1 2 }; set i [expr {[llength [h]] == 2}]; set i"),
+            "1"
+        );
+        assert_eq!(
+            ev("proc fib n { if {$n < 2} { return $n }; expr {[fib [expr {$n - 1}]] + [fib [expr {$n - 2}]]} }; fib 12"),
+            "144"
+        );
+        // A condition's brackets re-run every iteration (while/if).
+        assert_eq!(
+            ev("set L {}; set n 0; while {[llength $L] < 3} { lappend L [incr n] }; set L"),
+            "1 2 3"
+        );
+        // Control flow through expr-embedded brackets.
+        assert_eq!(
+            ev("set hits 0; for {set i 0} {$i < 3} {incr i} { set t [expr {[continue] + 1}]; incr hits }; set hits"),
+            "0"
+        );
+        assert_eq!(ev("proc r {} { expr {1 + [return 42]} }; r"), "42");
+    }
+
+    #[test]
+    fn test_expr_inline_error_framing() {
+        // An error crossing an expr-operand bracket APPENDS the owning
+        // command's frame (eval_expr's bracket is a plain nested eval —
+        // no err_from_subst), unlike a word bracket, which defers.
+        let mut interp = Interp::new();
+        let r = interp.eval("expr {[nosuch a]}");
+        assert!(r.is_err());
+        assert_eq!(r.unwrap_err().message_text(), "invalid command name \"nosuch\"");
+        let info = interp.err_info.take().unwrap_or_default();
+        assert!(info.contains("\"nosuch a\""), "inner frame in {info}");
+        assert!(info.contains("\"expr {[nosuch a]}\""), "appended expr frame in {info}");
+
+        // Mixed: word bracket defers, expr bracket inside it appends.
+        let mut interp = Interp::new();
+        let r = interp.eval("set x [expr {[nosuch a]}]");
+        assert!(r.is_err());
+        let info = interp.err_info.take().unwrap_or_default();
+        assert!(info.contains("\"nosuch a\""), "inner frame in {info}");
+        assert!(info.contains("\"expr {[nosuch a]}\""), "expr frame in {info}");
+        assert_eq!(interp.err_pending_top.as_deref(), Some("set x [expr {[nosuch a]}]"));
+
+        // Transparent-body suppression: `if`'s body error adds no if frame;
+        // the expr frame still appends (both engines agree, verified vs
+        // tclsh modulo the recorded expr-frame divergence).
+        let mut interp = Interp::new();
+        let r = interp.eval("expr {1 + [if {1} {error mid}]}");
+        assert!(r.is_err());
+        assert_eq!(r.unwrap_err().message_text(), "mid");
+        let info = interp.err_info.take().unwrap_or_default();
+        assert!(info.contains("\"error mid\""), "inner frame in {info}");
+        assert!(info.contains("\"expr {1 + [if {1} {error mid}]}\""), "expr frame in {info}");
+        assert!(!info.contains("\"if {1} {error mid}\""), "no if frame: {info}");
     }
 
     #[test]

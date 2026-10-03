@@ -4,8 +4,11 @@
 //! at compile time, emitting native comparison/arithmetic opcodes instead
 //! of `PushConst + EvalExpr`.
 //!
-//! Falls back to `None` for expressions that are too complex (function calls,
-//! command substitution `[…]`, ternary `?:`, string literals with spaces, etc.).
+//! Falls back to `false` for expressions that are too complex (function calls,
+//! ternary `?:`, string literals with spaces, etc.).  `[…]` operands ask the
+//! sink to inline them — a bare [`ByteCode`] sink cannot, a
+//! [`crate::compiler::Compiler`] can (when the word is verbatim braced, so
+//! the bracket's content span is locatable in the unit source).
 
 use crate::bytecode::ByteCode;
 use crate::opcode::OpCode;
@@ -22,7 +25,17 @@ use crate::opcode::OpCode;
 /// ops — and their internal jumps would also collide with the executor's
 /// not-taken-jump body-entry tracking.  `parse_bitor` stops at `&&`/`||`,
 /// leaving tokens unconsumed → `false`.
-pub fn try_compile_expr(bytecode: &mut ByteCode, expr: &str, line: u32) -> bool {
+///
+/// `expr_base` is the expression text's byte offset within the enclosing
+/// unit source — `Some(_)` only when the word is verbatim braced, the
+/// condition under which a `[…]` operand's content span can be rebased.
+/// `None` keeps every bracketed expression on the runtime evaluator.
+pub fn try_compile_expr(
+    sink: &mut dyn ExprSink,
+    expr: &str,
+    line: u32,
+    expr_base: Option<u32>,
+) -> bool {
     let tokens = match tokenize(expr) {
         Some(t) => t,
         None => return false,
@@ -47,7 +60,7 @@ pub fn try_compile_expr(bytecode: &mut ByteCode, expr: &str, line: u32) -> bool 
     if tokens.len() == 1 {
         return false;
     }
-    let mut parser = ExprCodegen { bytecode, tokens: &tokens, pos: 0, line };
+    let mut parser = ExprCodegen { sink, tokens: &tokens, pos: 0, line, expr_base };
     if parser.parse_bitor().is_err() {
         return false;
     }
@@ -71,10 +84,45 @@ enum Token {
     BitAnd, BitOr, BitXor, BitNot, Shl, Shr,
     StrEq, StrNe,
     LParen, RParen,
+    /// `[script]` command substitution — the script text and the byte
+    /// offset of its content within the expression string (for span
+    /// rebasing into the enclosing unit).
+    Cmd(String, usize),
+}
+
+/// Where a compiled expression emits its ops.  A bare [`ByteCode`] takes
+/// plain operand ops only; the [`crate::compiler::Compiler`] sink can
+/// additionally inline `[...]` operands (returning false keeps the whole
+/// expression on the runtime evaluator).
+pub trait ExprSink {
+    fn emit(&mut self, op: OpCode, line: u32);
+    fn add_const(&mut self, name: &str) -> u16;
+    fn emit_sub(&mut self, script: &str, abs_start: u32, line: u32) -> bool;
+}
+
+impl ExprSink for ByteCode {
+    fn emit(&mut self, op: OpCode, line: u32) {
+        ByteCode::emit(self, op, line);
+    }
+    fn add_const(&mut self, name: &str) -> u16 {
+        ByteCode::add_const(self, name)
+    }
+    fn emit_sub(&mut self, _script: &str, _abs_start: u32, _line: u32) -> bool {
+        false
+    }
 }
 
 fn tokenize(expr: &str) -> Option<Vec<Token>> {
     let chars: Vec<char> = expr.chars().collect();
+    // Byte offset of each char — `[...]` operands rebase into the unit by
+    // it, and multi-byte content elsewhere must not skew the spans.
+    let mut boff: Vec<usize> = Vec::with_capacity(chars.len() + 1);
+    let mut b = 0usize;
+    for &c in &chars {
+        boff.push(b);
+        b += c.len_utf8();
+    }
+    boff.push(b);
     let mut tokens = Vec::new();
     let mut i = 0;
     let len = chars.len();
@@ -83,6 +131,35 @@ fn tokenize(expr: &str) -> Option<Vec<Token>> {
         // Skip whitespace
         if chars[i].is_ascii_whitespace() {
             i += 1;
+            continue;
+        }
+
+        // Command substitution: [script] — depth-balanced, exactly the
+        // runtime evaluator's collect_bracket_command scan.
+        if chars[i] == '[' {
+            let content_char = i + 1;
+            let mut script = String::new();
+            let mut depth = 1;
+            i += 1;
+            while i < len && depth > 0 {
+                let c = chars[i];
+                i += 1;
+                if c == '[' {
+                    depth += 1;
+                    script.push(c);
+                } else if c == ']' {
+                    depth -= 1;
+                    if depth > 0 {
+                        script.push(c);
+                    }
+                } else {
+                    script.push(c);
+                }
+            }
+            if depth > 0 {
+                return None; // unclosed bracket — runtime error path
+            }
+            tokens.push(Token::Cmd(script, boff[content_char]));
             continue;
         }
 
@@ -266,10 +343,11 @@ fn tokenize(expr: &str) -> Option<Vec<Token>> {
 // ---------------------------------------------------------------------------
 
 struct ExprCodegen<'a> {
-    bytecode: &'a mut ByteCode,
+    sink: &'a mut dyn ExprSink,
     tokens: &'a [Token],
     pos: usize,
     line: u32,
+    expr_base: Option<u32>,
 }
 
 type CResult = Result<(), ()>;
@@ -301,7 +379,7 @@ impl<'a> ExprCodegen<'a> {
         self.parse_bitxor()?;
         while self.match_tok(&Token::BitOr) {
             self.parse_bitxor()?;
-            self.bytecode.emit(OpCode::BitOr, self.line);
+            self.sink.emit(OpCode::BitOr, self.line);
         }
         Ok(())
     }
@@ -311,7 +389,7 @@ impl<'a> ExprCodegen<'a> {
         self.parse_bitand()?;
         while self.match_tok(&Token::BitXor) {
             self.parse_bitand()?;
-            self.bytecode.emit(OpCode::BitXor, self.line);
+            self.sink.emit(OpCode::BitXor, self.line);
         }
         Ok(())
     }
@@ -321,7 +399,7 @@ impl<'a> ExprCodegen<'a> {
         self.parse_equality()?;
         while self.match_tok(&Token::BitAnd) {
             self.parse_equality()?;
-            self.bytecode.emit(OpCode::BitAnd, self.line);
+            self.sink.emit(OpCode::BitAnd, self.line);
         }
         Ok(())
     }
@@ -332,16 +410,16 @@ impl<'a> ExprCodegen<'a> {
         loop {
             if self.match_tok(&Token::Eq) {
                 self.parse_relational()?;
-                self.bytecode.emit(OpCode::Eq, self.line);
+                self.sink.emit(OpCode::Eq, self.line);
             } else if self.match_tok(&Token::Ne) {
                 self.parse_relational()?;
-                self.bytecode.emit(OpCode::Ne, self.line);
+                self.sink.emit(OpCode::Ne, self.line);
             } else if self.match_tok(&Token::StrEq) {
                 self.parse_relational()?;
-                self.bytecode.emit(OpCode::StrEq, self.line);
+                self.sink.emit(OpCode::StrEq, self.line);
             } else if self.match_tok(&Token::StrNe) {
                 self.parse_relational()?;
-                self.bytecode.emit(OpCode::StrNe, self.line);
+                self.sink.emit(OpCode::StrNe, self.line);
             } else {
                 break;
             }
@@ -355,16 +433,16 @@ impl<'a> ExprCodegen<'a> {
         loop {
             if self.match_tok(&Token::Lt) {
                 self.parse_shift()?;
-                self.bytecode.emit(OpCode::Lt, self.line);
+                self.sink.emit(OpCode::Lt, self.line);
             } else if self.match_tok(&Token::Gt) {
                 self.parse_shift()?;
-                self.bytecode.emit(OpCode::Gt, self.line);
+                self.sink.emit(OpCode::Gt, self.line);
             } else if self.match_tok(&Token::Le) {
                 self.parse_shift()?;
-                self.bytecode.emit(OpCode::Le, self.line);
+                self.sink.emit(OpCode::Le, self.line);
             } else if self.match_tok(&Token::Ge) {
                 self.parse_shift()?;
-                self.bytecode.emit(OpCode::Ge, self.line);
+                self.sink.emit(OpCode::Ge, self.line);
             } else {
                 break;
             }
@@ -378,10 +456,10 @@ impl<'a> ExprCodegen<'a> {
         loop {
             if self.match_tok(&Token::Shl) {
                 self.parse_add()?;
-                self.bytecode.emit(OpCode::Shl, self.line);
+                self.sink.emit(OpCode::Shl, self.line);
             } else if self.match_tok(&Token::Shr) {
                 self.parse_add()?;
-                self.bytecode.emit(OpCode::Shr, self.line);
+                self.sink.emit(OpCode::Shr, self.line);
             } else {
                 break;
             }
@@ -395,10 +473,10 @@ impl<'a> ExprCodegen<'a> {
         loop {
             if self.match_tok(&Token::Plus) {
                 self.parse_mul()?;
-                self.bytecode.emit(OpCode::Add, self.line);
+                self.sink.emit(OpCode::Add, self.line);
             } else if self.match_tok(&Token::Minus) {
                 self.parse_mul()?;
-                self.bytecode.emit(OpCode::Sub, self.line);
+                self.sink.emit(OpCode::Sub, self.line);
             } else {
                 break;
             }
@@ -412,13 +490,13 @@ impl<'a> ExprCodegen<'a> {
         loop {
             if self.match_tok(&Token::Star) {
                 self.parse_power()?;
-                self.bytecode.emit(OpCode::Mul, self.line);
+                self.sink.emit(OpCode::Mul, self.line);
             } else if self.match_tok(&Token::Slash) {
                 self.parse_power()?;
-                self.bytecode.emit(OpCode::Div, self.line);
+                self.sink.emit(OpCode::Div, self.line);
             } else if self.match_tok(&Token::Percent) {
                 self.parse_power()?;
-                self.bytecode.emit(OpCode::Mod, self.line);
+                self.sink.emit(OpCode::Mod, self.line);
             } else {
                 break;
             }
@@ -431,7 +509,7 @@ impl<'a> ExprCodegen<'a> {
         self.parse_unary()?;
         if self.match_tok(&Token::StarStar) {
             self.parse_power()?; // right-associative
-            self.bytecode.emit(OpCode::Pow, self.line);
+            self.sink.emit(OpCode::Pow, self.line);
         }
         Ok(())
     }
@@ -440,7 +518,7 @@ impl<'a> ExprCodegen<'a> {
     fn parse_unary(&mut self) -> CResult {
         if self.match_tok(&Token::Minus) {
             self.parse_unary()?;
-            self.bytecode.emit(OpCode::Neg, self.line);
+            self.sink.emit(OpCode::Neg, self.line);
             Ok(())
         } else if self.match_tok(&Token::Plus) {
             // tclsh's unary plus FORCES numeric interpretation
@@ -450,11 +528,11 @@ impl<'a> ExprCodegen<'a> {
             Err(())
         } else if self.match_tok(&Token::Not) {
             self.parse_unary()?;
-            self.bytecode.emit(OpCode::Not, self.line);
+            self.sink.emit(OpCode::Not, self.line);
             Ok(())
         } else if self.match_tok(&Token::BitNot) {
             self.parse_unary()?;
-            self.bytecode.emit(OpCode::BitNot, self.line);
+            self.sink.emit(OpCode::BitNot, self.line);
             Ok(())
         } else {
             self.parse_primary()
@@ -466,24 +544,41 @@ impl<'a> ExprCodegen<'a> {
         match self.advance() {
             Some(Token::Int(n)) => {
                 let n = *n;
-                self.bytecode.emit(OpCode::PushInt(n), self.line);
+                self.sink.emit(OpCode::PushInt(n), self.line);
                 Ok(())
             }
             Some(Token::Float(n)) => {
                 let n = *n;
-                self.bytecode.emit(OpCode::PushFloat(n), self.line);
+                self.sink.emit(OpCode::PushFloat(n), self.line);
                 Ok(())
             }
             Some(Token::Var(name)) => {
                 let name = name.clone();
-                let idx = self.bytecode.add_const(&name);
-                self.bytecode.emit(OpCode::LoadVar(idx), self.line);
+                let idx = self.sink.add_const(&name);
+                self.sink.emit(OpCode::LoadVar(idx), self.line);
                 Ok(())
             }
             Some(Token::LParen) => {
                 self.parse_bitor()?;
                 if !self.match_tok(&Token::RParen) {
                     return Err(());
+                }
+                Ok(())
+            }
+            Some(Token::Cmd(script, off)) => {
+                let (script, off) = (script.clone(), *off);
+                match self.expr_base {
+                    // Verbatim-braced word: the bracket content's absolute
+                    // start is known, so inline it exactly like a whole-word
+                    // bracket (ExprMark … SubEnd region in the unit).
+                    Some(base) => {
+                        if !self.sink.emit_sub(&script, base + off as u32, self.line) {
+                            return Err(());
+                        }
+                    }
+                    // No locatable span — the whole expression stays on the
+                    // runtime evaluator, which owns the nested-eval framing.
+                    None => return Err(()),
                 }
                 Ok(())
             }
@@ -502,7 +597,7 @@ mod tests {
 
     fn compile_expr(expr: &str) -> Option<Vec<OpCode>> {
         let mut bc = ByteCode::new();
-        if try_compile_expr(&mut bc, expr, 1) {
+        if try_compile_expr(&mut bc, expr, 1, None) {
             Some(bc.ops().to_vec())
         } else {
             None
@@ -676,7 +771,7 @@ mod tests {
 
     fn compile_expr_with_peephole(expr: &str) -> Option<Vec<OpCode>> {
         let mut bc = ByteCode::new();
-        if try_compile_expr(&mut bc, expr, 1) {
+        if try_compile_expr(&mut bc, expr, 1, None) {
             bc.peephole();
             Some(bc.ops().to_vec())
         } else {

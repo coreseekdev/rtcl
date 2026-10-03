@@ -486,6 +486,15 @@ pub enum OpCode {
     /// bracket's result is the last command's value, already on the stack.
     SubEnd,
 
+    /// Enters an inlined `[...]` operand of a compiled expression (the
+    /// `expr {[fib $n] + 1}` shape).  Like [`OpCode::SubMark`] the bracket's
+    /// script is compiled inline, but the region is marked "expr": an error
+    /// crossing it makes the expression-owning command **append** its
+    /// harness frame (eval_expr's bracket runs a plain nested eval that sets
+    /// no `err_from_subst`, so the command's frame is logged, not deferred).
+    /// Closed by the shared [`OpCode::SubEnd`].
+    ExprMark,
+
     /// No operation.
     Nop,
 }
@@ -615,6 +624,7 @@ impl fmt::Display for OpCode {
             OpCode::NextMark => write!(f, "NEXT_MARK"),
             OpCode::SubMark => write!(f, "SUB_MARK"),
             OpCode::SubEnd => write!(f, "SUB_END"),
+            OpCode::ExprMark => write!(f, "EXPR_MARK"),
             OpCode::Nop => write!(f, "NOP"),
         }
     }

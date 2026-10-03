@@ -93,7 +93,7 @@ impl Compiler {
             | OpCode::BitAnd | OpCode::BitOr | OpCode::BitXor | OpCode::BitNot
             | OpCode::Shl | OpCode::Shr
             | OpCode::BeginCmd(_) | OpCode::BodyMark | OpCode::NextMark
-            | OpCode::SubMark | OpCode::SubEnd
+            | OpCode::SubMark | OpCode::SubEnd | OpCode::ExprMark
             | OpCode::Call { .. } | OpCode::CallExpand { .. }
             | OpCode::DynCall { .. } | OpCode::DynCallExpand { .. }
         ));
@@ -857,12 +857,23 @@ impl Compiler {
                 // PushInt lands, then `&&` is rejected) — roll the unit back
                 // before the fallback, or the orphan value misaligns the
                 // stack (harmless when the expression is a whole unit;
-                // fatal when it compiles inline inside a word).
+                // fatal when it compiles inline inside a word).  Inlining a
+                // `[...]` operand also pushes sites for its inner commands,
+                // so the rollback covers both ops and sites.
                 let ops_mark = self.bytecode.ops().len();
-                if crate::expr_compile::try_compile_expr(&mut self.bytecode, s, line) {
+                let sites_mark = self.bytecode.sites.len();
+                // expr_base: the expression text's byte offset within the
+                // unit — `Some(_)` only for a verbatim-braced word, the
+                // condition under which a bracket operand's content span
+                // can rebase into the unit.
+                let expr_base = self
+                    .is_verbatim_braced(cmd, word_idx, s)
+                    .then(|| self.span_base + cmd.word_srcs[word_idx].start + 1);
+                if crate::expr_compile::try_compile_expr(self, s, line, expr_base) {
                     return;
                 }
                 self.bytecode.truncate_ops(ops_mark);
+                self.bytecode.sites.truncate(sites_mark);
                 // Fallback: runtime eval
                 self.bytecode.emit_push_const(s, line);
                 self.bytecode.emit(OpCode::EvalExpr, line);
@@ -872,6 +883,41 @@ impl Compiler {
                 self.bytecode.emit(OpCode::EvalExpr, line);
             }
         }
+    }
+}
+
+impl crate::expr_compile::ExprSink for Compiler {
+    fn emit(&mut self, op: OpCode, line: u32) {
+        self.bytecode.emit(op, line);
+    }
+
+    fn add_const(&mut self, name: &str) -> u16 {
+        self.bytecode.add_const(name)
+    }
+
+    /// Inline a `[...]` operand of the expression being compiled:
+    /// `abs_start` is the bracket content's absolute start in the unit
+    /// source.  Returns false (compiling nothing) when the script does not
+    /// parse — the caller abandons the whole expression to the runtime
+    /// evaluator, whose nested eval owns the parse-error framing.
+    fn emit_sub(&mut self, script: &str, abs_start: u32, line: u32) -> bool {
+        let Ok(commands) = crate::parse(script) else {
+            return false;
+        };
+        let saved = self.span_base;
+        self.span_base = abs_start;
+        // line_base is inherited unchanged — same rule as whole-word
+        // brackets: the tree-walk's nested eval runs with the enclosing
+        // offset still installed.
+        self.bytecode.emit(OpCode::ExprMark, line);
+        if commands.is_empty() {
+            self.bytecode.emit(OpCode::PushEmpty, line);
+        } else {
+            self.compile_commands(&commands);
+        }
+        self.bytecode.emit(OpCode::SubEnd, line);
+        self.span_base = saved;
+        true
     }
 }
 
@@ -1202,6 +1248,54 @@ mod tests {
         let bc = Compiler::compile_script("set x a[foo]b").unwrap();
         assert!(bc.ops().iter().any(|o| matches!(o, OpCode::EvalScript)));
 
+    }
+
+    #[test]
+    fn test_compile_expr_bracket_inline() {
+        // Brackets as operands of a compiled expression inline too
+        // (ExprMark/SubEnd) — the classic fib recursion shape.
+        let src = "set s [expr {[f 1] + [f 2]}]";
+        let bc = Compiler::compile_script(src).unwrap();
+        let ops = bc.ops();
+        assert!(ops.iter().any(|o| matches!(o, OpCode::ExprMark)));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::Add)));
+        assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
+        assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalScript)));
+
+        // Inner command sites rebase into the unit source.
+        let f_site = bc
+            .sites
+            .iter()
+            .find(|s| s.text.slice(&bc.source) == "f 1")
+            .expect("rebased inner site");
+        assert_eq!(f_site.line, 1);
+
+        // A bracket inside a multi-line expression: the collected script
+        // starts at `[` (no leading newline), so the inner command's line
+        // follows the enclosing command's line — exactly what the
+        // tree-walk's nested eval produces (line_base inherited).
+        let src = "set x [expr {\n    [nosuch a]\n    + 1}]";
+        let bc = Compiler::compile_script(src).unwrap();
+        let site = bc
+            .sites
+            .iter()
+            .find(|s| s.text.slice(&bc.source) == "nosuch a")
+            .expect("inner site");
+        assert_eq!(site.line, 1);
+
+        // Failure mid-expression rolls back the inlined bracket AND its
+        // sites before the EvalExpr fallback (the `&&` rejection leaves
+        // no orphan ops or sites behind).
+        let src = "set q [expr {[f 1] && 0}]";
+        let bc = Compiler::compile_script(src).unwrap();
+        let ops = bc.ops();
+        assert!(!ops.iter().any(|o| matches!(o, OpCode::ExprMark)));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
+        assert!(!bc.sites.iter().any(|s| s.text.slice(&bc.source) == "f 1"));
+
+        // A non-verbatim expr word (substitution) keeps the runtime eval.
+        let bc = Compiler::compile_script("set e {1 + 1}; expr $e").unwrap();
+        assert!(bc.ops().iter().any(|o| matches!(o, OpCode::EvalExpr)));
     }
 
     #[test]

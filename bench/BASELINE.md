@@ -78,3 +78,24 @@ list_ops                  5          7      1.4
 proc_fib                  5         25      5.0
 string_build              3          3      1.0
 var_incr                 41         29       .7
+
+# ---------------------------------------------------------------------------
+# bench — 2026-10-03, expr-bracket inlining: `[...]` operands of compiled
+# expressions inline into the unit (ExprMark/SubEnd regions; the
+# ExprSink trait lets expr_compile emit into the Compiler, byte-offset
+# rebasing via the verbatim-braced word's span).  The classic
+# `expr {[fib [expr {$n-1}]] + [fib [expr {$n-2}]]}` shape no longer
+# runs the runtime expression parser per evaluation.  fib25 hand-probe:
+# 654ms → 136ms (4.8x; tclsh 31ms).  Error framing differentially
+# verified bytecode == tree-walk on 6 probe scripts; rtcl-vs-tclsh
+# deltas remain the recorded divergence classes (expr/if harness
+# frames, empty-operand message).
+# Same machine, reps=5, taskset -c 0.
+
+case               tclsh_ms    rtcl_ms    ratio
+arith_loop               34         31       .9
+dict_ops                  5          6      1.2
+list_ops                  5          7      1.4
+proc_fib                  4         13      3.2
+string_build              3          3      1.0
+var_incr                 39         29       .7

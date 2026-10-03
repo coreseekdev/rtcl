@@ -460,6 +460,8 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             // Sub-region framing likewise (see vm_exec's unwind).
             OpCode::SubMark => {}
             OpCode::SubEnd => {}
+            // Expr-operand sub-region framing likewise.
+            OpCode::ExprMark => {}
             OpCode::Nop => {}
         }
     }

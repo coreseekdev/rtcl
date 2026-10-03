@@ -5,9 +5,9 @@
 
 ## 0. 项目与仓库
 
-- 仓库：`git@github.com:coreseekdev/rtcl.git`，本地 checkout `/home/nzinfo/src.note/rtcl`，分支 `master`。
+- 仓库：`git@github.com:coreseekdev/rtcl.git`，master 工作树 = `/home/nzinfo/src.note/rtcl-master`（持久盘；2026-10-03 从 /tmp tmpfs 迁出——/tmp 重启即失，工作成果必须及时 commit+push），分支 `master`。
 - 定位：Rust 实现的 Tcl 解释器（jimtcl 血统的轻量定位），target = native + **wasm32-unknown-unknown（预期主路径）** + wasm32-wasip1 + embedded no_std。
-- crate 结构：`rtcl-parser`（递归下降解析 + ByteCode 编译）、`rtcl-ir`（OpCode 三层：primitive / `Call(CmdId)` 0..127 stdlib 128+ 扩展 / `DynCall`）、`rtcl-vm`（execute.rs dispatch 循环 + `VmContext` trait + Value/Error 唯一实现）、`rtcl-core`（Interp + 内建命令，`value.rs`/`error.rs` 只是 re-export）、`rtcl-cli`、`rtcl-wasm`、`rtcl-expect`。
+- crate 结构：`rtcl-parser`（递归下降解析 + ByteCode 编译）、`rtcl-ir`（OpCode 三层：primitive / `Call(CmdId)` 0..127 stdlib 128+ 扩展 / `DynCall`）、`rtcl-vm`（execute.rs dispatch 循环 + `VmContext` trait + Value/Error 唯一实现）、`rtcl-core`（Interp + 内建命令，`value.rs`/`error.rs` 只是 re-export）、`rtcl-cli`、`rtcl-wasm`、`rtcl-expect`、`rtcl-jit`（ByteCode → wasm 发射器，JIT M0 起）。
 - Tcl 官方源码（行为 oracle 的测试语料）：`/home/nzinfo/src.note/rtcl/.refer/tcl`（已 gitignore；如被删重新 `git clone --depth 1 https://github.com/tcltk/tcl.git .refer/tcl`）。
 - 系统 oracle：`/usr/bin/tclsh` = Tcl 8.6.17。**一切语义以 tclsh 实测为准，不凭记忆。**
 

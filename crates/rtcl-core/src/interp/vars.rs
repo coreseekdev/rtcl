@@ -524,6 +524,35 @@ impl Interp {
                 Err(Error::var_not_found(name))
             }
         } else {
+            // Fast path: unqualified scalar in the innermost frame (no
+            // `::` qualifier, no upvar link) — the proc-local and
+            // loop-variable case.  One hash probe, no allocation; the
+            // slow path below keeps the full scope-chain semantics.
+            if !name.contains("::") {
+                if let Some(frame) = self.frames.last() {
+                    if !frame.upvars.contains_key(name) {
+                        if let Some(v) = frame.locals.get(name) {
+                            if frame.array_locals.contains(name) {
+                                return Err(Error::runtime(
+                                    format!("can't read \"{}\": variable is array", name),
+                                    ErrorCode::Generic,
+                                ));
+                            }
+                            return Ok(v);
+                        }
+                    }
+                } else if self.current_namespace == "::" && self.flat_aliases.is_empty() {
+                    if let Some(v) = self.globals.get(name) {
+                        if self.array_globals.contains(name) {
+                            return Err(Error::runtime(
+                                format!("can't read \"{}\": variable is array", name),
+                                ErrorCode::Generic,
+                            ));
+                        }
+                        return Ok(v);
+                    }
+                }
+            }
             let loc = self.resolve_loc(name);
             if self.loc_is_array(&loc) {
                 return Err(Error::runtime(
@@ -632,6 +661,38 @@ impl Interp {
                     Error::runtime(format!("can't set \"{}\": {}", name, e), ErrorCode::Generic)
                 })?;
         } else {
+            // Fast path: unqualified scalar write hitting an existing
+            // variable in the innermost frame (or the global table at
+            // "::" top level) — no upvar/dead link, not an array.  One
+            // get_mut probe, zero allocations; creation, links, arrays
+            // and qualified names keep the slow path below (same errors,
+            // same trace firing).
+            if !name.contains("::") && self.dead_flat.is_empty() {
+                let mut wrote = false;
+                if let Some(frame) = self.frames.last_mut() {
+                    if !frame.upvars.contains_key(name) && !frame.array_locals.contains(name) {
+                        if let Some(slot) = frame.locals.get_mut(name) {
+                            *slot = value.clone();
+                            wrote = true;
+                        }
+                    }
+                } else if self.current_namespace == "::" && self.flat_aliases.is_empty() {
+                    if !self.array_globals.contains(name) {
+                        if let Some(slot) = self.globals.get_mut(name) {
+                            *slot = value.clone();
+                            wrote = true;
+                        }
+                    }
+                }
+                if wrote {
+                    if !self.var_traces.is_empty() {
+                        self.fire_traces(name, None, "write").map_err(|e| {
+                            Error::runtime(format!("can't set \"{}\": {}", name, e), ErrorCode::Generic)
+                        })?;
+                    }
+                    return Ok(value);
+                }
+            }
             let loc = self.resolve_loc(name);
             if self.loc_is_array(&loc) {
                 return Err(Error::runtime(
@@ -1052,6 +1113,13 @@ impl Interp {
     /// callback may create the element (trace-1.7).  No fire when the
     /// array is missing or the base is a scalar (trace-1.8).
     pub fn read_var(&mut self, name: &str) -> Result<Value> {
+        // Fast path: scalar read with no variable traces registered — the
+        // loop-body `$x` case.  The base-name allocation and the read
+        // trace pass are both no-ops without traces, so skip them whole
+        // (tclsh: scalar reads take the var-table direct hit).
+        if !name.contains('(') && self.var_traces.is_empty() {
+            return self.get_var(name).cloned();
+        }
         let (base, idx) = match split_array_ref(name) {
             Some((b, i)) => (b.to_string(), Some(i.to_string())),
             None => (name.to_string(), None),

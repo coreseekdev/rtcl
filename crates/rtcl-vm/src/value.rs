@@ -615,6 +615,17 @@ impl Value {
         }
     }
 
+    /// Do both handles point at the same `ValueInner` allocation?
+    ///
+    /// Pointer identity, not string equality — the loop-body memo keys on
+    /// "is this the exact script Value the interpreter handed out last
+    /// time".  Clones share the allocation and still compare equal; a
+    /// value rebuilt from text compares different even when the text
+    /// matches, so a stale memo can never be hit through a look-alike.
+    pub fn same_allocation(&self, other: &Value) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Parse or return a dict as an owned DictMap.
     pub fn as_dict(&self) -> Option<DictMap> {
         match &self.inner.rep {

@@ -485,7 +485,7 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(wrong_args("lmap", "varList list ?varList list ...? command"));
     }
 
-    let body = args[args.len() - 1].as_str();
+    let body = &args[args.len() - 1];
     let mut collected: Vec<Value> = Vec::new();
 
     struct VarGroup {
@@ -525,7 +525,7 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         // A `return -level 0 $v` in the body ends the body script with
         // $v: lmap still collects it and keeps iterating (lmap-1.2a).
-        match demote_level0_return(interp.eval(body)) {
+        match demote_level0_return(interp.eval_body_value(body)) {
             Ok(v) => collected.push(v),
             Err(e) => {
                 if e.is_break() { break; }

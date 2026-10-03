@@ -218,6 +218,15 @@ pub struct Interp {
     /// is interchangeable with the AST walk.  Bound and cleared together
     /// with the parse cache (see `eval`).
     pub(crate) bytecode_cache: HashMap<Rc<str>, Rc<rtcl_parser::ByteCode>>,
+    /// Loop-body memo: recent body `Value`s handed to
+    /// [`Interp::eval_body_value`] plus their compiled forms — a pointer
+    /// compare replaces `eval`'s two full-text cache hashes on every hit
+    /// (while/for/foreach bodies, `time` scripts).  A few slots, not one:
+    /// `for` alternates body and next scripts every iteration, and one
+    /// loop nested inside another needs both its own body and the outer
+    /// body/next resident (tclsh instead compiles loop bodies inline into
+    /// the surrounding bytecode and pays nothing per iteration).
+    pub(crate) body_memo: Vec<(Value, Rc<rtcl_parser::ByteCode>)>,
     /// `check_expr` verdict memo: expr text → `Err(msg)` on syntax error,
     /// `Ok(())` when clean (see `types::expr::eval_expr`).  Pure function
     /// of the text; loop conditions re-check every iteration.
@@ -470,6 +479,7 @@ impl Interp {
             procs: HashMap::new(),
             parse_cache: HashMap::new(),
             bytecode_cache: HashMap::new(),
+            body_memo: Vec::new(),
             expr_check_cache: HashMap::new(),
             call_depth: 0,
             max_call_depth: 1000,

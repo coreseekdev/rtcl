@@ -357,12 +357,12 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let val_var = var_list[1].as_str().to_string();
             // Clone the dict: body evaluation may modify variables
             let entries = parse_dict(interp, &args[3])?;
-            let body = args[4].as_str();
+            let body = &args[4];
             let mut result = Value::empty();
             for (k, v) in &entries {
                 interp.set_var(&key_var, Value::from_str(k))?;
                 interp.set_var(&val_var, v.clone())?;
-                match demote_level0_return(interp.eval(body)) {
+                match demote_level0_return(interp.eval_body_value(body)) {
                     Ok(r) => result = r,
                     Err(e) => {
                         if e.is_break() {
@@ -537,7 +537,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let var_name = args[2].as_str();
-            let body = args[args.len() - 1].as_str();
+            let body = &args[args.len() - 1];
 
             let mut current = interp.get_var(var_name)?.clone();
             let keys: Vec<&str> = args[3..args.len() - 1]
@@ -563,7 +563,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.set_var(k, v.clone())?;
             }
 
-            let result = demote_level0_return(interp.eval(body));
+            let result = demote_level0_return(interp.eval_body_value(body));
             // tclsh leaves the mapped variables in place on error and does
             // not write the dict back; break/continue still write back.
             match &result {
@@ -649,12 +649,12 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     }
                     let key_var = var_list[0].as_str().to_string();
                     let val_var = var_list[1].as_str().to_string();
-                    let script = args[5].as_str();
+                    let script = &args[5];
                     let mut filtered = entries.empty_like(0);
                     for (k, v) in &entries {
                         interp.set_var(&key_var, Value::from_str(k))?;
                         interp.set_var(&val_var, v.clone())?;
-                        match demote_level0_return(interp.eval(script)) {
+                        match demote_level0_return(interp.eval_body_value(script)) {
                             Ok(r) => {
                                 // tclsh requires a boolean body result
                                 // ("expected boolean value but got ...").
@@ -705,12 +705,12 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let key_var = var_list[0].as_str().to_string();
             let val_var = var_list[1].as_str().to_string();
             let entries = parse_dict(interp, &args[3])?;
-            let body = args[4].as_str();
+            let body = &args[4];
             let mut result_entries = entries.empty_like(entries.len());
             for (k, v) in &entries {
                 interp.set_var(&key_var, Value::from_str(k))?;
                 interp.set_var(&val_var, v.clone())?;
-                match demote_level0_return(interp.eval(body)) {
+                match demote_level0_return(interp.eval_body_value(body)) {
                     Ok(new_v) => {
                         result_entries.insert(k.clone(), new_v);
                     }
@@ -781,7 +781,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let var_name = args[2].as_str().to_string();
-            let body = args[args.len() - 1].as_str().to_string();
+            let body = &args[args.len() - 1];
             let pairs: Vec<(String, String)> = args[3..args.len() - 1]
                 .chunks(2)
                 .map(|c| (c[0].as_str().to_string(), c[1].as_str().to_string()))
@@ -796,7 +796,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
             }
 
-            let result = interp.eval(&body);
+            let result = interp.eval_body_value(body);
 
             if interp.get_var(&var_name).is_ok() {
                 let cur_val = interp.get_var(&var_name).ok().cloned().unwrap_or_default();

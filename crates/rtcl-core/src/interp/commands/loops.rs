@@ -15,7 +15,7 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     let test = args[1].as_str();
-    let body = args[2].as_str();
+    let body = &args[2];
 
     // tclsh compiles the body inline against one absolute line table, so a
     // body command's `(procedure ... line N)` reports its line in the
@@ -26,7 +26,7 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // A body that came from a variable keeps the unshifted numbering (its
     // origin is unknowable; tclsh in that case also numbers from 1).
     let saved_offset = interp.line_offset;
-    let body_offset = match interp.body_is_verbatim_script(2, body) {
+    let body_offset = match interp.body_is_verbatim_script(2, body.as_str()) {
         Some(extra) => Some(saved_offset + interp.cur_cmd_line.max(1) - 1 + extra),
         None => None,
     };
@@ -39,7 +39,7 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if let Some(off) = body_offset {
             interp.line_offset = off;
         }
-        let r = demote_level0_return(interp.eval(body));
+        let r = demote_level0_return(interp.eval_body_value(body));
         interp.line_offset = saved_offset;
         match r {
             Ok(_) => {}
@@ -71,8 +71,8 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let start = args[1].as_str();
     let test = args[2].as_str();
-    let next = args[3].as_str();
-    let body = args[4].as_str();
+    let next = &args[3];
+    let body = &args[4];
 
     demote_level0_return(interp.eval(start))?;
 
@@ -80,7 +80,7 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let cond = interp.eval_expr(test)?;
         if !crate::types::expr_funcs::strict_bool(&cond)? { break; }
 
-        match demote_level0_return(interp.eval(body)) {
+        match demote_level0_return(interp.eval_body_value(body)) {
             Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
@@ -99,7 +99,7 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
 
-        match demote_level0_return(interp.eval(next)) {
+        match demote_level0_return(interp.eval_body_value(next)) {
             Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
@@ -136,7 +136,7 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         ));
     }
 
-    let body = args[args.len() - 1].as_str();
+    let body = &args[args.len() - 1];
 
     // Collect (var_names, data_list) pairs
     // var_names is a list: single var "x" or multi-var "{a b c}"
@@ -201,7 +201,7 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
             }
         }
-        match demote_level0_return(interp.eval(body)) {
+        match demote_level0_return(interp.eval_body_value(body)) {
             Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
@@ -237,7 +237,7 @@ pub fn cmd_time(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         ));
     }
 
-    let script = args[1].as_str();
+    let script = &args[1];
     let count: u64 = if args.len() == 3 {
         args[2].as_int().unwrap_or(1) as u64
     } else {
@@ -246,7 +246,7 @@ pub fn cmd_time(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let start = std::time::Instant::now();
     for _ in 0..count {
-        let _ = interp.eval(script)?;
+        let _ = interp.eval_body_value(script)?;
     }
     let elapsed = start.elapsed();
     let us_per_iter = if count > 0 {
@@ -278,7 +278,7 @@ pub fn cmd_timerate(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         ));
     }
 
-    let script = args[1].as_str();
+    let script = &args[1];
     let duration_ms: u64 = if args.len() >= 3 {
         args[2].as_int().unwrap_or(1000) as u64
     } else {
@@ -295,7 +295,7 @@ pub fn cmd_timerate(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut count: u64 = 0;
 
     while start.elapsed() < deadline && count < max_count {
-        let _ = interp.eval(script)?;
+        let _ = interp.eval_body_value(script)?;
         count += 1;
     }
 
@@ -391,7 +391,7 @@ pub fn cmd_range(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 ///   loop var first limit body    — var goes from first to limit-1, step 1
 ///   loop var first limit incr body — var goes from first towards limit, step incr
 pub fn cmd_loop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    let (var, mut i, limit, step, body) = match args.len() {
+    let (var, mut i, limit, step) = match args.len() {
         // loop var limit body
         4 => {
             let var = args[1].as_str().to_string();
@@ -401,7 +401,7 @@ pub fn cmd_loop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     crate::error::ErrorCode::Generic,
                 )
             })?;
-            (var, 0i64, limit, 1i64, args[3].as_str().to_string())
+            (var, 0i64, limit, 1i64)
         }
         // loop var first limit body
         5 => {
@@ -418,7 +418,7 @@ pub fn cmd_loop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     crate::error::ErrorCode::Generic,
                 )
             })?;
-            (var, first, limit, 1i64, args[4].as_str().to_string())
+            (var, first, limit, 1i64)
         }
         // loop var first limit incr body
         6 => {
@@ -447,7 +447,7 @@ pub fn cmd_loop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     crate::error::ErrorCode::Generic,
                 ));
             }
-            (var, first, limit, step, args[5].as_str().to_string())
+            (var, first, limit, step)
         }
         _ => {
             return Err(Error::wrong_args_with_usage(
@@ -458,6 +458,7 @@ pub fn cmd_loop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             ));
         }
     };
+    let body = &args[args.len() - 1];
 
     let mut result = Value::empty();
 
@@ -467,7 +468,7 @@ pub fn cmd_loop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             break;
         }
         interp.set_var(&var, Value::from_int(i))?;
-        match interp.eval(&body) {
+        match interp.eval_body_value(body) {
             Ok(v) => result = v,
             Err(e) => {
                 if e.is_break() {

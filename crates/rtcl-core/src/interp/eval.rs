@@ -75,6 +75,44 @@ impl Interp {
         self.eval_commands(&unit)
     }
 
+    /// Evaluate a command body held as a [`Value`] — the per-iteration
+    /// case (while/for/foreach bodies, `time` scripts).  [`Interp::eval`]
+    /// hashes the full body text twice per call (parse-cache probe +
+    /// bytecode-cache probe); this memo replaces both with one pointer
+    /// compare when the caller hands back the exact allocation it
+    /// received on the previous iteration (tclsh instead compiles loop
+    /// bodies inline into the surrounding bytecode and pays nothing per
+    /// iteration).  A miss runs plain `eval` and memoizes the bytecode
+    /// that eval seeded for this text; the hit path re-checks `eval`'s
+    /// bytecode gates every iteration, so a Tier1 epoch bump or a
+    /// registered exec trace falls straight back to `eval`.
+    pub(crate) fn eval_body_value(&mut self, body: &Value) -> Result<Value> {
+        // Pointer-identity scan of the resident bodies (FIFO, bounded):
+        // body/next of one `for` plus one nested loop's bodies all fit.
+        let hit = self
+            .body_memo
+            .iter()
+            .find(|(v, c)| v.same_allocation(body) && !c.fallback && c.epoch == self.tier1_epoch)
+            .map(|(_, c)| Rc::clone(c));
+        if let Some(code) = hit {
+            if super::vm_exec::bytecode_applicable(self) {
+                return super::vm_exec::exec_bytecode(self, &code);
+            }
+        }
+        let text = body.as_str();
+        let r = self.eval(text);
+        if r.is_ok() {
+            if let Some(code) = self.bytecode_cache.get(text) {
+                const BODY_MEMO_MAX: usize = 4;
+                if self.body_memo.len() == BODY_MEMO_MAX {
+                    self.body_memo.remove(0);
+                }
+                self.body_memo.push((body.clone(), Rc::clone(code)));
+            }
+        }
+        r
+    }
+
     /// Parse-failure → tclsh errorInfo seeding: the logged frame is the
     /// failing command's text from its first character through the
     /// offending delimiter (tclsh logs the partially-consumed command,

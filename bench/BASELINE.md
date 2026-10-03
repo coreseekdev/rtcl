@@ -1,5 +1,6 @@
 # bench baseline — bd3e169 2026-09-29
 # Linux 7.0.0-31-generic x86_64, tclsh 8.6.17, reps=5 best-of
+# Architecture review + ranked roadmap (2026-10-04): ../ARCHITECTURE-PERF.md
 
 case               tclsh_ms    rtcl_ms    ratio
 arith_loop               43        249      5.7

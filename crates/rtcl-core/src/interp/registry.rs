@@ -335,7 +335,7 @@ impl Interp {
         // Check proc definitions first — auto-generate usage from arglist
         if let Some(proc_def) = self.procs.get(name) {
             let mut parts = Vec::new();
-            for (param, default) in &proc_def.params {
+            for (param, default) in proc_def.params.iter() {
                 if param == "args" {
                     parts.push("?arg ...?".to_string());
                 } else if default.is_some() {

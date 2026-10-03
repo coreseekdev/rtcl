@@ -31,11 +31,11 @@ impl Interp {
             ));
         }
 
-        let mut current_params = proc_def.params.clone();
-        let mut current_body = proc_def.body.clone();
+        let mut current_params = Rc::clone(&proc_def.params);
+        let mut current_body = Rc::clone(&proc_def.body);
         let mut current_compiled = proc_def.compiled.clone();
         let mut current_args: Vec<Value> = args.to_vec();
-        let mut current_statics: HashMap<String, Value> = proc_def.statics.clone();
+        let mut current_statics: HashMap<String, Value> = (*proc_def.statics).clone();
         let mut current_proc_name = proc_name.to_string();
         let mut ns_override = ns_override;
 
@@ -65,19 +65,36 @@ impl Interp {
         // arity check fails, so it can't leak into a later call).
         let level0_override = self.frame_level0_args.take();
 
-        // Push a new call frame
-        self.frames.push(CallFrame {
-            locals: HashMap::new(),
-            array_locals: HashSet::new(),
-            upvars: HashMap::new(),
-            ns: None,
-            call_ns: Some(prev_namespace.clone()),
-            local_procs: Vec::new(),
-            deferred_scripts: Vec::new(),
-            tailcall: None,
-            level0: String::new(),
-            ns_depth: self.ns_level0.len(),
-        });
+        // Push a new call frame (a recycled one when the pool has one —
+        // the maps keep their allocation and capacity)
+        let mut frame = match self.frame_pool.pop() {
+            Some(mut f) => {
+                f.locals.clear();
+                f.array_locals.clear();
+                f.upvars.clear();
+                f.local_procs.clear();
+                f.deferred_scripts.clear();
+                f
+            }
+            None => CallFrame {
+                locals: HashMap::new(),
+                array_locals: HashSet::new(),
+                upvars: HashMap::new(),
+                ns: None,
+                call_ns: None,
+                local_procs: Vec::new(),
+                deferred_scripts: Vec::new(),
+                tailcall: None,
+                level0_src: None,
+                ns_depth: 0,
+            },
+        };
+        frame.ns = None;
+        frame.call_ns = Some(prev_namespace.clone());
+        frame.tailcall = None;
+        frame.level0_src = None;
+        frame.ns_depth = self.ns_level0.len();
+        self.frames.push(frame);
 
         let final_result = loop {
             // ── Enter the definition namespace (also on tail-call switch) ──
@@ -96,12 +113,11 @@ impl Interp {
                 // `info level 0` shows the invocation as dispatched: the
                 // as-typed command word plus the evaluated arguments
                 // (tclsh 47.1: `ns a b c` → `::ns::a b c`).  `apply`
-                // overrides with `apply {<term>} <args...>`.
-                frame.level0 = match &level0_override {
-                    Some(l0) => Value::from_list(l0).as_str().to_string(),
-                    None => {
-                        Value::from_list(&current_args.to_vec()).as_str().to_string()
-                    }
+                // overrides with `apply {<term>} <args...>`.  The words
+                // are stored raw and rendered only if asked.
+                frame.level0_src = match &level0_override {
+                    Some(l0) => Some(l0.to_vec()),
+                    None => None, // filled from current_args after binding
                 };
             }
 
@@ -192,6 +208,14 @@ impl Interp {
                 self.frames.last_mut().unwrap().locals.insert("args".to_string(), Value::from_str(&list_str));
             }
 
+            // Hand the invocation words to the frame for a potential
+            // `info level 0` — moved, not re-rendered (the render ran a
+            // list build + quoting walk per call for nothing).
+            let frame = self.frames.last_mut().unwrap();
+            if frame.level0_src.is_none() {
+                frame.level0_src = Some(std::mem::take(&mut current_args));
+            }
+
             // ── Inject static variables into the frame ─────────────
             for (sname, sval) in &current_statics {
                 self.frames.last_mut().unwrap().locals.insert(sname.clone(), sval.clone());
@@ -243,7 +267,7 @@ impl Interp {
                             }
                         }
                         if let Some(pdef) = self.procs.get_mut(&current_proc_name) {
-                            Rc::make_mut(pdef).statics.clone_from(&current_statics);
+                            Rc::make_mut(pdef).statics = Rc::new(current_statics.clone());
                         }
                         current_statics = HashMap::new();
                     }
@@ -259,10 +283,10 @@ impl Interp {
                     let cmd_name = tc_args[0].clone();
                     if let Some(new_proc) = self.procs.get(&cmd_name).cloned() {
                         // Tail-call to another proc — reuse the frame (no depth increase)
-                        current_params = new_proc.params.clone();
-                        current_body = new_proc.body.clone();
+                        current_params = Rc::clone(&new_proc.params);
+                        current_body = Rc::clone(&new_proc.body);
                         current_compiled = new_proc.compiled.clone();
-                        current_statics = new_proc.statics.clone();
+                        current_statics = (*new_proc.statics).clone();
                         current_proc_name = cmd_name.clone();
                         current_args = tc_args.into_iter().map(|s| Value::from_str(&s)).collect();
                         // The reused frame's enterstep context now names the
@@ -330,7 +354,7 @@ impl Interp {
                     }
                 }
                 if let Some(pdef) = self.procs.get_mut(&current_proc_name) {
-                    Rc::make_mut(pdef).statics = updated;
+                    Rc::make_mut(pdef).statics = Rc::new(updated);
                 }
             }
         }
@@ -388,14 +412,35 @@ impl Interp {
             self.err_pending_top = saved_pending;
         }
 
-        // Pop the frame and leave the definition namespace
-        self.frames.pop();
+        // Pop the frame and leave the definition namespace; the emptied
+        // frame goes to the pool for the next call (its maps keep their
+        // allocation).  Pool depth is naturally bounded by recursion.
+        let mut popped = self.frames.pop().unwrap();
+        popped.locals.clear();
+        popped.array_locals.clear();
+        popped.upvars.clear();
+        popped.local_procs.clear();
+        popped.deferred_scripts.clear();
+        popped.level0_src = None;
+        popped.tailcall = None;
+        popped.ns = None;
+        popped.call_ns = None;
+        if self.frame_pool.len() < 32 {
+            self.frame_pool.push(popped);
+        }
         // Frame-local trace tables keyed F{idx}:... must not leak into the
-        // next call that reuses this frame index.
-        let fkey = format!("F{}:", self.frames.len());
-        self.var_traces.retain(|k, _| !k.starts_with(&fkey));
-        self.elem_traces.retain(|k, _| !k.starts_with(&fkey));
-        self.trace_phantoms.retain(|k, _| !k.starts_with(&fkey));
+        // next call that reuses this frame index.  (The retain only runs
+        // when a table is non-empty — the format! below was a per-call
+        // allocation that `p` on an empty table didn't pay for in tclsh.)
+        if !self.var_traces.is_empty()
+            || !self.elem_traces.is_empty()
+            || !self.trace_phantoms.is_empty()
+        {
+            let fkey = format!("F{}:", self.frames.len());
+            self.var_traces.retain(|k, _| !k.starts_with(&fkey));
+            self.elem_traces.retain(|k, _| !k.starts_with(&fkey));
+            self.trace_phantoms.retain(|k, _| !k.starts_with(&fkey));
+        }
         self.current_namespace = prev_namespace;
         self.call_depth -= 1;
 

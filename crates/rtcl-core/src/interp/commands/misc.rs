@@ -1094,21 +1094,22 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // interleave with the namespace evals that enclose them —
             // each frame's ns_depth marks how many were live at its push
             // (`info level N` yields the proc's invocation words, 47.1,
-            // or the ns-eval command's source, 25.9).
-            let mut entries: Vec<&str> = Vec::with_capacity(depth as usize);
+            // or the ns-eval command's source, 25.9).  Frame entries
+            // render lazily from the stored invocation words.
+            let mut entries: Vec<String> = Vec::with_capacity(depth as usize);
             let mut consumed = 0usize;
             for f in &interp.frames {
                 while consumed < f.ns_depth && consumed < interp.ns_level0.len() {
-                    entries.push(&interp.ns_level0[consumed]);
+                    entries.push(interp.ns_level0[consumed].clone());
                     consumed += 1;
                 }
-                entries.push(&f.level0);
+                entries.push(crate::interp::frame_level0(f));
             }
             while consumed < interp.ns_level0.len() {
-                entries.push(&interp.ns_level0[consumed]);
+                entries.push(interp.ns_level0[consumed].clone());
                 consumed += 1;
             }
-            Ok(Value::from_str(entries[(pos - 1) as usize]))
+            Ok(Value::from_str(&entries[(pos - 1) as usize]))
         }
         "complete" => {
             if args.len() != 3 {

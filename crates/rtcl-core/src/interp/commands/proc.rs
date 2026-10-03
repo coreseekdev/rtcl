@@ -4,6 +4,8 @@ use crate::error::{Error, Result};
 use crate::interp::{Interp, ProcDef, UpvarLink};
 use crate::value::Value;
 
+use super::super::Rc;
+
 use super::list::{set_error_code, strict_list, tcl_get_int};
 
 #[cfg(not(feature = "embedded"))]
@@ -131,9 +133,9 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let compiled = super::super::vm_exec::compile_proc_body(&body, interp.tier1_epoch);
     let proc_def = ProcDef {
-        params: defaults,
-        body,
-        statics,
+        params: Rc::new(defaults),
+        body: Rc::from(body),
+        statics: Rc::new(statics),
         compiled,
     };
 
@@ -265,9 +267,9 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
 
     let proc_def = ProcDef {
-        params: defaults,
-        body,
-        statics: HashMap::new(),
+        params: Rc::new(defaults),
+        body: Rc::from(body),
+        statics: Rc::new(HashMap::new()),
         compiled: None,
     };
 

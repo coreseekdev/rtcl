@@ -48,10 +48,14 @@ use alloc::rc::Rc;
 /// A procedure definition.
 #[derive(Debug, Clone)]
 pub(crate) struct ProcDef {
-    pub params: Vec<(String, Option<String>)>,
-    pub body: String,
+    /// Shared behind `Rc<ProcDef>` and cloned per call site, so the heavy
+    /// fields are `Rc` themselves — a call then bumps pointers instead of
+    /// deep-copying the parameter list, the body text and the statics map
+    /// (tclsh's proc record is likewise shared until redefined).
+    pub params: Rc<Vec<(String, Option<String>)>>,
+    pub body: Rc<str>,
     /// Static variables: persist across calls. Key = var name, value = current value.
-    pub statics: HashMap<String, Value>,
+    pub statics: Rc<HashMap<String, Value>>,
     /// Body compiled once at definition time (named `proc` only; apply
     /// lambdas and OO synthetics stay on the tree-walk, which their
     /// per-construction lifetime would otherwise recompile per call).
@@ -124,12 +128,25 @@ pub(crate) struct CallFrame {
     /// and a second `tailcall` overwrites it (tclsh tailcall-12.3).
     pub tailcall: Option<Vec<String>>,
     /// `info level 0` for this frame: the invocation words as dispatched
-    /// (as-typed command name + evaluated arguments), list-rendered.
-    pub level0: String,
+    /// (as-typed command name + evaluated arguments).  Stored raw —
+    /// rendering the list form cost an allocation + quoting walk per call
+    /// that the ~never-asked `info level 0` doesn't justify (tclsh renders
+    /// from the live argv on demand).  [`frame_level0`] renders it.
+    pub level0_src: Option<Vec<Value>>,
     /// How many `namespace eval`s were open when this frame was created —
     /// reconstructs the tclsh varFrame chain (proc frames and ns-eval
     /// scopes interleave) for `uplevel` level arithmetic.
     pub ns_depth: usize,
+}
+
+/// `info level 0` string for a frame: the invocation words, list-rendered
+/// on demand from [`CallFrame::level0_src`].
+pub(crate) fn frame_level0(frame: &CallFrame) -> String {
+    frame
+        .level0_src
+        .as_ref()
+        .map(|words| Value::from_list(words).as_str().to_string())
+        .unwrap_or_default()
 }
 
 /// One live `array startsearch` iteration over an array's element names.
@@ -193,6 +210,11 @@ pub struct Interp {
     pub(crate) array_globals: HashSet<String>,
     /// Procedure call frames (empty at global level).
     pub(crate) frames: Vec<CallFrame>,
+    /// Recycled call frames: proc return pushes its (emptied) frame here
+    /// and the next call pops it, keeping the locals-map allocation and
+    /// its capacity across calls (tclsh keeps one frame arena per
+    /// interpreter; recursion depth bounds the pool naturally).
+    pub(crate) frame_pool: Vec<CallFrame>,
     /// Commands (built-in and registered).
     pub(crate) commands: HashMap<String, CommandFunc>,
     /// Command category metadata.
@@ -473,6 +495,7 @@ impl Interp {
             ns_level0: Vec::new(),
             ns_stack: Vec::new(),
             frames: Vec::new(),
+            frame_pool: Vec::new(),
             commands: HashMap::new(),
             command_categories: HashMap::new(),
             command_meta: HashMap::new(),

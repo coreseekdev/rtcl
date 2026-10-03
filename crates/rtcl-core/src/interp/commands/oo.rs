@@ -236,9 +236,9 @@ pub(crate) fn init(interp: &mut Interp) {
         interp.procs.insert(
             key,
             super::super::Rc::new(ProcDef {
-                params: vec![("args".to_string(), None)],
-                body,
-                statics: HashMap::new(), compiled: None,
+                params: super::super::Rc::new(vec![("args".to_string(), None)]),
+                body: super::super::Rc::from(body),
+                statics: super::super::Rc::new(HashMap::new()), compiled: None,
             }),
         );
     }
@@ -661,8 +661,12 @@ fn exec_chain_entry(
             let mut params: Vec<(String, Option<String>)> =
                 vec![(method.to_string(), None)];
             params.extend(entry.def.params.iter().cloned());
-            let proc_def =
-                ProcDef { params, body, statics: HashMap::new(), compiled: None };
+            let proc_def = ProcDef {
+                params: super::super::Rc::new(params),
+                body: super::super::Rc::from(body),
+                statics: super::super::Rc::new(HashMap::new()),
+                compiled: None,
+            };
 
             let mut args: Vec<Value> =
                 vec![Value::from_str(typed), Value::from_str(method)];
@@ -869,7 +873,7 @@ extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Valu
         let l0 = interp
             .frames
             .last()
-            .map(|f| f.level0.clone())
+            .map(crate::interp::frame_level0)
             .unwrap_or_default();
         let words = Value::from_str(&l0).as_list().unwrap_or_default();
         if words.len() > 2 {
@@ -882,7 +886,7 @@ extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Valu
     let l0 = interp
         .frames
         .last()
-        .map(|f| f.level0.clone())
+        .map(crate::interp::frame_level0)
         .unwrap_or_default();
     let typed = Value::from_str(&l0)
         .as_list()
@@ -1066,7 +1070,12 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
                 .map(|c| c.variables.clone())
                 .unwrap_or_default();
             let body = format!("{}{}", link_prefix(&vars, &ctor.params), ctor.body);
-            let proc_def = ProcDef { params, body, statics: HashMap::new(), compiled: None };
+            let proc_def = ProcDef {
+                params: super::super::Rc::new(params),
+                body: super::super::Rc::from(body),
+                statics: super::super::Rc::new(HashMap::new()),
+                compiled: None,
+            };
             let mut args: Vec<Value> =
                 vec![Value::from_str(&name_typed), Value::from_str("constructor")];
             args.extend_from_slice(&rest[1..]);
@@ -1108,7 +1117,12 @@ fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value]) -> Result<Value>
             .map(|c| c.variables.clone())
             .unwrap_or_default();
         let body = format!("{}{}", link_prefix(&vars, &ctor.params), ctor.body);
-        let proc_def = ProcDef { params, body, statics: HashMap::new(), compiled: None };
+        let proc_def = ProcDef {
+            params: super::super::Rc::new(params),
+            body: super::super::Rc::from(body),
+            statics: super::super::Rc::new(HashMap::new()),
+            compiled: None,
+        };
         let typed = name.clone();
         let mut args: Vec<Value> = vec![Value::from_str(&typed), Value::from_str("constructor")];
         args.extend_from_slice(rest);
@@ -1238,9 +1252,9 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
             };
             let body = format!("{}{}", link_prefix(&vars, &[]), entry.def.body);
             let proc_def = ProcDef {
-                params: vec![("destructor".to_string(), None)],
-                body,
-                statics: HashMap::new(), compiled: None,
+                params: super::super::Rc::new(vec![("destructor".to_string(), None)]),
+                body: super::super::Rc::from(body),
+                statics: super::super::Rc::new(HashMap::new()), compiled: None,
             };
             let args = vec![Value::from_str(key), Value::from_str("destructor")];
             interp.oo.active.push(ActiveMethod {

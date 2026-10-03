@@ -1,5 +1,7 @@
 //! Procedure call and tail-call optimisation for [`Interp`].
 
+use std::borrow::Cow;
+
 use super::{CallFrame, Interp, ProcDef, VarMap, VarSet};
 use crate::error::{Error, Result};
 use crate::value::Value;
@@ -33,7 +35,9 @@ impl Interp {
         let mut current_compiled = proc_def.compiled.clone();
         let mut current_args: Vec<Value> = args.to_vec();
         let mut current_statics: HashMap<String, Value> = (*proc_def.statics).clone();
-        let mut current_proc_name = proc_name.to_string();
+        // Borrowed until a tail-call rebind owns its target's name: plain
+        // global proc calls pay no per-call String for the frame name.
+        let mut current_proc_name = Cow::Borrowed(proc_name);
         let mut ns_override = ns_override;
 
         // Execution traces (tclsh 8.6.17): `enter` fires before the frame
@@ -145,7 +149,7 @@ impl Interp {
                     // but appends parameter descriptors verbatim ("?arg ...?").
                     let name_word = if current_proc_name == "apply lambdaExpr" {
                         // Synthetic apply frame: Tcl renders this prefix literally.
-                        current_proc_name.clone()
+                        current_proc_name.to_string()
                     } else {
                         crate::value::tcl_quote(&current_proc_name)
                     };
@@ -269,7 +273,7 @@ impl Interp {
                                 }
                             }
                         }
-                        if let Some(pdef) = self.procs.get_mut(&current_proc_name) {
+                        if let Some(pdef) = self.procs.get_mut(current_proc_name.as_ref()) {
                             Rc::make_mut(pdef).statics = Rc::new(current_statics.clone());
                         }
                         current_statics = HashMap::new();
@@ -290,7 +294,7 @@ impl Interp {
                         current_body = Rc::clone(&new_proc.body);
                         current_compiled = new_proc.compiled.clone();
                         current_statics = (*new_proc.statics).clone();
-                        current_proc_name = cmd_name.clone();
+                        current_proc_name = Cow::Owned(cmd_name.clone());
                         current_args = tc_args.into_iter().map(|s| Value::from_str(&s)).collect();
                         // The reused frame's enterstep context now names the
                         // tail-call target (corpus-free: no extra enter/leave
@@ -356,7 +360,7 @@ impl Interp {
                         updated.insert(sname, val.clone());
                     }
                 }
-                if let Some(pdef) = self.procs.get_mut(&current_proc_name) {
+                if let Some(pdef) = self.procs.get_mut(current_proc_name.as_ref()) {
                     Rc::make_mut(pdef).statics = Rc::new(updated);
                 }
             }

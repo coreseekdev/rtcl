@@ -218,8 +218,9 @@ pub struct Interp {
     /// call borrows one and returns it emptied, so proc calls pay no
     /// fresh stack/loops/bodies/scratch allocations.
     pub(crate) vm_pool: vm_exec::VmPool,
-    /// Commands (built-in and registered).
-    pub(crate) commands: HashMap<String, CommandFunc>,
+    /// Commands (built-in and registered).  Fx-hashed like the var tables:
+    // dispatch probes this per command, and SipHash was ~20ns of every call.
+    pub(crate) commands: VarMap<CommandFunc>,
     /// Command category metadata.
     pub(crate) command_categories: HashMap<String, CommandCategory>,
     /// Command metadata (usage + help) for built-in and registered commands.
@@ -227,7 +228,7 @@ pub struct Interp {
     /// User-defined procedures.  `Rc` so per-call dispatch clones a
     /// reference (params + body + statics are NOT copied per call);
     /// statics write-back goes through `Rc::make_mut`.
-    pub(crate) procs: HashMap<String, Rc<ProcDef>>,
+    pub(crate) procs: VarMap<Rc<ProcDef>>,
     /// Parse-tree cache: script text → AST (with the source text the
     /// commands' spans point into; the key `Rc<str>` shares the unit's
     /// source allocation).  Parsing is a pure function of the text
@@ -500,10 +501,10 @@ impl Interp {
             frames: Vec::new(),
             frame_pool: Vec::new(),
             vm_pool: vm_exec::VmPool::new(),
-            commands: HashMap::new(),
+            commands: VarMap::default(),
             command_categories: HashMap::new(),
             command_meta: HashMap::new(),
-            procs: HashMap::new(),
+            procs: VarMap::default(),
             parse_cache: HashMap::new(),
             bytecode_cache: HashMap::new(),
             body_memo: Vec::new(),

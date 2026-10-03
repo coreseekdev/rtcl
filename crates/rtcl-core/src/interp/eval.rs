@@ -1,5 +1,7 @@
 //! Evaluation methods on [`Interp`] — script parsing and word expansion.
 
+use std::borrow::Cow;
+
 use super::{Interp, Rc};
 use crate::error::{Error, Result};
 use crate::parser::{Command, Word};
@@ -367,7 +369,9 @@ impl Interp {
         // 3. Fall back to global unqualified name
 
         // User-defined procs (including `namespace import` aliases, which
-        // dispatch to the origin's *current* body and namespace)
+        // dispatch to the origin's *current* body and namespace).  The
+        // carried name is a Cow: the hot plain-name hit borrows the
+        // invocation word instead of allocating a String per call.
         let proc_lookup = if self.current_namespace != "::"
             && !cmd_name.starts_with("::")
             && !cmd_name.contains("::")
@@ -379,17 +383,17 @@ impl Interp {
             let qualified = crate::interp::commands::namespace::qualify(
                 &self.current_namespace, cmd_name,
             );
-            self.procs.get(&qualified).cloned().map(|p| (p, qualified))
-                .or_else(|| self.procs.get(cmd_name).cloned().map(|p| (p, cmd_name.to_string())))
+            self.procs.get(&qualified).cloned().map(|p| (p, Cow::Owned(qualified)))
+                .or_else(|| self.procs.get(cmd_name).cloned().map(|p| (p, Cow::Borrowed(cmd_name))))
         } else {
-            self.procs.get(cmd_name).cloned().map(|p| (p, cmd_name.to_string()))
+            self.procs.get(cmd_name).cloned().map(|p| (p, Cow::Borrowed(cmd_name)))
         }
             .or_else(|| {
                 if self.current_namespace != "::" && !cmd_name.starts_with("::") {
                     let qualified = crate::interp::commands::namespace::qualify(
                         &self.current_namespace, cmd_name,
                     );
-                    self.procs.get(&qualified).cloned().map(|p| (p, qualified))
+                    self.procs.get(&qualified).cloned().map(|p| (p, Cow::Owned(qualified)))
                 } else {
                     None
                 }
@@ -398,7 +402,7 @@ impl Interp {
                 // `foo::p` at global scope is the fully-qualified `::foo::p`
                 if !cmd_name.starts_with("::") && cmd_name.contains("::") {
                     let qualified = format!("::{}", cmd_name);
-                    self.procs.get(&qualified).cloned().map(|p| (p, qualified))
+                    self.procs.get(&qualified).cloned().map(|p| (p, Cow::Owned(qualified)))
                 } else {
                     None
                 }
@@ -421,7 +425,7 @@ impl Interp {
                     self, cmd_name,
                 )?;
                 let origin = crate::interp::commands::namespace::origin_of(self, &found)?;
-                self.procs.get(&origin).cloned().map(|p| (p, origin))
+                self.procs.get(&origin).cloned().map(|p| (p, Cow::Owned(origin)))
             })
             .or_else(|| {
                 // Colon runs collapse in command names too: `p1:::g`
@@ -429,7 +433,7 @@ impl Interp {
                 if cmd_name.contains("::") {
                     let norm = crate::interp::commands::namespace::normalise(cmd_name);
                     if norm != cmd_name {
-                        return self.procs.get(&norm).cloned().map(|p| (p, norm));
+                        return self.procs.get(&norm).cloned().map(|p| (p, Cow::Owned(norm)));
                     }
                 }
                 None
@@ -440,7 +444,7 @@ impl Interp {
                 // proc (tclsh 52.2: `foo` inside ::bar::jim finds ::foo).
                 if !cmd_name.starts_with("::") {
                     let qualified = format!("::{}", cmd_name);
-                    self.procs.get(&qualified).cloned().map(|p| (p, qualified))
+                    self.procs.get(&qualified).cloned().map(|p| (p, Cow::Owned(qualified)))
                 } else {
                     None
                 }
@@ -451,12 +455,12 @@ impl Interp {
                 // The frame name is as invoked (tclsh `(procedure "::pp")`).
                 if cmd_name.starts_with("::") && !cmd_name[2..].contains("::") {
                     let bare = &cmd_name[2..];
-                    return self.procs.get(bare).cloned().map(|p| (p, cmd_name.to_string()));
+                    return self.procs.get(bare).cloned().map(|p| (p, Cow::Owned(cmd_name.to_string())));
                 }
                 None
             });
         if let Some((proc_def, resolved_name)) = proc_lookup {
-            return self.call_proc(&proc_def, &args, &resolved_name, None);
+            return self.call_proc(&proc_def, args, &resolved_name, None);
         }
 
         // Namespace ensembles: the command itself, or an import alias

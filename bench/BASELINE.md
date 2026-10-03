@@ -124,3 +124,21 @@ list_ops                  4          7      1.7
 proc_fib                  4         13      3.2
 string_build              3          3      1.0
 var_incr                 40         28       .7
+
+# ---------------------------------------------------------------------------
+# E1.75 2026-10-04: dispatch maps + per-call name allocations.  commands/
+# procs move from std SipHash to varmap's Fx hasher (dispatch probes them
+# every DynCall); dispatch_values carries the resolved proc name as a Cow
+# (plain-name hit borrows the invocation word); call_proc's frame name is
+# a Cow borrowed until a tail-call rebind owns its target.  Two String
+# allocations per proc call gone.  Gates: judge 87/87, sweep artifact-only
+# (objmech flat=0s/1s timing flake), tests green.
+# fib25 121→114ms; decomp_var/decomp_call within noise (142/106ms best-of).
+
+case               tclsh_ms    rtcl_ms    ratio
+arith_loop               45         37       .8
+dict_ops                  5          6      1.2
+list_ops                  4          7      1.7
+proc_fib                  4         12      3.0
+string_build              3          3      1.0
+var_incr                 40         28       .7

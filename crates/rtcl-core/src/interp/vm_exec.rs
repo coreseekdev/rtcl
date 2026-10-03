@@ -260,7 +260,16 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &ByteCode) -> Result<Valu
     // left installed (e.g. a `while` body rebased by cmd_while).
     interp.line_offset = entry_offset;
 
-    let r = exec_inner(interp, code, entry_offset);
+    // The executor state comes from the interp's pool: a proc call pays no
+    // fresh allocations for the stack/loops/bodies/scratch Vecs (the pool
+    // keeps their capacity).  Depth is naturally bounded by recursion —
+    // a live VmState is never in the pool, so pooling cannot alias.
+    let r = {
+        let mut st = interp.vm_pool.take(entry_offset);
+        let r = exec_inner(interp, code, entry_offset, &mut st);
+        interp.vm_pool.give(st);
+        r
+    };
 
     interp.cur_source = saved_source;
     interp.cur_cmd_text = saved_text;
@@ -270,17 +279,13 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &ByteCode) -> Result<Valu
     r
 }
 
-fn exec_inner(interp: &mut Interp, code: &ByteCode, entry_offset: usize) -> Result<Value> {
+fn exec_inner(
+    interp: &mut Interp,
+    code: &ByteCode,
+    entry_offset: usize,
+    st: &mut VmState,
+) -> Result<Value> {
     let ops = code.ops();
-    let mut st = VmState {
-        stack: Vec::with_capacity(16),
-        loops: Vec::new(),
-        bodies: Vec::new(),
-        expand_base: 0,
-        cur_site: usize::MAX,
-        entry_offset,
-        pc: 0,
-    };
 
     let result = loop {
         // Stream end: the tree-walk's result is the last command's, which
@@ -288,7 +293,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, entry_offset: usize) -> Resu
         // dispatches all push their result).
         let Some(op) = ops.get(st.pc) else { break st.pop_val() };
         st.pc += 1;
-        if let Err(e) = exec_op(interp, code, &op, &mut st) {
+        if let Err(e) = exec_op(interp, code, &op, st) {
             // Control-flow completions propagate framelessly — except
             // break/continue that crossed a *dispatched command* or
             // *nested script* boundary inside an inline loop: exactly
@@ -296,7 +301,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, entry_offset: usize) -> Resu
             // Level 1 belongs to this loop (jump); deeper levels
             // propagate decremented (loops.rs parity).
             if !interp.err_is_error(&e) && (e.is_break() || e.is_continue()) {
-                match loop_signal(&mut st, e) {
+                match loop_signal(st, e) {
                     Ok(()) => continue,
                     Err(e) => return Err(e),
                 }
@@ -322,7 +327,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, entry_offset: usize) -> Resu
                 .last()
                 .is_some_and(|r| r.site() == st.cur_site)
             {
-                unwind_subs(interp, code, &mut st, &e);
+                unwind_subs(interp, code, st, &e);
                 return Err(e);
             }
             // Everything else appends this command's harness frame —
@@ -344,7 +349,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, entry_offset: usize) -> Resu
             // the top level (the tree-walk's CommandSub word boundary, the
             // outermost deferral winning); each expression-operand owner
             // appends its harness frame.
-            unwind_subs(interp, code, &mut st, &e);
+            unwind_subs(interp, code, st, &e);
             return Err(e);
         }
     };
@@ -361,6 +366,10 @@ struct VmState {
     /// script).  Pushed by not-taken condition jumps and the region marks,
     /// popped by the plain `Jump` that ends every body.
     bodies: Vec<Region>,
+    /// Reusable argument buffer for the dispatch ops: entries are MOVED
+    /// off the stack into it (drain), not cloned — one buffer per executor
+    /// state instead of a fresh Vec per dispatched command.
+    scratch: Vec<Value>,
     /// Stack base of the current command's `{*}` expansion region.
     expand_base: usize,
     /// Site index of the `BeginCmd` most recently executed.
@@ -370,6 +379,19 @@ struct VmState {
 }
 
 impl VmState {
+    fn new(entry_offset: usize) -> Self {
+        VmState {
+            stack: Vec::with_capacity(16),
+            loops: Vec::new(),
+            bodies: Vec::new(),
+            scratch: Vec::new(),
+            expand_base: 0,
+            cur_site: usize::MAX,
+            entry_offset,
+            pc: 0,
+        }
+    }
+
     fn pop_val(&mut self) -> Value {
         match self.stack.pop() {
             Some(Entry::Val(v)) => v,
@@ -386,16 +408,56 @@ impl VmState {
         }
     }
 
-    /// Gather the current command's arguments, splicing `{*}` expansions.
-    fn collect_args(&self, from: usize) -> Vec<Value> {
-        let mut args = Vec::with_capacity(self.stack.len() - from);
-        for entry in &self.stack[from..] {
+    /// Move the current command's arguments off the stack into `scratch`
+    /// (splicing `{*}` expansions), leaving the stack truncated at
+    /// `from`.  Borrowing, not owning: the dispatch helpers take the
+    /// buffer by reference and the buffer survives for the next command.
+    fn collect_args_into_scratch(&mut self, from: usize) {
+        self.scratch.clear();
+        for entry in self.stack.drain(from..) {
             match entry {
-                Entry::Val(v) => args.push(v.clone()),
-                Entry::Expanded(vs) => args.extend(vs.iter().cloned()),
+                Entry::Val(v) => self.scratch.push(v),
+                Entry::Expanded(vs) => self.scratch.extend(vs),
             }
         }
-        args
+    }
+}
+
+/// Recycled [`VmState`]s, owned by the interp: every `exec_bytecode` call
+/// borrows one and gives it back emptied, so proc calls stop paying the
+/// four Vec allocations.  The type is opaque outside this module (the
+/// pool methods are the only API); spare depth is capped — deeper
+/// recursion churn simply drops the excess states.
+pub(crate) struct VmPool {
+    spare: Vec<VmState>,
+}
+
+impl VmPool {
+    pub(crate) fn new() -> Self {
+        VmPool { spare: Vec::new() }
+    }
+
+    fn take(&mut self, entry_offset: usize) -> VmState {
+        match self.spare.pop() {
+            Some(mut st) => {
+                st.expand_base = 0;
+                st.cur_site = usize::MAX;
+                st.entry_offset = entry_offset;
+                st.pc = 0;
+                st
+            }
+            None => VmState::new(entry_offset),
+        }
+    }
+
+    fn give(&mut self, mut st: VmState) {
+        st.stack.clear();
+        st.loops.clear();
+        st.bodies.clear();
+        st.scratch.clear();
+        if self.spare.len() < 4 {
+            self.spare.push(st);
+        }
     }
 }
 
@@ -614,28 +676,24 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         }
         OpCode::Call { cmd_id, argc } => {
             let from = st.stack.len() - *argc as usize;
-            let args = st.collect_args(from);
-            st.stack.truncate(from);
-            let v = dispatch_call(interp, args, *cmd_id)?;
+            st.collect_args_into_scratch(from);
+            let v = dispatch_call(interp, &st.scratch, *cmd_id)?;
             st.stack.push(Entry::Val(v));
         }
         OpCode::CallExpand { cmd_id, .. } => {
-            let args = st.collect_args(st.expand_base);
-            st.stack.truncate(st.expand_base);
-            let v = dispatch_call(interp, args, *cmd_id)?;
+            st.collect_args_into_scratch(st.expand_base);
+            let v = dispatch_call(interp, &st.scratch, *cmd_id)?;
             st.stack.push(Entry::Val(v));
         }
         OpCode::DynCall { argc } => {
             let from = st.stack.len() - *argc as usize;
-            let args = st.collect_args(from);
-            st.stack.truncate(from);
-            let v = dispatch_dynamic(interp, args)?;
+            st.collect_args_into_scratch(from);
+            let v = dispatch_dynamic(interp, &st.scratch)?;
             st.stack.push(Entry::Val(v));
         }
         OpCode::DynCallExpand { .. } => {
-            let args = st.collect_args(st.expand_base);
-            st.stack.truncate(st.expand_base);
-            let v = dispatch_dynamic(interp, args)?;
+            st.collect_args_into_scratch(st.expand_base);
+            let v = dispatch_dynamic(interp, &st.scratch)?;
             st.stack.push(Entry::Val(v));
         }
 
@@ -751,7 +809,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
 /// identical-code-folding can merge distinct fns to one address — the
 /// invoked name must still be the canonical builtin the id names, so a
 /// `rename`d command keeps the full dispatch's lookup semantics.)
-fn dispatch_call(interp: &mut Interp, args: Vec<Value>, cmd_id: u16) -> Result<Value> {
+fn dispatch_call(interp: &mut Interp, args: &[Value], cmd_id: u16) -> Result<Value> {
     if interp.exec_traces.is_empty()
         && interp.current_namespace == "::"
         && interp.procs.is_empty()
@@ -764,10 +822,9 @@ fn dispatch_call(interp: &mut Interp, args: Vec<Value>, cmd_id: u16) -> Result<V
             let f = interp.commands.get(name).copied();
             if let Some(f) = f {
                 interp.call_depth += 1;
-                let r = f(interp, &args);
+                let r = f(interp, args);
                 interp.call_depth -= 1;
-                let name = args[0].as_str().to_string();
-                return interp.fill_wrong_args(&name, r);
+                return interp.fill_wrong_args(name, r);
             }
         }
     }
@@ -776,9 +833,9 @@ fn dispatch_call(interp: &mut Interp, args: Vec<Value>, cmd_id: u16) -> Result<V
 
 /// Full dispatch — `dispatch_values` with the execution-step trace
 /// bracketing `eval_command` provides.
-fn dispatch_dynamic(interp: &mut Interp, args: Vec<Value>) -> Result<Value> {
-    let step = interp.exec_step_begin(&args);
-    let r = interp.dispatch_values(&args);
+fn dispatch_dynamic(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let step = interp.exec_step_begin(args);
+    let r = interp.dispatch_values(args);
     if let Some(ctx) = step {
         match &r {
             Ok(v) => {

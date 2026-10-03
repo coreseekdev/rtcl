@@ -172,15 +172,21 @@ impl Interp {
                 }
             }
 
-            for (i, (param, default)) in regular_params.iter().enumerate() {
-                let value = if i + 1 < current_args.len() {
-                    current_args[i + 1].clone()
-                } else if let Some(d) = default {
-                    Value::from_str(d)
-                } else {
-                    Value::empty()
-                };
-                self.frames.last_mut().unwrap().locals.insert(param.clone(), value);
+            // Positional binding: hoist the frame borrow — the loop does
+            // nothing but inserts into the locals map (the name-keyed cost
+            // the slot-locals rework targets; E1 keeps it, just tighter).
+            {
+                let frame = self.frames.last_mut().unwrap();
+                for (i, (param, default)) in regular_params.iter().enumerate() {
+                    let value = if i + 1 < current_args.len() {
+                        current_args[i + 1].clone()
+                    } else if let Some(d) = default {
+                        Value::from_str(d)
+                    } else {
+                        Value::empty()
+                    };
+                    frame.locals.insert(param.clone(), value);
+                }
             }
 
             if has_args {

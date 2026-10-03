@@ -100,3 +100,27 @@ list_ops                  5          7      1.4
 proc_fib                  4         13      3.2
 string_build              3          3      1.0
 var_incr                 39         29       .7
+
+# ---------------------------------------------------------------------------
+# E1 2026-10-04 (ARCHITECTURE-PERF.md item E, stage 1): VmState pooling +
+# allocation-free dispatch collection.  exec_bytecode borrows its
+# stack/loops/bodies/scratch Vecs from an Interp-level pool (capacity kept
+# across proc calls); Call/DynCall ops DRAIN entries into a reusable
+# scratch buffer (moves, no per-arg Value clone, no per-command Vec) and
+# the dispatch helpers take &[Value] (the per-call command-name String is
+# gone).  call_proc: frame-locals borrow hoisted out of the binding loop.
+# Gates: judge 87/87, two-engine sweep artifact-only, workspace tests
+# green, feature matrix green.
+# Decomposition probes (taskset -c 0, best-of-3): decomp_call 115→110ms,
+# decomp_var 151→142ms, fib25 134→121ms; bench table unchanged (list_ops
+# 1.7 is tclsh-side noise — its reference also moved 5→4ms).
+# The measured 7x binding+vars slice needs E2 (slot locals); E1 removed
+# the allocation tax around it.
+
+case               tclsh_ms    rtcl_ms    ratio
+arith_loop               45         37       .8
+dict_ops                  5          6      1.2
+list_ops                  4          7      1.7
+proc_fib                  4         13      3.2
+string_build              3          3      1.0
+var_incr                 40         28       .7

@@ -214,6 +214,10 @@ pub struct Interp {
     /// its capacity across calls (tclsh keeps one frame arena per
     /// interpreter; recursion depth bounds the pool naturally).
     pub(crate) frame_pool: Vec<CallFrame>,
+    /// Recycled bytecode-executor states (vm_exec): every exec_bytecode
+    /// call borrows one and returns it emptied, so proc calls pay no
+    /// fresh stack/loops/bodies/scratch allocations.
+    pub(crate) vm_pool: vm_exec::VmPool,
     /// Commands (built-in and registered).
     pub(crate) commands: HashMap<String, CommandFunc>,
     /// Command category metadata.
@@ -495,6 +499,7 @@ impl Interp {
             ns_stack: Vec::new(),
             frames: Vec::new(),
             frame_pool: Vec::new(),
+            vm_pool: vm_exec::VmPool::new(),
             commands: HashMap::new(),
             command_categories: HashMap::new(),
             command_meta: HashMap::new(),

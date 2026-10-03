@@ -224,6 +224,29 @@ pub fn cmd_lappend(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(wrong_args("lappend", "varName ?value ...?"));
     }
     let var_name = args[1].as_str();
+    // Fast path: the variable already holds a list rep and every
+    // mutation guard holds — take the value out of its slot (sole
+    // owner), append in place through the COW rep, put it back.
+    // Amortised O(1); tclsh appends to the unshared list object the
+    // same way.  Creation, string-rep sources, links, arrays and
+    // traced variables keep the rebuilding path below.
+    if args.len() >= 3
+        && interp
+            .get_var(var_name)
+            .is_ok_and(|v| v.as_list_ref().is_some())
+    {
+        if let Some(mut v) = interp.take_var_fast(var_name) {
+            if let Some(items) = v.as_list_mut() {
+                for arg in &args[2..] {
+                    items.push(arg.clone());
+                }
+                return interp.set_var(var_name, v);
+            }
+            // Unreachable (rep checked before the take); restore raw
+            // and rebuild through the slow path.
+            interp.store_var(var_name, v);
+        }
+    }
     let mut list = match interp.get_var(var_name) {
         Ok(v) => {
             let v = v.clone();

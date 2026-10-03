@@ -197,6 +197,27 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let var_name = args[2].as_str();
+            // Fast path: single-key `dict set var k v` whose variable
+            // already holds a dict rep — take the value out of its slot
+            // (sole owner), insert in place through the COW rep, put it
+            // back.  Amortised O(1); multi-key nesting, creation,
+            // string-rep sources, links and traced variables keep the
+            // rebuilding path below.
+            if args.len() == 5
+                && interp
+                    .get_var(var_name)
+                    .is_ok_and(|v| v.as_dict_ref().is_some())
+            {
+                if let Some(mut v) = interp.take_var_fast(var_name) {
+                    if let Some(map) = v.as_dict_mut() {
+                        map.insert(args[3].as_str().to_string(), args[4].clone());
+                        return interp.set_var(var_name, v);
+                    }
+                    // Unreachable (rep checked before the take); restore
+                    // raw and rebuild through the slow path.
+                    interp.store_var(var_name, v);
+                }
+            }
             let value = args[args.len() - 1].clone();
             let keys: Vec<&str> = args[3..args.len() - 1]
                 .iter()

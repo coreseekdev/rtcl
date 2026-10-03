@@ -353,7 +353,7 @@ impl Interp {
     }
 
     /// Set a variable in the current scope, following upvar links.
-    fn store_var(&mut self, name: &str, value: Value) {
+    pub(crate) fn store_var(&mut self, name: &str, value: Value) {
         if let Some(gname) = Self::split_global(name) {
             let gname = self.redirect_flat(gname);
             self.globals.insert(gname, value);
@@ -706,6 +706,38 @@ impl Interp {
             })?;
         }
         Ok(value)
+    }
+
+    /// Take the variable's value out of its slot for in-place mutation
+    /// (tclsh: mutate the refcnt==1 object).  Returns `None` unless
+    /// every guard for the mutation fast path holds: unqualified scalar
+    /// name, no upvar/dead link, not an array, no variable traces
+    /// registered anywhere, and the variable currently exists.  The
+    /// caller MUST put a value back (e.g. via `set_var`, which fires the
+    /// write traces) before any user code runs — nothing observes the
+    /// empty window.
+    pub(crate) fn take_var_fast(&mut self, name: &str) -> Option<Value> {
+        if name.contains("::")
+            || name.contains('(')
+            || !self.var_traces.is_empty()
+            || !self.dead_flat.is_empty()
+        {
+            return None;
+        }
+        if let Some(frame) = self.frames.last_mut() {
+            if frame.upvars.contains_key(name) || frame.array_locals.contains(name) {
+                return None;
+            }
+            frame.locals.remove(name)
+        } else {
+            if self.current_namespace != "::"
+                || !self.flat_aliases.is_empty()
+                || self.array_globals.contains(name)
+            {
+                return None;
+            }
+            self.globals.remove(name)
+        }
     }
 
     pub fn unset_var(&mut self, name: &str) -> Result<()> {

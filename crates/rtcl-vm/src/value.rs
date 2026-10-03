@@ -598,6 +598,23 @@ impl Value {
         }
     }
 
+    /// Get a mutable reference to the list items (COW) — the
+    /// `as_dict_mut` mirror for lists.  In-place when this handle is
+    /// the value's sole owner (the interpreter's mutation fast path
+    /// takes the variable out of its slot first, tclsh's refcnt==1
+    /// mutation); otherwise the `ValueInner` is cloned once.
+    pub fn as_list_mut(&mut self) -> Option<&mut Vec<Value>> {
+        if !matches!(&self.inner.rep, InternalRep::List(_)) {
+            return None;
+        }
+        let inner = Rc::make_mut(&mut self.inner);
+        inner.string = OnceCell::new(); // invalidate string
+        match &mut inner.rep {
+            InternalRep::List(items) => Some(items),
+            _ => None,
+        }
+    }
+
     /// Parse or return a dict as an owned DictMap.
     pub fn as_dict(&self) -> Option<DictMap> {
         match &self.inner.rep {

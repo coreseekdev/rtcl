@@ -392,31 +392,35 @@ impl Interp {
         // propagating out, and a trace error stays a background error that
         // leaves the in-flight errorInfo untouched).  Whole-array traces
         // fire once for the array; element-only registrations do not.
-        let teardown_prefix = format!("F{}:", self.frames.len() - 1);
-        let traced: Vec<String> = self
-            .var_traces
-            .keys()
-            .filter(|k| k.starts_with(&teardown_prefix))
-            .map(|k| k[teardown_prefix.len()..].to_string())
-            .collect();
-        if !traced.is_empty() {
-            if let Some(frame) = self.frames.last_mut() {
-                frame.locals.clear();
-                frame.array_locals.clear();
+        // The per-call `F{i}:` prefix allocation only happens when there
+        // are traces at all to find.
+        if !self.var_traces.is_empty() {
+            let teardown_prefix = format!("F{}:", self.frames.len() - 1);
+            let traced: Vec<String> = self
+                .var_traces
+                .keys()
+                .filter(|k| k.starts_with(&teardown_prefix))
+                .map(|k| k[teardown_prefix.len()..].to_string())
+                .collect();
+            if !traced.is_empty() {
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.locals.clear();
+                    frame.array_locals.clear();
+                }
+                // Trace callbacks must not disturb the error (if any) that is
+                // unwinding through this frame.
+                let saved_info = self.err_info.take();
+                let saved_fresh = std::mem::take(&mut self.err_fresh);
+                let saved_raised = std::mem::take(&mut self.err_code_raised);
+                let saved_pending = self.err_pending_top.take();
+                for name in traced {
+                    let _ = self.fire_traces(&name, None, "unset");
+                }
+                self.err_info = saved_info;
+                self.err_fresh = saved_fresh;
+                self.err_code_raised = saved_raised;
+                self.err_pending_top = saved_pending;
             }
-            // Trace callbacks must not disturb the error (if any) that is
-            // unwinding through this frame.
-            let saved_info = self.err_info.take();
-            let saved_fresh = std::mem::take(&mut self.err_fresh);
-            let saved_raised = std::mem::take(&mut self.err_code_raised);
-            let saved_pending = self.err_pending_top.take();
-            for name in traced {
-                let _ = self.fire_traces(&name, None, "unset");
-            }
-            self.err_info = saved_info;
-            self.err_fresh = saved_fresh;
-            self.err_code_raised = saved_raised;
-            self.err_pending_top = saved_pending;
         }
 
         // Pop the frame and leave the definition namespace; the emptied

@@ -810,9 +810,13 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
 /// invoked name must still be the canonical builtin the id names, so a
 /// `rename`d command keeps the full dispatch's lookup semantics.)
 fn dispatch_call(interp: &mut Interp, args: &[Value], cmd_id: u16) -> Result<Value> {
+    // `procs` needs the per-name probe, not is_empty: a script WITH procs
+    // still dispatches hundreds of builtins per loop iteration, and only a
+    // proc whose name shadows THIS builtin diverts the call — one Fx
+    // contains_key against the whole resolution chain.
     if interp.exec_traces.is_empty()
         && interp.current_namespace == "::"
-        && interp.procs.is_empty()
+        && !interp.procs.contains_key(args[0].as_str())
         && interp.aliases.is_empty()
         && interp.ensembles.is_empty()
         && interp.import_aliases.is_empty()

@@ -1,0 +1,32 @@
+[package]
+name = "rtcl-jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rtcl-ir = { path = "../rtcl-ir" }
+wasm-encoder = "0.261"
+
+# jit-wasm: instantiation through the JS WebAssembly API (the primary
+# target — wasm32-unknown-unknown in browsers / node / bun).
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+
+[dev-dependencies]
+rtcl-parser = { path = "../rtcl-parser" }
+# Test-only engine: a small pure-Rust wasm interpreter used to verify the
+# emitter's output end-to-end on the native side.  Production engines are
+# js-sys (jit-wasm) and wasmtime (jit-native, lands with M1).
+wasmi = "2.0"
+
+[features]
+default = []
+jit-wasm = ["dep:js-sys", "dep:wasm-bindgen"]
+# wasmtime-backed native instantiation lands with JIT M1 (kept as a stub
+# feature for now so the feature matrix compiles in both states).
+jit-native = []

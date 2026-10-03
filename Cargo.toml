@@ -8,6 +8,7 @@ members = [
     "crates/rtcl-cli",
     "crates/rtcl-expect",
     "crates/rtcl-wasm",
+    "crates/rtcl-jit",
 ]
 
 [workspace.package]

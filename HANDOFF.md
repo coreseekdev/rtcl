@@ -39,7 +39,8 @@
 - 剩余 5 个 case 级失败：namespace-old 边缘语义，低优先，记录备查即可。
 - **解释器快车道已落地（2026-10-02，`58c2839`..`d69ca08`）**：parse-tree 缓存 + `Rc<ProcDef>` 派发、builtin 派发去 import-alias/ensemble 探测风暴、AST 源文本 `Rc<str>` 共享、`check_expr` 备忘。judge/case 级无回退；数字见 `bench/BASELINE.md` 第二张表。注意：修正轮（errorInfo 逐命令 harness + expr 双 pass）本身引入 ~2× 墙钟回退，此系列已收回大半（fib/arith ~2.3×/2.1×）；剩余差距主因 = 逐命令 harness 与 expr 解释，Phase 3/JIT 路线均绕开。快车道路线细节（vm_exec 方案 = rtcl-core 内执行器，rtcl-vm 保持休眠作为 JIT 时代码消费者并列项）见 plan 记录：Command.text/word_srcs 已 Rc 化，ByteCode 站点表/compile-once 尚未动工。
 - **字节码 VM 已落地（2026-10-03，C5+C6）**：`rtcl-core/src/interp/vm_exec.rs` 执行器成为第二条活路径——(1) C5：命名 proc 在 `proc` 定义点编译一次（`ProcDef.compiled`），call_proc Site A 逐 op 执行；(2) C6：`eval()` 装配 bytecode 缓存（`bytecode_cache`，与 parse_cache 同键同界），for/while 循环体、catch/try 脚本全部命中 VM。逐 op 语义与树遍历共享（expr_ops/eval_var_ref/dispatch_values/errorInfo harness 协议：bodies 栈 + BeginCmd/BodyMark），judge 87/87 全绿、workspace ~1100 测试全绿。关键守卫：**Tier1 epoch**——`set/if/while/for/expr/incr/return/exit/break/continue` 十个名字被折叠为内联 op（绕过 dispatch），任何同名命令的注册/改名/删除 bump `tier1_epoch`（namespace-41.1），不匹配的编译体回退树遍历；fallback 白名单、`RTCL_NO_BYTECODE`、exec traces 同样钉回树遍历。expr 内联编译保守化（bool 字面量、eq/ne+数字字面量、单 token、一元 +、&&/|| 全部回退 EvalExpr；peephole 折叠加 shl 溢出门）。bench：arith 1.62×、fib 1.83×、var_incr 2.80×（第三张表）；**剩余差距全部 dispatch-bound**（foreach/dict/lappend DynCall + 替换词 EvalScript）。
-- **下一阶段 = JIT（§5），从 M0 启动。**
+- **JIT M0 已落地（2026-10-03）**：`crates/rtcl-jit` crate——rtcl-ir `ByteCode` 的第二个消费者。发射器（`emit.rs`，wasm-encoder 0.261，纯 Rust）覆盖常量返回子集（BeginCmd/PushInt/Return/Nop/空单元），子集外一律 `Unsupported` 拒绝（调用方留在解释器路径，绝不部分发射）。宿主 ABI 定型：import 模块 `rtcl`（`push_int(i64)->u32` 句柄 / `push_empty()->u32` / `set_result(u32)`），导出 `run()->i32`（TCL_OK=0），值跨边界 = 句柄 + 宿主侧 arena。round-trip 单测（wasmi 2.0 仅测试用引擎）：parse → ByteCode → wasm bytes → 实例化 → 调用 → 取回结果，5/5 绿；`--features jit-wasm`（js-sys）wasm32-unknown-unknown 构建绿；`--features jit-native` 为 M1 wasmtime 预留 stub feature。
+- **下一阶段 = JIT M1（expr Int 快车道）**，验收见 §5。
 - 历史裁决：
   - **Rc vs Arc**：保持 Rc（wasm 单线程模型；`2257f20` 的静默回退恰好正确）。多 worker 场景每 worker 一个 Interp，不共享。
   - **Value 类型已统一**：rtcl-core 只是 re-export rtcl-vm，无需合并。
@@ -69,7 +70,7 @@
 
 ### JIT 里程碑
 
-- **M0**：`rtcl-jit` crate 骨架 + wasm-encoder 发射最小 module（空 proc round-trip：编译→实例化→调用→拿回结果），双 feature 编译通过。验收：单元测试 + wasm32-unknown-unknown 构建绿。
+- **M0 ✅（2026-10-03）**：`rtcl-jit` crate 骨架 + wasm-encoder 发射最小 module（常量返回子集 round-trip：编译→实例化→调用→拿回结果），双 feature 编译通过。验收达成：单元测试（wasmi round-trip 5/5）+ wasm32-unknown-unknown 构建绿。注意：测试引擎用 wasmi 2.0（纯 Rust、轻量）；wasmtime（jit-native 的真身）推迟到 M1 落地——本机 3.4GB 构建内存限制下先不引 cranelift。
 - **M1**：expr Int 快车道——`expr` bytecode 子集（PushInt/算术/比较/跳转）编译为 wasm i64 指令，InternalRep 守卫。验收：judge 三向差分全绿 + `bench/cases/arith_loop.tcl` 提速 ≥3×。
 - **M2**：proc body + primitive ops（变量经 handle arena）。验收：proc_fib.tcl 提速。
 - **M3**：epoch 失效守卫 + rename/redefine 风暴 fuzz。

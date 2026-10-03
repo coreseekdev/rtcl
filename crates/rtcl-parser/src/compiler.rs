@@ -56,6 +56,24 @@ pub struct Compiler {
     /// and cleared around nested loop compilations — their bodies' breaks
     /// and continues belong to the nested loop.
     in_next: bool,
+    /// True while compiling a *procedure body*: parameters are seeded into
+    /// the locals table and plain-name variable reads/writes of table
+    /// names compile to slot ops (`LoadLocal`/`StoreLocal`/`IncrLocal`).
+    /// The frame-side executor binds parameters positionally into slots
+    /// and consults the same table from every name-keyed variable path,
+    /// so uncompiled writers (foreach vars, lappend, catch results) stay
+    /// correct.  Eval-level units never set this — their variables are
+    /// globals/namespace vars, never frame slots.
+    locals_mode: bool,
+}
+
+/// May a name of this shape live in a proc's compiled locals table?
+/// Slot names are plain: no `::` qualification, no array reference, and
+/// non-empty (a parameter list may legally contain stranger names — those
+/// bind through the name-keyed store instead, and a proc with any such
+/// parameter forgoes slots entirely; see the frame-side gate in `call.rs`).
+pub fn slot_candidate(name: &str) -> bool {
+    !name.is_empty() && !name.contains('(') && !name.contains("::")
 }
 
 impl Compiler {
@@ -63,6 +81,27 @@ impl Compiler {
     /// spans must point into `source` (as [`crate::ScriptUnit::parse`]
     /// produces).  Sites referencing the source are emitted per command.
     pub fn compile_unit(source: Rc<str>, commands: &[Command]) -> ByteCode {
+        Self::compile_impl(source, commands, false, &[])
+    }
+
+    /// [`Self::compile_unit`] for a procedure body: `param_names` seed the
+    /// locals table (slot i = the i-th name) and plain-name variable ops
+    /// of table names compile to slot form.  The frame-side caller binds
+    /// parameters positionally into slots — the order here is the contract.
+    pub fn compile_unit_locals(
+        source: Rc<str>,
+        commands: &[Command],
+        param_names: &[&str],
+    ) -> ByteCode {
+        Self::compile_impl(source, commands, true, param_names)
+    }
+
+    fn compile_impl(
+        source: Rc<str>,
+        commands: &[Command],
+        locals_mode: bool,
+        params: &[&str],
+    ) -> ByteCode {
         let mut c = Compiler {
             bytecode: ByteCode::new(),
             loops: Vec::new(),
@@ -70,7 +109,15 @@ impl Compiler {
             span_base: 0,
             line_base: 0,
             in_next: false,
+            locals_mode,
         };
+        if locals_mode {
+            for p in params {
+                if slot_candidate(p) {
+                    c.bytecode.add_local(p);
+                }
+            }
+        }
         c.compile_commands(commands);
         c.bytecode.peephole();
         c.bytecode.source = source;
@@ -79,6 +126,7 @@ impl Compiler {
             | OpCode::PushInt(_) | OpCode::PushFloat(_) | OpCode::PushTrue | OpCode::PushFalse
             | OpCode::Pop | OpCode::Dup
             | OpCode::LoadVar(_) | OpCode::StoreVar(_) | OpCode::StoreVarPop(_)
+            | OpCode::LoadLocal(_) | OpCode::StoreLocal(_) | OpCode::IncrLocal(_, _)
             | OpCode::IncrVar(_, _)
             | OpCode::Concat(_) | OpCode::ExpandList | OpCode::ExpandMark
             | OpCode::Jump(_) | OpCode::JumpTrue(_) | OpCode::JumpFalse(_)
@@ -214,6 +262,35 @@ impl Compiler {
     // Word compilation
     // -----------------------------------------------------------------------
 
+    /// Emit a read of variable `name`: the slot op when this unit's locals
+    /// table holds the name (proc bodies only), the name-keyed op otherwise
+    /// (the executor's name path consults the slot table at runtime, so
+    /// both forms observe the same variable).
+    fn emit_var_read(&mut self, name: &str, line: u32) {
+        if self.locals_mode && slot_candidate(name) {
+            if let Some(slot) = self.bytecode.find_local(name) {
+                self.bytecode.emit(OpCode::LoadLocal(slot), line);
+                return;
+            }
+        }
+        let idx = self.bytecode.add_const(name);
+        self.bytecode.emit(OpCode::LoadVar(idx), line);
+    }
+
+    /// Emit a scalar store to `name`.  Writes *discover*: a plain-name
+    /// `set` target in a proc body gains a slot here (params seed the
+    /// first slots; `set` targets append in compilation order — the same
+    /// order the tree-walk would insert them at runtime).
+    fn emit_var_store(&mut self, name: &str, line: u32) {
+        if self.locals_mode && slot_candidate(name) {
+            let slot = self.bytecode.add_local(name);
+            self.bytecode.emit(OpCode::StoreLocal(slot), line);
+            return;
+        }
+        let idx = self.bytecode.add_const(name);
+        self.bytecode.emit(OpCode::StoreVar(idx), line);
+    }
+
     fn compile_word(&mut self, word: &Word, line: u32) {
         match word {
             Word::Literal(s) => {
@@ -233,8 +310,7 @@ impl Compiler {
                 }
             }
             Word::VarRef(name) => {
-                let idx = self.bytecode.add_const(name);
-                self.bytecode.emit(OpCode::LoadVar(idx), line);
+                self.emit_var_read(name, line);
             }
             Word::CommandSub(script) => {
                 self.bytecode.emit_push_const(script, line);
@@ -322,8 +398,7 @@ impl Compiler {
         let line = self.abs_line(cmd);
         if let Word::Literal(name) = &cmd.words[1] {
             self.compile_word_spanned(&cmd.words[2], line, cmd, 2);
-            let idx = self.bytecode.add_const(name);
-            self.bytecode.emit(OpCode::StoreVar(idx), line);
+            self.emit_var_store(name, line);
         } else {
             // Dynamic var name — dispatch the real `set`
             self.compile_dyncall(cmd);
@@ -334,8 +409,7 @@ impl Compiler {
     fn compile_set_get(&mut self, cmd: &Command) {
         let line = self.abs_line(cmd);
         if let Word::Literal(name) = &cmd.words[1] {
-            let idx = self.bytecode.add_const(name);
-            self.bytecode.emit(OpCode::LoadVar(idx), line);
+            self.emit_var_read(name, line);
         } else {
             self.compile_dyncall(cmd);
         }
@@ -636,7 +710,6 @@ impl Compiler {
             return self.compile_dyncall(cmd); // too many args — cmd_incr errors
         }
         if let Word::Literal(var_name) = &cmd.words[1] {
-            let name_idx = self.bytecode.add_const(var_name);
             let amount = if cmd.words.len() == 3 {
                 if let Word::Literal(s) = &cmd.words[2] {
                     // Round-trip gate: `incr x 007` must add 7 (octal),
@@ -652,7 +725,16 @@ impl Compiler {
             } else {
                 1
             };
-            self.bytecode.emit(OpCode::IncrVar(name_idx, amount), line);
+            // A plain-name `incr` target in a proc body takes a slot too
+            // (writes discover, like `set`): the hot loop counter then
+            // mutates the slot's int rep in place, no name probe at all.
+            if self.locals_mode && slot_candidate(var_name) {
+                let slot = self.bytecode.add_local(var_name);
+                self.bytecode.emit(OpCode::IncrLocal(slot, amount), line);
+            } else {
+                let name_idx = self.bytecode.add_const(var_name);
+                self.bytecode.emit(OpCode::IncrVar(name_idx, amount), line);
+            }
         } else {
             self.compile_dyncall(cmd);
         }
@@ -907,6 +989,12 @@ impl crate::expr_compile::ExprSink for Compiler {
 
     fn add_const(&mut self, name: &str) -> u16 {
         self.bytecode.add_const(name)
+    }
+
+    /// A `$var` operand of a compiled expression reads through the slot
+    /// when the locals table holds it — the loop-condition counter case.
+    fn var_read(&mut self, name: &str, line: u32) {
+        self.emit_var_read(name, line)
     }
 
     /// Inline a `[...]` operand of the expression being compiled:

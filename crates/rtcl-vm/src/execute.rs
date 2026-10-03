@@ -94,6 +94,14 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                 let name = code.locals().get(*slot as usize).map(|s| s.as_str()).unwrap_or("");
                 ctx.set_var(name, val)?;
             }
+            OpCode::IncrLocal(slot, amount) => {
+                let name = code.locals().get(*slot as usize).map(|s| s.as_str()).unwrap_or("");
+                let cur = ctx.get_var(name).unwrap_or_else(|_| Value::empty());
+                let next = cur.as_int().unwrap_or(0).saturating_add(*amount);
+                let val = Value::from_int(next);
+                ctx.set_var(name, val.clone())?;
+                stack.push(val);
+            }
             OpCode::LoadArrayElem(name_idx) => {
                 let index_val = stack.pop().unwrap_or_else(Value::empty);
                 let name = code.get_const(*name_idx).unwrap_or("");

@@ -75,6 +75,8 @@ impl Interp {
                 f.upvars.clear();
                 f.local_procs.clear();
                 f.deferred_scripts.clear();
+                f.slots.clear();
+                f.slot_table = None;
                 f
             }
             None => CallFrame {
@@ -85,6 +87,8 @@ impl Interp {
                 call_ns: None,
                 local_procs: Vec::new(),
                 deferred_scripts: Vec::new(),
+                slots: Vec::new(),
+                slot_table: None,
                 tailcall: None,
                 level0_src: None,
                 ns_depth: 0,
@@ -98,6 +102,49 @@ impl Interp {
         self.frames.push(frame);
 
         let final_result = loop {
+            // ── E2 slot-locals gate (re-checked every iteration: a tailcall
+            // rebind swaps the compiled body, and the shape must follow) ──
+            // The conditions are the execution gate below plus the slot
+            // shape: no statics (they inject through the name-keyed store)
+            // and the table's params-first seeding aligning positionally —
+            // the first `params.len()` table entries must BE the params in
+            // order.  Duplicate parameter names dedup in `add_local` and
+            // non-candidate names (qualified/array) are skipped by the
+            // seeding, both shrinking the table out of alignment (tclsh
+            // rejects duplicate proc params at definition; rtcl accepts
+            // them with map semantics).  When the gate fails the frame
+            // stays name-keyed and the body's slot ops fall back to their
+            // name paths (which is also what a mid-run degrade leaves
+            // behind).
+            let slot_mode = match &current_compiled {
+                Some(code)
+                    if !code.fallback
+                        && code.epoch == self.tier1_epoch
+                        && super::vm_exec::bytecode_applicable(self)
+                        && current_statics.is_empty()
+                        && !code.locals().is_empty()
+                        && current_params.len() <= code.locals().len()
+                        && current_params
+                            .iter()
+                            .zip(code.locals().iter())
+                            .all(|((n, _), tab)| n == tab) =>
+                {
+                    let table = Rc::clone(code);
+                    let n = code.locals().len();
+                    let frame = self.frames.last_mut().unwrap();
+                    frame.slots.clear();
+                    frame.slots.resize(n, None);
+                    frame.slot_table = Some(table);
+                    true
+                }
+                _ => {
+                    let frame = self.frames.last_mut().unwrap();
+                    frame.slots.clear();
+                    frame.slot_table = None;
+                    false
+                }
+            };
+
             // ── Enter the definition namespace (also on tail-call switch) ──
             // The override (apply's ::ns element) applies to the first frame
             // only; tail-call targets recompute from their own names.
@@ -176,9 +223,10 @@ impl Interp {
                 }
             }
 
-            // Positional binding: hoist the frame borrow — the loop does
-            // nothing but inserts into the locals map (the name-keyed cost
-            // the slot-locals rework targets; E1 keeps it, just tighter).
+            // Positional binding: hoist the frame borrow — a slot-compiled
+            // frame binds argument i into slot i (the table's params-first
+            // seeding is the positional contract), the name-keyed frame
+            // inserts into the map.
             {
                 let frame = self.frames.last_mut().unwrap();
                 for (i, (param, default)) in regular_params.iter().enumerate() {
@@ -189,7 +237,11 @@ impl Interp {
                     } else {
                         Value::empty()
                     };
-                    frame.locals.insert(param.clone(), value);
+                    if slot_mode {
+                        frame.slots[i] = Some(value);
+                    } else {
+                        frame.locals.insert(param.clone(), value);
+                    }
                 }
             }
 
@@ -212,7 +264,15 @@ impl Interp {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
-                self.frames.last_mut().unwrap().locals.insert("args".to_string(), Value::from_str(&list_str));
+                let frame = self.frames.last_mut().unwrap();
+                if slot_mode {
+                    // `args` is the table's last entry — index
+                    // `regular_params.len()` (params seeded in order, all
+                    // candidates under the slot gate).
+                    frame.slots[regular_params.len()] = Some(Value::from_str(&list_str));
+                } else {
+                    frame.locals.insert("args".to_string(), Value::from_str(&list_str));
+                }
             }
 
             // Hand the invocation words to the frame for a potential
@@ -432,6 +492,8 @@ impl Interp {
         popped.upvars.clear();
         popped.local_procs.clear();
         popped.deferred_scripts.clear();
+        popped.slots.clear();
+        popped.slot_table = None;
         popped.level0_src = None;
         popped.tailcall = None;
         popped.ns = None;

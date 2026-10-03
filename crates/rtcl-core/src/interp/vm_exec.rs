@@ -30,9 +30,17 @@ use std::sync::OnceLock;
 /// Compile a proc body once, at definition time.  `None` when the body
 /// does not parse — the tree-walk reproduces the per-call parse error
 /// exactly (`seed_parse_error` runs on every uncached `eval`).
-pub(crate) fn compile_proc_body(body: &str, epoch: u64) -> Option<Rc<ByteCode>> {
+/// `params` seed the compiled locals table (slot i = the i-th name), the
+/// contract the frame-side positional binding relies on.
+pub(crate) fn compile_proc_body(
+    params: &[(String, Option<String>)],
+    body: &str,
+    epoch: u64,
+) -> Option<Rc<ByteCode>> {
     let unit = rtcl_parser::ScriptUnit::parse(body).ok()?;
-    let mut code = Compiler::compile_unit(Rc::clone(&unit.source), &unit.commands);
+    let names: Vec<&str> = params.iter().map(|(n, _)| n.as_str()).collect();
+    let mut code =
+        Compiler::compile_unit_locals(Rc::clone(&unit.source), &unit.commands, &names);
     code.epoch = epoch;
     Some(Rc::new(code))
 }
@@ -336,7 +344,8 @@ fn exec_inner(
             let site = &code.sites[st.cur_site];
             let text = site.text.slice(&code.source);
             let line = st.entry_offset + site.line as usize;
-            let is_word_op = matches!(op, OpCode::LoadVar(_) | OpCode::EvalScript);
+            let is_word_op =
+                matches!(op, OpCode::LoadVar(_) | OpCode::LoadLocal(_) | OpCode::EvalScript);
             if is_word_op && std::mem::take(&mut interp.err_from_subst) {
                 interp.err_pending_top = Some(Rc::from(text));
                 interp.err_line = line;
@@ -528,6 +537,54 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                     let v = super::commands::misc::cmd_incr(interp, &args)?;
                     st.stack.push(Entry::Val(v));
                 }
+            }
+        }
+
+        // ── Slot locals (E2) ────────────────────────────────────────────
+        // The slot ops only fire on slot-compiled frames; every fallback
+        // goes through the name-keyed path, which consults the same table
+        // (degraded, statics, unset cells, traces) — so the two storage
+        // forms alias one variable set either way.
+        OpCode::LoadLocal(slot) => {
+            let slot = *slot as usize;
+            let v = match interp.frame_slot_value(slot) {
+                Some(v) => v,
+                None => {
+                    let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
+                    interp.eval_var_ref(name)?
+                }
+            };
+            st.stack.push(Entry::Val(v));
+        }
+        OpCode::StoreLocal(slot) => {
+            let slot = *slot as usize;
+            // `set` keeps its result: the value stays on the stack.
+            let v = st.top_val();
+            if !interp.frame_slot_write(slot, v.clone()) {
+                let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
+                interp.set_var(name, v)?;
+            }
+        }
+        OpCode::IncrLocal(slot, amount) => {
+            let slot = *slot as usize;
+            // Same fallback ladder as IncrVar: slot fast path, then the
+            // name fast path (degraded frames), then the real `incr`,
+            // which owns creation and the exact errors.
+            let name = || code.locals().get(slot).map(String::as_str).unwrap_or("");
+            match interp.frame_slot_incr(slot, *amount) {
+                Some(v) => st.stack.push(Entry::Val(v)),
+                None => match interp.incr_var_fast(name(), *amount) {
+                    Some(v) => st.stack.push(Entry::Val(v)),
+                    None => {
+                        let args = [
+                            Value::from_str("incr"),
+                            Value::from_str(name()),
+                            Value::from_int(*amount),
+                        ];
+                        let v = super::commands::misc::cmd_incr(interp, &args)?;
+                        st.stack.push(Entry::Val(v));
+                    }
+                },
             }
         }
 
@@ -1079,5 +1136,206 @@ mod sub_inline_tests {
         // Lazy ints still render exactly.
         assert_eq!(ev("set x [expr {1000000 + 2}]; set x"), "1000002");
         assert_eq!(ev("set x -5; set x"), "-5");
+    }
+}
+
+#[cfg(test)]
+mod slot_locals_tests {
+    //! E2 slot-resolved proc locals: slots are the canonical store of the
+    //! compiled locals table's names; every name-keyed path aliases them.
+
+    use crate::interp::Interp;
+
+    fn ev(script: &str) -> String {
+        let mut interp = Interp::new();
+        interp.eval(script).unwrap().as_str().to_string()
+    }
+
+    fn assert_both(script: &str, want: &str) {
+        // (named assert_both for the historical two-engine form; the
+        // tree-walk half lives in the external sweep — env-var toggling
+        // here would race the OnceLock under parallel tests)
+        assert_eq!(ev(script), want, "{script}");
+    }
+
+    #[test]
+    fn test_slot_basics() {
+        assert_both("proc p {a b} { set c [expr {$a + $b}] ; incr c ; return $c }; p 1 2", "4");
+        assert_both("proc q {} { set x 5; set x }; q", "5");
+        assert_both("proc r {a} { set a 9; return $a }; r 1", "9");
+        assert_both("proc s {x args} { return $x|[llength $args] }; s 1 2 3", "1|2");
+        assert_both("proc d {a {b 7}} { return $a+$b }; d 1", "1+7");
+    }
+
+    #[test]
+    fn test_slot_use_before_set_error() {
+        assert_both(
+            "proc p {} { puts $never }; catch p m; set m",
+            "can't read \"never\": no such variable",
+        );
+        assert_both(
+            "proc p {a} { unset a; set a }; catch {p 1} m; set m",
+            "can't read \"a\": no such variable",
+        );
+    }
+
+    #[test]
+    fn test_slot_uncompiled_writer_aliasing() {
+        // foreach writes a table name through the name path.
+        assert_both(
+            "proc f {} { set total 0; foreach i {1 2 3} { incr total $i }; return $total }; f",
+            "6",
+        );
+        // catch stores its result into a table name.
+        assert_both(
+            "proc c {} { set msg old; catch {error boom} msg; return $msg }; c",
+            "boom",
+        );
+        // lappend mutates a table name.
+        assert_both("proc l {} { set v a; lappend v b; return $v }; l", "a b");
+        // append / unset / recreate cycles.
+        assert_both("proc a {} { set v 1; unset v; set v 2; return $v }; a", "2");
+        // info exists sees slot state.
+        assert_both("proc e {x} { return [info exists x] }; e 1", "1");
+        assert_both(
+            "proc e2 {x} { unset x; return [info exists x] }; e2 1",
+            "0",
+        );
+        // expr reads the slot (loop-condition shape).
+        assert_both(
+            "proc w {} { set i 0; while {$i < 4} { incr i }; return $i }; w",
+            "4",
+        );
+    }
+
+    #[test]
+    fn test_slot_degrade_upvar() {
+        // upvar to a caller local: both frames observe one variable.
+        assert_both(
+            "proc inner {n} { upvar 1 $n s; incr s }; proc outer {} { set shared 41; inner shared; return $shared }; outer",
+            "42",
+        );
+        // upvar onto an existing local name errors (exists check consults
+        // the migrated map).
+        assert_both(
+            "proc p {} { set x 1; upvar 0 y x }; catch p m; set m",
+            "variable \"x\" already exists",
+        );
+    }
+
+    #[test]
+    fn test_slot_degrade_global() {
+        assert_both(
+            "set g 10; proc p {} { global g; incr g; return $g }; p; set g",
+            "11",
+        );
+        // A global'd name that was already written compiled: the degrade
+        // migrates the prior slot value into the link-visible store.
+        assert_both(
+            "proc p {} { set g2 3; global g2; return $g2 }; p",
+            "3",
+        );
+    }
+
+    #[test]
+    fn test_slot_degrade_array() {
+        assert_both(
+            "proc p {} { set a(0) x; return [array exists a] }; p",
+            "1",
+        );
+        // Element read/write through the map after array-ification.
+        assert_both("proc p {} { set a(0) 1; set a(1) 2; return $a(0)$a(1) }; p", "12");
+    }
+
+    #[test]
+    fn test_slot_degrade_trace() {
+        assert_both(
+            "proc p {} { set t 1; trace add variable t write {apply {args {set ::hit 1}}}; set t 2; return [list $t [info exists ::hit]] }; p",
+            "2 1",
+        );
+    }
+
+    #[test]
+    fn test_slot_enumeration_degrades() {
+        assert_both(
+            "proc p {a b} { set loc1 1; set loc2 2; lsort [info locals] }; p 1 2",
+            "a b loc1 loc2",
+        );
+        assert_both(
+            "proc p {z} { set w 9; lsort [info vars] }; p 5",
+            "w z",
+        );
+        assert_both(
+            "proc p {q} { set inner 3; info frame 0 }; p 9",
+            "type proc level 0 cmd {} locals {q inner}",
+        );
+    }
+
+    #[test]
+    fn test_slot_tailcall_rebind() {
+        // The tailcall loop re-gates per iteration; slot binding follows
+        // the new proc's table.
+        assert_both(
+            "proc tc {n acc} { if {$n <= 0} { return $acc }; tailcall tc [expr {$n - 1}] [expr {$n + $acc}] }; tc 5 0",
+            "15",
+        );
+        assert_both(
+            "proc a {n} { if {$n <= 0} { return a }; tailcall b [expr {$n - 1}] }; proc b {n} { if {$n <= 0} { return b }; tailcall a [expr {$n - 1}] }; a 4",
+            "a",
+        );
+    }
+
+    #[test]
+    fn test_slot_epoch_fallback() {
+        // Shadowing an inline-folded command bumps the epoch: the compiled
+        // body goes stale and the call runs tree-walked, where the frame
+        // is name-keyed (slot gate consults the same epoch) and the body's
+        // slot ops take their name fallbacks.  The shadow forwards to the
+        // renamed builtin, so the observable result is unchanged.
+        let script = "proc p {a} { set b [expr {$a + 1}]; return $b }; \
+rename set myset; \
+proc set {args} { uplevel 1 [linsert $args 0 myset] }; \
+p 1";
+        assert_eq!(ev(script), "2");
+    }
+
+    #[test]
+    fn test_slot_statics_stay_name_keyed() {
+        assert_both(
+            "proc p {} { set c 5; return $c }; p",
+            "5",
+        );
+    }
+
+    #[test]
+    fn test_slot_duplicate_param_names_stay_name_keyed() {
+        // Duplicate parameter names dedup in the compiled locals table
+        // (params {old - -} → table len 2), so the positional slot binding
+        // would write past the table: the slot gate must detect the
+        // misalignment and keep the frame name-keyed (tclsh rejects such
+        // procs at definition; rtcl accepts them with map semantics).
+        assert_both(
+            "proc cb {old - -} { return [list $old [info level 0]] }; cb a b c",
+            "a {cb a b c}",
+        );
+        // rtcl's map binding is last-wins for a readable duplicate (tclsh
+        // 8.6.17 is first-wins — a recorded divergence class, not slot
+        // business); both engines must agree on it.
+        assert_both("proc dq {x x} { return $x }; dq 7 8", "8");
+        // (Non-candidate formal names — qualified, array-element, empty —
+        // are rejected at `proc` definition in both rtcl and tclsh, so
+        // duplicates are the only reachable misalignment; the gate's zip
+        // alignment also covers them defensively, e.g. for apply lambdas.)
+    }
+
+    #[test]
+    fn test_slot_exotic_param_names() {
+        // Non-candidate parameter names bind through the map; the frame
+        // forgoes slots entirely and stays correct.
+        assert_both("proc p {a b} { return [list $a $b] }; p 1 2", "1 2");
+        assert_both(
+            "proc p {n} { set n [expr {$n * 2}]; return $n }; p 21",
+            "42",
+        );
     }
 }

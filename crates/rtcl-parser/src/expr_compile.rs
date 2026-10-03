@@ -98,6 +98,13 @@ pub trait ExprSink {
     fn emit(&mut self, op: OpCode, line: u32);
     fn add_const(&mut self, name: &str) -> u16;
     fn emit_sub(&mut self, script: &str, abs_start: u32, line: u32) -> bool;
+    /// Emit a variable read of `name` (a `$var` operand).  The default is
+    /// the plain name-keyed op; the Compiler sink overrides it to use a
+    /// compiled local slot when the unit's locals table holds the name.
+    fn var_read(&mut self, name: &str, line: u32) {
+        let idx = self.add_const(name);
+        self.emit(OpCode::LoadVar(idx), line);
+    }
 }
 
 impl ExprSink for ByteCode {
@@ -562,8 +569,7 @@ impl<'a> ExprCodegen<'a> {
             }
             Some(Token::Var(name)) => {
                 let name = name.clone();
-                let idx = self.sink.add_const(&name);
-                self.sink.emit(OpCode::LoadVar(idx), self.line);
+                self.sink.var_read(&name, self.line);
                 Ok(())
             }
             Some(Token::LParen) => {

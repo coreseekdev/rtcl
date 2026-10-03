@@ -249,10 +249,16 @@ pub enum OpCode {
     /// Used when the result of `set` is not needed.
     StoreVarPop(u16),
 
-    /// Load from a call-frame slot (local variable, fast path).
+    /// Load from a call-frame slot (local variable, fast path).  Operand =
+    /// slot index; the name lives at `ByteCode::locals()[slot]`, so an
+    /// unset slot or a frame that degraded back to the name-keyed store
+    /// (upvar/trace/array restructure) falls back to the ordinary
+    /// scope-chain read of that name.
     LoadLocal(u16),
 
     /// Store TOS into a call-frame slot.  Leaves the value on the stack.
+    /// Operand/naming contract as [`OpCode::LoadLocal`]; a degraded frame
+    /// falls back to `set_var` of the name.
     StoreLocal(u16),
 
     /// Load an array element: `$name(TOS)`.  Name from constant pool.
@@ -263,6 +269,11 @@ pub enum OpCode {
 
     /// Increment a variable by a signed immediate and push the new value.
     IncrVar(u16, i64),
+
+    /// Increment a call-frame slot by a signed immediate (naming contract
+    /// as [`OpCode::LoadLocal`]); a degraded frame or non-integer value
+    /// falls back to the real `incr`, which owns the exact errors.
+    IncrLocal(u16, i64),
 
     /// Append TOS to the variable (constant-pool name index).
     /// Pops the append value, pushes the new variable value.
@@ -522,6 +533,7 @@ impl fmt::Display for OpCode {
             OpCode::LoadArrayElem(idx) => write!(f, "LOAD_ARRAY_ELEM {}", idx),
             OpCode::StoreArrayElem(idx) => write!(f, "STORE_ARRAY_ELEM {}", idx),
             OpCode::IncrVar(idx, n) => write!(f, "INCR_VAR {} {}", idx, n),
+            OpCode::IncrLocal(slot, n) => write!(f, "INCR_LOCAL {} {}", slot, n),
             OpCode::AppendVar(idx) => write!(f, "APPEND_VAR {}", idx),
             OpCode::UnsetVar(idx) => write!(f, "UNSET_VAR {}", idx),
             OpCode::VarExists(idx) => write!(f, "VAR_EXISTS {}", idx),

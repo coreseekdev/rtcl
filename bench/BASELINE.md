@@ -142,3 +142,56 @@ list_ops                  4          7      1.7
 proc_fib                  4         12      3.0
 string_build              3          3      1.0
 var_incr                 40         28       .7
+# ---------------------------------------------------------------------------
+# E1.9 2026-10-04 (549a716; note backfilled): dispatch_call's builtin fast
+# path required `procs.is_empty()` — any script defining a single proc
+# diverted EVERY compiled Call op through the full dispatch_values probe
+# storm; the guard now probes `!procs.contains_key(name)`.  call_proc's
+# frame teardown skips the `F{i}:` prefix format! and traced-name scan
+# when no variable traces exist.  fib25 114→104ms, decomp_call ~106→104,
+# decomp_var unchanged (~144).  Gates: judge 87/87, tests green.
+# (Bench table unchanged from E1.75 within noise.)
+
+# ---------------------------------------------------------------------------
+# E2 2026-10-04 (ARCHITECTURE-PERF.md item E, stage 2): slot-resolved proc
+# locals.  `proc` compiles its body with a locals table (params seed the
+# first slots in order, plain-name `set`/`incr` targets append at compile
+# time — `compile_unit_locals`); plain-name reads/writes of table names
+# compile to LoadLocal/StoreLocal/IncrLocal (slot operand; expr `$var`
+# operands route through ExprSink::var_read so loop conditions hit slots
+# too).  call_proc binds arguments positionally into the slots when the
+# slot gate holds (compiled + epoch-valid + bytecode applicable + no
+# statics + the table's params-first seeding aligning positionally with
+# the parameter list + non-empty table; re-gated per tailcall iteration —
+# the alignment zip also catches duplicate parameter names, which dedup
+# in the table and would shift every later slot; tclsh rejects such
+# procs at definition, rtcl accepts them with map semantics (last
+# binding wins; tclsh is first-wins — a recorded divergence class)).
+# Slots are the canonical store and
+# every name-keyed path ALIASES them (tclsh's compiledLocals/var-table
+# trick): get_var/resolve_var/set_var/store_var/remove_var/
+# loc_base_exists/incr_var_fast/take_var_fast consult
+# `CallFrame::slot_index_of` first.  Degrade (slots → map, in slot order
+# — the tree-walk's insertion order, keeping unsorted enumerations
+# byte-exact) on: upvar/global/variable link install (both the linking
+# frame and a frame-target's frame), trace registration, array-ification
+# (set_var element branch + mark_array), and whole-frame for `info
+# locals`/`info vars`/`info frame`.  Unset empties the cell; slot ops on
+# degraded/statics frames fall back through their name paths.
+# Gates: judge 87/87; two-engine sweeps — judge corpus 0 diffs (87
+# files) and full probe sweep 394 files with only the 11 known
+# artifacts (8 env-dump, bnprobe2 pointers, objmech/objsec timing);
+# workspace tests 1132 green (+13 slot_locals tests) covering
+# basics/aliasing/degrades/tailcall/epoch/enumeration/duplicate-params.
+# Decomposition probes (taskset -c 0, best-of-3): decomp_var 144→96ms
+# (tclsh 54; gap 2.7→1.8x), decomp_call 104→96ms (tclsh 74), fib25
+# 104→87ms (tclsh 31).  Bench table: proc_fib 12→9ms (3.0→1.8x);
+# everything else already at/below parity and unchanged.
+
+case               tclsh_ms    rtcl_ms    ratio
+arith_loop               32         31       .9
+dict_ops                  4          6      1.5
+list_ops                  4          7      1.7
+proc_fib                  5          9      1.8
+string_build              3          4      1.3
+var_incr                 40         27       .6

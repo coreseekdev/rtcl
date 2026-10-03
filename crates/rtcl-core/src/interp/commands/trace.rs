@@ -124,6 +124,10 @@ fn add_variable(interp: &mut Interp, rest: &[Value]) -> Result<Value> {
     let ops = parse_ops(interp, &rest[1], VAR_OPS)?;
     let script = rest[2].as_str().to_string();
     let trace = VarTrace { ops, script };
+    // A traced frame-local name leaves the slot model: slot writes don't
+    // run the trace machinery, so the name-keyed store must own it (a
+    // no-op for globals, qualified names, and non-table names).
+    interp.degrade_frame_local_here(&name);
     if let Some((base, elem)) = split_elem(&name) {
         let base_s = base.to_string();
         if !interp.is_array_semantic(base) {

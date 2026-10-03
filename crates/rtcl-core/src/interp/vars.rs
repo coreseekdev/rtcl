@@ -51,6 +51,117 @@ pub(crate) fn stamp_key(loc: &VarLoc) -> String {
 impl Interp {
     // ── internal helpers ────────────────────────────────────────
 
+    // ── E2 slot-locals aliasing ───────────────────────────────────
+    //
+    // tclsh's compiledLocals array and its locals hash table alias the
+    // same Var entries.  rtcl models that with slots as the canonical
+    // store of table names plus these consults on every name-keyed path:
+    // an uncompiled writer (foreach var, lappend, catch result, `global`
+    // mirror…) observes the same variable the compiled ops touch.
+
+    /// Value of slot `slot` in the current frame, when it holds one
+    /// (unset slots and name-keyed frames both miss — the callers fall
+    /// back to the name path).
+    pub(crate) fn frame_slot_value(&self, slot: usize) -> Option<Value> {
+        self.frames.last()?.slots.get(slot)?.clone()
+    }
+
+    /// Write `value` into slot `slot` of the current frame.  `false` when
+    /// the frame is not slot-compiled (or has degraded) — the caller then
+    /// takes the name path.
+    pub(crate) fn frame_slot_write(&mut self, slot: usize, value: Value) -> bool {
+        match self.frames.last_mut().and_then(|f| f.slots.get_mut(slot)) {
+            Some(cell) => {
+                *cell = Some(value);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `incr` on a frame slot, mutating the int rep in place
+    /// (the slot analogue of [`Interp::incr_var_fast`]; `None` falls back
+    /// to the real `incr`, which owns creation and the exact errors).
+    pub(crate) fn frame_slot_incr(&mut self, slot: usize, amount: i64) -> Option<Value> {
+        if !self.var_traces.is_empty() {
+            return None;
+        }
+        let cell = self.frames.last_mut()?.slots.get_mut(slot)?.as_mut()?;
+        let current = cell.as_int()?;
+        // Overflow belongs to the real `incr` (ARITH IOVERFLOW error).
+        let next = current.checked_add(amount)?;
+        cell.set_int_rep(next);
+        Some(cell.clone())
+    }
+
+    /// Degrade `frames[frame_idx]` back to the name-keyed store — but
+    /// only when `name` actually lives in its slot table (otherwise the
+    /// exceptional structure being installed coexists with the slots
+    /// fine, and the frame keeps its fast paths).  Slot values migrate in
+    /// slot order: params first, then `set`-discovered names in
+    /// compilation order — the same sequence in which the tree-walk
+    /// inserts them at runtime, so hash iteration order (and anything
+    /// derived from it after a later degrade) matches too.
+    pub(crate) fn degrade_frame_local(&mut self, frame_idx: usize, name: &str) {
+        let base = match name.find('(') {
+            Some(i) => &name[..i],
+            None => name,
+        };
+        let Some(f) = self.frames.get_mut(frame_idx) else { return };
+        if f.slots.is_empty() || f.slot_index_of(base).is_none() {
+            return;
+        }
+        if let Some(table) = f.slot_table.take() {
+            for (i, name) in table.locals().iter().enumerate() {
+                if let Some(v) = f.slots.get_mut(i).and_then(|c| c.take()) {
+                    f.locals.insert(name.clone(), v);
+                }
+            }
+        }
+        f.slots.clear();
+    }
+
+    /// Whole-frame degrade of `frames[frame_idx]` — for sites that enumerate
+    /// the name-keyed store (`info vars`, `info locals`, `info frame`):
+    /// after this, `frame.locals` alone is a complete view again.
+    pub(crate) fn degrade_frame_all_at(&mut self, frame_idx: usize) {
+        let table = {
+            let f = match self.frames.get_mut(frame_idx) {
+                Some(f) => f,
+                None => return,
+            };
+            if f.slots.is_empty() {
+                return;
+            }
+            f.slot_table.take()
+        };
+        let f = &mut self.frames[frame_idx];
+        if let Some(table) = table {
+            for (i, name) in table.locals().iter().enumerate() {
+                if let Some(v) = f.slots.get_mut(i).and_then(|c| c.take()) {
+                    f.locals.insert(name.clone(), v);
+                }
+            }
+        }
+        f.slots.clear();
+    }
+
+    /// [`Self::degrade_frame_all_at`] on the current frame (no-op at the
+    /// global level).
+    pub(crate) fn degrade_frame_all(&mut self) {
+        if let Some(i) = self.frames.len().checked_sub(1) {
+            self.degrade_frame_all_at(i);
+        }
+    }
+
+    /// [`Self::degrade_frame_local`] on the current frame (no-op at the
+    /// global level, where there is nothing to degrade).
+    pub(crate) fn degrade_frame_local_here(&mut self, name: &str) {
+        if let Some(i) = self.frames.len().checked_sub(1) {
+            self.degrade_frame_local(i, name);
+        }
+    }
+
     /// Resolve the owning scope of a variable name (upvar links followed).
     pub(crate) fn resolve_loc(&self, name: &str) -> VarLoc {
         if let Some(gname) = Self::split_global(name) {
@@ -133,7 +244,7 @@ impl Interp {
             VarLoc::Frame(i, n) => self
                 .frames
                 .get(*i)
-                .map(|f| f.locals.contains_key(n))
+                .map(|f| f.locals.contains_key(n) || f.slot_value(n).is_some())
                 .unwrap_or(false),
         }
     }
@@ -311,8 +422,12 @@ impl Interp {
                         .get(self.redirect_flat(gname.clone()).as_str())
                         .or_else(|| frame.locals.get(name)),
                     UpvarLink::Frame { frame_index, var_name } => {
+                        // Link installation degrades the target frame, so
+                        // the map probe is the live path; the slot consult
+                        // is defense in depth.
                         self.frames.get(*frame_index)
-                            .and_then(|f| f.locals.get(var_name.as_str()))
+                            .and_then(|f| f.slot_value(var_name.as_str())
+                                .or_else(|| f.locals.get(var_name.as_str())))
                     }
                     UpvarLink::Dead { target, .. } => self
                         .globals
@@ -320,7 +435,11 @@ impl Interp {
                         .or_else(|| frame.locals.get(name)),
                 };
             }
-            frame.locals.get(name)
+            // Slotted name: the slot is the canonical store (unset slots
+            // fall through — the map never holds a table name).
+            frame
+                .slot_value(name)
+                .or_else(|| frame.locals.get(name))
         } else {
             // Outside procs an unqualified name resolves in the current
             // namespace first, then the global namespace (tclsh 8.6.17:
@@ -385,7 +504,14 @@ impl Interp {
                 }
             }
         } else {
-            self.frames[frame_idx].locals.insert(name.to_string(), value);
+            let f = &mut self.frames[frame_idx];
+            match f.slot_index_of(name) {
+                // Slotted name: the slot is the canonical store.
+                Some(i) => f.slots[i] = Some(value),
+                None => {
+                    f.locals.insert(name.to_string(), value);
+                }
+            }
         }
     }
 
@@ -482,7 +608,15 @@ impl Interp {
                 }
             }
         } else {
-            self.frames[frame_idx].locals.remove(name);
+            let f = &mut self.frames[frame_idx];
+            match f.slot_index_of(name) {
+                // Unset of a slotted name empties the cell (tclsh: the
+                // compiledLocal's Var is cleared, the table entry stays).
+                Some(i) => f.slots[i] = None,
+                None => {
+                    f.locals.remove(name);
+                }
+            }
         }
     }
 
@@ -531,6 +665,15 @@ impl Interp {
             if !name.contains("::") {
                 if let Some(frame) = self.frames.last() {
                     if !frame.upvars.contains_key(name) {
+                        // Slotted name: the slot is the canonical store (a
+                        // table name is never in the map).  An empty cell is
+                        // the unset state — the map probe below must not run.
+                        if let Some(i) = frame.slot_index_of(name) {
+                            return match frame.slots[i].as_ref() {
+                                Some(v) => Ok(v),
+                                None => Err(Error::var_not_found(name)),
+                            };
+                        }
                         if let Some(v) = frame.locals.get(name) {
                             if frame.array_locals.contains(name) {
                                 return Err(Error::runtime(
@@ -622,6 +765,10 @@ impl Interp {
         }
         self.check_parent_ns(name)?;
         if let Some((array_name, index)) = split_array_ref(name) {
+            // Array-ification of a slotted name migrates the frame back to
+            // the name-keyed store (element keys are flat map entries; the
+            // slot model has no element form).
+            self.degrade_frame_local_here(array_name);
             let base = array_name.to_string();
             let idx = index.to_string();
             let loc = self.resolve_loc(array_name);
@@ -671,9 +818,20 @@ impl Interp {
                 let mut wrote = false;
                 if let Some(frame) = self.frames.last_mut() {
                     if !frame.upvars.contains_key(name) && !frame.array_locals.contains(name) {
-                        if let Some(slot) = frame.locals.get_mut(name) {
-                            *slot = value.clone();
-                            wrote = true;
+                        match frame.slot_index_of(name) {
+                            // Slotted name: write the cell (creation of an
+                            // unset slot reaches here via the slow path's
+                            // store_var, which consults the same table).
+                            Some(i) => {
+                                frame.slots[i] = Some(value.clone());
+                                wrote = true;
+                            }
+                            None => {
+                                if let Some(slot) = frame.locals.get_mut(name) {
+                                    *slot = value.clone();
+                                    wrote = true;
+                                }
+                            }
                         }
                     }
                 } else if self.current_namespace == "::" && self.flat_aliases.is_empty() {
@@ -728,7 +886,13 @@ impl Interp {
             if frame.upvars.contains_key(name) || frame.array_locals.contains(name) {
                 return None;
             }
-            frame.locals.remove(name)
+            match frame.slot_index_of(name) {
+                // Slotted name: lift the value out of the cell; the caller
+                // puts the replacement back (slot-None is the interim
+                // state, same as the map-remove window).
+                Some(i) => frame.slots.get_mut(i)?.take(),
+                None => frame.locals.remove(name),
+            }
         } else {
             if self.current_namespace != "::"
                 || !self.flat_aliases.is_empty()
@@ -759,7 +923,12 @@ impl Interp {
             if frame.upvars.contains_key(name) || frame.array_locals.contains(name) {
                 return None;
             }
-            frame.locals.get_mut(name)?
+            match frame.slot_index_of(name) {
+                // Slotted name: unset cell → the real `incr` creates it
+                // from 0 (its set_var consults the table again).
+                Some(i) => frame.slots.get_mut(i)?.as_mut()?,
+                None => frame.locals.get_mut(name)?,
+            }
         } else {
             if self.current_namespace != "::"
                 || !self.flat_aliases.is_empty()
@@ -1228,6 +1397,8 @@ impl Interp {
     /// elements — `array set x {}` on a missing variable still creates it.
     pub(crate) fn mark_array(&mut self, name: &str) -> Result<()> {
         self.check_parent_ns(name)?;
+        // Array-ification degrades (element keys are flat map entries).
+        self.degrade_frame_local_here(name);
         let loc = self.resolve_loc(name);
         if !self.loc_is_array(&loc) {
             let base_key = loc.base_name().to_string();

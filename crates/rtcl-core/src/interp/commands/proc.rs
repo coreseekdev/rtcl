@@ -131,7 +131,8 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
-    let compiled = super::super::vm_exec::compile_proc_body(&body, interp.tier1_epoch);
+    let compiled =
+        super::super::vm_exec::compile_proc_body(&defaults, &body, interp.tier1_epoch);
     let proc_def = ProcDef {
         params: Rc::new(defaults),
         body: Rc::from(body),
@@ -651,6 +652,13 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
 
+        // A frame-target link must land in the target's name-keyed store
+        // (slot cells and upvar links do not alias): degrade the target
+        // frame when the linked name sits in its slot table.
+        if let UpvarLink::Frame { frame_index, var_name } = &link {
+            interp.degrade_frame_local(*frame_index, var_name);
+        }
+
         // Self-reference, direct or through a link chain.
         if let UpvarLink::Frame { frame_index, var_name } = &link {
             if *frame_index == current_idx && *var_name == local_var {
@@ -676,7 +684,10 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
         // An existing local that is not itself an alias blocks the link;
         // replacing an existing alias is silent (upvar-6.1 re-links `x`
-        // once per loop iteration).
+        // once per loop iteration).  The alias name leaves the slot model
+        // first (links and slot cells don't alias; the exists check and
+        // every later write go through the map).
+        interp.degrade_frame_local(current_idx, &local_var);
         let has_link = interp.frames[current_idx].upvars.contains_key(&local_var);
         if !has_link
             && (interp.frames[current_idx].locals.contains_key(&local_var)
@@ -797,6 +808,10 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // The local alias is the tail after the last `::` run
         // (`global a::b` binds `b` — tclsh), `ns::` binds the empty name.
         let local = super::namespace::split_var_tail(name).to_string();
+        // The alias name leaves the slot model (links and slot cells
+        // don't alias); a frame whose `global`d name is NOT slotted keeps
+        // its fast paths — this is the common hot-proc shape.
+        interp.degrade_frame_local(current_idx, &local);
         interp.frames[current_idx].upvars.insert(
             local.clone(),
             UpvarLink::Global(target.clone()),

@@ -233,6 +233,9 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         } else {
             let local_name = split_var_tail(raw_name).to_string();
             let frame_idx = interp.frames.len() - 1;
+            // The alias name leaves the slot model (links and slot cells
+            // don't alias) — same partial-degrade rule as `global`.
+            interp.degrade_frame_local(frame_idx, &local_name);
             interp.frames[frame_idx].upvars.insert(
                 local_name.clone(),
                 crate::interp::UpvarLink::Global(qualified.clone()),

@@ -121,6 +121,18 @@ pub(crate) struct CallFrame {
     pub local_procs: Vec<String>,
     /// Scripts registered by `defer` — executed in reverse order on frame exit.
     pub deferred_scripts: Vec<String>,
+    /// E2 slot-compiled locals: the frame's variable values by slot index
+    /// (`None` = currently unset — a `set` target whose write was skipped
+    /// by control flow).  Empty when the frame is not slot-compiled, or
+    /// after it degraded back to the name-keyed store: slots and `locals`
+    /// never hold the same name at once, they alias (every name-keyed
+    /// read/write consults [`CallFrame::slot_index_of`] first, so
+    /// uncompiled writers — foreach vars, `lappend`, `catch` results —
+    /// observe and mutate the same variable the compiled ops touch).
+    pub slots: Vec<Option<Value>>,
+    /// The compiled unit the slots belong to; its `locals()` table names
+    /// slot i.  `Rc` — one bump per call, taken on degrade.
+    pub slot_table: Option<Rc<ByteCode>>,
     /// Deferred `tailcall` command, armed by the `tailcall` builtin and
     /// fired at frame exit — kept on the frame (not just the completion
     /// error) so a `catch` consuming the completion still lets it fire,
@@ -136,6 +148,30 @@ pub(crate) struct CallFrame {
     /// reconstructs the tclsh varFrame chain (proc frames and ns-eval
     /// scopes interleave) for `uplevel` level arithmetic.
     pub ns_depth: usize,
+}
+
+impl CallFrame {
+    /// Slot index of `name` in this frame's compiled locals table, when
+    /// the frame is slot-compiled (`None` for name-keyed/degraded frames
+    /// or table misses — the caller then takes its ordinary path).  A
+    /// linear scan, like tclsh's compiledLocals lookup; tables are small
+    /// (params + `set`/`incr` targets).
+    pub(crate) fn slot_index_of(&self, name: &str) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        self.slot_table
+            .as_ref()?
+            .locals()
+            .iter()
+            .position(|n| n == name)
+    }
+
+    /// Current value of the named slot (`None` when unset or absent).
+    pub(crate) fn slot_value(&self, name: &str) -> Option<&Value> {
+        let i = self.slot_index_of(name)?;
+        self.slots[i].as_ref()
+    }
 }
 
 /// `info level 0` string for a frame: the invocation words, list-rendered

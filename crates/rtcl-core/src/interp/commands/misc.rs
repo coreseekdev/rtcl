@@ -853,6 +853,10 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let source = if qualified {
                 &interp.globals
             } else {
+                // Slot-compiled frames enumerate through the name-keyed
+                // store: migrate first (once per frame — later calls see
+                // empty slots and skip straight through).
+                interp.degrade_frame_all();
                 interp.scope_vars()
             };
             // At namespace scope the namespace's own variables report
@@ -1134,6 +1138,9 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
+            // Slot-compiled frames enumerate through the name-keyed store
+            // (migrate first; later calls on the same frame skip through).
+            interp.degrade_frame_all();
             if let Some(frame) = interp.frames.last() {
                 let mut vars: Vec<Value> = frame.locals.keys()
                     .filter(|name| {
@@ -1298,6 +1305,9 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 depth - 1
             };
+            // Slot-compiled frames report locals through the name-keyed
+            // store — migrate the target frame first (any level).
+            interp.degrade_frame_all_at(level);
             let vars: Vec<String> = if let Some(frame) = interp.frames.get(level) {
                 frame.locals.keys().cloned().collect()
             } else {

@@ -2,6 +2,8 @@
 //! lassign, lrepeat, lreverse, concat, split, join, lmap, lset, lsubst.
 //! See list_sort.rs for lsearch and lsort.
 
+use std::borrow::Cow;
+
 use crate::error::{Error, Result};
 use crate::interp::Interp;
 use crate::value::{is_tcl_space, Value};
@@ -34,6 +36,18 @@ pub(crate) fn strict_list(interp: &mut Interp, v: &Value) -> Result<Vec<Value>> 
         set_error_code(interp, e.code);
         tcl_err(e.message)
     })
+}
+
+/// [`strict_list`] with a borrow fast path: a value already carrying a
+/// list internal rep is viewed in place (zero-copy, tclsh's
+/// `TclListObjGetElements` hands out pointers the same way); only
+/// string/dict reps materialise a `Vec`.  Hot read paths (foreach,
+/// lindex, llength) go through this.
+pub(crate) fn strict_list_cow<'a>(interp: &mut Interp, v: &'a Value) -> Result<Cow<'a, [Value]>> {
+    match v.as_list_ref() {
+        Some(items) => Ok(Cow::Borrowed(items)),
+        None => strict_list(interp, v).map(Cow::Owned),
+    }
 }
 
 /// Tcl's bad-index error (`TCL VALUE INDEX`), including the
@@ -163,7 +177,7 @@ pub fn cmd_llength(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         set_error_code(interp, "TCL WRONGARGS");
         return Err(wrong_args("llength", "list"));
     }
-    let list = strict_list(interp, &args[1])?;
+    let list = strict_list_cow(interp, &args[1])?;
     Ok(Value::from_int(list.len() as i64))
 }
 
@@ -189,16 +203,17 @@ pub fn cmd_lindex(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         args[2..].to_vec()
     };
     for idx_val in &indices {
-        let list = strict_list(interp, &current)?;
-        let idx_str = idx_val.as_str();
-        let len = list.len();
-        match parse_tcl_index(idx_str, len) {
-            Some(raw) if raw >= 0 && (raw as usize) < len => {
-                current = list[raw as usize].clone();
+        let next = {
+            let list = strict_list_cow(interp, &current)?;
+            let idx_str = idx_val.as_str();
+            let len = list.len();
+            match parse_tcl_index(idx_str, len) {
+                Some(raw) if raw >= 0 && (raw as usize) < len => list[raw as usize].clone(),
+                Some(_) => return Ok(Value::empty()),
+                None => return Err(bad_index(interp, idx_str)),
             }
-            Some(_) => return Ok(Value::empty()),
-            None => return Err(bad_index(interp, idx_str)),
-        }
+        };
+        current = next;
     }
     Ok(current)
 }

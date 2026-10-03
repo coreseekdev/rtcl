@@ -1,11 +1,13 @@
 //! Iteration and timing commands: while, for, foreach, time, timerate, range.
 
+use std::borrow::Cow;
+
 use crate::error::{Error, Result};
 use crate::interp::Interp;
 use crate::value::Value;
 
 use super::dict::demote_level0_return;
-use super::list::{set_error_code, strict_list, tcl_err};
+use super::list::{set_error_code, strict_list, strict_list_cow, tcl_err};
 
 pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
@@ -138,9 +140,9 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // Collect (var_names, data_list) pairs
     // var_names is a list: single var "x" or multi-var "{a b c}"
-    struct VarGroup {
+    struct VarGroup<'a> {
         vars: Vec<String>,
-        data: Vec<Value>,
+        data: Cow<'a, [Value]>,
     }
     let mut groups: Vec<VarGroup> = Vec::new();
     let mut i = 1;
@@ -154,7 +156,10 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             set_error_code(interp, "TCL OPERATION FOREACH NEEDVARS");
             return Err(tcl_err("foreach varlist is empty"));
         }
-        let data = strict_list(interp, &args[i + 1])?;
+        // A value already carrying a list rep is viewed in place — the
+        // iteration never mutates the source (tclsh hands the foreach
+        // body pointers into the source list the same way).
+        let data = strict_list_cow(interp, &args[i + 1])?;
         groups.push(VarGroup { vars, data });
         i += 2;
     }

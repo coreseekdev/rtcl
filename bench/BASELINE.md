@@ -42,3 +42,19 @@ list_ops                  7         42     6.00        0.98x
 proc_fib                  8         41     5.12        1.83x
 string_build              5          9     1.80        0.89x
 var_incr                 41         98     2.39        2.80x
+
+# ---------------------------------------------------------------------------
+# bench — 74f9449 2026-10-03, after the A-series architecture batch
+# (A1 var fast paths, A3 zero-copy list reads, A4 in-place mutation,
+# A5 loop-body memo + call-proc overhead, A2 for-inline + return
+# -level 0 semantics).  for now compiles inline like tclsh: the
+# per-iteration ExprParser run is gone.
+# Linux 7.0.0-34-generic x86_64, tclsh 8.6.17, reps=5
+
+case               tclsh_ms    rtcl_ms    ratio
+arith_loop               33         53      1.6
+dict_ops                  5          7      1.4
+list_ops                  5          8      1.6
+proc_fib                  5         27      5.4
+string_build              3          4      1.3
+var_incr                 41         44      1.1

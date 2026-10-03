@@ -1,0 +1,3 @@
+set x [
+    nosuchcmd a
+]

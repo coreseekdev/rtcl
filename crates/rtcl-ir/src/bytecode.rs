@@ -169,6 +169,16 @@ impl ByteCode {
         idx
     }
 
+    /// Roll emitted instructions back to `len` (a previously observed
+    /// `ops().len()`).  The expression compiler emits speculatively and can
+    /// fail mid-expression, leaving orphan stack pushes behind — harmless
+    /// at unit level (only the final stack value is read) but fatal when
+    /// the same expression compiles inline inside a word.
+    pub fn truncate_ops(&mut self, len: usize) {
+        self.ops.truncate(len);
+        self.line_map.truncate(len);
+    }
+
     /// Patch the operand of a jump instruction at `idx`.
     pub fn patch_jump(&mut self, idx: usize, target: u32) {
         match &mut self.ops[idx] {

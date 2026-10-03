@@ -105,16 +105,22 @@ struct LoopFrame {
 /// owns it (`BeginCmd` site index), and for a `for` loop's next script
 /// that it IS the next region: a `continue` signal raised there escapes
 /// the loop (for-8.2).
+///
+/// `Sub` marks an inlined `[...]` word: not a body (errors inside it are
+/// NOT frameless) — it records which command's word the bracket belongs
+/// to, so an error crossing it defers that command's frame to the top
+/// level (the tree-walk's `eval_word` CommandSub boundary).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Region {
     Body(usize),
     Next(usize),
+    Sub(usize),
 }
 
 impl Region {
     fn site(self) -> usize {
         match self {
-            Region::Body(s) | Region::Next(s) => s,
+            Region::Body(s) | Region::Next(s) | Region::Sub(s) => s,
         }
     }
 }
@@ -184,6 +190,25 @@ fn loop_signal(st: &mut VmState, e: Error) -> Result<()> {
 }
 
 
+/// Deferred frames for the inlined `[...]` regions an error crosses on
+/// its way out of the unit (the tree-walk's `eval_word` CommandSub
+/// boundary): pop the region stack and defer each bracket-owning
+/// command's frame to the top level — body/next regions crossed add
+/// nothing (their constructs log no frames of their own, the err_fresh
+/// suppression), and the outermost bracket's deferral wins, exactly like
+/// nested `err_pending_top` overwrites.
+fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState) {
+    while let Some(region) = st.bodies.last().copied() {
+        st.bodies.pop();
+        if let Region::Sub(site_idx) = region {
+            let site = &code.sites[site_idx];
+            let text = site.text.slice(&code.source);
+            interp.err_pending_top = Some(Rc::from(text));
+            interp.err_line = st.entry_offset + site.line as usize;
+        }
+    }
+}
+
 /// Execute a proc body's compiled bytecode on `interp`.
 ///
 /// Callers gate on [`bytecode_applicable`] and `!code.fallback`; errors
@@ -234,7 +259,6 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, entry_offset: usize) -> Resu
         // the stack discipline leaves on top (`set`/`incr` fast paths and
         // dispatches all push their result).
         let Some(op) = ops.get(st.pc) else { break st.pop_val() };
-        let op = op.clone();
         st.pc += 1;
         if let Err(e) = exec_op(interp, code, &op, &mut st) {
             // Control-flow completions propagate framelessly — except
@@ -261,6 +285,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, entry_offset: usize) -> Resu
                 .last()
                 .is_some_and(|r| r.site() == st.cur_site)
             {
+                unwind_subs(interp, code, &mut st);
                 return Err(e);
             }
             // Everything else appends this command's harness frame —
@@ -277,6 +302,11 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, entry_offset: usize) -> Resu
                 let msg = e.message_text();
                 interp.err_harness_frame(&msg, text, line);
             }
+            // The error then crosses every still-open inlined `[...]`
+            // region: each bracket-owning command defers its frame to the
+            // top level (the tree-walk's CommandSub word boundary), the
+            // outermost deferral winning.
+            unwind_subs(interp, code, &mut st);
             return Err(e);
         }
     };
@@ -384,19 +414,11 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         }
         OpCode::IncrVar(idx, amount) => {
             let name = code.get_const(*idx).unwrap_or("");
-            // Fast path for the success case only; any failure falls back
-            // to the real `incr`, whose error framing (scalar/array
-            // conflicts, missing vars) it owns.
-            let fast = interp
-                .get_var(name)
-                .ok()
-                .and_then(|v| v.as_int())
-                .map(|current| Value::from_int(current + *amount));
-            match fast {
-                Some(new_val) => {
-                    let v = interp.set_var(name, new_val)?;
-                    st.stack.push(Entry::Val(v));
-                }
+            // Fast path for the success case only; any failure (missing
+            // var, non-integer value, overflow, traces, qualified/array
+            // names) falls back to the real `incr`, whose errors it owns.
+            match interp.incr_var_fast(name, *amount) {
+                Some(v) => st.stack.push(Entry::Val(v)),
                 None => {
                     let args = [
                         Value::from_str("incr"),
@@ -525,6 +547,12 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         }
         OpCode::NextMark => {
             st.bodies.push(Region::Next(st.cur_site));
+        }
+        OpCode::SubMark => {
+            st.bodies.push(Region::Sub(st.cur_site));
+        }
+        OpCode::SubEnd => {
+            st.bodies.pop();
         }
         OpCode::Call { cmd_id, argc } => {
             let from = st.stack.len() - *argc as usize;
@@ -745,4 +773,87 @@ fn shift(st: &mut VmState, shl: bool) -> Result<()> {
     let v = crate::types::expr_ops::int_shift(&a, &b, shl)?;
     st.stack.push(Entry::Val(v));
     Ok(())
+}
+
+#[cfg(test)]
+mod sub_inline_tests {
+    use crate::interp::Interp;
+
+    fn ev(script: &str) -> String {
+        let mut interp = Interp::new();
+        interp.eval(script).unwrap().as_str().to_string()
+    }
+
+    #[test]
+    fn test_sub_inline_values() {
+        // Whole-word brackets compile inline (SubMark/SubEnd) — values,
+        // nesting and empties all agree with the tree-walk.
+        assert_eq!(ev("set x [expr {6 * 7}]; set x"), "42");
+        // tclsh: an empty bracket substitutes to the empty command name.
+        assert_eq!(
+            ev("catch {set x [[]]} m; set m"),
+            "invalid command name \"\""
+        );
+        assert_eq!(ev("set x [list]; set x"), "");
+        assert_eq!(
+            ev("proc f n { expr {$n + 1} }; set x [f [f [f 0]]]; set x"),
+            "3"
+        );
+        // The bracket result is the LAST command's value; earlier results
+        // are discarded like any script.
+        assert_eq!(ev("set x [list a; list b]; set x"), "b");
+    }
+
+    #[test]
+    fn test_sub_inline_expr_partial_rollback() {
+        // `1 && 0` makes the expression compiler emit PushInt(1) and THEN
+        // bail on `&&`.  Inline in a word, the orphan would misalign the
+        // stack (invalid command name "1") — the compiler must roll back
+        // to the EvalExpr fallback.
+        assert_eq!(ev("set q [expr {1 && 0}]; set q"), "0");
+        // Tcl logical ops normalise to 1/0.
+        assert_eq!(ev("set q [expr {0 || 7}]; set q"), "1");
+        assert_eq!(ev("set q [expr {1 && 0}]; set q"), "0");
+    }
+
+    #[test]
+    fn test_sub_inline_error_framing() {
+        // An error inside an inlined bracket gets the failing command's
+        // frame plus the deferral of the bracket-owning command — the
+        // tree-walk's CommandSub word boundary.
+        let mut interp = Interp::new();
+        let r = interp.eval("set x [nosuch a]");
+        assert!(r.is_err());
+        let info = interp.err_info.take().unwrap_or_default();
+        assert!(info.contains("\"nosuch a\""), "inner frame in {info}");
+        assert_eq!(interp.err_pending_top.as_deref(), Some("set x [nosuch a]"));
+
+        // Nested: the outermost bracket's deferral wins.
+        let mut interp = Interp::new();
+        let r = interp.eval("set x [string length [nosuch a]]");
+        assert!(r.is_err());
+        assert_eq!(
+            interp.err_pending_top.as_deref(),
+            Some("set x [string length [nosuch a]]")
+        );
+    }
+
+    #[test]
+    fn test_incr_fast_paths() {
+        // incr mutates the int rep in place; the string rendering follows.
+        assert_eq!(ev("set x 5; incr x; set x"), "6");
+        assert_eq!(ev("set x 1000000; incr x 41; set x"), "1000041");
+        // Undefined variable starts at 0 (real incr via fallback).
+        assert_eq!(ev("incr fresh; set fresh"), "1");
+        // Non-integer value: the real incr's error.
+        assert_eq!(
+            ev("set s abc; catch {incr s} m; set m"),
+            "expected integer but got \"abc\""
+        );
+        // Array element: qualified shape, fallback to the real incr.
+        assert_eq!(ev("set a(1) 7; incr a(1) 2; set a(1)"), "9");
+        // Lazy ints still render exactly.
+        assert_eq!(ev("set x [expr {1000000 + 2}]; set x"), "1000002");
+        assert_eq!(ev("set x -5; set x"), "-5");
+    }
 }

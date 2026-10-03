@@ -740,6 +740,42 @@ impl Interp {
         }
     }
 
+    /// `incr` fast path: read-modify-write an integer scalar in one slot
+    /// lookup, mutating the stored value in place when it is unshared
+    /// (tclsh: TclIncrObj on a refcnt==1 object — no allocation, no string
+    /// rendering).  `None` whenever any guard fails — the caller falls
+    /// back to the real `incr`, which owns the exact errors (undefined
+    /// variable, non-integer value, overflow), creation, and trace
+    /// semantics.
+    pub(crate) fn incr_var_fast(&mut self, name: &str, amount: i64) -> Option<Value> {
+        if name.contains("::")
+            || name.contains('(')
+            || !self.var_traces.is_empty()
+            || !self.dead_flat.is_empty()
+        {
+            return None;
+        }
+        let slot = if let Some(frame) = self.frames.last_mut() {
+            if frame.upvars.contains_key(name) || frame.array_locals.contains(name) {
+                return None;
+            }
+            frame.locals.get_mut(name)?
+        } else {
+            if self.current_namespace != "::"
+                || !self.flat_aliases.is_empty()
+                || self.array_globals.contains(name)
+            {
+                return None;
+            }
+            self.globals.get_mut(name)?
+        };
+        let current = slot.as_int()?;
+        // Overflow belongs to the real `incr` (ARITH IOVERFLOW error).
+        let next = current.checked_add(amount)?;
+        slot.set_int_rep(next);
+        Some(slot.clone())
+    }
+
     pub fn unset_var(&mut self, name: &str) -> Result<()> {
         if let Some((array_name, index)) = split_array_ref(name) {
             let base = array_name.to_string();

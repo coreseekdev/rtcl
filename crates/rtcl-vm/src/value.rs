@@ -320,10 +320,11 @@ impl Value {
                 inner: Rc::clone(&ints[n as usize]),
             });
         }
-        let s = format_int(n);
+        // Lazy string (tclsh: an object born with an int rep carries no
+        // string until demanded) — the loop-counter case renders never.
         Value {
             inner: Rc::new(ValueInner {
-                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
+                string: OnceCell::new(),
                 rep: InternalRep::Int(n),
             }),
         }
@@ -331,10 +332,9 @@ impl Value {
 
     /// Create a value from a float
     pub fn from_float(n: f64) -> Self {
-        let s = format_float(n);
         Value {
             inner: Rc::new(ValueInner {
-                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
+                string: OnceCell::new(),
                 rep: InternalRep::Float(n),
             }),
         }
@@ -613,6 +613,15 @@ impl Value {
             InternalRep::List(items) => Some(items),
             _ => None,
         }
+    }
+
+    /// Overwrite the integer rep in place (COW) — the `incr` fast path,
+    /// tclsh's TclIncrObj on a refcnt==1 object: no allocation, and the
+    /// cached string rendering is dropped instead of eagerly rebuilt.
+    pub fn set_int_rep(&mut self, n: i64) {
+        let inner = Rc::make_mut(&mut self.inner);
+        inner.rep = InternalRep::Int(n);
+        inner.string = OnceCell::new(); // invalidate string
     }
 
     /// Do both handles point at the same `ValueInner` allocation?

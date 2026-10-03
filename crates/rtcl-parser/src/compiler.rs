@@ -93,6 +93,7 @@ impl Compiler {
             | OpCode::BitAnd | OpCode::BitOr | OpCode::BitXor | OpCode::BitNot
             | OpCode::Shl | OpCode::Shr
             | OpCode::BeginCmd(_) | OpCode::BodyMark | OpCode::NextMark
+            | OpCode::SubMark | OpCode::SubEnd
             | OpCode::Call { .. } | OpCode::CallExpand { .. }
             | OpCode::DynCall { .. } | OpCode::DynCallExpand { .. }
         ));
@@ -257,6 +258,61 @@ impl Compiler {
         }
     }
 
+    /// Compile a word whose source span is known (`cmd.words[word_idx]`,
+    /// rebased by the current [`Compiler::span_base`]).  This is the entry
+    /// point that inlines `[...]` command substitutions: the bracket's
+    /// script compiles into the unit between `SubMark`/`SubEnd`, exactly
+    /// what tclsh's compiler does (no nested eval per execution).  Only a
+    /// whole-word bracket can inline — the span must locate the content,
+    /// so brackets embedded in concatenations keep `EvalScript`.
+    fn compile_word_spanned(&mut self, word: &Word, line: u32, cmd: &Command, word_idx: usize) {
+        if let Word::CommandSub(script) = word {
+            if self.try_compile_sub(script, cmd, word_idx) {
+                return;
+            }
+        }
+        self.compile_word(word, line);
+    }
+
+    /// Inline a `[script]` word.  Returns false (compiling nothing) when
+    /// the word is not verbatim bracket source — then the caller falls
+    /// back to `PushConst` + `EvalScript`, whose nested `Interp::eval`
+    /// owns the exact semantics (parse errors with their own frames,
+    /// transparent bodies, traces).
+    fn try_compile_sub(&mut self, script: &str, cmd: &Command, word_idx: usize) -> bool {
+        let Some(ws) = cmd.word_srcs.get(word_idx) else {
+            return false;
+        };
+        let abs = SrcSpan { start: ws.start + self.span_base, end: ws.end + self.span_base };
+        let src = abs.slice(&self.source);
+        if !(src.len() >= 2
+            && src.starts_with('[')
+            && src.ends_with(']')
+            && &src[1..src.len() - 1] == script)
+        {
+            return false;
+        }
+        let Ok(commands) = crate::parse(script) else {
+            return false;
+        };
+        let content_start = abs.start + 1;
+        let saved = (self.span_base, self.line_base);
+        self.span_base = content_start;
+        // line_base is inherited unchanged: the tree-walk's nested eval
+        // runs with the enclosing offset still installed, so a command on
+        // the bracket's first line reports the same line either way.
+        self.bytecode.emit(OpCode::SubMark, self.abs_line(cmd));
+        if commands.is_empty() {
+            self.bytecode.emit(OpCode::PushEmpty, self.abs_line(cmd));
+        } else {
+            self.compile_commands(&commands);
+        }
+        self.bytecode.emit(OpCode::SubEnd, self.abs_line(cmd));
+        self.span_base = saved.0;
+        self.line_base = saved.1;
+        true
+    }
+
     // -----------------------------------------------------------------------
     // Tier 1 — control-flow commands (native opcodes, inline bodies)
     // -----------------------------------------------------------------------
@@ -265,7 +321,7 @@ impl Compiler {
     fn compile_set(&mut self, cmd: &Command) {
         let line = self.abs_line(cmd);
         if let Word::Literal(name) = &cmd.words[1] {
-            self.compile_word(&cmd.words[2], line);
+            self.compile_word_spanned(&cmd.words[2], line, cmd, 2);
             let idx = self.bytecode.add_const(name);
             self.bytecode.emit(OpCode::StoreVar(idx), line);
         } else {
@@ -351,7 +407,7 @@ impl Compiler {
         let line = self.abs_line(cmd);
         let mut end_jumps = Vec::new();
         for (expr_idx, body_idx) in &arms {
-            self.compile_expr_word(&cmd.words[*expr_idx], line);
+            self.compile_expr_word(&cmd.words[*expr_idx], line, cmd, *expr_idx);
             let false_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
             self.compile_body_inline(&cmd.words[*body_idx], cmd, *body_idx);
             let end_jump = self.bytecode.emit(OpCode::Jump(0), line);
@@ -426,7 +482,7 @@ impl Compiler {
         }
 
         // Compile the test expression
-        self.compile_expr_word(&cmd.words[1], line);
+        self.compile_expr_word(&cmd.words[1], line, cmd, 1);
         let exit_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
 
         // Compile the body inline (pre-checked above)
@@ -510,7 +566,7 @@ impl Compiler {
 
         let condition_pc = self.bytecode.current_offset();
 
-        self.compile_expr_word(&cmd.words[2], line);
+        self.compile_expr_word(&cmd.words[2], line, cmd, 2);
         let exit_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
 
         self.compile_body_inline(&cmd.words[4], cmd, 4);
@@ -553,7 +609,7 @@ impl Compiler {
     fn compile_expr(&mut self, cmd: &Command) {
         if cmd.words.len() == 2 {
             let line = self.abs_line(cmd);
-            self.compile_expr_word(&cmd.words[1], line);
+            self.compile_expr_word(&cmd.words[1], line, cmd, 1);
         } else {
             self.compile_dyncall(cmd);
         }
@@ -659,13 +715,13 @@ impl Compiler {
             self.bytecode.emit(OpCode::ExpandMark, line);
         }
 
-        for word in &cmd.words {
+        for (word_idx, word) in cmd.words.iter().enumerate() {
             match word {
                 Word::Expand(inner) => {
                     self.compile_word(inner, line);
                     self.bytecode.emit(OpCode::ExpandList, line);
                 }
-                _ => self.compile_word(word, line),
+                _ => self.compile_word_spanned(word, line, cmd, word_idx),
             }
         }
         if has_expand {
@@ -688,13 +744,13 @@ impl Compiler {
             self.bytecode.emit(OpCode::ExpandMark, line);
         }
 
-        for word in &cmd.words {
+        for (word_idx, word) in cmd.words.iter().enumerate() {
             match word {
                 Word::Expand(inner) => {
                     self.compile_word(inner, line);
                     self.bytecode.emit(OpCode::ExpandList, line);
                 }
-                _ => self.compile_word(word, line),
+                _ => self.compile_word_spanned(word, line, cmd, word_idx),
             }
         }
         if has_expand {
@@ -793,19 +849,26 @@ impl Compiler {
     /// For `Word::Literal` expressions that contain only variables, integers,
     /// and basic operators, compiles to native comparison/arithmetic opcodes.
     /// Falls back to `PushConst + EvalExpr` for complex expressions.
-    fn compile_expr_word(&mut self, word: &Word, line: u32) {
+    fn compile_expr_word(&mut self, word: &Word, line: u32, cmd: &Command, word_idx: usize) {
         match word {
             Word::Literal(s) => {
-                // Try inline compilation first
+                // Try inline compilation first.  The expression compiler
+                // emits speculatively and can fail mid-expression (`1 && 0`:
+                // PushInt lands, then `&&` is rejected) — roll the unit back
+                // before the fallback, or the orphan value misaligns the
+                // stack (harmless when the expression is a whole unit;
+                // fatal when it compiles inline inside a word).
+                let ops_mark = self.bytecode.ops().len();
                 if crate::expr_compile::try_compile_expr(&mut self.bytecode, s, line) {
                     return;
                 }
+                self.bytecode.truncate_ops(ops_mark);
                 // Fallback: runtime eval
                 self.bytecode.emit_push_const(s, line);
                 self.bytecode.emit(OpCode::EvalExpr, line);
             }
             _ => {
-                self.compile_word(word, line);
+                self.compile_word_spanned(word, line, cmd, word_idx);
                 self.bytecode.emit(OpCode::EvalExpr, line);
             }
         }
@@ -1104,6 +1167,41 @@ mod tests {
         assert_eq!(bc.sites[1].text.slice(&bc.source), "puts $x");
         // Word spans are shared (base 0) and slice against the unit source.
         assert_eq!(bc.sites[0].word_srcs[0].slice(&bc.source), "set");
+    }
+
+    #[test]
+    fn test_compile_sub_inline() {
+        // A whole-word bracket compiles inline: SubMark/SubEnd bracket the
+        // script's own compiled commands, and the inner command's site
+        // points back into the unit source (rebased spans).
+        let src = "set s [expr {6 * 7}]";
+        let bc = Compiler::compile_script(src).unwrap();
+        let ops = bc.ops();
+        assert!(ops.iter().any(|o| matches!(o, OpCode::SubMark)));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::SubEnd)));
+        assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalScript)));
+        let expr_site = bc
+            .sites
+            .iter()
+            .find(|s| s.text.slice(&bc.source) == "expr {6 * 7}")
+            .expect("expr site with unit-resolvable text");
+        assert_eq!(expr_site.line, 1);
+
+        // Multi-line bracket: the inner command keeps its physical line.
+        let src = "set x [\n    nosuch a\n]";
+        let bc = Compiler::compile_script(src).unwrap();
+        let site = bc
+            .sites
+            .iter()
+            .find(|s| s.text.slice(&bc.source) == "nosuch a")
+            .expect("inner site");
+        assert_eq!(site.line, 2);
+
+        // Brackets embedded in a concatenation have no locatable span —
+        // they keep the runtime EvalScript.
+        let bc = Compiler::compile_script("set x a[foo]b").unwrap();
+        assert!(bc.ops().iter().any(|o| matches!(o, OpCode::EvalScript)));
+
     }
 
     #[test]

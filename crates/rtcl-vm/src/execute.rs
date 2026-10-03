@@ -457,6 +457,9 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             // Body-region tracking is the interpreter executor's job.
             OpCode::BodyMark => {}
             OpCode::NextMark => {}
+            // Sub-region framing likewise (see vm_exec's unwind).
+            OpCode::SubMark => {}
+            OpCode::SubEnd => {}
             OpCode::Nop => {}
         }
     }

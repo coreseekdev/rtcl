@@ -58,3 +58,23 @@ list_ops                  5          8      1.6
 proc_fib                  5         27      5.4
 string_build              3          4      1.3
 var_incr                 41         44      1.1
+
+# ---------------------------------------------------------------------------
+# bench — 2026-10-03, B-series: value/literal architecture (lazy from_int,
+# in-place IncrVar single-lookup, inline `[...]` word compilation with
+# SubMark/SubEnd regions + expr partial-emission rollback fix).
+# Same machine, reps=3, taskset -c 0.
+#
+# rtcl now beats tclsh on the loop kernels (arith .8x, var_incr .7x) and
+# sits at parity on string_build.  proc_fib (5x) is the remaining gap:
+# brackets *inside braced exprs* still eval via the runtime expression
+# parser (fib25 with brackets-as-words: 175ms vs 654ms expr-embedded;
+# tclsh 30ms).
+
+case               tclsh_ms    rtcl_ms    ratio
+arith_loop               40         32       .8
+dict_ops                  5          7      1.4
+list_ops                  5          7      1.4
+proc_fib                  5         25      5.0
+string_build              3          3      1.0
+var_incr                 41         29       .7

@@ -472,6 +472,20 @@ pub enum OpCode {
     /// `break` from anywhere in the loop ends it (for-8.1).
     NextMark,
 
+    /// Enters an inlined `[...]` command-substitution region.  The
+    /// bracket's script is compiled inline (no nested eval), and the
+    /// executor tracks the region so an error raised inside it gets the
+    /// word-substitution framing: the failing command's own frame is
+    /// logged, then every command whose word contains the bracket defers
+    /// its frame to the top level (`err_pending_top`) instead of
+    /// appending — exactly what `eval_word`'s CommandSub boundary does in
+    /// the tree-walk.
+    SubMark,
+
+    /// Ends an inlined `[...]` region opened by [`OpCode::SubMark`].  The
+    /// bracket's result is the last command's value, already on the stack.
+    SubEnd,
+
     /// No operation.
     Nop,
 }
@@ -599,6 +613,8 @@ impl fmt::Display for OpCode {
             OpCode::BeginCmd(site) => write!(f, "BEGIN_CMD {}", site),
             OpCode::BodyMark => write!(f, "BODY_MARK"),
             OpCode::NextMark => write!(f, "NEXT_MARK"),
+            OpCode::SubMark => write!(f, "SUB_MARK"),
+            OpCode::SubEnd => write!(f, "SUB_END"),
             OpCode::Nop => write!(f, "NOP"),
         }
     }

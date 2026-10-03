@@ -1,6 +1,6 @@
 # rtcl 工程 Handoff — 多轮修正 → JIT 全任务交接
 
-> 最后更新：2026-10-02（修正轮已收敛 99.9%，JIT 阶段启动）
+> 最后更新：2026-10-03（JIT 推后；主线 = 解释器架构对齐 tclsh 8.6，见 §5）
 > 用途：任一 agent 读本文件即可接管全部剩余工作，无需对话历史。
 
 ## 0. 项目与仓库
@@ -40,7 +40,7 @@
 - **解释器快车道已落地（2026-10-02，`58c2839`..`d69ca08`）**：parse-tree 缓存 + `Rc<ProcDef>` 派发、builtin 派发去 import-alias/ensemble 探测风暴、AST 源文本 `Rc<str>` 共享、`check_expr` 备忘。judge/case 级无回退；数字见 `bench/BASELINE.md` 第二张表。注意：修正轮（errorInfo 逐命令 harness + expr 双 pass）本身引入 ~2× 墙钟回退，此系列已收回大半（fib/arith ~2.3×/2.1×）；剩余差距主因 = 逐命令 harness 与 expr 解释，Phase 3/JIT 路线均绕开。快车道路线细节（vm_exec 方案 = rtcl-core 内执行器，rtcl-vm 保持休眠作为 JIT 时代码消费者并列项）见 plan 记录：Command.text/word_srcs 已 Rc 化，ByteCode 站点表/compile-once 尚未动工。
 - **字节码 VM 已落地（2026-10-03，C5+C6）**：`rtcl-core/src/interp/vm_exec.rs` 执行器成为第二条活路径——(1) C5：命名 proc 在 `proc` 定义点编译一次（`ProcDef.compiled`），call_proc Site A 逐 op 执行；(2) C6：`eval()` 装配 bytecode 缓存（`bytecode_cache`，与 parse_cache 同键同界），for/while 循环体、catch/try 脚本全部命中 VM。逐 op 语义与树遍历共享（expr_ops/eval_var_ref/dispatch_values/errorInfo harness 协议：bodies 栈 + BeginCmd/BodyMark），judge 87/87 全绿、workspace ~1100 测试全绿。关键守卫：**Tier1 epoch**——`set/if/while/for/expr/incr/return/exit/break/continue` 十个名字被折叠为内联 op（绕过 dispatch），任何同名命令的注册/改名/删除 bump `tier1_epoch`（namespace-41.1），不匹配的编译体回退树遍历；fallback 白名单、`RTCL_NO_BYTECODE`、exec traces 同样钉回树遍历。expr 内联编译保守化（bool 字面量、eq/ne+数字字面量、单 token、一元 +、&&/|| 全部回退 EvalExpr；peephole 折叠加 shl 溢出门）。bench：arith 1.62×、fib 1.83×、var_incr 2.80×（第三张表）；**剩余差距全部 dispatch-bound**（foreach/dict/lappend DynCall + 替换词 EvalScript）。
 - **JIT M0 已落地（2026-10-03）**：`crates/rtcl-jit` crate——rtcl-ir `ByteCode` 的第二个消费者。发射器（`emit.rs`，wasm-encoder 0.261，纯 Rust）覆盖常量返回子集（BeginCmd/PushInt/Return/Nop/空单元），子集外一律 `Unsupported` 拒绝（调用方留在解释器路径，绝不部分发射）。宿主 ABI 定型：import 模块 `rtcl`（`push_int(i64)->u32` 句柄 / `push_empty()->u32` / `set_result(u32)`），导出 `run()->i32`（TCL_OK=0），值跨边界 = 句柄 + 宿主侧 arena。round-trip 单测（wasmi 2.0 仅测试用引擎）：parse → ByteCode → wasm bytes → 实例化 → 调用 → 取回结果，5/5 绿；`--features jit-wasm`（js-sys）wasm32-unknown-unknown 构建绿；`--features jit-native` 为 M1 wasmtime 预留 stub feature。
-- **下一阶段 = JIT M1（expr Int 快车道）**，验收见 §5。
+- **下一阶段 = 阶段一：解释器架构对齐 tclsh 8.6（§5 A 系列）**；JIT M1+ 推后（用户裁决 2026-10-03：tclsh 无 JIT，先榨干解释器架构）。
 - 历史裁决：
   - **Rc vs Arc**：保持 Rc（wasm 单线程模型；`2257f20` 的静默回退恰好正确）。多 worker 场景每 worker 一个 Interp，不共享。
   - **Value 类型已统一**：rtcl-core 只是 re-export rtcl-vm，无需合并。
@@ -52,7 +52,38 @@
 
 仍属独立里程碑的 missing-feature 大项（按需启动，不阻塞 JIT）：`binary` 命令、TclOO 深化、`-errorstack`/`-errorline`、跨 proc 错误栈帧定位。
 
-## 5. 待办：JIT（修正收敛后启动）
+## 5. 阶段一（当前主线）：解释器架构对齐 tclsh 8.6（2026-10-03 起）
+
+**用户裁决：JIT 推后** —— tclsh 本身并无 JIT，却比 rtcl 快 5–11×；先以 tclsh 为参照逐一补齐其解释器架构机制，榨干现有架构后再评估是否引入 JIT。rtcl-jit crate（M0）保留在库中不删除，M1+ 挂起。
+
+### 依据：逐项热点对照（静态剖析 + opt-level A/B 实测）
+
+tclsh 8.6 的性能来自六个机制（.refer/tcl 源码可查），rtcl 现状对照：
+
+| # | tclsh 机制 | tcl 位置 | rtcl 现状 | 差距量级 |
+|---|---|---|---|---|
+| 1 | **proc 局部变量编译期槽位**（INST_LOAD_STK4/STORE_STK4 直索 Vec，无哈希无分配） | tclProc.c InitLocalCache / tclExecute.c | 每次 LoadVar/StoreVar/IncrVar：split_array_ref 扫描 + resolve_loc（**每访问 1–2 次 String 堆分配**，vars.rs:71/75 `name.to_string()`）+ `HashMap<String,Value>` 查找 ×2；LoadLocal/StoreLocal opcode 已定义但从未发射 | fib 5.12×、arith 5.22×、var_incr 2.39× 的主因 |
+| 2 | **Tcl_Obj 引用计数 + refcnt==1 原地变更**（lappend/dict set 均摊 O(1)） | tclListObj.c ListRep / tclDictObj.c | ValueInner 不可变：lappend 每次 4 次容器复制（get_var clone→strict_list→from_list→set_var clone），O(n) per append；dict set 同理（IndexMap 整体 clone） | list_ops 6×、dict_ops 11.25× 的主因 |
+| 3 | **list 内部表示零拷贝读取**（TclListObjGetElements 给指针） | tclListObj.c | `as_list()` 每次调用 `items.clone()` 整体拷贝 Vec（foreach 每次 `interp.eval(body)` 前也拷一遍） | list/foreach 全部路径 |
+| 4 | **循环体编译进同一 bytecode**（foreach/while 的 body 无每迭代查找） | tclCompile.c TclCompileForeachCmd | 循环体走 `interp.eval(body)`：每迭代对 body 全文做 **两次** HashMap 哈希（parse_cache + bytecode_cache，均以整段文本为键） | 所有循环负载 |
+| 5 | **errorInfo 惰性构建**（成功路径零逐命令记账；出错时才从 addr→line 表重建） | tclExecute.c（无 per-cmd hook）/ tclLog.c | VM 每命令执行 BeginCmd：保存/恢复 cur_source/cur_cmd_*（Rc bump ×3+），树遍历路径同 | 全局常数开销 |
+| 6 | **字面量驻留表**（per-interp literal interning，编译期共享 Tcl_Obj） | tclCompile.c TclCreateLiteral | 常量池每次 PushConst 从 pool 索引取 String→重建 Value | 中等 |
+
+附带实测：release profile `opt-level="s"`（体积优先）→ 改 3 后 arith 1.13× / var_incr 1.23× / string_build 1.33×（真实但次要；wasm 主目标体积敏感，暂不改默认，结论记录在此）。
+
+另：rtcl 的 dispatch（DynCall→dispatch_values 7 臂链 + 守卫）每命令一次，tclsh 对已知命令编译为 INST_INVOKE_STK 直呼函数指针 —— Tier1 已折叠 10 个命令，foreach/dict/lappend 等仍走 dispatch（与 #2/#3 叠加后才显著）。
+
+### 工作项（A 系列，judge 门控逐项落地）
+
+- **A1 快赢（先落地）**：VarLoc 去分配化（借用/Rc 化，消每访问 String 堆分配）；IncrVar 单次解析（get+set 合一）；flat_aliases 线性扫改哈希。
+- **A2 结构项（最大头）**：slotted proc frame —— CallFrame 增 `slots: Vec<Slot>`（Own/Link(ArrayElem 或 VarLoc)/Array/Absent）+ 名字↔槽位表；编译器在 compile_proc_body 为纯局部名发射 LoadLocal/StoreLocal；upvar/global/variable/unset/array 写穿槽位保持名字路径一致（tclProc.c 模型）；调用点绑定参数直达槽位。
+- **A3 零拷贝 list**：`as_list_ref() -> Option<&[Value]>` + foreach/lindex/llength/ExpandList 热路径采纳。
+- **A4 原地变更**：InternalRep 容器 Rc 化（`List(Rc<Vec<Value>>)`/`Dict(Rc<..>)`）+ var 槽 take→`Rc::make_mut`→放回（无 trace/upvar 别名时走快路径，否则旧路径）——lappend/dict set 均摊 O(1)。
+- **A5 循环体免哈希**：eval 的单条目指针同一性缓存（同 Value 指针直接命中 bytecode）或循环体编译进单元。
+- **A6（可选）**：BeginCmd 惰性化 —— 成功路径记账移到出错时由 pc→site 表重建（先测 A1–A5 后的占比再决定）。
+- 每项 gate：`cargo test --workspace` 全绿 + judge 87/87 + bench 表更新；A2/A4 动 vars.rs/value.rs 核心语义，必要时逐 judge 文件比对 errorInfo 字节。
+
+## 6. 待办：JIT（**推后**，架构优化榨干后再评估）
 
 目标：rtcl compile Tcl → wasm module → 实例化执行。**预期路径 = wasm32-unknown-unknown + js-sys `new WebAssembly.Module(bytes)` 同步实例化**（<4KB 模块；per-proc 模块足够小）。
 
@@ -81,7 +112,7 @@
 
 Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直接对标）；tclquadcode（Tcl 官方 LLVM JIT 实验，已停滞，其停滞原因 = 语义角落难题集中在 trace/unknown/ensemble，不在代码生成）；CheerpJ。
 
-## 6. 并行 agent 派发模板（code-migration 纪律）
+## 7. 并行 agent 派发模板（code-migration 纪律）
 
 每个并行域的 prompt 必须包含：
 
@@ -109,13 +140,13 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
-## 7. 提交规约
+## 8. 提交规约
 
 - 每轮修正一个 commit，message 格式：`fix: Round N divergence burndown — <主题>`，正文列条目，尾部署名 `Co-Authored-By: Claude <noreply@anthropic.com>`。
 - 提交前必跑：`cargo test --workspace`（全绿）+ `./judge/run.sh`（无回退）。
 - `git push origin HEAD`（master，已配置 ssh）。
 - `.refer/`、`judge/BURNDOWN.md` 以外的新资产都可入库。
 
-## 8. 本文件维护
+## 9. 本文件维护
 
 每完成一轮修正或一个 JIT 里程碑：更新 §3 的数字、§4/§5 的完成状态、补充新裁决。handoff 文件自身入库（`HANDOFF.md` 在仓库根）。

@@ -1,6 +1,6 @@
 //! Procedure call and tail-call optimisation for [`Interp`].
 
-use super::{CallFrame, Interp, ProcDef};
+use super::{CallFrame, Interp, ProcDef, VarMap, VarSet};
 use crate::error::{Error, Result};
 use crate::value::Value;
 
@@ -9,9 +9,6 @@ use std::collections::HashMap;
 
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeMap as HashMap;
-
-#[cfg(not(feature = "embedded"))]
-use std::collections::HashSet;
 
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeSet as HashSet;
@@ -77,9 +74,9 @@ impl Interp {
                 f
             }
             None => CallFrame {
-                locals: HashMap::new(),
-                array_locals: HashSet::new(),
-                upvars: HashMap::new(),
+                locals: VarMap::default(),
+                array_locals: VarSet::default(),
+                upvars: VarMap::default(),
                 ns: None,
                 call_ns: None,
                 local_procs: Vec::new(),

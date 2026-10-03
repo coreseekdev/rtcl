@@ -6,7 +6,6 @@ use crate::error::{Error, Result};
 use crate::interp::Interp;
 use crate::value::Value;
 
-use super::dict::demote_level0_return;
 use super::list::{set_error_code, strict_list, strict_list_cow, tcl_err};
 
 pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -39,7 +38,7 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if let Some(off) = body_offset {
             interp.line_offset = off;
         }
-        let r = demote_level0_return(interp.eval_body_value(body));
+        let r = interp.eval_body_value(body);
         interp.line_offset = saved_offset;
         match r {
             Ok(_) => {}
@@ -74,13 +73,13 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let next = &args[3];
     let body = &args[4];
 
-    demote_level0_return(interp.eval(start))?;
+    interp.eval(start)?;
 
     loop {
         let cond = interp.eval_expr(test)?;
         if !crate::types::expr_funcs::strict_bool(&cond)? { break; }
 
-        match demote_level0_return(interp.eval_body_value(body)) {
+        match interp.eval_body_value(body) {
             Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
@@ -99,7 +98,7 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
 
-        match demote_level0_return(interp.eval_body_value(next)) {
+        match interp.eval_body_value(next) {
             Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
@@ -201,7 +200,7 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
             }
         }
-        match demote_level0_return(interp.eval_body_value(body)) {
+        match interp.eval_body_value(body) {
             Ok(_) => {}
             Err(e) => {
                 if e.is_break() {
@@ -608,14 +607,21 @@ mod tests {
 
     #[test]
     fn test_return_level0_in_for_body_is_normal() {
-        // `return -level 0` completes the body script normally: the loop
-        // keeps iterating (tclsh loops forever on `while {1} {return -level 0}`).
+        // `return -level 0` completes as an ordinary command: the body
+        // script keeps running past it and the loop keeps iterating
+        // (tclsh-probed: trailing commands still execute; tclsh loops
+        // forever on `while {1} {return -level 0; puts}`).
         let mut interp = Interp::new();
         let r = interp.eval(r#"
             proc p {} { for {set i 0} {$i<3} {incr i} { return -level 0 $i } ; list after $i }
             p
         "#).unwrap();
         assert_eq!(r.as_str(), "after 3");
+        let r = interp.eval(r#"
+            proc q {} { set L {}; for {set i 0} {$i<3} {incr i} { return -level 0 $i; lappend L $i }; set L }
+            q
+        "#).unwrap();
+        assert_eq!(r.as_str(), "0 1 2");
     }
 
     #[test]

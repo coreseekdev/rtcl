@@ -8,7 +8,6 @@ use crate::error::{Error, Result};
 use crate::interp::Interp;
 use crate::value::{is_tcl_space, Value};
 
-use super::dict::demote_level0_return;
 
 /// Build an error whose message survives `catch` verbatim (the interp
 /// stores `e.to_string()` into the result variable, and `Error::Msg`
@@ -523,9 +522,10 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.set_var(var, value)?;
             }
         }
-        // A `return -level 0 $v` in the body ends the body script with
-        // $v: lmap still collects it and keeps iterating (lmap-1.2a).
-        match demote_level0_return(interp.eval_body_value(body)) {
+        // A `return -level 0 $v` completes as an ordinary command
+        // whose result is $v: lmap collects it and keeps iterating
+        // (lmap-1.2a).
+        match interp.eval_body_value(body) {
             Ok(v) => collected.push(v),
             Err(e) => {
                 if e.is_break() { break; }

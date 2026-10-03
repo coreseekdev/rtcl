@@ -464,6 +464,14 @@ pub enum OpCode {
     /// condition errors append the construct's frame.
     BodyMark,
 
+    /// Enters a `for` loop's *next* script region.  Like [`OpCode::BodyMark`]
+    /// this opens a body region of the current command (its errors
+    /// propagate frameless), but the region is marked "next": a `continue`
+    /// signal raised inside it escapes the loop entirely (for-8.2 — tclsh's
+    /// compiled next script has no in-loop continue target), while a
+    /// `break` from anywhere in the loop ends it (for-8.1).
+    NextMark,
+
     /// No operation.
     Nop,
 }
@@ -590,6 +598,7 @@ impl fmt::Display for OpCode {
             OpCode::Line(n) => write!(f, "LINE {}", n),
             OpCode::BeginCmd(site) => write!(f, "BEGIN_CMD {}", site),
             OpCode::BodyMark => write!(f, "BODY_MARK"),
+            OpCode::NextMark => write!(f, "NEXT_MARK"),
             OpCode::Nop => write!(f, "NOP"),
         }
     }

@@ -362,7 +362,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             for (k, v) in &entries {
                 interp.set_var(&key_var, Value::from_str(k))?;
                 interp.set_var(&val_var, v.clone())?;
-                match demote_level0_return(interp.eval_body_value(body)) {
+                match interp.eval_body_value(body) {
                     Ok(r) => result = r,
                     Err(e) => {
                         if e.is_break() {
@@ -563,7 +563,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.set_var(k, v.clone())?;
             }
 
-            let result = demote_level0_return(interp.eval_body_value(body));
+            let result = interp.eval_body_value(body);
             // tclsh leaves the mapped variables in place on error and does
             // not write the dict back; break/continue still write back.
             match &result {
@@ -654,7 +654,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     for (k, v) in &entries {
                         interp.set_var(&key_var, Value::from_str(k))?;
                         interp.set_var(&val_var, v.clone())?;
-                        match demote_level0_return(interp.eval_body_value(script)) {
+                        match interp.eval_body_value(script) {
                             Ok(r) => {
                                 // tclsh requires a boolean body result
                                 // ("expected boolean value but got ...").
@@ -710,7 +710,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             for (k, v) in &entries {
                 interp.set_var(&key_var, Value::from_str(k))?;
                 interp.set_var(&val_var, v.clone())?;
-                match demote_level0_return(interp.eval_body_value(body)) {
+                match interp.eval_body_value(body) {
                     Ok(new_v) => {
                         result_entries.insert(k.clone(), new_v);
                     }
@@ -863,23 +863,6 @@ fn dict_unset_nested(entries: &mut DictMap, keys: &[&str]) -> Result<()> {
         entries.insert(key.to_string(), Value::from_dict_cached(sub_entries));
     }
     Ok(())
-}
-
-/// A `return -level 0` ends the current *script* with its value: command
-/// bodies see a normal completion carrying that value (tclsh converts
-/// TCL_RETURN with level 0 at the script boundary; cmd_return encodes
-/// explicit `-level 0` as level −1). Plain `return` and `-level N ≥ 1`
-/// keep propagating.
-pub(crate) fn demote_level0_return(r: Result<Value>) -> Result<Value> {
-    match r {
-        Err(Error::ControlFlow {
-            kind: crate::error::ControlFlow::Return,
-            level: -1,
-            value,
-            ..
-        }) => Ok(value.unwrap_or_default()),
-        other => other,
-    }
 }
 
 /// `tcl::dict::<sub>` ensemble commands: dispatch to `dict <sub> ...`
@@ -1281,6 +1264,11 @@ mod tests {
         // return -level 0 inside a caught script is a normal completion
         let r = interp.eval("catch {return -level 0 xyz} m; set m").unwrap();
         assert_eq!(r.as_str(), "xyz");
+        // ...and the script CONTINUES past it (tclsh-probed)
+        let r = interp
+            .eval("set L {}; catch {return -level 0 xyz; lappend L tail}; set L")
+            .unwrap();
+        assert_eq!(r.as_str(), "tail");
     }
 
     #[test]

@@ -50,6 +50,12 @@ pub struct Compiler {
     /// Line number of the current text's first line (1-based Tcl lines;
     /// 0 at top level).  Absolute line = `line_base + command.line`.
     line_base: u32,
+    /// True while compiling the *next* script region of an inline `for`:
+    /// a literal `continue` there escapes the loop (for-8.2), so it
+    /// compiles to `LoopExit` + `Continue` instead of the plain op.  Saved
+    /// and cleared around nested loop compilations — their bodies' breaks
+    /// and continues belong to the nested loop.
+    in_next: bool,
 }
 
 impl Compiler {
@@ -63,6 +69,7 @@ impl Compiler {
             source: Rc::clone(&source),
             span_base: 0,
             line_base: 0,
+            in_next: false,
         };
         c.compile_commands(commands);
         c.bytecode.peephole();
@@ -85,7 +92,7 @@ impl Compiler {
             | OpCode::Not
             | OpCode::BitAnd | OpCode::BitOr | OpCode::BitXor | OpCode::BitNot
             | OpCode::Shl | OpCode::Shr
-            | OpCode::BeginCmd(_) | OpCode::BodyMark
+            | OpCode::BeginCmd(_) | OpCode::BodyMark | OpCode::NextMark
             | OpCode::Call { .. } | OpCode::CallExpand { .. }
             | OpCode::DynCall { .. } | OpCode::DynCallExpand { .. }
         ));
@@ -162,10 +169,7 @@ impl Compiler {
                 "set" if cmd.words.len() == 2 => return self.compile_set_get(cmd),
                 "if" => return self.compile_if(cmd),
                 "while" if cmd.words.len() == 3 => return self.compile_while(cmd),
-                // `for` is not folded: its compiled loop would send a
-                // `continue` in the *next* script back to the next step,
-                // while tclsh's (and rtcl's cmd_for's) next-script continue
-                // escapes the loop entirely (for-8.2..for-8.12).
+                "for" if cmd.words.len() == 5 => return self.compile_for(cmd),
                 "expr" => return self.compile_expr(cmd),
                 "incr" if cmd.words.len() >= 2 => return self.compile_incr(cmd),
                 "break" if cmd.words.len() == 1 => {
@@ -173,6 +177,13 @@ impl Compiler {
                     return;
                 }
                 "continue" if cmd.words.len() == 1 => {
+                    // Inside a `for` next script the continue ESCAPES the
+                    // loop (for-8.2): leave this loop's context first, then
+                    // hand the signal to the enclosing loop — a direct jump
+                    // when one exists, the propagated error otherwise.
+                    if self.in_next {
+                        self.bytecode.emit(OpCode::LoopExit, line);
+                    }
                     self.bytecode.emit(OpCode::Continue, line);
                     return;
                 }
@@ -388,6 +399,10 @@ impl Compiler {
         if !self.body_inlinable(cmd, 2) || !matches!(cmd.words[1], Word::Literal(_)) {
             return self.compile_dyncall(cmd);
         }
+        // A loop owns the breaks/continues of its own scripts: clear any
+        // enclosing next-region context for the whole compilation.
+        let saved_next = self.in_next;
+        self.in_next = false;
         let line = self.abs_line(cmd);
 
         // Emit LoopEnter (targets patched later)
@@ -437,7 +452,96 @@ impl Compiler {
             self.bytecode.patch_jump(patch_idx, after_loop);
         }
 
+        self.in_next = saved_next;
+
         // While returns empty on normal exit
+        self.bytecode.emit(OpCode::PushEmpty, line);
+    }
+
+    /// `for start test next body`
+    ///
+    /// Compiled inline like `while` when start/next/body are inlinable
+    /// braced scripts and the test is a literal (same verbatim/parse
+    /// gates) — tclsh compiles `for` inline the same way, and the
+    /// dispatched `cmd_for` re-parses the test through the expression
+    /// parser on *every* iteration, which is exactly the gap this closes.
+    ///
+    /// Layout:
+    ///
+    /// ```text
+    ///   <start> ; Pop
+    ///   LoopEnter { cont: NEXT, brk: END }
+    /// COND:  <test> ; JumpFalse END        ; not-taken opens the body region
+    ///   <body> ; Pop ; Jump NEXT
+    /// NEXT:  NextMark                        ; opens the NEXT region
+    ///   <next> ; Pop ; Jump COND
+    /// END:   LoopExit ; PushEmpty
+    /// ```
+    ///
+    /// `continue` from the body jumps to NEXT (cont); from the next script
+    /// it escapes (compiled `LoopExit`+`Continue` there, and the executor's
+    /// loop-signal routing reads the NextMark region for signal-form
+    /// continues, e.g. `eval continue`); `break` from either ends the loop.
+    fn compile_for(&mut self, cmd: &Command) {
+        if !matches!(cmd.words[2], Word::Literal(_))
+            || !self.body_inlinable(cmd, 1)
+            || !self.body_inlinable(cmd, 3)
+            || !self.body_inlinable(cmd, 4)
+        {
+            return self.compile_dyncall(cmd);
+        }
+        // A loop owns the breaks/continues of its own scripts: clear any
+        // enclosing next-region context for the whole compilation.
+        let saved_next = self.in_next;
+        self.in_next = false;
+        let line = self.abs_line(cmd);
+
+        // The start script runs before the loop context exists — its own
+        // break/continue belong to the *enclosing* loop.
+        self.compile_body_inline(&cmd.words[1], cmd, 1);
+        self.bytecode.emit(OpCode::Pop, line);
+
+        let loop_enter = self.bytecode.emit(OpCode::LoopEnter { cont: 0, brk: 0 }, line);
+        self.loops.push(LoopCtx {
+            enter_idx: loop_enter,
+            continue_target: 0,
+            break_patches: Vec::new(),
+        });
+
+        let condition_pc = self.bytecode.current_offset();
+
+        self.compile_expr_word(&cmd.words[2], line);
+        let exit_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
+
+        self.compile_body_inline(&cmd.words[4], cmd, 4);
+        self.bytecode.emit(OpCode::Pop, line);
+        let body_end_jump = self.bytecode.emit(OpCode::Jump(0), line);
+
+        let next_pc = self.bytecode.current_offset();
+        if let Some(lctx) = self.loops.last_mut() {
+            lctx.continue_target = next_pc;
+        }
+        self.bytecode.emit(OpCode::NextMark, line);
+        self.in_next = true;
+        self.compile_body_inline(&cmd.words[3], cmd, 3);
+        self.in_next = false;
+        self.bytecode.emit(OpCode::Pop, line);
+        self.bytecode.emit(OpCode::Jump(condition_pc), line);
+
+        let end_pc = self.bytecode.current_offset();
+        self.bytecode.patch_jump(exit_jump, end_pc);
+        self.bytecode.patch_jump(body_end_jump, next_pc);
+        self.bytecode.patch_loop(loop_enter, next_pc, end_pc);
+        self.bytecode.emit(OpCode::LoopExit, line);
+
+        let lctx = self.loops.pop().unwrap();
+        for patch_idx in lctx.break_patches {
+            self.bytecode.patch_jump(patch_idx, end_pc);
+        }
+
+        self.in_next = saved_next;
+
+        // Tcl: loop commands always return the empty string
         self.bytecode.emit(OpCode::PushEmpty, line);
     }
 
@@ -754,15 +858,35 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_for_dyncall() {
-        // `for` is deliberately not folded: its compiled loop would send a
-        // `continue` in the next script back to the next step, while tclsh's
-        // next-script continue escapes the loop (for-8.2..for-8.12).  The
-        // real cmd_for runs via DynCall instead.
+    fn test_compile_for_inline() {
+        // `for` compiles inline like `while` (tclsh does the same): the
+        // test expression becomes native ops (no per-iteration ExprParser
+        // run), the next script opens a NEXT_MARK region so a `continue`
+        // there escapes the loop (for-8.2), and a literal continue inside
+        // that region emits LoopExit+Continue.
         let bc = Compiler::compile_script("for {set i 0} {$i < 10} {incr i} { set x $i }").unwrap();
         let ops = bc.ops();
-        assert!(!ops.iter().any(|o| matches!(o, OpCode::LoopEnter { .. })));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::DynCall { .. })));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::LoopEnter { .. })));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::LoopExit)));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::NextMark)));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::IncrVar(_, 1))));
+        // Condition compiled inline — no EvalExpr fallback.
+        assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
+        assert!(!ops.iter().any(|o| matches!(o, OpCode::DynCall { .. })));
+
+        // Non-inlinable shapes (unbraced next script) still dispatch the
+        // real cmd_for.
+        let bc = Compiler::compile_script("for {set i 0} {$i < 10} $next { set x $i }").unwrap();
+        assert!(bc.ops().iter().any(|o| matches!(o, OpCode::DynCall { .. })));
+
+        // A literal `continue` in the next script leaves the loop first.
+        let bc = Compiler::compile_script("for {set i 0} {$i < 10} {continue} { set x $i }").unwrap();
+        let ops = bc.ops();
+        let cont = ops.iter().position(|o| matches!(o, OpCode::Continue)).unwrap();
+        assert!(
+            ops[..cont].iter().any(|o| matches!(o, OpCode::LoopExit)),
+            "continue in a next script must be preceded by LoopExit"
+        );
     }
 
     #[test]

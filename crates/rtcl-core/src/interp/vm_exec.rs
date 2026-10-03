@@ -101,6 +101,24 @@ struct LoopFrame {
     stack_len: usize,
 }
 
+/// One inline body region currently executing — which command's construct
+/// owns it (`BeginCmd` site index), and for a `for` loop's next script
+/// that it IS the next region: a `continue` signal raised there escapes
+/// the loop (for-8.2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Region {
+    Body(usize),
+    Next(usize),
+}
+
+impl Region {
+    fn site(self) -> usize {
+        match self {
+            Region::Body(s) | Region::Next(s) => s,
+        }
+    }
+}
+
 /// Route a break/continue that surfaced as an *error* (it crossed a
 /// dispatched command or nested-script boundary — the compiled Break /
 /// Continue ops jump directly) to the innermost inline loop, mirroring
@@ -114,6 +132,48 @@ fn loop_signal(st: &mut VmState, e: Error) -> Result<()> {
     let is_brk = e.is_break();
     match st.loops.last() {
         Some(l) => {
+            // A continue raised inside this loop's NEXT region escapes the
+            // loop entirely (for-8.2: the compiled next script has no
+            // in-loop continue target, so `eval continue` there unwinds
+            // the `for` too).  A break from anywhere in the loop — body
+            // or next — ends it (for-8.1).
+            if !is_brk
+                && st.bodies[l.bodies_len..]
+                    .iter()
+                    .any(|r| matches!(r, Region::Next(_)))
+            {
+                st.bodies.truncate(l.bodies_len);
+                let stack_len = l.stack_len;
+                st.stack.truncate(stack_len);
+                st.loops.pop();
+                // The escaped signal surfaces where the `for` command
+                // itself sits (for-8.10: an inner for's next script runs
+                // `eval continue`; the OUTER loop continues from its own
+                // step).  Hand it to the enclosing inline loop — unless
+                // the for sat in *that* loop's next region, which has no
+                // continue target either: escape it too, and so on until
+                // a body region or the unit boundary.
+                loop {
+                    match st.loops.last() {
+                        Some(enc) => {
+                            let in_next = st.bodies[enc.bodies_len..]
+                                .iter()
+                                .any(|r| matches!(r, Region::Next(_)));
+                            let (bodies_len, stack_len, cont) =
+                                (enc.bodies_len, enc.stack_len, enc.cont);
+                            st.bodies.truncate(bodies_len);
+                            st.stack.truncate(stack_len);
+                            if in_next {
+                                st.loops.pop();
+                                continue;
+                            }
+                            st.pc = cont as usize;
+                            return Ok(());
+                        }
+                        None => return Err(e),
+                    }
+                }
+            }
             st.bodies.truncate(l.bodies_len);
             st.stack.truncate(l.stack_len);
             st.pc = if is_brk { l.brk as usize } else { l.cont as usize };
@@ -194,8 +254,13 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, entry_offset: usize) -> Resu
             }
             // A body error of the current command's own inline
             // construct propagates frameless (tree-walk: the
-            // construct's err_fresh suppression).
-            if st.bodies.last() == Some(&st.cur_site) {
+            // construct's err_fresh suppression).  A `for` next script
+            // is one of those bodies too.
+            if st
+                .bodies
+                .last()
+                .is_some_and(|r| r.site() == st.cur_site)
+            {
                 return Err(e);
             }
             // Everything else appends this command's harness frame —
@@ -224,10 +289,10 @@ struct VmState {
     stack: Vec<Entry>,
     loops: Vec<LoopFrame>,
     /// Body regions currently executing, as the `BeginCmd` site index of
-    /// the construct that owns each (`if` arm / `while` body).  Pushed by
-    /// not-taken condition jumps and `BodyMark`, popped by the plain
-    /// `Jump` that ends every body.
-    bodies: Vec<usize>,
+    /// the construct that owns each (`if` arm / `while` body / `for` next
+    /// script).  Pushed by not-taken condition jumps and the region marks,
+    /// popped by the plain `Jump` that ends every body.
+    bodies: Vec<Region>,
     /// Stack base of the current command's `{*}` expansion region.
     expand_base: usize,
     /// Site index of the `BeginCmd` most recently executed.
@@ -386,7 +451,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             } else {
                 // Not taken → entering an inline body of the current
                 // command's construct.
-                st.bodies.push(st.cur_site);
+                st.bodies.push(Region::Body(st.cur_site));
             }
         }
         OpCode::JumpFalse(t) => {
@@ -394,7 +459,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             if !crate::types::expr_funcs::strict_bool(&v)? {
                 st.pc = *t as usize;
             } else {
-                st.bodies.push(st.cur_site);
+                st.bodies.push(Region::Body(st.cur_site));
             }
         }
 
@@ -456,7 +521,10 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             st.cur_site = *site_idx as usize;
         }
         OpCode::BodyMark => {
-            st.bodies.push(st.cur_site);
+            st.bodies.push(Region::Body(st.cur_site));
+        }
+        OpCode::NextMark => {
+            st.bodies.push(Region::Next(st.cur_site));
         }
         OpCode::Call { cmd_id, argc } => {
             let from = st.stack.len() - *argc as usize;

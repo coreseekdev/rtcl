@@ -19,9 +19,11 @@ mod call;
 mod vm_bridge;
 mod vm_exec;
 mod util;
+mod varmap;
 
 // Re-export utilities so command modules can reach them via `super::super::glob_match`
 pub(crate) use util::{split_array_ref, glob_match};
+pub(crate) use varmap::{VarMap, VarSet};
 
 use crate::command::{CommandFunc, CommandCategory, CommandMeta};
 use crate::value::Value;
@@ -32,9 +34,6 @@ use std::collections::HashMap;
 
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeMap as HashMap;
-
-#[cfg(not(feature = "embedded"))]
-use std::collections::HashSet;
 
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeSet as HashSet;
@@ -104,10 +103,10 @@ pub(crate) struct EnsembleDef {
 /// A procedure call frame.
 #[derive(Debug, Clone)]
 pub(crate) struct CallFrame {
-    pub locals: HashMap<String, Value>,
+    pub locals: VarMap<Value>,
     /// Names in `locals` that are arrays (scalar/array distinction).
-    pub array_locals: HashSet<String>,
-    pub upvars: HashMap<String, UpvarLink>,
+    pub array_locals: VarSet,
+    pub upvars: VarMap<UpvarLink>,
     /// Namespace the running proc was defined in (tclsh: `namespace current`
     /// inside the proc resolves here).  Variable *reads* do NOT fall back to
     /// this namespace — only locals, upvar/`variable` links, and `::`-qualified
@@ -205,9 +204,9 @@ pub(crate) struct ExecStepCtx {
 /// Tcl interpreter.
 pub struct Interp {
     /// Variables (global scope).
-    pub(crate) globals: HashMap<String, Value>,
+    pub(crate) globals: VarMap<Value>,
     /// Names in `globals` that are arrays (scalar/array distinction).
-    pub(crate) array_globals: HashSet<String>,
+    pub(crate) array_globals: VarSet,
     /// Procedure call frames (empty at global level).
     pub(crate) frames: Vec<CallFrame>,
     /// Recycled call frames: proc return pushes its (emptied) frame here
@@ -463,8 +462,8 @@ impl Interp {
     /// Create a new interpreter.
     pub fn new() -> Self {
         let mut interp = Interp {
-            globals: HashMap::new(),
-            array_globals: HashSet::new(),
+            globals: VarMap::default(),
+            array_globals: VarSet::default(),
             array_searches: HashMap::new(),
             array_stamps: HashMap::new(),
             array_generations: HashMap::new(),
@@ -648,7 +647,7 @@ impl Interp {
 
     /// Reference to variable storage for the current scope (for iteration).
     /// Does NOT follow upvar links.
-    pub(crate) fn scope_vars(&self) -> &HashMap<String, Value> {
+    pub(crate) fn scope_vars(&self) -> &VarMap<Value> {
         if let Some(frame) = self.frames.last() {
             &frame.locals
         } else {

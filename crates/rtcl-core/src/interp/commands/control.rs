@@ -571,16 +571,47 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         error_code = Some(v.as_str().to_string());
     }
 
+    // `return -level 0 ?value?` with completion code ok is an ordinary
+    // command completion (tclsh: TclProcessReturn at level 0 / code TCL_OK
+    // just stores the value as the *command's* result — the current script
+    // keeps running; probed: trailing commands still execute, `catch` sees
+    // code 0).  -errorinfo/-errorcode are inert at code ok.  Error /
+    // break / continue codes with `-level 0` still fire below.
+    if level == 0 && code.unwrap_or(0) == 0 {
+        return Ok(result.unwrap_or_default());
+    }
+
     match code {
-        Some(c) => Err(Error::return_with_options(c, result, error_info, error_code)),
+        Some(c) => {
+            // `-level 0` fires the completion right here (tclsh:
+            // TclProcessReturn at level 0 materializes the code
+            // immediately — probed: `catch {return -level 0 -code
+            // error x}` reports 1, a `-code break` in a loop body ends
+            // the loop; the SAME codes without -level 0 stay deferred
+            // Return completions that only convert at proc boundaries).
+            // `-code return` and integer user codes pass through
+            // unchanged (catch reports 2 / the code).
+            if level == 0 {
+                return Err(match c {
+                    1 => Error::ControlFlow {
+                        kind: crate::error::ControlFlow::Error,
+                        value: result,
+                        level: 1,
+                        error_info,
+                        error_code,
+                    },
+                    3 => Error::brk(),
+                    4 => Error::cont(),
+                    _ => Error::return_with_options(c, result, error_info, error_code),
+                });
+            }
+            Err(Error::return_with_options(c, result, error_info, error_code))
+        }
         None => {
             if error_info.is_some() || error_code.is_some() {
                 Err(Error::return_with_options(0, result, error_info, error_code))
             } else if level_given {
-                // Explicit -level: encoded as -(N+1) so script boundaries
-                // can distinguish `return -level 0` (ends the current
-                // script, level −1) from a plain return (level 0 = leave
-                // the enclosing proc).
+                // Explicit -level (>= 1 here): encoded as -(N+1).
                 Err(Error::ret_level(level, result))
             } else {
                 Err(Error::ret(result))
@@ -620,17 +651,7 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let result_var = if args.len() > 2 { Some(args[2].as_str()) } else { None };
     let opts_var = if args.len() > 3 { Some(args[3].as_str()) } else { None };
 
-    // `return -level 0` (encoded level −1) ends the caught *script*
-    // itself: catch sees a normal completion carrying the value.
-    let caught = match interp.eval(script) {
-        Err(Error::ControlFlow {
-            kind: crate::error::ControlFlow::Return,
-            level: -1,
-            value,
-            ..
-        }) => Ok(value.unwrap_or_default()),
-        other => other,
-    };
+    let caught = interp.eval(script);
     match caught {
         Ok(v) => {
             if let Some(var) = result_var {
@@ -658,7 +679,16 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 };
                 interp.set_var(var, payload)?;
             }
-            let code = if e.is_return() || is_tc { 2 }
+            let code = if is_tc { 2 }
+            else if e.is_return() {
+                // A user integer completion code (`return -code 7`) passes
+                // through as the catch code (tclsh); the standard codes
+                // stay deferred completions reporting 2 until a proc
+                // boundary materializes them.
+                if let Error::ControlFlow { level, .. } = &e {
+                    if *level > 4 { *level as i64 } else { 2 }
+                } else { 2 }
+            }
             else if e.is_break() { 3 }
             else if e.is_continue() { 4 }
             else { 1 };

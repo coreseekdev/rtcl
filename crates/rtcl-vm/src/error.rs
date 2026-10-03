@@ -184,9 +184,10 @@ impl Error {
         }
     }
 
-    /// Create a `return -level N`: negative encodes the explicit level as
-    /// −(N+1) so it cannot collide with the -code completion codes and so
-    /// −1 (i.e. `-level 0`) can be recognized by script boundaries.
+    /// Create a `return -level N` (N ≥ 1 — level 0 with code ok completes
+    /// as an ordinary command in cmd_return and never raises): negative
+    /// encodes the explicit level as −(N+1) so it cannot collide with the
+    /// -code completion codes.
     pub fn ret_level(level: i32, value: Option<Value>) -> Self {
         Error::ControlFlow {
             kind: ControlFlow::Return,

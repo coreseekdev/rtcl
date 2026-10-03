@@ -525,7 +525,9 @@ impl Compiler {
     /// Layout:
     ///
     /// ```text
-    ///   <start> ; Pop
+    ///   ExprMark                       ; opens the START harness region
+    ///   <start>                        ; errors append the for's frame
+    ///   SubEnd                         ; …and restore the for as current
     ///   LoopEnter { cont: NEXT, brk: END }
     /// COND:  <test> ; JumpFalse END        ; not-taken opens the body region
     ///   <body> ; Pop ; Jump NEXT
@@ -533,6 +535,13 @@ impl Compiler {
     ///   <next> ; Pop ; Jump COND
     /// END:   LoopExit ; PushEmpty
     /// ```
+    ///
+    /// The start script sits in a harness region (ExprMark) because
+    /// cmd_for evaluates it with a plain eval whose errors cross the
+    /// command's boundary as an APPENDED frame (`for {nosuch} {1} {} {}`
+    /// logs the `for …` frame after `nosuch`'s), and the condition ops
+    /// after it must attribute to the `for` itself, not to the start's
+    /// last command.
     ///
     /// `continue` from the body jumps to NEXT (cont); from the next script
     /// it escapes (compiled `LoopExit`+`Continue` there, and the executor's
@@ -553,8 +562,13 @@ impl Compiler {
         let line = self.abs_line(cmd);
 
         // The start script runs before the loop context exists — its own
-        // break/continue belong to the *enclosing* loop.
+        // break/continue belong to the *enclosing* loop — inside a harness
+        // region: its errors append the `for`'s frame on the way out
+        // (cmd_for's plain start-eval boundary) and its close restores the
+        // `for` as the current command for the condition that follows.
+        self.bytecode.emit(OpCode::ExprMark, line);
         self.compile_body_inline(&cmd.words[1], cmd, 1);
+        self.bytecode.emit(OpCode::SubEnd, line);
         self.bytecode.emit(OpCode::Pop, line);
 
         let loop_enter = self.bytecode.emit(OpCode::LoopEnter { cont: 0, brk: 0 }, line);

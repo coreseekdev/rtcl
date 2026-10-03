@@ -7,13 +7,36 @@ use crate::value::Value;
 
 use super::list::set_error_code;
 
-/// Evaluate an `if`/`while` body script.  tclsh compiles these constructs
+/// Evaluate an `if` arm body script.  tclsh compiles these constructs
 /// inline: a body error propagates framelessly (F2/N8 — no frame names the
-/// `if`/`while` command itself), so mark the next harness append suppressed.
-fn eval_transparent_body(interp: &mut Interp, script: &str) -> Result<Value> {
+/// `if` command itself), so mark the next harness append suppressed.
+///
+/// The body also gets cmd_while's line rebasing: tclsh compiles against one
+/// absolute line table, so a body command's `(procedure ... line N)` reports
+/// its line in the enclosing script — the arm sits on the `if` command's
+/// line — not within the body text (`if {0} {…} else { nosuch }` on the
+/// proc body's second line reports line 2, not 1).  A body from a variable
+/// keeps the unshifted numbering (origin unknowable).
+fn eval_arm_body(interp: &mut Interp, word_idx: usize, script: &str) -> Result<Value> {
+    let saved_offset = interp.line_offset;
+    let offset = match interp.body_is_verbatim_script(word_idx, script) {
+        Some(extra) => Some(saved_offset + interp.cur_cmd_line.max(1) - 1 + extra),
+        None => None,
+    };
+    if let Some(off) = offset {
+        interp.line_offset = off;
+    }
     let r = interp.eval(script);
-    if r.is_err() {
-        interp.err_fresh = true;
+    interp.line_offset = saved_offset;
+    if let Err(e) = &r {
+        // Only a true error participates in harness-frame suppression —
+        // a control-flow completion (break/continue/return) never reaches
+        // an append, and arming `fresh` for it would leak into the NEXT
+        // error's framing, swallowing one of its harness frames
+        // (`if {...; continue}` followed by an unrelated error).
+        if interp.err_is_error(e) {
+            interp.err_fresh = true;
+        }
     }
     r
 }
@@ -42,7 +65,7 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     if crate::types::expr_funcs::strict_bool(&cond)? {
-        return eval_transparent_body(interp, args[i].as_str());
+        return eval_arm_body(interp, i, args[i].as_str());
     }
     i += 1;
 
@@ -70,7 +93,7 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     )));
                 }
                 if crate::types::expr_funcs::strict_bool(&cond)? {
-                    return eval_transparent_body(interp, args[i].as_str());
+                    return eval_arm_body(interp, i, args[i].as_str());
                 }
                 i += 1;
             }
@@ -85,10 +108,10 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         "wrong # args: extra words after \"else\" clause in \"if\" command",
                     ));
                 }
-                return eval_transparent_body(interp, args[i + 1].as_str());
+                return eval_arm_body(interp, i + 1, args[i + 1].as_str());
             }
             _ => {
-                return eval_transparent_body(interp, word);
+                return eval_arm_body(interp, i, word);
             }
         }
     }

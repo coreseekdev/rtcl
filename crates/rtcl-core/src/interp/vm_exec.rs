@@ -99,6 +99,11 @@ struct LoopFrame {
     /// (`set y 1; break`); the tree-walk has no stack, so the jump must
     /// discard the partial command's leftovers.
     stack_len: usize,
+    /// Site of the looping construct (`while`/`for`) — a `break`/`continue`
+    /// truncates the body regions without their closing jumps, so the
+    /// executor must re-attribute to the loop itself: the ops at the jump
+    /// target (a re-checked condition, the next script) belong to it.
+    owner: usize,
 }
 
 /// One inline body region currently executing — which command's construct
@@ -172,14 +177,15 @@ fn loop_signal(st: &mut VmState, e: Error) -> Result<()> {
                             let in_next = st.bodies[enc.bodies_len..]
                                 .iter()
                                 .any(|r| matches!(r, Region::Next(_)));
-                            let (bodies_len, stack_len, cont) =
-                                (enc.bodies_len, enc.stack_len, enc.cont);
+                            let (bodies_len, stack_len, cont, owner) =
+                                (enc.bodies_len, enc.stack_len, enc.cont, enc.owner);
                             st.bodies.truncate(bodies_len);
                             st.stack.truncate(stack_len);
                             if in_next {
                                 st.loops.pop();
                                 continue;
                             }
+                            st.cur_site = owner;
                             st.pc = cont as usize;
                             return Ok(());
                         }
@@ -189,6 +195,7 @@ fn loop_signal(st: &mut VmState, e: Error) -> Result<()> {
             }
             st.bodies.truncate(l.bodies_len);
             st.stack.truncate(l.stack_len);
+            st.cur_site = l.owner;
             st.pc = if is_brk { l.brk as usize } else { l.cont as usize };
             Ok(())
         }
@@ -295,6 +302,15 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, entry_offset: usize) -> Resu
                 }
             }
             if !interp.err_is_error(&e) {
+                return Err(e);
+            }
+            // A unit whose FIRST `BeginCmd` failed the recursion guard
+            // never opened a command: no site is current and no region is
+            // open, so there is no frame to append — the error propagates
+            // frameless to the call boundary (call_proc logs the procedure
+            // frame, the caller's dispatch appends its harness frame),
+            // exactly the tree-walk's eval_command-guard sequence.
+            if st.cur_site == usize::MAX {
                 return Err(e);
             }
             // A body error of the current command's own inline
@@ -484,8 +500,15 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
 
         // ── Control flow ────────────────────────────────────────────────
         OpCode::Jump(t) => {
-            // Every inline body ends with a plain Jump — close its region.
-            st.bodies.pop();
+            // Every inline body ends with a plain Jump — close its region
+            // and restore the owning construct as the current command: the
+            // words/bodies inside may have opened commands of their own
+            // (inlined brackets), and the construct's remaining ops (a
+            // re-checked loop condition, the result push) must attribute
+            // to the construct, not to the last inner command.
+            if let Some(region) = st.bodies.pop() {
+                st.cur_site = region.site();
+            }
             st.pc = *t as usize;
         }
         OpCode::JumpTrue(t) => {
@@ -514,6 +537,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 brk: *brk,
                 bodies_len: st.bodies.len(),
                 stack_len: st.stack.len(),
+                owner: st.cur_site,
             });
         }
         OpCode::LoopExit => {
@@ -523,6 +547,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             Some(l) => {
                 st.bodies.truncate(l.bodies_len);
                 st.stack.truncate(l.stack_len);
+                st.cur_site = l.owner;
                 st.pc = l.brk as usize;
             }
             None => return Err(Error::brk()),
@@ -531,6 +556,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             Some(l) => {
                 st.bodies.truncate(l.bodies_len);
                 st.stack.truncate(l.stack_len);
+                st.cur_site = l.owner;
                 st.pc = l.cont as usize;
             }
             None => return Err(Error::cont()),
@@ -577,7 +603,14 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             st.bodies.push(Region::Expr(st.cur_site));
         }
         OpCode::SubEnd => {
-            st.bodies.pop();
+            // Close the bracket region and restore its owning command as
+            // current: the bracket's inner commands clobbered cur_site, and
+            // the owner's remaining words / its own dispatch must attribute
+            // to the owner (e.g. `nosuch [list a]` logs `"nosuch [list
+            // a]"`, not `"list a"`).
+            if let Some(region) = st.bodies.pop() {
+                st.cur_site = region.site();
+            }
         }
         OpCode::Call { cmd_id, argc } => {
             let from = st.stack.len() - *argc as usize;
@@ -924,6 +957,48 @@ mod sub_inline_tests {
         assert!(info.contains("\"error mid\""), "inner frame in {info}");
         assert!(info.contains("\"expr {1 + [if {1} {error mid}]}\""), "expr frame in {info}");
         assert!(!info.contains("\"if {1} {error mid}\""), "no if frame: {info}");
+    }
+
+    #[test]
+    fn test_if_arm_body_line_rebase() {
+        // tclsh numbers an if arm against the enclosing script's single
+        // line table: with the `if` on the proc body's line 2, an else-
+        // body error reports `(procedure "b1" line 2)` — not the body
+        // text's own line 1.
+        let mut interp = Interp::new();
+        let r = interp.eval(
+            "proc b1 {} {\n    if {0} { puts a } else { nosuch }\n}\ncatch {b1} m\nset ::errorInfo",
+        );
+        let info = r.unwrap().as_str().to_string();
+        assert!(info.contains("(procedure \"b1\" line 2)"), "line 2 in {info}");
+        assert!(info.contains("\"nosuch\""), "inner frame in {info}");
+    }
+
+    #[test]
+    fn test_control_flow_does_not_leak_fresh() {
+        // A control-flow completion out of an if arm (the `continue`) must
+        // not arm the harness-frame suppression: the NEXT error in the
+        // interp keeps all of its frames — here both expr frames of the
+        // nested-bracket error (expr_bracket_control's `deep` case).
+        let mut interp = Interp::new();
+        let r = interp.eval(concat!(
+            "set out {}\n",
+            "for {set i 0} {$i < 4} {incr i} {\n",
+            "    if {[expr {$i % 2}] == 0} { lappend out even-$i ; continue }\n",
+            "    lappend out odd-$i\n",
+            "}\n",
+            "proc deep n { expr {[expr {[nosuch $n]}] + 1} }\n",
+            "catch {deep 3} m\nset ::errorInfo\n",
+        ));
+        let info = r.unwrap().as_str().to_string();
+        assert!(
+            info.contains("\"expr {[nosuch $n]}\""),
+            "inner expr frame present: {info}"
+        );
+        assert!(
+            info.contains("\"expr {[expr {[nosuch $n]}] + 1} "),
+            "outer expr frame present: {info}"
+        );
     }
 
     #[test]

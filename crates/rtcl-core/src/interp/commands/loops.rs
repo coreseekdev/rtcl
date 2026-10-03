@@ -52,8 +52,13 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     continue;
                 }
                 // tclsh compiles while inline: a body error names no frame
-                // for the while command itself (N8).
-                interp.err_fresh = true;
+                // for the while command itself (N8).  Only true errors arm
+                // the suppression — a return/exit completion never reaches
+                // an append, and a leaked `fresh` would swallow a harness
+                // frame of the NEXT error in the interp.
+                if interp.err_is_error(&e) {
+                    interp.err_fresh = true;
+                }
                 return Err(e);
             }
         }
@@ -92,7 +97,10 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 else {
                     // tclsh compiles for inline like while: frameless.
-                    interp.err_fresh = true;
+                    // True errors only — see the while-arm note above.
+                    if interp.err_is_error(&e) {
+                        interp.err_fresh = true;
+                    }
                     return Err(e);
                 }
             }
@@ -116,7 +124,10 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     return Err(e);
                 }
                 else {
-                    interp.err_fresh = true;
+                    // True errors only — see the while-arm note above.
+                    if interp.err_is_error(&e) {
+                        interp.err_fresh = true;
+                    }
                     return Err(e);
                 }
             }

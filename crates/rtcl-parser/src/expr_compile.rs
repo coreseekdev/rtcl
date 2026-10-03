@@ -272,6 +272,14 @@ fn tokenize(expr: &str) -> Option<Vec<Token>> {
                 tokens.push(Token::Float(val));
             } else {
                 let s: String = chars[start..i].iter().collect();
+                // Leading-zero integers are OCTAL in Tcl (`017` = 15);
+                // a decimal parse would silently change the value.  Leave
+                // them (and `08`-style invalid octals, whose exact error
+                // text matters) to the runtime evaluator.
+                let digits = s.strip_prefix('-').unwrap_or(&s);
+                if digits.len() > 1 && digits.starts_with('0') {
+                    return None;
+                }
                 let val: i64 = s.parse().ok()?;
                 tokens.push(Token::Int(val));
             }
@@ -731,6 +739,19 @@ mod tests {
         // String/var-only eq stays compiled.
         // (string literals aren't tokenized at all — var/var eq compiles)
         assert!(compile_expr("$s eq $t").is_some());
+    }
+
+    #[test]
+    fn leading_zero_int_not_compiled() {
+        // Leading-zero integers are octal in Tcl (`017` = 15); a decimal
+        // parse would silently change the value, and invalid octals
+        // (`08`) must keep the runtime evaluator's exact error text.
+        assert!(compile_expr("017 + $x").is_none());
+        assert!(compile_expr("-017 + $x").is_none());
+        assert!(compile_expr("08 + 2").is_none());
+        // Plain `0` and normal decimals still compile.
+        let ops = compile_expr("0 + $x").unwrap();
+        assert!(ops.iter().any(|o| matches!(o, OpCode::PushInt(0))));
     }
 
     #[test]

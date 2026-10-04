@@ -320,7 +320,8 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &ByteCode) -> Result<Valu
         rtcl_parser::SrcSpan { start: 0, end: 0 },
     );
     let saved_line = std::mem::replace(&mut interp.cur_cmd_line, 0);
-    let saved_srcs = std::mem::replace(&mut interp.cur_cmd_word_srcs, Rc::new(Vec::new()));
+    let saved_srcs =
+        std::mem::replace(&mut interp.cur_cmd_word_srcs, Rc::clone(&interp.word_srcs_nil));
     // The unit "acts at" this offset: nested evals (EvalScript →
     // `Interp::eval`) must see the same base the tree-walk would have
     // left installed (e.g. a `while` body rebased by cmd_while).

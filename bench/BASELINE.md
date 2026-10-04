@@ -384,3 +384,26 @@ var_incr                 44         34      0.7
 # → 14.9-16.3ms per iteration (~1.7x).  dloop 441 → 405-429ms (the
 # dict-keys foreach borrows too).  fib25 neutral (74-102ms band, no
 # foreach in the hot path).
+
+# ---------------------------------------------------------------------------
+# G2 2026-10-04: call-path allocation removal (borrowed args, pooled
+# level0, word-src singleton).  The same profile round put ~4.6%
+# allocator traffic (malloc+free) + 8.4% memmove on the fib25 path;
+# three per-call copies tracked down: (a) call_proc opened with
+# `args.to_vec()` — one Vec malloc + memcpy of every invocation word per
+# proc call, its buffer then moved into `level0_src` and DROPPED at
+# frame teardown; (b) exec_bytecode swapped cur_cmd_word_srcs for a
+# fresh `Rc::new(Vec::new())` per proc call; (c) `info level 0`'s
+# invocation words were Option<Vec<Value>> reallocated per call.
+# Fix: args borrow the caller's slice for the whole call (a tail-call
+# target materialises an owned vector — same shape the proc name's Cow
+# already had); CallFrame.level0 is a plain pooled buffer (cleared, not
+# dropped — capacity rides the frame pool; each loop iteration rewrites
+# it exactly as before: the apply override first, else this iteration's
+# words, tailcall rebinds included); exec_bytecode bumps a shared
+# `word_srcs_nil` Rc.
+# Gates: judge 87/87; sweep 8 known (objquad's clock-seconds boundary
+# flake did not fire this round); tests 1143; call-path smoke vs tclsh
+# byte-exact (info level 0 plain/args/defaults/tailcall-rebind/apply,
+# arity error text, level 1, 400-deep pool reuse), engines identical.
+# fib25 interleaved best-of-5: 79.0 -> 75.5ms (~4%); fe/dloop neutral.

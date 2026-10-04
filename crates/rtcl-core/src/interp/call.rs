@@ -33,7 +33,11 @@ impl Interp {
         let mut current_params = Rc::clone(&proc_def.params);
         let mut current_body = Rc::clone(&proc_def.body);
         let mut current_compiled = proc_def.compiled.clone();
-        let mut current_args: Vec<Value> = args.to_vec();
+        // The invocation's words: borrowed from the caller's slice for the
+        // whole call (zero-copy binding — the common case never rebinds),
+        // materialised into an owned vector only by a tail-call target,
+        // which then serves every later iteration.
+        let mut owned_args: Option<Vec<Value>> = None;
         let mut current_statics: HashMap<String, Value> = (*proc_def.statics).clone();
         // Borrowed until a tail-call rebind owns its target's name: plain
         // global proc calls pay no per-call String for the frame name.
@@ -97,14 +101,14 @@ impl Interp {
                 slots: Vec::new(),
                 slot_table: None,
                 tailcall: None,
-                level0_src: None,
+                level0: Vec::new(),
                 ns_depth: 0,
             },
         };
         frame.ns = None;
         frame.call_ns = Some(prev_namespace.clone());
         frame.tailcall = None;
-        frame.level0_src = None;
+        frame.level0.clear();
         frame.ns_depth = self.ns_level0.len();
         self.frames.push(frame);
 
@@ -170,11 +174,14 @@ impl Interp {
                 // as-typed command word plus the evaluated arguments
                 // (tclsh 47.1: `ns a b c` → `::ns::a b c`).  `apply`
                 // overrides with `apply {<term>} <args...>`.  The words
-                // are stored raw and rendered only if asked.
-                frame.level0_src = match &level0_override {
-                    Some(l0) => Some(l0.to_vec()),
-                    None => None, // filled from current_args after binding
-                };
+                // are stored raw and rendered only if asked.  The buffer
+                // is the frame's own (pool-carried capacity): each
+                // iteration rewrites it — the override wins, otherwise
+                // the binding step fills this iteration's words.
+                frame.level0.clear();
+                if let Some(l0) = &level0_override {
+                    frame.level0.clone_from(l0);
+                }
             }
 
             let has_args = current_params.last().map(|(p, _)| p.as_str()) == Some("args");
@@ -185,11 +192,15 @@ impl Interp {
                 &current_params[..]
             };
 
+            // This iteration's invocation words: the borrowed caller
+            // slice, or the tail-call target's owned vector.
+            let cur: &[Value] = owned_args.as_deref().unwrap_or(args);
+
             // ── Arity check (Tcl: wrong # args) ────────────────────
             // Tcl binds positionally: any parameter left without an
             // argument must have a default (or be the trailing `args`).
             {
-                let num_args = current_args.len().saturating_sub(1);
+                let num_args = cur.len().saturating_sub(1);
                 let mut arity_ok = has_args || num_args <= regular_params.len();
                 if arity_ok {
                     for (i, (_, d)) in regular_params.iter().enumerate() {
@@ -238,8 +249,8 @@ impl Interp {
             {
                 let frame = self.frames.last_mut().unwrap();
                 for (i, (param, default)) in regular_params.iter().enumerate() {
-                    let value = if i + 1 < current_args.len() {
-                        current_args[i + 1].clone()
+                    let value = if i + 1 < cur.len() {
+                        cur[i + 1].clone()
                     } else if let Some(d) = default {
                         Value::from_str(d)
                     } else {
@@ -255,8 +266,8 @@ impl Interp {
 
             if has_args {
                 let remaining_start = regular_params.len() + 1;
-                let remaining_args: Vec<&Value> = if remaining_start < current_args.len() {
-                    current_args[remaining_start..].iter().collect()
+                let remaining_args: Vec<&Value> = if remaining_start < cur.len() {
+                    cur[remaining_start..].iter().collect()
                 } else {
                     Vec::new()
                 };
@@ -284,11 +295,12 @@ impl Interp {
             }
 
             // Hand the invocation words to the frame for a potential
-            // `info level 0` — moved, not re-rendered (the render ran a
-            // list build + quoting walk per call for nothing).
+            // `info level 0` — refcount bumps into the pooled buffer, no
+            // per-call Vec (the old code moved a fresh to_vec allocation
+            // in here and dropped it at frame teardown).
             let frame = self.frames.last_mut().unwrap();
-            if frame.level0_src.is_none() {
-                frame.level0_src = Some(std::mem::take(&mut current_args));
+            if frame.level0.is_empty() {
+                frame.level0.extend(cur.iter().cloned());
             }
 
             // ── Inject static variables into the frame ─────────────
@@ -380,7 +392,7 @@ impl Interp {
                         current_compiled = new_proc.compiled.clone();
                         current_statics = (*new_proc.statics).clone();
                         current_proc_name = Cow::Owned(cmd_name.clone());
-                        current_args = tc_args.into_iter().map(|s| Value::from_str(&s)).collect();
+                        owned_args = Some(tc_args.into_iter().map(|s| Value::from_str(&s)).collect());
                         // The reused frame's enterstep context now names the
                         // tail-call target (corpus-free: no extra enter/leave
                         // fires for the switched-to command).  Only a traced
@@ -527,7 +539,9 @@ impl Interp {
         popped.deferred_scripts.clear();
         popped.slots.clear();
         popped.slot_table = None;
-        popped.level0_src = None;
+        // Kept (cleared, with capacity) — the pooled frame reuses the
+        // buffer for its next invocation's `info level 0` words.
+        popped.level0.clear();
         popped.tailcall = None;
         popped.ns = None;
         popped.call_ns = None;

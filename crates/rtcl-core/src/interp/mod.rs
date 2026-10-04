@@ -178,7 +178,11 @@ pub(crate) struct CallFrame {
     /// rendering the list form cost an allocation + quoting walk per call
     /// that the ~never-asked `info level 0` doesn't justify (tclsh renders
     /// from the live argv on demand).  [`frame_level0`] renders it.
-    pub level0_src: Option<Vec<Value>>,
+    /// A plain reused buffer: the frame pool carries the allocation across
+    /// calls (cleared, not dropped — a proc call pays no Vec malloc for
+    /// this), and emptiness doubles as "not a bound invocation" (a
+    /// dispatched command always has at least its name word).
+    pub level0: Vec<Value>,
     /// How many `namespace eval`s were open when this frame was created —
     /// reconstructs the tclsh varFrame chain (proc frames and ns-eval
     /// scopes interleave) for `uplevel` level arithmetic.
@@ -210,13 +214,12 @@ impl CallFrame {
 }
 
 /// `info level 0` string for a frame: the invocation words, list-rendered
-/// on demand from [`CallFrame::level0_src`].
+/// on demand from [`CallFrame::level0`].
 pub(crate) fn frame_level0(frame: &CallFrame) -> String {
-    frame
-        .level0_src
-        .as_ref()
-        .map(|words| Value::from_list(words).as_str().to_string())
-        .unwrap_or_default()
+    if frame.level0.is_empty() {
+        return String::new();
+    }
+    Value::from_list(&frame.level0).as_str().to_string()
 }
 
 /// One live `array startsearch` iteration over an array's element names.
@@ -475,6 +478,11 @@ pub struct Interp {
     /// Spans resolve through [`Interp::cur_source`]; `Rc` (shared with the
     /// cached parse tree) so save/restore per dispatch is a refcount bump.
     pub(crate) cur_cmd_word_srcs: Rc<Vec<rtcl_parser::SrcSpan>>,
+    /// Shared empty word-source vector — `exec_bytecode` swaps the
+    /// per-command word sources out for this singleton on entry (one Rc
+    /// bump; the previous code allocated a fresh `Rc<Vec<..>>` per proc
+    /// call).
+    pub(crate) word_srcs_nil: Rc<Vec<rtcl_parser::SrcSpan>>,
     /// Source text of the command currently dispatching, for constructs
     /// that need the raw invocation (`info level 0` inside
     /// `namespace eval`).  Span into [`Interp::cur_source`].
@@ -614,6 +622,7 @@ impl Interp {
             line_offset: 0,
             cur_cmd_line: 0,
             cur_cmd_word_srcs: Rc::new(Vec::new()),
+            word_srcs_nil: Rc::new(Vec::new()),
             cur_cmd_text: rtcl_parser::SrcSpan { start: 0, end: 0 },
             cur_source: Rc::from(""),
             err_from_subst: false,

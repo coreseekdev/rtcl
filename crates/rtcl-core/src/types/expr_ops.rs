@@ -31,7 +31,6 @@ pub(crate) fn as_int_val(v: &Value) -> Result<i64> {
 /// result stays a float.
 pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Value> {
     use num_bigint::BigInt;
-    use num_integer::Integer;
     use super::bignum::{floor_div as big_div, int_rep, to_value};
     // NaN operands can't take part in arithmetic (`"nan" + 0` →
     // can't use non-numeric floating-point value as operand of "+").
@@ -44,20 +43,24 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
     }
     if let (Some(ia), Some(ib)) = (int_rep(left), int_rep(right)) {
         if let (IntRep::I64(a), IntRep::I64(b)) = (&ia, &ib) {
+            // Widen lazily: the bignum forms are converted only on an
+            // actual i64 overflow — a non-overflowing op (the common case
+            // by far) allocates nothing.  This used to convert both
+            // operands eagerly: two BigInt allocations per `+`/`-`/`*`/`/`,
+            // wasted whenever checked arithmetic succeeded.
             let widen = |x: BigInt| Ok(to_value(IntRep::Big(x)));
-            let (ba, bb) = (ia.to_big(), ib.to_big());
             return match op {
                 '+' => match a.checked_add(*b) {
                     Some(r) => Ok(Value::from_int(r)),
-                    None => widen(ba + bb),
+                    None => widen(ia.to_big() + ib.to_big()),
                 },
                 '-' => match a.checked_sub(*b) {
                     Some(r) => Ok(Value::from_int(r)),
-                    None => widen(ba - bb),
+                    None => widen(ia.to_big() - ib.to_big()),
                 },
                 '*' => match a.checked_mul(*b) {
                     Some(r) => Ok(Value::from_int(r)),
-                    None => widen(ba * bb),
+                    None => widen(ia.to_big() * ib.to_big()),
                 },
                 '/' => {
                     if *b == 0 {
@@ -65,7 +68,7 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
                     }
                     // i64::MIN / -1 overflows in Rust; Tcl widens to bignum
                     if *a == i64::MIN && *b == -1 {
-                        return widen(ba.div_floor(&bb));
+                        return widen(big_div(&ia.to_big(), &ib.to_big()));
                     }
                     Ok(Value::from_int(super::expr::floor_div(*a, *b)))
                 }
@@ -222,7 +225,16 @@ pub(crate) fn int_bitop(left: &Value, right: &Value, op: char) -> Result<Value> 
         super::bignum::int_rep(left),
         super::bignum::int_rep(right),
     ) {
-        use num_bigint::BigInt;
+        // i64×i64 never overflows a bitwise op — no bignum conversion on
+        // the common path (this used to widen BOTH operands on every
+        // `&`/`|`/`^`).
+        if let (IntRep::I64(a), IntRep::I64(b)) = (&ia, &ib) {
+            return Ok(Value::from_int(match op {
+                '|' => a | b,
+                '^' => a ^ b,
+                _ => a & b,
+            }));
+        }
         let (a, b) = (ia.to_big(), ib.to_big());
         return Ok(super::bignum::to_value(IntRep::Big(
             match op {

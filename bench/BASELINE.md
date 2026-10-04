@@ -328,3 +328,30 @@ list_ops                 10         11      1.1
 proc_fib                  8         16      2.0
 string_build              5          6      1.2
 var_incr                 42         38      0.9
+
+# ---------------------------------------------------------------------------
+# F-followup 2026-10-04: numeric fast path — lazy bignum widening.
+# The fib25 profile's remaining numeric bucket (as_int + int_rep/to_big
+# ~6%) traced to eager conversion: numeric_binop's I64×I64 arm computed
+# ia.to_big()/ib.to_big() (two BigInt allocations) BEFORE the checked
+# arithmetic, paying them on every non-overflowing op — i.e. every `+`,
+# `-`, `*`, `/` in loop/recursion code — and using them only on the
+# overflow-widen branch.  int_bitop had no i64 path at all: `&`/`|`/`^`
+# widened both operands to BigInt unconditionally.  Fix: widen lazily
+# (overflow arms convert inline); bitop gains an I64×I64 arm (bitwise on
+# i64 never overflows).  Side effect: bitop results of i64 operands now
+# carry the int rep instead of the string rep (string form identical).
+# Gates: judge 87/87; sweep 8 known / 0 new; tests 1143; numeric smoke
+# vs tclsh byte-exact (i64 overflow widen, MIN/-1, shifts, bitwise,
+# radix literals, float mixing, div-by-zero text).  fib25 interleaved vs
+# F2: neutral-to-marginal (the eager conversions were a smaller slice
+# than the profile bucket suggested); standard table under light load:
+# proc_fib 2.0 → 1.8, nothing regressed.
+
+case               tclsh_ms    rtcl_ms    ratio
+arith_loop               35         36      1.0
+dict_ops                  8         10      1.2
+list_ops                  9         10      1.1
+proc_fib                  8         15      1.8
+string_build              6          6      1.0
+var_incr                 44         34      0.7

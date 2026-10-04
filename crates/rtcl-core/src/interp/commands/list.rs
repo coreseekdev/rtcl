@@ -477,6 +477,7 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         .unwrap_or(0);
 
     for idx in 0..max_iters {
+        interp.charge_step()?;
         for g in &groups {
             let n = g.vars.len();
             for (vi, var) in g.vars.iter().enumerate() {

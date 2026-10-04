@@ -42,6 +42,12 @@ pub trait VmContext {
     /// the remaining elements are its arguments.
     fn invoke_command(&mut self, args: &[Value]) -> Result<Value>;
 
+    /// A1 步数预算：每条命令分派/每次循环回边计一步；超限抛
+    /// `ErrorCode::Timeout`。缺省 no-op——未武装预算的宿主零语义变化。
+    fn charge_step(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// **Call** — invoke a built-in command by numeric ID.
     ///
     /// `cmd_id` corresponds to a [`CmdId`](rtcl_parser::CmdId).

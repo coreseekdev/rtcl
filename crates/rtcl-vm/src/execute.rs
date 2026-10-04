@@ -137,19 +137,33 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             }
 
             // ── Control flow ────────────────────────────────────────
+            // A1 步数预算：向后跳 = 循环回边，每迭代计一步——纯控制流
+            // `while {1} {}` 在编译形里零命令分派，只有回边可计。
             OpCode::Jump(target) => {
-                pc = *target as usize;
+                let t = *target as usize;
+                if t < pc {
+                    ctx.charge_step()?;
+                }
+                pc = t;
             }
             OpCode::JumpTrue(target) => {
                 let val = stack.pop().unwrap_or_else(Value::empty);
                 if val.is_true() {
-                    pc = *target as usize;
+                    let t = *target as usize;
+                    if t < pc {
+                        ctx.charge_step()?;
+                    }
+                    pc = t;
                 }
             }
             OpCode::JumpFalse(target) => {
                 let val = stack.pop().unwrap_or_else(Value::empty);
                 if !val.is_true() {
-                    pc = *target as usize;
+                    let t = *target as usize;
+                    if t < pc {
+                        ctx.charge_step()?;
+                    }
+                    pc = t;
                 }
             }
 

@@ -625,6 +625,21 @@ mod tests {
     }
 
     #[test]
+    fn step_budget_trips_on_empty_body_while() {
+        // TASKS A1 的原始案例：空体 + 字面条件——编译形里零命令分派，
+        // 只能靠 VM 回边计步。
+        let mut interp = Interp::new();
+        interp.set_max_steps(Some(100));
+        let r = interp.eval("while {1} {}");
+        let msg = format!("{}", r.err().expect("empty-body while must trip budget"));
+        assert!(msg.contains("step budget"), "{msg}");
+        // 字面条件 + continue 体同样拦下。
+        let mut interp = Interp::new();
+        interp.set_max_steps(Some(100));
+        assert!(interp.eval("while {1} {continue}").is_err());
+    }
+
+    #[test]
     fn step_budget_default_unlimited_and_rearm_resets() {
         let mut interp = Interp::new();
         // 缺省不限：大循环照常完成（conformance 零行为变化）。

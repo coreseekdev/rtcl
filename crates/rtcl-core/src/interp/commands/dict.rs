@@ -339,6 +339,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let body = args[4].as_str();
             let mut result = Value::empty();
             for (k, v) in &entries {
+                interp.charge_step()?;
                 interp.set_var(&key_var, Value::from_str(k))?;
                 interp.set_var(&val_var, v.clone())?;
                 match demote_level0_return(interp.eval(body)) {

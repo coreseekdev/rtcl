@@ -68,6 +68,10 @@ impl VmContext for Interp {
         Interp::eval_expr(self, expr)
     }
 
+    fn charge_step(&mut self) -> Result<()> {
+        Interp::charge_step(self)
+    }
+
     fn invoke_command(&mut self, args: &[Value]) -> Result<Value> {
         if args.is_empty() {
             return Ok(Value::empty());

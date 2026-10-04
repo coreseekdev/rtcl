@@ -407,3 +407,43 @@ var_incr                 44         34      0.7
 # byte-exact (info level 0 plain/args/defaults/tailcall-rebind/apply,
 # arity error text, level 1, 400-deep pool reuse), engines identical.
 # fib25 interleaved best-of-5: 79.0 -> 75.5ms (~4%); fe/dloop neutral.
+
+# ---------------------------------------------------------------------------
+# G3 2026-10-04: literal value pool + negative small-int cache.  The
+# symbolized profile round showed every PushConst/PushInt re-allocated:
+# `Value::from_str` = one Rc malloc per literal push (dispatch command
+# names, data-list words, operator strings), and from_int covered only
+# [0,256) so decrementing loops' PushInt(-1) malloced per iteration.
+# Fix: Interp.const_pool (HashMap<code-addr, ConstPoolEntry{ Rc<ByteCode>
+# keepalive, Rc<[Value]> constants }>, bound 512 clear-on-overflow,
+# inserted at the four compile seams: eval's two compile_unit sites, proc
+# definition, lambda cache) pre-materialises a unit's constants; the
+# executor takes ONE pool probe per exec_bytecode call into VmState
+# (st.consts: Option<Rc<[Value]>>) and PushConst/PushConstWide become a
+# slice index + Rc bump, zero per-push malloc/copy (a pool miss falls
+# back to from_str — same bytes, correctness never depends on
+# residency).  CACHED_INTS extended to [-128,256): the -1/-N step
+# operands push a cached singleton instead of Rc::new per iteration.
+# SWEEP ROOT CAUSE FOUND (user-directed): the historical "8 known
+# artifacts" were never engine divergences — every one (ivars2,
+# namespace_varmodel2, oo2, p-uplevel-ns, q114b, trv_p11, trv_p8, u72)
+# diffs ONLY in an extra `env(RTCL_NO_BYTECODE)` element: the tree arm
+# was selected by exporting the env var, which materialises into
+# $env(*) at startup, and those probes enumerate variables.  Fix at the
+# launcher level (user directive): rtcl gains `--no-bytecode`
+# (rtcl_core::interp::set_bytecode_disabled — an AtomicBool consulted
+# by bytecode_applicable before the env OnceLock; env var still works)
+# and sweep2.sh selects the tree arm by FLAG, leaving the process env
+# identical between arms.  Result: sweep 0 diffs, strict — no known-
+# artifact allowance any more (objquad's clock-seconds boundary flake
+# remains possible under load; bn14 once flapped on the sweep's old
+# 60s bytecode-arm timeout under load — timeouts now 120s both arms).
+# Gates: judge 87/87; sweep 0; tests 1143; G3 smoke vs tclsh
+# byte-exact on string-form preservation (007/+5/-0/1.50/.5/1e3, octal
+# expr 010->8), negative ints through the cache edges (-128 cached,
+# -129 lazy), proc defaults, apply lambdas, pool overflow at 512 (>
+# 520 distinct units then literal re-check), post-overflow literals,
+# pooled-literal mutation independence (lappend COW); engines identical.
+# Bench (interleaved, machine loaded — ranges wide): literal-heavy
+# micro (proc mk {} { list <16 literals> }, 300k calls) 253ms -> 169ms
+# (~1.5x); fib25 73.5 vs 73.3 (neutral); fe/dloop neutral in noise.

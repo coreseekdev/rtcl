@@ -66,11 +66,27 @@ pub(crate) fn note_tier1_sweep(interp: &mut Interp) {
     interp.tier1_epoch += 1;
 }
 
+/// Programmatic engine switch (the CLI's `--no-bytecode`, embedders'
+/// escape hatch): same effect as the `RTCL_NO_BYTECODE` env var without
+/// setting a process env var — the env var materialises into `$env(*)`
+/// at startup and shows up in every variable enumeration, which
+/// differential probes compare byte-exactly.  Call before the first
+/// `Interp::new` (stdlib loading already consults it).
+pub fn set_bytecode_disabled(disabled: bool) {
+    BYTECODE_FORCED_OFF.store(disabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+static BYTECODE_FORCED_OFF: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// May the current call run its body through the bytecode executor?
 /// Execution traces observe every dispatched command, so they pin the
 /// proc to the tree-walk; `RTCL_NO_BYTECODE` is the manual escape hatch.
 pub(crate) fn bytecode_applicable(interp: &Interp) -> bool {
     if !interp.exec_traces.is_empty() {
+        return false;
+    }
+    if BYTECODE_FORCED_OFF.load(core::sync::atomic::Ordering::Relaxed) {
         return false;
     }
     #[cfg(not(feature = "embedded"))]
@@ -333,6 +349,7 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &ByteCode) -> Result<Valu
     // a live VmState is never in the pool, so pooling cannot alias.
     let r = {
         let mut st = interp.vm_pool.take(entry_offset);
+        st.consts = interp.const_pool_get(code);
         let r = exec_inner(interp, code, &mut st);
         interp.vm_pool.give(st);
         r
@@ -437,6 +454,11 @@ struct VmState {
     /// off the stack into it (drain), not cloned — one buffer per executor
     /// state instead of a fresh Vec per dispatched command.
     scratch: Vec<Value>,
+    /// The unit's pooled constants (see [`Interp::const_pool`]), taken at
+    /// `exec_bytecode` entry — PushConst/PushConstWide then push an Rc
+    /// bump (slice index + clone) instead of re-materialising the literal
+    /// string per push.
+    consts: Option<Rc<[Value]>>,
     /// Stack base of the current command's `{*}` expansion region.
     expand_base: usize,
     /// Site index of the `BeginCmd` most recently executed.
@@ -453,6 +475,7 @@ impl VmState {
             foreaches: Vec::new(),
             bodies: Vec::new(),
             scratch: Vec::new(),
+            consts: None,
             expand_base: 0,
             cur_site: usize::MAX,
             entry_offset,
@@ -512,6 +535,7 @@ impl VmPool {
                 st.cur_site = usize::MAX;
                 st.entry_offset = entry_offset;
                 st.pc = 0;
+                st.consts = None;
                 st
             }
             None => VmState::new(entry_offset),
@@ -524,6 +548,7 @@ impl VmPool {
         st.foreaches.clear();
         st.bodies.clear();
         st.scratch.clear();
+        st.consts = None;
         if self.spare.len() < 4 {
             self.spare.push(st);
         }
@@ -536,13 +561,26 @@ impl VmPool {
 fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) -> Result<()> {
     match op {
         // ── Stack ───────────────────────────────────────────────────────
+        // Literals come from the unit's pooled constants (one Rc bump);
+        // a pool miss re-materialises from the string table, which is
+        // exactly what the pool was built from — same bytes either way.
         OpCode::PushConst(idx) => {
-            let s = code.get_const(*idx).unwrap_or("");
-            st.stack.push(Entry::Val(Value::from_str(s)));
+            let v = st
+                .consts
+                .as_deref()
+                .and_then(|vs| vs.get(*idx as usize))
+                .cloned()
+                .unwrap_or_else(|| Value::from_str(code.get_const(*idx).unwrap_or("")));
+            st.stack.push(Entry::Val(v));
         }
         OpCode::PushConstWide(idx) => {
-            let s = code.get_const_wide(*idx).unwrap_or("");
-            st.stack.push(Entry::Val(Value::from_str(s)));
+            let v = st
+                .consts
+                .as_deref()
+                .and_then(|vs| vs.get(*idx as usize))
+                .cloned()
+                .unwrap_or_else(|| Value::from_str(code.get_const_wide(*idx).unwrap_or("")));
+            st.stack.push(Entry::Val(v));
         }
         OpCode::PushEmpty => st.stack.push(Entry::Val(Value::empty())),
         OpCode::PushInt(n) => st.stack.push(Entry::Val(Value::from_int(*n))),

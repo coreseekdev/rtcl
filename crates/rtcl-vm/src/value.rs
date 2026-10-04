@@ -258,6 +258,11 @@ pub struct Value {
 // overhead — `Value::clone()` becomes a simple reference-count increment.
 
 const SMALL_INT_CACHE_SIZE: usize = 256;
+/// Lower bound of the small-int cache: the negatives cover the `-1`
+/// step operands loop code pushes per iteration (`expr {$n - 1}`'s
+/// PushInt), which would otherwise malloc a fresh `Rc<ValueInner>`
+/// every time.
+const INT_CACHE_MIN: i64 = -128;
 
 thread_local! {
     static CACHED_EMPTY: Rc<ValueInner> = Rc::new(ValueInner {
@@ -275,9 +280,10 @@ thread_local! {
         rep: InternalRep::Bool(false),
     });
 
-    /// Cached small integers [0, 256) — covers loop counters, return codes,
-    /// list indices, and most Tcl numeric constants.
-    static CACHED_INTS: Vec<Rc<ValueInner>> = (0..SMALL_INT_CACHE_SIZE as i64)
+    /// Cached small integers [-128, 256) — covers loop counters, return
+    /// codes, list indices, most Tcl numeric constants, and the negative
+    /// step operands of decrementing loops.
+    static CACHED_INTS: Vec<Rc<ValueInner>> = (INT_CACHE_MIN..SMALL_INT_CACHE_SIZE as i64)
         .map(|n| {
             Rc::new(ValueInner {
                 string: OnceCell::from(SmallVec::from_slice(format_int(n).as_bytes())),
@@ -314,10 +320,11 @@ impl Value {
 
     /// Create a value from an integer
     pub fn from_int(n: i64) -> Self {
-        // Fast path: use cached singleton for small non-negative integers
-        if n >= 0 && (n as usize) < SMALL_INT_CACHE_SIZE {
+        // Fast path: cached singleton for small integers (negatives
+        // included — `-1` sits in every decrementing loop).
+        if n >= INT_CACHE_MIN && n < SMALL_INT_CACHE_SIZE as i64 {
             return CACHED_INTS.with(|ints| Value {
-                inner: Rc::clone(&ints[n as usize]),
+                inner: Rc::clone(&ints[(n - INT_CACHE_MIN) as usize]),
             });
         }
         // Lazy string (tclsh: an object born with an int rep carries no

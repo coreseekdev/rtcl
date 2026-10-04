@@ -133,6 +133,9 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let compiled =
         super::super::vm_exec::compile_proc_body(&defaults, &body, interp.tier1_epoch);
+    if let Some(code) = &compiled {
+        interp.const_pool_insert(code);
+    }
     let proc_def = ProcDef {
         params: Rc::new(defaults),
         body: Rc::from(body),
@@ -282,6 +285,7 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.tier1_epoch,
             );
             if let Some(code) = &c {
+                interp.const_pool_insert(code);
                 if interp.lambda_code_cache.len() >= 1024 {
                     interp.lambda_code_cache.clear();
                 }

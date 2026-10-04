@@ -25,6 +25,8 @@ mod varmap;
 pub(crate) use util::{split_array_ref, glob_match};
 pub(crate) use varmap::{VarMap, VarSet};
 
+pub use vm_exec::set_bytecode_disabled;
+
 use crate::command::{CommandFunc, CommandCategory, CommandMeta};
 use crate::value::Value;
 use rtcl_parser::ByteCode;
@@ -222,6 +224,19 @@ pub(crate) fn frame_level0(frame: &CallFrame) -> String {
     Value::from_list(&frame.level0).as_str().to_string()
 }
 
+/// One [`Interp::const_pool`] entry: a compiled unit's string constants
+/// pre-materialised as `Value`s (tclsh's literal table).  Holds the
+/// `Rc<ByteCode>` keepalive so the address key stays valid for the
+/// entry's lifetime.
+pub(crate) struct ConstPoolEntry {
+    /// The compiled unit the values belong to (address-keyed keepalive).
+    pub code: Rc<ByteCode>,
+    /// `code.constants()` as `Value`s, in table order — one slice serves
+    /// both `PushConst` (u16) and `PushConstWide` (u32), which index the
+    /// same table.
+    pub values: Rc<[Value]>,
+}
+
 /// One live `array startsearch` iteration over an array's element names.
 /// A snapshot of the element set plus the array's mutation stamp: any
 /// element added or removed (tclsh semantics) invalidates the search.
@@ -347,6 +362,15 @@ pub struct Interp {
     /// functions of it (tclsh caches the compiled form on the lambda
     /// obj).  Bounded like the parse cache (wasm32 is a target).
     pub(crate) lambda_code_cache: HashMap<String, Rc<rtcl_parser::ByteCode>>,
+    /// Literal value pool: compiled unit (by `Rc` allocation address) →
+    /// its constants as ready `Value`s.  `PushConst` then pushes an
+    /// Rc bump instead of re-materialising the literal string on every
+    /// execution (tclsh keeps literal objects in a table exactly like
+    /// this).  The entry keeps the `Rc<ByteCode>` alive, so the address
+    /// is unique and stable for the entry's lifetime; bounded with
+    /// clear-on-overflow (wasm32 is a target).  A miss simply falls back
+    /// to `Value::from_str` — correctness never depends on residency.
+    pub(crate) const_pool: HashMap<usize, ConstPoolEntry>,
     /// `check_expr` verdict memo: expr text → `Err(msg)` on syntax error,
     /// `Ok(())` when clean (see `types::expr::eval_expr`).  Pure function
     /// of the text; loop conditions re-check every iteration.
@@ -645,6 +669,7 @@ impl Interp {
             bytecode_cache: HashMap::new(),
             body_memo: Vec::new(),
             lambda_code_cache: HashMap::new(),
+            const_pool: HashMap::new(),
             in_locals_unit: false,
             expr_check_cache: HashMap::new(),
             call_depth: 0,
@@ -847,6 +872,40 @@ impl Interp {
                 self.cmd_cache_len += 1;
             }
         }
+    }
+
+    /// Materialise `code`'s constants into the literal pool (idempotent
+    /// overwrite; units without constants skip the pool entirely).
+    /// Called once at each compile seam — a cached unit then serves every
+    /// later execution.
+    pub(crate) fn const_pool_insert(&mut self, code: &Rc<ByteCode>) {
+        const CONST_POOL_MAX: usize = 512;
+        if code.constants().is_empty() {
+            return;
+        }
+        if self.const_pool.len() >= CONST_POOL_MAX {
+            self.const_pool.clear();
+        }
+        let values: Rc<[Value]> = code
+            .constants()
+            .iter()
+            .map(|s| Value::from_str(s))
+            .collect();
+        self.const_pool.insert(
+            Rc::as_ptr(code) as usize,
+            ConstPoolEntry {
+                code: Rc::clone(code),
+                values,
+            },
+        );
+    }
+
+    /// Pool probe for a unit being executed (one hash per `exec_bytecode`
+    /// call, amortised over every PushConst it runs).
+    pub(crate) fn const_pool_get(&self, code: &ByteCode) -> Option<Rc<[Value]>> {
+        self.const_pool
+            .get(&(code as *const ByteCode as usize))
+            .map(|e| Rc::clone(&e.values))
     }
 
     /// A command table (`commands` / `procs` / `ensembles` /

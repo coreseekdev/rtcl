@@ -74,8 +74,9 @@ impl Interp {
                     // with non-whitelisted ops carry `fallback` and are
                     // cached anyway (the check is per call — a Tier1 shadow
                     // bump must keep taking effect on cached code).
-                    let code = Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands);
-                    self.bytecode_cache.insert(Rc::clone(&rc.source), Rc::new(code));
+                    let code = Rc::new(Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands));
+                    self.const_pool_insert(&code);
+                    self.bytecode_cache.insert(Rc::clone(&rc.source), code);
                 }
                 rc
             }
@@ -138,8 +139,9 @@ impl Interp {
                         self.bytecode_cache.clear();
                     }
                     self.parse_cache.insert(Rc::clone(&rc.source), Rc::clone(&rc));
-                    let code = Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands);
-                    self.bytecode_cache.insert(Rc::clone(&rc.source), Rc::new(code));
+                    let code = Rc::new(Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands));
+                    self.const_pool_insert(&code);
+                    self.bytecode_cache.insert(Rc::clone(&rc.source), code);
                 }
                 rc
             }

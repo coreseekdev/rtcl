@@ -27,10 +27,20 @@ struct Args {
     /// Quiet mode (don't print banner)
     #[arg(short = 'q', long)]
     quiet: bool,
+
+    /// Run on the tree-walk engine only (bytecode off) — the CLI twin of
+    /// the RTCL_NO_BYTECODE env var; a flag leaves the process env, and
+    /// thus $env(*), untouched (env enumerations stay comparable).
+    #[arg(long)]
+    no_bytecode: bool,
 }
 
 fn main() {
     let args = Args::parse();
+
+    if args.no_bytecode {
+        rtcl_core::interp::set_bytecode_disabled(true);
+    }
 
     let result = if let Some(ref file) = args.file {
         run_file(file, args.quiet)

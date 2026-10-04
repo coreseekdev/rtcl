@@ -45,17 +45,24 @@ impl Interp {
         // (trace-40.1); `leave` fires after the frame is gone.  The
         // resolved key doubles as this frame's enterstep context (the
         // body's commands resolve their enterstep traces through it).
-        let exec_key = super::commands::proc::resolve_command_key(self, proc_name)
-            .unwrap_or_else(|| proc_name.to_string());
-        let exec_cmdtext = if self.exec_traces.is_empty() {
-            String::new()
-        } else {
-            Value::from_list(args).as_str().to_string()
-        };
-        if !self.exec_traces.is_empty() {
+        // The context is only READ while execution traces exist
+        // (`exec_step_begin`'s first check), so the untraced path — every
+        // proc call in a normal session — skips the resolve (a multi-probe
+        // + format! walk) and the push/pop entirely.  tclsh agrees: traces
+        // (enterstep, leave) registered on a proc that is ALREADY running
+        // do not instrument that invocation (probed 8.6.17: no enterstep,
+        // no leave output; rtcl's former eager context fired them — a
+        // divergence this fixes).
+        let traced_entry = !self.exec_traces.is_empty();
+        let mut leave_ctx: Option<(String, String)> = None;
+        if traced_entry {
+            let exec_key = super::commands::proc::resolve_command_key(self, proc_name)
+                .unwrap_or_else(|| proc_name.to_string());
+            let exec_cmdtext = Value::from_list(args).as_str().to_string();
             self.exec_fire_enter(&exec_key, &exec_cmdtext)?;
+            self.exec_step_stack.push(exec_key.clone());
+            leave_ctx = Some((exec_key, exec_cmdtext));
         }
-        self.exec_step_stack.push(exec_key.clone());
 
         self.call_depth += 1;
 
@@ -375,11 +382,16 @@ impl Interp {
                         current_args = tc_args.into_iter().map(|s| Value::from_str(&s)).collect();
                         // The reused frame's enterstep context now names the
                         // tail-call target (corpus-free: no extra enter/leave
-                        // fires for the switched-to command).
-                        let new_key = super::commands::proc::resolve_command_key(self, &cmd_name)
-                            .unwrap_or_else(|| cmd_name.clone());
-                        if let Some(top) = self.exec_step_stack.last_mut() {
-                            *top = new_key;
+                        // fires for the switched-to command).  Only a traced
+                        // entry pushed one — without the guard this would
+                        // clobber the CALLER's context.
+                        if traced_entry {
+                            let new_key =
+                                super::commands::proc::resolve_command_key(self, &cmd_name)
+                                    .unwrap_or_else(|| cmd_name.clone());
+                            if let Some(top) = self.exec_step_stack.last_mut() {
+                                *top = new_key;
+                            }
                         }
                         continue;
                     } else {
@@ -539,17 +551,24 @@ impl Interp {
 
         // Execution traces: the frame is gone; `leave` fires with the
         // completion code and result (errors are background errors).
-        self.exec_step_stack.pop();
-        if !self.exec_traces.is_empty() {
-            let pair = match &final_result {
-                Ok(v) => Some(("0", v.as_str().to_string())),
-                Err(e) if self.err_is_error(e) => {
-                    Some(("1", e.message_text().to_string()))
+        // Only a traced entry pushed a context (and has the key/cmdtext
+        // to report); a trace registered mid-body does not fire for the
+        // already-running invocation (tclsh-probed above).
+        if traced_entry {
+            self.exec_step_stack.pop();
+            if !self.exec_traces.is_empty() {
+                if let Some((exec_key, exec_cmdtext)) = &leave_ctx {
+                    let pair = match &final_result {
+                        Ok(v) => Some(("0", v.as_str().to_string())),
+                        Err(e) if self.err_is_error(e) => {
+                            Some(("1", e.message_text().to_string()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((code, res)) = pair {
+                        self.exec_fire_leave(exec_key, exec_cmdtext, code, &res);
+                    }
                 }
-                _ => None,
-            };
-            if let Some((code, res)) = pair {
-                self.exec_fire_leave(&exec_key, &exec_cmdtext, code, &res);
             }
         }
 

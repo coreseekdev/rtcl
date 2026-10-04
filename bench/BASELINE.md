@@ -260,3 +260,40 @@ list_ops                  5          7      1.4
 proc_fib                  5         11      2.2
 string_build              4          4      1.0
 var_incr                 42         31      0.7
+
+# ---------------------------------------------------------------------------
+# F1 2026-10-04 (ARCHITECTURE-PERF.md item F, part 1): lazy execution-trace
+# context in call_proc.  F was re-scoped from measurement, not assumption:
+# the roadmap text assumed return-with-value allocates, but Error::ret moves
+# the Value inline into the enum (allocation-free) and compiled loops
+# already jump directly for break/continue.  The symbolized fib25 profile
+# said the real per-call costs were call_proc self 18.3% (its FIRST act was
+# resolve_command_key — the 7-arm probe chain + a format! qualifier walk —
+# plus two String allocs and an exec_step_stack push) — while the only
+# reader, exec_step_begin (trace.rs), checks exec_traces.is_empty() first:
+# in an untraced session (every real one) all of it was dead work.  Fix:
+# `traced_entry` gate — the resolve/push/leave-context happen only when
+# execution traces exist; the tailcall rebind and the exit pop/leave-fire
+# are guarded by the same flag (the rebind would otherwise clobber the
+# CALLER's context).
+# Semantics: probed tclsh 8.6.17 — enterstep/leave traces registered on an
+# ALREADY-RUNNING proc do not instrument that invocation; rtcl's eager
+# context DID fire them (two divergences, /tmp/trv_mid2.tcl + trv_leave.tcl
+# shapes).  After F1 rtcl matches tclsh byte-for-byte on both probes.
+# Gates: judge 87/87; two-engine sweep 8 known artifacts / 0 new (objquad
+# flaked once — it prints clock-seconds deltas, timing not semantics; 3/3
+# clean re-runs); workspace tests 1143 green.  Interleaved A/B vs pre-F1
+# HEAD build under load ~4-5: dloop 568-629 → 452-460ms (~20%; the loop
+# calls a proc per iteration, each paying the resolve) vs tclsh 267 (1.7x);
+# fe_bench 0.14-0.17 → 0.12s; fib25 96.8-112.6 → 93.1-96.6ms (~4% — call
+# overhead is a smaller slice of fib's recursive profile).  Standard table
+# (5 reps best-of, noisy machine): ratios improved across the board vs the
+# post-C row (dict_ops 1.2→1.0, list_ops 1.4→0.9, proc_fib 2.2→2.1).
+
+case               tclsh_ms    rtcl_ms    ratio
+arith_loop               41         40      0.9
+dict_ops                  8          8      1.0
+list_ops                 10          9      0.9
+proc_fib                  7         15      2.1
+string_build              6          8      1.3
+var_incr                 51         34      0.6

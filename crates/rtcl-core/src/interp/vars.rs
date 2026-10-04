@@ -664,9 +664,13 @@ impl Interp {
             // `::` qualifier, no upvar link) — the proc-local and
             // loop-variable case.  One hash probe, no allocation; the
             // slow path below keeps the full scope-chain semantics.
+            // The upvar/array sidecar probes are guarded by emptiness:
+            // an empty set can't contain the name, and the common frame
+            // (no upvars, no local arrays) then pays probes only for
+            // `locals` itself.
             if !name.contains("::") {
                 if let Some(frame) = self.frames.last() {
-                    if !frame.upvars.contains_key(name) {
+                    if frame.upvars.is_empty() || !frame.upvars.contains_key(name) {
                         // Slotted name: the slot is the canonical store (a
                         // table name is never in the map).  An empty cell is
                         // the unset state — the map probe below must not run.
@@ -677,7 +681,9 @@ impl Interp {
                             };
                         }
                         if let Some(v) = frame.locals.get(name) {
-                            if frame.array_locals.contains(name) {
+                            if !frame.array_locals.is_empty()
+                                && frame.array_locals.contains(name)
+                            {
                                 return Err(Error::runtime(
                                     format!("can't read \"{}\": variable is array", name),
                                     ErrorCode::Generic,
@@ -688,7 +694,7 @@ impl Interp {
                     }
                 } else if self.current_namespace.as_ref() == "::" && self.flat_aliases.is_empty() {
                     if let Some(v) = self.globals.get(name) {
-                        if self.array_globals.contains(name) {
+                        if !self.array_globals.is_empty() && self.array_globals.contains(name) {
                             return Err(Error::runtime(
                                 format!("can't read \"{}\": variable is array", name),
                                 ErrorCode::Generic,
@@ -819,7 +825,9 @@ impl Interp {
             if !name.contains("::") && self.dead_flat.is_empty() {
                 let mut wrote = false;
                 if let Some(frame) = self.frames.last_mut() {
-                    if !frame.upvars.contains_key(name) && !frame.array_locals.contains(name) {
+                    if (frame.upvars.is_empty() || !frame.upvars.contains_key(name))
+                        && (frame.array_locals.is_empty() || !frame.array_locals.contains(name))
+                    {
                         match frame.slot_index_of(name) {
                             // Slotted name: write the cell (creation of an
                             // unset slot reaches here via the slow path's
@@ -837,7 +845,7 @@ impl Interp {
                         }
                     }
                 } else if self.current_namespace.as_ref() == "::" && self.flat_aliases.is_empty() {
-                    if !self.array_globals.contains(name) {
+                    if self.array_globals.is_empty() || !self.array_globals.contains(name) {
                         if let Some(slot) = self.globals.get_mut(name) {
                             *slot = value.clone();
                             wrote = true;
@@ -885,7 +893,10 @@ impl Interp {
             return None;
         }
         if let Some(frame) = self.frames.last_mut() {
-            if frame.upvars.contains_key(name) || frame.array_locals.contains(name) {
+            if !frame.upvars.is_empty() && frame.upvars.contains_key(name) {
+                return None;
+            }
+            if !frame.array_locals.is_empty() && frame.array_locals.contains(name) {
                 return None;
             }
             match frame.slot_index_of(name) {
@@ -898,7 +909,7 @@ impl Interp {
         } else {
             if self.current_namespace.as_ref() != "::"
                 || !self.flat_aliases.is_empty()
-                || self.array_globals.contains(name)
+                || (!self.array_globals.is_empty() && self.array_globals.contains(name))
             {
                 return None;
             }
@@ -922,7 +933,10 @@ impl Interp {
             return None;
         }
         let slot = if let Some(frame) = self.frames.last_mut() {
-            if frame.upvars.contains_key(name) || frame.array_locals.contains(name) {
+            if !frame.upvars.is_empty() && frame.upvars.contains_key(name) {
+                return None;
+            }
+            if !frame.array_locals.is_empty() && frame.array_locals.contains(name) {
                 return None;
             }
             match frame.slot_index_of(name) {
@@ -934,7 +948,7 @@ impl Interp {
         } else {
             if self.current_namespace.as_ref() != "::"
                 || !self.flat_aliases.is_empty()
-                || self.array_globals.contains(name)
+                || (!self.array_globals.is_empty() && self.array_globals.contains(name))
             {
                 return None;
             }

@@ -447,3 +447,35 @@ var_incr                 44         34      0.7
 # Bench (interleaved, machine loaded — ranges wide): literal-heavy
 # micro (proc mk {} { list <16 literals> }, 300k calls) 253ms -> 169ms
 # (~1.5x); fib25 73.5 vs 73.3 (neutral); fe/dloop neutral in noise.
+
+# ---------------------------------------------------------------------------
+# G4 2026-10-04: var fast-path empty-set guards (G4a) + dict Fx hashing with
+# fmix64 finalizer (G4b).  G4a: get_var/set_var/take_var_fast/incr_var_fast
+# guarded their upvar/array sidecar probes with set-emptiness checks (an
+# empty set can't contain the name — pure equivalence), removing 1-2
+# sidecar hash probes per var access on common frames.  G4b: DictMap's
+# Ordered/Unordered moved from std SipHash to a local Fx multiply-mix
+# (rtcl-vm std-only, dependency direction forbids importing varmap's).
+# COLLISION POST-MORTEM (why G4b carries an fmix64 finalizer): the first
+# cut returned the raw multiply-mix hash, and hashbrown picks buckets from
+# the LOW bits — which a multiply-mix leaves dependent only on the first
+# ~2 bytes.  dloop's keys all share the 3-byte prefix "key" (digits start
+# at bit 24), so all 300k keys were congruent mod the 2^19 table mask:
+# every insert into one probe chain, insert_full 30% of profile, dloop
+# 0.85s vs 0.53s (a REGRESSION, caught by the interleaved A/B gate).
+# The variable tables never hit this (small tables, early-distinct short
+# names).  Fix: `finish` runs murmur3 fmix64 (bijection, full avalanche —
+# low bits depend on ALL key bytes; ~2 multiplies).  Iteration order is
+# unaffected: Ordered keeps insertion order, Unordered's was never
+# specified (`dict create -unordered` is an rtcl extension).
+# Gates: judge 87/87; sweep 0 diffs (strict); tests 1143; feature matrix
+# green (embedded + no-default + std variants); dict smoke vs tclsh
+# byte-exact three-way (create/get/set/unset order incl. overwrite-position
+# and reinsert-at-end, nested set/unset, dict with/lappend/incr/append,
+# merge/filter/map/replace/update, dict for order, keys/values/size,
+# 40-key insertion order, nested-list values, error texts+errorInfo) —
+# and byte-identical against the G3 binary (pre-change oracle).
+# Bench (interleaved best-of-5, load ~7): dloop 0.50 -> 0.44s (~12%,
+# G4b's target); g3_lit 0.33 -> 0.28 (~10%); fib25/fe_bench neutral;
+# dict_ops 11 -> 10ms, list_ops 11 -> 10, var_incr 47 -> 44, proc_fib
+# 16 -> 15 (all same-or-better within granularity).

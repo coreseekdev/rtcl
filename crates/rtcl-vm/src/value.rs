@@ -26,6 +26,74 @@ use std::collections::HashMap;
 use indexmap::IndexMap;
 use smallvec::SmallVec;
 
+// ── dict-key hashing ───────────────────────────────────────────
+// Unkeyed multiply-mix hasher for dict keys — the same shape and
+// rationale as the interpreter's variable tables (rtcl-core's
+// interp/varmap.rs: ~2ns vs ~20ns per short-key probe; tclsh hashes
+// script-provided dict keys unkeyed too).  Neither dict variant's
+// ITERATION order depends on it: `Ordered` keeps insertion order,
+// `Unordered`'s order was never specified.  Duplicated here because
+// the dependency edge runs rtcl-core -> rtcl-vm.
+const FX_SEED: u64 = 0x517c_c1b7_2722_0a95;
+
+#[derive(Default, Clone)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+}
+
+// Only `write` + `write_u8` are exercised (`Hash for str` decomposes to
+// those) — same note as varmap.rs.
+//
+// Unlike the variable tables, dicts grow to 100k+ script-chosen keys, and
+// hashbrown picks the bucket from the LOW bits of the finished hash.  A
+// raw multiply-mix leaves those low bits dependent only on the first ~2
+// bytes (a shared prefix like "key<i>" makes every key congruent mod the
+// table mask — 300k inserts into one probe chain, quadratic).  `finish`
+// therefore runs murmur3's fmix64 avalanche over the accumulated word:
+// a bijection (distinct keys stay distinct) whose low bits depend on ALL
+// input bytes.  ~2 multiplies — still far below SipHash.
+impl core::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let mut x = self.hash;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        x ^= x >> 33;
+        x
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_le_bytes(c.try_into().unwrap()));
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rem.len()].copy_from_slice(rem);
+            self.add(u64::from_le_bytes(buf));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add(i as u64);
+    }
+}
+
+type FastBuild = std::hash::BuildHasherDefault<FxHasher>;
+type FastIndexMap = IndexMap<String, Value, FastBuild>;
+type FastHashMap = HashMap<String, Value, FastBuild>;
+
 /// Maximum inline string length before heap allocation
 const INLINE_SIZE: usize = 23;
 
@@ -57,23 +125,23 @@ pub enum InternalRep {
 /// - `Unordered`: backed by `HashMap`, no order guarantee (faster for large dicts)
 #[derive(Debug, Clone)]
 pub enum DictMap {
-    Ordered(IndexMap<String, Value>),
-    Unordered(HashMap<String, Value>),
+    Ordered(FastIndexMap),
+    Unordered(FastHashMap),
 }
 
 impl Default for DictMap {
-    fn default() -> Self { DictMap::Ordered(IndexMap::new()) }
+    fn default() -> Self { DictMap::Ordered(FastIndexMap::default()) }
 }
 
 impl DictMap {
-    pub fn ordered() -> Self { DictMap::Ordered(IndexMap::new()) }
-    pub fn unordered() -> Self { DictMap::Unordered(HashMap::new()) }
+    pub fn ordered() -> Self { DictMap::Ordered(FastIndexMap::default()) }
+    pub fn unordered() -> Self { DictMap::Unordered(FastHashMap::default()) }
 
     pub fn ordered_with_capacity(cap: usize) -> Self {
-        DictMap::Ordered(IndexMap::with_capacity(cap))
+        DictMap::Ordered(FastIndexMap::with_capacity_and_hasher(cap, FastBuild::default()))
     }
     pub fn unordered_with_capacity(cap: usize) -> Self {
-        DictMap::Unordered(HashMap::with_capacity(cap))
+        DictMap::Unordered(FastHashMap::with_capacity_and_hasher(cap, FastBuild::default()))
     }
 
     pub fn is_ordered(&self) -> bool { matches!(self, DictMap::Ordered(_)) }
@@ -386,7 +454,7 @@ impl Value {
 
     /// Create a dict value from key-value pairs (ordered).
     pub fn from_dict_pairs(pairs: &[(Value, Value)]) -> Self {
-        let mut map = IndexMap::with_capacity(pairs.len());
+        let mut map = FastIndexMap::with_capacity_and_hasher(pairs.len(), FastBuild::default());
         for (k, v) in pairs {
             map.insert(k.as_str().to_string(), v.clone());
         }

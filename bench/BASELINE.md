@@ -503,3 +503,44 @@ var_incr                 44         34      0.7
 # Remaining fib hotspots for the next profile round: call_proc 24.9%
 # (share inflated by the shrunken rest), memmove 3.9%, bignum int_rep
 # 2.5%, as_int 2.5%, pop_val 2.4%.
+
+# ---------------------------------------------------------------------------
+# G6 2026-10-05: OO method-body compilation (memo) + bare `self` parity.
+# exec_chain_entry rebuilt the synthetic method ProcDef per call — two
+# full-body String copies (link_prefix push_str + Rc::from), a fresh
+# params Vec, compiled: None (call_proc then eval'd through the bytecode
+# cache's full-text probe), for EVERY method invocation.  tclsh compiles
+# a method body once and keeps it on the method record.  Change:
+# `MethodDef.proc_memo: Rc<RefCell<Option<(String, Rc<ProcDef>)>>>` —
+# filled on first call when the defining owner declares NO `variable`s
+# (the assembled body is then def.body verbatim, a pure function of
+# def + invoked method name; keyed by the typed name because params[0]
+# feeds the arity-usage text and `info level 0`).  Owners WITH variables
+# keep the rebuild (the prefix follows the live variable lists).
+# Invalidation is structural: (re)definition installs a fresh MethodDef
+# (set_method), `export` toggling is the only in-place mutation and
+# never enters the memo; the shared ProcDef is never written back (OO
+# statics are always empty, so call_proc's Rc::make_mut statics
+# write-back cannot fire) and its compiled form goes through call_proc's
+# per-call epoch/applicability gate exactly like a named proc's — plus
+# it unlocks the E2 slot-locals binding for method bodies.
+# Also fixed (found by the smoke, pre-existing, both engines): `self`
+# with no arguments now returns the object's qualified name (tclsh
+# parity; it was `wrong # args: should be "self subcommand"`).  Probes
+# never caught it — the sweep is engine-vs-engine and both arms erred.
+# Gates: judge 87/87; sweep 0 (incl. new probe oo17); tests 1143/0;
+# feature matrix: std variants + rtcl-vm no-default + wasm32 green
+# (rtcl-core `embedded` no_std is broken PRE-EXISTING — 2231 errors at
+# G5 too — unchanged, not this round's doing).  OO smoke (oo17.tcl,
+# 15 sections: memo/rebuild paths, my/next, redefinition mid-flight,
+# export toggling after memo fill, forward, ctor/dtor, oo::copy,
+# recursion through the shared ProcDef, tailcall in a memoised method,
+# arity text, info level 0, error framing) byte-exact vs tclsh 8.6.17.
+# Bench (1M method calls, interleaved best-of-3, load ~3): memo path
+# 1543 -> 1317ms (~15%); vars path 2652 -> 2543 (unchanged path, noise);
+# tclsh 393/449 — OO call gap 3.9x -> 3.3x.  fib25/dloop neutral.
+# Remaining OO per-call cost for the profile round: build_chain rebuilds
+# the resolution order per call and ActiveMethod clones the whole chain
+# (chain.to_vec() — every ChainEntry's params Vec + body String) per
+# invocation; oo::object dispatch is ~3.3x tclsh while method BODIES now
+# match named-proc speed.

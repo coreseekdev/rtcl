@@ -32,6 +32,7 @@ use crate::interp::commands::misc;
 use crate::interp::commands::namespace::{normalise, parent_of, qualify};
 use crate::interp::{Interp, ProcDef, Rc};
 use crate::value::Value;
+use core::cell::RefCell;
 
 #[cfg(not(feature = "embedded"))]
 use std::collections::HashMap;
@@ -65,6 +66,17 @@ pub(crate) struct MethodDef {
     pub body: String,
     pub exported: bool,
     pub kind: MethodKind,
+    /// Compiled form of the assembled method [`ProcDef`], memoised for the
+    /// no-`variable` case (see `memoised_proc_def`): `(typed method name,
+    /// ProcDef)`.  `Rc<RefCell<..>>` so chain clones share one cell; a
+    /// redefinition installs a fresh `MethodDef` (fresh cell), retiring the
+    /// memo with its inputs.
+    pub proc_memo: Rc<RefCell<Option<(String, Rc<ProcDef>)>>>,
+}
+
+/// A fresh [`MethodDef::proc_memo`] cell.
+fn fresh_memo() -> Rc<RefCell<Option<(String, Rc<ProcDef>)>>> {
+    Rc::new(RefCell::new(None))
 }
 
 /// Whose definition a chain entry comes from.  `variable` linking and
@@ -164,7 +176,7 @@ pub(crate) struct OoState {
 // ── init ───────────────────────────────────────────────────────────────
 
 fn builtin_method(name: &'static str) -> MethodDef {
-    MethodDef { params: Vec::new(), body: String::new(), exported: true, kind: MethodKind::Builtin(name) }
+    MethodDef { params: Vec::new(), body: String::new(), exported: true, kind: MethodKind::Builtin(name), proc_memo: fresh_memo() }
 }
 
 fn register_object_command(interp: &mut Interp, key: &str, func: crate::command::CommandFunc) {
@@ -655,20 +667,22 @@ fn exec_chain_entry(
             // Link the defining owner's `variable`s (skipping names bound
             // as parameters, including the synthetic method-name param).
             let vars = owner_variables(interp, &entry.owner, key);
-            let mut body = link_prefix(&vars, &entry.def.params);
-            body.push_str(&entry.def.body);
 
-            // The synthetic first parameter carries the method name so
-            // arity errors read `wrong # args: should be "obj m a b"` and
-            // `info level 0` is `obj m x`.
-            let mut params: Vec<(String, Option<String>)> =
-                vec![(method.to_string(), None)];
-            params.extend(entry.def.params.iter().cloned());
-            let proc_def = ProcDef {
-                params: super::super::Rc::new(params),
-                body: super::super::Rc::from(body),
-                statics: super::super::Rc::new(HashMap::new()),
-                compiled: None,
+            // tclsh compiles a method body once and caches the compiled
+            // form on the method record; rtcl rebuilt this ProcDef per
+            // call — two full-body String copies plus the bytecode
+            // cache's full-text probe inside call_proc's eval.  An owner
+            // with no `variable` declarations assembles to `def.body`
+            // verbatim (a pure function of def + invoked method name),
+            // so that case memoises on the MethodDef; owners WITH
+            // variables keep the rebuild (the prefix follows the live
+            // variable lists).
+            let proc_def: Rc<ProcDef> = if vars.is_empty() {
+                memoised_proc_def(interp, &entry.def, method)
+            } else {
+                let mut body = link_prefix(&vars, &entry.def.params);
+                body.push_str(&entry.def.body);
+                Rc::new(method_proc_def(&body, &entry.def.params, method))
             };
 
             let mut args: Vec<Value> =
@@ -702,6 +716,62 @@ fn link_prefix(vars: &[String], params: &[(String, Option<String>)]) -> String {
     } else {
         format!("variable {};", link.join(" "))
     }
+}
+
+/// Build the synthetic method [`ProcDef`] for `body` (already carrying
+/// any `variable` link prefix).  The first parameter carries the invoked
+/// method's name so arity errors read `wrong # args: should be
+/// "obj m a b"` and `info level 0` is `obj m x`.
+fn method_proc_def(
+    body: &str,
+    def_params: &[(String, Option<String>)],
+    method: &str,
+) -> ProcDef {
+    let mut params: Vec<(String, Option<String>)> = vec![(method.to_string(), None)];
+    params.extend(def_params.iter().cloned());
+    ProcDef {
+        params: Rc::new(params),
+        body: Rc::from(body),
+        statics: Rc::new(HashMap::new()),
+        compiled: None,
+    }
+}
+
+/// Memoised [`ProcDef`] for a method whose defining owner declares no
+/// `variable`s: the assembled body is `def.body` verbatim, so
+/// params/body/bytecode are pure functions of (def, method) — built and
+/// compiled once, shared by every invocation (tclsh caches the compiled
+/// body on its method record the same way).  Keyed by the typed method
+/// name (params[0] feeds the arity-usage text and `info level 0`); a
+/// mismatch or an empty memo just rebuilds.  Method (re)definition
+/// installs a fresh `MethodDef`, retiring the memo with its inputs;
+/// `export` toggling is the only in-place mutation and does not enter
+/// the memo.  The shared `Rc<ProcDef>` is never written back: OO
+/// statics are always empty, so `call_proc`'s `Rc::make_mut` write-back
+/// cannot fire, and its per-call epoch/applicability gate keeps a stale
+/// compiled form on the tree-walk exactly like a named proc's.
+fn memoised_proc_def(interp: &mut Interp, def: &MethodDef, method: &str) -> Rc<ProcDef> {
+    {
+        let memo = def.proc_memo.borrow();
+        if let Some((n, d)) = memo.as_ref() {
+            if n == method {
+                return Rc::clone(d);
+            }
+        }
+    }
+    let mut pd = method_proc_def(&def.body, &def.params, method);
+    // Compile at the same seam named `proc`s use; the compiled form also
+    // unlocks call_proc's slot-locals binding (empty statics, params
+    // seeded in order — the synthetic name first, by construction).
+    let compiled =
+        super::super::vm_exec::compile_proc_body(&pd.params, &def.body, interp.tier1_epoch);
+    if let Some(code) = &compiled {
+        interp.const_pool_insert(code);
+    }
+    pd.compiled = compiled;
+    let proc_def = Rc::new(pd);
+    *def.proc_memo.borrow_mut() = Some((method.to_string(), Rc::clone(&proc_def)));
+    proc_def
 }
 
 fn object_ns_of(interp: &Interp, key: &str) -> String {
@@ -804,7 +874,12 @@ fn chain_desc(entry: &ChainEntry, method: &str) -> Value {
 
 extern "Rust" fn cmd_oo_self(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(Error::wrong_args_with_usage("self", 2, args.len(), "subcommand"));
+        // `self` with no arguments is the object's fully-qualified name —
+        // the same value `self object` yields (tclsh 8.6.17).
+        return match top_active(interp) {
+            Some(a) => Ok(Value::from_str(&a.obj)),
+            None => Err(Error::invalid_command("self")),
+        };
     }
     let word = args[1].as_str();
     let sub = match resolve_sub(word, SELF_SUBCMDS) {
@@ -1434,6 +1509,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                 body: rest[2].as_str().to_string(),
                 exported: name_exports(&name),
                 kind: MethodKind::Tcl,
+                proc_memo: fresh_memo(),
             };
             set_method(interp, &target, &name, def)
         }
@@ -1452,6 +1528,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     cmd: rest[1].as_str().to_string(),
                     prefix: rest[2..].iter().map(|v| v.as_str().to_string()).collect(),
                 },
+                proc_memo: fresh_memo(),
             };
             set_method(interp, &target, &name, def)
         }
@@ -1538,6 +1615,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                         body: rest[1].as_str().to_string(),
                         exported: false,
                         kind: MethodKind::Tcl,
+                        proc_memo: fresh_memo(),
                     });
                 }
             }
@@ -1557,6 +1635,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                         body: rest[0].as_str().to_string(),
                         exported: false,
                         kind: MethodKind::Tcl,
+                        proc_memo: fresh_memo(),
                     });
                 }
             }

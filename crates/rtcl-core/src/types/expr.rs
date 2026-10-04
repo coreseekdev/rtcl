@@ -465,6 +465,16 @@ impl<'a> ExprParser<'a> {
         if self.peek() == '[' {
             self.advance();
             let cmd = self.collect_bracket_command();
+            // An operand bracket of a COMPILED expression inlines into
+            // the surrounding unit (ExprMark) — the tree-walk twin keeps
+            // the proc-unit context for it (a foreach dispatched from
+            // inside the bracket then takes compiled semantics, matching
+            // the unit the compiler would have built).  Brackets inside
+            // quoted-string substitution below stay plain nested evals
+            // — the compiler emits EvalScript for those.
+            if self.interp.lexical_body {
+                self.interp.next_eval_lexical = true;
+            }
             return self.interp.eval(&cmd);
         }
 

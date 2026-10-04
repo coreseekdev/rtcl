@@ -20,6 +20,46 @@ struct ActiveLoop {
     break_pc: u32,
 }
 
+/// One active inline foreach/lmap: the strict-parsed data lists, the
+/// current iteration index, and (lmap) the body results so far.
+struct ForeachLoop {
+    info_idx: u32,
+    lists: Vec<Vec<Value>>,
+    idx: usize,
+    collected: Option<Vec<Value>>,
+}
+
+/// Bind iteration `idx` of every group through the context's name-keyed
+/// variable writes (no slot machinery in this VM — see the op arms).
+fn foreach_bind(
+    ctx: &mut dyn VmContext,
+    code: &ByteCode,
+    foreaches: &mut [ForeachLoop],
+    _stack: &mut Vec<Value>,
+) -> Result<()> {
+    // Split borrows: the shape table (code) and the loop state are
+    // disjoint from ctx, which the writes need mutably.
+    let fl = foreaches.last_mut().expect("foreach loop");
+    let info_idx = fl.info_idx;
+    let idx = fl.idx;
+    let lists = &fl.lists;
+    let Some(info) = code.foreach_info(info_idx) else {
+        return Ok(());
+    };
+    for (g, list) in info.groups.iter().zip(lists.iter()) {
+        let n = g.len();
+        for (vi, t) in g.iter().enumerate() {
+            let name = code.get_const(t.name_idx).unwrap_or("");
+            let v = list
+                .get(idx * n + vi)
+                .cloned()
+                .unwrap_or_else(Value::empty);
+            ctx.set_var(name, v)?;
+        }
+    }
+    Ok(())
+}
+
 /// Execute a compiled [`ByteCode`] block using the given [`VmContext`].
 ///
 /// Returns the final value left on the stack (or empty if the stack is
@@ -29,6 +69,7 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
     let mut pc: usize = 0;
     let mut stack: Vec<Value> = Vec::with_capacity(32);
     let mut loops: Vec<ActiveLoop> = Vec::new();
+    let mut foreaches: Vec<ForeachLoop> = Vec::new();
     let mut expand_mark: usize = 0;
 
     while pc < ops.len() {
@@ -170,6 +211,85 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             }
             OpCode::LoopExit => {
                 loops.pop();
+            }
+            // ── Inline foreach/lmap ────────────────────────────────
+            // This standalone VM has no compiled-locals/slot machinery;
+            // the interpreter's executor (rtcl-core::vm_exec) owns the
+            // full semantics (slots, degrade frames, error framing).
+            // Here the loop runs value-level: pop the data lists, bind
+            // names through the context, collect for lmap.
+            OpCode::ForeachStart { info, next, end } => {
+                let fi = code
+                    .foreach_info(*info)
+                    .expect("foreach info index");
+                let ngroups = fi.groups.len();
+                let mut lists = Vec::with_capacity(ngroups);
+                for _ in 0..ngroups {
+                    let v = stack.pop().unwrap_or_else(Value::empty);
+                    lists.push(v.as_list().unwrap_or_default());
+                }
+                lists.reverse();
+                let max = fi
+                    .groups
+                    .iter()
+                    .zip(&lists)
+                    .map(|(g, l)| l.len().div_ceil(g.len().max(1)))
+                    .max()
+                    .unwrap_or(0);
+                foreaches.push(ForeachLoop {
+                    info_idx: *info,
+                    lists,
+                    idx: 0,
+                    collected: fi.lmap.then(Vec::new),
+                });
+                loops.push(ActiveLoop {
+                    continue_pc: *next,
+                    break_pc: *end,
+                });
+                if max == 0 {
+                    pc = *end as usize;
+                } else {
+                    foreach_bind(ctx, code, &mut foreaches, &mut stack)?;
+                }
+            }
+            OpCode::ForeachNext { info, body } => {
+                let fi = code
+                    .foreach_info(*info)
+                    .expect("foreach info index");
+                let (idx, max) = {
+                    let fl = foreaches.last().expect("foreach loop");
+                    let max = fi
+                        .groups
+                        .iter()
+                        .zip(&fl.lists)
+                        .map(|(g, l)| l.len().div_ceil(g.len().max(1)))
+                        .max()
+                        .unwrap_or(0);
+                    (fl.idx + 1, max)
+                };
+                if idx < max {
+                    foreaches.last_mut().unwrap().idx = idx;
+                    foreach_bind(ctx, code, &mut foreaches, &mut stack)?;
+                    pc = *body as usize;
+                }
+                // done → fall through to ForeachEnd
+            }
+            OpCode::ForeachCollect => {
+                let v = stack.pop().unwrap_or_else(Value::empty);
+                if let Some(fl) = foreaches.last_mut() {
+                    if let Some(c) = &mut fl.collected {
+                        c.push(v);
+                    }
+                }
+            }
+            OpCode::ForeachEnd => {
+                loops.pop();
+                let fl = foreaches.pop();
+                let v = match fl.and_then(|f| f.collected) {
+                    Some(c) => Value::from_list(&c),
+                    None => Value::empty(),
+                };
+                stack.push(v);
             }
             OpCode::Break => {
                 if let Some(active) = loops.last() {

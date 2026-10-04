@@ -35,6 +35,7 @@ pub use opcode::OpCode;
 pub use opcode::CmdId;
 pub use bytecode::ByteCode;
 pub use compiler::Compiler;
+pub use compiler::split_varlist_simple;
 
 // ---------------------------------------------------------------------------
 // AST types

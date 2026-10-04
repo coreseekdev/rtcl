@@ -17,7 +17,18 @@ use super::list::set_error_code;
 /// line — not within the body text (`if {0} {…} else { nosuch }` on the
 /// proc body's second line reports line 2, not 1).  A body from a variable
 /// keeps the unshifted numbering (origin unknowable).
-fn eval_arm_body(interp: &mut Interp, word_idx: usize, script: &str) -> Result<Value> {
+///
+/// `same_unit`: the compiler inlined this `if` (all arms verbatim; see
+/// [`if_inline_body_indices`]) — the arm body is part of the proc's unit,
+/// so its script keeps the lexical (compiled-context) evaluation, and a
+/// foreach dispatched from inside it takes the compiled semantics exactly
+/// as it would inside the unit the compiler built.
+fn eval_arm_body(
+    interp: &mut Interp,
+    word_idx: usize,
+    script: &str,
+    same_unit: bool,
+) -> Result<Value> {
     let saved_offset = interp.line_offset;
     let offset = match interp.body_is_verbatim_script(word_idx, script) {
         Some(extra) => Some(saved_offset + interp.cur_cmd_line.max(1) - 1 + extra),
@@ -25,6 +36,9 @@ fn eval_arm_body(interp: &mut Interp, word_idx: usize, script: &str) -> Result<V
     };
     if let Some(off) = offset {
         interp.line_offset = off;
+    }
+    if same_unit {
+        interp.next_eval_lexical = true;
     }
     let r = interp.eval(script);
     interp.line_offset = saved_offset;
@@ -41,12 +55,67 @@ fn eval_arm_body(interp: &mut Interp, word_idx: usize, script: &str) -> Result<V
     r
 }
 
+/// Value-level mirror of `Compiler::compile_if`'s structural walk: the
+/// word indices of every body this `if` could run, `Some` only when the
+/// word sequence matches the grammar the compiler inlines — any
+/// deviation (dangling keyword, non-keyword word after a body, trailing
+/// words after `else`, non-literal keyword words) means the compiler
+/// dispatches the real `if`, so the tree side must not preserve the unit
+/// context through the bodies either (a foreach inside them stays
+/// dispatched in BOTH engines).
+fn if_inline_body_indices(interp: &Interp, args: &[Value]) -> Option<Vec<usize>> {
+    let is_kw = |i: usize, kw: &str| {
+        args.get(i).is_some_and(|v| v.as_str() == kw) && interp.word_is_plain_literal(i, kw)
+    };
+    let n = args.len();
+    let mut idxs = Vec::new();
+    let mut i = 2usize;
+    loop {
+        if i >= n {
+            return None; // dangling keyword / no body
+        }
+        i += 1; // past the condition
+        if is_kw(i, "then") {
+            i += 1;
+        }
+        if i >= n {
+            return None; // condition without body
+        }
+        idxs.push(i);
+        i += 1;
+        if i >= n {
+            break;
+        }
+        if is_kw(i, "elseif") {
+            i += 1;
+        } else if is_kw(i, "else") {
+            i += 1;
+            if i + 1 != n {
+                return None; // missing body / trailing words
+            }
+            idxs.push(i);
+            break;
+        } else {
+            return None; // implicit-arm shape: the compiler DynCalls
+        }
+    }
+    Some(idxs)
+}
+
 pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_msg(
             "wrong # args: no expression after \"if\" argument",
         ));
     }
+
+    // The compiler's all-or-nothing inline decision, evaluated before any
+    // arm runs: every body of a structurally inlinable `if` is part of
+    // the proc's unit, so all of them keep the lexical context.
+    let same_unit = interp.lexical_body
+        && if_inline_body_indices(interp, args).is_some_and(|idxs| {
+            idxs.iter().all(|&bi| interp.body_would_compile(bi, args[bi].as_str()))
+        });
 
     let expr = args[1].as_str();
     let cond = interp.eval_expr(expr)?;
@@ -65,7 +134,7 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     if crate::types::expr_funcs::strict_bool(&cond)? {
-        return eval_arm_body(interp, i, args[i].as_str());
+        return eval_arm_body(interp, i, args[i].as_str(), same_unit);
     }
     i += 1;
 
@@ -93,7 +162,7 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     )));
                 }
                 if crate::types::expr_funcs::strict_bool(&cond)? {
-                    return eval_arm_body(interp, i, args[i].as_str());
+                    return eval_arm_body(interp, i, args[i].as_str(), same_unit);
                 }
                 i += 1;
             }
@@ -108,10 +177,10 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         "wrong # args: extra words after \"else\" clause in \"if\" command",
                     ));
                 }
-                return eval_arm_body(interp, i + 1, args[i + 1].as_str());
+                return eval_arm_body(interp, i + 1, args[i + 1].as_str(), same_unit);
             }
             _ => {
-                return eval_arm_body(interp, i, word);
+                return eval_arm_body(interp, i, word, same_unit);
             }
         }
     }
@@ -674,7 +743,21 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let result_var = if args.len() > 2 { Some(args[2].as_str()) } else { None };
     let opts_var = if args.len() > 3 { Some(args[3].as_str()) } else { None };
 
-    let caught = interp.eval(script);
+    // tclsh compiles a braced catch body INLINE into the enclosing unit
+    // when that unit is a proc context (compiledLocals): the body then
+    // runs with compiled/lexical semantics — construct bodies frameless,
+    // loop-variable writes plain.  Everywhere else (top level, eval'd
+    // strings, uplevel) the body is its own dispatched unit with the
+    // decorated shapes.  Mirror the split: `lexical_body` is the
+    // tree-walk's compiled-context flag, `in_locals_unit` the compiled
+    // executor's — either way a braces-only verbatim body runs lexically.
+    let same_unit = (interp.lexical_body || interp.in_locals_unit)
+        && interp.body_would_compile(1, script);
+    let caught = if same_unit {
+        interp.eval_lexical_script(script)
+    } else {
+        interp.eval(script)
+    };
     match caught {
         Ok(v) => {
             if let Some(var) = result_var {

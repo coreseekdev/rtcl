@@ -326,6 +326,37 @@ pub enum OpCode {
     /// Leave a loop context.
     LoopExit,
 
+    // ── Inline foreach/lmap (D) ────────────────────────────────────────────
+    //
+    // One compiled `foreach`/`lmap` per `ForeachInfo` table entry.  The
+    // var-lists resolved at compile time (slot or name targets), the data
+    // lists strict-parsed and bound per iteration at runtime — exactly
+    // tclsh's INST_FOREACH layout.  `ForeachStart` also pushes the loop
+    // frame (`cont`/`brk` patched to the ForeachNext/ForeachEnd PCs), so
+    // compiled `Break`/`Continue` and error-form signals route through
+    // the ordinary loop machinery.
+
+    /// Pop the group data lists, strict-parse them, push the foreach
+    /// frame + loop frame, bind iteration 0 and fall into the body — or
+    /// jump straight to `end` when every list is too short to iterate.
+    /// Operand indexes [`ByteCode::foreach_infos`].
+    ForeachStart { info: u32, next: u32, end: u32 },
+
+    /// Advance to the next iteration: done → fall through to the closing
+    /// [`OpCode::ForeachEnd`]; otherwise bind the new index's values and
+    /// jump to `body` (a [`OpCode::BodyMark`]).
+    ForeachNext { info: u32, body: u32 },
+
+    /// lmap only: pop the body's result into the foreach frame's
+    /// collected list (foreach compiles a plain `Pop` instead).
+    ForeachCollect,
+
+    /// Close the loop: pop the loop frame and the foreach frame, push the
+    /// construct's result — the empty string for `foreach`, the collected
+    /// body results for `lmap` (results accumulated before a `break` are
+    /// kept; `continue` skips its iteration's collection).
+    ForeachEnd,
+
     /// Break out of the innermost loop.
     /// If executing inside a direct bytecode loop, the VM jumps to the
     /// loop's `brk` target.  If no loop is active (e.g. break inside a
@@ -556,6 +587,14 @@ impl fmt::Display for OpCode {
                 write!(f, "LOOP_ENTER cont={} brk={}", cont, brk)
             }
             OpCode::LoopExit => write!(f, "LOOP_EXIT"),
+            OpCode::ForeachStart { info, next, end } => {
+                write!(f, "FOREACH_START info={} next={} end={}", info, next, end)
+            }
+            OpCode::ForeachNext { info, body } => {
+                write!(f, "FOREACH_NEXT info={} body={}", info, body)
+            }
+            OpCode::ForeachCollect => write!(f, "FOREACH_COLLECT"),
+            OpCode::ForeachEnd => write!(f, "FOREACH_END"),
             OpCode::Break => write!(f, "BREAK"),
             OpCode::Continue => write!(f, "CONTINUE"),
 

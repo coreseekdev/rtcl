@@ -289,6 +289,11 @@ pub struct Interp {
     /// body/next resident (tclsh instead compiles loop bodies inline into
     /// the surrounding bytecode and pays nothing per iteration).
     pub(crate) body_memo: Vec<(Value, Rc<rtcl_parser::ByteCode>)>,
+    /// Compiled lambda bodies keyed by the apply term string — the term
+    /// IS the lambda's identity, so params/body/bytecode are pure
+    /// functions of it (tclsh caches the compiled form on the lambda
+    /// obj).  Bounded like the parse cache (wasm32 is a target).
+    pub(crate) lambda_code_cache: HashMap<String, Rc<rtcl_parser::ByteCode>>,
     /// `check_expr` verdict memo: expr text → `Err(msg)` on syntax error,
     /// `Ok(())` when clean (see `types::expr::eval_expr`).  Pure function
     /// of the text; loop conditions re-check every iteration.
@@ -353,6 +358,15 @@ pub struct Interp {
     /// `test` compiled `set ::g 0` inline, then `proc set` shadowed it —
     /// tclsh re-resolves and so must we).
     pub(crate) tier1_epoch: u64,
+    /// True while executing a compiled PROC-CONTEXT unit (`locals_mode`:
+    /// proc bodies, compiled lambda bodies) — the runtime mirror of
+    /// tclsh's compiledLocals context.  DynCall'd commands consult it to
+    /// reproduce semantics the compiler bakes in at inline sites
+    /// (cmd_catch: a braced body runs lexically — its constructs inline,
+    /// loop-variable writes stay plain — instead of as a fresh
+    /// dispatched unit).  Cleared at every fresh-unit boundary (`eval`
+    /// of a new text), like `lexical_body`.
+    pub(crate) in_locals_unit: bool,
     /// Eval-level (no call frame) variable aliases created by `upvar` /
     /// `variable`: canonical local flat key → canonical target flat key.
     /// At the global level tclsh's `upvar`/`variable` link two variables;
@@ -425,6 +439,21 @@ pub struct Interp {
     /// nested eval already logged its frames; the enclosing command logs
     /// none and marks [`Interp::err_pending_top`] instead).
     pub(crate) err_from_subst: bool,
+    /// The script unit currently tree-walking is part of a proc body —
+    /// the context tclsh compiles foreach/lmap in (compiledLocals), so
+    /// dispatched `foreach` takes the compiled semantics (frameless body
+    /// errors, absolute lines, plain var-write errors).  Arming a
+    /// construct's body for "same unit" (while/for/if-arm bodies,
+    /// `[...]` words, expr-operand brackets — the seams the compiler
+    /// inlines into the surrounding unit) sets
+    /// [`Interp::next_eval_lexical`]; `eval` consumes it at entry and
+    /// restores this field on exit.  `exec_bytecode` runs its unit with
+    /// this cleared: a DynCall'd command inside compiled unit is tclsh's
+    /// INST_CALL fallback — dispatched semantics.
+    pub(crate) lexical_body: bool,
+    /// Pending "the next `eval` is part of the current proc body unit"
+    /// request (see [`Interp::lexical_body`]).
+    pub(crate) next_eval_lexical: bool,
     /// Source of the outermost command whose word substitution errored,
     /// waiting to see if the error escapes uncaught — the top-level
     /// report then adds `invoked from within "<text>"` (tclsh logs the
@@ -531,6 +560,8 @@ impl Interp {
             cur_cmd_text: rtcl_parser::SrcSpan { start: 0, end: 0 },
             cur_source: Rc::from(""),
             err_from_subst: false,
+            lexical_body: false,
+            next_eval_lexical: false,
             err_pending_top: None,
             ns_level0: Vec::new(),
             ns_stack: Vec::new(),
@@ -544,6 +575,8 @@ impl Interp {
             parse_cache: HashMap::new(),
             bytecode_cache: HashMap::new(),
             body_memo: Vec::new(),
+            lambda_code_cache: HashMap::new(),
+            in_locals_unit: false,
             expr_check_cache: HashMap::new(),
             call_depth: 0,
             max_call_depth: 1000,

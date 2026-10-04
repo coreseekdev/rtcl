@@ -484,6 +484,13 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(wrong_args("lmap", "varList list ?varList list ...? command"));
     }
 
+    // The compiled shape — identical gates to foreach (tclsh compiles both
+    // the same way inside proc bodies): frameless body errors, plain
+    // var-writes, results collected.
+    if interp.lexical_body && super::loops::foreach_inline_shape(interp, args) {
+        return super::loops::foreach_lexical(interp, args, true);
+    }
+
     let body = &args[args.len() - 1];
     let mut collected: Vec<Value> = Vec::new();
 
@@ -519,7 +526,26 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             for (vi, var) in g.vars.iter().enumerate() {
                 let data_idx = idx * n + vi;
                 let value = g.data.get(data_idx).cloned().unwrap_or_else(Value::empty);
-                interp.set_var(var, value)?;
+                if let Err(e) = interp.set_var(var, value) {
+                    // Dispatched lmap decorates a loop-variable write
+                    // failure exactly like dispatched foreach (probed
+                    // tclsh 8.6.17: the `(setting lmap loop variable)`
+                    // frame replaces the `while executing` one, and TCL
+                    // WRITE VARNAME installs as ::errorCode).
+                    if interp.err_is_error(&e) {
+                        set_error_code(interp, "TCL WRITE VARNAME");
+                        if interp.err_info.is_none() {
+                            interp.err_info = Some(e.message_text());
+                        }
+                        if let Some(info) = &mut interp.err_info {
+                            info.push_str(&format!(
+                                "\n    (setting lmap loop variable \"{}\")",
+                                var
+                            ));
+                        }
+                    }
+                    return Err(e);
+                }
             }
         }
         // A `return -level 0 $v` completes as an ordinary command
@@ -528,8 +554,18 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         match interp.eval_body_value(body) {
             Ok(v) => collected.push(v),
             Err(e) => {
-                if e.is_break() { break; }
-                if e.is_continue() { continue; }
+                if e.is_break() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    break;
+                }
+                if e.is_continue() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    continue;
+                }
+                // Dispatched lmap adds its own body exit frame between the
+                // failing command's frame and the lmap command's harness
+                // frame (probed: `("lmap" body line N)`, body-relative).
+                interp.err_exit_frame("\"lmap\" body");
                 return Err(e);
             }
         }

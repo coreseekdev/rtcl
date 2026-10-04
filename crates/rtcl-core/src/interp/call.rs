@@ -303,7 +303,24 @@ impl Interp {
                 {
                     super::vm_exec::exec_bytecode(self, code)
                 }
-                _ => self.eval(&current_body),
+                // The tree-walked body IS the proc's unit when a compiled
+                // form exists but was bypassed (stale Tier1 epoch, exec
+                // traces, RTCL_NO_BYTECODE, fallback ops): the unit the
+                // compiler built inlines loop/if bodies and brackets, so
+                // the tree-walked twin must keep the compiled-context
+                // semantics through those constructs.  Bodies with NO
+                // compiled form (apply lambdas, OO synthetics — and
+                // non-parsing bodies) stay dispatched: in the bytecode
+                // engine they run through `eval`'s fast path as plain
+                // compile_units, and the two engines must agree byte-exact
+                // (tclsh compiling lambda/method bodies like procs is a
+                // recorded follow-up, not this change).
+                _ => {
+                    if current_compiled.is_some() {
+                        self.next_eval_lexical = true;
+                    }
+                    self.eval(&current_body)
+                }
             };
 
             // A tailcall whose completion an inner catch consumed leaves

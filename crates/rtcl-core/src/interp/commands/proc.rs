@@ -267,11 +267,35 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     };
 
+    // tclsh compiles lambda bodies like proc bodies (a proc-context unit
+    // with compiledLocals): inline foreach/lmap, frameless construct-body
+    // errors, plain loop-variable writes.  Memoised by the term string —
+    // the term IS the lambda's identity — and gated per call by the same
+    // epoch/trace checks as proc bodies in `call_proc`.
+    let compiled = match interp.lambda_code_cache.get(args[1].as_str()) {
+        Some(c) => Some(Rc::clone(c)),
+        None => {
+            let c = super::super::vm_exec::compile_proc_body(
+                &defaults,
+                &body,
+                interp.tier1_epoch,
+            );
+            if let Some(code) = &c {
+                if interp.lambda_code_cache.len() >= 1024 {
+                    interp.lambda_code_cache.clear();
+                }
+                interp.lambda_code_cache
+                    .insert(args[1].as_str().to_string(), Rc::clone(code));
+            }
+            c
+        }
+    };
+
     let proc_def = ProcDef {
         params: Rc::new(defaults),
         body: Rc::from(body),
         statics: Rc::new(HashMap::new()),
-        compiled: None,
+        compiled,
     };
 
     // Create args for call_proc: [name, arg1, arg2, ...]

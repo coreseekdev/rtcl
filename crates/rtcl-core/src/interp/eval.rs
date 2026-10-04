@@ -25,6 +25,20 @@ pub(crate) fn tcl_log_excerpt(text: &str) -> String {
 
 impl Interp {
     pub fn eval(&mut self, script: &str) -> Result<Value> {
+        // This eval IS the unit an armed "same unit" request names (a
+        // construct's inline body, a `[...]` word): consume the flag for
+        // the unit's duration, restoring the enclosing unit's context on
+        // every exit.  A nested eval nobody armed runs non-lexical — a
+        // fresh unit (eval/uplevel/namespace eval/source), matching the
+        // compiler's compile_unit (never locals_mode) for those texts.
+        let saved_lexical = self.lexical_body;
+        self.lexical_body = std::mem::take(&mut self.next_eval_lexical);
+        // A fresh unit is a non-proc context (tclsh compiles eval'd texts
+        // as standalone units with no compiledLocals): commands inside
+        // must not see the enclosing proc context — a catch body here is
+        // its own dispatched unit, not an inlined one.
+        let saved_inl = self.in_locals_unit;
+        self.in_locals_unit = false;
         // Parse-tree cache: parsing is a pure function of the text, so a
         // cached tree is interchangeable with a fresh parse — substitutions
         // all happen after parse, and the AST retains each command's
@@ -41,7 +55,11 @@ impl Interp {
             None => {
                 let rc = match rtcl_parser::ScriptUnit::parse(script) {
                     Ok(unit) => Rc::new(unit),
-                    Err(pe) => return Err(self.seed_parse_error(script, &pe)),
+                    Err(pe) => {
+                        self.lexical_body = saved_lexical;
+                        self.in_locals_unit = saved_inl;
+                        return Err(self.seed_parse_error(script, &pe));
+                    }
                 };
                 if script.len() <= PARSE_CACHE_MAX_SCRIPT {
                     if self.parse_cache.len() >= PARSE_CACHE_MAX {
@@ -70,11 +88,66 @@ impl Interp {
                     && super::vm_exec::bytecode_applicable(self)
                 {
                     let code = Rc::clone(code);
-                    return super::vm_exec::exec_bytecode(self, &code);
+                    // exec_bytecode clears the lexical flag for the unit's
+                    // DynCalls and restores this unit's context itself
+                    // (and re-establishes the proc-context signal per its
+                    // own locals_mode).
+                    let r = super::vm_exec::exec_bytecode(self, &code);
+                    self.lexical_body = saved_lexical;
+                    self.in_locals_unit = saved_inl;
+                    return r;
                 }
             }
         }
-        self.eval_commands(&unit)
+        let r = self.eval_commands(&unit);
+        self.lexical_body = saved_lexical;
+        self.in_locals_unit = saved_inl;
+        r
+    }
+
+    /// Evaluate a script the enclosing unit's compiler would have INLINED
+    /// (cmd_catch's braced body inside a proc-context unit): the commands
+    /// run tree-walked with lexical semantics — the twin of the compiler's
+    /// inline body — never as a fresh dispatched unit.  Caching mirrors
+    /// [`Interp::eval`] (other callers of the same text still get the
+    /// compiled dispatched form); the fast path is skipped because a
+    /// compiled standalone unit would run its constructs dispatched, the
+    /// opposite of what this context means.
+    pub(crate) fn eval_lexical_script(&mut self, script: &str) -> Result<Value> {
+        let saved_lexical = self.lexical_body;
+        self.lexical_body = true;
+        let saved_inl = self.in_locals_unit;
+        self.in_locals_unit = false;
+        const PARSE_CACHE_MAX: usize = 1024;
+        const PARSE_CACHE_MAX_SCRIPT: usize = 262_144;
+        let cached = self.parse_cache.get(script).cloned();
+        let unit = match cached {
+            Some(rc) => rc,
+            None => {
+                let rc = match rtcl_parser::ScriptUnit::parse(script) {
+                    Ok(unit) => Rc::new(unit),
+                    Err(pe) => {
+                        self.lexical_body = saved_lexical;
+                        self.in_locals_unit = saved_inl;
+                        return Err(self.seed_parse_error(script, &pe));
+                    }
+                };
+                if script.len() <= PARSE_CACHE_MAX_SCRIPT {
+                    if self.parse_cache.len() >= PARSE_CACHE_MAX {
+                        self.parse_cache.clear();
+                        self.bytecode_cache.clear();
+                    }
+                    self.parse_cache.insert(Rc::clone(&rc.source), Rc::clone(&rc));
+                    let code = Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands);
+                    self.bytecode_cache.insert(Rc::clone(&rc.source), Rc::new(code));
+                }
+                rc
+            }
+        };
+        let r = self.eval_commands(&unit);
+        self.lexical_body = saved_lexical;
+        self.in_locals_unit = saved_inl;
+        r
     }
 
     /// Evaluate a command body held as a [`Value`] — the per-iteration
@@ -89,6 +162,16 @@ impl Interp {
     /// bytecode gates every iteration, so a Tier1 epoch bump or a
     /// registered exec trace falls straight back to `eval`.
     pub(crate) fn eval_body_value(&mut self, body: &Value) -> Result<Value> {
+        // A caller that armed the "same unit" request (cmd_while/cmd_for —
+        // the constructs whose bodies the compiler inlines when the gates
+        // pass) hands it to this body eval.  The compiled-unit hit path
+        // discards it: an eval'd body TEXT is its own unit (compile_unit,
+        // never locals_mode), so anything inside it — including a DynCall'd
+        // foreach — runs dispatched, exactly like the compiler would emit
+        // for that text.  The miss path re-arms so `eval` runs the body
+        // script with the proc-unit context (the tree-walk twin of the
+        // compiler inlining the body into the surrounding unit).
+        let armed = std::mem::take(&mut self.next_eval_lexical);
         // Pointer-identity scan of the resident bodies (FIFO, bounded):
         // body/next of one `for` plus one nested loop's bodies all fit.
         let hit = self
@@ -101,6 +184,7 @@ impl Interp {
                 return super::vm_exec::exec_bytecode(self, &code);
             }
         }
+        self.next_eval_lexical = armed;
         let text = body.as_str();
         let r = self.eval(text);
         if r.is_ok() {
@@ -229,6 +313,58 @@ impl Interp {
             Some(0)
         } else {
             None
+        }
+    }
+
+    /// Would the compiler inline body word `idx` of the currently
+    /// dispatching command — the shape half of the gates constructs check
+    /// before preserving the proc-unit context through their bodies (the
+    /// lexical twin of `Compiler`'s inline decision; the compiler also
+    /// requires `locals_mode`, which the tree side models as
+    /// [`Interp::lexical_body`])?  Braces-only verbatim — stricter than
+    /// [`Self::body_is_verbatim_script`], which also accepts quotes — and
+    /// the script must parse.  An empty body word inlines too.
+    pub(crate) fn body_would_compile(&self, idx: usize, value: &str) -> bool {
+        if value.is_empty() {
+            return true;
+        }
+        match self.cur_cmd_word_srcs.get(idx) {
+            Some(ws) => {
+                let src = ws.slice(&self.cur_source);
+                src.len() >= 2
+                    && src.starts_with('{')
+                    && src.ends_with('}')
+                    && &src[1..src.len() - 1] == value
+                    && rtcl_parser::parse(value).is_ok()
+            }
+            None => false,
+        }
+    }
+
+    /// Is word `idx` of the command currently dispatching a plain literal
+    /// word — no substitution, bare/braced/quoted text — whose content is
+    /// `value`?  The value-level mirror of `matches!(words[idx],
+    /// Word::Literal(_))`: the compiler's while/for condition gates and
+    /// `if`'s keyword walk require Literal WORDS, not just literal-shaped
+    /// values (a `$cond` or `"$c$ond"` word must not pass).  A bare word
+    /// whose source carries backslash continuations is rejected (the
+    /// unescaped content is not re-derivable) — a residual, vanishingly
+    /// rare divergence class.
+    pub(crate) fn word_is_plain_literal(&self, idx: usize, value: &str) -> bool {
+        match self.cur_cmd_word_srcs.get(idx) {
+            Some(ws) => {
+                let src = ws.slice(&self.cur_source);
+                (src == value && !src.contains('\\'))
+                    || src
+                        .strip_prefix('{')
+                        .and_then(|s| s.strip_suffix('}'))
+                        .is_some_and(|inner| inner == value)
+                    || src
+                        .strip_prefix('"')
+                        .and_then(|s| s.strip_suffix('"'))
+                        .is_some_and(|inner| inner == value)
+            }
+            None => false,
         }
     }
 
@@ -666,27 +802,43 @@ impl Interp {
 
     /// Evaluate a word to get its value.
     pub(crate) fn eval_word(&mut self, word: &Word) -> Result<Value> {
+        self.eval_word_ctx(word, true)
+    }
+
+    /// [`Self::eval_word`] with the unit context: a WHOLE-WORD `[...]`
+    /// compiles inline into the surrounding unit (`SubMark`/`SubEnd`) when
+    /// its script parses, so at word top level the tree-walk twin keeps the
+    /// proc-unit context — arm the "same unit" request.  A bracket inside a
+    /// Concat part or a `{*}` word compiles through `compile_word` →
+    /// `EvalScript` (a nested unit); those recurse with `same_unit = false`
+    /// and their brackets start fresh, non-lexical units.
+    fn eval_word_ctx(&mut self, word: &Word, same_unit: bool) -> Result<Value> {
         match word {
             Word::Literal(s) => Ok(Value::from_str(s)),
             Word::VarRef(name) => self.eval_var_ref(name),
-            Word::CommandSub(cmd) => match self.eval(cmd) {
-                Ok(v) => Ok(v),
-                Err(e) => {
-                    // Mark the boundary: the enclosing command must not
-                    // log its own frame (the nested eval just did).
-                    self.err_from_subst = true;
-                    Err(e)
+            Word::CommandSub(cmd) => {
+                if same_unit && self.lexical_body {
+                    self.next_eval_lexical = true;
                 }
-            },
+                match self.eval(cmd) {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        // Mark the boundary: the enclosing command must not
+                        // log its own frame (the nested eval just did).
+                        self.err_from_subst = true;
+                        Err(e)
+                    }
+                }
+            }
             Word::Concat(parts) => {
                 let mut result = String::new();
                 for part in parts {
-                    let value = self.eval_word(part)?;
+                    let value = self.eval_word_ctx(part, false)?;
                     result.push_str(value.as_str());
                 }
                 Ok(Value::from_str(&result))
             }
-            Word::Expand(inner) => self.eval_word(inner),
+            Word::Expand(inner) => self.eval_word_ctx(inner, false),
             Word::ExprSugar(expr) => self.eval_expr(expr),
         }
     }

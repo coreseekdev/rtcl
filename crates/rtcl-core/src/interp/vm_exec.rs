@@ -46,15 +46,15 @@ pub(crate) fn compile_proc_body(
 }
 
 /// Bump [`Interp::tier1_epoch`] when `key`'s leaf name matches one of the
-/// inline-folded Tier1 commands.  Only these ten names can be shadowed
-/// out from under a compiled body — everything else in the bytecode goes
+/// inline-folded Tier1 commands.  Only these names can be shadowed out
+/// from under a compiled body — everything else in the bytecode goes
 /// through dispatch (`Call`/`DynCall`) and re-resolves per call.
 pub(crate) fn note_tier1_mutation(interp: &mut Interp, key: &str) {
     let leaf = key.rsplit("::").next().unwrap_or(key);
     if matches!(
         leaf,
         "set" | "if" | "while" | "for" | "expr" | "incr" | "return" | "exit" | "break"
-            | "continue"
+            | "continue" | "foreach" | "lmap"
     ) {
         interp.tier1_epoch += 1;
     }
@@ -112,6 +112,17 @@ struct LoopFrame {
     /// executor must re-attribute to the loop itself: the ops at the jump
     /// target (a re-checked condition, the next script) belong to it.
     owner: usize,
+}
+
+/// One active inline foreach/lmap (`ForeachStart` … `ForeachEnd`): the
+/// strict-parsed data lists and the current iteration index; `collected`
+/// is `Some` for an lmap (body results so far — kept across a `break`,
+/// skipped by a `continue`).
+struct ForeachFrame {
+    info_idx: u32,
+    lists: Vec<Vec<Value>>,
+    idx: usize,
+    collected: Option<Vec<Value>>,
 }
 
 /// One inline body region currently executing — which command's construct
@@ -252,6 +263,18 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
 /// boundary handling (`(procedure …)` frames, return decoding, break →
 /// error conversion) needs no changes.
 pub(crate) fn exec_bytecode(interp: &mut Interp, code: &ByteCode) -> Result<Value> {
+    // A compiled unit's DynCall'd foreach runs DISPATCHED (tclsh's
+    // INST_CALL fallback): clear the lexical flag for the unit's
+    // duration, restoring the enclosing unit's context afterwards.
+    let saved_lexical = interp.lexical_body;
+    interp.lexical_body = false;
+    // Proc-context signal (tclsh's compiledLocals): a locals-mode unit
+    // is where the compiler inlines braced catch bodies, so DynCall'd
+    // commands inside it must see the proc context.  Non-locals units
+    // (eval'd texts) clear it — their contents are fresh non-proc
+    // contexts exactly like a tree-walked eval.
+    let saved_inl = interp.in_locals_unit;
+    interp.in_locals_unit = code.locals_mode;
     // The unit is one "current script": command-substitution errors inside
     // it defer their enclosing-command frame via err_pending_top, and the
     // site lines are absolute already (entry_offset + site.line).
@@ -274,7 +297,7 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &ByteCode) -> Result<Valu
     // a live VmState is never in the pool, so pooling cannot alias.
     let r = {
         let mut st = interp.vm_pool.take(entry_offset);
-        let r = exec_inner(interp, code, entry_offset, &mut st);
+        let r = exec_inner(interp, code, &mut st);
         interp.vm_pool.give(st);
         r
     };
@@ -284,15 +307,12 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &ByteCode) -> Result<Valu
     interp.cur_cmd_line = saved_line;
     interp.cur_cmd_word_srcs = saved_srcs;
     interp.line_offset = entry_offset;
+    interp.lexical_body = saved_lexical;
+    interp.in_locals_unit = saved_inl;
     r
 }
 
-fn exec_inner(
-    interp: &mut Interp,
-    code: &ByteCode,
-    entry_offset: usize,
-    st: &mut VmState,
-) -> Result<Value> {
+fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<Value> {
     let ops = code.ops();
 
     let result = loop {
@@ -370,6 +390,8 @@ fn exec_inner(
 struct VmState {
     stack: Vec<Entry>,
     loops: Vec<LoopFrame>,
+    /// Active inline foreach/lmap frames (see [`ForeachFrame`]).
+    foreaches: Vec<ForeachFrame>,
     /// Body regions currently executing, as the `BeginCmd` site index of
     /// the construct that owns each (`if` arm / `while` body / `for` next
     /// script).  Pushed by not-taken condition jumps and the region marks,
@@ -392,6 +414,7 @@ impl VmState {
         VmState {
             stack: Vec::with_capacity(16),
             loops: Vec::new(),
+            foreaches: Vec::new(),
             bodies: Vec::new(),
             scratch: Vec::new(),
             expand_base: 0,
@@ -462,6 +485,7 @@ impl VmPool {
     fn give(&mut self, mut st: VmState) {
         st.stack.clear();
         st.loops.clear();
+        st.foreaches.clear();
         st.bodies.clear();
         st.scratch.clear();
         if self.spare.len() < 4 {
@@ -662,6 +686,85 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         OpCode::LoopExit => {
             st.loops.pop();
         }
+
+        // ── Inline foreach/lmap (D) ────────────────────────────────────
+        OpCode::ForeachStart { info, next, end } => {
+            let info_ref = code.foreach_info(*info).expect("foreach info index");
+            let ngroups = info_ref.groups.len();
+            let mut lists = Vec::with_capacity(ngroups);
+            // Pop the group data values (last group on top), strict-parse
+            // each exactly like cmd_foreach — same errors, same errorCode.
+            for _ in 0..ngroups {
+                let v = st.pop_val();
+                lists.push(super::commands::list::strict_list(interp, &v)?);
+            }
+            lists.reverse();
+            let max = info_ref
+                .groups
+                .iter()
+                .zip(&lists)
+                .map(|(g, l)| l.len().div_ceil(g.len().max(1)))
+                .max()
+                .unwrap_or(0);
+            let collected = info_ref.lmap.then(Vec::new);
+            st.foreaches.push(ForeachFrame {
+                info_idx: *info,
+                lists,
+                idx: 0,
+                collected,
+            });
+            // The loop frame rides the ordinary machinery: compiled
+            // Break/Continue and error-form signals route through it.
+            st.loops.push(LoopFrame {
+                cont: *next,
+                brk: *end,
+                bodies_len: st.bodies.len(),
+                stack_len: st.stack.len(),
+                owner: st.cur_site,
+            });
+            if max == 0 {
+                st.pc = *end as usize;
+            } else {
+                foreach_bind(interp, code, info_ref, st, 0)?;
+            }
+        }
+        OpCode::ForeachNext { info, body } => {
+            let info_ref = code.foreach_info(*info).expect("foreach info index");
+            let (idx, max) = {
+                let ff = st.foreaches.last().expect("foreach frame");
+                let max = info_ref
+                    .groups
+                    .iter()
+                    .zip(&ff.lists)
+                    .map(|(g, l)| l.len().div_ceil(g.len().max(1)))
+                    .max()
+                    .unwrap_or(0);
+                (ff.idx + 1, max)
+            };
+            if idx < max {
+                st.foreaches.last_mut().unwrap().idx = idx;
+                foreach_bind(interp, code, info_ref, st, idx)?;
+                st.pc = *body as usize;
+            }
+            // done → fall through to the closing ForeachEnd
+        }
+        OpCode::ForeachCollect => {
+            let v = st.pop_val();
+            if let Some(ff) = st.foreaches.last_mut() {
+                if let Some(c) = &mut ff.collected {
+                    c.push(v);
+                }
+            }
+        }
+        OpCode::ForeachEnd => {
+            st.loops.pop();
+            let ff = st.foreaches.pop();
+            let v = match ff.and_then(|f| f.collected) {
+                Some(c) => Value::from_list(&c),
+                None => Value::empty(),
+            };
+            st.stack.push(Entry::Val(v));
+        }
         OpCode::Break => match st.loops.last() {
             Some(l) => {
                 st.bodies.truncate(l.bodies_len);
@@ -849,6 +952,52 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 "bytecode op not supported by the interpreter executor",
                 crate::error::ErrorCode::Generic,
             ));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Inline foreach helpers
+// ---------------------------------------------------------------------------
+
+/// Bind iteration `idx`'s values of every group: the slot when the
+/// current frame still holds one for the target (unset cells recreate —
+/// tclsh clears the compiledLocal's Var, the table entry stays), the
+/// name-keyed `set_var` otherwise (degraded frames, qualified/array
+/// names, statics).  Compiled-context var-write failures are PLAIN — no
+/// `(setting foreach loop variable)` decoration — but ::errorCode still
+/// installs TCL WRITE VARNAME and the error still appends the enclosing
+/// command's harness frame through the ordinary op-error path (probed
+/// tclsh 8.6.17: `can't set "a": …` + `while executing "foreach …"` +
+/// `(procedure "p" line N)`).
+fn foreach_bind(
+    interp: &mut Interp,
+    code: &ByteCode,
+    info: &rtcl_parser::bytecode::ForeachInfo,
+    st: &VmState,
+    idx: usize,
+) -> Result<()> {
+    let ff = st.foreaches.last().expect("foreach frame");
+    for (g, list) in info.groups.iter().zip(&ff.lists) {
+        let n = g.len();
+        for (vi, t) in g.iter().enumerate() {
+            let v = list.get(idx * n + vi).cloned().unwrap_or_else(Value::empty);
+            match t.slot {
+                Some(s) if interp.frame_slot_write(s as usize, v.clone()) => {}
+                _ => {
+                    let name = code.get_const(t.name_idx).unwrap_or("");
+                    if let Err(e) = interp.set_var(name, v) {
+                        if interp.err_is_error(&e) {
+                            super::commands::list::set_error_code(
+                                interp,
+                                "TCL WRITE VARNAME",
+                            );
+                        }
+                        return Err(e);
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -1137,6 +1286,329 @@ mod sub_inline_tests {
         assert_eq!(ev("set x [expr {1000000 + 2}]; set x"), "1000002");
         assert_eq!(ev("set x -5; set x"), "-5");
     }
+}
+
+#[cfg(test)]
+mod foreach_inline_tests {
+    //! Item D — foreach/lmap inlined into compiled proc bodies
+    //! (tclsh's compiledLocals shape).  The tree-walk twin (lexical
+    //! arm) runs under RTCL_NO_BYTECODE in the external sweep; these
+    //! in-process cases pin the bytecode engine's compiled shape.
+
+    use crate::interp::Interp;
+
+    fn ev(script: &str) -> String {
+        let mut interp = Interp::new();
+        interp.eval(script).unwrap().as_str().to_string()
+    }
+
+    fn caught(script: &str) -> (String, String, String) {
+        // (message, errorCode, errorInfo) of the caught error.
+        let mut interp = Interp::new();
+        let r = interp
+            .eval(&format!("catch {{{script}}} m; list $m $::errorCode $::errorInfo"))
+            .unwrap();
+        let list = r.as_list().unwrap();
+        (
+            list[0].as_str().to_string(),
+            list[1].as_str().to_string(),
+            list[2].as_str().to_string(),
+        )
+    }
+
+    #[test]
+    fn test_foreach_inline_values() {
+        assert_eq!(
+            ev("proc p {} { set r {}; foreach i {a b c} { lappend r $i }; return $r }; p"),
+            "a b c",
+        );
+        // Multi-var groups and ragged tails (missing elements read empty).
+        assert_eq!(
+            ev("proc p {} { set r {}; foreach {x y} {1 2 3} { lappend r $x-$y }; return $r }; p"),
+            "1-2 3-",
+        );
+        // Two groups in lockstep.
+        assert_eq!(
+            ev("proc p {} { set r {}; foreach a {1 2} b {x y} { lappend r $a$b }; return $r }; p"),
+            "1x 2y",
+        );
+        // Empty data list: zero iterations, empty result.
+        assert_eq!(
+            ev("proc p {} { set hit 0; foreach i {} { incr hit }; return $hit }; p"),
+            "0",
+        );
+        // Empty body word inlines too.
+        assert_eq!(
+            ev("proc p {} { foreach i {1 2} {}; return done }; p"),
+            "done",
+        );
+        // The loop variable binds a slot the rest of the body reads.
+        assert_eq!(
+            ev("proc p {} { set s 0; foreach i {1 2 3 4} { incr s $i }; return $s }; p"),
+            "10",
+        );
+        // Nested inline foreach.
+        assert_eq!(
+            ev("proc p {} { set r {}; foreach a {1 2} { foreach b {x y} { lappend r $a$b } }; return $r }; p"),
+            "1x 1y 2x 2y",
+        );
+    }
+
+    #[test]
+    fn test_foreach_inline_break_continue() {
+        assert_eq!(
+            ev("proc p {} { set r {}; foreach i {1 2 3 4} { if {$i == 3} break; lappend r $i }; return $r }; p"),
+            "1 2",
+        );
+        assert_eq!(
+            ev("proc p {} { set r {}; foreach i {1 2 3 4} { if {$i == 2} continue; lappend r $i }; return $r }; p"),
+            "1 3 4",
+        );
+        // Level-2 break passes the loop through: catch reports code 2 and
+        // the result variable stays empty (probed tclsh: p=2, resc=,,).
+        assert_eq!(
+            ev("proc p {} { set c [catch {foreach i {1} { return -code break -level 2 }}]; return $c }; p"),
+            "2",
+        );
+        assert_eq!(
+            ev("proc q {} { catch {foreach i {1} { return -code break -level 2 }} c; return ,$c, }; q"),
+            ",,",
+        );
+        // return unwinds the proc with its value.
+        assert_eq!(
+            ev("proc p {} { foreach i {1 2} { return $i } }; p"),
+            "1",
+        );
+    }
+
+    #[test]
+    fn test_lmap_inline_values() {
+        assert_eq!(
+            ev("proc p {} { lmap i {1 2 3} { expr {$i * 2} } }; p"),
+            "2 4 6",
+        );
+        // break keeps the results collected so far; continue skips one.
+        assert_eq!(
+            ev("proc p {} { lmap i {1 2 3 4} { if {$i == 2} break; expr {$i * 10} } }; p"),
+            "10",
+        );
+        assert_eq!(
+            ev("proc p {} { lmap i {1 2 3} { if {$i == 2} continue; expr {$i * 10} } }; p"),
+            "10 30",
+        );
+        // return -level 0 completes as an ordinary command: collected.
+        assert_eq!(
+            ev("proc p {} { lmap i {1 2} { return -level 0 v$i } }; p"),
+            "v1 v2",
+        );
+        // lmap with a multi-var group.
+        assert_eq!(
+            ev("proc p {} { lmap {a b} {1 2 3 4} { expr {$a + $b} } }; p"),
+            "3 7",
+        );
+    }
+
+    #[test]
+    fn test_foreach_inline_error_framing() {
+        // Compiled shape (probed tclsh): the body error names no foreach
+        // frame — innermost command frame + absolute procedure line.
+        let (m, _c, info) = caught(
+            "proc p {} {\n    foreach x {1 2 3} {\n        nosuchcmd\n    }\n}\np",
+        );
+        assert_eq!(m, "invalid command name \"nosuchcmd\"");
+        assert!(info.contains("\"nosuchcmd\""), "inner frame in {info}");
+        assert!(info.contains("(procedure \"p\" line 3)"), "absolute line in {info}");
+        assert!(!info.contains("\"foreach\" body"), "no body frame: {info}");
+        assert!(!info.contains("\"foreach x"), "no foreach frame: {info}");
+
+        // Var-write failure in compiled context: PLAIN (no decoration) but
+        // with the foreach command's harness frame + TCL WRITE VARNAME.
+        let (m, c, info) = caught(
+            "proc p {} {\n    set a(0) 44\n    foreach a {1 2 3} { set x 1 }\n}\np",
+        );
+        assert_eq!(m, "can't set \"a\": variable is array");
+        assert_eq!(c, "TCL WRITE VARNAME");
+        assert!(info.contains("\"foreach a {1 2 3} { set x 1 }\""), "cmd frame in {info}");
+        assert!(info.contains("(procedure \"p\" line 3)"), "line 3 in {info}");
+        assert!(!info.contains("(setting foreach loop variable"), "no decoration: {info}");
+    }
+
+    #[test]
+    fn test_foreach_dispatched_error_framing() {
+        // Top level (no compiledLocals): the dispatched shape — body exit
+        // frame + decoration, body-relative lines (foreach-1.14 shape).
+        let (m, c, info) = caught("unset -nocomplain a; set a(0) 44; foreach a {1 2 3} {}");
+        assert_eq!(m, "can't set \"a\": variable is array");
+        assert_eq!(c, "TCL WRITE VARNAME");
+        assert!(info.contains("(setting foreach loop variable \"a\")"), "decoration in {info}");
+
+        let (m, _c, info) = caught("foreach i {1 2 3} { nosuchcmd }");
+        assert_eq!(m, "invalid command name \"nosuchcmd\"");
+        assert!(info.contains("(\"foreach\" body line 1)"), "exit frame in {info}");
+        assert!(info.contains("\"foreach i {1 2 3} { nosuchcmd }\""), "harness in {info}");
+    }
+
+    #[test]
+    fn test_lmap_dispatched_error_framing() {
+        // The dispatched-lmap fixes: decoration + errorCode, body exit
+        // frame, loop-level handling (probed tclsh 8.6.17).
+        let (m, c, info) = caught("unset -nocomplain a; set a(0) 44; lmap a {1 2 3} {set x 1}");
+        assert_eq!(m, "can't set \"a\": variable is array");
+        assert_eq!(c, "TCL WRITE VARNAME");
+        assert!(info.contains("(setting lmap loop variable \"a\")"), "decoration in {info}");
+
+        let (m, _c, info) = caught("lmap i {1 2 3} { nosuchcmd }");
+        assert_eq!(m, "invalid command name \"nosuchcmd\"");
+        assert!(info.contains("(\"lmap\" body line 1)"), "exit frame in {info}");
+        assert!(info.contains("\"lmap i {1 2 3} { nosuchcmd }\""), "harness in {info}");
+
+        // A level-2 break escapes the dispatched lmap (catch sees 2), and
+        // the multi-line body frame counts body-relative lines.
+        let (m, _c, info) = caught("lmap i {1 2} {\n    set t $i\n    nosuchcmd2\n}");
+        assert!(info.contains("(\"lmap\" body line 3)"), "body-relative line in {info}");
+    }
+
+    #[test]
+    fn test_foreach_slots_and_degrade() {
+        // The loop variable lands in a slot the compiled body reads; a
+        // later `set` of the same name sees the same storage.
+        assert_eq!(
+            ev("proc p {} { set last 0; foreach i {5 6 7} { set last $i }; return $last }; p"),
+            "7",
+        );
+        // upvar to a loop variable degrades the frame: iteration still
+        // writes through the name path.
+        assert_eq!(
+            ev("proc inner {n} { upvar 1 $n s; set s 99 }\nproc p {} { set r {}; foreach i {1 2} { inner i; lappend r $i }; return $r }; p"),
+            "99 99",
+        );
+        // unset mid-loop recreates the variable on the next binding.
+        assert_eq!(
+            ev("proc p {} { set r {}; foreach i {1 2 3} { lappend r [info exists i]; unset i }; return $r }; p"),
+            "1 1 1",
+        );
+        // Non-candidate loop names (qualified) bind through set_var.
+        assert_eq!(
+            ev("proc p {} { set r {}; foreach ::g {1 2} { lappend r $::g }; return $r }; p"),
+            "1 2",
+        );
+    }
+
+    #[test]
+    fn test_foreach_in_noninline_shapes_stay_dispatched() {
+        // Quoted body word: the compiler requires braces-only verbatim —
+        // dispatched, so the body error gains the exit frame.
+        let mut interp = Interp::new();
+        let r = interp
+            .eval("proc p {} { foreach i {1} \"nosuchcmd\" }\ncatch {p} m\nset ::errorInfo")
+            .unwrap();
+        let info = r.as_str();
+        assert!(info.contains("(\"foreach\" body line 1)"), "dispatched shape: {info}");
+        // A body from a variable: dispatched as well.
+        let mut interp = Interp::new();
+        let r = interp
+            .eval("proc p {b} { foreach i {1} $b }\ncatch {p nosuchcmd} m\nset ::errorInfo")
+            .unwrap();
+        let info = r.as_str();
+        assert!(info.contains("(\"foreach\" body line 1)"), "var body dispatched: {info}");
+    }
+
+    #[test]
+    fn test_catch_body_shapes_by_context() {
+        // tclsh inlines a braces-only catch body into proc-context units
+        // (procs, lambdas) and leaves it a dispatched unit everywhere
+        // else.  Probed shapes:
+        // - dispatched: `(setting lmap loop variable …)` + `invoked
+        //   from within`;
+        // - inlined: plain write + `while executing` (the compiled
+        //   var-write frame).
+        assert_eq!(
+            ev("set a(0) 44; catch {lmap a {1 2 3} {}} m; set ::errorInfo"),
+            "can't set \"a\": variable is array\n    (setting lmap loop variable \"a\")\n    invoked from within\n\"lmap a {1 2 3} {}\"",
+        );
+        assert_eq!(
+            ev("proc p {} { set a(0) 44; catch {lmap a {1 2 3} {}} m; set ::errorInfo }; p"),
+            "can't set \"a\": variable is array\n    while executing\n\"lmap a {1 2 3} {}\"",
+        );
+        // Apply bodies compile like proc bodies — same inlined shape.
+        assert_eq!(
+            ev("apply {{} { set a(0) 44; catch {lmap a {1 2 3} {}} m; set ::errorInfo }}"),
+            "can't set \"a\": variable is array\n    while executing\n\"lmap a {1 2 3} {}\"",
+        );
+        // An eval'd string inside a proc is a fresh unit — the catch
+        // body inside it is dispatched again.
+        assert_eq!(
+            ev("proc p {} { set a(0) 44; eval {catch {lmap a {1 2 3} {}} m}; set ::errorInfo }; p"),
+            "can't set \"a\": variable is array\n    (setting lmap loop variable \"a\")\n    invoked from within\n\"lmap a {1 2 3} {}\"",
+        );
+        // A non-braces-only body word (quoted / from a variable) stays
+        // dispatched even inside a proc.
+        assert_eq!(
+            ev("proc p {} { set a(0) 44; catch \"lmap a {1 2 3} {}\" m; set ::errorInfo }; p"),
+            "can't set \"a\": variable is array\n    (setting lmap loop variable \"a\")\n    invoked from within\n\"lmap a {1 2 3} {}\"",
+        );
+        assert_eq!(
+            ev("proc p {b} { set a(0) 44; catch $b m; set ::errorInfo }; p {lmap a {1 2 3} {}}"),
+            "can't set \"a\": variable is array\n    (setting lmap loop variable \"a\")\n    invoked from within\n\"lmap a {1 2 3} {}\"",
+        );
+    }
+
+    #[test]
+    fn test_apply_lambda_compiles() {
+        // tclsh compiles lambda bodies like proc bodies; the inline
+        // foreach/lmap now applies to them (defaults, args, slots).
+        assert_eq!(
+            ev("apply {{x} { set r {}; foreach i $x { lappend r [expr {$i * 2}] }; return $r }} {1 2 3}"),
+            "2 4 6",
+        );
+        assert_eq!(ev("apply {{} { lmap i {1 2 3} { expr {$i * $i} } }}"), "1 4 9");
+        assert_eq!(ev("apply {{a {b 10}} { expr {$a + $b} }} 5"), "15");
+        assert_eq!(ev("apply {{args} { llength $args }} a b c"), "3");
+        // The lambda boundary frame survives compilation.
+        let mut interp = Interp::new();
+        let r = interp
+            .eval("catch {apply {{} { nosuchcmd }}} m\nset ::errorInfo")
+            .unwrap();
+        let info = r.as_str().to_string();
+        assert!(info.contains("\"nosuchcmd\""), "inner frame in {info}");
+        assert!(
+            info.contains("(lambda term \"{} { nosuchcmd }\" line 1)"),
+            "lambda frame in {info}"
+        );
+        // A non-parsing lambda body keeps the per-call parse-error path.
+        assert_eq!(
+            ev("catch {apply {{} { set x \"unterm}} } m; set m"),
+            "missing \""
+        );
+    }
+
+    #[test]
+    fn test_foreach_inside_loop_constructs() {
+        // A foreach in an inlined while/if body of a compiled proc is part
+        // of the same unit (compiled shape); in a while with a non-literal
+        // condition the body is a nested unit (dispatched shape).
+        let mut interp = Interp::new();
+        let r = interp
+            .eval(concat!(
+                "proc a {} { set c 1; while $c { foreach i {1} { nosuchcmd } ; set c 0 } }\n",
+                "catch {a} m\nset ::errorInfo\n",
+            ))
+            .unwrap();
+        assert!(r.as_str().contains("(\"foreach\" body line 1)"), "nested-unit dispatched: {}", r.as_str());
+
+        let mut interp = Interp::new();
+        let r = interp
+            .eval(concat!(
+                "proc b {} { if {1} { foreach i {1} { nosuchcmd } } }\n",
+                "catch {b} m\nset ::errorInfo\n",
+            ))
+            .unwrap();
+        let info = r.as_str();
+        assert!(info.contains("\"nosuchcmd\""), "inner frame in {info}");
+        assert!(!info.contains("\"foreach\" body"), "same-unit compiled: {info}");
+        assert!(info.contains("(procedure \"b\" line 1)"), "abs line in {info}");
+    }
+
 }
 
 #[cfg(test)]

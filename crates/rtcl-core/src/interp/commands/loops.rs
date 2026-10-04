@@ -30,6 +30,15 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         None => None,
     };
 
+    // The compiler inlines this while (verbatim body + literal condition
+    // word — `Compiler::compile_while`'s gates): the body is part of the
+    // proc's unit, so each per-iteration eval keeps the lexical context
+    // and a foreach dispatched from inside the body takes the compiled
+    // semantics, matching the unit the compiler would have built.
+    let same_unit = interp.lexical_body
+        && interp.word_is_plain_literal(1, test)
+        && interp.body_would_compile(2, body.as_str());
+
     loop {
         let cond = interp.eval_expr(test)?;
         if !crate::types::expr_funcs::strict_bool(&cond)? {
@@ -37,6 +46,9 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         if let Some(off) = body_offset {
             interp.line_offset = off;
+        }
+        if same_unit {
+            interp.next_eval_lexical = true;
         }
         let r = interp.eval_body_value(body);
         interp.line_offset = saved_offset;
@@ -78,12 +90,27 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let next = &args[3];
     let body = &args[4];
 
+    // `Compiler::compile_for`'s inline gates: literal condition word +
+    // inlinable start/next/body scripts — all four words belong to the
+    // proc's unit, so their evals keep the lexical context.
+    let same_unit = interp.lexical_body
+        && interp.word_is_plain_literal(2, test)
+        && interp.body_would_compile(1, start)
+        && interp.body_would_compile(3, next.as_str())
+        && interp.body_would_compile(4, body.as_str());
+
+    if same_unit {
+        interp.next_eval_lexical = true;
+    }
     interp.eval(start)?;
 
     loop {
         let cond = interp.eval_expr(test)?;
         if !crate::types::expr_funcs::strict_bool(&cond)? { break; }
 
+        if same_unit {
+            interp.next_eval_lexical = true;
+        }
         match interp.eval_body_value(body) {
             Ok(_) => {}
             Err(e) => {
@@ -106,6 +133,9 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
 
+        if same_unit {
+            interp.next_eval_lexical = true;
+        }
         match interp.eval_body_value(next) {
             Ok(_) => {}
             Err(e) => {
@@ -144,6 +174,14 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "foreach", 4, args.len(),
             "varList list ?varList list ...? command",
         ));
+    }
+
+    // The compiled shape (tclsh inlines foreach inside proc bodies — the
+    // compiledLocals context): frameless body errors with absolute lines
+    // and plain var-write errors.  Only when the invocation is exactly
+    // what the compiler would inline.
+    if interp.lexical_body && foreach_inline_shape(interp, args) {
+        return foreach_lexical(interp, args, false);
     }
 
     let body = &args[args.len() - 1];
@@ -231,6 +269,154 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     // Tcl: loop commands always return the empty string
+    Ok(Value::empty())
+}
+
+/// Value-level mirror of `Compiler::compile_foreach`'s inline gates: even
+/// arity >= 4, word/argument alignment (no `{*}` expansion — any word whose
+/// source leads with `{*}`, or an argument-count mismatch against the
+/// source words, means the compiler dispatched this invocation), every
+/// varlist word a plain literal passing `split_varlist_simple` with at
+/// least one name, and an inlinable body word.  Shared by `foreach` and
+/// `lmap` (identical gates, `collect` the only difference).
+pub(crate) fn foreach_inline_shape(interp: &Interp, args: &[Value]) -> bool {
+    let n = args.len();
+    if n < 4 || n % 2 != 0 {
+        return false;
+    }
+    // `{*}` re-shapes the argument list at runtime — the compiler cannot
+    // treat the invocation statically, and neither can this value-level
+    // walk (indices past an expansion point to the wrong words).
+    if interp.cur_cmd_word_srcs.len() != n {
+        return false;
+    }
+    for ws in interp.cur_cmd_word_srcs.iter() {
+        if ws.slice(&interp.cur_source).starts_with("{*}") {
+            return false;
+        }
+    }
+    for wi in (1..n - 1).step_by(2) {
+        let value = args[wi].as_str();
+        if !interp.word_is_plain_literal(wi, value) {
+            return false;
+        }
+        match rtcl_parser::split_varlist_simple(value) {
+            Some(names) if !names.is_empty() => {}
+            _ => return false,
+        }
+    }
+    interp.body_would_compile(n - 1, args[n - 1].as_str())
+}
+
+/// The compiled-shape foreach/lmap body (tclsh's inlined form, probed):
+/// body errors are FRAMELESS with absolute line attribution (no
+/// `("foreach" body line N)`, the construct's own harness frame
+/// suppressed — only the innermost failing command's frame remains), and
+/// loop-variable writes fail PLAIN (no `(setting foreach loop variable)`
+/// decoration; the enclosing command's harness frame and TCL WRITE
+/// VARNAME errorCode are all tclsh's compiled form adds).  `collect`
+/// selects lmap: results accumulate, survive a `break`, and a `continue`
+/// skips the collection.
+pub(crate) fn foreach_lexical(interp: &mut Interp, args: &[Value], lmap: bool) -> Result<Value> {
+    let n = args.len();
+    let body = &args[n - 1];
+
+    struct VarGroup<'a> {
+        vars: Vec<String>,
+        data: Cow<'a, [Value]>,
+    }
+    let mut groups: Vec<VarGroup> = Vec::new();
+    let mut i = 1;
+    while i < n - 1 {
+        // The varlist value passed the simple-split gate, so its names are
+        // exactly the whitespace tokens (identical to strict_list's view
+        // of the same text).
+        let vars: Vec<String> = args[i]
+            .as_str()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let data = strict_list_cow(interp, &args[i + 1])?;
+        groups.push(VarGroup { vars, data });
+        i += 2;
+    }
+
+    let max_iters = groups
+        .iter()
+        .map(|g| g.data.len().div_ceil(g.vars.len().max(1)))
+        .max()
+        .unwrap_or(0);
+
+    // Compiled foreach numbers body commands absolutely (one line table):
+    // rebase the body's lines onto the foreach command's own line, exactly
+    // cmd_while's verbatim-body case.
+    let saved_offset = interp.line_offset;
+    let body_offset = match interp.body_is_verbatim_script(n - 1, body.as_str()) {
+        Some(extra) => Some(saved_offset + interp.cur_cmd_line.max(1) - 1 + extra),
+        None => None,
+    };
+
+    let mut collected: Vec<Value> = Vec::new();
+    for idx in 0..max_iters {
+        for g in &groups {
+            let gn = g.vars.len();
+            for (vi, var) in g.vars.iter().enumerate() {
+                let value = g
+                    .data
+                    .get(idx * gn + vi)
+                    .cloned()
+                    .unwrap_or_else(Value::empty);
+                if let Err(e) = interp.set_var(var, value) {
+                    // Plain failure: the error propagates to the enclosing
+                    // command's ordinary harness frame; only the errorCode
+                    // install is ours.
+                    if interp.err_is_error(&e) {
+                        set_error_code(interp, "TCL WRITE VARNAME");
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        // The body is part of the unit the compiler would have built —
+        // keep the lexical context through its script.
+        interp.line_offset = body_offset.unwrap_or(saved_offset);
+        interp.next_eval_lexical = true;
+        let r = interp.eval_body_value(body);
+        interp.line_offset = saved_offset;
+        match r {
+            Ok(v) => {
+                if lmap {
+                    collected.push(v);
+                }
+            }
+            Err(e) => {
+                if e.is_break() {
+                    if e.loop_level() > 1 {
+                        return Err(e.with_decremented_loop_level());
+                    }
+                    break;
+                }
+                if e.is_continue() {
+                    if e.loop_level() > 1 {
+                        return Err(e.with_decremented_loop_level());
+                    }
+                    continue;
+                }
+                // Frameless: suppress the construct's own harness frame
+                // (true errors only — a completion never reaches an
+                // append, and a leaked `fresh` would eat the NEXT error's
+                // frame).
+                if interp.err_is_error(&e) {
+                    interp.err_fresh = true;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    if lmap {
+        return Ok(Value::from_list(&collected));
+    }
     Ok(Value::empty())
 }
 

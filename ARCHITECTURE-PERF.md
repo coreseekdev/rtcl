@@ -81,12 +81,46 @@ Design (staged):
 Risk: high (var traces, upvar, info locals, tailcall); gate every step
 with judge + two-engine sweep.
 
-### D. Inline foreach/lmap/switch/catch bodies  ←  next
-foreach currently DynCalls cmd_foreach per iteration set with per-body
-eval_body_value.  Compiling the body inline (LoopEnter per list
-element) attacks the 1.2-1.4× data-op gap.  Medium risk: foreach's
-var-list shapes (multi-var, {a b} pairs, `continue`/`break` semantics)
-and lmap's result accumulation.
+### D. Inline foreach/lmap + proc-context catch/apply bodies  ←  DONE (2026-10-04)
+foreach DynCall'd cmd_foreach per iteration set with per-body
+eval_body_value; proc-foreach bench was 28× tclsh.  Landed in three
+coherent pieces (all gated judge 87/87 + two-engine sweep clean):
+
+- **D-bytecode**: `ForeachStart/Next/Collect/End` ops with a
+  `ForeachInfo` shape table (groups of `VarTarget{slot, name_idx}`) —
+  strict-parsed data lists, slot-or-name binding per iteration,
+  compiled break/continue through the ordinary loop machinery, lmap
+  collects.  Fold gate mirrors tclsh: locals-mode unit + literal
+  varlists + braces-only verbatim body (`compiler.rs`
+  `"foreach"/"lmap" if self.locals_mode`).
+- **D-tree (lexical twin)**: `interp.lexical_body` /
+  `next_eval_lexical` — cmd_foreach/cmd_lmap/cmd_while/cmd_for/if-arms
+  run a value-level twin (`foreach_lexical`) gated by value-level
+  mirrors of the compiler gates (`body_would_compile`,
+  `word_is_plain_literal`, `foreach_inline_shape`), so the tree engine
+  (RTCL_NO_BYTECODE) produces byte-identical output to the bytecode
+  engine.  Arming sites mirror the compiler's inline decisions exactly
+  (eval_word_ctx whole-word brackets, expr operand brackets, loop/if
+  bodies, call.rs tree path).
+- **D-context (catch/apply)**: tclsh compiles apply lambda bodies like
+  proc bodies and inlines braced catch bodies into proc-context units;
+  everything else (top level, eval'd strings) stays dispatched with the
+  `(setting foreach loop variable …)` decorated shapes.  rtcl mirrors:
+  `ByteCode::locals_mode` → `Interp::in_locals_unit` (set by
+  exec_bytecode for locals units, cleared by `eval` at fresh-unit
+  boundaries), `cmd_apply` compiles lambda bodies (memoised by term
+  string in `lambda_code_cache`), `cmd_catch` runs braces-only bodies
+  through `eval_lexical_script` when `(lexical_body ||
+  in_locals_unit)`.  This closed judge gen_lmap lmap-4.15 (tclsh's
+  compiled-context var-write shape) while keeping foreach-1.14's
+  top-level decoration.
+
+Residual (recorded): OO method bodies still `compiled: None` (tclsh
+compiles them; uncovered by the corpus — engines agree on the
+dispatched shape).  Catch bodies run tree-walked (lexical) rather than
+compiler-inlined — perf follow-up is true catch inlining at the
+compiler level (CatchStart/CatchEnd reserved).  proc-foreach bench:
+57ms → 14-19ms vs tclsh 5.2ms (gap 28× → ~3×).
 
 ### C. dispatch_values probe-storm slimming
 Each DynCall walks namespace-resolution chains with successive map
@@ -110,7 +144,11 @@ JIT's front-end analysis.
 ## Decision
 
 E1 → E1.75 → E1.9 → E2 landed (proc_fib 3.0→1.8×, decomp_var 2.7→1.8×).
-Next: D (foreach/lmap inline), then C, re-baseline, then decide JIT M0.
+D landed (foreach/lmap inline + lexical twin + catch/apply proc-context;
+proc-foreach 28× → ~3×).
+Next: C (dispatch slimming), F (ControlFlow rework), re-baseline, then
+decide JIT M0.  Remaining follow-ups from D: compiler-level catch-body
+inlining; OO method-body compilation; lambda-code cache on the Value rep.
 Every step gated on: build
 (ulimit 3.4G) → judge 87/87 → two-engine probe sweep → workspace tests
 → bench delta recorded in BASELINE.md.

@@ -16,7 +16,7 @@
 //! 3. **Unknown / dynamic commands** fall back to `DynCall { argc }`.
 
 use crate::{Command, Word};
-use crate::bytecode::{ByteCode, CmdSite, SrcSpan};
+use crate::bytecode::{ByteCode, CmdSite, ForeachInfo, SrcSpan, VarTarget};
 use crate::opcode::{OpCode, CmdId};
 use std::rc::Rc;
 
@@ -76,6 +76,23 @@ pub fn slot_candidate(name: &str) -> bool {
     !name.is_empty() && !name.contains('(') && !name.contains("::")
 }
 
+/// Split a var-list literal into its variable names, conservatively:
+/// plain whitespace-separated tokens, each free of the characters that
+/// would make whitespace splitting disagree with Tcl's list parser
+/// (`{}` grouping, `[]`/`$`/`"` substitution, `\` escapes).  Anything
+/// else returns `None` — the caller dispatches the real command, whose
+/// runtime list parse owns the exotic shapes (and their exact errors).
+pub fn split_varlist_simple(value: &str) -> Option<Vec<&str>> {
+    let mut out = Vec::new();
+    for tok in value.split_whitespace() {
+        if tok.contains(['{', '}', '[', ']', '"', '$', '\\']) {
+            return None;
+        }
+        out.push(tok);
+    }
+    Some(out)
+}
+
 impl Compiler {
     /// Compile a parsed unit together with its source text.  `commands`
     /// spans must point into `source` (as [`crate::ScriptUnit::parse`]
@@ -121,6 +138,7 @@ impl Compiler {
         c.compile_commands(commands);
         c.bytecode.peephole();
         c.bytecode.source = source;
+        c.bytecode.locals_mode = locals_mode;
         c.bytecode.fallback = !c.bytecode.ops().iter().all(|op| matches!(op,
             OpCode::PushConst(_) | OpCode::PushConstWide(_) | OpCode::PushEmpty
             | OpCode::PushInt(_) | OpCode::PushFloat(_) | OpCode::PushTrue | OpCode::PushFalse
@@ -131,6 +149,8 @@ impl Compiler {
             | OpCode::Concat(_) | OpCode::ExpandList | OpCode::ExpandMark
             | OpCode::Jump(_) | OpCode::JumpTrue(_) | OpCode::JumpFalse(_)
             | OpCode::LoopEnter { .. } | OpCode::LoopExit | OpCode::Break | OpCode::Continue
+            | OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. }
+            | OpCode::ForeachCollect | OpCode::ForeachEnd
             | OpCode::Return | OpCode::Exit(_)
             | OpCode::EvalScript | OpCode::EvalExpr
             | OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Pow
@@ -219,6 +239,12 @@ impl Compiler {
                 "if" => return self.compile_if(cmd),
                 "while" if cmd.words.len() == 3 => return self.compile_while(cmd),
                 "for" if cmd.words.len() == 5 => return self.compile_for(cmd),
+                // foreach/lmap inline only in proc bodies (locals_mode) —
+                // tclsh's compiledLocals requirement; every other context
+                // (top level, eval, uplevel, namespace eval) keeps the
+                // dispatched command's semantics.
+                "foreach" if self.locals_mode => return self.compile_foreach(cmd, false),
+                "lmap" if self.locals_mode => return self.compile_foreach(cmd, true),
                 "expr" => return self.compile_expr(cmd),
                 "incr" if cmd.words.len() >= 2 => return self.compile_incr(cmd),
                 "break" if cmd.words.len() == 1 => {
@@ -687,6 +713,109 @@ impl Compiler {
 
         // Tcl: loop commands always return the empty string
         self.bytecode.emit(OpCode::PushEmpty, line);
+    }
+
+    /// `foreach varList list ?varList list ...? body` / `lmap …`
+    ///
+    /// Compiled inline (proc bodies only — `locals_mode`, tclsh's
+    /// compiledLocals requirement; top-level / eval'd / uplevel'd
+    /// occurrences dispatch the real command, whose per-iteration
+    /// binding walk is the exact tree-walk semantics) when every
+    /// var-list word is a literal of simple whitespace-separated names
+    /// and the body is a braced verbatim script that parses.  Plain-name
+    /// loop variables gain locals-table slots BEFORE the body compiles,
+    /// so `$x` reads inside the body are `LoadLocal` and the per-
+    /// iteration bind writes the slot directly.
+    ///
+    /// Layout (targets patched after emission):
+    /// ```text
+    ///   <data words>                      ; one runtime value per group
+    ///   ForeachStart { info, next, end }  ; strict-parse, bind(0) | jump end
+    /// BODY:  BodyMark                     ; opens the frameless body region
+    ///   <body inline>
+    ///   ForeachCollect (lmap) | Pop       ; keep / discard the body result
+    ///   Jump next                         ; closes the body region
+    /// NEXT:  ForeachNext { info, body }   ; bind(++idx) + jump body | fall
+    /// END:   ForeachEnd                   ; pop frames, push "" / collected
+    /// ```
+    ///
+    /// `ForeachStart` pushes the loop frame itself (cont = NEXT,
+    /// brk = END), so the body's compiled `Break`/`Continue` and
+    /// error-form signals route through the ordinary loop machinery; a
+    /// `break` lands on END, which still materialises the lmap results
+    /// collected so far (tclsh: `{10 30}` for break/continue skips).
+    fn compile_foreach(&mut self, cmd: &Command, lmap: bool) {
+        // Arity: >= 4 words and even (varList/list pairs + body) — other
+        // shapes dispatch so the real command owns the wrong-#-args error.
+        if cmd.words.len() < 4 || cmd.words.len() % 2 != 0 {
+            return self.compile_dyncall(cmd);
+        }
+        // `{*}` can change the argument count at runtime — dispatch.
+        if cmd.words.iter().any(|w| matches!(w, Word::Expand(_))) {
+            return self.compile_dyncall(cmd);
+        }
+        let ngroups = (cmd.words.len() - 2) / 2;
+        let mut groups: Vec<Vec<VarTarget>> = Vec::with_capacity(ngroups);
+        for g in 0..ngroups {
+            let Word::Literal(vl) = &cmd.words[1 + 2 * g] else {
+                return self.compile_dyncall(cmd);
+            };
+            let Some(names) = split_varlist_simple(vl) else {
+                return self.compile_dyncall(cmd);
+            };
+            // tclsh: an empty varlist is a runtime error — dispatch so the
+            // command owns the exact NEEDVARS error and errorCode.
+            if names.is_empty() {
+                return self.compile_dyncall(cmd);
+            }
+            let mut targets = Vec::with_capacity(names.len());
+            for name in names {
+                let slot = if self.locals_mode && slot_candidate(name) {
+                    Some(self.bytecode.add_local(name))
+                } else {
+                    None
+                };
+                let name_idx = self.bytecode.add_const(name);
+                targets.push(VarTarget { slot, name_idx });
+            }
+            groups.push(targets);
+        }
+        let body_idx = cmd.words.len() - 1;
+        if !self.body_inlinable(cmd, body_idx) {
+            return self.compile_dyncall(cmd);
+        }
+        let line = self.abs_line(cmd);
+        let info_idx = self.bytecode.add_foreach_info(ForeachInfo { groups, lmap });
+
+        for g in 0..ngroups {
+            let wi = 2 + 2 * g;
+            let w = cmd.words[wi].clone();
+            self.compile_word_spanned(&w, line, cmd, wi);
+        }
+        let start_idx = self.bytecode.emit(
+            OpCode::ForeachStart { info: info_idx, next: 0, end: 0 },
+            line,
+        );
+
+        let body_pc = self.bytecode.current_offset();
+        self.bytecode.emit(OpCode::BodyMark, line);
+        let body_word = cmd.words[body_idx].clone();
+        self.compile_body_inline(&body_word, cmd, body_idx);
+        if lmap {
+            self.bytecode.emit(OpCode::ForeachCollect, line);
+        } else {
+            self.bytecode.emit(OpCode::Pop, line);
+        }
+        let jump_idx = self.bytecode.emit(OpCode::Jump(0), line);
+
+        let next_pc = self.bytecode.current_offset();
+        self.bytecode.emit(OpCode::ForeachNext { info: info_idx, body: body_pc }, line);
+
+        let end_pc = self.bytecode.current_offset();
+        self.bytecode.emit(OpCode::ForeachEnd, line);
+
+        self.bytecode.patch_jump(jump_idx, next_pc);
+        self.bytecode.patch_foreach_start(start_idx, next_pc, end_pc);
     }
 
     /// `expr ...`

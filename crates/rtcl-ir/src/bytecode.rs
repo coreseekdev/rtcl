@@ -62,6 +62,27 @@ pub struct CmdSite {
     pub word_srcs: Rc<Vec<SrcSpan>>,
 }
 
+/// One loop variable of a compiled foreach/lmap: the frame slot when the
+/// name entered the locals table (plain name in a proc body), plus the
+/// name's constant-pool index for the `set_var` fallback — degraded
+/// frames (upvar/trace/array restructure, statics, unset-slot paths)
+/// resolve by name against the same storage.
+#[derive(Debug, Clone)]
+pub struct VarTarget {
+    pub slot: Option<u16>,
+    pub name_idx: u16,
+}
+
+/// Compile-time resolved shape of one `foreach`/`lmap`: the var-list
+/// groups (targets in iteration order) and whether the construct
+/// collects body results (`lmap`).  `ForeachStart`/`ForeachNext` index
+/// this table.
+#[derive(Debug, Clone)]
+pub struct ForeachInfo {
+    pub groups: Vec<Vec<VarTarget>>,
+    pub lmap: bool,
+}
+
 /// Compiled bytecode for a single compilation unit (script / proc body).
 #[derive(Debug, Clone)]
 pub struct ByteCode {
@@ -73,6 +94,8 @@ pub struct ByteCode {
     locals: Vec<String>,
     /// Source line corresponding to each instruction (parallel to `ops`).
     line_map: Vec<u32>,
+    /// foreach/lmap loop shapes, referenced by the `Foreach*` ops.
+    foreach_infos: Vec<ForeachInfo>,
     /// Per-command source sites, referenced by `BeginCmd(site_idx)`.
     pub sites: Vec<CmdSite>,
     /// The compilation unit's source text — `sites` spans point into it;
@@ -82,6 +105,13 @@ pub struct ByteCode {
     /// changing semantics (unusual `if` shapes, `return` options, …).
     /// The consumer must fall back to AST evaluation for the whole unit.
     pub fallback: bool,
+    /// This unit was compiled in proc context (locals table active —
+    /// `compile_unit_locals`): foreach/lmap inline-fold and braced catch
+    /// bodies would inline (tclsh's compiledLocals units).  The executor
+    /// surfaces it as the runtime proc-context signal
+    /// (`Interp::in_locals_unit`) so DynCall'd commands can mirror the
+    /// compiler's inline decisions.
+    pub locals_mode: bool,
     /// The producer's shadow epoch at compile time (rtcl-core: any
     /// command whose leaf name matches an inline-folded Tier1 command —
     /// `set`, `if`, `while`, … — bumps it).  A consumer must only run
@@ -98,9 +128,11 @@ impl Default for ByteCode {
             ops: Vec::new(),
             locals: Vec::new(),
             line_map: Vec::new(),
+            foreach_infos: Vec::new(),
             sites: Vec::new(),
             source: Rc::from(""),
             fallback: false,
+            locals_mode: false,
             epoch: 0,
         }
     }
@@ -201,6 +233,18 @@ impl ByteCode {
         }
     }
 
+    /// Patch a `ForeachStart` instruction's jump targets (continue/loop
+    /// end — the same roles `LoopEnter`'s targets play for its loop frame).
+    pub fn patch_foreach_start(&mut self, idx: usize, next: u32, end: u32) {
+        match &mut self.ops[idx] {
+            OpCode::ForeachStart { next: n, end: e, .. } => {
+                *n = next;
+                *e = end;
+            }
+            _ => panic!("patch_foreach_start on non-ForeachStart instruction at {}", idx),
+        }
+    }
+
     /// Number of emitted instructions.
     pub fn len(&self) -> usize {
         self.ops.len()
@@ -241,6 +285,20 @@ impl ByteCode {
     /// Read-only view of local names.
     pub fn locals(&self) -> &[String] {
         &self.locals
+    }
+
+    // -- foreach shapes ------------------------------------------------------
+
+    /// Register a foreach/lmap loop shape; returns its table index.
+    pub fn add_foreach_info(&mut self, info: ForeachInfo) -> u32 {
+        let idx = self.foreach_infos.len() as u32;
+        self.foreach_infos.push(info);
+        idx
+    }
+
+    /// Look up a foreach/lmap shape by index.
+    pub fn foreach_info(&self, idx: u32) -> Option<&ForeachInfo> {
+        self.foreach_infos.get(idx as usize)
     }
 
     // -- line map ------------------------------------------------------------

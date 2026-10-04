@@ -195,3 +195,28 @@ list_ops                  4          7      1.7
 proc_fib                  5          9      1.8
 string_build              3          4      1.3
 var_incr                 40         27       .6
+
+# ---------------------------------------------------------------------------
+# D 2026-10-04 (ARCHITECTURE-PERF.md item D): inline foreach/lmap in compiled
+# proc bodies (ForeachStart/Next/Collect/End + slot-or-name binding) with the
+# lexical tree-walk twin (lexical_body arming mirrors the compiler's inline
+# decisions) and the proc-context catch/apply work: tclsh compiles apply
+# lambda bodies like proc bodies and inlines braces-only catch bodies into
+# proc-context units — ByteCode::locals_mode → Interp::in_locals_unit, apply
+# compiles+memoises (lambda_code_cache), catch routes braced bodies through
+# eval_lexical_script.  This closed judge gen_lmap lmap-4.15 (compiled-context
+# plain var-write) while keeping foreach-1.14's top-level decoration.
+# Gates: judge 87/87, two-engine sweep 8 known artifacts / 0 new, workspace
+# tests 785+ (incl. foreach-inline + catch-context + apply-compile suites).
+# The standard table doesn't exercise foreach — the dedicated microbench
+# (taskset -c 0, /tmp/fe_bench.tcl shape) carries the D number:
+#   proc-foreach: rtcl 14.9-15.4ms vs tclsh 5.2-5.5ms (~2.9x; was 28x pre-D).
+# proc_fib 9→11ms is reps-3 noise (E2's reps-5 run recorded 9).
+
+case               tclsh_ms    rtcl_ms    ratio
+arith_loop               34         34      1.0
+dict_ops                  5          7      1.4
+list_ops                  5          8      1.6
+proc_fib                  5         11      2.2
+string_build              3          4      1.3
+var_incr                 39         31       0.7

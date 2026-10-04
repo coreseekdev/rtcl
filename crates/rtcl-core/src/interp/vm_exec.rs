@@ -120,9 +120,44 @@ struct LoopFrame {
 /// skipped by a `continue`).
 struct ForeachFrame {
     info_idx: u32,
-    lists: Vec<Vec<Value>>,
+    lists: Vec<ForeachList>,
     idx: usize,
+    /// Iteration count, fixed at start (max over groups) — ForeachNext
+    /// used to recompute this per iteration over every group's list.
+    iters: usize,
     collected: Option<Vec<Value>>,
+}
+
+/// One foreach varlist: borrowed from a cached list rep, or owned.
+///
+/// A value that already carries a list internal rep is held by reference
+/// (one Rc bump — tclsh's foreach keeps a refcount on the list object and
+/// reads elements in place, and so does the tree engine's `strict_list_cow`
+/// fast path).  Lists materialised from a string/dict rep are owned
+/// vectors, exactly what `strict_list` produced before.  A mid-loop
+/// mutation of the source (`lappend` on the iterated variable) copies
+/// under COW, so iteration proceeds over the start snapshot in both
+/// forms — matching tclsh, whose shared list is duplicated on first
+/// write.
+enum ForeachList {
+    Rep(Value),
+    Owned(Vec<Value>),
+}
+
+impl ForeachList {
+    fn len(&self) -> usize {
+        match self {
+            ForeachList::Rep(v) => v.as_list_ref().map_or(0, <[Value]>::len),
+            ForeachList::Owned(v) => v.len(),
+        }
+    }
+
+    fn get(&self, i: usize) -> Option<&Value> {
+        match self {
+            ForeachList::Rep(v) => v.as_list_ref().and_then(|s| s.get(i)),
+            ForeachList::Owned(v) => v.get(i),
+        }
+    }
 }
 
 /// One inline body region currently executing — which command's construct
@@ -584,7 +619,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             let slot = *slot as usize;
             // `set` keeps its result: the value stays on the stack.
             let v = st.top_val();
-            if !interp.frame_slot_write(slot, v.clone()) {
+            if !interp.frame_slot_write(slot, &v) {
                 let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
                 interp.set_var(name, v)?;
             }
@@ -694,9 +729,19 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             let mut lists = Vec::with_capacity(ngroups);
             // Pop the group data values (last group on top), strict-parse
             // each exactly like cmd_foreach — same errors, same errorCode.
+            // A value already carrying a list rep iterates by reference
+            // (zero-copy); other reps materialise an owned Vec through the
+            // strict parse.  A list-rep value never fails the strict parse,
+            // so the error surface is identical to the always-owned form.
             for _ in 0..ngroups {
                 let v = st.pop_val();
-                lists.push(super::commands::list::strict_list(interp, &v)?);
+                if v.as_list_ref().is_some() {
+                    lists.push(ForeachList::Rep(v));
+                } else {
+                    lists.push(ForeachList::Owned(
+                        super::commands::list::strict_list(interp, &v)?,
+                    ));
+                }
             }
             lists.reverse();
             let max = info_ref
@@ -711,6 +756,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 info_idx: *info,
                 lists,
                 idx: 0,
+                iters: max,
                 collected,
             });
             // The loop frame rides the ordinary machinery: compiled
@@ -732,14 +778,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             let info_ref = code.foreach_info(*info).expect("foreach info index");
             let (idx, max) = {
                 let ff = st.foreaches.last().expect("foreach frame");
-                let max = info_ref
-                    .groups
-                    .iter()
-                    .zip(&ff.lists)
-                    .map(|(g, l)| l.len().div_ceil(g.len().max(1)))
-                    .max()
-                    .unwrap_or(0);
-                (ff.idx + 1, max)
+                (ff.idx + 1, ff.iters)
             };
             if idx < max {
                 st.foreaches.last_mut().unwrap().idx = idx;
@@ -979,15 +1018,18 @@ fn foreach_bind(
     idx: usize,
 ) -> Result<()> {
     let ff = st.foreaches.last().expect("foreach frame");
+    // Out-of-range targets (multi-group lists of uneven length) bind the
+    // empty value — one shared instance per bind, not per variable.
+    let empty = Value::empty();
     for (g, list) in info.groups.iter().zip(&ff.lists) {
         let n = g.len();
         for (vi, t) in g.iter().enumerate() {
-            let v = list.get(idx * n + vi).cloned().unwrap_or_else(Value::empty);
+            let v: &Value = list.get(idx * n + vi).unwrap_or(&empty);
             match t.slot {
-                Some(s) if interp.frame_slot_write(s as usize, v.clone()) => {}
+                Some(s) if interp.frame_slot_write(s as usize, v) => {}
                 _ => {
                     let name = code.get_const(t.name_idx).unwrap_or("");
-                    if let Err(e) = interp.set_var(name, v) {
+                    if let Err(e) = interp.set_var(name, v.clone()) {
                         if interp.err_is_error(&e) {
                             super::commands::list::set_error_code(
                                 interp,

@@ -68,11 +68,13 @@ impl Interp {
 
     /// Write `value` into slot `slot` of the current frame.  `false` when
     /// the frame is not slot-compiled (or has degraded) — the caller then
-    /// takes the name path.
-    pub(crate) fn frame_slot_write(&mut self, slot: usize, value: Value) -> bool {
+    /// takes the name path.  Takes the value by reference: the refcount
+    /// bump happens only on the write, so a caller whose fallback consumes
+    /// the value pays nothing extra on the attempt.
+    pub(crate) fn frame_slot_write(&mut self, slot: usize, value: &Value) -> bool {
         match self.frames.last_mut().and_then(|f| f.slots.get_mut(slot)) {
             Some(cell) => {
-                *cell = Some(value);
+                *cell = Some(value.clone());
                 true
             }
             None => false,

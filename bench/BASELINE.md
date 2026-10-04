@@ -355,3 +355,32 @@ list_ops                  9         10      1.1
 proc_fib                  8         15      1.8
 string_build              6          6      1.0
 var_incr                 44         34      0.7
+
+# ---------------------------------------------------------------------------
+# G1 2026-10-04: foreach zero-copy iteration + hoisted iteration count.
+# New profile round (perf, cpu-clock, symbolized) on the >1.2x-gap loads
+# found the compiled foreach paying per-iteration copies the two-engine
+# design never intended: (a) ForeachNext RE-COMPUTED the group iteration
+# count on every iteration (groups × lists zip + div_ceil + max — 7.3% of
+# the proc-foreach profile); (b) ForeachStart strict-listed every varlist
+# into an OWNED Vec<Value> — a 200k-element list cost 200k Rc bumps at
+# start and 200k drops at end (Vec<Value> clone 5.5% + drop 6.1%);
+# (c) foreach_bind cloned each bound value twice (owned get + the slot
+# write's by-value argument).  Fix: iteration count fixed once at
+# ForeachStart (ForeachFrame.iters); a varlist already carrying a list
+# internal rep is held BY REFERENCE (ForeachList::Rep — one Rc bump, the
+# tclsh model of a refcounted list read in place; COW keeps mid-loop
+# `lappend` iterating the start snapshot, probed byte-exact); only
+# string/dict-rep sources materialise an owned Vec (same strict-parse
+# errors).  frame_slot_write takes &Value so the slot path bumps once
+# and the name fallback moves the value.
+# Gates: judge 87/87; sweep 8 known + objquad (clock-seconds boundary
+# flake, value output identical — bytecode now finishes the 40000 case
+# just under the second boundary more often than the tree engine);
+# tests 1143; foreach smoke vs tclsh byte-exact incl. uneven multi-group,
+# lmap, break/continue, mid-loop lappend on the iterated list, dict
+# flatten, in-proc error framing; both engines byte-identical.
+# fe_bench (proc-foreach, time {p $L} 5, best of interleaved): 26.3ms
+# → 14.9-16.3ms per iteration (~1.7x).  dloop 441 → 405-429ms (the
+# dict-keys foreach borrows too).  fib25 neutral (74-102ms band, no
+# foreach in the hot path).

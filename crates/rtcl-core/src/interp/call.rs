@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 
 use super::{CallFrame, Interp, ProcDef, VarMap, VarSet};
+use super::util::rfind_ns_sep;
 use crate::error::{Error, Result};
 use crate::value::Value;
 
@@ -705,7 +706,7 @@ impl Interp {
 /// `::p` → `::`, bare `p` → `::`.  The root case hands out the shared
 /// [`Interp::ns_root`] — a global-scope proc call allocates nothing here.
 fn ns_of_qualified(interp: &Interp, name: &str) -> Rc<str> {
-    match name.rfind("::") {
+    match rfind_ns_sep(name) {
         Some(0) => Rc::clone(&interp.ns_root),
         Some(pos) => Rc::from(format!("::{}", name[..pos].trim_start_matches("::"))),
         None => Rc::clone(&interp.ns_root),

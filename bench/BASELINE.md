@@ -479,3 +479,27 @@ var_incr                 44         34      0.7
 # G4b's target); g3_lit 0.33 -> 0.28 (~10%); fib25/fe_bench neutral;
 # dict_ops 11 -> 10ms, list_ops 11 -> 10, var_incr 47 -> 44, proc_fib
 # 16 -> 15 (all same-or-better within granularity).
+
+# ---------------------------------------------------------------------------
+# G5 2026-10-04: dispatch-path probe cleanup, all from a symbolized fib25
+# profile on the G4 build: (a) cmd_cache root fast path — resolution at
+# global scope ("::", every plain proc call) probed a two-level map, the
+# outer probe re-hashing "::" per dispatched command (3.11%); a dedicated
+# cmd_cache_root map makes it one probe (shares cmd_cache_len, the gen
+# ageing, and the overflow clear).  (b) const_pool identity hasher — the
+# pool is keyed by ByteCode address (unique, well-spread) but hashed with
+# std's keyed SipHash (RandomState::hash_one 1.51% per exec_bytecode
+# probe); PtrHasher (write_usize = move) removes it.  Embedded builds
+# keep BTreeMap (cfg-split field).  (c) "::" substring scans off the hot
+# paths: str::contains/rfind("::") pays StrSearcher::new setup for a
+# two-byte needle on 1-4 byte names — has_ns_sep (windows(2)) in
+# get_var/set_var/take_var_fast/incr_var_fast, rfind_ns_sep in
+# ns_of_qualified (per proc call).  StrSearcher::new went 4.35% -> ABSENT,
+# cmd_cache_get 3.11% -> 0.58%, hash_one 1.51% -> ABSENT.
+# Gates: judge 87/87; sweep 0; tests 1143; feature matrix green (incl.
+# embedded); dict+g3 smokes byte-exact vs tclsh.  fib25 x10 batch: 819
+# median -> ~779-809ms (~3% wall; the profile deltas are the reliable
+# signal — 80ms granularity per run hides it).  dloop/fe neutral.
+# Remaining fib hotspots for the next profile round: call_proc 24.9%
+# (share inflated by the shrunken rest), memmove 3.9%, bignum int_rep
+# 2.5%, as_int 2.5%, pop_val 2.4%.

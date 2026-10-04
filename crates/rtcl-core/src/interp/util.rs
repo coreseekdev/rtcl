@@ -11,6 +11,26 @@ pub(crate) fn split_array_ref(name: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Does `name` contain a `::` namespace separator?  The variable and
+/// dispatch fast paths ask this about every short name ("n", "acc",
+/// "fib"); a two-byte window scan avoids `str::contains`' substring
+/// searcher setup (StrSearcher::new was several percent of the fib
+/// profile — the needle is two bytes and the haystacks are 1-4).
+#[inline]
+pub(crate) fn has_ns_sep(name: &str) -> bool {
+    name.as_bytes().windows(2).any(|w| w == b"::")
+}
+
+/// Byte offset of the LAST `::` in `name` — `str::rfind("::")` without
+/// the substring-searcher setup (`ns_of_qualified` probes every proc
+/// call, and bare names like "fib" paid StrSearcher::new + a reverse
+/// search each time).
+#[inline]
+pub(crate) fn rfind_ns_sep(name: &str) -> Option<usize> {
+    let b = name.as_bytes();
+    (0..b.len().saturating_sub(1)).rev().find(|&i| &b[i..i + 2] == b"::")
+}
+
 /// Glob pattern matching, a faithful port of tclsh's `TclUniCharMatch`
 /// (tclUtf.c): `*`, `?`, `\\` escapes outside brackets, and `[...]` classes
 /// where `]` at any member position fails, `-` always starts a range, ranges

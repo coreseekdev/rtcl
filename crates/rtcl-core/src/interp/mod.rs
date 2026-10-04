@@ -224,6 +224,32 @@ pub(crate) fn frame_level0(frame: &CallFrame) -> String {
     Value::from_list(&frame.level0).as_str().to_string()
 }
 
+/// Identity hasher for the const pool's pointer keys: ByteCode addresses
+/// are already unique and well-spread, so "hashing" is a move, not a mix
+/// (std's keyed SipHash on the per-`exec_bytecode` probe was ~1.5% of the
+/// fib profile).  Only `write_usize` is exercised (`Hash for usize`).
+#[cfg(not(feature = "embedded"))]
+#[derive(Default)]
+pub(crate) struct PtrHasher(u64);
+
+#[cfg(not(feature = "embedded"))]
+impl core::hash::Hasher for PtrHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.0 = n as u64;
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        // Never reached through usize keys; kept total for safety.
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ b as u64;
+        }
+    }
+}
+
 /// One [`Interp::const_pool`] entry: a compiled unit's string constants
 /// pre-materialised as `Value`s (tclsh's literal table).  Holds the
 /// `Rc<ByteCode>` keepalive so the address key stays valid for the
@@ -328,6 +354,12 @@ pub struct Interp {
     /// Bounded (`cmd_cache_len` cap, clear on overflow) — wasm32 is a
     /// target.
     pub(crate) cmd_cache: VarMap<VarMap<CachedCmd>>,
+    /// Root-namespace (`::`) half of the resolution cache: the common
+    /// global-scope case resolves with ONE probe instead of the two-level
+    /// map's two (the outer probe re-hashed `"::"` for every dispatched
+    /// command — ~3% of the fib profile).  Shares `cmd_cache_len` and the
+    /// generation ageing with the two-level half.
+    pub(crate) cmd_cache_root: VarMap<CachedCmd>,
     /// Number of inner entries across `cmd_cache` (cheap overflow check;
     /// the cap keeps the clear-on-overflow amortised).
     pub(crate) cmd_cache_len: usize,
@@ -370,6 +402,10 @@ pub struct Interp {
     /// is unique and stable for the entry's lifetime; bounded with
     /// clear-on-overflow (wasm32 is a target).  A miss simply falls back
     /// to `Value::from_str` — correctness never depends on residency.
+    #[cfg(not(feature = "embedded"))]
+    pub(crate) const_pool:
+        HashMap<usize, ConstPoolEntry, core::hash::BuildHasherDefault<PtrHasher>>,
+    #[cfg(feature = "embedded")]
     pub(crate) const_pool: HashMap<usize, ConstPoolEntry>,
     /// `check_expr` verdict memo: expr text → `Err(msg)` on syntax error,
     /// `Ok(())` when clean (see `types::expr::eval_expr`).  Pure function
@@ -663,13 +699,14 @@ impl Interp {
             command_meta: HashMap::new(),
             procs: VarMap::default(),
             cmd_cache: VarMap::default(),
+            cmd_cache_root: VarMap::default(),
             cmd_cache_len: 0,
             cmd_generation: 0,
             parse_cache: HashMap::new(),
             bytecode_cache: HashMap::new(),
             body_memo: Vec::new(),
             lambda_code_cache: HashMap::new(),
-            const_pool: HashMap::new(),
+            const_pool: HashMap::default(),
             in_locals_unit: false,
             expr_check_cache: HashMap::new(),
             call_depth: 0,
@@ -829,6 +866,10 @@ impl Interp {
     /// in the current namespace, if one was cached under the live
     /// command-table generation.  Two Fx hashes, zero allocations.
     pub(crate) fn cmd_cache_get(&self, name: &str) -> Option<ResolvedCmd> {
+        if self.current_namespace.as_ref() == "::" {
+            let cached = self.cmd_cache_root.get(name)?;
+            return (cached.gen == self.cmd_generation).then(|| cached.target.clone());
+        }
         let inner = self.cmd_cache.get(self.current_namespace.as_ref())?;
         let cached = inner.get(name)?;
         (cached.gen == self.cmd_generation).then(|| cached.target.clone())
@@ -841,32 +882,25 @@ impl Interp {
         const CMD_CACHE_MAX: usize = 8192;
         if self.cmd_cache_len >= CMD_CACHE_MAX {
             self.cmd_cache.clear();
+            self.cmd_cache_root.clear();
             self.cmd_cache_len = 0;
+        }
+        let entry = CachedCmd { gen: self.cmd_generation, target };
+        if self.current_namespace.as_ref() == "::" {
+            if self.cmd_cache_root.insert(name.to_string(), entry).is_none() {
+                self.cmd_cache_len += 1;
+            }
+            return;
         }
         match self.cmd_cache.get_mut(self.current_namespace.as_ref()) {
             Some(inner) => {
-                if inner
-                    .insert(
-                        name.to_string(),
-                        CachedCmd {
-                            gen: self.cmd_generation,
-                            target,
-                        },
-                    )
-                    .is_none()
-                {
+                if inner.insert(name.to_string(), entry).is_none() {
                     self.cmd_cache_len += 1;
                 }
             }
             None => {
                 let mut inner: VarMap<CachedCmd> = VarMap::default();
-                inner.insert(
-                    name.to_string(),
-                    CachedCmd {
-                        gen: self.cmd_generation,
-                        target,
-                    },
-                );
+                inner.insert(name.to_string(), entry);
                 self.cmd_cache
                     .insert(self.current_namespace.to_string(), inner);
                 self.cmd_cache_len += 1;

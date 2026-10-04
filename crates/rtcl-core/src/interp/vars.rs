@@ -4,7 +4,7 @@
 //! `Interp::globals`; inside a proc they use the current `CallFrame`'s
 //! locals (or follow upvar links to globals / other frames).
 
-use super::util::split_array_ref;
+use super::util::{has_ns_sep, split_array_ref};
 use super::{Interp, UpvarLink};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
@@ -668,7 +668,7 @@ impl Interp {
             // an empty set can't contain the name, and the common frame
             // (no upvars, no local arrays) then pays probes only for
             // `locals` itself.
-            if !name.contains("::") {
+            if !has_ns_sep(name) {
                 if let Some(frame) = self.frames.last() {
                     if frame.upvars.is_empty() || !frame.upvars.contains_key(name) {
                         // Slotted name: the slot is the canonical store (a
@@ -822,7 +822,7 @@ impl Interp {
             // get_mut probe, zero allocations; creation, links, arrays
             // and qualified names keep the slow path below (same errors,
             // same trace firing).
-            if !name.contains("::") && self.dead_flat.is_empty() {
+            if !has_ns_sep(name) && self.dead_flat.is_empty() {
                 let mut wrote = false;
                 if let Some(frame) = self.frames.last_mut() {
                     if (frame.upvars.is_empty() || !frame.upvars.contains_key(name))
@@ -885,7 +885,7 @@ impl Interp {
     /// write traces) before any user code runs — nothing observes the
     /// empty window.
     pub(crate) fn take_var_fast(&mut self, name: &str) -> Option<Value> {
-        if name.contains("::")
+        if has_ns_sep(name)
             || name.contains('(')
             || !self.var_traces.is_empty()
             || !self.dead_flat.is_empty()
@@ -925,7 +925,7 @@ impl Interp {
     /// variable, non-integer value, overflow), creation, and trace
     /// semantics.
     pub(crate) fn incr_var_fast(&mut self, name: &str, amount: i64) -> Option<Value> {
-        if name.contains("::")
+        if has_ns_sep(name)
             || name.contains('(')
             || !self.var_traces.is_empty()
             || !self.dead_flat.is_empty()

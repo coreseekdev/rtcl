@@ -297,3 +297,34 @@ list_ops                 10          9      0.9
 proc_fib                  7         15      2.1
 string_build              6          8      1.3
 var_incr                 51         34      0.6
+
+# ---------------------------------------------------------------------------
+# F2 2026-10-04 (ARCHITECTURE-PERF.md item F, part 2): namespaces as Rc<str>.
+# The F1 profile's next cost: call_proc cloned 3-4 namespace Strings per call
+# (prev_namespace, frame.call_ns, ns_of_qualified's result, def_ns for the
+# frame) — all "::" (2 chars, one malloc each) for global-scope procs, plus
+# ns_of_qualified's rfind showed as the profile's ReverseSearcher.  Change:
+# `current_namespace: Rc<str>` (+ `ns_root: Rc<str>` cached root handed out
+# per global-proc call), `frame.ns`/`frame.call_ns: Option<Rc<str>>`,
+# ns_of_qualified returns Rc<str> reusing ns_root; names built fresh
+# (qualify, ns eval, oo::define) move their String in via `Rc::from`
+# (reuses the allocation).  A global-scope proc call now allocates ZERO
+# namespace strings (was 4-5).  ~60 sites touched, all cold paths
+# (namespace/info commands, upvar targets, unknown-handler walk);
+# comparisons became `.as_ref() ==`, map probes `.get(x.as_ref())`.
+# Gates: judge 87/87; two-engine sweep 8 known artifacts / 0 new; workspace
+# tests 1143 green; namespace smoke vs tclsh byte-exact (proc-in-ns,
+# relative resolution, ensemble, upvar/uplevel, apply ::ns, rename across
+# ns, variable, tailcall-in-ns, info level 0) + F1's trace probes still
+# byte-match tclsh.  Interleaved A/B vs F1 build: fib25 89.7-99.0 →
+# 80.4-83.1ms (~10-15%; recursion clones namespaces per call); dloop
+# 0.41-0.47 → 0.43-0.44s (~3%, noise-adjacent); fe_bench neutral (foreach
+# body dominates, not the call seam).
+
+case               tclsh_ms    rtcl_ms    ratio
+arith_loop               40         36      0.9
+dict_ops                  8          9      1.1
+list_ops                 10         11      1.1
+proc_fib                  8         16      2.0
+string_build              5          6      1.2
+var_incr                 42         38      0.9

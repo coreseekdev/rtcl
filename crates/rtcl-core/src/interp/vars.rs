@@ -448,7 +448,7 @@ impl Interp {
             // `unset` at that level always operate on the global table.  A
             // bare-declared (valueless) name stops the chain: reads fail
             // rather than falling through to the global variable.
-            if self.current_namespace != "::" {
+            if self.current_namespace.as_ref() != "::" {
                 let key = self.redirect_flat(self.canonical_global(name));
                 if let Some(v) = self.globals.get(key.as_str()) {
                     return Some(v);
@@ -466,7 +466,7 @@ impl Interp {
     fn ns_var_declared(&self, name: &str) -> bool {
         let key = format!("{}::{}", &self.current_namespace[2..], name);
         self.namespaces
-            .get(&self.current_namespace)
+            .get(self.current_namespace.as_ref())
             .map(|info| info.variables.contains(&key))
             .unwrap_or(false)
     }
@@ -584,7 +584,7 @@ impl Interp {
             // Unsetting also forgets the `variable` declaration (tclsh:
             // `namespace which -variable` afterwards is empty and reads
             // fall through to the global namespace again).
-            if let Some(info) = self.namespaces.get_mut(&self.current_namespace) {
+            if let Some(info) = self.namespaces.get_mut(self.current_namespace.as_ref()) {
                 info.variables.remove(&key);
             }
             return;
@@ -627,7 +627,7 @@ impl Interp {
             let mut loc = self.resolve_loc(array_name);
             if !self.loc_is_array(&loc)
                 && self.frames.is_empty()
-                && self.current_namespace != "::"
+                && self.current_namespace.as_ref() != "::"
                 && !array_name.contains("::")
             {
                 // Unqualified array read outside procs: the current
@@ -684,7 +684,7 @@ impl Interp {
                             return Ok(v);
                         }
                     }
-                } else if self.current_namespace == "::" && self.flat_aliases.is_empty() {
+                } else if self.current_namespace.as_ref() == "::" && self.flat_aliases.is_empty() {
                     if let Some(v) = self.globals.get(name) {
                         if self.array_globals.contains(name) {
                             return Err(Error::runtime(
@@ -834,7 +834,7 @@ impl Interp {
                             }
                         }
                     }
-                } else if self.current_namespace == "::" && self.flat_aliases.is_empty() {
+                } else if self.current_namespace.as_ref() == "::" && self.flat_aliases.is_empty() {
                     if !self.array_globals.contains(name) {
                         if let Some(slot) = self.globals.get_mut(name) {
                             *slot = value.clone();
@@ -894,7 +894,7 @@ impl Interp {
                 None => frame.locals.remove(name),
             }
         } else {
-            if self.current_namespace != "::"
+            if self.current_namespace.as_ref() != "::"
                 || !self.flat_aliases.is_empty()
                 || self.array_globals.contains(name)
             {
@@ -930,7 +930,7 @@ impl Interp {
                 None => frame.locals.get_mut(name)?,
             }
         } else {
-            if self.current_namespace != "::"
+            if self.current_namespace.as_ref() != "::"
                 || !self.flat_aliases.is_empty()
                 || self.array_globals.contains(name)
             {
@@ -1024,7 +1024,7 @@ impl Interp {
                 self.elem_traces.remove(&sk);
                 self.trace_phantoms.remove(&sk);
                 Ok(())
-            } else if self.current_namespace != "::" && self.ns_var_declared(&given) {
+            } else if self.current_namespace.as_ref() != "::" && self.ns_var_declared(&given) {
                 // `variable`-declared but valueless (or declared with the
                 // value living in the namespace's own slot): unset removes
                 // the declaration and succeeds (tclsh 8.6.17).
@@ -1055,7 +1055,7 @@ impl Interp {
             let mut loc = self.resolve_loc(array_name);
             if !self.loc_is_array(&loc)
                 && self.frames.is_empty()
-                && self.current_namespace != "::"
+                && self.current_namespace.as_ref() != "::"
                 && !array_name.contains("::")
             {
                 let alt = VarLoc::Global(format!(

@@ -30,7 +30,7 @@
 use crate::error::{Error, ErrorCode, Result};
 use crate::interp::commands::misc;
 use crate::interp::commands::namespace::{normalise, parent_of, qualify};
-use crate::interp::{Interp, ProcDef};
+use crate::interp::{Interp, ProcDef, Rc};
 use crate::value::Value;
 
 #[cfg(not(feature = "embedded"))]
@@ -572,7 +572,7 @@ fn frame_in_object_ns(interp: &Interp, obj_ns: &str) -> bool {
         .last()
         .and_then(|f| f.ns.clone())
         .unwrap_or_else(|| interp.current_namespace.clone());
-    ns == obj_ns || ns.starts_with(&format!("{}::", obj_ns))
+    ns.as_ref() == obj_ns || ns.starts_with(&format!("{}::", obj_ns))
 }
 
 // ── messages ───────────────────────────────────────────────────────────
@@ -1299,7 +1299,7 @@ fn run_define_script(
         DefineTarget::Class(c) | DefineTarget::Object(c) => c.clone(),
     };
     interp.oo.define_stack.push(target);
-    let prev = core::mem::replace(&mut interp.current_namespace, "::oo::define".to_string());
+    let prev = core::mem::replace(&mut interp.current_namespace, Rc::from("::oo::define"));
     let r = interp.eval(script);
     interp.current_namespace = prev;
     interp.oo.define_stack.pop();
@@ -1339,7 +1339,7 @@ extern "Rust" fn cmd_oo_define(interp: &mut Interp, args: &[Value]) -> Result<Va
         // definition context, with no definition-script error frame
         // (tclsh: `oo::define C error foo` reports only the outer frame).
         interp.oo.define_stack.push(DefineTarget::Class(canonical));
-        let prev = core::mem::replace(&mut interp.current_namespace, "::oo::define".to_string());
+        let prev = core::mem::replace(&mut interp.current_namespace, Rc::from("::oo::define"));
         let r = interp.dispatch_values(&args[2..]);
         interp.current_namespace = prev;
         interp.oo.define_stack.pop();
@@ -1367,7 +1367,7 @@ extern "Rust" fn cmd_oo_objdefine(interp: &mut Interp, args: &[Value]) -> Result
     } else {
         // Multi-word form — see cmd_oo_define.
         interp.oo.define_stack.push(DefineTarget::Object(canonical));
-        let prev = core::mem::replace(&mut interp.current_namespace, "::oo::define".to_string());
+        let prev = core::mem::replace(&mut interp.current_namespace, Rc::from("::oo::define"));
         let r = interp.dispatch_values(&args[2..]);
         interp.current_namespace = prev;
         interp.oo.define_stack.pop();
@@ -2472,6 +2472,7 @@ pub(crate) extern "Rust" fn cmd_namespace_entry(interp: &mut Interp, args: &[Val
 #[cfg(test)]
 mod tests {
     use crate::interp::Interp;
+use crate::interp::Rc;
 
     fn eval(script: &str) -> String {
         let mut interp = Interp::new();

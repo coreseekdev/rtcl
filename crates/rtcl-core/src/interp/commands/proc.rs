@@ -75,7 +75,7 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // namespace context — `proc e1::cmd` at global and `namespace eval e1
     // {proc cmd}` must land on the SAME registered key (`::e1::cmd`,
     // tclsh), otherwise redefinition splits into two commands.
-    let name = if raw_name.contains("::") || interp.current_namespace != "::" {
+    let name = if raw_name.contains("::") || interp.current_namespace.as_ref() != "::" {
         super::namespace::qualify(&interp.current_namespace, raw_name)
     } else {
         raw_name.to_string()
@@ -465,7 +465,7 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let saved_ns_stack: Vec<_> = interp.ns_stack.split_off(ns_trim);
     let saved_l0: Vec<_> = interp.ns_level0.split_off(ns_trim);
     let saved_ns = interp.current_namespace.clone();
-    interp.current_namespace = target_ns;
+    interp.current_namespace = Rc::from(target_ns);
     let result = eval_tagged(interp, &script, "uplevel");
     interp.current_namespace = saved_ns;
     interp.ns_level0.extend(saved_l0);
@@ -505,8 +505,9 @@ fn uplevel_resolve(interp: &Interp, target: usize) -> (usize, usize, String) {
             let depth = interp.frames[fi].ns_depth.min(interp.ns_stack.len());
             let ns = interp.frames[fi]
                 .ns
-                .clone()
-                .unwrap_or_else(|| "::".to_string());
+                .as_deref()
+                .unwrap_or("::")
+                .to_string();
             // Frames strictly above the target pop; `uplevel 0` stays in
             // the running frame.
             (interp.frames.len() - fi - 1, depth, ns)
@@ -636,7 +637,7 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let ns = interp.frames[current_idx]
                 .call_ns
                 .clone()
-                .unwrap_or_else(|| "::".to_string());
+                .unwrap_or_else(|| Rc::clone(&interp.ns_root));
             UpvarTarget::Ns(ns)
         }
         TargetScope::Idx(k) => upvar_target(interp, k),
@@ -782,7 +783,7 @@ enum UpvarTarget {
     /// The true global namespace (`upvar #0`, fell off everything).
     GlobalNs,
     /// An open `namespace eval`'s (or fallen-off caller's) variable table.
-    Ns(String),
+    Ns(Rc<str>),
     /// A proc frame by absolute index.
     Frame(usize),
 }
@@ -793,7 +794,7 @@ fn upvar_target(interp: &Interp, target: usize) -> UpvarTarget {
     for (i, f) in interp.frames.iter().enumerate() {
         let below = f.ns_depth.min(interp.ns_stack.len());
         if idx < below {
-            return UpvarTarget::Ns(interp.ns_stack[idx].clone());
+            return UpvarTarget::Ns(Rc::from(interp.ns_stack[idx].as_str()));
         }
         idx -= below;
         if idx == 0 {
@@ -802,7 +803,7 @@ fn upvar_target(interp: &Interp, target: usize) -> UpvarTarget {
         idx -= 1;
     }
     if idx < interp.ns_stack.len() {
-        UpvarTarget::Ns(interp.ns_stack[idx].clone())
+        UpvarTarget::Ns(Rc::from(interp.ns_stack[idx].as_str()))
     } else {
         UpvarTarget::GlobalNs
     }
@@ -874,7 +875,7 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         })?;
     let new_key = if new_name.is_empty() {
         String::new()
-    } else if new_name.contains("::") || interp.current_namespace != "::" {
+    } else if new_name.contains("::") || interp.current_namespace.as_ref() != "::" {
         // Namespace-qualified targets store fully-qualified, exactly like
         // `proc` definition does (basic-18.6: `rename q test_ns_basic::p`
         // must land on the key the ns-first dispatch — and the namespace
@@ -1044,7 +1045,7 @@ pub(crate) fn resolve_command_key(interp: &Interp, name: &str) -> Option<String>
     if interp.procs.contains_key(name) || interp.commands.contains_key(name) {
         return Some(name.to_string());
     }
-    if interp.current_namespace != "::" && !name.starts_with("::") {
+    if interp.current_namespace.as_ref() != "::" && !name.starts_with("::") {
         let qualified =
             super::namespace::qualify(&interp.current_namespace, name);
         if interp.procs.contains_key(&qualified) || interp.commands.contains_key(&qualified) {
@@ -1079,7 +1080,7 @@ pub(crate) fn resolve_command_key(interp: &Interp, name: &str) -> Option<String>
     }
     // Namespace ensembles resolve like commands for rename.
     let mut keys: Vec<String> = vec![name.to_string()];
-    if interp.current_namespace != "::" && !name.starts_with("::") {
+    if interp.current_namespace.as_ref() != "::" && !name.starts_with("::") {
         keys.push(super::namespace::qualify(&interp.current_namespace, name));
     }
     if !name.starts_with("::") {
@@ -1094,7 +1095,7 @@ pub(crate) fn resolve_command_key(interp: &Interp, name: &str) -> Option<String>
     // itself, not the origin (48.2).
     let alias_key = if name.starts_with("::") {
         name.to_string()
-    } else if interp.current_namespace != "::" {
+    } else if interp.current_namespace.as_ref() != "::" {
         super::namespace::qualify(&interp.current_namespace, name)
     } else {
         format!("::{}", name)

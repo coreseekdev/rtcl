@@ -7,15 +7,15 @@ frame pool).  Bench history: `bench/BASELINE.md`; correctness gates: judge
 87/87 vs live tclsh 8.6.17 + full two-engine probe sweep (bytecode ==
 tree-walk byte-exact, modulo recorded divergence classes).
 
-## Where we are (2026-10-04, taskset -c 0, best-of)
+## Where we are (2026-10-04 post-F, taskset -c 0, best-of, noisy machine)
 
 bench case      tclsh   rtcl    ratio      note
-arith_loop         34     31      .9       compiled while + IncrVar
-dict_ops            5      6     1.2       DynCall dispatch
-list_ops            5      7     1.4       DynCall dispatch
-proc_fib            4     13     3.2       fib20; fib25 hand-probe 134ms vs 31ms (4.3x)
-string_build        3      3     1.0
-var_incr           39     29      .7
+arith_loop         40     36      .9       compiled while + IncrVar
+dict_ops            8      9     1.1       DynCall dispatch
+list_ops           10     11     1.1       DynCall dispatch
+proc_fib            8     16     2.0       fib20; fib25 interleaved ~80ms vs tclsh 25-39
+string_build        5      6     1.2
+var_incr           42     38      .9
 
 Decomposition probes (startup-corrected, per-call):
 
@@ -140,11 +140,27 @@ the statics unit tests caught it).  Ensemble/unknown/unresolved stay
 uncached.  dloop 598→437ms vs tclsh 249 (2.2×→1.76×); gates green
 (judge 87/87, sweep 8 known, tests 1143).  Full notes in BASELINE.md "C".
 
-### F. ControlFlow rework
-`Error::ControlFlow { code, level, ... }` is constructed/decoded on
-every return/break/continue crossing; return-with-value allocates.  A
-dedicated completion enum carried in VmState would remove per-iteration
-costs in loop-heavy code that mixes dispatch and inline constructs.
+### F. Call-path rework  ←  DONE (2026-10-04, F1 bb7de53 + F2)
+Re-scoped from measurement, not the roadmap's original text (the
+ControlFlow-allocates assumption was wrong: `Error::ret` moves the Value
+inline; compiled loops already jump directly).  The measured costs were
+per-call dead work in call_proc:
+- **F1 — lazy execution-trace context**: call_proc's first act was
+  resolve_command_key (7-arm probe chain + format! walk) + 2 String
+  allocs + an exec_step_stack push, whose only reader gates on
+  `exec_traces.is_empty()` — dead in every untraced session.  Gated
+  behind `traced_entry` (tailcall rebind + exit pop/fire carry the same
+  guard).  tclsh-probed: traces registered on an already-running proc do
+  NOT instrument that invocation — rtcl's eager context DID (two
+  divergences fixed; probes now byte-match).  dloop ~20%, fib25 ~4%.
+- **F2 — namespaces as `Rc<str>`**: `current_namespace`/`frame.ns`/
+  `frame.call_ns` were Strings cloned 3-5× per call (all "::" for global
+  procs) and `ns_of_qualified`'s rfind was the profile's
+  ReverseSearcher.  Now Rc bumps + a cached `ns_root`; fresh names move
+  in via `Rc::from(String)` (reuses the allocation).  A global-scope
+  proc call allocates zero namespace strings.  fib25 another ~10-15%
+  (89.7-99.0 → 80.4-83.1ms interleaved vs F1); dloop/fe_bench neutral.
+Full notes in BASELINE.md "F1"/"F2".
 
 ### JIT (HANDOFF §5, M0-M4) — after the interpreter plateaus
 Tcl → wasm per-proc modules, interpreter stays as fallback.  The slot-
@@ -158,11 +174,17 @@ E1 → E1.75 → E1.9 → E2 landed (proc_fib 3.0→1.8×, decomp_var 2.7→1.8�
 D landed (foreach/lmap inline + lexical twin + catch/apply proc-context;
 proc-foreach 28× → ~3×).
 C landed (resolution cache; dloop 2.2×→1.76×).
-Next: F (ControlFlow rework), re-baseline, then decide JIT M0.  Remaining
+F landed (F1 lazy trace context — dloop ~20% and two trace divergences
+fixed; F2 Rc<str> namespaces — fib25 ~10-15% more; fib25 journey
+post-E2 87 → ~80ms best under load, vs tclsh 25-39 same conditions).
+Next: re-baseline, then decide JIT M0.  Remaining
 follow-ups from D: compiler-level catch-body inlining; OO method-body
 compilation; lambda-code cache on the Value rep.  New follow-up from C's
 testing: `rename` of a name a proc shadows removes the builtin and leaves
 the proc (tclsh removes the resolved command — pre-existing, recorded).
+Also recorded: numeric fast path (Value::as_int through bignum machinery
+~6% on fib — the next measured target if more interpreter headroom is
+wanted before JIT).
 Every step gated on: build
 (ulimit 3.4G) → judge 87/87 → two-engine probe sweep → workspace tests
 → bench delta recorded in BASELINE.md.

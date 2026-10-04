@@ -532,7 +532,7 @@ impl Interp {
         // dispatch to the origin's *current* body and namespace).  The
         // carried name is a Cow: the hot plain-name hit borrows the
         // invocation word instead of allocating a String per call.
-        let proc_lookup = if self.current_namespace != "::"
+        let proc_lookup = if self.current_namespace.as_ref() != "::"
             && !cmd_name.starts_with("::")
             && !cmd_name.contains("::")
         {
@@ -549,7 +549,7 @@ impl Interp {
             self.procs.get(cmd_name).cloned().map(|p| (p, Cow::Borrowed(cmd_name)))
         }
             .or_else(|| {
-                if self.current_namespace != "::" && !cmd_name.starts_with("::") {
+                if self.current_namespace.as_ref() != "::" && !cmd_name.starts_with("::") {
                     let qualified = crate::interp::commands::namespace::qualify(
                         &self.current_namespace, cmd_name,
                     );
@@ -639,7 +639,7 @@ impl Interp {
 
         // Built-in commands
         let func = self.commands.get(cmd_name).cloned().or_else(|| {
-            if self.current_namespace != "::" && !cmd_name.starts_with("::") {
+            if self.current_namespace.as_ref() != "::" && !cmd_name.starts_with("::") {
                 let qualified = crate::interp::commands::namespace::qualify(
                     &self.current_namespace, cmd_name,
                 );
@@ -749,7 +749,7 @@ impl Interp {
                 if cmd_name != "unknown" {
                     let mut anc = self.current_namespace.clone();
                     let handler = loop {
-                        if let Some(v) = self.ns_unknown.get(&anc) {
+                        if let Some(v) = self.ns_unknown.get(anc.as_ref()) {
                             let words: Vec<String> =
                                 crate::value::Value::from_str(v.as_str())
                                     .as_list()
@@ -759,10 +759,10 @@ impl Interp {
                                     .unwrap_or_default();
                             break if words.is_empty() { None } else { Some(words) };
                         }
-                        if anc == "::" {
+                        if anc.as_ref() == "::" {
                             break None;
                         }
-                        anc = crate::interp::commands::namespace::parent_of(&anc);
+                        anc = Rc::from(crate::interp::commands::namespace::parent_of(anc.as_ref()));
                     };
                     if let Some(words) = handler {
                         let mut call: Vec<Value> = words
@@ -999,7 +999,7 @@ fn resolve_proc_key(interp: &Interp, name: &str) -> Option<String> {
     if interp.procs.contains_key(name) {
         return Some(name.to_string());
     }
-    if interp.current_namespace != "::" && !name.starts_with("::") {
+    if interp.current_namespace.as_ref() != "::" && !name.starts_with("::") {
         let qualified =
             crate::interp::commands::namespace::qualify(&interp.current_namespace, name);
         if interp.procs.contains_key(&qualified) {

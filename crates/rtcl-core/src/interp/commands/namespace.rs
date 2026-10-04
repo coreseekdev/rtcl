@@ -15,6 +15,7 @@
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::interp::Interp;
+use crate::interp::Rc;
 use crate::interp::commands::proc::move_alias_origins;
 use crate::value::Value;
 
@@ -149,7 +150,7 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // (`variable test_ns_var::` declares test_ns_var's "" variable —
         // var-7.12; `variable :` is a plain name — var-7.13).
         let qualified = if raw_name.is_empty() {
-            if ns == "::" {
+            if ns.as_ref() == "::" {
                 String::new()
             } else {
                 var_key(&format!("{}::", ns))
@@ -165,7 +166,7 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // The variable's namespace must exist (`can't define "<as-typed>":
         // parent namespace doesn't exist` — var-7.7, var-1.11's family).
         let ns_part = if raw_name.is_empty() {
-            ns.clone()
+            ns.to_string()
         } else if raw_name.ends_with("::") {
             normalise(&format!("::{}", &qualified))
         } else {
@@ -296,7 +297,7 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     interp.ns_stack.push(qualified.clone());
     // Marks for the eval-level variable links this body creates — they
     // die with it (tclsh's ns-eval varFrame pops).
-    let prev = std::mem::replace(&mut interp.current_namespace, qualified.clone());
+    let prev = std::mem::replace(&mut interp.current_namespace, Rc::from(qualified.clone()));
     let result = interp.eval(&body);
     interp.current_namespace = prev;
     interp.ns_stack.pop();
@@ -376,7 +377,7 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // still reports the deleted namespace both in the eval body and in
         // a proc frame; `namespace exists` is 0 for it).  Only the delete
         // trace callbacks below run fresh in `::` (34.4/34.5).
-        let inside = interp.current_namespace == qualified
+        let inside = interp.current_namespace.as_ref() == qualified
             || interp.current_namespace.starts_with(&prefix);
 
         let var_prefix = var_key(&prefix);
@@ -454,7 +455,7 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if inside {
             interp.procs.retain(|k, _| k != &qualified && !k.starts_with(&prefix));
         }
-        let saved_ns = Some(std::mem::replace(&mut interp.current_namespace, "::".to_string()));
+        let saved_ns = Some(std::mem::replace(&mut interp.current_namespace, Rc::clone(&interp.ns_root)));
         for key in &dead_procs {
             interp.fire_cmd_traces(key, key, "", "delete");
         }
@@ -540,7 +541,7 @@ fn ns_parent(interp: &Interp, args: &[Value]) -> Result<Value> {
     let ns = if args.len() == 3 {
         require_ns(interp, args[2].as_str())?
     } else {
-        interp.current_namespace.clone()
+        interp.current_namespace.to_string()
     };
     if ns == "::" {
         return Ok(Value::empty());
@@ -562,7 +563,7 @@ fn ns_children(interp: &Interp, args: &[Value]) -> Result<Value> {
     let ns = if args.len() >= 3 {
         require_ns(interp, args[2].as_str())?
     } else {
-        interp.current_namespace.clone()
+        interp.current_namespace.to_string()
     };
     let pattern = if args.len() >= 4 { Some(args[3].as_str()) } else { None };
 
@@ -661,7 +662,7 @@ fn ns_which(interp: &Interp, args: &[Value]) -> Result<Value> {
             let key = var_key(&qualified);
             let declared = interp
                 .namespaces
-                .get(&interp.current_namespace)
+                .get(interp.current_namespace.as_ref())
                 .map(|info| info.variables.contains(&key))
                 .unwrap_or(false);
             if interp.globals.contains_key(&key) || declared {
@@ -741,7 +742,7 @@ fn ns_export(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         given.push(pat.to_string());
     }
 
-    let info = interp.namespaces.entry(ns).or_default();
+    let info = interp.namespaces.entry(ns.to_string()).or_default();
     if clear {
         info.export_patterns.clear();
     }
@@ -809,7 +810,7 @@ fn ns_import(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ErrorCode::NotFound,
             ));
         }
-        if src == cur {
+        if src == cur.as_ref() {
             // tclsh names the source namespace by its simple name
             let simple = ns_tail_str(&src).to_string();
             return Err(Error::runtime(
@@ -872,7 +873,7 @@ fn ns_import(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // An existing command of that name in the target namespace
             // conflicts.  Procs defined at global scope are keyed by their
             // as-typed name ("cmd1", not "::cmd1").
-            let at_global = cur == "::";
+            let at_global = cur.as_ref() == "::";
             let bare = target.trim_start_matches("::").to_string();
             let proc_hit = interp.procs.contains_key(&target)
                 || (at_global && interp.procs.contains_key(&bare));
@@ -947,10 +948,10 @@ fn ns_forget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // The alias lives in the current namespace iff its qualifiers
             // ARE the current namespace (global aliases have none).
             let alias_ns = ns_qualifiers_str(alias);
-            let in_cur = if cur == "::" {
+            let in_cur = if cur.as_ref() == "::" {
                 alias_ns.is_empty()
             } else {
-                alias_ns == cur
+                alias_ns == cur.as_ref()
             };
             let from_src = origin
                 .strip_prefix(&src_prefix)
@@ -1016,13 +1017,13 @@ fn ns_unknown(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let cur = interp.current_namespace.clone();
     if args.len() == 3 {
         let script = args[2].as_str().to_string();
-        interp.ns_unknown.insert(cur, script);
+        interp.ns_unknown.insert(cur.to_string(), script);
         return Ok(args[2].clone());
     }
-    if let Some(h) = interp.ns_unknown.get(&cur) {
+    if let Some(h) = interp.ns_unknown.get(cur.as_ref()) {
         return Ok(Value::from_str(h));
     }
-    if cur == "::" {
+    if cur.as_ref() == "::" {
         return Ok(Value::from_str("::unknown"));
     }
     Ok(Value::empty())
@@ -1210,8 +1211,8 @@ fn ens_create(interp: &mut Interp, opts: &[Value]) -> Result<Value> {
     // The ensemble command is named after the namespace and lives in its
     // PARENT (tclsh: `namespace eval ns {namespace ensemble create}` yields
     // the command `ns`, callable from the parent level).
-    let mut name = if ns == "::" {
-        ns.clone()
+    let mut name = if ns.as_ref() == "::" {
+        ns.to_string()
     } else {
         let tail = ns.rsplit("::").next().unwrap_or("").to_string();
         match parent_of(&ns) {
@@ -1220,7 +1221,7 @@ fn ens_create(interp: &mut Interp, opts: &[Value]) -> Result<Value> {
         }
     };
     let mut def = crate::interp::EnsembleDef {
-        namespace: ns.clone(),
+        namespace: ns.to_string(),
         map: Vec::new(),
         prefixes: true,
         subcommands: None,
@@ -1307,7 +1308,7 @@ pub(crate) fn find_ensemble_key(interp: &Interp, name: &str) -> Option<String> {
     if interp.ensembles.contains_key(name) {
         return Some(name.to_string());
     }
-    if cur != "::" && !name.starts_with("::") {
+    if cur.as_ref() != "::" && !name.starts_with("::") {
         let qualified = qualify(cur, name);
         if interp.ensembles.contains_key(&qualified) {
             return Some(qualified);
@@ -1668,7 +1669,7 @@ fn ens_configure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         .or_else(|| {
             let ns = if typed.starts_with("::") {
                 normalise(&typed)
-            } else if interp.current_namespace == "::" {
+            } else if interp.current_namespace.as_ref() == "::" {
                 format!("::{}", typed)
             } else {
                 qualify(&interp.current_namespace, &typed)
@@ -2044,6 +2045,7 @@ pub(crate) fn ensure_namespace(
 #[cfg(test)]
 mod tests {
     use crate::interp::Interp;
+use crate::interp::Rc;
 
     fn eval(script: &str) -> String {
         let mut interp = Interp::new();

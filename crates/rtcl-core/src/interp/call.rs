@@ -158,8 +158,9 @@ impl Interp {
             {
                 let def_ns = ns_override
                     .take()
-                    .unwrap_or_else(|| ns_of_qualified(&current_proc_name));
-                self.current_namespace = def_ns.clone();
+                    .map(Rc::from)
+                    .unwrap_or_else(|| ns_of_qualified(self, &current_proc_name));
+                self.current_namespace = Rc::clone(&def_ns);
                 let frame = self.frames.last_mut().unwrap();
                 frame.ns = Some(def_ns);
                 frame.locals.clear();
@@ -687,11 +688,12 @@ impl Interp {
 }
 
 /// The namespace part of a qualified proc name: `::foo::p` → `::foo`,
-/// `::p` → `::`, bare `p` → `::`.
-fn ns_of_qualified(name: &str) -> String {
+/// `::p` → `::`, bare `p` → `::`.  The root case hands out the shared
+/// [`Interp::ns_root`] — a global-scope proc call allocates nothing here.
+fn ns_of_qualified(interp: &Interp, name: &str) -> Rc<str> {
     match name.rfind("::") {
-        Some(0) => "::".to_string(),
-        Some(pos) => format!("::{}", name[..pos].trim_start_matches("::")),
-        None => "::".to_string(),
+        Some(0) => Rc::clone(&interp.ns_root),
+        Some(pos) => Rc::from(format!("::{}", name[..pos].trim_start_matches("::"))),
+        None => Rc::clone(&interp.ns_root),
     }
 }

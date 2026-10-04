@@ -24,7 +24,7 @@ pub(crate) fn resolve_proc_key(interp: &Interp, name: &str) -> Option<String> {
     if has(interp, name) {
         return Some(name.to_string());
     }
-    if interp.current_namespace != "::" && !name.starts_with("::") {
+    if interp.current_namespace.as_ref() != "::" && !name.starts_with("::") {
         let qualified = super::namespace::qualify(&interp.current_namespace, name);
         if has(interp, &qualified) {
             return Some(qualified);
@@ -608,7 +608,7 @@ fn resolve_info_pattern(interp: &Interp, pat: &str) -> Option<(String, Option<St
     let mut ns = if pat.starts_with("::") {
         "::".to_string()
     } else {
-        interp.current_namespace.clone()
+        interp.current_namespace.to_string()
     };
     let mut rest = pat.trim_start_matches(':');
     loop {
@@ -663,7 +663,7 @@ fn list_commands_in(
     merge_globals: bool,
 ) -> Result<Value> {
     let (eff, simple, specific) = match pattern {
-        None => (interp.current_namespace.clone(), None, false),
+        None => (interp.current_namespace.to_string(), None, false),
         Some(p) => match resolve_info_pattern(interp, p) {
             None => return Ok(Value::from_list(&[])),
             Some(pi) => pi,
@@ -863,7 +863,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // relative (tclsh: inside `namespace eval nn`, `info vars`
             // lists `zz`, not `::nn::zz` — var-1.14); variables of child
             // namespaces are not listed at all.
-            let ns_prefix = if interp.frames.is_empty() && interp.current_namespace != "::" {
+            let ns_prefix = if interp.frames.is_empty() && interp.current_namespace.as_ref() != "::" {
                 Some(format!("{}::", &interp.current_namespace[2..]))
             } else {
                 None

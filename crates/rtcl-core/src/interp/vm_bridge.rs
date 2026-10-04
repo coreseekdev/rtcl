@@ -77,7 +77,7 @@ impl VmContext for Interp {
         // Try user-defined procs first.  A simple name inside a
         // namespace resolves there before any bare-keyed global proc
         // (tclsh lookup order — mirrors eval.rs dispatch).
-        let proc_def = if self.current_namespace != "::"
+        let proc_def = if self.current_namespace.as_ref() != "::"
             && !cmd_name.starts_with("::")
             && !cmd_name.contains("::")
         {

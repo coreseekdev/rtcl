@@ -145,13 +145,13 @@ pub(crate) struct CallFrame {
     /// Namespace the running proc was defined in (tclsh: `namespace current`
     /// inside the proc resolves here).  Variable *reads* do NOT fall back to
     /// this namespace — only locals, upvar/`variable` links, and `::`-qualified
-    /// names are visible in a proc frame.
-    pub ns: Option<String>,
+    /// names are visible in a proc frame.  `Rc<str>` — written per call.
+    pub ns: Option<Rc<str>>,
     /// Namespace active at CALL time — the context of the caller's script
     /// (e.g. the body of a `namespace eval` this proc was invoked from).
     /// `uplevel` relative levels target this context when the caller is
     /// not a proc frame (tclsh 8.6.17).
-    pub call_ns: Option<String>,
+    pub call_ns: Option<Rc<str>>,
     /// Commands created by `local` — deleted when this frame exits.
     pub local_procs: Vec<String>,
     /// Scripts registered by `defer` — executed in reverse order on frame exit.
@@ -359,8 +359,15 @@ pub struct Interp {
     /// Package registry: name → version string.
     #[cfg(feature = "package")]
     pub(crate) packages: HashMap<String, String>,
-    /// Current namespace ("::") at the global level.
-    pub(crate) current_namespace: String,
+    /// Current namespace ("::") at the global level.  `Rc<str>` — a proc
+    /// call swaps this to the definition namespace and back, and the swap
+    /// is a refcount bump rather than a heap copy; same for the frame's
+    /// `ns`/`call_ns` records.  Names built fresh (qualify, ns eval) move
+    /// their String in via `Rc::from`, which reuses the allocation.
+    pub(crate) current_namespace: Rc<str>,
+    /// The root namespace as a shared `Rc` — the namespace of every
+    /// global-scope proc, handed out per call without allocating.
+    pub(crate) ns_root: Rc<str>,
     /// Known namespaces ("::" always present).
     pub(crate) namespaces: HashMap<String, commands::namespace::NamespaceInfo>,
     /// `namespace import` aliases: fully-qualified alias name → the fully
@@ -637,7 +644,8 @@ impl Interp {
             code_cache: HashMap::new(),
             #[cfg(feature = "package")]
             packages: HashMap::new(),
-            current_namespace: "::".to_string(),
+            current_namespace: Rc::from("::"),
+            ns_root: Rc::from("::"),
             namespaces: {
                 let mut ns = HashMap::new();
                 ns.insert("::".to_string(), commands::namespace::NamespaceInfo::default());
@@ -787,7 +795,7 @@ impl Interp {
     /// in the current namespace, if one was cached under the live
     /// command-table generation.  Two Fx hashes, zero allocations.
     pub(crate) fn cmd_cache_get(&self, name: &str) -> Option<ResolvedCmd> {
-        let inner = self.cmd_cache.get(self.current_namespace.as_str())?;
+        let inner = self.cmd_cache.get(self.current_namespace.as_ref())?;
         let cached = inner.get(name)?;
         (cached.gen == self.cmd_generation).then(|| cached.target.clone())
     }
@@ -801,7 +809,7 @@ impl Interp {
             self.cmd_cache.clear();
             self.cmd_cache_len = 0;
         }
-        match self.cmd_cache.get_mut(self.current_namespace.as_str()) {
+        match self.cmd_cache.get_mut(self.current_namespace.as_ref()) {
             Some(inner) => {
                 if inner
                     .insert(
@@ -826,7 +834,7 @@ impl Interp {
                     },
                 );
                 self.cmd_cache
-                    .insert(self.current_namespace.clone(), inner);
+                    .insert(self.current_namespace.to_string(), inner);
                 self.cmd_cache_len += 1;
             }
         }

@@ -122,12 +122,23 @@ compiler-inlined — perf follow-up is true catch inlining at the
 compiler level (CatchStart/CatchEnd reserved).  proc-foreach bench:
 57ms → 14-19ms vs tclsh 5.2ms (gap 28× → ~3×).
 
-### C. dispatch_values probe-storm slimming
-Each DynCall walks namespace-resolution chains with successive map
-probes.  A CmdId-indexed builtin table + procs fast map already exists
-partially (dispatch_call guards); extend to the resolution order so the
-common case (plain global proc or builtin) is ≤2 probes.  Small (few %)
-but cheap.
+### C. dispatch_values probe-storm slimming  ←  DONE (2026-10-04, c849b39)
+Root cause (instrumented, not guessed): stdlib's `namespace ensemble
+create` in `namespace eval ::tcl::tm` keeps `ensembles` non-empty in
+every real session, so `dispatch_call`'s fast path NEVER fired — every
+compiled Call/DynCall walked the full chain: ~7 procs probes +
+find_ensemble + the commands chain, with two heap `format!("::{}", name)`
+keys per dispatched command (~1M dispatches in the dict bench; profile:
+fmt ~6%, VarHasher 5.3%, memcmp 5%).  Fix: tclsh-style resolved-command
+tokens — `cmd_cache[(namespace, name)] -> CachedCmd{gen, target}`,
+generation bumped at every commands/procs/ensembles/import_aliases
+mutation (35+ sites).  Builtins cache the fn ptr (one generation-checked
+probe replaces both the guard storm and the CmdId memcmp chain); procs
+cache the resolved KEY and re-fetch the def per call (statics write-back
+replaces the map entry via `Rc::make_mut` — caching the def goes stale;
+the statics unit tests caught it).  Ensemble/unknown/unresolved stay
+uncached.  dloop 598→437ms vs tclsh 249 (2.2×→1.76×); gates green
+(judge 87/87, sweep 8 known, tests 1143).  Full notes in BASELINE.md "C".
 
 ### F. ControlFlow rework
 `Error::ControlFlow { code, level, ... }` is constructed/decoded on
@@ -146,9 +157,12 @@ JIT's front-end analysis.
 E1 → E1.75 → E1.9 → E2 landed (proc_fib 3.0→1.8×, decomp_var 2.7→1.8×).
 D landed (foreach/lmap inline + lexical twin + catch/apply proc-context;
 proc-foreach 28× → ~3×).
-Next: C (dispatch slimming), F (ControlFlow rework), re-baseline, then
-decide JIT M0.  Remaining follow-ups from D: compiler-level catch-body
-inlining; OO method-body compilation; lambda-code cache on the Value rep.
+C landed (resolution cache; dloop 2.2×→1.76×).
+Next: F (ControlFlow rework), re-baseline, then decide JIT M0.  Remaining
+follow-ups from D: compiler-level catch-body inlining; OO method-body
+compilation; lambda-code cache on the Value rep.  New follow-up from C's
+testing: `rename` of a name a proc shadows removes the builtin and leaves
+the proc (tclsh removes the resolved command — pre-existing, recorded).
 Every step gated on: build
 (ulimit 3.4G) → judge 87/87 → two-engine probe sweep → workspace tests
 → bench delta recorded in BASELINE.md.

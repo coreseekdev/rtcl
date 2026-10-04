@@ -32,15 +32,6 @@ pub(crate) fn as_int_val(v: &Value) -> Result<i64> {
 pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Value> {
     use num_bigint::BigInt;
     use super::bignum::{floor_div as big_div, int_rep, to_value};
-    // NaN operands can't take part in arithmetic (`"nan" + 0` →
-    // can't use non-numeric floating-point value as operand of "+").
-    if left.as_float().map_or(false, |f| f.is_nan())
-        || right.as_float().map_or(false, |f| f.is_nan())
-    {
-        return Err(Error::Msg(format!(
-            "can't use non-numeric floating-point value as operand of \"{op}\""
-        )));
-    }
     if let (Some(ia), Some(ib)) = (int_rep(left), int_rep(right)) {
         if let (IntRep::I64(a), IntRep::I64(b)) = (&ia, &ib) {
             // Widen lazily: the bignum forms are converted only on an
@@ -89,6 +80,20 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
             }
             _ => Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
         };
+    }
+    // NaN operands can't take part in arithmetic (`"nan" + 0` →
+    // can't use non-numeric floating-point value as operand of "+").
+    // Checked only now, AFTER the both-integer fast path: an integer
+    // never carries NaN, and probing as_float first re-parsed every
+    // string operand as a float before the int parse could even run
+    // (double parse per `+` on bracket results — several percent of the
+    // fib profile).
+    if left.as_float().map_or(false, |f| f.is_nan())
+        || right.as_float().map_or(false, |f| f.is_nan())
+    {
+        return Err(Error::Msg(format!(
+            "can't use non-numeric floating-point value as operand of \"{op}\""
+        )));
     }
     match (left.as_float(), right.as_float()) {
         (Some(a), Some(b)) => {

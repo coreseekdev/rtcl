@@ -544,3 +544,59 @@ var_incr                 44         34      0.7
 # (chain.to_vec() — every ChainEntry's params Vec + body String) per
 # invocation; oo::object dispatch is ~3.3x tclsh while method BODIES now
 # match named-proc speed.
+
+# ---------------------------------------------------------------------------
+# G7 2026-10-05: the profile round (frame-pointer symbolized builds at
+# /tmp/g7sym, callchains via `perf script` frame-walking), plus the two
+# certain fixes it found in the expr layer.
+#
+# fib25 (5k samples): exec_op 14.9% + exec_bytecode 13.1% + call_proc
+# 12.1% (the call machinery is ~40% of fib); memmove 9.5% (mostly with
+# dispatch_values as the direct caller — the per-call args/level0 Vec
+# copies); dispatch_values self 4.2%; FxHasher::write 3.9%;
+# numeric_binop 3.0%; from_int 2.9%; as_float 2.8%; cmd_cache_get 2.7%;
+# as_int 2.4%; memcmp 2.3%; pop_val 2.0%; int_rep 1.5%; numeric_cmp
+# 1.3%.  dloop: dict IndexMap ops ~33% (600k hashed dict set/get —
+# inherent work); the VARIABLE layer ~15% (globals get 4.1% + globals
+# get_mut 2.6% [symbol ICF-folded with the procs map instantiation] +
+# array_globals VarSet contains_key 4.9% + set_var/get_var self +
+# split_array_ref 0.8% + canonical_global_in 0.8%) — the array_globals
+# probe runs on every global-scope var op because env/tcl_platform make
+# that set permanently non-empty.  fe_bench: exec_op 32.9% dominant;
+# frame_slot_write 3.6%; foreach_bind 3.0%; Rc<ValueInner>::new 3.0%
+# (from_int outside the small-int cache — inherent, tclsh allocates per
+# result too); drop_glue 1.6%.
+#
+# Two fixes from this (both semantics-preserving, probed against tclsh):
+# (a) numeric_binop's NaN guard ran as_float on BOTH operands BEFORE the
+#     integer fast path — a string-rep operand (every bracket result in
+#     `expr {[fib ...] + [fib ...]}`) was float-parsed, then int-parsed:
+#     double parse per `+`.  The guard now sits after the both-int arm
+#     (an integer never carries NaN; Int + "nan" skips the int arm and
+#     still errors exactly as before).
+# (b) numeric_cmp allocated TWO BigInts per comparison (to_big on both
+#     int reps even for I64×I64) — every loop condition `$i < $n` paid
+#     two allocations per iteration.  I64×I64 now compares directly.
+# Bench (interleaved x10 batches, best-of-3, load ~7): fib25 0.76 ->
+# 0.70s (~8%); fe_bench 1.01 -> 0.94 (~7%); dloop neutral (no cmp/binop
+# in its loop — dict get/incr only).  Gates: judge 87/87; sweep 0
+# (incl. new probe numcmp1: NaN operand orders, i64 overflow widen,
+# i64::MIN /-1 and %-1, hex/octal/binary operands, cross-rep equality,
+# string operands, div-by-zero texts) byte-exact vs tclsh 8.6.17;
+# tests 1143/0.
+#
+# Ranked next-round candidates (all profiled, none taken this round):
+# 1. Call-site command tokens in ByteCode (tclsh's model): the compiled
+#    Call op would carry its resolved target + epoch, folding
+#    cmd_cache_get (2.7%) + the dispatch_values probe chain + the
+#    procs.get re-fetch (~19% of fib all told).
+# 2. Array marker inside the globals/locals tables (rep variant or a
+#    tagged base entry): kills the array_globals contains probe and the
+#    second table probe per global var op (dloop var layer ~15% ->
+#    ~7%).  Architecture change — the base-key Value::empty() marker
+#    and every loc_* path would move.
+# 3. Zero-copy frame level0/args plumbing (fib memmove 9.5%): the
+#    dispatch scratch already holds the words; call_proc rewrites
+#    level0 from it per call.
+# 4. OO chain caching (G6 follow-up): build_chain + chain.to_vec()
+#    per method call is the remaining OO dispatch gap (3.3x tclsh).

@@ -160,8 +160,12 @@ pub(crate) fn nan_pair(a: &Value, b: &Value) -> bool {
 }
 
 pub(crate) fn numeric_cmp(a: &Value, b: &Value) -> Option<Ordering> {
-    use super::bignum::{cmp_rep_float, int_rep};
+    use super::bignum::{cmp_rep_float, int_rep, IntRep};
     match (int_rep(a), int_rep(b)) {
+        // i64×i64 compares directly — the widening arm below used to
+        // allocate TWO BigInts per comparison (`$n < 2` in every loop
+        // condition paid them each iteration).
+        (Some(IntRep::I64(x)), Some(IntRep::I64(y))) => Some(x.cmp(&y)),
         (Some(x), Some(y)) => Some(x.to_big().cmp(&y.to_big())),
         (Some(x), None) => b.as_float().and_then(|y| cmp_rep_float(&x, y)),
         (None, Some(y)) => a

@@ -349,7 +349,12 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &ByteCode) -> Result<Valu
     // a live VmState is never in the pool, so pooling cannot alias.
     let r = {
         let mut st = interp.vm_pool.take(entry_offset);
-        st.consts = interp.const_pool_get(code);
+        let (consts, cmd_sites) = interp
+            .const_pool_get(code)
+            .map(|(v, s)| (Some(v), Some(s)))
+            .unwrap_or((None, None));
+        st.consts = consts;
+        st.cmd_sites = cmd_sites;
         let r = exec_inner(interp, code, &mut st);
         interp.vm_pool.give(st);
         r
@@ -459,6 +464,12 @@ struct VmState {
     /// bump (slice index + clone) instead of re-materialising the literal
     /// string per push.
     consts: Option<Rc<[Value]>>,
+    /// The unit's call-site command tokens (same pool entry as `consts`):
+    /// `Call`/`DynCall` ops resolve through their slot instead of the
+    /// cmd_cache hash probe + dispatch chain, re-resolving on a
+    /// generation/name/namespace mismatch.  Shared `Rc` — every depth
+    /// executing this unit uses the one table.
+    cmd_sites: Option<Rc<core::cell::RefCell<Vec<(u32, super::CmdSite)>>>>,
     /// Stack base of the current command's `{*}` expansion region.
     expand_base: usize,
     /// Site index of the `BeginCmd` most recently executed.
@@ -476,6 +487,7 @@ impl VmState {
             bodies: Vec::new(),
             scratch: Vec::new(),
             consts: None,
+            cmd_sites: None,
             expand_base: 0,
             cur_site: usize::MAX,
             entry_offset,
@@ -516,11 +528,14 @@ impl VmState {
 
 /// Recycled [`VmState`]s, owned by the interp: every `exec_bytecode` call
 /// borrows one and gives it back emptied, so proc calls stop paying the
-/// four Vec allocations.  The type is opaque outside this module (the
-/// pool methods are the only API); spare depth is capped — deeper
-/// recursion churn simply drops the excess states.
+/// four Vec allocations.  Boxed: the struct is ~168 bytes and pool-pop/
+/// pool-push moved it whole (a memcpy each, visible in the fib profile);
+/// the box rides the pool instead, so only a fresh recursion level ever
+/// allocates one.  The type is opaque outside this module (the pool
+/// methods are the only API); spare depth is capped — deeper recursion
+/// churn simply drops the excess states.
 pub(crate) struct VmPool {
-    spare: Vec<VmState>,
+    spare: Vec<Box<VmState>>,
 }
 
 impl VmPool {
@@ -528,7 +543,7 @@ impl VmPool {
         VmPool { spare: Vec::new() }
     }
 
-    fn take(&mut self, entry_offset: usize) -> VmState {
+    fn take(&mut self, entry_offset: usize) -> Box<VmState> {
         match self.spare.pop() {
             Some(mut st) => {
                 st.expand_base = 0;
@@ -536,19 +551,21 @@ impl VmPool {
                 st.entry_offset = entry_offset;
                 st.pc = 0;
                 st.consts = None;
+                st.cmd_sites = None;
                 st
             }
-            None => VmState::new(entry_offset),
+            None => Box::new(VmState::new(entry_offset)),
         }
     }
 
-    fn give(&mut self, mut st: VmState) {
+    fn give(&mut self, mut st: Box<VmState>) {
         st.stack.clear();
         st.loops.clear();
         st.foreaches.clear();
         st.bodies.clear();
         st.scratch.clear();
         st.consts = None;
+        st.cmd_sites = None;
         if self.spare.len() < 4 {
             self.spare.push(st);
         }
@@ -912,26 +929,26 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 st.cur_site = region.site();
             }
         }
-        OpCode::Call { cmd_id, argc } => {
+        OpCode::Call { argc, .. } => {
             let from = st.stack.len() - *argc as usize;
             st.collect_args_into_scratch(from);
-            let v = dispatch_call(interp, &st.scratch, *cmd_id)?;
+            let v = dispatch_site(interp, st, dispatch_call)?;
             st.stack.push(Entry::Val(v));
         }
-        OpCode::CallExpand { cmd_id, .. } => {
+        OpCode::CallExpand { .. } => {
             st.collect_args_into_scratch(st.expand_base);
-            let v = dispatch_call(interp, &st.scratch, *cmd_id)?;
+            let v = dispatch_site(interp, st, dispatch_call)?;
             st.stack.push(Entry::Val(v));
         }
         OpCode::DynCall { argc } => {
             let from = st.stack.len() - *argc as usize;
             st.collect_args_into_scratch(from);
-            let v = dispatch_dynamic(interp, &st.scratch)?;
+            let v = dispatch_site(interp, st, dispatch_dynamic)?;
             st.stack.push(Entry::Val(v));
         }
         OpCode::DynCallExpand { .. } => {
             st.collect_args_into_scratch(st.expand_base);
-            let v = dispatch_dynamic(interp, &st.scratch)?;
+            let v = dispatch_site(interp, st, dispatch_dynamic)?;
             st.stack.push(Entry::Val(v));
         }
 
@@ -1092,13 +1109,96 @@ fn foreach_bind(
 /// winner `dispatch_values`'s full chain would produce for this exact
 /// invocation name (a proc/ensemble/import shadowing the builtin simply
 /// caches a different variant or nothing), so a cached `Builtin` IS the
+/// Dispatch `st.scratch` for the call op at `st.pc - 1`: through the
+/// unit's call-site token when it is still valid, else the full resolver
+/// `full` — then backfill the token from what the full path cached.
+///
+/// The token is the fib profile's missing tclsh step: every compiled
+/// `Call`/`DynCall` paid `cmd_cache_get` inside `dispatch_call` AND again
+/// inside `dispatch_values` (two Fx hash probes) plus the
+/// `dispatch_dynamic`/`exec_step_begin` layers before `call_proc`.  A
+/// valid token skips all of it: the builtin fn / proc key sits on the op
+/// (indexed by op pc, no hashing), gated by the command-table generation,
+/// the invocation name, and the resolving namespace — the exact key
+/// `cmd_cache` uses.  Ensemble/unknown/unresolved names never cache, so
+/// they keep the full path (as before); execution traces route through
+/// `dispatch_dynamic`'s bracketing.
+fn dispatch_site(
+    interp: &mut Interp,
+    st: &mut VmState,
+    full: fn(&mut Interp, &[Value]) -> Result<Value>,
+) -> Result<Value> {
+    let pc = (st.pc - 1) as u32;
+    if interp.exec_traces.is_empty() {
+        if let Some(slots) = st.cmd_sites.clone() {
+            let name = st.scratch[0].as_str();
+            let hit = {
+                let slots = slots.borrow();
+                match slots.binary_search_by_key(&pc, |(p, _)| *p) {
+                    Ok(i) => {
+                        let s = &slots[i].1;
+                        (s.gen == interp.cmd_generation
+                            && s.name.as_ref() == name
+                            && s.ns.as_ref() == interp.current_namespace.as_ref())
+                            .then(|| s.target.clone())
+                    }
+                    Err(_) => None,
+                }
+            };
+            match hit {
+                Some(super::ResolvedCmd::Builtin(f)) => {
+                    // dispatch_values' prologue + dispatch_call's builtin
+                    // arm, verbatim: fresh error state, depth bracket,
+                    // wrong-#-args post-fill.
+                    interp.err_code_raised = false;
+                    interp.call_depth += 1;
+                    let r = f(interp, &st.scratch);
+                    interp.call_depth -= 1;
+                    return interp.fill_wrong_args(name, r);
+                }
+                Some(super::ResolvedCmd::Proc(key)) => {
+                    // The def is re-fetched per call (statics write-back
+                    // replaces the map entry) — one probe, always fresh.
+                    if let Some(def) = interp.procs.get(key.as_ref()).cloned() {
+                        interp.err_code_raised = false;
+                        return interp.call_proc(&def, &st.scratch, &key, None);
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    let name = st.scratch[0].as_str();
+    let r = full(interp, &st.scratch);
+    // Backfill the token from the resolution the full path just cached
+    // (proc/builtin wins only — matching cmd_cache's policy).
+    if interp.exec_traces.is_empty() {
+        if let Some(target) = interp.cmd_cache_get(name) {
+            if let Some(slots) = &st.cmd_sites {
+                let site = super::CmdSite {
+                    gen: interp.cmd_generation,
+                    name: Rc::from(name),
+                    ns: Rc::clone(&interp.current_namespace),
+                    target,
+                };
+                let mut v = slots.borrow_mut();
+                match v.binary_search_by_key(&pc, |(p, _)| *p) {
+                    Ok(i) => v[i].1 = site,
+                    Err(i) => v.insert(i, (pc, site)),
+                }
+            }
+        }
+    }
+    r
+}
+
 /// dispatch outcome: call it directly.  Everything else — cache miss
 /// (first call, ensemble/unknown resolution), a cached `Proc`, or
 /// execution traces needing `dispatch_dynamic`'s bracketing — takes the
 /// exact full dispatch.  `cmd_id` is no longer consulted: the cache is
 /// keyed by the invoked name, a strictly stronger identity check than
 /// the `CmdId` string match it replaced.
-fn dispatch_call(interp: &mut Interp, args: &[Value], _cmd_id: u16) -> Result<Value> {
+fn dispatch_call(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if interp.exec_traces.is_empty() {
         let hit = match interp.cmd_cache_get(args[0].as_str()) {
             Some(super::ResolvedCmd::Builtin(f)) => Some(f),

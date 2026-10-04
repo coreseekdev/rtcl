@@ -600,3 +600,65 @@ var_incr                 44         34      0.7
 #    level0 from it per call.
 # 4. OO chain caching (G6 follow-up): build_chain + chain.to_vec()
 #    per method call is the remaining OO dispatch gap (3.3x tclsh).
+
+# ---------------------------------------------------------------------------
+# G8 2026-10-05: the four-angle optimization round (architecture
+# re-audit / flamegraph tooling / data-path copies / Rc-vs-String
+# sharing).  Root causes were established byte-precisely before any
+# change: DWARF-callchain perf (`--call-graph dwarf`) attributed the
+# fib memmove bucket to pool-pop/frame-push/frame-pop/pool-push, and
+# disassembling the memmove call sites read the size registers —
+# `mov $0x108,%edx` = 264B (CallFrame), `mov $0xa8,%edx` = 168B
+# (VmState) — so the copies were the POOL ELEMENTS themselves, four
+# moves per proc call (CallFrame) and two per exec_bytecode (VmState).
+#
+# Changes (all semantics-preserving, gates below):
+# (a) frames/frame_pool as Vec<Box<CallFrame>>: the pool moves 8-byte
+#     pointers; a box is allocated only at a new recursion depth.
+# (b) VmPool as Vec<Box<VmState>>: same (the 168B take/give memcpys).
+# (c) Call-site command tokens (G7 candidate 1, tclsh's resolved
+#     `Command *` model): each compiled Call/DynCall op resolves
+#     through a per-op slot on the const-pool entry (keyed by op pc,
+#     binary-searched) instead of cmd_cache_get in dispatch_call AND
+#     dispatch_values (two Fx probes) + the 7-arm chain.  Validity =
+#     command-table generation + invocation name + resolving ns —
+#     the exact cmd_cache key; ensemble/unknown never cache; exec
+#     traces and pool eviction degrade to the full path; backfill
+#     from what the full path cached after every miss.  Proc defs
+#     are still re-fetched per call (statics write-back freshness).
+# (d) MethodDef { params: Rc<[(String, Option<String>)]>,
+#     body: Rc<str> }: build_chain/chain clones and constructor
+#     synthesis become Rc bumps.
+#
+# Flamegraph tooling (kept for the next rounds): /tmp/flamegen.py —
+# `perf script` -> collapsed stacks + SVG (usage: `python3 flamegen.py
+# IN.script OUT.svg --collapsed OUT.collapsed`); profile builds need
+# CARGO_PROFILE_RELEASE_STRIP=false (workspace release profile strips)
+# + `-C force-frame-pointers=yes`; DWARF mode for exact attribution
+# when FP unwinding misattributes through non-FP helper frames.
+#
+# Profile delta (fib25x25, 1303 samples vs G7's 1800 = ~27% less CPU
+# for the same work): cmd_cache_get 2.7% -> 0.00%; memmove 9.5% ->
+# 0.38% (background); dispatch_values/dispatch_dynamic (was the
+# dominant dispatch layer) -> 4.07% each (first-call resolution +
+# backfill only — the token fast path sits directly under exec_op);
+# fib is now arithmetic-bound: arith 11.7%, numeric_binop 8.9%,
+# rel 8.3%, as_int 6.5%, find_inner 6.0% (the single procs.get
+# re-fetch), Rc clone/inc_strong ~4.4% each (inherent refcounting).
+#
+# Bench (interleaved batches, best-of-3, load ~3.5): fib25 x10-batch
+# 746 -> 609ms (-18%; tclsh 357ms — gap 2.09x -> 1.71x); oo_bench2
+# 1337 -> 1235ms (-7.6%); fe_bench / dloop neutral (both non-
+# call-bound — the tokens/pools never fire in their hot loops).
+# Gates: judge 87/87 (final binary re-confirmed); sweep 0 diffs;
+# tests 1143/0 (the two `unused import: Rc` warnings are pre-existing
+# test-module imports, oo.rs:2557 / namespace.rs:2048); feature
+# matrix: rtcl-core std variants x6 + rtcl-vm no-default + wasm32
+# green; OO smoke byte-exact vs tclsh 8.6.17.
+#
+# G7 ranked-candidates ledger: #1 (call-site tokens) DONE above.
+# #3 (zero-copy level0) is OBSOLETE — the memmove was the frame
+# struct itself, now boxed; level0's pooled buffer was already
+# copy-free.  #2 (array marker inside the var tables, dloop var
+# layer ~15% -> ~7%) and #4 (OO chain caching, build_chain rebuilds
+# per call) remain open.

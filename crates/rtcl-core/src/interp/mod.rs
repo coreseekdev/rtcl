@@ -261,6 +261,27 @@ pub(crate) struct ConstPoolEntry {
     /// both `PushConst` (u16) and `PushConstWide` (u32), which index the
     /// same table.
     pub values: Rc<[Value]>,
+    /// Per-call-site resolved-command tokens (tclsh caches a resolved
+    /// `Command *` on its invoke instructions the same way): keyed by the
+    /// op index of the `Call`/`DynCall` op, sorted.  Shared through the
+    /// entry so one pool probe per `exec_bytecode` reaches both the
+    /// constants and these — the executor pays no per-call hashing.
+    pub sites: Rc<core::cell::RefCell<Vec<(u32, CmdSite)>>>,
+}
+
+/// One call-site resolution token: the dispatch outcome a specific
+/// compiled call op resolved to, valid while the command-table generation,
+/// the invocation name, and the resolving namespace all hold (a
+/// substituted command word or a namespace switch re-resolves).
+#[derive(Debug, Clone)]
+pub(crate) struct CmdSite {
+    pub gen: u64,
+    /// Invocation word this resolution answered (the op may see a
+    /// different substituted name each execution).
+    pub name: Rc<str>,
+    /// Namespace the resolution ran under (`cmd_cache`'s outer key).
+    pub ns: Rc<str>,
+    pub target: ResolvedCmd,
 }
 
 /// One live `array startsearch` iteration over an array's element names.
@@ -322,13 +343,17 @@ pub struct Interp {
     pub(crate) globals: VarMap<Value>,
     /// Names in `globals` that are arrays (scalar/array distinction).
     pub(crate) array_globals: VarSet,
-    /// Procedure call frames (empty at global level).
-    pub(crate) frames: Vec<CallFrame>,
+    /// Procedure call frames (empty at global level).  Boxed: a `CallFrame`
+    /// is ~264 bytes and pool-pop/frame-push/frame-pop/pool-push moved the
+    /// whole struct four times per call (a memcpy each — the fib profile's
+    /// memmove bucket); boxing makes those moves 8-byte pointer copies while
+    /// the box itself rides the pool.
+    pub(crate) frames: Vec<Box<CallFrame>>,
     /// Recycled call frames: proc return pushes its (emptied) frame here
     /// and the next call pops it, keeping the locals-map allocation and
     /// its capacity across calls (tclsh keeps one frame arena per
     /// interpreter; recursion depth bounds the pool naturally).
-    pub(crate) frame_pool: Vec<CallFrame>,
+    pub(crate) frame_pool: Vec<Box<CallFrame>>,
     /// Recycled bytecode-executor states (vm_exec): every exec_bytecode
     /// call borrows one and returns it emptied, so proc calls pay no
     /// fresh stack/loops/bodies/scratch allocations.
@@ -930,16 +955,24 @@ impl Interp {
             ConstPoolEntry {
                 code: Rc::clone(code),
                 values,
+                sites: Rc::default(),
             },
         );
     }
 
     /// Pool probe for a unit being executed (one hash per `exec_bytecode`
-    /// call, amortised over every PushConst it runs).
-    pub(crate) fn const_pool_get(&self, code: &ByteCode) -> Option<Rc<[Value]>> {
+    /// call, amortised over every PushConst and call-site token it uses):
+    /// the literal slice plus the call-site token table.
+    pub(crate) fn const_pool_get(
+        &self,
+        code: &ByteCode,
+    ) -> Option<(
+        Rc<[Value]>,
+        Rc<core::cell::RefCell<Vec<(u32, CmdSite)>>>,
+    )> {
         self.const_pool
             .get(&(code as *const ByteCode as usize))
-            .map(|e| Rc::clone(&e.values))
+            .map(|e| (Rc::clone(&e.values), Rc::clone(&e.sites)))
     }
 
     /// A command table (`commands` / `procs` / `ensembles` /

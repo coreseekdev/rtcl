@@ -62,8 +62,11 @@ pub(crate) enum MethodKind {
 /// A method definition (own methods, forwards, constructors, destructors).
 #[derive(Debug, Clone)]
 pub(crate) struct MethodDef {
-    pub params: Vec<(String, Option<String>)>,
-    pub body: String,
+    /// Shared (immutable once defined): chain building / `chain.to_vec()`
+    /// / constructor clones bump references instead of copying every
+    /// parameter name and the whole body string per method call.
+    pub params: Rc<[(String, Option<String>)]>,
+    pub body: Rc<str>,
     pub exported: bool,
     pub kind: MethodKind,
     /// Compiled form of the assembled method [`ProcDef`], memoised for the
@@ -176,7 +179,7 @@ pub(crate) struct OoState {
 // ── init ───────────────────────────────────────────────────────────────
 
 fn builtin_method(name: &'static str) -> MethodDef {
-    MethodDef { params: Vec::new(), body: String::new(), exported: true, kind: MethodKind::Builtin(name), proc_memo: fresh_memo() }
+    MethodDef { params: Vec::new().into(), body: Rc::from(""), exported: true, kind: MethodKind::Builtin(name), proc_memo: fresh_memo() }
 }
 
 fn register_object_command(interp: &mut Interp, key: &str, func: crate::command::CommandFunc) {
@@ -951,7 +954,7 @@ extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Valu
         let l0 = interp
             .frames
             .last()
-            .map(crate::interp::frame_level0)
+            .map(|f| crate::interp::frame_level0(f))
             .unwrap_or_default();
         let words = Value::from_str(&l0).as_list().unwrap_or_default();
         if words.len() > 2 {
@@ -964,7 +967,7 @@ extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Valu
     let l0 = interp
         .frames
         .last()
-        .map(crate::interp::frame_level0)
+        .map(|f| crate::interp::frame_level0(f))
         .unwrap_or_default();
     let typed = Value::from_str(&l0)
         .as_list()
@@ -1505,8 +1508,8 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             let name = rest[0].as_str().to_string();
             let params = parse_param_list(rest[1].as_str())?;
             let def = MethodDef {
-                params,
-                body: rest[2].as_str().to_string(),
+                params: params.into(),
+                body: Rc::from(rest[2].as_str()),
                 exported: name_exports(&name),
                 kind: MethodKind::Tcl,
                 proc_memo: fresh_memo(),
@@ -1521,8 +1524,8 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             }
             let name = rest[0].as_str().to_string();
             let def = MethodDef {
-                params: Vec::new(),
-                body: String::new(),
+                params: Vec::new().into(),
+                body: Rc::from(""),
                 exported: name_exports(&name),
                 kind: MethodKind::Forward {
                     cmd: rest[1].as_str().to_string(),
@@ -1611,8 +1614,8 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             if let DefineTarget::Class(name) = target {
                 if let Some(c) = interp.oo.classes.get_mut(&name) {
                     c.constructor = Some(MethodDef {
-                        params,
-                        body: rest[1].as_str().to_string(),
+                        params: params.into(),
+                        body: Rc::from(rest[1].as_str()),
                         exported: false,
                         kind: MethodKind::Tcl,
                         proc_memo: fresh_memo(),
@@ -1631,8 +1634,8 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             if let DefineTarget::Class(name) = target {
                 if let Some(c) = interp.oo.classes.get_mut(&name) {
                     c.destructor = Some(MethodDef {
-                        params: Vec::new(),
-                        body: rest[0].as_str().to_string(),
+                        params: Vec::new().into(),
+                        body: Rc::from(rest[0].as_str()),
                         exported: false,
                         kind: MethodKind::Tcl,
                         proc_memo: fresh_memo(),

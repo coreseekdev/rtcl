@@ -91,7 +91,7 @@ impl Interp {
                 f.slot_table = None;
                 f
             }
-            None => CallFrame {
+            None => Box::new(CallFrame {
                 locals: VarMap::default(),
                 array_locals: VarSet::default(),
                 upvars: VarMap::default(),
@@ -104,7 +104,7 @@ impl Interp {
                 tailcall: None,
                 level0: Vec::new(),
                 ns_depth: 0,
-            },
+            }),
         };
         frame.ns = None;
         frame.call_ns = Some(prev_namespace.clone());

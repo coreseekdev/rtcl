@@ -662,3 +662,39 @@ var_incr                 44         34      0.7
 # copy-free.  #2 (array marker inside the var tables, dloop var
 # layer ~15% -> ~7%) and #4 (OO chain caching, build_chain rebuilds
 # per call) remain open.
+
+# ---------------------------------------------------------------------------
+# G8b 2026-10-05: OO chain memo — G7 candidate 4.  The oo_bench2 profile
+# (post-G8) showed build_chain at 33.0% of the whole benchmark (linearize
+# alone 19.6%: a C3 merge allocating a Vec<String> per class PER CALL,
+# plus per-class mixins.clone() and Owner::Class String compares), and
+# exec_chain_entry's ActiveMethod push cloned the chain again per call.
+#
+# Change: OoState gains mutation_ctr + chain_memo ((key, method,
+# include_private) -> (stamp, Rc<Vec<ChainEntry>>), capped 512
+# clear-on-overflow) — the cmd_generation/cmd_cache pattern applied to
+# method resolution.  invoke_method serves every hit without walking;
+# ActiveMethod.chain is now the shared Rc (next's invocation-time
+# snapshot semantics unchanged, minus the to_vec).  Every structural
+# mutation bumps the stamp: the four method-table helpers (set_method /
+# set_export / take_method / delete_method), the seven define arms
+# (mixin, superclass, constructor, destructor, unexport-hidden,
+# variable, filter), class/instance create, oo::copy, and destroy.
+# Audit: `interp.oo` is written ONLY in oo.rs (crate-wide grep); the
+# two init-time inserts precede any possible memo.  Redefinition-mid-
+# flight, export/unexport, mixin add/remove, superclass redefinition,
+# next-after-redefine, deletemethod/renamemethod, destroy cascade, and
+# unexport-of-inherited all verified byte-exact vs tclsh 8.6.17 (new
+# probe judge/probes/oo18.tcl, 11 sections).
+#
+# Profile: build_chain 33.0% -> 0.00%, linearize 19.6% -> 0.00%
+# (chain_for's memo probe costs 3.0%); oo_bench2 samples 1235 -> 799
+# for the same work.  Bench (interleaved best-of-3, load ~3):
+# oo_bench2 1311 -> 765ms (-42%; tclsh 393ms — OO call gap 2.9x ->
+# 1.95x, from 3.3x at G6); oo_bench2_vars 2555 -> 1895ms (-26%);
+# fib25 neutral.  Gates: judge 87/87; sweep 0; tests 1143/0; feature
+# matrix green (std variants, rtcl-vm no-default, wasm32).
+#
+# Remaining open candidates: #2 array marker inside the var tables
+# (dloop var layer ~15% -> ~7%); oo dispatch's cmd_oo_object entry
+# (typed/key String allocs per call) now the visible OO cost.

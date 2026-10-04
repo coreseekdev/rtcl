@@ -139,12 +139,15 @@ pub(crate) struct OoClass {
     pub obj_mixins: Vec<String>,
 }
 
-/// A method execution in progress (`self`/`my`/`next` context).
+/// A method execution in progress (`self`/`my`/`next` context).  The
+/// chain is an `Rc` snapshot shared with the memo it came from: `next`
+/// follows the chain as it was at INVOCATION time even across later
+/// redefinitions (the old `to_vec` copy's semantics, without the copy).
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveMethod {
     pub obj: String,
     pub method: String,
-    pub chain: Vec<ChainEntry>,
+    pub chain: Rc<Vec<ChainEntry>>,
     pub index: usize,
     /// `frames.len()` before the method's frame was pushed; the entry is
     /// live while `frames.len() > frame_depth`.
@@ -174,6 +177,24 @@ pub(crate) struct OoState {
     /// key no longer holds such a command were renamed away and are swept
     /// when their owner is destroyed (oo-1.20).
     pub my_commands: HashMap<String, String>,
+    /// Structural mutation stamp: bumped at EVERY mutation of the class /
+    /// object tables (create, destroy, every define word — see the bump
+    /// sites in this module).  [`OoState::chain_memo`] entries validate
+    /// against it, the same pattern as `Interp::cmd_generation` ageing the
+    /// resolution cache.  Every write to `oo.classes`/`oo.objects`
+    /// structure lives in this file; a missed bump site would serve a
+    /// stale chain, so the grep audit is `classes.(insert|remove|get_mut)`
+    /// + `objects.(insert|remove|get_mut)`.
+    pub mutation_ctr: u64,
+    /// Resolution-chain memo (tclsh caches the call context the same way):
+    /// (object/class key, method, include_private) → the chain as built,
+    /// valid under the `mutation_ctr` stamp it was built at.  A mutation
+    /// anywhere retires every entry at once — conservative but exactly
+    /// tclsh's re-resolution semantics.  Bounded with clear-on-overflow
+    /// (wasm32 is a target).  The `Rc` chain is shared with the
+    /// `ActiveMethod` snapshots, so `next` also stops paying a
+    /// `to_vec` per invocation.
+    pub chain_memo: HashMap<(String, String, bool), (u64, Rc<Vec<ChainEntry>>)>,
 }
 
 // ── init ───────────────────────────────────────────────────────────────
@@ -640,7 +661,7 @@ fn exec_chain_entry(
     key: &str,
     method: &str,
     index: usize,
-    chain: &[ChainEntry],
+    chain: &Rc<Vec<ChainEntry>>,
     call_args: &[Value],
     typed: &str,
 ) -> Result<Value> {
@@ -696,7 +717,7 @@ fn exec_chain_entry(
             interp.oo.active.push(ActiveMethod {
                 obj: key.to_string(),
                 method: method.to_string(),
-                chain: chain.to_vec(),
+                chain: Rc::clone(chain),
                 index,
                 frame_depth: interp.frames.len(),
             });
@@ -788,6 +809,12 @@ fn object_ns_of(interp: &Interp, key: &str) -> String {
 }
 
 /// Invoke `method` on `key`, or produce the unknown-method error.
+///
+/// The resolution chain comes from [`OoState::chain_memo`] — building it
+/// walked every linearised class (C3 merge + per-class mixin lists) per
+/// call, a third of the OO call bench.  A miss builds and backfills under
+/// the live mutation stamp; empty chains memo too (the unknown-method
+/// error path then skips the walk as well).
 fn invoke_method(
     interp: &mut Interp,
     key: &str,
@@ -796,11 +823,30 @@ fn invoke_method(
     typed: &str,
     include_private: bool,
 ) -> Result<Value> {
-    let chain = build_chain(interp, key, method, include_private);
+    let chain = chain_for(interp, key, method, include_private);
     if chain.is_empty() {
         return Err(unknown_method_error(interp, key, typed, method));
     }
     exec_chain_entry(interp, key, method, 0, &chain, call_args, typed)
+}
+
+/// The memoised [`build_chain`] for this invocation context.
+fn chain_for(interp: &mut Interp, key: &str, method: &str, include_private: bool) -> Rc<Vec<ChainEntry>> {
+    let memo_key = (key.to_string(), method.to_string(), include_private);
+    if let Some((stamp, chain)) = interp.oo.chain_memo.get(&memo_key) {
+        if *stamp == interp.oo.mutation_ctr {
+            return Rc::clone(chain);
+        }
+    }
+    let chain = Rc::new(build_chain(interp, key, method, include_private));
+    const CHAIN_MEMO_MAX: usize = 512;
+    if interp.oo.chain_memo.len() >= CHAIN_MEMO_MAX {
+        interp.oo.chain_memo.clear();
+    }
+    interp.oo
+        .chain_memo
+        .insert(memo_key, (interp.oo.mutation_ctr, Rc::clone(&chain)));
+    chain
 }
 
 // ── the object dispatcher ──────────────────────────────────────────────
@@ -1040,6 +1086,7 @@ fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
     }
     interp.oo.objects.remove(key);
     interp.oo.classes.remove(key);
+    interp.oo.mutation_ctr += 1;
     interp.oo.creation_order.retain(|k| k != key);
     // Namespace-scoped storage.
     let var_prefix = format!("{}::", ns.trim_start_matches(':'));
@@ -1115,6 +1162,7 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
             OoObject { ns: ns.clone(), class: class_key.to_string(), ..Default::default() },
         );
     }
+    interp.oo.mutation_ctr += 1;
     attach_object(interp, &canonical, &ns);
 
     // Definition script (metaclass create only).
@@ -1166,7 +1214,7 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
             interp.oo.active.push(ActiveMethod {
                 obj: canonical.clone(),
                 method: "constructor".to_string(),
-                chain: ctor_chain(interp, class_key),
+                chain: Rc::new(ctor_chain(interp, class_key)),
                 index: 0,
                 frame_depth: interp.frames.len(),
             });
@@ -1188,6 +1236,7 @@ fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value]) -> Result<Value>
         name.clone(),
         OoObject { ns: ns.clone(), class: class_key.to_string(), ..Default::default() },
     );
+    interp.oo.mutation_ctr += 1;
     attach_object(interp, &name, &ns);
 
     let ctor = interp.oo.classes.get(class_key).and_then(|c| c.constructor.clone());
@@ -1213,7 +1262,7 @@ fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value]) -> Result<Value>
         interp.oo.active.push(ActiveMethod {
             obj: name.clone(),
             method: "constructor".to_string(),
-            chain: ctor_chain(interp, class_key),
+            chain: Rc::new(ctor_chain(interp, class_key)),
             index: 0,
             frame_depth: interp.frames.len(),
         });
@@ -1323,7 +1372,7 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
         }
     } else {
         let class_key = interp.oo.objects.get(key).map(|o| o.class.clone()).unwrap_or_default();
-        let chain = dtor_chain(interp, &class_key);
+        let chain = Rc::new(dtor_chain(interp, &class_key));
         for (i, entry) in chain.iter().enumerate() {
             let vars = match &entry.owner {
                 Owner::Class(c) => interp
@@ -1344,7 +1393,7 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
             interp.oo.active.push(ActiveMethod {
                 obj: key.to_string(),
                 method: "destructor".to_string(),
-                chain: chain.clone(),
+                chain: Rc::clone(&chain),
                 index: i,
                 frame_depth: interp.frames.len(),
             });
@@ -1568,6 +1617,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     }
                 }
             }
+            interp.oo.mutation_ctr += 1;
             Ok(Value::empty())
         }
         "superclass" => {
@@ -1599,6 +1649,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     c.superclasses = supers;
                 }
             }
+            interp.oo.mutation_ctr += 1;
             Ok(Value::empty())
         }
         "constructor" => {
@@ -1622,6 +1673,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     });
                 }
             }
+            interp.oo.mutation_ctr += 1;
             Ok(Value::empty())
         }
         "destructor" => {
@@ -1642,6 +1694,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     });
                 }
             }
+            interp.oo.mutation_ctr += 1;
             Ok(Value::empty())
         }
         "export" => {
@@ -1667,6 +1720,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     }
                 }
             }
+            interp.oo.mutation_ctr += 1;
             Ok(Value::empty())
         }
         "deletemethod" => {
@@ -1715,6 +1769,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     }
                 }
             }
+            interp.oo.mutation_ctr += 1;
             Ok(Value::empty())
         }
         "filter" => {
@@ -1723,6 +1778,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     c.filters = rest.iter().map(|v| v.as_str().to_string()).collect();
                 }
             }
+            interp.oo.mutation_ctr += 1;
             Ok(Value::empty())
         }
         "renamemethod" => {
@@ -1784,6 +1840,7 @@ fn set_method(interp: &mut Interp, target: &DefineTarget, name: &str, def: Metho
             }
         }
     }
+    interp.oo.mutation_ctr += 1;
     Ok(Value::empty())
 }
 
@@ -1801,6 +1858,7 @@ fn find_table_mut<'a>(
 }
 
 fn set_export(interp: &mut Interp, target: &DefineTarget, name: &str, exported: bool) -> bool {
+    interp.oo.mutation_ctr += 1;
     if let Some(table) = find_table_mut(interp, target) {
         if let Some(slot) = table.iter_mut().find(|(n, _)| n == name) {
             slot.1.exported = exported;
@@ -1811,6 +1869,7 @@ fn set_export(interp: &mut Interp, target: &DefineTarget, name: &str, exported: 
 }
 
 fn take_method(interp: &mut Interp, target: &DefineTarget, name: &str) -> Option<MethodDef> {
+    interp.oo.mutation_ctr += 1;
     if let Some(table) = find_table_mut(interp, target) {
         if let Some(pos) = table.iter().position(|(n, _)| n == name) {
             return Some(table.remove(pos).1);
@@ -1820,6 +1879,7 @@ fn take_method(interp: &mut Interp, target: &DefineTarget, name: &str) -> Option
 }
 
 fn delete_method(interp: &mut Interp, target: &DefineTarget, name: &str) {
+    interp.oo.mutation_ctr += 1;
     if let Some(table) = find_table_mut(interp, target) {
         if let Some(pos) = table.iter().position(|(n, _)| n == name) {
             table.remove(pos);
@@ -1873,6 +1933,7 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     let mut copy = source.clone();
     copy.ns = new_ns.clone();
     interp.oo.objects.insert(full.clone(), copy);
+    interp.oo.mutation_ctr += 1;
     attach_object(interp, &full, &new_ns);
 
     // Copy namespace variables.
@@ -1894,7 +1955,7 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     }
 
     // `<cloned>` hook on the copy, with the source name as the sole argument.
-    let chain = build_chain(interp, &full, "<cloned>", true);
+    let chain = Rc::new(build_chain(interp, &full, "<cloned>", true));
     if !chain.is_empty() {
         let r = exec_chain_entry(
             interp,

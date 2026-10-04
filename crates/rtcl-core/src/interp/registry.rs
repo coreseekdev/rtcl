@@ -246,6 +246,7 @@ impl Interp {
             usage: entry.usage,
             help: entry.help,
         });
+        self.note_cmd_mutation();
     }
 
     /// Register all built-in commands from the master table.
@@ -300,6 +301,7 @@ impl Interp {
     pub fn register_command(&mut self, name: &str, func: CommandFunc) {
         self.commands.insert(name.to_string(), func);
         self.command_categories.insert(name.to_string(), CommandCategory::Extension);
+        self.note_cmd_mutation();
     }
 
     /// Register an external command with metadata (usage + help).
@@ -312,6 +314,7 @@ impl Interp {
         self.commands.insert(name.to_string(), func);
         self.command_categories.insert(name.to_string(), CommandCategory::Extension);
         self.command_meta.insert(name.to_string(), meta);
+        self.note_cmd_mutation();
     }
 
     pub fn delete_command(&mut self, name: &str) -> Result<()> {
@@ -320,6 +323,7 @@ impl Interp {
         }
         self.command_categories.remove(name);
         self.command_meta.remove(name);
+        self.note_cmd_mutation();
         Ok(())
     }
 

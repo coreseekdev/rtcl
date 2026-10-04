@@ -1007,35 +1007,28 @@ fn foreach_bind(
 // Dispatch helpers
 // ---------------------------------------------------------------------------
 
-/// `Call` — a known built-in.  With no procs/aliases/ensembles registered
-/// and the interp at the global namespace, the namespace-resolution chains
-/// in `dispatch_values` can only ever land on the very function the CmdId
-/// names, so call it directly; anything else (or when it wouldn't) takes
-/// the exact full dispatch.  (Function-pointer identity is not compared —
-/// identical-code-folding can merge distinct fns to one address — the
-/// invoked name must still be the canonical builtin the id names, so a
-/// `rename`d command keeps the full dispatch's lookup semantics.)
-fn dispatch_call(interp: &mut Interp, args: &[Value], cmd_id: u16) -> Result<Value> {
-    // `procs` needs the per-name probe, not is_empty: a script WITH procs
-    // still dispatches hundreds of builtins per loop iteration, and only a
-    // proc whose name shadows THIS builtin diverts the call — one Fx
-    // contains_key against the whole resolution chain.
-    if interp.exec_traces.is_empty()
-        && interp.current_namespace == "::"
-        && !interp.procs.contains_key(args[0].as_str())
-        && interp.aliases.is_empty()
-        && interp.ensembles.is_empty()
-        && interp.import_aliases.is_empty()
-    {
-        let name = args[0].as_str();
-        if rtcl_parser::CmdId::from_name(name).map(|c| c as u16) == Some(cmd_id) {
-            let f = interp.commands.get(name).copied();
-            if let Some(f) = f {
-                interp.call_depth += 1;
-                let r = f(interp, args);
-                interp.call_depth -= 1;
-                return interp.fill_wrong_args(name, r);
-            }
+/// `Call` — a known built-in.  The resolution cache already holds the
+/// winner `dispatch_values`'s full chain would produce for this exact
+/// invocation name (a proc/ensemble/import shadowing the builtin simply
+/// caches a different variant or nothing), so a cached `Builtin` IS the
+/// dispatch outcome: call it directly.  Everything else — cache miss
+/// (first call, ensemble/unknown resolution), a cached `Proc`, or
+/// execution traces needing `dispatch_dynamic`'s bracketing — takes the
+/// exact full dispatch.  `cmd_id` is no longer consulted: the cache is
+/// keyed by the invoked name, a strictly stronger identity check than
+/// the `CmdId` string match it replaced.
+fn dispatch_call(interp: &mut Interp, args: &[Value], _cmd_id: u16) -> Result<Value> {
+    if interp.exec_traces.is_empty() {
+        let hit = match interp.cmd_cache_get(args[0].as_str()) {
+            Some(super::ResolvedCmd::Builtin(f)) => Some(f),
+            _ => None,
+        };
+        if let Some(f) = hit {
+            let name = args[0].as_str();
+            interp.call_depth += 1;
+            let r = f(interp, args);
+            interp.call_depth -= 1;
+            return interp.fill_wrong_args(name, r);
         }
     }
     dispatch_dynamic(interp, args)

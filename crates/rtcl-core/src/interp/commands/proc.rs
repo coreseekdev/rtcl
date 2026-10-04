@@ -153,6 +153,7 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // A proc named like an inline-folded Tier1 command (`proc set {...}`)
     // invalidates every compiled body that folded that command.
     super::super::vm_exec::note_tier1_mutation(interp, &name);
+    interp.note_cmd_mutation();
     interp.procs.insert(name, super::super::Rc::new(proc_def));
     Ok(Value::empty())
 }
@@ -899,6 +900,9 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if !new_key.is_empty() {
         super::super::vm_exec::note_tier1_mutation(interp, &new_key);
     }
+    // The rename moves entries across every resolution table (commands,
+    // procs, ensembles, import aliases) — age the resolution cache out.
+    interp.note_cmd_mutation();
 
     // Rename in builtins
     if let Some(func) = interp.commands.remove(&old_key) {

@@ -499,6 +499,30 @@ impl Interp {
         self.err_code_raised = false;
         let cmd_name = args[0].as_str();
 
+        // Resolution cache (tclsh's resolved command tokens): the probe
+        // costs two Fx hashes and reproduces the winner the chain below
+        // produced for this (namespace, name, table generation) — the
+        // builtin/proc call shapes below are shared with the hit arms.
+        // Ensemble/unknown/unresolved outcomes are never cached, so they
+        // fall straight through to the full chain.
+        match self.cmd_cache_get(cmd_name) {
+            Some(super::ResolvedCmd::Builtin(f)) => {
+                self.call_depth += 1;
+                let result = f(self, args);
+                self.call_depth -= 1;
+                return self.fill_wrong_args(cmd_name, result);
+            }
+            Some(super::ResolvedCmd::Proc(key)) => {
+                // A generation-valid hit implies the key is still
+                // registered (every procs mutation bumps); the defensive
+                // fall-through covers a stale entry anyway.
+                if let Some(def) = self.procs.get(key.as_ref()).cloned() {
+                    return self.call_proc(&def, args, &key, None);
+                }
+            }
+            None => {}
+        }
+
         // Namespace-aware command lookup:
         // 1. Try the name as-is (handles fully-qualified "::ns::cmd" and global commands)
         // 2. If in a non-global namespace, try qualifying the name in the current namespace
@@ -596,6 +620,10 @@ impl Interp {
                 None
             });
         if let Some((proc_def, resolved_name)) = proc_lookup {
+            self.cmd_cache_put(
+                cmd_name,
+                super::ResolvedCmd::Proc(Rc::from(resolved_name.as_ref())),
+            );
             return self.call_proc(&proc_def, args, &resolved_name, None);
         }
 
@@ -647,6 +675,7 @@ impl Interp {
         });
         match func {
             Some(f) => {
+                self.cmd_cache_put(cmd_name, super::ResolvedCmd::Builtin(f));
                 self.call_depth += 1;
                 let result = f(self, &args);
                 self.call_depth -= 1;

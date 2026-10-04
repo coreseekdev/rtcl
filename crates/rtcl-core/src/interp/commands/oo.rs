@@ -176,6 +176,7 @@ fn register_object_command(interp: &mut Interp, key: &str, func: crate::command:
         key.to_string(),
         crate::command::CommandMeta { usage: "methodName ?arg ...?", help: "Object command" },
     );
+    interp.note_cmd_mutation();
 }
 
 fn register_oo_command(interp: &mut Interp, key: &str, usage: &'static str, func: crate::command::CommandFunc) {
@@ -187,6 +188,7 @@ fn register_oo_command(interp: &mut Interp, key: &str, usage: &'static str, func
         key.to_string(),
         crate::command::CommandMeta { usage, help: "TclOO command" },
     );
+    interp.note_cmd_mutation();
 }
 
 /// The definition words, registered as procs in `::oo::define` so that a
@@ -242,6 +244,7 @@ pub(crate) fn init(interp: &mut Interp) {
             }),
         );
     }
+    interp.note_cmd_mutation();
 }
 
 // ── namespace helpers ──────────────────────────────────────────────────
@@ -916,11 +919,13 @@ fn attach_ns_commands(interp: &mut Interp, key: &str, ns: &str) {
             .insert(cmd_key.clone(), crate::command::CommandCategory::Extension);
         interp.oo.my_commands.insert(cmd_key, key.to_string());
     }
+    interp.note_cmd_mutation();
 }
 
 /// Remove everything a create/new (or destroy) attached for `key`.
 fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
     super::super::vm_exec::note_tier1_mutation(interp, key);
+    interp.note_cmd_mutation();
     interp.commands.remove(key);
     interp.command_categories.remove(key);
     interp.command_meta.remove(key);
@@ -980,6 +985,7 @@ fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
 /// global namespace — tclsh command lookup reaches `::name` unqualified).
 fn attach_object(interp: &mut Interp, key: &str, ns: &str) {
     super::super::vm_exec::note_tier1_mutation(interp, key);
+    interp.note_cmd_mutation();
     register_object_command(interp, key, cmd_oo_object);
     if parent_of(key) == "::" {
         let bare = key.trim_start_matches(':');

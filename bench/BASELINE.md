@@ -220,3 +220,43 @@ list_ops                  5          8      1.6
 proc_fib                  5         11      2.2
 string_build              3          4      1.3
 var_incr                 39         31       0.7
+
+# ---------------------------------------------------------------------------
+# C 2026-10-04 (ARCHITECTURE-PERF.md item C): command-resolution cache.
+# Root cause first (instrumented): stdlib.tcl's `namespace ensemble create`
+# inside `namespace eval ::tcl::tm` means `ensembles` is NEVER empty in a
+# real session — dispatch_call's fast-path guard never fired, so EVERY
+# compiled Call/DynCall walked dispatch_values' full chain: ~7 procs probes
+# + find_ensemble + commands chain, including two heap `format!("::{}",
+# name)` keys per dispatched command (~1M dispatches in the dict bench;
+# profile: fmt machinery ~6%, VarHasher 5.3%, memcmp 5%).  Fix: tclsh-style
+# resolved-command tokens — `cmd_cache: VarMap<VarMap<CachedCmd>>` keyed by
+# (current namespace, invocation name), entries carry the command-table
+# generation; every commands/procs/ensembles/import_aliases mutation bumps
+# `cmd_generation` (hooks at all 35+ sites: proc/rename/namespace sweep/
+# import/forget/ensemble create/oo attach+detach/alias/interp/registry).
+# Outcomes cached: builtin fn ptr (Call ops now dispatch through ONE
+# generation-checked probe — the CmdId::from_name memcmp chain is gone)
+# and proc KEY (the def is re-fetched per call: statics write-back replaces
+# the map entry via Rc::make_mut, so caching the def would go stale — the
+# 5 statics unit tests caught exactly that).  Ensemble/unknown/unresolved
+# names re-run the chain (uncached).
+# Gates: judge 87/87; two-engine sweep 8 known artifacts / 0 new; workspace
+# tests 1143 green; dloop (300k dict set + 300k foreach dict get/incr):
+# rtcl 598→437ms best-of-3 vs tclsh 249ms (2.2x → 1.76x); post-C profile
+# shows the fmt/format entries gone, allocator/memmove dominant.  fe_bench
+# (foreach-inline) unchanged at 15.0-15.1ms as expected.  fib25 interleaved
+# A/B vs pre-C HEAD: <=3-5%, within the day's noise band (a co-running
+# session's test load inflated all engines; tclsh fib25 swung 26→44ms).
+# Known pre-existing divergence noticed while testing (NOT C's doing, not
+# corpus-covered): `rename` of a name a proc shadows removes the BUILTIN,
+# leaving the proc (tclsh removes the resolved command — the proc replaced
+# the table entry at definition).  Recorded as a follow-up.
+
+case               tclsh_ms    rtcl_ms    ratio
+arith_loop               33         35      1.0
+dict_ops                  5          6      1.2
+list_ops                  5          7      1.4
+proc_fib                  5         11      2.2
+string_build              4          4      1.0
+var_incr                 42         31      0.7

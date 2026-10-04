@@ -460,6 +460,9 @@ impl Interp {
                 self.commands.remove(name);
                 self.aliases.remove(name);
             }
+            if !procs_to_delete.is_empty() {
+                self.note_cmd_mutation();
+            }
         }
 
         // Frame teardown (tclsh): the proc's locals die with the frame —

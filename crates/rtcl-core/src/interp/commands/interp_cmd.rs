@@ -37,6 +37,7 @@ pub fn cmd_interp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         handle.clone(),
         make_interp_dispatch(&handle_for_cmd),
     );
+    interp.note_cmd_mutation();
 
     Ok(Value::from_str(&handle))
 }
@@ -123,6 +124,7 @@ fn interp_delete(interp: &mut Interp, handle: &str) -> Result<Value> {
     interp.commands.remove(handle);
     interp.command_categories.remove(handle);
     interp.command_meta.remove(handle);
+    interp.note_cmd_mutation();
     Ok(Value::empty())
 }
 

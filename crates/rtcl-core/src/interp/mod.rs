@@ -100,6 +100,41 @@ pub(crate) struct EnsembleDef {
     pub parameters: Vec<String>,
 }
 
+/// The outcome of one command-name resolution (`dispatch_values`'s
+/// procs/ensembles/builtins chain), memoised in [`Interp::cmd_cache`].
+/// tclsh caches resolved `Command *` tokens at its call sites; rtcl
+/// re-resolved per call, walking the full chain — including two
+/// `format!("::{}", name)` probe keys — for every dispatched command
+/// (stdlib's `::tcl::tm` ensemble means the engines' fast-path guards on
+/// "no ensembles registered" never fired in a real session).  Holding the
+/// fn pointer / `Rc<ProcDef>` is safe because every command-table mutation
+/// bumps [`Interp::cmd_generation`], a mismatch being a miss.  Only the
+/// proc-hit and builtin-hit outcomes are cached; ensemble/unknown/
+/// unresolved names re-run the chain every time (they sit outside hot
+/// loops, and their outcomes depend on maps worth keeping out of the
+/// staleness audit).
+#[derive(Debug, Clone)]
+pub(crate) enum ResolvedCmd {
+    /// A built-in won.  Which arm of the fallback chain found it doesn't
+    /// matter — the cached outcome is "call this fn".
+    Builtin(CommandFunc),
+    /// A proc won, registered under `key` — tclsh's command token.  The
+    /// def is NOT cached: `call_proc`'s statics write-back replaces the
+    /// map entry via `Rc::make_mut` (the cached handle would go stale),
+    /// so a hit re-fetches `procs[key]` — one probe, always-fresh def.
+    /// The name doubles as what `call_proc` reports in frames
+    /// (`(procedure "key")`).
+    Proc(Rc<str>),
+}
+
+/// One [`Interp::cmd_cache`] entry: the target plus the command-table
+/// generation it was resolved under.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedCmd {
+    pub gen: u64,
+    pub target: ResolvedCmd,
+}
+
 /// A procedure call frame.
 #[derive(Debug, Clone)]
 pub(crate) struct CallFrame {
@@ -265,6 +300,21 @@ pub struct Interp {
     /// reference (params + body + statics are NOT copied per call);
     /// statics write-back goes through `Rc::make_mut`.
     pub(crate) procs: VarMap<Rc<ProcDef>>,
+    /// Command-name resolution cache (tclsh's resolved-command tokens):
+    /// outer key = the namespace the resolution ran in, inner key = the
+    /// invocation name as written.  Both levels probe with `&str`, so a
+    /// hit costs two Fx hashes and zero allocations.  Entries carry the
+    /// command-table generation they resolved under; every mutation of
+    /// `commands`/`procs`/`ensembles`/`import_aliases`/`aliases` bumps
+    /// [`Interp::cmd_generation`], ageing every entry out at once.
+    /// Bounded (`cmd_cache_len` cap, clear on overflow) — wasm32 is a
+    /// target.
+    pub(crate) cmd_cache: VarMap<VarMap<CachedCmd>>,
+    /// Number of inner entries across `cmd_cache` (cheap overflow check;
+    /// the cap keeps the clear-on-overflow amortised).
+    pub(crate) cmd_cache_len: usize,
+    /// Command-table generation: bumped at every command-table mutation.
+    pub(crate) cmd_generation: u64,
     /// Parse-tree cache: script text → AST (with the source text the
     /// commands' spans point into; the key `Rc<str>` shares the unit's
     /// source allocation).  Parsing is a pure function of the text
@@ -572,6 +622,9 @@ impl Interp {
             command_categories: HashMap::new(),
             command_meta: HashMap::new(),
             procs: VarMap::default(),
+            cmd_cache: VarMap::default(),
+            cmd_cache_len: 0,
+            cmd_generation: 0,
             parse_cache: HashMap::new(),
             bytecode_cache: HashMap::new(),
             body_memo: Vec::new(),
@@ -728,6 +781,64 @@ impl Interp {
         } else {
             &self.globals
         }
+    }
+
+    /// Resolution-cache probe: the memoised winner for invoking `name`
+    /// in the current namespace, if one was cached under the live
+    /// command-table generation.  Two Fx hashes, zero allocations.
+    pub(crate) fn cmd_cache_get(&self, name: &str) -> Option<ResolvedCmd> {
+        let inner = self.cmd_cache.get(self.current_namespace.as_str())?;
+        let cached = inner.get(name)?;
+        (cached.gen == self.cmd_generation).then(|| cached.target.clone())
+    }
+
+    /// Resolution-cache insert (miss path only — the full chain just ran).
+    /// `note_cmd_mutation` bumps make stale entries miss, so an insert
+    /// here always overwrites with a fresh verdict for the same key.
+    pub(crate) fn cmd_cache_put(&mut self, name: &str, target: ResolvedCmd) {
+        const CMD_CACHE_MAX: usize = 8192;
+        if self.cmd_cache_len >= CMD_CACHE_MAX {
+            self.cmd_cache.clear();
+            self.cmd_cache_len = 0;
+        }
+        match self.cmd_cache.get_mut(self.current_namespace.as_str()) {
+            Some(inner) => {
+                if inner
+                    .insert(
+                        name.to_string(),
+                        CachedCmd {
+                            gen: self.cmd_generation,
+                            target,
+                        },
+                    )
+                    .is_none()
+                {
+                    self.cmd_cache_len += 1;
+                }
+            }
+            None => {
+                let mut inner: VarMap<CachedCmd> = VarMap::default();
+                inner.insert(
+                    name.to_string(),
+                    CachedCmd {
+                        gen: self.cmd_generation,
+                        target,
+                    },
+                );
+                self.cmd_cache
+                    .insert(self.current_namespace.clone(), inner);
+                self.cmd_cache_len += 1;
+            }
+        }
+    }
+
+    /// A command table (`commands` / `procs` / `ensembles` /
+    /// `import_aliases`) is about to change / has just changed: age every
+    /// resolution-cache entry out at once.  Cheap by construction — call
+    /// it from every mutation site; resolution-affecting mutations never
+    /// sit in hot loops.
+    pub(crate) fn note_cmd_mutation(&mut self) {
+        self.cmd_generation += 1;
     }
 }
 

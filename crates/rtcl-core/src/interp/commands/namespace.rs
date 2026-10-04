@@ -486,6 +486,7 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // The dying tree may have held a Tier1-named command — a coarse
         // sweep bump is cheaper than enumerating what just went away.
         super::super::vm_exec::note_tier1_sweep(interp);
+        interp.note_cmd_mutation();
     }
     Ok(Value::empty())
 }
@@ -917,6 +918,7 @@ fn ns_import(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             super::super::vm_exec::note_tier1_mutation(interp, &target);
             interp.import_aliases.insert(target, full_name);
         }
+        interp.note_cmd_mutation();
     }
 
     Ok(Value::empty())
@@ -957,6 +959,7 @@ fn ns_forget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             !(in_cur && from_src)
         });
         super::super::vm_exec::note_tier1_sweep(interp);
+        interp.note_cmd_mutation();
     }
     Ok(Value::empty())
 }
@@ -1276,6 +1279,7 @@ fn ens_create(interp: &mut Interp, opts: &[Value]) -> Result<Value> {
         i += 2;
     }
     interp.ensembles.insert(name, def);
+    interp.note_cmd_mutation();
     Ok(Value::empty())
 }
 

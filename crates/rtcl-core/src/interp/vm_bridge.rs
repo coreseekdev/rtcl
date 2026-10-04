@@ -72,6 +72,7 @@ impl VmContext for Interp {
         if args.is_empty() {
             return Ok(Value::empty());
         }
+        self.charge_step()?;
         let cmd_name = args[0].as_str();
 
         // Try user-defined procs first.  A simple name inside a
@@ -111,6 +112,7 @@ impl VmContext for Interp {
     }
 
     fn call(&mut self, cmd_id: u16, args: &[Value]) -> Result<Value> {
+        self.charge_step()?;
         let func = self.resolve_cmd(cmd_id);
         match func {
             Some(f) => {

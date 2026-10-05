@@ -313,7 +313,7 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
 /// return identically shaped [`Error`]s to the tree-walk so `call_proc`'s
 /// boundary handling (`(procedure …)` frames, return decoding, break →
 /// error conversion) needs no changes.
-pub(crate) fn exec_bytecode(interp: &mut Interp, code: &ByteCode) -> Result<Value> {
+pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<Value> {
     // A compiled unit's DynCall'd foreach runs DISPATCHED (tclsh's
     // INST_CALL fallback): clear the lexical flag for the unit's
     // duration, restoring the enclosing unit's context afterwards.
@@ -349,10 +349,23 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &ByteCode) -> Result<Valu
     // a live VmState is never in the pool, so pooling cannot alias.
     let r = {
         let mut st = interp.vm_pool.take(entry_offset);
-        let (consts, cmd_sites) = interp
-            .const_pool_get(code)
-            .map(|(v, s)| (Some(v), Some(s)))
-            .unwrap_or((None, None));
+        // The literal pool is capped and cleared on overflow: a unit whose
+        // entry was evicted (a stdlib load inserting hundreds of proc
+        // bodies ahead of the caller's units) used to stay evicted
+        // forever — every PushConst re-materialised its literals and every
+        // dispatch took the full resolution chain (the dloop profile: the
+        // dispatch layer at ~35% for exactly this reason).  The caller
+        // always holds the `Rc`, so a miss re-inserts lazily.
+        let (consts, cmd_sites) = match interp.const_pool_get(code) {
+            Some((v, s)) => (Some(v), Some(s)),
+            None => {
+                interp.const_pool_insert(code);
+                interp
+                    .const_pool_get(code)
+                    .map(|(v, s)| (Some(v), Some(s)))
+                    .unwrap_or((None, None))
+            }
+        };
         st.consts = consts;
         st.cmd_sites = cmd_sites;
         let r = exec_inner(interp, code, &mut st);

@@ -828,3 +828,24 @@ var_incr                 44         34      0.7
 # Bench: oo_bench2 787 -> 688ms (-13%; cumulative vs G8 base 1521 ->
 # 688 = -55%, gap 3.9x -> 1.76x tclsh); vars/other benches unchanged.
 # Gates: judge 87/87; sweep 0; tests 1143/0; feature matrix green.
+
+# ---------------------------------------------------------------------------
+# G8g 2026-10-06: const-pool eviction had no way back.  The dloop profile
+# at G8f showed the FULL dispatch chain (dispatch_site -> dispatch_call ->
+# dispatch_dynamic -> dispatch_values -> cmd_foreach) at ~35% — the
+# call-site tokens were never filling because st.cmd_sites was None: the
+# const_pool (cap 512, clear-on-overflow) is filled by every compile
+# seam INCLUDING the stdlib load's several hundred proc bodies, and the
+# clear wiped the top-level unit's entry AFTER its insert; cached units
+# never re-inserted, so every PushConst re-materialised its literals and
+# every dispatch took the full chain FOR THE REST OF THE SESSION.
+# (fib25x25 was unaffected — few units — which is why the G8 profile
+# looked clean while dloop paid.)
+#
+# Fix: exec_bytecode takes &Rc<ByteCode> (all three callers hold one)
+# and re-inserts on a pool miss — any eviction heals at the unit's next
+# execution; the cap also rises to 2048 (a stdlib load alone is worth
+# several hundred entries).  dloop 407 -> 364ms (gap 1.7x -> 1.51x
+# tclsh); oo_bench2 688 -> 659; fib/fe unchanged.
+# Gates: judge 87/87; sweep 0; tests 1143/0; feature matrix green
+# (spot: no-default + wasm32).

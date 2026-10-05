@@ -961,7 +961,10 @@ impl Interp {
     /// Called once at each compile seam — a cached unit then serves every
     /// later execution.
     pub(crate) fn const_pool_insert(&mut self, code: &Rc<ByteCode>) {
-        const CONST_POOL_MAX: usize = 512;
+        // 2048: a stdlib load inserts several hundred proc bodies; 512
+        // overflowed mid-session and the clear-on-overflow evicted the
+        // caller's units with no way back (pre-G8g they stayed evicted).
+        const CONST_POOL_MAX: usize = 2048;
         if code.constants().is_empty() {
             return;
         }

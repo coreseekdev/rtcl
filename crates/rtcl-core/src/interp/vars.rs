@@ -63,7 +63,11 @@ impl Interp {
     /// (unset slots and name-keyed frames both miss — the callers fall
     /// back to the name path).
     pub(crate) fn frame_slot_value(&self, slot: usize) -> Option<Value> {
-        self.frames.last()?.slots.get(slot)?.clone()
+        let f = self.frames.last()?;
+        if f.slot_aliased.get(slot).copied().unwrap_or(false) {
+            return None;
+        }
+        f.slots.get(slot)?.clone()
     }
 
     /// Write `value` into slot `slot` of the current frame.  `false` when
@@ -72,6 +76,14 @@ impl Interp {
     /// bump happens only on the write, so a caller whose fallback consumes
     /// the value pays nothing extra on the attempt.
     pub(crate) fn frame_slot_write(&mut self, slot: usize, value: &Value) -> bool {
+        if self
+            .frames
+            .last()
+            .map(|f| f.slot_aliased.get(slot).copied().unwrap_or(false))
+            .unwrap_or(true)
+        {
+            return false;
+        }
         match self.frames.last_mut().and_then(|f| f.slots.get_mut(slot)) {
             Some(cell) => {
                 *cell = Some(value.clone());
@@ -87,6 +99,12 @@ impl Interp {
     pub(crate) fn frame_slot_incr(&mut self, slot: usize, amount: i64) -> Option<Value> {
         if !self.var_traces.is_empty() {
             return None;
+        }
+        {
+            let f = self.frames.last_mut()?;
+            if f.slot_aliased.get(slot).copied().unwrap_or(false) {
+                return None;
+            }
         }
         let cell = self.frames.last_mut()?.slots.get_mut(slot)?.as_mut()?;
         let current = cell.as_int()?;
@@ -121,6 +139,36 @@ impl Interp {
             }
         }
         f.slots.clear();
+        f.slot_aliased.clear();
+    }
+
+    /// Link-only aliasing of ONE slot: move the cell's value into
+    /// `locals` and mark the slot aliased, so slot ops on that name defer
+    /// to the name path (which resolves the link) while every OTHER slot
+    /// keeps its compiled fast path.  Used by `upvar` / `global` /
+    /// `variable` — the links a hot method body re-installs per call —
+    /// where the old whole-frame flush demoted every variable of the
+    /// frame to name-keyed lookups.  Traces / array-ification / unset
+    /// keep [`Self::degrade_frame_local`]'s wholesale flush (their
+    /// storage-kind change is frame-wide by nature, and they are cold).
+    pub(crate) fn degrade_frame_link(&mut self, frame_idx: usize, name: &str) {
+        let base = match name.find('(') {
+            Some(i) => &name[..i],
+            None => name,
+        };
+        let Some(f) = self.frames.get_mut(frame_idx) else { return };
+        if f.slots.is_empty() {
+            return;
+        }
+        let Some(i) = f.slot_index_of(base) else { return };
+        if let Some(v) = f.slots[i].take() {
+            f.locals.insert(base.to_string(), v);
+        }
+        if f.slot_aliased.len() != f.slots.len() {
+            f.slot_aliased.clear();
+            f.slot_aliased.resize(f.slots.len(), false);
+        }
+        f.slot_aliased[i] = true;
     }
 
     /// Whole-frame degrade of `frames[frame_idx]` — for sites that enumerate
@@ -146,6 +194,7 @@ impl Interp {
             }
         }
         f.slots.clear();
+        f.slot_aliased.clear();
     }
 
     /// [`Self::degrade_frame_all_at`] on the current frame (no-op at the

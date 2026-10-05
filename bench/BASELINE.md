@@ -768,3 +768,36 @@ var_incr                 44         34      0.7
 # probes) — the linked-slot model (slot cell = Value | Link) is the
 # structural follow-up, same class as the array-marker refactor.
 # Gates: judge 87/87; sweep 0; tests 1143/0; feature matrix green.
+
+# ---------------------------------------------------------------------------
+# G8e 2026-10-05: linked slots — the whole-frame upvar degrade is gone
+# for link commands.  Installing a link (`upvar` / `global` /
+# `variable`) flushed EVERY slot value into the name map and dropped
+# the slot table, demoting the whole frame to name-keyed lookups — in
+# an OO method body whose `variable acc;` link re-installs per call,
+# every x/y/param op paid map hashing for the sake of one linked name.
+# Now: degrade_frame_link moves ONE cell into `locals` and sets a
+# parallel `slot_aliased` bool; the three frame_slot_* ops and
+# CallFrame::slot_value consult it (an indexed read, no hashing) and
+# defer to the name path, which resolves the link through its existing
+# (judge-proven) upvar machinery.  The name-path fast paths already
+# self-guard on `upvars.contains_key`, so no other site needed edits.
+# Scope: only the three link commands alias per-name (their storage
+# change is name-scoped); trace/array-ification/unset keep the
+# wholesale flush (frame-wide storage-kind change, cold paths), and
+# upvar-to-a-CALLER-frame local keeps it too — the target frame has no
+# upvar entry for its own name, so per-name aliasing there would let
+# the caller's compiled stores resurrect the flushed cell.  Enumeration
+# sites (info vars/locals/frame) already degrade wholesale first, so
+# the linked name is visible exactly as before.
+#
+# Profile (oo_bench2_vars): cmd_variable 24.2% -> 12.9% (the remaining
+# cost is the live per-call checks: parent-exists, ns variable-set
+# insert, upvar install — all semantics); set_var 16.4% / hashing 13%
+# / resolve_object_key 7.5% are the structural floor of the current
+# design (tclsh's compiledLocals hold direct pointers, no hashing).
+# Bench: oo_bench2_vars 1513 -> 1407ms (cumulative vs G8 base 2632 ->
+# 1407 = -46%, gap 6.2x -> 3.3x tclsh); oo_bench2/fib/dloop unchanged.
+# Gates: judge 87/87; sweep 0; tests 1143/0 (the test_slot_* battery
+# covers upvar/global/variable/array/trace degrades); all 7 var/OO
+# probes byte-exact vs tclsh 8.6.17.

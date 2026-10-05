@@ -88,6 +88,7 @@ impl Interp {
                 f.local_procs.clear();
                 f.deferred_scripts.clear();
                 f.slots.clear();
+                f.slot_aliased.clear();
                 f.slot_table = None;
                 f
             }
@@ -100,6 +101,7 @@ impl Interp {
                 local_procs: Vec::new(),
                 deferred_scripts: Vec::new(),
                 slots: Vec::new(),
+                slot_aliased: Vec::new(),
                 slot_table: None,
                 tailcall: None,
                 level0: Vec::new(),
@@ -146,12 +148,15 @@ impl Interp {
                     let frame = self.frames.last_mut().unwrap();
                     frame.slots.clear();
                     frame.slots.resize(n, None);
+                    frame.slot_aliased.clear();
+                    frame.slot_aliased.resize(n, false);
                     frame.slot_table = Some(table);
                     true
                 }
                 _ => {
                     let frame = self.frames.last_mut().unwrap();
                     frame.slots.clear();
+                    frame.slot_aliased.clear();
                     frame.slot_table = None;
                     false
                 }
@@ -539,6 +544,7 @@ impl Interp {
         popped.local_procs.clear();
         popped.deferred_scripts.clear();
         popped.slots.clear();
+        popped.slot_aliased.clear();
         popped.slot_table = None;
         // Kept (cleared, with capacity) — the pooled frame reuses the
         // buffer for its next invocation's `info level 0` words.

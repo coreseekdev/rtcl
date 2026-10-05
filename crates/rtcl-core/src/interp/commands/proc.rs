@@ -716,8 +716,11 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // replacing an existing alias is silent (upvar-6.1 re-links `x`
         // once per loop iteration).  The alias name leaves the slot model
         // first (links and slot cells don't alias; the exists check and
-        // every later write go through the map).
-        interp.degrade_frame_local(current_idx, &local_var);
+        // every later write go through the map) — link-only aliasing: the
+        // frame's other slots keep their compiled fast path, and this
+        // frame's own reads/writes of the alias re-resolve through the
+        // upvar guards.
+        interp.degrade_frame_link(current_idx, &local_var);
         let has_link = interp.frames[current_idx].upvars.contains_key(&local_var);
         if !has_link
             && (interp.frames[current_idx].locals.contains_key(&local_var)
@@ -839,9 +842,11 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // (`global a::b` binds `b` — tclsh), `ns::` binds the empty name.
         let local = super::namespace::split_var_tail(name).to_string();
         // The alias name leaves the slot model (links and slot cells
-        // don't alias); a frame whose `global`d name is NOT slotted keeps
-        // its fast paths — this is the common hot-proc shape.
-        interp.degrade_frame_local(current_idx, &local);
+        // don't alias); link-only aliasing keeps the frame's other slots
+        // on their compiled fast path — the frame's own ops on the name
+        // re-resolve through the upvar guards, the way tclsh's linked
+        // compiledLocal does.
+        interp.degrade_frame_link(current_idx, &local);
         interp.frames[current_idx].upvars.insert(
             local.clone(),
             UpvarLink::Global(target.clone()),

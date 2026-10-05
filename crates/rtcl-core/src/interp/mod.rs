@@ -167,6 +167,15 @@ pub(crate) struct CallFrame {
     /// uncompiled writers — foreach vars, `lappend`, `catch` results —
     /// observe and mutate the same variable the compiled ops touch).
     pub slots: Vec<Option<Value>>,
+    /// Parallel to `slots`: a slot whose storage moved to `locals` because
+    /// an exceptional structure was installed on its NAME (an upvar /
+    /// `global` / `variable` link — see
+    /// [`Interp::degrade_frame_link`]).  Slot ops consult this one bool
+    /// (an indexed read, no hashing) and defer to the name path, which
+    /// resolves the link; every other slot keeps its compiled fast path,
+    /// so a linked method variable no longer degrades the WHOLE frame to
+    /// name-keyed lookups.
+    pub slot_aliased: Vec<bool>,
     /// The compiled unit the slots belong to; its `locals()` table names
     /// slot i.  `Rc` — one bump per call, taken on degrade.
     pub slot_table: Option<Rc<ByteCode>>,
@@ -211,6 +220,9 @@ impl CallFrame {
     /// Current value of the named slot (`None` when unset or absent).
     pub(crate) fn slot_value(&self, name: &str) -> Option<&Value> {
         let i = self.slot_index_of(name)?;
+        if self.slot_aliased.get(i).copied().unwrap_or(false) {
+            return None;
+        }
         self.slots[i].as_ref()
     }
 }

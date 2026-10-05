@@ -189,14 +189,25 @@ pub(crate) struct OoState {
     /// + `objects.(insert|remove|get_mut)`.
     pub mutation_ctr: u64,
     /// Resolution-chain memo (tclsh caches the call context the same way):
-    /// (object/class key, method, include_private) → the chain as built,
-    /// valid under the `mutation_ctr` stamp it was built at.  A mutation
+    /// object/class key → method → the chain as built, valid under the
+    /// `mutation_ctr` stamp it was built at (nested maps so a hit probes
+    /// by `&str` twice and allocates nothing — the flat
+    /// `(String, String)` key allocated two Strings per probe, visible in
+    /// the OO call profile).  `chain_memo` serves plain dispatch,
+    /// `chain_memo_priv` the `include_private` (`my`) one.  A mutation
     /// anywhere retires every entry at once — conservative but exactly
     /// tclsh's re-resolution semantics.  Bounded with clear-on-overflow
     /// (wasm32 is a target).  The `Rc` chain is shared with the
     /// `ActiveMethod` snapshots, so `next` also stops paying a
     /// `to_vec` per invocation.
-    pub chain_memo: HashMap<(String, String, bool), (u64, Rc<Vec<ChainEntry>>)>,
+    pub chain_memo: HashMap<String, HashMap<String, (u64, Rc<Vec<ChainEntry>>)>>,
+    /// The `include_private` half of [`Self::chain_memo`].
+    pub chain_memo_priv: HashMap<String, HashMap<String, (u64, Rc<Vec<ChainEntry>>)>>,
+    /// Typed-name → canonical object/class key memo (see
+    /// `resolve_object_key`): current namespace → typed name →
+    /// (stamp, resolution).  `RefCell` so `&Interp` read paths can fill
+    /// it, the `proc_memo` precedent.
+    pub key_memo: RefCell<HashMap<String, HashMap<String, (u64, Option<Rc<str>>)>>>,
 }
 
 // ── init ───────────────────────────────────────────────────────────────
@@ -317,12 +328,50 @@ fn object_key_candidates(interp: &Interp, typed: &str) -> Vec<String> {
 
 /// Resolve an as-typed name to an object/class key.
 fn resolve_object_key(interp: &Interp, typed: &str) -> Option<String> {
-    for cand in object_key_candidates(interp, typed) {
-        if interp.oo.objects.contains_key(&cand) || interp.oo.classes.contains_key(&cand) {
-            return Some(cand);
+    // The resolution is a pure function of (current namespace, typed
+    // name, the object/class tables) — and every table mutation bumps
+    // `mutation_ctr` (the chain_memo audit), so entries validate against
+    // the stamp they resolved under.  The dispatcher runs this per method
+    // call; the naive form generated candidate Strings (`qualify` +
+    // `format!("::{}")`) and probed the tables twice each time — ~13% of
+    // the OO call bench.  Unknown names memoize too (the error path then
+    // skips the walk).  Bounded: a new outer entry clears the table at
+    // 64 namespaces, an inner one at 256 names.
+    {
+        let memo = interp.oo.key_memo.borrow();
+        if let Some(inner) = memo.get(interp.current_namespace.as_ref()) {
+            if let Some((stamp, k)) = inner.get(typed) {
+                if *stamp == interp.oo.mutation_ctr {
+                    return k.as_ref().map(|k| k.to_string());
+                }
+            }
         }
     }
-    None
+    let resolved: Option<Rc<str>> = (|| {
+        for cand in object_key_candidates(interp, typed) {
+            if interp.oo.objects.contains_key(&cand) || interp.oo.classes.contains_key(&cand) {
+                return Some(Rc::from(cand.as_str()));
+            }
+        }
+        None
+    })();
+    {
+        let mut memo = interp.oo.key_memo.borrow_mut();
+        const KEY_MEMO_NS_MAX: usize = 64;
+        const KEY_MEMO_NAME_MAX: usize = 256;
+        if memo.len() >= KEY_MEMO_NS_MAX && !memo.contains_key(interp.current_namespace.as_ref())
+        {
+            memo.clear();
+        }
+        let inner = memo
+            .entry(interp.current_namespace.to_string())
+            .or_insert_with(HashMap::new);
+        if inner.len() >= KEY_MEMO_NAME_MAX {
+            inner.clear();
+        }
+        inner.insert(typed.to_string(), (interp.oo.mutation_ctr, resolved.clone()));
+    }
+    resolved.map(|k| k.to_string())
 }
 
 /// Does a command (builtin, proc, ensemble or alias) exist under this
@@ -850,32 +899,53 @@ fn invoke_method(
     exec_chain_entry(interp, key, method, 0, &chain, call_args, typed)
 }
 
-/// The memoised [`build_chain`] for this invocation context.
+/// The memoised [`build_chain`] for this invocation context.  Nested maps
+/// probed by `&str`: a hit allocates nothing (the flat `(String, String)`
+/// key allocated two Strings per probe — see [`OoState::chain_memo`]).
 fn chain_for(interp: &mut Interp, key: &str, method: &str, include_private: bool) -> Rc<Vec<ChainEntry>> {
-    let memo_key = (key.to_string(), method.to_string(), include_private);
-    if let Some((stamp, chain)) = interp.oo.chain_memo.get(&memo_key) {
-        if *stamp == interp.oo.mutation_ctr {
-            return Rc::clone(chain);
-        }
+    let (memo, other) = if include_private {
+        (&interp.oo.chain_memo_priv, &interp.oo.chain_memo)
+    } else {
+        (&interp.oo.chain_memo, &interp.oo.chain_memo_priv)
+    };
+    if let Some((stamp, chain)) = memo
+        .get(key)
+        .and_then(|inner| inner.get(method))
+        .filter(|(s, _)| *s == interp.oo.mutation_ctr)
+    {
+        return Rc::clone(chain);
     }
+    let _ = other;
     let chain = Rc::new(build_chain(interp, key, method, include_private));
     const CHAIN_MEMO_MAX: usize = 512;
-    if interp.oo.chain_memo.len() >= CHAIN_MEMO_MAX {
-        interp.oo.chain_memo.clear();
+    {
+        let memo = if include_private {
+            &mut interp.oo.chain_memo_priv
+        } else {
+            &mut interp.oo.chain_memo
+        };
+        if memo.len() >= CHAIN_MEMO_MAX {
+            memo.clear();
+        }
+        memo.entry(key.to_string())
+            .or_insert_with(HashMap::new)
+            .insert(method.to_string(), (interp.oo.mutation_ctr, Rc::clone(&chain)));
     }
-    interp.oo
-        .chain_memo
-        .insert(memo_key, (interp.oo.mutation_ctr, Rc::clone(&chain)));
     chain
 }
 
 // ── the object dispatcher ──────────────────────────────────────────────
 
 extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    let typed = args[0].as_str().to_string();
-    let key = match resolve_object_key(interp, &typed) {
+    // Borrowed throughout: the typed name, the resolved key and the
+    // method word never need to outlive this dispatch (the ActiveMethod
+    // snapshot owns its copies).  The old form String-allocated the
+    // typed name, the method name AND a Vec clone of the call args per
+    // invocation — the dispatcher's entry tax.
+    let typed = args[0].as_str();
+    let key = match resolve_object_key(interp, typed) {
         Some(k) => k,
-        None => return Err(Error::invalid_command(&typed)),
+        None => return Err(Error::invalid_command(typed)),
     };
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage(
@@ -885,30 +955,29 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
             "method ?arg ...?",
         ));
     }
-    let method = args[1].as_str().to_string();
-    let call_args: Vec<Value> = args[2..].to_vec();
-    invoke_method(interp, &key, &method, &call_args, &typed, false)
+    let method = args[1].as_str();
+    invoke_method(interp, &key, method, &args[2..], typed, false)
 }
 
 // ── my / self / next ───────────────────────────────────────────────────
 
 extern "Rust" fn cmd_oo_my(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    let typed = args[0].as_str().to_string();
-    let cmd_key = qualify(&interp.current_namespace, &typed);
+    // Borrowed throughout (see cmd_oo_object).
+    let typed = args[0].as_str();
+    let cmd_key = qualify(&interp.current_namespace, typed);
     let key = match interp.oo.my_commands.get(&cmd_key) {
         Some(k) => k.clone(),
-        None => return Err(Error::invalid_command(&typed)),
+        None => return Err(Error::invalid_command(typed)),
     };
     let ns = object_ns_of(interp, &key);
     if !frame_in_object_ns(interp, &ns) {
-        return Err(Error::invalid_command(&typed));
+        return Err(Error::invalid_command(typed));
     }
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage("my", 2, args.len(), "method ?arg ...?"));
     }
-    let method = args[1].as_str().to_string();
-    let call_args: Vec<Value> = args[2..].to_vec();
-    invoke_method(interp, &key, &method, &call_args, &typed, true)
+    let method = args[1].as_str();
+    invoke_method(interp, &key, method, &args[2..], typed, true)
 }
 
 const SELF_SUBCMDS: &[&str] = &[

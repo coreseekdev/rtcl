@@ -801,3 +801,30 @@ var_incr                 44         34      0.7
 # Gates: judge 87/87; sweep 0; tests 1143/0 (the test_slot_* battery
 # covers upvar/global/variable/array/trace degrades); all 7 var/OO
 # probes byte-exact vs tclsh 8.6.17.
+
+# ---------------------------------------------------------------------------
+# G8f 2026-10-05: the OO dispatcher's entry tax.  oo_bench2 profile at
+# G8e: cmd_oo_object 65% inclusive, under it resolve_object_key 13.4%
+# (object_key_candidates 10.9%: `qualify` + `format!("::{}")` allocate
+# candidate Strings per call, then two owned-String table probes) —
+# plus chain_for's flat (String, String) memo key allocating two
+# Strings per PROBE, plus cmd_oo_object's own typed/method .to_string()
+# and a Vec clone of the call args.
+#
+# Changes: resolve_object_key memoised (OoState::key_memo, nested
+# ns->name maps probed by &str, valid under mutation_ctr — every
+# objects/classes mutation bumps it per the G8b audit, and `rename`
+# does not touch the oo tables, so the pure-function argument is
+# closed); chain_for split into nested chain_memo/chain_memo_priv
+# (zero-alloc hit); both dispatchers borrow the typed name, method
+# word and call-arg slice (nothing needs to outlive the dispatch — the
+# ActiveMethod snapshot owns its copies).  New probe oo20 (memoized
+# miss -> object created, destroy -> recreate as another class,
+# qualified form).  NOTE (pre-existing, both engines diverge from
+# tclsh): rtcl objects do not follow `rename` (tclsh: renamed object
+# command keeps working) — old and new binaries agree; recorded as a
+# follow-up, not this round's business.
+#
+# Bench: oo_bench2 787 -> 688ms (-13%; cumulative vs G8 base 1521 ->
+# 688 = -55%, gap 3.9x -> 1.76x tclsh); vars/other benches unchanged.
+# Gates: judge 87/87; sweep 0; tests 1143/0; feature matrix green.

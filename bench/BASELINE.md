@@ -965,3 +965,28 @@ var_incr                 44         34      0.7
 # the body from its site span, with framing parity) or exact mirroring
 # of the context-conditional routing in the executor.  Both are
 # next-major-project sized; parked, not attempted.
+
+# ---------------------------------------------------------------------------
+# G9 state board (2026-10-06, post-G9d): micro suite at parity or better
+# (arith .8x, dict .8x, list .8x, string_build 1.0x, var_incr .7x —
+# BELOW 1 means rtcl is faster; proc_fib micro 1.3x).  Heavy benches vs
+# tclsh 8.6.17: fib25 48ms/run ~1.4x; dloop 333ms 1.38x; oo_bench2
+# 638ms 1.63x; fe_bench 85ms 2.7x; oo_bench2_vars 1229ms 2.9x.  The arc
+# from the session start (10-85x at bd3e169): every remaining gap has
+# been decomposed to per-call semantic operations (hash probes,
+# refcounts, error-frame bookkeeping) — tclsh's residual edge is
+# pointer-stable compiledLocals (zero hashing on linked variables),
+# inline-expr object reuse, and four decades of constant-factor tuning.
+#
+# The mapped next-major projects, in expected-value order:
+# 1. Inline-int Value (tagged pointer / NaN-box): makes numbers
+#    immediate — zero alloc, zero refcount.  The wall is as_str(&self)
+#    -> &str for an immediate (needs Cow migration across every
+#    consumer, thousands of sites) or a render-ring footgun.  Biggest
+#    single lever left.
+# 2. Pointer-stable variable storage (slotmap-style tables with
+#    hash-carrying lookups): zeroes the hash chains on linked/global
+#    variable access (vars-bench remaining cost).  Touches VarMap's
+#    every consumer.
+# 3. Global foreach inlining (see the parked design note): kills the
+#    per-iteration body-eval machinery at top level (fe/dloop).

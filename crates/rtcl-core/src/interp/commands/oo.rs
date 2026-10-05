@@ -69,16 +69,18 @@ pub(crate) struct MethodDef {
     pub body: Rc<str>,
     pub exported: bool,
     pub kind: MethodKind,
-    /// Compiled form of the assembled method [`ProcDef`], memoised for the
-    /// no-`variable` case (see `memoised_proc_def`): `(typed method name,
+    /// Compiled form of the assembled method [`ProcDef`], memoised (see
+    /// `memoised_proc_def`): `(typed method name, owner `variable` snapshot,
     /// ProcDef)`.  `Rc<RefCell<..>>` so chain clones share one cell; a
     /// redefinition installs a fresh `MethodDef` (fresh cell), retiring the
-    /// memo with its inputs.
-    pub proc_memo: Rc<RefCell<Option<(String, Rc<ProcDef>)>>>,
+    /// memo with its inputs.  The vars snapshot is the `link_prefix` input —
+    /// a `variable` declaration change rebuilds (the `define` word also
+    /// bumps `mutation_ctr`, retiring the chain memo with it).
+    pub proc_memo: Rc<RefCell<Option<(String, Vec<String>, Rc<ProcDef>)>>>,
 }
 
 /// A fresh [`MethodDef::proc_memo`] cell.
-fn fresh_memo() -> Rc<RefCell<Option<(String, Rc<ProcDef>)>>> {
+fn fresh_memo() -> Rc<RefCell<Option<(String, Vec<String>, Rc<ProcDef>)>>> {
     Rc::new(RefCell::new(None))
 }
 
@@ -557,18 +559,18 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
 }
 
 /// Owner-specific variable declarations for a chain entry.
-fn owner_variables(interp: &Interp, owner: &Owner, key: &str) -> Vec<String> {
+fn owner_variables<'a>(interp: &'a Interp, owner: &'a Owner, key: &str) -> &'a [String] {
     match owner {
         Owner::Object => match interp.oo.objects.get(key) {
-            Some(o) => o.variables.clone(),
+            Some(o) => &o.variables,
             None => match interp.oo.classes.get(key) {
-                Some(c) => c.obj_variables.clone(),
-                None => vec![],
+                Some(c) => &c.obj_variables,
+                None => &[],
             },
         },
         Owner::Class(c) => match interp.oo.classes.get(c) {
-            Some(cls) => cls.variables.clone(),
-            None => vec![],
+            Some(cls) => &cls.variables,
+            None => &[],
         },
     }
 }
@@ -688,26 +690,17 @@ fn exec_chain_entry(
             interp.dispatch_values(&args)
         }
         MethodKind::Tcl => {
-            // Link the defining owner's `variable`s (skipping names bound
-            // as parameters, including the synthetic method-name param).
-            let vars = owner_variables(interp, &entry.owner, key);
-
             // tclsh compiles a method body once and caches the compiled
             // form on the method record; rtcl rebuilt this ProcDef per
             // call — two full-body String copies plus the bytecode
-            // cache's full-text probe inside call_proc's eval.  An owner
-            // with no `variable` declarations assembles to `def.body`
-            // verbatim (a pure function of def + invoked method name),
-            // so that case memoises on the MethodDef; owners WITH
-            // variables keep the rebuild (the prefix follows the live
-            // variable lists).
-            let proc_def: Rc<ProcDef> = if vars.is_empty() {
-                memoised_proc_def(interp, &entry.def, method)
-            } else {
-                let mut body = link_prefix(&vars, &entry.def.params);
-                body.push_str(&entry.def.body);
-                Rc::new(method_proc_def(&body, &entry.def.params, method))
-            };
+            // cache's full-text probe inside call_proc's eval (and no
+            // compiled form at all, so the body ran tree-walked).  The
+            // assembled body is a pure function of (def, invoked method
+            // name, the owner's `variable` list) — all memoised on the
+            // MethodDef, a `variable` change rebuilding via the
+            // snapshot compare.
+            let proc_def: Rc<ProcDef> =
+                memoised_proc_def(interp, &entry.owner, key, &entry.def, method);
 
             let mut args: Vec<Value> =
                 vec![Value::from_str(typed), Value::from_str(method)];
@@ -735,11 +728,15 @@ fn exec_chain_entry(
 fn link_prefix(vars: &[String], params: &[(String, Option<String>)]) -> String {
     let names: Vec<&str> = params.iter().map(|(p, _)| p.as_str()).collect();
     let link: Vec<&str> = vars.iter().map(|s| s.as_str()).filter(|v| !names.contains(v)).collect();
-    if link.is_empty() {
-        String::new()
-    } else {
-        format!("variable {};", link.join(" "))
-    }
+    // ONE `variable` command per name: `variable a b` at the Tcl level is
+    // the PAIRED declare-with-initial-value form (b is a's initial value),
+    // not a two-name declaration — a multi-name prefix used to clobber the
+    // first variable with the literal second name (probed tclsh 8.6.17:
+    // native TclOO links each name separately).
+    link
+        .iter()
+        .map(|n| format!("variable {};", n))
+        .collect()
 }
 
 /// Build the synthetic method [`ProcDef`] for `body` (already carrying
@@ -761,40 +758,63 @@ fn method_proc_def(
     }
 }
 
-/// Memoised [`ProcDef`] for a method whose defining owner declares no
-/// `variable`s: the assembled body is `def.body` verbatim, so
-/// params/body/bytecode are pure functions of (def, method) — built and
-/// compiled once, shared by every invocation (tclsh caches the compiled
-/// body on its method record the same way).  Keyed by the typed method
-/// name (params[0] feeds the arity-usage text and `info level 0`); a
-/// mismatch or an empty memo just rebuilds.  Method (re)definition
-/// installs a fresh `MethodDef`, retiring the memo with its inputs;
-/// `export` toggling is the only in-place mutation and does not enter
-/// the memo.  The shared `Rc<ProcDef>` is never written back: OO
+/// Memoised [`ProcDef`] for a method body: params/body/bytecode are pure
+/// functions of (def, invoked method name, the owner's `variable` list —
+/// the `link_prefix` input), so the assembled ProcDef is built and
+/// compiled once and shared by every invocation (tclsh caches the
+/// compiled body on its method record the same way).  Keyed by the
+/// typed method name (params[0] feeds the arity-usage text and
+/// `info level 0`) plus a snapshot of the owner's `variable` list; a
+/// mismatch on either just rebuilds.  Method (re)definition installs a
+/// fresh `MethodDef` (fresh cell), retiring the memo with its inputs; a
+/// `variable` declaration change diverges the live list from the
+/// snapshot (and bumps `mutation_ctr`, retiring the chain memo too).
+/// `export` toggling is the only other in-place mutation and does not
+/// enter the memo.  The shared `Rc<ProcDef>` is never written back: OO
 /// statics are always empty, so `call_proc`'s `Rc::make_mut` write-back
 /// cannot fire, and its per-call epoch/applicability gate keeps a stale
 /// compiled form on the tree-walk exactly like a named proc's.
-fn memoised_proc_def(interp: &mut Interp, def: &MethodDef, method: &str) -> Rc<ProcDef> {
+fn memoised_proc_def(
+    interp: &mut Interp,
+    owner: &Owner,
+    key: &str,
+    def: &MethodDef,
+    method: &str,
+) -> Rc<ProcDef> {
     {
+        let vars = owner_variables(interp, owner, key);
         let memo = def.proc_memo.borrow();
-        if let Some((n, d)) = memo.as_ref() {
-            if n == method {
+        if let Some((n, vs, d)) = memo.as_ref() {
+            if n == method && vs.as_slice() == vars {
                 return Rc::clone(d);
             }
         }
     }
-    let mut pd = method_proc_def(&def.body, &def.params, method);
+    // The prefix is non-empty whenever vars survive the param filter, so an
+    // empty buffer means "no prefix" — `&def.body` is then the assembled
+    // body verbatim.
+    let mut body_buf = String::new();
+    {
+        let vars = owner_variables(interp, owner, key);
+        if !vars.is_empty() {
+            body_buf = link_prefix(vars, &def.params);
+            body_buf.push_str(&def.body);
+        }
+    }
+    let body: &str = if body_buf.is_empty() { &def.body } else { &body_buf };
+    let mut pd = method_proc_def(body, &def.params, method);
     // Compile at the same seam named `proc`s use; the compiled form also
     // unlocks call_proc's slot-locals binding (empty statics, params
     // seeded in order — the synthetic name first, by construction).
     let compiled =
-        super::super::vm_exec::compile_proc_body(&pd.params, &def.body, interp.tier1_epoch);
+        super::super::vm_exec::compile_proc_body(&pd.params, body, interp.tier1_epoch);
     if let Some(code) = &compiled {
         interp.const_pool_insert(code);
     }
     pd.compiled = compiled;
     let proc_def = Rc::new(pd);
-    *def.proc_memo.borrow_mut() = Some((method.to_string(), Rc::clone(&proc_def)));
+    let snapshot = owner_variables(interp, owner, key).to_vec();
+    *def.proc_memo.borrow_mut() = Some((method.to_string(), snapshot, Rc::clone(&proc_def)));
     proc_def
 }
 

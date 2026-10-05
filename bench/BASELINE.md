@@ -698,3 +698,49 @@ var_incr                 44         34      0.7
 # Remaining open candidates: #2 array marker inside the var tables
 # (dloop var layer ~15% -> ~7%); oo dispatch's cmd_oo_object entry
 # (typed/key String allocs per call) now the visible OO cost.
+
+# ---------------------------------------------------------------------------
+# G8c 2026-10-05: vars-path memo unification + a pre-existing multi-
+# variable link_prefix bug found BY the new bench gate.
+#
+# The worst remaining gap was oo_bench2_vars (class methods whose owner
+# declares `variable`s): exec_chain_entry rebuilt + recompiled the
+# synthetic ProcDef EVERY call (fresh ProcDef has no compiled form, so
+# the body also ran tree-walked) — the memo only covered the no-vars
+# case because the prefix "follows the live variable lists".  But the
+# assembled body is a pure function of (def, method, owner vars): the
+# memo now keys on the typed method name PLUS a snapshot of the live
+# `variable` list (a `variable` declaration change diverges the
+# snapshot and rebuilds; the define word also bumps mutation_ctr,
+# retiring the chain memo).  owner_variables now returns a borrowed
+# slice (no Vec clone per call).
+#
+# BUG (pre-existing, found while validating the memo): link_prefix
+# emitted `variable a b;` for the names [a, b] — at the Tcl level that
+# is the PAIRED declare-with-initial-value form, so `acc` was clobbered
+# with the literal string "extra" and `$acc` read "extra" (probed
+# tclsh: methods link each name separately).  Any class with TWO
+# declared variables broke arithmetic on the first one (old binary:
+# `expected integer but got "log"`).  link_prefix now emits one
+# `variable <name>;` per name; ctor/dtor paths share the fix.  New
+# probe oo19.tcl (7 vars-memo sections + ctor/dtor with two variables)
+# byte-exact vs tclsh 8.6.17.
+#
+# Sweep flake resolved: judge/probes/objquad prints measured wall time
+# (clock seconds deltas around an 80k list-nest loop sitting near the
+# 1s print boundary) — under sustained load it flapped engine-vs-engine
+# 5/8 rounds, BOTH directions (captured artifacts /tmp/sweep_flaky/).
+# It and objtime (same pattern, ms granularity) are perf probes, not
+# semantics probes: both are now excluded from the differential sweep,
+# alongside pw/objmech etc.  The sweep itself is finally committed as
+# judge/sweep.sh (was a /tmp session artifact; 8-round capture loop
+# confirmed objquad was the ONLY flaky probe — zero other diffs).
+#
+# Bench (per-run ms, interleaved best-of-3, load ~2): oo_bench2_vars
+# 2590 -> 1682 (-35%; tclsh 421 — gap 6.2x -> 4.0x; remaining cost is
+# the per-call `variable` link execution + degraded name-keyed frame,
+# tclsh compiles the link into the frame); oo_bench2 1313 -> 772
+# (1.97x tclsh); fib25 72 -> 55ms/run (gap 2.0x -> 1.53x); dloop
+# 396 -> 370 (-7%, secondary).  Gates: judge 87/87; sweep 0
+# (judge/sweep.sh); tests 1143/0; feature matrix green (std variants,
+# rtcl-vm no-default, wasm32).

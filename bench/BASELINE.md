@@ -951,3 +951,17 @@ var_incr                 44         34      0.7
 # noise).  Reverted before commit; the negative result is the
 # record — the remaining fe_bench gap lives in per-op bookkeeping and
 # value lifecycle, not in op fusion.
+
+# ---------------------------------------------------------------------------
+# G9f 2026-10-06 (design note, parked): global-scope foreach inlining.
+# The locals_mode gate on foreach/lmap is the per-iteration body-eval
+# overhead at top level (fe_bench/dloop outer loops).  The tree engine
+# ALREADY routes inlinable-shape foreach through foreach_lexical
+# (compiled semantics) at global — BUT the routing is context-
+# conditional at RUNTIME (foreach_inline_shape consults
+# cur_cmd_word_srcs; probe-pinned: catch-wrapped lmap at global stays
+# dispatched-shaped), while a compiler inline is unconditional.  Doing
+# this right needs either a runtime bail in ForeachStart (re-evaluating
+# the body from its site span, with framing parity) or exact mirroring
+# of the context-conditional routing in the executor.  Both are
+# next-major-project sized; parked, not attempted.

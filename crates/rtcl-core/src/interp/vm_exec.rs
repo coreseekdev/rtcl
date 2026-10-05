@@ -349,25 +349,35 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
     // a live VmState is never in the pool, so pooling cannot alias.
     let r = {
         let mut st = interp.vm_pool.take(entry_offset);
-        // The literal pool is capped and cleared on overflow: a unit whose
-        // entry was evicted (a stdlib load inserting hundreds of proc
-        // bodies ahead of the caller's units) used to stay evicted
-        // forever — every PushConst re-materialised its literals and every
-        // dispatch took the full resolution chain (the dloop profile: the
-        // dispatch layer at ~35% for exactly this reason).  The caller
-        // always holds the `Rc`, so a miss re-inserts lazily.
-        let (consts, cmd_sites) = match interp.const_pool_get(code) {
-            Some((v, s)) => (Some(v), Some(s)),
-            None => {
-                interp.const_pool_insert(code);
-                interp
-                    .const_pool_get(code)
-                    .map(|(v, s)| (Some(v), Some(s)))
-                    .unwrap_or((None, None))
-            }
-        };
-        st.consts = consts;
-        st.cmd_sites = cmd_sites;
+        // Same-unit fast path: the state remembers which unit's literal
+        // slice + call-site table it holds (recursion re-borrows its own
+        // state).  A different unit (or a fresh state) falls to the pool
+        // probe — which also lazily heals eviction (see below).
+        let same = st
+            .consts_code
+            .map(|c| c == code.as_ref() as *const rtcl_parser::ByteCode)
+            .unwrap_or(false);
+        if !same {
+            // The literal pool is capped and cleared on overflow: a unit
+            // whose entry was evicted used to stay evicted forever —
+            // every PushConst re-materialised its literals and every
+            // dispatch took the full resolution chain (the dloop
+            // profile: ~35% dispatch layer).  The caller always holds
+            // the `Rc`, so a miss re-inserts lazily.
+            let (consts, cmd_sites) = match interp.const_pool_get(code) {
+                Some((v, s)) => (Some(v), Some(s)),
+                None => {
+                    interp.const_pool_insert(code);
+                    interp
+                        .const_pool_get(code)
+                        .map(|(v, s)| (Some(v), Some(s)))
+                        .unwrap_or((None, None))
+                }
+            };
+            st.consts = consts;
+            st.cmd_sites = cmd_sites;
+            st.consts_code = Some(code.as_ref() as *const rtcl_parser::ByteCode);
+        }
         let r = exec_inner(interp, code, &mut st);
         interp.vm_pool.give(st);
         r
@@ -483,6 +493,14 @@ struct VmState {
     /// generation/name/namespace mismatch.  Shared `Rc` — every depth
     /// executing this unit uses the one table.
     cmd_sites: Option<Rc<core::cell::RefCell<Vec<(u32, super::CmdSite)>>>>,
+    /// The unit whose consts/cmd_sites are loaded (identity by address,
+    /// `None` = none loaded).  `exec_bytecode` reuses the loaded pair
+    /// when the SAME unit borrows this state again — recursion into one
+    /// proc is exactly that — instead of re-hashing the const pool
+    /// (fib profile: the per-call pool probe was ~7% of the bench).
+    /// Correct regardless of pool residency: the state holds its own
+    /// `Rc`s, so a pool clear never invalidates them.
+    consts_code: Option<*const rtcl_parser::ByteCode>,
     /// Stack base of the current command's `{*}` expansion region.
     expand_base: usize,
     /// Site index of the `BeginCmd` most recently executed.
@@ -501,6 +519,7 @@ impl VmState {
             scratch: Vec::new(),
             consts: None,
             cmd_sites: None,
+            consts_code: None,
             expand_base: 0,
             cur_site: usize::MAX,
             entry_offset,
@@ -563,8 +582,6 @@ impl VmPool {
                 st.cur_site = usize::MAX;
                 st.entry_offset = entry_offset;
                 st.pc = 0;
-                st.consts = None;
-                st.cmd_sites = None;
                 st
             }
             None => Box::new(VmState::new(entry_offset)),
@@ -577,8 +594,9 @@ impl VmPool {
         st.foreaches.clear();
         st.bodies.clear();
         st.scratch.clear();
-        st.consts = None;
-        st.cmd_sites = None;
+        // consts/cmd_sites/consts_code deliberately stay: the next
+        // execution of the SAME unit reuses them without touching the
+        // const pool (the recursion hot path).
         if self.spare.len() < 4 {
             self.spare.push(st);
         }
@@ -1153,7 +1171,8 @@ fn dispatch_site(
                         (
                             (s.gen == interp.cmd_generation
                                 && s.name.as_ref() == name
-                                && s.ns.as_ref() == interp.current_namespace.as_ref())
+                                && (std::rc::Rc::ptr_eq(&s.ns, &interp.current_namespace)
+                                    || s.ns.as_ref() == interp.current_namespace.as_ref()))
                                 .then(|| s.target.clone()),
                             s.def.clone(),
                         )

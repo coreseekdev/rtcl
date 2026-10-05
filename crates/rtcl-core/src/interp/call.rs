@@ -137,11 +137,7 @@ impl Interp {
                         && super::vm_exec::bytecode_applicable(self)
                         && current_statics.is_empty()
                         && !code.locals().is_empty()
-                        && current_params.len() <= code.locals().len()
-                        && current_params
-                            .iter()
-                            .zip(code.locals().iter())
-                            .all(|((n, _), tab)| n == tab) =>
+                        && code.params_aligned == Some(current_params.len()) =>
                 {
                     let table = Rc::clone(code);
                     let n = code.locals().len();

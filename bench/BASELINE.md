@@ -901,3 +901,18 @@ var_incr                 44         34      0.7
 # Bench: oo_bench2 696 -> 638ms (every proc call benefits, OO method
 # bodies included); fib25 54-55 vs 70ms old (1.6x tclsh).  Gates:
 # judge 87/87; sweep 0; tests 1143/0.
+
+# ---------------------------------------------------------------------------
+# G9c 2026-10-06: three per-call constant costs.  (a) VmState remembers
+# the unit whose consts/cmd_sites it holds (identity compare) —
+# recursion re-borrows its own state, so the per-call const-pool hash
+# (~7% of fib) disappears on the hot path; eviction healing unchanged.
+# (b) the E2 slot-gate's param/table alignment moved to COMPILE time
+# (ByteCode::params_aligned, computed where the table is seeded — the
+# runtime gate used to re-verify with a zip walk per call).  (c) the
+# call-site token's namespace check takes an Rc::ptr_eq fast path (the
+# root namespace is one shared Rc).
+#
+# Bench: oo_bench2 638 -> 607ms (1.55x tclsh); fib neutral-to-slightly
+# better (53-55 vs 70ms old).  Gates: judge 87/87; sweep 0; tests
+# 1143/0.

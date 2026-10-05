@@ -105,6 +105,15 @@ pub struct ByteCode {
     /// changing semantics (unusual `if` shapes, `return` options, …).
     /// The consumer must fall back to AST evaluation for the whole unit.
     pub fallback: bool,
+    /// Compile-time verdict of the E2 slot-gate's param/table alignment
+    /// (`Some(params.len())`: every compile-time param was a slot
+    /// candidate and was appended in order — the table's first
+    /// `params.len()` entries ARE the params), `None` otherwise
+    /// (duplicates, non-candidate names, or not a locals-mode unit).
+    /// The runtime gate in `call_proc` re-checked the alignment with a
+    /// zip walk on EVERY call; it is a pure function of the (params,
+    /// table) pair, both fixed at compile time.
+    pub params_aligned: Option<usize>,
     /// This unit was compiled in proc context (locals table active —
     /// `compile_unit_locals`): foreach/lmap inline-fold and braced catch
     /// bodies would inline (tclsh's compiledLocals units).  The executor
@@ -132,6 +141,7 @@ impl Default for ByteCode {
             sites: Vec::new(),
             source: Rc::from(""),
             fallback: false,
+            params_aligned: None,
             locals_mode: false,
             epoch: 0,
         }

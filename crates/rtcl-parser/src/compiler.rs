@@ -129,10 +129,26 @@ impl Compiler {
             locals_mode,
         };
         if locals_mode {
+            // Track the slot-gate's param/table alignment here, where the
+            // seeding happens: every param must be a slot candidate AND
+            // land at the next index in order (duplicates and
+            // non-candidate names break the positional contract the
+            // runtime gate used to re-verify with a zip walk per call).
+            let mut aligned = true;
+            let mut expected = 0usize;
             for p in params {
                 if slot_candidate(p) {
-                    c.bytecode.add_local(p);
+                    let idx = c.bytecode.add_local(p) as usize;
+                    if idx != expected {
+                        aligned = false;
+                    }
+                    expected += 1;
+                } else {
+                    aligned = false;
                 }
+            }
+            if aligned {
+                c.bytecode.params_aligned = Some(params.len());
             }
         }
         c.compile_commands(commands);

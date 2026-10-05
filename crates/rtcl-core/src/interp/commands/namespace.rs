@@ -135,6 +135,50 @@ pub(crate) fn split_var_tail(name: &str) -> &str {
 }
 
 /// `variable ?name ?value? ...?`
+/// Resolve a `variable`-link declaration: (canonical variable key,
+/// parent-namespace part).  A pure string function of (ns, name),
+/// memoised in `var_link_cache` — shared by `cmd_variable` and the OO
+/// method prelink (which installs the same link without dispatching the
+/// command per call).
+pub(crate) fn resolve_var_link(interp: &mut Interp, ns: &str, raw_name: &str) -> (String, String) {
+    const VAR_LINK_CACHE_MAX: usize = 1024;
+    {
+        let memo = interp.var_link_cache.get(ns);
+        if let Some((q, np)) = memo.and_then(|inner| inner.get(raw_name)) {
+            return (q.clone(), np.clone());
+        }
+    }
+    let qualified = if raw_name.is_empty() {
+        if ns == "::" {
+            String::new()
+        } else {
+            var_key(&format!("{}::", ns))
+        }
+    } else {
+        let mut key = var_key(&qualify(ns, raw_name));
+        if raw_name.ends_with(':') && !key.ends_with(':') {
+            key.push_str("::");
+        }
+        key
+    };
+    let ns_part = if raw_name.is_empty() {
+        ns.to_string()
+    } else if raw_name.ends_with("::") {
+        normalise(&format!("::{}", &qualified))
+    } else {
+        parent_of(&normalise(&format!("::{}", &qualified)))
+    };
+    if interp.var_link_cache.len() >= VAR_LINK_CACHE_MAX {
+        interp.var_link_cache.clear();
+    }
+    interp
+        .var_link_cache
+        .entry(ns.to_string())
+        .or_default()
+        .insert(raw_name.to_string(), (qualified.clone(), ns_part.clone()));
+    (qualified, ns_part)
+}
+
 pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         // Bare `variable` is a no-op (var-7.16, var-7.17).
@@ -155,50 +199,7 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // allocated three strings per declaration (profiled: ~25% of an
         // OO method-call bench).  The live checks below (parent exists,
         // variable-set insert, upvar link) stay per-call.
-        let (qualified, ns_part) = {
-            const VAR_LINK_CACHE_MAX: usize = 1024;
-            let cached = interp
-                .var_link_cache
-                .get(ns.as_ref())
-                .and_then(|inner| inner.get(raw_name));
-            match cached {
-                Some((q, np)) => (q.clone(), np.clone()),
-                None => {
-                    let qualified = if raw_name.is_empty() {
-                        if ns.as_ref() == "::" {
-                            String::new()
-                        } else {
-                            var_key(&format!("{}::", ns))
-                        }
-                    } else {
-                        let mut key = var_key(&qualify(&ns, raw_name));
-                        if raw_name.ends_with(':') && !key.ends_with(':') {
-                            key.push_str("::");
-                        }
-                        key
-                    };
-                    // The variable's namespace must exist (`can't define
-                    // "<as-typed>": parent namespace doesn't exist` —
-                    // var-7.7, var-1.11's family).
-                    let ns_part = if raw_name.is_empty() {
-                        ns.to_string()
-                    } else if raw_name.ends_with("::") {
-                        normalise(&format!("::{}", &qualified))
-                    } else {
-                        parent_of(&normalise(&format!("::{}", &qualified)))
-                    };
-                    if interp.var_link_cache.len() >= VAR_LINK_CACHE_MAX {
-                        interp.var_link_cache.clear();
-                    }
-                    interp
-                        .var_link_cache
-                        .entry(ns.as_ref().to_string())
-                        .or_default()
-                        .insert(raw_name.to_string(), (qualified.clone(), ns_part.clone()));
-                    (qualified, ns_part)
-                }
-            }
-        };
+        let (qualified, ns_part) = resolve_var_link(interp, ns.as_ref(), raw_name);
         if ns_part != "::" && !interp.namespaces.contains_key(&ns_part) {
             crate::interp::commands::list::set_error_code(
                 interp,

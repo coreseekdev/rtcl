@@ -77,6 +77,10 @@ impl Interp {
         // Apply's one-shot `info level 0` word (consumed even when the
         // arity check fails, so it can't leak into a later call).
         let level0_override = self.frame_level0_args.take();
+        // The OO dispatcher's one-shot variable links (consumed here for
+        // the same leak reason; installed at frame setup below).
+        let prelink = self.frame_prelink.take();
+        let mut prelink_done = prelink.is_none();
 
         // Push a new call frame (a recycled one when the pool has one —
         // the maps keep their allocation and capacity)
@@ -303,6 +307,45 @@ impl Interp {
             let frame = self.frames.last_mut().unwrap();
             if frame.level0.is_empty() {
                 frame.level0.extend(cur.iter().cloned());
+            }
+
+            // ── OO variable prelink ─────────────────────────────────
+            // The method dispatcher's `variable` declarations installed
+            // here, at frame setup, instead of executing a `variable`
+            // command per name per call.  Consumed once: a tail-call
+            // rebind clears upvars anyway (the loop clears them every
+            // iteration), matching the old prefix-inside-the-body
+            // lifecycle.
+            if !prelink_done {
+                prelink_done = true;
+                let links: &[String] = prelink.as_deref().unwrap_or(&[]);
+                let frame_idx = self.frames.len() - 1;
+                let ns = self.current_namespace.clone();
+                for name in links.iter() {
+                    let (qualified, ns_part) = super::commands::namespace::resolve_var_link(
+                        self,
+                        ns.as_ref(),
+                        name,
+                    );
+                    // The definition namespace always exists (the object
+                    // created it), so the parent-exists check the
+                    // `variable` command performs cannot fail here.
+                    if let Some(info) = self.namespaces.get_mut(&ns_part) {
+                        info.variables.insert(qualified.clone());
+                    }
+                    // The alias name leaves the slot model (link-only
+                    // aliasing — the frame's other slots stay fast).
+                    self.degrade_frame_link(frame_idx, name);
+                    self.frames[frame_idx].upvars.insert(
+                        name.clone(),
+                        crate::interp::UpvarLink::Global(qualified.clone()),
+                    );
+                    // Seed a local copy when the namespace variable
+                    // already holds a value (var-7.12's family).
+                    if let Some(v) = self.globals.get(&qualified).cloned() {
+                        self.frames[frame_idx].locals.insert(name.clone(), v);
+                    }
+                }
             }
 
             // ── Inject static variables into the frame ─────────────

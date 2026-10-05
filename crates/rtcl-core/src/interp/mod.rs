@@ -674,6 +674,15 @@ pub struct Interp {
     /// Next child interpreter ID counter.
     #[cfg(feature = "std")]
     pub(crate) next_interp_id: u64,
+    /// One-shot variable-link list for the next `call_proc` frame: the OO
+    /// method dispatcher hands its owner's `variable` declarations over
+    /// and `call_proc` installs the links at frame setup — the same
+    /// triple the `variable` command performs (alias entry, per-name slot
+    /// aliasing, seed-if-exists), minus a dispatched command per variable
+    /// per call.  Prefix errors are unreachable: declaration names are
+    /// validated by the `variable` define word and object namespaces
+    /// always exist.
+    pub(crate) frame_prelink: Option<Vec<String>>,
     /// One-shot level-0 word override for the next `call_proc` frame
     /// (`apply` renders `info level 0` as `apply {<term>} <args...>`,
     /// which the plain arg-list form can't express).
@@ -809,6 +818,7 @@ impl Interp {
             #[cfg(feature = "std")]
             next_interp_id: 1,
             frame_level0_args: None,
+            frame_prelink: None,
             oo: commands::oo::OoState::default(),
             #[cfg(feature = "io")]
             reflected: HashMap::new(),

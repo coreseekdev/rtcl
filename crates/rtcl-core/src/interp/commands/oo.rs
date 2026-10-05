@@ -744,12 +744,16 @@ fn exec_chain_entry(
             // call — two full-body String copies plus the bytecode
             // cache's full-text probe inside call_proc's eval (and no
             // compiled form at all, so the body ran tree-walked).  The
-            // assembled body is a pure function of (def, invoked method
-            // name, the owner's `variable` list) — all memoised on the
-            // MethodDef, a `variable` change rebuilding via the
-            // snapshot compare.
-            let proc_def: Rc<ProcDef> =
+            // body is `def.body` verbatim; the owner's `variable`
+            // declarations ride frame_prelink into call_proc's frame
+            // setup (the same link, without dispatching a `variable`
+            // command per name per call).  Memoised on the MethodDef;
+            // a `variable` change rebuilds via the snapshot compare.
+            let (proc_def, links) =
                 memoised_proc_def(interp, &entry.owner, key, &entry.def, method);
+            if !links.is_empty() {
+                interp.frame_prelink = Some(links);
+            }
 
             let mut args: Vec<Value> =
                 vec![Value::from_str(typed), Value::from_str(method)];
@@ -829,34 +833,33 @@ fn memoised_proc_def(
     key: &str,
     def: &MethodDef,
     method: &str,
-) -> Rc<ProcDef> {
+) -> (Rc<ProcDef>, Vec<String>) {
+    // The link list: the owner's declared variables minus the names the
+    // parameter list already binds (the old `link_prefix` filter — the
+    // prefix text itself is gone; the links install at frame setup).
+    let links: Vec<String> = {
+        let vars = owner_variables(interp, owner, key);
+        let names: Vec<&str> = def.params.iter().map(|(p, _)| p.as_str()).collect();
+        vars.iter()
+            .filter(|v| !names.contains(&v.as_str()))
+            .cloned()
+            .collect()
+    };
     {
         let vars = owner_variables(interp, owner, key);
         let memo = def.proc_memo.borrow();
         if let Some((n, vs, d)) = memo.as_ref() {
             if n == method && vs.as_slice() == vars {
-                return Rc::clone(d);
+                return (Rc::clone(d), links);
             }
         }
     }
-    // The prefix is non-empty whenever vars survive the param filter, so an
-    // empty buffer means "no prefix" — `&def.body` is then the assembled
-    // body verbatim.
-    let mut body_buf = String::new();
-    {
-        let vars = owner_variables(interp, owner, key);
-        if !vars.is_empty() {
-            body_buf = link_prefix(vars, &def.params);
-            body_buf.push_str(&def.body);
-        }
-    }
-    let body: &str = if body_buf.is_empty() { &def.body } else { &body_buf };
-    let mut pd = method_proc_def(body, &def.params, method);
+    let mut pd = method_proc_def(&def.body, &def.params, method);
     // Compile at the same seam named `proc`s use; the compiled form also
     // unlocks call_proc's slot-locals binding (empty statics, params
     // seeded in order — the synthetic name first, by construction).
     let compiled =
-        super::super::vm_exec::compile_proc_body(&pd.params, body, interp.tier1_epoch);
+        super::super::vm_exec::compile_proc_body(&pd.params, &def.body, interp.tier1_epoch);
     if let Some(code) = &compiled {
         interp.const_pool_insert(code);
     }
@@ -864,7 +867,7 @@ fn memoised_proc_def(
     let proc_def = Rc::new(pd);
     let snapshot = owner_variables(interp, owner, key).to_vec();
     *def.proc_memo.borrow_mut() = Some((method.to_string(), snapshot, Rc::clone(&proc_def)));
-    proc_def
+    (proc_def, links)
 }
 
 fn object_ns_of(interp: &Interp, key: &str) -> String {

@@ -916,3 +916,23 @@ var_incr                 44         34      0.7
 # Bench: oo_bench2 638 -> 607ms (1.55x tclsh); fib neutral-to-slightly
 # better (53-55 vs 70ms old).  Gates: judge 87/87; sweep 0; tests
 # 1143/0.
+
+# ---------------------------------------------------------------------------
+# G9d 2026-10-06: the OO variable prelink.  The vars-method profile's
+# remaining cmd_variable share (12.9%) was the dispatched `variable`
+# command per name per call — the link prefix in the assembled body.
+# The prefix text is GONE: memoised_proc_def now returns the link list
+# (owner vars minus param-bound names), exec_chain_entry hands it to
+# call_proc via frame_prelink, and frame setup installs the exact same
+# triple cmd_variable performs (namespace variable-set insert, link-only
+# slot aliasing, upvar entry, seed-if-exists) via the shared
+# resolve_var_link memo.  Unreachable-error note: declaration names are
+# validated by the define word and object namespaces always exist, so
+# the parent-exists check cannot fail on this path.  Consumed once per
+# call (taken after the recursion guard — no leak into unrelated
+# calls), and the tailcall loop's upvar clear matches the old
+# prefix-inside-the-body lifecycle.
+#
+# Bench: oo_vars 1281 -> 1209ms (2.87x tclsh); oo_bench2 within noise.
+# Gates: judge 87/87; sweep 0; tests 1143/0; all 8 var/OO probes
+# byte-exact vs tclsh 8.6.17.

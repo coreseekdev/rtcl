@@ -5,12 +5,21 @@
 //!
 //! # Memory model
 //!
-//! Values are reference-counted (`Rc<ValueInner>`) with copy-on-write
-//! semantics, mirroring jimtcl's `refCount` / `Jim_DuplicateObj()` model.
+//! Values are reference-counted (`VPtr`, a hand-rolled `Rc<ValueInner>`)
+//! with copy-on-write semantics, mirroring jimtcl's `refCount` /
+//! `Jim_DuplicateObj()` model.
 //!
 //! - `Value::clone()` is O(1) — simply increments the reference count.
-//! - Mutation (e.g. list append) uses `Rc::make_mut()`, which deep-copies
-//!   only when the value is shared (`strong_count > 1`).
+//! - Mutation (e.g. list append) uses `VPtr::make_mut()`, which
+//!   deep-copies only when the value is shared (`strong_count > 1`).
+//! - The boxes come from a thread-local free list (jimtcl's free-list
+//!   pointers, which the original Rust port dropped in favour of the
+//!   allocator): a value whose last reference dies pushes its box back,
+//!   and the next value to be born reuses it.  After the interpreter's
+//!   working set is warm, per-value malloc/free traffic — the allocator
+//!   share the fib/fe_bench profiles kept showing — goes away; the
+//!   PAYLOADS (string buffers, list/dict vecs) are still dropped and
+//!   re-allocated normally.
 //! - Structured data (lists, dicts) are cached inside `InternalRep` to
 //!   avoid repeated string parse / serialize round-trips.
 //! - The string representation is lazily generated: after mutating the
@@ -19,9 +28,10 @@
 
 use core::fmt;
 use core::str::FromStr;
-use std::cell::OnceCell;
-use std::rc::Rc;
+use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
+use std::ops::Deref;
+use std::ptr::NonNull;
 
 use indexmap::IndexMap;
 use smallvec::SmallVec;
@@ -299,7 +309,7 @@ impl<'a> Iterator for DictValues<'a> {
 ///
 /// Corresponds to jimtcl's `Jim_Obj` minus the free-list pointers —
 /// Rust's allocator handles recycling.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ValueInner {
     /// String representation — lazily materialized via `OnceCell`.
     /// Empty cell means it will be generated on first `as_str()` access
@@ -307,6 +317,136 @@ struct ValueInner {
     string: OnceCell<SmallVec<[u8; INLINE_SIZE]>>,
     /// Cached typed representation.
     rep: InternalRep,
+    /// Reference count (jimtcl's `refCount`).  Owned by [`VPtr`]; a
+    /// cloned payload always starts at 1 (the clone owns its box).
+    rc: Cell<usize>,
+}
+
+impl Clone for ValueInner {
+    fn clone(&self) -> Self {
+        ValueInner {
+            string: self.string.clone(),
+            rep: self.rep.clone(),
+            rc: Cell::new(1),
+        }
+    }
+}
+
+// ── the recycled reference-counted box ────────────────────────
+
+/// Recycled-box reference-counted pointer to a [`ValueInner`] — a
+/// hand-rolled `Rc` whose dead boxes go to a thread-local free list
+/// instead of the allocator (jimtcl's free-list pointers).  The pointer
+/// is the SAME 8 bytes an `Rc` was, so [`Value`]'s layout is unchanged;
+/// `clone`/`drop`/`make_mut`/`strong_count`/`ptr_eq` reproduce the `Rc`
+/// semantics exactly, and `Deref` keeps every accessor working
+/// unchanged.  Deliberately `!Send`/`!Sync` (as `Rc` was): a value never
+/// crosses threads.
+struct VPtr(NonNull<ValueInner>);
+
+/// Recycled-box cap.  Beyond this the box is genuinely freed; 8192
+/// boxes ≈ 0.6MB of hot ValueInner memory.
+const FREELIST_CAP: usize = 8192;
+
+thread_local! {
+    static FREELIST: std::cell::RefCell<Vec<NonNull<ValueInner>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl VPtr {
+    fn new(inner: ValueInner) -> VPtr {
+        let recycled = FREELIST.try_with(|fl| fl.borrow_mut().pop());
+        match recycled {
+            Ok(Some(ptr)) => {
+                // The box's payload was dropped when it was recycled; the
+                // memory itself is still a live allocation.
+                unsafe { std::ptr::write(ptr.as_ptr(), inner) };
+                VPtr(ptr)
+            }
+            _ => VPtr(NonNull::from(Box::leak(Box::new(inner)))),
+        }
+    }
+
+    fn make_mut(this: &mut VPtr) -> &mut ValueInner {
+        unsafe {
+            let p = this.0.as_ptr();
+            if (*p).rc.get() > 1 {
+                let cloned = (*p).clone(); // payload deep-copy, rc starts at 1
+                *this = VPtr::new(cloned); // drops our share of the old box
+                &mut *this.0.as_ptr()
+            } else {
+                &mut *p
+            }
+        }
+    }
+
+    fn ptr_eq(a: &VPtr, b: &VPtr) -> bool {
+        a.0 == b.0
+    }
+
+    fn strong_count(this: &VPtr) -> usize {
+        unsafe { (*this.0.as_ptr()).rc.get() }
+    }
+}
+
+impl Clone for VPtr {
+    fn clone(&self) -> Self {
+        unsafe {
+            let p = self.0.as_ptr();
+            (*p).rc.set((*p).rc.get() + 1);
+        }
+        VPtr(self.0)
+    }
+}
+
+impl Drop for VPtr {
+    fn drop(&mut self) {
+        unsafe {
+            let p = self.0.as_ptr();
+            let n = (*p).rc.get();
+            if n > 1 {
+                (*p).rc.set(n - 1);
+                return;
+            }
+            // Last owner: free the payload (string buffer, list/dict
+            // vecs), then recycle the box itself.
+            std::ptr::drop_in_place(p);
+            let pushed = FREELIST.try_with(|fl| {
+                let mut fl = fl.borrow_mut();
+                if fl.len() < FREELIST_CAP {
+                    fl.push(self.0);
+                    true
+                } else {
+                    false
+                }
+            });
+            if pushed != Ok(true) {
+                // Freelist full — or already torn down at thread exit
+                // (try_with fails there): free the BOX for real.  The
+                // payload was already dropped above, so this must be a
+                // bare dealloc — `drop(Box::from_raw(p))` would run
+                // drop_in_place a SECOND time (the double-free the
+                // gen_dict corpus caught at the freelist-cap threshold).
+                std::alloc::dealloc(
+                    p.cast::<u8>(),
+                    std::alloc::Layout::new::<ValueInner>(),
+                );
+            }
+        }
+    }
+}
+
+impl Deref for VPtr {
+    type Target = ValueInner;
+    fn deref(&self) -> &ValueInner {
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl fmt::Debug for VPtr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
 }
 
 /// A Tcl value - "everything is a string"
@@ -315,7 +455,7 @@ struct ValueInner {
 /// Mutation triggers copy-on-write when the value is shared.
 #[derive(Debug, Clone)]
 pub struct Value {
-    inner: Rc<ValueInner>,
+    inner: VPtr,
 }
 
 // ── Cached singletons ──────────────────────────────────────────
@@ -333,29 +473,33 @@ const SMALL_INT_CACHE_SIZE: usize = 256;
 const INT_CACHE_MIN: i64 = -128;
 
 thread_local! {
-    static CACHED_EMPTY: Rc<ValueInner> = Rc::new(ValueInner {
+    static CACHED_EMPTY: VPtr = VPtr::new(ValueInner {
         string: OnceCell::from(SmallVec::new()),
         rep: InternalRep::None,
+        rc: Cell::new(1),
     });
 
-    static CACHED_BOOL_TRUE: Rc<ValueInner> = Rc::new(ValueInner {
+    static CACHED_BOOL_TRUE: VPtr = VPtr::new(ValueInner {
         string: OnceCell::from(SmallVec::from_slice(b"1")),
         rep: InternalRep::Bool(true),
+        rc: Cell::new(1),
     });
 
-    static CACHED_BOOL_FALSE: Rc<ValueInner> = Rc::new(ValueInner {
+    static CACHED_BOOL_FALSE: VPtr = VPtr::new(ValueInner {
         string: OnceCell::from(SmallVec::from_slice(b"0")),
         rep: InternalRep::Bool(false),
+        rc: Cell::new(1),
     });
 
     /// Cached small integers [-128, 256) — covers loop counters, return
     /// codes, list indices, most Tcl numeric constants, and the negative
     /// step operands of decrementing loops.
-    static CACHED_INTS: Vec<Rc<ValueInner>> = (INT_CACHE_MIN..SMALL_INT_CACHE_SIZE as i64)
+    static CACHED_INTS: Vec<VPtr> = (INT_CACHE_MIN..SMALL_INT_CACHE_SIZE as i64)
         .map(|n| {
-            Rc::new(ValueInner {
+            VPtr::new(ValueInner {
                 string: OnceCell::from(SmallVec::from_slice(format_int(n).as_bytes())),
                 rep: InternalRep::Int(n),
+                rc: Cell::new(1),
             })
         })
         .collect();
@@ -371,7 +515,7 @@ impl Value {
     /// Create an empty value
     pub fn empty() -> Self {
         Value {
-            inner: CACHED_EMPTY.with(Rc::clone),
+            inner: CACHED_EMPTY.with(VPtr::clone),
         }
     }
 
@@ -379,9 +523,10 @@ impl Value {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         Value {
-            inner: Rc::new(ValueInner {
+            inner: VPtr::new(ValueInner {
                 string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
                 rep: InternalRep::None,
+                rc: Cell::new(1),
             }),
         }
     }
@@ -392,15 +537,16 @@ impl Value {
         // included — `-1` sits in every decrementing loop).
         if n >= INT_CACHE_MIN && n < SMALL_INT_CACHE_SIZE as i64 {
             return CACHED_INTS.with(|ints| Value {
-                inner: Rc::clone(&ints[(n - INT_CACHE_MIN) as usize]),
+                inner: VPtr::clone(&ints[(n - INT_CACHE_MIN) as usize]),
             });
         }
         // Lazy string (tclsh: an object born with an int rep carries no
         // string until demanded) — the loop-counter case renders never.
         Value {
-            inner: Rc::new(ValueInner {
+            inner: VPtr::new(ValueInner {
                 string: OnceCell::new(),
                 rep: InternalRep::Int(n),
+                rc: Cell::new(1),
             }),
         }
     }
@@ -408,9 +554,10 @@ impl Value {
     /// Create a value from a float
     pub fn from_float(n: f64) -> Self {
         Value {
-            inner: Rc::new(ValueInner {
+            inner: VPtr::new(ValueInner {
                 string: OnceCell::new(),
                 rep: InternalRep::Float(n),
+                rc: Cell::new(1),
             }),
         }
     }
@@ -419,9 +566,9 @@ impl Value {
     pub fn from_bool(b: bool) -> Self {
         Value {
             inner: if b {
-                CACHED_BOOL_TRUE.with(Rc::clone)
+                CACHED_BOOL_TRUE.with(VPtr::clone)
             } else {
-                CACHED_BOOL_FALSE.with(Rc::clone)
+                CACHED_BOOL_FALSE.with(VPtr::clone)
             },
         }
     }
@@ -433,9 +580,10 @@ impl Value {
     /// accessed structurally (e.g. `lindex`, `lappend`).
     pub fn from_list_cached(items: Vec<Value>) -> Self {
         Value {
-            inner: Rc::new(ValueInner {
+            inner: VPtr::new(ValueInner {
                 string: OnceCell::new(), // lazy — generated on first as_str()
                 rep: InternalRep::List(items),
+                rc: Cell::new(1),
             }),
         }
     }
@@ -445,9 +593,10 @@ impl Value {
     /// The string representation is lazily generated on first `as_str()`.
     pub fn from_dict_cached(entries: DictMap) -> Self {
         Value {
-            inner: Rc::new(ValueInner {
+            inner: VPtr::new(ValueInner {
                 string: OnceCell::new(),
                 rep: InternalRep::Dict(entries),
+                rc: Cell::new(1),
             }),
         }
     }
@@ -459,9 +608,10 @@ impl Value {
             map.insert(k.as_str().to_string(), v.clone());
         }
         Value {
-            inner: Rc::new(ValueInner {
+            inner: VPtr::new(ValueInner {
                 string: OnceCell::new(),
                 rep: InternalRep::Dict(DictMap::Ordered(map)),
+                rc: Cell::new(1),
             }),
         }
     }
@@ -665,7 +815,7 @@ impl Value {
         if !matches!(&self.inner.rep, InternalRep::Dict(_)) {
             return None;
         }
-        let inner = Rc::make_mut(&mut self.inner);
+        let inner = VPtr::make_mut(&mut self.inner);
         inner.string = OnceCell::new(); // invalidate string
         match &mut inner.rep {
             InternalRep::Dict(map) => Some(map),
@@ -682,7 +832,7 @@ impl Value {
         if !matches!(&self.inner.rep, InternalRep::List(_)) {
             return None;
         }
-        let inner = Rc::make_mut(&mut self.inner);
+        let inner = VPtr::make_mut(&mut self.inner);
         inner.string = OnceCell::new(); // invalidate string
         match &mut inner.rep {
             InternalRep::List(items) => Some(items),
@@ -694,7 +844,7 @@ impl Value {
     /// tclsh's TclIncrObj on a refcnt==1 object: no allocation, and the
     /// cached string rendering is dropped instead of eagerly rebuilt.
     pub fn set_int_rep(&mut self, n: i64) {
-        let inner = Rc::make_mut(&mut self.inner);
+        let inner = VPtr::make_mut(&mut self.inner);
         inner.rep = InternalRep::Int(n);
         inner.string = OnceCell::new(); // invalidate string
     }
@@ -707,7 +857,7 @@ impl Value {
     /// value rebuilt from text compares different even when the text
     /// matches, so a stale memo can never be hit through a look-alike.
     pub fn same_allocation(&self, other: &Value) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
+        VPtr::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Parse or return a dict as an owned DictMap.
@@ -853,7 +1003,7 @@ impl Value {
     ///
     /// Equivalent to jimtcl's `Jim_IsShared()`.
     pub fn is_shared(&self) -> bool {
-        Rc::strong_count(&self.inner) > 1
+        VPtr::strong_count(&self.inner) > 1
     }
 }
 

@@ -849,3 +849,39 @@ var_incr                 44         34      0.7
 # tclsh); oo_bench2 688 -> 659; fib/fe unchanged.
 # Gates: judge 87/87; sweep 0; tests 1143/0; feature matrix green
 # (spot: no-default + wasm32).
+
+# ---------------------------------------------------------------------------
+# G9 2026-10-06: VPtr — the free-list is back.  jimtcl's Jim_Obj carries
+# free-list pointers (the Rust port's comment explicitly dropped them in
+# favour of the allocator); the fib/fe/dloop profiles kept showing the
+# allocator's share (~10-25%: Rc::new + drop glue + tcache paths) for a
+# value population that is overwhelmingly create-consume-drop within one
+# interpreter step.  Value now holds VPtr, a hand-rolled Rc<ValueInner>
+# whose dead boxes go to a thread-local free list (cap 8192 boxes):
+# clone/drop/make_mut/strong_count/ptr_eq reproduce the Rc semantics,
+# Deref keeps every accessor, Value stays 8 bytes, !Send/!Sync as Rc
+# was — the change is fully contained in rtcl-vm/src/value.rs (the only
+# file touching ValueInner; make_mut/strong_count had no callers
+# outside).  Payloads (string buffers, list/dict vecs) still drop
+# normally; only the BOX recycles.
+#
+# BUG the judge caught mid-round (and the process lesson): the worktree
+# judge had been running a STALE binary all day — judge/sweep "87/87"
+# verdicts for G8c..G8g were the Oct-5 G8 binary passing (the rsync
+# excludes target/).  The freshly-synced binary failed gen/gen_dict
+# + gen/gen_obj with SIGSEGV: VPtr::drop freed the payload with
+# drop_in_place and then, on the freelist-full path, did
+# drop(Box::from_raw(p)) — Box's own drop ran drop_in_place a SECOND
+# time.  Double free, firing only above the 8192-box cap (the 10000-
+# element dict-24.2x corpus cases), which is why every in-process test
+# (small populations) stayed green.  Fix: bare
+# alloc::dealloc with the ValueInner layout.  Worktree discipline is
+# now: rsync sources, cp target/release/rtcl into the worktree, then
+# judge.
+#
+# Bench: fib25 58 -> 51ms/run (gap 1.6x -> 1.42x); dloop 343 -> 324
+# (1.42x -> 1.34x); fe_bench 88 -> 82 (2.9x -> 2.65x); oo_vars 1407 ->
+# 1281 (3.3x -> 3.0x); oo_bench2 ~flat (load noise).  Memory: churn
+# test RSS stable (freelist cap bounds retention at ~0.6MB).  Gates:
+# judge 87/87 (real binary); sweep 0; tests 1143/0; probes oo18/19/20
+# byte-exact.

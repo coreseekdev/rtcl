@@ -1145,17 +1145,20 @@ fn dispatch_site(
     if interp.exec_traces.is_empty() {
         if let Some(slots) = st.cmd_sites.clone() {
             let name = st.scratch[0].as_str();
-            let hit = {
+            let (hit, site_def) = {
                 let slots = slots.borrow();
                 match slots.binary_search_by_key(&pc, |(p, _)| *p) {
                     Ok(i) => {
                         let s = &slots[i].1;
-                        (s.gen == interp.cmd_generation
-                            && s.name.as_ref() == name
-                            && s.ns.as_ref() == interp.current_namespace.as_ref())
-                            .then(|| s.target.clone())
+                        (
+                            (s.gen == interp.cmd_generation
+                                && s.name.as_ref() == name
+                                && s.ns.as_ref() == interp.current_namespace.as_ref())
+                                .then(|| s.target.clone()),
+                            s.def.clone(),
+                        )
                     }
-                    Err(_) => None,
+                    Err(_) => (None, None),
                 }
             };
             match hit {
@@ -1170,8 +1173,17 @@ fn dispatch_site(
                     return interp.fill_wrong_args(name, r);
                 }
                 Some(super::ResolvedCmd::Proc(key)) => {
-                    // The def is re-fetched per call (statics write-back
-                    // replaces the map entry) — one probe, always fresh.
+                    // The def rides the token: every `procs` mutation —
+                    // the statics write-backs included, which was the one
+                    // unbumped gap — increments `cmd_generation`, and this
+                    // site's gen check already ran above, so the carried
+                    // def IS the live map entry.
+                    if let Some(def) = site_def {
+                        interp.err_code_raised = false;
+                        return interp.call_proc(&def, &st.scratch, &key, None);
+                    }
+                    // A token from the pre-def transition window: fetch
+                    // once, and the next backfill rewrites the slot.
                     if let Some(def) = interp.procs.get(key.as_ref()).cloned() {
                         interp.err_code_raised = false;
                         return interp.call_proc(&def, &st.scratch, &key, None);
@@ -1187,12 +1199,19 @@ fn dispatch_site(
     // (proc/builtin wins only — matching cmd_cache's policy).
     if interp.exec_traces.is_empty() {
         if let Some(target) = interp.cmd_cache_get(name) {
+            // A proc verdict carries its def: the probe runs on the miss
+            // path only (cold), while every hit skips it forever.
+            let def = match &target {
+                super::ResolvedCmd::Proc(key) => interp.procs.get(key.as_ref()).cloned(),
+                _ => None,
+            };
             if let Some(slots) = &st.cmd_sites {
                 let site = super::CmdSite {
                     gen: interp.cmd_generation,
                     name: Rc::from(name),
                     ns: Rc::clone(&interp.current_namespace),
                     target,
+                    def,
                 };
                 let mut v = slots.borrow_mut();
                 match v.binary_search_by_key(&pc, |(p, _)| *p) {

@@ -121,11 +121,12 @@ pub(crate) enum ResolvedCmd {
     /// matter — the cached outcome is "call this fn".
     Builtin(CommandFunc),
     /// A proc won, registered under `key` — tclsh's command token.  The
-    /// def is NOT cached: `call_proc`'s statics write-back replaces the
-    /// map entry via `Rc::make_mut` (the cached handle would go stale),
-    /// so a hit re-fetches `procs[key]` — one probe, always-fresh def.
-    /// The name doubles as what `call_proc` reports in frames
-    /// (`(procedure "key")`).
+    /// def is NOT cached here (unlike the call-site token, whose
+    /// generation check now covers the statics write-back bump): the
+    /// resolution cache outlives many generations of nothing in
+    /// particular and `call_proc`'s per-hit re-fetch of `procs[key]` is
+    /// one probe.  The name doubles as what `call_proc` reports in
+    /// frames (`(procedure "key")`).
     Proc(Rc<str>),
 }
 
@@ -294,6 +295,15 @@ pub(crate) struct CmdSite {
     /// Namespace the resolution ran under (`cmd_cache`'s outer key).
     pub ns: Rc<str>,
     pub target: ResolvedCmd,
+    /// The proc def when `target` is `Proc` — the token hands the def
+    /// straight to `call_proc`, skipping the per-call `procs[key]`
+    /// probe (fib profile: hash + key compare + find ≈ 14% of the
+    /// whole bench).  Validity: every `procs` mutation bumps
+    /// `cmd_generation` — INCLUDING the statics write-backs, which
+    /// replace the map entry (bumped as of this token's introduction;
+    /// that was the one unbumped mutation and the reason the def
+    /// couldn't ride the token before).
+    pub def: Option<Rc<ProcDef>>,
 }
 
 /// One live `array startsearch` iteration over an array's element names.

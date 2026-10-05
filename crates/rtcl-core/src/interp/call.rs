@@ -378,6 +378,11 @@ impl Interp {
                         }
                         if let Some(pdef) = self.procs.get_mut(current_proc_name.as_ref()) {
                             Rc::make_mut(pdef).statics = Rc::new(current_statics.clone());
+                            // The map entry was replaced: age every
+                            // call-site token / resolution-cache entry
+                            // holding a def clone.  Statics-bearing procs
+                            // are never hot-loop material — one u64 bump.
+                            self.note_cmd_mutation();
                         }
                         current_statics = HashMap::new();
                     }
@@ -470,6 +475,9 @@ impl Interp {
                 }
                 if let Some(pdef) = self.procs.get_mut(current_proc_name.as_ref()) {
                     Rc::make_mut(pdef).statics = Rc::new(updated);
+                    // See the tail-call write-back: the entry was
+                    // replaced, so cached def handles must age out.
+                    self.note_cmd_mutation();
                 }
             }
         }

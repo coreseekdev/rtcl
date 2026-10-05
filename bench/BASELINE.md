@@ -885,3 +885,19 @@ var_incr                 44         34      0.7
 # test RSS stable (freelist cap bounds retention at ~0.6MB).  Gates:
 # judge 87/87 (real binary); sweep 0; tests 1143/0; probes oo18/19/20
 # byte-exact.
+
+# ---------------------------------------------------------------------------
+# G9b 2026-10-06: the call-site token carries the proc def.  The fib
+# profile at G9 showed the per-call `procs[key]` re-fetch at ~14%
+# inclusive (hash + key compare + find_inner) — the token stored the key
+# but re-resolved the def every call because the statics write-back
+# replaced the map entry WITHOUT bumping cmd_generation (the one
+# unbumped `procs` mutation).  Both write-backs now bump (one u64 per
+# write-back — statics-bearing procs are never hot-loop material), and
+# CmdSite gains `def: Option<Rc<ProcDef>>`: a proc verdict rides the
+# token straight into call_proc, the probe runs on the cold backfill
+# path only.
+#
+# Bench: oo_bench2 696 -> 638ms (every proc call benefits, OO method
+# bodies included); fib25 54-55 vs 70ms old (1.6x tclsh).  Gates:
+# judge 87/87; sweep 0; tests 1143/0.

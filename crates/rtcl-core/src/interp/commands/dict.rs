@@ -203,18 +203,18 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // back.  Amortised O(1); multi-key nesting, creation,
             // string-rep sources, links and traced variables keep the
             // rebuilding path below.
-            if args.len() == 5
-                && interp
-                    .get_var(var_name)
-                    .is_ok_and(|v| v.as_dict_ref().is_some())
-            {
+            if args.len() == 5 {
+                // take_var_fast owns every guard (as in lappend) — the
+                // old get_var pre-probe cost a full extra resolution per
+                // set; a non-dict rep is restored and the slow path
+                // parses it.
                 if let Some(mut v) = interp.take_var_fast(var_name) {
                     if let Some(map) = v.as_dict_mut() {
                         map.insert(args[3].as_str().to_string(), args[4].clone());
                         return interp.set_var(var_name, v);
                     }
-                    // Unreachable (rep checked before the take); restore
-                    // raw and rebuild through the slow path.
+                    // Not a dict rep: restore raw and rebuild through the
+                    // slow path (parse_dict owns the same errors).
                     interp.store_var(var_name, v);
                 }
             }

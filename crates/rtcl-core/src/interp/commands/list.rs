@@ -229,11 +229,11 @@ pub fn cmd_lappend(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Amortised O(1); tclsh appends to the unshared list object the
     // same way.  Creation, string-rep sources, links, arrays and
     // traced variables keep the rebuilding path below.
-    if args.len() >= 3
-        && interp
-            .get_var(var_name)
-            .is_ok_and(|v| v.as_list_ref().is_some())
-    {
+    if args.len() >= 3 {
+        // take_var_fast owns every guard (links, arrays, traces, ns
+        // qualifiers) and the old get_var pre-probe cost a full extra
+        // resolution per append; a non-list rep is restored and the slow
+        // path parses it, exactly as before.
         if let Some(mut v) = interp.take_var_fast(var_name) {
             if let Some(items) = v.as_list_mut() {
                 for arg in &args[2..] {
@@ -241,8 +241,8 @@ pub fn cmd_lappend(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 return interp.set_var(var_name, v);
             }
-            // Unreachable (rep checked before the take); restore raw
-            // and rebuild through the slow path.
+            // Not a list rep: restore raw and rebuild through the slow
+            // path (the strict parse below owns the same errors).
             interp.store_var(var_name, v);
         }
     }

@@ -541,7 +541,16 @@ impl Interp {
         if let Some(link) = self.frames[frame_idx].upvars.get(name).cloned() {
             match link {
                 UpvarLink::Global(gname) => {
-                    self.globals.insert(self.redirect_flat(gname), value);
+                    // A link write lands on the SAME global every time:
+                    // probe in place first (one hash, no key churn) — the
+                    // unconditional insert dropped and re-stored the key
+                    // String per write.
+                    let key = self.redirect_flat(gname);
+                    if let Some(slot) = self.globals.get_mut(&key) {
+                        *slot = value;
+                    } else {
+                        self.globals.insert(key, value);
+                    }
                 }
                 UpvarLink::Frame { frame_index, var_name } => {
                     if let Some(f) = self.frames.get_mut(frame_index) {

@@ -936,3 +936,18 @@ var_incr                 44         34      0.7
 # Bench: oo_vars 1281 -> 1209ms (2.87x tclsh); oo_bench2 within noise.
 # Gates: judge 87/87; sweep 0; tests 1143/0; all 8 var/OO probes
 # byte-exact vs tclsh 8.6.17.
+
+# ---------------------------------------------------------------------------
+# G9e 2026-10-06 (NEGATIVE RESULT, reverted): fused slot-arithmetic
+# superinstructions.  The peephole window [LoadLocal, LoadLocal, Add,
+# StoreLocal] -> AddSlotSlot never fires in real Tcl: the accumulator
+# pattern is always `set s [expr {$s + $i}]`, and the bracket word
+# compiles to SubMark .. SubEnd AROUND the inner expr ops — the
+# markers are the error-framing regions (they defer the outer `set`
+# command's errorInfo frame exactly like the tree-walk's CommandSub
+# boundary), so the four ops are never adjacent and removing them
+# would change error attribution.  Where the window could fire, the
+# bench showed nothing (fe/fib flat; a 3M-iteration micro was within
+# noise).  Reverted before commit; the negative result is the
+# record — the remaining fe_bench gap lives in per-op bookkeeping and
+# value lifecycle, not in op fusion.

@@ -388,6 +388,16 @@ pub struct Interp {
     /// Number of inner entries across `cmd_cache` (cheap overflow check;
     /// the cap keeps the clear-on-overflow amortised).
     pub(crate) cmd_cache_len: usize,
+    /// `variable`-link resolution memo: current namespace → declared name →
+    /// (canonical variable key, parent-namespace part).  The resolution is
+    /// a pure string function of (ns, name) — a hot loop's `variable acc;`
+    /// re-ran `qualify`/`normalise`/`parent_of` (three allocations) on
+    /// every call, ~25% of an OO method-call benchmark whose bodies carry
+    /// the link prefix.  The LIVE checks around it (parent exists, the
+    /// owning namespace's variable-set insert, the per-frame upvar link)
+    /// stay per-call.  No invalidation is needed; bounded like the other
+    /// caches (wasm32 is a target).
+    pub(crate) var_link_cache: VarMap<VarMap<(String, String)>>,
     /// Command-table generation: bumped at every command-table mutation.
     pub(crate) cmd_generation: u64,
     /// Parse-tree cache: script text → AST (with the source text the
@@ -726,6 +736,7 @@ impl Interp {
             cmd_cache: VarMap::default(),
             cmd_cache_root: VarMap::default(),
             cmd_cache_len: 0,
+            var_link_cache: VarMap::default(),
             cmd_generation: 0,
             parse_cache: HashMap::new(),
             bytecode_cache: HashMap::new(),

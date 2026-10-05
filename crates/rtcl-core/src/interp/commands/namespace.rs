@@ -148,29 +148,56 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // Flat key: normalise collapses colon runs, but a TRAILING run
         // names the empty variable in that namespace, so it is restored
         // (`variable test_ns_var::` declares test_ns_var's "" variable —
-        // var-7.12; `variable :` is a plain name — var-7.13).
-        let qualified = if raw_name.is_empty() {
-            if ns.as_ref() == "::" {
-                String::new()
-            } else {
-                var_key(&format!("{}::", ns))
+        // var-7.12; `variable :` is a plain name — var-7.13).  The
+        // resolution is a pure string function of (ns, name): memoised in
+        // `var_link_cache` — a hot method body re-declares its `variable`
+        // links on every call, and the qualified-key + parent computation
+        // allocated three strings per declaration (profiled: ~25% of an
+        // OO method-call bench).  The live checks below (parent exists,
+        // variable-set insert, upvar link) stay per-call.
+        let (qualified, ns_part) = {
+            const VAR_LINK_CACHE_MAX: usize = 1024;
+            let cached = interp
+                .var_link_cache
+                .get(ns.as_ref())
+                .and_then(|inner| inner.get(raw_name));
+            match cached {
+                Some((q, np)) => (q.clone(), np.clone()),
+                None => {
+                    let qualified = if raw_name.is_empty() {
+                        if ns.as_ref() == "::" {
+                            String::new()
+                        } else {
+                            var_key(&format!("{}::", ns))
+                        }
+                    } else {
+                        let mut key = var_key(&qualify(&ns, raw_name));
+                        if raw_name.ends_with(':') && !key.ends_with(':') {
+                            key.push_str("::");
+                        }
+                        key
+                    };
+                    // The variable's namespace must exist (`can't define
+                    // "<as-typed>": parent namespace doesn't exist` —
+                    // var-7.7, var-1.11's family).
+                    let ns_part = if raw_name.is_empty() {
+                        ns.to_string()
+                    } else if raw_name.ends_with("::") {
+                        normalise(&format!("::{}", &qualified))
+                    } else {
+                        parent_of(&normalise(&format!("::{}", &qualified)))
+                    };
+                    if interp.var_link_cache.len() >= VAR_LINK_CACHE_MAX {
+                        interp.var_link_cache.clear();
+                    }
+                    interp
+                        .var_link_cache
+                        .entry(ns.as_ref().to_string())
+                        .or_default()
+                        .insert(raw_name.to_string(), (qualified.clone(), ns_part.clone()));
+                    (qualified, ns_part)
+                }
             }
-        } else {
-            let mut key = var_key(&qualify(&ns, raw_name));
-            if raw_name.ends_with(':') && !key.ends_with(':') {
-                key.push_str("::");
-            }
-            key
-        };
-
-        // The variable's namespace must exist (`can't define "<as-typed>":
-        // parent namespace doesn't exist` — var-7.7, var-1.11's family).
-        let ns_part = if raw_name.is_empty() {
-            ns.to_string()
-        } else if raw_name.ends_with("::") {
-            normalise(&format!("::{}", &qualified))
-        } else {
-            parent_of(&normalise(&format!("::{}", &qualified)))
         };
         if ns_part != "::" && !interp.namespaces.contains_key(&ns_part) {
             crate::interp::commands::list::set_error_code(

@@ -744,3 +744,27 @@ var_incr                 44         34      0.7
 # 396 -> 370 (-7%, secondary).  Gates: judge 87/87; sweep 0
 # (judge/sweep.sh); tests 1143/0; feature matrix green (std variants,
 # rtcl-vm no-default, wasm32).
+
+# ---------------------------------------------------------------------------
+# G8d 2026-10-05: `variable`-link resolution memo.  The oo_bench2_vars
+# DWARF profile at G8c: cmd_variable 24.2% (under it qualify 11.4% +
+# format 10.7% + normalise 9.7%) — a hot method body re-declares its
+# `variable` links EVERY call (the link prefix is part of the body
+# text), and each declaration re-ran the qualified-key + parent-ns
+# computation: three string allocations + scans per variable per call.
+# The resolution is a pure string function of (current namespace,
+# declared name) — memoised in Interp::var_link_cache (nested
+# VarMap, the cmd_cache shape; bounded 1024 clear-on-overflow; NO
+# invalidation needed).  The live checks stay per-call: parent-exists
+# probe, the owning namespace's variable-set insert, the per-frame
+# upvar link + degrade.  (UpvarLink::Global stays String — Rc<str>
+# would touch every consumer for one clone.)
+#
+# Bench: oo_bench2_vars 1682 -> 1513ms (-10%; cumulative vs G8 base
+# 2632 -> 1513 = -43%, gap 6.2x -> 3.6x tclsh); oo_bench2 742ms
+# (1.9x); fib25 53ms/run (1.47x).  Remaining vars-path cost: the
+# per-call upvar degrade forces the whole compiled body name-keyed
+# (frame_slot_* fallbacks + upvar indirection + set_var's array
+# probes) — the linked-slot model (slot cell = Value | Link) is the
+# structural follow-up, same class as the array-marker refactor.
+# Gates: judge 87/87; sweep 0; tests 1143/0; feature matrix green.

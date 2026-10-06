@@ -720,7 +720,7 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // frame's other slots keep their compiled fast path, and this
         // frame's own reads/writes of the alias re-resolve through the
         // upvar guards.
-        interp.degrade_frame_link(current_idx, &local_var);
+        interp.degrade_frame_link(current_idx, &local_var, &link);
         let has_link = interp.frames[current_idx].upvars.contains_key(&local_var);
         if !has_link
             && (interp.frames[current_idx].locals.contains_key(&local_var)
@@ -846,11 +846,9 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // on their compiled fast path — the frame's own ops on the name
         // re-resolve through the upvar guards, the way tclsh's linked
         // compiledLocal does.
-        interp.degrade_frame_link(current_idx, &local);
-        interp.frames[current_idx].upvars.insert(
-            local.clone(),
-            UpvarLink::Global(target.clone()),
-        );
+        let glink = UpvarLink::Global(target.clone());
+        interp.degrade_frame_link(current_idx, &local, &glink);
+        interp.frames[current_idx].upvars.insert(local.clone(), glink);
         // The linked name lives in the proc's variable table (tclsh's
         // `info vars` lists it) — mirror the current value when one
         // exists; reads/writes still go through the link.

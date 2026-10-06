@@ -177,6 +177,13 @@ pub(crate) struct CallFrame {
     /// so a linked method variable no longer degrades the WHOLE frame to
     /// name-keyed lookups.
     pub slot_aliased: Vec<bool>,
+    /// Parallel to `slots`: for an aliased slot holding a GLOBAL link
+    /// (`variable`/`global`/upvar-to-global), the canonical target key —
+    /// slot ops resolve through ONE hash (`globals.get(key)`) instead of
+    /// the name path's two (upvars probe + globals probe).  `None` for
+    /// non-linked slots and for link kinds the direct path can't serve
+    /// (frame-to-frame upvar, dead targets).
+    pub link_keys: Vec<Option<std::rc::Rc<str>>>,
     /// The compiled unit the slots belong to; its `locals()` table names
     /// slot i.  `Rc` — one bump per call, taken on degrade.
     pub slot_table: Option<Rc<ByteCode>>,

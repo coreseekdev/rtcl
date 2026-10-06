@@ -65,7 +65,10 @@ impl Interp {
     pub(crate) fn frame_slot_value(&self, slot: usize) -> Option<Value> {
         let f = self.frames.last()?;
         if f.slot_aliased.get(slot).copied().unwrap_or(false) {
-            return None;
+            // Global link: ONE probe with the canonical key (the name
+            // path would pay upvars + globals = two hashes).
+            let key = f.link_keys.get(slot)?.as_ref()?;
+            return self.globals.get(key.as_ref()).cloned();
         }
         f.slots.get(slot)?.clone()
     }
@@ -76,12 +79,34 @@ impl Interp {
     /// bump happens only on the write, so a caller whose fallback consumes
     /// the value pays nothing extra on the attempt.
     pub(crate) fn frame_slot_write(&mut self, slot: usize, value: &Value) -> bool {
-        if self
+        let aliased = self
             .frames
             .last()
             .map(|f| f.slot_aliased.get(slot).copied().unwrap_or(false))
-            .unwrap_or(true)
-        {
+            .unwrap_or(true);
+        if aliased {
+            // Global link: write the target directly through the cached
+            // canonical key (one probe; creation goes through the name
+            // path — the link install seeded the variable, so the hot
+            // case is always the hit).
+            let key = self
+                .frames
+                .last()
+                .and_then(|f| f.link_keys.get(slot))
+                .and_then(|k| k.clone());
+            if let Some(key) = key {
+                if let Some(cell) = self.globals.get_mut(key.as_ref()) {
+                    *cell = value.clone();
+                    return true;
+                }
+                let name = self.frames.last().and_then(|f| {
+                    f.slot_table.as_ref().and_then(|t| t.locals().get(slot).cloned())
+                });
+                if let Some(name) = name {
+                    let _ = self.set_var(&name, value.clone());
+                    return true;
+                }
+            }
             return false;
         }
         match self.frames.last_mut().and_then(|f| f.slots.get_mut(slot)) {
@@ -101,9 +126,16 @@ impl Interp {
             return None;
         }
         {
-            let f = self.frames.last_mut()?;
+            let f = self.frames.last()?;
             if f.slot_aliased.get(slot).copied().unwrap_or(false) {
-                return None;
+                // Global link: one probe, in-place int rewrite when the
+                // stored value is unshared/immediate.
+                let key = f.link_keys.get(slot)?.as_ref()?;
+                let cell = self.globals.get_mut(key.as_ref())?;
+                let current = cell.as_int()?;
+                let next = current.checked_add(amount)?;
+                cell.set_int_rep(next);
+                return Some(cell.clone());
             }
         }
         let cell = self.frames.last_mut()?.slots.get_mut(slot)?.as_mut()?;
@@ -140,6 +172,7 @@ impl Interp {
         }
         f.slots.clear();
         f.slot_aliased.clear();
+        f.link_keys.clear();
     }
 
     /// Link-only aliasing of ONE slot: move the cell's value into
@@ -151,7 +184,7 @@ impl Interp {
     /// frame to name-keyed lookups.  Traces / array-ification / unset
     /// keep [`Self::degrade_frame_local`]'s wholesale flush (their
     /// storage-kind change is frame-wide by nature, and they are cold).
-    pub(crate) fn degrade_frame_link(&mut self, frame_idx: usize, name: &str) {
+    pub(crate) fn degrade_frame_link(&mut self, frame_idx: usize, name: &str, link: &crate::interp::UpvarLink) {
         let base = match name.find('(') {
             Some(i) => &name[..i],
             None => name,
@@ -169,6 +202,20 @@ impl Interp {
             f.slot_aliased.resize(f.slots.len(), false);
         }
         f.slot_aliased[i] = true;
+        // Global links get the direct-key fast path: slot ops on this
+        // name resolve through ONE globals probe with the canonical key
+        // (frame/dead links keep None — their name paths handle the
+        // indirection).
+        if f.link_keys.len() != f.slots.len() {
+            f.link_keys.clear();
+            f.link_keys.resize(f.slots.len(), None);
+        }
+        f.link_keys[i] = match link {
+            crate::interp::UpvarLink::Global(g) => {
+                Some(std::rc::Rc::from(g.as_str()))
+            }
+            _ => None,
+        };
     }
 
     /// Whole-frame degrade of `frames[frame_idx]` — for sites that enumerate
@@ -195,6 +242,7 @@ impl Interp {
         }
         f.slots.clear();
         f.slot_aliased.clear();
+        f.link_keys.clear();
     }
 
     /// [`Self::degrade_frame_all_at`] on the current frame (no-op at the

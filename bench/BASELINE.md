@@ -1097,3 +1097,21 @@ var_incr                 44         34      0.7
 # RSS stable 6.1MB.  Gates: judge 87/87; sweep 0; tests 1143/0;
 # i64-extremes probe byte-exact (heap-fallback range); feature matrix
 # green (no-default, rtcl-vm no-default, wasm32).
+
+# ---------------------------------------------------------------------------
+# G13 2026-10-07: the linked-slot key cache — Project 2's safe core.
+# Aliased slots holding GLOBAL links (`variable`/`global`/upvar-to-
+# global) now carry the canonical target key (CallFrame::link_keys,
+# parallel to slots, installed by degrade_frame_link from the link
+# kind — frame/dead links keep None and keep their name paths).  Slot
+# ops on those names resolve through ONE globals probe with the cached
+# key instead of the name path's two hashes (upvars probe + globals
+# probe); incr mutates in place through the same single probe.  No
+# unsafe, no generation counter — the cached key is immutable.  (The
+# full pointer-stable storage remains available if the last hash ever
+# matters; the safe subset covered the measured gap.)
+#
+# Bench: vars 1119 -> 791ms (2.45x -> 1.81x tclsh); dloop 284 vs 277 —
+# AT PARITY (1.03x); fe ~2.0x, fib 1.3x, oo 1.28x (same-session
+# references, both arms drifted up with load).  Gates: judge 87/87;
+# sweep 0; tests 1143/0.

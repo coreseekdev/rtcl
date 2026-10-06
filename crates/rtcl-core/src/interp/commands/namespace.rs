@@ -265,7 +265,8 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // The alias name leaves the slot model (links and slot cells
             // don't alias) — link-only aliasing keeps the frame's other
             // slots on their compiled fast path.
-            interp.degrade_frame_link(frame_idx, &local_name);
+            let vlink = crate::interp::UpvarLink::Global(qualified.clone());
+            interp.degrade_frame_link(frame_idx, &local_name, &vlink);
             interp.frames[frame_idx].upvars.insert(
                 local_name.clone(),
                 crate::interp::UpvarLink::Global(qualified.clone()),

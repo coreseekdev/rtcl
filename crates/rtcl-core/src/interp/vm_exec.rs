@@ -726,14 +726,32 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         }
         OpCode::LappendVar(name_idx) => {
             let value = st.pop_val();
-            let name = code.get_const(*name_idx).unwrap_or("").to_string();
-            let args = [
-                Value::from_str("lappend"),
-                Value::from_str(&name),
-                value,
-            ];
-            let v = super::commands::list::cmd_lappend(interp, &args)?;
-            st.stack.push(v);
+            let name = code.get_const(*name_idx).unwrap_or("");
+            // Fast path: take -> append in place -> store (cmd_lappend's
+            // own fast body, minus the arg assembly + command prologue).
+            // take_var_fast owns every guard (traces, links, arrays, ns
+            // qualifiers); a non-list rep is restored and the full
+            // command runs below (creation, strict parse, exact errors).
+            let mut fast = false;
+            if let Some(mut v) = interp.take_var_fast(name) {
+                if let Some(items) = v.as_list_mut() {
+                    items.push(value.clone());
+                    interp.set_var(name, v.clone());
+                    st.stack.push(v);
+                    fast = true;
+                } else {
+                    interp.store_var(name, v);
+                }
+            }
+            if !fast {
+                let args = [
+                    Value::from_str("lappend"),
+                    Value::from_str(name),
+                    value,
+                ];
+                let v = super::commands::list::cmd_lappend(interp, &args)?;
+                st.stack.push(v);
+            }
         }
         OpCode::IncrLocal(slot, amount) => {
             let slot = *slot as usize;

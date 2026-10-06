@@ -509,6 +509,21 @@ impl ByteCode {
                     *brk = forward[*brk as usize];
                 }
                 OpCode::CatchStart(t) => *t = forward[*t as usize],
+                // The inline foreach's targets bake pre-compaction
+                // indices: ForeachNext jumps back to the body,
+                // ForeachStart's next/end land on the iteration step and
+                // the exit.  Without this remap, ANY nop strip (a
+                // constant fold) earlier in the unit shifted the loop's
+                // entry by the strip count — latent since the inline
+                // foreach landed (proc bodies never folded ahead of a
+                // loop; the global-scope inline hit it on day one).
+                OpCode::ForeachStart { next, end, .. } => {
+                    *next = forward[*next as usize];
+                    *end = forward[*end as usize];
+                }
+                OpCode::ForeachNext { body, .. } => {
+                    *body = forward[*body as usize];
+                }
                 _ => {}
             }
         }

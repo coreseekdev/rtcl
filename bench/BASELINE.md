@@ -1012,3 +1012,24 @@ var_incr                 44         34      0.7
 # fib 45/39 = 1.15x; dloop 297/253 = 1.17x; oo 562/416 = 1.35x;
 # fe 96/46 = 2.1x; vars 1027/448 = 2.29x.  Micro suite: arith .8x,
 # var_incr .6x, string_build .9x, proc_fib .9x, dict/list 1.1x.
+
+# ---------------------------------------------------------------------------
+# G10b 2026-10-06: latent foreach-target corruption + the global-inline
+# verdict.  The experiment (drop foreach's locals_mode gate, inline at
+# top level) crashed immediately — not from the routing problem mapped
+# in G9f, but from strip_nops: its branch-target remap table (Jump /
+# JumpTrue / JumpFalse / LoopEnter / CatchStart) predates the inline
+# foreach and never remapped ForeachStart { next, end } / ForeachNext
+# { body }.  ANY constant fold ahead of an inlined foreach shifted the
+# loop's entry/exit by the strip count — latent since the inline
+# foreach landed (proc bodies never folded ahead of a loop).  Fixed
+# with the two missing remap arms.
+#
+# The global-inline verdict itself: TCLSH DOES NOT INLINE foreach at
+# eval level (compiledLocals are proc-context) — the probe-pinned
+# dispatched shape at top level IS tclsh's behavior, the original
+# locals_mode gate was correct, and the tree's foreach_lexical routing
+# is correctly scoped to lexical bodies.  Gate reverted; the sweep
+# differential (bytecode-inline vs tree-dispatched) proved it in one
+# run — exactly what the two-engine gate exists for.
+# Gates: judge 87/87; sweep 0; tests 1143/0.

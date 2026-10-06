@@ -1007,3 +1007,8 @@ var_incr                 44         34      0.7
 # CARGO_PROFILE_RELEASE_OPT_LEVEL="z" (cargo env override) when code
 # size matters — the profile keeps speed for native.
 # Gates: judge 87/87; sweep 0; tests 1143/0; wasm32 check green.
+
+# G10 verified board (same-session tclsh references, load ~2):
+# fib 45/39 = 1.15x; dloop 297/253 = 1.17x; oo 562/416 = 1.35x;
+# fe 96/46 = 2.1x; vars 1027/448 = 2.29x.  Micro suite: arith .8x,
+# var_incr .6x, string_build .9x, proc_fib .9x, dict/list 1.1x.

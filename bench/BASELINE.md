@@ -1183,3 +1183,11 @@ var_incr                 44         34      0.7
 # collect_args_into_scratch simplify.  Gates green; the definitive
 # bench needs settled load (external gcc jobs were running — tclsh
 # references drifted 1.4x mid-measurement).
+
+# G16 DEFINITIVE BOARD (settled load 2.0, 5-rep references):
+# fe 77/34 = 2.26x; fib 49/36 = 1.36x; dloop 281/267 = 1.05x (parity);
+# oo 526/402 = 1.31x; vars 775/524 = 1.48x; build 15/12 = 1.25x —
+# the G16 stack slimming halved the build loop (30 -> 15ms).  fe's sum
+# iteration stands at 2.8x (12.4ms vs 4.4ms per 200k pass) — foreach
+# bind + per-op weight; the next levers remain the two documented
+# projects (foreach routing parity, pointer-stable storage).

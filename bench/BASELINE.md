@@ -1067,3 +1067,33 @@ var_incr                 44         34      0.7
 # per-component overhead (lappend 19%, incr 19%, set_var 17%, allocs
 # 31%), no single lever.  var-bench pointer-stable storage remains
 # the vars fix (VarMap is a bare alias; encapsulation first).
+
+# ---------------------------------------------------------------------------
+# G12 2026-10-06: INLINE-INT VALUE — the tagged repr landed.  Value is a
+# Cell<u64> word: low bit set = an immediate i63 ([-2^62, 2^62); the
+# extremes fall back to a heap Int-rep box, full i64 preserved), low
+# bit clear = the recycled heap box (VPtr semantics unchanged).  The
+# migration wall (879 as_str->Cow sites) DISSOLVED: as_str keeps its
+# `-> &str` signature — an immediate whose string is first demanded
+# materializes through the Cell into a heap box and borrows from it.
+# Soundness: the upgrade is one-way and idempotent; every other &self
+# method is read-only; clones bump the box count, so a borrowed &str
+# outlives its origin correctly; PhantomData<*mut _> keeps Value
+# !Send/!Sync.  from_int/set_int_rep/as_int are now allocation- and
+# refcount-free on the i63 path; the small-int cache is subsumed
+# (removed).
+#
+# Two use-after-free bugs caught by the crash gates during development
+# (both "grab the box pointer without taking the rc" mistakes —
+# empty()'s singleton and as_str's fresh-box temporary; both fixed
+# with from_heap_clone / mem::forget ownership transfer) and one
+# semantic break: as_list/as_dict on an immediate must DELEGATE to the
+# string parse (an int's rendering is its list form — the old Int-rep
+# `_` arm parsed), not short-circuit None (binary format c0 caught it).
+#
+# Bench: fe_bench 89 -> 66ms (gap 2.0x -> 1.5x tclsh); build loop
+# 34 -> 27ms (was 160ms at G8); arith_loop micro 0.7x (FASTER than
+# tclsh); fib 1.14x; dloop/oo flat.  Memory: materialization churn
+# RSS stable 6.1MB.  Gates: judge 87/87; sweep 0; tests 1143/0;
+# i64-extremes probe byte-exact (heap-fallback range); feature matrix
+# green (no-default, rtcl-vm no-default, wasm32).

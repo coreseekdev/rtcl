@@ -30,6 +30,7 @@ use core::fmt;
 use core::str::FromStr;
 use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr::NonNull;
 
@@ -451,11 +452,152 @@ impl fmt::Debug for VPtr {
 
 /// A Tcl value - "everything is a string"
 ///
-/// Cloning a `Value` is **O(1)** (reference-count increment).
-/// Mutation triggers copy-on-write when the value is shared.
-#[derive(Debug, Clone)]
+/// Cloning a `Value` is **O(1)** — for the common case it is not even
+/// a refcount: the word is a tagged repr, low bit set = an **immediate
+/// integer** (`i63`, `[-2^62, 2^62)` — clone is a copy, drop is
+/// nothing, as_int is an untag, from_int never allocates; the
+/// full-i64 extremes fall back to a heap box with the Int rep).  Low
+/// bit clear = a heap box (recycled `VPtr`), refcounted with COW.
+///
+/// The one interior transition is *materialization*: an immediate
+/// whose string is first demanded upgrades itself to a heap box
+/// through the `Cell` and returns the borrow into that box — one-way
+/// and idempotent, so a `&str` from `as_str` stays valid for `&self`'s
+/// lifetime (clones bump the box's count; every other `&self` method
+/// is read-only).  `PhantomData<*mut _>` keeps `Value` !Send/!Sync,
+/// the same auto-trait surface `Rc` had.
 pub struct Value {
-    inner: VPtr,
+    bits: Cell<u64>,
+    _not_send: PhantomData<*mut ValueInner>,
+}
+
+impl Value {
+    #[inline]
+    fn is_imm(&self) -> bool {
+        self.bits.get() & 1 == 1
+    }
+    #[inline]
+    fn imm(&self) -> i64 {
+        (self.bits.get() as i64) >> 1
+    }
+    #[inline]
+    fn from_imm(n: i64) -> Value {
+        Value::with_bits(((n as u64) << 1) | 1)
+    }
+    #[inline]
+    fn set_imm(&self, n: i64) {
+        self.bits.set(((n as u64) << 1) | 1);
+    }
+    /// # Safety
+    /// `bits` must be a heap repr (low bit clear) from a live box.
+    #[inline]
+    unsafe fn heap_inner(&self) -> &ValueInner {
+        &*(self.bits.get() as *const ValueInner)
+    }
+    #[inline]
+    fn heap_ptr(&self) -> *mut ValueInner {
+        self.bits.get() as *mut ValueInner
+    }
+    #[inline]
+    fn with_bits(bits: u64) -> Value {
+        Value { bits: Cell::new(bits), _not_send: PhantomData }
+    }
+    /// The heap COW path shared by the mutators: deep-copy when shared.
+    #[inline]
+    fn heap_make_mut(&mut self) -> &mut ValueInner {
+        let p = self.heap_ptr();
+        unsafe {
+            if (*p).rc.get() > 1 {
+                let cloned = (*p).clone(); // payload deep-copy, rc starts at 1
+                let fresh = VPtr::new(cloned);
+                let new_bits = fresh.0.as_ptr();
+                std::mem::forget(fresh); // ownership transfers into `bits`
+                (*p).rc.set((*p).rc.get() - 1);
+                self.bits.set(new_bits as u64);
+                &mut *new_bits
+            } else {
+                &mut *p
+            }
+        }
+    }
+    /// Take ownership of a freshly built heap box as a heap `Value`.
+    #[inline]
+    fn from_vptr(v: VPtr) -> Value {
+        let bits = v.0.as_ptr() as u64;
+        std::mem::forget(v);
+        Value::with_bits(bits)
+    }
+    /// A heap `Value` sharing `other`'s box (refcount bump).
+    #[inline]
+    fn from_heap_clone(other: &VPtr) -> Value {
+        unsafe {
+            (*other.0.as_ptr()).rc.set((*other.0.as_ptr()).rc.get() + 1);
+        }
+        Value::with_bits(other.0.as_ptr() as u64)
+    }
+}
+
+impl Clone for Value {
+    #[inline]
+    fn clone(&self) -> Self {
+        let bits = self.bits.get();
+        if bits & 1 == 0 {
+            unsafe {
+                let p = bits as *mut ValueInner;
+                (*p).rc.set((*p).rc.get() + 1);
+            }
+        }
+        Value::with_bits(bits)
+    }
+}
+
+impl Drop for Value {
+    #[inline]
+    fn drop(&mut self) {
+        let bits = self.bits.get();
+        if bits & 1 == 1 {
+            return;
+        }
+        unsafe {
+            let p = bits as *mut ValueInner;
+            let n = (*p).rc.get();
+            if n > 1 {
+                (*p).rc.set(n - 1);
+                return;
+            }
+            // Last owner: free the payload (string buffer, list/dict
+            // vecs), then recycle the box itself.
+            std::ptr::drop_in_place(p);
+            let pushed = FREELIST.try_with(|fl| {
+                let mut fl = fl.borrow_mut();
+                if fl.len() < FREELIST_CAP {
+                    fl.push(NonNull::new_unchecked(p));
+                    true
+                } else {
+                    false
+                }
+            });
+            if pushed != Ok(true) {
+                // Freelist full — or already torn down at thread exit
+                // (try_with fails there): free the BOX for real.  The
+                // payload was already dropped above, so this must be a
+                // bare dealloc.
+                std::alloc::dealloc(
+                    p.cast::<u8>(),
+                    std::alloc::Layout::new::<ValueInner>(),
+                );
+            }
+        }
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_imm() {
+            return write!(f, "Value(imm {})", self.imm());
+        }
+        f.debug_struct("Value").finish_non_exhaustive()
+    }
 }
 
 // ── Cached singletons ──────────────────────────────────────────
@@ -514,62 +656,50 @@ impl Default for Value {
 impl Value {
     /// Create an empty value
     pub fn empty() -> Self {
-        Value {
-            inner: CACHED_EMPTY.with(VPtr::clone),
-        }
+        CACHED_EMPTY.with(|v| Value::from_heap_clone(v))
     }
 
     /// Create a value from a string
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
-        Value {
-            inner: VPtr::new(ValueInner {
+        Value::from_vptr(VPtr::new(ValueInner {
                 string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
                 rep: InternalRep::None,
                 rc: Cell::new(1),
-            }),
-        }
+            }))
     }
 
     /// Create a value from an integer
     pub fn from_int(n: i64) -> Self {
-        // Fast path: cached singleton for small integers (negatives
-        // included — `-1` sits in every decrementing loop).
-        if n >= INT_CACHE_MIN && n < SMALL_INT_CACHE_SIZE as i64 {
-            return CACHED_INTS.with(|ints| Value {
-                inner: VPtr::clone(&ints[(n - INT_CACHE_MIN) as usize]),
-            });
+        // Immediate for the whole i63 range — clone/drop/compare without
+        // the allocator or the refcount.  The extremes keep the heap
+        // fallback (full i64 range preserved); the lazy-string rule is
+        // tclsh's (an int renders never unless demanded).
+        if (i64::MIN >> 1) <= n && n <= (i64::MAX >> 1) {
+            return Value::from_imm(n);
         }
-        // Lazy string (tclsh: an object born with an int rep carries no
-        // string until demanded) — the loop-counter case renders never.
-        Value {
-            inner: VPtr::new(ValueInner {
-                string: OnceCell::new(),
-                rep: InternalRep::Int(n),
-                rc: Cell::new(1),
-            }),
-        }
+        Value::from_vptr(VPtr::new(ValueInner {
+            string: OnceCell::new(),
+            rep: InternalRep::Int(n),
+            rc: Cell::new(1),
+        }))
     }
 
     /// Create a value from a float
     pub fn from_float(n: f64) -> Self {
-        Value {
-            inner: VPtr::new(ValueInner {
+        Value::from_vptr(VPtr::new(ValueInner {
                 string: OnceCell::new(),
                 rep: InternalRep::Float(n),
                 rc: Cell::new(1),
-            }),
-        }
+            }))
     }
 
     /// Create a value from a boolean
     pub fn from_bool(b: bool) -> Self {
-        Value {
-            inner: if b {
-                CACHED_BOOL_TRUE.with(VPtr::clone)
-            } else {
-                CACHED_BOOL_FALSE.with(VPtr::clone)
-            },
+        if b {
+            CACHED_BOOL_TRUE.with(|v| Value::from_heap_clone(v))
+        } else {
+            CACHED_BOOL_FALSE.with(|v| Value::from_heap_clone(v))
         }
     }
 
@@ -579,26 +709,22 @@ impl Value {
     /// call — this avoids the serialize cost when the list is only ever
     /// accessed structurally (e.g. `lindex`, `lappend`).
     pub fn from_list_cached(items: Vec<Value>) -> Self {
-        Value {
-            inner: VPtr::new(ValueInner {
-                string: OnceCell::new(), // lazy — generated on first as_str()
-                rep: InternalRep::List(items),
-                rc: Cell::new(1),
-            }),
-        }
+        Value::from_vptr(VPtr::new(ValueInner {
+            string: OnceCell::new(), // lazy — generated on first as_str()
+            rep: InternalRep::List(items),
+            rc: Cell::new(1),
+        }))
     }
 
     /// Create a value directly from a cached dict.
     ///
     /// The string representation is lazily generated on first `as_str()`.
     pub fn from_dict_cached(entries: DictMap) -> Self {
-        Value {
-            inner: VPtr::new(ValueInner {
+        Value::from_vptr(VPtr::new(ValueInner {
                 string: OnceCell::new(),
                 rep: InternalRep::Dict(entries),
                 rc: Cell::new(1),
-            }),
-        }
+            }))
     }
 
     /// Create a dict value from key-value pairs (ordered).
@@ -607,13 +733,11 @@ impl Value {
         for (k, v) in pairs {
             map.insert(k.as_str().to_string(), v.clone());
         }
-        Value {
-            inner: VPtr::new(ValueInner {
+        Value::from_vptr(VPtr::new(ValueInner {
                 string: OnceCell::new(),
                 rep: InternalRep::Dict(DictMap::Ordered(map)),
                 rc: Cell::new(1),
-            }),
-        }
+            }))
     }
 
     /// Create a value from a list of values.
@@ -634,8 +758,22 @@ impl Value {
     /// If the string has not been materialized yet (lazy value), it is
     /// auto-generated from the internal representation via `OnceCell`.
     pub fn as_str(&self) -> &str {
-        let bytes = self.inner.string.get_or_init(|| {
-            match &self.inner.rep {
+        if self.is_imm() {
+            // Materialize: upgrade to a heap box (one-way, idempotent)
+            // and render into it — the returned &str borrows `self`,
+            // whose box now holds the rendering.
+            let n = self.imm();
+            let fresh = VPtr::new(ValueInner {
+                string: OnceCell::from(SmallVec::from_slice(format_int(n).as_bytes())),
+                rep: InternalRep::Int(n),
+                rc: Cell::new(1),
+            });
+            self.bits.set(fresh.0.as_ptr() as u64);
+            std::mem::forget(fresh); // rc 1 transfers into `bits`
+        }
+        let inner = unsafe { self.heap_inner() };
+        let bytes = inner.string.get_or_init(|| {
+            match &inner.rep {
                 InternalRep::List(items) => {
                     SmallVec::from_slice(serialize_list(items).as_bytes())
                 }
@@ -668,7 +806,11 @@ impl Value {
 
     /// Try to get as integer
     pub fn as_int(&self) -> Option<i64> {
-        match &self.inner.rep {
+        if self.is_imm() {
+            return Some(self.imm());
+        }
+        let inner = unsafe { self.heap_inner() };
+        match &inner.rep {
             InternalRep::Int(n) => Some(*n),
             _ => {
                 let s = self.to_str();
@@ -717,7 +859,11 @@ impl Value {
 
     /// Try to get as float
     pub fn as_float(&self) -> Option<f64> {
-        match &self.inner.rep {
+        if self.is_imm() {
+            return Some(self.imm() as f64);
+        }
+        let inner = unsafe { self.heap_inner() };
+        match &inner.rep {
             InternalRep::Float(n) => Some(*n),
             InternalRep::Int(n) => Some(*n as f64),
             _ => {
@@ -742,7 +888,11 @@ impl Value {
     /// string must be an unambiguous prefix of true/false/yes/no/on/off
     /// (`t`, `ye`, `of` are valid; `o` alone is ambiguous → None).
     pub fn as_bool(&self) -> Option<bool> {
-        match &self.inner.rep {
+        if self.is_imm() {
+            return Some(self.imm() != 0);
+        }
+        let inner = unsafe { self.heap_inner() };
+        match &inner.rep {
             InternalRep::Bool(b) => Some(*b),
             _ => {
                 if let Some(i) = self.as_int() {
@@ -774,7 +924,14 @@ impl Value {
     /// Returns a freshly parsed `Vec<Value>` — callers that need to
     /// mutate should use the `_mut` helpers instead.
     pub fn as_list(&self) -> Option<Vec<Value>> {
-        match &self.inner.rep {
+        if self.is_imm() {
+            // An immediate's rendering is its list form ("5" -> {5}) —
+            // the same string-parse the old Int-rep `_` arm took.
+            let s = self.as_str();
+            return parse_list(&s);
+        }
+        let inner = unsafe { self.heap_inner() };
+        match &inner.rep {
             InternalRep::List(items) => Some(items.clone()),
             InternalRep::Dict(map) => {
                 Some(map.iter().flat_map(|(k, v)| [Value::from_str(k), v.clone()]).collect())
@@ -789,7 +946,12 @@ impl Value {
     /// Like `as_list()`, but malformed list strings yield Tcl's parse
     /// error (message + `::errorCode`) instead of `None`.
     pub fn as_list_strict(&self) -> std::result::Result<Vec<Value>, ListParseError> {
-        match &self.inner.rep {
+        if self.is_imm() {
+            let s = self.as_str();
+            return parse_list_full(&s);
+        }
+        let inner = unsafe { self.heap_inner() };
+        match &inner.rep {
             InternalRep::List(items) => Ok(items.clone()),
             InternalRep::Dict(map) => {
                 Ok(map.iter().flat_map(|(k, v)| [Value::from_str(k), v.clone()]).collect())
@@ -804,7 +966,11 @@ impl Value {
     /// Get a reference to the dict's DictMap if the internal rep is Dict.
     /// Zero-copy — does not clone.
     pub fn as_dict_ref(&self) -> Option<&DictMap> {
-        match &self.inner.rep {
+        if self.is_imm() {
+            return None;
+        }
+        let inner = unsafe { self.heap_inner() };
+        match &inner.rep {
             InternalRep::Dict(map) => Some(map),
             _ => None,
         }
@@ -812,10 +978,13 @@ impl Value {
 
     /// Get a mutable reference to the dict's DictMap (COW).
     pub fn as_dict_mut(&mut self) -> Option<&mut DictMap> {
-        if !matches!(&self.inner.rep, InternalRep::Dict(_)) {
+        if self.is_imm() {
             return None;
         }
-        let inner = VPtr::make_mut(&mut self.inner);
+        if !matches!(unsafe { self.heap_inner() }.rep, InternalRep::Dict(_)) {
+            return None;
+        }
+        let inner = self.heap_make_mut();
         inner.string = OnceCell::new(); // invalidate string
         match &mut inner.rep {
             InternalRep::Dict(map) => Some(map),
@@ -829,10 +998,13 @@ impl Value {
     /// takes the variable out of its slot first, tclsh's refcnt==1
     /// mutation); otherwise the `ValueInner` is cloned once.
     pub fn as_list_mut(&mut self) -> Option<&mut Vec<Value>> {
-        if !matches!(&self.inner.rep, InternalRep::List(_)) {
+        if self.is_imm() {
             return None;
         }
-        let inner = VPtr::make_mut(&mut self.inner);
+        if !matches!(unsafe { self.heap_inner() }.rep, InternalRep::List(_)) {
+            return None;
+        }
+        let inner = self.heap_make_mut();
         inner.string = OnceCell::new(); // invalidate string
         match &mut inner.rep {
             InternalRep::List(items) => Some(items),
@@ -844,7 +1016,12 @@ impl Value {
     /// tclsh's TclIncrObj on a refcnt==1 object: no allocation, and the
     /// cached string rendering is dropped instead of eagerly rebuilt.
     pub fn set_int_rep(&mut self, n: i64) {
-        let inner = VPtr::make_mut(&mut self.inner);
+        // Immediate ints retag in place — no allocation, no refcount.
+        if self.is_imm() && (i64::MIN >> 1) <= n && n <= (i64::MAX >> 1) {
+            self.set_imm(n);
+            return;
+        }
+        let inner = self.heap_make_mut();
         inner.rep = InternalRep::Int(n);
         inner.string = OnceCell::new(); // invalidate string
     }
@@ -857,12 +1034,25 @@ impl Value {
     /// value rebuilt from text compares different even when the text
     /// matches, so a stale memo can never be hit through a look-alike.
     pub fn same_allocation(&self, other: &Value) -> bool {
-        VPtr::ptr_eq(&self.inner, &other.inner)
+        self.bits.get() == other.bits.get()
     }
 
     /// Parse or return a dict as an owned DictMap.
     pub fn as_dict(&self) -> Option<DictMap> {
-        match &self.inner.rep {
+        if self.is_imm() {
+            let s = self.as_str();
+            let list = parse_list(&s)?;
+            if list.len() % 2 != 0 {
+                return None;
+            }
+            let mut map = DictMap::ordered_with_capacity(list.len() / 2);
+            for c in list.chunks(2) {
+                map.insert(c[0].as_str().to_string(), c[1].clone());
+            }
+            return Some(map);
+        }
+        let inner = unsafe { self.heap_inner() };
+        match &inner.rep {
             InternalRep::Dict(map) => Some(map.clone()),
             InternalRep::List(items) => {
                 if items.len() % 2 != 0 { return None; }
@@ -888,7 +1078,11 @@ impl Value {
     /// Borrow the dict without cloning when the internal rep is already Dict.
     /// Returns `Cow::Borrowed` for zero-copy access, `Cow::Owned` when parsing is needed.
     pub fn as_dict_cow(&self) -> Option<std::borrow::Cow<'_, DictMap>> {
-        match &self.inner.rep {
+        if self.is_imm() {
+            return None;
+        }
+        let inner = unsafe { self.heap_inner() };
+        match &inner.rep {
             InternalRep::Dict(map) => Some(std::borrow::Cow::Borrowed(map)),
             InternalRep::List(items) => {
                 if items.len() % 2 != 0 { return None; }
@@ -913,10 +1107,14 @@ impl Value {
 
     /// Check if the value is empty
     pub fn is_empty(&self) -> bool {
-        if let Some(bytes) = self.inner.string.get() {
+        if self.is_imm() {
+            return false;
+        }
+        let inner = unsafe { self.heap_inner() };
+        if let Some(bytes) = inner.string.get() {
             bytes.is_empty()
         } else {
-            match &self.inner.rep {
+            match &inner.rep {
                 InternalRep::List(items) => items.is_empty(),
                 InternalRep::Dict(map) => map.is_empty(),
                 InternalRep::None => true,
@@ -976,7 +1174,11 @@ impl Value {
     /// Possible return values: `"string"`, `"int"`, `"float"`, `"bool"`,
     /// `"list"`, `"dict"`.
     pub fn type_name(&self) -> &'static str {
-        match &self.inner.rep {
+        if self.is_imm() {
+            return "int";
+        }
+        let inner = unsafe { self.heap_inner() };
+        match &inner.rep {
             InternalRep::None => "string",
             InternalRep::Int(_) => "int",
             InternalRep::Float(_) => "float",
@@ -991,7 +1193,11 @@ impl Value {
     /// Unlike `as_list()` this never parses a string into a list,
     /// mirroring the semantics of `as_dict_ref()`.
     pub fn as_list_ref(&self) -> Option<&[Value]> {
-        match &self.inner.rep {
+        if self.is_imm() {
+            return None;
+        }
+        let inner = unsafe { self.heap_inner() };
+        match &inner.rep {
             InternalRep::List(items) => Some(items.as_slice()),
             _ => None,
         }
@@ -1003,7 +1209,7 @@ impl Value {
     ///
     /// Equivalent to jimtcl's `Jim_IsShared()`.
     pub fn is_shared(&self) -> bool {
-        VPtr::strong_count(&self.inner) > 1
+        !self.is_imm() && unsafe { self.heap_inner().rc.get() > 1 }
     }
 }
 

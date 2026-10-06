@@ -456,6 +456,10 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.globals.remove(&k);
             }
             interp.array_globals.remove(&base);
+            interp.arrays_env_only = interp
+                .array_globals
+                .iter()
+                .all(|k| k == "env" || k == "tcl_platform");
             // Unset traces fire after the removal; a callback's `set` into
             // the deleted namespace fails its parent-namespace check
             // (18.4's catch=1) and cannot resurrect the variable.

@@ -1204,3 +1204,14 @@ var_incr                 44         34      0.7
 # threading) is the only remaining structural item and is
 # rewrite-grade.  fe (~2x) retains one mapped lever (foreach routing
 # parity, G9f); vars (~1.5-1.8x) retains pointer-stable storage.
+
+# ---------------------------------------------------------------------------
+# G18 2026-10-07: the arrays_env_only flag.  array_globals permanently
+# holds the startup arrays (env, tcl_platform), so every per-op guard
+# (`!is_empty() && contains(name)`) ran a real probe.  A flag — true
+# while the set is exactly the startup arrays, maintained at every
+# mutation site (4 insert/remove sites + init) — lets the fast-path
+# guards skip the probe when the answer is statically false.  Error-
+# path membership checks (loc_is_array) keep the probe.
+# Bench within today's noise band; the guard probes were ~10% of
+# var-heavy profiles.  Gates: judge 87/87; sweep 0; tests 1143/0.

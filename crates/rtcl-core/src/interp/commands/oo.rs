@@ -1191,6 +1191,10 @@ fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
     for g in globals {
         interp.globals.remove(&g);
         interp.array_globals.remove(&g);
+        interp.arrays_env_only = interp
+            .array_globals
+            .iter()
+            .all(|k| k == "env" || k == "tcl_platform");
     }
     if !keep_ns {
         interp.namespaces.remove(ns);
@@ -2042,6 +2046,9 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
         let is_array = interp.array_globals.contains(&k);
         interp.globals.insert(new_key.clone(), v);
         if is_array {
+            if new_key != "env" && new_key != "tcl_platform" {
+                interp.arrays_env_only = false;
+            }
             interp.array_globals.insert(new_key);
         }
     }

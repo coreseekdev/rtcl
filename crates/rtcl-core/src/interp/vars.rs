@@ -421,6 +421,9 @@ impl Interp {
             .or_insert(0) += 1;
         match loc {
             VarLoc::Global(n) => {
+                if n != "env" && n != "tcl_platform" {
+                    self.arrays_env_only = false;
+                }
                 self.array_globals.insert(n.clone());
             }
             VarLoc::Frame(i, n) => {
@@ -449,6 +452,10 @@ impl Interp {
                 }
                 let base = loc.base_name().to_string();
                 self.array_globals.remove(&base);
+                self.arrays_env_only = self
+                    .array_globals
+                    .iter()
+                    .all(|k| k == "env" || k == "tcl_platform");
                 self.globals.remove(&base);
             }
             VarLoc::Frame(i, _) => {
@@ -980,7 +987,7 @@ impl Interp {
                         }
                     }
                 } else if self.current_namespace.as_ref() == "::" && self.flat_aliases.is_empty() {
-                    if self.array_globals.is_empty() || !self.array_globals.contains(name) {
+                    if self.arrays_env_only || !self.array_globals.contains(name) {
                         if let Some(slot) = self.globals.get_mut(name) {
                             *slot = value.clone();
                             wrote = true;
@@ -1044,7 +1051,7 @@ impl Interp {
         } else {
             if self.current_namespace.as_ref() != "::"
                 || !self.flat_aliases.is_empty()
-                || (!self.array_globals.is_empty() && self.array_globals.contains(name))
+                || (!self.arrays_env_only && self.array_globals.contains(name))
             {
                 return None;
             }
@@ -1083,7 +1090,7 @@ impl Interp {
         } else {
             if self.current_namespace.as_ref() != "::"
                 || !self.flat_aliases.is_empty()
-                || (!self.array_globals.is_empty() && self.array_globals.contains(name))
+                || (!self.arrays_env_only && self.array_globals.contains(name))
             {
                 return None;
             }

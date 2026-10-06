@@ -372,6 +372,14 @@ pub struct Interp {
     pub(crate) globals: VarMap<Value>,
     /// Names in `globals` that are arrays (scalar/array distinction).
     pub(crate) array_globals: VarSet,
+    /// True while `array_globals` holds ONLY the startup arrays
+    /// (`env`, `tcl_platform`): the per-op array guards in get_var/
+    /// set_var/read_var then skip their `contains` probe entirely —
+    /// the startup arrays make the set permanently non-empty, and the
+    /// probe was ~10% of var-heavy loops (dloop/oo profiles).  Every
+    /// mutation site maintains the flag (inserts of any other name
+    /// clear it; removals recompute — both are cold paths).
+    pub(crate) arrays_env_only: bool,
     /// Procedure call frames (empty at global level).  Boxed: a `CallFrame`
     /// is ~264 bytes and pool-pop/frame-push/frame-pop/pool-push moved the
     /// whole struct four times per call (a memcpy each — the fib profile's
@@ -732,6 +740,7 @@ impl Interp {
         let mut interp = Interp {
             globals: VarMap::default(),
             array_globals: VarSet::default(),
+            arrays_env_only: true,
             array_searches: HashMap::new(),
             array_stamps: HashMap::new(),
             array_generations: HashMap::new(),
@@ -899,6 +908,7 @@ impl Interp {
         self.globals.insert("tcl_platform".to_string(), Value::empty());
         self.array_globals.insert("tcl_platform".to_string());
         self.array_globals.insert("env".to_string());
+        self.arrays_env_only = true;
 
         // --- $argv0, $argv, $argc (empty defaults — cli layer overrides) ---
         self.globals.insert("argv0".to_string(), Value::from_str(""));

@@ -1115,3 +1115,12 @@ var_incr                 44         34      0.7
 # AT PARITY (1.03x); fe ~2.0x, fib 1.3x, oo 1.28x (same-session
 # references, both arms drifted up with load).  Gates: judge 87/87;
 # sweep 0; tests 1143/0.
+
+# G13 CORRECTION (2026-10-07): the /tmp bench files were wiped between
+# sessions — several post-G13 readings ran against missing files (error
+# exits swallowed by >/dev/null).  The TRUE board with recreated files:
+# fe 111/46 = 2.4x; fib 49/28 = 1.75x; dloop 270/246 = 1.10x; oo
+# 643/399 = 1.61x; vars 815/438 = 1.86x; build 30/17 = 1.76x.  (The
+# pre-wipe "fib 1.26x / oo 1.28x" claims were optimistic.)  dloop is
+# the one AT-PARITY bench.  Bench scripts now belong in the repo, not
+# /tmp.

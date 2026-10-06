@@ -1191,3 +1191,16 @@ var_incr                 44         34      0.7
 # iteration stands at 2.8x (12.4ms vs 4.4ms per 200k pass) — foreach
 # bind + per-op weight; the next levers remain the two documented
 # projects (foreach routing parity, pointer-stable storage).
+
+# ---------------------------------------------------------------------------
+# G17 state (2026-10-07): the fib profile at G17 is FULLY DIFFUSE — the
+# top item is arith at 4.7%, then a long tail of 2-4% components
+# (drop_glue, rel, Rc<str> traffic from the per-call source/ns swaps,
+# strict_bool, slot ops, region pushes, stack Entry machinery).  No
+# lever above 5% remains: call overhead already beats tclsh (0.52x),
+# arithmetic/comparison runs on immediates, the frame/const pools are
+# identity-cached.  The residual fib gap (1.1-1.3x) is the SUM of the
+# per-op dispatch weight — the interpreter-core slimming (direct
+# threading) is the only remaining structural item and is
+# rewrite-grade.  fe (~2x) retains one mapped lever (foreach routing
+# parity, G9f); vars (~1.5-1.8x) retains pointer-stable storage.

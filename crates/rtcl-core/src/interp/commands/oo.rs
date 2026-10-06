@@ -302,7 +302,7 @@ pub(crate) fn init(interp: &mut Interp) {
 
 /// Ensure a namespace and its ancestors exist (local copy of the namespace
 /// module's `ensure_namespace`, which is private).
-fn ensure_ns(namespaces: &mut HashMap<String, super::namespace::NamespaceInfo>, qualified: &str) {
+fn ensure_ns(namespaces: &mut super::super::varmap::FxHashedMap<String, super::namespace::NamespaceInfo>, qualified: &str) {
     namespaces.entry("::".to_string()).or_default();
     if qualified == "::" {
         return;

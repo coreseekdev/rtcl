@@ -451,7 +451,7 @@ pub struct Interp {
     /// frames exactly (see `vm_exec`), so a cached unit running op-by-op
     /// is interchangeable with the AST walk.  Bound and cleared together
     /// with the parse cache (see `eval`).
-    pub(crate) bytecode_cache: HashMap<Rc<str>, Rc<rtcl_parser::ByteCode>>,
+    pub(crate) bytecode_cache: varmap::FxHashedMap<Rc<str>, Rc<rtcl_parser::ByteCode>>,
     /// Loop-body memo: recent body `Value`s handed to
     /// [`Interp::eval_body_value`] plus their compiled forms — a pointer
     /// compare replaces `eval`'s two full-text cache hashes on every hit
@@ -482,7 +482,7 @@ pub struct Interp {
     /// `check_expr` verdict memo: expr text → `Err(msg)` on syntax error,
     /// `Ok(())` when clean (see `types::expr::eval_expr`).  Pure function
     /// of the text; loop conditions re-check every iteration.
-    pub(crate) expr_check_cache: HashMap<String, Result<(), String>>,
+    pub(crate) expr_check_cache: varmap::FxHashedMap<String, Result<(), String>>,
     /// Call stack depth (for recursion limit).
     pub(crate) call_depth: usize,
     /// Maximum call depth.
@@ -490,7 +490,7 @@ pub struct Interp {
     /// Last result.
     pub(crate) result: Value,
     /// Bytecode cache — keyed by script source.
-    pub(crate) code_cache: HashMap<String, ByteCode>,
+    pub(crate) code_cache: varmap::FxHashedMap<String, ByteCode>,
     /// Package registry: name → version string.
     #[cfg(feature = "package")]
     pub(crate) packages: HashMap<String, String>,
@@ -504,7 +504,7 @@ pub struct Interp {
     /// global-scope proc, handed out per call without allocating.
     pub(crate) ns_root: Rc<str>,
     /// Known namespaces ("::" always present).
-    pub(crate) namespaces: HashMap<String, commands::namespace::NamespaceInfo>,
+    pub(crate) namespaces: varmap::FxHashedMap<String, commands::namespace::NamespaceInfo>,
     /// `namespace import` aliases: fully-qualified alias name → the fully
     /// qualified name of the original command.  Aliases stay separate from
     /// `procs` so the origin's *current* body always dispatches (tclsh
@@ -786,22 +786,22 @@ impl Interp {
             var_link_cache: VarMap::default(),
             cmd_generation: 0,
             parse_cache: HashMap::new(),
-            bytecode_cache: HashMap::new(),
+            bytecode_cache: varmap::FxHashedMap::default(),
             body_memo: Vec::new(),
             lambda_code_cache: HashMap::new(),
             const_pool: HashMap::default(),
             in_locals_unit: false,
-            expr_check_cache: HashMap::new(),
+            expr_check_cache: varmap::FxHashedMap::default(),
             call_depth: 0,
             max_call_depth: 1000,
             result: Value::empty(),
-            code_cache: HashMap::new(),
+            code_cache: varmap::FxHashedMap::default(),
             #[cfg(feature = "package")]
             packages: HashMap::new(),
             current_namespace: Rc::from("::"),
             ns_root: Rc::from("::"),
             namespaces: {
-                let mut ns = HashMap::new();
+                let mut ns = varmap::FxHashedMap::default();
                 ns.insert("::".to_string(), commands::namespace::NamespaceInfo::default());
                 ns
             },

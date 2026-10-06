@@ -2055,7 +2055,7 @@ pub(crate) fn origin_of(interp: &Interp, name: &str) -> Option<String> {
 
 /// Ensure that a namespace and all its ancestors exist in the namespace table.
 pub(crate) fn ensure_namespace(
-    namespaces: &mut std::collections::HashMap<String, NamespaceInfo>,
+    namespaces: &mut crate::interp::varmap::FxHashedMap<String, NamespaceInfo>,
     qualified: &str,
 ) {
     // Always ensure "::" exists

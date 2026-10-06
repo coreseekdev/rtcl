@@ -1223,3 +1223,13 @@ var_incr                 44         34      0.7
 # combined.  All three memos (chain_memo, chain_memo_priv, key_memo,
 # including their nested inner maps) now hash with the interpreter's
 # unkeyed Fx (~2ns).  Gates: judge 87/87; sweep 0; tests 1143/0.
+
+# ---------------------------------------------------------------------------
+# G20 2026-10-07: four more hot tables hash with Fx, not SipHash —
+# expr_check_cache (consulted on EVERY expr eval), namespaces (the
+# parent-exists probe in every variable-link install), code_cache and
+# bytecode_cache (probed on every eval and body eval).  A generic
+# FxHashedMap<K, V> alias joined varmap.rs.  Bench deferred — an
+# external node job spiked the load mid-measurement (tclsh references
+# doubled).
+# Gates: judge 87/87; sweep 0; tests 1143/0.

@@ -80,6 +80,13 @@ pub(crate) use fx::VarHasher;
 pub(crate) type VarMap<V> =
     std::collections::HashMap<String, V, std::hash::BuildHasherDefault<VarHasher>>;
 
+/// Generic Fx-hashed map: same unkeyed fast hash, any key/value.  For
+/// interpreter-side hot tables whose keys are interpreter-shaped
+/// (script text, names) — std's SipHash cost ~20ns/probe vs ~2ns.
+#[cfg(not(feature = "embedded"))]
+pub(crate) type FxHashedMap<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<VarHasher>>;
+
 #[cfg(not(feature = "embedded"))]
 pub(crate) type VarSet =
     std::collections::HashSet<String, std::hash::BuildHasherDefault<VarHasher>>;

@@ -1033,3 +1033,37 @@ var_incr                 44         34      0.7
 # differential (bytecode-inline vs tree-dispatched) proved it in one
 # run — exactly what the two-engine gate exists for.
 # Gates: judge 87/87; sweep 0; tests 1143/0.
+
+# ---------------------------------------------------------------------------
+# G11 2026-10-06: inline-int Value — feasibility PROVEN, migration
+# scoped, deferred as its own effort.  The tagged representation
+# (u64 word: bit0=1 -> immediate i63 via arithmetic shift, bit0=0 ->
+# heap VPtr; |n| >= 2^62 falls back to a heap Int-rep box, full i64
+# range preserved) was implemented and compiles clean through
+# rtcl-vm (value.rs + execute.rs).  The repr makes from_int/set_int_rep
+# allocation-free, as_int an untag, clone/drop copy/noop for the i63
+# range; heap semantics (COW, freelist, singletons) unchanged.
+#
+# The migration wall, measured: flipping as_str to Cow<'_, str> yields
+# 879 error sites in rtcl-core; iterating a span-driven auto-fixer
+# (.as_ref() insertion at `expected &str, found Cow` labels) clears
+# ~300 but the remainder splits into classes needing individual
+# judgment: 286 `expected Cow, found &str` (re-wrap sites), 273
+# Cow-method-not-found, 106 E0599, plus borrowck ripples.  Grinding
+# those auto-mechanically risks subtle hot-site into_owned()
+# regressions — deferred to a dedicated pass with per-file review.
+# The proven core is preserved at bench/next/inline-int-value-core.rs.txt
+# (compile-ready; drop into rtcl-vm/src/value.rs and run the fixer at
+# /tmp/cow_fix.py pattern — span-driven E0308 label matching).
+#
+# Why it matters (evidence): the leanest while+incr loop profile puts
+# as_int 12.5% + strict_bool 10.7% + drop 14.3% on value lifecycle;
+# tclsh allocates its add results too, so immediates are the
+# BEAT-tclsh move, not the parity move.  Per-op tax today ~20ns vs
+# tclsh ~7ns across all ops.
+#
+# Also resolved this round: the build loop (for+lappend, 200k iters)
+# decomposition — while+incr 2.4x tclsh, lappend adds 4.4x; diffuse
+# per-component overhead (lappend 19%, incr 19%, set_var 17%, allocs
+# 31%), no single lever.  var-bench pointer-stable storage remains
+# the vars fix (VarMap is a bare alias; encapsulation first).

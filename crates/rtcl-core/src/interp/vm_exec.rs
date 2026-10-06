@@ -396,12 +396,6 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
 fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<Value> {
     let ops = code.ops();
 
-    if std::env::var_os("RTCL_TRACE").is_some() {
-        for (i, o) in ops.iter().enumerate() {
-            eprintln!("OPS pc={} line={} {:?}", i, code.line_at(i), o);
-        }
-    }
-
     let result = loop {
         // Stream end: the tree-walk's result is the last command's, which
         // the stack discipline leaves on top (`set`/`incr` fast paths and
@@ -613,9 +607,6 @@ impl VmPool {
 /// would produce for the same operation; the caller classifies them into
 /// errorInfo frames.
 fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) -> Result<()> {
-    if std::env::var_os("RTCL_TRACE").is_some() {
-        eprintln!("TRACE pc={} line={} op={:?} stack={}", st.pc - 1, code.line_at(st.pc - 1), std::mem::discriminant(op), st.stack.len());
-    }
     match op {
         // ── Stack ───────────────────────────────────────────────────────
         // Literals come from the unit's pooled constants (one Rc bump);
@@ -872,13 +863,6 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         }
         OpCode::ForeachNext { info, body } => {
             let info_ref = code.foreach_info(*info).expect("foreach info index");
-            {
-                let ff = st.foreaches.last().expect("foreach frame");
-                let lf = st.loops.last().expect("loop frame");
-                if st.stack.len() != lf.stack_len {
-                    eprintln!("DBG ForeachNext stack drift: idx={} stack={} base={}", ff.idx, st.stack.len(), lf.stack_len);
-                }
-            }
             let (idx, max) = {
                 let ff = st.foreaches.last().expect("foreach frame");
                 (ff.idx + 1, ff.iters)
@@ -977,10 +961,6 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             }
         }
         OpCode::Call { argc, .. } => {
-            if st.stack.len() < *argc as usize {
-                let ln = code.line_at(st.pc - 1);
-                eprintln!("DBG Call underflow: pc={} line={} argc={} stack={} cur_site={}", st.pc - 1, ln, argc, st.stack.len(), st.cur_site);
-            }
             let from = st.stack.len() - *argc as usize;
             st.collect_args_into_scratch(from);
             let v = dispatch_site(interp, st, dispatch_call)?;

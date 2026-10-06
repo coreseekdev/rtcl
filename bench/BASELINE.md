@@ -1140,3 +1140,11 @@ var_incr                 44         34      0.7
 # CAVEAT for future rounds: kernel.perf_event_paranoid=4 blocks perf
 # entirely this session; earlier G9/G10 profiles were taken when it
 # was permissive.
+
+# fe decomposition (final, G13 state): build 30 vs 17ms (1.76x) +
+# 5x sum 16 vs 6.4ms each (2.5x) — the sum iteration is ~9 ops
+# (ForeachNext + bind + LL/LL/Add/SL + Pop) at ~9ns/op vs tclsh's
+# ~3.5ns/instruction; build is lappend-dispatch heavy.  Both are the
+# per-op weight item — the mapped interpreter-core slimming (direct
+# threading / stack-entry slimming) is the remaining lever, currently
+# blind without perf.

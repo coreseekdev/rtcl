@@ -711,6 +711,48 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 interp.set_var(name, v)?;
             }
         }
+        // ── Folded lappend ──────────────────────────────────────────────
+        // `lappend <literal-var> <value>`: the fast path appends through
+        // the variable's canonical slot storage (cmd_lappend's take/
+        // append/restore, slot-indexed — no name probes).  EVERY
+        // divergence risk (traces, aliased/linked slots, non-list rep
+        // needing the strict parse, creation) delegates to the real
+        // `cmd_lappend` with the assembled [cmd, name, value] args —
+        // identical errors, identical frames.
+        OpCode::LappendLocal(slot) => {
+            let slot = *slot as usize;
+            let value = st.pop_val();
+            let name = code.locals().get(slot).map(String::as_str).unwrap_or("").to_string();
+            if interp.lappend_slot_fast(slot, &value) {
+                let result = interp
+                    .frames
+                    .last()
+                    .and_then(|f| f.slots.get(slot))
+                    .and_then(|v| v.as_ref())
+                    .cloned()
+                    .unwrap_or_else(Value::empty);
+                st.stack.push(Entry::Val(result));
+            } else {
+                let args = [
+                    Value::from_str("lappend"),
+                    Value::from_str(&name),
+                    value,
+                ];
+                let v = super::commands::list::cmd_lappend(interp, &args)?;
+                st.stack.push(Entry::Val(v));
+            }
+        }
+        OpCode::LappendVar(name_idx) => {
+            let value = st.pop_val();
+            let name = code.get_const(*name_idx).unwrap_or("").to_string();
+            let args = [
+                Value::from_str("lappend"),
+                Value::from_str(&name),
+                value,
+            ];
+            let v = super::commands::list::cmd_lappend(interp, &args)?;
+            st.stack.push(Entry::Val(v));
+        }
         OpCode::IncrLocal(slot, amount) => {
             let slot = *slot as usize;
             // Same fallback ladder as IncrVar: slot fast path, then the

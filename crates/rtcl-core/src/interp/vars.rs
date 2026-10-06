@@ -118,6 +118,35 @@ impl Interp {
         }
     }
 
+    /// `lappend` on a frame slot's list — the compiled-op fast path.
+    /// Appends `value` to the slot's list in place when every guard the
+    /// real `lappend` enforces holds: no traces, not aliased/linked, the
+    /// cell holds a list rep.  `false` = take the dispatched command
+    /// (creation, string-rep parse, link write-through — its exact
+    /// semantics).
+    pub(crate) fn lappend_slot_fast(&mut self, slot: usize, value: &Value) -> bool {
+        if !self.var_traces.is_empty() {
+            return false;
+        }
+        let Some(f) = self.frames.last_mut() else {
+            return false;
+        };
+        if f.slot_aliased.get(slot).copied().unwrap_or(false) {
+            return false;
+        }
+        let Some(cell) = f.slots.get_mut(slot) else {
+            return false;
+        };
+        let Some(v) = cell else {
+            return false; // unset: creation is the dispatched command's job
+        };
+        let Some(items) = v.as_list_mut() else {
+            return false; // non-list rep: the strict parse owns the errors
+        };
+        items.push(value.clone());
+        true
+    }
+
     /// `incr` on a frame slot, mutating the int rep in place
     /// (the slot analogue of [`Interp::incr_var_fast`]; `None` falls back
     /// to the real `incr`, which owns creation and the exact errors).

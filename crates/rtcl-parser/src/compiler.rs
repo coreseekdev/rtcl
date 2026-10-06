@@ -167,6 +167,7 @@ impl Compiler {
             | OpCode::LoopEnter { .. } | OpCode::LoopExit | OpCode::Break | OpCode::Continue
             | OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. }
             | OpCode::ForeachCollect | OpCode::ForeachEnd
+            | OpCode::LappendLocal(_) | OpCode::LappendVar(_)
             | OpCode::Return | OpCode::Exit(_)
             | OpCode::EvalScript | OpCode::EvalExpr
             | OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Pow
@@ -261,6 +262,14 @@ impl Compiler {
                 // dispatched command's semantics.
                 "foreach" if self.locals_mode => return self.compile_foreach(cmd, false),
                 "lmap" if self.locals_mode => return self.compile_foreach(cmd, true),
+                // `lappend <literal-var> <value>` — the list-builder shape
+                // (build loops).  Folded to a slot/name op: the value word
+                // compiles inline, the op appends through the variable's
+                // canonical storage and leaves the new list as the result.
+                // Every guard failure (traces, linked slots, non-list rep,
+                // creation, dynamic var) falls back to dispatching the real
+                // command with the assembled arguments.
+                "lappend" if cmd.words.len() == 3 => return self.compile_lappend(cmd),
                 "expr" => return self.compile_expr(cmd),
                 "incr" if cmd.words.len() >= 2 => return self.compile_incr(cmd),
                 "break" if cmd.words.len() == 1 => {
@@ -849,6 +858,28 @@ impl Compiler {
     }
 
     /// `incr varName ?increment?`
+    /// `lappend varName value` — folded like `incr`: a literal var name
+    /// (no `{*}`) gains a slot/name op; every other shape dispatches.
+    fn compile_lappend(&mut self, cmd: &Command) {
+        let line = self.abs_line(cmd);
+        if cmd.words.iter().any(|w| matches!(w, Word::Expand(_))) {
+            return self.compile_dyncall(cmd);
+        }
+        if let Word::Literal(var_name) = &cmd.words[1] {
+            if self.locals_mode && slot_candidate(var_name) {
+                let slot = self.bytecode.add_local(var_name);
+                self.compile_word_spanned(&cmd.words[2], line, cmd, 2);
+                self.bytecode.emit(OpCode::LappendLocal(slot), line);
+            } else {
+                let name_idx = self.bytecode.add_const(var_name);
+                self.compile_word_spanned(&cmd.words[2], line, cmd, 2);
+                self.bytecode.emit(OpCode::LappendVar(name_idx), line);
+            }
+        } else {
+            self.compile_dyncall(cmd);
+        }
+    }
+
     fn compile_incr(&mut self, cmd: &Command) {
         let line = self.abs_line(cmd);
         if cmd.words.len() > 3 {

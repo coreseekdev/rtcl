@@ -381,6 +381,16 @@ pub enum OpCode {
 
     Add,
     Sub,
+    /// `lappend <literal-var> <value>` folded: append the stack value to
+    /// the variable's list (slot-indexed in locals-mode units, name-keyed
+    /// otherwise), leaving the new list as the command result.  Any guard
+    /// the real `lappend` enforces (traces, linked/aliased slots, non-
+    /// list rep needing the strict parse, creation) falls back to
+    /// dispatching `cmd_lappend` with the assembled arguments — same
+    /// errors, same frames.
+    LappendLocal(u16),
+    /// The name-keyed twin of [`OpCode::LappendLocal`] (top-level units).
+    LappendVar(u16),
     Mul,
     Div,
     Mod,
@@ -605,6 +615,8 @@ impl fmt::Display for OpCode {
 
             // Arithmetic
             OpCode::Add => write!(f, "ADD"),
+            OpCode::LappendLocal(s) => write!(f, "LAPPEND_L {}", s),
+            OpCode::LappendVar(n) => write!(f, "LAPPEND_V {}", n),
             OpCode::Sub => write!(f, "SUB"),
             OpCode::Mul => write!(f, "MUL"),
             OpCode::Div => write!(f, "DIV"),

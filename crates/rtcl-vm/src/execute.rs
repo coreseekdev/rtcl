@@ -77,6 +77,12 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
         pc += 1;
 
         match op {
+            OpCode::LappendLocal(..) | OpCode::LappendVar(..) => {
+                return Err(Error::runtime(
+                    "lappend ops are not supported here",
+                    ErrorCode::Generic,
+                ))
+            }
             // ── Stack manipulation ──────────────────────────────────
             OpCode::PushConst(idx) => {
                 let s = code.get_const(*idx).unwrap_or("");

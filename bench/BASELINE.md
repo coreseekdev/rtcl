@@ -1215,3 +1215,11 @@ var_incr                 44         34      0.7
 # path membership checks (loc_is_array) keep the probe.
 # Bench within today's noise band; the guard probes were ~10% of
 # var-heavy profiles.  Gates: judge 87/87; sweep 0; tests 1143/0.
+
+# ---------------------------------------------------------------------------
+# G19 2026-10-07: the OO memos hash with Fx, not SipHash.  The G8f
+# chain_memo/key_memo used plain std HashMap (RandomState ~20ns/probe)
+# — the oo profile showed make_hash<RandomState> + hash_one at ~16%
+# combined.  All three memos (chain_memo, chain_memo_priv, key_memo,
+# including their nested inner maps) now hash with the interpreter's
+# unkeyed Fx (~2ns).  Gates: judge 87/87; sweep 0; tests 1143/0.

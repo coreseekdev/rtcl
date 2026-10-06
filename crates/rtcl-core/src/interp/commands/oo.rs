@@ -36,6 +36,8 @@ use core::cell::RefCell;
 
 #[cfg(not(feature = "embedded"))]
 use std::collections::HashMap;
+#[cfg(not(feature = "embedded"))]
+type FxMap<V> = std::collections::HashMap<String, V, std::hash::BuildHasherDefault<crate::interp::varmap::VarHasher>>;
 
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeMap as HashMap;
@@ -200,14 +202,14 @@ pub(crate) struct OoState {
     /// (wasm32 is a target).  The `Rc` chain is shared with the
     /// `ActiveMethod` snapshots, so `next` also stops paying a
     /// `to_vec` per invocation.
-    pub chain_memo: HashMap<String, HashMap<String, (u64, Rc<Vec<ChainEntry>>)>>,
+    pub chain_memo: FxMap<FxMap<(u64, Rc<Vec<ChainEntry>>)>>,
     /// The `include_private` half of [`Self::chain_memo`].
-    pub chain_memo_priv: HashMap<String, HashMap<String, (u64, Rc<Vec<ChainEntry>>)>>,
+    pub chain_memo_priv: FxMap<FxMap<(u64, Rc<Vec<ChainEntry>>)>>,
     /// Typed-name → canonical object/class key memo (see
     /// `resolve_object_key`): current namespace → typed name →
     /// (stamp, resolution).  `RefCell` so `&Interp` read paths can fill
     /// it, the `proc_memo` precedent.
-    pub key_memo: RefCell<HashMap<String, HashMap<String, (u64, Option<Rc<str>>)>>>,
+    pub key_memo: RefCell<FxMap<FxMap<(u64, Option<Rc<str>>)>>>,
 }
 
 // ── init ───────────────────────────────────────────────────────────────
@@ -365,7 +367,7 @@ fn resolve_object_key(interp: &Interp, typed: &str) -> Option<String> {
         }
         let inner = memo
             .entry(interp.current_namespace.to_string())
-            .or_insert_with(HashMap::new);
+            .or_insert_with(FxMap::default);
         if inner.len() >= KEY_MEMO_NAME_MAX {
             inner.clear();
         }
@@ -931,7 +933,7 @@ fn chain_for(interp: &mut Interp, key: &str, method: &str, include_private: bool
             memo.clear();
         }
         memo.entry(key.to_string())
-            .or_insert_with(HashMap::new)
+            .or_insert_with(FxMap::default)
             .insert(method.to_string(), (interp.oo.mutation_ctr, Rc::clone(&chain)));
     }
     chain

@@ -1124,3 +1124,19 @@ var_incr                 44         34      0.7
 # pre-wipe "fib 1.26x / oo 1.28x" claims were optimistic.)  dloop is
 # the one AT-PARITY bench.  Bench scripts now belong in the repo, not
 # /tmp.
+
+# G13b (2026-10-07): proc-call overhead BEATS tclsh.  Layer
+# decomposition (300k-iteration loops, wall clock, load-noisy ±15%):
+# empty-proc loop rtcl 73ms vs tclsh 88 (0.83x); 1-arg proc 49 vs 94
+# (0.52x — 1.9x FASTER); 1-arg+expr 77 vs 106 (0.73x).  The
+# dispatch_site token + frame pool + slot binding + exec_bytecode
+# pipeline is now cheaper per call than tclsh's INST_START_CMD path.
+# fib's remaining 1.75x is therefore per-op weight on the ~12 body ops
+# (condition/subs/add), not call overhead — and profiling is currently
+# BLOCKED (kernel.perf_event_paranoid=4), so the next per-op steps
+# (inline-int arithmetic ops are in; the dispatch-loop slimming is the
+# mapped item) proceed by wall-clock decomposition only.
+#
+# CAVEAT for future rounds: kernel.perf_event_paranoid=4 blocks perf
+# entirely this session; earlier G9/G10 profiles were taken when it
+# was permissive.

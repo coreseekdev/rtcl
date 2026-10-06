@@ -1233,3 +1233,10 @@ var_incr                 44         34      0.7
 # external node job spiked the load mid-measurement (tclsh references
 # doubled).
 # Gates: judge 87/87; sweep 0; tests 1143/0.
+
+# G20 DEFINITIVE BOARD (settled load 2.0): fe 69/32 = 2.16x; vars
+# 770/445 = 1.73x; dloop 281/256 = 1.10x; fib 42/36 = 1.17x; oo
+# 518/405 = 1.28x; build 22/16 = 1.38x.  Micro suite (settled): arith
+# 0.6x, var_incr 0.6x, string_build 0.8x, dict_ops 0.9x, list_ops
+# 1.0x, proc_fib 1.0x — the micro suite is at parity or faster
+# throughout.

@@ -1148,3 +1148,27 @@ var_incr                 44         34      0.7
 # per-op weight item — the mapped interpreter-core slimming (direct
 # threading / stack-entry slimming) is the remaining lever, currently
 # blind without perf.
+
+# ---------------------------------------------------------------------------
+# G14 2026-10-07: immediate×immediate fast paths for every arithmetic
+# and comparison entry point.  With immediates landed (G12), the
+# compare/binop paths still paid nan_pair (six accessor calls), the
+# bignum int_rep parsing, and heap-box results for ints.  numeric_binop,
+# op_rel, op_eq, op_ne now untag-and-go when both operands are
+# immediates: checked arithmetic retags in place (no box, no refcount),
+# overflow/out-of-i63-range widens through the same BigInt arms, div-
+# by-zero and MIN/-1 hit the identical errors.  op_rel/op_eq/op_ne
+# untag-and-compare (immediates are ints — no NaN possible).
+#
+# BUG the judge corpus caught in the first cut: the immediate tag holds
+# i63 but checked_mul is an i64 check — 11^18 (5.6e18) passed checked,
+# then wrapped NEGATIVE in the tag shift.  Results now range-check
+# against i63 and widen otherwise (gen_expr expr-23.51/52/53).
+#
+# perf stat (3M while+incr): instructions 2652M -> 2090M (-21%),
+# cycles 501M -> 359M (-28%).  Bench: fe 66 -> 61 (1.74x); fib 43 -> 36
+# (1.06-1.29x — AT PARITY within noise); build 27 -> 22 (1.57x);
+# vars 800; dloop/oo flat.  Micro suite: arith 0.6x, var_incr 0.5x,
+# proc_fib 0.7x, dict 0.8x, list/string 1.0x.
+# Gates: judge 87/87; sweep 0; tests 1143/0; g11num/g11ext (overflow,
+# widening, mixed-rep, i64-extremes) byte-exact vs tclsh.

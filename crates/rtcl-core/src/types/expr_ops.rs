@@ -32,6 +32,52 @@ pub(crate) fn as_int_val(v: &Value) -> Result<i64> {
 pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Value> {
     use num_bigint::BigInt;
     use super::bignum::{floor_div as big_div, int_rep, to_value};
+    // Immediate×immediate: untag, checked arithmetic, retag — no rep
+    // parsing, no box, no refcount.  Overflow/div-edge falls into the
+    // exact same widening arms the general path uses (i63 bounds keep
+    // every non-overflowing result representable).
+    if left.is_imm() && right.is_imm() {
+        let (a, b) = (left.imm(), right.imm());
+        let wide = |x: i64, y: i64| -> Result<Value> {
+            use num_bigint::BigInt;
+            let (ba, bb) = (BigInt::from(x), BigInt::from(y));
+            Ok(match op {
+                '+' => to_value(IntRep::Big(ba + bb)),
+                '-' => to_value(IntRep::Big(ba - bb)),
+                '*' => to_value(IntRep::Big(ba * bb)),
+                '/' => to_value(IntRep::Big(big_div(&ba, &bb))),
+                _ => return Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
+            })
+        };
+        // The immediate tag only holds i63: a checked-i64 success can
+        // still exceed it (11^18 = 5.6e18 < i64::MAX but > 2^62) — such
+        // results widen to the exact BigInt form.
+        let fits = |r: i64| (i64::MIN >> 1) <= r && r <= (i64::MAX >> 1);
+        return match op {
+            '+' => match a.checked_add(b) {
+                Some(r) if fits(r) => Ok(Value::from_imm(r)),
+                _ => wide(a, b),
+            },
+            '-' => match a.checked_sub(b) {
+                Some(r) if fits(r) => Ok(Value::from_imm(r)),
+                _ => wide(a, b),
+            },
+            '*' => match a.checked_mul(b) {
+                Some(r) if fits(r) => Ok(Value::from_imm(r)),
+                _ => wide(a, b),
+            },
+            '/' => {
+                if b == 0 {
+                    return Err(Error::DivisionByZero);
+                }
+                if a == i64::MIN && b == -1 {
+                    return wide(a, b);
+                }
+                Ok(Value::from_imm(super::expr::floor_div(a, b)))
+            }
+            _ => Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
+        };
+    }
     if let (Some(ia), Some(ib)) = (int_rep(left), int_rep(right)) {
         if let (IntRep::I64(a), IntRep::I64(b)) = (&ia, &ib) {
             // Widen lazily: the bignum forms are converted only on an
@@ -264,6 +310,9 @@ pub(crate) fn int_bitop(left: &Value, right: &Value, op: char) -> Result<Value> 
 /// (int pairs compare as i64, no EPSILON tolerance); string comparison
 /// otherwise.  NaN compares unequal to everything (expr-22.9).
 pub(crate) fn op_eq(left: &Value, right: &Value) -> Value {
+    if left.is_imm() && right.is_imm() {
+        return Value::from_bool(left.imm() == right.imm());
+    }
     if expr_funcs::nan_pair(left, right) {
         return Value::from_bool(false);
     }
@@ -275,6 +324,9 @@ pub(crate) fn op_eq(left: &Value, right: &Value) -> Value {
 
 /// `!=` — negation of [`op_eq`]'s comparison, with NaN unequal to all.
 pub(crate) fn op_ne(left: &Value, right: &Value) -> Value {
+    if left.is_imm() && right.is_imm() {
+        return Value::from_bool(left.imm() != right.imm());
+    }
     if expr_funcs::nan_pair(left, right) {
         return Value::from_bool(true);
     }
@@ -288,6 +340,18 @@ pub(crate) fn op_ne(left: &Value, right: &Value) -> Value {
 /// string comparison otherwise; every comparison is false on NaN.
 pub(crate) fn op_rel(left: &Value, right: &Value, op: &str) -> Value {
     use core::cmp::Ordering;
+    // Immediate×immediate: untag and compare — no NaN possible, no rep
+    // parsing.
+    if left.is_imm() && right.is_imm() {
+        let (a, b) = (left.imm(), right.imm());
+        return Value::from_bool(match op {
+            "<" => a < b,
+            ">" => a > b,
+            "<=" => a <= b,
+            ">=" => a >= b,
+            _ => false,
+        });
+    }
     // NaN: every relational comparison is false.
     if expr_funcs::nan_pair(left, right) {
         return Value::from_bool(false);

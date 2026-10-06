@@ -473,19 +473,19 @@ pub struct Value {
 
 impl Value {
     #[inline]
-    fn is_imm(&self) -> bool {
+    pub fn is_imm(&self) -> bool {
         self.bits.get() & 1 == 1
     }
     #[inline]
-    fn imm(&self) -> i64 {
+    pub fn imm(&self) -> i64 {
         (self.bits.get() as i64) >> 1
     }
     #[inline]
-    fn from_imm(n: i64) -> Value {
+    pub fn from_imm(n: i64) -> Value {
         Value::with_bits(((n as u64) << 1) | 1)
     }
     #[inline]
-    fn set_imm(&self, n: i64) {
+    pub(crate) fn set_imm(&self, n: i64) {
         self.bits.set(((n as u64) << 1) | 1);
     }
     /// # Safety

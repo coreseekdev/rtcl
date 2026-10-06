@@ -105,11 +105,6 @@ pub(crate) fn bytecode_applicable(interp: &Interp) -> bool {
 // Executor state
 // ---------------------------------------------------------------------------
 
-/// Stack slot: a plain value or a `{*}`-expanded element run.
-enum Entry {
-    Val(Value),
-    Expanded(Vec<Value>),
-}
 
 /// One active bytecode loop (`LoopEnter` … `LoopExit`).
 struct LoopFrame {
@@ -469,7 +464,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
 }
 
 struct VmState {
-    stack: Vec<Entry>,
+    stack: Vec<Value>,
     loops: Vec<LoopFrame>,
     /// Active inline foreach/lmap frames (see [`ForeachFrame`]).
     foreaches: Vec<ForeachFrame>,
@@ -528,19 +523,11 @@ impl VmState {
     }
 
     fn pop_val(&mut self) -> Value {
-        match self.stack.pop() {
-            Some(Entry::Val(v)) => v,
-            Some(Entry::Expanded(vs)) => Value::from_list(&vs),
-            None => Value::empty(),
-        }
+        self.stack.pop().unwrap_or_else(Value::empty)
     }
 
     fn top_val(&self) -> Value {
-        match self.stack.last() {
-            Some(Entry::Val(v)) => v.clone(),
-            Some(Entry::Expanded(vs)) => Value::from_list(vs),
-            None => Value::empty(),
-        }
+        self.stack.last().cloned().unwrap_or_else(Value::empty)
     }
 
     /// Move the current command's arguments off the stack into `scratch`
@@ -549,12 +536,7 @@ impl VmState {
     /// buffer by reference and the buffer survives for the next command.
     fn collect_args_into_scratch(&mut self, from: usize) {
         self.scratch.clear();
-        for entry in self.stack.drain(from..) {
-            match entry {
-                Entry::Val(v) => self.scratch.push(v),
-                Entry::Expanded(vs) => self.scratch.extend(vs),
-            }
-        }
+        self.scratch.extend(self.stack.drain(from..));
     }
 }
 
@@ -619,7 +601,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 .and_then(|vs| vs.get(*idx as usize))
                 .cloned()
                 .unwrap_or_else(|| Value::from_str(code.get_const(*idx).unwrap_or("")));
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::PushConstWide(idx) => {
             let v = st
@@ -628,24 +610,24 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 .and_then(|vs| vs.get(*idx as usize))
                 .cloned()
                 .unwrap_or_else(|| Value::from_str(code.get_const_wide(*idx).unwrap_or("")));
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
-        OpCode::PushEmpty => st.stack.push(Entry::Val(Value::empty())),
-        OpCode::PushInt(n) => st.stack.push(Entry::Val(Value::from_int(*n))),
+        OpCode::PushEmpty => st.stack.push(Value::empty()),
+        OpCode::PushInt(n) => st.stack.push(Value::from_int(*n)),
         // float_value renders Tcl-exact (expr-52.x precision rules), not
         // Rust's default float formatting.
         OpCode::PushFloat(f) => {
             st.stack
-                .push(Entry::Val(crate::types::expr_funcs::float_value(*f)));
+                .push(crate::types::expr_funcs::float_value(*f));
         }
-        OpCode::PushTrue => st.stack.push(Entry::Val(Value::from_bool(true))),
-        OpCode::PushFalse => st.stack.push(Entry::Val(Value::from_bool(false))),
+        OpCode::PushTrue => st.stack.push(Value::from_bool(true)),
+        OpCode::PushFalse => st.stack.push(Value::from_bool(false)),
         OpCode::Pop => {
             st.stack.pop();
         }
         OpCode::Dup => {
             let v = st.top_val();
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
 
         // ── Variables ───────────────────────────────────────────────────
@@ -655,7 +637,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             // LoadVar with the raw reference text and need the same
             // index-substitution dance eval_word does.
             let v = interp.eval_var_ref(name)?;
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::StoreVar(idx) | OpCode::StoreVarPop(idx) => {
             let name = code.get_const(*idx).unwrap_or("");
@@ -673,7 +655,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             // var, non-integer value, overflow, traces, qualified/array
             // names) falls back to the real `incr`, whose errors it owns.
             match interp.incr_var_fast(name, *amount) {
-                Some(v) => st.stack.push(Entry::Val(v)),
+                Some(v) => st.stack.push(v),
                 None => {
                     let args = [
                         Value::from_str("incr"),
@@ -681,7 +663,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                         Value::from_int(*amount),
                     ];
                     let v = super::commands::misc::cmd_incr(interp, &args)?;
-                    st.stack.push(Entry::Val(v));
+                    st.stack.push(v);
                 }
             }
         }
@@ -700,7 +682,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                     interp.eval_var_ref(name)?
                 }
             };
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::StoreLocal(slot) => {
             let slot = *slot as usize;
@@ -731,7 +713,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                     .and_then(|v| v.as_ref())
                     .cloned()
                     .unwrap_or_else(Value::empty);
-                st.stack.push(Entry::Val(result));
+                st.stack.push(result);
             } else {
                 let args = [
                     Value::from_str("lappend"),
@@ -739,7 +721,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                     value,
                 ];
                 let v = super::commands::list::cmd_lappend(interp, &args)?;
-                st.stack.push(Entry::Val(v));
+                st.stack.push(v);
             }
         }
         OpCode::LappendVar(name_idx) => {
@@ -751,7 +733,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 value,
             ];
             let v = super::commands::list::cmd_lappend(interp, &args)?;
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::IncrLocal(slot, amount) => {
             let slot = *slot as usize;
@@ -760,9 +742,9 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             // which owns creation and the exact errors.
             let name = || code.locals().get(slot).map(String::as_str).unwrap_or("");
             match interp.frame_slot_incr(slot, *amount) {
-                Some(v) => st.stack.push(Entry::Val(v)),
+                Some(v) => st.stack.push(v),
                 None => match interp.incr_var_fast(name(), *amount) {
-                    Some(v) => st.stack.push(Entry::Val(v)),
+                    Some(v) => st.stack.push(v),
                     None => {
                         let args = [
                             Value::from_str("incr"),
@@ -770,7 +752,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                             Value::from_int(*amount),
                         ];
                         let v = super::commands::misc::cmd_incr(interp, &args)?;
-                        st.stack.push(Entry::Val(v));
+                        st.stack.push(v);
                     }
                 },
             }
@@ -783,26 +765,22 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         OpCode::ExpandList => {
             let v = st.pop_val();
             match v.as_list() {
-                Some(items) => st.stack.push(Entry::Expanded(items)),
-                None => st.stack.push(Entry::Expanded(vec![v])),
+                // Flatten: the elements join the stack individually —
+                // the call ops collect the whole `expand_base..` range,
+                // so per-expansion grouping is unnecessary.
+                Some(items) => st.stack.extend(items),
+                None => st.stack.push(v),
             }
         }
         OpCode::Concat(n) => {
             let n = *n as usize;
             let from = st.stack.len() - n;
             let mut s = String::new();
-            for e in &st.stack[from..] {
-                match e {
-                    Entry::Val(v) => s.push_str(v.as_str()),
-                    Entry::Expanded(vs) => {
-                        for v in vs {
-                            s.push_str(v.as_str());
-                        }
-                    }
-                }
+            for v in &st.stack[from..] {
+                s.push_str(v.as_str());
             }
             st.stack.truncate(from);
-            st.stack.push(Entry::Val(Value::from_str(&s)));
+            st.stack.push(Value::from_str(&s));
         }
 
         // ── Control flow ────────────────────────────────────────────────
@@ -931,7 +909,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 Some(c) => Value::from_list(&c),
                 None => Value::empty(),
             };
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::Break => match st.loops.last() {
             Some(l) => {
@@ -1006,30 +984,30 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             let from = st.stack.len() - *argc as usize;
             st.collect_args_into_scratch(from);
             let v = dispatch_site(interp, st, dispatch_call)?;
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::CallExpand { .. } => {
             st.collect_args_into_scratch(st.expand_base);
             let v = dispatch_site(interp, st, dispatch_call)?;
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::DynCall { argc } => {
             let from = st.stack.len() - *argc as usize;
             st.collect_args_into_scratch(from);
             let v = dispatch_site(interp, st, dispatch_dynamic)?;
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::DynCallExpand { .. } => {
             st.collect_args_into_scratch(st.expand_base);
             let v = dispatch_site(interp, st, dispatch_dynamic)?;
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
 
         // ── Evaluation ──────────────────────────────────────────────────
         OpCode::EvalScript => {
             let script = st.pop_val();
             match interp.eval(script.as_str()) {
-                Ok(v) => st.stack.push(Entry::Val(v)),
+                Ok(v) => st.stack.push(v),
                 Err(e) => {
                     // Word context: the nested eval logged its own frames;
                     // the enclosing command's frame defers to the top
@@ -1042,7 +1020,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         OpCode::EvalExpr => {
             let expr = st.pop_val();
             let v = interp.eval_expr(expr.as_str())?;
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
 
         // ── Arithmetic / comparison (expr_ops = the expr parser's own
@@ -1056,38 +1034,38 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             let b = st.pop_val();
             let a = st.pop_val();
             let v = crate::types::expr_ops::int_mod(&a, &b)?;
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::Pow => {
             let b = st.pop_val();
             let a = st.pop_val();
             let v = crate::types::expr_ops::op_pow(a, b)?;
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::Neg => {
             let a = st.pop_val();
             let v = crate::types::expr_ops::op_neg(&a)?;
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::Not => {
             let a = st.pop_val();
             let v = crate::types::expr_ops::op_not(&a)?;
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::BitNot => {
             let a = st.pop_val();
             let v = crate::types::expr_ops::op_bitnot(&a)?;
-            st.stack.push(Entry::Val(v));
+            st.stack.push(v);
         }
         OpCode::Eq => {
             let (a, b) = pop_pair(st);
             st.stack
-                .push(Entry::Val(crate::types::expr_ops::op_eq(&a, &b)));
+                .push(crate::types::expr_ops::op_eq(&a, &b));
         }
         OpCode::Ne => {
             let (a, b) = pop_pair(st);
             st.stack
-                .push(Entry::Val(crate::types::expr_ops::op_ne(&a, &b)));
+                .push(crate::types::expr_ops::op_ne(&a, &b));
         }
         OpCode::Lt => rel(st, "<")?,
         OpCode::Gt => rel(st, ">")?,
@@ -1096,12 +1074,12 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         OpCode::StrEq => {
             let (a, b) = pop_pair(st);
             st.stack
-                .push(Entry::Val(crate::types::expr_ops::op_str_eq(&a, &b)));
+                .push(crate::types::expr_ops::op_str_eq(&a, &b));
         }
         OpCode::StrNe => {
             let (a, b) = pop_pair(st);
             st.stack
-                .push(Entry::Val(crate::types::expr_ops::op_str_ne(&a, &b)));
+                .push(crate::types::expr_ops::op_str_ne(&a, &b));
         }
         OpCode::BitAnd => bits(st, '&')?,
         OpCode::BitOr => bits(st, '|')?,
@@ -1342,28 +1320,28 @@ fn pop_pair(st: &mut VmState) -> (Value, Value) {
 fn arith(st: &mut VmState, op: char) -> Result<()> {
     let (a, b) = pop_pair(st);
     let v = crate::types::expr_ops::numeric_binop(&a, &b, op)?;
-    st.stack.push(Entry::Val(v));
+    st.stack.push(v);
     Ok(())
 }
 
 fn rel(st: &mut VmState, op: &'static str) -> Result<()> {
     let (a, b) = pop_pair(st);
     let v = crate::types::expr_ops::op_rel(&a, &b, op);
-    st.stack.push(Entry::Val(v));
+    st.stack.push(v);
     Ok(())
 }
 
 fn bits(st: &mut VmState, op: char) -> Result<()> {
     let (a, b) = pop_pair(st);
     let v = crate::types::expr_ops::int_bitop(&a, &b, op)?;
-    st.stack.push(Entry::Val(v));
+    st.stack.push(v);
     Ok(())
 }
 
 fn shift(st: &mut VmState, shl: bool) -> Result<()> {
     let (a, b) = pop_pair(st);
     let v = crate::types::expr_ops::int_shift(&a, &b, shl)?;
-    st.stack.push(Entry::Val(v));
+    st.stack.push(v);
     Ok(())
 }
 

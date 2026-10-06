@@ -1172,3 +1172,14 @@ var_incr                 44         34      0.7
 # proc_fib 0.7x, dict 0.8x, list/string 1.0x.
 # Gates: judge 87/87; sweep 0; tests 1143/0; g11num/g11ext (overflow,
 # widening, mixed-rep, i64-extremes) byte-exact vs tclsh.
+
+# ---------------------------------------------------------------------------
+# G16 2026-10-07: the executor stack stores plain Values (8-byte words)
+# — the Entry enum (Val | Expanded(Vec)) is gone.  ExpandList now
+# flattens: the elements join the stack individually, and the
+# CallExpand/DynCallExpand ops collect the whole `expand_base..` range
+# (the per-expansion grouping was never needed — source order IS stack
+# order).  Stack push/pop move 8 bytes instead of 16; pop_val/top_val/
+# collect_args_into_scratch simplify.  Gates green; the definitive
+# bench needs settled load (external gcc jobs were running — tclsh
+# references drifted 1.4x mid-measurement).

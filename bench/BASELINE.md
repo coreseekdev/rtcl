@@ -990,3 +990,20 @@ var_incr                 44         34      0.7
 #    every consumer.
 # 3. Global foreach inlining (see the parked design note): kills the
 #    per-iteration body-eval machinery at top level (fe/dloop).
+
+# ---------------------------------------------------------------------------
+# G10 2026-10-06: the release profile was optimizing for SIZE.  The
+# workspace [profile.release] carried opt-level = "s" from its original
+# setup — the interpreter loop (exec_op's giant match, value ops, the
+# call path) was size-tuned, not speed-tuned.  perf stat on a 3M-
+# iteration while+add loop: rtcl 5550M instructions vs tclsh 2028M
+# (2.74x) — the instruction COUNT gap said "more work", and opt-level 3
+# attacks the codegen half of it.
+#
+# Bench (O3 vs s, same sources): fib25 51 -> 44ms (gap 1.3x tclsh);
+# dloop 360 -> 325 (1.17x!); oo_bench2 623 -> 572 (1.33x);
+# oo_bench2_vars 1214 -> 1049 (2.37x); fe_bench flat (noise band).
+# Binary 3.6 -> 4.5MB (+25%).  The wasm size target: rebuild with
+# CARGO_PROFILE_RELEASE_OPT_LEVEL="z" (cargo env override) when code
+# size matters — the profile keeps speed for native.
+# Gates: judge 87/87; sweep 0; tests 1143/0; wasm32 check green.

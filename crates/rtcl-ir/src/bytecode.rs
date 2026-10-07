@@ -81,6 +81,15 @@ pub struct VarTarget {
 pub struct ForeachInfo {
     pub groups: Vec<Vec<VarTarget>>,
     pub lmap: bool,
+    /// True when compiled OUTSIDE a proc body (top level, uplevel,
+    /// dispatched-unit evals): tclsh compiles foreach with
+    /// compiledLocals only in proc contexts, and its top-level foreach
+    /// keeps the DISPATCHED error shape — body errors gain the
+    /// `("foreach" body line N)` exit frame and loop-var write failures
+    /// gain the `(setting foreach loop variable "x")` decoration.  The
+    /// compiled foreach in a framed unit reproduces both; in proc units
+    /// (frameless/lexical) it does not.
+    pub framed: bool,
 }
 
 /// Compiled bytecode for a single compilation unit (script / proc body).

@@ -391,6 +391,11 @@ pub enum OpCode {
     LappendLocal(u16),
     /// The name-keyed twin of [`OpCode::LappendLocal`] (top-level units).
     LappendVar(u16),
+    /// Body region opener for FRAMED foreach bodies (compiled outside a
+    /// proc body): pushes `Region::BodyFramed` — body errors crossing it
+    /// gain the `("foreach"/"lmap" body line N)` exit frame, matching the
+    /// dispatched foreach's tclsh shape at top level.
+    BodyMarkFramed,
     /// Superinstruction (peephole-fused): `slots[a] OP slots[b]` with the
     /// result pushed — the fused `[LoadLocal a, LoadLocal b, ARITH-or-CMP]`
     /// window.  `cc` encodes the comparison for the Cmp forms (0=<, 1=>,
@@ -629,6 +634,7 @@ impl fmt::Display for OpCode {
             OpCode::Add => write!(f, "ADD"),
             OpCode::LappendLocal(s) => write!(f, "LAPPEND_L {}", s),
             OpCode::LappendVar(n) => write!(f, "LAPPEND_V {}", n),
+            OpCode::BodyMarkFramed => write!(f, "BODY_MARK_FRAMED"),
             OpCode::AddSlotSlot(a, b) => write!(f, "ADD_SS {} {}", a, b),
             OpCode::AddSlotImm(a, k) => write!(f, "ADD_SI {} {}", a, k),
             OpCode::CmpSlotSlot(a, b, cc) => write!(f, "CMP_SS {} {} cc={}", a, b, cc),

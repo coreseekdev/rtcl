@@ -137,6 +137,12 @@ struct ForeachFrame {
     /// used to recompute this per iteration over every group's list.
     iters: usize,
     collected: Option<Vec<Value>>,
+    /// FRAMED unit (compiled outside a proc body): body errors gain the
+    /// `("foreach"/"lmap" body line N)` exit frame and loop-var write
+    /// failures gain the `(setting ... loop variable)` decoration — the
+    /// dispatched foreach's tclsh shape at top level.
+    framed: bool,
+    lmap: bool,
 }
 
 /// One foreach varlist: borrowed from a cached list rep, or owned.
@@ -189,6 +195,11 @@ impl ForeachList {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Region {
     Body(usize),
+    /// A foreach body region in a FRAMED unit (compiled outside a proc
+    /// body): body errors crossing it gain the `("foreach" body line N)`
+    /// exit frame — the dispatched foreach's shape, which tclsh shows at
+    /// top level.  The bool is the lmap flag (the frame text differs).
+    BodyFramed(usize, bool),
     Next(usize),
     Sub(usize),
     Expr(usize),
@@ -197,7 +208,8 @@ enum Region {
 impl Region {
     fn site(self) -> usize {
         match self {
-            Region::Body(s) | Region::Next(s) | Region::Sub(s) | Region::Expr(s) => s,
+            Region::Body(s) | Region::BodyFramed(s, _) | Region::Next(s) | Region::Sub(s)
+            | Region::Expr(s) => s,
         }
     }
 }
@@ -298,6 +310,17 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                 interp.err_harness_frame(&msg, text, line);
             }
             Region::Body(_) | Region::Next(_) => {}
+            Region::BodyFramed(site_idx, lmap) => {
+                let site = &code.sites[site_idx];
+                let text = site.text.slice(&code.source);
+                let line = st.entry_offset + site.line as usize;
+                let tag = if lmap { "\"lmap\" body" } else { "\"foreach\" body" };
+                interp.err_exit_frame(tag);
+                // The foreach command's own harness frame follows
+                // immediately (`invoked from within`) — tclsh logs it
+                // before the error escapes the foreach command.
+                interp.err_harness_frame(e.message_text().as_str(), text, line);
+            }
         }
     }
 }
@@ -876,12 +899,15 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 .max()
                 .unwrap_or(0);
             let collected = info_ref.lmap.then(Vec::new);
+            let framed = info_ref.framed;
             st.foreaches.push(ForeachFrame {
                 info_idx: *info,
                 lists,
                 idx: 0,
                 iters: max,
                 collected,
+                framed: info_ref.framed,
+                lmap: info_ref.lmap,
             });
             // The loop frame rides the ordinary machinery: compiled
             // Break/Continue and error-form signals route through it.
@@ -977,6 +1003,15 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         }
         OpCode::BodyMark => {
             st.bodies.push(Region::Body(st.cur_site));
+        }
+        OpCode::BodyMarkFramed => {
+            let (framed, lmap) = st
+                .foreaches
+                .last()
+                .map(|ff| (ff.framed, ff.lmap))
+                .unwrap_or((false, false));
+            st.bodies.push(Region::BodyFramed(st.cur_site, lmap));
+            let _ = framed;
         }
         OpCode::NextMark => {
             st.bodies.push(Region::Next(st.cur_site));
@@ -1188,6 +1223,24 @@ fn foreach_bind(
                                 interp,
                                 "TCL WRITE VARNAME",
                             );
+                            if info.framed {
+                                // FRAMED unit: the dispatched foreach's
+                                // decoration rides between the message
+                                // and the command frame (tclsh top-level
+                                // shape).
+                                let what = if info.lmap { "lmap" } else { "foreach" };
+                                let deco = format!(
+                                    "\n    (setting {} loop variable \"{}\")",
+                                    what,
+                                    name
+                                );
+                                if interp.err_info.is_none() {
+                                    interp.err_info = Some(e.message_text());
+                                }
+                                if let Some(info_s) = &mut interp.err_info {
+                                    info_s.push_str(&deco);
+                                }
+                            }
                         }
                         return Err(e);
                     }

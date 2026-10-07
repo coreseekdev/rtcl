@@ -167,7 +167,7 @@ impl Compiler {
             | OpCode::LoopEnter { .. } | OpCode::LoopExit | OpCode::Break | OpCode::Continue
             | OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. }
             | OpCode::ForeachCollect | OpCode::ForeachEnd
-            | OpCode::LappendLocal(_) | OpCode::LappendVar(_)
+            | OpCode::LappendLocal(_) | OpCode::LappendVar(_) | OpCode::BodyMarkFramed
             | OpCode::AddSlotSlot(_, _) | OpCode::AddSlotImm(_, _)
             | OpCode::CmpSlotSlot(_, _, _) | OpCode::CmpSlotImm(_, _, _)
             | OpCode::Return | OpCode::Exit(_)
@@ -262,8 +262,8 @@ impl Compiler {
                 // tclsh's compiledLocals requirement; every other context
                 // (top level, eval, uplevel, namespace eval) keeps the
                 // dispatched command's semantics.
-                "foreach" if self.locals_mode => return self.compile_foreach(cmd, false),
-                "lmap" if self.locals_mode => return self.compile_foreach(cmd, true),
+                "foreach" => return self.compile_foreach(cmd, false),
+                "lmap" => return self.compile_foreach(cmd, true),
                 // `lappend <literal-var> <value>` — the list-builder shape
                 // (build loops).  Folded to a slot/name op: the value word
                 // compiles inline, the op appends through the variable's
@@ -812,7 +812,10 @@ impl Compiler {
             return self.compile_dyncall(cmd);
         }
         let line = self.abs_line(cmd);
-        let info_idx = self.bytecode.add_foreach_info(ForeachInfo { groups, lmap });
+        let framed = !self.locals_mode;
+        let info_idx =
+            self.bytecode
+                .add_foreach_info(ForeachInfo { groups, lmap, framed });
 
         for g in 0..ngroups {
             let wi = 2 + 2 * g;
@@ -825,7 +828,11 @@ impl Compiler {
         );
 
         let body_pc = self.bytecode.current_offset();
-        self.bytecode.emit(OpCode::BodyMark, line);
+        if framed {
+            self.bytecode.emit(OpCode::BodyMarkFramed, line);
+        } else {
+            self.bytecode.emit(OpCode::BodyMark, line);
+        }
         let body_word = cmd.words[body_idx].clone();
         self.compile_body_inline(&body_word, cmd, body_idx);
         if lmap {

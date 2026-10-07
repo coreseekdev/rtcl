@@ -1297,3 +1297,21 @@ var_incr                 44         34      0.7
 # the Fx-hashed String-keyed memos (G19/G23) stand.  (Shell-state resets
 # between bench invocations also produced phantom 1ms readings — measure
 # with freshly-defined helpers in the same command.)
+
+# ---------------------------------------------------------------------------
+# G24 2026-10-07: framed foreach — the global inline now reproduces the
+# dispatched tclsh shape.  ForeachInfo gains `framed` (true when the
+# foreach compiles OUTSIDE a proc body — tclsh's compiledLocals gating),
+# ForeachStart pushes Region::BodyFramed for those, and the error
+# protocol gains the dispatched shape: body errors crossing the framed
+# region append the innermost frame, the `("foreach"/"lmap" body line N)`
+# exit frame, AND the foreach command's own `invoked from within`
+# harness (all immediate — the pending-top deferral loses the frame to
+# inner catch); loop-var write failures gain the
+# `(setting foreach loop variable "x")` decoration before the harness.
+# All five foreach-shape pins (loops.rs + vm_exec foreach_inline_tests)
+# pass; gen_foreach foreach-1.14 byte-exact.
+#
+# This completes the foreach global inline (the gate opened in G21's
+# experiment): the compiled engine now matches the tree at every scope.
+# Gates: judge 87/87; sweep 0; tests 1143/0.

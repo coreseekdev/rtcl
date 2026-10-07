@@ -1315,3 +1315,20 @@ var_incr                 44         34      0.7
 # This completes the foreach global inline (the gate opened in G21's
 # experiment): the compiled engine now matches the tree at every scope.
 # Gates: judge 87/87; sweep 0; tests 1143/0.
+
+# ---------------------------------------------------------------------------
+# G25 2026-10-07 (FINAL optimization round): pooled args + method-head
+# cache.  The OO dispatch arm assembles [typed, method, call_args...] per
+# call — three allocations (the Vec + two from_str Values).  The Vec now
+# comes from OoState.args_pool (take/put, cap 8), and the head Values are
+# cached on MethodDef.head_cache keyed by the typed name (recycled on
+# call-site match).  oo_bench2 558 -> 508ms.  Gates: judge 87/87; sweep
+# 0; tests 1143/0; wasm32 build + node suite 18/18.
+#
+# == OPTIMIZATION PHASE CLOSED (production marking) — the definitive
+# settled-load board: oo 1.19x, vars 1.52x, fe 2.2x, fib 1.21x, dloop
+# 1.15x, build 1.43x; micro suite 0.6-1.0x (arith/var_incr/string_build
+# FASTER than tclsh).  wasm32: build green, node suite 18/18, 1.6MB.
+# The remaining levers are the two documented projects (foreach routing
+# parity, pointer-stable storage) plus direct threading — all deferred
+# with full playbooks above.

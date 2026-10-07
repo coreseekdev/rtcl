@@ -1286,3 +1286,14 @@ var_incr                 44         34      0.7
 # dispatcher's canonical key is now zero-alloc end-to-end (the
 # define-time callers materialize Strings; they are cold).
 # Gates: judge 87/87; sweep 0; tests 1143/0.
+
+# ---------------------------------------------------------------------------
+# G23b (NEGATIVE RESULT, reverted): Rc-keyed chain memos + Rc ActiveMethod.
+# Converting the chain/key memo keys (and ActiveMethod's obj/method) from
+# String to Rc<str> — to hand the dispatcher zero-alloc canonical keys —
+# measured 498 -> 617ms on oo_bench2 (+23%): the hit path needed the
+# stored key Rcs, and recovering them (memo.keys().find over the memo's
+# entries) cost more than the two String allocations it saved.  Reverted;
+# the Fx-hashed String-keyed memos (G19/G23) stand.  (Shell-state resets
+# between bench invocations also produced phantom 1ms readings — measure
+# with freshly-defined helpers in the same command.)

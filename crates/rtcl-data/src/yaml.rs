@@ -1,13 +1,16 @@
-//! YAML extension — `yaml::decode` and `yaml::encode` (mirrors core json.rs
-//! bridging conventions: `-null` option, bool→"1"/"0", numbers→canonical
-//! decimal strings, mapping→dict, sequence→list).
+//! YAML 扩展 — `yaml::decode` 与 `yaml::encode`。
+//!
+//! 桥接标量约定为本命令自有约定（有意偏离 core json.rs）：bool→"1"/"0"、
+//! number 经 serde_yaml 规范化为十进制串（不保留原文写法）；
+//! null→`-null` 替换值、string 原样、mapping→dict、sequence→list。
 //!
 //! ## Commands
 //!
 //! - `yaml::decode ?-null string? yaml-text`
 //! - `yaml::encode value`
 //!
-//! Also available as ensemble: `yaml decode ...`, `yaml encode ...`.
+//! 亦可作 ensemble：`yaml decode …`、`yaml encode …`（派发按实参位置识别、
+//! 与注册名解耦，对 `rename` 免疫）。
 
 use rtcl_core::error::{Error, ErrorCode, Result};
 use rtcl_core::interp::Interp;
@@ -16,27 +19,28 @@ use rtcl_core::value::{DictMap, Value};
 // ── Public entry points ────────────────────────────────────────
 
 /// `yaml` ensemble — dispatches to `decode` / `encode`.
-pub fn cmd_yaml(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_yaml(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    // ensemble 形态：args[0] = 注册名（`rename` 后可为任意名），args[1] = 子命令词，
+    // 载荷/选项自 args[2] 起。派发只认位置（args[1]）、不认注册名字面，
+    // 故 `rename yaml y` 后 `y decode …` 依旧正确路由。
     if args.len() < 2 {
-        return Err(Error::wrong_args("yaml", 2, args.len()));
+        let name = args.first().map(|v| v.as_str()).unwrap_or("yaml");
+        return Err(Error::wrong_args(name, 2, args.len()));
     }
+    let name = args[0].as_str();
     match args[1].as_str() {
-        "decode" => cmd_yaml_decode(interp, args),
-        "encode" => cmd_yaml_encode(interp, args),
+        "decode" => yaml_decode_from(args, 2),
+        "encode" => yaml_encode_from(args, 2),
         other => Err(Error::runtime(
-            format!("unknown yaml subcommand \"{}\": must be decode or encode", other),
+            format!("unknown {name} subcommand \"{other}\": must be decode or encode"),
             ErrorCode::InvalidOp,
         )),
     }
 }
 
-/// `yaml::decode ?-null string? yaml-text`
-pub fn cmd_yaml_decode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    // Ensemble call has args[0] == "yaml" with the subcommand word at args[1];
-    // a direct mount has args[0] == "yaml::decode" and args[1] is already the
-    // payload — so form detection must look at args[0], never args[1] (whose
-    // value may legitimately be the literal string "decode").
-    let start = if args.first().is_some_and(|v| v.as_str() == "yaml") { 2 } else { 1 };
+/// decode 实现 — `start` 由调用方按调用形态显式给定（ensemble = 2，直挂 = 1）。
+/// 实现本身绝不嗅探注册名，因此对 `rename` 免疫。
+fn yaml_decode_from(args: &[Value], start: usize) -> Result<Value> {
     let mut null_value = "null".to_string();
     let mut i = start;
 
@@ -70,10 +74,8 @@ pub fn cmd_yaml_decode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(bridge(&doc, &null_value))
 }
 
-/// `yaml::encode value`
-pub fn cmd_yaml_encode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    // Same args[0]-based form detection as cmd_yaml_decode.
-    let start = if args.first().is_some_and(|v| v.as_str() == "yaml") { 2 } else { 1 };
+/// encode 实现 — 同 [`yaml_decode_from`]，`start` 由调用方显式给定。
+fn yaml_encode_from(args: &[Value], start: usize) -> Result<Value> {
     if args.len() <= start {
         return Err(Error::wrong_args_with_usage(
             "yaml::encode", 1, 0, "value"));
@@ -85,13 +87,30 @@ pub fn cmd_yaml_encode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::from_str(&text))
 }
 
+/// `yaml::decode ?-null string? yaml-text` — 直挂形态：args[0] = 注册名，
+/// args[1] 起即选项/载荷（start = 1）。
+pub fn cmd_yaml_decode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    // 本函数历史上也承接 ensemble 形态实参（args[0] == "yaml" 且带子命令词 →
+    // start = 2），该双形态兼容按 args[0] 字面嗅探保留，只服务 Rust 直调方；
+    // 经注册名的 ensemble 路径一律走 cmd_yaml 的显式起点，对 rename 免疫。
+    // 形态识别必须看 args[0]、绝不能看 args[1]（其值恰可为字面 "decode"）。
+    let start = if args.first().is_some_and(|v| v.as_str() == "yaml") { 2 } else { 1 };
+    yaml_decode_from(args, start)
+}
+
+/// `yaml::encode value` — 直挂形态；双形态兼容同 [`cmd_yaml_decode`]。
+pub fn cmd_yaml_encode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let start = if args.first().is_some_and(|v| v.as_str() == "yaml") { 2 } else { 1 };
+    yaml_encode_from(args, start)
+}
+
 // ═══════════════════════════════════════════════════════════════
 // YAML → VALUE BRIDGE
 // ═══════════════════════════════════════════════════════════════
 
-/// Bridge a serde_yaml value to a rtcl Value (scalar table mirrors json.rs
-/// decode: null→`-null` value, bool→"1"/"0", number→canonical decimal string,
-/// string→verbatim; mapping→dict, sequence→list).
+/// Bridge a serde_yaml value to a rtcl Value — 标量表按本命令自有约定：
+/// null→`-null` 值、bool→"1"/"0"、number→serde_yaml 规范十进制串、
+/// string 原样；mapping→dict，sequence→list。
 fn bridge(sv: &serde_yaml::Value, null_repl: &str) -> Value {
     match sv {
         serde_yaml::Value::Null => Value::from_str(null_repl),
@@ -302,5 +321,24 @@ mod tests {
             Value::from_str("a: null\nb: 1\n"),
         ]).unwrap();
         assert_eq!(v.as_str(), "a NA b 1");
+    }
+
+    // ── 评审回归：ensemble 更名后按新名调用，派发不得依赖注册名字面 ──
+
+    #[test]
+    fn ensemble_survives_rename() {
+        let mut i = interp();
+        crate::register::register(&mut i);
+        i.eval("rename yaml y").unwrap();
+        // 更名后的 ensemble decode：位置派发，载荷自 args[2] 起
+        let v = i.eval("y decode {k: v}").unwrap();
+        assert_eq!(v.as_str(), "k v");
+        // 更名后的 ensemble encode：dict rep → mapping；标量按本命令约定
+        // 以字符串交给 serde_yaml，数字形的 "1" 须被单引号钉成字符串
+        let e = i.eval("y encode [dict create a 1]").unwrap();
+        assert_eq!(e.as_str(), "a: '1'\n");
+        // 直挂不受 ensemble 更名影响：yaml::decode 仍按直挂形态解析标量
+        let d = i.eval("yaml::decode decode").unwrap();
+        assert_eq!(d.as_str(), "decode");
     }
 }

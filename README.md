@@ -69,7 +69,7 @@ interp.eval("set x 42").unwrap();
 
 ### rtcl-data（宿主挂载的数据原语，`rtcl_data::register`）
 
-`yaml::decode/encode` · `sha1` · `sha256` · `atomic-write` · `url::normalize` · `url::key` · `url::pubkey`
+`yaml` · `yaml::decode/encode` · `sha1` · `sha256` · `atomic-write` · `url::normalize` · `url::key` · `url::pubkey`
 
 ## 表达式
 

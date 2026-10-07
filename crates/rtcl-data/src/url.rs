@@ -1,4 +1,6 @@
 //! URL 规范化与确定性 key（zk 血统；cito `src/key.rs` 的收编上层）。
+//! cito 血统出自 ERP zettelkasten zk.py（spec §5.1），收编自 cito
+//! `src/key.rs`（原行内 spec §5.1 引用按此处语境还原）。
 //!
 //! 规则：小写 scheme/host、去 `www.`、去 userinfo、去 fragment、
 //! 去 `utm_*`/`fbclid`/`gclid`、query 按 key 排序、去路径尾 `/`、

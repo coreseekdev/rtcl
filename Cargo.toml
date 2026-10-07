@@ -8,6 +8,7 @@ members = [
     "crates/rtcl-cli",
     "crates/rtcl-expect",
     "crates/rtcl-wasm",
+    "crates/rtcl-data",
 ]
 
 [workspace.package]
@@ -45,6 +46,11 @@ regex-lite = "0.1"
 num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
+rtcl-data = { path = "crates/rtcl-data" }
+sha1 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+serde_yaml = "0.9"
 
 [profile.release]
 opt-level = "s"      # Optimize for size

@@ -81,6 +81,11 @@ pub(crate) struct MethodDef {
     /// a `variable` declaration change rebuilds (the `define` word also
     /// bumps `mutation_ctr`, retiring the chain memo with it).
     pub proc_memo: Rc<RefCell<Option<(String, Vec<String>, Rc<ProcDef>)>>>,
+    /// Cached argument head for the invoked method: (typed name, the two
+    /// head Values [typed, method]).  The typed name varies per CALL SITE
+    /// (`c` vs `::c`); a match recycles the head Values without
+    /// allocation.  Cold on misses.
+    pub head_cache: RefCell<Option<(String, Value, Value)>>,
 }
 
 /// A fresh [`MethodDef::proc_memo`] cell.
@@ -178,6 +183,10 @@ pub(crate) struct OoState {
     /// Objects and classes in creation order (listing/cascade order).
     pub creation_order: Vec<String>,
     pub active: Vec<ActiveMethod>,
+    /// Pooled argument vectors for method invocation: taken at dispatch,
+    /// returned after the call — steady-state method calls allocate
+    /// nothing for the argument vector.
+    pub args_pool: Vec<Vec<Value>>,
     pub define_stack: Vec<DefineTarget>,
     /// `my`/`self`/`next` command keys → owning object key.  Entries whose
     /// key no longer holds such a command were renamed away and are swept
@@ -217,7 +226,7 @@ pub(crate) struct OoState {
 // ── init ───────────────────────────────────────────────────────────────
 
 fn builtin_method(name: &'static str) -> MethodDef {
-    MethodDef { params: Vec::new().into(), body: Rc::from(""), exported: true, kind: MethodKind::Builtin(name), proc_memo: fresh_memo() }
+    MethodDef { params: Vec::new().into(), body: Rc::from(""), exported: true, kind: MethodKind::Builtin(name), proc_memo: fresh_memo(), head_cache: RefCell::new(None) }
 }
 
 fn register_object_command(interp: &mut Interp, key: &str, func: crate::command::CommandFunc) {
@@ -759,8 +768,28 @@ fn exec_chain_entry(
                 interp.frame_prelink = Some(links);
             }
 
-            let mut args: Vec<Value> =
-                vec![Value::from_str(typed), Value::from_str(method)];
+            // Argument head (typed, method Values) from the MethodDef's
+            // cache when the typed name matches the last call site; the
+            // vector itself comes from the pool — steady-state method
+            // calls allocate nothing for the dispatch arguments.
+            let mut args = interp.oo.args_pool.pop().unwrap_or_default();
+            args.clear();
+            {
+                let mut hc = entry.def.head_cache.borrow_mut();
+                match hc.as_mut() {
+                    Some((t, h0, h1)) if t == typed => {
+                        args.push(h0.clone());
+                        args.push(h1.clone());
+                    }
+                    _ => {
+                        let h0 = Value::from_str(typed);
+                        let h1 = Value::from_str(method);
+                        args.push(h0.clone());
+                        args.push(h1.clone());
+                        *hc = Some((typed.to_string(), h0, h1));
+                    }
+                }
+            }
             args.extend_from_slice(call_args);
 
             let ns = object_ns_of(interp, key);
@@ -773,6 +802,10 @@ fn exec_chain_entry(
             });
             let r = interp.call_proc(&proc_def, &args, typed, Some(ns));
             cleanup_active(interp);
+            args.clear();
+            if interp.oo.args_pool.len() < 8 {
+                interp.oo.args_pool.push(args);
+            }
             r
         }
     }
@@ -1661,7 +1694,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                 body: Rc::from(rest[2].as_str()),
                 exported: name_exports(&name),
                 kind: MethodKind::Tcl,
-                proc_memo: fresh_memo(),
+                proc_memo: fresh_memo(), head_cache: RefCell::new(None),
             };
             set_method(interp, &target, &name, def)
         }
@@ -1680,7 +1713,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     cmd: rest[1].as_str().to_string(),
                     prefix: rest[2..].iter().map(|v| v.as_str().to_string()).collect(),
                 },
-                proc_memo: fresh_memo(),
+                proc_memo: fresh_memo(), head_cache: RefCell::new(None),
             };
             set_method(interp, &target, &name, def)
         }
@@ -1769,7 +1802,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                         body: Rc::from(rest[1].as_str()),
                         exported: false,
                         kind: MethodKind::Tcl,
-                        proc_memo: fresh_memo(),
+                        proc_memo: fresh_memo(), head_cache: RefCell::new(None),
                     });
                 }
             }
@@ -1790,7 +1823,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                         body: Rc::from(rest[0].as_str()),
                         exported: false,
                         kind: MethodKind::Tcl,
-                        proc_memo: fresh_memo(),
+                        proc_memo: fresh_memo(), head_cache: RefCell::new(None),
                     });
                 }
             }

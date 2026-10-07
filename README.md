@@ -65,6 +65,10 @@ interp.eval("set x 42").unwrap();
 `oo::class`/`oo::object`/`oo::define`/`oo::copy`/`self`/`my`/`next` +
 36 项扩展。逐命令语义由判官语料钉死。
 
+### rtcl-data（宿主挂载的数据原语，`rtcl_data::register`）
+
+`yaml::decode/encode` · `sha1` · `sha256` · `atomic-write` · `url::normalize` · `url::key` · `url::pubkey`
+
 ## 表达式
 
 标准 Tcl 表达式语义：i64 + 自动 bignum 宽化、浮点 Inf/NaN、

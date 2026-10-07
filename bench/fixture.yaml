@@ -1,0 +1,125 @@
+# rtcl-data micro-bench fixture — ~4KB real-world YAML (bib card collection).
+# Shape mirrors the zk/cardnote workload: nested maps, lists, unicode, quoted
+# scalars, multi-line strings. Keep this file stable — bench numbers depend on it.
+collection: zk-reading
+updated: "2026-09-30T08:15:00Z"
+owner:
+  name: 陈明
+  orcid: 0000-0002-1825-0097
+  affiliation: "Institute of Systems Research"
+defaults:
+  null_marker: NA
+  key_scheme: domain-h8
+  dedupe: true
+cards:
+  - id: a2a-protocol-org--cf95d4df
+    type: web
+    title: "Agent2Agent Protocol Specification"
+    url: "https://a2a-protocol.org/A2A/latest/specification/"
+    authors: []
+    published: ""
+    tags: [agent, protocol, interop]
+    notes: >-
+      Open protocol enabling agent-to-agent discovery and task delegation;
+      complements MCP which binds an agent to tools and resources.
+    metrics:
+      visits: 42
+      highlights: 7
+  - id: rust-lang-org--5f1a2b3c
+    type: web
+    title: "The Rust Programming Language"
+    url: "https://doc.rust-lang.org/book/"
+    authors: [Steve Klabnik, Carol Nichols]
+    published: "2019-08-12"
+    tags: [rust, book, systems]
+    notes: >-
+      The canonical introductory text. Chapters 10 (generics, traits,
+      lifetimes) and 15 (smart pointers) are the ones worth re-reading.
+    metrics:
+      visits: 310
+      highlights: 54
+  - id: arxiv-org--9c2e77a1
+    type: paper
+    title: "Attention Is All You Need"
+    url: "https://arxiv.org/abs/1706.03762"
+    authors:
+      - Ashish Vaswani
+      - Noam Shazeer
+      - Niki Parmar
+      - Jakob Uszkoreit
+      - Llion Jones
+      - Aidan N. Gomez
+      - Lukasz Kaiser
+      - Illia Polosukhin
+    published: "2017-06-12"
+    tags: [transformer, attention, nlp]
+    notes: |
+      Introduced the Transformer architecture: self-attention replaces
+      recurrence entirely. Multi-head attention allows the model to attend
+      to information from different representation subspaces.
+    metrics:
+      visits: 128
+      highlights: 23
+  - id: example-com--0000feed
+    type: template
+    title: "Placeholder card — shape only"
+    url: "https://example.com/docs/getting-started?utm_source=newsletter&id=7#intro"
+    authors: [Ada Lovelace, Alan Turing, Grace Hopper, Edsger Dijkstra]
+    published: "2024-11-01"
+    tags: [draft, example]
+    notes: >-
+      Exercises normalization paths in the key derivation: tracking params,
+      fragment stripping, trailing slash. Derived key should be
+      example-com--<h8> regardless of the noise parameters.
+    metrics:
+      visits: 0
+      highlights: 0
+  - id: tcl-lang-org--7b31d908
+    type: web
+    title: "Tcl Developer Site — Tcler's Wiki"
+    url: "https://wiki.tcl-lang.org/page/Brace%20usage"
+    authors: [Richard Suchenwirth]
+    published: "2003-03-21"
+    tags: [tcl, wiki, history]
+    notes: >-
+      Everything is a string, and that turned out to be a feature.
+      Braces defer evaluation; concat + uplevel is the classic control
+      structure recipe.
+    metrics:
+      visits: 87
+      highlights: 12
+  - id: sqlite-org--d4a19f22
+    type: web
+    title: "How SQLite Scales Read Concurrency"
+    url: "https://www.sqlite.org/wal.html#concurrency"
+    authors: [D. Richard Hipp]
+    published: "2010-04-29"
+    tags: [sqlite, wal, storage]
+    notes: >-
+      Write-ahead logging decouples readers from the writer: readers
+      never block, the writer never blocks readers. The checkpoint
+      strategy bounds WAL growth; busy_timeout governs contention.
+    metrics:
+      visits: 203
+      highlights: 31
+counts:
+  total: 6
+  by_type:
+    web: 4
+    paper: 1
+    template: 1
+  by_tag:
+    agent: 1
+    rust: 1
+    transformer: 1
+    draft: 1
+    tcl: 1
+    sqlite: 1
+schema:
+  required: [id, type, title, url]
+  optional: [authors, published, tags, notes, metrics]
+  id_pattern: "^<domain-slug>--<8hex>$"
+  key_rules:
+    - "normalize: lowercase host, drop www./userinfo/fragment/utm_*"
+    - "slug: host with dots replaced by dashes"
+    - "fingerprint: first 8 hex of sha1 over the normalized url"

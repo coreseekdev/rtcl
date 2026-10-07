@@ -6,6 +6,9 @@
 //! 缺 scheme 补 https。
 
 use crate::error::{DataError, Result};
+use rtcl_core::error::{Error, ErrorCode};
+use rtcl_core::interp::Interp;
+use rtcl_core::value::Value;
 use sha1::{Digest, Sha1};
 
 /// 小写 scheme/host、去 www.、去 userinfo、去 fragment、
@@ -148,6 +151,40 @@ pub fn strip_suffix(key: &str) -> &str {
     }
 }
 
+// ── Command wrappers ───────────────────────────────────────────
+
+/// `url::normalize url` → 规范化形态
+pub fn cmd_url_normalize(_interp: &mut Interp, args: &[Value]) -> rtcl_core::error::Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::wrong_args("url::normalize", 2, args.len()));
+    }
+    normalize_url(args[1].as_str())
+        .map(|s| Value::from_str(&s))
+        .map_err(|e| Error::runtime(e.to_string(), ErrorCode::InvalidOp))
+}
+
+/// `url::key url` → `domain--h8`（规范化 + 域名 slug + 8 位指纹）
+pub fn cmd_url_key(_interp: &mut Interp, args: &[Value]) -> rtcl_core::error::Result<Value> {
+    if args.len() != 2 {
+        return Err(Error::wrong_args("url::key", 2, args.len()));
+    }
+    derive_key(args[1].as_str())
+        .map(|s| Value::from_str(&s))
+        .map_err(|e| Error::runtime(e.to_string(), ErrorCode::InvalidOp))
+}
+
+/// `url::pubkey title firstAuthor published` → `pub--h8`
+pub fn cmd_url_pubkey(_interp: &mut Interp, args: &[Value]) -> rtcl_core::error::Result<Value> {
+    if args.len() != 4 {
+        return Err(Error::wrong_args("url::pubkey", 4, args.len()));
+    }
+    Ok(Value::from_str(&derive_pub_key(
+        args[1].as_str(),
+        args[2].as_str(),
+        args[3].as_str(),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +257,57 @@ mod tests {
     #[test]
     fn invalid_url_rejected() {
         assert!(normalize_url("::bad::").is_err());
+    }
+
+    #[test]
+    fn cmd_url_normalize_and_key_happy_path() {
+        let mut i = rtcl_core::interp::Interp::new();
+        let n = cmd_url_normalize(&mut i, &[
+            Value::from_str("url::normalize"),
+            Value::from_str("HTTPS://WWW.Example.com/A/B/?utm_source=x&id=2#frag"),
+        ]).unwrap();
+        assert_eq!(n.as_str(), "https://example.com/A/B?id=2");
+        let k = cmd_url_key(&mut i, &[
+            Value::from_str("url::key"),
+            Value::from_str("https://a2a-protocol.org/A2A/latest/specification/"),
+        ]).unwrap();
+        assert_eq!(k.as_str(), "a2a-protocol-org--cf95d4df");
+    }
+
+    #[test]
+    fn cmd_url_pubkey_happy_path() {
+        let mut i = rtcl_core::interp::Interp::new();
+        let k = cmd_url_pubkey(&mut i, &[
+            Value::from_str("url::pubkey"),
+            Value::from_str("Some Title"),
+            Value::from_str("Alice"),
+            Value::from_str("2026-05-07"),
+        ]).unwrap();
+        assert_eq!(k.as_str(), derive_pub_key("Some Title", "Alice", "2026-05-07"));
+        assert!(k.as_str().starts_with("pub--"));
+    }
+
+    #[test]
+    fn cmd_url_arity_errors() {
+        let mut i = rtcl_core::interp::Interp::new();
+        assert!(cmd_url_normalize(&mut i, &[Value::from_str("url::normalize")]).is_err());
+        assert!(cmd_url_key(&mut i, &[
+            Value::from_str("url::key"),
+            Value::from_str("https://a.com"),
+            Value::from_str("extra"),
+        ]).is_err());
+        assert!(cmd_url_pubkey(&mut i, &[
+            Value::from_str("url::pubkey"),
+            Value::from_str("t"), Value::from_str("a"),
+        ]).is_err());
+    }
+
+    #[test]
+    fn cmd_url_normalize_bad_url_is_runtime_error() {
+        let mut i = rtcl_core::interp::Interp::new();
+        let r = cmd_url_normalize(&mut i, &[
+            Value::from_str("url::normalize"), Value::from_str("::bad::"),
+        ]);
+        assert!(r.is_err());
     }
 }

@@ -1332,3 +1332,12 @@ var_incr                 44         34      0.7
 # The remaining levers are the two documented projects (foreach routing
 # parity, pointer-stable storage) plus direct threading — all deferred
 # with full playbooks above.
+# rtcl-data micro baseline — f809dbe 2026-10-07
+# Linux 7.0.0-34-generic x86_64, release, best-of-3
+# harness: crates/rtcl-data/src/bin/data_bench.rs (lib-level, no interp), fixture bench/fixture.yaml
+
+bench            per-op
+yaml_decode_4kb  74.2 us
+url_normalize    629 ns
+sha256_64b       203 ns
+

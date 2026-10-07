@@ -32,8 +32,11 @@ pub fn cmd_yaml(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 /// `yaml::decode ?-null string? yaml-text`
 pub fn cmd_yaml_decode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    // Parse options — skip args[0] ("yaml") and args[1] ("decode")
-    let start = if args.len() > 1 && args[1].as_str() == "decode" { 2 } else { 1 };
+    // Ensemble call has args[0] == "yaml" with the subcommand word at args[1];
+    // a direct mount has args[0] == "yaml::decode" and args[1] is already the
+    // payload — so form detection must look at args[0], never args[1] (whose
+    // value may legitimately be the literal string "decode").
+    let start = if args.first().is_some_and(|v| v.as_str() == "yaml") { 2 } else { 1 };
     let mut null_value = "null".to_string();
     let mut i = start;
 
@@ -69,7 +72,8 @@ pub fn cmd_yaml_decode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 /// `yaml::encode value`
 pub fn cmd_yaml_encode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    let start = if args.len() > 1 && args[1].as_str() == "encode" { 2 } else { 1 };
+    // Same args[0]-based form detection as cmd_yaml_decode.
+    let start = if args.first().is_some_and(|v| v.as_str() == "yaml") { 2 } else { 1 };
     if args.len() <= start {
         return Err(Error::wrong_args_with_usage(
             "yaml::encode", 1, 0, "value"));
@@ -265,6 +269,28 @@ mod tests {
             Value::from_str("yaml::encode"), Value::from_str("3"),
         ]).unwrap();
         assert_eq!(numeric.as_str(), "'3'\n", "钉死 serde_yaml 的实际引号行为");
+    }
+
+    // ── Task-6.1 回归：直挂载荷恰为字面 "decode"/"encode" 时不得误判为 ensemble ──
+
+    #[test]
+    fn direct_mount_decode_payload_literal_decode() {
+        // 直挂形态 args[1] 已是载荷；载荷恰为字面 "decode"（合法 YAML 标量）
+        // 曾被 args[1] 哨兵误判成 ensemble 而报 wrong-args
+        let mut i = interp();
+        let v = cmd_yaml_decode(&mut i, &[
+            Value::from_str("yaml::decode"), Value::from_str("decode"),
+        ]).unwrap();
+        assert_eq!(v.as_str(), "decode");
+    }
+
+    #[test]
+    fn direct_mount_encode_payload_literal_encode() {
+        let mut i = interp();
+        let e = cmd_yaml_encode(&mut i, &[
+            Value::from_str("yaml::encode"), Value::from_str("encode"),
+        ]).unwrap();
+        assert_eq!(e.as_str(), "encode\n");
     }
 
     #[test]

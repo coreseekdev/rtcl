@@ -1276,3 +1276,13 @@ var_incr                 44         34      0.7
 # touching the payload.  (The workspace test-compile also briefly
 # reported "tests: 0" — a stale-binary race, not a compile break.)
 # Gates: judge 87/87; sweep 0; tests 1143/0.
+
+# ---------------------------------------------------------------------------
+# G23 2026-10-07: the OO tables and memo keys go Fx/Rc.  OoState's
+# objects/classes/my_commands hash with the interpreter's unkeyed Fx
+# (they were std RandomState — resolve_object_key's two candidate
+# probes paid SipHash per call).  The chain/key memos key on Rc<str>
+# (probes still by &str), and the memo hit returns an Rc clone — the
+# dispatcher's canonical key is now zero-alloc end-to-end (the
+# define-time callers materialize Strings; they are cold).
+# Gates: judge 87/87; sweep 0; tests 1143/0.

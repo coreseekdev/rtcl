@@ -38,6 +38,8 @@ use core::cell::RefCell;
 use std::collections::HashMap;
 #[cfg(not(feature = "embedded"))]
 type FxMap<V> = std::collections::HashMap<String, V, std::hash::BuildHasherDefault<crate::interp::varmap::VarHasher>>;
+type FxMapK<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<crate::interp::varmap::VarHasher>>;
 
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeMap as HashMap;
@@ -202,14 +204,14 @@ pub(crate) struct OoState {
     /// (wasm32 is a target).  The `Rc` chain is shared with the
     /// `ActiveMethod` snapshots, so `next` also stops paying a
     /// `to_vec` per invocation.
-    pub chain_memo: FxMap<FxMap<(u64, Rc<Vec<ChainEntry>>)>>,
+    pub chain_memo: FxMapK<Rc<str>, FxMapK<Rc<str>, (u64, Rc<Vec<ChainEntry>>)>>,
     /// The `include_private` half of [`Self::chain_memo`].
-    pub chain_memo_priv: FxMap<FxMap<(u64, Rc<Vec<ChainEntry>>)>>,
+    pub chain_memo_priv: FxMapK<Rc<str>, FxMapK<Rc<str>, (u64, Rc<Vec<ChainEntry>>)>>,
     /// Typed-name → canonical object/class key memo (see
     /// `resolve_object_key`): current namespace → typed name →
     /// (stamp, resolution).  `RefCell` so `&Interp` read paths can fill
     /// it, the `proc_memo` precedent.
-    pub key_memo: RefCell<FxMap<FxMap<(u64, Option<Rc<str>>)>>>,
+    pub key_memo: RefCell<FxMapK<Rc<str>, FxMapK<Rc<str>, (u64, Option<Rc<str>>)>>>,
 }
 
 // ── init ───────────────────────────────────────────────────────────────
@@ -329,7 +331,7 @@ fn object_key_candidates(interp: &Interp, typed: &str) -> Vec<String> {
 }
 
 /// Resolve an as-typed name to an object/class key.
-fn resolve_object_key(interp: &Interp, typed: &str) -> Option<String> {
+fn resolve_object_key(interp: &Interp, typed: &str) -> Option<Rc<str>> {
     // The resolution is a pure function of (current namespace, typed
     // name, the object/class tables) — and every table mutation bumps
     // `mutation_ctr` (the chain_memo audit), so entries validate against
@@ -344,7 +346,7 @@ fn resolve_object_key(interp: &Interp, typed: &str) -> Option<String> {
         if let Some(inner) = memo.get(interp.current_namespace.as_ref()) {
             if let Some((stamp, k)) = inner.get(typed) {
                 if *stamp == interp.oo.mutation_ctr {
-                    return k.as_ref().map(|k| k.to_string());
+                    return k.clone();
                 }
             }
         }
@@ -366,14 +368,14 @@ fn resolve_object_key(interp: &Interp, typed: &str) -> Option<String> {
             memo.clear();
         }
         let inner = memo
-            .entry(interp.current_namespace.to_string())
-            .or_insert_with(FxMap::default);
+            .entry(Rc::from(interp.current_namespace.as_ref()))
+            .or_insert_with(FxMapK::default);
         if inner.len() >= KEY_MEMO_NAME_MAX {
             inner.clear();
         }
-        inner.insert(typed.to_string(), (interp.oo.mutation_ctr, resolved.clone()));
+        inner.insert(Rc::from(typed), (interp.oo.mutation_ctr, resolved.clone()));
     }
-    resolved.map(|k| k.to_string())
+    resolved
 }
 
 /// Does a command (builtin, proc, ensemble or alias) exist under this
@@ -932,9 +934,9 @@ fn chain_for(interp: &mut Interp, key: &str, method: &str, include_private: bool
         if memo.len() >= CHAIN_MEMO_MAX {
             memo.clear();
         }
-        memo.entry(key.to_string())
-            .or_insert_with(FxMap::default)
-            .insert(method.to_string(), (interp.oo.mutation_ctr, Rc::clone(&chain)));
+        memo.entry(Rc::from(key))
+            .or_insert_with(FxMapK::default)
+            .insert(Rc::from(method), (interp.oo.mutation_ctr, Rc::clone(&chain)));
     }
     chain
 }
@@ -1552,18 +1554,18 @@ extern "Rust" fn cmd_oo_define(interp: &mut Interp, args: &[Value]) -> Result<Va
     }
     let typed = args[1].as_str().to_string();
     let canonical = match resolve_object_key(interp, &typed) {
-        Some(k) if interp.oo.classes.contains_key(&k) => k,
+        Some(k) if interp.oo.classes.contains_key(k.as_ref()) => k,
         Some(_) => return Err(does_not_refer(false, &typed)),
         None => return Err(does_not_refer(true, &typed)),
     };
     if args.len() == 3 {
         let script = args[2].as_str().to_string();
-        run_define_script(interp, DefineTarget::Class(canonical), &script, true)
+        run_define_script(interp, DefineTarget::Class(canonical.to_string()), &script, true)
     } else {
         // Multi-word form: the words form a single command evaluated in the
         // definition context, with no definition-script error frame
         // (tclsh: `oo::define C error foo` reports only the outer frame).
-        interp.oo.define_stack.push(DefineTarget::Class(canonical));
+        interp.oo.define_stack.push(DefineTarget::Class(canonical.to_string()));
         let prev = core::mem::replace(&mut interp.current_namespace, Rc::from("::oo::define"));
         let r = interp.dispatch_values(&args[2..]);
         interp.current_namespace = prev;
@@ -1588,10 +1590,10 @@ extern "Rust" fn cmd_oo_objdefine(interp: &mut Interp, args: &[Value]) -> Result
     };
     if args.len() == 3 {
         let script = args[2].as_str().to_string();
-        run_define_script(interp, DefineTarget::Object(canonical), &script, false)
+        run_define_script(interp, DefineTarget::Object(canonical.to_string()), &script, false)
     } else {
         // Multi-word form — see cmd_oo_define.
-        interp.oo.define_stack.push(DefineTarget::Object(canonical));
+        interp.oo.define_stack.push(DefineTarget::Object(canonical.to_string()));
         let prev = core::mem::replace(&mut interp.current_namespace, Rc::from("::oo::define"));
         let r = interp.dispatch_values(&args[2..]);
         interp.current_namespace = prev;
@@ -1690,16 +1692,16 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     Some(k) => k,
                     None => return Err(does_not_refer(true, typed)),
                 };
-                if !interp.oo.classes.contains_key(&canonical) {
-                    if canonical == def_target_name(&target) {
+                if !interp.oo.classes.contains_key(canonical.as_ref()) {
+                    if canonical.as_ref() == def_target_name(&target) {
                         return Err(Error::Msg("may not mix a class into itself".to_string()));
                     }
                     return Err(Error::Msg("may only mix in classes".to_string()));
                 }
-                if canonical == def_target_name(&target) {
+                if canonical.as_ref() == def_target_name(&target) {
                     return Err(Error::Msg("may not mix a class into itself".to_string()));
                 }
-                mixins.push(canonical);
+                mixins.push(canonical.to_string());
             }
             match target {
                 DefineTarget::Object(name) => {
@@ -1730,17 +1732,17 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     Some(k) => k,
                     None => return Err(does_not_refer(true, typed)),
                 };
-                if !interp.oo.classes.contains_key(&canonical) {
+                if !interp.oo.classes.contains_key(canonical.as_ref()) {
                     return Err(Error::Msg("only a class can be a superclass".to_string()));
                 }
-                if canonical == target_name
+                if canonical.as_ref() == target_name
                     || linearize(interp, &canonical).iter().any(|c| *c == target_name)
                 {
                     return Err(Error::Msg(
                         "attempt to form circular dependency graph".to_string(),
                     ));
                 }
-                supers.push(canonical);
+                supers.push(canonical.to_string());
             }
             if let DefineTarget::Class(name) = target {
                 if let Some(c) = interp.oo.classes.get_mut(&name) {
@@ -1998,7 +2000,7 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     }
     let src_typed = args[1].as_str().to_string();
     let src = match resolve_object_key(interp, &src_typed) {
-        Some(k) if interp.oo.objects.contains_key(&k) => k,
+        Some(k) if interp.oo.objects.contains_key(k.as_ref()) => k,
         _ => return Err(does_not_refer(true, &src_typed)),
     };
     let (target_typed, full) = if args.len() == 4 {
@@ -2023,7 +2025,7 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     }
 
     let (source, ns) = {
-        let o = &interp.oo.objects[&src];
+        let o = &interp.oo.objects[src.as_ref()];
         (o.clone(), o.ns.clone())
     };
     interp.oo.next_obj_id += 1;
@@ -2107,7 +2109,9 @@ fn unknown_sub_error(word: &str, list: &[&str]) -> Error {
 }
 
 fn resolve_object_arg(interp: &Interp, typed: &str) -> std::result::Result<String, Error> {
-    resolve_object_key(interp, typed).ok_or_else(|| does_not_refer(true, typed))
+    resolve_object_key(interp, typed)
+        .map(|k| k.to_string())
+        .ok_or_else(|| does_not_refer(true, typed))
 }
 
 fn methods_listing(
@@ -2470,7 +2474,7 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                             } else {
                                 vec![]
                             };
-                            mixins.iter().any(|m| *m == t)
+                            mixins.iter().any(|m| m.as_str() == t.as_ref())
                         }
                         None => false,
                     }
@@ -2516,12 +2520,13 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 fn resolve_class_arg(interp: &Interp, typed: &str) -> std::result::Result<String, Error> {
+    // (cold define-time path: the Rc key materializes to String here)
     let key = match resolve_object_key(interp, typed) {
         Some(k) => k,
         None => return Err(does_not_refer(true, typed)),
     };
-    if interp.oo.classes.contains_key(&key) {
-        Ok(key)
+    if interp.oo.classes.contains_key(key.as_ref()) {
+        Ok(key.to_string())
     } else {
         Err(does_not_refer(false, typed))
     }
@@ -2655,7 +2660,7 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 super::list::set_error_code(interp, &format!("TCL LOOKUP OBJECT {}", typed));
                 does_not_refer(true, typed)
             })?;
-            if !interp.oo.classes.contains_key(&key) {
+            if !interp.oo.classes.contains_key(key.as_ref()) {
                 // Not-a-class: `TCL LOOKUP CLASS <name>` accompanies the
                 // message.
                 super::list::set_error_code(interp, &format!("TCL LOOKUP CLASS {}", typed));

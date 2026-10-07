@@ -1240,3 +1240,22 @@ var_incr                 44         34      0.7
 # 0.6x, var_incr 0.6x, string_build 0.8x, dict_ops 0.9x, list_ops
 # 1.0x, proc_fib 1.0x — the micro suite is at parity or faster
 # throughout.
+
+# ---------------------------------------------------------------------------
+# G21 2026-10-07: slot superinstructions — the loop-unrolling pass.  The
+# peephole now fuses the accumulator/condition triples EVERYWHERE
+# (including inside [expr ...] brackets — the earlier attempt required a
+# StoreLocal suffix and never fired; the window is the contiguous
+# [LoadLocal, LoadLocal/PushInt, ARITH-or-CMP] triple):
+#   [LL, LL, Add]        -> AddSlotSlot(a, b)
+#   [LL, PushInt, Add]   -> AddSlotImm(a, k)
+#   [LL, LL, CMP]        -> CmpSlotSlot(a, b, cc)   (cc: 4 orders + eq/ne)
+#   [LL/PushInt, CMP]    -> CmpSlotImm (mirrored cc for swapped operands)
+# The fused ops replicate LoadLocal's exact fallback (eval_var_ref on
+# the table name — globals fallback, linked-slot resolution, canonical
+# errors) inside themselves; comparisons run through op_rel/op_eq so
+# string operands are identical.  perf stat (3M while+incr):
+# instructions 2652M -> 2351M (-11%; the while body fuses only its
+# condition — the sum loop fuses 3 ops -> 1).  Gates: judge 87/87;
+# sweep 0; tests 1143/0; numeric probes byte-exact.  Definitive bench
+# deferred (external node load oscillating).

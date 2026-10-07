@@ -1045,6 +1045,35 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         //    semantics — overflow widening, floor division, exact error
         //    text) ──────────────────────────────────────────────────────
         OpCode::Add => arith(st, '+')?,
+        // ── Slot superinstructions (peephole loop unrolling) ────────────
+        // The fused [LoadLocal, LoadLocal/PushInt, ARITH-or-CMP] triples.
+        // Operand reads replicate LoadLocal exactly: the slot cell when
+        // set, `eval_var_ref` on the table name otherwise (linked slots,
+        // globals fallback, canonical errors — all owned by the same
+        // name path).  Comparisons run through op_rel/op_eq so string
+        // operands and error shapes are identical to the unfused ops.
+        OpCode::AddSlotSlot(a, b) => {
+            let va = slot_read_or_name(interp, code, *a as usize)?;
+            let vb = slot_read_or_name(interp, code, *b as usize)?;
+            let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
+            st.stack.push(v);
+        }
+        OpCode::AddSlotImm(a, k) => {
+            let va = slot_read_or_name(interp, code, *a as usize)?;
+            let vb = Value::from_int(*k);
+            let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
+            st.stack.push(v);
+        }
+        OpCode::CmpSlotSlot(a, b, cc) => {
+            let va = slot_read_or_name(interp, code, *a as usize)?;
+            let vb = slot_read_or_name(interp, code, *b as usize)?;
+            st.stack.push(cmp_values(&va, &vb, *cc));
+        }
+        OpCode::CmpSlotImm(a, k, cc) => {
+            let va = slot_read_or_name(interp, code, *a as usize)?;
+            let vb = Value::from_int(*k);
+            st.stack.push(cmp_values(&va, &vb, *cc));
+        }
         OpCode::Sub => arith(st, '-')?,
         OpCode::Mul => arith(st, '*')?,
         OpCode::Div => arith(st, '/')?,
@@ -1328,6 +1357,42 @@ fn dispatch_dynamic(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 // ---------------------------------------------------------------------------
 // Arithmetic helpers
 // ---------------------------------------------------------------------------
+
+/// Read slot `slot` with LoadLocal's exact fallback chain: the cell when
+/// set, `eval_var_ref` on the table name otherwise (globals fallback,
+/// linked-slot resolution, canonical errors — all owned by the name path).
+fn slot_read_or_name(interp: &mut Interp, code: &ByteCode, slot: usize) -> Result<Value> {
+    if let Some(f) = interp.frames.last() {
+        if !f.slot_aliased.get(slot).copied().unwrap_or(false) {
+            if let Some(v) = f.slots.get(slot) {
+                if let Some(v) = v {
+                    return Ok(v.clone());
+                }
+                // Unset cell: LoadLocal falls through to the name path —
+                // which for an unset table name errors identically.
+                let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
+                return interp.eval_var_ref(name);
+            }
+        }
+    }
+    let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
+    interp.eval_var_ref(name)
+}
+
+/// The comparison superinstruction's semantic: `op_rel` for the four
+/// relational operators (numeric-then-string, NaN rules included), plus
+/// eq/ne (numeric equality, then string equality — op_eq/op_ne's own
+/// contract).
+fn cmp_values(a: &Value, b: &Value, cc: u8) -> Value {
+    match cc {
+        0 => crate::types::expr_ops::op_rel(a, b, "<"),
+        1 => crate::types::expr_ops::op_rel(a, b, ">"),
+        2 => crate::types::expr_ops::op_rel(a, b, "<="),
+        3 => crate::types::expr_ops::op_rel(a, b, ">="),
+        4 => crate::types::expr_ops::op_eq(a, b),
+        _ => crate::types::expr_ops::op_ne(a, b),
+    }
+}
 
 fn pop_pair(st: &mut VmState) -> (Value, Value) {
     let b = st.pop_val();

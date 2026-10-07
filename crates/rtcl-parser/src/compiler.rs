@@ -168,6 +168,8 @@ impl Compiler {
             | OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. }
             | OpCode::ForeachCollect | OpCode::ForeachEnd
             | OpCode::LappendLocal(_) | OpCode::LappendVar(_)
+            | OpCode::AddSlotSlot(_, _) | OpCode::AddSlotImm(_, _)
+            | OpCode::CmpSlotSlot(_, _, _) | OpCode::CmpSlotImm(_, _, _)
             | OpCode::Return | OpCode::Exit(_)
             | OpCode::EvalScript | OpCode::EvalExpr
             | OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Pow

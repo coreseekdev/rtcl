@@ -391,6 +391,18 @@ pub enum OpCode {
     LappendLocal(u16),
     /// The name-keyed twin of [`OpCode::LappendLocal`] (top-level units).
     LappendVar(u16),
+    /// Superinstruction (peephole-fused): `slots[a] OP slots[b]` with the
+    /// result pushed — the fused `[LoadLocal a, LoadLocal b, ARITH-or-CMP]`
+    /// window.  `cc` encodes the comparison for the Cmp forms (0=<, 1=>,
+    /// 2=<=, 3=>=, 4===, 5=!=).  Unset/aliased slots replicate LoadLocal's
+    /// exact fallback (`eval_var_ref` on the table name) inside the op, so
+    /// values and errors are identical to the unfused triple.
+    AddSlotSlot(u16, u16),
+    /// `slots[a] OP k` (fused `[LoadLocal a, PushInt k, ARITH-or-CMP]`).
+    AddSlotImm(u16, i64),
+    /// Comparison superinstructions (same fallback contract).
+    CmpSlotSlot(u16, u16, u8),
+    CmpSlotImm(u16, i64, u8),
     Mul,
     Div,
     Mod,
@@ -617,6 +629,10 @@ impl fmt::Display for OpCode {
             OpCode::Add => write!(f, "ADD"),
             OpCode::LappendLocal(s) => write!(f, "LAPPEND_L {}", s),
             OpCode::LappendVar(n) => write!(f, "LAPPEND_V {}", n),
+            OpCode::AddSlotSlot(a, b) => write!(f, "ADD_SS {} {}", a, b),
+            OpCode::AddSlotImm(a, k) => write!(f, "ADD_SI {} {}", a, k),
+            OpCode::CmpSlotSlot(a, b, cc) => write!(f, "CMP_SS {} {} cc={}", a, b, cc),
+            OpCode::CmpSlotImm(a, k, cc) => write!(f, "CMP_SI {} {} cc={}", a, k, cc),
             OpCode::Sub => write!(f, "SUB"),
             OpCode::Mul => write!(f, "MUL"),
             OpCode::Div => write!(f, "DIV"),

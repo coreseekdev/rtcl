@@ -343,6 +343,80 @@ impl ByteCode {
 
     /// Single round of pattern matching. Returns `true` if any change was made.
     fn peephole_pass(&mut self) -> bool {
+        // --- slot superinstructions (loop unrolling) ---
+        //
+        // [LoadLocal a, LoadLocal b, ADD/CMP]      -> AddSlotSlot/CmpSlotSlot
+        // [LoadLocal a, PushInt k, ADD/CMP]        -> AddSlotImm(a, k, cc)
+        // [PushInt k, LoadLocal b, CMP]            -> CmpSlotImm(b, k, cc')
+        //
+        // The accumulator/condition shapes of every arithmetic loop, INCLUDING
+        // the copies inside `[expr ...]` bracket words (the window needs no
+        // StoreLocal suffix, so brackets don't block it).  cc' mirrors the
+        // comparison for the swapped operands (Lt<->Gt, Le<->Ge).  The fused
+        // ops replicate LoadLocal's fallback (`eval_var_ref` on the table
+        // name) inside themselves, so unset/linked slots and non-numeric
+        // operands produce the identical values and errors.
+        let mut slot_fused = false;
+        {
+        let cc_of = |op: &OpCode| -> Option<u8> {
+            match op {
+                OpCode::Lt => Some(0),
+                OpCode::Gt => Some(1),
+                OpCode::Le => Some(2),
+                OpCode::Ge => Some(3),
+                OpCode::Eq => Some(4),
+                OpCode::Ne => Some(5),
+                _ => None,
+            }
+        };
+        let mirror = |cc: u8| match cc {
+            0 => 1u8,
+            1 => 0u8,
+            2 => 3u8,
+            3 => 2u8,
+            other => other,
+        };
+        let len = self.ops.len();
+        let mut changed = false;
+        if len >= 3 {
+            let mut i = 0;
+            while i + 2 < len {
+                let fused: Option<OpCode> =
+                    match (&self.ops[i], &self.ops[i + 1], &self.ops[i + 2]) {
+                        (OpCode::LoadLocal(a), OpCode::LoadLocal(b), op) => {
+                            if matches!(op, OpCode::Add) {
+                                Some(OpCode::AddSlotSlot(*a, *b))
+                            } else {
+                                cc_of(op).map(|cc| OpCode::CmpSlotSlot(*a, *b, cc))
+                            }
+                        }
+                        (OpCode::LoadLocal(a), OpCode::PushInt(k), op) => {
+                            if matches!(op, OpCode::Add) {
+                                Some(OpCode::AddSlotImm(*a, *k))
+                            } else {
+                                cc_of(op).map(|cc| OpCode::CmpSlotImm(*a, *k, cc))
+                            }
+                        }
+                        (OpCode::PushInt(k), OpCode::LoadLocal(b), op) => cc_of(op)
+                            .map(|cc| OpCode::CmpSlotImm(*b, *k, mirror(cc))),
+                        _ => None,
+                    };
+                if let Some(f) = fused {
+                    self.ops[i] = f;
+                    self.ops[i + 1] = OpCode::Nop;
+                    self.ops[i + 2] = OpCode::Nop;
+                    slot_fused = true;
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        if slot_fused {
+            self.strip_nops();
+        }
+        }
+        let len = self.ops.len();
         let len = self.ops.len();
         if len < 2 {
             return false;

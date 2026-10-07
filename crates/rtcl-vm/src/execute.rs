@@ -77,7 +77,9 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
         pc += 1;
 
         match op {
-            OpCode::LappendLocal(..) | OpCode::LappendVar(..) => {
+            OpCode::LappendLocal(..) | OpCode::LappendVar(..)
+            | OpCode::AddSlotSlot(..) | OpCode::AddSlotImm(..)
+            | OpCode::CmpSlotSlot(..) | OpCode::CmpSlotImm(..) => {
                 return Err(Error::runtime(
                     "lappend ops are not supported here",
                     ErrorCode::Generic,

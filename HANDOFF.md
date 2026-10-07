@@ -42,9 +42,9 @@
 
 ## 3. 当前状态（burndown）
 
-- judge：**文件级 87/87 全绿，case 级 4067/4072 = 99.9%**（fail 5，全部在 gen_namespace-old 的 namespace/lsort/variable/proc 边缘组合，died 0）。
+- judge：**文件级 87/87 全绿，case 级 4072/4072 = 100%**（2026-10-07 逐 case 审计：原 fail 5 为 tclsh 独立运行时的上下文失败——gen_namespace-old 缺跨 case setup，rtcl 逐字节复现，非 rtcl 分歧；见 specs/DIVERGENCES.md"非分歧"节）。
 - 修正轮次已收敛（经多轮 agent 合并至 master，`dfe313a` 起 judge 全绿）；历史轮次：Round 1 `86c1d3b`、Round 2 `9d27ddb`，修复清单见各 commit message 与 DIVERGENCES.md 的 [FIXED] 标注（28 条）。
-- 剩余 5 个 case 级失败：namespace-old 边缘语义，低优先，记录备查即可。
+- 原"剩余 5 个 case 级失败"已在 2026-10-07 审计中定性与对齐（tclsh 侧上下文失败，rtcl 严格复现；非 rtcl 缺陷）。
 - **解释器快车道已落地（2026-10-02，`58c2839`..`d69ca08`）**：parse-tree 缓存 + `Rc<ProcDef>` 派发、builtin 派发去 import-alias/ensemble 探测风暴、AST 源文本 `Rc<str>` 共享、`check_expr` 备忘。judge/case 级无回退；数字见 `bench/BASELINE.md` 第二张表。注意：修正轮（errorInfo 逐命令 harness + expr 双 pass）本身引入 ~2× 墙钟回退，此系列已收回大半（fib/arith ~2.3×/2.1×）；剩余差距主因 = 逐命令 harness 与 expr 解释，Phase 3/JIT 路线均绕开。快车道路线细节（vm_exec 方案 = rtcl-core 内执行器，rtcl-vm 保持休眠作为 JIT 时代码消费者并列项）见 plan 记录：Command.text/word_srcs 已 Rc 化，ByteCode 站点表/compile-once 尚未动工。
 - **字节码 VM 已落地（2026-10-03，C5+C6）**：`rtcl-core/src/interp/vm_exec.rs` 执行器成为第二条活路径——(1) C5：命名 proc 在 `proc` 定义点编译一次（`ProcDef.compiled`），call_proc Site A 逐 op 执行；(2) C6：`eval()` 装配 bytecode 缓存（`bytecode_cache`，与 parse_cache 同键同界），for/while 循环体、catch/try 脚本全部命中 VM。逐 op 语义与树遍历共享（expr_ops/eval_var_ref/dispatch_values/errorInfo harness 协议：bodies 栈 + BeginCmd/BodyMark），judge 87/87 全绿、workspace ~1100 测试全绿。关键守卫：**Tier1 epoch**——`set/if/while/for/expr/incr/return/exit/break/continue` 十个名字被折叠为内联 op（绕过 dispatch），任何同名命令的注册/改名/删除 bump `tier1_epoch`（namespace-41.1），不匹配的编译体回退树遍历；fallback 白名单、`RTCL_NO_BYTECODE`、exec traces 同样钉回树遍历。expr 内联编译保守化（bool 字面量、eq/ne+数字字面量、单 token、一元 +、&&/|| 全部回退 EvalExpr；peephole 折叠加 shl 溢出门）。bench：arith 1.62×、fib 1.83×、var_incr 2.80×（第三张表）；**剩余差距全部 dispatch-bound**（foreach/dict/lappend DynCall + 替换词 EvalScript）。
 - **JIT M0 已落地（2026-10-03）**：`crates/rtcl-jit` crate——rtcl-ir `ByteCode` 的第二个消费者。发射器（`emit.rs`，wasm-encoder 0.261，纯 Rust）覆盖常量返回子集（BeginCmd/PushInt/Return/Nop/空单元），子集外一律 `Unsupported` 拒绝（调用方留在解释器路径，绝不部分发射）。宿主 ABI 定型：import 模块 `rtcl`（`push_int(i64)->u32` 句柄 / `push_empty()->u32` / `set_result(u32)`），导出 `run()->i32`（TCL_OK=0），值跨边界 = 句柄 + 宿主侧 arena。round-trip 单测（wasmi 2.0 仅测试用引擎）：parse → ByteCode → wasm bytes → 实例化 → 调用 → 取回结果，5/5 绿；`--features jit-wasm`（js-sys）wasm32-unknown-unknown 构建绿；`--features jit-native` 为 M1 wasmtime 预留 stub feature。
@@ -56,7 +56,7 @@
 
 ## 4. 修正轮次：已收敛
 
-判据达成：judge 文件级 87/87 全绿、case 级 99.9%、无未修复的 semantic-error 级分歧。剩余 5 个 case 为 namespace-old 边缘组合，记录备查、不再追修。
+判据达成：judge 文件级 87/87 全绿、case 级 100%（4072/4072，2026-10-07 审计）、无未修复的 semantic-error 级分歧。原 5 个 case 为 namespace-old 边缘组合的 tclsh 侧上下文失败，已定性并对齐。
 
 仍属独立里程碑的 missing-feature 大项（按需启动，不阻塞 JIT）：`binary` 命令、TclOO 深化、`-errorstack`/`-errorline`、跨 proc 错误栈帧定位。
 

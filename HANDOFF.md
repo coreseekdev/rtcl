@@ -1,6 +1,14 @@
 # rtcl 工程 Handoff — 多轮修正 → JIT 全任务交接
 
-> 最后更新：2026-10-03（JIT 推后；主线 = 解释器架构对齐 tclsh 8.6，见 §5）
+> **状态横幅（2026-10-07）**：语义修正与优化阶段已收敛——judge 87/87
+> 文件（case 级 4072/4072，原 5 例分歧已修复）、双引擎差分 0 分歧、
+> 性能微套件反超/持平 tclsh、生产就绪标记（见 `docs/PRODUCTION.md`）。
+> 当前待办见 `TODO.md`；性能台账见 `bench/BASELINE.md`；分歧台账见
+> `specs/DIVERGENCES.md`（已重建）。本文件 §1 基础设施/§2 方法论仍然
+> 有效；§3 以后的数字是 2026-10-03 的历史快照（当前数字以 PRODUCTION
+> 与 BASELINE 为准）；JIT 保持暂停。
+>
+> 最后更新：2026-10-07（横幅）；正文完成于 2026-10-03
 > 用途：任一 agent 读本文件即可接管全部剩余工作，无需对话历史。
 
 ## 0. 项目与仓库
@@ -23,8 +31,8 @@
 | allium 行为规格 | `specs/*.allium` | 6 域：interp/expr/list/string/variables/control-flow |
 | 分歧清单 | `specs/DIVERGENCES.md` | 格式：行为声明 \| Tcl 8.6 \| rtcl \| 复现脚本 \| 严重度；修复后标 `[FIXED YYYY-MM-DD]` |
 | 对拍探针 | `specs/probe.sh` | stdin 逐行 Tcl 片段，自动 tclsh vs rtcl diff |
-| 性能基线 | `bench/run.sh` → `bench/BASELINE.md` | rtcl vs tclsh best-of-5；基线：循环/数据结构密集慢 4–16×，string_build 1.5× |
-| 单测 | `cargo test --workspace` | ~746 个，必须保持全绿 |
+| 性能基线 | `bench/run.sh` → `bench/BASELINE.md` | rtcl vs tclsh best-of-N；微套件 0.6–1.0×（arith/var_incr/string_build 反超），重型 1.05–2.26× |
+| 单测 | `cargo test --workspace` | 1143 个，必须保持全绿 |
 
 ## 2. 方法论（两条 skill 的硬规则）
 

@@ -1,5 +1,11 @@
 # rtcl architecture review — where the remaining order-of-magnitude lives
 
+> **状态横幅（2026-10-07）**：本文是 2026-10-02..04 的历史分析，其中
+> "argument binding by name ~7x" 的主要缺口已由 E2 slot locals、G13
+> 链接键缓存、G18 env-only 标志关闭；bench 数字已过时（当前见
+> `bench/BASELINE.md` 尾部与 `docs/PRODUCTION.md`）。分解方法论与
+> "call machinery 1.6× vs binding 7×" 的结论仍有参考价值。
+
 Consolidated view after the 2026-10-02..04 architecture series (parse cache,
 bytecode VM for proc bodies and eval units, inline compilation of loop/if
 bodies, `[...]` words and expr operands, lazy int values, in-place incr,

@@ -40,6 +40,9 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         && interp.body_would_compile(2, body.as_str());
 
     loop {
+        // A1 步数预算：每迭代计一步（回退兜底：即使此内建不被编译为
+        // VM 回边，空体 while 也被覆盖）。
+        interp.charge_step()?;
         let cond = interp.eval_expr(test)?;
         if !crate::types::expr_funcs::strict_bool(&cond)? {
             break;
@@ -105,6 +108,7 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     interp.eval(start)?;
 
     loop {
+        interp.charge_step()?;
         let cond = interp.eval_expr(test)?;
         if !crate::types::expr_funcs::strict_bool(&cond)? { break; }
 
@@ -222,6 +226,7 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         .unwrap_or(0);
 
     for idx in 0..max_iters {
+        interp.charge_step()?;
         for g in &groups {
             let n = g.vars.len();
             for (vi, var) in g.vars.iter().enumerate() {
@@ -442,6 +447,7 @@ pub fn cmd_time(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let start = std::time::Instant::now();
     for _ in 0..count {
+        interp.charge_step()?;
         let _ = interp.eval_body_value(script)?;
     }
     let elapsed = start.elapsed();
@@ -659,6 +665,7 @@ pub fn cmd_loop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut result = Value::empty();
 
     loop {
+        interp.charge_step()?;
         let done = if step > 0 { i >= limit } else { i <= limit };
         if done {
             break;

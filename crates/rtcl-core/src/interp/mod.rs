@@ -493,6 +493,15 @@ pub struct Interp {
     pub(crate) call_depth: usize,
     /// Maximum call depth.
     pub(crate) max_call_depth: usize,
+    /// Eval step budget (A1): commands dispatched since last arm; every
+    /// command dispatch charges one step (interpreter `eval_command` and
+    /// the VM funnels `invoke_command`/`call` alike — pure control flow
+    /// like `while {1} {}` is caught too).
+    pub(crate) steps: u64,
+    /// `None` = unlimited (default — zero behavior change); `Some(n)` =
+    /// trip past n steps with `ErrorCode::Timeout`. Arming re-zeroes the
+    /// counter (nesting-proof: the host arms before each top-level eval).
+    pub(crate) max_steps: Option<u64>,
     /// Last result.
     pub(crate) result: Value,
     /// Bytecode cache — keyed by script source.
@@ -800,6 +809,8 @@ impl Interp {
             expr_check_cache: varmap::FxHashedMap::default(),
             call_depth: 0,
             max_call_depth: 1000,
+            steps: 0,
+            max_steps: None,
             result: Value::empty(),
             code_cache: varmap::FxHashedMap::default(),
             #[cfg(feature = "package")]
@@ -866,6 +877,35 @@ impl Interp {
     /// 原生构建默认已是 [`crate::host::NativeConsole`]，无需调用）。
     pub fn set_console(&mut self, console: Box<dyn crate::host::HostConsole>) {
         self.console = console;
+    }
+
+    /// A1 eval 步数预算：武装 `Some(n)` = 每次 eval 的命令步数上限，
+    /// 超限抛 `ErrorCode::Timeout`；`None` = 不限（缺省）。武装即清零
+    /// 计数——宿主每次顶层 eval 前武装一次，嵌套 eval/命令替换不重置
+    ///（预算跨嵌套累计，防 `while {1} {eval {...}}` 绕过）。
+    pub fn set_max_steps(&mut self, max: Option<u64>) {
+        self.steps = 0;
+        self.max_steps = max;
+    }
+
+    /// 当前步数预算（None = 不限）。
+    pub fn max_steps(&self) -> Option<u64> {
+        self.max_steps
+    }
+
+    /// 每条命令分派计一步；超限抛错。解释器（`eval_command`）与 VM
+    ///（`invoke_command`/`call`）两条分派路都过这里。
+    pub(crate) fn charge_step(&mut self) -> crate::error::Result<()> {
+        if let Some(max) = self.max_steps {
+            self.steps = self.steps.saturating_add(1);
+            if self.steps > max {
+                return Err(crate::error::Error::runtime(
+                    format!("eval step budget exceeded: {max}"),
+                    crate::error::ErrorCode::Timeout,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Populate special global variables (`$env`, `$tcl_platform`, etc.).
@@ -1057,6 +1097,58 @@ impl Interp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- A1 eval 步数预算（huijuan B7 前置：agent 脚本防跑飞） ----
+
+    #[test]
+    fn step_budget_trips_on_runaway_while() {
+        let mut interp = Interp::new();
+        interp.set_max_steps(Some(100));
+        let r = interp.eval("set n 0; while {1} {incr n}");
+        let msg = format!("{}", r.err().expect("runaway while must trip budget"));
+        assert!(msg.contains("step budget"), "{msg}");
+    }
+
+    #[test]
+    fn step_budget_trips_on_empty_body_while() {
+        // TASKS A1 的原始案例：空体 + 字面条件——编译形里零命令分派，
+        // 只能靠 VM 回边计步。
+        let mut interp = Interp::new();
+        interp.set_max_steps(Some(100));
+        let r = interp.eval("while {1} {}");
+        let msg = format!("{}", r.err().expect("empty-body while must trip budget"));
+        assert!(msg.contains("step budget"), "{msg}");
+        // 字面条件 + continue 体同样拦下。
+        let mut interp = Interp::new();
+        interp.set_max_steps(Some(100));
+        assert!(interp.eval("while {1} {continue}").is_err());
+    }
+
+    #[test]
+    fn step_budget_default_unlimited_and_rearm_resets() {
+        let mut interp = Interp::new();
+        // 缺省不限：大循环照常完成（conformance 零行为变化）。
+        assert!(interp.max_steps().is_none());
+        interp.eval("set n 0; while {$n < 2000} {incr n}").unwrap();
+        assert_eq!(interp.eval("set n").unwrap().as_str(), "2000");
+        // 武装即清零：上一段 2000+ 步不累计进下一段预算。
+        interp.set_max_steps(Some(50));
+        interp.eval("set m 0; while {$m < 10} {incr m}").unwrap();
+        assert_eq!(interp.eval("set m").unwrap().as_str(), "10");
+    }
+
+    #[test]
+    fn step_budget_catches_proc_bodies_and_recursion() {
+        let mut interp = Interp::new();
+        // 预算 45（≈15 层递归处拦截）：master 的 VM 帧比旧线胖，debug
+        // 深递归会先于预算撞上 2MB 测试线程栈——浅拦截同样证明 proc
+        // 体与递归都被计步。
+        interp.set_max_steps(Some(45));
+        let r = interp.eval(
+            "proc f {n} { if {$n <= 0} { return 0 }; expr {[f [expr {$n - 1}]] + 1} }\nf 500",
+        );
+        assert!(r.is_err(), "runaway recursion must trip budget");
+    }
 
     #[test]
     fn test_set_var() {

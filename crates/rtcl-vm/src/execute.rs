@@ -196,18 +196,33 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
 
             // ── Control flow ────────────────────────────────────────
             OpCode::Jump(target) => {
-                pc = *target as usize;
+                let t = *target as usize;
+                // A1 step budget: backward jump = loop back-edge — pure
+                // control flow (`while {1} {}`) dispatches zero commands,
+                // only the back-edge can charge it.
+                if t < pc {
+                    ctx.charge_step()?;
+                }
+                pc = t;
             }
             OpCode::JumpTrue(target) => {
                 let val = stack.pop().unwrap_or_else(Value::empty);
                 if val.is_true() {
-                    pc = *target as usize;
+                    let t = *target as usize;
+                    if t < pc {
+                        ctx.charge_step()?;
+                    }
+                    pc = t;
                 }
             }
             OpCode::JumpFalse(target) => {
                 let val = stack.pop().unwrap_or_else(Value::empty);
                 if !val.is_true() {
-                    pc = *target as usize;
+                    let t = *target as usize;
+                    if t < pc {
+                        ctx.charge_step()?;
+                    }
+                    pc = t;
                 }
             }
 
@@ -277,6 +292,8 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
                     (fl.idx + 1, max)
                 };
                 if idx < max {
+                    // A1 step budget: taken iteration edge = one step.
+                    ctx.charge_step()?;
                     foreaches.last_mut().unwrap().idx = idx;
                     foreach_bind(ctx, code, &mut foreaches, &mut stack)?;
                     pc = *body as usize;

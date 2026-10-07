@@ -834,11 +834,20 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             if let Some(region) = st.bodies.pop() {
                 st.cur_site = region.site();
             }
+            // A1 step budget: backward jump = loop back-edge — pure
+            // control flow (`while {1} {}`) dispatches zero commands,
+            // only the back-edge can charge it.
+            if i64::from(*t) < st.pc as i64 {
+                interp.charge_step()?;
+            }
             st.pc = *t as usize;
         }
         OpCode::JumpTrue(t) => {
             let v = st.pop_val();
             if crate::types::expr_funcs::strict_bool(&v)? {
+                if (*t as i64) < st.pc as i64 {
+                    interp.charge_step()?;
+                }
                 st.pc = *t as usize;
             } else {
                 // Not taken → entering an inline body of the current
@@ -849,6 +858,9 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         OpCode::JumpFalse(t) => {
             let v = st.pop_val();
             if !crate::types::expr_funcs::strict_bool(&v)? {
+                if (*t as i64) < st.pc as i64 {
+                    interp.charge_step()?;
+                }
                 st.pc = *t as usize;
             } else {
                 st.bodies.push(Region::Body(st.cur_site));
@@ -931,6 +943,8 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 (ff.idx + 1, ff.iters)
             };
             if idx < max {
+                // A1 step budget: taken iteration edge = one step.
+                interp.charge_step()?;
                 st.foreaches.last_mut().unwrap().idx = idx;
                 foreach_bind(interp, code, info_ref, st, idx)?;
                 st.pc = *body as usize;
@@ -959,6 +973,9 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 st.bodies.truncate(l.bodies_len);
                 st.stack.truncate(l.stack_len);
                 st.cur_site = l.owner;
+                if l.brk < st.pc as u32 {
+                    interp.charge_step()?;
+                }
                 st.pc = l.brk as usize;
             }
             None => return Err(Error::brk()),
@@ -968,6 +985,12 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 st.bodies.truncate(l.bodies_len);
                 st.stack.truncate(l.stack_len);
                 st.cur_site = l.owner;
+                // A1 step budget: continue jumps back to the loop's
+                // condition — a backward transfer IS the iteration edge
+                // when the body ends in `continue` (no plain Jump runs).
+                if l.cont < st.pc as u32 {
+                    interp.charge_step()?;
+                }
                 st.pc = l.cont as usize;
             }
             None => return Err(Error::cont()),
@@ -1278,6 +1301,12 @@ fn dispatch_site(
     st: &mut VmState,
     full: fn(&mut Interp, &[Value]) -> Result<Value>,
 ) -> Result<Value> {
+    // A1 step budget: the single choke point for every compiled command
+    // dispatch (builtin fn-pointer fast path, cached proc token, and the
+    // `full` fallback all pass through here — one charge per dispatch,
+    // never doubled: `dispatch_values`/`call_proc` don't route through
+    // the tree-walk's `eval_command`).
+    interp.charge_step()?;
     let pc = (st.pc - 1) as u32;
     if interp.exec_traces.is_empty() {
         if let Some(slots) = st.cmd_sites.clone() {

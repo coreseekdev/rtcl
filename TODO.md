@@ -26,11 +26,15 @@
   （3 层函数）可合并；`resolve_object_arg`（String 化）的调用点
   梳理。`bench/scripts/oo_bench2.tcl`。
 
-## 语义对齐（已知分歧，5/4072）
+## 语义对齐（与 specs/DIVERGENCES.md 同步，复核 2026-10-07）
 
-- [ ] rename 遮蔽过程后旧名解析（probe：`judge/probes/`）
-- [ ] `interp alias {} name {} target` 创建形式
-- [ ] 3 条错误信息帧计数微差（gen_* 语料可定位具体用例）
+- [x] gen_namespace-old 的 5 个 case 级失败 —— **已修复**（2026-10-07
+  实测逐字节一致；原 HANDOFF §3 的 5-case 计数过时）
+- [x] rename 遮蔽过程后旧名解析 —— 复核为**两引擎一致**（原记录有误）
+- [ ] `interp alias {} name {} target` 创建形式（空解释器占位参数；
+  唯一 OPEN 分歧，严重度低——见 specs/DIVERGENCES.md D-1）
+- [x] 整数溢出 f64 提升 —— 已改为精确 BigInt 宽化（gen_expr 大数幂
+  用例逐字节一致）
 
 ## 基础设施
 

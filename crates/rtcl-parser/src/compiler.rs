@@ -774,7 +774,7 @@ impl Compiler {
     fn compile_foreach(&mut self, cmd: &Command, lmap: bool) {
         // Arity: >= 4 words and even (varList/list pairs + body) — other
         // shapes dispatch so the real command owns the wrong-#-args error.
-        if cmd.words.len() < 4 || cmd.words.len() % 2 != 0 {
+        if cmd.words.len() < 4 || !cmd.words.len().is_multiple_of(2) {
             return self.compile_dyncall(cmd);
         }
         // `{*}` can change the argument count at runtime — dispatch.

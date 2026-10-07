@@ -3,7 +3,6 @@
 //! under a real wasm engine (wasmi, test-only) and matches the
 //! interpreter's semantics for the compiled subset.
 
-use rtcl_ir::bytecode::ByteCode;
 use rtcl_parser::{Compiler, ScriptUnit};
 use wasmi::{Caller, Engine, Linker, Module, Store, TypedFunc};
 
@@ -33,7 +32,7 @@ fn jit_compile(script: &str) -> Result<Vec<u8>, rtcl_jit::Unsupported> {
 /// result code plus the recorded result value.
 fn jit_run(bytes: &[u8]) -> Result<(i32, HostVal), wasmi::Error> {
     let engine = Engine::default();
-    let module = Module::new(&engine, &mut &bytes[..])?;
+    let module = Module::new(&engine, bytes)?;
     let mut store = Store::new(&engine, Host::default());
     let mut linker = <Linker<Host>>::new(&engine);
     linker.func_wrap(

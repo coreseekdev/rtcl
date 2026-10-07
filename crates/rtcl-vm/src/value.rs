@@ -673,7 +673,7 @@ impl Default for Value {
 impl Value {
     /// Create an empty value
     pub fn empty() -> Self {
-        CACHED_EMPTY.with(|v| Value::from_heap_clone(v))
+        CACHED_EMPTY.with(Value::from_heap_clone)
     }
 
     /// Create a value from a string
@@ -692,7 +692,7 @@ impl Value {
         // the allocator or the refcount.  The extremes keep the heap
         // fallback (full i64 range preserved); the lazy-string rule is
         // tclsh's (an int renders never unless demanded).
-        if (i64::MIN >> 1) <= n && n <= (i64::MAX >> 1) {
+        if ((i64::MIN >> 1)..=(i64::MAX >> 1)).contains(&n) {
             return Value::from_imm(n);
         }
         Value::from_vptr(VPtr::new(ValueInner {
@@ -714,9 +714,9 @@ impl Value {
     /// Create a value from a boolean
     pub fn from_bool(b: bool) -> Self {
         if b {
-            CACHED_BOOL_TRUE.with(|v| Value::from_heap_clone(v))
+            CACHED_BOOL_TRUE.with(Value::from_heap_clone)
         } else {
-            CACHED_BOOL_FALSE.with(|v| Value::from_heap_clone(v))
+            CACHED_BOOL_FALSE.with(Value::from_heap_clone)
         }
     }
 
@@ -945,7 +945,7 @@ impl Value {
             // An immediate's rendering is its list form ("5" -> {5}) —
             // the same string-parse the old Int-rep `_` arm took.
             let s = self.as_str();
-            return parse_list(&s);
+            return parse_list(s);
         }
         let inner = unsafe { self.heap_inner() };
         match &inner.rep {
@@ -965,7 +965,7 @@ impl Value {
     pub fn as_list_strict(&self) -> std::result::Result<Vec<Value>, ListParseError> {
         if self.is_imm() {
             let s = self.as_str();
-            return parse_list_full(&s);
+            return parse_list_full(s);
         }
         let inner = unsafe { self.heap_inner() };
         match &inner.rep {
@@ -1034,7 +1034,7 @@ impl Value {
     /// cached string rendering is dropped instead of eagerly rebuilt.
     pub fn set_int_rep(&mut self, n: i64) {
         // Immediate ints retag in place — no allocation, no refcount.
-        if self.is_imm() && (i64::MIN >> 1) <= n && n <= (i64::MAX >> 1) {
+        if self.is_imm() && ((i64::MIN >> 1)..=(i64::MAX >> 1)).contains(&n) {
             self.set_imm(n);
             return;
         }
@@ -1058,7 +1058,7 @@ impl Value {
     pub fn as_dict(&self) -> Option<DictMap> {
         if self.is_imm() {
             let s = self.as_str();
-            let list = parse_list(&s)?;
+            let list = parse_list(s)?;
             if list.len() % 2 != 0 {
                 return None;
             }

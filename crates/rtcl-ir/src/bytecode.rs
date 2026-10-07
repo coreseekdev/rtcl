@@ -386,7 +386,7 @@ impl ByteCode {
             other => other,
         };
         let len = self.ops.len();
-        let mut changed = false;
+        let _changed = false;
         if len >= 3 {
             let mut i = 0;
             while i + 2 < len {
@@ -425,7 +425,7 @@ impl ByteCode {
             self.strip_nops();
         }
         }
-        let len = self.ops.len();
+        let _len = self.ops.len();
         let len = self.ops.len();
         if len < 2 {
             return false;

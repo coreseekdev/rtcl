@@ -283,7 +283,7 @@ fn test_backslash_newline_line_continuation() {
     let cmds = parse("set x 123;\\\nset y 456").unwrap();
     // Should produce: set x 123 (cmd1) ; set y 456 (cmd2 via line continuation)
     // OR two commands depending on how ;\<newline> is handled
-    assert!(cmds.len() >= 1, "should parse: {:?}", cmds);
+    assert!(!cmds.is_empty(), "should parse: {:?}", cmds);
 }
 
 /// Backslash-newline after a bare word ENDS the word (tclsh 8.6.17:
@@ -422,8 +422,8 @@ fn test_var_ref_deep_namespace() {
 #[test]
 fn test_dollar_space_orphan() {
     let cmds = parse("set x \"$ y\"").unwrap();
-    let text = format!("{}", &cmds[0].words[2]);
-    assert_eq!(text, "$ y", "dollar-space: {:?}", &cmds[0].words[2]);
+    let text = format!("{}", cmds[0].words[2]);
+    assert_eq!(text, "$ y", "dollar-space: {:?}", cmds[0].words[2]);
 }
 
 /// Braced var ref: `${with spaces}` (unusual but valid).
@@ -532,7 +532,7 @@ fn test_escape_in_bare_word() {
 fn test_expand_before_semicolon() {
     let cmds = parse("cmd {*};other").unwrap();
     // {*} before ; should be literal *, not expand
-    assert!(cmds.len() >= 1);
+    assert!(!cmds.is_empty());
     match &cmds[0].words[1] {
         Word::Literal(s) => assert_eq!(s, "*"),
         w => panic!("expected Literal(*), got {:?}", w),

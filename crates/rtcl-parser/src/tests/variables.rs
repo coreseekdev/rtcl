@@ -47,15 +47,15 @@ fn test_empty_braced_var_name() {
 #[test]
 fn test_orphan_dollar_end_of_bare() {
     let cmds = parse("set x abc$").unwrap();
-    let text = format!("{}", &cmds[0].words[2]);
-    assert_eq!(text, "abc$", "dollar at end: {:?}", &cmds[0].words[2]);
+    let text = format!("{}", cmds[0].words[2]);
+    assert_eq!(text, "abc$", "dollar at end: {:?}", cmds[0].words[2]);
 }
 
 /// Multiple orphan dollars: `$ $ $`.
 #[test]
 fn test_multiple_orphan_dollars_quoted() {
     let cmds = parse("set x \"$ $ $\"").unwrap();
-    let text = format!("{}", &cmds[0].words[2]);
+    let text = format!("{}", cmds[0].words[2]);
     assert_eq!(text, "$ $ $");
 }
 
@@ -347,7 +347,7 @@ fn test_braced_var_with_suffix() {
 fn test_paren_expr_sugar_unclosed() {
     let cmds = parse("set x $(abc").unwrap();
     // No matching ')' → $ is orphan, (abc is literal
-    let text = format!("{}", &cmds[0].words[2]);
+    let text = format!("{}", cmds[0].words[2]);
     assert_eq!(text, "$(abc");
 }
 

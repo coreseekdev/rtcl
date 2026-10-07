@@ -149,14 +149,13 @@ pub fn validate(code: &ByteCode) -> Vec<ValidationError> {
                     });
                 }
             }
-            OpCode::Break | OpCode::Continue => {
-                if loop_depth <= 0 {
+            OpCode::Break | OpCode::Continue
+                if loop_depth <= 0 => {
                     // This is OK in some cases (break/continue used as
                     // a general command), so we make it a warning-level
                     // note rather than a hard error.  The VM will handle
                     // it by returning an Error.
                 }
-            }
 
             // Everything else — no structural checks needed.
             _ => {}

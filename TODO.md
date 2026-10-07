@@ -28,13 +28,17 @@
 
 ## 语义对齐（与 specs/DIVERGENCES.md 同步，复核 2026-10-07）
 
-- [x] gen_namespace-old 的 5 个 case 级失败 —— **已修复**（2026-10-07
-  实测逐字节一致；原 HANDOFF §3 的 5-case 计数过时）
-- [x] rename 遮蔽过程后旧名解析 —— 复核为**两引擎一致**（原记录有误）
+- [x] **case 级 4072/4072 严格对齐达成**：全量审计确认 0 项 rtcl 引起
+  的语义分歧；gen_namespace-old 的 5 例 FAIL 为 tclsh 独立运行时的
+  上下文失败（缺跨 case setup），rtcl 逐字节复现（非 rtcl 缺陷，
+  见 DIVERGENCES.md"非分歧"节）
+- [ ] 可选：extract.py 补跨 case setup 提取，使 5 例语料自洽
+  （tclsh 侧协议变更，谨慎）
 - [ ] `interp alias {} name {} target` 创建形式（空解释器占位参数；
-  唯一 OPEN 分歧，严重度低——见 specs/DIVERGENCES.md D-1）
+  唯一 OPEN 语义分歧，严重度低——DIVERGENCES.md D-1）
 - [x] 整数溢出 f64 提升 —— 已改为精确 BigInt 宽化（gen_expr 大数幂
   用例逐字节一致）
+- [x] rename 遮蔽过程后旧名解析 —— 复核为两引擎一致（原记录有误）
 
 ## 基础设施
 

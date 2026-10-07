@@ -10,20 +10,27 @@
 ## 1. 兼容性（vs tclsh 8.6.17）
 
 ### 判定方法
-- **判官体系**：`judge/run.sh` — 87 个语料文件、**4067/4072 用例逐字节比对**
-  （stdout + 退出码 + errorInfo/errorCode）。用例由 tclsh 8.6.17 官方测试
-  套件机械提取（23759 个候选中提取 5701、按形状/结果替换/优化约束过滤后
-  保留 4072）。
+- **判官体系**：`judge/run.sh` — 87 个语料文件、**4072 用例全量逐字节比对**
+  （stdout + 退出码 + errorInfo/errorCode）；4067 PASS + 5 FAIL（该 5 例
+  为 tclsh 独立运行时的自身失败，rtcl 逐字节复现——见下"已知分歧"）。
+  用例由 tclsh 8.6.17 官方测试套件机械提取（23759 个候选中提取 5701、
+  过滤后保留 4072）。
 - **双引擎差分**：`judge/sweep.sh` — 字节码引擎 vs 树遍历引擎全探针逐字节
   差分，0 分歧（35 个探针文件）。
 - **数字探针**：i64 极值/溢出宽化/除模语义/混合表示，与 tclsh 逐字节一致。
 
-### 已知分歧（5/4072 = 0.12%，全部记录在案）
-| # | 分歧 | 影响 |
-|---|------|------|
-| 1 | rename 遮蔽过程后旧名解析 | 边缘：rename+proc 组合 |
-| 2 | `interp alias {} name {} target` 形式 | 边缘：alias 创建语法变体 |
-| 3-5 | 其余为错误信息微差（帧计数） | 非语义 |
+### 已知分歧：**0 项 rtcl 引起的语义分歧**（2026-10-07 逐 case 审计）
+
+- **4072 case 全量审计**（tclsh 与 rtcl 各自运行全部 87 文件、逐 case
+  比对 PASS/FAIL）：tclsh 8.6.17 自身 FAIL 5 例（gen_namespace-old 的
+  2.3/6.10/6.13/6.16/6.19——提取语料缺少前序 case 6.12 等的跨 case
+  setup 状态，tclsh 独立运行时自身失败），**rtcl 逐字节复现相同的失败
+  输出——严格对齐，非 rtcl 分歧**。
+- **唯一 OPEN 语义分歧**：`interp alias {} name {} target` 空解释器
+  占位形式（tclsh 接受，rtcl 报 wrong # args）——低严重度，见
+  `specs/DIVERGENCES.md` D-1。
+- 历史记录更正：gen_namespace-old 的 5 例与 rename 遮蔽在 2026-10-03
+  被记为分歧，2026-10-07 复核均已修复/证伪（见 specs/DIVERGENCES.md）。
 
 **36 项超出标准 Tcl 的扩展**（保留判定经用户裁定）：`function`/`lambda`/
 `curry`/`loop`/`ensemble`/`defer`/`json`/`ref` 等。

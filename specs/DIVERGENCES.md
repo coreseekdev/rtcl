@@ -14,6 +14,19 @@
 - **复现**：`interp alias {} myalias {} puts`
 - **严重度**：低（`interp alias <ns> ...` 带名形式已支持；空形式罕见）。
 
+## 非分歧（tclsh 侧上下文失败，rtcl 严格对齐）
+
+### gen_namespace-old 2.3 / 6.10 / 6.13 / 6.16 / 6.19（5 例）
+- **现象**：tclsh 8.6.17 独立运行语料时自身 FAIL；rtcl 逐字节复现相同
+  失败输出（全文件 diff 为空）。
+- **根因**：提取器未包含前序 case 的跨 case setup——6.12 重定义
+  `trigger` 并创建 `test_ns_cache1::test_ns_cache_var`（6.13/6.16/6.19
+  依赖）；2.3 依赖被跳过的 `test_ns_simple::test_ns_x/y` setup。官方
+  套件带 harness 运行亦有 3 例 FAIL（8.6.17 自身状态）。
+- **结论**：rtcl 与 tclsh 严格对齐（含失败行为）；非 rtcl 缺陷。
+  若追求语料自洽，可在 extract.py 补跨 case setup 提取（协议变更，
+  需谨慎）。
+
 ## FIXED
 
 ### [FIXED 2026-10-07] 整数溢出 f64 提升（vs Tcl bignum）

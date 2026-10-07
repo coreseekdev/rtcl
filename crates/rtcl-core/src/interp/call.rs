@@ -149,7 +149,7 @@ impl Interp {
                     let n = code.locals().len();
                     let frame = self.frames.last_mut().unwrap();
                     frame.slots.clear();
-                    frame.slots.resize(n, None);
+                    frame.slots.resize(n, Value::UNSET);
                     frame.slot_aliased.clear();
                     frame.slot_aliased.resize(n, false);
                     frame.link_keys.clear();
@@ -268,7 +268,7 @@ impl Interp {
                         Value::empty()
                     };
                     if slot_mode {
-                        frame.slots[i] = Some(value);
+                        frame.slots[i] = value;
                     } else {
                         frame.locals.insert(param.clone(), value);
                     }
@@ -299,7 +299,7 @@ impl Interp {
                     // `args` is the table's last entry — index
                     // `regular_params.len()` (params seeded in order, all
                     // candidates under the slot gate).
-                    frame.slots[regular_params.len()] = Some(Value::from_str(&list_str));
+                    frame.slots[regular_params.len()] = Value::from_str(&list_str);
                 } else {
                     frame.locals.insert("args".to_string(), Value::from_str(&list_str));
                 }

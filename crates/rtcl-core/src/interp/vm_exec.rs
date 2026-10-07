@@ -710,7 +710,6 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                     .frames
                     .last()
                     .and_then(|f| f.slots.get(slot))
-                    .and_then(|v| v.as_ref())
                     .cloned()
                     .unwrap_or_else(Value::empty);
                 st.stack.push(result);
@@ -1365,13 +1364,13 @@ fn slot_read_or_name(interp: &mut Interp, code: &ByteCode, slot: usize) -> Resul
     if let Some(f) = interp.frames.last() {
         if !f.slot_aliased.get(slot).copied().unwrap_or(false) {
             if let Some(v) = f.slots.get(slot) {
-                if let Some(v) = v {
-                    return Ok(v.clone());
+                if v.is_unset() {
+                    // Unset cell: LoadLocal falls through to the name path —
+                    // which for an unset table name errors identically.
+                    let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
+                    return interp.eval_var_ref(name);
                 }
-                // Unset cell: LoadLocal falls through to the name path —
-                // which for an unset table name errors identically.
-                let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
-                return interp.eval_var_ref(name);
+                return Ok(v.clone());
             }
         }
     }

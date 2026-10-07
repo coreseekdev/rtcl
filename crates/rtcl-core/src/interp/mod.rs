@@ -167,7 +167,9 @@ pub(crate) struct CallFrame {
     /// read/write consults [`CallFrame::slot_index_of`] first, so
     /// uncompiled writers — foreach vars, `lappend`, `catch` results —
     /// observe and mutate the same variable the compiled ops touch).
-    pub slots: Vec<Option<Value>>,
+    /// 8-byte elements: an unset slot is the `Value::UNSET` sentinel
+    /// (bits 0 — unreachable for real values), not an Option wrapper.
+    pub slots: Vec<Value>,
     /// Parallel to `slots`: a slot whose storage moved to `locals` because
     /// an exceptional structure was installed on its NAME (an upvar /
     /// `global` / `variable` link — see
@@ -231,7 +233,11 @@ impl CallFrame {
         if self.slot_aliased.get(i).copied().unwrap_or(false) {
             return None;
         }
-        self.slots[i].as_ref()
+        let v = &self.slots[i];
+        if v.is_unset() {
+            return None;
+        }
+        Some(v)
     }
 }
 

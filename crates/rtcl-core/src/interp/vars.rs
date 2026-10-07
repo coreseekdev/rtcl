@@ -70,7 +70,11 @@ impl Interp {
             let key = f.link_keys.get(slot)?.as_ref()?;
             return self.globals.get(key.as_ref()).cloned();
         }
-        f.slots.get(slot)?.clone()
+        let v = f.slots.get(slot)?;
+        if v.is_unset() {
+            return None;
+        }
+        Some(v.clone())
     }
 
     /// Write `value` into slot `slot` of the current frame.  `false` when
@@ -111,7 +115,7 @@ impl Interp {
         }
         match self.frames.last_mut().and_then(|f| f.slots.get_mut(slot)) {
             Some(cell) => {
-                *cell = Some(value.clone());
+                *cell = value.clone();
                 true
             }
             None => false,
@@ -137,10 +141,10 @@ impl Interp {
         let Some(cell) = f.slots.get_mut(slot) else {
             return false;
         };
-        let Some(v) = cell else {
+        if cell.is_unset() {
             return false; // unset: creation is the dispatched command's job
-        };
-        let Some(items) = v.as_list_mut() else {
+        }
+        let Some(items) = cell.as_list_mut() else {
             return false; // non-list rep: the strict parse owns the errors
         };
         items.push(value.clone());
@@ -167,7 +171,10 @@ impl Interp {
                 return Some(cell.clone());
             }
         }
-        let cell = self.frames.last_mut()?.slots.get_mut(slot)?.as_mut()?;
+        let cell = self.frames.last_mut()?.slots.get_mut(slot)?;
+        if cell.is_unset() {
+            return None;
+        }
         let current = cell.as_int()?;
         // Overflow belongs to the real `incr` (ARITH IOVERFLOW error).
         let next = current.checked_add(amount)?;
@@ -194,8 +201,11 @@ impl Interp {
         }
         if let Some(table) = f.slot_table.take() {
             for (i, name) in table.locals().iter().enumerate() {
-                if let Some(v) = f.slots.get_mut(i).and_then(|c| c.take()) {
-                    f.locals.insert(name.clone(), v);
+                if let Some(cv) = f.slots.get_mut(i) {
+                    if !cv.is_unset() {
+                        let taken = std::mem::replace(cv, Value::UNSET);
+                        f.locals.insert(name.clone(), taken);
+                    }
                 }
             }
         }
@@ -223,8 +233,9 @@ impl Interp {
             return;
         }
         let Some(i) = f.slot_index_of(base) else { return };
-        if let Some(v) = f.slots[i].take() {
-            f.locals.insert(base.to_string(), v);
+        if !f.slots[i].is_unset() {
+            let taken = std::mem::replace(&mut f.slots[i], Value::UNSET);
+            f.locals.insert(base.to_string(), taken);
         }
         if f.slot_aliased.len() != f.slots.len() {
             f.slot_aliased.clear();
@@ -264,8 +275,11 @@ impl Interp {
         let f = &mut self.frames[frame_idx];
         if let Some(table) = table {
             for (i, name) in table.locals().iter().enumerate() {
-                if let Some(v) = f.slots.get_mut(i).and_then(|c| c.take()) {
-                    f.locals.insert(name.clone(), v);
+                if let Some(cv) = f.slots.get_mut(i) {
+                    if !cv.is_unset() {
+                        let taken = std::mem::replace(cv, Value::UNSET);
+                        f.locals.insert(name.clone(), taken);
+                    }
                 }
             }
         }
@@ -651,7 +665,7 @@ impl Interp {
             let f = &mut self.frames[frame_idx];
             match f.slot_index_of(name) {
                 // Slotted name: the slot is the canonical store.
-                Some(i) => f.slots[i] = Some(value),
+                Some(i) => f.slots[i] = value.clone(),
                 None => {
                     f.locals.insert(name.to_string(), value);
                 }
@@ -756,7 +770,7 @@ impl Interp {
             match f.slot_index_of(name) {
                 // Unset of a slotted name empties the cell (tclsh: the
                 // compiledLocal's Var is cleared, the table entry stays).
-                Some(i) => f.slots[i] = None,
+                Some(i) => f.slots[i] = Value::UNSET,
                 None => {
                     f.locals.remove(name);
                 }
@@ -817,10 +831,11 @@ impl Interp {
                         // table name is never in the map).  An empty cell is
                         // the unset state — the map probe below must not run.
                         if let Some(i) = frame.slot_index_of(name) {
-                            return match frame.slots[i].as_ref() {
-                                Some(v) => Ok(v),
-                                None => Err(Error::var_not_found(name)),
-                            };
+                            let sv = &frame.slots[i];
+                            if sv.is_unset() {
+                                return Err(Error::var_not_found(name));
+                            }
+                            return Ok(sv);
                         }
                         if let Some(v) = frame.locals.get(name) {
                             if !frame.array_locals.is_empty()
@@ -975,7 +990,7 @@ impl Interp {
                             // unset slot reaches here via the slow path's
                             // store_var, which consults the same table).
                             Some(i) => {
-                                frame.slots[i] = Some(value.clone());
+                                frame.slots[i] = value.clone();
                                 wrote = true;
                             }
                             None => {
@@ -1043,9 +1058,15 @@ impl Interp {
             }
             match frame.slot_index_of(name) {
                 // Slotted name: lift the value out of the cell; the caller
-                // puts the replacement back (slot-None is the interim
+                // puts the replacement back (slot-UNSET is the interim
                 // state, same as the map-remove window).
-                Some(i) => frame.slots.get_mut(i)?.take(),
+                Some(i) => {
+                    let cell = frame.slots.get_mut(i)?;
+                    if cell.is_unset() {
+                        return None;
+                    }
+                    Some(std::mem::replace(cell, Value::UNSET))
+                }
                 None => frame.locals.remove(name),
             }
         } else {
@@ -1084,7 +1105,13 @@ impl Interp {
             match frame.slot_index_of(name) {
                 // Slotted name: unset cell → the real `incr` creates it
                 // from 0 (its set_var consults the table again).
-                Some(i) => frame.slots.get_mut(i)?.as_mut()?,
+                Some(i) => {
+                    let cell = frame.slots.get_mut(i)?;
+                    if cell.is_unset() {
+                        return None;
+                    }
+                    cell
+                }
                 None => frame.locals.get_mut(name)?,
             }
         } else {

@@ -472,6 +472,19 @@ pub struct Value {
 }
 
 impl Value {
+    /// The unset-slot sentinel: bits == 0 is unreachable for valid values
+    /// (immediates have bit0 set; heap pointers are non-null), giving
+    /// `slots: Vec<Value>` an 8-byte element with an in-band "unset"
+    /// state — half the memory traffic of `Vec<Option<Value>>`.
+    pub const UNSET: Value = Value {
+        bits: Cell::new(0),
+        _not_send: PhantomData,
+    };
+
+    #[inline]
+    pub fn is_unset(&self) -> bool {
+        self.bits.get() == 0
+    }
     #[inline]
     pub fn is_imm(&self) -> bool {
         self.bits.get() & 1 == 1
@@ -541,11 +554,14 @@ impl Clone for Value {
     #[inline]
     fn clone(&self) -> Self {
         let bits = self.bits.get();
-        if bits & 1 == 0 {
-            unsafe {
-                let p = bits as *mut ValueInner;
-                (*p).rc.set((*p).rc.get() + 1);
-            }
+        // Immediates copy; the UNSET sentinel (bits 0) copies; heap words
+        // bump the refcount.
+        if bits & 1 == 1 || bits == 0 {
+            return Value::with_bits(bits);
+        }
+        unsafe {
+            let p = bits as *mut ValueInner;
+            (*p).rc.set((*p).rc.get() + 1);
         }
         Value::with_bits(bits)
     }
@@ -555,7 +571,8 @@ impl Drop for Value {
     #[inline]
     fn drop(&mut self) {
         let bits = self.bits.get();
-        if bits & 1 == 1 {
+        // Immediates and the UNSET sentinel own no heap box.
+        if bits & 1 == 1 || bits == 0 {
             return;
         }
         unsafe {

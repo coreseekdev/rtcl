@@ -1259,3 +1259,20 @@ var_incr                 44         34      0.7
 # condition — the sum loop fuses 3 ops -> 1).  Gates: judge 87/87;
 # sweep 0; tests 1143/0; numeric probes byte-exact.  Definitive bench
 # deferred (external node load oscillating).
+
+# ---------------------------------------------------------------------------
+# G22 2026-10-07: slot memory halved — `slots: Vec<Value>` with an
+# in-band unset sentinel.  `Cell<u64>` has no niche, so Option<Value>
+# was 16 bytes; bits==0 is unreachable for real values (immediates
+# have bit0 set, heap pointers are non-null), making it the natural
+# unset state: slots are now 8-byte words, halving slot memory traffic
+# for every slot op.  Value::UNSET / Value::is_unset are the API.
+#
+# CRASH GATE lesson (again, sharper): the first cut segfaulted —
+# Drop/Clone dispatched on `bits & 1` (immediate vs heap) and the
+# sentinel's bits==0 fell into the heap branch, dereferencing null.
+# The judge caught it as a 35-file wipe.  Clone/Drop now early-return
+# on bits==0, and every slot access is guarded by is_unset() before
+# touching the payload.  (The workspace test-compile also briefly
+# reported "tests: 0" — a stale-binary race, not a compile break.)
+# Gates: judge 87/87; sweep 0; tests 1143/0.

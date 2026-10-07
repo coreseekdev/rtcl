@@ -226,4 +226,55 @@ mod tests {
         ]);
         assert!(r.is_err());
     }
+
+    // ── Task-4 评审遗留：直挂形态 / 顶层标量 / -null 非空替换 ──
+
+    #[test]
+    fn direct_mount_forms_skip_no_ensemble_word() {
+        // 直挂（宿主直接调 cmd_*，args[0] = 注册名）：start = 1 分支
+        let mut i = interp();
+        let v = cmd_yaml_decode(&mut i, &[
+            Value::from_str("yaml::decode"), Value::from_str("k: v\n"),
+        ]).unwrap();
+        assert_eq!(v.as_str(), "k v");
+
+        let e = cmd_yaml_encode(&mut i, &[
+            Value::from_str("yaml::encode"), v,
+        ]).unwrap();
+        assert_eq!(e.as_str(), "k: v\n");
+
+        // 直挂形态同样接受 -null 选项（start=1 之后照常解析）
+        let n = cmd_yaml_decode(&mut i, &[
+            Value::from_str("yaml::decode"), Value::from_str("-null"),
+            Value::from_str("~"), Value::from_str("k: null\n"),
+        ]).unwrap();
+        assert_eq!(n.as_str(), "k ~");
+    }
+
+    #[test]
+    fn encode_top_level_scalars() {
+        // 全部标量经 value_to_yaml 以字符串交给 serde_yaml；
+        // 平原串原样输出，会再解析为其他类型的串被单引号钉成字符串
+        let mut i = interp();
+        let plain = cmd_yaml_encode(&mut i, &[
+            Value::from_str("yaml::encode"), Value::from_str("hello"),
+        ]).unwrap();
+        assert_eq!(plain.as_str(), "hello\n");
+
+        let numeric = cmd_yaml_encode(&mut i, &[
+            Value::from_str("yaml::encode"), Value::from_str("3"),
+        ]).unwrap();
+        assert_eq!(numeric.as_str(), "'3'\n", "钉死 serde_yaml 的实际引号行为");
+    }
+
+    #[test]
+    fn decode_null_option_non_empty_replacement() {
+        let mut i = interp();
+        let v = cmd_yaml_decode(&mut i, &[
+            Value::from_str("yaml"), Value::from_str("decode"),
+            Value::from_str("-null"), Value::from_str("NA"),
+            Value::from_str("a: null\nb: 1\n"),
+        ]).unwrap();
+        assert_eq!(v.as_str(), "a NA b 1");
+    }
 }

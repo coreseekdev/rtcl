@@ -10,8 +10,9 @@
 //! `Jim_DuplicateObj()` model.
 //!
 //! - `Value::clone()` is O(1) — simply increments the reference count.
-//! - Mutation (e.g. list append) uses `VPtr::make_mut()`, which
-//!   deep-copies only when the value is shared (`strong_count > 1`).
+//! - Mutation (e.g. list append) goes through copy-on-write
+//!   (`Value::heap_make_mut`), which deep-copies only when the value is
+//!   shared (reference count > 1).
 //! - The boxes come from a thread-local free list (jimtcl's free-list
 //!   pointers, which the original Rust port dropped in favour of the
 //!   allocator): a value whose last reference dies pushes its box back,
@@ -338,8 +339,8 @@ impl Clone for ValueInner {
 /// hand-rolled `Rc` whose dead boxes go to a thread-local free list
 /// instead of the allocator (jimtcl's free-list pointers).  The pointer
 /// is the SAME 8 bytes an `Rc` was, so [`Value`]'s layout is unchanged;
-/// `clone`/`drop`/`make_mut`/`strong_count`/`ptr_eq` reproduce the `Rc`
-/// semantics exactly, and `Deref` keeps every accessor working
+/// `clone`/`drop` reproduce the `Rc` semantics exactly, and `Deref`
+/// keeps every accessor working
 /// unchanged.  Deliberately `!Send`/`!Sync` (as `Rc` was): a value never
 /// crosses threads.
 struct VPtr(NonNull<ValueInner>);
@@ -365,27 +366,6 @@ impl VPtr {
             }
             _ => VPtr(NonNull::from(Box::leak(Box::new(inner)))),
         }
-    }
-
-    fn make_mut(this: &mut VPtr) -> &mut ValueInner {
-        unsafe {
-            let p = this.0.as_ptr();
-            if (*p).rc.get() > 1 {
-                let cloned = (*p).clone(); // payload deep-copy, rc starts at 1
-                *this = VPtr::new(cloned); // drops our share of the old box
-                &mut *this.0.as_ptr()
-            } else {
-                &mut *p
-            }
-        }
-    }
-
-    fn ptr_eq(a: &VPtr, b: &VPtr) -> bool {
-        a.0 == b.0
-    }
-
-    fn strong_count(this: &VPtr) -> usize {
-        unsafe { (*this.0.as_ptr()).rc.get() }
     }
 }
 
@@ -618,17 +598,10 @@ impl fmt::Debug for Value {
 
 // ── Cached singletons ──────────────────────────────────────────
 //
-// The VM's hottest paths (`PushEmpty`, `PushBool`, integer loop counters)
-// create the same values millions of times.  By caching them as thread-local
-// `Rc` singletons we eliminate per-use `Rc::new` + `OnceCell::from`
-// overhead — `Value::clone()` becomes a simple reference-count increment.
-
-const SMALL_INT_CACHE_SIZE: usize = 256;
-/// Lower bound of the small-int cache: the negatives cover the `-1`
-/// step operands loop code pushes per iteration (`expr {$n - 1}`'s
-/// PushInt), which would otherwise malloc a fresh `Rc<ValueInner>`
-/// every time.
-const INT_CACHE_MIN: i64 = -128;
+// The VM's hottest paths (`PushEmpty`, `PushBool`) create the same values
+// millions of times.  By caching them as thread-local `Rc` singletons we
+// eliminate per-use `Rc::new` + `OnceCell::from` overhead — `Value::clone()`
+// becomes a simple reference-count increment.
 
 thread_local! {
     static CACHED_EMPTY: VPtr = VPtr::new(ValueInner {
@@ -648,19 +621,6 @@ thread_local! {
         rep: InternalRep::Bool(false),
         rc: Cell::new(1),
     });
-
-    /// Cached small integers [-128, 256) — covers loop counters, return
-    /// codes, list indices, most Tcl numeric constants, and the negative
-    /// step operands of decrementing loops.
-    static CACHED_INTS: Vec<VPtr> = (INT_CACHE_MIN..SMALL_INT_CACHE_SIZE as i64)
-        .map(|n| {
-            VPtr::new(ValueInner {
-                string: OnceCell::from(SmallVec::from_slice(format_int(n).as_bytes())),
-                rep: InternalRep::Int(n),
-                rc: Cell::new(1),
-            })
-        })
-        .collect();
 }
 
 impl Default for Value {

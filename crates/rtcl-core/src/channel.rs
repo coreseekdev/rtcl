@@ -760,7 +760,7 @@ pub fn pipe_pair() -> (PipeReaderEnd, PipeWriterEnd) {
 
 impl Channel for PipeReaderEnd {
     fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut inner = self.shared.buf.lock().map_err(|_| io::Error::other("lock poisoned"))?;
+        let inner = self.shared.buf.lock().map_err(|_| io::Error::other("lock poisoned"))?;
         let avail = inner.len().saturating_sub(self.pos);
         if avail == 0 {
             // Nothing buffered (or the write end closed): report EOF. The

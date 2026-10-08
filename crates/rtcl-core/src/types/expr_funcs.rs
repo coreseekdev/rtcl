@@ -15,71 +15,6 @@ pub(crate) fn domain_error() -> Error {
     )
 }
 
-/// Format a double the way Tcl 8.6 stringifies one: shortest round-trip
-/// decimal digits, fixed notation when the decimal exponent of the leading
-/// digit is in `[-4, 16]` (appending `.0` when the digits would otherwise
-/// read as an integer), scientific notation (`1.5e+300`, `5e-324`,
-/// `1e+17`) outside that range.
-///
-/// This lives here (not in rtcl-vm's `value.rs`) so expression results
-/// match tclsh 8.6 byte-for-byte without changing the shared formatter.
-pub(crate) fn format_tcl_float(f: f64) -> String {
-    if f.is_nan() {
-        return "NaN".to_string();
-    }
-    if f.is_infinite() {
-        return if f < 0.0 { "-Inf".to_string() } else { "Inf".to_string() };
-    }
-    if f == 0.0 {
-        return if f.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
-    }
-    // Rust's LowerExp yields the shortest round-trip decimal as "d[.ddd]e<exp>".
-    let sci = format!("{:e}", f.abs());
-    let (mantissa, exp_str) = match sci.split_once('e') {
-        Some(parts) => parts,
-        None => return sci,
-    };
-    let exp10: i32 = exp_str.parse().unwrap_or(0);
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let n = digits.len() as i32;
-
-    let mut out = String::new();
-    if f < 0.0 {
-        out.push('-');
-    }
-    if (-4..=16).contains(&exp10) {
-        if exp10 >= n - 1 {
-            // Integral value: digits left-padded to the decimal point, then ".0"
-            out.push_str(&digits);
-            for _ in 0..(exp10 - (n - 1)) {
-                out.push('0');
-            }
-            out.push_str(".0");
-        } else if exp10 >= 0 {
-            let split = (exp10 + 1) as usize;
-            out.push_str(&digits[..split]);
-            out.push('.');
-            out.push_str(&digits[split..]);
-        } else {
-            out.push_str("0.");
-            for _ in 0..(-exp10 - 1) {
-                out.push('0');
-            }
-            out.push_str(&digits);
-        }
-    } else {
-        out.push_str(&digits[..1]);
-        if n > 1 {
-            out.push('.');
-            out.push_str(&digits[1..]);
-        }
-        out.push('e');
-        out.push(if exp10 < 0 { '-' } else { '+' });
-        out.push_str(&exp10.unsigned_abs().to_string());
-    }
-    out
-}
-
 /// A float `Value` carrying Tcl's canonical string form. Used for every
 /// float produced by the expression evaluator so results stringify exactly
 /// like tclsh (rtcl-vm's `Value::from_float` uses a different layout).
@@ -277,27 +212,6 @@ fn float_result(t: f64) -> Result<Value> {
             .ok_or_else(|| Error::Msg("integer value too large to represent".to_string()))?;
         Ok(to_value(IntRep::Big(b)))
     }
-}
-
-/// Exact comparison of an i64 against an f64 without rounding the integer
-/// to double (which would conflate e.g. 2^53+1 with 2^53).
-fn cmp_int_float(i: i64, f: f64) -> Option<Ordering> {
-    if f.is_nan() {
-        return None;
-    }
-    const TWO63: f64 = 9223372036854775808.0; // 2^63
-    if f >= TWO63 {
-        return Some(Ordering::Less);
-    }
-    if f < -TWO63 {
-        return Some(Ordering::Greater);
-    }
-    // |f| < 2^63, so its truncation is exactly representable as i64.
-    let fi = f.trunc() as i64;
-    Some(match i.cmp(&fi) {
-        Ordering::Equal => 0.0f64.partial_cmp(&f.fract()).unwrap_or(Ordering::Equal),
-        ord => ord,
-    })
 }
 
 fn require_args(name: &str, expected: usize, actual: usize) -> Result<()> {

@@ -303,13 +303,11 @@ impl Parser {
                 break;
             }
         }
-        let max_s;
         match self.at(j) {
             Some('}') => {
                 if min_s.is_empty() {
                     return None; // `{}` or `{,}`-ish: literal brace
                 }
-                max_s = min_s.clone();
                 let m: u32 = min_s.parse().ok()?;
                 return Some((m, Some(m), j + 1));
             }

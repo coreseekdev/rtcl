@@ -36,8 +36,6 @@ use core::cell::RefCell;
 
 #[cfg(not(feature = "embedded"))]
 use std::collections::HashMap;
-#[cfg(not(feature = "embedded"))]
-type FxMap<V> = std::collections::HashMap<String, V, std::hash::BuildHasherDefault<crate::interp::varmap::VarHasher>>;
 type FxMapK<K, V> =
     std::collections::HashMap<K, V, std::hash::BuildHasherDefault<crate::interp::varmap::VarHasher>>;
 
@@ -2754,7 +2752,6 @@ pub(crate) extern "Rust" fn cmd_namespace_entry(interp: &mut Interp, args: &[Val
 #[cfg(test)]
 mod tests {
     use crate::interp::Interp;
-use crate::interp::Rc;
 
     fn eval(script: &str) -> String {
         let mut interp = Interp::new();

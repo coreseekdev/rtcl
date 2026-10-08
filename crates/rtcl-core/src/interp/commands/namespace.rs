@@ -2078,7 +2078,6 @@ pub(crate) fn ensure_namespace(
 #[cfg(test)]
 mod tests {
     use crate::interp::Interp;
-use crate::interp::Rc;
 
     fn eval(script: &str) -> String {
         let mut interp = Interp::new();

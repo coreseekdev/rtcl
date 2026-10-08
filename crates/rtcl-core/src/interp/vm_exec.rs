@@ -130,7 +130,6 @@ struct LoopFrame {
 /// is `Some` for an lmap (body results so far — kept across a `break`,
 /// skipped by a `continue`).
 struct ForeachFrame {
-    info_idx: u32,
     lists: Vec<ForeachList>,
     idx: usize,
     /// Iteration count, fixed at start (max over groups) — ForeachNext
@@ -913,7 +912,6 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             let collected = info_ref.lmap.then(Vec::new);
             let _framed = info_ref.framed;
             st.foreaches.push(ForeachFrame {
-                info_idx: *info,
                 lists,
                 idx: 0,
                 iters: max,
@@ -1873,7 +1871,7 @@ mod foreach_inline_tests {
 
         // A level-2 break escapes the dispatched lmap (catch sees 2), and
         // the multi-line body frame counts body-relative lines.
-        let (m, _c, info) = caught("lmap i {1 2} {\n    set t $i\n    nosuchcmd2\n}");
+        let (_m, _c, info) = caught("lmap i {1 2} {\n    set t $i\n    nosuchcmd2\n}");
         assert!(info.contains("(\"lmap\" body line 3)"), "body-relative line in {info}");
     }
 

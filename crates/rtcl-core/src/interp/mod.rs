@@ -281,7 +281,11 @@ impl core::hash::Hasher for PtrHasher {
 /// `Rc<ByteCode>` keepalive so the address key stays valid for the
 /// entry's lifetime.
 pub(crate) struct ConstPoolEntry {
-    /// The compiled unit the values belong to (address-keyed keepalive).
+    /// The compiled unit the values belong to.  NOT dead code despite
+    /// never being read: the pool is keyed by `Rc::as_ptr(code)`, so the
+    /// entry must hold the unit alive or a freed unit's address could be
+    /// reused by a new unit and served this stale entry's constants.
+    #[allow(dead_code)]
     pub code: Rc<ByteCode>,
     /// `code.constants()` as `Value`s, in table order — one slice serves
     /// both `PushConst` (u16) and `PushConstWide` (u32), which index the
@@ -323,8 +327,6 @@ pub(crate) struct CmdSite {
 /// A snapshot of the element set plus the array's mutation stamp: any
 /// element added or removed (tclsh semantics) invalidates the search.
 pub(crate) struct ArraySearch {
-    /// Allocation counter value (smallest free at startsearch time).
-    pub id: i64,
     /// Rendered identifier, e.g. `s-1-a` — includes the array name as given.
     pub rendered: String,
     /// Remaining element names, in snapshot order.

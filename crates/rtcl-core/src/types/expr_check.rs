@@ -273,7 +273,7 @@ pub fn check_expr(expr: &str) -> Result<(), String> {
                 }
                 // Reduce loop: attach the complete tree to pending
                 // operators while precedence says so.
-                let mut popped = *c.stack.last().unwrap();
+                let mut popped;
                 loop {
                     popped = *c.stack.last().unwrap();
                     let tp = popped.prec();

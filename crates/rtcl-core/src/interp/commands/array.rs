@@ -171,7 +171,6 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let n = list.ctr;
             let rendered = format!("s-{}-{}", n, array_name);
             list.active.push(ArraySearch {
-                id: n,
                 rendered: rendered.clone(),
                 elements,
                 stamp,

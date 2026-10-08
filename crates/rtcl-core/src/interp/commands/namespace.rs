@@ -279,7 +279,7 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // stays invisible (tclsh: `info exists` → 0).
             let seeded = match &init_value {
                 Some(val) => Some(val.clone()),
-                None => interp.globals.get(&qualified).map(|v| v.clone()),
+                None => interp.globals.get(&qualified).cloned(),
             };
             if let Some(val) = seeded {
                 interp.frames[frame_idx].locals.insert(local_name, val);
@@ -1014,7 +1014,7 @@ fn ns_inscope(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut script = args[3].as_str().to_string();
     for a in &args[4..] {
         script.push(' ');
-        script.push_str(Value::from_list(&[a.clone()]).as_str());
+        script.push_str(Value::from_list(core::slice::from_ref(a)).as_str());
     }
     let sub = [
         args[0].clone(),
@@ -1267,7 +1267,7 @@ fn ens_create(interp: &mut Interp, opts: &[Value]) -> Result<Value> {
         let opt = match resolve_ens_opt(opts[i].as_str()) {
             Some(o) => o,
             None => {
-                let list: Vec<&str> = ENS_CREATE_OPTIONS.iter().copied().collect();
+                let list: Vec<&str> = ENS_CREATE_OPTIONS.to_vec();
                 return Err(Error::runtime(
                     format!(
                         "bad option \"{}\": must be {}",
@@ -1834,8 +1834,7 @@ fn ens_configure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         .unwrap_or_default(),
                 )),
                 other => {
-                    let mut list: Vec<&str> =
-                        ENS_CREATE_OPTIONS.iter().copied().collect();
+                    let mut list: Vec<&str> = ENS_CREATE_OPTIONS.to_vec();
                     list.push("-namespace");
                     Err(Error::runtime(
                         format!(
@@ -1886,8 +1885,7 @@ fn ens_configure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     );
                 }
                     other => {
-                        let mut list: Vec<&str> =
-                            ENS_CREATE_OPTIONS.iter().copied().collect();
+                        let mut list: Vec<&str> = ENS_CREATE_OPTIONS.to_vec();
                         list.push("-namespace");
                         return Err(Error::runtime(
                             format!(

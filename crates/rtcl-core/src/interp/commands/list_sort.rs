@@ -949,7 +949,6 @@ fn merge_lists(
     }
 
     let cmp = sort_compare(arena, l.unwrap(), r.unwrap(), st, interp);
-    let head;
     let mut tail;
     if cmp > 0 || (cmp == 0 && st.unique) {
         if cmp == 0 {
@@ -961,7 +960,7 @@ fn merge_lists(
         tail = l.unwrap();
         l = arena[tail].next;
     }
-    head = Some(tail);
+    let head = Some(tail);
 
     if !st.unique {
         while l.is_some() && r.is_some() {

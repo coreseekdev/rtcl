@@ -573,12 +573,11 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             Ok(())
         }
-        expand(&args[1..1 + num_option_words], &mut opts).map_err(|e| {
+        expand(&args[1..1 + num_option_words], &mut opts).inspect_err(|_| {
             // A malformed -options value is a RESULT-family error
             // (tclsh: `return -options {-code} x` → TCL RESULT
             // ILLEGAL_OPTIONS).
             set_error_code(_interp, "TCL RESULT ILLEGAL_OPTIONS");
-            e
         })?;
     }
 

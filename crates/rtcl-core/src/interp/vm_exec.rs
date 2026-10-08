@@ -19,7 +19,7 @@
 //! harness frame — through the word-error branch (`LoadVar`/`EvalScript`,
 //! honouring `err_from_subst`) or the dispatch branch (everything else).
 
-use super::{Interp, Rc};
+use super::{CmdSites, Interp, Rc};
 use crate::error::{Error, Result};
 use crate::value::Value;
 use rtcl_parser::{ByteCode, Compiler, OpCode};
@@ -372,7 +372,7 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
         // probe — which also lazily heals eviction (see below).
         let same = st
             .consts_code
-            .map(|c| c == code.as_ref() as *const rtcl_parser::ByteCode)
+            .map(|c| core::ptr::eq(c, code.as_ref()))
             .unwrap_or(false);
         if !same {
             // The literal pool is capped and cleared on overflow: a unit
@@ -419,7 +419,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
         // dispatches all push their result).
         let Some(op) = ops.get(st.pc) else { break st.pop_val() };
         st.pc += 1;
-        if let Err(e) = exec_op(interp, code, &op, st) {
+        if let Err(e) = exec_op(interp, code, op, st) {
             // Control-flow completions propagate framelessly — except
             // break/continue that crossed a *dispatched command* or
             // *nested script* boundary inside an inline loop: exactly
@@ -509,7 +509,7 @@ struct VmState {
     /// cmd_cache hash probe + dispatch chain, re-resolving on a
     /// generation/name/namespace mismatch.  Shared `Rc` — every depth
     /// executing this unit uses the one table.
-    cmd_sites: Option<Rc<core::cell::RefCell<Vec<(u32, super::CmdSite)>>>>,
+    cmd_sites: Option<CmdSites>,
     /// The unit whose consts/cmd_sites are loaded (identity by address,
     /// `None` = none loaded).  `exec_bytecode` reuses the loaded pair
     /// when the SAME unit borrows this state again — recursion into one
@@ -571,6 +571,9 @@ impl VmState {
 /// methods are the only API); spare depth is capped — deeper recursion
 /// churn simply drops the excess states.
 pub(crate) struct VmPool {
+    // Deliberate Box (see struct doc): pool pop/push must move an
+    // 8-byte pointer, not the ~168-byte state.
+    #[allow(clippy::vec_box)]
     spare: Vec<Box<VmState>>,
 }
 

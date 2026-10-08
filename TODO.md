@@ -26,6 +26,25 @@
   （3 层函数）可合并；`resolve_object_arg`（String 化）的调用点
   梳理。`bench/scripts/oo_bench2.tcl`。
 
+## 性能候选（评估结论存档，未排期）
+
+> 来自 clippy 归零批次（type_complexity alias 化）途中的性能评估——
+> 本轮只记录不实施；bench 显示热点后再入「性能优化」。
+
+- [ ] **`Rc<Vec<ChainEntry>>` 双重间接 → `Rc<[ChainEntry]>`**：切掉一层
+  Vec 头部（oo 链 memo 与 `ActiveMethod` 快照共用该形状）。机械小改，
+  列为第一个 bench 候选（`bench/scripts/oo_bench2.tcl`）。
+- [ ] **嵌套 memo 复合键**（`chain_memo`/`key_memo`，现 `ChainMemo`/
+  `KeyMemo`）：双层 `FxMapK<Rc<str>, …>` = 每次查找两次哈希 + 两次
+  Rc 间接。候选：单层复合键 `(Rc<str>, Rc<str>)`（(ns, name) 对，一次
+  哈希）。**优先级低**——这些是冷路径 memo（miss 才付出），bench 显示
+  OO 热点后再做。
+- [ ] **offset+len 替代 `Rc<str>`（用户提议，评估为大手术）**：当前
+  `Rc<str>` 已通过 refcount 免拷贝（parse_cache 以整段源码为键，word
+  级无重复分配）；改 span 模型需动 parser 的 Word 表示与缓存键设计。
+  收益点在 wasm 侧（减少分配器往返）。前置条件：bench 显示源码分配
+  占比 >5%。
+
 ## 语义对齐（与 specs/DIVERGENCES.md 同步，复核 2026-10-07）
 
 - [x] **case 级 4072/4072 严格对齐达成**：全量审计确认 0 项 rtcl 引起

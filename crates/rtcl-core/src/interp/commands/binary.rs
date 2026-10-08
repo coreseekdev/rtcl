@@ -150,7 +150,7 @@ fn resolve_prefix<'a>(name: &str, options: &[&'a str]) -> Option<&'a str> {
         return Some(exact);
     }
     let matches: Vec<&'a str> =
-        options.iter().filter(|o| o.starts_with(name)).map(|o| *o).collect();
+        options.iter().filter(|o| o.starts_with(name)).copied().collect();
     if matches.len() == 1 {
         Some(matches[0])
     } else {

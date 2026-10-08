@@ -396,10 +396,12 @@ impl Interp {
             return None;
         }
         let key = self.exec_step_stack.last()?.clone();
-        let snapshot: Vec<u64> = match self.exec_traces.get(&key) {
-            Some(v) => v.iter().map(|t| t.id).collect(),
-            None => return None,
-        };
+        let snapshot: Vec<u64> = self
+            .exec_traces
+            .get(&key)?
+            .iter()
+            .map(|t| t.id)
+            .collect();
         let cmdtext = Value::from_list(args).as_str().to_string();
         let _ = self.exec_fire_ids(&key, &snapshot, &cmdtext, "enterstep", &[], false);
         Some(ExecStepCtx { key, cmdtext, snapshot })

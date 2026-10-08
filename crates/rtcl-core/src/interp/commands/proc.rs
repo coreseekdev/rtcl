@@ -417,7 +417,7 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // (#0 = the global scope itself); past the top: bad level.
             if *n == 0 {
                 (interp.frames.len(), 0usize, "::".to_string())
-            } else if n - 1 >= scopes_total {
+            } else if *n > scopes_total {
                 return Err(bad_level(interp, word));
             } else {
                 uplevel_resolve(interp, n - 1)
@@ -558,7 +558,7 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         LevelSpec::Abs(n, word) => {
             if *n == 0 {
                 TargetScope::Global
-            } else if n - 1 >= scopes_total {
+            } else if *n > scopes_total {
                 return Err(bad_level(interp, word));
             } else {
                 TargetScope::Idx(n - 1)

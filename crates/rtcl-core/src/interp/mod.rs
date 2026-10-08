@@ -276,6 +276,17 @@ impl core::hash::Hasher for PtrHasher {
     }
 }
 
+/// One unit's per-call-site resolved-command token table (keyed by the
+/// op index of the `Call`/`DynCall` op, sorted): shared through the pool
+/// entry so one pool probe per `exec_bytecode` reaches every depth
+/// executing the unit.
+pub(crate) type CmdSites = Rc<core::cell::RefCell<Vec<(u32, CmdSite)>>>;
+
+/// One loaded unit's pooled constants plus its call-site token table —
+/// the pair [`Interp::const_pool_get`] hands the executor (a single pool
+/// probe serves both halves, so they travel together).
+pub(crate) type LoadedUnitParts = (Rc<[Value]>, CmdSites);
+
 /// One [`Interp::const_pool`] entry: a compiled unit's string constants
 /// pre-materialised as `Value`s (tclsh's literal table).  Holds the
 /// `Rc<ByteCode>` keepalive so the address key stays valid for the
@@ -296,7 +307,7 @@ pub(crate) struct ConstPoolEntry {
     /// op index of the `Call`/`DynCall` op, sorted.  Shared through the
     /// entry so one pool probe per `exec_bytecode` reaches both the
     /// constants and these — the executor pays no per-call hashing.
-    pub sites: Rc<core::cell::RefCell<Vec<(u32, CmdSite)>>>,
+    pub sites: CmdSites,
 }
 
 /// One call-site resolution token: the dispatch outcome a specific
@@ -393,11 +404,17 @@ pub struct Interp {
     /// whole struct four times per call (a memcpy each — the fib profile's
     /// memmove bucket); boxing makes those moves 8-byte pointer copies while
     /// the box itself rides the pool.
+    // Deliberate Box: see above — frame moves must stay pointer copies
+    // (the pool rides them per call); clippy's size heuristic disagrees.
+    #[allow(clippy::vec_box)]
     pub(crate) frames: Vec<Box<CallFrame>>,
     /// Recycled call frames: proc return pushes its (emptied) frame here
     /// and the next call pops it, keeping the locals-map allocation and
     /// its capacity across calls (tclsh keeps one frame arena per
     /// interpreter; recursion depth bounds the pool naturally).
+    // Deliberate Box: same as `frames` — the recycled frame must not be
+    // memcpy'd on pool pop/push.
+    #[allow(clippy::vec_box)]
     pub(crate) frame_pool: Vec<Box<CallFrame>>,
     /// Recycled bytecode-executor states (vm_exec): every exec_bytecode
     /// call borrows one and returns it emptied, so proc calls pay no
@@ -555,7 +572,7 @@ pub struct Interp {
     /// last) — execution `enterstep` traces resolve the *caller* command
     /// through this stack.
     pub(crate) exec_step_stack: Vec<String>,
-    /// > 0 while an execution-trace callback itself is running (its inner
+    /// `> 0` while an execution-trace callback itself is running (its inner
     /// commands do not re-trigger step traces — tclsh suppresses them).
     pub(crate) exec_step_running: u32,
     /// Shadow epoch for compiled proc bodies: bumped whenever a command
@@ -1074,13 +1091,7 @@ impl Interp {
     /// Pool probe for a unit being executed (one hash per `exec_bytecode`
     /// call, amortised over every PushConst and call-site token it uses):
     /// the literal slice plus the call-site token table.
-    pub(crate) fn const_pool_get(
-        &self,
-        code: &ByteCode,
-    ) -> Option<(
-        Rc<[Value]>,
-        Rc<core::cell::RefCell<Vec<(u32, CmdSite)>>>,
-    )> {
+    pub(crate) fn const_pool_get(&self, code: &ByteCode) -> Option<LoadedUnitParts> {
         self.const_pool
             .get(&(code as *const ByteCode as usize))
             .map(|e| (Rc::clone(&e.values), Rc::clone(&e.sites)))

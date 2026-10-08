@@ -239,7 +239,7 @@ pub(crate) fn int_shift(left: &Value, right: &Value, shl: bool) -> Result<Value>
         Some(IntRep::Big(b)) => {
             let shifted = if shl {
                 b << (count as usize)
-            } else if count as u64 >= b.bits() as u64 {
+            } else if count as u64 >= b.bits() {
                 // Saturate without building a 2^count denominator.
                 if b.is_negative() {
                     num_bigint::BigInt::from(-1)

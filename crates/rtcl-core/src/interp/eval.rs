@@ -215,7 +215,7 @@ impl Interp {
                 end -= 1;
             }
             let start = script[..end]
-                .rfind(|c| c == '\n' || c == ';')
+                .rfind(['\n', ';'])
                 .map(|i| i + 1)
                 .unwrap_or(0);
             self.err_info = Some(format!(
@@ -636,7 +636,7 @@ impl Interp {
             crate::interp::commands::namespace::find_ensemble(self, cmd_name)
         {
             return crate::interp::commands::namespace::dispatch_ensemble(
-                self, &ens_key, ens_def, &args,
+                self, &ens_key, ens_def, args,
             );
         }
 
@@ -680,7 +680,7 @@ impl Interp {
             Some(f) => {
                 self.cmd_cache_put(cmd_name, super::ResolvedCmd::Builtin(f));
                 self.call_depth += 1;
-                let result = f(self, &args);
+                let result = f(self, args);
                 self.call_depth -= 1;
                 self.fill_wrong_args(cmd_name, result)
             }
@@ -742,7 +742,7 @@ impl Interp {
                     .or_else(|| cmd_name.strip_prefix("tcl::unsupported::"))
                 {
                     if kind == "disassemble" || kind == "getbytecode" {
-                        return unsupported_bytecode_cmd(self, &args);
+                        return unsupported_bytecode_cmd(self, args);
                     }
                 }
                 // `namespace unknown` handler: the current namespace's

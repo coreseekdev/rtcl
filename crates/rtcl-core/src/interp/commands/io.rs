@@ -1059,7 +1059,7 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // Availability (index in range) is checked before the
                 // conversion character is validated ("%5%" with no args
                 // -> not enough; with args -> bad field specifier).
-                if n < 1 || n - 1 >= args.len().saturating_sub(2) {
+                if n < 1 || n > args.len().saturating_sub(2) {
                     return fmt_err!("\"%n$\" argument index out of range", "TCL FORMAT INDEXRANGE");
                 }
                 if !matches!(

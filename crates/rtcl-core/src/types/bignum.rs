@@ -84,7 +84,7 @@ pub fn parse_literal(s: &str) -> Option<BigInt> {
         if digits.is_empty()
             || !digits
                 .bytes()
-                .all(|b| b.is_ascii_digit() && (b as char).to_digit(radix).is_some())
+                .all(|b| b.is_ascii_digit() && (b as char).is_digit(radix))
         {
             return None;
         }
@@ -152,7 +152,7 @@ pub fn isqrt(x: &BigInt) -> BigInt {
         return BigInt::from(0u8);
     }
     // Initial guess: 2^ceil(bits/2) — within a factor of 2 of √x.
-    let bits = x.bits() as u64;
+    let bits = x.bits();
     let mut g: BigInt = BigInt::from(1u8) << (bits.div_ceil(2) + 1) as usize;
     loop {
         let next = (g.clone() + x.div_floor(&g)) >> 1u32;
@@ -184,7 +184,7 @@ pub fn sqrt_to_f64(b: &BigInt) -> f64 {
     if b.is_zero() {
         return 0.0;
     }
-    let bits = b.bits() as u64;
+    let bits = b.bits();
     let shift = bits.saturating_sub(64);
     let top = (b >> (shift as usize)).to_u64().unwrap_or(u64::MAX) as f64;
     // Fold one factor of 2 into the mantissa when the exponent is odd so
@@ -211,10 +211,7 @@ pub fn cmp_rep_float(a: &IntRep, f: f64) -> Option<core::cmp::Ordering> {
         });
     }
     let t = f.trunc();
-    let b = match big_from_f64(t) {
-        Some(b) => b,
-        None => return None,
-    };
+    let b = big_from_f64(t)?;
     match a.to_big().cmp(&b) {
         Ordering::Equal => {
             if f > t {

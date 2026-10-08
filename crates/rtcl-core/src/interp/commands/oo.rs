@@ -61,6 +61,9 @@ pub(crate) enum MethodKind {
     Builtin(&'static str),
 }
 
+/// 方法 proc 体 memo：(typed name, 参数名表, 定义)。
+type ProcMemo = Option<(String, Vec<String>, Rc<ProcDef>)>;
+
 /// A method definition (own methods, forwards, constructors, destructors).
 #[derive(Debug, Clone)]
 pub(crate) struct MethodDef {
@@ -78,7 +81,7 @@ pub(crate) struct MethodDef {
     /// memo with its inputs.  The vars snapshot is the `link_prefix` input —
     /// a `variable` declaration change rebuilds (the `define` word also
     /// bumps `mutation_ctr`, retiring the chain memo with it).
-    pub proc_memo: Rc<RefCell<Option<(String, Vec<String>, Rc<ProcDef>)>>>,
+    pub proc_memo: Rc<RefCell<ProcMemo>>,
     /// Cached argument head for the invoked method: (typed name, the two
     /// head Values [typed, method]).  The typed name varies per CALL SITE
     /// (`c` vs `::c`); a match recycles the head Values without
@@ -87,7 +90,7 @@ pub(crate) struct MethodDef {
 }
 
 /// A fresh [`MethodDef::proc_memo`] cell.
-fn fresh_memo() -> Rc<RefCell<Option<(String, Vec<String>, Rc<ProcDef>)>>> {
+fn fresh_memo() -> Rc<RefCell<ProcMemo>> {
     Rc::new(RefCell::new(None))
 }
 
@@ -108,6 +111,12 @@ pub(crate) struct ChainEntry {
     pub owner: Owner,
     pub def: MethodDef,
 }
+
+/// 链解析 memo：类键 → (成员/父类键 → (stamp, 条目))。
+type ChainMemo = FxMapK<Rc<str>, (u64, Rc<Vec<ChainEntry>>)>;
+
+/// 对象/类键解析 memo：ns 键 → (typed 名 → (stamp, 解析结果))。
+type KeyMemo = FxMapK<Rc<str>, (u64, Option<Rc<str>>)>;
 
 /// A plain object.
 #[derive(Debug, Default, Clone)]
@@ -211,14 +220,14 @@ pub(crate) struct OoState {
     /// (wasm32 is a target).  The `Rc` chain is shared with the
     /// `ActiveMethod` snapshots, so `next` also stops paying a
     /// `to_vec` per invocation.
-    pub chain_memo: FxMapK<Rc<str>, FxMapK<Rc<str>, (u64, Rc<Vec<ChainEntry>>)>>,
+    pub chain_memo: FxMapK<Rc<str>, ChainMemo>,
     /// The `include_private` half of [`Self::chain_memo`].
-    pub chain_memo_priv: FxMapK<Rc<str>, FxMapK<Rc<str>, (u64, Rc<Vec<ChainEntry>>)>>,
+    pub chain_memo_priv: FxMapK<Rc<str>, ChainMemo>,
     /// Typed-name → canonical object/class key memo (see
     /// `resolve_object_key`): current namespace → typed name →
     /// (stamp, resolution).  `RefCell` so `&Interp` read paths can fill
     /// it, the `proc_memo` precedent.
-    pub key_memo: RefCell<FxMapK<Rc<str>, FxMapK<Rc<str>, (u64, Option<Rc<str>>)>>>,
+    pub key_memo: RefCell<FxMapK<Rc<str>, KeyMemo>>,
 }
 
 // ── init ───────────────────────────────────────────────────────────────
@@ -376,7 +385,7 @@ fn resolve_object_key(interp: &Interp, typed: &str) -> Option<Rc<str>> {
         }
         let inner = memo
             .entry(Rc::from(interp.current_namespace.as_ref()))
-            .or_insert_with(FxMapK::default);
+            .or_default();
         if inner.len() >= KEY_MEMO_NAME_MAX {
             inner.clear();
         }
@@ -640,15 +649,11 @@ fn owner_variables<'a>(interp: &'a Interp, owner: &'a Owner, key: &str) -> &'a [
 /// Topmost live active-method entry (dropping stale ones).
 fn top_active(interp: &mut Interp) -> Option<ActiveMethod> {
     loop {
-        match interp.oo.active.last() {
-            Some(a) => {
-                if interp.frames.len() > a.frame_depth {
-                    return Some(a.clone());
-                }
-                interp.oo.active.pop();
-            }
-            None => return None,
+        let a = interp.oo.active.last()?;
+        if interp.frames.len() > a.frame_depth {
+            return Some(a.clone());
         }
+        interp.oo.active.pop();
     }
 }
 
@@ -1028,7 +1033,7 @@ fn resolve_sub<'a>(word: &str, list: &[&'a str]) -> Option<&'a str> {
             return Some(item);
         }
     }
-    let mut hits: Vec<&'a str> = list.iter().filter(|i| i.starts_with(word)).map(|i| *i).collect();
+    let mut hits: Vec<&'a str> = list.iter().filter(|i| i.starts_with(word)).copied().collect();
     if hits.len() == 1 {
         return hits.pop();
     }

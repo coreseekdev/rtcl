@@ -489,7 +489,7 @@ fn mathop_add(a: &Value, b: &Value) -> Result<Value> {
         return Ok(crate::types::expr_funcs::float_value(x + y));
     }
     Err(Error::runtime(
-        format!("can't use non-numeric string as operand of \"+\""),
+        "can't use non-numeric string as operand of \"+\"".to_string(),
         crate::error::ErrorCode::InvalidOp,
     ))
 }
@@ -2106,7 +2106,6 @@ pub fn cmd_assemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 //   - underflow (-1 / empty list) happens only when a FAILED conversion
 //     stopped at end-of-input (unlimited width) or exactly at the width
 //     boundary (limited width); a plain mismatch stops quietly.
-
 /// One parsed conversion specifier.
 struct ScanSpec {
     op: u8,

@@ -229,10 +229,10 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "link"
             } else if ft.is_dir() {
                 "directory"
-            } else if ft.is_file() {
-                "file"
             } else {
-                "file" // character/block special etc. — fallback
+                // Regular files and character/block specials etc. all
+                // report as "file" (tclsh's fallback type).
+                "file"
             };
             Ok(Value::from_str(t))
         }
@@ -1374,7 +1374,7 @@ fn format_exp(v: f64, prec: usize, upper: bool, hash: bool) -> String {
 fn trim_g_fraction(s: String) -> String {
     if let Some(pos) = s.find(['e', 'E']) {
         let (mant, exp) = s.split_at(pos);
-        if let Some(dot) = mant.find('.') {
+        if mant.contains('.') {
             let trimmed = mant.trim_end_matches('0');
             let trimmed = trimmed.strip_suffix('.').unwrap_or(trimmed);
             let mut out = String::with_capacity(mant.len() + exp.len());

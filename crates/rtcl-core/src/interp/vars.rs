@@ -1001,12 +1001,13 @@ impl Interp {
                             }
                         }
                     }
-                } else if self.current_namespace.as_ref() == "::" && self.flat_aliases.is_empty() {
-                    if self.arrays_env_only || !self.array_globals.contains(name) {
-                        if let Some(slot) = self.globals.get_mut(name) {
-                            *slot = value.clone();
-                            wrote = true;
-                        }
+                } else if self.current_namespace.as_ref() == "::"
+                    && self.flat_aliases.is_empty()
+                    && (self.arrays_env_only || !self.array_globals.contains(name))
+                {
+                    if let Some(slot) = self.globals.get_mut(name) {
+                        *slot = value.clone();
+                        wrote = true;
                     }
                 }
                 if wrote {
@@ -1160,19 +1161,19 @@ impl Interp {
                     self,
                     &format!("TCL LOOKUP VARNAME {}", base),
                 );
-                return Err(Error::runtime(
+                Err(Error::runtime(
                     format!("can't unset \"{}\": variable isn't array", name),
                     ErrorCode::Generic,
-                ));
+                ))
             } else {
                 crate::interp::commands::list::set_error_code(
                     self,
                     &format!("TCL LOOKUP VARNAME {}", base),
                 );
-                return Err(Error::runtime(
+                Err(Error::runtime(
                     format!("can't unset \"{}\": no such variable", name),
                     ErrorCode::NotFound,
-                ));
+                ))
             }
         } else {
             let given = name.to_string();
@@ -1347,7 +1348,6 @@ impl Interp {
     /// name2 as an empty string for whole-variable ops).
     pub(crate) fn fire_traces(&mut self, base: &str, elem: Option<&str>, op: &str) -> Result<()> {
         let key = self.array_stamp_key(base);
-        let mut scripts: Vec<String> = Vec::new();
         let scripts = self.collect_trace_scripts(&key, elem, op);
         for s in scripts.into_iter().rev() {
             // Most-recent-registered fires first (tclsh prepends to the

@@ -267,8 +267,8 @@ impl ChannelTable {
         self.channels.get_mut(id)
     }
 
-    pub fn get(&self, id: &str) -> Option<&Box<dyn Channel>> {
-        self.channels.get(id)
+    pub fn get(&self, id: &str) -> Option<&dyn Channel> {
+        self.channels.get(id).map(|ch| ch.as_ref())
     }
 
     pub fn close(&mut self, id: &str) -> io::Result<()> {

@@ -164,9 +164,9 @@ pub(crate) fn resolve_var_link(interp: &mut Interp, ns: &str, raw_name: &str) ->
     let ns_part = if raw_name.is_empty() {
         ns.to_string()
     } else if raw_name.ends_with("::") {
-        normalise(&format!("::{}", &qualified))
+        normalise(&format!("::{}", qualified))
     } else {
-        parent_of(&normalise(&format!("::{}", &qualified)))
+        parent_of(&normalise(&format!("::{}", qualified)))
     };
     if interp.var_link_cache.len() >= VAR_LINK_CACHE_MAX {
         interp.var_link_cache.clear();
@@ -673,9 +673,8 @@ fn ns_which(interp: &Interp, args: &[Value]) -> Result<Value> {
         "command" => {
             if interp.procs.contains_key(&qualified)
                 || interp.import_aliases.contains_key(&qualified)
+                || interp.commands.contains_key(&qualified)
             {
-                Ok(Value::from_str(&qualified))
-            } else if interp.commands.contains_key(&qualified) {
                 Ok(Value::from_str(&qualified))
             } else if interp.procs.contains_key(name)
                 || interp.import_aliases.contains_key(name)

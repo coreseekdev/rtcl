@@ -153,7 +153,7 @@ pub fn isqrt(x: &BigInt) -> BigInt {
     }
     // Initial guess: 2^ceil(bits/2) — within a factor of 2 of √x.
     let bits = x.bits() as u64;
-    let mut g: BigInt = BigInt::from(1u8) << ((bits + 1) / 2 + 1) as usize;
+    let mut g: BigInt = BigInt::from(1u8) << (bits.div_ceil(2) + 1) as usize;
     loop {
         let next = (g.clone() + x.div_floor(&g)) >> 1u32;
         if next >= g {
@@ -164,10 +164,10 @@ pub fn isqrt(x: &BigInt) -> BigInt {
     // Final exactness correction (guess is ≥ isqrt, off by at most 2).
     let mut r = g;
     while &r * &r > *x {
-        r = r - BigInt::from(1u8);
+        r -= BigInt::from(1u8);
     }
     while (&r + 1u8) * (&r + 1u8) <= *x {
-        r = r + BigInt::from(1u8);
+        r += BigInt::from(1u8);
     }
     r
 }
@@ -180,7 +180,7 @@ pub fn isqrt(x: &BigInt) -> BigInt {
 /// below 2^-63; the sqrt halves that, far under the 2^-53 rounding
 /// granularity, so the scaled result rounds like the exact one.
 pub fn sqrt_to_f64(b: &BigInt) -> f64 {
-    use num_traits::{One, ToPrimitive};
+    use num_traits::ToPrimitive;
     if b.is_zero() {
         return 0.0;
     }

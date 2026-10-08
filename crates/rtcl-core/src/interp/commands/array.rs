@@ -5,8 +5,6 @@ use crate::error::{Error, Result};
 use crate::interp::{glob_match, split_array_ref, ArraySearch, ArraySearchList, Interp};
 use crate::value::Value;
 
-#[cfg(feature = "regexp")]
-use regex::Regex;
 #[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
 use regex_lite::Regex;
 

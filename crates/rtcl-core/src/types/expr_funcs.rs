@@ -514,7 +514,7 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
                     crate::error::ErrorCode::Generic,
                 ));
             }
-            if args.len() < 1 {
+            if args.is_empty() {
                 return Err(Error::runtime(
                     format!("not enough arguments for math function \"{}\"", name),
                     crate::error::ErrorCode::Generic,

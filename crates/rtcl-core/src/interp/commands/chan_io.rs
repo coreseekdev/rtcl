@@ -1375,7 +1375,7 @@ fn chan_copy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let mut copied: i64 = 0;
     loop {
-        let want = limit.map(|s| (s - copied).min(4096).max(0) as usize).unwrap_or(4096);
+        let want = limit.map(|s| (s - copied).clamp(0, 4096) as usize).unwrap_or(4096);
         if want == 0 {
             break;
         }

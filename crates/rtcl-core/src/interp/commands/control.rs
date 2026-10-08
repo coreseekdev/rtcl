@@ -861,7 +861,7 @@ fn return_options_dict(code: i64, level: i64) -> Value {
 
 /// Tcl return-options dict for an error completion: adds `-errorcode`
 /// and `-errorinfo` next to `-code`/`-level`.
-fn error_options_dict(code: i64, level: i64, err: &Error, script: &str, accumulated: &str) -> Value {
+fn error_options_dict(code: i64, level: i64, err: &Error, _script: &str, accumulated: &str) -> Value {
     let error_code = err.tcl_error_code();
     Value::from_str(&format!(
         "-code {} -level {} -errorcode {} -errorinfo {}",

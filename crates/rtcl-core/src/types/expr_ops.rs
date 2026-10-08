@@ -52,7 +52,7 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
         // The immediate tag only holds i63: a checked-i64 success can
         // still exceed it (11^18 = 5.6e18 < i64::MAX but > 2^62) — such
         // results widen to the exact BigInt form.
-        let fits = |r: i64| (i64::MIN >> 1) <= r && r <= (i64::MAX >> 1);
+        let fits = |r: i64| ((i64::MIN >> 1)..=(i64::MAX >> 1)).contains(&r);
         return match op {
             '+' => match a.checked_add(b) {
                 Some(r) if fits(r) => Ok(Value::from_imm(r)),

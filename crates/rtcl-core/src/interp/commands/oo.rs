@@ -483,11 +483,11 @@ fn push_class_entry(
         return;
     }
     if let Some((_, def)) = cls.methods.iter().find(|(n, _)| n == method) {
-        if def.exported || include_private {
-            if !out.iter().any(|e| e.owner == Owner::Class(class.to_string())) {
-                out.push(ChainEntry { owner: Owner::Class(class.to_string()), def: def.clone() });
-                hidden.remove(method);
-            }
+        if (def.exported || include_private)
+            && !out.iter().any(|e| e.owner == Owner::Class(class.to_string()))
+        {
+            out.push(ChainEntry { owner: Owner::Class(class.to_string()), def: def.clone() });
+            hidden.remove(method);
         }
     }
 }
@@ -948,7 +948,7 @@ fn chain_for(interp: &mut Interp, key: &str, method: &str, include_private: bool
     } else {
         (&interp.oo.chain_memo, &interp.oo.chain_memo_priv)
     };
-    if let Some((stamp, chain)) = memo
+    if let Some((_, chain)) = memo
         .get(key)
         .and_then(|inner| inner.get(method))
         .filter(|(s, _)| *s == interp.oo.mutation_ctr)
@@ -1201,9 +1201,9 @@ fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
         .commands
         .iter()
         .filter(|(k, f)| {
-            let is_oo = **f as usize == cmd_oo_my as usize
-                || **f as usize == cmd_oo_self as usize
-                || **f as usize == cmd_oo_next as usize;
+            let is_oo = **f as usize == cmd_oo_my as *const () as usize
+                || **f as usize == cmd_oo_self as *const () as usize
+                || **f as usize == cmd_oo_next as *const () as usize;
             is_oo && !interp.oo.my_commands.contains_key(*k)
         })
         .map(|(k, _)| k.clone())

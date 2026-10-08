@@ -758,7 +758,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             if let Some(mut v) = interp.take_var_fast(name) {
                 if let Some(items) = v.as_list_mut() {
                     items.push(value.clone());
-                    interp.set_var(name, v.clone());
+                    let _ = interp.set_var(name, v.clone());
                     st.stack.push(v);
                     fast = true;
                 } else {
@@ -911,7 +911,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 .max()
                 .unwrap_or(0);
             let collected = info_ref.lmap.then(Vec::new);
-            let framed = info_ref.framed;
+            let _framed = info_ref.framed;
             st.foreaches.push(ForeachFrame {
                 info_idx: *info,
                 lists,

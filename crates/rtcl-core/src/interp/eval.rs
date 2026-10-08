@@ -13,7 +13,7 @@ use rtcl_parser::Compiler;
 /// characters renders as its first 150 chars + `...` (parseOld-10.14).
 pub(crate) fn tcl_log_excerpt(text: &str) -> String {
     let len = text.chars().count();
-    let cap = std::cmp::min(std::cmp::max(len, 100), 150);
+    let cap = len.clamp(100, 150);
     if len > cap {
         let mut s: String = text.chars().take(cap).collect();
         s.push_str("...");
@@ -715,7 +715,7 @@ impl Interp {
                         ));
                     }
                     let v = &args[1];
-                    let ptr = &*v as *const _ as usize;
+                    let ptr = v as *const _ as usize;
                     let tn = v.type_name();
                     let text = if tn == "list" || tn == "dict" {
                         format!(

@@ -982,9 +982,9 @@ fn decode_base64(input: &str, strict: bool) -> Result<Vec<u8>> {
             } else if c.is_ascii_uppercase() {
                 value = (value << 6) | (c - b'A') as u32;
             } else if c.is_ascii_lowercase() {
-                value = (value << 6) | (c - b'a') as u32 + 26;
+                value = (value << 6) | ((c - b'a') as u32 + 26);
             } else if c.is_ascii_digit() {
-                value = (value << 6) | (c - b'0') as u32 + 52;
+                value = (value << 6) | ((c - b'0') as u32 + 52);
             } else if c == b'+' {
                 value = (value << 6) | 0x3E;
             } else if c == b'/' {

@@ -933,7 +933,7 @@ fn sort_compare(
 /// the next element; with -unique an equality drops the LEFT element (so the
 /// later-seen survivor wins, per Tcl's merge order).
 fn merge_lists(
-    arena: &mut Vec<SortElement>,
+    arena: &mut [SortElement],
     left: Option<usize>,
     right: Option<usize>,
     st: &mut SortState,

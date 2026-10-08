@@ -172,7 +172,7 @@ impl<'a> JsonParser<'a> {
     fn parse_object(&mut self, null_val: &str, index_mode: bool) -> Result<(Value, String)> {
         self.expect(b'{')?;
         let mut entries = DictMap::ordered();
-        let mut schema_parts: Vec<String> = if self.build_schema { Vec::new() } else { Vec::new() };
+        let mut schema_parts: Vec<String> = Vec::new();
 
         self.skip_ws();
         if self.peek() == Some(b'}') {
@@ -226,7 +226,7 @@ impl<'a> JsonParser<'a> {
     fn parse_array(&mut self, null_val: &str, index_mode: bool) -> Result<(Value, String)> {
         self.expect(b'[')?;
         let mut items: Vec<Value> = Vec::new();
-        let mut schemas: Vec<String> = if self.build_schema { Vec::new() } else { Vec::new() };
+        let mut schemas: Vec<String> = Vec::new();
 
         self.skip_ws();
         if self.peek() == Some(b']') {

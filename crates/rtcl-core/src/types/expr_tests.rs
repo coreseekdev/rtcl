@@ -202,6 +202,12 @@ fn test_fmod_by_zero_domain_error() {
         eval_expr(&mut interp, "fmod(1, 0)").unwrap_err().to_string(),
         "domain error: argument not in valid range"
     );
+    // tclsh 8.6.17: -0.0 is a zero too (IEEE ==) — the zero test must
+    // catch it, not just +0.0 (guards the Some(0.0) pattern in fmod).
+    assert_eq!(
+        eval_expr(&mut interp, "fmod(1, -0.0)").unwrap_err().to_string(),
+        "domain error: argument not in valid range"
+    );
 }
 
 #[test]

@@ -113,7 +113,7 @@ impl Token {
 /// let input = "hello\r\nworld\rgoodbye";
 /// let mut tokenizer = Tokenizer::new(input);
 ///
-/// assert!(matches!(tokenizer.next(), Token::Other('h')));
+/// assert!(matches!(tokenizer.next_token(), Token::Other('h')));
 /// // ... more tokens ...
 /// ```
 pub struct Tokenizer<'a> {
@@ -168,7 +168,7 @@ impl<'a> Tokenizer<'a> {
             return Token::Eof;
         }
         let mut temp = self.clone();
-        temp.next()
+        temp.next_token()
     }
 
     /// Get the token at offset from current position.
@@ -178,13 +178,18 @@ impl<'a> Tokenizer<'a> {
             if temp.pos >= temp.bytes.len() {
                 return Token::Eof;
             }
-            temp.next();
+            temp.next_token();
         }
-        temp.next()
+        temp.next_token()
     }
 
     /// Get the next token and advance.
-    pub fn next(&mut self) -> Token {
+    ///
+    /// Named `next_token`, not `next`: `Tokenizer` is not an `Iterator`
+    /// (this returns `Token`, terminating with `Token::Eof` rather than
+    /// `None`), and an inherent `next` shadows `Iterator::next` for any
+    /// future generic use of the type.
+    pub fn next_token(&mut self) -> Token {
         if self.pos >= self.bytes.len() {
             return Token::Eof;
         }
@@ -290,7 +295,7 @@ impl<'a> Tokenizer<'a> {
             if !pred(tok) || tok == Token::Eof {
                 break;
             }
-            self.next();
+            self.next_token();
             count += 1;
         }
         count
@@ -372,58 +377,58 @@ mod tests {
     #[test]
     fn test_newline_normalization() {
         let mut tz = Tokenizer::new("a\nb\r\nc");
-        assert_eq!(tz.next(), Token::Other('a'));
-        assert_eq!(tz.next(), Token::Newline);
-        assert_eq!(tz.next(), Token::Other('b'));
-        assert_eq!(tz.next(), Token::Newline);  // \r\n -> Newline
-        assert_eq!(tz.next(), Token::Other('c'));
-        assert_eq!(tz.next(), Token::Eof);
+        assert_eq!(tz.next_token(), Token::Other('a'));
+        assert_eq!(tz.next_token(), Token::Newline);
+        assert_eq!(tz.next_token(), Token::Other('b'));
+        assert_eq!(tz.next_token(), Token::Newline);  // \r\n -> Newline
+        assert_eq!(tz.next_token(), Token::Other('c'));
+        assert_eq!(tz.next_token(), Token::Eof);
     }
 
     #[test]
     fn test_standalone_cr() {
         let mut tz = Tokenizer::new("a\rb");
-        assert_eq!(tz.next(), Token::Other('a'));
-        assert_eq!(tz.next(), Token::CarriageReturn);  // standalone \r
-        assert_eq!(tz.next(), Token::Other('b'));
+        assert_eq!(tz.next_token(), Token::Other('a'));
+        assert_eq!(tz.next_token(), Token::CarriageReturn);  // standalone \r
+        assert_eq!(tz.next_token(), Token::Other('b'));
     }
 
     #[test]
     fn test_cr_followed_by_non_lf() {
         let mut tz = Tokenizer::new("a\r b");
-        assert_eq!(tz.next(), Token::Other('a'));
-        assert_eq!(tz.next(), Token::CarriageReturn);  // \r followed by space
-        assert_eq!(tz.next(), Token::Whitespace);
-        assert_eq!(tz.next(), Token::Other('b'));
+        assert_eq!(tz.next_token(), Token::Other('a'));
+        assert_eq!(tz.next_token(), Token::CarriageReturn);  // \r followed by space
+        assert_eq!(tz.next_token(), Token::Whitespace);
+        assert_eq!(tz.next_token(), Token::Other('b'));
     }
 
     #[test]
     fn test_basic_tokens() {
         let mut tz = Tokenizer::new("{ $var } [cmd]");
-        assert_eq!(tz.next(), Token::LeftBrace);
-        assert_eq!(tz.next(), Token::Whitespace);
-        assert_eq!(tz.next(), Token::Dollar);
-        assert_eq!(tz.next(), Token::Other('v'));
-        assert_eq!(tz.next(), Token::Other('a'));
-        assert_eq!(tz.next(), Token::Other('r'));
-        assert_eq!(tz.next(), Token::Whitespace);
-        assert_eq!(tz.next(), Token::RightBrace);
-        assert_eq!(tz.next(), Token::Whitespace);
-        assert_eq!(tz.next(), Token::LeftBracket);
+        assert_eq!(tz.next_token(), Token::LeftBrace);
+        assert_eq!(tz.next_token(), Token::Whitespace);
+        assert_eq!(tz.next_token(), Token::Dollar);
+        assert_eq!(tz.next_token(), Token::Other('v'));
+        assert_eq!(tz.next_token(), Token::Other('a'));
+        assert_eq!(tz.next_token(), Token::Other('r'));
+        assert_eq!(tz.next_token(), Token::Whitespace);
+        assert_eq!(tz.next_token(), Token::RightBrace);
+        assert_eq!(tz.next_token(), Token::Whitespace);
+        assert_eq!(tz.next_token(), Token::LeftBracket);
     }
 
     #[test]
     fn test_line_tracking() {
         let mut tz = Tokenizer::new("a\nb\r\nc\nd");
         assert_eq!(tz.line(), 1);
-        tz.next();
-        tz.next();  // consume \n
+        tz.next_token();
+        tz.next_token();  // consume \n
         assert_eq!(tz.line(), 2);
-        tz.next();  // consume 'b'
-        tz.next();  // consume \r\n
+        tz.next_token();  // consume 'b'
+        tz.next_token();  // consume \r\n
         assert_eq!(tz.line(), 3);
-        tz.next();
-        tz.next();  // consume \n
+        tz.next_token();
+        tz.next_token();  // consume \n
         assert_eq!(tz.line(), 4);
     }
 
@@ -439,9 +444,9 @@ mod tests {
     fn test_checkpoint() {
         let mut tz = Tokenizer::new("abc");
         let cp = tz.checkpoint();
-        tz.next();
-        tz.next();
+        tz.next_token();
+        tz.next_token();
         tz.restore(cp);
-        assert_eq!(tz.next(), Token::Other('a'));
+        assert_eq!(tz.next_token(), Token::Other('a'));
     }
 }

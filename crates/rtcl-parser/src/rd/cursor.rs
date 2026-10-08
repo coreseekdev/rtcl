@@ -24,7 +24,7 @@ impl<'a> Cursor<'a> {
         let mut tokenizer = Tokenizer::new(input);
         let token_start = tokenizer.pos(); // 0
         let token_line = tokenizer.line(); // 1
-        let current = tokenizer.next();
+        let current = tokenizer.next_token();
         Self {
             input,
             tokenizer,
@@ -55,7 +55,7 @@ impl<'a> Cursor<'a> {
         let mut temp = self.tokenizer.clone();
         let mut tok = Token::Eof;
         for _ in 0..offset {
-            tok = temp.next();
+            tok = temp.next_token();
         }
         tok
     }
@@ -65,7 +65,7 @@ impl<'a> Cursor<'a> {
     pub fn advance(&mut self) {
         self.token_start = self.tokenizer.pos();
         self.token_line = self.tokenizer.line();
-        self.current = self.tokenizer.next();
+        self.current = self.tokenizer.next_token();
     }
 
     /// Advance and return the raw character at the current position.

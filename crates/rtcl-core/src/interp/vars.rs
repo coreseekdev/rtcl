@@ -203,7 +203,7 @@ impl Interp {
             for (i, name) in table.locals().iter().enumerate() {
                 if let Some(cv) = f.slots.get_mut(i) {
                     if !cv.is_unset() {
-                        let taken = std::mem::replace(cv, Value::UNSET);
+                        let taken = std::mem::replace(cv, Value::unset());
                         f.locals.insert(name.clone(), taken);
                     }
                 }
@@ -234,7 +234,7 @@ impl Interp {
         }
         let Some(i) = f.slot_index_of(base) else { return };
         if !f.slots[i].is_unset() {
-            let taken = std::mem::replace(&mut f.slots[i], Value::UNSET);
+            let taken = std::mem::replace(&mut f.slots[i], Value::unset());
             f.locals.insert(base.to_string(), taken);
         }
         if f.slot_aliased.len() != f.slots.len() {
@@ -277,7 +277,7 @@ impl Interp {
             for (i, name) in table.locals().iter().enumerate() {
                 if let Some(cv) = f.slots.get_mut(i) {
                     if !cv.is_unset() {
-                        let taken = std::mem::replace(cv, Value::UNSET);
+                        let taken = std::mem::replace(cv, Value::unset());
                         f.locals.insert(name.clone(), taken);
                     }
                 }
@@ -770,7 +770,7 @@ impl Interp {
             match f.slot_index_of(name) {
                 // Unset of a slotted name empties the cell (tclsh: the
                 // compiledLocal's Var is cleared, the table entry stays).
-                Some(i) => f.slots[i] = Value::UNSET,
+                Some(i) => f.slots[i] = Value::unset(),
                 None => {
                     f.locals.remove(name);
                 }
@@ -1066,7 +1066,7 @@ impl Interp {
                     if cell.is_unset() {
                         return None;
                     }
-                    Some(std::mem::replace(cell, Value::UNSET))
+                    Some(std::mem::replace(cell, Value::unset()))
                 }
                 None => frame.locals.remove(name),
             }

@@ -9,12 +9,12 @@ fn main() {
     {
         let input = "a\nb\r\nc";
         let mut tz = rtcl_parser::rd::token::Tokenizer::new(input);
-        assert_eq!(tz.next(), rtcl_parser::rd::token::Token::Other('a'));
-        assert_eq!(tz.next(), rtcl_parser::rd::token::Token::Newline);
-        assert_eq!(tz.next(), rtcl_parser::rd::token::Token::Other('b'));
-        assert_eq!(tz.next(), rtcl_parser::rd::token::Token::Newline); // \r\n normalized
-        assert_eq!(tz.next(), rtcl_parser::rd::token::Token::Other('c'));
-        assert_eq!(tz.next(), rtcl_parser::rd::token::Token::Eof);
+        assert_eq!(tz.next_token(), rtcl_parser::rd::token::Token::Other('a'));
+        assert_eq!(tz.next_token(), rtcl_parser::rd::token::Token::Newline);
+        assert_eq!(tz.next_token(), rtcl_parser::rd::token::Token::Other('b'));
+        assert_eq!(tz.next_token(), rtcl_parser::rd::token::Token::Newline); // \r\n normalized
+        assert_eq!(tz.next_token(), rtcl_parser::rd::token::Token::Other('c'));
+        assert_eq!(tz.next_token(), rtcl_parser::rd::token::Token::Eof);
         println!("✓ Test 1: Newline normalization passed");
     }
 
@@ -22,9 +22,9 @@ fn main() {
     {
         let input = "a\rb";
         let mut tz = rtcl_parser::rd::token::Tokenizer::new(input);
-        assert_eq!(tz.next(), rtcl_parser::rd::token::Token::Other('a'));
-        assert_eq!(tz.next(), rtcl_parser::rd::token::Token::CarriageReturn);
-        assert_eq!(tz.next(), rtcl_parser::rd::token::Token::Other('b'));
+        assert_eq!(tz.next_token(), rtcl_parser::rd::token::Token::Other('a'));
+        assert_eq!(tz.next_token(), rtcl_parser::rd::token::Token::CarriageReturn);
+        assert_eq!(tz.next_token(), rtcl_parser::rd::token::Token::Other('b'));
         println!("✓ Test 2: Standalone CR as whitespace passed");
     }
 

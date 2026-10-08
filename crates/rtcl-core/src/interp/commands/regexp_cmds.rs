@@ -952,8 +952,11 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
             // Build command: subSpec fullMatch capture1 capture2 ...
             let mut cmd_str = sub_spec.to_string();
-            for j in 0..groups.len() {
-                let m = groups[j].map(|(s, e)| &full_string[s..e]).unwrap_or("");
+            // Iterate the ranges directly — every group contributes an
+            // argument (empty `{}` for a non-participating group), so a
+            // `flatten()` here would silently drop arguments.
+            for g in groups {
+                let m = g.map(|(s, e)| &full_string[s..e]).unwrap_or("");
                 cmd_str.push(' ');
                 // Quote the argument for Tcl eval
                 cmd_str.push('{');

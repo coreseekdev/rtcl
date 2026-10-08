@@ -458,10 +458,17 @@ impl Value {
     /// (immediates have bit0 set; heap pointers are non-null), giving
     /// `slots: Vec<Value>` an 8-byte element with an in-band "unset"
     /// state — half the memory traffic of `Vec<Option<Value>>`.
-    pub const UNSET: Value = Value {
-        bits: Cell::new(0),
-        _not_send: PhantomData,
-    };
+    ///
+    /// A constructor fn rather than a `const` on purpose: `Value` wraps a
+    /// `Cell`, so an interior-mutable `const UNSET` would read as shared
+    /// mutable state.  It never is — a const inlines a fresh copy per use
+    /// and `Value` is !Send/!Sync — and the fn makes that fresh-copy-per-use
+    /// semantics explicit (there is no canonical UNSET instance to mutate).
+    #[inline]
+    #[must_use]
+    pub const fn unset() -> Value {
+        Value { bits: Cell::new(0), _not_send: PhantomData }
+    }
 
     #[inline]
     pub fn is_unset(&self) -> bool {

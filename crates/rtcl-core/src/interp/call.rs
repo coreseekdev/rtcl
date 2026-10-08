@@ -149,7 +149,7 @@ impl Interp {
                     let n = code.locals().len();
                     let frame = self.frames.last_mut().unwrap();
                     frame.slots.clear();
-                    frame.slots.resize(n, Value::UNSET);
+                    frame.slots.resize(n, Value::unset());
                     frame.slot_aliased.clear();
                     frame.slot_aliased.resize(n, false);
                     frame.link_keys.clear();

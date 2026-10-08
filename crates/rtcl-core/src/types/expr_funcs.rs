@@ -338,7 +338,11 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
         "fmod" => {
             require_args(name, 2, args.len())?;
             match (args[0].as_float(), args[1].as_float()) {
-                (Some(_), Some(b)) if b == 0.0 => Err(domain_error()),
+                // Pattern, not a `b == 0.0` guard: identical semantics
+                // (constant float patterns compare with `==`, so -0.0
+                // matches too — tclsh rejects fmod(x, -0.0) as a domain
+                // error, pinned in expr_tests).
+                (Some(_), Some(0.0)) => Err(domain_error()),
                 (Some(a), Some(b)) => Ok(float_value(a % b)),
                 _ => Err(Error::type_mismatch("number", "non-numeric value")),
             }

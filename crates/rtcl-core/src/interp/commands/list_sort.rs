@@ -1230,8 +1230,8 @@ pub fn cmd_lsort(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // Merge all remaining runs.
     let mut head = sublists[0];
-    for j in 1..NUM_LISTS {
-        head = merge_lists(&mut arena, sublists[j], head, &mut st, interp);
+    for &sl in sublists[1..].iter() {
+        head = merge_lists(&mut arena, sl, head, &mut st, interp);
     }
     if let Some(e) = st.error.take() {
         return Err(e);

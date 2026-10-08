@@ -978,7 +978,7 @@ fn mrep(
     caps: &mut Caps,
     k: &mut dyn FnMut(&mut Caps, usize) -> bool,
 ) -> bool {
-    let can_more = max.map_or(true, |mx| done < mx);
+    let can_more = max.is_none_or(|mx| done < mx);
     if lazy {
         if done >= min && k(caps, pos) {
             return true;

@@ -1305,7 +1305,7 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
                 typed,
                 2,
                 2 + rest.len(),
-                &format!("create {} ?definitionScript?", name_typed),
+                format!("create {} ?definitionScript?", name_typed),
             );
             detach_object(interp, &canonical, &ns, false);
             return Err(e);
@@ -1769,7 +1769,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     return Err(Error::Msg("only a class can be a superclass".to_string()));
                 }
                 if canonical.as_ref() == target_name
-                    || linearize(interp, &canonical).iter().any(|c| *c == target_name)
+                    || linearize(interp, &canonical).contains(&target_name)
                 {
                     return Err(Error::Msg(
                         "attempt to form circular dependency graph".to_string(),
@@ -2278,7 +2278,7 @@ fn class_call_chain(interp: &Interp, key: &str, method: &str) -> Vec<ChainEntry>
 fn call_filter_names(interp: &Interp, key: &str, class_instance: bool) -> Vec<String> {
     fn add_chain(interp: &Interp, class: &str, order: &mut Vec<String>) {
         for c in linearize(interp, class) {
-            if !order.iter().any(|x| *x == c) {
+            if !order.contains(&c) {
                 order.push(c);
             }
         }
@@ -2388,7 +2388,7 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "namespace" | "class" | "methods" | "mixins" | "vars" | "variables" => {
             if args.len() != 4 && !(sub == "methods" && args.len() >= 4) {
                 return Err(Error::wrong_args_with_usage(
-                    &format!("info object {}", sub),
+                    format!("info object {}", sub),
                     4,
                     args.len(),
                     "objName",
@@ -2476,7 +2476,7 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             };
             if args.len() != min_args {
                 return Err(Error::wrong_args_with_usage(
-                    &format!("info object isa {}", category),
+                    format!("info object isa {}", category),
                     min_args,
                     args.len(),
                     usage,
@@ -2658,7 +2658,7 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "mixins" | "variables" | "filters" => {
             if args.len() != 4 {
                 return Err(Error::wrong_args_with_usage(
-                    &format!("info class {}", sub),
+                    format!("info class {}", sub),
                     4,
                     args.len(),
                     "className",

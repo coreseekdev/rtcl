@@ -313,7 +313,7 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "wrong # args: should be \"switch ?-option ...? string {?pattern body ...? ?default body?}\"",
             ));
         }
-        if list.len() % 2 != 0 {
+        if !list.len().is_multiple_of(2) {
             let pats: Vec<String> = list.iter().map(|v| v.as_str().to_string()).collect();
             return Err(extra_pattern_error(true, &pats));
         }
@@ -321,7 +321,7 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             .map(|c| (c[0].as_str().to_string(), c[1].as_str().to_string()))
             .collect()
     } else {
-        if (objc - i) % 2 != 0 {
+        if !(objc - i).is_multiple_of(2) {
             let pats: Vec<String> = args[i..].iter().map(|v| v.as_str().to_string()).collect();
             return Err(extra_pattern_error(false, &pats));
         }
@@ -528,7 +528,7 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // (proc-old-7.15).  Only the values of recognised options are
     // validated (TclMergeReturnOptions).
     let objc = args.len();
-    let explicit_result = objc % 2 == 0;
+    let explicit_result = objc.is_multiple_of(2);
     let num_option_words = objc - 1 - usize::from(explicit_result);
     let result = if explicit_result {
         Some(args[objc - 1].clone())

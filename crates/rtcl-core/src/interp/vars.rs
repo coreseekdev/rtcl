@@ -357,7 +357,7 @@ impl Interp {
             }
         } else {
             let key = self.canonical_global(base);
-            if self.dead_flat.iter().any(|k| *k == key) {
+            if self.dead_flat.contains(&key) {
                 Some(false)
             } else {
                 None
@@ -1506,7 +1506,7 @@ impl Interp {
     pub(crate) fn deaden_links_under(&mut self, var_prefix: &str) {
         let aliases: Vec<(String, String)> = self.flat_aliases.clone();
         for (k, t) in aliases {
-            if t.starts_with(var_prefix) && !self.ns_variable_links.iter().any(|x| *x == t) {
+            if t.starts_with(var_prefix) && !self.ns_variable_links.contains(&t) {
                 self.dead_flat.push(k);
             }
         }

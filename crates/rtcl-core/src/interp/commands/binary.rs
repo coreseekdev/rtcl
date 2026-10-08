@@ -677,7 +677,7 @@ fn binary_encode(args: &[Value]) -> Result<Value> {
             Ok(Value::from_str(&s))
         }
         "base64" => {
-            if args.len() < 2 || args.len() % 2 != 0 {
+            if args.len() < 2 || !args.len().is_multiple_of(2) {
                 return Err(Error::wrong_args_with_usage(
                     "binary", 2, args.len(),
                     "encode base64 ?-maxlen len? ?-wrapchar char? data",
@@ -690,7 +690,7 @@ fn binary_encode(args: &[Value]) -> Result<Value> {
         }
         _ => {
             // uuencode
-            if args.len() < 2 || args.len() % 2 != 0 {
+            if args.len() < 2 || !args.len().is_multiple_of(2) {
                 return Err(Error::wrong_args_with_usage(
                     "binary", 2, args.len(),
                     "encode uuencode ?-maxlen len? ?-wrapchar char? data",
@@ -867,7 +867,7 @@ fn binary_decode(args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(Error::wrong_args_with_usage(
             "binary", 2, args.len(),
-            &format!("decode {} ?options? data", sub),
+            format!("decode {} ?options? data", sub),
         ));
     }
     let mut strict = false;

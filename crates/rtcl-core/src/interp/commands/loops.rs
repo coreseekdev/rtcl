@@ -286,7 +286,7 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// `lmap` (identical gates, `collect` the only difference).
 pub(crate) fn foreach_inline_shape(interp: &Interp, args: &[Value]) -> bool {
     let n = args.len();
-    if n < 4 || n % 2 != 0 {
+    if n < 4 || !n.is_multiple_of(2) {
         return false;
     }
     // `{*}` re-shapes the argument list at runtime — the compiler cannot

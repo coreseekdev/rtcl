@@ -533,7 +533,7 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // ns evals) a word that doesn't look like a level falls back to
     // pairs at the default level instead (`upvar a x y` → bad level
     // "1", but `upvar 0x x y` → bad level "0x").
-    let has_level = if args.len() % 2 == 0 {
+    let has_level = if args.len().is_multiple_of(2) {
         !interp.frames.is_empty()
             || !interp.ns_stack.is_empty()
             || level_shaped_global(args[1].as_str())

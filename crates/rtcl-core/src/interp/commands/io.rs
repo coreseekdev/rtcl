@@ -198,7 +198,7 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::wrong_args_with_usage(
             "file", 3, args.len(),
-            &format!("{} name ?arg ...?", subcmd),
+            format!("{} name ?arg ...?", subcmd),
         ));
     }
 
@@ -333,7 +333,7 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() < 4 {
                 return Err(Error::wrong_args_with_usage(
                     "file", 4, args.len(),
-                    &format!("{} name varName", subcmd),
+                    format!("{} name varName", subcmd),
                 ));
             }
             let var_name = args[3].as_str();
@@ -1489,7 +1489,7 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // `[...]` character classes, `{a,b}` alternation, etc.
         let paths = glob::glob(&full_pattern).map_err(|e| {
             Error::runtime(
-                &format!("bad glob pattern \"{}\": {}", full_pattern, e),
+                format!("bad glob pattern \"{}\": {}", full_pattern, e),
                 crate::error::ErrorCode::Generic,
             )
         })?;
@@ -1497,7 +1497,7 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         for entry in paths {
             let path = entry.map_err(|e| {
                 Error::runtime(
-                    &format!("glob: {}", e),
+                    format!("glob: {}", e),
                     crate::error::ErrorCode::Io,
                 )
             })?;

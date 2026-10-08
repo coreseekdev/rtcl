@@ -545,7 +545,7 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // Set options: pairs of -option value. A trailing option without a
     // value is a wrong-arg-count error (tclsh's fconfigureCmd).
-    if (args.len() - 2) % 2 != 0 {
+    if !(args.len() - 2).is_multiple_of(2) {
         return Err(Error::wrong_args_with_usage(
             "fconfigure", 2, args.len(),
             "channelId ?-option value ...?",
@@ -928,7 +928,7 @@ pub fn cmd_chan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "configure" => {
             // n == 1 queries everything, n == 2 queries one option, and any
             // larger count must be whole ?-option value? pairs.
-            if n == 0 || (n >= 3 && (n - 1) % 2 != 0) {
+            if n == 0 || (n >= 3 && !(n - 1).is_multiple_of(2)) {
                 wrong_usage!("chan configure channelId ?-option value ...?");
             }
             delegate!(cmd_fconfigure, "fconfigure")

@@ -134,8 +134,8 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
     // string operand as a float before the int parse could even run
     // (double parse per `+` on bracket results — several percent of the
     // fib profile).
-    if left.as_float().map_or(false, |f| f.is_nan())
-        || right.as_float().map_or(false, |f| f.is_nan())
+    if left.as_float().is_some_and(|f| f.is_nan())
+        || right.as_float().is_some_and(|f| f.is_nan())
     {
         return Err(Error::Msg(format!(
             "can't use non-numeric floating-point value as operand of \"{op}\""

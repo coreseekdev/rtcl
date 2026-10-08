@@ -440,7 +440,7 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // A `variable`-declared (at eval level) variable outlives the
             // namespace deletion for the rest of the declaring body
             // (var-1.16/1.17 read it after the self-delete).
-            if interp.ns_variable_links.iter().any(|x| *x == base) {
+            if interp.ns_variable_links.contains(&base) {
                 interp.ns_eval_keep.push(base.clone());
                 kept.push(base);
                 continue;
@@ -1065,7 +1065,7 @@ fn ns_unknown(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 /// `namespace upvar ns ?otherVar myVar ...?`
 fn ns_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    if args.len() < 3 || (args.len() - 3) % 2 != 0 {
+    if args.len() < 3 || !(args.len() - 3).is_multiple_of(2) {
         return Err(Error::wrong_args_with_usage(
             "namespace upvar", 3, args.len(),
             "ns ?otherVar myVar ...?",
@@ -1235,7 +1235,7 @@ fn parse_ens_map(
 /// `namespace ensemble create ?option value ...?` — registers the current
 /// namespace as an ensemble command (`-command name` overrides the name).
 fn ens_create(interp: &mut Interp, opts: &[Value]) -> Result<Value> {
-    if opts.len() % 2 != 0 {
+    if !opts.len().is_multiple_of(2) {
         return Err(Error::wrong_args_with_usage(
             "namespace ensemble create", 2, opts.len() + 2,
             "?option value ...?",

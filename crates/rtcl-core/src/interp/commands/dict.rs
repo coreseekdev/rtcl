@@ -127,7 +127,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     _ => {}
                 }
             }
-            if (args.len() - start) % 2 != 0 {
+            if !(args.len() - start).is_multiple_of(2) {
                 return Err(Error::wrong_args_with_usage(
                     "dict create",
                     2,
@@ -265,7 +265,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 let entries = borrow_dict(interp, &args[2]);
                 let key = args[3].as_str();
                 return Ok(Value::from_bool(
-                    entries.map_or(false, |e| e.contains_key(key)),
+                    entries.is_ok_and(|e| e.contains_key(key)),
                 ));
             }
             // Multi-key: walk nested dicts
@@ -412,7 +412,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dict replace", 3, args.len(), "dictionary ?key value ...?",
                 ));
             }
-            if (args.len() - 3) % 2 != 0 {
+            if !(args.len() - 3).is_multiple_of(2) {
                 return Err(Error::wrong_args_with_usage(
                     "dict replace",
                     3,
@@ -773,7 +773,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
         // ── dict update dictVariable key varName ?key varName ...? body
         "update" => {
-            if args.len() < 5 || (args.len() - 3) % 2 == 0 {
+            if args.len() < 5 || (args.len() - 3).is_multiple_of(2) {
                 return Err(Error::wrong_args_with_usage(
                     "dict update",
                     5,

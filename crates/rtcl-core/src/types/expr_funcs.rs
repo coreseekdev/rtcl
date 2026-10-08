@@ -534,10 +534,10 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
                 let r = match rep {
                     super::bignum::IntRep::I64(i) => {
                         let mut g = (i as f64).sqrt() as i64;
-                        while g > 0 && g.checked_mul(g).map_or(true, |g2| g2 > i) {
+                        while g > 0 && g.checked_mul(g).is_none_or(|g2| g2 > i) {
                             g -= 1;
                         }
-                        while g.checked_add(1).and_then(|g1| g1.checked_mul(g1)).map_or(false, |g2| g2 <= i) {
+                        while g.checked_add(1).and_then(|g1| g1.checked_mul(g1)).is_some_and(|g2| g2 <= i) {
                             g += 1;
                         }
                         g

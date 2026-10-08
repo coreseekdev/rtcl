@@ -2640,12 +2640,12 @@ fn scan_float(s: &[char], start: usize, limit: usize) -> FloatScan {
         i += 1;
     }
     if i < end && (s[i] == 'i' || s[i] == 'I') {
-        if i + 3 <= end && (s[i + 1].to_ascii_lowercase() == 'n') && (s[i + 2].to_ascii_lowercase() == 'f')
+        if i + 3 <= end && (s[i + 1].eq_ignore_ascii_case(&'n')) && (s[i + 2].eq_ignore_ascii_case(&'f'))
         {
             return FloatScan::Inf(i + 3 - start);
         }
         // Partial "i"/"in": consumed prefix only.
-        let matched = if i + 1 < end && s[i + 1].to_ascii_lowercase() == 'n' {
+        let matched = if i + 1 < end && s[i + 1].eq_ignore_ascii_case(&'n') {
             2
         } else {
             1
@@ -2654,12 +2654,12 @@ fn scan_float(s: &[char], start: usize, limit: usize) -> FloatScan {
     }
     if i < end && (s[i] == 'n' || s[i] == 'N') {
         if i + 3 <= end
-            && s[i + 1].to_ascii_lowercase() == 'a'
-            && s[i + 2].to_ascii_lowercase() == 'n'
+            && s[i + 1].eq_ignore_ascii_case(&'a')
+            && s[i + 2].eq_ignore_ascii_case(&'n')
         {
             return FloatScan::NanMatched;
         }
-        let matched = if i + 1 < end && s[i + 1].to_ascii_lowercase() == 'a' {
+        let matched = if i + 1 < end && s[i + 1].eq_ignore_ascii_case(&'a') {
             2
         } else {
             1

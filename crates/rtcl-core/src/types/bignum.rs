@@ -189,7 +189,7 @@ pub fn sqrt_to_f64(b: &BigInt) -> f64 {
     let top = (b >> (shift as usize)).to_u64().unwrap_or(u64::MAX) as f64;
     // Fold one factor of 2 into the mantissa when the exponent is odd so
     // the scale stays a clean power of 4.
-    let (mant, exp) = if shift % 2 == 0 {
+    let (mant, exp) = if shift.is_multiple_of(2) {
         (top, shift / 2)
     } else {
         (top * 2.0, (shift - 1) / 2)

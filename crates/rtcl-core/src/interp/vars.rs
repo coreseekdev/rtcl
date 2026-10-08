@@ -41,7 +41,7 @@ pub(crate) fn is_type_conflict(err: &Error) -> bool {
 }
 
 /// Canonical identity key for a variable location (scope-aware).
-pub(crate) fn stamp_key(loc: &VarLoc) -> String {
+fn stamp_key(loc: &VarLoc) -> String {
     match loc {
         VarLoc::Global(n) => format!("G:{}", n),
         VarLoc::Frame(i, n) => format!("F{}:{}", i, n),
@@ -305,7 +305,7 @@ impl Interp {
     }
 
     /// Resolve the owning scope of a variable name (upvar links followed).
-    pub(crate) fn resolve_loc(&self, name: &str) -> VarLoc {
+    fn resolve_loc(&self, name: &str) -> VarLoc {
         if let Some(gname) = Self::split_global(name) {
             return VarLoc::Global(self.redirect_flat(gname));
         }

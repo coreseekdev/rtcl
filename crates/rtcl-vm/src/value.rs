@@ -48,8 +48,11 @@ use smallvec::SmallVec;
 // the dependency edge runs rtcl-core -> rtcl-vm.
 const FX_SEED: u64 = 0x517c_c1b7_2722_0a95;
 
+/// Implementation detail of [`DictMap`]: unkeyed multiply-mix hasher.
+/// Exposed only because it parameterizes `DictMap`'s map types; do not
+/// rely on its exact hash values.
 #[derive(Default, Clone)]
-struct FxHasher {
+pub struct FxHasher {
     hash: u64,
 }
 

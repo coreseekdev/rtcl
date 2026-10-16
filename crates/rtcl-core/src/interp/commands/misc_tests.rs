@@ -43,8 +43,8 @@ fn test_sub_negate() {
 #[test]
 fn test_sub_negate_float() {
     let mut interp = Interp::new();
-    let r = interp.eval("- 3.14").unwrap();
-    assert_eq!(r.as_float(), Some(-3.14));
+    let r = interp.eval("- 3.75").unwrap();
+    assert_eq!(r.as_float(), Some(-3.75));
 }
 
 #[test]
@@ -713,10 +713,7 @@ fn test_scan_validator_errors_and_codes() {
     let r = interp
         .eval(r#"catch {scan abc {%}} m; list $m"#)
         .unwrap();
-    assert_eq!(
-        r.as_str(),
-        format!("{{bad scan conversion character \"\u{0}\"}}")
-    );
+    assert_eq!(r.as_str(), "{bad scan conversion character \"\u{0}\"}");
     // %c with width
     let r = interp
         .eval("catch {scan abc {%2c} v} m; list $m [set ::errorCode]")

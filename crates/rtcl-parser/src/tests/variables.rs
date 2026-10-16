@@ -37,9 +37,9 @@ fn test_braced_var_with_spaces_and_specials() {
 #[test]
 fn test_empty_braced_var_name() {
     let cmds = parse("set x ${}").unwrap();
-    match &cmds[0].words[2] {
-        Word::VarRef(name) => assert_eq!(name, ""),
-        _ => {} // PEG may parse this differently
+    // else: PEG may parse this differently
+    if let Word::VarRef(name) = &cmds[0].words[2] {
+        assert_eq!(name, "");
     }
 }
 

@@ -1118,7 +1118,7 @@ mod tests {
         let mut interp = Interp::new();
         interp.set_max_steps(Some(100));
         let r = interp.eval("set n 0; while {1} {incr n}");
-        let msg = format!("{}", r.err().expect("runaway while must trip budget"));
+        let msg = format!("{}", r.expect_err("runaway while must trip budget"));
         assert!(msg.contains("step budget"), "{msg}");
     }
 
@@ -1129,7 +1129,7 @@ mod tests {
         let mut interp = Interp::new();
         interp.set_max_steps(Some(100));
         let r = interp.eval("while {1} {}");
-        let msg = format!("{}", r.err().expect("empty-body while must trip budget"));
+        let msg = format!("{}", r.expect_err("empty-body while must trip budget"));
         assert!(msg.contains("step budget"), "{msg}");
         // 字面条件 + continue 体同样拦下。
         let mut interp = Interp::new();

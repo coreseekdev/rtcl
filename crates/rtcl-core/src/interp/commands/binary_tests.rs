@@ -27,7 +27,7 @@ fn test_format_a_truncates() {
 }
 
 #[test]
-fn test_format_A_pads_with_spaces() {
+fn test_format_upper_a_pads_with_spaces() {
     assert_eq!(eval("binary scan [binary format A3 ab] H* h; set h"), "616220");
 }
 
@@ -44,7 +44,7 @@ fn test_format_b_bits_lsb_first() {
 }
 
 #[test]
-fn test_format_B_bits_msb_first() {
+fn test_format_upper_b_bits_msb_first() {
     assert_eq!(eval("binary scan [binary format B4 1010] H* h; set h"), "a0");
 }
 
@@ -67,7 +67,7 @@ fn test_format_h_low_nibble_first() {
 }
 
 #[test]
-fn test_format_H_high_nibble_first() {
+fn test_format_upper_h_high_nibble_first() {
     assert_eq!(eval("binary scan [binary format H4 abcd] H* h; set h"), "abcd");
 }
 
@@ -103,7 +103,7 @@ fn test_format_s_little_endian() {
 }
 
 #[test]
-fn test_format_S_big_endian() {
+fn test_format_upper_s_big_endian() {
     assert_eq!(eval("binary scan [binary format S 1] H* h; set h"), "0001");
 }
 
@@ -116,7 +116,7 @@ fn test_format_i_le_w() {
 }
 
 #[test]
-fn test_format_I_W_big_endian() {
+fn test_format_upper_i_upper_w_big_endian() {
     assert_eq!(
         eval("binary scan [binary format I 1] H* a; binary scan [binary format W 1] H* b; list $a $b"),
         "00000001 0000000000000001"
@@ -164,7 +164,7 @@ fn test_format_d_1_0() {
 }
 
 #[test]
-fn test_format_q_le_Q_be() {
+fn test_format_q_le_upper_q_be() {
     assert_eq!(
         eval("binary scan [binary format q 1.0] H* a; binary scan [binary format Q 1.0] H* b; list $a $b"),
         "000000000000f03f 3ff0000000000000"
@@ -181,7 +181,7 @@ fn test_format_f_le_r_le() {
 }
 
 #[test]
-fn test_format_R_big_endian_float() {
+fn test_format_upper_r_big_endian_float() {
     assert_eq!(eval("binary scan [binary format R 1.0] H* h; set h"), "3f800000");
 }
 
@@ -201,12 +201,12 @@ fn test_format_x_nuls() {
 }
 
 #[test]
-fn test_format_X_moves_back() {
+fn test_format_upper_x_moves_back() {
     assert_eq!(eval("binary scan [binary format a1X1 ab] H* h; set h"), "61");
 }
 
 #[test]
-fn test_format_X_clamps_at_zero() {
+fn test_format_upper_x_clamps_at_zero() {
     assert_eq!(eval("binary scan [binary format a3X5 z] H* h; set h"), "7a0000");
 }
 
@@ -275,7 +275,7 @@ fn test_scan_s_signed_su_unsigned() {
 }
 
 #[test]
-fn test_scan_S_big_endian() {
+fn test_scan_upper_s_big_endian() {
     assert_eq!(eval("binary scan \\x00\\x01 S v; set v"), "1");
 }
 
@@ -328,7 +328,7 @@ fn test_scan_a_stops_at_count() {
 }
 
 #[test]
-fn test_scan_A_strips_trailing_ws_only_with_star() {
+fn test_scan_upper_a_strips_trailing_ws_only_with_star() {
     // A strips trailing spaces (and NULs) but not tabs (tclsh 8.6.17)
     assert_eq!(eval(r#"binary scan "ab\t  " A* v; set v"#), "ab\t");
     assert_eq!(eval(r#"binary scan "ab\t  " A3 v; set v"#), "ab\t");
@@ -341,7 +341,7 @@ fn test_scan_b_bits_lsb_first() {
 }
 
 #[test]
-fn test_scan_B_bits_msb_first() {
+fn test_scan_upper_b_bits_msb_first() {
     assert_eq!(eval("binary scan \\x80 B4 v; set v"), "1000");
 }
 
@@ -351,7 +351,7 @@ fn test_scan_h_lsb_nibble_first() {
 }
 
 #[test]
-fn test_scan_H_msb_nibble_first() {
+fn test_scan_upper_h_msb_nibble_first() {
     assert_eq!(eval("binary scan \\xab H2 v; set v"), "ab");
 }
 

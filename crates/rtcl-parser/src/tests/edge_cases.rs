@@ -239,18 +239,16 @@ fn test_missing_close_quote() {
 #[test]
 fn test_trailing_backslash_bare() {
     let result = parse("set x a\\");
-    match result {
-        Ok(cmds) => {
-            match &cmds[0].words[2] {
-                Word::Literal(s) => assert_eq!(s, "a\\"),
-                Word::Concat(parts) => {
-                    let full: String = parts.iter().map(|w| format!("{}", w)).collect();
-                    assert_eq!(full, "a\\", "trailing backslash: {:?}", parts);
-                }
-                w => panic!("expected a\\, got {:?}", w),
+    // Err: PEG backend rejects trailing backslash
+    if let Ok(cmds) = result {
+        match &cmds[0].words[2] {
+            Word::Literal(s) => assert_eq!(s, "a\\"),
+            Word::Concat(parts) => {
+                let full: String = parts.iter().map(|w| format!("{}", w)).collect();
+                assert_eq!(full, "a\\", "trailing backslash: {:?}", parts);
             }
+            w => panic!("expected a\\, got {:?}", w),
         }
-        Err(_) => {} // PEG backend rejects trailing backslash
     }
 }
 

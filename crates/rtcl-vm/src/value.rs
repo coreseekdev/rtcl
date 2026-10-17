@@ -185,6 +185,13 @@ impl DictMap {
         match self { DictMap::Ordered(m) => m.get(key), DictMap::Unordered(m) => m.get(key) }
     }
 
+    /// Mutable access to one entry — the nested `dict set` fast path's
+    /// in-place walk needs `&mut Value` handles held by the parent map
+    /// (child COW through `as_dict_mut` then lands in the same entry).
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        match self { DictMap::Ordered(m) => m.get_mut(key), DictMap::Unordered(m) => m.get_mut(key) }
+    }
+
     pub fn insert(&mut self, key: String, value: Value) -> Option<Value> {
         match self { DictMap::Ordered(m) => m.insert(key, value), DictMap::Unordered(m) => m.insert(key, value) }
     }

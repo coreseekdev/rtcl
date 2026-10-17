@@ -1081,6 +1081,56 @@ impl Interp {
         }
     }
 
+    /// Take a value out of its store for in-place mutation, following
+    /// exactly one `variable` command link (`UpvarLink::Global` — the
+    /// proc-level alias a `variable` declaration installs to the owning
+    /// namespace's variable table).  Same contract and guard spirit as
+    /// `take_var_fast`: traces, dead links, element names and array
+    /// targets bail (the caller then takes the generic path, which owns
+    /// creations and every error text), and the caller MUST put the
+    /// value back with `set_var` on the ORIGINAL name — which walks the
+    /// same link — before any user code runs.
+    ///
+    /// `dict set`'s nested structural fast path uses this so namespace
+    /// declares like `variable model`, `dict set model …` (the ui model
+    /// writers) stay O(1) per op instead of paying the O(n) rebuild.
+    /// Only proc-level links fast-path; eval-level `variable` aliases
+    /// (flat aliases) and upvar-to-frame keep the old route.
+    pub(crate) fn take_var_fast_link(&mut self, name: &str) -> Option<Value> {
+        if has_ns_sep(name)
+            || name.contains('(')
+            || !self.var_traces.is_empty()
+            || !self.dead_flat.is_empty()
+        {
+            return None;
+        }
+        let target = match self.frames.last()?.upvars.get(name) {
+            Some(UpvarLink::Global(g)) => g.clone(),
+            Some(_) | None => return None,
+        };
+        // The link target is the owning namespace's qualified name; keep
+        // the eval-level flat-alias redirect in step with resolve_var's
+        // read path (resolve_var: redirect_flat(gname) then globals).
+        let key = self.redirect_flat(target.clone());
+        if !self.arrays_env_only && self.array_globals.contains(key.as_str()) {
+            return None; // array target: scalar writes take the generic path
+        }
+        // Release the `variable` command's seeded local hold as well: the
+        // seed (namespace.rs `cmd_variable`) shares the same Value rep as
+        // the global, and leaving it in place pins the old rep so every
+        // in-place write COW-copies the whole dict (the O(n)-per-op
+        // hotspot in hot `variable`+`dict set` loops).  Reads refresh
+        // from the global (resolve_var consults the global first); the
+        // seed only keeps a mid-proc-deleted namespace variable readable,
+        // and nothing observes the take→put window — the caller writes
+        // straight through with set_var on the original name before any
+        // user code can run.
+        if let Some(frame) = self.frames.last_mut() {
+            frame.locals.remove(name);
+        }
+        self.globals.remove(key.as_str())
+    }
+
     /// `incr` fast path: read-modify-write an integer scalar in one slot
     /// lookup, mutating the stored value in place when it is unshared
     /// (tclsh: TclIncrObj on a refcnt==1 object — no allocation, no string

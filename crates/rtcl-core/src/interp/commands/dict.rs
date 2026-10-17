@@ -197,26 +197,33 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let var_name = args[2].as_str();
-            // Fast path: single-key `dict set var k v` whose variable
-            // already holds a dict rep — take the value out of its slot
-            // (sole owner), insert in place through the COW rep, put it
-            // back.  Amortised O(1); multi-key nesting, creation,
-            // string-rep sources, links and traced variables keep the
-            // rebuilding path below.
-            if args.len() == 5 {
-                // take_var_fast owns every guard (as in lappend) — the
-                // old get_var pre-probe cost a full extra resolution per
-                // set; a non-dict rep is restored and the slow path
-                // parses it.
-                if let Some(mut v) = interp.take_var_fast(var_name) {
-                    if let Some(map) = v.as_dict_mut() {
-                        map.insert(args[3].as_str().to_string(), args[4].clone());
-                        return interp.set_var(var_name, v);
-                    }
-                    // Not a dict rep: restore raw and rebuild through the
-                    // slow path (parse_dict owns the same errors).
-                    interp.store_var(var_name, v);
+            // Fast path: single-key AND nested multi-key `dict set` whose
+            // variable already holds a dict rep — take the value out of
+            // its store (sole owner, or through the proc-declared
+            // `variable` link), walk the COW dict reps in place and put
+            // it back.  O(path length), no re-parse/re-serialize per op,
+            // so a feed loop like `dict set m k $i v $i` stays linear
+            // overall (tclsh mutates the refcnt==1 nested object the
+            // same way).  Variable creation, string-rep sources,
+            // non-dict reps along the nested path, links other than
+            // `variable`, traced variables and arrays keep the
+            // rebuilding path below — which owns the exact Tcl parse
+            // errors ("missing value to go with key" et al.).
+            if let Some(mut v) = interp
+                .take_var_fast(var_name)
+                .or_else(|| interp.take_var_fast_link(var_name))
+            {
+                let keys: Vec<&str> = args[3..args.len() - 1]
+                    .iter()
+                    .map(|av| av.as_str())
+                    .collect();
+                if dict_set_inplace(&mut v, &keys, &args[args.len() - 1]) {
+                    return interp.set_var(var_name, v);
                 }
+                // Not every level is a dict rep: restore the taken value
+                // and rebuild through the slow path (parse_dict owns the
+                // same errors).
+                interp.store_var(var_name, v);
             }
             let value = args[args.len() - 1].clone();
             let keys: Vec<&str> = args[3..args.len() - 1]
@@ -833,6 +840,35 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 // ── Helpers ────────────────────────────────────────────────────
 
+/// In-place structural write for the `dict set` fast path: walk the COW
+/// dict reps down `keys`, inserting fresh sub-dicts for missing
+/// intermediates and opening each level through `as_dict_mut`, then write
+/// the leaf — O(path length), no parent re-parse or re-serialize.  The
+/// root rep was checked by the caller; every level here re-checks and
+/// returns false when a node is not a dict rep (immediate, scalar string,
+/// list …), making the caller restore the taken variable and fall back to
+/// the rebuilding path — which owns the exact Tcl parse errors.
+fn dict_set_inplace(v: &mut Value, keys: &[&str], value: &Value) -> bool {
+    if v.as_dict_ref().is_none() {
+        return false;
+    }
+    if keys.len() == 1 {
+        return match v.as_dict_mut() {
+            Some(map) => {
+                map.insert(keys[0].to_string(), value.clone());
+                true
+            }
+            None => false,
+        };
+    }
+    let Some(map) = v.as_dict_mut() else { return false };
+    if !map.contains_key(keys[0]) {
+        map.insert(keys[0].to_string(), Value::from_dict_cached(DictMap::ordered()));
+    }
+    let Some(child) = map.get_mut(keys[0]) else { return false };
+    dict_set_inplace(child, &keys[1..], value)
+}
+
 fn dict_set_nested(
     mut entries: DictMap,
     keys: &[&str],
@@ -1376,6 +1412,74 @@ mod tests {
         interp.eval("set d [dict create]").unwrap();
         interp.eval("dict set d a b 42").unwrap();
         assert_eq!(interp.eval("dict get $d a b").unwrap().as_str(), "42");
+    }
+
+    #[test]
+    fn test_dict_nested_set_fastpath_repeated_writes() {
+        // The in-place structural fast path (every level a dict rep):
+        // repeated nested writes must behave exactly like the rebuilding
+        // path — deep updates visible to `dict get` and string reps
+        // re-render the mutated content (as_dict_mut invalidates the
+        // cached strings on each walked level).  Verified against
+        // tclsh 8.6.
+        let mut interp = Interp::new();
+        interp
+            .eval(r#"set d {p {q {a 0 b 0}} s {}}
+                dict set d p q a 1
+                dict set d p q c 2
+                dict set d p q a 3
+                dict set d s x y z 9"#)
+            .unwrap();
+        assert_eq!(
+            interp.eval("dict get $d p q").unwrap().as_str(),
+            "a 3 b 0 c 2"
+        );
+        assert_eq!(
+            interp.eval("set d").unwrap().as_str(),
+            "p {q {a 3 b 0 c 2}} s {x {y {z 9}}}"
+        );
+    }
+
+    #[test]
+    fn test_dict_nested_set_drill_into_scalar_is_an_error() {
+        // A path drilling through an existing scalar rep falls back to
+        // the rebuild path, which owns tclsh's exact parse error
+        // ("missing value to go with key") and leaves the variable
+        // unchanged.
+        let mut interp = Interp::new();
+        interp.eval("set d3 [dict create pods 9]").unwrap();
+        assert_eq!(
+            interp
+                .eval("catch {dict set d3 pods 0 status zz} m; set m")
+                .unwrap()
+                .as_str(),
+            "missing value to go with key"
+        );
+        assert_eq!(interp.eval("set d3").unwrap().as_str(), "pods 9");
+    }
+
+    #[test]
+    fn test_dict_nested_set_via_variable_link() {
+        // `variable m` inside a proc installs the namespace link; the
+        // in-place fast path follows it (take_var_fast_link, which also
+        // drops the frame-local seed so the rep stays unshared): writes
+        // land in the owning namespace's variable and reads refresh.
+        // Output verified against tclsh 8.6.
+        let mut interp = Interp::new();
+        let r = interp
+            .eval(
+                r#"namespace eval tln {variable m [dict create p {}]}
+                proc tln::writer {k v} {
+                    variable m
+                    dict set m p $k $v
+                    dict set m p seen [expr {[dict size $m] + 0}]
+                }
+                tln::writer alpha 21
+                tln::writer beta 5
+                list [dict get $tln::m p alpha] [dict get $tln::m p seen] [set tln::m]"#,
+            )
+            .unwrap();
+        assert_eq!(r.as_str(), "21 1 {p {alpha 21 seen 1 beta 5}}");
     }
 
     // ── Ordered-specific tests ─────────────────────────────────

@@ -37,7 +37,10 @@ const shell = createShell(document.getElementById('term'), {
   exec: (s) => { if (!rtcl) throw new Error('WASM 尚未就绪'); return rtcl.exec(s); },
   isComplete: (s) => (rtcl ? rtcl.is_complete(s) : true),
 });
-const brace = (s) => '{' + s.replace(/\\/g, '\\\\').replace(/\{/g, '\\{').replace(/\}/g, '\\}') + '}';
+// Tcl 双引号词转义（无损；花括号转义在 Tcl 里有损：\\ 原样保留）
+const brace = (s) => '"' + String(s)
+  .replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  .replace(/\$/g, '\\$').replace(/\[/g, '\\[') + '"';
 
 let rtcl = null;
 

@@ -12,7 +12,11 @@
 // onError 收两种错误：回调脚本自身抛错（dispatch_event 返回的错误，
 // 不静默）与桥内部异常。
 
-const TCL_BRACE = (s) => '{' + String(s).replace(/\\/g, '\\\\').replace(/\{/g, '\\{').replace(/\}/g, '\\}') + '}';
+// Tcl 双引号词转义（无损）：大括号词内反斜杠原样保留，花括号
+// 转义天生有损；引号词走标准反斜杠替换，\ " $ [ 四个足矣。
+const TCL_QUOTE = (s) => '"' + String(s)
+  .replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  .replace(/\$/g, '\\$').replace(/\[/g, '\\[') + '"';
 
 export function installHttpBridge(rtcl, opts = {}) {
   const onError = opts.onError ?? ((m) => console.error('[http]', m));
@@ -31,7 +35,7 @@ export function installHttpBridge(rtcl, opts = {}) {
       inflight.delete(id);
       try {
         rtcl.dispatch_event(
-          `::http::_done ${id} ${status} ${TCL_BRACE(error)} ${TCL_BRACE(text)}`);
+          `::http::_done ${id} ${status} ${TCL_QUOTE(error)} ${TCL_QUOTE(text)}`);
       } catch (e) {
         onError(String((e && e.message) || e));   // 回调脚本错误：宿主呈现（bgerror 回路）
       }

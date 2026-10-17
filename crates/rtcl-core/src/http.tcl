@@ -61,12 +61,17 @@ proc ::http::_request {method url body optargs} {
         # 没有回调 = 错误无处可去（纪律：不许静默）——v1 强制回调。
         error "http: -command is required (完成经回调异步回灌；禁 vwait)"
     }
+    if {![string is integer -strict $timeout] || $timeout < 0} {
+        error "http: -timeout must be a non-negative integer (ms)"
+    }
     ::http::_require_bridge
     variable nextid
     variable calls
     set id [incr nextid]
     dict set calls $id $command
-    set opts [dict create timeout $timeout ctype $ctype]
+    # 选项以 JSON 过桥（JS 侧 JSON.parse；手搓小对象——json encode
+    # 无 schema 时按字符串编码，见 ui.tcl 同款做法）
+    set opts "\{\"timeout\":$timeout,\"ctype\":[json encode $ctype str]\}"
     if {[catch {__rtcl_http $id $method $url $body $opts} err]} {
         dict unset calls $id
         error "http: host bridge failed: $err"

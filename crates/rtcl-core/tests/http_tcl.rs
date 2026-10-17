@@ -47,7 +47,7 @@ fn get_request_reaches_bridge_and_returns_id() {
     assert_eq!(id.as_str(), "1");
     assert_eq!(
         log(&mut interp),
-        "1|GET|http://127.0.0.1:9/lines||timeout 0 ctype application/json"
+        "1|GET|http://127.0.0.1:9/lines||{\"timeout\":0,\"ctype\":\"application\\/json\"}"
     );
     // 脚本没被阻塞：回调尚未跑（完成还没回灌）
     assert_eq!(interp.eval("info exists ::got").unwrap().as_str(), "0");
@@ -79,7 +79,7 @@ fn post_carries_body_and_content_type() {
         .unwrap();
     assert_eq!(
         log(&mut interp),
-        "1|POST|http://x/echo|{\"a\":1}|timeout 0 ctype text/plain"
+        "1|POST|http://x/echo|{\"a\":1}|{\"timeout\":0,\"ctype\":\"text\\/plain\"}"
     );
 }
 

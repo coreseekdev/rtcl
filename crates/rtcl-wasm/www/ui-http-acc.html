@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>rtcl http::* acceptance (headless)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { font-family: monospace; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #term { flex: 1; border-right: 1px solid #30363d; min-width: 0; overflow: auto; }
+  #ui-root { flex: 1; overflow-y: auto; min-width: 0; }
+  #acc { position: fixed; bottom: 0; left: 0; right: 0; max-height: 38vh; overflow: auto; background:#010409; color:#7ee787; font-size:11px; padding:6px 10px; border-top:1px solid #30363d; white-space:pre-wrap; z-index: 9; }
+</style>
+</head>
+<body>
+<main>
+  <div id="term"></div>
+  <div id="ui-root"></div>
+</main>
+<pre id="acc">booting…</pre>
+<!-- 堵住 load 事件（--dump-dom --timeout 只能到点转储，页面真实任务先跑完） -->
+<img src="http://127.0.0.1:8766/hang" style="display:none" alt="">
+<script type="module">
+import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+import { createUiRuntime, registerDomRenderers, injectUiStyles } from './ui-runtime.js';
+import { createShell } from './shell.js';
+import { installHttpBridge } from './http-bridge.js';
+
+const acc = document.getElementById('acc');
+let accLines = [];
+const log = (s, mark) => { accLines.push((mark ? '  ' + mark + ' ' : '') + s); acc.textContent = accLines.join('\n'); };
+
+const nativeRaf = window.requestAnimationFrame.bind(window);
+window.requestAnimationFrame = (cb) => { nativeRaf(cb); setTimeout(() => cb(0), 0); return 0; };
+
+const shell = createShell(document.getElementById('term'), {
+  exec: (s) => { if (!rtcl) throw new Error('WASM 尚未就绪'); return rtcl.exec(s); },
+  isComplete: (s) => (rtcl ? rtcl.is_complete(s) : true),
+});
+// Tcl 双引号词转义（无损；花括号转义在 Tcl 里有损：\\ 原样保留）
+const brace = (s) => '"' + String(s)
+  .replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  .replace(/\$/g, '\\$').replace(/\[/g, '\\[') + '"';
+
+let rtcl = null;
+const ECHO = 'http://127.0.0.1:8767';
+
+async function main() {
+  await init();
+  rtcl = new RtclHandle();
+  rtcl.set_output_handler((s) => shell.print(s.replace(/\n$/, ''), 'puts'));
+  injectUiStyles();
+
+  const bridgeErrors = [];
+  installHttpBridge(rtcl, { onError: (m) => { bridgeErrors.push(m); shell.print('[http] ' + m, 'error'); } });
+
+  const fire = (path, event, detail) => {
+    try {
+      rtcl.dispatch_event(detail === undefined
+        ? `::ui::fire ${path} ${event}`
+        : `::ui::fire ${path} ${event} ${detail}`);
+    } catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const commitModel = (path, value) => {
+    try { rtcl.dispatch_event(`ui::model set ${path} ${brace(JSON.stringify(value))}`); }
+    catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const runtime = createUiRuntime(document.getElementById('ui-root'), {
+    fire, commitModel,
+    onError: (m) => shell.print('[ui] ' + m, 'error'),
+  });
+  registerDomRenderers(runtime);
+  rtcl.register_command('_ui', (opsJson) => { runtime.applyOps(JSON.parse(opsJson)); return ''; });
+
+  rtcl.exec('set tcl_interactive 1');
+  window.rtcl = rtcl;
+
+  // 摄取闭环演示：拉 JSON Lines → 逐行喂 table（L2→UI）
+  rtcl.exec(`
+ui::batch {
+  ui::surface .p -title "Pulled (http::get → table)"
+  ui::text .p.hint -variant caption -text "GET ${ECHO}/lines → jsonl → ui::model set /pulled/<i>"
+  ui::table .p.table -path /pulled -columns {level text} -weight 1
+}
+`);
+  window.__acc = { runtime, bridgeErrors };
+
+  acceptance(runtime, bridgeErrors).catch(e => log('harness error: ' + (e && e.message || e), 'ERR'));
+}
+
+async function acceptance(runtime, bridgeErrors) {
+  await new Promise(r => setTimeout(r, 0));
+  const term = document.getElementById('term');
+  const waitFor = (fn, ms = 5000) => new Promise((res, rej) => {
+    const t0 = Date.now();
+    const t = setInterval(() => {
+      let r = false;
+      try { r = fn(); } catch { r = false; }
+      if (r) { clearInterval(t); res(); }
+      else if (Date.now() - t0 > ms) { clearInterval(t); rej(new Error('wait timeout')); }
+    }, 25);
+  });
+  const execV = (s) => rtcl.exec(s);
+
+  // 1) 词表层装载 + 参数校验
+  const cmdsOk = execV('llength [info commands http::get]') === '1'
+    && execV('llength [info commands http::post]') === '1'
+    && execV('llength [info commands http::jsonl]') === '1';
+  let argErr = '';
+  try { rtcl.exec('http::get ' + ECHO + '/lines'); } catch (e) { argErr = String(e); }
+  const argOk = argErr.includes('-command is required');
+  log(`word layer loaded=${cmdsOk}; missing -command rejected=${argOk}`, '[1]');
+  const wlOk = cmdsOk && argOk;
+
+  // 2) GET JSON Lines → 非阻塞返回 → 完成回调 → 逐行喂表
+  const t0 = performance.now();
+  rtcl.exec(`http::get ${ECHO}/lines -command {
+    if {$http_error ne ""} { puts "pull-error: $http_error"; return }
+    set i 0
+    foreach line [http::jsonl $http_body] {
+      ui::model set /pulled/$i $line
+      incr i
+    }
+    puts "pulled $i lines (status $http_status)"
+  }`);
+  await waitFor(() => term.textContent.includes('pulled 3 lines'));
+  const getMs = Math.round(performance.now() - t0);
+  await new Promise(r => requestAnimationFrame(r));
+  const st = document.querySelector('.rui-table')._table;
+  const rows = st.rows.filter(Boolean);
+  const tableOk = rows.length === 3 && rows[1].level === 'warn' && rows[2].text === 'boom';
+  log(`GET /lines → 3 jsonl lines → table rows=${rows.length} in ${getMs}ms (async: script returned first) ${tableOk ? 'OK' : 'FAIL'}`, '[2]');
+  const getOk = tableOk;
+
+  // 3) POST 回显（body + content-type）
+  rtcl.exec(`http::post ${ECHO}/echo {{"k":1}} -command {set ::r_post [list $http_status $http_body]}`);
+  await waitFor(() => execV('info exists ::r_post') === '1');
+  const post = execV('set ::r_post');
+  const postOk = post.startsWith('200 ') && /"len":\s*7/.test(post);
+  log(`POST /echo round trip: ${postOk ? 'OK' : 'FAIL'} (${post.slice(0, 60)}…)`, '[3]');
+
+  // 4) HTTP >= 400 语义：完成、status 如实、error 空
+  rtcl.exec(`http::get ${ECHO}/boom -command {set ::r_boom [list $http_status $http_error]} `);
+  await waitFor(() => execV('info exists ::r_boom') === '1');
+  const boomOk = execV('set ::r_boom') === '500 {}';
+  log(`500 delivered as completion (status as-is, error empty) ${boomOk ? 'OK' : 'FAIL'}`, '[4]');
+
+  // 5) 网络错误 → status 0 + error（经回调可见，不静默）
+  rtcl.exec('http::get http://127.0.0.1:9/nope -command {puts "neterr: $http_status ($http_error)"}');
+  await waitFor(() => /neterr: 0 \(.+/.test(term.textContent));
+  const netOk = /neterr: 0 \(.+/.test(term.textContent);
+  log(`network error surfaces via callback ${netOk ? 'OK' : 'FAIL'}`, '[5]');
+
+  // 6) 超时：/slow（2s）with -timeout 300 → 中止
+  const t6 = performance.now();
+  rtcl.exec(`http::get ${ECHO}/slow -timeout 300 -command {set ::r_slow [list $http_status $http_error]}`);
+  await waitFor(() => execV('info exists ::r_slow') === '1', 3000);
+  const slowMs = Math.round(performance.now() - t6);
+  const slowOk = execV('set ::r_slow').includes('timeout after 300ms') && slowMs < 1500;
+  log(`timeout aborts at ~300ms (${slowMs}ms): ${execV('set ::r_slow')} ${slowOk ? 'OK' : 'FAIL'}`, '[6]');
+
+  const noSilent = bridgeErrors.length === 0;
+  log(`bridge/callback errors=${bridgeErrors.length} ${noSilent ? 'OK' : 'FAIL'}`, '[7]');
+
+  const all = wlOk && getOk && postOk && boomOk && netOk && slowOk && noSilent;
+  log(`VERDICT: ${all ? 'PASS' : 'FAIL'}`, 'END');
+  acc.title = all ? 'acc-pass' : 'acc-fail';
+}
+
+main().catch((e) => {
+  log('failed to init: ' + (e && e.message || e), 'ERR');
+});
+</script>
+</body>
+</html>

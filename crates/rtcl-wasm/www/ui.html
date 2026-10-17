@@ -38,6 +38,7 @@
 import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
 import { createUiRuntime, registerDomRenderers, injectUiStyles } from './ui-runtime.js';
 import { createShell } from './shell.js';
+import { installHttpBridge } from './http-bridge.js';
 
 const status = document.getElementById('status');
 
@@ -51,13 +52,17 @@ const shell = createShell(document.getElementById('term'), {
 });
 
 // Tcl 大括号引用：内层 } 与 \ 转义（嵌套 {} 自然平衡）
-const brace = (s) => '{' + s.replace(/\\/g, '\\\\').replace(/\{/g, '\\{').replace(/\}/g, '\\}') + '}';
+// Tcl 双引号词转义（无损；花括号转义在 Tcl 里有损：\\ 原样保留）
+const brace = (s) => '"' + String(s)
+  .replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  .replace(/\$/g, '\\$').replace(/\[/g, '\\[') + '"';
 
 async function main() {
   await init();
   rtcl = new RtclHandle();
   rtcl.set_output_handler((s) => shell.print(s.replace(/\n$/, ''), 'puts'));
   injectUiStyles();
+  installHttpBridge(rtcl, { onError: (m) => shell.print('[http] ' + m, 'error') });
 
   // 事件回灌：JS 组件事件 → Tcl 回调（契约 §2.4）。第三参 = 行级
   // detail（ui::table 下标），拼成 "::ui::fire <path> <ev> <detail>"。
@@ -271,6 +276,30 @@ ui::batch {
     puts "submit: [join $vals {, }]"
     ui::configure .n.hint -text "submitted: [ui::model get /issue/title]"
   }
+}
+`);
+
+  // L2 数据通道（ROADMAP §3）：wasm http 客户端。pull 拉 JSON Lines →
+  // 逐行喂 /pull（log 组件按 level 上色）。fetch 在 JS 里跑，回调
+  // 异步回灌（禁 vwait）。
+  rtcl.exec(`
+ui::batch {
+  ui::surface .r -title "Remote pull"
+  ui::text .r.hint -variant caption -text "try: pull http://127.0.0.1:8767/lines"
+  ui::log .r.log -path /pull -weight 1
+}
+set ::pullcursor 0
+proc pull {url} {
+    http::get $url -command {
+        if {$http_error ne ""} { puts "pull failed: $http_error"; return }
+        set n 0
+        foreach line [http::jsonl $http_body] {
+            ui::model set /pull/$::pullcursor $line
+            incr ::pullcursor
+            incr n
+        }
+        puts "pulled $n lines (status $http_status)"
+    }
 }
 `);
 

@@ -40,7 +40,7 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 | `ui::chart -vegalite` | ✅ v1 | Vega-Lite 子集（line/bar/point/area，x 序数等距）；spec 过桥、数据走 model 通道（spec.data.name） | 500 点流式 16ms；rAF 合并重绘 0.25ms/帧；组件/spec 不重建 |
 | `ui::trace` | ✅ v1 | span 树甘特图；折叠不改对齐、点条缩放/复位全客户端 | 6 行瀑布全交互零 Tcl 回灌 |
 | `ui::confirm` | ✅ v1 | 模态动作走 -command 回调（绑 ok；cancel 经 ui::on），决定后禁用、configure 重武装 | 创建脚本跑到底；决定异步回灌（不阻塞） |
-| `ui::form` | 缺失 | schema 驱动表单；-command 回调 | 表单提交不阻塞事件循环 |
+| `ui::form` | ✅ v1 | JSON Schema 子集（string/integer/number/boolean/enum + required）；值走模型 `-path` 基路径；客户端校验挡提交 | 击键零回灌、合法提交才回灌 commit（不阻塞） |
 | `ui::tabs` | 缺失 | surface 内组织 | 切换保各页状态 |
 | markdown `-text` | 缺失 | 渲染需 sanitize | XSS 用例全拒 |
 | L2 组件（popover/splitter） | 冻结 | 等真实拉动 | — |
@@ -114,5 +114,5 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 检视器：L1 稳定后，与 L3 并行
 ```
 
-建议下一块：**`ui::form`**（P1 尾巴的最后一件，schema 驱动
-+ `-command` 回调；组件层除它之外已齐，之后进 L2 数据通道）。
+建议下一块：**L2 数据通道**（ROADMAP §3——查询/SQL 面板、
+Worker 形态；P0/P1 组件层至此全齐）。

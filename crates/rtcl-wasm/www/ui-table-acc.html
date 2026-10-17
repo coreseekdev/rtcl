@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>rtcl ui::table acceptance (headless)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { font-family: monospace; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #term { flex: 1; border-right: 1px solid #30363d; min-width: 0; overflow: auto; }
+  #ui-root { flex: 1; overflow-y: auto; min-width: 0; }
+  #acc { position: fixed; bottom: 0; left: 0; right: 0; max-height: 38vh; overflow: auto; background:#010409; color:#7ee787; font-size:11px; padding:6px 10px; border-top:1px solid #30363d; white-space:pre-wrap; z-index: 9; }
+  #acc b { color:#3fb950; }
+</style>
+</head>
+<body>
+<main>
+  <div id="term"></div>
+  <div id="ui-root"></div>
+</main>
+<pre id="acc">booting…</pre>
+<!-- 堵住 load 事件（--dump-dom --timeout 只能到点转储，页面真实任务先跑完） -->
+<img src="http://127.0.0.1:8766/hang" style="display:none" alt="">
+<script type="module">
+import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+import { createUiRuntime, registerDomRenderers, injectUiStyles } from './ui-runtime.js';
+import { createShell } from './shell.js';
+
+const acc = document.getElementById('acc');
+let accLines = [];
+const log = (s, mark) => { accLines.push((mark ? '  ' + mark + ' ' : '') + s); acc.textContent = accLines.join('\n'); };
+
+// headless --dump-dom + --virtual-time-budget 不泵合成器帧：rAF 竞速
+// 一个 setTimeout 兜底，rAF 未泵时由定时器先到（语义同帧粒度接管）。
+// 顺带量每次被调度的"渲染回调执行耗时"（帧等待不算，真渲染几何才计）。
+const nativeRaf = window.requestAnimationFrame.bind(window);
+const rafExecCosts = [];
+window.requestAnimationFrame = (cb) => {
+  let done = false;
+  const once = (t) => {
+    if (!done) {
+      done = true;
+      const c0 = performance.now();
+      cb(t ?? performance.now());
+      rafExecCosts.push(performance.now() - c0);
+    }
+  };
+  nativeRaf(once);
+  setTimeout(() => once(0), 0);
+  return 0;
+};
+
+const shell = createShell(document.getElementById('term'), {
+  exec: (s) => { if (!rtcl) throw new Error('WASM 尚未就绪'); return rtcl.exec(s); },
+  isComplete: (s) => (rtcl ? rtcl.is_complete(s) : true),
+});
+
+const brace = (s) => '{' + s.replace(/\\/g, '\\\\').replace(/}/g, '\\}') + '}';
+
+let rtcl = null;
+
+async function main() {
+  await init();
+  rtcl = new RtclHandle();
+  rtcl.set_output_handler((s) => shell.print(s.replace(/\n$/, ''), 'puts'));
+  injectUiStyles();
+
+  const fire = (path, event, detail) => {
+    try {
+      rtcl.dispatch_event(detail === undefined
+        ? `::ui::fire ${path} ${event}`
+        : `::ui::fire ${path} ${event} ${detail}`);
+    } catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const commitModel = (path, value) => {
+    try { rtcl.dispatch_event(`ui::model set ${path} ${brace(JSON.stringify(value))}`); }
+    catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const runtime = createUiRuntime(document.getElementById('ui-root'), {
+    fire, commitModel,
+    onError: (m) => shell.print('[ui] ' + m, 'error'),
+  });
+  registerDomRenderers(runtime);
+  rtcl.register_command('_ui', (opsJson) => { runtime.applyOps(JSON.parse(opsJson)); return ''; });
+
+  rtcl.exec('set tcl_interactive 1');
+  window.rtcl = rtcl;
+
+  // ── 与 demo 相同的最小场景：Pods 面板（table + rowactions）──
+  rtcl.exec(`
+ui::batch {
+  ui::surface .p -title Pods
+  ui::text .p.hint -variant caption -text "feed: feedpods 100000"
+  ui::table .p.table -path /pods -columns {name status restarts age} -weight 1 \\
+      -rowactions {open {puts "open \\#$ui_row: [ui::model get /pods/$ui_row]"} \\
+                   del  {puts "del  \\#$ui_row"}}
+}
+ui::on .p.table rowclick {puts "rowclick \\#$ui_row"}
+proc feedpods {n {chunk 2000}} {
+    set statuses {Running Pending CrashLoopBackOff Succeeded Failed}
+    set fed 0
+    while {$fed < $n} {
+        set k [expr {$fed + $chunk > $n ? $n - $fed : $chunk}]
+        ui::batch {
+            for {set j 0} {$j < $k} {incr j} {
+                set i [expr {$fed + $j}]
+                ui::model set /pods/$i [format {{"name":"pod-%06d","status":"%s","restarts":%d,"age":"%dh"}} \\
+                    $i [lindex $statuses [expr {$i % 5}]] [expr {$i % 7}] [expr {1 + $i % 720}]]
+            }
+        }
+        set fed [expr {$fed + $k}]
+    }
+    return "fed $fed rows"
+}
+`);
+
+  acceptance(runtime).catch(e => log('harness error: ' + (e && e.message || e), 'ERR'));
+}
+
+async function acceptance(runtime) {
+  await new Promise(r => setTimeout(r, 0));   // 让 op 批先落
+
+  // 1) catalog 内省
+  const cat = rtcl.exec('ui::catalog Table');
+  const catOk = cat.includes('-path') && cat.includes('-columns') && cat.includes('-rowactions')
+    && cat.includes('-fill') && cat.includes('-weight');
+  log(`catalog Table introspection ${catOk ? 'OK' : 'FAIL'}`, '[1]');
+  if (!catOk) log(cat);
+
+  // 2) 10 万行游标喂数（与验收口径一致：ui::model set /pods 子路径）
+  const t0 = performance.now();
+  const fed = rtcl.exec('feedpods 100000');
+  const feedMs = Math.round(performance.now() - t0);
+  const table = document.querySelector('.rui-table');
+  const st = table._table;
+  await new Promise(r => requestAnimationFrame(r));   // 先泵一帧：同步喂数期间 rAF 定格，渲染看这一帧
+  const domRows = st.spacer.children.length;
+  log(`feedpods 100000 → ${fed} in ${feedMs}ms (sync exec: Tcl + bridge + row cache); model rows=${st.rows.length}; rendered rows=${domRows} (pool ${st.pool.size})`, '[2]');
+  let tailRow = '';
+  try { tailRow = rtcl.exec('ui::model get /pods/99999'); } catch (e) { tailRow = 'ERR ' + e; }
+  log(`ui::model get /pods/99999 → ${tailRow}`, '[2b]');
+
+  // 3) 滚动：50 步随机跳位。帧等待（rAF/泵间距）与"窗重渲染执行
+  const scrollExec = [];
+  const scrollMs = [];
+  let maxPool = 0;
+  for (let step = 0; step < 50; step++) {
+    const costsBefore = rafExecCosts.length;
+    table.scrollTop = Math.floor(Math.random() * 100000) * 28;
+    const t1 = performance.now();
+    table.dispatchEvent(new Event('scroll'));
+    await new Promise(r => requestAnimationFrame(r));
+    scrollMs.push(performance.now() - t1);
+    maxPool = Math.max(maxPool, st.pool.size);
+    for (const c of rafExecCosts.slice(costsBefore)) scrollExec.push(c);
+  }
+  const execAvg = scrollExec.reduce((a, b) => a + b, 0) / (scrollExec.length || 1);
+  const avg = scrollMs.reduce((a, b) => a + b, 0) / scrollMs.length;
+  log(`50 jumps: frame-wait avg ${avg.toFixed(2)}ms, render-exec avg ${execAvg.toFixed(3)}ms/${scrollExec.length} callbacks, max pool rows=${maxPool}`, '[3]');
+
+  // 4) 单行增量：只动该行 DOM；其他行节点身份保持
+  table.scrollTop = 42 * 28;
+  table.dispatchEvent(new Event('scroll'));
+  await new Promise(r => requestAnimationFrame(r));
+  const rowBefore = st.pool.get(42);
+  const othersBefore = [...st.pool.keys()];
+  const rowTextBefore = rowBefore._cells[0].textContent + '|' + rowBefore._cells[1].textContent;
+  rtcl.exec('ui::model set /pods/42 {{"name":"pod-000042","status":"CrashLoopBackOff","restarts":99,"age":"100h"}}');
+  const rowAfter = st.pool.get(42);
+  const othersAfter = [...st.pool.keys()];
+  const sameNode = rowBefore === rowAfter;
+  const sameOthers = othersBefore.join(',') === othersAfter.join(',');
+  const cellTxt = rowAfter._cells[0].textContent + '|' + rowAfter._cells[1].textContent + '|' + rowAfter._cells[2].textContent;
+  log(`single-row update: node reused=${sameNode}, other anchors stable=${sameOthers}`);
+  log(`row42 cells: ${rowTextBefore} → ${cellTxt}`, '[4]');
+  const rowOk = sameNode && sameOthers && cellTxt.endsWith('|CrashLoopBackOff|99');
+  log(`single-row incremental ${rowOk ? 'OK' : 'FAIL'}`, '[4]');
+
+  // 5) 点行 → Tcl 回调 → puts 进 shell transcript
+  const term = document.getElementById('term');
+  rowAfter.dispatchEvent(new MouseEvent('click', { bubbles: true }));   // 行身点击（容器委托 → rowclick）
+  await new Promise(r => setTimeout(r, 0));
+  const gotRowclick = term.textContent.includes('rowclick #42');
+  const actZone = st.pool.get(42).children[st.pool.get(42).children.length - 1];   // 行尾动作区（.rui-act 容器）
+  actZone.children[0].click();   // 行动作按钮 [open]
+  await new Promise(r => setTimeout(r, 0));
+  const gotOpen = term.textContent.includes('open #42');
+  log(`rowclick → shell${gotRowclick ? '' : ' MISSING'}; rowopen → shell${gotOpen ? '' : ' MISSING'}`, '[5]');
+  const tail = term.textContent.trim().split('\n').slice(-4).join(' ⏎ ');
+  log(`shell tail: ${tail}`, '[5b]');
+
+  const all = catOk && rowOk && gotRowclick && gotOpen && st.rows.length === 100000 && maxPool <= 30 && execAvg < 8 && avg < 100;
+  log(`VERDICT: ${all ? 'PASS' : 'FAIL'}`, 'END');
+  acc.title = all ? 'acc-pass' : 'acc-fail';
+}
+
+main().catch((e) => {
+  log('failed to init: ' + (e && e.message || e), 'ERR');
+});
+</script>
+</body>
+</html>

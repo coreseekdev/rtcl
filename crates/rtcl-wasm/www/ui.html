@@ -59,9 +59,14 @@ async function main() {
   rtcl.set_output_handler((s) => shell.print(s.replace(/\n$/, ''), 'puts'));
   injectUiStyles();
 
-  // 事件回灌：JS 组件事件 → Tcl 回调（契约 §2.4）
-  const fire = (path, event) => {
-    try { rtcl.dispatch_event(`::ui::fire ${path} ${event}`); }
+  // 事件回灌：JS 组件事件 → Tcl 回调（契约 §2.4）。第三参 = 行级
+  // detail（ui::table 下标），拼成 "::ui::fire <path> <ev> <detail>"。
+  const fire = (path, event, detail) => {
+    try {
+      rtcl.dispatch_event(detail === undefined
+        ? `::ui::fire ${path} ${event}`
+        : `::ui::fire ${path} ${event} ${detail}`);
+    }
     catch (e) { shell.print(String(e && e.message || e), 'error'); }
   };
   // 输入组件提交：本地编辑回写 Tcl 模型（契约 §2.2）
@@ -106,9 +111,46 @@ ui::batch {
 }
 `);
 
+  // M5: ui::table —— 虚拟滚动 + 行级增量。喂数不预置 /pods（dict set
+  // 自动建父，tclsh 同源语义）；行 JSON 双大括号字面量（引词规则，
+  // 见 rtcl-core/src/ui.tcl Table 注释）。行点击经 rowopen/rowdel/
+  // rowclick 回灌，脚本里 $ui_row = 行号（::ui::fire 第三参）。
+  rtcl.exec(`
+ui::batch {
+  ui::surface .p -title Pods
+  ui::text .p.hint -variant caption -text "feed: feedpods 100000"
+  ui::table .p.table -path /pods -columns {name status restarts age} -weight 1 \\
+      -rowactions {open {puts "open \\#$ui_row: [ui::model get /pods/$ui_row]"} \\
+                   del  {puts "del  \\#$ui_row"}}
+}
+ui::on .p.table rowclick {puts "rowclick \\#$ui_row"}
+`);
+
+  // 10 万行游标喂数（分批 ui::batch 每片一个过桥；协议一次一行）。
+  // 加载中 shell 仍可交互（W/Tcl 每片让回事件循环）。
+  rtcl.exec(`
+proc feedpods {n {chunk 2000}} {
+    set statuses {Running Pending CrashLoopBackOff Succeeded Failed}
+    set fed 0
+    while {$fed < $n} {
+        set k [expr {$fed + $chunk > $n ? $n - $fed : $chunk}]
+        ui::batch {
+            for {set j 0} {$j < $k} {incr j} {
+                set i [expr {$fed + $j}]
+                ui::model set /pods/$i [format {{"name":"pod-%06d","status":"%s","restarts":%d,"age":"%dh"}} \
+                    $i [lindex $statuses [expr {$i % 5}]] [expr {$i % 7}] [expr {1 + $i % 720}]]
+            }
+        }
+        set fed [expr {$fed + $k}]
+    }
+    return "fed $fed rows"
+}
+`);
+
   shell.print('rtcl ' + (rtcl.exec('info patchlevel') || '') + ' — ui demo ready.', 'result');
   shell.print('try:  % ui::text .s.main.note -text hello -variant caption', 'hint');
-  shell.print('      % ui::catalog Button   |   % ui::model get /name', 'hint');
+  shell.print('      % feedpods 100000        ;# 10 万行游标喂数 → .p 表格', 'hint');
+  shell.print('      % ui::catalog Table      |   % ui::model get /name', 'hint');
   shell.focus();
   status.textContent = 'ready';
   status.className = 'ok';

@@ -48,3 +48,4 @@ crates/rtcl-wasm/pkg/
 !bench/BASELINE.md
 !docs/PRODUCTION.md
 !docs/REPL-TCLSH-PARITY.md
+!docs/UI-DSL.md

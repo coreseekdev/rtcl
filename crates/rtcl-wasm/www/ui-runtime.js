@@ -1000,6 +1000,157 @@ runtime.registerRenderer('Chart', {
     if ('vegalite' in props) chartInit(st, props, hp);
   },
 });
+
+// ── Trace：span 树瀑布（L1 渲染新原语；UI-RESEARCH §3.1）──────
+// 数据：span 树 {name, start_ms, dur_ms, children[]}（数组 = 多根）。
+// 每 span 一行：名字列 + 轨道，条按**完整树**的 [min start, max
+// end] 域百分比摆放——折叠子树不改变其余条的对齐。折叠默认全展
+// 开；点名字/箭头折叠，点条缩放到该 span 时间窗（再点复位），点
+// 轨道空白复位。全部纯客户端（不触 Tcl）。缺少数值 start_ms/
+// dur_ms 的 span 防御性跳过。
+const TRACE_ROW_H = 22;
+
+function traceSchedule(st) {
+  if (st.pending) return;
+  st.pending = true;
+  requestAnimationFrame(() => { st.pending = false; traceRender(st); });
+}
+
+function traceRender(st) {
+  const el = st.el;
+  const roots = Array.isArray(st.value) ? st.value
+    : (st.value !== null && typeof st.value === 'object' ? [st.value] : []);
+
+  // 全域：遍历完整树（含折叠子树）
+  let lo = Infinity;
+  let hi = -Infinity;
+  const ranges = new Map();   // id -> [start, end]（缩放查找）
+  const walkDomain = (span, segs) => {
+    if (span === null || typeof span !== 'object' || Array.isArray(span)) return;
+    const s = Number(span.start_ms);
+    const d = Number(span.dur_ms);
+    if (!Number.isFinite(s) || !Number.isFinite(d)) return;
+    ranges.set(JSON.stringify(segs), [s, s + d]);
+    if (s < lo) lo = s;
+    if (s + d > hi) hi = s + d;
+    const kids = Array.isArray(span.children) ? span.children : [];
+    kids.forEach((k, i) => walkDomain(k, segs.concat([i])));
+  };
+  roots.forEach((r, i) => walkDomain(r, [i]));
+
+  if (lo === Infinity) {
+    const empty = h('div', 'rui-trace-empty');
+    empty.textContent = st.bindPath ? '(no spans)' : '(no -path)';
+    el.replaceChildren(empty);
+    return;
+  }
+
+  // 缩放覆盖域（span 不存在则复位）
+  if (st.zoomId !== null) {
+    const zr = ranges.get(st.zoomId);
+    if (zr) { lo = zr[0]; hi = zr[1]; } else { st.zoomId = null; }
+  }
+  const span = Math.max(hi - lo, 1e-9);
+
+  // 可见行（折叠感知）
+  const rows = [];
+  const walkVisible = (s, segs, depth) => {
+    if (s === null || typeof s !== 'object' || Array.isArray(s)) return;
+    const start = Number(s.start_ms);
+    const dur = Number(s.dur_ms);
+    if (!Number.isFinite(start) || !Number.isFinite(dur)) return;
+    const id = JSON.stringify(segs);
+    const kids = (Array.isArray(s.children) ? s.children : [])
+      .map((k, i) => [k, i]).filter(([k]) => k !== null && typeof k === 'object' && !Array.isArray(k));
+    const folded = st.folded.has(id);
+    rows.push({ id, span: s, depth, hasKids: kids.length > 0, folded });
+    if (!folded) for (const [k, i] of kids) walkVisible(k, segs.concat([i]), depth + 1);
+  };
+  roots.forEach((r, i) => walkVisible(r, [i], 0));
+  st.foldable = new Set(rows.filter(r => r.hasKids).map(r => r.id));
+
+  const rowEls = rows.map((r, i) => {
+    const row = h('div', 'rui-trace-row');
+    row.dataset.id = r.id;
+    row.style.top = (i * TRACE_ROW_H) + 'px';
+    const nameEl = h('div', 'rui-trace-name');
+    nameEl.style.paddingLeft = (r.depth * 12) + 'px';
+    const arrow = h('span', 'rui-trace-arrow');
+    arrow.textContent = r.hasKids ? (r.folded ? '▸' : '▾') : ' ';
+    const label = h('span', 'rui-trace-label');
+    label.textContent = r.span.name === undefined || r.span.name === null ? '(unnamed)' : String(r.span.name);
+    label.title = label.textContent;
+    const dur = h('span', 'rui-trace-dur');
+    dur.textContent = (Math.round(Number(r.span.dur_ms) * 10) / 10) + 'ms';
+    nameEl.append(arrow, label, dur);
+    const track = h('div', 'rui-trace-track');
+    const bar = h('div', 'rui-trace-bar');
+    const s = Number(r.span.start_ms);
+    const d = Number(r.span.dur_ms);
+    bar.dataset.id = r.id;
+    bar.style.left = (((s - lo) / span) * 100) + '%';
+    bar.style.width = Math.max(0.4, (d / span) * 100) + '%';
+    track.append(bar);
+    row.append(nameEl, track);
+    return row;
+  });
+  const wrap = h('div', 'rui-trace-rows');
+  wrap.style.height = (rows.length * TRACE_ROW_H) + 'px';
+  wrap.append(...rowEls);
+  el.replaceChildren(wrap);
+}
+
+function traceOnModelEvent(st, v, sub) {
+  if (sub === undefined || sub === st.bindPath) st.value = v;
+  else st.value = viewDelta(st.value, sub.slice(st.bindPath.length + 1).split('/'), v);
+  if (st.value !== undefined && st.value !== null
+      && (typeof st.value !== 'object')) {
+    throw new Error(`Trace ${st.path}: model "${st.bindPath}" must be a span object or array`);
+  }
+  traceSchedule(st);
+}
+
+runtime.registerRenderer('Trace', {
+  create(path, props, hp) {
+    const el = h('div', 'rui-trace');
+    const st = {
+      path, bindPath: typeof hp.bind === 'object' ? hp.bind.path : null,
+      el, value: undefined, folded: new Set(), foldable: new Set(),
+      zoomId: null, pending: false,
+    };
+    el._trace = st;
+    if (hp.bind) {
+      hp.bind.subscribe((v, sub) => traceOnModelEvent(st, v, sub));
+      const init = hp.bind.get();
+      if (init !== undefined) st.value = init;
+    }
+    el.addEventListener('click', (e) => {
+      const bar = e.target.closest('.rui-trace-bar');
+      if (bar) {   // 条：缩放到该 span（再点复位）
+        const id = bar.dataset.id;
+        st.zoomId = st.zoomId === id ? null : id;
+        traceSchedule(st);
+        return;
+      }
+      const name = e.target.closest('.rui-trace-name');
+      if (name) {  // 名字/箭头：折叠（仅对有子节点的行）
+        const row = e.target.closest('.rui-trace-row');
+        if (row && st.foldable.has(row.dataset.id)) {
+          const id = row.dataset.id;
+          if (st.folded.has(id)) st.folded.delete(id); else st.folded.add(id);
+          traceSchedule(st);
+        }
+        return;
+      }
+      if (st.zoomId !== null) { st.zoomId = null; traceSchedule(st); }   // 轨道空白：复位缩放
+    });
+    traceSchedule(st);
+    return el;
+  },
+  update(el, props, hp) {
+    // v1: -path 变化走重建；布局选项由 runtime 统一应用
+  },
+});
 }
 
 // ── 默认暗色主题（样式全在这里，渲染器不带样式）────────────────────────
@@ -1081,6 +1232,20 @@ export function injectUiStyles() {
 .rui-chart-line { fill:none; stroke:#58a6ff; stroke-width:1.5; }
 .rui-chart-area { fill:rgba(88,166,255,0.18); stroke:none; }
 .rui-chart-empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#8b949e; font-size:12px; }
+/* ui::trace —— span 树瀑布；条按完整树时间域的 % 摆放，折叠不改
+   对齐；轨道 overflow:hidden 负责缩放窗外的裁切。 */
+.rui-trace { background:#0d1117; border:1px solid #30363d; border-radius:6px; max-height:360px; overflow:auto; font:12px/22px ui-monospace, SFMono-Regular, Menlo, monospace; color:#c9d1d9; }
+.rui-trace-rows { position:relative; }
+.rui-trace-row { position:absolute; left:0; right:0; height:22px; display:flex; align-items:center; }
+.rui-trace-name { flex:0 0 42%; max-width:42%; display:flex; align-items:center; gap:5px; padding-right:8px; white-space:nowrap; overflow:hidden; }
+.rui-trace-arrow { flex:0 0 11px; color:#8b949e; }
+.rui-trace-label { overflow:hidden; text-overflow:ellipsis; color:#79c0ff; }
+.rui-trace-dur { color:#8b949e; font-size:11px; flex:0 0 auto; }
+.rui-trace-track { flex:1 1 auto; position:relative; height:100%; overflow:hidden; border-left:1px solid #21262d; }
+.rui-trace-row:hover .rui-trace-track { background:#10151c; }
+.rui-trace-bar { position:absolute; top:5px; height:12px; min-width:1px; background:#1f6feb; border-radius:2px; cursor:pointer; }
+.rui-trace-bar:hover { background:#58a6ff; }
+.rui-trace-empty { padding:10px; color:#8b949e; }
 `;
   document.head.appendChild(style);
 }

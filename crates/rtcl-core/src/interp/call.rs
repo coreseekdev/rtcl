@@ -277,23 +277,19 @@ impl Interp {
 
             if has_args {
                 let remaining_start = regular_params.len() + 1;
-                let remaining_args: Vec<&Value> = if remaining_start < cur.len() {
-                    cur[remaining_start..].iter().collect()
+                // $args 变量必须持有一个**规范** Tcl list（tclsh 同源）：
+                // 元素按 TclScanElement/TclConvertElement 规则加引号。
+                // 此前的手写 join 只对含空白的词加 {}，首字符为引号或花
+                // 括号的词（如行级 JSON `{"name":"x"}`）会被去引号落地，
+                // 之后任何 `lassign/lindex` 式重解析都会碎裂——tclsh 的
+                // `$args` 可无限往返。这里复用 Value::from_list 的序列化
+                // （与 `[list]` 输出同一实现），保证 round-trip 性质。
+                let remaining: Vec<Value> = if remaining_start < cur.len() {
+                    cur[remaining_start..].to_vec()
                 } else {
                     Vec::new()
                 };
-                let list_str: String = remaining_args
-                    .iter()
-                    .map(|v| {
-                        let s = v.as_str();
-                        if s.is_empty() || s.contains(' ') || s.contains('\t') || s.contains('\n') {
-                            format!("{{{}}}", s)
-                        } else {
-                            s.to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let list_str = Value::from_list(&remaining).as_str().to_string();
                 let frame = self.frames.last_mut().unwrap();
                 if slot_mode {
                     // `args` is the table's last entry — index
@@ -744,19 +740,10 @@ impl Interp {
             self.call_depth -= 1;
             self.fill_wrong_args(cmd_name, result)
         } else {
-            // Fallback: build script string and eval
-            let script: String = args
-                .iter()
-                .map(|a| {
-                    let s = a.as_str();
-                    if s.is_empty() || s.contains(' ') || s.contains('\t') || s.contains('\n') {
-                        format!("{{{}}}", s)
-                    } else {
-                        s.to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
+            // Fallback: build script string and eval。
+            // 同上：词序列化必须走规范 list 形式（含引号词才会往返），
+            // 否则拼出的脚本会把 `{"a":1}` 拆成碎的词。
+            let script = Value::from_list(args).as_str().to_string();
             self.eval(&script)
         }
     }

@@ -1179,6 +1179,37 @@ mod tests {
         let r = interp.eval("info statics counter").unwrap();
         assert_eq!(r.as_str(), "count 2");
     }
+
+    #[test]
+    fn test_args_variable_roundtrips_quote_and_brace_words() {
+        // tclsh：`$args` 持有规范 Tcl list，元素按 TclScanElement 规则
+        // 加引号后可被 lassign/lindex 无损重解析。此前手写 join 只有
+        // 空白词加 {}，行级 JSON 一类词即碎。
+        let mut interp = Interp::new();
+        interp
+            .eval(r#"proc peek {sub args} { lassign $args path value; list [llength $args] $sub $path $value }"#)
+            .unwrap();
+        assert_eq!(
+            interp
+                .eval(r#"peek set /pods/42 {"name":"pod-42","status":"Running"}"#)
+                .unwrap()
+                .as_str(),
+            r#"2 set /pods/42 {"name":"pod-42","status":"Running"}"#
+        );
+        // display 形式与 tclsh 一致：[list a {…}] 规范化保留引号包装，
+        // `$args` 同一形式（可再往返）。注意 args 不含已绑定的 sub。
+        let d = interp
+            .eval(r#"proc disp {sub args} { return $args }; disp set /pods/42 {"name":"x","y"}"#)
+            .unwrap();
+        assert_eq!(d.as_str(), r#"/pods/42 {"name":"x","y"}"#);
+        assert_eq!(
+            interp
+                .eval(r#"set d [list a {"name":"x","y"}]; set d"#)
+                .unwrap()
+                .as_str(),
+            r#"a {"name":"x","y"}"#
+        );
+    }
 }
 
 #[cfg(test)]

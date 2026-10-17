@@ -13,6 +13,16 @@ namespace eval ::ui {
     variable model    [dict create]   ;# Tcl 侧模型树
     variable batching 0
     variable batchops [list]
+    # 布局选项是所有组件的公共选项（设计见 docs/UI-LAYOUT.md §3），
+    # define 时合并进每个组件的 spec；组件 spec 可同名覆盖。
+    variable layoutopts [dict create \
+        fill    [list enum {none x y both} {}] \
+        weight  [list number {} {}] \
+        width   [list size {} {}] \
+        height  [list size {} {}] \
+        align   [list enum {start center end stretch} {}] \
+        gap     [list size {} {}] \
+        pad     [list size {} {}]]
 }
 
 # ── 路径与编码工具 ─────────────────────────────────────────
@@ -56,6 +66,11 @@ proc ::ui::_check_value {type opt kind meta value} {
         bool {
             if {![string is boolean -strict $value]} {
                 error "bad value \"$value\" for $opt on $type: expected boolean"
+            }
+        }
+        size {
+            if {![regexp {^[0-9]+(\.[0-9]+)?(px|%|em|rem|ch|vw)?$} $value]} {
+                error "bad value \"$value\" for $opt on $type: expected size (number, optional px/%/em/rem/ch/vw)"
             }
         }
     }
@@ -129,13 +144,17 @@ proc ::ui::define {type spec} {
             error "ui::define $type: bad spec entry for $opt (need {kind meta default})"
         }
         set kind [lindex $entry 0]
-        if {[lsearch -exact {string script enum number bool json bind} $kind] < 0} {
+        if {[lsearch -exact {string script enum number bool json bind size} $kind] < 0} {
             error "ui::define $type: unknown kind \"$kind\" for $opt"
         }
         # catalog 里选项名统一不带前导短横（词表写作 -text，解析键为 text）
         set key $opt
         if {[string match -* $opt]} { set key [string range $opt 1 end] }
         dict set normspec $key $entry
+    }
+    # 布局是公共选项：合并进组件 spec（组件可同名覆盖）
+    dict for {opt entry} $::ui::layoutopts {
+        if {![dict exists $normspec $opt]} { dict set normspec $opt $entry }
     }
     dict set catalog $type $normspec
     set lname [string tolower $type]

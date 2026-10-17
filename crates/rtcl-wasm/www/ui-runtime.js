@@ -21,6 +21,44 @@ export function createUiRuntime(root, opts = {}) {
     return i <= 0 ? '' : path.slice(0, i);
   }
 
+  // ── 布局：props 里的公共布局键 → el.style（docs/UI-LAYOUT.md §3）──
+  // 组件渲染器不感知布局；fill/weight 的主轴语义取决于父容器方向。
+
+  function axisOf(type) {
+    if (type === 'Row') return 'x';
+    if (type === 'Column' || type === 'Surface' || type === 'Card') return 'y';
+    return null;   // 叶子或未知父：按 block 语义退化
+  }
+
+  function cssSize(v) {
+    const s = String(v);
+    return /^[0-9]+(\.[0-9]+)?$/.test(s) ? s + 'px' : s;
+  }
+
+  const ALIGN_MAP = { start: 'flex-start', end: 'flex-end', center: 'center', stretch: 'stretch' };
+
+  function applyLayout(el, props, axis) {
+    if ('gap' in props) el.style.gap = cssSize(props.gap);
+    if ('pad' in props) el.style.padding = cssSize(props.pad);
+    if ('width' in props) el.style.width = cssSize(props.width);
+    if ('height' in props) el.style.height = cssSize(props.height);
+    if ('align' in props) el.style.alignSelf = ALIGN_MAP[props.align] ?? props.align;
+    if ('weight' in props) el.style.flex = `${props.weight} 1 0`;
+    if ('fill' in props) {
+      const f = props.fill;
+      if (axis === null) {
+        if (f === 'x' || f === 'both') el.style.width = '100%';
+        if (f === 'y' || f === 'both') el.style.height = '100%';
+      } else {
+        const crossStretch = axis === 'x' ? (f === 'y' || f === 'both') : (f === 'x' || f === 'both');
+        const mainFill = axis === 'x' ? (f === 'x' || f === 'both') : (f === 'y' || f === 'both');
+        if (crossStretch) el.style.alignSelf = 'stretch';
+        // flex 无"槽"概念：主轴填满等价于争抢剩余（显式 -weight 优先）
+        if (mainFill && !('weight' in props)) el.style.flexGrow = '1';
+      }
+    }
+  }
+
   function modelSet(path, value) {
     model.set(path, value);
     const s = subs.get(path);
@@ -71,22 +109,26 @@ export function createUiRuntime(root, opts = {}) {
         if (widgets.has(op.path)) throw new Error(`widget "${op.path}" already exists`);
         const parent = parentPath(op.path);
         let container = root;
+        let parentType = null;
         if (parent) {
           const p = widgets.get(parent);
           if (!p) throw new Error(`parent "${parent}" does not exist`);
           container = p.renderer.container ? p.renderer.container(p.el) : p.el;
+          parentType = p.type;
         }
         const props = op.props ?? {};
         const el = renderer.create(op.path, props, helpers(op.path, props));
         el.dataset.uiPath = op.path;
+        applyLayout(el, props, axisOf(parentType));
         container.appendChild(el);
-        widgets.set(op.path, { el, type: op.type, renderer, props });
+        widgets.set(op.path, { el, type: op.type, renderer, props, parentType });
         break;
       }
       case 'set': {
         const w = widgets.get(op.path);
         if (!w) throw new Error(`unknown widget "${op.path}"`);
         Object.assign(w.props, op.props ?? {});
+        applyLayout(w.el, op.props ?? {}, axisOf(w.parentType));
         if (w.renderer.update) {
           w.renderer.update(w.el, op.props ?? {}, helpers(op.path, w.props));
         }

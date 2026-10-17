@@ -181,6 +181,33 @@ fn configure_and_destroy() {
 }
 
 #[test]
+fn layout_options_pass_through_and_validate() {
+    let mut interp = setup();
+    interp.eval(r#"ui::surface .s; ui::row .s.r -gap 8"#).unwrap();
+    interp
+        .eval(r#"ui::text .s.r.t -text hi -weight 2 -fill y -align center -width 30%"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    assert!(log.contains(r#""gap":"8""#), "size 过线为 string: {log}");
+    assert!(log.contains(r#""weight":2"#), "number 过线为 JSON number: {log}");
+    assert!(log.contains(r#""fill":"y""#), "{log}");
+    assert!(log.contains(r#""align":"center""#), "{log}");
+    assert!(log.contains(r#""width":"30%""#), "{log}");
+
+    // 布局选项的校验同样严格
+    let e = interp.eval(r#"ui::text .s.r.t2 -fill everywhere"#).unwrap_err();
+    assert!(e.to_string().contains("must be one of"), "{e}");
+    let e = interp.eval(r#"ui::text .s.r.t2 -width abc"#).unwrap_err();
+    assert!(e.to_string().contains("expected size"), "{e}");
+    let e = interp.eval(r#"ui::text .s.r.t2 -weight x"#).unwrap_err();
+    assert!(e.to_string().contains("expected number"), "{e}");
+
+    // catalog 内省含公共布局选项（LLM 词表来源）
+    let c = interp.eval("ui::catalog Text").unwrap().as_str().to_string();
+    assert!(c.contains("-weight") && c.contains("-fill") && c.contains("-gap"), "{c}");
+}
+
+#[test]
 fn catalog_is_introspectable() {
     let mut interp = setup();
     let all = interp.eval("ui::catalog").unwrap().as_str().to_string();

@@ -50,3 +50,4 @@ crates/rtcl-wasm/pkg/
 !docs/REPL-TCLSH-PARITY.md
 !docs/UI-DSL.md
 !docs/UI-RESEARCH.md
+!docs/UI-LAYOUT.md

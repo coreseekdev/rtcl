@@ -607,6 +607,203 @@ runtime.registerRenderer('Log', {
     logBindEvents(st, el, hp.events);
   },
 });
+
+// ── Kv：键值详情（L1 详情双件套之一；UI-RESEARCH §2.3/§3）────────
+// 绑定一个模型对象，渲染 键|值 两列（标量原样；嵌套对象/数组
+// compact JSON 单行——下钻用 ui::tree）。键序：-keys 显式优先（只
+// 渲染列出的键），否则模型插入序。子路径增量原位更新单行；嵌套
+// 子路径（/info/a/b）合成进本地视图后重绘（详情对象小，重建成本
+// 可忽略）。
+//
+// 运行时 model 是 path->值 的平表（写 /info/a 不改 /info 对象本身，
+// Table 的 /pods/i 同源设计）：容器组件按增量把子路径写进自己的
+// 本地视图，全量 set 根路径时以根值为权威快照。
+function viewDelta(root, segs, value) {
+  if (segs.length === 0) return value;
+  const obj = (root !== null && typeof root === 'object') ? root : {};
+  let cur = obj;
+  for (let i = 0; i < segs.length - 1; i++) {
+    const k = segs[i];
+    const nxt = cur[k];
+    if (nxt === null || typeof nxt !== 'object') cur[k] = {};
+    cur = cur[k];
+  }
+  const last = segs[segs.length - 1];
+  if (value === undefined) delete cur[last]; else cur[last] = value;
+  return obj;
+}
+
+function kvFmt(v) {
+  if (v === null) return 'null';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+
+function kvRender(st) {
+  const v = st.value;
+  if (v !== undefined && v !== null && typeof v !== 'object') {
+    throw new Error(`Kv ${st.path}: model "${st.bindPath}" must be a JSON object`);
+  }
+  let keys = [];
+  if (v !== undefined && v !== null) {
+    const own = Object.keys(v);
+    const wanted = Array.isArray(st.keysOrder) && st.keysOrder.length ? st.keysOrder : own;
+    keys = wanted.filter(k => own.includes(k));   // -keys 列出的缺失键跳过
+  }
+  st.rows.clear();
+  if (v === undefined || keys.length === 0) {
+    const empty = h('div', 'rui-kv-empty');
+    empty.textContent = st.bindPath ? '(no entries)' : '(no -path)';
+    st.el.replaceChildren(empty);
+    return;
+  }
+  const nodes = [];
+  for (const k of keys) {
+    const row = h('div', 'rui-kv-row');
+    const kEl = h('div', 'rui-kv-k');
+    kEl.textContent = k;
+    kEl.title = k;
+    const vEl = h('div', 'rui-kv-v');
+    vEl.textContent = kvFmt(v[k]);
+    row.append(kEl, vEl);
+    nodes.push(row);
+    st.rows.set(k, { row, vEl });
+  }
+  st.el.replaceChildren(...nodes);
+}
+
+function kvOnModelEvent(st, sub, v) {
+  if (sub === undefined || sub === st.bindPath) { st.value = v; kvRender(st); return; }
+  const segs = sub.slice(st.bindPath.length + 1).split('/');
+  st.value = viewDelta(st.value, segs, v);
+  const row = segs.length === 1 ? st.rows.get(segs[0]) : undefined;
+  if (row !== undefined && v !== undefined) {
+    row.vEl.textContent = kvFmt(v);   // 单键原位更新（不重建其它行）
+  } else {
+    kvRender(st);                     // 嵌套/新键/删除：重建本地视图
+  }
+}
+
+runtime.registerRenderer('Kv', {
+  create(path, props, hp) {
+    const el = h('div', 'rui-kv');
+    const st = {
+      path, bindPath: typeof hp.bind === 'object' ? hp.bind.path : null,
+      el, value: undefined, keysOrder: Array.isArray(props.keys) ? props.keys : [],
+      rows: new Map(),
+    };
+    el._kv = st;
+    if (hp.bind) {
+      hp.bind.subscribe((v, sub) => kvOnModelEvent(st, sub, v));
+      const init = hp.bind.get();
+      if (init !== undefined) st.value = init;
+    }
+    kvRender(st);
+    return el;
+  },
+  update(el, props, hp) {
+    const st = el._kv;
+    if (!st) return;
+    if ('keys' in props) { st.keysOrder = Array.isArray(props.keys) ? props.keys : []; kvRender(st); }
+  },
+});
+
+// ── Tree：JSON 树（详情双件套之二）──────────────────────────────
+// 绑定任意 JSON 值。容器（对象/数组）默认折叠并给预览计数；展开
+// 状态存在客户端（Set，id = 段路径的 JSON 编码，键里带 "/" 也不
+// 歧义），每次切换/模型更新按可见节点重建（DOM 只物化展开路径——
+// "懒加载子节点"）。标量节点单行。u::on 类行事件 v1 不做。
+const TREE_INDENT = 14;
+
+function treeIsContainer(v) { return v !== null && typeof v === 'object'; }
+function treePreview(v) {
+  if (Array.isArray(v)) return `[…] ${v.length} items`;
+  return `{…} ${Object.keys(v).length} keys`;
+}
+function treeScalar(v) {
+  if (v === undefined) return '(deleted)';
+  if (v === null) return 'null';
+  if (typeof v === 'object') return Array.isArray(v) ? `[… ${v.length}]` : `{… ${Object.keys(v).length}}`;
+  return String(v);
+}
+
+function treeRender(st) {
+  const lines = [];
+  const walk = (value, label, depth, segs) => {
+    const id = JSON.stringify(segs);
+    const row = h('div', 'rui-tree-row');
+    row.dataset.id = id;
+    row.style.paddingLeft = (depth * TREE_INDENT) + 'px';
+    const arrow = h('span', 'rui-tree-arrow');
+    const lab = h('span', 'rui-tree-label');
+    lab.textContent = label;
+    row.append(arrow, lab);
+    if (treeIsContainer(value)) {
+      const open = st.expanded.has(id);
+      arrow.textContent = open ? '▾' : '▸';
+      row.classList.add('rui-tree-cont');
+      if (!open) {
+        const prev = h('span', 'rui-tree-prev');
+        prev.textContent = treePreview(value);
+        row.append(prev);
+        lines.push(row);
+        return;
+      }
+      lines.push(row);
+      const childKeys = Array.isArray(value) ? value.map((_, i) => i) : Object.keys(value);
+      for (const ck of childKeys) {
+        const childLabel = Array.isArray(value) ? `[${ck}]` : String(ck);
+        walk(value[ck], childLabel, depth + 1, segs.concat([typeof ck === 'number' ? '#' + ck : 'k:' + ck]));
+      }
+    } else {
+      arrow.textContent = ' ';
+      const val = h('span', 'rui-tree-val');
+      val.textContent = treeScalar(value);
+      row.append(val);
+      lines.push(row);
+    }
+  };
+  const root = st.value;
+  const rootLabel = treeIsContainer(root) ? '(root)' : 'value';
+  if (root === undefined) {
+    st.el.replaceChildren();
+    return;
+  }
+  walk(root, rootLabel, 0, []);
+  st.el.replaceChildren(...lines);
+}
+
+runtime.registerRenderer('Tree', {
+  create(path, props, hp) {
+    const el = h('div', 'rui-tree');
+    const st = {
+      path, bindPath: typeof hp.bind === 'object' ? hp.bind.path : null,
+      el, value: undefined, expanded: new Set(),
+    };
+    el._tree = st;
+    if (hp.bind) {
+      hp.bind.subscribe((v, sub) => {
+        if (sub === undefined || sub === st.bindPath) st.value = v;
+        else st.value = viewDelta(st.value, sub.slice(st.bindPath.length + 1).split('/'), v);
+        treeRender(st);
+      });
+      const init = hp.bind.get();
+      if (init !== undefined) st.value = init;
+    }
+    el.addEventListener('click', (e) => {
+      const row = e.target.closest('.rui-tree-row');
+      if (!row || !row.classList.contains('rui-tree-cont')) return;
+      const id = row.dataset.id;
+      if (st.expanded.has(id)) st.expanded.delete(id); else st.expanded.add(id);
+      treeRender(st);
+    });
+    treeRender(st);
+    return el;
+  },
+  update(el, props, hp) {
+    // v1: -path 变化走重建；布局选项由 runtime 统一应用
+  },
+});
 }
 
 // ── 默认暗色主题（样式全在这里，渲染器不带样式）────────────────────────
@@ -658,6 +855,22 @@ export function injectUiStyles() {
 .rui-log-line.rui-lv-warn { color:#d29922; }
 .rui-log-line.rui-lv-error { color:#f85149; }
 .rui-log-line.rui-lv-debug { color:#8b949e; }
+/* ui::kv —— 键值详情；行不虚拟化（详情对象小），长值换行。 */
+.rui-kv { background:#0d1117; border:1px solid #30363d; border-radius:6px; font-size:12px; color:#c9d1d9; overflow:hidden; }
+.rui-kv-row { display:flex; gap:12px; padding:4px 10px; border-bottom:1px solid #21262d; align-items:flex-start; }
+.rui-kv-row:last-child { border-bottom:none; }
+.rui-kv-k { flex:0 0 28%; max-width:28%; color:#8b949e; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.rui-kv-v { flex:1 1 auto; min-width:0; white-space:pre-wrap; word-break:break-word; }
+.rui-kv-empty { padding:8px 10px; color:#8b949e; font-size:12px; }
+/* ui::tree —— JSON 树；容器行可点（▸/▾），展开才物化子节点。 */
+.rui-tree { background:#0d1117; border:1px solid #30363d; border-radius:6px; max-height:320px; overflow:auto; padding:4px 0; font:12px/20px ui-monospace, SFMono-Regular, Menlo, monospace; color:#c9d1d9; }
+.rui-tree-row { display:flex; align-items:center; gap:6px; padding:0 10px; white-space:nowrap; cursor:default; }
+.rui-tree-row.rui-tree-cont { cursor:pointer; }
+.rui-tree-row.rui-tree-cont:hover { background:#161b22; }
+.rui-tree-arrow { flex:0 0 12px; color:#8b949e; text-align:center; }
+.rui-tree-label { color:#79c0ff; }
+.rui-tree-prev { color:#8b949e; }
+.rui-tree-val { color:#c9d1d9; overflow:hidden; text-overflow:ellipsis; }
 `;
   document.head.appendChild(style);
 }

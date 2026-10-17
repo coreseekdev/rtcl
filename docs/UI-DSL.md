@@ -1,5 +1,7 @@
 # rtcl Web UI DSL（ui::*）契约 v1
 
+
+
 状态：草案（开发中）。本文件冻结 web shell 右侧面板的 UI DSL 契约，
 是 Tcl 词表层、Rust 桥接层、JS 运行时三方的共同依据。
 
@@ -189,3 +191,40 @@ ui::define Button {
 - M5 候选：Worker 形态（`after`/`vwait` 纪律在 Worker 下才完整
   生效）、`query` op、L1 分子组件（table/chart/log）、markdown
   text、Base UI/TanStack 替换纯 DOM 渲染器
+- M5 ✅ `ui::table` v1（L1 首个分子组件，2025-10-17）：词表
+  （Table define：`-path` bind、`-columns` list kind、
+  `-rowactions` script）+ JS 渲染器（虚拟滚动 spacer/池 + 行级
+  增量复用节点 + 事件委托）+ demo/验收页（M1 明细见
+  crates/rtcl-wasm/www/ui-table-acc.html，落地中的契约缺口收进
+  本文件 §8）
+
+## 8. 变更建议（v1 落地中发现的缺口；本节只记录，未改协议）
+
+以下条目在 `ui::table`（M5 首个 L1 分子组件，已落地）实现过程中
+踩实，属于**契约缺口候选**，等下一轮契约评审定夺再进 §2 正文：
+
+1. **事件行级 detail**：`::ui::fire 路径 事件 ?detail?`（第三参
+   可选，目前仅行场景使用；action 脚本里以 `$ui_row` 读行
+   号——Tk `%` 替换的轻量替身，回调结束后
+   `unset -nocomplain ui_row` 复位）。若事件未来改走 JSON 形状
+   （§2.4 的 JSON 行方案），建议该形状增加 `detail` 字段，别把
+   行号塞进事件名。
+2. **bind 订阅前缀扇出**：Table 订阅 `/pods` 时，`ui::model set
+   /pods/42 …` 也要送达（回调第二参 = 实际变更路径；第一参 =
+   绑定前缀处的整值）。Field/Checkbox 只消费第一参，行为不变。
+   建议 §2.2 正文补一句"订阅按前缀匹配，回调第二参携带变更
+   路径"。
+3. **cell 级模型增量需行值为 dict**：`ui::model set /pods/42/status
+   X` 下钻标量行报 `missing value to go with key`（dict set 语义，
+   tclsh 8.6 同源，非 bug）。Table v1 不依赖 cell 级：行值整体
+   替换；若要 cell 级，行必须存 dict（契约 §2.2 未写这层前提）。
+4. **`ui::model sync`**（§2.2 已列）：ui.tcl 词表未实现，快照走
+   `ui::snapshot` 反生成脚本路线（§2.6）。落地时建议明确它与
+   snapshot 的分工：sync = 一次性全量推桥（初始挂载），snapshot
+   = 反生成等价构建脚本（协作折叠）。
+
+实现里程碑取证（Ark 旁注，非契约）：喂数吞吐依赖嵌套 `dict set`
+的就地快路径（rtcl 解释器侧，2025-10-17 起 `feedpods 100000` ≈
+2.4s，rtcl-cli 基准见 commit 3101690）；喂数脚本里 `format` 的
+参数必须与命令同物理行（`[...]` 内完整命令后的换行即命令终结
+符，tclsh 同源）。

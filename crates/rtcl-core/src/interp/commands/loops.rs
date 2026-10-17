@@ -445,14 +445,14 @@ pub fn cmd_time(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         1
     };
 
-    let start = std::time::Instant::now();
+    let start_ms = interp.clock.now_ms();
     for _ in 0..count {
         interp.charge_step()?;
         let _ = interp.eval_body_value(script)?;
     }
-    let elapsed = start.elapsed();
+    let elapsed_ms = interp.clock.now_ms() - start_ms;
     let us_per_iter = if count > 0 {
-        elapsed.as_micros() as f64 / count as f64
+        elapsed_ms * 1000.0 / count as f64
     } else {
         0.0
     };
@@ -492,18 +492,18 @@ pub fn cmd_timerate(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         u64::MAX
     };
 
-    let deadline = std::time::Duration::from_millis(duration_ms);
-    let start = std::time::Instant::now();
+    let deadline_ms = interp.clock.now_ms() + duration_ms as f64;
+    let start_ms = interp.clock.now_ms();
     let mut count: u64 = 0;
 
-    while start.elapsed() < deadline && count < max_count {
+    while interp.clock.now_ms() < deadline_ms && count < max_count {
         let _ = interp.eval_body_value(script)?;
         count += 1;
     }
 
-    let elapsed = start.elapsed();
+    let elapsed_ms = interp.clock.now_ms() - start_ms;
     let us_per_iter = if count > 0 {
-        elapsed.as_micros() as f64 / count as f64
+        elapsed_ms * 1000.0 / count as f64
     } else {
         0.0
     };

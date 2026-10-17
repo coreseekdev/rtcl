@@ -8,23 +8,19 @@
 //! - `after info ?id?` — list or query scheduled events
 //! - `vwait varName` — enter event loop until variable changes
 //! - `update ?idletasks?` — process pending events
+//!
+//! Timing goes through the host clock ([`crate::host::HostClock`]): native
+//! builds sleep for real; hosts that cannot block (browser Worker) reject
+//! `after ms` and `vwait`'s blocking-wait branch with a Tcl error, steering
+//! scripts to the event-driven `after ms script` form (docs/UI-DSL.md §4).
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::interp::Interp;
 use crate::value::Value;
 
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
-
-/// Process-wide epoch for monotonic time.
-fn epoch() -> &'static Instant {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    EPOCH.get_or_init(Instant::now)
-}
-
-/// Current monotonic time in milliseconds since process start.
-fn now_ms() -> u64 {
-    epoch().elapsed().as_millis() as u64
+/// Current monotonic time in milliseconds, from the host clock.
+fn now_ms(interp: &Interp) -> u64 {
+    interp.clock.now_ms() as u64
 }
 
 // ---------- after ----------
@@ -54,8 +50,12 @@ pub fn cmd_after(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             })?;
 
             if args.len() == 2 {
-                // after ms — synchronous sleep
-                std::thread::sleep(Duration::from_millis(ms));
+                // after ms — synchronous sleep. Hosts that cannot block
+                // (browser Worker) reject it; there one must use the
+                // event-driven `after ms script` form instead.
+                interp.clock.sleep_ms(ms).map_err(|e| {
+                    Error::runtime(format!("after: {e}"), ErrorCode::Generic)
+                })?;
                 Ok(Value::empty())
             } else {
                 // after ms script ?script ...? — schedule timed event
@@ -78,7 +78,7 @@ pub fn cmd_after(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 fn schedule_event(interp: &mut Interp, delay_ms: u64, script: String, is_idle: bool) -> u64 {
     let id = interp.next_event_id;
     interp.next_event_id += 1;
-    let fire_at_ms = if is_idle { 0 } else { now_ms() + delay_ms };
+    let fire_at_ms = if is_idle { 0 } else { now_ms(interp) + delay_ms };
     interp.event_queue.push(crate::interp::TimedEvent {
         id,
         fire_at_ms,
@@ -193,7 +193,7 @@ pub fn cmd_vwait(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     loop {
         // Process at least one round of events
-        let processed = process_events(interp, false)?;
+        let processed = process_events(interp, false, None)?;
 
         // Check if variable has changed
         let current = interp.get_var(varname).ok().map(|v| v.as_str().to_string());
@@ -216,13 +216,18 @@ pub fn cmd_vwait(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .map(|ev| ev.fire_at_ms)
                 .min();
             if let Some(fire_at) = next_fire {
-                let now = now_ms();
+                let now = now_ms(interp);
                 if fire_at > now {
-                    std::thread::sleep(Duration::from_millis(fire_at - now));
+                    // Blocking wait. Hosts that cannot sleep (browser
+                    // Worker) reject this — waiting on external events
+                    // there must be event-driven, not `vwait`-driven.
+                    interp.clock.sleep_ms(fire_at - now).map_err(|e| {
+                        Error::runtime(format!("vwait: {e}"), ErrorCode::Generic)
+                    })?;
                 }
             } else {
                 // Only idle events — process them
-                process_events(interp, true)?;
+                process_events(interp, true, None)?;
             }
         }
     }
@@ -252,7 +257,7 @@ pub fn cmd_update(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // Process all currently-ready events (non-blocking)
     loop {
-        let processed = process_events(interp, idle_only)?;
+        let processed = process_events(interp, idle_only, None)?;
         if processed == 0 {
             break;
         }
@@ -261,13 +266,51 @@ pub fn cmd_update(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::empty())
 }
 
+// ---------- Host-facing event injection ----------
+
+impl Interp {
+    /// 外部事件入队（UI 事件、宿主回调）：作为立即触发的事件进入事件
+    /// 队列，由 `update`/`vwait`/[`Interp::pump_events`] 消费。
+    pub fn post_event(&mut self, script: &str) {
+        let id = self.next_event_id;
+        self.next_event_id += 1;
+        self.event_queue.push(crate::interp::TimedEvent {
+            id,
+            fire_at_ms: 0,
+            script: script.to_string(),
+            is_idle: false,
+        });
+    }
+
+    /// 泵入并执行所有就绪事件（含 [`Interp::post_event`] 注入的外部
+    /// 事件）。与 `update` 不同：事件脚本的错误不静默，收集后一并
+    /// 返回，供宿主（wasm 桥）把 UI 回调错误呈现到 shell。
+    /// 返回错误消息列表（空 = 全部成功）。
+    pub fn pump_events(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        loop {
+            match process_events(self, false, Some(&mut errors)) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    errors.push(e.to_string());
+                    break;
+                }
+            }
+        }
+        errors
+    }
+}
+
 // ---------- Event processing ----------
 
 /// Process ready events from the queue. Returns the number of events fired.
 ///
 /// If `idle_only` is true, only idle events are processed.
-fn process_events(interp: &mut Interp, idle_only: bool) -> Result<usize> {
-    let now = now_ms();
+/// Script errors are ignored (like jimtcl's bgerror handling) unless
+/// `errors` is provided, in which case messages are collected there.
+fn process_events(interp: &mut Interp, idle_only: bool, mut errors: Option<&mut Vec<String>>) -> Result<usize> {
+    let now = now_ms(interp);
     let mut fired = 0;
 
     // Collect indices of ready events (fire in order of scheduling)
@@ -288,7 +331,11 @@ fn process_events(interp: &mut Interp, idle_only: bool) -> Result<usize> {
         fired += 1;
 
         // Execute the script, ignoring errors (like jimtcl's bgerror handling)
-        let _ = interp.eval_isolated(&ev.script);
+        if let Err(e) = interp.eval_isolated(&ev.script) {
+            if let Some(sink) = errors.as_deref_mut() {
+                sink.push(e.to_string());
+            }
+        }
     }
 
     Ok(fired)
@@ -408,5 +455,30 @@ mod tests {
         interp.eval("update").unwrap();
         let r = interp.eval("set result").unwrap();
         assert_eq!(r.as_str(), "abc");
+    }
+
+    #[test]
+    fn test_post_event_and_pump() {
+        let mut interp = Interp::new();
+        interp.post_event("set injected hello");
+        interp.post_event("set second world");
+        let errors = interp.pump_events();
+        assert!(errors.is_empty(), "clean pump: {:?}", errors);
+        assert_eq!(interp.eval("set injected").unwrap().as_str(), "hello");
+        assert_eq!(interp.eval("set second").unwrap().as_str(), "world");
+        // Queue drained
+        assert!(interp.eval("after info").unwrap().as_str().is_empty());
+    }
+
+    #[test]
+    fn test_pump_events_collects_errors() {
+        let mut interp = Interp::new();
+        interp.post_event("nosuchcmd x");
+        interp.post_event("set survived 1");
+        let errors = interp.pump_events();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("nosuchcmd"));
+        // Later events still fire after an error
+        assert_eq!(interp.eval("set survived").unwrap().as_str(), "1");
     }
 }

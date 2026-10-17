@@ -699,6 +699,10 @@ pub struct Interp {
     /// 宿主控制台服务：无 `io` 特性构建里 `puts` 的 stdout/stderr 落点
     /// （原生 stdio，或 wasm 宿主注入的 JS 实现）。
     pub(crate) console: Box<dyn crate::host::HostConsole>,
+    /// 时钟服务：`after`/`vwait`/`time` 的 now/sleep 落点
+    /// （原生 `Instant`，或 wasm 宿主注入的 JS 实现）。
+    #[cfg(feature = "std")]
+    pub(crate) clock: Box<dyn crate::host::HostClock>,
     /// Alias definitions (name → target + prefix args).
     pub(crate) aliases: HashMap<String, commands::introspect::AliasInfo>,
     /// Reference table for ref/getref/setref.
@@ -866,6 +870,8 @@ impl Interp {
             #[cfg(feature = "std")]
             next_event_id: 1,
             #[cfg(feature = "std")]
+            clock: Box::new(crate::host::NativeClock),
+            #[cfg(feature = "std")]
             child_interps: HashMap::new(),
             #[cfg(feature = "std")]
             next_interp_id: 1,
@@ -892,10 +898,25 @@ impl Interp {
         }
     }
 
+    /// 加载 ui::* 词表层（契约见 docs/UI-DSL.md）。宿主须先注册 `_ui`
+    /// 桥命令（wasm：JS op 汇聚点；原生测试：记录器）。词表命令在
+    /// 调用时才解析 `_ui`，所以注册可以晚于加载。
+    pub fn load_ui(&mut self) -> crate::error::Result<()> {
+        const UI_TCL: &str = include_str!("../ui.tcl");
+        self.eval(UI_TCL).map(|_| ())
+    }
+
     /// 注入宿主控制台实现（wasm 宿主由此把 `puts` 的输出接到 JS 回调；
     /// 原生构建默认已是 [`crate::host::NativeConsole`]，无需调用）。
     pub fn set_console(&mut self, console: Box<dyn crate::host::HostConsole>) {
         self.console = console;
+    }
+
+    /// 注入宿主时钟实现（wasm 宿主由此给 `after`/`vwait`/`time` 接上
+    /// JS 时钟；原生构建默认已是 [`crate::host::NativeClock`]，无需调用）。
+    #[cfg(feature = "std")]
+    pub fn set_clock(&mut self, clock: Box<dyn crate::host::HostClock>) {
+        self.clock = clock;
     }
 
     /// A1 eval 步数预算：武装 `Some(n)` = 每次 eval 的命令步数上限，

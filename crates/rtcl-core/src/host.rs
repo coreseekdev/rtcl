@@ -72,8 +72,36 @@ pub trait HostFs: Send {}
 /// 环境变量服务：`$env` 数组与 `info exists env(...)` 的宿主接缝。
 pub trait HostEnv: Send {}
 
-/// 时钟服务：`clock seconds`/`clock clicks`/`after` 计时的宿主接缝。
-pub trait HostClock: Send {}
+/// 时钟服务：`after`/`vwait` 计时与 `time`/`timerate` 测量的宿主接缝。
+///
+/// 原生构建默认使用 [`NativeClock`]；wasm 宿主经 `Interp::set_clock`
+/// 注入 JS 实现（`Date.now`）。浏览器无法同步睡眠：wasm 宿主的
+/// [`HostClock::sleep_ms`] 返回 `Err`，`after ms`（无脚本的同步睡眠）
+/// 与 `vwait` 的阻塞等待分支因此报 Tcl 错误——浏览器脚本必须用
+/// `after ms script` 的事件驱动形式（见 docs/UI-DSL.md §4）。
+pub trait HostClock: Send {
+    /// 单调毫秒（允许亚毫秒精度），起点宿主自定义、仅要求自洽。
+    fn now_ms(&self) -> f64;
+    /// 同步睡眠。浏览器宿主返回 `Err`（Worker 内阻塞会饿死事件投递）。
+    fn sleep_ms(&self, ms: u64) -> Result<(), String>;
+}
+
+/// std 原生时钟：`Instant` 计时 + `thread::sleep`。
+#[cfg(feature = "std")]
+pub struct NativeClock;
+
+#[cfg(feature = "std")]
+impl HostClock for NativeClock {
+    fn now_ms(&self) -> f64 {
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
+    }
+
+    fn sleep_ms(&self, ms: u64) -> Result<(), String> {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        Ok(())
+    }
+}
 
 /// 进程执行服务：`exec`/`open |cmd` 的宿主接缝（浏览器下不存在，
 /// 对应 feature 在 wasm 组合里天然缺席）。

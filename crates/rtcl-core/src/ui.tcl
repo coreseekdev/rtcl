@@ -639,3 +639,15 @@ proc ::ui::model {sub args} {
 ::ui::define Chart {
     -vegalite {json {} {}}
 }
+
+# 分布式 trace 瀑布（L1 渲染新原语；UI-RESEARCH §3.1）。-path 是
+# bind 类选项：span 树 {name, start_ms, dur_ms, children[]}（也接受
+# span 数组 = 多根）。甘特式时间轴：每 span 一行，条的位置/宽度按
+# 完整树的全局 [min start, max end] 域百分比摆放——折叠子树不改变
+# 对齐；点击名字/箭头折叠（默认全展开），点击条缩放到该 span 的时
+# 间窗（再点复位），点轨道空白复位缩放。折叠/缩放纯客户端，不触
+# Tcl。树里缺数值 start_ms/dur_ms 的 span 防御性跳过（数据质量归
+# 喂数侧，UI-DSL.md §8 条目 13）。
+::ui::define Trace {
+    -path {bind {} {}}
+}

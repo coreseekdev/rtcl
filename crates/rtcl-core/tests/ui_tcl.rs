@@ -576,3 +576,34 @@ fn chart_catalog_shows_options_and_layout() {
     let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
     assert!(all.contains("Chart"), "{all}");
 }
+
+// ── Trace：span 树瀑布词表层 ─────────────────────────────────
+
+#[test]
+fn trace_create_emits_shape() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp
+        .eval(r#"ui::trace .s.tr -path /trace -weight 1 -fill x"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    assert!(
+        log.contains(concat!(
+            r#"{"op":"create","path":".s.tr","type":"Trace","#,
+            r#""props":{"bind":"\/trace","weight":1,"fill":"x"},"events":[]}"#
+        )),
+        "trace create op: {log}"
+    );
+}
+
+#[test]
+fn trace_catalog_shows_options_and_layout() {
+    let mut interp = setup();
+    let c = interp.eval("ui::catalog Trace").unwrap().as_str().to_string();
+    for opt in ["-path", "-fill", "-weight"] {
+        assert!(c.contains(opt), "catalog Trace missing {opt}: {c}");
+    }
+    assert!(c.contains("bind"), "{c}");
+    let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
+    assert!(all.contains("Trace"), "{all}");
+}

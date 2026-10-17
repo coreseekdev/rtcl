@@ -234,6 +234,20 @@ proc feedlog {n {chunk 2000}} {
 }
 `);
 
+  // M10: ui::confirm —— 模态动作异步回灌（禁 vwait）。-command 绑 ok
+  // 事件；Cancel 回灌 cancel（ui::on 绑定）。configure 改 preview 会
+  // 重新武装——demo 里 Confirm 后换成结果消息，可反复点。
+  rtcl.exec(`
+ui::batch {
+  ui::surface .z -title "Danger zone"
+  ui::text .z.hint -variant caption -text "modal action: -command fires async on Confirm (script never blocks)"
+  ui::confirm .z.conf -danger 1 \\
+      -preview {{"action":"delete issue","issue":"SENTRY-42","affected":3}} \\
+      -command {puts "CONFIRMED (async): would delete SENTRY-42 · 3 affected"; ui::configure .z.conf -preview {"executed — configure re-arms for the next question"}}
+}
+ui::on .z.conf cancel {puts "cancelled — no action taken"}
+`);
+
   shell.print('rtcl ' + (rtcl.exec('info patchlevel') || '') + ' — ui demo ready.', 'result');
   shell.print('try:  % ui::text .s.main.note -text hello -variant caption', 'hint');
   shell.print('      % feedpods 100000        ;# 10 万行游标喂数 → .p 表格', 'hint');

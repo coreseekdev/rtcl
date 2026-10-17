@@ -43,7 +43,11 @@ export function createUiRuntime(root, opts = {}) {
     if ('width' in props) el.style.width = cssSize(props.width);
     if ('height' in props) el.style.height = cssSize(props.height);
     if ('align' in props) el.style.alignSelf = ALIGN_MAP[props.align] ?? props.align;
-    if ('weight' in props) el.style.flex = `${props.weight} 1 0`;
+    // Tk -weight 语义：分配（父容器的）额外空间，保留自然尺寸。
+    // flex-basis 必须是 auto——basis 0 会把固定设计高的组件在
+    // auto 高的 flex column 父里塌到零贡献（rect 2px，M5 的 table
+    // 就因此整体不可见，被 clientHeight||320 的虚拟化回退掩盖）。
+    if ('weight' in props) el.style.flex = `${props.weight} 1 auto`;
     if ('fill' in props) {
       const f = props.fill;
       if (axis === null) {
@@ -563,32 +567,45 @@ function logOnModelEvent(st, sub, v) {
   if (/^\d+$/.test(rest)) logLineDelta(st, +rest, v);
 }
 
+// 行事件绑定：create 与 update（ui::on 后挂 → set op 携带 events）都
+// 进这里；幂等（只挂一次）。事件名是 Tcl 侧的转发开关。
+function logBindEvents(st, el, events) {
+  if (st.clickBound || !Array.isArray(events) || !events.includes('lineclick')) return;
+  st.clickBound = true;
+  el.addEventListener('click', (e) => {
+    const line = e.target.closest('.rui-log-line');
+    if (line) st.fire('lineclick', line.dataset.idx);
+  });
+}
+
 runtime.registerRenderer('Log', {
   create(path, props, hp) {
     const el = h('div', 'rui-log');
     const spacer = h('div', 'rui-log-spacer');
     el.append(spacer);
-    const st = { path, bindPath: typeof hp.bind === 'object' ? hp.bind.path : null, el, spacer, rows: [], n: 0, pool: new Map(), pending: false, following: true };
+    const st = { path, bindPath: typeof hp.bind === 'object' ? hp.bind.path : null, el, spacer, rows: [], n: 0, pool: new Map(), pending: false, following: true, clickBound: false };
     el._log = st;
     if (hp.bind) {
       hp.bind.subscribe((v, sub) => logOnModelEvent(st, sub, v));
       const init = hp.bind.get();
       if (init !== undefined) logSetDataAll(st, init);
     }
+    st.fire = hp.fire;
+    logBindEvents(st, el, hp.events);
     el.addEventListener('scroll', () => {
       st.following = st.el.scrollTop + st.el.clientHeight >= st.el.scrollHeight - LOG_ROW_H;
       logScheduleWindow(st);
     }, { passive: true });
-    if (Array.isArray(hp.events) && hp.events.includes('lineclick')) {
-      el.addEventListener('click', (e) => {
-        const line = e.target.closest('.rui-log-line');
-        if (line) hp.fire('lineclick', line.dataset.idx);
-      });
-    }
     logRenderWindow(st);
     return el;
   },
-  update(el, props, hp) { /* v1: Log 无专有可更新选项（-path 变化走重建） */ },
+  update(el, props, hp) {
+    // v1: Log 无专有可更新选项（-path 变化走重建）；事件走这里后挂
+    const st = el._log;
+    if (!st) return;
+    st.fire = hp.fire;
+    logBindEvents(st, el, hp.events);
+  },
 });
 }
 

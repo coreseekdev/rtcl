@@ -158,10 +158,16 @@ runtime.applyOps([{ op: 'model', sub: 'unset', path: '/deploylog/317' }]);
 ok(st.rows[317] === undefined, 'unset leaves hole in cache');
 ok(st.pool.get(317)?._text.textContent === '', 'hole renders empty line');
 
-// 非 lineclick events → 不挂委托
+// 非 lineclick events → 不挂委托；ui::on 后挂（set op 带 events）→ update 补挂
 runtime.applyOps([{ op: 'create', path: '.quiet', type: 'Log', props: { bind: '/q' }, events: [] }]);
 const q = root.children[1];
 ok(q._log && !q.listeners.click, 'no delegate when events empty');
+runtime.applyOps([{ op: 'set', path: '.quiet', props: {}, events: ['lineclick'] }]);
+ok(q._log.clickBound === true && q.listeners.click?.length === 1, 'ui::on later attach binds via update (idempotent)');
+runtime.applyOps([{ op: 'model', sub: 'set', path: '/q/0', value: { level: 'info', text: 'x' } }]);
+flushRaf();
+q._log.pool.get(0).dispatchEv('click', { target: q._log.pool.get(0) });
+ok(fired[fired.length - 1]?.[0] === '.quiet' && fired[fired.length - 1]?.[1] === 'lineclick', 'later-attached delegate fires lineclick', fired[fired.length - 1]);
 
 // 错误回路：非数组全量喂 → onError（不静默）
 runtime.applyOps([{ op: 'create', path: '.bad', type: 'Log', props: { bind: '/x' } }]);

@@ -71,7 +71,7 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 |---|---|
 | 单页静态打包 | wasm+js+html 一目录，离线可跑（build.sh 已半就位） |
 | 脚本存档/分享 | dashboard = 可重放 Tcl 脚本；git 可 diff；`source` 即部署 |
-| LLM 回路 | `ui::catalog` → prompt 词表；safe interp 执行；错误结构化回执（契约 §5/§6） |
+| LLM 回路 | `ui::catalog` → prompt 词表；safe interp 执行；错误结构化回执（契约 §5/§6）；**流式渲染免费拥有**——LLM 逐行产出 Tcl 命令即逐条渲染，无需专用增量解析器（对照 docs/UI-GENUI.md）；修改走 append-only delta + `ui::snapshot` 折叠基线（契约 §2.6） |
 | 主题系统 | CSS 变量已起步；主题包 = 一段 CSS 文件；词表零感知 |
 
 ## 6. UI 设计器问题：做检视器，不做设计器

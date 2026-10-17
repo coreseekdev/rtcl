@@ -111,6 +111,25 @@ ui::define Button {
 - 喂 LLM 的 prompt 从 catalog **生成**，与实现不漂移
 - safe interp 策略：可按词条裁剪（如只放行 `ui::model` 域）
 
+### 2.6 协作纪律：append-only 修改与快照折叠
+
+- 所有 UI 变更以**追加**形式发生：改属性 = 追加 `ui::configure`；
+  删除 = 追加 `ui::destroy`（墓碑）。协作历史（transcript）
+  不被改写。多生成源（人 / LLM / 规则 proc / 事件回调）共享同一
+  追加流：无锁无争，顺序即历史。
+- **快照折叠**：`ui::snapshot path ?-model /prefix?` 从注册表
+  反生成等价构建脚本（create 命令序列，含 props 与 -command；
+  `-model` 附带导出模型切片为 `ui::model set` 行）。
+  性质：snapshot 是纯函数（当前状态 → 脚本）；
+  snapshot + 后续 delta ≡ 完整历史。
+- 用途：分享/部署（新会话 `source` 即重建）；日志压缩（折叠点
+  之前可弃）；**LLM 上下文管理**——长 delta 流折叠为基线，
+  生成者只见基线 + 其后 delta，避免全量重生成的视图状态丢失
+  与 token 浪费（生成式 UI 生态对照见 docs/UI-GENUI.md）。
+- 语义损失声明（v1）：bind 统一重建为 `-path`（`-variable` 糖
+  不还原）；同一事件的多个回调脚本，首个并入创建行 `-command`，
+  其余重建为 `ui::on` 行。
+
 ## 3. op 协议（桥线格式）
 
 `_ui` 是唯一注册到 JS 的命令，载荷是 JSON 的 op 数组：

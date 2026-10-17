@@ -709,3 +709,54 @@ fn json_kind_accepts_scalars_rejects_empty() {
     let e = interp.eval(r#"ui::confirm .s.e -preview {}"#).unwrap_err();
     assert!(e.to_string().contains("expected JSON"), "{e}");
 }
+
+// ── Form：schema 驱动表单（-command 绑 commit）────────────────
+
+#[test]
+fn form_create_emits_shape_and_binds_commit() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp
+        .eval(r#"ui::form .s.f -path /form -schema {{"type":"object","properties":{"email":{"type":"string","title":"Email"}},"required":["email"]}} -command {set ::submitted 1}"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    assert!(
+        log.contains(concat!(
+            r#"{"op":"create","path":".s.f","type":"Form","#,
+            r#""props":{"bind":"\/form","schema":{"type":"object","properties":{"email":{"type":"string","title":"Email"}},"required":["email"]}},"events":["commit"]}"#
+        )),
+        "form create op: {log}"
+    );
+    assert!(!log.contains("set ::submitted"), "command script must not cross: {log}");
+}
+
+#[test]
+fn form_commit_relay_and_error_path() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp
+        .eval(r#"ui::form .s.f -path /form -schema {{"type":"object","properties":{}}} -command {set ::submitted 1}"#)
+        .unwrap();
+    // 创建后脚本跑到底（不阻塞）
+    assert_eq!(interp.eval("info exists ::submitted").unwrap().as_str(), "0");
+    interp.post_event("::ui::fire .s.f commit");
+    let errors = interp.pump_events();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(interp.eval("set ::submitted").unwrap().as_str(), "1");
+
+    // 非法 schema JSON → Tcl 错误
+    let e = interp.eval(r#"ui::form .s.bad -schema {nope}"#).unwrap_err();
+    assert!(e.to_string().contains("expected JSON"), "{e}");
+}
+
+#[test]
+fn form_catalog_shows_options_and_layout() {
+    let mut interp = setup();
+    let c = interp.eval("ui::catalog Form").unwrap().as_str().to_string();
+    for opt in ["-path", "-schema", "-command", "-fill", "-weight"] {
+        assert!(c.contains(opt), "catalog Form missing {opt}: {c}");
+    }
+    assert!(c.contains("bind"), "{c}");
+    let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
+    assert!(all.contains("Form"), "{all}");
+}

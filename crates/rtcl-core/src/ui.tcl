@@ -236,8 +236,10 @@ proc ::ui::_parse_options {type path optvals} {
                 # 收到"转发此事件"的标记（events 数组）。
                 if {$name eq "command"} {
                     # Confirm 的决定事件是 ok（确认才跑动作；cancel 经
-                    # ui::on 绑，默认无事）；其余组件 -command 仍是 click。
-                    set ev [expr {$type eq "Confirm" ? "ok" : "click"}]
+                    # ui::on 绑，默认无事）；Form 的提交事件是 commit；
+                    # 其余组件 -command 仍是 click。
+                    set ev [expr {$type eq "Confirm" ? "ok"
+                        : ($type eq "Form" ? "commit" : "click")}]
                     ::ui::_bind $path $ev $val
                     if {[lsearch -exact $newev $ev] < 0} { lappend newev $ev }
                 } elseif {$name eq "rowactions"} {
@@ -468,7 +470,7 @@ proc ::ui::snapshot {path args} {
             set ev [string range $key [expr {[string length $p] + 1}] end]
             set first 1
             foreach s $scripts {
-                if {$first && ($ev eq "click" || ($t eq "Confirm" && $ev eq "ok"))} {
+                if {$first && ($ev eq "click" || ($t eq "Confirm" && $ev eq "ok") || ($t eq "Form" && $ev eq "commit"))} {
                     lappend cmd -command $s
                 } else {
                     lappend extra [list ::ui::on $p $ev $s]
@@ -667,5 +669,25 @@ proc ::ui::model {sub args} {
 ::ui::define Confirm {
     -danger  {bool {} false}
     -preview {json {} {}}
+    -command {script {} {}}
+}
+
+# schema 驱动表单（P1 尾巴的收官件；UI-DSL §2.3）。-schema 是 JSON
+# 类选项（JSON Schema 子集）：type=object 的 properties 逐项渲染控件
+# （string→文本、integer/number→数字框、boolean→勾选、enum→下拉；
+# title 作标签、required 数组做必填校验）。字段值以模型为准：-path
+# 是 bind 基路径，字段 <prop> 的读写都在 <基路径>/<prop>（初始值从
+# 模型拉取；变更（change/blur/Enter）才回写模型——击键不触 Tcl，
+# 与 Field 同纪律）。
+#
+# 提交：表单自带 Submit 按钮；客户端先跑 required/number 校验，缺项
+# 标红并在表单内提示、**不回灌**（可见错误，非静默）；通过则回灌
+# commit 事件（-command 绑它，异步——禁 vwait）。脚本用
+# [ui::model get <基路径>] 读全部值（值在变更时已进模型）。契约
+# §2.4 草图里 commit 内联 vars 未实现（fire 第三参是字符串 detail；
+# 值以模型为准），记 docs/UI-DSL.md §8。
+::ui::define Form {
+    -path   {bind {} {}}
+    -schema {json {} {}}
     -command {script {} {}}
 }

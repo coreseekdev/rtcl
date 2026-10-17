@@ -75,9 +75,11 @@ proc ::ui::_check_value {type opt kind meta value} {
             }
         }
         json {
-            # 原样过桥的 JSON payload（-vegalite 等）：词表层先验语法，
-            # 坏了就是 Tcl 错误——别让非法 JSON 到 JS 侧才炸。
-            if {[catch {json decode $value}]} {
+            # 原样过桥的 JSON payload（-vegalite/-preview）：词表层先验
+            # 语法，坏了就是 Tcl 错误。json decode 只收对象/数组为根
+            # （rtcl 语义），故包一层数组再解——标量 JSON 也合法；空串
+            # 不是任何 JSON 值。
+            if {$value eq "" || [catch {json decode "\[$value\]"}]} {
                 error "bad value \"$value\" for $opt on $type: expected JSON"
             }
         }

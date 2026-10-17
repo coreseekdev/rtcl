@@ -688,3 +688,24 @@ fn confirm_catalog_shows_options_and_layout() {
     let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
     assert!(all.contains("Confirm"), "{all}");
 }
+
+#[test]
+fn json_kind_accepts_scalars_rejects_empty() {
+    // json kind 放行标量 JSON（-confirm 的字符串消息预览依赖它；
+    // rtcl 的 json decode 只收对象/数组为根，校验包了一层数组）；
+    // 空串会破坏 ops payload，必须拒绝。
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp.eval(r#"ui::confirm .s.a -preview {"executed — re-armed"}"#).unwrap();
+    interp.eval(r#"ui::confirm .s.b -preview 42"#).unwrap();
+    interp.eval(r#"ui::confirm .s.c -preview true"#).unwrap();
+    interp.eval(r#"ui::confirm .s.d -preview null"#).unwrap();
+    let log = op_log(&mut interp);
+    assert!(log.contains(r#""preview":"executed — re-armed""#), "{log}");
+    assert!(log.contains(r#""preview":42"#), "{log}");
+    assert!(log.contains(r#""preview":true"#), "{log}");
+    assert!(log.contains(r#""preview":null"#), "{log}");
+
+    let e = interp.eval(r#"ui::confirm .s.e -preview {}"#).unwrap_err();
+    assert!(e.to_string().contains("expected JSON"), "{e}");
+}

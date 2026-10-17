@@ -915,6 +915,13 @@ impl Interp {
         self.eval(HTTP_TCL).map(|_| ())
     }
 
+    /// 加载 log::* 词表层（内存 ring 事件存储 + 查询管道，
+    /// docs/ROADMAP.md §3 起步版）。纯 Tcl，原生与 wasm 都可用。
+    pub fn load_log(&mut self) -> crate::error::Result<()> {
+        const LOG_TCL: &str = include_str!("../log.tcl");
+        self.eval(LOG_TCL).map(|_| ())
+    }
+
     /// 注入宿主控制台实现（wasm 宿主由此把 `puts` 的输出接到 JS 回调；
     /// 原生构建默认已是 [`crate::host::NativeConsole`]，无需调用）。
     pub fn set_console(&mut self, console: Box<dyn crate::host::HostConsole>) {

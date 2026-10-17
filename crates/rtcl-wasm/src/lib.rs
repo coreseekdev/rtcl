@@ -29,6 +29,10 @@ impl RtclHandle {
             .interp
             .load_http()
             .map_err(|e| JsValue::from_str(&format!("http.tcl failed to load: {e}")))?;
+        handle
+            .interp
+            .load_log()
+            .map_err(|e| JsValue::from_str(&format!("log.tcl failed to load: {e}")))?;
         Ok(handle)
     }
 

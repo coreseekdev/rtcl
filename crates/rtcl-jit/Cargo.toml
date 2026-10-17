@@ -21,7 +21,8 @@ wasm-bindgen = { version = "0.2", optional = true }
 # the M1' engine for judge --engine jit and benches.  wasmi was already
 # approved as the test engine (M0); promoting it to an optional real
 # dependency keeps default builds untouched.
-rtcl-core = { path = "../rtcl-core", optional = true, default-features = false, features = ["std"] }
+# 与 rtcl-cli 同一 feature 面（rtcl_std 默认）——judge 三向字节等价的前提。
+rtcl-core = { path = "../rtcl-core", optional = true }
 rtcl-parser = { path = "../rtcl-parser", optional = true }
 rtcl-vm = { path = "../rtcl-vm", optional = true }
 wasmi = { version = "2.0", optional = true }

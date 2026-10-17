@@ -750,8 +750,10 @@ name = "rtcl-jit"
 version = "0.1.0"
 dependencies = [
  "js-sys",
+ "rtcl-core",
  "rtcl-ir",
  "rtcl-parser",
+ "rtcl-vm",
  "wasm-bindgen",
  "wasm-encoder",
  "wasmi",

@@ -188,6 +188,16 @@ proc feedcpu {n {chunk 50}} {
 }
 `);
 
+  // M9: ui::trace —— span 树瀑布（甘特条 + 折叠/缩放全客户端）
+  rtcl.exec(`
+ui::batch {
+  ui::surface .t -title "Trace (http.request)"
+  ui::text .t.hint -variant caption -text "click name = fold · click bar = zoom to span (click again / track = reset)"
+  ui::trace .t.tr -path /trace -weight 1
+}
+ui::model set /trace {{"name":"http.request","start_ms":0,"dur_ms":240,"children":[{"name":"db.query","start_ms":10,"dur_ms":120,"children":[{"name":"SELECT","start_ms":15,"dur_ms":40,"children":[]},{"name":"index scan","start_ms":60,"dur_ms":60,"children":[]}]},{"name":"cache.get","start_ms":140,"dur_ms":30,"children":[]},{"name":"serialize","start_ms":175,"dur_ms":60,"children":[]}]}}
+`);
+
   // M6: ui::log —— 追加式日志流。行值 JSON 对象的 level 字段着色
   // （info/warn/error/debug，样式在 ui-runtime.js 的 CSS）；标量行
   // 值视为 info。上滚暂停跟随、回底自动恢复。行点击经 lineclick

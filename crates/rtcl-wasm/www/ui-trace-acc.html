@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>rtcl ui::trace acceptance (headless)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { font-family: monospace; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #term { flex: 1; border-right: 1px solid #30363d; min-width: 0; overflow: auto; }
+  #ui-root { flex: 1; overflow-y: auto; min-width: 0; }
+  #acc { position: fixed; bottom: 0; left: 0; right: 0; max-height: 38vh; overflow: auto; background:#010409; color:#7ee787; font-size:11px; padding:6px 10px; border-top:1px solid #30363d; white-space:pre-wrap; z-index: 9; }
+</style>
+</head>
+<body>
+<main>
+  <div id="term"></div>
+  <div id="ui-root"></div>
+</main>
+<pre id="acc">booting…</pre>
+<!-- 堵住 load 事件（--dump-dom --timeout 只能到点转储，页面真实任务先跑完） -->
+<img src="http://127.0.0.1:8766/hang" style="display:none" alt="">
+<script type="module">
+import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+import { createUiRuntime, registerDomRenderers, injectUiStyles } from './ui-runtime.js';
+import { createShell } from './shell.js';
+
+const acc = document.getElementById('acc');
+let accLines = [];
+const log = (s, mark) => { accLines.push((mark ? '  ' + mark + ' ' : '') + s); acc.textContent = accLines.join('\n'); };
+
+const nativeRaf = window.requestAnimationFrame.bind(window);
+window.requestAnimationFrame = (cb) => { nativeRaf(cb); setTimeout(() => cb(0), 0); return 0; };
+
+const shell = createShell(document.getElementById('term'), {
+  exec: (s) => { if (!rtcl) throw new Error('WASM 尚未就绪'); return rtcl.exec(s); },
+  isComplete: (s) => (rtcl ? rtcl.is_complete(s) : true),
+});
+const brace = (s) => '{' + s.replace(/\\/g, '\\\\').replace(/}/g, '\\}') + '}';
+
+let rtcl = null;
+
+async function main() {
+  await init();
+  rtcl = new RtclHandle();
+  rtcl.set_output_handler((s) => shell.print(s.replace(/\n$/, ''), 'puts'));
+  injectUiStyles();
+
+  const fired = [];
+  const fire = (path, event, detail) => {
+    fired.push([path, event, detail]);
+    try {
+      rtcl.dispatch_event(detail === undefined
+        ? `::ui::fire ${path} ${event}`
+        : `::ui::fire ${path} ${event} ${detail}`);
+    } catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const commitModel = (path, value) => {
+    try { rtcl.dispatch_event(`ui::model set ${path} ${brace(JSON.stringify(value))}`); }
+    catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const runtime = createUiRuntime(document.getElementById('ui-root'), {
+    fire, commitModel,
+    onError: (m) => shell.print('[ui] ' + m, 'error'),
+  });
+  registerDomRenderers(runtime);
+  rtcl.register_command('_ui', (opsJson) => { runtime.applyOps(JSON.parse(opsJson)); return ''; });
+
+  rtcl.exec('set tcl_interactive 1');
+  window.rtcl = rtcl;
+
+  // ── 与 demo 相同：http.request 瀑布 ──
+  rtcl.exec(`
+ui::batch {
+  ui::surface .t -title "Trace (http.request)"
+  ui::text .t.hint -variant caption -text "click name = fold · click bar = zoom to span"
+  ui::trace .t.tr -path /trace -weight 1
+}
+ui::model set /trace {{"name":"http.request","start_ms":0,"dur_ms":240,"children":[{"name":"db.query","start_ms":10,"dur_ms":120,"children":[{"name":"SELECT","start_ms":15,"dur_ms":40,"children":[]},{"name":"index scan","start_ms":60,"dur_ms":60,"children":[]}]},{"name":"cache.get","start_ms":140,"dur_ms":30,"children":[]},{"name":"serialize","start_ms":175,"dur_ms":60,"children":[]}]}}
+`);
+
+  acceptance(runtime, fired).catch(e => log('harness error: ' + (e && e.message || e), 'ERR'));
+}
+
+async function acceptance(runtime, fired) {
+  await new Promise(r => setTimeout(r, 0));
+
+  // 1) catalog 内省
+  const cat = rtcl.exec('ui::catalog Trace');
+  const catOk = cat.includes('-path') && cat.includes('-fill') && cat.includes('-weight');
+  log(`catalog Trace introspection ${catOk ? 'OK' : 'FAIL'}`, '[1]');
+
+  const trEl = document.querySelector('.rui-trace');
+  const st = trEl._trace;
+  const curRows = () => trEl.children[0].children;   // 重渲染换节点：每次新鲜读
+  const labelOf = (r) => r.children[0].children[1].textContent;
+  const barOf = (name) => [...curRows()].find(r => labelOf(r) === name).children[1].children[0];
+  const pct = (s) => parseFloat(s);
+  const click = (el) => el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+
+  await new Promise(r => requestAnimationFrame(r));
+  log(`rows=${curRows().length}: ${[...curRows()].map(labelOf).join(',')}`, '[2]');
+  const geoOk = curRows().length === 6
+    && Math.abs(pct(barOf('http.request').style.left)) < 0.01 && Math.abs(pct(barOf('http.request').style.width) - 100) < 0.01
+    && Math.abs(pct(barOf('db.query').style.left) - 10 / 240 * 100) < 0.01
+    && Math.abs(pct(barOf('db.query').style.width) - 120 / 240 * 100) < 0.01
+    && curRows()[1].children[0].style.paddingLeft === '12px'
+    && curRows()[2].children[0].style.paddingLeft === '24px';
+  log(`span rows + bar geometry (root 0-100%, db.query 4.17-54.17%) + indent ${geoOk ? 'OK' : 'FAIL'}`, '[2]');
+
+  // 3) 折叠：行数减、其余条对齐不变（全域来自完整树）
+  click([...curRows()].find(r => labelOf(r) === 'db.query').children[0]);
+  await new Promise(r => setTimeout(r, 0));
+  const foldedRows = [...curRows()].map(labelOf);
+  const foldOk = curRows().length === 4 && foldedRows.join(',') === 'http.request,db.query,cache.get,serialize'
+    && Math.abs(pct(barOf('db.query').style.left) - 10 / 240 * 100) < 0.01;
+  click([...curRows()].find(r => labelOf(r) === 'db.query').children[0]);
+  await new Promise(r => setTimeout(r, 0));
+  const unfoldOk = curRows().length === 6;
+  log(`fold -> ${foldedRows.join(',')} ${foldOk ? 'OK' : 'FAIL'}; unfold ${unfoldOk ? 'OK' : 'FAIL'}`, '[3]');
+
+  // 4) 缩放：点 db.query 条 → 域 [10,130]
+  click(barOf('db.query'));
+  await new Promise(r => setTimeout(r, 0));
+  const zoomOk = Math.abs(pct(barOf('db.query').style.left)) < 0.01 && Math.abs(pct(barOf('db.query').style.width) - 100) < 0.01
+    && Math.abs(pct(barOf('SELECT').style.left) - 5 / 120 * 100) < 0.01
+    && Math.abs(pct(barOf('SELECT').style.width) - 40 / 120 * 100) < 0.01
+    && pct(barOf('http.request').style.left) < 0;
+  click(barOf('db.query'));
+  await new Promise(r => setTimeout(r, 0));
+  const resetOk = Math.abs(pct(barOf('db.query').style.width) - 120 / 240 * 100) < 0.01;
+  // 再缩放一次，点轨道空白复位
+  click(barOf('db.query'));
+  await new Promise(r => setTimeout(r, 0));
+  click(barOf('cache.get').closest('.rui-trace-track'));
+  await new Promise(r => setTimeout(r, 0));
+  const bgResetOk = Math.abs(pct(barOf('db.query').style.width) - 120 / 240 * 100) < 0.01;
+  log(`zoom ${zoomOk ? 'OK' : 'FAIL'}; second-click reset ${resetOk ? 'OK' : 'FAIL'}; track-bg reset ${bgResetOk ? 'OK' : 'FAIL'}`, '[4]');
+
+  // 5) 子路径更新：两条路径都验。
+  // 5a) JS 侧直注子路径 op（与桥同形；真实 DOM 上验 viewDelta 合成）：
+  //     cache.get=children[1] 时长 30 → 90 → 条宽 12.5% → 37.5%
+  runtime.applyOps([{ op: 'model', sub: 'set', path: '/trace/children/1/dur_ms', value: 90 }]);
+  await new Promise(r => requestAnimationFrame(r));
+  const updA = Math.abs(pct(barOf('cache.get').style.width) - 90 / 240 * 100) < 0.01;
+  // 5b) Tcl 整体重喂（Tcl 侧 /trace 是 JSON 串，下钻 dict 会报
+  //     "missing value to go with key"——§8 条目 3；整体 set 合法）
+  rtcl.exec('ui::model set /trace {{"name":"http.request","start_ms":0,"dur_ms":240,"children":[{"name":"db.query","start_ms":10,"dur_ms":120,"children":[{"name":"SELECT","start_ms":15,"dur_ms":40,"children":[]},{"name":"index scan","start_ms":60,"dur_ms":60,"children":[]}]},{"name":"cache.get","start_ms":140,"dur_ms":90,"children":[]},{"name":"serialize","start_ms":175,"dur_ms":60,"children":[]}]}}');
+  await new Promise(r => requestAnimationFrame(r));
+  const updB = Math.abs(pct(barOf('cache.get').style.width) - 90 / 240 * 100) < 0.01;
+  const updOk = updA && updB;
+  log(`subpath op (JS-injected) rescales=${updA}; Tcl full re-feed rescales=${updB} ${updOk ? 'OK' : 'FAIL'}`, '[5]');
+
+  // 6) 折叠/缩放/复位全程零 Tcl 回灌
+  const noBridgeOk = fired.length === 0;
+  log(`fold/zoom stays JS-side (fires=${fired.length}) ${noBridgeOk ? 'OK' : 'FAIL'}`, '[6]');
+
+  const all = catOk && geoOk && foldOk && unfoldOk && zoomOk && resetOk && bgResetOk && updOk && noBridgeOk;
+  log(`VERDICT: ${all ? 'PASS' : 'FAIL'}`, 'END');
+  acc.title = all ? 'acc-pass' : 'acc-fail';
+}
+
+main().catch((e) => {
+  log('failed to init: ' + (e && e.message || e), 'ERR');
+});
+</script>
+</body>
+</html>

@@ -46,3 +46,5 @@ crates/rtcl-wasm/pkg/
 # Project docs exceptions
 !HANDOFF.md
 !bench/BASELINE.md
+!docs/PRODUCTION.md
+!docs/REPL-TCLSH-PARITY.md

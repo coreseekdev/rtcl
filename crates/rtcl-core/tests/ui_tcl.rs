@@ -760,3 +760,20 @@ fn form_catalog_shows_options_and_layout() {
     let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
     assert!(all.contains("Form"), "{all}");
 }
+
+#[test]
+fn model_json_string_normalized_on_store() {
+    // host 提交路径：字符串是 JSON 字面量（"x"）——库存纯文本（get
+    // 不带引号；回推 JS 时 _json_or_string 再编码回 JSON 串）；
+    // 空串同理（否则回推会变成 2 字符的 ""，表单控件可见垃圾）。
+    let mut interp = setup();
+    interp.eval(r#"ui::model set /m {"hello world"}"#).unwrap();
+    assert_eq!(interp.eval("ui::model get /m").unwrap().as_str(), "hello world");
+    let log = op_log(&mut interp);
+    assert!(log.contains(r#""path":"\/m","value":"hello world""#), "{log}");
+
+    interp.eval(r#"ui::model set /m2 {""}"#).unwrap();
+    let log = op_log(&mut interp);
+    assert!(log.contains(r#""path":"\/m2","value":"""#), "{log}");
+    assert_eq!(interp.eval("ui::model get /m2").unwrap().as_str(), "");
+}

@@ -509,6 +509,13 @@ proc ::ui::model {sub args} {
         set {
             if {[llength $args] != 2} { error "usage: ui::model set path value" }
             lassign $args path value
+            # host 提交的字符串是 JSON 字面量（"x"）：去引号规范化——让
+            # 模型里的字符串与 Tcl 侧直接 set 的字符串同形（get 不带引
+            # 号；回推 JS 时再编码回 JSON 串）。其余值（对象/数组/数/
+            # 布尔/null 文本）按原文本存（行 JSON 串的既有约定）。
+            if {[string index $value 0] eq "\"" && ![catch {json decode "\[$value\]"} arr]} {
+                set value [lindex $arr 0]
+            }
             dict set model {*}[::ui::_model_keys $path] $value
             ::ui::_emit "\{\"op\":\"model\",\"sub\":\"set\",\"path\":[json encode $path str],\"value\":[::ui::_json_or_string $value]\}"
             return $value

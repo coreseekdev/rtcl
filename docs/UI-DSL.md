@@ -197,11 +197,18 @@ ui::define Button {
   增量复用节点 + 事件委托）+ demo/验收页（M1 明细见
   crates/rtcl-wasm/www/ui-table-acc.html，落地中的契约缺口收进
   本文件 §8）
+- M6 ✅ `ui::log` v1（L1 第二个分子组件，2025-10-17）：词表
+  （Log define：`-path` bind；行值 JSON 对象的 level 字段着色、
+  标量行视为 info）+ JS 渲染器（尾部窗口虚拟化 + follow 钉底/
+  上滚暂停/回底恢复 + lineclick 容器委托）+ demo/验收页
+  （crates/rtcl-wasm/www/ui-log-acc.html）。附带修掉布局引擎
+  `-weight` 的 flex-basis 0 塌缩 bug（M5 的 table 一并恢复可见）
 
 ## 8. 变更建议（v1 落地中发现的缺口；本节只记录，未改协议）
 
-以下条目在 `ui::table`（M5 首个 L1 分子组件，已落地）实现过程中
-踩实，属于**契约缺口候选**，等下一轮契约评审定夺再进 §2 正文：
+以下条目在 `ui::table` / `ui::log`（M5/M6 首两个 L1 分子组件，
+已落地）实现过程中踩实，属于**契约缺口候选**，等下一轮契约评审
+定夺再进 §2 正文：
 
 1. **事件行级 detail**：`::ui::fire 路径 事件 ?detail?`（第三参
    可选，目前仅行场景使用；action 脚本里以 `$ui_row` 读行
@@ -228,3 +235,19 @@ ui::define Button {
 2.4s，rtcl-cli 基准见 commit 3101690）；喂数脚本里 `format` 的
 参数必须与命令同物理行（`[...]` 内完整命令后的换行即命令终结
 符，tclsh 同源）。
+
+以下条目在 `ui::log`（M6）落地过程中踩实，同为缺口候选：
+
+5. **日志正则高亮**（UI-RESEARCH §3.2 已列）：v1 未做——高亮要
+   在渲染器里对行文本做安全分片（禁 innerHTML），且规则该由 Tcl
+   侧过桥（如 `-highlight {regex class …}` 选项）。若做，建议先
+   定"规则留在 Tcl、渲染器只收规则列表"的形状。
+6. **级别词表是开放的**：渲染器按行值 `level` 字段挂
+   `rui-lv-*` 类（词表字符白名单，未知级别落默认样式；样式全在
+   注入 CSS），Tcl 侧没有 `-levels` 之类的选项来声明/校验级别集。
+   若要做级别过滤、计数、点击缩窄等交互，级别词表需要过桥（=
+   契约新增选项，先评审）。
+7. **log 行高固定 22px（单行、长行 CSS 截断省略）**：多行/wrap
+   不在 v1——wrap 会打破固定行高窗口化假设（需测量或估高）。
+   另：v1 在 JS 侧保留全量行缓存（`st.rows`），超大流（10^6 行）
+   的 scrollback 裁剪/内存回收未做。

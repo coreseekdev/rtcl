@@ -611,11 +611,11 @@ fn execute(
     let g_fuel = wasmi::Global::new(&mut store, wasmi::Val::I64(0), wasmi::Mutability::Var);
     let g_epoch = wasmi::Global::new(&mut store, wasmi::Val::I64(0), wasmi::Mutability::Var);
     let g_caching = wasmi::Global::new(&mut store, wasmi::Val::I32(1), wasmi::Mutability::Var);
-    linker.define("rtcl", "fuel", Extern::Global(g_fuel.clone())).unwrap();
-    linker.define("rtcl", "epoch", Extern::Global(g_epoch.clone())).unwrap();
-    linker.define("rtcl", "caching", Extern::Global(g_caching.clone())).unwrap();
-    let g_fuel_call = g_fuel.clone();
-    let g_caching_call = g_caching.clone();
+    linker.define("rtcl", "fuel", Extern::Global(g_fuel)).unwrap();
+    linker.define("rtcl", "epoch", Extern::Global(g_epoch)).unwrap();
+    linker.define("rtcl", "caching", Extern::Global(g_caching)).unwrap();
+    let g_fuel_call = g_fuel;
+    let g_caching_call = g_caching;
 
     linker
         .func_wrap("rtcl", "unbox_int", |c: Caller<'_, Host>, h: i32| -> (i32, i64) {
@@ -697,9 +697,9 @@ fn execute(
         })
         .unwrap();
     linker
-        .func_wrap("rtcl", "push_const", |mut c: Caller<'_, Host>, idx: i32| -> i64 {
-            let h = abi::const_handle(idx as u32);
-            h
+        .func_wrap("rtcl", "push_const", |_c: Caller<'_, Host>, idx: i32| -> i64 {
+            
+            abi::const_handle(idx as u32)
         })
         .unwrap();
     linker
@@ -725,7 +725,7 @@ fn execute(
 }
 
 /// run() 返回后的共享终局：错误二分（case a/b）与报告构建。
-pub fn finish(mut host: Host, outcome_code: i32, file: &str) -> (Interp, JitRun) {
+pub(crate) fn finish(mut host: Host, outcome_code: i32, file: &str) -> (Interp, JitRun) {
     let pending_exit = host.pending_exit.take();
     let (driver_report, eval_error) = match outcome_code {
         code::ERROR => {

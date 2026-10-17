@@ -37,7 +37,7 @@ pub fn run(l1: &L1, code: &ByteCode) -> Result<(), Unsupported> {
     }
     // i63 域外立即数：tagging 会回绕（ByteCode 可携带全 i64 的
     // PushInt/IncrVar 量）——编译拒绝，留解释器的 bignum 路径。
-    let imm_ok = |n: i64| n >= -(1i64 << 62) && n < (1i64 << 62);
+    let imm_ok = |n: i64| (-(1i64 << 62)..(1i64 << 62)).contains(&n);
     for (pc, a) in l1.ops.iter().enumerate() {
         match &a.op {
             OpCode::PushInt(n) if !imm_ok(*n) => {

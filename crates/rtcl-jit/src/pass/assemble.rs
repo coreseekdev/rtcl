@@ -22,7 +22,6 @@ const I32: ValType = ValType::I32;
 
 struct Env<'a> {
     l2: &'a L2,
-    nv: u32,     // 值寄存器数（含出口槽）
     scratch: u32,
     epoch_home: u32,
     bool_base: u32,
@@ -43,7 +42,6 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
     let nv = l2.max_depth + 1;
     let env = Env {
         l2,
-        nv,
         scratch: nv + 1,
         epoch_home: nv + 2,
         bool_base: nv + 3,
@@ -55,7 +53,6 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
     let bregs = count_bregs(l3);
     let env = Env {
         l2,
-        nv,
         scratch: nv + 1,
         epoch_home: nv + 2,
         bool_base: nv + 3,
@@ -234,7 +231,7 @@ fn check_sentinel(e: &Env, f: &mut Function, reg: u32, fail: u32) {
 
 /// `rtcl.fail(id)` → i32 kind；kind==0（纯错误）→ return TCL_ERROR。
 /// 其余 kind 由 CallSite 模板特判（break/continue 出口）。
-fn fail_path(e: &Env, f: &mut Function, fail: u32) {
+fn fail_path(_e: &Env, f: &mut Function, fail: u32) {
     f.instruction(&Instruction::I32Const(fail as i32));
     f.instruction(&Instruction::Call(import::FAIL));
     f.instruction(&Instruction::I32Eqz);
@@ -330,7 +327,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::LocalSet(dst.0));
         }
         Instr::LoadVar { dst, var, fail } => {
-            let var = *var as u32;
+            let var = *var;
             let vals = cache::VALUES + var * 8;
             let state = cache::STATE + var;
             f.instruction(&Instruction::Block(BlockType::Empty)); // done
@@ -355,7 +352,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::End); // done
         }
         Instr::StoreVar { src, var, keep: _, fail } => {
-            let var = *var as u32;
+            let var = *var;
             let vals = cache::VALUES + var * 8;
             let state = cache::STATE + var;
             f.instruction(&Instruction::Block(BlockType::Empty)); // done
@@ -379,7 +376,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::End); // done
         }
         Instr::IncrVar { dst, var, amount, fail } => {
-            let var = *var as u32;
+            let var = *var;
             let vals = cache::VALUES + var * 8;
             let state = cache::STATE + var;
             f.instruction(&Instruction::Block(BlockType::Empty)); // done

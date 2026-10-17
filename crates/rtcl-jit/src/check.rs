@@ -78,11 +78,10 @@ pub fn check_l2(l2: &L2) -> Result<(), CheckError> {
 pub fn check_l3(l3: &L3, max_regs: u32, max_bregs: u32) -> Result<(), CheckError> {
     walk_l3(l3, 0, &mut |node, depth| {
         match node {
-            L3::Br { depth: d, .. } | L3::BrIf { depth: d, .. } => {
-                if *d > depth {
+            L3::Br { depth: d, .. } | L3::BrIf { depth: d, .. }
+                if *d > depth => {
                     return err(format!("br depth {d} exceeds nesting {depth}"));
                 }
-            }
             _ => {}
         }
         Ok(())

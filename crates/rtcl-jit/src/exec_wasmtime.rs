@@ -4,14 +4,12 @@
 
 use crate::abi;
 use crate::emit;
-use crate::exec::{Host, JitRun, Outcome, Pending};
-use crate::pass::EmitConfig;
+use crate::exec::{Host, JitRun};
 use rtcl_core::value::Value;
-use rtcl_core::{Error, Interp};
+use rtcl_core::Interp;
 use rtcl_parser::ByteCode;
 use rtcl_vm::VmContext;
-use std::rc::Rc;
-use wasmtime::{Caller, Engine, Extern, Linker, Module, Store, TypedFunc, Val};
+use wasmtime::{Caller, Engine, Linker, Module, Store, TypedFunc, Val};
 
 pub fn execute(
     interp: Interp,
@@ -86,7 +84,7 @@ pub fn execute(
             c.data_mut().incr_var_raw(name_h, n)
         })
         .unwrap();
-    let caching_g = g_caching.clone();
+    let caching_g = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -103,7 +101,7 @@ pub fn execute(
             c.data_mut().set_result_raw(v);
         })
         .unwrap();
-    let fuel_g = g_fuel.clone();
+    let fuel_g = g_fuel;
     linker
         .func_wrap("rtcl", "refuel", move |mut c: Caller<'_, Host>| -> i64 {
             let chunk = c.data().refuel_chunk();

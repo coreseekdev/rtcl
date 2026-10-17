@@ -383,21 +383,6 @@ fn backedge_fail(ctx: &Ctx, pc: u32, t: u32) -> u32 {
         .unwrap_or(0)
 }
 
-/// 从 `from` 出发的可达集。
-fn reach(ctx: &Ctx, from: u32) -> BTreeSet<u32> {
-    let mut seen = BTreeSet::new();
-    let mut work = vec![from];
-    seen.insert(from);
-    while let Some(p) = work.pop() {
-        for &t in &ctx.l2.edges[p as usize] {
-            if seen.insert(t) {
-                work.push(t);
-            }
-        }
-    }
-    seen
-}
-
 /// 分支的汇合点 = 直接后支配者（ipdom）。循环内两臂经回边彼此可达，
 /// 可达集求交会被污染（把 header 当 merge）——后支配树是正确工具：
 /// break-if 的 ipdom = 循环出口，普通 if-else 的 ipdom = 真实 merge。
@@ -487,7 +472,6 @@ fn preds_n_root(_d: &std::collections::BTreeSet<u32>) -> bool {
     false
 }
 
-#[allow(dead_code)]
 fn merge_point_unused(ctx: &Ctx, branch_pc: u32, a: u32, b: u32) -> Option<u32> {
     let _ = (ctx, branch_pc, a, b);
     None

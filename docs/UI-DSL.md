@@ -203,12 +203,18 @@ ui::define Button {
   上滚暂停/回底恢复 + lineclick 容器委托）+ demo/验收页
   （crates/rtcl-wasm/www/ui-log-acc.html）。附带修掉布局引擎
   `-weight` 的 flex-basis 0 塌缩 bug（M5 的 table 一并恢复可见）
+- M7 ✅ `ui::kv` / `ui::tree` v1（详情双件套，2025-10-17）：Kv
+  （`-path` bind + `-keys` list；键序/量格式化/单键原位增量）+
+  Tree（`-path` bind；容器折叠预览、点击逐层展开、标量/数组根）
+  + demo（点 Pods 行 → 行 JSON 转喂 `/pod`，kv/tree 同源）+ 验收页
+  （crates/rtcl-wasm/www/ui-detail-acc.html）。子路径增量由渲染器
+  本地合成（运行时 model 平表语义，见 §8 条目 8）
 
 ## 8. 变更建议（v1 落地中发现的缺口；本节只记录，未改协议）
 
-以下条目在 `ui::table` / `ui::log`（M5/M6 首两个 L1 分子组件，
-已落地）实现过程中踩实，属于**契约缺口候选**，等下一轮契约评审
-定夺再进 §2 正文：
+以下条目在 `ui::table` / `ui::log` / `ui::kv` / `ui::tree`（M5–M7
+L1 分子组件，已落地）实现过程中踩实，属于**契约缺口候选**，等下一
+轮契约评审定夺再进 §2 正文：
 
 1. **事件行级 detail**：`::ui::fire 路径 事件 ?detail?`（第三参
    可选，目前仅行场景使用；action 脚本里以 `$ui_row` 读行
@@ -251,3 +257,18 @@ ui::define Button {
    不在 v1——wrap 会打破固定行高窗口化假设（需测量或估高）。
    另：v1 在 JS 侧保留全量行缓存（`st.rows`），超大流（10^6 行）
    的 scrollback 裁剪/内存回收未做。
+
+以下条目在 `ui::kv` / `ui::tree`（M7）落地过程中踩实：
+
+8. **容器组件的子路径增量合成**（契约澄清候选，重要）：运行时
+   model 是 `path → 值` 平表——`ui::model set /info/a/b` 不会修改
+   `/info` 处已存的对象（Table 的 `/pods/i` 本来就靠这个设计）。
+   绑定**容器路径**的渲染器（Table/Kv/Tree）必须自行按增量把子
+   路径合成进视图；根路径的全量 set 才是权威快照。建议 §2.2 正
+   文写清"容器路径的整值读取不反映之后的子路径写入"。
+9. **kv/tree 无行/节点事件**：kv 行点击、tree 节点点击（选中、
+   上下文动作）v1 不做；若需要，沿用行号/节点路径 detail 的形
+   状（`::ui::fire` 第三参）；tree 的节点 detail 该是段路径。
+10. **tree 展开无子节点上限**：折叠态 DOM 有界，但展开一个万级
+    数组/对象会一次物化全部子行。超大节点需要分页/上限（v1 记
+    缺口，等真实流量的拉动）。

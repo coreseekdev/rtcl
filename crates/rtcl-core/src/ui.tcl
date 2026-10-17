@@ -233,8 +233,11 @@ proc ::ui::_parse_options {type path optvals} {
                 # script 类选项留在 Tcl 侧注册（Tk -command 语义），JS 只
                 # 收到"转发此事件"的标记（events 数组）。
                 if {$name eq "command"} {
-                    ::ui::_bind $path click $val
-                    if {[lsearch -exact $newev click] < 0} { lappend newev click }
+                    # Confirm 的决定事件是 ok（确认才跑动作；cancel 经
+                    # ui::on 绑，默认无事）；其余组件 -command 仍是 click。
+                    set ev [expr {$type eq "Confirm" ? "ok" : "click"}]
+                    ::ui::_bind $path $ev $val
+                    if {[lsearch -exact $newev $ev] < 0} { lappend newev $ev }
                 } elseif {$name eq "rowactions"} {
                     # -rowactions {open {…} del {…}}：动作名→脚本 dict。
                     # 脚本不过桥；JS 经 events 数组拿到动作名（渲染器在
@@ -463,7 +466,7 @@ proc ::ui::snapshot {path args} {
             set ev [string range $key [expr {[string length $p] + 1}] end]
             set first 1
             foreach s $scripts {
-                if {$first && $ev eq "click"} {
+                if {$first && ($ev eq "click" || ($t eq "Confirm" && $ev eq "ok"))} {
                     lappend cmd -command $s
                 } else {
                     lappend extra [list ::ui::on $p $ev $s]
@@ -650,4 +653,17 @@ proc ::ui::model {sub args} {
 # 喂数侧，UI-DSL.md §8 条目 13）。
 ::ui::define Trace {
     -path {bind {} {}}
+}
+
+# 确认卡片（P1 收官件；UI-RESEARCH §4 P1.6、浏览器纪律 §4.2）。模态
+# 决定**异步回灌**：-command 绑在 ok 事件（点 Confirm 才跑），点
+# Cancel 回灌 cancel（经 ui::on 绑，默认无事）——脚本绝不 vwait 等
+# 返回值。一次决定后按钮禁用；ui::configure 改 -preview/-danger 会
+# 重新武装（新问题 = 新一发，可在 -command 里 configure 复用同一
+# 卡片）。-preview 是 JSON：字符串渲染为提示文字，对象/数组渲染为
+# 缩进 JSON（危险动作"将删除什么"的预览）。
+::ui::define Confirm {
+    -danger  {bool {} false}
+    -preview {json {} {}}
+    -command {script {} {}}
 }

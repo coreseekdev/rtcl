@@ -607,3 +607,84 @@ fn trace_catalog_shows_options_and_layout() {
     let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
     assert!(all.contains("Trace"), "{all}");
 }
+
+// ── Confirm：模态决定的异步回灌（禁 vwait）─────────────────────
+
+#[test]
+fn confirm_create_binds_command_to_ok_event() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp
+        .eval(r#"ui::confirm .s.c -danger 1 -preview {{"issue":"SENTRY-42","affected":3}} -command {set ::ran 1}"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    // -command 绑 ok（不是 click）；脚本不过桥；preview 原样过线。
+    assert!(
+        log.contains(concat!(
+            r#"{"op":"create","path":".s.c","type":"Confirm","#,
+            r#""props":{"danger":true,"preview":{"issue":"SENTRY-42","affected":3}},"events":["ok"]}"#
+        )),
+        "confirm create op: {log}"
+    );
+    assert!(!log.contains("set ::ran"), "command script must not cross: {log}");
+}
+
+#[test]
+fn confirm_decision_relay_is_async() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp
+        .eval(r#"ui::confirm .s.c -command {set ::ran 1}"#)
+        .unwrap();
+    // 创建后脚本立即跑到底（没有等待）——ran 未置位
+    assert_eq!(interp.eval("info exists ::ran").unwrap().as_str(), "0");
+
+    // JS 点 Confirm → fire ok → 命令跑
+    interp.post_event("::ui::fire .s.c ok");
+    let errors = interp.pump_events();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(interp.eval("set ::ran").unwrap().as_str(), "1");
+
+    // cancel 默认无 handler：静默
+    interp.post_event("::ui::fire .s.c cancel");
+    let errors = interp.pump_events();
+    assert!(errors.is_empty(), "{errors:?}");
+
+    // ui::on 绑 cancel → set op 带新事件；再点 Cancel 生效
+    interp
+        .eval(r#"ui::on .s.c cancel {set ::cancelled 1}"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    assert!(
+        log.contains(r#""op":"set","path":".s.c","props":{},"events":["ok","cancel"]"#),
+        "cancel binding crosses as events: {log}"
+    );
+    interp.post_event("::ui::fire .s.c cancel");
+    let errors = interp.pump_events();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(interp.eval("set ::cancelled").unwrap().as_str(), "1");
+
+    // ok 重复回灌：命令再跑一次（JS 侧按钮已禁用，协议层不拦）
+    interp.post_event("::ui::fire .s.c ok");
+    let errors = interp.pump_events();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn confirm_invalid_preview_is_tcl_error() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    let e = interp.eval(r#"ui::confirm .s.c -preview {not json} -command {}"#).unwrap_err();
+    assert!(e.to_string().contains("expected JSON"), "{e}");
+}
+
+#[test]
+fn confirm_catalog_shows_options_and_layout() {
+    let mut interp = setup();
+    let c = interp.eval("ui::catalog Confirm").unwrap().as_str().to_string();
+    for opt in ["-danger", "-preview", "-command", "-fill", "-weight"] {
+        assert!(c.contains(opt), "catalog Confirm missing {opt}: {c}");
+    }
+    let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
+    assert!(all.contains("Confirm"), "{all}");
+}

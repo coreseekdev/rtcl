@@ -285,21 +285,51 @@ ui::batch {
   rtcl.exec(`
 ui::batch {
   ui::surface .r -title "Remote pull"
-  ui::text .r.hint -variant caption -text "try: pull http://127.0.0.1:8767/lines"
+  ui::text .r.hint -variant caption -text "try: pull http://127.0.0.1:8767/lines ; then: qt level"
   ui::log .r.log -path /pull -weight 1
 }
+ui::batch {
+  ui::surface .q -title "Query (log::top)"
+  ui::text .q.hint -variant caption -text "feedq 2000 ; qt level · qt ms  (查询管道 → 表)"
+  ui::table .q.table -path /qrows -columns {value count} -weight 1
+}
 set ::pullcursor 0
+set ::qrows 0
 proc pull {url} {
     http::get $url -command {
         if {$http_error ne ""} { puts "pull failed: $http_error"; return }
-        set n 0
+        set n [log::ingest-lines $http_body -source http]
+        set i 0
         foreach line [http::jsonl $http_body] {
             ui::model set /pull/$::pullcursor $line
             incr ::pullcursor
-            incr n
+            incr i
         }
-        puts "pulled $n lines (status $http_status)"
+        puts "pulled $i lines (status $http_status; log::count [log::count])"
     }
+}
+proc feedq {n} {
+    set levels {info warn error debug}
+    set batch [list]
+    for {set i 0} {$i < $n} {incr i} {
+        lappend batch [format {{"level":"%s","ms":%d,"i":%d}} [lindex $levels [expr {$i % 4}]] [expr {$i % 97}] $i]
+    }
+    log::ingest-lines [join $batch \\n] -source gen
+    return "ingested $n (log::count [log::count])"
+}
+proc qt {field} {
+    set new [log::top $field 20]
+    set n [expr {[llength $new] / 2}]
+    set i 0
+    ui::batch {
+        foreach {v c} $new {
+            ui::model set /qrows/$i [format {{"value":%s,"count":%d}} [json encode $v str] $c]
+            incr i
+        }
+        while {$i < $::qrows} { ui::model unset /qrows/$i ; incr i }
+    }
+    set ::qrows $n
+    return "top $field: $n rows"
 }
 `);
 

@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>rtcl log::* acceptance (headless)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { font-family: monospace; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #term { flex: 1; border-right: 1px solid #30363d; min-width: 0; overflow: auto; }
+  #ui-root { flex: 1; overflow-y: auto; min-width: 0; }
+  #acc { position: fixed; bottom: 0; left: 0; right: 0; max-height: 38vh; overflow: auto; background:#010409; color:#7ee787; font-size:11px; padding:6px 10px; border-top:1px solid #30363d; white-space:pre-wrap; z-index: 9; }
+</style>
+</head>
+<body>
+<main>
+  <div id="term"></div>
+  <div id="ui-root"></div>
+</main>
+<pre id="acc">booting…</pre>
+<!-- 堵住 load 事件（--dump-dom --timeout 只能到点转储，页面真实任务先跑完） -->
+<img src="http://127.0.0.1:8766/hang" style="display:none" alt="">
+<script type="module">
+import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+import { createUiRuntime, registerDomRenderers, injectUiStyles } from './ui-runtime.js';
+import { createShell } from './shell.js';
+
+const acc = document.getElementById('acc');
+let accLines = [];
+const log = (s, mark) => { accLines.push((mark ? '  ' + mark + ' ' : '') + s); acc.textContent = accLines.join('\n'); };
+
+const nativeRaf = window.requestAnimationFrame.bind(window);
+window.requestAnimationFrame = (cb) => { nativeRaf(cb); setTimeout(() => cb(0), 0); return 0; };
+
+const shell = createShell(document.getElementById('term'), {
+  exec: (s) => { if (!rtcl) throw new Error('WASM 尚未就绪'); return rtcl.exec(s); },
+  isComplete: (s) => (rtcl ? rtcl.is_complete(s) : true),
+});
+const brace = (s) => '"' + String(s)
+  .replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  .replace(/\$/g, '\\$').replace(/\[/g, '\\[') + '"';
+
+let rtcl = null;
+
+async function main() {
+  await init();
+  rtcl = new RtclHandle();
+  rtcl.set_output_handler((s) => shell.print(s.replace(/\n$/, ''), 'puts'));
+  injectUiStyles();
+
+  const fire = (path, event, detail) => {
+    try {
+      rtcl.dispatch_event(detail === undefined
+        ? `::ui::fire ${path} ${event}`
+        : `::ui::fire ${path} ${event} ${detail}`);
+    } catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const commitModel = (path, value) => {
+    try { rtcl.dispatch_event(`ui::model set ${path} ${brace(JSON.stringify(value))}`); }
+    catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const runtime = createUiRuntime(document.getElementById('ui-root'), {
+    fire, commitModel,
+    onError: (m) => shell.print('[ui] ' + m, 'error'),
+  });
+  registerDomRenderers(runtime);
+  rtcl.register_command('_ui', (opsJson) => { runtime.applyOps(JSON.parse(opsJson)); return ''; });
+
+  rtcl.exec('set tcl_interactive 1');
+  window.rtcl = rtcl;
+
+  // 查询管道 → 表格（出现多行/少行时按 /qrows 索引覆盖 + 清理）
+  rtcl.exec(`
+ui::batch {
+  ui::surface .q -title "Query (log::top → table)"
+  ui::text .q.hint -variant caption -text "feedq 300 ; qt level"
+  ui::table .q.table -path /qrows -columns {value count} -weight 1
+}
+set ::qrows 0
+proc feedq {n} {
+    set levels {info warn error debug}
+    set batch [list]
+    for {set i 0} {$i < $n} {incr i} {
+        lappend batch [format {{"level":"%s","ms":%d,"i":%d}} [lindex $levels [expr {$i % 4}]] [expr {$i % 97}] $i]
+    }
+    log::ingest-lines [join $batch \\n] -source gen
+    return "ingested $n (log::count [log::count])"
+}
+proc qt {field} {
+    set new [log::top $field 20]
+    set n [expr {[llength $new] / 2}]
+    set i 0
+    ui::batch {
+        foreach {v c} $new {
+            ui::model set /qrows/$i [format {{"value":%s,"count":%d}} [json encode $v str] $c]
+            incr i
+        }
+        while {$i < $::qrows} { ui::model unset /qrows/$i ; incr i }
+    }
+    set ::qrows $n
+    return "top $field: $n rows"
+}
+`);
+  window.__acc = { runtime };
+
+  acceptance(runtime).catch(e => log('harness error: ' + (e && e.message || e), 'ERR'));
+}
+
+async function acceptance(runtime) {
+  await new Promise(r => setTimeout(r, 0));
+  const execV = (s) => rtcl.exec(s);
+
+  // 1) 装载与校验
+  const wlOk = execV('llength [info commands log::ingest]') === '1'
+    && execV('llength [info commands log::hist]') === '1'
+    && execV('log::capacity') === '10000';
+  let badErr = '';
+  try { rtcl.exec('log::ingest {not json}'); } catch (e) { badErr = String(e); }
+  log(`word layer loaded=${wlOk}; bad event rejected=${badErr.includes('JSON object')}`, '[1]');
+  const loadOk = wlOk && badErr.includes('JSON object');
+
+  // 2) 批量入环（纯 Tcl，不过桥）
+  const t0 = performance.now();
+  const fed = execV('feedq 300');
+  const feedMs = Math.round(performance.now() - t0);
+  const countOk = fed.includes('(log::count 300)');
+  log(`${fed} in ${feedMs}ms`, '[2]');
+  const ringOk = countOk;
+
+  // 3) stats：计数降序、并列值升序（300 整除 4 → 各 75）
+  const top = execV('log::top level 10');
+  const statsOk = top === 'debug 75 error 75 info 75 warn 75';
+  log(`log::top level 10 → ${top} ${statsOk ? 'OK' : 'FAIL'}`, '[3]');
+
+  // 4) 查询 → 表格：qt 喂 /qrows，表行 4
+  execV('qt level');
+  await new Promise(r => requestAnimationFrame(r));
+  const st = document.querySelector('.rui-table')._table;
+  const rows = st.rows.filter(Boolean);
+  const tableOk = rows.length === 4 && rows[0].value === 'debug' && Number(rows[0].count) === 75;
+  log(`qt level → table rows=${rows.length} first=${rows[0]?.value}:${rows[0]?.count} ${tableOk ? 'OK' : 'FAIL'}`, '[4]');
+
+  // 5) hist：5 桶、计数和 = 300（Tcl 侧验证）
+  const histOk = execV('set h [log::hist ms 5]; expr {[llength $h] == 15}') === '1'
+    && execV('set h [log::hist ms 5]; set s 0; foreach {a b c} $h {incr s $c}; set s') === '300';
+  const hist5 = execV('log::hist ms 5');
+  log(`log::hist ms 5 → ${hist5}`, '[5]');
+  log(`hist buckets=5, counts sum=300 ${histOk ? 'OK' : 'FAIL'}`, '[5]');
+
+  // 6) search / tail
+  const searchOk = execV('llength [log::search {"i":42}]') === '1'
+    && execV('llength [log::tail 2]') === '2'
+    && execV('llength [log::tail 10 -source gen]') === '10';
+  log(`search/tail shapes ${searchOk ? 'OK' : 'FAIL'}`, '[6]');
+
+  // 7) 容量淘汰（最后做，会缩环）
+  execV('log::capacity 50');
+  const evictOk = execV('log::count') === '50'
+    && execV('llength [log::search level]') === '50';
+  log(`capacity 50 → count=50, all evicted-window searchable ${evictOk ? 'OK' : 'FAIL'}`, '[7]');
+
+  const all = loadOk && ringOk && statsOk && tableOk && histOk && searchOk && evictOk;
+  log(`VERDICT: ${all ? 'PASS' : 'FAIL'}`, 'END');
+  acc.title = all ? 'acc-pass' : 'acc-fail';
+}
+
+main().catch((e) => {
+  log('failed to init: ' + (e && e.message || e), 'ERR');
+});
+</script>
+</body>
+</html>

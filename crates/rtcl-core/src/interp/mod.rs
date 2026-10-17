@@ -906,6 +906,15 @@ impl Interp {
         self.eval(UI_TCL).map(|_| ())
     }
 
+    /// 加载 http::* 词表层（数据通道的 wasm 客户端，docs/ROADMAP.md
+    /// §3）。宿主须注册 `__rtcl_http` 桥（wasm：www/http-bridge.js 的
+    /// fetch 实现；原生：暂无，本方法仅供 wasm 宿主显式调用）。同样
+    /// 调用时才解析桥命令，注册可晚于加载。
+    pub fn load_http(&mut self) -> crate::error::Result<()> {
+        const HTTP_TCL: &str = include_str!("../http.tcl");
+        self.eval(HTTP_TCL).map(|_| ())
+    }
+
     /// 注入宿主控制台实现（wasm 宿主由此把 `puts` 的输出接到 JS 回调；
     /// 原生构建默认已是 [`crate::host::NativeConsole`]，无需调用）。
     pub fn set_console(&mut self, console: Box<dyn crate::host::HostConsole>) {

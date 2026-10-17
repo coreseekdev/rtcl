@@ -25,6 +25,10 @@ impl RtclHandle {
             .interp
             .load_ui()
             .map_err(|e| JsValue::from_str(&format!("ui.tcl failed to load: {e}")))?;
+        handle
+            .interp
+            .load_http()
+            .map_err(|e| JsValue::from_str(&format!("http.tcl failed to load: {e}")))?;
         Ok(handle)
     }
 

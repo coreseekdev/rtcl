@@ -248,6 +248,32 @@ ui::batch {
 ui::on .z.conf cancel {puts "cancelled — no action taken"}
 `);
 
+  // M11: ui::form —— schema 驱动表单。值以模型为准（-path 基路径，
+  // 字段 <prop> 读写 /issue/<prop>）；击键不触 Tcl，变更才回写；
+  // Submit 先客户端校验（required），通过才回灌 commit（-command）。
+  rtcl.exec(`
+ui::batch {
+  ui::surface .n -title "New issue"
+  ui::text .n.hint -variant caption -text "form: type a title, pick severity, Submit (required: title + urgent)"
+  ui::form .n.form -path /issue -schema {
+    {"type":"object",
+     "properties":{
+       "title":{"type":"string","title":"Title"},
+       "severity":{"enum":["low","medium","high","critical"],"title":"Severity"},
+       "note":{"type":"string","title":"Note"},
+       "urgent":{"type":"boolean","title":"Urgent"}},
+     "required":["title","urgent"]}
+  } -command {
+    set vals {}
+    foreach k {title severity note urgent} {
+      if {![catch {ui::model get /issue/$k} v]} { lappend vals "$k=$v" }
+    }
+    puts "submit: [join $vals {, }]"
+    ui::configure .n.hint -text "submitted: [ui::model get /issue/title]"
+  }
+}
+`);
+
   shell.print('rtcl ' + (rtcl.exec('info patchlevel') || '') + ' — ui demo ready.', 'result');
   shell.print('try:  % ui::text .s.main.note -text hello -variant caption', 'hint');
   shell.print('      % feedpods 100000        ;# 10 万行游标喂数 → .p 表格', 'hint');

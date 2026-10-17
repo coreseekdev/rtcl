@@ -147,9 +147,46 @@ proc feedpods {n {chunk 2000}} {
 }
 `);
 
+  // M6: ui::log —— 追加式日志流。行值 JSON 对象的 level 字段着色
+  // （info/warn/error/debug，样式在 ui-runtime.js 的 CSS）；标量行
+  // 值视为 info。上滚暂停跟随、回底自动恢复。行点击经 lineclick
+  // 回灌（ui::on 绑定；$ui_row = 行号）。
+  rtcl.exec(`
+ui::batch {
+  ui::surface .d -title "Deploy log"
+  ui::text .d.hint -variant caption -text "feed: feedlog 20000 · click a line"
+  ui::log .d.log -path /deploylog -weight 1
+}
+ui::on .d.log lineclick {puts "lineclick \\#$ui_row: [ui::model get /deploylog/$ui_row]"}
+set ::logcursor 0
+`);
+
+  // 游标追加（同 feedpods：每片一个 ui::batch；format 参数与命令同
+  // 物理行——[...] 内换行即命令终结符）。
+  rtcl.exec(`
+proc feedlog {n {chunk 2000}} {
+    # 全局游标：重复调用是追加，不是从 0 重写（日志语义）
+    set levels {info warn error debug}
+    set fed 0
+    while {$fed < $n} {
+        set k [expr {$fed + $chunk > $n ? $n - $fed : $chunk}]
+        ui::batch {
+            for {set j 0} {$j < $k} {incr j} {
+                set i [expr {$::logcursor + $j}]
+                ui::model set /deploylog/$i [format {{"ts":"00:%02d:%02d","level":"%s","text":"step %d: pipeline %s (pid %d)"}} [expr {($i / 60) % 60}] [expr {$i % 60}] [lindex $levels [expr {$i % 4}]] $i [lindex $levels [expr {$i % 4}]] [expr {4000 + $i % 900}]]
+            }
+        }
+        set ::logcursor [expr {$::logcursor + $k}]
+        set fed [expr {$fed + $k}]
+    }
+    return "fed $fed lines (total $::logcursor)"
+}
+`);
+
   shell.print('rtcl ' + (rtcl.exec('info patchlevel') || '') + ' — ui demo ready.', 'result');
   shell.print('try:  % ui::text .s.main.note -text hello -variant caption', 'hint');
   shell.print('      % feedpods 100000        ;# 10 万行游标喂数 → .p 表格', 'hint');
+  shell.print('      % feedlog 20000          ;# 2 万行流式追加 → .d 日志', 'hint');
   shell.print('      % ui::catalog Table      |   % ui::model get /name', 'hint');
   shell.focus();
   status.textContent = 'ready';

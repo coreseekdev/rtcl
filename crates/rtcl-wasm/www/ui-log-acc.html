@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>rtcl ui::log acceptance (headless)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { font-family: monospace; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #term { flex: 1; border-right: 1px solid #30363d; min-width: 0; overflow: auto; }
+  #ui-root { flex: 1; overflow-y: auto; min-width: 0; }
+  #acc { position: fixed; bottom: 0; left: 0; right: 0; max-height: 38vh; overflow: auto; background:#010409; color:#7ee787; font-size:11px; padding:6px 10px; border-top:1px solid #30363d; white-space:pre-wrap; z-index: 9; }
+  #acc b { color:#3fb950; }
+</style>
+</head>
+<body>
+<main>
+  <div id="term"></div>
+  <div id="ui-root"></div>
+</main>
+<pre id="acc">booting…</pre>
+<!-- 堵住 load 事件（--dump-dom --timeout 只能到点转储，页面真实任务先跑完） -->
+<img src="http://127.0.0.1:8766/hang" style="display:none" alt="">
+<script type="module">
+import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+import { createUiRuntime, registerDomRenderers, injectUiStyles } from './ui-runtime.js';
+import { createShell } from './shell.js';
+
+const acc = document.getElementById('acc');
+let accLines = [];
+const log = (s, mark) => { accLines.push((mark ? '  ' + mark + ' ' : '') + s); acc.textContent = accLines.join('\n'); };
+
+// headless --dump-dom + --virtual-time-budget 不泵合成器帧：rAF 竞速
+// 一个 setTimeout 兜底，rAF 未泵时由定时器先到（语义同帧粒度接管）。
+// 顺带量每次被调度的"渲染回调执行耗时"（帧等待不算，真渲染几何才计）。
+const nativeRaf = window.requestAnimationFrame.bind(window);
+const rafExecCosts = [];
+window.requestAnimationFrame = (cb) => {
+  let done = false;
+  const once = (t) => {
+    if (!done) {
+      done = true;
+      const c0 = performance.now();
+      cb(t ?? performance.now());
+      rafExecCosts.push(performance.now() - c0);
+    }
+  };
+  nativeRaf(once);
+  setTimeout(() => once(0), 0);
+  return 0;
+};
+
+const shell = createShell(document.getElementById('term'), {
+  exec: (s) => { if (!rtcl) throw new Error('WASM 尚未就绪'); return rtcl.exec(s); },
+  isComplete: (s) => (rtcl ? rtcl.is_complete(s) : true),
+});
+
+const brace = (s) => '{' + s.replace(/\\/g, '\\\\').replace(/}/g, '\\}') + '}';
+
+let rtcl = null;
+
+async function main() {
+  await init();
+  rtcl = new RtclHandle();
+  rtcl.set_output_handler((s) => shell.print(s.replace(/\n$/, ''), 'puts'));
+  injectUiStyles();
+
+  const fire = (path, event, detail) => {
+    try {
+      rtcl.dispatch_event(detail === undefined
+        ? `::ui::fire ${path} ${event}`
+        : `::ui::fire ${path} ${event} ${detail}`);
+    } catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const commitModel = (path, value) => {
+    try { rtcl.dispatch_event(`ui::model set ${path} ${brace(JSON.stringify(value))}`); }
+    catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const runtime = createUiRuntime(document.getElementById('ui-root'), {
+    fire, commitModel,
+    onError: (m) => shell.print('[ui] ' + m, 'error'),
+  });
+  registerDomRenderers(runtime);
+  rtcl.register_command('_ui', (opsJson) => { runtime.applyOps(JSON.parse(opsJson)); return ''; });
+
+  rtcl.exec('set tcl_interactive 1');
+  window.rtcl = rtcl;
+
+  // ── 与 demo 相同的最小场景：Deploy log 面板（log + lineclick）──
+  rtcl.exec(`
+ui::batch {
+  ui::surface .d -title "Deploy log"
+  ui::text .d.hint -variant caption -text "feed: feedlog 20000 · click a line"
+  ui::log .d.log -path /deploylog -weight 1
+}
+ui::on .d.log lineclick {puts "lineclick \\#$ui_row: [ui::model get /deploylog/$ui_row]"}
+set ::logcursor 0
+proc feedlog {n {chunk 2000}} {
+    # 全局游标：重复调用是追加，不是从 0 重写（日志语义）
+    set levels {info warn error debug}
+    set fed 0
+    while {$fed < $n} {
+        set k [expr {$fed + $chunk > $n ? $n - $fed : $chunk}]
+        ui::batch {
+            for {set j 0} {$j < $k} {incr j} {
+                set i [expr {$::logcursor + $j}]
+                ui::model set /deploylog/$i [format {{"ts":"00:%02d:%02d","level":"%s","text":"step %d: pipeline %s (pid %d)"}} [expr {($i / 60) % 60}] [expr {$i % 60}] [lindex $levels [expr {$i % 4}]] $i [lindex $levels [expr {$i % 4}]] [expr {4000 + $i % 900}]]
+            }
+        }
+        set ::logcursor [expr {$::logcursor + $k}]
+        set fed [expr {$fed + $k}]
+    }
+    return "fed $fed lines (total $::logcursor)"
+}
+`);
+
+  acceptance(runtime).catch(e => log('harness error: ' + (e && e.message || e), 'ERR'));
+}
+
+async function acceptance(runtime) {
+  await new Promise(r => setTimeout(r, 0));   // 让 op 批先落
+
+  // 1) catalog 内省
+  const cat = rtcl.exec('ui::catalog Log');
+  const catOk = cat.includes('-path') && cat.includes('-fill') && cat.includes('-weight') && cat.includes('bind');
+  log(`catalog Log introspection ${catOk ? 'OK' : 'FAIL'}`, '[1]');
+  if (!catOk) log(cat);
+
+  // 2) 2 万行游标追加（验收口径"每秒千行不丢帧"：同步喂数 + 帧成本）
+  const logEl = document.querySelector('.rui-log');
+  const st = logEl._log;
+  const costsBefore = rafExecCosts.length;
+  const t0 = performance.now();
+  const fed = rtcl.exec('feedlog 20000');
+  const feedMs = Math.round(performance.now() - t0);
+  await new Promise(r => requestAnimationFrame(r));   // 泵一帧：同步喂数期间 rAF 定格，渲染看这一帧
+  const feedExec = rafExecCosts.slice(costsBefore);   // 含喂数后那次窗口渲染回调
+  const feedExecAvg = feedExec.reduce((a, b) => a + b, 0) / (feedExec.length || 1);
+  const pinned = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 22;
+  const cs = getComputedStyle(logEl);
+  const chain = [];
+  let cur = logEl;
+  while (cur && cur !== document.body) { chain.push(`${cur.className || cur.tagName}:${cur.clientHeight}/${Math.round(cur.getBoundingClientRect().height)}`); cur = cur.parentElement; }
+  const hasRule = [...document.styleSheets].some(ss => { try { return [...ss.cssRules].some(r => (r.selectorText || '') === '.rui-log'); } catch (e) { return false; } });
+  log(`css: computedH=${cs.height} display=${cs.display} box=${cs.boxSizing} rulePresent=${hasRule} chain=${chain.join(' > ')}`, '[2c]');
+  log(`layout: clientHeight=${logEl.clientHeight} scrollHeight=${logEl.scrollHeight} scrollTop=${logEl.scrollTop} rect=${JSON.stringify(logEl.getBoundingClientRect())}`, '[2d]');
+  log(`feedlog 20000 → ${fed} in ${feedMs}ms (${(20000 / (feedMs / 1000)).toFixed(0)} lines/s); model lines=${st.rows.length}; rendered=${st.spacer.children.length} (pool ${st.pool.size}); following=${st.following}, pinned=${pinned}; render-exec avg ${feedExecAvg.toFixed(3)}ms/${feedExec.length}`, '[2]');
+
+  // 3) follow 钉底 + 尾行渲染 + 级别类名
+  const tailIdx = Math.max(...st.pool.keys());
+  const tail = st.pool.get(tailIdx);
+  const tailCls = tail ? tail.className : '';
+  const tailTxt = tail ? tail._text.textContent : '';
+  log(`tail line #${tailIdx}: "${tailTxt}" class="${tailCls}"`, '[3]');
+  const followOk = pinned && tailIdx === 19999 && tailCls.includes('rui-lv-debug');
+  log(`follow pin-to-bottom ${followOk ? 'OK' : 'FAIL'}`, '[3]');
+
+  // 4) 上滚暂停：位置不动、缓存继续涨；回底恢复
+  logEl.scrollTop = 500 * 22;
+  logEl.dispatchEvent(new Event('scroll'));
+  await new Promise(r => requestAnimationFrame(r));
+  const pausedFollowing = st.following;
+  const scrollTopAtPause = logEl.scrollTop;
+  const poolAtPause = [...st.pool.keys()].join(',');
+  const t2 = performance.now();
+  rtcl.exec('feedlog 2000');
+  const feed2Ms = Math.round(performance.now() - t2);
+  await new Promise(r => requestAnimationFrame(r));
+  const keptScroll = logEl.scrollTop === scrollTopAtPause && [...st.pool.keys()].join(',') === poolAtPause;
+  log(`pausedFollowing=${pausedFollowing}, st.n=${st.n} (expect 22000); scroll kept=${keptScroll}; +2000 lines in ${feed2Ms}ms while paused`, '[4]');
+  // 回底 → 恢复
+  logEl.scrollTop = logEl.scrollHeight - logEl.clientHeight;
+  logEl.dispatchEvent(new Event('scroll'));
+  await new Promise(r => requestAnimationFrame(r));
+  const tailIdx2 = Math.max(...st.pool.keys());
+  const resumeOk = st.following && tailIdx2 === 21999;
+  log(`resume: following=${st.following}, tail=#${tailIdx2} ${resumeOk ? 'OK' : 'FAIL'}`, '[4b]');
+
+  // 5) 点行 → Tcl 回调 → puts 进 shell transcript
+  const term = document.getElementById('term');
+  st.pool.get(21999).dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 0));
+  const gotClick = term.textContent.includes('lineclick #21999');
+  log(`lineclick → shell${gotClick ? '' : ' MISSING'}`, '[5]');
+  const tail5 = term.textContent.trim().split('\n').slice(-2).join(' ⏎ ');
+  log(`shell tail: ${tail5}`, '[5b]');
+
+  // 6) 单行重写（原位） + 标量行值 + 级别类名注入边界
+  const before = st.pool.get(21999);
+  rtcl.exec('ui::model set /deploylog/21999 {{"level":"error","text":"step 21999: FAILED"}}');
+  const after = st.pool.get(21999);
+  const singleOk = before === after && after._text.textContent === 'step 21999: FAILED' && after.className.includes('rui-lv-error');
+  // 标量行值检查：0 行在池外，先滚回顶部把它拉进窗口（此后 following=false，
+  // 是本 harness 最后一步，不影响其他判据）
+  logEl.scrollTop = 0;
+  logEl.dispatchEvent(new Event('scroll'));
+  await new Promise(r => requestAnimationFrame(r));
+  rtcl.exec('ui::model set /deploylog/0 plain-scalar-line');
+  await new Promise(r => requestAnimationFrame(r));
+  const line0 = st.pool.get(0);
+  const scalarOk = line0 && line0.className.includes('rui-lv-info') && line0._text.textContent === 'plain-scalar-line';
+  log(`single-line in-place=${singleOk}; scalar-line info fallback=${scalarOk}`, '[6]');
+
+  const all = catOk && followOk && st.rows.length === 22000 && st.n === 22000 && !pausedFollowing && keptScroll && resumeOk && gotClick && singleOk && scalarOk && st.pool.size <= 32 && feedExecAvg < 8 && feedMs < 15000;
+  log(`VERDICT: ${all ? 'PASS' : 'FAIL'}`, 'END');
+  acc.title = all ? 'acc-pass' : 'acc-fail';
+}
+
+main().catch((e) => {
+  log('failed to init: ' + (e && e.message || e), 'ERR');
+});
+</script>
+</body>
+</html>

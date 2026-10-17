@@ -38,7 +38,7 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 | `ui::log` | ✅ v1 | 流式追加渲染器 + 级别着色 + 跟随/暂停（正则高亮留 §8）；`-path` 行数组游标追加 | 2 万行 756ms（~26k 行/s）；上滚暂停/回底恢复 |
 | `ui::kv` / `ui::tree` | ✅ v1 | 详情双件套；kv `-keys` 键序 + 单键增量；tree 折叠预览 + 点击展开（DOM 惰性物化） | 嵌套模型渲染；展开/折叠零 Tcl 往返 |
 | `ui::chart -vegalite` | ✅ v1 | Vega-Lite 子集（line/bar/point/area，x 序数等距）；spec 过桥、数据走 model 通道（spec.data.name） | 500 点流式 16ms；rAF 合并重绘 0.25ms/帧；组件/spec 不重建 |
-| `ui::trace` | 缺失 | span 树甘特图（运维场景唯一新渲染原语） | span 折叠/缩放 |
+| `ui::trace` | ✅ v1 | span 树甘特图；折叠不改对齐、点条缩放/复位全客户端 | 6 行瀑布全交互零 Tcl 回灌 |
 | `ui::form` / `ui::confirm` | 缺失 | schema 驱动表单；模态动作走 -command 回调（禁 vwait） | confirm 不阻塞事件循环 |
 | `ui::tabs` | 缺失 | surface 内组织 | 切换保各页状态 |
 | markdown `-text` | 缺失 | 渲染需 sanitize | XSS 用例全拒 |
@@ -113,5 +113,5 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 检视器：L1 稳定后，与 L3 并行
 ```
 
-建议下一块：**`ui::trace`**（P1 下一件——span 树甘特图，运维场景
-唯一的渲染新原语；P0 三件 + chart 已齐）。
+建议下一块：**`ui::confirm`**（P1 尾声——模态动作走 `-command`
+回调，浏览器纪律下禁 vwait 的关键件；P0 三件 + chart/trace 已齐）。

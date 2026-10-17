@@ -17,16 +17,30 @@ wasm-encoder = "0.261"
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 
+# jit-exec: in-process executor (wasmi) + the `jitsh` driver binary —
+# the M1' engine for judge --engine jit and benches.  wasmi was already
+# approved as the test engine (M0); promoting it to an optional real
+# dependency keeps default builds untouched.
+rtcl-core = { path = "../rtcl-core", optional = true, default-features = false, features = ["std"] }
+rtcl-parser = { path = "../rtcl-parser", optional = true }
+rtcl-vm = { path = "../rtcl-vm", optional = true }
+wasmi = { version = "2.0", optional = true }
+
 [dev-dependencies]
 rtcl-parser = { path = "../rtcl-parser" }
-# Test-only engine: a small pure-Rust wasm interpreter used to verify the
-# emitter's output end-to-end on the native side.  Production engines are
-# js-sys (jit-wasm) and wasmtime (jit-native, lands with M1).
+# Test-only engine for emitter round-trips (also the jit-exec engine).
 wasmi = "2.0"
+
+[[bin]]
+name = "jitsh"
+path = "src/bin/jitsh.rs"
+required-features = ["jit-exec"]
 
 [features]
 default = []
 jit-wasm = ["dep:js-sys", "dep:wasm-bindgen"]
-# wasmtime-backed native instantiation lands with JIT M1 (kept as a stub
-# feature for now so the feature matrix compiles in both states).
+# wasmtime-backed native instantiation（M1' 起接线；wasmtime 构建内存
+# 预算见 HANDOFF §6 M0 注记——jit-native 尝试记录见任务回报）。
 jit-native = []
+# wasmi 执行器 + jitsh 驱动（judge --engine jit 的引擎）。
+jit-exec = ["dep:wasmi", "dep:rtcl-core", "dep:rtcl-parser", "dep:rtcl-vm"]

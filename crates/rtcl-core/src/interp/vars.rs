@@ -1081,52 +1081,93 @@ impl Interp {
         }
     }
 
-    /// Take a value out of its store for in-place mutation, following
-    /// exactly one `variable` command link (`UpvarLink::Global` — the
-    /// proc-level alias a `variable` declaration installs to the owning
-    /// namespace's variable table).  Same contract and guard spirit as
-    /// `take_var_fast`: traces, dead links, element names and array
-    /// targets bail (the caller then takes the generic path, which owns
-    /// creations and every error text), and the caller MUST put the
-    /// value back with `set_var` on the ORIGINAL name — which walks the
-    /// same link — before any user code runs.
+    /// Take a value out of its store for in-place mutation when plain
+    /// frame-local travel won't do: the proc-level `variable` command
+    /// link (`UpvarLink::Global` — the alias a `variable` declaration
+    /// installs to the owning namespace's variable table), qualified
+    /// names (`::m …`), and bare/relative-qualified names at eval level
+    /// under the namespace's canonical write key.  Same contract and
+    /// guard spirit as `take_var_fast`: traces, dead links, element
+    /// names and array targets bail (the caller then takes the generic
+    /// path, which owns creations and every error text), and the caller
+    /// MUST put the value back with `set_var` on the ORIGINAL name —
+    /// which walks the same link/resolution — before any user code
+    /// runs.
     ///
-    /// `dict set`'s nested structural fast path uses this so namespace
-    /// declares like `variable model`, `dict set model …` (the ui model
-    /// writers) stay O(1) per op instead of paying the O(n) rebuild.
-    /// Only proc-level links fast-path; eval-level `variable` aliases
-    /// (flat aliases) and upvar-to-frame keep the old route.
+    /// The store keys here mirror `store_var`/`resolve_loc` exactly
+    /// (`redirect_flat` over the split/canonical forms), so the take and
+    /// the put-back can never have landed on different slots.
+    ///
+    /// `dict set`'s nested structural fast path uses this so
+    /// namespace/qualified model writers (`variable model`,
+    /// `dict set model …`; `dict set ::ui::model …`) stay O(1) per op
+    /// instead of paying the O(n) rebuild.  upvar-to-Frame and dead
+    /// links keep the old route.
     pub(crate) fn take_var_fast_link(&mut self, name: &str) -> Option<Value> {
-        if has_ns_sep(name)
-            || name.contains('(')
+        if name.contains('(')
             || !self.var_traces.is_empty()
             || !self.dead_flat.is_empty()
         {
             return None;
         }
-        let target = match self.frames.last()?.upvars.get(name) {
-            Some(UpvarLink::Global(g)) => g.clone(),
-            Some(_) | None => return None,
-        };
-        // The link target is the owning namespace's qualified name; keep
-        // the eval-level flat-alias redirect in step with resolve_var's
-        // read path (resolve_var: redirect_flat(gname) then globals).
-        let key = self.redirect_flat(target.clone());
-        if !self.arrays_env_only && self.array_globals.contains(key.as_str()) {
-            return None; // array target: scalar writes take the generic path
+
+        // (0) Leading-`::` names are frame-independent: even inside a
+        //     proc they address the global table (resolve_loc's
+        //     split_global arm short-circuits the frame walk).  Same
+        //     key math, so take and put-back can't split.
+        if let Some(gname) = Self::split_global(name) {
+            let key = self.redirect_flat(gname);
+            if key.contains('(')
+                || (!self.arrays_env_only && self.array_globals.contains(key.as_str()))
+            {
+                return None;
+            }
+            return self.globals.remove(key.as_str());
         }
-        // Release the `variable` command's seeded local hold as well: the
-        // seed (namespace.rs `cmd_variable`) shares the same Value rep as
-        // the global, and leaving it in place pins the old rep so every
-        // in-place write COW-copies the whole dict (the O(n)-per-op
-        // hotspot in hot `variable`+`dict set` loops).  Reads refresh
-        // from the global (resolve_var consults the global first); the
-        // seed only keeps a mid-proc-deleted namespace variable readable,
-        // and nothing observes the take→put window — the caller writes
-        // straight through with set_var on the original name before any
-        // user code can run.
-        if let Some(frame) = self.frames.last_mut() {
-            frame.locals.remove(name);
+
+        // (1) Proc level: only the `variable` command's namespace link.
+        //     Unlinked proc locals were handled by take_var_fast.
+        if let Some(frame) = self.frames.last() {
+            let target = match frame.upvars.get(name) {
+                Some(UpvarLink::Global(g)) => g.clone(),
+                _ => return None,
+            };
+            // The link target is the owning namespace's qualified name;
+            // keep the eval-level flat-alias redirect in step with
+            // resolve_var's read path (resolve_var: redirect_flat(gname)
+            // then globals).
+            let key = self.redirect_flat(target);
+            if key.contains('(')
+                || (!self.arrays_env_only && self.array_globals.contains(key.as_str()))
+            {
+                return None; // element/array target: scalar writes take the generic path
+            }
+            // Release the `variable` command's seeded local hold as well:
+            // the seed (namespace.rs `cmd_variable`) shares the same Value
+            // rep as the global, and leaving it in place pins the old rep
+            // so every in-place write COW-copies the whole dict (the
+            // O(n)-per-op hotspot in hot `variable`+`dict set` loops).
+            // Reads refresh from the global (resolve_var consults the
+            // global first); the seed only keeps a mid-proc-deleted
+            // namespace variable readable, and nothing observes the
+            // take→put window — the caller writes straight through with
+            // set_var on the original name before any user code can run.
+            if let Some(frame) = self.frames.last_mut() {
+                frame.locals.remove(name);
+            }
+            return self.globals.remove(key.as_str());
+        }
+
+        // (2) Eval level: qualified (`::m`), relative-qualified (`sub::m`)
+        //     and bare names all canonicalize to the namespace's
+        //     canonical WRITE key (store_var's eval arm: every write in a
+        //     namespace lands in that namespace's variable), through the
+        //     flat-alias redirect exactly as resolve_loc computes it.
+        let key = self.redirect_flat(self.canonical_global(name));
+        if key.contains('(')
+            || (!self.arrays_env_only && self.array_globals.contains(key.as_str()))
+        {
+            return None;
         }
         self.globals.remove(key.as_str())
     }

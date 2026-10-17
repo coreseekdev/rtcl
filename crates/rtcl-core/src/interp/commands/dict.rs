@@ -1482,6 +1482,42 @@ mod tests {
         assert_eq!(r.as_str(), "21 1 {p {alpha 21 seen 1 beta 5}}");
     }
 
+    #[test]
+    fn test_dict_nested_set_qualified_name() {
+        // `dict set ::m …` inside a proc — the qualified name is
+        // frame-independent, so take_var_fast_link's split_global arm
+        // addresses the global store directly.  Output verified against
+        // tclsh 8.6.
+        let mut interp = Interp::new();
+        let r = interp
+            .eval(r#"set ::m [dict create]
+                proc wq {n} { for {set i 0} {$i < $n} {incr i} { dict set ::m pods $i x $i } }
+                wq 100
+                list [dict get $::m pods 99 x] [dict get $::m pods 99] [dict size $::m]"#)
+            .unwrap();
+        assert_eq!(r.as_str(), "99 {x 99} 1");
+    }
+
+    #[test]
+    fn test_dict_nested_set_namespace_eval_bare_and_relative() {
+        // `namespace eval` bodies run at eval level: bare names write the
+        // namespace's canonical variable and relative-qualified names
+        // nest under the current namespace (a write never lands on a
+        // global-named "shadow").  Output verified against tclsh 8.6.
+        let mut interp = Interp::new();
+        let r = interp
+            .eval(
+                r#"namespace eval tb { dict set q pods 0 v 1 ; dict set q pods 1 v 2 ; dict set q pods 0 w 3 }
+                namespace eval tc { dict set sc pods 0 x 1 ; dict set sc pods 1 x 2 ; dict set sc pods 9 x 9 }
+                list [set ::tb::q] [set ::tc::sc]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            r.as_str(),
+            "{pods {0 {v 1 w 3} 1 {v 2}}} {pods {0 {x 1} 1 {x 2} 9 {x 9}}}"
+        );
+    }
+
     // ── Ordered-specific tests ─────────────────────────────────
 
     #[test]

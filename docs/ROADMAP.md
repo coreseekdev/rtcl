@@ -37,7 +37,7 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 | `ui::table` | ✅ v1 | 列定义 + **虚拟滚动 + 游标喂数**（禁一次性全量）；`-rowactions` 行事件 | 10 万行流畅滚动；模型子路径增量追加 |
 | `ui::log` | ✅ v1 | 流式追加渲染器 + 级别着色 + 跟随/暂停（正则高亮留 §8）；`-path` 行数组游标追加 | 2 万行 756ms（~26k 行/s）；上滚暂停/回底恢复 |
 | `ui::kv` / `ui::tree` | ✅ v1 | 详情双件套；kv `-keys` 键序 + 单键增量；tree 折叠预览 + 点击展开（DOM 惰性物化） | 嵌套模型渲染；展开/折叠零 Tcl 往返 |
-| `ui::chart -vegalite` | 缺失 | spec 过桥、数据走 model 通道（图表定义与数据分离） | 时序数据刷新图表不重排 |
+| `ui::chart -vegalite` | ✅ v1 | Vega-Lite 子集（line/bar/point/area，x 序数等距）；spec 过桥、数据走 model 通道（spec.data.name） | 500 点流式 16ms；rAF 合并重绘 0.25ms/帧；组件/spec 不重建 |
 | `ui::trace` | 缺失 | span 树甘特图（运维场景唯一新渲染原语） | span 折叠/缩放 |
 | `ui::form` / `ui::confirm` | 缺失 | schema 驱动表单；模态动作走 -command 回调（禁 vwait） | confirm 不阻塞事件循环 |
 | `ui::tabs` | 缺失 | surface 内组织 | 切换保各页状态 |
@@ -113,6 +113,5 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 检视器：L1 稳定后，与 L3 并行
 ```
 
-建议下一块：**`ui::chart -vegalite`**（P1 之首——P0 三件已齐
-（table/log 数据面 + kv/tree 详情面）；图表定义与数据分离，数据
-走 model 通道）。
+建议下一块：**`ui::trace`**（P1 下一件——span 树甘特图，运维场景
+唯一的渲染新原语；P0 三件 + chart 已齐）。

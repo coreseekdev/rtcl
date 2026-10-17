@@ -209,6 +209,12 @@ ui::define Button {
   + demo（点 Pods 行 → 行 JSON 转喂 `/pod`，kv/tree 同源）+ 验收页
   （crates/rtcl-wasm/www/ui-detail-acc.html）。子路径增量由渲染器
   本地合成（运行时 model 平表语义，见 §8 条目 8）
+- M8 ✅ `ui::chart -vegalite` v1（L1 数据分析组件，2025-10-17）：
+  `-vegalite` 走新 json kind（spec 原样过桥，词表层先 `json decode`
+  校验）+ JS 渲染器（Vega-Lite 子集：mark line/bar/point/area，
+  x/y field 编码，x 序数等距；数据走 model 通道 `spec.data.name`，
+  增量 append 合并 rAF 重绘，spec 不变组件不重建）+ demo 流式 CPU
+  图 + ui-chart-acc.html。完整 Vega-Lite 语法需引入库（§8 条目 11）
 
 ## 8. 变更建议（v1 落地中发现的缺口；本节只记录，未改协议）
 
@@ -272,3 +278,16 @@ L1 分子组件，已落地）实现过程中踩实，属于**契约缺口候选
 10. **tree 展开无子节点上限**：折叠态 DOM 有界，但展开一个万级
     数组/对象会一次物化全部子行。超大节点需要分页/上限（v1 记
     缺口，等真实流量的拉动）。
+
+以下条目在 `ui::chart`（M8）落地过程中踩实：
+
+11. **Vega-Lite 只实现子集**（v1，零新依赖的取舍）：支持 mark
+    line/bar/point/area + x/y 的 field 编码；缺 transforms
+    （aggregate/filter/bin）、color/系列拆分、tooltip/selection、
+    nice 轴与时间轴、图例。完整语法 = 引入 vega-lite 库（与
+    "不引新 JS 依赖"冲突，需要契约评审定 vendoring 路线）；扩展
+    建议按真实场景逐项加子集，而不是一次全量。
+12. **chart 数据窗口/降采样**：v1 渲染全部行（500 点 rAF 重绘
+    实测 0.25ms/帧）；万级点会线性推高多边形顶点与标签成本，滚动
+    窗口（保留最近 N 点）与降采样未做。另：非对象行/非数值 y 在
+    渲染时防御性跳过（静默）——数据质量校验归喂数侧。

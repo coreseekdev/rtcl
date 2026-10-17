@@ -471,6 +471,125 @@ runtime.registerRenderer('Table', {
     tableResolveActions(st, hp.events);
   },
 });
+
+// ── Log：追加式日志流（UI-RESEARCH §3.2）────────────────────────
+// 模型是行数组（ui::model set /deploylog/i 一次一行，与 Table 同款
+// 游标/前缀扇出）。DOM 只留窗口行：spacer 撑总高 + 行 translateY
+// 绝对定位（与 Table 同构）。行值 JSON 对象的 level 字段挂颜色类
+// （样式在 injectUiStyles；类名只取词表字符，未知/非法落 info）；
+// 标量行值视为 info。follow：贴底时新行自动钉底；用户上滚即暂停，
+// 滚回底部自动恢复。行事件 lineclick 容器委托（events 含 lineclick
+// 才挂，事件名是 Tcl 侧的转发开关）。正则高亮 v1 不做。
+const LOG_ROW_H = 22;
+const LOG_BUF = 8;
+
+function logScheduleWindow(st) {
+  if (st.pending) return;
+  st.pending = true;
+  requestAnimationFrame(() => { st.pending = false; logRenderWindow(st); });
+}
+
+function logRenderWindow(st) {
+  const height = st.el.clientHeight || 320;
+  const first = Math.max(0, Math.floor(st.el.scrollTop / LOG_ROW_H) - LOG_BUF);
+  const end = Math.min(st.n, first + Math.ceil(height / LOG_ROW_H) + LOG_BUF * 2);
+  for (const [idx, rel] of st.pool) {
+    if (idx < first || idx >= end) { rel.remove(); st.pool.delete(idx); }
+  }
+  for (let i = first; i < end; i++) {
+    let r = st.pool.get(i);
+    if (r === undefined) {
+      r = logMakeLine(st, i);
+      st.spacer.appendChild(r);
+      st.pool.set(i, r);
+      logFillLine(st, r);
+    }
+  }
+}
+
+function logMakeLine(st, idx) {
+  const r = h('div', 'rui-log-line');
+  r.dataset.idx = idx;
+  r.style.transform = `translateY(${idx * LOG_ROW_H}px)`;
+  r._text = h('span', 'rui-log-text');
+  r.appendChild(r._text);
+  return r;
+}
+
+function logFillLine(st, r) {
+  const row = st.rows[+r.dataset.idx];
+  let text = '';
+  let level = 'info';
+  if (row != null) {
+    if (typeof row === 'object') {
+      text = row.text == null ? '' : String(row.text);
+      // level 进 CSS 类名：只放词表字符，其余落默认（类名注入边界）
+      level = /^[A-Za-z0-9_-]+$/.test(String(row.level ?? '')) ? String(row.level) : 'info';
+    } else {
+      text = String(row);
+    }
+  }
+  r.className = `rui-log-line rui-lv-${level}`;
+  r._text.textContent = text;   // 值来自 JSON，转义即安全（不拼 HTML）
+}
+
+function logSetDataAll(st, v) {
+  if (v === undefined) st.rows = [];
+  else if (Array.isArray(v)) st.rows = v;
+  else throw new Error(`Log ${st.path}: model "${st.bindPath}" must be a JSON array of lines`);
+  st.n = st.rows.length;
+  st.spacer.style.height = (st.n * LOG_ROW_H) + 'px';
+  st.spacer.replaceChildren();   // 全量替换：窗口行节点重建
+  st.pool.clear();
+  if (st.following) st.el.scrollTop = st.el.scrollHeight;   // 全量后仍钉底
+  logRenderWindow(st);
+}
+
+function logLineDelta(st, i, v) {
+  st.rows[i] = v;
+  if (i + 1 > st.n) {
+    st.n = i + 1;
+    st.spacer.style.height = (st.n * LOG_ROW_H) + 'px';
+  }
+  const r = st.pool.get(i);
+  if (r !== undefined) logFillLine(st, r);   // 窗口内：原位写行
+  if (st.following) st.el.scrollTop = st.el.scrollHeight;   // follow 钉底
+  logScheduleWindow(st);   // 游标追加的窗口自亮（同 Table 的增量路径）
+}
+
+function logOnModelEvent(st, sub, v) {
+  if (sub === undefined || sub === st.bindPath) { logSetDataAll(st, v); return; }
+  const rest = sub.slice(st.bindPath.length + 1);
+  if (/^\d+$/.test(rest)) logLineDelta(st, +rest, v);
+}
+
+runtime.registerRenderer('Log', {
+  create(path, props, hp) {
+    const el = h('div', 'rui-log');
+    const spacer = h('div', 'rui-log-spacer');
+    el.append(spacer);
+    const st = { path, bindPath: typeof hp.bind === 'object' ? hp.bind.path : null, el, spacer, rows: [], n: 0, pool: new Map(), pending: false, following: true };
+    el._log = st;
+    if (hp.bind) {
+      hp.bind.subscribe((v, sub) => logOnModelEvent(st, sub, v));
+      const init = hp.bind.get();
+      if (init !== undefined) logSetDataAll(st, init);
+    }
+    el.addEventListener('scroll', () => {
+      st.following = st.el.scrollTop + st.el.clientHeight >= st.el.scrollHeight - LOG_ROW_H;
+      logScheduleWindow(st);
+    }, { passive: true });
+    if (Array.isArray(hp.events) && hp.events.includes('lineclick')) {
+      el.addEventListener('click', (e) => {
+        const line = e.target.closest('.rui-log-line');
+        if (line) hp.fire('lineclick', line.dataset.idx);
+      });
+    }
+    logRenderWindow(st);
+    return el;
+  },
+  update(el, props, hp) { /* v1: Log 无专有可更新选项（-path 变化走重建） */ },
+});
 }
 
 // ── 默认暗色主题（样式全在这里，渲染器不带样式）────────────────────────
@@ -514,6 +633,14 @@ export function injectUiStyles() {
 .rui-td-acts { flex:0 0 auto; display:flex; gap:6px; padding:0 8px; }
 .rui-act { background:#21262d; color:#58a6ff; border:1px solid #30363d; border-radius:4px; padding:2px 8px; font:inherit; font-size:11px; cursor:pointer; }
 .rui-act:hover { background:#30363d; }
+/* ui::log —— 追加式日志流；行高 22px 须与 ui-runtime.js 的
+   LOG_ROW_H 同步（box-sizing:border-box 锁定）。 */
+.rui-log { position:relative; height:320px; overflow-y:auto; background:#0a0c10; border:1px solid #30363d; border-radius:6px; font:12px/22px ui-monospace, SFMono-Regular, Menlo, monospace; color:#c9d1d9; }
+.rui-log-spacer { position:relative; }
+.rui-log-line { position:absolute; left:0; right:0; top:0; height:22px; box-sizing:border-box; display:flex; align-items:center; white-space:nowrap; overflow:hidden; }
+.rui-log-line.rui-lv-warn { color:#d29922; }
+.rui-log-line.rui-lv-error { color:#f85149; }
+.rui-log-line.rui-lv-debug { color:#8b949e; }
 `;
   document.head.appendChild(style);
 }

@@ -534,3 +534,45 @@ fn kv_tree_catalog_shows_options_and_layout() {
     assert!(all.contains("Kv"), "{all}");
     assert!(all.contains("Tree"), "{all}");
 }
+
+// ── Chart：Vega-Lite spec（JSON kind）过桥 ─────────────────────
+
+#[test]
+fn chart_create_passes_vegalite_spec_raw() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp
+        .eval(r#"ui::chart .s.c -vegalite {{"data":{"name":"/cpu"},"mark":"line","encoding":{"x":{"field":"t"},"y":{"field":"v","type":"quantitative"}}}} -weight 1"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    // spec 原样过线（json kind 不重编码）：数据路径在 spec 里
+    // （data.name），图表定义与数据分离。
+    assert!(
+        log.contains(concat!(
+            r#"{"op":"create","path":".s.c","type":"Chart","#,
+            r#""props":{"vegalite":{"data":{"name":"/cpu"},"mark":"line","encoding":{"x":{"field":"t"},"y":{"field":"v","type":"quantitative"}}},"weight":1},"events":[]}"#
+        )),
+        "chart create op: {log}"
+    );
+}
+
+#[test]
+fn chart_invalid_json_is_tcl_error() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    let e = interp.eval(r#"ui::chart .s.c -vegalite {not json}"#).unwrap_err();
+    assert!(e.to_string().contains("expected JSON"), "{e}");
+    // 坏 spec 不产生 op
+    assert_eq!(op_log(&mut interp).lines().count(), 1, "no op for bad spec");
+}
+
+#[test]
+fn chart_catalog_shows_options_and_layout() {
+    let mut interp = setup();
+    let c = interp.eval("ui::catalog Chart").unwrap().as_str().to_string();
+    for opt in ["-vegalite", "-fill", "-weight", "-gap"] {
+        assert!(c.contains(opt), "catalog Chart missing {opt}: {c}");
+    }
+    let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
+    assert!(all.contains("Chart"), "{all}");
+}

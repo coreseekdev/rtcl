@@ -74,6 +74,13 @@ proc ::ui::_check_value {type opt kind meta value} {
                 error "bad value \"$value\" for $opt on $type: expected size (number, optional px/%/em/rem/ch/vw)"
             }
         }
+        json {
+            # 原样过桥的 JSON payload（-vegalite 等）：词表层先验语法，
+            # 坏了就是 Tcl 错误——别让非法 JSON 到 JS 侧才炸。
+            if {[catch {json decode $value}]} {
+                error "bad value \"$value\" for $opt on $type: expected JSON"
+            }
+        }
     }
 }
 
@@ -610,4 +617,25 @@ proc ::ui::model {sub args} {
 # 状态重绘可见节点。
 ::ui::define Tree {
     -path {bind {} {}}
+}
+
+# 图表（L1 数据分析组件；UI-RESEARCH §2.2/§2.3）。-vegalite 是
+# JSON 类选项：payload 即 Vega-Lite spec（v1 支持子集），原样过桥。
+# 数据走 model 通道（图表定义与数据分离）：spec 的
+# "data":{"name":"<模型路径>"} 声明数据起点——行数组，游标喂数同
+# Table/Log；渲染器订阅该前缀，增量 append 只重绘图形（rAF 合并），
+# spec 不变不重建组件。
+#
+#   ui::chart .c -vegalite {
+#     {"data": {"name": "/cpu"},
+#      "mark": "line",
+#      "encoding": {"x": {"field": "t"}, "y": {"field": "v", "type": "quantitative"}}}
+#   }
+#   （一层 {…} 在传参时就被剥掉，JSON 外层大括号要写在引词花括号里面
+#    ——与 model 行 JSON 的双大括号规则同源。）
+#
+# v1 支持 mark: line/bar/point/area；x 一律按序数等距摆放（时序
+# 标签原样显示）；完整 Vega-Lite 语法需引入库（docs/UI-DSL.md §8）。
+::ui::define Chart {
+    -vegalite {json {} {}}
 }

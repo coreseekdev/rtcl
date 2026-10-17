@@ -51,7 +51,7 @@ const shell = createShell(document.getElementById('term'), {
 });
 
 // Tcl 大括号引用：内层 } 与 \ 转义（嵌套 {} 自然平衡）
-const brace = (s) => '{' + s.replace(/\\/g, '\\\\').replace(/}/g, '\\}') + '}';
+const brace = (s) => '{' + s.replace(/\\/g, '\\\\').replace(/\{/g, '\\{').replace(/\}/g, '\\}') + '}';
 
 async function main() {
   await init();

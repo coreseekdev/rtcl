@@ -37,7 +37,7 @@ const shell = createShell(document.getElementById('term'), {
   exec: (s) => { if (!rtcl) throw new Error('WASM 尚未就绪'); return rtcl.exec(s); },
   isComplete: (s) => (rtcl ? rtcl.is_complete(s) : true),
 });
-const brace = (s) => '{' + s.replace(/\\/g, '\\\\').replace(/}/g, '\\}') + '}';
+const brace = (s) => '{' + s.replace(/\\/g, '\\\\').replace(/\{/g, '\\{').replace(/\}/g, '\\}') + '}';
 
 let rtcl = null;
 

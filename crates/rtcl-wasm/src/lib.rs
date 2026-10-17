@@ -1,6 +1,7 @@
 mod js_command;
 mod clock;
 mod output;
+pub mod jit_abi;
 
 use wasm_bindgen::prelude::*;
 use rtcl_core::Interp;

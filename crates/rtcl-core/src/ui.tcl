@@ -8,6 +8,7 @@
 namespace eval ::ui {
     variable catalog  [dict create]   ;# type -> dict(option -> {kind meta default})
     variable widgets  [dict create]   ;# path -> type
+    variable props    [dict create]   ;# path -> 规范化 props（快照用，契约 §2.6）
     variable handlers [dict create]   ;# "$path|$event" -> script list
     variable events   [dict create]   ;# path -> 已告知 JS 转发的事件名
     variable model    [dict create]   ;# Tcl 侧模型树
@@ -81,6 +82,12 @@ proc ::ui::_encode_value {kind value} {
         number  { json encode $value num }
         bool    { json encode $value bool }
         json    { return $value }
+        list {
+            # Tcl 列表 → JSON 数组（-columns 等键名列表；元素各自编码）
+            set parts [list]
+            foreach e $value { lappend parts [json encode $e str] }
+            return "\[[join $parts ,]\]"
+        }
         default { json encode $value str }
     }
 }
@@ -144,7 +151,7 @@ proc ::ui::define {type spec} {
             error "ui::define $type: bad spec entry for $opt (need {kind meta default})"
         }
         set kind [lindex $entry 0]
-        if {[lsearch -exact {string script enum number bool json bind size} $kind] < 0} {
+        if {[lsearch -exact {string script enum number bool json bind size list} $kind] < 0} {
             error "ui::define $type: unknown kind \"$kind\" for $opt"
         }
         # catalog 里选项名统一不带前导短横（词表写作 -text，解析键为 text）
@@ -216,9 +223,27 @@ proc ::ui::_parse_options {type path optvals} {
         ::ui::_check_value $type $opt $kind $meta $val
         switch -- $kind {
             script {
+                # script 类选项留在 Tcl 侧注册（Tk -command 语义），JS 只
+                # 收到"转发此事件"的标记（events 数组）。
                 if {$name eq "command"} {
                     ::ui::_bind $path click $val
                     if {[lsearch -exact $newev click] < 0} { lappend newev click }
+                } elseif {$name eq "rowactions"} {
+                    # -rowactions {open {…} del {…}}：动作名→脚本 dict。
+                    # 脚本不过桥；JS 经 events 数组拿到动作名（渲染器在
+                    # 行尾画按钮），点击回灌 fire <path> row<动作> <行号>。
+                    if {[llength $val] % 2 != 0} {
+                        error "$type $path: -rowactions must be event script pairs"
+                    }
+                    foreach {k s} $val {
+                        if {![regexp {^[A-Za-z][A-Za-z0-9_-]*$} $k]} {
+                            error "$type $path: bad rowaction name \"$k\":\
+                                   letter first, then letters/digits/_/" \
+                                ;# 措辞不带方括号：双引号里 [ ] 是命令替换
+                        }
+                        ::ui::_bind $path row$k $s
+                        if {[lsearch -exact $newev row$k] < 0} { lappend newev row$k }
+                    }
                 }
                 continue
             }
@@ -260,14 +285,20 @@ proc ::ui::on {path event script} {
 
 # JS 事件回灌入口：dispatch_event("::ui::fire .s.b click")。
 # 回调脚本在全局作用域执行（Tk 语义）。
-proc ::ui::fire {path event} {
+# 可选第三参 = 事件的行级参数（ui::table 行事件回灌行号，如
+# "::ui::fire .s.t rowopen 42"）：rowaction/-command 一类脚本经调用方
+# 作用域里的 $ui_row 读取（Tk % 替换的轻量替身——v1 不做通用
+# 替换机制）。无 detail 的 fire 不设该变量；回调结束即清理。
+proc ::ui::fire {path event {detail ""}} {
     variable handlers
     set key "$path|$event"
     if {![dict exists $handlers $key]} { return "" }
     set result ""
+    if {$detail ne ""} { uplevel 1 [list set ui_row $detail] }
     foreach script [dict get $handlers $key] {
         set result [uplevel 1 $script]
     }
+    if {$detail ne ""} { uplevel 1 [list unset -nocomplain ui_row] }
     return $result
 }
 
@@ -297,6 +328,7 @@ proc ::ui::_create {type path arglist} {
         }
     }
     dict set widgets $path $type
+    dict set ::ui::props $path $props
     if {![dict exists $events $path]} { dict set events $path [list] }
     foreach e $newev {
         if {[lsearch -exact [dict get $events $path] $e] < 0} {
@@ -314,6 +346,11 @@ proc ::ui::configure {path args} {
     set evlist [list]
     if {[dict exists $events $path]} { set evlist [dict get $events $path] }
     lassign [::ui::_parse_options [dict get $widgets $path] $path $args] props newev
+    # 快照注册表合并（契约 §2.6：snapshot 从注册表反生成）
+    set cur [dict create]
+    if {[dict exists $::ui::props $path]} { set cur [dict get $::ui::props $path] }
+    dict for {k v} $props { dict set cur $k $v }
+    dict set ::ui::props $path $cur
     ::ui::_emit_set $path $props $evlist
     return $path
 }
@@ -330,6 +367,7 @@ proc ::ui::destroy {path} {
     foreach p $doomed {
         dict unset widgets $p
         if {[dict exists $events $p]} { dict unset events $p }
+        if {[dict exists $::ui::props $p]} { dict unset ::ui::props $p }
         dict for {k v} $handlers {
             if {[string match "$p|*" $k]} { dict unset handlers $k }
         }
@@ -355,6 +393,7 @@ proc ::ui::batch {script} {
     set saved_handlers $handlers
     set saved_events $events
     set saved_model $model
+    set saved_props $::ui::props
     set code [catch {uplevel 1 $script} result]
     set batching 0
     set ops $batchops
@@ -364,12 +403,82 @@ proc ::ui::batch {script} {
         set handlers $saved_handlers
         set events $saved_events
         set model $saved_model
+        set ::ui::props $saved_props
         return -code $code $result
     }
     if {[llength $ops] > 0} {
         _ui "\[[join $ops ,]\]"
     }
     return $result
+}
+
+# ── 快照（契约 §2.6）──────────────────────────────────────
+# 从注册表反生成等价构建脚本：snapshot 是纯函数（当前状态 → 脚本），
+# snapshot + 后续 delta ≡ 完整历史。
+
+# 模型树递归展开为 {path value} 叶子对（node 若非 dict 视为叶子）
+proc ::ui::_model_dump {node prefix outVar} {
+    upvar $outVar acc
+    if {[catch {dict size $node} n] || $n == 0} {
+        lappend acc [list $prefix $node]
+        return
+    }
+    dict for {k v} $node {
+        ::ui::_model_dump $v "$prefix/$k" acc
+    }
+}
+
+proc ::ui::snapshot {path args} {
+    variable widgets
+    variable props
+    variable handlers
+    if {![dict exists $widgets $path]} { error "unknown widget \"$path\"" }
+    set modelPrefix ""
+    foreach {k v} $args {
+        if {$k eq "-model"} { set modelPrefix $v } else {
+            error "ui::snapshot: unknown option \"$k\""
+        }
+    }
+    set lines [list]
+    dict for {p t} $widgets {
+        if {!($p eq $path || [string match "$path.*" $p])} { continue }
+        set cmd [list ::ui::[string tolower $t] $p]
+        if {[dict exists $props $p]} {
+            dict for {k v} [dict get $props $p] {
+                # bind 重建为 -path（-variable 糖不还原，契约 §2.6）
+                if {$k eq "bind"} { lappend cmd -path $v } else { lappend cmd -$k $v }
+            }
+        }
+        # 回调：首个并入创建行 -command，其余重建 ui::on 行
+        set extra [list]
+        dict for {key scripts} $handlers {
+            if {![string match "$p|*" $key]} { continue }
+            set ev [string range $key [expr {[string length $p] + 1}] end]
+            set first 1
+            foreach s $scripts {
+                if {$first && $ev eq "click"} {
+                    lappend cmd -command $s
+                } else {
+                    lappend extra [list ::ui::on $p $ev $s]
+                }
+                set first 0
+            }
+        }
+        lappend lines $cmd
+        foreach e $extra { lappend lines $e }
+    }
+    if {$modelPrefix ne ""} {
+        set leaves [list]
+        set keys [::ui::_model_keys $modelPrefix]
+        if {[dict exists $::ui::model {*}$keys]} {
+            ::ui::_model_dump [dict get $::ui::model {*}$keys] $modelPrefix leaves
+        }
+        foreach pair $leaves {
+            lassign $pair mp mv
+            lappend lines [list ::ui::model set $mp $mv]
+        }
+    }
+    join $lines \n
 }
 
 # ── 模型域 ────────────────────────────────────────────────
@@ -439,4 +548,30 @@ proc ::ui::model {sub args} {
 ::ui::define Checkbox {
     -label {string {} {}}
     -path  {bind {} {}}
+}
+
+# ── L1 分子组件（随 JS 渲染器逐个落地；渲染器见 ui-runtime.js）──
+
+# 行数组表格。-path 是 bind 类选项：指向模型里的行数组（契约 §2.3；
+# 数据喂数走 ui::model set 子路径增量，禁一次性全量 JSON——
+# UI-RESEARCH §2.1/§5）。就和脚本里其它 dict 值一样：
+#
+#   ui::model set /pods/42 [format {{"name":"pod-%d","status":"Running"}} 42]
+#   ui::model set /pods/108 {{"name":"pod-108","status":"Pending"}}
+#
+# Tcl 引词规则：一层 {…} 在传参时就去壳，字面量行 JSON 要双大括号
+# （或运行时字符串）；不要预置 /pods 标量（dict set 自动建父——与
+# tclsh 一致，标量再下钻报 "missing value to go with key"）。行在
+# 模型树里存为原始 JSON 串：v1 只支持整行增量；cell 级更新需行值为
+# dict（模型通道演进，docs/UI-DSL.md 变更建议 §8）。
+#
+# -columns 为列键的 Tcl 列表（list kind → JSON 数组过线）。
+# -rowactions {open {…}} 的动作脚本留在 Tcl 侧（Tk -command 同款），
+# JS 只收 row<动作> 转发标记并在行尾画按钮；行点击回灌 rowclick
+# （默认无 handler，经 ui::on 绑）。行级动作脚本由把行号放在
+# $ui_row（见 ::ui::fire 注释）。
+::ui::define Table {
+    -path       {bind {} {}}
+    -columns    {list {} {}}
+    -rowactions {script {} {}}
 }

@@ -208,6 +208,50 @@ fn layout_options_pass_through_and_validate() {
 }
 
 #[test]
+fn snapshot_replays_to_equivalent_state() {
+    let mut interp = setup();
+    interp
+        .eval(r#"ui::surface .s -title T; ui::text .s.t -text hello -weight 2"#)
+        .unwrap();
+    interp
+        .eval(r#"ui::button .s.b -text Go -command {puts hi}"#)
+        .unwrap();
+    interp.eval(r#"ui::configure .s.t -text world"#).unwrap();
+    interp.eval(r#"ui::model set /name alice"#).unwrap();
+
+    let snap = interp
+        .eval(r#"ui::snapshot .s -model /name"#)
+        .unwrap()
+        .as_str()
+        .to_string();
+    assert!(snap.contains("ui::surface .s -title T"), "{snap}");
+    assert!(snap.contains("-text world"), "configure 已合并: {snap}");
+    assert!(snap.contains("-command {puts hi}"), "{snap}");
+    assert!(snap.contains("-weight 2"), "{snap}");
+    assert!(snap.contains("ui::model set /name alice"), "{snap}");
+
+    // destroy 后墓碑从快照消失
+    interp.eval("ui::destroy .s.b").unwrap();
+    let snap2 = interp.eval("ui::snapshot .s").unwrap().as_str().to_string();
+    assert!(!snap2.contains(".s.b"), "{snap2}");
+
+    // 重放等价：新 interp 执行快照，注册表与 op 流一致
+    let mut interp2 = setup();
+    interp2.eval(&snap).unwrap();
+    let log2 = op_log(&mut interp2);
+    assert!(log2.contains(r#""path":".s.t"#) && log2.contains(r#""text":"world""#), "{log2}");
+    assert!(log2.contains(r#""weight":2"#), "{log2}");
+    assert!(log2.contains(r#""events":["click"]"#), "{log2}");
+    assert_eq!(
+        interp2.eval("ui::model get /name").unwrap().as_str(),
+        "alice"
+    );
+    // 快照里的 -command 重放后仍可触发
+    interp2.post_event("::ui::fire .s.b click");
+    assert!(interp2.pump_events().is_empty());
+}
+
+#[test]
 fn catalog_is_introspectable() {
     let mut interp = setup();
     let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
@@ -216,4 +260,123 @@ fn catalog_is_introspectable() {
     assert!(btn.contains("enum"), "{btn}");
     let e = interp.eval("ui::catalog Nope").unwrap_err();
     assert!(e.to_string().contains("unknown component type"), "{e}");
+}
+
+#[test]
+fn table_create_emits_shape_and_scripts_stay_tcl_side() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp
+        .eval(r#"
+            ui::table .s.t -path /pods -columns {name status restarts age} \
+                -rowactions {open {puts open} del {puts del}} \
+                -weight 2 -fill y
+        "#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    // op 形状：bind 类 -path 过线为 props.bind；-columns 过线为 JSON
+    // 数组；布局公共选项混入 props；events 数组含 row<动作> 名。
+    assert!(
+        log.contains(concat!(
+            r#"{"op":"create","path":".s.t","type":"Table","#,
+            r#""props":{"bind":"\/pods","columns":["name","status","restarts","age"],"#,
+            r#""weight":2,"fill":"y"},"events":["rowopen","rowdel"]}"#
+        )),
+        "table create op: {log}"
+    );
+    // -rowactions 的脚本本身不过桥（只有事件名过线）
+    assert!(!log.contains("puts open"), "rowaction script must not cross: {log}");
+    assert!(!log.contains("puts del"), "rowaction script must not cross: {log}");
+    assert!(log.contains(r#""events":["rowopen","rowdel"]"#), "{log}");
+}
+
+#[test]
+fn table_rowactions_validation_errors() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+
+    // 奇数个元素 → 事件脚本不成对
+    let e = interp
+        .eval(r#"ui::table .s.t -path /pods -columns name -rowactions {open {puts o} foo}"#)
+        .unwrap_err();
+    assert!(e.to_string().contains("must be event script pairs"), "{e}");
+
+    // 动作名非法（事件名要能成为 Tcl 词与 JS 字符串）
+    let e = interp
+        .eval(r#"ui::table .s.t -path /pods -columns name -rowactions {open! {puts o}}"#)
+        .unwrap_err();
+    assert!(e.to_string().contains("bad rowaction name"), "{e}");
+
+    // 校验失败不发 op（.s 的 create 之外无多余批次）
+    assert_eq!(op_log(&mut interp).lines().count(), 1, "errors must not emit ops");
+}
+
+#[test]
+fn table_row_event_passes_row_index_via_ui_row() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp
+        .eval(r#"
+            ui::table .s.t -path /pods -columns name -rowactions {open {set ::got $ui_row}}
+        "#)
+        .unwrap();
+    // JS 回灌 "::ui::fire .s.t rowopen 42"，行号进回调脚本作用域
+    interp.post_event("::ui::fire .s.t rowopen 42");
+    let errors = interp.pump_events();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(interp.eval("set ::got").unwrap().as_str(), "42");
+    assert!(
+        interp.eval("info exists ::ui_row").unwrap().as_str() == "0",
+        "ui_row must not leak out of the callback"
+    );
+
+    // rowclick 未绑 handler：静默无错（Tk 语义——未注册事件不是错误）
+    interp.post_event("::ui::fire .s.t rowclick 42");
+    let errors = interp.pump_events();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn table_model_incremental_subpath_ops() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp.eval(r#"ui::table .s.t -path /pods -columns name"#).unwrap();
+    // 游标喂数：不预置 /pods（dict set 自动建父——与 tclsh 一致，
+    // 预置标量再下钻会报 "missing value to go with key"）。
+    // 行值以运行时字符串构造（词法 {…} 会被去外壳，json decode 的
+    // 根检查看到的是 {"name":…} 原文）——真实喂法见测试与 demo。
+    interp
+        .eval(r#"set row [format {{"name":"pod-%d","status":"Running"}} 42]; ui::model set /pods/42 $row"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    assert!(
+        log.contains(r#""op":"model","sub":"set","path":"\/pods\/42","value":{"name":"pod-42","status":"Running"}"#),
+        "row-increment op: {log}"
+    );
+
+    // 行存为原始 JSON 串（Tcl 模型树 dict 语义：标量不能再下钻），
+    // v1 只支持整行增量；cell 级 /pods/42/status 需行值为 dict，
+    // 留作模型通道演进（docs/UI-DSL.md 变更建议 §8）。
+    // 直接传字面量行 JSON 要双大括号（Tcl 引词规则：一层 {…} 即去壳）。
+    interp
+        .eval(r#"ui::model set /pods/0 {{"name":"pod-0"}}"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    assert!(
+        log.contains(r#""op":"model","sub":"set","path":"\/pods\/0","value":{"name":"pod-0"}"#),
+        "cursor ops stay one-row-per-op: {log}"
+    );
+}
+
+#[test]
+fn table_catalog_shows_options_and_layout() {
+    let mut interp = setup();
+    let c = interp.eval("ui::catalog Table").unwrap().as_str().to_string();
+    // 组件自身选项 + 公共布局选项（词表层单一事实源，喂 LLM 的 prompt）
+    for opt in ["-path", "-columns", "-rowactions", "-fill", "-weight", "-gap"] {
+        assert!(c.contains(opt), "catalog Table missing {opt}: {c}");
+    }
+    assert!(c.contains("bind"), "{c}");
+    let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
+    assert!(all.contains("Table"), "{all}");
 }

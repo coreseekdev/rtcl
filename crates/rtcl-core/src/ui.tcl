@@ -575,3 +575,19 @@ proc ::ui::model {sub args} {
     -columns    {list {} {}}
     -rowactions {script {} {}}
 }
+
+# 日志流（L1 第二个分子组件；UI-RESEARCH §3.2）。-path 是 bind 类
+# 选项：模型里的行数组，**追加式喂数**（与 Table 同款游标）：
+#
+#   ui::model set /deploylog/0 [format {{"ts":"00:00:01","level":"info","text":"ok"}}]
+#   ui::model set /deploylog/1 {{"level":"warn","text":"slow step"}}
+#
+# 行值 JSON 对象的 level 字段决定颜色类（info/warn/error/debug …，
+# 样式在渲染器 CSS；未知级别落默认样式）；标量行值视为 info。
+# 正则高亮 v1 不做（docs/UI-DSL.md 变更建议 §8）。行点击回灌
+# lineclick（ui::on 绑定，行号放 $ui_row——见 ::ui::fire 注释）；
+# 无动作按钮（行动作是 Table 的事，log 的钻取走 lineclick →
+# 新 surface）。
+::ui::define Log {
+    -path {bind {} {}}
+}

@@ -380,3 +380,89 @@ fn table_catalog_shows_options_and_layout() {
     let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
     assert!(all.contains("Table"), "{all}");
 }
+
+// ── Log：词表层（追加式行数组；与 Table 同款 bind/游标语义）────
+
+#[test]
+fn log_create_emits_shape_and_cursor_appends() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp
+        .eval(r#"ui::log .s.l -path /deploylog -weight 1 -fill x"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    // -path bind 过线为 props.bind；布局公共选项混入；无 events（无
+    // lineactions，lineclick 走 ui::on 动态注册）。
+    assert!(
+        log.contains(concat!(
+            r#"{"op":"create","path":".s.l","type":"Log","#,
+            r#""props":{"bind":"\/deploylog","weight":1,"fill":"x"},"events":[]"#
+        )),
+        "log create op: {log}"
+    );
+
+    // 追加喂数：子路径一次一行（同 table 游标；行值对象带 level）
+    interp
+        .eval(r#"set l0 [format {{"ts":"00:00:01","level":"info","text":"pipeline ok"}}]; ui::model set /deploylog/0 $l0"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    assert!(
+        log.contains(r#""op":"model","sub":"set","path":"\/deploylog\/0","value":{"ts":"00:00:01","level":"info","text":"pipeline ok"}"#),
+        "append op one-row-per-op: {log}"
+    );
+    // 标量行值也过线（渲染器 fallback info）
+    interp.eval(r#"ui::model set /deploylog/1 {{"level":"warn","text":"slow"}}"#).unwrap();
+    interp.eval(r#"ui::model set /deploylog/2 plain-text"#).unwrap();
+    let log = op_log(&mut interp);
+    assert!(
+        log.contains(r#""path":"\/deploylog\/1","value":{"level":"warn","text":"slow"}"#),
+        "{log}"
+    );
+    assert!(
+        log.contains(r#""path":"\/deploylog\/2","value":"plain-text""#),
+        "scalar line value passes as string: {log}"
+    );
+}
+
+#[test]
+fn log_lineclick_event_passes_line_index_via_ui_row() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp.eval(r#"ui::log .s.l -path /deploylog"#).unwrap();
+    interp
+        .eval(r#"ui::on .s.l lineclick {set ::got $ui_row}"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    // ui::on 动态注册 → set op 携带更新后的 events（转发标记过桥）
+    assert!(
+        log.contains(r#""op":"set","path":".s.l","props":{},"events":["lineclick"]"#),
+        "ui::on emits set op with events: {log}"
+    );
+
+    // JS 回灌 "::ui::fire .s.l lineclick 42"，行号进回调作用域
+    interp.post_event("::ui::fire .s.l lineclick 42");
+    let errors = interp.pump_events();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(interp.eval("set ::got").unwrap().as_str(), "42");
+    assert!(
+        interp.eval("info exists ::ui_row").unwrap().as_str() == "0",
+        "ui_row must not leak out of the callback"
+    );
+
+    // 未绑事件名静默（Tk 语义）
+    interp.post_event("::ui::fire .s.l linehover 3");
+    let errors = interp.pump_events();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn log_catalog_shows_options_and_layout() {
+    let mut interp = setup();
+    let c = interp.eval("ui::catalog Log").unwrap().as_str().to_string();
+    for opt in ["-path", "-fill", "-weight", "-gap"] {
+        assert!(c.contains(opt), "catalog Log missing {opt}: {c}");
+    }
+    assert!(c.contains("bind"), "{c}");
+    let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
+    assert!(all.contains("Log"), "{all}");
+}

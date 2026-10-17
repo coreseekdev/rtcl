@@ -6,9 +6,10 @@
 > 当前待办见 `TODO.md`；性能台账见 `bench/BASELINE.md`；分歧台账见
 > `specs/DIVERGENCES.md`（已重建）。本文件 §1 基础设施/§2 方法论仍然
 > 有效；§3 以后的数字是 2026-10-03 的历史快照（当前数字以 PRODUCTION
-> 与 BASELINE 为准）；JIT 保持暂停。
+> 与 BASELINE 为准）；JIT 保持暂停（2026-10-17 内存管理/编译管线设计
+> 定稿 = 路线 C，见 `docs/JIT-WASM-GC.md`，实现仍暂停）。
 >
-> 最后更新：2026-10-07（横幅）；正文完成于 2026-10-03
+> 最后更新：2026-10-17（横幅）；正文完成于 2026-10-03
 > 用途：任一 agent 读本文件即可接管全部剩余工作，无需对话历史。
 
 ## 0. 项目与仓库
@@ -119,6 +120,43 @@ tclsh 8.6 的性能来自六个机制（.refer/tcl 源码可查），rtcl 现状
 ### 参考先例
 
 Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直接对标）；tclquadcode（Tcl 官方 LLVM JIT 实验，已停滞，其停滞原因 = 语义角落难题集中在 trace/unknown/ensemble，不在代码生成）；CheerpJ。
+
+### 设计定稿：内存管理路线 C（2026-10-17）
+
+- **GC 问题已闭环**：Tcl = 引用计数 + 无环树，不需要 tracing GC；WasmGC
+  路线（无 finalizer、回收时机不可控）会丢「refcount==0 即时析构」语义
+  （trace/命令删除回调依赖），否决。**定案 = 路线 C**：模块内 tagged-i64
+  立即数快车道（与宿主 Value 8 字节形状同构）+ 堆对象 handle-arena 留
+  宿主 RC + 字符串边界 js-string-builtins 窄切口。完整设计（业界对照、
+  ABI v2 全文、编译器架构参考、验证矩阵）：`docs/JIT-WASM-GC.md`。
+- **ABI v2 取代 M0 三函数**（breaking）：值穿越 = tagged i64，立即数
+  零往返；multi-value 错误标志；**fuel/epoch imported mutable globals**
+  （顺带补齐 JIT 步数预算缺口）；wasm→wasm 直通（裸 extern "C" 导出
+  直塞 import object，省 JS trampoline）。原 M1 修订为 **M1'**，重启时
+  按新文档 §3/§4 执行。
+- **两个新开关**：`lazy-string`（JS 串默认保持 externref、首次字节操作
+  才物化——**独立于 JIT，rtcl-wasm 默认 on，可先行**，解释器主路径即
+  受益）与 `jit-float-lane`（f64 快车道，默认 off，三向差分绿后评估）。
+- **fallback 原则措辞修订**：M0 是编译级全有/全无；路线 C 起为「编译
+  仍全量、运行时快慢分流」（守卫失败 = 调宿主 full-semantics import）。
+- **编译管线架构取向 = Chez Scheme / Nanopass**（参考 guenchi 0x7c06、
+  王垠《我不是编译器专家》、Keep ICFP'13）：编译快到无需分级（per-proc
+  <1ms 同步编译本来就是 Chez 式增量编译）；复杂度放运行时（值表示/
+  freelist/lazy-string）而非编译器；寄存器分配委托 wasm 引擎（Chez 换
+  图着色付的 2× 编译税我们不用付）；M1' 的 emit.rs 按 nanopass 纪律拆
+  为单职责 pass 链（L0-L4 IR 分层 + 每 pass 独立 golden 测试）。
+  **后继项目实证**（2026-10-17 补）：Racket CS 默认全编译转正、
+  per-lambda 懒编译被官方判「should be discontinued」——**M4 热点
+  tier-up 据此降级为可选**（默认 = proc 定义即编译）；Idris2 以 Chez
+  为唯一默认后端十年；Chez 自身仍活跃（10.4.1，2026-05）。参考代码
+  阅读清单（Chez s/ 各 pass 文件行数与顺序）见 `docs/JIT-WASM-GC.md`
+  §7.5；MoonBit 编译器管线对照（两段式结构、ANF 而非 SSA、contification
+  免 tail-call 提案、br_table 分派启发式、自研 wasm 编码器直出）见
+  §7.7（源码实证：moonbitlang/moonbit-compiler 开源部分）。
+- 重启前置不变：阶段一榨干 + 新文档 §8 假设 A–E 先实测再承诺。
+- **任务包已就绪（2026-10-17）**：`TASK-JIT-WASM.md` —— 把本任务完整
+  委托给新 agent 的自足施工图（必读清单、M1' 范围与验收门禁、硬约束、
+  文件互斥、返回格式、派发 prompt）。重启时直接派发该文件。
 
 ## 7. 并行 agent 派发模板（code-migration 纪律）
 

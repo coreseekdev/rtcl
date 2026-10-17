@@ -65,13 +65,19 @@
   OnceCell/线程本地 freelist 的 no_std 替代是主因）
 - [ ] perf 依赖：`kernel.perf_event_paranoid` 每次重启回 4——写入
   sysctl.d 或 CI 环境预设
-- [ ] JIT（rtcl-jit）暂停中：若重启，先评估 M1 里程碑
-  （见 HANDOFF.md §5；解释器为主要引擎的前提下优先级最低）
+- [ ] JIT（rtcl-jit）暂停中：内存管理/编译管线设计已定稿（路线 C，
+  `docs/JIT-WASM-GC.md`）；任务包已就绪（`TASK-JIT-WASM.md`，重启时
+  直接派发给新 agent）；若重启，按新文档 M1'（ABI v2 + Int 快车道）
+  执行（见 HANDOFF.md §5/§6；解释器为主要引擎的前提下优先级最低）
 - [ ] JIT 侧步数预算：A1 eval 步数预算（`set_max_steps`）只覆盖解释器
   与 vm_exec 回边——JIT 编译的 proc 内纯控制流循环（`while {1} {}`
-  编进 wasm 原生循环）绕过全部计步点。命令分派仍经宿主 import 计步，
-  但停机保证对 JIT 形不完整。重启 JIT 时需在 wasm 侧加 fuel/epoch
-  中断机制补齐另一半（M3 epoch guard 是自然挂点）。
+  编进 wasm 原生循环）绕过全部计步点。**方案已定**：fuel/epoch
+  imported mutable globals（`docs/JIT-WASM-GC.md` §3），随 M1' 落地。
+- [ ] lazy-string（独立于 JIT 的 wasm 边界优化，可先行，设计见
+  `docs/JIT-WASM-GC.md` §6）：`InternalRep::HostStr(u32)` +
+  `HostStringBacking` trait（choke point = `value.rs` 的 as_str 物化
+  入口）；rtcl-wasm 默认 on。前置：string.allium 加 astral probe 裁决
+  `string length` 三方语义。
 
 ## 已完成（近三轮，供对照）
 

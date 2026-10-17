@@ -338,8 +338,9 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::GlobalGet(2)); // caching
             f.instruction(&Instruction::I32Eqz);
             f.instruction(&Instruction::BrIf(0)); // → host
-            ld8(f, state);
-            f.instruction(&Instruction::I32Eqz);
+            // 值槽 0 = 未缓存（合法值恒非 0：imm 为奇、句柄 ≥4）。
+            ld64(f, vals);
+            f.instruction(&Instruction::I64Eqz);
             f.instruction(&Instruction::BrIf(0)); // absent → host
             ld64(f, vals);
             f.instruction(&Instruction::LocalSet(dst.0));
@@ -386,8 +387,8 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::GlobalGet(2));
             f.instruction(&Instruction::I32Eqz);
             f.instruction(&Instruction::BrIf(0));
-            ld8(f, state);
-            f.instruction(&Instruction::I32Eqz);
+            ld64(f, vals); // 0 = 未缓存
+            f.instruction(&Instruction::I64Eqz);
             f.instruction(&Instruction::BrIf(0));
             ld64(f, vals);
             f.instruction(&Instruction::LocalSet(dst.0));
@@ -490,6 +491,13 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::End); // done
         }
         Instr::Unary { kind, dst, a, fail } => emit_unary(*kind, dst.0, a.0, *fail, e, f),
+        Instr::BoolOfBool { dst, v } => {
+            // tagged 0/1 → bool：v != 1（tag(0)=1）。
+            f.instruction(&Instruction::LocalGet(v.0));
+            f.instruction(&Instruction::I64Const(1));
+            f.instruction(&Instruction::I64Ne);
+            f.instruction(&Instruction::LocalSet(e.b(dst.0)));
+        }
         Instr::BoolTest { dst, v, fail } => {
             f.instruction(&Instruction::Block(BlockType::Empty)); // done
             f.instruction(&Instruction::Block(BlockType::Empty)); // host
@@ -697,19 +705,18 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
             f.instruction(&Instruction::LocalSet(dst));
         }
         BinOp::Shl | BinOp::Shr => {
-            // 移位数 b ∈ [0, 63]（负数/超宽 → 宿主精确语义）。
-            f.instruction(&Instruction::LocalGet(b));
-            f.instruction(&Instruction::I64Const(1));
-            f.instruction(&Instruction::I64ShrS);
-            f.instruction(&Instruction::I64Const(0));
-            f.instruction(&Instruction::I64LtS);
-            f.instruction(&Instruction::I64ExtendI32U);
-            f.instruction(&Instruction::LocalGet(b));
-            f.instruction(&Instruction::I64Const(1));
-            f.instruction(&Instruction::I64ShrS);
-            f.instruction(&Instruction::I64Const(63));
-            f.instruction(&Instruction::I64GtS);
-            f.instruction(&Instruction::I64ExtendI32U);
+            // 移位数 b_u ∈ [0, 63]（负数/超宽 → 宿主精确语义）。
+            for k in [0i64, 63] {
+                f.instruction(&Instruction::LocalGet(b));
+                f.instruction(&Instruction::I64Const(1));
+                f.instruction(&Instruction::I64ShrS);
+                f.instruction(&Instruction::I64Const(k));
+                f.instruction(if k == 0 {
+                    &Instruction::I64LtS
+                } else {
+                    &Instruction::I64GtS
+                });
+            }
             f.instruction(&Instruction::I32Or);
             f.instruction(&Instruction::If(BlockType::Empty));
             f.instruction(&Instruction::Br(1)); // → slow

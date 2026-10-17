@@ -20,16 +20,20 @@ struct Ctx<'a> {
     bregs: u32,
     /// (cont, brk) of enclosing loops。
     loops: Vec<(u32, u32)>,
+    /// 直接后支配者（虚拟出口 = 单元末尾）。
+    idom: Vec<u32>,
 }
 
 pub fn run(l2: &L2, _code: &ByteCode) -> Result<(L3, u32), Unsupported> {
     let n = l2.ops.len();
+    let idom = post_dominate(l2, n as u32);
     let mut ctx = Ctx {
         l2,
         reachable: BTreeSet::new(),
         placed: vec![false; n],
         bregs: 0,
         loops: Vec::new(),
+        idom: idom.clone(),
     };
     // 可达集（从 0 出发沿 edges）。
     let mut work = vec![0u32];
@@ -98,13 +102,27 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
             OpCode::LoopEnter { cont, brk } => {
                 ctx.placed[pc as usize] = true;
                 ctx.loops.push((cont, brk));
-                let body = seq(ctx, pc + 1, brk)?;
+                // for 形循环的 continue 目标 = next 区域起点（header <
+                // cont < brk）：body 包一层 Block(cont)——continue 的 br
+                // 落到 next 区域开头；while 形 cont == header 无需拆分。
+                let header = pc + 1;
+                let body = if cont > header && cont < brk {
+                    L3::Seq(vec![
+                        L3::Block {
+                            cont,
+                            body: Box::new(seq(ctx, header, cont)?),
+                        },
+                        seq(ctx, cont, brk)?,
+                    ])
+                } else {
+                    seq(ctx, header, brk)?
+                };
                 ctx.loops.pop();
                 if (brk as usize) < ctx.l2.ops.len() {
                     ctx.placed[brk as usize] = true; // LoopExit
                 }
                 items.push(L3::Loop {
-                    header: pc + 1,
+                    header,
                     exit: brk,
                     body: Box::new(body),
                 });
@@ -142,25 +160,78 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
                 let breg = BReg(ctx.bregs);
                 ctx.bregs += 1;
                 let fail = ctx.l2.fail_of[pc as usize].expect("cond fail");
+                // 产生者分析：值的写入者是「输出恒为 tagged 0/1」的 op
+                // → 布尔转换纯化（免宿主兜底路径）。
+                let pure_bool = {
+                    let mut producer = None;
+                    for back in (0..pc).rev() {
+                        if ctx.l2.writes[back as usize] == Some(v) {
+                            producer = Some(&ctx.l2.ops[back as usize].op);
+                            break;
+                        }
+                    }
+                    matches!(
+                        producer,
+                        Some(
+                            OpCode::Lt
+                                | OpCode::Gt
+                                | OpCode::Le
+                                | OpCode::Ge
+                                | OpCode::Eq
+                                | OpCode::Ne
+                                | OpCode::And
+                                | OpCode::Or
+                                | OpCode::Not
+                                | OpCode::StrEq
+                                | OpCode::StrNe
+                        )
+                    )
+                };
+                let test = if pure_bool {
+                    L3::Instr(Instr::BoolOfBool { dst: breg, v: Reg(v) })
+                } else {
+                    L3::Instr(Instr::BoolTest { dst: breg, v: Reg(v), fail })
+                };
                 let taken_when_true = matches!(op, OpCode::JumpTrue(_));
-                let j = merge_point(ctx, t, pc + 1).unwrap_or(end).min(end);
-                let arm_target = seq(ctx, t, j)?;
-                let arm_fall = seq(ctx, pc + 1, j)?;
+                // ipdom = 真实汇合点；臂区间不得越过当前 range（越界臂
+                // 以 Br 到祖先标签收尾——如 for 的 cond-false → 循环出口，
+                // 落到 range 末尾会错进 next 区域）。
+                let j_real = {
+                    let ip = ctx.idom[pc as usize];
+                    let j = if ip == u32::MAX { end } else { ip };
+                    if j > pc { j } else { end }
+                };
+                let (arm_target, arm_fall, cont_pc) = if t >= end {
+                    // 转移目标在 range 外（典型：cond-false → 循环出口）。
+                    let fail = if t <= pc { backedge_fail(ctx, pc, t) } else { 0 };
+                    (
+                        L3::Br { target: t, depth: 0, backedge: t <= pc, fail },
+                        seq(ctx, pc + 1, end)?,
+                        end,
+                    )
+                } else if j_real > end {
+                    (seq(ctx, t, end)?, seq(ctx, pc + 1, end)?, end)
+                } else {
+                    (seq(ctx, t, j_real)?, seq(ctx, pc + 1, j_real)?, j_real)
+                };
                 let (then_, else_) = if taken_when_true {
                     (arm_target, arm_fall)
                 } else {
                     (arm_fall, arm_target)
                 };
                 items.push(L3::Seq(vec![
-                    L3::Instr(Instr::BoolTest { dst: breg, v: Reg(v), fail }),
+                    test,
                     L3::If {
                         cond: breg,
-                        j,
+                        // wasm 级汇合位置（= cont_pc）：真实 ipdom 越界时
+                        // 若用 j_real 做标签会遮蔽同 pc 的祖先标签
+                        // （循环出口），cond-false 分支会错误折回 if 末尾。
+                        j: cont_pc,
                         then_: Box::new(then_),
                         else_: Box::new(else_),
                     },
                 ]));
-                pc = j;
+                pc = cont_pc;
             }
             OpCode::Break | OpCode::Continue => {
                 ctx.placed[pc as usize] = true;
@@ -327,12 +398,99 @@ fn reach(ctx: &Ctx, from: u32) -> BTreeSet<u32> {
     seen
 }
 
-/// 两臂的最小公共可达 pc（> lower_bound）。
-fn merge_point(ctx: &Ctx, a: u32, b: u32) -> Option<u32> {
-    let ra = reach(ctx, a);
-    let rb = reach(ctx, b);
-    let lower = a.min(b);
-    ra.intersection(&rb).copied().filter(|p| *p > lower).min()
+/// 分支的汇合点 = 直接后支配者（ipdom）。循环内两臂经回边彼此可达，
+/// 可达集求交会被污染（把 header 当 merge）——后支配树是正确工具：
+/// break-if 的 ipdom = 循环出口，普通 if-else 的 ipdom = 真实 merge。
+/// n = 单元出口哨兵（虚拟出口吸收全部终端）。
+fn post_dominate(l2: &L2, n: u32) -> Vec<u32> {
+    // preds[x]：x 的前驱（含虚拟出口的逆向根）。
+    let total = n as usize + 1;
+    let mut preds: Vec<Vec<u32>> = vec![vec![]; total];
+    for (pc, e) in l2.edges.iter().enumerate() {
+        for &t in e {
+            if (t as usize) < total {
+                preds[t as usize].push(pc as u32);
+            }
+        }
+    }
+    // 逆向图（根 = 出口 n）：逆向后继 = 前驱。迭代支配集。
+    // dom(v) on reverse graph from root n。
+    let all: std::collections::BTreeSet<u32> = (0..=n).collect();
+    let mut dom: Vec<std::collections::BTreeSet<u32>> =
+        (0..total).map(|i| {
+            let mut s = std::collections::BTreeSet::new();
+            s.insert(i as u32);
+            s
+        })
+        .collect();
+    // 逆向图的根 = n（虚拟出口）。其他点初值 = 全集。
+    for d in dom.iter_mut().take(total) {
+        if !preds_n_root(d) {
+            *d = all.clone();
+        }
+    }
+    dom[n as usize].clear();
+    dom[n as usize].insert(n);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for v in 0..total {
+            if v == n as usize {
+                continue;
+            }
+            // 逆向图中 v 的前驱 = 正向的后继（edges[v] + 出口边）。
+            let mut ps: Vec<u32> = l2.edges[v].clone();
+            if l2.edges[v].is_empty() {
+                // 终端（无后继）→ 逆向图连虚拟出口。
+                ps.push(n);
+            }
+            if ps.is_empty() {
+                continue;
+            }
+            let mut inter: Option<std::collections::BTreeSet<u32>> = None;
+            for p in ps {
+                if (p as usize) < total {
+                    inter = Some(match inter {
+                        None => dom[p as usize].clone(),
+                        Some(cur) => cur
+                            .intersection(&dom[p as usize])
+                            .cloned()
+                            .collect(),
+                    });
+                }
+            }
+            if let Some(mut inter) = inter {
+                inter.insert(v as u32);
+                if inter != dom[v] {
+                    dom[v] = inter;
+                    changed = true;
+                }
+            }
+        }
+    }
+    // idom(v) = dom(v)\{v} 中 |dom| 最大者。
+    let mut idom = vec![u32::MAX; total];
+    for v in 0..total {
+        let others: Vec<u32> = dom[v].iter().copied().filter(|x| *x != v as u32).collect();
+        if let Some(best) = others
+            .iter()
+            .max_by_key(|c| dom[**c as usize].len())
+            .copied()
+        {
+            idom[v] = best;
+        }
+    }
+    idom
+}
+
+fn preds_n_root(_d: &std::collections::BTreeSet<u32>) -> bool {
+    false
+}
+
+#[allow(dead_code)]
+fn merge_point_unused(ctx: &Ctx, branch_pc: u32, a: u32, b: u32) -> Option<u32> {
+    let _ = (ctx, branch_pc, a, b);
+    None
 }
 
 // ── phase B：分支深度解析 ─────────────────────────────────────────────────

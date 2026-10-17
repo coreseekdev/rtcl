@@ -1,108 +1,165 @@
-//! M0 acceptance: the full round-trip — parse Tcl → compile ByteCode →
-//! emit a wasm module → instantiate → call → retrieve the result — runs
-//! under a real wasm engine (wasmi, test-only) and matches the
-//! interpreter's semantics for the compiled subset.
+//! 需要 jit-exec（wasmi 执行器）；默认构建跳过。
+#![cfg(feature = "jit-exec")]
 
+//! ABI v2 round-trip：parse → ByteCode → nanopass 发射 → wasmi 实例化 →
+//! 宿主执行（`exec::run_top` 全链路），与解释器语义对齐。
+//! M0 的三函数 handle ABI 测试已随 ABI v2 重写（设计文档 §3、风险 5）。
+
+use rtcl_core::Interp;
+use rtcl_jit::exec::{self, Outcome};
 use rtcl_parser::{Compiler, ScriptUnit};
-use wasmi::{Caller, Engine, Linker, Module, Store, TypedFunc};
+use std::rc::Rc;
 
-/// Host-side view of a Tcl value crossing the jit boundary (the arena,
-/// per HANDOFF §5: u32 handles + runtime-side value storage).
-#[derive(Debug, Clone, PartialEq)]
-enum HostVal {
-    Int(i64),
-    Empty,
-}
-
-#[derive(Default)]
-struct Host {
-    arena: Vec<HostVal>,
-    result: Option<HostVal>,
-}
-
-/// Compile `script` the same way `rtcl-core`'s vm_exec does, then emit a
-/// wasm module from the ByteCode.
-fn jit_compile(script: &str) -> Result<Vec<u8>, rtcl_jit::Unsupported> {
+/// 编译断言：`script` 的单元是否被 JIT 接受。
+fn accepted(script: &str) -> bool {
     let unit = ScriptUnit::parse(script).expect("parse");
-    let code = Compiler::compile_unit(unit.source, &unit.commands);
-    rtcl_jit::emit::compile_module(&code)
+    let bc = Compiler::compile_unit(unit.source, &unit.commands);
+    rtcl_jit::emit::compile(&bc, &Default::default()).is_ok()
 }
 
-/// Instantiate `bytes` against a fresh host and run it; returns the Tcl
-/// result code plus the recorded result value.
-fn jit_run(bytes: &[u8]) -> Result<(i32, HostVal), wasmi::Error> {
-    let engine = Engine::default();
-    let module = Module::new(&engine, bytes)?;
-    let mut store = Store::new(&engine, Host::default());
-    let mut linker = <Linker<Host>>::new(&engine);
-    linker.func_wrap(
-        "rtcl",
-        "push_int",
-        |mut caller: Caller<'_, Host>, v: i64| -> i32 {
-            let h = caller.data().arena.len() as i32;
-            caller.data_mut().arena.push(HostVal::Int(v));
-            h
+/// 与 jitsh 文件模式同构的输出（stdout 拼接 + 退出码）——差分用。
+fn jit_file_mode(script: &str, file: &str) -> (String, i32) {
+    let interp = Interp::new();
+    let (mut interp, run) = exec::run_top(interp, script, file);
+    match run.outcome {
+        Outcome::Fallback => match interp.eval(script) {
+            Ok(_) => (String::new(), 0),
+            Err(e) => (interp.error_report(&e, file), 1),
         },
-    )?;
-    linker.func_wrap("rtcl", "push_empty", |mut caller: Caller<'_, Host>| -> i32 {
-        let h = caller.data().arena.len() as i32;
-        caller.data_mut().arena.push(HostVal::Empty);
-        h
-    })?;
-    linker.func_wrap("rtcl", "set_result", |mut caller: Caller<'_, Host>, h: i32| {
-        let v = caller.data().arena[h as usize].clone();
-        caller.data_mut().result = Some(v);
-    })?;
-    let instance = linker.instantiate_and_start(&mut store, &module)?;
-    let run: TypedFunc<(), i32> = instance.get_typed_func(&store, "run")?;
-    let code = run.call(&mut store, ())?;
-    let result = store.data().result.clone().expect("set_result ran");
-    Ok((code, result))
-}
-
-fn roundtrip(script: &str) -> (i32, HostVal) {
-    let bytes = jit_compile(script).expect("emitter accepts");
-    jit_run(&bytes).expect("wasm runs")
-}
-
-#[test]
-fn wasm_magic_prefix() {
-    let bytes = jit_compile("return 42").expect("compiles");
-    assert_eq!(&bytes[..4], b"\0asm");
-    // A 3-instruction program is a few dozen bytes — the per-proc module
-    // size assumption (<4KB, HANDOFF §5) has huge headroom.
-    assert!(bytes.len() < 256, "module too large: {}", bytes.len());
-}
-
-#[test]
-fn empty_body_roundtrip() {
-    // `proc q {} {}` — an empty unit must yield the empty value.
-    assert_eq!(roundtrip(""), (0, HostVal::Empty));
-}
-
-#[test]
-fn return_int_roundtrip() {
-    assert_eq!(roundtrip("return 42"), (0, HostVal::Int(42)));
-    assert_eq!(roundtrip("return 0"), (0, HostVal::Int(0)));
-}
-
-#[test]
-fn stream_end_takes_last_value() {
-    // The interpreter's stream-end discipline: the result is the last
-    // command's value (depth 1 at stream end — the leftover handle
-    // becomes the result).  `expr {2 + 3}` also exercises the peephole
-    // fold: the jit consumes the already-folded PUSH_INT 5.
-    assert_eq!(roundtrip("expr {2 + 3}"), (0, HostVal::Int(5)));
-}
-
-#[test]
-fn unsupported_ops_are_rejected_not_miscompiled() {
-    // Anything outside the M0 subset must be rejected cleanly so the
-    // caller keeps the interpreter path — never partially compiled.
-    // (`return -7` dispatches by design — compile_return keeps
-    // option-lookalike values away from the Return op.)
-    for src in ["set x 1", "if {1} {} {}", "expr {1 + x}", "puts hi", "return -7"] {
-        let err = jit_compile(src).expect_err("must reject");
-        assert!(!err.0.is_empty());
+        Outcome::Completed { code, exit_code } => match code {
+            0 | 5 => (String::new(), 0),
+            6 => (rtcl_core::Error::exit(Some(exit_code.unwrap_or(0))).to_string(), 1),
+            _ => {
+                if let Some(e) = run.eval_error {
+                    (interp.error_report(&e, file), 1)
+                } else {
+                    (run.driver_report.clone().unwrap_or_default(), 1)
+                }
+            }
+        },
     }
+}
+
+fn interp_file_mode(script: &str, file: &str) -> (String, i32) {
+    let mut interp = Interp::new();
+    match interp.eval(script) {
+        Ok(_) => (String::new(), 0),
+        Err(e) => (interp.error_report(&e, file), 1),
+    }
+}
+
+fn assert_same(script: &str) {
+    let file = "t.tcl";
+    let a = interp_file_mode(script, file);
+    let b = jit_file_mode(script, file);
+    assert_eq!(a, b, "divergence for {script:?}:\n  interp={a:?}\n  jit   ={b:?}");
+}
+
+#[test]
+fn wasm_magic_prefix_and_size() {
+    let unit = ScriptUnit::parse("set s 0\nfor {set i 0} {$i < 100} {incr i} {set s [expr {$s + $i}]}")
+        .expect("parse");
+    let bc = Compiler::compile_unit(unit.source, &unit.commands);
+    let m = rtcl_jit::emit::compile(&bc, &Default::default()).expect("compiles");
+    assert_eq!(&m.bytes[..4], b"\0asm");
+    // per-proc/unit 模块 <4KB 预算（HANDOFF §6）——含完整 ABI 导入段。
+    assert!(m.bytes.len() < 4096, "module too large: {}", m.bytes.len());
+}
+
+#[test]
+fn acceptance_subset() {
+    // 接受：Tier1 折叠的数值/控制流 + Call。
+    for src in [
+        "set x 1\nputs $x",
+        "set i 0\nwhile {$i < 3} {incr i}",
+        "for {set i 0} {$i < 9} {incr i 2} {if {$i == 4} {continue}}",
+        "return 5",
+        "exit 3",
+    ] {
+        assert!(accepted(src), "must accept: {src:?}");
+    }
+    // 拒绝：M1' 之外的 op（foreach/lappend/EvalScript/数组元素引用…）。
+    // 顶层 `eval {...}`/`string ...` 本身是 Call（接受）；拒绝的是这些
+    // op 出现在单元内的形状（经实证 disassemble 校准）。
+    for src in [
+        "foreach x {1 2} {puts $x}",
+        "lappend l x",
+        "set x [eval {puts 1}]",      // Call 嵌 Sub region（错误协议二分）
+        "set a(1) 2\nputs $a($x)",   // 数组元素引用（下标替换语义）
+        "puts [expr {min(2, 3)}]",    // mathfunc → EvalExpr/DynCall 形
+    ] {
+        assert!(!accepted(src), "must reject: {src:?}");
+    }
+}
+
+#[test]
+fn end_to_end_matches_interpreter() {
+    // 覆盖：常量/变量/算术/比较/循环/break/continue/return/exit/错误帧链/
+    // Sub 区域 defer/守卫兜底（非数值字符串/浮点/bignum）/exit 码。
+    for src in [
+        "set x 5\nputs $x\nputs [expr {$x + 3 * 2}]",
+        "set s 0\nfor {set i 0} {$i < 100} {incr i} {set s [expr {$s + $i * 2}]}\nputs $s",
+        "set i 0\nwhile {$i < 5} { incr i; puts $i }",
+        "set s 0\nfor {set i 0} {$i < 10} {incr i 2} {\n  if {$i == 4} { continue }\n  if {$i == 8} { break }\n  set s [expr {$s + $i}]\n}\nputs $s",
+        "set x abc\nputs [expr {$x + 1}]",
+        "set x 1\nerror boom\nputs unreachable",
+        "puts [expr {7 / 2}]\nputs [expr {-7 / 2}]\nputs [expr {-7 % 2}]\nputs [expr {1 << 100}]\nputs [expr {2 ** 10}]\nputs [expr {1 + \" 42 \"}]",
+        "return 42\nputs no",
+        "exit 3\nputs no",
+        "if {yes} { puts yes } else { puts no }\nif no { puts a } elseif maybe { puts b } else { puts c }",
+        "set x 1.5\nputs $x\nputs [expr {1.5 + 1}]",
+        "set a(1) x\nputs $a(1)",
+        "break",
+        "continue",
+        "set i 5\nset j 3\nputs [expr {$i & $j}]\nputs [expr {$i | 8}]\nputs [expr {$i ^ 1}]\nputs [expr {$i << 60}]\nputs [expr {$i >> 2}]\nputs [expr {!$i}]\nputs [expr {-$i}]\nputs [expr {~$i}]",
+        "set x 1\nwhile {$x} { set x [expr {$x + 1}]; if {$x > 3} { break } }\nputs $x",
+        "puts [expr {2 == 2}]\nputs [expr {\"42\" == 42}]\nputs [expr {abc eq abc}]\nputs [expr {abc neabd}]",
+        "set big [expr {2 ** 62}]\nputs [expr {$big + $big}]",
+    ] {
+        assert_same(src);
+    }
+}
+
+#[test]
+fn budget_stops_jit_infinite_loop() {
+    // `while {$x} {}` 形态被 JIT 接受（无条件回边）——fuel 必须可停机。
+    let script = "set x 1\nwhile {$x} {}";
+    let file = "t.tcl";
+    // interp 侧
+    let mut ip = Interp::new();
+    ip.set_max_steps(Some(10_000));
+    let a = match ip.eval(script) {
+        Err(e) => (ip.error_report(&e, file), 1),
+        Ok(_) => (String::new(), 0),
+    };
+    // jit 侧（同预算）
+    let (mut ip2, run) = {
+        let ip = Interp::new();
+        let mut ip = ip;
+        ip.set_max_steps(Some(10_000));
+        exec::run_top(ip, script, file)
+    };
+    let b = match run.outcome {
+        Outcome::Fallback => match ip2.eval(script) {
+            Err(e) => (ip2.error_report(&e, file), 1),
+            Ok(_) => (String::new(), 0),
+        },
+        Outcome::Completed { code, .. } => {
+            assert_ne!(code, 0, "infinite loop must not complete");
+            if let Some(e) = run.eval_error {
+                (ip2.error_report(&e, file), 1)
+            } else {
+                (run.driver_report.clone().unwrap_or_default(), 1)
+            }
+        }
+    };
+    assert!(a.0.contains("step budget"), "interp: {a:?}");
+    assert_eq!(a, b, "budget report must be byte-identical");
+    // 可恢复：同单元无预算时正常完成（用退出码观察——文件模式不回显
+    // 顶层结果；循环若未正常结束则 error）。
+    let c = jit_file_mode(
+        "set x 1\nset n 0\nwhile {$x} { incr n; if {$n > 4} { set x 0 } }\nif {$n != 5} { error \"n=$n\" }",
+        file,
+    );
+    assert_eq!(c, (String::new(), 0), "resumable run: {c:?}");
 }

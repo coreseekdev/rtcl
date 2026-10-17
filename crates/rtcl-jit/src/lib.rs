@@ -39,5 +39,8 @@ pub mod engine;
 #[cfg(feature = "jit-exec")]
 pub mod exec;
 
+#[cfg(all(feature = "jit-exec", feature = "jit-native"))]
+pub mod exec_wasmtime;
+
 /// Shorthand for the emitter's rejection type.
 pub use emit::Unsupported;

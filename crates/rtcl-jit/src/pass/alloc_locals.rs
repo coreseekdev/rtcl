@@ -223,16 +223,39 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
         writes.push(w);
     }
 
-    // 栈纪律校验：每条边目标处的模拟深度必须与源操作后深度一致。
+    // 栈纪律校验：线性模拟深度与边目标一致。两类编译器习语放宽：
+    // (a) 目标更深（then 臂跳过 else 的 PUSH_EMPTY 直达 POP）——差值
+    //     必须由目标处起连续的 POP 吸收（读到的旧槽即被丢弃）；
+    // (b) Break/Continue 截断到循环入口深度（vm_exec 的 stack_len 纪律）。
     for (pc, e) in edges.iter().enumerate() {
         let after = depth_after(&l1.ops[pc].op, depth_at[pc]);
+        let is_bc = matches!(l1.ops[pc].op, OpCode::Break | OpCode::Continue);
         for &t in e {
-            if (t as usize) < n && depth_at[t as usize] != after {
-                return Err(Unsupported(format!(
-                    "stack discipline broken at pc {pc} -> {t}: {} != {}",
-                    depth_at[t as usize], after
-                )));
+            let Some(tu) = (t as usize).checked_sub(0).filter(|x| *x < n) else {
+                continue;
+            };
+            let target_d = depth_at[tu];
+            if target_d == after || (is_bc && target_d < after) {
+                continue;
             }
+            if target_d > after {
+                let mut absorb = target_d - after;
+                let mut q = tu;
+                while absorb > 0 && q < n {
+                    if matches!(l1.ops[q].op, OpCode::Pop) {
+                        absorb -= 1;
+                        q += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if absorb == 0 {
+                    continue;
+                }
+            }
+            return Err(Unsupported(format!(
+                "stack discipline broken at pc {pc} -> {t}: {target_d} != {after}"
+            )));
         }
     }
 

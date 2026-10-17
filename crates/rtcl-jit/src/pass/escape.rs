@@ -17,6 +17,42 @@ pub fn run(l1: &L1, code: &ByteCode) -> Result<(), Unsupported> {
     if code.fallback {
         return Err(Unsupported("unit has fallback=true".into()));
     }
+    // 数组元素引用（名字含 '('）：eval_var_ref 需做下标替换/解析，
+    // read_var 公共入口不等价——编译拒绝（M2 经 LoadArrayElem 接管）。
+    for (pc, a) in l1.ops.iter().enumerate() {
+        let name_idx = match &a.op {
+            OpCode::LoadVar(i) | OpCode::StoreVar(i) | OpCode::StoreVarPop(i)
+            | OpCode::IncrVar(i, _) => Some(*i as u32),
+            _ => None,
+        };
+        if let Some(idx) = name_idx {
+            if let Some(name) = code.get_const_wide(idx) {
+                if name.contains('(') {
+                    return Err(Unsupported(format!(
+                        "array-element var ref {name:?} at pc {pc}"
+                    )));
+                }
+            }
+        }
+    }
+    // i63 域外立即数：tagging 会回绕（ByteCode 可携带全 i64 的
+    // PushInt/IncrVar 量）——编译拒绝，留解释器的 bignum 路径。
+    let imm_ok = |n: i64| n >= -(1i64 << 62) && n < (1i64 << 62);
+    for (pc, a) in l1.ops.iter().enumerate() {
+        match &a.op {
+            OpCode::PushInt(n) if !imm_ok(*n) => {
+                return Err(Unsupported(format!(
+                    "PushInt {n} outside i63 at pc {pc} (bignum)"
+                )));
+            }
+            OpCode::IncrVar(_, n) if !imm_ok(*n) => {
+                return Err(Unsupported(format!(
+                    "IncrVar amount {n} outside i63 at pc {pc}"
+                )));
+            }
+            _ => {}
+        }
+    }
     if l1.ops.len() > MAX_OPS {
         return Err(Unsupported(format!("{} ops > {}", l1.ops.len(), MAX_OPS)));
     }

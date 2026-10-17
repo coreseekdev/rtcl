@@ -41,15 +41,15 @@ pub enum Outcome {
 
 /// 宿主侧挂起错误：`from_eval` = 来自 `rtcl.call` 的 eval（解释器已
 /// 累积 errorInfo——case a）；否则快车道宿主原语错误（case b）。
-struct Pending {
+pub(crate) struct Pending {
     err: Error,
     from_eval: bool,
 }
 
-struct Host {
-    interp: Interp,
-    arena: Vec<Value>,
-    consts: Vec<String>,
+pub(crate) struct Host {
+    pub(crate) interp: Interp,
+    pub(crate) arena: Vec<Value>,
+    pub(crate) consts: Vec<String>,
     fails: Vec<FailInfo>,
     sites: Vec<rtcl_parser::SrcSpan>,
     lines: Vec<u32>,
@@ -266,6 +266,168 @@ fn expr_quote(s: &str) -> String {
 }
 
 impl Host {
+    // ── 构造与引擎协作 ──────────────────────────────────────────────
+
+    pub fn new(interp: Interp, arena: Vec<Value>, bc: &ByteCode, module: &emit::Module) -> Host {
+        Host {
+            interp,
+            arena,
+            consts: bc.constants().to_vec(),
+            fails: module.l2.fails.clone(),
+            sites: bc.sites.iter().map(|s| s.text).collect(),
+            lines: bc.sites.iter().map(|s| s.line).collect(),
+            source: Rc::clone(&bc.source),
+            result: None,
+            pending: None,
+            pending_exit: None,
+            info: None,
+            err_line: 0,
+            pending_top: None,
+            refuel_chunk: abi::REFUEL_CHUNK,
+        }
+    }
+
+    pub fn arena_len(&self) -> usize {
+        self.arena.len()
+    }
+
+    pub fn arena_truncate(&mut self, n: usize) {
+        self.arena.truncate(n);
+    }
+
+    pub fn refuel_chunk(&self) -> i64 {
+        self.refuel_chunk
+    }
+
+    pub fn interp_mut(&mut self) -> &mut Interp {
+        &mut self.interp
+    }
+
+    pub fn set_pending(&mut self, err: Error, from_eval: bool) {
+        self.pending = Some(Pending { err, from_eval });
+    }
+
+    // ── 宿主逻辑（引擎无关；各引擎的 import 包装只做参数搬运）──────
+
+    pub fn binary_op_raw(&mut self, op: i32, a: i64, b: i64) -> i64 {
+        match self.binary_op(op, a, b) {
+            Ok(v) => self.tag_value(&v),
+            Err(e) => {
+                self.pending = Some(Pending { err: e, from_eval: false });
+                abi::ERR_SENTINEL
+            }
+        }
+    }
+
+    pub fn get_var_raw(&mut self, name_h: i32) -> i64 {
+        let name = self.const_name(name_h);
+        match self.interp.read_var(&name) {
+            Ok(v) => self.tag_value(&v),
+            Err(e) => {
+                self.pending = Some(Pending { err: e, from_eval: false });
+                abi::ERR_SENTINEL
+            }
+        }
+    }
+
+    pub fn set_var_raw(&mut self, name_h: i32, v: i64) -> i32 {
+        let name = self.const_name(name_h);
+        let val = self.value_of(v);
+        match self.interp.set_var(&name, val) {
+            Ok(_) => 0,
+            Err(e) => {
+                self.pending = Some(Pending { err: e, from_eval: false });
+                1
+            }
+        }
+    }
+
+    pub fn incr_var_raw(&mut self, name_h: i32, n: i64) -> i64 {
+        let name = self.const_name(name_h);
+        match self.interp.incr_var(&name, abi::untag(n)) {
+            Ok(v) => self.tag_value(&v),
+            Err(e) => {
+                self.pending = Some(Pending { err: e, from_eval: false });
+                abi::ERR_SENTINEL
+            }
+        }
+    }
+
+    /// 命令分派：站点原文 + 换行前缀 eval 路由。
+    pub fn call_raw(&mut self, _cmd_id: i32, site: i32, _argc: i32) -> i64 {
+        let site = site.max(0) as u32;
+        let text = self.site_text(site).to_string();
+        let line = self.lines.get(site as usize).copied().unwrap_or(1).max(1) as usize;
+        let script = format!("{}{}", "\n".repeat(line - 1), text);
+        match self.interp.eval(&script) {
+            Ok(v) => self.tag_value(&v),
+            Err(e) => {
+                self.pending = Some(Pending { err: e, from_eval: true });
+                abi::ERR_SENTINEL
+            }
+        }
+    }
+
+    pub fn set_result_raw(&mut self, v: i64) {
+        let val = self.value_of(v);
+        self.result = Some(val);
+    }
+
+    pub fn bool_test_raw(&mut self, v: i64) -> i64 {
+        match self.bool_test(v) {
+            Ok(b) => abi::tag_imm(b as i64),
+            Err(e) => {
+                self.pending = Some(Pending { err: e, from_eval: false });
+                abi::ERR_SENTINEL
+            }
+        }
+    }
+
+    pub fn unbox_int_raw(&self, h: i32) -> (i32, i64) {
+        let v = self.arena.get((h >> 1) as usize).cloned().unwrap_or_else(Value::empty);
+        match v.as_int() {
+            Some(n) => (1, n),
+            None => (0, 0),
+        }
+    }
+
+    pub fn unbox_float_raw(&self, h: i32) -> (i32, f64) {
+        let v = self.arena.get((h >> 1) as usize).cloned().unwrap_or_else(Value::empty);
+        match v.as_float() {
+            Some(f) => (1, f),
+            None => (0, 0.0),
+        }
+    }
+
+    pub fn box_raw(&mut self, v: i64) -> i32 {
+        let val = self.value_of(v);
+        let idx = self.arena.len();
+        self.arena.push(val);
+        ((idx as u64) << 1) as i32
+    }
+
+    pub fn box_float_raw(&mut self, f: f64) -> i32 {
+        let val = Value::from_float(f);
+        let idx = self.arena.len();
+        self.arena.push(val);
+        ((idx as u64) << 1) as i32
+    }
+
+    pub fn fail_raw(&mut self, fail_id: i32) -> i32 {
+        self.take_fail(fail_id.max(0) as u32)
+    }
+
+    pub fn exit_raw(&mut self, code: i32) {
+        self.pending_exit = Some(code);
+    }
+
+    fn const_name(&self, name_h: i32) -> String {
+        self.consts
+            [((name_h >> 1) as usize)
+                .saturating_sub(abi::CONST_ARENA_BASE as usize)]
+        .clone()
+    }
+
     /// binary_op：宿主完整 Tcl 语义（§3）——`types::eval_expr` 原文路由。
     fn binary_op(&mut self, op: i32, a: i64, b: i64) -> Result<Value, Error> {
         let kind = op;
@@ -333,6 +495,16 @@ impl Host {
     }
 }
 
+/// 执行引擎选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngineKind {
+    /// wasmi（in-process 纯 Rust；judge/bench 默认）。
+    #[default]
+    Wasmi,
+    /// wasmtime（native JIT；feature `jit-native`）。
+    Wasmtime,
+}
+
 /// 顶层驱动：接受则 wasm 执行，否则 Fallback。
 pub struct JitRun {
     pub outcome: Outcome,
@@ -345,6 +517,23 @@ pub struct JitRun {
 }
 
 pub fn run_top(interp: Interp, script: &str, file: &str) -> (Interp, JitRun) {
+    run_top_with(interp, script, file, engine_from_env())
+}
+
+/// `RTCL_JIT_ENGINE=wasmtime|wasmi`（默认 wasmi）。
+pub fn engine_from_env() -> EngineKind {
+    match std::env::var("RTCL_JIT_ENGINE").as_deref() {
+        Ok("wasmtime") if cfg!(feature = "jit-native") => EngineKind::Wasmtime,
+        _ => EngineKind::Wasmi,
+    }
+}
+
+pub fn run_top_with(
+    interp: Interp,
+    script: &str,
+    file: &str,
+    engine: EngineKind,
+) -> (Interp, JitRun) {
     let unit = match ScriptUnit::parse(script) {
         Ok(u) => u,
         Err(_) => {
@@ -368,7 +557,13 @@ pub fn run_top(interp: Interp, script: &str, file: &str) -> (Interp, JitRun) {
             })
         }
     };
-    execute(interp, &bc, &module, file)
+    match engine {
+        #[cfg(feature = "jit-native")]
+        EngineKind::Wasmtime => crate::exec_wasmtime::execute(interp, &bc, &module, file),
+        EngineKind::Wasmi => execute(interp, &bc, &module, file),
+        #[cfg(not(feature = "jit-native"))]
+        EngineKind::Wasmtime => execute(interp, &bc, &module, file),
+    }
 }
 
 fn execute(
@@ -423,133 +618,67 @@ fn execute(
     let g_caching_call = g_caching.clone();
 
     linker
-        .func_wrap("rtcl", "unbox_int", |mut c: Caller<'_, Host>, h: i32| -> (i32, i64) {
-            let v = c.data().arena.get((h >> 1) as usize).cloned().unwrap_or_else(Value::empty);
-            match v.as_int() {
-                Some(n) => (1, n),
-                None => (0, 0),
-            }
+        .func_wrap("rtcl", "unbox_int", |c: Caller<'_, Host>, h: i32| -> (i32, i64) {
+            c.data().unbox_int_raw(h)
         })
         .unwrap();
     linker
-        .func_wrap("rtcl", "unbox_float", |mut c: Caller<'_, Host>, h: i32| -> (i32, f64) {
-            let v = c.data().arena.get((h >> 1) as usize).cloned().unwrap_or_else(Value::empty);
-            match v.as_float() {
-                Some(f) => (1, f),
-                None => (0, 0.0),
-            }
+        .func_wrap("rtcl", "unbox_float", |c: Caller<'_, Host>, h: i32| -> (i32, f64) {
+            c.data().unbox_float_raw(h)
         })
         .unwrap();
     linker
         .func_wrap("rtcl", "box", |mut c: Caller<'_, Host>, v: i64| -> i32 {
-            let val = c.data().value_of(v);
-            let idx = c.data().arena.len();
-            c.data_mut().arena.push(val);
-            ((idx as u64) << 1) as i32
+            c.data_mut().box_raw(v)
         })
         .unwrap();
     linker
         .func_wrap("rtcl", "box_float", |mut c: Caller<'_, Host>, f: f64| -> i32 {
-            let val = Value::from_float(f);
-            let idx = c.data().arena.len();
-            c.data_mut().arena.push(val);
-            ((idx as u64) << 1) as i32
+            c.data_mut().box_float_raw(f)
         })
         .unwrap();
     linker
         .func_wrap("rtcl", "binary_op", |mut c: Caller<'_, Host>, op: i32, a: i64, b: i64| -> i64 {
-            match c.data_mut().binary_op(op, a, b) {
-                Ok(v) => {
-                    let t = c.data_mut().tag_value(&v);
-                    t
-                }
-                Err(e) => {
-                    c.data_mut().pending = Some(Pending { err: e, from_eval: false });
-                    abi::ERR_SENTINEL
-                }
-            }
+            c.data_mut().binary_op_raw(op, a, b)
         })
         .unwrap();
     linker
         .func_wrap("rtcl", "get_var", |mut c: Caller<'_, Host>, name_h: i32| -> i64 {
-            let name = c.data().consts[((name_h >> 1) as usize).saturating_sub(abi::CONST_ARENA_BASE as usize)].clone();
-            match c.data_mut().interp.read_var(&name) {
-                Ok(v) => {
-                    let t = c.data_mut().tag_value(&v);
-                    t
-                }
-                Err(e) => {
-                    c.data_mut().pending = Some(Pending { err: e, from_eval: false });
-                    abi::ERR_SENTINEL
-                }
-            }
+            c.data_mut().get_var_raw(name_h)
         })
         .unwrap();
     linker
         .func_wrap("rtcl", "set_var", |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i32 {
-            let name = c.data().consts[((name_h >> 1) as usize).saturating_sub(abi::CONST_ARENA_BASE as usize)].clone();
-            let val = c.data().value_of(v);
-            match c.data_mut().interp.set_var(&name, val) {
-                Ok(_) => 0,
-                Err(e) => {
-                    c.data_mut().pending = Some(Pending { err: e, from_eval: false });
-                    1
-                }
-            }
+            c.data_mut().set_var_raw(name_h, v)
         })
         .unwrap();
     linker
-        .func_wrap(
-            "rtcl",
-            "incr_var",
-            |mut c: Caller<'_, Host>, name_h: i32, n: i64| -> i64 {
-                let name =
-                    c.data().consts[((name_h >> 1) as usize).saturating_sub(abi::CONST_ARENA_BASE as usize)].clone();
-                let amount = abi::untag(n);
-                match c.data_mut().interp.incr_var(&name, amount) {
-                    Ok(v) => c.data_mut().tag_value(&v),
-                    Err(e) => {
-                        c.data_mut().pending = Some(Pending { err: e, from_eval: false });
-                        abi::ERR_SENTINEL
-                    }
-                }
-            },
-        )
+        .func_wrap("rtcl", "incr_var", |mut c: Caller<'_, Host>, name_h: i32, n: i64| -> i64 {
+            c.data_mut().incr_var_raw(name_h, n)
+        })
         .unwrap();
     linker
         .func_wrap(
             "rtcl",
             "call",
-            move |mut c: Caller<'_, Host>, _cmd_id: i32, site: i32, _argc: i32| -> i64 {
-                // 宿主 eval 路由：站点原文 + 换行前缀（行号对齐）。
+            move |mut c: Caller<'_, Host>, cmd_id: i32, site: i32, argc: i32| -> i64 {
                 // 新进程不变量落地：首次命令调用即关闭变量缓存。
                 let _ = g_caching_call.set(&mut c, wasmi::Val::I32(0));
-                let site = site.max(0) as u32;
-                let text = c.data().site_text(site).to_string();
-                let line = c.data().lines.get(site as usize).copied().unwrap_or(1).max(1) as usize;
-                let script = format!("{}{}", "\n".repeat(line - 1), text);
-                match c.data_mut().interp.eval(&script) {
-                    Ok(v) => c.data_mut().tag_value(&v),
-                    Err(e) => {
-                        c.data_mut().pending = Some(Pending { err: e, from_eval: true });
-                        abi::ERR_SENTINEL
-                    }
-                }
+                c.data_mut().call_raw(cmd_id, site, argc)
             },
         )
         .unwrap();
     linker
         .func_wrap("rtcl", "set_result", |mut c: Caller<'_, Host>, v: i64| {
-            let val = c.data().value_of(v);
-            c.data_mut().result = Some(val);
+            c.data_mut().set_result_raw(v);
         })
         .unwrap();
     linker
         .func_wrap("rtcl", "refuel", move |mut c: Caller<'_, Host>| -> i64 {
-            let chunk = c.data().refuel_chunk;
+            let chunk = c.data().refuel_chunk();
             for _ in 0..chunk {
-                if let Err(e) = VmContext::charge_step(&mut c.data_mut().interp) {
-                    c.data_mut().pending = Some(Pending { err: e, from_eval: false });
+                if let Err(e) = VmContext::charge_step(c.data_mut().interp_mut()) {
+                    c.data_mut().set_pending(e, false);
                     return abi::ERR_SENTINEL;
                 }
             }
@@ -559,18 +688,12 @@ fn execute(
         .unwrap();
     linker
         .func_wrap("rtcl", "fail", |mut c: Caller<'_, Host>, fail_id: i32| -> i32 {
-            c.data_mut().take_fail(fail_id as u32)
+            c.data_mut().fail_raw(fail_id)
         })
         .unwrap();
     linker
         .func_wrap("rtcl", "bool_test", |mut c: Caller<'_, Host>, v: i64| -> i64 {
-            match c.data().bool_test(v) {
-                Ok(b) => abi::tag_imm(b as i64),
-                Err(e) => {
-                    c.data_mut().pending = Some(Pending { err: e, from_eval: false });
-                    abi::ERR_SENTINEL
-                }
-            }
+            c.data_mut().bool_test_raw(v)
         })
         .unwrap();
     linker
@@ -581,7 +704,7 @@ fn execute(
         .unwrap();
     linker
         .func_wrap("rtcl", "exit", |mut c: Caller<'_, Host>, code: i32| {
-            c.data_mut().pending_exit = Some(code);
+            c.data_mut().exit_raw(code);
         })
         .unwrap();
 
@@ -598,11 +721,11 @@ fn execute(
 
     // arena 回收到水位线（§3 纪律）。
     store.data_mut().arena.truncate(watermark);
+    crate::exec::finish(store.into_data(), rc, file)
+}
 
-    let mut host = store.into_data();
-    // 首次 call 关缓存：在 call import 内部做（读取 cur_site 与
-    // caching global 的通道在实例上）；上面 instantiate 后统一处理。
-    let outcome_code = rc;
+/// run() 返回后的共享终局：错误二分（case a/b）与报告构建。
+pub fn finish(mut host: Host, outcome_code: i32, file: &str) -> (Interp, JitRun) {
     let pending_exit = host.pending_exit.take();
     let (driver_report, eval_error) = match outcome_code {
         code::ERROR => {

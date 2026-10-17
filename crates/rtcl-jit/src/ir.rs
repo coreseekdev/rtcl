@@ -234,6 +234,9 @@ pub enum Instr {
     Unary { kind: BinOp, dst: Reg, a: Reg, fail: u32 },
     /// strict_bool 兜底（JumpTrue/JumpFalse 的 TOS）→ 0/1 布尔寄存器。
     BoolTest { dst: BReg, v: Reg, fail: u32 },
+    /// 产生者已知是 tagged 0/1（Cmp/Eq/Ne/And/Or/Not/StrEq/StrNe 的
+    /// 输出恒为 tag(0)/tag(1)）——纯转换，无宿主路径。
+    BoolOfBool { dst: BReg, v: Reg },
     /// 命令分派（宿主 eval 路由；含缓存 flush 与 break/continue 出口）。
     /// `brk`/`cont` = 出口目标 pc（无循环 = None）；`cont_back` = continue
     /// 目标是回边（需 fuel 计步）；phase B 会把目标 pc 改写为分支深度。

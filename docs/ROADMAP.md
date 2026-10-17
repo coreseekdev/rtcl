@@ -114,5 +114,6 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 检视器：L1 稳定后，与 L3 并行
 ```
 
-建议下一块：**L2 数据通道**（ROADMAP §3——查询/SQL 面板、
-Worker 形态；P0/P1 组件层至此全齐）。
+建议下一块：**L2 事件存储 + 查询管道**（ROADMAP §3：wasm 侧
+内存 ring buffer / `db::*` 词表起步——http 客户端已就位，摄取
+的下一站；P0/P1 组件层全齐）。

@@ -1151,6 +1151,79 @@ runtime.registerRenderer('Trace', {
     // v1: -path 变化走重建；布局选项由 runtime 统一应用
   },
 });
+
+// ── Confirm：确认卡片（P1 收官件；UI-RESEARCH §4、纪律 §4.2）──
+// 异步模态：点 Confirm 回灌 ok（-command 绑它）、点 Cancel 回灌
+// cancel——创建脚本跑到底，决定稍后以 fire 到达（禁 vwait）。一次
+// 决定后按钮禁用；configure 更新 -preview/-danger 重新武装（新问题
+// = 新一发）。-preview：字符串 = 提示文字；对象/数组 = 缩进 JSON。
+function confirmRender(st) {
+  const el = st.el;
+  el.className = 'rui-confirm'
+    + (st.danger ? ' rui-confirm-danger' : '')
+    + (st.decided ? ' rui-confirm-done' : '');
+  const kids = [];
+  if (typeof st.preview === 'string') {
+    const msg = h('div', 'rui-confirm-msg');
+    msg.textContent = st.preview;
+    kids.push(msg);
+  } else if (st.preview !== undefined && st.preview !== null) {
+    const pre = h('pre', 'rui-confirm-prev');
+    pre.textContent = JSON.stringify(st.preview, null, 2);
+    kids.push(pre);
+  }
+  const btns = h('div', 'rui-confirm-btns');
+  const ok = h('button', 'rui-confirm-btn rui-confirm-ok');
+  ok.type = 'button';
+  ok.textContent = 'Confirm';
+  ok.disabled = st.decided;
+  const no = h('button', 'rui-confirm-btn rui-confirm-cancel');
+  no.type = 'button';
+  no.textContent = 'Cancel';
+  no.disabled = st.decided;
+  btns.append(ok, no);
+  kids.push(btns);
+  el.replaceChildren(...kids);
+}
+
+function confirmDecide(st, which) {
+  if (st.decided) return;   // 真 DOM 里 disabled 已拦；shim/兜底再拦一层
+  st.decided = true;
+  confirmRender(st);
+  st.fire(which);
+}
+
+runtime.registerRenderer('Confirm', {
+  create(path, props, hp) {
+    const el = h('div', 'rui-confirm');
+    const st = {
+      path, el,
+      danger: !!props.danger,
+      preview: props.preview,
+      decided: false,
+      fire: hp.fire,
+    };
+    el._confirm = st;
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('.rui-confirm-ok')) confirmDecide(st, 'ok');
+      else if (e.target.closest('.rui-confirm-cancel')) confirmDecide(st, 'cancel');
+    });
+    confirmRender(st);
+    return el;
+  },
+  update(el, props, hp) {
+    const st = el._confirm;
+    if (!st) return;
+    st.fire = hp.fire;
+    let changed = false;
+    if ('danger' in props) { st.danger = !!props.danger; changed = true; }
+    if ('preview' in props) { st.preview = props.preview; changed = true; }
+    if (changed) {
+      st.decided = false;   // 新配置 = 新问题：重新武装
+      confirmRender(st);
+    }
+  },
+});
 }
 
 // ── 默认暗色主题（样式全在这里，渲染器不带样式）────────────────────────
@@ -1246,6 +1319,21 @@ export function injectUiStyles() {
 .rui-trace-bar { position:absolute; top:5px; height:12px; min-width:1px; background:#1f6feb; border-radius:2px; cursor:pointer; }
 .rui-trace-bar:hover { background:#58a6ff; }
 .rui-trace-empty { padding:10px; color:#8b949e; }
+/* ui::confirm —— 确认卡片：预览块 + Confirm/Cancel；danger 红边，
+   已决定（禁用）半透明。 */
+.rui-confirm { background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:12px; display:flex; flex-direction:column; gap:10px; }
+.rui-confirm.rui-confirm-danger { border-color:#f85149; }
+.rui-confirm.rui-confirm-done { opacity:0.65; }
+.rui-confirm-msg { color:#c9d1d9; font-size:13px; white-space:pre-wrap; }
+.rui-confirm-prev { margin:0; padding:8px 10px; background:#161b22; border:1px solid #30363d; border-radius:4px; color:#c9d1d9; font:12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; word-break:break-word; max-height:160px; overflow:auto; }
+.rui-confirm-btns { display:flex; gap:8px; justify-content:flex-end; }
+.rui-confirm-btn { background:#21262d; color:#c9d1d9; border:1px solid #30363d; border-radius:4px; padding:4px 12px; font:inherit; font-size:12px; cursor:pointer; }
+.rui-confirm-btn:hover:not(:disabled) { background:#30363d; }
+.rui-confirm-ok { background:#238636; border-color:#2ea043; color:#fff; }
+.rui-confirm-ok:hover:not(:disabled) { background:#2ea043; }
+.rui-confirm-danger .rui-confirm-ok { background:#da3633; border-color:#f85149; }
+.rui-confirm-danger .rui-confirm-ok:hover:not(:disabled) { background:#f85149; }
+.rui-confirm-btn:disabled { opacity:0.5; cursor:default; }
 `;
   document.head.appendChild(style);
 }

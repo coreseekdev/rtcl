@@ -156,9 +156,13 @@ tclsh 交互态有完整 `history` 命令（`history` 列事件表、`history ke
 ```
 
 rtcl 现状：CLI 上下键历史由 rustyline 提供，`.history` 点命令打印编号
-列表（只读）；web 用输入框上下键。**差距**：没有可编程的 `history`
-Tcl 命令、无 `!` 展开（tclsh 本身也没有 `!` 展开）。作为点命令扩展面
-保留，待需求出现再补内置命令。
+列表（只读）；web 由各宿主页在 JS 侧实现（www 与 gezi 面板均为
+输入框数组 + 上下键）。
+
+**架构决定（2026-10-17）**：不实现内置 `history` Tcl 命令。历史是
+宿主侧职责——native 由 rustyline 承担，web 由 JS 承担；需要可编程
+事件表的宿主可以用 `register_command` 从自己一侧注入 `history` 命令，
+解释器核心保持无关（tclsh 的 history 也是 Tcl 层库而非解释器内建）。
 
 ## rtcl 侧实现索引
 
@@ -171,9 +175,11 @@ Tcl 命令、无 `!` 展开（tclsh 本身也没有 `!` 展开）。作为点命
   同一套 parity 输出规则）。
 - `crates/rtcl-wasm/test.js` — is_complete 的 node 侧回归（24/24）。
 
-## 已知差距（截至本文）
+## 已知差距与决定（截至本文）
 
-1. `history` 内置命令（可编程事件表）未实现——点命令 `.history` 替代。
+1. ~~`history` 内置命令未实现~~ → **决定不做内置**（见上节）：历史
+   由宿主侧提供——native 走 rustyline，web 走 JS；宿主可经
+   `register_command` 自行注入可编程 `history`。
 2. tclsh 的 `tcl_readline`/`!` 历史展开不存在（tclsh 8.6 亦无）。
 3. script 模式 `exit N` 的退出码（rc=1 vs tclsh rc=N）是文件模式语义，
    归 judge 语料管，REPL 侧已对齐。

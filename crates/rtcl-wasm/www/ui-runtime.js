@@ -114,6 +114,8 @@ export function createUiRuntime(root, opts = {}) {
         s.set(path, cb);
         return () => { const cur = subs.get(modelPath); if (cur) cur.delete(path); };
       },
+      // 通用提交（Form 的字段路径 <base>/<prop> 在渲染时才拼出）
+      commit: (modelPath, value) => commitModel(modelPath, value),
       events: events ?? [],
     };
   }
@@ -1224,6 +1226,179 @@ runtime.registerRenderer('Confirm', {
     }
   },
 });
+
+// ── Form：schema 驱动表单（P1 收官件；UI-DSL §2.3/§2.4）────────
+// JSON Schema 子集：properties 的 string/integer/number/boolean/
+// enum 逐项渲染控件（title 作标签、required 做必填）。值以模型为准：
+// -path 基路径，字段读写 <base>/<prop>；变更（change/blur/Enter）才
+// 回写模型——击键不触 Tcl（与 Field 同纪律）。提交先跑客户端校验：
+// 缺项标红 + 表单内提示、不回灌（可见错误，非静默）；通过才回灌
+// commit（-command 绑它，异步）。contract 草图的内联 vars 未实现
+// （fire 只带字符串 detail；脚本用 ui::model get 读值）。
+const FORM_SCALAR_TYPES = ['string', 'integer', 'number', 'boolean'];
+
+function formValidateSchema(path, schema) {
+  if (schema === null || typeof schema !== 'object' || Array.isArray(schema)
+      || schema.properties === null || typeof schema.properties !== 'object' || Array.isArray(schema.properties)) {
+    throw new Error(`Form ${path}: -schema must be an object with a properties object`);
+  }
+  if (schema.required !== undefined
+      && (!Array.isArray(schema.required) || schema.required.some(r => typeof r !== 'string'))) {
+    throw new Error(`Form ${path}: -schema required must be an array of strings`);
+  }
+  for (const [name, prop] of Object.entries(schema.properties)) {
+    if (prop === null || typeof prop !== 'object' || Array.isArray(prop)) {
+      throw new Error(`Form ${path}: property "${name}" must be an object`);
+    }
+    if (prop.type !== undefined && !FORM_SCALAR_TYPES.includes(prop.type)) {
+      throw new Error(`Form ${path}: property "${name}" has unsupported type "${prop.type}" (v1: ${FORM_SCALAR_TYPES.join('/')})`);
+    }
+    if (prop.enum !== undefined && !Array.isArray(prop.enum)) {
+      throw new Error(`Form ${path}: property "${name}" enum must be an array`);
+    }
+  }
+}
+
+function formFieldPath(st, name) {
+  return st.base === null ? null : `${st.base}/${name}`;
+}
+
+// 本地值 → 控件（初始同步与模型回推共用）
+function formApplyValue(st, name, v) {
+  const f = st.inputs.get(name);
+  if (!f) return;
+  const { input, prop } = f;
+  if (prop.type === 'boolean') input.checked = v === true || v === 'true';
+  else if (prop.enum !== undefined) input.value = v === undefined || v === null ? '' : String(v);
+  else input.value = v === undefined || v === null ? '' : String(v);
+}
+
+function formOnModelEvent(st, v, sub) {
+  if (sub === undefined || sub === st.base) {
+    // 基路径全量 set = 权威快照：逐字段灌值（缺的复位）
+    const obj = v !== null && typeof v === 'object' && !Array.isArray(v) ? v : {};
+    for (const name of st.inputs.keys()) formApplyValue(st, name, obj[name]);
+    return;
+  }
+  const rest = sub.slice(st.base.length + 1);
+  if (!rest.includes('/')) formApplyValue(st, rest, v);   // 单层字段更新
+  // 更深路径（嵌套对象）v1 不支持（校验已拒非标量类型）
+}
+
+function formCommitField(st, name) {
+  const f = st.inputs.get(name);
+  if (!f) return;
+  const { input, prop } = f;
+  const p = formFieldPath(st, name);
+  if (p === null) return;                 // 无 -path：值只在 DOM，不写模型
+  let v;
+  if (prop.type === 'boolean') v = input.checked;
+  else if (prop.type === 'integer' || prop.type === 'number') {
+    v = input.value === '' ? '' : Number(input.value);
+  } else v = input.value;
+  st.commit(p, v);
+}
+
+function formSubmit(st) {
+  const missing = [];
+  for (const [name, { input, prop }] of st.inputs) {
+    let bad = false;
+    if (prop.type === 'boolean') bad = st.required.has(name) && !input.checked;
+    else bad = st.required.has(name) && String(input.value).trim() === '';
+    if (bad) missing.push(name);
+    input.classList.toggle('rui-form-bad', bad);
+  }
+  if (missing.length > 0) {
+    st.err.textContent = `missing required: ${missing.join(', ')}`;
+    st.err.classList.add('rui-form-error-show');
+    return;   // 客户端校验挡住提交（可见错误，不回灌）
+  }
+  st.err.textContent = '';
+  st.err.classList.remove('rui-form-error-show');
+  st.fire('commit');
+}
+
+function formRender(st) {
+  const el = st.el;
+  el.replaceChildren();
+  st.inputs.clear();
+  const props = st.schema ? st.schema.properties : {};
+  for (const [name, prop] of Object.entries(props)) {
+    const field = h('label', 'rui-form-field');
+    const lab = h('span', 'rui-form-label');
+    lab.textContent = prop.title === undefined || prop.title === null ? name : String(prop.title);
+    if (st.required.has(name)) {
+      lab.textContent += ' *';
+      lab.classList.add('rui-form-req');
+    }
+    let input;
+    if (Array.isArray(prop.enum)) {
+      input = h('select', 'rui-form-input');
+      for (const opt of prop.enum) {
+        const o = h('option', '');
+        o.value = String(opt);
+        o.textContent = String(opt);
+        input.append(o);
+      }
+    } else if (prop.type === 'boolean') {
+      input = h('input', 'rui-form-input rui-form-check');
+      input.type = 'checkbox';
+    } else {
+      input = h('input', 'rui-form-input');
+      input.type = prop.type === 'integer' || prop.type === 'number' ? 'number' : 'text';
+    }
+    field.append(lab, input);
+    el.append(field);
+    st.inputs.set(name, { input, prop });
+    input.addEventListener('change', () => formCommitField(st, name));
+    if (prop.type !== 'boolean' && prop.enum === undefined) {
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { formCommitField(st, name); formSubmit(st); }
+      });
+    }
+    // 初始值：模型优先（无 -path 时跳过）
+    const p = formFieldPath(st, name);
+    if (p !== null) {
+      const v = st.read(p);
+      if (v !== undefined) formApplyValue(st, name, v);
+    }
+  }
+  st.err = h('div', 'rui-form-error');
+  const btn = h('button', 'rui-form-submit');
+  btn.type = 'button';
+  btn.textContent = 'Submit';
+  btn.addEventListener('click', () => formSubmit(st));
+  el.append(st.err, btn);
+}
+
+function formInit(st, props, hp) {
+  const schema = 'schema' in props ? props.schema : st.schema;
+  if (schema !== undefined && schema !== null) formValidateSchema(st.path, schema);
+  st.schema = schema !== null && schema !== undefined
+    && typeof schema === 'object' && !Array.isArray(schema) ? schema : null;
+  st.base = hp.bind ? hp.bind.path : null;
+  st.read = hp.read;
+  st.commit = hp.commit;
+  st.fire = hp.fire;
+  st.required = new Set(Array.isArray(st.schema?.required) ? st.schema.required : []);
+  if (hp.bind) hp.bind.subscribe((v, sub) => formOnModelEvent(st, v, sub));
+  formRender(st);
+}
+
+runtime.registerRenderer('Form', {
+  create(path, props, hp) {
+    const el = h('div', 'rui-form');   // div 而非 <form>：Enter 由 keydown 自理，避免原生提交刷页
+    const st = { path, el, schema: null, base: null, required: new Set(), inputs: new Map(), err: null };
+    el._form = st;
+    formInit(st, props, hp);
+    return el;
+  },
+  update(el, props, hp) {
+    const st = el._form;
+    if (!st) return;
+    if ('schema' in props || 'bind' in props) formInit(st, props, hp);
+  },
+});
 }
 
 // ── 默认暗色主题（样式全在这里，渲染器不带样式）────────────────────────
@@ -1334,6 +1509,19 @@ export function injectUiStyles() {
 .rui-confirm-danger .rui-confirm-ok { background:#da3633; border-color:#f85149; }
 .rui-confirm-danger .rui-confirm-ok:hover:not(:disabled) { background:#f85149; }
 .rui-confirm-btn:disabled { opacity:0.5; cursor:default; }
+/* ui::form —— schema 驱动表单（控件皮肤与 Field 对齐）。 */
+.rui-form { display:flex; flex-direction:column; gap:8px; background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:12px; }
+.rui-form-field { display:flex; flex-direction:column; gap:4px; }
+.rui-form-label { color:#8b949e; font-size:12px; }
+.rui-form-req { color:#d29922; }
+.rui-form-input { background:#161b22; border:1px solid #30363d; border-radius:4px; color:#c9d1d9; padding:5px 8px; font:inherit; font-size:12px; }
+.rui-form-input:focus { outline:none; border-color:#58a6ff; }
+.rui-form-bad { border-color:#f85149; }
+.rui-form-check { width:auto; align-self:flex-start; }
+.rui-form-error { color:#f85149; font-size:12px; display:none; }
+.rui-form-error.rui-form-error-show { display:block; }
+.rui-form-submit { align-self:flex-start; background:#238636; border:1px solid #2ea043; color:#fff; border-radius:4px; padding:5px 14px; font:inherit; font-size:12px; cursor:pointer; }
+.rui-form-submit:hover { background:#2ea043; }
 `;
   document.head.appendChild(style);
 }

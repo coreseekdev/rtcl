@@ -49,7 +49,7 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 
 | 工作块 | 状态 | 说明 |
 |---|---|---|
-| **HTTP 摄取/客户端** | 缺失 | 双形态：native 宿主提供 server 端点（事件写入）；wasm 侧 `http` 命令包 fetch（拉取+webhook 上报）。事件格式 JSON Lines |
+| **HTTP 摄取/客户端** | 部分 ✅ | wasm 客户端 ✅（`http::get/post` + fetch 桥 `www/http-bridge.js` + `http::jsonl`；回调异步回灌、超时中止、状态如实——验收 ui-http-acc.html：拉取 3 行喂表 27ms、超时 326ms 中止）；native server 端点 + webhook 上报形态缺失 |
 | **事件存储** | 缺失 | 选型待定：native = SQLite（FTS5 全文索引覆盖日志搜索大半）；wasm = IndexedDB 或内存 ring buffer。rtcl-data 扩展 `db::*` 词表 |
 | **查询管道词表** | 缺失 | `log::search / stats / top / rare / timechart` 等，输出为 Tcl dict/list——直接 `ui::model set` 进组件。与 SPL 对位但保持 Tcl 组合性 |
 | **规则/告警引擎** | 缺失 | `after` 轮询 + 规则 proc（条件 → 动作：toast/webhook/新 surface）；规则即脚本，可存档 |

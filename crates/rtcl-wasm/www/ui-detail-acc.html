@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>rtcl ui::kv / ui::tree acceptance (headless)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { font-family: monospace; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #term { flex: 1; border-right: 1px solid #30363d; min-width: 0; overflow: auto; }
+  #ui-root { flex: 1; overflow-y: auto; min-width: 0; }
+  #acc { position: fixed; bottom: 0; left: 0; right: 0; max-height: 38vh; overflow: auto; background:#010409; color:#7ee787; font-size:11px; padding:6px 10px; border-top:1px solid #30363d; white-space:pre-wrap; z-index: 9; }
+</style>
+</head>
+<body>
+<main>
+  <div id="term"></div>
+  <div id="ui-root"></div>
+</main>
+<pre id="acc">booting…</pre>
+<!-- 堵住 load 事件（--dump-dom --timeout 只能到点转储，页面真实任务先跑完） -->
+<img src="http://127.0.0.1:8766/hang" style="display:none" alt="">
+<script type="module">
+import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+import { createUiRuntime, registerDomRenderers, injectUiStyles } from './ui-runtime.js';
+import { createShell } from './shell.js';
+
+const acc = document.getElementById('acc');
+let accLines = [];
+const log = (s, mark) => { accLines.push((mark ? '  ' + mark + ' ' : '') + s); acc.textContent = accLines.join('\n'); };
+
+const nativeRaf = window.requestAnimationFrame.bind(window);
+window.requestAnimationFrame = (cb) => { nativeRaf(cb); setTimeout(() => cb(0), 0); return 0; };
+
+const shell = createShell(document.getElementById('term'), {
+  exec: (s) => { if (!rtcl) throw new Error('WASM 尚未就绪'); return rtcl.exec(s); },
+  isComplete: (s) => (rtcl ? rtcl.is_complete(s) : true),
+});
+const brace = (s) => '{' + s.replace(/\\/g, '\\\\').replace(/}/g, '\\}') + '}';
+
+let rtcl = null;
+
+async function main() {
+  await init();
+  rtcl = new RtclHandle();
+  rtcl.set_output_handler((s) => shell.print(s.replace(/\n$/, ''), 'puts'));
+  injectUiStyles();
+
+  const fired = [];
+  const fire = (path, event, detail) => {
+    fired.push([path, event, detail]);
+    try {
+      rtcl.dispatch_event(detail === undefined
+        ? `::ui::fire ${path} ${event}`
+        : `::ui::fire ${path} ${event} ${detail}`);
+    } catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const commitModel = (path, value) => {
+    try { rtcl.dispatch_event(`ui::model set ${path} ${brace(JSON.stringify(value))}`); }
+    catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const runtime = createUiRuntime(document.getElementById('ui-root'), {
+    fire, commitModel,
+    onError: (m) => shell.print('[ui] ' + m, 'error'),
+  });
+  registerDomRenderers(runtime);
+  rtcl.register_command('_ui', (opsJson) => { runtime.applyOps(JSON.parse(opsJson)); return ''; });
+
+  rtcl.exec('set tcl_interactive 1');
+  window.rtcl = rtcl;
+
+  // ── 详情双件套：kv + tree 共享 /detail ──
+  // 逐键喂数：Tcl 侧 model 是嵌套 dict，子路径 set 合法（整体喂 JSON
+  // 串则 /detail 是标量，Tcl dict 语义下不可再下钻——§8 条目 3）。
+  // JS 侧渲染器按增量合成视图（运行时 model 平表语义）。
+  rtcl.exec(`
+ui::batch {
+  ui::surface .det -title "Event detail"
+  ui::row .det.pair
+  ui::kv .det.pair.kv -path /detail -keys {id status zone uptime meta} -weight 1
+  ui::tree .det.pair.tree -path /detail -weight 1
+}
+ui::model set /detail/id evt-42
+ui::model set /detail/status unresolved
+ui::model set /detail/zone eu-west
+ui::model set /detail/uptime 1234
+ui::model set /detail/meta/sdk "rtcl 0.1"
+ui::model set /detail/meta/tags {["a","b"]}
+ui::model set /detail/meta/sampled true
+ui::model set /detail/meta/parent null
+`);
+
+  acceptance(runtime, fired).catch(e => log('harness error: ' + (e && e.message || e), 'ERR'));
+}
+
+async function acceptance(runtime, fired) {
+  await new Promise(r => setTimeout(r, 0));
+
+  // 1) catalog 内省
+  const catK = rtcl.exec('ui::catalog Kv');
+  const catT = rtcl.exec('ui::catalog Tree');
+  const catOk = catK.includes('-path') && catK.includes('-keys') && catK.includes('-weight')
+    && catT.includes('-path') && catT.includes('-weight');
+  log(`catalog Kv/Tree introspection ${catOk ? 'OK' : 'FAIL'}`, '[1]');
+
+  // 2) kv 全量：键序 + 值格式化
+  const kvEl = document.querySelector('.rui-kv');
+  const st = kvEl._kv;
+  const fmt = (d) => d.map(([k, v]) => k + '=' + v).join('|');
+  const rowTexts = () => [...st.rows.entries()].map(([k, r]) => [k, r.vEl.textContent]);
+  const t2 = fmt(rowTexts());
+  const kvFullOk = t2 === 'id=evt-42|status=unresolved|zone=eu-west|uptime=1234|meta={"sdk":"rtcl 0.1","tags":["a","b"],"sampled":true,"parent":null}';
+  log(`kv full set: ${t2}`, '[2]');
+  log(`kv -keys order + value formatting ${kvFullOk ? 'OK' : 'FAIL'}`, '[2]');
+
+  // 3) kv 单键增量：节点复用 + 原位写
+  const statusRow = st.rows.get('status').row;
+  const idRow = st.rows.get('id').row;
+  rtcl.exec('ui::model set /detail/status acknowledged');
+  const kvIncOk = st.rows.get('status').row === statusRow
+    && st.rows.get('status').vEl.textContent === 'acknowledged'
+    && st.rows.get('id').row === idRow;
+  log(`kv single-key incremental (node reuse) ${kvIncOk ? 'OK' : 'FAIL'}`, '[3]');
+
+  // 4) tree 初始：根折叠 + 预览
+  const treeEl = document.querySelector('.rui-tree');
+  const ts = treeEl._tree;
+  const trows = () => ts.el.children;
+  const labelOf = (r) => r.children[1]?.textContent ?? '';
+  const treeInitOk = trows().length === 1 && labelOf(trows()[0]) === '(root)'
+    && trows()[0].children[2]?.textContent.includes('5 keys');
+  log(`tree initial collapsed root ${treeInitOk ? 'OK' : 'FAIL'} (rows=${trows().length})`, '[4]');
+
+  // 5) 展开根 → 子节点 + 缩进
+  trows()[0].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 0));
+  const rootKids = [...trows()].map(labelOf);
+  const treeExpandOk = trows().length === 6 && rootKids.join(',') === '(root),id,status,zone,uptime,meta'
+    && trows()[1].style.paddingLeft === '14px';
+  log(`tree root expand: ${rootKids.join(',')} ${treeExpandOk ? 'OK' : 'FAIL'}`, '[5]');
+
+  // 6) 展开 meta → 嵌套对象/数组预览
+  const metaIdx = [...trows()].map(labelOf).indexOf('meta');
+  trows()[metaIdx].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 0));
+  const metaKids = [...trows()].map(labelOf);
+  const tagsRow = [...trows()].find(r => labelOf(r) === 'tags');
+  const treeNestedOk = metaKids.includes('sdk') && metaKids.includes('sampled')
+    && tagsRow?.children[2]?.textContent.includes('2 items')
+    && trows()[metaIdx + 1].style.paddingLeft === '28px';
+  log(`tree meta expand: ${metaKids.join(',')} ${treeNestedOk ? 'OK' : 'FAIL'}`, '[6]');
+
+  // 7) 子路径更新：kv meta 行重绘 + tree 可见节点同步（同一增量）
+  rtcl.exec('ui::model set /detail/meta/sampled false');
+  await new Promise(r => setTimeout(r, 0));
+  const kvMeta = st.rows.get('meta').vEl.textContent;
+  const sampledRow = [...trows()].find(r => labelOf(r) === 'sampled');
+  const subpathOk = kvMeta.includes('"sampled":false') && sampledRow?.children[2]?.textContent === 'false';
+  log(`subpath /detail/meta/sampled → kv meta="${kvMeta}" tree sampled=${sampledRow?.children[2]?.textContent} ${subpathOk ? 'OK' : 'FAIL'}`, '[7]');
+
+  // 8) 展开/折叠不触 Tcl（无事件回灌）
+  const noBridgeOk = fired.length === 0;
+  log(`expand/collapse keeps JS-side (fires=${fired.length}) ${noBridgeOk ? 'OK' : 'FAIL'}`, '[8]');
+
+  const all = catOk && kvFullOk && kvIncOk && treeInitOk && treeExpandOk && treeNestedOk && subpathOk && noBridgeOk;
+  log(`VERDICT: ${all ? 'PASS' : 'FAIL'}`, 'END');
+  acc.title = all ? 'acc-pass' : 'acc-fail';
+}
+
+main().catch((e) => {
+  log('failed to init: ' + (e && e.message || e), 'ERR');
+});
+</script>
+</body>
+</html>

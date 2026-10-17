@@ -118,12 +118,23 @@ ui::batch {
   rtcl.exec(`
 ui::batch {
   ui::surface .p -title Pods
-  ui::text .p.hint -variant caption -text "feed: feedpods 100000"
+  ui::text .p.hint -variant caption -text "feed: feedpods 100000 · click a row"
   ui::table .p.table -path /pods -columns {name status restarts age} -weight 1 \\
       -rowactions {open {puts "open \\#$ui_row: [ui::model get /pods/$ui_row]"} \\
                    del  {puts "del  \\#$ui_row"}}
 }
-ui::on .p.table rowclick {puts "rowclick \\#$ui_row"}
+ui::on .p.table rowclick {
+  puts "rowclick \\#$ui_row"
+  # 行值在模型里是原始 JSON 串：原样转喂 /pod，kv/tree 拿到的是 JSON 对象
+  ui::model set /pod [ui::model get /pods/$ui_row]
+}
+ui::batch {
+  ui::surface .pd -title "Pod detail"
+  ui::text .pd.hint -variant caption -text "kv + tree share /pod (click a Pods row)"
+  ui::row .pd.pair
+  ui::kv .pd.pair.kv -path /pod -keys {name status restarts age} -weight 1
+  ui::tree .pd.pair.tree -path /pod -weight 1
+}
 `);
 
   // 10 万行游标喂数（分批 ui::batch 每片一个过桥；协议一次一行）。

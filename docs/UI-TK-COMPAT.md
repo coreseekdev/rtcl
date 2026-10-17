@@ -7,10 +7,10 @@
 
 | 对象 | 形态 | 观察 |
 |---|---|---|
-| [visualtkinter.com](https://visualtkinter.com/designer?template=calculator) | 在线拖拽设计器 | 生成的 calculator 模板是**纯 `place` 绝对定位**（每按钮 `place(x=20,y=80,width=50,height=50)`）——GUI builder 的 WYSIWYG 天性 |
-| [VisualTK 离线备份](https://github.com/mechatronod/VisualTK)（visualtk.com 的 HTTrack 快照） | 已在本地跑通（见 §5） | 经典三栏：控件调色板 / 点阵画布 / **Tkinter option 全集平铺的属性检查器**（Activebackground/Anchor/bitmap/compound/cursor…几十个属性无分组无校验） |
+| [visualtkinter.com](https://visualtkinter.com/designer?template=calculator)（线上现行版） | 在线拖拽设计器 | **默认 grid 推断模式**（见 §3.1）：从画布位置推断 row/column 轨道、columnspan、sticky，并生成 `columnconfigure weight=1` + minsize；可切回 fixed（place）。CustomTkinter 导出、项目级 Style、LAYERS 面板、GRID 吸附——与老站快照是两个时代的产品 |
+| [VisualTK 离线备份](https://github.com/mechatronod/VisualTK)（visualtk.com **老站** 2023/24 快照，与线上 visualtkinter.com 差距大，勿混为一谈） | 已在本地跑通（见 §5） | 经典三栏：控件调色板 / 点阵画布 / **Tkinter option 全集平铺的属性检查器**；纯 place 输出 |
 | [tcltk.wasm](https://github.com/t3tra-dev/tcltk.wasm) | Tcl/Tk 8.6.18 经 Emscripten 移植浏览器 | 真 Tk 渲染（canvas 输出），2026 年活跃维护 |
-| pygubu / PAGE / Tkinter-Designer | Tkinter RAD 生态 | 同样以 place/绝对坐标为主输出 |
+| pygubu / PAGE / Tkinter-Designer | Tkinter RAD 生态 | 以 place/绝对坐标为主输出（未逐一复核现行版） |
 
 ## 2. 三条路线
 
@@ -41,22 +41,54 @@ pack .s.b -fill both -expand 1        ;# → ui::configure .s.b -fill both -weig
   设计的词表，人工直写同样顺手。
 - 判：**主线，继续**。
 
-## 3. 关键论据：设计器工具暴露了 Tk 词表的真实成本
+## 3. 关键论据：Tk 词表缺的不是布局语义，而是中间层元数据
 
-VisualTK/visualtkinter 的 generated code 全部是 place 绝对定位，
-检查器是 option 全集平铺——这不是工具做得差，而是 **Tk 词表缺少
-中间层**：没有布局语义的结构化声明（pack 顺序即语义），没有
-属性约束（任何 option 任何值都合法到运行时才炸），没有数据绑定
-（-textvariable 是弱形式）。
+~~设计器只会生成 place~~（已被证伪，见下）——真实情况是：
+**布局语义 Tk 有（grid），设计器也能产出；Tk 词表真正的缺口在
+元数据与数据层**。
 
-机器生成场景下这三个缺失是致命的（LLM 需要校验反馈回路），
-人工设计器场景下它们退化为"画布拖拽 + 大表单"。我们的 catalog
-spec（kind/meta/default + 布局公共选项）恰好同时是：
+### 3.1 visualtkinter.com 现行版的 grid 推断（2026-10 复核）
+
+calculator 模板在 grid 模式下生成：
+
+```python
+self.display.grid(row=0, column=0, columnspan=4, sticky="ew", padx=4, pady=4)
+self.button1.grid(row=1, column=0, sticky="w", padx=4, pady=4)
+...
+root.columnconfigure(0, minsize=58, weight=1)   # 轨道推断 + weight + minsize
+root.rowconfigure(0, minsize=48)
+```
+
+推断算法四件套：**画布位置 → 网格轨道；跨度 → columnspan；保守
+sticky（按钮 "w"、display "ew"）；画布尺寸 → minsize + 均分
+weight**。这证明两件事：
+
+1. Tk grid 语义（row/column/span/sticky/weight/minsize）完全可以
+   由设计器产出——我们 L1 `ui::grid` 的词汇与 Tk 对齐（
+   `-row/-col/-span/-sticky/-weight`）因此多了一条理由：该词汇
+   已被设计器场景验证为可可视化、可推断。
+2. "画布自由拖拽 + 网格轨道推断"是设计器交互的已验证可行解，
+   将来若做设计器形态可直接参考（而不是约束用户逐格摆放）。
+
+### 3.2 仍然成立的缺口
+
+但线上版同时确认了 Tk 词表的另一半问题依旧存在：
+
+- **无 catalog/校验概念**：检查器的属性 schema 是每个设计器工具
+  侧硬编码维护的（线上版分组精美，但那是工具自己的元数据，
+  与 Tk 运行时无关；运行时对任何 option/值组合照旧宽容到出错
+  才炸）。我们的 catalog 是单一事实源，同时服务校验/LLM/检查器。
+- **无数据绑定**：生成代码里显示刷新靠 `entry.insert/delete`
+  命令式操作，模型概念缺失。
+- **无批量化/事务**：逐 widget 命令流。
+
+机器生成场景下这三点是致命的（LLM 需要校验反馈回路），而它们
+恰恰是 ui::* catalog 的既有能力：
 
 1. 词表命令的校验器（已实现）
 2. **LLM 的 prompt 词表**（`ui::catalog` 内省即文档）
 3. **属性检查器的表单 schema**——kind=enum→下拉、bool→勾选、
-   size→带单位输入、script→代码框。VisualTK 右侧检查器要硬编码
+   size→带单位输入、script→代码框。Tk 设计器的检查器要硬编码
    几十个属性，我们一行 `ui::catalog Button` 全导出。
 
 第 3 点是自举机会：用 ui::* 渲染 ui::* 的属性检查器

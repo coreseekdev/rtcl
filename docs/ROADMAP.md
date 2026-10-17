@@ -83,8 +83,12 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 1. 目标用户（开发者/运维/LLM）表达 UI 意图的最高效路径是
    **命令/脚本**，不是拖拽；dashboard 的可重放脚本形态与拖拽
    设计器的二进制工程文件形态根本冲突。
-2. 拖拽设计器开发成本高（画布/对齐/undo），收益场景窄；
-   VisualTK 系的实证：画布天然退化为 place 绝对定位。
+2. 拖拽设计器开发成本高（画布/对齐/undo），收益场景窄。
+   （修正记录：visualtkinter.com 现行版已证明"画布拖拽 + 网格
+   轨道推断"可行——grid 模式生成 row/column/columnspan/sticky +
+   `columnconfigure weight`。这不改变上述结论：它解决的是"设计器
+   能否产出结构化布局"，而我们的判断是"目标用户是否需要设计器"。
+   若将来需要，轨道推断交互已被验证可参考，见 UI-TK-COMPAT.md §3.1。）
 3. 但**探索性调参**（改文案/尺寸/variant 所见即所得）是真实需求，
    检视器覆盖它且几乎免费——catalog spec 就是表单 schema
    （enum→下拉、bool→勾选、size→单位输入、script→代码框）。

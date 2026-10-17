@@ -39,6 +39,7 @@ import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
 import { createUiRuntime, registerDomRenderers, injectUiStyles } from './ui-runtime.js';
 import { createShell } from './shell.js';
 import { installHttpBridge } from './http-bridge.js';
+import { startHeartbeat } from './event-loop.js';
 
 const status = document.getElementById('status');
 
@@ -63,6 +64,9 @@ async function main() {
   rtcl.set_output_handler((s) => shell.print(s.replace(/\n$/, ''), 'puts'));
   injectUiStyles();
   installHttpBridge(rtcl, { onError: (m) => shell.print('[http] ' + m, 'error') });
+  // wasm 主线程形态的自发事件循环：心跳把到点的 after 事件泵出来
+  // （rules::* 规则、after 轮询都靠它流动）
+  startHeartbeat(rtcl, { intervalMs: 50, onError: (m) => shell.print('[hb] ' + m, 'error') });
 
   // 事件回灌：JS 组件事件 → Tcl 回调（契约 §2.4）。第三参 = 行级
   // detail（ui::table 下标），拼成 "::ui::fire <path> <ev> <detail>"。
@@ -330,6 +334,23 @@ proc qt {field} {
     }
     set ::qrows $n
     return "top $field: $n rows"
+}
+`);
+
+  // M12: rules::* —— 规则/告警引擎（after 轮询 + 心跳驱动）。规则即
+  // 脚本：条件沿触发（去抖），动作写 /alerts 进 log 组件。试试：
+  // set ::load 92 / set ::load 20 / rules::list
+  rtcl.exec(`
+ui::batch {
+  ui::surface .a -title "Alerts (rules::*)"
+  ui::text .a.hint -variant caption -text "try: set ::load 92   (rule: load > 85, edge-triggered)"
+  ui::log .a.log -path /alerts -weight 1
+}
+set ::load 10
+set ::alertseq 0
+rules::add loadwatch -every 200 -when {expr {$::load > 85}} -do {
+    ui::model set /alerts/$::alertseq [format {{"level":"error","text":"load %d%% exceeds 85%% (loadwatch)"}} $::load]
+    incr ::alertseq
 }
 `);
 

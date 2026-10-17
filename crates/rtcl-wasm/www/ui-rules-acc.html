@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>rtcl rules::* acceptance (headless)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { font-family: monospace; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #term { flex: 1; border-right: 1px solid #30363d; min-width: 0; overflow: auto; }
+  #ui-root { flex: 1; overflow-y: auto; min-width: 0; }
+  #acc { position: fixed; bottom: 0; left: 0; right: 0; max-height: 38vh; overflow: auto; background:#010409; color:#7ee787; font-size:11px; padding:6px 10px; border-top:1px solid #30363d; white-space:pre-wrap; z-index: 9; }
+</style>
+</head>
+<body>
+<main>
+  <div id="term"></div>
+  <div id="ui-root"></div>
+</main>
+<pre id="acc">booting…</pre>
+<!-- 堵住 load 事件（--dump-dom --timeout 只能到点转储，页面真实任务先跑完） -->
+<img src="http://127.0.0.1:8766/hang" style="display:none" alt="">
+<script type="module">
+import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+import { createUiRuntime, registerDomRenderers, injectUiStyles } from './ui-runtime.js';
+import { createShell } from './shell.js';
+import { startHeartbeat } from './event-loop.js';
+
+const acc = document.getElementById('acc');
+let accLines = [];
+const log = (s, mark) => { accLines.push((mark ? '  ' + mark + ' ' : '') + s); acc.textContent = accLines.join('\n'); };
+
+const nativeRaf = window.requestAnimationFrame.bind(window);
+window.requestAnimationFrame = (cb) => { nativeRaf(cb); setTimeout(() => cb(0), 0); return 0; };
+
+const shell = createShell(document.getElementById('term'), {
+  exec: (s) => { if (!rtcl) throw new Error('WASM 尚未就绪'); return rtcl.exec(s); },
+  isComplete: (s) => (rtcl ? rtcl.is_complete(s) : true),
+});
+const brace = (s) => '"' + String(s)
+  .replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  .replace(/\$/g, '\\$').replace(/\[/g, '\\[') + '"';
+
+let rtcl = null;
+
+async function main() {
+  await init();
+  rtcl = new RtclHandle();
+  rtcl.set_output_handler((s) => shell.print(s.replace(/\n$/, ''), 'puts'));
+  injectUiStyles();
+
+  const hbErrors = [];
+  startHeartbeat(rtcl, { intervalMs: 40, onError: (m) => { hbErrors.push(m); shell.print('[hb] ' + m, 'error'); } });
+
+  const fire = (path, event, detail) => {
+    try {
+      rtcl.dispatch_event(detail === undefined
+        ? `::ui::fire ${path} ${event}`
+        : `::ui::fire ${path} ${event} ${detail}`);
+    } catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const commitModel = (path, value) => {
+    try { rtcl.dispatch_event(`ui::model set ${path} ${brace(JSON.stringify(value))}`); }
+    catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const runtime = createUiRuntime(document.getElementById('ui-root'), {
+    fire, commitModel,
+    onError: (m) => shell.print('[ui] ' + m, 'error'),
+  });
+  registerDomRenderers(runtime);
+  rtcl.register_command('_ui', (opsJson) => { runtime.applyOps(JSON.parse(opsJson)); return ''; });
+
+  rtcl.exec('set tcl_interactive 1');
+  window.rtcl = rtcl;
+
+  // ── 告警闭环：规则 → /alerts → log 组件 ──
+  rtcl.exec(`
+ui::batch {
+  ui::surface .a -title "Alerts (rules::*)"
+  ui::text .a.hint -variant caption -text "rule: load > 85 (edge-triggered)"
+  ui::log .a.log -path /alerts -weight 1
+}
+set ::load 10
+set ::alertseq 0
+rules::add loadwatch -every 50 -when {expr {$::load > 85}} -do {
+    ui::model set /alerts/$::alertseq [format {{"level":"error","text":"load %d%% exceeds 85%%"}} $::load]
+    incr ::alertseq
+}
+rules::add broken -every 50 -when {error "sensor down"} -do {set x 1}
+`);
+  window.__acc = { hbErrors };
+
+  acceptance(hbErrors).catch(e => log('harness error: ' + (e && e.message || e), 'ERR'));
+}
+
+async function acceptance(hbErrors) {
+  await new Promise(r => setTimeout(r, 0));
+  const execV = (s) => rtcl.exec(s);
+  const waitFor = (fn, ms = 4000) => new Promise((res, rej) => {
+    const t0 = Date.now();
+    const t = setInterval(() => {
+      let r = false;
+      try { r = fn(); } catch { r = false; }
+      if (r) { clearInterval(t); res(); }
+      else if (Date.now() - t0 > ms) { clearInterval(t); rej(new Error('wait timeout')); }
+    }, 20);
+  });
+
+  // 1) 词表装载 + 校验 + list 形状
+  const wlOk = execV('llength [info commands rules::add]') === '1';
+  let badErr = '';
+  try { rtcl.exec('rules::add x -every 0 -do {set y 1}'); } catch (e) { badErr = String(e); }
+  // 名单按名排序：[broken, loadwatch] 各 5 项 → loadwatch 在第 5 项，
+  // 其 fires（+3）应为 0
+  const listOk = execV('lindex [rules::list] 0') === 'broken'
+    && execV('lindex [rules::list] 5') === 'loadwatch'
+    && execV('lindex [rules::list] 8') === '0';
+  log(`word layer=${wlOk}; -every validation=${badErr.includes('positive integer')}; list shape=${listOk}`, '[1]');
+  const loadOk = wlOk && badErr.includes('positive integer') && listOk;
+
+  // 2) 心跳驱动：掀起条件 → 规则触发（等待真实时间）
+  const t0 = performance.now();
+  execV('set ::load 90');
+  await waitFor(() => execV('rules::fires loadwatch') === '1');
+  const fireMs = Math.round(performance.now() - t0);
+  log(`load 90 → rule fired in ${fireMs}ms (heartbeat 40ms)`, '[2]');
+  const firedOk = execV('rules::fires loadwatch') === '1' && Number(execV('rules::fires loadwatch')) === 1;
+
+  // 3) 沿去抖：保持为真不再触发；告警已进 /alerts → log 组件
+  await new Promise(r => setTimeout(r, 300));
+  const edgeOk = execV('rules::fires loadwatch') === '1'
+    && execV('llength [ui::model get /alerts]') === '2'   // 一个告警事件 = 键值对两元素
+  const alert0 = execV('ui::model get /alerts/0');
+  const domLog = document.querySelector('.rui-log')._log;
+  await new Promise(r => requestAnimationFrame(r));
+  const lines = domLog.rows.filter(Boolean);
+  const uiOk = lines.length === 1 && lines[0].text === 'load 90% exceeds 85%' && lines[0].level === 'error';
+  log(`edge debounce (fires=1 after 300ms)=${edgeOk}; alert line in DOM="${lines[0]?.text}" class=${lines[0] ? '' : '?'}${uiOk ? ' OK' : ' FAIL'}`, '[3]');
+  const alertOk = edgeOk && uiOk;
+
+  // 4) 回落重新武装 → 第二次沿 → 第二行告警
+  execV('set ::load 20');
+  await waitFor(() => execV('lindex [rules::list] 2') === '1');   // armed 回 1
+  execV('set ::load 92');
+  await waitFor(() => execV('rules::fires loadwatch') === '2');
+  await new Promise(r => requestAnimationFrame(r));
+  const lines2 = domLog.rows.filter(Boolean);
+  const rearmOk = lines2.length === 2 && lines2[1].text === 'load 92% exceeds 85%';
+  log(`re-arm cycle → fires=${execV('rules::fires loadwatch')}, alerts rows=${lines2.length} ${rearmOk ? 'OK' : 'FAIL'}`, '[4]');
+
+  // 5) 坏规则不杀循环：errors 计数、好规则仍工作
+  const errs = Number(execV('rules::errors'));
+  const aliveOk = errs >= 1 && execV('rules::fires loadwatch') === '2';
+  log(`broken rule errors=${errs}, loadwatch survives=${aliveOk ? 'OK' : 'FAIL'}`, '[5]');
+
+  // 6) stop 后不再触发；start 后行为保持（沿不重置）
+  execV('set ::load 20');
+  await waitFor(() => execV('lindex [rules::list] 2') === '1');
+  execV('rules::stop loadwatch');
+  execV('set ::load 97');
+  await new Promise(r => setTimeout(r, 300));
+  const stopOk = execV('rules::fires loadwatch') === '2';
+  log(`stop: no fire while stopped ${stopOk ? 'OK' : 'FAIL'}`, '[6]');
+
+  const noHbErrors = hbErrors.length === 0;
+  log(`heartbeat errors=${hbErrors.length} ${noHbErrors ? 'OK' : 'FAIL'}`, '[7]');
+
+  const all = loadOk && firedOk && alertOk && rearmOk && aliveOk && stopOk && noHbErrors;
+  log(`VERDICT: ${all ? 'PASS' : 'FAIL'}`, 'END');
+  acc.title = all ? 'acc-pass' : 'acc-fail';
+}
+
+main().catch((e) => {
+  log('failed to init: ' + (e && e.message || e), 'ERR');
+});
+</script>
+</body>
+</html>

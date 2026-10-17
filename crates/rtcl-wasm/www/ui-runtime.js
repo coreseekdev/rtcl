@@ -374,7 +374,11 @@ function tableRowDelta(st, i, v) {
     st.spacer.style.height = (st.n * TABLE_ROW_H) + 'px';
   }
   const r = st.pool.get(i);
-  if (r !== undefined) tableFillRow(st, r);   // 可视区外：只进缓存
+  if (r !== undefined) tableFillRow(st, r);   // 可视区内：原位写 cell（不重建）
+  // 游标喂数的可视区自亮：行进窗内时由下一帧补渲染（scroll 才渲染
+  // 的话，停在 scrollTop=0 的用户看着 10 万行流过仍是空表）。rAF 合
+  // 并吞掉批内全量 schedule，每帧至多一次 membership 差分。
+  tableScheduleWindow(st);
 }
 
 // 订阅回调（前缀扇出，第二参 = 实际变更路径）：

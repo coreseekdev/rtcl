@@ -220,6 +220,11 @@ ui::define Button {
   多根数组）+ JS 渲染器（甘特条按完整树时间域 % 摆放、名字区折叠、
   点条缩放到 span 窗/再点复位、轨道空白复位——全客户端）+ demo
   静态瀑布 + ui-trace-acc.html。缺口见 §8 条目 13/14
+- M10 ✅ `ui::confirm` v1（P1 收官件，2025-10-18）：Confirm define
+  （`-danger` bool、`-preview` json——字符串=消息文字、对象/数组=缩进
+  JSON、`-command` 绑 **ok** 事件）+ JS 渲染器（预览卡 + Confirm/
+  Cancel；一次决定后禁用，configure 重武装）+ demo Danger zone +
+  ui-confirm-acc.html。异步回灌 = 禁 vwait 的落地形状（§4.2）
 
 ## 8. 变更建议（v1 落地中发现的缺口；本节只记录，未改协议）
 
@@ -308,3 +313,14 @@ L1 分子组件，已落地）实现过程中踩实，属于**契约缺口候选
     无问题，万级树没有窗口化）；缩放只有"点条跳窗/复位"，没有
     时间轴拖拽/滚轮缩放、没有时间刻度线。等真实数据量拉动再
     加（虚拟化可复用 Table 的池式做法）。
+
+以下条目在 `ui::confirm`（M10）落地过程中踩实：
+
+15. **script 选项 configure 是累积而非替换**（既有偏差，Button
+    同款）：`ui::configure 路径 -command {新脚本}` 走 `_bind` 追加
+    ——同一事件会先跑旧脚本再跑新脚本；Tk 语义是替换。修法是给
+    -command 维护"当前脚本"游标（ui::on 的多 handler 语义不动），
+    涉及解释器侧注册表，先记录待评审。
+16. **confirm 按钮文案固定**（Confirm/Cancel 英文）、动作只有
+    ok/cancel 两分支；i18n、多动作（是/否/稍后）、"记住选择"等
+    留给未来（契约 §2.3 也未含）。-preview 是只读预览，无编辑。

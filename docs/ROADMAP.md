@@ -39,7 +39,8 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 | `ui::kv` / `ui::tree` | ✅ v1 | 详情双件套；kv `-keys` 键序 + 单键增量；tree 折叠预览 + 点击展开（DOM 惰性物化） | 嵌套模型渲染；展开/折叠零 Tcl 往返 |
 | `ui::chart -vegalite` | ✅ v1 | Vega-Lite 子集（line/bar/point/area，x 序数等距）；spec 过桥、数据走 model 通道（spec.data.name） | 500 点流式 16ms；rAF 合并重绘 0.25ms/帧；组件/spec 不重建 |
 | `ui::trace` | ✅ v1 | span 树甘特图；折叠不改对齐、点条缩放/复位全客户端 | 6 行瀑布全交互零 Tcl 回灌 |
-| `ui::form` / `ui::confirm` | 缺失 | schema 驱动表单；模态动作走 -command 回调（禁 vwait） | confirm 不阻塞事件循环 |
+| `ui::confirm` | ✅ v1 | 模态动作走 -command 回调（绑 ok；cancel 经 ui::on），决定后禁用、configure 重武装 | 创建脚本跑到底；决定异步回灌（不阻塞） |
+| `ui::form` | 缺失 | schema 驱动表单；-command 回调 | 表单提交不阻塞事件循环 |
 | `ui::tabs` | 缺失 | surface 内组织 | 切换保各页状态 |
 | markdown `-text` | 缺失 | 渲染需 sanitize | XSS 用例全拒 |
 | L2 组件（popover/splitter） | 冻结 | 等真实拉动 | — |
@@ -113,5 +114,5 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 检视器：L1 稳定后，与 L3 并行
 ```
 
-建议下一块：**`ui::confirm`**（P1 尾声——模态动作走 `-command`
-回调，浏览器纪律下禁 vwait 的关键件；P0 三件 + chart/trace 已齐）。
+建议下一块：**`ui::form`**（P1 尾巴的最后一件，schema 驱动
++ `-command` 回调；组件层除它之外已齐，之后进 L2 数据通道）。

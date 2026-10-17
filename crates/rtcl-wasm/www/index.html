@@ -82,28 +82,11 @@ function print(text, cls) {
   term.scrollTop = term.scrollHeight;
 }
 
-// ── Tcl reader: is the script complete? (brace/bracket/quote balance) ──
-// Models the Tcl reader: braces are strong quotes (backslash is literal
-// inside them), backslash escapes apply outside braces, brackets track
-// command substitution depth.
-function isComplete(script) {
-  let brace = 0, bracket = 0, inQuote = false;
-  for (let i = 0; i < script.length; i++) {
-    const c = script[i];
-    if (brace === 0 && c === '\\') { i++; continue; }  // escape (incl. inside quotes)
-    if (inQuote) { if (c === '"') inQuote = false; continue; }
-    if (brace > 0) {
-      if (c === '{') brace++;
-      else if (c === '}') brace--;
-      continue;                                        // brackets/quotes are literal in braces
-    }
-    if (c === '{') brace = 1;
-    else if (c === '"') inQuote = true;
-    else if (c === '[') bracket++;
-    else if (c === ']') bracket--;
-  }
-  return brace === 0 && !inQuote && bracket <= 0;
-}
+// ── Tcl reader: completeness comes from the interpreter itself ──
+// RtclHandle::is_complete() exposes rtcl_parser::is_complete — the same
+// oracle `info complete` and the native CLI REPL use, so the web terminal
+// never drifts from the real Tcl reader (brace/bracket/quote balance,
+// backslash-newline edge cases included).
 
 // ── Line editor: mirror the hidden input's value + caret ──
 function render() {
@@ -121,6 +104,7 @@ function render() {
 }
 
 function submit() {
+  if (!rtcl) return;
   const line = buf;
   buf = '';
   kbd.value = '';
@@ -132,8 +116,8 @@ function submit() {
   histIdx = -1;
 
   pending += (pending ? '\n' : '') + line;
-  if (!isComplete(pending)) {
-    ps.textContent = '>';
+  if (!rtcl.is_complete(pending)) {
+    ps.textContent = '...';   // tclsh prints no continuation prompt; rtcl marks it (CLI does the same)
     render();
     return;
   }
@@ -145,12 +129,29 @@ function submit() {
   render();
 }
 
+// Output parity with tclsh interactive mode: results echo bare, errors
+// print the bare message (no prefix — the errorInfo stack is script-mode
+// behavior), top-level `return` echoes its value, `break`/`continue`
+// report the tclsh exception text, `exit` notes the code (a browser page
+// cannot exit).
 function run(script) {
   try {
     const result = rtcl.exec(script);
     if (result !== '') print(result, 'result');
   } catch (e) {
-    print('error: ' + (e && e.message || e), 'error');
+    const msg = String(e && e.message || e);
+    let m;
+    if ((m = msg.match(/^return with value: (.*)$/s))) {
+      if (m[1] !== '') print(m[1], 'result');
+    } else if (msg === 'break') {
+      print('invoked "break" outside of a loop', 'error');
+    } else if (msg === 'continue') {
+      print('invoked "continue" outside of a loop', 'error');
+    } else if ((m = msg.match(/^exit with value: (\d+)$/))) {
+      print('exit ' + m[1], 'hint');
+    } else {
+      print(msg, 'error');
+    }
   }
 }
 
@@ -185,7 +186,7 @@ kbd.addEventListener('paste', (e) => {
   const text = (e.clipboardData || window.clipboardData).getData('text');
   if (!text.includes('\n')) return;              // single line: default insert
   e.preventDefault();
-  print('% ' + text.replace(/\n/g, '\n  '), 'echo');
+  print(ps.textContent + ' ' + text.replace(/\n/g, '\n  '), 'echo');
   run(text.replace(/\n+$/, ''));
 });
 
@@ -197,6 +198,9 @@ async function main() {
   // puts → output pane (no `rename puts` hack — stdout channel is replaced)
   rtcl.set_output_handler((s) => print(s.replace(/\n$/, ''), 'puts'));
 
+  // tclsh's interactive main loop runs with tcl_interactive = 1.
+  rtcl.exec('set tcl_interactive 1');
+
   // Demo: JS functions registered as Tcl commands
   rtcl.register_command('add', (a, b) => Number(a) + Number(b));
   rtcl.register_command('now', () => new Date().toLocaleTimeString());
@@ -205,7 +209,9 @@ async function main() {
   window.rtcl = rtcl;
   print('rtcl ' + (rtcl.exec('info patchlevel') || '') + ' — WASM ready.', 'result');
   print('JS-registered commands: add, now, ticket', 'hint');
-  print('try:  % add 1 2   |   % now   |   % proc f {x} { expr {$x*$x} }; f 9', 'hint');
+  print('try:  % add 1 2   |   % proc f {x} {', 'hint');
+  print('        expr {$x*$x}', 'hint');
+  print('      }   (multi-line: open braces/quotes keep reading)', 'hint');
   print('open DevTools and run  rtcl.register_command("hi", () => "hello")', 'hint');
   print('');
 

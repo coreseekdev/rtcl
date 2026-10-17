@@ -73,6 +73,14 @@ async function test() {
     assertThrows(() => rtcl.exec("temp_cmd"), "invalid command", "unregister: command gone after removal");
     assertEq(rtcl.unregister_command("temp_cmd"), false, "unregister: returns false for missing command");
 
+    // ── Tcl reader completeness (REPL multi-line support) ────────────────
+    assertEq(rtcl.is_complete("set x 1"), true, "is_complete: single command");
+    assertEq(rtcl.is_complete("set x {"), false, "is_complete: unclosed brace");
+    assertEq(rtcl.is_complete("set x {a\nb\nc}"), true, "is_complete: closed multi-line brace");
+    assertEq(rtcl.is_complete('puts "unclosed'), false, "is_complete: unclosed quote");
+    assertEq(rtcl.is_complete("set i [expr 1 +"), false, "is_complete: unclosed bracket");
+    assertEq(rtcl.is_complete("set a 1 \\"), true, "is_complete: bare trailing backslash (tclsh parity)");
+
     // ── Output handler (puts redirection) ────────────────────────────────
     const out = [];
     rtcl.set_output_handler((s) => out.push(s));

@@ -41,6 +41,14 @@ impl RtclHandle {
         Ok(js_command::unregister_js_command(&mut self.interp, self.id, name))
     }
 
+    /// Tcl reader check: is `code` a complete script (braces, quotes and
+    /// brackets balanced)?  Web REPLs call this to decide whether to keep
+    /// reading continuation lines — the same oracle `info complete` and the
+    /// native CLI REPL use (`rtcl_parser::is_complete`).
+    pub fn is_complete(&self, code: &str) -> bool {
+        rtcl_parser::is_complete(code)
+    }
+
     /// Route `puts` (stdout) output to a JavaScript callback.
     ///
     /// 注入 rtcl-core 的 `HostConsole` 宿主控制台服务：无 `io` 特性构建

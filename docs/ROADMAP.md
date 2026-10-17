@@ -50,8 +50,8 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 | 工作块 | 状态 | 说明 |
 |---|---|---|
 | **HTTP 摄取/客户端** | 部分 ✅ | wasm 客户端 ✅（`http::get/post` + fetch 桥 `www/http-bridge.js` + `http::jsonl`；回调异步回灌、超时中止、状态如实——验收 ui-http-acc.html：拉取 3 行喂表 27ms、超时 326ms 中止）；native server 端点 + webhook 上报形态缺失 |
-| **事件存储** | 缺失 | 选型待定：native = SQLite（FTS5 全文索引覆盖日志搜索大半）；wasm = IndexedDB 或内存 ring buffer。rtcl-data 扩展 `db::*` 词表 |
-| **查询管道词表** | 缺失 | `log::search / stats / top / rare / timechart` 等，输出为 Tcl dict/list——直接 `ui::model set` 进组件。与 SPL 对位但保持 Tcl 组合性 |
+| **事件存储** | 部分 ✅ | wasm 内存 ring ✅ v1（`log::*` 纯 Tcl：容量上限/最旧淘汰/来源标签，2025-10-18）；SQLite（FTS5）与 IndexedDB 持久形态、rtcl-data 的 `db::*` 词表仍缺失 |
+| **查询管道词表** | 部分 ✅ | v1：`log::ingest(-lines) / count / tail / search / stats / top / hist`——平铺 list 输出直喂组件（验收：300 条 8ms；统计序/直方图/淘汰窗全过）；`rare / timechart`（时间字段直方图）与更多 SPL 对位词缺失 |
 | **规则/告警引擎** | 缺失 | `after` 轮询 + 规则 proc（条件 → 动作：toast/webhook/新 surface）；规则即脚本，可存档 |
 | **大数据二进制通道** | 冻结（P2） | Arrow IPC over buffer_paths 式通道；table 到十万行级再启 |
 
@@ -114,6 +114,5 @@ UI-RESEARCH.md（需求）、UI-LAYOUT.md（布局）、UI-TK-COMPAT.md（词表
 检视器：L1 稳定后，与 L3 并行
 ```
 
-建议下一块：**L2 事件存储 + 查询管道**（ROADMAP §3：wasm 侧
-内存 ring buffer / `db::*` 词表起步——http 客户端已就位，摄取
-的下一站；P0/P1 组件层全齐）。
+建议下一块：**规则/告警引擎**（ROADMAP §3：`after` 轮询 +
+规则 proc（条件 → 动作）；存储与查询已就位，自动化是下一站）。

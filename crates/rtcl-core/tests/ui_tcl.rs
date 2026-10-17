@@ -466,3 +466,71 @@ fn log_catalog_shows_options_and_layout() {
     let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
     assert!(all.contains("Log"), "{all}");
 }
+
+// ── Kv / Tree：详情双件套词表层 ────────────────────────────────
+
+#[test]
+fn kv_create_emits_shape_and_keys_list() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp
+        .eval(r#"ui::kv .s.kv -path /info -keys {name status uptime} -weight 1"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    // -path bind 过线；-keys list kind → JSON 数组；布局公共选项混入；
+    // 无事件（kv 是只读详情，无行事件）。
+    assert!(
+        log.contains(concat!(
+            r#"{"op":"create","path":".s.kv","type":"Kv","#,
+            r#""props":{"bind":"\/info","keys":["name","status","uptime"],"weight":1},"events":[]}"#
+        )),
+        "kv create op: {log}"
+    );
+
+    // 子路径增量：/info/status 单键更新一次一个 op
+    interp
+        .eval(r#"ui::model set /info/status Running"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    assert!(
+        log.contains(r#""op":"model","sub":"set","path":"\/info\/status","value":"Running""#),
+        "kv per-key model op: {log}"
+    );
+}
+
+#[test]
+fn tree_create_emits_shape() {
+    let mut interp = setup();
+    interp.eval("ui::surface .s").unwrap();
+    interp
+        .eval(r#"ui::tree .s.tree -path /obj -fill x"#)
+        .unwrap();
+    let log = op_log(&mut interp);
+    assert!(
+        log.contains(concat!(
+            r#"{"op":"create","path":".s.tree","type":"Tree","#,
+            r#""props":{"bind":"\/obj","fill":"x"},"events":[]}"#
+        )),
+        "tree create op: {log}"
+    );
+}
+
+#[test]
+fn kv_tree_catalog_shows_options_and_layout() {
+    let mut interp = setup();
+    let c = interp.eval("ui::catalog Kv").unwrap().as_str().to_string();
+    for opt in ["-path", "-keys", "-fill", "-weight"] {
+        assert!(c.contains(opt), "catalog Kv missing {opt}: {c}");
+    }
+    assert!(c.contains("bind"), "{c}");
+
+    let t = interp.eval("ui::catalog Tree").unwrap().as_str().to_string();
+    for opt in ["-path", "-fill", "-weight"] {
+        assert!(t.contains(opt), "catalog Tree missing {opt}: {t}");
+    }
+    assert!(t.contains("bind"), "{t}");
+
+    let all = interp.eval("ui::catalog").unwrap().as_str().to_string();
+    assert!(all.contains("Kv"), "{all}");
+    assert!(all.contains("Tree"), "{all}");
+}

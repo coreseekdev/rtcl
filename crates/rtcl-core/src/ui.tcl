@@ -591,3 +591,23 @@ proc ::ui::model {sub args} {
 ::ui::define Log {
     -path {bind {} {}}
 }
+
+# 键值详情（L1 详情双件套之一；UI-RESEARCH §2.3/§3）。-path 是 bind
+# 类选项：模型里的一个对象，渲染为"键 | 值"两列（标量原样，嵌套
+# 对象/数组 compact JSON 单行——要下钻用 ui::tree）。键序默认 = 模型
+# 对象的插入序；-keys 给显式键序（Tcl 列表 → JSON 数组）只渲染列出的
+# 键（缺失的跳过）。子路径增量（ui::model set /info/status X）原位
+# 更新对应行，不重建其它行。
+::ui::define Kv {
+    -path {bind {} {}}
+    -keys {list {} {}}
+}
+
+# JSON 树（详情双件套之二）。-path 指向任意 JSON 值：对象/数组按
+# 键/下标递归，容器节点默认折叠（预览 "{…} N keys" / "[…] N items"），
+# 点击逐层展开——DOM 只物化可见节点（"懒加载子节点" = 渲染惰性，
+# 数据本就在模型里）。标量节点单行显示。模型子树更新后按当前展开
+# 状态重绘可见节点。
+::ui::define Tree {
+    -path {bind {} {}}
+}

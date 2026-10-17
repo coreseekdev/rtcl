@@ -1,4 +1,5 @@
 mod js_command;
+mod clock;
 mod output;
 
 use wasm_bindgen::prelude::*;
@@ -19,6 +20,11 @@ impl RtclHandle {
             id: js_command::next_interp_id(),
         };
         handle.interp.register_command("_js_dispatch", js_command::js_dispatch_cmd);
+        handle.interp.set_clock(Box::new(clock::JsClock));
+        handle
+            .interp
+            .load_ui()
+            .map_err(|e| JsValue::from_str(&format!("ui.tcl failed to load: {e}")))?;
         Ok(handle)
     }
 
@@ -57,6 +63,20 @@ impl RtclHandle {
         self.interp
             .set_console(Box::new(output::JsConsole::new(callback)));
         Ok(())
+    }
+
+    /// Inject an external event (UI action, host callback): queue the
+    /// script and immediately pump all ready events. 事件回调脚本的错误
+    /// 不静默——收集后以 `Err` 抛给 JS，供 shell 呈现（对应
+    /// docs/UI-DSL.md 的 bgerror 回路）。
+    pub fn dispatch_event(&mut self, script: &str) -> Result<(), JsValue> {
+        self.interp.post_event(script);
+        let errors = self.interp.pump_events();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(JsValue::from_str(&errors.join("\n")))
+        }
     }
 }
 

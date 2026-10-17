@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rtcl ui demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: "SF Mono", Consolas, "Liberation Mono", Menlo, monospace;
+    background: #0d1117; color: #c9d1d9;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 8px 16px; background: #161b22; border-bottom: 1px solid #30363d;
+    font-size: 13px; color: #8b949e; display: flex; align-items: center; gap: 10px;
+  }
+  header b { color: #7ee787; font-weight: normal; }
+  #status { margin-left: auto; font-size: 12px; }
+  #status.ok { color: #3fb950; }
+  #status.err { color: #f85149; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #term { flex: 1; border-right: 1px solid #30363d; min-width: 0; }
+  #ui-root { flex: 1; overflow-y: auto; min-width: 0; }
+</style>
+</head>
+<body>
+<header>
+  <b>rtcl</b> ui demo — 左侧 shell，右侧 ui::* 即时面板
+  <span id="status">loading WASM…</span>
+</header>
+<main>
+  <div id="term"></div>
+  <div id="ui-root"></div>
+</main>
+<script type="module">
+import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+import { createUiRuntime, registerDomRenderers, injectUiStyles } from './ui-runtime.js';
+import { createShell } from './shell.js';
+
+const status = document.getElementById('status');
+
+let rtcl = null;
+const shell = createShell(document.getElementById('term'), {
+  exec: (s) => {
+    if (!rtcl) throw new Error('WASM 尚未就绪');
+    return rtcl.exec(s);
+  },
+  isComplete: (s) => (rtcl ? rtcl.is_complete(s) : true),
+});
+
+// Tcl 大括号引用：内层 } 与 \ 转义（嵌套 {} 自然平衡）
+const brace = (s) => '{' + s.replace(/\\/g, '\\\\').replace(/}/g, '\\}') + '}';
+
+async function main() {
+  await init();
+  rtcl = new RtclHandle();
+  rtcl.set_output_handler((s) => shell.print(s.replace(/\n$/, ''), 'puts'));
+  injectUiStyles();
+
+  // 事件回灌：JS 组件事件 → Tcl 回调（契约 §2.4）
+  const fire = (path, event) => {
+    try { rtcl.dispatch_event(`::ui::fire ${path} ${event}`); }
+    catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  // 输入组件提交：本地编辑回写 Tcl 模型（契约 §2.2）
+  const commitModel = (path, value) => {
+    try { rtcl.dispatch_event(`ui::model set ${path} ${brace(JSON.stringify(value))}`); }
+    catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+
+  const runtime = createUiRuntime(document.getElementById('ui-root'), {
+    fire,
+    commitModel,
+    onError: (m) => shell.print('[ui] ' + m, 'error'),
+  });
+  registerDomRenderers(runtime);
+
+  // _ui 是唯一桥命令：词表层送来的 op JSON 数组在此汇聚（契约 §3）
+  rtcl.register_command('_ui', (opsJson) => {
+    runtime.applyOps(JSON.parse(opsJson));
+    return '';
+  });
+
+  rtcl.exec('set tcl_interactive 1');
+  window.rtcl = rtcl;
+
+  // M4 验收：6 行 counter + 一个验证 model/bind 回路的表单面板
+  rtcl.exec(`
+set ::n 0
+ui::batch {
+  ui::surface .s -title Counter
+  ui::column .s.main
+  ui::text .s.main.count -text 0
+  ui::button .s.main.inc -text +1 -command {ui::configure .s.main.count -text [incr ::n]}
+}
+ui::model set /name ""
+ui::model set /enabled false
+ui::batch {
+  ui::surface .f -title Form
+  ui::column .f.main
+  ui::field .f.main.name -label Name -path /name
+  ui::checkbox .f.main.ok -label Enabled -path /enabled
+  ui::button .f.main.dump -text Dump -command {puts "name=\[ui::model get /name\] enabled=\[ui::model get /enabled\]"}
+}
+`);
+
+  shell.print('rtcl ' + (rtcl.exec('info patchlevel') || '') + ' — ui demo ready.', 'result');
+  shell.print('try:  % ui::text .s.main.note -text hello -variant caption', 'hint');
+  shell.print('      % ui::catalog Button   |   % ui::model get /name', 'hint');
+  shell.focus();
+  status.textContent = 'ready';
+  status.className = 'ok';
+}
+
+main().catch((e) => {
+  status.textContent = 'error: ' + (e && e.message || e);
+  status.className = 'err';
+  shell.print('failed to init: ' + (e && e.message || e), 'error');
+});
+</script>
+</body>
+</html>

@@ -922,6 +922,14 @@ impl Interp {
         self.eval(LOG_TCL).map(|_| ())
     }
 
+    /// 加载 rules::* 词表层（规则/告警引擎，docs/ROADMAP.md §3）。
+    /// after 轮询驱动；wasm 主线程形态需要宿主心跳把到点的 after
+    /// 事件泵出来（www/event-loop.js）。
+    pub fn load_rules(&mut self) -> crate::error::Result<()> {
+        const RULES_TCL: &str = include_str!("../rules.tcl");
+        self.eval(RULES_TCL).map(|_| ())
+    }
+
     /// 注入宿主控制台实现（wasm 宿主由此把 `puts` 的输出接到 JS 回调；
     /// 原生构建默认已是 [`crate::host::NativeConsole`]，无需调用）。
     pub fn set_console(&mut self, console: Box<dyn crate::host::HostConsole>) {

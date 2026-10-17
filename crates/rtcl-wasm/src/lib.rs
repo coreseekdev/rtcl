@@ -33,6 +33,10 @@ impl RtclHandle {
             .interp
             .load_log()
             .map_err(|e| JsValue::from_str(&format!("log.tcl failed to load: {e}")))?;
+        handle
+            .interp
+            .load_rules()
+            .map_err(|e| JsValue::from_str(&format!("rules.tcl failed to load: {e}")))?;
         Ok(handle)
     }
 

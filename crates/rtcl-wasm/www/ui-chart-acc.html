@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>rtcl ui::chart acceptance (headless)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body { font-family: monospace; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #term { flex: 1; border-right: 1px solid #30363d; min-width: 0; overflow: auto; }
+  #ui-root { flex: 1; overflow-y: auto; min-width: 0; }
+  #acc { position: fixed; bottom: 0; left: 0; right: 0; max-height: 38vh; overflow: auto; background:#010409; color:#7ee787; font-size:11px; padding:6px 10px; border-top:1px solid #30363d; white-space:pre-wrap; z-index: 9; }
+</style>
+</head>
+<body>
+<main>
+  <div id="term"></div>
+  <div id="ui-root"></div>
+</main>
+<pre id="acc">booting…</pre>
+<!-- 堵住 load 事件（--dump-dom --timeout 只能到点转储，页面真实任务先跑完） -->
+<img src="http://127.0.0.1:8766/hang" style="display:none" alt="">
+<script type="module">
+import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+import { createUiRuntime, registerDomRenderers, injectUiStyles } from './ui-runtime.js';
+import { createShell } from './shell.js';
+
+const acc = document.getElementById('acc');
+let accLines = [];
+const log = (s, mark) => { accLines.push((mark ? '  ' + mark + ' ' : '') + s); acc.textContent = accLines.join('\n'); };
+
+const nativeRaf = window.requestAnimationFrame.bind(window);
+const rafExecCosts = [];
+window.requestAnimationFrame = (cb) => {
+  let done = false;
+  const once = (t) => {
+    if (!done) {
+      done = true;
+      const c0 = performance.now();
+      cb(t ?? performance.now());
+      rafExecCosts.push(performance.now() - c0);
+    }
+  };
+  nativeRaf(once);
+  setTimeout(() => once(0), 0);
+  return 0;
+};
+
+const shell = createShell(document.getElementById('term'), {
+  exec: (s) => { if (!rtcl) throw new Error('WASM 尚未就绪'); return rtcl.exec(s); },
+  isComplete: (s) => (rtcl ? rtcl.is_complete(s) : true),
+});
+const brace = (s) => '{' + s.replace(/\\/g, '\\\\').replace(/}/g, '\\}') + '}';
+
+let rtcl = null;
+
+async function main() {
+  await init();
+  rtcl = new RtclHandle();
+  rtcl.set_output_handler((s) => shell.print(s.replace(/\n$/, ''), 'puts'));
+  injectUiStyles();
+
+  const fire = (path, event, detail) => {
+    try {
+      rtcl.dispatch_event(detail === undefined
+        ? `::ui::fire ${path} ${event}`
+        : `::ui::fire ${path} ${event} ${detail}`);
+    } catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const commitModel = (path, value) => {
+    try { rtcl.dispatch_event(`ui::model set ${path} ${brace(JSON.stringify(value))}`); }
+    catch (e) { shell.print(String(e && e.message || e), 'error'); }
+  };
+  const runtime = createUiRuntime(document.getElementById('ui-root'), {
+    fire, commitModel,
+    onError: (m) => shell.print('[ui] ' + m, 'error'),
+  });
+  registerDomRenderers(runtime);
+  rtcl.register_command('_ui', (opsJson) => { runtime.applyOps(JSON.parse(opsJson)); return ''; });
+
+  rtcl.exec('set tcl_interactive 1');
+  window.rtcl = rtcl;
+
+  // ── 与 demo 相同的场景：流式线图 + 柱状变体 ──
+  rtcl.exec(`
+ui::batch {
+  ui::surface .ch -title "CPU (streaming)"
+  ui::text .ch.hint -variant caption -text "data via /cpu, spec unchanged"
+  ui::chart .ch.line -vegalite {
+    {"data":{"name":"/cpu"},
+     "mark":"line",
+     "encoding":{"x":{"field":"t"},"y":{"field":"v","type":"quantitative"}}}
+  } -weight 1
+}
+ui::batch {
+  ui::surface .bar -title "Histogram"
+  ui::chart .bar.b -vegalite {{"data":{"name":"/hist"},"mark":"bar","encoding":{"x":{"field":"bin"},"y":{"field":"n"}}}} -weight 1
+}
+set ::cpucursor 0
+proc feedcpu {n {chunk 50}} {
+    set fed 0
+    while {$fed < $n} {
+        set k [expr {$fed + $chunk > $n ? $n - $fed : $chunk}]
+        ui::batch {
+            for {set j 0} {$j < $k} {incr j} {
+                set i [expr {$::cpucursor + $j}]
+                ui::model set /cpu/$i [format {{"t":"%02d:%02d","v":%.1f}} [expr {($i / 60) % 60}] [expr {$i % 60}] [expr {50 + 30 * sin($i / 9.0)}]]
+            }
+        }
+        set ::cpucursor [expr {$::cpucursor + $k}]
+        set fed [expr {$fed + $k}]
+    }
+    return "fed $fed points (total $::cpucursor)"
+}
+`);
+
+  acceptance(runtime).catch(e => log('harness error: ' + (e && e.message || e), 'ERR'));
+}
+
+async function acceptance(runtime) {
+  await new Promise(r => setTimeout(r, 0));
+
+  // 1) catalog 内省
+  const cat = rtcl.exec('ui::catalog Chart');
+  const catOk = cat.includes('-vegalite') && cat.includes('-fill') && cat.includes('-weight');
+  log(`catalog Chart introspection ${catOk ? 'OK' : 'FAIL'}`, '[1]');
+
+  const lineEl = document.querySelector('.rui-chart');
+  const st = lineEl._chart;
+  const cls = (el) => (el.getAttribute('class') || '').split(/\s+/);   // SVG className 是 SVGAnimatedString，一律读属性
+  const svgOf = () => [...st.plot.children].find(e => cls(e).includes('rui-chart-svg'));
+  const lineOf = () => {
+    const svg = svgOf();
+    return svg ? [...svg.children].find(e => cls(e).includes('rui-chart-line')) : undefined;
+  };
+  const pointCount = () => (lineOf()?.getAttribute('points') || '').split(' ').filter(Boolean).length;
+
+  // 2) 游标喂 100 点（流式路径；全量数组 set 由 [4] 的 /hist 覆盖）
+  const t2 = performance.now();
+  const fed100 = rtcl.exec('feedcpu 100');
+  await new Promise(r => requestAnimationFrame(r));
+  log(`${fed100} in ${Math.round(performance.now() - t2)}ms → line points=${pointCount()}, grid=${[...st.plot.children].filter(e => cls(e).includes('rui-chart-grid')).length}, x labels=${[...st.plot.children].filter(e => cls(e).includes('rui-chart-xtick')).length}`, '[2]');
+  const fullOk = pointCount() === 100;
+
+  // 3) 流式 append 400 点（游标；rAF 合并重绘）
+  const costsBefore = rafExecCosts.length;
+  const t0 = performance.now();
+  const fed = rtcl.exec('feedcpu 400');
+  const feedMs = Math.round(performance.now() - t0);
+  await new Promise(r => requestAnimationFrame(r));
+  const execCosts = rafExecCosts.slice(costsBefore);
+  const execAvg = execCosts.reduce((a, b) => a + b, 0) / (execCosts.length || 1);
+  const sameEl = document.querySelector('.rui-chart') === lineEl && st.spec.data.name === '/cpu';
+  log(`${fed} in ${feedMs}ms; line points=${pointCount()}; redraw callbacks=${execCosts.length}, exec avg=${execAvg.toFixed(3)}ms; widget/spec unchanged=${sameEl}`, '[3]');
+  const streamOk = pointCount() === 500 && sameEl && execAvg < 8 && feedMs < 10000;
+
+  // 4) 柱状变体：全量 12 桶 → 12 根柱
+  const hist = [];
+  for (let i = 0; i < 12; i++) hist.push({ bin: `bucket-${i}`, n: Math.round(10 + 40 * Math.abs(Math.sin(i))) });
+  rtcl.exec(`ui::model set /hist {${JSON.stringify(hist)}}`);
+  await new Promise(r => requestAnimationFrame(r));
+  const barEl = document.querySelectorAll('.rui-chart')[1];
+  const bars = [...barEl._chart.plot.children].filter(e => cls(e).includes('rui-chart-bar'));
+  const barOk = bars.length === 12 && bars.every(e => parseFloat(e.style.height) > 0);
+  log(`bar mark: bars=${bars.length}, heights ok=${barOk}`, '[4]');
+
+  // 5) spec 结构错误 → onError → shell 可见（不静默）
+  rtcl.exec('ui::chart .ch.bad -vegalite {{"mark":"line","encoding":{"x":{"field":"t"}}}}');
+  await new Promise(r => setTimeout(r, 0));
+  const term = document.getElementById('term');
+  const errVisible = term.textContent.includes('spec.encoding.x.field');   // onError 带 op 前缀（create <path>: …）
+  log(`bad spec surfaces in shell ${errVisible ? 'OK' : 'FAIL'}`, '[5]');
+
+  // 构造期 Tcl 校验：非法 JSON 是 Tcl 错误
+  let tclErr = '';
+  try { rtcl.exec('ui::chart .ch.bad2 -vegalite {not json}'); } catch (e) { tclErr = String(e); }
+  const jsonErrOk = tclErr.includes('expected JSON');
+  log(`malformed -vegalite is a Tcl error ${jsonErrOk ? 'OK' : 'FAIL'}`, '[6]');
+
+  const all = catOk && fullOk && streamOk && barOk && errVisible && jsonErrOk;
+  log(`VERDICT: ${all ? 'PASS' : 'FAIL'}`, 'END');
+  acc.title = all ? 'acc-pass' : 'acc-fail';
+}
+
+main().catch((e) => {
+  log('failed to init: ' + (e && e.message || e), 'ERR');
+});
+</script>
+</body>
+</html>

@@ -158,6 +158,36 @@ proc feedpods {n {chunk 2000}} {
 }
 `);
 
+  // M8: ui::chart —— Vega-Lite 子集（线图）。数据走 model 通道：
+  // spec.data.name 指向 /cpu，feedcpu 游标 append，spec 不变只重绘。
+  rtcl.exec(`
+ui::batch {
+  ui::surface .ch -title "CPU (streaming)"
+  ui::text .ch.hint -variant caption -text "feed: feedcpu 200 · data via /cpu, spec unchanged"
+  ui::chart .ch.line -vegalite {
+    {"data":{"name":"/cpu"},
+     "mark":"line",
+     "encoding":{"x":{"field":"t"},"y":{"field":"v","type":"quantitative"}}}
+  } -weight 1
+}
+set ::cpucursor 0
+proc feedcpu {n {chunk 50}} {
+    set fed 0
+    while {$fed < $n} {
+        set k [expr {$fed + $chunk > $n ? $n - $fed : $chunk}]
+        ui::batch {
+            for {set j 0} {$j < $k} {incr j} {
+                set i [expr {$::cpucursor + $j}]
+                ui::model set /cpu/$i [format {{"t":"%02d:%02d","v":%.1f}} [expr {($i / 60) % 60}] [expr {$i % 60}] [expr {50 + 30 * sin($i / 9.0)}]]
+            }
+        }
+        set ::cpucursor [expr {$::cpucursor + $k}]
+        set fed [expr {$fed + $k}]
+    }
+    return "fed $fed points (total $::cpucursor)"
+}
+`);
+
   // M6: ui::log —— 追加式日志流。行值 JSON 对象的 level 字段着色
   // （info/warn/error/debug，样式在 ui-runtime.js 的 CSS）；标量行
   // 值视为 info。上滚暂停跟随、回底自动恢复。行点击经 lineclick
@@ -198,6 +228,7 @@ proc feedlog {n {chunk 2000}} {
   shell.print('try:  % ui::text .s.main.note -text hello -variant caption', 'hint');
   shell.print('      % feedpods 100000        ;# 10 万行游标喂数 → .p 表格', 'hint');
   shell.print('      % feedlog 20000          ;# 2 万行流式追加 → .d 日志', 'hint');
+  shell.print('      % feedcpu 200            ;# 200 点流式喂数 → .ch 图表', 'hint');
   shell.print('      % ui::catalog Table      |   % ui::model get /name', 'hint');
   shell.focus();
   status.textContent = 'ready';

@@ -105,6 +105,15 @@ export function createUiRuntime(root, opts = {}) {
         },
         commit: (value) => commitModel(props.bind, value),
       } : null,
+      // 通用模型访问（-vegalite 一类：数据路径写在 spec 里，而不是
+      // props.bind）。watch 与前缀扇出同语义，返回退订函数。
+      read: (modelPath) => model.get(modelPath),
+      watch: (modelPath, cb) => {
+        let s = subs.get(modelPath);
+        if (!s) subs.set(modelPath, (s = new Map()));
+        s.set(path, cb);
+        return () => { const cur = subs.get(modelPath); if (cur) cur.delete(path); };
+      },
       events: events ?? [],
     };
   }
@@ -804,6 +813,193 @@ runtime.registerRenderer('Tree', {
     // v1: -path 变化走重建；布局选项由 runtime 统一应用
   },
 });
+
+// ── Chart：Vega-Lite 子集（L1 数据分析组件；UI-RESEARCH §2.2）──
+// 项目零新依赖：不引 vega-lite 库，内置常见声明式子集——mark
+// line/bar/point/area + x/y 的 field 编码；x 按序数等距摆放（时序
+// 标签原样显示）。数据走 model 通道：spec.data.name 是模型路径
+// （行数组，游标喂数），渲染器订阅该前缀，增量 append 合并到一帧
+// 重绘（spec 不变，组件不重建）。spec 结构错误在 create/update
+// 同步抛（applyOp 的 try/catch → onError）；渲染阶段只做防御性
+// 数据跳过（非对象行 / 非数值 y），不抛错。
+const CHART_MARKS = ['line', 'bar', 'point', 'area'];
+
+function chartFmt(v) {
+  const a = Math.abs(v);
+  if (a >= 1000) return String(Math.round(v));
+  return String(Math.round(v * 100) / 100);
+}
+
+function chartValidate(path, spec) {
+  if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) {
+    throw new Error(`Chart ${path}: -vegalite must be a JSON object`);
+  }
+  const enc = spec.encoding;
+  if (!enc || typeof enc !== 'object' || !enc.x || !enc.y
+      || typeof enc.x.field !== 'string' || typeof enc.y.field !== 'string') {
+    throw new Error(`Chart ${path}: spec.encoding.x.field and spec.encoding.y.field are required`);
+  }
+  const mark = typeof spec.mark === 'string' ? spec.mark : (spec.mark && spec.mark.type);
+  if (!CHART_MARKS.includes(mark)) {
+    throw new Error(`Chart ${path}: unsupported mark "${mark}" (v1: ${CHART_MARKS.join('/')})`);
+  }
+  if (spec.data !== undefined) {
+    const name = spec.data && spec.data.name;
+    if (typeof name !== 'string' || name === '') {
+      throw new Error(`Chart ${path}: spec.data.name must be a model path`);
+    }
+  }
+}
+
+function chartSchedule(st) {
+  if (st.pending) return;
+  st.pending = true;
+  requestAnimationFrame(() => { st.pending = false; chartRender(st); });
+}
+
+function chartRender(st) {
+  const spec = st.spec;
+  st.plot.replaceChildren();
+  if (!spec) return;
+  const xf = spec.encoding.x.field;
+  const yf = spec.encoding.y.field;
+  const mark = typeof spec.mark === 'string' ? spec.mark : spec.mark.type;
+  const pts = [];
+  for (let i = 0; i < st.n; i++) {
+    const r = st.rows[i];
+    if (r === null || typeof r !== 'object' || Array.isArray(r)) continue;
+    const y = Number(r[yf]);
+    if (!Number.isFinite(y)) continue;
+    pts.push({ x: r[xf] === undefined || r[xf] === null ? '' : String(r[xf]), y });
+  }
+  if (pts.length === 0) {
+    const empty = h('div', 'rui-chart-empty');
+    empty.textContent = '(no data)';
+    st.plot.append(empty);
+    return;
+  }
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const p of pts) { if (p.y < lo) lo = p.y; if (p.y > hi) hi = p.y; }
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const pad = (hi - lo) * 0.08;
+  lo -= pad;
+  hi += pad;
+  const yPct = (v) => (1 - (v - lo) / (hi - lo)) * 100;
+  const n = pts.length;
+  const xPct = (i) => (n === 1 ? 50 : (i / (n - 1)) * 100);
+
+  // y 网格 + 刻度（5 档；v1 线性均分，不取整"nice"数）
+  for (let k = 0; k <= 4; k++) {
+    const v = lo + (hi - lo) * k / 4;
+    const grid = h('div', 'rui-chart-grid');
+    grid.style.top = yPct(v) + '%';
+    st.plot.append(grid);
+    const lab = h('div', 'rui-chart-ytick');
+    lab.style.top = yPct(v) + '%';
+    lab.textContent = chartFmt(v);
+    st.plot.append(lab);
+  }
+  // x 标签（最多 7 个，等步采样）
+  const step = Math.max(1, Math.ceil(n / 7));
+  for (let i = 0; i < n; i += step) {
+    const lab = h('div', 'rui-chart-xtick');
+    lab.style.left = xPct(i) + '%';
+    lab.textContent = pts[i].x;
+    st.plot.append(lab);
+  }
+  if (mark === 'bar') {
+    const band = 100 / n;
+    for (let i = 0; i < n; i++) {
+      const bar = h('div', 'rui-chart-bar');
+      bar.style.left = (i * band + band * 0.12) + '%';
+      bar.style.width = (band * 0.76) + '%';
+      bar.style.height = (100 - yPct(pts[i].y)) + '%';
+      st.plot.append(bar);
+    }
+    return;
+  }
+  if (mark === 'point') {
+    for (let i = 0; i < n; i++) {
+      const dot = h('div', 'rui-chart-dot');
+      dot.style.left = xPct(i) + '%';
+      dot.style.top = yPct(pts[i].y) + '%';
+      st.plot.append(dot);
+    }
+    return;
+  }
+  // line / area：SVG 用 100×100 百分比坐标（preserveAspectRatio=none +
+  // vector-effect 保描边宽度）——无需像素测量，尺寸变化不重算。
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'rui-chart-svg');
+  svg.setAttribute('viewBox', '0 0 100 100');
+  svg.setAttribute('preserveAspectRatio', 'none');
+  const coords = pts.map((p, i) => `${xPct(i)},${yPct(p.y)}`);
+  if (mark === 'area') {
+    const poly = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+    poly.setAttribute('points', `0,100 ${coords.join(' ')} 100,100`);
+    poly.setAttribute('class', 'rui-chart-area');
+    svg.append(poly);
+  }
+  const line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+  line.setAttribute('points', coords.join(' '));
+  line.setAttribute('class', 'rui-chart-line');
+  line.setAttribute('vector-effect', 'non-scaling-stroke');
+  svg.append(line);
+  st.plot.append(svg);
+}
+
+function chartOnModelEvent(st, v, sub) {
+  if (sub === st.dataPath) {
+    st.rows = Array.isArray(v) ? v : [];
+    st.n = st.rows.length;
+  } else {
+    const rest = sub.slice(st.dataPath.length + 1);
+    if (/^\d+$/.test(rest)) {
+      st.rows[+rest] = v;
+      if (+rest + 1 > st.n) st.n = +rest + 1;
+    }
+  }
+  chartSchedule(st);
+}
+
+function chartInit(st, props, hp) {
+  const spec = props.vegalite;
+  if (spec !== undefined && spec !== null) chartValidate(st.path, spec);   // 结构错误 → 同步抛给 applyOp
+  if (st.unwatch) { st.unwatch(); st.unwatch = null; }
+  st.spec = null;
+  st.dataPath = null;
+  st.rows = [];
+  st.n = 0;
+  if (spec !== undefined && spec !== null) {
+    st.spec = spec;
+    const name = spec.data && typeof spec.data.name === 'string' ? spec.data.name : null;
+    if (name) {
+      st.dataPath = name;
+      const init = hp.read(name);
+      if (Array.isArray(init)) { st.rows = init; st.n = init.length; }
+      st.unwatch = hp.watch(name, (v, sub) => chartOnModelEvent(st, v, sub));
+    }
+  }
+  chartSchedule(st);
+}
+
+runtime.registerRenderer('Chart', {
+  create(path, props, hp) {
+    const el = h('div', 'rui-chart');
+    const plot = h('div', 'rui-chart-plot');
+    el.append(plot);
+    const st = { path, el, plot, spec: null, dataPath: null, rows: [], n: 0, pending: false, unwatch: null };
+    el._chart = st;
+    chartInit(st, props, hp);
+    return el;
+  },
+  update(el, props, hp) {
+    const st = el._chart;
+    if (!st) return;
+    if ('vegalite' in props) chartInit(st, props, hp);
+  },
+});
 }
 
 // ── 默认暗色主题（样式全在这里，渲染器不带样式）────────────────────────
@@ -871,6 +1067,20 @@ export function injectUiStyles() {
 .rui-tree-label { color:#79c0ff; }
 .rui-tree-prev { color:#8b949e; }
 .rui-tree-val { color:#c9d1d9; overflow:hidden; text-overflow:ellipsis; }
+/* ui::chart —— Vega-Lite 子集（line/bar/point/area）。坐标全用 %：
+   SVG viewBox 0 0 100 100 + preserveAspectRatio=none，描边靠
+   vector-effect 保持宽度——无需像素测量，尺寸变化自动跟随。 */
+.rui-chart { position:relative; height:240px; background:#0d1117; border:1px solid #30363d; border-radius:6px; overflow:hidden; }
+.rui-chart-plot { position:absolute; left:48px; right:14px; top:10px; bottom:26px; }
+.rui-chart-grid { position:absolute; left:0; right:0; height:1px; background:#21262d; }
+.rui-chart-ytick { position:absolute; right:100%; margin-right:6px; transform:translateY(-50%); color:#8b949e; font-size:11px; white-space:nowrap; }
+.rui-chart-xtick { position:absolute; top:100%; margin-top:4px; transform:translateX(-50%); color:#8b949e; font-size:11px; white-space:nowrap; }
+.rui-chart-bar { position:absolute; bottom:0; background:#1f6feb; border-radius:1px 1px 0 0; }
+.rui-chart-dot { position:absolute; width:5px; height:5px; border-radius:50%; background:#58a6ff; transform:translate(-50%,-50%); }
+.rui-chart-svg { position:absolute; left:0; top:0; width:100%; height:100%; overflow:visible; }
+.rui-chart-line { fill:none; stroke:#58a6ff; stroke-width:1.5; }
+.rui-chart-area { fill:rgba(88,166,255,0.18); stroke:none; }
+.rui-chart-empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:#8b949e; font-size:12px; }
 `;
   document.head.appendChild(style);
 }

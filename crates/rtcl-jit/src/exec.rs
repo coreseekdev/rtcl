@@ -63,6 +63,21 @@ pub(crate) struct Host {
     pending_top: Option<String>,
     /// 步数预算的 charge 粒度（REFUEL_CHUNK 次 backedge 计 1 步/次）。
     refuel_chunk: i64,
+    /// foreach/lmap 宿主态栈（lists/collected）。
+    pub(crate) foreaches: Vec<ForeachHost>,
+    /// ByteCode 的 foreach 形状表（start/bind 目标用）。
+    pub(crate) infos: Vec<rtcl_parser::bytecode::ForeachInfo>,
+    /// 最近 rtcl.fail 的表索引（case-a 帧构建用）。
+    pub(crate) last_fail: Option<u32>,
+    /// 自首次任意宿主命令求值后置位——此后 var_traces/dead_flat 可能
+    /// 非空（take_var_fast 的守卫集），LappendVar 等保守路径据此分支。
+    pub(crate) commands_ran: bool,
+}
+
+/// 一个活动 foreach/lmap 的宿主态。
+pub(crate) struct ForeachHost {
+    pub lists: Vec<Vec<Value>>,
+    pub collected: Option<Vec<Value>>,
 }
 
 /// err_is_error 复刻（控制流完成不参与帧累积）。
@@ -135,18 +150,33 @@ impl Host {
         self.pending_top = None;
     }
 
+    /// err_exit_frame 复刻：`\n    (tag line N)`（累积器为空则无操作）。
+    fn exit_frame(&mut self, tag: &str) {
+        if let Some(info) = &mut self.info {
+            info.push_str(&format!("\n    ({} line {})", tag, self.err_line));
+        }
+    }
+
     /// unwind_subs 复刻（Sub → defer 最外层；Expr → append；
     /// Body/Next → 无）。
     fn unwind(&mut self, bodies: &[(crate::ir::BodyKind, u32)], e: &Error) {
-        for (kind, site) in bodies {
-            let text = self.site_text(*site).to_string();
-            let line = self.lines.get(*site as usize).copied().unwrap_or(0) as usize;
+        for (kind, site) in bodies.iter().map(|(k, s)| (*k, *s)) {
+            let text = self.site_text(site).to_string();
+            let line = self.lines.get(site as usize).copied().unwrap_or(0) as usize;
             match kind {
                 crate::ir::BodyKind::Sub => {
                     self.pending_top = Some(text);
                     self.err_line = line;
                 }
                 crate::ir::BodyKind::Expr => {
+                    let msg = e.message_text();
+                    self.harness_frame(&msg, &text, line);
+                }
+                crate::ir::BodyKind::BodyFramed(lmap) => {
+                    // vm_exec unwind_subs 的 BodyFramed 复刻：
+                    // ("foreach"/"lmap" body line N) + 站点 harness 帧。
+                    let tag = if lmap { "\"lmap\" body" } else { "\"foreach\" body" };
+                    self.exit_frame(tag);
                     let msg = e.message_text();
                     self.harness_frame(&msg, &text, line);
                 }
@@ -184,6 +214,52 @@ impl Host {
         }
         self.pending = Some(Pending { err: e, from_eval: false });
         0
+    }
+
+    /// case-a 帧构建：interp 累积器（经哨兵标签 error_report 取出——
+    /// 空 file 名不可能出现在真实路径，剥尾确定）+ 驱动补帧（EvalExpr
+    /// 站点 harness / EvalScript pending / unwind 的 Sub/Expr/BodyFramed）
+    /// + 文件帧（err_line 取最后一次 append 的行）。
+    pub(crate) fn build_case_a_report(&mut self, fail_id: Option<u32>, e: &Error, file: &str) -> String {
+        const SENT: &str = "\u{0}j";
+        let raw = self.interp.error_report(e, SENT);
+        let tail = format!("\n    (file \"{}\" line ", SENT);
+        let base = match raw.rfind(&tail) {
+            Some(i) => raw[..i].to_string(),
+            None => raw,
+        };
+        self.info = if base.is_empty() { None } else { Some(base) };
+        let mut pending_frame: Option<(String, usize)> = None;
+        if let Some(fid) = fail_id {
+            if let Some(fi) = self.fails.get(fid as usize).cloned() {
+                let text = self.site_text(fi.site).to_string();
+                let line = self.lines.get(fi.site as usize).copied().unwrap_or(0) as usize;
+                match fi.kind {
+                    crate::ir::FailKind::EvalExpr => {
+                        let msg = e.message_text();
+                        self.harness_frame(&msg, &text, line);
+                    }
+                    crate::ir::FailKind::EvalScript => {
+                        pending_frame = Some((text, line));
+                    }
+                    _ => {}
+                }
+                self.unwind(&fi.bodies, e);
+            }
+        }
+        if let Some((t, l)) = pending_frame.take() {
+            if let Some(info) = &mut self.info {
+                info.push_str(&format!(
+                    "\n    invoked from within\n\"{}\"",
+                    log_excerpt(&t)
+                ));
+                self.err_line = l;
+            }
+        }
+        if let Some(info) = &mut self.info {
+            info.push_str(&format!("\n    (file \"{}\" line {})", file, self.err_line));
+        }
+        self.info.take().unwrap_or_else(|| e.to_string())
     }
 
     /// error_report 复刻（case b 终局）。
@@ -265,6 +341,15 @@ fn expr_quote(s: &str) -> String {
     }
 }
 
+/// arena 预驻留：0=UNSET 1=哨兵保留 2=EMPTY 3..=常量池。
+fn arena_of(bc: &ByteCode) -> Vec<Value> {
+    let mut arena = vec![Value::unset(), Value::unset(), Value::empty()];
+    for c in bc.constants() {
+        arena.push(Value::from_str(c));
+    }
+    arena
+}
+
 impl Host {
     // ── 构造与引擎协作 ──────────────────────────────────────────────
 
@@ -284,6 +369,18 @@ impl Host {
             err_line: 0,
             pending_top: None,
             refuel_chunk: abi::REFUEL_CHUNK,
+            foreaches: Vec::new(),
+            infos: {
+                let mut v = Vec::new();
+                let mut i = 0u32;
+                while let Some(f) = bc.foreach_info(i) {
+                    v.push(f.clone());
+                    i += 1;
+                }
+                v
+            },
+            last_fail: None,
+            commands_ran: false,
         }
     }
 
@@ -355,6 +452,7 @@ impl Host {
 
     /// 命令分派：站点原文 + 换行前缀 eval 路由。
     pub fn call_raw(&mut self, _cmd_id: i32, site: i32, _argc: i32) -> i64 {
+        self.commands_ran = true;
         let site = site.max(0) as u32;
         let text = self.site_text(site).to_string();
         let line = self.lines.get(site as usize).copied().unwrap_or(1).max(1) as usize;
@@ -413,8 +511,233 @@ impl Host {
         ((idx as u64) << 1) as i32
     }
 
+    /// `rtcl.concat_n(base_off, n)`：从模块 memory 读 n 个 tagged word，
+    /// as_str 连接（vm_exec Concat 语义——永不失败）。
+    pub fn concat_raw(&mut self, words: &[u64]) -> i64 {
+        let mut joined = String::new();
+        for w in words {
+            let v = self.value_of(*w as i64);
+            joined.push_str(v.as_str());
+        }
+        let out = Value::from_str(&joined);
+        self.tag_value(&out)
+    }
+
     pub fn fail_raw(&mut self, fail_id: i32) -> i32 {
+        self.last_fail = Some(fail_id.max(0) as u32);
         self.take_fail(fail_id.max(0) as u32)
+    }
+
+    /// `foreach_start(info, words)`：strict 解析 + bind(0)；返回 tagged
+    /// iters 或哨兵。
+    pub fn foreach_start_raw(&mut self, info: i32, words: &[u64]) -> i64 {
+        let info = info.max(0) as usize;
+        let Some(fi) = self.infos.get(info).cloned() else {
+            return abi::tag_imm(0);
+        };
+        // vm_exec 弹组序 = 逆序；暂存区升序——逆读。
+        let mut lists = Vec::with_capacity(words.len());
+        for w in words.iter().rev() {
+            let v = self.value_of(*w as i64);
+            match v.as_list_ref() {
+                Some(items) => lists.push(items.to_vec()),
+                None => match v.as_list_strict() {
+                    Ok(items) => lists.push(items),
+                    Err(e) => {
+                        let _ = self.interp.set_var("errorCode", Value::from_str(e.code));
+                        self.pending = Some(Pending {
+                            err: Error::Msg(e.message),
+                            from_eval: false,
+                        });
+                        return abi::ERR_SENTINEL;
+                    }
+                },
+            }
+        }
+        let max = fi
+            .groups
+            .iter()
+            .zip(&lists)
+            .map(|(g, l)| l.len().div_ceil(g.len().max(1)))
+            .max()
+            .unwrap_or(0);
+        self.foreaches.push(ForeachHost {
+            lists,
+            collected: fi.lmap.then(Vec::new),
+        });
+        if max > 0 && self.foreach_bind_idx(&fi, 0).is_err() {
+            return abi::ERR_SENTINEL;
+        }
+        abi::tag_imm(max as i64)
+    }
+
+    /// bind 第 idx 次迭代的循环变量（foreach_bind 复刻：空值兜底、
+    /// framed 装饰、TCL WRITE VARNAME）。
+    fn foreach_bind_idx(
+        &mut self,
+        fi: &rtcl_parser::bytecode::ForeachInfo,
+        idx: usize,
+    ) -> Result<(), ()> {
+        let empty = Value::empty();
+        let groups = fi.groups.clone();
+        for (g_i, g) in groups.iter().enumerate() {
+            let n = g.len();
+            for (vi, t) in g.iter().enumerate() {
+                let v = self
+                    .foreaches
+                    .last()
+                    .and_then(|f| f.lists.get(g_i))
+                    .and_then(|l| l.get(idx * n + vi))
+                    .cloned()
+                    .unwrap_or_else(|| empty.clone());
+                let name = self.consts.get(t.name_idx as usize).cloned().unwrap_or_default();
+                if let Err(e) = self.interp.set_var(&name, v) {
+                    if is_real_error(&e) {
+                        let _ = self
+                            .interp
+                            .set_var("errorCode", Value::from_str("TCL WRITE VARNAME"));
+                        if fi.framed {
+                            let what = if fi.lmap { "lmap" } else { "foreach" };
+                            if self.info.is_none() {
+                                self.info = Some(e.message_text());
+                            }
+                            let deco = format!("\n    (setting {} loop variable \"{}\")", what, name);
+                            if let Some(is) = &mut self.info {
+                                is.push_str(&deco);
+                            }
+                        }
+                    }
+                    self.pending = Some(Pending { err: e, from_eval: false });
+                    return Err(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn foreach_bind_raw(&mut self, info: i32, idx: i32) -> i64 {
+        let fi = match self.infos.get(info.max(0) as usize) {
+            Some(f) => f.clone(),
+            None => return 0,
+        };
+        match self.foreach_bind_idx(&fi, idx.max(0) as usize) {
+            Ok(()) => 0,
+            Err(()) => abi::ERR_SENTINEL,
+        }
+    }
+
+    pub fn foreach_collect_raw(&mut self, v: i64) {
+        let val = self.value_of(v);
+        if let Some(f) = self.foreaches.last_mut() {
+            if let Some(c) = &mut f.collected {
+                c.push(val);
+            }
+        }
+    }
+
+    pub fn foreach_end_raw(&mut self) -> i64 {
+        let f = self.foreaches.pop();
+        let v = match f.and_then(|f| f.collected) {
+            Some(c) => Value::from_list(&c),
+            None => Value::empty(),
+        };
+        self.tag_value(&v)
+    }
+
+    /// LappendVar 宿主全语义（vm_exec LappendVar 臂的公共 API 复刻）：
+    /// 存在且 list rep → 追加；不存在 → 创建 [value]；非 list rep →
+    /// strict 错误（cmd_lappend 的形状）。
+    pub fn lappend_var_raw(&mut self, name_h: i32, v: i64) -> i64 {
+        let name = self.const_name(name_h);
+        let val = self.value_of(v);
+        if self.interp.var_exists(&name) {
+            match self.interp.get_var(&name) {
+                Ok(cur) => match cur.as_list() {
+                    Some(mut items) => {
+                        items.push(val);
+                        let nv = Value::from_list(&items);
+                        match self.interp.set_var(&name, nv.clone()) {
+                            Ok(_) => self.tag_value(&nv),
+                            Err(e) => {
+                                self.pending = Some(Pending { err: e, from_eval: false });
+                                abi::ERR_SENTINEL
+                            }
+                        }
+                    }
+                    None => {
+                        // 非 list rep：cmd_lappend 的 strict 错误。
+                        let s = cur.as_str().to_string();
+                        let probe = Value::from_str(&s);
+                        match probe.as_list_strict() {
+                            Ok(items) => {
+                                // as_list 宽松失败但 strict 成功（罕见形状）
+                                let mut items = items;
+                                items.push(val);
+                                let nv = Value::from_list(&items);
+                                match self.interp.set_var(&name, nv.clone()) {
+                                    Ok(_) => self.tag_value(&nv),
+                                    Err(e) => {
+                                        self.pending =
+                                            Some(Pending { err: e, from_eval: false });
+                                        abi::ERR_SENTINEL
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = self
+                                    .interp
+                                    .set_var("errorCode", Value::from_str(e.code));
+                                self.pending = Some(Pending {
+                                    err: Error::Msg(e.message),
+                                    from_eval: false,
+                                });
+                                abi::ERR_SENTINEL
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    self.pending = Some(Pending { err: e, from_eval: false });
+                    abi::ERR_SENTINEL
+                }
+            }
+        } else {
+            let nv = Value::from_list(&[val]);
+            match self.interp.set_var(&name, nv.clone()) {
+                Ok(_) => self.tag_value(&nv),
+                Err(e) => {
+                    self.pending = Some(Pending { err: e, from_eval: false });
+                    abi::ERR_SENTINEL
+                }
+            }
+        }
+    }
+
+    /// EvalScript 路由：嵌套 eval；错误 from_eval=true（站点 pending 帧
+    /// 由 case-a 构建器补）。
+    pub fn eval_script_raw(&mut self, v: i64) -> i64 {
+        self.commands_ran = true;
+        let val = self.value_of(v);
+        let script = val.as_str().to_string();
+        match self.interp.eval(&script) {
+            Ok(r) => self.tag_value(&r),
+            Err(e) => {
+                self.pending = Some(Pending { err: e, from_eval: true });
+                abi::ERR_SENTINEL
+            }
+        }
+    }
+
+    pub fn eval_expr_raw(&mut self, v: i64) -> i64 {
+        let val = self.value_of(v);
+        let expr = val.as_str().to_string();
+        match self.interp.eval_expr(&expr) {
+            Ok(r) => self.tag_value(&r),
+            Err(e) => {
+                self.pending = Some(Pending { err: e, from_eval: true });
+                abi::ERR_SENTINEL
+            }
+        }
     }
 
     pub fn exit_raw(&mut self, code: i32) {
@@ -430,6 +753,8 @@ impl Host {
 
     /// binary_op：宿主完整 Tcl 语义（§3）——`types::eval_expr` 原文路由。
     fn binary_op(&mut self, op: i32, a: i64, b: i64) -> Result<Value, Error> {
+        // 表达式可含命令替换（eval_expr 求值 [..]）——置位。
+        self.commands_ran = true;
         let kind = op;
         let va = self.value_of(a);
         let vb = self.value_of(b);
@@ -566,6 +891,22 @@ pub fn run_top_with(
     }
 }
 
+/// 从实例 memory 读 n 个 u64（暂存区协议）。
+fn read_words(c: &wasmi::Caller<'_, Host>, base: i32, n: i32) -> Vec<u64> {
+    let n_words = n.max(0) as usize;
+    let mut bytes = vec![0u8; n_words * 8];
+    let mut words = vec![0u64; n_words];
+    if let Some(wasmi::Extern::Memory(m)) = c.get_export("memory") {
+        let _ = m.read(c, base as usize, &mut bytes);
+        for (i, w) in words.iter_mut().enumerate() {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+            *w = u64::from_le_bytes(b);
+        }
+    }
+    words
+}
+
 fn execute(
     interp: Interp,
     bc: &ByteCode,
@@ -575,27 +916,8 @@ fn execute(
     use wasmi::{Caller, Engine, Extern, Linker, Module, Store, TypedFunc};
 
     // arena 预驻留：0=UNSET 1=哨兵保留 2=EMPTY 3..=常量池。
-    let mut arena = vec![Value::unset(), Value::unset(), Value::empty()];
-    for c in bc.constants() {
-        arena.push(Value::from_str(c));
-    }
-    let host = Host {
-        interp,
-        arena,
-        consts: bc.constants().to_vec(),
-        fails: module.l2.fails.clone(),
-        sites: bc.sites.iter().map(|s| s.text).collect(),
-        lines: bc.sites.iter().map(|s| s.line).collect(),
-        source: Rc::clone(&bc.source),
-        result: None,
-        pending: None,
-        pending_exit: None,
-        info: None,
-        err_line: 0,
-        pending_top: None,
-        refuel_chunk: abi::REFUEL_CHUNK,
-    };
-    let watermark = host.arena.len();
+    let host = Host::new(interp, arena_of(bc), bc, module);
+    let watermark = host.arena_len();
 
     let engine = Engine::default();
     let wmodule = match Module::new(&engine, &module.bytes[..]) {
@@ -703,6 +1025,70 @@ fn execute(
         })
         .unwrap();
     linker
+        .func_wrap("rtcl", "concat_n", |mut c: Caller<'_, Host>, base: i32, n: i32| -> i64 {
+            let mem = c.get_export("memory").and_then(|e| e.into_memory());
+            let n_words = n.max(0) as usize;
+            let mut bytes = vec![0u8; n_words * 8];
+            let mut words = vec![0u64; n_words];
+            if let Some(m) = mem {
+                let _ = m.read(&c, base as usize, &mut bytes);
+                for (i, w) in words.iter_mut().enumerate() {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+                    *w = u64::from_le_bytes(b);
+                }
+            }
+            c.data_mut().concat_raw(&words)
+        })
+        .unwrap();
+    let g_caching_fe = g_caching.clone();
+    linker
+        .func_wrap(
+            "rtcl",
+            "foreach_start",
+            move |mut c: Caller<'_, Host>, info: i32, base: i32, ngroups: i32| -> i64 {
+                let words = read_words(&c, base, ngroups);
+                c.data_mut().foreach_start_raw(info, &words)
+            },
+        )
+        .unwrap();
+    let g_caching_bind = g_caching.clone();
+    linker
+        .func_wrap(
+            "rtcl",
+            "foreach_bind",
+            move |mut c: Caller<'_, Host>, info: i32, idx: i32| -> i64 {
+                let _ = g_caching_bind.set(&mut c, wasmi::Val::I32(0));
+                c.data_mut().foreach_bind_raw(info, idx)
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap("rtcl", "foreach_collect", |mut c: Caller<'_, Host>, v: i64| {
+            c.data_mut().foreach_collect_raw(v);
+        })
+        .unwrap();
+    linker
+        .func_wrap("rtcl", "foreach_end", |mut c: Caller<'_, Host>| -> i64 {
+            c.data_mut().foreach_end_raw()
+        })
+        .unwrap();
+    linker
+        .func_wrap("rtcl", "lappend_var", |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i64 {
+            c.data_mut().lappend_var_raw(name_h, v)
+        })
+        .unwrap();
+    linker
+        .func_wrap("rtcl", "eval_script", |mut c: Caller<'_, Host>, v: i64| -> i64 {
+            c.data_mut().eval_script_raw(v)
+        })
+        .unwrap();
+    linker
+        .func_wrap("rtcl", "eval_expr", |mut c: Caller<'_, Host>, v: i64| -> i64 {
+            c.data_mut().eval_expr_raw(v)
+        })
+        .unwrap();
+    linker
         .func_wrap("rtcl", "exit", |mut c: Caller<'_, Host>, code: i32| {
             c.data_mut().exit_raw(code);
         })
@@ -732,7 +1118,27 @@ pub(crate) fn finish(mut host: Host, outcome_code: i32, file: &str) -> (Interp, 
             let is_case_a = host.pending.as_ref().is_some_and(|p| p.from_eval);
             if is_case_a {
                 let e = host.pending.take().unwrap().err;
-                (None, Some(e))
+                // 需要驱动补帧的形态（EvalExpr 站点帧 / EvalScript
+                // pending / unwind 有 Sub/Expr/BodyFramed）；纯 Call 的
+                // 站点帧已由嵌套 eval 追加——走 error_report 原路。
+                let needs_extras = host.last_fail.is_some_and(|f| {
+                    host.fails.get(f as usize).is_some_and(|fi| {
+                        !matches!(fi.kind, crate::ir::FailKind::Call)
+                            || fi
+                                .bodies
+                                .iter()
+                                .any(|(k, _)| !matches!(
+                                    k,
+                                    crate::ir::BodyKind::Body | crate::ir::BodyKind::Next
+                                ))
+                    })
+                });
+                if needs_extras {
+                    let r = host.build_case_a_report(host.last_fail, &e, file);
+                    (Some(r), None)
+                } else {
+                    (None, Some(e))
+                }
             } else {
                 let r = host.driver_report(file);
                 (Some(r), None)

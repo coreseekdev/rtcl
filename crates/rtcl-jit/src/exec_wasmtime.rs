@@ -9,7 +9,23 @@ use rtcl_core::value::Value;
 use rtcl_core::Interp;
 use rtcl_parser::ByteCode;
 use rtcl_vm::VmContext;
-use wasmtime::{Caller, Engine, Linker, Module, Store, TypedFunc, Val};
+use wasmtime::{Caller, Engine, Extern, Linker, Module, Store, TypedFunc, Val};
+
+/// 从实例 memory 读 n 个 u64（暂存区协议）。
+fn read_words(c: &mut Caller<'_, Host>, base: i32, n: i32) -> Vec<u64> {
+    let n_words = n.max(0) as usize;
+    let mut bytes = vec![0u8; n_words * 8];
+    let mut words = vec![0u64; n_words];
+    if let Some(Extern::Memory(m)) = c.get_export("memory") {
+        let _ = m.read(&mut *c, base as usize, &mut bytes);
+        for (i, w) in words.iter_mut().enumerate() {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+            *w = u64::from_le_bytes(b);
+        }
+    }
+    words
+}
 
 pub fn execute(
     interp: Interp,
@@ -128,6 +144,64 @@ pub fn execute(
     linker
         .func_wrap("rtcl", "push_const", |_c: Caller<'_, Host>, idx: i32| -> i64 {
             abi::const_handle(idx as u32)
+        })
+        .unwrap();
+    linker
+        .func_wrap(
+            "rtcl",
+            "concat_n",
+            |mut c: Caller<'_, Host>, base: i32, n: i32| -> i64 {
+                let words = read_words(&mut c, base, n);
+                c.data_mut().concat_raw(&words)
+            },
+        )
+        .unwrap();
+    let caching_fs = g_caching.clone();
+    linker
+        .func_wrap(
+            "rtcl",
+            "foreach_start",
+            move |mut c: Caller<'_, Host>, info: i32, base: i32, ngroups: i32| -> i64 {
+                let _ = caching_fs.set(&mut c, Val::I32(0));
+                let words = read_words(&mut c, base, ngroups);
+                c.data_mut().foreach_start_raw(info, &words)
+            },
+        )
+        .unwrap();
+    let caching_fb = g_caching.clone();
+    linker
+        .func_wrap(
+            "rtcl",
+            "foreach_bind",
+            move |mut c: Caller<'_, Host>, info: i32, idx: i32| -> i64 {
+                let _ = caching_fb.set(&mut c, Val::I32(0));
+                c.data_mut().foreach_bind_raw(info, idx)
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap("rtcl", "foreach_collect", |mut c: Caller<'_, Host>, v: i64| {
+            c.data_mut().foreach_collect_raw(v);
+        })
+        .unwrap();
+    linker
+        .func_wrap("rtcl", "foreach_end", |mut c: Caller<'_, Host>| -> i64 {
+            c.data_mut().foreach_end_raw()
+        })
+        .unwrap();
+    linker
+        .func_wrap("rtcl", "eval_script", |mut c: Caller<'_, Host>, v: i64| -> i64 {
+            c.data_mut().eval_script_raw(v)
+        })
+        .unwrap();
+    linker
+        .func_wrap("rtcl", "eval_expr", |mut c: Caller<'_, Host>, v: i64| -> i64 {
+            c.data_mut().eval_expr_raw(v)
+        })
+        .unwrap();
+    linker
+        .func_wrap("rtcl", "lappend_var", |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i64 {
+            c.data_mut().lappend_var_raw(name_h, v)
         })
         .unwrap();
     linker

@@ -69,9 +69,9 @@ fn golden_l2_alloc_locals() {
 0006 CALL cmd=128 argc=2 r=[0, 1] w=Some(0) fail=Some(2)
 vars:
   cache=0 x (const 0)
-fail[0] pc=2 site=0 word=false bodies=[]
-fail[1] pc=5 site=1 word=true bodies=[]
-fail[2] pc=6 site=1 word=false bodies=[]
+fail[0] pc=2 site=0 word=false kind=Cold bodies=[]
+fail[1] pc=5 site=1 word=true kind=Cold bodies=[]
+fail[2] pc=6 site=1 word=false kind=Call bodies=[]
 ";
     assert_eq!(text, expected);
 }

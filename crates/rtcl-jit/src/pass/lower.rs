@@ -22,9 +22,12 @@ struct Ctx<'a> {
     loops: Vec<(u32, u32)>,
     /// 直接后支配者（虚拟出口 = 单元末尾）。
     idom: Vec<u32>,
+    /// foreach 计数器序号（i/iters 对，local = foreach_base + 2n）。
+    fcounters: u32,
 }
 
 pub fn run(l2: &L2, _code: &ByteCode) -> Result<(L3, u32), Unsupported> {
+    FOREACH_COUNTERS.with(|m| m.borrow_mut().clear());
     let n = l2.ops.len();
     let idom = post_dominate(l2, n as u32);
     let mut ctx = Ctx {
@@ -34,6 +37,7 @@ pub fn run(l2: &L2, _code: &ByteCode) -> Result<(L3, u32), Unsupported> {
         bregs: 0,
         loops: Vec::new(),
         idom: idom.clone(),
+        fcounters: 0,
     };
     // 可达集（从 0 出发沿 edges）。
     let mut work = vec![0u32];
@@ -102,21 +106,7 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
             OpCode::LoopEnter { cont, brk } => {
                 ctx.placed[pc as usize] = true;
                 ctx.loops.push((cont, brk));
-                // for 形循环的 continue 目标 = next 区域起点（header <
-                // cont < brk）：body 包一层 Block(cont)——continue 的 br
-                // 落到 next 区域开头；while 形 cont == header 无需拆分。
-                let header = pc + 1;
-                let body = if cont > header && cont < brk {
-                    L3::Seq(vec![
-                        L3::Block {
-                            cont,
-                            body: Box::new(seq(ctx, header, cont)?),
-                        },
-                        seq(ctx, cont, brk)?,
-                    ])
-                } else {
-                    seq(ctx, header, brk)?
-                };
+                let (header, body) = loop_body(ctx, pc + 1, cont, brk)?;
                 ctx.loops.pop();
                 if (brk as usize) < ctx.l2.ops.len() {
                     ctx.placed[brk as usize] = true; // LoopExit
@@ -127,6 +117,80 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
                     body: Box::new(body),
                 });
                 pc = brk + 1;
+            }
+            OpCode::ForeachStart { info, next, end } => {
+                ctx.placed[pc as usize] = true;
+                ctx.loops.push((next, end));
+                let ng = ctx
+                    .l2
+                    .reads[pc as usize]
+                    .len() as u16;
+                let counter = ctx.fcounters;
+                ctx.fcounters += 1;
+                FOREACH_COUNTERS.with(|m| m.borrow_mut().push((info, counter)));
+                let (header, body) = loop_body(ctx, pc + 1, next, end)?;
+                ctx.loops.pop();
+                if (end as usize) < ctx.l2.ops.len() {
+                    ctx.placed[end as usize] = true; // ForeachEnd 由模板发射
+                    // —— 标记已放置，pc 跳过。
+                }
+                items.push(L3::Seq(vec![
+                    L3::Instr(Instr::ForeachStart {
+                        info,
+                        ngroups: ng,
+                        counter,
+                        srcs: ctx.l2.reads[pc as usize].iter().map(|x| Reg(*x)).collect(),
+                        fail: ctx.l2.fail_of[pc as usize].unwrap_or(0),
+                    }),
+                    L3::Loop {
+                        header,
+                        exit: end,
+                        body: Box::new(body),
+                    },
+                    // ForeachEnd（brk 出口与正常出口都在此汇合）。
+                    L3::Instr(Instr::ForeachEnd {
+                        dst: Reg(depth_at_end(ctx, end)),
+                    }),
+                ]));
+                pc = end + 1;
+            }
+            OpCode::ForeachNext { info, body: body_t } => {
+                ctx.placed[pc as usize] = true;
+                // 展开：Block(done=end){ step(i+1,i<iters→b);
+                // br_if done when b==0; bind(i); fuel; br header }。
+                let breg = BReg(ctx.bregs);
+                ctx.bregs += 1;
+                let fail = ctx.l2.fail_of[pc as usize].unwrap_or(0);
+                let end_t = ctx
+                    .l2
+                    .edges[pc as usize]
+                    .first()
+                    .copied()
+                    .unwrap_or(pc as u32 + 1);
+                let counter = foreach_counter_of(ctx, info);
+                items.push(L3::Block {
+                    cont: end_t,
+                    body: Box::new(L3::Seq(vec![
+                        L3::Instr(Instr::ForeachStep { counter, b: breg }),
+                        L3::BrIf {
+                            target: end_t,
+                            depth: 0,
+                            cond: breg,
+                            when_zero: true,
+                            backedge: false,
+                            fail: 0,
+                        },
+                        L3::Instr(Instr::ForeachBind { info, counter, fail }),
+                        L3::Instr(Instr::BackedgeFuel { fail }),
+                        L3::Br {
+                            target: body_t,
+                            depth: 0,
+                            backedge: true,
+                            fail,
+                        },
+                    ])),
+                });
+                pc += 1;
             }
             OpCode::Jump(t) => {
                 ctx.placed[pc as usize] = true;
@@ -274,6 +338,46 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
     Ok(L3::Seq(items))
 }
 
+/// pc 处的值栈深度（线性重放；与 alloc_locals 的 depth_at 同式）。
+fn depth_at_end(ctx: &Ctx, end: u32) -> u32 {
+    let mut d = 0u32;
+    for a in ctx.l2.ops.iter().take(end as usize + 1) {
+        let (pops, pushes) = crate::pass::stack_effect(&a.op);
+        d = d - pops.min(d) + pushes;
+    }
+    d
+}
+
+/// 循环体结构（for/foreach 共用）：cont 介于 header/brk 时 body 包
+/// Block(cont)——continue 落到 next/ForeachNext 区。
+fn loop_body(ctx: &mut Ctx, header: u32, cont: u32, brk: u32) -> Result<(u32, L3), Unsupported> {
+    let body = if cont > header && cont < brk {
+        Ok(L3::Seq(vec![
+            L3::Block {
+                cont,
+                body: Box::new(seq(ctx, header, cont)?),
+            },
+            seq(ctx, cont, brk)?,
+        ]))
+    } else {
+        seq(ctx, header, brk)
+    };
+    Ok((header, body?))
+}
+
+/// 该 info 的计数器序号（ForeachStart 分配序与发射序一致：按 info idx
+/// 稳定——ForeachNext 查询同表）。
+fn foreach_counter_of(_ctx: &Ctx, info: u32) -> u32 {
+    // ForeachStart 顺序处理，counter 按出现序分配；info 与 counter 的
+    // 对应存于侧表（thread_local 会破坏纯函数性——改在 run() 里收集）。
+    FOREACH_COUNTERS.with(|m| m.borrow().iter().find(|(i, _)| *i == info).map(|(_, c)| *c).unwrap_or(0))
+}
+
+thread_local! {
+    static FOREACH_COUNTERS: std::cell::RefCell<Vec<(u32, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// 直线 op 的模板（控制流 op 除外）。
 fn template(ctx: &Ctx, pc: u32, op: &OpCode) -> Result<Option<Instr>, Unsupported> {
     let r = &ctx.l2.reads[pc as usize];
@@ -310,6 +414,47 @@ fn template(ctx: &Ctx, pc: u32, op: &OpCode) -> Result<Option<Instr>, Unsupporte
         OpCode::StoreVar(_) => Instr::StoreVar { src: Reg(r[0]), var: var(ctx, pc), keep: true, fail: fail() },
         OpCode::StoreVarPop(_) => Instr::StoreVar { src: Reg(r[0]), var: var(ctx, pc), keep: false, fail: fail() },
         OpCode::IncrVar(_, n) => Instr::IncrVar { dst: dst(), var: var(ctx, pc), amount: *n, fail: fail() },
+        OpCode::Concat(_) => Instr::Concat {
+            dst: dst(),
+            srcs: r.iter().map(|x| Reg(*x)).collect(),
+            fail: 0,
+        },
+        OpCode::ForeachCollect => Instr::ForeachCollect { src: Reg(r[0]) },
+        OpCode::ForeachEnd => Instr::ForeachEnd { dst: dst() },
+        OpCode::EvalScript => Instr::EvalScript {
+            dst: dst(),
+            src: Reg(r[0]),
+            fail: fail(),
+        },
+        OpCode::EvalExpr => Instr::EvalExpr {
+            dst: dst(),
+            src: Reg(r[0]),
+            fail: fail(),
+        },
+        OpCode::LappendVar(_) => Instr::LappendVar {
+            dst: dst(),
+            src: Reg(r[0]),
+            var: var(ctx, pc),
+            fail: fail(),
+        },
+        OpCode::DynCall { argc } => {
+            let (cont, brk) = match ctx.loops.last() {
+                Some(&(c, b)) => (Some(c), Some(b)),
+                None => (None, None),
+            };
+            Instr::CallSite {
+                dst: dst(),
+                cmd_id: 0,
+                argc: *argc,
+                fail: fail(),
+                site: ctx.l2.fails[fail() as usize].site,
+                brk,
+                cont,
+                cont_back: cont.is_some_and(|c| c <= pc),
+                brk_depth: None,
+                cont_depth: None,
+            }
+        }
         OpCode::Call { cmd_id, argc } => {
             let (cont, brk) = match ctx.loops.last() {
                 Some(&(c, b)) => (Some(c), Some(b)),

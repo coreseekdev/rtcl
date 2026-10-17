@@ -26,7 +26,7 @@ fn main() {
     let script = match std::fs::read_to_string(&file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("cannot read file '{}': {}", file, e);
+            eprintln!("Error: cannot read file '{}': {}", file, e);
             std::process::exit(1);
         }
     };

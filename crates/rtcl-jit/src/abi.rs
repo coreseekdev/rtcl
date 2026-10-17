@@ -138,11 +138,19 @@ pub mod import {
     pub const INCR_VAR: u32 = 12;
     pub const PUSH_CONST: u32 = 13;
     pub const EXIT: u32 = 14;
+    pub const CONCAT: u32 = 15;
+    pub const FOREACH_START: u32 = 16;
+    pub const FOREACH_BIND: u32 = 17;
+    pub const FOREACH_COLLECT: u32 = 18;
+    pub const FOREACH_END: u32 = 19;
+    pub const EVAL_SCRIPT: u32 = 20;
+    pub const EVAL_EXPR: u32 = 21;
+    pub const LAPPEND_VAR: u32 = 22;
     /// The one locally defined function (`run`) comes after the imports.
-    pub const RUN: u32 = 15;
+    pub const RUN: u32 = 23;
     /// Number of imported functions (globals come first in the import
     /// section but do not shift function indices).
-    pub const COUNT: u32 = 15;
+    pub const COUNT: u32 = 23;
 }
 
 /// Fuel policy: each loop back-edge decrements the imported `fuel`
@@ -158,41 +166,32 @@ pub mod cache {
     /// Per-var state byte: 0 = absent (zero-init), 1 = clean, 2 = dirty.
     pub const STATE: u32 = 512;
     pub const MAX_VARS: usize = 64;
+    /// 可变参数 op（Concat 等）的暂存区：n 个 tagged word，8 字节/个。
+    pub const SCRATCH: u32 = 1024;
 }
 
-/// wasm-encoder type-section indices for the function signatures.
+/// wasm-encoder type-section indices for the function signatures
+/// （与 assemble 的发射序一致——单一事实源在 assemble，修改须同步）。
 pub mod ty {
-    /// `() -> i32` — `run`.
     pub const RUN: u32 = 0;
-    /// `(i64) -> i32` — box.
     pub const BOX: u32 = 1;
-    /// `(f64) -> i32` — box_float.
     pub const BOX_FLOAT: u32 = 2;
-    /// `(i32, i64, i64) -> i64` — binary_op.
     pub const BINARY_OP: u32 = 3;
-    /// `(i32) -> i64` — get_var / bool_test / push_const.
     pub const I32_TO_I64: u32 = 4;
-    /// `(i32, i64) -> i32` — set_var（返回 0=ok/1=错误；ABI 加法性扩展：
-    /// §3 草图无返回值，存储错误信令需要状态通道）。
     pub const SET_VAR: u32 = 5;
-    /// `(i32, i32, i32) -> i64` — call.
     pub const CALL: u32 = 6;
-    /// `(i64) -> ()` — set_result.
     pub const SET_RESULT: u32 = 7;
-    /// `() -> i64` — refuel.
     pub const REFUEL: u32 = 8;
-    /// `(i32) -> i32` — fail（返回 0=纯错误/1..4=控制流穿越 kind）。
     pub const FAIL: u32 = 9;
-    /// `(i32) -> (i32, i64)` — unbox_int (multi-value, Wasm 2.0).
     pub const UNBOX_INT: u32 = 10;
-    /// `(i32) -> (i32, f64)` — unbox_float (multi-value).
     pub const UNBOX_FLOAT: u32 = 11;
-    /// `(i32, i64) -> i64` — incr_var（同 SET_VAR 形状、结果 tagged）。
     pub const INCR_VAR: u32 = 12;
-    /// `(i32) -> ()` — exit。
     pub const I32_VOID: u32 = 13;
-    /// 兼容别名（assemble 用）。
-    pub const I32_VOID2: u32 = 13;
-    /// `(i64) -> i64` — bool_test（输入 tagged word，输出 tagged 0/1）。
     pub const BOOL_TEST: u32 = 14;
+    pub const CONCAT_TY: u32 = 15;
+    pub const FOREACH_START: u32 = 16;
+    pub const FOREACH_BIND: u32 = 17;
+    pub const FOREACH_COLLECT: u32 = 18;
+    pub const FOREACH_END_TY: u32 = 19;
+    pub const I64_TO_I64: u32 = 20;
 }

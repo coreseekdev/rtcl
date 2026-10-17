@@ -22,7 +22,7 @@ pub fn run(l1: &L1, code: &ByteCode) -> Result<(), Unsupported> {
     for (pc, a) in l1.ops.iter().enumerate() {
         let name_idx = match &a.op {
             OpCode::LoadVar(i) | OpCode::StoreVar(i) | OpCode::StoreVarPop(i)
-            | OpCode::IncrVar(i, _) => Some(*i as u32),
+            | OpCode::IncrVar(i, _) | OpCode::LappendVar(i) => Some(*i as u32),
             _ => None,
         };
         if let Some(idx) = name_idx {
@@ -64,15 +64,17 @@ pub fn run(l1: &L1, code: &ByteCode) -> Result<(), Unsupported> {
     for (pc, a) in l1.ops.iter().enumerate() {
         let op = &a.op;
         classify(op).ok_or_else(|| Unsupported(op.to_string()))?;
-        if matches!(op, OpCode::Call { .. }) && bodies.last().is_some_and(|k| *k >= 3) {
+        if matches!(op, OpCode::Call { .. } | OpCode::DynCall { .. })
+            && bodies.last().is_some_and(|k| *k == 3 || *k == 4)
+        {
             // bodies 编码: 1=Body 2=Next 3=Sub 4=Expr（Sub/Expr ≥3）。
             return Err(Unsupported(format!(
-                "Call inside Sub/Expr region at pc {pc} (M1': host-eval error \
-                 accumulator split)"
+                "DynCall/Call inside Sub/Expr region at pc {pc}"
             )));
         }
         match op {
             OpCode::BodyMark => bodies.push(1),
+            OpCode::BodyMarkFramed => bodies.push(5),
             OpCode::NextMark => bodies.push(2),
             OpCode::SubMark => bodies.push(3),
             OpCode::ExprMark => bodies.push(4),
@@ -114,7 +116,14 @@ pub fn run(l1: &L1, code: &ByteCode) -> Result<(), Unsupported> {
             }
             _ => {}
         }
-        let (pops, pushes) = crate::pass::stack_effect(op);
+        let (pops, pushes) = match op {
+            OpCode::ForeachStart { info, .. } => (
+                code.foreach_info(*info).map(|f| f.groups.len() as u32).unwrap_or(0),
+                0,
+            ),
+            OpCode::ForeachEnd => (0, 1),
+            other => crate::pass::stack_effect(other),
+        };
         depth = depth - pops.min(depth) + pushes;
         if depth > MAX_DEPTH {
             return Err(Unsupported(format!("stack depth > {MAX_DEPTH} at pc {pc}")));

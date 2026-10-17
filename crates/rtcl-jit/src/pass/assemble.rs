@@ -22,6 +22,8 @@ const I32: ValType = ValType::I32;
 
 struct Env<'a> {
     l2: &'a L2,
+    /// foreach 计数器（i/iters 对）的 local 基址。
+    foreach_base: u32,
     scratch: u32,
     epoch_home: u32,
     bool_base: u32,
@@ -40,27 +42,20 @@ impl<'a> Env<'a> {
 pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
     let _ = cfg;
     let nv = l2.max_depth + 1;
-    let env = Env {
-        l2,
-        scratch: nv + 1,
-        epoch_home: nv + 2,
-        bool_base: nv + 3,
-        kind: nv + 3, // + bregs 在下面补
-        // kind 实际 = bool_base + bregs —— bregs 由 run() 调用方传入？
-    };
-    let _ = env;
-
     let bregs = count_bregs(l3);
+    let nf = count_foreach(l3);
+    let foreach_base = nv + 3;
     let env = Env {
         l2,
+        foreach_base,
         scratch: nv + 1,
         epoch_home: nv + 2,
-        bool_base: nv + 3,
-        kind: nv + 3 + bregs,
+        bool_base: foreach_base + 2 * nf,
+        kind: foreach_base + 2 * nf + bregs,
     };
 
     let mut body = Function::new(vec![
-        (nv + 3, I64), // 值栈 + 出口槽 + SCRATCH + EPOCH_HOME
+        (nv + 3 + 2 * nf, I64), // 值栈 + 出口 + SCRATCH + EPOCH + foreach 对
         (bregs + 1, I32),
     ]);
 
@@ -84,6 +79,13 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
     types.ty().function(vec![I32, I64], vec![I64]); // INCR_VAR
     types.ty().function(vec![I32], vec![]); // I32_VOID2 (exit)
     types.ty().function(vec![I64], vec![I64]); // BOOL_TEST
+    types.ty().function(vec![I32, I32], vec![I64]); // CONCAT_TY
+    types.ty().function(vec![I32, I32, I32], vec![I64]); // FOREACH_START
+    types.ty().function(vec![I32, I32], vec![I64]); // FOREACH_BIND
+    types.ty().function(vec![I64], vec![]); // FOREACH_COLLECT
+    types.ty().function(vec![], vec![I64]); // FOREACH_END_TY
+    types.ty().function(vec![I64], vec![I64]); // I64_TO_I64 (eval_script/eval_expr)
+    types.ty().function(vec![I32, I32], vec![I64]); // CONCAT
 
     let mut imports = ImportSection::new();
     let mut_g = |t: ValType| GlobalType { val_type: t, mutable: true, shared: false };
@@ -104,7 +106,15 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
     imports.import("rtcl", "bool_test", EntityType::Function(ty::BOOL_TEST));
     imports.import("rtcl", "incr_var", EntityType::Function(ty::INCR_VAR));
     imports.import("rtcl", "push_const", EntityType::Function(ty::I32_TO_I64));
-    imports.import("rtcl", "exit", EntityType::Function(ty::I32_VOID2));
+    imports.import("rtcl", "exit", EntityType::Function(ty::I32_VOID));
+    imports.import("rtcl", "concat_n", EntityType::Function(ty::CONCAT_TY));
+    imports.import("rtcl", "foreach_start", EntityType::Function(ty::FOREACH_START));
+    imports.import("rtcl", "foreach_bind", EntityType::Function(ty::FOREACH_BIND));
+    imports.import("rtcl", "foreach_collect", EntityType::Function(ty::FOREACH_COLLECT));
+    imports.import("rtcl", "foreach_end", EntityType::Function(ty::FOREACH_END_TY));
+    imports.import("rtcl", "eval_script", EntityType::Function(ty::I64_TO_I64));
+    imports.import("rtcl", "eval_expr", EntityType::Function(ty::I64_TO_I64));
+    imports.import("rtcl", "lappend_var", EntityType::Function(ty::INCR_VAR));
 
     let mut funcs = FunctionSection::new();
     funcs.function(ty::RUN);
@@ -119,6 +129,7 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
     let mut exports = ExportSection::new();
     exports.export("run", ExportKind::Func, import::RUN);
     exports.export("cur_site", ExportKind::Global, 3);
+    exports.export("memory", ExportKind::Memory, 0);
 
     let mut memory = MemorySection::new();
     memory.memory(MemoryType { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None });
@@ -135,6 +146,20 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
     module.section(&exports);
     module.section(&code_section);
     module.finish()
+}
+
+fn count_foreach(l3: &L3) -> u32 {
+    let mut max = 0u32;
+    walk(l3, &mut |n| {
+        let L3::Instr(i) = n else { return };
+        let c = match i {
+            Instr::ForeachStart { counter, .. } | Instr::ForeachBind { counter, .. }
+            | Instr::ForeachStep { counter, .. } => *counter + 1,
+            _ => 0,
+        };
+        max = max.max(c);
+    });
+    max
 }
 
 fn count_bregs(l3: &L3) -> u32 {
@@ -516,6 +541,96 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::I64Eq);
             f.instruction(&Instruction::LocalSet(e.b(dst.0)));
             f.instruction(&Instruction::End); // done
+        }
+        Instr::Concat { dst, srcs, fail: _ } => {
+            // 暂存区写入 + 宿主拼接（vm_exec Concat：as_str 连接，不失败）。
+            for (i, r) in srcs.iter().enumerate() {
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::LocalGet(r.0));
+                f.instruction(&Instruction::I64Store(MemArg {
+                    offset: (cache::SCRATCH + (i as u32) * 8) as u64,
+                    align: 3,
+                    memory_index: 0,
+                }));
+            }
+            f.instruction(&Instruction::I32Const(cache::SCRATCH as i32));
+            f.instruction(&Instruction::I32Const(srcs.len() as i32));
+            f.instruction(&Instruction::Call(import::CONCAT));
+            f.instruction(&Instruction::LocalSet(dst.0));
+        }
+        Instr::ForeachStart { info, ngroups: _, counter, srcs, fail } => {
+            // 数据值写暂存区（升序 = 组序；宿主逆序弹组对齐 vm_exec）。
+            for (i, r) in srcs.iter().enumerate() {
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::LocalGet(r.0));
+                f.instruction(&Instruction::I64Store(MemArg {
+                    offset: (cache::SCRATCH + (i as u32) * 8) as u64,
+                    align: 3,
+                    memory_index: 0,
+                }));
+            }
+            f.instruction(&Instruction::I32Const(*info as i32));
+            f.instruction(&Instruction::I32Const(cache::SCRATCH as i32));
+            f.instruction(&Instruction::I32Const(srcs.len() as i32));
+            f.instruction(&Instruction::Call(import::FOREACH_START));
+            f.instruction(&Instruction::LocalSet(e.scratch));
+            check_sentinel(e, f, e.scratch, *fail);
+            // iters = untag(result); i = 0。
+            f.instruction(&Instruction::LocalGet(e.scratch));
+            f.instruction(&Instruction::I64Const(1));
+            f.instruction(&Instruction::I64ShrS);
+            f.instruction(&Instruction::LocalSet(e.foreach_base + counter * 2 + 1));
+            f.instruction(&Instruction::I64Const(0));
+            f.instruction(&Instruction::LocalSet(e.foreach_base + counter * 2));
+        }
+        Instr::ForeachStep { counter, b } => {
+            // i += 1；bb = (i < iters)。
+            let li = e.foreach_base + counter * 2;
+            let lt = li + 1;
+            f.instruction(&Instruction::LocalGet(li));
+            f.instruction(&Instruction::I64Const(1));
+            f.instruction(&Instruction::I64Add);
+            f.instruction(&Instruction::LocalSet(li));
+            f.instruction(&Instruction::LocalGet(li));
+            f.instruction(&Instruction::LocalGet(lt));
+            f.instruction(&Instruction::I64LtS);
+            f.instruction(&Instruction::LocalSet(e.b(b.0)));
+        }
+        Instr::ForeachBind { info, counter, fail } => {
+            emit_flush(e, f, *fail);
+            f.instruction(&Instruction::I32Const(*info as i32));
+            f.instruction(&Instruction::LocalGet(e.foreach_base + counter * 2));
+            f.instruction(&Instruction::Call(import::FOREACH_BIND));
+            f.instruction(&Instruction::LocalSet(e.scratch));
+            check_sentinel(e, f, e.scratch, *fail);
+        }
+        Instr::ForeachCollect { src } => {
+            f.instruction(&Instruction::LocalGet(src.0));
+            f.instruction(&Instruction::Call(import::FOREACH_COLLECT));
+        }
+        Instr::ForeachEnd { dst } => {
+            f.instruction(&Instruction::Call(import::FOREACH_END));
+            f.instruction(&Instruction::LocalSet(dst.0));
+        }
+        Instr::EvalScript { dst, src, fail } => {
+            f.instruction(&Instruction::LocalGet(src.0));
+            f.instruction(&Instruction::Call(import::EVAL_SCRIPT));
+            f.instruction(&Instruction::LocalSet(dst.0));
+            check_sentinel(e, f, dst.0, *fail);
+        }
+        Instr::EvalExpr { dst, src, fail } => {
+            f.instruction(&Instruction::LocalGet(src.0));
+            f.instruction(&Instruction::Call(import::EVAL_EXPR));
+            f.instruction(&Instruction::LocalSet(dst.0));
+            check_sentinel(e, f, dst.0, *fail);
+        }
+        Instr::LappendVar { dst, src, var, fail } => {
+            emit_flush(e, f, *fail);
+            f.instruction(&Instruction::I32Const(e.name_handle(*var)));
+            f.instruction(&Instruction::LocalGet(src.0));
+            f.instruction(&Instruction::Call(import::LAPPEND_VAR));
+            f.instruction(&Instruction::LocalSet(dst.0));
+            check_sentinel(e, f, dst.0, *fail);
         }
         Instr::SetSite(k) => {
             f.instruction(&Instruction::I32Const(*k as i32));

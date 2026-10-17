@@ -6,7 +6,7 @@
 
 use crate::abi;
 use crate::emit::Unsupported;
-use crate::ir::{Backedge, BodyKind, FailInfo, L1, L2, VarSlot};
+use crate::ir::{Backedge, BodyKind, FailInfo, FailKind, L1, L2, VarSlot};
 use crate::pass::{classify, stack_effect, Flow};
 use rtcl_ir::bytecode::ByteCode;
 use rtcl_ir::opcode::OpCode;
@@ -21,7 +21,9 @@ fn body_kind(kind: u8) -> BodyKind {
         1 => BodyKind::Body,
         2 => BodyKind::Next,
         3 => BodyKind::Sub,
-        _ => BodyKind::Expr,
+        4 => BodyKind::Expr,
+        5 => BodyKind::BodyFramed(false),
+        _ => BodyKind::BodyFramed(true),
     }
 }
 
@@ -39,6 +41,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
     let mut cur_site: u32 = u32::MAX;
     let mut bodies: Vec<(u8, u32)> = Vec::new();
     let mut loops: Vec<(u32, u32, usize, u32)> = Vec::new(); // (cont, brk, bodies_len, owner)
+    let mut foreaches: Vec<(u32, bool)> = Vec::new(); // (info_idx, lmap)
     let mut vars: Vec<VarSlot> = Vec::new();
     let mut var_of_const: HashMap<u32, u32> = HashMap::new();
     let mut fails: Vec<FailInfo> = Vec::new();
@@ -50,6 +53,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
         cur_site: u32,
         bodies: &[(u8, u32)],
         word_op: bool,
+        kind: FailKind,
         fails: &mut Vec<FailInfo>,
     ) -> u32 {
         let id = fails.len() as u32;
@@ -58,6 +62,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             site: cur_site,
             bodies: bodies.iter().map(|(k, s)| (body_kind(*k), *s)).collect(),
             word_op,
+            kind,
         });
         id
     }
@@ -65,15 +70,29 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
     for (pc, a) in l1.ops.iter().enumerate() {
         let op = &a.op;
         depth_at[pc] = depth;
-        let (pops, pushes) = stack_effect(op);
+        let (pops, pushes) = match op {
+            // ngroups 由 info 表决定（stack_effect 无 ByteCode 访问）。
+            OpCode::ForeachStart { info, .. } => (
+                code.foreach_info(*info).map(|f| f.groups.len() as u32).unwrap_or(0),
+                0,
+            ),
+            OpCode::ForeachEnd => (0, 1),
+            other => stack_effect(other),
+        };
         let base = depth.saturating_sub(pops);
 
         // 读写槽。
         let (r, w): (Vec<u32>, Option<u32>) = match op {
             OpCode::Dup => (vec![depth - 1], Some(depth)),
             OpCode::StoreVar(_) => (vec![depth - 1], None),
+            OpCode::LappendVar(_) => (vec![depth - 1], Some(depth - 1)),
             OpCode::Neg | OpCode::Not | OpCode::BitNot => (vec![depth - 1], Some(depth - 1)),
-            OpCode::Call { .. } => ((base..depth).collect(), Some(base)),
+            OpCode::Call { .. } | OpCode::DynCall { .. } => {
+                ((base..depth).collect(), Some(base))
+            }
+            OpCode::Concat(_) => ((base..depth).collect(), Some(base)),
+            OpCode::ForeachStart { .. } => ((base..depth).collect(), None),
+            OpCode::ForeachEnd => (vec![], Some(depth)),
             OpCode::JumpTrue(_) | OpCode::JumpFalse(_) | OpCode::Return => (vec![depth - 1], None),
             _ if pops == 0 && pushes == 1 => (vec![], Some(depth)),
             _ if pops == 2 && pushes == 1 => (vec![depth - 2, depth - 1], Some(depth - 2)),
@@ -102,7 +121,9 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
         };
         match op {
             OpCode::LoadVar(i) | OpCode::StoreVar(i) | OpCode::StoreVarPop(i)
-            | OpCode::IncrVar(i, _) => intern_var(*i as u32, &mut vars, &mut var_of_const)?,
+            | OpCode::IncrVar(i, _) | OpCode::LappendVar(i) => {
+                intern_var(*i as u32, &mut vars, &mut var_of_const)?
+            }
             OpCode::PushConst(i) => used_consts.push(*i as u32),
             OpCode::PushConstWide(i) => used_consts.push(*i),
             _ => {}
@@ -110,9 +131,9 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
 
         // 失败点（可失败的宿主交互）。
         let fail = match op {
-            OpCode::LoadVar(_) => Some(snap(pc, cur_site, &bodies, true, &mut fails)),
+            OpCode::LoadVar(_) => Some(snap(pc, cur_site, &bodies, true, FailKind::Cold, &mut fails)),
             OpCode::StoreVar(_) | OpCode::StoreVarPop(_) | OpCode::IncrVar(_, _) => {
-                Some(snap(pc, cur_site, &bodies, false, &mut fails))
+                Some(snap(pc, cur_site, &bodies, false, FailKind::Cold, &mut fails))
             }
             OpCode::Add
             | OpCode::Sub
@@ -139,8 +160,26 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             | OpCode::StrEq
             | OpCode::StrNe
             | OpCode::JumpTrue(_)
-            | OpCode::JumpFalse(_) => Some(snap(pc, cur_site, &bodies, false, &mut fails)),
-            OpCode::Call { .. } => Some(snap(pc, cur_site, &bodies, false, &mut fails)),
+            | OpCode::JumpFalse(_) => Some(snap(pc, cur_site, &bodies, false, FailKind::Cold, &mut fails)),
+            OpCode::Call { .. } | OpCode::DynCall { .. } => Some(snap(
+                pc,
+                cur_site,
+                &bodies,
+                false,
+                FailKind::Call,
+                &mut fails,
+            )),
+            OpCode::EvalScript => Some(snap(pc, cur_site, &bodies, true, FailKind::EvalScript, &mut fails)),
+            OpCode::LappendVar(_) => Some(snap(pc, cur_site, &bodies, false, FailKind::Cold, &mut fails)),
+            OpCode::EvalExpr => Some(snap(pc, cur_site, &bodies, false, FailKind::EvalExpr, &mut fails)),
+            OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. } => Some(snap(
+                pc,
+                cur_site,
+                &bodies,
+                false,
+                FailKind::Cold,
+                &mut fails,
+            )),
             _ => None,
         };
         fail_of.push(fail);
@@ -177,7 +216,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
         for &t in &edge {
             if t <= pc as u32 {
                 // 回边 = fuel 计步点：失败上下文同本 op（追加表项）。
-                let bf = snap(pc, cur_site, &bodies, false, &mut fails);
+                let bf = snap(pc, cur_site, &bodies, false, FailKind::Cold, &mut fails);
                 backedges.push(Backedge { src: pc as u32, target: t, fail: bf });
             }
         }
@@ -201,6 +240,19 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
                 }
             }
             OpCode::JumpTrue(_) | OpCode::JumpFalse(_) => bodies.push((1, cur_site)),
+            OpCode::BodyMarkFramed => {
+                let lmap = foreaches.last().map(|(_, l)| *l).unwrap_or(false);
+                bodies.push((if lmap { 6 } else { 5 }, cur_site));
+            }
+            OpCode::ForeachStart { info, next, end, .. } => {
+                let lmap = code.foreach_info(*info).map(|f| f.lmap).unwrap_or(false);
+                foreaches.push((*info, lmap));
+                loops.push((*next, *end, bodies.len(), cur_site));
+            }
+            OpCode::ForeachEnd => {
+                foreaches.pop();
+                loops.pop();
+            }
             OpCode::LoopEnter { cont, brk } => {
                 loops.push((*cont, *brk, bodies.len(), cur_site));
             }

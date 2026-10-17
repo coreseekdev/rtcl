@@ -81,6 +81,21 @@ pub struct Backedge {
     pub fail: u32,
 }
 
+/// 失败点归属的 op 类别——case-a 帧构建器需要知道「站点帧已由嵌套
+/// eval 追加（Call）还是需要驱动补（EvalExpr）或走 pending 语义
+/// （EvalScript/LoadVar）」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailKind {
+    /// Call/DynCall：嵌套 eval 已含站点帧，驱动不补。
+    Call,
+    /// EvalScript：word 语义——站点帧走 pending（最后追加）。
+    EvalScript,
+    /// EvalExpr：驱动补站点 harness 帧。
+    EvalExpr,
+    /// 其余（变量/算术/bool/foreach bind/回边 fuel）：case-b 路径。
+    Cold,
+}
+
 /// 宿主调用失败点的静态上下文（编译期模拟烘焙；运行时 bodies/cur_site
 /// 在结构化 ByteCode 上是路径不变的）。
 #[derive(Debug, Clone, PartialEq)]
@@ -94,6 +109,8 @@ pub struct FailInfo {
     pub bodies: Vec<(BodyKind, u32)>,
     /// 词操作（LoadVar）——M1' 中 err_from_subst 恒 false，保留协议位。
     pub word_op: bool,
+    /// 失败 op 类别（case-a 帧构建用）。
+    pub kind: FailKind,
 }
 
 /// 内联 region 种类（vm_exec `Region` 的静态子集）。
@@ -103,6 +120,8 @@ pub enum BodyKind {
     Next,
     Sub,
     Expr,
+    /// framed foreach/lmap 体（bool = lmap 标志——帧文本不同）。
+    BodyFramed(bool),
 }
 
 impl fmt::Display for BodyKind {
@@ -112,6 +131,7 @@ impl fmt::Display for BodyKind {
             BodyKind::Next => "next",
             BodyKind::Sub => "sub",
             BodyKind::Expr => "expr",
+            BodyKind::BodyFramed(_) => "bodyframed",
         })
     }
 }
@@ -175,10 +195,11 @@ impl fmt::Display for L2 {
                 fi.bodies.iter().map(|(k, s)| format!("{k}:{s}")).collect();
             writeln!(
                 f,
-                "fail[{i}] pc={} site={} word={} bodies=[{}]",
+                "fail[{i}] pc={} site={} word={} kind={:?} bodies=[{}]",
                 fi.pc,
                 fi.site,
                 fi.word_op,
+                fi.kind,
                 bodies.join(" ")
             )?;
         }
@@ -222,6 +243,25 @@ pub enum Instr {
     Copy { dst: Reg, src: Reg },
     /// PushFloat：box_float 宿主装箱（float lane off，C-float 里程碑）。
     BoxFloat { dst: Reg, v: f64 },
+    /// `Concat(n)`：n 个输入寄存器字符串拼接（宿主 as_str 路由）。
+    Concat { dst: Reg, srcs: Vec<Reg>, fail: u32 },
+    /// ForeachStart：弹 ngroups 数据值（写暂存区）→ 宿主 strict 解析 +
+    /// bind(0)，返回 tagged iters（0 = 空转）或哨兵。
+    ForeachStart { info: u32, ngroups: u16, counter: u32, srcs: Vec<Reg>, fail: u32 },
+    /// ForeachStep：counter+1 → i；bb = (i < iters)。
+    ForeachStep { counter: u32, b: BReg },
+    /// ForeachBind：宿主 bind(i)（含 framed 错误装饰复刻）。
+    ForeachBind { info: u32, counter: u32, fail: u32 },
+    /// ForeachCollect（lmap）：弹值入宿主 collected。
+    ForeachCollect { src: Reg },
+    /// ForeachEnd：弹循环态，压 empty/collected。
+    ForeachEnd { dst: Reg },
+    /// EvalScript：弹值 → 宿主 `interp.eval`（词边界，word_op 失败语境）。
+    EvalScript { dst: Reg, src: Reg, fail: u32 },
+    /// EvalExpr：弹值 → 宿主 `interp.eval_expr`。
+    EvalExpr { dst: Reg, src: Reg, fail: u32 },
+    /// `lappend <literal-var> <value>`（name-keyed 宿主全语义）。
+    LappendVar { dst: Reg, src: Reg, var: u32, fail: u32 },
     /// 变量/常量/宿主交互模板（展开含守卫与哨兵检查）。
     LoadVar { dst: Reg, var: u32, fail: u32 },
     StoreVar { src: Reg, var: u32, keep: bool, fail: u32 },

@@ -89,7 +89,7 @@ pub fn stack_effect(op: &rtcl_ir::opcode::OpCode) -> (u32, u32) {
         | O::BitAnd | O::BitOr | O::BitXor | O::Shl | O::Shr | O::Eq | O::Ne | O::Lt
         | O::Gt | O::Le | O::Ge | O::StrEq | O::StrNe => (2, 1),
         O::Neg | O::Not | O::BitNot => (1, 1),
-        O::Call { argc, .. } => (*argc as u32, 1),
+        O::Call { argc, .. } | O::DynCall { argc } => (*argc as u32, 1),
         _ => (0, 0),
     }
 }

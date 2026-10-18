@@ -13,7 +13,7 @@ use std::rc::Rc;
 /// 编译断言：`script` 的单元是否被 JIT 接受。
 fn accepted(script: &str) -> bool {
     let unit = ScriptUnit::parse(script).expect("parse");
-    let bc = Compiler::compile_unit(unit.source, &unit.commands);
+    let bc = Compiler::compile_unit(unit.source, &unit.commands).unfused();
     rtcl_jit::emit::compile(&bc, &Default::default()).is_ok()
 }
 
@@ -59,7 +59,7 @@ fn assert_same(script: &str) {
 fn wasm_magic_prefix_and_size() {
     let unit = ScriptUnit::parse("set s 0\nfor {set i 0} {$i < 100} {incr i} {set s [expr {$s + $i}]}")
         .expect("parse");
-    let bc = Compiler::compile_unit(unit.source, &unit.commands);
+    let bc = Compiler::compile_unit(unit.source, &unit.commands).unfused();
     let m = rtcl_jit::emit::compile(&bc, &Default::default()).expect("compiles");
     assert_eq!(&m.bytes[..4], b"\0asm");
     // per-proc/unit 模块 <4KB 预算（HANDOFF §6）——含完整 ABI 导入段。

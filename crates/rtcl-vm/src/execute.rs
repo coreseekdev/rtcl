@@ -80,9 +80,14 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             OpCode::LappendLocal(..) | OpCode::LappendVar(..)
             | OpCode::AddSlotSlot(..) | OpCode::AddSlotImm(..)
             | OpCode::CmpSlotSlot(..) | OpCode::CmpSlotImm(..)
-            | OpCode::LappendSlotSlot(..) | OpCode::IncrLocalPop(..)
+            | OpCode::LappendSlotSlot(..) | OpCode::IncrLocalPop(..) | OpCode::StoreLocalPop(..)
             | OpCode::CmpSlotSlotJumpTrue(..) | OpCode::CmpSlotSlotJumpFalse(..)
             | OpCode::CmpSlotImmJumpTrue(..) | OpCode::CmpSlotImmJumpFalse(..)
+            | OpCode::AddVarVar(..) | OpCode::AddVarImm(..)
+            | OpCode::CmpVarVar(..) | OpCode::CmpVarImm(..)
+            | OpCode::CmpVarVarJumpTrue(..) | OpCode::CmpVarVarJumpFalse(..)
+            | OpCode::CmpVarImmJumpTrue(..) | OpCode::CmpVarImmJumpFalse(..)
+            | OpCode::LappendVarVar(..) | OpCode::IncrVarPop(..)
             | OpCode::BodyMarkFramed => {
                 return Err(Error::runtime(
                     "lappend ops are not supported here",

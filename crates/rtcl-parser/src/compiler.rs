@@ -163,7 +163,9 @@ impl Compiler {
             | OpCode::PushInt(_) | OpCode::PushFloat(_) | OpCode::PushTrue | OpCode::PushFalse
             | OpCode::Pop | OpCode::Dup
             | OpCode::LoadVar(_) | OpCode::StoreVar(_) | OpCode::StoreVarPop(_)
-            | OpCode::LoadLocal(_) | OpCode::StoreLocal(_) | OpCode::IncrLocal(_, _)
+            | OpCode::IncrVarPop(_, _)
+            | OpCode::LoadLocal(_) | OpCode::StoreLocal(_) | OpCode::StoreLocalPop(_)
+            | OpCode::IncrLocal(_, _)
             | OpCode::IncrLocalPop(_, _)
             | OpCode::IncrVar(_, _)
             | OpCode::Concat(_) | OpCode::ExpandList | OpCode::ExpandMark
@@ -172,11 +174,15 @@ impl Compiler {
             | OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. }
             | OpCode::ForeachCollect | OpCode::ForeachEnd
             | OpCode::LappendLocal(_) | OpCode::LappendVar(_) | OpCode::BodyMarkFramed
-            | OpCode::LappendSlotSlot(_, _)
+            | OpCode::LappendSlotSlot(_, _) | OpCode::LappendVarVar(_, _)
             | OpCode::AddSlotSlot(_, _) | OpCode::AddSlotImm(_, _)
             | OpCode::CmpSlotSlot(_, _, _) | OpCode::CmpSlotImm(_, _, _)
             | OpCode::CmpSlotSlotJumpTrue(_, _, _, _) | OpCode::CmpSlotSlotJumpFalse(_, _, _, _)
             | OpCode::CmpSlotImmJumpTrue(_, _, _, _) | OpCode::CmpSlotImmJumpFalse(_, _, _, _)
+            | OpCode::AddVarVar(_, _) | OpCode::AddVarImm(_, _)
+            | OpCode::CmpVarVar(_, _, _) | OpCode::CmpVarImm(_, _, _)
+            | OpCode::CmpVarVarJumpTrue(_, _, _, _) | OpCode::CmpVarVarJumpFalse(_, _, _, _)
+            | OpCode::CmpVarImmJumpTrue(_, _, _, _) | OpCode::CmpVarImmJumpFalse(_, _, _, _)
             | OpCode::Return | OpCode::Exit(_)
             | OpCode::EvalScript | OpCode::EvalExpr
             | OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Pow
@@ -1252,10 +1258,11 @@ mod tests {
         // Should have LoopEnter/LoopExit instead of EvalScript for body
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopEnter { .. })));
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopExit)));
-        // Body is compiled inline — incr becomes IncrVar
-        assert!(ops.iter().any(|o| matches!(o, OpCode::IncrVar(_, 1))));
-        // Condition is compiled inline — LoadVar + PushInt(10) + Lt
-        assert!(ops.iter().any(|o| matches!(o, OpCode::Lt)));
+        // Body is compiled inline — the statement `incr x` fuses to
+        // IncrVarPop; the condition's `LoadVar + PushInt + Lt + JumpFalse`
+        // chain fuses to a comparison branch (`CmpVarImmJumpFalse`).
+        assert!(ops.iter().any(|o| matches!(o, OpCode::IncrVarPop(_, 1))));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::CmpVarImmJumpFalse(..))));
         // Should NOT have EvalExpr (expression was compiled inline)
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
     }
@@ -1272,7 +1279,7 @@ mod tests {
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopEnter { .. })));
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopExit)));
         assert!(ops.iter().any(|o| matches!(o, OpCode::NextMark)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::IncrVar(_, 1))));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::IncrVarPop(_, 1))));
         // Condition compiled inline — no EvalExpr fallback.
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::DynCall { .. })));
@@ -1610,3 +1617,4 @@ mod tests {
         assert_eq!(bc.sites[0].text.slice(&bc.source), "while {$i < 2} {\n  incr i\n}");
     }
 }
+

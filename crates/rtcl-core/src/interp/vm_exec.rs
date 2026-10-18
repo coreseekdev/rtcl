@@ -477,6 +477,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             OpCode::IncrVar(idx, amount) => op_incr_var(interp, code, st, *idx, *amount),
             OpCode::LoadLocal(slot) => op_load_local(interp, code, st, *slot),
             OpCode::StoreLocal(slot) => op_store_local(interp, code, st, *slot),
+            OpCode::StoreLocalPop(slot) => op_store_local_pop(interp, code, st, *slot),
             OpCode::IncrLocal(slot, amount) => op_incr_local(interp, code, st, *slot, *amount),
 
             // ── Slot superinstructions ──────────────────────────────────
@@ -484,6 +485,10 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             OpCode::AddSlotImm(a, k) => op_add_slot_imm(interp, code, st, *a, *k),
             OpCode::CmpSlotSlot(a, b, cc) => op_cmp_slot_slot(interp, code, st, *a, *b, *cc),
             OpCode::CmpSlotImm(a, k, cc) => op_cmp_slot_imm(interp, code, st, *a, *k, *cc),
+            OpCode::AddVarVar(a, b) => op_add_var_var(interp, code, st, *a, *b),
+            OpCode::AddVarImm(a, k) => op_add_var_imm(interp, code, st, *a, *k),
+            OpCode::CmpVarVar(a, b, cc) => op_cmp_var_var(interp, code, st, *a, *b, *cc),
+            OpCode::CmpVarImm(a, k, cc) => op_cmp_var_imm(interp, code, st, *a, *k, *cc),
 
             // ── Fused slot pairs (the `fuse_slot_pairs` windows) ────────
             // One dispatch covers the producer and its consumer; the
@@ -500,7 +505,21 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             OpCode::CmpSlotImmJumpFalse(a, k, cc, t) => {
                 op_cmp_si_jump(interp, code, st, *a, *k, *cc, *t, false)
             }
+            OpCode::CmpVarVarJumpTrue(a, b, cc, t) => {
+                op_cmp_vv_jump(interp, code, st, *a, *b, *cc, *t, true)
+            }
+            OpCode::CmpVarVarJumpFalse(a, b, cc, t) => {
+                op_cmp_vv_jump(interp, code, st, *a, *b, *cc, *t, false)
+            }
+            OpCode::CmpVarImmJumpTrue(a, k, cc, t) => {
+                op_cmp_vi_jump(interp, code, st, *a, *k, *cc, *t, true)
+            }
+            OpCode::CmpVarImmJumpFalse(a, k, cc, t) => {
+                op_cmp_vi_jump(interp, code, st, *a, *k, *cc, *t, false)
+            }
             OpCode::LappendSlotSlot(src, dst) => op_lappend_slot_slot(interp, code, *src, *dst),
+            OpCode::LappendVarVar(src, dst) => op_lappend_var_var(interp, code, *src, *dst),
+            OpCode::IncrVarPop(idx, amount) => op_incr_var_pop(interp, code, *idx, *amount),
             OpCode::IncrLocalPop(slot, amount) => {
                 let _ = incr_local_value(interp, code, *slot, *amount)?;
                 Ok(())
@@ -913,6 +932,25 @@ fn op_store_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: 
     Ok(())
 }
 
+/// `StoreLocalPop`'s body: the result is discarded, so the popped value
+/// moves into the slot (no clone) — the same delegation ladder as
+/// [`op_store_local`], one stack round-trip shorter.
+#[inline]
+fn op_store_local_pop(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    slot: u16,
+) -> Result<()> {
+    let slot = slot as usize;
+    let v = st.pop_val();
+    if let Err(v) = interp.frame_slot_write_move(slot, v) {
+        let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
+        interp.set_var(name, v)?;
+    }
+    Ok(())
+}
+
 /// `IncrLocal`'s value, without the stack push — the fused
 /// `IncrLocal + Pop` arm consumes it directly.
 #[inline]
@@ -1017,6 +1055,174 @@ fn op_cmp_slot_imm(
     let vb = Value::from_int(k);
     st.stack.push(cmp_values(&va, &vb, cc));
     Ok(())
+}
+
+/// `LoadVar`'s read for the name-keyed superinstructions — the exact
+/// `eval_var_ref` path (array references, link indirection, canonical
+/// errors) the unfused window's `LoadVar` would take.
+#[inline]
+fn var_read(interp: &mut Interp, code: &ByteCode, idx: u16) -> Result<Value> {
+    let name = code.get_const(idx).unwrap_or("");
+    interp.eval_var_ref(name)
+}
+
+#[inline]
+fn op_add_var_var(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    b: u16,
+) -> Result<()> {
+    let va = var_read(interp, code, a)?;
+    let vb = var_read(interp, code, b)?;
+    let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
+    st.stack.push(v);
+    Ok(())
+}
+
+#[inline]
+fn op_add_var_imm(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    k: i64,
+) -> Result<()> {
+    let va = var_read(interp, code, a)?;
+    let vb = Value::from_int(k);
+    let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
+    st.stack.push(v);
+    Ok(())
+}
+
+#[inline]
+fn op_cmp_var_var(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    b: u16,
+    cc: u8,
+) -> Result<()> {
+    let va = var_read(interp, code, a)?;
+    let vb = var_read(interp, code, b)?;
+    st.stack.push(cmp_values(&va, &vb, cc));
+    Ok(())
+}
+
+#[inline]
+fn op_cmp_var_imm(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    k: i64,
+    cc: u8,
+) -> Result<()> {
+    let va = var_read(interp, code, a)?;
+    st.stack.push(cmp_values(&va, &Value::from_int(k), cc));
+    Ok(())
+}
+
+/// Fused `[CmpVarVar, JumpTrue/JumpFalse]` — the name-keyed twin of
+/// [`op_cmp_ss_jump`].
+#[inline]
+#[allow(clippy::too_many_arguments)] // interp/code/st + the op's five operands
+fn op_cmp_vv_jump(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    b: u16,
+    cc: u8,
+    t: u32,
+    want: bool,
+) -> Result<()> {
+    let va = var_read(interp, code, a)?;
+    let vb = var_read(interp, code, b)?;
+    let v = cmp_values(&va, &vb, cc);
+    jump_if_value(interp, st, &v, t, want, st.pc)?;
+    Ok(())
+}
+
+/// Fused `[CmpVarImm, JumpTrue/JumpFalse]` — [`op_cmp_vv_jump`] with the
+/// immediate operand.
+#[inline]
+#[allow(clippy::too_many_arguments)] // interp/code/st + the op's five operands
+fn op_cmp_vi_jump(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    k: i64,
+    cc: u8,
+    t: u32,
+    want: bool,
+) -> Result<()> {
+    let va = var_read(interp, code, a)?;
+    let v = cmp_values(&va, &Value::from_int(k), cc);
+    jump_if_value(interp, st, &v, t, want, st.pc)?;
+    Ok(())
+}
+
+/// `lappend <name> <value>`'s shared body (the `LappendVar` arm and the
+/// `LappendVarVar` fusion): take → in-place append → store through
+/// `take_var_fast` (its own guards own traces/links/arrays/qualifiers), or
+/// the dispatched `cmd_lappend` with the assembled arguments for
+/// creation, strict parse and exact errors.  Returns the command's
+/// result — the caller pushes it or discards it.
+#[inline]
+fn lappend_var_impl(
+    interp: &mut Interp,
+    code: &ByteCode,
+    name_idx: u16,
+    value: Value,
+) -> Result<Value> {
+    let name = code.get_const(name_idx).unwrap_or("");
+    if let Some(mut v) = interp.take_var_fast(name) {
+        if let Some(items) = v.as_list_mut() {
+            items.push(value);
+            let _ = interp.set_var(name, v.clone());
+            return Ok(v);
+        }
+        interp.store_var(name, v);
+    }
+    let args = [
+        Value::from_str("lappend"),
+        Value::from_str(name),
+        value,
+    ];
+    super::commands::list::cmd_lappend(interp, &args)
+}
+
+/// Fused `[LoadVar src, LappendVar dst, Pop]` — the name-keyed
+/// `lappend <var> $value` statement: read the source (LoadVar's exact
+/// path), append through [`lappend_var_impl`], discard the result.
+#[inline]
+fn op_lappend_var_var(interp: &mut Interp, code: &ByteCode, src: u16, dst: u16) -> Result<()> {
+    let value = var_read(interp, code, src)?;
+    let _ = lappend_var_impl(interp, code, dst, value)?;
+    Ok(())
+}
+
+/// Fused `[IncrVar idx, Pop]` — [`op_incr_var`]'s ladder with the
+/// discarded result.
+#[inline]
+fn op_incr_var_pop(interp: &mut Interp, code: &ByteCode, idx: u16, amount: i64) -> Result<()> {
+    let name = code.get_const(idx).unwrap_or("");
+    match interp.incr_var_fast(name, amount) {
+        Some(_) => Ok(()),
+        None => {
+            let args = [
+                Value::from_str("incr"),
+                Value::from_str(name),
+                Value::from_int(amount),
+            ];
+            let _ = super::commands::misc::cmd_incr(interp, &args)?;
+            Ok(())
+        }
+    }
 }
 
 /// Fused `[CmpSlotSlot, JumpTrue/JumpFalse]`: the comparison branches
@@ -1428,6 +1634,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         // forms alias one variable set either way.
         OpCode::LoadLocal(slot) => op_load_local(interp, code, st, *slot)?,
         OpCode::StoreLocal(slot) => op_store_local(interp, code, st, *slot)?,
+        OpCode::StoreLocalPop(slot) => op_store_local_pop(interp, code, st, *slot)?,
         // ── Folded lappend ──────────────────────────────────────────────
         // `lappend <literal-var> <value>`: the fast path appends through
         // the variable's canonical slot storage (cmd_lappend's take/
@@ -1461,33 +1668,14 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             }
         }
         OpCode::LappendVar(name_idx) => {
-            let value = st.pop_val();
-            let name = code.get_const(*name_idx).unwrap_or("");
             // Fast path: take -> append in place -> store (cmd_lappend's
             // own fast body, minus the arg assembly + command prologue).
             // take_var_fast owns every guard (traces, links, arrays, ns
             // qualifiers); a non-list rep is restored and the full
-            // command runs below (creation, strict parse, exact errors).
-            let mut fast = false;
-            if let Some(mut v) = interp.take_var_fast(name) {
-                if let Some(items) = v.as_list_mut() {
-                    items.push(value.clone());
-                    let _ = interp.set_var(name, v.clone());
-                    st.stack.push(v);
-                    fast = true;
-                } else {
-                    interp.store_var(name, v);
-                }
-            }
-            if !fast {
-                let args = [
-                    Value::from_str("lappend"),
-                    Value::from_str(name),
-                    value,
-                ];
-                let v = super::commands::list::cmd_lappend(interp, &args)?;
-                st.stack.push(v);
-            }
+            // command runs (creation, strict parse, exact errors).
+            let value = st.pop_val();
+            let v = lappend_var_impl(interp, code, *name_idx, value)?;
+            st.stack.push(v);
         }
         OpCode::IncrLocal(slot, amount) => op_incr_local(interp, code, st, *slot, *amount)?,
 
@@ -1628,6 +1816,24 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             op_cmp_si_jump(interp, code, st, *a, *k, *cc, *t, false)?
         }
         OpCode::LappendSlotSlot(src, dst) => op_lappend_slot_slot(interp, code, *src, *dst)?,
+        OpCode::LappendVarVar(src, dst) => op_lappend_var_var(interp, code, *src, *dst)?,
+        OpCode::IncrVarPop(idx, amount) => op_incr_var_pop(interp, code, *idx, *amount)?,
+        OpCode::AddVarVar(a, b) => op_add_var_var(interp, code, st, *a, *b)?,
+        OpCode::AddVarImm(a, k) => op_add_var_imm(interp, code, st, *a, *k)?,
+        OpCode::CmpVarVar(a, b, cc) => op_cmp_var_var(interp, code, st, *a, *b, *cc)?,
+        OpCode::CmpVarImm(a, k, cc) => op_cmp_var_imm(interp, code, st, *a, *k, *cc)?,
+        OpCode::CmpVarVarJumpTrue(a, b, cc, t) => {
+            op_cmp_vv_jump(interp, code, st, *a, *b, *cc, *t, true)?
+        }
+        OpCode::CmpVarVarJumpFalse(a, b, cc, t) => {
+            op_cmp_vv_jump(interp, code, st, *a, *b, *cc, *t, false)?
+        }
+        OpCode::CmpVarImmJumpTrue(a, k, cc, t) => {
+            op_cmp_vi_jump(interp, code, st, *a, *k, *cc, *t, true)?
+        }
+        OpCode::CmpVarImmJumpFalse(a, k, cc, t) => {
+            op_cmp_vi_jump(interp, code, st, *a, *k, *cc, *t, false)?
+        }
         OpCode::IncrLocalPop(slot, amount) => {
             let _ = incr_local_value(interp, code, *slot, *amount)?;
         }
@@ -2749,4 +2955,5 @@ p 1";
         );
     }
 }
+
 

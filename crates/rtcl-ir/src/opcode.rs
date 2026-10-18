@@ -261,6 +261,14 @@ pub enum OpCode {
     /// falls back to `set_var` of the name.
     StoreLocal(u16),
 
+    /// Fusion of `[StoreLocal slot, Pop]` — the `set <var> <value>`
+    /// statement shape: the value is moved into the slot, and the
+    /// discarded result is never materialized (no clone for the cell, no
+    /// stack round-trip of the result).  Same fast path and fallback
+    /// ladder as the pair (a degraded frame stores through `set_var` of
+    /// the table name).
+    StoreLocalPop(u16),
+
     /// Load an array element: `$name(TOS)`.  Name from constant pool.
     LoadArrayElem(u16),
 
@@ -269,6 +277,11 @@ pub enum OpCode {
 
     /// Increment a variable by a signed immediate and push the new value.
     IncrVar(u16, i64),
+    /// Fusion of `[IncrVar idx, Pop]` — the increment's result is
+    /// discarded (the bare-`incr` statement shape).  Same fast path and
+    /// fallback ladder as [`OpCode::IncrVar`]; only the stack round-trip
+    /// of the discarded result is elided.
+    IncrVarPop(u16, i64),
 
     /// Increment a call-frame slot by a signed immediate (naming contract
     /// as [`OpCode::LoadLocal`]); a degraded frame or non-integer value
@@ -397,6 +410,14 @@ pub enum OpCode {
     LappendLocal(u16),
     /// The name-keyed twin of [`OpCode::LappendLocal`] (top-level units).
     LappendVar(u16),
+    /// Fusion of `[LoadVar src, LappendVar dst, Pop]` — the name-keyed
+    /// `lappend <var> $value` statement shape: read the source variable
+    /// (both operands are constant-pool name indices; the read replicates
+    /// `LoadVar`'s `eval_var_ref` path, array refs included), append into
+    /// the destination through the pair's take/append/restore ladder
+    /// (`cmd_lappend` fallback with identical errors); the discarded
+    /// result is never materialized.
+    LappendVarVar(u16, u16),
     /// Fusion of `[LoadLocal src, LappendLocal dst, Pop]` — the compiler's
     /// `lappend <var> $value` statement shape: append `slots[src]` to
     /// `slots[dst]` through the same take/append/restore ladder as the
@@ -421,6 +442,19 @@ pub enum OpCode {
     /// Comparison superinstructions (same fallback contract).
     CmpSlotSlot(u16, u16, u8),
     CmpSlotImm(u16, i64, u8),
+    /// The name-keyed twins of [`OpCode::AddSlotSlot`] /
+    /// [`OpCode::CmpSlotSlot`] / [`OpCode::CmpSlotImm`]: fused
+    /// `[LoadVar a, LoadVar b, ARITH-or-CMP]`, `[LoadVar a, PushInt k,
+    /// ARITH-or-CMP]` and `[PushInt k, LoadVar b, CMP]` windows of
+    /// eval-level units (globals/namespace vars), with `cc` mirroring
+    /// [`OpCode::CmpSlotImm`]'s encoding.  Operand reads run through
+    /// `eval_var_ref` exactly as `LoadVar`'s do (array references, link
+    /// indirection, canonical errors), so values and errors match the
+    /// unfused windows.
+    AddVarVar(u16, u16),
+    AddVarImm(u16, i64),
+    CmpVarVar(u16, u16, u8),
+    CmpVarImm(u16, i64, u8),
     /// Fusions of `[cmp superinstruction, JumpTrue/JumpFalse]` — the
     /// condition shape of every compiled loop: branch on the comparison
     /// directly instead of pushing a boolean for the jump to pop and
@@ -434,6 +468,11 @@ pub enum OpCode {
     CmpSlotSlotJumpFalse(u16, u16, u8, u32),
     CmpSlotImmJumpTrue(u16, i64, u8, u32),
     CmpSlotImmJumpFalse(u16, i64, u8, u32),
+    /// The name-keyed twins of the fused comparison branches above.
+    CmpVarVarJumpTrue(u16, u16, u8, u32),
+    CmpVarVarJumpFalse(u16, u16, u8, u32),
+    CmpVarImmJumpTrue(u16, i64, u8, u32),
+    CmpVarImmJumpFalse(u16, i64, u8, u32),
     Mul,
     Div,
     Mod,
@@ -614,9 +653,11 @@ impl fmt::Display for OpCode {
             OpCode::StoreVarPop(idx) => write!(f, "STORE_VAR_POP {}", idx),
             OpCode::LoadLocal(slot) => write!(f, "LOAD_LOCAL {}", slot),
             OpCode::StoreLocal(slot) => write!(f, "STORE_LOCAL {}", slot),
+            OpCode::StoreLocalPop(slot) => write!(f, "STORE_LOCAL_POP {}", slot),
             OpCode::LoadArrayElem(idx) => write!(f, "LOAD_ARRAY_ELEM {}", idx),
             OpCode::StoreArrayElem(idx) => write!(f, "STORE_ARRAY_ELEM {}", idx),
             OpCode::IncrVar(idx, n) => write!(f, "INCR_VAR {} {}", idx, n),
+            OpCode::IncrVarPop(idx, n) => write!(f, "INCR_VAR_POP {} {}", idx, n),
             OpCode::IncrLocal(slot, n) => write!(f, "INCR_LOCAL {} {}", slot, n),
             OpCode::IncrLocalPop(slot, n) => write!(f, "INCR_LOCAL_POP {} {}", slot, n),
             OpCode::AppendVar(idx) => write!(f, "APPEND_VAR {}", idx),
@@ -661,12 +702,17 @@ impl fmt::Display for OpCode {
             OpCode::Add => write!(f, "ADD"),
             OpCode::LappendLocal(s) => write!(f, "LAPPEND_L {}", s),
             OpCode::LappendVar(n) => write!(f, "LAPPEND_V {}", n),
+            OpCode::LappendVarVar(src, dst) => write!(f, "LAPPEND_VV {} {}", src, dst),
             OpCode::LappendSlotSlot(src, dst) => write!(f, "LAPPEND_SS {} {}", src, dst),
             OpCode::BodyMarkFramed => write!(f, "BODY_MARK_FRAMED"),
             OpCode::AddSlotSlot(a, b) => write!(f, "ADD_SS {} {}", a, b),
             OpCode::AddSlotImm(a, k) => write!(f, "ADD_SI {} {}", a, k),
             OpCode::CmpSlotSlot(a, b, cc) => write!(f, "CMP_SS {} {} cc={}", a, b, cc),
             OpCode::CmpSlotImm(a, k, cc) => write!(f, "CMP_SI {} {} cc={}", a, k, cc),
+            OpCode::AddVarVar(a, b) => write!(f, "ADD_VV {} {}", a, b),
+            OpCode::AddVarImm(a, k) => write!(f, "ADD_VI {} {}", a, k),
+            OpCode::CmpVarVar(a, b, cc) => write!(f, "CMP_VV {} {} cc={}", a, b, cc),
+            OpCode::CmpVarImm(a, k, cc) => write!(f, "CMP_VI {} {} cc={}", a, k, cc),
             OpCode::CmpSlotSlotJumpTrue(a, b, cc, t) => {
                 write!(f, "CMP_SS_JT {} {} cc={} -> {}", a, b, cc, t)
             }
@@ -678,6 +724,18 @@ impl fmt::Display for OpCode {
             }
             OpCode::CmpSlotImmJumpFalse(a, k, cc, t) => {
                 write!(f, "CMP_SI_JF {} {} cc={} -> {}", a, k, cc, t)
+            }
+            OpCode::CmpVarVarJumpTrue(a, b, cc, t) => {
+                write!(f, "CMP_VV_JT {} {} cc={} -> {}", a, b, cc, t)
+            }
+            OpCode::CmpVarVarJumpFalse(a, b, cc, t) => {
+                write!(f, "CMP_VV_JF {} {} cc={} -> {}", a, b, cc, t)
+            }
+            OpCode::CmpVarImmJumpTrue(a, k, cc, t) => {
+                write!(f, "CMP_VI_JT {} {} cc={} -> {}", a, k, cc, t)
+            }
+            OpCode::CmpVarImmJumpFalse(a, k, cc, t) => {
+                write!(f, "CMP_VI_JF {} {} cc={} -> {}", a, k, cc, t)
             }
             OpCode::Sub => write!(f, "SUB"),
             OpCode::Mul => write!(f, "MUL"),

@@ -6,16 +6,20 @@
 
 ## 性能优化（剩余杠杆）
 
-- [x] **nanopass 融合（Round F，本批次提交）**：`fuse_slot_pairs` pass +
-  6 个融合 op（`CmpSlotSlot/ImmJumpTrue/False`、`LappendSlotSlot`、
-  `IncrLocalPop`）——build-only 1.29x→0.86x 指令、fe wall 1.33x→1.18x。
-  约束：融合 op 仅 locals-mode（JIT 兼容）；规范见 `bench/BASELINE.md`
-  Round F。可扩展窗口（`LoadLocal+Jump`、name-keyed 版 lappend/incr）
-  需与 JIT 接受集协调后入列。
-- [ ] **fe 求和迭代 2.8× → 收尾**：foreach_bind + 9 ops 的 per-op 权重
-  （9ns/op vs tclsh 3.5ns）。`bench/scripts/fe_bench.tcl`、
-  `bench/scripts/sum_only.tcl`。依赖 foreach 路由对齐（下条）+ 每op税。
-  （注：`build` 段已由 Round F 收尾至 0.86x，余量集中在 `p`/foreach 求和）
+- [x] **name-keyed 超指令（Round G，本批次提交）**：全局/eval 级循环的
+  `CmpVar*Jump*`/`AddVar*`/`LappendVarVar`/`IncrVarPop`/`StoreLocalPop`；
+  `ByteCode::unfused()` 桥保 JIT 全绿（`docs/JIT-OPCODE-DELTA.md`）。
+  dloop 0.69x、sum_only 0.72x、fe 1.29x（指令数比）。
+- [ ] **JIT 原生 lower（可选，JIT 侧）**：接受 A 族并直接 lower，免去
+  `unfused()` 展开（清单见 `docs/JIT-OPCODE-DELTA.md` §4）。
+- [x] **nanopass 融合（Round F，已提交 3964c97）**：`fuse_slot_pairs` → 
+  `fuse_pairs` pass + 融合 op（cmp+jcc ×4、lappend/incr pop 版）——
+  build-only 1.29x→0.85x 指令。
+- [ ] **fe 求和迭代（p 段）**：foreach_bind + meta op（BODY_MARK/SUB_MARK/
+  BEGIN_CMD×2/SUB_END）的 per-op 权重；候选 = `[FOREACH_NEXT, BODY_MARK]`
+  区域合并、`[BEGIN_CMD, SUB_MARK]` 合并、foreach_bind 去 TLS `Value::empty`
+  与 slot 写路径瘦身。`bench/scripts/fe_bench.tcl`。
+  （注：`build` 段已由 Round F 收尾至 0.85x，余量集中在 `p`/foreach 求和）
 - [ ] **foreach 路由对齐**（G9f 存档，G24 已落 framed 双模式的一半）：
   全局编译 foreach 已工作（G21 实验 + G24 framed）✅ **已完成的
   部分：全局内联 + framed 错误协议**。剩余：`uplevel`/`namespace eval`

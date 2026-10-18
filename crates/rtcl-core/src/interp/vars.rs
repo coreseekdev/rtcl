@@ -122,6 +122,56 @@ impl Interp {
         }
     }
 
+    /// The `StoreLocalPop` storage arm: same fast path and delegation
+    /// points as [`Self::frame_slot_write`], but the caller's only
+    /// remaining handle to `value` moves into the cell — the discarded
+    /// result never pays a clone.  `Err(value)` returns that handle to
+    /// the caller (which then takes the name path, exactly the `false`
+    /// branch of the cloning write).
+    pub(crate) fn frame_slot_write_move(
+        &mut self,
+        slot: usize,
+        value: Value,
+    ) -> core::result::Result<(), Value> {
+        let aliased = self
+            .frames
+            .last()
+            .map(|f| f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false))
+            .unwrap_or(true);
+        if aliased {
+            // Global link: write the target directly through the cached
+            // canonical key (one probe; creation goes through the name
+            // path — the link install seeded the variable, so the hot
+            // case is always the hit).
+            let key = self
+                .frames
+                .last()
+                .and_then(|f| f.link_keys.get(slot))
+                .and_then(|k| k.clone());
+            if let Some(key) = key {
+                if let Some(cell) = self.globals.get_mut(key.as_ref()) {
+                    *cell = value;
+                    return Ok(());
+                }
+                let name = self.frames.last().and_then(|f| {
+                    f.slot_table.as_ref().and_then(|t| t.locals().get(slot).cloned())
+                });
+                if let Some(name) = name {
+                    let _ = self.set_var(&name, value);
+                    return Ok(());
+                }
+            }
+            return Err(value);
+        }
+        match self.frames.last_mut().and_then(|f| f.slots.get_mut(slot)) {
+            Some(cell) => {
+                *cell = value;
+                Ok(())
+            }
+            None => Err(value),
+        }
+    }
+
     /// `lappend` on a frame slot's list — the compiled-op fast path.
     /// Appends `value` to the slot's list in place when every guard the
     /// real `lappend` enforces holds: no traces, not aliased/linked, the

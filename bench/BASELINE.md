@@ -1416,3 +1416,34 @@ oovars 是内存停顿主导（指令 1.05x 但 wall 1.47x：cache-refs 346M vs 
 指令数比（rtcl/tclsh）。wall（3 次交错 best-of-N）：fe 1.18x、dloop 0.78x、
 oo2 0.56x、oovars 0.99x、fib 1.00x。build 循环每迭代 op 数 12→8。
 
+## Round G — name-keyed 超指令 + de-fusion 桥（2026-10-18，JIT 约束解除后）
+
+方向更新（用户裁决）：wasm 性能目标优先，**允许 break JIT**——JIT 侧靠
+文档 + 一个展开钩子跟进，不再以「JIT 接受集」反向限制解释器的 op 集合。
+
+- `fuse_pairs` 新增 name-keyed 窗口（eval 级单元 = 全局/namespace 变量
+  代码，也是 wasm 嵌入场景的主力形态）：
+  `[LoadVar,LoadVar,ADD/CMP] → AddVarVar/CmpVarVar`、
+  `[LoadVar,PushInt k,ADD/CMP] → AddVarImm/CmpVarImm`（含镜像序
+  `[PushInt,LoadVar,CMP]`）、`[LoadVar,LappendVar,Pop] → LappendVarVar`、
+  `[IncrVar,Pop] → IncrVarPop`、`[CmpVar*,JumpT/F] → CmpVar*JumpT/F`
+  （4 个融合分支）。
+- `StoreLocalPop`（[StoreLocal,Pop]）：值 move 进 slot，去 clone+drop；
+  `frame_slot_write_move` 与其克隆版同款守卫。
+- `ByteCode::unfused()`：全部融合 op 展开回**融合前**规范窗口（含靶点
+  重映射、全族覆盖测试 `unfused_covers_every_family`）。JIT 编译边界调用
+  之（`exec.rs` + golden/roundtrip/microbench 测试助手），**JIT 接受集与
+  golden 全绿、零回退损失**；原生 lower 列为可选优化。
+- `docs/JIT-OPCODE-DELTA.md`：逐 op 语义、窗口表、建议 lower 路径、降级
+  保真三件事（回边计步/站点 region/值语义）与「已完成/可选」接线清单。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| F 后 | 1.00x | 1.40x | 0.70x | 0.54x | 0.75x | 0.86x |
+| G（本提交） | 1.00x | 1.29x | 0.69x | 0.53x | 0.73x | 0.85x |
+
+补充（指令数比）：sum_only 0.78x→0.72x（全局 while + 5×foreach 求和）；
+全局 while 循环 12→8 op/迭代；oo2 4863M→4737M、oovars 7.09G→6.90G。
+wall（3 次交错 best-of-N）：fe 1.13x、dloop 0.73–0.81x、oo2 0.57x、
+oovars 0.96x、sum_only 0.68x、fib 1.03x（噪声带内）。
+

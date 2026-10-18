@@ -17,6 +17,10 @@
 > 关联：`crates/rtcl-ir/src/opcode.rs`（每个变体的文档）、
 > `crates/rtcl-ir/src/bytecode.rs`（`fuse_pairs` 窗口表 + 跳转靶点规则）、
 > `bench/BASELINE.md` Round F/G 数字。
+>
+> **增补（`perf/interp-arch-opt-2`，2026-10-18，Round U）**：本分支新增
+> `ForNextIncrLocal/Var`（`for` 尾骨架融合）——语义、靶点义务与计步口径见
+> §1 末尾「Round U 增补」；`unfused()` 边界接线不变，JIT 接受集零改动。
 
 ## 1. 背景：融合窗口从哪来
 
@@ -74,6 +78,27 @@ Sub region 开→expr 站点→读/加→region 关→写入（move），任一�
 取字节码（`crates/rtcl-jit/src/exec.rs`），proc 体的 locals 编译不会送进
 JIT，因此这几族当前对接受集不可见；A 族（name-keyed）会出现在 JIT 消费的
 单元里，**必须更新接受集/降级路径**。
+
+### Round U 增补（循环骨架融合）
+
+| 窗口 | 融合 op | 类别 |
+|---|---|---|
+| `[SwapToNextMark, BeginCmdIncrLocalPop(site,x,k), Jump(t)]` | `ForNextIncrLocal(site,x,k,t)` | 仅 locals-mode |
+| `[SwapToNextMark, BeginCmdIncrVarPop(site,x,k), Jump(t)]` | `ForNextIncrVar(site,x,k,t)` | **JIT 可见** |
+
+- 语义 = `swap-to-next-mark`（归一化 region 栈到循环帧入口深度）→ `BeginCmd`
+  （设站点）→ `incr x k` 且丢弃结果 → 回边跳转。任一步失败时站点/region/
+  错误状态与原三 op 逐步相同；`k` 必须放进 `i32`，否则窗口不融合（保留三 op 形）。
+- **靶点双向义务（Round T/U 的血泪教训，务必保持）**：融合 op 自带的 `t`
+  必须同时登记在 `collect_jump_targets`（防止后续窗口吃掉靶点）与 `strip_nops`
+  的 `forward` 重映射（否则 nop 压缩后回边靶点漂移、循环不退出）。
+- `unfused()` 展开为 `[Nop, NextMark, BeginCmd, IncrLocal/Var, Pop, Jump(t)]`
+  （`t` 由通用靶点重映射处理；`Nop` 占位被消费的 trampoline Jump）；
+  再 `peephole()` 必须回到同一形状——`unfused_covers_every_family` 与
+  roundtrip 测试覆盖此契约。
+- **回边计步平价**：执行器传 `op_jump_from(interp, st, t, st.pc + 1)`——
+  分发已把 `st.pc` 增到「融合 op 索引 +1」，被消费的 `Jump` 位于窗口尾
+  （= `st.pc + 1`），与原两/三 op 形的回边判定逐位相同。
 
 ## 2. A 族逐 op 语义与建议 lower
 

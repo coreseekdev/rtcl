@@ -184,3 +184,28 @@
 - [x] G16 执行器栈裸 Value 化
 - [x] G12+G14 内联整数 Value + 全算术/比较立即数快速路径
 - [x] G13 链接键缓存（单次 globals 探测）
+
+## OO 优化第二批（perf/interp-arch-opt-2，2026-10-18）
+
+**已落地**
+1. ✅ head_cache 身份比较（`Value::same_allocation`，免 memcmp/`to_string`）— `94957ef`
+2. ✅ ChainEntry 预取 owner 变量表 Rc（memo 检查免表探测；`fresh_chain` 门控）— `94957ef`
+   → oo2 **0.48x**、oovars **0.57x**；全门禁绿（tests 1256/0、judge 88/88、sweep 0）
+
+**已实验关闭**
+6. ❌ while 体尾融合 `[BeginCmdIncr*Pop, Jump]`→单 op：while 微基准 **+1.54%**
+   （+12 instr/迭代，热派发面增长吃回）→ 回退留档（`d85033d`，Round Z）。
+   注：micro_incr 的 for 体尾是 fall-through（无 Jump），该窗口对它无效。
+
+**待做（按序）**
+3. ⏳ OO 派发站点级 memo（4-6% oovars，中高风险）：`(unit, pc)` 键控缓存
+   `(chain, links, head Values)`，`mutation_ctr` 校验；`next`/ActiveMethod 上下文
+   逐字保持（参考 `fresh_chain` 门控思路：只有站点直调路径吃缓存）。
+4. ⏳ call_proc 帧准备（fib 2-3%）：先按既有 perf 画像方法定位（call.rs 逐段），
+   候选：level0 填充（每参一次 clone+push）、slot_mode 门禁的 resize、
+   ns_of_qualified、pool 收发。需先画像再动。
+5. ⏳ `Value` 字符串句柄共享（最深）：为派发名/变量名的 ptr 比较提供全局前提；
+   与 3 号配合才有复利。设计先行，勿裸改 ValueInterner。
+
+**其余候选**：`call_proc` 帧准备之外的四板点（fib 0.85x / fe 0.92x / dloop 0.68x /
+build 0.72x）已在上一节定界；micro_add 0.89x、micro_lappend 0.72x（已 <1x）。

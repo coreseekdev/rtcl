@@ -10,6 +10,7 @@ members = [
     "crates/rtcl-wasm",
     "crates/rtcl-jit",
     "crates/rtcl-data",
+    "crates/rtcl-wasi",
 ]
 
 [workspace.package]

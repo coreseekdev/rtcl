@@ -1,0 +1,13 @@
+[package]
+name = "rtcl-wasi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WASI (wasm32-wasip1) C ABI embed for rtcl — interpreter as a replaceable wasm component"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# 最小能力面：std + regexp-lite（无 file/io/exec/env；宿主服务后续经 imports 提供）
+rtcl-core = { path = "../rtcl-core", default-features = false, features = ["std", "regexp-lite"] }

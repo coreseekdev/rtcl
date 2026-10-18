@@ -1417,6 +1417,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtcl-wasi"
+version = "0.1.0"
+dependencies = [
+ "rtcl-core",
+]
+
+[[package]]
 name = "rtcl-wasm"
 version = "0.1.0"
 dependencies = [

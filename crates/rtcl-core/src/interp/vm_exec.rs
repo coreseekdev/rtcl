@@ -419,7 +419,176 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
         // dispatches all push their result).
         let Some(op) = ops.get(st.pc) else { break st.pop_val() };
         st.pc += 1;
-        if let Err(e) = exec_op(interp, code, op, st) {
+        // ── Hot lane ────────────────────────────────────────────────────
+        // The ops a compiled loop body is made of run inline: the
+        // `exec_op` call + its second dispatch was the exec-side profile's
+        // largest single item on the loop benches.  Each arm runs the same
+        // shared helper `exec_op` runs for that variant — or, for the
+        // one-liners, its verbatim body — so the two dispatch paths stay
+        // one semantic source; every other op, and every fallback inside a
+        // helper, funnels through `exec_op` exactly as before.
+        let r: Result<()> = match op {
+            // ── Stack ───────────────────────────────────────────────────
+            OpCode::PushConst(idx) => {
+                op_push_const(st, code, *idx);
+                Ok(())
+            }
+            OpCode::PushConstWide(idx) => {
+                op_push_const_wide(st, code, *idx);
+                Ok(())
+            }
+            OpCode::PushEmpty => {
+                st.stack.push(Value::empty());
+                Ok(())
+            }
+            OpCode::PushInt(n) => {
+                st.stack.push(Value::from_int(*n));
+                Ok(())
+            }
+            OpCode::PushTrue => {
+                st.stack.push(Value::from_bool(true));
+                Ok(())
+            }
+            OpCode::PushFalse => {
+                st.stack.push(Value::from_bool(false));
+                Ok(())
+            }
+            OpCode::Pop => {
+                st.stack.pop();
+                Ok(())
+            }
+            OpCode::Dup => {
+                let v = st.top_val();
+                st.stack.push(v);
+                Ok(())
+            }
+
+            // ── Variables ───────────────────────────────────────────────
+            OpCode::LoadVar(idx) => op_load_var(interp, code, st, *idx),
+            OpCode::StoreVar(idx) => op_store_var(interp, code, st, *idx, true),
+            OpCode::StoreVarPop(idx) => op_store_var(interp, code, st, *idx, false),
+            OpCode::IncrVar(idx, amount) => op_incr_var(interp, code, st, *idx, *amount),
+            OpCode::LoadLocal(slot) => op_load_local(interp, code, st, *slot),
+            OpCode::StoreLocal(slot) => op_store_local(interp, code, st, *slot),
+            OpCode::IncrLocal(slot, amount) => op_incr_local(interp, code, st, *slot, *amount),
+
+            // ── Slot superinstructions ──────────────────────────────────
+            OpCode::AddSlotSlot(a, b) => op_add_slot_slot(interp, code, st, *a, *b),
+            OpCode::AddSlotImm(a, k) => op_add_slot_imm(interp, code, st, *a, *k),
+            OpCode::CmpSlotSlot(a, b, cc) => op_cmp_slot_slot(interp, code, st, *a, *b, *cc),
+            OpCode::CmpSlotImm(a, k, cc) => op_cmp_slot_imm(interp, code, st, *a, *k, *cc),
+
+            // ── Arithmetic / comparison ─────────────────────────────────
+            OpCode::Add => arith(st, '+'),
+            OpCode::Sub => arith(st, '-'),
+            OpCode::Mul => arith(st, '*'),
+            OpCode::Div => arith(st, '/'),
+            OpCode::Mod => op_int_mod(st),
+            OpCode::Neg => {
+                let a = st.pop_val();
+                let v = crate::types::expr_ops::op_neg(&a)?;
+                st.stack.push(v);
+                Ok(())
+            }
+            OpCode::Eq => {
+                let (a, b) = pop_pair(st);
+                st.stack.push(crate::types::expr_ops::op_eq(&a, &b));
+                Ok(())
+            }
+            OpCode::Ne => {
+                let (a, b) = pop_pair(st);
+                st.stack.push(crate::types::expr_ops::op_ne(&a, &b));
+                Ok(())
+            }
+            OpCode::Lt => rel(st, "<"),
+            OpCode::Gt => rel(st, ">"),
+            OpCode::Le => rel(st, "<="),
+            OpCode::Ge => rel(st, ">="),
+            OpCode::StrEq => {
+                let (a, b) = pop_pair(st);
+                st.stack.push(crate::types::expr_ops::op_str_eq(&a, &b));
+                Ok(())
+            }
+            OpCode::StrNe => {
+                let (a, b) = pop_pair(st);
+                st.stack.push(crate::types::expr_ops::op_str_ne(&a, &b));
+                Ok(())
+            }
+            OpCode::Concat(n) => {
+                op_concat(st, *n);
+                Ok(())
+            }
+
+            // ── Control flow ────────────────────────────────────────────
+            OpCode::Jump(t) => op_jump(interp, st, *t),
+            OpCode::JumpTrue(t) => op_jump_if(interp, st, *t, true),
+            OpCode::JumpFalse(t) => op_jump_if(interp, st, *t, false),
+
+            // ── Loops / regions ─────────────────────────────────────────
+            OpCode::LoopEnter { cont, brk } => {
+                op_loop_enter(st, *cont, *brk);
+                Ok(())
+            }
+            OpCode::LoopExit => {
+                st.loops.pop();
+                Ok(())
+            }
+            OpCode::BodyMark => {
+                st.bodies.push(Region::Body(st.cur_site));
+                Ok(())
+            }
+            OpCode::BodyMarkFramed => {
+                op_body_mark_framed(st);
+                Ok(())
+            }
+            OpCode::NextMark => {
+                st.bodies.push(Region::Next(st.cur_site));
+                Ok(())
+            }
+            OpCode::SubMark => {
+                st.bodies.push(Region::Sub(st.cur_site));
+                Ok(())
+            }
+            OpCode::ExprMark => {
+                st.bodies.push(Region::Expr(st.cur_site));
+                Ok(())
+            }
+            OpCode::SubEnd => {
+                op_sub_end(st);
+                Ok(())
+            }
+            OpCode::BeginCmd(site_idx) => op_begin_cmd(interp, code, st, *site_idx),
+
+            // ── Inline foreach / break / continue ───────────────────────
+            OpCode::ForeachStart { info, next, end } => {
+                op_foreach_start(interp, code, st, *info, *next, *end)
+            }
+            OpCode::ForeachNext { info, body } => op_foreach_next(interp, code, st, *info, *body),
+            OpCode::ForeachCollect => {
+                op_foreach_collect(st);
+                Ok(())
+            }
+            OpCode::ForeachEnd => {
+                op_foreach_end(st);
+                Ok(())
+            }
+            OpCode::Break => op_break(interp, st),
+            OpCode::Continue => op_continue(interp, st),
+
+            // ── Return / exit / meta ────────────────────────────────────
+            // (Control-flow completions: the shared error handler below
+            // propagates them framelessly, unchanged.)
+            OpCode::Return => {
+                let v = st.pop_val();
+                Err(Error::ret(Some(v)))
+            }
+            OpCode::Exit(c) => Err(Error::exit(Some(*c))),
+            OpCode::Nop | OpCode::Line(_) => Ok(()),
+
+            // Everything else takes the table dispatch.
+            _ => exec_op(interp, code, op, st),
+        };
+        if let Err(e) = r {
             // Control-flow completions propagate framelessly — except
             // break/continue that crossed a *dispatched command* or
             // *nested script* boundary inside an inline loop: exactly
@@ -1039,6 +1208,38 @@ fn op_sub_end(st: &mut VmState) {
     }
 }
 
+#[inline]
+fn op_load_var(interp: &mut Interp, code: &ByteCode, st: &mut VmState, idx: u16) -> Result<()> {
+    let name = code.get_const(idx).unwrap_or("");
+    // eval_var_ref, not a raw read: `$a($i)` words compile to LoadVar with
+    // the raw reference text and need the same index-substitution dance
+    // eval_word does.
+    let v = interp.eval_var_ref(name)?;
+    st.stack.push(v);
+    Ok(())
+}
+
+#[inline]
+fn op_concat(st: &mut VmState, n: u16) {
+    let n = n as usize;
+    let from = st.stack.len() - n;
+    let mut s = String::new();
+    for v in &st.stack[from..] {
+        s.push_str(v.as_str());
+    }
+    st.stack.truncate(from);
+    st.stack.push(Value::from_str(&s));
+}
+
+#[inline]
+fn op_int_mod(st: &mut VmState) -> Result<()> {
+    let b = st.pop_val();
+    let a = st.pop_val();
+    let v = crate::types::expr_ops::int_mod(&a, &b)?;
+    st.stack.push(v);
+    Ok(())
+}
+
 /// Execute one instruction.  Errors carry the same shape the tree-walk
 /// would produce for the same operation; the caller classifies them into
 /// errorInfo frames.
@@ -1069,14 +1270,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         }
 
         // ── Variables ───────────────────────────────────────────────────
-        OpCode::LoadVar(idx) => {
-            let name = code.get_const(*idx).unwrap_or("");
-            // eval_var_ref, not a raw read: `$a($i)` words compile to
-            // LoadVar with the raw reference text and need the same
-            // index-substitution dance eval_word does.
-            let v = interp.eval_var_ref(name)?;
-            st.stack.push(v);
-        }
+        OpCode::LoadVar(idx) => op_load_var(interp, code, st, *idx)?,
         OpCode::StoreVar(idx) | OpCode::StoreVarPop(idx) => {
             let keep = matches!(op, OpCode::StoreVar(_));
             op_store_var(interp, code, st, *idx, keep)?
@@ -1165,16 +1359,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 None => st.stack.push(v),
             }
         }
-        OpCode::Concat(n) => {
-            let n = *n as usize;
-            let from = st.stack.len() - n;
-            let mut s = String::new();
-            for v in &st.stack[from..] {
-                s.push_str(v.as_str());
-            }
-            st.stack.truncate(from);
-            st.stack.push(Value::from_str(&s));
-        }
+        OpCode::Concat(n) => op_concat(st, *n),
 
         // ── Control flow ────────────────────────────────────────────────
         OpCode::Jump(t) => op_jump(interp, st, *t)?,
@@ -1287,12 +1472,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         OpCode::Sub => arith(st, '-')?,
         OpCode::Mul => arith(st, '*')?,
         OpCode::Div => arith(st, '/')?,
-        OpCode::Mod => {
-            let b = st.pop_val();
-            let a = st.pop_val();
-            let v = crate::types::expr_ops::int_mod(&a, &b)?;
-            st.stack.push(v);
-        }
+        OpCode::Mod => op_int_mod(st)?,
         OpCode::Pow => {
             let b = st.pop_val();
             let a = st.pop_val();

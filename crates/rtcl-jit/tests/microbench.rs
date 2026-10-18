@@ -60,7 +60,7 @@ fn per_proc_compile_latency() {
         let src: &'static str = Box::leak(src.to_string().into_boxed_str());
         bench(&format!("bytecode: {name}"), 200, || {
             let unit = ScriptUnit::parse(src).expect("parse");
-            Compiler::compile_unit(unit.source, &unit.commands)
+            Compiler::compile_unit(unit.source, &unit.commands).unfused()
         });
     }
 

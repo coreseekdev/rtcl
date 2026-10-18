@@ -936,7 +936,10 @@ pub fn run_top_with(
             })
         }
     };
-    let bc = Compiler::compile_unit(Rc::clone(&unit.source), &unit.commands);
+    // 解释器原生超指令（rtcl-ir 的 fuse_pairs）先展开回规范窗口：JIT
+    // 接受集/降级路径无需跟进修补（口径与替代方案见
+    // docs/JIT-OPCODE-DELTA.md；将来做原生 lower 时删掉本展开即可）。
+    let bc = Compiler::compile_unit(Rc::clone(&unit.source), &unit.commands).unfused();
     let module = match emit::compile(&bc, &EmitConfig::default()) {
         Ok(m) => m,
         Err(_) => {

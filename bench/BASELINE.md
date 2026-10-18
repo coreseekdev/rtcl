@@ -1512,6 +1512,29 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## 实验记录 — 循环骨架融合（Round T，已回退）
+
+消融定位（新增 micro）：**`while` 形态 1.09x vs `for` 形态 1.33x**
+（`micro_base` tclsh 337M vs rtcl 450M，1M 迭代）——差距集中在 `for` 专属的
+next-script 转换（`SWAP_TO_NEXT_MARK` + Next region + 一跳派发 ≈107 instr/迭代），
+而非通用循环机制。
+
+实现（两窗口，均逐字复刻）：
+- 3-op `[SwapToNextMark, BeginCmdIncrLocal/VarPop(site,x,k), Jump(t)]`
+  → `ForNextIncrLocal/Var`（k 需 fits-i32；entries 在头部=continue 落点等价）；
+- 2-op `[BeginCmdIncrLocal/VarPop, Jump]` → `Incr*PopJump`。
+
+实测：`micro_base` 449.9M→**430.9M**（1.33x→1.28x）、`micro_incr` 533.9M→
+518.9M、`m_while` 342.9M→337.9M；但 **judge 破防**：2-op 窗口令
+`control_flow` 的 `for` 不终止；移除 2-op 后 3-op 仍令 `gen_expr`（`expr-23.49`
+的 `for {set tval 0} {$tval <= 66} {incr tval}`）不终止——两窗口均曾复现
+「循环不退出」，根因未在预算内收敛（自测小脚本 f1/f2/f3、cf_min 均通过，
+长脚本多构造交互处失败 → 疑似与 `strip/remap` 的 `cont/brk` 靶点交互）。
+
+**整批回退**（分支保留 master 基线）。结论：骨架融合必须配「循环终止性」
+专项矩阵（break/continue/next-script 逃逸 × 嵌套 × strip 交互）才能安全落地，
+列入下一批（完整工作段 + 专项探针）。
+
 ## 实验记录 — VarMap RC 键表示层（Round S，已回退）
 
 按计划试做 `VarMap/VarSet/UpvarMap` 键 → `Name(Rc<str>)`（ptr-first `Eq` +

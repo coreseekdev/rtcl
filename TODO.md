@@ -32,6 +32,13 @@
      call_proc 12%。
   4. 空循环基线（dispatch + region 簿记）：`bodies` 预留 + unchecked push、
      `VmState` 帧指针缓存（unsafe 面小、收益 ~5-8%）。
+- [x] **OO prelink 去税 + 变量语义修正（Rounds Q/R）**：注册一次性、
+  `(qualified,ns_part)` 预计算、去冗余 seed、memo 身份补 ns —— oovars
+  0.69x→**0.58x** 指令 / 0.96x→0.70x wall；新增 judge 回归
+  `oo_instance_vars.tcl`（88/88）。
+- [x] **dloop 画像结论（0.68x）**：剩余成本 = 派发式 `incr acc [dict get …]`
+  的名字扫描（`split_array_ref`/`redirect_flat`，每次访问 2-3 扫）与 dict
+  插入（IndexMap rehash/alloc，摊销固有）——进一步需下表的 VarMap 键表示层。
 - [x] **rtcl-vm 边界 unfused()**（Round P）：`execute()` 入口展开融合 op
   （与 JIT 同桥）；canonical 集之外的面（lappend 族）维持其既有显式拒绝。
 - [ ] **OO 派发 per-call 字符串面（Round O 画像，oovars 0.69x）**：

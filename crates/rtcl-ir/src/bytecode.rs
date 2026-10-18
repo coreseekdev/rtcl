@@ -433,6 +433,17 @@ impl ByteCode {
         }
         let len = self.ops.len();
         let targets = self.collect_jump_targets();
+        // Class-A fusions ([Jump trampoline, NextMark/ForeachNext]) move
+        // the consumed op's semantics *into the head* (the fused executor
+        // helper normalizes both entries, so entry at the tail is
+        // equivalent).  Targets that pointed at the consumed op must
+        // follow it to the head — `strip_nops`' forward map would land
+        // them *past* the fused op (the op after it).  The retarget is
+        // step-charge faithful: for every just-before continue the
+        // comparison `cont < pc` keeps its verdict (the head index is
+        // exactly the consumed op's index minus one, and both sides shift
+        // with the same compaction).
+        let mut retargets: Vec<(u32, u32)> = Vec::new();
         let mut changed = false;
         let mut i = 0;
         while i + 1 < len {
@@ -495,6 +506,49 @@ impl ByteCode {
                         _ => None,
                     }
                 }
+                // ── meta-op pairs (site/region bookkeeping) ──────────────
+                (OpCode::BeginCmd(site), OpCode::SubMark) if !targets[i + 1] => {
+                    Some((OpCode::BeginCmdSubMark(*site), 2))
+                }
+                (OpCode::ExprMark, OpCode::BeginCmd(site)) if !targets[i + 1] => {
+                    Some((OpCode::ExprMarkBeginCmd(*site), 2))
+                }
+                (OpCode::BeginCmd(site), OpCode::PushConst(idx)) if !targets[i + 1] => {
+                    Some((OpCode::BeginCmdPushConst(*site, *idx), 2))
+                }
+                (OpCode::SubEnd, OpCode::StoreLocalPop(slot)) if !targets[i + 1] => {
+                    Some((OpCode::SubEndStoreLocalPop(*slot), 2))
+                }
+                (OpCode::SubEnd, OpCode::StoreVarPop(idx)) if !targets[i + 1] => {
+                    Some((OpCode::SubEndStoreVarPop(*idx), 2))
+                }
+                (OpCode::SubEnd, OpCode::Return) if !targets[i + 1] => {
+                    Some((OpCode::SubEndReturn, 2))
+                }
+                // ── loop-control meta pairs ─────────────────────────────
+                // Trampoline tabs: the jump's target is the mark itself.
+                // The fused op normalizes the region stack to the loop
+                // frame's entry depth (the fused executor helper), so a
+                // `continue` landing on the same (consumed) instruction
+                // arrives with the same state either way — no target guard
+                // is needed here, unlike the value-window fusions.
+                (OpCode::Jump(t), OpCode::NextMark) if *t as usize == i + 1 => {
+                    retargets.push(((i + 1) as u32, i as u32));
+                    Some((OpCode::SwapToNextMark, 2))
+                }
+                (OpCode::Jump(t), OpCode::ForeachNext { info, body }) if *t as usize == i + 1 => {
+                    retargets.push(((i + 1) as u32, i as u32));
+                    Some((OpCode::ForeachNextClose(*info, *body), 2))
+                }
+                (OpCode::NextMark, OpCode::BeginCmd(site)) if !targets[i + 1] => {
+                    Some((OpCode::NextMarkBeginCmd(*site), 2))
+                }
+                (OpCode::BeginCmd(site), OpCode::IncrLocalPop(x, k)) if !targets[i + 1] => {
+                    Some((OpCode::BeginCmdIncrLocalPop(*site, *x, *k), 2))
+                }
+                (OpCode::BeginCmd(site), OpCode::IncrVarPop(x, k)) if !targets[i + 1] => {
+                    Some((OpCode::BeginCmdIncrVarPop(*site, *x, *k), 2))
+                }
                 // ── statement-result discards ───────────────────────────
                 (OpCode::IncrVar(x, k), OpCode::Pop) if !targets[i + 1] => {
                     Some((OpCode::IncrVarPop(*x, *k), 2))
@@ -516,6 +570,63 @@ impl ByteCode {
                 i += width;
             } else {
                 i += 1;
+            }
+        }
+        if !retargets.is_empty() {
+            for op in self.ops.iter_mut() {
+                match op {
+                    OpCode::Jump(t)
+                    | OpCode::JumpTrue(t)
+                    | OpCode::JumpFalse(t)
+                    | OpCode::CatchStart(t)
+                    | OpCode::CmpSlotSlotJumpTrue(_, _, _, t)
+                    | OpCode::CmpSlotSlotJumpFalse(_, _, _, t)
+                    | OpCode::CmpSlotImmJumpTrue(_, _, _, t)
+                    | OpCode::CmpSlotImmJumpFalse(_, _, _, t)
+                    | OpCode::CmpVarVarJumpTrue(_, _, _, t)
+                    | OpCode::CmpVarVarJumpFalse(_, _, _, t)
+                    | OpCode::CmpVarImmJumpTrue(_, _, _, t)
+                    | OpCode::CmpVarImmJumpFalse(_, _, _, t) => {
+                        for &(from, to) in &retargets {
+                            if *t == from {
+                                *t = to;
+                            }
+                        }
+                    }
+                    OpCode::LoopEnter { cont, brk } => {
+                        for f in [cont, brk] {
+                            for &(from, to) in &retargets {
+                                if *f == from {
+                                    *f = to;
+                                }
+                            }
+                        }
+                    }
+                    OpCode::ForeachStart { next, end, .. } => {
+                        for f in [next, end] {
+                            for &(from, to) in &retargets {
+                                if *f == from {
+                                    *f = to;
+                                }
+                            }
+                        }
+                    }
+                    OpCode::ForeachNext { body, .. } => {
+                        for &(from, to) in &retargets {
+                            if *body == from {
+                                *body = to;
+                            }
+                        }
+                    }
+                    OpCode::ForeachNextClose(_, body) => {
+                        for &(from, to) in &retargets {
+                            if *body == from {
+                                *body = to;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         changed
@@ -544,6 +655,17 @@ impl ByteCode {
                     | OpCode::CmpVarVar(..)
                     | OpCode::AddVarImm(..)
                     | OpCode::AddVarVar(..)
+                    | OpCode::BeginCmdSubMark(..)
+                    | OpCode::ExprMarkBeginCmd(..)
+                    | OpCode::BeginCmdPushConst(..)
+                    | OpCode::SubEndStoreLocalPop(..)
+                    | OpCode::SubEndStoreVarPop(..)
+                    | OpCode::SubEndReturn
+                    | OpCode::SwapToNextMark
+                    | OpCode::NextMarkBeginCmd(..)
+                    | OpCode::BeginCmdIncrLocalPop(..)
+                    | OpCode::BeginCmdIncrVarPop(..)
+                    | OpCode::ForeachNextClose(..)
             )
         })
     }
@@ -625,6 +747,56 @@ impl ByteCode {
                 OpCode::StoreLocalPop(x) => {
                     out.push(OpCode::StoreLocal(*x));
                     out.push(OpCode::Pop);
+                }
+                OpCode::BeginCmdSubMark(site) => {
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::SubMark);
+                }
+                OpCode::ExprMarkBeginCmd(site) => {
+                    out.push(OpCode::ExprMark);
+                    out.push(OpCode::BeginCmd(*site));
+                }
+                OpCode::BeginCmdPushConst(site, idx) => {
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::PushConst(*idx));
+                }
+                OpCode::SubEndStoreLocalPop(slot) => {
+                    // Straight to the pre-fusion canonical form: a
+                    // `StoreLocalPop` here would still be a fused op the
+                    // boundary must not emit.
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::StoreLocal(*slot));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::SubEndStoreVarPop(idx) => {
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::StoreVarPop(*idx));
+                }
+                OpCode::SubEndReturn => {
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::Return);
+                }
+                OpCode::SwapToNextMark => {
+                    out.push(OpCode::Nop);
+                    out.push(OpCode::NextMark);
+                }
+                OpCode::NextMarkBeginCmd(site) => {
+                    out.push(OpCode::NextMark);
+                    out.push(OpCode::BeginCmd(*site));
+                }
+                OpCode::BeginCmdIncrLocalPop(site, x, k) => {
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::IncrLocal(*x, *k));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::BeginCmdIncrVarPop(site, x, k) => {
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::IncrVar(*x, *k));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::ForeachNextClose(info, body) => {
+                    out.push(OpCode::Nop);
+                    out.push(OpCode::ForeachNext { info: *info, body: *body });
                 }
                 // The name-keyed superinstructions themselves predate the
                 // fusion only as windows — expand them back too.
@@ -734,6 +906,7 @@ impl ByteCode {
                     mark(*end);
                 }
                 OpCode::ForeachNext { body, .. } => mark(*body),
+                OpCode::ForeachNextClose(_, body) => mark(*body),
                 _ => {}
             }
         }
@@ -989,6 +1162,9 @@ impl ByteCode {
                 OpCode::ForeachNext { body, .. } => {
                     *body = forward[*body as usize];
                 }
+                OpCode::ForeachNextClose(_, body) => {
+                    *body = forward[*body as usize];
+                }
                 _ => {}
             }
         }
@@ -1186,6 +1362,17 @@ mod tests {
                 OpCode::CmpVarVar(1, 2, 0),
                 OpCode::AddVarImm(1, 9),
                 OpCode::AddVarVar(1, 2),
+                OpCode::BeginCmdSubMark(1),
+                OpCode::ExprMarkBeginCmd(1),
+                OpCode::BeginCmdPushConst(1, 2),
+                OpCode::SubEndStoreLocalPop(1),
+                OpCode::SubEndStoreVarPop(1),
+                OpCode::SubEndReturn,
+                OpCode::SwapToNextMark,
+                OpCode::NextMarkBeginCmd(1),
+                OpCode::BeginCmdIncrLocalPop(1, 2, 1),
+                OpCode::BeginCmdIncrVarPop(1, 2, 1),
+                OpCode::ForeachNextClose(1, 2),
                 OpCode::Return,
             ],
             false,

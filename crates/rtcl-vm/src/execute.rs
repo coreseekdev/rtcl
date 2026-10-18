@@ -88,6 +88,12 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             | OpCode::CmpVarVarJumpTrue(..) | OpCode::CmpVarVarJumpFalse(..)
             | OpCode::CmpVarImmJumpTrue(..) | OpCode::CmpVarImmJumpFalse(..)
             | OpCode::LappendVarVar(..) | OpCode::IncrVarPop(..)
+            | OpCode::BeginCmdSubMark(..) | OpCode::ExprMarkBeginCmd(..)
+            | OpCode::BeginCmdPushConst(..) | OpCode::SubEndStoreLocalPop(..)
+            | OpCode::SubEndStoreVarPop(..) | OpCode::SubEndReturn
+            | OpCode::SwapToNextMark | OpCode::NextMarkBeginCmd(..)
+            | OpCode::BeginCmdIncrLocalPop(..) | OpCode::BeginCmdIncrVarPop(..)
+            | OpCode::ForeachNextClose(..)
             | OpCode::BodyMarkFramed => {
                 return Err(Error::runtime(
                     "lappend ops are not supported here",

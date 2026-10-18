@@ -1447,3 +1447,33 @@ oo2 0.56x、oovars 0.99x、fib 1.00x。build 循环每迭代 op 数 12→8。
 wall（3 次交错 best-of-N）：fe 1.13x、dloop 0.73–0.81x、oo2 0.57x、
 oovars 0.96x、sum_only 0.68x、fib 1.03x（噪声带内）。
 
+## Round H — meta op 与循环控制融合（2026-10-18，继续）
+
+数据驱动：per-op 语义体 ≈ tclsh 的 1.1x，真正差距在**每迭代 op 数**（错误
+簿记的 meta op 税）。逐项增量测量（空 for 循环基线）显示 rtcl 534 instr/迭代
+vs tclsh 337。本轮把编译器的高频簿记相邻对交给 `fuse_pairs`：
+
+- meta 对：`[BeginCmd,SubMark]→BeginCmdSubMark`、
+  `[ExprMark,BeginCmd]→ExprMarkBeginCmd`、`[BeginCmd,PushConst]→
+  BeginCmdPushConst`、`[SubEnd,StoreLocalPop/StoreVarPop/Return]→
+  SubEndStoreLocalPop/…VarPop/SubEndReturn`。
+- 循环控制：`[Jump(t=下一op),NextMark]→SwapToNextMark`、
+  `[Jump(t=下一op),ForeachNext]→ForeachNextClose`、
+  `[NextMark,BeginCmd]→NextMarkBeginCmd`、
+  `[BeginCmd,IncrLocal/VarPop]→BeginCmdIncrLocal/VarPop`。
+- **class-A 靶点重定向**：被消费的 `NextMark`/`ForeachNext` 常是 `continue`
+  的落点——融合时把指向它的靶点重定向到融合 op 头（展开为 `[Nop,原op]`，
+  trampoline 语义）；执行器按 `LoopFrame` 归一化 region 栈（与 `op_continue`
+  同款），双入口等价、计步平价。
+- 两个自查 bug：`ForeachNextClose` 的 `body` 靶点漏进 `strip_nops` 重映射
+  （judge 8 例 + 1 panic 抓到）；class-A 融合需重定向 else 跳过归一化
+  （judge control_flow / gen_lmap 抓到）。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| G 后 | 1.00x | 1.29x | 0.69x | 0.53x | 0.73x | 0.85x |
+| H（本提交） | 0.99x | 1.23x | 0.69x | 0.52x | 0.72x | 0.84x |
+
+dloop 的 0.45x 假象说明：坏 remap 下循环少干活（judge 未绿时的数字不可用，
+已剔除）。空循环基线 534→517 instr/迭代。
+

@@ -520,6 +520,32 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             OpCode::LappendSlotSlot(src, dst) => op_lappend_slot_slot(interp, code, *src, *dst),
             OpCode::LappendVarVar(src, dst) => op_lappend_var_var(interp, code, *src, *dst),
             OpCode::IncrVarPop(idx, amount) => op_incr_var_pop(interp, code, *idx, *amount),
+            OpCode::BeginCmdSubMark(site) => op_begin_cmd_sub_mark(interp, code, st, *site),
+            OpCode::ExprMarkBeginCmd(site) => op_expr_mark_begin_cmd(interp, code, st, *site),
+            OpCode::BeginCmdPushConst(site, idx) => {
+                op_begin_cmd_push_const(interp, code, st, *site, *idx)
+            }
+            OpCode::SubEndStoreLocalPop(slot) => {
+                op_sub_end_store_local_pop(interp, code, st, *slot)
+            }
+            OpCode::SubEndStoreVarPop(idx) => op_sub_end_store_var_pop(interp, code, st, *idx),
+            OpCode::SubEndReturn => op_sub_end_return(st),
+            OpCode::SwapToNextMark => {
+                op_swap_to_next_mark(st);
+                Ok(())
+            }
+            OpCode::NextMarkBeginCmd(site) => {
+                op_next_mark_begin_cmd(interp, code, st, *site)
+            }
+            OpCode::BeginCmdIncrLocalPop(site, slot, amount) => {
+                op_begin_cmd_incr_local_pop(interp, code, st, *site, *slot, *amount)
+            }
+            OpCode::BeginCmdIncrVarPop(site, idx, amount) => {
+                op_begin_cmd_incr_var_pop(interp, code, st, *site, *idx, *amount)
+            }
+            OpCode::ForeachNextClose(info, body) => {
+                op_foreach_next_close(interp, code, st, *info, *body)
+            }
             OpCode::IncrLocalPop(slot, amount) => {
                 let _ = incr_local_value(interp, code, *slot, *amount)?;
                 Ok(())
@@ -949,6 +975,179 @@ fn op_store_local_pop(
         interp.set_var(name, v)?;
     }
     Ok(())
+}
+
+/// `SubEnd`'s region close (see [`op_sub_end`]) followed by a store —
+/// the `set x [...]` statement tail in one dispatch.  The steps, their
+/// order and every delegation are the pair's verbatim.
+#[inline]
+fn op_sub_end_store_local_pop(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    slot: u16,
+) -> Result<()> {
+    op_sub_end(st);
+    op_store_local_pop(interp, code, st, slot)
+}
+
+/// [`op_sub_end_store_local_pop`]'s name-keyed twin (`[SubEnd,
+/// StoreVarPop]`).
+#[inline]
+fn op_sub_end_store_var_pop(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    idx: u16,
+) -> Result<()> {
+    op_sub_end(st);
+    op_store_var(interp, code, st, idx, false)
+}
+
+/// `[SubEnd, Return]` — `return [...]`: close the bracket region, then
+/// return the value (the `Return` arm's exact completion).
+#[inline]
+fn op_sub_end_return(st: &mut VmState) -> Result<()> {
+    op_sub_end(st);
+    let v = st.pop_val();
+    Err(Error::ret(Some(v)))
+}
+
+/// `[BeginCmd s, SubMark]`: set the site, then open the bracket region of
+/// the just-set site.
+#[inline]
+fn op_begin_cmd_sub_mark(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    site: u32,
+) -> Result<()> {
+    op_begin_cmd(interp, code, st, site)?;
+    st.bodies.push(Region::Sub(st.cur_site));
+    Ok(())
+}
+
+/// `[ExprMark, BeginCmd s]`: open the expression-operand region, then set
+/// the site.
+#[inline]
+fn op_expr_mark_begin_cmd(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    site: u32,
+) -> Result<()> {
+    st.bodies.push(Region::Expr(st.cur_site));
+    op_begin_cmd(interp, code, st, site)
+}
+
+/// `[BeginCmd s, PushConst i]`: set the site, then push the constant (the
+/// dispatch shape's name push).
+#[inline]
+fn op_begin_cmd_push_const(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    site: u32,
+    idx: u16,
+) -> Result<()> {
+    op_begin_cmd(interp, code, st, site)?;
+    op_push_const(st, code, idx);
+    Ok(())
+}
+
+/// `[Jump(t), NextMark]` (only fused when `t` is the mark itself — the
+/// region-closing trampoline): normalize the region stack to the loop's
+/// entry depth and open the next-script region of the loop's owner site.
+/// Two entries reach this op: the body-end trampoline (the jump popped the
+/// body region; `cur_site` is the body's site = the owner) and a compiled
+/// `continue` (which already truncated to the same depth and set the
+/// owner) — [`op_continue`]'s normalization covers both exactly.  No
+/// backward-step charge: the trampoline's target is one past the jump,
+/// and `continue` charged its own edge.
+#[inline]
+fn op_swap_to_next_mark(st: &mut VmState) {
+    match st.loops.last() {
+        Some(l) => {
+            st.bodies.truncate(l.bodies_len);
+            st.cur_site = l.owner;
+        }
+        None => {
+            if let Some(region) = st.bodies.pop() {
+                st.cur_site = region.site();
+            }
+        }
+    }
+    st.bodies.push(Region::Next(st.cur_site));
+}
+
+/// `[NextMark, BeginCmd s]`: open the next-script region, then set the
+/// site.
+#[inline]
+fn op_next_mark_begin_cmd(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    site: u32,
+) -> Result<()> {
+    st.bodies.push(Region::Next(st.cur_site));
+    op_begin_cmd(interp, code, st, site)
+}
+
+/// `[BeginCmd s, IncrLocalPop x k]` — the `for` next-script's `incr`
+/// statement in one dispatch.
+#[inline]
+fn op_begin_cmd_incr_local_pop(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    site: u32,
+    slot: u16,
+    amount: i64,
+) -> Result<()> {
+    op_begin_cmd(interp, code, st, site)?;
+    let _ = incr_local_value(interp, code, slot, amount)?;
+    Ok(())
+}
+
+/// `[BeginCmd s, IncrVarPop i k]` — the name-keyed twin.
+#[inline]
+fn op_begin_cmd_incr_var_pop(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    site: u32,
+    idx: u16,
+    amount: i64,
+) -> Result<()> {
+    op_begin_cmd(interp, code, st, site)?;
+    op_incr_var_pop(interp, code, idx, amount)
+}
+
+/// `[Jump(t), ForeachNext]` (trampoline): normalize the region stack to
+/// the foreach's entry depth (the body-end jump popped the body region;
+/// a compiled `continue` truncated the same way through its loop frame),
+/// then the iterator advance/bind ([`op_foreach_next`] owns the taken-edge
+/// step charge).
+#[inline]
+fn op_foreach_next_close(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    info: u32,
+    body: u32,
+) -> Result<()> {
+    match st.loops.last() {
+        Some(l) => {
+            st.bodies.truncate(l.bodies_len);
+            st.cur_site = l.owner;
+        }
+        None => {
+            if let Some(region) = st.bodies.pop() {
+                st.cur_site = region.site();
+            }
+        }
+    }
+    op_foreach_next(interp, code, st, info, body)
 }
 
 /// `IncrLocal`'s value, without the stack push — the fused
@@ -1818,6 +2017,27 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         OpCode::LappendSlotSlot(src, dst) => op_lappend_slot_slot(interp, code, *src, *dst)?,
         OpCode::LappendVarVar(src, dst) => op_lappend_var_var(interp, code, *src, *dst)?,
         OpCode::IncrVarPop(idx, amount) => op_incr_var_pop(interp, code, *idx, *amount)?,
+        OpCode::BeginCmdSubMark(site) => op_begin_cmd_sub_mark(interp, code, st, *site)?,
+        OpCode::ExprMarkBeginCmd(site) => op_expr_mark_begin_cmd(interp, code, st, *site)?,
+        OpCode::BeginCmdPushConst(site, idx) => {
+            op_begin_cmd_push_const(interp, code, st, *site, *idx)?
+        }
+        OpCode::SubEndStoreLocalPop(slot) => {
+            op_sub_end_store_local_pop(interp, code, st, *slot)?
+        }
+        OpCode::SubEndStoreVarPop(idx) => op_sub_end_store_var_pop(interp, code, st, *idx)?,
+        OpCode::SubEndReturn => op_sub_end_return(st)?,
+        OpCode::SwapToNextMark => op_swap_to_next_mark(st),
+        OpCode::NextMarkBeginCmd(site) => op_next_mark_begin_cmd(interp, code, st, *site)?,
+        OpCode::BeginCmdIncrLocalPop(site, slot, amount) => {
+            op_begin_cmd_incr_local_pop(interp, code, st, *site, *slot, *amount)?
+        }
+        OpCode::BeginCmdIncrVarPop(site, idx, amount) => {
+            op_begin_cmd_incr_var_pop(interp, code, st, *site, *idx, *amount)?
+        }
+        OpCode::ForeachNextClose(info, body) => {
+            op_foreach_next_close(interp, code, st, *info, *body)?
+        }
         OpCode::AddVarVar(a, b) => op_add_var_var(interp, code, st, *a, *b)?,
         OpCode::AddVarImm(a, k) => op_add_var_imm(interp, code, st, *a, *k)?,
         OpCode::CmpVarVar(a, b, cc) => op_cmp_var_var(interp, code, st, *a, *b, *cc)?,
@@ -2955,5 +3175,8 @@ p 1";
         );
     }
 }
+
+
+
 
 

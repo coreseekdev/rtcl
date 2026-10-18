@@ -192,7 +192,13 @@ impl Compiler {
             | OpCode::Not
             | OpCode::BitAnd | OpCode::BitOr | OpCode::BitXor | OpCode::BitNot
             | OpCode::Shl | OpCode::Shr
-            | OpCode::BeginCmd(_) | OpCode::BodyMark | OpCode::NextMark
+            | OpCode::BeginCmd(_) | OpCode::BeginCmdSubMark(_) | OpCode::ExprMarkBeginCmd(_)
+            | OpCode::BeginCmdPushConst(_, _)
+            | OpCode::SubEndStoreLocalPop(_) | OpCode::SubEndStoreVarPop(_) | OpCode::SubEndReturn
+            | OpCode::SwapToNextMark | OpCode::NextMarkBeginCmd(_)
+            | OpCode::BeginCmdIncrLocalPop(_, _, _) | OpCode::BeginCmdIncrVarPop(_, _, _)
+            | OpCode::ForeachNextClose(_, _)
+            | OpCode::BodyMark | OpCode::NextMark
             | OpCode::SubMark | OpCode::SubEnd | OpCode::ExprMark
             | OpCode::Call { .. } | OpCode::CallExpand { .. }
             | OpCode::DynCall { .. } | OpCode::DynCallExpand { .. }
@@ -1261,7 +1267,10 @@ mod tests {
         // Body is compiled inline — the statement `incr x` fuses to
         // IncrVarPop; the condition's `LoadVar + PushInt + Lt + JumpFalse`
         // chain fuses to a comparison branch (`CmpVarImmJumpFalse`).
-        assert!(ops.iter().any(|o| matches!(o, OpCode::IncrVarPop(_, 1))));
+        assert!(ops.iter().any(|o| matches!(
+            o,
+            OpCode::IncrVarPop(_, 1) | OpCode::BeginCmdIncrVarPop(_, _, 1)
+        )));
         assert!(ops.iter().any(|o| matches!(o, OpCode::CmpVarImmJumpFalse(..))));
         // Should NOT have EvalExpr (expression was compiled inline)
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
@@ -1278,8 +1287,14 @@ mod tests {
         let ops = bc.ops();
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopEnter { .. })));
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopExit)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::NextMark)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::IncrVarPop(_, 1))));
+        assert!(ops.iter().any(|o| matches!(
+            o,
+            OpCode::NextMark | OpCode::SwapToNextMark | OpCode::NextMarkBeginCmd(_)
+        )));
+        assert!(ops.iter().any(|o| matches!(
+            o,
+            OpCode::IncrVarPop(_, 1) | OpCode::BeginCmdIncrVarPop(_, _, 1)
+        )));
         // Condition compiled inline — no EvalExpr fallback.
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::DynCall { .. })));
@@ -1524,8 +1539,12 @@ mod tests {
         let src = "set s [expr {6 * 7}]";
         let bc = Compiler::compile_script(src).unwrap();
         let ops = bc.ops();
-        assert!(ops.iter().any(|o| matches!(o, OpCode::SubMark)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::SubEnd)));
+        // The bracket opener fuses with the site set (BeginCmdSubMark) or
+        // stays a standalone SubMark.
+        assert!(ops
+            .iter()
+            .any(|o| matches!(o, OpCode::SubMark | OpCode::BeginCmdSubMark(_))));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::SubEnd | OpCode::SubEndStoreLocalPop(_) | OpCode::SubEndStoreVarPop(_) | OpCode::SubEndReturn)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalScript)));
         let expr_site = bc
             .sites
@@ -1558,7 +1577,9 @@ mod tests {
         let src = "set s [expr {[f 1] + [f 2]}]";
         let bc = Compiler::compile_script(src).unwrap();
         let ops = bc.ops();
-        assert!(ops.iter().any(|o| matches!(o, OpCode::ExprMark)));
+        assert!(ops
+            .iter()
+            .any(|o| matches!(o, OpCode::ExprMark | OpCode::ExprMarkBeginCmd(_))));
         assert!(ops.iter().any(|o| matches!(o, OpCode::Add)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalScript)));
@@ -1615,6 +1636,23 @@ mod tests {
         // The while command's own site keeps its top-level identity.
         assert_eq!(bc.sites[0].line, 1);
         assert_eq!(bc.sites[0].text.slice(&bc.source), "while {$i < 2} {\n  incr i\n}");
+    }
+}
+
+
+#[cfg(test)]
+mod dump_probe5 {
+    use crate::Compiler;
+    fn show(src: &str) {
+        let code = Compiler::compile_script(src).unwrap();
+        println!("--- {}\n{}", src, code);
+    }
+    #[test]
+    fn dump_expr_bracket_shapes() {
+        show("expr {[foo 1] + 2}");
+        show("expr {[foo [bar]] + 2}");
+        show("expr {[expr {$n - 1}] + 2}");
+        show("proc f {n} { expr {[f [expr {$n-1}]] + [f [expr {$n-2}]]} }");
     }
 }
 

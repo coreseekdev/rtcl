@@ -590,6 +590,54 @@ pub enum OpCode {
     /// per-command bookkeeping).
     BeginCmd(u32),
 
+    /// Fusion of `[BeginCmd s, SubMark]` — a command whose next word is a
+    /// `[...]` bracket: set the site, then open the bracket region
+    /// (`Region::Sub` of the just-set site).  Same steps, one dispatch.
+    BeginCmdSubMark(u32),
+
+    /// Fusion of `[ExprMark, BeginCmd s]` — an expression operand's owner
+    /// region opens, then the operand command's site is set.
+    ExprMarkBeginCmd(u32),
+
+    /// Fusion of `[BeginCmd s, PushConst i]` — the dispatch shape of every
+    /// literal-named command: set the site, push the name constant.
+    BeginCmdPushConst(u32, u16),
+
+    /// Fusion of `[SubEnd, StoreLocalPop d]` — a `set x [...]` statement's
+    /// tail: close the bracket region (restoring the owning command's
+    /// site), then move the value into the slot.
+    SubEndStoreLocalPop(u16),
+
+    /// Fusion of `[SubEnd, StoreVarPop i]` — the name-keyed twin.
+    SubEndStoreVarPop(u16),
+
+    /// Fusion of `[SubEnd, Return]` — `return [...]`: close the bracket
+    /// region, then return the value.
+    SubEndReturn,
+
+    /// Fusion of `[Jump(t), NextMark]` (only emitted when `t` is the mark
+    /// itself — a region-closing trampoline): close the body region
+    /// (restoring the construct's site), then open the next-script region
+    /// of that site.  The jump's backward-step charge never applies to
+    /// this shape (its target is one past the jump).
+    SwapToNextMark,
+
+    /// Fusion of `[NextMark, BeginCmd s]` — the `for` next-script's
+    /// region open plus its first command's site.
+    NextMarkBeginCmd(u32),
+
+    /// Fusion of `[BeginCmd s, IncrLocalPop x k]` — the `for` next-script
+    /// `incr` statement in one dispatch.
+    BeginCmdIncrLocalPop(u32, u16, i64),
+
+    /// Fusion of `[BeginCmd s, IncrVarPop i k]` — the name-keyed twin.
+    BeginCmdIncrVarPop(u32, u16, i64),
+
+    /// Fusion of `[Jump(t), ForeachNext { info, body }]` (only when `t`
+    /// is the ForeachNext itself — the iteration loop's region-closing
+    /// trampoline): close the body region, then advance the iterator
+    /// (binding the next values) and jump back to the body.
+    ForeachNextClose(u32, u32),
     /// Enters an inline body reached by a *taken* jump (an `if`'s else
     /// body).  Every other inline body is entered by a not-taken
     /// `JumpFalse`/`JumpTrue`, which the executor uses to track which
@@ -803,6 +851,27 @@ impl fmt::Display for OpCode {
             // Debug
             OpCode::Line(n) => write!(f, "LINE {}", n),
             OpCode::BeginCmd(site) => write!(f, "BEGIN_CMD {}", site),
+            OpCode::BeginCmdSubMark(site) => write!(f, "BEGIN_CMD_SUB {}", site),
+            OpCode::ExprMarkBeginCmd(site) => write!(f, "EXPR_MARK_BEGIN {}", site),
+            OpCode::BeginCmdPushConst(site, idx) => {
+                write!(f, "BEGIN_CMD_PUSH_CONST {} {}", site, idx)
+            }
+            OpCode::SubEndStoreLocalPop(slot) => {
+                write!(f, "SUB_END_STORE_L_POP {}", slot)
+            }
+            OpCode::SubEndStoreVarPop(idx) => write!(f, "SUB_END_STORE_V_POP {}", idx),
+            OpCode::SubEndReturn => write!(f, "SUB_END_RETURN"),
+            OpCode::SwapToNextMark => write!(f, "SWAP_TO_NEXT_MARK"),
+            OpCode::NextMarkBeginCmd(site) => write!(f, "NEXT_MARK_BEGIN_CMD {}", site),
+            OpCode::BeginCmdIncrLocalPop(site, slot, n) => {
+                write!(f, "BEGIN_CMD_INCR_L_POP {} {} {}", site, slot, n)
+            }
+            OpCode::BeginCmdIncrVarPop(site, idx, n) => {
+                write!(f, "BEGIN_CMD_INCR_V_POP {} {} {}", site, idx, n)
+            }
+            OpCode::ForeachNextClose(info, body) => {
+                write!(f, "FOREACH_NEXT_CLOSE {} -> {}", info, body)
+            }
             OpCode::BodyMark => write!(f, "BODY_MARK"),
             OpCode::NextMark => write!(f, "NEXT_MARK"),
             OpCode::SubMark => write!(f, "SUB_MARK"),

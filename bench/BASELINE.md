@@ -1512,6 +1512,15 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round AC — 4/5 号研究与设计（2026-10-18，不动物码）
+
+- 4 号（call_proc 帧准备）：查台账无近期 fib 画像可直接引用（F1 为 10-04
+  旧案）；审读 call.rs 后判定现候选逐项 <1%，**必须先画像**再动。可执行
+  配方（含 debug 构建、perf record、perf script 自聚合）已写入 TODO。
+- 5 号（Value 句柄共享）：设计稿 `docs/DESIGN-value-handles.md` 落盘——
+  S1 名字构造点显式共享（低风险，先做）/ S2 短串线程本地驻留（需 micro
+  证明数据串无回退）/ S3 表示层统一（暂不计划）；红线与 JIT 契约写明。
+
 ## Round AB — my 派发快径实验（2026-10-18，结论：回退）
 
 对 `cmd_oo_my` 复用派发缓存（第 2 槽）+ `frame_in_object_ns` 免 `format!`：

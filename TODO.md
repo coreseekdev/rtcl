@@ -206,11 +206,20 @@
    **低优先级**（板面不覆盖 `my`）。
 
 **待做（按序）**
-4. ⏳ call_proc 帧准备（fib 2-3%）：先按既有 perf 画像方法定位（call.rs 逐段），
-   候选：level0 填充（每参一次 clone+push）、slot_mode 门禁的 resize、
-   ns_of_qualified、pool 收发。需先画像再动。
-5. ⏳ `Value` 字符串句柄共享（最深）：为派发名/变量名的 ptr 比较提供全局前提；
-   与 3 号配合才有复利。设计先行，勿裸改 ValueInterner。
+4. ⏳ call_proc 帧准备（fib 2-3%）：**先画像再动**。可执行配方：
+   `CARGO_TARGET_DIR=/tmp/opencode/rtcl-prof CARGO_PROFILE_RELEASE_STRIP=false     CARGO_PROFILE_RELEASE_DEBUG=1 RUSTFLAGS="-C force-frame-pointers=yes"     cargo build --release -p rtcl-cli` → `setarch $(uname -m) -R perf record     -F 8000 -g ./target/release/rtcl -f bench/scripts/fib25.tcl` →
+    `perf script` 导出后 python 自聚合（本机 `perf report` 会超时）。
+   已审读 call.rs 的候选（逐项都 <1%，需画像确认可叠加值 ≥2% 的组合）：
+   level0 每参 clone+push（~20 instr/调用）、slot_mode 门禁的
+   `Rc::clone(code)`+`slots.resize`、`ns_of_qualified`+两次 ns Rc clone、
+   帧池收发与 11 项字段 clear、返回值/`call_depth` 管道。
+   注意红线：`info level 0` 的语义是「调用时刻的词快照」，level0 惰性化
+   不可行（args 切片不驻帧；且调用后无法重建）——除非能证明全局无读者。
+5. ⏳ `Value` 字符串句柄共享（最深）：**设计稿已落盘** `docs/DESIGN-value-handles.md`
+   （S1 名字构造点显式共享 → S2 短串线程本地驻留 → S3 表示层统一；
+   红线=单向 identity 推理/Weak 不泄漏/不驻留数据串/可关）。S1 与 3 号缓存
+   的复利点：`my`/`$o $m` 计算名也能 identity 命中（Round AB 冲刷问题的解）。
+   动码前先建 `dispatch_dynamic.tcl` 微基准。
 
 **其余候选**：`call_proc` 帧准备之外的四板点（fib 0.85x / fe 0.92x / dloop 0.68x /
 build 0.72x）已在上一节定界；micro_add 0.89x、micro_lappend 0.72x（已 <1x）。

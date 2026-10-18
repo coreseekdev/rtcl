@@ -1641,19 +1641,4 @@ mod tests {
 }
 
 
-#[cfg(test)]
-mod dump_probe5 {
-    use crate::Compiler;
-    fn show(src: &str) {
-        let code = Compiler::compile_script(src).unwrap();
-        println!("--- {}\n{}", src, code);
-    }
-    #[test]
-    fn dump_expr_bracket_shapes() {
-        show("expr {[foo 1] + 2}");
-        show("expr {[foo [bar]] + 2}");
-        show("expr {[expr {$n - 1}] + 2}");
-        show("proc f {n} { expr {[f [expr {$n-1}]] + [f [expr {$n-2}]]} }");
-    }
-}
 

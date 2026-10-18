@@ -3248,12 +3248,3 @@ p 1";
 
 
 
-#[cfg(test)]
-mod dump_probe9 {
-    #[test]
-    fn dump_p_h() {
-        let body = "set sum 0\nforeach i $L { set sum [expr {$sum + $i}] }\nreturn $sum";
-        let code = super::compile_proc_body(&[("L".to_string(), None)], body, 0).unwrap();
-        println!("{}", code);
-    }
-}

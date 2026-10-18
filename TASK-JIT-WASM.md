@@ -2,10 +2,21 @@
 
 > **用途**：把「Tcl → WASM 编译/JIT」任务完整委托给一个新 agent。
 > 本文件自足：读完本文件 + 指定资料即可开工，无需对话历史。
-> **状态**：设计已定稿（`docs/JIT-WASM-GC.md`），JIT 实现处于暂停
-> （HANDOFF.md §5 裁决：先榨干解释器架构）。本包是重启施工图；
-> 若本包被发出，即视为裁决已解除暂停。
-> 创建：2026-10-17。
+> **状态**：设计已定稿（`docs/JIT-WASM-GC.md`）。**M1' 已完成、M2 已落半**
+> （原语/foreach/lmap 内联 8e1034d + 真实接受路径修复 f25d234；judge 三向
+> 87/87 双引擎）。解释器性能两批（PR #1/#2，2026-10-18/19 合并）已榨干，
+> 施工恢复。**剩余 = M2 后半（proc body + slot 单态 int 缓存）与 M3（epoch
+> 接 Tier1 bump）**——两者的协调者侧接口改动在 `jit/proc-body-epoch` 分支
+> 处理。创建：2026-10-17；本段更新：2026-10-19。
+>
+> **地壳变动（2026-10-18 起，重启前必读）**：
+> - crate 布局：解释器已整体迁入 **rtcl-vm**（rtcl-vm 即 VM），rtcl-core
+>   退为 facade——本文件旧锚点中的 `rtcl-core/src/interp/**` 一律读作
+>   `rtcl-vm/src/interp/**`；演示 VM `rtcl-vm/src/execute.rs` 已删除。
+> - 解释器新增融合超指令族（G/M/U 轮）；JIT 编译边界统一经
+>   `ByteCode::unfused()` 取规范窗口——**接受集零改动**，契约与逐 op 表
+>   见 `docs/JIT-OPCODE-DELTA.md`（含 Round U 增补）。
+> - judge 语料现为 **88 文件**（新增 `judge/corpus/oo_instance_vars.tcl`）。
 
 ## 0. 一分钟定位
 
@@ -32,7 +43,7 @@
    - `crates/rtcl-ir/src/{opcode.rs,bytecode.rs}` —— JIT 的输入 IR
    - `crates/rtcl-vm/src/value.rs:317-524` —— Value = tagged u64 /
      ValueInner / RC / freelist（ABI 设计的物理基础）
-   - `crates/rtcl-core/src/interp/vm_exec.rs` —— ByteCode 的第一消费者，
+   - `crates/rtcl-vm/src/interp/vm_exec.rs` —— ByteCode 的第一消费者，
      逐 op 语义参照物（改语义必须与之逐字节对齐）
    - `crates/rtcl-parser/src/compiler.rs` —— ByteCode 产出端
 5. 语义门禁语料（本任务的「考卷」）：
@@ -98,8 +109,8 @@ C-float / C-str / C-lazy 见设计文档 §5/§6/§9。
 2. **不引入新依赖**（rtcl 是嵌入式定位）。wasm-encoder/js-sys/wasmi/
    wasmtime 已批，其余先问。
 3. **不顺手重构解释器**；不改 ByteCode 语义——如确需改，必须同步
-   `rtcl-core/src/interp/vm_exec.rs`（活路径）与
-   `crates/rtcl-vm/src/execute.rs`（休眠参照），并在回报中显式声明。
+   `rtcl-vm/src/interp/vm_exec.rs`（活路径；原演示 VM `execute.rs` 已
+   删除，无第二参照），并在回报中显式声明。
 4. **帧共享纪律**：守卫失败只发生在 op 边界；值在宿主 arena、变量在
    宿主 frame；**永不把未物化的 JIT 私有状态带出 guard 点**（设计文档
    §7.9 模式 3）。

@@ -145,12 +145,15 @@ pub(crate) fn split_var_tail(name: &str) -> &str {
 /// memoised in `var_link_cache` — shared by `cmd_variable` and the OO
 /// method prelink (which installs the same link without dispatching the
 /// command per call).
-pub(crate) fn resolve_var_link(interp: &mut Interp, ns: &str, raw_name: &str) -> (String, String) {
+pub(crate) fn resolve_var_link(interp: &mut Interp, ns: &str, raw_name: &str) -> (Rc<str>, Rc<str>) {
     const VAR_LINK_CACHE_MAX: usize = 1024;
     {
         let memo = interp.var_link_cache.get(ns);
         if let Some((q, np)) = memo.and_then(|inner| inner.get(raw_name)) {
-            return (q.clone(), np.clone());
+            // `Rc`-valued memo: a hit is two refcount bumps, no text
+            // copies — the prelink loop runs this for every link name of
+            // every method call.
+            return (Rc::clone(q), Rc::clone(np));
         }
     }
     let qualified = if raw_name.is_empty() {
@@ -176,12 +179,14 @@ pub(crate) fn resolve_var_link(interp: &mut Interp, ns: &str, raw_name: &str) ->
     if interp.var_link_cache.len() >= VAR_LINK_CACHE_MAX {
         interp.var_link_cache.clear();
     }
+    let qrc: Rc<str> = Rc::from(qualified.as_str());
+    let nprc: Rc<str> = Rc::from(ns_part.as_str());
     interp
         .var_link_cache
         .entry(ns.to_string())
         .or_default()
-        .insert(raw_name.to_string(), (qualified.clone(), ns_part.clone()));
-    (qualified, ns_part)
+        .insert(raw_name.to_string(), (Rc::clone(&qrc), Rc::clone(&nprc)));
+    (qrc, nprc)
 }
 
 pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -205,7 +210,7 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // OO method-call bench).  The live checks below (parent exists,
         // variable-set insert, upvar link) stay per-call.
         let (qualified, ns_part) = resolve_var_link(interp, ns.as_ref(), raw_name);
-        if ns_part != "::" && !interp.namespaces.contains_key(&ns_part) {
+        if &*ns_part != "::" && !interp.namespaces.contains_key(&*ns_part) {
             crate::interp::commands::list::set_error_code(
                 interp,
                 &format!("TCL LOOKUP VARNAME {}", raw_name),
@@ -224,7 +229,7 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // `namespace eval n {variable v}; info exists n::v` → 0).
         let init_value = if i + 1 < args.len() {
             let val = args[i + 1].clone();
-            interp.globals.insert(qualified.clone(), val);
+            interp.globals.insert(qualified.to_string(), val);
             i += 2;
             Some(args[i - 1].clone())
         } else {
@@ -233,8 +238,8 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         };
 
         // Register the name in the OWNING namespace's variable table.
-        if let Some(info) = interp.namespaces.get_mut(&ns_part) {
-            info.variables.insert(qualified.clone());
+        if let Some(info) = interp.namespaces.get_mut(&*ns_part) {
+            info.variables.insert(qualified.to_string());
         }
 
         // If we're inside a proc, create an upvar link from the local
@@ -255,13 +260,13 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     .iter_mut()
                     .find(|(k, _)| *k == raw_name);
                 match existing {
-                    Some((_, t)) => *t = qualified.clone(),
+                    Some((_, t)) => *t = qualified.to_string(),
                     None => interp
                         .flat_aliases
-                        .push((raw_name.to_string(), qualified.clone())),
+                        .push((raw_name.to_string(), qualified.to_string())),
                 }
-                if !interp.ns_variable_links.iter().any(|x| x == &qualified) {
-                    interp.ns_variable_links.push(qualified.clone());
+                if !interp.ns_variable_links.iter().any(|x| x.as_str() == &*qualified) {
+                    interp.ns_variable_links.push(qualified.to_string());
                 }
             }
         } else {
@@ -270,11 +275,11 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // The alias name leaves the slot model (links and slot cells
             // don't alias) — link-only aliasing keeps the frame's other
             // slots on their compiled fast path.
-            let vlink = crate::interp::UpvarLink::Global(qualified.clone());
+            let vlink = crate::interp::UpvarLink::Global(Rc::clone(&qualified));
             interp.degrade_frame_link(frame_idx, &local_name, &vlink);
             interp.frames[frame_idx].upvars.insert(
-                local_name.clone(),
-                crate::interp::UpvarLink::Global(qualified.clone()),
+                Rc::from(local_name.as_str()),
+                crate::interp::UpvarLink::Global(Rc::clone(&qualified)),
             );
             // The alias name is in the proc's variable table (tclsh's
             // `info vars` lists linked variables — var-7.12's `{{}}`,
@@ -284,7 +289,7 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // stays invisible (tclsh: `info exists` → 0).
             let seeded = match &init_value {
                 Some(val) => Some(val.clone()),
-                None => interp.globals.get(&qualified).cloned(),
+                None => interp.globals.get(&*qualified).cloned(),
             };
             if let Some(val) = seeded {
                 interp.frames[frame_idx].locals.insert(local_name, val);
@@ -1085,7 +1090,7 @@ fn ns_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let frame_idx = interp.frames.len() - 1;
             interp.frames[frame_idx]
                 .upvars
-                .insert(my.to_string(), crate::interp::UpvarLink::Global(target));
+                .insert(Rc::from(my), crate::interp::UpvarLink::Global(Rc::from(target)));
         }
         i += 2;
     }

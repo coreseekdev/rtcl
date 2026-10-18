@@ -68,8 +68,11 @@ pub(crate) struct ProcDef {
 /// A link from a local variable name to a variable in another scope.
 #[derive(Debug, Clone)]
 pub(crate) enum UpvarLink {
-    /// Link to `globals[name]`.
-    Global(String),
+    /// Link to `globals[name]`.  `Rc<str>`: the canonical key is memoised
+    /// in `var_link_cache` and handed to the frame's upvar map, slot
+    /// `link_keys` and `globals` probes by refcount — a `variable` link
+    /// installed on every method call allocated four strings here.
+    Global(Rc<str>),
     /// Link to `frames[frame_index].locals[name]`.
     Frame { frame_index: usize, var_name: String },
     /// The link's target was destroyed by a `namespace delete` (or the
@@ -78,6 +81,14 @@ pub(crate) enum UpvarLink {
     /// (tclsh 8.6.17).  `array` distinguishes the two error messages.
     Dead { array: bool, target: String },
 }
+
+/// Frame upvar links.  `Rc<str>` keys: a prelinked method's link names
+/// are memoised (`ProcMemo`) and re-inserted on every call, so the key is
+/// a refcount bump rather than a fresh `String`.
+#[cfg(not(feature = "embedded"))]
+pub(crate) type UpvarMap = varmap::FxHashedMap<Rc<str>, UpvarLink>;
+#[cfg(feature = "embedded")]
+pub(crate) type UpvarMap = alloc::collections::BTreeMap<Rc<str>, UpvarLink>;
 
 /// A live `namespace ensemble` — the ensemble command's dispatch table
 /// (tclsh 8.6.17).  Keyed in `Interp::ensembles` by the ensemble's
@@ -144,7 +155,7 @@ pub(crate) struct CallFrame {
     pub locals: VarMap<Value>,
     /// Names in `locals` that are arrays (scalar/array distinction).
     pub array_locals: VarSet,
-    pub upvars: VarMap<UpvarLink>,
+    pub upvars: UpvarMap,
     /// Namespace the running proc was defined in (tclsh: `namespace current`
     /// inside the proc resolves here).  Variable *reads* do NOT fall back to
     /// this namespace — only locals, upvar/`variable` links, and `::`-qualified
@@ -465,7 +476,7 @@ pub struct Interp {
     /// owning namespace's variable-set insert, the per-frame upvar link)
     /// stay per-call.  No invalidation is needed; bounded like the other
     /// caches (wasm32 is a target).
-    pub(crate) var_link_cache: VarMap<VarMap<(String, String)>>,
+    pub(crate) var_link_cache: VarMap<VarMap<(Rc<str>, Rc<str>)>>,
     /// Command-table generation: bumped at every command-table mutation.
     pub(crate) cmd_generation: u64,
     /// Parse-tree cache: script text → AST (with the source text the
@@ -741,7 +752,7 @@ pub struct Interp {
     /// per call.  Prefix errors are unreachable: declaration names are
     /// validated by the `variable` define word and object namespaces
     /// always exist.
-    pub(crate) frame_prelink: Option<Vec<String>>,
+    pub(crate) frame_prelink: Option<Rc<Vec<Rc<str>>>>,
     /// One-shot level-0 word override for the next `call_proc` frame
     /// (`apply` renders `info level 0` as `apply {<term>} <args...>`,
     /// which the plain arg-list form can't express).

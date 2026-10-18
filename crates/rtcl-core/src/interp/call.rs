@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use super::{CallFrame, Interp, ProcDef, VarMap, VarSet};
+use super::{CallFrame, Interp, ProcDef, UpvarMap, VarMap, VarSet};
 use super::util::rfind_ns_sep;
 use crate::error::{Error, Result};
 use crate::value::Value;
@@ -23,7 +23,7 @@ impl Interp {
     ///
     /// `ns_override` pins the frame's namespace for `apply {p b ::ns}`
     /// (the lambda runs in `::ns` regardless of its synthetic name).
-    pub(crate) fn call_proc(&mut self, proc_def: &ProcDef, args: &[Value], proc_name: &str, ns_override: Option<String>) -> Result<Value> {
+    pub(crate) fn call_proc(&mut self, proc_def: &ProcDef, args: &[Value], proc_name: &str, ns_override: Option<Rc<str>>) -> Result<Value> {
         if self.call_depth > self.max_call_depth {
             return Err(Error::runtime(
                 "maximum recursion depth exceeded",
@@ -101,7 +101,7 @@ impl Interp {
             None => Box::new(CallFrame {
                 locals: VarMap::default(),
                 array_locals: VarSet::default(),
-                upvars: VarMap::default(),
+                upvars: UpvarMap::default(),
                 ns: None,
                 call_ns: None,
                 local_procs: Vec::new(),
@@ -177,7 +177,6 @@ impl Interp {
             {
                 let def_ns = ns_override
                     .take()
-                    .map(Rc::from)
                     .unwrap_or_else(|| ns_of_qualified(self, &current_proc_name));
                 self.current_namespace = Rc::clone(&def_ns);
                 let frame = self.frames.last_mut().unwrap();
@@ -323,7 +322,7 @@ impl Interp {
             // lifecycle.
             if !prelink_done {
                 prelink_done = true;
-                let links: &[String] = prelink.as_deref().unwrap_or(&[]);
+                let links: &[Rc<str>] = prelink.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
                 let frame_idx = self.frames.len() - 1;
                 let ns = self.current_namespace.clone();
                 for name in links.iter() {
@@ -334,22 +333,26 @@ impl Interp {
                     );
                     // The definition namespace always exists (the object
                     // created it), so the parent-exists check the
-                    // `variable` command performs cannot fail here.
-                    if let Some(info) = self.namespaces.get_mut(&ns_part) {
-                        info.variables.insert(qualified.clone());
+                    // `variable` command performs cannot fail here.  The
+                    // name is registered once — a re-declaration on every
+                    // call finds it present and allocates nothing.
+                    if let Some(info) = self.namespaces.get_mut(&*ns_part) {
+                        if !info.variables.contains(&*qualified) {
+                            info.variables.insert(qualified.to_string());
+                        }
                     }
                     // The alias name leaves the slot model (link-only
                     // aliasing — the frame's other slots stay fast).
-                    let glink = crate::interp::UpvarLink::Global(qualified.clone());
+                    let glink = crate::interp::UpvarLink::Global(Rc::clone(&qualified));
                     self.degrade_frame_link(frame_idx, name, &glink);
                     self.frames[frame_idx].upvars.insert(
-                        name.clone(),
-                        crate::interp::UpvarLink::Global(qualified.clone()),
+                        Rc::clone(name),
+                        crate::interp::UpvarLink::Global(Rc::clone(&qualified)),
                     );
                     // Seed a local copy when the namespace variable
                     // already holds a value (var-7.12's family).
-                    if let Some(v) = self.globals.get(&qualified).cloned() {
-                        self.frames[frame_idx].locals.insert(name.clone(), v);
+                    if let Some(v) = self.globals.get(&*qualified).cloned() {
+                        self.frames[frame_idx].locals.insert(name.to_string(), v);
                     }
                 }
             }

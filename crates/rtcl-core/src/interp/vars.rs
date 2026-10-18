@@ -5,7 +5,7 @@
 //! locals (or follow upvar links to globals / other frames).
 
 use super::util::{has_ns_sep, split_array_ref};
-use super::{Interp, UpvarLink};
+use super::{Interp, Rc, UpvarLink};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
 
@@ -253,9 +253,8 @@ impl Interp {
             f.link_keys.resize(f.slots.len(), None);
         }
         f.link_keys[i] = match link {
-            crate::interp::UpvarLink::Global(g) => {
-                Some(std::rc::Rc::from(g.as_str()))
-            }
+            // The cached `Rc<str>` target, by refcount.
+            crate::interp::UpvarLink::Global(g) => Some(std::rc::Rc::clone(g)),
             _ => None,
         };
     }
@@ -316,7 +315,7 @@ impl Interp {
             if let Some(link) = frame.upvars.get(name) {
                 return match link {
                     UpvarLink::Global(gname) => {
-                        VarLoc::Global(self.redirect_flat(gname.clone()))
+                        VarLoc::Global(self.redirect_flat(gname.to_string()))
                     }
                     UpvarLink::Frame { frame_index, var_name } => {
                         VarLoc::Frame(*frame_index, var_name.clone())
@@ -571,7 +570,7 @@ impl Interp {
                     // `namespace delete [namespace current]`).
                     UpvarLink::Global(gname) => self
                         .globals
-                        .get(self.redirect_flat(gname.clone()).as_str())
+                        .get(self.redirect_flat(gname.to_string()).as_str())
                         .or_else(|| frame.locals.get(name)),
                     UpvarLink::Frame { frame_index, var_name } => {
                         // Link installation degrades the target frame, so
@@ -646,7 +645,7 @@ impl Interp {
                     // probe in place first (one hash, no key churn) — the
                     // unconditional insert dropped and re-stored the key
                     // String per write.
-                    let key = self.redirect_flat(gname);
+                    let key = self.redirect_flat(gname.to_string());
                     if let Some(slot) = self.globals.get_mut(&key) {
                         *slot = value;
                     } else {
@@ -717,10 +716,10 @@ impl Interp {
                         let flat = self
                             .flat_aliases
                             .iter()
-                            .find(|(k, _)| k == g)
+                            .find(|(k, _)| k.as_str() == &**g)
                             .map(|(_, t)| t.as_str())
-                            .unwrap_or(g);
-                        (flat == key).then(|| n.clone())
+                            .unwrap_or(&**g);
+                        (flat == key).then(|| n.to_string())
                     }
                     _ => None,
                 })
@@ -754,7 +753,7 @@ impl Interp {
         if let Some(link) = self.frames[frame_idx].upvars.get(name).cloned() {
             match link {
                 UpvarLink::Global(gname) => {
-                    let gname = self.redirect_flat(gname);
+                    let gname = self.redirect_flat(gname.to_string());
                     self.globals.remove(gname.as_str());
                 }
                 UpvarLink::Frame { frame_index, var_name } => {
@@ -1132,7 +1131,7 @@ impl Interp {
         //     Unlinked proc locals were handled by take_var_fast.
         if let Some(frame) = self.frames.last() {
             let target = match frame.upvars.get(name) {
-                Some(UpvarLink::Global(g)) => g.clone(),
+                Some(UpvarLink::Global(g)) => g.to_string(),
                 _ => return None,
             };
             // The link target is the owning namespace's qualified name;
@@ -1414,12 +1413,12 @@ impl Interp {
                     .flat_aliases
                     .iter()
                     .find(|(k, _)| *k == base)
-                    .map(|(_, t)| UpvarLink::Global(t.clone())),
+                    .map(|(_, t)| UpvarLink::Global(Rc::from(t.as_str()))),
             };
             match next {
                 Some(UpvarLink::Global(g)) => {
                     scope = None;
-                    base = g;
+                    base = g.to_string();
                 }
                 Some(UpvarLink::Frame {
                     frame_index,
@@ -1583,7 +1582,7 @@ impl Interp {
                     UpvarLink::Global(g) if scope_idx.is_none() && g.starts_with(&elem_prefix) => {
                         *link = UpvarLink::Dead {
                             array: true,
-                            target: g.clone(),
+                            target: g.to_string(),
                         };
                     }
                     _ => {}
@@ -1614,7 +1613,7 @@ impl Interp {
                     if g.starts_with(var_prefix) {
                         *link = UpvarLink::Dead {
                             array: false,
-                            target: g.clone(),
+                            target: g.to_string(),
                         };
                     }
                 }

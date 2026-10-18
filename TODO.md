@@ -54,6 +54,10 @@
      去 KeyMemo/ChainMemo 的每调用哈希+memcmp（≈4-6%，改动大）。
   4. `head_cache` 的 typed 比较 → 与调用站点共享 `Rc<str>` 身份（需
      `Value` 字符串 rep 可暴露 Rc，或站点级持有）。
+- [x] **站点惰性化（Round W，审计后关闭）**：读取点审计 8 处（foreach
+  形状门/控制构造行基/namespace 辅助/tree-walk 词读）→ 收益 15-20
+  instr/命令 vs 引入 (unit,site) 惰性解析 + 错误路径双模型 → 不做。
+  结论见 BASELINE「Round W」。
 - [ ] **下一批（按预期收益，Round L+ 候选）**：
   1. `BEGIN_CMD` 的 `word_srcs` 借用化：`cur_cmd_word_srcs` 改 `(*const
      SrcSpan, len)` 新type（site/单元生命周期内有效；save/restore 只拷指针），

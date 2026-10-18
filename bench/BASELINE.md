@@ -1512,6 +1512,24 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## 审计记录 — 站点惰性化（Round W，结论：不做）
+
+想要「`BEGIN_CMD` 只写 `cur_site`，文本/行/word_srcs 延迟到错误路径解析」。
+先做读取点审计（`cur_cmd_text/cur_cmd_line/cur_cmd_word_srcs/line_offset`）：
+
+| 读者 | 何时运行 | 惰性化影响 |
+|---|---|---|
+| vm_exec 错误处理 + unwind_subs + 各 Region 臂 | 编译单元出错 | 可从 `code.sites[st.cur_site]` 直接解析 ✓（本可行） |
+| `loops.rs:295` foreach/lmap 内联形状门 | 编译单元**派发** foreach/lmap 时 | ✗ 需要 BEGIN_CMD 写的 word_srcs（派发者无 code） |
+| `control.rs:32`/`loops.rs:27,358,387`（`line_offset + cur_cmd_line`） | 派发 while/for/if 的 tree-walk 体求值 | ✗ 需要 BEGIN_CMD 的字段 |
+| `namespace.rs:336`（`cur_cmd_text.slice`） | 派发辅助命令 | ✗ 同上 |
+| `eval.rs:308/333/356`（word 读取） | tree-walk 词求值（自带 save/restore 写字段） | ○ 非 BEGIN_CMD 来源 |
+
+结论：**收益 ~15-20 instr/命令，代价是给 8 个外部读点 + 错误路径引入 (unit, site)
+惰性解析**——且 Round L 之后 `op_begin_cmd` 本就只剩「守卫 + site 查表 +
+4-5 个廉价存储」≈25 instr（word_srcs 已是 ptr+len 切片，无 Rc）。风险/收益
+不成立，**关闭该项**。
+
 ## Round V — 死推入消除 + 骨架成本归因（2026-10-18）
 
 `[PushEmpty/PushTrue/PushFalse/PushInt/PushConst(Wide), Pop]` → `Nop, Nop`

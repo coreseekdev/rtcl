@@ -39,7 +39,10 @@ impl Interp {
         // materialised into an owned vector only by a tail-call target,
         // which then serves every later iteration.
         let mut owned_args: Option<Vec<Value>> = None;
-        let mut current_statics: HashMap<String, Value> = (*proc_def.statics).clone();
+        // Static variables ride the def's shared map: the common (empty)
+        // case is one refcount bump, not a map clone per call; write-backs
+        // COW via `Rc::make_mut`.
+        let mut current_statics: Rc<HashMap<String, Value>> = Rc::clone(&proc_def.statics);
         // Borrowed until a tail-call rebind owns its target's name: plain
         // global proc calls pay no per-call String for the frame name.
         let mut current_proc_name = Cow::Borrowed(proc_name);
@@ -152,11 +155,13 @@ impl Interp {
                     let frame = self.frames.last_mut().unwrap();
                     frame.slots.clear();
                     frame.slots.resize(n, Value::unset());
+                    // The alias/`Global`-link side vectors build lazily:
+                    // `degrade_frame_link` sizes them on first use, every
+                    // reader probes with `.get(slot)` — no per-call resize
+                    // of either.
                     frame.slot_aliased.clear();
-                    frame.slot_aliased.resize(n, false);
                     frame.has_aliased = false;
                     frame.link_keys.clear();
-                    frame.link_keys.resize(n, None);
                     frame.slot_table = Some(table);
                     true
                 }
@@ -358,7 +363,7 @@ impl Interp {
             }
 
             // ── Inject static variables into the frame ─────────────
-            for (sname, sval) in &current_statics {
+            for (sname, sval) in current_statics.iter() {
                 self.frames.last_mut().unwrap().locals.insert(sname.clone(), sval.clone());
             }
 
@@ -420,19 +425,19 @@ impl Interp {
                             let snames: Vec<String> = current_statics.keys().cloned().collect();
                             for sname in &snames {
                                 if let Some(val) = frame.locals.get(sname) {
-                                    current_statics.insert(sname.clone(), val.clone());
+                                    Rc::make_mut(&mut current_statics).insert(sname.clone(), val.clone());
                                 }
                             }
                         }
                         if let Some(pdef) = self.procs.get_mut(current_proc_name.as_ref()) {
-                            Rc::make_mut(pdef).statics = Rc::new(current_statics.clone());
+                            Rc::make_mut(pdef).statics = Rc::clone(&current_statics);
                             // The map entry was replaced: age every
                             // call-site token / resolution-cache entry
                             // holding a def clone.  Statics-bearing procs
                             // are never hot-loop material — one u64 bump.
                             self.note_cmd_mutation();
                         }
-                        current_statics = HashMap::new();
+                        current_statics = Rc::new(HashMap::new());
                     }
                     let tc_args = match self.frames.last_mut().unwrap().tailcall.take() {
                         Some(a) => a,
@@ -449,7 +454,7 @@ impl Interp {
                         current_params = Rc::clone(&new_proc.params);
                         current_body = Rc::clone(&new_proc.body);
                         current_compiled = new_proc.compiled.clone();
-                        current_statics = (*new_proc.statics).clone();
+                        current_statics = Rc::clone(&new_proc.statics);
                         current_proc_name = Cow::Owned(cmd_name.clone());
                         owned_args = Some(tc_args.into_iter().map(|s| Value::from_str(&s)).collect());
                         // The reused frame's enterstep context now names the
@@ -515,14 +520,14 @@ impl Interp {
         // Write back static variables to the proc definition
         if !current_statics.is_empty() {
             if let Some(frame) = self.frames.last() {
-                let mut updated = current_statics;
+                let mut updated = Rc::clone(&current_statics);
                 for sname in updated.keys().cloned().collect::<Vec<_>>() {
                     if let Some(val) = frame.locals.get(&sname) {
-                        updated.insert(sname, val.clone());
+                        Rc::make_mut(&mut updated).insert(sname, val.clone());
                     }
                 }
                 if let Some(pdef) = self.procs.get_mut(current_proc_name.as_ref()) {
-                    Rc::make_mut(pdef).statics = Rc::new(updated);
+                    Rc::make_mut(pdef).statics = updated;
                     // See the tail-call write-back: the entry was
                     // replaced, so cached def handles must age out.
                     self.note_cmd_mutation();

@@ -1527,6 +1527,23 @@ op_ne` 改为其薄包装，语义单一来源）；融合分支 op（`CmpSlot*/
 （起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
 build 1.29。）
 
+## Round N — 调用路径去分配（2026-10-18，继续）
+
+- `current_statics` 从 `HashMap` clone/调用 → `Rc<HashMap>`（默认零成本，
+  写回 COW）；`slot_aliased`/`link_keys` 侧向量懒化（`degrade_frame_link`
+  按需扩容，读者全走 `.get`）——每调用去一次 map clone 与两次 resize。
+- 实验记录（已回退）：int 原位快车道（`slot_int`）——fib −7M 但 fe/oovars
+  +20M（热径 match/布局敏感，净负）；结论：此代码库上小改热径臂会牵动
+  LLVM 布局，收益需按全板验证。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| M 后 | 0.90x | 0.93x | 0.68x | 0.51x | 0.70x | 0.73x |
+| N（本提交） | **0.85x** | 0.93x | 0.68x | **0.49x** | 0.70x | 0.73x |
+
+（起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
+build 1.29。）
+
 ## Round M — fib 参数括号窗口族（2026-10-18，继续）
 
 fib 每次递归调用 26 op：新增 8 个窗口 op 折叠参数括号族——

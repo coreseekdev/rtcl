@@ -354,7 +354,7 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
     );
     let saved_line = std::mem::replace(&mut interp.cur_cmd_line, 0);
     let saved_srcs =
-        std::mem::replace(&mut interp.cur_cmd_word_srcs, Rc::clone(&interp.word_srcs_nil));
+        std::mem::replace(&mut interp.cur_cmd_word_srcs, super::util::WordSrcs::empty());
     // The unit "acts at" this offset: nested evals (EvalScript →
     // `Interp::eval`) must see the same base the tree-walk would have
     // left installed (e.g. a `while` body rebased by cmd_while).
@@ -1839,7 +1839,7 @@ fn op_begin_cmd(
     let site = &code.sites[site_idx as usize];
     interp.cur_cmd_text = site.text;
     interp.cur_cmd_line = site.line_rel as usize;
-    interp.cur_cmd_word_srcs = Rc::clone(&site.word_srcs);
+    interp.cur_cmd_word_srcs = super::util::WordSrcs::from_rc(&site.word_srcs);
     interp.line_offset = st.entry_offset + site.line_delta as usize;
     st.cur_site = site_idx as usize;
     Ok(())

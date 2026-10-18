@@ -658,14 +658,10 @@ pub struct Interp {
     /// Raw source of each word of the command currently dispatching,
     /// aligned with its arguments — braced/quoted script words carry their
     /// delimiters, letting constructs recover their body's line offset.
-    /// Spans resolve through [`Interp::cur_source`]; `Rc` (shared with the
-    /// cached parse tree) so save/restore per dispatch is a refcount bump.
-    pub(crate) cur_cmd_word_srcs: Rc<Vec<rtcl_parser::SrcSpan>>,
-    /// Shared empty word-source vector — `exec_bytecode` swaps the
-    /// per-command word sources out for this singleton on entry (one Rc
-    /// bump; the previous code allocated a fresh `Rc<Vec<..>>` per proc
-    /// call).
-    pub(crate) word_srcs_nil: Rc<Vec<rtcl_parser::SrcSpan>>,
+    /// Spans resolve through [`Interp::cur_source`]; borrowed from the
+    /// owning unit/AST (see [`WordSrcs`]) so per-command save/restore is
+    /// a pointer copy, not a refcount bump.
+    pub(crate) cur_cmd_word_srcs: util::WordSrcs,
     /// Source text of the command currently dispatching, for constructs
     /// that need the raw invocation (`info level 0` inside
     /// `namespace eval`).  Span into [`Interp::cur_source`].
@@ -818,8 +814,7 @@ impl Interp {
             err_line: 1,
             line_offset: 0,
             cur_cmd_line: 0,
-            cur_cmd_word_srcs: Rc::new(Vec::new()),
-            word_srcs_nil: Rc::new(Vec::new()),
+            cur_cmd_word_srcs: util::WordSrcs::empty(),
             cur_cmd_text: rtcl_parser::SrcSpan { start: 0, end: 0 },
             cur_source: Rc::from(""),
             err_from_subst: false,

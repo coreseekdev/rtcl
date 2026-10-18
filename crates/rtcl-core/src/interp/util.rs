@@ -159,3 +159,58 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
 
     match_helper(&pattern, 0, &text, 0)
 }
+
+
+/// Borrowed word source spans of the command currently dispatching: a raw
+/// slice into the owning unit's/AST's `word_srcs` vector.
+///
+/// The interpreter used to hold an `Rc<Vec<SrcSpan>>` and clone it on
+/// every `BeginCmd` — refcount traffic on the hottest path in the VM even
+/// though the spans are immutable for their owner's lifetime.  Every
+/// reader (`Interp::cur_cmd_word_srcs` consumers: the word-span readers
+/// and the `foreach`/`lmap` inline-shape gate) runs while the owning
+/// unit/AST is borrowed on the stack: `exec_bytecode` holds the unit for
+/// its whole run, a tree-walk `eval_command` holds its `ScriptUnit`, and
+/// the save/restore around nested evaluation copies the pointer pair.
+///
+/// SAFETY contract: the pointer is dereferenced *only* by those readers,
+/// each of which runs inside an active command of the owning unit; the
+/// pair may outlive the owner as a stale value but must never be read
+/// then (every read site sits in an active command's evaluation).
+#[derive(Clone, Copy)]
+pub(crate) struct WordSrcs {
+    ptr: *const rtcl_parser::SrcSpan,
+    len: usize,
+}
+
+impl WordSrcs {
+    /// The empty slice (no owner) — the value every unit entry swaps in.
+    #[inline]
+    pub(crate) fn empty() -> Self {
+        Self {
+            ptr: core::ptr::NonNull::<rtcl_parser::SrcSpan>::dangling().as_ptr(),
+            len: 0,
+        }
+    }
+
+    /// Borrow `rc`'s spans; the caller guarantees `rc` outlives every
+    /// read of the result (see the type's contract).
+    #[inline]
+    pub(crate) fn from_rc(rc: &std::rc::Rc<Vec<rtcl_parser::SrcSpan>>) -> Self {
+        Self {
+            ptr: rc.as_ptr(),
+            len: rc.len(),
+        }
+    }
+}
+
+impl core::ops::Deref for WordSrcs {
+    type Target = [rtcl_parser::SrcSpan];
+    #[inline]
+    fn deref(&self) -> &[rtcl_parser::SrcSpan] {
+        if self.len == 0 {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}

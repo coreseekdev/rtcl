@@ -455,7 +455,10 @@ impl Interp {
         let saved_source = std::mem::replace(&mut self.cur_source, Rc::clone(&unit.source));
         let saved_text = std::mem::replace(&mut self.cur_cmd_text, cmd.text);
         let saved_line = std::mem::replace(&mut self.cur_cmd_line, cmd.line);
-        let saved_srcs = std::mem::replace(&mut self.cur_cmd_word_srcs, cmd.word_srcs.clone());
+        let saved_srcs = std::mem::replace(
+            &mut self.cur_cmd_word_srcs,
+            super::util::WordSrcs::from_rc(&cmd.word_srcs),
+        );
         // Execution enterstep/leavestep traces (tclsh 8.6.17): fire
         // against the enclosing traced proc, if any.  enterstep runs
         // before dispatch; leavestep after, with the completion code and

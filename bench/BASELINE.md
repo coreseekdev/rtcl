@@ -1527,6 +1527,28 @@ op_ne` 改为其薄包装，语义单一来源）；融合分支 op（`CmpSlot*/
 （起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
 build 1.29。）
 
+## Round O — OO 变量表 Rc 化（2026-10-18，继续）
+
+`OoObject/OoClass.variables`（+ `obj_variables`）从 `Vec<String>` 改为
+`Rc<Vec<String>>`：`variable` 声明**整体替换**向量（指针即版本），
+`memoised_proc_def` 的每调用校验从「方法名 + 变量表内容逐项比较」变为
+**一次指针比较**（`owner_variables` 返回 `Option<&Rc<..>>`，无所有者用
+`None` 身份）。oovars 6614M→6563M（0.69x）。
+
+画像（oovars 3978 样本）：memcmp 9.5%、hashbrown 探测 ~12%、call_proc 6.4%；
+per-call 字符串面 = KeyMemo/ChainMemo 两次哈希+memcmp、`owner_variables` 的
+object 表查找、`head_cache` 的 typed 比较、prelink 安装（`resolve_var_link`
+memo + `slot_index_of` 线性扫描 + `Upvars.insert`）——**下一批候选**（见
+TODO）。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| N 后 | 0.85x | 0.93x | 0.68x | 0.49x | 0.70x | 0.73x |
+| O（本提交） | 0.85x | 0.93x | 0.68x | 0.49x | **0.69x** | 0.73x |
+
+（起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
+build 1.29。）
+
 ## Round N — 调用路径去分配（2026-10-18，继续）
 
 - `current_statics` 从 `HashMap` clone/调用 → `Rc<HashMap>`（默认零成本，

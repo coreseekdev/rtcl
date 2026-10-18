@@ -18,6 +18,16 @@
 - [x] **fe 求和迭代（p 段，Rounds G–K 收尾）**：p 循环 9 op→**2 op**/迭代
   （`SET_SS_ADD` + `FOREACH_NEXT_CLOSE`），foreach_bind 快路径、body-mark
   折叠、融合分支直取布尔——fe 0.96x 指令 / 0.85x wall、build 0.76x。
+- [ ] **OO 派发 per-call 字符串面（Round O 画像，oovars 0.69x）**：
+  1. prelink 索引预计算：链 memo 构建时把 `(slot_idx, key, name)` 预先算好
+     （编译体 locals 已知），每调用安装省去 `resolve_var_link` memo 探测 +
+     `slot_index_of` 线性扫描（≈5% oovars）。
+  2. `ChainEntry` 携带 owner 变量表 `Rc`（9 个构建点），去每调用
+     `owner_variables` 的表查找（≈2%）。
+  3. 派发站点级 OO memo（`ResolvedCmd` 增 OoMethod 变体 + backfill 探测），
+     去 KeyMemo/ChainMemo 的每调用哈希+memcmp（≈4-6%，改动大）。
+  4. `head_cache` 的 typed 比较 → 与调用站点共享 `Rc<str>` 身份（需
+     `Value` 字符串 rep 可暴露 Rc，或站点级持有）。
 - [ ] **下一批（按预期收益，Round L+ 候选）**：
   1. `BEGIN_CMD` 的 `word_srcs` 借用化：`cur_cmd_word_srcs` 改 `(*const
      SrcSpan, len)` 新type（site/单元生命周期内有效；save/restore 只拷指针），

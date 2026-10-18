@@ -64,7 +64,7 @@ pub(crate) enum MethodKind {
 }
 
 /// 方法 proc 体 memo：(typed name, 参数名表, 定义)。
-type ProcMemo = Option<(String, Vec<String>, Rc<ProcDef>, Rc<Vec<Rc<str>>>)>;
+type ProcMemo = Option<(Option<Rc<Vec<String>>>, Rc<ProcDef>, Rc<Vec<Rc<str>>>)>;
 
 /// A method definition (own methods, forwards, constructors, destructors).
 #[derive(Debug, Clone)]
@@ -135,8 +135,10 @@ pub(crate) struct OoObject {
     pub mixins: Vec<String>,
     /// Per-object methods in definition order.
     pub methods: Vec<(String, MethodDef)>,
-    /// `variable` declarations (definition order).
-    pub variables: Vec<String>,
+    /// `variable` declarations (definition order).  `Rc`: the method-call
+    /// fast path memoises on this list's identity (a declaration replaces
+    /// the whole vector, so a pointer compare detects it).
+    pub variables: Rc<Vec<String>>,
 }
 
 /// A class (both the behaviour of its instances and, via `obj_*`, the
@@ -149,7 +151,7 @@ pub(crate) struct OoClass {
     pub mixins: Vec<String>,
     /// Methods of *instances* of this class.
     pub methods: Vec<(String, MethodDef)>,
-    pub variables: Vec<String>,
+    pub variables: Rc<Vec<String>>,
     /// Names hidden by `unexport` of a method this class does not itself
     /// define (hides the inherited implementation).
     pub hidden: Vec<String>,
@@ -159,7 +161,7 @@ pub(crate) struct OoClass {
     pub filters: Vec<String>,
     // ── the class object's own per-object definitions (oo::objdefine) ──
     pub obj_methods: Vec<(String, MethodDef)>,
-    pub obj_variables: Vec<String>,
+    pub obj_variables: Rc<Vec<String>>,
     pub obj_mixins: Vec<String>,
 }
 
@@ -644,19 +646,17 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
 }
 
 /// Owner-specific variable declarations for a chain entry.
-fn owner_variables<'a>(interp: &'a Interp, owner: &'a Owner, key: &str) -> &'a [String] {
+fn owner_variables<'a>(
+    interp: &'a Interp,
+    owner: &'a Owner,
+    key: &str,
+) -> Option<&'a Rc<Vec<String>>> {
     match owner {
         Owner::Object => match interp.oo.objects.get(key) {
-            Some(o) => &o.variables,
-            None => match interp.oo.classes.get(key) {
-                Some(c) => &c.obj_variables,
-                None => &[],
-            },
+            Some(o) => Some(&o.variables),
+            None => interp.oo.classes.get(key).map(|c| &c.obj_variables),
         },
-        Owner::Class(c) => match interp.oo.classes.get(c) {
-            Some(cls) => &cls.variables,
-            None => &[],
-        },
+        Owner::Class(c) => interp.oo.classes.get(c).map(|cls| &cls.variables),
     }
 }
 
@@ -895,23 +895,32 @@ fn memoised_proc_def(
     // minus parameter-bound names — the old `link_prefix` filter, the
     // prefix text itself is gone) is built only on a rebuild and cached
     // beside the ProcDef.
-    let vars = owner_variables(interp, owner, key);
+    // The owner's live `variable` list, by identity: the memo keys on the
+    // `Rc`'s pointer (a declaration replaces the vector wholesale), so the
+    // per-call check is one pointer compare — no table-content walk.
+    let vars: Option<Rc<Vec<String>>> = owner_variables(interp, owner, key).cloned();
     {
         let memo = def.proc_memo.borrow();
-        if let Some((n, vs, d, links)) = memo.as_ref() {
-            if n == method && vs.as_slice() == vars {
+        if let Some((vs, d, links)) = memo.as_ref() {
+            if match (vs, &vars) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                _ => false,
+            } {
                 return (Rc::clone(d), Rc::clone(links));
             }
         }
     }
     let names: Vec<&str> = def.params.iter().map(|(p, _)| p.as_str()).collect();
+    let empty: Vec<String> = Vec::new();
+    let vars_slice: &[String] = vars.as_deref().unwrap_or(&empty);
     let links: Rc<Vec<Rc<str>>> = Rc::new(
-        vars.iter()
+        vars_slice
+            .iter()
             .filter(|v| !names.contains(&v.as_str()))
             .map(|v| Rc::from(v.as_str()))
             .collect(),
     );
-    let snapshot: Vec<String> = vars.to_vec();
     let mut pd = method_proc_def(&def.body, &def.params, method);
     // Compile at the same seam named `proc`s use; the compiled form also
     // unlocks call_proc's slot-locals binding (empty statics, params
@@ -924,7 +933,7 @@ fn memoised_proc_def(
     pd.compiled = compiled;
     let proc_def = Rc::new(pd);
     *def.proc_memo.borrow_mut() =
-        Some((method.to_string(), snapshot, Rc::clone(&proc_def), Rc::clone(&links)));
+        Some((vars.clone(), Rc::clone(&proc_def), Rc::clone(&links)));
     (proc_def, links)
 }
 
@@ -1361,7 +1370,7 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
                 .oo
                 .classes
                 .get(class_key)
-                .map(|c| c.variables.clone())
+                .map(|c| (*c.variables).clone())
                 .unwrap_or_default();
             let body = format!("{}{}", link_prefix(&vars, &ctor.params), ctor.body);
             let proc_def = ProcDef {
@@ -1409,7 +1418,7 @@ fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value]) -> Result<Value>
             .oo
             .classes
             .get(class_key)
-            .map(|c| c.variables.clone())
+            .map(|c| (*c.variables).clone())
             .unwrap_or_default();
         let body = format!("{}{}", link_prefix(&vars, &ctor.params), ctor.body);
         let proc_def = ProcDef {
@@ -1541,7 +1550,7 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
                     .oo
                     .classes
                     .get(c)
-                    .map(|cls| cls.variables.clone())
+                    .map(|cls| (*cls.variables).clone())
                     .unwrap_or_default(),
                 Owner::Object => vec![],
             };
@@ -1914,18 +1923,24 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     DefineTarget::Class(name2) => {
                         if let Some(c) = interp.oo.classes.get_mut(name2) {
                             if !c.variables.contains(&name) {
-                                c.variables.push(name);
+                                let mut v = (*c.variables).clone();
+                                v.push(name);
+                                c.variables = Rc::new(v);
                             }
                         }
                     }
                     DefineTarget::Object(name2) => {
                         if let Some(o) = interp.oo.objects.get_mut(name2) {
                             if !o.variables.contains(&name) {
-                                o.variables.push(name);
+                                let mut v = (*o.variables).clone();
+                                v.push(name);
+                                o.variables = Rc::new(v);
                             }
                         } else if let Some(c) = interp.oo.classes.get_mut(name2) {
                             if !c.obj_variables.contains(&name) {
-                                c.obj_variables.push(name);
+                                let mut v = (*c.obj_variables).clone();
+                                v.push(name);
+                                c.obj_variables = Rc::new(v);
                             }
                         }
                     }
@@ -2697,7 +2712,7 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let cls = interp.oo.classes.get(&key);
             let items: Vec<String> = match (sub, cls) {
                 ("mixins", Some(c)) => c.mixins.clone(),
-                ("variables", Some(c)) => c.variables.clone(),
+                ("variables", Some(c)) => (*c.variables).clone(),
                 ("filters", Some(c)) => c.filters.clone(),
                 _ => vec![],
             };

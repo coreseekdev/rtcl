@@ -197,10 +197,15 @@
    （+12 instr/迭代，热派发面增长吃回）→ 回退留档（`d85033d`，Round Z）。
    注：micro_incr 的 for 体尾是 fall-through（无 Jump），该窗口对它无效。
 
+**已落地（续）**
+3. ✅ OO 派发站点级 memo（`OoCallCache`，`04fd3ed`）——身份(typed/method
+   `same_allocation`)+ns 指针+`mutation_ctr` 四项验证，命中直达
+   `exec_chain_entry`。oo2 **0.43x**、oovars **0.52x**（各 −10.5%/−8.3%）。
+   续做实验（`f8c3007`/Round AB）：`my` 复用缓存与免 `format!` 门禁均无正收益
+   （单槽被交替方法冲刷，−2.89%/−0.01%）→ 回退；`my` 多槽身份索引缓存列为
+   **低优先级**（板面不覆盖 `my`）。
+
 **待做（按序）**
-3. ⏳ OO 派发站点级 memo（4-6% oovars，中高风险）：`(unit, pc)` 键控缓存
-   `(chain, links, head Values)`，`mutation_ctr` 校验；`next`/ActiveMethod 上下文
-   逐字保持（参考 `fresh_chain` 门控思路：只有站点直调路径吃缓存）。
 4. ⏳ call_proc 帧准备（fib 2-3%）：先按既有 perf 画像方法定位（call.rs 逐段），
    候选：level0 填充（每参一次 clone+push）、slot_mode 门禁的 resize、
    ns_of_qualified、pool 收发。需先画像再动。

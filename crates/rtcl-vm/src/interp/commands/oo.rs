@@ -1010,10 +1010,10 @@ fn chain_for(
     method: &str,
     include_private: bool,
 ) -> (Rc<Vec<ChainEntry>>, Rc<str>) {
-    let (memo, other) = if include_private {
-        (&interp.oo.chain_memo_priv, &interp.oo.chain_memo)
+    let memo = if include_private {
+        &interp.oo.chain_memo_priv
     } else {
-        (&interp.oo.chain_memo, &interp.oo.chain_memo_priv)
+        &interp.oo.chain_memo
     };
     // Hit: hand back the memo's own method-name Rc — the dispatcher's
     // ActiveMethod shares it, so a hit allocates nothing.
@@ -1024,7 +1024,6 @@ fn chain_for(
     {
         return (Rc::clone(chain), Rc::clone(k));
     }
-    let _ = other;
     let chain = Rc::new(build_chain(interp, key, method, include_private));
     let method_rc: Rc<str> = Rc::from(method);
     const CHAIN_MEMO_MAX: usize = 512;

@@ -137,6 +137,35 @@
   入口）；rtcl-wasm 默认 on。前置：string.allium 加 astral probe 裁决
   `string length` 三方语义。
 
+## perf/interp-arch-opt 评审跟进（2026-10-18，PR #1 合并时记录）
+
+- [ ] **P1 prelink 去 seed 语义回归**（call.rs `frame_prelink`）：方法存活期
+  `namespace delete [self namespace]` 后读 `variable` 声明变量，master/tclsh
+  返回旧值、现返回 no such variable（构造器预设值丢失）。触发面窄；修法
+  候选：prelink 恢复 seed（付一次拷贝）或 ns 删除时把链接值物化回
+  locals。需补 judge 回归用例。
+- [ ] **P1 OO proc_memo 单槽 × 实例 ns 身份**（oo.rs）：一个类的全部实例
+  共享一个 memo cell，多实例交替调用同方法时 0 命中并全量重编译
+  ProcDef——单实例热循环（oo_bench2 形状）之外反而比拼串路径慢。修法
+  候选：chain 构建时对克隆 def 换 fresh_memo，或 memo 改 per-ns 小 map。
+- [ ] **P1 consts_code ABA 窗口（预存，master 同款）**（vm_exec.rs）：
+  const_pool 2048 clear-all 丢弃 keepalive 后，新 ByteCode 复用同地址可
+  使 `ptr::eq` 误判 same → 静默错值。修法：state 改持 `Option<Rc<ByteCode>>`
+  保活身份（一次 Rc bump）。
+- [ ] P2 proc_memo 身份缺 method 名：`renamemethod` 后 arity 错误文本吐
+  旧方法名（仅用法串，非执行语义）。
+- [ ] P2 ctor/dtor 未迁移 prelink（双轨 OO variable 链接实现并存）。
+- [ ] P2 tier1_epoch 名单缺 `lappend`（预存）：shadow lappend 不失效已
+  编译体内联折叠；名单与 compiler Tier-1 清单两处手工同步，加锚定注释。
+- [ ] P2 宿主 `register_command` 不 bump tier1_epoch（预存）：宿主注册
+  set/if 等名字不失效内联折叠。
+- [ ] P2 融合臂慢路径直调 cmd_incr/cmd_lappend 跳过 `err_code_raised`
+  重置：catch 遗留态下 ::errorCode 派生可能偏差。
+- [ ] P2 varmap.rs 注释错误：`"abc"` vs `"abc\0"` 的 str-hash 并不能区分
+  （尾零填充后 word 相同）；HashMap 等价比较兜底，仅性能面。
+- [ ] P2 内联折叠 Tier1 命令不计步（直线大编译体 max_steps 低估）——
+  设计取舍，文档化即可。
+
 ## 已完成（近三轮，供对照）
 
 - [x] G22 槽内存减半（Vec<Value> + UNSET 哨兵）

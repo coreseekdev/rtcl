@@ -1348,16 +1348,8 @@ dependencies = [
 name = "rtcl-core"
 version = "0.1.0"
 dependencies = [
- "glob",
- "indexmap",
- "num-bigint",
- "num-integer",
- "num-traits",
- "regex",
- "regex-lite",
  "rtcl-parser",
  "rtcl-vm",
- "spin",
 ]
 
 [[package]]

@@ -10,43 +10,24 @@ categories = ["parser-implementations", "embedded", "command-line-interface"]
 [dependencies]
 rtcl-parser.workspace = true
 rtcl-vm.workspace = true
-indexmap.workspace = true
-
-num-bigint.workspace = true
-num-traits.workspace = true
-num-integer.workspace = true
-
-[dependencies.glob]
-workspace = true
-optional = true
-
-[dependencies.regex]
-workspace = true
-optional = true
-
-[dependencies.regex-lite]
-workspace = true
-optional = true
-
-[dependencies.spin]
-workspace = true
-optional = true
 
 [features]
 # The interpreter lives in `rtcl-vm` now; every feature is a passthrough
-# so existing dependents keep their feature names.
+# so existing dependents keep their feature names. Each std-requiring
+# passthrough also enables the local `std` so facade-gated re-exports
+# (`channel` etc.) keep their master-era visibility.
 default = ["rtcl_std"]
 std = ["rtcl-vm/std"]
-rtcl_std = ["rtcl-vm/rtcl_std"]
-file = ["rtcl-vm/file"]
-io = ["rtcl-vm/io"]
-exec = ["rtcl-vm/exec"]
-clock = ["rtcl-vm/clock"]
-regexp = ["rtcl-vm/regexp"]
-regexp-lite = ["rtcl-vm/regexp-lite"]
-env = ["rtcl-vm/env"]
-package = ["rtcl-vm/package"]
-signal = ["rtcl-vm/signal"]
+rtcl_std = ["rtcl-vm/rtcl_std", "std"]
+file = ["rtcl-vm/file", "std"]
+io = ["rtcl-vm/io", "std"]
+exec = ["rtcl-vm/exec", "std"]
+clock = ["rtcl-vm/clock", "std"]
+regexp = ["rtcl-vm/regexp", "std"]
+regexp-lite = ["rtcl-vm/regexp-lite", "std"]
+env = ["rtcl-vm/env", "std"]
+package = ["rtcl-vm/package", "std"]
+signal = ["rtcl-vm/signal", "std"]
 alloc = ["rtcl-vm/alloc"]
 embedded = ["rtcl-vm/embedded"]
 debug = ["rtcl-vm/debug"]

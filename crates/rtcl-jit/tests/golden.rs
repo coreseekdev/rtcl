@@ -12,7 +12,7 @@ use rtcl_parser::{ByteCode, Compiler, ScriptUnit};
 
 fn compile_unit(src: &str) -> ByteCode {
     let unit = ScriptUnit::parse(src).expect("parse");
-    Compiler::compile_unit(unit.source, &unit.commands)
+    Compiler::compile_unit(unit.source, &unit.commands).unfused()
 }
 
 fn to_l2(src: &str) -> (ByteCode, L2) {

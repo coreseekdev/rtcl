@@ -623,6 +623,19 @@ impl ByteCode {
         self.ops.truncate(new_len);
         self.line_map.truncate(new_len);
     }
+
+    /// Expand fused superinstructions back to their canonical op windows.
+    ///
+    /// Staging placeholder: the fused families land with the interpreter
+    /// perf batch (`perf/interp-arch-opt`), which replaces this body with
+    /// the real expansion (jump targets remapped through the expansion
+    /// shift). Consumers whose accepted-op set must stay canonical — the
+    /// JIT's analysis boundary — already call this at their compile entry,
+    /// so they need no further changes when the families arrive. Contract
+    /// and per-op tables: `docs/JIT-OPCODE-DELTA.md`.
+    pub fn unfused(&self) -> ByteCode {
+        self.clone()
+    }
 }
 
 impl fmt::Display for ByteCode {

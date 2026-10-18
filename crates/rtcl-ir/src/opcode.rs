@@ -275,6 +275,12 @@ pub enum OpCode {
     /// falls back to the real `incr`, which owns the exact errors.
     IncrLocal(u16, i64),
 
+    /// Fusion of `[IncrLocal slot, Pop]` — the increment's result is
+    /// discarded (the `for`-next / bare-`incr` statement shape).  Same
+    /// fast path and fallback ladder as [`OpCode::IncrLocal`]; only the
+    /// stack round-trip of the discarded result is elided.
+    IncrLocalPop(u16, i64),
+
     /// Append TOS to the variable (constant-pool name index).
     /// Pops the append value, pushes the new variable value.
     AppendVar(u16),
@@ -391,6 +397,13 @@ pub enum OpCode {
     LappendLocal(u16),
     /// The name-keyed twin of [`OpCode::LappendLocal`] (top-level units).
     LappendVar(u16),
+    /// Fusion of `[LoadLocal src, LappendLocal dst, Pop]` — the compiler's
+    /// `lappend <var> $value` statement shape: append `slots[src]` to
+    /// `slots[dst]` through the same take/append/restore ladder as the
+    /// pair (including the `cmd_lappend` fallback with the assembled
+    /// `[lappend, name, value]` args and identical errors); the discarded
+    /// result is never materialized.
+    LappendSlotSlot(u16, u16),
     /// Body region opener for FRAMED foreach bodies (compiled outside a
     /// proc body): pushes `Region::BodyFramed` — body errors crossing it
     /// gain the `("foreach"/"lmap" body line N)` exit frame, matching the
@@ -408,6 +421,19 @@ pub enum OpCode {
     /// Comparison superinstructions (same fallback contract).
     CmpSlotSlot(u16, u16, u8),
     CmpSlotImm(u16, i64, u8),
+    /// Fusions of `[cmp superinstruction, JumpTrue/JumpFalse]` — the
+    /// condition shape of every compiled loop: branch on the comparison
+    /// directly instead of pushing a boolean for the jump to pop and
+    /// re-coerce.  `t` is the jump target (absolute); the operand read
+    /// fallback, the NaN/string comparison semantics, the not-taken
+    /// `Region::Body` open and the backward-edge step charge are exactly
+    /// the fused pair's (the charge tests against the original jump op's
+    /// index — one past this op — so `t == pc+1` classifies like the
+    /// dispatched `JumpFalse` did).
+    CmpSlotSlotJumpTrue(u16, u16, u8, u32),
+    CmpSlotSlotJumpFalse(u16, u16, u8, u32),
+    CmpSlotImmJumpTrue(u16, i64, u8, u32),
+    CmpSlotImmJumpFalse(u16, i64, u8, u32),
     Mul,
     Div,
     Mod,
@@ -592,6 +618,7 @@ impl fmt::Display for OpCode {
             OpCode::StoreArrayElem(idx) => write!(f, "STORE_ARRAY_ELEM {}", idx),
             OpCode::IncrVar(idx, n) => write!(f, "INCR_VAR {} {}", idx, n),
             OpCode::IncrLocal(slot, n) => write!(f, "INCR_LOCAL {} {}", slot, n),
+            OpCode::IncrLocalPop(slot, n) => write!(f, "INCR_LOCAL_POP {} {}", slot, n),
             OpCode::AppendVar(idx) => write!(f, "APPEND_VAR {}", idx),
             OpCode::UnsetVar(idx) => write!(f, "UNSET_VAR {}", idx),
             OpCode::VarExists(idx) => write!(f, "VAR_EXISTS {}", idx),
@@ -634,11 +661,24 @@ impl fmt::Display for OpCode {
             OpCode::Add => write!(f, "ADD"),
             OpCode::LappendLocal(s) => write!(f, "LAPPEND_L {}", s),
             OpCode::LappendVar(n) => write!(f, "LAPPEND_V {}", n),
+            OpCode::LappendSlotSlot(src, dst) => write!(f, "LAPPEND_SS {} {}", src, dst),
             OpCode::BodyMarkFramed => write!(f, "BODY_MARK_FRAMED"),
             OpCode::AddSlotSlot(a, b) => write!(f, "ADD_SS {} {}", a, b),
             OpCode::AddSlotImm(a, k) => write!(f, "ADD_SI {} {}", a, k),
             OpCode::CmpSlotSlot(a, b, cc) => write!(f, "CMP_SS {} {} cc={}", a, b, cc),
             OpCode::CmpSlotImm(a, k, cc) => write!(f, "CMP_SI {} {} cc={}", a, k, cc),
+            OpCode::CmpSlotSlotJumpTrue(a, b, cc, t) => {
+                write!(f, "CMP_SS_JT {} {} cc={} -> {}", a, b, cc, t)
+            }
+            OpCode::CmpSlotSlotJumpFalse(a, b, cc, t) => {
+                write!(f, "CMP_SS_JF {} {} cc={} -> {}", a, b, cc, t)
+            }
+            OpCode::CmpSlotImmJumpTrue(a, k, cc, t) => {
+                write!(f, "CMP_SI_JT {} {} cc={} -> {}", a, k, cc, t)
+            }
+            OpCode::CmpSlotImmJumpFalse(a, k, cc, t) => {
+                write!(f, "CMP_SI_JF {} {} cc={} -> {}", a, k, cc, t)
+            }
             OpCode::Sub => write!(f, "SUB"),
             OpCode::Mul => write!(f, "MUL"),
             OpCode::Div => write!(f, "DIV"),
@@ -712,5 +752,24 @@ impl fmt::Display for OpCode {
             OpCode::ExprMark => write!(f, "EXPR_MARK"),
             OpCode::Nop => write!(f, "NOP"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpCode;
+
+    /// The dispatch loop copies an `OpCode` per executed instruction — the
+    /// enum stays in its 16-byte envelope (the binding constraint is the
+    /// widest payload: `u16 + i64` / `u16 + i64 + u8`).  A superinstruction
+    /// needing a larger payload must either fit the envelope or pay for a
+    /// side table explicitly; silently growing the enum taxes every op.
+    #[test]
+    fn opcode_size_budget() {
+        assert!(
+            core::mem::size_of::<OpCode>() <= 16,
+            "OpCode grew to {} bytes",
+            core::mem::size_of::<OpCode>()
+        );
     }
 }

@@ -327,7 +327,11 @@ impl ByteCode {
         self.line_map.get(idx).copied().unwrap_or(0)
     }
 
-    /// Run a peephole optimization pass on the bytecode.
+    /// Run the optimization pipeline on the bytecode — the driver of the
+    /// nanopass phase (each pass below is a pure function over the op
+    /// vector; `strip_nops` compacts between rounds and remaps every
+    /// target-carrying op, so passes may rewrite a window to `Nop` +
+    /// fused head without touching control flow).
     ///
     /// Patterns (2-op):
     /// - `StoreVar(x) + Pop` → `StoreVarPop(x)` + `Nop`
@@ -338,16 +342,122 @@ impl ByteCode {
     /// - `PushInt(a) + PushInt(b) + ArithOp` → `PushInt(result)` + `Nop + Nop`
     /// - `PushInt(a) + PushInt(b) + CmpOp` → `PushTrue/PushFalse` + `Nop + Nop`
     ///
+    /// Slot-pair fusions (locals-mode units only, see
+    /// [`Self::fuse_slot_pairs`]) run in the same round.
+    ///
     /// Runs iteratively until no further changes are made.
     pub fn peephole(&mut self) {
-        // Iterate: fold → strip nops → fold again (for chained constant expressions)
+        // Iterate: fold → strip nops → fold again (for chained constant
+        // expressions).
         for _ in 0..8 {
-            let changed = self.peephole_pass();
+            let changed = self.peephole_pass() | self.fuse_slot_pairs();
             self.strip_nops();
             if !changed {
                 break;
             }
         }
+    }
+
+    /// Nanopass fusion of the compiler's producer/consumer pairs in
+    /// locals-mode units (the paired ops are interpreter-only slot ops —
+    /// the JIT compiles name-keyed units exclusively, so its accepted op
+    /// set must stay untouched here).
+    ///
+    /// Windows (a fusion is refused when any op *inside* the window —
+    /// everything but the head — is a jump target: the fused op replaces
+    /// the window as a unit, and an entry point on the consumer would
+    /// lose its producer):
+    ///
+    /// - `[CmpSlotSlot(a,b,cc), JumpTrue(t)]`   → `CmpSlotSlotJumpTrue(a,b,cc,t)`
+    /// - `[CmpSlotSlot(a,b,cc), JumpFalse(t)]`  → `CmpSlotSlotJumpFalse(a,b,cc,t)`
+    /// - `[CmpSlotImm(a,k,cc), JumpTrue(t)]`    → `CmpSlotImmJumpTrue(a,k,cc,t)`
+    /// - `[CmpSlotImm(a,k,cc), JumpFalse(t)]`   → `CmpSlotImmJumpFalse(a,k,cc,t)`
+    /// - `[LoadLocal(s), LappendLocal(d), Pop]` → `LappendSlotSlot(s,d)`
+    /// - `[IncrLocal(s,k), Pop]`                → `IncrLocalPop(s,k)`
+    fn fuse_slot_pairs(&mut self) -> bool {
+        if !self.locals_mode || self.ops.len() < 2 {
+            return false;
+        }
+        let len = self.ops.len();
+        let targets = self.collect_jump_targets();
+        let mut changed = false;
+        let mut i = 0;
+        while i + 1 < len {
+            let fused: Option<(OpCode, usize)> = match (&self.ops[i], &self.ops[i + 1]) {
+                (OpCode::CmpSlotSlot(a, b, cc), OpCode::JumpTrue(t)) if !targets[i + 1] => {
+                    Some((OpCode::CmpSlotSlotJumpTrue(*a, *b, *cc, *t), 2))
+                }
+                (OpCode::CmpSlotSlot(a, b, cc), OpCode::JumpFalse(t)) if !targets[i + 1] => {
+                    Some((OpCode::CmpSlotSlotJumpFalse(*a, *b, *cc, *t), 2))
+                }
+                (OpCode::CmpSlotImm(a, k, cc), OpCode::JumpTrue(t)) if !targets[i + 1] => {
+                    Some((OpCode::CmpSlotImmJumpTrue(*a, *k, *cc, *t), 2))
+                }
+                (OpCode::CmpSlotImm(a, k, cc), OpCode::JumpFalse(t)) if !targets[i + 1] => {
+                    Some((OpCode::CmpSlotImmJumpFalse(*a, *k, *cc, *t), 2))
+                }
+                (OpCode::LoadLocal(s), OpCode::LappendLocal(d)) => {
+                    if !targets[i + 1]
+                        && i + 2 < len
+                        && !targets[i + 2]
+                        && matches!(self.ops[i + 2], OpCode::Pop)
+                    {
+                        Some((OpCode::LappendSlotSlot(*s, *d), 3))
+                    } else {
+                        None
+                    }
+                }
+                (OpCode::IncrLocal(s, k), OpCode::Pop) if !targets[i + 1] => {
+                    Some((OpCode::IncrLocalPop(*s, *k), 2))
+                }
+                _ => None,
+            };
+            if let Some((op, width)) = fused {
+                self.ops[i] = op;
+                for slot in self.ops[i + 1..i + width].iter_mut() {
+                    *slot = OpCode::Nop;
+                }
+                changed = true;
+                i += width;
+            } else {
+                i += 1;
+            }
+        }
+        changed
+    }
+
+    /// Indices that are jump targets of any target-carrying op — the
+    /// complete set `strip_nops` remaps (keep the two in agreement).
+    fn collect_jump_targets(&self) -> Vec<bool> {
+        let mut targets = vec![false; self.ops.len() + 1];
+        let mut mark = |t: u32| {
+            if (t as usize) < targets.len() {
+                targets[t as usize] = true;
+            }
+        };
+        for op in &self.ops {
+            match op {
+                OpCode::Jump(t)
+                | OpCode::JumpTrue(t)
+                | OpCode::JumpFalse(t)
+                | OpCode::CatchStart(t)
+                | OpCode::CmpSlotSlotJumpTrue(_, _, _, t)
+                | OpCode::CmpSlotSlotJumpFalse(_, _, _, t)
+                | OpCode::CmpSlotImmJumpTrue(_, _, _, t)
+                | OpCode::CmpSlotImmJumpFalse(_, _, _, t) => mark(*t),
+                OpCode::LoopEnter { cont, brk } => {
+                    mark(*cont);
+                    mark(*brk);
+                }
+                OpCode::ForeachStart { next, end, .. } => {
+                    mark(*next);
+                    mark(*end);
+                }
+                OpCode::ForeachNext { body, .. } => mark(*body),
+                _ => {}
+            }
+        }
+        targets
     }
 
     /// Single round of pattern matching. Returns `true` if any change was made.
@@ -587,6 +697,10 @@ impl ByteCode {
                 OpCode::Jump(t) => *t = forward[*t as usize],
                 OpCode::JumpTrue(t) => *t = forward[*t as usize],
                 OpCode::JumpFalse(t) => *t = forward[*t as usize],
+                OpCode::CmpSlotSlotJumpTrue(_, _, _, t)
+                | OpCode::CmpSlotSlotJumpFalse(_, _, _, t)
+                | OpCode::CmpSlotImmJumpTrue(_, _, _, t)
+                | OpCode::CmpSlotImmJumpFalse(_, _, _, t) => *t = forward[*t as usize],
                 OpCode::LoopEnter { cont, brk } => {
                     *cont = forward[*cont as usize];
                     *brk = forward[*brk as usize];
@@ -645,5 +759,117 @@ impl fmt::Display for ByteCode {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bc(ops: &[OpCode], locals_mode: bool) -> ByteCode {
+        let mut c = ByteCode::new();
+        for op in ops {
+            c.emit(op.clone(), 0);
+        }
+        c.locals_mode = locals_mode;
+        c
+    }
+
+    /// The producer/consumer windows collapse to one op each, and the
+    /// `strip_nops` compaction leaves no residue.
+    #[test]
+    fn fuses_slot_pair_windows() {
+        let mut code = bc(
+            &[
+                OpCode::CmpSlotSlot(1, 2, 0),
+                OpCode::JumpFalse(8),
+                OpCode::Nop,
+                OpCode::LoadLocal(1),
+                OpCode::LappendLocal(2),
+                OpCode::Pop,
+                OpCode::IncrLocal(3, 1),
+                OpCode::Pop,
+                OpCode::Return,
+            ],
+            true,
+        );
+        code.peephole();
+        assert_eq!(
+            code.ops(),
+            &[
+                OpCode::CmpSlotSlotJumpFalse(1, 2, 0, 3),
+                OpCode::LappendSlotSlot(1, 2),
+                OpCode::IncrLocalPop(3, 1),
+                OpCode::Return,
+            ]
+        );
+    }
+
+    /// A jump targeting the consumer inside the window refuses the
+    /// fusion: the fused op replaces the whole window, and an entry
+    /// point on the consumer would lose its producer.
+    #[test]
+    fn refuses_fusion_when_target_inside_window() {
+        let mut code = bc(
+            &[
+                OpCode::JumpTrue(2),
+                OpCode::LoadLocal(1),
+                OpCode::LappendLocal(2),
+                OpCode::Pop,
+                OpCode::Return,
+            ],
+            true,
+        );
+        code.peephole();
+        assert!(code
+            .ops()
+            .iter()
+            .any(|o| matches!(o, OpCode::LappendLocal(_))));
+        assert!(code.ops().iter().any(|o| matches!(o, OpCode::Pop)));
+    }
+
+    /// Name-keyed units keep their op set — the fused ops are
+    /// interpreter-only (the JIT compiles name-keyed units and must not
+    /// meet ops outside its accepted set).
+    #[test]
+    fn name_keyed_units_do_not_fuse() {
+        let mut code = bc(
+            &[
+                OpCode::CmpSlotSlot(1, 2, 0),
+                OpCode::JumpFalse(3),
+                OpCode::Nop,
+                OpCode::Return,
+            ],
+            false,
+        );
+        code.peephole();
+        assert!(code.ops().iter().any(|o| matches!(o, OpCode::JumpFalse(_))));
+    }
+
+    /// `strip_nops` remaps the fused op's own jump target like the
+    /// dispatched jump ops' (a compaction ahead of the window must not
+    /// shift the branch landing).
+    #[test]
+    fn strip_remaps_fused_targets() {
+        let mut code = bc(
+            &[
+                OpCode::Nop,
+                OpCode::CmpSlotSlot(1, 2, 0),
+                OpCode::JumpFalse(4),
+                OpCode::Nop,
+                OpCode::Return,
+            ],
+            true,
+        );
+        code.peephole();
+        let target = code
+            .ops()
+            .iter()
+            .find_map(|o| match o {
+                OpCode::CmpSlotSlotJumpFalse(_, _, _, t) => Some(*t),
+                _ => None,
+            })
+            .expect("fused branch present");
+        assert_eq!(target as usize, code.ops().len() - 1);
     }
 }

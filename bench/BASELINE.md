@@ -1360,3 +1360,59 @@ sha256_64b       203 ns
 指令数比（rtcl/tclsh，越低越好）：fib 1.04x、fe 1.51x、dloop 0.86x、oo2 0.73x、
 oovars 1.05x、build-only 1.29x。fe 的余量集中在 `build`（lappend 循环，1.22x）；
 oovars 是内存停顿主导（指令 1.05x 但 wall 1.47x：cache-refs 346M vs tclsh 74M）。
+
+## Round D/E — 分配与扫描去除（2026-10-18，继续）
+
+| 轮次 | 改动 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars |
+|---|---|---|---|---|---|---|
+| D1+D2（bd71f9e） | OO `objects/classes/my_commands`、namespace `variables` 换 Fx 哈希（去 SipHash）；VarHasher 尾块免 memcpy | — | — | — | 0.67x | 0.96x |
+| D3（2cd2669） | 派发链名字 `Rc<str>` 共享（ActiveMethod/chain memo 键/对象 ns）、prelink 记忆化（ProcMemo 携带链接表 Rc）、upvar 链接 `Rc<str>` + upvars 键 `Rc<str>` | — | — | — | 0.60x | 0.81x |
+| E1（本提交） | 短名 `(` 扫描内联字节循环（util::find_paren/strip_paren）、`dead_link_error`/`check_parent_ns` 空表/无 `::` 快速短路 | 1.02x | 1.51x | 0.70x | 0.54x | 0.75x |
+
+以上为指令数比（rtcl/tclsh）。wall 对应：oo2 0.63x、oovars 1.04x、dloop 0.77x、fib 0.87x、fe 1.33x。
+
+**新目标（wasm 视角）**：指令数比 0.5~0.6x 为目标，1.2x 为下限。当前最差点：
+- fe_bench 1.51x 指令 / 1.33x wall —— `build`（lappend 循环，build-only 1.29x 指令）是唯一还大幅落后的热点
+- fib25 1.02x 指令（proc 调用路径）
+- oovars 0.75x 指令但 wall 1.04x（内存停顿：IPC 比 ≈0.72）
+
+## Round F — nanopass 融合：比较/分支与槽对窗口（2026-10-18，继续）
+
+背景：JIT 侧（master `24ed853`）的发射器已是 nanopass 管线（L0→L4 +
+层间 `check.rs` 校验）。本轮把解释器的 opcode 构造侧同样推进为「独立纯
+函数 pass、单向重写」：新增 `ByteCode::fuse_slot_pairs`（由 `peephole()`
+驱动，与既有折叠 pass 同轮迭代；`locals_mode` 门控），按跳转靶点位图
+逐窗口重写——窗口内部（head 之外）是靶点则拒绝融合（融合 op 整体替换
+窗口，源自 consumer 的入口会丢掉 producer）；`strip_nops` 同步重映射
+融合 op 自带的 `t`。
+
+| 窗口 | 融合 op |
+|---|---|
+| `[CmpSlotSlot, JumpTrue/JumpFalse]` | `CmpSlotSlotJumpTrue/False(a,b,cc,t)` |
+| `[CmpSlotImm, JumpTrue/JumpFalse]` | `CmpSlotImmJumpTrue/False(a,k,cc,t)` |
+| `[LoadLocal, LappendLocal, Pop]` | `LappendSlotSlot(src,dst)` |
+| `[IncrLocal, Pop]` | `IncrLocalPop(s,k)` |
+
+语义与兼容保障：
+- 融合 op 只出现在 locals-mode 单元（JIT 只编译 name-keyed 单元，接受集
+  不受扰）；`rtcl-vm` 并行 VM 显式拒绝，`ByteCode.fallback` 白名单同步
+  补入（语义标志不变）。
+- `OpCode` 尺寸簿记测试（≤16B，dispatch 每 op 拷贝一次枚举）——新
+  payload 不得顶出信封。
+- 分支融合的 backward-charge 以「原 jump op 索引 +1」为界（`t == pc+1`
+  与派发版 JumpFalse 同判）；fall-through 即 `st.pc` 本身（融合后布局）。
+- 拾获两个真 bug：① `peephole()` 早于 `locals_mode` 赋值（pass 空跑）；
+  ② 融合臂 fall-through 多加 1，吞掉紧随的 `BEGIN_CMD`——judge
+  `gen_proc-old` 抓到（body 错误帧与 proc 帧从 errorInfo 消失），已修 +
+  回归测试 `fused_branch_fallthrough_keeps_site`。
+- 同批：`LappendLocal` fallback 名的 `.to_string()` 惰性化（此前每次迭代
+  一次 malloc+memcpy ≈13% build 时间）。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| 起点（本轮前） | 1.02x | 1.51x | 0.70x | 0.54x | 0.75x | 1.29x |
+| F（本提交） | 1.00x | 1.40x | 0.70x | 0.54x | 0.75x | 0.86x |
+
+指令数比（rtcl/tclsh）。wall（3 次交错 best-of-N）：fe 1.18x、dloop 0.78x、
+oo2 0.56x、oovars 0.99x、fib 1.00x。build 循环每迭代 op 数 12→8。
+

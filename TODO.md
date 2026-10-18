@@ -6,9 +6,16 @@
 
 ## 性能优化（剩余杠杆）
 
+- [x] **nanopass 融合（Round F，本批次提交）**：`fuse_slot_pairs` pass +
+  6 个融合 op（`CmpSlotSlot/ImmJumpTrue/False`、`LappendSlotSlot`、
+  `IncrLocalPop`）——build-only 1.29x→0.86x 指令、fe wall 1.33x→1.18x。
+  约束：融合 op 仅 locals-mode（JIT 兼容）；规范见 `bench/BASELINE.md`
+  Round F。可扩展窗口（`LoadLocal+Jump`、name-keyed 版 lappend/incr）
+  需与 JIT 接受集协调后入列。
 - [ ] **fe 求和迭代 2.8× → 收尾**：foreach_bind + 9 ops 的 per-op 权重
   （9ns/op vs tclsh 3.5ns）。`bench/scripts/fe_bench.tcl`、
   `bench/scripts/sum_only.tcl`。依赖 foreach 路由对齐（下条）+ 每op税。
+  （注：`build` 段已由 Round F 收尾至 0.86x，余量集中在 `p`/foreach 求和）
 - [ ] **foreach 路由对齐**（G9f 存档，G24 已落 framed 双模式的一半）：
   全局编译 foreach 已工作（G21 实验 + G24 framed）✅ **已完成的
   部分：全局内联 + framed 错误协议**。剩余：`uplevel`/`namespace eval`

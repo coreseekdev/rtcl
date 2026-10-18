@@ -152,15 +152,19 @@ impl Compiler {
             }
         }
         c.compile_commands(commands);
+        // `locals_mode` must be visible to the optimization pipeline: the
+        // slot-pair fusions are interpreter-only (name-keyed units keep
+        // the JIT's accepted op set).
+        c.bytecode.locals_mode = locals_mode;
         c.bytecode.peephole();
         c.bytecode.source = source;
-        c.bytecode.locals_mode = locals_mode;
         c.bytecode.fallback = !c.bytecode.ops().iter().all(|op| matches!(op,
             OpCode::PushConst(_) | OpCode::PushConstWide(_) | OpCode::PushEmpty
             | OpCode::PushInt(_) | OpCode::PushFloat(_) | OpCode::PushTrue | OpCode::PushFalse
             | OpCode::Pop | OpCode::Dup
             | OpCode::LoadVar(_) | OpCode::StoreVar(_) | OpCode::StoreVarPop(_)
             | OpCode::LoadLocal(_) | OpCode::StoreLocal(_) | OpCode::IncrLocal(_, _)
+            | OpCode::IncrLocalPop(_, _)
             | OpCode::IncrVar(_, _)
             | OpCode::Concat(_) | OpCode::ExpandList | OpCode::ExpandMark
             | OpCode::Jump(_) | OpCode::JumpTrue(_) | OpCode::JumpFalse(_)
@@ -168,8 +172,11 @@ impl Compiler {
             | OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. }
             | OpCode::ForeachCollect | OpCode::ForeachEnd
             | OpCode::LappendLocal(_) | OpCode::LappendVar(_) | OpCode::BodyMarkFramed
+            | OpCode::LappendSlotSlot(_, _)
             | OpCode::AddSlotSlot(_, _) | OpCode::AddSlotImm(_, _)
             | OpCode::CmpSlotSlot(_, _, _) | OpCode::CmpSlotImm(_, _, _)
+            | OpCode::CmpSlotSlotJumpTrue(_, _, _, _) | OpCode::CmpSlotSlotJumpFalse(_, _, _, _)
+            | OpCode::CmpSlotImmJumpTrue(_, _, _, _) | OpCode::CmpSlotImmJumpFalse(_, _, _, _)
             | OpCode::Return | OpCode::Exit(_)
             | OpCode::EvalScript | OpCode::EvalExpr
             | OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Pow

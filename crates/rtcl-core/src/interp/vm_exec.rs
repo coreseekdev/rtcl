@@ -485,6 +485,27 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             OpCode::CmpSlotSlot(a, b, cc) => op_cmp_slot_slot(interp, code, st, *a, *b, *cc),
             OpCode::CmpSlotImm(a, k, cc) => op_cmp_slot_imm(interp, code, st, *a, *k, *cc),
 
+            // ── Fused slot pairs (the `fuse_slot_pairs` windows) ────────
+            // One dispatch covers the producer and its consumer; the
+            // helpers are the same ones `exec_op` routes to.
+            OpCode::CmpSlotSlotJumpTrue(a, b, cc, t) => {
+                op_cmp_ss_jump(interp, code, st, *a, *b, *cc, *t, true)
+            }
+            OpCode::CmpSlotSlotJumpFalse(a, b, cc, t) => {
+                op_cmp_ss_jump(interp, code, st, *a, *b, *cc, *t, false)
+            }
+            OpCode::CmpSlotImmJumpTrue(a, k, cc, t) => {
+                op_cmp_si_jump(interp, code, st, *a, *k, *cc, *t, true)
+            }
+            OpCode::CmpSlotImmJumpFalse(a, k, cc, t) => {
+                op_cmp_si_jump(interp, code, st, *a, *k, *cc, *t, false)
+            }
+            OpCode::LappendSlotSlot(src, dst) => op_lappend_slot_slot(interp, code, *src, *dst),
+            OpCode::IncrLocalPop(slot, amount) => {
+                let _ = incr_local_value(interp, code, *slot, *amount)?;
+                Ok(())
+            }
+
             // ── Arithmetic / comparison ─────────────────────────────────
             OpCode::Add => arith(st, '+'),
             OpCode::Sub => arith(st, '-'),
@@ -858,16 +879,24 @@ fn op_incr_var(
     Ok(())
 }
 
+/// `LoadLocal`'s value, without the stack push — the fused
+/// `LoadLocal + JumpTrue/JumpFalse` and `LoadLocal + LappendLocal` arms
+/// consume it directly.
 #[inline]
-fn op_load_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: u16) -> Result<()> {
+fn load_local_value(interp: &mut Interp, code: &ByteCode, slot: u16) -> Result<Value> {
     let slot = slot as usize;
-    let v = match interp.frame_slot_value(slot) {
-        Some(v) => v,
+    match interp.frame_slot_value(slot) {
+        Some(v) => Ok(v),
         None => {
             let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
-            interp.eval_var_ref(name)?
+            interp.eval_var_ref(name)
         }
-    };
+    }
+}
+
+#[inline]
+fn op_load_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: u16) -> Result<()> {
+    let v = load_local_value(interp, code, slot)?;
     st.stack.push(v);
     Ok(())
 }
@@ -884,6 +913,36 @@ fn op_store_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: 
     Ok(())
 }
 
+/// `IncrLocal`'s value, without the stack push — the fused
+/// `IncrLocal + Pop` arm consumes it directly.
+#[inline]
+fn incr_local_value(
+    interp: &mut Interp,
+    code: &ByteCode,
+    slot: u16,
+    amount: i64,
+) -> Result<Value> {
+    let slot = slot as usize;
+    // Same fallback ladder as IncrVar: slot fast path, then the name fast
+    // path (degraded frames), then the real `incr`, which owns creation
+    // and the exact errors.
+    let name = || code.locals().get(slot).map(String::as_str).unwrap_or("");
+    match interp.frame_slot_incr(slot, amount) {
+        Some(v) => Ok(v),
+        None => match interp.incr_var_fast(name(), amount) {
+            Some(v) => Ok(v),
+            None => {
+                let args = [
+                    Value::from_str("incr"),
+                    Value::from_str(name()),
+                    Value::from_int(amount),
+                ];
+                super::commands::misc::cmd_incr(interp, &args)
+            }
+        },
+    }
+}
+
 #[inline]
 fn op_incr_local(
     interp: &mut Interp,
@@ -892,26 +951,8 @@ fn op_incr_local(
     slot: u16,
     amount: i64,
 ) -> Result<()> {
-    let slot = slot as usize;
-    // Same fallback ladder as IncrVar: slot fast path, then the name fast
-    // path (degraded frames), then the real `incr`, which owns creation
-    // and the exact errors.
-    let name = || code.locals().get(slot).map(String::as_str).unwrap_or("");
-    match interp.frame_slot_incr(slot, amount) {
-        Some(v) => st.stack.push(v),
-        None => match interp.incr_var_fast(name(), amount) {
-            Some(v) => st.stack.push(v),
-            None => {
-                let args = [
-                    Value::from_str("incr"),
-                    Value::from_str(name()),
-                    Value::from_int(amount),
-                ];
-                let v = super::commands::misc::cmd_incr(interp, &args)?;
-                st.stack.push(v);
-            }
-        },
-    }
+    let v = incr_local_value(interp, code, slot, amount)?;
+    st.stack.push(v);
     Ok(())
 }
 
@@ -978,6 +1019,77 @@ fn op_cmp_slot_imm(
     Ok(())
 }
 
+/// Fused `[CmpSlotSlot, JumpTrue/JumpFalse]`: the comparison branches
+/// directly through [`jump_if_value`] — no boolean is materialized.  The
+/// operand read replicates [`op_cmp_slot_slot`]'s exact fallback.  At
+/// entry `st.pc` points one past this op — the index the pair's jump op
+/// would have had — which is the `jump_pc` the backward-edge step charge
+/// tests against; the not-taken path falls through to `jump_pc + 1`.
+#[inline]
+#[allow(clippy::too_many_arguments)] // interp/code/st + the op's five operands
+fn op_cmp_ss_jump(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    b: u16,
+    cc: u8,
+    t: u32,
+    want: bool,
+) -> Result<()> {
+    let va = slot_read_or_name(interp, code, a as usize)?;
+    let vb = slot_read_or_name(interp, code, b as usize)?;
+    let v = cmp_values(&va, &vb, cc);
+    // The fused op compacted the pair into one slot: `st.pc` already
+    // points at the op after the pair, so the not-taken fall-through is
+    // simply "leave `st.pc` alone" (the charge parity below still uses
+    // `st.pc + 1`, the pair's original jump-op index).
+    jump_if_value(interp, st, &v, t, want, st.pc)?;
+    Ok(())
+}
+
+/// Fused `[CmpSlotImm, JumpTrue/JumpFalse]` — [`op_cmp_ss_jump`] with the
+/// immediate operand.
+#[inline]
+#[allow(clippy::too_many_arguments)] // interp/code/st + the op's five operands
+fn op_cmp_si_jump(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    k: i64,
+    cc: u8,
+    t: u32,
+    want: bool,
+) -> Result<()> {
+    let va = slot_read_or_name(interp, code, a as usize)?;
+    let v = cmp_values(&va, &Value::from_int(k), cc);
+    jump_if_value(interp, st, &v, t, want, st.pc)?;
+    Ok(())
+}
+
+/// Fused `[LoadLocal src, LappendLocal dst, Pop]` — the `lappend <var>
+/// $value` statement shape: same fast/fallback ladder as the pair (the
+/// `LappendLocal` arm's take/append/restore fast path; the dispatched
+/// `cmd_lappend` fallback with identical arguments otherwise), without
+/// the stack round-trip or the discarded result.
+#[inline]
+fn op_lappend_slot_slot(interp: &mut Interp, code: &ByteCode, src: u16, dst: u16) -> Result<()> {
+    let value = load_local_value(interp, code, src)?;
+    let dst = dst as usize;
+    if interp.lappend_slot_fast(dst, &value) {
+        return Ok(());
+    }
+    let name = code.locals().get(dst).map(String::as_str).unwrap_or("");
+    let args = [
+        Value::from_str("lappend"),
+        Value::from_str(name),
+        value,
+    ];
+    let _ = super::commands::list::cmd_lappend(interp, &args)?;
+    Ok(())
+}
+
 #[inline]
 fn op_jump(interp: &mut Interp, st: &mut VmState, t: u32) -> Result<()> {
     // Every inline body ends with a plain Jump — close its region and
@@ -999,19 +1111,44 @@ fn op_jump(interp: &mut Interp, st: &mut VmState, t: u32) -> Result<()> {
     Ok(())
 }
 
+/// The branch semantic shared by `JumpTrue`/`JumpFalse` and the fused
+/// `[cmp, jcc]` superinstructions: branch on `v` directly, without the
+/// stack round-trip the unfused pair performs.  `jump_pc` is the index of
+/// the *jump op* being realised — the backward-edge step charge
+/// (`op_jump`'s loop-back parity) tests against it exactly as the
+/// dispatched `op_jump_if` did with `st.pc == jump_pc + 1`.  Returns
+/// whether the branch was taken; a not-taken branch leaves `st.pc`
+/// untouched (callers fall through past the consumed jump) and opens the
+/// construct's body region, exactly as the stack round-trip would.
 #[inline]
-fn op_jump_if(interp: &mut Interp, st: &mut VmState, t: u32, want: bool) -> Result<()> {
-    let v = st.pop_val();
-    if crate::types::expr_funcs::strict_bool(&v)? == want {
-        if (t as i64) < st.pc as i64 {
+fn jump_if_value(
+    interp: &mut Interp,
+    st: &mut VmState,
+    v: &Value,
+    t: u32,
+    want: bool,
+    jump_pc: usize,
+) -> Result<bool> {
+    if crate::types::expr_funcs::strict_bool(v)? == want {
+        if (t as i64) < (jump_pc + 1) as i64 {
             interp.charge_step()?;
         }
         st.pc = t as usize;
+        Ok(true)
     } else {
         // Not taken → entering an inline body of the current command's
         // construct.
         st.bodies.push(Region::Body(st.cur_site));
+        Ok(false)
     }
+}
+
+#[inline]
+fn op_jump_if(interp: &mut Interp, st: &mut VmState, t: u32, want: bool) -> Result<()> {
+    let v = st.pop_val();
+    // The dispatch incremented past the jump op: its own index is
+    // `st.pc - 1`.
+    jump_if_value(interp, st, &v, t, want, st.pc - 1)?;
     Ok(())
 }
 
@@ -1302,7 +1439,6 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         OpCode::LappendLocal(slot) => {
             let slot = *slot as usize;
             let value = st.pop_val();
-            let name = code.locals().get(slot).map(String::as_str).unwrap_or("").to_string();
             if interp.lappend_slot_fast(slot, &value) {
                 let result = interp
                     .frames
@@ -1312,9 +1448,12 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                     .unwrap_or_else(Value::empty);
                 st.stack.push(result);
             } else {
+                // The name is only needed on the fallback path — keep the
+                // hot path free of the per-iteration String materialization.
+                let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
                 let args = [
                     Value::from_str("lappend"),
-                    Value::from_str(&name),
+                    Value::from_str(name),
                     value,
                 ];
                 let v = super::commands::list::cmd_lappend(interp, &args)?;
@@ -1476,6 +1615,22 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         OpCode::AddSlotImm(a, k) => op_add_slot_imm(interp, code, st, *a, *k)?,
         OpCode::CmpSlotSlot(a, b, cc) => op_cmp_slot_slot(interp, code, st, *a, *b, *cc)?,
         OpCode::CmpSlotImm(a, k, cc) => op_cmp_slot_imm(interp, code, st, *a, *k, *cc)?,
+        OpCode::CmpSlotSlotJumpTrue(a, b, cc, t) => {
+            op_cmp_ss_jump(interp, code, st, *a, *b, *cc, *t, true)?
+        }
+        OpCode::CmpSlotSlotJumpFalse(a, b, cc, t) => {
+            op_cmp_ss_jump(interp, code, st, *a, *b, *cc, *t, false)?
+        }
+        OpCode::CmpSlotImmJumpTrue(a, k, cc, t) => {
+            op_cmp_si_jump(interp, code, st, *a, *k, *cc, *t, true)?
+        }
+        OpCode::CmpSlotImmJumpFalse(a, k, cc, t) => {
+            op_cmp_si_jump(interp, code, st, *a, *k, *cc, *t, false)?
+        }
+        OpCode::LappendSlotSlot(src, dst) => op_lappend_slot_slot(interp, code, *src, *dst)?,
+        OpCode::IncrLocalPop(slot, amount) => {
+            let _ = incr_local_value(interp, code, *slot, *amount)?;
+        }
         OpCode::Sub => arith(st, '-')?,
         OpCode::Mul => arith(st, '*')?,
         OpCode::Div => arith(st, '/')?,
@@ -1883,6 +2038,33 @@ mod sub_inline_tests {
         // The bracket result is the LAST command's value; earlier results
         // are discarded like any script.
         assert_eq!(ev("set x [list a; list b]; set x"), "b");
+    }
+
+    /// The fused `[cmp, jcc]` superinstruction must not skip the op that
+    /// follows the pair: the fused op occupies the pair's head slot, so
+    /// the not-taken fall-through is `st.pc` itself (a stray `pc + 1` once
+    /// swallowed the body's first `BeginCmd`, making every body error look
+    /// like the construct's own — the inner command frames vanished from
+    /// errorInfo; caught by judge gen/gen_proc-old).
+    #[test]
+    fn fused_branch_fallthrough_keeps_site() {
+        let mut interp = Interp::new();
+        interp
+            .eval(
+                "proc t {} {\n    set x 44\n    while {$x < 100} {\n        error \"boom\"\n    }\n}",
+            )
+            .unwrap();
+        interp.eval("catch {t} m").unwrap();
+        let info = interp
+            .eval("set ::errorInfo")
+            .unwrap()
+            .as_str()
+            .to_string();
+        assert!(info.contains("error \"boom\""), "inner frame missing: {info}");
+        assert!(
+            info.contains("(procedure \"t\" line 4)"),
+            "procedure frame missing: {info}"
+        );
     }
 
     #[test]
@@ -2567,3 +2749,4 @@ p 1";
         );
     }
 }
+

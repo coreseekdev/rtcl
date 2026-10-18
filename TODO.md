@@ -18,6 +18,22 @@
 - [x] **fe 求和迭代（p 段，Rounds G–K 收尾）**：p 循环 9 op→**2 op**/迭代
   （`SET_SS_ADD` + `FOREACH_NEXT_CLOSE`），foreach_bind 快路径、body-mark
   折叠、融合分支直取布尔——fe 0.96x 指令 / 0.85x wall、build 0.76x。
+- [ ] **表示层重构（用户已授权，Tcl byte-2-byte 语义为红线）**——deep-dive 批次：
+  1. **`Value` 字符串表示层可共享**：`ValueInner.string` 从 `OnceCell<String>`
+     改为可共享句柄（如 `StrRep::Shared(Rc<str>) | Owned(Box<str>)`）+
+     `Value::str_handle() -> Option<Rc<str>>`：常量池/派发站点名共享同一句柄，
+     命令名/变量名的比较走 **ptr 快路径**（oovars/dloop 画像里 memcmp ~8%
+     + hashbrown 探测的字符串比较部分是目标）。注意 `append`/字符串改写走
+     COW；JIT 不触 Value 内部（仅 ABI）✓。
+  2. **`VarMap/VarSet` 键 `Rc<str>` + ptr-first Eq**（`Borrow<str>` 保 &str
+     查询）：link/prelink/OO memo 路径用共享句柄插查，探针 eq 去 memcmp；
+     插入时用已有的 memoized `Rc`（而非新 String）。
+  3. `call_proc` 帧准备缓存（按 ProcDef 预置 slots/绑定顺序）——fib 画像
+     call_proc 12%。
+  4. 空循环基线（dispatch + region 簿记）：`bodies` 预留 + unchecked push、
+     `VmState` 帧指针缓存（unsafe 面小、收益 ~5-8%）。
+- [x] **rtcl-vm 边界 unfused()**（Round P）：`execute()` 入口展开融合 op
+  （与 JIT 同桥）；canonical 集之外的面（lappend 族）维持其既有显式拒绝。
 - [ ] **OO 派发 per-call 字符串面（Round O 画像，oovars 0.69x）**：
   1. prelink 索引预计算：链 memo 构建时把 `(slot_idx, key, name)` 预先算好
      （编译体 locals 已知），每调用安装省去 `resolve_var_link` memo 探测 +

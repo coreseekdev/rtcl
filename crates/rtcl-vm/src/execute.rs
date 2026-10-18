@@ -65,6 +65,18 @@ fn foreach_bind(
 /// Returns the final value left on the stack (or empty if the stack is
 /// empty after execution).
 pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
+    // The interpreter's fused superinstructions are expanded back to
+    // their canonical windows first (`ByteCode::unfused`, the same bridge
+    // the JIT's compile boundary uses) — this VM implements the canonical
+    // op set, and the fused families would otherwise hit its explicit
+    // rejection arm.  Zero-cost when the unit has no fused ops.
+    let unfused;
+    let code = if code.has_fused_ops() {
+        unfused = code.unfused();
+        &unfused
+    } else {
+        code
+    };
     let ops = code.ops();
     let mut pc: usize = 0;
     let mut stack: Vec<Value> = Vec::with_capacity(32);

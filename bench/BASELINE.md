@@ -1512,6 +1512,14 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round X — OO prelink 槽位预计算（2026-10-18）
+
+`PrelinkEntry.slot`：链 memo 构建时（拿到编译体之后）预计算每个链接名在
+`locals` 表中的槽位；安装路径改走 `degrade_frame_link_at(frame_idx, name,
+slot, link)`——命中预计算槽位时跳过 `slot_index_of` 的线性名字扫描
+（debug_assert 校验槽位与名字一致）。实测 oovars 5536M→**5499M**；
+oo2/fe/fib/dloop/build 持平。门禁：tests 1256/0、judge 88/88、sweep 0。
+
 ## 审计记录 — 站点惰性化（Round W，结论：不做）
 
 想要「`BEGIN_CMD` 只写 `cur_site`，文本/行/word_srcs 延迟到错误路径解析」。

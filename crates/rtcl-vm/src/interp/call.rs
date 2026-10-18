@@ -356,7 +356,7 @@ impl Interp {
                     // The alias name leaves the slot model (link-only
                     // aliasing — the frame's other slots stay fast).
                     let glink = crate::interp::UpvarLink::Global(Rc::clone(qualified));
-                    self.degrade_frame_link(frame_idx, name, &glink);
+                    self.degrade_frame_link_at(frame_idx, name, entry.slot, &glink);
                     self.frames[frame_idx].upvars.insert(
                         Rc::clone(name),
                         crate::interp::UpvarLink::Global(Rc::clone(qualified)),

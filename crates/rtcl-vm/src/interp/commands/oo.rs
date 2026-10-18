@@ -942,6 +942,15 @@ fn memoised_proc_def(
     let names: Vec<&str> = def.params.iter().map(|(p, _)| p.as_str()).collect();
     let empty: Vec<String> = Vec::new();
     let vars_slice: &[String] = vars.as_deref().unwrap_or(&empty);
+    let mut pd = method_proc_def(&def.body, &def.params, method);
+    // Compile at the same seam named `proc`s use; the compiled form also
+    // unlocks call_proc's slot-locals binding (empty statics, params
+    // seeded in order — the synthetic name first, by construction).
+    let compiled =
+        super::super::vm_exec::compile_proc_body(&pd.params, &def.body, interp.tier1_epoch);
+    // The prelink list lands here — after the compiled body exists, so
+    // each entry can carry the frame slot its name occupies (the install
+    // then skips the locals-table scan).
     let links: Rc<Vec<crate::interp::PrelinkEntry>> = Rc::new(
         vars_slice
             .iter()
@@ -951,21 +960,22 @@ fn memoised_proc_def(
                 // here so the per-call install never probes the memo.
                 let (qualified, ns_part) =
                     crate::interp::commands::namespace::resolve_var_link(interp, ns, v);
+                let slot = compiled.as_ref().and_then(|c| {
+                    c.locals()
+                        .iter()
+                        .position(|l| l == v.as_str())
+                        .map(|i| i as u16)
+                });
                 crate::interp::PrelinkEntry {
                     name: Rc::from(v.as_str()),
                     qualified,
                     ns_part,
                     registered: core::cell::Cell::new(false),
+                    slot,
                 }
             })
             .collect(),
     );
-    let mut pd = method_proc_def(&def.body, &def.params, method);
-    // Compile at the same seam named `proc`s use; the compiled form also
-    // unlocks call_proc's slot-locals binding (empty statics, params
-    // seeded in order — the synthetic name first, by construction).
-    let compiled =
-        super::super::vm_exec::compile_proc_body(&pd.params, &def.body, interp.tier1_epoch);
     if let Some(code) = &compiled {
         interp.const_pool_insert(code);
     }

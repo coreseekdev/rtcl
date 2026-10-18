@@ -6,7 +6,7 @@
 //! - [`vars`]: variable access methods
 //! - [`eval`]: script evaluation and word expansion
 //! - [`call`]: procedure calls and tail-call optimisation
-//! - [`vm_bridge`]: [`VmContext`](rtcl_vm::VmContext) implementation
+//! - [`vm_bridge`]: [`VmContext`](crate::VmContext) implementation
 //! - [`util`]: shared helpers (`split_array_ref`, `glob_match`)
 //! - [`commands`] submodules: individual command implementations
 

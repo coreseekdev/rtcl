@@ -3,7 +3,7 @@
 use super::Interp;
 use crate::error::{Error, Result};
 use crate::value::Value;
-use rtcl_vm::VmContext;
+use crate::VmContext;
 
 impl Interp {
     /// Tcl renders every arity error with the command's usage text; fill it

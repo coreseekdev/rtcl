@@ -21,22 +21,25 @@
 extern crate alloc;
 
 // Core modules — error and value re-export from rtcl-vm
+// The interpreter and its supporting modules live in `rtcl-vm`; this
+// crate is the compatibility facade (same paths, same items).
 pub mod error;
-pub mod host;
 pub mod value;
-pub mod parser;
-pub mod interp;
-pub mod command;
-pub mod types;
+
+pub use rtcl_vm::host;
+pub use rtcl_vm::parser;
+pub use rtcl_vm::interp;
+pub use rtcl_vm::command;
+pub use rtcl_vm::types;
 #[cfg(feature = "std")]
-pub mod channel;
+pub use rtcl_vm::channel;
 
 // Re-exports for convenience
 pub use error::{Error, Result};
 pub use value::Value;
-pub use interp::Interp;
-pub use parser::parse;
-pub use command::{CommandFunc, CommandMeta};
+pub use rtcl_vm::interp::Interp;
+pub use rtcl_vm::parser::parse;
+pub use rtcl_vm::command::{CommandFunc, CommandMeta};
 
 // Re-export sub-crates so downstream can access them via rtcl_core
 pub use rtcl_parser;
@@ -46,9 +49,9 @@ pub use rtcl_vm;
 pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::value::Value;
-    pub use crate::interp::Interp;
-    pub use crate::parser::parse;
-    pub use crate::types::*;
+    pub use rtcl_vm::interp::Interp;
+    pub use rtcl_vm::parser::parse;
+    pub use rtcl_vm::types::*;
     pub use rtcl_parser::{ByteCode, Compiler, OpCode};
     pub use rtcl_vm::VmContext;
 }

@@ -27,7 +27,12 @@ pub(crate) struct NamespaceInfo {
     /// leading `::`).  A bare `variable x` registers the name without
     /// creating storage — `namespace which -variable x` still resolves it,
     /// while `info exists` stays 0 (tclsh 8.6.17).
-    pub variables: std::collections::HashSet<String>,
+    /// Fx-hashed ([`crate::interp::varmap::VarSet`]): re-declared (and so
+    /// re-inserted) on every method call through the `variable` prelink,
+    /// and probed by `variable`/`namespace which`; std's SipHash insert
+    /// was ~2% of the oo_bench2_vars profile.  Read order never leaks
+    /// (the one walk sorts).
+    pub variables: crate::interp::varmap::VarSet,
 }
 
 /// The full subcommand table (tclsh 8.6.17) — also the order used in the

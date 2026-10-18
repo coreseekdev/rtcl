@@ -53,11 +53,17 @@ mod fx {
                 self.add(u64::from_le_bytes(*c));
             }
             if !rem.is_empty() {
-                // Zero-padded tail: "abc" and "abc\0" still differ through
-                // the str-hash terminator byte.
-                let mut buf = [0u8; 8];
-                buf[..rem.len()].copy_from_slice(rem);
-                self.add(u64::from_le_bytes(buf));
+                // Zero-padded little-endian tail, assembled without a
+                // scratch buffer: the old `copy_from_slice` into an
+                // `[u8; 8]` showed up as `memcpy` inside the hash of
+                // every 1-4 byte variable name (~2% of the OO-call
+                // profile).  "abc" and "abc\0" still differ through the
+                // str-hash terminator byte.
+                let mut tail = 0u64;
+                for (i, &b) in rem.iter().enumerate() {
+                    tail |= (b as u64) << (8 * i);
+                }
+                self.add(tail);
             }
         }
 

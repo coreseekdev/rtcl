@@ -1341,3 +1341,22 @@ yaml_decode_4kb  74.2 us
 url_normalize    629 ns
 sha256_64b       203 ns
 
+
+## perf/interp-arch-opt — 解释器热径优化（2026-10-18）
+
+分支 `perf/interp-arch-opt`（不合并 master，JIT M2 期间独立验证）。画像工具：
+`setarch -R perf record -F 4000 -g` + 专用构建（frame pointers + debug info），
+`perf script` 文本自聚合（本机 `perf report` 超时不可用）；开发反馈以
+`perf stat -e instructions:u`（±0.01% 稳定）为准，wall 用交错 best-of-N。
+
+| 轮次 | 改动 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars |
+|---|---|---|---|---|---|---|
+| 起点（master f25d234） | — | 1.32x | 1.82x | 1.01x | 1.07x | 1.59x |
+| A（6892c48+da44359） | exec_op 热径内联 hot lane（共享 #[inline] 语义体） | 0.97x | 1.71x | 0.98x | 1.07x | 1.52x |
+| B1（c7e8f57） | `as_int/as_float` 补 Bool rep 快路径（循环条件不再字符串解析 "1"/"0"） | — | 1.47x | — | — | 1.49x |
+| B2（fb931c3） | Frame.has_aliased 帧级短路（slot 别名探测） | — | — | — | — | — |
+| B3（本提交） | Value::drop 内联两层（tag/refcount）+ as_int/as_float 拆分快慢 + strict_bool 内联 + op 边界检查单次化 | 1.03x | 1.23x | 1.01x | 0.97x | 1.47x |
+
+指令数比（rtcl/tclsh，越低越好）：fib 1.04x、fe 1.51x、dloop 0.86x、oo2 0.73x、
+oovars 1.05x、build-only 1.29x。fe 的余量集中在 `build`（lappend 循环，1.22x）；
+oovars 是内存停顿主导（指令 1.05x 但 wall 1.47x：cache-refs 346M vs tclsh 74M）。

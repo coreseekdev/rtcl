@@ -38,6 +38,8 @@ use core::cell::RefCell;
 use std::collections::HashMap;
 type FxMapK<K, V> =
     std::collections::HashMap<K, V, std::hash::BuildHasherDefault<crate::interp::varmap::VarHasher>>;
+#[cfg(feature = "embedded")]
+type FxMapK<K, V> = alloc::collections::BTreeMap<K, V>;
 
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeMap as HashMap;
@@ -185,8 +187,14 @@ pub(crate) enum DefineTarget {
 #[derive(Debug, Default)]
 pub(crate) struct OoState {
     pub next_obj_id: usize,
-    pub objects: HashMap<String, OoObject>,
-    pub classes: HashMap<String, OoClass>,
+    // Fx-hashed: these are probed by canonical object/class key on every
+    // OO dispatch (`resolve_object_key`, `owner_variables`,
+    // `object_ns_of`); std's SipHash was ~5% of the oo_bench2_vars
+    // profile in `find<(String, OoClass)>`.  Never iterated for output
+    // (`creation_order` drives listings), so the hash choice is
+    // order-invisible.
+    pub objects: FxMapK<String, OoObject>,
+    pub classes: FxMapK<String, OoClass>,
     /// Objects and classes in creation order (listing/cascade order).
     pub creation_order: Vec<String>,
     pub active: Vec<ActiveMethod>,
@@ -198,7 +206,7 @@ pub(crate) struct OoState {
     /// `my`/`self`/`next` command keys → owning object key.  Entries whose
     /// key no longer holds such a command were renamed away and are swept
     /// when their owner is destroyed (oo-1.20).
-    pub my_commands: HashMap<String, String>,
+    pub my_commands: FxMapK<String, String>,
     /// Structural mutation stamp: bumped at EVERY mutation of the class /
     /// object tables (create, destroy, every define word — see the bump
     /// sites in this module).  [`OoState::chain_memo`] entries validate

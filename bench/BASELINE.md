@@ -1512,6 +1512,15 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round AI — call_proc 批次 3 实验（2026-10-18，结论：回退）
+
+把「位置绑定 + `args` 尾 + `info level 0` 填词」的三次
+`self.frames.last_mut()` 借用合并为一次（args 尾先算成 `Option<String>`，
+帧借用期间不再重借）。画像里 `last_mut`/`as_mut_slice`/`non_null<Box>`
+合计 ≈4.2% of call_proc self，预期 ~0.5%——实测**净负**：fib +0.71%、
+oo2 +0.42%、oovars +0.31%（合并块更大、跨 `extend` 的生命周期拉长）。
+按纪律回退；item 4 以 AF+AH 收口。
+
 ## Round AH — call_proc 批次 1+2（2026-10-18，4 号收口）
 
 批次 1（守卫两个每调用 `take()`）：`frame.tailcall.is_some()` 与

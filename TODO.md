@@ -206,7 +206,10 @@
    **低优先级**（板面不覆盖 `my`）。
 
 **待做（按序）**
-4. ⏳ call_proc 帧准备（fib 2-3%）：**先画像再动**。可执行配方：
+4. ✅ call_proc 帧准备（Round AF/AH/AI）：画像定位后落地「去三连 Rc clone +
+   take 守卫 + ns 身份写/池化帧保留」——fib25 507.46M→**493.75M（−2.70%，
+   0.85x→0.83x）**、oo2 −1.38%、oovars −1.01%；批次 3（借用合并）实测净负
+   已回退（`aa5b3cf` 收口）。剩余的后期配方（原条目保留作参考）：
    `CARGO_TARGET_DIR=/tmp/opencode/rtcl-prof CARGO_PROFILE_RELEASE_STRIP=false     CARGO_PROFILE_RELEASE_DEBUG=1 RUSTFLAGS="-C force-frame-pointers=yes"     cargo build --release -p rtcl-cli` → `setarch $(uname -m) -R perf record     -F 8000 -g ./target/release/rtcl -f bench/scripts/fib25.tcl` →
     `perf script` 导出后 python 自聚合（本机 `perf report` 会超时）。
    已审读 call.rs 的候选（逐项都 <1%，需画像确认可叠加值 ≥2% 的组合）：
@@ -215,7 +218,10 @@
    帧池收发与 11 项字段 clear、返回值/`call_depth` 管道。
    注意红线：`info level 0` 的语义是「调用时刻的词快照」，level0 惰性化
    不可行（args 切片不驻帧；且调用后无法重建）——除非能证明全局无读者。
-5. 🔶 部分达成（Round AA/AG 实测修订）：派发名的 identity 命中已在
+5. ✅ 关闭（有证据，2026-10-18）：S1 被 Round AA/AG 缓存提前兑现；S2 经
+   成本/收益评估判定不做（每次短串构造加哈希 vs 罕见站点收益；板面不覆盖）；
+   S3 原计划不做。判定与理由见 `docs/DESIGN-value-handles.md` 1.5/1.6 节。
+   （下方为当时的中间状态记录）：派发名的 identity 命中已在
    对象派发（单槽）与 `my`（双槽，−32.3%）落地；`dispatch_dynamic`
    （`$o $m` 变量名）与字面量同速。**S1（名字构造点显式共享）已被
    上述缓存实现取代**——设计文档已加「实测修订」节。剩余价值集中在

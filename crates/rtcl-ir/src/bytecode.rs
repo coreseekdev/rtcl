@@ -595,6 +595,28 @@ impl ByteCode {
                 // `continue` landing on the same (consumed) instruction
                 // arrives with the same state either way — no target guard
                 // is needed here, unlike the value-window fusions.
+                // The whole `for` next-script tail in one op (the common
+                // `incr` shape; `k` must fit i32).
+                (OpCode::SwapToNextMark, OpCode::BeginCmdIncrLocalPop(site, x, k))
+                    if tail_free(3) =>
+                {
+                    match &self.ops[i + 2] {
+                        OpCode::Jump(t) => i32::try_from(*k)
+                            .ok()
+                            .map(|k32| (OpCode::ForNextIncrLocal(*site, *x, k32, *t), 3)),
+                        _ => None,
+                    }
+                }
+                (OpCode::SwapToNextMark, OpCode::BeginCmdIncrVarPop(site, x, k))
+                    if tail_free(3) =>
+                {
+                    match &self.ops[i + 2] {
+                        OpCode::Jump(t) => i32::try_from(*k)
+                            .ok()
+                            .map(|k32| (OpCode::ForNextIncrVar(*site, *x, k32, *t), 3)),
+                        _ => None,
+                    }
+                }
                 (OpCode::Jump(t), OpCode::NextMark) if *t as usize == i + 1 => {
                     retargets.push(((i + 1) as u32, i as u32));
                     Some((OpCode::SwapToNextMark, 2))
@@ -737,6 +759,8 @@ impl ByteCode {
                     | OpCode::SubEndStoreVarPop(..)
                     | OpCode::SubEndReturn
                     | OpCode::SwapToNextMark
+                    | OpCode::ForNextIncrLocal(..)
+                    | OpCode::ForNextIncrVar(..)
                     | OpCode::NextMarkBeginCmd(..)
                     | OpCode::BeginCmdIncrLocalPop(..)
                     | OpCode::BeginCmdIncrVarPop(..)
@@ -864,6 +888,22 @@ impl ByteCode {
                 OpCode::SwapToNextMark => {
                     out.push(OpCode::Nop);
                     out.push(OpCode::NextMark);
+                }
+                OpCode::ForNextIncrLocal(site, x, k, t) => {
+                    out.push(OpCode::Nop); // retired body-end trampoline Jump
+                    out.push(OpCode::NextMark);
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::IncrLocal(*x, *k as i64));
+                    out.push(OpCode::Pop);
+                    out.push(OpCode::Jump(*t));
+                }
+                OpCode::ForNextIncrVar(site, x, k, t) => {
+                    out.push(OpCode::Nop);
+                    out.push(OpCode::NextMark);
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::IncrVar(*x, *k as i64));
+                    out.push(OpCode::Pop);
+                    out.push(OpCode::Jump(*t));
                 }
                 OpCode::NextMarkBeginCmd(site) => {
                     out.push(OpCode::NextMark);
@@ -1046,6 +1086,9 @@ impl ByteCode {
                 }
                 OpCode::ForeachNext { body, .. } => mark(*body),
                 OpCode::ForeachNextClose(_, body) => mark(*body),
+                OpCode::ForNextIncrLocal(_, _, _, t) | OpCode::ForNextIncrVar(_, _, _, t) => {
+                    mark(*t)
+                }
                 _ => {}
             }
         }
@@ -1304,6 +1347,9 @@ impl ByteCode {
                 OpCode::ForeachNextClose(_, body) => {
                     *body = forward[*body as usize];
                 }
+                OpCode::ForNextIncrLocal(_, _, _, t) | OpCode::ForNextIncrVar(_, _, _, t) => {
+                    *t = forward[*t as usize];
+                }
                 _ => {}
             }
         }
@@ -1508,6 +1554,8 @@ mod tests {
                 OpCode::SubEndStoreVarPop(1),
                 OpCode::SubEndReturn,
                 OpCode::SwapToNextMark,
+                OpCode::ForNextIncrLocal(1, 2, 1, 3),
+                OpCode::ForNextIncrVar(1, 2, 1, 3),
                 OpCode::NextMarkBeginCmd(1),
                 OpCode::BeginCmdIncrLocalPop(1, 2, 1),
                 OpCode::BeginCmdIncrVarPop(1, 2, 1),

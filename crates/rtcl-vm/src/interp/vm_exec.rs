@@ -540,6 +540,12 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                 op_swap_to_next_mark(st);
                 Ok(())
             }
+            OpCode::ForNextIncrLocal(site, slot, amount, t) => {
+                op_for_next_incr_local(interp, code, st, *site, *slot, *amount, *t)
+            }
+            OpCode::ForNextIncrVar(site, idx, amount, t) => {
+                op_for_next_incr_var(interp, code, st, *site, *idx, *amount, *t)
+            }
             OpCode::NextMarkBeginCmd(site) => {
                 op_next_mark_begin_cmd(interp, code, st, *site)
             }
@@ -1104,6 +1110,48 @@ fn op_swap_to_next_mark(st: &mut VmState) {
         }
     }
     st.bodies.push(Region::Next(st.cur_site));
+}
+
+/// The `for` next-script tail `[SwapToNextMark, BeginCmdIncrLocalPop,
+/// Jump]` in one dispatch: the swap's region normalization + next-region
+/// open, the site set, the increment-and-discard, then the jump's region
+/// close, step charge and transfer — the verbatim sequence, so entries at
+/// the head (a compiled `continue`) and errors at any step see identical
+/// state.  The window's Jump sat one past the fused head's next op, hence
+/// `jump_pc = st.pc + 1` for the backward-charge parity.
+#[allow(clippy::too_many_arguments)] // interp/code/st + the window's four operands
+#[inline]
+fn op_for_next_incr_local(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    site: u32,
+    slot: u16,
+    amount: i32,
+    t: u32,
+) -> Result<()> {
+    op_swap_to_next_mark(st);
+    op_begin_cmd(interp, code, st, site)?;
+    let _ = incr_local_value(interp, code, slot, amount as i64)?;
+    op_jump_from(interp, st, t, st.pc + 1)
+}
+
+/// The name-keyed twin of [`op_for_next_incr_local`].
+#[allow(clippy::too_many_arguments)] // interp/code/st + the window's four operands
+#[inline]
+fn op_for_next_incr_var(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    site: u32,
+    idx: u16,
+    amount: i32,
+    t: u32,
+) -> Result<()> {
+    op_swap_to_next_mark(st);
+    op_begin_cmd(interp, code, st, site)?;
+    op_incr_var_pop(interp, code, idx, amount as i64)?;
+    op_jump_from(interp, st, t, st.pc + 1)
 }
 
 /// `[NextMark, BeginCmd s]`: open the next-script region, then set the
@@ -1727,6 +1775,16 @@ fn op_lappend_slot_slot(interp: &mut Interp, code: &ByteCode, src: u16, dst: u16
 
 #[inline]
 fn op_jump(interp: &mut Interp, st: &mut VmState, t: u32) -> Result<()> {
+    // `st.pc` is the jump op's own index + 1 (the dispatch incremented).
+    op_jump_from(interp, st, t, st.pc - 1)
+}
+
+/// [`op_jump`] with the jump's *original* op index supplied: a fused
+/// loop-tail op compacts several ops into the head, and the backward-step
+/// charge tests against where the jump op sits (`jump_pc + 1`), exactly as
+/// the dispatched `Jump` did.
+#[inline]
+fn op_jump_from(interp: &mut Interp, st: &mut VmState, t: u32, jump_pc: usize) -> Result<()> {
     // Every inline body ends with a plain Jump — close its region and
     // restore the owning construct as the current command: the words/bodies
     // inside may have opened commands of their own (inlined brackets), and
@@ -1739,7 +1797,7 @@ fn op_jump(interp: &mut Interp, st: &mut VmState, t: u32) -> Result<()> {
     // A1 step budget: backward jump = loop back-edge — pure control flow
     // (`while {1} {}`) dispatches zero commands, only the back-edge can
     // charge it.
-    if i64::from(t) < st.pc as i64 {
+    if i64::from(t) < (jump_pc + 1) as i64 {
         interp.charge_step()?;
     }
     st.pc = t as usize;
@@ -2277,6 +2335,12 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         OpCode::SubEndStoreVarPop(idx) => op_sub_end_store_var_pop(interp, code, st, *idx)?,
         OpCode::SubEndReturn => op_sub_end_return(st)?,
         OpCode::SwapToNextMark => op_swap_to_next_mark(st),
+        OpCode::ForNextIncrLocal(site, slot, amount, t) => {
+            op_for_next_incr_local(interp, code, st, *site, *slot, *amount, *t)?
+        }
+        OpCode::ForNextIncrVar(site, idx, amount, t) => {
+            op_for_next_incr_var(interp, code, st, *site, *idx, *amount, *t)?
+        }
         OpCode::NextMarkBeginCmd(site) => op_next_mark_begin_cmd(interp, code, st, *site)?,
         OpCode::BeginCmdIncrLocalPop(site, slot, amount) => {
             op_begin_cmd_incr_local_pop(interp, code, st, *site, *slot, *amount)?

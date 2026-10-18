@@ -1512,6 +1512,21 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round U — 循环骨架融合（修复版，2026-10-18）
+
+Round T 失败**根因已定位并修复**：`ForNextIncrLocal/Var` 携带的跳转靶点
+漏进 `strip_nops` 重映射与 `collect_jump_targets`——复杂脚本里前段折叠
+产生的 nop 一经 strip 就把条件靶点移错（循环不退出）；简单脚本无 nop
+故自测通过。补上两处后：
+
+- `[SwapToNextMark, BeginCmdIncrLocal/VarPop(site,x,k), Jump(t)]`
+  → `ForNextIncrLocal/Var`（k 需 fits-i32；`jump_pc = st.pc + 1` 计步平价）；
+  entries 在头部（continue 落点）执行同一序列。
+- 实测：`micro_base` 449.9M→**430.9M（1.33x→1.28x）**、`micro_incr`
+  533.9M→518.9M（1.36x→1.33x）、`build-only` 3485M→**3371M（0.75x→0.72x）**、
+  `fe_bench` 0.93x→**0.92x**；fib/dloop/oo2/oovars 持平。
+- 门禁：tests **1256/0**、judge **88/88**（含 control_flow/gen_expr）、sweep 0。
+
 ## 实验记录 — 循环骨架融合（Round T，已回退）
 
 消融定位（新增 micro）：**`while` 形态 1.09x vs `for` 形态 1.33x**

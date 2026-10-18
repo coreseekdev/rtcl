@@ -199,6 +199,7 @@ impl Compiler {
             | OpCode::BeginCmdIncrLocalPop(_, _, _) | OpCode::BeginCmdIncrVarPop(_, _, _)
             | OpCode::ForeachNextClose(_, _)
             | OpCode::SlotSetAddSS { .. } | OpCode::VarSetAddVV { .. }
+            | OpCode::ForNextIncrLocal(_, _, _, _) | OpCode::ForNextIncrVar(_, _, _, _)
             | OpCode::PushConstSubMark(_) | OpCode::SubMarkBeginCmd(_)
             | OpCode::ExprMarkBeginPushConst(_, _)
             | OpCode::SubSlotImm(_, _) | OpCode::SubSlotSlot(_, _)
@@ -1277,7 +1278,10 @@ mod tests {
         // chain fuses to a comparison branch (`CmpVarImmJumpFalse`).
         assert!(ops.iter().any(|o| matches!(
             o,
-            OpCode::IncrVarPop(_, 1) | OpCode::BeginCmdIncrVarPop(_, _, 1)
+            OpCode::IncrVarPop(_, 1)
+                | OpCode::BeginCmdIncrVarPop(_, _, 1)
+                | OpCode::ForNextIncrVar(_, _, 1, _)
+                | OpCode::ForNextIncrLocal(_, _, 1, _)
         )));
         assert!(ops.iter().any(|o| matches!(o, OpCode::CmpVarImmJumpFalse(..))));
         // Should NOT have EvalExpr (expression was compiled inline)
@@ -1295,13 +1299,22 @@ mod tests {
         let ops = bc.ops();
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopEnter { .. })));
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopExit)));
+        // The next-script region marker may ride the whole-tail fusion
+        // (`ForNextIncrLocal/Var`) when the next script is a single incr.
         assert!(ops.iter().any(|o| matches!(
             o,
-            OpCode::NextMark | OpCode::SwapToNextMark | OpCode::NextMarkBeginCmd(_)
+            OpCode::NextMark
+                | OpCode::SwapToNextMark
+                | OpCode::NextMarkBeginCmd(_)
+                | OpCode::ForNextIncrLocal(..)
+                | OpCode::ForNextIncrVar(..)
         )));
         assert!(ops.iter().any(|o| matches!(
             o,
-            OpCode::IncrVarPop(_, 1) | OpCode::BeginCmdIncrVarPop(_, _, 1)
+            OpCode::IncrVarPop(_, 1)
+                | OpCode::BeginCmdIncrVarPop(_, _, 1)
+                | OpCode::ForNextIncrVar(_, _, 1, _)
+                | OpCode::ForNextIncrLocal(_, _, 1, _)
         )));
         // Condition compiled inline — no EvalExpr fallback.
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));

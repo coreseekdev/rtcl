@@ -1514,8 +1514,14 @@ oovars 1.59 / build 1.29）。
 
 ## Round AE — call_proc 行级归因（2026-10-18）
 
-`perf report -i /tmp/fib25.perf --stdio -q --symbols=call_proc --sort=srcline`
-（过滤后只对 call_proc 叶帧做 addr2line，避免 +srcline 全量超时）：
+工具路径三连挫（已踩，勿重复）：
+1) `perf script -F +srcline` 全量：逐帧 addr2line，4.4M 帧 → 超时（900s）。
+2) `perf report --symbols=call_proc --sort=srcline`：本机版本该组合无输出。
+3) 小样本重录（`-F 4000`×12）+ `-F +srcline`：重录仅得 6 样本（record 未采到
+   子进程），且本机 perf 不认 `+srcline` 字段（133 行无行号）。
+→ **正确工具是 `perf annotate`**：`perf annotate -i /tmp/fib25.perf --stdio
+   -s call_proc`（单符号源码/汇编注记，只对一个符号做 addr2line，成本可控）。
+（下列为路径 2 的空输出记录）：
 
 ```
 (perf report --symbols 过滤无输出)

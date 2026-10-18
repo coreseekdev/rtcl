@@ -564,6 +564,11 @@ impl Clone for Value {
 }
 
 impl Drop for Value {
+    /// Two inlined tiers before any call: the tag check (immediates and
+    /// the UNSET sentinel own no heap box) and a plain refcount decrement
+    /// for a shared box.  Every discarded immediate — each loop's popped
+    /// `incr`/`set`/`lappend` result — used to pay a `drop_glue` call;
+    /// only the last-owner free is outlined.
     #[inline]
     fn drop(&mut self) {
         let bits = self.bits.get();
@@ -578,8 +583,24 @@ impl Drop for Value {
                 (*p).rc.set(n - 1);
                 return;
             }
-            // Last owner: free the payload (string buffer, list/dict
-            // vecs), then recycle the box itself.
+        }
+        self.drop_last_owner();
+    }
+}
+
+impl Value {
+    /// The last-owner arm of [`Drop`], outlined: free the payload (string
+    /// buffer, list/dict vecs), then recycle the box itself.
+    #[inline(never)]
+    fn drop_last_owner(&mut self) {
+        let bits = self.bits.get();
+        if bits & 1 == 1 || bits == 0 {
+            // Defensive: only reached with a heap box (the inline tier
+            // returns first); kept so the outlined arm is self-contained.
+            return;
+        }
+        unsafe {
+            let p = bits as *mut ValueInner;
             std::ptr::drop_in_place(p);
             let pushed = FREELIST.try_with(|fl| {
                 let mut fl = fl.borrow_mut();
@@ -798,6 +819,11 @@ impl Value {
     }
 
     /// Try to get as integer
+    ///
+    /// The Int/Bool arms are `#[inline]` (every compiled loop condition and
+    /// `incr` lands here); the string-rep arm is outlined so call sites
+    /// don't carry the radix parser's code.
+    #[inline]
     pub fn as_int(&self) -> Option<i64> {
         if self.is_imm() {
             return Some(self.imm());
@@ -809,7 +835,15 @@ impl Value {
             // path every loop condition takes (Tcl_GetBooleanFromObj's
             // numeric arm), not a from-scratch decimal parse.
             InternalRep::Bool(b) => Some(*b as i64),
-            _ => {
+            _ => self.as_int_from_string(),
+        }
+    }
+
+    /// The string-rep arm of [`Self::as_int`], outlined.
+    #[inline(never)]
+    fn as_int_from_string(&self) -> Option<i64> {
+        {
+            {
                 let s = self.to_str();
                 let s = s.trim();
                 // Handle hex, octal, binary — with optional sign
@@ -854,7 +888,9 @@ impl Value {
         }
     }
 
-    /// Try to get as float
+    /// Try to get as float (numeric arms `#[inline]`, string arm outlined —
+    /// see [`Self::as_int`]).
+    #[inline]
     pub fn as_float(&self) -> Option<f64> {
         if self.is_imm() {
             return Some(self.imm() as f64);
@@ -864,19 +900,23 @@ impl Value {
             InternalRep::Float(n) => Some(*n),
             InternalRep::Int(n) => Some(*n as f64),
             InternalRep::Bool(b) => Some(u8::from(*b) as f64),
-            _ => {
-                let s = self.to_str();
-                let s = s.trim();
-                // Tcl accepts Inf / -Inf / NaN (any case) as numeric strings.
-                match s.to_ascii_lowercase().as_str() {
-                    "inf" | "infinity" => return Some(f64::INFINITY),
-                    "-inf" | "-infinity" => return Some(f64::NEG_INFINITY),
-                    "nan" => return Some(f64::NAN),
-                    _ => {}
-                }
-                f64::from_str(s).ok()
-            }
+            _ => self.as_float_from_string(),
         }
+    }
+
+    /// The string-rep arm of [`Self::as_float`], outlined.
+    #[inline(never)]
+    fn as_float_from_string(&self) -> Option<f64> {
+        let s = self.to_str();
+        let s = s.trim();
+        // Tcl accepts Inf / -Inf / NaN (any case) as numeric strings.
+        match s.to_ascii_lowercase().as_str() {
+            "inf" | "infinity" => return Some(f64::INFINITY),
+            "-inf" | "-infinity" => return Some(f64::NEG_INFINITY),
+            "nan" => return Some(f64::NAN),
+            _ => {}
+        }
+        f64::from_str(s).ok()
     }
 
     /// Try to get as boolean

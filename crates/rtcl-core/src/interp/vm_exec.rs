@@ -417,7 +417,14 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
         // Stream end: the tree-walk's result is the last command's, which
         // the stack discipline leaves on top (`set`/`incr` fast paths and
         // dispatches all push their result).
-        let Some(op) = ops.get(st.pc) else { break st.pop_val() };
+        // One bounds check per op, then an unchecked load: the `get`
+        // Option cost sits on every dispatch of every loop (the profile's
+        // `get<OpCode>` ~4% of the build loop).
+        if st.pc >= ops.len() {
+            break st.pop_val();
+        }
+        // SAFETY: the check above proves `st.pc` in-bounds.
+        let op = unsafe { ops.get_unchecked(st.pc) };
         st.pc += 1;
         // ── Hot lane ────────────────────────────────────────────────────
         // The ops a compiled loop body is made of run inline: the
@@ -1775,7 +1782,7 @@ fn dispatch_dynamic(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// Read slot `slot` with LoadLocal's exact fallback chain: the cell when
 /// set, `eval_var_ref` on the table name otherwise (globals fallback,
 /// linked-slot resolution, canonical errors — all owned by the name path).
-#[inline]
+#[inline(always)]
 fn slot_read_or_name(interp: &mut Interp, code: &ByteCode, slot: usize) -> Result<Value> {
     if let Some(f) = interp.frames.last() {
         if !(f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false)) {
@@ -1798,7 +1805,7 @@ fn slot_read_or_name(interp: &mut Interp, code: &ByteCode, slot: usize) -> Resul
 /// relational operators (numeric-then-string, NaN rules included), plus
 /// eq/ne (numeric equality, then string equality — op_eq/op_ne's own
 /// contract).
-#[inline]
+#[inline(always)]
 fn cmp_values(a: &Value, b: &Value, cc: u8) -> Value {
     match cc {
         0 => crate::types::expr_ops::op_rel(a, b, "<"),

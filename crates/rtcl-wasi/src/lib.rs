@@ -19,6 +19,11 @@
 use rtcl_core::Interp;
 use std::cell::RefCell;
 
+mod host;
+
+/// examine bridge 词表（guest 内 Tcl；http.tcl 由 `load_http()` 提供）。
+const WASI_BRIDGE: &str = include_str!("../tcl/wasi-bridge.tcl");
+
 /// ABI 版本（宿主加载时必须相等）。
 pub const ABI_VERSION: u32 = 1;
 
@@ -63,14 +68,25 @@ pub extern "C" fn rtcl_free(ptr: *mut u8, len: usize) {
 }
 
 /// 初始化解释器：`abi` 必须等于 [`ABI_VERSION`]；返回 handle（v0 恒为 1），0 = 失败。
+/// 同时装配 guest 词层：http.tcl（native 契约）+ `__rtcl_http` 桥 + `host::*` 原语。
 #[no_mangle]
 pub extern "C" fn rtcl_init(abi: u32) -> u32 {
     if abi != ABI_VERSION {
         return 0;
     }
     STATE.with(|s| {
+        let mut interp = Interp::new();
+        host::register(&mut interp);
+        // 词层失败仅警告（对齐 rtcl-native::net::install 的纪律：不静默但也
+        // 不因可选词层失败阻断解释器本体）。
+        if let Err(e) = interp.load_http() {
+            eprintln!("rtcl-wasi: warning: http word layer failed to load: {e}");
+        }
+        if let Err(e) = interp.eval(WASI_BRIDGE) {
+            eprintln!("rtcl-wasi: warning: http guest bridge failed to load: {e}");
+        }
         *s.borrow_mut() = Some(State {
-            interp: Interp::new(),
+            interp,
             result: String::new(),
             error: String::new(),
         });

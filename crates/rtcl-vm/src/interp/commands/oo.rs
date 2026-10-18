@@ -224,15 +224,16 @@ pub(crate) enum DefineTarget {
     Object(String),
 }
 
-/// One-entry dispatcher cache for [`cmd_oo_object`] (see its fast path).
-/// Validation is identity-and-stamp: the typed word and the method word
-/// must be the *same allocations* (a const-pool literal or a slot value
-/// re-cloned — both stable across calls), the resolution namespace the
-/// same `Rc`, and the mutation stamp live.  Those together imply
-/// `resolve_object_key` would recompute the identical key and `chain_for`
-/// would hit its memo — so both hash probes are skipped and the cached
-/// chain feeds `exec_chain_entry` directly.  `include_private` dispatch
-/// (`my`) neither consults nor fills the entry.
+/// Dispatcher-cache entry for the object dispatcher and `my` (see their
+/// fast paths).  Validation is identity-and-stamp: the typed word and the
+/// method word must be the *same allocations* (a const-pool literal, a
+/// slot value re-cloned, or the `my` word — all stable across calls), the
+/// resolution namespace the same `Rc`, and the mutation stamp live.
+/// Those together imply `resolve_object_key`/`qualify` would recompute
+/// the identical key and `chain_for` would hit its memo — so the hash
+/// probes are skipped and the cached chain feeds `exec_chain_entry`.
+/// Each dispatcher holds a two-entry set (two call sites, or two method
+/// names alternating — the one-entry form thrashed, Round AB).
 #[derive(Debug)]
 pub(crate) struct OoCallCache {
     pub ns: Rc<str>,
@@ -240,6 +241,9 @@ pub(crate) struct OoCallCache {
     pub typed: Value,
     pub method: Value,
     pub key: Rc<str>,
+    /// The object's namespace, captured at fill time — the `my` slot's
+    /// `frame_in_object_ns` guard needs it without re-probing the tables.
+    pub obj_ns: Option<Rc<str>>,
     pub method_rc: Rc<str>,
     pub chain: Rc<Vec<ChainEntry>>,
 }
@@ -292,9 +296,15 @@ pub(crate) struct OoState {
     pub chain_memo: FxMapK<Rc<str>, ChainMemo>,
     /// The `include_private` half of [`Self::chain_memo`].
     pub chain_memo_priv: FxMapK<Rc<str>, ChainMemo>,
-    /// One-entry dispatch cache for the object dispatcher — see
-    /// [`OoCallCache`].
-    pub call_cache: Option<OoCallCache>,
+    /// The object dispatcher's cache entry — a single slot: its hot loops
+    /// repeat one method, and a second probe costs a few instructions per
+    /// call (measured).  See [`OoCallCache`].
+    pub obj_cache: Option<OoCallCache>,
+    /// The `my` dispatcher's two-entry set: method bodies alternate
+    /// `my a` / `my b` recursion, which a single slot thrashed (Round AB).
+    pub my_cache: [Option<OoCallCache>; 2],
+    /// Alternating fill cursor for [`Self::my_cache`].
+    pub my_cache_next: u8,
     /// Typed-name → canonical object/class key memo (see
     /// `resolve_object_key`): current namespace → typed name →
     /// (stamp, resolution).  `RefCell` so `&Interp` read paths can fill
@@ -1073,6 +1083,52 @@ fn object_ns_of(interp: &Interp, key: &str) -> Rc<str> {
     Rc::from("::")
 }
 
+/// Is the entry still the resolution this invocation would recompute?
+fn cache_entry_live(interp: &Interp, c: &OoCallCache, typed_val: &Value, method_val: &Value) -> bool {
+    c.stamp == interp.oo.mutation_ctr
+        && Rc::ptr_eq(&c.ns, &interp.current_namespace)
+        && c.typed.same_allocation(typed_val)
+        && c.method.same_allocation(method_val)
+}
+
+/// Two-entry probe for the `my` dispatcher's set.
+fn my_cache_hit(interp: &Interp, typed_val: &Value, method_val: &Value) -> Option<usize> {
+    if let Some(c) = &interp.oo.my_cache[0] {
+        if cache_entry_live(interp, c, typed_val, method_val) {
+            return Some(0);
+        }
+    }
+    if let Some(c) = &interp.oo.my_cache[1] {
+        if cache_entry_live(interp, c, typed_val, method_val) {
+            return Some(1);
+        }
+    }
+    None
+}
+
+/// Build an entry for the current resolution (the caller only fills after
+/// a miss, so no stale-match handling is needed).
+fn cache_entry(
+    interp: &Interp,
+    typed_val: &Value,
+    method_val: &Value,
+    obj_ns: Option<Rc<str>>,
+    key: &Rc<str>,
+    method_rc: &Rc<str>,
+    chain: &Rc<Vec<ChainEntry>>,
+) -> OoCallCache {
+    OoCallCache {
+        ns: Rc::clone(&interp.current_namespace),
+        stamp: interp.oo.mutation_ctr,
+        typed: typed_val.clone(),
+        method: method_val.clone(),
+        key: Rc::clone(key),
+        obj_ns,
+        method_rc: Rc::clone(method_rc),
+        chain: Rc::clone(chain),
+    }
+}
+
 /// Invoke `method` on `key`, or produce the unknown-method error.
 ///
 /// The resolution chain comes from [`OoState::chain_memo`] — building it
@@ -1094,18 +1150,22 @@ fn invoke_method(
     if chain.is_empty() {
         return Err(unknown_method_error(interp, key, typed, method));
     }
-    if !include_private {
-        // Refresh the dispatcher cache for the next call to this site
-        // (stamp-validated, so a mutation retires it implicitly).
-        interp.oo.call_cache = Some(OoCallCache {
-            ns: Rc::clone(&interp.current_namespace),
-            stamp: interp.oo.mutation_ctr,
-            typed: typed_val.clone(),
-            method: method_val.clone(),
-            key: Rc::clone(key),
-            method_rc: Rc::clone(&method_rc),
-            chain: Rc::clone(&chain),
-        });
+    if include_private {
+        let idx = (interp.oo.my_cache_next & 1) as usize;
+        interp.oo.my_cache_next = (idx as u8 + 1) & 1;
+        let entry = cache_entry(
+            interp,
+            typed_val,
+            method_val,
+            Some(object_ns_of(interp, key)),
+            key,
+            &method_rc,
+            &chain,
+        );
+        interp.oo.my_cache[idx] = Some(entry);
+    } else {
+        let entry = cache_entry(interp, typed_val, method_val, None, key, &method_rc, &chain);
+        interp.oo.obj_cache = Some(entry);
     }
     exec_chain_entry(interp, key, &method_rc, 0, &chain, call_args, typed, typed_val, true)
 }
@@ -1167,22 +1227,20 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
     // resolution straight through.  `args.len() < 2` keeps falling into
     // the arity error below.
     if args.len() >= 2 {
-        if let Some(c) = interp.oo.call_cache.as_ref() {
-            if c.stamp == interp.oo.mutation_ctr
-                && Rc::ptr_eq(&c.ns, &interp.current_namespace)
-                && c.typed.same_allocation(&args[0])
-                && c.method.same_allocation(&args[1])
-            {
-                let key = Rc::clone(&c.key);
-                let method_rc = Rc::clone(&c.method_rc);
-                let chain = Rc::clone(&c.chain);
+        if let Some(c) = interp.oo.obj_cache.as_ref() {
+            if cache_entry_live(interp, c, &args[0], &args[1]) {
+                let (key, method_rc, chain) = (
+                    Rc::clone(&c.key),
+                    Rc::clone(&c.method_rc),
+                    Rc::clone(&c.chain),
+                );
                 return exec_chain_entry(
-                    interp,
-                    &key,
-                    &method_rc,
-                    0,
-                    &chain,
-                    &args[2..],
+                interp,
+                &key,
+                &method_rc,
+                0,
+                &chain,
+                &args[2..],
                     typed,
                     &args[0],
                     true,
@@ -1211,6 +1269,38 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
 extern "Rust" fn cmd_oo_my(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Borrowed throughout (see cmd_oo_object).
     let typed = args[0].as_str();
+    // Dispatcher cache, `my` slot: the typed word ("my"), the method word,
+    // the namespace and the stamp pin the resolution (`qualify` + the
+    // `my_commands` probe) and the chain.  The frame guard still runs per
+    // call — it depends on the live frame stack.
+    if args.len() >= 2 {
+        if let Some(i) = my_cache_hit(interp, &args[0], &args[1]) {
+            let (key, method_rc, chain, obj_ns) = {
+                let c = interp.oo.my_cache[i].as_ref().unwrap();
+                (
+                    Rc::clone(&c.key),
+                    Rc::clone(&c.method_rc),
+                    Rc::clone(&c.chain),
+                    c.obj_ns.clone(),
+                )
+            };
+            let obj_ns = obj_ns.unwrap_or_else(|| object_ns_of(interp, &key));
+            if !frame_in_object_ns(interp, &obj_ns) {
+                return Err(Error::invalid_command(typed));
+            }
+            return exec_chain_entry(
+                interp,
+                &key,
+                &method_rc,
+                0,
+                &chain,
+                &args[2..],
+                typed,
+                &args[0],
+                true,
+            );
+        }
+    }
     let cmd_key = qualify(&interp.current_namespace, typed);
     let key: Rc<str> = match interp.oo.my_commands.get(&cmd_key) {
         Some(k) => Rc::from(k.as_str()),

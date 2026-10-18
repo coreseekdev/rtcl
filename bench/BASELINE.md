@@ -1512,6 +1512,22 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round AG — my 双槽派发缓存（2026-10-18，5 号配套实测）
+
+结构：对象派发**单槽**（`obj_cache`）＋ `my` 派发**双槽**（`my_cache[2]` +
+交替填充游标）。验证不变（`cache_entry_live`：stamp + ns 指针 + typed/method
+分配身份）；`my` 路径仍逐调用跑 `frame_in_object_ns` 门禁（obj_ns 随条目缓存）。
+
+实测（确定性指令数）：
+- `my_bench`（a↔b 交替递归，2.1M 次 `my`）17.466G→**11.827G（−32.3%）**
+  ——Round AB 单槽冲刷问题的正解。
+- `dispatch_dynamic`（`$o $m` 变量名派发）4.448G 持平（对象单槽已覆盖）。
+- oo2 3809.1M / oovars 4915.2M 持平（**回退过程留档**：把对象派发也做双槽
+  会因第二槽探测 +7 instr/调用使 oo2/oovars 各 +0.18%，故拆成单/双槽；
+  展开手写探针救不回这 7 instr，成本在条目本身）。
+- 板面六项与 AF 相同（fib 0.84x / fe 0.92x / dloop 0.68x / oo2 0.42x /
+  oovars 0.52x / build 0.72x）。门禁：tests 1256/0、judge 88/88、sweep 0。
+
 ## Round AF — call_proc 去 Rc 流量（2026-10-18，4 号第一刀）
 
 **落地**（call.rs）：`params`/`body`/`compiled` 的每调用三连 `Rc::clone`

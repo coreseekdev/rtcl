@@ -215,11 +215,13 @@
    帧池收发与 11 项字段 clear、返回值/`call_depth` 管道。
    注意红线：`info level 0` 的语义是「调用时刻的词快照」，level0 惰性化
    不可行（args 切片不驻帧；且调用后无法重建）——除非能证明全局无读者。
-5. ⏳ `Value` 字符串句柄共享（最深）：**设计稿已落盘** `docs/DESIGN-value-handles.md`
-   （S1 名字构造点显式共享 → S2 短串线程本地驻留 → S3 表示层统一；
-   红线=单向 identity 推理/Weak 不泄漏/不驻留数据串/可关）。S1 与 3 号缓存
-   的复利点：`my`/`$o $m` 计算名也能 identity 命中（Round AB 冲刷问题的解）。
-   动码前先建 `dispatch_dynamic.tcl` 微基准。
+5. 🔶 部分达成（Round AA/AG 实测修订）：派发名的 identity 命中已在
+   对象派发（单槽）与 `my`（双槽，−32.3%）落地；`dispatch_dynamic`
+   （`$o $m` 变量名）与字面量同速。**S1（名字构造点显式共享）已被
+   上述缓存实现取代**——设计文档已加「实测修订」节。剩余价值集中在
+   **S2（短串驻留在 Value 构造点，服务「拼出来的名字」）**：收益不在
+   板面，且需先在 micro_add/lappend 上证明数据串无回退；S3 暂不计划。
+   结论与证据见 `docs/DESIGN-value-handles.md`。
 
 **其余候选**：`call_proc` 帧准备之外的四板点（fib 0.85x / fe 0.92x / dloop 0.68x /
 build 0.72x）已在上一节定界；micro_add 0.89x、micro_lappend 0.72x（已 <1x）。

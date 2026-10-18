@@ -81,7 +81,14 @@ impl Interp {
         let prev_namespace = self.current_namespace.clone();
         // Apply's one-shot `info level 0` word (consumed even when the
         // arity check fails, so it can't leak into a later call).
-        let level0_override = self.frame_level0_args.take();
+        // Same guard as the tailcall marker: `take()` on the (24-byte)
+        // Option is a full replace; `apply` frames are the only ones that
+        // ever arm it.
+        let level0_override = if self.frame_level0_args.is_some() {
+            self.frame_level0_args.take()
+        } else {
+            None
+        };
         // The OO dispatcher's one-shot variable links (consumed here for
         // the same leak reason; installed at frame setup below).
         let prelink = self.frame_prelink.take();
@@ -124,8 +131,14 @@ impl Interp {
                 ns_depth: 0,
             }),
         };
-        frame.ns = None;
-        frame.call_ns = Some(prev_namespace.clone());
+        // `frame.ns`/`frame.call_ns` are *retained* across the pool
+        // round-trip (not reset here, not cleared at the epilogue): the
+        // assignments below are identity-checked, so a hot proc in one
+        // namespace pays neither a drop nor a clone per call.  The frame
+        // is only read after the definition namespace is (re)established.
+        if !matches!(&frame.call_ns, Some(n) if Rc::ptr_eq(n, &prev_namespace)) {
+            frame.call_ns = Some(Rc::clone(&prev_namespace));
+        }
         frame.tailcall = None;
         frame.level0.clear();
         frame.ns_depth = self.ns_level0.len();
@@ -191,9 +204,17 @@ impl Interp {
                 let def_ns = ns_override
                     .take()
                     .unwrap_or_else(|| ns_of_qualified(self, &current_proc_name));
-                self.current_namespace = Rc::clone(&def_ns);
+                // Identity-checked writes: in a hot proc the namespace is
+                // the same allocation across calls (`Rc<str>` drops were
+                // 8% of `call_proc` self), so both the interpreter's
+                // current namespace and the frame's skip the churn.
+                if !Rc::ptr_eq(&self.current_namespace, &def_ns) {
+                    self.current_namespace = Rc::clone(&def_ns);
+                }
                 let frame = self.frames.last_mut().unwrap();
-                frame.ns = Some(def_ns);
+                if !matches!(&frame.ns, Some(n) if Rc::ptr_eq(n, &def_ns)) {
+                    frame.ns = Some(def_ns);
+                }
                 frame.locals.clear();
                 frame.array_locals.clear();
                 frame.upvars.clear();
@@ -419,9 +440,15 @@ impl Interp {
             // `catch [list tailcall foo]; tailcall` → {}).
             if !matches!(&result, Err(e) if e.is_tail_call()) {
                 if let Some(frame) = self.frames.last_mut() {
-                    if let Some(tc_args) = frame.tailcall.take() {
-                        if !tc_args.is_empty() {
-                            result = Err(Error::tail_call(tc_args));
+                    // `is_some` guard: the bare `take()` is a full
+                    // `mem::replace` of the (24-byte) Option every call —
+                    // on the overwhelmingly common unarmed frame the
+                    // discriminant check is all that's needed.
+                    if frame.tailcall.is_some() {
+                        if let Some(tc_args) = frame.tailcall.take() {
+                            if !tc_args.is_empty() {
+                                result = Err(Error::tail_call(tc_args));
+                            }
                         }
                     }
                 }
@@ -621,9 +648,12 @@ impl Interp {
         // Kept (cleared, with capacity) — the pooled frame reuses the
         // buffer for its next invocation's `info level 0` words.
         popped.level0.clear();
-        popped.tailcall = None;
-        popped.ns = None;
-        popped.call_ns = None;
+        if popped.tailcall.is_some() {
+            popped.tailcall = None;
+        }
+        // `popped.ns`/`popped.call_ns` are retained (see the prologue):
+        // the next invocation's identity checks decide whether they are
+        // replaced; the pooled frame keeps at most two namespace `Rc`s.
         if self.frame_pool.len() < 32 {
             self.frame_pool.push(popped);
         }

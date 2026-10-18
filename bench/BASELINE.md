@@ -1512,6 +1512,25 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round AH — call_proc 批次 1+2（2026-10-18，4 号收口）
+
+批次 1（守卫两个每调用 `take()`）：`frame.tailcall.is_some()` 与
+`frame_level0_args.is_some()` 守卫——裸 `take()` 是对 24 字节 Option 的全量
+`mem::replace`（画像里合计 4.6% of call_proc self）。fib −0.24%、oo2
+−0.13%、oovars −0.10%。
+
+批次 2（ns 身份写 + 池化帧保留 ns/call_ns）：`prev_namespace` 桥接的
+`frame.call_ns`、`frame.ns`、`interp.current_namespace` 三处赋值改为
+**指针相等即跳过**；`frame.ns = None`（序）/`popped.ns = None`
+（收尾）**删除**——池化帧保留至多两个命名空间 `Rc`，复用时由身份检查决定
+是否替换。读点核对：`call_ns` 仅 `upvar_target` 的 Bottom 分支读（同值
+语义不变）；`frame.ns` 只在进入定义命名空间后读取。fib −1.31%、oo2
+−0.60%、oovars −0.43%。
+
+**item 4 合计（AF+批次 1+2）**：fib25 507.46M→**493.75M（−2.70%）**，
+比值 0.85x→**0.83x**；oo2 −1.38%（0.42x）；oovars −1.01%（0.52x）。
+门禁：tests 1256/0、judge 88/88、sweep 0。
+
 ## Round AG — my 双槽派发缓存（2026-10-18，5 号配套实测）
 
 结构：对象派发**单槽**（`obj_cache`）＋ `my` 派发**双槽**（`my_cache[2]` +

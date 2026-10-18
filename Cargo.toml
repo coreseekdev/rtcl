@@ -14,6 +14,7 @@ members = [
     "crates/rtcl-towasm",
     "crates/rtcl-data", "crates/rtcl-tk-core", "crates/rtcl-tk-runtime", "crates/rtcl-tk-nsh",
     "crates/rtcl-native",
+    "crates/rtcl-wasi",
     "apps/rtcl-tk-demo",
     "apps/rtcl-tk-app/native",
 ]

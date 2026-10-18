@@ -25,7 +25,11 @@ mod host;
 const WASI_BRIDGE: &str = include_str!("../tcl/wasi-bridge.tcl");
 
 /// ABI 版本（宿主加载时必须相等）。
-pub const ABI_VERSION: u32 = 1;
+///
+/// v0 语义：单整数即**主版本**（接受 `== 1`）。将来扩展时低 16 位作次版本、
+/// 高 16 位作主版本（宿主届时按主版本协商）。
+/// feature `abi-v2` 仅供 S3 演练（装成 2，验证宿主回退路径），不发布。
+pub const ABI_VERSION: u32 = if cfg!(feature = "abi-v2") { 2 } else { 1 };
 
 const STATUS_OK: i32 = 0;
 const STATUS_ERROR: i32 = 1;

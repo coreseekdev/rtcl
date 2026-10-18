@@ -1512,6 +1512,32 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## 实验记录 — VarMap RC 键表示层（Round S，已回退）
+
+按计划试做 `VarMap/VarSet/UpvarMap` 键 → `Name(Rc<str>)`（ptr-first `Eq` +
+`Borrow<str>`，178 处机械修复全部由编译器引导落地；并把
+`UpvarLink::Global` 的**句柄身份**贯通到 `VarLoc::Global(Name)`：
+link 首次写入用同一 `Rc` 入表，槽-link 探针（`frame_slot_value/write/incr`
+的 `get_mut`）改为 `Name` 句柄查询 → 命中时 ptr 比较、跳过 memcmp）。
+
+实测（与基线逐项对比）：
+
+| bench | 基线 | 本次 | 结论 |
+|---|---|---|---|
+| fib25 | 508.1M | 507.0M | 持平 |
+| fe_bench | 577.5M | 577.8M | 持平 |
+| dloop | 2977M | 3030M | **+1.8% 回退** |
+| oo_bench2 | 4358M | 4355M | 持平 |
+| oovars | 5508M | 5517-5536M | 略负 |
+| build-only | 3467M | 3473M | 略负 |
+
+结论：**中性偏负，回退**。原因：省下的 memcmp（短名 ~10-20 instr）抵不过
+探针仍需的字符串 hash（未keyed Fx 也要 ~20-30 instr）与句柄克隆/释放
+（4-8 instr），且 `Name` 键让 hot 表的行宽/代码布局变动带来 dloop 的净负。
+**此实验关闭该项**：变量表键表示层在此架构下不成立；若未来做
+`Value` 字符串句柄共享（派发名/常量池），可重估「散列按身份缓存」的第三条路
+（哈希值随句柄记忆化，需不动用不安全代码的 memo 结构）。
+
 ## Round R — OO 变量语义修正 + 大赢（2026-10-18，继续）
 
 两个语义发现（探针 + judge 语料联合作证）：

@@ -19,6 +19,9 @@
   （`SET_SS_ADD` + `FOREACH_NEXT_CLOSE`），foreach_bind 快路径、body-mark
   折叠、融合分支直取布尔——fe 0.96x 指令 / 0.85x wall、build 0.76x。
 - [ ] **表示层重构（用户已授权，Tcl byte-2-byte 语义为红线）**——deep-dive 批次：
+  0. ~~`VarMap/VarSet/UpvarMap` 键 `Rc<str>`/`Name`~~ —— **Round S 实测
+     中性偏负，已回退（见 BASELINE）**：ptr 命中省下的 memcmp 抵不过 hash
+     与句柄克隆；键表示层在此架构关闭。剩余三条仍有效：
   1. **`Value` 字符串表示层可共享**：`ValueInner.string` 从 `OnceCell<String>`
      改为可共享句柄（如 `StrRep::Shared(Rc<str>) | Owned(Box<str>)`）+
      `Value::str_handle() -> Option<Rc<str>>`：常量池/派发站点名共享同一句柄，

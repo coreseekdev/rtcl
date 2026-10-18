@@ -1512,6 +1512,15 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round AE — call_proc 行级归因（2026-10-18）
+
+`perf report -i /tmp/fib25.perf --stdio -q --symbols=call_proc --sort=srcline`
+（过滤后只对 call_proc 叶帧做 addr2line，避免 +srcline 全量超时）：
+
+```
+(perf report --symbols 过滤无输出)
+```
+
 ## Round AD — fib25 符号化画像（2026-10-18，4 号定位）
 
 方法：`CARGO_TARGET_DIR=/tmp/opencode/rtcl-prof` + `CARGO_PROFILE_RELEASE_DEBUG=1`

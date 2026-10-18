@@ -15,11 +15,22 @@
 - [x] **nanopass 融合（Round F，已提交 3964c97）**：`fuse_slot_pairs` → 
   `fuse_pairs` pass + 融合 op（cmp+jcc ×4、lappend/incr pop 版）——
   build-only 1.29x→0.85x 指令。
-- [ ] **fe 求和迭代（p 段）**：foreach_bind + meta op（BODY_MARK/SUB_MARK/
-  BEGIN_CMD×2/SUB_END）的 per-op 权重；候选 = `[FOREACH_NEXT, BODY_MARK]`
-  区域合并、`[BEGIN_CMD, SUB_MARK]` 合并、foreach_bind 去 TLS `Value::empty`
-  与 slot 写路径瘦身。`bench/scripts/fe_bench.tcl`。
-  （注：`build` 段已由 Round F 收尾至 0.85x，余量集中在 `p`/foreach 求和）
+- [x] **fe 求和迭代（p 段，Rounds G–K 收尾）**：p 循环 9 op→**2 op**/迭代
+  （`SET_SS_ADD` + `FOREACH_NEXT_CLOSE`），foreach_bind 快路径、body-mark
+  折叠、融合分支直取布尔——fe 0.96x 指令 / 0.85x wall、build 0.76x。
+- [ ] **下一批（按预期收益，Round L+ 候选）**：
+  1. `BEGIN_CMD` 的 `word_srcs` 借用化：`cur_cmd_word_srcs` 改 `(*const
+     SrcSpan, len)` 新type（site/单元生命周期内有效；save/restore 只拷指针），
+     去每命令 rc++/--——p_only 画像里 `op_begin_cmd` 5% + `drop<Rc<Vec<SrcSpan>>>`
+     3.7%；预期 fe/fib ~5%。**unsafe，需严肃审 lifetimer**（跨嵌套 eval 的
+     saved 引用链：调用者的单元在其 `exec_bytecode` 帧存活期间一直有效）。
+  2. fib 调用路径：`call_proc`（画像 11%）——参数绑定零拷贝化、`slot_mode`
+     门的检查合并、`ns_of_qualified` 的每调用开销。
+  3. 空循环基线 524 vs 337 instr/迭代：dispatch + region 簿记（Vec push/pop）；
+     候选 = `bodies` 预留 + unchecked push（unsafe）、`frames.last()` 缓存
+     （VmState 帧指针 + generation）——深水区。
+  4. 更多语句窗口：`incr x [expr {...}]`、`set x [cmd ...]`（含 dispatch 的
+     bracket 结果窗口）、`[SubEnd, DynCall/Call]`。
 - [ ] **foreach 路由对齐**（G9f 存档，G24 已落 framed 双模式的一半）：
   全局编译 foreach 已工作（G21 实验 + G24 framed）✅ **已完成的
   部分：全局内联 + framed 错误协议**。剩余：`uplevel`/`namespace eval`

@@ -1512,6 +1512,15 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round P — rtcl-vm 即 VM（crate 重构，2026-10-18）
+
+- 删除未使用的演示 VM（`execute.rs`）与死 API `Interp::eval_compiled`；
+  `VmContext` 保留（JIT/wasm ABI 经它回调 `charge_step`）。
+- `interp/types/channel/command/host/parser` + stdlib `.tcl` 数据整体迁入
+  **`rtcl-vm`**；`rtcl-core` 变 facade（路径/feature 全透传，下游零改动）。
+  指令数比无回退：fib 0.85 / fe 0.93 / dloop 0.68 / oo2 0.48 / oovars 0.69 /
+  build 0.74（四道门全绿）。
+
 ## Round K — 融合分支直取布尔（2026-10-18，继续）
 
 `expr_ops::cmp_bool(left, right, cc)`：比较的**真值**直返（`op_rel/op_eq/

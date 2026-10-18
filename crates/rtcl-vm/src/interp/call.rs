@@ -355,11 +355,11 @@ impl Interp {
                     }
                     // The alias name leaves the slot model (link-only
                     // aliasing — the frame's other slots stay fast).
-                    let glink = crate::interp::UpvarLink::Global(Rc::clone(&qualified));
+                    let glink = crate::interp::UpvarLink::Global(Rc::clone(qualified));
                     self.degrade_frame_link(frame_idx, name, &glink);
                     self.frames[frame_idx].upvars.insert(
                         Rc::clone(name),
-                        crate::interp::UpvarLink::Global(Rc::clone(&qualified)),
+                        crate::interp::UpvarLink::Global(Rc::clone(qualified)),
                     );
                     // No seed: live reads go through the upvar link; the
                     // seed copied the global and allocated a String key

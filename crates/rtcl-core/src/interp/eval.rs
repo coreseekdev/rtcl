@@ -370,18 +370,6 @@ impl Interp {
         }
     }
 
-    /// Compile a script to bytecode (caching it) and execute via the VM.
-    pub fn eval_compiled(&mut self, script: &str) -> Result<Value> {
-        let code = if let Some(cached) = self.code_cache.get(script) {
-            cached.clone()
-        } else {
-            let compiled = Compiler::compile_script(script)
-                .map_err(|e| Error::syntax(e.to_string(), 0, 0))?;
-            self.code_cache.insert(script.to_string(), compiled.clone());
-            compiled
-        };
-        rtcl_vm::execute(self, &code)
-    }
 
     pub fn eval_commands(&mut self, unit: &rtcl_parser::ScriptUnit) -> Result<Value> {
         let mut result = Value::empty();

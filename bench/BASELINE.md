@@ -1512,6 +1512,18 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round Z — while 体尾融合实验（2026-10-18，结论：回退）
+
+新 op `IncrPopJumpLocal/Var`：`[BeginCmdIncr*Pop(site,x,k), Jump(t)]` 单 op
+（`while {..} {incr i}` 的体尾形状；`for`/最小值脚本已在 IR 层验证融合触发）。
+实测（`/tmp/while_incr.tcl`，3M 次 while+incr）：融合后**净增** 36.0M 指令
+（2.336G→2.372G，**+1.54%**，≈+12 instr/迭代）；六板与 micro 板持平（该形状
+不在其中）。根因判定：热 op 派发面再加两个臂后，小循环（2 op/迭代）的派发/
+布局成本上升，吃掉并超过省下的一次派发——与「热 op 加分支反复净负」的先例
+一致。另外 micro_incr 的 `for` 体尾是 **fall-through**（体尾无 Jump，直接落入
+advance 块），本窗口对其根本无效。
+决策：回退（无板面收益 + 目标形状变慢 + 增加 JIT 增量面），实验记录留档。
+
 ## Round Y — OO 派发快径两连（2026-10-18）
 
 1. **head_cache 身份比较**：`MethodDef.head_cache` 键从 `(String, Value, Value)`

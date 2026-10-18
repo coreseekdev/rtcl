@@ -87,6 +87,21 @@ pub(crate) enum UpvarLink {
 /// a refcount bump rather than a fresh `String`.
 #[cfg(not(feature = "embedded"))]
 pub(crate) type UpvarMap = varmap::FxHashedMap<Rc<str>, UpvarLink>;
+
+/// One OO-method `variable` prelink: the declared name plus the
+/// once-ness flag of its namespace-set registration (the registering
+/// namespace is the object's own, whose lifetime is the memo's — a
+/// re-created namespace implies a retired chain memo).
+#[derive(Debug)]
+pub(crate) struct PrelinkEntry {
+    pub(crate) name: Rc<str>,
+    /// `resolve_var_link`'s deterministic result — pure string math
+    /// memoised by that call; precomputed with the prelink list so the
+    /// per-call install skips the probe entirely.
+    pub(crate) qualified: Rc<str>,
+    pub(crate) ns_part: Rc<str>,
+    pub(crate) registered: core::cell::Cell<bool>,
+}
 #[cfg(feature = "embedded")]
 pub(crate) type UpvarMap = alloc::collections::BTreeMap<Rc<str>, UpvarLink>;
 
@@ -748,7 +763,7 @@ pub struct Interp {
     /// per call.  Prefix errors are unreachable: declaration names are
     /// validated by the `variable` define word and object namespaces
     /// always exist.
-    pub(crate) frame_prelink: Option<Rc<Vec<Rc<str>>>>,
+    pub(crate) frame_prelink: Option<Rc<Vec<PrelinkEntry>>>,
     /// One-shot level-0 word override for the next `call_proc` frame
     /// (`apply` renders `info level 0` as `apply {<term>} <args...>`,
     /// which the plain arg-list form can't express).

@@ -64,7 +64,7 @@ pub(crate) enum MethodKind {
 }
 
 /// 方法 proc 体 memo：(typed name, 参数名表, 定义)。
-type ProcMemo = Option<(Option<Rc<Vec<String>>>, Rc<ProcDef>, Rc<Vec<Rc<str>>>)>;
+type ProcMemo = Option<(Option<Rc<Vec<String>>>, Rc<ProcDef>, Rc<Vec<crate::interp::PrelinkEntry>>)>;
 
 /// A method definition (own methods, forwards, constructors, destructors).
 #[derive(Debug, Clone)]
@@ -781,8 +781,12 @@ fn exec_chain_entry(
             // setup (the same link, without dispatching a `variable`
             // command per name per call).  Memoised on the MethodDef;
             // a `variable` change rebuilds via the snapshot compare.
+            // The def namespace rides the same value the frame install
+            // would use (the object's namespace) — computed before the
+            // memo build so the prelink list can pre-resolve each name.
+            let ns = object_ns_of(interp, key);
             let (proc_def, links) =
-                memoised_proc_def(interp, &entry.owner, key, &entry.def, method);
+                memoised_proc_def(interp, &entry.owner, key, &entry.def, method, &ns);
             if !links.is_empty() {
                 interp.frame_prelink = Some(links);
             }
@@ -811,7 +815,6 @@ fn exec_chain_entry(
             }
             args.extend_from_slice(call_args);
 
-            let ns = object_ns_of(interp, key);
             interp.oo.active.push(ActiveMethod {
                 obj: Rc::clone(key),
                 method: Rc::clone(method),
@@ -889,7 +892,8 @@ fn memoised_proc_def(
     key: &str,
     def: &MethodDef,
     method: &str,
-) -> (Rc<ProcDef>, Rc<Vec<Rc<str>>>) {
+    ns: &Rc<str>,
+) -> (Rc<ProcDef>, Rc<Vec<crate::interp::PrelinkEntry>>) {
     // The live `variable` list is the memo key — one probe of the owner's
     // table, no allocation; the link list (owner's declared variables
     // minus parameter-bound names — the old `link_prefix` filter, the
@@ -914,11 +918,22 @@ fn memoised_proc_def(
     let names: Vec<&str> = def.params.iter().map(|(p, _)| p.as_str()).collect();
     let empty: Vec<String> = Vec::new();
     let vars_slice: &[String] = vars.as_deref().unwrap_or(&empty);
-    let links: Rc<Vec<Rc<str>>> = Rc::new(
+    let links: Rc<Vec<crate::interp::PrelinkEntry>> = Rc::new(
         vars_slice
             .iter()
             .filter(|v| !names.contains(&v.as_str()))
-            .map(|v| Rc::from(v.as_str()))
+            .map(|v| {
+                // Pure string math (see `resolve_var_link`) — precomputed
+                // here so the per-call install never probes the memo.
+                let (qualified, ns_part) =
+                    crate::interp::commands::namespace::resolve_var_link(interp, ns, v);
+                crate::interp::PrelinkEntry {
+                    name: Rc::from(v.as_str()),
+                    qualified,
+                    ns_part,
+                    registered: core::cell::Cell::new(false),
+                }
+            })
             .collect(),
     );
     let mut pd = method_proc_def(&def.body, &def.params, method);

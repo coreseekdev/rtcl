@@ -1,6 +1,7 @@
 //! Procedure call and tail-call optimisation for [`Interp`].
 
 use std::borrow::Cow;
+use super::PrelinkEntry;
 
 use super::{CallFrame, Interp, ProcDef, UpvarMap, VarMap, VarSet};
 use super::util::rfind_ns_sep;
@@ -330,24 +331,28 @@ impl Interp {
             // lifecycle.
             if !prelink_done {
                 prelink_done = true;
-                let links: &[Rc<str>] = prelink.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+                let links: &[PrelinkEntry] = prelink.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
                 let frame_idx = self.frames.len() - 1;
                 let ns = self.current_namespace.clone();
-                for name in links.iter() {
-                    let (qualified, ns_part) = super::commands::namespace::resolve_var_link(
-                        self,
-                        ns.as_ref(),
-                        name,
-                    );
+                for entry in links.iter() {
+                    let name = &entry.name;
+                    let (qualified, ns_part) = (&entry.qualified, &entry.ns_part);
                     // The definition namespace always exists (the object
                     // created it), so the parent-exists check the
                     // `variable` command performs cannot fail here.  The
-                    // name is registered once — a re-declaration on every
-                    // call finds it present and allocates nothing.
-                    if let Some(info) = self.namespaces.get_mut(&*ns_part) {
-                        if !info.variables.contains(&*qualified) {
-                            info.variables.insert(qualified.to_string());
+                    // registration runs ONCE per memo (a flag beside the
+                    // entry) instead of probing the namespace's variable
+                    // set on every call; the entry is retired with the
+                    // chain memo, which the object namespace's lifetime
+                    // bounds.  The `(qualified, ns_part)` pair is
+                    // precomputed there too (pure string math).
+                    if !entry.registered.get() {
+                        if let Some(info) = self.namespaces.get_mut(&**ns_part) {
+                            if !info.variables.contains(&**qualified) {
+                                info.variables.insert(qualified.to_string());
+                            }
                         }
+                        entry.registered.set(true);
                     }
                     // The alias name leaves the slot model (link-only
                     // aliasing — the frame's other slots stay fast).
@@ -359,7 +364,7 @@ impl Interp {
                     );
                     // Seed a local copy when the namespace variable
                     // already holds a value (var-7.12's family).
-                    if let Some(v) = self.globals.get(&*qualified).cloned() {
+                    if let Some(v) = self.globals.get(&**qualified).cloned() {
                         self.frames[frame_idx].locals.insert(name.to_string(), v);
                     }
                 }

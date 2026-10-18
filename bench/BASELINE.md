@@ -1512,6 +1512,22 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round Q — OO prelink 条目预计算（2026-10-18，继续）
+
+OO 方法每次调用的 prelink 安装原本做 4 个哈希/字符串探测（`resolve_var_link`
+memo、namespace 变量集注册、slot 扫描、upvars 插入）。两步去化：
+
+- **注册一次性**：`PrelinkEntry.registered: Cell<bool>` —— namespace 变量集
+  的注册只跑一次（条目的失效域 = 链 memo = 对象 ns 生命周期）；
+- **`(qualified, ns_part)` 预计算**：`resolve_var_link` 是纯字符串函数
+  （其 memo 可替换、结果不可变）——在 `memoised_proc_def` 构建时（用对象
+  ns，与安装时同值）算好存入条目。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| P 后 | 0.85x | 0.93x | 0.68x | 0.48x | 0.69x | 0.74x |
+| Q（本提交） | 0.85x | 0.93x | 0.68x | 0.48x | **0.64x** | 0.74x |
+
 ## Round P — rtcl-vm 即 VM（crate 重构，2026-10-18）
 
 - 删除未使用的演示 VM（`execute.rs`）与死 API `Interp::eval_compiled`；
@@ -1563,9 +1579,13 @@ build 1.29。）
 - `current_statics` 从 `HashMap` clone/调用 → `Rc<HashMap>`（默认零成本，
   写回 COW）；`slot_aliased`/`link_keys` 侧向量懒化（`degrade_frame_link`
   按需扩容，读者全走 `.get`）——每调用去一次 map clone 与两次 resize。
-- 实验记录（已回退）：int 原位快车道（`slot_int`）——fib −7M 但 fe/oovars
-  +20M（热径 match/布局敏感，净负）；结论：此代码库上小改热径臂会牵动
-  LLVM 布局，收益需按全板验证。
+- 实验记录（已回退，两次）：
+  ① int 原位快车道（`slot_int`）全量铺开——fib −7M 但 fe/oovars +20M；
+  ② 同一快车道**只加在 `SET_SS_ADD`**（fe 热点 op）——仍 fe +9M（577.5M
+  →586.5M，+1.6%），其余不变。
+  结论：该架构下热 op 内增加分支/重试路径会牵动 LLVM 寄存器分配与布局，
+  净负且与收益面无关；per-op 语义体已到该架构的实用地板（~80-100
+  instr/op），进一步需要更激进的结构（寄存器式执行器/专用循环形）。
 
 | 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
 |---|---|---|---|---|---|---|

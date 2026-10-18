@@ -63,19 +63,30 @@ pub(crate) enum MethodKind {
     Builtin(&'static str),
 }
 
-/// 方法 proc 体 memo：(typed name, 参数名表, 定义)。
-/// Memo layout: `(owner vars, def namespace, ProcDef, prelink entries)`.
+/// 方法 proc 体 memo 的一条构建：`(owner vars, def namespace, method
+/// name, 定义, prelink entries)`。
 ///
 /// The namespace is part of the identity: one `MethodDef` serves every
 /// instance of a class, and each instance's `variable` links resolve in
 /// its OWN namespace (`::oo::ObjN`) — the shared class `variables` list
 /// alone would let one instance's prelink resolution leak to another.
-type ProcMemo = Option<(
-    Option<Rc<Vec<String>>>,
-    Rc<str>,
-    Rc<ProcDef>,
-    Rc<Vec<crate::interp::PrelinkEntry>>,
-)>;
+/// The method NAME rides the key too: `renamemethod` moves the same
+/// `MethodDef` under a new name, and the arity text's `params[0]` must
+/// name the invoked method.
+#[derive(Debug, Clone)]
+pub(crate) struct ProcMemoEntry {
+    vars: Option<Rc<Vec<String>>>,
+    ns: Rc<str>,
+    method: Rc<str>,
+    def: Rc<ProcDef>,
+    links: Rc<Vec<crate::interp::PrelinkEntry>>,
+}
+
+/// Capped evict-oldest: alternating instances of one class (and a
+/// `renamemethod`) each keep their own build instead of ping-ponging a
+/// single slot — a miss paid a full ProcDef rebuild + recompile.
+type ProcMemo = Vec<ProcMemoEntry>;
+const PROC_MEMO_MAX: usize = 4;
 
 /// A method definition (own methods, forwards, constructors, destructors).
 #[derive(Debug, Clone)]
@@ -88,8 +99,8 @@ pub(crate) struct MethodDef {
     pub exported: bool,
     pub kind: MethodKind,
     /// Compiled form of the assembled method [`ProcDef`], memoised (see
-    /// `memoised_proc_def`): `(typed method name, owner `variable` snapshot,
-    /// ProcDef, the resolved link-name list)`.  `Rc<RefCell<..>>` so chain
+    /// `memoised_proc_def`): entries keyed `(owner `variable` snapshot,
+    /// instance ns, method name)`.  `Rc<RefCell<..>>` so chain
     /// clones share one cell; a redefinition installs a fresh `MethodDef`
     /// (fresh cell), retiring the memo with its inputs.  The vars snapshot
     /// is the `link_prefix` input — a `variable` declaration change
@@ -107,7 +118,7 @@ pub(crate) struct MethodDef {
 
 /// A fresh [`MethodDef::proc_memo`] cell.
 fn fresh_memo() -> Rc<RefCell<ProcMemo>> {
-    Rc::new(RefCell::new(None))
+    Rc::new(RefCell::new(Vec::new()))
 }
 
 /// Whose definition a chain entry comes from.  `variable` linking and
@@ -916,16 +927,16 @@ fn memoised_proc_def(
     let vars: Option<Rc<Vec<String>>> = owner_variables(interp, owner, key).cloned();
     {
         let memo = def.proc_memo.borrow();
-        if let Some((vs, memo_ns, d, links)) = memo.as_ref() {
-            if Rc::ptr_eq(memo_ns, ns)
-                && match (vs, &vars) {
+        if let Some(e) = memo.iter().find(|e| {
+            Rc::ptr_eq(&e.ns, ns)
+                && e.method.as_ref() == method
+                && match (&e.vars, &vars) {
                     (None, None) => true,
                     (Some(a), Some(b)) => Rc::ptr_eq(a, b),
                     _ => false,
                 }
-            {
-                return (Rc::clone(d), Rc::clone(links));
-            }
+        }) {
+            return (Rc::clone(&e.def), Rc::clone(&e.links));
         }
     }
     let names: Vec<&str> = def.params.iter().map(|(p, _)| p.as_str()).collect();
@@ -960,12 +971,17 @@ fn memoised_proc_def(
     }
     pd.compiled = compiled;
     let proc_def = Rc::new(pd);
-    *def.proc_memo.borrow_mut() = Some((
-        vars.clone(),
-        Rc::clone(ns),
-        Rc::clone(&proc_def),
-        Rc::clone(&links),
-    ));
+    let mut memo = def.proc_memo.borrow_mut();
+    if memo.len() >= PROC_MEMO_MAX {
+        memo.remove(0);
+    }
+    memo.push(ProcMemoEntry {
+        vars: vars.clone(),
+        ns: Rc::clone(ns),
+        method: Rc::from(method),
+        def: Rc::clone(&proc_def),
+        links: Rc::clone(&links),
+    });
     (proc_def, links)
 }
 
@@ -1286,8 +1302,12 @@ fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
     interp.oo.classes.remove(key);
     interp.oo.mutation_ctr += 1;
     interp.oo.creation_order.retain(|k| k != key);
-    // Namespace-scoped storage.
+    // Namespace-scoped storage.  A running method's `variable` links into
+    // this namespace keep their value as a seeded local copy (tclsh: the
+    // linked Var is refcounted — the destroy purge must not strand the
+    // frame's reads).
     let var_prefix = format!("{}::", ns.trim_start_matches(':'));
+    interp.materialize_frame_links(&var_prefix);
     let globals: Vec<String> = interp
         .globals
         .keys()

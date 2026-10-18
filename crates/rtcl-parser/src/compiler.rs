@@ -274,6 +274,9 @@ impl Compiler {
         // dispatch of the real builtin (exact semantics over coverage).
         // Tier-1 folding assumes the name still resolves to the builtin at
         // runtime; the executor guards that with its invalidation epoch.
+        // KEEP IN SYNC: every name folded below must appear in
+        // `note_tier1_mutation`'s leaf list (rtcl-vm vm_exec.rs) — a name
+        // missing there keeps stale folds in already-compiled bodies.
         if let Word::Literal(name) = &cmd.words[0] {
             match name.as_str() {
                 // ── Tier 1: compiled to native opcodes ──────────────────

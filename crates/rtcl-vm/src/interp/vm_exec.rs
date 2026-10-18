@@ -51,10 +51,15 @@ pub(crate) fn compile_proc_body(
 /// through dispatch (`Call`/`DynCall`) and re-resolves per call.
 pub(crate) fn note_tier1_mutation(interp: &mut Interp, key: &str) {
     let leaf = key.rsplit("::").next().unwrap_or(key);
+    // KEEP IN SYNC with the compiler's Tier-1 fold list
+    // (`rtcl-parser/src/compiler.rs`, the `match` on folded command
+    // names): every name the compiler inline-folds must bump the epoch
+    // here, or a redefinition leaves stale folds in compiled bodies
+    // (`lappend` was the one gap — `compile_lappend` folds it).
     if matches!(
         leaf,
         "set" | "if" | "while" | "for" | "expr" | "incr" | "return" | "exit" | "break"
-            | "continue" | "foreach" | "lmap"
+            | "continue" | "foreach" | "lmap" | "lappend"
     ) {
         interp.tier1_epoch += 1;
     }
@@ -372,7 +377,8 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
         // probe — which also lazily heals eviction (see below).
         let same = st
             .consts_code
-            .map(|c| core::ptr::eq(c, code.as_ref()))
+            .as_ref()
+            .map(|c| Rc::ptr_eq(c, code))
             .unwrap_or(false);
         if !same {
             // The literal pool is capped and cleared on overflow: a unit
@@ -393,7 +399,7 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
             };
             st.consts = consts;
             st.cmd_sites = cmd_sites;
-            st.consts_code = Some(code.as_ref() as *const rtcl_parser::ByteCode);
+            st.consts_code = Some(Rc::clone(code));
         }
         let r = exec_inner(interp, code, &mut st);
         interp.vm_pool.give(st);
@@ -767,14 +773,16 @@ struct VmState {
     /// generation/name/namespace mismatch.  Shared `Rc` — every depth
     /// executing this unit uses the one table.
     cmd_sites: Option<CmdSites>,
-    /// The unit whose consts/cmd_sites are loaded (identity by address,
-    /// `None` = none loaded).  `exec_bytecode` reuses the loaded pair
+    /// The unit whose consts/cmd_sites are loaded (identity by the held
+    /// `Rc`, `None` = none loaded).  `exec_bytecode` reuses the loaded pair
     /// when the SAME unit borrows this state again — recursion into one
     /// proc is exactly that — instead of re-hashing the const pool
     /// (fib profile: the per-call pool probe was ~7% of the bench).
     /// Correct regardless of pool residency: the state holds its own
-    /// `Rc`s, so a pool clear never invalidates them.
-    consts_code: Option<*const rtcl_parser::ByteCode>,
+    /// `Rc`s, and keying identity on the held `Rc` (not a borrowed
+    /// address) closes the ABA window where a pool clear-all plus a
+    /// same-address reallocation would alias a dead unit's tables.
+    consts_code: Option<Rc<rtcl_parser::ByteCode>>,
     /// Stack base of the current command's `{*}` expansion region.
     expand_base: usize,
     /// Site index of the `BeginCmd` most recently executed.
@@ -932,6 +940,9 @@ fn op_incr_var(
                 Value::from_str(name),
                 Value::from_int(amount),
             ];
+            // dispatch's builtin arm resets first (fresh error state);
+            // the fallback owns its errors the same way.
+            interp.err_code_raised = false;
             let v = super::commands::misc::cmd_incr(interp, &args)?;
             st.stack.push(v);
         }
@@ -1375,6 +1386,9 @@ fn incr_local_value(
                     Value::from_str(name()),
                     Value::from_int(amount),
                 ];
+                // dispatch's builtin arm resets first (fresh error state);
+                // the fallback owns its errors the same way.
+                interp.err_code_raised = false;
                 super::commands::misc::cmd_incr(interp, &args)
             }
         },
@@ -1583,7 +1597,11 @@ fn lappend_var_impl(
     if let Some(mut v) = interp.take_var_fast(name) {
         if let Some(items) = v.as_list_mut() {
             items.push(value);
-            let _ = interp.set_var(name, v.clone());
+            let r = interp.set_var(name, v.clone());
+            // The take removed the variable; a failure here would silently
+            // drop it.  The guards (traces/links/arrays/qualifiers) make
+            // this unreachable — assert it stays that way.
+            debug_assert!(r.is_ok(), "lappend fast-path store failed for {name:?}");
             return Ok(v);
         }
         interp.store_var(name, v);
@@ -1593,6 +1611,9 @@ fn lappend_var_impl(
         Value::from_str(name),
         value,
     ];
+    // dispatch's builtin arm resets first (fresh error state); the
+    // fallback owns its errors the same way.
+    interp.err_code_raised = false;
     super::commands::list::cmd_lappend(interp, &args)
 }
 
@@ -1619,6 +1640,9 @@ fn op_incr_var_pop(interp: &mut Interp, code: &ByteCode, idx: u16, amount: i64) 
                 Value::from_str(name),
                 Value::from_int(amount),
             ];
+            // dispatch's builtin arm resets first (fresh error state);
+            // the fallback owns its errors the same way.
+            interp.err_code_raised = false;
             let _ = super::commands::misc::cmd_incr(interp, &args)?;
             Ok(())
         }
@@ -1694,6 +1718,9 @@ fn op_lappend_slot_slot(interp: &mut Interp, code: &ByteCode, src: u16, dst: u16
         Value::from_str(name),
         value,
     ];
+    // dispatch's builtin arm resets first (fresh error state); the
+    // fallback owns its errors the same way.
+    interp.err_code_raised = false;
     let _ = super::commands::list::cmd_lappend(interp, &args)?;
     Ok(())
 }
@@ -1831,7 +1858,6 @@ fn op_foreach_start(
         .max()
         .unwrap_or(0);
     let collected = info_ref.lmap.then(Vec::new);
-    let _framed = info_ref.framed;
     st.foreaches.push(ForeachFrame {
         lists,
         idx: 0,
@@ -1963,13 +1989,10 @@ fn op_begin_cmd(
 
 #[inline]
 fn op_body_mark_framed(st: &mut VmState) {
-    let (framed, lmap) = st
-        .foreaches
-        .last()
-        .map(|ff| (ff.framed, ff.lmap))
-        .unwrap_or((false, false));
+    // The compiler only emits this op for framed units, so `framed` is
+    // known true here — `lmap` is the only per-iteration input.
+    let lmap = st.foreaches.last().map(|ff| ff.lmap).unwrap_or(false);
     st.bodies.push(Region::BodyFramed(st.cur_site, lmap));
-    let _ = framed;
 }
 
 #[inline]

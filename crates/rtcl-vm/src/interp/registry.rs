@@ -301,6 +301,10 @@ impl Interp {
     pub fn register_command(&mut self, name: &str, func: CommandFunc) {
         self.commands.insert(name.to_string(), func);
         self.command_categories.insert(name.to_string(), CommandCategory::Extension);
+        // A host command shadowing a Tier-1 name (`set`/`if`/…) must
+        // retire compiled bodies' inline folds, like the script-side
+        // define paths do.
+        super::vm_exec::note_tier1_mutation(self, name);
         self.note_cmd_mutation();
     }
 
@@ -314,6 +318,7 @@ impl Interp {
         self.commands.insert(name.to_string(), func);
         self.command_categories.insert(name.to_string(), CommandCategory::Extension);
         self.command_meta.insert(name.to_string(), meta);
+        super::vm_exec::note_tier1_mutation(self, name);
         self.note_cmd_mutation();
     }
 
@@ -323,6 +328,7 @@ impl Interp {
         }
         self.command_categories.remove(name);
         self.command_meta.remove(name);
+        super::vm_exec::note_tier1_mutation(self, name);
         self.note_cmd_mutation();
         Ok(())
     }

@@ -1649,6 +1649,42 @@ impl Interp {
     /// dead — reads keep the seeded copy, writes error (var-1.15/1.16).
     /// Variables a `variable` command declared at eval level are exempt:
     /// the declaring scope still references them.
+    /// Seed every frame's `variable`/`global` link under `var_prefix`
+    /// with the target's live value — the prelink path installs links
+    /// WITHOUT an install-time seed (a per-call copy), so this dead-time
+    /// materialisation is what reads after the purge fall back to
+    /// (tclsh keeps the linked Var refcounted; 46.8).  Callers purge the
+    /// namespace's globals right after (namespace delete) or destroy the
+    /// object's storage (OO destroy).  Prefix forms with or without the
+    /// leading `::` both match (the two call sites spell it differently).
+    pub(crate) fn materialize_frame_links(&mut self, var_prefix: &str) {
+        let norm_prefix = var_prefix.trim_start_matches(':');
+        let mut to_seed: Vec<(usize, Rc<str>, String)> = Vec::new();
+        for (fi, f) in self.frames.iter().enumerate() {
+            for (name, link) in f.upvars.iter() {
+                if let UpvarLink::Global(g) = link {
+                    if g.trim_start_matches(':').starts_with(norm_prefix)
+                        && !f.locals.contains_key(&**name)
+                    {
+                        to_seed.push((fi, Rc::clone(name), g.to_string()));
+                    }
+                }
+            }
+        }
+        for (fi, name, target) in to_seed {
+            // The same lookup a read through the link performs — the
+            // seeded copy is exactly what the later fallback returns.
+            let key = self.redirect_flat(target.clone());
+            let v = self
+                .globals
+                .get(key.as_str())
+                .or_else(|| self.globals.get(target.trim_start_matches(':')));
+            if let Some(v) = v {
+                self.frames[fi].locals.insert(name.to_string(), v.clone());
+            }
+        }
+    }
+
     pub(crate) fn deaden_links_under(&mut self, var_prefix: &str) {
         let aliases: Vec<(String, String)> = self.flat_aliases.clone();
         for (k, t) in aliases {
@@ -1660,6 +1696,9 @@ impl Interp {
         // with it (an `upvar` inside `namespace eval ns` links ns's own
         // variable).
         self.flat_aliases.retain(|(k, _)| !k.starts_with(var_prefix));
+        // Frame links under the dying tree keep their value as a seeded
+        // local copy (writes still error — the links go dead below).
+        self.materialize_frame_links(var_prefix);
         for f in self.frames.iter_mut() {
             for link in f.upvars.values_mut() {
                 if let UpvarLink::Global(g) = link {

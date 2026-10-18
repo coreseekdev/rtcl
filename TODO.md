@@ -137,32 +137,36 @@
   入口）；rtcl-wasm 默认 on。前置：string.allium 加 astral probe 裁决
   `string length` 三方语义。
 
-## perf/interp-arch-opt 评审跟进（2026-10-18，PR #1 合并时记录）
+## perf/interp-arch-opt 评审跟进（2026-10-18，PR #1 合并时记录；wave-2 已修大半）
 
-- [ ] **P1 prelink 去 seed 语义回归**（call.rs `frame_prelink`）：方法存活期
-  `namespace delete [self namespace]` 后读 `variable` 声明变量，master/tclsh
-  返回旧值、现返回 no such variable（构造器预设值丢失）。触发面窄；修法
-  候选：prelink 恢复 seed（付一次拷贝）或 ns 删除时把链接值物化回
-  locals。需补 judge 回归用例。
-- [ ] **P1 OO proc_memo 单槽 × 实例 ns 身份**（oo.rs）：一个类的全部实例
-  共享一个 memo cell，多实例交替调用同方法时 0 命中并全量重编译
-  ProcDef——单实例热循环（oo_bench2 形状）之外反而比拼串路径慢。修法
-  候选：chain 构建时对克隆 def 换 fresh_memo，或 memo 改 per-ns 小 map。
-- [ ] **P1 consts_code ABA 窗口（预存，master 同款）**（vm_exec.rs）：
-  const_pool 2048 clear-all 丢弃 keepalive 后，新 ByteCode 复用同地址可
-  使 `ptr::eq` 误判 same → 静默错值。修法：state 改持 `Option<Rc<ByteCode>>`
-  保活身份（一次 Rc bump）。
-- [ ] P2 proc_memo 身份缺 method 名：`renamemethod` 后 arity 错误文本吐
-  旧方法名（仅用法串，非执行语义）。
-- [ ] P2 ctor/dtor 未迁移 prelink（双轨 OO variable 链接实现并存）。
-- [ ] P2 tier1_epoch 名单缺 `lappend`（预存）：shadow lappend 不失效已
-  编译体内联折叠；名单与 compiler Tier-1 清单两处手工同步，加锚定注释。
-- [ ] P2 宿主 `register_command` 不 bump tier1_epoch（预存）：宿主注册
-  set/if 等名字不失效内联折叠。
-- [ ] P2 融合臂慢路径直调 cmd_incr/cmd_lappend 跳过 `err_code_raised`
-  重置：catch 遗留态下 ::errorCode 派生可能偏差。
-- [ ] P2 varmap.rs 注释错误：`"abc"` vs `"abc\0"` 的 str-hash 并不能区分
-  （尾零填充后 word 相同）；HashMap 等价比较兜底，仅性能面。
+- [x] **P1 prelink 去 seed 语义回归**——wave-2 已修（master `materialize_frame_links`）：
+  ns 删除/OO 销毁清除 `ns::*` 前，把存活帧的 `variable`/`global` 链接值补种进
+  frame.locals（零热径成本，快照比 master 安装期 seed 更新）。探针恢复 tclsh
+  一致（constructor 预设值在 `namespace delete [self namespace]` 后可读）。
+- [x] **P1 OO proc_memo 单槽 × 实例 ns 身份**——wave-2 已修：单槽改
+  `(owner vars, 实例 ns, method 名)` 键控、上限 4 的 evict-oldest 多槽，
+  多实例交替/renamemethod 不再全量重编译乒乓。
+- [x] **P1 consts_code ABA 窗口**——wave-2 已修：身份键从裸指针改持
+  `Rc<ByteCode>` 保活（状态池复用期间防地址复用误判）。
+- [x] P2 proc_memo 身份缺 method 名——随多槽键控一并修复（renamemethod
+  后 arity 文本与 tclsh 逐字节一致，探针钉住）。
+- [x] P2 方法帧 `info vars` 不列 variable 链接名——wave-2 已修：链接名在
+  目标存在时并入列表（`interp.get_var` 探测，不发 trace）。
+- [x] P2 tier1_epoch 名单缺 `lappend`——wave-2 已修：名单补 lappend，
+  双侧加 KEEP IN SYNC 锚定注释（vm_exec note_tier1_mutation ↔ compiler
+  Tier-1 fold match）；宿主 register/delete_command 也补 bump（原来只
+  bump cmd_generation）。探针：shadow lappend 后已编译 proc 正确改走分派。
+- [x] P2 融合臂慢路径直调 cmd_incr/cmd_lappend 跳过 `err_code_raised`
+  重置——wave-2 已修（5 处补 `err_code_raised = false`，与 dispatch
+  builtin 臂同 idiom）；lappend 快路径吞 set_var 错误改 debug_assert。
+- [x] P2 varmap.rs 注释错误（"abc" vs "abc\0" 哈希可区分）——已改为如实
+  描述（HashMap 等价比较兜底，最坏一次多余探测）。
+- [ ] P2 ctor/dtor 未迁移 prelink（双轨 OO variable 链接实现并存；ctor/dtor
+  每对象创建仍付拼串+重解析成本）。
+- [ ] P2 `oo::objdefine <obj> renamemethod` 对类方法静默成功且不改名
+  （tclsh 报 "method old does not exist"）——wave-2 探针发现的预存分歧。
+- [ ] P2 PrelinkEntry.registered 一次性注册无 ns 重建重注册路径（触发面
+  极窄：对象 ns 被删后按同名重建）。
 - [ ] P2 内联折叠 Tier1 命令不计步（直线大编译体 max_steps 低估）——
   设计取舍，文档化即可。
 

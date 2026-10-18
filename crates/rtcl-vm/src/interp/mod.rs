@@ -555,8 +555,6 @@ pub struct Interp {
     pub(crate) max_steps: Option<u64>,
     /// Last result.
     pub(crate) result: Value,
-    /// Bytecode cache — keyed by script source.
-    pub(crate) code_cache: varmap::FxHashedMap<String, ByteCode>,
     /// Package registry: name → version string.
     #[cfg(feature = "package")]
     pub(crate) packages: HashMap<String, String>,
@@ -862,7 +860,6 @@ impl Interp {
             steps: 0,
             max_steps: None,
             result: Value::empty(),
-            code_cache: varmap::FxHashedMap::default(),
             #[cfg(feature = "package")]
             packages: HashMap::new(),
             current_namespace: Rc::from("::"),

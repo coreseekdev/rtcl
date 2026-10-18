@@ -1482,7 +1482,7 @@ mod tests {
     /// op outside the pre-fusion set (the JIT/`rtcl-vm` boundary contract).
     #[test]
     fn unfused_covers_every_family() {
-        let mut code = bc(
+        let code = bc(
             &[
                 OpCode::CmpSlotSlotJumpTrue(1, 2, 0, 12),
                 OpCode::CmpSlotSlotJumpFalse(1, 2, 0, 12),

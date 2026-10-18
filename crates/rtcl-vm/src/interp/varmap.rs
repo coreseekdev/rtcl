@@ -57,8 +57,11 @@ mod fx {
                 // scratch buffer: the old `copy_from_slice` into an
                 // `[u8; 8]` showed up as `memcpy` inside the hash of
                 // every 1-4 byte variable name (~2% of the OO-call
-                // profile).  "abc" and "abc\0" still differ through the
-                // str-hash terminator byte.
+                // profile).  Length-distinct names stay distinct (the
+                // terminator keeps "a" apart from "ab"); a NUL suffix
+                // collides with its prefix's padded tail ("abc" vs
+                // "abc\0"), but HashMap's key equality absorbs that —
+                // worst case one extra probe, never a wrong hit.
                 let mut tail = 0u64;
                 for (i, &b) in rem.iter().enumerate() {
                     tail |= (b as u64) << (8 * i);

@@ -859,6 +859,23 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.degrade_frame_all();
                 interp.scope_vars()
             };
+            // Collect first: the filter below is pure name math, and the
+            // frame's link names join the pool here — `variable`/`global`
+            // links are link-only (no locals entry), but tclsh lists them
+            // while the link's target exists (master listed them only
+            // when an install-time seed had copied a value).
+            let mut names: Vec<String> = source.keys().cloned().collect();
+            if !qualified {
+                if let Some(frame) = interp.frames.last() {
+                    for name in frame.upvars.keys() {
+                        if !frame.locals.contains_key(&**name)
+                            && interp.get_var(name).is_ok()
+                        {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+            }
             // At namespace scope the namespace's own variables report
             // relative (tclsh: inside `namespace eval nn`, `info vars`
             // lists `zz`, not `::nn::zz` — var-1.14); variables of child
@@ -868,8 +885,8 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             } else {
                 None
             };
-            let mut vars: Vec<Value> = source
-                .keys()
+            let mut vars: Vec<Value> = names
+                .iter()
                 .filter_map(|name| {
                     // Bare `info vars` at the global level lists only true
                     // globals — namespace variables are invisible there

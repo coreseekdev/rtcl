@@ -363,8 +363,9 @@ impl Interp {
                     );
                     // No seed: live reads go through the upvar link; the
                     // seed copied the global and allocated a String key
-                    // per call. (Known edge: deleting the target ns
-                    // mid-method loses the value — see TODO review items.)
+                    // per call. A frame whose target namespace dies
+                    // mid-method gets a dead-time copy instead
+                    // (`materialize_frame_links`).
                 }
             }
 

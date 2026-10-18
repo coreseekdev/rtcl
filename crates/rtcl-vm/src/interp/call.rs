@@ -32,9 +32,10 @@ impl Interp {
             ));
         }
 
-        let mut current_params = Rc::clone(&proc_def.params);
-        let mut current_body = Rc::clone(&proc_def.body);
-        let mut current_compiled = proc_def.compiled.clone();
+        // The def's params/body/compiled are read through a reference for
+        // the whole call; only a tail-call rebind needs an owned def (the
+        // loop's `tc_def`) — the three per-call Rc clones are gone.
+        let mut tc_def: Option<Rc<ProcDef>> = None;
         // The invocation's words: borrowed from the caller's slice for the
         // whole call (zero-copy binding — the common case never rebinds),
         // materialised into an owned vector only by a tail-call target,
@@ -131,6 +132,9 @@ impl Interp {
         self.frames.push(frame);
 
         let final_result = loop {
+            // The def this iteration runs: the called one, or a tail-call
+            // target's (owned by `tc_def`).
+            let def: &ProcDef = tc_def.as_deref().unwrap_or(proc_def);
             // ── E2 slot-locals gate (re-checked every iteration: a tailcall
             // rebind swaps the compiled body, and the shape must follow) ──
             // The conditions are the execution gate below plus the slot
@@ -145,14 +149,14 @@ impl Interp {
             // stays name-keyed and the body's slot ops fall back to their
             // name paths (which is also what a mid-run degrade leaves
             // behind).
-            let slot_mode = match &current_compiled {
+            let slot_mode = match &def.compiled {
                 Some(code)
                     if !code.fallback
                         && code.epoch == self.tier1_epoch
                         && super::vm_exec::bytecode_applicable(self)
                         && current_statics.is_empty()
                         && !code.locals().is_empty()
-                        && code.params_aligned == Some(current_params.len()) =>
+                        && code.params_aligned == Some(def.params.len()) =>
                 {
                     let table = Rc::clone(code);
                     let n = code.locals().len();
@@ -207,12 +211,12 @@ impl Interp {
                 }
             }
 
-            let has_args = current_params.last().map(|(p, _)| p.as_str()) == Some("args");
+            let has_args = def.params.last().map(|(p, _)| p.as_str()) == Some("args");
 
             let regular_params = if has_args {
-                &current_params[..current_params.len() - 1]
+                &def.params[..def.params.len() - 1]
             } else {
-                &current_params[..]
+                &def.params[..]
             };
 
             // This iteration's invocation words: the borrowed caller
@@ -243,9 +247,9 @@ impl Interp {
                         crate::value::tcl_quote(&current_proc_name)
                     };
                     let mut usage = name_word;
-                    for (i, (p, d)) in current_params.iter().enumerate() {
+                    for (i, (p, d)) in def.params.iter().enumerate() {
                         usage.push(' ');
-                        if has_args && i == current_params.len() - 1 {
+                        if has_args && i == def.params.len() - 1 {
                             usage.push_str("?arg ...?");
                         } else if d.is_some() {
                             usage.push('?');
@@ -381,7 +385,7 @@ impl Interp {
             // observed frames, `RTCL_NO_BYTECODE`, non-whitelisted ops,
             // a Tier1 command shadowed since compilation) stays on the
             // tree-walk.
-            let mut result = match &current_compiled {
+            let mut result = match &def.compiled {
                 Some(code)
                     if !code.fallback
                         && code.epoch == self.tier1_epoch
@@ -402,10 +406,10 @@ impl Interp {
                 // (tclsh compiling lambda/method bodies like procs is a
                 // recorded follow-up, not this change).
                 _ => {
-                    if current_compiled.is_some() {
+                    if def.compiled.is_some() {
                         self.next_eval_lexical = true;
                     }
-                    self.eval(&current_body)
+                    self.eval(&def.body)
                 }
             };
 
@@ -458,10 +462,8 @@ impl Interp {
                     let cmd_name = tc_args[0].clone();
                     if let Some(new_proc) = self.procs.get(&cmd_name).cloned() {
                         // Tail-call to another proc — reuse the frame (no depth increase)
-                        current_params = Rc::clone(&new_proc.params);
-                        current_body = Rc::clone(&new_proc.body);
-                        current_compiled = new_proc.compiled.clone();
                         current_statics = Rc::clone(&new_proc.statics);
+                        tc_def = Some(new_proc);
                         current_proc_name = Cow::Owned(cmd_name.clone());
                         owned_args = Some(tc_args.into_iter().map(|s| Value::from_str(&s)).collect());
                         // The reused frame's enterstep context now names the

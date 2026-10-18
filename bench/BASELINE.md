@@ -1512,6 +1512,28 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round AF — call_proc 去 Rc 流量（2026-10-18，4 号第一刀）
+
+**落地**（call.rs）：`params`/`body`/`compiled` 的每调用三连 `Rc::clone`
+改为「全程经引用读 def；仅尾调用重绑时取 owned def（`tc_def:
+Option<Rc<ProcDef>>`，循环头 `let def = tc_def.as_deref().unwrap_or(proc_def)`）」，
+`statics` 仍为每调用一次 clone（COW 写回需要 owned）。行为等价：
+尾调用分支只是把三个赋值换成一个 `tc_def = Some(new_proc)`。
+
+实测（指令数，确定性）：
+- fib25 507.46M→**501.52M（−1.17%）**，比值 0.85x→**0.84x**
+- oo2 3834.1M→**3809.1M（−0.65%）**，**0.42x**
+- oovars 4939.2M→**4915.2M（−0.49%）**，0.52x
+- fe/dloop/build 持平。门禁：tests 1256/0、judge 88/88、sweep 0。
+
+**同批否决**（两组合并实验，均回退留档）：
+1. `bytecode_applicable` 每迭代一次化 + 槽向量「resize+重写」原位重置：
+   合并净负（fib +0.45%、oo2 +0.75%、oovars +0.8%）——未拆分单因，
+   但两者都不留。
+2. 全批（上述+去 Rc）曾测得 fib −0.65%/oo2 +0.13%/oovars +0.36%；
+   拆分后确认收益全部来自去 Rc，且单留它比全批更好（fib −1.17%）。
+   教训：**小改动必须拆分 A/B**，合并测量会把负项混进正项。
+
 ## Round AE — call_proc 行级归因（2026-10-18）
 
 工具路径三连挫（已踩，勿重复）：

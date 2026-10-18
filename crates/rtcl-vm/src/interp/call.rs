@@ -32,9 +32,10 @@ impl Interp {
             ));
         }
 
-        let mut current_params = Rc::clone(&proc_def.params);
-        let mut current_body = Rc::clone(&proc_def.body);
-        let mut current_compiled = proc_def.compiled.clone();
+        // The def's params/body/compiled are read through a reference for
+        // the whole call; only a tail-call rebind needs an owned def (the
+        // loop's `tc_def`) — the three per-call Rc clones are gone.
+        let mut tc_def: Option<Rc<ProcDef>> = None;
         // The invocation's words: borrowed from the caller's slice for the
         // whole call (zero-copy binding — the common case never rebinds),
         // materialised into an owned vector only by a tail-call target,
@@ -80,7 +81,14 @@ impl Interp {
         let prev_namespace = self.current_namespace.clone();
         // Apply's one-shot `info level 0` word (consumed even when the
         // arity check fails, so it can't leak into a later call).
-        let level0_override = self.frame_level0_args.take();
+        // Same guard as the tailcall marker: `take()` on the (24-byte)
+        // Option is a full replace; `apply` frames are the only ones that
+        // ever arm it.
+        let level0_override = if self.frame_level0_args.is_some() {
+            self.frame_level0_args.take()
+        } else {
+            None
+        };
         // The OO dispatcher's one-shot variable links (consumed here for
         // the same leak reason; installed at frame setup below).
         let prelink = self.frame_prelink.take();
@@ -123,14 +131,23 @@ impl Interp {
                 ns_depth: 0,
             }),
         };
-        frame.ns = None;
-        frame.call_ns = Some(prev_namespace.clone());
+        // `frame.ns`/`frame.call_ns` are *retained* across the pool
+        // round-trip (not reset here, not cleared at the epilogue): the
+        // assignments below are identity-checked, so a hot proc in one
+        // namespace pays neither a drop nor a clone per call.  The frame
+        // is only read after the definition namespace is (re)established.
+        if !matches!(&frame.call_ns, Some(n) if Rc::ptr_eq(n, &prev_namespace)) {
+            frame.call_ns = Some(Rc::clone(&prev_namespace));
+        }
         frame.tailcall = None;
         frame.level0.clear();
         frame.ns_depth = self.ns_level0.len();
         self.frames.push(frame);
 
         let final_result = loop {
+            // The def this iteration runs: the called one, or a tail-call
+            // target's (owned by `tc_def`).
+            let def: &ProcDef = tc_def.as_deref().unwrap_or(proc_def);
             // ── E2 slot-locals gate (re-checked every iteration: a tailcall
             // rebind swaps the compiled body, and the shape must follow) ──
             // The conditions are the execution gate below plus the slot
@@ -145,14 +162,22 @@ impl Interp {
             // stays name-keyed and the body's slot ops fall back to their
             // name paths (which is also what a mid-run degrade leaves
             // behind).
-            let slot_mode = match &current_compiled {
+            //
+            // LOAD-BEARING for the OO prelink slots: the `slot_table`
+            // installed here is the SAME compiled unit the OO memo
+            // precomputed its `PrelinkEntry::slot` indices against
+            // (oo.rs builds both from one `memoised_proc_def`), so
+            // `degrade_frame_link_at` may trust the index with only a
+            // debug_assert on the name.  Changing what this gate accepts
+            // changes that invariant.
+            let slot_mode = match &def.compiled {
                 Some(code)
                     if !code.fallback
                         && code.epoch == self.tier1_epoch
                         && super::vm_exec::bytecode_applicable(self)
                         && current_statics.is_empty()
                         && !code.locals().is_empty()
-                        && code.params_aligned == Some(current_params.len()) =>
+                        && code.params_aligned == Some(def.params.len()) =>
                 {
                     let table = Rc::clone(code);
                     let n = code.locals().len();
@@ -187,9 +212,17 @@ impl Interp {
                 let def_ns = ns_override
                     .take()
                     .unwrap_or_else(|| ns_of_qualified(self, &current_proc_name));
-                self.current_namespace = Rc::clone(&def_ns);
+                // Identity-checked writes: in a hot proc the namespace is
+                // the same allocation across calls (`Rc<str>` drops were
+                // 8% of `call_proc` self), so both the interpreter's
+                // current namespace and the frame's skip the churn.
+                if !Rc::ptr_eq(&self.current_namespace, &def_ns) {
+                    self.current_namespace = Rc::clone(&def_ns);
+                }
                 let frame = self.frames.last_mut().unwrap();
-                frame.ns = Some(def_ns);
+                if !matches!(&frame.ns, Some(n) if Rc::ptr_eq(n, &def_ns)) {
+                    frame.ns = Some(def_ns);
+                }
                 frame.locals.clear();
                 frame.array_locals.clear();
                 frame.upvars.clear();
@@ -207,12 +240,12 @@ impl Interp {
                 }
             }
 
-            let has_args = current_params.last().map(|(p, _)| p.as_str()) == Some("args");
+            let has_args = def.params.last().map(|(p, _)| p.as_str()) == Some("args");
 
             let regular_params = if has_args {
-                &current_params[..current_params.len() - 1]
+                &def.params[..def.params.len() - 1]
             } else {
-                &current_params[..]
+                &def.params[..]
             };
 
             // This iteration's invocation words: the borrowed caller
@@ -243,9 +276,9 @@ impl Interp {
                         crate::value::tcl_quote(&current_proc_name)
                     };
                     let mut usage = name_word;
-                    for (i, (p, d)) in current_params.iter().enumerate() {
+                    for (i, (p, d)) in def.params.iter().enumerate() {
                         usage.push(' ');
-                        if has_args && i == current_params.len() - 1 {
+                        if has_args && i == def.params.len() - 1 {
                             usage.push_str("?arg ...?");
                         } else if d.is_some() {
                             usage.push('?');
@@ -356,7 +389,7 @@ impl Interp {
                     // The alias name leaves the slot model (link-only
                     // aliasing — the frame's other slots stay fast).
                     let glink = crate::interp::UpvarLink::Global(Rc::clone(qualified));
-                    self.degrade_frame_link(frame_idx, name, &glink);
+                    self.degrade_frame_link_at(frame_idx, name, entry.slot, &glink);
                     self.frames[frame_idx].upvars.insert(
                         Rc::clone(name),
                         crate::interp::UpvarLink::Global(Rc::clone(qualified)),
@@ -381,7 +414,7 @@ impl Interp {
             // observed frames, `RTCL_NO_BYTECODE`, non-whitelisted ops,
             // a Tier1 command shadowed since compilation) stays on the
             // tree-walk.
-            let mut result = match &current_compiled {
+            let mut result = match &def.compiled {
                 Some(code)
                     if !code.fallback
                         && code.epoch == self.tier1_epoch
@@ -402,10 +435,10 @@ impl Interp {
                 // (tclsh compiling lambda/method bodies like procs is a
                 // recorded follow-up, not this change).
                 _ => {
-                    if current_compiled.is_some() {
+                    if def.compiled.is_some() {
                         self.next_eval_lexical = true;
                     }
-                    self.eval(&current_body)
+                    self.eval(&def.body)
                 }
             };
 
@@ -415,9 +448,15 @@ impl Interp {
             // `catch [list tailcall foo]; tailcall` → {}).
             if !matches!(&result, Err(e) if e.is_tail_call()) {
                 if let Some(frame) = self.frames.last_mut() {
-                    if let Some(tc_args) = frame.tailcall.take() {
-                        if !tc_args.is_empty() {
-                            result = Err(Error::tail_call(tc_args));
+                    // `is_some` guard: the bare `take()` is a full
+                    // `mem::replace` of the (24-byte) Option every call —
+                    // on the overwhelmingly common unarmed frame the
+                    // discriminant check is all that's needed.
+                    if frame.tailcall.is_some() {
+                        if let Some(tc_args) = frame.tailcall.take() {
+                            if !tc_args.is_empty() {
+                                result = Err(Error::tail_call(tc_args));
+                            }
                         }
                     }
                 }
@@ -458,10 +497,8 @@ impl Interp {
                     let cmd_name = tc_args[0].clone();
                     if let Some(new_proc) = self.procs.get(&cmd_name).cloned() {
                         // Tail-call to another proc — reuse the frame (no depth increase)
-                        current_params = Rc::clone(&new_proc.params);
-                        current_body = Rc::clone(&new_proc.body);
-                        current_compiled = new_proc.compiled.clone();
                         current_statics = Rc::clone(&new_proc.statics);
+                        tc_def = Some(new_proc);
                         current_proc_name = Cow::Owned(cmd_name.clone());
                         owned_args = Some(tc_args.into_iter().map(|s| Value::from_str(&s)).collect());
                         // The reused frame's enterstep context now names the
@@ -619,9 +656,12 @@ impl Interp {
         // Kept (cleared, with capacity) — the pooled frame reuses the
         // buffer for its next invocation's `info level 0` words.
         popped.level0.clear();
-        popped.tailcall = None;
-        popped.ns = None;
-        popped.call_ns = None;
+        if popped.tailcall.is_some() {
+            popped.tailcall = None;
+        }
+        // `popped.ns`/`popped.call_ns` are retained (see the prologue):
+        // the next invocation's identity checks decide whether they are
+        // replaced; the pooled frame keeps at most two namespace `Rc`s.
         if self.frame_pool.len() < 32 {
             self.frame_pool.push(popped);
         }

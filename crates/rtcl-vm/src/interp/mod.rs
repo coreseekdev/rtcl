@@ -101,6 +101,11 @@ pub(crate) struct PrelinkEntry {
     pub(crate) qualified: Rc<str>,
     pub(crate) ns_part: Rc<str>,
     pub(crate) registered: core::cell::Cell<bool>,
+    /// The frame slot holding `name` in the linked body's compiled locals
+    /// (precomputed with the list; the installing frame IS that body's, so
+    /// the per-call link install skips the table scan).  `None` when the
+    /// body has no slot for it (name-keyed frames fall back).
+    pub(crate) slot: Option<u16>,
 }
 #[cfg(feature = "embedded")]
 pub(crate) type UpvarMap = alloc::collections::BTreeMap<Rc<str>, UpvarLink>;

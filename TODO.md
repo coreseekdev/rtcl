@@ -54,6 +54,10 @@
      去 KeyMemo/ChainMemo 的每调用哈希+memcmp（≈4-6%，改动大）。
   4. `head_cache` 的 typed 比较 → 与调用站点共享 `Rc<str>` 身份（需
      `Value` 字符串 rep 可暴露 Rc，或站点级持有）。
+- [x] **站点惰性化（Round W，审计后关闭）**：读取点审计 8 处（foreach
+  形状门/控制构造行基/namespace 辅助/tree-walk 词读）→ 收益 15-20
+  instr/命令 vs 引入 (unit,site) 惰性解析 + 错误路径双模型 → 不做。
+  结论见 BASELINE「Round W」。
 - [ ] **下一批（按预期收益，Round L+ 候选）**：
   1. `BEGIN_CMD` 的 `word_srcs` 借用化：`cur_cmd_word_srcs` 改 `(*const
      SrcSpan, len)` 新type（site/单元生命周期内有效；save/restore 只拷指针），
@@ -180,3 +184,50 @@
 - [x] G16 执行器栈裸 Value 化
 - [x] G12+G14 内联整数 Value + 全算术/比较立即数快速路径
 - [x] G13 链接键缓存（单次 globals 探测）
+
+## OO 优化第二批（perf/interp-arch-opt-2，2026-10-18）
+
+**已落地**
+1. ✅ head_cache 身份比较（`Value::same_allocation`，免 memcmp/`to_string`）— `94957ef`
+2. ✅ ChainEntry 预取 owner 变量表 Rc（memo 检查免表探测；`fresh_chain` 门控）— `94957ef`
+   → oo2 **0.48x**、oovars **0.57x**；全门禁绿（tests 1256/0、judge 88/88、sweep 0）
+
+**已实验关闭**
+6. ❌ while 体尾融合 `[BeginCmdIncr*Pop, Jump]`→单 op：while 微基准 **+1.54%**
+   （+12 instr/迭代，热派发面增长吃回）→ 回退留档（`d85033d`，Round Z）。
+   注：micro_incr 的 for 体尾是 fall-through（无 Jump），该窗口对它无效。
+
+**已落地（续）**
+3. ✅ OO 派发站点级 memo（`OoCallCache`，`04fd3ed`）——身份(typed/method
+   `same_allocation`)+ns 指针+`mutation_ctr` 四项验证，命中直达
+   `exec_chain_entry`。oo2 **0.43x**、oovars **0.52x**（各 −10.5%/−8.3%）。
+   续做实验（`f8c3007`/Round AB）：`my` 复用缓存与免 `format!` 门禁均无正收益
+   （单槽被交替方法冲刷，−2.89%/−0.01%）→ 回退；后由 Round AG 的 `my` 双槽
+   落地解决（17.466G→11.827G，−32.3%），多槽索引不再需要。
+
+**待做（按序）**
+4. ✅ call_proc 帧准备（Round AF/AH/AI）：画像定位后落地「去三连 Rc clone +
+   take 守卫 + ns 身份写/池化帧保留」——fib25 507.46M→**493.75M（−2.70%，
+   0.85x→0.83x）**、oo2 −1.38%、oovars −1.01%；批次 3（借用合并）实测净负
+   已回退（`aa5b3cf` 收口）。剩余的后期配方（原条目保留作参考）：
+   `CARGO_TARGET_DIR=/tmp/opencode/rtcl-prof CARGO_PROFILE_RELEASE_STRIP=false     CARGO_PROFILE_RELEASE_DEBUG=1 RUSTFLAGS="-C force-frame-pointers=yes"     cargo build --release -p rtcl-cli` → `setarch $(uname -m) -R perf record     -F 8000 -g ./target/release/rtcl -f bench/scripts/fib25.tcl` →
+    `perf script` 导出后 python 自聚合（本机 `perf report` 会超时）。
+   已审读 call.rs 的候选（逐项都 <1%，需画像确认可叠加值 ≥2% 的组合）：
+   level0 每参 clone+push（~20 instr/调用）、slot_mode 门禁的
+   `Rc::clone(code)`+`slots.resize`、`ns_of_qualified`+两次 ns Rc clone、
+   帧池收发与 11 项字段 clear、返回值/`call_depth` 管道。
+   注意红线：`info level 0` 的语义是「调用时刻的词快照」，level0 惰性化
+   不可行（args 切片不驻帧；且调用后无法重建）——除非能证明全局无读者。
+5. ✅ 关闭（有证据，2026-10-18）：S1 被 Round AA/AG 缓存提前兑现；S2 经
+   成本/收益评估判定不做（每次短串构造加哈希 vs 罕见站点收益；板面不覆盖）；
+   S3 原计划不做。判定与理由见 `docs/DESIGN-value-handles.md` 1.5/1.6 节。
+   （下方为当时的中间状态记录）：派发名的 identity 命中已在
+   对象派发（单槽）与 `my`（双槽，−32.3%）落地；`dispatch_dynamic`
+   （`$o $m` 变量名）与字面量同速。**S1（名字构造点显式共享）已被
+   上述缓存实现取代**——设计文档已加「实测修订」节。剩余价值集中在
+   **S2（短串驻留在 Value 构造点，服务「拼出来的名字」）**：收益不在
+   板面，且需先在 micro_add/lappend 上证明数据串无回退；S3 暂不计划。
+   结论与证据见 `docs/DESIGN-value-handles.md`。
+
+**其余候选**：`call_proc` 帧准备之外的四板点（fib 0.85x / fe 0.92x / dloop 0.68x /
+build 0.72x）已在上一节定界；micro_add 0.89x、micro_lappend 0.72x（已 <1x）。

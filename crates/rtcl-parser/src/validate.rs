@@ -113,7 +113,9 @@ pub fn validate(code: &ByteCode) -> Vec<ValidationError> {
             | OpCode::CmpVarVarJumpTrue(_, _, _, target)
             | OpCode::CmpVarVarJumpFalse(_, _, _, target)
             | OpCode::CmpVarImmJumpTrue(_, _, _, target)
-            | OpCode::CmpVarImmJumpFalse(_, _, _, target) => {
+            | OpCode::CmpVarImmJumpFalse(_, _, _, target)
+            | OpCode::ForNextIncrLocal(_, _, _, target)
+            | OpCode::ForNextIncrVar(_, _, _, target) => {
                 if *target as usize > len {
                     errors.push(ValidationError {
                         pc,

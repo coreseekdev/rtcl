@@ -1512,6 +1512,287 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round AI — call_proc 批次 3 实验（2026-10-18，结论：回退）
+
+把「位置绑定 + `args` 尾 + `info level 0` 填词」的三次
+`self.frames.last_mut()` 借用合并为一次（args 尾先算成 `Option<String>`，
+帧借用期间不再重借）。画像里 `last_mut`/`as_mut_slice`/`non_null<Box>`
+合计 ≈4.2% of call_proc self，预期 ~0.5%——实测**净负**：fib +0.71%、
+oo2 +0.42%、oovars +0.31%（合并块更大、跨 `extend` 的生命周期拉长）。
+按纪律回退；item 4 以 AF+AH 收口。
+
+## Round AH — call_proc 批次 1+2（2026-10-18，4 号收口）
+
+批次 1（守卫两个每调用 `take()`）：`frame.tailcall.is_some()` 与
+`frame_level0_args.is_some()` 守卫——裸 `take()` 是对 24 字节 Option 的全量
+`mem::replace`（画像里合计 4.6% of call_proc self）。fib −0.24%、oo2
+−0.13%、oovars −0.10%。
+
+批次 2（ns 身份写 + 池化帧保留 ns/call_ns）：`prev_namespace` 桥接的
+`frame.call_ns`、`frame.ns`、`interp.current_namespace` 三处赋值改为
+**指针相等即跳过**；`frame.ns = None`（序）/`popped.ns = None`
+（收尾）**删除**——池化帧保留至多两个命名空间 `Rc`，复用时由身份检查决定
+是否替换。读点核对：`call_ns` 仅 `upvar_target` 的 Bottom 分支读（同值
+语义不变）；`frame.ns` 只在进入定义命名空间后读取。fib −1.31%、oo2
+−0.60%、oovars −0.43%。
+
+**item 4 合计（AF+批次 1+2）**：fib25 507.46M→**493.75M（−2.70%）**，
+比值 0.85x→**0.83x**；oo2 −1.38%（0.42x）；oovars −1.01%（0.52x）。
+门禁：tests 1256/0、judge 88/88、sweep 0。
+
+## Round AG — my 双槽派发缓存（2026-10-18，5 号配套实测）
+
+结构：对象派发**单槽**（`obj_cache`）＋ `my` 派发**双槽**（`my_cache[2]` +
+交替填充游标）。验证不变（`cache_entry_live`：stamp + ns 指针 + typed/method
+分配身份）；`my` 路径仍逐调用跑 `frame_in_object_ns` 门禁（obj_ns 随条目缓存）。
+
+实测（确定性指令数）：
+- `my_bench`（a↔b 交替递归，2.1M 次 `my`）17.466G→**11.827G（−32.3%）**
+  ——Round AB 单槽冲刷问题的正解。
+- `dispatch_dynamic`（`$o $m` 变量名派发）4.448G 持平（对象单槽已覆盖）。
+- oo2 3809.1M / oovars 4915.2M 持平（**回退过程留档**：把对象派发也做双槽
+  会因第二槽探测 +7 instr/调用使 oo2/oovars 各 +0.18%，故拆成单/双槽；
+  展开手写探针救不回这 7 instr，成本在条目本身）。
+- 板面六项与 AF 相同（fib 0.84x / fe 0.92x / dloop 0.68x / oo2 0.42x /
+  oovars 0.52x / build 0.72x）。门禁：tests 1256/0、judge 88/88、sweep 0。
+
+## Round AF — call_proc 去 Rc 流量（2026-10-18，4 号第一刀）
+
+**落地**（call.rs）：`params`/`body`/`compiled` 的每调用三连 `Rc::clone`
+改为「全程经引用读 def；仅尾调用重绑时取 owned def（`tc_def:
+Option<Rc<ProcDef>>`，循环头 `let def = tc_def.as_deref().unwrap_or(proc_def)`）」，
+`statics` 仍为每调用一次 clone（COW 写回需要 owned）。行为等价：
+尾调用分支只是把三个赋值换成一个 `tc_def = Some(new_proc)`。
+
+实测（指令数，确定性）：
+- fib25 507.46M→**501.52M（−1.17%）**，比值 0.85x→**0.84x**
+- oo2 3834.1M→**3809.1M（−0.65%）**，**0.42x**
+- oovars 4939.2M→**4915.2M（−0.49%）**，0.52x
+- fe/dloop/build 持平。门禁：tests 1256/0、judge 88/88、sweep 0。
+
+**同批否决**（两组合并实验，均回退留档）：
+1. `bytecode_applicable` 每迭代一次化 + 槽向量「resize+重写」原位重置：
+   合并净负（fib +0.45%、oo2 +0.75%、oovars +0.8%）——未拆分单因，
+   但两者都不留。
+2. 全批（上述+去 Rc）曾测得 fib −0.65%/oo2 +0.13%/oovars +0.36%；
+   拆分后确认收益全部来自去 Rc，且单留它比全批更好（fib −1.17%）。
+   教训：**小改动必须拆分 A/B**，合并测量会把负项混进正项。
+
+## Round AE — call_proc 行级归因（2026-10-18）
+
+工具路径三连挫（已踩，勿重复）：
+1) `perf script -F +srcline` 全量：逐帧 addr2line，4.4M 帧 → 超时（900s）。
+2) `perf report --symbols=call_proc --sort=srcline`：本机版本该组合无输出。
+3) 小样本重录（`-F 4000`×12）+ `-F +srcline`：重录仅得 6 样本（record 未采到
+   子进程），且本机 perf 不认 `+srcline` 字段（133 行无行号）。
+→ **正确工具是 `perf annotate`**：`perf annotate -i /tmp/fib25.perf --stdio -s call_proc`
+（实测输出如下，逐行占比为 call_proc 的 self 内部）：
+
+```
+(perf annotate 无输出)
+```
+
+（原始建议保留）`perf annotate`：`perf annotate -i /tmp/fib25.perf --stdio
+   -s call_proc`（单符号源码/汇编注记，只对一个符号做 addr2line，成本可控）。
+（下列为路径 2 的空输出记录）：
+
+```
+(perf report --symbols 过滤无输出)
+```
+
+## Round AD — fib25 符号化画像（2026-10-18，4 号定位）
+
+方法：`CARGO_TARGET_DIR=/tmp/opencode/rtcl-prof` + `CARGO_PROFILE_RELEASE_DEBUG=1`
++ `-C force-frame-pointers=yes` 构建 → `setarch -R perf record -F 40000 -g`
+（30 次 fib25，38,698 样本）→ `perf script` 导出 + python 自聚合。
+
+**self(叶) top**：`exec_inner` 12.91% · **`call_proc` 10.73%** ·
+`[unknown]` 7.63% · `numeric_binop` 3.09% · `op_begin_cmd` 2.13% ·
+`dispatch_site` 2.13% · `__memcmp_evex_movbe` 1.96% · `get<u64>` 1.95% ·
+`drop` 1.81% + `drop<str>` 1.78% · `branch<Value,Error>` 1.51% ·
+`exec_bytecode` 1.37% · `resize<Value>` 1.30% · `op_cmp_si_jump` 1.29%。
+**inclusive**：`call_proc` 89.37%、`exec_bytecode`/`exec_inner` 91.24%。
+
+结论（4 号可动性）：`call_proc` self = 10.73%（fib 全调用都在其下），按
+243K 次调用折算 ≈ **224 instr/调用**的纯帧准备/收尾——与 TODO 的候选清单
+（level0/槽 resize/ns/池收发）量级吻合；砍掉其 30-40% ≈ fib 3-4%。
+下一步：**行级归因**。注意：`perf script -F +srcline` 会对每帧跑 addr2line，
+全量 4.4M 帧会超时（已踩）——改用小样本（`-F 2000`、3-5 次运行）或
+`perf report --stdio --sort=srcline` 定向看 `call_proc` 内部行。
+另注：`[unknown]` 7.63% 与 `drop`/`resize`/`get<u64>` 的 5-6% 是新线索
+（帧准备里的容器 clea/resize 与引用计数释放），画像下一轮一并归因。
+
+## Round AC — 4/5 号研究与设计（2026-10-18，不动物码）
+
+- 4 号（call_proc 帧准备）：查台账无近期 fib 画像可直接引用（F1 为 10-04
+  旧案）；审读 call.rs 后判定现候选逐项 <1%，**必须先画像**再动。可执行
+  配方（含 debug 构建、perf record、perf script 自聚合）已写入 TODO。
+- 5 号（Value 句柄共享）：设计稿 `docs/DESIGN-value-handles.md` 落盘——
+  S1 名字构造点显式共享（低风险，先做）/ S2 短串线程本地驻留（需 micro
+  证明数据串无回退）/ S3 表示层统一（暂不计划）；红线与 JIT 契约写明。
+
+## Round AB — my 派发快径实验（2026-10-18，结论：回退）
+
+对 `cmd_oo_my` 复用派发缓存（第 2 槽）+ `frame_in_object_ns` 免 `format!`：
+- `my` 快径（单槽）：交替递归微基准（a↔b 互调，2.1M 次 my 调用）
+  **−2.89%**（17.55G→18.06G）。根因：单槽缓存被交替方法名冲刷，
+  每次调用 = 验证失败 + 慢径 + 填充（object_ns_of/Rc clones），
+  而慢径时省下的（qualify/Rc::from/两哈希）已被摊销得比预期小。
+- 仅免 `format!` 门禁：**−0.01%**（噪声），保留价值不足。
+结论：两者均回退。`my` 派发的进一步优化需要**按方法词身份索引的多槽缓存**
+（如 4 槽，idx = 词指针低位），且板面不覆盖 `my`——记录为低优先级。
+（对照：对象派发单槽即可，因热点循环形状是同一方法重复调用——Round AA。）
+
+## Round AA — OO 派发站点级 memo（2026-10-18）
+
+`OoCallCache`（OoState 单槽）：缓存 `(ns, stamp, typed, method, key,
+method_rc, chain)`；命中判定 = 变异戳相等 + 当前命名空间 `Rc` 指针相等 +
+typed/method 两词 `same_allocation`（常量池字面量/槽值 clone 的分配稳定）
+——四项合起来蕴含 `resolve_object_key` 必得同 key、`chain_for` 必 memo 命中，
+于是两次哈希探测全免，缓存链直进 `exec_chain_entry`。`my`
+（include_private）路径既不查也不填（帧上下文门禁语义另议）。
+
+实测：oo2 4284M→**3834M（−10.5%）0.48x→0.43x**；oovars 5389M→**4939M
+（−8.3%）0.57x→0.52x**；其余板持平。两板均进入 0.5-0.6 目标带（oo2 更低）。
+门禁：tests 1256/0、judge 88/88、sweep 0。
+
+## Round Z — while 体尾融合实验（2026-10-18，结论：回退）
+
+新 op `IncrPopJumpLocal/Var`：`[BeginCmdIncr*Pop(site,x,k), Jump(t)]` 单 op
+（`while {..} {incr i}` 的体尾形状；`for`/最小值脚本已在 IR 层验证融合触发）。
+实测（`/tmp/while_incr.tcl`，3M 次 while+incr）：融合后**净增** 36.0M 指令
+（2.336G→2.372G，**+1.54%**，≈+12 instr/迭代）；六板与 micro 板持平（该形状
+不在其中）。根因判定：热 op 派发面再加两个臂后，小循环（2 op/迭代）的派发/
+布局成本上升，吃掉并超过省下的一次派发——与「热 op 加分支反复净负」的先例
+一致。另外 micro_incr 的 `for` 体尾是 **fall-through**（体尾无 Jump，直接落入
+advance 块），本窗口对其根本无效。
+决策：回退（无板面收益 + 目标形状变慢 + 增加 JIT 增量面），实验记录留档。
+
+## Round Y — OO 派发快径两连（2026-10-18）
+
+1. **head_cache 身份比较**：`MethodDef.head_cache` 键从 `(String, Value, Value)`
+   改 `(Value, Value, Value)`，命中判定 `Value::same_allocation`（ptr 比较，
+   免 memcmp、免 miss 路径的 `to_string` 分配）。`invoke_method`/
+   `exec_chain_entry` 增 `typed_val: &Value` 参数（`next`/`<cloned>` 冷路径
+   传临时 Value）。oovars 5499M→5482M，oo2 4394M→4376M。
+2. **ChainEntry 携带 owner 变量表**：链构建点（构建时表项在手，clone 即得）
+   预取 owner 的 `variables`/`obj_variables` Rc；`memoised_proc_def` 的 memo
+   键检查不再每调用做 `objects.get`/`classes.get` 哈希探测。
+   健全性：该字段唯一写点（`oo::define variable`）换 Rc 且必 bump
+   `mutation_ctr`，而链 memo 由 ctr 盖章——盖章未变则 hint == live。
+   `next`/`<cloned>` 路径经 `fresh_chain=false` 走原 live 探测（方法体内
+   声明 `variable` 后 `next` 的观测语义逐字保持）。
+   oovars 5482M→5389M（**0.58x→0.57x**），oo2 4376M→4284M（**0.49x→0.48x**）。
+
+门禁：tests 1256/0、judge 88/88、sweep 0。
+
+## 快照 — perf/interp-arch-opt-2 收盘（2026-10-18）
+
+指令数比（rtcl/tclsh）/ wall（3 次交错 best-of）：
+
+| bench | 指令比 | wall |
+|---|---|---|
+| fib25 | 0.85x | 0.88x |
+| fe_bench | 0.92x | 0.79x |
+| dloop | 0.68x | 0.72x |
+| oo_bench2 | 0.49x | 0.56x |
+| oovars | 0.58x | 0.66x |
+| build-only | 0.72x | — |
+| micro_base | 1.08x | — |
+| micro_incr | 1.33x | — |
+
+本轮（评审合并后新分支）五个轮次：U 骨架融合修复（靶点 remap）、V 死推入
+消除、W 站点惰性审计（关闭）、X prelink 槽位预计算；S/T 为回退实验记录。
+下一批候选（定界已入 TODO）：head_cache 身份比较、ChainEntry 携带 owner
+变量表、OO 派发站点级 memo、call_proc 帧准备、`Value` 字符串句柄共享。
+
+## Round X — OO prelink 槽位预计算（2026-10-18）
+
+`PrelinkEntry.slot`：链 memo 构建时（拿到编译体之后）预计算每个链接名在
+`locals` 表中的槽位；安装路径改走 `degrade_frame_link_at(frame_idx, name,
+slot, link)`——命中预计算槽位时跳过 `slot_index_of` 的线性名字扫描
+（debug_assert 校验槽位与名字一致）。实测 oovars 5536M→**5499M**；
+oo2/fe/fib/dloop/build 持平。门禁：tests 1256/0、judge 88/88、sweep 0。
+
+## 审计记录 — 站点惰性化（Round W，结论：不做）
+
+想要「`BEGIN_CMD` 只写 `cur_site`，文本/行/word_srcs 延迟到错误路径解析」。
+先做读取点审计（`cur_cmd_text/cur_cmd_line/cur_cmd_word_srcs/line_offset`）：
+
+| 读者 | 何时运行 | 惰性化影响 |
+|---|---|---|
+| vm_exec 错误处理 + unwind_subs + 各 Region 臂 | 编译单元出错 | 可从 `code.sites[st.cur_site]` 直接解析 ✓（本可行） |
+| `loops.rs:295` foreach/lmap 内联形状门 | 编译单元**派发** foreach/lmap 时 | ✗ 需要 BEGIN_CMD 写的 word_srcs（派发者无 code） |
+| `control.rs:32`/`loops.rs:27,358,387`（`line_offset + cur_cmd_line`） | 派发 while/for/if 的 tree-walk 体求值 | ✗ 需要 BEGIN_CMD 的字段 |
+| `namespace.rs:336`（`cur_cmd_text.slice`） | 派发辅助命令 | ✗ 同上 |
+| `eval.rs:308/333/356`（word 读取） | tree-walk 词求值（自带 save/restore 写字段） | ○ 非 BEGIN_CMD 来源 |
+
+结论：**收益 ~15-20 instr/命令，代价是给 8 个外部读点 + 错误路径引入 (unit, site)
+惰性解析**——且 Round L 之后 `op_begin_cmd` 本就只剩「守卫 + site 查表 +
+4-5 个廉价存储」≈25 instr（word_srcs 已是 ptr+len 切片，无 Rc）。风险/收益
+不成立，**关闭该项**。
+
+## Round V — 死推入消除 + 骨架成本归因（2026-10-18）
+
+`[PushEmpty/PushTrue/PushFalse/PushInt/PushConst(Wide), Pop]` → `Nop, Nop`
+（语义空操作：被丢弃的字面量不可观测；空体/常量体构造的常见形）。
+
+- `micro_base`（空 for 体）430.9M→**365.9M（1.28x→1.08x）**——空体的
+  `PUSH_EMPTY+POP` 每迭代 ~28 instr 归零。
+- 全板：fe 0.92x、build 0.72x、其余持平（该形只在空体/常量体构造出现）。
+
+**micro 成本归因**（perf 叶表，回答「为何 1.3x」）：
+
+| micro | 每迭代 | 构成（叶%） |
+|---|---|---|
+| micro_base | 366 instr / 2 op | exec_inner 19.9（派发 ~72/迭代）、条件 cmp_bool 13.3+op_cmp_ss_jump 10.2+slot_read 6.0（≈108）、尾 op 9.6+incr 路径 ~11（≈74）、region drop/clone ~7 |
+| micro_incr | 519 instr / 3 op | exec_inner 16.0（~83）、条件 ~18（~93）、体 `incr x`（op_begin_cmd 6.5 + incr_local_value 6.5 + set_int_rep 5.2 + frame_slot_incr 4.3 + get<u64> 5.6 ≈ 150）、尾 ~120 |
+
+结论：**单 op ≈170-180 instr**（tclsh ≈48/指令），主因 = 每命令 `BEGIN_CMD`
+站点存储（~34）、通用槽访问（frames.last+检查+clone，每次 ~20×5）、
+region 簿记（~40/迭代）、派发（~36/op）与 Result/helper 管道——tclsh 的
+等价循环没有运行时站点/region 簿记（errorInfo 走静态行表）且指令更扁平。
+这是架构地板；后续只剩「体+尾」合并省一次派发（~36/迭代，payload 受限）
+等小项。
+
+## Round U — 循环骨架融合（修复版，2026-10-18）
+
+Round T 失败**根因已定位并修复**：`ForNextIncrLocal/Var` 携带的跳转靶点
+漏进 `strip_nops` 重映射与 `collect_jump_targets`——复杂脚本里前段折叠
+产生的 nop 一经 strip 就把条件靶点移错（循环不退出）；简单脚本无 nop
+故自测通过。补上两处后：
+
+- `[SwapToNextMark, BeginCmdIncrLocal/VarPop(site,x,k), Jump(t)]`
+  → `ForNextIncrLocal/Var`（k 需 fits-i32；`jump_pc = st.pc + 1` 计步平价）；
+  entries 在头部（continue 落点）执行同一序列。
+- 实测：`micro_base` 449.9M→**430.9M（1.33x→1.28x）**、`micro_incr`
+  533.9M→518.9M（1.36x→1.33x）、`build-only` 3485M→**3371M（0.75x→0.72x）**、
+  `fe_bench` 0.93x→**0.92x**；fib/dloop/oo2/oovars 持平。
+- 门禁：tests **1256/0**、judge **88/88**（含 control_flow/gen_expr）、sweep 0。
+
+## 实验记录 — 循环骨架融合（Round T，已回退）
+
+消融定位（新增 micro）：**`while` 形态 1.09x vs `for` 形态 1.33x**
+（`micro_base` tclsh 337M vs rtcl 450M，1M 迭代）——差距集中在 `for` 专属的
+next-script 转换（`SWAP_TO_NEXT_MARK` + Next region + 一跳派发 ≈107 instr/迭代），
+而非通用循环机制。
+
+实现（两窗口，均逐字复刻）：
+- 3-op `[SwapToNextMark, BeginCmdIncrLocal/VarPop(site,x,k), Jump(t)]`
+  → `ForNextIncrLocal/Var`（k 需 fits-i32；entries 在头部=continue 落点等价）；
+- 2-op `[BeginCmdIncrLocal/VarPop, Jump]` → `Incr*PopJump`。
+
+实测：`micro_base` 449.9M→**430.9M**（1.33x→1.28x）、`micro_incr` 533.9M→
+518.9M、`m_while` 342.9M→337.9M；但 **judge 破防**：2-op 窗口令
+`control_flow` 的 `for` 不终止；移除 2-op 后 3-op 仍令 `gen_expr`（`expr-23.49`
+的 `for {set tval 0} {$tval <= 66} {incr tval}`）不终止——两窗口均曾复现
+「循环不退出」，根因未在预算内收敛（自测小脚本 f1/f2/f3、cf_min 均通过，
+长脚本多构造交互处失败 → 疑似与 `strip/remap` 的 `cont/brk` 靶点交互）。
+
+**整批回退**（分支保留 master 基线）。结论：骨架融合必须配「循环终止性」
+专项矩阵（break/continue/next-script 逃逸 × 嵌套 × strip 交互）才能安全落地，
+列入下一批（完整工作段 + 专项探针）。
+
 ## 实验记录 — VarMap RC 键表示层（Round S，已回退）
 
 按计划试做 `VarMap/VarSet/UpvarMap` 键 → `Name(Rc<str>)`（ptr-first `Eq` +

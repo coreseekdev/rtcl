@@ -633,6 +633,18 @@ pub enum OpCode {
     /// Fusion of `[BeginCmd s, IncrVarPop i k]` — the name-keyed twin.
     BeginCmdIncrVarPop(u32, u16, i64),
 
+    /// Fusion of the whole `for` next-script tail:
+    /// `[SwapToNextMark, BeginCmdIncrLocalPop(site, slot, k), Jump(t)]` —
+    /// close the body region / open the next region, set the incr's site,
+    /// increment-and-discard, then the back-edge (region close, step
+    /// charge, jump).  `k` must fit `i32` (the fusion gate; anything else
+    /// keeps the three-op form).  Entries at the window head (a compiled
+    /// `continue` lands there) execute the identical sequence.
+    ForNextIncrLocal(u32, u16, i32, u32),
+
+    /// The name-keyed twin of [`OpCode::ForNextIncrLocal`].
+    ForNextIncrVar(u32, u16, i32, u32),
+
     /// Fusion of `[Jump(t), ForeachNext { info, body }]` (only when `t`
     /// is the ForeachNext itself — the iteration loop's region-closing
     /// trampoline): close the body region, then advance the iterator
@@ -921,6 +933,12 @@ impl fmt::Display for OpCode {
             OpCode::SubEndStoreVarPop(idx) => write!(f, "SUB_END_STORE_V_POP {}", idx),
             OpCode::SubEndReturn => write!(f, "SUB_END_RETURN"),
             OpCode::SwapToNextMark => write!(f, "SWAP_TO_NEXT_MARK"),
+            OpCode::ForNextIncrLocal(site, slot, k, t) => {
+                write!(f, "FOR_NEXT_INCR_L {} {} {} -> {}", site, slot, k, t)
+            }
+            OpCode::ForNextIncrVar(site, idx, k, t) => {
+                write!(f, "FOR_NEXT_INCR_V {} {} {} -> {}", site, idx, k, t)
+            }
             OpCode::NextMarkBeginCmd(site) => write!(f, "NEXT_MARK_BEGIN_CMD {}", site),
             OpCode::BeginCmdIncrLocalPop(site, slot, n) => {
                 write!(f, "BEGIN_CMD_INCR_L_POP {} {} {}", site, slot, n)

@@ -88,6 +88,10 @@ pub(crate) struct ProcMemoEntry {
 type ProcMemo = Vec<ProcMemoEntry>;
 const PROC_MEMO_MAX: usize = 4;
 
+/// The [`MethodDef::head_cache`] cell: (typed name's `Value`, method
+/// name's `Rc`, the two head Values [typed, method]).
+type HeadCache = (Value, Rc<str>, Value, Value);
+
 /// A method definition (own methods, forwards, constructors, destructors).
 #[derive(Debug, Clone)]
 pub(crate) struct MethodDef {
@@ -109,11 +113,15 @@ pub(crate) struct MethodDef {
     /// the frame-prelink list back as an `Rc`, so a method call allocates
     /// nothing for its `variable` links.
     pub proc_memo: Rc<RefCell<ProcMemo>>,
-    /// Cached argument head for the invoked method: (typed name, the two
-    /// head Values [typed, method]).  The typed name varies per CALL SITE
-    /// (`c` vs `::c`); a match recycles the head Values without
-    /// allocation.  Cold on misses.
-    pub head_cache: RefCell<Option<(String, Value, Value)>>,
+    /// Cached argument head for the invoked method: (the typed name's
+    /// `Value`, the method name's `Rc`, the two head Values [typed,
+    /// method]).  The typed name varies per CALL SITE (`c` vs `::c`) and
+    /// the method name varies per `renamemethod` (the moved `MethodDef`
+    /// keeps this cell); the hit test is `Value::same_allocation` plus
+    /// `Rc::ptr_eq` on the method — pointer compares, since values are
+    /// immutable and the cache keeps its own handles alive (no string
+    /// compare, no `to_string` on the miss path).  Cold on misses.
+    pub head_cache: RefCell<Option<HeadCache>>,
 }
 
 /// A fresh [`MethodDef::proc_memo`] cell.
@@ -137,6 +145,13 @@ pub(crate) enum Owner {
 pub(crate) struct ChainEntry {
     pub owner: Owner,
     pub def: MethodDef,
+    /// The owner's `variable` list (identity) as of chain construction,
+    /// captured while the table entry was already at hand.  Sound to reuse
+    /// while `mutation_ctr` is unchanged: the field's only writer
+    /// (`oo::define variable`) swaps the Rc and bumps the counter, and
+    /// chains handed out are stamped by it.  `None` (chains not from the
+    /// stamp-checked memo) falls back to the per-call probe.
+    pub vars: Option<Rc<Vec<String>>>,
 }
 
 /// 链解析 memo：类键 → (成员/父类键 → (stamp, 条目))。
@@ -215,6 +230,30 @@ pub(crate) enum DefineTarget {
     Object(String),
 }
 
+/// Dispatcher-cache entry for the object dispatcher and `my` (see their
+/// fast paths).  Validation is identity-and-stamp: the typed word and the
+/// method word must be the *same allocations* (a const-pool literal, a
+/// slot value re-cloned, or the `my` word — all stable across calls), the
+/// resolution namespace the same `Rc`, and the mutation stamp live.
+/// Those together imply `resolve_object_key`/`qualify` would recompute
+/// the identical key and `chain_for` would hit its memo — so the hash
+/// probes are skipped and the cached chain feeds `exec_chain_entry`.
+/// Each dispatcher holds a two-entry set (two call sites, or two method
+/// names alternating — the one-entry form thrashed, Round AB).
+#[derive(Debug)]
+pub(crate) struct OoCallCache {
+    pub ns: Rc<str>,
+    pub stamp: u64,
+    pub typed: Value,
+    pub method: Value,
+    pub key: Rc<str>,
+    /// The object's namespace, captured at fill time — the `my` slot's
+    /// `frame_in_object_ns` guard needs it without re-probing the tables.
+    pub obj_ns: Option<Rc<str>>,
+    pub method_rc: Rc<str>,
+    pub chain: Rc<Vec<ChainEntry>>,
+}
+
 /// All OO state, hanging off [`Interp`].
 #[derive(Debug, Default)]
 pub(crate) struct OoState {
@@ -263,6 +302,15 @@ pub(crate) struct OoState {
     pub chain_memo: FxMapK<Rc<str>, ChainMemo>,
     /// The `include_private` half of [`Self::chain_memo`].
     pub chain_memo_priv: FxMapK<Rc<str>, ChainMemo>,
+    /// The object dispatcher's cache entry — a single slot: its hot loops
+    /// repeat one method, and a second probe costs a few instructions per
+    /// call (measured).  See [`OoCallCache`].
+    pub obj_cache: Option<OoCallCache>,
+    /// The `my` dispatcher's two-entry set: method bodies alternate
+    /// `my a` / `my b` recursion, which a single slot thrashed (Round AB).
+    pub my_cache: [Option<OoCallCache>; 2],
+    /// Alternating fill cursor for [`Self::my_cache`].
+    pub my_cache_next: u8,
     /// Typed-name → canonical object/class key memo (see
     /// `resolve_object_key`): current namespace → typed name →
     /// (stamp, resolution).  `RefCell` so `&Interp` read paths can fill
@@ -533,7 +581,11 @@ fn push_class_entry(
         if (def.exported || include_private)
             && !out.iter().any(|e| e.owner == Owner::Class(class.to_string()))
         {
-            out.push(ChainEntry { owner: Owner::Class(class.to_string()), def: def.clone() });
+            out.push(ChainEntry {
+                vars: Some(Rc::clone(&cls.variables)),
+                owner: Owner::Class(class.to_string()),
+                def: def.clone(),
+            });
             hidden.remove(method);
         }
     }
@@ -548,7 +600,11 @@ fn build_chain(interp: &Interp, key: &str, method: &str, include_private: bool) 
     if let Some(obj) = interp.oo.objects.get(key) {
         if let Some((_, def)) = obj.methods.iter().find(|(n, _)| n == method) {
             if def.exported || include_private {
-                out.push(ChainEntry { owner: Owner::Object, def: def.clone() });
+                out.push(ChainEntry {
+                    vars: Some(Rc::clone(&obj.variables)),
+                    owner: Owner::Object,
+                    def: def.clone(),
+                });
             }
         }
         for m in &obj.mixins {
@@ -573,7 +629,11 @@ fn build_chain(interp: &Interp, key: &str, method: &str, include_private: bool) 
         // mixins, then the metaclass chain.
         if let Some((_, def)) = cls.obj_methods.iter().find(|(n, _)| n == method) {
             if def.exported || include_private {
-                out.push(ChainEntry { owner: Owner::Object, def: def.clone() });
+                out.push(ChainEntry {
+                    vars: Some(Rc::clone(&cls.obj_variables)),
+                    owner: Owner::Object,
+                    def: def.clone(),
+                });
             }
         }
         for m in &cls.obj_mixins {
@@ -610,6 +670,7 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
                 for (name, def) in &cls.methods {
                     if !out.iter().any(|(n, _)| n == name) && !hidden.contains(name) {
                         out.push((name.clone(), ChainEntry {
+                            vars: Some(Rc::clone(&cls.variables)),
                             owner: Owner::Class($class.clone()),
                             def: def.clone(),
                         }));
@@ -623,7 +684,11 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
     if let Some(obj) = interp.oo.objects.get(key) {
         for (name, def) in &obj.methods {
             if !out.iter().any(|(n, _)| n == name) {
-                out.push((name.clone(), ChainEntry { owner: Owner::Object, def: def.clone() }));
+                out.push((name.clone(), ChainEntry {
+                    vars: Some(Rc::clone(&obj.variables)),
+                    owner: Owner::Object,
+                    def: def.clone(),
+                }));
             }
         }
         for m in &obj.mixins {
@@ -646,7 +711,11 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
     if let Some(cls) = interp.oo.classes.get(key) {
         for (name, def) in &cls.obj_methods {
             if !out.iter().any(|(n, _)| n == name) {
-                out.push((name.clone(), ChainEntry { owner: Owner::Object, def: def.clone() }));
+                out.push((name.clone(), ChainEntry {
+                    vars: Some(Rc::clone(&cls.obj_variables)),
+                    owner: Owner::Object,
+                    def: def.clone(),
+                }));
             }
         }
         for m in &cls.obj_mixins {
@@ -761,6 +830,7 @@ fn does_not_refer(kind_obj: bool, typed: &str) -> Error {
 
 /// Execute chain entry `index` for object `key` (`typed` = as-typed object
 /// name, used in messages and `info level 0`).
+#[allow(clippy::too_many_arguments)]
 fn exec_chain_entry(
     interp: &mut Interp,
     key: &Rc<str>,
@@ -769,6 +839,8 @@ fn exec_chain_entry(
     chain: &Rc<Vec<ChainEntry>>,
     call_args: &[Value],
     typed: &str,
+    typed_val: &Value,
+    fresh_chain: bool,
 ) -> Result<Value> {
     let entry = &chain[index];
     match entry.def.kind.clone() {
@@ -807,8 +879,13 @@ fn exec_chain_entry(
             // would use (the object's namespace) — computed before the
             // memo build so the prelink list can pre-resolve each name.
             let ns = object_ns_of(interp, key);
-            let (proc_def, links) =
-                memoised_proc_def(interp, &entry.owner, key, &entry.def, method, &ns);
+            let (proc_def, links) = {
+                // Hint only for chains straight from the stamp-checked
+                // memo; `next`/cold paths keep the live probe so a
+                // mid-body `variable` declaration is observed there.
+                let vars_hint = if fresh_chain { entry.vars.as_ref() } else { None };
+                memoised_proc_def(interp, &entry.owner, key, &entry.def, method, &ns, vars_hint)
+            };
             if !links.is_empty() {
                 interp.frame_prelink = Some(links);
             }
@@ -822,7 +899,16 @@ fn exec_chain_entry(
             {
                 let mut hc = entry.def.head_cache.borrow_mut();
                 match hc.as_mut() {
-                    Some((t, h0, h1)) if t == typed => {
+                    // Identity, not text: the cached handle stays alive in
+                    // the cell, so pointer equality implies equal text — a
+                    // different allocation with look-alike text misses and
+                    // rebuilds (correct, just cold).  The method word rides
+                    // along: `renamemethod` moves this def (and its cell)
+                    // under a new name, and the old head would replay the
+                    // stale name in `info level 0`.
+                    Some((t, m, h0, h1))
+                        if t.same_allocation(typed_val) && Rc::ptr_eq(m, method) =>
+                    {
                         args.push(h0.clone());
                         args.push(h1.clone());
                     }
@@ -831,7 +917,7 @@ fn exec_chain_entry(
                         let h1 = Value::from_str(method);
                         args.push(h0.clone());
                         args.push(h1.clone());
-                        *hc = Some((typed.to_string(), h0, h1));
+                        *hc = Some((typed_val.clone(), Rc::clone(method), h0, h1));
                     }
                 }
             }
@@ -915,6 +1001,7 @@ fn memoised_proc_def(
     def: &MethodDef,
     method: &str,
     ns: &Rc<str>,
+    vars_hint: Option<&Rc<Vec<String>>>,
 ) -> (Rc<ProcDef>, Rc<Vec<crate::interp::PrelinkEntry>>) {
     // The live `variable` list is the memo key — one probe of the owner's
     // table, no allocation; the link list (owner's declared variables
@@ -924,7 +1011,10 @@ fn memoised_proc_def(
     // The owner's live `variable` list, by identity: the memo keys on the
     // `Rc`'s pointer (a declaration replaces the vector wholesale), so the
     // per-call check is one pointer compare — no table-content walk.
-    let vars: Option<Rc<Vec<String>>> = owner_variables(interp, owner, key).cloned();
+    let vars: Option<Rc<Vec<String>>> = match vars_hint {
+        Some(v) => Some(Rc::clone(v)),
+        None => owner_variables(interp, owner, key).cloned(),
+    };
     {
         let memo = def.proc_memo.borrow();
         if let Some(e) = memo.iter().find(|e| {
@@ -942,6 +1032,15 @@ fn memoised_proc_def(
     let names: Vec<&str> = def.params.iter().map(|(p, _)| p.as_str()).collect();
     let empty: Vec<String> = Vec::new();
     let vars_slice: &[String] = vars.as_deref().unwrap_or(&empty);
+    let mut pd = method_proc_def(&def.body, &def.params, method);
+    // Compile at the same seam named `proc`s use; the compiled form also
+    // unlocks call_proc's slot-locals binding (empty statics, params
+    // seeded in order — the synthetic name first, by construction).
+    let compiled =
+        super::super::vm_exec::compile_proc_body(&pd.params, &def.body, interp.tier1_epoch);
+    // The prelink list lands here — after the compiled body exists, so
+    // each entry can carry the frame slot its name occupies (the install
+    // then skips the locals-table scan).
     let links: Rc<Vec<crate::interp::PrelinkEntry>> = Rc::new(
         vars_slice
             .iter()
@@ -951,21 +1050,22 @@ fn memoised_proc_def(
                 // here so the per-call install never probes the memo.
                 let (qualified, ns_part) =
                     crate::interp::commands::namespace::resolve_var_link(interp, ns, v);
+                let slot = compiled.as_ref().and_then(|c| {
+                    c.locals()
+                        .iter()
+                        .position(|l| l == v.as_str())
+                        .map(|i| i as u16)
+                });
                 crate::interp::PrelinkEntry {
                     name: Rc::from(v.as_str()),
                     qualified,
                     ns_part,
                     registered: core::cell::Cell::new(false),
+                    slot,
                 }
             })
             .collect(),
     );
-    let mut pd = method_proc_def(&def.body, &def.params, method);
-    // Compile at the same seam named `proc`s use; the compiled form also
-    // unlocks call_proc's slot-locals binding (empty statics, params
-    // seeded in order — the synthetic name first, by construction).
-    let compiled =
-        super::super::vm_exec::compile_proc_body(&pd.params, &def.body, interp.tier1_epoch);
     if let Some(code) = &compiled {
         interp.const_pool_insert(code);
     }
@@ -995,6 +1095,52 @@ fn object_ns_of(interp: &Interp, key: &str) -> Rc<str> {
     Rc::from("::")
 }
 
+/// Is the entry still the resolution this invocation would recompute?
+fn cache_entry_live(interp: &Interp, c: &OoCallCache, typed_val: &Value, method_val: &Value) -> bool {
+    c.stamp == interp.oo.mutation_ctr
+        && Rc::ptr_eq(&c.ns, &interp.current_namespace)
+        && c.typed.same_allocation(typed_val)
+        && c.method.same_allocation(method_val)
+}
+
+/// Two-entry probe for the `my` dispatcher's set.
+fn my_cache_hit(interp: &Interp, typed_val: &Value, method_val: &Value) -> Option<usize> {
+    if let Some(c) = &interp.oo.my_cache[0] {
+        if cache_entry_live(interp, c, typed_val, method_val) {
+            return Some(0);
+        }
+    }
+    if let Some(c) = &interp.oo.my_cache[1] {
+        if cache_entry_live(interp, c, typed_val, method_val) {
+            return Some(1);
+        }
+    }
+    None
+}
+
+/// Build an entry for the current resolution (the caller only fills after
+/// a miss, so no stale-match handling is needed).
+fn cache_entry(
+    interp: &Interp,
+    typed_val: &Value,
+    method_val: &Value,
+    obj_ns: Option<Rc<str>>,
+    key: &Rc<str>,
+    method_rc: &Rc<str>,
+    chain: &Rc<Vec<ChainEntry>>,
+) -> OoCallCache {
+    OoCallCache {
+        ns: Rc::clone(&interp.current_namespace),
+        stamp: interp.oo.mutation_ctr,
+        typed: typed_val.clone(),
+        method: method_val.clone(),
+        key: Rc::clone(key),
+        obj_ns,
+        method_rc: Rc::clone(method_rc),
+        chain: Rc::clone(chain),
+    }
+}
+
 /// Invoke `method` on `key`, or produce the unknown-method error.
 ///
 /// The resolution chain comes from [`OoState::chain_memo`] — building it
@@ -1002,19 +1148,39 @@ fn object_ns_of(interp: &Interp, key: &str) -> Rc<str> {
 /// call, a third of the OO call bench.  A miss builds and backfills under
 /// the live mutation stamp; empty chains memo too (the unknown-method
 /// error path then skips the walk as well).
+#[allow(clippy::too_many_arguments)]
 fn invoke_method(
     interp: &mut Interp,
     key: &Rc<str>,
     method: &str,
+    method_val: &Value,
     call_args: &[Value],
     typed: &str,
+    typed_val: &Value,
     include_private: bool,
 ) -> Result<Value> {
     let (chain, method_rc) = chain_for(interp, key, method, include_private);
     if chain.is_empty() {
         return Err(unknown_method_error(interp, key, typed, method));
     }
-    exec_chain_entry(interp, key, &method_rc, 0, &chain, call_args, typed)
+    if include_private {
+        let idx = (interp.oo.my_cache_next & 1) as usize;
+        interp.oo.my_cache_next = (idx as u8 + 1) & 1;
+        let entry = cache_entry(
+            interp,
+            typed_val,
+            method_val,
+            Some(object_ns_of(interp, key)),
+            key,
+            &method_rc,
+            &chain,
+        );
+        interp.oo.my_cache[idx] = Some(entry);
+    } else {
+        let entry = cache_entry(interp, typed_val, method_val, None, key, &method_rc, &chain);
+        interp.oo.obj_cache = Some(entry);
+    }
+    exec_chain_entry(interp, key, &method_rc, 0, &chain, call_args, typed, typed_val, true)
 }
 
 /// The memoised [`build_chain`] for this invocation context.  Nested maps
@@ -1068,6 +1234,33 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
     // typed name, the method name AND a Vec clone of the call args per
     // invocation — the dispatcher's entry tax.
     let typed = args[0].as_str();
+    // Dispatcher cache (see [`OoCallCache`]): a stable typed word + method
+    // word under the same namespace and live mutation stamp mean the
+    // resolve and the chain memo would both hit — run the cached
+    // resolution straight through.  `args.len() < 2` keeps falling into
+    // the arity error below.
+    if args.len() >= 2 {
+        if let Some(c) = interp.oo.obj_cache.as_ref() {
+            if cache_entry_live(interp, c, &args[0], &args[1]) {
+                let (key, method_rc, chain) = (
+                    Rc::clone(&c.key),
+                    Rc::clone(&c.method_rc),
+                    Rc::clone(&c.chain),
+                );
+                return exec_chain_entry(
+                    interp,
+                    &key,
+                    &method_rc,
+                    0,
+                    &chain,
+                    &args[2..],
+                    typed,
+                    &args[0],
+                    true,
+                );
+            }
+        }
+    }
     let key = match resolve_object_key(interp, typed) {
         Some(k) => k,
         None => return Err(Error::invalid_command(typed)),
@@ -1081,7 +1274,7 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
         ));
     }
     let method = args[1].as_str();
-    invoke_method(interp, &key, method, &args[2..], typed, false)
+    invoke_method(interp, &key, method, &args[1], &args[2..], typed, &args[0], false)
 }
 
 // ── my / self / next ───────────────────────────────────────────────────
@@ -1089,6 +1282,38 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
 extern "Rust" fn cmd_oo_my(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Borrowed throughout (see cmd_oo_object).
     let typed = args[0].as_str();
+    // Dispatcher cache, `my` slot: the typed word ("my"), the method word,
+    // the namespace and the stamp pin the resolution (`qualify` + the
+    // `my_commands` probe) and the chain.  The frame guard still runs per
+    // call — it depends on the live frame stack.
+    if args.len() >= 2 {
+        if let Some(i) = my_cache_hit(interp, &args[0], &args[1]) {
+            let (key, method_rc, chain, obj_ns) = {
+                let c = interp.oo.my_cache[i].as_ref().unwrap();
+                (
+                    Rc::clone(&c.key),
+                    Rc::clone(&c.method_rc),
+                    Rc::clone(&c.chain),
+                    c.obj_ns.clone(),
+                )
+            };
+            let obj_ns = obj_ns.unwrap_or_else(|| object_ns_of(interp, &key));
+            if !frame_in_object_ns(interp, &obj_ns) {
+                return Err(Error::invalid_command(typed));
+            }
+            return exec_chain_entry(
+                interp,
+                &key,
+                &method_rc,
+                0,
+                &chain,
+                &args[2..],
+                typed,
+                &args[0],
+                true,
+            );
+        }
+    }
     let cmd_key = qualify(&interp.current_namespace, typed);
     let key: Rc<str> = match interp.oo.my_commands.get(&cmd_key) {
         Some(k) => Rc::from(k.as_str()),
@@ -1102,7 +1327,7 @@ extern "Rust" fn cmd_oo_my(interp: &mut Interp, args: &[Value]) -> Result<Value>
         return Err(Error::wrong_args_with_usage("my", 2, args.len(), "method ?arg ...?"));
     }
     let method = args[1].as_str();
-    invoke_method(interp, &key, method, &args[2..], typed, true)
+    invoke_method(interp, &key, method, &args[1], &args[2..], typed, &args[0], true)
 }
 
 const SELF_SUBCMDS: &[&str] = &[
@@ -1233,7 +1458,17 @@ extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Valu
         .as_list()
         .and_then(|l| l.first().map(|v| v.as_str().to_string()))
         .unwrap_or_else(|| act.obj.to_string());
-    exec_chain_entry(interp, &act.obj, &act.method, next_index, &act.chain, &call_args, &typed)
+    exec_chain_entry(
+        interp,
+        &act.obj,
+        &act.method,
+        next_index,
+        &act.chain,
+        &call_args,
+        &typed,
+        &Value::from_str(&typed),
+        false,
+    )
 }
 
 // ── create / new / destroy builtins ────────────────────────────────────
@@ -1504,7 +1739,11 @@ fn ctor_chain(interp: &Interp, class_key: &str) -> Vec<ChainEntry> {
     for c in linearize(interp, class_key) {
         if let Some(cls) = interp.oo.classes.get(&c) {
             if let Some(def) = &cls.constructor {
-                out.push(ChainEntry { owner: Owner::Class(c.clone()), def: def.clone() });
+                out.push(ChainEntry {
+                    vars: Some(Rc::clone(&cls.variables)),
+                    owner: Owner::Class(c.clone()),
+                    def: def.clone(),
+                });
             }
         }
     }
@@ -1516,7 +1755,11 @@ fn dtor_chain(interp: &Interp, class_key: &str) -> Vec<ChainEntry> {
     for c in linearize(interp, class_key) {
         if let Some(cls) = interp.oo.classes.get(&c) {
             if let Some(def) = &cls.destructor {
-                out.push(ChainEntry { owner: Owner::Class(c.clone()), def: def.clone() });
+                out.push(ChainEntry {
+                    vars: Some(Rc::clone(&cls.variables)),
+                    owner: Owner::Class(c.clone()),
+                    def: def.clone(),
+                });
             }
         }
     }
@@ -2196,6 +2439,8 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
             &chain,
             &[Value::from_str(&src)],
             &target_typed,
+            &Value::from_str(&target_typed),
+            false,
         );
         if let Err(e) = r {
             detach_object(interp, &full, &new_ns, false);

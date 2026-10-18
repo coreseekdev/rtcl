@@ -272,12 +272,42 @@ impl Interp {
     /// keep [`Self::degrade_frame_local`]'s wholesale flush (their
     /// storage-kind change is frame-wide by nature, and they are cold).
     pub(crate) fn degrade_frame_link(&mut self, frame_idx: usize, name: &str, link: &crate::interp::UpvarLink) {
+        self.degrade_frame_link_at(frame_idx, name, None, link)
+    }
+
+    /// [`Self::degrade_frame_link`] with a precomputed slot index (the OO
+    /// dispatcher's prelink knows it from the compiled body's locals
+    /// table, and the frame it installs into is that same body's — the
+    /// scan is skipped; a stale/foreign index falls back).
+    pub(crate) fn degrade_frame_link_at(
+        &mut self,
+        frame_idx: usize,
+        name: &str,
+        slot: Option<u16>,
+        link: &crate::interp::UpvarLink,
+    ) {
         let base = super::util::strip_paren(name);
         let Some(f) = self.frames.get_mut(frame_idx) else { return };
         if f.slots.is_empty() {
             return;
         }
-        let Some(i) = f.slot_index_of(base) else { return };
+        let i = match slot {
+            Some(s) if (s as usize) < f.slots.len() => {
+                debug_assert_eq!(
+                    f.slot_table
+                        .as_ref()
+                        .and_then(|t| t.locals().get(s as usize))
+                        .map(|l| l.as_str()),
+                    Some(base),
+                    "prelink slot must name the same local"
+                );
+                s as usize
+            }
+            _ => match f.slot_index_of(base) {
+                Some(i) => i,
+                None => return,
+            },
+        };
         if !f.slots[i].is_unset() {
             let taken = std::mem::replace(&mut f.slots[i], Value::unset());
             f.locals.insert(base.to_string(), taken);

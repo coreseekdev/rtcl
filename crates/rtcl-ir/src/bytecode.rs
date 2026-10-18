@@ -506,6 +506,23 @@ impl ByteCode {
                         _ => None,
                     }
                 }
+                // ── dead pushes (a pushed-and-discarded literal) ────────
+                // `[Push*, Pop]`: the value is never observed (Tcl has no
+                // way to see a discarded result; the push itself has no
+                // side effect beyond the stack word, and the pop's drop is
+                // the inverse).  The empty/constant body shape of every
+                // `for`/`if`-arm emits it.
+                (OpCode::PushEmpty, OpCode::Pop)
+                | (OpCode::PushTrue, OpCode::Pop)
+                | (OpCode::PushFalse, OpCode::Pop)
+                | (OpCode::PushInt(_), OpCode::Pop)
+                | (OpCode::PushFloat(_), OpCode::Pop)
+                | (OpCode::PushConst(_), OpCode::Pop)
+                | (OpCode::PushConstWide(_), OpCode::Pop)
+                    if !targets[i + 1] =>
+                {
+                    Some((OpCode::Nop, 2))
+                }
                 // ── meta-op pairs (site/region bookkeeping) ──────────────
                 (OpCode::BeginCmd(site), OpCode::SubMark) if !targets[i + 1] => {
                     Some((OpCode::BeginCmdSubMark(*site), 2))
@@ -595,6 +612,28 @@ impl ByteCode {
                 // `continue` landing on the same (consumed) instruction
                 // arrives with the same state either way — no target guard
                 // is needed here, unlike the value-window fusions.
+                // The whole `for` next-script tail in one op (the common
+                // `incr` shape; `k` must fit i32).
+                (OpCode::SwapToNextMark, OpCode::BeginCmdIncrLocalPop(site, x, k))
+                    if tail_free(3) =>
+                {
+                    match &self.ops[i + 2] {
+                        OpCode::Jump(t) => i32::try_from(*k)
+                            .ok()
+                            .map(|k32| (OpCode::ForNextIncrLocal(*site, *x, k32, *t), 3)),
+                        _ => None,
+                    }
+                }
+                (OpCode::SwapToNextMark, OpCode::BeginCmdIncrVarPop(site, x, k))
+                    if tail_free(3) =>
+                {
+                    match &self.ops[i + 2] {
+                        OpCode::Jump(t) => i32::try_from(*k)
+                            .ok()
+                            .map(|k32| (OpCode::ForNextIncrVar(*site, *x, k32, *t), 3)),
+                        _ => None,
+                    }
+                }
                 (OpCode::Jump(t), OpCode::NextMark) if *t as usize == i + 1 => {
                     retargets.push(((i + 1) as u32, i as u32));
                     Some((OpCode::SwapToNextMark, 2))
@@ -661,7 +700,13 @@ impl ByteCode {
                     | OpCode::CmpVarVarJumpTrue(_, _, _, t)
                     | OpCode::CmpVarVarJumpFalse(_, _, _, t)
                     | OpCode::CmpVarImmJumpTrue(_, _, _, t)
-                    | OpCode::CmpVarImmJumpFalse(_, _, _, t) => {
+                    | OpCode::CmpVarImmJumpFalse(_, _, _, t)
+                    // Same obligation as above: every target-carrying op
+                    // must ride the retarget pass (Round T's lesson —
+                    // unreachable under today's compiler shapes, closed
+                    // by invariant rather than by reachability).
+                    | OpCode::ForNextIncrLocal(_, _, _, t)
+                    | OpCode::ForNextIncrVar(_, _, _, t) => {
                         for &(from, to) in &retargets {
                             if *t == from {
                                 *t = to;
@@ -737,6 +782,8 @@ impl ByteCode {
                     | OpCode::SubEndStoreVarPop(..)
                     | OpCode::SubEndReturn
                     | OpCode::SwapToNextMark
+                    | OpCode::ForNextIncrLocal(..)
+                    | OpCode::ForNextIncrVar(..)
                     | OpCode::NextMarkBeginCmd(..)
                     | OpCode::BeginCmdIncrLocalPop(..)
                     | OpCode::BeginCmdIncrVarPop(..)
@@ -755,13 +802,15 @@ impl ByteCode {
         })
     }
 
-    /// Expand every fused superinstruction back to its canonical window —
-    /// the exact op sequence this unit would have had with fusion disabled
-    /// (`fuse_pairs` is a pure rewrite, so this is its inverse; jump
-    /// targets are remapped through the expansion shift).  Consumers whose
-    /// accepted-op set must not meet the fused families (the JIT's
-    /// analysis boundary, `rtcl-vm`) call this once at their compile
-    /// entry — see `docs/JIT-OPCODE-DELTA.md`.
+    /// Expand every fused superinstruction back to its canonical window:
+    /// semantics-equivalent canonical ops with jump targets remapped
+    /// through the expansion shift.  NOT a shape inverse — expanding and
+    /// re-running `peephole()` need not rebuild the same fused ops (e.g.
+    /// a `ForNextIncr*` window whose retired trampoline jump expands to a
+    /// `Nop` placeholder re-fuses into a different, equivalent form).
+    /// Consumers whose accepted-op set must not meet the fused families
+    /// (the JIT's analysis boundary, `rtcl-vm`) call this once at their
+    /// compile entry — see `docs/JIT-OPCODE-DELTA.md`.
     pub fn unfused(&self) -> ByteCode {
         /// Expand one fused op into `out`; `false` = not fused (the
         /// caller copies it verbatim).
@@ -864,6 +913,22 @@ impl ByteCode {
                 OpCode::SwapToNextMark => {
                     out.push(OpCode::Nop);
                     out.push(OpCode::NextMark);
+                }
+                OpCode::ForNextIncrLocal(site, x, k, t) => {
+                    out.push(OpCode::Nop); // retired body-end trampoline Jump
+                    out.push(OpCode::NextMark);
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::IncrLocal(*x, *k as i64));
+                    out.push(OpCode::Pop);
+                    out.push(OpCode::Jump(*t));
+                }
+                OpCode::ForNextIncrVar(site, x, k, t) => {
+                    out.push(OpCode::Nop);
+                    out.push(OpCode::NextMark);
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::IncrVar(*x, *k as i64));
+                    out.push(OpCode::Pop);
+                    out.push(OpCode::Jump(*t));
                 }
                 OpCode::NextMarkBeginCmd(site) => {
                     out.push(OpCode::NextMark);
@@ -1046,6 +1111,9 @@ impl ByteCode {
                 }
                 OpCode::ForeachNext { body, .. } => mark(*body),
                 OpCode::ForeachNextClose(_, body) => mark(*body),
+                OpCode::ForNextIncrLocal(_, _, _, t) | OpCode::ForNextIncrVar(_, _, _, t) => {
+                    mark(*t)
+                }
                 _ => {}
             }
         }
@@ -1304,6 +1372,9 @@ impl ByteCode {
                 OpCode::ForeachNextClose(_, body) => {
                     *body = forward[*body as usize];
                 }
+                OpCode::ForNextIncrLocal(_, _, _, t) | OpCode::ForNextIncrVar(_, _, _, t) => {
+                    *t = forward[*t as usize];
+                }
                 _ => {}
             }
         }
@@ -1478,6 +1549,34 @@ mod tests {
         assert_eq!(again.ops(), code.ops());
     }
 
+    /// The for-tail window REALLY fires from the canonical pre-fusion
+    /// sequence (trampoline jump → next-region mark → begin/incr/pop →
+    /// backedge): `[Jump(i+1), NextMark, BeginCmd, IncrLocalPop, Jump]`
+    /// collapses through both passes to the single fused op.  Guards
+    /// against the window silently dying to a future peephole change —
+    /// unlike the compiler-side OR-pattern asserts, this one is exact.
+    /// The expansion is canonical (no fused ops); note it does NOT
+    /// round-trip to the same fused op — the retired trampoline expands
+    /// to a `Nop`, so re-fusing yields a different, equivalent form (see
+    /// `unfused`'s doc).
+    #[test]
+    fn fuses_for_tail_window() {
+        let mut code = bc(
+            &[
+                OpCode::Jump(1),
+                OpCode::NextMark,
+                OpCode::BeginCmd(1),
+                OpCode::IncrLocalPop(0, 1),
+                OpCode::Jump(0),
+            ],
+            true,
+        );
+        code.peephole();
+        assert_eq!(code.ops(), &[OpCode::ForNextIncrLocal(1, 0, 1, 0)]);
+        let back = code.unfused();
+        assert!(!back.has_fused_ops());
+    }
+
     /// Every fused/superinstruction family expands — `unfused()` leaves no
     /// op outside the pre-fusion set (the JIT/`rtcl-vm` boundary contract).
     #[test]
@@ -1508,6 +1607,8 @@ mod tests {
                 OpCode::SubEndStoreVarPop(1),
                 OpCode::SubEndReturn,
                 OpCode::SwapToNextMark,
+                OpCode::ForNextIncrLocal(1, 2, 1, 3),
+                OpCode::ForNextIncrVar(1, 2, 1, 3),
                 OpCode::NextMarkBeginCmd(1),
                 OpCode::BeginCmdIncrLocalPop(1, 2, 1),
                 OpCode::BeginCmdIncrVarPop(1, 2, 1),

@@ -1425,8 +1425,8 @@ fn op_cmp_vv_jump(
 ) -> Result<()> {
     let va = var_read(interp, code, a)?;
     let vb = var_read(interp, code, b)?;
-    let v = cmp_values(&va, &vb, cc);
-    jump_if_value(interp, st, &v, t, want, st.pc)?;
+    let cond = crate::types::expr_ops::cmp_bool(&va, &vb, cc);
+    jump_if_bool(interp, st, cond, t, want, st.pc)?;
     Ok(())
 }
 
@@ -1445,8 +1445,8 @@ fn op_cmp_vi_jump(
     want: bool,
 ) -> Result<()> {
     let va = var_read(interp, code, a)?;
-    let v = cmp_values(&va, &Value::from_int(k), cc);
-    jump_if_value(interp, st, &v, t, want, st.pc)?;
+    let cond = crate::types::expr_ops::cmp_bool(&va, &Value::from_int(k), cc);
+    jump_if_bool(interp, st, cond, t, want, st.pc)?;
     Ok(())
 }
 
@@ -1529,12 +1529,14 @@ fn op_cmp_ss_jump(
 ) -> Result<()> {
     let va = slot_read_or_name(interp, code, a as usize)?;
     let vb = slot_read_or_name(interp, code, b as usize)?;
-    let v = cmp_values(&va, &vb, cc);
+    // The comparison's truth directly — no boolean `Value` round-trip
+    // (see `cmp_bool`).
+    let cond = crate::types::expr_ops::cmp_bool(&va, &vb, cc);
     // The fused op compacted the pair into one slot: `st.pc` already
     // points at the op after the pair, so the not-taken fall-through is
     // simply "leave `st.pc` alone" (the charge parity below still uses
     // `st.pc + 1`, the pair's original jump-op index).
-    jump_if_value(interp, st, &v, t, want, st.pc)?;
+    jump_if_bool(interp, st, cond, t, want, st.pc)?;
     Ok(())
 }
 
@@ -1553,8 +1555,8 @@ fn op_cmp_si_jump(
     want: bool,
 ) -> Result<()> {
     let va = slot_read_or_name(interp, code, a as usize)?;
-    let v = cmp_values(&va, &Value::from_int(k), cc);
-    jump_if_value(interp, st, &v, t, want, st.pc)?;
+    let cond = crate::types::expr_ops::cmp_bool(&va, &Value::from_int(k), cc);
+    jump_if_bool(interp, st, cond, t, want, st.pc)?;
     Ok(())
 }
 
@@ -1619,7 +1621,30 @@ fn jump_if_value(
     want: bool,
     jump_pc: usize,
 ) -> Result<bool> {
-    if crate::types::expr_funcs::strict_bool(v)? == want {
+    jump_if_bool(
+        interp,
+        st,
+        crate::types::expr_funcs::strict_bool(v)?,
+        t,
+        want,
+        jump_pc,
+    )
+}
+
+/// [`jump_if_value`] for a caller that already holds the truth value (the
+/// fused comparison branches compute it directly —
+/// [`crate::types::expr_ops::cmp_bool`] — instead of materializing a
+/// boolean `Value` and re-coercing it).
+#[inline]
+fn jump_if_bool(
+    interp: &mut Interp,
+    st: &mut VmState,
+    cond: bool,
+    t: u32,
+    want: bool,
+    jump_pc: usize,
+) -> Result<bool> {
+    if cond == want {
         if (t as i64) < (jump_pc + 1) as i64 {
             interp.charge_step()?;
         }

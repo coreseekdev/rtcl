@@ -1512,3 +1512,18 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round K — 融合分支直取布尔（2026-10-18，继续）
+
+`expr_ops::cmp_bool(left, right, cc)`：比较的**真值**直返（`op_rel/op_eq/
+op_ne` 改为其薄包装，语义单一来源）；融合分支 op（`CmpSlot*/CmpVar*Jump*`）
+经新 `jump_if_bool` 直接消费，去掉每条件一次的
+`Value::from_bool`（缓存单例句柄）+ `strict_bool`（重强制）往返回。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| J 后 | 0.99x | 0.99x | 0.69x | 0.52x | 0.72x | 0.84x |
+| K（本提交） | **0.97x** | **0.96x** | 0.69x | 0.52x | 0.72x | **0.76x** |
+
+（起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
+build 1.29。）
+

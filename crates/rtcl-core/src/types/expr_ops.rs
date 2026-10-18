@@ -306,72 +306,93 @@ pub(crate) fn int_bitop(left: &Value, right: &Value, op: char) -> Result<Value> 
     }))
 }
 
+/// [`op_rel`]/[`op_eq`]/[`op_ne`]'s truth value without the `Value`
+/// wrapping: the fused comparison branches consume the bool directly,
+/// skipping `from_bool`'s cached-singleton handle and the `strict_bool`
+/// re-coercion of what is already a boolean.  `cc` is the
+/// superinstruction encoding (0=<, 1=>, 2=<=, 3=>=, 4===, 5=!=); the
+/// semantics are exactly the `Value` forms' — which are now defined
+/// through this one source.
+pub(crate) fn cmp_bool(left: &Value, right: &Value, cc: u8) -> bool {
+    use core::cmp::Ordering;
+    if left.is_imm() && right.is_imm() {
+        let (a, b) = (left.imm(), right.imm());
+        return match cc {
+            0 => a < b,
+            1 => a > b,
+            2 => a <= b,
+            3 => a >= b,
+            4 => a == b,
+            _ => a != b,
+        };
+    }
+    match cc {
+        // Relational: NaN → false; numeric first, string fallback.
+        0..=3 => {
+            if expr_funcs::nan_pair(left, right) {
+                return false;
+            }
+            match expr_funcs::numeric_cmp(left, right) {
+                Some(ord) => match cc {
+                    0 => ord == Ordering::Less,
+                    1 => ord == Ordering::Greater,
+                    2 => ord != Ordering::Greater,
+                    _ => ord != Ordering::Less,
+                },
+                None => match cc {
+                    0 => left.as_str() < right.as_str(),
+                    1 => left.as_str() > right.as_str(),
+                    2 => left.as_str() <= right.as_str(),
+                    _ => left.as_str() >= right.as_str(),
+                },
+            }
+        }
+        // `==`: NaN unequal to all; numeric else string equality.
+        4 => {
+            if expr_funcs::nan_pair(left, right) {
+                return false;
+            }
+            match expr_funcs::numeric_cmp(left, right) {
+                Some(ord) => ord == Ordering::Equal,
+                None => left.as_str() == right.as_str(),
+            }
+        }
+        // `!=`: negation of the above, NaN unequal to all.
+        _ => {
+            if expr_funcs::nan_pair(left, right) {
+                return true;
+            }
+            match expr_funcs::numeric_cmp(left, right) {
+                Some(ord) => ord != Ordering::Equal,
+                None => left.as_str() != right.as_str(),
+            }
+        }
+    }
+}
+
 /// `==` — exact numeric comparison when both operands are numeric
 /// (int pairs compare as i64, no EPSILON tolerance); string comparison
 /// otherwise.  NaN compares unequal to everything (expr-22.9).
 pub(crate) fn op_eq(left: &Value, right: &Value) -> Value {
-    if left.is_imm() && right.is_imm() {
-        return Value::from_bool(left.imm() == right.imm());
-    }
-    if expr_funcs::nan_pair(left, right) {
-        return Value::from_bool(false);
-    }
-    match expr_funcs::numeric_cmp(left, right) {
-        Some(ord) => Value::from_bool(ord == core::cmp::Ordering::Equal),
-        None => Value::from_bool(left.as_str() == right.as_str()),
-    }
+    Value::from_bool(cmp_bool(left, right, 4))
 }
 
 /// `!=` — negation of [`op_eq`]'s comparison, with NaN unequal to all.
 pub(crate) fn op_ne(left: &Value, right: &Value) -> Value {
-    if left.is_imm() && right.is_imm() {
-        return Value::from_bool(left.imm() != right.imm());
-    }
-    if expr_funcs::nan_pair(left, right) {
-        return Value::from_bool(true);
-    }
-    match expr_funcs::numeric_cmp(left, right) {
-        Some(ord) => Value::from_bool(ord != core::cmp::Ordering::Equal),
-        None => Value::from_bool(left.as_str() != right.as_str()),
-    }
+    Value::from_bool(cmp_bool(left, right, 5))
 }
 
 /// `<`, `>`, `<=`, `>=` — numeric when both operands are numeric,
 /// string comparison otherwise; every comparison is false on NaN.
 pub(crate) fn op_rel(left: &Value, right: &Value, op: &str) -> Value {
-    use core::cmp::Ordering;
-    // Immediate×immediate: untag and compare — no NaN possible, no rep
-    // parsing.
-    if left.is_imm() && right.is_imm() {
-        let (a, b) = (left.imm(), right.imm());
-        return Value::from_bool(match op {
-            "<" => a < b,
-            ">" => a > b,
-            "<=" => a <= b,
-            ">=" => a >= b,
-            _ => false,
-        });
-    }
-    // NaN: every relational comparison is false.
-    if expr_funcs::nan_pair(left, right) {
-        return Value::from_bool(false);
-    }
-    match expr_funcs::numeric_cmp(left, right) {
-        Some(ord) => Value::from_bool(match op {
-            "<" => ord == Ordering::Less,
-            ">" => ord == Ordering::Greater,
-            "<=" => ord != Ordering::Greater,
-            ">=" => ord != Ordering::Less,
-            _ => false,
-        }),
-        None => Value::from_bool(match op {
-            "<" => left.as_str() < right.as_str(),
-            ">" => left.as_str() > right.as_str(),
-            "<=" => left.as_str() <= right.as_str(),
-            ">=" => left.as_str() >= right.as_str(),
-            _ => false,
-        }),
-    }
+    let cc = match op {
+        "<" => 0,
+        ">" => 1,
+        "<=" => 2,
+        ">=" => 3,
+        _ => 0,
+    };
+    Value::from_bool(cmp_bool(left, right, cc))
 }
 
 /// `eq` / `ne` — pure string comparison.

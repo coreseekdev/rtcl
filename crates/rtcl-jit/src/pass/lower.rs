@@ -29,6 +29,21 @@ struct Ctx<'a> {
 pub fn run(l2: &L2, _code: &ByteCode) -> Result<(L3, u32), Unsupported> {
     FOREACH_COUNTERS.with(|m| m.borrow_mut().clear());
     let n = l2.ops.len();
+    // 空单元（`proc p {}` 的体）：无 CFG 可结构化——直接出最小模块
+    // （置空结果 + OK）。可达集种子会摸 edges[0]，空表越界。
+    if n == 0 {
+        let root = L3::Seq(vec![
+            L3::Instr(Instr::EpochCheck { at_entry: true }),
+            L3::Instr(Instr::Const {
+                dst: Reg(0),
+                bits: crate::abi::EMPTY_HANDLE,
+                what: ConstWhat::Handle,
+            }),
+            L3::Instr(Instr::SetResult { src: Reg(0) }),
+            L3::Instr(Instr::ReturnCode { code: crate::abi::code::OK }),
+        ]);
+        return Ok((root, 0));
+    }
     let idom = post_dominate(l2, n as u32);
     let mut ctx = Ctx {
         l2,

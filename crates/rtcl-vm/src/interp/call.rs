@@ -420,7 +420,14 @@ impl Interp {
                         && code.epoch == self.tier1_epoch
                         && super::vm_exec::bytecode_applicable(self) =>
                 {
-                    super::vm_exec::exec_bytecode(self, code)
+                    // M2 seam: the process-level JIT hook (if installed)
+                    // gets first shot at this body; None keeps the
+                    // bytecode executor.  All downstream decoding (ret /
+                    // (procedure …) frames / break conversion) is shared.
+                    match super::vm_exec::proc_body_executor(self, code) {
+                        Some(r) => r,
+                        None => super::vm_exec::exec_bytecode(self, code),
+                    }
                 }
                 // The tree-walked body IS the proc's unit when a compiled
                 // form exists but was bypassed (stale Tier1 epoch, exec

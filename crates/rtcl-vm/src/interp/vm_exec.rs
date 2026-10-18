@@ -329,6 +329,38 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
     }
 }
 
+/// Process-level JIT hook for proc bodies (M2 seam).
+///
+/// [`Interp::call_proc`]'s Site A consults this after its own gates
+/// (`!fallback`, epoch match, `bytecode_applicable`) pass: `Some(r)`
+/// replaces the `exec_bytecode` result (ret decoding, `(procedure …)`
+/// frames and break→error conversion all stay in call_proc); `None`
+/// keeps the bytecode executor.  A fn pointer — no closure state, the
+/// engine registers once at process start (`set_proc_body_executor`).
+pub type ProcBodyExecutor =
+    fn(&mut Interp, &Rc<ByteCode>) -> Option<crate::error::Result<Value>>;
+
+static PROC_BODY_EXECUTOR: std::sync::OnceLock<Option<ProcBodyExecutor>> =
+    std::sync::OnceLock::new();
+
+/// Register the proc-body JIT hook.  First call wins (`OnceLock` — the
+/// engine installs at process start; re-registration is a no-op and
+/// `None` cannot unregister by design).  With no hook installed the
+/// interpreter behaves exactly as before (zero-change default).
+pub fn set_proc_body_executor(executor: Option<ProcBodyExecutor>) {
+    let _ = PROC_BODY_EXECUTOR.set(executor);
+}
+
+/// Site A hook probe: returns the JIT executor's result when one is
+/// installed and it accepts this body, `None` to run `exec_bytecode`.
+pub(crate) fn proc_body_executor(
+    interp: &mut Interp,
+    code: &Rc<ByteCode>,
+) -> Option<crate::error::Result<Value>> {
+    let f = (*PROC_BODY_EXECUTOR.get().unwrap_or(&None))?;
+    f(interp, code)
+}
+
 /// Execute a proc body's compiled bytecode on `interp`.
 ///
 /// Callers gate on [`bytecode_applicable`] and `!code.fallback`; errors

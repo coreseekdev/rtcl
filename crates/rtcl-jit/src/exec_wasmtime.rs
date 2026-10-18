@@ -40,7 +40,8 @@ pub fn execute(
     // M3：epoch global 以解释器当前代初始化（与 exec.rs 同一语义——
     // 入口-only，运行中不刷新；回边比对为 M4 模块缓存预留）。
     let epoch0 = interp.tier1_epoch() as i64;
-    let host = Host::new(interp, arena, bc, module);
+    let mut interp_cell = interp;
+    let host = Host::new(&mut interp_cell as *mut rtcl_core::Interp, arena, bc, module);
     let watermark = host.arena_len();
 
     let engine = Engine::default();
@@ -228,5 +229,7 @@ pub fn execute(
     let rc = run.call(&mut store, ()).expect("wasmtime: run");
     store.data_mut().arena_truncate(watermark);
 
-    crate::exec::finish(store.into_data(), rc, file)
+    let host = store.into_data();
+    let run = crate::exec::finish(host, rc, file);
+    (interp_cell, run)
 }

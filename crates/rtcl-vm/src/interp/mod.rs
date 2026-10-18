@@ -25,7 +25,7 @@ mod varmap;
 pub(crate) use util::{split_array_ref, glob_match};
 pub(crate) use varmap::{VarMap, VarSet};
 
-pub use vm_exec::set_bytecode_disabled;
+pub use vm_exec::{set_bytecode_disabled, set_proc_body_executor, ProcBodyExecutor};
 
 use crate::command::{CommandFunc, CommandCategory, CommandMeta};
 use crate::value::Value;

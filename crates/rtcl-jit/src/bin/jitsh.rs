@@ -9,6 +9,8 @@ use rtcl_core::Interp;
 use rtcl_jit::exec::{self, Outcome};
 
 fn main() {
+    // M2 seam：注册 proc-body JIT 钩子（jitsh 是 JIT 引擎执行体）。
+    rtcl_jit::proc_exec::install();
     let mut args = std::env::args().skip(1);
     let file = match (args.next().as_deref(), args.next()) {
         (Some("-f"), Some(f)) => f,

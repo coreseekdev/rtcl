@@ -20,6 +20,9 @@
 //! （新进程不变量：首次命令调用之前不可能存在 trace/upvar/链接——
 //! 首次 `rtcl.call` 时宿主清零 `caching` global，此后全部走宿主）。
 
+// 本文件 Host 持 *mut Interp（M2 seam 的所有权交换）；unsafe 收敛于 irp()。
+#![allow(unsafe_code)]
+
 use crate::abi::{self, code, BinOp};
 use crate::emit;
 use crate::ir::FailInfo;
@@ -42,21 +45,23 @@ pub enum Outcome {
 /// 宿主侧挂起错误：`from_eval` = 来自 `rtcl.call` 的 eval（解释器已
 /// 累积 errorInfo——case a）；否则快车道宿主原语错误（case b）。
 pub(crate) struct Pending {
-    err: Error,
+    pub(crate) err: Error,
     from_eval: bool,
 }
 
 pub(crate) struct Host {
-    pub(crate) interp: Interp,
+    /// 单线程作用域指针：Store 活着期间调用方的 `&mut Interp` 借用
+    /// 有效（钩子同步执行，返回后 Host 即弃）。
+    pub(crate) interp: *mut Interp,
     pub(crate) arena: Vec<Value>,
     pub(crate) consts: Vec<String>,
     fails: Vec<FailInfo>,
     sites: Vec<rtcl_parser::SrcSpan>,
     lines: Vec<u32>,
     source: Rc<str>,
-    result: Option<Value>,
-    pending: Option<Pending>,
-    pending_exit: Option<i32>,
+    pub(crate) result: Option<Value>,
+    pub(crate) pending: Option<Pending>,
+    pub(crate) pending_exit: Option<i32>,
     /// case b 的驱动侧 errorInfo 累积器（机械复刻 err_harness_frame）。
     info: Option<String>,
     err_line: usize,
@@ -72,6 +77,17 @@ pub(crate) struct Host {
     /// 自首次任意宿主命令求值后置位——此后 var_traces/dead_flat 可能
     /// 非空（take_var_fast 的守卫集），LappendVar 等保守路径据此分支。
     pub(crate) commands_ran: bool,
+}
+
+impl Host {
+    /// 指针解引用单点（安全性论证见字段 doc：单线程同步作用域）。
+    #[allow(clippy::mut_from_ref)]
+    fn irp(&self) -> &mut Interp {
+        #[allow(unsafe_code)]
+        unsafe {
+            &mut *self.interp
+        }
+    }
 }
 
 /// 一个活动 foreach/lmap 的宿主态。
@@ -210,7 +226,7 @@ impl Host {
         // 哨兵取出作为基底（无累积器时 = 消息文本，两种情形同构）。
         {
             const SENT: &str = "\u{0}j";
-            let raw = self.interp.error_report(&e, SENT);
+            let raw = self.irp().error_report(&e, SENT);
             let tail = format!("\n    (file \"{}\" line ", SENT);
             let base = match raw.rfind(&tail) {
                 Some(i) => Some(raw[..i].to_string()),
@@ -245,7 +261,7 @@ impl Host {
     /// + 文件帧（err_line 取最后一次 append 的行）。
     pub(crate) fn build_case_a_report(&mut self, fail_id: Option<u32>, e: &Error, file: &str) -> String {
         const SENT: &str = "\u{0}j";
-        let raw = self.interp.error_report(e, SENT);
+        let raw = self.irp().error_report(e, SENT);
         let tail = format!("\n    (file \"{}\" line ", SENT);
         let base = match raw.rfind(&tail) {
             Some(i) => raw[..i].to_string(),
@@ -379,7 +395,7 @@ fn expr_quote(s: &str) -> String {
 }
 
 /// arena 预驻留：0=UNSET 1=哨兵保留 2=EMPTY 3..=常量池。
-fn arena_of(bc: &ByteCode) -> Vec<Value> {
+pub(crate) fn arena_of(bc: &ByteCode) -> Vec<Value> {
     let mut arena = vec![Value::unset(), Value::unset(), Value::empty()];
     for c in bc.constants() {
         arena.push(Value::from_str(c));
@@ -390,7 +406,7 @@ fn arena_of(bc: &ByteCode) -> Vec<Value> {
 impl Host {
     // ── 构造与引擎协作 ──────────────────────────────────────────────
 
-    pub fn new(interp: Interp, arena: Vec<Value>, bc: &ByteCode, module: &emit::Module) -> Host {
+    pub fn new(interp: *mut Interp, arena: Vec<Value>, bc: &ByteCode, module: &emit::Module) -> Host {
         Host {
             interp,
             arena,
@@ -434,7 +450,7 @@ impl Host {
     }
 
     pub fn interp_mut(&mut self) -> &mut Interp {
-        &mut self.interp
+        unsafe { &mut *self.interp }
     }
 
     pub fn set_pending(&mut self, err: Error, from_eval: bool) {
@@ -489,7 +505,7 @@ impl Host {
 
     pub fn get_var_raw(&mut self, name_h: i32) -> i64 {
         let name = self.const_name(name_h);
-        match self.interp.read_var(&name) {
+        match self.irp().read_var(&name) {
             Ok(v) => {
                 let t = self.tag_value(&v);
                 t
@@ -504,7 +520,7 @@ impl Host {
     pub fn set_var_raw(&mut self, name_h: i32, v: i64) -> i32 {
         let name = self.const_name(name_h);
         let val = self.value_of(v);
-        match self.interp.set_var(&name, val) {
+        match self.irp().set_var(&name, val) {
             Ok(_) => 0,
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: false });
@@ -515,7 +531,7 @@ impl Host {
 
     pub fn incr_var_raw(&mut self, name_h: i32, n: i64) -> i64 {
         let name = self.const_name(name_h);
-        match self.interp.incr_var(&name, abi::untag(n)) {
+        match self.irp().incr_var(&name, abi::untag(n)) {
             Ok(v) => self.tag_value(&v),
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: false });
@@ -531,7 +547,7 @@ impl Host {
         let text = self.site_text(site).to_string();
         let line = self.lines.get(site as usize).copied().unwrap_or(1).max(1) as usize;
         let script = format!("{}{}", "\n".repeat(line - 1), text);
-        match self.interp.eval(&script) {
+        match self.irp().eval(&script) {
             Ok(v) => self.tag_value(&v),
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: true });
@@ -618,7 +634,7 @@ impl Host {
                 None => match v.as_list_strict() {
                     Ok(items) => lists.push(items),
                     Err(e) => {
-                        let _ = self.interp.set_var("errorCode", Value::from_str(e.code));
+                        let _ = self.irp().set_var("errorCode", Value::from_str(e.code));
                         self.pending = Some(Pending {
                             err: Error::Msg(e.message),
                             from_eval: false,
@@ -665,10 +681,10 @@ impl Host {
                     .cloned()
                     .unwrap_or_else(|| empty.clone());
                 let name = self.consts.get(t.name_idx as usize).cloned().unwrap_or_default();
-                if let Err(e) = self.interp.set_var(&name, v) {
+                if let Err(e) = self.irp().set_var(&name, v) {
                     if is_real_error(&e) {
                         let _ = self
-                            .interp
+                            .irp()
                             .set_var("errorCode", Value::from_str("TCL WRITE VARNAME"));
                         if fi.framed {
                             let what = if fi.lmap { "lmap" } else { "foreach" };
@@ -724,13 +740,13 @@ impl Host {
     pub fn lappend_var_raw(&mut self, name_h: i32, v: i64) -> i64 {
         let name = self.const_name(name_h);
         let val = self.value_of(v);
-        if self.interp.var_exists(&name) {
-            match self.interp.get_var(&name) {
+        if self.irp().var_exists(&name) {
+            match self.irp().get_var(&name) {
                 Ok(cur) => match cur.as_list() {
                     Some(mut items) => {
                         items.push(val);
                         let nv = Value::from_list(&items);
-                        match self.interp.set_var(&name, nv.clone()) {
+                        match self.irp().set_var(&name, nv.clone()) {
                             Ok(_) => self.tag_value(&nv),
                             Err(e) => {
                                 self.pending = Some(Pending { err: e, from_eval: false });
@@ -748,7 +764,7 @@ impl Host {
                                 let mut items = items;
                                 items.push(val);
                                 let nv = Value::from_list(&items);
-                                match self.interp.set_var(&name, nv.clone()) {
+                                match self.irp().set_var(&name, nv.clone()) {
                                     Ok(_) => self.tag_value(&nv),
                                     Err(e) => {
                                         self.pending =
@@ -759,7 +775,7 @@ impl Host {
                             }
                             Err(e) => {
                                 let _ = self
-                                    .interp
+                                    .irp()
                                     .set_var("errorCode", Value::from_str(e.code));
                                 self.pending = Some(Pending {
                                     err: Error::Msg(e.message),
@@ -777,7 +793,7 @@ impl Host {
             }
         } else {
             let nv = Value::from_list(&[val]);
-            match self.interp.set_var(&name, nv.clone()) {
+            match self.irp().set_var(&name, nv.clone()) {
                 Ok(_) => self.tag_value(&nv),
                 Err(e) => {
                     self.pending = Some(Pending { err: e, from_eval: false });
@@ -793,7 +809,7 @@ impl Host {
         self.commands_ran = true;
         let val = self.value_of(v);
         let script = val.as_str().to_string();
-        match self.interp.eval(&script) {
+        match self.irp().eval(&script) {
             Ok(r) => self.tag_value(&r),
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: true });
@@ -805,7 +821,7 @@ impl Host {
     pub fn eval_expr_raw(&mut self, v: i64) -> i64 {
         let val = self.value_of(v);
         let expr = val.as_str().to_string();
-        match self.interp.eval_expr(&expr) {
+        match self.irp().eval_expr(&expr) {
             Ok(r) => self.tag_value(&r),
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: true });
@@ -862,7 +878,7 @@ impl Host {
             _ => return Err(Error::Msg("jit: bad binary_op".into())),
         };
         let _ = HARNESS_MAX;
-        self.interp.eval_expr(&expr)
+        self.irp().eval_expr(&expr)
     }
 
     /// strict_bool 复刻（expr_funcs::strict_bool 的公共 API 重实现：
@@ -1017,7 +1033,10 @@ fn execute(
     // STALE）为 M4 的模块缓存/proc-body 钩子预留：届时按调用入口
     // 拒绝陈旧模块即可，无需中断运行。
     let epoch0 = interp.tier1_epoch() as i64;
-    let host = Host::new(interp, arena_of(bc), bc, module);
+    // M2 seam：Host 持指针（单线程作用域借用）——Interp 本体留在本
+    // 栈帧，Store drop 后取回返回。
+    let mut interp_cell = interp;
+    let host = Host::new(&mut interp_cell as *mut Interp, arena_of(bc), bc, module);
     let watermark = host.arena_len();
 
     let engine = Engine::default();
@@ -1218,11 +1237,13 @@ fn execute(
 
     // arena 回收到水位线（§3 纪律）。
     store.data_mut().arena.truncate(watermark);
-    crate::exec::finish(store.into_data(), rc, file)
+    let host = store.into_data();
+    let run = crate::exec::finish(host, rc, file);
+    (interp_cell, run)
 }
 
 /// run() 返回后的共享终局：错误二分（case a/b）与报告构建。
-pub(crate) fn finish(mut host: Host, outcome_code: i32, file: &str) -> (Interp, JitRun) {
+pub(crate) fn finish(mut host: Host, outcome_code: i32, file: &str) -> JitRun {
     let pending_exit = host.pending_exit.take();
     let (driver_report, eval_error) = match outcome_code {
         code::ERROR => {
@@ -1267,15 +1288,10 @@ pub(crate) fn finish(mut host: Host, outcome_code: i32, file: &str) -> (Interp, 
         }
         _ => (None, None),
     };
-    let result = host.result.take();
-    let interp = host.interp;
-    (
-        interp,
-        JitRun {
-            outcome: Outcome::Completed { code: outcome_code, exit_code: pending_exit },
-            driver_report,
-            eval_error,
-            result,
-        },
-    )
+    JitRun {
+        outcome: Outcome::Completed { code: outcome_code, exit_code: pending_exit },
+        driver_report,
+        eval_error,
+        result: host.result.take(),
+    }
 }

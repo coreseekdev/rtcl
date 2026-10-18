@@ -19,6 +19,9 @@
 //!   new WebAssembly.Module(bytes),
 //!   { rtcl: { ...globals, ...(direct_or_tramp) } });
 //! ```
+//! TODO(M2 wasm 侧): proc-body 钩子（rtcl_jit::proc_exec::install）暂不
+//! 在 wasm32 内嵌接线——进程级钩子 + *mut Interp 语义需按 wasm 单线程
+//! 会话模型复核后再接。
 //! 导出函数操作「当前 JIT 会话」（`rtcl_jit_session_begin/end` 括起，
 //! 单线程、作用域内有效）；`jit_compile`（feature `jit`）提供纯发射。
 

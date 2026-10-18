@@ -1512,6 +1512,28 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round AD — fib25 符号化画像（2026-10-18，4 号定位）
+
+方法：`CARGO_TARGET_DIR=/tmp/opencode/rtcl-prof` + `CARGO_PROFILE_RELEASE_DEBUG=1`
++ `-C force-frame-pointers=yes` 构建 → `setarch -R perf record -F 40000 -g`
+（30 次 fib25，38,698 样本）→ `perf script` 导出 + python 自聚合。
+
+**self(叶) top**：`exec_inner` 12.91% · **`call_proc` 10.73%** ·
+`[unknown]` 7.63% · `numeric_binop` 3.09% · `op_begin_cmd` 2.13% ·
+`dispatch_site` 2.13% · `__memcmp_evex_movbe` 1.96% · `get<u64>` 1.95% ·
+`drop` 1.81% + `drop<str>` 1.78% · `branch<Value,Error>` 1.51% ·
+`exec_bytecode` 1.37% · `resize<Value>` 1.30% · `op_cmp_si_jump` 1.29%。
+**inclusive**：`call_proc` 89.37%、`exec_bytecode`/`exec_inner` 91.24%。
+
+结论（4 号可动性）：`call_proc` self = 10.73%（fib 全调用都在其下），按
+243K 次调用折算 ≈ **224 instr/调用**的纯帧准备/收尾——与 TODO 的候选清单
+（level0/槽 resize/ns/池收发）量级吻合；砍掉其 30-40% ≈ fib 3-4%。
+下一步：**行级归因**。注意：`perf script -F +srcline` 会对每帧跑 addr2line，
+全量 4.4M 帧会超时（已踩）——改用小样本（`-F 2000`、3-5 次运行）或
+`perf report --stdio --sort=srcline` 定向看 `call_proc` 内部行。
+另注：`[unknown]` 7.63% 与 `drop`/`resize`/`get<u64>` 的 5-6% 是新线索
+（帧准备里的容器 clea/resize 与引用计数释放），画像下一轮一并归因。
+
 ## Round AC — 4/5 号研究与设计（2026-10-18，不动物码）
 
 - 4 号（call_proc 帧准备）：查台账无近期 fib 画像可直接引用（F1 为 10-04

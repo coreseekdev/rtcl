@@ -610,6 +610,435 @@ impl VmPool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared op bodies
+// ---------------------------------------------------------------------------
+//
+// The ops that make up a compiled loop's body are dispatched from two call
+// sites — `exec_inner`'s inline hot lane and the `exec_op` table — and both
+// run these bodies: one semantic source per op, `#[inline]` so the split is
+// a code-shape device, not an abstraction boundary.
+
+#[inline]
+fn op_push_const(st: &mut VmState, code: &ByteCode, idx: u16) {
+    let v = st
+        .consts
+        .as_deref()
+        .and_then(|vs| vs.get(idx as usize))
+        .cloned()
+        .unwrap_or_else(|| Value::from_str(code.get_const(idx).unwrap_or("")));
+    st.stack.push(v);
+}
+
+#[inline]
+fn op_push_const_wide(st: &mut VmState, code: &ByteCode, idx: u32) {
+    let v = st
+        .consts
+        .as_deref()
+        .and_then(|vs| vs.get(idx as usize))
+        .cloned()
+        .unwrap_or_else(|| Value::from_str(code.get_const_wide(idx).unwrap_or("")));
+    st.stack.push(v);
+}
+
+#[inline]
+fn op_store_var(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    idx: u16,
+    keep: bool,
+) -> Result<()> {
+    let name = code.get_const(idx).unwrap_or("");
+    let v = if keep { st.top_val() } else { st.pop_val() };
+    interp.set_var(name, v)?;
+    Ok(())
+}
+
+#[inline]
+fn op_incr_var(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    idx: u16,
+    amount: i64,
+) -> Result<()> {
+    let name = code.get_const(idx).unwrap_or("");
+    // Fast path for the success case only; any failure (missing var,
+    // non-integer value, overflow, traces, qualified/array names) falls
+    // back to the real `incr`, whose errors it owns.
+    match interp.incr_var_fast(name, amount) {
+        Some(v) => st.stack.push(v),
+        None => {
+            let args = [
+                Value::from_str("incr"),
+                Value::from_str(name),
+                Value::from_int(amount),
+            ];
+            let v = super::commands::misc::cmd_incr(interp, &args)?;
+            st.stack.push(v);
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn op_load_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: u16) -> Result<()> {
+    let slot = slot as usize;
+    let v = match interp.frame_slot_value(slot) {
+        Some(v) => v,
+        None => {
+            let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
+            interp.eval_var_ref(name)?
+        }
+    };
+    st.stack.push(v);
+    Ok(())
+}
+
+#[inline]
+fn op_store_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: u16) -> Result<()> {
+    let slot = slot as usize;
+    // `set` keeps its result: the value stays on the stack.
+    let v = st.top_val();
+    if !interp.frame_slot_write(slot, &v) {
+        let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
+        interp.set_var(name, v)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn op_incr_local(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    slot: u16,
+    amount: i64,
+) -> Result<()> {
+    let slot = slot as usize;
+    // Same fallback ladder as IncrVar: slot fast path, then the name fast
+    // path (degraded frames), then the real `incr`, which owns creation
+    // and the exact errors.
+    let name = || code.locals().get(slot).map(String::as_str).unwrap_or("");
+    match interp.frame_slot_incr(slot, amount) {
+        Some(v) => st.stack.push(v),
+        None => match interp.incr_var_fast(name(), amount) {
+            Some(v) => st.stack.push(v),
+            None => {
+                let args = [
+                    Value::from_str("incr"),
+                    Value::from_str(name()),
+                    Value::from_int(amount),
+                ];
+                let v = super::commands::misc::cmd_incr(interp, &args)?;
+                st.stack.push(v);
+            }
+        },
+    }
+    Ok(())
+}
+
+// The fused [LoadLocal, LoadLocal/PushInt, ARITH-or-CMP] superinstructions'
+// bodies (see the executor arm docs for the fallback contract).
+
+#[inline]
+fn op_add_slot_slot(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    b: u16,
+) -> Result<()> {
+    let va = slot_read_or_name(interp, code, a as usize)?;
+    let vb = slot_read_or_name(interp, code, b as usize)?;
+    let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
+    st.stack.push(v);
+    Ok(())
+}
+
+#[inline]
+fn op_add_slot_imm(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    k: i64,
+) -> Result<()> {
+    let va = slot_read_or_name(interp, code, a as usize)?;
+    let vb = Value::from_int(k);
+    let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
+    st.stack.push(v);
+    Ok(())
+}
+
+#[inline]
+fn op_cmp_slot_slot(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    b: u16,
+    cc: u8,
+) -> Result<()> {
+    let va = slot_read_or_name(interp, code, a as usize)?;
+    let vb = slot_read_or_name(interp, code, b as usize)?;
+    st.stack.push(cmp_values(&va, &vb, cc));
+    Ok(())
+}
+
+#[inline]
+fn op_cmp_slot_imm(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    k: i64,
+    cc: u8,
+) -> Result<()> {
+    let va = slot_read_or_name(interp, code, a as usize)?;
+    let vb = Value::from_int(k);
+    st.stack.push(cmp_values(&va, &vb, cc));
+    Ok(())
+}
+
+#[inline]
+fn op_jump(interp: &mut Interp, st: &mut VmState, t: u32) -> Result<()> {
+    // Every inline body ends with a plain Jump — close its region and
+    // restore the owning construct as the current command: the words/bodies
+    // inside may have opened commands of their own (inlined brackets), and
+    // the construct's remaining ops (a re-checked loop condition, the
+    // result push) must attribute to the construct, not to the last inner
+    // command.
+    if let Some(region) = st.bodies.pop() {
+        st.cur_site = region.site();
+    }
+    // A1 step budget: backward jump = loop back-edge — pure control flow
+    // (`while {1} {}`) dispatches zero commands, only the back-edge can
+    // charge it.
+    if i64::from(t) < st.pc as i64 {
+        interp.charge_step()?;
+    }
+    st.pc = t as usize;
+    Ok(())
+}
+
+#[inline]
+fn op_jump_if(interp: &mut Interp, st: &mut VmState, t: u32, want: bool) -> Result<()> {
+    let v = st.pop_val();
+    if crate::types::expr_funcs::strict_bool(&v)? == want {
+        if (t as i64) < st.pc as i64 {
+            interp.charge_step()?;
+        }
+        st.pc = t as usize;
+    } else {
+        // Not taken → entering an inline body of the current command's
+        // construct.
+        st.bodies.push(Region::Body(st.cur_site));
+    }
+    Ok(())
+}
+
+#[inline]
+fn op_loop_enter(st: &mut VmState, cont: u32, brk: u32) {
+    st.loops.push(LoopFrame {
+        cont,
+        brk,
+        bodies_len: st.bodies.len(),
+        stack_len: st.stack.len(),
+        owner: st.cur_site,
+    });
+}
+
+#[inline]
+fn op_foreach_start(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    info: u32,
+    next: u32,
+    end: u32,
+) -> Result<()> {
+    let info_ref = code.foreach_info(info).expect("foreach info index");
+    let ngroups = info_ref.groups.len();
+    let mut lists = Vec::with_capacity(ngroups);
+    // Pop the group data values (last group on top), strict-parse each
+    // exactly like cmd_foreach — same errors, same errorCode.  A value
+    // already carrying a list rep iterates by reference (zero-copy); other
+    // reps materialise an owned Vec through the strict parse.  A list-rep
+    // value never fails the strict parse, so the error surface is identical
+    // to the always-owned form.
+    for _ in 0..ngroups {
+        let v = st.pop_val();
+        if v.as_list_ref().is_some() {
+            lists.push(ForeachList::Rep(v));
+        } else {
+            lists.push(ForeachList::Owned(super::commands::list::strict_list(
+                interp, &v,
+            )?));
+        }
+    }
+    lists.reverse();
+    let max = info_ref
+        .groups
+        .iter()
+        .zip(&lists)
+        .map(|(g, l)| l.len().div_ceil(g.len().max(1)))
+        .max()
+        .unwrap_or(0);
+    let collected = info_ref.lmap.then(Vec::new);
+    let _framed = info_ref.framed;
+    st.foreaches.push(ForeachFrame {
+        lists,
+        idx: 0,
+        iters: max,
+        collected,
+        framed: info_ref.framed,
+        lmap: info_ref.lmap,
+    });
+    // The loop frame rides the ordinary machinery: compiled Break/Continue
+    // and error-form signals route through it.
+    st.loops.push(LoopFrame {
+        cont: next,
+        brk: end,
+        bodies_len: st.bodies.len(),
+        stack_len: st.stack.len(),
+        owner: st.cur_site,
+    });
+    if max == 0 {
+        st.pc = end as usize;
+    } else {
+        foreach_bind(interp, code, info_ref, st, 0)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn op_foreach_next(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    info: u32,
+    body: u32,
+) -> Result<()> {
+    let info_ref = code.foreach_info(info).expect("foreach info index");
+    let (idx, max) = {
+        let ff = st.foreaches.last().expect("foreach frame");
+        (ff.idx + 1, ff.iters)
+    };
+    if idx < max {
+        // A1 step budget: taken iteration edge = one step.
+        interp.charge_step()?;
+        st.foreaches.last_mut().unwrap().idx = idx;
+        foreach_bind(interp, code, info_ref, st, idx)?;
+        st.pc = body as usize;
+    }
+    // done → fall through to the closing ForeachEnd
+    Ok(())
+}
+
+#[inline]
+fn op_foreach_collect(st: &mut VmState) {
+    let v = st.pop_val();
+    if let Some(ff) = st.foreaches.last_mut() {
+        if let Some(c) = &mut ff.collected {
+            c.push(v);
+        }
+    }
+}
+
+#[inline]
+fn op_foreach_end(st: &mut VmState) {
+    st.loops.pop();
+    let ff = st.foreaches.pop();
+    let v = match ff.and_then(|f| f.collected) {
+        Some(c) => Value::from_list(&c),
+        None => Value::empty(),
+    };
+    st.stack.push(v);
+}
+
+#[inline]
+fn op_break(interp: &mut Interp, st: &mut VmState) -> Result<()> {
+    match st.loops.last() {
+        Some(l) => {
+            st.bodies.truncate(l.bodies_len);
+            st.stack.truncate(l.stack_len);
+            st.cur_site = l.owner;
+            if l.brk < st.pc as u32 {
+                interp.charge_step()?;
+            }
+            st.pc = l.brk as usize;
+            Ok(())
+        }
+        None => Err(Error::brk()),
+    }
+}
+
+#[inline]
+fn op_continue(interp: &mut Interp, st: &mut VmState) -> Result<()> {
+    match st.loops.last() {
+        Some(l) => {
+            st.bodies.truncate(l.bodies_len);
+            st.stack.truncate(l.stack_len);
+            st.cur_site = l.owner;
+            // A1 step budget: continue jumps back to the loop's condition —
+            // a backward transfer IS the iteration edge when the body ends
+            // in `continue` (no plain Jump runs).
+            if l.cont < st.pc as u32 {
+                interp.charge_step()?;
+            }
+            st.pc = l.cont as usize;
+            Ok(())
+        }
+        None => Err(Error::cont()),
+    }
+}
+
+#[inline]
+fn op_begin_cmd(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    site_idx: u32,
+) -> Result<()> {
+    if interp.call_depth > interp.max_call_depth {
+        return Err(Error::runtime(
+            "maximum recursion depth exceeded",
+            crate::error::ErrorCode::StackOverflow,
+        ));
+    }
+    let site = &code.sites[site_idx as usize];
+    interp.cur_cmd_text = site.text;
+    interp.cur_cmd_line = site.line_rel as usize;
+    interp.cur_cmd_word_srcs = Rc::clone(&site.word_srcs);
+    interp.line_offset = st.entry_offset + site.line_delta as usize;
+    st.cur_site = site_idx as usize;
+    Ok(())
+}
+
+#[inline]
+fn op_body_mark_framed(st: &mut VmState) {
+    let (framed, lmap) = st
+        .foreaches
+        .last()
+        .map(|ff| (ff.framed, ff.lmap))
+        .unwrap_or((false, false));
+    st.bodies.push(Region::BodyFramed(st.cur_site, lmap));
+    let _ = framed;
+}
+
+#[inline]
+fn op_sub_end(st: &mut VmState) {
+    // Close the bracket region and restore its owning command as current:
+    // the bracket's inner commands clobbered cur_site, and the owner's
+    // remaining words / its own dispatch must attribute to the owner (e.g.
+    // `nosuch [list a]` logs `"nosuch [list a]"`, not `"list a"`).
+    if let Some(region) = st.bodies.pop() {
+        st.cur_site = region.site();
+    }
+}
+
 /// Execute one instruction.  Errors carry the same shape the tree-walk
 /// would produce for the same operation; the caller classifies them into
 /// errorInfo frames.
@@ -619,24 +1048,8 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         // Literals come from the unit's pooled constants (one Rc bump);
         // a pool miss re-materialises from the string table, which is
         // exactly what the pool was built from — same bytes either way.
-        OpCode::PushConst(idx) => {
-            let v = st
-                .consts
-                .as_deref()
-                .and_then(|vs| vs.get(*idx as usize))
-                .cloned()
-                .unwrap_or_else(|| Value::from_str(code.get_const(*idx).unwrap_or("")));
-            st.stack.push(v);
-        }
-        OpCode::PushConstWide(idx) => {
-            let v = st
-                .consts
-                .as_deref()
-                .and_then(|vs| vs.get(*idx as usize))
-                .cloned()
-                .unwrap_or_else(|| Value::from_str(code.get_const_wide(*idx).unwrap_or("")));
-            st.stack.push(v);
-        }
+        OpCode::PushConst(idx) => op_push_const(st, code, *idx),
+        OpCode::PushConstWide(idx) => op_push_const_wide(st, code, *idx),
         OpCode::PushEmpty => st.stack.push(Value::empty()),
         OpCode::PushInt(n) => st.stack.push(Value::from_int(*n)),
         // float_value renders Tcl-exact (expr-52.x precision rules), not
@@ -665,59 +1078,18 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             st.stack.push(v);
         }
         OpCode::StoreVar(idx) | OpCode::StoreVarPop(idx) => {
-            let name = code.get_const(*idx).unwrap_or("");
             let keep = matches!(op, OpCode::StoreVar(_));
-            let v = if keep {
-                st.top_val()
-            } else {
-                st.pop_val()
-            };
-            interp.set_var(name, v)?;
+            op_store_var(interp, code, st, *idx, keep)?
         }
-        OpCode::IncrVar(idx, amount) => {
-            let name = code.get_const(*idx).unwrap_or("");
-            // Fast path for the success case only; any failure (missing
-            // var, non-integer value, overflow, traces, qualified/array
-            // names) falls back to the real `incr`, whose errors it owns.
-            match interp.incr_var_fast(name, *amount) {
-                Some(v) => st.stack.push(v),
-                None => {
-                    let args = [
-                        Value::from_str("incr"),
-                        Value::from_str(name),
-                        Value::from_int(*amount),
-                    ];
-                    let v = super::commands::misc::cmd_incr(interp, &args)?;
-                    st.stack.push(v);
-                }
-            }
-        }
+        OpCode::IncrVar(idx, amount) => op_incr_var(interp, code, st, *idx, *amount)?,
 
         // ── Slot locals (E2) ────────────────────────────────────────────
         // The slot ops only fire on slot-compiled frames; every fallback
         // goes through the name-keyed path, which consults the same table
         // (degraded, statics, unset cells, traces) — so the two storage
         // forms alias one variable set either way.
-        OpCode::LoadLocal(slot) => {
-            let slot = *slot as usize;
-            let v = match interp.frame_slot_value(slot) {
-                Some(v) => v,
-                None => {
-                    let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
-                    interp.eval_var_ref(name)?
-                }
-            };
-            st.stack.push(v);
-        }
-        OpCode::StoreLocal(slot) => {
-            let slot = *slot as usize;
-            // `set` keeps its result: the value stays on the stack.
-            let v = st.top_val();
-            if !interp.frame_slot_write(slot, &v) {
-                let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
-                interp.set_var(name, v)?;
-            }
-        }
+        OpCode::LoadLocal(slot) => op_load_local(interp, code, st, *slot)?,
+        OpCode::StoreLocal(slot) => op_store_local(interp, code, st, *slot)?,
         // ── Folded lappend ──────────────────────────────────────────────
         // `lappend <literal-var> <value>`: the fast path appends through
         // the variable's canonical slot storage (cmd_lappend's take/
@@ -777,28 +1149,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 st.stack.push(v);
             }
         }
-        OpCode::IncrLocal(slot, amount) => {
-            let slot = *slot as usize;
-            // Same fallback ladder as IncrVar: slot fast path, then the
-            // name fast path (degraded frames), then the real `incr`,
-            // which owns creation and the exact errors.
-            let name = || code.locals().get(slot).map(String::as_str).unwrap_or("");
-            match interp.frame_slot_incr(slot, *amount) {
-                Some(v) => st.stack.push(v),
-                None => match interp.incr_var_fast(name(), *amount) {
-                    Some(v) => st.stack.push(v),
-                    None => {
-                        let args = [
-                            Value::from_str("incr"),
-                            Value::from_str(name()),
-                            Value::from_int(*amount),
-                        ];
-                        let v = super::commands::misc::cmd_incr(interp, &args)?;
-                        st.stack.push(v);
-                    }
-                },
-            }
-        }
+        OpCode::IncrLocal(slot, amount) => op_incr_local(interp, code, st, *slot, *amount)?,
 
         // ── Expansion ───────────────────────────────────────────────────
         OpCode::ExpandMark => {
@@ -826,176 +1177,25 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         }
 
         // ── Control flow ────────────────────────────────────────────────
-        OpCode::Jump(t) => {
-            // Every inline body ends with a plain Jump — close its region
-            // and restore the owning construct as the current command: the
-            // words/bodies inside may have opened commands of their own
-            // (inlined brackets), and the construct's remaining ops (a
-            // re-checked loop condition, the result push) must attribute
-            // to the construct, not to the last inner command.
-            if let Some(region) = st.bodies.pop() {
-                st.cur_site = region.site();
-            }
-            // A1 step budget: backward jump = loop back-edge — pure
-            // control flow (`while {1} {}`) dispatches zero commands,
-            // only the back-edge can charge it.
-            if i64::from(*t) < st.pc as i64 {
-                interp.charge_step()?;
-            }
-            st.pc = *t as usize;
-        }
-        OpCode::JumpTrue(t) => {
-            let v = st.pop_val();
-            if crate::types::expr_funcs::strict_bool(&v)? {
-                if (*t as i64) < st.pc as i64 {
-                    interp.charge_step()?;
-                }
-                st.pc = *t as usize;
-            } else {
-                // Not taken → entering an inline body of the current
-                // command's construct.
-                st.bodies.push(Region::Body(st.cur_site));
-            }
-        }
-        OpCode::JumpFalse(t) => {
-            let v = st.pop_val();
-            if !crate::types::expr_funcs::strict_bool(&v)? {
-                if (*t as i64) < st.pc as i64 {
-                    interp.charge_step()?;
-                }
-                st.pc = *t as usize;
-            } else {
-                st.bodies.push(Region::Body(st.cur_site));
-            }
-        }
+        OpCode::Jump(t) => op_jump(interp, st, *t)?,
+        OpCode::JumpTrue(t) => op_jump_if(interp, st, *t, true)?,
+        OpCode::JumpFalse(t) => op_jump_if(interp, st, *t, false)?,
 
         // ── Loops ───────────────────────────────────────────────────────
-        OpCode::LoopEnter { cont, brk } => {
-            st.loops.push(LoopFrame {
-                cont: *cont,
-                brk: *brk,
-                bodies_len: st.bodies.len(),
-                stack_len: st.stack.len(),
-                owner: st.cur_site,
-            });
-        }
+        OpCode::LoopEnter { cont, brk } => op_loop_enter(st, *cont, *brk),
         OpCode::LoopExit => {
             st.loops.pop();
         }
 
         // ── Inline foreach/lmap (D) ────────────────────────────────────
         OpCode::ForeachStart { info, next, end } => {
-            let info_ref = code.foreach_info(*info).expect("foreach info index");
-            let ngroups = info_ref.groups.len();
-            let mut lists = Vec::with_capacity(ngroups);
-            // Pop the group data values (last group on top), strict-parse
-            // each exactly like cmd_foreach — same errors, same errorCode.
-            // A value already carrying a list rep iterates by reference
-            // (zero-copy); other reps materialise an owned Vec through the
-            // strict parse.  A list-rep value never fails the strict parse,
-            // so the error surface is identical to the always-owned form.
-            for _ in 0..ngroups {
-                let v = st.pop_val();
-                if v.as_list_ref().is_some() {
-                    lists.push(ForeachList::Rep(v));
-                } else {
-                    lists.push(ForeachList::Owned(
-                        super::commands::list::strict_list(interp, &v)?,
-                    ));
-                }
-            }
-            lists.reverse();
-            let max = info_ref
-                .groups
-                .iter()
-                .zip(&lists)
-                .map(|(g, l)| l.len().div_ceil(g.len().max(1)))
-                .max()
-                .unwrap_or(0);
-            let collected = info_ref.lmap.then(Vec::new);
-            let _framed = info_ref.framed;
-            st.foreaches.push(ForeachFrame {
-                lists,
-                idx: 0,
-                iters: max,
-                collected,
-                framed: info_ref.framed,
-                lmap: info_ref.lmap,
-            });
-            // The loop frame rides the ordinary machinery: compiled
-            // Break/Continue and error-form signals route through it.
-            st.loops.push(LoopFrame {
-                cont: *next,
-                brk: *end,
-                bodies_len: st.bodies.len(),
-                stack_len: st.stack.len(),
-                owner: st.cur_site,
-            });
-            if max == 0 {
-                st.pc = *end as usize;
-            } else {
-                foreach_bind(interp, code, info_ref, st, 0)?;
-            }
+            op_foreach_start(interp, code, st, *info, *next, *end)?
         }
-        OpCode::ForeachNext { info, body } => {
-            let info_ref = code.foreach_info(*info).expect("foreach info index");
-            let (idx, max) = {
-                let ff = st.foreaches.last().expect("foreach frame");
-                (ff.idx + 1, ff.iters)
-            };
-            if idx < max {
-                // A1 step budget: taken iteration edge = one step.
-                interp.charge_step()?;
-                st.foreaches.last_mut().unwrap().idx = idx;
-                foreach_bind(interp, code, info_ref, st, idx)?;
-                st.pc = *body as usize;
-            }
-            // done → fall through to the closing ForeachEnd
-        }
-        OpCode::ForeachCollect => {
-            let v = st.pop_val();
-            if let Some(ff) = st.foreaches.last_mut() {
-                if let Some(c) = &mut ff.collected {
-                    c.push(v);
-                }
-            }
-        }
-        OpCode::ForeachEnd => {
-            st.loops.pop();
-            let ff = st.foreaches.pop();
-            let v = match ff.and_then(|f| f.collected) {
-                Some(c) => Value::from_list(&c),
-                None => Value::empty(),
-            };
-            st.stack.push(v);
-        }
-        OpCode::Break => match st.loops.last() {
-            Some(l) => {
-                st.bodies.truncate(l.bodies_len);
-                st.stack.truncate(l.stack_len);
-                st.cur_site = l.owner;
-                if l.brk < st.pc as u32 {
-                    interp.charge_step()?;
-                }
-                st.pc = l.brk as usize;
-            }
-            None => return Err(Error::brk()),
-        },
-        OpCode::Continue => match st.loops.last() {
-            Some(l) => {
-                st.bodies.truncate(l.bodies_len);
-                st.stack.truncate(l.stack_len);
-                st.cur_site = l.owner;
-                // A1 step budget: continue jumps back to the loop's
-                // condition — a backward transfer IS the iteration edge
-                // when the body ends in `continue` (no plain Jump runs).
-                if l.cont < st.pc as u32 {
-                    interp.charge_step()?;
-                }
-                st.pc = l.cont as usize;
-            }
-            None => return Err(Error::cont()),
-        },
+        OpCode::ForeachNext { info, body } => op_foreach_next(interp, code, st, *info, *body)?,
+        OpCode::ForeachCollect => op_foreach_collect(st),
+        OpCode::ForeachEnd => op_foreach_end(st),
+        OpCode::Break => op_break(interp, st)?,
+        OpCode::Continue => op_continue(interp, st)?,
 
         // ── Return / exit ───────────────────────────────────────────────
         OpCode::Return => {
@@ -1011,32 +1211,11 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         }
 
         // ── Commands ────────────────────────────────────────────────────
-        OpCode::BeginCmd(site_idx) => {
-            if interp.call_depth > interp.max_call_depth {
-                return Err(Error::runtime(
-                    "maximum recursion depth exceeded",
-                    crate::error::ErrorCode::StackOverflow,
-                ));
-            }
-            let site = &code.sites[*site_idx as usize];
-            interp.cur_cmd_text = site.text;
-            interp.cur_cmd_line = site.line_rel as usize;
-            interp.cur_cmd_word_srcs = Rc::clone(&site.word_srcs);
-            interp.line_offset = st.entry_offset + site.line_delta as usize;
-            st.cur_site = *site_idx as usize;
-        }
+        OpCode::BeginCmd(site_idx) => op_begin_cmd(interp, code, st, *site_idx)?,
         OpCode::BodyMark => {
             st.bodies.push(Region::Body(st.cur_site));
         }
-        OpCode::BodyMarkFramed => {
-            let (framed, lmap) = st
-                .foreaches
-                .last()
-                .map(|ff| (ff.framed, ff.lmap))
-                .unwrap_or((false, false));
-            st.bodies.push(Region::BodyFramed(st.cur_site, lmap));
-            let _ = framed;
-        }
+        OpCode::BodyMarkFramed => op_body_mark_framed(st),
         OpCode::NextMark => {
             st.bodies.push(Region::Next(st.cur_site));
         }
@@ -1046,16 +1225,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         OpCode::ExprMark => {
             st.bodies.push(Region::Expr(st.cur_site));
         }
-        OpCode::SubEnd => {
-            // Close the bracket region and restore its owning command as
-            // current: the bracket's inner commands clobbered cur_site, and
-            // the owner's remaining words / its own dispatch must attribute
-            // to the owner (e.g. `nosuch [list a]` logs `"nosuch [list
-            // a]"`, not `"list a"`).
-            if let Some(region) = st.bodies.pop() {
-                st.cur_site = region.site();
-            }
-        }
+        OpCode::SubEnd => op_sub_end(st),
         OpCode::Call { argc, .. } => {
             let from = st.stack.len() - *argc as usize;
             st.collect_args_into_scratch(from);
@@ -1110,28 +1280,10 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         // globals fallback, canonical errors — all owned by the same
         // name path).  Comparisons run through op_rel/op_eq so string
         // operands and error shapes are identical to the unfused ops.
-        OpCode::AddSlotSlot(a, b) => {
-            let va = slot_read_or_name(interp, code, *a as usize)?;
-            let vb = slot_read_or_name(interp, code, *b as usize)?;
-            let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
-            st.stack.push(v);
-        }
-        OpCode::AddSlotImm(a, k) => {
-            let va = slot_read_or_name(interp, code, *a as usize)?;
-            let vb = Value::from_int(*k);
-            let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
-            st.stack.push(v);
-        }
-        OpCode::CmpSlotSlot(a, b, cc) => {
-            let va = slot_read_or_name(interp, code, *a as usize)?;
-            let vb = slot_read_or_name(interp, code, *b as usize)?;
-            st.stack.push(cmp_values(&va, &vb, *cc));
-        }
-        OpCode::CmpSlotImm(a, k, cc) => {
-            let va = slot_read_or_name(interp, code, *a as usize)?;
-            let vb = Value::from_int(*k);
-            st.stack.push(cmp_values(&va, &vb, *cc));
-        }
+        OpCode::AddSlotSlot(a, b) => op_add_slot_slot(interp, code, st, *a, *b)?,
+        OpCode::AddSlotImm(a, k) => op_add_slot_imm(interp, code, st, *a, *k)?,
+        OpCode::CmpSlotSlot(a, b, cc) => op_cmp_slot_slot(interp, code, st, *a, *b, *cc)?,
+        OpCode::CmpSlotImm(a, k, cc) => op_cmp_slot_imm(interp, code, st, *a, *k, *cc)?,
         OpCode::Sub => arith(st, '-')?,
         OpCode::Mul => arith(st, '*')?,
         OpCode::Div => arith(st, '/')?,
@@ -1443,6 +1595,7 @@ fn dispatch_dynamic(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// Read slot `slot` with LoadLocal's exact fallback chain: the cell when
 /// set, `eval_var_ref` on the table name otherwise (globals fallback,
 /// linked-slot resolution, canonical errors — all owned by the name path).
+#[inline]
 fn slot_read_or_name(interp: &mut Interp, code: &ByteCode, slot: usize) -> Result<Value> {
     if let Some(f) = interp.frames.last() {
         if !f.slot_aliased.get(slot).copied().unwrap_or(false) {
@@ -1465,6 +1618,7 @@ fn slot_read_or_name(interp: &mut Interp, code: &ByteCode, slot: usize) -> Resul
 /// relational operators (numeric-then-string, NaN rules included), plus
 /// eq/ne (numeric equality, then string equality — op_eq/op_ne's own
 /// contract).
+#[inline]
 fn cmp_values(a: &Value, b: &Value, cc: u8) -> Value {
     match cc {
         0 => crate::types::expr_ops::op_rel(a, b, "<"),
@@ -1476,12 +1630,14 @@ fn cmp_values(a: &Value, b: &Value, cc: u8) -> Value {
     }
 }
 
+#[inline]
 fn pop_pair(st: &mut VmState) -> (Value, Value) {
     let b = st.pop_val();
     let a = st.pop_val();
     (a, b)
 }
 
+#[inline]
 fn arith(st: &mut VmState, op: char) -> Result<()> {
     let (a, b) = pop_pair(st);
     let v = crate::types::expr_ops::numeric_binop(&a, &b, op)?;
@@ -1489,6 +1645,7 @@ fn arith(st: &mut VmState, op: char) -> Result<()> {
     Ok(())
 }
 
+#[inline]
 fn rel(st: &mut VmState, op: &'static str) -> Result<()> {
     let (a, b) = pop_pair(st);
     let v = crate::types::expr_ops::op_rel(&a, &b, op);
@@ -1496,6 +1653,7 @@ fn rel(st: &mut VmState, op: &'static str) -> Result<()> {
     Ok(())
 }
 
+#[inline]
 fn bits(st: &mut VmState, op: char) -> Result<()> {
     let (a, b) = pop_pair(st);
     let v = crate::types::expr_ops::int_bitop(&a, &b, op)?;
@@ -1503,6 +1661,7 @@ fn bits(st: &mut VmState, op: char) -> Result<()> {
     Ok(())
 }
 
+#[inline]
 fn shift(st: &mut VmState, shl: bool) -> Result<()> {
     let (a, b) = pop_pair(st);
     let v = crate::types::expr_ops::int_shift(&a, &b, shl)?;

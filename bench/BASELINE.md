@@ -1512,6 +1512,24 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round Y — OO 派发快径两连（2026-10-18）
+
+1. **head_cache 身份比较**：`MethodDef.head_cache` 键从 `(String, Value, Value)`
+   改 `(Value, Value, Value)`，命中判定 `Value::same_allocation`（ptr 比较，
+   免 memcmp、免 miss 路径的 `to_string` 分配）。`invoke_method`/
+   `exec_chain_entry` 增 `typed_val: &Value` 参数（`next`/`<cloned>` 冷路径
+   传临时 Value）。oovars 5499M→5482M，oo2 4394M→4376M。
+2. **ChainEntry 携带 owner 变量表**：链构建点（构建时表项在手，clone 即得）
+   预取 owner 的 `variables`/`obj_variables` Rc；`memoised_proc_def` 的 memo
+   键检查不再每调用做 `objects.get`/`classes.get` 哈希探测。
+   健全性：该字段唯一写点（`oo::define variable`）换 Rc 且必 bump
+   `mutation_ctr`，而链 memo 由 ctr 盖章——盖章未变则 hint == live。
+   `next`/`<cloned>` 路径经 `fresh_chain=false` 走原 live 探测（方法体内
+   声明 `variable` 后 `next` 的观测语义逐字保持）。
+   oovars 5482M→5389M（**0.58x→0.57x**），oo2 4376M→4284M（**0.49x→0.48x**）。
+
+门禁：tests 1256/0、judge 88/88、sweep 0。
+
 ## 快照 — perf/interp-arch-opt-2 收盘（2026-10-18）
 
 指令数比（rtcl/tclsh）/ wall（3 次交错 best-of）：

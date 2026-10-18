@@ -109,11 +109,13 @@ pub(crate) struct MethodDef {
     /// the frame-prelink list back as an `Rc`, so a method call allocates
     /// nothing for its `variable` links.
     pub proc_memo: Rc<RefCell<ProcMemo>>,
-    /// Cached argument head for the invoked method: (typed name, the two
-    /// head Values [typed, method]).  The typed name varies per CALL SITE
-    /// (`c` vs `::c`); a match recycles the head Values without
-    /// allocation.  Cold on misses.
-    pub head_cache: RefCell<Option<(String, Value, Value)>>,
+    /// Cached argument head for the invoked method: (the typed name's
+    /// `Value`, the two head Values [typed, method]).  The typed name
+    /// varies per CALL SITE (`c` vs `::c`); the hit test is
+    /// `Value::same_allocation` — a pointer compare, since values are
+    /// immutable and the cache keeps its own handle alive (no string
+    /// compare, no `to_string` on the miss path).  Cold on misses.
+    pub head_cache: RefCell<Option<(Value, Value, Value)>>,
 }
 
 /// A fresh [`MethodDef::proc_memo`] cell.
@@ -137,6 +139,13 @@ pub(crate) enum Owner {
 pub(crate) struct ChainEntry {
     pub owner: Owner,
     pub def: MethodDef,
+    /// The owner's `variable` list (identity) as of chain construction,
+    /// captured while the table entry was already at hand.  Sound to reuse
+    /// while `mutation_ctr` is unchanged: the field's only writer
+    /// (`oo::define variable`) swaps the Rc and bumps the counter, and
+    /// chains handed out are stamped by it.  `None` (chains not from the
+    /// stamp-checked memo) falls back to the per-call probe.
+    pub vars: Option<Rc<Vec<String>>>,
 }
 
 /// 链解析 memo：类键 → (成员/父类键 → (stamp, 条目))。
@@ -533,7 +542,11 @@ fn push_class_entry(
         if (def.exported || include_private)
             && !out.iter().any(|e| e.owner == Owner::Class(class.to_string()))
         {
-            out.push(ChainEntry { owner: Owner::Class(class.to_string()), def: def.clone() });
+            out.push(ChainEntry {
+                vars: Some(Rc::clone(&cls.variables)),
+                owner: Owner::Class(class.to_string()),
+                def: def.clone(),
+            });
             hidden.remove(method);
         }
     }
@@ -548,7 +561,11 @@ fn build_chain(interp: &Interp, key: &str, method: &str, include_private: bool) 
     if let Some(obj) = interp.oo.objects.get(key) {
         if let Some((_, def)) = obj.methods.iter().find(|(n, _)| n == method) {
             if def.exported || include_private {
-                out.push(ChainEntry { owner: Owner::Object, def: def.clone() });
+                out.push(ChainEntry {
+                    vars: Some(Rc::clone(&obj.variables)),
+                    owner: Owner::Object,
+                    def: def.clone(),
+                });
             }
         }
         for m in &obj.mixins {
@@ -573,7 +590,11 @@ fn build_chain(interp: &Interp, key: &str, method: &str, include_private: bool) 
         // mixins, then the metaclass chain.
         if let Some((_, def)) = cls.obj_methods.iter().find(|(n, _)| n == method) {
             if def.exported || include_private {
-                out.push(ChainEntry { owner: Owner::Object, def: def.clone() });
+                out.push(ChainEntry {
+                    vars: Some(Rc::clone(&cls.obj_variables)),
+                    owner: Owner::Object,
+                    def: def.clone(),
+                });
             }
         }
         for m in &cls.obj_mixins {
@@ -610,6 +631,7 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
                 for (name, def) in &cls.methods {
                     if !out.iter().any(|(n, _)| n == name) && !hidden.contains(name) {
                         out.push((name.clone(), ChainEntry {
+                            vars: Some(Rc::clone(&cls.variables)),
                             owner: Owner::Class($class.clone()),
                             def: def.clone(),
                         }));
@@ -623,7 +645,11 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
     if let Some(obj) = interp.oo.objects.get(key) {
         for (name, def) in &obj.methods {
             if !out.iter().any(|(n, _)| n == name) {
-                out.push((name.clone(), ChainEntry { owner: Owner::Object, def: def.clone() }));
+                out.push((name.clone(), ChainEntry {
+                    vars: Some(Rc::clone(&obj.variables)),
+                    owner: Owner::Object,
+                    def: def.clone(),
+                }));
             }
         }
         for m in &obj.mixins {
@@ -646,7 +672,11 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
     if let Some(cls) = interp.oo.classes.get(key) {
         for (name, def) in &cls.obj_methods {
             if !out.iter().any(|(n, _)| n == name) {
-                out.push((name.clone(), ChainEntry { owner: Owner::Object, def: def.clone() }));
+                out.push((name.clone(), ChainEntry {
+                    vars: Some(Rc::clone(&cls.obj_variables)),
+                    owner: Owner::Object,
+                    def: def.clone(),
+                }));
             }
         }
         for m in &cls.obj_mixins {
@@ -769,6 +799,8 @@ fn exec_chain_entry(
     chain: &Rc<Vec<ChainEntry>>,
     call_args: &[Value],
     typed: &str,
+    typed_val: &Value,
+    fresh_chain: bool,
 ) -> Result<Value> {
     let entry = &chain[index];
     match entry.def.kind.clone() {
@@ -807,8 +839,13 @@ fn exec_chain_entry(
             // would use (the object's namespace) — computed before the
             // memo build so the prelink list can pre-resolve each name.
             let ns = object_ns_of(interp, key);
-            let (proc_def, links) =
-                memoised_proc_def(interp, &entry.owner, key, &entry.def, method, &ns);
+            let (proc_def, links) = {
+                // Hint only for chains straight from the stamp-checked
+                // memo; `next`/cold paths keep the live probe so a
+                // mid-body `variable` declaration is observed there.
+                let vars_hint = if fresh_chain { entry.vars.as_ref() } else { None };
+                memoised_proc_def(interp, &entry.owner, key, &entry.def, method, &ns, vars_hint)
+            };
             if !links.is_empty() {
                 interp.frame_prelink = Some(links);
             }
@@ -822,7 +859,11 @@ fn exec_chain_entry(
             {
                 let mut hc = entry.def.head_cache.borrow_mut();
                 match hc.as_mut() {
-                    Some((t, h0, h1)) if t == typed => {
+                    // Identity, not text: the cached handle stays alive in
+                    // the cell, so pointer equality implies equal text — a
+                    // different allocation with look-alike text misses and
+                    // rebuilds (correct, just cold).
+                    Some((t, h0, h1)) if t.same_allocation(typed_val) => {
                         args.push(h0.clone());
                         args.push(h1.clone());
                     }
@@ -831,7 +872,7 @@ fn exec_chain_entry(
                         let h1 = Value::from_str(method);
                         args.push(h0.clone());
                         args.push(h1.clone());
-                        *hc = Some((typed.to_string(), h0, h1));
+                        *hc = Some((typed_val.clone(), h0, h1));
                     }
                 }
             }
@@ -915,6 +956,7 @@ fn memoised_proc_def(
     def: &MethodDef,
     method: &str,
     ns: &Rc<str>,
+    vars_hint: Option<&Rc<Vec<String>>>,
 ) -> (Rc<ProcDef>, Rc<Vec<crate::interp::PrelinkEntry>>) {
     // The live `variable` list is the memo key — one probe of the owner's
     // table, no allocation; the link list (owner's declared variables
@@ -924,7 +966,10 @@ fn memoised_proc_def(
     // The owner's live `variable` list, by identity: the memo keys on the
     // `Rc`'s pointer (a declaration replaces the vector wholesale), so the
     // per-call check is one pointer compare — no table-content walk.
-    let vars: Option<Rc<Vec<String>>> = owner_variables(interp, owner, key).cloned();
+    let vars: Option<Rc<Vec<String>>> = match vars_hint {
+        Some(v) => Some(Rc::clone(v)),
+        None => owner_variables(interp, owner, key).cloned(),
+    };
     {
         let memo = def.proc_memo.borrow();
         if let Some(e) = memo.iter().find(|e| {
@@ -1018,13 +1063,14 @@ fn invoke_method(
     method: &str,
     call_args: &[Value],
     typed: &str,
+    typed_val: &Value,
     include_private: bool,
 ) -> Result<Value> {
     let (chain, method_rc) = chain_for(interp, key, method, include_private);
     if chain.is_empty() {
         return Err(unknown_method_error(interp, key, typed, method));
     }
-    exec_chain_entry(interp, key, &method_rc, 0, &chain, call_args, typed)
+    exec_chain_entry(interp, key, &method_rc, 0, &chain, call_args, typed, typed_val, true)
 }
 
 /// The memoised [`build_chain`] for this invocation context.  Nested maps
@@ -1091,7 +1137,7 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
         ));
     }
     let method = args[1].as_str();
-    invoke_method(interp, &key, method, &args[2..], typed, false)
+    invoke_method(interp, &key, method, &args[2..], typed, &args[0], false)
 }
 
 // ── my / self / next ───────────────────────────────────────────────────
@@ -1112,7 +1158,7 @@ extern "Rust" fn cmd_oo_my(interp: &mut Interp, args: &[Value]) -> Result<Value>
         return Err(Error::wrong_args_with_usage("my", 2, args.len(), "method ?arg ...?"));
     }
     let method = args[1].as_str();
-    invoke_method(interp, &key, method, &args[2..], typed, true)
+    invoke_method(interp, &key, method, &args[2..], typed, &args[0], true)
 }
 
 const SELF_SUBCMDS: &[&str] = &[
@@ -1243,7 +1289,17 @@ extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Valu
         .as_list()
         .and_then(|l| l.first().map(|v| v.as_str().to_string()))
         .unwrap_or_else(|| act.obj.to_string());
-    exec_chain_entry(interp, &act.obj, &act.method, next_index, &act.chain, &call_args, &typed)
+    exec_chain_entry(
+        interp,
+        &act.obj,
+        &act.method,
+        next_index,
+        &act.chain,
+        &call_args,
+        &typed,
+        &Value::from_str(&typed),
+        false,
+    )
 }
 
 // ── create / new / destroy builtins ────────────────────────────────────
@@ -1514,7 +1570,11 @@ fn ctor_chain(interp: &Interp, class_key: &str) -> Vec<ChainEntry> {
     for c in linearize(interp, class_key) {
         if let Some(cls) = interp.oo.classes.get(&c) {
             if let Some(def) = &cls.constructor {
-                out.push(ChainEntry { owner: Owner::Class(c.clone()), def: def.clone() });
+                out.push(ChainEntry {
+                    vars: Some(Rc::clone(&cls.variables)),
+                    owner: Owner::Class(c.clone()),
+                    def: def.clone(),
+                });
             }
         }
     }
@@ -1526,7 +1586,11 @@ fn dtor_chain(interp: &Interp, class_key: &str) -> Vec<ChainEntry> {
     for c in linearize(interp, class_key) {
         if let Some(cls) = interp.oo.classes.get(&c) {
             if let Some(def) = &cls.destructor {
-                out.push(ChainEntry { owner: Owner::Class(c.clone()), def: def.clone() });
+                out.push(ChainEntry {
+                    vars: Some(Rc::clone(&cls.variables)),
+                    owner: Owner::Class(c.clone()),
+                    def: def.clone(),
+                });
             }
         }
     }
@@ -2206,6 +2270,8 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
             &chain,
             &[Value::from_str(&src)],
             &target_typed,
+            &Value::from_str(&target_typed),
+            false,
         );
         if let Err(e) = r {
             detach_object(interp, &full, &new_ns, false);

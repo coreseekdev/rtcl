@@ -179,6 +179,12 @@ pub(crate) struct CallFrame {
     /// so a linked method variable no longer degrades the WHOLE frame to
     /// name-keyed lookups.
     pub slot_aliased: Vec<bool>,
+    /// Frame-level short-circuit for the `slot_aliased` scan: true once
+    /// ANY slot of this frame has been link-aliased (`upvar` / `global` /
+    /// `variable`).  The hot slot ops test this one bool first — a frame
+    /// that never saw a link (the overwhelmingly common case) skips the
+    /// per-slot Vec<bool> probe entirely.  Cleared with `slot_aliased`.
+    pub has_aliased: bool,
     /// Parallel to `slots`: for an aliased slot holding a GLOBAL link
     /// (`variable`/`global`/upvar-to-global), the canonical target key —
     /// slot ops resolve through ONE hash (`globals.get(key)`) instead of
@@ -230,7 +236,7 @@ impl CallFrame {
     /// Current value of the named slot (`None` when unset or absent).
     pub(crate) fn slot_value(&self, name: &str) -> Option<&Value> {
         let i = self.slot_index_of(name)?;
-        if self.slot_aliased.get(i).copied().unwrap_or(false) {
+        if self.has_aliased && self.slot_aliased.get(i).copied().unwrap_or(false) {
             return None;
         }
         let v = &self.slots[i];

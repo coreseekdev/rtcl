@@ -1778,7 +1778,7 @@ fn dispatch_dynamic(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 #[inline]
 fn slot_read_or_name(interp: &mut Interp, code: &ByteCode, slot: usize) -> Result<Value> {
     if let Some(f) = interp.frames.last() {
-        if !f.slot_aliased.get(slot).copied().unwrap_or(false) {
+        if !(f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false)) {
             if let Some(v) = f.slots.get(slot) {
                 if v.is_unset() {
                     // Unset cell: LoadLocal falls through to the name path —

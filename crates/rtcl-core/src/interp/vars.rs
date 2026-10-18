@@ -64,7 +64,7 @@ impl Interp {
     /// back to the name path).
     pub(crate) fn frame_slot_value(&self, slot: usize) -> Option<Value> {
         let f = self.frames.last()?;
-        if f.slot_aliased.get(slot).copied().unwrap_or(false) {
+        if f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false) {
             // Global link: ONE probe with the canonical key (the name
             // path would pay upvars + globals = two hashes).
             let key = f.link_keys.get(slot)?.as_ref()?;
@@ -86,7 +86,7 @@ impl Interp {
         let aliased = self
             .frames
             .last()
-            .map(|f| f.slot_aliased.get(slot).copied().unwrap_or(false))
+            .map(|f| f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false))
             .unwrap_or(true);
         if aliased {
             // Global link: write the target directly through the cached
@@ -135,7 +135,7 @@ impl Interp {
         let Some(f) = self.frames.last_mut() else {
             return false;
         };
-        if f.slot_aliased.get(slot).copied().unwrap_or(false) {
+        if f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false) {
             return false;
         }
         let Some(cell) = f.slots.get_mut(slot) else {
@@ -160,7 +160,7 @@ impl Interp {
         }
         {
             let f = self.frames.last()?;
-            if f.slot_aliased.get(slot).copied().unwrap_or(false) {
+            if f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false) {
                 // Global link: one probe, in-place int rewrite when the
                 // stored value is unshared/immediate.
                 let key = f.link_keys.get(slot)?.as_ref()?;
@@ -212,6 +212,7 @@ impl Interp {
         f.slots.clear();
         f.slot_aliased.clear();
         f.link_keys.clear();
+        f.has_aliased = false;
     }
 
     /// Link-only aliasing of ONE slot: move the cell's value into
@@ -242,6 +243,7 @@ impl Interp {
             f.slot_aliased.resize(f.slots.len(), false);
         }
         f.slot_aliased[i] = true;
+        f.has_aliased = true;
         // Global links get the direct-key fast path: slot ops on this
         // name resolve through ONE globals probe with the canonical key
         // (frame/dead links keep None — their name paths handle the
@@ -286,6 +288,7 @@ impl Interp {
         f.slots.clear();
         f.slot_aliased.clear();
         f.link_keys.clear();
+        f.has_aliased = false;
     }
 
     /// [`Self::degrade_frame_all_at`] on the current frame (no-op at the

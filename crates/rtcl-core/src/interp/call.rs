@@ -94,6 +94,7 @@ impl Interp {
                 f.slots.clear();
                 f.slot_aliased.clear();
                 f.link_keys.clear();
+                f.has_aliased = false;
                 f.slot_table = None;
                 f
             }
@@ -107,6 +108,7 @@ impl Interp {
                 deferred_scripts: Vec::new(),
                 slots: Vec::new(),
                 slot_aliased: Vec::new(),
+                has_aliased: false,
                 link_keys: Vec::new(),
                 slot_table: None,
                 tailcall: None,
@@ -152,6 +154,7 @@ impl Interp {
                     frame.slots.resize(n, Value::unset());
                     frame.slot_aliased.clear();
                     frame.slot_aliased.resize(n, false);
+                    frame.has_aliased = false;
                     frame.link_keys.clear();
                     frame.link_keys.resize(n, None);
                     frame.slot_table = Some(table);
@@ -161,6 +164,7 @@ impl Interp {
                     let frame = self.frames.last_mut().unwrap();
                     frame.slots.clear();
                     frame.slot_aliased.clear();
+                    frame.has_aliased = false;
                     frame.link_keys.clear();
                     frame.slot_table = None;
                     false
@@ -594,6 +598,7 @@ impl Interp {
         popped.deferred_scripts.clear();
         popped.slots.clear();
         popped.slot_aliased.clear();
+        popped.has_aliased = false;
         popped.link_keys.clear();
         popped.slot_table = None;
         // Kept (cleared, with capacity) — the pooled frame reuses the

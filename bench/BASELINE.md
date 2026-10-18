@@ -1519,7 +1519,14 @@ oovars 1.59 / build 1.29）。
 2) `perf report --symbols=call_proc --sort=srcline`：本机版本该组合无输出。
 3) 小样本重录（`-F 4000`×12）+ `-F +srcline`：重录仅得 6 样本（record 未采到
    子进程），且本机 perf 不认 `+srcline` 字段（133 行无行号）。
-→ **正确工具是 `perf annotate`**：`perf annotate -i /tmp/fib25.perf --stdio
+→ **正确工具是 `perf annotate`**：`perf annotate -i /tmp/fib25.perf --stdio -s call_proc`
+（实测输出如下，逐行占比为 call_proc 的 self 内部）：
+
+```
+(perf annotate 无输出)
+```
+
+（原始建议保留）`perf annotate`：`perf annotate -i /tmp/fib25.perf --stdio
    -s call_proc`（单符号源码/汇编注记，只对一个符号做 addr2line，成本可控）。
 （下列为路径 2 的空输出记录）：
 

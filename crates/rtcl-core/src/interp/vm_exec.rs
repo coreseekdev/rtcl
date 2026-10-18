@@ -1184,11 +1184,14 @@ fn op_var_set_add_vv(
     Ok(())
 }
 
-/// `[Jump(t), ForeachNext]` (trampoline): normalize the region stack to
-/// the foreach's entry depth (the body-end jump popped the body region;
-/// a compiled `continue` truncated the same way through its loop frame),
-/// then the iterator advance/bind ([`op_foreach_next`] owns the taken-edge
-/// step charge).
+/// `[Jump(t), ForeachNext]` (trampoline) with the body-mark folded in:
+/// normalize the region stack to the foreach's entry depth (the body-end
+/// jump popped the body region; a compiled `continue` truncated the same
+/// way through its loop frame), then the iterator advance/bind (the taken
+/// edge owns [`op_foreach_next`]'s step charge) and the body region open —
+/// `body` already points *past* the branch's `BODY_MARK`, which only the
+/// first iteration (entered by `ForeachStart`'s fall-through) executes.
+/// The region kind mirrors [`op_body_mark_framed`].
 #[inline]
 fn op_foreach_next_close(
     interp: &mut Interp,
@@ -1208,7 +1211,28 @@ fn op_foreach_next_close(
             }
         }
     }
-    op_foreach_next(interp, code, st, info, body)
+    let info_ref = code.foreach_info(info).expect("foreach info index");
+    let (idx, max) = {
+        let ff = st.foreaches.last().expect("foreach frame");
+        (ff.idx + 1, ff.iters)
+    };
+    if idx < max {
+        interp.charge_step()?;
+        st.foreaches.last_mut().unwrap().idx = idx;
+        foreach_bind(interp, code, info_ref, st, idx)?;
+        let (framed, lmap) = {
+            let ff = st.foreaches.last().expect("foreach frame");
+            (ff.framed, ff.lmap)
+        };
+        if framed {
+            st.bodies.push(Region::BodyFramed(st.cur_site, lmap));
+        } else {
+            st.bodies.push(Region::Body(st.cur_site));
+        }
+        st.pc = body as usize;
+    }
+    // done → fall through to the closing ForeachEnd
+    Ok(())
 }
 
 /// `IncrLocal`'s value, without the stack push — the fused
@@ -2217,6 +2241,23 @@ fn foreach_bind(
     idx: usize,
 ) -> Result<()> {
     let ff = st.foreaches.last().expect("foreach frame");
+    // The dominant shape — one group, one variable, slot target — binds
+    // through the frame slot directly, skipping the nested iteration (and
+    // the empty-singleton's thread-local lookup, which only the
+    // out-of-range branches need).
+    if let [g] = info.groups.as_slice() {
+        if let [t] = g.as_slice() {
+            if let (Some(slot), [list]) = (t.slot, ff.lists.as_slice()) {
+                let v = match list.get(idx) {
+                    Some(v) => v,
+                    None => &Value::empty(),
+                };
+                if interp.frame_slot_write(slot as usize, v) {
+                    return Ok(());
+                }
+            }
+        }
+    }
     // Out-of-range targets (multi-group lists of uneven length) bind the
     // empty value — one shared instance per bind, not per variable.
     let empty = Value::empty();

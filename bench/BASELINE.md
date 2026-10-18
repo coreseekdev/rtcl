@@ -1494,3 +1494,21 @@ fe 的 `p` 循环每迭代 6 op → 3 op（BODY_MARK / SET_SS_ADD /
 FOREACH_NEXT_CLOSE）；wall（3 次交错）：fe 1.10x、dloop 0.81x、oo2 0.65x、
 oovars 1.01x、fib 0.97x。
 
+## Round J — foreach 绑定快路径 + body-mark 折叠（2026-10-18，继续）
+
+- `foreach_bind` 常见形（单 group、单变量、slot 目标）直绑：跳过双层迭代器
+  与 `Value::empty()` 的 TLS 查找（只在越界分支取用）——p_only −8%。
+- `[Jump(t=下一op), ForeachNext]` 融合把 **body region 的建设收进
+  FOREACH_NEXT_CLOSE**：body 入口指向 `BODY_MARK` 之后（首轮仍经
+  `ForeachStart` 落穿执行标记，后续迭代由融合 op 按 `framed/lmap` 开
+  region）——p 循环 3 op → 2 op（SET_SS_ADD / FOREACH_NEXT_CLOSE）。
+  非内联形状（body 非 BODY_MARK）保持原 op 对。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| I 后 | 0.99x | 1.10x | 0.69x | 0.52x | 0.72x | 0.84x |
+| J（本提交） | 0.99x | **0.99x** | 0.69x | 0.52x | 0.72x | 0.84x |
+
+**六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
+oovars 1.59 / build 1.29）。
+

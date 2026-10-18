@@ -566,9 +566,21 @@ impl ByteCode {
                     retargets.push(((i + 1) as u32, i as u32));
                     Some((OpCode::SwapToNextMark, 2))
                 }
-                (OpCode::Jump(t), OpCode::ForeachNext { info, body }) if *t as usize == i + 1 => {
+                // The body-mark folding requires the body entry to be a
+                // BODY_MARK (the inlined foreach shape): the fused op owns
+                // the per-iteration region open and the target skips the
+                // mark (first-iteration entry still runs it, via
+                // ForeachStart's fall-through); foreign shapes keep the
+                // plain pair.
+                (OpCode::Jump(t), OpCode::ForeachNext { info, body })
+                    if *t as usize == i + 1
+                        && matches!(
+                            self.ops.get(*body as usize),
+                            Some(OpCode::BodyMark | OpCode::BodyMarkFramed)
+                        ) =>
+                {
                     retargets.push(((i + 1) as u32, i as u32));
-                    Some((OpCode::ForeachNextClose(*info, *body), 2))
+                    Some((OpCode::ForeachNextClose(*info, *body + 1), 2))
                 }
                 (OpCode::NextMark, OpCode::BeginCmd(site)) if !targets[i + 1] => {
                     Some((OpCode::NextMarkBeginCmd(*site), 2))

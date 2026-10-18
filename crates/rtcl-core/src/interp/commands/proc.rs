@@ -743,7 +743,7 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // array container (not the element) in tclsh (probed:
         // `upvar 0 a(e) x` → `array exists a` = 1, `info exists x` = 0).
         if let UpvarLink::Global(gname) = &link {
-            if let Some(paren) = gname.find('(') {
+            if let Some(paren) = super::super::util::find_paren(gname) {
                 let base = &gname[..paren];
                 if !interp.is_array_semantic(base) && !interp.var_exists(base) {
                     let _ = interp.mark_array(base);

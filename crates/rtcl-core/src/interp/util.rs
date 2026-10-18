@@ -2,12 +2,40 @@
 
 /// Split `name(index)` into `(name, index)`.
 pub(crate) fn split_array_ref(name: &str) -> Option<(&str, &str)> {
-    let paren = name.find('(')?;
+    let paren = find_paren(name)?;
     let end_paren = name.rfind(')')?;
     if end_paren > paren {
         Some((&name[..paren], &name[paren + 1..end_paren]))
     } else {
         None
+    }
+}
+
+/// Byte offset of the first `(` in `name`.  Every variable read/write and
+/// every link install asks this of a short name ("i", "n", "acc" — the
+/// element form is rare); `str::find`'s memchr setup dominated the leaf
+/// samples for them, so short names take a byte loop.
+#[inline]
+pub(crate) fn find_paren(name: &str) -> Option<usize> {
+    let b = name.as_bytes();
+    if b.len() <= 16 {
+        for (i, &c) in b.iter().enumerate() {
+            if c == b'(' {
+                return Some(i);
+            }
+        }
+        None
+    } else {
+        name.find('(')
+    }
+}
+
+/// `name` without its array-element suffix (`a(x)` → `a`).
+#[inline]
+pub(crate) fn strip_paren(name: &str) -> &str {
+    match find_paren(name) {
+        Some(i) => &name[..i],
+        None => name,
     }
 }
 

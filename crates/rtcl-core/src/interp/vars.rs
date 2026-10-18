@@ -191,10 +191,7 @@ impl Interp {
     /// inserts them at runtime, so hash iteration order (and anything
     /// derived from it after a later degrade) matches too.
     pub(crate) fn degrade_frame_local(&mut self, frame_idx: usize, name: &str) {
-        let base = match name.find('(') {
-            Some(i) => &name[..i],
-            None => name,
-        };
+        let base = super::util::strip_paren(name);
         let Some(f) = self.frames.get_mut(frame_idx) else { return };
         if f.slots.is_empty() || f.slot_index_of(base).is_none() {
             return;
@@ -225,10 +222,7 @@ impl Interp {
     /// keep [`Self::degrade_frame_local`]'s wholesale flush (their
     /// storage-kind change is frame-wide by nature, and they are cold).
     pub(crate) fn degrade_frame_link(&mut self, frame_idx: usize, name: &str, link: &crate::interp::UpvarLink) {
-        let base = match name.find('(') {
-            Some(i) => &name[..i],
-            None => name,
-        };
+        let base = super::util::strip_paren(name);
         let Some(f) = self.frames.get_mut(frame_idx) else { return };
         if f.slots.is_empty() {
             return;
@@ -348,17 +342,23 @@ impl Interp {
     /// pre-deletion behavior against the seeded local copy.  Returns
     /// `Some(is_element_error)` when the write must fail.
     fn dead_link_error(&self, name: &str) -> Option<bool> {
-        let base = match name.find('(') {
-            Some(i) => &name[..i],
-            None => name,
-        };
+        // Every `set_var` pays this first: nothing linked (the common
+        // case) means nothing can be dead — skip the paren scan AND the
+        // upvar hash probe entirely.
         if let Some(frame) = self.frames.last() {
+            if frame.upvars.is_empty() {
+                return None;
+            }
+            let base = super::util::strip_paren(name);
             match frame.upvars.get(base) {
                 Some(UpvarLink::Dead { array, .. }) => Some(*array),
                 _ => None,
             }
         } else {
-            let key = self.canonical_global(base);
+            if self.dead_flat.is_empty() {
+                return None;
+            }
+            let key = self.canonical_global(super::util::strip_paren(name));
             if self.dead_flat.contains(&key) {
                 Some(false)
             } else {
@@ -882,11 +882,14 @@ impl Interp {
     /// `set ::nope2::` is not — var-1.12).  Reads, `info exists`, and unset
     /// stay plain misses.
     pub(crate) fn check_parent_ns(&mut self, name: &str) -> Result<()> {
-        let var = match name.find('(') {
-            Some(i) => &name[..i],
-            None => name,
-        };
-        if !var.contains("::") {
+        // Fast reject: a name with no `::` anywhere cannot name a
+        // namespace-scoped variable (stripping an element suffix can't
+        // add one either) — the scan below is for qualified names only.
+        if !super::util::has_ns_sep(name) {
+            return Ok(());
+        }
+        let var = super::util::strip_paren(name);
+        if !super::util::has_ns_sep(var) {
             return Ok(());
         }
         let full = super::commands::namespace::qualify(&self.current_namespace, var);

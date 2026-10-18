@@ -888,7 +888,7 @@ impl Interp {
         // `[winfo name $zz]` even when the array itself is
         // missing (misc-1.1), and an index error masks the
         // array lookup entirely.
-        if let Some(open) = name.find('(') {
+        if let Some(open) = crate::interp::util::find_paren(name) {
             if name.ends_with(')') {
                 let raw = &name[open + 1..name.len() - 1];
                 if raw.contains('$') || raw.contains('[') || raw.contains('\\') {

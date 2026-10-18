@@ -1512,6 +1512,19 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round AA — OO 派发站点级 memo（2026-10-18）
+
+`OoCallCache`（OoState 单槽）：缓存 `(ns, stamp, typed, method, key,
+method_rc, chain)`；命中判定 = 变异戳相等 + 当前命名空间 `Rc` 指针相等 +
+typed/method 两词 `same_allocation`（常量池字面量/槽值 clone 的分配稳定）
+——四项合起来蕴含 `resolve_object_key` 必得同 key、`chain_for` 必 memo 命中，
+于是两次哈希探测全免，缓存链直进 `exec_chain_entry`。`my`
+（include_private）路径既不查也不填（帧上下文门禁语义另议）。
+
+实测：oo2 4284M→**3834M（−10.5%）0.48x→0.43x**；oovars 5389M→**4939M
+（−8.3%）0.57x→0.52x**；其余板持平。两板均进入 0.5-0.6 目标带（oo2 更低）。
+门禁：tests 1256/0、judge 88/88、sweep 0。
+
 ## Round Z — while 体尾融合实验（2026-10-18，结论：回退）
 
 新 op `IncrPopJumpLocal/Var`：`[BeginCmdIncr*Pop(site,x,k), Jump(t)]` 单 op

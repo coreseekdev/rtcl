@@ -224,6 +224,26 @@ pub(crate) enum DefineTarget {
     Object(String),
 }
 
+/// One-entry dispatcher cache for [`cmd_oo_object`] (see its fast path).
+/// Validation is identity-and-stamp: the typed word and the method word
+/// must be the *same allocations* (a const-pool literal or a slot value
+/// re-cloned — both stable across calls), the resolution namespace the
+/// same `Rc`, and the mutation stamp live.  Those together imply
+/// `resolve_object_key` would recompute the identical key and `chain_for`
+/// would hit its memo — so both hash probes are skipped and the cached
+/// chain feeds `exec_chain_entry` directly.  `include_private` dispatch
+/// (`my`) neither consults nor fills the entry.
+#[derive(Debug)]
+pub(crate) struct OoCallCache {
+    pub ns: Rc<str>,
+    pub stamp: u64,
+    pub typed: Value,
+    pub method: Value,
+    pub key: Rc<str>,
+    pub method_rc: Rc<str>,
+    pub chain: Rc<Vec<ChainEntry>>,
+}
+
 /// All OO state, hanging off [`Interp`].
 #[derive(Debug, Default)]
 pub(crate) struct OoState {
@@ -272,6 +292,9 @@ pub(crate) struct OoState {
     pub chain_memo: FxMapK<Rc<str>, ChainMemo>,
     /// The `include_private` half of [`Self::chain_memo`].
     pub chain_memo_priv: FxMapK<Rc<str>, ChainMemo>,
+    /// One-entry dispatch cache for the object dispatcher — see
+    /// [`OoCallCache`].
+    pub call_cache: Option<OoCallCache>,
     /// Typed-name → canonical object/class key memo (see
     /// `resolve_object_key`): current namespace → typed name →
     /// (stamp, resolution).  `RefCell` so `&Interp` read paths can fill
@@ -1061,6 +1084,7 @@ fn invoke_method(
     interp: &mut Interp,
     key: &Rc<str>,
     method: &str,
+    method_val: &Value,
     call_args: &[Value],
     typed: &str,
     typed_val: &Value,
@@ -1069,6 +1093,19 @@ fn invoke_method(
     let (chain, method_rc) = chain_for(interp, key, method, include_private);
     if chain.is_empty() {
         return Err(unknown_method_error(interp, key, typed, method));
+    }
+    if !include_private {
+        // Refresh the dispatcher cache for the next call to this site
+        // (stamp-validated, so a mutation retires it implicitly).
+        interp.oo.call_cache = Some(OoCallCache {
+            ns: Rc::clone(&interp.current_namespace),
+            stamp: interp.oo.mutation_ctr,
+            typed: typed_val.clone(),
+            method: method_val.clone(),
+            key: Rc::clone(key),
+            method_rc: Rc::clone(&method_rc),
+            chain: Rc::clone(&chain),
+        });
     }
     exec_chain_entry(interp, key, &method_rc, 0, &chain, call_args, typed, typed_val, true)
 }
@@ -1124,6 +1161,35 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
     // typed name, the method name AND a Vec clone of the call args per
     // invocation — the dispatcher's entry tax.
     let typed = args[0].as_str();
+    // Dispatcher cache (see [`OoCallCache`]): a stable typed word + method
+    // word under the same namespace and live mutation stamp mean the
+    // resolve and the chain memo would both hit — run the cached
+    // resolution straight through.  `args.len() < 2` keeps falling into
+    // the arity error below.
+    if args.len() >= 2 {
+        if let Some(c) = interp.oo.call_cache.as_ref() {
+            if c.stamp == interp.oo.mutation_ctr
+                && Rc::ptr_eq(&c.ns, &interp.current_namespace)
+                && c.typed.same_allocation(&args[0])
+                && c.method.same_allocation(&args[1])
+            {
+                let key = Rc::clone(&c.key);
+                let method_rc = Rc::clone(&c.method_rc);
+                let chain = Rc::clone(&c.chain);
+                return exec_chain_entry(
+                    interp,
+                    &key,
+                    &method_rc,
+                    0,
+                    &chain,
+                    &args[2..],
+                    typed,
+                    &args[0],
+                    true,
+                );
+            }
+        }
+    }
     let key = match resolve_object_key(interp, typed) {
         Some(k) => k,
         None => return Err(Error::invalid_command(typed)),
@@ -1137,7 +1203,7 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
         ));
     }
     let method = args[1].as_str();
-    invoke_method(interp, &key, method, &args[2..], typed, &args[0], false)
+    invoke_method(interp, &key, method, &args[1], &args[2..], typed, &args[0], false)
 }
 
 // ── my / self / next ───────────────────────────────────────────────────
@@ -1158,7 +1224,7 @@ extern "Rust" fn cmd_oo_my(interp: &mut Interp, args: &[Value]) -> Result<Value>
         return Err(Error::wrong_args_with_usage("my", 2, args.len(), "method ?arg ...?"));
     }
     let method = args[1].as_str();
-    invoke_method(interp, &key, method, &args[2..], typed, &args[0], true)
+    invoke_method(interp, &key, method, &args[1], &args[2..], typed, &args[0], true)
 }
 
 const SELF_SUBCMDS: &[&str] = &[

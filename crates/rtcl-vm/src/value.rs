@@ -805,6 +805,10 @@ impl Value {
         let inner = unsafe { self.heap_inner() };
         match &inner.rep {
             InternalRep::Int(n) => Some(*n),
+            // The cached bool rep's string is exactly "1"/"0" — the fast
+            // path every loop condition takes (Tcl_GetBooleanFromObj's
+            // numeric arm), not a from-scratch decimal parse.
+            InternalRep::Bool(b) => Some(*b as i64),
             _ => {
                 let s = self.to_str();
                 let s = s.trim();
@@ -859,6 +863,7 @@ impl Value {
         match &inner.rep {
             InternalRep::Float(n) => Some(*n),
             InternalRep::Int(n) => Some(*n as f64),
+            InternalRep::Bool(b) => Some(u8::from(*b) as f64),
             _ => {
                 let s = self.to_str();
                 let s = s.trim();

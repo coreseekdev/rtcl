@@ -638,6 +638,35 @@ pub enum OpCode {
     /// trampoline): close the body region, then advance the iterator
     /// (binding the next values) and jump back to the body.
     ForeachNextClose(u32, u32),
+
+    /// Fusion of `[BeginCmdSubMark s1, BeginCmd s2, AddSlotSlot a b,
+    /// SubEndStoreLocalPop d]` — the dominant `set <slot> [expr {$a + $b}]`
+    /// statement: set the set-command's site, open the bracket region, set
+    /// the expr command's site, compute the sum, close the region
+    /// (restoring the set site), store the value by move into the slot.
+    /// Each step is the pair's verbatim body and order, so error frames
+    /// and region state at any failing step are identical.
+    SlotSetAddSS {
+        /// The `set` command's site.
+        set_site: u32,
+        /// The bracketed `expr` command's site.
+        expr_site: u32,
+        a: u16,
+        b: u16,
+        /// The destination slot (`set`'s variable).
+        dst: u16,
+    },
+
+    /// The name-keyed twin: `set <var> [expr {$a + $b}]` with `a`/`b`/`dst`
+    /// constant-pool name indices (reads through `eval_var_ref`, store
+    /// through `set_var`).
+    VarSetAddVV {
+        set_site: u32,
+        expr_site: u32,
+        a: u16,
+        b: u16,
+        dst: u16,
+    },
     /// Enters an inline body reached by a *taken* jump (an `if`'s else
     /// body).  Every other inline body is entered by a not-taken
     /// `JumpFalse`/`JumpTrue`, which the executor uses to track which
@@ -871,6 +900,12 @@ impl fmt::Display for OpCode {
             }
             OpCode::ForeachNextClose(info, body) => {
                 write!(f, "FOREACH_NEXT_CLOSE {} -> {}", info, body)
+            }
+            OpCode::SlotSetAddSS { set_site, expr_site, a, b, dst } => {
+                write!(f, "SET_SS_ADD {} {} {} {} -> {}", set_site, expr_site, a, b, dst)
+            }
+            OpCode::VarSetAddVV { set_site, expr_site, a, b, dst } => {
+                write!(f, "SET_VV_ADD {} {} {} {} -> {}", set_site, expr_site, a, b, dst)
             }
             OpCode::BodyMark => write!(f, "BODY_MARK"),
             OpCode::NextMark => write!(f, "NEXT_MARK"),

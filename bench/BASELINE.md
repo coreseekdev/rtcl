@@ -1477,3 +1477,20 @@ vs tclsh 337。本轮把编译器的高频簿记相邻对交给 `fuse_pairs`：
 dloop 的 0.45x 假象说明：坏 remap 下循环少干活（judge 未绿时的数字不可用，
 已剔除）。空循环基线 534→517 instr/迭代。
 
+## Round I — 语句级融合（2026-10-18，继续）
+
+`set <slot> [expr {$a + $b>}]` / `set <var> [expr {$a + $b>}]` 的整段窗口
+（`[BeginCmdSubMark, BeginCmd, AddSlotSlot/AddVarVar, SubEndStoreLocal/VarPop]`）
+折叠为单 op `SlotSetAddSS` / `VarSetAddVV`（payload 14B，保持 ≤16 信封）；
+逐字复刻各步（站点、Sub region、读、加、关 region、move 写入），错误/region
+状态在任一步失败时与原窗口一致；`unfused()` 直落 7/8 op 规范形。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| H 后 | 0.99x | 1.23x | 0.69x | 0.52x | 0.72x | 0.84x |
+| I（本提交） | 0.99x | 1.10x | 0.69x | 0.52x | 0.72x | 0.84x |
+
+fe 的 `p` 循环每迭代 6 op → 3 op（BODY_MARK / SET_SS_ADD /
+FOREACH_NEXT_CLOSE）；wall（3 次交错）：fe 1.10x、dloop 0.81x、oo2 0.65x、
+oovars 1.01x、fib 0.97x。
+

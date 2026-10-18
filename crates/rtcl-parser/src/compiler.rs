@@ -198,6 +198,7 @@ impl Compiler {
             | OpCode::SwapToNextMark | OpCode::NextMarkBeginCmd(_)
             | OpCode::BeginCmdIncrLocalPop(_, _, _) | OpCode::BeginCmdIncrVarPop(_, _, _)
             | OpCode::ForeachNextClose(_, _)
+            | OpCode::SlotSetAddSS { .. } | OpCode::VarSetAddVV { .. }
             | OpCode::BodyMark | OpCode::NextMark
             | OpCode::SubMark | OpCode::SubEnd | OpCode::ExprMark
             | OpCode::Call { .. } | OpCode::CallExpand { .. }

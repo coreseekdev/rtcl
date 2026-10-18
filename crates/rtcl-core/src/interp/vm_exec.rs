@@ -546,6 +546,12 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             OpCode::ForeachNextClose(info, body) => {
                 op_foreach_next_close(interp, code, st, *info, *body)
             }
+            OpCode::SlotSetAddSS { set_site, expr_site, a, b, dst } => op_slot_set_add_ss(
+                interp, code, st, *set_site, *expr_site, *a, *b, *dst,
+            ),
+            OpCode::VarSetAddVV { set_site, expr_site, a, b, dst } => op_var_set_add_vv(
+                interp, code, st, *set_site, *expr_site, *a, *b, *dst,
+            ),
             OpCode::IncrLocalPop(slot, amount) => {
                 let _ = incr_local_value(interp, code, *slot, *amount)?;
                 Ok(())
@@ -1121,6 +1127,61 @@ fn op_begin_cmd_incr_var_pop(
 ) -> Result<()> {
     op_begin_cmd(interp, code, st, site)?;
     op_incr_var_pop(interp, code, idx, amount)
+}
+
+/// The `set <slot> [expr {$a + $b}]` statement window, in one dispatch —
+/// the exact step sequence of `[BeginCmdSubMark, BeginCmd, AddSlotSlot,
+/// SubEndStoreLocalPop]` (see the opcode's docs).
+#[allow(clippy::too_many_arguments)] // interp/code/st + the window's five operands
+#[inline]
+fn op_slot_set_add_ss(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    set_site: u32,
+    expr_site: u32,
+    a: u16,
+    b: u16,
+    dst: u16,
+) -> Result<()> {
+    op_begin_cmd(interp, code, st, set_site)?;
+    st.bodies.push(Region::Sub(st.cur_site));
+    op_begin_cmd(interp, code, st, expr_site)?;
+    let va = slot_read_or_name(interp, code, a as usize)?;
+    let vb = slot_read_or_name(interp, code, b as usize)?;
+    let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
+    op_sub_end(st);
+    let dst = dst as usize;
+    if let Err(v) = interp.frame_slot_write_move(dst, v) {
+        let name = code.locals().get(dst).map(String::as_str).unwrap_or("");
+        interp.set_var(name, v)?;
+    }
+    Ok(())
+}
+
+/// The name-keyed twin (`set <var> [expr {$a + $b}]`).
+#[allow(clippy::too_many_arguments)] // interp/code/st + the window's five operands
+#[inline]
+fn op_var_set_add_vv(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    set_site: u32,
+    expr_site: u32,
+    a: u16,
+    b: u16,
+    dst: u16,
+) -> Result<()> {
+    op_begin_cmd(interp, code, st, set_site)?;
+    st.bodies.push(Region::Sub(st.cur_site));
+    op_begin_cmd(interp, code, st, expr_site)?;
+    let va = var_read(interp, code, a)?;
+    let vb = var_read(interp, code, b)?;
+    let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
+    op_sub_end(st);
+    let name = code.get_const(dst).unwrap_or("");
+    interp.set_var(name, v)?;
+    Ok(())
 }
 
 /// `[Jump(t), ForeachNext]` (trampoline): normalize the region stack to
@@ -2037,6 +2098,12 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         }
         OpCode::ForeachNextClose(info, body) => {
             op_foreach_next_close(interp, code, st, *info, *body)?
+        }
+        OpCode::SlotSetAddSS { set_site, expr_site, a, b, dst } => {
+            op_slot_set_add_ss(interp, code, st, *set_site, *expr_site, *a, *b, *dst)?
+        }
+        OpCode::VarSetAddVV { set_site, expr_site, a, b, dst } => {
+            op_var_set_add_vv(interp, code, st, *set_site, *expr_site, *a, *b, *dst)?
         }
         OpCode::AddVarVar(a, b) => op_add_var_var(interp, code, st, *a, *b)?,
         OpCode::AddVarImm(a, k) => op_add_var_imm(interp, code, st, *a, *k)?,
@@ -3180,3 +3247,13 @@ p 1";
 
 
 
+
+#[cfg(test)]
+mod dump_probe9 {
+    #[test]
+    fn dump_p_h() {
+        let body = "set sum 0\nforeach i $L { set sum [expr {$sum + $i}] }\nreturn $sum";
+        let code = super::compile_proc_body(&[("L".to_string(), None)], body, 0).unwrap();
+        println!("{}", code);
+    }
+}

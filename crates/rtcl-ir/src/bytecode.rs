@@ -525,6 +525,36 @@ impl ByteCode {
                 (OpCode::SubEnd, OpCode::Return) if !targets[i + 1] => {
                     Some((OpCode::SubEndReturn, 2))
                 }
+                // ── statement windows (4-op) ────────────────────────────
+                (
+                    OpCode::BeginCmdSubMark(s1),
+                    OpCode::BeginCmd(s2),
+                ) if tail_free(4) => match (&self.ops[i + 2], &self.ops[i + 3]) {
+                    (
+                        OpCode::AddSlotSlot(a, b),
+                        OpCode::SubEndStoreLocalPop(d),
+                    ) => Some((
+                        OpCode::SlotSetAddSS {
+                            set_site: *s1,
+                            expr_site: *s2,
+                            a: *a,
+                            b: *b,
+                            dst: *d,
+                        },
+                        4,
+                    )),
+                    (OpCode::AddVarVar(a, b), OpCode::SubEndStoreVarPop(d)) => Some((
+                        OpCode::VarSetAddVV {
+                            set_site: *s1,
+                            expr_site: *s2,
+                            a: *a,
+                            b: *b,
+                            dst: *d,
+                        },
+                        4,
+                    )),
+                    _ => None,
+                },
                 // ── loop-control meta pairs ─────────────────────────────
                 // Trampoline tabs: the jump's target is the mark itself.
                 // The fused op normalizes the region stack to the loop
@@ -666,6 +696,8 @@ impl ByteCode {
                     | OpCode::BeginCmdIncrLocalPop(..)
                     | OpCode::BeginCmdIncrVarPop(..)
                     | OpCode::ForeachNextClose(..)
+                    | OpCode::SlotSetAddSS { .. }
+                    | OpCode::VarSetAddVV { .. }
             )
         })
     }
@@ -797,6 +829,25 @@ impl ByteCode {
                 OpCode::ForeachNextClose(info, body) => {
                     out.push(OpCode::Nop);
                     out.push(OpCode::ForeachNext { info: *info, body: *body });
+                }
+                OpCode::SlotSetAddSS { set_site, expr_site, a, b, dst } => {
+                    out.push(OpCode::BeginCmd(*set_site));
+                    out.push(OpCode::SubMark);
+                    out.push(OpCode::BeginCmd(*expr_site));
+                    out.push(OpCode::AddSlotSlot(*a, *b));
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::StoreLocal(*dst));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::VarSetAddVV { set_site, expr_site, a, b, dst } => {
+                    out.push(OpCode::BeginCmd(*set_site));
+                    out.push(OpCode::SubMark);
+                    out.push(OpCode::BeginCmd(*expr_site));
+                    out.push(OpCode::LoadVar(*a));
+                    out.push(OpCode::LoadVar(*b));
+                    out.push(OpCode::Add);
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::StoreVarPop(*dst));
                 }
                 // The name-keyed superinstructions themselves predate the
                 // fusion only as windows — expand them back too.
@@ -1373,6 +1424,8 @@ mod tests {
                 OpCode::BeginCmdIncrLocalPop(1, 2, 1),
                 OpCode::BeginCmdIncrVarPop(1, 2, 1),
                 OpCode::ForeachNextClose(1, 2),
+                OpCode::SlotSetAddSS { set_site: 1, expr_site: 2, a: 3, b: 4, dst: 5 },
+                OpCode::VarSetAddVV { set_site: 1, expr_site: 2, a: 3, b: 4, dst: 5 },
                 OpCode::Return,
             ],
             false,

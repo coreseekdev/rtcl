@@ -1512,6 +1512,26 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## 快照 — perf/interp-arch-opt-2 收盘（2026-10-18）
+
+指令数比（rtcl/tclsh）/ wall（3 次交错 best-of）：
+
+| bench | 指令比 | wall |
+|---|---|---|
+| fib25 | 0.85x | 0.88x |
+| fe_bench | 0.92x | 0.79x |
+| dloop | 0.68x | 0.72x |
+| oo_bench2 | 0.49x | 0.56x |
+| oovars | 0.58x | 0.66x |
+| build-only | 0.72x | — |
+| micro_base | 1.08x | — |
+| micro_incr | 1.33x | — |
+
+本轮（评审合并后新分支）五个轮次：U 骨架融合修复（靶点 remap）、V 死推入
+消除、W 站点惰性审计（关闭）、X prelink 槽位预计算；S/T 为回退实验记录。
+下一批候选（定界已入 TODO）：head_cache 身份比较、ChainEntry 携带 owner
+变量表、OO 派发站点级 memo、call_proc 帧准备、`Value` 字符串句柄共享。
+
 ## Round X — OO prelink 槽位预计算（2026-10-18）
 
 `PrelinkEntry.slot`：链 memo 构建时（拿到编译体之后）预计算每个链接名在

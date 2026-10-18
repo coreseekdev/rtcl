@@ -10,16 +10,19 @@ use std::path::PathBuf;
 
 mod repl;
 
-#[cfg(feature = "net")]
-mod net;
-
-/// 构建解释器：`net` feature 下注入 native HTTP 宿主
-/// （HostHttp 实现 + `__rtcl_http`/`__rtcl_http_cancel` 桥 + `http::*` 词表）。
+/// 构建解释器：`net` feature 下注入 native 宿主服务（rtcl-native 的
+/// HostHttp 实现 + `__rtcl_http`/`__rtcl_http_cancel` 桥 + `http::*` 词表）。
 fn new_interp() -> Interp {
-    let mut interp = Interp::new();
     #[cfg(feature = "net")]
-    net::install(&mut interp);
-    interp
+    {
+        let mut interp = Interp::new();
+        rtcl_native::net::install(&mut interp);
+        interp
+    }
+    #[cfg(not(feature = "net"))]
+    {
+        Interp::new()
+    }
 }
 
 #[derive(Parser, Debug)]

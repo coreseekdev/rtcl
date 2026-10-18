@@ -1,0 +1,22 @@
+[package]
+name = "rtcl-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native host services for rtcl (std-backed implementations of rtcl-core host traits)"
+
+[dependencies]
+# default-features = false：本 crate 只补宿主服务，不决定解释器能力面。
+# 消费方（rtcl-cli / rogo）各自组合 rtcl-core 的 feature；feature 统一
+# 由 Cargo 在最终构建中合并，rogo 的 default-features=false 沙箱面不受影响。
+rtcl-core = { path = "../rtcl-core", default-features = false, features = ["std"] }
+
+[dependencies.reqwest]
+workspace = true
+optional = true
+
+[features]
+default = []
+# 网络宿主服务：HostHttp 的 reqwest（blocking + rustls）实现 +
+# `__rtcl_http` / `__rtcl_http_cancel` 桥命令。
+net = ["dep:reqwest", "rtcl-core/net"]

@@ -10,6 +10,7 @@ members = [
     "crates/rtcl-wasm",
     "crates/rtcl-jit",
     "crates/rtcl-data",
+    "crates/rtcl-native",
 ]
 
 [workspace.package]
@@ -48,6 +49,7 @@ num-bigint = "0.4"
 num-traits = "0.2"
 num-integer = "0.1"
 rtcl-data = { path = "crates/rtcl-data" }
+rtcl-native = { path = "crates/rtcl-native" }
 sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"

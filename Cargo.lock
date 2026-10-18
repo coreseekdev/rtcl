@@ -1644,9 +1644,9 @@ dependencies = [
  "anyhow",
  "clap",
  "colored",
- "reqwest",
  "rtcl-core",
  "rtcl-expect",
+ "rtcl-native",
  "rtcl-parser",
  "rustyline",
 ]
@@ -1705,6 +1705,14 @@ dependencies = [
  "wasm-encoder 0.261.0",
  "wasmi",
  "wasmtime",
+]
+
+[[package]]
+name = "rtcl-native"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "rtcl-core",
 ]
 
 [[package]]

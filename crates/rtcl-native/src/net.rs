@@ -1,5 +1,6 @@
 //! native HTTP 宿主服务（`net` feature）：[`HostHttp`] 的 reqwest（blocking）
-//! 实现 + `__rtcl_http` / `__rtcl_http_cancel` 桥命令（rogo R0 探针，2026-10-18）。
+//! 实现 + `__rtcl_http` / `__rtcl_http_cancel` 桥命令。
+//! 由 rtcl-cli 与 rogo 等宿主消费（`rtcl_native::net::install`）。
 //!
 //! 事件面与 wasm 的 `www/http-bridge.js` 完全同形（Tcl 脚本无感）：
 //! - 逐块：宿主 set_var `::http_chunk` + `::http::ev_id`，再 re-entrant

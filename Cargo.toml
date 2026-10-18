@@ -62,5 +62,12 @@ codegen-units = 1    # Better optimization
 panic = "abort"      # Smaller binary
 strip = true         # Strip symbols
 
+# wasm 尺寸导向构建（rtcl-wasi guest）：
+#   cargo build -p rtcl-wasi --target wasm32-wasip1 --profile wasm-size
+# release 覆盖速度，wasm-size 覆盖体积（S2 bench 后决定默认用哪个）。
+[profile.wasm-size]
+inherits = "release"
+opt-level = "s"
+
 [profile.dev]
 opt-level = 0

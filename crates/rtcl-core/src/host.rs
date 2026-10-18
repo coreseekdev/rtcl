@@ -106,3 +106,58 @@ impl HostClock for NativeClock {
 /// 进程执行服务：`exec`/`open |cmd` 的宿主接缝（浏览器下不存在，
 /// 对应 feature 在 wasm 组合里天然缺席）。
 pub trait HostExec: Send {}
+
+// ---------------------------------------------------------------------------
+// HTTP 客户端服务（rogo R0 探针，2026-10-18）
+// ---------------------------------------------------------------------------
+
+/// HTTP 客户端服务：`http::*` 词表层（`crates/rtcl-core/src/http.tcl`）
+/// 在 native 侧的宿主接缝。
+///
+/// 形态约定：
+/// - **阻塞式流**：`request` 返回可逐块读取的响应体；宿主命令在读取循环里
+///   以 re-entrant `eval` 驱动 Tcl 回调（`::http::_delta` / `::http::_done`）。
+///   Tcl 层面的"异步"始终是回调 + 事件循环——与 wasm（JS fetch +
+///   `dispatch_event` 回灌）保持同一事件面，脚本无感。
+/// - **无 async/await**：native 实现用 blocking 客户端即可（rtcl-cli 的
+///   `net` feature 用 reqwest blocking，tokio 不进入 rtcl 依赖面）。
+/// - wasm 构建只携带本 trait（无实现）：JS 桥不经过它，走
+///   `__rtcl_http` + `post_event`/`dispatch_event`。
+pub trait HostHttp: Send {
+    /// 发起请求并返回流式响应；连接/构建失败立即 `Err(消息)`。
+    fn request(&self, req: &HttpRequest) -> Result<Box<dyn HttpResponse>, String>;
+}
+
+/// 一次 HTTP 请求（最小形状，wire 无关）。
+#[derive(Debug, Clone)]
+pub struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    /// 请求头（保序）。
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+    /// 总超时（毫秒；0 = 不设）。
+    pub timeout_ms: u64,
+    /// 是否跟随重定向（默认 true）。
+    pub follow_redirects: bool,
+}
+
+/// 流式响应：先拿 head（状态/头/final URL），再逐块 [`HttpResponse::read_chunk`]
+/// 直到 `Ok(None)`（EOF）。`Err` 即流中止（网络/超时/取消）。
+pub trait HttpResponse: Send {
+    fn status(&self) -> u16;
+    fn final_url(&self) -> String;
+    fn header(&self, name: &str) -> Option<String>;
+    fn headers(&self) -> Vec<(String, String)>;
+    /// 下一块原始字节；`Ok(None)` = 正常结束。
+    fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, String>;
+}
+
+/// 无网络服务占位（wasm / 未注入宿主）：请求即报错，绝不静默。
+pub struct NullHttp;
+
+impl HostHttp for NullHttp {
+    fn request(&self, _req: &HttpRequest) -> Result<Box<dyn HttpResponse>, String> {
+        Err("http service is not available in this host (native: build rtcl-cli with --features net)".to_string())
+    }
+}

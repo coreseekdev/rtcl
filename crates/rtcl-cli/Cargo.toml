@@ -21,7 +21,16 @@ annotate-snippets.workspace = true
 [features]
 default = []
 expect = ["rtcl-expect"]
+# native HTTP 宿主动力（reqwest blocking；rogo R0）。默认关闭，
+# 只有显式 `--features net` 的构建携带网络实现。
+net = ["dep:reqwest", "rtcl-core/net"]
 
 [dependencies.rtcl-expect]
+workspace = true
+optional = true
+
+# net feature：native HTTP 宿主实现（阻塞式、rustls）。版本与 feature 面
+# 由 workspace 统一钉定（rogo R0 探针，2026-10-18）。
+[dependencies.reqwest]
 workspace = true
 optional = true

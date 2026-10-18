@@ -38,6 +38,10 @@ default = ["rtcl_std"]
 std = []
 # Tcl standard library — all extensions combined
 rtcl_std = ["file", "io", "exec", "clock", "regexp", "env", "signal", "package"]
+# Native HTTP 宿主服务接缝（rogo R0）：trait 本身无条件编译；本 feature 供
+# CLI 侧转发/门控实现（reqwest）。刻意**不进** rtcl_std——默认构建零变化，
+# wasm 组合也不携带网络实现。
+net = ["std"]
 # Individual Tcl extensions (each implies Rust std)
 file = ["std", "dep:glob"]        # file, cd, pwd, glob, readdir, source
 io = ["std"]                      # channel I/O: open, close, read, gets, seek, tell, eof, flush, fconfigure, pid

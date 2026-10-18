@@ -10,6 +10,18 @@ use std::path::PathBuf;
 
 mod repl;
 
+#[cfg(feature = "net")]
+mod net;
+
+/// 构建解释器：`net` feature 下注入 native HTTP 宿主
+/// （HostHttp 实现 + `__rtcl_http`/`__rtcl_http_cancel` 桥 + `http::*` 词表）。
+fn new_interp() -> Interp {
+    let mut interp = Interp::new();
+    #[cfg(feature = "net")]
+    net::install(&mut interp);
+    interp
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "rtcl", about, version)]
 struct Args {
@@ -68,7 +80,7 @@ fn main() {
 }
 
 fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
-    let mut interp = Interp::new();
+    let mut interp = new_interp();
 
     // Set script name for info script command
     interp.set_script_name(&path.to_string_lossy());
@@ -92,7 +104,7 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
 }
 
 fn run_command(cmd: &str, quiet: bool) -> Result<(), String> {
-    let mut interp = Interp::new();
+    let mut interp = new_interp();
 
     let result = interp.eval(cmd)
         .map_err(|e| e.to_string())?;
@@ -118,7 +130,7 @@ fn run_repl(quiet: bool) -> Result<i32, String> {
     let mut rl: Editor<(), DefaultHistory> = Editor::with_config(config)
         .map_err(|e| format!("failed to create editor: {}", e))?;
 
-    let mut interp = Interp::new();
+    let mut interp = new_interp();
 
     // tclsh's interactive main loop runs with tcl_interactive = 1.
     let _ = interp.eval("set tcl_interactive 1");

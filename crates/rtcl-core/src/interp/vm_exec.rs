@@ -552,6 +552,15 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             OpCode::VarSetAddVV { set_site, expr_site, a, b, dst } => op_var_set_add_vv(
                 interp, code, st, *set_site, *expr_site, *a, *b, *dst,
             ),
+            // fib's per-call windows (×2/call) stay in the hot lane; the
+            // rest of the fib family rides `exec_op` (keeping the hot-lane
+            // match small measured faster for the fe/build loops).
+            OpCode::PushConstSubMark(idx) => {
+                op_push_const_sub_mark(st, code, *idx);
+                Ok(())
+            }
+            OpCode::SubSlotImm(a, k) => op_sub_slot_imm(interp, code, st, *a, *k),
+            OpCode::SubEndDynCall(argc) => op_sub_end_dyn_call(interp, st, *argc),
             OpCode::IncrLocalPop(slot, amount) => {
                 let _ = incr_local_value(interp, code, *slot, *amount)?;
                 Ok(())
@@ -1182,6 +1191,113 @@ fn op_var_set_add_vv(
     let name = code.get_const(dst).unwrap_or("");
     interp.set_var(name, v)?;
     Ok(())
+}
+
+/// `[PushConst i, SubMark]` — the name push plus the bracket region open.
+#[inline]
+fn op_push_const_sub_mark(st: &mut VmState, code: &ByteCode, idx: u16) {
+    op_push_const(st, code, idx);
+    st.bodies.push(Region::Sub(st.cur_site));
+}
+
+/// `[SubMark, BeginCmd s]` — the argument-bracket entry.
+#[inline]
+fn op_sub_mark_begin_cmd(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    site: u32,
+) -> Result<()> {
+    st.bodies.push(Region::Sub(st.cur_site));
+    op_begin_cmd(interp, code, st, site)
+}
+
+/// `[ExprMark, BeginCmd s, PushConst i]` — an expression operand's region
+/// open, command site and name push.
+#[inline]
+fn op_expr_mark_begin_push_const(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    site: u32,
+    idx: u16,
+) -> Result<()> {
+    st.bodies.push(Region::Expr(st.cur_site));
+    op_begin_cmd(interp, code, st, site)?;
+    op_push_const(st, code, idx);
+    Ok(())
+}
+
+/// `[LoadLocal a, PushInt k, Sub]` — slot minus immediate.
+#[inline]
+fn op_sub_slot_imm(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    k: i64,
+) -> Result<()> {
+    let va = slot_read_or_name(interp, code, a as usize)?;
+    let vb = Value::from_int(k);
+    let v = crate::types::expr_ops::numeric_binop(&va, &vb, '-')?;
+    st.stack.push(v);
+    Ok(())
+}
+
+/// `[LoadLocal a, LoadLocal b, Sub]` — slot minus slot.
+#[inline]
+fn op_sub_slot_slot(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    a: u16,
+    b: u16,
+) -> Result<()> {
+    let va = slot_read_or_name(interp, code, a as usize)?;
+    let vb = slot_read_or_name(interp, code, b as usize)?;
+    let v = crate::types::expr_ops::numeric_binop(&va, &vb, '-')?;
+    st.stack.push(v);
+    Ok(())
+}
+
+/// `[SubEnd, DynCall argc]` — close the bracket region, then dispatch the
+/// bracket-result call (the `DynCall` arm's exact body; the site cache
+/// keys on `st.pc - 1`, which now names this fused op — the first
+/// execution backfills it, every later one hits).
+#[inline]
+fn op_sub_end_dyn_call(
+    interp: &mut Interp,
+    st: &mut VmState,
+    argc: u16,
+) -> Result<()> {
+    op_sub_end(st);
+    let from = st.stack.len() - argc as usize;
+    st.collect_args_into_scratch(from);
+    let v = dispatch_site(interp, st, dispatch_dynamic)?;
+    st.stack.push(v);
+    Ok(())
+}
+
+/// `[SubEnd, Call { cmd_id, argc }]` — the cached-builtin twin.
+#[inline]
+fn op_sub_end_call(
+    interp: &mut Interp,
+    st: &mut VmState,
+    argc: u16,
+) -> Result<()> {
+    op_sub_end(st);
+    let from = st.stack.len() - argc as usize;
+    st.collect_args_into_scratch(from);
+    let v = dispatch_site(interp, st, dispatch_call)?;
+    st.stack.push(v);
+    Ok(())
+}
+
+/// `[SubEnd, Add]` — close the bracket region, then add.
+#[inline]
+fn op_sub_end_add(st: &mut VmState) -> Result<()> {
+    op_sub_end(st);
+    arith(st, '+')
 }
 
 /// `[Jump(t), ForeachNext]` (trampoline) with the body-mark folded in:
@@ -2154,6 +2270,16 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         OpCode::VarSetAddVV { set_site, expr_site, a, b, dst } => {
             op_var_set_add_vv(interp, code, st, *set_site, *expr_site, *a, *b, *dst)?
         }
+        OpCode::PushConstSubMark(idx) => op_push_const_sub_mark(st, code, *idx),
+        OpCode::SubMarkBeginCmd(site) => op_sub_mark_begin_cmd(interp, code, st, *site)?,
+        OpCode::ExprMarkBeginPushConst(site, idx) => {
+            op_expr_mark_begin_push_const(interp, code, st, *site, *idx)?
+        }
+        OpCode::SubSlotImm(a, k) => op_sub_slot_imm(interp, code, st, *a, *k)?,
+        OpCode::SubSlotSlot(a, b) => op_sub_slot_slot(interp, code, st, *a, *b)?,
+        OpCode::SubEndDynCall(argc) => op_sub_end_dyn_call(interp, st, *argc)?,
+        OpCode::SubEndCall { argc, .. } => op_sub_end_call(interp, st, *argc)?,
+        OpCode::SubEndAdd => op_sub_end_add(st)?,
         OpCode::AddVarVar(a, b) => op_add_var_var(interp, code, st, *a, *b)?,
         OpCode::AddVarImm(a, k) => op_add_var_imm(interp, code, st, *a, *k)?,
         OpCode::CmpVarVar(a, b, cc) => op_cmp_var_var(interp, code, st, *a, *b, *cc)?,
@@ -3308,6 +3434,7 @@ p 1";
         );
     }
 }
+
 
 
 

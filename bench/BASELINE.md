@@ -1527,6 +1527,28 @@ op_ne` 改为其薄包装，语义单一来源）；融合分支 op（`CmpSlot*/
 （起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
 build 1.29。）
 
+## Round M — fib 参数括号窗口族（2026-10-18，继续）
+
+fib 每次递归调用 26 op：新增 8 个窗口 op 折叠参数括号族——
+`PushConstSubMark`（命令名 push + bracket region）、`SubMarkBeginCmd`、
+`ExprMarkBeginPushConst`、`SubSlotImm/SubSlotSlot`（`$n-1` 形）、
+`SubEndDynCall/SubEndCall`（bracket 结果的 dispatch）、`SubEndAdd`——每次
+调用 26→17 op。dispatcher 的 site 缓存按 `st.pc-1` 键控：融合后自愈
+（首次 miss 回填融合 op 的 pc，之后命中）。
+
+热径布局调优（实测）：仅 `PushConstSubMark/SubSlotImm/SubEndDynCall`
+（fib ×2/调用）留在热径 match，其余走 `exec_op`——热径 match 保持小，
+fe/build 不因新 op 变慢（全放热径：fib 0.90x 但 fe/build +0.9%；全放
+exec_op：fe/build 恢复但 fib 0.92x；折中两者兼得）。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| L 后 | 0.95x | 0.93x | 0.68x | 0.51x | 0.70x | 0.73x |
+| M（本提交） | **0.90x** | 0.93x | 0.68x | 0.51x | 0.70x | 0.73x |
+
+（起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
+build 1.29。）
+
 ## Round L — word_srcs 借用切片（2026-10-18，继续）
 
 `Interp::cur_cmd_word_srcs` 从 `Rc<Vec<SrcSpan>>` 改为借用新类型

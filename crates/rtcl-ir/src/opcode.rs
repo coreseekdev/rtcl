@@ -667,6 +667,36 @@ pub enum OpCode {
         b: u16,
         dst: u16,
     },
+
+    /// Fusion of `[PushConst i, SubMark]` — the dispatch shape's name push
+    /// plus the bracket-word region open.
+    PushConstSubMark(u16),
+
+    /// Fusion of `[SubMark, BeginCmd s]` — open the bracket region, then
+    /// set the bracket command's site (the argument-bracket entry).
+    SubMarkBeginCmd(u32),
+
+    /// Fusion of `[ExprMark, BeginCmd s, PushConst i]` — the expression
+    /// operand's region open, its command's site, and its name push.
+    ExprMarkBeginPushConst(u32, u16),
+
+    /// `sub` superinstructions, the `AddSlot*` twins: `slots[a] - k` /
+    /// `slots[a] - slots[b]` with the result pushed (same operand-read
+    /// fallback as the `AddSlot*` forms).
+    SubSlotImm(u16, i64),
+    SubSlotSlot(u16, u16),
+
+    /// Fusion of `[SubEnd, DynCall argc]` — close the bracket region, then
+    /// dispatch the bracket-result call.
+    SubEndDynCall(u16),
+
+    /// Fusion of `[SubEnd, Call { cmd_id, argc }]` — the cached-builtin
+    /// twin of [`OpCode::SubEndDynCall`].
+    SubEndCall { cmd_id: u16, argc: u16 },
+
+    /// Fusion of `[SubEnd, Add]` — close the bracket region, then add the
+    /// two stack operands.
+    SubEndAdd,
     /// Enters an inline body reached by a *taken* jump (an `if`'s else
     /// body).  Every other inline body is entered by a not-taken
     /// `JumpFalse`/`JumpTrue`, which the executor uses to track which
@@ -907,6 +937,18 @@ impl fmt::Display for OpCode {
             OpCode::VarSetAddVV { set_site, expr_site, a, b, dst } => {
                 write!(f, "SET_VV_ADD {} {} {} {} -> {}", set_site, expr_site, a, b, dst)
             }
+            OpCode::PushConstSubMark(i) => write!(f, "PUSH_CONST_SUB {}", i),
+            OpCode::SubMarkBeginCmd(site) => write!(f, "SUB_MARK_BEGIN {}", site),
+            OpCode::ExprMarkBeginPushConst(site, i) => {
+                write!(f, "EXPR_MARK_BEGIN_PUSH {} {}", site, i)
+            }
+            OpCode::SubSlotImm(a, k) => write!(f, "SUB_SI {} {}", a, k),
+            OpCode::SubSlotSlot(a, b) => write!(f, "SUB_SS {} {}", a, b),
+            OpCode::SubEndDynCall(argc) => write!(f, "SUB_END_DYNCALL {}", argc),
+            OpCode::SubEndCall { cmd_id, argc } => {
+                write!(f, "SUB_END_CALL {} {}", cmd_id, argc)
+            }
+            OpCode::SubEndAdd => write!(f, "SUB_END_ADD"),
             OpCode::BodyMark => write!(f, "BODY_MARK"),
             OpCode::NextMark => write!(f, "NEXT_MARK"),
             OpCode::SubMark => write!(f, "SUB_MARK"),

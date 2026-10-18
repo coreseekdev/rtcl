@@ -199,6 +199,10 @@ impl Compiler {
             | OpCode::BeginCmdIncrLocalPop(_, _, _) | OpCode::BeginCmdIncrVarPop(_, _, _)
             | OpCode::ForeachNextClose(_, _)
             | OpCode::SlotSetAddSS { .. } | OpCode::VarSetAddVV { .. }
+            | OpCode::PushConstSubMark(_) | OpCode::SubMarkBeginCmd(_)
+            | OpCode::ExprMarkBeginPushConst(_, _)
+            | OpCode::SubSlotImm(_, _) | OpCode::SubSlotSlot(_, _)
+            | OpCode::SubEndDynCall(_) | OpCode::SubEndCall { .. } | OpCode::SubEndAdd
             | OpCode::BodyMark | OpCode::NextMark
             | OpCode::SubMark | OpCode::SubEnd | OpCode::ExprMark
             | OpCode::Call { .. } | OpCode::CallExpand { .. }
@@ -1578,9 +1582,12 @@ mod tests {
         let src = "set s [expr {[f 1] + [f 2]}]";
         let bc = Compiler::compile_script(src).unwrap();
         let ops = bc.ops();
-        assert!(ops
-            .iter()
-            .any(|o| matches!(o, OpCode::ExprMark | OpCode::ExprMarkBeginCmd(_))));
+        assert!(ops.iter().any(|o| matches!(
+            o,
+            OpCode::ExprMark
+                | OpCode::ExprMarkBeginCmd(_)
+                | OpCode::ExprMarkBeginPushConst(_, _)
+        )));
         assert!(ops.iter().any(|o| matches!(o, OpCode::Add)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalScript)));

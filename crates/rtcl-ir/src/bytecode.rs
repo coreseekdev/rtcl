@@ -525,6 +525,39 @@ impl ByteCode {
                 (OpCode::SubEnd, OpCode::Return) if !targets[i + 1] => {
                     Some((OpCode::SubEndReturn, 2))
                 }
+                // ── fib-family windows (arg brackets, sub exprs) ────────
+                (OpCode::PushConst(idx), OpCode::SubMark) if !targets[i + 1] => {
+                    Some((OpCode::PushConstSubMark(*idx), 2))
+                }
+                (OpCode::SubMark, OpCode::BeginCmd(site)) if !targets[i + 1] => {
+                    Some((OpCode::SubMarkBeginCmd(*site), 2))
+                }
+                (OpCode::ExprMarkBeginCmd(site), OpCode::PushConst(idx))
+                    if !targets[i + 1] =>
+                {
+                    Some((OpCode::ExprMarkBeginPushConst(*site, *idx), 2))
+                }
+                (OpCode::LoadLocal(a), OpCode::PushInt(k)) if tail_free(3) => {
+                    match self.ops[i + 2] {
+                        OpCode::Sub => Some((OpCode::SubSlotImm(*a, *k), 3)),
+                        _ => None,
+                    }
+                }
+                (OpCode::LoadLocal(a), OpCode::LoadLocal(b)) if tail_free(3) => {
+                    match self.ops[i + 2] {
+                        OpCode::Sub => Some((OpCode::SubSlotSlot(*a, *b), 3)),
+                        _ => None,
+                    }
+                }
+                (OpCode::SubEnd, OpCode::DynCall { argc }) if !targets[i + 1] => {
+                    Some((OpCode::SubEndDynCall(*argc), 2))
+                }
+                (OpCode::SubEnd, OpCode::Call { cmd_id, argc }) if !targets[i + 1] => {
+                    Some((OpCode::SubEndCall { cmd_id: *cmd_id, argc: *argc }, 2))
+                }
+                (OpCode::SubEnd, OpCode::Add) if !targets[i + 1] => {
+                    Some((OpCode::SubEndAdd, 2))
+                }
                 // ── statement windows (4-op) ────────────────────────────
                 (
                     OpCode::BeginCmdSubMark(s1),
@@ -710,6 +743,14 @@ impl ByteCode {
                     | OpCode::ForeachNextClose(..)
                     | OpCode::SlotSetAddSS { .. }
                     | OpCode::VarSetAddVV { .. }
+                    | OpCode::PushConstSubMark(..)
+                    | OpCode::SubMarkBeginCmd(..)
+                    | OpCode::ExprMarkBeginPushConst(..)
+                    | OpCode::SubSlotImm(..)
+                    | OpCode::SubSlotSlot(..)
+                    | OpCode::SubEndDynCall(..)
+                    | OpCode::SubEndCall { .. }
+                    | OpCode::SubEndAdd
             )
         })
     }
@@ -860,6 +901,41 @@ impl ByteCode {
                     out.push(OpCode::Add);
                     out.push(OpCode::SubEnd);
                     out.push(OpCode::StoreVarPop(*dst));
+                }
+                OpCode::PushConstSubMark(i) => {
+                    out.push(OpCode::PushConst(*i));
+                    out.push(OpCode::SubMark);
+                }
+                OpCode::SubMarkBeginCmd(site) => {
+                    out.push(OpCode::SubMark);
+                    out.push(OpCode::BeginCmd(*site));
+                }
+                OpCode::ExprMarkBeginPushConst(site, i) => {
+                    out.push(OpCode::ExprMark);
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::PushConst(*i));
+                }
+                OpCode::SubSlotImm(a, k) => {
+                    out.push(OpCode::LoadLocal(*a));
+                    out.push(OpCode::PushInt(*k));
+                    out.push(OpCode::Sub);
+                }
+                OpCode::SubSlotSlot(a, b) => {
+                    out.push(OpCode::LoadLocal(*a));
+                    out.push(OpCode::LoadLocal(*b));
+                    out.push(OpCode::Sub);
+                }
+                OpCode::SubEndDynCall(argc) => {
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::DynCall { argc: *argc });
+                }
+                OpCode::SubEndCall { cmd_id, argc } => {
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::Call { cmd_id: *cmd_id, argc: *argc });
+                }
+                OpCode::SubEndAdd => {
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::Add);
                 }
                 // The name-keyed superinstructions themselves predate the
                 // fusion only as windows — expand them back too.
@@ -1438,6 +1514,14 @@ mod tests {
                 OpCode::ForeachNextClose(1, 2),
                 OpCode::SlotSetAddSS { set_site: 1, expr_site: 2, a: 3, b: 4, dst: 5 },
                 OpCode::VarSetAddVV { set_site: 1, expr_site: 2, a: 3, b: 4, dst: 5 },
+                OpCode::PushConstSubMark(1),
+                OpCode::SubMarkBeginCmd(1),
+                OpCode::ExprMarkBeginPushConst(1, 2),
+                OpCode::SubSlotImm(1, 2),
+                OpCode::SubSlotSlot(1, 2),
+                OpCode::SubEndDynCall(2),
+                OpCode::SubEndCall { cmd_id: 1, argc: 2 },
+                OpCode::SubEndAdd,
                 OpCode::Return,
             ],
             false,

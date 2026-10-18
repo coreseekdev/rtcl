@@ -95,6 +95,10 @@ pub fn execute(ctx: &mut dyn VmContext, code: &ByteCode) -> Result<Value> {
             | OpCode::BeginCmdIncrLocalPop(..) | OpCode::BeginCmdIncrVarPop(..)
             | OpCode::ForeachNextClose(..)
             | OpCode::SlotSetAddSS { .. } | OpCode::VarSetAddVV { .. }
+            | OpCode::PushConstSubMark(..) | OpCode::SubMarkBeginCmd(..)
+            | OpCode::ExprMarkBeginPushConst(..)
+            | OpCode::SubSlotImm(..) | OpCode::SubSlotSlot(..)
+            | OpCode::SubEndDynCall(..) | OpCode::SubEndCall { .. } | OpCode::SubEndAdd
             | OpCode::BodyMarkFramed => {
                 return Err(Error::runtime(
                     "lappend ops are not supported here",

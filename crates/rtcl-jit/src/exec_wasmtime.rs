@@ -80,8 +80,10 @@ pub fn execute(
             c.data_mut().box_float_raw(f)
         })
         .unwrap();
+    let caching_bin = g_caching.clone();
     linker
-        .func_wrap("rtcl", "binary_op", |mut c: Caller<'_, Host>, op: i32, a: i64, b: i64| -> i64 {
+        .func_wrap("rtcl", "binary_op", move |mut c: Caller<'_, Host>, op: i32, a: i64, b: i64| -> i64 {
+            let _ = caching_bin.set(&mut c, Val::I32(0));
             c.data_mut().binary_op_raw(op, a, b)
         })
         .unwrap();
@@ -189,18 +191,24 @@ pub fn execute(
             c.data_mut().foreach_end_raw()
         })
         .unwrap();
+    let caching_es = g_caching.clone();
     linker
-        .func_wrap("rtcl", "eval_script", |mut c: Caller<'_, Host>, v: i64| -> i64 {
+        .func_wrap("rtcl", "eval_script", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
+            let _ = caching_es.set(&mut c, Val::I32(0));
             c.data_mut().eval_script_raw(v)
         })
         .unwrap();
+    let caching_ee = g_caching.clone();
     linker
-        .func_wrap("rtcl", "eval_expr", |mut c: Caller<'_, Host>, v: i64| -> i64 {
+        .func_wrap("rtcl", "eval_expr", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
+            let _ = caching_ee.set(&mut c, Val::I32(0));
             c.data_mut().eval_expr_raw(v)
         })
         .unwrap();
+    let caching_lap = g_caching.clone();
     linker
-        .func_wrap("rtcl", "lappend_var", |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i64 {
+        .func_wrap("rtcl", "lappend_var", move |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i64 {
+            let _ = caching_lap.set(&mut c, Val::I32(0));
             c.data_mut().lappend_var_raw(name_h, v)
         })
         .unwrap();

@@ -250,6 +250,8 @@ pub enum Instr {
     ForeachStart { info: u32, ngroups: u16, counter: u32, srcs: Vec<Reg>, fail: u32 },
     /// ForeachStep：counter+1 → i；bb = (i < iters)。
     ForeachStep { counter: u32, b: BReg },
+    /// ForeachEntry：bb = (i < iters)（不自增——循环首检查）。
+    ForeachEntry { counter: u32, b: BReg },
     /// ForeachBind：宿主 bind(i)（含 framed 错误装饰复刻）。
     ForeachBind { info: u32, counter: u32, fail: u32 },
     /// ForeachCollect（lmap）：弹值入宿主 collected。

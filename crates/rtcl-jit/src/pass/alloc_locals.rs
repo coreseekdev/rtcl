@@ -32,10 +32,12 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
     let mut depth = 0u32;
     let mut max_depth = 0u32;
     let mut depth_at = vec![0u32; n];
+    let mut after_at = vec![0u32; n];
     let mut reads: Vec<Vec<u32>> = Vec::with_capacity(n);
     let mut writes: Vec<Option<u32>> = Vec::with_capacity(n);
     let mut edges: Vec<Vec<u32>> = Vec::with_capacity(n);
     let mut backedges: Vec<Backedge> = Vec::new();
+    let mut pending_backedges: Vec<(u32, u32)> = Vec::new();
 
     // 上下文模拟状态（与 vm_exec 的 bodies/cur_site 纪律逐条对齐）。
     let mut cur_site: u32 = u32::MAX;
@@ -87,6 +89,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             OpCode::StoreVar(_) => (vec![depth - 1], None),
             OpCode::LappendVar(_) => (vec![depth - 1], Some(depth - 1)),
             OpCode::Neg | OpCode::Not | OpCode::BitNot => (vec![depth - 1], Some(depth - 1)),
+            OpCode::EvalScript | OpCode::EvalExpr => (vec![depth - 1], Some(depth - 1)),
             OpCode::Call { .. } | OpCode::DynCall { .. } => {
                 ((base..depth).collect(), Some(base))
             }
@@ -95,6 +98,9 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             OpCode::ForeachEnd => (vec![], Some(depth)),
             OpCode::JumpTrue(_) | OpCode::JumpFalse(_) | OpCode::Return => (vec![depth - 1], None),
             _ if pops == 0 && pushes == 1 => (vec![], Some(depth)),
+            // break/continue 之后的死代码：线性深度下溢——读集置空
+            //（op 不可达，寄存器引用无意义）。
+            _ if pops as u32 > depth => (vec![], None),
             _ if pops == 2 && pushes == 1 => (vec![depth - 2, depth - 1], Some(depth - 2)),
             _ if pops == 1 && pushes == 0 => (vec![depth - 1], None),
             _ => (vec![], None),
@@ -215,9 +221,9 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
         };
         for &t in &edge {
             if t <= pc as u32 {
-                // 回边 = fuel 计步点：失败上下文同本 op（追加表项）。
-                let bf = snap(pc, cur_site, &bodies, false, FailKind::Cold, &mut fails);
-                backedges.push(Backedge { src: pc as u32, target: t, fail: bf });
+                // 回边 = fuel 计步点：失败上下文在上下文推进之后快照
+                // （vm_exec 的 charge 在 Jump 弹 body 之后——帧态一致）。
+                pending_backedges.push((pc as u32, t));
             }
         }
         edges.push(edge);
@@ -269,7 +275,15 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             _ => {}
         }
 
+        for &(src, t) in &pending_backedges {
+            if src == pc as u32 {
+                let bf = snap(pc, cur_site, &bodies, false, FailKind::Cold, &mut fails);
+                backedges.push(Backedge { src, target: t, fail: bf });
+            }
+        }
+        pending_backedges.retain(|(src, _)| *src != pc as u32);
         depth = base + pushes;
+        after_at[pc] = depth;
         max_depth = max_depth.max(depth);
         reads.push(r);
         writes.push(w);
@@ -280,7 +294,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
     //     必须由目标处起连续的 POP 吸收（读到的旧槽即被丢弃）；
     // (b) Break/Continue 截断到循环入口深度（vm_exec 的 stack_len 纪律）。
     for (pc, e) in edges.iter().enumerate() {
-        let after = depth_after(&l1.ops[pc].op, depth_at[pc]);
+        let after = after_at[pc];
         let is_bc = matches!(l1.ops[pc].op, OpCode::Break | OpCode::Continue);
         for &t in e {
             let Some(tu) = (t as usize).checked_sub(0).filter(|x| *x < n) else {
@@ -326,7 +340,3 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
     })
 }
 
-fn depth_after(op: &OpCode, before: u32) -> u32 {
-    let (pops, pushes) = stack_effect(op);
-    before - pops.min(before) + pushes
-}

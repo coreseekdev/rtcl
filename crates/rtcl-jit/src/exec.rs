@@ -198,6 +198,21 @@ impl Host {
             0 => e,
             k => return k,
         };
+        // 宿主原语错误也可能已在 interp 累积帧（如 trace 脚本失败）——
+        // 哨兵取出作为基底（无累积器时 = 消息文本，两种情形同构）。
+        {
+            const SENT: &str = "\u{0}j";
+            let raw = self.interp.error_report(&e, SENT);
+            let tail = format!("\n    (file \"{}\" line ", SENT);
+            let base = match raw.rfind(&tail) {
+                Some(i) => Some(raw[..i].to_string()),
+                None if raw != e.to_string() => Some(raw),
+                None => None,
+            };
+            if let Some(b) = base {
+                self.info = Some(b);
+            }
+        }
         let fi = self.fails.get(fail_id as usize).cloned();
         if let Some(fi) = fi {
             let frameless = fi
@@ -234,6 +249,12 @@ impl Host {
             if let Some(fi) = self.fails.get(fid as usize).cloned() {
                 let text = self.site_text(fi.site).to_string();
                 let line = self.lines.get(fi.site as usize).copied().unwrap_or(0) as usize;
+                // err_line 初始化 = 最内层失败帧的行（vm_exec 的 err_line
+                // 由嵌套 eval 的最后一次 append 设置；此处以 fail 站点行
+                // 近似——exit_frame 在 harness append 之前读取它）。
+                if self.info.is_some() {
+                    self.err_line = line;
+                }
                 match fi.kind {
                     crate::ir::FailKind::EvalExpr => {
                         let msg = e.message_text();
@@ -247,7 +268,15 @@ impl Host {
                 self.unwind(&fi.bodies, e);
             }
         }
-        if let Some((t, l)) = pending_frame.take() {
+        // pending 帧最终追加（vm_exec error_report 的 drain 语义）：
+        // unwind 的 Sub 覆盖 step-1 的 word pending（外层胜出）。
+        // pending_top 只带文本（无行——unwind 已设置 err_line）。
+        let mut pending_final = pending_frame;
+        if let Some(t) = self.pending_top.take() {
+            let l = self.err_line;
+            pending_final = Some((t, l));
+        }
+        if let Some((t, l)) = pending_final {
             if let Some(info) = &mut self.info {
                 info.push_str(&format!(
                     "\n    invoked from within\n\"{}\"",
@@ -407,6 +436,40 @@ impl Host {
     // ── 宿主逻辑（引擎无关；各引擎的 import 包装只做参数搬运）──────
 
     pub fn binary_op_raw(&mut self, op: i32, a: i64, b: i64) -> i64 {
+        let r = self.do_binary_op(op, a, b);
+        r
+    }
+
+    fn do_binary_op(&mut self, op: i32, a: i64, b: i64) -> i64 {
+        let r = self.binary_op_impl(op, a, b);
+        // 布尔值域 op（比较/逻辑）归一为 imm 0/1——vm_exec 的 op_eq/
+        // op_rel 直接 from_bool（imm）；eval_expr 路由可能产出字符串
+        // 形态（"0"/"1"），下游 BoolOfBool/BoolTest 的 tagged-0/1 假设
+        // 依赖 imm 形状。
+        const BOOL_OPS: &[i32] = &[
+            14, 15, 16, 17, 18, 19, 20, 21, 22, 23, // Eq Ne Lt Gt Le Ge StrEq StrNe And Or
+        ];
+        if BOOL_OPS.contains(&op) {
+            if let Ok(v) = self.value_of_result(r) {
+                if let Some(i) = v.as_int() {
+                    return abi::tag_imm(i.clamp(0, 1));
+                }
+            }
+        }
+        r
+    }
+
+    fn value_of_result(&self, tagged: i64) -> Result<Value, ()> {
+        if tagged & 1 == 1 {
+            return Ok(Value::from_imm(abi::untag(tagged)));
+        }
+        self.arena
+            .get((tagged >> 1) as usize)
+            .cloned()
+            .ok_or(())
+    }
+
+    fn binary_op_impl(&mut self, op: i32, a: i64, b: i64) -> i64 {
         match self.binary_op(op, a, b) {
             Ok(v) => self.tag_value(&v),
             Err(e) => {
@@ -419,7 +482,10 @@ impl Host {
     pub fn get_var_raw(&mut self, name_h: i32) -> i64 {
         let name = self.const_name(name_h);
         match self.interp.read_var(&name) {
-            Ok(v) => self.tag_value(&v),
+            Ok(v) => {
+                let t = self.tag_value(&v);
+                t
+            }
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: false });
                 abi::ERR_SENTINEL
@@ -959,8 +1025,11 @@ fn execute(
             c.data_mut().box_float_raw(f)
         })
         .unwrap();
+    let g_caching_bin = g_caching.clone();
     linker
-        .func_wrap("rtcl", "binary_op", |mut c: Caller<'_, Host>, op: i32, a: i64, b: i64| -> i64 {
+        .func_wrap("rtcl", "binary_op", move |mut c: Caller<'_, Host>, op: i32, a: i64, b: i64| -> i64 {
+            // 表达式可含 [cmd] 替换——缓存窗口关闭。
+            let _ = g_caching_bin.set(&mut c, wasmi::Val::I32(0));
             c.data_mut().binary_op_raw(op, a, b)
         })
         .unwrap();
@@ -1048,6 +1117,7 @@ fn execute(
             "foreach_start",
             move |mut c: Caller<'_, Host>, info: i32, base: i32, ngroups: i32| -> i64 {
                 let words = read_words(&c, base, ngroups);
+                let _ = g_caching_fe.set(&mut c, wasmi::Val::I32(0));
                 c.data_mut().foreach_start_raw(info, &words)
             },
         )
@@ -1073,18 +1143,24 @@ fn execute(
             c.data_mut().foreach_end_raw()
         })
         .unwrap();
+    let g_caching_lap = g_caching.clone();
     linker
-        .func_wrap("rtcl", "lappend_var", |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i64 {
+        .func_wrap("rtcl", "lappend_var", move |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i64 {
+            let _ = g_caching_lap.set(&mut c, wasmi::Val::I32(0));
             c.data_mut().lappend_var_raw(name_h, v)
         })
         .unwrap();
+    let g_caching_es = g_caching.clone();
     linker
-        .func_wrap("rtcl", "eval_script", |mut c: Caller<'_, Host>, v: i64| -> i64 {
+        .func_wrap("rtcl", "eval_script", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
+            let _ = g_caching_es.set(&mut c, wasmi::Val::I32(0));
             c.data_mut().eval_script_raw(v)
         })
         .unwrap();
+    let g_caching_ee = g_caching.clone();
     linker
-        .func_wrap("rtcl", "eval_expr", |mut c: Caller<'_, Host>, v: i64| -> i64 {
+        .func_wrap("rtcl", "eval_expr", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
+            let _ = g_caching_ee.set(&mut c, wasmi::Val::I32(0));
             c.data_mut().eval_expr_raw(v)
         })
         .unwrap();

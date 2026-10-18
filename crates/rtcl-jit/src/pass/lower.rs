@@ -134,6 +134,8 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
                     ctx.placed[end as usize] = true; // ForeachEnd 由模板发射
                     // —— 标记已放置，pc 跳过。
                 }
+                let ebreg = BReg(ctx.bregs);
+                ctx.bregs += 1;
                 items.push(L3::Seq(vec![
                     L3::Instr(Instr::ForeachStart {
                         info,
@@ -145,7 +147,18 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
                     L3::Loop {
                         header,
                         exit: end,
-                        body: Box::new(body),
+                        body: Box::new(L3::Seq(vec![
+                            L3::Instr(Instr::ForeachEntry { counter, b: ebreg }),
+                            L3::BrIf {
+                                target: end,
+                                depth: 0,
+                                cond: ebreg,
+                                when_zero: true,
+                                backedge: false,
+                                fail: 0,
+                            },
+                            body,
+                        ])),
                     },
                     // ForeachEnd（brk 出口与正常出口都在此汇合）。
                     L3::Instr(Instr::ForeachEnd {
@@ -161,35 +174,28 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
                 let breg = BReg(ctx.bregs);
                 ctx.bregs += 1;
                 let fail = ctx.l2.fail_of[pc as usize].unwrap_or(0);
-                let end_t = ctx
-                    .l2
-                    .edges[pc as usize]
-                    .first()
-                    .copied()
-                    .unwrap_or(pc as u32 + 1);
+                // done → br 到循环出口（= ForeachEnd 处的 exit 标签）；
+                // 继续迭代 → bind + br header（fuel 由 instrument 织入）。
+                let end_t = ctx.loops.last().map(|(_, b)| *b).unwrap_or(pc as u32 + 1);
                 let counter = foreach_counter_of(ctx, info);
-                items.push(L3::Block {
-                    cont: end_t,
-                    body: Box::new(L3::Seq(vec![
-                        L3::Instr(Instr::ForeachStep { counter, b: breg }),
-                        L3::BrIf {
-                            target: end_t,
-                            depth: 0,
-                            cond: breg,
-                            when_zero: true,
-                            backedge: false,
-                            fail: 0,
-                        },
-                        L3::Instr(Instr::ForeachBind { info, counter, fail }),
-                        L3::Instr(Instr::BackedgeFuel { fail }),
-                        L3::Br {
-                            target: body_t,
-                            depth: 0,
-                            backedge: true,
-                            fail,
-                        },
-                    ])),
-                });
+                items.push(L3::Seq(vec![
+                    L3::Instr(Instr::ForeachStep { counter, b: breg }),
+                    L3::BrIf {
+                        target: end_t,
+                        depth: 0,
+                        cond: breg,
+                        when_zero: true,
+                        backedge: false,
+                        fail: 0,
+                    },
+                    L3::Instr(Instr::ForeachBind { info, counter, fail }),
+                    L3::Br {
+                        target: body_t,
+                        depth: 0,
+                        backedge: true,
+                        fail,
+                    },
+                ]));
                 pc += 1;
             }
             OpCode::Jump(t) => {

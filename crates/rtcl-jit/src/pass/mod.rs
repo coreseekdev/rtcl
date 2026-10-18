@@ -61,7 +61,10 @@ pub fn classify(op: &rtcl_ir::opcode::OpCode) -> Option<Flow> {
         | O::Mul | O::Div | O::Mod | O::Pow | O::Neg | O::Not | O::And | O::Or
         | O::BitAnd | O::BitOr | O::BitXor | O::BitNot | O::Shl | O::Shr | O::Eq
         | O::Ne | O::Lt | O::Gt | O::Le | O::Ge | O::StrEq | O::StrNe
-        | O::Call { .. } => Flow::Fall,
+        | O::Call { .. } | O::DynCall { .. } | O::Concat(_) | O::EvalScript
+        | O::EvalExpr | O::LappendVar(_)
+        | O::ForeachStart { .. } | O::ForeachNext { .. } | O::ForeachCollect
+        | O::ForeachEnd | O::BodyMarkFramed => Flow::Fall,
         O::Jump(t) => Flow::Jump(*t),
         O::JumpTrue(t) => Flow::Cond(*t, true),
         O::JumpFalse(t) => Flow::Cond(*t, false),
@@ -90,6 +93,10 @@ pub fn stack_effect(op: &rtcl_ir::opcode::OpCode) -> (u32, u32) {
         | O::Gt | O::Le | O::Ge | O::StrEq | O::StrNe => (2, 1),
         O::Neg | O::Not | O::BitNot => (1, 1),
         O::Call { argc, .. } | O::DynCall { argc } => (*argc as u32, 1),
+        O::Concat(n) => (*n as u32, 1),
+        O::EvalScript | O::EvalExpr => (1, 1),
+        O::ForeachCollect => (1, 0),
+        O::LappendVar(_) => (1, 1),
         _ => (0, 0),
     }
 }

@@ -169,7 +169,15 @@ fn count_bregs(l3: &L3) -> u32 {
         if let L3::If { cond, .. } = n {
             max = max.max(cond.0 + 1);
         }
-        if let L3::Instr(Instr::BoolTest { dst, .. }) = n {
+        if let L3::BrIf { cond, .. } = n {
+            max = max.max(cond.0 + 1);
+        }
+        if let L3::Instr(
+            Instr::BoolTest { dst, .. }
+            | Instr::ForeachEntry { b: dst, .. }
+            | Instr::ForeachStep { b: dst, .. },
+        ) = n
+        {
             max = max.max(dst.0 + 1);
         }
     });
@@ -192,7 +200,7 @@ fn walk(n: &L3, f: &mut impl FnMut(&L3)) {
 fn emit_node(n: &L3, e: &Env, f: &mut Function) {
     match n {
         L3::Seq(items) => items.iter().for_each(|i| emit_node(i, e, f)),
-        L3::If { cond, then_, else_, .. } => {
+        L3::If { cond, then_, else_, j } => {
             f.instruction(&Instruction::LocalGet(e.b(cond.0)));
             f.instruction(&Instruction::If(BlockType::Empty));
             emit_node(then_, e, f);
@@ -213,7 +221,7 @@ fn emit_node(n: &L3, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::End);
         }
         L3::Br { depth, .. } => { f.instruction(&Instruction::Br(*depth)); }
-        L3::BrIf { depth, cond, when_zero, .. } => {
+        L3::BrIf { depth, cond, when_zero, target, .. } => {
             f.instruction(&Instruction::LocalGet(e.b(cond.0)));
             if *when_zero {
                 f.instruction(&Instruction::I32Eqz);
@@ -282,20 +290,22 @@ fn retag_in_place(f: &mut Function, reg: u32) {
 /// 「range 不 ok 则 fallthrough 到 slow」的复合片段：跳转目标 = 1（外层
 /// slow block 的内层 ok block 由调用方保证）。约定：调用方提供
 /// `block $ok { … }` 包裹快车道，range-bad 时 `br 1`（跳到 slow）。
-fn range_guard_br_slow(f: &mut Function, reg: u32, scratch: u32) {
+/// 范围检查（结果须落 [-2^62, 2^62)，即 >>62 ∈ {0,-1}）；不满足 →
+/// br 0（慢路径）。免临时寄存器（重算两次 shift——不占 scratch/
+/// epoch_home，避免与持有中的计算结果/epoch 快照冲突）。
+fn range_guard_br_slow(f: &mut Function, reg: u32) {
     f.instruction(&Instruction::LocalGet(reg));
     f.instruction(&Instruction::I64Const(62));
     f.instruction(&Instruction::I64ShrS);
-    f.instruction(&Instruction::LocalSet(scratch));
-    // ok = (t == 0) | (t == -1)；!ok → br 1（slow）
-    f.instruction(&Instruction::LocalGet(scratch));
     f.instruction(&Instruction::I64Eqz);
-    f.instruction(&Instruction::LocalGet(scratch));
+    f.instruction(&Instruction::LocalGet(reg));
+    f.instruction(&Instruction::I64Const(62));
+    f.instruction(&Instruction::I64ShrS);
     f.instruction(&Instruction::I64Const(-1));
     f.instruction(&Instruction::I64Eq);
     f.instruction(&Instruction::I32Or);
     f.instruction(&Instruction::I32Eqz);
-    f.instruction(&Instruction::BrIf(1));
+    f.instruction(&Instruction::BrIf(0));
 }
 
 fn imm_guard_br_slow(f: &mut Function, reg: u32) {
@@ -303,7 +313,10 @@ fn imm_guard_br_slow(f: &mut Function, reg: u32) {
     f.instruction(&Instruction::I64Const(1));
     f.instruction(&Instruction::I64And);
     f.instruction(&Instruction::I64Eqz);
-    f.instruction(&Instruction::BrIf(1));
+    // 非立即数 → br 0：退出内层 slow/host 块，落到慢路径（br 1 会
+    // 跳过慢代码直达 done——M1' 遗留极性反转，长期被 Call-in-Sub 拒绝
+    // 造成的回落掩盖）。
+    f.instruction(&Instruction::BrIf(0));
 }
 
 /// retag( (i32 bool) → tagged i64 )：值在 i32 栈顶。
@@ -422,7 +435,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::I64Const(*amount));
             f.instruction(&Instruction::I64Add);
             f.instruction(&Instruction::LocalSet(dst.0));
-            range_guard_br_slow(f, dst.0, e.scratch);
+            range_guard_br_slow(f, dst.0);
             retag_in_place(f, dst.0);
             st64_local(f, vals, dst.0);
             st8(f, state, 2);
@@ -569,6 +582,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                     memory_index: 0,
                 }));
             }
+            emit_flush(e, f, *fail);
             f.instruction(&Instruction::I32Const(*info as i32));
             f.instruction(&Instruction::I32Const(cache::SCRATCH as i32));
             f.instruction(&Instruction::I32Const(srcs.len() as i32));
@@ -582,6 +596,14 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::LocalSet(e.foreach_base + counter * 2 + 1));
             f.instruction(&Instruction::I64Const(0));
             f.instruction(&Instruction::LocalSet(e.foreach_base + counter * 2));
+        }
+        Instr::ForeachEntry { counter, b } => {
+            let li = e.foreach_base + counter * 2;
+            let lt = li + 1;
+            f.instruction(&Instruction::LocalGet(li));
+            f.instruction(&Instruction::LocalGet(lt));
+            f.instruction(&Instruction::I64LtS);
+            f.instruction(&Instruction::LocalSet(e.b(b.0)));
         }
         Instr::ForeachStep { counter, b } => {
             // i += 1；bb = (i < iters)。
@@ -600,6 +622,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             emit_flush(e, f, *fail);
             f.instruction(&Instruction::I32Const(*info as i32));
             f.instruction(&Instruction::LocalGet(e.foreach_base + counter * 2));
+            f.instruction(&Instruction::I32WrapI64);
             f.instruction(&Instruction::Call(import::FOREACH_BIND));
             f.instruction(&Instruction::LocalSet(e.scratch));
             check_sentinel(e, f, e.scratch, *fail);
@@ -613,12 +636,14 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::LocalSet(dst.0));
         }
         Instr::EvalScript { dst, src, fail } => {
+            emit_flush(e, f, *fail);
             f.instruction(&Instruction::LocalGet(src.0));
             f.instruction(&Instruction::Call(import::EVAL_SCRIPT));
             f.instruction(&Instruction::LocalSet(dst.0));
             check_sentinel(e, f, dst.0, *fail);
         }
         Instr::EvalExpr { dst, src, fail } => {
+            emit_flush(e, f, *fail);
             f.instruction(&Instruction::LocalGet(src.0));
             f.instruction(&Instruction::Call(import::EVAL_EXPR));
             f.instruction(&Instruction::LocalSet(dst.0));
@@ -676,6 +701,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
 }
 
 fn call_binary_op(op: BinOp, a: u32, b: u32, dst: u32, fail: u32, e: &Env, f: &mut Function) {
+    emit_flush(e, f, fail);
     f.instruction(&Instruction::I32Const(op as i32));
     f.instruction(&Instruction::LocalGet(a));
     f.instruction(&Instruction::LocalGet(b));
@@ -719,14 +745,15 @@ fn emit_unary(kind: BinOp, dst: u32, a: u32, fail: u32, e: &Env, f: &mut Functio
     imm_guard_br_slow(f, a);
     match kind {
         BinOp::Neg => {
-            // 0 - untag(a)
             f.instruction(&Instruction::I64Const(0));
             f.instruction(&Instruction::LocalGet(a));
             f.instruction(&Instruction::I64Const(1));
             f.instruction(&Instruction::I64ShrS);
             f.instruction(&Instruction::I64Sub);
+            f.instruction(&Instruction::LocalSet(e.scratch));
+            range_guard_br_slow(f, e.scratch);
+            f.instruction(&Instruction::LocalGet(e.scratch));
             f.instruction(&Instruction::LocalSet(dst));
-            range_guard_br_slow(f, dst, e.scratch);
         }
         BinOp::Not => {
             // bool = a != 1（tagged imm）；!bool
@@ -738,14 +765,15 @@ fn emit_unary(kind: BinOp, dst: u32, a: u32, fail: u32, e: &Env, f: &mut Functio
             f.instruction(&Instruction::LocalSet(dst));
         }
         BinOp::BitNot => {
-            // -1 ^ untag(a)
             f.instruction(&Instruction::I64Const(-1));
             f.instruction(&Instruction::LocalGet(a));
             f.instruction(&Instruction::I64Const(1));
             f.instruction(&Instruction::I64ShrS);
             f.instruction(&Instruction::I64Xor);
+            f.instruction(&Instruction::LocalSet(e.scratch));
+            range_guard_br_slow(f, e.scratch);
+            f.instruction(&Instruction::LocalGet(e.scratch));
             f.instruction(&Instruction::LocalSet(dst));
-            range_guard_br_slow(f, dst, e.scratch);
         }
         _ => unreachable!("unary kind"),
     }
@@ -773,6 +801,8 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
     imm_guard_br_slow(f, b);
     match kind {
         BinOp::Add | BinOp::Sub | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+            // 先算进 scratch（dst 与 a 别名——范围检查失败时慢路径还要
+            // 读原始 a/b，不能先覆盖）。
             f.instruction(&Instruction::LocalGet(a));
             f.instruction(&Instruction::I64Const(1));
             f.instruction(&Instruction::I64ShrS);
@@ -786,8 +816,10 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
                 BinOp::BitOr => &Instruction::I64Or,
                 _ => &Instruction::I64Xor,
             });
+            f.instruction(&Instruction::LocalSet(e.scratch));
+            range_guard_br_slow(f, e.scratch);
+            f.instruction(&Instruction::LocalGet(e.scratch));
             f.instruction(&Instruction::LocalSet(dst));
-            range_guard_br_slow(f, dst, e.scratch);
         }
         BinOp::Mul => {
             // §4：高 32 位符号扩展检查（|a|,|b| < 2^31）→ 积 < 2^62。
@@ -844,10 +876,12 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
             } else {
                 &Instruction::I64ShrS
             });
-            f.instruction(&Instruction::LocalSet(dst));
+            f.instruction(&Instruction::LocalSet(e.scratch));
             if kind == BinOp::Shl {
-                range_guard_br_slow(f, dst, e.scratch);
+                range_guard_br_slow(f, e.scratch);
             }
+            f.instruction(&Instruction::LocalGet(e.scratch));
+            f.instruction(&Instruction::LocalSet(dst));
         }
         BinOp::Eq | BinOp::Ne => {
             // §4：tagged 直接比较。

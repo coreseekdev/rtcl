@@ -109,7 +109,10 @@ impl Interp {
                 call_ns: None,
                 local_procs: Vec::new(),
                 deferred_scripts: Vec::new(),
-                slots: Vec::new(),
+                // Small head-room: a fresh frame is created per call once
+                // the pool is exhausted (deep recursion), and the slot
+                // fill would otherwise realloc on its first resize.
+                slots: Vec::with_capacity(8),
                 slot_aliased: Vec::new(),
                 has_aliased: false,
                 link_keys: Vec::new(),

@@ -1588,7 +1588,10 @@ mod tests {
                 | OpCode::ExprMarkBeginCmd(_)
                 | OpCode::ExprMarkBeginPushConst(_, _)
         )));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::Add)));
+        // The final `+` may ride a bracket-close fusion (SubEndAdd).
+        assert!(ops
+            .iter()
+            .any(|o| matches!(o, OpCode::Add | OpCode::SubEndAdd)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalScript)));
 

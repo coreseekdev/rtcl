@@ -88,6 +88,10 @@ pub(crate) struct ProcMemoEntry {
 type ProcMemo = Vec<ProcMemoEntry>;
 const PROC_MEMO_MAX: usize = 4;
 
+/// The [`MethodDef::head_cache`] cell: (typed name's `Value`, method
+/// name's `Rc`, the two head Values [typed, method]).
+type HeadCache = (Value, Rc<str>, Value, Value);
+
 /// A method definition (own methods, forwards, constructors, destructors).
 #[derive(Debug, Clone)]
 pub(crate) struct MethodDef {
@@ -110,12 +114,14 @@ pub(crate) struct MethodDef {
     /// nothing for its `variable` links.
     pub proc_memo: Rc<RefCell<ProcMemo>>,
     /// Cached argument head for the invoked method: (the typed name's
-    /// `Value`, the two head Values [typed, method]).  The typed name
-    /// varies per CALL SITE (`c` vs `::c`); the hit test is
-    /// `Value::same_allocation` — a pointer compare, since values are
-    /// immutable and the cache keeps its own handle alive (no string
+    /// `Value`, the method name's `Rc`, the two head Values [typed,
+    /// method]).  The typed name varies per CALL SITE (`c` vs `::c`) and
+    /// the method name varies per `renamemethod` (the moved `MethodDef`
+    /// keeps this cell); the hit test is `Value::same_allocation` plus
+    /// `Rc::ptr_eq` on the method — pointer compares, since values are
+    /// immutable and the cache keeps its own handles alive (no string
     /// compare, no `to_string` on the miss path).  Cold on misses.
-    pub head_cache: RefCell<Option<(Value, Value, Value)>>,
+    pub head_cache: RefCell<Option<HeadCache>>,
 }
 
 /// A fresh [`MethodDef::proc_memo`] cell.
@@ -824,6 +830,7 @@ fn does_not_refer(kind_obj: bool, typed: &str) -> Error {
 
 /// Execute chain entry `index` for object `key` (`typed` = as-typed object
 /// name, used in messages and `info level 0`).
+#[allow(clippy::too_many_arguments)]
 fn exec_chain_entry(
     interp: &mut Interp,
     key: &Rc<str>,
@@ -895,8 +902,13 @@ fn exec_chain_entry(
                     // Identity, not text: the cached handle stays alive in
                     // the cell, so pointer equality implies equal text — a
                     // different allocation with look-alike text misses and
-                    // rebuilds (correct, just cold).
-                    Some((t, h0, h1)) if t.same_allocation(typed_val) => {
+                    // rebuilds (correct, just cold).  The method word rides
+                    // along: `renamemethod` moves this def (and its cell)
+                    // under a new name, and the old head would replay the
+                    // stale name in `info level 0`.
+                    Some((t, m, h0, h1))
+                        if t.same_allocation(typed_val) && Rc::ptr_eq(m, method) =>
+                    {
                         args.push(h0.clone());
                         args.push(h1.clone());
                     }
@@ -905,7 +917,7 @@ fn exec_chain_entry(
                         let h1 = Value::from_str(method);
                         args.push(h0.clone());
                         args.push(h1.clone());
-                        *hc = Some((typed_val.clone(), h0, h1));
+                        *hc = Some((typed_val.clone(), Rc::clone(method), h0, h1));
                     }
                 }
             }
@@ -1136,6 +1148,7 @@ fn cache_entry(
 /// call, a third of the OO call bench.  A miss builds and backfills under
 /// the live mutation stamp; empty chains memo too (the unknown-method
 /// error path then skips the walk as well).
+#[allow(clippy::too_many_arguments)]
 fn invoke_method(
     interp: &mut Interp,
     key: &Rc<str>,
@@ -1235,12 +1248,12 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
                     Rc::clone(&c.chain),
                 );
                 return exec_chain_entry(
-                interp,
-                &key,
-                &method_rc,
-                0,
-                &chain,
-                &args[2..],
+                    interp,
+                    &key,
+                    &method_rc,
+                    0,
+                    &chain,
+                    &args[2..],
                     typed,
                     &args[0],
                     true,

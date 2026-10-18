@@ -3520,12 +3520,23 @@ p 1";
             "42",
         );
     }
+
+    #[test]
+    fn test_for_tail_fusion_continue_landing() {
+        // The for-tail fusion (ForNextIncrLocal/Var) owns the next-script
+        // region head — a `continue` in the body now lands ON the fused
+        // op, which must run the next script and take the backedge with
+        // the same step-count charging as the 3-op form.
+        assert_both(
+            "proc p {} { set acc {}; for {set i 0} {$i < 5} {incr i} { \
+             if {$i == 1 || $i == 3} continue; lappend acc $i }; return $acc }; p",
+            "0 2 4",
+        );
+        // Same shape with a variable-name next script (top-level loop →
+        // name-keyed incr → ForNextIncrVar).
+        assert_both(
+            "set acc {}; for {set i 0} {$i < 4} {incr i} { if {$i == 2} continue; lappend acc $i }; set acc",
+            "0 1 3",
+        );
+    }
 }
-
-
-
-
-
-
-
-

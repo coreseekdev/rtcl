@@ -162,6 +162,14 @@ impl Interp {
             // stays name-keyed and the body's slot ops fall back to their
             // name paths (which is also what a mid-run degrade leaves
             // behind).
+            //
+            // LOAD-BEARING for the OO prelink slots: the `slot_table`
+            // installed here is the SAME compiled unit the OO memo
+            // precomputed its `PrelinkEntry::slot` indices against
+            // (oo.rs builds both from one `memoised_proc_def`), so
+            // `degrade_frame_link_at` may trust the index with only a
+            // debug_assert on the name.  Changing what this gate accepts
+            // changes that invariant.
             let slot_mode = match &def.compiled {
                 Some(code)
                     if !code.fallback

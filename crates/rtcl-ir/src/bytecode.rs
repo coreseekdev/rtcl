@@ -516,6 +516,7 @@ impl ByteCode {
                 | (OpCode::PushTrue, OpCode::Pop)
                 | (OpCode::PushFalse, OpCode::Pop)
                 | (OpCode::PushInt(_), OpCode::Pop)
+                | (OpCode::PushFloat(_), OpCode::Pop)
                 | (OpCode::PushConst(_), OpCode::Pop)
                 | (OpCode::PushConstWide(_), OpCode::Pop)
                     if !targets[i + 1] =>
@@ -699,7 +700,13 @@ impl ByteCode {
                     | OpCode::CmpVarVarJumpTrue(_, _, _, t)
                     | OpCode::CmpVarVarJumpFalse(_, _, _, t)
                     | OpCode::CmpVarImmJumpTrue(_, _, _, t)
-                    | OpCode::CmpVarImmJumpFalse(_, _, _, t) => {
+                    | OpCode::CmpVarImmJumpFalse(_, _, _, t)
+                    // Same obligation as above: every target-carrying op
+                    // must ride the retarget pass (Round T's lesson —
+                    // unreachable under today's compiler shapes, closed
+                    // by invariant rather than by reachability).
+                    | OpCode::ForNextIncrLocal(_, _, _, t)
+                    | OpCode::ForNextIncrVar(_, _, _, t) => {
                         for &(from, to) in &retargets {
                             if *t == from {
                                 *t = to;
@@ -795,13 +802,15 @@ impl ByteCode {
         })
     }
 
-    /// Expand every fused superinstruction back to its canonical window —
-    /// the exact op sequence this unit would have had with fusion disabled
-    /// (`fuse_pairs` is a pure rewrite, so this is its inverse; jump
-    /// targets are remapped through the expansion shift).  Consumers whose
-    /// accepted-op set must not meet the fused families (the JIT's
-    /// analysis boundary, `rtcl-vm`) call this once at their compile
-    /// entry — see `docs/JIT-OPCODE-DELTA.md`.
+    /// Expand every fused superinstruction back to its canonical window:
+    /// semantics-equivalent canonical ops with jump targets remapped
+    /// through the expansion shift.  NOT a shape inverse — expanding and
+    /// re-running `peephole()` need not rebuild the same fused ops (e.g.
+    /// a `ForNextIncr*` window whose retired trampoline jump expands to a
+    /// `Nop` placeholder re-fuses into a different, equivalent form).
+    /// Consumers whose accepted-op set must not meet the fused families
+    /// (the JIT's analysis boundary, `rtcl-vm`) call this once at their
+    /// compile entry — see `docs/JIT-OPCODE-DELTA.md`.
     pub fn unfused(&self) -> ByteCode {
         /// Expand one fused op into `out`; `false` = not fused (the
         /// caller copies it verbatim).
@@ -1538,6 +1547,34 @@ mod tests {
         let mut again = back;
         again.peephole();
         assert_eq!(again.ops(), code.ops());
+    }
+
+    /// The for-tail window REALLY fires from the canonical pre-fusion
+    /// sequence (trampoline jump → next-region mark → begin/incr/pop →
+    /// backedge): `[Jump(i+1), NextMark, BeginCmd, IncrLocalPop, Jump]`
+    /// collapses through both passes to the single fused op.  Guards
+    /// against the window silently dying to a future peephole change —
+    /// unlike the compiler-side OR-pattern asserts, this one is exact.
+    /// The expansion is canonical (no fused ops); note it does NOT
+    /// round-trip to the same fused op — the retired trampoline expands
+    /// to a `Nop`, so re-fusing yields a different, equivalent form (see
+    /// `unfused`'s doc).
+    #[test]
+    fn fuses_for_tail_window() {
+        let mut code = bc(
+            &[
+                OpCode::Jump(1),
+                OpCode::NextMark,
+                OpCode::BeginCmd(1),
+                OpCode::IncrLocalPop(0, 1),
+                OpCode::Jump(0),
+            ],
+            true,
+        );
+        code.peephole();
+        assert_eq!(code.ops(), &[OpCode::ForNextIncrLocal(1, 0, 1, 0)]);
+        let back = code.unfused();
+        assert!(!back.has_fused_ops());
     }
 
     /// Every fused/superinstruction family expands — `unfused()` leaves no

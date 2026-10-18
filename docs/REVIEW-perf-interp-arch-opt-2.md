@@ -1,8 +1,8 @@
 # 评审材料 — `perf/interp-arch-opt-2`（解释器性能第二批）
 
-> **状态**：20 个提交（其中 4 个是纯实验记录/审计/设计文档，2 个负结果已回退并留档），
-> 四道门全绿；分支已推送 origin，**领先 master 20 / 落后 0**（未与 master 合并，
-> 由协调者处理）。本文件即 PR 描述：范围、实测、手段清单、门禁、语义风险、
+> **状态**：22 个提交（其中 14 个是实验记录/审计/设计/台账文档，4 个负结果轮次
+> 已回退并留档），四道门全绿；分支已推送 origin，**领先 master 22 / 落后 0**
+> （未与 master 合并，由协调者处理）。本文件即 PR 描述：范围、实测、手段清单、门禁、语义风险、
 > 生态兼容与未做项。
 
 ## 1. 范围与目标
@@ -15,6 +15,10 @@
 - 允许 break 生态组件但必须给跟进契约（JIT 见 §6）；不新增依赖。
 
 ## 2. 实测指标（起点 = 合并后 master → 分支最新）
+
+（注：micro_base/micro_incr/fe/build 四行的起点列是 Round U/V 落地后的分支内
+快照——master 同期值 micro_base 1.33x、micro_incr 1.36x、fe 0.93x、build
+0.75x，见 BASELINE 的 T 轮记录；其余行起点即 master。）
 
 指令数比（`bash /tmp/icount.sh`）：
 
@@ -40,9 +44,9 @@ wall（`bash /tmp/heavy.sh 3`，best-of-3，机器噪声大）：
 | oo_bench2 | 0.56x | **0.46x** |
 | oo_bench2_vars | 0.69x | **0.58x** |
 
-新微基准 `/tmp/my_bench.tcl`（a↔b 交替 `my` 递归，2.1M 次 `my` 调用）：
-17.466G → **11.761G（−32.3%）**；`dispatch_dynamic.tcl`（`$o $m` 变量名派发）
-4.448G 与字面量派发同速。两脚本内容见 `bench/COMPARE.md` 的微基准矩阵附录/台账。
+新微基准（已入库 `bench/micro/my_bench.tcl`，a↔b 交替 `my` 递归，2.1M 次 `my`
+调用）：17.466G → **11.827G（−32.3%）**；`bench/micro/dispatch_dynamic.tcl`
+（`$o $m` 变量名派发）4.448G，与字面量派发同速。
 
 ## 3. 手段清单（按轮次）
 
@@ -58,7 +62,7 @@ wall（`bash /tmp/heavy.sh 3`，best-of-3，机器噪声大）：
 | AA | `04fd3ed` | **OO 派发站点级 memo**（`OoCallCache`：ns 指针 + `mutation_ctr` + 两词分配身份，四项验证） | oo2 −10.5%、oovars −8.3% |
 | AB | `f8c3007` | `my` 单槽快径 + 免 `format!` 门禁 | −2.89% / −0.01% → 均回退留档 |
 | AC | `14b0cc9` | 4 号画像配方 + 5 号 `Value` 句柄共享设计稿 | 文档 |
-| AD/AE | `e5ddbe3`…`7906d0f` | fib25 符号化画像（`call_proc` self 10.73%）+ 行级归因（绕过 3 条 perf 工具坑，`sym+offset` + 批量 `addr2line`） | 画像数据入库 |
+| AD/AE | `e5ddbe3`…`7906d0f` | fib25 符号化画像（`call_proc` self 10.73%）；行级归因尝试了 3 条 perf 工具路径（`sym+offset`/批量 `addr2line`/`perf annotate`）均未产出（过程留档） | 符号画像入库；行级占比（AH/AI 引用的 4.6%/4.2%）为会话内测量，未入库 |
 | AF | `d785ca5` | call_proc 去每调用三连 `Rc::clone`（def 经引用读，尾调用才取 owned） | fib −1.17% |
 | AG | `6cbe978` | **`my` 双槽派发缓存**（对象派发保持单槽——双槽 +7 instr/调用实测回退） | `my_bench` **−32.3%** |
 | AH | `aa5b3cf` | call_proc 批 1（`take()` 守卫）+ 批 2（ns 身份写 + 池化帧保留 ns/call_ns） | fib −0.24% / −1.31% |
@@ -125,6 +129,6 @@ bash /tmp/heavy.sh 3                # wall（交错 best-of-3）
 ./judge/run.sh && ./judge/sweep.sh  # 语义门禁
 cargo test --workspace
 # 微基准（本 PR 新增）：
-perf stat -x, -e instructions:u ./target/release/rtcl -f /tmp/my_bench.tcl
-perf stat -x, -e instructions:u ./target/release/rtcl -f /tmp/dispatch_dynamic.tcl
+perf stat -x, -e instructions:u ./target/release/rtcl -f bench/micro/my_bench.tcl
+perf stat -x, -e instructions:u ./target/release/rtcl -f bench/micro/dispatch_dynamic.tcl
 ```

@@ -1,13 +1,13 @@
 # 设计：`Value` 字符串句柄共享（TODO 5 号）
 
-状态：设计稿（2026-10-18）。本文只描述**方案与分期**，不改 `ValueInterner` / `Value` 表示。
+状态：设计稿（2026-10-18）。本文只描述**方案与分期**，不改 `Value` 表示（仓库无 intern 表）。
 
 ## 1. 为什么做（已有实证）
 
 Round AA 的 OO 派发站点缓存（`OoCallCache`，`04fd3ed`）之所以能命中，前提是
 **常量池字面量的 `Value` 分配在热点循环里稳定**：`c compute 7 3` 里 `"c"`、
 `"compute"` 每次都是同一个 `ValueInner`，于是 `Value::same_allocation` 的
-ptr 比较可作廉价的「同一性」验证（再叠加 ns 指针 + `mutation_ctr` 保证语义）。
+分配同一性比较（bits 相等——立即数为值等价、堆值为同 box）可作廉价的「同一性」验证（再叠加 ns 指针 + `mutation_ctr` 保证语义）。
 
 这一机制在**计算出的名字**上立刻失效，Round AB 的 `my` 实验就是反例：
 `my a`/`my b` 交替时单槽缓存被冲刷（−2.89% 回退），而若名字来自变量或拼接

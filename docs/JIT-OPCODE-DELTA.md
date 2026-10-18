@@ -94,8 +94,10 @@ JIT，因此这几族当前对接受集不可见；A 族（name-keyed）会出�
   的 `forward` 重映射（否则 nop 压缩后回边靶点漂移、循环不退出）。
 - `unfused()` 展开为 `[Nop, NextMark, BeginCmd, IncrLocal/Var, Pop, Jump(t)]`
   （`t` 由通用靶点重映射处理；`Nop` 占位被消费的 trampoline Jump）；
-  再 `peephole()` 必须回到同一形状——`unfused_covers_every_family` 与
-  roundtrip 测试覆盖此契约。
+  展开结果再 `peephole()` 得到的是**语义等价**的规范形，但不必是同一融合形
+  （退役 trampoline 展开为 `Nop`，`ForNextIncr*` 不会再融合回原样）；契约由
+  `unfused_covers_every_family`（展开后零融合 op）与 `fuses_for_tail_window`
+  （窗口真实触发）钉住。
 - **回边计步平价**：执行器传 `op_jump_from(interp, st, t, st.pc + 1)`——
   分发已把 `st.pc` 增到「融合 op 索引 +1」，被消费的 `Jump` 位于窗口尾
   （= `st.pc + 1`），与原两/三 op 形的回边判定逐位相同。

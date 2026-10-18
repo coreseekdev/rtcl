@@ -1,6 +1,6 @@
 # http.tcl —— HTTP 词表层（native / wasm 事件面同形）。
 #
-#   http::get  URL ?-command {…}? ?-stream {…}? ?-timeout ms? ?-content-type type?
+#   http::get  URL ?-command {…}? ?-stream {…}? ?-timeout ms? ?-headers {…}? ?-content-type type?
 #   http::post URL BODY ?同上?
 #
 # -stream 脚本：每收到一块原始字节执行一次；块文本在 $::http_chunk，
@@ -56,11 +56,13 @@ proc ::http::_request {method url body optargs} {
     set stream ""
     set timeout 0
     set ctype "application/json"
+    set headers ""
     foreach {k v} $optargs {
         switch -- $k {
             -command      { set command $v }
             -stream       { set stream $v }
             -timeout      { set timeout $v }
+            -headers      { set headers $v }
             -content-type { set ctype $v }
             default       { error "http: unknown option \"$k\"" }
         }
@@ -83,7 +85,7 @@ proc ::http::_request {method url body optargs} {
     set opts "\{\"timeout\":$timeout,\"ctype\":[json encode $ctype str]"
     if {$stream ne ""} { append opts ",\"stream\":true" }
     append opts "\}"
-    if {[catch {__rtcl_http $id $method $url $body $opts} err]} {
+    if {[catch {__rtcl_http $id $method $url $body $opts $headers} err]} {
         dict unset calls $id
         error "http: host bridge failed: $err"
     }

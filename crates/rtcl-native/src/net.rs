@@ -145,7 +145,8 @@ fn cancels() -> &'static Mutex<HashSet<String>> {
     CANCELS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// `__rtcl_http id method url body optsJson`（wasm 桥同签名）。
+/// `__rtcl_http id method url body optsJson ?headers?`（wasm 桥同签名；
+/// wasm JS 忽略第 6 参，native 用它承载调用方请求头，如 Authorization）。
 pub fn bridge(interp: &mut Interp, args: &[Value]) -> rtcl_core::error::Result<Value> {
     let arg = |i: usize| -> String {
         args.get(i)
@@ -157,19 +158,35 @@ pub fn bridge(interp: &mut Interp, args: &[Value]) -> rtcl_core::error::Result<V
     let url = arg(3);
     let body = arg(4);
     let opts = arg(5);
+    let headers_arg = args.get(6);
 
     let timeout = opt_u64(&opts, "timeout").unwrap_or(0);
     let stream = opt_bool(&opts, "stream").unwrap_or(false);
     let ctype = opt_str(&opts, "ctype").unwrap_or_else(|| "application/json".to_string());
 
+    // 调用方请求头（Tcl dict → k/v 对）；content-type 仅在调用方未提供时补默认。
+    let mut headers: Vec<(String, String)> = Vec::new();
+    if let Some(h) = headers_arg {
+        if let Some(pairs) = h.as_list() {
+            for chunk in pairs.chunks(2) {
+                if chunk.len() == 2 {
+                    headers.push((
+                        chunk[0].as_str().to_string(),
+                        chunk[1].as_str().to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    let has_ctype = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
+    if !body.is_empty() && !has_ctype {
+        headers.push(("content-type".to_string(), ctype));
+    }
+
     let req = HttpRequest {
         method,
         url,
-        headers: if body.is_empty() {
-            Vec::new()
-        } else {
-            vec![("content-type".to_string(), ctype)]
-        },
+        headers,
         body: if body.is_empty() {
             None
         } else {
@@ -318,15 +335,19 @@ mod tests {
 
     struct Mock {
         url: String,
+        captured: std::sync::Arc<std::sync::Mutex<String>>,
         _join: thread::JoinHandle<()>,
     }
 
     /// 一次性 mock：`status` 状态行；`head_delay_ms` 在响应头前等待；
     /// `chunks` 为 (距上一块的延迟 ms, 文本)，chunked 传输、逐块 flush。
+    /// `captured` 保存客户端请求头原文（断言请求头用）。
     fn spawn_mock(status: u16, head_delay_ms: u64, chunks: Vec<(u64, String)>) -> Mock {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
         let addr = listener.local_addr().unwrap();
         let url = format!("http://127.0.0.1:{}/sse", addr.port());
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap = captured.clone();
         let join = thread::spawn(move || {
             let Ok((mut sock, _)) = listener.accept() else {
                 return;
@@ -345,6 +366,9 @@ mod tests {
                     }
                     Err(_) => return,
                 }
+            }
+            if let Ok(mut c) = cap.lock() {
+                *c = String::from_utf8_lossy(&seen).to_string();
             }
             thread::sleep(Duration::from_millis(head_delay_ms));
             let head = format!(
@@ -367,7 +391,11 @@ mod tests {
             let _ = sock.write_all(b"0\r\n\r\n");
             let _ = sock.flush();
         });
-        Mock { url, _join: join }
+        Mock {
+            url,
+            captured,
+            _join: join,
+        }
     }
 
     fn test_interp() -> Interp {
@@ -384,6 +412,22 @@ mod tests {
 
     fn get(interp: &mut Interp, script: &str) -> String {
         interp.eval(script).unwrap().as_str().to_string()
+    }
+
+    #[test]
+    fn custom_headers_reach_the_wire() {
+        let mock = spawn_mock(200, 0, vec![(0, "{}".to_string())]);
+        let mut interp = test_interp();
+        set_url(&mut interp, &mock);
+        interp
+            .eval(
+                r#"http::post $::u body -headers {Authorization {Bearer tok-123} X-A 1} -command {set ::final [list $http_status $http_body]}"#,
+            )
+            .unwrap();
+        let req = mock.captured.lock().unwrap().clone().to_lowercase();
+        assert!(req.contains("authorization: bearer tok-123"), "{req}");
+        assert!(req.contains("x-a: 1"), "{req}");
+        assert!(req.contains("content-type: application/json"), "{req}");
     }
 
     #[test]

@@ -200,7 +200,7 @@ fn walk(n: &L3, f: &mut impl FnMut(&L3)) {
 fn emit_node(n: &L3, e: &Env, f: &mut Function) {
     match n {
         L3::Seq(items) => items.iter().for_each(|i| emit_node(i, e, f)),
-        L3::If { cond, then_, else_, j } => {
+        L3::If { cond, then_, else_, .. } => {
             f.instruction(&Instruction::LocalGet(e.b(cond.0)));
             f.instruction(&Instruction::If(BlockType::Empty));
             emit_node(then_, e, f);
@@ -221,7 +221,7 @@ fn emit_node(n: &L3, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::End);
         }
         L3::Br { depth, .. } => { f.instruction(&Instruction::Br(*depth)); }
-        L3::BrIf { depth, cond, when_zero, target, .. } => {
+        L3::BrIf { depth, cond, when_zero, .. } => {
             f.instruction(&Instruction::LocalGet(e.b(cond.0)));
             if *when_zero {
                 f.instruction(&Instruction::I32Eqz);

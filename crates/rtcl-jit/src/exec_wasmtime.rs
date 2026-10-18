@@ -37,6 +37,9 @@ pub fn execute(
     for c in bc.constants() {
         arena.push(Value::from_str(c));
     }
+    // M3：epoch global 以解释器当前代初始化（与 exec.rs 同一语义——
+    // 入口-only，运行中不刷新；回边比对为 M4 模块缓存预留）。
+    let epoch0 = interp.tier1_epoch() as i64;
     let host = Host::new(interp, arena, bc, module);
     let watermark = host.arena_len();
 
@@ -51,7 +54,7 @@ pub fn execute(
         wasmtime::Global::new(&mut store, mut_g(wasmtime::ValType::I64), Val::I64(0))
             .expect("fuel global");
     let g_epoch =
-        wasmtime::Global::new(&mut store, mut_g(wasmtime::ValType::I64), Val::I64(0))
+        wasmtime::Global::new(&mut store, mut_g(wasmtime::ValType::I64), Val::I64(epoch0))
             .expect("epoch global");
     let g_caching =
         wasmtime::Global::new(&mut store, mut_g(wasmtime::ValType::I32), Val::I32(1))

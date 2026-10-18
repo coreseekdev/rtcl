@@ -178,6 +178,21 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
                 // 继续迭代 → bind + br header（fuel 由 instrument 织入）。
                 let end_t = ctx.loops.last().map(|(_, b)| *b).unwrap_or(pc as u32 + 1);
                 let counter = foreach_counter_of(ctx, info);
+                // 回跳目标 = 对应 FOREACH_START 的落点（header）而非
+                // body 目标：PR#2 起 unfused 形状的 FOREACH_NEXT body
+                // 指向 BeginCmd（跳过 BODY_MARK_FRAMED）——JIT 的
+                // region 栈是编译期烘焙（BODY_MARK_FRAMED 无代码），
+                // 跳 header 与 vm_exec 跳 body 语义等价，且 header 有
+                // Loop 标签可解析（PR#2 前两者重合，回跳目标是 body
+                // 还是 header 无差别）。
+                let start_pc = ctx
+                    .l2
+                    .ops
+                    .iter()
+                    .take(pc as usize)
+                    .position(|a| matches!(&a.op, OpCode::ForeachStart { info: i, .. } if *i == info))
+                    .map(|p| p as u32 + 1)
+                    .unwrap_or(body_t);
                 items.push(L3::Seq(vec![
                     L3::Instr(Instr::ForeachStep { counter, b: breg }),
                     L3::BrIf {
@@ -190,7 +205,7 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
                     },
                     L3::Instr(Instr::ForeachBind { info, counter, fail }),
                     L3::Br {
-                        target: body_t,
+                        target: start_pc,
                         depth: 0,
                         backedge: true,
                         fail,

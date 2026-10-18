@@ -16,7 +16,13 @@ printf 'proc set {args} {return 99}\nset x 5\nputs $x\n' > _e2.tcl
 printf 'set x 5\nrename set set2\nset y 7\nputs $x-$y\n' > _e3.tcl
 RTCL=${RTCL:-/home/nzinfo/src.note/rtcl/target/release/rtcl}
 JIT=${JIT:-/home/nzinfo/src.note/rtcl/target/release/jitsh}
-for f in _e1 _e2 _e3; do
+# M3 扩充形状（PR#2 扩名单）：lappend 折叠的途中重定义；rename 形状。
+# e4：跨单元 bump——proc lappend 先重定义，随后含折叠 lappend 的新单元
+#     必须走树遍历（vm_exec gate 语义；JIT 入口 gate 同口径 → Fallback）。
+printf 'proc lappend {args} {return CAPTURED}\nlappend x 1\nputs $x\n' > _e4.tcl
+# e5：rename 挡折叠命令——rename incr incr2 后 incr 走动态解析。
+printf 'rename incr incr2\nset n 5\nincr n\nputs $n\n' > _e5.tcl
+for f in _e1 _e2 _e3 _e4 _e5; do
   echo "== $f =="
   printf "  tclsh    : "; timeout 5 tclsh $f.tcl 2>&1 | head -2
   printf "  tree     : "; timeout 5 "$RTCL" --no-bytecode -f $f.tcl 2>&1 | head -2

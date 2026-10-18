@@ -40,6 +40,10 @@ fn main() {
             }
         }
         Outcome::Completed { code, exit_code } => match code {
+            // 5 = STALE：epoch 回边比对失败（M4 模块缓存时代的信号）。
+            // 当前驱动语义是仅单元入口 gate（run_top_with），运行中
+            // epoch global 不刷新 → 不可能产生 STALE；维持忽略仅为
+            // 完整覆盖返回码空间。
             0 | 5 => {}
             6 => {
                 // exit N：rtcl 文件模式行为（error_report(exit) = to_string）。

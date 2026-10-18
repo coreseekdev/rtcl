@@ -986,6 +986,17 @@ impl Interp {
         self.max_steps
     }
 
+    /// Tier1 折叠代（只读）。Tier1 命令（`set`/`if`/`while`/…，PR#2 起
+    /// 含 `lappend` 与宿主注册命令）被编译单元内联折叠，任何同名命令
+    /// 的注册/改名/删除都会 bump 此计数；编译单元记录其编译时代的
+    /// `epoch`，消费方（字节码 VM 的单元入口门、JIT 驱动的执行入口门）
+    /// 比对两者判定折叠是否仍有效——不等则退回动态解析路径
+    /// （namespace-41.1）。仅供嵌入式宿主/JIT 失效检查读取；bump 只
+    /// 发生在解释器内部的注册/改名路径上，无 setter。
+    pub fn tier1_epoch(&self) -> u64 {
+        self.tier1_epoch
+    }
+
     /// 每条命令分派计一步；超限抛错。解释器（`eval_command`）与 VM
     ///（`invoke_command`/`call`）两条分派路都过这里。
     pub(crate) fn charge_step(&mut self) -> crate::error::Result<()> {

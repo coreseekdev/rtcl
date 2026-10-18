@@ -190,7 +190,15 @@ impl Host {
         let Some(p) = self.pending.take() else { return 0 };
         let e = p.err;
         if p.from_eval {
-            // case a：解释器已按协议累积；只分类。pending 保留给终局报告。
+            // case a：解释器已按协议累积；先分类——控制流穿越
+            // （宿主 eval 里的 break/continue 冒出，PR#2 起 `if $c
+            // continue` 走 DynCall 的树遍历 cmd_if，不捕获控制流）必须
+            // 以 kind 返回，CallSite 的出口分派才能内跳；纯错误保留
+            // pending 给终局报告（帧已在 interp，驱动不补）。
+            let kind = classify_control(&e);
+            if kind != 0 {
+                return kind;
+            }
             self.pending = Some(Pending { err: e, from_eval: true });
             return 0;
         }
@@ -940,6 +948,24 @@ pub fn run_top_with(
     // 接受集/降级路径无需跟进修补（口径与替代方案见
     // docs/JIT-OPCODE-DELTA.md；将来做原生 lower 时删掉本展开即可）。
     let bc = Compiler::compile_unit(Rc::clone(&unit.source), &unit.commands).unfused();
+    // M3 入口失效 gate —— 与 rtcl-vm eval.rs 的 bytecode_cache gate
+    // 逐条对齐（!fallback 由 emit::compile 的拒绝路径等价承担）：
+    // 单元编译时代的 `epoch` != 解释器当前 tier1_epoch ⇒ Tier1 折叠
+    // 已被中途的命令注册/改名/删除（proc set、rename、宿主注册……）
+    // 作废，整单元回解释器（Fallback ⇒ interp.eval ⇒ 同一款 gate ⇒
+    // 树遍历）。vm_exec 的语义是仅单元入口检查（同单元内 bump 不
+    // 重 gate——e1/e2 探针口径），本 gate 同样只在该入口比较一次。
+    // 现场编译的单元 epoch 恒 0（ByteCode 默认；proc body 由
+    // compile_proc_body 盖章），故 bump 后本 gate 恒失败——与
+    // vm_exec 的「bump 后顶层 eval 全走树遍历」行为严格一致。
+    if bc.epoch != interp.tier1_epoch() {
+        return (interp, JitRun {
+            outcome: Outcome::Fallback,
+            driver_report: None,
+            eval_error: None,
+            result: None,
+        });
+    }
     let module = match emit::compile(&bc, &EmitConfig::default()) {
         Ok(m) => m,
         Err(_) => {
@@ -985,6 +1011,12 @@ fn execute(
     use wasmi::{Caller, Engine, Extern, Linker, Module, Store, TypedFunc};
 
     // arena 预驻留：0=UNSET 1=哨兵保留 2=EMPTY 3..=常量池。
+    // M3：epoch global 以解释器当前代初始化（替换 M1' 的硬编码 0）。
+    // 运行中不刷新——vm_exec 的失效语义是仅单元入口检查（入口 gate
+    // 在 run_top_with），回边比对（EpochCheck{at_entry:false} →
+    // STALE）为 M4 的模块缓存/proc-body 钩子预留：届时按调用入口
+    // 拒绝陈旧模块即可，无需中断运行。
+    let epoch0 = interp.tier1_epoch() as i64;
     let host = Host::new(interp, arena_of(bc), bc, module);
     let watermark = host.arena_len();
 
@@ -1000,7 +1032,7 @@ fn execute(
     // caching=1 直到首次 rtcl.call）。句柄克隆进宿主闭包（wasm→宿主
     // 直写 global，§3「宿主充值」）。
     let g_fuel = wasmi::Global::new(&mut store, wasmi::Val::I64(0), wasmi::Mutability::Var);
-    let g_epoch = wasmi::Global::new(&mut store, wasmi::Val::I64(0), wasmi::Mutability::Var);
+    let g_epoch = wasmi::Global::new(&mut store, wasmi::Val::I64(epoch0), wasmi::Mutability::Var);
     let g_caching = wasmi::Global::new(&mut store, wasmi::Val::I32(1), wasmi::Mutability::Var);
     linker.define("rtcl", "fuel", Extern::Global(g_fuel)).unwrap();
     linker.define("rtcl", "epoch", Extern::Global(g_epoch)).unwrap();

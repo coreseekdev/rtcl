@@ -6,7 +6,7 @@
 //! - [`vars`]: variable access methods
 //! - [`eval`]: script evaluation and word expansion
 //! - [`call`]: procedure calls and tail-call optimisation
-//! - [`vm_bridge`]: [`VmContext`](rtcl_vm::VmContext) implementation
+//! - [`vm_bridge`]: [`VmContext`](crate::VmContext) implementation
 //! - [`util`]: shared helpers (`split_array_ref`, `glob_match`)
 //! - [`commands`] submodules: individual command implementations
 
@@ -68,8 +68,11 @@ pub(crate) struct ProcDef {
 /// A link from a local variable name to a variable in another scope.
 #[derive(Debug, Clone)]
 pub(crate) enum UpvarLink {
-    /// Link to `globals[name]`.
-    Global(String),
+    /// Link to `globals[name]`.  `Rc<str>`: the canonical key is memoised
+    /// in `var_link_cache` and handed to the frame's upvar map, slot
+    /// `link_keys` and `globals` probes by refcount — a `variable` link
+    /// installed on every method call allocated four strings here.
+    Global(Rc<str>),
     /// Link to `frames[frame_index].locals[name]`.
     Frame { frame_index: usize, var_name: String },
     /// The link's target was destroyed by a `namespace delete` (or the
@@ -78,6 +81,29 @@ pub(crate) enum UpvarLink {
     /// (tclsh 8.6.17).  `array` distinguishes the two error messages.
     Dead { array: bool, target: String },
 }
+
+/// Frame upvar links.  `Rc<str>` keys: a prelinked method's link names
+/// are memoised (`ProcMemo`) and re-inserted on every call, so the key is
+/// a refcount bump rather than a fresh `String`.
+#[cfg(not(feature = "embedded"))]
+pub(crate) type UpvarMap = varmap::FxHashedMap<Rc<str>, UpvarLink>;
+
+/// One OO-method `variable` prelink: the declared name plus the
+/// once-ness flag of its namespace-set registration (the registering
+/// namespace is the object's own, whose lifetime is the memo's — a
+/// re-created namespace implies a retired chain memo).
+#[derive(Debug)]
+pub(crate) struct PrelinkEntry {
+    pub(crate) name: Rc<str>,
+    /// `resolve_var_link`'s deterministic result — pure string math
+    /// memoised by that call; precomputed with the prelink list so the
+    /// per-call install skips the probe entirely.
+    pub(crate) qualified: Rc<str>,
+    pub(crate) ns_part: Rc<str>,
+    pub(crate) registered: core::cell::Cell<bool>,
+}
+#[cfg(feature = "embedded")]
+pub(crate) type UpvarMap = alloc::collections::BTreeMap<Rc<str>, UpvarLink>;
 
 /// A live `namespace ensemble` — the ensemble command's dispatch table
 /// (tclsh 8.6.17).  Keyed in `Interp::ensembles` by the ensemble's
@@ -144,7 +170,7 @@ pub(crate) struct CallFrame {
     pub locals: VarMap<Value>,
     /// Names in `locals` that are arrays (scalar/array distinction).
     pub array_locals: VarSet,
-    pub upvars: VarMap<UpvarLink>,
+    pub upvars: UpvarMap,
     /// Namespace the running proc was defined in (tclsh: `namespace current`
     /// inside the proc resolves here).  Variable *reads* do NOT fall back to
     /// this namespace — only locals, upvar/`variable` links, and `::`-qualified
@@ -179,6 +205,12 @@ pub(crate) struct CallFrame {
     /// so a linked method variable no longer degrades the WHOLE frame to
     /// name-keyed lookups.
     pub slot_aliased: Vec<bool>,
+    /// Frame-level short-circuit for the `slot_aliased` scan: true once
+    /// ANY slot of this frame has been link-aliased (`upvar` / `global` /
+    /// `variable`).  The hot slot ops test this one bool first — a frame
+    /// that never saw a link (the overwhelmingly common case) skips the
+    /// per-slot Vec<bool> probe entirely.  Cleared with `slot_aliased`.
+    pub has_aliased: bool,
     /// Parallel to `slots`: for an aliased slot holding a GLOBAL link
     /// (`variable`/`global`/upvar-to-global), the canonical target key —
     /// slot ops resolve through ONE hash (`globals.get(key)`) instead of
@@ -230,7 +262,7 @@ impl CallFrame {
     /// Current value of the named slot (`None` when unset or absent).
     pub(crate) fn slot_value(&self, name: &str) -> Option<&Value> {
         let i = self.slot_index_of(name)?;
-        if self.slot_aliased.get(i).copied().unwrap_or(false) {
+        if self.has_aliased && self.slot_aliased.get(i).copied().unwrap_or(false) {
             return None;
         }
         let v = &self.slots[i];
@@ -459,7 +491,7 @@ pub struct Interp {
     /// owning namespace's variable-set insert, the per-frame upvar link)
     /// stay per-call.  No invalidation is needed; bounded like the other
     /// caches (wasm32 is a target).
-    pub(crate) var_link_cache: VarMap<VarMap<(String, String)>>,
+    pub(crate) var_link_cache: VarMap<VarMap<(Rc<str>, Rc<str>)>>,
     /// Command-table generation: bumped at every command-table mutation.
     pub(crate) cmd_generation: u64,
     /// Parse-tree cache: script text → AST (with the source text the
@@ -641,14 +673,10 @@ pub struct Interp {
     /// Raw source of each word of the command currently dispatching,
     /// aligned with its arguments — braced/quoted script words carry their
     /// delimiters, letting constructs recover their body's line offset.
-    /// Spans resolve through [`Interp::cur_source`]; `Rc` (shared with the
-    /// cached parse tree) so save/restore per dispatch is a refcount bump.
-    pub(crate) cur_cmd_word_srcs: Rc<Vec<rtcl_parser::SrcSpan>>,
-    /// Shared empty word-source vector — `exec_bytecode` swaps the
-    /// per-command word sources out for this singleton on entry (one Rc
-    /// bump; the previous code allocated a fresh `Rc<Vec<..>>` per proc
-    /// call).
-    pub(crate) word_srcs_nil: Rc<Vec<rtcl_parser::SrcSpan>>,
+    /// Spans resolve through [`Interp::cur_source`]; borrowed from the
+    /// owning unit/AST (see [`WordSrcs`]) so per-command save/restore is
+    /// a pointer copy, not a refcount bump.
+    pub(crate) cur_cmd_word_srcs: util::WordSrcs,
     /// Source text of the command currently dispatching, for constructs
     /// that need the raw invocation (`info level 0` inside
     /// `namespace eval`).  Span into [`Interp::cur_source`].
@@ -735,7 +763,7 @@ pub struct Interp {
     /// per call.  Prefix errors are unreachable: declaration names are
     /// validated by the `variable` define word and object namespaces
     /// always exist.
-    pub(crate) frame_prelink: Option<Vec<String>>,
+    pub(crate) frame_prelink: Option<Rc<Vec<PrelinkEntry>>>,
     /// One-shot level-0 word override for the next `call_proc` frame
     /// (`apply` renders `info level 0` as `apply {<term>} <args...>`,
     /// which the plain arg-list form can't express).
@@ -801,8 +829,7 @@ impl Interp {
             err_line: 1,
             line_offset: 0,
             cur_cmd_line: 0,
-            cur_cmd_word_srcs: Rc::new(Vec::new()),
-            word_srcs_nil: Rc::new(Vec::new()),
+            cur_cmd_word_srcs: util::WordSrcs::empty(),
             cur_cmd_text: rtcl_parser::SrcSpan { start: 0, end: 0 },
             cur_source: Rc::from(""),
             err_from_subst: false,

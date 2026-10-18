@@ -6,9 +6,67 @@
 
 ## 性能优化（剩余杠杆）
 
-- [ ] **fe 求和迭代 2.8× → 收尾**：foreach_bind + 9 ops 的 per-op 权重
-  （9ns/op vs tclsh 3.5ns）。`bench/scripts/fe_bench.tcl`、
-  `bench/scripts/sum_only.tcl`。依赖 foreach 路由对齐（下条）+ 每op税。
+- [x] **name-keyed 超指令（Round G，本批次提交）**：全局/eval 级循环的
+  `CmpVar*Jump*`/`AddVar*`/`LappendVarVar`/`IncrVarPop`/`StoreLocalPop`；
+  `ByteCode::unfused()` 桥保 JIT 全绿（`docs/JIT-OPCODE-DELTA.md`）。
+  dloop 0.69x、sum_only 0.72x、fe 1.29x（指令数比）。
+- [ ] **JIT 原生 lower（可选，JIT 侧）**：接受 A 族并直接 lower，免去
+  `unfused()` 展开（清单见 `docs/JIT-OPCODE-DELTA.md` §4）。
+- [x] **nanopass 融合（Round F，已提交 3964c97）**：`fuse_slot_pairs` → 
+  `fuse_pairs` pass + 融合 op（cmp+jcc ×4、lappend/incr pop 版）——
+  build-only 1.29x→0.85x 指令。
+- [x] **fe 求和迭代（p 段，Rounds G–K 收尾）**：p 循环 9 op→**2 op**/迭代
+  （`SET_SS_ADD` + `FOREACH_NEXT_CLOSE`），foreach_bind 快路径、body-mark
+  折叠、融合分支直取布尔——fe 0.96x 指令 / 0.85x wall、build 0.76x。
+- [ ] **表示层重构（用户已授权，Tcl byte-2-byte 语义为红线）**——deep-dive 批次：
+  0. ~~`VarMap/VarSet/UpvarMap` 键 `Rc<str>`/`Name`~~ —— **Round S 实测
+     中性偏负，已回退（见 BASELINE）**：ptr 命中省下的 memcmp 抵不过 hash
+     与句柄克隆；键表示层在此架构关闭。剩余三条仍有效：
+  1. **`Value` 字符串表示层可共享**：`ValueInner.string` 从 `OnceCell<String>`
+     改为可共享句柄（如 `StrRep::Shared(Rc<str>) | Owned(Box<str>)`）+
+     `Value::str_handle() -> Option<Rc<str>>`：常量池/派发站点名共享同一句柄，
+     命令名/变量名的比较走 **ptr 快路径**（oovars/dloop 画像里 memcmp ~8%
+     + hashbrown 探测的字符串比较部分是目标）。注意 `append`/字符串改写走
+     COW；JIT 不触 Value 内部（仅 ABI）✓。
+  2. **`VarMap/VarSet` 键 `Rc<str>` + ptr-first Eq**（`Borrow<str>` 保 &str
+     查询）：link/prelink/OO memo 路径用共享句柄插查，探针 eq 去 memcmp；
+     插入时用已有的 memoized `Rc`（而非新 String）。
+  3. `call_proc` 帧准备缓存（按 ProcDef 预置 slots/绑定顺序）——fib 画像
+     call_proc 12%。
+  4. 空循环基线（dispatch + region 簿记）：`bodies` 预留 + unchecked push、
+     `VmState` 帧指针缓存（unsafe 面小、收益 ~5-8%）。
+- [x] **OO prelink 去税 + 变量语义修正（Rounds Q/R）**：注册一次性、
+  `(qualified,ns_part)` 预计算、去冗余 seed、memo 身份补 ns —— oovars
+  0.69x→**0.58x** 指令 / 0.96x→0.70x wall；新增 judge 回归
+  `oo_instance_vars.tcl`（88/88）。
+- [x] **dloop 画像结论（0.68x）**：剩余成本 = 派发式 `incr acc [dict get …]`
+  的名字扫描（`split_array_ref`/`redirect_flat`，每次访问 2-3 扫）与 dict
+  插入（IndexMap rehash/alloc，摊销固有）——进一步需下表的 VarMap 键表示层。
+- [x] **rtcl-vm 边界 unfused()**（Round P）：`execute()` 入口展开融合 op
+  （与 JIT 同桥）；canonical 集之外的面（lappend 族）维持其既有显式拒绝。
+- [ ] **OO 派发 per-call 字符串面（Round O 画像，oovars 0.69x）**：
+  1. prelink 索引预计算：链 memo 构建时把 `(slot_idx, key, name)` 预先算好
+     （编译体 locals 已知），每调用安装省去 `resolve_var_link` memo 探测 +
+     `slot_index_of` 线性扫描（≈5% oovars）。
+  2. `ChainEntry` 携带 owner 变量表 `Rc`（9 个构建点），去每调用
+     `owner_variables` 的表查找（≈2%）。
+  3. 派发站点级 OO memo（`ResolvedCmd` 增 OoMethod 变体 + backfill 探测），
+     去 KeyMemo/ChainMemo 的每调用哈希+memcmp（≈4-6%，改动大）。
+  4. `head_cache` 的 typed 比较 → 与调用站点共享 `Rc<str>` 身份（需
+     `Value` 字符串 rep 可暴露 Rc，或站点级持有）。
+- [ ] **下一批（按预期收益，Round L+ 候选）**：
+  1. `BEGIN_CMD` 的 `word_srcs` 借用化：`cur_cmd_word_srcs` 改 `(*const
+     SrcSpan, len)` 新type（site/单元生命周期内有效；save/restore 只拷指针），
+     去每命令 rc++/--——p_only 画像里 `op_begin_cmd` 5% + `drop<Rc<Vec<SrcSpan>>>`
+     3.7%；预期 fe/fib ~5%。**unsafe，需严肃审 lifetimer**（跨嵌套 eval 的
+     saved 引用链：调用者的单元在其 `exec_bytecode` 帧存活期间一直有效）。
+  2. fib 调用路径：`call_proc`（画像 11%）——参数绑定零拷贝化、`slot_mode`
+     门的检查合并、`ns_of_qualified` 的每调用开销。
+  3. 空循环基线 524 vs 337 instr/迭代：dispatch + region 簿记（Vec push/pop）；
+     候选 = `bodies` 预留 + unchecked push（unsafe）、`frames.last()` 缓存
+     （VmState 帧指针 + generation）——深水区。
+  4. 更多语句窗口：`incr x [expr {...}]`、`set x [cmd ...]`（含 dispatch 的
+     bracket 结果窗口）、`[SubEnd, DynCall/Call]`。
 - [ ] **foreach 路由对齐**（G9f 存档，G24 已落 framed 双模式的一半）：
   全局编译 foreach 已工作（G21 实验 + G24 framed）✅ **已完成的
   部分：全局内联 + framed 错误协议**。剩余：`uplevel`/`namespace eval`
@@ -78,6 +136,35 @@
   `HostStringBacking` trait（choke point = `value.rs` 的 as_str 物化
   入口）；rtcl-wasm 默认 on。前置：string.allium 加 astral probe 裁决
   `string length` 三方语义。
+
+## perf/interp-arch-opt 评审跟进（2026-10-18，PR #1 合并时记录）
+
+- [ ] **P1 prelink 去 seed 语义回归**（call.rs `frame_prelink`）：方法存活期
+  `namespace delete [self namespace]` 后读 `variable` 声明变量，master/tclsh
+  返回旧值、现返回 no such variable（构造器预设值丢失）。触发面窄；修法
+  候选：prelink 恢复 seed（付一次拷贝）或 ns 删除时把链接值物化回
+  locals。需补 judge 回归用例。
+- [ ] **P1 OO proc_memo 单槽 × 实例 ns 身份**（oo.rs）：一个类的全部实例
+  共享一个 memo cell，多实例交替调用同方法时 0 命中并全量重编译
+  ProcDef——单实例热循环（oo_bench2 形状）之外反而比拼串路径慢。修法
+  候选：chain 构建时对克隆 def 换 fresh_memo，或 memo 改 per-ns 小 map。
+- [ ] **P1 consts_code ABA 窗口（预存，master 同款）**（vm_exec.rs）：
+  const_pool 2048 clear-all 丢弃 keepalive 后，新 ByteCode 复用同地址可
+  使 `ptr::eq` 误判 same → 静默错值。修法：state 改持 `Option<Rc<ByteCode>>`
+  保活身份（一次 Rc bump）。
+- [ ] P2 proc_memo 身份缺 method 名：`renamemethod` 后 arity 错误文本吐
+  旧方法名（仅用法串，非执行语义）。
+- [ ] P2 ctor/dtor 未迁移 prelink（双轨 OO variable 链接实现并存）。
+- [ ] P2 tier1_epoch 名单缺 `lappend`（预存）：shadow lappend 不失效已
+  编译体内联折叠；名单与 compiler Tier-1 清单两处手工同步，加锚定注释。
+- [ ] P2 宿主 `register_command` 不 bump tier1_epoch（预存）：宿主注册
+  set/if 等名字不失效内联折叠。
+- [ ] P2 融合臂慢路径直调 cmd_incr/cmd_lappend 跳过 `err_code_raised`
+  重置：catch 遗留态下 ::errorCode 派生可能偏差。
+- [ ] P2 varmap.rs 注释错误：`"abc"` vs `"abc\0"` 的 str-hash 并不能区分
+  （尾零填充后 word 相同）；HashMap 等价比较兜底，仅性能面。
+- [ ] P2 内联折叠 Tier1 命令不计步（直线大编译体 max_steps 低估）——
+  设计取舍，文档化即可。
 
 ## 已完成（近三轮，供对照）
 

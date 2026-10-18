@@ -38,6 +38,8 @@ use core::cell::RefCell;
 use std::collections::HashMap;
 type FxMapK<K, V> =
     std::collections::HashMap<K, V, std::hash::BuildHasherDefault<crate::interp::varmap::VarHasher>>;
+#[cfg(feature = "embedded")]
+type FxMapK<K, V> = alloc::collections::BTreeMap<K, V>;
 
 #[cfg(feature = "embedded")]
 use alloc::collections::BTreeMap as HashMap;
@@ -62,7 +64,18 @@ pub(crate) enum MethodKind {
 }
 
 /// 方法 proc 体 memo：(typed name, 参数名表, 定义)。
-type ProcMemo = Option<(String, Vec<String>, Rc<ProcDef>)>;
+/// Memo layout: `(owner vars, def namespace, ProcDef, prelink entries)`.
+///
+/// The namespace is part of the identity: one `MethodDef` serves every
+/// instance of a class, and each instance's `variable` links resolve in
+/// its OWN namespace (`::oo::ObjN`) — the shared class `variables` list
+/// alone would let one instance's prelink resolution leak to another.
+type ProcMemo = Option<(
+    Option<Rc<Vec<String>>>,
+    Rc<str>,
+    Rc<ProcDef>,
+    Rc<Vec<crate::interp::PrelinkEntry>>,
+)>;
 
 /// A method definition (own methods, forwards, constructors, destructors).
 #[derive(Debug, Clone)]
@@ -76,11 +89,14 @@ pub(crate) struct MethodDef {
     pub kind: MethodKind,
     /// Compiled form of the assembled method [`ProcDef`], memoised (see
     /// `memoised_proc_def`): `(typed method name, owner `variable` snapshot,
-    /// ProcDef)`.  `Rc<RefCell<..>>` so chain clones share one cell; a
-    /// redefinition installs a fresh `MethodDef` (fresh cell), retiring the
-    /// memo with its inputs.  The vars snapshot is the `link_prefix` input —
-    /// a `variable` declaration change rebuilds (the `define` word also
-    /// bumps `mutation_ctr`, retiring the chain memo with it).
+    /// ProcDef, the resolved link-name list)`.  `Rc<RefCell<..>>` so chain
+    /// clones share one cell; a redefinition installs a fresh `MethodDef`
+    /// (fresh cell), retiring the memo with its inputs.  The vars snapshot
+    /// is the `link_prefix` input — a `variable` declaration change
+    /// rebuilds (the `define` word also bumps `mutation_ctr`, retiring the
+    /// chain memo with it).  The link list rides the same key: a hit hands
+    /// the frame-prelink list back as an `Rc`, so a method call allocates
+    /// nothing for its `variable` links.
     pub proc_memo: Rc<RefCell<ProcMemo>>,
     /// Cached argument head for the invoked method: (typed name, the two
     /// head Values [typed, method]).  The typed name varies per CALL SITE
@@ -121,29 +137,32 @@ type KeyMemo = FxMapK<Rc<str>, (u64, Option<Rc<str>>)>;
 /// A plain object.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct OoObject {
-    /// Per-object namespace (`::oo::ObjN`).
-    pub ns: String,
+    /// Per-object namespace (`::oo::ObjN`).  `Rc<str>`: the dispatcher
+    /// hands it to `call_proc` (and `self namespace`) on every call.
+    pub ns: Rc<str>,
     /// Canonical class key.
     pub class: String,
     /// Per-object mixins (canonical keys).
     pub mixins: Vec<String>,
     /// Per-object methods in definition order.
     pub methods: Vec<(String, MethodDef)>,
-    /// `variable` declarations (definition order).
-    pub variables: Vec<String>,
+    /// `variable` declarations (definition order).  `Rc`: the method-call
+    /// fast path memoises on this list's identity (a declaration replaces
+    /// the whole vector, so a pointer compare detects it).
+    pub variables: Rc<Vec<String>>,
 }
 
 /// A class (both the behaviour of its instances and, via `obj_*`, the
 /// class-as-object's own per-object definitions).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct OoClass {
-    pub ns: String,
+    pub ns: Rc<str>,
     pub superclasses: Vec<String>,
     /// Class-level mixins.
     pub mixins: Vec<String>,
     /// Methods of *instances* of this class.
     pub methods: Vec<(String, MethodDef)>,
-    pub variables: Vec<String>,
+    pub variables: Rc<Vec<String>>,
     /// Names hidden by `unexport` of a method this class does not itself
     /// define (hides the inherited implementation).
     pub hidden: Vec<String>,
@@ -153,7 +172,7 @@ pub(crate) struct OoClass {
     pub filters: Vec<String>,
     // ── the class object's own per-object definitions (oo::objdefine) ──
     pub obj_methods: Vec<(String, MethodDef)>,
-    pub obj_variables: Vec<String>,
+    pub obj_variables: Rc<Vec<String>>,
     pub obj_mixins: Vec<String>,
 }
 
@@ -163,8 +182,12 @@ pub(crate) struct OoClass {
 /// redefinitions (the old `to_vec` copy's semantics, without the copy).
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveMethod {
-    pub obj: String,
-    pub method: String,
+    /// `Rc<str>`: the hot dispatcher shares the resolved key and the
+    /// chain-memo's method key instead of allocating two Strings per
+    /// method call (profile: ~1.5% malloc + ~1.5% free under
+    /// `invoke_method`/`exec_chain_entry`, plus their drops).
+    pub obj: Rc<str>,
+    pub method: Rc<str>,
     pub chain: Rc<Vec<ChainEntry>>,
     pub index: usize,
     /// `frames.len()` before the method's frame was pushed; the entry is
@@ -185,8 +208,14 @@ pub(crate) enum DefineTarget {
 #[derive(Debug, Default)]
 pub(crate) struct OoState {
     pub next_obj_id: usize,
-    pub objects: HashMap<String, OoObject>,
-    pub classes: HashMap<String, OoClass>,
+    // Fx-hashed: these are probed by canonical object/class key on every
+    // OO dispatch (`resolve_object_key`, `owner_variables`,
+    // `object_ns_of`); std's SipHash was ~5% of the oo_bench2_vars
+    // profile in `find<(String, OoClass)>`.  Never iterated for output
+    // (`creation_order` drives listings), so the hash choice is
+    // order-invisible.
+    pub objects: FxMapK<String, OoObject>,
+    pub classes: FxMapK<String, OoClass>,
     /// Objects and classes in creation order (listing/cascade order).
     pub creation_order: Vec<String>,
     pub active: Vec<ActiveMethod>,
@@ -198,7 +227,7 @@ pub(crate) struct OoState {
     /// `my`/`self`/`next` command keys → owning object key.  Entries whose
     /// key no longer holds such a command were renamed away and are swept
     /// when their owner is destroyed (oo-1.20).
-    pub my_commands: HashMap<String, String>,
+    pub my_commands: FxMapK<String, String>,
     /// Structural mutation stamp: bumped at EVERY mutation of the class /
     /// object tables (create, destroy, every define word — see the bump
     /// sites in this module).  [`OoState::chain_memo`] entries validate
@@ -278,7 +307,7 @@ pub(crate) fn init(interp: &mut Interp) {
     // must-be list ends with `destroy`.
     let id = interp.oo.next_obj_id + 1;
     interp.oo.next_obj_id = id;
-    let mut root = OoClass { ns: format!("::oo::Obj{}", id), ..Default::default() };
+    let mut root = OoClass { ns: Rc::from(format!("::oo::Obj{}", id)), ..Default::default() };
     root.methods.push(("destroy".to_string(), builtin_method("destroy")));
     interp.oo.classes.insert("::oo::object".to_string(), root);
     interp.oo.creation_order.push("::oo::object".to_string());
@@ -287,7 +316,7 @@ pub(crate) fn init(interp: &mut Interp) {
     let id = interp.oo.next_obj_id + 1;
     interp.oo.next_obj_id = id;
     let mut metaclass =
-        OoClass { ns: format!("::oo::Obj{}", id), superclasses: vec!["::oo::object".to_string()], ..Default::default() };
+        OoClass { ns: Rc::from(format!("::oo::Obj{}", id)), superclasses: vec!["::oo::object".to_string()], ..Default::default() };
     metaclass.methods.push(("create".to_string(), builtin_method("create")));
     metaclass.methods.push(("new".to_string(), builtin_method("new")));
     interp.oo.classes.insert("::oo::class".to_string(), metaclass);
@@ -628,19 +657,17 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
 }
 
 /// Owner-specific variable declarations for a chain entry.
-fn owner_variables<'a>(interp: &'a Interp, owner: &'a Owner, key: &str) -> &'a [String] {
+fn owner_variables<'a>(
+    interp: &'a Interp,
+    owner: &'a Owner,
+    key: &str,
+) -> Option<&'a Rc<Vec<String>>> {
     match owner {
         Owner::Object => match interp.oo.objects.get(key) {
-            Some(o) => &o.variables,
-            None => match interp.oo.classes.get(key) {
-                Some(c) => &c.obj_variables,
-                None => &[],
-            },
+            Some(o) => Some(&o.variables),
+            None => interp.oo.classes.get(key).map(|c| &c.obj_variables),
         },
-        Owner::Class(c) => match interp.oo.classes.get(c) {
-            Some(cls) => &cls.variables,
-            None => &[],
-        },
+        Owner::Class(c) => interp.oo.classes.get(c).map(|cls| &cls.variables),
     }
 }
 
@@ -725,8 +752,8 @@ fn does_not_refer(kind_obj: bool, typed: &str) -> Error {
 /// name, used in messages and `info level 0`).
 fn exec_chain_entry(
     interp: &mut Interp,
-    key: &str,
-    method: &str,
+    key: &Rc<str>,
+    method: &Rc<str>,
     index: usize,
     chain: &Rc<Vec<ChainEntry>>,
     call_args: &[Value],
@@ -765,8 +792,12 @@ fn exec_chain_entry(
             // setup (the same link, without dispatching a `variable`
             // command per name per call).  Memoised on the MethodDef;
             // a `variable` change rebuilds via the snapshot compare.
+            // The def namespace rides the same value the frame install
+            // would use (the object's namespace) — computed before the
+            // memo build so the prelink list can pre-resolve each name.
+            let ns = object_ns_of(interp, key);
             let (proc_def, links) =
-                memoised_proc_def(interp, &entry.owner, key, &entry.def, method);
+                memoised_proc_def(interp, &entry.owner, key, &entry.def, method, &ns);
             if !links.is_empty() {
                 interp.frame_prelink = Some(links);
             }
@@ -795,10 +826,9 @@ fn exec_chain_entry(
             }
             args.extend_from_slice(call_args);
 
-            let ns = object_ns_of(interp, key);
             interp.oo.active.push(ActiveMethod {
-                obj: key.to_string(),
-                method: method.to_string(),
+                obj: Rc::clone(key),
+                method: Rc::clone(method),
                 chain: Rc::clone(chain),
                 index,
                 frame_depth: interp.frames.len(),
@@ -873,27 +903,52 @@ fn memoised_proc_def(
     key: &str,
     def: &MethodDef,
     method: &str,
-) -> (Rc<ProcDef>, Vec<String>) {
-    // The link list: the owner's declared variables minus the names the
-    // parameter list already binds (the old `link_prefix` filter — the
-    // prefix text itself is gone; the links install at frame setup).
-    let links: Vec<String> = {
-        let vars = owner_variables(interp, owner, key);
-        let names: Vec<&str> = def.params.iter().map(|(p, _)| p.as_str()).collect();
-        vars.iter()
-            .filter(|v| !names.contains(&v.as_str()))
-            .cloned()
-            .collect()
-    };
+    ns: &Rc<str>,
+) -> (Rc<ProcDef>, Rc<Vec<crate::interp::PrelinkEntry>>) {
+    // The live `variable` list is the memo key — one probe of the owner's
+    // table, no allocation; the link list (owner's declared variables
+    // minus parameter-bound names — the old `link_prefix` filter, the
+    // prefix text itself is gone) is built only on a rebuild and cached
+    // beside the ProcDef.
+    // The owner's live `variable` list, by identity: the memo keys on the
+    // `Rc`'s pointer (a declaration replaces the vector wholesale), so the
+    // per-call check is one pointer compare — no table-content walk.
+    let vars: Option<Rc<Vec<String>>> = owner_variables(interp, owner, key).cloned();
     {
-        let vars = owner_variables(interp, owner, key);
         let memo = def.proc_memo.borrow();
-        if let Some((n, vs, d)) = memo.as_ref() {
-            if n == method && vs.as_slice() == vars {
-                return (Rc::clone(d), links);
+        if let Some((vs, memo_ns, d, links)) = memo.as_ref() {
+            if Rc::ptr_eq(memo_ns, ns)
+                && match (vs, &vars) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                    _ => false,
+                }
+            {
+                return (Rc::clone(d), Rc::clone(links));
             }
         }
     }
+    let names: Vec<&str> = def.params.iter().map(|(p, _)| p.as_str()).collect();
+    let empty: Vec<String> = Vec::new();
+    let vars_slice: &[String] = vars.as_deref().unwrap_or(&empty);
+    let links: Rc<Vec<crate::interp::PrelinkEntry>> = Rc::new(
+        vars_slice
+            .iter()
+            .filter(|v| !names.contains(&v.as_str()))
+            .map(|v| {
+                // Pure string math (see `resolve_var_link`) — precomputed
+                // here so the per-call install never probes the memo.
+                let (qualified, ns_part) =
+                    crate::interp::commands::namespace::resolve_var_link(interp, ns, v);
+                crate::interp::PrelinkEntry {
+                    name: Rc::from(v.as_str()),
+                    qualified,
+                    ns_part,
+                    registered: core::cell::Cell::new(false),
+                }
+            })
+            .collect(),
+    );
     let mut pd = method_proc_def(&def.body, &def.params, method);
     // Compile at the same seam named `proc`s use; the compiled form also
     // unlocks call_proc's slot-locals binding (empty statics, params
@@ -905,19 +960,23 @@ fn memoised_proc_def(
     }
     pd.compiled = compiled;
     let proc_def = Rc::new(pd);
-    let snapshot = owner_variables(interp, owner, key).to_vec();
-    *def.proc_memo.borrow_mut() = Some((method.to_string(), snapshot, Rc::clone(&proc_def)));
+    *def.proc_memo.borrow_mut() = Some((
+        vars.clone(),
+        Rc::clone(ns),
+        Rc::clone(&proc_def),
+        Rc::clone(&links),
+    ));
     (proc_def, links)
 }
 
-fn object_ns_of(interp: &Interp, key: &str) -> String {
+fn object_ns_of(interp: &Interp, key: &str) -> Rc<str> {
     if let Some(o) = interp.oo.objects.get(key) {
-        return o.ns.clone();
+        return Rc::clone(&o.ns);
     }
     if let Some(c) = interp.oo.classes.get(key) {
-        return c.ns.clone();
+        return Rc::clone(&c.ns);
     }
-    "::".to_string()
+    Rc::from("::")
 }
 
 /// Invoke `method` on `key`, or produce the unknown-method error.
@@ -929,37 +988,44 @@ fn object_ns_of(interp: &Interp, key: &str) -> String {
 /// error path then skips the walk as well).
 fn invoke_method(
     interp: &mut Interp,
-    key: &str,
+    key: &Rc<str>,
     method: &str,
     call_args: &[Value],
     typed: &str,
     include_private: bool,
 ) -> Result<Value> {
-    let chain = chain_for(interp, key, method, include_private);
+    let (chain, method_rc) = chain_for(interp, key, method, include_private);
     if chain.is_empty() {
         return Err(unknown_method_error(interp, key, typed, method));
     }
-    exec_chain_entry(interp, key, method, 0, &chain, call_args, typed)
+    exec_chain_entry(interp, key, &method_rc, 0, &chain, call_args, typed)
 }
 
 /// The memoised [`build_chain`] for this invocation context.  Nested maps
 /// probed by `&str`: a hit allocates nothing (the flat `(String, String)`
 /// key allocated two Strings per probe — see [`OoState::chain_memo`]).
-fn chain_for(interp: &mut Interp, key: &str, method: &str, include_private: bool) -> Rc<Vec<ChainEntry>> {
-    let (memo, other) = if include_private {
-        (&interp.oo.chain_memo_priv, &interp.oo.chain_memo)
+fn chain_for(
+    interp: &mut Interp,
+    key: &str,
+    method: &str,
+    include_private: bool,
+) -> (Rc<Vec<ChainEntry>>, Rc<str>) {
+    let memo = if include_private {
+        &interp.oo.chain_memo_priv
     } else {
-        (&interp.oo.chain_memo, &interp.oo.chain_memo_priv)
+        &interp.oo.chain_memo
     };
-    if let Some((_, chain)) = memo
+    // Hit: hand back the memo's own method-name Rc — the dispatcher's
+    // ActiveMethod shares it, so a hit allocates nothing.
+    if let Some((k, (_, chain))) = memo
         .get(key)
-        .and_then(|inner| inner.get(method))
-        .filter(|(s, _)| *s == interp.oo.mutation_ctr)
+        .and_then(|inner| inner.get_key_value(method))
+        .filter(|(_, (s, _))| *s == interp.oo.mutation_ctr)
     {
-        return Rc::clone(chain);
+        return (Rc::clone(chain), Rc::clone(k));
     }
-    let _ = other;
     let chain = Rc::new(build_chain(interp, key, method, include_private));
+    let method_rc: Rc<str> = Rc::from(method);
     const CHAIN_MEMO_MAX: usize = 512;
     {
         let memo = if include_private {
@@ -972,9 +1038,9 @@ fn chain_for(interp: &mut Interp, key: &str, method: &str, include_private: bool
         }
         memo.entry(Rc::from(key))
             .or_insert_with(FxMapK::default)
-            .insert(Rc::from(method), (interp.oo.mutation_ctr, Rc::clone(&chain)));
+            .insert(Rc::clone(&method_rc), (interp.oo.mutation_ctr, Rc::clone(&chain)));
     }
-    chain
+    (chain, method_rc)
 }
 
 // ── the object dispatcher ──────────────────────────────────────────────
@@ -1008,8 +1074,8 @@ extern "Rust" fn cmd_oo_my(interp: &mut Interp, args: &[Value]) -> Result<Value>
     // Borrowed throughout (see cmd_oo_object).
     let typed = args[0].as_str();
     let cmd_key = qualify(&interp.current_namespace, typed);
-    let key = match interp.oo.my_commands.get(&cmd_key) {
-        Some(k) => k.clone(),
+    let key: Rc<str> = match interp.oo.my_commands.get(&cmd_key) {
+        Some(k) => Rc::from(k.as_str()),
         None => return Err(Error::invalid_command(typed)),
     };
     let ns = object_ns_of(interp, &key);
@@ -1150,7 +1216,7 @@ extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Valu
     let typed = Value::from_str(&l0)
         .as_list()
         .and_then(|l| l.first().map(|v| v.as_str().to_string()))
-        .unwrap_or_else(|| act.obj.clone());
+        .unwrap_or_else(|| act.obj.to_string());
     exec_chain_entry(interp, &act.obj, &act.method, next_index, &act.chain, &call_args, &typed)
 }
 
@@ -1282,12 +1348,12 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
             name_typed
         )));
     }
-    let ns = next_ns(interp);
+    let ns = Rc::from(next_ns(interp));
     if is_meta {
         interp.oo.classes.insert(
             canonical.clone(),
             OoClass {
-                ns: ns.clone(),
+                ns: Rc::clone(&ns),
                 superclasses: vec!["::oo::object".to_string()],
                 ..Default::default()
             },
@@ -1295,7 +1361,7 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
     } else {
         interp.oo.objects.insert(
             canonical.clone(),
-            OoObject { ns: ns.clone(), class: class_key.to_string(), ..Default::default() },
+            OoObject { ns: Rc::clone(&ns), class: class_key.to_string(), ..Default::default() },
         );
     }
     interp.oo.mutation_ctr += 1;
@@ -1335,7 +1401,7 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
                 .oo
                 .classes
                 .get(class_key)
-                .map(|c| c.variables.clone())
+                .map(|c| (*c.variables).clone())
                 .unwrap_or_default();
             let body = format!("{}{}", link_prefix(&vars, &ctor.params), ctor.body);
             let proc_def = ProcDef {
@@ -1348,13 +1414,13 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
                 vec![Value::from_str(&name_typed), Value::from_str("constructor")];
             args.extend_from_slice(&rest[1..]);
             interp.oo.active.push(ActiveMethod {
-                obj: canonical.clone(),
-                method: "constructor".to_string(),
+                obj: Rc::from(canonical.as_str()),
+                method: Rc::from("constructor"),
                 chain: Rc::new(ctor_chain(interp, class_key)),
                 index: 0,
                 frame_depth: interp.frames.len(),
             });
-            let r = interp.call_proc(&proc_def, &args, &name_typed, Some(ns.clone()));
+            let r = interp.call_proc(&proc_def, &args, &name_typed, Some(Rc::clone(&ns)));
             cleanup_active(interp);
             if let Err(e) = r {
                 detach_object(interp, &canonical, &ns, false);
@@ -1367,10 +1433,10 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
 
 fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value]) -> Result<Value> {
     let name = next_ns(interp);
-    let ns = name.clone();
+    let ns: Rc<str> = Rc::from(name.as_str());
     interp.oo.objects.insert(
         name.clone(),
-        OoObject { ns: ns.clone(), class: class_key.to_string(), ..Default::default() },
+        OoObject { ns: Rc::clone(&ns), class: class_key.to_string(), ..Default::default() },
     );
     interp.oo.mutation_ctr += 1;
     attach_object(interp, &name, &ns);
@@ -1383,7 +1449,7 @@ fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value]) -> Result<Value>
             .oo
             .classes
             .get(class_key)
-            .map(|c| c.variables.clone())
+            .map(|c| (*c.variables).clone())
             .unwrap_or_default();
         let body = format!("{}{}", link_prefix(&vars, &ctor.params), ctor.body);
         let proc_def = ProcDef {
@@ -1396,13 +1462,13 @@ fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value]) -> Result<Value>
         let mut args: Vec<Value> = vec![Value::from_str(&typed), Value::from_str("constructor")];
         args.extend_from_slice(rest);
         interp.oo.active.push(ActiveMethod {
-            obj: name.clone(),
-            method: "constructor".to_string(),
+            obj: Rc::from(name.as_str()),
+            method: Rc::from("constructor"),
             chain: Rc::new(ctor_chain(interp, class_key)),
             index: 0,
             frame_depth: interp.frames.len(),
         });
-        let r = interp.call_proc(&proc_def, &args, &typed, Some(ns.clone()));
+        let r = interp.call_proc(&proc_def, &args, &typed, Some(Rc::clone(&ns)));
         cleanup_active(interp);
         if let Err(e) = r {
             detach_object(interp, &name, &ns, false);
@@ -1515,7 +1581,7 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
                     .oo
                     .classes
                     .get(c)
-                    .map(|cls| cls.variables.clone())
+                    .map(|cls| (*cls.variables).clone())
                     .unwrap_or_default(),
                 Owner::Object => vec![],
             };
@@ -1527,8 +1593,8 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
             };
             let args = vec![Value::from_str(key), Value::from_str("destructor")];
             interp.oo.active.push(ActiveMethod {
-                obj: key.to_string(),
-                method: "destructor".to_string(),
+                obj: Rc::from(key),
+                method: Rc::from("destructor"),
                 chain: Rc::clone(&chain),
                 index: i,
                 frame_depth: interp.frames.len(),
@@ -1888,18 +1954,24 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                     DefineTarget::Class(name2) => {
                         if let Some(c) = interp.oo.classes.get_mut(name2) {
                             if !c.variables.contains(&name) {
-                                c.variables.push(name);
+                                let mut v = (*c.variables).clone();
+                                v.push(name);
+                                c.variables = Rc::new(v);
                             }
                         }
                     }
                     DefineTarget::Object(name2) => {
                         if let Some(o) = interp.oo.objects.get_mut(name2) {
                             if !o.variables.contains(&name) {
-                                o.variables.push(name);
+                                let mut v = (*o.variables).clone();
+                                v.push(name);
+                                o.variables = Rc::new(v);
                             }
                         } else if let Some(c) = interp.oo.classes.get_mut(name2) {
                             if !c.obj_variables.contains(&name) {
-                                c.obj_variables.push(name);
+                                let mut v = (*c.obj_variables).clone();
+                                v.push(name);
+                                c.obj_variables = Rc::new(v);
                             }
                         }
                     }
@@ -2067,7 +2139,7 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     interp.oo.next_obj_id += 1;
     let new_ns = format!("::oo::Obj{}", interp.oo.next_obj_id);
     let mut copy = source.clone();
-    copy.ns = new_ns.clone();
+    copy.ns = Rc::from(new_ns.as_str());
     interp.oo.objects.insert(full.clone(), copy);
     interp.oo.mutation_ctr += 1;
     attach_object(interp, &full, &new_ns);
@@ -2098,8 +2170,8 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     if !chain.is_empty() {
         let r = exec_chain_entry(
             interp,
-            &full,
-            "<cloned>",
+            &Rc::from(full.as_str()),
+            &Rc::from("<cloned>"),
             0,
             &chain,
             &[Value::from_str(&src)],
@@ -2435,7 +2507,7 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         .map(|k| k[prefix.len()..].split('(').next().unwrap_or("").to_string())
                         .filter(|n| !n.is_empty())
                         .collect();
-                    if let Some(nsi) = interp.namespaces.get(&ns) {
+                    if let Some(nsi) = interp.namespaces.get(ns.as_ref()) {
                         for v in &nsi.variables {
                             let ns_prefix = format!("{}::", ns.trim_start_matches(':'));
                             let tail = v.strip_prefix(&ns_prefix);
@@ -2671,7 +2743,7 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let cls = interp.oo.classes.get(&key);
             let items: Vec<String> = match (sub, cls) {
                 ("mixins", Some(c)) => c.mixins.clone(),
-                ("variables", Some(c)) => c.variables.clone(),
+                ("variables", Some(c)) => (*c.variables).clone(),
                 ("filters", Some(c)) => c.filters.clone(),
                 _ => vec![],
             };
@@ -2735,7 +2807,7 @@ pub(crate) extern "Rust" fn cmd_namespace_entry(interp: &mut Interp, args: &[Val
                         continue;
                     }
                     let ns = object_ns_of(interp, &k);
-                    let hit = ns == qualified
+                    let hit = ns.as_ref() == qualified.as_str()
                         || ns.starts_with(&cmd_prefix)
                         || k == qualified
                         || k.starts_with(&cmd_prefix);

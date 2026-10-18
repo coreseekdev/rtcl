@@ -152,15 +152,21 @@ impl Compiler {
             }
         }
         c.compile_commands(commands);
+        // `locals_mode` must be visible to the optimization pipeline: the
+        // slot-pair fusions are interpreter-only (name-keyed units keep
+        // the JIT's accepted op set).
+        c.bytecode.locals_mode = locals_mode;
         c.bytecode.peephole();
         c.bytecode.source = source;
-        c.bytecode.locals_mode = locals_mode;
         c.bytecode.fallback = !c.bytecode.ops().iter().all(|op| matches!(op,
             OpCode::PushConst(_) | OpCode::PushConstWide(_) | OpCode::PushEmpty
             | OpCode::PushInt(_) | OpCode::PushFloat(_) | OpCode::PushTrue | OpCode::PushFalse
             | OpCode::Pop | OpCode::Dup
             | OpCode::LoadVar(_) | OpCode::StoreVar(_) | OpCode::StoreVarPop(_)
-            | OpCode::LoadLocal(_) | OpCode::StoreLocal(_) | OpCode::IncrLocal(_, _)
+            | OpCode::IncrVarPop(_, _)
+            | OpCode::LoadLocal(_) | OpCode::StoreLocal(_) | OpCode::StoreLocalPop(_)
+            | OpCode::IncrLocal(_, _)
+            | OpCode::IncrLocalPop(_, _)
             | OpCode::IncrVar(_, _)
             | OpCode::Concat(_) | OpCode::ExpandList | OpCode::ExpandMark
             | OpCode::Jump(_) | OpCode::JumpTrue(_) | OpCode::JumpFalse(_)
@@ -168,8 +174,15 @@ impl Compiler {
             | OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. }
             | OpCode::ForeachCollect | OpCode::ForeachEnd
             | OpCode::LappendLocal(_) | OpCode::LappendVar(_) | OpCode::BodyMarkFramed
+            | OpCode::LappendSlotSlot(_, _) | OpCode::LappendVarVar(_, _)
             | OpCode::AddSlotSlot(_, _) | OpCode::AddSlotImm(_, _)
             | OpCode::CmpSlotSlot(_, _, _) | OpCode::CmpSlotImm(_, _, _)
+            | OpCode::CmpSlotSlotJumpTrue(_, _, _, _) | OpCode::CmpSlotSlotJumpFalse(_, _, _, _)
+            | OpCode::CmpSlotImmJumpTrue(_, _, _, _) | OpCode::CmpSlotImmJumpFalse(_, _, _, _)
+            | OpCode::AddVarVar(_, _) | OpCode::AddVarImm(_, _)
+            | OpCode::CmpVarVar(_, _, _) | OpCode::CmpVarImm(_, _, _)
+            | OpCode::CmpVarVarJumpTrue(_, _, _, _) | OpCode::CmpVarVarJumpFalse(_, _, _, _)
+            | OpCode::CmpVarImmJumpTrue(_, _, _, _) | OpCode::CmpVarImmJumpFalse(_, _, _, _)
             | OpCode::Return | OpCode::Exit(_)
             | OpCode::EvalScript | OpCode::EvalExpr
             | OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Pow
@@ -179,7 +192,18 @@ impl Compiler {
             | OpCode::Not
             | OpCode::BitAnd | OpCode::BitOr | OpCode::BitXor | OpCode::BitNot
             | OpCode::Shl | OpCode::Shr
-            | OpCode::BeginCmd(_) | OpCode::BodyMark | OpCode::NextMark
+            | OpCode::BeginCmd(_) | OpCode::BeginCmdSubMark(_) | OpCode::ExprMarkBeginCmd(_)
+            | OpCode::BeginCmdPushConst(_, _)
+            | OpCode::SubEndStoreLocalPop(_) | OpCode::SubEndStoreVarPop(_) | OpCode::SubEndReturn
+            | OpCode::SwapToNextMark | OpCode::NextMarkBeginCmd(_)
+            | OpCode::BeginCmdIncrLocalPop(_, _, _) | OpCode::BeginCmdIncrVarPop(_, _, _)
+            | OpCode::ForeachNextClose(_, _)
+            | OpCode::SlotSetAddSS { .. } | OpCode::VarSetAddVV { .. }
+            | OpCode::PushConstSubMark(_) | OpCode::SubMarkBeginCmd(_)
+            | OpCode::ExprMarkBeginPushConst(_, _)
+            | OpCode::SubSlotImm(_, _) | OpCode::SubSlotSlot(_, _)
+            | OpCode::SubEndDynCall(_) | OpCode::SubEndCall { .. } | OpCode::SubEndAdd
+            | OpCode::BodyMark | OpCode::NextMark
             | OpCode::SubMark | OpCode::SubEnd | OpCode::ExprMark
             | OpCode::Call { .. } | OpCode::CallExpand { .. }
             | OpCode::DynCall { .. } | OpCode::DynCallExpand { .. }
@@ -1245,10 +1269,14 @@ mod tests {
         // Should have LoopEnter/LoopExit instead of EvalScript for body
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopEnter { .. })));
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopExit)));
-        // Body is compiled inline — incr becomes IncrVar
-        assert!(ops.iter().any(|o| matches!(o, OpCode::IncrVar(_, 1))));
-        // Condition is compiled inline — LoadVar + PushInt(10) + Lt
-        assert!(ops.iter().any(|o| matches!(o, OpCode::Lt)));
+        // Body is compiled inline — the statement `incr x` fuses to
+        // IncrVarPop; the condition's `LoadVar + PushInt + Lt + JumpFalse`
+        // chain fuses to a comparison branch (`CmpVarImmJumpFalse`).
+        assert!(ops.iter().any(|o| matches!(
+            o,
+            OpCode::IncrVarPop(_, 1) | OpCode::BeginCmdIncrVarPop(_, _, 1)
+        )));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::CmpVarImmJumpFalse(..))));
         // Should NOT have EvalExpr (expression was compiled inline)
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
     }
@@ -1264,8 +1292,14 @@ mod tests {
         let ops = bc.ops();
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopEnter { .. })));
         assert!(ops.iter().any(|o| matches!(o, OpCode::LoopExit)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::NextMark)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::IncrVar(_, 1))));
+        assert!(ops.iter().any(|o| matches!(
+            o,
+            OpCode::NextMark | OpCode::SwapToNextMark | OpCode::NextMarkBeginCmd(_)
+        )));
+        assert!(ops.iter().any(|o| matches!(
+            o,
+            OpCode::IncrVarPop(_, 1) | OpCode::BeginCmdIncrVarPop(_, _, 1)
+        )));
         // Condition compiled inline — no EvalExpr fallback.
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::DynCall { .. })));
@@ -1510,8 +1544,12 @@ mod tests {
         let src = "set s [expr {6 * 7}]";
         let bc = Compiler::compile_script(src).unwrap();
         let ops = bc.ops();
-        assert!(ops.iter().any(|o| matches!(o, OpCode::SubMark)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::SubEnd)));
+        // The bracket opener fuses with the site set (BeginCmdSubMark) or
+        // stays a standalone SubMark.
+        assert!(ops
+            .iter()
+            .any(|o| matches!(o, OpCode::SubMark | OpCode::BeginCmdSubMark(_))));
+        assert!(ops.iter().any(|o| matches!(o, OpCode::SubEnd | OpCode::SubEndStoreLocalPop(_) | OpCode::SubEndStoreVarPop(_) | OpCode::SubEndReturn)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalScript)));
         let expr_site = bc
             .sites
@@ -1544,8 +1582,16 @@ mod tests {
         let src = "set s [expr {[f 1] + [f 2]}]";
         let bc = Compiler::compile_script(src).unwrap();
         let ops = bc.ops();
-        assert!(ops.iter().any(|o| matches!(o, OpCode::ExprMark)));
-        assert!(ops.iter().any(|o| matches!(o, OpCode::Add)));
+        assert!(ops.iter().any(|o| matches!(
+            o,
+            OpCode::ExprMark
+                | OpCode::ExprMarkBeginCmd(_)
+                | OpCode::ExprMarkBeginPushConst(_, _)
+        )));
+        // The final `+` may ride a bracket-close fusion (SubEndAdd).
+        assert!(ops
+            .iter()
+            .any(|o| matches!(o, OpCode::Add | OpCode::SubEndAdd)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalExpr)));
         assert!(!ops.iter().any(|o| matches!(o, OpCode::EvalScript)));
 
@@ -1603,3 +1649,6 @@ mod tests {
         assert_eq!(bc.sites[0].text.slice(&bc.source), "while {$i < 2} {\n  incr i\n}");
     }
 }
+
+
+

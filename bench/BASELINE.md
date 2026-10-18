@@ -1341,3 +1341,340 @@ yaml_decode_4kb  74.2 us
 url_normalize    629 ns
 sha256_64b       203 ns
 
+
+## perf/interp-arch-opt — 解释器热径优化（2026-10-18）
+
+分支 `perf/interp-arch-opt`（不合并 master，JIT M2 期间独立验证）。画像工具：
+`setarch -R perf record -F 4000 -g` + 专用构建（frame pointers + debug info），
+`perf script` 文本自聚合（本机 `perf report` 超时不可用）；开发反馈以
+`perf stat -e instructions:u`（±0.01% 稳定）为准，wall 用交错 best-of-N。
+
+| 轮次 | 改动 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars |
+|---|---|---|---|---|---|---|
+| 起点（master f25d234） | — | 1.32x | 1.82x | 1.01x | 1.07x | 1.59x |
+| A（6892c48+da44359） | exec_op 热径内联 hot lane（共享 #[inline] 语义体） | 0.97x | 1.71x | 0.98x | 1.07x | 1.52x |
+| B1（c7e8f57） | `as_int/as_float` 补 Bool rep 快路径（循环条件不再字符串解析 "1"/"0"） | — | 1.47x | — | — | 1.49x |
+| B2（fb931c3） | Frame.has_aliased 帧级短路（slot 别名探测） | — | — | — | — | — |
+| B3（本提交） | Value::drop 内联两层（tag/refcount）+ as_int/as_float 拆分快慢 + strict_bool 内联 + op 边界检查单次化 | 1.03x | 1.23x | 1.01x | 0.97x | 1.47x |
+
+指令数比（rtcl/tclsh，越低越好）：fib 1.04x、fe 1.51x、dloop 0.86x、oo2 0.73x、
+oovars 1.05x、build-only 1.29x。fe 的余量集中在 `build`（lappend 循环，1.22x）；
+oovars 是内存停顿主导（指令 1.05x 但 wall 1.47x：cache-refs 346M vs tclsh 74M）。
+
+## Round D/E — 分配与扫描去除（2026-10-18，继续）
+
+| 轮次 | 改动 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars |
+|---|---|---|---|---|---|---|
+| D1+D2（bd71f9e） | OO `objects/classes/my_commands`、namespace `variables` 换 Fx 哈希（去 SipHash）；VarHasher 尾块免 memcpy | — | — | — | 0.67x | 0.96x |
+| D3（2cd2669） | 派发链名字 `Rc<str>` 共享（ActiveMethod/chain memo 键/对象 ns）、prelink 记忆化（ProcMemo 携带链接表 Rc）、upvar 链接 `Rc<str>` + upvars 键 `Rc<str>` | — | — | — | 0.60x | 0.81x |
+| E1（本提交） | 短名 `(` 扫描内联字节循环（util::find_paren/strip_paren）、`dead_link_error`/`check_parent_ns` 空表/无 `::` 快速短路 | 1.02x | 1.51x | 0.70x | 0.54x | 0.75x |
+
+以上为指令数比（rtcl/tclsh）。wall 对应：oo2 0.63x、oovars 1.04x、dloop 0.77x、fib 0.87x、fe 1.33x。
+
+**新目标（wasm 视角）**：指令数比 0.5~0.6x 为目标，1.2x 为下限。当前最差点：
+- fe_bench 1.51x 指令 / 1.33x wall —— `build`（lappend 循环，build-only 1.29x 指令）是唯一还大幅落后的热点
+- fib25 1.02x 指令（proc 调用路径）
+- oovars 0.75x 指令但 wall 1.04x（内存停顿：IPC 比 ≈0.72）
+
+## Round F — nanopass 融合：比较/分支与槽对窗口（2026-10-18，继续）
+
+背景：JIT 侧（master `24ed853`）的发射器已是 nanopass 管线（L0→L4 +
+层间 `check.rs` 校验）。本轮把解释器的 opcode 构造侧同样推进为「独立纯
+函数 pass、单向重写」：新增 `ByteCode::fuse_slot_pairs`（由 `peephole()`
+驱动，与既有折叠 pass 同轮迭代；`locals_mode` 门控），按跳转靶点位图
+逐窗口重写——窗口内部（head 之外）是靶点则拒绝融合（融合 op 整体替换
+窗口，源自 consumer 的入口会丢掉 producer）；`strip_nops` 同步重映射
+融合 op 自带的 `t`。
+
+| 窗口 | 融合 op |
+|---|---|
+| `[CmpSlotSlot, JumpTrue/JumpFalse]` | `CmpSlotSlotJumpTrue/False(a,b,cc,t)` |
+| `[CmpSlotImm, JumpTrue/JumpFalse]` | `CmpSlotImmJumpTrue/False(a,k,cc,t)` |
+| `[LoadLocal, LappendLocal, Pop]` | `LappendSlotSlot(src,dst)` |
+| `[IncrLocal, Pop]` | `IncrLocalPop(s,k)` |
+
+语义与兼容保障：
+- 融合 op 只出现在 locals-mode 单元（JIT 只编译 name-keyed 单元，接受集
+  不受扰）；`rtcl-vm` 并行 VM 显式拒绝，`ByteCode.fallback` 白名单同步
+  补入（语义标志不变）。
+- `OpCode` 尺寸簿记测试（≤16B，dispatch 每 op 拷贝一次枚举）——新
+  payload 不得顶出信封。
+- 分支融合的 backward-charge 以「原 jump op 索引 +1」为界（`t == pc+1`
+  与派发版 JumpFalse 同判）；fall-through 即 `st.pc` 本身（融合后布局）。
+- 拾获两个真 bug：① `peephole()` 早于 `locals_mode` 赋值（pass 空跑）；
+  ② 融合臂 fall-through 多加 1，吞掉紧随的 `BEGIN_CMD`——judge
+  `gen_proc-old` 抓到（body 错误帧与 proc 帧从 errorInfo 消失），已修 +
+  回归测试 `fused_branch_fallthrough_keeps_site`。
+- 同批：`LappendLocal` fallback 名的 `.to_string()` 惰性化（此前每次迭代
+  一次 malloc+memcpy ≈13% build 时间）。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| 起点（本轮前） | 1.02x | 1.51x | 0.70x | 0.54x | 0.75x | 1.29x |
+| F（本提交） | 1.00x | 1.40x | 0.70x | 0.54x | 0.75x | 0.86x |
+
+指令数比（rtcl/tclsh）。wall（3 次交错 best-of-N）：fe 1.18x、dloop 0.78x、
+oo2 0.56x、oovars 0.99x、fib 1.00x。build 循环每迭代 op 数 12→8。
+
+## Round G — name-keyed 超指令 + de-fusion 桥（2026-10-18，JIT 约束解除后）
+
+方向更新（用户裁决）：wasm 性能目标优先，**允许 break JIT**——JIT 侧靠
+文档 + 一个展开钩子跟进，不再以「JIT 接受集」反向限制解释器的 op 集合。
+
+- `fuse_pairs` 新增 name-keyed 窗口（eval 级单元 = 全局/namespace 变量
+  代码，也是 wasm 嵌入场景的主力形态）：
+  `[LoadVar,LoadVar,ADD/CMP] → AddVarVar/CmpVarVar`、
+  `[LoadVar,PushInt k,ADD/CMP] → AddVarImm/CmpVarImm`（含镜像序
+  `[PushInt,LoadVar,CMP]`）、`[LoadVar,LappendVar,Pop] → LappendVarVar`、
+  `[IncrVar,Pop] → IncrVarPop`、`[CmpVar*,JumpT/F] → CmpVar*JumpT/F`
+  （4 个融合分支）。
+- `StoreLocalPop`（[StoreLocal,Pop]）：值 move 进 slot，去 clone+drop；
+  `frame_slot_write_move` 与其克隆版同款守卫。
+- `ByteCode::unfused()`：全部融合 op 展开回**融合前**规范窗口（含靶点
+  重映射、全族覆盖测试 `unfused_covers_every_family`）。JIT 编译边界调用
+  之（`exec.rs` + golden/roundtrip/microbench 测试助手），**JIT 接受集与
+  golden 全绿、零回退损失**；原生 lower 列为可选优化。
+- `docs/JIT-OPCODE-DELTA.md`：逐 op 语义、窗口表、建议 lower 路径、降级
+  保真三件事（回边计步/站点 region/值语义）与「已完成/可选」接线清单。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| F 后 | 1.00x | 1.40x | 0.70x | 0.54x | 0.75x | 0.86x |
+| G（本提交） | 1.00x | 1.29x | 0.69x | 0.53x | 0.73x | 0.85x |
+
+补充（指令数比）：sum_only 0.78x→0.72x（全局 while + 5×foreach 求和）；
+全局 while 循环 12→8 op/迭代；oo2 4863M→4737M、oovars 7.09G→6.90G。
+wall（3 次交错 best-of-N）：fe 1.13x、dloop 0.73–0.81x、oo2 0.57x、
+oovars 0.96x、sum_only 0.68x、fib 1.03x（噪声带内）。
+
+## Round H — meta op 与循环控制融合（2026-10-18，继续）
+
+数据驱动：per-op 语义体 ≈ tclsh 的 1.1x，真正差距在**每迭代 op 数**（错误
+簿记的 meta op 税）。逐项增量测量（空 for 循环基线）显示 rtcl 534 instr/迭代
+vs tclsh 337。本轮把编译器的高频簿记相邻对交给 `fuse_pairs`：
+
+- meta 对：`[BeginCmd,SubMark]→BeginCmdSubMark`、
+  `[ExprMark,BeginCmd]→ExprMarkBeginCmd`、`[BeginCmd,PushConst]→
+  BeginCmdPushConst`、`[SubEnd,StoreLocalPop/StoreVarPop/Return]→
+  SubEndStoreLocalPop/…VarPop/SubEndReturn`。
+- 循环控制：`[Jump(t=下一op),NextMark]→SwapToNextMark`、
+  `[Jump(t=下一op),ForeachNext]→ForeachNextClose`、
+  `[NextMark,BeginCmd]→NextMarkBeginCmd`、
+  `[BeginCmd,IncrLocal/VarPop]→BeginCmdIncrLocal/VarPop`。
+- **class-A 靶点重定向**：被消费的 `NextMark`/`ForeachNext` 常是 `continue`
+  的落点——融合时把指向它的靶点重定向到融合 op 头（展开为 `[Nop,原op]`，
+  trampoline 语义）；执行器按 `LoopFrame` 归一化 region 栈（与 `op_continue`
+  同款），双入口等价、计步平价。
+- 两个自查 bug：`ForeachNextClose` 的 `body` 靶点漏进 `strip_nops` 重映射
+  （judge 8 例 + 1 panic 抓到）；class-A 融合需重定向 else 跳过归一化
+  （judge control_flow / gen_lmap 抓到）。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| G 后 | 1.00x | 1.29x | 0.69x | 0.53x | 0.73x | 0.85x |
+| H（本提交） | 0.99x | 1.23x | 0.69x | 0.52x | 0.72x | 0.84x |
+
+dloop 的 0.45x 假象说明：坏 remap 下循环少干活（judge 未绿时的数字不可用，
+已剔除）。空循环基线 534→517 instr/迭代。
+
+## Round I — 语句级融合（2026-10-18，继续）
+
+`set <slot> [expr {$a + $b>}]` / `set <var> [expr {$a + $b>}]` 的整段窗口
+（`[BeginCmdSubMark, BeginCmd, AddSlotSlot/AddVarVar, SubEndStoreLocal/VarPop]`）
+折叠为单 op `SlotSetAddSS` / `VarSetAddVV`（payload 14B，保持 ≤16 信封）；
+逐字复刻各步（站点、Sub region、读、加、关 region、move 写入），错误/region
+状态在任一步失败时与原窗口一致；`unfused()` 直落 7/8 op 规范形。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| H 后 | 0.99x | 1.23x | 0.69x | 0.52x | 0.72x | 0.84x |
+| I（本提交） | 0.99x | 1.10x | 0.69x | 0.52x | 0.72x | 0.84x |
+
+fe 的 `p` 循环每迭代 6 op → 3 op（BODY_MARK / SET_SS_ADD /
+FOREACH_NEXT_CLOSE）；wall（3 次交错）：fe 1.10x、dloop 0.81x、oo2 0.65x、
+oovars 1.01x、fib 0.97x。
+
+## Round J — foreach 绑定快路径 + body-mark 折叠（2026-10-18，继续）
+
+- `foreach_bind` 常见形（单 group、单变量、slot 目标）直绑：跳过双层迭代器
+  与 `Value::empty()` 的 TLS 查找（只在越界分支取用）——p_only −8%。
+- `[Jump(t=下一op), ForeachNext]` 融合把 **body region 的建设收进
+  FOREACH_NEXT_CLOSE**：body 入口指向 `BODY_MARK` 之后（首轮仍经
+  `ForeachStart` 落穿执行标记，后续迭代由融合 op 按 `framed/lmap` 开
+  region）——p 循环 3 op → 2 op（SET_SS_ADD / FOREACH_NEXT_CLOSE）。
+  非内联形状（body 非 BODY_MARK）保持原 op 对。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| I 后 | 0.99x | 1.10x | 0.69x | 0.52x | 0.72x | 0.84x |
+| J（本提交） | 0.99x | **0.99x** | 0.69x | 0.52x | 0.72x | 0.84x |
+
+**六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
+oovars 1.59 / build 1.29）。
+
+## 实验记录 — VarMap RC 键表示层（Round S，已回退）
+
+按计划试做 `VarMap/VarSet/UpvarMap` 键 → `Name(Rc<str>)`（ptr-first `Eq` +
+`Borrow<str>`，178 处机械修复全部由编译器引导落地；并把
+`UpvarLink::Global` 的**句柄身份**贯通到 `VarLoc::Global(Name)`：
+link 首次写入用同一 `Rc` 入表，槽-link 探针（`frame_slot_value/write/incr`
+的 `get_mut`）改为 `Name` 句柄查询 → 命中时 ptr 比较、跳过 memcmp）。
+
+实测（与基线逐项对比）：
+
+| bench | 基线 | 本次 | 结论 |
+|---|---|---|---|
+| fib25 | 508.1M | 507.0M | 持平 |
+| fe_bench | 577.5M | 577.8M | 持平 |
+| dloop | 2977M | 3030M | **+1.8% 回退** |
+| oo_bench2 | 4358M | 4355M | 持平 |
+| oovars | 5508M | 5517-5536M | 略负 |
+| build-only | 3467M | 3473M | 略负 |
+
+结论：**中性偏负，回退**。原因：省下的 memcmp（短名 ~10-20 instr）抵不过
+探针仍需的字符串 hash（未keyed Fx 也要 ~20-30 instr）与句柄克隆/释放
+（4-8 instr），且 `Name` 键让 hot 表的行宽/代码布局变动带来 dloop 的净负。
+**此实验关闭该项**：变量表键表示层在此架构下不成立；若未来做
+`Value` 字符串句柄共享（派发名/常量池），可重估「散列按身份缓存」的第三条路
+（哈希值随句柄记忆化，需不动用不安全代码的 memo 结构）。
+
+## Round R — OO 变量语义修正 + 大赢（2026-10-18，继续）
+
+两个语义发现（探针 + judge 语料联合作证）：
+
+1. **prelink 的「seed 局部副本」移除**：安装时把 namespace 变量的现值拷进
+   `frame.locals`（每次调用一次全局探测 + String 分配）。Tcl 的 `variable`
+   链接语义是活链接（读写直达 ns 变量，无副本）——upvar 链接已提供该路径，
+   seed 纯属冗余。移除后 oovars 6051M→**5515M**（−8.9%）。
+2. **方法 memo 身份补 ns**（我预计算引入的跨实例串扰，探针抓到）：一个
+   `MethodDef` 服务类的所有实例，而各实例的 `variable` 链接要在**自己的
+   ns**（`::oo::ObjN`）解析——memo 元组加入 def ns 的 `Rc` 身份比较；
+   新增 judge 语料 `oo_instance_vars.tcl` 作回归（tclsh 差分通过）。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| Q 后 | 0.85x | 0.93x | 0.68x | 0.48x | 0.64x | 0.74x |
+| R（本提交） | 0.85x | 0.93x | 0.68x | 0.48x | **0.58x** | 0.74x |
+
+## Round Q — OO prelink 条目预计算（2026-10-18，继续）
+
+OO 方法每次调用的 prelink 安装原本做 4 个哈希/字符串探测（`resolve_var_link`
+memo、namespace 变量集注册、slot 扫描、upvars 插入）。两步去化：
+
+- **注册一次性**：`PrelinkEntry.registered: Cell<bool>` —— namespace 变量集
+  的注册只跑一次（条目的失效域 = 链 memo = 对象 ns 生命周期）；
+- **`(qualified, ns_part)` 预计算**：`resolve_var_link` 是纯字符串函数
+  （其 memo 可替换、结果不可变）——在 `memoised_proc_def` 构建时（用对象
+  ns，与安装时同值）算好存入条目。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| P 后 | 0.85x | 0.93x | 0.68x | 0.48x | 0.69x | 0.74x |
+| Q（本提交） | 0.85x | 0.93x | 0.68x | 0.48x | **0.64x** | 0.74x |
+
+## Round P — rtcl-vm 即 VM（crate 重构，2026-10-18）
+
+- 删除未使用的演示 VM（`execute.rs`）与死 API `Interp::eval_compiled`；
+  `VmContext` 保留（JIT/wasm ABI 经它回调 `charge_step`）。
+- `interp/types/channel/command/host/parser` + stdlib `.tcl` 数据整体迁入
+  **`rtcl-vm`**；`rtcl-core` 变 facade（路径/feature 全透传，下游零改动）。
+  指令数比无回退：fib 0.85 / fe 0.93 / dloop 0.68 / oo2 0.48 / oovars 0.69 /
+  build 0.74（四道门全绿）。
+
+## Round K — 融合分支直取布尔（2026-10-18，继续）
+
+`expr_ops::cmp_bool(left, right, cc)`：比较的**真值**直返（`op_rel/op_eq/
+op_ne` 改为其薄包装，语义单一来源）；融合分支 op（`CmpSlot*/CmpVar*Jump*`）
+经新 `jump_if_bool` 直接消费，去掉每条件一次的
+`Value::from_bool`（缓存单例句柄）+ `strict_bool`（重强制）往返回。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| J 后 | 0.99x | 0.99x | 0.69x | 0.52x | 0.72x | 0.84x |
+| K（本提交） | **0.97x** | **0.96x** | 0.69x | 0.52x | 0.72x | **0.76x** |
+
+（起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
+build 1.29。）
+
+## Round O — OO 变量表 Rc 化（2026-10-18，继续）
+
+`OoObject/OoClass.variables`（+ `obj_variables`）从 `Vec<String>` 改为
+`Rc<Vec<String>>`：`variable` 声明**整体替换**向量（指针即版本），
+`memoised_proc_def` 的每调用校验从「方法名 + 变量表内容逐项比较」变为
+**一次指针比较**（`owner_variables` 返回 `Option<&Rc<..>>`，无所有者用
+`None` 身份）。oovars 6614M→6563M（0.69x）。
+
+画像（oovars 3978 样本）：memcmp 9.5%、hashbrown 探测 ~12%、call_proc 6.4%；
+per-call 字符串面 = KeyMemo/ChainMemo 两次哈希+memcmp、`owner_variables` 的
+object 表查找、`head_cache` 的 typed 比较、prelink 安装（`resolve_var_link`
+memo + `slot_index_of` 线性扫描 + `Upvars.insert`）——**下一批候选**（见
+TODO）。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| N 后 | 0.85x | 0.93x | 0.68x | 0.49x | 0.70x | 0.73x |
+| O（本提交） | 0.85x | 0.93x | 0.68x | 0.49x | **0.69x** | 0.73x |
+
+（起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
+build 1.29。）
+
+## Round N — 调用路径去分配（2026-10-18，继续）
+
+- `current_statics` 从 `HashMap` clone/调用 → `Rc<HashMap>`（默认零成本，
+  写回 COW）；`slot_aliased`/`link_keys` 侧向量懒化（`degrade_frame_link`
+  按需扩容，读者全走 `.get`）——每调用去一次 map clone 与两次 resize。
+- 实验记录（已回退，两次）：
+  ① int 原位快车道（`slot_int`）全量铺开——fib −7M 但 fe/oovars +20M；
+  ② 同一快车道**只加在 `SET_SS_ADD`**（fe 热点 op）——仍 fe +9M（577.5M
+  →586.5M，+1.6%），其余不变。
+  结论：该架构下热 op 内增加分支/重试路径会牵动 LLVM 寄存器分配与布局，
+  净负且与收益面无关；per-op 语义体已到该架构的实用地板（~80-100
+  instr/op），进一步需要更激进的结构（寄存器式执行器/专用循环形）。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| M 后 | 0.90x | 0.93x | 0.68x | 0.51x | 0.70x | 0.73x |
+| N（本提交） | **0.85x** | 0.93x | 0.68x | **0.49x** | 0.70x | 0.73x |
+
+（起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
+build 1.29。）
+
+## Round M — fib 参数括号窗口族（2026-10-18，继续）
+
+fib 每次递归调用 26 op：新增 8 个窗口 op 折叠参数括号族——
+`PushConstSubMark`（命令名 push + bracket region）、`SubMarkBeginCmd`、
+`ExprMarkBeginPushConst`、`SubSlotImm/SubSlotSlot`（`$n-1` 形）、
+`SubEndDynCall/SubEndCall`（bracket 结果的 dispatch）、`SubEndAdd`——每次
+调用 26→17 op。dispatcher 的 site 缓存按 `st.pc-1` 键控：融合后自愈
+（首次 miss 回填融合 op 的 pc，之后命中）。
+
+热径布局调优（实测）：仅 `PushConstSubMark/SubSlotImm/SubEndDynCall`
+（fib ×2/调用）留在热径 match，其余走 `exec_op`——热径 match 保持小，
+fe/build 不因新 op 变慢（全放热径：fib 0.90x 但 fe/build +0.9%；全放
+exec_op：fe/build 恢复但 fib 0.92x；折中两者兼得）。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| L 后 | 0.95x | 0.93x | 0.68x | 0.51x | 0.70x | 0.73x |
+| M（本提交） | **0.90x** | 0.93x | 0.68x | 0.51x | 0.70x | 0.73x |
+
+（起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
+build 1.29。）
+
+## Round L — word_srcs 借用切片（2026-10-18，继续）
+
+`Interp::cur_cmd_word_srcs` 从 `Rc<Vec<SrcSpan>>` 改为借用新类型
+`util::WordSrcs`（`(*const SrcSpan, len)`，`Deref<[SrcSpan]>`）：`BeginCmd`
+每次命令不再 rc++/--（`strip` 后 op_begin_cmd 画像 4-5% + Rc 释放 3.7%）。
+安全性契约：所有读者（词跨度读取、`foreach/lmap` 内联形状门）都在
+owner（编译单元/AST）被栈借用的活动命令内运行；嵌套 save/restore 只
+拷贝指针对。JIT 不受影响（同一 `site.word_srcs` Rc 仍在 ByteCode 里）。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| K 后 | 0.97x | 0.96x | 0.69x | 0.52x | 0.72x | 0.76x |
+| L（本提交） | **0.95x** | **0.93x** | 0.68x | **0.51x** | **0.70x** | **0.73x** |
+
+（起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
+build 1.29。）
+

@@ -261,6 +261,14 @@ pub enum OpCode {
     /// falls back to `set_var` of the name.
     StoreLocal(u16),
 
+    /// Fusion of `[StoreLocal slot, Pop]` — the `set <var> <value>`
+    /// statement shape: the value is moved into the slot, and the
+    /// discarded result is never materialized (no clone for the cell, no
+    /// stack round-trip of the result).  Same fast path and fallback
+    /// ladder as the pair (a degraded frame stores through `set_var` of
+    /// the table name).
+    StoreLocalPop(u16),
+
     /// Load an array element: `$name(TOS)`.  Name from constant pool.
     LoadArrayElem(u16),
 
@@ -269,11 +277,22 @@ pub enum OpCode {
 
     /// Increment a variable by a signed immediate and push the new value.
     IncrVar(u16, i64),
+    /// Fusion of `[IncrVar idx, Pop]` — the increment's result is
+    /// discarded (the bare-`incr` statement shape).  Same fast path and
+    /// fallback ladder as [`OpCode::IncrVar`]; only the stack round-trip
+    /// of the discarded result is elided.
+    IncrVarPop(u16, i64),
 
     /// Increment a call-frame slot by a signed immediate (naming contract
     /// as [`OpCode::LoadLocal`]); a degraded frame or non-integer value
     /// falls back to the real `incr`, which owns the exact errors.
     IncrLocal(u16, i64),
+
+    /// Fusion of `[IncrLocal slot, Pop]` — the increment's result is
+    /// discarded (the `for`-next / bare-`incr` statement shape).  Same
+    /// fast path and fallback ladder as [`OpCode::IncrLocal`]; only the
+    /// stack round-trip of the discarded result is elided.
+    IncrLocalPop(u16, i64),
 
     /// Append TOS to the variable (constant-pool name index).
     /// Pops the append value, pushes the new variable value.
@@ -391,6 +410,21 @@ pub enum OpCode {
     LappendLocal(u16),
     /// The name-keyed twin of [`OpCode::LappendLocal`] (top-level units).
     LappendVar(u16),
+    /// Fusion of `[LoadVar src, LappendVar dst, Pop]` — the name-keyed
+    /// `lappend <var> $value` statement shape: read the source variable
+    /// (both operands are constant-pool name indices; the read replicates
+    /// `LoadVar`'s `eval_var_ref` path, array refs included), append into
+    /// the destination through the pair's take/append/restore ladder
+    /// (`cmd_lappend` fallback with identical errors); the discarded
+    /// result is never materialized.
+    LappendVarVar(u16, u16),
+    /// Fusion of `[LoadLocal src, LappendLocal dst, Pop]` — the compiler's
+    /// `lappend <var> $value` statement shape: append `slots[src]` to
+    /// `slots[dst]` through the same take/append/restore ladder as the
+    /// pair (including the `cmd_lappend` fallback with the assembled
+    /// `[lappend, name, value]` args and identical errors); the discarded
+    /// result is never materialized.
+    LappendSlotSlot(u16, u16),
     /// Body region opener for FRAMED foreach bodies (compiled outside a
     /// proc body): pushes `Region::BodyFramed` — body errors crossing it
     /// gain the `("foreach"/"lmap" body line N)` exit frame, matching the
@@ -408,6 +442,37 @@ pub enum OpCode {
     /// Comparison superinstructions (same fallback contract).
     CmpSlotSlot(u16, u16, u8),
     CmpSlotImm(u16, i64, u8),
+    /// The name-keyed twins of [`OpCode::AddSlotSlot`] /
+    /// [`OpCode::CmpSlotSlot`] / [`OpCode::CmpSlotImm`]: fused
+    /// `[LoadVar a, LoadVar b, ARITH-or-CMP]`, `[LoadVar a, PushInt k,
+    /// ARITH-or-CMP]` and `[PushInt k, LoadVar b, CMP]` windows of
+    /// eval-level units (globals/namespace vars), with `cc` mirroring
+    /// [`OpCode::CmpSlotImm`]'s encoding.  Operand reads run through
+    /// `eval_var_ref` exactly as `LoadVar`'s do (array references, link
+    /// indirection, canonical errors), so values and errors match the
+    /// unfused windows.
+    AddVarVar(u16, u16),
+    AddVarImm(u16, i64),
+    CmpVarVar(u16, u16, u8),
+    CmpVarImm(u16, i64, u8),
+    /// Fusions of `[cmp superinstruction, JumpTrue/JumpFalse]` — the
+    /// condition shape of every compiled loop: branch on the comparison
+    /// directly instead of pushing a boolean for the jump to pop and
+    /// re-coerce.  `t` is the jump target (absolute); the operand read
+    /// fallback, the NaN/string comparison semantics, the not-taken
+    /// `Region::Body` open and the backward-edge step charge are exactly
+    /// the fused pair's (the charge tests against the original jump op's
+    /// index — one past this op — so `t == pc+1` classifies like the
+    /// dispatched `JumpFalse` did).
+    CmpSlotSlotJumpTrue(u16, u16, u8, u32),
+    CmpSlotSlotJumpFalse(u16, u16, u8, u32),
+    CmpSlotImmJumpTrue(u16, i64, u8, u32),
+    CmpSlotImmJumpFalse(u16, i64, u8, u32),
+    /// The name-keyed twins of the fused comparison branches above.
+    CmpVarVarJumpTrue(u16, u16, u8, u32),
+    CmpVarVarJumpFalse(u16, u16, u8, u32),
+    CmpVarImmJumpTrue(u16, i64, u8, u32),
+    CmpVarImmJumpFalse(u16, i64, u8, u32),
     Mul,
     Div,
     Mod,
@@ -525,6 +590,113 @@ pub enum OpCode {
     /// per-command bookkeeping).
     BeginCmd(u32),
 
+    /// Fusion of `[BeginCmd s, SubMark]` — a command whose next word is a
+    /// `[...]` bracket: set the site, then open the bracket region
+    /// (`Region::Sub` of the just-set site).  Same steps, one dispatch.
+    BeginCmdSubMark(u32),
+
+    /// Fusion of `[ExprMark, BeginCmd s]` — an expression operand's owner
+    /// region opens, then the operand command's site is set.
+    ExprMarkBeginCmd(u32),
+
+    /// Fusion of `[BeginCmd s, PushConst i]` — the dispatch shape of every
+    /// literal-named command: set the site, push the name constant.
+    BeginCmdPushConst(u32, u16),
+
+    /// Fusion of `[SubEnd, StoreLocalPop d]` — a `set x [...]` statement's
+    /// tail: close the bracket region (restoring the owning command's
+    /// site), then move the value into the slot.
+    SubEndStoreLocalPop(u16),
+
+    /// Fusion of `[SubEnd, StoreVarPop i]` — the name-keyed twin.
+    SubEndStoreVarPop(u16),
+
+    /// Fusion of `[SubEnd, Return]` — `return [...]`: close the bracket
+    /// region, then return the value.
+    SubEndReturn,
+
+    /// Fusion of `[Jump(t), NextMark]` (only emitted when `t` is the mark
+    /// itself — a region-closing trampoline): close the body region
+    /// (restoring the construct's site), then open the next-script region
+    /// of that site.  The jump's backward-step charge never applies to
+    /// this shape (its target is one past the jump).
+    SwapToNextMark,
+
+    /// Fusion of `[NextMark, BeginCmd s]` — the `for` next-script's
+    /// region open plus its first command's site.
+    NextMarkBeginCmd(u32),
+
+    /// Fusion of `[BeginCmd s, IncrLocalPop x k]` — the `for` next-script
+    /// `incr` statement in one dispatch.
+    BeginCmdIncrLocalPop(u32, u16, i64),
+
+    /// Fusion of `[BeginCmd s, IncrVarPop i k]` — the name-keyed twin.
+    BeginCmdIncrVarPop(u32, u16, i64),
+
+    /// Fusion of `[Jump(t), ForeachNext { info, body }]` (only when `t`
+    /// is the ForeachNext itself — the iteration loop's region-closing
+    /// trampoline): close the body region, then advance the iterator
+    /// (binding the next values) and jump back to the body.
+    ForeachNextClose(u32, u32),
+
+    /// Fusion of `[BeginCmdSubMark s1, BeginCmd s2, AddSlotSlot a b,
+    /// SubEndStoreLocalPop d]` — the dominant `set <slot> [expr {$a + $b}]`
+    /// statement: set the set-command's site, open the bracket region, set
+    /// the expr command's site, compute the sum, close the region
+    /// (restoring the set site), store the value by move into the slot.
+    /// Each step is the pair's verbatim body and order, so error frames
+    /// and region state at any failing step are identical.
+    SlotSetAddSS {
+        /// The `set` command's site.
+        set_site: u32,
+        /// The bracketed `expr` command's site.
+        expr_site: u32,
+        a: u16,
+        b: u16,
+        /// The destination slot (`set`'s variable).
+        dst: u16,
+    },
+
+    /// The name-keyed twin: `set <var> [expr {$a + $b}]` with `a`/`b`/`dst`
+    /// constant-pool name indices (reads through `eval_var_ref`, store
+    /// through `set_var`).
+    VarSetAddVV {
+        set_site: u32,
+        expr_site: u32,
+        a: u16,
+        b: u16,
+        dst: u16,
+    },
+
+    /// Fusion of `[PushConst i, SubMark]` — the dispatch shape's name push
+    /// plus the bracket-word region open.
+    PushConstSubMark(u16),
+
+    /// Fusion of `[SubMark, BeginCmd s]` — open the bracket region, then
+    /// set the bracket command's site (the argument-bracket entry).
+    SubMarkBeginCmd(u32),
+
+    /// Fusion of `[ExprMark, BeginCmd s, PushConst i]` — the expression
+    /// operand's region open, its command's site, and its name push.
+    ExprMarkBeginPushConst(u32, u16),
+
+    /// `sub` superinstructions, the `AddSlot*` twins: `slots[a] - k` /
+    /// `slots[a] - slots[b]` with the result pushed (same operand-read
+    /// fallback as the `AddSlot*` forms).
+    SubSlotImm(u16, i64),
+    SubSlotSlot(u16, u16),
+
+    /// Fusion of `[SubEnd, DynCall argc]` — close the bracket region, then
+    /// dispatch the bracket-result call.
+    SubEndDynCall(u16),
+
+    /// Fusion of `[SubEnd, Call { cmd_id, argc }]` — the cached-builtin
+    /// twin of [`OpCode::SubEndDynCall`].
+    SubEndCall { cmd_id: u16, argc: u16 },
+
+    /// Fusion of `[SubEnd, Add]` — close the bracket region, then add the
+    /// two stack operands.
+    SubEndAdd,
     /// Enters an inline body reached by a *taken* jump (an `if`'s else
     /// body).  Every other inline body is entered by a not-taken
     /// `JumpFalse`/`JumpTrue`, which the executor uses to track which
@@ -588,10 +760,13 @@ impl fmt::Display for OpCode {
             OpCode::StoreVarPop(idx) => write!(f, "STORE_VAR_POP {}", idx),
             OpCode::LoadLocal(slot) => write!(f, "LOAD_LOCAL {}", slot),
             OpCode::StoreLocal(slot) => write!(f, "STORE_LOCAL {}", slot),
+            OpCode::StoreLocalPop(slot) => write!(f, "STORE_LOCAL_POP {}", slot),
             OpCode::LoadArrayElem(idx) => write!(f, "LOAD_ARRAY_ELEM {}", idx),
             OpCode::StoreArrayElem(idx) => write!(f, "STORE_ARRAY_ELEM {}", idx),
             OpCode::IncrVar(idx, n) => write!(f, "INCR_VAR {} {}", idx, n),
+            OpCode::IncrVarPop(idx, n) => write!(f, "INCR_VAR_POP {} {}", idx, n),
             OpCode::IncrLocal(slot, n) => write!(f, "INCR_LOCAL {} {}", slot, n),
+            OpCode::IncrLocalPop(slot, n) => write!(f, "INCR_LOCAL_POP {} {}", slot, n),
             OpCode::AppendVar(idx) => write!(f, "APPEND_VAR {}", idx),
             OpCode::UnsetVar(idx) => write!(f, "UNSET_VAR {}", idx),
             OpCode::VarExists(idx) => write!(f, "VAR_EXISTS {}", idx),
@@ -634,11 +809,41 @@ impl fmt::Display for OpCode {
             OpCode::Add => write!(f, "ADD"),
             OpCode::LappendLocal(s) => write!(f, "LAPPEND_L {}", s),
             OpCode::LappendVar(n) => write!(f, "LAPPEND_V {}", n),
+            OpCode::LappendVarVar(src, dst) => write!(f, "LAPPEND_VV {} {}", src, dst),
+            OpCode::LappendSlotSlot(src, dst) => write!(f, "LAPPEND_SS {} {}", src, dst),
             OpCode::BodyMarkFramed => write!(f, "BODY_MARK_FRAMED"),
             OpCode::AddSlotSlot(a, b) => write!(f, "ADD_SS {} {}", a, b),
             OpCode::AddSlotImm(a, k) => write!(f, "ADD_SI {} {}", a, k),
             OpCode::CmpSlotSlot(a, b, cc) => write!(f, "CMP_SS {} {} cc={}", a, b, cc),
             OpCode::CmpSlotImm(a, k, cc) => write!(f, "CMP_SI {} {} cc={}", a, k, cc),
+            OpCode::AddVarVar(a, b) => write!(f, "ADD_VV {} {}", a, b),
+            OpCode::AddVarImm(a, k) => write!(f, "ADD_VI {} {}", a, k),
+            OpCode::CmpVarVar(a, b, cc) => write!(f, "CMP_VV {} {} cc={}", a, b, cc),
+            OpCode::CmpVarImm(a, k, cc) => write!(f, "CMP_VI {} {} cc={}", a, k, cc),
+            OpCode::CmpSlotSlotJumpTrue(a, b, cc, t) => {
+                write!(f, "CMP_SS_JT {} {} cc={} -> {}", a, b, cc, t)
+            }
+            OpCode::CmpSlotSlotJumpFalse(a, b, cc, t) => {
+                write!(f, "CMP_SS_JF {} {} cc={} -> {}", a, b, cc, t)
+            }
+            OpCode::CmpSlotImmJumpTrue(a, k, cc, t) => {
+                write!(f, "CMP_SI_JT {} {} cc={} -> {}", a, k, cc, t)
+            }
+            OpCode::CmpSlotImmJumpFalse(a, k, cc, t) => {
+                write!(f, "CMP_SI_JF {} {} cc={} -> {}", a, k, cc, t)
+            }
+            OpCode::CmpVarVarJumpTrue(a, b, cc, t) => {
+                write!(f, "CMP_VV_JT {} {} cc={} -> {}", a, b, cc, t)
+            }
+            OpCode::CmpVarVarJumpFalse(a, b, cc, t) => {
+                write!(f, "CMP_VV_JF {} {} cc={} -> {}", a, b, cc, t)
+            }
+            OpCode::CmpVarImmJumpTrue(a, k, cc, t) => {
+                write!(f, "CMP_VI_JT {} {} cc={} -> {}", a, k, cc, t)
+            }
+            OpCode::CmpVarImmJumpFalse(a, k, cc, t) => {
+                write!(f, "CMP_VI_JF {} {} cc={} -> {}", a, k, cc, t)
+            }
             OpCode::Sub => write!(f, "SUB"),
             OpCode::Mul => write!(f, "MUL"),
             OpCode::Div => write!(f, "DIV"),
@@ -705,6 +910,45 @@ impl fmt::Display for OpCode {
             // Debug
             OpCode::Line(n) => write!(f, "LINE {}", n),
             OpCode::BeginCmd(site) => write!(f, "BEGIN_CMD {}", site),
+            OpCode::BeginCmdSubMark(site) => write!(f, "BEGIN_CMD_SUB {}", site),
+            OpCode::ExprMarkBeginCmd(site) => write!(f, "EXPR_MARK_BEGIN {}", site),
+            OpCode::BeginCmdPushConst(site, idx) => {
+                write!(f, "BEGIN_CMD_PUSH_CONST {} {}", site, idx)
+            }
+            OpCode::SubEndStoreLocalPop(slot) => {
+                write!(f, "SUB_END_STORE_L_POP {}", slot)
+            }
+            OpCode::SubEndStoreVarPop(idx) => write!(f, "SUB_END_STORE_V_POP {}", idx),
+            OpCode::SubEndReturn => write!(f, "SUB_END_RETURN"),
+            OpCode::SwapToNextMark => write!(f, "SWAP_TO_NEXT_MARK"),
+            OpCode::NextMarkBeginCmd(site) => write!(f, "NEXT_MARK_BEGIN_CMD {}", site),
+            OpCode::BeginCmdIncrLocalPop(site, slot, n) => {
+                write!(f, "BEGIN_CMD_INCR_L_POP {} {} {}", site, slot, n)
+            }
+            OpCode::BeginCmdIncrVarPop(site, idx, n) => {
+                write!(f, "BEGIN_CMD_INCR_V_POP {} {} {}", site, idx, n)
+            }
+            OpCode::ForeachNextClose(info, body) => {
+                write!(f, "FOREACH_NEXT_CLOSE {} -> {}", info, body)
+            }
+            OpCode::SlotSetAddSS { set_site, expr_site, a, b, dst } => {
+                write!(f, "SET_SS_ADD {} {} {} {} -> {}", set_site, expr_site, a, b, dst)
+            }
+            OpCode::VarSetAddVV { set_site, expr_site, a, b, dst } => {
+                write!(f, "SET_VV_ADD {} {} {} {} -> {}", set_site, expr_site, a, b, dst)
+            }
+            OpCode::PushConstSubMark(i) => write!(f, "PUSH_CONST_SUB {}", i),
+            OpCode::SubMarkBeginCmd(site) => write!(f, "SUB_MARK_BEGIN {}", site),
+            OpCode::ExprMarkBeginPushConst(site, i) => {
+                write!(f, "EXPR_MARK_BEGIN_PUSH {} {}", site, i)
+            }
+            OpCode::SubSlotImm(a, k) => write!(f, "SUB_SI {} {}", a, k),
+            OpCode::SubSlotSlot(a, b) => write!(f, "SUB_SS {} {}", a, b),
+            OpCode::SubEndDynCall(argc) => write!(f, "SUB_END_DYNCALL {}", argc),
+            OpCode::SubEndCall { cmd_id, argc } => {
+                write!(f, "SUB_END_CALL {} {}", cmd_id, argc)
+            }
+            OpCode::SubEndAdd => write!(f, "SUB_END_ADD"),
             OpCode::BodyMark => write!(f, "BODY_MARK"),
             OpCode::NextMark => write!(f, "NEXT_MARK"),
             OpCode::SubMark => write!(f, "SUB_MARK"),
@@ -712,5 +956,24 @@ impl fmt::Display for OpCode {
             OpCode::ExprMark => write!(f, "EXPR_MARK"),
             OpCode::Nop => write!(f, "NOP"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpCode;
+
+    /// The dispatch loop copies an `OpCode` per executed instruction — the
+    /// enum stays in its 16-byte envelope (the binding constraint is the
+    /// widest payload: `u16 + i64` / `u16 + i64 + u8`).  A superinstruction
+    /// needing a larger payload must either fit the envelope or pay for a
+    /// side table explicitly; silently growing the enum taxes every op.
+    #[test]
+    fn opcode_size_budget() {
+        assert!(
+            core::mem::size_of::<OpCode>() <= 16,
+            "OpCode grew to {} bytes",
+            core::mem::size_of::<OpCode>()
+        );
     }
 }

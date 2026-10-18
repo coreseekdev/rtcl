@@ -157,6 +157,46 @@ impl Default for ByteCode {
     }
 }
 
+/// Comparison op → `cc` encoding shared by the superinstruction peepholes
+/// and the pair fusions (see the `AddSlotSlot` variant docs).
+fn cmp_cc_of(op: &OpCode) -> Option<u8> {
+    match op {
+        OpCode::Lt => Some(0),
+        OpCode::Gt => Some(1),
+        OpCode::Le => Some(2),
+        OpCode::Ge => Some(3),
+        OpCode::Eq => Some(4),
+        OpCode::Ne => Some(5),
+        _ => None,
+    }
+}
+
+/// Inverse of [`cmp_cc_of`] — the comparison op for a `cc` value (cc is
+/// compiler-generated, 0..=5; anything else degrades to `Ne`, whose only
+/// reachable source is corruption the validator would have rejected).
+fn cmp_op_of(cc: u8) -> OpCode {
+    match cc {
+        0 => OpCode::Lt,
+        1 => OpCode::Gt,
+        2 => OpCode::Le,
+        3 => OpCode::Ge,
+        4 => OpCode::Eq,
+        _ => OpCode::Ne,
+    }
+}
+
+/// Swapped-operand comparison encoding: `a < b` ⇔ `b > a`, `a <= b` ⇔
+/// `b >= a` (eq/ne are symmetric).
+fn cmp_cc_mirror(cc: u8) -> u8 {
+    match cc {
+        0 => 1,
+        1 => 0,
+        2 => 3,
+        3 => 2,
+        other => other,
+    }
+}
+
 impl ByteCode {
     /// Create a new, empty [`ByteCode`].
     pub fn new() -> Self {
@@ -327,7 +367,11 @@ impl ByteCode {
         self.line_map.get(idx).copied().unwrap_or(0)
     }
 
-    /// Run a peephole optimization pass on the bytecode.
+    /// Run the optimization pipeline on the bytecode — the driver of the
+    /// nanopass phase (each pass below is a pure function over the op
+    /// vector; `strip_nops` compacts between rounds and remaps every
+    /// target-carrying op, so passes may rewrite a window to `Nop` +
+    /// fused head without touching control flow).
     ///
     /// Patterns (2-op):
     /// - `StoreVar(x) + Pop` → `StoreVarPop(x)` + `Nop`
@@ -338,16 +382,674 @@ impl ByteCode {
     /// - `PushInt(a) + PushInt(b) + ArithOp` → `PushInt(result)` + `Nop + Nop`
     /// - `PushInt(a) + PushInt(b) + CmpOp` → `PushTrue/PushFalse` + `Nop + Nop`
     ///
+    /// Producer/consumer pair fusions (see [`Self::fuse_pairs`]) run in
+    /// the same round.
+    ///
     /// Runs iteratively until no further changes are made.
     pub fn peephole(&mut self) {
-        // Iterate: fold → strip nops → fold again (for chained constant expressions)
+        // Iterate: fold → strip nops → fold again (for chained constant
+        // expressions).
         for _ in 0..8 {
-            let changed = self.peephole_pass();
+            let changed = self.peephole_pass() | self.fuse_pairs();
             self.strip_nops();
             if !changed {
                 break;
             }
         }
+    }
+
+    /// Nanopass fusion of the compiler's producer/consumer windows —
+    /// one pure rewrite per window family, jump-target aware: a fusion is
+    /// refused when any op *inside* the window (everything but the head)
+    /// is a jump target, since the fused op replaces the window as a unit
+    /// and an entry point on a tail op would lose its producers.
+    ///
+    /// Window table (3-op windows first so the 2-op branch windows see
+    /// the superinstructions in the next round; the driver iterates to
+    /// convergence with `strip_nops` between rounds):
+    ///
+    /// | window | fused op |
+    /// |---|---|
+    /// | `[LoadVar a, LoadVar b, ADD/CMP]` | `AddVarVar` / `CmpVarVar` |
+    /// | `[LoadVar a, PushInt k, ADD/CMP]` | `AddVarImm` / `CmpVarImm` |
+    /// | `[PushInt k, LoadVar b, CMP]` | `CmpVarImm(b, k, mirrored cc)` |
+    /// | `[LoadVar s, LappendVar d, Pop]` | `LappendVarVar` |
+    /// | `[LoadVar s, LappendLocal d, Pop]` | `LappendSlotSlot` |
+    /// | `[LoadLocal s, LappendLocal d, Pop]` | `LappendSlotSlot` |
+    /// | `[IncrVar x, Pop]` / `[IncrLocal x, Pop]` | `IncrVarPop` / `IncrLocalPop` |
+    /// | `[StoreLocal x, Pop]` | `StoreLocalPop` |
+    /// | `[CmpSlotSlot/Imm, JumpTrue/False]` | `CmpSlotSlot/Imm...JumpTrue/False` |
+    /// | `[CmpVarVar/Imm, JumpTrue/False]` | `CmpVarVar/Imm...JumpTrue/False` |
+    ///
+    /// The slot families only match locals-mode codegen (`LoadLocal` and
+    /// the slot superinstructions appear nowhere else), the var families
+    /// match eval-level codegen — every unit runs the pass.  The fused
+    /// ops are interpreter-native windows; the JIT's accepted-op delta
+    /// they create is chronicled in `docs/JIT-OPCODE-DELTA.md` so its
+    /// accept set / lowering can follow.
+    fn fuse_pairs(&mut self) -> bool {
+        if self.ops.len() < 2 {
+            return false;
+        }
+        let len = self.ops.len();
+        let targets = self.collect_jump_targets();
+        // Class-A fusions ([Jump trampoline, NextMark/ForeachNext]) move
+        // the consumed op's semantics *into the head* (the fused executor
+        // helper normalizes both entries, so entry at the tail is
+        // equivalent).  Targets that pointed at the consumed op must
+        // follow it to the head — `strip_nops`' forward map would land
+        // them *past* the fused op (the op after it).  The retarget is
+        // step-charge faithful: for every just-before continue the
+        // comparison `cont < pc` keeps its verdict (the head index is
+        // exactly the consumed op's index minus one, and both sides shift
+        // with the same compaction).
+        let mut retargets: Vec<(u32, u32)> = Vec::new();
+        let mut changed = false;
+        let mut i = 0;
+        while i + 1 < len {
+            // Window tails must not be jump targets.
+            let tail_free = |w: usize| (1..w).all(|k| i + k < len && !targets[i + k]);
+            let fused: Option<(OpCode, usize)> = match (&self.ops[i], &self.ops[i + 1]) {
+                // ── fused comparison branches ───────────────────────────
+                (OpCode::CmpSlotSlot(a, b, cc), OpCode::JumpTrue(t)) if !targets[i + 1] => {
+                    Some((OpCode::CmpSlotSlotJumpTrue(*a, *b, *cc, *t), 2))
+                }
+                (OpCode::CmpSlotSlot(a, b, cc), OpCode::JumpFalse(t)) if !targets[i + 1] => {
+                    Some((OpCode::CmpSlotSlotJumpFalse(*a, *b, *cc, *t), 2))
+                }
+                (OpCode::CmpSlotImm(a, k, cc), OpCode::JumpTrue(t)) if !targets[i + 1] => {
+                    Some((OpCode::CmpSlotImmJumpTrue(*a, *k, *cc, *t), 2))
+                }
+                (OpCode::CmpSlotImm(a, k, cc), OpCode::JumpFalse(t)) if !targets[i + 1] => {
+                    Some((OpCode::CmpSlotImmJumpFalse(*a, *k, *cc, *t), 2))
+                }
+                (OpCode::CmpVarVar(a, b, cc), OpCode::JumpTrue(t)) if !targets[i + 1] => {
+                    Some((OpCode::CmpVarVarJumpTrue(*a, *b, *cc, *t), 2))
+                }
+                (OpCode::CmpVarVar(a, b, cc), OpCode::JumpFalse(t)) if !targets[i + 1] => {
+                    Some((OpCode::CmpVarVarJumpFalse(*a, *b, *cc, *t), 2))
+                }
+                (OpCode::CmpVarImm(a, k, cc), OpCode::JumpTrue(t)) if !targets[i + 1] => {
+                    Some((OpCode::CmpVarImmJumpTrue(*a, *k, *cc, *t), 2))
+                }
+                (OpCode::CmpVarImm(a, k, cc), OpCode::JumpFalse(t)) if !targets[i + 1] => {
+                    Some((OpCode::CmpVarImmJumpFalse(*a, *k, *cc, *t), 2))
+                }
+                // ── name-keyed superinstructions ────────────────────────
+                (OpCode::LoadVar(a), OpCode::PushInt(k)) if tail_free(3) => {
+                    match self.ops[i + 2].clone() {
+                        OpCode::Add => Some((OpCode::AddVarImm(*a, *k), 3)),
+                        op => cmp_cc_of(&op).map(|cc| (OpCode::CmpVarImm(*a, *k, cc), 3)),
+                    }
+                }
+                (OpCode::PushInt(k), OpCode::LoadVar(b)) if tail_free(3) => {
+                    cmp_cc_of(&self.ops[i + 2])
+                        .map(|cc| (OpCode::CmpVarImm(*b, *k, cmp_cc_mirror(cc)), 3))
+                }
+                (OpCode::LoadVar(a), OpCode::LoadVar(b)) if tail_free(3) => {
+                    match self.ops[i + 2].clone() {
+                        OpCode::Add => Some((OpCode::AddVarVar(*a, *b), 3)),
+                        op => cmp_cc_of(&op).map(|cc| (OpCode::CmpVarVar(*a, *b, cc), 3)),
+                    }
+                }
+                // ── name-keyed lappend statement ────────────────────────
+                (OpCode::LoadVar(s), OpCode::LappendVar(d)) if tail_free(3) => {
+                    match self.ops[i + 2] {
+                        OpCode::Pop => Some((OpCode::LappendVarVar(*s, *d), 3)),
+                        _ => None,
+                    }
+                }
+                // ── slot lappend statement ──────────────────────────────
+                (OpCode::LoadLocal(s), OpCode::LappendLocal(d)) if tail_free(3) => {
+                    match self.ops[i + 2] {
+                        OpCode::Pop => Some((OpCode::LappendSlotSlot(*s, *d), 3)),
+                        _ => None,
+                    }
+                }
+                // ── meta-op pairs (site/region bookkeeping) ──────────────
+                (OpCode::BeginCmd(site), OpCode::SubMark) if !targets[i + 1] => {
+                    Some((OpCode::BeginCmdSubMark(*site), 2))
+                }
+                (OpCode::ExprMark, OpCode::BeginCmd(site)) if !targets[i + 1] => {
+                    Some((OpCode::ExprMarkBeginCmd(*site), 2))
+                }
+                (OpCode::BeginCmd(site), OpCode::PushConst(idx)) if !targets[i + 1] => {
+                    Some((OpCode::BeginCmdPushConst(*site, *idx), 2))
+                }
+                (OpCode::SubEnd, OpCode::StoreLocalPop(slot)) if !targets[i + 1] => {
+                    Some((OpCode::SubEndStoreLocalPop(*slot), 2))
+                }
+                (OpCode::SubEnd, OpCode::StoreVarPop(idx)) if !targets[i + 1] => {
+                    Some((OpCode::SubEndStoreVarPop(*idx), 2))
+                }
+                (OpCode::SubEnd, OpCode::Return) if !targets[i + 1] => {
+                    Some((OpCode::SubEndReturn, 2))
+                }
+                // ── fib-family windows (arg brackets, sub exprs) ────────
+                (OpCode::PushConst(idx), OpCode::SubMark) if !targets[i + 1] => {
+                    Some((OpCode::PushConstSubMark(*idx), 2))
+                }
+                (OpCode::SubMark, OpCode::BeginCmd(site)) if !targets[i + 1] => {
+                    Some((OpCode::SubMarkBeginCmd(*site), 2))
+                }
+                (OpCode::ExprMarkBeginCmd(site), OpCode::PushConst(idx))
+                    if !targets[i + 1] =>
+                {
+                    Some((OpCode::ExprMarkBeginPushConst(*site, *idx), 2))
+                }
+                (OpCode::LoadLocal(a), OpCode::PushInt(k)) if tail_free(3) => {
+                    match self.ops[i + 2] {
+                        OpCode::Sub => Some((OpCode::SubSlotImm(*a, *k), 3)),
+                        _ => None,
+                    }
+                }
+                (OpCode::LoadLocal(a), OpCode::LoadLocal(b)) if tail_free(3) => {
+                    match self.ops[i + 2] {
+                        OpCode::Sub => Some((OpCode::SubSlotSlot(*a, *b), 3)),
+                        _ => None,
+                    }
+                }
+                (OpCode::SubEnd, OpCode::DynCall { argc }) if !targets[i + 1] => {
+                    Some((OpCode::SubEndDynCall(*argc), 2))
+                }
+                (OpCode::SubEnd, OpCode::Call { cmd_id, argc }) if !targets[i + 1] => {
+                    Some((OpCode::SubEndCall { cmd_id: *cmd_id, argc: *argc }, 2))
+                }
+                (OpCode::SubEnd, OpCode::Add) if !targets[i + 1] => {
+                    Some((OpCode::SubEndAdd, 2))
+                }
+                // ── statement windows (4-op) ────────────────────────────
+                (
+                    OpCode::BeginCmdSubMark(s1),
+                    OpCode::BeginCmd(s2),
+                ) if tail_free(4) => match (&self.ops[i + 2], &self.ops[i + 3]) {
+                    (
+                        OpCode::AddSlotSlot(a, b),
+                        OpCode::SubEndStoreLocalPop(d),
+                    ) => Some((
+                        OpCode::SlotSetAddSS {
+                            set_site: *s1,
+                            expr_site: *s2,
+                            a: *a,
+                            b: *b,
+                            dst: *d,
+                        },
+                        4,
+                    )),
+                    (OpCode::AddVarVar(a, b), OpCode::SubEndStoreVarPop(d)) => Some((
+                        OpCode::VarSetAddVV {
+                            set_site: *s1,
+                            expr_site: *s2,
+                            a: *a,
+                            b: *b,
+                            dst: *d,
+                        },
+                        4,
+                    )),
+                    _ => None,
+                },
+                // ── loop-control meta pairs ─────────────────────────────
+                // Trampoline tabs: the jump's target is the mark itself.
+                // The fused op normalizes the region stack to the loop
+                // frame's entry depth (the fused executor helper), so a
+                // `continue` landing on the same (consumed) instruction
+                // arrives with the same state either way — no target guard
+                // is needed here, unlike the value-window fusions.
+                (OpCode::Jump(t), OpCode::NextMark) if *t as usize == i + 1 => {
+                    retargets.push(((i + 1) as u32, i as u32));
+                    Some((OpCode::SwapToNextMark, 2))
+                }
+                // The body-mark folding requires the body entry to be a
+                // BODY_MARK (the inlined foreach shape): the fused op owns
+                // the per-iteration region open and the target skips the
+                // mark (first-iteration entry still runs it, via
+                // ForeachStart's fall-through); foreign shapes keep the
+                // plain pair.
+                (OpCode::Jump(t), OpCode::ForeachNext { info, body })
+                    if *t as usize == i + 1
+                        && matches!(
+                            self.ops.get(*body as usize),
+                            Some(OpCode::BodyMark | OpCode::BodyMarkFramed)
+                        ) =>
+                {
+                    retargets.push(((i + 1) as u32, i as u32));
+                    Some((OpCode::ForeachNextClose(*info, *body + 1), 2))
+                }
+                (OpCode::NextMark, OpCode::BeginCmd(site)) if !targets[i + 1] => {
+                    Some((OpCode::NextMarkBeginCmd(*site), 2))
+                }
+                (OpCode::BeginCmd(site), OpCode::IncrLocalPop(x, k)) if !targets[i + 1] => {
+                    Some((OpCode::BeginCmdIncrLocalPop(*site, *x, *k), 2))
+                }
+                (OpCode::BeginCmd(site), OpCode::IncrVarPop(x, k)) if !targets[i + 1] => {
+                    Some((OpCode::BeginCmdIncrVarPop(*site, *x, *k), 2))
+                }
+                // ── statement-result discards ───────────────────────────
+                (OpCode::IncrVar(x, k), OpCode::Pop) if !targets[i + 1] => {
+                    Some((OpCode::IncrVarPop(*x, *k), 2))
+                }
+                (OpCode::IncrLocal(x, k), OpCode::Pop) if !targets[i + 1] => {
+                    Some((OpCode::IncrLocalPop(*x, *k), 2))
+                }
+                (OpCode::StoreLocal(x), OpCode::Pop) if !targets[i + 1] => {
+                    Some((OpCode::StoreLocalPop(*x), 2))
+                }
+                _ => None,
+            };
+            if let Some((op, width)) = fused {
+                self.ops[i] = op;
+                for slot in self.ops[i + 1..i + width].iter_mut() {
+                    *slot = OpCode::Nop;
+                }
+                changed = true;
+                i += width;
+            } else {
+                i += 1;
+            }
+        }
+        if !retargets.is_empty() {
+            for op in self.ops.iter_mut() {
+                match op {
+                    OpCode::Jump(t)
+                    | OpCode::JumpTrue(t)
+                    | OpCode::JumpFalse(t)
+                    | OpCode::CatchStart(t)
+                    | OpCode::CmpSlotSlotJumpTrue(_, _, _, t)
+                    | OpCode::CmpSlotSlotJumpFalse(_, _, _, t)
+                    | OpCode::CmpSlotImmJumpTrue(_, _, _, t)
+                    | OpCode::CmpSlotImmJumpFalse(_, _, _, t)
+                    | OpCode::CmpVarVarJumpTrue(_, _, _, t)
+                    | OpCode::CmpVarVarJumpFalse(_, _, _, t)
+                    | OpCode::CmpVarImmJumpTrue(_, _, _, t)
+                    | OpCode::CmpVarImmJumpFalse(_, _, _, t) => {
+                        for &(from, to) in &retargets {
+                            if *t == from {
+                                *t = to;
+                            }
+                        }
+                    }
+                    OpCode::LoopEnter { cont, brk } => {
+                        for f in [cont, brk] {
+                            for &(from, to) in &retargets {
+                                if *f == from {
+                                    *f = to;
+                                }
+                            }
+                        }
+                    }
+                    OpCode::ForeachStart { next, end, .. } => {
+                        for f in [next, end] {
+                            for &(from, to) in &retargets {
+                                if *f == from {
+                                    *f = to;
+                                }
+                            }
+                        }
+                    }
+                    OpCode::ForeachNext { body, .. } => {
+                        for &(from, to) in &retargets {
+                            if *body == from {
+                                *body = to;
+                            }
+                        }
+                    }
+                    OpCode::ForeachNextClose(_, body) => {
+                        for &(from, to) in &retargets {
+                            if *body == from {
+                                *body = to;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        changed
+    }
+
+    /// Does the unit contain any fused superinstruction (see
+    /// [`Self::fuse_pairs`])?
+    pub fn has_fused_ops(&self) -> bool {
+        self.ops.iter().any(|op| {
+            matches!(
+                op,
+                OpCode::CmpSlotSlotJumpTrue(..)
+                    | OpCode::CmpSlotSlotJumpFalse(..)
+                    | OpCode::CmpSlotImmJumpTrue(..)
+                    | OpCode::CmpSlotImmJumpFalse(..)
+                    | OpCode::CmpVarVarJumpTrue(..)
+                    | OpCode::CmpVarVarJumpFalse(..)
+                    | OpCode::CmpVarImmJumpTrue(..)
+                    | OpCode::CmpVarImmJumpFalse(..)
+                    | OpCode::LappendSlotSlot(..)
+                    | OpCode::LappendVarVar(..)
+                    | OpCode::IncrLocalPop(..)
+                    | OpCode::IncrVarPop(..)
+                    | OpCode::StoreLocalPop(..)
+                    | OpCode::CmpVarImm(..)
+                    | OpCode::CmpVarVar(..)
+                    | OpCode::AddVarImm(..)
+                    | OpCode::AddVarVar(..)
+                    | OpCode::BeginCmdSubMark(..)
+                    | OpCode::ExprMarkBeginCmd(..)
+                    | OpCode::BeginCmdPushConst(..)
+                    | OpCode::SubEndStoreLocalPop(..)
+                    | OpCode::SubEndStoreVarPop(..)
+                    | OpCode::SubEndReturn
+                    | OpCode::SwapToNextMark
+                    | OpCode::NextMarkBeginCmd(..)
+                    | OpCode::BeginCmdIncrLocalPop(..)
+                    | OpCode::BeginCmdIncrVarPop(..)
+                    | OpCode::ForeachNextClose(..)
+                    | OpCode::SlotSetAddSS { .. }
+                    | OpCode::VarSetAddVV { .. }
+                    | OpCode::PushConstSubMark(..)
+                    | OpCode::SubMarkBeginCmd(..)
+                    | OpCode::ExprMarkBeginPushConst(..)
+                    | OpCode::SubSlotImm(..)
+                    | OpCode::SubSlotSlot(..)
+                    | OpCode::SubEndDynCall(..)
+                    | OpCode::SubEndCall { .. }
+                    | OpCode::SubEndAdd
+            )
+        })
+    }
+
+    /// Expand every fused superinstruction back to its canonical window —
+    /// the exact op sequence this unit would have had with fusion disabled
+    /// (`fuse_pairs` is a pure rewrite, so this is its inverse; jump
+    /// targets are remapped through the expansion shift).  Consumers whose
+    /// accepted-op set must not meet the fused families (the JIT's
+    /// analysis boundary, `rtcl-vm`) call this once at their compile
+    /// entry — see `docs/JIT-OPCODE-DELTA.md`.
+    pub fn unfused(&self) -> ByteCode {
+        /// Expand one fused op into `out`; `false` = not fused (the
+        /// caller copies it verbatim).
+        fn expand_into(op: &OpCode, out: &mut Vec<OpCode>) -> bool {
+            match op {
+                OpCode::CmpSlotSlotJumpTrue(a, b, cc, t) => {
+                    out.push(OpCode::CmpSlotSlot(*a, *b, *cc));
+                    out.push(OpCode::JumpTrue(*t));
+                }
+                OpCode::CmpSlotSlotJumpFalse(a, b, cc, t) => {
+                    out.push(OpCode::CmpSlotSlot(*a, *b, *cc));
+                    out.push(OpCode::JumpFalse(*t));
+                }
+                OpCode::CmpSlotImmJumpTrue(a, k, cc, t) => {
+                    out.push(OpCode::CmpSlotImm(*a, *k, *cc));
+                    out.push(OpCode::JumpTrue(*t));
+                }
+                OpCode::CmpSlotImmJumpFalse(a, k, cc, t) => {
+                    out.push(OpCode::CmpSlotImm(*a, *k, *cc));
+                    out.push(OpCode::JumpFalse(*t));
+                }
+                // The name-keyed families predate the fusion only as raw
+                // windows — expand straight through (a jump fusion's
+                // canonical form is the four-op chain; re-fusing it via
+                // `fuse_pairs` is exact, see the round-trip test).
+                OpCode::CmpVarVarJumpTrue(a, b, cc, t) => {
+                    out.push(OpCode::LoadVar(*a));
+                    out.push(OpCode::LoadVar(*b));
+                    out.push(cmp_op_of(*cc));
+                    out.push(OpCode::JumpTrue(*t));
+                }
+                OpCode::CmpVarVarJumpFalse(a, b, cc, t) => {
+                    out.push(OpCode::LoadVar(*a));
+                    out.push(OpCode::LoadVar(*b));
+                    out.push(cmp_op_of(*cc));
+                    out.push(OpCode::JumpFalse(*t));
+                }
+                OpCode::CmpVarImmJumpTrue(a, k, cc, t) => {
+                    out.push(OpCode::LoadVar(*a));
+                    out.push(OpCode::PushInt(*k));
+                    out.push(cmp_op_of(*cc));
+                    out.push(OpCode::JumpTrue(*t));
+                }
+                OpCode::CmpVarImmJumpFalse(a, k, cc, t) => {
+                    out.push(OpCode::LoadVar(*a));
+                    out.push(OpCode::PushInt(*k));
+                    out.push(cmp_op_of(*cc));
+                    out.push(OpCode::JumpFalse(*t));
+                }
+                OpCode::LappendSlotSlot(src, dst) => {
+                    out.push(OpCode::LoadLocal(*src));
+                    out.push(OpCode::LappendLocal(*dst));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::LappendVarVar(src, dst) => {
+                    out.push(OpCode::LoadVar(*src));
+                    out.push(OpCode::LappendVar(*dst));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::IncrLocalPop(x, k) => {
+                    out.push(OpCode::IncrLocal(*x, *k));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::IncrVarPop(x, k) => {
+                    out.push(OpCode::IncrVar(*x, *k));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::StoreLocalPop(x) => {
+                    out.push(OpCode::StoreLocal(*x));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::BeginCmdSubMark(site) => {
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::SubMark);
+                }
+                OpCode::ExprMarkBeginCmd(site) => {
+                    out.push(OpCode::ExprMark);
+                    out.push(OpCode::BeginCmd(*site));
+                }
+                OpCode::BeginCmdPushConst(site, idx) => {
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::PushConst(*idx));
+                }
+                OpCode::SubEndStoreLocalPop(slot) => {
+                    // Straight to the pre-fusion canonical form: a
+                    // `StoreLocalPop` here would still be a fused op the
+                    // boundary must not emit.
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::StoreLocal(*slot));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::SubEndStoreVarPop(idx) => {
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::StoreVarPop(*idx));
+                }
+                OpCode::SubEndReturn => {
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::Return);
+                }
+                OpCode::SwapToNextMark => {
+                    out.push(OpCode::Nop);
+                    out.push(OpCode::NextMark);
+                }
+                OpCode::NextMarkBeginCmd(site) => {
+                    out.push(OpCode::NextMark);
+                    out.push(OpCode::BeginCmd(*site));
+                }
+                OpCode::BeginCmdIncrLocalPop(site, x, k) => {
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::IncrLocal(*x, *k));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::BeginCmdIncrVarPop(site, x, k) => {
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::IncrVar(*x, *k));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::ForeachNextClose(info, body) => {
+                    out.push(OpCode::Nop);
+                    out.push(OpCode::ForeachNext { info: *info, body: *body });
+                }
+                OpCode::SlotSetAddSS { set_site, expr_site, a, b, dst } => {
+                    out.push(OpCode::BeginCmd(*set_site));
+                    out.push(OpCode::SubMark);
+                    out.push(OpCode::BeginCmd(*expr_site));
+                    out.push(OpCode::AddSlotSlot(*a, *b));
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::StoreLocal(*dst));
+                    out.push(OpCode::Pop);
+                }
+                OpCode::VarSetAddVV { set_site, expr_site, a, b, dst } => {
+                    out.push(OpCode::BeginCmd(*set_site));
+                    out.push(OpCode::SubMark);
+                    out.push(OpCode::BeginCmd(*expr_site));
+                    out.push(OpCode::LoadVar(*a));
+                    out.push(OpCode::LoadVar(*b));
+                    out.push(OpCode::Add);
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::StoreVarPop(*dst));
+                }
+                OpCode::PushConstSubMark(i) => {
+                    out.push(OpCode::PushConst(*i));
+                    out.push(OpCode::SubMark);
+                }
+                OpCode::SubMarkBeginCmd(site) => {
+                    out.push(OpCode::SubMark);
+                    out.push(OpCode::BeginCmd(*site));
+                }
+                OpCode::ExprMarkBeginPushConst(site, i) => {
+                    out.push(OpCode::ExprMark);
+                    out.push(OpCode::BeginCmd(*site));
+                    out.push(OpCode::PushConst(*i));
+                }
+                OpCode::SubSlotImm(a, k) => {
+                    out.push(OpCode::LoadLocal(*a));
+                    out.push(OpCode::PushInt(*k));
+                    out.push(OpCode::Sub);
+                }
+                OpCode::SubSlotSlot(a, b) => {
+                    out.push(OpCode::LoadLocal(*a));
+                    out.push(OpCode::LoadLocal(*b));
+                    out.push(OpCode::Sub);
+                }
+                OpCode::SubEndDynCall(argc) => {
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::DynCall { argc: *argc });
+                }
+                OpCode::SubEndCall { cmd_id, argc } => {
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::Call { cmd_id: *cmd_id, argc: *argc });
+                }
+                OpCode::SubEndAdd => {
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::Add);
+                }
+                // The name-keyed superinstructions themselves predate the
+                // fusion only as windows — expand them back too.
+                OpCode::CmpVarImm(a, k, cc) => {
+                    out.push(OpCode::LoadVar(*a));
+                    out.push(OpCode::PushInt(*k));
+                    out.push(cmp_op_of(*cc));
+                }
+                OpCode::CmpVarVar(a, b, cc) => {
+                    out.push(OpCode::LoadVar(*a));
+                    out.push(OpCode::LoadVar(*b));
+                    out.push(cmp_op_of(*cc));
+                }
+                OpCode::AddVarImm(a, k) => {
+                    out.push(OpCode::LoadVar(*a));
+                    out.push(OpCode::PushInt(*k));
+                    out.push(OpCode::Add);
+                }
+                OpCode::AddVarVar(a, b) => {
+                    out.push(OpCode::LoadVar(*a));
+                    out.push(OpCode::LoadVar(*b));
+                    out.push(OpCode::Add);
+                }
+                _ => return false,
+            }
+            true
+        }
+
+        if !self.has_fused_ops() {
+            return self.clone();
+        }
+        // old index → new index (expansion heads are the only jump targets
+        // a fusion may have consumed; `fuse_pairs` refuses windows with
+        // interior targets).
+        let mut map = Vec::with_capacity(self.ops.len());
+        let mut ops = Vec::with_capacity(self.ops.len() + self.ops.len() / 4);
+        let mut line_map = Vec::with_capacity(ops.capacity());
+        for (i, op) in self.ops.iter().enumerate() {
+            map.push(ops.len() as u32);
+            let line = self.line_at(i);
+            let before = ops.len();
+            if !expand_into(op, &mut ops) {
+                ops.push(op.clone());
+            }
+            for _ in before..ops.len() {
+                line_map.push(line);
+            }
+        }
+        let n_ops = ops.len() as u32;
+        let remap = |t: &mut u32| {
+            *t = map.get(*t as usize).copied().unwrap_or(n_ops);
+        };
+        for op in ops.iter_mut() {
+            match op {
+                OpCode::Jump(t)
+                | OpCode::JumpTrue(t)
+                | OpCode::JumpFalse(t)
+                | OpCode::CatchStart(t) => remap(t),
+                OpCode::LoopEnter { cont, brk } => {
+                    remap(cont);
+                    remap(brk);
+                }
+                OpCode::ForeachStart { next, end, .. } => {
+                    remap(next);
+                    remap(end);
+                }
+                OpCode::ForeachNext { body, .. } => remap(body),
+                _ => {}
+            }
+        }
+        ByteCode {
+            ops,
+            line_map,
+            ..self.clone()
+        }
+    }
+
+    /// Indices that are jump targets of any target-carrying op — the
+    /// complete set `strip_nops` remaps (keep the two in agreement).
+    fn collect_jump_targets(&self) -> Vec<bool> {
+        let mut targets = vec![false; self.ops.len() + 1];
+        let mut mark = |t: u32| {
+            if (t as usize) < targets.len() {
+                targets[t as usize] = true;
+            }
+        };
+        for op in &self.ops {
+            match op {
+                OpCode::Jump(t)
+                | OpCode::JumpTrue(t)
+                | OpCode::JumpFalse(t)
+                | OpCode::CatchStart(t)
+                | OpCode::CmpSlotSlotJumpTrue(_, _, _, t)
+                | OpCode::CmpSlotSlotJumpFalse(_, _, _, t)
+                | OpCode::CmpSlotImmJumpTrue(_, _, _, t)
+                | OpCode::CmpSlotImmJumpFalse(_, _, _, t)
+                | OpCode::CmpVarVarJumpTrue(_, _, _, t)
+                | OpCode::CmpVarVarJumpFalse(_, _, _, t)
+                | OpCode::CmpVarImmJumpTrue(_, _, _, t)
+                | OpCode::CmpVarImmJumpFalse(_, _, _, t) => mark(*t),
+                OpCode::LoopEnter { cont, brk } => {
+                    mark(*cont);
+                    mark(*brk);
+                }
+                OpCode::ForeachStart { next, end, .. } => {
+                    mark(*next);
+                    mark(*end);
+                }
+                OpCode::ForeachNext { body, .. } => mark(*body),
+                OpCode::ForeachNextClose(_, body) => mark(*body),
+                _ => {}
+            }
+        }
+        targets
     }
 
     /// Single round of pattern matching. Returns `true` if any change was made.
@@ -367,24 +1069,8 @@ impl ByteCode {
         // operands produce the identical values and errors.
         let mut slot_fused = false;
         {
-        let cc_of = |op: &OpCode| -> Option<u8> {
-            match op {
-                OpCode::Lt => Some(0),
-                OpCode::Gt => Some(1),
-                OpCode::Le => Some(2),
-                OpCode::Ge => Some(3),
-                OpCode::Eq => Some(4),
-                OpCode::Ne => Some(5),
-                _ => None,
-            }
-        };
-        let mirror = |cc: u8| match cc {
-            0 => 1u8,
-            1 => 0u8,
-            2 => 3u8,
-            3 => 2u8,
-            other => other,
-        };
+        let cc_of = cmp_cc_of;
+        let mirror = cmp_cc_mirror;
         let len = self.ops.len();
         let _changed = false;
         if len >= 3 {
@@ -587,6 +1273,14 @@ impl ByteCode {
                 OpCode::Jump(t) => *t = forward[*t as usize],
                 OpCode::JumpTrue(t) => *t = forward[*t as usize],
                 OpCode::JumpFalse(t) => *t = forward[*t as usize],
+                OpCode::CmpSlotSlotJumpTrue(_, _, _, t)
+                | OpCode::CmpSlotSlotJumpFalse(_, _, _, t)
+                | OpCode::CmpSlotImmJumpTrue(_, _, _, t)
+                | OpCode::CmpSlotImmJumpFalse(_, _, _, t)
+                | OpCode::CmpVarVarJumpTrue(_, _, _, t)
+                | OpCode::CmpVarVarJumpFalse(_, _, _, t)
+                | OpCode::CmpVarImmJumpTrue(_, _, _, t)
+                | OpCode::CmpVarImmJumpFalse(_, _, _, t) => *t = forward[*t as usize],
                 OpCode::LoopEnter { cont, brk } => {
                     *cont = forward[*cont as usize];
                     *brk = forward[*brk as usize];
@@ -607,6 +1301,9 @@ impl ByteCode {
                 OpCode::ForeachNext { body, .. } => {
                     *body = forward[*body as usize];
                 }
+                OpCode::ForeachNextClose(_, body) => {
+                    *body = forward[*body as usize];
+                }
                 _ => {}
             }
         }
@@ -622,19 +1319,6 @@ impl ByteCode {
         }
         self.ops.truncate(new_len);
         self.line_map.truncate(new_len);
-    }
-
-    /// Expand fused superinstructions back to their canonical op windows.
-    ///
-    /// Staging placeholder: the fused families land with the interpreter
-    /// perf batch (`perf/interp-arch-opt`), which replaces this body with
-    /// the real expansion (jump targets remapped through the expansion
-    /// shift). Consumers whose accepted-op set must stay canonical — the
-    /// JIT's analysis boundary — already call this at their compile entry,
-    /// so they need no further changes when the families arrive. Contract
-    /// and per-op tables: `docs/JIT-OPCODE-DELTA.md`.
-    pub fn unfused(&self) -> ByteCode {
-        self.clone()
     }
 }
 
@@ -658,5 +1342,220 @@ impl fmt::Display for ByteCode {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bc(ops: &[OpCode], locals_mode: bool) -> ByteCode {
+        let mut c = ByteCode::new();
+        for op in ops {
+            c.emit(op.clone(), 0);
+        }
+        c.locals_mode = locals_mode;
+        c
+    }
+
+    /// The producer/consumer windows collapse to one op each, and the
+    /// `strip_nops` compaction leaves no residue.
+    #[test]
+    fn fuses_slot_pair_windows() {
+        let mut code = bc(
+            &[
+                OpCode::CmpSlotSlot(1, 2, 0),
+                OpCode::JumpFalse(8),
+                OpCode::Nop,
+                OpCode::LoadLocal(1),
+                OpCode::LappendLocal(2),
+                OpCode::Pop,
+                OpCode::IncrLocal(3, 1),
+                OpCode::Pop,
+                OpCode::StoreLocal(4),
+                OpCode::Pop,
+                OpCode::Return,
+            ],
+            true,
+        );
+        code.peephole();
+        assert_eq!(
+            code.ops(),
+            &[
+                OpCode::CmpSlotSlotJumpFalse(1, 2, 0, 3),
+                OpCode::LappendSlotSlot(1, 2),
+                OpCode::IncrLocalPop(3, 1),
+                OpCode::StoreLocalPop(4),
+                OpCode::Return,
+            ]
+        );
+    }
+
+    /// A jump targeting the consumer inside the window refuses the
+    /// fusion: the fused op replaces the whole window, and an entry
+    /// point on the consumer would lose its producer.
+    #[test]
+    fn refuses_fusion_when_target_inside_window() {
+        let mut code = bc(
+            &[
+                OpCode::JumpTrue(2),
+                OpCode::LoadLocal(1),
+                OpCode::LappendLocal(2),
+                OpCode::Pop,
+                OpCode::Return,
+            ],
+            true,
+        );
+        code.peephole();
+        assert!(code
+            .ops()
+            .iter()
+            .any(|o| matches!(o, OpCode::LappendLocal(_))));
+        assert!(code.ops().iter().any(|o| matches!(o, OpCode::Pop)));
+    }
+
+    /// Name-keyed (eval-level) windows fuse too — the chain
+    /// `[LoadVar, PushInt, Lt, JumpFalse]` becomes one op over two rounds
+    /// of the driver.  The op-set delta this creates for the JIT's accept
+    /// set is chronicled in `docs/JIT-OPCODE-DELTA.md`.
+    #[test]
+    fn fuses_name_keyed_windows() {
+        let mut code = bc(
+            &[
+                OpCode::LoadVar(1),
+                OpCode::PushInt(200000),
+                OpCode::Lt,
+                OpCode::JumpFalse(5),
+                OpCode::Nop,
+                OpCode::Return,
+            ],
+            false,
+        );
+        code.peephole();
+        assert_eq!(
+            code.ops(),
+            &[
+                OpCode::CmpVarImmJumpFalse(1, 200000, 0, 1),
+                OpCode::Return,
+            ]
+        );
+    }
+
+    /// `unfused()` is the exact inverse of the fusions — expansion
+    /// re-creates the canonical windows, jump targets included — and
+    /// re-fusing the result yields the identical unit (round trip).  The
+    /// JIT/`rtcl-vm` boundary relies on this to keep its accepted set
+    /// untouched (see `docs/JIT-OPCODE-DELTA.md`).
+    #[test]
+    fn unfused_expands_windows() {
+        let mut code = bc(
+            &[
+                OpCode::LoadVar(1),
+                OpCode::PushInt(200000),
+                OpCode::Lt,
+                OpCode::JumpFalse(5),
+                OpCode::Nop,
+                OpCode::Return,
+            ],
+            false,
+        );
+        code.peephole();
+        assert_eq!(code.ops()[0], OpCode::CmpVarImmJumpFalse(1, 200000, 0, 1));
+        let back = code.unfused();
+        assert!(!back.has_fused_ops());
+        assert_eq!(
+            back.ops(),
+            &[
+                OpCode::LoadVar(1),
+                OpCode::PushInt(200000),
+                OpCode::Lt,
+                OpCode::JumpFalse(4),
+                OpCode::Return,
+            ]
+        );
+        let mut again = back;
+        again.peephole();
+        assert_eq!(again.ops(), code.ops());
+    }
+
+    /// Every fused/superinstruction family expands — `unfused()` leaves no
+    /// op outside the pre-fusion set (the JIT/`rtcl-vm` boundary contract).
+    #[test]
+    fn unfused_covers_every_family() {
+        let mut code = bc(
+            &[
+                OpCode::CmpSlotSlotJumpTrue(1, 2, 0, 12),
+                OpCode::CmpSlotSlotJumpFalse(1, 2, 0, 12),
+                OpCode::CmpSlotImmJumpTrue(1, 9, 0, 12),
+                OpCode::CmpSlotImmJumpFalse(1, 9, 0, 12),
+                OpCode::CmpVarVarJumpTrue(1, 2, 0, 12),
+                OpCode::CmpVarVarJumpFalse(1, 2, 0, 12),
+                OpCode::CmpVarImmJumpTrue(1, 9, 0, 12),
+                OpCode::CmpVarImmJumpFalse(1, 9, 0, 12),
+                OpCode::LappendSlotSlot(1, 2),
+                OpCode::LappendVarVar(1, 2),
+                OpCode::IncrLocalPop(1, 1),
+                OpCode::IncrVarPop(1, 1),
+                OpCode::StoreLocalPop(1),
+                OpCode::CmpVarImm(1, 9, 0),
+                OpCode::CmpVarVar(1, 2, 0),
+                OpCode::AddVarImm(1, 9),
+                OpCode::AddVarVar(1, 2),
+                OpCode::BeginCmdSubMark(1),
+                OpCode::ExprMarkBeginCmd(1),
+                OpCode::BeginCmdPushConst(1, 2),
+                OpCode::SubEndStoreLocalPop(1),
+                OpCode::SubEndStoreVarPop(1),
+                OpCode::SubEndReturn,
+                OpCode::SwapToNextMark,
+                OpCode::NextMarkBeginCmd(1),
+                OpCode::BeginCmdIncrLocalPop(1, 2, 1),
+                OpCode::BeginCmdIncrVarPop(1, 2, 1),
+                OpCode::ForeachNextClose(1, 2),
+                OpCode::SlotSetAddSS { set_site: 1, expr_site: 2, a: 3, b: 4, dst: 5 },
+                OpCode::VarSetAddVV { set_site: 1, expr_site: 2, a: 3, b: 4, dst: 5 },
+                OpCode::PushConstSubMark(1),
+                OpCode::SubMarkBeginCmd(1),
+                OpCode::ExprMarkBeginPushConst(1, 2),
+                OpCode::SubSlotImm(1, 2),
+                OpCode::SubSlotSlot(1, 2),
+                OpCode::SubEndDynCall(2),
+                OpCode::SubEndCall { cmd_id: 1, argc: 2 },
+                OpCode::SubEndAdd,
+                OpCode::Return,
+            ],
+            false,
+        );
+        assert!(code.has_fused_ops());
+        let back = code.unfused();
+        assert!(!back.has_fused_ops());
+        assert_eq!(back.ops().last(), Some(&OpCode::Return));
+    }
+
+    /// `strip_nops` remaps the fused op's own jump target like the
+    /// dispatched jump ops' (a compaction ahead of the window must not
+    /// shift the branch landing).
+    #[test]
+    fn strip_remaps_fused_targets() {
+        let mut code = bc(
+            &[
+                OpCode::Nop,
+                OpCode::CmpSlotSlot(1, 2, 0),
+                OpCode::JumpFalse(4),
+                OpCode::Nop,
+                OpCode::Return,
+            ],
+            true,
+        );
+        code.peephole();
+        let target = code
+            .ops()
+            .iter()
+            .find_map(|o| match o {
+                OpCode::CmpSlotSlotJumpFalse(_, _, _, t) => Some(*t),
+                _ => None,
+            })
+            .expect("fused branch present");
+        assert_eq!(target as usize, code.ops().len() - 1);
     }
 }

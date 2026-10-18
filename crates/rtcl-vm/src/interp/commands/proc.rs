@@ -250,7 +250,7 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 crate::error::ErrorCode::NotFound,
             ));
         }
-        Some(qualified)
+        Some(Rc::from(qualified))
     } else {
         None
     };
@@ -658,9 +658,9 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // target (upvar-4.2: p3 aliases p2's alias of p1's local;
         // upvar-8.5: the reverse link closes a cycle onto itself).
         let mut link = match &target {
-            UpvarTarget::GlobalNs => UpvarLink::Global(other_var.clone()),
+            UpvarTarget::GlobalNs => UpvarLink::Global(Rc::from(other_var.as_str())),
             UpvarTarget::Ns(ns) => {
-                UpvarLink::Global(interp.canonical_global_in(ns, &other_var))
+                UpvarLink::Global(Rc::from(interp.canonical_global_in(ns, &other_var)))
             }
             UpvarTarget::Frame(fi) => UpvarLink::Frame {
                 frame_index: *fi,
@@ -721,7 +721,7 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // frame's own reads/writes of the alias re-resolve through the
         // upvar guards.
         interp.degrade_frame_link(current_idx, &local_var, &link);
-        let has_link = interp.frames[current_idx].upvars.contains_key(&local_var);
+        let has_link = interp.frames[current_idx].upvars.contains_key(local_var.as_str());
         if !has_link
             && (interp.frames[current_idx].locals.contains_key(&local_var)
                 || interp
@@ -738,12 +738,12 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
         interp.frames[current_idx]
             .upvars
-            .insert(local_var.clone(), link.clone());
+            .insert(Rc::from(local_var.as_str()), link.clone());
         // Linking to an ELEMENT of a missing array still creates the
         // array container (not the element) in tclsh (probed:
         // `upvar 0 a(e) x` → `array exists a` = 1, `info exists x` = 0).
         if let UpvarLink::Global(gname) = &link {
-            if let Some(paren) = gname.find('(') {
+            if let Some(paren) = super::super::util::find_paren(gname) {
                 let base = &gname[..paren];
                 if !interp.is_array_semantic(base) && !interp.var_exists(base) {
                     let _ = interp.mark_array(base);
@@ -755,7 +755,7 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // target when one exists; reads/writes still go through the
         // link.
         let mirror: Option<Value> = match &link {
-            UpvarLink::Global(gname) => interp.globals.get(gname).cloned(),
+            UpvarLink::Global(gname) => interp.globals.get(&**gname).cloned(),
             UpvarLink::Frame { frame_index, var_name } => interp
                 .frames
                 .get(*frame_index)
@@ -846,9 +846,9 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // on their compiled fast path — the frame's own ops on the name
         // re-resolve through the upvar guards, the way tclsh's linked
         // compiledLocal does.
-        let glink = UpvarLink::Global(target.clone());
+        let glink = UpvarLink::Global(Rc::from(target.as_str()));
         interp.degrade_frame_link(current_idx, &local, &glink);
-        interp.frames[current_idx].upvars.insert(local.clone(), glink);
+        interp.frames[current_idx].upvars.insert(Rc::from(local.as_str()), glink);
         // The linked name lives in the proc's variable table (tclsh's
         // `info vars` lists it) — mirror the current value when one
         // exists; reads/writes still go through the link.

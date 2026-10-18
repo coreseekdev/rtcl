@@ -106,6 +106,24 @@ pub fn validate(code: &ByteCode) -> Vec<ValidationError> {
                     });
                 }
             }
+            OpCode::CmpSlotSlotJumpTrue(_, _, _, target)
+            | OpCode::CmpSlotSlotJumpFalse(_, _, _, target)
+            | OpCode::CmpSlotImmJumpTrue(_, _, _, target)
+            | OpCode::CmpSlotImmJumpFalse(_, _, _, target)
+            | OpCode::CmpVarVarJumpTrue(_, _, _, target)
+            | OpCode::CmpVarVarJumpFalse(_, _, _, target)
+            | OpCode::CmpVarImmJumpTrue(_, _, _, target)
+            | OpCode::CmpVarImmJumpFalse(_, _, _, target) => {
+                if *target as usize > len {
+                    errors.push(ValidationError {
+                        pc,
+                        message: format!(
+                            "fused jump target {} out of bounds (code length {})",
+                            target, len,
+                        ),
+                    });
+                }
+            }
             OpCode::CatchStart(target) => {
                 if *target as usize > len {
                     errors.push(ValidationError {

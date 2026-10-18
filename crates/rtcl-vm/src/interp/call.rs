@@ -1,8 +1,9 @@
 //! Procedure call and tail-call optimisation for [`Interp`].
 
 use std::borrow::Cow;
+use super::PrelinkEntry;
 
-use super::{CallFrame, Interp, ProcDef, VarMap, VarSet};
+use super::{CallFrame, Interp, ProcDef, UpvarMap, VarMap, VarSet};
 use super::util::rfind_ns_sep;
 use crate::error::{Error, Result};
 use crate::value::Value;
@@ -23,7 +24,7 @@ impl Interp {
     ///
     /// `ns_override` pins the frame's namespace for `apply {p b ::ns}`
     /// (the lambda runs in `::ns` regardless of its synthetic name).
-    pub(crate) fn call_proc(&mut self, proc_def: &ProcDef, args: &[Value], proc_name: &str, ns_override: Option<String>) -> Result<Value> {
+    pub(crate) fn call_proc(&mut self, proc_def: &ProcDef, args: &[Value], proc_name: &str, ns_override: Option<Rc<str>>) -> Result<Value> {
         if self.call_depth > self.max_call_depth {
             return Err(Error::runtime(
                 "maximum recursion depth exceeded",
@@ -39,7 +40,10 @@ impl Interp {
         // materialised into an owned vector only by a tail-call target,
         // which then serves every later iteration.
         let mut owned_args: Option<Vec<Value>> = None;
-        let mut current_statics: HashMap<String, Value> = (*proc_def.statics).clone();
+        // Static variables ride the def's shared map: the common (empty)
+        // case is one refcount bump, not a map clone per call; write-backs
+        // COW via `Rc::make_mut`.
+        let mut current_statics: Rc<HashMap<String, Value>> = Rc::clone(&proc_def.statics);
         // Borrowed until a tail-call rebind owns its target's name: plain
         // global proc calls pay no per-call String for the frame name.
         let mut current_proc_name = Cow::Borrowed(proc_name);
@@ -94,19 +98,24 @@ impl Interp {
                 f.slots.clear();
                 f.slot_aliased.clear();
                 f.link_keys.clear();
+                f.has_aliased = false;
                 f.slot_table = None;
                 f
             }
             None => Box::new(CallFrame {
                 locals: VarMap::default(),
                 array_locals: VarSet::default(),
-                upvars: VarMap::default(),
+                upvars: UpvarMap::default(),
                 ns: None,
                 call_ns: None,
                 local_procs: Vec::new(),
                 deferred_scripts: Vec::new(),
-                slots: Vec::new(),
+                // Small head-room: a fresh frame is created per call once
+                // the pool is exhausted (deep recursion), and the slot
+                // fill would otherwise realloc on its first resize.
+                slots: Vec::with_capacity(8),
                 slot_aliased: Vec::new(),
+                has_aliased: false,
                 link_keys: Vec::new(),
                 slot_table: None,
                 tailcall: None,
@@ -150,10 +159,13 @@ impl Interp {
                     let frame = self.frames.last_mut().unwrap();
                     frame.slots.clear();
                     frame.slots.resize(n, Value::unset());
+                    // The alias/`Global`-link side vectors build lazily:
+                    // `degrade_frame_link` sizes them on first use, every
+                    // reader probes with `.get(slot)` — no per-call resize
+                    // of either.
                     frame.slot_aliased.clear();
-                    frame.slot_aliased.resize(n, false);
+                    frame.has_aliased = false;
                     frame.link_keys.clear();
-                    frame.link_keys.resize(n, None);
                     frame.slot_table = Some(table);
                     true
                 }
@@ -161,6 +173,7 @@ impl Interp {
                     let frame = self.frames.last_mut().unwrap();
                     frame.slots.clear();
                     frame.slot_aliased.clear();
+                    frame.has_aliased = false;
                     frame.link_keys.clear();
                     frame.slot_table = None;
                     false
@@ -173,7 +186,6 @@ impl Interp {
             {
                 let def_ns = ns_override
                     .take()
-                    .map(Rc::from)
                     .unwrap_or_else(|| ns_of_qualified(self, &current_proc_name));
                 self.current_namespace = Rc::clone(&def_ns);
                 let frame = self.frames.last_mut().unwrap();
@@ -319,39 +331,45 @@ impl Interp {
             // lifecycle.
             if !prelink_done {
                 prelink_done = true;
-                let links: &[String] = prelink.as_deref().unwrap_or(&[]);
+                let links: &[PrelinkEntry] = prelink.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
                 let frame_idx = self.frames.len() - 1;
-                let ns = self.current_namespace.clone();
-                for name in links.iter() {
-                    let (qualified, ns_part) = super::commands::namespace::resolve_var_link(
-                        self,
-                        ns.as_ref(),
-                        name,
-                    );
+                for entry in links.iter() {
+                    let name = &entry.name;
+                    let (qualified, ns_part) = (&entry.qualified, &entry.ns_part);
                     // The definition namespace always exists (the object
                     // created it), so the parent-exists check the
-                    // `variable` command performs cannot fail here.
-                    if let Some(info) = self.namespaces.get_mut(&ns_part) {
-                        info.variables.insert(qualified.clone());
+                    // `variable` command performs cannot fail here.  The
+                    // registration runs ONCE per memo (a flag beside the
+                    // entry) instead of probing the namespace's variable
+                    // set on every call; the entry is retired with the
+                    // chain memo, which the object namespace's lifetime
+                    // bounds.  The `(qualified, ns_part)` pair is
+                    // precomputed there too (pure string math).
+                    if !entry.registered.get() {
+                        if let Some(info) = self.namespaces.get_mut(&**ns_part) {
+                            if !info.variables.contains(&**qualified) {
+                                info.variables.insert(qualified.to_string());
+                            }
+                        }
+                        entry.registered.set(true);
                     }
                     // The alias name leaves the slot model (link-only
                     // aliasing — the frame's other slots stay fast).
-                    let glink = crate::interp::UpvarLink::Global(qualified.clone());
+                    let glink = crate::interp::UpvarLink::Global(Rc::clone(&qualified));
                     self.degrade_frame_link(frame_idx, name, &glink);
                     self.frames[frame_idx].upvars.insert(
-                        name.clone(),
-                        crate::interp::UpvarLink::Global(qualified.clone()),
+                        Rc::clone(name),
+                        crate::interp::UpvarLink::Global(Rc::clone(&qualified)),
                     );
-                    // Seed a local copy when the namespace variable
-                    // already holds a value (var-7.12's family).
-                    if let Some(v) = self.globals.get(&qualified).cloned() {
-                        self.frames[frame_idx].locals.insert(name.clone(), v);
-                    }
+                    // No seed: live reads go through the upvar link; the
+                    // seed copied the global and allocated a String key
+                    // per call. (Known edge: deleting the target ns
+                    // mid-method loses the value — see TODO review items.)
                 }
             }
 
             // ── Inject static variables into the frame ─────────────
-            for (sname, sval) in &current_statics {
+            for (sname, sval) in current_statics.iter() {
                 self.frames.last_mut().unwrap().locals.insert(sname.clone(), sval.clone());
             }
 
@@ -413,19 +431,19 @@ impl Interp {
                             let snames: Vec<String> = current_statics.keys().cloned().collect();
                             for sname in &snames {
                                 if let Some(val) = frame.locals.get(sname) {
-                                    current_statics.insert(sname.clone(), val.clone());
+                                    Rc::make_mut(&mut current_statics).insert(sname.clone(), val.clone());
                                 }
                             }
                         }
                         if let Some(pdef) = self.procs.get_mut(current_proc_name.as_ref()) {
-                            Rc::make_mut(pdef).statics = Rc::new(current_statics.clone());
+                            Rc::make_mut(pdef).statics = Rc::clone(&current_statics);
                             // The map entry was replaced: age every
                             // call-site token / resolution-cache entry
                             // holding a def clone.  Statics-bearing procs
                             // are never hot-loop material — one u64 bump.
                             self.note_cmd_mutation();
                         }
-                        current_statics = HashMap::new();
+                        current_statics = Rc::new(HashMap::new());
                     }
                     let tc_args = match self.frames.last_mut().unwrap().tailcall.take() {
                         Some(a) => a,
@@ -442,7 +460,7 @@ impl Interp {
                         current_params = Rc::clone(&new_proc.params);
                         current_body = Rc::clone(&new_proc.body);
                         current_compiled = new_proc.compiled.clone();
-                        current_statics = (*new_proc.statics).clone();
+                        current_statics = Rc::clone(&new_proc.statics);
                         current_proc_name = Cow::Owned(cmd_name.clone());
                         owned_args = Some(tc_args.into_iter().map(|s| Value::from_str(&s)).collect());
                         // The reused frame's enterstep context now names the
@@ -508,14 +526,14 @@ impl Interp {
         // Write back static variables to the proc definition
         if !current_statics.is_empty() {
             if let Some(frame) = self.frames.last() {
-                let mut updated = current_statics;
+                let mut updated = Rc::clone(&current_statics);
                 for sname in updated.keys().cloned().collect::<Vec<_>>() {
                     if let Some(val) = frame.locals.get(&sname) {
-                        updated.insert(sname, val.clone());
+                        Rc::make_mut(&mut updated).insert(sname, val.clone());
                     }
                 }
                 if let Some(pdef) = self.procs.get_mut(current_proc_name.as_ref()) {
-                    Rc::make_mut(pdef).statics = Rc::new(updated);
+                    Rc::make_mut(pdef).statics = updated;
                     // See the tail-call write-back: the entry was
                     // replaced, so cached def handles must age out.
                     self.note_cmd_mutation();
@@ -594,6 +612,7 @@ impl Interp {
         popped.deferred_scripts.clear();
         popped.slots.clear();
         popped.slot_aliased.clear();
+        popped.has_aliased = false;
         popped.link_keys.clear();
         popped.slot_table = None;
         // Kept (cleared, with capacity) — the pooled frame reuses the

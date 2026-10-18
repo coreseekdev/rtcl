@@ -3,11 +3,54 @@ name = "rtcl-vm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Bytecode execution engine and shared types for rtcl"
-keywords = ["tcl", "vm", "bytecode", "interpreter"]
+description = "rtcl VM — Value/Error/VmContext runtime core plus the interpreter (tree-walk + bytecode executor)"
+keywords = ["tcl", "vm", "bytecode", "interpreter", "embedded"]
 categories = ["parser-implementations"]
 
 [dependencies]
 rtcl-ir.workspace = true
+rtcl-parser.workspace = true
 smallvec.workspace = true
 indexmap.workspace = true
+
+num-bigint.workspace = true
+num-traits.workspace = true
+num-integer.workspace = true
+
+[dependencies.glob]
+workspace = true
+optional = true
+
+[dependencies.regex]
+workspace = true
+optional = true
+
+[dependencies.regex-lite]
+workspace = true
+optional = true
+
+[dependencies.spin]
+workspace = true
+optional = true
+
+[features]
+default = ["rtcl_std"]
+# OS-level platform features (time, hostname, channels, filesystem)
+std = []
+# Tcl standard library — all extensions combined
+rtcl_std = ["file", "io", "exec", "clock", "regexp", "env", "signal", "package"]
+# Individual Tcl extensions (each implies Rust std)
+file = ["std", "dep:glob"]        # file, cd, pwd, glob, readdir, source
+io = ["std"]                      # channel I/O: open, close, read, gets, seek, tell, eof, flush, fconfigure, pid
+exec = ["std"]                    # exec, wait
+clock = ["std"]                   # clock seconds/clicks/format/scan
+regexp = ["std", "dep:regex"]     # regexp, regsub
+regexp-lite = ["std", "dep:regex-lite"]  # regexp, regsub (smaller WASM binary)
+env = ["std"]                     # $env array from OS environment
+package = ["file"]                # package provide/require/names/forget
+signal = ["std"]                  # kill, sleep
+# For embedded/no-std targets
+alloc = []
+embedded = ["alloc", "dep:spin"]
+# Enable extra diagnostics
+debug = []

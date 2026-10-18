@@ -5,7 +5,7 @@
 //! locals (or follow upvar links to globals / other frames).
 
 use super::util::{has_ns_sep, split_array_ref};
-use super::{Interp, UpvarLink};
+use super::{Interp, Rc, UpvarLink};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
 
@@ -64,7 +64,7 @@ impl Interp {
     /// back to the name path).
     pub(crate) fn frame_slot_value(&self, slot: usize) -> Option<Value> {
         let f = self.frames.last()?;
-        if f.slot_aliased.get(slot).copied().unwrap_or(false) {
+        if f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false) {
             // Global link: ONE probe with the canonical key (the name
             // path would pay upvars + globals = two hashes).
             let key = f.link_keys.get(slot)?.as_ref()?;
@@ -86,7 +86,7 @@ impl Interp {
         let aliased = self
             .frames
             .last()
-            .map(|f| f.slot_aliased.get(slot).copied().unwrap_or(false))
+            .map(|f| f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false))
             .unwrap_or(true);
         if aliased {
             // Global link: write the target directly through the cached
@@ -122,6 +122,56 @@ impl Interp {
         }
     }
 
+    /// The `StoreLocalPop` storage arm: same fast path and delegation
+    /// points as [`Self::frame_slot_write`], but the caller's only
+    /// remaining handle to `value` moves into the cell — the discarded
+    /// result never pays a clone.  `Err(value)` returns that handle to
+    /// the caller (which then takes the name path, exactly the `false`
+    /// branch of the cloning write).
+    pub(crate) fn frame_slot_write_move(
+        &mut self,
+        slot: usize,
+        value: Value,
+    ) -> core::result::Result<(), Value> {
+        let aliased = self
+            .frames
+            .last()
+            .map(|f| f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false))
+            .unwrap_or(true);
+        if aliased {
+            // Global link: write the target directly through the cached
+            // canonical key (one probe; creation goes through the name
+            // path — the link install seeded the variable, so the hot
+            // case is always the hit).
+            let key = self
+                .frames
+                .last()
+                .and_then(|f| f.link_keys.get(slot))
+                .and_then(|k| k.clone());
+            if let Some(key) = key {
+                if let Some(cell) = self.globals.get_mut(key.as_ref()) {
+                    *cell = value;
+                    return Ok(());
+                }
+                let name = self.frames.last().and_then(|f| {
+                    f.slot_table.as_ref().and_then(|t| t.locals().get(slot).cloned())
+                });
+                if let Some(name) = name {
+                    let _ = self.set_var(&name, value);
+                    return Ok(());
+                }
+            }
+            return Err(value);
+        }
+        match self.frames.last_mut().and_then(|f| f.slots.get_mut(slot)) {
+            Some(cell) => {
+                *cell = value;
+                Ok(())
+            }
+            None => Err(value),
+        }
+    }
+
     /// `lappend` on a frame slot's list — the compiled-op fast path.
     /// Appends `value` to the slot's list in place when every guard the
     /// real `lappend` enforces holds: no traces, not aliased/linked, the
@@ -135,7 +185,7 @@ impl Interp {
         let Some(f) = self.frames.last_mut() else {
             return false;
         };
-        if f.slot_aliased.get(slot).copied().unwrap_or(false) {
+        if f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false) {
             return false;
         }
         let Some(cell) = f.slots.get_mut(slot) else {
@@ -160,7 +210,7 @@ impl Interp {
         }
         {
             let f = self.frames.last()?;
-            if f.slot_aliased.get(slot).copied().unwrap_or(false) {
+            if f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false) {
                 // Global link: one probe, in-place int rewrite when the
                 // stored value is unshared/immediate.
                 let key = f.link_keys.get(slot)?.as_ref()?;
@@ -191,10 +241,7 @@ impl Interp {
     /// inserts them at runtime, so hash iteration order (and anything
     /// derived from it after a later degrade) matches too.
     pub(crate) fn degrade_frame_local(&mut self, frame_idx: usize, name: &str) {
-        let base = match name.find('(') {
-            Some(i) => &name[..i],
-            None => name,
-        };
+        let base = super::util::strip_paren(name);
         let Some(f) = self.frames.get_mut(frame_idx) else { return };
         if f.slots.is_empty() || f.slot_index_of(base).is_none() {
             return;
@@ -212,6 +259,7 @@ impl Interp {
         f.slots.clear();
         f.slot_aliased.clear();
         f.link_keys.clear();
+        f.has_aliased = false;
     }
 
     /// Link-only aliasing of ONE slot: move the cell's value into
@@ -224,10 +272,7 @@ impl Interp {
     /// keep [`Self::degrade_frame_local`]'s wholesale flush (their
     /// storage-kind change is frame-wide by nature, and they are cold).
     pub(crate) fn degrade_frame_link(&mut self, frame_idx: usize, name: &str, link: &crate::interp::UpvarLink) {
-        let base = match name.find('(') {
-            Some(i) => &name[..i],
-            None => name,
-        };
+        let base = super::util::strip_paren(name);
         let Some(f) = self.frames.get_mut(frame_idx) else { return };
         if f.slots.is_empty() {
             return;
@@ -242,6 +287,7 @@ impl Interp {
             f.slot_aliased.resize(f.slots.len(), false);
         }
         f.slot_aliased[i] = true;
+        f.has_aliased = true;
         // Global links get the direct-key fast path: slot ops on this
         // name resolve through ONE globals probe with the canonical key
         // (frame/dead links keep None — their name paths handle the
@@ -251,9 +297,8 @@ impl Interp {
             f.link_keys.resize(f.slots.len(), None);
         }
         f.link_keys[i] = match link {
-            crate::interp::UpvarLink::Global(g) => {
-                Some(std::rc::Rc::from(g.as_str()))
-            }
+            // The cached `Rc<str>` target, by refcount.
+            crate::interp::UpvarLink::Global(g) => Some(std::rc::Rc::clone(g)),
             _ => None,
         };
     }
@@ -286,6 +331,7 @@ impl Interp {
         f.slots.clear();
         f.slot_aliased.clear();
         f.link_keys.clear();
+        f.has_aliased = false;
     }
 
     /// [`Self::degrade_frame_all_at`] on the current frame (no-op at the
@@ -313,7 +359,7 @@ impl Interp {
             if let Some(link) = frame.upvars.get(name) {
                 return match link {
                     UpvarLink::Global(gname) => {
-                        VarLoc::Global(self.redirect_flat(gname.clone()))
+                        VarLoc::Global(self.redirect_flat(gname.to_string()))
                     }
                     UpvarLink::Frame { frame_index, var_name } => {
                         VarLoc::Frame(*frame_index, var_name.clone())
@@ -346,17 +392,23 @@ impl Interp {
     /// pre-deletion behavior against the seeded local copy.  Returns
     /// `Some(is_element_error)` when the write must fail.
     fn dead_link_error(&self, name: &str) -> Option<bool> {
-        let base = match name.find('(') {
-            Some(i) => &name[..i],
-            None => name,
-        };
+        // Every `set_var` pays this first: nothing linked (the common
+        // case) means nothing can be dead — skip the paren scan AND the
+        // upvar hash probe entirely.
         if let Some(frame) = self.frames.last() {
+            if frame.upvars.is_empty() {
+                return None;
+            }
+            let base = super::util::strip_paren(name);
             match frame.upvars.get(base) {
                 Some(UpvarLink::Dead { array, .. }) => Some(*array),
                 _ => None,
             }
         } else {
-            let key = self.canonical_global(base);
+            if self.dead_flat.is_empty() {
+                return None;
+            }
+            let key = self.canonical_global(super::util::strip_paren(name));
             if self.dead_flat.contains(&key) {
                 Some(false)
             } else {
@@ -568,7 +620,7 @@ impl Interp {
                     // `namespace delete [namespace current]`).
                     UpvarLink::Global(gname) => self
                         .globals
-                        .get(self.redirect_flat(gname.clone()).as_str())
+                        .get(self.redirect_flat(gname.to_string()).as_str())
                         .or_else(|| frame.locals.get(name)),
                     UpvarLink::Frame { frame_index, var_name } => {
                         // Link installation degrades the target frame, so
@@ -643,7 +695,7 @@ impl Interp {
                     // probe in place first (one hash, no key churn) — the
                     // unconditional insert dropped and re-stored the key
                     // String per write.
-                    let key = self.redirect_flat(gname);
+                    let key = self.redirect_flat(gname.to_string());
                     if let Some(slot) = self.globals.get_mut(&key) {
                         *slot = value;
                     } else {
@@ -714,10 +766,10 @@ impl Interp {
                         let flat = self
                             .flat_aliases
                             .iter()
-                            .find(|(k, _)| k == g)
+                            .find(|(k, _)| k.as_str() == &**g)
                             .map(|(_, t)| t.as_str())
-                            .unwrap_or(g);
-                        (flat == key).then(|| n.clone())
+                            .unwrap_or(&**g);
+                        (flat == key).then(|| n.to_string())
                     }
                     _ => None,
                 })
@@ -751,7 +803,7 @@ impl Interp {
         if let Some(link) = self.frames[frame_idx].upvars.get(name).cloned() {
             match link {
                 UpvarLink::Global(gname) => {
-                    let gname = self.redirect_flat(gname);
+                    let gname = self.redirect_flat(gname.to_string());
                     self.globals.remove(gname.as_str());
                 }
                 UpvarLink::Frame { frame_index, var_name } => {
@@ -880,11 +932,14 @@ impl Interp {
     /// `set ::nope2::` is not — var-1.12).  Reads, `info exists`, and unset
     /// stay plain misses.
     pub(crate) fn check_parent_ns(&mut self, name: &str) -> Result<()> {
-        let var = match name.find('(') {
-            Some(i) => &name[..i],
-            None => name,
-        };
-        if !var.contains("::") {
+        // Fast reject: a name with no `::` anywhere cannot name a
+        // namespace-scoped variable (stripping an element suffix can't
+        // add one either) — the scan below is for qualified names only.
+        if !super::util::has_ns_sep(name) {
+            return Ok(());
+        }
+        let var = super::util::strip_paren(name);
+        if !super::util::has_ns_sep(var) {
             return Ok(());
         }
         let full = super::commands::namespace::qualify(&self.current_namespace, var);
@@ -1129,7 +1184,7 @@ impl Interp {
         //     Unlinked proc locals were handled by take_var_fast.
         if let Some(frame) = self.frames.last() {
             let target = match frame.upvars.get(name) {
-                Some(UpvarLink::Global(g)) => g.clone(),
+                Some(UpvarLink::Global(g)) => g.to_string(),
                 _ => return None,
             };
             // The link target is the owning namespace's qualified name;
@@ -1411,12 +1466,12 @@ impl Interp {
                     .flat_aliases
                     .iter()
                     .find(|(k, _)| *k == base)
-                    .map(|(_, t)| UpvarLink::Global(t.clone())),
+                    .map(|(_, t)| UpvarLink::Global(Rc::from(t.as_str()))),
             };
             match next {
                 Some(UpvarLink::Global(g)) => {
                     scope = None;
-                    base = g;
+                    base = g.to_string();
                 }
                 Some(UpvarLink::Frame {
                     frame_index,
@@ -1580,7 +1635,7 @@ impl Interp {
                     UpvarLink::Global(g) if scope_idx.is_none() && g.starts_with(&elem_prefix) => {
                         *link = UpvarLink::Dead {
                             array: true,
-                            target: g.clone(),
+                            target: g.to_string(),
                         };
                     }
                     _ => {}
@@ -1611,7 +1666,7 @@ impl Interp {
                     if g.starts_with(var_prefix) {
                         *link = UpvarLink::Dead {
                             array: false,
-                            target: g.clone(),
+                            target: g.to_string(),
                         };
                     }
                 }

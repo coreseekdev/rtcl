@@ -370,18 +370,6 @@ impl Interp {
         }
     }
 
-    /// Compile a script to bytecode (caching it) and execute via the VM.
-    pub fn eval_compiled(&mut self, script: &str) -> Result<Value> {
-        let code = if let Some(cached) = self.code_cache.get(script) {
-            cached.clone()
-        } else {
-            let compiled = Compiler::compile_script(script)
-                .map_err(|e| Error::syntax(e.to_string(), 0, 0))?;
-            self.code_cache.insert(script.to_string(), compiled.clone());
-            compiled
-        };
-        rtcl_vm::execute(self, &code)
-    }
 
     pub fn eval_commands(&mut self, unit: &rtcl_parser::ScriptUnit) -> Result<Value> {
         let mut result = Value::empty();
@@ -455,7 +443,10 @@ impl Interp {
         let saved_source = std::mem::replace(&mut self.cur_source, Rc::clone(&unit.source));
         let saved_text = std::mem::replace(&mut self.cur_cmd_text, cmd.text);
         let saved_line = std::mem::replace(&mut self.cur_cmd_line, cmd.line);
-        let saved_srcs = std::mem::replace(&mut self.cur_cmd_word_srcs, cmd.word_srcs.clone());
+        let saved_srcs = std::mem::replace(
+            &mut self.cur_cmd_word_srcs,
+            super::util::WordSrcs::from_rc(&cmd.word_srcs),
+        );
         // Execution enterstep/leavestep traces (tclsh 8.6.17): fire
         // against the enclosing traced proc, if any.  enterstep runs
         // before dispatch; leavestep after, with the completion code and
@@ -888,7 +879,7 @@ impl Interp {
         // `[winfo name $zz]` even when the array itself is
         // missing (misc-1.1), and an index error masks the
         // array lookup entirely.
-        if let Some(open) = name.find('(') {
+        if let Some(open) = crate::interp::util::find_paren(name) {
             if name.ends_with(')') {
                 let raw = &name[open + 1..name.len() - 1];
                 if raw.contains('$') || raw.contains('[') || raw.contains('\\') {

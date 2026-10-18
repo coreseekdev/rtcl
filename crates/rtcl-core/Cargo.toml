@@ -3,55 +3,33 @@ name = "rtcl-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Core library for rtcl - lightweight Tcl interpreter"
+description = "Compatibility facade over rtcl-vm (the interpreter crate) — same paths, same features"
 keywords = ["tcl", "scripting", "interpreter", "embedded"]
 categories = ["parser-implementations", "embedded", "command-line-interface"]
 
 [dependencies]
 rtcl-parser.workspace = true
 rtcl-vm.workspace = true
-indexmap.workspace = true
-
-num-bigint.workspace = true
-num-traits.workspace = true
-num-integer.workspace = true
-
-[dependencies.glob]
-workspace = true
-optional = true
-
-[dependencies.regex]
-workspace = true
-optional = true
-
-[dependencies.regex-lite]
-workspace = true
-optional = true
-
-[dependencies.spin]
-workspace = true
-optional = true
 
 [features]
+# The interpreter lives in `rtcl-vm` now; every feature is a passthrough
+# so existing dependents keep their feature names. Each std-requiring
+# passthrough also enables the local `std` so facade-gated re-exports
+# (`channel` etc.) keep their master-era visibility.
 default = ["rtcl_std"]
-# OS-level platform features (time, hostname, channels, filesystem)
-std = []
-# Tcl standard library — all extensions combined
-rtcl_std = ["file", "io", "exec", "clock", "regexp", "env", "signal", "package"]
-# Individual Tcl extensions (each implies Rust std)
-file = ["std", "dep:glob"]        # file, cd, pwd, glob, readdir, source
-io = ["std"]                      # channel I/O: open, close, read, gets, seek, tell, eof, flush, fconfigure, pid
-exec = ["std"]                    # exec, wait
-clock = ["std"]                   # clock seconds/clicks/format/scan
-regexp = ["std", "dep:regex"]     # regexp, regsub
-regexp-lite = ["std", "dep:regex-lite"]  # regexp, regsub (smaller WASM binary)
-env = ["std"]                     # $env array from OS environment
-package = ["file"]                # package provide/require/names/forget
-signal = ["std"]                  # kill, sleep
-# For embedded/no-std targets
-alloc = []
-embedded = ["alloc", "dep:spin"]
-# Enable extra diagnostics
-debug = []
+std = ["rtcl-vm/std"]
+rtcl_std = ["rtcl-vm/rtcl_std", "std"]
+file = ["rtcl-vm/file", "std"]
+io = ["rtcl-vm/io", "std"]
+exec = ["rtcl-vm/exec", "std"]
+clock = ["rtcl-vm/clock", "std"]
+regexp = ["rtcl-vm/regexp", "std"]
+regexp-lite = ["rtcl-vm/regexp-lite", "std"]
+env = ["rtcl-vm/env", "std"]
+package = ["rtcl-vm/package", "std"]
+signal = ["rtcl-vm/signal", "std"]
+alloc = ["rtcl-vm/alloc"]
+embedded = ["rtcl-vm/embedded"]
+debug = ["rtcl-vm/debug"]
 
 [dev-dependencies]

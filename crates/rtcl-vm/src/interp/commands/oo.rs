@@ -64,7 +64,18 @@ pub(crate) enum MethodKind {
 }
 
 /// 方法 proc 体 memo：(typed name, 参数名表, 定义)。
-type ProcMemo = Option<(Option<Rc<Vec<String>>>, Rc<ProcDef>, Rc<Vec<crate::interp::PrelinkEntry>>)>;
+/// Memo layout: `(owner vars, def namespace, ProcDef, prelink entries)`.
+///
+/// The namespace is part of the identity: one `MethodDef` serves every
+/// instance of a class, and each instance's `variable` links resolve in
+/// its OWN namespace (`::oo::ObjN`) — the shared class `variables` list
+/// alone would let one instance's prelink resolution leak to another.
+type ProcMemo = Option<(
+    Option<Rc<Vec<String>>>,
+    Rc<str>,
+    Rc<ProcDef>,
+    Rc<Vec<crate::interp::PrelinkEntry>>,
+)>;
 
 /// A method definition (own methods, forwards, constructors, destructors).
 #[derive(Debug, Clone)]
@@ -905,12 +916,14 @@ fn memoised_proc_def(
     let vars: Option<Rc<Vec<String>>> = owner_variables(interp, owner, key).cloned();
     {
         let memo = def.proc_memo.borrow();
-        if let Some((vs, d, links)) = memo.as_ref() {
-            if match (vs, &vars) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Rc::ptr_eq(a, b),
-                _ => false,
-            } {
+        if let Some((vs, memo_ns, d, links)) = memo.as_ref() {
+            if Rc::ptr_eq(memo_ns, ns)
+                && match (vs, &vars) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                    _ => false,
+                }
+            {
                 return (Rc::clone(d), Rc::clone(links));
             }
         }
@@ -947,8 +960,12 @@ fn memoised_proc_def(
     }
     pd.compiled = compiled;
     let proc_def = Rc::new(pd);
-    *def.proc_memo.borrow_mut() =
-        Some((vars.clone(), Rc::clone(&proc_def), Rc::clone(&links)));
+    *def.proc_memo.borrow_mut() = Some((
+        vars.clone(),
+        Rc::clone(ns),
+        Rc::clone(&proc_def),
+        Rc::clone(&links),
+    ));
     (proc_def, links)
 }
 

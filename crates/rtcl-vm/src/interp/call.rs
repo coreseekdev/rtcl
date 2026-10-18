@@ -333,7 +333,6 @@ impl Interp {
                 prelink_done = true;
                 let links: &[PrelinkEntry] = prelink.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
                 let frame_idx = self.frames.len() - 1;
-                let ns = self.current_namespace.clone();
                 for entry in links.iter() {
                     let name = &entry.name;
                     let (qualified, ns_part) = (&entry.qualified, &entry.ns_part);
@@ -362,11 +361,9 @@ impl Interp {
                         Rc::clone(name),
                         crate::interp::UpvarLink::Global(Rc::clone(&qualified)),
                     );
-                    // Seed a local copy when the namespace variable
-                    // already holds a value (var-7.12's family).
-                    if let Some(v) = self.globals.get(&**qualified).cloned() {
-                        self.frames[frame_idx].locals.insert(name.to_string(), v);
-                    }
+                    // EXPERIMENT: seed removed (live reads go through the
+                    // upvar link; the seed copied the global and allocated
+                    // a String key per call).
                 }
             }
 

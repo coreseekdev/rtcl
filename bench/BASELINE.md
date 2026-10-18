@@ -1512,6 +1512,24 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round R — OO 变量语义修正 + 大赢（2026-10-18，继续）
+
+两个语义发现（探针 + judge 语料联合作证）：
+
+1. **prelink 的「seed 局部副本」移除**：安装时把 namespace 变量的现值拷进
+   `frame.locals`（每次调用一次全局探测 + String 分配）。Tcl 的 `variable`
+   链接语义是活链接（读写直达 ns 变量，无副本）——upvar 链接已提供该路径，
+   seed 纯属冗余。移除后 oovars 6051M→**5515M**（−8.9%）。
+2. **方法 memo 身份补 ns**（我预计算引入的跨实例串扰，探针抓到）：一个
+   `MethodDef` 服务类的所有实例，而各实例的 `variable` 链接要在**自己的
+   ns**（`::oo::ObjN`）解析——memo 元组加入 def ns 的 `Rc` 身份比较；
+   新增 judge 语料 `oo_instance_vars.tcl` 作回归（tclsh 差分通过）。
+
+| 轮次 | fib25 | fe_bench | dloop | oo_bench2 | oo_bench2_vars | build-only |
+|---|---|---|---|---|---|---|
+| Q 后 | 0.85x | 0.93x | 0.68x | 0.48x | 0.64x | 0.74x |
+| R（本提交） | 0.85x | 0.93x | 0.68x | 0.48x | **0.58x** | 0.74x |
+
 ## Round Q — OO prelink 条目预计算（2026-10-18，继续）
 
 OO 方法每次调用的 prelink 安装原本做 4 个哈希/字符串探测（`resolve_var_link`

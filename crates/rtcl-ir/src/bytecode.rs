@@ -506,6 +506,22 @@ impl ByteCode {
                         _ => None,
                     }
                 }
+                // ── dead pushes (a pushed-and-discarded literal) ────────
+                // `[Push*, Pop]`: the value is never observed (Tcl has no
+                // way to see a discarded result; the push itself has no
+                // side effect beyond the stack word, and the pop's drop is
+                // the inverse).  The empty/constant body shape of every
+                // `for`/`if`-arm emits it.
+                (OpCode::PushEmpty, OpCode::Pop)
+                | (OpCode::PushTrue, OpCode::Pop)
+                | (OpCode::PushFalse, OpCode::Pop)
+                | (OpCode::PushInt(_), OpCode::Pop)
+                | (OpCode::PushConst(_), OpCode::Pop)
+                | (OpCode::PushConstWide(_), OpCode::Pop)
+                    if !targets[i + 1] =>
+                {
+                    Some((OpCode::Nop, 2))
+                }
                 // ── meta-op pairs (site/region bookkeeping) ──────────────
                 (OpCode::BeginCmd(site), OpCode::SubMark) if !targets[i + 1] => {
                     Some((OpCode::BeginCmdSubMark(*site), 2))

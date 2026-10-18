@@ -1512,6 +1512,29 @@ oovars 1.01x、fib 0.97x。
 **六个基准全部 ≤1.0x**（起点：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 /
 oovars 1.59 / build 1.29）。
 
+## Round V — 死推入消除 + 骨架成本归因（2026-10-18）
+
+`[PushEmpty/PushTrue/PushFalse/PushInt/PushConst(Wide), Pop]` → `Nop, Nop`
+（语义空操作：被丢弃的字面量不可观测；空体/常量体构造的常见形）。
+
+- `micro_base`（空 for 体）430.9M→**365.9M（1.28x→1.08x）**——空体的
+  `PUSH_EMPTY+POP` 每迭代 ~28 instr 归零。
+- 全板：fe 0.92x、build 0.72x、其余持平（该形只在空体/常量体构造出现）。
+
+**micro 成本归因**（perf 叶表，回答「为何 1.3x」）：
+
+| micro | 每迭代 | 构成（叶%） |
+|---|---|---|
+| micro_base | 366 instr / 2 op | exec_inner 19.9（派发 ~72/迭代）、条件 cmp_bool 13.3+op_cmp_ss_jump 10.2+slot_read 6.0（≈108）、尾 op 9.6+incr 路径 ~11（≈74）、region drop/clone ~7 |
+| micro_incr | 519 instr / 3 op | exec_inner 16.0（~83）、条件 ~18（~93）、体 `incr x`（op_begin_cmd 6.5 + incr_local_value 6.5 + set_int_rep 5.2 + frame_slot_incr 4.3 + get<u64> 5.6 ≈ 150）、尾 ~120 |
+
+结论：**单 op ≈170-180 instr**（tclsh ≈48/指令），主因 = 每命令 `BEGIN_CMD`
+站点存储（~34）、通用槽访问（frames.last+检查+clone，每次 ~20×5）、
+region 簿记（~40/迭代）、派发（~36/op）与 Result/helper 管道——tclsh 的
+等价循环没有运行时站点/region 簿记（errorInfo 走静态行表）且指令更扁平。
+这是架构地板；后续只剩「体+尾」合并省一次派发（~36/迭代，payload 受限）
+等小项。
+
 ## Round U — 循环骨架融合（修复版，2026-10-18）
 
 Round T 失败**根因已定位并修复**：`ForNextIncrLocal/Var` 携带的跳转靶点

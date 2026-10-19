@@ -146,11 +146,14 @@ pub mod import {
     pub const EVAL_SCRIPT: u32 = 20;
     pub const EVAL_EXPR: u32 = 21;
     pub const LAPPEND_VAR: u32 = 22;
+    /// `(i32, i32, i32) -> i64` — call_argv(base, argc, site)：直连分派
+    /// （M2 全案：已求值实参走 dispatch_values，免站点原文 eval 全链）。
+    pub const CALL_ARGV: u32 = 23;
     /// The one locally defined function (`run`) comes after the imports.
-    pub const RUN: u32 = 23;
+    pub const RUN: u32 = 24;
     /// Number of imported functions (globals come first in the import
     /// section but do not shift function indices).
-    pub const COUNT: u32 = 23;
+    pub const COUNT: u32 = 24;
 }
 
 /// Fuel policy: each loop back-edge decrements the imported `fuel`
@@ -166,7 +169,8 @@ pub mod cache {
     /// Per-var state byte: 0 = absent (zero-init), 1 = clean, 2 = dirty.
     pub const STATE: u32 = 512;
     pub const MAX_VARS: usize = 64;
-    /// 可变参数 op（Concat 等）的暂存区：n 个 tagged word，8 字节/个。
+    /// 可变参数 op（Concat/foreach/call_argv）的暂存区：n 个 tagged
+    /// word，8 字节/个。上限 = CallSite 的 argc ≤ 16 + 常规可变 op。
     pub const SCRATCH: u32 = 1024;
 }
 

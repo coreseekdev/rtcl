@@ -36,6 +36,19 @@ thread_local! {
     static PROC_MODULES: std::cell::RefCell<
         std::collections::HashMap<(usize, u64), Rc<emit::Module>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// wasmi 实例池：key = (interp 指针, 模块 key)。fib 类深递归每次
+    /// 调用 instantiate 是 .24×→.47× 后的剩余大头（vm_exec 有 VmPool
+    /// 复用而 JIT 没有）——Store+Instance 成对缓存（fuel/epoch/caching
+    /// global 状态在 Store 内持续，语义一致；Host 状态 run 前 reset）。
+    /// 单线程顺序执行；池上限 = 递归深度（64），超出全清。
+    static WASMI_POOL: std::cell::RefCell<
+        Vec<((usize, usize, u64), wasmi::Store<Host>, wasmi::Instance)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 池 key 的 epoch 分量（redefine 换 Rc + epoch 变化——双重防陈旧）。
+fn code_epoch_key(bc: &ByteCode) -> u64 {
+    bc.epoch
 }
 
 /// 钩子体：接受则 JIT 执行，`None` 退回 vm_exec。
@@ -56,11 +69,11 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
         // 同款）。编译拒绝不缓存负项（退回 vm_exec，重试成本低）。
         let bc = code.unfused();
         match emit::compile(&bc, &EmitConfig::default()) {
-            Ok(m) => {
+            Ok(mm) => {
                 if c.len() >= 64 {
                     c.clear();
                 }
-                let m = Rc::new(m);
+                let m = Rc::new(mm);
                 c.insert(key, Rc::clone(&m));
                 Some(m)
             }
@@ -70,6 +83,7 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
     // proc 语境的 case-b 帧协议已落地（rtcl-vm jit_err_* 公共入口 +
     // Host.proc_ctx 路由）——不再按 Cold 退回（f002196/f004860 的
     // (procedure …) 帧链由差分验证）。
+    CURRENT_MODULE_BYTES.with(|b| *b.borrow_mut() = module.bytes.clone());
     Some(execute_proc(interp, code, &module))
 }
 
@@ -78,24 +92,108 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
     use wasmi::{Caller, Engine, Extern, Linker, Module, Store, TypedFunc};
 
     let epoch0 = interp.tier1_epoch() as i64;
-    let mut host = Host::new(
-        interp as *mut Interp,
-        crate::exec::arena_of(bc),
-        bc,
-        module,
+    // key 三元组：interp 指针 + **proc 体 Rc 指针** + epoch——只有
+    // epoch 会让不同 proc（同 interp 同 epoch）撞 key（B 的调用命中
+    // A 的 Store/Instance——judge gen_oo/gen_proc 大面积回归的根因）。
+    let pool_key = (
+        interp as *mut Interp as usize,
+        Rc::as_ptr(bc) as usize,
+        code_epoch_key(bc),
     );
-    // proc 语境标记：case-b 帧写 interp 累积器（见 exec::take_fail）。
-    host.proc_ctx = true;
-    let watermark = host.arena_len();
 
-    let engine = Engine::default();
-    let wmodule = Module::new(&engine, &module.bytes[..]).expect("jit proc: module");
-    let mut store = Store::new(&engine, host);
-    let mut linker = <Linker<Host>>::new(&engine);
+    // 池命中：reset Host 状态 + 复用 Store/Instance（免 instantiate——
+    // vm_exec 有 VmPool 复用而 JIT 每次重建是 .47× 的剩余大头）。
+    let mut reused = false;
+    WASMI_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some(pos) = p.iter().position(|(k, ..)| *k == pool_key) {
+            let (_, mut store, inst) = p.remove(pos);
+            store.data_mut().reset_for_reuse();
+            // 把 Store/Instance 经 thread_local 传给本函数继续用：
+            // 单线程——借用 thread_local 槽位代替跨作用域移动。
+            POOL_TAKE.with(|t| *t.borrow_mut() = Some((store, inst)));
+            reused = true;
+        }
+    });
+    let (mut store, instance) = if reused {
+        POOL_TAKE.with(|t| t.borrow_mut().take().expect("pool take"))
+    } else {
+        let mut host = Host::new(
+            interp as *mut Interp,
+            crate::exec::arena_of(bc),
+            bc,
+            module,
+        );
+        host.proc_ctx = true;
+        let engine = Engine::default();
+        let wmodule = Module::new(&engine, &module.bytes[..]).expect("jit proc: module");
+        let mut store = Store::new(&engine, host);
+        // 注册 imports + instantiate（与 exec.rs 同款宿主闭包）。
+        let instance = register_and_instantiate(&mut store, epoch0);
+        (store, instance)
+    };
+    let watermark = store.data().arena_len();
 
-    let g_fuel = wasmi::Global::new(&mut store, wasmi::Val::I64(0), wasmi::Mutability::Var);
-    let g_epoch = wasmi::Global::new(&mut store, wasmi::Val::I64(epoch0), wasmi::Mutability::Var);
-    let g_caching = wasmi::Global::new(&mut store, wasmi::Val::I32(1), wasmi::Mutability::Var);
+    let run: TypedFunc<(), i32> = instance
+        .get_typed_func(&store, "run")
+        .expect("run export");
+    let rc = run.call(&mut store, ()).unwrap_or_else(|trap| {
+        panic!("jit proc: wasm trap: {trap:?}")
+    });
+    store.data_mut().arena_truncate(watermark);
+
+    // 读取结果（借用）→ Store/Instance 还池 → 组装返回。
+    let result = store.data_mut().result.take();
+    let pending_exit = store.data_mut().pending_exit.take();
+    let pending = store.data_mut().pending.take();
+    WASMI_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() >= 64 {
+            p.clear();
+        }
+        p.push((pool_key, store, instance));
+    });
+
+    match rc {
+        code::OK => Ok(result.unwrap_or_else(Value::empty)),
+        code::RETURN => Err(Error::ret(result)),
+        code::BREAK => Err(Error::brk()),
+        code::CONTINUE => Err(Error::cont()),
+        code::STALE => Err(Error::Msg("jit proc: stale epoch (unexpected)".into())),
+        code::EXIT => Err(Error::exit(Some(pending_exit.unwrap_or(0)))),
+        _ => match pending {
+            Some(p) => Err(p.err),
+            None => Err(Error::Msg("jit proc: failed without pending error".into())),
+        },
+    }
+}
+
+thread_local! {
+    /// register_and_instantiate 的模块字节交接（execute_proc 设置）。
+    static CURRENT_MODULE_BYTES: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// execute_proc 内部的 Store 交接槽（单线程；池命中路径把
+    /// Store/Instance 从 WASMI_POOL 移交进作用域）。
+    static POOL_TAKE: std::cell::RefCell<
+        Option<(wasmi::Store<Host>, wasmi::Instance)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// imports 注册 + 实例化（proc 语境；与 exec.rs 同款宿主闭包）。
+fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64) -> wasmi::Instance {
+    use wasmi::{Caller, Engine, Extern, Linker, Module, TypedFunc};
+
+    let wmodule = {
+        // Module::new 需要 Engine——从 store 取。
+        let engine = store.engine().clone();
+        let bytes = CURRENT_MODULE_BYTES.with(|b| b.borrow().clone());
+        Module::new(&engine, &bytes).expect("jit proc: module")
+    };
+    let mut linker = <Linker<Host>>::new(store.engine());
+
+    let g_fuel = wasmi::Global::new(&mut *store, wasmi::Val::I64(0), wasmi::Mutability::Var);
+    let g_epoch = wasmi::Global::new(&mut *store, wasmi::Val::I64(epoch0), wasmi::Mutability::Var);
+    let g_caching = wasmi::Global::new(&mut *store, wasmi::Val::I32(1), wasmi::Mutability::Var);
     linker.define("rtcl", "fuel", Extern::Global(g_fuel.clone())).unwrap();
     linker.define("rtcl", "epoch", Extern::Global(g_epoch.clone())).unwrap();
     linker.define("rtcl", "caching", Extern::Global(g_caching.clone())).unwrap();
@@ -150,6 +248,16 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
             move |mut c: Caller<'_, Host>, cmd_id: i32, site: i32, argc: i32| -> i64 {
                 let _ = caching_call.set(&mut c, wasmi::Val::I32(0));
                 c.data_mut().call_raw(cmd_id, site, argc)
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "rtcl",
+            "call_argv",
+            |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
+                let words = read_words(&mut c, base, argc);
+                c.data_mut().call_argv_raw(&words, site)
             },
         )
         .unwrap();
@@ -253,32 +361,11 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
         })
         .unwrap();
 
-    let instance = linker
-        .instantiate_and_start(&mut store, &wmodule)
-        .unwrap_or_else(|e| panic!("jit proc: instantiate failed: {e}"));
-    let run: TypedFunc<(), i32> = instance.get_typed_func(&store, "run").unwrap();
-    let rc = run.call(&mut store, ()).unwrap_or_else(|trap| {
-        panic!("jit proc: wasm trap: {trap:?}")
-    });
-    store.data_mut().arena_truncate(watermark);
-
-    let mut host = store.into_data();
-    let result = host.result.take();
-    let pending_exit = host.pending_exit.take();
-    // 返回码映射（proc 语境——错误原样传播，call_proc 边界负责帧）。
-    match rc {
-        code::OK => Ok(result.unwrap_or_else(Value::empty)),
-        code::RETURN => Err(Error::ret(result)),
-        code::BREAK => Err(Error::brk()),
-        code::CONTINUE => Err(Error::cont()),
-        code::STALE => Err(Error::Msg("jit proc: stale epoch (unexpected)".into())),
-        code::EXIT => Err(Error::exit(Some(pending_exit.unwrap_or(0)))),
-        _ => match host.pending.take() {
-            Some(p) => Err(p.err),
-            None => Err(Error::Msg("jit proc: failed without pending error".into())),
-        },
-    }
+    linker
+        .instantiate_and_start(store, &wmodule)
+        .unwrap_or_else(|e| panic!("jit proc: instantiate failed: {e}"))
 }
+
 
 /// 从实例 memory 读 n 个 u64（暂存区协议；与 exec.rs 同款）。
 fn read_words(c: &mut Caller<'_, Host>, base: i32, n: i32) -> Vec<u64> {

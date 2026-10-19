@@ -197,6 +197,16 @@ pub fn execute(
         .unwrap();
     let caching_es = g_caching.clone();
     linker
+        .func_wrap(
+            "rtcl",
+            "call_argv",
+            |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
+                let words = read_words(&mut c, base, argc);
+                c.data_mut().call_argv_raw(&words, site)
+            },
+        )
+        .unwrap();
+    linker
         .func_wrap("rtcl", "eval_script", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
             let _ = caching_es.set(&mut c, Val::I32(0));
             c.data_mut().eval_script_raw(v)

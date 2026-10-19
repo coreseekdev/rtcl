@@ -517,6 +517,19 @@ impl Host {
         self.arena.len()
     }
 
+    /// 实例池复用前的状态复位（arena 已在 run 后截回水位线；fuel/
+    /// epoch/caching global 持续——语义一致）。
+    pub fn reset_for_reuse(&mut self) {
+        self.result = None;
+        self.pending = None;
+        self.pending_exit = None;
+        self.info = None;
+        self.pending_top = None;
+        self.last_fail = None;
+        self.foreaches.clear();
+        self.err_line = 0;
+    }
+
     pub fn arena_truncate(&mut self, n: usize) {
         self.arena.truncate(n);
     }
@@ -627,6 +640,28 @@ impl Host {
             Ok(v) => self.tag_value(&v),
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: true });
+                abi::ERR_SENTINEL
+            }
+        }
+    }
+
+    /// 直连分派（M2 全案）：已求值实参 → charge_step → dispatch_values。
+    /// 错误 = case-b（from_eval=false）——驱动补站点帧；无宿主 eval 记账。
+    pub fn call_argv_raw(&mut self, words: &[u64], site: i32) -> i64 {
+        let mut args: Vec<Value> = Vec::with_capacity(words.len());
+        for w in words {
+            args.push(self.value_of(*w as i64));
+        }
+        if let Err(e) = rtcl_vm::VmContext::charge_step(self.irp()) {
+            self.pending = Some(Pending { err: e, from_eval: false });
+            return abi::ERR_SENTINEL;
+        }
+        match self.irp().dispatch_values(&args) {
+            Ok(v) => self.tag_value(&v),
+            Err(e) => {
+                // case-b：帧由 wasm 侧哨兵 → rtcl.fail(fail_id) →
+                // take_fail 用 fail 表的 site 补（vm_exec exec_inner 同款）。
+                self.pending = Some(Pending { err: e, from_eval: false });
                 abi::ERR_SENTINEL
             }
         }
@@ -1284,6 +1319,16 @@ fn execute(
             let _ = g_caching_lap.set(&mut c, wasmi::Val::I32(0));
             c.data_mut().lappend_var_raw(name_h, v)
         })
+        .unwrap();
+    linker
+        .func_wrap(
+            "rtcl",
+            "call_argv",
+            |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
+                let words = read_words(&c, base, argc);
+                c.data_mut().call_argv_raw(&words, site)
+            },
+        )
         .unwrap();
     let g_caching_es = g_caching.clone();
     linker

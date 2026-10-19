@@ -287,8 +287,11 @@ pub enum Instr {
         cmd_id: u16,
         argc: u16,
         fail: u32,
-        /// 站点索引（宿主 eval 路由用——静态正确，见 fail 表）。
+        /// 站点索引（宿主 eval 路由/错误帧用——静态正确，见 fail 表）。
         site: u32,
+        /// 实参寄存器（含命令名——dispatch_values 的 args[0] 语义）；
+        /// 直连路由写暂存区用。
+        srcs: Vec<Reg>,
         brk: Option<u32>,
         cont: Option<u32>,
         cont_back: bool,

@@ -111,7 +111,20 @@ impl Host {
             return Value::from_imm(abi::untag(tagged));
         }
         let idx = (tagged >> 1) as usize;
-        self.arena.get(idx).cloned().unwrap_or_else(Value::empty)
+        match self.arena.get(idx) {
+            Some(v) => {
+                let c = v.clone();
+                // UNSET（bits 0）不得出 arena——合法流里不会出现；出现
+                // 即驱动寄存器纪律被破坏（f012451：bitnot 慢路径拿到
+                // 未初始化寄存器）——按空值兜底防 SEGV（空指针 deref），
+                // 根因（写丢失的精确定位）见 findings 注释。
+                if c.is_unset() {
+                    return Value::empty();
+                }
+                c
+            }
+            None => Value::empty(),
+        }
     }
 
     fn tag_value(&mut self, v: &Value) -> i64 {

@@ -239,6 +239,89 @@ pub fn cmd_exec_run(interp: &mut Interp, args: &[Value]) -> TclResult<Value> {
     Ok(Value::from_str(&String::from_utf8_lossy(&out)))
 }
 
+fn exec_call(method: &[u8], fields: &[&[u8]], usage: &str) -> TclResult<Value> {
+    let mut v: Vec<&[u8]> = vec![method];
+    v.extend_from_slice(fields);
+    host_call(&v)
+        .map(|b| text_of(b))
+        .map_err(|e| terr(format!("{usage}: {e}")))
+}
+
+/// `host::exec::open <prog> ?arg ...?` → 会话 id（分块流式）。
+pub fn cmd_exec_open(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let prog = arg(args, 1);
+    if prog.is_empty() {
+        return Err(terr("host::exec::open <prog> ?arg ...?"));
+    }
+    let argbuf: Vec<String> = (2..args.len()).map(|i| arg(args, i)).collect();
+    let mut fields: Vec<&[u8]> = vec![prog.as_bytes()];
+    for a in &argbuf {
+        fields.push(a.as_bytes());
+    }
+    exec_call(b"exec.open", &fields, "host::exec::open")
+}
+
+/// `host::exec::write <id> <data>` → 写入字节数（0 = 写端已关/EPIPE）。
+pub fn cmd_exec_write(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    let data = arg(args, 2);
+    if id.is_empty() {
+        return Err(terr("host::exec::write <id> <data>"));
+    }
+    exec_call(b"exec.write", &[id.as_bytes(), data.as_bytes()], "host::exec::write")
+}
+
+/// `host::exec::read <id> ?max?` → stdout 分块（空 = EOF）。
+pub fn cmd_exec_read(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    let max = arg(args, 2);
+    if id.is_empty() {
+        return Err(terr("host::exec::read <id> ?max?"));
+    }
+    exec_call(b"exec.read", &[id.as_bytes(), max.as_bytes()], "host::exec::read")
+}
+
+/// `host::exec::close-stdin <id>` → 子进程见 EOF。
+pub fn cmd_exec_close_stdin(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    if id.is_empty() {
+        return Err(terr("host::exec::close-stdin <id>"));
+    }
+    exec_call(b"exec.close-stdin", &[id.as_bytes()], "host::exec::close-stdin")
+}
+
+/// `host::exec::wait <id>` → 退出码；`::host::exec::stderr` 存放 stderr。
+pub fn cmd_exec_wait(interp: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    if id.is_empty() {
+        return Err(terr("host::exec::wait <id>"));
+    }
+    let reply = host_call(&[b"exec.wait", id.as_bytes()])
+        .map_err(|e| terr(format!("host::exec::wait: {e}")))?;
+    let parts = parse_frame(&reply).map_err(|e| terr(format!("host::exec::wait: {e}")))?;
+    let code: i32 = parts
+        .first()
+        .and_then(|b| String::from_utf8_lossy(b).parse().ok())
+        .unwrap_or(1);
+    let err = parts.get(1).cloned().unwrap_or_default();
+    let _ = interp.eval("namespace eval ::host::exec {}");
+    interp.set_var("::host::exec::code", Value::from_str(&code.to_string()))?;
+    interp.set_var(
+        "::host::exec::stderr",
+        Value::from_str(&String::from_utf8_lossy(&err)),
+    )?;
+    Ok(Value::from_str(&code.to_string()))
+}
+
+/// `host::exec::kill <id>` → 关闭宿主侧句柄（v0 无法强制终止运行中的 wasm）。
+pub fn cmd_exec_kill(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    if id.is_empty() {
+        return Err(terr("host::exec::kill <id>"));
+    }
+    exec_call(b"exec.kill", &[id.as_bytes()], "host::exec::kill")
+}
+
 pub fn register(interp: &mut Interp) {
     interp.register_command("host::fs::read", cmd_fs_read);
     interp.register_command("host::fs::write", cmd_fs_write);
@@ -253,4 +336,10 @@ pub fn register(interp: &mut Interp) {
     interp.register_command("host::http::body", cmd_http_body);
     interp.register_command("host::http::cancel", cmd_http_cancel);
     interp.register_command("host::exec::run", cmd_exec_run);
+    interp.register_command("host::exec::open", cmd_exec_open);
+    interp.register_command("host::exec::write", cmd_exec_write);
+    interp.register_command("host::exec::read", cmd_exec_read);
+    interp.register_command("host::exec::close-stdin", cmd_exec_close_stdin);
+    interp.register_command("host::exec::wait", cmd_exec_wait);
+    interp.register_command("host::exec::kill", cmd_exec_kill);
 }

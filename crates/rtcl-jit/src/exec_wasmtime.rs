@@ -49,6 +49,13 @@ pub fn execute(
     let mut store = Store::new(&engine, host);
     let mut linker = <Linker<Host>>::new(&engine);
 
+/// wasmtime 引擎的 ABI 注册（顶层与 proc 池路径共用）。返回
+/// (fuel, caching) 句柄克隆（call/refuel 闭包内清缓存/充值用）。
+fn register_wasmtime_abi(
+    mut store: &mut wasmtime::Store<Host>,
+    epoch0: i64,
+) -> (wasmtime::Global, wasmtime::Global) {
+    let mut linker = <wasmtime::Linker<Host>>::new(store.engine());
     let mut_g =
         |ty: wasmtime::ValType| wasmtime::GlobalType::new(ty, wasmtime::Mutability::Var);
     let g_fuel =
@@ -231,6 +238,12 @@ pub fn execute(
             c.data_mut().exit_raw(code);
         })
         .unwrap();
+
+    linker.define(&mut *store, "rtcl", "fuel", g_fuel).unwrap();
+    linker.define(&mut *store, "rtcl", "epoch", g_epoch).unwrap();
+    linker.define(&mut *store, "rtcl", "caching", g_caching).unwrap();
+    (g_fuel, g_caching)
+}
 
     let instance = linker.instantiate(&mut store, &wmodule).expect("wasmtime: instantiate");
     let run: TypedFunc<(), i32> = instance

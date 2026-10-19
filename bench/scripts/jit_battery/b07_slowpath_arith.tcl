@@ -1,0 +1,6 @@
+puts [expr {7 / 2}]
+puts [expr {-7 / 2}]
+puts [expr {-7 % 2}]
+puts [expr {1 << 100}]
+puts [expr {2 ** 10}]
+puts [expr {1 + " 42 "}]

@@ -176,7 +176,12 @@ impl Host {
     /// unwind_subs 复刻（Sub → defer 最外层；Expr → append；
     /// Body/Next → 无）。
     fn unwind(&mut self, bodies: &[(crate::ir::BodyKind, u32)], e: &Error) {
-        for (kind, site) in bodies.iter().map(|(k, s)| (*k, *s)) {
+        // vm_exec unwind_subs 是 **LIFO**（st.bodies.pop()——栈顶先弹）：
+        // Sub 先于 BodyFramed（pending_top 随后被 BodyFramed 的
+        // harness_frame 清除——外层帧吞掉词括号的 defer）；FIFO 顺序会
+        // 反过来让 pending_top 存活到终局、exit_frame 行号取错源
+        // （fuzz f000200 簇：尾部多 puts 帧 + ("foreach" body) 行差 1）。
+        for (kind, site) in bodies.iter().rev().map(|(k, s)| (*k, *s)) {
             let text = self.site_text(site).to_string();
             let line = self.lines.get(site as usize).copied().unwrap_or(0) as usize;
             match kind {
@@ -267,7 +272,16 @@ impl Host {
             Some(i) => raw[..i].to_string(),
             None => raw,
         };
-        self.info = if base.is_empty() { None } else { Some(base) };
+        // base == 裸消息（e.to_string()）⇒ interp 累积器为空（无任何
+        // 帧 append 过）——保持 info=None，让驱动补帧走 harness_frame
+        // 的**首帧**分支（"msg\n    while executing\n…"）；把裸消息
+        // 塞进 info 会让补帧走 append 分支丢帧头（fuzz f001026：
+        // `puts [expr {$n && $s}]` 的 expr 站点帧）。
+        self.info = if !base.is_empty() && base != e.to_string() {
+            Some(base)
+        } else {
+            None
+        };
         let mut pending_frame: Option<(String, usize)> = None;
         if let Some(fid) = fail_id {
             if let Some(fi) = self.fails.get(fid as usize).cloned() {
@@ -354,6 +368,24 @@ fn classify_control(e: &Error) -> i32 {
 
 /// expr 操作数的 canonical 引用（braced 优先，双引号转义兜底）。
 fn expr_quote(s: &str) -> String {
+    // 数值字面量裸写——expr 里 {} 是**字符串字面量**，数值操作数
+    // braced 会让算术报 "can't use non-numeric string"（fuzz f002484：
+    // Neg 慢路径的 -2^62 → bignum 宽化）。仅数值形态裸写（数字开头，
+    // 含 dec/hex/oct/bin/科学计数/小数）；标识符/布尔词裸写会踩 expr
+    // 的 bareword 门槛（"abc + 1" 报 invalid bareword 而非
+    // non-numeric——错误文本走样），维持 braced（字符串语义）。
+    let numeric = {
+        let body = s.strip_prefix(['+', '-']).unwrap_or(s);
+        !body.is_empty()
+            && body.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+            && body.chars().all(|c| {
+                c.is_ascii_hexdigit()
+                    || matches!(c, '.' | 'x' | 'X' | 'o' | 'O' | 'b' | 'B' | 'e' | 'E' | '+' | '-')
+            })
+    };
+    if numeric {
+        return s.to_string();
+    }
     let braced_ok = {
         let mut depth: i32 = 0;
         let mut ok = true;
@@ -625,9 +657,11 @@ impl Host {
         let Some(fi) = self.infos.get(info).cloned() else {
             return abi::tag_imm(0);
         };
-        // vm_exec 弹组序 = 逆序；暂存区升序——逆读。
+        // vm_exec：逆序弹组后 lists.reverse() → 最终 lists[0]=组0。
+        // 暂存区升序（srcs = base..depth = 栈序）正读即同序——不再逆读
+        // （fuzz f002609：多组 foreach 组间错位）。
         let mut lists = Vec::with_capacity(words.len());
-        for w in words.iter().rev() {
+        for w in words.iter() {
             let v = self.value_of(*w as i64);
             match v.as_list_ref() {
                 Some(items) => lists.push(items.to_vec()),
@@ -857,7 +891,10 @@ impl Host {
             x if x == BinOp::Div as i32 => format!("{sa} / {sb}"),
             x if x == BinOp::Mod as i32 => format!("{sa} % {sb}"),
             x if x == BinOp::Pow as i32 => format!("{sa} ** {sb}"),
-            x if x == BinOp::Neg as i32 => format!("-{sa}"),
+            // -(sa)：操作数可能是负数字面量（裸写）——"- -5" 形态的
+            // 拼接会破坏括号子表达式的字面量结构（f002484：NEG 慢路径
+            // 的 bignum 宽化 "--4611…" 非法词）。
+            x if x == BinOp::Neg as i32 => format!("-({sa})"),
             x if x == BinOp::Not as i32 => format!("!{sa}"),
             x if x == BinOp::BitNot as i32 => format!("~{sa}"),
             x if x == BinOp::BitAnd as i32 => format!("{sa} & {sb}"),

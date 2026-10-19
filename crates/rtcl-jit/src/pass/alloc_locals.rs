@@ -255,6 +255,18 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
                 foreaches.push((*info, lmap));
                 loops.push((*next, *end, bodies.len(), cur_site));
             }
+            // FOREACH_NEXT：vm_exec 的 op_foreach_next(_close) 回跳循环
+            // 头时 bodies 截断到循环入口（LoopFrame.bodies_len）——PR#2
+            // 起 FOREACH_NEXT_CLOSE 吸收了体闭合 JUMP，unfused 展开为
+            // NOP，BodyFramed 的 region 失去弹出点；此处按同一语义
+            // 截断（body 首经时 push 的条目已写入 fail 表，不受影响）。
+            OpCode::ForeachNext { .. } => {
+                if let Some(l) = loops.last() {
+                    let (_, _, blen, owner) = *l;
+                    bodies.truncate(blen);
+                    cur_site = owner;
+                }
+            }
             OpCode::ForeachEnd => {
                 foreaches.pop();
                 loops.pop();

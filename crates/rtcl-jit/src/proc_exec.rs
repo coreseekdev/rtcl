@@ -67,6 +67,19 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
             Err(_) => None,
         }
     })?;
+    // proc 语境的 case-b（宿主原语错误：变量读/算术/bool/foreach bind）
+    // 帧协议缺口：vm_exec 的 exec_inner 把帧写 interp.err_info，JIT 的
+    // 驱动侧补帧无法经公共 API 写入（pub(crate)）——含 case-b fail 的
+    // proc 体一律退回 vm_exec（fuzz f002196/f004860：(procedure …) 帧
+    // 链缺中间帧）。纯 case-a（Call/EvalScript/EvalExpr）体保留 JIT。
+    if module
+        .l2
+        .fails
+        .iter()
+        .any(|f| f.kind == crate::ir::FailKind::Cold)
+    {
+        return None;
+    }
     Some(execute_proc(interp, code, &module))
 }
 

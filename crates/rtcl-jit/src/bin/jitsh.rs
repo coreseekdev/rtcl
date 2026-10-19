@@ -9,6 +9,12 @@ use rtcl_core::Interp;
 use rtcl_jit::exec::{self, Outcome};
 
 fn main() {
+    // 启动一次性 CLI 诊断（fuzz 接受性探针；绝不进每 op 路径）：
+    // RTCL_JIT_ACCEPT=1 时对脚本做接受性判定后退出。
+    if std::env::var_os("RTCL_JIT_ACCEPT").is_some() {
+        accept_probe();
+        return;
+    }
     // M2 seam：注册 proc-body JIT 钩子（jitsh 是 JIT 引擎执行体）。
     rtcl_jit::proc_exec::install();
     let mut args = std::env::args().skip(1);
@@ -101,4 +107,36 @@ fn run_command(cmd: &str) {
             }
         }
     }
+}
+
+/// 接受性探针：parse → compile_unit → unfused → emit::compile。
+fn accept_probe() {
+    use rtcl_parser::{Compiler, ScriptUnit};
+    use std::rc::Rc;
+    // argv[1] = "-c"/"-f"（accept_probe 在 argv[0]=jitsh 后直接取 1/2）。
+    let script = match (std::env::args().nth(1).as_deref(), std::env::args().nth(2)) {
+        (Some("-c"), Some(c)) => c,
+        (Some("-f"), Some(f)) => match std::fs::read_to_string(&f) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("REJECT: io {e}");
+                return;
+            }
+        },
+        _ => {
+            println!("REJECT: no input");
+            return;
+        }
+    };
+    let verdict = match ScriptUnit::parse(&script) {
+        Ok(unit) => {
+            let bc = Compiler::compile_unit(Rc::clone(&unit.source), &unit.commands).unfused();
+            match rtcl_jit::emit::compile(&bc, &Default::default()) {
+                Ok(_) => "ACCEPT".to_string(),
+                Err(e) => format!("REJECT: {e}"),
+            }
+        }
+        Err(e) => format!("REJECT: parse {e}"),
+    };
+    println!("{verdict}");
 }

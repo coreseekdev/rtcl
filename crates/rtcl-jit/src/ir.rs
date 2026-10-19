@@ -267,7 +267,7 @@ pub enum Instr {
     /// 变量/常量/宿主交互模板（展开含守卫与哨兵检查）。
     LoadVar { dst: Reg, var: u32, fail: u32 },
     StoreVar { src: Reg, var: u32, keep: bool, fail: u32 },
-    IncrVar { dst: Reg, var: u32, amount: i64, fail: u32 },
+    IncrVar { dst: Reg, var: u32, amount: i64, fail: u32, site: u32 },
     /// §4 快车道二元运算（guard: 双立即数；失败 → binary_op 兜底）。
     Arith { kind: BinOp, dst: Reg, a: Reg, b: Reg, fail: u32 },
     /// §4 比较免 untag：tagged word 上 i64 比较。

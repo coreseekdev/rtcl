@@ -422,7 +422,7 @@ fn template(ctx: &Ctx, pc: u32, op: &OpCode) -> Result<Option<Instr>, Unsupporte
     let var = |ctx: &Ctx, pc: u32| -> u32 {
         let idx = match &ctx.l2.ops[pc as usize].op {
             OpCode::LoadVar(i) | OpCode::StoreVar(i) | OpCode::StoreVarPop(i)
-            | OpCode::IncrVar(i, _) => *i as u32,
+            | OpCode::IncrVar(i, _) | OpCode::LappendVar(i) => *i as u32,
             _ => 0,
         };
         ctx.l2.vars.iter().find(|v| v.const_idx == idx).map(|v| v.cache).unwrap_or(0)
@@ -449,7 +449,13 @@ fn template(ctx: &Ctx, pc: u32, op: &OpCode) -> Result<Option<Instr>, Unsupporte
         OpCode::LoadVar(_) => Instr::LoadVar { dst: dst(), var: var(ctx, pc), fail: fail() },
         OpCode::StoreVar(_) => Instr::StoreVar { src: Reg(r[0]), var: var(ctx, pc), keep: true, fail: fail() },
         OpCode::StoreVarPop(_) => Instr::StoreVar { src: Reg(r[0]), var: var(ctx, pc), keep: false, fail: fail() },
-        OpCode::IncrVar(_, n) => Instr::IncrVar { dst: dst(), var: var(ctx, pc), amount: *n, fail: fail() },
+        OpCode::IncrVar(_, n) => Instr::IncrVar {
+            dst: dst(),
+            var: var(ctx, pc),
+            amount: *n,
+            fail: fail(),
+            site: ctx.l2.fails[fail() as usize].site,
+        },
         OpCode::Concat(_) => Instr::Concat {
             dst: dst(),
             srcs: r.iter().map(|x| Reg(*x)).collect(),

@@ -27,6 +27,14 @@ pub fn run(l1: &L1, code: &ByteCode) -> Result<(), Unsupported> {
         };
         if let Some(idx) = name_idx {
             if let Some(name) = code.get_const_wide(idx) {
+                // 数组元素引用：一律拒收。曾尝试放宽字面下标（退化为
+                // read_var(全名)），差分矩阵证伪：公共 read_var/set_var/
+                // incr_var 对「base 是数组/标量 × 字面下标」的四形状与
+                // vm_exec 的 eval_var_ref（split_array_ref 解析）语义
+                // 不等价（can't set/read "a": variable is/isn't array
+                // 的保护缺失，jit 侧静默错写）。修齐需 rtcl-vm 增加公共
+                // 数组感知入口（硬约束外）——回归记录见
+                // bench/scripts/jit_battery/b31/b32。
                 if name.contains('(') {
                     return Err(Unsupported(format!(
                         "array-element var ref {name:?} at pc {pc}"

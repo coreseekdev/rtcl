@@ -103,9 +103,138 @@ impl HostClock for NativeClock {
     }
 }
 
-/// 进程执行服务：`exec`/`open |cmd` 的宿主接缝（浏览器下不存在，
-/// 对应 feature 在 wasm 组合里天然缺席）。
-pub trait HostExec: Send {}
+/// POSIX 错误的投影：`EINTR` 由宿主内部重试、**不暴露**；短读/短写正常；
+/// `read` 返回 0 即 EOF。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecIoError {
+    /// EAGAIN/EWOULDBLOCK（本 trait 的 IO 一律非阻塞）。
+    WouldBlock,
+    /// EPIPE：读端已关闭（写端视角）；不投递 SIGPIPE。
+    BrokenPipe,
+    /// 其它（EIO/EBADF…）。
+    Other(String),
+}
+
+/// 一个待执行命令（`argv[0]` 含程序名；PATH 解析由宿主负责）。
+#[derive(Debug, Clone)]
+pub struct ExecCommand {
+    pub prog: String,
+    pub argv: Vec<String>,
+}
+
+/// 一次性聚合结果（[`exec_collect`] 的返回）。
+#[derive(Debug, Clone)]
+pub struct ExecOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub code: i32,
+}
+
+/// 运行中的进程句柄：stdin/stdout/stderr 均为**字节流**且 IO **非阻塞**
+/// （`WouldBlock`）——是否阻塞由调用方用 [`HostProcess::poll`] 决定。
+/// 管道实现应为有界内存（背压），**不落盘**（宿主负责）。
+pub trait HostProcess: Send {
+    fn write_stdin(&mut self, buf: &[u8]) -> Result<usize, ExecIoError>;
+    /// 0 = EOF。
+    fn read_stdout(&mut self, out: &mut [u8]) -> Result<usize, ExecIoError>;
+    fn read_stderr(&mut self, out: &mut [u8]) -> Result<usize, ExecIoError>;
+    /// 关闭写端（子进程见 EOF）。
+    fn close_stdin(&mut self) -> Result<(), String>;
+    /// 非阻塞：`Some(code)` = 已退出；`None` = 仍在运行。
+    fn wait(&mut self) -> Result<Option<i32>, String>;
+    /// 请求终止（不等待；随后 stdin 写 → `BrokenPipe`，stdout/stderr 排空后 EOF）。
+    fn kill(&mut self) -> Result<(), String>;
+    /// 等待任一关注事件就绪 / 超时 / 退出（避免忙等）。
+    fn poll(&mut self, read: bool, write: bool, timeout_ms: u64) -> Result<(), String>;
+}
+
+/// 进程执行服务：宿主**只要求实现 `spawn`**（流式）；一次性 `exec` 是解释器
+/// 侧 helper（[`exec_collect`]），不属于宿主 ABI。
+///
+/// 范围（2026-10-19 裁决）：仅 wasm 命令（WASI p1 命令形态）；native binary
+/// 不在本机制内（将来若需要，另设显式能力的 exec 通道）。
+pub trait HostExec: Send {
+    fn spawn(
+        &self,
+        cmd: &ExecCommand,
+        env: &[(String, String)],
+    ) -> Result<Box<dyn HostProcess>, String>;
+}
+
+/// 阻塞聚合 helper：对齐 tclsh `exec` 的基本读取面（stdout/stderr 全收 +
+/// 退出码）；超时 → kill 并报错。非零退出**不是** `Err`（由 Tcl 层决定是否
+/// 按 `CHILDSTATUS` 抛错）。
+#[cfg(feature = "std")]
+pub fn exec_collect(
+    host: &dyn HostExec,
+    cmd: &ExecCommand,
+    stdin: &[u8],
+    env: &[(String, String)],
+    timeout_ms: u64,
+) -> Result<ExecOutput, String> {
+    let mut p = host.spawn(cmd, env)?;
+    let start = std::time::Instant::now();
+    let mut in_off = 0usize;
+    let mut stdin_closed = false;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        while in_off < stdin.len() && !stdin_closed {
+            match p.write_stdin(&stdin[in_off..]) {
+                Ok(0) => break,
+                Ok(n) => in_off += n,
+                Err(ExecIoError::WouldBlock) => break,
+                Err(ExecIoError::BrokenPipe) => in_off = stdin.len(),
+                Err(ExecIoError::Other(e)) => return Err(format!("stdin: {e}")),
+            }
+        }
+        if in_off >= stdin.len() && !stdin_closed {
+            p.close_stdin()?;
+            stdin_closed = true;
+        }
+        loop {
+            match p.read_stdout(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(ExecIoError::WouldBlock) => break,
+                Err(ExecIoError::BrokenPipe) => break,
+                Err(ExecIoError::Other(e)) => return Err(format!("stdout: {e}")),
+            }
+        }
+        loop {
+            match p.read_stderr(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => err.extend_from_slice(&buf[..n]),
+                Err(ExecIoError::WouldBlock) => break,
+                Err(ExecIoError::BrokenPipe) => break,
+                Err(ExecIoError::Other(e)) => return Err(format!("stderr: {e}")),
+            }
+        }
+        if let Some(code) = p.wait()? {
+            loop {
+                match p.read_stdout(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+            loop {
+                match p.read_stderr(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => err.extend_from_slice(&buf[..n]),
+                    Err(_) => break,
+                }
+            }
+            return Ok(ExecOutput { stdout: out, stderr: err, code });
+        }
+        if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
+            let _ = p.kill();
+            return Err(format!("exec: timeout after {timeout_ms}ms"));
+        }
+        p.poll(in_off < stdin.len(), true, 10)?;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // HTTP 客户端服务（rogo R0 探针，2026-10-18）

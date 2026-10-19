@@ -22,6 +22,30 @@ mod imports {
     }
 }
 
+/// 解析宿主应答帧（与请求同格式）：`[u32 n][u32 len + bytes]...`。
+fn parse_frame(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let rd = |b: &[u8]| u32::from_le_bytes(b.try_into().unwrap()) as usize;
+    if bytes.len() < 4 {
+        return Err("malformed frame".into());
+    }
+    let n = rd(&bytes[..4]);
+    let mut off = 4usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        if off + 4 > bytes.len() {
+            return Err("truncated frame length".into());
+        }
+        let l = rd(&bytes[off..off + 4]);
+        off += 4;
+        if off + l > bytes.len() {
+            return Err("truncated frame field".into());
+        }
+        out.push(bytes[off..off + l].to_vec());
+        off += l;
+    }
+    Ok(out)
+}
+
 fn frame(fields: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(fields.len() as u32).to_le_bytes());
@@ -185,6 +209,36 @@ pub fn cmd_http_cancel(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
     call_unit("host::http::cancel <id>", &[b"http.cancel", id.as_bytes()])
 }
 
+/// `host::exec::run <prog> ?arg ...?` —— 经宿主 PATH 执行 wasm 命令。
+/// v0 聚合形态：stdin 为空；stdout 作为结果返回；`::host::exec::code` /
+/// `::host::exec::stderr` 存退出码与 stderr（文本，lossy）。
+pub fn cmd_exec_run(interp: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let prog = arg(args, 1);
+    if prog.is_empty() {
+        return Err(terr("host::exec::run <prog> ?arg ...?"));
+    }
+    let argbuf: Vec<String> = (2..args.len()).map(|i| arg(args, i)).collect();
+    let mut fields: Vec<&[u8]> = vec![b"exec.run", prog.as_bytes(), b""];
+    for a in &argbuf {
+        fields.push(a.as_bytes());
+    }
+    let reply = host_call(&fields).map_err(|e| terr(format!("host::exec::run: {e}")))?;
+    let parts = parse_frame(&reply).map_err(|e| terr(format!("host::exec::run: {e}")))?;
+    let out = parts.first().cloned().unwrap_or_default();
+    let err = parts.get(1).cloned().unwrap_or_default();
+    let code: i32 = parts
+        .get(2)
+        .and_then(|b| String::from_utf8_lossy(b).parse().ok())
+        .unwrap_or(0);
+    let _ = interp.eval("namespace eval ::host::exec {}");
+    interp.set_var("::host::exec::code", Value::from_str(&code.to_string()))?;
+    interp.set_var(
+        "::host::exec::stderr",
+        Value::from_str(&String::from_utf8_lossy(&err)),
+    )?;
+    Ok(Value::from_str(&String::from_utf8_lossy(&out)))
+}
+
 pub fn register(interp: &mut Interp) {
     interp.register_command("host::fs::read", cmd_fs_read);
     interp.register_command("host::fs::write", cmd_fs_write);
@@ -198,4 +252,5 @@ pub fn register(interp: &mut Interp) {
     interp.register_command("host::http::next", cmd_http_next);
     interp.register_command("host::http::body", cmd_http_body);
     interp.register_command("host::http::cancel", cmd_http_cancel);
+    interp.register_command("host::exec::run", cmd_exec_run);
 }

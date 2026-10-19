@@ -53,11 +53,12 @@ fn main() {
             // epoch global 不刷新 → 不可能产生 STALE；维持忽略仅为
             // 完整覆盖返回码空间。
             0 | 5 => {}
+            // 顶层 return（含带值）= 正常完成（tclsh 文件模式：rc 0、
+            // 静默——与 rtcl-cli run_file 2026-10-19 对齐同步）。
+            2 => {}
             6 => {
-                // exit N：rtcl 文件模式行为（error_report(exit) = to_string）。
-                let c = exit_code.unwrap_or(0);
-                eprintln!("{}", rtcl_core::Error::exit(Some(c)));
-                std::process::exit(1);
+                // exit N：以 N 退出且无输出（tclsh 对齐）。
+                std::process::exit(exit_code.unwrap_or(0));
             }
             _ => {
                 if let Some(e) = run.eval_error {

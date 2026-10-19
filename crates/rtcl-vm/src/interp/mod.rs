@@ -997,6 +997,31 @@ impl Interp {
         self.tier1_epoch
     }
 
+    /// JIT/嵌入式执行器的错误帧写入口（case-b：宿主原语错误不在嵌套
+    /// eval 内发生，帧须由外部执行器按 vm_exec exec_inner 的形状补进
+    /// 本累积器——proc 语境的 (procedure …) 边界帧依赖它）。与内部
+    /// err_harness_frame/err_exit_frame/pending_top/err_line 同实现，
+    /// 语义以 judge 差分为准。
+    pub fn jit_err_harness_frame(&mut self, msg: &str, text: &str, line: usize) {
+        self.err_harness_frame(msg, text, line);
+    }
+
+    /// 同上：`(tag line N)` 构造出口帧。
+    pub fn jit_err_exit_frame(&mut self, tag: &str) {
+        self.err_exit_frame(tag);
+    }
+
+    /// 同上：词括号 defer（pending 帧 + 行号）。
+    pub fn jit_err_set_pending(&mut self, text: &str, line: usize) {
+        self.err_pending_top = Some(Rc::from(text));
+        self.err_line = line;
+    }
+
+    /// 同上：行号直设（exit_frame 前置读取的口径）。
+    pub fn jit_err_set_line(&mut self, line: usize) {
+        self.err_line = line;
+    }
+
     /// 每条命令分派计一步；超限抛错。解释器（`eval_command`）与 VM
     ///（`invoke_command`/`call`）两条分派路都过这里。
     pub(crate) fn charge_step(&mut self) -> crate::error::Result<()> {

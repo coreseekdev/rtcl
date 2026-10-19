@@ -72,6 +72,10 @@ pub(crate) struct Host {
     pub(crate) foreaches: Vec<ForeachHost>,
     /// ByteCode 的 foreach 形状表（start/bind 目标用）。
     pub(crate) infos: Vec<rtcl_parser::bytecode::ForeachInfo>,
+    /// proc 语境（proc_exec 置位）：case-b 帧写入 interp 累积器
+    /// （经 rtcl-vm jit_err_* 公共入口）而非驱动侧字符串——
+    /// (procedure …) 边界帧依赖 interp 累积器。
+    pub(crate) proc_ctx: bool,
     /// 最近 rtcl.fail 的表索引（case-a 帧构建用）。
     pub(crate) last_fail: Option<u32>,
     /// 自首次任意宿主命令求值后置位——此后 var_traces/dead_flat 可能
@@ -243,6 +247,45 @@ impl Host {
             }
         }
         let fi = self.fails.get(fail_id as usize).cloned();
+        if self.proc_ctx {
+            // proc 语境：帧直写 interp 累积器（call_proc 的 (procedure …)
+            // 边界读它）；驱动侧字符串路径不适用。
+            if let Some(fi) = &fi {
+                let frameless = fi
+                    .bodies
+                    .last()
+                    .is_some_and(|(_, s)| *s == fi.site);
+                if fi.site != u32::MAX && !frameless {
+                    let text = self.site_text(fi.site).to_string();
+                    let line = self.lines.get(fi.site as usize).copied().unwrap_or(0) as usize;
+                    let msg = e.message_text();
+                    self.irp().jit_err_set_line(line);
+                    self.irp().jit_err_harness_frame(&msg, &text, line);
+                }
+                for (kind, site) in fi.bodies.iter().rev() {
+                    let text = self.site_text(*site).to_string();
+                    let line = self.lines.get(*site as usize).copied().unwrap_or(0) as usize;
+                    match kind {
+                        crate::ir::BodyKind::Sub => {
+                            self.irp().jit_err_set_pending(&text, line);
+                        }
+                        crate::ir::BodyKind::Expr => {
+                            let msg = e.message_text();
+                            self.irp().jit_err_harness_frame(&msg, &text, line);
+                        }
+                        crate::ir::BodyKind::BodyFramed(lmap) => {
+                            let tag = if *lmap { "\"lmap\" body" } else { "\"foreach\" body" };
+                            self.irp().jit_err_exit_frame(tag);
+                            let msg = e.message_text();
+                            self.irp().jit_err_harness_frame(&msg, &text, line);
+                        }
+                        crate::ir::BodyKind::Body | crate::ir::BodyKind::Next => {}
+                    }
+                }
+            }
+            self.pending = Some(Pending { err: e, from_eval: false });
+            return 0;
+        }
         if let Some(fi) = fi {
             let frameless = fi
                 .bodies
@@ -465,6 +508,7 @@ impl Host {
                 v
             },
             last_fail: None,
+            proc_ctx: false,
             commands_ran: false,
         }
     }

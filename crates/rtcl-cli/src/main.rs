@@ -79,6 +79,16 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
     let result = interp.eval(&script);
 
     if let Err(e) = result {
+        // tclsh 文件模式语义（REPL 侧 repl.rs 已对齐，2026-10-19 文件
+        // 侧跟进）：`exit N` 以 N 退出且无输出；顶层 `return`（含带值）
+        // 是正常完成（rc 0、静默）——二者的值不打印、不走 errorInfo。
+        if e.is_exit() {
+            std::process::exit(repl::exit_code_of(&e));
+        }
+        if e.is_return() {
+            let _ = quiet;
+            return Ok(());
+        }
         // tclsh prints the full accumulated errorInfo (message + frames +
         // `(file ...)` tail) verbatim on stderr.
         let report = interp.error_report(&e, &path.to_string_lossy());

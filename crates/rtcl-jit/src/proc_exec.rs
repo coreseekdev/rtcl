@@ -67,19 +67,9 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
             Err(_) => None,
         }
     })?;
-    // proc 语境的 case-b（宿主原语错误：变量读/算术/bool/foreach bind）
-    // 帧协议缺口：vm_exec 的 exec_inner 把帧写 interp.err_info，JIT 的
-    // 驱动侧补帧无法经公共 API 写入（pub(crate)）——含 case-b fail 的
-    // proc 体一律退回 vm_exec（fuzz f002196/f004860：(procedure …) 帧
-    // 链缺中间帧）。纯 case-a（Call/EvalScript/EvalExpr）体保留 JIT。
-    if module
-        .l2
-        .fails
-        .iter()
-        .any(|f| f.kind == crate::ir::FailKind::Cold)
-    {
-        return None;
-    }
+    // proc 语境的 case-b 帧协议已落地（rtcl-vm jit_err_* 公共入口 +
+    // Host.proc_ctx 路由）——不再按 Cold 退回（f002196/f004860 的
+    // (procedure …) 帧链由差分验证）。
     Some(execute_proc(interp, code, &module))
 }
 
@@ -88,12 +78,14 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
     use wasmi::{Caller, Engine, Extern, Linker, Module, Store, TypedFunc};
 
     let epoch0 = interp.tier1_epoch() as i64;
-    let host = Host::new(
+    let mut host = Host::new(
         interp as *mut Interp,
         crate::exec::arena_of(bc),
         bc,
         module,
     );
+    // proc 语境标记：case-b 帧写 interp 累积器（见 exec::take_fail）。
+    host.proc_ctx = true;
     let watermark = host.arena_len();
 
     let engine = Engine::default();

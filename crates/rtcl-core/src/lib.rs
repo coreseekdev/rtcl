@@ -30,6 +30,9 @@ pub mod command;
 pub mod types;
 #[cfg(feature = "std")]
 pub mod channel;
+/// 内存有界管道（POSIX pipe/read/write 语义子集）：解释器层的进程组合原语。
+#[cfg(feature = "std")]
+pub mod pipe;
 
 // Re-exports for convenience
 pub use error::{Error, Result};

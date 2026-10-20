@@ -256,6 +256,10 @@ fn pipeline_call(method: &[u8], args: &[Value]) -> TclResult<Value> {
     let stdin_file = arg(args, 3);
     let stderr_mode = arg(args, 4);
     let stderr_path = arg(args, 5);
+    let merges = args
+        .get(6)
+        .and_then(|v| v.as_list())
+        .unwrap_or_default();
     let mut owned: Vec<Vec<u8>> = vec![
         method.to_vec(),
         stdin.into_bytes(),
@@ -264,13 +268,18 @@ fn pipeline_call(method: &[u8], args: &[Value]) -> TclResult<Value> {
         stderr_path.into_bytes(),
         stages.len().to_string().into_bytes(),
     ];
-    for st in &stages {
+    for (idx, st) in stages.iter().enumerate() {
         let words = st
             .as_list()
             .ok_or_else(|| terr("host::exec::pipeline: stage must be a list"))?;
         if words.is_empty() {
             return Err(terr("host::exec::pipeline: empty stage"));
         }
+        let merge = merges
+            .get(idx)
+            .map(|v| v.as_str() == "1")
+            .unwrap_or(false);
+        owned.push(if merge { b"1".to_vec() } else { b"0".to_vec() });
         owned.push(words.len().to_string().into_bytes());
         for w in words {
             owned.push(w.as_str().as_bytes().to_vec());

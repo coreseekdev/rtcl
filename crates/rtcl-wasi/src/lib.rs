@@ -16,6 +16,7 @@
 //! 宿主加载流程：校验 `rtcl_abi_version` → `rtcl_alloc` 写入脚本 →
 //! `rtcl_init` → `rtcl_eval` → 两次调用 `*_len`/`*_copy` 取回文本。
 
+use rtcl_core::host::HostClock;
 use rtcl_core::Interp;
 use std::cell::RefCell;
 
@@ -34,6 +35,23 @@ pub const ABI_VERSION: u32 = if cfg!(feature = "abi-v2") { 2 } else { 1 };
 const STATUS_OK: i32 = 0;
 const STATUS_ERROR: i32 = 1;
 const STATUS_INVALID: i32 = 2;
+
+struct WasiClock;
+
+impl HostClock for WasiClock {
+    fn now_ms(&self) -> f64 {
+        host::host_call(&[b"clock.now-ms"])
+            .ok()
+            .and_then(|b| String::from_utf8_lossy(&b).parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    fn sleep_ms(&self, ms: u64) -> Result<(), String> {
+        host::host_call(&[b"clock.sleep", ms.to_string().as_bytes()])
+            .map(|_| ())
+            .map_err(|e| format!("clock.sleep: {e}"))
+    }
+}
 
 struct State {
     interp: Interp,
@@ -81,6 +99,7 @@ pub extern "C" fn rtcl_init(abi: u32) -> u32 {
     STATE.with(|s| {
         let mut interp = Interp::new();
         host::register(&mut interp);
+        interp.set_clock(Box::new(WasiClock));
         // 词层失败仅警告（对齐 rtcl-native::net::install 的纪律：不静默但也
         // 不因可选词层失败阻断解释器本体）。
         if let Err(e) = interp.load_http() {

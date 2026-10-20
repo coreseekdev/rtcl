@@ -14,4 +14,4 @@ abi-v2 = []
 
 [dependencies]
 # 最小能力面：std + regexp-lite（无 file/io/exec/env；宿主服务后续经 imports 提供）
-rtcl-core = { path = "../rtcl-core", default-features = false, features = ["std", "regexp-lite"] }
+rtcl-core = { path = "../rtcl-core", default-features = false, features = ["std", "regexp-lite", "clock"] }

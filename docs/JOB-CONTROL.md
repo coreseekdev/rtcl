@@ -53,7 +53,7 @@ Running / StopRequested / Stopped ── kill ──▶ Killed
 
 ## 3. Rust 公共 trait
 
-`rtcl-core::host` 中扩展已有的 `HostProcess`（不新建平行 trait）。**没有 stdin/stdout/stderr 专用方法**；统一走 fd 文件视图：
+`rtcl-core::host` 中扩展已有的 `HostProcess`（不新建平行 trait）。**没有 stdin/stdout/stderr 专用方法，也没有 spawn 时的 path/data 特例**；fd 表由调用方先建好，0/1/2 只是约定：
 
 ```rust
 pub type JobId = u64;
@@ -65,86 +65,86 @@ pub trait HostFd: Send {
     fn write(&mut self, buf: &[u8]) -> Result<usize, ExecIoError>;
     fn close(&mut self) -> Result<(), String>;
     fn poll(&mut self, read: bool, write: bool, timeout_ms: u64) -> Result<(), String>;
+    fn dup(&self) -> Result<Box<dyn HostFd>, String>;
 }
 
-pub enum PipeSide { ParentReads, ParentWrites }
 pub enum FdMode { Read, Write, Append }
 
-pub enum FdSpec {
-    Null,
-    Pipe(PipeSide),
-    File { path: String, mode: FdMode },
-    Data(Vec<u8>),
-    Dup(u32),
-    Handle(Box<dyn HostFd>),
+pub trait HostFs: Send {
+    fn open(&self, path: &str, mode: FdMode) -> Result<Box<dyn HostFd>, String>;
 }
 
-pub struct ExecCommand {
-    pub prog: String,
-    pub argv: Vec<String>,
-    pub fds: Vec<FdSpec>,   // 下标 = 子进程 fd；0/1/2 只是约定
+pub struct NullFd;                      // /dev/null
+pub struct BytesFd { /* data, off */ }  // 只读内存流（heredoc）
+
+pub struct ExecCommand { pub prog: String, pub argv: Vec<String> }
+
+pub trait HostExec: Send {
+    /// fds 下标 = 子进程 fd；None = 该 fd 关闭；尾部缺失 = 关闭。
+    fn spawn(&self, cmd: &ExecCommand,
+             fds: Vec<Option<Box<dyn HostFd>>>,
+             env: &[(String, String)]) -> Result<Box<dyn HostProcess>, String>;
+
+    /// 建一对端点 (read, write)；一端进子进程 fd 表，另一端父进程保留，
+    /// 或两端分别交给管道两端的 job。
+    fn pipe(&self) -> Result<(Box<dyn HostFd>, Box<dyn HostFd>), String>;
 }
 
 pub trait HostProcess: Send {
     fn id(&self) -> JobId;
-    fn fd(&mut self, fd: u32) -> Option<&mut dyn HostFd>;
     fn state(&mut self) -> Result<JobState, String>;
     fn stop(&mut self) -> Result<(), String>;
     fn resume(&mut self) -> Result<(), String>;
     fn wait(&mut self) -> Result<Option<i32>, String>;
     fn kill(&mut self) -> Result<(), String>;
-    fn poll(&mut self, fds: &[u32], timeout_ms: u64) -> Result<(), String>;
-}
-
-pub trait HostExec: Send {
-    fn spawn(&self, cmd: &ExecCommand, env: &[(String, String)])
-        -> Result<Box<dyn HostProcess>, String>;
-    /// 子进程侧端点对 (read, write)，供 FdSpec::Handle 直连两个 job。
-    fn pipe(&self) -> Result<(Box<dyn HostFd>, Box<dyn HostFd>), String>;
+    fn poll(&mut self, timeout_ms: u64) -> Result<(), String>; // 只等状态/超时
 }
 ```
 
-- `fd(0/1/2)` 与 `fd(3+)` 完全同构；`0/1/2` 只是约定，不是特例。
-- `FdSpec::Pipe` 由宿主建管道，父侧端点经 `HostProcess::fd(n)` 暴露；
-  `FdSpec::Handle` 是**子进程侧**端点（管道直连、外部 fd）。
-- 管道：`HostExec::pipe()` 返回子进程侧 `(read, write)`；stage A 的 fd 1 用
-  `Handle(write)`，stage B 的 fd 0 用 `Handle(read)`，不经过父进程。
-- 重定向：`<` = `File{Read}`@0，`<<` = `Data`@0，`>`/`>>` =
-  `File{Write/Append}`@1，`2>@1` = `Dup(1)`@2。
+- `0/1/2` 与 `3+` 完全同构；没有 `read_stdout()`/`write_stdin()` 之类的方法。
+- **文件视图由调用方构建**：
+  - 捕获 stdout：`(r, w) = pipe()`，子进程 `fds[1] = Some(w)`，父进程读 `r`；
+  - 注入 stdin：`(r, w) = pipe()`，子进程 `fds[0] = Some(r)`，父进程写 `w`；
+  - 管道：`(r, w) = pipe()`，A 的 fd 1 = `Some(w)`，B 的 fd 0 = `Some(r)`；
+  - 文件：`fs.open(path, Read/Write/Append)` 的返回值放进 fd 表；
+  - heredoc：`BytesFd`；`/dev/null`：`NullFd`；`2>@1`：`fds[1].dup()`。
+- `spawn` 接管子进程侧端点；父进程只保留自己需要的另一端。没有
+  `HostProcess::fd()`，没有隐式 stdio。
+- `HostProcess::poll` 只等生命周期；fd 就绪用 `HostFd::poll`（两者可组合）。
 - `HostExec::spawn` 返回 `Box<dyn HostProcess>`；不增加 capability 位。
-- `poll` 除 I/O 就绪/超时/退出外，**状态变化**（stop/resume/stopped）也必须唤醒。
 - 具体错误文本不作规范；Tcl 层按状态决定 `CHILDSTATUS` / `CHILDKILLED` / `CHILDStopped` 的呈现。
 
 ## 4. 宿主 ABI（wasm / 浏览器）
 
 与 Rust trait 同义；沿用现有 `host.call` 帧格式（`[u32 nfields][u32 len + bytes]...`）。
-fd 是第一等参数：
+fd 是全局句柄，先建后用：
 
 | 方法 | 语义 |
 |---|---|
-| `exec.open <prog> <fdplan> ?arg ...?` | 创建 job，返回 handle |
-| `exec.pipe` | 建子进程侧端点对，返回 `[read-handle, write-handle]` |
-| `exec.fd.read <id> <fd> ?max?` | 读父侧 fd（空 = EOF） |
-| `exec.fd.write <id> <fd> <data>` | 写父侧 fd |
-| `exec.fd.close <id> <fd>` | 关闭父侧 fd（子进程见 EOF） |
-| `exec.fd.poll <id> <fd> ?timeout?` | 等单个 fd |
-| `exec.poll <id> <fds> ?timeout?` | 等一组 fd + 状态变化 |
+| `exec.pipe` | 返回 `[read-handle, write-handle]` |
+| `fs.open <path> <mode>` | 返回文件 handle（native p-root / web OPFS） |
+| `fs.bytes <data>` | 返回只读内存流 handle |
+| `fd.null` | 返回 `/dev/null` handle |
+| `fd.read <handle> ?max?` | 读父侧 handle（空 = EOF） |
+| `fd.write <handle> <data>` | 写父侧 handle |
+| `fd.close <handle>` | 关闭父侧 handle |
+| `fd.poll <handle> ?timeout?` | 等单个 handle |
+| `fd.dup <handle>` | 复制 handle（`2>@1`） |
+| `exec.open <prog> <fdhandles> ?arg ...?` | 创建 job，返回 job id；handle 表被接管 |
 | `exec.state <id>` | `running` / `stopping` / `stopped` / `exited <code>` / `killed` |
 | `exec.stop <id>` | 请求协作挂起 |
 | `exec.resume <id>` | 清除挂起 |
 | `exec.kill <id>` | 硬杀 |
 | `exec.wait <id>` | 阻塞到终态；前台作业的 stop 由宿主 job prompt 处理，不把 Tcl 栈打断 |
 | `exec.list` | 当前 job 列表（宿主 job table） |
-| `exec.run <prog> ?arg ...?` | 一次性聚合便利方法，不参与 job control（内部用 0/1/2 fd） |
+| `exec.run <prog> ?arg ...?` | 一次性聚合便利方法，不参与 job control（内部建 0/1/2 fd） |
 
-`fdplan` 是 fd 规则序列（每项 `fd:kind[:arg]`，逗号分隔）：
-`null` / `pipe-r` / `pipe-w` / `file-r:<path>` / `file-w:<path>` /
-`file-a:<path>` / `data:<bytes>` / `dup:<fd>` / `handle:<id>`。
-
+- `fdhandles` 是逗号分隔的 handle 列表：`-` 表示 fd 关闭；列表下标 = fd 号。
+- `exec.open` **消费** 列表里的 handle（所有权转移给子进程）；父进程要保留的一端不在列表里。
 - `exec.wait` 在宿主 job prompt 里遇到 `fg` 继续等待，遇到 `bg` 返回“已转后台”，遇到 `kill` 返回错误/终态。
 - 所有实现必须支持 `exec.kill`（native SIGKILL / web `Worker.terminate()`）；`exec.stop` 允许停在 `StopRequested`。
 - 不新增 `preemptive` 标志；没有“本地更强”的分支。
-- 旧 `exec.read/write/close-stdin` 是 `exec.fd.*` 的 0/1/2 语法糖，新 ABI 不再作为规范接口。
+- 旧 `exec.read/write/close-stdin` 是 `fd.read/write/close` 的 0/1/2 语法糖，新 ABI 不再作为规范接口。
 
 ## 5. Tcl 词语义
 
@@ -163,12 +163,13 @@ job wait   ?job-id?
 - `job-id` 接受 handle 或 `%N` 作业号；缺省为当前 job。
 - `jobs` 是 `job list` 的只读别名，由 profile 提供；`kill` 不覆盖 rtcl 已有的 OS `kill`，统一用 `job kill`。
 - `exec ... &` 返回 handle 列表（tclsh 的 PID 列表位置）；`job list` 同时给出 `%N`。
+- `exec` 的重定向先在 Tcl 侧构建 fd 视图：`<`/`>`/`>>` 用 `fs.open`，`<<` 用 `fs.bytes`，`2>@1` 用 `dup`，`|` 用 `exec.pipe` + 两端 handle；spawn 只看到 fd 表，不看到路径/数据。
 - 前台 `exec` 被 Ctrl-Z 后进入**受限 job prompt**（只接受 `jobs/fg/bg/kill/help`），不执行任意 Tcl；`fg` 保留 Tcl 栈，`bg` 让 `exec` 返回 handle 列表，`kill` 结束作业。
 - 非交互脚本不做作业控制；Ctrl-Z/Ctrl-C 不改变脚本语义。
 
 ## 6. 终端与 I/O
 
-- native：rogo 拥有 tty；job 使用 OS pipe；rogo 代理 stdin/stdout/stderr。**不使用 `tcsetpgrp`/`SIGTSTP` 作业控制，不使用 `SIGSTOP`。**
+- native：rogo 拥有 tty；job 使用 OS pipe；rogo 代理 fd 0/1/2。**不使用 `tcsetpgrp`/`SIGTSTP` 作业控制，不使用 `SIGSTOP`。**
 - web：wterm/TS 行规程；job 使用 Worker + SAB ring；主线程拥有终端。
 - 前台 job 的 stdin 由宿主按行转发；后台 job 的 stdin 关闭（读得 EOF）。
 - 输出按宿主终端路由；有界背压：OS pipe 满 / SAB ring 满时 job 在写 import 阻塞。
@@ -199,7 +200,7 @@ job wait   ?job-id?
 
 ## 10. 实施切片
 
-1. 本规范 + `rtcl-core` trait 扩展（当前）；
+1. 本规范 + `rtcl-core` fd 视图 trait（当前）；
 2. rogo native runner 后端 + 统一 checkpoint 协议；
 3. rtcl `job` 词层 + `exec` 接入；
 4. rogo web host（Worker/SAB/COOP-COEP/wterm）；

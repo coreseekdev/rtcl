@@ -53,59 +53,98 @@ Running / StopRequested / Stopped ── kill ──▶ Killed
 
 ## 3. Rust 公共 trait
 
-`rtcl-core::host` 中扩展已有的 `HostProcess`（不新建平行 trait）：
+`rtcl-core::host` 中扩展已有的 `HostProcess`（不新建平行 trait）。**没有 stdin/stdout/stderr 专用方法**；统一走 fd 文件视图：
 
 ```rust
 pub type JobId = u64;
 
-pub enum JobState {
-    Running,
-    StopRequested,
-    Stopped,
-    Exited(i32),
-    Killed,
+pub enum JobState { Running, StopRequested, Stopped, Exited(i32), Killed }
+
+pub trait HostFd: Send {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, ExecIoError>;
+    fn write(&mut self, buf: &[u8]) -> Result<usize, ExecIoError>;
+    fn close(&mut self) -> Result<(), String>;
+    fn poll(&mut self, read: bool, write: bool, timeout_ms: u64) -> Result<(), String>;
+}
+
+pub enum PipeSide { ParentReads, ParentWrites }
+pub enum FdMode { Read, Write, Append }
+
+pub enum FdSpec {
+    Null,
+    Pipe(PipeSide),
+    File { path: String, mode: FdMode },
+    Data(Vec<u8>),
+    Dup(u32),
+    Handle(Box<dyn HostFd>),
+}
+
+pub struct ExecCommand {
+    pub prog: String,
+    pub argv: Vec<String>,
+    pub fds: Vec<FdSpec>,   // 下标 = 子进程 fd；0/1/2 只是约定
 }
 
 pub trait HostProcess: Send {
     fn id(&self) -> JobId;
-    fn write_stdin(&mut self, buf: &[u8]) -> Result<usize, ExecIoError>;
-    fn read_stdout(&mut self, out: &mut [u8]) -> Result<usize, ExecIoError>;
-    fn read_stderr(&mut self, out: &mut [u8]) -> Result<usize, ExecIoError>;
-    fn close_stdin(&mut self) -> Result<(), String>;
+    fn fd(&mut self, fd: u32) -> Option<&mut dyn HostFd>;
     fn state(&mut self) -> Result<JobState, String>;
     fn stop(&mut self) -> Result<(), String>;
     fn resume(&mut self) -> Result<(), String>;
     fn wait(&mut self) -> Result<Option<i32>, String>;
     fn kill(&mut self) -> Result<(), String>;
-    fn poll(&mut self, read: bool, write: bool, timeout_ms: u64) -> Result<(), String>;
+    fn poll(&mut self, fds: &[u32], timeout_ms: u64) -> Result<(), String>;
+}
+
+pub trait HostExec: Send {
+    fn spawn(&self, cmd: &ExecCommand, env: &[(String, String)])
+        -> Result<Box<dyn HostProcess>, String>;
+    /// 子进程侧端点对 (read, write)，供 FdSpec::Handle 直连两个 job。
+    fn pipe(&self) -> Result<(Box<dyn HostFd>, Box<dyn HostFd>), String>;
 }
 ```
 
-- `HostExec::spawn` 仍只返回 `Box<dyn HostProcess>`；不增加 capability 位。
+- `fd(0/1/2)` 与 `fd(3+)` 完全同构；`0/1/2` 只是约定，不是特例。
+- `FdSpec::Pipe` 由宿主建管道，父侧端点经 `HostProcess::fd(n)` 暴露；
+  `FdSpec::Handle` 是**子进程侧**端点（管道直连、外部 fd）。
+- 管道：`HostExec::pipe()` 返回子进程侧 `(read, write)`；stage A 的 fd 1 用
+  `Handle(write)`，stage B 的 fd 0 用 `Handle(read)`，不经过父进程。
+- 重定向：`<` = `File{Read}`@0，`<<` = `Data`@0，`>`/`>>` =
+  `File{Write/Append}`@1，`2>@1` = `Dup(1)`@2。
+- `HostExec::spawn` 返回 `Box<dyn HostProcess>`；不增加 capability 位。
 - `poll` 除 I/O 就绪/超时/退出外，**状态变化**（stop/resume/stopped）也必须唤醒。
 - 具体错误文本不作规范；Tcl 层按状态决定 `CHILDSTATUS` / `CHILDKILLED` / `CHILDStopped` 的呈现。
 
 ## 4. 宿主 ABI（wasm / 浏览器）
 
-与 Rust trait 同义；沿用现有 `host.call` 帧格式（`[u32 nfields][u32 len + bytes]...`）：
+与 Rust trait 同义；沿用现有 `host.call` 帧格式（`[u32 nfields][u32 len + bytes]...`）。
+fd 是第一等参数：
 
 | 方法 | 语义 |
 |---|---|
-| `exec.open <prog> ?arg ...?` | 创建 job，返回 handle |
-| `exec.write <id> <data>` | 写 stdin |
-| `exec.read <id> ?max?` | 读 stdout（空 = EOF） |
-| `exec.close-stdin <id>` | stdin EOF |
+| `exec.open <prog> <fdplan> ?arg ...?` | 创建 job，返回 handle |
+| `exec.pipe` | 建子进程侧端点对，返回 `[read-handle, write-handle]` |
+| `exec.fd.read <id> <fd> ?max?` | 读父侧 fd（空 = EOF） |
+| `exec.fd.write <id> <fd> <data>` | 写父侧 fd |
+| `exec.fd.close <id> <fd>` | 关闭父侧 fd（子进程见 EOF） |
+| `exec.fd.poll <id> <fd> ?timeout?` | 等单个 fd |
+| `exec.poll <id> <fds> ?timeout?` | 等一组 fd + 状态变化 |
 | `exec.state <id>` | `running` / `stopping` / `stopped` / `exited <code>` / `killed` |
 | `exec.stop <id>` | 请求协作挂起 |
 | `exec.resume <id>` | 清除挂起 |
 | `exec.kill <id>` | 硬杀 |
 | `exec.wait <id>` | 阻塞到终态；前台作业的 stop 由宿主 job prompt 处理，不把 Tcl 栈打断 |
 | `exec.list` | 当前 job 列表（宿主 job table） |
-| `exec.run <prog> ?arg ...?` | 一次性聚合便利方法，不参与 job control |
+| `exec.run <prog> ?arg ...?` | 一次性聚合便利方法，不参与 job control（内部用 0/1/2 fd） |
+
+`fdplan` 是 fd 规则序列（每项 `fd:kind[:arg]`，逗号分隔）：
+`null` / `pipe-r` / `pipe-w` / `file-r:<path>` / `file-w:<path>` /
+`file-a:<path>` / `data:<bytes>` / `dup:<fd>` / `handle:<id>`。
 
 - `exec.wait` 在宿主 job prompt 里遇到 `fg` 继续等待，遇到 `bg` 返回“已转后台”，遇到 `kill` 返回错误/终态。
 - 所有实现必须支持 `exec.kill`（native SIGKILL / web `Worker.terminate()`）；`exec.stop` 允许停在 `StopRequested`。
 - 不新增 `preemptive` 标志；没有“本地更强”的分支。
+- 旧 `exec.read/write/close-stdin` 是 `exec.fd.*` 的 0/1/2 语法糖，新 ABI 不再作为规范接口。
 
 ## 5. Tcl 词语义
 

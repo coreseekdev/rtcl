@@ -115,11 +115,79 @@ pub enum ExecIoError {
     Other(String),
 }
 
-/// 一个待执行命令（`argv[0]` 含程序名；PATH 解析由宿主负责）。
-#[derive(Debug, Clone)]
+/// 父进程侧的 fd 端点：统一的字节流/文件视图。
+///
+/// 进程没有 `stdin/stdout/stderr` 专用方法——0/1/2 只是 fd 约定。
+/// `HostFd` 同时覆盖管道、文件、内存流；WASI 的 `fd_read/fd_write/fd_close`
+/// 直接映射到这一层。
+pub trait HostFd: Send {
+    /// 0 = EOF。方向不符 → `Other`。
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, ExecIoError>;
+    fn write(&mut self, buf: &[u8]) -> Result<usize, ExecIoError>;
+    /// 关闭父侧端点（子进程见 EOF / 写端 EPIPE）。
+    fn close(&mut self) -> Result<(), String>;
+    /// 等待可读/可写/超时（避免忙等）。
+    fn poll(&mut self, read: bool, write: bool, timeout_ms: u64) -> Result<(), String>;
+}
+
+/// 管道端在父进程侧的方向；子进程侧方向相反。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipeSide {
+    /// 父进程读（子进程写）：stdout/stderr 捕获。
+    ParentReads,
+    /// 父进程写（子进程读）：stdin 注入。
+    ParentWrites,
+}
+
+/// 文件打开模式（宿主按 p-root/OPFS 解析路径）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdMode {
+    Read,
+    Write,
+    Append,
+}
+
+/// spawn 时构建子进程 fd 表的单条规则；下标即子进程 fd 号。
+///
+/// 0/1/2 只是约定，3+ 同样支持；缺省时宿主补 `Null`。
+/// `Handle`/`Data` 是**子进程侧**端点；`Pipe` 由宿主建管道并在
+/// [`HostProcess::fd`] 暴露父侧端点。
+pub enum FdSpec {
+    /// /dev/null（读 EOF / 写丢弃）。
+    Null,
+    /// 宿主建管道；父侧端点通过 `HostProcess::fd(n)` 获取。
+    Pipe(PipeSide),
+    /// 宿主打开文件（native p-root / web OPFS）。
+    File { path: String, mode: FdMode },
+    /// 子进程读的内存字节流（heredoc / `<<`）。
+    Data(Vec<u8>),
+    /// 复制子进程另一个 fd（`2>@1`）。
+    Dup(u32),
+    /// 预先建好的子进程侧端点（管道连接、外部 fd）。
+    Handle(Box<dyn HostFd>),
+}
+
+/// 一个待执行命令：`argv[0]` 含程序名；PATH 解析由宿主负责。
+/// `fds` 是完整 fd 视图，不区分 stdio 特例。
 pub struct ExecCommand {
     pub prog: String,
     pub argv: Vec<String>,
+    pub fds: Vec<FdSpec>,
+}
+
+impl ExecCommand {
+    /// 默认 fd 表：0=Null，1/2=父读管道。
+    pub fn new(prog: impl Into<String>, argv: Vec<String>) -> Self {
+        Self {
+            prog: prog.into(),
+            argv,
+            fds: vec![
+                FdSpec::Null,
+                FdSpec::Pipe(PipeSide::ParentReads),
+                FdSpec::Pipe(PipeSide::ParentReads),
+            ],
+        }
+    }
 }
 
 /// 一次性聚合结果（[`exec_collect`] 的返回）。
@@ -180,8 +248,11 @@ impl JobState {
     }
 }
 
-/// 运行中的作业句柄：stdin/stdout/stderr 均为**字节流**且 IO **非阻塞**
-/// （`WouldBlock`）——是否阻塞由调用方用 [`HostProcess::poll`] 决定。
+/// 运行中的作业句柄：fd 表 + 生命周期。
+///
+/// 父进程只持有需要自己读写的端点（`FdSpec::Pipe`）；`File/Data/Handle/Null`
+/// 没有父侧端点，`fd(n)` 返回 `None`。fd IO 恒为**非阻塞**
+/// （`WouldBlock`），是否阻塞由 [`HostProcess::poll`] / [`HostFd::poll`] 决定。
 /// 管道实现应为有界内存（背压），**不落盘**（宿主负责）。
 ///
 /// 挂起是**协作式**的：只有 guest 到达宿主 import/checkpoint 时才会从
@@ -190,12 +261,8 @@ impl JobState {
 pub trait HostProcess: Send {
     /// 稳定、不透明的作业句柄。
     fn id(&self) -> JobId;
-    fn write_stdin(&mut self, buf: &[u8]) -> Result<usize, ExecIoError>;
-    /// 0 = EOF。
-    fn read_stdout(&mut self, out: &mut [u8]) -> Result<usize, ExecIoError>;
-    fn read_stderr(&mut self, out: &mut [u8]) -> Result<usize, ExecIoError>;
-    /// 关闭写端（子进程见 EOF）。
-    fn close_stdin(&mut self) -> Result<(), String>;
+    /// 父侧 fd 端点；没有父侧端点 → `None`。
+    fn fd(&mut self, fd: u32) -> Option<&mut (dyn HostFd + 'static)>;
     /// 非阻塞读取当前状态；终态可重复读取。
     fn state(&mut self) -> Result<JobState, String>;
     /// 请求协作式挂起；立即返回。幂等。
@@ -205,16 +272,16 @@ pub trait HostProcess: Send {
     /// 非阻塞：`Some(code)` = 已到终态；`None` = 仍在运行/挂起。
     /// `Killed` 返回 `Some(137)`。
     fn wait(&mut self) -> Result<Option<i32>, String>;
-    /// 请求**硬杀**（不等待；随后 stdin 写 → `BrokenPipe`，stdout/stderr
-    /// 排空后 EOF）。状态进入 `Killed`。
+    /// 请求**硬杀**（不等待；随后 fd 写 → `BrokenPipe`，读端排空后 EOF）。
+    /// 状态进入 `Killed`。
     fn kill(&mut self) -> Result<(), String>;
-    /// 等待任一关注事件就绪 / 超时 / **状态变化**（stop/resume/stopped/
-    /// exited/killed）（避免忙等）。
-    fn poll(&mut self, read: bool, write: bool, timeout_ms: u64) -> Result<(), String>;
+    /// 等待指定父侧 fd 就绪 / 超时 / **状态变化**（stop/resume/stopped/
+    /// exited/killed）；`fds` 为空时纯等状态/超时。
+    fn poll(&mut self, fds: &[u32], timeout_ms: u64) -> Result<(), String>;
 }
 
-/// 进程执行服务：宿主**只要求实现 `spawn`**（流式）；一次性 `exec` 是解释器
-/// 侧 helper（[`exec_collect`]），不属于宿主 ABI。
+/// 进程执行服务：`spawn` 是必需的；`pipe` 为管道连接提供子进程侧端点。
+/// 一次性 `exec` 是解释器侧 helper（[`exec_collect`]），不属于宿主 ABI。
 ///
 /// 返回的 [`HostProcess`] 同时是作业句柄；`stop/resume/state/kill` 的语义见
 /// 该 trait 与 `docs/JOB-CONTROL.md`。
@@ -227,80 +294,92 @@ pub trait HostExec: Send {
         cmd: &ExecCommand,
         env: &[(String, String)],
     ) -> Result<Box<dyn HostProcess>, String>;
+
+    /// 创建一对**子进程侧**端点 `(read, write)`，供 `FdSpec::Handle` 连接
+    /// 两个 job（管道）；不经过父进程。默认不支持（单命令宿主可忽略）。
+    fn pipe(&self) -> Result<(Box<dyn HostFd>, Box<dyn HostFd>), String> {
+        Err("host does not support exec pipes".to_string())
+    }
 }
 
-/// 阻塞聚合 helper：对齐 tclsh `exec` 的基本读取面（stdout/stderr 全收 +
-/// 退出码）；超时 → kill 并报错。非零退出**不是** `Err`（由 Tcl 层决定是否
-/// 按 `CHILDSTATUS` 抛错）。
+/// 阻塞聚合 helper：把命令的 fd 0/1/2 重建成
+/// `Data(stdin)` + 两条父读管道，收齐 stdout/stderr 与退出码；
+/// 超时 → kill 并报错。非零退出**不是** `Err`（由 Tcl 层决定是否按
+/// `CHILDSTATUS` 抛错）。fd 3+ 的调用方规则保留。
 #[cfg(feature = "std")]
 pub fn exec_collect(
     host: &dyn HostExec,
-    cmd: &ExecCommand,
+    mut cmd: ExecCommand,
     stdin: &[u8],
     env: &[(String, String)],
     timeout_ms: u64,
 ) -> Result<ExecOutput, String> {
-    let mut p = host.spawn(cmd, env)?;
+    while cmd.fds.len() < 3 {
+        cmd.fds.push(FdSpec::Null);
+    }
+    cmd.fds[0] = if stdin.is_empty() {
+        FdSpec::Null
+    } else {
+        FdSpec::Data(stdin.to_vec())
+    };
+    cmd.fds[1] = FdSpec::Pipe(PipeSide::ParentReads);
+    cmd.fds[2] = FdSpec::Pipe(PipeSide::ParentReads);
+
+    let mut p = host.spawn(&cmd, env)?;
     let start = std::time::Instant::now();
-    let mut in_off = 0usize;
-    let mut stdin_closed = false;
     let mut out = Vec::new();
     let mut err = Vec::new();
+    let mut out_eof = false;
+    let mut err_eof = false;
     let mut buf = [0u8; 64 * 1024];
+
     loop {
-        while in_off < stdin.len() && !stdin_closed {
-            match p.write_stdin(&stdin[in_off..]) {
-                Ok(0) => break,
-                Ok(n) => in_off += n,
-                Err(ExecIoError::WouldBlock) => break,
-                Err(ExecIoError::BrokenPipe) => in_off = stdin.len(),
-                Err(ExecIoError::Other(e)) => return Err(format!("stdin: {e}")),
-            }
+        if !out_eof {
+            out_eof = read_available(p.as_mut(), 1, &mut out, &mut buf)?;
         }
-        if in_off >= stdin.len() && !stdin_closed {
-            p.close_stdin()?;
-            stdin_closed = true;
-        }
-        loop {
-            match p.read_stdout(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => out.extend_from_slice(&buf[..n]),
-                Err(ExecIoError::WouldBlock) => break,
-                Err(ExecIoError::BrokenPipe) => break,
-                Err(ExecIoError::Other(e)) => return Err(format!("stdout: {e}")),
-            }
-        }
-        loop {
-            match p.read_stderr(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => err.extend_from_slice(&buf[..n]),
-                Err(ExecIoError::WouldBlock) => break,
-                Err(ExecIoError::BrokenPipe) => break,
-                Err(ExecIoError::Other(e)) => return Err(format!("stderr: {e}")),
-            }
+        if !err_eof {
+            err_eof = read_available(p.as_mut(), 2, &mut err, &mut buf)?;
         }
         if let Some(code) = p.wait()? {
-            loop {
-                match p.read_stdout(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => out.extend_from_slice(&buf[..n]),
-                    Err(_) => break,
-                }
-            }
-            loop {
-                match p.read_stderr(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => err.extend_from_slice(&buf[..n]),
-                    Err(_) => break,
-                }
-            }
+            // 退出后把管道剩余字节排空（忽略方向/关闭错误）。
+            let _ = read_available(p.as_mut(), 1, &mut out, &mut buf);
+            let _ = read_available(p.as_mut(), 2, &mut err, &mut buf);
             return Ok(ExecOutput { stdout: out, stderr: err, code });
         }
         if timeout_ms > 0 && start.elapsed().as_millis() as u64 >= timeout_ms {
             let _ = p.kill();
             return Err(format!("exec: timeout after {timeout_ms}ms"));
         }
-        p.poll(in_off < stdin.len(), true, 10)?;
+        let mut poll_fds = Vec::new();
+        if !out_eof {
+            poll_fds.push(1);
+        }
+        if !err_eof {
+            poll_fds.push(2);
+        }
+        p.poll(&poll_fds, 10)?;
+    }
+}
+
+/// 读一个父侧 fd 直到 `WouldBlock`；返回是否 EOF。`exec_collect` 内部使用。
+#[cfg(feature = "std")]
+fn read_available(
+    p: &mut dyn HostProcess,
+    fd: u32,
+    out: &mut Vec<u8>,
+    buf: &mut [u8],
+) -> Result<bool, String> {
+    let Some(f) = p.fd(fd) else {
+        return Err(format!("exec: host did not expose fd {fd}"));
+    };
+    loop {
+        match f.read(buf) {
+            Ok(0) => return Ok(true),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(ExecIoError::WouldBlock) => return Ok(false),
+            Err(ExecIoError::BrokenPipe) => return Ok(true),
+            Err(ExecIoError::Other(e)) => return Err(format!("fd {fd}: {e}")),
+        }
     }
 }
 
@@ -383,5 +462,117 @@ mod job_state_tests {
         assert_eq!(JobState::Stopped.label(), "stopped");
         assert_eq!(JobState::Exited(3).label(), "exited");
         assert_eq!(JobState::Killed.label(), "killed");
+    }
+
+    struct ReadFd {
+        data: Vec<u8>,
+        off: usize,
+    }
+
+    impl HostFd for ReadFd {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, ExecIoError> {
+            if self.off >= self.data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(self.data.len() - self.off);
+            buf[..n].copy_from_slice(&self.data[self.off..self.off + n]);
+            self.off += n;
+            Ok(n)
+        }
+        fn write(&mut self, _buf: &[u8]) -> Result<usize, ExecIoError> {
+            Err(ExecIoError::Other("read-only fd".into()))
+        }
+        fn close(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn poll(&mut self, _read: bool, _write: bool, _timeout_ms: u64) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct MockProcess {
+        fds: Vec<Option<Box<dyn HostFd>>>,
+        state: JobState,
+    }
+
+    impl HostProcess for MockProcess {
+        fn id(&self) -> JobId {
+            7
+        }
+        fn fd(&mut self, fd: u32) -> Option<&mut (dyn HostFd + 'static)> {
+            self.fds.get_mut(fd as usize)?.as_deref_mut()
+        }
+        fn state(&mut self) -> Result<JobState, String> {
+            Ok(self.state)
+        }
+        fn stop(&mut self) -> Result<(), String> {
+            if self.state == JobState::Running {
+                self.state = JobState::StopRequested;
+            }
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<(), String> {
+            if matches!(self.state, JobState::StopRequested | JobState::Stopped) {
+                self.state = JobState::Running;
+            }
+            Ok(())
+        }
+        fn wait(&mut self) -> Result<Option<i32>, String> {
+            Ok(self.state.exit_code())
+        }
+        fn kill(&mut self) -> Result<(), String> {
+            self.state = JobState::Killed;
+            Ok(())
+        }
+        fn poll(&mut self, _fds: &[u32], _timeout_ms: u64) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct MockHost {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        code: i32,
+    }
+
+    impl HostExec for MockHost {
+        fn spawn(
+            &self,
+            cmd: &ExecCommand,
+            _env: &[(String, String)],
+        ) -> Result<Box<dyn HostProcess>, String> {
+            assert!(matches!(cmd.fds[1], FdSpec::Pipe(PipeSide::ParentReads)));
+            assert!(matches!(cmd.fds[2], FdSpec::Pipe(PipeSide::ParentReads)));
+            Ok(Box::new(MockProcess {
+                fds: vec![
+                    None,
+                    Some(Box::new(ReadFd { data: self.stdout.clone(), off: 0 })),
+                    Some(Box::new(ReadFd { data: self.stderr.clone(), off: 0 })),
+                ],
+                state: JobState::Exited(self.code),
+            }))
+        }
+    }
+
+    #[test]
+    fn exec_command_defaults_to_fd_view() {
+        let cmd = ExecCommand::new("hello", vec!["hello".into()]);
+        assert_eq!(cmd.fds.len(), 3);
+        assert!(matches!(cmd.fds[0], FdSpec::Null));
+        assert!(matches!(cmd.fds[1], FdSpec::Pipe(PipeSide::ParentReads)));
+        assert!(matches!(cmd.fds[2], FdSpec::Pipe(PipeSide::ParentReads)));
+    }
+
+    #[test]
+    fn exec_collect_reads_fd_1_2_not_stdio_methods() {
+        let host = MockHost {
+            stdout: b"out\n".to_vec(),
+            stderr: b"err\n".to_vec(),
+            code: 3,
+        };
+        let out = exec_collect(&host, ExecCommand::new("mock", vec![]), b"", &[], 1000).unwrap();
+        assert_eq!(out.stdout, b"out\n");
+        assert_eq!(out.stderr, b"err\n");
+        assert_eq!(out.code, 3);
     }
 }

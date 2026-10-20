@@ -254,10 +254,14 @@ fn pipeline_call(method: &[u8], args: &[Value]) -> TclResult<Value> {
     }
     let stdin = arg(args, 2);
     let stdin_file = arg(args, 3);
+    let stderr_mode = arg(args, 4);
+    let stderr_path = arg(args, 5);
     let mut owned: Vec<Vec<u8>> = vec![
         method.to_vec(),
         stdin.into_bytes(),
         stdin_file.into_bytes(),
+        stderr_mode.into_bytes(),
+        stderr_path.into_bytes(),
         stages.len().to_string().into_bytes(),
     ];
     for st in &stages {

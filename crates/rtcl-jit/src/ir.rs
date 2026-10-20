@@ -145,6 +145,10 @@ pub struct L2 {
     pub writes: Vec<Option<u32>>,
     /// 值栈最大深度 = i64 寄存器个数。
     pub max_depth: u32,
+    /// 每 op 执行后的值栈深度（alloc_locals 的线性模拟产物；lower 的
+    /// ForeachEnd dst 定位等消费者用——重放需复刻 ForeachStart 的
+    /// ngroups 特判，查表免重复）。
+    pub depth_after: Vec<u32>,
     /// 变量缓存槽（按首次引用顺序）。
     pub vars: Vec<VarSlot>,
     /// 宿主失败点表（`rtcl.fail(fail_id)` 的 fail_id 下标）。

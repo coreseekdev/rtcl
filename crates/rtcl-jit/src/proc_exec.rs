@@ -109,7 +109,11 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
 
     // 池命中：reset Host 状态 + 复用 Store/Instance（免 instantiate——
     // vm_exec 有 VmPool 复用而 JIT 每次重建是 .47× 的剩余大头）。
+    // ⚠️ 池化交互 bug（2026-10-20）：同 Store 第二次 run 提前 OK 退出
+    // （defarg 双调用第二返回值丢失）judge 6 文件回归——**默认禁用**
+    // （RTCL_JIT_PROC_POOL=1 调试启用），正确性优先。
     let mut reused = false;
+    if std::env::var_os("RTCL_JIT_PROC_POOL").is_some() {
     WASMI_POOL.with(|p| {
         let mut p = p.borrow_mut();
         if let Some(pos) = p.iter().position(|(k, ..)| *k == pool_key) {
@@ -121,6 +125,7 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
             reused = true;
         }
     });
+    }
     let (mut store, instance) = if reused {
         POOL_TAKE.with(|t| t.borrow_mut().take().expect("pool take"))
     } else {
@@ -152,13 +157,16 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
     let result = store.data_mut().result.take();
     let pending_exit = store.data_mut().pending_exit.take();
     let pending = store.data_mut().pending.take();
-    WASMI_POOL.with(|p| {
-        let mut p = p.borrow_mut();
-        if p.len() >= 64 {
-            p.clear();
-        }
-        p.push((pool_key, store, instance));
-    });
+    if std::env::var_os("RTCL_JIT_PROC_POOL").is_some() {
+        WASMI_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() >= 64 {
+                p.clear();
+            }
+            p.push((pool_key, store, instance));
+        });
+    }
+    // 禁池：Store 离开作用域自然销毁（值已全部 take，无悬垂）。
 
     match rc {
         code::OK => Ok(result.unwrap_or_else(Value::empty)),
@@ -257,11 +265,13 @@ fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64) -> wasm
             },
         )
         .unwrap();
+    let caching_cav = g_caching.clone();
     linker
         .func_wrap(
             "rtcl",
             "call_argv",
-            |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
+            move |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
+                let _ = caching_cav.set(&mut c, wasmi::Val::I32(0));
                 let words = read_words(&mut c, base, argc);
                 c.data_mut().call_argv_raw(&words, site)
             },

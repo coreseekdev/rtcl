@@ -203,11 +203,13 @@ fn register_wasmtime_abi(
         })
         .unwrap();
     let caching_es = g_caching.clone();
+    let caching_cav = g_caching.clone();
     linker
         .func_wrap(
             "rtcl",
             "call_argv",
-            |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
+            move |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
+                let _ = caching_cav.set(&mut c, Val::I32(0));
                 let words = read_words(&mut c, base, argc);
                 c.data_mut().call_argv_raw(&words, site)
             },

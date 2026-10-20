@@ -177,7 +177,8 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
                     },
                     // ForeachEnd（brk 出口与正常出口都在此汇合）。
                     L3::Instr(Instr::ForeachEnd {
-                        dst: Reg(depth_at_end(ctx, end)),
+                        // 槽号 = 深度-1（depth_after 是执行后的深度计数）。
+                        dst: Reg(depth_at_end(ctx, end).saturating_sub(1)),
                     }),
                 ]));
                 pc = end + 1;
@@ -374,14 +375,11 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
     Ok(L3::Seq(items))
 }
 
-/// pc 处的值栈深度（线性重放；与 alloc_locals 的 depth_at 同式）。
+/// pc 处（含）执行后的值栈深度——查 alloc_locals 的模拟表（重放需
+/// 复刻 ForeachStart 的 ngroups 特判，查表免重复；lmap 列表 dst 曾因
+/// 重放高估 1 槽而错位——puts 读到残留的末次迭代值）。
 fn depth_at_end(ctx: &Ctx, end: u32) -> u32 {
-    let mut d = 0u32;
-    for a in ctx.l2.ops.iter().take(end as usize + 1) {
-        let (pops, pushes) = crate::pass::stack_effect(&a.op);
-        d = d - pops.min(d) + pushes;
-    }
-    d
+    ctx.l2.depth_after[end as usize]
 }
 
 /// 循环体结构（for/foreach 共用）：cont 介于 header/brk 时 body 包

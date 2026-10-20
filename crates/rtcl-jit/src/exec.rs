@@ -55,6 +55,8 @@ pub(crate) struct Host {
     pub(crate) interp: *mut Interp,
     pub(crate) arena: Vec<Value>,
     pub(crate) consts: Vec<String>,
+    /// locals 名（slot 重写的伪常量槽——名字解析同 consts 公式延伸）。
+    pub(crate) local_names: Vec<String>,
     fails: Vec<FailInfo>,
     sites: Vec<rtcl_parser::SrcSpan>,
     lines: Vec<u32>,
@@ -482,11 +484,15 @@ fn expr_quote(s: &str) -> String {
     }
 }
 
-/// arena 预驻留：0=UNSET 1=哨兵保留 2=EMPTY 3..=常量池。
+/// arena 预驻留：0=UNSET 1=哨兵保留 2=EMPTY 3..=常量池，随后 =
+/// locals 名（slot 重写的伪常量槽——alloc_locals 同公式）。
 pub(crate) fn arena_of(bc: &ByteCode) -> Vec<Value> {
     let mut arena = vec![Value::unset(), Value::unset(), Value::empty()];
     for c in bc.constants() {
         arena.push(Value::from_str(c));
+    }
+    for l in bc.locals() {
+        arena.push(Value::from_str(l));
     }
     arena
 }
@@ -499,6 +505,7 @@ impl Host {
             interp,
             arena,
             consts: bc.constants().to_vec(),
+            local_names: bc.locals().to_vec(),
             fails: module.l2.fails.clone(),
             sites: bc.sites.iter().map(|s| s.text).collect(),
             lines: bc.sites.iter().map(|s| s.line).collect(),
@@ -961,10 +968,16 @@ impl Host {
     }
 
     fn const_name(&self, name_h: i32) -> String {
-        self.consts
-            [((name_h >> 1) as usize)
-                .saturating_sub(abi::CONST_ARENA_BASE as usize)]
-        .clone()
+        let idx = ((name_h >> 1) as usize).saturating_sub(abi::CONST_ARENA_BASE as usize);
+        if idx < self.consts.len() {
+            self.consts[idx].clone()
+        } else {
+            // 伪常量槽：locals 名（slot 重写——arena 预驻留同公式）。
+            self.local_names
+                .get(idx - self.consts.len())
+                .cloned()
+                .unwrap_or_default()
+        }
     }
 
     /// binary_op：宿主完整 Tcl 语义（§3）——`types::eval_expr` 原文路由。
@@ -1333,11 +1346,14 @@ fn execute(
             c.data_mut().lappend_var_raw(name_h, v)
         })
         .unwrap();
+    let g_caching_cav = g_caching.clone();
     linker
         .func_wrap(
             "rtcl",
             "call_argv",
-            |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
+            move |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
+                // 命令可写任意变量——缓存窗口关闭（与 call 同纪律）。
+                let _ = g_caching_cav.set(&mut c, wasmi::Val::I32(0));
                 let words = read_words(&c, base, argc);
                 c.data_mut().call_argv_raw(&words, site)
             },

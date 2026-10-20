@@ -122,6 +122,7 @@ fn cpcheck_rejects_malformed() {
         reads: vec![],
         writes: vec![Some(9)],
         max_depth: 2,
+        depth_after: vec![],
         vars: vec![],
         fails: vec![],
         fail_of: vec![],

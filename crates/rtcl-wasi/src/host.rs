@@ -230,9 +230,11 @@ fn pipeline_call(method: &[u8], args: &[Value]) -> TclResult<Value> {
         return Err(terr("host::exec::pipeline: empty pipeline"));
     }
     let stdin = arg(args, 2);
+    let stdin_file = arg(args, 3);
     let mut owned: Vec<Vec<u8>> = vec![
         method.to_vec(),
         stdin.into_bytes(),
+        stdin_file.into_bytes(),
         stages.len().to_string().into_bytes(),
     ];
     for st in &stages {

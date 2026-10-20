@@ -196,6 +196,7 @@ job wait   ?job-id?
 - 输出按宿主终端路由；有界背压：OS pipe 满 / SAB ring 满时 job 在写 import 阻塞。
 - **fd 继承边界**：HostFd 端点一律 `FD_CLOEXEC`；子进程只保留 spawn 时 `dup2` 的目标 fd。否则 runner 会继承自己管道的另一端（heredoc 写端会让 stdin 永远等不到 EOF）。
 - 父侧 HostFd 保持非阻塞接口；子进程 stdio 在 `dup2` 后清 `O_NONBLOCK`，runner 才能按阻塞语义做 stdin relay。
+- 前台 Ctrl-Z 仅在 stdin/stdout 都是 tty 时启用：rogo 捕获 `SIGTSTP`，runner 在**独立进程组**（不接收终端信号），随后进入受限 `job%` prompt（`fg/bg/jobs/kill/help`，不执行 Tcl）。`fg` 保留 Tcl 栈；`bg` 把句柄交给 HostJobs 并让 `exec` 返回 job id。
 - 不支持 termios/全屏 TUI（WASI p1 无 termios）；两边一致。
 - Ctrl-Z = stop 请求；Ctrl-C = cancel 请求（协作退出，超时 kill）；guest 不接收 OS 信号。
 

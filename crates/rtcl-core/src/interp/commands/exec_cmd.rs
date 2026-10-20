@@ -4,13 +4,53 @@
 //! returns the collected standard output.
 
 use crate::error::{Error, ErrorCode, Result};
-use crate::host::{BytesFd, ExecCommand, ExecIoError, FdMode, HostFd, HostFs, HostProcess, NullFd};
+use crate::host::{
+    BytesFd, ExecCommand, ExecIoError, FdMode, HostFd, HostFs, HostProcess, JobState, NullFd,
+};
 use crate::interp::Interp;
 use crate::value::Value;
 
 use std::io::Read;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+mod tty {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub static TSTP: AtomicBool = AtomicBool::new(false);
+    pub static INT: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn on_tstp(_: libc::c_int) {
+        TSTP.store(true, Ordering::SeqCst);
+    }
+    extern "C" fn on_int(_: libc::c_int) {
+        INT.store(true, Ordering::SeqCst);
+    }
+
+    pub struct Guard {
+        old_tstp: libc::sighandler_t,
+        old_int: libc::sighandler_t,
+    }
+
+    impl Guard {
+        pub fn install() -> Self {
+            let old_tstp =
+                unsafe { libc::signal(libc::SIGTSTP, on_tstp as libc::sighandler_t) };
+            let old_int = unsafe { libc::signal(libc::SIGINT, on_int as libc::sighandler_t) };
+            Self { old_tstp, old_int }
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::signal(libc::SIGTSTP, self.old_tstp);
+                libc::signal(libc::SIGINT, self.old_int);
+            }
+        }
+    }
+}
 
 fn exec_err(msg: std::io::Error) -> Error {
     Error::runtime(msg.to_string(), ErrorCode::Io)
@@ -510,6 +550,30 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(exec_err_str("exec: host job table unavailable"));
     }
 
+    let command_text = stages
+        .iter()
+        .map(|s| s.join(" "))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    let interactive = {
+        use std::io::IsTerminal;
+        let i = std::io::stdin().is_terminal();
+        let o = std::io::stdout().is_terminal();
+        if std::env::var_os("ROGO_JOB_DEBUG").is_some() {
+            eprintln!("exec-host: stdin_tty={i} stdout_tty={o}");
+        }
+        i && o
+    };
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    let interactive = false;
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    let _sig_guard = if interactive {
+        Some(tty::Guard::install())
+    } else {
+        None
+    };
+
     let host = interp
         .host_exec()
         .ok_or_else(|| exec_err_str("exec: host exec unavailable"))?;
@@ -613,12 +677,7 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let jobs = interp
             .host_jobs()
             .ok_or_else(|| exec_err_str("exec: host job table unavailable"))?;
-        let command = stages
-            .iter()
-            .map(|s| s.join(" "))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        let id = jobs.add(handles, command);
+        let id = jobs.add(handles, command_text.clone());
         return Ok(Value::from_str(&id.to_string()));
     }
 
@@ -631,6 +690,57 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut exit_code = 0i32;
 
     loop {
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        if interactive {
+            if tty::INT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                for h in &mut handles {
+                    let _ = h.kill();
+                }
+            }
+            if tty::TSTP.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                if std::env::var_os("ROGO_JOB_DEBUG").is_some() {
+                    eprintln!("exec-host: tstp requested");
+                }
+                for h in &mut handles {
+                    let _ = h.stop();
+                }
+                // 最多等 500ms 的 checkpoint ack；纯计算保持 stopping。
+                let start = Instant::now();
+                loop {
+                    let all_stopped = handles.iter_mut().all(|h| {
+                        matches!(
+                            h.state(),
+                            Ok(JobState::Stopped) | Ok(JobState::Exited(_)) | Ok(JobState::Killed)
+                        )
+                    });
+                    if all_stopped || start.elapsed() >= Duration::from_millis(500) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                match job_prompt(&mut handles, &command_text) {
+                    PromptAction::Fg => {}
+                    PromptAction::Bg => {
+                        if let Some(f) = out_r.take() {
+                            spawn_drain(f, false);
+                        }
+                        if let Some(f) = err_r.take() {
+                            spawn_drain(f, true);
+                        }
+                        let jobs = interp
+                            .host_jobs()
+                            .ok_or_else(|| exec_err_str("exec: host job table unavailable"))?;
+                        let id = jobs.add(handles, command_text.clone());
+                        return Ok(Value::from_str(&id.to_string()));
+                    }
+                    PromptAction::Kill | PromptAction::Eof => {
+                        for h in &mut handles {
+                            let _ = h.kill();
+                        }
+                    }
+                }
+            }
+        }
         if let Some(f) = out_r.as_mut() {
             if !out_eof {
                 out_eof = read_host_fd(f.as_mut(), &mut out)?;
@@ -746,6 +856,73 @@ fn read_host_fd(f: &mut dyn HostFd, out: &mut Vec<u8>) -> Result<bool> {
             Err(ExecIoError::WouldBlock) => return Ok(false),
             Err(ExecIoError::BrokenPipe) => return Ok(true),
             Err(ExecIoError::Other(e)) => return Err(exec_err_str(e)),
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+enum PromptAction {
+    Fg,
+    Bg,
+    Kill,
+    Eof,
+}
+
+/// 前台 Ctrl-Z 的受限 job prompt：只接受 fg/bg/jobs/kill/help，不跑 Tcl。
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+fn job_prompt(handles: &mut [Box<dyn HostProcess>], command: &str) -> PromptAction {
+    use std::io::Write;
+    loop {
+        if tty::INT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return PromptAction::Kill;
+        }
+        // Ctrl-Z 在 job prompt 内无意义。
+        let _ = tty::TSTP.swap(false, std::sync::atomic::Ordering::SeqCst);
+
+        let id = handles.last().map(|h| h.id()).unwrap_or(0);
+        let state = handles
+            .iter_mut()
+            .filter_map(|h| h.state().ok())
+            .next_back()
+            .unwrap_or(JobState::Running);
+        println!("[{id}]+ {} {command}", state.label());
+        print!("job% ");
+        let _ = std::io::stdout().flush();
+
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => return PromptAction::Eof,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                if tty::INT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return PromptAction::Kill;
+                }
+                continue;
+            }
+            Err(_) => return PromptAction::Eof,
+        }
+        match line.trim() {
+            "" | "fg" => {
+                for h in handles.iter_mut() {
+                    let _ = h.resume();
+                }
+                return PromptAction::Fg;
+            }
+            "bg" => {
+                for h in handles.iter_mut() {
+                    let _ = h.resume();
+                }
+                return PromptAction::Bg;
+            }
+            "jobs" | "list" => {
+                for h in handles.iter_mut() {
+                    let st = h.state().unwrap_or(JobState::Running);
+                    println!("{} {} {command}", h.id(), st.label());
+                }
+            }
+            "kill" => return PromptAction::Kill,
+            "help" => println!("job prompt: fg | bg | jobs | kill | help"),
+            other => println!("job prompt: unknown command \"{other}\" (fg|bg|jobs|kill|help)"),
         }
     }
 }

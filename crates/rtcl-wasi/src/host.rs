@@ -209,6 +209,93 @@ pub fn cmd_http_cancel(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
     call_unit("host::http::cancel <id>", &[b"http.cancel", id.as_bytes()])
 }
 
+/// `host::exec::pipeline <stage-list> <stdin>` —— 宿主按 stage 连接有界管道；
+/// 返回会话 id。stage-list = 每 stage 一个 Tcl 列表（首词 = 命令名）。
+pub fn cmd_exec_pipeline(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let stages = args
+        .get(1)
+        .and_then(|v| v.as_list())
+        .ok_or_else(|| terr("host::exec::pipeline <stage-list> <stdin>"))?;
+    if stages.is_empty() {
+        return Err(terr("host::exec::pipeline: empty pipeline"));
+    }
+    let stdin = arg(args, 2);
+    let mut owned: Vec<Vec<u8>> = vec![
+        b"exec.pipeline".to_vec(),
+        stdin.into_bytes(),
+        stages.len().to_string().into_bytes(),
+    ];
+    for st in &stages {
+        let words = st
+            .as_list()
+            .ok_or_else(|| terr("host::exec::pipeline: stage must be a list"))?;
+        if words.is_empty() {
+            return Err(terr("host::exec::pipeline: empty stage"));
+        }
+        owned.push(words.len().to_string().into_bytes());
+        for w in words {
+            owned.push(w.as_str().as_bytes().to_vec());
+        }
+    }
+    let refs: Vec<&[u8]> = owned.iter().map(|b| b.as_slice()).collect();
+    host_call(&refs)
+        .map(text_of)
+        .map_err(|e| terr(format!("host::exec::pipeline: {e}")))
+}
+
+/// `host::exec::pipeline.read <id> ?max?` —— 读最后 stage stdout（空 = EOF）。
+pub fn cmd_exec_pipeline_read(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    let max = arg(args, 2);
+    if id.is_empty() {
+        return Err(terr("host::exec::pipeline.read <id> ?max?"));
+    }
+    let reply = host_call(&[
+        b"exec.pipeline.read",
+        id.as_bytes(),
+        max.as_bytes(),
+    ])
+    .map_err(|e| terr(format!("host::exec::pipeline.read: {e}")))?;
+    Ok(text_of(reply))
+}
+
+/// `host::exec::pipeline.wait <id>` —— 等所有 stage；设置 code/stderr。
+pub fn cmd_exec_pipeline_wait(interp: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    if id.is_empty() {
+        return Err(terr("host::exec::pipeline.wait <id>"));
+    }
+    let reply = host_call(&[b"exec.pipeline.wait", id.as_bytes()])
+        .map_err(|e| terr(format!("host::exec::pipeline.wait: {e}")))?;
+    let parts = parse_frame(&reply)
+        .map_err(|e| terr(format!("host::exec::pipeline.wait: {e}")))?;
+    let code: i32 = parts
+        .first()
+        .and_then(|b| String::from_utf8_lossy(b).parse().ok())
+        .unwrap_or(1);
+    let err = parts.get(1).cloned().unwrap_or_default();
+    let _ = interp.eval("namespace eval ::host::exec {}");
+    interp.set_var("::host::exec::code", Value::from_str(&code.to_string()))?;
+    interp.set_var(
+        "::host::exec::stderr",
+        Value::from_str(&String::from_utf8_lossy(&err)),
+    )?;
+    Ok(Value::from_str(&code.to_string()))
+}
+
+/// `host::exec::pipeline.kill <id>` —— 删除会话并关闭宿主侧句柄。
+pub fn cmd_exec_pipeline_kill(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    if id.is_empty() {
+        return Err(terr("host::exec::pipeline.kill <id>"));
+    }
+    exec_call(
+        b"exec.pipeline.kill",
+        &[id.as_bytes()],
+        "host::exec::pipeline.kill",
+    )
+}
+
 /// `host::exec::run <prog> ?arg ...?` —— 经宿主 PATH 执行 wasm 命令。
 /// v0 聚合形态：stdin 为空；stdout 作为结果返回；`::host::exec::code` /
 /// `::host::exec::stderr` 存退出码与 stderr（文本，lossy）。
@@ -335,6 +422,10 @@ pub fn register(interp: &mut Interp) {
     interp.register_command("host::http::next", cmd_http_next);
     interp.register_command("host::http::body", cmd_http_body);
     interp.register_command("host::http::cancel", cmd_http_cancel);
+    interp.register_command("host::exec::pipeline", cmd_exec_pipeline);
+    interp.register_command("host::exec::pipeline.read", cmd_exec_pipeline_read);
+    interp.register_command("host::exec::pipeline.wait", cmd_exec_pipeline_wait);
+    interp.register_command("host::exec::pipeline.kill", cmd_exec_pipeline_kill);
     interp.register_command("host::exec::run", cmd_exec_run);
     interp.register_command("host::exec::open", cmd_exec_open);
     interp.register_command("host::exec::write", cmd_exec_write);

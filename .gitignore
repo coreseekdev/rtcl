@@ -55,4 +55,5 @@ crates/rtcl-wasm/pkg/
 !docs/ROADMAP.md
 !docs/UI-GENUI.md
 !docs/JIT-WASM-GC.md
+!docs/JOB-CONTROL.md
 !TASK-JIT-WASM.md

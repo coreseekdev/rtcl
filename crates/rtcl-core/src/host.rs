@@ -130,26 +130,94 @@ pub struct ExecOutput {
     pub code: i32,
 }
 
-/// 运行中的进程句柄：stdin/stdout/stderr 均为**字节流**且 IO **非阻塞**
+/// 作业句柄：不透明、在句柄生命周期内稳定。
+///
+/// native 通常是 runner 子进程 PID，web 是合成 ID；调用方**不得**假设 OS
+/// PID/信号语义（见 `docs/JOB-CONTROL.md`）。
+pub type JobId = u64;
+
+/// 作业生命周期状态（native 与 web 同一套，无抢占式分支）。
+///
+/// 规范（2026-10-20）：
+/// - `stop` 幂等：`Running → StopRequested`；guest 在下一个 checkpoint 才进入
+///   `Stopped`。没有 checkpoint 的纯计算会一直停在 `StopRequested`。
+/// - `resume` 幂等：`StopRequested/Stopped → Running`；终态上为 no-op。
+/// - `kill` 幂等：立即进入 `Killed`（硬杀，不保证 guest 清理）。
+/// - `Exited` / `Killed` 是终态；`wait` 对 `Killed` 返回 137（128+SIGKILL 约定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    Running,
+    StopRequested,
+    Stopped,
+    Exited(i32),
+    Killed,
+}
+
+impl JobState {
+    /// 终态：不会再生变化。
+    pub fn is_terminal(self) -> bool {
+        matches!(self, JobState::Exited(_) | JobState::Killed)
+    }
+
+    /// Tcl/`job list` 使用的稳定标签。
+    pub fn label(self) -> &'static str {
+        match self {
+            JobState::Running => "running",
+            JobState::StopRequested => "stopping",
+            JobState::Stopped => "stopped",
+            JobState::Exited(_) => "exited",
+            JobState::Killed => "killed",
+        }
+    }
+
+    /// 终态退出码；非终态为 `None`。`Killed` 固定 137。
+    pub fn exit_code(self) -> Option<i32> {
+        match self {
+            JobState::Exited(code) => Some(code),
+            JobState::Killed => Some(137),
+            JobState::Running | JobState::StopRequested | JobState::Stopped => None,
+        }
+    }
+}
+
+/// 运行中的作业句柄：stdin/stdout/stderr 均为**字节流**且 IO **非阻塞**
 /// （`WouldBlock`）——是否阻塞由调用方用 [`HostProcess::poll`] 决定。
 /// 管道实现应为有界内存（背压），**不落盘**（宿主负责）。
+///
+/// 挂起是**协作式**的：只有 guest 到达宿主 import/checkpoint 时才会从
+/// `StopRequested` 进入 `Stopped`。native 不得用 SIGSTOP、web 不得用
+/// `Worker.terminate()` 冒充挂起（terminate 只能是 `kill`）。
 pub trait HostProcess: Send {
+    /// 稳定、不透明的作业句柄。
+    fn id(&self) -> JobId;
     fn write_stdin(&mut self, buf: &[u8]) -> Result<usize, ExecIoError>;
     /// 0 = EOF。
     fn read_stdout(&mut self, out: &mut [u8]) -> Result<usize, ExecIoError>;
     fn read_stderr(&mut self, out: &mut [u8]) -> Result<usize, ExecIoError>;
     /// 关闭写端（子进程见 EOF）。
     fn close_stdin(&mut self) -> Result<(), String>;
-    /// 非阻塞：`Some(code)` = 已退出；`None` = 仍在运行。
+    /// 非阻塞读取当前状态；终态可重复读取。
+    fn state(&mut self) -> Result<JobState, String>;
+    /// 请求协作式挂起；立即返回。幂等。
+    fn stop(&mut self) -> Result<(), String>;
+    /// 取消挂起 / 恢复运行；立即返回。幂等；终态上 no-op。
+    fn resume(&mut self) -> Result<(), String>;
+    /// 非阻塞：`Some(code)` = 已到终态；`None` = 仍在运行/挂起。
+    /// `Killed` 返回 `Some(137)`。
     fn wait(&mut self) -> Result<Option<i32>, String>;
-    /// 请求终止（不等待；随后 stdin 写 → `BrokenPipe`，stdout/stderr 排空后 EOF）。
+    /// 请求**硬杀**（不等待；随后 stdin 写 → `BrokenPipe`，stdout/stderr
+    /// 排空后 EOF）。状态进入 `Killed`。
     fn kill(&mut self) -> Result<(), String>;
-    /// 等待任一关注事件就绪 / 超时 / 退出（避免忙等）。
+    /// 等待任一关注事件就绪 / 超时 / **状态变化**（stop/resume/stopped/
+    /// exited/killed）（避免忙等）。
     fn poll(&mut self, read: bool, write: bool, timeout_ms: u64) -> Result<(), String>;
 }
 
 /// 进程执行服务：宿主**只要求实现 `spawn`**（流式）；一次性 `exec` 是解释器
 /// 侧 helper（[`exec_collect`]），不属于宿主 ABI。
+///
+/// 返回的 [`HostProcess`] 同时是作业句柄；`stop/resume/state/kill` 的语义见
+/// 该 trait 与 `docs/JOB-CONTROL.md`。
 ///
 /// 范围（2026-10-19 裁决）：仅 wasm 命令（WASI p1 命令形态）；native binary
 /// 不在本机制内（将来若需要，另设显式能力的 exec 通道）。
@@ -288,5 +356,32 @@ pub struct NullHttp;
 impl HostHttp for NullHttp {
     fn request(&self, _req: &HttpRequest) -> Result<Box<dyn HttpResponse>, String> {
         Err("http service is not available in this host (native: build rtcl-cli with --features net)".to_string())
+    }
+}
+
+#[cfg(test)]
+mod job_state_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_and_exit_codes() {
+        assert!(!JobState::Running.is_terminal());
+        assert!(!JobState::StopRequested.is_terminal());
+        assert!(!JobState::Stopped.is_terminal());
+        assert!(JobState::Exited(0).is_terminal());
+        assert!(JobState::Killed.is_terminal());
+
+        assert_eq!(JobState::Exited(7).exit_code(), Some(7));
+        assert_eq!(JobState::Killed.exit_code(), Some(137));
+        assert_eq!(JobState::Stopped.exit_code(), None);
+    }
+
+    #[test]
+    fn stable_labels() {
+        assert_eq!(JobState::Running.label(), "running");
+        assert_eq!(JobState::StopRequested.label(), "stopping");
+        assert_eq!(JobState::Stopped.label(), "stopped");
+        assert_eq!(JobState::Exited(3).label(), "exited");
+        assert_eq!(JobState::Killed.label(), "killed");
     }
 }

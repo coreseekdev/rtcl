@@ -67,6 +67,14 @@ pub fn cmd_yaml_decode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(bridge(&doc, &null_value))
 }
 
+/// Parse YAML text into a Tcl Value without a native interpreter.
+/// Hosts use this to expose YAML config to wasm guests.
+pub fn yaml_to_value(text: &str) -> std::result::Result<Value, String> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(text)
+        .map_err(|e| format!("yaml parse: {e}"))?;
+    Ok(bridge(&doc, "null"))
+}
+
 /// `yaml::encode value`
 pub fn cmd_yaml_encode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let start = if args.len() > 1 && args[1].as_str() == "encode" { 2 } else { 1 };

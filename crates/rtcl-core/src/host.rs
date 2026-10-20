@@ -347,6 +347,29 @@ pub trait HostExec: Send {
     }
 }
 
+/// 作业表里的一条公开信息（`job list` 用）。
+#[derive(Debug, Clone)]
+pub struct JobInfo {
+    pub id: JobId,
+    pub command: String,
+    pub state: JobState,
+}
+
+/// 宿主作业表：`exec &` / `job *` 的落点。
+///
+/// 一个 entry 是一组 `HostProcess`（pipeline 的所有 stage）；`wait` 非阻塞，
+/// Tcl 层需要阻塞时自行轮询。实现负责保留句柄（不能 drop，否则 native
+/// 后端会杀掉仍在运行的 job）。
+pub trait HostJobs: Send {
+    fn add(&self, handles: Vec<Box<dyn HostProcess>>, command: String) -> JobId;
+    fn list(&self) -> Vec<JobInfo>;
+    fn stop(&self, id: JobId) -> Result<(), String>;
+    fn resume(&self, id: JobId) -> Result<(), String>;
+    fn kill(&self, id: JobId) -> Result<(), String>;
+    /// 非阻塞：all stages terminal → `Some(code)`，否则 `None`。
+    fn wait(&self, id: JobId) -> Result<Option<i32>, String>;
+}
+
 /// 阻塞聚合 helper：构建 fd 0/1/2（stdin 用内存流或 NullFd，stdout/stderr
 /// 用两条管道），收齐输出与退出码；超时 → kill 并报错。非零退出**不是**
 /// `Err`（由 Tcl 层决定是否按 `CHILDSTATUS` 抛错）。

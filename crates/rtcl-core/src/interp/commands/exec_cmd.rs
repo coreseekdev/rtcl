@@ -506,10 +506,8 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if stages.is_empty() {
         return Err(exec_err_str("no command given"));
     }
-    if background {
-        return Err(exec_err_str(
-            "exec: background jobs are not wired to the job table yet",
-        ));
+    if background && interp.host_jobs().is_none() {
+        return Err(exec_err_str("exec: host job table unavailable"));
     }
 
     let host = interp
@@ -604,6 +602,26 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         handles.push(p);
     }
 
+    if background {
+        // 后台 job：输出不阻塞调用方，交给 drain 线程；句柄进宿主作业表。
+        if let Some(f) = out_r.take() {
+            spawn_drain(f, false);
+        }
+        if let Some(f) = err_r.take() {
+            spawn_drain(f, true);
+        }
+        let jobs = interp
+            .host_jobs()
+            .ok_or_else(|| exec_err_str("exec: host job table unavailable"))?;
+        let command = stages
+            .iter()
+            .map(|s| s.join(" "))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let id = jobs.add(handles, command);
+        return Ok(Value::from_str(&id.to_string()));
+    }
+
     let mut out = Vec::new();
     let mut err = Vec::new();
     let mut out_eof = out_r.is_none();
@@ -695,6 +713,30 @@ fn host_open(fs: Option<&dyn HostFs>, path: &str, mode: FdMode) -> Result<Box<dy
     fs.open(path, mode).map_err(exec_err_str)
 }
 
+fn spawn_drain(mut f: Box<dyn HostFd>, stderr: bool) {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stderr {
+                        use std::io::Write;
+                        let _ = std::io::stderr().write_all(&buf[..n]);
+                    } else {
+                        use std::io::Write;
+                        let _ = std::io::stdout().write_all(&buf[..n]);
+                    }
+                }
+                Err(ExecIoError::WouldBlock) => {
+                    let _ = f.poll(true, false, 10);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
 fn read_host_fd(f: &mut dyn HostFd, out: &mut Vec<u8>) -> Result<bool> {
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -706,6 +748,69 @@ fn read_host_fd(f: &mut dyn HostFd, out: &mut Vec<u8>) -> Result<bool> {
             Err(ExecIoError::Other(e)) => return Err(exec_err_str(e)),
         }
     }
+}
+
+/// `job list|stop|resume|fg|bg|kill|wait ?job-id?`
+pub fn cmd_job(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let sub = args
+        .get(1)
+        .map(|v| v.as_str().to_string())
+        .ok_or_else(|| exec_err_str("usage: job list|stop|resume|fg|bg|kill|wait ?job-id?"))?;
+    let jobs = interp
+        .host_jobs()
+        .ok_or_else(|| exec_err_str("job: host job table unavailable"))?;
+    match sub.as_str() {
+        "list" => {
+            let list = jobs.list();
+            let text = list
+                .iter()
+                .map(|j| format!("{} {} {}", j.id, j.state.label(), j.command))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(Value::from_str(&text))
+        }
+        "stop" => {
+            jobs.stop(job_id(args)?).map_err(exec_err_str)?;
+            Ok(Value::empty())
+        }
+        "resume" => {
+            jobs.resume(job_id(args)?).map_err(exec_err_str)?;
+            Ok(Value::empty())
+        }
+        "kill" => {
+            jobs.kill(job_id(args)?).map_err(exec_err_str)?;
+            Ok(Value::empty())
+        }
+        "bg" => {
+            jobs.resume(job_id(args)?).map_err(exec_err_str)?;
+            Ok(Value::empty())
+        }
+        "fg" | "wait" => {
+            let id = job_id(args)?;
+            if sub == "fg" {
+                jobs.resume(id).map_err(exec_err_str)?;
+            }
+            loop {
+                if let Some(code) = jobs.wait(id).map_err(exec_err_str)? {
+                    return Ok(Value::from_str(&code.to_string()));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        other => Err(exec_err_str(format!(
+            "job: unknown subcommand \"{other}\" (list|stop|resume|fg|bg|kill|wait)"
+        ))),
+    }
+}
+
+fn job_id(args: &[Value]) -> Result<u64> {
+    let raw = args
+        .get(2)
+        .map(|v| v.as_str())
+        .ok_or_else(|| exec_err_str("job: missing job-id"))?;
+    raw.trim_start_matches('%')
+        .parse::<u64>()
+        .map_err(|_| exec_err_str(format!("job: bad job-id \"{raw}\"")))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

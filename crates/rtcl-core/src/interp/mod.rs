@@ -708,6 +708,8 @@ pub struct Interp {
     /// 宿主文件服务：exec 重定向/heredoc 先经 `open` 构建 `HostFd`，
     /// 再放进子进程 fd 表（`None` → 该宿主不提供文件 fd）。
     pub(crate) fs: Option<Box<dyn crate::host::HostFs>>,
+    /// 宿主作业表（`exec &` / `job *`）；`None` → 不支持后台作业。
+    pub(crate) jobs: Option<Box<dyn crate::host::HostJobs>>,
     /// 时钟服务：`after`/`vwait`/`time` 的 now/sleep 落点
     /// （原生 `Instant`，或 wasm 宿主注入的 JS 实现）。
     #[cfg(feature = "std")]
@@ -871,6 +873,7 @@ impl Interp {
             http: Box::new(crate::host::NullHttp),
             exec: None,
             fs: None,
+            jobs: None,
             aliases: HashMap::new(),
             references: HashMap::new(),
             next_ref_id: 0,
@@ -972,6 +975,16 @@ impl Interp {
     /// 只读访问宿主文件服务（未注入 → `None`）。
     pub fn host_fs(&self) -> Option<&dyn crate::host::HostFs> {
         self.fs.as_deref()
+    }
+
+    /// 注入宿主作业表（`exec &` / `job *`）。
+    pub fn set_jobs(&mut self, jobs: Box<dyn crate::host::HostJobs>) {
+        self.jobs = Some(jobs);
+    }
+
+    /// 只读访问宿主作业表（未注入 → `None`）。
+    pub fn host_jobs(&self) -> Option<&dyn crate::host::HostJobs> {
+        self.jobs.as_deref()
     }
 
     /// 只读访问宿主 HTTP 服务。桥命令用：`request` 返回独立拥有的响应体，

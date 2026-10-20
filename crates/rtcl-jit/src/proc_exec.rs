@@ -86,11 +86,11 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
     CURRENT_MODULE_BYTES.with(|b| *b.borrow_mut() = module.bytes.clone());
     // 引擎分派（RTCL_JIT_ENGINE；默认 wasmi）。wasmtime 走 Cranelift
     // 池化路径（Engine 单例 + Module 缓存 + Store/Instance 池）。
+    #[cfg(feature = "jit-native")]
     if crate::exec::engine_from_env() == crate::exec::EngineKind::Wasmtime {
-        Some(execute_proc_wasmtime(interp, code, &module))
-    } else {
-        Some(execute_proc(interp, code, &module))
+        return Some(execute_proc_wasmtime(interp, code, &module));
     }
+    Some(execute_proc(interp, code, &module))
 }
 
 /// 实例化并执行 proc 体，映射 `run()` 返回码。
@@ -393,17 +393,21 @@ fn read_words(c: &mut Caller<'_, Host>, base: i32, n: i32) -> Vec<u64> {
 
 thread_local! {
     /// wasmtime Engine 单例（Cranelift 配置复用；Engine 构造贵）。
+    #[cfg(feature = "jit-native")]
     static WT_ENGINE: wasmtime::Engine = wasmtime::Engine::default();
     /// Cranelift Module 缓存（key 三元组同 wasmi 池）。
+    #[cfg(feature = "jit-native")]
     static WT_MODULES: std::cell::RefCell<
         std::collections::HashMap<(usize, usize, u64), wasmtime::Module>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
     /// wasmtime Store+Instance 池（key 三元组；上限 64）。
+    #[cfg(feature = "jit-native")]
     static WT_POOL: std::cell::RefCell<
         Vec<((usize, usize, u64), wasmtime::Store<Host>, wasmtime::Instance)>,
     > = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(feature = "jit-native")]
 fn execute_proc_wasmtime(
     interp: &mut Interp,
     bc: &Rc<ByteCode>,
@@ -493,16 +497,19 @@ fn execute_proc_wasmtime(
 
 thread_local! {
     /// wasmtime 路径的 Store 交接槽（单线程；池命中移交进作用域）。
+    #[cfg(feature = "jit-native")]
     static WT_TAKE: std::cell::RefCell<
         Option<(wasmtime::Store<Host>, wasmtime::Instance)>,
     > = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(feature = "jit-native")]
 fn store_engine() -> wasmtime::Engine {
     WT_ENGINE.with(|e| e.clone())
 }
 
 /// wasmtime 的 proc 语境 ABI 注册（call_argv 直连 + 全套宿主路由）。
+#[cfg(feature = "jit-native")]
 fn register_wasmtime_proc(
     store: &mut wasmtime::Store<Host>,
     epoch0: i64,
@@ -695,6 +702,7 @@ fn register_wasmtime_proc(
 }
 
 /// 从 wasmtime 实例 memory 读 n 个 u64（SCRATCH 协议；wasmi 版同款）。
+#[cfg(feature = "jit-native")]
 fn read_words_wt(c: &mut wasmtime::Caller<'_, Host>, base: i32, n: i32) -> Vec<u64> {
     let n_words = n.max(0) as usize;
     let mut bytes = vec![0u8; n_words * 8];

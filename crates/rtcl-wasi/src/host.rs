@@ -306,6 +306,45 @@ pub fn cmd_exec_pipeline_kill(_i: &mut Interp, args: &[Value]) -> TclResult<Valu
     )
 }
 
+/// `host::exec::pipeline.stop <id>` —— 请求协作式挂起。
+pub fn cmd_exec_pipeline_stop(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    if id.is_empty() {
+        return Err(terr("host::exec::pipeline.stop <id>"));
+    }
+    exec_call(
+        b"exec.pipeline.stop",
+        &[id.as_bytes()],
+        "host::exec::pipeline.stop",
+    )
+}
+
+/// `host::exec::pipeline.resume <id>`。
+pub fn cmd_exec_pipeline_resume(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    if id.is_empty() {
+        return Err(terr("host::exec::pipeline.resume <id>"));
+    }
+    exec_call(
+        b"exec.pipeline.resume",
+        &[id.as_bytes()],
+        "host::exec::pipeline.resume",
+    )
+}
+
+/// `host::exec::pipeline.state <id>` → running/stopping/stopped/killed。
+pub fn cmd_exec_pipeline_state(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    if id.is_empty() {
+        return Err(terr("host::exec::pipeline.state <id>"));
+    }
+    exec_call(
+        b"exec.pipeline.state",
+        &[id.as_bytes()],
+        "host::exec::pipeline.state",
+    )
+}
+
 /// `host::exec::run <prog> ?arg ...?` —— 经宿主 PATH 执行 wasm 命令。
 /// v0 聚合形态：stdin 为空；stdout 作为结果返回；`::host::exec::code` /
 /// `::host::exec::stderr` 存退出码与 stderr（文本，lossy）。
@@ -437,6 +476,9 @@ pub fn register(interp: &mut Interp) {
     interp.register_command("host::exec::pipeline.read", cmd_exec_pipeline_read);
     interp.register_command("host::exec::pipeline.wait", cmd_exec_pipeline_wait);
     interp.register_command("host::exec::pipeline.kill", cmd_exec_pipeline_kill);
+    interp.register_command("host::exec::pipeline.stop", cmd_exec_pipeline_stop);
+    interp.register_command("host::exec::pipeline.resume", cmd_exec_pipeline_resume);
+    interp.register_command("host::exec::pipeline.state", cmd_exec_pipeline_state);
     interp.register_command("host::exec::run", cmd_exec_run);
     interp.register_command("host::exec::open", cmd_exec_open);
     interp.register_command("host::exec::write", cmd_exec_write);

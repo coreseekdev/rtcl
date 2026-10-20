@@ -114,6 +114,27 @@ pub trait HostProcess: Send {
 - `HostExec::spawn` 返回 `Box<dyn HostProcess>`；不增加 capability 位。
 - 具体错误文本不作规范；Tcl 层按状态决定 `CHILDSTATUS` / `CHILDKILLED` / `CHILDStopped` 的呈现。
 
+### 作业表
+
+`exec &` 与 `job *` 通过宿主作业表访问；一个 entry 是 pipeline 的一组 stage：
+
+```rust
+pub struct JobInfo { pub id: JobId, pub command: String, pub state: JobState }
+
+pub trait HostJobs: Send {
+    fn add(&self, handles: Vec<Box<dyn HostProcess>>, command: String) -> JobId;
+    fn list(&self) -> Vec<JobInfo>;
+    fn stop(&self, id: JobId) -> Result<(), String>;
+    fn resume(&self, id: JobId) -> Result<(), String>;
+    fn kill(&self, id: JobId) -> Result<(), String>;
+    fn wait(&self, id: JobId) -> Result<Option<i32>, String>; // 非阻塞
+}
+```
+
+- 表必须**保留句柄**；drop 在 native 后端会杀掉仍在运行的 job。
+- group state：所有 stage 终态 → 最后 stage 的退出码；否则有 stopped/stopping 就显示对应状态，否则 running。
+- Tcl 的 `%N` 是用户层别名，落到 `JobId`（native 是内部作业号，不是 OS PID）。
+
 ## 4. 宿主 ABI（wasm / 浏览器）
 
 与 Rust trait 同义；沿用现有 `host.call` 帧格式（`[u32 nfields][u32 len + bytes]...`）。
@@ -173,6 +194,8 @@ job wait   ?job-id?
 - web：wterm/TS 行规程；job 使用 Worker + SAB ring；主线程拥有终端。
 - 前台 job 的 stdin 由宿主按行转发；后台 job 的 stdin 关闭（读得 EOF）。
 - 输出按宿主终端路由；有界背压：OS pipe 满 / SAB ring 满时 job 在写 import 阻塞。
+- **fd 继承边界**：HostFd 端点一律 `FD_CLOEXEC`；子进程只保留 spawn 时 `dup2` 的目标 fd。否则 runner 会继承自己管道的另一端（heredoc 写端会让 stdin 永远等不到 EOF）。
+- 父侧 HostFd 保持非阻塞接口；子进程 stdio 在 `dup2` 后清 `O_NONBLOCK`，runner 才能按阻塞语义做 stdin relay。
 - 不支持 termios/全屏 TUI（WASI p1 无 termios）；两边一致。
 - Ctrl-Z = stop 请求；Ctrl-C = cancel 请求（协作退出，超时 kill）；guest 不接收 OS 信号。
 

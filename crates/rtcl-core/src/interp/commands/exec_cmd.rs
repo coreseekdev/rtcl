@@ -4,11 +4,13 @@
 //! returns the collected standard output.
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::host::{BytesFd, ExecCommand, ExecIoError, FdMode, HostFd, HostFs, HostProcess, NullFd};
 use crate::interp::Interp;
 use crate::value::Value;
 
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 fn exec_err(msg: std::io::Error) -> Error {
     Error::runtime(msg.to_string(), ErrorCode::Io)
@@ -24,6 +26,12 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args_with_usage(
             "exec", 2, args.len(), "exec ?switches? arg ?arg ...?",
         ));
+    }
+
+    // Host-backed exec（rogo）：外部命令是 wasm，所有 I/O 走 fd 表。
+    // 没有注入 HostExec 的 rtcl-cli 仍走下面的原生 std 路径。
+    if interp.host_exec().is_some() {
+        return cmd_exec_host(interp, args);
     }
 
     // Parse switches
@@ -361,6 +369,343 @@ enum StderrRedirect {
     Truncate(String),
     Append(String),
     ToStdout,
+}
+
+/// Host-backed `exec`：每个 stage 构建完整 fd 表；阶段间用 pipe 的子进程侧
+/// 端点直连，最后一段的 stdout/stderr 由父进程侧端点捕获。
+///
+/// 0/1/2 只是 fd 号；重定向、管道、heredoc 全部走同一套 `HostFd`。
+fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let mut i = 1;
+    let mut ignore_stderr = false;
+    let mut keep_newline = false;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-ignorestderr" => {
+                ignore_stderr = true;
+                i += 1;
+            }
+            "-keepnewline" => {
+                keep_newline = true;
+                i += 1;
+            }
+            "--" => {
+                i += 1;
+                break;
+            }
+            s if s.starts_with('-') => {
+                return Err(exec_err_str(format!(
+                    "bad switch \"{s}\": must be -ignorestderr, -keepnewline, or --"
+                )));
+            }
+            _ => break,
+        }
+    }
+
+    let mut stages: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut merge_stderr_in_pipe = false;
+    let mut input_redirect: Option<InputRedirect> = None;
+    let mut output_redirect: Option<OutputRedirect> = None;
+    let mut stderr_redirect: Option<StderrRedirect> = None;
+    let mut background = false;
+
+    while i < args.len() {
+        let token = args[i].as_str();
+        match token {
+            "|" => {
+                if current.is_empty() {
+                    return Err(exec_err_str("illegal use of | or |& in command"));
+                }
+                stages.push(std::mem::take(&mut current));
+                i += 1;
+            }
+            "|&" => {
+                if current.is_empty() {
+                    return Err(exec_err_str("illegal use of | or |& in command"));
+                }
+                stages.push(std::mem::take(&mut current));
+                merge_stderr_in_pipe = true;
+                i += 1;
+            }
+            "<" => {
+                if i + 1 >= args.len() {
+                    return Err(exec_err_str("can't specify \"<\" as last word in command"));
+                }
+                input_redirect = Some(InputRedirect::File(args[i + 1].as_str().to_string()));
+                i += 2;
+            }
+            "<<" => {
+                if i + 1 >= args.len() {
+                    return Err(exec_err_str("can't specify \"<<\" as last word in command"));
+                }
+                input_redirect = Some(InputRedirect::String(args[i + 1].as_str().to_string()));
+                i += 2;
+            }
+            ">" => {
+                if i + 1 >= args.len() {
+                    return Err(exec_err_str("can't specify \">\" as last word in command"));
+                }
+                output_redirect = Some(OutputRedirect::Truncate(args[i + 1].as_str().to_string()));
+                i += 2;
+            }
+            ">>" => {
+                if i + 1 >= args.len() {
+                    return Err(exec_err_str("can't specify \">>\" as last word in command"));
+                }
+                output_redirect = Some(OutputRedirect::Append(args[i + 1].as_str().to_string()));
+                i += 2;
+            }
+            "2>" => {
+                if i + 1 >= args.len() {
+                    return Err(exec_err_str("can't specify \"2>\" as last word in command"));
+                }
+                stderr_redirect = Some(StderrRedirect::Truncate(args[i + 1].as_str().to_string()));
+                i += 2;
+            }
+            "2>>" => {
+                if i + 1 >= args.len() {
+                    return Err(exec_err_str("can't specify \"2>>\" as last word in command"));
+                }
+                stderr_redirect = Some(StderrRedirect::Append(args[i + 1].as_str().to_string()));
+                i += 2;
+            }
+            "2>@1" => {
+                stderr_redirect = Some(StderrRedirect::ToStdout);
+                i += 1;
+            }
+            ">&" | ">>&" => {
+                if i + 1 >= args.len() {
+                    return Err(exec_err_str(format!(
+                        "can't specify \"{token}\" as last word in command"
+                    )));
+                }
+                let path = args[i + 1].as_str().to_string();
+                if token == ">&" {
+                    output_redirect = Some(OutputRedirect::Truncate(path.clone()));
+                    stderr_redirect = Some(StderrRedirect::Truncate(path));
+                } else {
+                    output_redirect = Some(OutputRedirect::Append(path.clone()));
+                    stderr_redirect = Some(StderrRedirect::Append(path));
+                }
+                i += 2;
+            }
+            "&" if i + 1 == args.len() => {
+                background = true;
+                i += 1;
+            }
+            _ => {
+                current.push(token.to_string());
+                i += 1;
+            }
+        }
+    }
+    if !current.is_empty() {
+        stages.push(current);
+    }
+    if stages.is_empty() {
+        return Err(exec_err_str("no command given"));
+    }
+    if background {
+        return Err(exec_err_str(
+            "exec: background jobs are not wired to the job table yet",
+        ));
+    }
+
+    let host = interp
+        .host_exec()
+        .ok_or_else(|| exec_err_str("exec: host exec unavailable"))?;
+    let fs = interp.host_fs();
+    let n = stages.len();
+    let mut stage_in: Option<Box<dyn HostFd>> = None;
+    let mut handles: Vec<Box<dyn HostProcess>> = Vec::with_capacity(n);
+    let mut out_r: Option<Box<dyn HostFd>> = None;
+    let mut err_r: Option<Box<dyn HostFd>> = None;
+
+    for (idx, stage) in stages.iter().enumerate() {
+        let last = idx + 1 == n;
+        let mut fds: Vec<Option<Box<dyn HostFd>>> = vec![None, None, None];
+
+        // fd 0
+        if idx == 0 {
+            fds[0] = Some(match &input_redirect {
+                Some(InputRedirect::File(p)) => host_open(fs, p, FdMode::Read)?,
+                Some(InputRedirect::String(s)) => {
+                    Box::new(BytesFd::new(s.as_bytes().to_vec()))
+                }
+                None => Box::new(NullFd),
+            });
+        } else {
+            fds[0] = stage_in.take();
+        }
+
+        // fd 1 + link to next stage
+        let stdout_child: Option<Box<dyn HostFd>> = if last {
+            if let Some(r) = &output_redirect {
+                let mode = match r {
+                    OutputRedirect::Truncate(_) => FdMode::Write,
+                    OutputRedirect::Append(_) => FdMode::Append,
+                };
+                let path = match r {
+                    OutputRedirect::Truncate(p) | OutputRedirect::Append(p) => p,
+                };
+                Some(host_open(fs, path, mode)?)
+            } else {
+                let (r, w) = host.pipe().map_err(exec_err_str)?;
+                out_r = Some(r);
+                Some(w)
+            }
+        } else {
+            let (r, w) = host.pipe().map_err(exec_err_str)?;
+            stage_in = Some(r);
+            Some(w)
+        };
+
+        // `2>@1` 必须在 fd1 被移入表之前复制。
+        let stdout_dup = if last && matches!(stderr_redirect, Some(StderrRedirect::ToStdout)) {
+            stdout_child
+                .as_ref()
+                .map(|f| f.dup())
+                .transpose()
+                .map_err(exec_err_str)?
+        } else {
+            None
+        };
+        fds[1] = stdout_child;
+
+        // fd 2
+        if last {
+            fds[2] = match &stderr_redirect {
+                Some(StderrRedirect::Truncate(p)) => Some(host_open(fs, p, FdMode::Write)?),
+                Some(StderrRedirect::Append(p)) => Some(host_open(fs, p, FdMode::Append)?),
+                Some(StderrRedirect::ToStdout) => stdout_dup,
+                None if ignore_stderr => Some(Box::new(NullFd)),
+                None => {
+                    let (r, w) = host.pipe().map_err(exec_err_str)?;
+                    err_r = Some(r);
+                    Some(w)
+                }
+            };
+        } else if merge_stderr_in_pipe {
+            fds[2] = fds[1]
+                .as_ref()
+                .map(|f| f.dup())
+                .transpose()
+                .map_err(exec_err_str)?;
+        } else {
+            fds[2] = Some(Box::new(NullFd));
+        }
+
+        let cmd = ExecCommand {
+            prog: stage[0].clone(),
+            argv: stage.clone(),
+        };
+        let p = host.spawn(&cmd, fds, &[]).map_err(exec_err_str)?;
+        handles.push(p);
+    }
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut out_eof = out_r.is_none();
+    let mut err_eof = err_r.is_none();
+    let mut done = vec![false; handles.len()];
+    let mut any_error = false;
+    let mut exit_code = 0i32;
+
+    loop {
+        if let Some(f) = out_r.as_mut() {
+            if !out_eof {
+                out_eof = read_host_fd(f.as_mut(), &mut out)?;
+            }
+        }
+        if let Some(f) = err_r.as_mut() {
+            if !err_eof {
+                err_eof = read_host_fd(f.as_mut(), &mut err)?;
+            }
+        }
+        let mut all = true;
+        for (idx, p) in handles.iter_mut().enumerate() {
+            if done[idx] {
+                continue;
+            }
+            if let Some(code) = p.wait().map_err(exec_err_str)? {
+                done[idx] = true;
+                if code != 0 {
+                    any_error = true;
+                    exit_code = code;
+                }
+            } else {
+                all = false;
+            }
+        }
+        if all {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // 收尾排空管道剩余字节。
+    if let Some(f) = out_r.as_mut() {
+        while !out_eof {
+            out_eof = read_host_fd(f.as_mut(), &mut out)?;
+        }
+    }
+    if let Some(f) = err_r.as_mut() {
+        while !err_eof {
+            err_eof = read_host_fd(f.as_mut(), &mut err)?;
+        }
+    }
+
+    let mut stdout = String::from_utf8_lossy(&out).to_string();
+    if !keep_newline && stdout.ends_with('\n') {
+        stdout.pop();
+        if stdout.ends_with('\r') {
+            stdout.pop();
+        }
+    }
+    let stderr = String::from_utf8_lossy(&err).to_string();
+
+    if any_error {
+        let last_pid = handles.last().map(|p| p.id()).unwrap_or(0);
+        let error_code = format!("CHILDSTATUS {last_pid} {exit_code}");
+        let _ = interp.set_var("::errorCode", Value::from_str(&error_code));
+        interp.err_code_raised = true;
+        let mut msg = stderr.clone();
+        if msg.is_empty() {
+            msg = format!("child process exited abnormally (exit code {exit_code})");
+        }
+        if msg.ends_with('\n') {
+            msg.pop();
+        }
+        return Err(Error::runtime(
+            format!("{stdout}{msg}"),
+            ErrorCode::Generic,
+        ));
+    }
+
+    let _ = interp.set_var("::errorCode", Value::from_str("NONE"));
+    if !stderr.is_empty() && !ignore_stderr {
+        eprint!("{stderr}");
+    }
+    Ok(Value::from_str(&stdout))
+}
+
+fn host_open(fs: Option<&dyn HostFs>, path: &str, mode: FdMode) -> Result<Box<dyn HostFd>> {
+    let fs = fs.ok_or_else(|| exec_err_str("exec: host filesystem unavailable"))?;
+    fs.open(path, mode).map_err(exec_err_str)
+}
+
+fn read_host_fd(f: &mut dyn HostFd, out: &mut Vec<u8>) -> Result<bool> {
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => return Ok(true),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(ExecIoError::WouldBlock) => return Ok(false),
+            Err(ExecIoError::BrokenPipe) => return Ok(true),
+            Err(ExecIoError::Other(e)) => return Err(exec_err_str(e)),
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

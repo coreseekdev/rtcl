@@ -196,6 +196,11 @@ impl BytesFd {
     pub fn new(data: Vec<u8>) -> Self {
         Self { data, off: 0 }
     }
+
+    /// 原始字节（native runner 用管道把内存流接到子进程 fd）。
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 impl HostFd for BytesFd {

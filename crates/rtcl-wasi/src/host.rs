@@ -171,6 +171,29 @@ pub fn cmd_fs_remove(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
     call_unit("host::fs::remove <path>", &[b"fs.remove", path.as_bytes()])
 }
 
+/// `host::env::get <name>` —— 宿主环境变量（空 = 未设置）。
+pub fn cmd_env_get(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let name = arg(args, 1);
+    call_text("host::env::get <name>", &[b"env.get", name.as_bytes()])
+}
+
+/// `host::clock::now-ms` —— Unix 毫秒。
+pub fn cmd_clock_now_ms(_i: &mut Interp, _args: &[Value]) -> TclResult<Value> {
+    call_text("host::clock::now-ms", &[b"clock.now-ms"])
+}
+
+/// `host::fs::sha256 <path>` —— 小写十六进制。
+pub fn cmd_fs_sha256(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let path = arg(args, 1);
+    call_text("host::fs::sha256 <path>", &[b"fs.sha256", path.as_bytes()])
+}
+
+/// `host::yaml::load <path>` —— YAML 文件 → Tcl dict/list 字符串。
+pub fn cmd_yaml_load(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let path = arg(args, 1);
+    call_text("host::yaml::load <path>", &[b"yaml.load", path.as_bytes()])
+}
+
 /// `host::http::start <method> <url> <body> <opts> <headers_encoded>`
 /// （headers 编码：每行 `k\tv`；见 wasi 桥）。
 pub fn cmd_http_start(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
@@ -469,6 +492,10 @@ pub fn register(interp: &mut Interp) {
     interp.register_command("host::fs::exists", cmd_fs_exists);
     interp.register_command("host::fs::mkdir", cmd_fs_mkdir);
     interp.register_command("host::fs::remove", cmd_fs_remove);
+    interp.register_command("host::fs::sha256", cmd_fs_sha256);
+    interp.register_command("host::env::get", cmd_env_get);
+    interp.register_command("host::clock::now-ms", cmd_clock_now_ms);
+    interp.register_command("host::yaml::load", cmd_yaml_load);
     interp.register_command("host::http::start", cmd_http_start);
     interp.register_command("host::http::next", cmd_http_next);
     interp.register_command("host::http::body", cmd_http_body);

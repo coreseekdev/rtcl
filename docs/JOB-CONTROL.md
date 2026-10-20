@@ -194,7 +194,7 @@ job wait   ?job-id?
 - web：wterm/TS 行规程；job 使用 Worker + SAB ring；主线程拥有终端。
 - 前台 job 的 stdin 由宿主按行转发；后台 job 的 stdin 关闭（读得 EOF）。
 - 输出按宿主终端路由；有界背压：OS pipe 满 / SAB ring 满时 job 在写 import 阻塞。
-- **流式不变量**：pipe/ring 必须有界且边读边消费；宿主 pipeline 禁止把 stage 输出整体缓存后再转发。`< file` 由宿主流式读；stderr 只保留有界前缀（默认 64KiB），溢出直写终端。
+- **流式不变量**：pipe/ring 必须有界且边读边消费；宿主 pipeline 禁止把 stage 输出整体缓存后再转发。`< file` 由宿主流式读。stderr 是宿主流目标：默认阻塞写终端（背压），`2>@1` 并入 stdout 管道，`2>file` 流文件，`-ignorestderr` 丢弃；禁止全量内存收集。
 - **fd 继承边界**：HostFd 端点一律 `FD_CLOEXEC`；子进程只保留 spawn 时 `dup2` 的目标 fd。否则 runner 会继承自己管道的另一端（heredoc 写端会让 stdin 永远等不到 EOF）。
 - 父侧 HostFd 保持非阻塞接口；子进程 stdio 在 `dup2` 后清 `O_NONBLOCK`，runner 才能按阻塞语义做 stdin relay。
 - 前台 Ctrl-Z 仅在 stdin/stdout 都是 tty 时启用：rogo 捕获 `SIGTSTP`，runner 在**独立进程组**（不接收终端信号），随后进入受限 `job%` prompt（`fg/bg/jobs/kill/help`，不执行 Tcl）。`fg` 保留 Tcl 栈；`bg` 把句柄交给 HostJobs 并让 `exec` 返回 job id。

@@ -212,6 +212,16 @@ pub fn cmd_http_cancel(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
 /// `host::exec::pipeline <stage-list> <stdin>` —— 宿主按 stage 连接有界管道；
 /// 返回会话 id。stage-list = 每 stage 一个 Tcl 列表（首词 = 命令名）。
 pub fn cmd_exec_pipeline(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    pipeline_call(b"exec.pipeline", args)
+}
+
+/// 后台形态：宿主把最后 stdout / 全部 stderr 直接 drain 到自己的终端；
+/// guest 只拿 job id，用 job wait/kill 管理。
+pub fn cmd_exec_pipeline_bg(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    pipeline_call(b"exec.pipeline.bg", args)
+}
+
+fn pipeline_call(method: &[u8], args: &[Value]) -> TclResult<Value> {
     let stages = args
         .get(1)
         .and_then(|v| v.as_list())
@@ -221,7 +231,7 @@ pub fn cmd_exec_pipeline(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
     }
     let stdin = arg(args, 2);
     let mut owned: Vec<Vec<u8>> = vec![
-        b"exec.pipeline".to_vec(),
+        method.to_vec(),
         stdin.into_bytes(),
         stages.len().to_string().into_bytes(),
     ];
@@ -423,6 +433,7 @@ pub fn register(interp: &mut Interp) {
     interp.register_command("host::http::body", cmd_http_body);
     interp.register_command("host::http::cancel", cmd_http_cancel);
     interp.register_command("host::exec::pipeline", cmd_exec_pipeline);
+    interp.register_command("host::exec::pipeline.bg", cmd_exec_pipeline_bg);
     interp.register_command("host::exec::pipeline.read", cmd_exec_pipeline_read);
     interp.register_command("host::exec::pipeline.wait", cmd_exec_pipeline_wait);
     interp.register_command("host::exec::pipeline.kill", cmd_exec_pipeline_kill);

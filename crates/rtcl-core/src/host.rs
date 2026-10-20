@@ -125,7 +125,9 @@ pub enum ExecIoError {
 /// 进程没有 `stdin/stdout/stderr` 专用方法——0/1/2 只是 fd 约定。
 /// `HostFd` 同时覆盖管道、文件、内存流；WASI 的 `fd_read/fd_write/fd_close`
 /// 直接映射到这一层。
-pub trait HostFd: Send {
+pub trait HostFd: Send + 'static {
+    /// 原生宿主用它 downcast 到具体 fd（管道/文件）；抽象层不依赖 OS。
+    fn as_any(&self) -> &dyn std::any::Any;
     /// 0 = EOF。方向不符 → `Other`。
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, ExecIoError>;
     fn write(&mut self, buf: &[u8]) -> Result<usize, ExecIoError>;
@@ -164,6 +166,9 @@ impl ExecCommand {
 pub struct NullFd;
 
 impl HostFd for NullFd {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn read(&mut self, _buf: &mut [u8]) -> Result<usize, ExecIoError> {
         Ok(0)
     }
@@ -194,6 +199,9 @@ impl BytesFd {
 }
 
 impl HostFd for BytesFd {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, ExecIoError> {
         if self.off >= self.data.len() {
             return Ok(0);
@@ -521,6 +529,9 @@ mod job_state_tests {
     }
 
     impl HostFd for PipeEnd {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
         fn read(&mut self, buf: &mut [u8]) -> Result<usize, ExecIoError> {
             if self.writer {
                 return Err(ExecIoError::Other("write-only fd".into()));

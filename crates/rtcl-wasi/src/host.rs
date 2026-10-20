@@ -370,6 +370,50 @@ pub fn cmd_exec_pipeline_resume(_i: &mut Interp, args: &[Value]) -> TclResult<Va
     )
 }
 
+/// `host::exec::pipeline.foreground <id>` —— Ctrl-Z 只作用于该会话。
+pub fn cmd_exec_pipeline_foreground(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    if id.is_empty() {
+        return Err(terr("host::exec::pipeline.foreground <id>"));
+    }
+    exec_call(
+        b"exec.pipeline.foreground",
+        &[id.as_bytes()],
+        "host::exec::pipeline.foreground",
+    )
+}
+
+/// `host::exec::pipeline.clear-foreground`。
+pub fn cmd_exec_pipeline_clear_foreground(_i: &mut Interp, _args: &[Value]) -> TclResult<Value> {
+    exec_call(
+        b"exec.pipeline.clear-foreground",
+        &[],
+        "host::exec::pipeline.clear-foreground",
+    )
+}
+
+/// `host::exec::pipeline.detach <id>` —— 前台转后台，宿主继续 drain stdout。
+pub fn cmd_exec_pipeline_detach(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let id = arg(args, 1);
+    if id.is_empty() {
+        return Err(terr("host::exec::pipeline.detach <id>"));
+    }
+    exec_call(
+        b"exec.pipeline.detach",
+        &[id.as_bytes()],
+        "host::exec::pipeline.detach",
+    )
+}
+
+/// `host::term::readline <prompt>` —— 受限 job prompt 读一行。
+pub fn cmd_term_readline(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
+    let prompt = arg(args, 1);
+    call_text(
+        "host::term::readline <prompt>",
+        &[b"term.readline", prompt.as_bytes()],
+    )
+}
+
 /// `host::exec::pipeline.state <id>` → running/stopping/stopped/killed。
 pub fn cmd_exec_pipeline_state(_i: &mut Interp, args: &[Value]) -> TclResult<Value> {
     let id = arg(args, 1);
@@ -521,6 +565,13 @@ pub fn register(interp: &mut Interp) {
     interp.register_command("host::exec::pipeline.stop", cmd_exec_pipeline_stop);
     interp.register_command("host::exec::pipeline.resume", cmd_exec_pipeline_resume);
     interp.register_command("host::exec::pipeline.state", cmd_exec_pipeline_state);
+    interp.register_command("host::exec::pipeline.foreground", cmd_exec_pipeline_foreground);
+    interp.register_command(
+        "host::exec::pipeline.clear-foreground",
+        cmd_exec_pipeline_clear_foreground,
+    );
+    interp.register_command("host::exec::pipeline.detach", cmd_exec_pipeline_detach);
+    interp.register_command("host::term::readline", cmd_term_readline);
     interp.register_command("host::exec::run", cmd_exec_run);
     interp.register_command("host::exec::open", cmd_exec_open);
     interp.register_command("host::exec::write", cmd_exec_write);

@@ -20,6 +20,9 @@
 //! （新进程不变量：首次命令调用之前不可能存在 trace/upvar/链接——
 //! 首次 `rtcl.call` 时宿主清零 `caching` global，此后全部走宿主）。
 
+// 本文件 Host 持 *mut Interp（M2 seam 的所有权交换）；unsafe 收敛于 irp()。
+#![allow(unsafe_code)]
+
 use crate::abi::{self, code, BinOp};
 use crate::emit;
 use crate::ir::FailInfo;
@@ -42,21 +45,25 @@ pub enum Outcome {
 /// 宿主侧挂起错误：`from_eval` = 来自 `rtcl.call` 的 eval（解释器已
 /// 累积 errorInfo——case a）；否则快车道宿主原语错误（case b）。
 pub(crate) struct Pending {
-    err: Error,
+    pub(crate) err: Error,
     from_eval: bool,
 }
 
 pub(crate) struct Host {
-    pub(crate) interp: Interp,
+    /// 单线程作用域指针：Store 活着期间调用方的 `&mut Interp` 借用
+    /// 有效（钩子同步执行，返回后 Host 即弃）。
+    pub(crate) interp: *mut Interp,
     pub(crate) arena: Vec<Value>,
     pub(crate) consts: Vec<String>,
+    /// locals 名（slot 重写的伪常量槽——名字解析同 consts 公式延伸）。
+    pub(crate) local_names: Vec<String>,
     fails: Vec<FailInfo>,
     sites: Vec<rtcl_parser::SrcSpan>,
     lines: Vec<u32>,
     source: Rc<str>,
-    result: Option<Value>,
-    pending: Option<Pending>,
-    pending_exit: Option<i32>,
+    pub(crate) result: Option<Value>,
+    pub(crate) pending: Option<Pending>,
+    pub(crate) pending_exit: Option<i32>,
     /// case b 的驱动侧 errorInfo 累积器（机械复刻 err_harness_frame）。
     info: Option<String>,
     err_line: usize,
@@ -67,11 +74,30 @@ pub(crate) struct Host {
     pub(crate) foreaches: Vec<ForeachHost>,
     /// ByteCode 的 foreach 形状表（start/bind 目标用）。
     pub(crate) infos: Vec<rtcl_parser::bytecode::ForeachInfo>,
+    /// proc 语境（proc_exec 置位）：case-b 帧写入 interp 累积器
+    /// （经 rtcl-vm jit_err_* 公共入口）而非驱动侧字符串——
+    /// (procedure …) 边界帧依赖 interp 累积器。
+    pub(crate) proc_ctx: bool,
     /// 最近 rtcl.fail 的表索引（case-a 帧构建用）。
     pub(crate) last_fail: Option<u32>,
     /// 自首次任意宿主命令求值后置位——此后 var_traces/dead_flat 可能
     /// 非空（take_var_fast 的守卫集），LappendVar 等保守路径据此分支。
     pub(crate) commands_ran: bool,
+    /// 池复用时的 global 重置句柄（register 时存入）。
+    pub(crate) g_fuel_h: Option<wasmi::Global>,
+    pub(crate) g_epoch_h: Option<wasmi::Global>,
+    pub(crate) g_caching_h: Option<wasmi::Global>,
+}
+
+impl Host {
+    /// 指针解引用单点（安全性论证见字段 doc：单线程同步作用域）。
+    #[allow(clippy::mut_from_ref)]
+    fn irp(&self) -> &mut Interp {
+        #[allow(unsafe_code)]
+        unsafe {
+            &mut *self.interp
+        }
+    }
 }
 
 /// 一个活动 foreach/lmap 的宿主态。
@@ -91,7 +117,20 @@ impl Host {
             return Value::from_imm(abi::untag(tagged));
         }
         let idx = (tagged >> 1) as usize;
-        self.arena.get(idx).cloned().unwrap_or_else(Value::empty)
+        match self.arena.get(idx) {
+            Some(v) => {
+                let c = v.clone();
+                // UNSET（bits 0）不得出 arena——合法流里不会出现；出现
+                // 即驱动寄存器纪律被破坏（f012451：bitnot 慢路径拿到
+                // 未初始化寄存器）——按空值兜底防 SEGV（空指针 deref），
+                // 根因（写丢失的精确定位）见 findings 注释。
+                if c.is_unset() {
+                    return Value::empty();
+                }
+                c
+            }
+            None => Value::empty(),
+        }
     }
 
     fn tag_value(&mut self, v: &Value) -> i64 {
@@ -160,7 +199,12 @@ impl Host {
     /// unwind_subs 复刻（Sub → defer 最外层；Expr → append；
     /// Body/Next → 无）。
     fn unwind(&mut self, bodies: &[(crate::ir::BodyKind, u32)], e: &Error) {
-        for (kind, site) in bodies.iter().map(|(k, s)| (*k, *s)) {
+        // vm_exec unwind_subs 是 **LIFO**（st.bodies.pop()——栈顶先弹）：
+        // Sub 先于 BodyFramed（pending_top 随后被 BodyFramed 的
+        // harness_frame 清除——外层帧吞掉词括号的 defer）；FIFO 顺序会
+        // 反过来让 pending_top 存活到终局、exit_frame 行号取错源
+        // （fuzz f000200 簇：尾部多 puts 帧 + ("foreach" body) 行差 1）。
+        for (kind, site) in bodies.iter().rev().map(|(k, s)| (*k, *s)) {
             let text = self.site_text(site).to_string();
             let line = self.lines.get(site as usize).copied().unwrap_or(0) as usize;
             match kind {
@@ -190,7 +234,15 @@ impl Host {
         let Some(p) = self.pending.take() else { return 0 };
         let e = p.err;
         if p.from_eval {
-            // case a：解释器已按协议累积；只分类。pending 保留给终局报告。
+            // case a：解释器已按协议累积；先分类——控制流穿越
+            // （宿主 eval 里的 break/continue 冒出，PR#2 起 `if $c
+            // continue` 走 DynCall 的树遍历 cmd_if，不捕获控制流）必须
+            // 以 kind 返回，CallSite 的出口分派才能内跳；纯错误保留
+            // pending 给终局报告（帧已在 interp，驱动不补）。
+            let kind = classify_control(&e);
+            if kind != 0 {
+                return kind;
+            }
             self.pending = Some(Pending { err: e, from_eval: true });
             return 0;
         }
@@ -202,7 +254,7 @@ impl Host {
         // 哨兵取出作为基底（无累积器时 = 消息文本，两种情形同构）。
         {
             const SENT: &str = "\u{0}j";
-            let raw = self.interp.error_report(&e, SENT);
+            let raw = self.irp().error_report(&e, SENT);
             let tail = format!("\n    (file \"{}\" line ", SENT);
             let base = match raw.rfind(&tail) {
                 Some(i) => Some(raw[..i].to_string()),
@@ -214,6 +266,45 @@ impl Host {
             }
         }
         let fi = self.fails.get(fail_id as usize).cloned();
+        if self.proc_ctx {
+            // proc 语境：帧直写 interp 累积器（call_proc 的 (procedure …)
+            // 边界读它）；驱动侧字符串路径不适用。
+            if let Some(fi) = &fi {
+                let frameless = fi
+                    .bodies
+                    .last()
+                    .is_some_and(|(_, s)| *s == fi.site);
+                if fi.site != u32::MAX && !frameless {
+                    let text = self.site_text(fi.site).to_string();
+                    let line = self.lines.get(fi.site as usize).copied().unwrap_or(0) as usize;
+                    let msg = e.message_text();
+                    self.irp().jit_err_set_line(line);
+                    self.irp().jit_err_harness_frame(&msg, &text, line);
+                }
+                for (kind, site) in fi.bodies.iter().rev() {
+                    let text = self.site_text(*site).to_string();
+                    let line = self.lines.get(*site as usize).copied().unwrap_or(0) as usize;
+                    match kind {
+                        crate::ir::BodyKind::Sub => {
+                            self.irp().jit_err_set_pending(&text, line);
+                        }
+                        crate::ir::BodyKind::Expr => {
+                            let msg = e.message_text();
+                            self.irp().jit_err_harness_frame(&msg, &text, line);
+                        }
+                        crate::ir::BodyKind::BodyFramed(lmap) => {
+                            let tag = if *lmap { "\"lmap\" body" } else { "\"foreach\" body" };
+                            self.irp().jit_err_exit_frame(tag);
+                            let msg = e.message_text();
+                            self.irp().jit_err_harness_frame(&msg, &text, line);
+                        }
+                        crate::ir::BodyKind::Body | crate::ir::BodyKind::Next => {}
+                    }
+                }
+            }
+            self.pending = Some(Pending { err: e, from_eval: false });
+            return 0;
+        }
         if let Some(fi) = fi {
             let frameless = fi
                 .bodies
@@ -237,13 +328,22 @@ impl Host {
     /// + 文件帧（err_line 取最后一次 append 的行）。
     pub(crate) fn build_case_a_report(&mut self, fail_id: Option<u32>, e: &Error, file: &str) -> String {
         const SENT: &str = "\u{0}j";
-        let raw = self.interp.error_report(e, SENT);
+        let raw = self.irp().error_report(e, SENT);
         let tail = format!("\n    (file \"{}\" line ", SENT);
         let base = match raw.rfind(&tail) {
             Some(i) => raw[..i].to_string(),
             None => raw,
         };
-        self.info = if base.is_empty() { None } else { Some(base) };
+        // base == 裸消息（e.to_string()）⇒ interp 累积器为空（无任何
+        // 帧 append 过）——保持 info=None，让驱动补帧走 harness_frame
+        // 的**首帧**分支（"msg\n    while executing\n…"）；把裸消息
+        // 塞进 info 会让补帧走 append 分支丢帧头（fuzz f001026：
+        // `puts [expr {$n && $s}]` 的 expr 站点帧）。
+        self.info = if !base.is_empty() && base != e.to_string() {
+            Some(base)
+        } else {
+            None
+        };
         let mut pending_frame: Option<(String, usize)> = None;
         if let Some(fid) = fail_id {
             if let Some(fi) = self.fails.get(fid as usize).cloned() {
@@ -330,6 +430,24 @@ fn classify_control(e: &Error) -> i32 {
 
 /// expr 操作数的 canonical 引用（braced 优先，双引号转义兜底）。
 fn expr_quote(s: &str) -> String {
+    // 数值字面量裸写——expr 里 {} 是**字符串字面量**，数值操作数
+    // braced 会让算术报 "can't use non-numeric string"（fuzz f002484：
+    // Neg 慢路径的 -2^62 → bignum 宽化）。仅数值形态裸写（数字开头，
+    // 含 dec/hex/oct/bin/科学计数/小数）；标识符/布尔词裸写会踩 expr
+    // 的 bareword 门槛（"abc + 1" 报 invalid bareword 而非
+    // non-numeric——错误文本走样），维持 braced（字符串语义）。
+    let numeric = {
+        let body = s.strip_prefix(['+', '-']).unwrap_or(s);
+        !body.is_empty()
+            && body.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+            && body.chars().all(|c| {
+                c.is_ascii_hexdigit()
+                    || matches!(c, '.' | 'x' | 'X' | 'o' | 'O' | 'b' | 'B' | 'e' | 'E' | '+' | '-')
+            })
+    };
+    if numeric {
+        return s.to_string();
+    }
     let braced_ok = {
         let mut depth: i32 = 0;
         let mut ok = true;
@@ -370,11 +488,15 @@ fn expr_quote(s: &str) -> String {
     }
 }
 
-/// arena 预驻留：0=UNSET 1=哨兵保留 2=EMPTY 3..=常量池。
-fn arena_of(bc: &ByteCode) -> Vec<Value> {
+/// arena 预驻留：0=UNSET 1=哨兵保留 2=EMPTY 3..=常量池，随后 =
+/// locals 名（slot 重写的伪常量槽——alloc_locals 同公式）。
+pub(crate) fn arena_of(bc: &ByteCode) -> Vec<Value> {
     let mut arena = vec![Value::unset(), Value::unset(), Value::empty()];
     for c in bc.constants() {
         arena.push(Value::from_str(c));
+    }
+    for l in bc.locals() {
+        arena.push(Value::from_str(l));
     }
     arena
 }
@@ -382,11 +504,12 @@ fn arena_of(bc: &ByteCode) -> Vec<Value> {
 impl Host {
     // ── 构造与引擎协作 ──────────────────────────────────────────────
 
-    pub fn new(interp: Interp, arena: Vec<Value>, bc: &ByteCode, module: &emit::Module) -> Host {
+    pub fn new(interp: *mut Interp, arena: Vec<Value>, bc: &ByteCode, module: &emit::Module) -> Host {
         Host {
             interp,
             arena,
             consts: bc.constants().to_vec(),
+            local_names: bc.locals().to_vec(),
             fails: module.l2.fails.clone(),
             sites: bc.sites.iter().map(|s| s.text).collect(),
             lines: bc.sites.iter().map(|s| s.line).collect(),
@@ -409,12 +532,29 @@ impl Host {
                 v
             },
             last_fail: None,
+            proc_ctx: false,
             commands_ran: false,
+            g_fuel_h: None,
+            g_epoch_h: None,
+            g_caching_h: None,
         }
     }
 
     pub fn arena_len(&self) -> usize {
         self.arena.len()
+    }
+
+    /// 实例池复用前的状态复位（arena 已在 run 后截回水位线；fuel/
+    /// epoch/caching global 持续——语义一致）。
+    pub fn reset_for_reuse(&mut self) {
+        self.result = None;
+        self.pending = None;
+        self.pending_exit = None;
+        self.info = None;
+        self.pending_top = None;
+        self.last_fail = None;
+        self.foreaches.clear();
+        self.err_line = 0;
     }
 
     pub fn arena_truncate(&mut self, n: usize) {
@@ -426,7 +566,7 @@ impl Host {
     }
 
     pub fn interp_mut(&mut self) -> &mut Interp {
-        &mut self.interp
+        unsafe { &mut *self.interp }
     }
 
     pub fn set_pending(&mut self, err: Error, from_eval: bool) {
@@ -436,8 +576,8 @@ impl Host {
     // ── 宿主逻辑（引擎无关；各引擎的 import 包装只做参数搬运）──────
 
     pub fn binary_op_raw(&mut self, op: i32, a: i64, b: i64) -> i64 {
-        let r = self.do_binary_op(op, a, b);
-        r
+        
+        self.do_binary_op(op, a, b)
     }
 
     fn do_binary_op(&mut self, op: i32, a: i64, b: i64) -> i64 {
@@ -481,10 +621,10 @@ impl Host {
 
     pub fn get_var_raw(&mut self, name_h: i32) -> i64 {
         let name = self.const_name(name_h);
-        match self.interp.read_var(&name) {
+        match self.irp().read_var(&name) {
             Ok(v) => {
-                let t = self.tag_value(&v);
-                t
+                
+                self.tag_value(&v)
             }
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: false });
@@ -496,7 +636,7 @@ impl Host {
     pub fn set_var_raw(&mut self, name_h: i32, v: i64) -> i32 {
         let name = self.const_name(name_h);
         let val = self.value_of(v);
-        match self.interp.set_var(&name, val) {
+        match self.irp().set_var(&name, val) {
             Ok(_) => 0,
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: false });
@@ -507,7 +647,7 @@ impl Host {
 
     pub fn incr_var_raw(&mut self, name_h: i32, n: i64) -> i64 {
         let name = self.const_name(name_h);
-        match self.interp.incr_var(&name, abi::untag(n)) {
+        match self.irp().incr_var(&name, abi::untag(n)) {
             Ok(v) => self.tag_value(&v),
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: false });
@@ -523,10 +663,32 @@ impl Host {
         let text = self.site_text(site).to_string();
         let line = self.lines.get(site as usize).copied().unwrap_or(1).max(1) as usize;
         let script = format!("{}{}", "\n".repeat(line - 1), text);
-        match self.interp.eval(&script) {
+        match self.irp().eval(&script) {
             Ok(v) => self.tag_value(&v),
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: true });
+                abi::ERR_SENTINEL
+            }
+        }
+    }
+
+    /// 直连分派（M2 全案）：已求值实参 → charge_step → dispatch_values。
+    /// 错误 = case-b（from_eval=false）——驱动补站点帧；无宿主 eval 记账。
+    pub fn call_argv_raw(&mut self, words: &[u64], _site: i32) -> i64 {
+        let mut args: Vec<Value> = Vec::with_capacity(words.len());
+        for w in words {
+            args.push(self.value_of(*w as i64));
+        }
+        if let Err(e) = rtcl_vm::VmContext::charge_step(self.irp()) {
+            self.pending = Some(Pending { err: e, from_eval: false });
+            return abi::ERR_SENTINEL;
+        }
+        match self.irp().dispatch_values(&args) {
+            Ok(v) => self.tag_value(&v),
+            Err(e) => {
+                // case-b：帧由 wasm 侧哨兵 → rtcl.fail(fail_id) →
+                // take_fail 用 fail 表的 site 补（vm_exec exec_inner 同款）。
+                self.pending = Some(Pending { err: e, from_eval: false });
                 abi::ERR_SENTINEL
             }
         }
@@ -601,16 +763,18 @@ impl Host {
         let Some(fi) = self.infos.get(info).cloned() else {
             return abi::tag_imm(0);
         };
-        // vm_exec 弹组序 = 逆序；暂存区升序——逆读。
+        // vm_exec：逆序弹组后 lists.reverse() → 最终 lists[0]=组0。
+        // 暂存区升序（srcs = base..depth = 栈序）正读即同序——不再逆读
+        // （fuzz f002609：多组 foreach 组间错位）。
         let mut lists = Vec::with_capacity(words.len());
-        for w in words.iter().rev() {
+        for w in words.iter() {
             let v = self.value_of(*w as i64);
             match v.as_list_ref() {
                 Some(items) => lists.push(items.to_vec()),
                 None => match v.as_list_strict() {
                     Ok(items) => lists.push(items),
                     Err(e) => {
-                        let _ = self.interp.set_var("errorCode", Value::from_str(e.code));
+                        let _ = self.irp().set_var("errorCode", Value::from_str(e.code));
                         self.pending = Some(Pending {
                             err: Error::Msg(e.message),
                             from_eval: false,
@@ -657,10 +821,10 @@ impl Host {
                     .cloned()
                     .unwrap_or_else(|| empty.clone());
                 let name = self.consts.get(t.name_idx as usize).cloned().unwrap_or_default();
-                if let Err(e) = self.interp.set_var(&name, v) {
+                if let Err(e) = self.irp().set_var(&name, v) {
                     if is_real_error(&e) {
                         let _ = self
-                            .interp
+                            .irp()
                             .set_var("errorCode", Value::from_str("TCL WRITE VARNAME"));
                         if fi.framed {
                             let what = if fi.lmap { "lmap" } else { "foreach" };
@@ -716,13 +880,13 @@ impl Host {
     pub fn lappend_var_raw(&mut self, name_h: i32, v: i64) -> i64 {
         let name = self.const_name(name_h);
         let val = self.value_of(v);
-        if self.interp.var_exists(&name) {
-            match self.interp.get_var(&name) {
+        if self.irp().var_exists(&name) {
+            match self.irp().get_var(&name) {
                 Ok(cur) => match cur.as_list() {
                     Some(mut items) => {
                         items.push(val);
                         let nv = Value::from_list(&items);
-                        match self.interp.set_var(&name, nv.clone()) {
+                        match self.irp().set_var(&name, nv.clone()) {
                             Ok(_) => self.tag_value(&nv),
                             Err(e) => {
                                 self.pending = Some(Pending { err: e, from_eval: false });
@@ -740,7 +904,7 @@ impl Host {
                                 let mut items = items;
                                 items.push(val);
                                 let nv = Value::from_list(&items);
-                                match self.interp.set_var(&name, nv.clone()) {
+                                match self.irp().set_var(&name, nv.clone()) {
                                     Ok(_) => self.tag_value(&nv),
                                     Err(e) => {
                                         self.pending =
@@ -751,7 +915,7 @@ impl Host {
                             }
                             Err(e) => {
                                 let _ = self
-                                    .interp
+                                    .irp()
                                     .set_var("errorCode", Value::from_str(e.code));
                                 self.pending = Some(Pending {
                                     err: Error::Msg(e.message),
@@ -769,7 +933,7 @@ impl Host {
             }
         } else {
             let nv = Value::from_list(&[val]);
-            match self.interp.set_var(&name, nv.clone()) {
+            match self.irp().set_var(&name, nv.clone()) {
                 Ok(_) => self.tag_value(&nv),
                 Err(e) => {
                     self.pending = Some(Pending { err: e, from_eval: false });
@@ -785,7 +949,7 @@ impl Host {
         self.commands_ran = true;
         let val = self.value_of(v);
         let script = val.as_str().to_string();
-        match self.interp.eval(&script) {
+        match self.irp().eval(&script) {
             Ok(r) => self.tag_value(&r),
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: true });
@@ -797,7 +961,7 @@ impl Host {
     pub fn eval_expr_raw(&mut self, v: i64) -> i64 {
         let val = self.value_of(v);
         let expr = val.as_str().to_string();
-        match self.interp.eval_expr(&expr) {
+        match self.irp().eval_expr(&expr) {
             Ok(r) => self.tag_value(&r),
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: true });
@@ -811,10 +975,16 @@ impl Host {
     }
 
     fn const_name(&self, name_h: i32) -> String {
-        self.consts
-            [((name_h >> 1) as usize)
-                .saturating_sub(abi::CONST_ARENA_BASE as usize)]
-        .clone()
+        let idx = ((name_h >> 1) as usize).saturating_sub(abi::CONST_ARENA_BASE as usize);
+        if idx < self.consts.len() {
+            self.consts[idx].clone()
+        } else {
+            // 伪常量槽：locals 名（slot 重写——arena 预驻留同公式）。
+            self.local_names
+                .get(idx - self.consts.len())
+                .cloned()
+                .unwrap_or_default()
+        }
     }
 
     /// binary_op：宿主完整 Tcl 语义（§3）——`types::eval_expr` 原文路由。
@@ -833,7 +1003,10 @@ impl Host {
             x if x == BinOp::Div as i32 => format!("{sa} / {sb}"),
             x if x == BinOp::Mod as i32 => format!("{sa} % {sb}"),
             x if x == BinOp::Pow as i32 => format!("{sa} ** {sb}"),
-            x if x == BinOp::Neg as i32 => format!("-{sa}"),
+            // -(sa)：操作数可能是负数字面量（裸写）——"- -5" 形态的
+            // 拼接会破坏括号子表达式的字面量结构（f002484：NEG 慢路径
+            // 的 bignum 宽化 "--4611…" 非法词）。
+            x if x == BinOp::Neg as i32 => format!("-({sa})"),
             x if x == BinOp::Not as i32 => format!("!{sa}"),
             x if x == BinOp::BitNot as i32 => format!("~{sa}"),
             x if x == BinOp::BitAnd as i32 => format!("{sa} & {sb}"),
@@ -854,7 +1027,7 @@ impl Host {
             _ => return Err(Error::Msg("jit: bad binary_op".into())),
         };
         let _ = HARNESS_MAX;
-        self.interp.eval_expr(&expr)
+        self.irp().eval_expr(&expr)
     }
 
     /// strict_bool 复刻（expr_funcs::strict_bool 的公共 API 重实现：
@@ -940,6 +1113,24 @@ pub fn run_top_with(
     // 接受集/降级路径无需跟进修补（口径与替代方案见
     // docs/JIT-OPCODE-DELTA.md；将来做原生 lower 时删掉本展开即可）。
     let bc = Compiler::compile_unit(Rc::clone(&unit.source), &unit.commands).unfused();
+    // M3 入口失效 gate —— 与 rtcl-vm eval.rs 的 bytecode_cache gate
+    // 逐条对齐（!fallback 由 emit::compile 的拒绝路径等价承担）：
+    // 单元编译时代的 `epoch` != 解释器当前 tier1_epoch ⇒ Tier1 折叠
+    // 已被中途的命令注册/改名/删除（proc set、rename、宿主注册……）
+    // 作废，整单元回解释器（Fallback ⇒ interp.eval ⇒ 同一款 gate ⇒
+    // 树遍历）。vm_exec 的语义是仅单元入口检查（同单元内 bump 不
+    // 重 gate——e1/e2 探针口径），本 gate 同样只在该入口比较一次。
+    // 现场编译的单元 epoch 恒 0（ByteCode 默认；proc body 由
+    // compile_proc_body 盖章），故 bump 后本 gate 恒失败——与
+    // vm_exec 的「bump 后顶层 eval 全走树遍历」行为严格一致。
+    if bc.epoch != interp.tier1_epoch() {
+        return (interp, JitRun {
+            outcome: Outcome::Fallback,
+            driver_report: None,
+            eval_error: None,
+            result: None,
+        });
+    }
     let module = match emit::compile(&bc, &EmitConfig::default()) {
         Ok(m) => m,
         Err(_) => {
@@ -985,7 +1176,16 @@ fn execute(
     use wasmi::{Caller, Engine, Extern, Linker, Module, Store, TypedFunc};
 
     // arena 预驻留：0=UNSET 1=哨兵保留 2=EMPTY 3..=常量池。
-    let host = Host::new(interp, arena_of(bc), bc, module);
+    // M3：epoch global 以解释器当前代初始化（替换 M1' 的硬编码 0）。
+    // 运行中不刷新——vm_exec 的失效语义是仅单元入口检查（入口 gate
+    // 在 run_top_with），回边比对（EpochCheck{at_entry:false} →
+    // STALE）为 M4 的模块缓存/proc-body 钩子预留：届时按调用入口
+    // 拒绝陈旧模块即可，无需中断运行。
+    let epoch0 = interp.tier1_epoch() as i64;
+    // M2 seam：Host 持指针（单线程作用域借用）——Interp 本体留在本
+    // 栈帧，Store drop 后取回返回。
+    let mut interp_cell = interp;
+    let host = Host::new(&mut interp_cell as *mut Interp, arena_of(bc), bc, module);
     let watermark = host.arena_len();
 
     let engine = Engine::default();
@@ -1000,7 +1200,7 @@ fn execute(
     // caching=1 直到首次 rtcl.call）。句柄克隆进宿主闭包（wasm→宿主
     // 直写 global，§3「宿主充值」）。
     let g_fuel = wasmi::Global::new(&mut store, wasmi::Val::I64(0), wasmi::Mutability::Var);
-    let g_epoch = wasmi::Global::new(&mut store, wasmi::Val::I64(0), wasmi::Mutability::Var);
+    let g_epoch = wasmi::Global::new(&mut store, wasmi::Val::I64(epoch0), wasmi::Mutability::Var);
     let g_caching = wasmi::Global::new(&mut store, wasmi::Val::I32(1), wasmi::Mutability::Var);
     linker.define("rtcl", "fuel", Extern::Global(g_fuel)).unwrap();
     linker.define("rtcl", "epoch", Extern::Global(g_epoch)).unwrap();
@@ -1028,7 +1228,7 @@ fn execute(
             c.data_mut().box_float_raw(f)
         })
         .unwrap();
-    let g_caching_bin = g_caching.clone();
+    let g_caching_bin = g_caching;
     linker
         .func_wrap("rtcl", "binary_op", move |mut c: Caller<'_, Host>, op: i32, a: i64, b: i64| -> i64 {
             // 表达式可含 [cmd] 替换——缓存窗口关闭。
@@ -1113,7 +1313,7 @@ fn execute(
             c.data_mut().concat_raw(&words)
         })
         .unwrap();
-    let g_caching_fe = g_caching.clone();
+    let g_caching_fe = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -1125,7 +1325,7 @@ fn execute(
             },
         )
         .unwrap();
-    let g_caching_bind = g_caching.clone();
+    let g_caching_bind = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -1146,21 +1346,34 @@ fn execute(
             c.data_mut().foreach_end_raw()
         })
         .unwrap();
-    let g_caching_lap = g_caching.clone();
+    let g_caching_lap = g_caching;
     linker
         .func_wrap("rtcl", "lappend_var", move |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i64 {
             let _ = g_caching_lap.set(&mut c, wasmi::Val::I32(0));
             c.data_mut().lappend_var_raw(name_h, v)
         })
         .unwrap();
-    let g_caching_es = g_caching.clone();
+    let g_caching_cav = g_caching;
+    linker
+        .func_wrap(
+            "rtcl",
+            "call_argv",
+            move |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
+                // 命令可写任意变量——缓存窗口关闭（与 call 同纪律）。
+                let _ = g_caching_cav.set(&mut c, wasmi::Val::I32(0));
+                let words = read_words(&c, base, argc);
+                c.data_mut().call_argv_raw(&words, site)
+            },
+        )
+        .unwrap();
+    let g_caching_es = g_caching;
     linker
         .func_wrap("rtcl", "eval_script", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
             let _ = g_caching_es.set(&mut c, wasmi::Val::I32(0));
             c.data_mut().eval_script_raw(v)
         })
         .unwrap();
-    let g_caching_ee = g_caching.clone();
+    let g_caching_ee = g_caching;
     linker
         .func_wrap("rtcl", "eval_expr", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
             let _ = g_caching_ee.set(&mut c, wasmi::Val::I32(0));
@@ -1186,11 +1399,13 @@ fn execute(
 
     // arena 回收到水位线（§3 纪律）。
     store.data_mut().arena.truncate(watermark);
-    crate::exec::finish(store.into_data(), rc, file)
+    let host = store.into_data();
+    let run = crate::exec::finish(host, rc, file);
+    (interp_cell, run)
 }
 
 /// run() 返回后的共享终局：错误二分（case a/b）与报告构建。
-pub(crate) fn finish(mut host: Host, outcome_code: i32, file: &str) -> (Interp, JitRun) {
+pub(crate) fn finish(mut host: Host, outcome_code: i32, file: &str) -> JitRun {
     let pending_exit = host.pending_exit.take();
     let (driver_report, eval_error) = match outcome_code {
         code::ERROR => {
@@ -1235,15 +1450,10 @@ pub(crate) fn finish(mut host: Host, outcome_code: i32, file: &str) -> (Interp, 
         }
         _ => (None, None),
     };
-    let result = host.result.take();
-    let interp = host.interp;
-    (
-        interp,
-        JitRun {
-            outcome: Outcome::Completed { code: outcome_code, exit_code: pending_exit },
-            driver_report,
-            eval_error,
-            result,
-        },
-    )
+    JitRun {
+        outcome: Outcome::Completed { code: outcome_code, exit_code: pending_exit },
+        driver_report,
+        eval_error,
+        result: host.result.take(),
+    }
 }

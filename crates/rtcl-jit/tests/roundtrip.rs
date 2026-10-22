@@ -8,7 +8,6 @@
 use rtcl_core::Interp;
 use rtcl_jit::exec::{self, Outcome};
 use rtcl_parser::{Compiler, ScriptUnit};
-use std::rc::Rc;
 
 /// 编译断言：`script` 的单元是否被 JIT 接受。
 fn accepted(script: &str) -> bool {
@@ -81,6 +80,7 @@ fn acceptance_subset() {
         "set s {puts hi}\nputs a[eval $s]b",
         "while {1} {break}",
         "set cmd puts\n$cmd hello",
+        "set x [eval {puts 1}]",      // Call-in-Sub（call_argv 直连后允许）
         "puts [expr {min(2, 3)}]",    // mathfunc → EVAL_EXPR 宿主路由
     ] {
         assert!(accepted(src), "must accept: {src:?}");
@@ -89,7 +89,6 @@ fn acceptance_subset() {
     // 顶层 `eval {...}`/`string ...` 本身是 Call（接受）；拒绝的是这些
     // op 出现在单元内的形状（经实证 disassemble 校准）。
     for src in [
-        "set x [eval {puts 1}]",      // Call 嵌 Sub region（错误协议二分）
         "set a(1) 2\nputs $a($x)",   // 数组元素引用（下标替换语义）
     ] {
         assert!(!accepted(src), "must reject: {src:?}");
@@ -122,6 +121,49 @@ fn end_to_end_matches_interpreter() {
     ] {
         assert_same(src);
     }
+}
+
+#[test]
+fn tier1_bump_falls_back_to_interpreter() {
+    // M3 入口失效 gate：Tier1 bump（proc set 重定义）之后，含折叠 set
+    // 的顶层单元必须 Fallback，且终局行为与纯 interp.eval 逐字节一致
+    // （tclsh 语义：重定义的 set 不赋值 → can't read "x"）。
+    // 跨单元口径 = vm_exec eval.rs 的 bytecode gate（单元内中途 bump
+    // 不重 gate——e1/e2 探针口径，JIT 不比 vm_exec 严）。
+    let script = "set x 5\nputs $x";
+
+    // 纯解释器基线：bump 后 eval 走树遍历（set 被重定义 proc 拦截）。
+    let mut base = Interp::new();
+    base.eval("proc set {args} {return 99}").expect("bump eval");
+    let base_report = match base.eval(script) {
+        Ok(v) => (v.to_string(), 0),
+        Err(e) => (base.error_report(&e, "t.tcl"), 1),
+    };
+    assert!(
+        base_report.0.contains("can't read \"x\""),
+        "tree-walk baseline must shadow set: {base_report:?}"
+    );
+
+    // JIT 驱动：同一 Interp 上 bump 后 run_top_with ⇒ 必须 Fallback
+    // （bc.epoch(0) != tier1_epoch(1)），终局与基线一致。
+    let mut bumped = Interp::new();
+    bumped.eval("proc set {args} {return 99}").expect("bump eval");
+    assert_ne!(bumped.tier1_epoch(), 0, "bump must have fired");
+    let (mut interp, run) = exec::run_top_with(bumped, script, "t.tcl", exec::EngineKind::Wasmi);
+    match run.outcome {
+        Outcome::Fallback => {}
+        Outcome::Completed { code, .. } => {
+            panic!("stale unit must fall back, got completed code={code}")
+        }
+    }
+    let jit_report = match interp.eval(script) {
+        Ok(v) => (v.to_string(), 0),
+        Err(e) => (interp.error_report(&e, "t.tcl"), 1),
+    };
+    assert_eq!(base_report, jit_report, "fallback must match interpreter");
+
+    // 对照：无 bump 时同脚本被接受（gate 不误伤）。
+    assert!(accepted(script), "fresh-epoch unit must be accepted");
 }
 
 #[test]

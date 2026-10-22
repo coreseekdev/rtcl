@@ -26,7 +26,11 @@
 //! (wasmi in-process executor + `jitsh` binary).  wasip1 / embedded no_std
 //! never JIT.
 
-#![forbid(unsafe_code)]
+// M2 seam：proc-body 钩子拿 &mut Interp，而 wasmi/wasmtime 的 Store
+// 要求 Host 拥有其数据——Host 改持 *mut Interp（单线程同步执行期间
+// 调用方借用天然有效，钩子返回后指针即弃）。deny 允许模块级 allow
+// 收窄 unsafe 的范围（forbid 无法被覆盖）。
+#![deny(unsafe_code)]
 
 pub mod abi;
 pub mod check;
@@ -38,6 +42,9 @@ pub mod engine;
 
 #[cfg(feature = "jit-exec")]
 pub mod exec;
+
+#[cfg(feature = "jit-exec")]
+pub mod proc_exec;
 
 #[cfg(all(feature = "jit-exec", feature = "jit-native"))]
 pub mod exec_wasmtime;

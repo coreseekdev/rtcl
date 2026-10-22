@@ -145,6 +145,10 @@ pub struct L2 {
     pub writes: Vec<Option<u32>>,
     /// 值栈最大深度 = i64 寄存器个数。
     pub max_depth: u32,
+    /// 每 op 执行后的值栈深度（alloc_locals 的线性模拟产物；lower 的
+    /// ForeachEnd dst 定位等消费者用——重放需复刻 ForeachStart 的
+    /// ngroups 特判，查表免重复）。
+    pub depth_after: Vec<u32>,
     /// 变量缓存槽（按首次引用顺序）。
     pub vars: Vec<VarSlot>,
     /// 宿主失败点表（`rtcl.fail(fail_id)` 的 fail_id 下标）。
@@ -267,7 +271,7 @@ pub enum Instr {
     /// 变量/常量/宿主交互模板（展开含守卫与哨兵检查）。
     LoadVar { dst: Reg, var: u32, fail: u32 },
     StoreVar { src: Reg, var: u32, keep: bool, fail: u32 },
-    IncrVar { dst: Reg, var: u32, amount: i64, fail: u32 },
+    IncrVar { dst: Reg, var: u32, amount: i64, fail: u32, site: u32 },
     /// §4 快车道二元运算（guard: 双立即数；失败 → binary_op 兜底）。
     Arith { kind: BinOp, dst: Reg, a: Reg, b: Reg, fail: u32 },
     /// §4 比较免 untag：tagged word 上 i64 比较。
@@ -287,8 +291,11 @@ pub enum Instr {
         cmd_id: u16,
         argc: u16,
         fail: u32,
-        /// 站点索引（宿主 eval 路由用——静态正确，见 fail 表）。
+        /// 站点索引（宿主 eval 路由/错误帧用——静态正确，见 fail 表）。
         site: u32,
+        /// 实参寄存器（含命令名——dispatch_values 的 args[0] 语义）；
+        /// 直连路由写暂存区用。
+        srcs: Vec<Reg>,
         brk: Option<u32>,
         cont: Option<u32>,
         cont_back: bool,

@@ -78,6 +78,7 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
     types.ty().function(vec![I32], vec![I32, ValType::F64]); // UNBOX_FLOAT
     types.ty().function(vec![I32, I64], vec![I64]); // INCR_VAR
     types.ty().function(vec![I32], vec![]); // I32_VOID2 (exit)
+    // CALL type (i32,i32,i32)->i64 reused for call_argv — no new type needed
     types.ty().function(vec![I64], vec![I64]); // BOOL_TEST
     types.ty().function(vec![I32, I32], vec![I64]); // CONCAT_TY
     types.ty().function(vec![I32, I32, I32], vec![I64]); // FOREACH_START
@@ -115,6 +116,7 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
     imports.import("rtcl", "eval_script", EntityType::Function(ty::I64_TO_I64));
     imports.import("rtcl", "eval_expr", EntityType::Function(ty::I64_TO_I64));
     imports.import("rtcl", "lappend_var", EntityType::Function(ty::INCR_VAR));
+    imports.import("rtcl", "call_argv", EntityType::Function(ty::CALL));
 
     let mut funcs = FunctionSection::new();
     funcs.function(ty::RUN);
@@ -200,7 +202,7 @@ fn walk(n: &L3, f: &mut impl FnMut(&L3)) {
 fn emit_node(n: &L3, e: &Env, f: &mut Function) {
     match n {
         L3::Seq(items) => items.iter().for_each(|i| emit_node(i, e, f)),
-        L3::If { cond, then_, else_, j } => {
+        L3::If { cond, then_, else_, .. } => {
             f.instruction(&Instruction::LocalGet(e.b(cond.0)));
             f.instruction(&Instruction::If(BlockType::Empty));
             emit_node(then_, e, f);
@@ -221,7 +223,7 @@ fn emit_node(n: &L3, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::End);
         }
         L3::Br { depth, .. } => { f.instruction(&Instruction::Br(*depth)); }
-        L3::BrIf { depth, cond, when_zero, target, .. } => {
+        L3::BrIf { depth, cond, when_zero, .. } => {
             f.instruction(&Instruction::LocalGet(e.b(cond.0)));
             if *when_zero {
                 f.instruction(&Instruction::I32Eqz);
@@ -245,6 +247,17 @@ fn ld64(f: &mut Function, off: u32) {
     f.instruction(&Instruction::I32Const(0));
     f.instruction(&Instruction::I64Load(MemArg { offset: off as u64, align: 3, memory_index: 0 }));
 }
+/// 站点原文 eval 回退开关（启动读一次；CallProc 直连的逐 shape 对照）。
+pub fn site_eval_fallback() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FLAG: AtomicBool = AtomicBool::new(false);
+    static INIT: AtomicBool = AtomicBool::new(false);
+    if !INIT.swap(true, Ordering::Relaxed) {
+        FLAG.store(std::env::var_os("RTCL_JIT_SITE_EVAL").is_some(), Ordering::Relaxed);
+    }
+    FLAG.load(Ordering::Relaxed)
+}
+
 /// mem[off] = local.get(src)——store 需要 [addr, value] 栈序。
 fn st64_local(f: &mut Function, off: u32, src: u32) {
     f.instruction(&Instruction::I32Const(0));
@@ -413,7 +426,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::End);
             f.instruction(&Instruction::End); // done
         }
-        Instr::IncrVar { dst, var, amount, fail } => {
+        Instr::IncrVar { dst, var, amount, fail, site } => {
             let var = *var;
             let vals = cache::VALUES + var * 8;
             let state = cache::STATE + var;
@@ -441,21 +454,47 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             st8(f, state, 2);
             f.instruction(&Instruction::Br(1));
             f.instruction(&Instruction::End); // host:
-            f.instruction(&Instruction::I32Const(e.name_handle(var)));
-            f.instruction(&Instruction::I64Const(crate::abi::tag_imm(*amount)));
-            f.instruction(&Instruction::Call(import::INCR_VAR));
+            // 降级走站点原文 eval 路由（rtcl.call 全语义）：incr_var
+            // 公共入口的错误文本与 cmd_incr（tclsh 对齐面）不同
+            // （fuzz f004106："expected integer, got yes" vs
+            // "expected integer but got \"yes\""）。**先 flush**：
+            // 缓存里的旧值（如 "on"）必须写回 interp——否则 incr 在
+            // interp 上把不存在/过期的变量当 0 创建（f004881/f002484）。
+            emit_flush(e, f, *fail);
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::I32Const(*site as i32));
+            f.instruction(&Instruction::I32Const(0));
+            f.instruction(&Instruction::Call(import::CALL));
             f.instruction(&Instruction::LocalSet(dst.0));
             check_sentinel(e, f, dst.0, *fail);
             f.instruction(&Instruction::End); // done
         }
-        Instr::CallSite { dst, cmd_id, argc, fail, site, cont_back, brk_depth, cont_depth, .. } => {
+        Instr::CallSite { dst, cmd_id, argc, fail, site, srcs, cont_back, brk_depth, cont_depth, .. } => {
             emit_flush(e, f, *fail);
-            f.instruction(&Instruction::I32Const(*cmd_id as i32));
-            // argv_base_h 槽位在 M1' 传站点索引（宿主按站点原文 eval 路由；
-            // §3 的 argv 语义留给 M2 的参数直传）。
-            f.instruction(&Instruction::I32Const(*site as i32));
-            f.instruction(&Instruction::I32Const(*argc as i32));
-            f.instruction(&Instruction::Call(import::CALL));
+            // M2 全案直连：已求值实参寄存器写暂存区（SCRATCH 协议）→
+            // rtcl.call_argv(base, argc, site) 直传 dispatch_values，
+            // 免站点原文 eval 全链。RTCL_JIT_SITE_EVAL=1（启动读一次）
+            // 回退原路由（逐 shape 对照用）。
+            if site_eval_fallback() {
+                f.instruction(&Instruction::I32Const(*cmd_id as i32));
+                f.instruction(&Instruction::I32Const(*site as i32));
+                f.instruction(&Instruction::I32Const(*argc as i32));
+                f.instruction(&Instruction::Call(import::CALL));
+            } else {
+                for (i, r) in srcs.iter().enumerate() {
+                    f.instruction(&Instruction::I32Const(0));
+                    f.instruction(&Instruction::LocalGet(r.0));
+                    f.instruction(&Instruction::I64Store(MemArg {
+                        offset: (cache::SCRATCH + (i as u32) * 8) as u64,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                }
+                f.instruction(&Instruction::I32Const(cache::SCRATCH as i32));
+                f.instruction(&Instruction::I32Const(*argc as i32));
+                f.instruction(&Instruction::I32Const(*site as i32));
+                f.instruction(&Instruction::Call(import::CALL_ARGV));
+            }
             f.instruction(&Instruction::LocalSet(dst.0));
             // 哨兵 → rtcl.fail(id) 返回 kind：
             //   0=纯错误 → return TCL_ERROR；1=break(level1) → br 内层

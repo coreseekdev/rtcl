@@ -19,6 +19,23 @@ pub fn run(l1: &L1, code: &ByteCode) -> Result<(), Unsupported> {
     }
     // 数组元素引用（名字含 '('）：eval_var_ref 需做下标替换/解析，
     // read_var 公共入口不等价——编译拒绝（M2 经 LoadArrayElem 接管）。
+        // apply/locals_mode 单元 + FOREACH 系：lmap 在 lambda 体（参数非
+    // locals、循环变量经 lmap bind）的伪槽×bind 组合仍有缺陷
+    // （gen_lmap lmap-5.3..5.8：apply+多组 lmap 输出末元素）——
+    // 顶层多组 lmap 已修（单组+多组探针均对），locals_mode 单元收紧。
+    if code.locals_mode
+&& l1.ops.iter().any(|a| {
+    matches!(
+        a.op,
+        OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. }
+    )
+})
+    {
+return Err(Unsupported(
+    "foreach/lmap inside locals_mode unit (apply/lambda body)".into(),
+));
+    }
+
     for (pc, a) in l1.ops.iter().enumerate() {
         let name_idx = match &a.op {
             OpCode::LoadVar(i) | OpCode::StoreVar(i) | OpCode::StoreVarPop(i)
@@ -27,6 +44,14 @@ pub fn run(l1: &L1, code: &ByteCode) -> Result<(), Unsupported> {
         };
         if let Some(idx) = name_idx {
             if let Some(name) = code.get_const_wide(idx) {
+    // 数组元素引用：一律拒收。曾尝试放宽字面下标（退化为
+                // read_var(全名)），差分矩阵证伪：公共 read_var/set_var/
+                // incr_var 对「base 是数组/标量 × 字面下标」的四形状与
+                // vm_exec 的 eval_var_ref（split_array_ref 解析）语义
+                // 不等价（can't set/read "a": variable is/isn't array
+                // 的保护缺失，jit 侧静默错写）。修齐需 rtcl-vm 增加公共
+                // 数组感知入口（硬约束外）——回归记录见
+                // bench/scripts/jit_battery/b31/b32。
                 if name.contains('(') {
                     return Err(Unsupported(format!(
                         "array-element var ref {name:?} at pc {pc}"
@@ -66,10 +91,11 @@ pub fn run(l1: &L1, code: &ByteCode) -> Result<(), Unsupported> {
         classify(op).ok_or_else(|| Unsupported(op.to_string()))?;
         if matches!(op, OpCode::Call { .. } | OpCode::DynCall { .. })
             && bodies.last().is_some_and(|k| *k == 3 || *k == 4)
+            && crate::pass::assemble::site_eval_fallback()
         {
-            // bodies 编码: 1=Body 2=Next 3=Sub 4=Expr（Sub/Expr ≥3）。
+            // 临时实验放开（Phase 0 诊断期）：call_argv 直连下不拒。
             return Err(Unsupported(format!(
-                "DynCall/Call inside Sub/Expr region at pc {pc}"
+                "DynCall/Call inside Sub/Expr region at pc {pc} (SITE_EVAL)"
             )));
         }
         match op {

@@ -483,7 +483,11 @@ impl Interp {
     /// Dispatch an already-evaluated argument vector: procs, ensembles,
     /// builtins, expr functions, then unknown handlers.  This is the tail
     /// of [`eval_command`] shared with ensemble/unknown re-dispatch.
-    pub(crate) fn dispatch_values(&mut self, args: &[Value]) -> Result<Value> {
+    /// 以已求值实参直接分派一条命令（JIT CallProc 直连 / 嵌入式调用
+    /// 方用）。与内部调用点同一实现——完整解析链（procs/ensembles/
+    /// builtins/unknown）、无自身 harness 帧（调用方负责站点帧——
+    /// vm_exec exec_inner 同款职责）。
+    pub fn dispatch_values(&mut self, args: &[Value]) -> Result<Value> {
         if args.is_empty() {
             return Ok(Value::empty());
         }

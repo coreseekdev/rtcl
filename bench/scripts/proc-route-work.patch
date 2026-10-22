@@ -1,0 +1,372 @@
+diff --git a/crates/rtcl-jit/src/exec.rs b/crates/rtcl-jit/src/exec.rs
+index 4b75d8f..b10b4f1 100644
+--- a/crates/rtcl-jit/src/exec.rs
++++ b/crates/rtcl-jit/src/exec.rs
+@@ -55,6 +55,8 @@ pub(crate) struct Host {
+     pub(crate) interp: *mut Interp,
+     pub(crate) arena: Vec<Value>,
+     pub(crate) consts: Vec<String>,
++    /// locals 名（slot 重写的伪常量槽——名字解析同 consts 公式延伸）。
++    pub(crate) local_names: Vec<String>,
+     fails: Vec<FailInfo>,
+     sites: Vec<rtcl_parser::SrcSpan>,
+     lines: Vec<u32>,
+@@ -482,12 +484,16 @@ fn expr_quote(s: &str) -> String {
+     }
+ }
+ 
+-/// arena 预驻留：0=UNSET 1=哨兵保留 2=EMPTY 3..=常量池。
++/// arena 预驻留：0=UNSET 1=哨兵保留 2=EMPTY 3..=常量池，随后 =
++/// locals 名（slot 重写的伪常量槽——alloc_locals 同公式）。
+ pub(crate) fn arena_of(bc: &ByteCode) -> Vec<Value> {
+     let mut arena = vec![Value::unset(), Value::unset(), Value::empty()];
+     for c in bc.constants() {
+         arena.push(Value::from_str(c));
+     }
++    for l in bc.locals() {
++        arena.push(Value::from_str(l));
++    }
+     arena
+ }
+ 
+@@ -499,6 +505,7 @@ impl Host {
+             interp,
+             arena,
+             consts: bc.constants().to_vec(),
++            local_names: bc.locals().to_vec(),
+             fails: module.l2.fails.clone(),
+             sites: bc.sites.iter().map(|s| s.text).collect(),
+             lines: bc.sites.iter().map(|s| s.line).collect(),
+@@ -610,6 +617,7 @@ impl Host {
+         match self.irp().read_var(&name) {
+             Ok(v) => {
+                 let t = self.tag_value(&v);
++                eprintln!("[get] {name} -> {t} (str={:?})", v.as_str());
+                 t
+             }
+             Err(e) => {
+@@ -961,10 +969,16 @@ impl Host {
+     }
+ 
+     fn const_name(&self, name_h: i32) -> String {
+-        self.consts
+-            [((name_h >> 1) as usize)
+-                .saturating_sub(abi::CONST_ARENA_BASE as usize)]
+-        .clone()
++        let idx = ((name_h >> 1) as usize).saturating_sub(abi::CONST_ARENA_BASE as usize);
++        if idx < self.consts.len() {
++            self.consts[idx].clone()
++        } else {
++            // 伪常量槽：locals 名（slot 重写——arena 预驻留同公式）。
++            self.local_names
++                .get(idx - self.consts.len())
++                .cloned()
++                .unwrap_or_default()
++        }
+     }
+ 
+     /// binary_op：宿主完整 Tcl 语义（§3）——`types::eval_expr` 原文路由。
+@@ -1333,11 +1347,14 @@ fn execute(
+             c.data_mut().lappend_var_raw(name_h, v)
+         })
+         .unwrap();
++    let g_caching_cav = g_caching.clone();
+     linker
+         .func_wrap(
+             "rtcl",
+             "call_argv",
+-            |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
++            move |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
++                // 命令可写任意变量——缓存窗口关闭（与 call 同纪律）。
++                let _ = g_caching_cav.set(&mut c, wasmi::Val::I32(0));
+                 let words = read_words(&c, base, argc);
+                 c.data_mut().call_argv_raw(&words, site)
+             },
+diff --git a/crates/rtcl-jit/src/exec_wasmtime.rs b/crates/rtcl-jit/src/exec_wasmtime.rs
+index ce17fa6..45455bb 100644
+--- a/crates/rtcl-jit/src/exec_wasmtime.rs
++++ b/crates/rtcl-jit/src/exec_wasmtime.rs
+@@ -203,11 +203,13 @@ fn register_wasmtime_abi(
+         })
+         .unwrap();
+     let caching_es = g_caching.clone();
++    let caching_cav = g_caching.clone();
+     linker
+         .func_wrap(
+             "rtcl",
+             "call_argv",
+-            |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
++            move |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
++                let _ = caching_cav.set(&mut c, Val::I32(0));
+                 let words = read_words(&mut c, base, argc);
+                 c.data_mut().call_argv_raw(&words, site)
+             },
+diff --git a/crates/rtcl-jit/src/ir.rs b/crates/rtcl-jit/src/ir.rs
+index 886f78d..b8c8a87 100644
+--- a/crates/rtcl-jit/src/ir.rs
++++ b/crates/rtcl-jit/src/ir.rs
+@@ -145,6 +145,10 @@ pub struct L2 {
+     pub writes: Vec<Option<u32>>,
+     /// 值栈最大深度 = i64 寄存器个数。
+     pub max_depth: u32,
++    /// 每 op 执行后的值栈深度（alloc_locals 的线性模拟产物；lower 的
++    /// ForeachEnd dst 定位等消费者用——重放需复刻 ForeachStart 的
++    /// ngroups 特判，查表免重复）。
++    pub depth_after: Vec<u32>,
+     /// 变量缓存槽（按首次引用顺序）。
+     pub vars: Vec<VarSlot>,
+     /// 宿主失败点表（`rtcl.fail(fail_id)` 的 fail_id 下标）。
+diff --git a/crates/rtcl-jit/src/pass/alloc_locals.rs b/crates/rtcl-jit/src/pass/alloc_locals.rs
+index d166fbf..beaed25 100644
+--- a/crates/rtcl-jit/src/pass/alloc_locals.rs
++++ b/crates/rtcl-jit/src/pass/alloc_locals.rs
+@@ -27,6 +27,77 @@ fn body_kind(kind: u8) -> BodyKind {
+     }
+ }
+ 
++/// slot 系 op → 名键重写（proc 体 JIT 的关键开放）。须在 escape 之前
++/// 调用（escape 的拒绝名单不含 slot 系的模板出口）。
++pub fn rewrite_slots(l1: &mut L1, code: &ByteCode) {
++    // ── slot 系 op → 名键重写 ───────────────────────────────────────
++    // slot 系（LoadLocal/StoreLocal/IncrLocal/LappendLocal/AddSlotSlot/
++    // AddSlotImm/CmpSlotSlot/CmpSlotImm）此前 classify 通过但 lower 无
++    // 模板——静默无操作（proc_scope 的 counter incr c 丢失 → 0/1）。
++    // 语义等价：slot 名 = code.locals()[slot]（非退化帧下 slot 表与
++    // 名字路径别名同一存储——宿主 read_var/set_var/incr_var 路由）。
++    // 名字句柄 = 伪常量槽（consts.len()+slot，执行器 arena 预驻留
++    // 追加 locals 名——同公式）。融合超指令展开为规范窗口。
++    {
++        let base = code.constants().len() as u32;
++        let pseudo = |slot: u16| base + slot as u32;
++        let mut rewritten: Vec<OpCode> = Vec::with_capacity(l1.ops.len() * 2);
++        for l1op in l1.ops.drain(..) {
++            let op = l1op.op;
++            match op {
++                OpCode::LoadLocal(s) => rewritten.push(OpCode::LoadVar(pseudo(s) as u16)),
++                OpCode::StoreLocal(s) => rewritten.push(OpCode::StoreVar(pseudo(s) as u16)),
++                OpCode::IncrLocal(s, n) => rewritten.push(OpCode::IncrVar(pseudo(s) as u16, n)),
++                OpCode::LappendLocal(s) => rewritten.push(OpCode::LappendVar(pseudo(s) as u16)),
++                OpCode::AddSlotSlot(a, b) => {
++                    rewritten.push(OpCode::LoadVar(pseudo(a) as u16));
++                    rewritten.push(OpCode::LoadVar(pseudo(b) as u16));
++                    rewritten.push(OpCode::Add);
++                }
++                OpCode::AddSlotImm(a, k) => {
++                    rewritten.push(OpCode::LoadVar(pseudo(a) as u16));
++                    rewritten.push(OpCode::PushInt(k));
++                    rewritten.push(OpCode::Add);
++                }
++                OpCode::CmpSlotSlot(a, b, cc) => {
++                    rewritten.push(OpCode::LoadVar(pseudo(a) as u16));
++                    rewritten.push(OpCode::LoadVar(pseudo(b) as u16));
++                    rewritten.push(match cc {
++                        0 => OpCode::Lt,
++                        1 => OpCode::Gt,
++                        2 => OpCode::Le,
++                        3 => OpCode::Ge,
++                        4 => OpCode::Eq,
++                        _ => OpCode::Ne,
++                    });
++                }
++                OpCode::CmpSlotImm(a, k, cc) => {
++                    rewritten.push(OpCode::LoadVar(pseudo(a) as u16));
++                    rewritten.push(OpCode::PushInt(k));
++                    rewritten.push(match cc {
++                        0 => OpCode::Lt,
++                        1 => OpCode::Gt,
++                        2 => OpCode::Le,
++                        3 => OpCode::Ge,
++                        4 => OpCode::Eq,
++                        _ => OpCode::Ne,
++                    });
++                }
++                other => rewritten.push(other),
++            }
++            // lane 字段随 op 丢弃——重写后的规范窗口由 plan_guards 的
++            // guardable 集覆盖（annotate_lane 的 lane 信息对 slot 重写
++            // 产物不敏感：数值 op 语义同 M1' 路径）。
++        }
++        l1.ops = rewritten.into_iter().map(|op| crate::ir::L1Op {
++            op,
++            in_lanes: [crate::ir::Lane::Any, crate::ir::Lane::Any],
++            out_lane: crate::ir::Lane::Any,
++            guarded: false,
++        }).collect();
++    }
++}
++
+ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
+     let n = l1.ops.len();
+     let mut depth = 0u32;
+@@ -114,9 +185,19 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
+             if var_of_const.contains_key(&idx) {
+                 return Ok(());
+             }
+-            let name = code
+-                .get_const_wide(idx)
+-                .ok_or_else(|| Unsupported(format!("const {idx} missing")))?;
++            // 伪常量槽（>= consts.len()）：slot 重写产出的 locals 名，
++            // 执行器 arena 预驻留时按序追加（同一公式）。
++            let name = if (idx as usize) >= code.constants().len() {
++                let slot = idx - code.constants().len() as u32;
++                code.locals()
++                    .get(slot as usize)
++                    .cloned()
++                    .ok_or_else(|| Unsupported(format!("local {slot} missing")))?
++            } else {
++                code.get_const_wide(idx)
++                    .ok_or_else(|| Unsupported(format!("const {idx} missing")))?
++                    .to_string()
++            };
+             if vars.len() >= abi::cache::MAX_VARS {
+                 return Err(Unsupported(format!("> {} distinct vars", abi::cache::MAX_VARS)));
+             }
+@@ -342,6 +423,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
+         reads,
+         writes,
+         max_depth,
++        depth_after: after_at,
+         vars,
+         fails,
+         fail_of,
+diff --git a/crates/rtcl-jit/src/pass/escape.rs b/crates/rtcl-jit/src/pass/escape.rs
+index 1f4628c..485bfdd 100644
+--- a/crates/rtcl-jit/src/pass/escape.rs
++++ b/crates/rtcl-jit/src/pass/escape.rs
+@@ -74,10 +74,11 @@ pub fn run(l1: &L1, code: &ByteCode) -> Result<(), Unsupported> {
+         classify(op).ok_or_else(|| Unsupported(op.to_string()))?;
+         if matches!(op, OpCode::Call { .. } | OpCode::DynCall { .. })
+             && bodies.last().is_some_and(|k| *k == 3 || *k == 4)
++            && crate::pass::assemble::site_eval_fallback()
+         {
+-            // bodies 编码: 1=Body 2=Next 3=Sub 4=Expr（Sub/Expr ≥3）。
++            // 临时实验放开（Phase 0 诊断期）：call_argv 直连下不拒。
+             return Err(Unsupported(format!(
+-                "DynCall/Call inside Sub/Expr region at pc {pc}"
++                "DynCall/Call inside Sub/Expr region at pc {pc} (SITE_EVAL)"
+             )));
+         }
+         match op {
+diff --git a/crates/rtcl-jit/src/pass/lower.rs b/crates/rtcl-jit/src/pass/lower.rs
+index c45303d..27f3109 100644
+--- a/crates/rtcl-jit/src/pass/lower.rs
++++ b/crates/rtcl-jit/src/pass/lower.rs
+@@ -177,7 +177,8 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
+                     },
+                     // ForeachEnd（brk 出口与正常出口都在此汇合）。
+                     L3::Instr(Instr::ForeachEnd {
+-                        dst: Reg(depth_at_end(ctx, end)),
++                        // 槽号 = 深度-1（depth_after 是执行后的深度计数）。
++                        dst: Reg(depth_at_end(ctx, end).saturating_sub(1)),
+                     }),
+                 ]));
+                 pc = end + 1;
+@@ -374,14 +375,11 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
+     Ok(L3::Seq(items))
+ }
+ 
+-/// pc 处的值栈深度（线性重放；与 alloc_locals 的 depth_at 同式）。
++/// pc 处（含）执行后的值栈深度——查 alloc_locals 的模拟表（重放需
++/// 复刻 ForeachStart 的 ngroups 特判，查表免重复；lmap 列表 dst 曾因
++/// 重放高估 1 槽而错位——puts 读到残留的末次迭代值）。
+ fn depth_at_end(ctx: &Ctx, end: u32) -> u32 {
+-    let mut d = 0u32;
+-    for a in ctx.l2.ops.iter().take(end as usize + 1) {
+-        let (pops, pushes) = crate::pass::stack_effect(&a.op);
+-        d = d - pops.min(d) + pushes;
+-    }
+-    d
++    ctx.l2.depth_after[end as usize]
+ }
+ 
+ /// 循环体结构（for/foreach 共用）：cont 介于 header/brk 时 body 包
+diff --git a/crates/rtcl-jit/src/pass/mod.rs b/crates/rtcl-jit/src/pass/mod.rs
+index 87e4c8b..1bc4a89 100644
+--- a/crates/rtcl-jit/src/pass/mod.rs
++++ b/crates/rtcl-jit/src/pass/mod.rs
+@@ -103,7 +103,8 @@ pub fn stack_effect(op: &rtcl_ir::opcode::OpCode) -> (u32, u32) {
+ 
+ /// 全管线：L0 → L4 字节。层间校验默认开启。
+ pub fn run(code: &ByteCode, cfg: &EmitConfig) -> Result<(Vec<u8>, L2, L3), Unsupported> {
+-    let l1 = annotate_lane::run(code);
++    let mut l1 = annotate_lane::run(code);
++    alloc_locals::rewrite_slots(&mut l1, code);
+     escape::run(&l1, code)?;
+     let l1 = plan_guards::run(l1);
+     check::check_l1(&l1).map_err(|e| Unsupported(e.to_string()))?;
+diff --git a/crates/rtcl-jit/src/proc_exec.rs b/crates/rtcl-jit/src/proc_exec.rs
+index 8e92d6c..d51737c 100644
+--- a/crates/rtcl-jit/src/proc_exec.rs
++++ b/crates/rtcl-jit/src/proc_exec.rs
+@@ -109,7 +109,11 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
+ 
+     // 池命中：reset Host 状态 + 复用 Store/Instance（免 instantiate——
+     // vm_exec 有 VmPool 复用而 JIT 每次重建是 .47× 的剩余大头）。
++    // ⚠️ 池化交互 bug（2026-10-20）：同 Store 第二次 run 提前 OK 退出
++    // （defarg 双调用第二返回值丢失）judge 6 文件回归——**默认禁用**
++    // （RTCL_JIT_PROC_POOL=1 调试启用），正确性优先。
+     let mut reused = false;
++    if std::env::var_os("RTCL_JIT_PROC_POOL").is_some() {
+     WASMI_POOL.with(|p| {
+         let mut p = p.borrow_mut();
+         if let Some(pos) = p.iter().position(|(k, ..)| *k == pool_key) {
+@@ -121,6 +125,7 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
+             reused = true;
+         }
+     });
++    }
+     let (mut store, instance) = if reused {
+         POOL_TAKE.with(|t| t.borrow_mut().take().expect("pool take"))
+     } else {
+@@ -152,13 +157,17 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
+     let result = store.data_mut().result.take();
+     let pending_exit = store.data_mut().pending_exit.take();
+     let pending = store.data_mut().pending.take();
+-    WASMI_POOL.with(|p| {
+-        let mut p = p.borrow_mut();
+-        if p.len() >= 64 {
+-            p.clear();
+-        }
+-        p.push((pool_key, store, instance));
+-    });
++    if std::env::var_os("RTCL_JIT_PROC_POOL").is_some() {
++        WASMI_POOL.with(|p| {
++            let mut p = p.borrow_mut();
++            if p.len() >= 64 {
++                p.clear();
++            }
++            p.push((pool_key, store, instance));
++        });
++    } else {
++        drop(store);
++    }
+ 
+     match rc {
+         code::OK => Ok(result.unwrap_or_else(Value::empty)),
+@@ -257,11 +266,13 @@ fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64) -> wasm
+             },
+         )
+         .unwrap();
++    let caching_cav = g_caching.clone();
+     linker
+         .func_wrap(
+             "rtcl",
+             "call_argv",
+-            |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
++            move |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
++                let _ = caching_cav.set(&mut c, wasmi::Val::I32(0));
+                 let words = read_words(&mut c, base, argc);
+                 c.data_mut().call_argv_raw(&words, site)
+             },
+diff --git a/crates/rtcl-jit/tests/golden.rs b/crates/rtcl-jit/tests/golden.rs
+index d825618..38cda0a 100644
+--- a/crates/rtcl-jit/tests/golden.rs
++++ b/crates/rtcl-jit/tests/golden.rs
+@@ -122,6 +122,7 @@ fn cpcheck_rejects_malformed() {
+         reads: vec![],
+         writes: vec![Some(9)],
+         max_depth: 2,
++        depth_after: vec![],
+         vars: vec![],
+         fails: vec![],
+         fail_of: vec![],

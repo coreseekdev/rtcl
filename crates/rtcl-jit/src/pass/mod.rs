@@ -103,7 +103,8 @@ pub fn stack_effect(op: &rtcl_ir::opcode::OpCode) -> (u32, u32) {
 
 /// 全管线：L0 → L4 字节。层间校验默认开启。
 pub fn run(code: &ByteCode, cfg: &EmitConfig) -> Result<(Vec<u8>, L2, L3), Unsupported> {
-    let l1 = annotate_lane::run(code);
+    let mut l1 = annotate_lane::run(code);
+    alloc_locals::rewrite_slots(&mut l1, code);
     escape::run(&l1, code)?;
     let l1 = plan_guards::run(l1);
     check::check_l1(&l1).map_err(|e| Unsupported(e.to_string()))?;

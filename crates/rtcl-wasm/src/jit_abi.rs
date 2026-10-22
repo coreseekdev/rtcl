@@ -19,6 +19,14 @@
 //!   new WebAssembly.Module(bytes),
 //!   { rtcl: { ...globals, ...(direct_or_tramp) } });
 //! ```
+//! TODO(M2 wasm 侧): proc-body 钩子（rtcl_jit::proc_exec::install）评估
+//! 结论（2026-10-19 合并任务阶段 5，time-boxed）：**暂不接线**。*mut
+//! Interp 的安全性论证（单线程同步作用域内调用方借用有效）在 native
+//! 侧成立，但 wasm32 的 RtclHandle 经 wasm-bindgen 暴露——JS 可在钩子
+//! 执行期间重入任意 &mut RtclHandle 方法（JS 回调命令 `_js_dispatch`），
+//! 别名 &mut 的前提被破坏；需要先给执行器加「宿主回调重入哨兵」（如
+//! Host 持标志位 + js_command 入口检查）才能安全接线。工作量独立
+//! （半个任务包），不影响 native 侧 judge/bench 路径。
 //! 导出函数操作「当前 JIT 会话」（`rtcl_jit_session_begin/end` 括起，
 //! 单线程、作用域内有效）；`jit_compile`（feature `jit`）提供纯发射。
 

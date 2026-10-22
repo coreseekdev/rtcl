@@ -25,7 +25,7 @@ mod varmap;
 pub(crate) use util::{split_array_ref, glob_match};
 pub(crate) use varmap::{VarMap, VarSet};
 
-pub use vm_exec::set_bytecode_disabled;
+pub use vm_exec::{set_bytecode_disabled, set_proc_body_executor, ProcBodyExecutor};
 
 use crate::command::{CommandFunc, CommandCategory, CommandMeta};
 use crate::value::Value;
@@ -984,6 +984,42 @@ impl Interp {
     /// 当前步数预算（None = 不限）。
     pub fn max_steps(&self) -> Option<u64> {
         self.max_steps
+    }
+
+    /// Tier1 折叠代（只读）。Tier1 命令（`set`/`if`/`while`/…，PR#2 起
+    /// 含 `lappend` 与宿主注册命令）被编译单元内联折叠，任何同名命令
+    /// 的注册/改名/删除都会 bump 此计数；编译单元记录其编译时代的
+    /// `epoch`，消费方（字节码 VM 的单元入口门、JIT 驱动的执行入口门）
+    /// 比对两者判定折叠是否仍有效——不等则退回动态解析路径
+    /// （namespace-41.1）。仅供嵌入式宿主/JIT 失效检查读取；bump 只
+    /// 发生在解释器内部的注册/改名路径上，无 setter。
+    pub fn tier1_epoch(&self) -> u64 {
+        self.tier1_epoch
+    }
+
+    /// JIT/嵌入式执行器的错误帧写入口（case-b：宿主原语错误不在嵌套
+    /// eval 内发生，帧须由外部执行器按 vm_exec exec_inner 的形状补进
+    /// 本累积器——proc 语境的 (procedure …) 边界帧依赖它）。与内部
+    /// err_harness_frame/err_exit_frame/pending_top/err_line 同实现，
+    /// 语义以 judge 差分为准。
+    pub fn jit_err_harness_frame(&mut self, msg: &str, text: &str, line: usize) {
+        self.err_harness_frame(msg, text, line);
+    }
+
+    /// 同上：`(tag line N)` 构造出口帧。
+    pub fn jit_err_exit_frame(&mut self, tag: &str) {
+        self.err_exit_frame(tag);
+    }
+
+    /// 同上：词括号 defer（pending 帧 + 行号）。
+    pub fn jit_err_set_pending(&mut self, text: &str, line: usize) {
+        self.err_pending_top = Some(Rc::from(text));
+        self.err_line = line;
+    }
+
+    /// 同上：行号直设（exit_frame 前置读取的口径）。
+    pub fn jit_err_set_line(&mut self, line: usize) {
+        self.err_line = line;
     }
 
     /// 每条命令分派计一步；超限抛错。解释器（`eval_command`）与 VM

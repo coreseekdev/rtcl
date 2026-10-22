@@ -27,6 +27,77 @@ fn body_kind(kind: u8) -> BodyKind {
     }
 }
 
+/// slot 系 op → 名键重写（proc 体 JIT 的关键开放）。须在 escape 之前
+/// 调用（escape 的拒绝名单不含 slot 系的模板出口）。
+pub fn rewrite_slots(l1: &mut L1, code: &ByteCode) {
+    // ── slot 系 op → 名键重写 ───────────────────────────────────────
+    // slot 系（LoadLocal/StoreLocal/IncrLocal/LappendLocal/AddSlotSlot/
+    // AddSlotImm/CmpSlotSlot/CmpSlotImm）此前 classify 通过但 lower 无
+    // 模板——静默无操作（proc_scope 的 counter incr c 丢失 → 0/1）。
+    // 语义等价：slot 名 = code.locals()[slot]（非退化帧下 slot 表与
+    // 名字路径别名同一存储——宿主 read_var/set_var/incr_var 路由）。
+    // 名字句柄 = 伪常量槽（consts.len()+slot，执行器 arena 预驻留
+    // 追加 locals 名——同公式）。融合超指令展开为规范窗口。
+    {
+        let base = code.constants().len() as u32;
+        let pseudo = |slot: u16| base + slot as u32;
+        let mut rewritten: Vec<OpCode> = Vec::with_capacity(l1.ops.len() * 2);
+        for l1op in l1.ops.drain(..) {
+            let op = l1op.op;
+            match op {
+                OpCode::LoadLocal(s) => rewritten.push(OpCode::LoadVar(pseudo(s) as u16)),
+                OpCode::StoreLocal(s) => rewritten.push(OpCode::StoreVar(pseudo(s) as u16)),
+                OpCode::IncrLocal(s, n) => rewritten.push(OpCode::IncrVar(pseudo(s) as u16, n)),
+                OpCode::LappendLocal(s) => rewritten.push(OpCode::LappendVar(pseudo(s) as u16)),
+                OpCode::AddSlotSlot(a, b) => {
+                    rewritten.push(OpCode::LoadVar(pseudo(a) as u16));
+                    rewritten.push(OpCode::LoadVar(pseudo(b) as u16));
+                    rewritten.push(OpCode::Add);
+                }
+                OpCode::AddSlotImm(a, k) => {
+                    rewritten.push(OpCode::LoadVar(pseudo(a) as u16));
+                    rewritten.push(OpCode::PushInt(k));
+                    rewritten.push(OpCode::Add);
+                }
+                OpCode::CmpSlotSlot(a, b, cc) => {
+                    rewritten.push(OpCode::LoadVar(pseudo(a) as u16));
+                    rewritten.push(OpCode::LoadVar(pseudo(b) as u16));
+                    rewritten.push(match cc {
+                        0 => OpCode::Lt,
+                        1 => OpCode::Gt,
+                        2 => OpCode::Le,
+                        3 => OpCode::Ge,
+                        4 => OpCode::Eq,
+                        _ => OpCode::Ne,
+                    });
+                }
+                OpCode::CmpSlotImm(a, k, cc) => {
+                    rewritten.push(OpCode::LoadVar(pseudo(a) as u16));
+                    rewritten.push(OpCode::PushInt(k));
+                    rewritten.push(match cc {
+                        0 => OpCode::Lt,
+                        1 => OpCode::Gt,
+                        2 => OpCode::Le,
+                        3 => OpCode::Ge,
+                        4 => OpCode::Eq,
+                        _ => OpCode::Ne,
+                    });
+                }
+                other => rewritten.push(other),
+            }
+            // lane 字段随 op 丢弃——重写后的规范窗口由 plan_guards 的
+            // guardable 集覆盖（annotate_lane 的 lane 信息对 slot 重写
+            // 产物不敏感：数值 op 语义同 M1' 路径）。
+        }
+        l1.ops = rewritten.into_iter().map(|op| crate::ir::L1Op {
+            op,
+            in_lanes: [crate::ir::Lane::Any, crate::ir::Lane::Any],
+            out_lane: crate::ir::Lane::Any,
+            guarded: false,
+        }).collect();
+    }
+}
+
 pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
     let n = l1.ops.len();
     let mut depth = 0u32;
@@ -100,7 +171,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             _ if pops == 0 && pushes == 1 => (vec![], Some(depth)),
             // break/continue 之后的死代码：线性深度下溢——读集置空
             //（op 不可达，寄存器引用无意义）。
-            _ if pops as u32 > depth => (vec![], None),
+            _ if pops > depth => (vec![], None),
             _ if pops == 2 && pushes == 1 => (vec![depth - 2, depth - 1], Some(depth - 2)),
             _ if pops == 1 && pushes == 0 => (vec![depth - 1], None),
             _ => (vec![], None),
@@ -114,9 +185,19 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             if var_of_const.contains_key(&idx) {
                 return Ok(());
             }
-            let name = code
-                .get_const_wide(idx)
-                .ok_or_else(|| Unsupported(format!("const {idx} missing")))?;
+            // 伪常量槽（>= consts.len()）：slot 重写产出的 locals 名，
+            // 执行器 arena 预驻留时按序追加（同一公式）。
+            let name = if (idx as usize) >= code.constants().len() {
+                let slot = idx - code.constants().len() as u32;
+                code.locals()
+                    .get(slot as usize)
+                    .cloned()
+                    .ok_or_else(|| Unsupported(format!("local {slot} missing")))?
+            } else {
+                code.get_const_wide(idx)
+                    .ok_or_else(|| Unsupported(format!("const {idx} missing")))?
+                    .to_string()
+            };
             if vars.len() >= abi::cache::MAX_VARS {
                 return Err(Unsupported(format!("> {} distinct vars", abi::cache::MAX_VARS)));
             }
@@ -255,6 +336,18 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
                 foreaches.push((*info, lmap));
                 loops.push((*next, *end, bodies.len(), cur_site));
             }
+            // FOREACH_NEXT：vm_exec 的 op_foreach_next(_close) 回跳循环
+            // 头时 bodies 截断到循环入口（LoopFrame.bodies_len）——PR#2
+            // 起 FOREACH_NEXT_CLOSE 吸收了体闭合 JUMP，unfused 展开为
+            // NOP，BodyFramed 的 region 失去弹出点；此处按同一语义
+            // 截断（body 首经时 push 的条目已写入 fail 表，不受影响）。
+            OpCode::ForeachNext { .. } => {
+                if let Some(l) = loops.last() {
+                    let (_, _, blen, owner) = *l;
+                    bodies.truncate(blen);
+                    cur_site = owner;
+                }
+            }
             OpCode::ForeachEnd => {
                 foreaches.pop();
                 loops.pop();
@@ -330,6 +423,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
         reads,
         writes,
         max_depth,
+        depth_after: after_at,
         vars,
         fails,
         fail_of,

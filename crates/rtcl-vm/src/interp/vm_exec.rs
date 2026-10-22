@@ -464,6 +464,12 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
         // SAFETY: the check above proves `st.pc` in-bounds.
         let op = unsafe { ops.get_unchecked(st.pc) };
         st.pc += 1;
+        // M3 OPEN: mid-unit Tier1 redefinition (e1-e3 probes). Re-dispatch
+        // via eval(remaining) fixes simple cases (e1: 6→5, e2: error shape,
+        // e3: error shape) but regresses namespace probes (ens/ens2: eval
+        // doesn't preserve namespace/lexical context — byte diffs).
+        // Proper fix needs namespace-aware re-dispatch (or per-cmd
+        // epoch check via a host fn). Recorded for future task.
         // ── Hot lane ────────────────────────────────────────────────────
         // The ops a compiled loop body is made of run inline: the
         // `exec_op` call + its second dispatch was the exec-side profile's

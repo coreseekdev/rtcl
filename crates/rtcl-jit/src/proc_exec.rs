@@ -36,14 +36,14 @@ thread_local! {
     static PROC_MODULES: std::cell::RefCell<
         std::collections::HashMap<(usize, u64), Rc<emit::Module>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
-    /// wasmi 实例池：key = (interp 指针, 模块 key)。fib 类深递归每次
-    /// 调用 instantiate 是 .24×→.47× 后的剩余大头（vm_exec 有 VmPool
-    /// 复用而 JIT 没有）——Store+Instance 成对缓存（fuel/epoch/caching
-    /// global 状态在 Store 内持续，语义一致；Host 状态 run 前 reset）。
-    /// 单线程顺序执行；池上限 = 递归深度（64），超出全清。
-    static WASMI_POOL: std::cell::RefCell<
-        Vec<((usize, usize, u64), wasmi::Store<Host>, wasmi::Instance)>,
-    > = const { std::cell::RefCell::new(Vec::new()) };
+    /// wasmi **编译产物**缓存 + **Engine 单例**（Module/Linker 绑
+    /// Engine——每次 default() 让缓存跨引擎失效）。Store/Host/Instance
+    /// **每次新建**：wasmi Store 复用有状态残留（同 Store 第二次 run
+    /// 提前 OK 退出——defarg 双调用实证），正确性优先。
+    static WASMI_MODULES: std::cell::RefCell<
+        std::collections::HashMap<(usize, usize, u64), wasmi::Module>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static WASMI_ENGINE: std::cell::OnceCell<wasmi::Engine> = std::cell::OnceCell::new();
 }
 
 /// 池 key 的 epoch 分量（redefine 换 Rc + epoch 变化——双重防陈旧）。
@@ -83,7 +83,6 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
     // proc 语境的 case-b 帧协议已落地（rtcl-vm jit_err_* 公共入口 +
     // Host.proc_ctx 路由）——不再按 Cold 退回（f002196/f004860 的
     // (procedure …) 帧链由差分验证）。
-    CURRENT_MODULE_BYTES.with(|b| *b.borrow_mut() = module.bytes.clone());
     // 引擎分派（RTCL_JIT_ENGINE；默认 wasmi）。wasmtime 走 Cranelift
     // 池化路径（Engine 单例 + Module 缓存 + Store/Instance 池）。
     #[cfg(feature = "jit-native")]
@@ -107,42 +106,30 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
         code_epoch_key(bc),
     );
 
-    // 池命中：reset Host 状态 + 复用 Store/Instance（免 instantiate——
-    // vm_exec 有 VmPool 复用而 JIT 每次重建是 .47× 的剩余大头）。
-    // ⚠️ 池化交互 bug（2026-10-20）：同 Store 第二次 run 提前 OK 退出
-    // （defarg 双调用第二返回值丢失）judge 6 文件回归——**默认禁用**
-    // （RTCL_JIT_PROC_POOL=1 调试启用），正确性优先。
-    let mut reused = false;
-    if std::env::var_os("RTCL_JIT_PROC_POOL").is_some() {
-    WASMI_POOL.with(|p| {
-        let mut p = p.borrow_mut();
-        if let Some(pos) = p.iter().position(|(k, ..)| *k == pool_key) {
-            let (_, mut store, inst) = p.remove(pos);
-            store.data_mut().reset_for_reuse();
-            // 把 Store/Instance 经 thread_local 传给本函数继续用：
-            // 单线程——借用 thread_local 槽位代替跨作用域移动。
-            POOL_TAKE.with(|t| *t.borrow_mut() = Some((store, inst)));
-            reused = true;
+    // Engine 单例 + Module 编译缓存（key 三元组）；Store/Host/Instance
+    // 每次新建——wasmi Store 复用有状态残留（defarg 双调用实证）。
+    let engine = WASMI_ENGINE.with(|e| e.get_or_init(Engine::default).clone());
+    let wmodule = WASMI_MODULES.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some(w) = m.get(&pool_key) {
+            return w.clone();
         }
+        let w = Module::new(&engine, &module.bytes[..]).expect("jit proc: module");
+        if m.len() >= 64 {
+            m.clear();
+        }
+        m.insert(pool_key, w.clone());
+        w
     });
-    }
-    let (mut store, instance) = if reused {
-        POOL_TAKE.with(|t| t.borrow_mut().take().expect("pool take"))
-    } else {
-        let mut host = Host::new(
-            interp as *mut Interp,
-            crate::exec::arena_of(bc),
-            bc,
-            module,
-        );
-        host.proc_ctx = true;
-        let engine = Engine::default();
-        let wmodule = Module::new(&engine, &module.bytes[..]).expect("jit proc: module");
-        let mut store = Store::new(&engine, host);
-        // 注册 imports + instantiate（与 exec.rs 同款宿主闭包）。
-        let instance = register_and_instantiate(&mut store, epoch0);
-        (store, instance)
-    };
+    let mut host = Host::new(
+        interp as *mut Interp,
+        crate::exec::arena_of(bc),
+        bc,
+        module,
+    );
+    host.proc_ctx = true;
+    let mut store = Store::new(&engine, host);
+    let instance = register_and_instantiate(&mut store, epoch0, &wmodule);
     let watermark = store.data().arena_len();
 
     let run: TypedFunc<(), i32> = instance
@@ -153,20 +140,10 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
     });
     store.data_mut().arena_truncate(watermark);
 
-    // 读取结果（借用）→ Store/Instance 还池 → 组装返回。
+    // 读取结果 → Store 随作用域销毁（值已全部 take，无悬垂）。
     let result = store.data_mut().result.take();
     let pending_exit = store.data_mut().pending_exit.take();
     let pending = store.data_mut().pending.take();
-    if std::env::var_os("RTCL_JIT_PROC_POOL").is_some() {
-        WASMI_POOL.with(|p| {
-            let mut p = p.borrow_mut();
-            if p.len() >= 64 {
-                p.clear();
-            }
-            p.push((pool_key, store, instance));
-        });
-    }
-    // 禁池：Store 离开作用域自然销毁（值已全部 take，无悬垂）。
 
     match rc {
         code::OK => Ok(result.unwrap_or_else(Value::empty)),
@@ -183,26 +160,16 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
 }
 
 thread_local! {
-    /// register_and_instantiate 的模块字节交接（execute_proc 设置）。
-    static CURRENT_MODULE_BYTES: std::cell::RefCell<Vec<u8>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// execute_proc 内部的 Store 交接槽（单线程；池命中路径把
-    /// Store/Instance 从 WASMI_POOL 移交进作用域）。
+    /// execute_proc 内部的 Store 交接槽（单线程）。
     static POOL_TAKE: std::cell::RefCell<
         Option<(wasmi::Store<Host>, wasmi::Instance)>,
-    > = const { std::cell::RefCell::new(None) };
+    > = std::cell::RefCell::new(None);
 }
 
 /// imports 注册 + 实例化（proc 语境；与 exec.rs 同款宿主闭包）。
-fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64) -> wasmi::Instance {
+fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64, wmodule: &wasmi::Module) -> wasmi::Instance {
     use wasmi::{Caller, Engine, Extern, Linker, Module, TypedFunc};
 
-    let wmodule = {
-        // Module::new 需要 Engine——从 store 取。
-        let engine = store.engine().clone();
-        let bytes = CURRENT_MODULE_BYTES.with(|b| b.borrow().clone());
-        Module::new(&engine, &bytes).expect("jit proc: module")
-    };
     let mut linker = <Linker<Host>>::new(store.engine());
 
     let g_fuel = wasmi::Global::new(&mut *store, wasmi::Val::I64(0), wasmi::Mutability::Var);

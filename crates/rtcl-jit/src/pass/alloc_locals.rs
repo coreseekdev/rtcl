@@ -171,7 +171,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             _ if pops == 0 && pushes == 1 => (vec![], Some(depth)),
             // break/continue 之后的死代码：线性深度下溢——读集置空
             //（op 不可达，寄存器引用无意义）。
-            _ if pops as u32 > depth => (vec![], None),
+            _ if pops > depth => (vec![], None),
             _ if pops == 2 && pushes == 1 => (vec![depth - 2, depth - 1], Some(depth - 2)),
             _ if pops == 1 && pushes == 0 => (vec![depth - 1], None),
             _ => (vec![], None),

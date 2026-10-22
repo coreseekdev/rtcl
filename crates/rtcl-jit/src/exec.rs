@@ -576,8 +576,8 @@ impl Host {
     // ── 宿主逻辑（引擎无关；各引擎的 import 包装只做参数搬运）──────
 
     pub fn binary_op_raw(&mut self, op: i32, a: i64, b: i64) -> i64 {
-        let r = self.do_binary_op(op, a, b);
-        r
+        
+        self.do_binary_op(op, a, b)
     }
 
     fn do_binary_op(&mut self, op: i32, a: i64, b: i64) -> i64 {
@@ -623,8 +623,8 @@ impl Host {
         let name = self.const_name(name_h);
         match self.irp().read_var(&name) {
             Ok(v) => {
-                let t = self.tag_value(&v);
-                t
+                
+                self.tag_value(&v)
             }
             Err(e) => {
                 self.pending = Some(Pending { err: e, from_eval: false });
@@ -674,7 +674,7 @@ impl Host {
 
     /// 直连分派（M2 全案）：已求值实参 → charge_step → dispatch_values。
     /// 错误 = case-b（from_eval=false）——驱动补站点帧；无宿主 eval 记账。
-    pub fn call_argv_raw(&mut self, words: &[u64], site: i32) -> i64 {
+    pub fn call_argv_raw(&mut self, words: &[u64], _site: i32) -> i64 {
         let mut args: Vec<Value> = Vec::with_capacity(words.len());
         for w in words {
             args.push(self.value_of(*w as i64));
@@ -1228,7 +1228,7 @@ fn execute(
             c.data_mut().box_float_raw(f)
         })
         .unwrap();
-    let g_caching_bin = g_caching.clone();
+    let g_caching_bin = g_caching;
     linker
         .func_wrap("rtcl", "binary_op", move |mut c: Caller<'_, Host>, op: i32, a: i64, b: i64| -> i64 {
             // 表达式可含 [cmd] 替换——缓存窗口关闭。
@@ -1313,7 +1313,7 @@ fn execute(
             c.data_mut().concat_raw(&words)
         })
         .unwrap();
-    let g_caching_fe = g_caching.clone();
+    let g_caching_fe = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -1325,7 +1325,7 @@ fn execute(
             },
         )
         .unwrap();
-    let g_caching_bind = g_caching.clone();
+    let g_caching_bind = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -1346,14 +1346,14 @@ fn execute(
             c.data_mut().foreach_end_raw()
         })
         .unwrap();
-    let g_caching_lap = g_caching.clone();
+    let g_caching_lap = g_caching;
     linker
         .func_wrap("rtcl", "lappend_var", move |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i64 {
             let _ = g_caching_lap.set(&mut c, wasmi::Val::I32(0));
             c.data_mut().lappend_var_raw(name_h, v)
         })
         .unwrap();
-    let g_caching_cav = g_caching.clone();
+    let g_caching_cav = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -1366,14 +1366,14 @@ fn execute(
             },
         )
         .unwrap();
-    let g_caching_es = g_caching.clone();
+    let g_caching_es = g_caching;
     linker
         .func_wrap("rtcl", "eval_script", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
             let _ = g_caching_es.set(&mut c, wasmi::Val::I32(0));
             c.data_mut().eval_script_raw(v)
         })
         .unwrap();
-    let g_caching_ee = g_caching.clone();
+    let g_caching_ee = g_caching;
     linker
         .func_wrap("rtcl", "eval_expr", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
             let _ = g_caching_ee.set(&mut c, wasmi::Val::I32(0));

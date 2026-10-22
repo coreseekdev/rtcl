@@ -76,7 +76,7 @@ fn main() {
 }
 
 fn run_command(cmd: &str) {
-    let mut interp = Interp::new();
+    let interp = Interp::new();
     let (mut interp, run) = exec::run_top(interp, cmd, "");
     match run.outcome {
         Outcome::Fallback => match interp.eval(cmd) {

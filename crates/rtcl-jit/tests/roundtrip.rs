@@ -8,7 +8,6 @@
 use rtcl_core::Interp;
 use rtcl_jit::exec::{self, Outcome};
 use rtcl_parser::{Compiler, ScriptUnit};
-use std::rc::Rc;
 
 /// 编译断言：`script` 的单元是否被 JIT 接受。
 fn accepted(script: &str) -> bool {
@@ -81,6 +80,7 @@ fn acceptance_subset() {
         "set s {puts hi}\nputs a[eval $s]b",
         "while {1} {break}",
         "set cmd puts\n$cmd hello",
+        "set x [eval {puts 1}]",      // Call-in-Sub（call_argv 直连后允许）
         "puts [expr {min(2, 3)}]",    // mathfunc → EVAL_EXPR 宿主路由
     ] {
         assert!(accepted(src), "must accept: {src:?}");
@@ -89,7 +89,6 @@ fn acceptance_subset() {
     // 顶层 `eval {...}`/`string ...` 本身是 Call（接受）；拒绝的是这些
     // op 出现在单元内的形状（经实证 disassemble 校准）。
     for src in [
-        "set x [eval {puts 1}]",      // Call 嵌 Sub region（错误协议二分）
         "set a(1) 2\nputs $a($x)",   // 数组元素引用（下标替换语义）
     ] {
         assert!(!accepted(src), "must reject: {src:?}");

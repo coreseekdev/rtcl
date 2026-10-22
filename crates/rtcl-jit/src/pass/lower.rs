@@ -192,7 +192,7 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
                 let fail = ctx.l2.fail_of[pc as usize].unwrap_or(0);
                 // done → br 到循环出口（= ForeachEnd 处的 exit 标签）；
                 // 继续迭代 → bind + br header（fuel 由 instrument 织入）。
-                let end_t = ctx.loops.last().map(|(_, b)| *b).unwrap_or(pc as u32 + 1);
+                let end_t = ctx.loops.last().map(|(_, b)| *b).unwrap_or(pc + 1);
                 let counter = foreach_counter_of(ctx, info);
                 // 回跳目标 = 对应 FOREACH_START 的落点（header）而非
                 // body 目标：PR#2 起 unfused 形状的 FOREACH_NEXT body
@@ -659,10 +659,6 @@ fn preds_n_root(_d: &std::collections::BTreeSet<u32>) -> bool {
     false
 }
 
-fn merge_point_unused(ctx: &Ctx, branch_pc: u32, a: u32, b: u32) -> Option<u32> {
-    let _ = (ctx, branch_pc, a, b);
-    None
-}
 
 // ── phase B：分支深度解析 ─────────────────────────────────────────────────
 

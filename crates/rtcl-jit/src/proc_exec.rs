@@ -43,12 +43,12 @@ thread_local! {
     static WASMI_MODULES: std::cell::RefCell<
         std::collections::HashMap<(usize, usize, u64), wasmi::Module>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
-    static WASMI_ENGINE: std::cell::OnceCell<wasmi::Engine> = std::cell::OnceCell::new();
+    static WASMI_ENGINE: std::cell::OnceCell<wasmi::Engine> = const { std::cell::OnceCell::new() };
     /// Store/Instance **池**（key 三元组）：复用免 instantiate——状态
     /// 残留由 **完整重置**（globals + memory cache 区 + host 状态）修复。
     static PROC_POOL: std::cell::RefCell<
         Vec<((usize, usize, u64), wasmi::Store<Host>, wasmi::Instance)>,
-    > = std::cell::RefCell::new(Vec::new());
+    > = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// 池 key 的 epoch 分量（redefine 换 Rc + epoch 变化——双重防陈旧）。
@@ -99,7 +99,7 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
 
 /// 实例化并执行 proc 体，映射 `run()` 返回码。
 fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -> rtcl_core::Result<Value> {
-    use wasmi::{Caller, Engine, Extern, Linker, Module, Store, TypedFunc};
+    use wasmi::{Engine, Module, Store, TypedFunc};
 
     let epoch0 = interp.tier1_epoch() as i64;
     // key 三元组：interp 指针 + **proc 体 Rc 指针** + epoch——只有
@@ -137,7 +137,7 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
             // 完整重置（顺序关键：globals → memory → host）。
             let (gf, ge, gc) = {
                 let h = store.data();
-                (h.g_fuel_h.clone(), h.g_epoch_h.clone(), h.g_caching_h.clone())
+                (h.g_fuel_h, h.g_epoch_h, h.g_caching_h)
             };
             if let Some(g) = &gf { let _ = g.set(&mut store, wasmi::Val::I64(0)); }
             if let Some(g) = &ge { let _ = g.set(&mut store, wasmi::Val::I64(epoch0)); }
@@ -162,7 +162,7 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
             // 存 global 句柄（池重置用）。
             let (gf, ge, gc) = {
                 let h = store.data();
-                (h.g_fuel_h.clone(), h.g_epoch_h.clone(), h.g_caching_h.clone())
+                (h.g_fuel_h, h.g_epoch_h, h.g_caching_h)
             };
             let _ = (gf, ge, gc);
             (store, inst)
@@ -208,21 +208,21 @@ thread_local! {
     /// execute_proc 内部的 Store 交接槽（单线程）。
     static POOL_TAKE: std::cell::RefCell<
         Option<(wasmi::Store<Host>, wasmi::Instance)>,
-    > = std::cell::RefCell::new(None);
+    > = const { std::cell::RefCell::new(None) };
 }
 
 /// imports 注册 + 实例化（proc 语境；与 exec.rs 同款宿主闭包）。
 fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64, wmodule: &wasmi::Module) -> wasmi::Instance {
-    use wasmi::{Caller, Engine, Extern, Linker, Module, TypedFunc};
+    use wasmi::{Caller, Extern, Linker};
 
     let mut linker = <Linker<Host>>::new(store.engine());
 
     let g_fuel = wasmi::Global::new(&mut *store, wasmi::Val::I64(0), wasmi::Mutability::Var);
     let g_epoch = wasmi::Global::new(&mut *store, wasmi::Val::I64(epoch0), wasmi::Mutability::Var);
     let g_caching = wasmi::Global::new(&mut *store, wasmi::Val::I32(1), wasmi::Mutability::Var);
-    linker.define("rtcl", "fuel", Extern::Global(g_fuel.clone())).unwrap();
-    linker.define("rtcl", "epoch", Extern::Global(g_epoch.clone())).unwrap();
-    linker.define("rtcl", "caching", Extern::Global(g_caching.clone())).unwrap();
+    linker.define("rtcl", "fuel", Extern::Global(g_fuel)).unwrap();
+    linker.define("rtcl", "epoch", Extern::Global(g_epoch)).unwrap();
+    linker.define("rtcl", "caching", Extern::Global(g_caching)).unwrap();
 
     linker
         .func_wrap("rtcl", "unbox_int", |c: Caller<'_, Host>, h: i32| -> (i32, i64) {
@@ -244,7 +244,7 @@ fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64, wmodule
             c.data_mut().box_float_raw(f)
         })
         .unwrap();
-    let caching_bin = g_caching.clone();
+    let caching_bin = g_caching;
     linker
         .func_wrap("rtcl", "binary_op", move |mut c: Caller<'_, Host>, op: i32, a: i64, b: i64| -> i64 {
             let _ = caching_bin.set(&mut c, wasmi::Val::I32(0));
@@ -266,7 +266,7 @@ fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64, wmodule
             c.data_mut().incr_var_raw(name_h, n)
         })
         .unwrap();
-    let caching_call = g_caching.clone();
+    let caching_call = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -277,7 +277,7 @@ fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64, wmodule
             },
         )
         .unwrap();
-    let caching_cav = g_caching.clone();
+    let caching_cav = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -294,7 +294,7 @@ fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64, wmodule
             c.data_mut().set_result_raw(v);
         })
         .unwrap();
-    let fuel_g = g_fuel.clone();
+    let fuel_g = g_fuel;
     linker
         .func_wrap("rtcl", "refuel", move |mut c: Caller<'_, Host>| -> i64 {
             let chunk = c.data().refuel_chunk();
@@ -323,7 +323,7 @@ fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64, wmodule
             abi::const_handle(idx as u32)
         })
         .unwrap();
-    let caching_fs = g_caching.clone();
+    let caching_fs = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -335,7 +335,7 @@ fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64, wmodule
             },
         )
         .unwrap();
-    let caching_fb = g_caching.clone();
+    let caching_fb = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -356,21 +356,21 @@ fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64, wmodule
             c.data_mut().foreach_end_raw()
         })
         .unwrap();
-    let caching_es = g_caching.clone();
+    let caching_es = g_caching;
     linker
         .func_wrap("rtcl", "eval_script", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
             let _ = caching_es.set(&mut c, wasmi::Val::I32(0));
             c.data_mut().eval_script_raw(v)
         })
         .unwrap();
-    let caching_ee = g_caching.clone();
+    let caching_ee = g_caching;
     linker
         .func_wrap("rtcl", "eval_expr", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
             let _ = caching_ee.set(&mut c, wasmi::Val::I32(0));
             c.data_mut().eval_expr_raw(v)
         })
         .unwrap();
-    let caching_lap = g_caching.clone();
+    let caching_lap = g_caching;
     linker
         .func_wrap("rtcl", "lappend_var", move |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i64 {
             let _ = caching_lap.set(&mut c, wasmi::Val::I32(0));
@@ -390,7 +390,7 @@ fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64, wmodule
         .unwrap();
 
     linker
-        .instantiate_and_start(store, &wmodule)
+        .instantiate_and_start(store, wmodule)
         .unwrap_or_else(|e| panic!("jit proc: instantiate failed: {e}"))
 }
 
@@ -435,7 +435,7 @@ fn execute_proc_wasmtime(
     bc: &Rc<ByteCode>,
     module: &emit::Module,
 ) -> rtcl_core::Result<Value> {
-    use wasmtime::{Extern, Store, TypedFunc, Val};
+    use wasmtime::{Store, TypedFunc};
 
     let epoch0 = interp.tier1_epoch() as i64;
     let pool_key = (
@@ -575,7 +575,7 @@ fn register_wasmtime_proc(
             c.data_mut().box_float_raw(f)
         })
         .unwrap();
-    let caching_bin = g_caching.clone();
+    let caching_bin = g_caching;
     linker
         .func_wrap("rtcl", "binary_op", move |mut c: Caller<'_, Host>, op: i32, a: i64, b: i64| -> i64 {
             let _ = caching_bin.set(&mut c, Val::I32(0));
@@ -597,7 +597,7 @@ fn register_wasmtime_proc(
             c.data_mut().incr_var_raw(name_h, n)
         })
         .unwrap();
-    let caching_call = g_caching.clone();
+    let caching_call = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -623,7 +623,7 @@ fn register_wasmtime_proc(
             c.data_mut().set_result_raw(v);
         })
         .unwrap();
-    let fuel_g = g_fuel.clone();
+    let fuel_g = g_fuel;
     linker
         .func_wrap("rtcl", "refuel", move |mut c: Caller<'_, Host>| -> i64 {
             let chunk = c.data().refuel_chunk();
@@ -652,7 +652,7 @@ fn register_wasmtime_proc(
             abi::const_handle(idx as u32)
         })
         .unwrap();
-    let caching_fs = g_caching.clone();
+    let caching_fs = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -664,7 +664,7 @@ fn register_wasmtime_proc(
             },
         )
         .unwrap();
-    let caching_fb = g_caching.clone();
+    let caching_fb = g_caching;
     linker
         .func_wrap(
             "rtcl",
@@ -685,21 +685,21 @@ fn register_wasmtime_proc(
             c.data_mut().foreach_end_raw()
         })
         .unwrap();
-    let caching_es = g_caching.clone();
+    let caching_es = g_caching;
     linker
         .func_wrap("rtcl", "eval_script", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
             let _ = caching_es.set(&mut c, Val::I32(0));
             c.data_mut().eval_script_raw(v)
         })
         .unwrap();
-    let caching_ee = g_caching.clone();
+    let caching_ee = g_caching;
     linker
         .func_wrap("rtcl", "eval_expr", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
             let _ = caching_ee.set(&mut c, Val::I32(0));
             c.data_mut().eval_expr_raw(v)
         })
         .unwrap();
-    let caching_lap = g_caching.clone();
+    let caching_lap = g_caching;
     linker
         .func_wrap("rtcl", "lappend_var", move |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i64 {
             let _ = caching_lap.set(&mut c, Val::I32(0));

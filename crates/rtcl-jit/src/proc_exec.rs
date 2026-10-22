@@ -44,6 +44,11 @@ thread_local! {
         std::collections::HashMap<(usize, usize, u64), wasmi::Module>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
     static WASMI_ENGINE: std::cell::OnceCell<wasmi::Engine> = std::cell::OnceCell::new();
+    /// Store/Instance **池**（key 三元组）：复用免 instantiate——状态
+    /// 残留由 **完整重置**（globals + memory cache 区 + host 状态）修复。
+    static PROC_POOL: std::cell::RefCell<
+        Vec<((usize, usize, u64), wasmi::Store<Host>, wasmi::Instance)>,
+    > = std::cell::RefCell::new(Vec::new());
 }
 
 /// 池 key 的 epoch 分量（redefine 换 Rc + epoch 变化——双重防陈旧）。
@@ -121,15 +126,48 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
         m.insert(pool_key, w.clone());
         w
     });
-    let mut host = Host::new(
-        interp as *mut Interp,
-        crate::exec::arena_of(bc),
-        bc,
-        module,
-    );
-    host.proc_ctx = true;
-    let mut store = Store::new(&engine, host);
-    let instance = register_and_instantiate(&mut store, epoch0, &wmodule);
+    // 池命中：完整重置（globals + cache 区 + host 状态）+ 复用
+    // Store/Instance；未命中：新建入池。
+    let pooled = PROC_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        p.iter().position(|(k, ..)| *k == pool_key).map(|pos| p.remove(pos))
+    });
+    let (mut store, instance) = match pooled {
+        Some((_, mut store, inst)) => {
+            // 完整重置（顺序关键：globals → memory → host）。
+            let (gf, ge, gc) = {
+                let h = store.data();
+                (h.g_fuel_h.clone(), h.g_epoch_h.clone(), h.g_caching_h.clone())
+            };
+            if let Some(g) = &gf { let _ = g.set(&mut store, wasmi::Val::I64(0)); }
+            if let Some(g) = &ge { let _ = g.set(&mut store, wasmi::Val::I64(epoch0)); }
+            if let Some(g) = &gc { let _ = g.set(&mut store, wasmi::Val::I32(1)); }
+            if let Some(wasmi::Extern::Memory(m)) = inst.get_export(&store, "memory") {
+                let zeros = vec![0u8; 1024]; // cache::VALUES(0-511) + STATE(512-767) + SCRATCH(1024+)
+                let _ = m.write(&mut store, 0, &zeros);
+            }
+            store.data_mut().reset_for_reuse();
+            (store, inst)
+        }
+        None => {
+            let mut host = Host::new(
+                interp as *mut Interp,
+                crate::exec::arena_of(bc),
+                bc,
+                module,
+            );
+            host.proc_ctx = true;
+            let mut store = Store::new(&engine, host);
+            let inst = register_and_instantiate(&mut store, epoch0, &wmodule);
+            // 存 global 句柄（池重置用）。
+            let (gf, ge, gc) = {
+                let h = store.data();
+                (h.g_fuel_h.clone(), h.g_epoch_h.clone(), h.g_caching_h.clone())
+            };
+            let _ = (gf, ge, gc);
+            (store, inst)
+        }
+    };
     let watermark = store.data().arena_len();
 
     let run: TypedFunc<(), i32> = instance
@@ -140,10 +178,17 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
     });
     store.data_mut().arena_truncate(watermark);
 
-    // 读取结果 → Store 随作用域销毁（值已全部 take，无悬垂）。
+    // 读取结果 → Store/Instance 还池。
     let result = store.data_mut().result.take();
     let pending_exit = store.data_mut().pending_exit.take();
     let pending = store.data_mut().pending.take();
+    PROC_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() >= 64 {
+            p.clear();
+        }
+        p.push((pool_key, store, instance));
+    });
 
     match rc {
         code::OK => Ok(result.unwrap_or_else(Value::empty)),

@@ -83,6 +83,10 @@ pub(crate) struct Host {
     /// 自首次任意宿主命令求值后置位——此后 var_traces/dead_flat 可能
     /// 非空（take_var_fast 的守卫集），LappendVar 等保守路径据此分支。
     pub(crate) commands_ran: bool,
+    /// 池复用时的 global 重置句柄（register 时存入）。
+    pub(crate) g_fuel_h: Option<wasmi::Global>,
+    pub(crate) g_epoch_h: Option<wasmi::Global>,
+    pub(crate) g_caching_h: Option<wasmi::Global>,
 }
 
 impl Host {
@@ -530,6 +534,9 @@ impl Host {
             last_fail: None,
             proc_ctx: false,
             commands_ran: false,
+            g_fuel_h: None,
+            g_epoch_h: None,
+            g_caching_h: None,
         }
     }
 

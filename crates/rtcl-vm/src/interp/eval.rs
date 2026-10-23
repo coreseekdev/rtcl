@@ -896,6 +896,15 @@ impl Interp {
         }
         self.read_var(name)
     }
+
+    /// ⑥ 数组下标公共入口（JIT 宿主路由用）：名字可携带**未替换**的下标
+    /// 文本 `a($i)`——下标先做完整词级替换再读（`eval_var_ref` 同款；
+    /// rtcl-jit 跨 crate 取 pub 版）。写路径（set/incr/lappend）不需要
+    /// 对应入口：编译器只对字面名发射 StoreVar/IncrVar/LappendVar，
+    /// 带替换下标的写一律走 DynCall 分派（命令自己替换实参）。
+    pub fn jit_read_var_ref(&mut self, name: &str) -> Result<Value> {
+        self.eval_var_ref(name)
+    }
 }
 
 /// `tcl::unsupported::disassemble` / `getbytecode` — Tcl 8.6's compiler

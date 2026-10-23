@@ -198,9 +198,28 @@ fn tokenize(expr: &str) -> Option<Vec<Token>> {
                 while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
                     i += 1;
                 }
-                // Reject array element access $name(index)
+                // $name(index)：数组元素读——括号内原文（可含 $k/[..] 嵌套）
+                // 作为名字的一部分发射；LoadVar 的执行（eval_var_ref）做
+                // 下标替换。配对括号扫描；未闭合回落树走查。
                 if i < len && chars[i] == '(' {
-                    return None;
+                    let mut depth = 0;
+                    while i < len {
+                        match chars[i] {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    if depth != 0 {
+                        return None; // unclosed subscript — runtime error path
+                    }
                 }
                 let name: String = chars[start..i].iter().collect();
                 tokens.push(Token::Var(name));

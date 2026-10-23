@@ -629,7 +629,10 @@ impl Host {
 
     pub fn get_var_raw(&mut self, name_h: i32) -> i64 {
         let name = self.const_name(name_h);
-        match self.irp().read_var(&name) {
+        // ⑥ 数组下标感知：名字可携带未替换下标（expr 编译放行
+        // $name(index) 后，LoadVar 的名字是原文）——jit_read_var_ref
+        // 做下标替换；裸 read_var 会按字面 "$k" 找元素。
+        match self.irp().jit_read_var_ref(&name) {
             Ok(v) => {
                 
                 self.tag_value(&v)

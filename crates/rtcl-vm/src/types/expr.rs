@@ -492,7 +492,9 @@ impl<'a> ExprParser<'a> {
                 return self.interp.get_var(&name).cloned();
             }
             let name = self.parse_var_name();
-            return self.interp.get_var(&name).cloned();
+            // eval_var_ref，非裸 get_var：`$a($k)` 的下标要做完整词级
+            // 替换（tclsh：expr {$a($k)} 读 a(7)，不是元素 "$k"）。
+            return self.interp.jit_read_var_ref(&name);
         }
 
         // String literal
@@ -822,7 +824,8 @@ impl<'a> ExprParser<'a> {
                             // "$" with no variable name is a literal dollar sign
                             s.push('$');
                         } else {
-                            let val = self.interp.get_var(&name).cloned()?;
+                            // 引号串内同理：下标替换后读（$a($k)）。
+                            let val = self.interp.jit_read_var_ref(&name)?;
                             s.push_str(val.as_str());
                         }
                     }
@@ -954,13 +957,22 @@ impl<'a> ExprParser<'a> {
             if c.is_alphanumeric() || c == '_' || c == ':' {
                 s.push(self.advance());
             } else if c == '(' {
-                // Array reference: name(index)
-                s.push(self.advance());
-                while !self.is_at_end() && self.peek() != ')' {
-                    s.push(self.advance());
-                }
-                if !self.is_at_end() {
-                    s.push(self.advance()); // consume ')'
+                // Array reference: name(index)——配对括号（下标可嵌套
+                // `$b(1)`），原文交给 jit_read_var_ref 做下标替换。
+                let mut depth = 0;
+                while !self.is_at_end() {
+                    let c = self.advance();
+                    s.push(c);
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 break;
             } else {

@@ -56,7 +56,9 @@ pub fn execute(
     let run: TypedFunc<(), i32> = instance
         .get_typed_func(&mut store, "run")
         .expect("run export");
+    rtcl_vm::interp::set_jit_call_in_flight(true);
     let rc = run.call(&mut store, ()).expect("wasmtime: run");
+    rtcl_vm::interp::set_jit_call_in_flight(false);
     store.data_mut().arena_truncate(watermark);
 
     let host = store.into_data();

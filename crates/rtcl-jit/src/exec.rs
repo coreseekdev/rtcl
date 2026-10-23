@@ -1403,10 +1403,13 @@ fn execute(
     let run: TypedFunc<(), i32> = instance.get_typed_func(&store, "run").unwrap();
 
 
+    rtcl_vm::interp::set_jit_call_in_flight(true);
     let rc = run.call(&mut store, ()).unwrap_or_else(|trap| {
+        rtcl_vm::interp::set_jit_call_in_flight(false);
         // wasm trap = 内部 bug（越界/除零未兜底等）——显式失败。
         panic!("jit: wasm trap: {trap:?}")
     });
+    rtcl_vm::interp::set_jit_call_in_flight(false);
 
     // arena 回收到水位线（§3 纪律）。
     store.data_mut().arena.truncate(watermark);

@@ -22,6 +22,12 @@ pub fn next_interp_id() -> u64 {
 /// Native command `_js_dispatch <interpId> <name> <args...>` — dispatches to the
 /// JS callback registered for `interpId`. The id is baked into the generated
 /// proc wrapper, so each interpreter only ever reaches its own bucket.
+///
+/// ⑧ 重入哨兵：JIT wasm 调用期间此入口**允许**进入（JS 命令作为叶子
+/// 调用是合法模式），但回调里对解释器的任何重入（`RtclHandle::exec`/
+/// `dispatch_event`/`register_command` 等导出）会被 `rtcl_vm::interp::
+/// jit_call_in_flight` 哨兵以明确错误拒绝——重入检测集中在导出层，
+/// 此处不再重复拦截（JIT 于 wasm32 接线后如需收紧可在此补）。
 pub fn js_dispatch_cmd(_interp: &mut rtcl_core::Interp, args: &[Value]) -> rtcl_core::error::Result<Value> {
     if args.len() < 3 {
         return Err(rtcl_core::error::Error::wrong_args("_js_dispatch", 3, args.len()));

@@ -190,9 +190,13 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
     let run: TypedFunc<(), i32> = instance
         .get_typed_func(&store, "run")
         .expect("run export");
+    // ⑧ 重入哨兵：run 窗口内 wasm32 宿主的重入求值被明确拒绝。
+    rtcl_vm::interp::set_jit_call_in_flight(true);
     let rc = run.call(&mut store, ()).unwrap_or_else(|trap| {
+        rtcl_vm::interp::set_jit_call_in_flight(false);
         panic!("jit proc: wasm trap: {trap:?}")
     });
+    rtcl_vm::interp::set_jit_call_in_flight(false);
     store.data_mut().arena_truncate(watermark);
 
     // 读取结果 → Store/Instance 还池。
@@ -514,7 +518,9 @@ fn execute_proc_wasmtime(
     let run: TypedFunc<(), i32> = instance
         .get_typed_func(&mut store, "run")
         .expect("run export");
+    rtcl_vm::interp::set_jit_call_in_flight(true);
     let rc = run.call(&mut store, ()).expect("jit proc wt: run");
+    rtcl_vm::interp::set_jit_call_in_flight(false);
     store.data_mut().arena_truncate(watermark);
 
     let result = store.data_mut().result.take();

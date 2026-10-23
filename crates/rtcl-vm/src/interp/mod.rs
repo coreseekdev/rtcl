@@ -1024,6 +1024,8 @@ impl Interp {
 
     /// 每条命令分派计一步；超限抛错。解释器（`eval_command`）与 VM
     ///（`invoke_command`/`call`）两条分派路都过这里。
+    /// 每条命令分派计一步；超限抛错。解释器（`eval_command`）与 VM
+    ///（`invoke_command`/`call`）两条分派路都过这里。
     pub(crate) fn charge_step(&mut self) -> crate::error::Result<()> {
         if let Some(max) = self.max_steps {
             self.steps = self.steps.saturating_add(1);
@@ -1692,4 +1694,27 @@ mod tests {
         // defer runs in reverse order on proc exit
         assert_eq!(result.as_str(), "body deferred2 deferred1");
     }
+}
+
+// ── ⑧ wasm32 重入哨兵 ─────────────────────────────────────────────────────
+//
+// JIT 的 wasm 执行期间（rtcl-jit 的 run() 括起的窗口），JS 侧对同一解释
+// 器的重入（`RtclHandle::exec`/`dispatch_event`/`register_command` 等
+// wasm-bindgen 导出）会在外层 wasm 帧仍持有解释器裸指针时重新进入求值
+// ——单线程顺序执行下无数据竞争，但嵌套求值会经由 proc-body 钩子递归
+// JIT 化同一 proc（池条目正被外层占用），栈纪律与错误帧的契约都未定义。
+// 哨兵放在 rtcl-vm（rtcl-jit 与 rtcl-wasm 共同可见的层）：rtcl-jit 在
+// run() 前后武装/解除，rtcl-wasm 的重入入口检测并以明确错误拒绝。
+thread_local! {
+    static JIT_CALL_IN_FLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 武装/解除「JIT wasm 调用进行中」哨兵（rtcl-jit 专用；RAII 成对调用）。
+pub fn set_jit_call_in_flight(in_flight: bool) {
+    JIT_CALL_IN_FLIGHT.with(|f| f.set(in_flight));
+}
+
+/// JIT wasm 调用是否进行中（wasm32 宿主重入入口的检测点）。
+pub fn jit_call_in_flight() -> bool {
+    JIT_CALL_IN_FLIGHT.with(|f| f.get())
 }

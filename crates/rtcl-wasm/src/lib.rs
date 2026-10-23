@@ -43,6 +43,13 @@ impl RtclHandle {
 
     /// Execute a Tcl script and return the result as a string.
     pub fn exec(&mut self, code: &str) -> Result<String, JsValue> {
+        // ⑧ 重入哨兵：JIT wasm 调用进行中（JS 命令回调里再调 exec），
+        // 外层 wasm 帧仍持有解释器——明确拒绝而非未定义行为。
+        if rtcl_vm::interp::jit_call_in_flight() {
+            return Err(JsValue::from_str(
+                "reentrant execution during JIT call is not supported",
+            ));
+        }
         self.interp
             .eval(code)
             .map(|v| v.to_string())
@@ -51,12 +58,22 @@ impl RtclHandle {
 
     /// Register a JavaScript function as a Tcl command.
     pub fn register_command(&mut self, name: &str, callback: js_sys::Function) -> Result<(), JsValue> {
+        if rtcl_vm::interp::jit_call_in_flight() {
+            return Err(JsValue::from_str(
+                "reentrant registration during JIT call is not supported",
+            ));
+        }
         js_command::register_js_command(&mut self.interp, self.id, name, callback);
         Ok(())
     }
 
     /// Remove a JS-registered command.
     pub fn unregister_command(&mut self, name: &str) -> Result<bool, JsValue> {
+        if rtcl_vm::interp::jit_call_in_flight() {
+            return Err(JsValue::from_str(
+                "reentrant unregistration during JIT call is not supported",
+            ));
+        }
         Ok(js_command::unregister_js_command(&mut self.interp, self.id, name))
     }
 
@@ -83,6 +100,11 @@ impl RtclHandle {
     /// 不静默——收集后以 `Err` 抛给 JS，供 shell 呈现（对应
     /// docs/UI-DSL.md 的 bgerror 回路）。
     pub fn dispatch_event(&mut self, script: &str) -> Result<(), JsValue> {
+        if rtcl_vm::interp::jit_call_in_flight() {
+            return Err(JsValue::from_str(
+                "reentrant dispatch during JIT call is not supported",
+            ));
+        }
         self.interp.post_event(script);
         let errors = self.interp.pump_events();
         if errors.is_empty() {

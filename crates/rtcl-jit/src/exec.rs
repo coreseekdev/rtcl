@@ -46,7 +46,7 @@ pub enum Outcome {
 /// 累积 errorInfo——case a）；否则快车道宿主原语错误（case b）。
 pub(crate) struct Pending {
     pub(crate) err: Error,
-    from_eval: bool,
+    pub(crate) from_eval: bool,
 }
 
 pub(crate) struct Host {
@@ -80,6 +80,12 @@ pub(crate) struct Host {
     pub(crate) proc_ctx: bool,
     /// 最近 rtcl.fail 的表索引（case-a 帧构建用）。
     pub(crate) last_fail: Option<u32>,
+    /// 入口纪元（④ 中途 bump 检测的比对基准；proc 池 key 含 epoch，
+    /// 池命中隐含相等）。
+    pub(crate) epoch_at_entry: u64,
+    /// ④ 中途 bump 的边界 site（bump 命令自身——重分派从其下一条
+    /// 顶层命令起）。
+    pub(crate) stale_site: Option<u32>,
     /// 自首次任意宿主命令求值后置位——此后 var_traces/dead_flat 可能
     /// 非空（take_var_fast 的守卫集），LappendVar 等保守路径据此分支。
     pub(crate) commands_ran: bool,
@@ -233,6 +239,11 @@ impl Host {
     fn take_fail(&mut self, fail_id: u32) -> i32 {
         let Some(p) = self.pending.take() else { return 0 };
         let e = p.err;
+        // ④ 中途 bump 标记：kind 6（CallSite 模板 → return STALE，
+        // 驱动侧重分派）。无帧处理——bump 命令已正常完成。
+        if e.message_text() == STALE_MARK {
+            return 6;
+        }
         if p.from_eval {
             // case a：解释器已按协议累积；先分类——控制流穿越
             // （宿主 eval 里的 break/continue 冒出，PR#2 起 `if $c
@@ -424,6 +435,9 @@ impl Host {
     }
 }
 
+/// ④ 中途 bump 的 pending 标记（take_fail → kind 6）。
+const STALE_MARK: &str = "\u{0}jit-stale";
+
 /// 控制流分类（fail 的返回 kind）：0=错误、1/3=break（内层/外层）、
 /// 2/4=continue。level≤1 = 属于本单元的内层循环。
 fn classify_control(e: &Error) -> i32 {
@@ -545,6 +559,8 @@ impl Host {
             g_fuel_h: None,
             g_epoch_h: None,
             g_caching_h: None,
+            epoch_at_entry: unsafe { (*interp).tier1_epoch() },
+            stale_site: None,
         }
     }
 
@@ -561,6 +577,7 @@ impl Host {
         self.info = None;
         self.pending_top = None;
         self.last_fail = None;
+        self.stale_site = None;
         self.foreaches.clear();
         self.err_line = 0;
     }
@@ -685,7 +702,7 @@ impl Host {
 
     /// 直连分派（M2 全案）：已求值实参 → charge_step → dispatch_values。
     /// 错误 = case-b（from_eval=false）——驱动补站点帧；无宿主 eval 记账。
-    pub fn call_argv_raw(&mut self, words: &[u64], _site: i32) -> i64 {
+    pub fn call_argv_raw(&mut self, words: &[u64], site: i32) -> i64 {
         let mut args: Vec<Value> = Vec::with_capacity(words.len());
         for w in words {
             args.push(self.value_of(*w as i64));
@@ -695,7 +712,22 @@ impl Host {
             return abi::ERR_SENTINEL;
         }
         match self.irp().dispatch_values(&args) {
-            Ok(v) => self.tag_value(&v),
+            Ok(v) => {
+                // ④ Tier1 中途 bump：当前命令已完成（结果暂存——bump
+                // 恰在末条命令时即单元结果），从其下一条顶层命令重分派。
+                // 经既有哨兵→fail→kind 协议：kind 6 → wasm return STALE，
+                // 驱动侧调 jit_redispatch_after。
+                if self.irp().tier1_epoch() != self.epoch_at_entry {
+                    self.stale_site = Some(site.max(0) as u32);
+                    self.result = Some(v);
+                    self.pending = Some(Pending {
+                        err: Error::Msg(STALE_MARK.to_string()),
+                        from_eval: false,
+                    });
+                    return abi::ERR_SENTINEL;
+                }
+                self.tag_value(&v)
+            }
             Err(e) => {
                 // case-b：帧由 wasm 侧哨兵 → rtcl.fail(fail_id) →
                 // take_fail 用 fail 表的 site 补（vm_exec exec_inner 同款）。
@@ -1410,6 +1442,31 @@ fn execute(
         panic!("jit: wasm trap: {trap:?}")
     });
     rtcl_vm::interp::set_jit_call_in_flight(false);
+
+    // ④ 中途 bump：整单元 STALE → 从 bump 命令的下一条顶层命令树走查
+    //（上下文保持；非边界 bump 维持错误报告现状）。重分派后按正常
+    // 完成收束（结果 = 重分派结果，或 bump 恰在末条时的暂存结果）。
+    let rc = if rc == code::STALE {
+        let stale = { store.data().stale_site };
+        match stale.and_then(|site| {
+            store.data_mut().interp_mut().jit_redispatch_after(&bc, site)
+        }) {
+            Some((true, Ok(v))) => {
+                store.data_mut().result = Some(v);
+                code::OK
+            }
+            // 错误帧已由树走查 harness 追加到 interp 累积器——以 case-a
+            // 进 pending，finish 的 eval_error 路径交 jitsh error_report。
+            Some((true, Err(e))) => {
+                store.data_mut().pending = Some(Pending { err: e, from_eval: true });
+                code::ERROR
+            }
+            Some((false, _)) => code::OK, // 末条 bump：结果已暂存 host.result
+            None => code::STALE,          // 非边界：维持 finish 现状路径
+        }
+    } else {
+        rc
+    };
 
     // arena 回收到水位线（§3 纪律）。
     store.data_mut().arena.truncate(watermark);

@@ -3631,3 +3631,24 @@ p 1";
         );
     }
 }
+
+
+impl Interp {
+    /// ④ JIT 驱动的中途 bump 重分派（rtcl-jit 跨 crate 公共入口）：
+    /// `site` = bump 命令自身的 site——找到包含它的顶层命令，从其
+    /// **下一条**起树走查（上下文保持：proc 语境的帧/命名空间/
+    /// line_offset 由调用链已就位）。返回 `(是否执行了命令, 结果)`；
+    /// None = site 非顶层边界（命令中段 bump——维持现状的记录分歧）。
+    pub fn jit_redispatch_after(
+        &mut self,
+        code: &ByteCode,
+        site: u32,
+    ) -> Option<(bool, crate::error::Result<crate::value::Value>)> {
+        let (unit, idx) = redispatch_target(self, code, site)?;
+        let next = idx + 1;
+        if next >= unit.commands.len() {
+            return Some((false, Ok(crate::value::Value::empty())));
+        }
+        Some((true, self.eval_commands_from(&unit, next)))
+    }
+}

@@ -121,7 +121,7 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
 
 /// 实例化并执行 proc 体，映射 `run()` 返回码。
 fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -> rtcl_core::Result<Value> {
-    use wasmi::{Engine, Module, Store, TypedFunc};
+    use wasmi::{Engine, Module, Store};
 
     let epoch0 = interp.tier1_epoch() as i64;
     // key 三元组：interp 指针 + **proc 体 Rc 指针** + epoch——只有
@@ -207,9 +207,10 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
     store.data_mut().arena_truncate(watermark);
 
     // 读取结果 → Store/Instance 还池。
-    let result = store.data_mut().result.take();
+    let mut result = store.data_mut().result.take();
     let pending_exit = store.data_mut().pending_exit.take();
     let pending = store.data_mut().pending.take();
+    let stale_site = store.data_mut().stale_site;
     PROC_POOL.with(|p| {
         let mut p = p.borrow_mut();
         if p.len() >= 64 {
@@ -223,7 +224,18 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
         code::RETURN => Err(Error::ret(result)),
         code::BREAK => Err(Error::brk()),
         code::CONTINUE => Err(Error::cont()),
-        code::STALE => Err(Error::Msg("jit proc: stale epoch (unexpected)".into())),
+        // ④ 中途 bump：从 bump 命令的下一条顶层命令树走查重分派
+        //（proc 语境的帧/命名空间/行号已由 call_proc 就位——上下文
+        // 保持由 eval_commands_from 保证）。非边界 bump 维持错误现状。
+        code::STALE => {
+            let r = stale_site
+                .and_then(|site| interp.jit_redispatch_after(bc, site));
+            match r {
+                Some((true, res)) => res,
+                Some((false, _)) => Ok(result.take().unwrap_or_else(Value::empty)),
+                None => Err(Error::Msg("jit proc: stale epoch at non-boundary".into())),
+            }
+        }
         code::EXIT => Err(Error::exit(Some(pending_exit.unwrap_or(0)))),
         _ => match pending {
             Some(p) => Err(p.err),
@@ -530,9 +542,10 @@ fn execute_proc_wasmtime(
     rtcl_vm::interp::set_jit_call_in_flight(false);
     store.data_mut().arena_truncate(watermark);
 
-    let result = store.data_mut().result.take();
+    let mut result = store.data_mut().result.take();
     let pending_exit = store.data_mut().pending_exit.take();
     let pending = store.data_mut().pending.take();
+    let stale_site = store.data_mut().stale_site;
     WT_POOL.with(|p| {
         let mut p = p.borrow_mut();
         if p.len() >= 64 {
@@ -546,7 +559,16 @@ fn execute_proc_wasmtime(
         code::RETURN => Err(Error::ret(result)),
         code::BREAK => Err(Error::brk()),
         code::CONTINUE => Err(Error::cont()),
-        code::STALE => Err(Error::Msg("jit proc wt: stale epoch (unexpected)".into())),
+        // ④ 中途 bump 重分派（wasmi proc 路径同款）。
+        code::STALE => {
+            let r = stale_site
+                .and_then(|site| interp.jit_redispatch_after(bc, site));
+            match r {
+                Some((true, res)) => res,
+                Some((false, _)) => Ok(result.take().unwrap_or_else(Value::empty)),
+                None => Err(Error::Msg("jit proc wt: stale epoch at non-boundary".into())),
+            }
+        }
         code::EXIT => Err(Error::exit(Some(pending_exit.unwrap_or(0)))),
         _ => match pending {
             Some(p) => Err(p.err),

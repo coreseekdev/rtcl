@@ -6,6 +6,7 @@
 //! 共用的注册体：全套 `rtcl::*` 宿主路由 + fuel/epoch/caching 三个
 //! 可变 global，返回 global 句柄供池命中重置。
 
+use crate::abi::code;
 use crate::emit;
 use crate::exec::{Host, JitRun};
 use rtcl_core::Interp;
@@ -59,6 +60,29 @@ pub fn execute(
     rtcl_vm::interp::set_jit_call_in_flight(true);
     let rc = run.call(&mut store, ()).expect("wasmtime: run");
     rtcl_vm::interp::set_jit_call_in_flight(false);
+    // ④ 中途 bump 重分派（与 exec.rs wasmi 顶层同款）。
+    let rc = if rc == code::STALE {
+        let stale = { store.data().stale_site };
+        match stale.and_then(|site| {
+            store.data_mut().interp_mut().jit_redispatch_after(&bc, site)
+        }) {
+            Some((true, Ok(v))) => {
+                store.data_mut().result = Some(v);
+                code::OK
+            }
+            Some((true, Err(e))) => {
+                store.data_mut().pending = Some(crate::exec::Pending {
+                    err: e,
+                    from_eval: true,
+                });
+                code::ERROR
+            }
+            Some((false, _)) => code::OK,
+            None => code::STALE,
+        }
+    } else {
+        rc
+    };
     store.data_mut().arena_truncate(watermark);
 
     let host = store.into_data();

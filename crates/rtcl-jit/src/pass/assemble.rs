@@ -524,6 +524,15 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 f.instruction(&Instruction::Br(d + 2));
                 f.instruction(&Instruction::End);
             }
+            // ④ kind 6 = Tier1 中途 bump：整单元 return STALE，驱动侧
+            // 从 bump 命令的下一条顶层命令树走查重分派。
+            f.instruction(&Instruction::LocalGet(e.kind));
+            f.instruction(&Instruction::I32Const(6));
+            f.instruction(&Instruction::I32Eq);
+            f.instruction(&Instruction::If(BlockType::Empty));
+            f.instruction(&Instruction::I32Const(code::STALE));
+            f.instruction(&Instruction::Return);
+            f.instruction(&Instruction::End);
             for (k, c) in [(3, code::BREAK), (4, code::CONTINUE)] {
                 f.instruction(&Instruction::LocalGet(e.kind));
                 f.instruction(&Instruction::I32Const(k));

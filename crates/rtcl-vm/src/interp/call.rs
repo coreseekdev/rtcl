@@ -408,6 +408,15 @@ impl Interp {
             }
 
             // ── Execute body ───────────────────────────────────────
+            // A proc body's lines are body-relative (tclsh: `(procedure
+            // "p" line 1)` is the body's first line) regardless of any
+            // caller rebase in flight — an inlined foreach/if body leaves
+            // line_offset rebased to its absolute position, and both body
+            // executors (tree-walk eval, exec_bytecode's entry_offset)
+            // would otherwise inherit it and mis-number the callee's
+            // frames (min4: `(procedure "P" line 3)` instead of line 1).
+            let saved_body_offset = self.line_offset;
+            self.line_offset = 0;
             // A named proc's body compiled once at `proc` time runs
             // op-by-op here — same errors, same frames, no per-call
             // re-parse.  Everything else (non-parsing bodies, trace-
@@ -448,6 +457,7 @@ impl Interp {
                     self.eval(&def.body)
                 }
             };
+            self.line_offset = saved_body_offset;
 
             // A tailcall whose completion an inner catch consumed leaves
             // the frame marker armed: it still fires at body end and

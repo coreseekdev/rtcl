@@ -574,35 +574,28 @@ fn backedge_fail(ctx: &Ctx, pc: u32, t: u32) -> u32 {
 /// 可达集求交会被污染（把 header 当 merge）——后支配树是正确工具：
 /// break-if 的 ipdom = 循环出口，普通 if-else 的 ipdom = 真实 merge。
 /// n = 单元出口哨兵（虚拟出口吸收全部终端）。
+/// 支配集用位图（u64 字）表示：BTreeSet 版每点存全集 + while-changed
+/// 全扫，长链单元 O(N³·logN)——260 站点 12s（gen_set 撞 judge 15s
+/// 超时的根因）；位图同算法快 ~64×。
 fn post_dominate(l2: &L2, n: u32) -> Vec<u32> {
-    // preds[x]：x 的前驱（含虚拟出口的逆向根）。
     let total = n as usize + 1;
-    let mut preds: Vec<Vec<u32>> = vec![vec![]; total];
-    for (pc, e) in l2.edges.iter().enumerate() {
-        for &t in e {
-            if (t as usize) < total {
-                preds[t as usize].push(pc as u32);
-            }
-        }
+    let words = (total + 63) / 64;
+    let set_bit = |w: &mut [u64], i: usize| w[i >> 6] |= 1u64 << (i & 63);
+    // 末字填充位（≥total）一律清零：位迭代/idom 索引不越界。
+    let pad_mask = if total % 64 == 0 {
+        u64::MAX
+    } else {
+        (1u64 << (total % 64)) - 1
+    };
+    // 初值：每点 = 全集（含自身；逆向图根 n 除外——只含自己）。
+    let mut dom: Vec<Vec<u64>> = vec![vec![u64::MAX; words]; total];
+    for row in dom.iter_mut() {
+        row[words - 1] &= pad_mask;
     }
-    // 逆向图（根 = 出口 n）：逆向后继 = 前驱。迭代支配集。
-    // dom(v) on reverse graph from root n。
-    let all: std::collections::BTreeSet<u32> = (0..=n).collect();
-    let mut dom: Vec<std::collections::BTreeSet<u32>> =
-        (0..total).map(|i| {
-            let mut s = std::collections::BTreeSet::new();
-            s.insert(i as u32);
-            s
-        })
-        .collect();
-    // 逆向图的根 = n（虚拟出口）。其他点初值 = 全集。
-    for d in dom.iter_mut().take(total) {
-        if !preds_n_root(d) {
-            *d = all.clone();
-        }
+    for w in dom[n as usize].iter_mut() {
+        *w = 0;
     }
-    dom[n as usize].clear();
-    dom[n as usize].insert(n);
+    set_bit(&mut dom[n as usize], n as usize);
     let mut changed = true;
     while changed {
         changed = false;
@@ -610,53 +603,62 @@ fn post_dominate(l2: &L2, n: u32) -> Vec<u32> {
             if v == n as usize {
                 continue;
             }
-            // 逆向图中 v 的前驱 = 正向的后继（edges[v] + 出口边）。
-            let mut ps: Vec<u32> = l2.edges[v].clone();
-            if l2.edges[v].is_empty() {
-                // 终端（无后继）→ 逆向图连虚拟出口。
-                ps.push(n);
+            // 逆向图中 v 的前驱 = 正向的后继（edges[v]；终端连虚拟出口）。
+            let succ = &l2.edges[v];
+            let mut inter = vec![u64::MAX; words];
+            let mut any = false;
+            if succ.is_empty() {
+                for (d, s) in inter.iter_mut().zip(&dom[n as usize]) {
+                    *d &= s;
+                }
+                any = true;
+            } else {
+                for &p in succ {
+                    if (p as usize) < total {
+                        for (d, s) in inter.iter_mut().zip(&dom[p as usize]) {
+                            *d &= s;
+                        }
+                        any = true;
+                    }
+                }
             }
-            if ps.is_empty() {
+            if !any {
                 continue;
             }
-            let mut inter: Option<std::collections::BTreeSet<u32>> = None;
-            for p in ps {
-                if (p as usize) < total {
-                    inter = Some(match inter {
-                        None => dom[p as usize].clone(),
-                        Some(cur) => cur
-                            .intersection(&dom[p as usize])
-                            .cloned()
-                            .collect(),
-                    });
-                }
-            }
-            if let Some(mut inter) = inter {
-                inter.insert(v as u32);
-                if inter != dom[v] {
-                    dom[v] = inter;
-                    changed = true;
-                }
+            set_bit(&mut inter, v);
+            if inter != dom[v] {
+                dom[v] = inter;
+                changed = true;
             }
         }
     }
-    // idom(v) = dom(v)\{v} 中 |dom| 最大者。
+    // idom(v) = dom(v)\{v} 中 |dom| 最大者（并列取最大 pc——BTreeSet
+    // 升伟迭代 + max_by_key 的末位决胜同款）。
+    let popcnt = |s: &[u64]| -> u32 { s.iter().map(|w| w.count_ones()).sum() };
     let mut idom = vec![u32::MAX; total];
     for v in 0..total {
-        let others: Vec<u32> = dom[v].iter().copied().filter(|x| *x != v as u32).collect();
-        if let Some(best) = others
-            .iter()
-            .max_by_key(|c| dom[**c as usize].len())
-            .copied()
-        {
-            idom[v] = best;
+        let mut best: Option<(u32, usize)> = None; // (popcount, node)
+        for w in 0..words {
+            let mut bits = dom[v][w];
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let c = w * 64 + b;
+                if c == v {
+                    continue;
+                }
+                let pc = popcnt(&dom[c]);
+                // >=：并列时后（更大 pc）胜——与 BTreeSet 版决胜一致。
+                if best.is_none() || pc >= best.unwrap().0 {
+                    best = Some((pc, c));
+                }
+            }
+        }
+        if let Some((_, c)) = best {
+            idom[v] = c as u32;
         }
     }
     idom
-}
-
-fn preds_n_root(_d: &std::collections::BTreeSet<u32>) -> bool {
-    false
 }
 
 

@@ -250,25 +250,17 @@ impl Host {
             0 => e,
             k => return k,
         };
-        // 宿主原语错误也可能已在 interp 累积帧（如 trace 脚本失败）——
-        // 哨兵取出作为基底（无累积器时 = 消息文本，两种情形同构）。
-        {
-            const SENT: &str = "\u{0}j";
-            let raw = self.irp().error_report(&e, SENT);
-            let tail = format!("\n    (file \"{}\" line ", SENT);
-            let base = match raw.rfind(&tail) {
-                Some(i) => Some(raw[..i].to_string()),
-                None if raw != e.to_string() => Some(raw),
-                None => None,
-            };
-            if let Some(b) = base {
-                self.info = Some(b);
-            }
-        }
         let fi = self.fails.get(fail_id as usize).cloned();
         if self.proc_ctx {
             // proc 语境：帧直写 interp 累积器（call_proc 的 (procedure …)
-            // 边界读它）；驱动侧字符串路径不适用。
+            // 边界读它）；驱动侧字符串路径不适用。**不抽累积器**：
+            // 嵌套 proc 的错误帧已在 interp 上（dispatch_values →
+            // call_proc(inner) 已追加），哨兵 error_report 会把它 take
+            // 进 self.info——proc_ctx 下那是死存储，帧就此丢失
+            // （p06 嵌套差分：inner 的 while-executing/procedure 帧被
+            // `"inner"` 站点帧顶替）。jit_err_* 在原累积器上追加，
+            // Some→invoked-from-within、None→首帧，与 vm_exec 的
+            // err_harness_frame 同构。
             if let Some(fi) = &fi {
                 let frameless = fi
                     .bodies
@@ -304,6 +296,22 @@ impl Host {
             }
             self.pending = Some(Pending { err: e, from_eval: false });
             return 0;
+        }
+        // 字符串路径的基底：宿主原语错误也可能已在 interp 累积帧（如
+        // trace 脚本失败）——哨兵取出作为基底（无累积器时 = 消息文本，
+        // 两种情形同构）。
+        {
+            const SENT: &str = "\u{0}j";
+            let raw = self.irp().error_report(&e, SENT);
+            let tail = format!("\n    (file \"{}\" line ", SENT);
+            let base = match raw.rfind(&tail) {
+                Some(i) => Some(raw[..i].to_string()),
+                None if raw != e.to_string() => Some(raw),
+                None => None,
+            };
+            if let Some(b) = base {
+                self.info = Some(b);
+            }
         }
         if let Some(fi) = fi {
             let frameless = fi

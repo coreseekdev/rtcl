@@ -12,6 +12,23 @@
 //! 宿主原语错误（case b）的驱动侧补帧（harness/unwind）在 proc 语境
 //! 的对齐由差分电池裁决（见 `bench/scripts/jit_proc_probes/`）。
 
+/// 池 key 三元组（interp 指针, proc 体 Rc 指针, epoch）。
+type PoolKey = (usize, usize, u64);
+/// (fuel, epoch, caching) global 句柄三元组（池命中重置用）。
+#[cfg(feature = "jit-native")]
+type WtGlobals = (wasmtime::Global, wasmtime::Global, wasmtime::Global);
+/// wasmtime 池条目：key + Store + Instance + global 句柄。
+#[cfg(feature = "jit-native")]
+type WtPoolEntry = (
+    PoolKey,
+    wasmtime::Store<Host>,
+    wasmtime::Instance,
+    WtGlobals,
+);
+/// 池命中 → 作用域的交接槽条目（key 已核过，不带）。
+#[cfg(feature = "jit-native")]
+type WtTake = (wasmtime::Store<Host>, wasmtime::Instance, WtGlobals);
+
 use crate::abi::{self, code};
 use crate::emit;
 use crate::exec::Host;
@@ -47,7 +64,7 @@ thread_local! {
     /// Store/Instance **池**（key 三元组）：复用免 instantiate——状态
     /// 残留由 **完整重置**（globals + memory cache 区 + host 状态）修复。
     static PROC_POOL: std::cell::RefCell<
-        Vec<((usize, usize, u64), wasmi::Store<Host>, wasmi::Instance)>,
+        Vec<(PoolKey, wasmi::Store<Host>, wasmi::Instance)>,
     > = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -414,19 +431,19 @@ fn read_words(c: &mut Caller<'_, Host>, base: i32, n: i32) -> Vec<u64> {
 // ── wasmtime proc 路径（阶段 3：Cranelift + 池化冲 1×）────────────────
 
 thread_local! {
-    /// wasmtime Engine 单例（Cranelift 配置复用；Engine 构造贵）。
-    #[cfg(feature = "jit-native")]
-    static WT_ENGINE: wasmtime::Engine = wasmtime::Engine::default();
     /// Cranelift Module 缓存（key 三元组同 wasmi 池）。
     #[cfg(feature = "jit-native")]
     static WT_MODULES: std::cell::RefCell<
         std::collections::HashMap<(usize, usize, u64), wasmtime::Module>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
-    /// wasmtime Store+Instance 池（key 三元组；上限 64）。
+    /// wasmtime Store+Instance+globals 池（key 三元组；上限 64）。globals
+    /// 句柄随池条目保存——池命中必须**完整重置**（fuel=0 / epoch=本代 /
+    /// caching=1 + 清 memory 缓存区 + reset_for_reuse），与 wasmi 路径
+    /// 同款；只做 reset_for_reuse 会把上一调用的 epoch/caching/缓存值
+    /// 带进来（catch_error 差分实证：第二调用读到空变量值）。
     #[cfg(feature = "jit-native")]
-    static WT_POOL: std::cell::RefCell<
-        Vec<((usize, usize, u64), wasmtime::Store<Host>, wasmtime::Instance)>,
-    > = const { std::cell::RefCell::new(Vec::new()) };
+    static WT_POOL: std::cell::RefCell<Vec<WtPoolEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(feature = "jit-native")]
@@ -444,18 +461,26 @@ fn execute_proc_wasmtime(
         code_epoch_key(bc),
     );
 
-    // 池命中：reset + 复用 Store/Instance（免 Cranelift 编译与实例化）。
+    // 池命中：完整重置（globals → memory 缓存区 → host 状态）+ 复用
+    // Store/Instance（免 Cranelift 编译与实例化）。
     let mut reused = false;
     WT_POOL.with(|p| {
         let mut p = p.borrow_mut();
         if let Some(pos) = p.iter().position(|(k, ..)| *k == pool_key) {
-            let (_, mut store, inst) = p.remove(pos);
+            let (_, mut store, inst, (gf, ge, gc)) = p.remove(pos);
+            let _ = gf.set(&mut store, wasmtime::Val::I64(0));
+            let _ = ge.set(&mut store, wasmtime::Val::I64(epoch0));
+            let _ = gc.set(&mut store, wasmtime::Val::I32(1));
+            if let Some(wasmtime::Extern::Memory(m)) = inst.get_export(&mut store, "memory") {
+                let zeros = vec![0u8; 1024]; // VALUES + STATE + SCRATCH 缓存区
+                let _ = m.write(&mut store, 0, &zeros);
+            }
             store.data_mut().reset_for_reuse();
-            WT_TAKE.with(|t| *t.borrow_mut() = Some((store, inst)));
+            WT_TAKE.with(|t| *t.borrow_mut() = Some((store, inst, (gf, ge, gc))));
             reused = true;
         }
     });
-    let (mut store, instance) = if reused {
+    let (mut store, instance, globals) = if reused {
         WT_TAKE.with(|t| t.borrow_mut().take().expect("wt pool take"))
     } else {
         let mut host = Host::new(
@@ -470,7 +495,7 @@ fn execute_proc_wasmtime(
             if let Some(w) = m.get(&pool_key) {
                 return w.clone();
             }
-            let engine = WT_ENGINE.with(|e| e.clone());
+            let engine = store_engine();
             let w = wasmtime::Module::new(&engine, &module.bytes[..])
                 .expect("jit proc wt: module");
             if m.len() >= 64 {
@@ -481,8 +506,8 @@ fn execute_proc_wasmtime(
         });
         let engine = store_engine();
         let mut store = Store::new(&engine, host);
-        let instance = register_wasmtime_proc(&mut store, epoch0, &wmodule);
-        (store, instance)
+        let (instance, globals) = register_wasmtime_proc(&mut store, epoch0, &wmodule);
+        (store, instance, globals)
     };
     let watermark = store.data().arena_len();
 
@@ -500,7 +525,7 @@ fn execute_proc_wasmtime(
         if p.len() >= 64 {
             p.clear();
         }
-        p.push((pool_key, store, instance));
+        p.push((pool_key, store, instance, globals));
     });
 
     match rc {
@@ -520,222 +545,26 @@ fn execute_proc_wasmtime(
 thread_local! {
     /// wasmtime 路径的 Store 交接槽（单线程；池命中移交进作用域）。
     #[cfg(feature = "jit-native")]
-    static WT_TAKE: std::cell::RefCell<
-        Option<(wasmtime::Store<Host>, wasmtime::Instance)>,
-    > = const { std::cell::RefCell::new(None) };
+    static WT_TAKE: std::cell::RefCell<Option<WtTake>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(feature = "jit-native")]
 fn store_engine() -> wasmtime::Engine {
-    WT_ENGINE.with(|e| e.clone())
+    crate::exec_wasmtime::wt_engine()
 }
 
-/// wasmtime 的 proc 语境 ABI 注册（call_argv 直连 + 全套宿主路由）。
+/// wasmtime 的 proc 语境 ABI 注册（与 exec_wasmtime 顶层路径共用同一
+/// 注册体）。
 #[cfg(feature = "jit-native")]
 fn register_wasmtime_proc(
     store: &mut wasmtime::Store<Host>,
     epoch0: i64,
     wmodule: &wasmtime::Module,
-) -> wasmtime::Instance {
-    use wasmtime::{Caller, Val};
-    let mut linker = <wasmtime::Linker<Host>>::new(store.engine());
-
-    let mut_g =
-        |ty: wasmtime::ValType| wasmtime::GlobalType::new(ty, wasmtime::Mutability::Var);
-    let g_fuel =
-        wasmtime::Global::new(&mut *store, mut_g(wasmtime::ValType::I64), Val::I64(0))
-            .expect("fuel global");
-    let g_epoch =
-        wasmtime::Global::new(&mut *store, mut_g(wasmtime::ValType::I64), Val::I64(epoch0))
-            .expect("epoch global");
-    let g_caching =
-        wasmtime::Global::new(&mut *store, mut_g(wasmtime::ValType::I32), Val::I32(1))
-            .expect("caching global");
-    linker.define(&mut *store, "rtcl", "fuel", g_fuel).unwrap();
-    linker.define(&mut *store, "rtcl", "epoch", g_epoch).unwrap();
-    linker.define(&mut *store, "rtcl", "caching", g_caching).unwrap();
-
-    linker
-        .func_wrap("rtcl", "unbox_int", |c: Caller<'_, Host>, h: i32| -> (i32, i64) {
-            c.data().unbox_int_raw(h)
-        })
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "unbox_float", |c: Caller<'_, Host>, h: i32| -> (i32, f64) {
-            c.data().unbox_float_raw(h)
-        })
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "box", |mut c: Caller<'_, Host>, v: i64| -> i32 {
-            c.data_mut().box_raw(v)
-        })
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "box_float", |mut c: Caller<'_, Host>, f: f64| -> i32 {
-            c.data_mut().box_float_raw(f)
-        })
-        .unwrap();
-    let caching_bin = g_caching;
-    linker
-        .func_wrap("rtcl", "binary_op", move |mut c: Caller<'_, Host>, op: i32, a: i64, b: i64| -> i64 {
-            let _ = caching_bin.set(&mut c, Val::I32(0));
-            c.data_mut().binary_op_raw(op, a, b)
-        })
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "get_var", |mut c: Caller<'_, Host>, name_h: i32| -> i64 {
-            c.data_mut().get_var_raw(name_h)
-        })
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "set_var", |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i32 {
-            c.data_mut().set_var_raw(name_h, v)
-        })
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "incr_var", |mut c: Caller<'_, Host>, name_h: i32, n: i64| -> i64 {
-            c.data_mut().incr_var_raw(name_h, n)
-        })
-        .unwrap();
-    let caching_call = g_caching;
-    linker
-        .func_wrap(
-            "rtcl",
-            "call",
-            move |mut c: Caller<'_, Host>, cmd_id: i32, site: i32, argc: i32| -> i64 {
-                let _ = caching_call.set(&mut c, Val::I32(0));
-                c.data_mut().call_raw(cmd_id, site, argc)
-            },
-        )
-        .unwrap();
-    linker
-        .func_wrap(
-            "rtcl",
-            "call_argv",
-            |mut c: Caller<'_, Host>, base: i32, argc: i32, site: i32| -> i64 {
-                let words = read_words_wt(&mut c, base, argc);
-                c.data_mut().call_argv_raw(&words, site)
-            },
-        )
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "set_result", |mut c: Caller<'_, Host>, v: i64| {
-            c.data_mut().set_result_raw(v);
-        })
-        .unwrap();
-    let fuel_g = g_fuel;
-    linker
-        .func_wrap("rtcl", "refuel", move |mut c: Caller<'_, Host>| -> i64 {
-            let chunk = c.data().refuel_chunk();
-            for _ in 0..chunk {
-                if let Err(e) = rtcl_vm::VmContext::charge_step(c.data_mut().interp_mut()) {
-                    c.data_mut().set_pending(e, false);
-                    return abi::ERR_SENTINEL;
-                }
-            }
-            let _ = fuel_g.set(&mut c, Val::I64(chunk));
-            0
-        })
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "fail", |mut c: Caller<'_, Host>, fail_id: i32| -> i32 {
-            c.data_mut().fail_raw(fail_id)
-        })
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "bool_test", |mut c: Caller<'_, Host>, v: i64| -> i64 {
-            c.data_mut().bool_test_raw(v)
-        })
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "push_const", |_c: Caller<'_, Host>, idx: i32| -> i64 {
-            abi::const_handle(idx as u32)
-        })
-        .unwrap();
-    let caching_fs = g_caching;
-    linker
-        .func_wrap(
-            "rtcl",
-            "foreach_start",
-            move |mut c: Caller<'_, Host>, info: i32, base: i32, ngroups: i32| -> i64 {
-                let _ = caching_fs.set(&mut c, Val::I32(0));
-                let words = read_words_wt(&mut c, base, ngroups);
-                c.data_mut().foreach_start_raw(info, &words)
-            },
-        )
-        .unwrap();
-    let caching_fb = g_caching;
-    linker
-        .func_wrap(
-            "rtcl",
-            "foreach_bind",
-            move |mut c: Caller<'_, Host>, info: i32, idx: i32| -> i64 {
-                let _ = caching_fb.set(&mut c, Val::I32(0));
-                c.data_mut().foreach_bind_raw(info, idx)
-            },
-        )
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "foreach_collect", |mut c: Caller<'_, Host>, v: i64| {
-            c.data_mut().foreach_collect_raw(v);
-        })
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "foreach_end", |mut c: Caller<'_, Host>| -> i64 {
-            c.data_mut().foreach_end_raw()
-        })
-        .unwrap();
-    let caching_es = g_caching;
-    linker
-        .func_wrap("rtcl", "eval_script", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
-            let _ = caching_es.set(&mut c, Val::I32(0));
-            c.data_mut().eval_script_raw(v)
-        })
-        .unwrap();
-    let caching_ee = g_caching;
-    linker
-        .func_wrap("rtcl", "eval_expr", move |mut c: Caller<'_, Host>, v: i64| -> i64 {
-            let _ = caching_ee.set(&mut c, Val::I32(0));
-            c.data_mut().eval_expr_raw(v)
-        })
-        .unwrap();
-    let caching_lap = g_caching;
-    linker
-        .func_wrap("rtcl", "lappend_var", move |mut c: Caller<'_, Host>, name_h: i32, v: i64| -> i64 {
-            let _ = caching_lap.set(&mut c, Val::I32(0));
-            c.data_mut().lappend_var_raw(name_h, v)
-        })
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "concat_n", |mut c: Caller<'_, Host>, base: i32, n: i32| -> i64 {
-            let words = read_words_wt(&mut c, base, n);
-            c.data_mut().concat_raw(&words)
-        })
-        .unwrap();
-    linker
-        .func_wrap("rtcl", "exit", |mut c: Caller<'_, Host>, code: i32| {
-            c.data_mut().exit_raw(code);
-        })
-        .unwrap();
-
-    linker
-        .instantiate(&mut *store, wmodule)
-        .expect("jit proc wt: instantiate")
+) -> (
+    wasmtime::Instance,
+    (wasmtime::Global, wasmtime::Global, wasmtime::Global),
+) {
+    crate::exec_wasmtime::register_wasmtime_abi(store, epoch0, wmodule)
 }
 
-/// 从 wasmtime 实例 memory 读 n 个 u64（SCRATCH 协议；wasmi 版同款）。
-#[cfg(feature = "jit-native")]
-fn read_words_wt(c: &mut wasmtime::Caller<'_, Host>, base: i32, n: i32) -> Vec<u64> {
-    let n_words = n.max(0) as usize;
-    let mut bytes = vec![0u8; n_words * 8];
-    let mut words = vec![0u64; n_words];
-    if let Some(wasmtime::Extern::Memory(m)) = c.get_export("memory") {
-        let _ = m.read(&mut *c, base as usize, &mut bytes);
-        for (i, w) in words.iter_mut().enumerate() {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
-            *w = u64::from_le_bytes(b);
-        }
-    }
-    words
-}

@@ -102,18 +102,42 @@ pub fn stack_effect(op: &rtcl_ir::opcode::OpCode) -> (u32, u32) {
 }
 
 /// 全管线：L0 → L4 字节。层间校验默认开启。
+/// RTCL_JIT_PASS_TIMING=1 时打印每 pass 耗时（诊断大单元的规模病）。
 pub fn run(code: &ByteCode, cfg: &EmitConfig) -> Result<(Vec<u8>, L2, L3), Unsupported> {
+    let timing = std::env::var_os("RTCL_JIT_PASS_TIMING").is_some();
+    let mut t0 = std::time::Instant::now();
+    macro_rules! mark {
+        ($name:expr) => {
+            if timing {
+                let t = t0;
+                t0 = std::time::Instant::now();
+                eprintln!("[pass] {}: {:?}", $name, t.elapsed());
+            }
+        };
+    }
     let mut l1 = annotate_lane::run(code);
+    mark!("annotate_lane");
     alloc_locals::rewrite_slots(&mut l1, code);
+    mark!("rewrite_slots");
     escape::run(&l1, code)?;
+    mark!("escape");
     let l1 = plan_guards::run(l1);
+    mark!("plan_guards");
     check::check_l1(&l1).map_err(|e| Unsupported(e.to_string()))?;
+    mark!("check_l1");
     let l2 = alloc_locals::run(l1, code)?;
+    mark!("alloc_locals");
     check::check_l2(&l2).map_err(|e| Unsupported(e.to_string()))?;
+    mark!("check_l2");
     let (mut l3, bregs) = lower::run(&l2, code)?;
+    mark!("lower");
     l3 = instrument::run(l3, cfg);
+    mark!("instrument");
     check::check_l3(&l3, l2.max_depth + 1, bregs)
         .map_err(|e| Unsupported(e.to_string()))?;
+    mark!("check_l3");
     let bytes = assemble::run(&l3, &l2, code, cfg);
+    mark!("assemble");
+    let _ = t0;
     Ok((bytes, l2, l3))
 }

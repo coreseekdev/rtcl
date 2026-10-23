@@ -64,7 +64,12 @@ thread_local! {
     /// Store/Instance **池**（key 三元组）：复用免 instantiate——状态
     /// 残留由 **完整重置**（globals + memory cache 区 + host 状态）修复。
     static PROC_POOL: std::cell::RefCell<
-        Vec<(PoolKey, wasmi::Store<Host>, wasmi::Instance)>,
+        Vec<(
+            PoolKey,
+            wasmi::Store<Host>,
+            wasmi::Instance,
+            wasmi::TypedFunc<(), i32>,
+        )>,
     > = const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -149,8 +154,8 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
         let mut p = p.borrow_mut();
         p.iter().position(|(k, ..)| *k == pool_key).map(|pos| p.remove(pos))
     });
-    let (mut store, instance) = match pooled {
-        Some((_, mut store, inst)) => {
+    let (mut store, instance, run) = match pooled {
+        Some((_, mut store, inst, runf)) => {
             // 完整重置（顺序关键：globals → memory → host）。
             let (gf, ge, gc) = {
                 let h = store.data();
@@ -164,7 +169,7 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
                 let _ = m.write(&mut store, 0, &zeros);
             }
             store.data_mut().reset_for_reuse();
-            (store, inst)
+            (store, inst, runf)
         }
         None => {
             let mut host = Host::new(
@@ -182,14 +187,16 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
                 (h.g_fuel_h, h.g_epoch_h, h.g_caching_h)
             };
             let _ = (gf, ge, gc);
-            (store, inst)
+            let runf = inst
+                .get_typed_func::<(), i32>(&store, "run")
+                .expect("run export");
+            (store, inst, runf)
         }
     };
     let watermark = store.data().arena_len();
 
-    let run: TypedFunc<(), i32> = instance
-        .get_typed_func(&store, "run")
-        .expect("run export");
+    // run 句柄随池条目缓存——免每调用的字符串导出查找（fib 差分
+    // 实证 ~0.1µs/调用）。
     // ⑧ 重入哨兵：run 窗口内 wasm32 宿主的重入求值被明确拒绝。
     rtcl_vm::interp::set_jit_call_in_flight(true);
     let rc = run.call(&mut store, ()).unwrap_or_else(|trap| {
@@ -208,7 +215,7 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
         if p.len() >= 64 {
             p.clear();
         }
-        p.push((pool_key, store, instance));
+        p.push((pool_key, store, instance, run));
     });
 
     match rc {

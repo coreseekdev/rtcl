@@ -1050,9 +1050,17 @@ impl Value {
     /// tclsh's TclIncrObj on a refcnt==1 object: no allocation, and the
     /// cached string rendering is dropped instead of eagerly rebuilt.
     pub fn set_int_rep(&mut self, n: i64) {
-        // Immediate ints retag in place — no allocation, no refcount.
-        if self.is_imm() && ((i64::MIN >> 1)..=(i64::MAX >> 1)).contains(&n) {
-            self.set_imm(n);
+        if self.is_imm() {
+            // Immediate ints retag in place — no allocation, no refcount.
+            if ((i64::MIN >> 1)..=(i64::MAX >> 1)).contains(&n) {
+                self.set_imm(n);
+                return;
+            }
+            // 超出 i63 imm 域的结果（如 2^62-1 + 5）没有堆箱可复用：
+            // 整值换新（from_int 落回堆装箱）。不能落入 heap_make_mut——
+            // 那会把 imm 位型当 *mut ValueInner 解引用（f004649 的
+            // 未对齐崩溃根因）。
+            *self = Value::from_int(n);
             return;
         }
         let inner = self.heap_make_mut();

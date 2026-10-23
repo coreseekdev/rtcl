@@ -492,8 +492,10 @@ fn template(ctx: &Ctx, pc: u32, op: &OpCode) -> Result<Option<Instr>, Unsupporte
                 brk,
                 cont,
                 cont_back: cont.is_some_and(|c| c <= pc),
+                esc: ctx.l2.fails[fail() as usize].esc,
                 brk_depth: None,
                 cont_depth: None,
+                esc_depth: None,
             }
         }
         OpCode::Call { cmd_id, argc } => {
@@ -511,8 +513,10 @@ fn template(ctx: &Ctx, pc: u32, op: &OpCode) -> Result<Option<Instr>, Unsupporte
                 brk,
                 cont,
                 cont_back: cont.is_some_and(|c| c <= pc),
+                esc: ctx.l2.fails[fail() as usize].esc,
                 brk_depth: None,
                 cont_depth: None,
+                esc_depth: None,
             }
         }
         OpCode::Lt | OpCode::Gt | OpCode::Le | OpCode::Ge => {
@@ -709,12 +713,16 @@ fn resolve(node: &mut L3, labels: &mut Vec<Label>) -> Result<(), String> {
             *depth = (labels.len() - 1 - idx) as u32;
         }
         L3::Instr(Instr::CallSite {
-            brk, cont, brk_depth, cont_depth, ..
+            brk, cont, brk_depth, cont_depth, esc, esc_depth, ..
         }) => {
             // 目标 pc → 分支深度（调用现场到目标循环标签）。解析失败
             // （目标不是祖先标签）= 出口深度 None → return 码路径。
             *brk_depth = brk.and_then(|t| resolve_target_opt(labels, t));
             *cont_depth = cont.and_then(|t| resolve_target_opt(labels, t));
+            // kind-5 逃逸：ESC_UNIT（或解析失败）恒 None = 单元返回。
+            *esc_depth = esc
+                .filter(|t| *t != crate::ir::ESC_UNIT)
+                .and_then(|t| resolve_target_opt(labels, t));
         }
         L3::Instr(_) => {}
     }

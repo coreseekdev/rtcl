@@ -162,14 +162,46 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
     let mut fail_of: Vec<Option<u32>> = Vec::with_capacity(n);
     let mut used_consts: Vec<u32> = Vec::new();
 
+    #[allow(clippy::too_many_arguments)]
     fn snap(
         pc: usize,
         cur_site: u32,
         bodies: &[(u8, u32)],
+        loops: &[(u32, u32, usize, u32)],
         word_op: bool,
         kind: FailKind,
         fails: &mut Vec<FailInfo>,
     ) -> u32 {
+        // kind-5 逃逸解析（vm_exec loop_signal 的快照期复刻——模拟此处
+        // 同时持有 bodies/loops）：内层循环的 Next 区 continue 逃逸该
+        // 循环；沿祖先循环外推——Next 区的继续逃逸（区间上界=刚逃逸
+        // 层的入口，屏蔽其已截断的 Next 标记），第一个 body 区祖先的
+        // cont 即落点；无祖先 = 单元边界（wasm return CONTINUE）。
+        // 静态线性模拟下 bodies 可能已被 Break/Continue/区域闭合截断到
+        // 比祖先入口更短（运行期的配对保证不成立）——越界区间按无
+        // Next 处理（= body 区祖先）。
+        let next_in = |from: usize, to: usize| -> bool {
+            bodies
+                .get(from..to)
+                .is_some_and(|sl| sl.iter().any(|(k, _)| *k == 2))
+        };
+        let esc: Option<u32> = match loops.last() {
+            Some(&(_, _, blen, _)) if !next_in(blen, bodies.len()) => None,
+            Some(&(_, _, blen, _)) => {
+                let mut upper = blen;
+                let mut target = crate::ir::ESC_UNIT;
+                for &(cont, _brk, eblen, _owner) in loops.iter().rev().skip(1) {
+                    if next_in(eblen, upper.min(bodies.len())) {
+                        upper = eblen;
+                        continue;
+                    }
+                    target = cont;
+                    break;
+                }
+                Some(target)
+            }
+            None => None,
+        };
         let id = fails.len() as u32;
         fails.push(FailInfo {
             pc: pc as u32,
@@ -177,6 +209,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             bodies: bodies.iter().map(|(k, s)| (body_kind(*k), *s)).collect(),
             word_op,
             kind,
+            esc,
         });
         id
     }
@@ -184,20 +217,6 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
     for (pc, a) in l1.ops.iter().enumerate() {
         let op = &a.op;
         depth_at[pc] = depth;
-        // `for` next 脚本里的**分派命令**（for-8.2/8.8/8.10 的
-        // `incr i; eval continue`——eval 编译为 Call，非 EvalScript）：
-        // 分派返回的 break/continue 按 vm_exec loop_signal 须**逃逸**
-        // 本循环（unwind + 交外层/边界转错）——wasm 的 CallSite kind
-        // 分派只能内跳最近循环的 cont/brk 标签，静态结构表达不了
-        // 「跳出一个循环再信号外层」。kind-5 逃逸通道是后续工程；
-        // 此前拒绝（回落解释器 = 语义正确；与 pc 重映射修复前这些
-        // 单元被整体拒绝的行为一致）。op 级的 incr/set/lappend
-        // （IncrVar/StoreVar/LappendVar）不受影响。
-        if matches!(op, OpCode::Call { .. } | OpCode::DynCall { .. })
-            && bodies.iter().any(|(k, _)| *k == 2)
-        {
-            return Err(Unsupported("dispatched command inside for-next script".to_string()));
-        }
         let (pops, pushes) = match op {
             // ngroups 由 info 表决定（stack_effect 无 ByteCode 访问）。
             OpCode::ForeachStart { info, .. } => (
@@ -273,9 +292,9 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
 
         // 失败点（可失败的宿主交互）。
         let fail = match op {
-            OpCode::LoadVar(_) => Some(snap(pc, cur_site, &bodies, true, FailKind::Cold, &mut fails)),
+            OpCode::LoadVar(_) => Some(snap(pc, cur_site, &bodies, &loops, true, FailKind::Cold, &mut fails)),
             OpCode::StoreVar(_) | OpCode::StoreVarPop(_) | OpCode::IncrVar(_, _) => {
-                Some(snap(pc, cur_site, &bodies, false, FailKind::Cold, &mut fails))
+                Some(snap(pc, cur_site, &bodies, &loops, false, FailKind::Cold, &mut fails))
             }
             OpCode::Add
             | OpCode::Sub
@@ -302,22 +321,24 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             | OpCode::StrEq
             | OpCode::StrNe
             | OpCode::JumpTrue(_)
-            | OpCode::JumpFalse(_) => Some(snap(pc, cur_site, &bodies, false, FailKind::Cold, &mut fails)),
+            | OpCode::JumpFalse(_) => Some(snap(pc, cur_site, &bodies, &loops, false, FailKind::Cold, &mut fails)),
             OpCode::Call { .. } | OpCode::DynCall { .. } => Some(snap(
                 pc,
                 cur_site,
                 &bodies,
+                &loops,
                 false,
                 FailKind::Call,
                 &mut fails,
             )),
-            OpCode::EvalScript => Some(snap(pc, cur_site, &bodies, true, FailKind::EvalScript, &mut fails)),
-            OpCode::LappendVar(_) => Some(snap(pc, cur_site, &bodies, false, FailKind::Cold, &mut fails)),
-            OpCode::EvalExpr => Some(snap(pc, cur_site, &bodies, false, FailKind::EvalExpr, &mut fails)),
+            OpCode::EvalScript => Some(snap(pc, cur_site, &bodies, &loops, true, FailKind::EvalScript, &mut fails)),
+            OpCode::LappendVar(_) => Some(snap(pc, cur_site, &bodies, &loops, false, FailKind::Cold, &mut fails)),
+            OpCode::EvalExpr => Some(snap(pc, cur_site, &bodies, &loops, false, FailKind::EvalExpr, &mut fails)),
             OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. } => Some(snap(
                 pc,
                 cur_site,
                 &bodies,
+                &loops,
                 false,
                 FailKind::Cold,
                 &mut fails,
@@ -425,7 +446,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
 
         for &(src, t) in &pending_backedges {
             if src == pc as u32 {
-                let bf = snap(pc, cur_site, &bodies, false, FailKind::Cold, &mut fails);
+                let bf = snap(pc, cur_site, &bodies, &loops, false, FailKind::Cold, &mut fails);
                 backedges.push(Backedge { src, target: t, fail: bf });
             }
         }

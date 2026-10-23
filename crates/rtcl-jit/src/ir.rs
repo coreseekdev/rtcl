@@ -111,7 +111,15 @@ pub struct FailInfo {
     pub word_op: bool,
     /// 失败 op 类别（case-a 帧构建用）。
     pub kind: FailKind,
+    /// kind-5 Next 区域 continue 逃逸解析（loop_signal 快照期复刻）：
+    /// None = 普通 continue（内跳最近循环 cont）；Some(ESC_UNIT) =
+    /// 逃逸到单元边界（wasm return CONTINUE，proc 边界转错）；Some(pc)
+    /// = 跳到第一个 body 区祖先循环的 cont。
+    pub esc: Option<u32>,
 }
+
+/// FailInfo.esc 的单元边界哨兵。
+pub const ESC_UNIT: u32 = u32::MAX;
 
 /// 内联 region 种类（vm_exec `Region` 的静态子集）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,9 +307,13 @@ pub enum Instr {
         brk: Option<u32>,
         cont: Option<u32>,
         cont_back: bool,
+        /// kind-5 逃逸目标（fail 表的 esc 副本；ESC_UNIT = 单元返回）。
+        esc: Option<u32>,
         /// phase B 解析后的出口深度（None = 无循环或不可达标签）。
         brk_depth: Option<u32>,
         cont_depth: Option<u32>,
+        /// kind-5 的逃逸深度（Some(MAX) 副本时恒 None = 单元返回）。
+        esc_depth: Option<u32>,
     },
     /// `rtcl.fail(fail_id)` + 返回 TCL_ERROR。
     Fail { fail: u32 },

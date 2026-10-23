@@ -469,7 +469,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             check_sentinel(e, f, dst.0, *fail);
             f.instruction(&Instruction::End); // done
         }
-        Instr::CallSite { dst, cmd_id, argc, fail, site, srcs, cont_back, brk_depth, cont_depth, .. } => {
+        Instr::CallSite { dst, cmd_id, argc, fail, site, srcs, cont_back, brk_depth, cont_depth, esc, esc_depth, .. } => {
             emit_flush(e, f, *fail);
             // M2 全案直连：已求值实参寄存器写暂存区（SCRATCH 协议）→
             // rtcl.call_argv(base, argc, site) 直传 dispatch_values，
@@ -533,6 +533,25 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::I32Const(code::STALE));
             f.instruction(&Instruction::Return);
             f.instruction(&Instruction::End);
+            // kind 5 = Next 区域 continue 逃逸：跳第一个 body 区祖先
+            // 循环的 cont（深度已解析）；无祖先/解析失败 → 单元返回
+            // CONTINUE（proc 边界按 loop_signal 语义转错）。
+            if esc.is_some() {
+                f.instruction(&Instruction::LocalGet(e.kind));
+                f.instruction(&Instruction::I32Const(5));
+                f.instruction(&Instruction::I32Eq);
+                f.instruction(&Instruction::If(BlockType::Empty));
+                match esc_depth {
+                    Some(d) => {
+                        f.instruction(&Instruction::Br(d + 2));
+                    }
+                    None => {
+                        f.instruction(&Instruction::I32Const(code::CONTINUE));
+                        f.instruction(&Instruction::Return);
+                    }
+                }
+                f.instruction(&Instruction::End);
+            }
             for (k, c) in [(3, code::BREAK), (4, code::CONTINUE)] {
                 f.instruction(&Instruction::LocalGet(e.kind));
                 f.instruction(&Instruction::I32Const(k));

@@ -250,7 +250,17 @@ impl Host {
             // continue` 走 DynCall 的树遍历 cmd_if，不捕获控制流）必须
             // 以 kind 返回，CallSite 的出口分派才能内跳；纯错误保留
             // pending 给终局报告（帧已在 interp，驱动不补）。
+            // kind 5：Next 区域的 continue 逃逸（loop_signal 语义——
+            // fail 表的 esc 已在快照期解析好落点）。
             let kind = classify_control(&e);
+            if kind == 2
+                && self
+                    .fails
+                    .get(fail_id as usize)
+                    .is_some_and(|f| f.esc.is_some())
+            {
+                return 5;
+            }
             if kind != 0 {
                 return kind;
             }
@@ -259,6 +269,14 @@ impl Host {
         }
         let e = match classify_control(&e) {
             0 => e,
+            // kind 5：Next 区域的 continue 逃逸（同 case-a 口径）。
+            2 if self
+                .fails
+                .get(fail_id as usize)
+                .is_some_and(|f| f.esc.is_some()) =>
+            {
+                return 5
+            }
             k => return k,
         };
         let fi = self.fails.get(fail_id as usize).cloned();

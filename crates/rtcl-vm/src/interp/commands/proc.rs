@@ -320,8 +320,18 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if let Err(e) = &r {
         if interp.err_is_error(e) {
             // F5: `(lambda term "{} {boomap}" line N)` — the lambda TERM's
-            // value renders in the tag.
-            let tag = format!("lambda term \"{}\"", args[1].as_str());
+            // value renders in the tag.  tclsh caps THIS frame at 60
+            // chars (empirical: for-8.2/for-8.8 both truncate there —
+            // a different budget than the 150-char log excerpt).
+            let term = args[1].as_str();
+            let term: std::borrow::Cow<str> = if term.chars().count() > 60 {
+                let mut s: String = term.chars().take(60).collect();
+                s.push_str("...");
+                s.into()
+            } else {
+                term.into()
+            };
+            let tag = format!("lambda term \"{}\"", term);
             interp.err_exit_frame(&tag);
         }
     }

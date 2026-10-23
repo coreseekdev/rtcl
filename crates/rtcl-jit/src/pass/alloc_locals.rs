@@ -42,7 +42,14 @@ pub fn rewrite_slots(l1: &mut L1, code: &ByteCode) {
         let base = code.constants().len() as u32;
         let pseudo = |slot: u16| base + slot as u32;
         let mut rewritten: Vec<OpCode> = Vec::with_capacity(l1.ops.len() * 2);
+        // 多 op 展开（Cmp/AddSlot*）让后续 op 的 pc 平移——**所有**
+        // 跳转/迭代目标必须按 old→new 映射重编，否则目标错位
+        //（fib 的 `if {$n<2}`：CmpSlotImm 展开 +2 后 JumpFalse(7)
+        // 指向了 Return——栈纪律检查器拦下整单元拒绝，proc 体静默
+        // 回落解释器，每次调用重编译——fib .13× 的真正根因）。
+        let mut map: Vec<u32> = Vec::with_capacity(l1.ops.len());
         for l1op in l1.ops.drain(..) {
+            map.push(rewritten.len() as u32);
             let op = l1op.op;
             match op {
                 OpCode::LoadLocal(s) => rewritten.push(OpCode::LoadVar(pseudo(s) as u16)),
@@ -88,6 +95,40 @@ pub fn rewrite_slots(l1: &mut L1, code: &ByteCode) {
             // lane 字段随 op 丢弃——重写后的规范窗口由 plan_guards 的
             // guardable 集覆盖（annotate_lane 的 lane 信息对 slot 重写
             // 产物不敏感：数值 op 语义同 M1' 路径）。
+        }
+        // pc 目标重映射（映射表按 old op 边界建——目标都指向 op 起点）。
+        let at = |map: &[u32], t: &mut u32| {
+            if let Some(n) = map.get(*t as usize) {
+                *t = *n;
+            }
+        };
+        for op in rewritten.iter_mut() {
+            match op {
+                OpCode::Jump(t) | OpCode::JumpTrue(t) | OpCode::JumpFalse(t) => at(&map, t),
+                OpCode::LoopEnter { cont, brk } => {
+                    at(&map, cont);
+                    at(&map, brk);
+                }
+                OpCode::ForeachStart { next, end, .. } => {
+                    at(&map, next);
+                    at(&map, end);
+                }
+                OpCode::ForeachNext { body, .. } => at(&map, body),
+                OpCode::CatchStart(t) => at(&map, t),
+                OpCode::CmpSlotSlotJumpTrue(_, _, _, t)
+                | OpCode::CmpSlotSlotJumpFalse(_, _, _, t)
+                | OpCode::CmpSlotImmJumpTrue(_, _, _, t)
+                | OpCode::CmpSlotImmJumpFalse(_, _, _, t)
+                | OpCode::CmpVarVarJumpTrue(_, _, _, t)
+                | OpCode::CmpVarVarJumpFalse(_, _, _, t)
+                | OpCode::CmpVarImmJumpTrue(_, _, _, t)
+                | OpCode::CmpVarImmJumpFalse(_, _, _, t) => at(&map, t),
+                OpCode::ForNextIncrLocal(_, _, _, t) | OpCode::ForNextIncrVar(_, _, _, t) => {
+                    at(&map, t)
+                }
+                OpCode::ForeachNextClose(_, b) => at(&map, b),
+                _ => {}
+            }
         }
         l1.ops = rewritten.into_iter().map(|op| crate::ir::L1Op {
             op,
@@ -143,6 +184,20 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
     for (pc, a) in l1.ops.iter().enumerate() {
         let op = &a.op;
         depth_at[pc] = depth;
+        // `for` next 脚本里的**分派命令**（for-8.2/8.8/8.10 的
+        // `incr i; eval continue`——eval 编译为 Call，非 EvalScript）：
+        // 分派返回的 break/continue 按 vm_exec loop_signal 须**逃逸**
+        // 本循环（unwind + 交外层/边界转错）——wasm 的 CallSite kind
+        // 分派只能内跳最近循环的 cont/brk 标签，静态结构表达不了
+        // 「跳出一个循环再信号外层」。kind-5 逃逸通道是后续工程；
+        // 此前拒绝（回落解释器 = 语义正确；与 pc 重映射修复前这些
+        // 单元被整体拒绝的行为一致）。op 级的 incr/set/lappend
+        // （IncrVar/StoreVar/LappendVar）不受影响。
+        if matches!(op, OpCode::Call { .. } | OpCode::DynCall { .. })
+            && bodies.iter().any(|(k, _)| *k == 2)
+        {
+            return Err(Unsupported("dispatched command inside for-next script".to_string()));
+        }
         let (pops, pushes) = match op {
             // ngroups 由 info 表决定（stack_effect 无 ByteCode 访问）。
             OpCode::ForeachStart { info, .. } => (

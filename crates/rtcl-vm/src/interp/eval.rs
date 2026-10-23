@@ -380,6 +380,24 @@ impl Interp {
         Ok(result)
     }
 
+    /// ④ Tier1 中途重定义的树走查 re-dispatch：从第 `k` 个命令起执行，
+    /// **保留调用方（vm_exec）已就位的单元上下文**（namespace/词法/
+    /// line_offset）——与 `eval(remaining)` 的"新单元重置语义"不同，
+    /// 后者正是 083537a 实验回退的原因（ens/ens2 丢上下文差分）。
+    pub(crate) fn eval_commands_from(
+        &mut self,
+        unit: &rtcl_parser::ScriptUnit,
+        k: usize,
+    ) -> Result<Value> {
+        let mut result = Value::empty();
+        let from = k.min(unit.commands.len());
+        for cmd in &unit.commands[from..] {
+            result = self.eval_command(unit, cmd)?;
+        }
+        self.result = result.clone();
+        Ok(result)
+    }
+
     fn eval_command(&mut self, unit: &rtcl_parser::ScriptUnit, cmd: &Command) -> Result<Value> {
         if cmd.words.is_empty() {
             return Ok(Value::empty());

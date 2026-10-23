@@ -448,6 +448,52 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
     r
 }
 
+/// BeginCmd 系 op（含全部 PR#2 融合形态）的 site 下标——命令边界。
+fn begin_cmd_site(op: &OpCode) -> Option<u32> {
+    match op {
+        OpCode::BeginCmd(s)
+        | OpCode::ExprMarkBeginCmd(s)
+        | OpCode::BeginCmdPushConst(s, _)
+        | OpCode::NextMarkBeginCmd(s)
+        | OpCode::BeginCmdIncrLocalPop(s, ..)
+        | OpCode::BeginCmdIncrVarPop(s, ..)
+        | OpCode::SubMarkBeginCmd(s)
+        | OpCode::ExprMarkBeginPushConst(s, _)
+        | OpCode::ForNextIncrLocal(s, ..)
+        | OpCode::ForNextIncrVar(s, ..) => Some(*s),
+        _ => None,
+    }
+}
+
+/// ④ 重分派目标：site 的源起点对应**顶层**命令（span 起点相等——内联
+/// 括号/体内子命令的起点落在顶层 span 内部，不等于任何顶层起点）→
+/// (该单元的 ScriptUnit, 命令下标)。单元优先取 parse_cache（内容等值
+/// 命中；proc 体首次走此路径时现解析并回填）。
+fn redispatch_target(
+    interp: &mut Interp,
+    code: &ByteCode,
+    site: u32,
+) -> Option<(Rc<rtcl_parser::ScriptUnit>, usize)> {
+    let span = code.sites.get(site as usize)?.text;
+    // parse_cache 以 Rc<str> 为键（str Borrow）——按内容等值命中；proc 体
+    // 首次走此路径时现解析并回填（key 共享 code.source 分配）。
+    let unit = match interp.parse_cache.get(&*code.source) {
+        Some(u) => Rc::clone(u),
+        None => {
+            let u = Rc::new(rtcl_parser::ScriptUnit::parse(&code.source).ok()?);
+            interp
+                .parse_cache
+                .insert(Rc::clone(&code.source), Rc::clone(&u));
+            u
+        }
+    };
+    let idx = unit
+        .commands
+        .iter()
+        .position(|c| c.text.start == span.start)?;
+    Some((unit, idx))
+}
+
 fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<Value> {
     let ops = code.ops();
 
@@ -464,12 +510,19 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
         // SAFETY: the check above proves `st.pc` in-bounds.
         let op = unsafe { ops.get_unchecked(st.pc) };
         st.pc += 1;
-        // M3 OPEN: mid-unit Tier1 redefinition (e1-e3 probes). Re-dispatch
-        // via eval(remaining) fixes simple cases (e1: 6→5, e2: error shape,
-        // e3: error shape) but regresses namespace probes (ens/ens2: eval
-        // doesn't preserve namespace/lexical context — byte diffs).
-        // Proper fix needs namespace-aware re-dispatch (or per-cmd
-        // epoch check via a host fn). Recorded for future task.
+        // ④ Tier1 中途重定义（e1-e3 探针）：bump 后本单元的折叠 op 失效
+        // ——从当前命令起改走树走查（上下文保持：namespace/词法/
+        // line_offset 已由 exec_bytecode 就位；083537a 实验的
+        // eval(remaining) 因重置单元上下文回退）。site 起点非顶层命令
+        // 起点（命令中段的 bump——括号/体内重定义）时维持现状（记录
+        // 分歧：重进入点只支持命令边界）。
+        if interp.tier1_epoch != code.epoch {
+            if let Some(site) = begin_cmd_site(op) {
+                if let Some((unit, cmd_idx)) = redispatch_target(interp, code, site) {
+                    break interp.eval_commands_from(&unit, cmd_idx)?;
+                }
+            }
+        }
         // ── Hot lane ────────────────────────────────────────────────────
         // The ops a compiled loop body is made of run inline: the
         // `exec_op` call + its second dispatch was the exec-side profile's

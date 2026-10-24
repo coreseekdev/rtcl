@@ -209,8 +209,9 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
     if let Some(np) = nparams {
         // 参数 var 映射：l2.vars 中 const_idx ∈ [const_base, const_base+np)
         let mut param_slot = std::collections::HashMap::new();
+        let consts_len2 = code.constants().len() as u32;
         for (vi, v) in l2.vars.iter().enumerate() {
-            if let Some(slot) = v.const_idx.checked_sub(l2.const_base) {
+            if let Some(slot) = v.const_idx.checked_sub(consts_len2) {
                 if (slot as usize) < np {
                     param_slot.insert(vi as u32, slot);
                 }
@@ -257,13 +258,14 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
         fw.instruction(&Instruction::I32Mul);
         fw.instruction(&Instruction::I32Add);
         fw.instruction(&Instruction::LocalSet(4));
-        // 拷贝实参：mem[param_base + i*8] = mem[argv + i*8]
+        // 拷贝实参（跳过 argv[0]——SCRATCH 暂存的是 dispatch_values 形状，
+        // args[0] = 命令名）：mem[param_base + i*8] = mem[argv + (i+1)*8]
         for i in 0..np as u32 {
             fw.instruction(&Instruction::LocalGet(4));
             fw.instruction(&Instruction::I32Const((i * 8) as i32));
             fw.instruction(&Instruction::I32Add);
             fw.instruction(&Instruction::LocalGet(2));
-            fw.instruction(&Instruction::I32Const((i * 8) as i32));
+            fw.instruction(&Instruction::I32Const(((i + 1) * 8) as i32));
             fw.instruction(&Instruction::I32Add);
             fw.instruction(&Instruction::I64Load(MemArg { offset: 0, align: 3, memory_index: 0 }));
             fw.instruction(&Instruction::I64Store(MemArg { offset: 0, align: 3, memory_index: 0 }));
@@ -364,10 +366,21 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
 /// - 无宿主路由 op（EvalScript/EvalExpr/LappendVar/Concat/Foreach*——
 ///   需要 interp 帧在场）；Call/DynCall 允许（直呼 + 回落双分支）
 fn fast_gate(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
+    if let Some(r) = fast_gate_inner(l2, l3, code) {
+        return Some(r);
+    }
+    None
+}
+
+fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
     use crate::ir::Instr;
     let np = code.params_aligned?;
+    // VarSlot.const_idx 是**池相对**索引（name_handle 才加 CONST_BASE）——
+    // local 伪常量段 = [consts_len, consts_len+locals)。此前误减
+    // l2.const_base（=3）致 fib 的参数 n 被判非常量而拒绝。
+    let consts_len = code.constants().len() as u32;
     for v in &l2.vars {
-        let slot = v.const_idx.checked_sub(l2.const_base)?;
+        let slot = v.const_idx.checked_sub(consts_len)?;
         if slot as usize >= np {
             return None;
         }
@@ -375,28 +388,36 @@ fn fast_gate(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
     if !l2.backedges.is_empty() {
         return None;
     }
-    let mut ok = true;
+    let mut bad: Option<&'static str> = None;
+    let mut has_loop = false;
     walk(l3, &mut |n| {
+        if matches!(n, L3::Loop { .. }) {
+            has_loop = true;
+        }
         let L3::Instr(i) = n else { return };
-        match i {
-            Instr::EvalScript { .. }
-            | Instr::EvalExpr { .. }
-            | Instr::LappendVar { .. }
-            | Instr::Concat { .. }
-            | Instr::ForeachStart { .. }
+        let b = match i {
+            Instr::EvalScript { .. } => Some("eval_script"),
+            Instr::EvalExpr { .. } => Some("eval_expr"),
+            Instr::LappendVar { .. } => Some("lappend"),
+            Instr::Concat { .. } => Some("concat"),
+            Instr::ForeachStart { .. }
             | Instr::ForeachBind { .. }
             | Instr::ForeachStep { .. }
             | Instr::ForeachEnd { .. }
-            | Instr::ForeachCollect { .. }
-            | Instr::BackedgeFuel { .. } => ok = false,
-            Instr::StoreVar { .. } | Instr::IncrVar { .. } => ok = false, // v1：参数只读
-            _ => {}
-        }
-        if matches!(n, L3::Loop { .. }) {
-            ok = false;
+            | Instr::ForeachCollect { .. } => Some("foreach"),
+            Instr::BackedgeFuel { .. } => Some("backedge"),
+            Instr::StoreVar { .. } | Instr::IncrVar { .. } => Some("store/incr"),
+            _ => None,
+        };
+        if b.is_some() && bad.is_none() {
+            bad = b;
         }
     });
-    if ok { Some(np) } else { None }
+    if bad.is_some() || has_loop {
+        return None;
+    }
+    let _ = (&bad, has_loop);
+    Some(np)
 }
 
 fn count_foreach(l3: &L3) -> u32 {
@@ -844,10 +865,22 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 f.instruction(&Instruction::I32Const(cache::SCRATCH as i32));
                 f.instruction(&Instruction::Call(import::RESOLVE_PROC));
                 f.instruction(&Instruction::LocalSet(dst.0));
-                check_sentinel(e, f, dst.0, *fail);
-                // fail_path 落穿（kind≠0）：3/4/6 → (哨兵, 映射 rc) 返回
-                //（1/2/5 被 loop gate 排除）。
-                for (k, rc) in [(3i32, code::BREAK), (4, code::CONTINUE), (6, code::STALE)] {
+                // 哨兵分支内：fail_path（kind 0 → 帧+(哨兵,ERROR) 返回）
+                // + kind 臂（1-4/6 → (哨兵, 映射 rc) 返回）。**必须在 If
+                // 内**——外面的 kind 局部是未初始化垃圾（fib(2) 实证：
+                // 随机命中 CONTINUE 码泄漏到 proc 边界）。
+                f.instruction(&Instruction::LocalGet(dst.0));
+                f.instruction(&Instruction::I64Const(abi::ERR_SENTINEL));
+                f.instruction(&Instruction::I64Eq);
+                f.instruction(&Instruction::If(BlockType::Empty));
+                fail_path(e, f, *fail);
+                for (k, rc) in [
+                    (1i32, code::BREAK),
+                    (2, code::CONTINUE),
+                    (3, code::BREAK),
+                    (4, code::CONTINUE),
+                    (6, code::STALE),
+                ] {
                     f.instruction(&Instruction::LocalGet(e.kind));
                     f.instruction(&Instruction::I32Const(k));
                     f.instruction(&Instruction::I32Eq);
@@ -856,6 +889,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                     ret_fast_sentinel(f, rc);
                     f.instruction(&Instruction::End);
                 }
+                f.instruction(&Instruction::End);
                 f.instruction(&Instruction::End); // $done
                 return;
             }

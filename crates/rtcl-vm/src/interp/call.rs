@@ -838,6 +838,37 @@ fn ns_of_qualified(interp: &Interp, name: &str) -> Rc<str> {
 }
 
 impl Interp {
+    /// 编译体 → 注册名反查（fast 错误冷路径的 (procedure "name") 帧）。
+    pub fn jit_proc_name_of(&self, code: &Rc<rtcl_ir::bytecode::ByteCode>) -> Option<String> {
+        for (k, def) in self.procs.iter() {
+            if let Some(cc) = &def.compiled {
+                if Rc::ptr_eq(cc, code) {
+                    return Some(k.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// fast-tier 目标自省（rtcl-jit resolve_proc 冷融合用）：名字是
+    /// 普通 proc（无 trace/statics）→ 其编译体 Rc（调用方再判 fast
+    /// 形状）；否则 None（内建/未知/复杂形状走分派回落）。
+    pub fn jit_proc_code(&mut self, name: &str) -> Option<Rc<rtcl_ir::bytecode::ByteCode>> {
+        if !self.exec_traces.is_empty() {
+            return None;
+        }
+        match self.cmd_cache_get(name) {
+            Some(super::ResolvedCmd::Proc(key)) => {
+                let def = self.procs.get(key.as_ref())?;
+                if !def.statics.is_empty() {
+                    return None;
+                }
+                def.compiled.clone()
+            }
+            _ => None,
+        }
+    }
+
     /// JIT 直呼快路径（call_argv 直连路由的 dispatch 免除层）：
     /// cmd_cache 命中 proc 且形状门过 → 精简帧机器（call_proc 的
     /// 无循环/无 trace/无 statics 版；epilogue 语义逐项复刻——

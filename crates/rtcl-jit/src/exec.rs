@@ -57,7 +57,7 @@ pub(crate) struct Host {
     pub(crate) consts: Vec<String>,
     /// locals 名（slot 重写的伪常量槽——名字解析同 consts 公式延伸）。
     pub(crate) local_names: Vec<String>,
-    fails: Vec<FailInfo>,
+    pub(crate) fails: Vec<FailInfo>,
     sites: Vec<rtcl_parser::SrcSpan>,
     lines: Vec<u32>,
     source: Rc<str>,
@@ -118,7 +118,7 @@ fn is_real_error(e: &Error) -> bool {
 }
 
 impl Host {
-    fn value_of(&self, tagged: i64) -> Value {
+    pub(crate) fn value_of(&self, tagged: i64) -> Value {
         if tagged & 1 == 1 {
             return Value::from_imm(abi::untag(tagged));
         }
@@ -139,7 +139,7 @@ impl Host {
         }
     }
 
-    fn tag_value(&mut self, v: &Value) -> i64 {
+    pub(crate) fn tag_value(&mut self, v: &Value) -> i64 {
         if v.is_imm() {
             return abi::tag_imm(v.imm());
         }
@@ -236,7 +236,7 @@ impl Host {
     }
 
     /// case b 的 fail 处置：分类 + （错误时）帧追加。返回 kind。
-    fn take_fail(&mut self, fail_id: u32) -> i32 {
+    pub(crate) fn take_fail(&mut self, fail_id: u32) -> i32 {
         let Some(p) = self.pending.take() else { return 0 };
         let e = p.err;
         // ④ 中途 bump 标记：kind 6（CallSite 模板 → return STALE，
@@ -454,11 +454,11 @@ impl Host {
 }
 
 /// ④ 中途 bump 的 pending 标记（take_fail → kind 6）。
-const STALE_MARK: &str = "\u{0}jit-stale";
+pub(crate) const STALE_MARK: &str = "\u{0}jit-stale";
 
 /// 控制流分类（fail 的返回 kind）：0=错误、1/3=break（内层/外层）、
 /// 2/4=continue。level≤1 = 属于本单元的内层循环。
-fn classify_control(e: &Error) -> i32 {
+pub(crate) fn classify_control(e: &Error) -> i32 {
     if e.is_break() {
         if e.loop_level() > 1 { 3 } else { 1 }
     } else if e.is_continue() {
@@ -604,6 +604,12 @@ impl Host {
         self.arena.truncate(n);
     }
 
+    pub(crate) fn site_text_of(&self, site: u32) -> String {
+        self.site_text(site).to_string()
+    }
+    pub(crate) fn lines_of(&self, site: u32) -> usize {
+        self.lines.get(site as usize).copied().unwrap_or(0) as usize
+    }
     pub fn refuel_chunk(&self) -> i64 {
         self.refuel_chunk
     }
@@ -1044,7 +1050,7 @@ impl Host {
         self.pending_exit = Some(code);
     }
 
-    fn const_name(&self, name_h: i32) -> String {
+    pub(crate) fn const_name(&self, name_h: i32) -> String {
         let idx = ((name_h >> 1) as usize).saturating_sub(abi::CONST_ARENA_BASE as usize);
         if idx < self.consts.len() {
             self.consts[idx].clone()

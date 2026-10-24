@@ -103,7 +103,7 @@ pub fn stack_effect(op: &rtcl_ir::opcode::OpCode) -> (u32, u32) {
 
 /// 全管线：L0 → L4 字节。层间校验默认开启。
 /// RTCL_JIT_PASS_TIMING=1 时打印每 pass 耗时（诊断大单元的规模病）。
-pub fn run(code: &ByteCode, cfg: &EmitConfig) -> Result<(Vec<u8>, L2, L3), Unsupported> {
+pub fn run(code: &ByteCode, cfg: &EmitConfig) -> Result<(Vec<u8>, L2, L3, Option<crate::emit::FastMeta>), Unsupported> {
     // Instant::now 在 wasm32 上 panic——只在启用时取时。
     let timing = crate::env_enabled("RTCL_JIT_PASS_TIMING");
     let mut t0 = timing.then(std::time::Instant::now);
@@ -136,8 +136,8 @@ pub fn run(code: &ByteCode, cfg: &EmitConfig) -> Result<(Vec<u8>, L2, L3), Unsup
     check::check_l3(&l3, l2.max_depth + 1, bregs)
         .map_err(|e| Unsupported(e.to_string()))?;
     mark!("check_l3");
-    let bytes = assemble::run(&l3, &l2, code, cfg);
+    let (bytes, fast) = assemble::run(&l3, &l2, code, cfg);
     mark!("assemble");
     let _ = t0;
-    Ok((bytes, l2, l3))
+    Ok((bytes, l2, l3, fast))
 }

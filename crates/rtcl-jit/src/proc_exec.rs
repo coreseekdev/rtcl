@@ -250,7 +250,15 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
         if let Some(w) = m.get(&pool_key) {
             return w.clone();
         }
-        let w = Module::new(&engine, &module.bytes[..]).expect("jit proc: module");
+        let w = match Module::new(&engine, &module.bytes[..]) {
+            Ok(m) => m,
+            Err(e) => {
+                if std::env::var_os("JIT_DUMP_MOD").is_some() {
+                    std::fs::write("/tmp/jitdbg/failmod.wasm", &module.bytes[..]).unwrap();
+                }
+                panic!("jit proc: module: {e:?}");
+            }
+        };
         if m.len() >= 64 {
             m.clear();
         }
@@ -304,6 +312,27 @@ fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64, wmodule
     linker.define("rtcl", "fuel", Extern::Global(g_fuel)).unwrap();
     linker.define("rtcl", "epoch", Extern::Global(g_epoch)).unwrap();
     linker.define("rtcl", "caching", Extern::Global(g_caching)).unwrap();
+    // fast 模块附加导入 stub（经常规池运行时 proc_main 不被调用）。
+    {
+        let mem = wasmi::Memory::new(&mut *store, wasmi::MemoryType::new(1, None)).unwrap();
+        linker.define("rtcl", "memory", Extern::Memory(mem)).unwrap();
+        let tbl = wasmi::Table::new(
+            &mut *store,
+            wasmi::TableType::new(wasmi::RefType::Func, 256, None),
+            wasmi::Ref::Func(wasmi::Nullable::Null),
+        ).unwrap();
+        linker.define("rtcl", "funs", Extern::Table(tbl)).unwrap();
+        let g_cur = wasmi::Global::new(&mut *store, wasmi::Val::I32(0), wasmi::Mutability::Var);
+        linker.define("rtcl", "cur_proc", Extern::Global(g_cur)).unwrap();
+        let g_scb = wasmi::Global::new(&mut *store, wasmi::Val::I32(0), wasmi::Mutability::Var);
+        linker.define("rtcl", "site_cache_base", Extern::Global(g_scb)).unwrap();
+        let g_fd = wasmi::Global::new(&mut *store, wasmi::Val::I32(0), wasmi::Mutability::Var);
+        linker.define("rtcl", "fast_depth", Extern::Global(g_fd)).unwrap();
+    }
+    linker.func_wrap("rtcl", "resolve_proc", |_s: i32, _a: i32, _b: i32| -> i64 {
+        unreachable!("resolve_proc stub (regular store)")
+    }).unwrap();
+    linker.func_wrap("rtcl", "proc_exit_frame", |_slot: i32| {}).unwrap();
 
     linker
         .func_wrap("rtcl", "unbox_int", |c: Caller<'_, Host>, h: i32| -> (i32, i64) {

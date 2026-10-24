@@ -119,6 +119,34 @@ pub(crate) fn register_wasmtime_abi(
     linker.define(&mut *store, "rtcl", "fuel", g_fuel).unwrap();
     linker.define(&mut *store, "rtcl", "epoch", g_epoch).unwrap();
     linker.define(&mut *store, "rtcl", "caching", g_caching).unwrap();
+    // fast 模块附加导入 stub（wasmtime 路径不实现 fast 驱动——
+    // fast 模块经此注册时走 run() 经典行为）。
+    let mem = wasmtime::Memory::new(&mut *store, wasmtime::MemoryType::new(1, None))
+        .expect("stub memory");
+    linker.define(&mut *store, "rtcl", "memory", wasmtime::Extern::Memory(mem)).unwrap();
+    let tbl = wasmtime::Table::new(
+        &mut *store,
+        wasmtime::TableType::new(wasmtime::RefType::FUNCREF, 256, None),
+        wasmtime::Ref::Func(None),
+    ).expect("stub table");
+    linker.define(&mut *store, "rtcl", "funs", wasmtime::Extern::Table(tbl)).unwrap();
+    let mk_g = |store: &mut wasmtime::Store<Host>| {
+        wasmtime::Global::new(
+            store,
+            wasmtime::GlobalType::new(wasmtime::ValType::I32, wasmtime::Mutability::Var),
+            Val::I32(0),
+        ).expect("stub global")
+    };
+    let g_cur = mk_g(&mut *store);
+    let g_scb = mk_g(&mut *store);
+    let g_fd = mk_g(&mut *store);
+    linker.define(&mut *store, "rtcl", "cur_proc", g_cur).unwrap();
+    linker.define(&mut *store, "rtcl", "site_cache_base", g_scb).unwrap();
+    linker.define(&mut *store, "rtcl", "fast_depth", g_fd).unwrap();
+    linker.func_wrap("rtcl", "resolve_proc", |_s: i32, _a: i32, _b: i32| -> i64 {
+        unreachable!("resolve_proc stub (wasmtime store)")
+    }).unwrap();
+    linker.func_wrap("rtcl", "proc_exit_frame", |_slot: i32| {}).unwrap();
 
     linker
         .func_wrap("rtcl", "unbox_int", |c: Caller<'_, Host>, h: i32| -> (i32, i64) {

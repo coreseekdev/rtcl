@@ -13,7 +13,8 @@ use crate::pass::EmitConfig;
 use rtcl_ir::bytecode::ByteCode;
 use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
-    GlobalSection, GlobalType, ImportSection, Instruction, MemArg, MemorySection, MemoryType,
+    GlobalSection, GlobalType, ImportSection, Instruction, MemArg, MemorySection, MemoryType, RefType,
+    TableType,
     Module, TypeSection, ValType,
 };
 
@@ -28,6 +29,27 @@ struct Env<'a> {
     epoch_home: u32,
     bool_base: u32,
     kind: u32,
+    /// fast-tier（proc_main 发射中）：Some(ctx) 时——LoadVar(参数)→
+    /// local.get；SetResult 免宿主直记寄存器；fail/出口返回
+    /// (i64 哨兵, i32 rc) 多值；cur_site global 下标 = 4（多导入
+    /// cur_proc 一个）。
+    fast: Option<FastCtx>,
+}
+
+struct FastCtx {
+    /// var（l2.vars 下标）→ 参数 slot（per-depth 参数区偏移 = slot*8）。
+    param_slot: std::collections::HashMap<u32, u32>,
+    /// SetResult 记录的结果寄存器（ReturnCode 出口读取）。
+    res_reg: std::cell::Cell<Option<u32>>,
+    /// 编译期 tier1 epoch（CallSite 槽缓存失效基准）。
+    epoch: u64,
+}
+
+impl Env<'_> {
+    /// fast 模式下的 cur_site global 下标（4 个导入 global）。
+    fn site_global(&self) -> u32 {
+        if self.fast.is_some() { 6 } else { 3 }
+    }
 }
 
 impl<'a> Env<'a> {
@@ -39,12 +61,13 @@ impl<'a> Env<'a> {
     }
 }
 
-pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
+pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Option<crate::emit::FastMeta>) {
     let _ = cfg;
     let nv = l2.max_depth + 1;
     let bregs = count_bregs(l3);
     let nf = count_foreach(l3);
     let foreach_base = nv + 3;
+    let nparams = fast_gate(l2, l3, code);
     let env = Env {
         l2,
         foreach_base,
@@ -52,6 +75,7 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
         epoch_home: nv + 2,
         bool_base: foreach_base + 2 * nf,
         kind: foreach_base + 2 * nf + bregs,
+        fast: None,
     };
 
     let mut body = Function::new(vec![
@@ -119,6 +143,9 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
     types.ty().function(vec![], vec![I64]); // FOREACH_END_TY
     types.ty().function(vec![I64], vec![I64]); // I64_TO_I64 (eval_script/eval_expr)
     types.ty().function(vec![I32, I32], vec![I64]); // CONCAT
+    // fast-tier：多值 proc_main（值 + rc）与无参 fast_impl（run 同布局）。
+    types.ty().function(vec![I32, I32, I32], vec![I64, I32]); // PROC_MAIN
+    types.ty().function(vec![], vec![I64, I32]); // PROC_IMPL
 
     let mut imports = ImportSection::new();
     let mut_g = |t: ValType| GlobalType { val_type: t, mutable: true, shared: false };
@@ -149,12 +176,145 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
     imports.import("rtcl", "eval_expr", EntityType::Function(ty::I64_TO_I64));
     imports.import("rtcl", "lappend_var", EntityType::Function(ty::INCR_VAR));
     imports.import("rtcl", "call_argv", EntityType::Function(ty::CALL));
+    // fast-tier 冷路径导入（常规模块也导入——linker 定义 stub 保持
+    // 函数索引全局一致：import::RUN/COUNT）。
+    imports.import("rtcl", "resolve_proc", EntityType::Function(ty::CALL));
+    imports.import("rtcl", "proc_exit_frame", EntityType::Function(ty::I32_VOID));
+    if nparams.is_some() {
+        // fast 专属导入：共享 memory、funcref 表、cur_proc/
+        // site_cache_base/fast_depth 三个可变 global（cur_site=6）。
+        imports.import("rtcl", "memory", EntityType::Memory(MemoryType {
+            minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None,
+        }));
+        imports.import("rtcl", "funs", EntityType::Table(TableType {
+            element_type: RefType::FUNCREF, minimum: 256, maximum: None, shared: false, table64: false,
+        }));
+        imports.import("rtcl", "cur_proc", EntityType::Global(GlobalType {
+            val_type: I32, mutable: true, shared: false }));
+        imports.import("rtcl", "site_cache_base", EntityType::Global(GlobalType {
+            val_type: I32, mutable: true, shared: false }));
+        imports.import("rtcl", "fast_depth", EntityType::Global(GlobalType {
+            val_type: I32, mutable: true, shared: false }));
+    }
+
+    // ── fast-tier：fast_impl + proc_main 薄 wrapper ──────────────────
+    // 三函数结构：proc_main(3 个 i32 参数) 占 local 0-2 会推移值栈寄存器
+    // 布局（kind/scratch/epoch 全错位）——所以 fast 体放**无参**的
+    // fast_impl（局部布局与 run 完全一致，零移位）；proc_main 只做
+    // cur_proc 保存/设置、fast_depth++、参数区拷贝（per-depth 切片，
+    // 递归互不覆盖）、fuel、尾调 fast_impl、出栈恢复。
+    let mut fast_meta = None;
+    let mut fast_impl: Option<Function> = None;
+    let mut fast_wrap: Option<Function> = None;
+    if let Some(np) = nparams {
+        // 参数 var 映射：l2.vars 中 const_idx ∈ [const_base, const_base+np)
+        let mut param_slot = std::collections::HashMap::new();
+        for (vi, v) in l2.vars.iter().enumerate() {
+            if let Some(slot) = v.const_idx.checked_sub(l2.const_base) {
+                if (slot as usize) < np {
+                    param_slot.insert(vi as u32, slot);
+                }
+            }
+        }
+        let fenv = Env {
+            l2,
+            foreach_base,
+            scratch: nv + 1,
+            epoch_home: nv + 2,
+            bool_base: foreach_base + 2 * nf,
+            kind: foreach_base + 2 * nf + bregs,
+            fast: Some(FastCtx {
+                param_slot,
+                res_reg: std::cell::Cell::new(None),
+                epoch: code.epoch,
+            }),
+        };
+        // fast_impl：局部 = run 布局（无参数移位）
+        let mut fb = Function::new(vec![
+            (nv + 3 + 2 * nf, I64),
+            (bregs + 1, I32),
+        ]);
+        emit_node(l3, &fenv, &mut fb);
+        fb.instruction(&Instruction::End);
+        fast_impl = Some(fb);
+
+        // proc_main wrapper：locals = 2 个 i32（saved_cur, param_base）
+        let mut fw = Function::new(vec![(2, I32)]);
+        // cur_proc 保存/设置
+        fw.instruction(&Instruction::GlobalGet(3));
+        fw.instruction(&Instruction::LocalSet(3));
+        fw.instruction(&Instruction::LocalGet(0));
+        fw.instruction(&Instruction::GlobalSet(3));
+        // fast_depth++（错误帧内外层判别 + 参数区切片下标）
+        fw.instruction(&Instruction::GlobalGet(5));
+        fw.instruction(&Instruction::I32Const(1));
+        fw.instruction(&Instruction::I32Add);
+        fw.instruction(&Instruction::GlobalSet(5));
+        // param_base = PARAMS + depth * PARAM_STRIDE
+        fw.instruction(&Instruction::I32Const(cache::PARAMS as i32));
+        fw.instruction(&Instruction::GlobalGet(5));
+        fw.instruction(&Instruction::I32Const(cache::PARAM_STRIDE as i32));
+        fw.instruction(&Instruction::I32Mul);
+        fw.instruction(&Instruction::I32Add);
+        fw.instruction(&Instruction::LocalSet(4));
+        // 拷贝实参：mem[param_base + i*8] = mem[argv + i*8]
+        for i in 0..np as u32 {
+            fw.instruction(&Instruction::LocalGet(4));
+            fw.instruction(&Instruction::I32Const((i * 8) as i32));
+            fw.instruction(&Instruction::I32Add);
+            fw.instruction(&Instruction::LocalGet(2));
+            fw.instruction(&Instruction::I32Const((i * 8) as i32));
+            fw.instruction(&Instruction::I32Add);
+            fw.instruction(&Instruction::I64Load(MemArg { offset: 0, align: 3, memory_index: 0 }));
+            fw.instruction(&Instruction::I64Store(MemArg { offset: 0, align: 3, memory_index: 0 }));
+        }
+        // fuel：扣 1，空 → refuel（pending 已置）→ 恢复栈后 (哨兵, ERROR)
+        fw.instruction(&Instruction::GlobalGet(0));
+        fw.instruction(&Instruction::I64Const(1));
+        fw.instruction(&Instruction::I64Sub);
+        fw.instruction(&Instruction::GlobalSet(0));
+        fw.instruction(&Instruction::GlobalGet(0));
+        fw.instruction(&Instruction::I64Const(0));
+        fw.instruction(&Instruction::I64LtS);
+        fw.instruction(&Instruction::If(BlockType::Empty));
+        fw.instruction(&Instruction::Call(import::REFUEL));
+        fw.instruction(&Instruction::Drop);
+        fw.instruction(&Instruction::GlobalGet(5));
+        fw.instruction(&Instruction::I32Const(1));
+        fw.instruction(&Instruction::I32Sub);
+        fw.instruction(&Instruction::GlobalSet(5));
+        fw.instruction(&Instruction::LocalGet(3));
+        fw.instruction(&Instruction::GlobalSet(3));
+        fw.instruction(&Instruction::I64Const(abi::ERR_SENTINEL));
+        fw.instruction(&Instruction::I32Const(code::ERROR));
+        fw.instruction(&Instruction::Return);
+        fw.instruction(&Instruction::End);
+        // 尾调 fast_impl → [i64, i32]；恢复栈；透传返回
+        fw.instruction(&Instruction::Call(import::FAST_IMPL));
+        fw.instruction(&Instruction::GlobalGet(5));
+        fw.instruction(&Instruction::I32Const(1));
+        fw.instruction(&Instruction::I32Sub);
+        fw.instruction(&Instruction::GlobalSet(5));
+        fw.instruction(&Instruction::LocalGet(3));
+        fw.instruction(&Instruction::GlobalSet(3));
+        fw.instruction(&Instruction::Return);
+        fw.instruction(&Instruction::End);
+        fast_wrap = Some(fw);
+
+        fast_meta = Some(crate::emit::FastMeta { nparams: np, epoch: code.epoch });
+    }
 
     let mut funcs = FunctionSection::new();
     funcs.function(ty::RUN);
+    let has_fast = fast_impl.is_some();
+    if has_fast {
+        funcs.function(ty::PROC_IMPL);
+        funcs.function(ty::PROC_MAIN);
+    }
 
     let mut globals = GlobalSection::new();
-    // 3 imported globals (fuel/epoch/caching) → cur_site = global index 3。
+    // 导入 global 数：常规 3（fuel/epoch/caching）→ cur_site=3；
+    // fast 4（+cur_proc）→ cur_site=4。
     globals.global(
         GlobalType { val_type: I32, mutable: true, shared: false },
         &wasm_encoder::ConstExpr::i32_const(-1),
@@ -162,24 +322,81 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
 
     let mut exports = ExportSection::new();
     exports.export("run", ExportKind::Func, import::RUN);
-    exports.export("cur_site", ExportKind::Global, 3);
+    exports.export("cur_site", ExportKind::Global, if has_fast { 6 } else { 3 });
     exports.export("memory", ExportKind::Memory, 0);
+    if has_fast {
+        exports.export("proc_main", ExportKind::Func, import::FAST_IMPL + 1);
+    }
 
     let mut memory = MemorySection::new();
-    memory.memory(MemoryType { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None });
+    if nparams.is_none() {
+        // fast 模块导入共享 memory（"rtcl" "memory"）——不自带。
+        memory.memory(MemoryType { minimum: 1, maximum: None, memory64: false, shared: false, page_size_log2: None });
+    }
 
     let mut code_section = CodeSection::new();
     code_section.function(&body);
+    if let Some(fb) = &fast_impl {
+        code_section.function(fb);
+    }
+    if let Some(fw) = &fast_wrap {
+        code_section.function(fw);
+    }
 
     let mut module = Module::new();
     module.section(&types);
     module.section(&imports);
     module.section(&funcs);
-    module.section(&memory);
+    if nparams.is_none() {
+        module.section(&memory);
+    }
     module.section(&globals);
     module.section(&exports);
     module.section(&code_section);
-    module.finish()
+    (module.finish(), fast_meta)
+}
+
+/// fast-tier 形状门（v1，MoonBit 式「热路径零宿主过渡」接受集）：
+/// - params_aligned（精确参数个数 + slot 对齐种子）
+/// - 所有 vars 都是参数（vars ⊆ params：cache 区协议不适用，全程
+///   wasm local）
+/// - 无循环/回边（BREAK/CONTINUE 出口协议未定义）、无 foreach
+/// - 无宿主路由 op（EvalScript/EvalExpr/LappendVar/Concat/Foreach*——
+///   需要 interp 帧在场）；Call/DynCall 允许（直呼 + 回落双分支）
+fn fast_gate(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
+    use crate::ir::Instr;
+    let np = code.params_aligned?;
+    for v in &l2.vars {
+        let slot = v.const_idx.checked_sub(l2.const_base)?;
+        if slot as usize >= np {
+            return None;
+        }
+    }
+    if !l2.backedges.is_empty() {
+        return None;
+    }
+    let mut ok = true;
+    walk(l3, &mut |n| {
+        let L3::Instr(i) = n else { return };
+        match i {
+            Instr::EvalScript { .. }
+            | Instr::EvalExpr { .. }
+            | Instr::LappendVar { .. }
+            | Instr::Concat { .. }
+            | Instr::ForeachStart { .. }
+            | Instr::ForeachBind { .. }
+            | Instr::ForeachStep { .. }
+            | Instr::ForeachEnd { .. }
+            | Instr::ForeachCollect { .. }
+            | Instr::BackedgeFuel { .. } => ok = false,
+            Instr::StoreVar { .. } | Instr::IncrVar { .. } => ok = false, // v1：参数只读
+            _ => {}
+        }
+        if matches!(n, L3::Loop { .. }) {
+            ok = false;
+        }
+    });
+    if ok { Some(np) } else { None }
 }
 
 fn count_foreach(l3: &L3) -> u32 {
@@ -312,11 +529,44 @@ fn check_sentinel(e: &Env, f: &mut Function, reg: u32, fail: u32) {
     f.instruction(&Instruction::End);
 }
 
+/// fast 模式的多值返回尾：(i64 哨兵, i32 rc)。
+fn ret_fast_sentinel(f: &mut Function, rc: i32) {
+    f.instruction(&Instruction::I64Const(abi::ERR_SENTINEL));
+    f.instruction(&Instruction::I32Const(rc));
+    f.instruction(&Instruction::Return);
+}
+
+/// fast 模式出口：depth--（fast_depth global）后按模式返回。
+fn fast_depth_dec(f: &mut Function) {
+    f.instruction(&Instruction::GlobalGet(5));
+    f.instruction(&Instruction::I32Const(1));
+    f.instruction(&Instruction::I32Sub);
+    f.instruction(&Instruction::GlobalSet(5));
+}
+
 /// `rtcl.fail(id)` → i32 kind；kind==0（纯错误）→ return TCL_ERROR。
 /// 其余 kind 由 CallSite 模板特判（break/continue 出口）。
-fn fail_path(_e: &Env, f: &mut Function, fail: u32) {
+fn fail_path(e: &Env, f: &mut Function, fail: u32) {
     f.instruction(&Instruction::I32Const(fail as i32));
     f.instruction(&Instruction::Call(import::FAIL));
+    // fast：kind==0（纯错误）→ 内层（depth>1）补 (procedure …) 帧
+    // 后以 (哨兵, ERROR) 多值返回；外层的帧由 call_proc 边界补。
+    if e.fast.is_some() {
+        f.instruction(&Instruction::LocalTee(e.kind));
+        f.instruction(&Instruction::I32Eqz);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::GlobalGet(5));
+        f.instruction(&Instruction::I32Const(1));
+        f.instruction(&Instruction::I32GtU);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::GlobalGet(3)); // cur_proc（wrapper 设置）
+        f.instruction(&Instruction::Call(import::PROC_EXIT_FRAME));
+        f.instruction(&Instruction::End);
+        fast_depth_dec(f);
+        ret_fast_sentinel(f, code::ERROR);
+        f.instruction(&Instruction::End);
+        return;
+    }
     f.instruction(&Instruction::I32Eqz);
     f.instruction(&Instruction::If(BlockType::Empty));
     f.instruction(&Instruction::I32Const(code::ERROR));
@@ -416,6 +666,24 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
         }
         Instr::LoadVar { dst, var, fail } => {
             let var = *var;
+            // fast：参数从 per-depth 参数区直读（PARAMS + depth*STRIDE
+            // + slot*8——proc_main wrapper 拷贝；递归各层切片互不覆盖）。
+            if let Some(fc) = &e.fast {
+                if let Some(slot) = fc.param_slot.get(&var) {
+                    f.instruction(&Instruction::I32Const(cache::PARAMS as i32));
+                    f.instruction(&Instruction::GlobalGet(5));
+                    f.instruction(&Instruction::I32Const(cache::PARAM_STRIDE as i32));
+                    f.instruction(&Instruction::I32Mul);
+                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::I64Load(MemArg {
+                        offset: (*slot * 8) as u64,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                    f.instruction(&Instruction::LocalSet(dst.0));
+                    return;
+                }
+            }
             let vals = cache::VALUES + var * 8;
             let state = cache::STATE + var;
             f.instruction(&Instruction::Block(BlockType::Empty)); // done
@@ -508,6 +776,89 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
         }
         Instr::CallSite { dst, cmd_id, argc, fail, site, srcs, cont_back, brk_depth, cont_depth, esc, esc_depth, .. } => {
             emit_flush(e, f, *fail);
+            // ── fast-tier 直呼：epoch 门 + 槽缓存 → call_indirect；
+            // 未命中 resolve_proc 冷融合（解析+代打+回填缓存）。
+            // 统一 rc 分派：OK/RETURN=值；ERROR→fail_path（帧+哨兵）；
+            // BREAK/CONTINUE/STALE/EXIT 经多值返回向上传播（零宿主）。
+            if let Some(fc) = &e.fast {
+                for (i, r) in srcs.iter().enumerate() {
+                    f.instruction(&Instruction::I32Const(0));
+                    f.instruction(&Instruction::LocalGet(r.0));
+                    f.instruction(&Instruction::I64Store(MemArg {
+                        offset: (cache::SCRATCH + (i as u32) * 8) as u64,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                }
+                f.instruction(&Instruction::Block(BlockType::Empty)); // $done
+                f.instruction(&Instruction::Block(BlockType::Empty)); // $fallback
+                // epoch 失配（宿主 impure 路由会刷新共享 epoch）→ 回落。
+                f.instruction(&Instruction::GlobalGet(1));
+                f.instruction(&Instruction::I64Const(fc.epoch as i64));
+                f.instruction(&Instruction::I64Ne);
+                f.instruction(&Instruction::BrIf(1));
+                // 槽缓存读：mem[site_cache_base + site*4]
+                f.instruction(&Instruction::GlobalGet(4));
+                f.instruction(&Instruction::I32Const((*site as i32) * 4));
+                f.instruction(&Instruction::I32Add);
+                f.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+                f.instruction(&Instruction::LocalTee(e.kind));
+                f.instruction(&Instruction::I32Const(-1));
+                f.instruction(&Instruction::I32Eq);
+                f.instruction(&Instruction::BrIf(1));
+                // call_indirect (slot, argc, SCRATCH, 表idx=slot)——
+                // 表下标是**第 4 个**栈操作数（独立实验踩坑：漏压则
+                // "expected i32 but nothing on stack"）。
+                f.instruction(&Instruction::LocalGet(e.kind));
+                f.instruction(&Instruction::I32Const(*argc as i32));
+                f.instruction(&Instruction::I32Const(cache::SCRATCH as i32));
+                f.instruction(&Instruction::LocalGet(e.kind));
+                f.instruction(&Instruction::CallIndirect { type_index: ty::PROC_MAIN as u32, table_index: 0 });
+                // [i64 val, i32 rc] → kind=rc，dst=val
+                f.instruction(&Instruction::LocalSet(e.kind));
+                f.instruction(&Instruction::LocalSet(dst.0));
+                // rc == OK(0) 或 RETURN(2) → done
+                f.instruction(&Instruction::LocalGet(e.kind));
+                f.instruction(&Instruction::I32Eqz);
+                f.instruction(&Instruction::LocalGet(e.kind));
+                f.instruction(&Instruction::I32Const(code::RETURN));
+                f.instruction(&Instruction::I32Eq);
+                f.instruction(&Instruction::I32Or);
+                f.instruction(&Instruction::BrIf(0));
+                // rc == ERROR(1) → fail_path（帧 + (哨兵, ERROR)）
+                f.instruction(&Instruction::LocalGet(e.kind));
+                f.instruction(&Instruction::I32Const(code::ERROR));
+                f.instruction(&Instruction::I32Eq);
+                f.instruction(&Instruction::If(BlockType::Empty));
+                fail_path(e, f, *fail);
+                f.instruction(&Instruction::End);
+                // 其余 rc（BREAK/CONTINUE/STALE/EXIT）传播
+                fast_depth_dec(f);
+                f.instruction(&Instruction::I64Const(abi::ERR_SENTINEL));
+                f.instruction(&Instruction::LocalGet(e.kind));
+                f.instruction(&Instruction::Return);
+                f.instruction(&Instruction::End); // $fallback:
+                // resolve_proc(site, argc, SCRATCH) → i64（冷融合）
+                f.instruction(&Instruction::I32Const(*site as i32));
+                f.instruction(&Instruction::I32Const(*argc as i32));
+                f.instruction(&Instruction::I32Const(cache::SCRATCH as i32));
+                f.instruction(&Instruction::Call(import::RESOLVE_PROC));
+                f.instruction(&Instruction::LocalSet(dst.0));
+                check_sentinel(e, f, dst.0, *fail);
+                // fail_path 落穿（kind≠0）：3/4/6 → (哨兵, 映射 rc) 返回
+                //（1/2/5 被 loop gate 排除）。
+                for (k, rc) in [(3i32, code::BREAK), (4, code::CONTINUE), (6, code::STALE)] {
+                    f.instruction(&Instruction::LocalGet(e.kind));
+                    f.instruction(&Instruction::I32Const(k));
+                    f.instruction(&Instruction::I32Eq);
+                    f.instruction(&Instruction::If(BlockType::Empty));
+                    fast_depth_dec(f);
+                    ret_fast_sentinel(f, rc);
+                    f.instruction(&Instruction::End);
+                }
+                f.instruction(&Instruction::End); // $done
+                return;
+            }
             // M2 全案直连：已求值实参寄存器写暂存区（SCRATCH 协议）→
             // rtcl.call_argv(base, argc, site) 直传 dispatch_values，
             // 免站点原文 eval 全链。RTCL_JIT_SITE_EVAL=1（启动读一次）
@@ -763,28 +1114,63 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
         }
         Instr::SetSite(k) => {
             f.instruction(&Instruction::I32Const(*k as i32));
-            f.instruction(&Instruction::GlobalSet(3));
+            f.instruction(&Instruction::GlobalSet(e.site_global()));
         }
         Instr::SetResult { src } => {
-            f.instruction(&Instruction::LocalGet(src.0));
-            f.instruction(&Instruction::Call(import::SET_RESULT));
+            if let Some(fc) = &e.fast {
+                fc.res_reg.set(Some(src.0));
+            } else {
+                f.instruction(&Instruction::LocalGet(src.0));
+                f.instruction(&Instruction::Call(import::SET_RESULT));
+            }
         }
         Instr::ReturnCode { code } => {
-            f.instruction(&Instruction::I32Const(*code));
-            f.instruction(&Instruction::Return);
+            if let Some(fc) = &e.fast {
+                // OK/RETURN：结果寄存器直读（消灭 set_result 宿主调用）；
+                // 其余码带值传播（外层驱动解码）。depth-- 先行——值压栈
+                // 后不得再有栈操作（值栈污染 = 校验 mismatch 实证）。
+                fast_depth_dec(f);
+                match *code {
+                    code::OK | code::RETURN => {
+                        if let Some(r) = fc.res_reg.get() {
+                            f.instruction(&Instruction::LocalGet(r));
+                        } else {
+                            f.instruction(&Instruction::I64Const(abi::tag_imm(0)));
+                        }
+                    }
+                    _ => {
+                        f.instruction(&Instruction::I64Const(abi::ERR_SENTINEL));
+                    }
+                }
+                f.instruction(&Instruction::I32Const(*code));
+                f.instruction(&Instruction::Return);
+            } else {
+                f.instruction(&Instruction::I32Const(*code));
+                f.instruction(&Instruction::Return);
+            }
         }
         Instr::Fail { fail } => {
             f.instruction(&Instruction::I32Const(*fail as i32));
             f.instruction(&Instruction::Call(import::FAIL));
             f.instruction(&Instruction::Drop);
-            f.instruction(&Instruction::I32Const(code::ERROR));
-            f.instruction(&Instruction::Return);
+            if e.fast.is_some() {
+                fast_depth_dec(f);
+                ret_fast_sentinel(f, code::ERROR);
+            } else {
+                f.instruction(&Instruction::I32Const(code::ERROR));
+                f.instruction(&Instruction::Return);
+            }
         }
         Instr::Exit { code } => {
             f.instruction(&Instruction::I32Const(*code));
             f.instruction(&Instruction::Call(import::EXIT));
-            f.instruction(&Instruction::I32Const(code::EXIT));
-            f.instruction(&Instruction::Return);
+            if e.fast.is_some() {
+                fast_depth_dec(f);
+                ret_fast_sentinel(f, code::EXIT);
+            } else {
+                f.instruction(&Instruction::I32Const(code::EXIT));
+                f.instruction(&Instruction::Return);
+            }
         }
         Instr::BackedgeFuel { fail } => emit_fuel(e, f, *fail),
         Instr::EpochCheck { at_entry } => {

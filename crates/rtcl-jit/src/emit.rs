@@ -27,6 +27,19 @@ pub struct Module {
     pub bytes: Vec<u8>,
     pub l2: L2,
     pub l3: L3,
+    /// fast-tier 元数据（assemble 的 fast gate 命中时）：
+    /// (nparams, my_epoch)——proc_main 导出已发射，驱动可入共享
+    /// Store + funcref 表（call_indirect 直呼协议）。
+    pub fast: Option<FastMeta>,
+}
+
+/// fast-tier 元数据。
+#[derive(Debug, Clone, Copy)]
+pub struct FastMeta {
+    /// proc 参数个数（params_aligned 语义下的精确个数）。
+    pub nparams: usize,
+    /// 编译期 tier1 epoch（CallSite 槽缓存的失效基准）。
+    pub epoch: u64,
 }
 
 /// Compile a [`ByteCode`] to a wasm module via the nanopass pipeline.
@@ -40,6 +53,6 @@ pub fn compile_module(code: &ByteCode) -> Result<Vec<u8>, Unsupported> {
 
 /// 全产物编译（含 L2/L3）。
 pub fn compile(code: &ByteCode, cfg: &EmitConfig) -> Result<Module, Unsupported> {
-    let (bytes, l2, l3) = pass::run(code, cfg)?;
-    Ok(Module { bytes, l2, l3 })
+    let (bytes, l2, l3, fast) = pass::run(code, cfg)?;
+    Ok(Module { bytes, l2, l3, fast })
 }

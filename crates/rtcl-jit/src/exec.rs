@@ -1275,6 +1275,28 @@ fn execute(
     linker.define("rtcl", "fuel", Extern::Global(g_fuel)).unwrap();
     linker.define("rtcl", "epoch", Extern::Global(g_epoch)).unwrap();
     linker.define("rtcl", "caching", Extern::Global(g_caching)).unwrap();
+    // fast 模块的附加导入 stub（fast 门的模块经常规池运行时：proc_main
+    // 不被调用，这些定义只为实例化完整——共享 Store 驱动提供真实现）。
+    {
+        let mem = wasmi::Memory::new(&mut store, wasmi::MemoryType::new(1, None)).unwrap();
+        linker.define("rtcl", "memory", Extern::Memory(mem)).unwrap();
+        let tbl = wasmi::Table::new(
+            &mut store,
+            wasmi::TableType::new(wasmi::RefType::Func, 256, None),
+            wasmi::Ref::Func(wasmi::Nullable::Null),
+        ).unwrap();
+        linker.define("rtcl", "funs", Extern::Table(tbl)).unwrap();
+        let g_cur = wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Var);
+        linker.define("rtcl", "cur_proc", Extern::Global(g_cur)).unwrap();
+        let g_scb = wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Var);
+        linker.define("rtcl", "site_cache_base", Extern::Global(g_scb)).unwrap();
+        let g_fd = wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Var);
+        linker.define("rtcl", "fast_depth", Extern::Global(g_fd)).unwrap();
+    }
+    linker.func_wrap("rtcl", "resolve_proc", |_cmd: i32, _argc: i32, _base: i32| -> i64 {
+        unreachable!("resolve_proc stub (regular store)")
+    }).unwrap();
+    linker.func_wrap("rtcl", "proc_exit_frame", |_slot: i32| {}).unwrap();
     let g_fuel_call = g_fuel;
     let g_caching_call = g_caching;
 

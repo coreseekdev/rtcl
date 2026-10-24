@@ -149,11 +149,20 @@ pub mod import {
     /// `(i32, i32, i32) -> i64` — call_argv(base, argc, site)：直连分派
     /// （M2 全案：已求值实参走 dispatch_values，免站点原文 eval 全链）。
     pub const CALL_ARGV: u32 = 23;
+    /// `(i32, i32, i32) -> i64` — resolve_proc(site, argc, argv_base)：
+    /// fast-tier 调用点冷融合——解析目标 proc→槽号回填 site-cache 并
+    /// 代打一次；不可 fast 化 → cache=-1（后续走 call_argv 回落）。
+    pub const RESOLVE_PROC: u32 = 24;
+    /// `(i32) -> ()` — proc_exit_frame(slot)：fast 错误冷路径，本层补
+    /// `(procedure "name" line N)` 帧。
+    pub const PROC_EXIT_FRAME: u32 = 25;
     /// The one locally defined function (`run`) comes after the imports.
-    pub const RUN: u32 = 24;
+    pub const RUN: u32 = 26;
+    /// fast-tier 的 fast_impl（run 之后、proc_main 之前）。
+    pub const FAST_IMPL: u32 = 27;
     /// Number of imported functions (globals come first in the import
     /// section but do not shift function indices).
-    pub const COUNT: u32 = 24;
+    pub const COUNT: u32 = 26;
 }
 
 /// Fuel policy: each loop back-edge decrements the imported `fuel`
@@ -172,6 +181,18 @@ pub mod cache {
     /// 可变参数 op（Concat/foreach/call_argv）的暂存区：n 个 tagged
     /// word，8 字节/个。上限 = CallSite 的 argc ≤ 16 + 常规可变 op。
     pub const SCRATCH: u32 = 1024;
+    /// fast-tier 参数区（per-depth 切片：base = PARAMS + depth*PARAM_STRIDE，
+    /// 由 proc_main wrapper 拷贝实参——fast_impl 的 LoadVar(参数) 从
+    /// 此读，递归各层互不覆盖）。
+    pub const PARAMS: u32 = 8192;
+    /// 每深度参数区（8B × 最大参数数 16）。
+    pub const PARAM_STRIDE: u32 = 128;
+    /// fast-tier site-cache：每 proc 一段（SITE_STRIDE 字节），槽号
+    /// i32×site——由宿主在实例化时设 per-instance global
+    /// site_cache_base。SCRATCH 之后留 1KB 余量。
+    pub const SITE_CACHE_BASE: u32 = 4096;
+    /// 每 proc 的 site-cache 段长（i32 × 1024 sites）。
+    pub const SITE_STRIDE: u32 = 4096;
 }
 
 /// wasm-encoder type-section indices for the function signatures
@@ -198,4 +219,11 @@ pub mod ty {
     pub const FOREACH_COLLECT: u32 = 18;
     pub const FOREACH_END_TY: u32 = 19;
     pub const I64_TO_I64: u32 = 20;
+    /// fast-tier proc_main：`(i32 slot, i32 argc, i32 argv) -> (i64 val, i32 rc)`
+    /// ——多值返回贯穿 wasm 层（控制流经 rc 传播免宿主）。
+    /// 注意：RUN..CONCAT 共 22 项（0-21）——fast 两型在表尾。
+    pub const PROC_MAIN: u32 = 22;
+    /// fast-tier fast_impl（无参，局部布局与 run 完全一致——proc_main
+    /// 参数占 local 0-2 会推移值栈寄存器，故薄 wrapper + 独立体函数）。
+    pub const PROC_IMPL: u32 = 23;
 }

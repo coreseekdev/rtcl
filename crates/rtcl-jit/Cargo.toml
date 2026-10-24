@@ -25,12 +25,24 @@ wasm-bindgen = { version = "0.2", optional = true }
 # default-features=false + std：JIT 只用门面的核心类型（Interp/Error/
 # Value）——默认 rtcl_std 经特征统一把 rtcl-vm 的 OS 侧特性（env：
 # $env 镜像 std::env::vars）拉进 wasm32 构建（构造即 panic）。
-rtcl-core = { path = "../rtcl-core", optional = true, default-features = false, features = ["std"] }
+# std+regexp+clock+file+io+package：jitsh 的 CLI 面需要的**安全子集**
+#（env/exec/signal 排除——wasm32 图里 rtcl-jit 会把这些特征统一进
+# rtcl-vm/rtcl-core，env 的 $env 镜像 std::env::vars 构造即 panic；
+# 原生联编 rtcl-cli 时特征并集自然补全 rtcl_std）。此前只开 std，
+# 单独构建 --bin jitsh 时 switch/lsearch -regexp 消失（gen_switch/
+# gen_regexp 差分实证——曾经的"绿门禁"跑的是 workspace 联编产物）。
+rtcl-core = { path = "../rtcl-core", optional = true, default-features = false, features = [
+    "std", "regexp", "clock", "file", "io", "package",
+] }
 rtcl-parser = { path = "../rtcl-parser", optional = true }
 # default-features=false：JIT 只用解释器核心（dispatch/charge/帧入口），
 # 不需要 rtcl_std 的 OS 侧特性——特性统一会把默认 rtcl_std（含 env）
 # 拉进 wasm32 构建（$env 镜像 std::env::vars 构造即 panic）。
-rtcl-vm = { path = "../rtcl-vm", optional = true, default-features = false, features = ["std"] }
+# 同上：安全子集（regexp 全量——switch/lsearch -regexp 的运行时；
+# wasm32 下 regex crate 纯 Rust 可编译）。
+rtcl-vm = { path = "../rtcl-vm", optional = true, default-features = false, features = [
+    "std", "regexp", "clock", "file", "io", "package",
+] }
 wasmi = { version = "2.0", optional = true }
 wasmtime = { version = "49", optional = true }
 

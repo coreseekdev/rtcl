@@ -433,7 +433,7 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
             st.cmd_sites = cmd_sites;
             st.consts_code = Some(Rc::clone(code));
         }
-        let r = exec_inner(interp, code, &mut st);
+    let r = exec_inner(interp, code, &mut st);
         interp.vm_pool.give(st);
         r
     };

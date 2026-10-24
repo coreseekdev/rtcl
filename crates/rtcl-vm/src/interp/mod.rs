@@ -1022,6 +1022,13 @@ impl Interp {
         self.err_line = line;
     }
 
+    /// 同上：defer 帧清除（err_harness_frame 的 superseded 规则暴露给
+    /// JIT 驱动——本层 harness 已 append 时，Sub defer 的外围命令帧
+    /// 被顶替）。
+    pub fn jit_err_clear_pending(&mut self) {
+        self.err_pending_top = None;
+    }
+
     /// 每条命令分派计一步；超限抛错。解释器（`eval_command`）与 VM
     ///（`invoke_command`/`call`）两条分派路都过这里。
     /// 每条命令分派计一步；超限抛错。解释器（`eval_command`）与 VM

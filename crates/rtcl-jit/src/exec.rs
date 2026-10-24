@@ -245,6 +245,22 @@ impl Host {
             return 6;
         }
         if p.from_eval {
+            // case a 的行号修补：EvalScript（词括号 script）的树走查种子
+            // 只写 err_info 头，err_line 未更新——exit_frame 会打出 stale
+            // 行号（rp3：line 1 应为 2）。取 fail 站点行（Sub 外围同规则）。
+            if let Some(fi) = self.fails.get(fail_id as usize) {
+                if fi.site != u32::MAX {
+                    let mut line = self.lines.get(fi.site as usize).copied().unwrap_or(0) as usize;
+                    if let Some((crate::ir::BodyKind::Sub, psite)) = fi.bodies.last() {
+                        if *psite != fi.site {
+                            line = self.lines.get(*psite as usize).copied().unwrap_or(0) as usize;
+                        }
+                    }
+                    if line > 0 {
+                        self.irp().jit_err_set_line(line);
+                    }
+                }
+            }
             // case a：解释器已按协议累积；先分类——控制流穿越
             // （宿主 eval 里的 break/continue 冒出，PR#2 起 `if $c
             // continue` 走 DynCall 的树遍历 cmd_if，不捕获控制流）必须
@@ -281,6 +297,11 @@ impl Host {
         };
         let fi = self.fails.get(fail_id as usize).cloned();
         if self.proc_ctx {
+            // 内联括号形（rd3/dp2 族）：EvalExpr 失败于 Sub region 内、
+            // 站点是外围命令（set/puts）——vm 对应形状（内联 StoreVar/
+            // 分派后不落该命令帧）不追加站点帧；take_fail 追加即多帧
+            // （dp2 多出 "set m […]" 帧）。头帧由 eval_expr 的树走查
+            // 种子或内层分派补。
             // proc 语境：帧直写 interp 累积器（call_proc 的 (procedure …)
             // 边界读它）；驱动侧字符串路径不适用。**不抽累积器**：
             // 嵌套 proc 的错误帧已在 interp 上（dispatch_values →
@@ -297,17 +318,36 @@ impl Host {
                     .is_some_and(|(_, s)| *s == fi.site);
                 if fi.site != u32::MAX && !frameless {
                     let text = self.site_text(fi.site).to_string();
-                    let line = self.lines.get(fi.site as usize).copied().unwrap_or(0) as usize;
+                    // 括号内子命令的 site.line 是**括号相对**行（rp2 实证：
+                    // lines_vec=[2,1,3]——expr 站点 1 而 oracle 2）——帧行号
+                    // 取外围 Sub 站点的绝对行。
+                    let mut line = self.lines.get(fi.site as usize).copied().unwrap_or(0) as usize;
+                    if let Some((crate::ir::BodyKind::Sub, psite)) = fi.bodies.last() {
+                        if *psite != fi.site {
+                            line = self.lines.get(*psite as usize).copied().unwrap_or(0) as usize;
+                        }
+                    }
                     let msg = e.message_text();
                     self.irp().jit_err_set_line(line);
                     self.irp().jit_err_harness_frame(&msg, &text, line);
                 }
+                // 词括号 defer 的 superseded 规则（eval.rs:279）：本层
+                // harness 已 append → 其后 Sub region 的 pending defer
+                // 帧清除（外层胜出），不再于 unwind 循环里二次落帧
+                // （dp2 的 "set m […]" 双帧实证——unwind 的 Sub 臂在
+                // ctx-append 之后又 set_pending 一次，最终 error_report
+                // 把它追加）。
+                let appended_here = fi.site != u32::MAX && !frameless;
                 for (kind, site) in fi.bodies.iter().rev() {
                     let text = self.site_text(*site).to_string();
                     let line = self.lines.get(*site as usize).copied().unwrap_or(0) as usize;
                     match kind {
                         crate::ir::BodyKind::Sub => {
-                            self.irp().jit_err_set_pending(&text, line);
+                            // 本层已 harness append → Sub defer 帧 superseded
+                            // （vm eval.rs:279 同款；dp2 双帧实证）。
+                            if !appended_here {
+                                self.irp().jit_err_set_pending(&text, line);
+                            }
                         }
                         crate::ir::BodyKind::Expr => {
                             let msg = e.message_text();
@@ -1040,7 +1080,12 @@ impl Host {
         match self.irp().eval_expr(&expr) {
             Ok(r) => self.tag_value(&r),
             Err(e) => {
-                self.pending = Some(Pending { err: e, from_eval: true });
+                // 树走查 eval_expr 对**求值期**错误（非解析期）不落
+                // 任何帧——纯解释里帧来自分派层 harness；JIT 的对应
+                // 物 = take_fail 的 case-b 站点帧（vm:779 同款）。
+                // from_eval=true 会走 case-a「解释器已累积」早退——
+                // 帧就此丢失（rd3：内层 expr 帧被外层 call 帧顶替）。
+                self.pending = Some(Pending { err: e, from_eval: false });
                 abi::ERR_SENTINEL
             }
         }

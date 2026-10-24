@@ -844,6 +844,9 @@ fn fast_read_words(c: &mut wasmi::Caller<'_, FastHost>, base: i32, n: i32) -> Ve
 
 /// fast 版 take_fail（Host::take_fail 的 proc_ctx 臂复刻；pending 共享）。
 fn fast_take_fail(h: &mut FastHost, cur: usize, fail_id: u32) -> i32 {
+    if std::env::var_os("JIT_VM_TRACE").is_some() {
+        eprintln!("[fast] take_fail cur={cur} fid={fail_id}");
+    }
     use crate::ir::BodyKind;
     let Some(p) = h.pending.take() else { return 0 };
     let e = p.err;

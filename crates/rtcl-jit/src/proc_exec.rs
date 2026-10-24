@@ -727,6 +727,9 @@ pub(crate) struct FastHost {
     pub stale_site: Option<u32>,
     pub epoch_at_entry: u64,
     pub last_fail: Option<u32>,
+    /// slot → 本实例 site_cache_base 值（import 非 export，Caller 拿
+    /// 不到——实例化时登记）。
+    pub scb_of: Vec<i32>,
     // 共享句柄（二阶段初始化：实体须在 Store 存在后创建——先 None 后
     // 填充；使用方经 *_g()/mem()/tbl() 取，init 后恒 Some）。
     pub engine: wasmi::Engine,
@@ -757,6 +760,20 @@ impl FastHost {
 thread_local! {
     static FAST_STORE: std::cell::RefCell<Option<wasmi::Store<FastHost>>> =
         const { std::cell::RefCell::new(None) };
+    /// fast 调用窗口标志：execute_fast 的 tf.call 期间为真——此时
+    /// resolve 分派支的嵌套 exec_proc_body **不得**再进 execute_fast
+    ///（FAST_STORE 的 RefCell 已被外层持有，双重借用 panic；u1/t5 冷
+    /// callee 实证）。嵌套走常规池（冷路径，一次性——cmd_cache 变热
+    /// 后 resolve 走 fast_ensure+exec 支，不经 hook）。
+    static FAST_IN_CALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 当前是否处于 fast 调用窗口。
+fn fast_in_call() -> bool {
+    FAST_IN_CALL.with(|f| f.get())
+}
+
+thread_local! {
     static FAST_MODULES: std::cell::RefCell<
         std::collections::HashMap<PoolKey, wasmi::Module>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -961,13 +978,6 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
     linker.func_wrap("rtcl", "fail", |mut c: Caller<'_, FastHost>, fail_id: i32| -> i32 {
         let cur = read_cur(&mut c);
         let fid = fail_id.max(0) as u32;
-        if crate::env_enabled("JIT_FT") {
-            let site = c
-                .get_export("cur_site")
-                .and_then(|e| e.into_global())
-                .and_then(|g| match g.get(&mut c) { wasmi::Val::I32(v) => Some(v), _ => None });
-            eprintln!("[fail] cur={cur} fid={fid} site={site:?}");
-        }
         c.data_mut().last_fail = Some(fid);
         let h = &mut c.data_mut();
         fast_take_fail(h, cur, fid)
@@ -1074,16 +1084,11 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
         let target = interp.jit_proc_code(&name);
         // cache 写辅助：本实例 site_cache_base global + 共享 memory。
         let write_cache = |c: &mut Caller<'_, FastHost>, slot: i32| {
-            let scb = c
-                .get_export("site_cache_base")
-                .and_then(|e| e.into_global());
-            if let Some(g) = scb {
-                if let wasmi::Val::I32(b) = g.get(&mut *c) {
-                    if let Some(wasmi::Extern::Memory(m)) = c.get_export("memory") {
-                        let addr = (b + site * 4).max(0) as usize;
-                        let _ = m.write(&mut *c, addr, &slot.to_le_bytes());
-                    }
-                }
+            let cur0 = read_cur(c);
+            let base = c.data().scb_of.get(cur0).copied().unwrap_or(0);
+            if let Some(wasmi::Extern::Memory(m)) = c.get_export("memory") {
+                let addr = (base + site * 4).max(0) as usize;
+                let _ = m.write(&mut *c, addr, &slot.to_le_bytes());
             }
         };
         let slot = target.as_ref().and_then(|code| fast_ensure_slot(&mut c, interp, code));
@@ -1224,6 +1229,7 @@ fn fast_ensure_slot(
     }
     let h = c.data_mut();
     h.hosts.push(host);
+    h.scb_of.push(scb as i32);
     h.codes.push(Rc::clone(code));
     h.runs.push(tf);
     h.slots.insert(pool_key, slot);
@@ -1246,6 +1252,7 @@ fn init_fast_store(interp: &mut Interp) -> wasmi::Store<FastHost> {
             stale_site: None,
             epoch_at_entry: 0,
             last_fail: None,
+            scb_of: Vec::new(),
             engine: engine.clone(),
             memory: None,
             table: None,
@@ -1285,6 +1292,9 @@ fn init_fast_store(interp: &mut Interp) -> wasmi::Store<FastHost> {
 ///（module.fast 存在才 fast 化——非 fast 体 None 回落常规路径，编译
 /// 产物已被 PROC_MODULES 缓存，常规冷路径零额外成本）。
 fn fast_try(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core::Result<Value>> {
+    if fast_in_call() {
+        return None;
+    }
     let key = (Rc::as_ptr(code) as usize, code.epoch);
     let module = compile_cached(code, key)?;
     let meta = module.fast?;
@@ -1376,6 +1386,7 @@ fn execute_fast(
                 }
                 let h = store.data_mut();
                 h.hosts.push(host);
+                h.scb_of.push(scb as i32);
                 h.codes.push(Rc::clone(bc));
                 h.runs.push(tf);
                 h.slots.insert(pool_key, slot);
@@ -1410,10 +1421,12 @@ fn execute_fast(
             mem.write(&mut *store, arg_base + 8, &buf).ok()?;
         }
         let tf = store.data().runs[slot];
+        FAST_IN_CALL.with(|f| f.set(true));
         let r = tf.call(
             &mut *store,
             (slot as i32, meta.nparams as i32, arg_base as i32),
         );
+        FAST_IN_CALL.with(|f| f.set(false));
         let (val, rc) = match r {
             Ok(pair) => pair,
             Err(_trap) => {

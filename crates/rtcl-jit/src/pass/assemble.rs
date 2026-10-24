@@ -270,7 +270,10 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
             fw.instruction(&Instruction::I64Load(MemArg { offset: 0, align: 3, memory_index: 0 }));
             fw.instruction(&Instruction::I64Store(MemArg { offset: 0, align: 3, memory_index: 0 }));
         }
-        // fuel：扣 1，空 → refuel（pending 已置）→ 恢复栈后 (哨兵, ERROR)
+        // fuel：扣 1，空 → refuel。成功（返回 0，fuel 已充值 chunk）
+        // **继续执行**；失败（哨兵，pending 已置）→ 恢复栈 + (哨兵,
+        // ERROR)。此前无条件返回 ERROR——fib 在第 ~1024 次调用（首个
+        // chunk 耗尽）全体报「failed without pending」的根因。
         fw.instruction(&Instruction::GlobalGet(0));
         fw.instruction(&Instruction::I64Const(1));
         fw.instruction(&Instruction::I64Sub);
@@ -280,7 +283,9 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
         fw.instruction(&Instruction::I64LtS);
         fw.instruction(&Instruction::If(BlockType::Empty));
         fw.instruction(&Instruction::Call(import::REFUEL));
-        fw.instruction(&Instruction::Drop);
+        fw.instruction(&Instruction::I64Const(0));
+        fw.instruction(&Instruction::I64Ne);
+        fw.instruction(&Instruction::If(BlockType::Empty));
         fw.instruction(&Instruction::GlobalGet(5));
         fw.instruction(&Instruction::I32Const(1));
         fw.instruction(&Instruction::I32Sub);
@@ -290,6 +295,7 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
         fw.instruction(&Instruction::I64Const(abi::ERR_SENTINEL));
         fw.instruction(&Instruction::I32Const(code::ERROR));
         fw.instruction(&Instruction::Return);
+        fw.instruction(&Instruction::End);
         fw.instruction(&Instruction::End);
         // 尾调 fast_impl → [i64, i32]；恢复栈；透传返回
         fw.instruction(&Instruction::Call(import::FAST_IMPL));
@@ -816,7 +822,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 f.instruction(&Instruction::GlobalGet(1));
                 f.instruction(&Instruction::I64Const(fc.epoch as i64));
                 f.instruction(&Instruction::I64Ne);
-                f.instruction(&Instruction::BrIf(1));
+                f.instruction(&Instruction::BrIf(0));
                 // 槽缓存读：mem[site_cache_base + site*4]
                 f.instruction(&Instruction::GlobalGet(4));
                 f.instruction(&Instruction::I32Const((*site as i32) * 4));
@@ -825,7 +831,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 f.instruction(&Instruction::LocalTee(e.kind));
                 f.instruction(&Instruction::I32Const(-1));
                 f.instruction(&Instruction::I32Eq);
-                f.instruction(&Instruction::BrIf(1));
+                f.instruction(&Instruction::BrIf(0));
                 // call_indirect (slot, argc, SCRATCH, 表idx=slot)——
                 // 表下标是**第 4 个**栈操作数（独立实验踩坑：漏压则
                 // "expected i32 but nothing on stack"）。
@@ -844,7 +850,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 f.instruction(&Instruction::I32Const(code::RETURN));
                 f.instruction(&Instruction::I32Eq);
                 f.instruction(&Instruction::I32Or);
-                f.instruction(&Instruction::BrIf(0));
+                f.instruction(&Instruction::BrIf(1));
                 // rc == ERROR(1) → fail_path（帧 + (哨兵, ERROR)）
                 f.instruction(&Instruction::LocalGet(e.kind));
                 f.instruction(&Instruction::I32Const(code::ERROR));

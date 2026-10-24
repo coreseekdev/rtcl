@@ -17,17 +17,17 @@ type PoolKey = (usize, usize, u64);
 /// (fuel, epoch, caching) global 句柄三元组（池命中重置用）。
 #[cfg(feature = "jit-native")]
 type WtGlobals = (wasmtime::Global, wasmtime::Global, wasmtime::Global);
-/// wasmtime 池条目：key + Store + Instance + global 句柄。
+/// wasmtime 池条目：key + Store + Instance + global 句柄 + run 句柄 +
+/// cache 区 extent（512+vars）。
 #[cfg(feature = "jit-native")]
 type WtPoolEntry = (
     PoolKey,
     wasmtime::Store<Host>,
     wasmtime::Instance,
     WtGlobals,
+    wasmtime::TypedFunc<(), i32>,
+    u32,
 );
-/// 池命中 → 作用域的交接槽条目（key 已核过，不带）。
-#[cfg(feature = "jit-native")]
-type WtTake = (wasmtime::Store<Host>, wasmtime::Instance, WtGlobals);
 
 use crate::abi::{self, code};
 use crate::emit;
@@ -69,6 +69,7 @@ thread_local! {
             wasmi::Store<Host>,
             wasmi::Instance,
             wasmi::TypedFunc<(), i32>,
+            u32, // cache 区 extent（512+vars；emit 期定数）
         )>,
     > = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -85,15 +86,42 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
     if code.epoch != interp.tier1_epoch() {
         return None;
     }
+    // 引擎分派（RTCL_JIT_ENGINE；默认 wasmi）。wasmtime 走 Cranelift
+    // 池化路径（Engine 单例 + Module 缓存 + Store/Instance 池）。
+    #[cfg(feature = "jit-native")]
+    if crate::exec::engine_from_env() == crate::exec::EngineKind::Wasmtime {
+        // 池优先：命中 = 该单元此前已被接受（池条目只在编译成功后
+        // 存在）——免 PROC_MODULES/WASMI_MODULES 两次哈希查找
+        //（fib 差分剖析：每调用 ~80ns 的纯开销）。
+        if let Some(r) = execute_proc_wasmtime_pooled(interp, code) {
+            return Some(r);
+        }
+        let key = (Rc::as_ptr(code) as usize, code.epoch);
+        let module = compile_cached(code, key)?;
+        return Some(execute_proc_wasmtime(interp, code, &module));
+    }
+    // wasmi 池优先（同上——命中路径零模块查找）。
+    if let Some(r) = execute_proc_pooled(interp, code) {
+        return Some(r);
+    }
     let key = (Rc::as_ptr(code) as usize, code.epoch);
-    let module = PROC_MODULES.with(|c| {
+    let module = compile_cached(code, key)?;
+    // proc 语境的 case-b 帧协议已落地（rtcl-vm jit_err_* 公共入口 +
+    // Host.proc_ctx 路由）——不再按 Cold 退回（f002196/f004860 的
+    // (procedure …) 帧链由差分验证）。
+    Some(execute_proc(interp, code, &module))
+}
+
+/// emit 编译缓存（key 二元组；未命中现编译，拒绝不缓存负项）。
+fn compile_cached(code: &Rc<ByteCode>, key: (usize, u64)) -> Option<Rc<emit::Module>> {
+    PROC_MODULES.with(|c| {
         let mut c = c.borrow_mut();
         if let Some(m) = c.get(&key) {
             return Some(Rc::clone(m));
         }
         // PR#2 融合超指令展开（BEGIN_CMD_PUSH_CONST / FOREACH_NEXT_CLOSE
         // / CMP_VI_JF …）——JIT 消费 unfused 规范形状（run_top_with
-        // 同款）。编译拒绝不缓存负项（退回 vm_exec，重试成本低）。
+        // 同款）。
         let bc = code.unfused();
         match emit::compile(&bc, &EmitConfig::default()) {
             Ok(mm) => {
@@ -106,93 +134,59 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
             }
             Err(_) => None,
         }
-    })?;
-    // proc 语境的 case-b 帧协议已落地（rtcl-vm jit_err_* 公共入口 +
-    // Host.proc_ctx 路由）——不再按 Cold 退回（f002196/f004860 的
-    // (procedure …) 帧链由差分验证）。
-    // 引擎分派（RTCL_JIT_ENGINE；默认 wasmi）。wasmtime 走 Cranelift
-    // 池化路径（Engine 单例 + Module 缓存 + Store/Instance 池）。
-    #[cfg(feature = "jit-native")]
-    if crate::exec::engine_from_env() == crate::exec::EngineKind::Wasmtime {
-        return Some(execute_proc_wasmtime(interp, code, &module));
-    }
-    Some(execute_proc(interp, code, &module))
+    })
 }
 
 /// 实例化并执行 proc 体，映射 `run()` 返回码。
-fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -> rtcl_core::Result<Value> {
-    use wasmi::{Engine, Module, Store};
-
-    let epoch0 = interp.tier1_epoch() as i64;
-    // key 三元组：interp 指针 + **proc 体 Rc 指针** + epoch——只有
-    // epoch 会让不同 proc（同 interp 同 epoch）撞 key（B 的调用命中
-    // A 的 Store/Instance——judge gen_oo/gen_proc 大面积回归的根因）。
+/// 池快路径：仅当池命中时执行（命中 = 单元此前被接受——免模块查找）。
+/// 未命中返回 None，由冷路径（execute_proc）建 Store 入池。
+fn execute_proc_pooled(interp: &mut Interp, bc: &Rc<ByteCode>) -> Option<rtcl_core::Result<Value>> {
     let pool_key = (
         interp as *mut Interp as usize,
         Rc::as_ptr(bc) as usize,
         code_epoch_key(bc),
     );
-
-    // Engine 单例 + Module 编译缓存（key 三元组）；Store/Host/Instance
-    // 每次新建——wasmi Store 复用有状态残留（defarg 双调用实证）。
-    let engine = WASMI_ENGINE.with(|e| e.get_or_init(Engine::default).clone());
-    let wmodule = WASMI_MODULES.with(|m| {
-        let mut m = m.borrow_mut();
-        if let Some(w) = m.get(&pool_key) {
-            return w.clone();
-        }
-        let w = Module::new(&engine, &module.bytes[..]).expect("jit proc: module");
-        if m.len() >= 64 {
-            m.clear();
-        }
-        m.insert(pool_key, w.clone());
-        w
-    });
-    // 池命中：完整重置（globals + cache 区 + host 状态）+ 复用
-    // Store/Instance；未命中：新建入池。
     let pooled = PROC_POOL.with(|p| {
         let mut p = p.borrow_mut();
         p.iter().position(|(k, ..)| *k == pool_key).map(|pos| p.remove(pos))
-    });
-    let (mut store, instance, run) = match pooled {
-        Some((_, mut store, inst, runf)) => {
-            // 完整重置（顺序关键：globals → memory → host）。
-            let (gf, ge, gc) = {
-                let h = store.data();
-                (h.g_fuel_h, h.g_epoch_h, h.g_caching_h)
-            };
-            if let Some(g) = &gf { let _ = g.set(&mut store, wasmi::Val::I64(0)); }
-            if let Some(g) = &ge { let _ = g.set(&mut store, wasmi::Val::I64(epoch0)); }
-            if let Some(g) = &gc { let _ = g.set(&mut store, wasmi::Val::I32(1)); }
-            if let Some(wasmi::Extern::Memory(m)) = inst.get_export(&store, "memory") {
-                let zeros = vec![0u8; 1024]; // cache::VALUES(0-511) + STATE(512-767) + SCRATCH(1024+)
-                let _ = m.write(&mut store, 0, &zeros);
-            }
-            store.data_mut().reset_for_reuse();
-            (store, inst, runf)
-        }
-        None => {
-            let mut host = Host::new(
-                interp as *mut Interp,
-                crate::exec::arena_of(bc),
-                bc,
-                module,
-            );
-            host.proc_ctx = true;
-            let mut store = Store::new(&engine, host);
-            let inst = register_and_instantiate(&mut store, epoch0, &wmodule);
-            // 存 global 句柄（池重置用）。
-            let (gf, ge, gc) = {
-                let h = store.data();
-                (h.g_fuel_h, h.g_epoch_h, h.g_caching_h)
-            };
-            let _ = (gf, ge, gc);
-            let runf = inst
-                .get_typed_func::<(), i32>(&store, "run")
-                .expect("run export");
-            (store, inst, runf)
-        }
-    };
+    })?;
+    let (_, mut store, instance, run, extent) = pooled;
+    pool_reset(&mut store, instance, extent);
+    Some(run_and_decode(interp, bc, store, instance, run, extent, pool_key))
+}
+
+/// 池命中重置（裁剪版）。语义依据：
+/// - **fuel 免 set**：fuel 只在回边扣减、耗尽 refuel——剩余预算让下一
+///   调用更晚触发 refuel，语义无害（charge_step 的步数预算才是防线）。
+/// - **epoch 免 set**：池 key 含 epoch 且入口门刚比对过 code.epoch ==
+///   interp.tier1_epoch()——global 里就是同值。
+/// - **caching 必设 1**：cache 区（VALUES/STATE）清零后重新武装。
+/// - **memory 清零裁剪到实际 extent**：只清 [0, 512+vars)（VALUES
+///   槽 + STATE 字节；vars 数 emit 期随池条目存档）——SCRATCH 区
+///   先写后读无跨调用语义。1024B→~513B（fib 1 变量）。
+fn pool_reset(store: &mut wasmi::Store<Host>, instance: wasmi::Instance, extent: u32) {
+    let gc = store.data().g_caching_h;
+    if let Some(g) = &gc {
+        let _ = g.set(&mut *store, wasmi::Val::I32(1));
+    }
+    if let Some(wasmi::Extern::Memory(m)) = instance.get_export(&mut *store, "memory") {
+        let zeros = vec![0u8; extent as usize];
+        let _ = m.write(&mut *store, 0, &zeros);
+    }
+    store.data_mut().reset_for_reuse();
+}
+
+/// run + 结果解码 + 还池（池快路径与冷路径共用）。
+#[allow(clippy::too_many_arguments)]
+fn run_and_decode(
+    interp: &mut Interp,
+    bc: &Rc<ByteCode>,
+    mut store: wasmi::Store<Host>,
+    instance: wasmi::Instance,
+    run: wasmi::TypedFunc<(), i32>,
+    extent: u32,
+    pool_key: PoolKey,
+) -> rtcl_core::Result<Value> {
     let watermark = store.data().arena_len();
 
     // run 句柄随池条目缓存——免每调用的字符串导出查找（fib 差分
@@ -216,7 +210,7 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
         if p.len() >= 64 {
             p.clear();
         }
-        p.push((pool_key, store, instance, run));
+        p.push((pool_key, store, instance, run, extent));
     });
 
     match rc {
@@ -225,7 +219,7 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
         code::BREAK => Err(Error::brk()),
         code::CONTINUE => Err(Error::cont()),
         // ④ 中途 bump：从 bump 命令的下一条顶层命令树走查重分派
-        //（proc 语境的帧/命名空间/行号已由 call_proc 就位——上下文
+        //(proc 语境的帧/命名空间/行号已由 call_proc 就位——上下文
         // 保持由 eval_commands_from 保证）。非边界 bump 维持错误现状。
         code::STALE => {
             let r = stale_site
@@ -242,6 +236,65 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
             None => Err(Error::Msg("jit proc: failed without pending error".into())),
         },
     }
+}
+
+/// 冷路径：建 Store/Host/Instance 入池后执行。
+fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -> rtcl_core::Result<Value> {
+    use wasmi::{Engine, Module, Store};
+
+    let epoch0 = interp.tier1_epoch() as i64;
+    // key 三元组：interp 指针 + **proc 体 Rc 指针** + epoch——只有
+    // epoch 会让不同 proc（同 interp 同 epoch）撞 key（B 的调用命中
+    // A 的 Store/Instance——judge gen_oo/gen_proc 大面积回归的根因）。
+    let pool_key = (
+        interp as *mut Interp as usize,
+        Rc::as_ptr(bc) as usize,
+        code_epoch_key(bc),
+    );
+
+    // Engine 单例 + Module 编译缓存（key 三元组）。
+    let engine = WASMI_ENGINE.with(|e| e.get_or_init(Engine::default).clone());
+    let wmodule = WASMI_MODULES.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some(w) = m.get(&pool_key) {
+            return w.clone();
+        }
+        let w = Module::new(&engine, &module.bytes[..]).expect("jit proc: module");
+        if m.len() >= 64 {
+            m.clear();
+        }
+        m.insert(pool_key, w.clone());
+        w
+    });
+    // 池条目只在冷路径创建（池快路径未命中）——取走即可（position
+    // 恒 miss，remove 兜底防御重复）。
+    let pooled = PROC_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        p.iter().position(|(k, ..)| *k == pool_key).map(|pos| p.remove(pos))
+    });
+    let (_, mut store, instance, run, extent) = match pooled {
+        Some(entry) => entry,
+        None => {
+            let mut host = Host::new(
+                interp as *mut Interp,
+                crate::exec::arena_of(bc),
+                bc,
+                module,
+            );
+            host.proc_ctx = true;
+            let mut store = Store::new(&engine, host);
+            let inst = register_and_instantiate(&mut store, epoch0, &wmodule);
+            let runf = inst
+                .get_typed_func::<(), i32>(&store, "run")
+                .expect("run export");
+            // cache 区实际 extent（VALUES 槽 + STATE 字节；emit 期
+            // l2.vars 定数）。
+            let extent = 512u32 + module.l2.vars.len() as u32;
+            (pool_key, store, inst, runf, extent)
+        }
+    };
+    pool_reset(&mut store, instance, extent);
+    run_and_decode(interp, bc, store, instance, run, extent, pool_key)
 }
 
 thread_local! {
@@ -469,74 +522,60 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// 池快路径（wasmtime）：仅命中时执行——免模块查找（同 wasmi 池优先）。
 #[cfg(feature = "jit-native")]
-fn execute_proc_wasmtime(
+fn execute_proc_wasmtime_pooled(
     interp: &mut Interp,
     bc: &Rc<ByteCode>,
-    module: &emit::Module,
-) -> rtcl_core::Result<Value> {
-    use wasmtime::{Store, TypedFunc};
-
-    let epoch0 = interp.tier1_epoch() as i64;
+) -> Option<rtcl_core::Result<Value>> {
     let pool_key = (
         interp as *mut Interp as usize,
         Rc::as_ptr(bc) as usize,
         code_epoch_key(bc),
     );
-
-    // 池命中：完整重置（globals → memory 缓存区 → host 状态）+ 复用
-    // Store/Instance（免 Cranelift 编译与实例化）。
-    let mut reused = false;
-    WT_POOL.with(|p| {
+    let pooled = WT_POOL.with(|p| {
         let mut p = p.borrow_mut();
-        if let Some(pos) = p.iter().position(|(k, ..)| *k == pool_key) {
-            let (_, mut store, inst, (gf, ge, gc)) = p.remove(pos);
-            let _ = gf.set(&mut store, wasmtime::Val::I64(0));
-            let _ = ge.set(&mut store, wasmtime::Val::I64(epoch0));
-            let _ = gc.set(&mut store, wasmtime::Val::I32(1));
-            if let Some(wasmtime::Extern::Memory(m)) = inst.get_export(&mut store, "memory") {
-                let zeros = vec![0u8; 1024]; // VALUES + STATE + SCRATCH 缓存区
-                let _ = m.write(&mut store, 0, &zeros);
-            }
-            store.data_mut().reset_for_reuse();
-            WT_TAKE.with(|t| *t.borrow_mut() = Some((store, inst, (gf, ge, gc))));
-            reused = true;
-        }
-    });
-    let (mut store, instance, globals) = if reused {
-        WT_TAKE.with(|t| t.borrow_mut().take().expect("wt pool take"))
-    } else {
-        let mut host = Host::new(
-            interp as *mut Interp,
-            crate::exec::arena_of(bc),
-            bc,
-            module,
-        );
-        host.proc_ctx = true;
-        let wmodule = WT_MODULES.with(|m| {
-            let mut m = m.borrow_mut();
-            if let Some(w) = m.get(&pool_key) {
-                return w.clone();
-            }
-            let engine = store_engine();
-            let w = wasmtime::Module::new(&engine, &module.bytes[..])
-                .expect("jit proc wt: module");
-            if m.len() >= 64 {
-                m.clear();
-            }
-            m.insert(pool_key, w.clone());
-            w
-        });
-        let engine = store_engine();
-        let mut store = Store::new(&engine, host);
-        let (instance, globals) = register_wasmtime_proc(&mut store, epoch0, &wmodule);
-        (store, instance, globals)
-    };
+        p.iter().position(|(k, ..)| *k == pool_key).map(|pos| p.remove(pos))
+    })?;
+    let (_, mut store, instance, globals, run, extent) = pooled;
+    pool_reset_wt(&mut store, instance, &globals.2, extent);
+    Some(run_and_decode_wt(interp, bc, store, instance, globals, run, extent, pool_key))
+}
+
+/// 池命中重置（wasmtime；裁剪依据同 wasmi pool_reset）。gc = caching
+/// global 句柄（随池条目保存——Host.g_caching_h 是 wasmi 类型）。
+#[cfg(feature = "jit-native")]
+fn pool_reset_wt(
+    store: &mut wasmtime::Store<Host>,
+    instance: wasmtime::Instance,
+    gc: &wasmtime::Global,
+    extent: u32,
+) {
+    let _ = gc.set(&mut *store, wasmtime::Val::I32(1));
+    if let Some(wasmtime::Extern::Memory(m)) = instance.get_export(&mut *store, "memory") {
+        let zeros = vec![0u8; extent as usize];
+        let _ = m.write(&mut *store, 0, &zeros);
+    }
+    store.data_mut().reset_for_reuse();
+}
+
+/// run + 结果解码 + 还池（wasmtime；池快路径与冷路径共用）。
+#[cfg(feature = "jit-native")]
+#[allow(clippy::too_many_arguments)]
+fn run_and_decode_wt(
+    interp: &mut Interp,
+    bc: &Rc<ByteCode>,
+    mut store: wasmtime::Store<Host>,
+    instance: wasmtime::Instance,
+    globals: WtGlobals,
+    run: wasmtime::TypedFunc<(), i32>,
+    extent: u32,
+    pool_key: PoolKey,
+) -> rtcl_core::Result<Value> {
+    use wasmtime::TypedFunc;
+
     let watermark = store.data().arena_len();
 
-    let run: TypedFunc<(), i32> = instance
-        .get_typed_func(&mut store, "run")
-        .expect("run export");
     rtcl_vm::interp::set_jit_call_in_flight(true);
     let rc = run.call(&mut store, ()).expect("jit proc wt: run");
     rtcl_vm::interp::set_jit_call_in_flight(false);
@@ -551,7 +590,7 @@ fn execute_proc_wasmtime(
         if p.len() >= 64 {
             p.clear();
         }
-        p.push((pool_key, store, instance, globals));
+        p.push((pool_key, store, instance, globals, run, extent));
     });
 
     match rc {
@@ -577,11 +616,51 @@ fn execute_proc_wasmtime(
     }
 }
 
-thread_local! {
-    /// wasmtime 路径的 Store 交接槽（单线程；池命中移交进作用域）。
-    #[cfg(feature = "jit-native")]
-    static WT_TAKE: std::cell::RefCell<Option<WtTake>> =
-        const { std::cell::RefCell::new(None) };
+/// 冷路径（wasmtime）：建 Store/Host/Instance 入池后执行。
+#[cfg(feature = "jit-native")]
+fn execute_proc_wasmtime(
+    interp: &mut Interp,
+    bc: &Rc<ByteCode>,
+    module: &emit::Module,
+) -> rtcl_core::Result<Value> {
+    use wasmtime::Store;
+
+    let epoch0 = interp.tier1_epoch() as i64;
+    let pool_key = (
+        interp as *mut Interp as usize,
+        Rc::as_ptr(bc) as usize,
+        code_epoch_key(bc),
+    );
+    let mut host = Host::new(
+        interp as *mut Interp,
+        crate::exec::arena_of(bc),
+        bc,
+        module,
+    );
+    host.proc_ctx = true;
+    let wmodule = WT_MODULES.with(|m| {
+        let mut m = m.borrow_mut();
+        if let Some(w) = m.get(&pool_key) {
+            return w.clone();
+        }
+        let engine = store_engine();
+        let w = wasmtime::Module::new(&engine, &module.bytes[..])
+            .expect("jit proc wt: module");
+        if m.len() >= 64 {
+            m.clear();
+        }
+        m.insert(pool_key, w.clone());
+        w
+    });
+    let engine = store_engine();
+    let mut store = Store::new(&engine, host);
+    let (instance, globals) = register_wasmtime_proc(&mut store, epoch0, &wmodule);
+    let run = instance
+        .get_typed_func(&mut store, "run")
+        .expect("run export");
+    let extent = 512u32 + module.l2.vars.len() as u32;
+    pool_reset_wt(&mut store, instance, &globals.2, extent);
+    run_and_decode_wt(interp, bc, store, instance, globals, run, extent, pool_key)
 }
 
 #[cfg(feature = "jit-native")]

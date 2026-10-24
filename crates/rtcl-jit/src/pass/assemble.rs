@@ -397,6 +397,10 @@ fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
             return None;
         }
     }
+    // site-cache 段容量（SITE_STRIDE/4 = 256 槽）：超长 proc 不 fast 化。
+    if code.sites.len() > (crate::abi::cache::SITE_STRIDE / 4) as usize {
+        return None;
+    }
     if !l2.backedges.is_empty() {
         return None;
     }

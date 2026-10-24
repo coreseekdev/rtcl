@@ -183,16 +183,24 @@ pub mod cache {
     pub const SCRATCH: u32 = 1024;
     /// fast-tier 参数区（per-depth 切片：base = PARAMS + depth*PARAM_STRIDE，
     /// 由 proc_main wrapper 拷贝实参——fast_impl 的 LoadVar(参数) 从
-    /// 此读，递归各层互不覆盖）。
-    pub const PARAMS: u32 = 8192;
+    /// 此读，递归各层互不覆盖）。**独占区段**——与 site-cache 之间
+    /// 硬分隔（旧布局 PARAMS=8192 与 slot≥1 的缓存段 [4096+s*4096,..)
+    /// 在 8192 处重叠，靠低偏移侥幸不撞；另有 >125 slot 溢出 8 页
+    /// 内存）。
+    pub const PARAMS: u32 = SITE_CACHE_END;
     /// 每深度参数区（8B × 最大参数数 16）。
     pub const PARAM_STRIDE: u32 = 128;
     /// fast-tier site-cache：每 proc 一段（SITE_STRIDE 字节），槽号
-    /// i32×site——由宿主在实例化时设 per-instance global
-    /// site_cache_base。SCRATCH 之后留 1KB 余量。
+    /// i32×site。槽位上限 = MAX_FAST_SLOTS（容量与 OOB 防线——超出
+    /// 的 proc 不 fast 化，回解释器）。
     pub const SITE_CACHE_BASE: u32 = 4096;
-    /// 每 proc 的 site-cache 段长（i32 × 1024 sites）。
-    pub const SITE_STRIDE: u32 = 4096;
+    /// 每 proc 的 site-cache 段长（i32 × 256 sites——fast gate 按
+    /// sites.len()≤256 拒绝超长 proc）。
+    pub const SITE_STRIDE: u32 = 1024;
+    /// fast 槽位上限（内存预算：4096 + 64*1024 = 69632 ≤ 参数区起点）。
+    pub const MAX_FAST_SLOTS: usize = 64;
+    /// site-cache 区段终点 = 参数区起点。
+    pub const SITE_CACHE_END: u32 = SITE_CACHE_BASE + MAX_FAST_SLOTS as u32 * SITE_STRIDE;
 }
 
 /// wasm-encoder type-section indices for the function signatures

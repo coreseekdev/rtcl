@@ -1234,6 +1234,10 @@ fn fast_ensure_slot(
         }
     })?;
     let slot = c.data().hosts.len();
+    if slot >= crate::abi::cache::MAX_FAST_SLOTS {
+        // 槽位上限（内存预算/容量防线）：超出不 fast 化。
+        return None;
+    }
     let scb = crate::abi::cache::SITE_CACHE_BASE + (slot as u32) * crate::abi::cache::SITE_STRIDE;
     let mut linker = fast_linker(c, scb as i32);
     let host = Host::new(interp as *mut Interp, crate::exec::arena_of(code), code, &module);
@@ -1286,7 +1290,10 @@ fn init_fast_store(interp: &mut Interp) -> wasmi::Store<FastHost> {
             o_depth: None,
         },
     );
-    let memory = wasmi::Memory::new(&mut store, wasmi::MemoryType::new(8, None)).expect("fast memory");
+    // 16 页（1MB）：site-cache 68KB + 参数切片（128B×depth——深度
+    // ~5000 的余量；超出深度由 wasmi 栈限先行拦截）。
+    let memory =
+        wasmi::Memory::new(&mut store, wasmi::MemoryType::new(16, None)).expect("fast memory");
     let table = wasmi::Table::new(
         &mut store,
         wasmi::TableType::new(wasmi::RefType::Func, 256, None),
@@ -1364,7 +1371,9 @@ fn execute_fast(
         // slot 确保（驱动侧——resolve 闭包内另有 fast_ensure_slot）
         let slot = match store.data().slots.get(&pool_key) {
             Some(s) => *s,
-            None => {
+            None
+                if store.data().hosts.len() < crate::abi::cache::MAX_FAST_SLOTS =>
+            {
                 let engine0 = store.data().engine.clone();
                 let wmodule = match FAST_MODULES.with(|m| {
                     let mut m = m.borrow_mut();
@@ -1415,6 +1424,8 @@ fn execute_fast(
                 h.slots.insert(pool_key, slot);
                 slot
             }
+            // 槽位上限：超出不 fast 化（回解释器）。
+            None => return None,
         };
         // 入口 globals：epoch/fuel/depth（句柄先克隆，避免借用冲突）
         {

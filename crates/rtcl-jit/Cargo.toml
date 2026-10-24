@@ -22,9 +22,15 @@ wasm-bindgen = { version = "0.2", optional = true }
 # approved as the test engine (M0); promoting it to an optional real
 # dependency keeps default builds untouched.
 # 与 rtcl-cli 同一 feature 面（rtcl_std 默认）——judge 三向字节等价的前提。
-rtcl-core = { path = "../rtcl-core", optional = true }
+# default-features=false + std：JIT 只用门面的核心类型（Interp/Error/
+# Value）——默认 rtcl_std 经特征统一把 rtcl-vm 的 OS 侧特性（env：
+# $env 镜像 std::env::vars）拉进 wasm32 构建（构造即 panic）。
+rtcl-core = { path = "../rtcl-core", optional = true, default-features = false, features = ["std"] }
 rtcl-parser = { path = "../rtcl-parser", optional = true }
-rtcl-vm = { path = "../rtcl-vm", optional = true }
+# default-features=false：JIT 只用解释器核心（dispatch/charge/帧入口），
+# 不需要 rtcl_std 的 OS 侧特性——特性统一会把默认 rtcl_std（含 env）
+# 拉进 wasm32 构建（$env 镜像 std::env::vars 构造即 panic）。
+rtcl-vm = { path = "../rtcl-vm", optional = true, default-features = false, features = ["std"] }
 wasmi = { version = "2.0", optional = true }
 wasmtime = { version = "49", optional = true }
 

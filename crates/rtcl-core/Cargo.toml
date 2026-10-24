@@ -9,7 +9,16 @@ categories = ["parser-implementations", "embedded", "command-line-interface"]
 
 [dependencies]
 rtcl-parser.workspace = true
-rtcl-vm.workspace = true
+# default-features=false：本门面自身的 default=["rtcl_std"] 显式重开
+# 全集；无默认依赖让 embedded/wasm32 依赖方（rtcl-wasm：std+
+# regexp-lite）的特征裁剪真正生效——否则 cargo 特征统一把 rtcl-vm
+# 默认的 rtcl_std（含 env——$env 镜像的 std::env::vars 在
+# wasm32-unknown-unknown 上构造即 panic）拉回 wasm 构建。
+# 直接 path 依赖而非 workspace 继承：成员级 default-features=false 对
+# dep.workspace=true 被 cargo 静默忽略（workspace 依赖的 default-features
+# 只认根声明）——曾让 rtcl-vm 默认 rtcl_std（含 env）漏进 wasm32 构建，
+# $env 镜像的 std::env::vars 构造即 panic。
+rtcl-vm = { path = "../rtcl-vm", default-features = false }
 
 [features]
 # The interpreter lives in `rtcl-vm` now; every feature is a passthrough

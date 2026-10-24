@@ -253,7 +253,7 @@ pub fn site_eval_fallback() -> bool {
     static FLAG: AtomicBool = AtomicBool::new(false);
     static INIT: AtomicBool = AtomicBool::new(false);
     if !INIT.swap(true, Ordering::Relaxed) {
-        FLAG.store(std::env::var_os("RTCL_JIT_SITE_EVAL").is_some(), Ordering::Relaxed);
+        FLAG.store(crate::env_enabled("RTCL_JIT_SITE_EVAL"), Ordering::Relaxed);
     }
     FLAG.load(Ordering::Relaxed)
 }

@@ -104,13 +104,13 @@ pub fn stack_effect(op: &rtcl_ir::opcode::OpCode) -> (u32, u32) {
 /// 全管线：L0 → L4 字节。层间校验默认开启。
 /// RTCL_JIT_PASS_TIMING=1 时打印每 pass 耗时（诊断大单元的规模病）。
 pub fn run(code: &ByteCode, cfg: &EmitConfig) -> Result<(Vec<u8>, L2, L3), Unsupported> {
-    let timing = std::env::var_os("RTCL_JIT_PASS_TIMING").is_some();
-    let mut t0 = std::time::Instant::now();
+    // Instant::now 在 wasm32 上 panic——只在启用时取时。
+    let timing = crate::env_enabled("RTCL_JIT_PASS_TIMING");
+    let mut t0 = timing.then(std::time::Instant::now);
     macro_rules! mark {
         ($name:expr) => {
-            if timing {
-                let t = t0;
-                t0 = std::time::Instant::now();
+            if let (true, Some(t)) = (timing, t0.take()) {
+                t0 = Some(std::time::Instant::now());
                 eprintln!("[pass] {}: {:?}", $name, t.elapsed());
             }
         };

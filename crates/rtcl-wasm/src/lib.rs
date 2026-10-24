@@ -22,6 +22,11 @@ impl RtclHandle {
         };
         handle.interp.register_command("_js_dispatch", js_command::js_dispatch_cmd);
         handle.interp.set_clock(Box::new(clock::JsClock));
+        // wasm32 JIT 接线（feature `jit`）：进程级 proc-body 钩子——
+        // wasmi 在 wasm32 内执行编译体（池/协议与原生路径同源；⑧
+        // 重入哨兵在导出层拒绝 JIT 窗口内的 JS 重入）。
+        #[cfg(feature = "jit")]
+        rtcl_jit::proc_exec::install();
         handle
             .interp
             .load_ui()

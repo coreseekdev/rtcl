@@ -32,6 +32,35 @@
 // 收窄 unsafe 的范围（forbid 无法被覆盖）。
 #![deny(unsafe_code)]
 
+/// 环境开关读取（wasm32 安全）：std::env 在 wasm32-unknown-unknown 上
+/// 直接 panic（unsupported）——wasm32 构建恒 false（宿主可经 JS 侧的
+/// 其它通道配置，后续需要时再补 ABI）。
+pub(crate) fn env_enabled(name: &str) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = name;
+        false
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::var_os(name).is_some()
+    }
+}
+
+/// 同上：带值的 env 读取（wasm32 恒 None）。
+pub(crate) fn env_value(name: &str) -> Option<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = name;
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::var(name).ok()
+    }
+}
+
+
 pub mod abi;
 pub mod check;
 pub mod ir;

@@ -10,7 +10,26 @@ rtcl-core = { path = "../rtcl-core", default-features = false, features = ["std"
 rtcl-parser = { path = "../rtcl-parser" }
 wasm-bindgen = "0.2"
 js-sys = "0.3"
-rtcl-vm = { path = "../rtcl-vm" }
+# default-features=false：rtcl-vm 默认 rtcl_std 含 env（$env 镜像在
+# Interp::new 里 std::env::vars()——wasm32-unknown-unknown 无 env 支持，
+# 构造即 panic）。显式子集去掉 env/exec/signal（无 OS 语义）；stdlib
+# Tcl 的 file/io/clock/regexp/package 保留。
+rtcl-vm = { path = "../rtcl-vm", default-features = false, features = [
+    "std",
+    "file",
+    "io",
+    "clock",
+    "package",
+    "regexp-lite",
+] }
+# wasm32 JIT 接线（⑧ 重入哨兵已就位）：wasmi 是纯 Rust——在
+# wasm32 里跑 wasm（解释器套解释器，比 JS WebAssembly API 路径慢
+# 但零 JS 侧代码，全量复用池/协议/错误帧）。默认关——wasm32 包体
+# 敏感，嵌入方按需开。
+rtcl-jit = { path = "../rtcl-jit", optional = true, features = ["jit-exec"] }
+
+[features]
+jit = ["dep:rtcl-jit"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

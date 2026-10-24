@@ -1422,6 +1422,7 @@ version = "0.1.0"
 dependencies = [
  "js-sys",
  "rtcl-core",
+ "rtcl-jit",
  "rtcl-parser",
  "rtcl-vm",
  "wasm-bindgen",

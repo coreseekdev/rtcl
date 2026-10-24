@@ -1147,8 +1147,8 @@ pub fn run_top(interp: Interp, script: &str, file: &str) -> (Interp, JitRun) {
 
 /// `RTCL_JIT_ENGINE=wasmtime|wasmi`（默认 wasmi）。
 pub fn engine_from_env() -> EngineKind {
-    match std::env::var("RTCL_JIT_ENGINE").as_deref() {
-        Ok("wasmtime") if cfg!(feature = "jit-native") => EngineKind::Wasmtime,
+    match crate::env_value("RTCL_JIT_ENGINE").as_deref() {
+        Some("wasmtime") if cfg!(feature = "jit-native") => EngineKind::Wasmtime,
         _ => EngineKind::Wasmi,
     }
 }

@@ -77,6 +77,24 @@ fn code_epoch_key(bc: &ByteCode) -> u64 {
     bc.epoch
 }
 
+/// fast-only 策略（主线 CLI 特性默认置位）：仅 fast-tier 生效——
+/// 非 fast 形状直接退回解释器（exec_bytecode），**不走**常规 JIT 池
+/// 路径（该路径对 proc 密集代码是解释器的 0.2-0.45×，opt-in 场景的
+/// 安全性要求宁可不开）。RTCL_JIT_POOL=1 可重新启用全池。
+static FAST_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 置位 fast-only（进程级，engine 注册时调用一次）。
+pub fn set_fast_only(v: bool) {
+    FAST_ONLY.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn fast_only() -> bool {
+    if crate::env_value("RTCL_JIT_POOL").as_deref() == Some("1") {
+        return false;
+    }
+    FAST_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 钩子体：接受则 JIT 执行，`None` 退回 vm_exec。
 fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core::Result<Value>> {
     // epoch 门（M3 口径——Site A 的 guard 已查过，此处防御性重查：
@@ -103,6 +121,11 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
         if let Some(r) = fast_try(interp, code) {
             return Some(r);
         }
+    }
+    // fast-only：非 fast 形状到此为止——退回解释器（None →
+    // exec_bytecode），常规池路径仅在显式 RTCL_JIT_POOL=1 时走。
+    if fast_only() {
+        return None;
     }
     // 引擎分派（RTCL_JIT_ENGINE；默认 wasmi）。wasmtime 走 Cranelift
     // 池化路径（Engine 单例 + Module 缓存 + Store/Instance 池）。

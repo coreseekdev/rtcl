@@ -25,6 +25,9 @@ rust-version = "1.70"
 rtcl-ir = { path = "crates/rtcl-ir" }
 rtcl-parser = { path = "crates/rtcl-parser" }
 rtcl-vm = { path = "crates/rtcl-vm" }
+# 供 rtcl-cli 的可选 jit 特性经 workspace 继承引用（安全子集与
+# rtcl-jit 自身声明一致——env/exec/signal 排除）。
+rtcl-jit = { path = "crates/rtcl-jit", default-features = false }
 rtcl-core = { path = "crates/rtcl-core" }
 rtcl-expect = { path = "crates/rtcl-expect" }
 

@@ -21,6 +21,17 @@ annotate-snippets.workspace = true
 [features]
 default = []
 expect = ["rtcl-expect"]
+# 可选 JIT（主线 opt-in）：proc-body fast-tier 直呼——命中 fast 形状
+# （纯参数读/无循环/无变量写的 proc）走 wasm 直呼，其余形状保持
+# 解释器（fast-only 策略，绝不落入比解释器慢的常规池路径；
+# RTCL_JIT_POOL=1 可全开）。默认构建零 JIT（不依赖 rtcl-jit）。
+jit = ["dep:rtcl-jit"]
+
+[dependencies.rtcl-jit]
+workspace = true
+optional = true
+default-features = false
+features = ["jit-exec"]
 
 [dependencies.rtcl-expect]
 workspace = true

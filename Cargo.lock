@@ -1340,6 +1340,7 @@ dependencies = [
  "colored",
  "rtcl-core",
  "rtcl-expect",
+ "rtcl-jit",
  "rtcl-parser",
  "rustyline",
 ]

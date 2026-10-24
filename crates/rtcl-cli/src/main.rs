@@ -37,6 +37,13 @@ struct Args {
 }
 
 fn main() {
+    // 可选 JIT（--features jit）：proc-body fast-tier 直呼。fast-only
+    // 策略——命中 fast 形状才 JIT，其余形状保持解释器。
+    #[cfg(feature = "jit")]
+    {
+        rtcl_jit::proc_exec::install();
+        rtcl_jit::proc_exec::set_fast_only(true);
+    }
     let args = Args::parse();
 
     if args.no_bytecode {

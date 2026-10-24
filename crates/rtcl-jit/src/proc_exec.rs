@@ -961,6 +961,13 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
     linker.func_wrap("rtcl", "fail", |mut c: Caller<'_, FastHost>, fail_id: i32| -> i32 {
         let cur = read_cur(&mut c);
         let fid = fail_id.max(0) as u32;
+        if crate::env_enabled("JIT_FT") {
+            let site = c
+                .get_export("cur_site")
+                .and_then(|e| e.into_global())
+                .and_then(|g| match g.get(&mut c) { wasmi::Val::I32(v) => Some(v), _ => None });
+            eprintln!("[fail] cur={cur} fid={fid} site={site:?}");
+        }
         c.data_mut().last_fail = Some(fid);
         let h = &mut c.data_mut();
         fast_take_fail(h, cur, fid)
@@ -1207,6 +1214,14 @@ fn fast_ensure_slot(
     let tf = f.typed::<(i32, i32, i32), (i64, i32)>(&mut *c).ok()?;
     let tbl = c.data().tbl();
     tbl.set(&mut *c, slot as u64, wasmi::Ref::Func(f.into())).ok()?;
+    // site-cache 段预失效（0xFF = -1）：新鲜内存是 0——slot 0 恒「命中」
+    // 表[0]（第一个实例自己）→ 自调用死循环（t5 栈耗尽/judge 25 fail
+    // 的根因）。
+    {
+        let mem = c.data().mem();
+        let fill = vec![0xFFu8; crate::abi::cache::SITE_STRIDE as usize];
+        let _ = mem.write(&mut *c, scb as usize, &fill);
+    }
     let h = c.data_mut();
     h.hosts.push(host);
     h.codes.push(Rc::clone(code));
@@ -1354,6 +1369,11 @@ fn execute_fast(
                 let tf = f.typed::<(i32, i32, i32), (i64, i32)>(&mut *store).ok()?;
                 let tbl = store.data().tbl();
                 tbl.set(&mut *store, slot as u64, wasmi::Ref::Func(f.into())).ok()?;
+                {
+                    let mem = store.data().mem();
+                    let fill = vec![0xFFu8; crate::abi::cache::SITE_STRIDE as usize];
+                    let _ = mem.write(&mut *store, scb as usize, &fill);
+                }
                 let h = store.data_mut();
                 h.hosts.push(host);
                 h.codes.push(Rc::clone(bc));

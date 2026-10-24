@@ -583,7 +583,6 @@ fn fail_path(e: &Env, f: &mut Function, fail: u32) {
         f.instruction(&Instruction::GlobalGet(3)); // cur_proc（wrapper 设置）
         f.instruction(&Instruction::Call(import::PROC_EXIT_FRAME));
         f.instruction(&Instruction::End);
-        fast_depth_dec(f);
         ret_fast_sentinel(f, code::ERROR);
         f.instruction(&Instruction::End);
         return;
@@ -853,8 +852,10 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 f.instruction(&Instruction::If(BlockType::Empty));
                 fail_path(e, f, *fail);
                 f.instruction(&Instruction::End);
-                // 其余 rc（BREAK/CONTINUE/STALE/EXIT）传播
-                fast_depth_dec(f);
+                // 其余 rc（BREAK/CONTINUE/STALE/EXIT）传播（depth-- 由
+                // wrapper 尾部统一——impl 侧曾双递减致深度转负、参数
+                // 切片地址变负读到常量区句柄串，fib(3) 串 operand/
+                // fib(5+) OOB trap 双症状的根因）
                 f.instruction(&Instruction::I64Const(abi::ERR_SENTINEL));
                 f.instruction(&Instruction::LocalGet(e.kind));
                 f.instruction(&Instruction::Return);
@@ -885,7 +886,6 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                     f.instruction(&Instruction::I32Const(k));
                     f.instruction(&Instruction::I32Eq);
                     f.instruction(&Instruction::If(BlockType::Empty));
-                    fast_depth_dec(f);
                     ret_fast_sentinel(f, rc);
                     f.instruction(&Instruction::End);
                 }
@@ -1161,9 +1161,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
         Instr::ReturnCode { code } => {
             if let Some(fc) = &e.fast {
                 // OK/RETURN：结果寄存器直读（消灭 set_result 宿主调用）；
-                // 其余码带值传播（外层驱动解码）。depth-- 先行——值压栈
-                // 后不得再有栈操作（值栈污染 = 校验 mismatch 实证）。
-                fast_depth_dec(f);
+                // 其余码带值传播（外层驱动解码；depth-- 由 wrapper 统一）。
                 match *code {
                     code::OK | code::RETURN => {
                         if let Some(r) = fc.res_reg.get() {
@@ -1188,7 +1186,6 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::Call(import::FAIL));
             f.instruction(&Instruction::Drop);
             if e.fast.is_some() {
-                fast_depth_dec(f);
                 ret_fast_sentinel(f, code::ERROR);
             } else {
                 f.instruction(&Instruction::I32Const(code::ERROR));
@@ -1199,7 +1196,6 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::I32Const(*code));
             f.instruction(&Instruction::Call(import::EXIT));
             if e.fast.is_some() {
-                fast_depth_dec(f);
                 ret_fast_sentinel(f, code::EXIT);
             } else {
                 f.instruction(&Instruction::I32Const(code::EXIT));

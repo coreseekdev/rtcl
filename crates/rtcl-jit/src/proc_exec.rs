@@ -97,9 +97,9 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
             true
         }
     };
-    // 默认关闭（opt-in）：嵌套调用链的参数切片传递仍有差分 bug
-    //（fib(2) 内层读参错位→句柄串入算术）；f1-f3/f810 单层直呼已对。
-    if fast_ok && crate::env_value("RTCL_JIT_FAST").as_deref() == Some("1") {
+    // 默认开启（RTCL_JIT_FAST=0 关闭——差分回归逃生口）。judge 88/88
+    // （fast=1）+ battery/probes + fib(2)-(30) 全深度三方一致后转正。
+    if fast_ok && crate::env_value("RTCL_JIT_FAST").as_deref() != Some("0") {
         if let Some(r) = fast_try(interp, code) {
             return Some(r);
         }

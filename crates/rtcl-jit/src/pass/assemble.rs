@@ -334,6 +334,12 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
     exports.export("memory", ExportKind::Memory, 0);
     if has_fast {
         exports.export("proc_main", ExportKind::Func, import::FAST_IMPL + 1);
+        // re-export 导入的 cur_proc：宿主闭包经 Caller::get_export 路由
+        // per-proc 表——get_export 只查 export 段（import 不可见），
+        // 此前 cur 恒 0：单 fast proc 时 hosts[0] 恰好正确（fib 全对
+        // 的假象），多 proc 即交叉污染（add 的 arena 把 "uplevel" 句柄
+        // 解成 "a"——m3 实证 words 同、name 异）。
+        exports.export("cur_proc", ExportKind::Global, 3);
     }
 
     let mut memory = MemorySection::new();

@@ -368,7 +368,20 @@ impl Host {
         }
         // 字符串路径的基底：宿主原语错误也可能已在 interp 累积帧（如
         // trace 脚本失败）——哨兵取出作为基底（无累积器时 = 消息文本，
-        // 两种情形同构）。
+        // 两种情形同构）。**基底抽取前先清 interp 的 pending defer**：
+        // 本层即将 append 站点帧（下方的 harness_frame），vm 语义里
+        // harness append 会 supersede 掉 defer 帧（eval.rs:279）——
+        // error_report 的 flush 会把 defer 帧提前落进基底（dp6/f000319：
+        // "set m […]" 出现在站点帧之前的根因）。
+        if let Some(fi) = &fi {
+            let frameless = fi
+                .bodies
+                .last()
+                .is_some_and(|(_, s2)| *s2 == fi.site);
+            if fi.site != u32::MAX && !frameless {
+                self.irp().jit_err_clear_pending();
+            }
+        }
         {
             const SENT: &str = "\u{0}j";
             let raw = self.irp().error_report(&e, SENT);

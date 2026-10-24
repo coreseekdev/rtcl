@@ -729,7 +729,16 @@ impl Host {
             self.pending = Some(Pending { err: e, from_eval: false });
             return abi::ERR_SENTINEL;
         }
-        match self.irp().dispatch_values(&args) {
+        // 直呼快路径：cmd_cache 命中 proc 且形状门过 → 免 dispatch
+        // 臂层直达 call_proc（fib 差分剖析：dispatch 层叠 ~30-50ns/调用）。
+        let r = match self
+            .irp()
+            .jit_call_proc_direct(args[0].as_str(), &args)
+        {
+            Some(r) => r,
+            None => self.irp().dispatch_values(&args),
+        };
+        match r {
             Ok(v) => {
                 // ④ Tier1 中途 bump：当前命令已完成（结果暂存——bump
                 // 恰在末条命令时即单元结果），从其下一条顶层命令重分派。

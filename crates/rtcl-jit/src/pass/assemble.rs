@@ -59,6 +59,38 @@ pub fn run(l3: &L3, l2: &L2, _code: &ByteCode, cfg: &EmitConfig) -> Vec<u8> {
         (bregs + 1, I32),
     ]);
 
+    // ── 序言：cache 区清零 + caching=1（池重置的 wasm 侧承担）──────
+    // 池命中的宿主重置此前每调用写 512+vars 字节 + 1 次 global.set
+    //（~120ns）；搬进序言后每 var 2 条 store（~2ns）+ 1 条 global.set，
+    // 且宿主 pool_reset 瘦身为纯 reset_for_reuse。语义：清零发生在
+    // 任何 LoadVar 之前——cache 契约「caching=1 ⇒ VALUES 槽新鲜」在
+    // 运行起点成立；运行中的 impure 路由仍以 caching=0 失效整窗。
+    // 变量数 = l2.vars.len()（名字键变量表）——nv 是值栈寄存器数，
+    // 两者无关；少清会让池复用读到陈旧缓存（namespace-old-7.10 实证）。
+    let nvars = env.l2.vars.len() as u32;
+    // 地址风格 = 全文件约定：I32Const(0) + MemArg.offset（有效地址 =
+    // addr + offset；双写会让清零落到 2×off——namespace-old-7.10 实证）。
+    for var in 0..nvars {
+        let vals = cache::VALUES + var * 8;
+        let state = cache::STATE + var;
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I64Const(0));
+        body.instruction(&Instruction::I64Store(MemArg {
+            offset: vals as u64,
+            align: 3,
+            memory_index: 0,
+        }));
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Const(0));
+        body.instruction(&Instruction::I32Store8(MemArg {
+            offset: state as u64,
+            align: 0,
+            memory_index: 0,
+        }));
+    }
+    body.instruction(&Instruction::I32Const(1));
+    body.instruction(&Instruction::GlobalSet(2)); // caching = 1
+
     emit_node(l3, &env, &mut body);
     body.instruction(&Instruction::End); // 函数终结（wasm-encoder 不自动补）
 
@@ -243,6 +275,11 @@ fn st8(f: &mut Function, off: u32, val: i32) {
     f.instruction(&Instruction::I32Const(val));
     f.instruction(&Instruction::I32Store8(MemArg { offset: off as u64, align: 0, memory_index: 0 }));
 }
+/// i32 常量入栈（地址计算用）。
+fn f_const(f: &mut Function, v: i32) {
+    f.instruction(&Instruction::I32Const(v));
+}
+
 fn ld64(f: &mut Function, off: u32) {
     f.instruction(&Instruction::I32Const(0));
     f.instruction(&Instruction::I64Load(MemArg { offset: off as u64, align: 3, memory_index: 0 }));

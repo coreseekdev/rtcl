@@ -26,7 +26,6 @@ type WtPoolEntry = (
     wasmtime::Instance,
     WtGlobals,
     wasmtime::TypedFunc<(), i32>,
-    u32,
 );
 
 use crate::abi::{self, code};
@@ -69,7 +68,6 @@ thread_local! {
             wasmi::Store<Host>,
             wasmi::Instance,
             wasmi::TypedFunc<(), i32>,
-            u32, // cache 区 extent（512+vars；emit 期定数）
         )>,
     > = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -150,9 +148,9 @@ fn execute_proc_pooled(interp: &mut Interp, bc: &Rc<ByteCode>) -> Option<rtcl_co
         let mut p = p.borrow_mut();
         p.iter().position(|(k, ..)| *k == pool_key).map(|pos| p.remove(pos))
     })?;
-    let (_, mut store, instance, run, extent) = pooled;
-    pool_reset(&mut store, instance, extent);
-    Some(run_and_decode(interp, bc, store, instance, run, extent, pool_key))
+    let (_, mut store, instance, run) = pooled;
+    pool_reset(&mut store);
+    Some(run_and_decode(interp, bc, store, instance, run, pool_key))
 }
 
 /// 池命中重置（裁剪版）。语义依据：
@@ -164,27 +162,20 @@ fn execute_proc_pooled(interp: &mut Interp, bc: &Rc<ByteCode>) -> Option<rtcl_co
 /// - **memory 清零裁剪到实际 extent**：只清 [0, 512+vars)（VALUES
 ///   槽 + STATE 字节；vars 数 emit 期随池条目存档）——SCRATCH 区
 ///   先写后读无跨调用语义。1024B→~513B（fib 1 变量）。
-fn pool_reset(store: &mut wasmi::Store<Host>, instance: wasmi::Instance, extent: u32) {
-    let gc = store.data().g_caching_h;
-    if let Some(g) = &gc {
-        let _ = g.set(&mut *store, wasmi::Val::I32(1));
-    }
-    if let Some(wasmi::Extern::Memory(m)) = instance.get_export(&mut *store, "memory") {
-        let zeros = vec![0u8; extent as usize];
-        let _ = m.write(&mut *store, 0, &zeros);
-    }
+/// 池命中重置（wasm 序言承担 cache 清零 + caching=1——每 var 2 条
+/// store ~2ns vs 宿主 memory.write ~80ns；fuel/epoch 免 set 依据见
+/// run_and_decode 注释）。宿主侧只剩 host 状态清理。
+fn pool_reset(store: &mut wasmi::Store<Host>) {
     store.data_mut().reset_for_reuse();
 }
 
 /// run + 结果解码 + 还池（池快路径与冷路径共用）。
-#[allow(clippy::too_many_arguments)]
 fn run_and_decode(
     interp: &mut Interp,
     bc: &Rc<ByteCode>,
     mut store: wasmi::Store<Host>,
     instance: wasmi::Instance,
     run: wasmi::TypedFunc<(), i32>,
-    extent: u32,
     pool_key: PoolKey,
 ) -> rtcl_core::Result<Value> {
     let watermark = store.data().arena_len();
@@ -210,7 +201,7 @@ fn run_and_decode(
         if p.len() >= 64 {
             p.clear();
         }
-        p.push((pool_key, store, instance, run, extent));
+        p.push((pool_key, store, instance, run));
     });
 
     match rc {
@@ -272,7 +263,7 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
         let mut p = p.borrow_mut();
         p.iter().position(|(k, ..)| *k == pool_key).map(|pos| p.remove(pos))
     });
-    let (_, mut store, instance, run, extent) = match pooled {
+    let (_, mut store, instance, run) = match pooled {
         Some(entry) => entry,
         None => {
             let mut host = Host::new(
@@ -287,14 +278,11 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
             let runf = inst
                 .get_typed_func::<(), i32>(&store, "run")
                 .expect("run export");
-            // cache 区实际 extent（VALUES 槽 + STATE 字节；emit 期
-            // l2.vars 定数）。
-            let extent = 512u32 + module.l2.vars.len() as u32;
-            (pool_key, store, inst, runf, extent)
+            (pool_key, store, inst, runf)
         }
     };
-    pool_reset(&mut store, instance, extent);
-    run_and_decode(interp, bc, store, instance, run, extent, pool_key)
+    pool_reset(&mut store);
+    run_and_decode(interp, bc, store, instance, run, pool_key)
 }
 
 thread_local! {
@@ -537,25 +525,14 @@ fn execute_proc_wasmtime_pooled(
         let mut p = p.borrow_mut();
         p.iter().position(|(k, ..)| *k == pool_key).map(|pos| p.remove(pos))
     })?;
-    let (_, mut store, instance, globals, run, extent) = pooled;
-    pool_reset_wt(&mut store, instance, &globals.2, extent);
-    Some(run_and_decode_wt(interp, bc, store, instance, globals, run, extent, pool_key))
+    let (_, mut store, instance, globals, run) = pooled;
+    pool_reset_wt(&mut store);
+    Some(run_and_decode_wt(interp, bc, store, instance, globals, run, pool_key))
 }
 
-/// 池命中重置（wasmtime；裁剪依据同 wasmi pool_reset）。gc = caching
-/// global 句柄（随池条目保存——Host.g_caching_h 是 wasmi 类型）。
+/// 池命中重置（wasmtime；wasm 序言承担 cache 清零 + caching=1）。
 #[cfg(feature = "jit-native")]
-fn pool_reset_wt(
-    store: &mut wasmtime::Store<Host>,
-    instance: wasmtime::Instance,
-    gc: &wasmtime::Global,
-    extent: u32,
-) {
-    let _ = gc.set(&mut *store, wasmtime::Val::I32(1));
-    if let Some(wasmtime::Extern::Memory(m)) = instance.get_export(&mut *store, "memory") {
-        let zeros = vec![0u8; extent as usize];
-        let _ = m.write(&mut *store, 0, &zeros);
-    }
+fn pool_reset_wt(store: &mut wasmtime::Store<Host>) {
     store.data_mut().reset_for_reuse();
 }
 
@@ -569,7 +546,6 @@ fn run_and_decode_wt(
     instance: wasmtime::Instance,
     globals: WtGlobals,
     run: wasmtime::TypedFunc<(), i32>,
-    extent: u32,
     pool_key: PoolKey,
 ) -> rtcl_core::Result<Value> {
     use wasmtime::TypedFunc;
@@ -590,7 +566,7 @@ fn run_and_decode_wt(
         if p.len() >= 64 {
             p.clear();
         }
-        p.push((pool_key, store, instance, globals, run, extent));
+        p.push((pool_key, store, instance, globals, run));
     });
 
     match rc {
@@ -658,9 +634,8 @@ fn execute_proc_wasmtime(
     let run = instance
         .get_typed_func(&mut store, "run")
         .expect("run export");
-    let extent = 512u32 + module.l2.vars.len() as u32;
-    pool_reset_wt(&mut store, instance, &globals.2, extent);
-    run_and_decode_wt(interp, bc, store, instance, globals, run, extent, pool_key)
+    pool_reset_wt(&mut store);
+    run_and_decode_wt(interp, bc, store, instance, globals, run, pool_key)
 }
 
 #[cfg(feature = "jit-native")]

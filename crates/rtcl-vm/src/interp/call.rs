@@ -836,3 +836,426 @@ fn ns_of_qualified(interp: &Interp, name: &str) -> Rc<str> {
         None => Rc::clone(&interp.ns_root),
     }
 }
+
+impl Interp {
+    /// JIT 直呼快路径（call_argv 直连路由的 dispatch 免除层）：
+    /// cmd_cache 命中 proc 且形状门过 → 精简帧机器（call_proc 的
+    /// 无循环/无 trace/无 statics 版；epilogue 语义逐项复刻——
+    /// break/continue 转错、(procedure …) 帧、deferred/local-proc/
+    /// var-trace 兜底、return -code 解码、帧池归还）。形状门不过或
+    /// 非 proc → None（调用方退回 dispatch_values 全链）。
+    ///
+    /// 不支持的形态（在门或兜底里保持正确）：
+    /// - 执行 trace：入口门排除（enter/leave 语境依赖全链）
+    /// - statics：入口门排除（statics 注入/回写依赖 call_proc 循环）
+    /// - tailcall：出口检测——弹帧后按重分派语义交 dispatch_values
+    ///   （同深度：帧已弹，目标帧顶替；无 (procedure "P") 帧——
+    ///   与 call_proc 的帧复用语义一致）
+    /// - apply/OO：level0_override/prelink 仅由那些入口武装——
+    ///   本路径不读（cmd_cache 的 proc 键不含它们）
+    pub fn jit_call_proc_direct(&mut self, name: &str, args: &[Value]) -> Option<Result<Value>> {
+        if !self.exec_traces.is_empty() {
+            return None;
+        }
+        let def = match self.cmd_cache_get(name) {
+            Some(super::ResolvedCmd::Proc(key)) => self.procs.get(key.as_ref()).cloned()?,
+            _ => return None,
+        };
+        if !def.statics.is_empty() {
+            return None;
+        }
+        // 名字借用调用方切片（call_proc 的 Cow::Borrowed 同款——每调用
+        // 一次 Rc<str> 堆分配即 ~40ns，fib A/B 实证）。
+        let key: &str = name;
+        if self.call_depth > self.max_call_depth {
+            return Some(Err(Error::runtime(
+                "maximum recursion depth exceeded",
+                crate::error::ErrorCode::StackOverflow,
+            )));
+        }
+        self.call_depth += 1;
+
+        // 定义命名空间（与 call_proc 同源：注册名的限定前缀）。
+        let prev_namespace = self.current_namespace.clone();
+        let mut frame = match self.frame_pool.pop() {
+            Some(mut f) => {
+                f.locals.clear();
+                f.array_locals.clear();
+                f.upvars.clear();
+                f.local_procs.clear();
+                f.deferred_scripts.clear();
+                f.slots.clear();
+                f.slot_aliased.clear();
+                f.link_keys.clear();
+                f.has_aliased = false;
+                f.slot_table = None;
+                f
+            }
+            None => Box::new(CallFrame {
+                locals: VarMap::default(),
+                array_locals: VarSet::default(),
+                upvars: UpvarMap::default(),
+                ns: None,
+                call_ns: None,
+                local_procs: Vec::new(),
+                deferred_scripts: Vec::new(),
+                slots: Vec::with_capacity(8),
+                slot_aliased: Vec::new(),
+                has_aliased: false,
+                link_keys: Vec::new(),
+                slot_table: None,
+                tailcall: None,
+                level0: Vec::new(),
+                ns_depth: 0,
+            }),
+        };
+        if !matches!(&frame.call_ns, Some(n) if Rc::ptr_eq(n, &prev_namespace)) {
+            frame.call_ns = Some(Rc::clone(&prev_namespace));
+        }
+        frame.tailcall = None;
+        frame.level0.clear();
+        frame.ns_depth = self.ns_level0.len();
+        self.frames.push(frame);
+
+        // slot-locals 门 + 种子（call_proc 同款——params 对齐 + 无
+        // statics；OO prelink 槽的 LOAD-BEARING 不变量同源）。
+        let slot_mode = match &def.compiled {
+            Some(code)
+                if !code.fallback
+                    && code.epoch == self.tier1_epoch
+                    && super::vm_exec::bytecode_applicable(self)
+                    && !code.locals().is_empty()
+                    && code.params_aligned == Some(def.params.len()) =>
+            {
+                let table = Rc::clone(code);
+                let n = code.locals().len();
+                let frame = self.frames.last_mut().unwrap();
+                frame.slots.clear();
+                frame.slots.resize(n, Value::unset());
+                frame.slot_aliased.clear();
+                frame.has_aliased = false;
+                frame.link_keys.clear();
+                frame.slot_table = Some(table);
+                true
+            }
+            _ => {
+                let frame = self.frames.last_mut().unwrap();
+                frame.slots.clear();
+                frame.slot_aliased.clear();
+                frame.has_aliased = false;
+                frame.link_keys.clear();
+                frame.slot_table = None;
+                false
+            }
+        };
+
+        // 定义命名空间入帧（identity-checked 写，call_proc 同款）。
+        {
+            let def_ns = ns_of_qualified(self, &key);
+            if !Rc::ptr_eq(&self.current_namespace, &def_ns) {
+                self.current_namespace = Rc::clone(&def_ns);
+            }
+            let frame = self.frames.last_mut().unwrap();
+            if !matches!(&frame.ns, Some(n) if Rc::ptr_eq(n, &def_ns)) {
+                frame.ns = Some(def_ns);
+            }
+            frame.locals.clear();
+            frame.array_locals.clear();
+            frame.upvars.clear();
+        }
+
+        let has_args = def.params.last().map(|(p, _)| p.as_str()) == Some("args");
+        let regular_params = if has_args {
+            &def.params[..def.params.len() - 1]
+        } else {
+            &def.params[..]
+        };
+
+        // arity 检查（tclsh 同款报错形状）。
+        {
+            let num_args = args.len().saturating_sub(1);
+            let mut arity_ok = has_args || num_args <= regular_params.len();
+            if arity_ok {
+                for (i, (_, d)) in regular_params.iter().enumerate() {
+                    if i >= num_args && d.is_none() {
+                        arity_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !arity_ok {
+                let name_word = crate::value::tcl_quote(&key);
+                let mut usage = name_word;
+                for (i, (p, d)) in def.params.iter().enumerate() {
+                    usage.push(' ');
+                    if has_args && i == def.params.len() - 1 {
+                        usage.push_str("?arg ...?");
+                    } else if d.is_some() {
+                        usage.push('?');
+                        usage.push_str(p);
+                        usage.push('?');
+                    } else {
+                        usage.push_str(p);
+                    }
+                }
+                super::commands::list::set_error_code(self, "TCL WRONGARGS");
+                let e = Error::Msg(format!("wrong # args: should be \"{}\"", usage));
+                // 帧清理走共享出口（self.frames 已 push）。
+                self.jit_frame_epilogue_pop(prev_namespace);
+                self.call_depth -= 1;
+                return Some(Err(e));
+            }
+        }
+
+        // 位置绑定 + args 包（call_proc 同款）。
+        {
+            let frame = self.frames.last_mut().unwrap();
+            for (i, (param, default)) in regular_params.iter().enumerate() {
+                let value = if i + 1 < args.len() {
+                    args[i + 1].clone()
+                } else if let Some(d) = default {
+                    Value::from_str(d)
+                } else {
+                    Value::empty()
+                };
+                if slot_mode {
+                    frame.slots[i] = value;
+                } else {
+                    frame.locals.insert(param.clone(), value);
+                }
+            }
+        }
+        if has_args {
+            let remaining_start = regular_params.len() + 1;
+            let remaining: Vec<Value> = if remaining_start < args.len() {
+                args[remaining_start..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let list_str = Value::from_list(&remaining).as_str().to_string();
+            let frame = self.frames.last_mut().unwrap();
+            if slot_mode {
+                frame.slots[regular_params.len()] = Value::from_str(&list_str);
+            } else {
+                frame.locals.insert("args".to_string(), Value::from_str(&list_str));
+            }
+        }
+        {
+            let frame = self.frames.last_mut().unwrap();
+            if frame.level0.is_empty() {
+                frame.level0.extend(args.iter().cloned());
+            }
+        }
+
+        // 体执行（Site A 钩子优先；gate 与 call_proc 一致）。
+        let result = match &def.compiled {
+            Some(code)
+                if !code.fallback
+                    && code.epoch == self.tier1_epoch
+                    && super::vm_exec::bytecode_applicable(self) =>
+            {
+                match super::vm_exec::proc_body_executor(self, code) {
+                    Some(r) => r,
+                    None => super::vm_exec::exec_bytecode(self, code),
+                }
+            }
+            _ => {
+                if def.compiled.is_some() {
+                    self.next_eval_lexical = true;
+                }
+                self.eval(&def.body)
+            }
+        };
+
+        // ── Epilogue（call_proc 语义复刻）────────────────────────────
+        // tailcall：弹帧后重分派（帧顶替、同深度、无 P 帧）。
+        let result = match result {
+            Err(e) if e.is_tail_call() => {
+                let tc_args = match self.frames.last_mut().unwrap().tailcall.take() {
+                    Some(a) => a,
+                    None => match e.into_tail_call_args() {
+                        Some(a) => a,
+                        None => Vec::new(),
+                    },
+                };
+                self.jit_frame_epilogue_pop(prev_namespace);
+                self.call_depth -= 1;
+                if tc_args.is_empty() {
+                    return Some(Ok(Value::empty()));
+                }
+                let vals: Vec<Value> =
+                    tc_args.iter().map(|s| Value::from_str(s)).collect();
+                return Some(self.dispatch_values(&vals));
+            }
+            r => r,
+        };
+
+        // break/continue 逃逸转错（proc 边界，tclsh proc-old-5.14）。
+        let result = match result {
+            Err(e) if e.is_break() || e.is_continue() => {
+                let msg = if e.is_break() {
+                    "invoked \"break\" outside of a loop"
+                } else {
+                    "invoked \"continue\" outside of a loop"
+                };
+                self.err_info = Some(msg.to_string());
+                self.err_fresh = false;
+                self.err_line = 1;
+                super::commands::list::set_error_code(self, "TCL RESULT UNEXPECTED");
+                Err(Error::Msg(msg.to_string()))
+            }
+            other => other,
+        };
+
+        // `(procedure "name" line N)` 出口帧。
+        if let Err(e) = &result {
+            if self.err_is_error(e) {
+                let tag = format!("procedure \"{}\"", key);
+                self.err_exit_frame(&tag);
+            }
+        }
+
+        // deferred / local procs / var-trace 兜底（无则零成本）。
+        {
+            let (scripts, procs_to_delete) = match self.frames.last() {
+                Some(frame) => (
+                    frame.deferred_scripts.clone(),
+                    frame.local_procs.clone(),
+                ),
+                None => (Vec::new(), Vec::new()),
+            };
+            if !scripts.is_empty() {
+                for script in scripts.iter().rev() {
+                    let _ = self.eval_isolated(script);
+                }
+            }
+            if !procs_to_delete.is_empty() {
+                for pname in &procs_to_delete {
+                    super::vm_exec::note_tier1_mutation(self, pname);
+                    self.procs.remove(pname);
+                    self.commands.remove(pname);
+                    self.aliases.remove(pname);
+                }
+                self.note_cmd_mutation();
+            }
+        }
+        if !self.var_traces.is_empty() {
+            let teardown_prefix = format!("F{}:", self.frames.len() - 1);
+            let traced: Vec<String> = self
+                .var_traces
+                .keys()
+                .filter(|k| k.starts_with(&teardown_prefix))
+                .map(|k| k[teardown_prefix.len()..].to_string())
+                .collect();
+            if !traced.is_empty() {
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.locals.clear();
+                    frame.array_locals.clear();
+                }
+                let saved_info = self.err_info.take();
+                let saved_fresh = std::mem::take(&mut self.err_fresh);
+                let saved_raised = std::mem::take(&mut self.err_code_raised);
+                let saved_pending = self.err_pending_top.take();
+                for tname in traced {
+                    let _ = self.fire_traces(&tname, None, "unset");
+                }
+                self.err_info = saved_info;
+                self.err_fresh = saved_fresh;
+                self.err_code_raised = saved_raised;
+                self.err_pending_top = saved_pending;
+            }
+        }
+
+        self.jit_frame_epilogue_pop(prev_namespace);
+        self.call_depth -= 1;
+
+        // return -code 解码（call_proc 同款）。
+        Some(match result {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if e.is_return() {
+                    match &e {
+                        Error::ControlFlow { level, value, error_info, error_code, .. } => {
+                            if let Some(code) = error_code {
+                                let _ = self.set_var("::errorCode", Value::from_str(code));
+                                self.err_code_raised = true;
+                            }
+                            let val = value.clone().unwrap_or_default();
+                            match *level {
+                                0 => Ok(val),
+                                n if n < 0 => Ok(val),
+                                1 => {
+                                    if let Some(info) = error_info {
+                                        self.err_info = Some(info.clone());
+                                        self.err_fresh = false;
+                                    }
+                                    if let Some(info) = error_info {
+                                        let _ = self.set_var("::errorInfo", Value::from_str(info));
+                                    }
+                                    Err(Error::ControlFlow {
+                                        kind: crate::error::ControlFlow::Error,
+                                        value: Some(val),
+                                        level: 1,
+                                        error_info: error_info.clone(),
+                                        error_code: error_code.clone(),
+                                    })
+                                }
+                                3 => Err(Error::ControlFlow {
+                                    kind: crate::error::ControlFlow::Break,
+                                    value: Some(val),
+                                    level: 1,
+                                    error_info: None,
+                                    error_code: None,
+                                }),
+                                4 => Err(Error::ControlFlow {
+                                    kind: crate::error::ControlFlow::Continue,
+                                    value: Some(val),
+                                    level: 1,
+                                    error_info: None,
+                                    error_code: None,
+                                }),
+                                _ => Ok(val),
+                            }
+                        }
+                        _ => Ok(Value::empty()),
+                    }
+                } else {
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    /// 精简帧出口的弹帧+池归还+trace 键清理（epilogue 共用；命名空间
+    /// 恢复由调用方持有 prev_namespace）。
+    fn jit_frame_epilogue_pop(&mut self, prev_namespace: Rc<str>) {
+        let mut popped = self.frames.pop().unwrap();
+        popped.locals.clear();
+        popped.array_locals.clear();
+        popped.upvars.clear();
+        popped.local_procs.clear();
+        popped.deferred_scripts.clear();
+        popped.slots.clear();
+        popped.slot_aliased.clear();
+        popped.has_aliased = false;
+        popped.link_keys.clear();
+        popped.slot_table = None;
+        popped.level0.clear();
+        if popped.tailcall.is_some() {
+            popped.tailcall = None;
+        }
+        if self.frame_pool.len() < 32 {
+            self.frame_pool.push(popped);
+        }
+        if !self.var_traces.is_empty()
+            || !self.elem_traces.is_empty()
+            || !self.trace_phantoms.is_empty()
+        {
+            let fkey = format!("F{}:", self.frames.len());
+            self.var_traces.retain(|k, _| !k.starts_with(&fkey));
+            self.elem_traces.retain(|k, _| !k.starts_with(&fkey));
+            self.trace_phantoms.retain(|k, _| !k.starts_with(&fkey));
+        }
+        self.current_namespace = prev_namespace;
+    }
+}

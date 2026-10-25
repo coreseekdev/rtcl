@@ -1959,3 +1959,31 @@ owner（编译单元/AST）被栈借用的活动命令内运行；嵌套 save/re
 （起点 master：fib 1.32 / fe 1.82 / dloop 1.01 / oo2 1.07 / oovars 1.59 /
 build 1.29。）
 
+
+
+# ---------------------------------------------------------------------------
+# bench — perf/wave2 cc188db 2026-10-24, JIT fast-tier milestone
+# (tag jit-fast-tier @ 6db3724 + wave2 fixes), Linux 7.0.0-38-generic,
+# tclsh 8.6.17.  进程内 `time {}`（消除 ~5.5ms 双方共担的进程开销——
+# 墙钟口径在 fib 这种 <100ms 的 case 上会严重失真）+ 钉核 best-of-5 墙钟参考。
+
+进程内 time（µs/次）          tclsh      rtcl(interp)   jitsh(fast-tier)
+fib25  (242785 proc calls)  113797        71494           52541
+arith  (1M-loop)            701975       394291          337144
+forloop (100k, proc)          9413        19979           13301
+foreach (20k×10)                1.8          6.0            6.0
+
+钉核墙钟 best-of-5 (ms)      tclsh      rtcl           jitsh
+fib25                          119          88             85
+arith1M                       817         263            229
+
+要点：
+- **proc 密集（fib）**：fast-tier 直呼快过 interp 1.36×（进程内）；
+  vs tclsh 2.2×。forloop 同理 1.5×。
+- **无 proc 调用的纯循环（arith）**：jitsh 走解释器同速路径+序言
+  重置的微增益，1.17× vs interp；vs tclsh 2.1×。
+- **foreach**：与 interp 持平（foreach 家族宿主路由 = interp 自身
+  分派成本；tclsh 差距是解释器层面的，非 JIT 回归）。fast 门扩展
+  （循环/变量写/foreach 内联）是后续收益面。
+- 墙钟 fib 表观差距远小于进程内（~5.5ms spawn/init 开销占 fib25
+  墙钟的 6-10%）；arith 墙钟与进程内方向一致。

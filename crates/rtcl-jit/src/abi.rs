@@ -156,13 +156,16 @@ pub mod import {
     /// `(i32) -> ()` — proc_exit_frame(slot)：fast 错误冷路径，本层补
     /// `(procedure "name" line N)` 帧。
     pub const PROC_EXIT_FRAME: u32 = 25;
+    /// `(i32) -> i64` — sync_var(name_h)：v2.1 调用后槽重同步（名字
+    /// 读或 0；无哨兵协议）。
+    pub const SYNC_VAR: u32 = 26;
     /// The one locally defined function (`run`) comes after the imports.
-    pub const RUN: u32 = 26;
+    pub const RUN: u32 = 27;
     /// fast-tier 的 fast_impl（run 之后、proc_main 之前）。
-    pub const FAST_IMPL: u32 = 27;
+    pub const FAST_IMPL: u32 = 28;
     /// Number of imported functions (globals come first in the import
     /// section but do not shift function indices).
-    pub const COUNT: u32 = 26;
+    pub const COUNT: u32 = 27;
 }
 
 /// Fuel policy: each loop back-edge decrements the imported `fuel`

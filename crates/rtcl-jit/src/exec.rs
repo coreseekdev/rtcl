@@ -823,6 +823,16 @@ impl Host {
         }
     }
 
+    /// v2.1 槽重同步：名字读或 0（未定义）——无哨兵协议。
+    pub fn sync_var_raw(&mut self, name_h: i32) -> i64 {
+        let name = self.const_name(name_h);
+        let r = self.irp().get_var(&name).cloned();
+        match r {
+            Ok(v) => self.tag_value(&v),
+            Err(_) => 0,
+        }
+    }
+
     pub fn set_result_raw(&mut self, v: i64) {
         let val = self.value_of(v);
         self.result = Some(val);
@@ -1421,6 +1431,11 @@ fn execute(
     linker
         .func_wrap("rtcl", "set_result", |mut c: Caller<'_, Host>, v: i64| {
             c.data_mut().set_result_raw(v);
+        })
+        .unwrap();
+    linker
+        .func_wrap("rtcl", "sync_var", |mut c: Caller<'_, Host>, name_h: i32| -> i64 {
+            c.data_mut().sync_var_raw(name_h)
         })
         .unwrap();
     linker

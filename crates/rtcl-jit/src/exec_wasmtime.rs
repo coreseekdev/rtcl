@@ -221,6 +221,11 @@ pub(crate) fn register_wasmtime_abi(
             c.data_mut().set_result_raw(v);
         })
         .unwrap();
+    linker
+        .func_wrap("rtcl", "sync_var", |mut c: Caller<'_, Host>, name_h: i32| -> i64 {
+            c.data_mut().sync_var_raw(name_h)
+        })
+        .unwrap();
     let fuel_g = g_fuel;
     linker
         .func_wrap("rtcl", "refuel", move |mut c: Caller<'_, Host>| -> i64 {

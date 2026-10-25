@@ -37,8 +37,15 @@ struct Env<'a> {
 }
 
 struct FastCtx {
-    /// var（l2.vars 下标）→ 参数 slot（per-depth 参数区偏移 = slot*8）。
+    /// var（l2.vars 下标）→ slot（per-depth 参数区偏移 = slot*8）；
+    /// 两段布局：[0,nparams) 参数段（wrapper 预填非 0），[nparams,)
+    /// 局部段（wrapper 清零 = 未写）。
     param_slot: std::collections::HashMap<u32, u32>,
+    nparams: u32,
+    /// var_idx → 名字句柄（调用后槽重同步）。
+    var_names: Vec<i32>,
+    /// resync 临时 i64 local 下标（fast_impl 的 i64 组末尾追加位）。
+    tmp64: u32,
     /// SetResult 记录的结果寄存器（ReturnCode 出口读取）。
     res_reg: std::cell::Cell<Option<u32>>,
     /// 编译期 tier1 epoch（CallSite 槽缓存失效基准）。
@@ -180,6 +187,7 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
     // 函数索引全局一致：import::RUN/COUNT）。
     imports.import("rtcl", "resolve_proc", EntityType::Function(ty::CALL));
     imports.import("rtcl", "proc_exit_frame", EntityType::Function(ty::I32_VOID));
+    imports.import("rtcl", "sync_var", EntityType::Function(ty::I32_TO_I64));
     if nparams.is_some() {
         // fast 专属导入：共享 memory、funcref 表、cur_proc/
         // site_cache_base/fast_depth 三个可变 global（cur_site=6）。
@@ -210,29 +218,44 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
         // 参数 var 映射：l2.vars 中 const_idx ∈ [const_base, const_base+np)
         let mut param_slot = std::collections::HashMap::new();
         let consts_len2 = code.constants().len() as u32;
+        let mut nvars2 = 0usize;
         for (vi, v) in l2.vars.iter().enumerate() {
             if let Some(slot) = v.const_idx.checked_sub(consts_len2) {
-                if (slot as usize) < np {
-                    param_slot.insert(vi as u32, slot);
-                }
+                nvars2 = nvars2.max(slot as usize + 1);
+                param_slot.insert(vi as u32, slot);
             }
         }
+        let nvars = nvars2;
+        // fast_impl 的 i64 组比 run 多一枚 TMP64（resync 临时，落位
+        // nv+3+2nf）——fast 语境的全部寄存器基址随之 +1（WAT 反汇编
+        // 实证：Env 沿用 run 基址时首个 i32 寄存器与 TMP64 撞位，
+        // i64/i32 型错配 = 模块校验失败）。
+        let fast_foreach_base = nv + 4 + 2 * nf;
         let fenv = Env {
             l2,
-            foreach_base,
+            foreach_base: fast_foreach_base,
             scratch: nv + 1,
             epoch_home: nv + 2,
-            bool_base: foreach_base + 2 * nf,
-            kind: foreach_base + 2 * nf + bregs,
+            bool_base: fast_foreach_base + 2 * nf,
+            kind: fast_foreach_base + 2 * nf + bregs,
             fast: Some(FastCtx {
                 param_slot,
+                nparams: np as u32,
+                var_names: {
+                    let mut vnh = vec![0i32; l2.vars.len()];
+                    for (vi, vv) in l2.vars.iter().enumerate() {
+                        vnh[vi] = crate::abi::const_handle(vv.const_idx) as i32;
+                    }
+                    vnh
+                },
+                tmp64: nv + 3 + 2 * nf,
                 res_reg: std::cell::Cell::new(None),
                 epoch: code.epoch,
             }),
         };
         // fast_impl：局部 = run 布局（无参数移位）
         let mut fb = Function::new(vec![
-            (nv + 3 + 2 * nf, I64),
+            (nv + 4 + 2 * nf, I64), // +TMP64（resync 临时）
             (bregs + 1, I32),
         ]);
         emit_node(l3, &fenv, &mut fb);
@@ -268,6 +291,14 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
             fw.instruction(&Instruction::I32Const(((i + 1) * 8) as i32));
             fw.instruction(&Instruction::I32Add);
             fw.instruction(&Instruction::I64Load(MemArg { offset: 0, align: 3, memory_index: 0 }));
+            fw.instruction(&Instruction::I64Store(MemArg { offset: 0, align: 3, memory_index: 0 }));
+        }
+        // 局部段清零 [np, nvars)：上一同深度调用残留即脏帧。
+        for i in np as u32..nvars as u32 {
+            fw.instruction(&Instruction::LocalGet(4));
+            fw.instruction(&Instruction::I32Const((i * 8) as i32));
+            fw.instruction(&Instruction::I32Add);
+            fw.instruction(&Instruction::I64Const(0));
             fw.instruction(&Instruction::I64Store(MemArg { offset: 0, align: 3, memory_index: 0 }));
         }
         // fuel：扣 1，空 → refuel。成功（返回 0，fuel 已充值 chunk）
@@ -391,11 +422,13 @@ fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
     // local 伪常量段 = [consts_len, consts_len+locals)。此前误减
     // l2.const_base（=3）致 fib 的参数 n 被判非常量而拒绝。
     let consts_len = code.constants().len() as u32;
+    let mut nvars = 0usize;
     for v in &l2.vars {
-        let slot = v.const_idx.checked_sub(consts_len)?;
-        if slot as usize >= np {
-            return None;
-        }
+        let slot = v.const_idx.checked_sub(consts_len)? as usize;
+        nvars = nvars.max(slot + 1);
+    }
+    if nvars > (crate::abi::cache::PARAM_STRIDE / 8) as usize {
+        return None;
     }
     // site-cache 段容量（SITE_STRIDE/4 = 256 槽）：超长 proc 不 fast 化。
     if code.sites.len() > (crate::abi::cache::SITE_STRIDE / 4) as usize {
@@ -422,7 +455,7 @@ fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
             | Instr::ForeachEnd { .. }
             | Instr::ForeachCollect { .. } => Some("foreach"),
             Instr::BackedgeFuel { .. } => Some("backedge"),
-            Instr::StoreVar { .. } | Instr::IncrVar { .. } => Some("store/incr"),
+            Instr::IncrVar { .. } => Some("incr"),
             _ => None,
         };
         if b.is_some() && bad.is_none() {
@@ -706,6 +739,10 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             // + slot*8——proc_main wrapper 拷贝；递归各层切片互不覆盖）。
             if let Some(fc) = &e.fast {
                 if let Some(slot) = fc.param_slot.get(&var) {
+                    // 三块模板（经典臂同构）：槽非零直读；零（局部段
+                    // 未写）→ 宿主名字路由。
+                    f.instruction(&Instruction::Block(BlockType::Empty)); // done
+                    f.instruction(&Instruction::Block(BlockType::Empty)); // host
                     f.instruction(&Instruction::I32Const(cache::PARAMS as i32));
                     f.instruction(&Instruction::GlobalGet(5));
                     f.instruction(&Instruction::I32Const(cache::PARAM_STRIDE as i32));
@@ -716,7 +753,16 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                         align: 3,
                         memory_index: 0,
                     }));
+                    f.instruction(&Instruction::LocalTee(dst.0));
+                    f.instruction(&Instruction::I64Eqz);
+                    f.instruction(&Instruction::BrIf(0)); // 零 → host
+                    f.instruction(&Instruction::Br(1)); // done
+                    f.instruction(&Instruction::End); // host:
+                    f.instruction(&Instruction::I32Const(e.name_handle(var)));
+                    f.instruction(&Instruction::Call(import::GET_VAR));
                     f.instruction(&Instruction::LocalSet(dst.0));
+                    check_sentinel(e, f, dst.0, *fail);
+                    f.instruction(&Instruction::End); // done
                     return;
                 }
             }
@@ -745,6 +791,29 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
         }
         Instr::StoreVar { src, var, keep: _, fail } => {
             let var = *var;
+            if let Some(fc) = &e.fast {
+                if let Some(slot) = fc.param_slot.get(&var) {
+                    f.instruction(&Instruction::I32Const(cache::PARAMS as i32));
+                    f.instruction(&Instruction::GlobalGet(5));
+                    f.instruction(&Instruction::I32Const(cache::PARAM_STRIDE as i32));
+                    f.instruction(&Instruction::I32Mul);
+                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalGet(src.0));
+                    f.instruction(&Instruction::I64Store(MemArg {
+                        offset: (*slot * 8) as u64,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                    if *slot >= fc.nparams {
+                        // 局部段镜像宿主：global/upvar 链接的正确性。
+                        f.instruction(&Instruction::I32Const(e.name_handle(var)));
+                        f.instruction(&Instruction::LocalGet(src.0));
+                        f.instruction(&Instruction::Call(import::SET_VAR));
+                        f.instruction(&Instruction::Drop);
+                    }
+                    return;
+                }
+            }
             let vals = cache::VALUES + var * 8;
             let state = cache::STATE + var;
             f.instruction(&Instruction::Block(BlockType::Empty)); // done
@@ -906,6 +975,28 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                     f.instruction(&Instruction::End);
                 }
                 f.instruction(&Instruction::End);
+                // ── 调用后槽重同步：被调方可能经 upvar/global 改本帧槽
+                //（uv2：p2 的 upvar 写落 interp 帧槽，wasm 槽 stale）。
+                // 每 var 一次 sync_var（名字读或 0）写回槽——用专用
+                // TMP64 临时（fc.tmp64），不碰 dst（调用结果仍在途）。
+                for (vi, _) in e.l2.vars.iter().enumerate() {
+                    let slot = fc.param_slot.get(&(vi as u32)).copied().unwrap_or(0);
+                    let name_h = fc.var_names.get(vi).copied().unwrap_or(0);
+                    f.instruction(&Instruction::I32Const(name_h));
+                    f.instruction(&Instruction::Call(import::SYNC_VAR));
+                    f.instruction(&Instruction::LocalSet(fc.tmp64));
+                    f.instruction(&Instruction::I32Const(cache::PARAMS as i32));
+                    f.instruction(&Instruction::GlobalGet(5));
+                    f.instruction(&Instruction::I32Const(cache::PARAM_STRIDE as i32));
+                    f.instruction(&Instruction::I32Mul);
+                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalGet(fc.tmp64));
+                    f.instruction(&Instruction::I64Store(MemArg {
+                        offset: (slot * 8) as u64,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                }
                 f.instruction(&Instruction::End); // $done
                 return;
             }

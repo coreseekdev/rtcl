@@ -1725,3 +1725,20 @@ pub fn set_jit_call_in_flight(in_flight: bool) {
 pub fn jit_call_in_flight() -> bool {
     JIT_CALL_IN_FLIGHT.with(|f| f.get())
 }
+
+// ── fast-tier 跨帧写哨兵：upvar/global 命令链接到非当前帧时置位；
+// rtcl-jit 的 fast linker 在每次分派后读取并写入 wasm dirty global
+//（调用后槽 resync 的运行时门——常见路径零宿主读）。
+thread_local! {
+    static JIT_CROSS_FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 置位跨帧写哨兵（upvar/global 命令实现调用；帧深度>0 时）。
+pub fn jit_note_cross_frame() {
+    JIT_CROSS_FRAME.with(|f| f.set(true));
+}
+
+/// 读取并清除跨帧写哨兵（fast linker 分派后调用）。
+pub fn jit_take_cross_frame() -> bool {
+    JIT_CROSS_FRAME.with(|f| f.replace(false))
+}

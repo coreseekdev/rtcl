@@ -414,6 +414,11 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     } else {
         LevelSpec::Rel(1, "1".to_string())
     };
+    // fast-tier 跨帧写哨兵：任何 upvar 链接（相对层级≥1 即跨帧；upvar 0
+    // 是本帧别名，无跨帧写风险）。
+    if !matches!(&spec, LevelSpec::Rel(0, _)) {
+        crate::interp::jit_note_cross_frame();
+    }
     let script_start = if has_level { 2usize } else { 1usize };
 
     // tclsh counts every varFrame — proc frames AND open `namespace
@@ -838,6 +843,10 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     let current_idx = interp.frames.len() - 1;
+    // fast-tier 哨兵：global 链接到全局帧（proc 深度>0 时必跨帧）。
+    if interp.frames.len() > 1 {
+        crate::interp::jit_note_cross_frame();
+    }
 
     for arg in &args[1..] {
         let name = arg.as_str();

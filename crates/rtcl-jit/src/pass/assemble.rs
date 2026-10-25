@@ -46,6 +46,9 @@ struct FastCtx {
     var_names: Vec<i32>,
     /// resync 临时 i64 local 下标（fast_impl 的 i64 组末尾追加位）。
     tmp64: u32,
+    /// 体含 CallSite 才需要调用后 resync（纯算术叶子无人可写本帧
+    /// 槽——fib 内层叶路径免 per-var 宿主读，性能关键）。
+    resync_on: bool,
     /// SetResult 记录的结果寄存器（ReturnCode 出口读取）。
     res_reg: std::cell::Cell<Option<u32>>,
     /// 编译期 tier1 epoch（CallSite 槽缓存失效基准）。
@@ -203,6 +206,8 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
             val_type: I32, mutable: true, shared: false }));
         imports.import("rtcl", "fast_depth", EntityType::Global(GlobalType {
             val_type: I32, mutable: true, shared: false }));
+        imports.import("rtcl", "dirty", EntityType::Global(GlobalType {
+            val_type: I32, mutable: true, shared: false }));
     }
 
     // ── fast-tier：fast_impl + proc_main 薄 wrapper ──────────────────
@@ -249,6 +254,15 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
                     vnh
                 },
                 tmp64: nv + 3 + 2 * nf,
+                resync_on: {
+                    let mut hc = false;
+                    walk(l3, &mut |n| {
+                        if matches!(n, L3::Instr(Instr::CallSite { .. })) {
+                            hc = true;
+                        }
+                    });
+                    hc
+                },
                 res_reg: std::cell::Cell::new(None),
                 epoch: code.epoch,
             }),
@@ -979,6 +993,14 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 //（uv2：p2 的 upvar 写落 interp 帧槽，wasm 槽 stale）。
                 // 每 var 一次 sync_var（名字读或 0）写回槽——用专用
                 // TMP64 临时（fc.tmp64），不碰 dst（调用结果仍在途）。
+                // 仅体含 CallSite 时发射（纯算术叶子无人可写本帧）。
+                if fc.resync_on {
+                // dirty 门：被调方实际执行了跨帧 upvar/global 才重拉
+                //（宿主置位；此处检查+清除）。常见路径零宿主读。
+                f.instruction(&Instruction::GlobalGet(6)); // dirty（fuel0 epoch1 caching2 cur_proc3 site_cache_base4 fast_depth5 dirty6）
+                f.instruction(&Instruction::If(BlockType::Empty));
+                f.instruction(&Instruction::I32Const(0));
+                f.instruction(&Instruction::GlobalSet(6));
                 for (vi, _) in e.l2.vars.iter().enumerate() {
                     let slot = fc.param_slot.get(&(vi as u32)).copied().unwrap_or(0);
                     let name_h = fc.var_names.get(vi).copied().unwrap_or(0);
@@ -997,6 +1019,8 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                         memory_index: 0,
                     }));
                 }
+                }
+                f.instruction(&Instruction::End); // dirty end
                 f.instruction(&Instruction::End); // $done
                 return;
             }

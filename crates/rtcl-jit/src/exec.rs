@@ -1366,6 +1366,8 @@ fn execute(
         linker.define("rtcl", "site_cache_base", Extern::Global(g_scb)).unwrap();
         let g_fd = wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Var);
         linker.define("rtcl", "fast_depth", Extern::Global(g_fd)).unwrap();
+        let g_dty = wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Var);
+        linker.define("rtcl", "dirty", Extern::Global(g_dty)).unwrap();
     }
     linker.func_wrap("rtcl", "resolve_proc", |_cmd: i32, _argc: i32, _base: i32| -> i64 {
         unreachable!("resolve_proc stub (regular store)")

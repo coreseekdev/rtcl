@@ -143,6 +143,12 @@ pub(crate) fn register_wasmtime_abi(
     linker.define(&mut *store, "rtcl", "cur_proc", g_cur).unwrap();
     linker.define(&mut *store, "rtcl", "site_cache_base", g_scb).unwrap();
     linker.define(&mut *store, "rtcl", "fast_depth", g_fd).unwrap();
+    let g_dty = wasmtime::Global::new(
+        &mut *store,
+        wasmtime::GlobalType::new(wasmtime::ValType::I32, wasmtime::Mutability::Var),
+        Val::I32(0),
+    ).expect("stub dirty");
+    linker.define(&mut *store, "rtcl", "dirty", g_dty).unwrap();
     linker.func_wrap("rtcl", "resolve_proc", |_s: i32, _a: i32, _b: i32| -> i64 {
         unreachable!("resolve_proc stub (wasmtime store)")
     }).unwrap();

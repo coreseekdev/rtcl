@@ -363,6 +363,8 @@ fn register_and_instantiate(store: &mut wasmi::Store<Host>, epoch0: i64, wmodule
         linker.define("rtcl", "site_cache_base", Extern::Global(g_scb)).unwrap();
         let g_fd = wasmi::Global::new(&mut *store, wasmi::Val::I32(0), wasmi::Mutability::Var);
         linker.define("rtcl", "fast_depth", Extern::Global(g_fd)).unwrap();
+        let g_dty = wasmi::Global::new(&mut *store, wasmi::Val::I32(0), wasmi::Mutability::Var);
+        linker.define("rtcl", "dirty", Extern::Global(g_dty)).unwrap();
     }
     linker.func_wrap("rtcl", "resolve_proc", |_s: i32, _a: i32, _b: i32| -> i64 {
         unreachable!("resolve_proc stub (regular store)")
@@ -768,6 +770,7 @@ pub(crate) struct FastHost {
     pub o_caching: Option<wasmi::Global>,
     pub o_cur: Option<wasmi::Global>,
     pub o_depth: Option<wasmi::Global>,
+    pub o_dirty: Option<wasmi::Global>,
 }
 
 impl FastHost {
@@ -927,6 +930,11 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
     linker.define("rtcl", "caching", Extern::Global(g_caching)).unwrap();
     linker.define("rtcl", "cur_proc", Extern::Global(g_cur)).unwrap();
     linker.define("rtcl", "fast_depth", Extern::Global(g_depth)).unwrap();
+    let g_dirty = {
+        let ctx = store.as_context();
+        ctx.data().o_dirty.clone().expect("fast store init")
+    };
+    linker.define("rtcl", "dirty", Extern::Global(g_dirty)).unwrap();
     let g_scb = wasmi::Global::new(&mut *store, Val::I32(site_cache_base), wasmi::Mutability::Var);
     linker.define("rtcl", "site_cache_base", Extern::Global(g_scb)).unwrap();
 
@@ -1066,6 +1074,18 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
 
     // call_argv：resolve 未命中（cache=-1）后的常驻回落——jit_call_proc_direct
     // 优先，dispatch_values 兜底；④ epoch 门同 call_argv_raw。
+    linker.func_wrap("rtcl", "sync_var", |mut c: Caller<'_, FastHost>, name_h: i32| -> i64 {
+        let cur = read_cur(&mut c);
+        let name = c.data().hosts[cur].const_name(name_h);
+        let interp = unsafe { &mut *c.data().interp };
+        match interp.get_var(&name).cloned() {
+            Ok(v) => {
+                let h = &mut c.data_mut().hosts[cur];
+                h.tag_value(&v)
+            }
+            Err(_) => 0,
+        }
+    }).unwrap();
     linker.func_wrap("rtcl", "call_argv", |mut c: Caller<'_, FastHost>, base: i32, argc: i32, site: i32| -> i64 {
         let cur = read_cur(&mut c);
         refresh_epoch(&mut c);
@@ -1083,6 +1103,13 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
             Some(r) => r,
             None => interp.dispatch_values(&args),
         };
+        // 跨帧写哨兵传播：被调方执行了 upvar/global（链接跨帧）→
+        // dirty global 置位（wasm 侧调用后 resync 的运行时门）。
+        if rtcl_vm::interp::jit_take_cross_frame() {
+            if let Some(g) = c.data().o_dirty.clone() {
+                let _ = g.set(&mut c, wasmi::Val::I32(1));
+            }
+        }
         match r {
             Ok(v) => {
                 if interp.tier1_epoch() != epoch0 {
@@ -1296,6 +1323,7 @@ fn init_fast_store(interp: &mut Interp) -> wasmi::Store<FastHost> {
             o_caching: None,
             o_cur: None,
             o_depth: None,
+            o_dirty: None,
         },
     );
     // 16 页（1MB）：site-cache 68KB + 参数切片（128B×depth——深度
@@ -1322,6 +1350,10 @@ fn init_fast_store(interp: &mut Interp) -> wasmi::Store<FastHost> {
         h.o_caching = Some(g_caching);
         h.o_cur = Some(g_cur);
         h.o_depth = Some(g_depth);
+    }
+    {
+        let g_dirty = wasmi::Global::new(&mut store, wasmi::Val::I32(0), wasmi::Mutability::Var);
+        store.data_mut().o_dirty = Some(g_dirty);
     }
     store
 }

@@ -2017,3 +2017,32 @@ fl 9145→6979）、6bc32bc（slot_base 缓存 + fast 免 SetSite + 纯读单元
   resync/dirty 机器全 wasmi 特化，移植是独立工作量。
 - 正确性：形状 17 项 vs tclsh 全一致（rd/rp/dp 余项为 tclsh 措辞
   差、rtcl==jitsh）；fuzz 三种子 1100 例 0 分歧；rtcl-vm 809 全过。
+
+# ---------------------------------------------------------------------------
+# perf/wave2 wasmtime fast 驱动 @ 888ff1e 2026-10-27（闲时任务 #145）。
+# 同机态同窗交错钉核 best-of-5（快照口径；机态漂移 4×+，比例为准）。
+
+形状（µs/次）        tclsh    rtcl(interp)  jitsh@wasmi  jitsh@wasmtime
+fib25                 24828       14849        15101          3203
+forloop                2564        2209         3110          1280
+
+比例（wasmtime fast ÷ interp）：fib **0.22×（4.6× 快于解释器）**、
+fl **0.58×（1.7× 快于解释器）**——「不弱于解释器」目标在 proc 形状
+达成；vs tclsh：fib 7.8×、fl 2.0×。
+
+本节提交：9fef47c（Phase A 循环臂融合：Cmp→BoolOfBool 直写 + IncrVar
+零检查消除 + LoadVar 寻址补漏——wasmi fl -18%）→ 888ff1e（Phase B
+wasmtime fast 全量移植 exec_fast_wt.rs + p05 循环控制流修复：fast
+CallSite resolve 臂 kind1/2 补内层出口 br，深度=经典 d+1/d+2 再 +1
+——resolve 点只多 $done 一层）。
+
+要点：
+- **wasmi fast 的循环 1.46× 落后是指令解释地板**，wasmtime native
+  编译一票翻盘——两引擎共享发射器与 Host 路由，引擎侧仅 Caller/
+  Global/Table 类型差异（exec_fast_wt.rs 与 proc_exec.rs 同构）。
+- p05 教训：fast CallSite 臂的 kind 分支深度是发射点块结构的函数，
+  动块结构必须 WAT 块栈实测（$done 在 resolve 点仍在、$fallback 已闭）。
+- 双引擎门禁全绿：probes 18/18×2、battery 33/33×2、fuzz 两种子
+  1600 例 0 分歧×2、rtcl-vm 809。
+- 下一档杆：arith（无 proc 纯循环）走顶层 classic——fast 化顶层单元
+  或 interpreter 内联是独立课题；foreach 内联依旧 OPEN。

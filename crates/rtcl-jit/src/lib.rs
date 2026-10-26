@@ -80,6 +80,8 @@ pub mod proc_exec;
 
 #[cfg(all(feature = "jit-exec", feature = "jit-native"))]
 pub mod exec_wasmtime;
+#[cfg(all(feature = "jit-exec", feature = "jit-native"))]
+pub mod exec_fast_wt;
 
 /// Shorthand for the emitter's rejection type.
 pub use emit::Unsupported;

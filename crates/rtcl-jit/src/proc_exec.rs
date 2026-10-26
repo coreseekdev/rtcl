@@ -13,7 +13,7 @@
 //! 的对齐由差分电池裁决（见 `bench/scripts/jit_proc_probes/`）。
 
 /// 池 key 三元组（interp 指针, proc 体 Rc 指针, epoch）。
-type PoolKey = (usize, usize, u64);
+pub(crate) type PoolKey = (usize, usize, u64);
 /// (fuel, epoch, caching) global 句柄三元组（池命中重置用）。
 #[cfg(feature = "jit-native")]
 type WtGlobals = (wasmtime::Global, wasmtime::Global, wasmtime::Global);
@@ -88,7 +88,7 @@ pub fn set_fast_only(v: bool) {
     FAST_ONLY.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn fast_only() -> bool {
+pub(crate) fn fast_only() -> bool {
     if crate::env_value("RTCL_JIT_POOL").as_deref() == Some("1") {
         return false;
     }
@@ -102,22 +102,22 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
     if code.epoch != interp.tier1_epoch() {
         return None;
     }
-    // fast-tier 优先（MoonBit 式直呼；RTCL_JIT_FAST=0 关闭；wasmtime 引
-    // 慢路径不适用——共享 Store 驱动是 wasmi 实现）。槽命中零编译查
-    // 找；未命中 compile_cached（常规冷路径也需要同一编译——零浪费）。
-    let fast_ok = {
-        #[cfg(feature = "jit-native")]
-        {
-            crate::exec::engine_from_env() != crate::exec::EngineKind::Wasmtime
-        }
-        #[cfg(not(feature = "jit-native"))]
-        {
-            true
-        }
-    };
+    // fast-tier 优先（MoonBit 式直呼；RTCL_JIT_FAST=0 关闭）。引擎分派：
+    // wasmi → FAST_STORE 驱动；wasmtime → WT_FAST_STORE 驱动（exec_fast_wt，
+    // 与 wasmi 同构）。槽命中零编译查找；未命中 compile_cached（常规冷
+    // 路径也需要同一编译——零浪费）。
     // 默认开启（RTCL_JIT_FAST=0 关闭——差分回归逃生口）。judge 88/88
     // （fast=1）+ battery/probes + fib(2)-(30) 全深度三方一致后转正。
-    if fast_ok && crate::env_value("RTCL_JIT_FAST").as_deref() != Some("0") {
+    if crate::env_value("RTCL_JIT_FAST").as_deref() != Some("0") {
+        #[cfg(feature = "jit-native")]
+        if crate::exec::engine_from_env() == crate::exec::EngineKind::Wasmtime {
+            if let Some(r) = crate::exec_fast_wt::fast_try_wt(interp, code) {
+                return Some(r);
+            }
+        } else if let Some(r) = fast_try(interp, code) {
+            return Some(r);
+        }
+        #[cfg(not(feature = "jit-native"))]
         if let Some(r) = fast_try(interp, code) {
             return Some(r);
         }
@@ -154,7 +154,7 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
 }
 
 /// emit 编译缓存（key 二元组；未命中现编译，拒绝不缓存负项）。
-fn compile_cached(code: &Rc<ByteCode>, key: (usize, u64)) -> Option<Rc<emit::Module>> {
+pub(crate) fn compile_cached(code: &Rc<ByteCode>, key: (usize, u64)) -> Option<Rc<emit::Module>> {
     PROC_MODULES.with(|c| {
         let mut c = c.borrow_mut();
         if let Some(m) = c.get(&key) {
@@ -808,8 +808,13 @@ thread_local! {
 }
 
 /// 当前是否处于 fast 调用窗口。
-fn fast_in_call() -> bool {
+pub(crate) fn fast_in_call() -> bool {
     FAST_IN_CALL.with(|f| f.get())
+}
+
+/// fast 调用窗口标志设置（wasmtime fast 驱动复用同一线程本地）。
+pub(crate) fn set_fast_in_call(v: bool) {
+    FAST_IN_CALL.with(|f| f.set(v))
 }
 
 thread_local! {

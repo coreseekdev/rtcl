@@ -1349,6 +1349,30 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 f.instruction(&Instruction::I64Eq);
                 f.instruction(&Instruction::If(BlockType::Empty));
                 fail_path(e, f, *fail);
+                // kind 1/2 = level-1 break/continue：内层循环出口 br
+                //（经典臂同款深度 +1——resolve 点只比经典多 $done 一层，
+                // $fallback 已在其前闭合；v3.1 循环进 fast 后必须在单元
+                // 内解析，单元返回会被 proc 边界转成 "outside of a loop"
+                // 错，p05 实证）。
+                if let Some(d) = brk_depth {
+                    f.instruction(&Instruction::LocalGet(e.kind));
+                    f.instruction(&Instruction::I32Const(1));
+                    f.instruction(&Instruction::I32Eq);
+                    f.instruction(&Instruction::BrIf(d + 2));
+                }
+                if let Some(d) = cont_depth {
+                    f.instruction(&Instruction::LocalGet(e.kind));
+                    f.instruction(&Instruction::I32Const(2));
+                    f.instruction(&Instruction::I32Eq);
+                    f.instruction(&Instruction::If(BlockType::Empty));
+                    if *cont_back {
+                        emit_fuel(e, f, *fail);
+                    }
+                    f.instruction(&Instruction::Br(d + 3));
+                    f.instruction(&Instruction::End);
+                }
+                // 剩余 kinds（无循环的 1/2、level>1 的 3/4、stale 6）
+                // 单元返回。
                 for (k, rc) in [
                     (1i32, code::BREAK),
                     (2, code::CONTINUE),

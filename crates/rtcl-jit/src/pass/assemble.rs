@@ -77,6 +77,7 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
     let bregs = count_bregs(l3);
     let nf = count_foreach(l3);
     let foreach_base = nv + 3;
+    if std::env::var_os("JIT_FT").is_some() { eprintln!("[gate] {:?}", fast_gate(l2,l3,code)); }
     let nparams = fast_gate(l2, l3, code);
     let env = Env {
         l2,
@@ -448,9 +449,7 @@ fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
     if code.sites.len() > (crate::abi::cache::SITE_STRIDE / 4) as usize {
         return None;
     }
-    if !l2.backedges.is_empty() {
-        return None;
-    }
+    // v3: loops allowed
     let mut bad: Option<&'static str> = None;
     let mut has_loop = false;
     walk(l3, &mut |n| {
@@ -469,14 +468,13 @@ fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
             | Instr::ForeachEnd { .. }
             | Instr::ForeachCollect { .. } => Some("foreach"),
             Instr::BackedgeFuel { .. } => Some("backedge"),
-            Instr::IncrVar { .. } => Some("incr"),
             _ => None,
         };
         if b.is_some() && bad.is_none() {
             bad = b;
         }
     });
-    if bad.is_some() || has_loop {
+    if bad.is_some() {
         return None;
     }
     let _ = (&bad, has_loop);
@@ -852,6 +850,96 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
         }
         Instr::IncrVar { dst, var, amount, fail, site } => {
             let var = *var;
+            if let Some(fc) = &e.fast {
+                if let Some(slot) = fc.param_slot.get(&var) {
+                    let tmp = fc.tmp64;
+                    let mut slot_addr = |f: &mut Function| {
+                        f.instruction(&Instruction::I32Const(cache::PARAMS as i32));
+                        f.instruction(&Instruction::GlobalGet(5));
+                        f.instruction(&Instruction::I32Const(cache::PARAM_STRIDE as i32));
+                        f.instruction(&Instruction::I32Mul);
+                        f.instruction(&Instruction::I32Add);
+                    };
+                    f.instruction(&Instruction::Block(BlockType::Empty)); // done
+                    f.instruction(&Instruction::Block(BlockType::Empty)); // slow
+                    slot_addr(&mut *f);
+                    f.instruction(&Instruction::I64Load(MemArg {
+                        offset: (*slot * 8) as u64,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                    f.instruction(&Instruction::LocalTee(tmp));
+                    f.instruction(&Instruction::I64Eqz);
+                    f.instruction(&Instruction::BrIf(0)); // 零 → slow
+                    f.instruction(&Instruction::LocalGet(tmp));
+                    f.instruction(&Instruction::I64Const(1));
+                    f.instruction(&Instruction::I64And);
+                    f.instruction(&Instruction::I64Eqz);
+                    f.instruction(&Instruction::BrIf(0)); // 非 imm → slow
+                    f.instruction(&Instruction::LocalGet(tmp));
+                    f.instruction(&Instruction::I64Const(1));
+                    f.instruction(&Instruction::I64ShrS);
+                    f.instruction(&Instruction::I64Const(*amount));
+                    f.instruction(&Instruction::I64Add);
+                    f.instruction(&Instruction::LocalSet(tmp));
+                    f.instruction(&Instruction::LocalGet(tmp));
+                    f.instruction(&Instruction::I64Const(62));
+                    f.instruction(&Instruction::I64ShrS);
+                    f.instruction(&Instruction::I64Eqz);
+                    f.instruction(&Instruction::LocalGet(tmp));
+                    f.instruction(&Instruction::I64Const(62));
+                    f.instruction(&Instruction::I64ShrS);
+                    f.instruction(&Instruction::I64Const(-1));
+                    f.instruction(&Instruction::I64Eq);
+                    f.instruction(&Instruction::I32Or);
+                    f.instruction(&Instruction::I32Eqz);
+                    f.instruction(&Instruction::BrIf(0)); // 越界 → slow
+                    f.instruction(&Instruction::LocalGet(tmp));
+                    f.instruction(&Instruction::I64Const(1));
+                    f.instruction(&Instruction::I64Shl);
+                    f.instruction(&Instruction::I64Const(1));
+                    f.instruction(&Instruction::I64Or);
+                    f.instruction(&Instruction::LocalSet(dst.0));
+                    slot_addr(&mut *f);
+                    f.instruction(&Instruction::LocalGet(dst.0));
+                    f.instruction(&Instruction::I64Store(MemArg {
+                        offset: (*slot * 8) as u64,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                    if *slot >= fc.nparams {
+                        f.instruction(&Instruction::I32Const(e.name_handle(var)));
+                        f.instruction(&Instruction::LocalGet(dst.0));
+                        f.instruction(&Instruction::Call(import::SET_VAR));
+                        f.instruction(&Instruction::Drop);
+                    }
+                    f.instruction(&Instruction::Br(1)); // done
+                    f.instruction(&Instruction::End); // slow:
+                    f.instruction(&Instruction::I32Const(e.name_handle(var)));
+                    // incr_var 宿主闭包对增量做 untag（与常规 linker 同
+                    // 约定）——发射端必须送 tagged 立即数，否则 amount 被
+                    // 右移折半（inc1：incr i 5 实际加 2）。
+                    f.instruction(&Instruction::I64Const(abi::tag_imm(*amount)));
+                    f.instruction(&Instruction::Call(import::INCR_VAR));
+                    f.instruction(&Instruction::LocalSet(dst.0));
+                    check_sentinel(e, f, dst.0, *fail);
+                    slot_addr(&mut *f);
+                    f.instruction(&Instruction::LocalGet(dst.0));
+                    f.instruction(&Instruction::I64Store(MemArg {
+                        offset: (*slot * 8) as u64,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                    if *slot >= fc.nparams {
+                        f.instruction(&Instruction::I32Const(e.name_handle(var)));
+                        f.instruction(&Instruction::LocalGet(dst.0));
+                        f.instruction(&Instruction::Call(import::SET_VAR));
+                        f.instruction(&Instruction::Drop);
+                    }
+                    f.instruction(&Instruction::End); // done
+                    return;
+                }
+            }
             let vals = cache::VALUES + var * 8;
             let state = cache::STATE + var;
             f.instruction(&Instruction::Block(BlockType::Empty)); // done

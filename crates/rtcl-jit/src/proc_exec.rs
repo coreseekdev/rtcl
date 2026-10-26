@@ -293,7 +293,15 @@ fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit::Module) -
         if let Some(w) = m.get(&pool_key) {
             return w.clone();
         }
-        let w = Module::new(&engine, &module.bytes[..]).expect("jit proc: module");
+        let w = match Module::new(&engine, &module.bytes[..]) {
+            Ok(m) => m,
+            Err(e) => {
+                if std::env::var_os("JIT_DM").is_some() {
+                    std::fs::write("/tmp/jitdbg/dm.wasm", &module.bytes[..]).ok();
+                }
+                panic!("jit proc: module: {e:?}");
+            }
+        };
         if m.len() >= 64 {
             m.clear();
         }
@@ -970,6 +978,9 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
         let cur = read_cur(&mut c);
         let name = c.data_mut().hosts[cur].const_name(name_h);
         let r = unsafe { &mut *c.data().interp }.jit_read_var_ref(&name);
+        if std::env::var_os("JIT_FT").is_some() {
+            eprintln!("[ft] get_var cur={cur} name={name:?} -> {:?}", r.as_ref().map(|v| v.as_str().to_string()).map_err(|e| e.message_text().to_string()));
+        }
         let h = &mut c.data_mut().hosts[cur];
         match r {
             Ok(v) => h.tag_value(&v),
@@ -1019,7 +1030,11 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
         let fid = fail_id.max(0) as u32;
         c.data_mut().last_fail = Some(fid);
         let h = &mut c.data_mut();
-        fast_take_fail(h, cur, fid)
+        let r = fast_take_fail(h, cur, fid);
+        if std::env::var_os("JIT_FT").is_some() {
+            eprintln!("[ft] fail cur={cur} fid={fid} -> {r} (pending={})", c.data().pending.is_some());
+        }
+        r
     }).unwrap();
     linker.func_wrap("rtcl", "bool_test", |mut c: Caller<'_, FastHost>, v: i64| -> i64 {
         let cur = read_cur(&mut c);
@@ -1034,6 +1049,9 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
     linker.func_wrap("rtcl", "incr_var", |mut c: Caller<'_, FastHost>, name_h: i32, n: i64| -> i64 {
         let cur = read_cur(&mut c);
         let r = c.data_mut().hosts[cur].incr_var_raw(name_h, n);
+        if std::env::var_os("JIT_FT").is_some() {
+            eprintln!("[ft] incr_var cur={cur} name={:?} n={n} -> {r}", c.data().hosts[cur].const_name(name_h));
+        }
         if r == abi::ERR_SENTINEL {
             let e = c.data_mut().hosts[cur].pending.take().map(|p| p.err)
                 .unwrap_or_else(|| Error::Msg("fast incr failed".into()));
@@ -1263,6 +1281,9 @@ fn fast_ensure_slot(
                     m.clear();
                 }
                 m.insert(pool_key, w.clone());
+                if std::env::var_os("JIT_DM").is_some() {
+                    let _ = std::fs::write("/tmp/jitdbg/fm.wasm", &module.bytes[..]);
+                }
                 Some(w)
             }
             Err(_) => None,
@@ -1426,6 +1447,9 @@ fn execute_fast(
                                 m.clear();
                             }
                             m.insert(pool_key, w.clone());
+                            if std::env::var_os("JIT_DM").is_some() {
+                                let _ = std::fs::write("/tmp/jitdbg/fm.wasm", &module.bytes[..]);
+                            }
                             Ok(w)
                         }
                         Err(e) => Err(e),

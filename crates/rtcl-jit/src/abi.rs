@@ -193,6 +193,13 @@ pub mod cache {
     pub const PARAMS: u32 = SITE_CACHE_END;
     /// 每深度参数区（8B × 最大参数数 16）。
     pub const PARAM_STRIDE: u32 = 128;
+    /// lazy-flush 槽脏位掩码：per-depth 切片末字（slot 15 保留不用，
+    /// gate 上限 = PARAM_STRIDE/8 - 1）。写进内存而非 wasm local——
+    /// proc_main 出口 flush 要读它（upvar 被调方写必须在调用方 resync
+    /// 前落到 interp 帧，uv2）。
+    pub const SLOT_MASK_OFF: u32 = PARAM_STRIDE - 8;
+    /// 每 proc 最大槽数（末槽保留给掩码）。
+    pub const MAX_SLOTS_PER_PROC: usize = (PARAM_STRIDE / 8) as usize - 1;
     /// fast-tier site-cache：每 proc 一段（SITE_STRIDE 字节），槽号
     /// i32×site。槽位上限 = MAX_FAST_SLOTS（容量与 OOB 防线——超出
     /// 的 proc 不 fast 化，回解释器）。

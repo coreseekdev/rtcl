@@ -72,6 +72,15 @@ impl FastHostWt {
 }
 
 thread_local! {
+    /// fast 模块专用 Engine（OptLevel::Speed）：fast 单元小（~1.5-4KB），
+    /// Cranelift speed 档编译毫秒级——顶层大单元的 19s 编译超时是
+    /// classic 引擎 None 档的缘由，fast 侧不受约束。perf：fib/fl 再
+    /// 提一档（None→Speed 典型 1.5-3×）。
+    static WT_FAST_ENGINE: wasmtime::Engine = {
+        let mut cfg = wasmtime::Config::new();
+        cfg.cranelift_opt_level(wasmtime::OptLevel::Speed);
+        wasmtime::Engine::new(&cfg).expect("wasmtime fast engine")
+    };
     static WT_FAST_STORE: std::cell::RefCell<Option<wasmtime::Store<FastHostWt>>> =
         const { std::cell::RefCell::new(None) };
     static WT_FAST_MODULES: std::cell::RefCell<
@@ -588,7 +597,7 @@ fn fast_ensure_slot_wt(
 /// 初始化共享 fast Store（二阶段：句柄在 Store 存在后创建；wasmi
 /// init_fast_store 同构——16 页内存，global 七件套）。
 fn init_fast_store_wt(interp: &mut Interp) -> wasmtime::Store<FastHostWt> {
-    let engine = crate::exec_wasmtime::wt_engine();
+    let engine = WT_FAST_ENGINE.with(|e| e.clone());
     let mut store = wasmtime::Store::new(
         &engine,
         FastHostWt {

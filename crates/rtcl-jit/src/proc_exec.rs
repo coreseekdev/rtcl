@@ -1200,16 +1200,16 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
                         args.push(h.value_of(*w as i64));
                     }
                 }
-                match interp.dispatch_values(&args) {
+                let disp = interp.dispatch_values(&args);
+                match disp {
                     Ok(v) => {
-                        // 跨帧写哨兵传播（与 call_argv 同）：fast 体命令
-                        // 站点恒走本分支（cache=-1 → 逐次 resolve），被分派
-                        // 命令（upvar/global）置的哨兵若不在此消费，
-                        // dirty 永不置位、调用方 resync 不触发（uv2）。
-                        if rtcl_vm::interp::jit_take_cross_frame() {
-                            if let Some(g) = c.data().o_dirty.clone() {
-                                let _ = g.set(&mut c, wasmi::Val::I32(1));
-                            }
+                        // 无条件 dirty：非 proc 命令的宿主分派可能改任意
+                        // 帧变量（lappend/eval 型 catch/upvar/global…），
+                        // 仅跨帧哨兵会漏（catch body 内 lappend 改调用方
+                        // 帧变量、fast 槽 stale——judge catch_error 实证）。
+                        // proc 直呼走 Some 臂不经此处，热路径零成本。
+                        if let Some(g) = c.data().o_dirty.clone() {
+                            let _ = g.set(&mut c, wasmi::Val::I32(1));
                         }
                         if interp.tier1_epoch() != epoch0 {
                             c.data_mut().stale_site = Some(site.max(0) as u32);

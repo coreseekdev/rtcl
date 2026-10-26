@@ -90,6 +90,9 @@ impl<'a> Env<'a> {
 pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Option<crate::emit::FastMeta>) {
     let _ = cfg;
     let nv = l2.max_depth + 1;
+    if std::env::var_os("JIT_L3").is_some() {
+        eprintln!("=== L3 (sites={}) ===\n{}", code.sites.len(), l3);
+    }
     let bregs = count_bregs(l3);
     let nf = count_foreach(l3);
     let foreach_base = nv + 3;

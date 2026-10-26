@@ -482,13 +482,14 @@ fn fast_linker_wt<C: wasmtime::AsContextMut<Data = FastHostWt>>(
                 }
                 match interp.dispatch_values(&args) {
                     Ok(v) => {
-                        // 跨帧写哨兵传播：fast 体命令站点恒走本分支
-                        //（cache=-1 逐次 resolve）——不消费则 dirty 永不
-                        // 置位、调用方 resync 不触发（uv2）。
-                        if rtcl_vm::interp::jit_take_cross_frame() {
-                            if std::env::var_os("JIT_FT").is_some() {
-                                eprintln!("[ft-wt] resolve dispatch cross-frame → dirty=1 (cur={cur})");
-                            }
+                        // 无条件 dirty：非 proc 命令的宿主分派可能改任意
+                        // 帧变量（lappend/eval 型 catch…）——仅跨帧哨兵
+                        // 会漏（judge catch_error 实证）。proc 直呼走
+                        // Some 臂不经此处，热路径零成本。
+                        if std::env::var_os("JIT_FT").is_some() {
+                            eprintln!("[ft-wt] resolve dispatch → dirty=1 (cur={cur})");
+                        }
+                        {
                             let g = c.data().dirty_g();
                             let _ = g.set(&mut c, Val::I32(1));
                         }

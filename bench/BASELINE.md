@@ -2046,3 +2046,15 @@ CallSite resolve 臂 kind1/2 补内层出口 br，深度=经典 d+1/d+2 再 +1
   1600 例 0 分歧×2、rtcl-vm 809。
 - 下一档杆：arith（无 proc 纯循环）走顶层 classic——fast 化顶层单元
   或 interpreter 内联是独立课题；foreach 内联依旧 OPEN。
+
+# ---------------------------------------------------------------------------
+# 补遗（同日，闲时任务 #145 收尾）：judge conformance 全满 + 两修复
+# @ a237487。judge --engine jit：8b63ae3 基线 81/88（7 败）→ 88/88
+# 双引擎全满。两修复均为 v2/v3.1 语义缺口（非移植引入）：
+# 1. dbd9239：resolve_proc 非 proc 命令分派后无条件 dirty——eval 型
+#    命令（catch/apply body）内 lappend/set 改调用方帧变量，仅跨帧
+#    哨兵会漏（fast 槽 stale → catch_error）。
+# 2. a237487：fast_take_fail 补 kind2→5 esc 转换 + CallSite kind-5
+#    出口臂（eval 型 continue 逃逸，gen_for）。
+# perf 复测（Speed 引擎 e29fd6a）：fib best 2952µs（4.9× interp）、
+# fl ~1.3-1.5ms（1.5-1.7× interp）——与 888ff1e 表一致。

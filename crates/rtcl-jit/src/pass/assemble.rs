@@ -50,6 +50,12 @@ struct FastCtx {
     var_names: Vec<i32>,
     /// resync 临时 i64 local 下标（fast_impl 的 i64 组末尾追加位）。
     tmp64: u32,
+    /// 槽切片基址缓存 i32 local（fast_impl 入口算一次）。
+    slot_base: u32,
+    /// 体含 StoreVar/IncrVar（槽写）才需要 lazy-flush 机器——纯读
+    /// 形状（fib）掩码恒 0，wrapper 清零/出口 flush/CallSite flush
+    /// 全免（每调用 ~12 指令协议开销）。
+    has_slot_writes: bool,
     /// 体含 CallSite 才需要调用后 resync（纯算术叶子无人可写本帧
     /// 槽——fib 内层叶路径免 per-var 宿主读，性能关键）。
     resync_on: bool,
@@ -242,7 +248,11 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
         // nv+3+2nf）——fast 语境的全部寄存器基址随之 +1（WAT 反汇编
         // 实证：Env 沿用 run 基址时首个 i32 寄存器与 TMP64 撞位，
         // i64/i32 型错配 = 模块校验失败）。
-        let fast_foreach_base = nv + 4 + 2 * nf;
+        let fast_foreach_base = nv + 5 + 2 * nf;
+        // 槽切片基址缓存 i32 local（入口算一次 = PARAMS + depth*STRIDE，
+        // fast_impl 内恒定）：所有槽寻址 5 指令 → 1 local.get（fl 循环
+        // 8 个寻址点/迭代，~35 指令/迭代）。
+        let slot_base_local = nv + 4 + 2 * nf;
         let vnh = {
             let mut v = vec![0i32; l2.vars.len()];
             for (vi, vv) in l2.vars.iter().enumerate() {
@@ -256,6 +266,18 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
                 sn[*slot as usize] = vnh[*vi as usize];
             }
             sn
+        };
+        let has_slot_writes = {
+            let mut w = false;
+            walk(l3, &mut |n| {
+                if matches!(
+                    n,
+                    L3::Instr(Instr::StoreVar { .. }) | L3::Instr(Instr::IncrVar { .. })
+                ) {
+                    w = true;
+                }
+            });
+            w
         };
         let fenv = Env {
             l2,
@@ -271,6 +293,8 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
                 slot_names: slot_names.clone(),
                 var_names: vnh,
                 tmp64: nv + 3 + 2 * nf,
+                slot_base: slot_base_local,
+                has_slot_writes,
                 resync_on: {
                     let mut hc = false;
                     walk(l3, &mut |n| {
@@ -284,11 +308,18 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
                 epoch: code.epoch,
             }),
         };
-        // fast_impl：局部 = run 布局（无参数移位）
+        // fast_impl：局部 = run 布局（无参数移位）+ slot_base i32
         let mut fb = Function::new(vec![
             (nv + 4 + 2 * nf, I64), // +TMP64（resync 临时）
-            (bregs + 1, I32),
+            (bregs + 2 + 2 * nf, I32), // +slot_base（i32 组首位）
         ]);
+        // 入口：slot_base = PARAMS + fast_depth * PARAM_STRIDE
+        fb.instruction(&Instruction::I32Const(cache::PARAMS as i32));
+        fb.instruction(&Instruction::GlobalGet(5));
+        fb.instruction(&Instruction::I32Const(cache::PARAM_STRIDE as i32));
+        fb.instruction(&Instruction::I32Mul);
+        fb.instruction(&Instruction::I32Add);
+        fb.instruction(&Instruction::LocalSet(slot_base_local));
         emit_node(l3, &fenv, &mut fb);
         fb.instruction(&Instruction::End);
         fast_impl = Some(fb);
@@ -335,14 +366,16 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
             fw.instruction(&Instruction::I64Const(0));
             fw.instruction(&Instruction::I64Store(MemArg { offset: 0, align: 3, memory_index: 0 }));
         }
-        // 脏位掩码清零（切片末字）——同上，防残留。
-        fw.instruction(&Instruction::LocalGet(4));
-        fw.instruction(&Instruction::I64Const(0));
-        fw.instruction(&Instruction::I64Store(MemArg {
-            offset: cache::SLOT_MASK_OFF as u64,
-            align: 3,
-            memory_index: 0,
-        }));
+        // 脏位掩码清零（切片末字）——同上，防残留（纯读单元免）。
+        if has_slot_writes {
+            fw.instruction(&Instruction::LocalGet(4));
+            fw.instruction(&Instruction::I64Const(0));
+            fw.instruction(&Instruction::I64Store(MemArg {
+                offset: cache::SLOT_MASK_OFF as u64,
+                align: 3,
+                memory_index: 0,
+            }));
+        }
         // fuel：扣 1，空 → refuel。成功（返回 0，fuel 已充值 chunk）
         // **继续执行**；失败（哨兵，pending 已置）→ 恢复栈 + (哨兵,
         // ERROR)。此前无条件返回 ERROR——fib 在第 ~1024 次调用（首个
@@ -379,7 +412,18 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
         fw.instruction(&Instruction::LocalSet(5));
         // lazy-flush 出口落盘：调用方 resync（dirty 门）从 interp 帧拉
         // 真值——本帧脏槽必须先落（uv2：p2 经 upvar 写 p1 的槽，写停
-        // 在 p2 槽掩码里，不落则 p1 拉回旧值）。
+        // 在 p2 槽掩码里，不落则 p1 拉回旧值）。纯读单元免；掩码空
+        // 早退——脏形状每调用只付一次 load+test。
+        if has_slot_writes {
+        fw.instruction(&Instruction::Block(BlockType::Empty)); // $noflush
+        fw.instruction(&Instruction::LocalGet(4));
+        fw.instruction(&Instruction::I64Load(MemArg {
+            offset: cache::SLOT_MASK_OFF as u64,
+            align: 3,
+            memory_index: 0,
+        }));
+        fw.instruction(&Instruction::I64Eqz);
+        fw.instruction(&Instruction::BrIf(0));
         for slot in 0..nvars as u32 {
             fw.instruction(&Instruction::Block(BlockType::Empty));
             fw.instruction(&Instruction::LocalGet(4));
@@ -425,6 +469,8 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
             align: 3,
             memory_index: 0,
         }));
+        fw.instruction(&Instruction::End); // $noflush
+        }
         // 恢复栈；透传返回
         fw.instruction(&Instruction::GlobalGet(5));
         fw.instruction(&Instruction::I32Const(1));
@@ -816,20 +862,16 @@ fn emit_fuel(e: &Env, f: &mut Function, fail: u32) {
     f.instruction(&Instruction::End);
 }
 
-/// lazy-flush 协议：per-depth 切片基址（PARAMS + depth*STRIDE）压栈。
-fn fast_slot_base(f: &mut Function) {
-    f.instruction(&Instruction::I32Const(cache::PARAMS as i32));
-    f.instruction(&Instruction::GlobalGet(5));
-    f.instruction(&Instruction::I32Const(cache::PARAM_STRIDE as i32));
-    f.instruction(&Instruction::I32Mul);
-    f.instruction(&Instruction::I32Add);
+/// lazy-flush 协议：per-depth 切片基址（入口缓存的 slot_base local）。
+fn fast_slot_base(f: &mut Function, sb: u32) {
+    f.instruction(&Instruction::LocalGet(sb));
 }
 
 /// 槽脏位掩码置位（切片末字）：StoreVar/IncrVar fast 臂替代逐次
 /// set_var 镜像——稳态循环零宿主调用，真值在宿主边界统一 flush。
 /// 值经 tmp64 中转（store 栈序 = 地址在前）。
-fn fast_mask_set(f: &mut Function, tmp64: u32, slot: u32) {
-    fast_slot_base(f);
+fn fast_mask_set(f: &mut Function, tmp64: u32, sb: u32, slot: u32) {
+    fast_slot_base(f, sb);
     f.instruction(&Instruction::I64Load(MemArg {
         offset: cache::SLOT_MASK_OFF as u64,
         align: 3,
@@ -838,7 +880,7 @@ fn fast_mask_set(f: &mut Function, tmp64: u32, slot: u32) {
     f.instruction(&Instruction::I64Const(1i64 << slot.min(63)));
     f.instruction(&Instruction::I64Or);
     f.instruction(&Instruction::LocalSet(tmp64));
-    fast_slot_base(f);
+    fast_slot_base(f, sb);
     f.instruction(&Instruction::LocalGet(tmp64));
     f.instruction(&Instruction::I64Store(MemArg {
         offset: cache::SLOT_MASK_OFF as u64,
@@ -853,9 +895,22 @@ fn fast_mask_set(f: &mut Function, tmp64: u32, slot: u32) {
 /// proc_main 出口（调用方 resync 拉 interp 帧前必须落盘）。
 fn emit_slot_flush(e: &Env, f: &mut Function, fail: u32) {
     let fc = e.fast.as_ref().expect("emit_slot_flush outside fast ctx");
+    if !fc.has_slot_writes {
+        return; // 纯读单元：掩码恒 0，零发射
+    }
+    // 掩码空早退：一次 load+test（纯读形状每次调用边界 ~4 指令）。
+    f.instruction(&Instruction::Block(BlockType::Empty)); // $noflush
+    fast_slot_base(f, fc.slot_base);
+    f.instruction(&Instruction::I64Load(MemArg {
+        offset: cache::SLOT_MASK_OFF as u64,
+        align: 3,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::I64Eqz);
+    f.instruction(&Instruction::BrIf(0));
     for slot in 0..fc.nslots {
         f.instruction(&Instruction::Block(BlockType::Empty)); // 本槽 done
-        fast_slot_base(f);
+        fast_slot_base(f, fc.slot_base);
         f.instruction(&Instruction::I64Load(MemArg {
             offset: cache::SLOT_MASK_OFF as u64,
             align: 3,
@@ -868,7 +923,7 @@ fn emit_slot_flush(e: &Env, f: &mut Function, fail: u32) {
         f.instruction(&Instruction::I64Eqz);
         f.instruction(&Instruction::BrIf(0));
         f.instruction(&Instruction::I32Const(fc.slot_names[slot as usize]));
-        fast_slot_base(f);
+        fast_slot_base(f, fc.slot_base);
         f.instruction(&Instruction::I64Load(MemArg {
             offset: (slot * 8) as u64,
             align: 3,
@@ -882,13 +937,14 @@ fn emit_slot_flush(e: &Env, f: &mut Function, fail: u32) {
         f.instruction(&Instruction::End);
         f.instruction(&Instruction::End); // 本槽 done
     }
-    fast_slot_base(f);
+    fast_slot_base(f, fc.slot_base);
     f.instruction(&Instruction::I64Const(0));
     f.instruction(&Instruction::I64Store(MemArg {
         offset: cache::SLOT_MASK_OFF as u64,
         align: 3,
         memory_index: 0,
     }));
+    f.instruction(&Instruction::End); // $noflush
 }
 
 fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
@@ -967,11 +1023,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             let var = *var;
             if let Some(fc) = &e.fast {
                 if let Some(slot) = fc.param_slot.get(&var) {
-                    f.instruction(&Instruction::I32Const(cache::PARAMS as i32));
-                    f.instruction(&Instruction::GlobalGet(5));
-                    f.instruction(&Instruction::I32Const(cache::PARAM_STRIDE as i32));
-                    f.instruction(&Instruction::I32Mul);
-                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalGet(fc.slot_base));
                     f.instruction(&Instruction::LocalGet(src.0));
                     f.instruction(&Instruction::I64Store(MemArg {
                         offset: (*slot * 8) as u64,
@@ -981,7 +1033,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                     // lazy-flush：置脏位（含参数段——参数也可被 set 改写，
                     // 此前仅局部段镜像、参数写对宿主帧不可见是既有缺口），
                     // 宿主边界统一 set_var。
-                    fast_mask_set(&mut *f, fc.tmp64, *slot);
+                    fast_mask_set(&mut *f, fc.tmp64, fc.slot_base, *slot);
                     return;
                 }
             }
@@ -1012,12 +1064,9 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             if let Some(fc) = &e.fast {
                 if let Some(slot) = fc.param_slot.get(&var) {
                     let tmp = fc.tmp64;
+                    let sb = fc.slot_base;
                     let mut slot_addr = |f: &mut Function| {
-                        f.instruction(&Instruction::I32Const(cache::PARAMS as i32));
-                        f.instruction(&Instruction::GlobalGet(5));
-                        f.instruction(&Instruction::I32Const(cache::PARAM_STRIDE as i32));
-                        f.instruction(&Instruction::I32Mul);
-                        f.instruction(&Instruction::I32Add);
+                        f.instruction(&Instruction::LocalGet(sb));
                     };
                     f.instruction(&Instruction::Block(BlockType::Empty)); // done
                     f.instruction(&Instruction::Block(BlockType::Empty)); // slow
@@ -1066,7 +1115,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                         align: 3,
                         memory_index: 0,
                     }));
-                    fast_mask_set(&mut *f, fc.tmp64, *slot);
+                    fast_mask_set(&mut *f, fc.tmp64, fc.slot_base, *slot);
                     f.instruction(&Instruction::Br(1)); // done
                     f.instruction(&Instruction::End); // slow:
                     f.instruction(&Instruction::I32Const(e.name_handle(var)));
@@ -1084,7 +1133,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                         align: 3,
                         memory_index: 0,
                     }));
-                    fast_mask_set(&mut *f, fc.tmp64, *slot);
+                    fast_mask_set(&mut *f, fc.tmp64, fc.slot_base, *slot);
                     f.instruction(&Instruction::End); // done
                     return;
                 }
@@ -1248,11 +1297,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                     f.instruction(&Instruction::I32Const(name_h));
                     f.instruction(&Instruction::Call(import::SYNC_VAR));
                     f.instruction(&Instruction::LocalSet(fc.tmp64));
-                    f.instruction(&Instruction::I32Const(cache::PARAMS as i32));
-                    f.instruction(&Instruction::GlobalGet(5));
-                    f.instruction(&Instruction::I32Const(cache::PARAM_STRIDE as i32));
-                    f.instruction(&Instruction::I32Mul);
-                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalGet(fc.slot_base));
                     f.instruction(&Instruction::LocalGet(fc.tmp64));
                     f.instruction(&Instruction::I64Store(MemArg {
                         offset: (slot * 8) as u64,
@@ -1261,7 +1306,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                     }));
                 }
                 // resync 后槽 = interp 真值，脏位作废。
-                fast_slot_base(f);
+                fast_slot_base(f, fc.slot_base);
                 f.instruction(&Instruction::I64Const(0));
                 f.instruction(&Instruction::I64Store(MemArg {
                     offset: cache::SLOT_MASK_OFF as u64,
@@ -1527,8 +1572,12 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             check_sentinel(e, f, dst.0, *fail);
         }
         Instr::SetSite(k) => {
-            f.instruction(&Instruction::I32Const(*k as i32));
-            f.instruction(&Instruction::GlobalSet(e.site_global()));
+            // fast 体不发 SetSite：cur_site 无 fast 侧读者（错误路径走
+            // fails 表 + fail id），纯负载（fl 循环 2×2 指令/迭代）。
+            if e.fast.is_none() {
+                f.instruction(&Instruction::I32Const(*k as i32));
+                f.instruction(&Instruction::GlobalSet(e.site_global()));
+            }
         }
         Instr::SetResult { src } => {
             if let Some(fc) = &e.fast {

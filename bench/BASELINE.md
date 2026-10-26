@@ -1987,3 +1987,33 @@ arith1M                       817         263            229
   （循环/变量写/foreach 内联）是后续收益面。
 - 墙钟 fib 表观差距远小于进程内（~5.5ms spawn/init 开销占 fib25
   墙钟的 6-10%）；arith 墙钟与进程内方向一致。
+
+# ---------------------------------------------------------------------------
+# perf/wave2 fast-tier v3 系列 @ 6bc32bc 2026-10-25（快照机态：闲时高频，
+# 与上表不可比——当日 tclsh fib25 仅 24.4ms vs 台账时 113.8ms，机态差
+# ~4.7×；比例口径为准）。进程内 time + 钉核 best-of-5 交错。
+
+形状（µs/次）                 tclsh      rtcl(interp)   jitsh(fast v3.1)
+fib25 (242785 proc calls)     24356        14495           15553   （≈持平 1.02-1.08×）
+forloop (100k, proc+incr)      4438*         2162            3730   （1.73× 落后）
+* fl.tcl 钉核当日值
+
+本系列四提交：8864903（IncrVar 增量 tag 修复——untag 折半族：
+inc1/gi3/fl 全系值错单根因）、ebca5ce（v3.1 循环进 fast + cur_site
+全局 6→7 撞位修复 + resolve_proc 哨兵传播——uv2 关键）、aad1b63
+（lazy-flush 槽脏位掩码：切片末字 SLOT_MASK_OFF=120，gate 16→15 槽；
+fl 9145→6979）、6bc32bc（slot_base 缓存 + fast 免 SetSite + 纯读单元
+免 flush——fl 6979→3730，fib 回持平）。
+
+要点：
+- **fib 持平**：fast 协议开销（wrapper/CallSite 门）与 interp 分派
+  相抵；纯读单元免 flush 后无额外税。
+- **循环 1.73× 落后 = wasmi 指令解释地板**：fl 稳态 ~100 wasm 指令/
+  迭代 × wasmi 分派 vs interp 原生 ~21ns/迭代。Arith/Cmp 已全内联
+  （含 tagged 单调比较免 untag），进一步融合空间 <30%。
+- **下一档杆 = wasmtime fast 驱动**：exec_wasmtime 现仅经典 run()
+  （stub 注释：fast 驱动未实现）；fl@wasmtime-classic 已 5401µs，
+  fast+wasmtime（Liftoff 原生编译）预期 <interp。FastHost/linker/
+  resync/dirty 机器全 wasmi 特化，移植是独立工作量。
+- 正确性：形状 17 项 vs tclsh 全一致（rd/rp/dp 余项为 tclsh 措辞
+  差、rtcl==jitsh）；fuzz 三种子 1100 例 0 分歧；rtcl-vm 809 全过。

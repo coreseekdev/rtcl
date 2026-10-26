@@ -58,7 +58,9 @@ struct FastCtx {
 impl Env<'_> {
     /// fast 模式下的 cur_site global 下标（4 个导入 global）。
     fn site_global(&self) -> u32 {
-        if self.fast.is_some() { 6 } else { 3 }
+        // fast 模块导入 7 个 global（0-6），内部 cur_site = 7
+        //（fast 6 是 dirty——resync 门专用，SetSite 不得碰）。
+        if self.fast.is_some() { 7 } else { 3 }
     }
 }
 
@@ -367,8 +369,10 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
     }
 
     let mut globals = GlobalSection::new();
-    // 导入 global 数：常规 3（fuel/epoch/caching）→ cur_site=3；
-    // fast 4（+cur_proc）→ cur_site=4。
+    // 导入 global 数：常规 3（fuel/epoch/caching）→ cur_site=3；fast 7
+    // （+cur_proc/site_cache_base/fast_depth/dirty）→ cur_site=7。此前
+    // fast 侧写/export 都指 6——dirty 引入后没同步，SetSite 一直把站点
+    // 号写进 dirty（假触发 resync 门）。
     globals.global(
         GlobalType { val_type: I32, mutable: true, shared: false },
         &wasm_encoder::ConstExpr::i32_const(-1),
@@ -376,7 +380,7 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
 
     let mut exports = ExportSection::new();
     exports.export("run", ExportKind::Func, import::RUN);
-    exports.export("cur_site", ExportKind::Global, if has_fast { 6 } else { 3 });
+    exports.export("cur_site", ExportKind::Global, if has_fast { 7 } else { 3 });
     exports.export("memory", ExportKind::Memory, 0);
     if has_fast {
         exports.export("proc_main", ExportKind::Func, import::FAST_IMPL + 1);
@@ -467,7 +471,9 @@ fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
             | Instr::ForeachStep { .. }
             | Instr::ForeachEnd { .. }
             | Instr::ForeachCollect { .. } => Some("foreach"),
-            Instr::BackedgeFuel { .. } => Some("backedge"),
+            // v3.1：BackedgeFuel 放行——emit_fuel 只用 fuel global(0) +
+            // REFUEL import + check_sentinel，fast 模块全部可用
+            // （fast refuel 闭包 = charge_step 循环，与经典同语义）。
             _ => None,
         };
         if b.is_some() && bad.is_none() {
@@ -1431,6 +1437,11 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 f.instruction(&Instruction::LocalGet(e.epoch_home));
                 f.instruction(&Instruction::I64Ne);
                 f.instruction(&Instruction::If(BlockType::Empty));
+                // fast_impl 结果是 (i64, i32) 多值——return 前必须补
+                // 值位（run 是单 i32，无需）。
+                if e.fast.is_some() {
+                    f.instruction(&Instruction::I64Const(0));
+                }
                 f.instruction(&Instruction::I32Const(code::STALE));
                 f.instruction(&Instruction::Return);
                 f.instruction(&Instruction::End);

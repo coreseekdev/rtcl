@@ -1124,6 +1124,9 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
         // 跨帧写哨兵传播：被调方执行了 upvar/global（链接跨帧）→
         // dirty global 置位（wasm 侧调用后 resync 的运行时门）。
         if rtcl_vm::interp::jit_take_cross_frame() {
+            if std::env::var_os("JIT_FT").is_some() {
+                eprintln!("[ft] call_argv cross-frame → dirty=1 (cur={cur})");
+            }
             if let Some(g) = c.data().o_dirty.clone() {
                 let _ = g.set(&mut c, wasmi::Val::I32(1));
             }
@@ -1194,6 +1197,15 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
                 }
                 match interp.dispatch_values(&args) {
                     Ok(v) => {
+                        // 跨帧写哨兵传播（与 call_argv 同）：fast 体命令
+                        // 站点恒走本分支（cache=-1 → 逐次 resolve），被分派
+                        // 命令（upvar/global）置的哨兵若不在此消费，
+                        // dirty 永不置位、调用方 resync 不触发（uv2）。
+                        if rtcl_vm::interp::jit_take_cross_frame() {
+                            if let Some(g) = c.data().o_dirty.clone() {
+                                let _ = g.set(&mut c, wasmi::Val::I32(1));
+                            }
+                        }
                         if interp.tier1_epoch() != epoch0 {
                             c.data_mut().stale_site = Some(site.max(0) as u32);
                             c.data_mut().pending = Some(crate::exec::Pending {

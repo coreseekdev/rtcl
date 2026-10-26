@@ -56,6 +56,10 @@ struct FastCtx {
     /// 形状（fib）掩码恒 0，wrapper 清零/出口 flush/CallSite flush
     /// 全免（每调用 ~12 指令协议开销）。
     has_slot_writes: bool,
+    /// Cmp-BoolOfBool 融合表（Cmp dst reg -> 目标 BReg）：Cmp 结果仅被
+    /// 紧随 BoolOfBool 消费（全单元 use-count==1）时，fast 臂 i32 比较
+    /// 结果直写 b 寄存器、BoolOfBool 空转（循环条件省 ~7 指令/迭代）。
+    fused_cmp: std::collections::HashMap<u32, u32>,
     /// 体含 CallSite 才需要调用后 resync（纯算术叶子无人可写本帧
     /// 槽——fib 内层叶路径免 per-var 宿主读，性能关键）。
     resync_on: bool,
@@ -295,6 +299,7 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
                 tmp64: nv + 3 + 2 * nf,
                 slot_base: slot_base_local,
                 has_slot_writes,
+                fused_cmp: scan_fused_cmps(l3),
                 resync_on: {
                     let mut hc = false;
                     walk(l3, &mut |n| {
@@ -663,6 +668,92 @@ fn walk(n: &L3, f: &mut impl FnMut(&L3)) {
     }
 }
 
+/// Reg 操作数枚举（uses/defs 分计——非 SSA 即放弃融合）。
+fn reg_use_def(i: &Instr, r: u32, uses: &mut usize, defs: &mut usize) {
+    match i {
+        Instr::Const { dst, .. } | Instr::BoxFloat { dst, .. } | Instr::LoadVar { dst, .. }
+        | Instr::IncrVar { dst, .. } | Instr::ForeachEnd { dst } => {
+            if dst.0 == r { *defs += 1 }
+        }
+        Instr::Copy { dst, src }
+        | Instr::EvalScript { dst, src, .. }
+        | Instr::EvalExpr { dst, src, .. }
+        | Instr::LappendVar { dst, src, .. } => {
+            if dst.0 == r { *defs += 1 }
+            if src.0 == r { *uses += 1 }
+        }
+        Instr::Concat { dst, srcs, .. } | Instr::CallSite { dst, srcs, .. } => {
+            if dst.0 == r { *defs += 1 }
+            for x in srcs {
+                if x.0 == r { *uses += 1 }
+            }
+        }
+        Instr::ForeachStart { srcs, .. } => {
+            for x in srcs {
+                if x.0 == r { *uses += 1 }
+            }
+        }
+        Instr::ForeachCollect { src } | Instr::StoreVar { src, .. } | Instr::SetResult { src } => {
+            if src.0 == r { *uses += 1 }
+        }
+        Instr::Arith { dst, a, b, .. } | Instr::Cmp { dst, a, b, .. } => {
+            if dst.0 == r { *defs += 1 }
+            if a.0 == r { *uses += 1 }
+            if b.0 == r { *uses += 1 }
+        }
+        Instr::Unary { dst, a, .. } => {
+            if dst.0 == r { *defs += 1 }
+            if a.0 == r { *uses += 1 }
+        }
+        Instr::BoolTest { v, .. } | Instr::BoolOfBool { v, .. } => {
+            if v.0 == r { *uses += 1 }
+        }
+        _ => {}
+    }
+}
+
+/// Cmp-BoolOfBool 融合扫描：同层相邻、v==dst、全单元 defs==1 且
+/// uses==1（唯一读者就是紧随的转换）。
+fn scan_fused_cmps(l3: &L3) -> std::collections::HashMap<u32, u32> {
+    let mut out = std::collections::HashMap::new();
+    fn go(n: &L3, root: &L3, out: &mut std::collections::HashMap<u32, u32>) {
+        match n {
+            L3::Seq(items) => {
+                for w in items.windows(2) {
+                    if let (
+                        L3::Instr(Instr::Cmp { dst, .. }),
+                        L3::Instr(Instr::BoolOfBool { dst: breg, v }),
+                    ) = (&w[0], &w[1])
+                    {
+                        if v.0 == dst.0 {
+                            let (mut uses, mut defs) = (0usize, 0usize);
+                            walk(root, &mut |x| {
+                                if let L3::Instr(i) = x {
+                                    reg_use_def(i, dst.0, &mut uses, &mut defs);
+                                }
+                            });
+                            if uses == 1 && defs == 1 {
+                                out.insert(dst.0, breg.0);
+                            }
+                        }
+                    }
+                }
+                for it in items {
+                    go(it, root, out);
+                }
+            }
+            L3::If { then_, else_, .. } => {
+                go(then_, root, out);
+                go(else_, root, out);
+            }
+            L3::Loop { body, .. } | L3::Block { body, .. } => go(body, root, out),
+            _ => {}
+        }
+    }
+    go(l3, l3, &mut out);
+    out
+}
+
 fn emit_node(n: &L3, e: &Env, f: &mut Function) {
     match n {
         L3::Seq(items) => items.iter().for_each(|i| emit_node(i, e, f)),
@@ -973,11 +1064,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                     // 未写）→ 宿主名字路由。
                     f.instruction(&Instruction::Block(BlockType::Empty)); // done
                     f.instruction(&Instruction::Block(BlockType::Empty)); // host
-                    f.instruction(&Instruction::I32Const(cache::PARAMS as i32));
-                    f.instruction(&Instruction::GlobalGet(5));
-                    f.instruction(&Instruction::I32Const(cache::PARAM_STRIDE as i32));
-                    f.instruction(&Instruction::I32Mul);
-                    f.instruction(&Instruction::I32Add);
+                    f.instruction(&Instruction::LocalGet(fc.slot_base));
                     f.instruction(&Instruction::I64Load(MemArg {
                         offset: (*slot * 8) as u64,
                         align: 3,
@@ -1076,9 +1163,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                         align: 3,
                         memory_index: 0,
                     }));
-                    f.instruction(&Instruction::LocalTee(tmp));
-                    f.instruction(&Instruction::I64Eqz);
-                    f.instruction(&Instruction::BrIf(0)); // 零 → slow
+                    f.instruction(&Instruction::LocalSet(tmp));
                     f.instruction(&Instruction::LocalGet(tmp));
                     f.instruction(&Instruction::I64Const(1));
                     f.instruction(&Instruction::I64And);
@@ -1421,13 +1506,19 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             imm_guard_br_slow(f, b.0);
             f.instruction(&Instruction::LocalGet(a.0));
             f.instruction(&Instruction::LocalGet(b.0));
+            let fused = e.fast.as_ref().and_then(|fc| fc.fused_cmp.get(&dst.0)).copied();
             f.instruction(match cc {
                 CmpOp::Lt => &Instruction::I64LtS,
                 CmpOp::Gt => &Instruction::I64GtS,
                 CmpOp::Le => &Instruction::I64LeS,
                 CmpOp::Ge => &Instruction::I64GeS,
             });
-            tag_bool(f, dst.0);
+            if let Some(br) = fused {
+                // 融合：i32 比较结果直写 b 寄存器（免 tag_bool + BoolOfBool）。
+                f.instruction(&Instruction::LocalSet(e.b(br)));
+            } else {
+                tag_bool(f, dst.0);
+            }
             f.instruction(&Instruction::Br(1));
             f.instruction(&Instruction::End); // slow:
             let op = match cc {
@@ -1437,10 +1528,23 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 CmpOp::Ge => BinOp::Ge,
             };
             call_binary_op(op, a.0, b.0, dst.0, *fail, e, f);
+            if let Some(br) = fused {
+                // 慢路径结果仍须落到 b 寄存器（快路径已直写）——
+                // BoolOfBool 转换语义（tagged bool 与 tag(0) 不等）。
+                f.instruction(&Instruction::LocalGet(dst.0));
+                f.instruction(&Instruction::I64Const(1));
+                f.instruction(&Instruction::I64Ne);
+                f.instruction(&Instruction::LocalSet(e.b(br)));
+            }
             f.instruction(&Instruction::End); // done
         }
         Instr::Unary { kind, dst, a, fail } => emit_unary(*kind, dst.0, a.0, *fail, e, f),
         Instr::BoolOfBool { dst, v } => {
+            // 融合臂：Cmp fast 路径已直写 b 寄存器（慢路径也在 Cmp 臂
+            // 补写）——此处空转。
+            if e.fast.as_ref().is_some_and(|fc| fc.fused_cmp.contains_key(&v.0)) {
+                return;
+            }
             // tagged 0/1 → bool：v != 1（tag(0)=1）。
             f.instruction(&Instruction::LocalGet(v.0));
             f.instruction(&Instruction::I64Const(1));

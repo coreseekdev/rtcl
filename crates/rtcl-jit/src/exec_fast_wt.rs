@@ -140,6 +140,15 @@ fn fast_take_fail_wt(h: &mut FastHostWt, cur: usize, fail_id: u32) -> i32 {
     }
     let kind = crate::exec::classify_control(&e);
     if kind != 0 {
+        // kind 5：Next 区域 continue 逃逸（经典 take_fail 同口径）。
+        if kind == 2
+            && h.hosts[cur]
+                .fails
+                .get(fail_id as usize)
+                .is_some_and(|f| f.esc.is_some())
+        {
+            return 5;
+        }
         return kind;
     }
     let Some(fi) = h.hosts[cur].fails.get(fail_id as usize).cloned() else {

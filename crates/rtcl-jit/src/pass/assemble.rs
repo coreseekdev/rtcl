@@ -1374,6 +1374,28 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                     f.instruction(&Instruction::Br(d + 3));
                     f.instruction(&Instruction::End);
                 }
+                // kind 5 = Next 区域 continue 逃逸（eval 型 continue 穿
+                // body 区——gen_for 的 eval continue 形状）：跳第一个
+                // body 区祖先循环的 cont（经典臂 esc_depth 同款深度 +1
+                // ——resolve 点多 $done 一层）；无祖先/解析失败 → 单元
+                // 返回 CONTINUE（proc 边界按 loop_signal 语义转错）。
+                // 此前 kind 5 无臂——ladder 不含 5，穿落到哨兵值继续
+                // 执行（gen_for FAIL 根因）。
+                if esc.is_some() {
+                    f.instruction(&Instruction::LocalGet(e.kind));
+                    f.instruction(&Instruction::I32Const(5));
+                    f.instruction(&Instruction::I32Eq);
+                    f.instruction(&Instruction::If(BlockType::Empty));
+                    match esc_depth {
+                        Some(d) => {
+                            f.instruction(&Instruction::Br(d + 3));
+                        }
+                        None => {
+                            ret_fast_sentinel(f, code::CONTINUE);
+                        }
+                    }
+                    f.instruction(&Instruction::End);
+                }
                 // 剩余 kinds（无循环的 1/2、level>1 的 3/4、stale 6）
                 // 单元返回。
                 for (k, rc) in [

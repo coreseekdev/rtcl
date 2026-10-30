@@ -821,6 +821,7 @@ thread_local! {
     static FAST_MODULES: std::cell::RefCell<
         std::collections::HashMap<PoolKey, wasmi::Module>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static DM_SEQ: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Caller 上读 cur_proc global（每宿主调用 ~few ns——全部冷路径）。
@@ -1085,17 +1086,35 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
     linker.func_wrap("rtcl", "concat_n", |_c: Caller<'_, FastHost>, _b: i32, _n: i32| -> i64 {
         unreachable!("concat in fast store (gated)")
     }).unwrap();
-    linker.func_wrap("rtcl", "foreach_start", |_c: Caller<'_, FastHost>, _i: i32, _b: i32, _n: i32| -> i64 {
-        unreachable!("foreach in fast store (gated)")
+    // v4 foreach 真路由（gate 放行后 fast 体可达）：与经典闭包同语义，
+    // 经 cur_proc 路由到 per-proc Host。bind 写帧变量——调用方（wasm
+    // ForeachBind 臂）随后 emit_resync_slots 拉回槽。
+    linker.func_wrap("rtcl", "foreach_start", |mut c: Caller<'_, FastHost>, info: i32, base: i32, ngroups: i32| -> i64 {
+        let cur = read_cur(&mut c);
+        let words = fast_read_words(&mut c, base, ngroups);
+        let h = &mut c.data_mut().hosts[cur];
+        let r = h.foreach_start_raw(info, &words);
+        if r == abi::ERR_SENTINEL {
+            let e = h.pending.take().map(|p| p.err)
+                .unwrap_or_else(|| Error::Msg("fast foreach_start failed".into()));
+            c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
+        }
+        r
     }).unwrap();
-    linker.func_wrap("rtcl", "foreach_bind", |_c: Caller<'_, FastHost>, _i: i32, _x: i32| -> i64 {
-        unreachable!("foreach in fast store (gated)")
+    linker.func_wrap("rtcl", "foreach_collect", |mut c: Caller<'_, FastHost>, v: i64| -> () {
+        let cur = read_cur(&mut c);
+        c.data_mut().hosts[cur].foreach_collect_raw(v);
     }).unwrap();
-    linker.func_wrap("rtcl", "foreach_collect", |_c: Caller<'_, FastHost>, _v: i64| -> () {
-        unreachable!("foreach in fast store (gated)")
-    }).unwrap();
-    linker.func_wrap("rtcl", "foreach_end", |_c: Caller<'_, FastHost>| -> i64 {
-        unreachable!("foreach in fast store (gated)")
+    linker.func_wrap("rtcl", "foreach_end", |mut c: Caller<'_, FastHost>| -> i64 {
+        let cur = read_cur(&mut c);
+        let h = &mut c.data_mut().hosts[cur];
+        let r = h.foreach_end_raw();
+        if r == abi::ERR_SENTINEL {
+            let e = h.pending.take().map(|p| p.err)
+                .unwrap_or_else(|| Error::Msg("fast foreach_end failed".into()));
+            c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
+        }
+        r
     }).unwrap();
     linker.func_wrap("rtcl", "eval_script", |_c: Caller<'_, FastHost>, _v: i64| -> i64 {
         unreachable!("eval_script in fast store (gated)")
@@ -1113,13 +1132,32 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
         let cur = read_cur(&mut c);
         let name = c.data().hosts[cur].const_name(name_h);
         let interp = unsafe { &mut *c.data().interp };
-        match interp.get_var(&name).cloned() {
+        let r = match interp.get_var(&name).cloned() {
             Ok(v) => {
                 let h = &mut c.data_mut().hosts[cur];
                 h.tag_value(&v)
             }
             Err(_) => 0,
+        };
+        if std::env::var_os("JIT_FT").is_some() {
+            let pv = if r == 0 { "<none>".into() } else { c.data().hosts[cur].value_of(r).as_str().to_string() };
+            eprintln!("[ft] sync {name} = {pv}");
         }
+        r
+    }).unwrap();
+    linker.func_wrap("rtcl", "foreach_bind", |mut c: Caller<'_, FastHost>, info: i32, idx: i32| -> i64 {
+        let cur = read_cur(&mut c);
+        if std::env::var_os("JIT_FT").is_some() {
+            eprintln!("[ft] foreach_bind info={info} idx={idx}");
+        }
+        let h = &mut c.data_mut().hosts[cur];
+        let r = h.foreach_bind_raw(info, idx);
+        if r == abi::ERR_SENTINEL {
+            let e = h.pending.take().map(|p| p.err)
+                .unwrap_or_else(|| Error::Msg("fast foreach_bind failed".into()));
+            c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
+        }
+        r
     }).unwrap();
     linker.func_wrap("rtcl", "call_argv", |mut c: Caller<'_, FastHost>, base: i32, argc: i32, site: i32| -> i64 {
         let cur = read_cur(&mut c);
@@ -1311,7 +1349,12 @@ fn fast_ensure_slot(
                 }
                 m.insert(pool_key, w.clone());
                 if std::env::var_os("JIT_DM").is_some() {
-                    let _ = std::fs::write("/tmp/jitdbg/fm.wasm", &module.bytes[..]);
+                    let n = DM_SEQ.with(|c| {
+                        let n = c.get();
+                        c.set(n + 1);
+                        n
+                    });
+                    let _ = std::fs::write(format!("/tmp/jitdbg/fm{n}.wasm"), &module.bytes[..]);
                 }
                 Some(w)
             }
@@ -1477,7 +1520,12 @@ fn execute_fast(
                             }
                             m.insert(pool_key, w.clone());
                             if std::env::var_os("JIT_DM").is_some() {
-                                let _ = std::fs::write("/tmp/jitdbg/fm.wasm", &module.bytes[..]);
+                                let n = DM_SEQ.with(|c| {
+                                    let n = c.get();
+                                    c.set(n + 1);
+                                    n
+                                });
+                                let _ = std::fs::write(format!("/tmp/jitdbg/fm{n}.wasm"), &module.bytes[..]);
                             }
                             Ok(w)
                         }

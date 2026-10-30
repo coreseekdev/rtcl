@@ -365,17 +365,44 @@ fn fast_linker_wt<C: wasmtime::AsContextMut<Data = FastHostWt>>(
     linker.func_wrap("rtcl", "concat_n", |_c: Caller<'_, FastHostWt>, _b: i32, _n: i32| -> i64 {
         unreachable!("concat in fast store (gated)")
     }).unwrap();
-    linker.func_wrap("rtcl", "foreach_start", |_c: Caller<'_, FastHostWt>, _i: i32, _b: i32, _n: i32| -> i64 {
-        unreachable!("foreach in fast store (gated)")
+    // v4 foreach 真路由（wasmi 侧同构）。
+    linker.func_wrap("rtcl", "foreach_start", |mut c: Caller<'_, FastHostWt>, info: i32, base: i32, ngroups: i32| -> i64 {
+        let cur = read_cur_wt(&mut c);
+        let words = fast_read_words_wt(&mut c, base, ngroups);
+        let h = &mut c.data_mut().hosts[cur];
+        let r = h.foreach_start_raw(info, &words);
+        if r == abi::ERR_SENTINEL {
+            let e = h.pending.take().map(|p| p.err)
+                .unwrap_or_else(|| Error::Msg("fast foreach_start failed".into()));
+            c.data_mut().pending = Some(Pending { err: e, from_eval: false });
+        }
+        r
     }).unwrap();
-    linker.func_wrap("rtcl", "foreach_bind", |_c: Caller<'_, FastHostWt>, _i: i32, _x: i32| -> i64 {
-        unreachable!("foreach in fast store (gated)")
+    linker.func_wrap("rtcl", "foreach_bind", |mut c: Caller<'_, FastHostWt>, info: i32, idx: i32| -> i64 {
+        let cur = read_cur_wt(&mut c);
+        let h = &mut c.data_mut().hosts[cur];
+        let r = h.foreach_bind_raw(info, idx);
+        if r == abi::ERR_SENTINEL {
+            let e = h.pending.take().map(|p| p.err)
+                .unwrap_or_else(|| Error::Msg("fast foreach_bind failed".into()));
+            c.data_mut().pending = Some(Pending { err: e, from_eval: false });
+        }
+        r
     }).unwrap();
-    linker.func_wrap("rtcl", "foreach_collect", |_c: Caller<'_, FastHostWt>, _v: i64| -> () {
-        unreachable!("foreach in fast store (gated)")
+    linker.func_wrap("rtcl", "foreach_collect", |mut c: Caller<'_, FastHostWt>, v: i64| -> () {
+        let cur = read_cur_wt(&mut c);
+        c.data_mut().hosts[cur].foreach_collect_raw(v);
     }).unwrap();
-    linker.func_wrap("rtcl", "foreach_end", |_c: Caller<'_, FastHostWt>| -> i64 {
-        unreachable!("foreach in fast store (gated)")
+    linker.func_wrap("rtcl", "foreach_end", |mut c: Caller<'_, FastHostWt>| -> i64 {
+        let cur = read_cur_wt(&mut c);
+        let h = &mut c.data_mut().hosts[cur];
+        let r = h.foreach_end_raw();
+        if r == abi::ERR_SENTINEL {
+            let e = h.pending.take().map(|p| p.err)
+                .unwrap_or_else(|| Error::Msg("fast foreach_end failed".into()));
+            c.data_mut().pending = Some(Pending { err: e, from_eval: false });
+        }
+        r
     }).unwrap();
     linker.func_wrap("rtcl", "eval_script", |_c: Caller<'_, FastHostWt>, _v: i64| -> i64 {
         unreachable!("eval_script in fast store (gated)")

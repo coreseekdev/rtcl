@@ -26,7 +26,7 @@ struct Ctx<'a> {
     fcounters: u32,
 }
 
-pub fn run(l2: &L2, _code: &ByteCode) -> Result<(L3, u32), Unsupported> {
+pub fn run(l2: &L2, code: &ByteCode) -> Result<(L3, u32), Unsupported> {
     FOREACH_COUNTERS.with(|m| m.borrow_mut().clear());
     let n = l2.ops.len();
     // 空单元（`proc p {}` 的体）：无 CFG 可结构化——直接出最小模块
@@ -66,7 +66,7 @@ pub fn run(l2: &L2, _code: &ByteCode) -> Result<(L3, u32), Unsupported> {
     }
     let body = seq(&mut ctx, 0, n as u32)?;
     // 单元终结：流末值 = 栈顶槽（深度是 pc 的确定函数）。
-    let final_depth = final_depth(l2);
+    let final_depth = final_depth(l2, code);
     let exit_reg = l2.max_depth; // final_depth==0 时的出口专用槽
     let term = if final_depth > 0 {
         L3::Instr(Instr::SetResult { src: Reg(final_depth - 1) })
@@ -98,10 +98,22 @@ pub fn run(l2: &L2, _code: &ByteCode) -> Result<(L3, u32), Unsupported> {
     Ok((root, ctx.bregs))
 }
 
-fn final_depth(l2: &L2) -> u32 {
+fn final_depth(l2: &L2, code: &rtcl_ir::bytecode::ByteCode) -> u32 {
+    // 与 alloc_locals 的深度表同一套 foreach 效应（Start 弹 ngroups、
+    // End 推 1——vm_exec 真语义）。通用 stack_effect 对 foreach 按
+    // (0,0)（无 ByteCode 访问不知 ngroups），单元终结 SetResult 的
+    // src 因此比 ForeachEnd dst 高 ngroups-1 格——lmap/foreach 为末
+    // 命令时返回 iters/残留值（p5 返 "3"、crash 返 "z" 实证）。
     let mut d = 0u32;
-    for op in l2.ops.iter().map(|a| &a.op) {
-        let (pops, pushes) = crate::pass::stack_effect(op);
+    for a in l2.ops.iter() {
+        let (pops, pushes) = match &a.op {
+            OpCode::ForeachStart { info, .. } => (
+                code.foreach_info(*info).map(|f| f.groups.len() as u32).unwrap_or(0),
+                0,
+            ),
+            OpCode::ForeachEnd => (0, 1),
+            other => crate::pass::stack_effect(other),
+        };
         d = d - pops.min(d) + pushes;
     }
     d

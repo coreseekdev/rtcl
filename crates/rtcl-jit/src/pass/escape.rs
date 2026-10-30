@@ -19,22 +19,11 @@ pub fn run(l1: &L1, code: &ByteCode) -> Result<(), Unsupported> {
     }
     // 数组元素引用（名字含 '('）：eval_var_ref 需做下标替换/解析，
     // read_var 公共入口不等价——编译拒绝（M2 经 LoadArrayElem 接管）。
-        // apply/locals_mode 单元 + FOREACH 系：lmap 在 lambda 体（参数非
-    // locals、循环变量经 lmap bind）的伪槽×bind 组合仍有缺陷
-    // （gen_lmap lmap-5.3..5.8：apply+多组 lmap 输出末元素）——
-    // 顶层多组 lmap 已修（单组+多组探针均对），locals_mode 单元收紧。
-    if code.locals_mode
-&& l1.ops.iter().any(|a| {
-    matches!(
-        a.op,
-        OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. }
-    )
-})
-    {
-return Err(Unsupported(
-    "foreach/lmap inside locals_mode unit (apply/lambda body)".into(),
-));
-    }
+        // v4：locals_mode FOREACH 收紧解除（ae44a98 曾拒）——ae44a98 同
+    // 提交已修 lmap ForeachEnd dst 错位（depth_after 表 + lower 查表
+    // -1），其上的整单元拒绝是保险带；v4 foreach 进 fast 后 fast 臂
+    // bind 后 resync（emit_resync_slots）兜住 bind 写帧变量的槽陈旧。
+    // judge gen_lmap/foreach-8.1 全量回归见台账（88/88×2 引擎）。
 
     for (pc, a) in l1.ops.iter().enumerate() {
         let name_idx = match &a.op {

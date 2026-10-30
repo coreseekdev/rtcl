@@ -41,6 +41,14 @@ pub(crate) fn compile_proc_body(
     let names: Vec<&str> = params.iter().map(|(n, _)| n.as_str()).collect();
     let mut code =
         Compiler::compile_unit_locals(Rc::clone(&unit.source), &unit.commands, &names);
+    if std::env::var_os("JIT_FT").is_some() {
+        eprintln!(
+            "[cg] params={:?} aligned={:?} nlocals={}",
+            names,
+            code.params_aligned,
+            code.locals().len()
+        );
+    }
     code.epoch = epoch;
     Some(Rc::new(code))
 }

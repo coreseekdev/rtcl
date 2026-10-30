@@ -288,7 +288,12 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
         };
         let fenv = Env {
             l2,
-            foreach_base: fast_foreach_base,
+            // foreach i/iters 是 i64 对：基址 = nv+3（与经典同——fast
+            // i64 组 nv+4+2nf 已含对区，TMP64=nv+3+2nf 恰在其后）。
+            // fast_foreach_base 是 i32 侧 bool/kind 基址公式（沿用），
+            // 不是 i64 基址——原误用会让 nf>0 时 foreach 对写进 i32
+            // 组（验证失败/类型错配）。
+            foreach_base: nv + 3,
             scratch: nv + 1,
             epoch_home: nv + 2,
             bool_base: fast_foreach_base + 2 * nf,
@@ -571,17 +576,36 @@ fn fast_gate(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
 
 fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
     use crate::ir::Instr;
-    let np = code.params_aligned?;
+    let np = match code.params_aligned {
+        Some(np) => np,
+        None => {
+            if std::env::var_os("JIT_FT").is_some() {
+                eprintln!("[gate] reject: params_aligned=None");
+            }
+            return None;
+        }
+    };
     // VarSlot.const_idx 是**池相对**索引（name_handle 才加 CONST_BASE）——
     // local 伪常量段 = [consts_len, consts_len+locals)。此前误减
     // l2.const_base（=3）致 fib 的参数 n 被判非常量而拒绝。
     let consts_len = code.constants().len() as u32;
     let mut nvars = 0usize;
     for v in &l2.vars {
-        let slot = v.const_idx.checked_sub(consts_len)? as usize;
+        let slot = match v.const_idx.checked_sub(consts_len) {
+            Some(s) => s as usize,
+            None => {
+                if std::env::var_os("JIT_FT").is_some() {
+                    eprintln!("[gate] reject: var const_idx below consts_len (非局部变量)");
+                }
+                return None;
+            }
+        };
         nvars = nvars.max(slot + 1);
     }
     if nvars > crate::abi::cache::MAX_SLOTS_PER_PROC {
+        if std::env::var_os("JIT_FT").is_some() {
+            eprintln!("[gate] reject: nvars={nvars} > cap");
+        }
         return None;
     }
     // site-cache 段容量（SITE_STRIDE/4 = 256 槽）：超长 proc 不 fast 化。
@@ -601,11 +625,9 @@ fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
             Instr::EvalExpr { .. } => Some("eval_expr"),
             Instr::LappendVar { .. } => Some("lappend"),
             Instr::Concat { .. } => Some("concat"),
-            Instr::ForeachStart { .. }
-            | Instr::ForeachBind { .. }
-            | Instr::ForeachStep { .. }
-            | Instr::ForeachEnd { .. }
-            | Instr::ForeachCollect { .. } => Some("foreach"),
+            // v4：foreach 放行——六臂全引擎无关（SCRATCH 协议共享、
+            // i64 对区已预留、FOREACH_* import 两引擎 linker 就位）；
+            // bind 写帧变量由臂内 resync（emit_resync_slots）兜。
             // v3.1：BackedgeFuel 放行——emit_fuel 只用 fuel global(0) +
             // REFUEL import + check_sentinel，fast 模块全部可用
             // （fast refuel 闭包 = charge_step 循环，与经典同语义）。
@@ -616,6 +638,9 @@ fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
         }
     });
     if bad.is_some() {
+        if std::env::var_os("JIT_FT").is_some() {
+            eprintln!("[gate] reject: {}", bad.unwrap());
+        }
         return None;
     }
     let _ = (&bad, has_loop);
@@ -976,6 +1001,46 @@ fn fast_mask_set(f: &mut Function, tmp64: u32, sb: u32, slot: u32) {
     f.instruction(&Instruction::LocalSet(tmp64));
     fast_slot_base(f, sb);
     f.instruction(&Instruction::LocalGet(tmp64));
+    f.instruction(&Instruction::I64Store(MemArg {
+        offset: cache::SLOT_MASK_OFF as u64,
+        align: 3,
+        memory_index: 0,
+    }));
+}
+
+/// 槽重同步（CallSite dirty 门体 + ForeachBind 臂共用）：每 var 一次
+/// sync_var（名字读或 0）写回槽——宿主侧改写的帧变量拉回 fast 槽。
+/// dirty global 的置位/清除由调用方负责（bind 恒同步、CallSite 门控）。
+fn emit_resync_slots(e: &Env, f: &mut Function) {
+    let fc = e.fast.as_ref().expect("emit_resync_slots outside fast ctx");
+    if std::env::var_os("JIT_FT").is_some() {
+        for (vi, v) in e.l2.vars.iter().enumerate() {
+            let slot = fc.param_slot.get(&(vi as u32)).copied();
+            eprintln!(
+                "[resync-map] vi={vi} slot={:?} name_h={} const_idx={}",
+                slot,
+                fc.var_names.get(vi).copied().unwrap_or(-1),
+                v.const_idx
+            );
+        }
+    }
+    for (vi, _) in e.l2.vars.iter().enumerate() {
+        let slot = fc.param_slot.get(&(vi as u32)).copied().unwrap_or(0);
+        let name_h = fc.var_names.get(vi).copied().unwrap_or(0);
+        f.instruction(&Instruction::I32Const(name_h));
+        f.instruction(&Instruction::Call(import::SYNC_VAR));
+        f.instruction(&Instruction::LocalSet(fc.tmp64));
+        f.instruction(&Instruction::LocalGet(fc.slot_base));
+        f.instruction(&Instruction::LocalGet(fc.tmp64));
+        f.instruction(&Instruction::I64Store(MemArg {
+            offset: (slot * 8) as u64,
+            align: 3,
+            memory_index: 0,
+        }));
+    }
+    // 同步后槽 = interp 真值，脏位作废。
+    fast_slot_base(f, fc.slot_base);
+    f.instruction(&Instruction::I64Const(0));
     f.instruction(&Instruction::I64Store(MemArg {
         offset: cache::SLOT_MASK_OFF as u64,
         align: 3,
@@ -1425,28 +1490,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 f.instruction(&Instruction::If(BlockType::Empty));
                 f.instruction(&Instruction::I32Const(0));
                 f.instruction(&Instruction::GlobalSet(6));
-                for (vi, _) in e.l2.vars.iter().enumerate() {
-                    let slot = fc.param_slot.get(&(vi as u32)).copied().unwrap_or(0);
-                    let name_h = fc.var_names.get(vi).copied().unwrap_or(0);
-                    f.instruction(&Instruction::I32Const(name_h));
-                    f.instruction(&Instruction::Call(import::SYNC_VAR));
-                    f.instruction(&Instruction::LocalSet(fc.tmp64));
-                    f.instruction(&Instruction::LocalGet(fc.slot_base));
-                    f.instruction(&Instruction::LocalGet(fc.tmp64));
-                    f.instruction(&Instruction::I64Store(MemArg {
-                        offset: (slot * 8) as u64,
-                        align: 3,
-                        memory_index: 0,
-                    }));
-                }
-                // resync 后槽 = interp 真值，脏位作废。
-                fast_slot_base(f, fc.slot_base);
-                f.instruction(&Instruction::I64Const(0));
-                f.instruction(&Instruction::I64Store(MemArg {
-                    offset: cache::SLOT_MASK_OFF as u64,
-                    align: 3,
-                    memory_index: 0,
-                }));
+                emit_resync_slots(e, f);
                 }
                 f.instruction(&Instruction::End); // dirty end
                 f.instruction(&Instruction::End); // $done
@@ -1650,6 +1694,12 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 }));
             }
             emit_flush(e, f, *fail);
+            // fast：Start 宿主侧 bind(0) 前 flush——槽独占值（`set t 0`
+            // 尚未落 interp）先落盘，随后的 resync 才不会把不存在变量
+            // 的槽抹成 0（fe1 首轮实测）。
+            if e.fast.is_some() {
+                emit_slot_flush(e, f, *fail);
+            }
             f.instruction(&Instruction::I32Const(*info as i32));
             f.instruction(&Instruction::I32Const(cache::SCRATCH as i32));
             f.instruction(&Instruction::I32Const(srcs.len() as i32));
@@ -1663,6 +1713,13 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::LocalSet(e.foreach_base + counter * 2 + 1));
             f.instruction(&Instruction::I64Const(0));
             f.instruction(&Instruction::LocalSet(e.foreach_base + counter * 2));
+            // fast：Start 宿主侧 bind(0)（lower 注释「解析 + bind(0)」）
+            // 写迭代 0 的循环变量——背边 bind 的 resync 只覆盖迭代 ≥1，
+            // 首迭代循环变量槽 stale（a1：外层二轮内层首读 j=旧值，
+            // t=11 实证）。Start 后 resync 拉回。
+            if e.fast.is_some() {
+                emit_resync_slots(e, f);
+            }
         }
         Instr::ForeachEntry { counter, b } => {
             let li = e.foreach_base + counter * 2;
@@ -1687,12 +1744,25 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
         }
         Instr::ForeachBind { info, counter, fail } => {
             emit_flush(e, f, *fail);
+            // fast：bind 前先落盘脏槽——bind 宿主侧要读/写 interp 帧
+            //（循环变量），且紧随的 resync 按「interp 真值」覆盖全部
+            // 槽：未 flush 的槽先被 sync_var 读成不存在→0 抹掉
+            //（fe1 `set t 0` 槽值被抹 → can't read "t" 实证）。
+            if e.fast.is_some() {
+                emit_slot_flush(e, f, *fail);
+            }
             f.instruction(&Instruction::I32Const(*info as i32));
             f.instruction(&Instruction::LocalGet(e.foreach_base + counter * 2));
             f.instruction(&Instruction::I32WrapI64);
             f.instruction(&Instruction::Call(import::FOREACH_BIND));
             f.instruction(&Instruction::LocalSet(e.scratch));
             check_sentinel(e, f, e.scratch, *fail);
+            // fast：bind 宿主侧写了帧变量（循环变量）——fast 槽 stale，
+            // 逐 var sync 拉回（bind 每迭代一次，代价 = interp 同级；
+            // 无此步循环体 LoadVar 读到旧值，fe 形状实证）。
+            if e.fast.is_some() {
+                emit_resync_slots(e, f);
+            }
         }
         Instr::ForeachCollect { src } => {
             f.instruction(&Instruction::LocalGet(src.0));

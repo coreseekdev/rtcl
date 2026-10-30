@@ -46,6 +46,11 @@ struct FastCtx {
     nslots: u32,
     /// slot → name handle（lazy-flush 逆查；param_slot 的反转）。
     slot_names: Vec<i32>,
+    /// 字节码 locals 槽 → fast 槽（foreach 循环变量定向 resync 用）。
+    slot_of_local: std::collections::HashMap<u32, u32>,
+    /// foreach info → [(fast_slot, name_h)]（循环变量定向 resync 表；
+    /// 无 fast 槽的循环变量不在表内——其读取走宿主路由）。
+    foreach_var_handles: std::collections::HashMap<u32, Vec<(u32, i32)>>,
     /// var_idx → 名字句柄（调用后槽重同步）。
     var_names: Vec<i32>,
     /// resync 临时 i64 local 下标（fast_impl 的 i64 组末尾追加位）。
@@ -274,6 +279,40 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
             }
             sn
         };
+        // 字节码 locals 槽 → fast 槽（foreach 循环变量定向 resync 用）。
+        let slot_of_local = {
+            let mut sl = std::collections::HashMap::new();
+            for (vi, v) in l2.vars.iter().enumerate() {
+                if let Some(fs) = param_slot.get(&(vi as u32)) {
+                    if let Some(ls) = v.const_idx.checked_sub(consts_len2) {
+                        sl.insert(ls, *fs);
+                    }
+                }
+            }
+            sl
+        };
+        // foreach info → [(fast_slot, name_h)]（循环变量定向 resync 表；
+        // 无 fast 槽的循环变量不在表内——其读取走宿主路由）。
+        let foreach_var_handles = {
+            let mut fh: std::collections::HashMap<u32, Vec<(u32, i32)>> =
+                std::collections::HashMap::new();
+            for ii in 0..code.foreach_info_len() {
+                if let Some(fi) = code.foreach_info(ii) {
+                    let mut list = Vec::new();
+                    for g in &fi.groups {
+                        for t in g {
+                            if let Some(ls) = t.slot {
+                                if let Some(fs) = slot_of_local.get(&(ls as u32)) {
+                                    list.push((*fs, crate::abi::const_handle(t.name_idx as u32) as i32));
+                                }
+                            }
+                        }
+                    }
+                    fh.insert(ii, list);
+                }
+            }
+            fh
+        };
         let has_slot_writes = {
             let mut w = false;
             walk(l3, &mut |n| {
@@ -303,6 +342,8 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
                 nparams: np as u32,
                 nslots: nvars as u32,
                 slot_names: slot_names.clone(),
+                slot_of_local,
+                foreach_var_handles,
                 var_names: vnh,
                 tmp64: nv + 3 + 2 * nf,
                 slot_base: slot_base_local,
@@ -625,9 +666,20 @@ fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
             Instr::EvalExpr { .. } => Some("eval_expr"),
             Instr::LappendVar { .. } => Some("lappend"),
             Instr::Concat { .. } => Some("concat"),
-            // v4：foreach 放行——六臂全引擎无关（SCRATCH 协议共享、
-            // i64 对区已预留、FOREACH_* import 两引擎 linker 就位）；
-            // bind 写帧变量由臂内 resync（emit_resync_slots）兜。
+            // v4：foreach 语义全绿但 perf 回退 gate 收回——fast 臂每
+            // 迭代 flush+bind+sync 三次宿主调用 ~200ns，interp 内联
+            // foreach 直写槽 ~16ns/迭代（fe_bench 20k：fast 4.1ms vs
+            // interp 0.32ms = 12×劣化；回落 interp=持平）。RTCL_JIT_
+            // FE_FAST=1 重新放行（实验档，正确性已由本轮全绿背书）。
+            Instr::ForeachStart { .. }
+            | Instr::ForeachBind { .. }
+            | Instr::ForeachStep { .. }
+            | Instr::ForeachEnd { .. }
+            | Instr::ForeachCollect { .. }
+                if std::env::var("RTCL_JIT_FE_FAST").as_deref() != Ok("1") =>
+            {
+                Some("foreach")
+            }
             // v3.1：BackedgeFuel 放行——emit_fuel 只用 fuel global(0) +
             // REFUEL import + check_sentinel，fast 模块全部可用
             // （fast refuel 闭包 = charge_step 循环，与经典同语义）。
@@ -1006,6 +1058,27 @@ fn fast_mask_set(f: &mut Function, tmp64: u32, sb: u32, slot: u32) {
         align: 3,
         memory_index: 0,
     }));
+}
+
+/// foreach 循环变量定向 resync：只把本 foreach 绑定的循环变量从
+/// interp 拉回 fast 槽（bind 每迭代一次——全量 resync 的 nvars 次
+/// sync_var 宿主调用让 fe_bench 20× 慢于 interp，定向后仅循环变量）。
+/// 循环变量无 fast 槽（未进 param_slot）时跳过——其读取本就走宿主。
+fn emit_resync_foreach(f: &mut Function, fc: &FastCtx, info: u32) {
+    if let Some(list) = fc.foreach_var_handles.get(&info) {
+        for (fs, name_h) in list {
+            f.instruction(&Instruction::I32Const(*name_h));
+            f.instruction(&Instruction::Call(import::SYNC_VAR));
+            f.instruction(&Instruction::LocalSet(fc.tmp64));
+            f.instruction(&Instruction::LocalGet(fc.slot_base));
+            f.instruction(&Instruction::LocalGet(fc.tmp64));
+            f.instruction(&Instruction::I64Store(MemArg {
+                offset: (*fs * 8) as u64,
+                align: 3,
+                memory_index: 0,
+            }));
+        }
+    }
 }
 
 /// 槽重同步（CallSite dirty 门体 + ForeachBind 臂共用）：每 var 一次
@@ -1716,9 +1789,9 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             // fast：Start 宿主侧 bind(0)（lower 注释「解析 + bind(0)」）
             // 写迭代 0 的循环变量——背边 bind 的 resync 只覆盖迭代 ≥1，
             // 首迭代循环变量槽 stale（a1：外层二轮内层首读 j=旧值，
-            // t=11 实证）。Start 后 resync 拉回。
-            if e.fast.is_some() {
-                emit_resync_slots(e, f);
+            // t=11 实证）。Start 后定向 resync 拉回循环变量。
+            if let Some(fc) = &e.fast {
+                emit_resync_foreach(f, fc, *info);
             }
         }
         Instr::ForeachEntry { counter, b } => {
@@ -1758,10 +1831,10 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::LocalSet(e.scratch));
             check_sentinel(e, f, e.scratch, *fail);
             // fast：bind 宿主侧写了帧变量（循环变量）——fast 槽 stale，
-            // 逐 var sync 拉回（bind 每迭代一次，代价 = interp 同级；
-            // 无此步循环体 LoadVar 读到旧值，fe 形状实证）。
-            if e.fast.is_some() {
-                emit_resync_slots(e, f);
+            // 定向 sync 循环变量拉回（无此步循环体 LoadVar 读旧值，
+            // fe 形状实证）。
+            if let Some(fc) = &e.fast {
+                emit_resync_foreach(f, fc, *info);
             }
         }
         Instr::ForeachCollect { src } => {

@@ -356,6 +356,10 @@ impl ByteCode {
     }
 
     /// Look up a foreach/lmap shape by index.
+    pub fn foreach_info_len(&self) -> u32 {
+        self.foreach_infos.len() as u32
+    }
+
     pub fn foreach_info(&self, idx: u32) -> Option<&ForeachInfo> {
         self.foreach_infos.get(idx as usize)
     }

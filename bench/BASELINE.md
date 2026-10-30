@@ -2058,3 +2058,40 @@ CallSite resolve 臂 kind1/2 补内层出口 br，深度=经典 d+1/d+2 再 +1
 #    出口臂（eval 型 continue 逃逸，gen_for）。
 # perf 复测（Speed 引擎 e29fd6a）：fib best 2952µs（4.9× interp）、
 # fl ~1.3-1.5ms（1.5-1.7× interp）——与 888ff1e 表一致。
+
+# ---------------------------------------------------------------------------
+# 闲时任务 #794（foreach 内联 + esc 臂校验）@ 9d1a830 2026-10-31。
+# 机态：当日 tclsh fib25 ~25ms（闲时高频档），比例口径为准。
+
+## Phase 0：esc 臂深度 WAT 实测（gen_for for-8.2 apply 单元）
+
+kind-5 逃逸 Br(esc_depth+3) 目标 = 经典 Br(esc_depth+2) 同语义 if 块
+（fast 块栈多 $done 一层），无函数层溢出；judge 88/88×2 背书。
+结论：纸面推导 +1 关系成立，p05 教训的 WAT 实测法复核通过。
+
+## foreach/lmap 进 fast：语义全绿、perf 止损回摆
+
+- 语义修复三件（judge 88/88×2 下 foreach/lmap 全转绿）：
+  final_depth vm 对齐（通用 stack_effect foreach=(0,0) 与
+  alloc_locals info 感知表分叉 ngroups-1 格 → 单元末 SetResult 错位，
+  lmap 双组返 iters、foreach-8.1 crash 返 "z"——ae44a98 整单元拒绝
+  掩盖的原始 bug 族）；bind 协议（Start/Bind 前 flush、Start 后定向
+  resync——Start 宿主 bind(0) 写迭代 0 循环变量）；布局（foreach i64
+  对基址 nv+3，fast_foreach_base 是 i32 侧公式勿混用）。
+- perf 实测（fe_bench foreach 20k 求和，钉核交错）：
+  rtcl(interp 内联 foreach) 0.32ms；fast(wasmi/wasmtime) 4.1/4.8ms
+  ——每迭代 flush+bind+sync 三次宿主调用 ~200ns vs interp 直写槽
+  ~16ns。**gate 收回**（foreach 默认回落 exec_bytecode 解释 = 3.25ms
+  ——仍比 HEAD 的 6.94ms 快 2.1×：escape 拒绝解除后单元得以编译、
+  回落从树遍历变为字节码解释）。RTCL_JIT_FE_FAST=1 重新放行。
+- 预外发现：jitsh 非 fast 回落 vs rtcl 纯解释在 for+lindex 形状差
+  2.2×（4751 vs 10480µs）——jitsh 解释路径预存税（hook 探测/记账），
+  foreach 形状 10×（3310 vs 353）——独立 OPEN 项。
+- 回归 spot-check：fib25 wt 4.0ms（≈interp 4.9×）、fl wt 1.9ms
+  （1.6×）——lower.rs final_depth 改动无 perf 回归。
+
+## 门禁终态（9d1a830）
+
+judge 88/88×2、battery 33/33×2、probes 18/18×2、fuzz 800 例 0 分歧
+×2、fe/lm/mg 10 形状 ×2 模式（默认+FE_FAST=1）全对 tclsh、
+rtcl-vm 809。

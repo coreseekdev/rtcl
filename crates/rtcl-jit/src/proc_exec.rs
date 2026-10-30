@@ -127,6 +127,14 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
     if fast_only() {
         return None;
     }
+    // 非 fast 体默认回落 exec_bytecode（rtcl 原生解释器）——classic
+    // wasm 模块的逐命令宿主分派对 dispatch 密集体 3-7× 慢于原生
+    // （tax1 foreach 6.9×/tax2 for+lindex 3.1× 实测；此前注释声称
+    // 「常规池仅在 RTCL_JIT_POOL=1 时走」但代码从未兑现）。classic
+    // 池 = 显式 opt-in（RTCL_JIT_POOL=1，旧行为全量保留）。
+    if crate::env_value("RTCL_JIT_POOL").as_deref() != Some("1") {
+        return None;
+    }
     // 引擎分派（RTCL_JIT_ENGINE；默认 wasmi）。wasmtime 走 Cranelift
     // 池化路径（Engine 单例 + Module 缓存 + Store/Instance 池）。
     #[cfg(feature = "jit-native")]

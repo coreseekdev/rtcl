@@ -695,8 +695,43 @@ fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
         }
         return None;
     }
+    // v5：循环体内 CallSite 拒绝——每迭代 CallSite 协议（flush + 宿主
+    // 分派 + dispatch 后无条件 dirty→resync）~300-500ns，interp 的
+    // DynCall/内联分派 ~190ns：dispatch 密集循环 fast 净亏 2.7×
+    //（tc lindex 循环实测）。回落 exec_bytecode = interp 平价。
+    // proc 互调循环（call_indirect 无 resync）理论可赢——无实测证据
+    // 前一并拒绝，出现反例再细分。
+    if callsite_in_loop(l3) {
+        if std::env::var_os("JIT_FT").is_some() {
+            eprintln!("[gate] reject: callsite-in-loop");
+        }
+        return None;
+    }
     let _ = (&bad, has_loop);
     Some(np)
+}
+
+/// L3 循环（含循环内 If/Block 嵌套）体内是否有 CallSite。
+fn callsite_in_loop(n: &L3) -> bool {
+    match n {
+        L3::Loop { body, .. } => {
+            fn has_call(m: &L3) -> bool {
+                match m {
+                    L3::Instr(Instr::CallSite { .. }) => true,
+                    L3::Seq(items) => items.iter().any(has_call),
+                    L3::If { then_, else_, .. } => has_call(then_) || has_call(else_),
+                    L3::Block { body, .. } => has_call(body),
+                    L3::Loop { .. } | L3::Br { .. } | L3::BrIf { .. } => false,
+                    _ => false,
+                }
+            }
+            has_call(body)
+        }
+        L3::Seq(items) => items.iter().any(callsite_in_loop),
+        L3::If { then_, else_, .. } => callsite_in_loop(then_) || callsite_in_loop(else_),
+        L3::Block { body, .. } => callsite_in_loop(body),
+        _ => false,
+    }
 }
 
 fn count_foreach(l3: &L3) -> u32 {

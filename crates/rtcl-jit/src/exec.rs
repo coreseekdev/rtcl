@@ -1286,6 +1286,19 @@ pub fn run_top_with(
             })
         }
     };
+    // v5 顶层同款：循环内命令分派（DynCall/Call）的经典 wasm 每迭代
+    // 宿主协议（var 缓存失效 + 分派往返）远慢于解释器原生分派——
+    // dict_ops 23×/list_ops 9× 实测亏；arith/var_incr 纯算术循环
+    // classic 1.4-1.9× 赢。回落 interp.eval（jitsh main 的 Fallback
+    // 分支）。
+    if crate::pass::assemble::callsite_in_loop(&module.l3) {
+        return (interp, JitRun {
+            outcome: Outcome::Fallback,
+            driver_report: None,
+            eval_error: None,
+            result: None,
+        });
+    }
     match engine {
         #[cfg(feature = "jit-native")]
         EngineKind::Wasmtime => crate::exec_wasmtime::execute(interp, &bc, &module, file),

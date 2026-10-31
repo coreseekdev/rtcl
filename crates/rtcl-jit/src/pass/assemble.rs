@@ -712,7 +712,7 @@ fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
 }
 
 /// L3 循环（含循环内 If/Block 嵌套）体内是否有 CallSite。
-fn callsite_in_loop(n: &L3) -> bool {
+pub(crate) fn callsite_in_loop(n: &L3) -> bool {
     match n {
         L3::Loop { body, .. } => {
             fn has_call(m: &L3) -> bool {

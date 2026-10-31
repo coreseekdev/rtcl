@@ -2095,3 +2095,41 @@ kind-5 逃逸 Br(esc_depth+3) 目标 = 经典 Br(esc_depth+2) 同语义 if 块
 judge 88/88×2、battery 33/33×2、probes 18/18×2、fuzz 800 例 0 分歧
 ×2、fe/lm/mg 10 形状 ×2 模式（默认+FE_FAST=1）全对 tclsh、
 rtcl-vm 809。
+
+# ---------------------------------------------------------------------------
+# 会话续（同日）：jitsh 回落税两根因修复 + foreach arena 决策 @ 51928dd。
+# 墙钟含 ~4ms spawn（best-of-3 钉核），比例口径为准。
+
+## 回落税两根因（21ae920）
+
+1. classic 池从未兑现 opt-in：exec_proc_body 对非 fast 体无条件走
+   classic wasm（注释声称仅 RTCL_JIT_POOL=1）——逐命令宿主分派比
+   exec_bytecode 慢 3-7×。修复后默认回落 exec_bytecode；
+   foreach 形状 6.9×→1.05×。
+2. gate v5：循环体内 CallSite 拒绝（callsite_in_loop 静态分析）——
+   fast 的每迭代 CallSite 协议（flush+分派+dbd9239 无条件 dirty→
+   resync）~500ns/iter vs interp ~190ns，tc lindex 循环 2.7× 净亏。
+   拒绝后 exec_bytecode 平价。fib 递归不在循环内不受影响（wt 5×）。
+
+## 顶层 classic 同款（51928dd）
+
+run_top_with 对 callsite_in_loop 的顶层单元回 interp（module.l3 复
+用）：dict_ops 162→7ms、list_ops 55→7ms（墙钟，与 rtcl 平价）；
+arith_loop 11/8ms（wt，赢 1.3-1.8×）与 var_incr 保留。
+bench/cases 六例 jitsh 全部 ≥ rtcl 平价。
+
+## foreach arena 决策（不做）
+
+fast foreach 转正的唯一路径（bind 纯 wasm 化：Start 预展开 tagged
+元素到 arena + base 打包返回 + Bind wasm 直写槽）评估后放弃——
+interp 内联 foreach 的 bind 是原生槽直写 ~16ns/iter，wasm 侧即使
+零宿主也 ~20-100ns/iter（wt 指令数下限/wasmi 解释地板），结构上
+不可能赢过 interp；foreach 形状的正确终态 = exec_bytecode 回落
+（已平价）。RTCL_JIT_FE_FAST=1 实验档保留（语义全绿背书仍在）。
+
+## 门禁终态（51928dd）
+
+judge 88/88×2、battery 33/33×2、probes 18/18×2、fuzz 三种子 1200 例
+0 分歧×2、17 形状×2 引擎（timing 脚本剥首行）、rtcl-vm 809；
+fib wt 2.95ms（5.0× interp）、fl wt 1.3ms（1.7×）、bench/cases 六例
+全 ≥ 平价。

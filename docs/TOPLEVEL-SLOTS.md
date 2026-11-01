@@ -87,3 +87,23 @@ ts 独立字段方案废弃。工作量 = 帧生命周期（eval 顶层压/弹�
 - C1（本地编译）+ 标量快路径（c8dbe4d）：顶层循环 80 → 64ns/iter
   （-20%），已绿。
 - slot 级收益（→25ns）需 C2'（真实 CallFrame），独立整段实施。
+
+
+## C2' 实施记录（2026-11-01：边界纪律版实施 + 语义长尾清点，回滚至 C1）
+
+C2'（ts 仅归槽 op + 名路径纯全局 + flush/invalidate 边界）核心落地并
+测得：裸顶层循环 24 → 16-17ms 墙钟（**-30%**，loop_arith_name
+19.2→17.2µs）。随后的语义长尾逐一浮现：
+
+1. **LappendLocal 无 ts 分支**（lappend 写全局、LoadLocal 读 ts =
+   双写者）——补全形态覆盖（unset 创建 / list rep 直推 / string rep
+   严格解析回存 / 解析错误同步回落）后 br.tcl 仍 "0 1"——lappend 的
+   fallback 链或读路径另有分叉未定位。
+2. **数组-标量错误归属**：`set y 5; set y(0)` 应报 "variable isn't
+   array"——ts 读分支对 '(' 名跳过后丢失了「y 是标量」的信息。
+3. **trace 中途注册**：单元执行中 `trace add variable` → ts 写绕过
+   trace 触发——需要边界检查 var_traces 非空 → flush + 永久降级。
+
+每项修复需全门禁矩阵复验（judge + rtcl-vm 单测 + fuzz ×2 引擎 +
+towasm）。会话预算内无法完成——**已回滚至 C1 绿态**（标量快路径
+-20% 保留），C2' 完整实施 = 下轮整段任务（边界面清单 = 本节）。

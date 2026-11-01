@@ -2152,3 +2152,37 @@ wasm32 编译：rtcl-jit（jit-exec）/ rtcl-wasm（jit）cargo check 干净。
 注：wasm32 上 fast 层现经 wasmi-in-wasm 执行（rtcl-wasm jit =
 jit-exec）；「产物交宿主引擎原生编译」（js-sys 桥出字节）是兑现
 aggressive 红利的后续工作——策略开关先行，浏览器 bench 是下一步。
+
+# ---------------------------------------------------------------------------
+# 目标对齐（2026-11-01 用户拍板）+ 双线落地 @ 3813969。
+
+**对齐结论**：双线并行——in-process JIT（Lane A，架构合并）与 towasm
+产物（Lane B，独立）。依据：用户最初指令「目标产物性能」（MoonBit
+式产物观）+ wasm32 部署论证（jit 本地执行 vs rtcl 解释退化）。
+
+## Lane B（towasm，8a76420）
+
+rtcl-towasm crate（lib+bin）：compile_script 纯编译（不需解释器实例）
++ wasmparser 解析产物字节的 ABI 契约清单 + CLI（-o/--manifest/
+--verify）+ 跨引擎回环门禁（解释器 vs wasmi 产物 vs wasmtime 产物
+三方对值，5 形状）。
+**roundtrip 揪出真缺口**：classic 端际缓存回写——caching=1 期间
+StoreVar 只写 wasm 值栈缓存且随 Store 丢弃，interp 帧从未回写（单
+单元 judge 全经 set_result/puts 宿主出口不可见；跨单元读帧 = REPL
+多次 eval/towasm 消费方/rtcl-wasm 嵌入读到陈旧值）。修复 = 两引擎
+execute 尾部逐 var 查 STATE(=2) → set_var_raw 回写。
+**架构事实**：产物仅含顶层单元（proc 体运行时编译 = jiterpreter
+模式，清单如实标注）——AOT 模块集 = towasm 路线图首位。
+
+## Lane A（合并计划，3813969）
+
+docs/JIT-ENGINE-MERGE.md：引擎镜像盘点（fast-tier wasmi↔wasmtime
+~800 行逐函数镜像 + classic linker ×2）、目标布局（engine/ 模块树 +
+host.rs 迁出）、EngineOps trait 草图（收敛 7 条已定谳 API 不对称）、
+五期计划（P1 纯搬迁→P5）每期全门禁纪律、与 towasm 的 pub 接口约束
+（emit::compile + execute_artifact_* 不得破坏）。
+
+## 门禁终态
+
+towasm 6/6、judge 88/88×2、battery 33/33、probes 18/18×2、fuzz 800
+例 0 分歧×2、rtcl-vm 809。

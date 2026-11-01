@@ -1776,6 +1776,46 @@ impl Interp {
         self.get_var(name).cloned()
     }
 
+    /// 顶层标量直读快路径（name-keyed 热循环专用，var_read 咽喉）：
+    /// 单次括号扫描 + 单次哈希探测，跳过 eval_var_ref/get_var 的重复
+    /// 下标检查与 scope-chain 步进。守卫集 = 全语义路径可能分岔的全
+    /// 部条件；任一命中返回 None（调用方走 eval_var_ref 全链）。
+    pub(crate) fn read_var_scalar_top(&self, name: &str) -> Option<&Value> {
+        if name.contains('(')
+            || has_ns_sep(name)
+            || !self.var_traces.is_empty()
+            || !self.dead_flat.is_empty()
+            || !self.frames.is_empty()
+            || self.current_namespace.as_ref() != "::"
+            || !self.flat_aliases.is_empty()
+        {
+            return None;
+        }
+        if !self.array_globals.is_empty() && self.array_globals.contains(name) {
+            return None; // 数组语义（is-array 错误文本归属全链）
+        }
+        self.globals.get(name)
+    }
+
+    /// 顶层标量直写实守卫（set_var_scalar_top 前置；分离以避免 value
+    /// 在守卫失败时被移动）。守卫集 = set_var 全链可能分岔的条件。
+    pub(crate) fn scalar_top_write_ok(&self, name: &str) -> bool {
+        !name.contains('(')
+            && !has_ns_sep(name)
+            && self.var_traces.is_empty()
+            && self.dead_flat.is_empty()
+            && self.frames.is_empty()
+            && self.current_namespace.as_ref() == "::"
+            && self.flat_aliases.is_empty()
+            && (self.array_globals.is_empty() || !self.array_globals.contains(name))
+    }
+
+    /// 顶层标量直写（守卫由 scalar_top_write_ok 前置；写 trace 已被
+    /// var_traces 空守卫排除）。set_var 返回语义 = Ok(新值)。
+    pub(crate) fn set_var_scalar_top(&mut self, name: &str, value: Value) {
+        self.globals.insert(name.to_string(), value);
+    }
+
     /// `info exists`, which fires read traces (tclsh probe: yes, even for
     /// missing scalars) but swallows trace errors.
     pub fn exists_firing(&mut self, name: &str) -> bool {

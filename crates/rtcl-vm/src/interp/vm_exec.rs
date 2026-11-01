@@ -1021,7 +1021,12 @@ fn op_store_var(
 ) -> Result<()> {
     let name = code.get_const(idx).unwrap_or("");
     let v = if keep { st.top_val() } else { st.pop_val() };
-    interp.set_var(name, v)?;
+    // 顶层标量直写实路径（守卫前置分离——value 不因守卫失败被移动）。
+    if interp.scalar_top_write_ok(name) {
+        interp.set_var_scalar_top(name, v);
+    } else {
+        interp.set_var(name, v)?;
+    }
     Ok(())
 }
 
@@ -1624,6 +1629,11 @@ fn op_cmp_slot_imm(
 #[inline]
 fn var_read(interp: &mut Interp, code: &ByteCode, idx: u16) -> Result<Value> {
     let name = code.get_const(idx).unwrap_or("");
+    // 顶层标量直读快路径（单扫描+单探测）；None → 全语义链
+    //（下标替换/数组/traces/namespace）。
+    if let Some(v) = interp.read_var_scalar_top(name) {
+        return Ok(v.clone());
+    }
     interp.eval_var_ref(name)
 }
 
@@ -2165,11 +2175,10 @@ fn op_sub_end(st: &mut VmState) {
 
 #[inline]
 fn op_load_var(interp: &mut Interp, code: &ByteCode, st: &mut VmState, idx: u16) -> Result<()> {
-    let name = code.get_const(idx).unwrap_or("");
     // eval_var_ref, not a raw read: `$a($i)` words compile to LoadVar with
     // the raw reference text and need the same index-substitution dance
-    // eval_word does.
-    let v = interp.eval_var_ref(name)?;
+    // eval_word does.（var_read = 同体 + 顶层标量直读快路径）
+    let v = var_read(interp, code, idx)?;
     st.stack.push(v);
     Ok(())
 }

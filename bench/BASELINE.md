@@ -2133,3 +2133,22 @@ judge 88/88×2、battery 33/33×2、probes 18/18×2、fuzz 三种子 1200 例
 0 分歧×2、17 形状×2 引擎（timing 脚本剥首行）、rtcl-vm 809；
 fib wt 2.95ms（5.0× interp）、fl wt 1.3ms（1.7×）、bench/cases 六例
 全 ≥ 平价。
+
+# ---------------------------------------------------------------------------
+# aggressive_tier 目标感知策略 @ 75f47d7（用户指令「接近即保留」）。
+
+v5 回落决策全部基于 native 口径。wasm32 target（rtcl-wasm）下基线
+反转：解释器自身跑在宿主 wasm 引擎里（每 op 间接分派），JIT 产物
+由宿主引擎原生编译——native 平价/小亏形状在 wasm32 反超。
+
+aggressive_tier()：wasm32 自动启用；native 用 RTCL_JIT_AGGRESSIVE=1
+覆盖。三决策点：gate v5 callsite_in_loop 拒绝 / 顶层 v5 回落 / 非
+fast 体 exec_bytecode 回落——aggressive 下全部保留 JIT 路径。
+实证：tc 的 p 默认 reject:callsite-in-loop → AGGRESSIVE Some(1)（值
+正确）；两模式 judge 88/88×2、battery/probes 全绿、fuzz 900 例
+0 分歧（保留路径正确性由 native AGGRESSIVE 档背书）。
+
+wasm32 编译：rtcl-jit（jit-exec）/ rtcl-wasm（jit）cargo check 干净。
+注：wasm32 上 fast 层现经 wasmi-in-wasm 执行（rtcl-wasm jit =
+jit-exec）；「产物交宿主引擎原生编译」（js-sys 桥出字节）是兑现
+aggressive 红利的后续工作——策略开关先行，浏览器 bench 是下一步。

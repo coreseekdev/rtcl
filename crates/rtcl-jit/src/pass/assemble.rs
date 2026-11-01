@@ -617,16 +617,11 @@ fn fast_gate(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
 
 fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
     use crate::ir::Instr;
-    // 顶层 slot 单元拒绝（C4 范围）：顶层变量是全局别名——fast tier
-    // 的槽位模型（proc 帧隔离 + flush/reload 纪律）未覆盖全局别名，
-    // params_aligned=Some(0) 的意外满足会把它拉进 fast 执行（foreach
-    // body 行号错位实证）。
-    if code.toplevel_slots {
-        if std::env::var_os("JIT_FT").is_some() {
-            eprintln!("[gate] reject: toplevel_slots (C4)");
-        }
-        return None;
-    }
+    // 顶层 slot 单元（C4）：fast tier 的槽模型 + 既有 flush/resync
+    // 纪律（emit_slot_flush 前置 + 分派后无条件 dirty→resync）天然
+    // 覆盖全局别名——顶层变量经 flush 落全局、resync 拉回 ✓。C4 时段
+    // 未覆盖的语义（foreach 已在门内 ✓、dispatch 边界 flush 已有 ✓）
+    // 由全门禁矩阵背书。
     let np = match code.params_aligned {
         Some(np) => np,
         None => {

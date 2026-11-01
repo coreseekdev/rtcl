@@ -488,6 +488,18 @@ fn init_fast_store(interp: &mut Interp) -> wasmi::Store<FastHost> {
 /// fast-tier 尝试：槽命中直接驱动（零编译查找）；未命中编译判定
 ///（module.fast 存在才 fast 化——非 fast 体 None 回落常规路径，编译
 /// 产物已被 PROC_MODULES 缓存，常规冷路径零额外成本）。
+/// 顶层单元的 fast 执行（C4）：run_top_with 直调——JitRun 映射（rc
+/// 语义 = finish() 同款：0=ok 2=return 6=exit 1=error）。
+pub(crate) fn execute_fast_top_wasmi(
+    interp: &mut Interp,
+    bc: &Rc<ByteCode>,
+    module: &emit::Module,
+    meta: crate::emit::FastMeta,
+) -> Option<crate::exec::JitRun> {
+    let r = execute_fast(interp, bc, module, meta)?;
+    Some(crate::exec::map_fast_top_run(r))
+}
+
 pub(crate) fn fast_try(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core::Result<Value>> {
     if crate::fast::fast_in_call() {
         return None;

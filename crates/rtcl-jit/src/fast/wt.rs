@@ -504,6 +504,17 @@ fn init_fast_store_wt(interp: &mut Interp) -> wasmtime::Store<FastHostWt> {
 }
 
 /// fast-tier 尝试（wasmtime 侧；fast_try 同构）。
+/// 顶层单元的 fast 执行（wasmtime）——JitRun 映射同 wasmi。
+pub(crate) fn execute_fast_top_wt(
+    interp: &mut Interp,
+    bc: &Rc<ByteCode>,
+    module: &crate::emit::Module,
+    meta: crate::emit::FastMeta,
+) -> Option<crate::exec::JitRun> {
+    let r = execute_fast_wt(interp, bc, module, meta)?;
+    Some(crate::exec::map_fast_top_run(r))
+}
+
 pub(crate) fn fast_try_wt(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core::Result<Value>> {
     if crate::fast::fast_in_call() {
         return None;
@@ -515,7 +526,7 @@ pub(crate) fn fast_try_wt(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rt
 }
 
 /// fast-tier 外层驱动（wasmtime；execute_fast 同构）。
-fn execute_fast_wt(
+pub(crate) fn execute_fast_wt(
     interp: &mut Interp,
     bc: &Rc<ByteCode>,
     module: &crate::emit::Module,

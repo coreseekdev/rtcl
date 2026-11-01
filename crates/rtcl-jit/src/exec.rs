@@ -68,6 +68,50 @@ pub struct JitRun {
     pub result: Option<Value>,
 }
 
+/// 顶层 fast 执行的结果 → JitRun（rc 语义 = finish() 同款）。
+pub(crate) fn map_fast_top_run(r: rtcl_core::Result<Value>) -> JitRun {
+    match r {
+        Ok(v) => JitRun {
+            outcome: Outcome::Completed { code: code::OK, exit_code: None },
+            driver_report: None,
+            eval_error: None,
+            result: Some(v),
+        },
+        Err(e) => match &e {
+            Error::ControlFlow { kind: rtcl_vm::error::ControlFlow::Return, value, .. } => JitRun {
+                outcome: Outcome::Completed { code: code::RETURN, exit_code: None },
+                driver_report: None,
+                eval_error: None,
+                result: value.clone(),
+            },
+            Error::ControlFlow { kind: rtcl_vm::error::ControlFlow::Exit, value, .. } => {
+                let exit_code = value.as_ref().and_then(|v| v.as_int()).map(|i| i as i32);
+                JitRun {
+                    outcome: Outcome::Completed { code: code::EXIT, exit_code },
+                    driver_report: None,
+                    eval_error: None,
+                    result: None,
+                }
+            }
+            Error::ControlFlow { kind: k, .. } => {
+                let c = if matches!(k, rtcl_vm::error::ControlFlow::Break) { code::BREAK } else { code::CONTINUE };
+                JitRun {
+                    outcome: Outcome::Completed { code: c, exit_code: None },
+                    driver_report: None,
+                    eval_error: Some(e),
+                    result: None,
+                }
+            }
+            _ => JitRun {
+                outcome: Outcome::Completed { code: code::ERROR, exit_code: None },
+                driver_report: None,
+                eval_error: Some(e),
+                result: None,
+            },
+        },
+    }
+}
+
 pub fn run_top(interp: Interp, script: &str, file: &str) -> (Interp, JitRun) {
     run_top_with(interp, script, file, engine_from_env())
 }
@@ -85,7 +129,7 @@ pub fn engine_from_env() -> EngineKind {
 }
 
 pub fn run_top_with(
-    interp: Interp,
+    mut interp: Interp,
     script: &str,
     file: &str,
     engine: EngineKind,
@@ -146,6 +190,21 @@ pub fn run_top_with(
             eval_error: None,
             result: None,
         });
+    }
+    // 顶层 fast tier（C4）：toplevel slot 单元走 fast 执行——exit flush
+    // /分派边界 flush+resync 既有机制覆盖全局别名。None → classic 回落。
+    if let Some(meta) = &module.fast {
+        let mut interp_mut = interp;
+        if let Some(run) = crate::fast::execute_fast_top(
+            &mut interp_mut,
+            &bc,
+            &module,
+            meta.clone(),
+            engine,
+        ) {
+            return (interp_mut, run);
+        }
+        interp = interp_mut;
     }
     match engine {
         #[cfg(feature = "jit-native")]

@@ -85,6 +85,8 @@ pub mod engine;
 
 #[cfg(feature = "jit-exec")]
 pub mod exec;
+#[cfg(feature = "jit-exec")]
+pub mod host;
 
 #[cfg(feature = "jit-exec")]
 // fast-tier 驱动持 *mut Interp（单线程作用域借用，与 exec.rs 同一安全

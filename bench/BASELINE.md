@@ -2194,3 +2194,14 @@ fast-tier wasmi↔wasmtime 镜像合并：FastShared 共享层 + sh_* 逻辑体
 行；本会话 p05/dirty/sync/kind5 系列「每个修复双处落地」的痛点解除。
 perf 无回归（fib wt 3.0ms/5.0×、fl wt 1.4ms/1.6×、wasmi fib 平价）。
 门禁双引擎全绿（judge/battery/probes/fuzz/towasm/rtcl-vm）。
+
+## Lane A 收官（f003957，2026-11-01）
+
+P1 物理布局 + P2 Host 迁出完成，合并治理收官：
+- proc_exec.rs 1656 → **101 行**（纯钩子：install + 策略 + 引擎分派）；
+  exec.rs 1673 → **557**（纯顶层驱动）；Host → host.rs（1176，叶模块）；
+  fast/{shared,wasmi,wt} + classic/{mod,wasmi,wt} 各归其位。
+- P4 classic linker 合并评估后放弃：逻辑已 100% 单点化（Host 方法），
+  剩余为注册胶水（类型使然），trait 成本 > 收益。
+- perf 无回归；门禁双引擎全绿（judge 88/88×2、battery、probes、
+  fuzz 800×2、towasm 6/6、rtcl-vm 809）。

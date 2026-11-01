@@ -2205,3 +2205,20 @@ P1 物理布局 + P2 Host 迁出完成，合并治理收官：
   剩余为注册胶水（类型使然），trait 成本 > 收益。
 - perf 无回归；门禁双引擎全绿（judge 88/88×2、battery、probes、
   fuzz 800×2、towasm 6/6、rtcl-vm 809）。
+
+## A 线深挖（2026-11-01 续：f66f5f1 + 9976009）
+
+1. **默认引擎翻转**（f66f5f1）：jit-native 在位时 engine_from_env
+   默认 wasmtime——fib25 默认 15.0→3.0ms（5.0×）、fl 3.2→1.4ms
+   （2.3×）直达默认路径；纯 jit-exec 构建（rtcl-cli）保持 wasmi；
+   显式 RTCL_JIT_ENGINE 恒优先。
+2. **稳态指令谱定谳**（9976009）：fib fast 模块 WAT——wrapper 58
+   指令/调用 + fast_impl 稳态 ~57，合计 ~115 ÷ 12.4ns ≈ 2.7 指令/ns
+   = Cranelift Speed 代码质量地板；残余可瘦点（dirty 门/slot_base/
+   fuel）各 ≤5% 且均带语义，不动。
+3. **fast_mask_set 直排**：i64.store 栈序地址在前，tmp64 中转消除
+   （-2 指令/次 × 每迭代 2 次）——fl 对 interp 1.6-1.7× → **1.82×**
+   （0.55×，同窗 best5 均值）。
+4. **基线修正**：arith 顶层 4 引擎全平价（80ns/iter，name-keyed 变量
+   查表主导）——顶层循环的真正杠杆 = slot 化（top-level locals_mode，
+   独立大项，OPEN）。

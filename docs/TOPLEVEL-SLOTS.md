@@ -57,3 +57,33 @@ ForNextIncrVar。**白名单外一律 flush+reload**（fail-safe：新增 op
 顶层 arith 循环 94 → ~30ns/iter（**3×**，解释器直受益）；顶层
 loop-only 42 → ~25ns。与 JIT 无关——纯解释器性能（用户指令「解释器
 性能也非常重要」）。JIT 侧（C4）为衍生收益。
+
+
+## C2 实施记录（2026-11-01：两轮证伪，回滚至 C1——止损）
+
+C2（tslots 背衬）两轮实施均触发语义回归，按止损纪律回滚至 C1：
+
+- **第一轮**（ts 槽权威 + 名路径落全局 + flush/reload 双边界）：
+  dict set 的写走 store_var（全局），reload-after 用旧全局覆盖 ts
+  新值——`dict get $d c` 读到旧 dict。
+- **第二轮**（名路径 ts 权威写——set_var/store_var/get_var/incr
+  ts 臂）：分派写 ts、链接写（proc 内 `global x; set x`）落全局——
+  **双写者分歧**：命令写与链接写交错时 last-write-wins 无法在双
+  存储间维持（flush/reload 顺序任选都丢一侧）。judge 6 文件回归
+  （dict_basic/list_basic/vars_misc + gen_var）。
+
+**根因**：顶层变量 = 全局变量的别名语义要求**单一存储**。ts 缓存 +
+双路径写 = 双存储——无论纪律怎么排，交错写必有一侧 stale。
+
+**正解（C2'，需整段实施）**：顶层单元压**真实 CallFrame**（复用
+proc 帧的槽机制——slots + slot_table + degrade 链全部现成），全局
+表作为该帧的**父作用域**（读写规则 = get_var 现有的 frame→global
+fallback 链）。`global x`/upvar 链接经既有 degrade 机制落全局 ✓。
+ts 独立字段方案废弃。工作量 = 帧生命周期（eval 顶层压/弹）+ 语义
+面（info level / uplevel 层数 / errorInfo 帧）全面回归。
+
+## 现状与收益口径
+
+- C1（本地编译）+ 标量快路径（c8dbe4d）：顶层循环 80 → 64ns/iter
+  （-20%），已绿。
+- slot 级收益（→25ns）需 C2'（真实 CallFrame），独立整段实施。

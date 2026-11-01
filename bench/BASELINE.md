@@ -2186,3 +2186,11 @@ host.rs 迁出）、EngineOps trait 草图（收敛 7 条已定谳 API 不对称
 
 towasm 6/6、judge 88/88×2、battery 33/33、probes 18/18×2、fuzz 800
 例 0 分歧×2、rtcl-vm 809。
+
+## Lane A P3-lite（e1679ac，2026-11-01）
+
+fast-tier wasmi↔wasmtime 镜像合并：FastShared 共享层 + sh_* 逻辑体
+10 函数单点化，两引擎闭包瘦身（胶水+委托）。1656+887 → 1441+680+314
+行；本会话 p05/dirty/sync/kind5 系列「每个修复双处落地」的痛点解除。
+perf 无回归（fib wt 3.0ms/5.0×、fl wt 1.4ms/1.6×、wasmi fib 平价）。
+门禁双引擎全绿（judge/battery/probes/fuzz/towasm/rtcl-vm）。

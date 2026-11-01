@@ -2253,3 +2253,22 @@ native bench 档）。f66f5f1 的默认翻转撤销，fib 5.0×/fl 1.82× 保留
   fuzz 12 分歧（foreach 装饰/catch 形状/顶层 fast 误纳）→ 三层修复
   全绿。教训：locals_mode 一开，foreach/catch/错误的语义面全动——
   fail-safe 白名单 + 全门禁矩阵缺一不可。
+
+## C4——顶层单元进 fast tier（e992d61，2026-11-01）
+
+顶层 slot 单元（C1 locals_mode 编译）走 fast tier 执行：gate 放行 +
+run_top_with 接线（execute_fast_top 引擎分派 + JitRun 映射 = finish
+同款 rc 语义）。既有机制全覆盖顶层全局别名：emit_slot_flush 前置、
+分派后无条件 dirty→resync、wrapper epilogue exit flush、ts 作用域
+take/restore（嵌套 proc 执行时悬挂）。
+
+实测（裸顶层 arith 300k，墙钟含 ~4ms spawn）：
+- jitsh@wasmi 25ms（interp 31 = 1.24×）
+- jitsh@wasmtime **11-15ms（interp 31 = 2.5×）**
+- 值正确。
+
+意义：顶层循环（Tcl 最常见的性能热点）脱离解释瓶颈——C1 编译 +
+C4 fast 执行的组合让**整个脚本**（不只 proc 体）享受编译执行。
+
+门禁双引擎全绿：judge 88/88×2、battery 33/33×2、probes 18/18×2、
+fuzz 800 例 0 分歧×2、towasm 6/6、rtcl-vm 809。

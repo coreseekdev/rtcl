@@ -29,6 +29,10 @@ type WtPoolEntry = (
 );
 
 use crate::abi::{self, code};
+use crate::fast_shared::{
+    sh_binary_op, sh_bool_test, sh_call_dispatch, sh_fail, sh_get_var,
+    sh_incr_var, sh_proc_exit_frame, sh_rc_to_i64, sh_set_var, sh_sync_var,
+};
 use crate::emit;
 use crate::exec::Host;
 use crate::pass::EmitConfig;
@@ -763,23 +767,10 @@ fn register_wasmtime_proc(
 //   （内含 ④ STALE 机制）
 
 pub(crate) struct FastHost {
-    pub interp: *mut Interp,
-    /// per-proc 表（arena/fails/lines/consts——Host 全方法复用）。
-    pub hosts: Vec<Host>,
-    /// slot → proc 体（名反查/jit_redispatch_after 用）。
-    pub codes: Vec<Rc<ByteCode>>,
+    /// 引擎无关共享层（逻辑真值——docs/JIT-ENGINE-MERGE.md P3-lite）。
+    pub sh: crate::fast_shared::FastShared,
     /// slot → proc_main 句柄（resolve 冷融合代打）。
     pub runs: Vec<wasmi::TypedFunc<(i32, i32, i32), (i64, i32)>>,
-    pub slots: std::collections::HashMap<PoolKey, usize>,
-    // 共享运行态
-    pub pending: Option<crate::exec::Pending>,
-    pub pending_exit: Option<i32>,
-    pub stale_site: Option<u32>,
-    pub epoch_at_entry: u64,
-    pub last_fail: Option<u32>,
-    /// slot → 本实例 site_cache_base 值（import 非 export，Caller 拿
-    /// 不到——实例化时登记）。
-    pub scb_of: Vec<i32>,
     // 共享句柄（二阶段初始化：实体须在 Store 存在后创建——先 None 后
     // 填充；使用方经 *_g()/mem()/tbl() 取，init 后恒 Some）。
     pub engine: wasmi::Engine,
@@ -851,7 +842,7 @@ fn read_cur(c: &mut wasmi::Caller<'_, FastHost>) -> usize {
 /// 即时可见。
 fn refresh_epoch(c: &mut wasmi::Caller<'_, FastHost>) {
     let h = c.data();
-    let now = unsafe { (*h.interp).tier1_epoch() } as i64;
+    let now = unsafe { (*h.sh.interp).tier1_epoch() } as i64;
     let g = h.epoch_g();
     if let wasmi::Val::I64(cur) = g.get(&mut *c) {
         if cur != now {
@@ -877,69 +868,6 @@ fn fast_read_words(c: &mut wasmi::Caller<'_, FastHost>, base: i32, n: i32) -> Ve
 }
 
 /// fast 版 take_fail（Host::take_fail 的 proc_ctx 臂复刻；pending 共享）。
-fn fast_take_fail(h: &mut FastHost, cur: usize, fail_id: u32) -> i32 {
-    if std::env::var_os("JIT_VM_TRACE").is_some() {
-        eprintln!("[fast] take_fail cur={cur} fid={fail_id}");
-    }
-    use crate::ir::BodyKind;
-    let Some(p) = h.pending.take() else { return 0 };
-    let e = p.err;
-    if e.message_text() == crate::exec::STALE_MARK {
-        return 6;
-    }
-    let kind = crate::exec::classify_control(&e);
-    if kind != 0 {
-        // kind 5：Next 区域 continue 逃逸（fail 表 esc 已在快照期解析
-        // ——经典 take_fail 同口径；fast CallSite 臂的 esc 臂据此 br。
-        // 缺此转换时 eval 型 continue 落 kind 2、cont_depth None →
-        // 单元返回 CONTINUE → proc 边界转错（gen_for FAIL 根因）。
-        if kind == 2
-            && h.hosts[cur]
-                .fails
-                .get(fail_id as usize)
-                .is_some_and(|f| f.esc.is_some())
-        {
-            return 5;
-        }
-        return kind;
-    }
-    let Some(fi) = h.hosts[cur].fails.get(fail_id as usize).cloned() else {
-        h.pending = Some(crate::exec::Pending { err: e, from_eval: false });
-        return 0;
-    };
-    let irp = unsafe { &mut *h.interp };
-    let frameless = fi
-        .bodies
-        .last()
-        .is_some_and(|(_, s)| *s == fi.site);
-    if fi.site != u32::MAX && !frameless {
-        let text = h.hosts[cur].site_text_of(fi.site);
-        let line = h.hosts[cur].lines_of(fi.site);
-        let msg = e.message_text();
-        irp.jit_err_set_line(line);
-        irp.jit_err_harness_frame(&msg, &text, line);
-    }
-    for (bkind, site) in fi.bodies.iter().rev() {
-        let text = h.hosts[cur].site_text_of(*site);
-        let line = h.hosts[cur].lines_of(*site);
-        match bkind {
-            BodyKind::Sub => irp.jit_err_set_pending(&text, line),
-            BodyKind::Expr => {
-                let msg = e.message_text();
-                irp.jit_err_harness_frame(&msg, &text, line);
-            }
-            BodyKind::BodyFramed(lmap) => {
-                let tag = if *lmap { "\"lmap\" body" } else { "\"foreach\" body" };
-                irp.jit_err_exit_frame(tag);
-                let msg = e.message_text();
-                irp.jit_err_harness_frame(&msg, &text, line);
-            }
-            BodyKind::Body | BodyKind::Next => {}
-        }
-    }
-    h.pending = Some(crate::exec::Pending { err: e, from_eval: false });
-    0
-}
 
 /// fast 共享 Store 的 linker：per-instance 重建（闭包注册一次/proc，
 /// 冷）；共享 memory/table/fuel/epoch/caching/cur_proc/fast_depth 的同
@@ -979,60 +907,32 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
     // ── 宿主路由（热路径不触达；冷路径经 cur_proc 路由到 per-proc Host ──
     linker.func_wrap("rtcl", "unbox_int", |mut c: Caller<'_, FastHost>, h: i32| -> (i32, i64) {
         let cur = read_cur(&mut c);
-        c.data_mut().hosts[cur].unbox_int_raw(h)
+        c.data_mut().sh.hosts[cur].unbox_int_raw(h)
     }).unwrap();
     linker.func_wrap("rtcl", "unbox_float", |mut c: Caller<'_, FastHost>, h: i32| -> (i32, f64) {
         let cur = read_cur(&mut c);
-        c.data_mut().hosts[cur].unbox_float_raw(h)
+        c.data_mut().sh.hosts[cur].unbox_float_raw(h)
     }).unwrap();
     linker.func_wrap("rtcl", "box", |mut c: Caller<'_, FastHost>, v: i64| -> i32 {
         let cur = read_cur(&mut c);
-        c.data_mut().hosts[cur].box_raw(v)
+        c.data_mut().sh.hosts[cur].box_raw(v)
     }).unwrap();
     linker.func_wrap("rtcl", "box_float", |mut c: Caller<'_, FastHost>, f: f64| -> i32 {
         let cur = read_cur(&mut c);
-        c.data_mut().hosts[cur].box_float_raw(f)
+        c.data_mut().sh.hosts[cur].box_float_raw(f)
     }).unwrap();
     linker.func_wrap("rtcl", "binary_op", |mut c: Caller<'_, FastHost>, op: i32, a: i64, b: i64| -> i64 {
         let cur = read_cur(&mut c);
         refresh_epoch(&mut c);
-        let h = &mut c.data_mut().hosts[cur];
-        let r = h.binary_op_raw(op, a, b);
-        if r == abi::ERR_SENTINEL {
-            let e = h.pending.take().map(|p| p.err).unwrap_or_else(|| Error::Msg("fast binary_op failed".into()));
-            c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
-        }
-        r
+        sh_binary_op(&mut c.data_mut().sh, cur, op, a, b)
     }).unwrap();
     linker.func_wrap("rtcl", "get_var", |mut c: Caller<'_, FastHost>, name_h: i32| -> i64 {
         let cur = read_cur(&mut c);
-        let name = c.data_mut().hosts[cur].const_name(name_h);
-        let r = unsafe { &mut *c.data().interp }.jit_read_var_ref(&name);
-        if std::env::var_os("JIT_FT").is_some() {
-            eprintln!("[ft] get_var cur={cur} name={name:?} -> {:?}", r.as_ref().map(|v| v.as_str().to_string()).map_err(|e| e.message_text().to_string()));
-        }
-        let h = &mut c.data_mut().hosts[cur];
-        match r {
-            Ok(v) => h.tag_value(&v),
-            Err(e) => {
-                c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
-                abi::ERR_SENTINEL
-            }
-        }
+        sh_get_var(&mut c.data_mut().sh, cur, name_h)
     }).unwrap();
     linker.func_wrap("rtcl", "set_var", |mut c: Caller<'_, FastHost>, name_h: i32, v: i64| -> i32 {
         let cur = read_cur(&mut c);
-        let (name, val) = {
-            let h = &mut c.data_mut().hosts[cur];
-            (h.const_name(name_h), h.value_of(v))
-        };
-        match unsafe { &mut *c.data().interp }.set_var(&name, val) {
-            Ok(_) => 0,
-            Err(e) => {
-                c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
-                1
-            }
-        }
+        sh_set_var(&mut c.data_mut().sh, cur, name_h, v)
     }).unwrap();
     linker.func_wrap("rtcl", "call", |_c: Caller<'_, FastHost>, _a: i32, _b: i32, _d: i32| -> i64 {
         // fast 体从不发射 site-eval 路由（RTCL_JIT_SITE_EVAL 仅经典体）
@@ -1047,8 +947,8 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
     linker.func_wrap("rtcl", "refuel", move |mut c: Caller<'_, FastHost>| -> i64 {
         let chunk = abi::REFUEL_CHUNK;
         for _ in 0..chunk {
-            if let Err(e) = rtcl_vm::VmContext::charge_step(unsafe { &mut *c.data().interp }) {
-                c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
+            if let Err(e) = rtcl_vm::VmContext::charge_step(unsafe { &mut *c.data().sh.interp }) {
+                c.data_mut().sh.pending = Some(crate::exec::Pending { err: e, from_eval: false });
                 return abi::ERR_SENTINEL;
             }
         }
@@ -1057,43 +957,21 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
     }).unwrap();
     linker.func_wrap("rtcl", "fail", |mut c: Caller<'_, FastHost>, fail_id: i32| -> i32 {
         let cur = read_cur(&mut c);
-        let fid = fail_id.max(0) as u32;
-        c.data_mut().last_fail = Some(fid);
-        let h = &mut c.data_mut();
-        let r = fast_take_fail(h, cur, fid);
-        if std::env::var_os("JIT_FT").is_some() {
-            eprintln!("[ft] fail cur={cur} fid={fid} -> {r} (pending={})", c.data().pending.is_some());
-        }
-        r
+        sh_fail(&mut c.data_mut().sh, cur, fail_id)
     }).unwrap();
     linker.func_wrap("rtcl", "bool_test", |mut c: Caller<'_, FastHost>, v: i64| -> i64 {
         let cur = read_cur(&mut c);
-        let r = c.data_mut().hosts[cur].bool_test_raw(v);
-        if r == abi::ERR_SENTINEL {
-            let e = c.data_mut().hosts[cur].pending.take().map(|p| p.err)
-                .unwrap_or_else(|| Error::Msg("fast bool_test failed".into()));
-            c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
-        }
-        r
+        sh_bool_test(&mut c.data_mut().sh, cur, v)
     }).unwrap();
     linker.func_wrap("rtcl", "incr_var", |mut c: Caller<'_, FastHost>, name_h: i32, n: i64| -> i64 {
         let cur = read_cur(&mut c);
-        let r = c.data_mut().hosts[cur].incr_var_raw(name_h, n);
-        if std::env::var_os("JIT_FT").is_some() {
-            eprintln!("[ft] incr_var cur={cur} name={:?} n={n} -> {r}", c.data().hosts[cur].const_name(name_h));
-        }
-        if r == abi::ERR_SENTINEL {
-            let e = c.data_mut().hosts[cur].pending.take().map(|p| p.err)
-                .unwrap_or_else(|| Error::Msg("fast incr failed".into()));
-            c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
-        }
-        r
+        sh_incr_var(&mut c.data_mut().sh, cur, name_h, n)
     }).unwrap();
     linker.func_wrap("rtcl", "push_const", |_c: Caller<'_, FastHost>, idx: i32| -> i64 {
         abi::const_handle(idx as u32)
     }).unwrap();
     linker.func_wrap("rtcl", "exit", |mut c: Caller<'_, FastHost>, code: i32| {
-        c.data_mut().pending_exit = Some(code);
+        c.data_mut().sh.pending_exit = Some(code);
     }).unwrap();
     linker.func_wrap("rtcl", "concat_n", |_c: Caller<'_, FastHost>, _b: i32, _n: i32| -> i64 {
         unreachable!("concat in fast store (gated)")
@@ -1104,27 +982,27 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
     linker.func_wrap("rtcl", "foreach_start", |mut c: Caller<'_, FastHost>, info: i32, base: i32, ngroups: i32| -> i64 {
         let cur = read_cur(&mut c);
         let words = fast_read_words(&mut c, base, ngroups);
-        let h = &mut c.data_mut().hosts[cur];
+        let h = &mut c.data_mut().sh.hosts[cur];
         let r = h.foreach_start_raw(info, &words);
         if r == abi::ERR_SENTINEL {
             let e = h.pending.take().map(|p| p.err)
                 .unwrap_or_else(|| Error::Msg("fast foreach_start failed".into()));
-            c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
+            c.data_mut().sh.pending = Some(crate::exec::Pending { err: e, from_eval: false });
         }
         r
     }).unwrap();
     linker.func_wrap("rtcl", "foreach_collect", |mut c: Caller<'_, FastHost>, v: i64| -> () {
         let cur = read_cur(&mut c);
-        c.data_mut().hosts[cur].foreach_collect_raw(v);
+        c.data_mut().sh.hosts[cur].foreach_collect_raw(v);
     }).unwrap();
     linker.func_wrap("rtcl", "foreach_end", |mut c: Caller<'_, FastHost>| -> i64 {
         let cur = read_cur(&mut c);
-        let h = &mut c.data_mut().hosts[cur];
+        let h = &mut c.data_mut().sh.hosts[cur];
         let r = h.foreach_end_raw();
         if r == abi::ERR_SENTINEL {
             let e = h.pending.take().map(|p| p.err)
                 .unwrap_or_else(|| Error::Msg("fast foreach_end failed".into()));
-            c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
+            c.data_mut().sh.pending = Some(crate::exec::Pending { err: e, from_eval: false });
         }
         r
     }).unwrap();
@@ -1142,32 +1020,19 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
     // 优先，dispatch_values 兜底；④ epoch 门同 call_argv_raw。
     linker.func_wrap("rtcl", "sync_var", |mut c: Caller<'_, FastHost>, name_h: i32| -> i64 {
         let cur = read_cur(&mut c);
-        let name = c.data().hosts[cur].const_name(name_h);
-        let interp = unsafe { &mut *c.data().interp };
-        let r = match interp.get_var(&name).cloned() {
-            Ok(v) => {
-                let h = &mut c.data_mut().hosts[cur];
-                h.tag_value(&v)
-            }
-            Err(_) => 0,
-        };
-        if std::env::var_os("JIT_FT").is_some() {
-            let pv = if r == 0 { "<none>".into() } else { c.data().hosts[cur].value_of(r).as_str().to_string() };
-            eprintln!("[ft] sync {name} = {pv}");
-        }
-        r
+        sh_sync_var(&mut c.data_mut().sh, cur, name_h)
     }).unwrap();
     linker.func_wrap("rtcl", "foreach_bind", |mut c: Caller<'_, FastHost>, info: i32, idx: i32| -> i64 {
         let cur = read_cur(&mut c);
         if std::env::var_os("JIT_FT").is_some() {
             eprintln!("[ft] foreach_bind info={info} idx={idx}");
         }
-        let h = &mut c.data_mut().hosts[cur];
+        let h = &mut c.data_mut().sh.hosts[cur];
         let r = h.foreach_bind_raw(info, idx);
         if r == abi::ERR_SENTINEL {
             let e = h.pending.take().map(|p| p.err)
                 .unwrap_or_else(|| Error::Msg("fast foreach_bind failed".into()));
-            c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
+            c.data_mut().sh.pending = Some(crate::exec::Pending { err: e, from_eval: false });
         }
         r
     }).unwrap();
@@ -1177,45 +1042,19 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
         let words = fast_read_words(&mut c, base, argc);
         let mut args: Vec<Value> = Vec::with_capacity(words.len());
         {
-            let h = &c.data().hosts[cur];
+            let h = &c.data().sh.hosts[cur];
             for w in words {
                 args.push(h.value_of(w as i64));
             }
         }
-        let interp = unsafe { &mut *c.data().interp };
-        let epoch0 = c.data().epoch_at_entry;
-        let r = match interp.jit_call_proc_direct(args[0].as_str(), &args) {
-            Some(r) => r,
-            None => interp.dispatch_values(&args),
-        };
-        // 跨帧写哨兵传播：被调方执行了 upvar/global（链接跨帧）→
-        // dirty global 置位（wasm 侧调用后 resync 的运行时门）。
-        if rtcl_vm::interp::jit_take_cross_frame() {
-            if std::env::var_os("JIT_FT").is_some() {
-                eprintln!("[ft] call_argv cross-frame → dirty=1 (cur={cur})");
-            }
+        let epoch0 = c.data().sh.epoch_at_entry;
+        let (r, cross) = sh_call_dispatch(&mut c.data_mut().sh, cur, args, site, epoch0, true);
+        if cross {
             if let Some(g) = c.data().o_dirty.clone() {
                 let _ = g.set(&mut c, wasmi::Val::I32(1));
             }
         }
-        match r {
-            Ok(v) => {
-                if interp.tier1_epoch() != epoch0 {
-                    c.data_mut().stale_site = Some(site.max(0) as u32);
-                    c.data_mut().pending = Some(crate::exec::Pending {
-                        err: Error::Msg(crate::exec::STALE_MARK.to_string()),
-                        from_eval: false,
-                    });
-                    return abi::ERR_SENTINEL;
-                }
-                let h = &mut c.data_mut().hosts[cur];
-                h.tag_value(&v)
-            }
-            Err(e) => {
-                c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
-                abi::ERR_SENTINEL
-            }
-        }
+        r
     }).unwrap();
 
     // resolve_proc：冷融合——解析目标 → fast 化则实例化+填 cache+代打；
@@ -1224,14 +1063,14 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
         let cur = read_cur(&mut c);
         refresh_epoch(&mut c);
         let words = fast_read_words(&mut c, base, argc);
-        let name = c.data().hosts[cur].value_of(words[0] as i64).as_str().to_string();
-        let interp = unsafe { &mut *c.data().interp };
-        let epoch0 = c.data().epoch_at_entry;
+        let name = c.data().sh.hosts[cur].value_of(words[0] as i64).as_str().to_string();
+        let interp = unsafe { &mut *c.data().sh.interp };
+        let epoch0 = c.data().sh.epoch_at_entry;
         let target = interp.jit_proc_code(&name);
         // cache 写辅助：本实例 site_cache_base global + 共享 memory。
         let write_cache = |c: &mut Caller<'_, FastHost>, slot: i32| {
             let cur0 = read_cur(c);
-            let base = c.data().scb_of.get(cur0).copied().unwrap_or(0);
+            let base = c.data().sh.scb_of.get(cur0).copied().unwrap_or(0);
             if let Some(wasmi::Extern::Memory(m)) = c.get_export("memory") {
                 let addr = (base + site * 4).max(0) as usize;
                 let _ = m.write(&mut *c, addr, &slot.to_le_bytes());
@@ -1243,9 +1082,9 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
                 write_cache(&mut c, slot as i32);
                 let tf = c.data().runs[slot];
                 match tf.call(&mut c, (slot as i32, argc, base)) {
-                    Ok((val, rc)) => fast_rc_to_i64(&mut c, val, rc),
+                    Ok((val, rc)) => sh_rc_to_i64(&mut c.data_mut().sh, val, rc),
                     Err(_) => {
-                        c.data_mut().pending = Some(crate::exec::Pending {
+                        c.data_mut().sh.pending = Some(crate::exec::Pending {
                             err: Error::runtime("maximum recursion depth exceeded", rtcl_core::error::ErrorCode::StackOverflow),
                             from_eval: false,
                         });
@@ -1257,53 +1096,27 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
                 write_cache(&mut c, -1);
                 let mut args: Vec<Value> = Vec::with_capacity(words.len());
                 {
-                    let h = &c.data().hosts[cur];
+                    let h = &c.data().sh.hosts[cur];
                     for w in &words {
                         args.push(h.value_of(*w as i64));
                     }
                 }
-                let disp = interp.dispatch_values(&args);
-                match disp {
-                    Ok(v) => {
-                        // 无条件 dirty：非 proc 命令的宿主分派可能改任意
-                        // 帧变量（lappend/eval 型 catch/upvar/global…），
-                        // 仅跨帧哨兵会漏（catch body 内 lappend 改调用方
-                        // 帧变量、fast 槽 stale——judge catch_error 实证）。
-                        // proc 直呼走 Some 臂不经此处，热路径零成本。
-                        if let Some(g) = c.data().o_dirty.clone() {
-                            let _ = g.set(&mut c, wasmi::Val::I32(1));
-                        }
-                        if interp.tier1_epoch() != epoch0 {
-                            c.data_mut().stale_site = Some(site.max(0) as u32);
-                            c.data_mut().pending = Some(crate::exec::Pending {
-                                err: Error::Msg(crate::exec::STALE_MARK.to_string()),
-                                from_eval: false,
-                            });
-                            return abi::ERR_SENTINEL;
-                        }
-                        let h = &mut c.data_mut().hosts[cur];
-                        h.tag_value(&v)
-                    }
-                    Err(e) => {
-                        c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
-                        abi::ERR_SENTINEL
+                // 无条件 dirty 在 sh_call_dispatch 内（非 proc 命令可能
+                // 改任意帧变量——catch_error 实证）。
+                let (r, cross) = sh_call_dispatch(&mut c.data_mut().sh, cur, args, site, epoch0, false);
+                if cross {
+                    if let Some(g) = c.data().o_dirty.clone() {
+                        let _ = g.set(&mut c, wasmi::Val::I32(1));
                     }
                 }
+                r
             }
         }
     }).unwrap();
 
     // proc_exit_frame：fast 错误冷路径——本层补 (procedure "name" line N)。
     linker.func_wrap("rtcl", "proc_exit_frame", |mut c: Caller<'_, FastHost>, slot: i32| {
-        let slot = slot.max(0) as usize;
-        let code = c.data().codes.get(slot).cloned();
-        if let Some(code) = code {
-            let ip = unsafe { &mut *c.data().interp };
-            if let Some(name) = ip.jit_proc_name_of(&code) {
-                let tag = format!("procedure \"{}\"", name);
-                ip.jit_err_exit_frame(&tag);
-            }
-        }
+        sh_proc_exit_frame(&mut c.data_mut().sh, slot);
     }).unwrap();
 
     linker
@@ -1311,25 +1124,6 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
 
 /// 多值 (val, rc) → 单 i64（resolve 代打的返回契约）：OK/RETURN=值；
 /// 其余置共享 pending（控制流错误显式构造；错误沿用内层已置的）。
-fn fast_rc_to_i64(c: &mut wasmi::Caller<'_, FastHost>, val: i64, rc: i32) -> i64 {
-    match rc {
-        0 | 2 => val,
-        3 | 4 => {
-            let e = if rc == 3 { Error::brk() } else { Error::cont() };
-            c.data_mut().pending = Some(crate::exec::Pending { err: e, from_eval: false });
-            abi::ERR_SENTINEL
-        }
-        5 => {
-            c.data_mut().pending = Some(crate::exec::Pending {
-                err: Error::Msg(crate::exec::STALE_MARK.to_string()),
-                from_eval: false,
-            });
-            abi::ERR_SENTINEL
-        }
-        6 => abi::ERR_SENTINEL, // EXIT：pending_exit 已置
-        _ => abi::ERR_SENTINEL, // ERROR：内层 fail 已置 pending+帧
-    }
-}
 
 /// 在共享 Store 内确保 slot（解析目标 → emit 缓存 → fast gate → 实例化
 /// → 表槽/句柄/登记）。不可 fast 化或实例化失败 → None。
@@ -1343,7 +1137,7 @@ fn fast_ensure_slot(
         Rc::as_ptr(code) as usize,
         code.epoch,
     );
-    if let Some(s) = c.data().slots.get(&pool_key) {
+    if let Some(s) = c.data().sh.slots.get(&pool_key) {
         return Some(*s);
     }
     let module = compile_cached(code, (Rc::as_ptr(code) as usize, code.epoch))?;
@@ -1373,7 +1167,7 @@ fn fast_ensure_slot(
             Err(_) => None,
         }
     })?;
-    let slot = c.data().hosts.len();
+    let slot = c.data().sh.hosts.len();
     if slot >= crate::abi::cache::MAX_FAST_SLOTS {
         // 槽位上限（内存预算/容量防线）：超出不 fast 化。
         return None;
@@ -1395,11 +1189,11 @@ fn fast_ensure_slot(
         let _ = mem.write(&mut *c, scb as usize, &fill);
     }
     let h = c.data_mut();
-    h.hosts.push(host);
-    h.scb_of.push(scb as i32);
-    h.codes.push(Rc::clone(code));
+    h.sh.hosts.push(host);
+    h.sh.scb_of.push(scb as i32);
+    h.sh.codes.push(Rc::clone(code));
     h.runs.push(tf);
-    h.slots.insert(pool_key, slot);
+    h.sh.slots.insert(pool_key, slot);
     Some(slot)
 }
 
@@ -1409,17 +1203,8 @@ fn init_fast_store(interp: &mut Interp) -> wasmi::Store<FastHost> {
     let mut store = wasmi::Store::new(
         &engine,
         FastHost {
-            interp: interp as *mut Interp,
-            hosts: Vec::new(),
-            codes: Vec::new(),
+            sh: crate::fast_shared::FastShared::new(interp as *mut Interp),
             runs: Vec::new(),
-            slots: std::collections::HashMap::new(),
-            pending: None,
-            pending_exit: None,
-            stale_site: None,
-            epoch_at_entry: 0,
-            last_fail: None,
-            scb_of: Vec::new(),
             engine: engine.clone(),
             memory: None,
             table: None,
@@ -1496,7 +1281,7 @@ fn execute_fast(
         }
         {
             let store = cell.as_mut().unwrap();
-            if store.data().interp != interp as *mut Interp {
+            if store.data().sh.interp != interp as *mut Interp {
                 *store = init_fast_store(interp);
             }
         }
@@ -1504,20 +1289,20 @@ fn execute_fast(
         // 入口态
         {
             let h = store.data_mut();
-            h.pending = None;
-            h.pending_exit = None;
-            h.stale_site = None;
-            h.last_fail = None;
-            h.epoch_at_entry = epoch;
+            h.sh.pending = None;
+            h.sh.pending_exit = None;
+            h.sh.stale_site = None;
+            h.sh.last_fail = None;
+            h.sh.epoch_at_entry = epoch;
         }
         if let Err(e) = rtcl_vm::VmContext::charge_step(interp) {
             return Some(Err(e));
         }
         // slot 确保（驱动侧——resolve 闭包内另有 fast_ensure_slot）
-        let slot = match store.data().slots.get(&pool_key) {
+        let slot = match store.data().sh.slots.get(&pool_key) {
             Some(s) => *s,
             None
-                if store.data().hosts.len() < crate::abi::cache::MAX_FAST_SLOTS =>
+                if store.data().sh.hosts.len() < crate::abi::cache::MAX_FAST_SLOTS =>
             {
                 let engine0 = store.data().engine.clone();
                 let wmodule = match FAST_MODULES.with(|m| {
@@ -1547,7 +1332,7 @@ fn execute_fast(
                     Ok(w) => w,
                     Err(_) => return None,
                 };
-                let slot = store.data().hosts.len();
+                let slot = store.data().sh.hosts.len();
                 let scb = crate::abi::cache::SITE_CACHE_BASE
                     + (slot as u32) * crate::abi::cache::SITE_STRIDE;
                 let mut linker = fast_linker(store, scb as i32);
@@ -1570,11 +1355,11 @@ fn execute_fast(
                     let _ = mem.write(&mut *store, scb as usize, &fill);
                 }
                 let h = store.data_mut();
-                h.hosts.push(host);
-                h.scb_of.push(scb as i32);
-                h.codes.push(Rc::clone(bc));
+                h.sh.hosts.push(host);
+                h.sh.scb_of.push(scb as i32);
+                h.sh.codes.push(Rc::clone(bc));
                 h.runs.push(tf);
-                h.slots.insert(pool_key, slot);
+                h.sh.slots.insert(pool_key, slot);
                 slot
             }
             // 槽位上限：超出不 fast 化（回解释器）。
@@ -1599,7 +1384,7 @@ fn execute_fast(
             for i in 0..meta.nparams {
                 let name = bc.locals().get(i).cloned().unwrap_or_default();
                 let v = interp.get_var(&name).cloned().unwrap_or(Value::empty());
-                let tag = store.data_mut().hosts[slot].tag_value(&v);
+                let tag = store.data_mut().sh.hosts[slot].tag_value(&v);
                 buf.extend_from_slice(&tag.to_le_bytes());
             }
             // wrapper 拷贝语义 = dispatch_values 形状（argv[0] 是命令名，
@@ -1625,12 +1410,12 @@ fn execute_fast(
             }
         };
         let out = match rc {
-            0 => Ok(store.data().hosts[slot].value_of(val)),
-            2 => Err(Error::ret(Some(store.data().hosts[slot].value_of(val)))),
+            0 => Ok(store.data().sh.hosts[slot].value_of(val)),
+            2 => Err(Error::ret(Some(store.data().sh.hosts[slot].value_of(val)))),
             3 => Err(Error::brk()),
             4 => Err(Error::cont()),
             5 => {
-                let site = store.data().stale_site;
+                let site = store.data().sh.stale_site;
                 match site.and_then(|s| interp.jit_redispatch_after(bc, s)) {
                     Some((true, res)) => res,
                     Some((false, _)) => Ok(Value::empty()),
@@ -1638,19 +1423,19 @@ fn execute_fast(
                 }
             }
             6 => {
-                let code = store.data_mut().pending_exit.take().unwrap_or(0);
+                let code = store.data_mut().sh.pending_exit.take().unwrap_or(0);
                 Err(Error::exit(Some(code)))
             }
-            _ => match store.data_mut().pending.take() {
+            _ => match store.data_mut().sh.pending.take() {
                 Some(p) => Err(p.err),
                 None => Err(Error::Msg("jit fast: failed without pending".into())),
             },
         };
         // 出口清理（下次入口也重置——此处防御性）
         let h = store.data_mut();
-        h.pending = None;
-        h.stale_site = None;
-        h.last_fail = None;
+        h.sh.pending = None;
+        h.sh.stale_site = None;
+        h.sh.last_fail = None;
         Some(out)
     })
 }

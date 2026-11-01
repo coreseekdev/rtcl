@@ -91,6 +91,8 @@ pub mod exec;
 // 论证）——crate 级 deny(unsafe_code) 在此放开。
 #[allow(unsafe_code)]
 pub mod proc_exec;
+#[cfg(feature = "jit-exec")]
+pub(crate) mod fast_shared;
 
 #[cfg(all(feature = "jit-exec", feature = "jit-native"))]
 pub mod exec_wasmtime;

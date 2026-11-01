@@ -2235,3 +2235,21 @@ native bench 档）。f66f5f1 的默认翻转撤销，fib 5.0×/fl 1.82× 保留
 - rtcl 默认构建 = 纯解释器（零 JIT 依赖）
 - rtcl --features jit = 解释器默认 + JIT 特性开关（fast-only 策略）
 - jitsh = JIT 引擎执行体/差分 oracle（hook 全量）
+
+## top-level slot 化 C1（fcaa578，2026-11-01）
+
+顶层单元 locals_mode 编译落地（设计 docs/TOPLEVEL-SLOTS.md）：
+- Compiler：compile_unit_toplevel 新入口（locals_mode + toplevel_slots）；
+  framed 解耦（顶层 slot 单元保留错误帧）；foreach/lmap 内联门收窄
+  （顶层保持分派——bind 写帧槽背衬 = C2）。
+- eval 深度门：仅最外层 eval slot 编译；嵌套体 eval（dict update/
+  with 别名）保持非 slot。
+- JIT gate 拒绝 toplevel_slots 单元（C4 范围：全局别名语义未覆盖
+  ——params_aligned=Some(0) 意外满足 fast 门，foreach body 行号
+  错位实证）。
+- C1 零 perf 变化（LoadLocal 走 fallback 名键读同速）；C2（tslots
+  背衬 + 分派边界 flush/reload）为提速层（预期 94→~30ns/iter）。
+- 实验路径：盲切 → judge 85/88 → 深度门 88/88 → rtcl-vm 4 测试 +
+  fuzz 12 分歧（foreach 装饰/catch 形状/顶层 fast 误纳）→ 三层修复
+  全绿。教训：locals_mode 一开，foreach/catch/错误的语义面全动——
+  fail-safe 白名单 + 全门禁矩阵缺一不可。

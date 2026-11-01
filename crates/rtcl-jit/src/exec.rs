@@ -1324,6 +1324,18 @@ fn read_words(c: &wasmi::Caller<'_, Host>, base: i32, n: i32) -> Vec<u64> {
     words
 }
 
+/// towasm 产物回环入口：以既有字节在 wasmi 顶层执行（execute 的 pub
+/// 包装——产物即产品：任意引擎拿到同一份 .wasm 都应等价执行，见
+/// crates/rtcl-towasm 的跨引擎 roundtrip 门禁）。
+pub fn execute_artifact_wasmi(
+    interp: Interp,
+    bc: &ByteCode,
+    module: &emit::Module,
+    file: &str,
+) -> (Interp, JitRun) {
+    execute(interp, bc, module, file)
+}
+
 fn execute(
     interp: Interp,
     bc: &ByteCode,
@@ -1584,6 +1596,34 @@ fn execute(
         // wasm trap = 内部 bug（越界/除零未兜底等）——显式失败。
         panic!("jit: wasm trap: {trap:?}")
     });
+    // run 结束缓存回写：caching=1 期间 StoreVar 只写 wasm 缓存（值栈
+    // 区），缓存随 Store 丢弃——interp 帧从未回写。单单元 judge 全经
+    // set_result/puts（宿主出口）不可见；跨单元读帧（REPL 多次 eval、
+    // towasm 产物消费方、rtcl-wasm 嵌入）读到陈旧值 = 正确性缺口。
+    // 逐 var 查 STATE：2=脏 → set_var_raw 回写（O(nvars) 内存读 +
+    // 脏项宿主 set）。
+    {
+        let nvars = module.l2.vars.len().min(crate::abi::cache::MAX_VARS);
+        if nvars > 0 {
+            if let Some(wasmi::Extern::Memory(m)) = instance.get_export(&mut store, "memory") {
+                let mut states = vec![0u8; nvars];
+                if m.read(&mut store, crate::abi::cache::STATE as usize, &mut states).is_ok() {
+                    let mut vals = vec![0u8; nvars * 8];
+                    let _ = m.read(&mut store, crate::abi::cache::VALUES as usize, &mut vals);
+                    for (k, v) in module.l2.vars.iter().enumerate() {
+                        if states[k] == 2 {
+                            let mut b = [0u8; 8];
+                            b.copy_from_slice(&vals[k * 8..k * 8 + 8]);
+                            let tagged = i64::from_le_bytes(b);
+                            let name_h = crate::abi::const_handle(v.const_idx) as i32;
+                            store.data_mut().set_var_raw(name_h, tagged);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     rtcl_vm::interp::set_jit_call_in_flight(false);
 
     // ④ 中途 bump：整单元 STALE → 从 bump 命令的下一条顶层命令树走查

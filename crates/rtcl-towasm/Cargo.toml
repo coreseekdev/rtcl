@@ -1,0 +1,23 @@
+[package]
+name = "rtcl-towasm"
+version.workspace = true
+edition.workspace = true
+
+# towasm —— Tcl → wasm 产物编译器（独立线）：产物 + ABI 契约清单 +
+# 跨引擎回环验证。与进程内 JIT（rtcl-jit 的 fast-tier 执行）共享同
+# 一 emit 管线，但产品形态独立：.wasm 字节 + rtcl.* 运行时契约，
+# 任意 WASM 引擎（浏览器 V8/JSC、wasmtime、wasmi、Node）皆可实例化。
+
+[dependencies]
+rtcl-core = { path = "../rtcl-core" }
+rtcl-parser = { path = "../rtcl-parser" }
+rtcl-vm = { path = "../rtcl-vm" }
+rtcl-jit = { path = "../rtcl-jit", features = ["jit-exec", "jit-native"] }
+wasmparser = "0.261"
+
+[[bin]]
+name = "towasm"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"

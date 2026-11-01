@@ -59,6 +59,32 @@ pub fn execute(
         .expect("run export");
     rtcl_vm::interp::set_jit_call_in_flight(true);
     let rc = run.call(&mut store, ()).expect("wasmtime: run");
+    // run 结束缓存回写（wasmi 侧 exec::execute 同款——跨单元读帧的
+    // 正确性缺口：caching=1 期间 StoreVar 只写 wasm 缓存，缓存随
+    // Store 丢弃，interp 帧从未回写）。
+    {
+        let nvars = module.l2.vars.len().min(crate::abi::cache::MAX_VARS);
+        if nvars > 0 {
+            let mem = instance.get_export(&mut store, "memory").and_then(|e| e.into_memory());
+            if let Some(m) = mem {
+                let mut states = vec![0u8; nvars];
+                if m.read(&mut store, crate::abi::cache::STATE as usize, &mut states).is_ok() {
+                    let mut vals = vec![0u8; nvars * 8];
+                    let _ = m.read(&mut store, crate::abi::cache::VALUES as usize, &mut vals);
+                    for (k, v) in module.l2.vars.iter().enumerate() {
+                        if states[k] == 2 {
+                            let mut b = [0u8; 8];
+                            b.copy_from_slice(&vals[k * 8..k * 8 + 8]);
+                            let tagged = i64::from_le_bytes(b);
+                            let name_h = crate::abi::const_handle(v.const_idx) as i32;
+                            store.data_mut().set_var_raw(name_h, tagged);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     rtcl_vm::interp::set_jit_call_in_flight(false);
     // ④ 中途 bump 重分派（与 exec.rs wasmi 顶层同款）。
     let rc = if rc == code::STALE {

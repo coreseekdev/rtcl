@@ -9,6 +9,7 @@ members = [
     "crates/rtcl-expect",
     "crates/rtcl-wasm",
     "crates/rtcl-jit",
+    "crates/rtcl-towasm",
     "crates/rtcl-data",
 ]
 

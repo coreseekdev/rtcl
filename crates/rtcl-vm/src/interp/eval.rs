@@ -25,6 +25,13 @@ pub(crate) fn tcl_log_excerpt(text: &str) -> String {
 
 impl Interp {
     pub fn eval(&mut self, script: &str) -> Result<Value> {
+        self.eval_depth += 1;
+        let r = self.eval_impl(script);
+        self.eval_depth -= 1;
+        r
+    }
+
+    fn eval_impl(&mut self, script: &str) -> Result<Value> {
         // This eval IS the unit an armed "same unit" request names (a
         // construct's inline body, a `[...]` word): consume the flag for
         // the unit's duration, restoring the enclosing unit's context on
@@ -74,7 +81,18 @@ impl Interp {
                     // with non-whitelisted ops carry `fallback` and are
                     // cached anyway (the check is per call — a Tier1 shadow
                     // bump must keep taking effect on cached code).
-                    let code = Rc::new(Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands));
+                                        // 顶层 slot 编译（C1）：仅最外层 eval（深度 0）——
+                    // 嵌套体 eval（dict update/with、eval 命令）的变量
+                    // 链接语义依赖非 slot 编译。
+                    let code = if self.eval_depth == 1 {
+                        Rc::new(Compiler::compile_unit_locals(
+                            Rc::clone(&rc.source),
+                            &rc.commands,
+                            &[],
+                        ))
+                    } else {
+                        Rc::new(Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands))
+                    };
                     self.const_pool_insert(&code);
                     self.bytecode_cache.insert(Rc::clone(&rc.source), code);
                 }

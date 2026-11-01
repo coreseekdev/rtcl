@@ -713,6 +713,10 @@ pub struct Interp {
     /// this cleared: a DynCall'd command inside compiled unit is tclsh's
     /// INST_CALL fallback — dispatched semantics.
     pub(crate) lexical_body: bool,
+    /// eval 递归深度（0 = 最外层——文件/REPL 顶层；≥1 = 嵌套 eval）。
+    /// 顶层 slot 编译只在深度 0 生效（嵌套体 eval 的变量链接语义
+    /// ——dict update/with 的别名——依赖非 slot 编译）。
+    pub(crate) eval_depth: usize,
     /// Pending "the next `eval` is part of the current proc body unit"
     /// request (see [`Interp::lexical_body`]).
     pub(crate) next_eval_lexical: bool,
@@ -837,6 +841,7 @@ impl Interp {
             cur_source: Rc::from(""),
             err_from_subst: false,
             lexical_body: false,
+            eval_depth: 0,
             next_eval_lexical: false,
             err_pending_top: None,
             ns_level0: Vec::new(),

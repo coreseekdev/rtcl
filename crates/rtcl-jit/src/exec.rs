@@ -1290,8 +1290,8 @@ pub fn run_top_with(
     // 宿主协议（var 缓存失效 + 分派往返）远慢于解释器原生分派——
     // dict_ops 23×/list_ops 9× 实测亏；arith/var_incr 纯算术循环
     // classic 1.4-1.9× 赢。回落 interp.eval（jitsh main 的 Fallback
-    // 分支）。
-    if crate::pass::assemble::callsite_in_loop(&module.l3) {
+    // 分支）。aggressive（wasm32）：解释器基线 wasm 化，保留 classic。
+    if !crate::aggressive_tier() && crate::pass::assemble::callsite_in_loop(&module.l3) {
         return (interp, JitRun {
             outcome: Outcome::Fallback,
             driver_report: None,

@@ -132,7 +132,11 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
     // （tax1 foreach 6.9×/tax2 for+lindex 3.1× 实测；此前注释声称
     // 「常规池仅在 RTCL_JIT_POOL=1 时走」但代码从未兑现）。classic
     // 池 = 显式 opt-in（RTCL_JIT_POOL=1，旧行为全量保留）。
-    if crate::env_value("RTCL_JIT_POOL").as_deref() != Some("1") {
+    // aggressive（wasm32）：JIT 产物宿主引擎原生编译 vs 解释器 wasm
+    // 化——classic 保留（接近即保留，用户指令）。
+    if !crate::aggressive_tier()
+        && crate::env_value("RTCL_JIT_POOL").as_deref() != Some("1")
+    {
         return None;
     }
     // 引擎分派（RTCL_JIT_ENGINE；默认 wasmi）。wasmtime 走 Cranelift

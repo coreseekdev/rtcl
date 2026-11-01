@@ -701,7 +701,9 @@ fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
     //（tc lindex 循环实测）。回落 exec_bytecode = interp 平价。
     // proc 互调循环（call_indirect 无 resync）理论可赢——无实测证据
     // 前一并拒绝，出现反例再细分。
-    if callsite_in_loop(l3) {
+    // aggressive（wasm32/RTCL_JIT_AGGRESSIVE=1）：解释器基线 wasm 化
+    // 后反转，平价形状按用户指令保留 JIT 路径，不拒绝。
+    if !crate::aggressive_tier() && callsite_in_loop(l3) {
         if std::env::var_os("JIT_FT").is_some() {
             eprintln!("[gate] reject: callsite-in-loop");
         }

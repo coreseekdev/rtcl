@@ -47,6 +47,20 @@ pub(crate) fn env_enabled(name: &str) -> bool {
     }
 }
 
+/// wasm32 目标策略（「接近即保留」）：解释器自身跑在宿主 wasm 引擎
+/// 里（每 op 一次 wasm 间接分派），而 JIT 产物由宿主引擎原生编译
+/// ——基线对比从 native 的「jit vs 原生解释器」变为「jit vs wasm 化
+/// 解释器」，native 实测的平价/小亏形状在 wasm32 上反超。native 上
+/// v5 按钉核实测回落（每形状有数字背书）；wasm32 或
+/// RTCL_JIT_AGGRESSIVE=1 时保留全部 JIT 路径（用户指令：与 rtcl
+/// 性能接近也应保留——wasm32 基线不同）。
+pub(crate) fn aggressive_tier() -> bool {
+    if cfg!(target_arch = "wasm32") {
+        return true;
+    }
+    env_value("RTCL_JIT_AGGRESSIVE").as_deref() == Some("1")
+}
+
 /// 同上：带值的 env 读取（wasm32 恒 None）。
 pub(crate) fn env_value(name: &str) -> Option<String> {
     #[cfg(target_arch = "wasm32")]

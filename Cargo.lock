@@ -1401,6 +1401,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtcl-towasm"
+version = "0.1.0"
+dependencies = [
+ "rtcl-core",
+ "rtcl-jit",
+ "rtcl-parser",
+ "rtcl-vm",
+ "wasmparser 0.261.0",
+]
+
+[[package]]
 name = "rtcl-vm"
 version = "0.1.0"
 dependencies = [
@@ -2046,8 +2057,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f20f20e44f7e8aeb6744823ea9d869ede51e51be4fdaedede2852282e54d2d8"
 dependencies = [
  "bitflags",
+ "hashbrown 0.17.1",
  "indexmap",
  "semver",
+ "serde",
 ]
 
 [[package]]

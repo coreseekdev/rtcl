@@ -77,13 +77,18 @@ EngineOps impl。
 ## 3. 分期计划（每期门禁 = judge 88/88×2 + battery 33/33 + probes
 18/18×2 + fuzz 800×2 + rtcl-vm 809 + bench/cases 六例 ≥ 平价）
 
+- **P3-lite ✅ 已完成**（e1679ac，2026-11-01）：FastShared 共享层 +
+  sh_* 逻辑体 10 函数单点化；两引擎闭包瘦身为胶水+委托；~400 行
+  重复逻辑消除（1656+887 → 1441+680+314）。语义修复从此单点落地
+  （p05/dirty/sync/kind5 系列的双落痛点解除）。EngineOps trait
+  （闭包签名级合并）推迟——sh_ 委托已消除逻辑重复，trait 的边际
+  收益剩胶水行数，风险/收益不划算时可以停在这里。
 - **P1 纯搬迁（零代码变化）**：文件移动到 engine/ 布局 + pub(crate)
   re-export；judge/fuzz 差分应逐字节不变。风险 = 可见性churn。
+  （可选——逻辑已单点化后，物理布局纯治理。）
 - **P2 Host 迁出**：exec.rs 的 Host 结构与方法独立 host.rs（纯移动）。
-- **P3 fast 镜像合并**：EngineOps trait + fast_linker 单份实现 +
-  wasmi/wasmtime 两个 impl；删 fast_wt 镜像 ~800 行。**最大收益期**。
-- **P4 classic linker 合并**：同法处理 register_wasmtime_abi vs
-  exec.rs 内联段（~250 行）。
+- **P4 classic linker 合并**：register_wasmtime_abi vs exec.rs 内联段
+  （~250 行胶水）——同法可 sh_ 委托，收益中等。
 - **P5（可选）jitsh 并入 rtcl**：rtcl --features jit 已有钩子路径；
   jitsh 保留为差分 oracle（judge 三向需要独立二进制），CLI 文档化
   分工即可，不必物理合并。

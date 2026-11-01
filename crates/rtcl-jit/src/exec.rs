@@ -76,7 +76,21 @@ pub fn run_top(interp: Interp, script: &str, file: &str) -> (Interp, JitRun) {
 pub fn engine_from_env() -> EngineKind {
     match crate::env_value("RTCL_JIT_ENGINE").as_deref() {
         Some("wasmtime") if cfg!(feature = "jit-native") => EngineKind::Wasmtime,
-        _ => EngineKind::Wasmi,
+        Some("wasmi") => EngineKind::Wasmi,
+        // 默认引擎：jit-native 在位时选 wasmtime——Cranelift 原生编译
+        // vs wasmi 指令解释（fib 5.0×/loop 1.7× vs wasmi 路径，实测
+        // 2026-11-01）；纯 jit-exec 构建（rtcl-cli）无 wasmtime 依赖，
+        // 保持 wasmi。RTCL_JIT_ENGINE 显式指定恒优先。
+        _ => {
+            #[cfg(feature = "jit-native")]
+            {
+                EngineKind::Wasmtime
+            }
+            #[cfg(not(feature = "jit-native"))]
+            {
+                EngineKind::Wasmi
+            }
+        }
     }
 }
 

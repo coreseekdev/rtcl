@@ -83,15 +83,37 @@ EngineOps impl。
   （p05/dirty/sync/kind5 系列的双落痛点解除）。EngineOps trait
   （闭包签名级合并）推迟——sh_ 委托已消除逻辑重复，trait 的边际
   收益剩胶水行数，风险/收益不划算时可以停在这里。
-- **P1 纯搬迁（零代码变化）**：文件移动到 engine/ 布局 + pub(crate)
-  re-export；judge/fuzz 差分应逐字节不变。风险 = 可见性churn。
-  （可选——逻辑已单点化后，物理布局纯治理。）
-- **P2 Host 迁出**：exec.rs 的 Host 结构与方法独立 host.rs（纯移动）。
-- **P4 classic linker 合并**：register_wasmtime_abi vs exec.rs 内联段
-  （~250 行胶水）——同法可 sh_ 委托，收益中等。
-- **P5（可选）jitsh 并入 rtcl**：rtcl --features jit 已有钩子路径；
-  jitsh 保留为差分 oracle（judge 三向需要独立二进制），CLI 文档化
-  分工即可，不必物理合并。
+- **P1 ✅ 已完成**（73582ea）：fast/ 与 classic/ 模块树成型——
+  proc_exec.rs 1656→101（纯钩子层：install + 策略 + 引擎分派）；
+  fast/{shared,wasmi,wt} + classic/{mod,wasmi,wt} 各归其位。
+  TL 拆分教训：原 51-79 thread_local 混装 4 static 分属三个子系统，
+  盲切丢段——条目索引 + git 原文逐字恢复；多轮正则补丁会弄乱文件，
+  整文件重写优于补丁。
+- **P2 ✅ 已完成**（55571cb）：Host → host.rs（1176 行叶模块），
+  exec.rs 1673→557（纯顶层驱动）。
+- **P4 ❌ 评估后放弃**：classic linker 三实例（exec.rs wasmi 顶层 /
+  exec_wasmtime.rs wasmtime / classic/wasmi.rs proc 池）——逻辑已
+  100% 单点化（Host 方法），剩余为注册胶水（每闭包 1-5 行直调）。
+  trait 化成本 > 收益（P3-lite 同标准），接受为「类型使然的胶水」。
+- **P5 jitsh/rtcl 分工（文档化即可）**：jitsh = 差分 oracle（judge
+  三向的第二引擎执行体，hook 全量安装）+ fast-tier 专用 bench 入口；
+  rtcl --features jit = 生产 CLI（钩子可选挂载）。二者共享同一
+  执行机器（本 crate），不物理合并。
+
+## 合并终态（2026-11-01）
+
+| 层 | 文件 | 行数 | 内容 |
+|---|---|---|---|
+| 共享逻辑 | fast/shared.rs | 314 | FastShared + sh_*（fast 语义单一真值） |
+| 共享宿主 | host.rs | 1176 | Host（classic/fast 两线共用的 ABI v2 方法全集） |
+| fast 驱动 | fast/wasmi.rs + fast/wt.rs | 678+680 | 引擎胶水 |
+| classic 池 | classic/{mod,wasmi,wt}.rs | 51+425+210 | 模块缓存 + 两引擎 proc 池 |
+| 顶层驱动 | exec.rs | 557 | run_top/execute/finish |
+| 钩子 | proc_exec.rs | 101 | install + 策略 + 引擎分派 |
+| 契约 | abi.rs | 247 | 单一真值（= towasm 产物契约） |
+
+（原 proc_exec.rs+exec.rs = 3329 行混装 → 职责单一化后 4220 总行
+含 host.rs 1176；净变化 +~50，换来的是每个子系统的边界可读。）
 
 ## 4. 风险登记
 

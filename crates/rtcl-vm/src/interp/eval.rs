@@ -84,11 +84,16 @@ impl Interp {
                                         // 顶层 slot 编译（C1）：仅最外层 eval（深度 0）——
                     // 嵌套体 eval（dict update/with、eval 命令）的变量
                     // 链接语义依赖非 slot 编译。
+                    // foreach/lmap 排除：内联 foreach 的 bind 写帧槽，
+                    // 顶层无帧背衬（C2 tslots 落地前 defer）。
+                    // 顶层 slot 编译（C1）：仅最外层 eval（深度 0）——
+                    // 嵌套体 eval（dict update/with、eval 命令）的变量
+                    // 链接语义依赖非 slot 编译。foreach/lmap/catch 保持
+                    // 顶层分派语义（compile_unit_toplevel）。
                     let code = if self.eval_depth == 1 {
-                        Rc::new(Compiler::compile_unit_locals(
+                        Rc::new(Compiler::compile_unit_toplevel(
                             Rc::clone(&rc.source),
                             &rc.commands,
-                            &[],
                         ))
                     } else {
                         Rc::new(Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands))

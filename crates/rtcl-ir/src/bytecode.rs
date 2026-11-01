@@ -123,6 +123,9 @@ pub struct ByteCode {
     /// zip walk on EVERY call; it is a pure function of the (params,
     /// table) pair, both fixed at compile time.
     pub params_aligned: Option<usize>,
+    /// 顶层 slot 单元（locals_mode + 顶层语义：framed 错误帧、foreach
+    /// 保持分派、运行时非 proc 语境信号）。
+    pub toplevel_slots: bool,
     /// This unit was compiled in proc context (locals table active —
     /// `compile_unit_locals`): foreach/lmap inline-fold and braced catch
     /// bodies would inline (tclsh's compiledLocals units).  The executor
@@ -151,6 +154,7 @@ impl Default for ByteCode {
             source: Rc::from(""),
             fallback: false,
             params_aligned: None,
+            toplevel_slots: false,
             locals_mode: false,
             epoch: 0,
         }

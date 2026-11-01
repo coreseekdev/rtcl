@@ -387,7 +387,9 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
     // (eval'd texts) clear it — their contents are fresh non-proc
     // contexts exactly like a tree-walked eval.
     let saved_inl = interp.in_locals_unit;
-    interp.in_locals_unit = code.locals_mode;
+    // 顶层 slot 单元：非 proc 语境（catch 内联/信号语义与 proc 区分
+    // ——tclsh 顶层 catch 保持分派形状）。
+    interp.in_locals_unit = code.locals_mode && !code.toplevel_slots;
     // The unit is one "current script": command-substitution errors inside
     // it defer their enclosing-command frame via err_pending_top, and the
     // site lines are absolute already (entry_offset + site.line).

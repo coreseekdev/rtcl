@@ -65,6 +65,9 @@ pub struct Compiler {
     /// correct.  Eval-level units never set this — their variables are
     /// globals/namespace vars, never frame slots.
     locals_mode: bool,
+    /// 顶层 slot 单元（locals_mode 的槽位资格 + framed 错误帧保留 +
+    /// foreach 保持分派 + 运行时非 proc 语境信号）。
+    toplevel_slots: bool,
 }
 
 /// May a name of this shape live in a proc's compiled locals table?
@@ -98,7 +101,15 @@ impl Compiler {
     /// spans must point into `source` (as [`crate::ScriptUnit::parse`]
     /// produces).  Sites referencing the source are emitted per command.
     pub fn compile_unit(source: Rc<str>, commands: &[Command]) -> ByteCode {
-        Self::compile_impl(source, commands, false, &[])
+        Self::compile_impl(source, commands, false, &[], false)
+    }
+
+    /// 顶层 slot 单元（top-level slot 化 C1）：locals_mode 的槽位资格
+    /// + 顶层语义保留——framed 错误帧、foreach/lmap 保持分派（bind 写
+    /// 帧槽的顶层背衬 = C2）、运行时非 proc 语境信号
+    ///（ByteCode.toplevel_slots）。
+    pub fn compile_unit_toplevel(source: Rc<str>, commands: &[Command]) -> ByteCode {
+        Self::compile_impl(source, commands, true, &[], true)
     }
 
     /// [`Self::compile_unit`] for a procedure body: `param_names` seed the
@@ -110,7 +121,7 @@ impl Compiler {
         commands: &[Command],
         param_names: &[&str],
     ) -> ByteCode {
-        Self::compile_impl(source, commands, true, param_names)
+        Self::compile_impl(source, commands, true, param_names, false)
     }
 
     fn compile_impl(
@@ -118,6 +129,7 @@ impl Compiler {
         commands: &[Command],
         locals_mode: bool,
         params: &[&str],
+        toplevel_slots: bool,
     ) -> ByteCode {
         let mut c = Compiler {
             bytecode: ByteCode::new(),
@@ -127,6 +139,7 @@ impl Compiler {
             line_base: 0,
             in_next: false,
             locals_mode,
+            toplevel_slots,
         };
         if locals_mode {
             // Track the slot-gate's param/table alignment here, where the
@@ -156,6 +169,7 @@ impl Compiler {
         // slot-pair fusions are interpreter-only (name-keyed units keep
         // the JIT's accepted op set).
         c.bytecode.locals_mode = locals_mode;
+        c.bytecode.toplevel_slots = toplevel_slots;
         c.bytecode.peephole();
         c.bytecode.source = source;
         c.bytecode.fallback = !c.bytecode.ops().iter().all(|op| matches!(op,
@@ -290,8 +304,14 @@ impl Compiler {
                 // tclsh's compiledLocals requirement; every other context
                 // (top level, eval, uplevel, namespace eval) keeps the
                 // dispatched command's semantics.
-                "foreach" => return self.compile_foreach(cmd, false),
-                "lmap" => return self.compile_foreach(cmd, true),
+                "foreach" if !self.toplevel_slots => {
+                    return self.compile_foreach(cmd, false)
+                }
+                "lmap" if !self.toplevel_slots => {
+                    return self.compile_foreach(cmd, true)
+                }
+                // 顶层 slot 单元：foreach/lmap 保持分派（bind 写帧槽的
+                // 顶层背衬 = C2；framed 装饰语义亦依赖分派路径）。
                 // `lappend <literal-var> <value>` — the list-builder shape
                 // (build loops).  Folded to a slot/name op: the value word
                 // compiles inline, the op appends through the variable's
@@ -840,7 +860,9 @@ impl Compiler {
             return self.compile_dyncall(cmd);
         }
         let line = self.abs_line(cmd);
-        let framed = !self.locals_mode;
+        // framed 语义 = 错误帧保留（顶层 slot 单元也要帧——tclsh 顶层
+        // 构造错误带帧）；与 locals_mode（槽位资格）解耦。
+        let framed = !self.locals_mode || self.toplevel_slots;
         let info_idx =
             self.bytecode
                 .add_foreach_info(ForeachInfo { groups, lmap, framed });

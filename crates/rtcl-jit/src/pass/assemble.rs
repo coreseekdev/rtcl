@@ -1078,7 +1078,10 @@ fn fast_slot_base(f: &mut Function, sb: u32) {
 /// 槽脏位掩码置位（切片末字）：StoreVar/IncrVar fast 臂替代逐次
 /// set_var 镜像——稳态循环零宿主调用，真值在宿主边界统一 flush。
 /// 值经 tmp64 中转（store 栈序 = 地址在前）。
-fn fast_mask_set(f: &mut Function, tmp64: u32, sb: u32, slot: u32) {
+fn fast_mask_set(f: &mut Function, _tmp64: u32, sb: u32, slot: u32) {
+    // 直排形式：i64.store 栈序 = 地址在前——先压地址，值在其上计算，
+    // 免 tmp64 中转（-2 指令/次；稳态循环每迭代 2 次 mask 置位）。
+    fast_slot_base(f, sb);
     fast_slot_base(f, sb);
     f.instruction(&Instruction::I64Load(MemArg {
         offset: cache::SLOT_MASK_OFF as u64,
@@ -1087,9 +1090,6 @@ fn fast_mask_set(f: &mut Function, tmp64: u32, sb: u32, slot: u32) {
     }));
     f.instruction(&Instruction::I64Const(1i64 << slot.min(63)));
     f.instruction(&Instruction::I64Or);
-    f.instruction(&Instruction::LocalSet(tmp64));
-    fast_slot_base(f, sb);
-    f.instruction(&Instruction::LocalGet(tmp64));
     f.instruction(&Instruction::I64Store(MemArg {
         offset: cache::SLOT_MASK_OFF as u64,
         align: 3,

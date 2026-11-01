@@ -2222,3 +2222,16 @@ P1 物理布局 + P2 Host 迁出完成，合并治理收官：
 4. **基线修正**：arith 顶层 4 引擎全平价（80ns/iter，name-keyed 变量
    查表主导）——顶层循环的真正杠杆 = slot 化（top-level locals_mode，
    独立大项，OPEN）。
+
+## 对齐修正（b3fe4a2，2026-11-01）：默认引擎回归 wasmi
+
+用户对齐：**JIT 的进程内执行 target = wasmi**（纯 Rust 全平台可用，
+含主 target wasm32-unknown-unknown 的 wasmi-in-wasm 部署路径）；
+wasmtime = 显式 opt-in（RTCL_JIT_ENGINE=wasmtime + jit-native，
+native bench 档）。f66f5f1 的默认翻转撤销，fib 5.0×/fl 1.82× 保留
+为 wasmtime 档数字（bench 用 RTCL_JIT_ENGINE=wasmtime 复现）。
+
+产品层分层（既状确认）：
+- rtcl 默认构建 = 纯解释器（零 JIT 依赖）
+- rtcl --features jit = 解释器默认 + JIT 特性开关（fast-only 策略）
+- jitsh = JIT 引擎执行体/差分 oracle（hook 全量）

@@ -26,7 +26,7 @@ pub(crate) struct FastShared {
     pub hosts: Vec<Host>,
     /// slot → proc 体（名反查/jit_redispatch_after 用）。
     pub codes: Vec<Rc<ByteCode>>,
-    pub slots: std::collections::HashMap<crate::proc_exec::PoolKey, usize>,
+    pub slots: std::collections::HashMap<crate::classic::PoolKey, usize>,
     // 共享运行态
     pub pending: Option<Pending>,
     pub pending_exit: Option<i32>,

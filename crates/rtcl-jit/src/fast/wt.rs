@@ -16,7 +16,7 @@
 #![allow(unsafe_code)]
 
 use crate::abi;
-use crate::fast_shared::{
+use crate::fast::shared::{
     sh_binary_op, sh_bool_test, sh_call_dispatch, sh_fail, sh_get_var,
     sh_incr_var, sh_proc_exit_frame, sh_rc_to_i64, sh_set_var, sh_sync_var,
 };
@@ -31,7 +31,7 @@ type PoolKey = (usize, usize, u64);
 
 pub(crate) struct FastHostWt {
     /// 引擎无关共享层（逻辑真值——docs/JIT-ENGINE-MERGE.md P3-lite）。
-    pub sh: crate::fast_shared::FastShared,
+    pub sh: crate::fast::shared::FastShared,
     /// slot → proc_main 句柄（resolve 冷融合代打）。
     pub runs: Vec<wasmtime::TypedFunc<(i32, i32, i32), (i64, i32)>>,
     pub engine: wasmtime::Engine,
@@ -382,7 +382,7 @@ fn fast_ensure_slot_wt(
     if let Some(s) = c.data().sh.slots.get(&pool_key) {
         return Some(*s);
     }
-    let module = crate::proc_exec::compile_cached(code, (Rc::as_ptr(code) as usize, code.epoch))?;
+    let module = crate::classic::compile_cached(code, (Rc::as_ptr(code) as usize, code.epoch))?;
     let _meta = module.fast?; // fast gate 不命中 → None（分派回落）
     let engine = c.data().engine.clone();
     let wmodule = WT_FAST_MODULES.with(|m| {
@@ -440,7 +440,7 @@ fn init_fast_store_wt(interp: &mut Interp) -> wasmtime::Store<FastHostWt> {
     let mut store = wasmtime::Store::new(
         &engine,
         FastHostWt {
-            sh: crate::fast_shared::FastShared::new(interp as *mut Interp),
+            sh: crate::fast::shared::FastShared::new(interp as *mut Interp),
             runs: Vec::new(),
             engine: engine.clone(),
             memory: None,
@@ -505,11 +505,11 @@ fn init_fast_store_wt(interp: &mut Interp) -> wasmtime::Store<FastHostWt> {
 
 /// fast-tier 尝试（wasmtime 侧；fast_try 同构）。
 pub(crate) fn fast_try_wt(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core::Result<Value>> {
-    if crate::proc_exec::fast_in_call() {
+    if crate::fast::fast_in_call() {
         return None;
     }
     let key = (Rc::as_ptr(code) as usize, code.epoch);
-    let module = crate::proc_exec::compile_cached(code, key)?;
+    let module = crate::classic::compile_cached(code, key)?;
     let meta = module.fast?;
     execute_fast_wt(interp, code, &module, meta)
 }
@@ -635,9 +635,9 @@ fn execute_fast_wt(
             mem.write(&mut *store, arg_base + 8, &buf).ok()?;
         }
         let tf = store.data().runs[slot].clone();
-        crate::proc_exec::set_fast_in_call(true);
+        crate::fast::set_fast_in_call(true);
         let r = tf.call(&mut *store, (slot as i32, meta.nparams as i32, arg_base as i32));
-        crate::proc_exec::set_fast_in_call(false);
+        crate::fast::set_fast_in_call(false);
         let (val, rc) = match r {
             Ok(pair) => pair,
             Err(_trap) => {

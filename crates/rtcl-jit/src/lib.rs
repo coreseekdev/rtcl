@@ -94,12 +94,12 @@ pub mod host;
 #[allow(unsafe_code)]
 pub mod proc_exec;
 #[cfg(feature = "jit-exec")]
-pub(crate) mod fast_shared;
+pub(crate) mod classic;
+#[cfg(feature = "jit-exec")]
+pub(crate) mod fast;
 
 #[cfg(all(feature = "jit-exec", feature = "jit-native"))]
 pub mod exec_wasmtime;
-#[cfg(all(feature = "jit-exec", feature = "jit-native"))]
-pub mod exec_fast_wt;
 
 /// Shorthand for the emitter's rejection type.
 pub use emit::Unsupported;

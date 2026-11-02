@@ -2284,3 +2284,51 @@ rtcl≠tclsh）/ jitsh 静默成功 = **与 tclsh 一致（更正确）**。fuzz
 附带发现：`time {...}` 体是嵌套 eval（深度≥2）→ 非 slot 编译——
 所有包 time 的基准从未测过顶层 slot 路径（测量方法学修正：裸循环
 文件墙钟）。
+
+## C2'——解释器 tslots + C4 gate 重开（76b7056/c3c7e32，2026-11-03）
+
+C2 双写者根因（顶层变量=全局别名，ts 缓存+名路径双写）证伪后重做：
+**ts = 私有缓存**（TopSlots{names,values,aliased}），名路径只触全局，
+边界同步。三层模型下解释器是产品默认——本项把 C1 顶层槽编译的收益
+落到 rtcl 默认构建。
+
+### 机制
+- top_op_class 穷举三分类：Pure(0) 栈/算术/槽 op+全融合族 / FlushOnly(1)
+  名键读 / FlushInvalidate(2) 分派·名写·数组化；新 op 编译期强制分类
+- 名路径 ts 臂 7 处（get_var/set_var/incr_var_fast/lappend_slot_fast/
+  frame_slot_*），直通咽喉（scalar_top read/write）由 class 1/2 边界
+  背书
+- **悬挂同步**（e.tcl lappend 丢失实证）：exec_bytecode/ns eval 的
+  take 前 flush + restore 后 invalidate（嵌套单元直写全局，恢复副本
+  stale——flush 会反向覆盖，只能失效）。EvalExpr(class 1) 括号内嵌套
+  单元是盲区来源：class-1 不失效，靠悬挂点同步兜底
+- 边界降级（trace/dead 中途注册 → flush+永久 ts=None）；aliased 初值
+  =array_globals；set_var 数组化标记 ts.aliased
+- 融合 op 白名单（SubEndStoreLocalPop/ForNextIncrLocal 等）：漏列即
+  每迭代 flush+invalidate（440ns/iter → 132ms 回归实证）
+
+### 性能（裸顶层循环 300k，墙钟）
+- rtcl interp：31ms → **10ms（-68%）**——裸顶层 arith 与 jitsh@wasmtime
+  同档（11-15ms），解释器默认构建首次追平 Cranelift 顶层形状
+- jitsh@wasmi 25ms → 顶层循环相对 wasmi 反超（10 vs 25）——wasmi
+  顶层 fast tier 的存在意义需重估（见 OPEN）
+
+### 门禁
+judge 88/88×2（interp + jit 三向）、battery 33/33、probes 18/18、
+fuzz 500×2 引擎 0 分歧、rtcl-vm 809、towasm 6/6。
+C4 gate 重开独立复核：f000137 三方 rc=0 一致（has_foreach 编译侧排
+除后分歧源结构性消失）+ lmap 括号逃逸形状（continue/break/过滤）
+三方一致。
+
+### preexisting 缺口（本轮发现，非 C2' 引入）
+ns eval 体 `set` **已存在的全局裸名**写全局（tclsh 解析链含 global
+fallback——`set v9 100` in ns 体覆写 ::v9），rtcl 一律建 ns 表
+（::demo::v9）。全新名两侧一致建 ns 表。ts 悬挂期（名路径纯全局）
+与本分歧正交——名字解析规则专项待办。
+
+### 教训
+- 悬挂 take/restore 的同步语义要在**建立悬挂时**一次想全：flush 的
+  方向性（pending→全局 vs 全局→槽）在两端相反
+- 探针定位分歧：RTCL_DBG 环境门 eprintln 逐写点插桩（flush/fill/
+  fsw/fswm/set_var-arm），一轮跑出完整读写序——比 stash 二分快
+- 单次执行 ≤10min 硬规矩（构建 -j 2 ~2min15s，后台+短轮询）

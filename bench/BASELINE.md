@@ -2363,3 +2363,33 @@ has_foreach 编译侧排除结构性消失。专项关闭。
 ### 门禁
 battery 33/33、probes 18/18、judge 88/88×2、fuzz 500×2 引擎 0 分歧、
 rtcl-vm 809、towasm 6/6；本机差分 11/11；bare.tcl 10ms 持平。
+
+## 深水区检测（allium 规约驱动，1dd2d81，2026-11-03）
+
+用户指令：借助 allium skill 检测深水区正确性。规约先行——
+specs/variables.allium 深水节 16 rule（ns×proc 帧隔离/upvar 交叉/
+variable 链/delete/which/ts 桥），specs/variables-deep.probes 17 探针
+经 specs/probe.sh 三方差分，oracle 定性后修 rtcl。
+
+### 修复（3 真 bug）
+- **upvar 0 ::a(e) x 元素链**：parse_level("0")=Rel(0) → Frame 臂 →
+  链接 = 字面名 "::a(e)" 的帧局部。Frame 臂根限定目标切全局链 +
+  set_var 元素形式 loc 键重入（**良构守卫 ends_with(')')**——
+  set-old-4.5 半开名 a(bcd 是标量，裸 contains('(') 递归 = 栈溢出，
+  judge gen_set-old 拦截）
+- **死父 ns 建链**：can't access "::d::v": parent namespace doesn't
+  exist（三臂统一——GlobalNs/eval/Frame）
+- **variable 瞬态链接**：eval 级 variable 链接移 ns_transient（体帧
+  作用域，ns eval 入口 take/退出恢复）；upvar eval 别名留
+  flat_aliases 持久（var-3.10）。教训：两类链接生灭语义相反——
+  save/restore flat_aliases 整表曾把 var-3.10 一并杀掉（judge 回归
+  拦截），分表才对
+
+### 定性澄清
+- ns 内定义 proc 顶层不可见 = **伪分歧**（首轮 probe.sh 的 rc 列
+  误读；catch 值形复核三方一致）
+- 自删形状 = 真分歧 → DIVERGENCES.md D-2 OPEN（帧视图 vs 表复活）
+
+### 门禁
+judge 88/88×2、battery 33/33、probes 18/18、fuzz 500×2 引擎 0 分歧、
+rtcl-vm 809、towasm 6/6、深水 16/17、nr 11/11、bare 10ms 持平。

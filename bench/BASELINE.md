@@ -2332,3 +2332,34 @@ fallback——`set v9 100` in ns 体覆写 ::v9），rtcl 一律建 ns 表
 - 探针定位分歧：RTCL_DBG 环境门 eprintln 逐写点插桩（flush/fill/
   fsw/fswm/set_var-arm），一轮跑出完整读写序——比 stash 二分快
 - 单次执行 ≤10min 硬规矩（构建 -j 2 ~2min15s，后台+短轮询）
+
+## 名字解析专项 + ts ::-leaf 根限定（ce1d9fc，2026-11-03）
+
+tclsh oracle 探全（nr1-nr4）：eval 级变量解析链两级——**当前 ns 表 →
+全局；父 ns 不在链上**（a::b 体 set x 建 a::b::x；读 a::y 报 no
+such）。写命中链上首个已存在者，创建落当前 ns；variable 声明记录
+（含 valueless）截链。
+
+### 修复面
+- A：ns 体 set 已存在全局裸名 → 全局（原建 ns 表）
+- E：ns 体 unset 全局裸名 → 全局（原报 no such variable）
+- L：ns 体数组元素 → 全局基（原建 ns 数组）
+- ::-leaf ts 臂劫持（C2' 回归）：$d7::s 的 leaf "s" 撞顶层槽 s，
+  读/写劫持成槽值。leaf 撞名仅对根限定 ::leaf 成立——两臂改
+  strip_prefix("::") 且 rest 无 ::/(。I 形状（variable 声明后 set）
+  全程由此造成，variable 命令无辜（种子 d7::s=9 本就正确）
+
+### 复核关闭
+lmap 体作用域 quirk（f000137 定性遗留）：proc 内体读外层局部/体写
+变量体外可见/双变量列表/体读全局四形状三方一致——原分歧源随
+has_foreach 编译侧排除结构性消失。专项关闭。
+
+### 教训
+- ts 臂的「同名等价」假设要精确到限定形式：leaf 撞名 ≠ 同一变量
+  （rsplit 惰性——根限定才可劫持）
+- divergent-shape 探针先行（nr1-nr4 oracle 表）再动代码：一次定准
+  规则（两级链、无父链、声明截链），避免按直觉实现父链回退
+
+### 门禁
+battery 33/33、probes 18/18、judge 88/88×2、fuzz 500×2 引擎 0 分歧、
+rtcl-vm 809、towasm 6/6；本机差分 11/11；bare.tcl 10ms 持平。

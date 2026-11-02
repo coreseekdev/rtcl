@@ -4,10 +4,15 @@
 
 # ── throw / parray (already implemented) ────────────────────────────────
 
-# throw — Generate an exception with the given code and optional message.
-# jimtcl: tclcompat.tcl
-proc throw {code {msg ""}} {
-    return -code $code $msg
+# throw — Generate an ERROR exception whose errorCode is the given
+# code (tclsh 8.6 semantics: code is an arbitrary string/list riding
+# ::errorCode — NOT a completion code; dict-deep 探针 `throw {E C} msg`
+# → m=msg、errorCode=E C)。jimtcl 的 completion-code 形式弃用。
+proc throw {code {msg ""} {info ""}} {
+    if {[string length $info]} {
+        return -code error -errorcode $code -errorinfo $info $msg
+    }
+    return -code error -errorcode $code $msg
 }
 
 # parray — Pretty-print an array.

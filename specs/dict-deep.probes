@@ -1,6 +1,6 @@
 # dict 深水探针（dict-deep;probe.sh 差分）
 puts [dict for {k v} {a 1 b 2} {expr {$v+5}}]
-dict map {k v} {a 1 b 2 c 3} {if {$k=="c"} {break}; expr {$v*10}}
+puts [dict map {k v} {a 1 b 2 c 3} {if {$k=="c"} {break}; expr {$v*10}}]
 set d {k abc}; catch {dict incr d k} m; puts "$m | $d"
 catch {dict update novar k v {set v 5}} m; puts "$m | [info exists novar]"
 catch {dict get {a b c}} m; puts "$m"

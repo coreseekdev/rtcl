@@ -109,7 +109,46 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args_with_usage("dict", 2, args.len(), "subcommand ?arg ...?"));
     }
 
-    let subcmd = args[1].as_str();
+    // 子命令解析：全名 → 唯一前缀缩写（dict-deep 探针：`dict cr a 1`
+    // → create）；歧义/无匹配 → tclsh 同文错误。ensemble proc 回落
+    // （`dict <name>` proc）仅对未解析名保留原行为。
+    const DICT_SUBCMDS: &[&str] = &[
+        "append", "create", "exists", "filter", "for", "get", "incr", "info",
+        "keys", "lappend", "map", "merge", "remove", "replace", "set", "size",
+        "unset", "update", "values", "with",
+    ];
+    let raw = args[1].as_str();
+    let matches: Vec<&str> = DICT_SUBCMDS
+        .iter()
+        .copied()
+        .filter(|s| s.starts_with(raw))
+        .collect();
+    let subcmd = match matches.as_slice() {
+        [one] => (*one).to_string(),
+        [] => {
+            if interp.procs.contains_key(&format!("dict {}", raw)) {
+                raw.to_string()
+            } else {
+                return Err(Error::runtime(
+                    format!(
+                        "unknown or ambiguous subcommand \"{}\": must be append, create, exists, filter, for, get, incr, info, keys, lappend, map, merge, remove, replace, set, size, unset, update, values, or with",
+                        raw
+                    ),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+        }
+        _ => {
+            return Err(Error::runtime(
+                format!(
+                    "unknown or ambiguous subcommand \"{}\": must be append, create, exists, filter, for, get, incr, info, keys, lappend, map, merge, remove, replace, set, size, unset, update, values, or with",
+                    raw
+                ),
+                crate::error::ErrorCode::Generic,
+            ));
+        }
+    };
+    let subcmd = subcmd.as_str();
     match subcmd {
         // ── dict create ?-ordered|-unordered? ?key value ...? ──
         "create" => {
@@ -154,6 +193,9 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             if args.len() == 3 {
+                // 无键返回整字典，但奇长仍须先报（dict-deep 探针：
+                // `dict get {a b c}` → missing value to go with key）。
+                parse_dict(interp, &args[2])?;
                 return Ok(args[2].clone());
             }
             // Single-key fast path: zero-copy via borrow
@@ -162,10 +204,18 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 let key = args[3].as_str();
                 return match entries.get(key) {
                     Some(v) => Ok(v.clone()),
-                    None => Err(Error::runtime(
-                        format!("key \"{}\" not known in dictionary", key),
-                        crate::error::ErrorCode::NotFound,
-                    )),
+                    None => {
+                        // tclsh：缺键 errorCode = TCL LOOKUP DICT <key>
+                        //（dict-deep 探针）。
+                        super::list::set_error_code(
+                            interp,
+                            &format!("TCL LOOKUP DICT {}", crate::value::tcl_quote(key)),
+                        );
+                        Err(Error::runtime(
+                            format!("key \"{}\" not known in dictionary", key),
+                            crate::error::ErrorCode::NotFound,
+                        ))
+                    }
                 };
             }
             // Multi-key: must clone intermediate dicts
@@ -365,13 +415,12 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // Clone the dict: body evaluation may modify variables
             let entries = parse_dict(interp, &args[3])?;
             let body = &args[4];
-            let mut result = Value::empty();
             for (k, v) in &entries {
                 interp.charge_step()?;
                 interp.set_var(&key_var, Value::from_str(k))?;
                 interp.set_var(&val_var, v.clone())?;
                 match interp.eval_body_value(body) {
-                    Ok(r) => result = r,
+                    Ok(_) => {}
                     Err(e) => {
                         if e.is_break() {
                             break;
@@ -383,7 +432,8 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     }
                 }
             }
-            Ok(result)
+            // dict for 恒返回空串（dict-deep 探针：tclsh 不回显体末值）。
+            Ok(Value::empty())
         }
 
         // ── dict merge ?dictionary ...? ────────────────────────
@@ -482,7 +532,18 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             };
             let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
             let mut entries = parse_dict(interp, &dict_val)?;
-            let cur = entries.get(key).and_then(|v| v.as_int()).unwrap_or(0);
+            // 现存键非整数 → 报错且不动字典（dict-deep 探针：tclsh
+            // `expected integer but got "abc"`、d 保持 k abc——原
+            // unwrap_or(0) 会静默覆盖成 1）。
+            let cur = match entries.get(key) {
+                Some(v) => v.as_int().ok_or_else(|| {
+                    Error::runtime(
+                        format!("expected integer but got \"{}\"", v.as_str()),
+                        crate::error::ErrorCode::Generic,
+                    )
+                })?,
+                None => 0,
+            };
             entries.insert(key.to_string(), Value::from_int(cur + incr));
             let result = Value::from_dict_cached(entries);
             interp.set_var(var_name, result)
@@ -724,7 +785,9 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     }
                     Err(e) => {
                         if e.is_break() {
-                            break;
+                            // tclsh dict map 的 break 丢弃已累积结果
+                            //（dict-deep 探针：返回空串，非半成 dict）。
+                            return Ok(Value::empty());
                         }
                         if e.is_continue() {
                             continue;
@@ -785,7 +848,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dict update",
                     5,
                     args.len(),
-                    "dictVariable key varName ?key varName ...? body",
+                    "dictVarName key varName ?key varName ...? script",
                 ));
             }
             let var_name = args[2].as_str().to_string();
@@ -795,7 +858,13 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .map(|c| (c[0].as_str().to_string(), c[1].as_str().to_string()))
                 .collect();
 
-            let dict_val = interp.get_var(&var_name).ok().cloned().unwrap_or_default();
+            let dict_val = match interp.get_var(&var_name) {
+                Ok(v) => v.clone(),
+                // dict update 要求变量已存在（dict-deep 探针：tclsh
+                // `can't read "novar": no such variable`、不创建——原
+                // unwrap_or_default 静默空字典起跑）。
+                Err(e) => return Err(e),
+            };
             let entries = parse_dict(interp, &dict_val)?;
 
             for (key, local_var) in &pairs {

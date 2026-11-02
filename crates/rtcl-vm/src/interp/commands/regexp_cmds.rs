@@ -69,10 +69,11 @@ pub(crate) fn validate_are(pattern: &str) -> Option<(&'static str, String)> {
                     ));
                 }
                 // Alphanumeric escapes must be ones Tcl's ARE knows
-                // (`\Q..\E` quoting is Perl-only — tclsh rejects it);
-                // punctuation escapes are literal.
+                // (`\Q..\E` quoting is Perl-only — tclsh rejects it;
+                // `\u` likewise absent from 8.6.17 ARE — matching-deep
+                // 探针 oracle); punctuation escapes are literal.
                 let esc = b[i + 1];
-                if esc.is_ascii_alphanumeric() && !esc.is_ascii_digit() && !b"dDsSwWbBAZzmMyYCNceNntrfvUux".contains(&esc)
+                if esc.is_ascii_alphanumeric() && !esc.is_ascii_digit() && !b"dDsSwWbBAZzmMyYCNceNntrfvUx".contains(&esc)
                 {
                     return Some((
                         "REG_EESCAPE",

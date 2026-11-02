@@ -86,9 +86,12 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
     let result = interp.eval(&script);
 
     if let Err(e) = result {
-        // tclsh 文件模式语义（REPL 侧 repl.rs 已对齐，2026-10-19 文件
-        // 侧跟进）：`exit N` 以 N 退出且无输出；顶层 `return`（含带值）
-        // 是正常完成（rc 0、静默）——二者的值不打印、不走 errorInfo。
+        // 顶层控制流解码（tclsh main 语义，D-11）：先按 -code 解码——
+        // `return -code error/break/continue` 与裸 break/continue 在顶层
+        // 就是错误（完整 errorInfo rc 1，帧为看到该完成的命令，tclsh
+        // 转换点语义），普通 return（含带值）仍是正常完成（rc 0、静默），
+        // `exit N` 以 N 退出且无输出。
+        let e = interp.decode_toplevel_flow(e);
         if e.is_exit() {
             std::process::exit(repl::exit_code_of(&e));
         }
@@ -111,8 +114,14 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
 fn run_command(cmd: &str, quiet: bool) -> Result<(), String> {
     let mut interp = Interp::new();
 
-    let result = interp.eval(cmd)
-        .map_err(|e| e.to_string())?;
+    let result = match interp.eval(cmd) {
+        Ok(r) => r,
+        // -c 与 -f 同语义（error-deep 探针：tclsh `catch {exit 3}` 穿透
+        // catch 以 3 退出——原 to_string() 把 exit 信号降级成错误文本）。
+        Err(e) if e.is_exit() => std::process::exit(repl::exit_code_of(&e)),
+        Err(e) if e.is_return() => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
 
     if !quiet && !result.is_empty() {
         println!("{}", result);
@@ -221,6 +230,11 @@ fn eval_repl_line(interp: &mut Interp, script: &str) -> Result<(), i32> {
             Ok(())
         }
         Err(e) => {
+            // 顶层控制流解码（tclsh main 语义，D-11）：return -code
+            // error/break/continue 与裸 break/continue 是错误（REPL 侧
+            // 裸消息呈现、继续循环）；普通 return 仍走 control_flow_text
+            // 回显。exit 在解码中穿透。
+            let e = interp.decode_toplevel_flow(e);
             if e.is_exit() {
                 return Err(repl::exit_code_of(&e));
             }

@@ -768,6 +768,11 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::from_int(0))
         }
         Err(e) => {
+            // exit 不可捕获（error-deep 探针：tclsh `catch {exit 3}` 直
+            // 接终止进程 rc=3——信号穿透 catch 继续上抛）。
+            if e.is_exit() {
+                return Err(e);
+            }
             // A `tailcall` completion caught here: the deferred command
             // stays armed on the frame marker and fires at frame exit;
             // the completion itself reports as a `return` (code 2) with
@@ -786,13 +791,10 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let code = if is_tc { 2 }
             else if e.is_return() {
-                // A user integer completion code (`return -code 7`) passes
-                // through as the catch code (tclsh); the standard codes
-                // stay deferred completions reporting 2 until a proc
-                // boundary materializes them.
-                if let Error::ControlFlow { level, .. } = &e {
-                    if *level > 4 { *level as i64 } else { 2 }
-                } else { 2 }
+                // return 信号恒报 2（error-deep 探针：tclsh 对
+                // `return -code 7` 也报 2——用户码随 options 的 -code
+                // 走，catch 结果码只区分完成类别）。
+                2
             }
             else if e.is_break() { 3 }
             else if e.is_continue() { 4 }
@@ -824,26 +826,50 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // tclsh resets the code for every new error (rename-3.1) and
             // the var always exists after an error (fresh interp:
             // `info exists errorCode` → 0 until then).
+            if interp.err_code_raised {
+                // 抬升点装的 errorCode 标志按**每次抬升**消费（原只在
+                // code==1 消费——`catch {return -errorcode X}` 留下武装
+                // 标志，下一个错误的派生码被吞：error-deep 探针 A B
+                // 残留实证）。tclsh 对 return 的 -errorcode 不落
+                // ::errorCode（ec1/ec2 实证）。
+                interp.err_code_raised = false;
+            }
             if code == 1 {
-                if interp.err_code_raised {
-                    interp.err_code_raised = false;
-                } else {
-                    // Derived codes: tclsh stamps a code on every error —
-                    // wrong-args (TCL WRONGARGS), arithmetic (ARITH ...),
-                    // var lookups (TCL LOOKUP/READ VARNAME), unknown
-                    // commands (TCL LOOKUP COMMAND); plain errors reset
-                    // the var to NONE.
-                    let tec = e.tcl_error_code();
-                    let _ = interp.set_var("::errorCode", Value::from_str(&tec));
-                }
+                // Derived codes: tclsh stamps a code on every error —
+                // wrong-args (TCL WRONGARGS), arithmetic (ARITH ...),
+                // var lookups (TCL LOOKUP/READ VARNAME), unknown
+                // commands (TCL LOOKUP COMMAND); plain errors reset
+                // the var to NONE.
+                let tec = e.tcl_error_code();
+                let _ = interp.set_var("::errorCode", Value::from_str(&tec));
             }
             if let Some(ov) = opts_var {
-                let level = if e.is_return() { 0 } else { 1 };
                 let opts = if code == 1 {
                     // Tcl error completions carry -errorcode and -errorinfo.
                     error_options_dict(1, 0, &e, script, &error_info)
+                } else if e.is_return() {
+                    // return 信号：-level 1、-code = return 自身的码；
+                    // 带 -errorcode 载荷时键序 errorcode 在前（tclsh
+                    // ec2 实证 `-errorcode {A B} -code 0 -level 1`），
+                    // 无载荷且码为 error 补 `-errorcode NONE`。
+                    let rc = match &e {
+                        Error::ControlFlow { level, .. } => *level as i64,
+                        _ => 0,
+                    };
+                    match &e {
+                        Error::ControlFlow { error_code: Some(c), .. } => Value::from_str(
+                            &format!("-errorcode {} -code {} -level 1",
+                                     crate::value::tcl_quote(c), rc),
+                        ),
+                        _ if rc == 1 => {
+                            Value::from_str("-code 1 -level 1 -errorcode NONE")
+                        }
+                        _ => return_options_dict(rc, 1),
+                    }
                 } else {
-                    return_options_dict(code, level)
+                    // break/continue：-level 0（tclsh `catch {break}` →
+                    // -code 3 -level 0——原 return/非 return 的 0/1 倒置）。
+                    return_options_dict(code, 0)
                 };
                 interp.set_var(ov, opts)?;
             }
@@ -1007,6 +1033,67 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 finally_script = Some(args[i + 1].as_str());
                 i += 2;
+            }
+            "trap" => {
+                // trap pattern varList script——errorCode 按空格分词逐段
+                // glob 比对（error-deep 探针：try trap {ARITH DIVZERO *}
+                // 曾落 _ 臂被拒，而报错文本自称 trap 合法）。
+                if i + 3 >= args.len() {
+                    return Err(Error::wrong_args_msg(
+                        "wrong # args to trap clause: must be \"... trap pattern variableList script\"",
+                    ));
+                }
+                let pattern = args[i + 1].as_str();
+                let var_list = args[i + 2].as_str();
+                let handler_body = args[i + 3].as_str();
+                if handler_result.is_none() && exit_code == 1 {
+                    // errorCode 取自**错误对象**（try 体错误未落
+                    // ::errorCode 变量——catch 才消费 err_code_raised；
+                    // tcl_error_code 已按列表语义渲染）。
+                    let tec = match &body_result {
+                        Err(e) => e.tcl_error_code(),
+                        _ => String::new(),
+                    };
+                    let pats: Vec<&str> = pattern.split_whitespace().collect();
+                    // tec 是列表渲染串（"ARITH DIVZERO {divide by zero}"）
+                    // ——按列表解析取元素，失败退整串单元素。
+                    let tec_list: Vec<String> = crate::value::parse_dict_full(&tec)
+                        .map(|vs| vs.iter().map(|v| v.as_str().to_string()).collect())
+                        .unwrap_or_else(|_| vec![tec.clone()]);
+                    let matched = pats.len() == tec_list.len()
+                        && pats
+                            .iter()
+                            .zip(&tec_list)
+                            .all(|(p, w)| super::super::util::glob_match(p, w));
+                    if matched {
+                        let vars: Vec<&str> = var_list.split_whitespace().collect();
+                        if let Some(msg_var) = vars.first() {
+                            if !msg_var.is_empty() {
+                                interp.set_var(msg_var, Value::from_str(&result_value))?;
+                            }
+                        }
+                        if let Some(opts_var) = vars.get(1) {
+                            if !opts_var.is_empty() {
+                                let accumulated = interp
+                                    .get_var("::errorInfo")
+                                    .map(|v| v.as_str().to_string())
+                                    .unwrap_or_default();
+                                if let Err(e) = &body_result {
+                                    let opts = error_options_dict(
+                                        exit_code as i64,
+                                        0,
+                                        e,
+                                        body,
+                                        &accumulated,
+                                    );
+                                    interp.set_var(opts_var, opts)?;
+                                }
+                            }
+                        }
+                        handler_result = Some(interp.eval(handler_body));
+                    }
+                }
+                i += 4;
             }
             _ => {
                 return Err(Error::runtime(

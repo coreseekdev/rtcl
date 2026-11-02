@@ -2412,3 +2412,21 @@ rtcl-vm 809、towasm 6/6、深水 16/17、nr 11/11、bare 10ms 持平。
 
 门禁：judge 88/88×2、battery 33/33、probes 18/18、fuzz 500×2 引擎
 0 分歧、rtcl-vm 809、towasm 6/6、深水 17/17、本机差分 14/14。
+
+## dict/error 域深水修复（1b80c20，2026-11-03，并行会话协作期）
+
+dict-deep 15/20、error-deep 13/20、matching-deep 13/22、variables-deep
+17/17。修复清单见提交（catch options 语义族/exit 穿透/throw tclsh 化/
+dict 前缀缩写族/\\u 校验）。
+
+**并行会话协作注意**：工作树出现共享在途编辑（defer_flow_frame/
+eval/vm_exec/channel——io 域）。gen_join/gen_ioCmd/gen_split/b12 四例
+门禁回归经干净 HEAD A/B 定性**归属并行在途编辑**（join 错误对象在
+fresh interp 下已非 WrongNumArgs——与 catch 域改动无因果），移交该
+会话。多会话同树协作纪律：提交前 A/B 干净 HEAD、按文件归属切分。
+
+剩余 OPEN（记 DIVERGENCES.md）：dict info（hash internals 不可复现）/
+dict getdef（rtcl 多出的 8.7 特性）/errorstack+errorline+options 键序
+（catch {error boom} vs catch {nosuchcmd} 两种键序）/try 体 errorInfo
+帧/正则惰性量词组语义（Henry Spencer 最短整体匹配——(a+?)(a*) →
+"a a {}"）/lookahead 的 crate→bt 回退缺口/\\u 外转义文本。

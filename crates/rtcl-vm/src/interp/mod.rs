@@ -1389,10 +1389,21 @@ mod tests {
     }
 
     #[test]
-    fn test_stdlib_throw_ok() {
+    fn test_stdlib_throw_list_errorcode() {
+        // dict-deep：throw {E C} msg —— code 是列表形 errorCode。
         let mut interp = Interp::new();
-        let result = interp.eval("throw ok hello").unwrap();
-        assert_eq!(result.as_str(), "hello");
+        let r = interp
+            .eval("catch {throw {E C} msg} m; list $m $::errorCode")
+            .unwrap();
+        assert_eq!(r.as_str(), "msg {E C}");
+    }
+
+    #[test]
+    fn test_stdlib_throw_ok() {
+        // tclsh 8.6 throw 语义：code 是 errorCode（任意串），一律报错。
+        let mut interp = Interp::new();
+        let code = interp.eval("catch {throw ok hello} m; list $m $::errorCode").unwrap();
+        assert_eq!(code.as_str(), "hello ok");
     }
 
     #[test]

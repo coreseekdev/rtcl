@@ -2393,3 +2393,22 @@ variable 链/delete/which/ts 桥），specs/variables-deep.probes 17 探针
 ### 门禁
 judge 88/88×2、battery 33/33、probes 18/18、fuzz 500×2 引擎 0 分歧、
 rtcl-vm 809、towasm 6/6、深水 16/17、nr 11/11、bare 10ms 持平。
+
+## D-2 关闭（d72465c，2026-11-03）
+
+体中自删的帧视图语义：oracle sd1-sd3 探全后修复两处——
+- get_var/var_exists **限定名死父 ns 守卫**：限定读 → can't read:
+  no such variable、exists → 0（体内体外一致；裸名 keep-alive 链接
+  不受影响）。教训：守卫的父键须先剥前导 ::（根 ns 下 canonical 原样
+  返回 '::d::x'，直接 rsplit 拼 '::::d'——gen_namespace-46.3/深水
+  3 探针回归拦截）
+- ns_eval **退出清扫**：死者前缀的 globals/array_globals 残留随体
+  消亡（post-delete 写入 + keep-alive；体中重建该 ns 则跳过）
+
+意外收货：工作树出现三份新深水探针（dict/error/matching-deep，
+21+21+23 行，同格式）——随 D-2 提交入库并跑差分，挖出三个新语义域
+的真分歧（dict incr 非整数、catch options 保真、正则惰性量词等，
+见 DIVERGENCES.md 后续）。
+
+门禁：judge 88/88×2、battery 33/33、probes 18/18、fuzz 500×2 引擎
+0 分歧、rtcl-vm 809、towasm 6/6、深水 17/17、本机差分 14/14。

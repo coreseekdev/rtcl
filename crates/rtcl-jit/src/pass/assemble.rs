@@ -617,11 +617,9 @@ fn fast_gate(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
 
 fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
     use crate::ir::Instr;
-    // 顶层 slot 单元（C4）：fast tier 的槽模型 + 既有 flush/resync
-    // 纪律（emit_slot_flush 前置 + 分派后无条件 dirty→resync）天然
-    // 覆盖全局别名——顶层变量经 flush 落全局、resync 拉回 ✓。C4 时段
-    // 未覆盖的语义（foreach 已在门内 ✓、dispatch 边界 flush 已有 ✓）
-    // 由全门禁矩阵背书。
+    // 顶层 slot 单元（C4）暂缓：分派中 lmap/continue 的体作用域在
+    // fast tier 下与解释器分歧（preexist_wasmi_f000137：rtcl 报
+    // can't read n / fast 静默 rc=0）。恢复拒绝至该语义面解决。
     let np = match code.params_aligned {
         Some(np) => np,
         None => {

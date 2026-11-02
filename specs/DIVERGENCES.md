@@ -1,7 +1,10 @@
 # rtcl ↔ tclsh 8.6.17 已知分歧清单
 
 > 格式：行为声明 | Tcl 8.6 行为 | rtcl 行为 | 复现 | 严重度。
-> 修复后标 `[FIXED YYYY-MM-DD]`。复核日期：**2026-10-07**（实测逐字节比对）。
+> 修复后标 `[FIXED YYYY-MM-DD]`。最近盘点：**2026-11-03 深水区全量建模**
+> （error-deep / dict / matching / io 四份新 allium 规格 + 四套深水探针
+> 差分实证）。条目后括注对应规格的 spec-local 标签（规格文件内的
+> [D-x] 注释是 spec-local 编号，以本台账为准）。
 
 ## OPEN
 
@@ -9,49 +12,297 @@
 - **行为**：`interp alias {} myalias {} puts` —— 用空字符串占位源/目标
   解释器创建别名。
 - **Tcl 8.6**：接受，创建 `myalias` → `puts` 的别名。
-- **rtcl**：`wrong # args: should be "interp interp"`（interp 命令的
-  alias 子命令未实现空解释器参数形式）。
+- **rtcl**：`wrong # args: should be "interp interp"`。
 - **复现**：`interp alias {} myalias {} puts`
-- **严重度**：低（`interp alias <ns> ...` 带名形式已支持；空形式罕见）。
+- **严重度**：低。
+
+### 异常面（error-deep.allium + specs/error-deep.probes）
+
+### D-3 catch options 字典缺 `-errorline` / `-errorstack`（spec [D-2]）
+- **Tcl 8.6**：error 完成的 options 字典 6 键齐全（含 -errorstack 的
+  `INNER {invokeStk1 ...}` 栈项与 -errorline 行号）。
+- **rtcl**：仅 4 键（-code -level -errorcode -errorinfo）。
+- **复现**：`catch {error boom} m o; puts [dict keys $o]`
+- **严重度**：中。
+
+### D-4 非 error 完成的 options 字典 -code/-level 未按 proc 边界解码（spec [D-3]）
+- **Tcl 8.6**：catch {f}（f 内 `return hi`）→ `-code 0 -level 1`；
+  catch {break} → `-code 3 -level 0`；catch {return -code error boom}
+  → `-code 1 -level 1 -errorcode NONE`。
+- **rtcl**：分别 `-code 2 -level 0`、`-level 1`、`-code 2 -level 0`
+  （透传未解码完成码）。
+- **复现**：`proc f {} {return hi}; catch {f} v o; puts $o`
+- **严重度**：中。
+
+### D-5 `return -level N` 层级丢失（spec [D-4]/[D-5]）
+- **Tcl 8.6**：① `return -code N`（N>4 整数）catch 报 2，原始 N 落
+  options（-code 7 -level 1）；② 值形式 `return -level 2 v` 越两层，
+  catch 得 `-code 0 -level 2`；③ `return -level 2 -code error` 在 N 层
+  之上物化（errorInfo 只含 f1 帧）。
+- **rtcl**：① catch 直通报 7；② `-code 2 -level 0`；③ 在第一层 proc
+  边界提前物化（多出 f2/(procedure f1) 帧）。
+- **复现**：`proc f2 {} {return -level 2 -code error deep}; proc f1 {} {f2}; catch f1 m; puts $::errorInfo`
+- **严重度**：中。
+
+### D-6 `return -errorcode` 污染 ::errorCode（spec [D-6]）
+- **Tcl 8.6**：`return -errorcode {A B} v`（code ok）不写 ::errorCode。
+- **rtcl**：写全局 ::errorCode 并置 raised 位，下一个错误的码被污染
+  （后续 `expr 1/0` 的 errorCode 变 A B）。
+- **复现**：`proc p {} {return -errorcode {A B} v}; catch p; catch {expr 1/0}; puts $errorCode`
+- **严重度**：中。
+
+### D-7 `exit` 可被 catch（spec [D-7]）
+- **Tcl 8.6**：`catch {exit 3}` 直接退出进程 rc=3，后续代码不执行。
+- **rtcl**：exit 是普通可捕获完成，打印 after，rc=0。
+- **复现**：`catch {exit 3} m; puts after`
+- **严重度**：高。
+
+### D-8 `throw` 非 TIP 388 语义（spec [D-8]）
+- **Tcl 8.6**：`throw errorCode message`（`throw {E C} msg` → msg / E C）。
+- **rtcl**：jimtcl 风格 `throw code ?msg?`（stdlib.tcl proc），
+  `throw {E C} msg` 报 bad completion code。
+- **复现**：`catch {throw {E C} msg} m; puts "$m|$::errorCode"`
+- **严重度**：中。
+
+### D-9 `try` 无 `trap` handler（spec [D-9]）
+- **Tcl 8.6**：`try {...} trap {ARITH DIVZERO *} {m} {...}` 按 errorCode
+  前缀匹配。
+- **rtcl**：`bad handler type "trap"`。
+- **复现**：`try {expr 1/0} trap {ARITH DIVZERO *} {m} {puts $m}`
+- **严重度**：高（8.6 核心语法缺失）。
+
+### D-10 try body 错误缺 `("try" body line N)` errorInfo 帧（spec [D-10]）
+- **Tcl 8.6**：errorInfo 含 `("try" body line 1)` 出口帧。
+- **rtcl**：帧缺失。
+- **复现**：`try {error y} on error {m o} {puts $::errorInfo}`
+- **严重度**：低。
+
+### D-11 文件模式顶层 `return -code error` / `break` 收尾语义
+- **Tcl 8.6**：顶层 `return -code error boom` 打印完整 errorInfo（含
+  `(file ...)` 帧）rc=1；顶层 `break` 打印
+  `invoked "break" outside of a loop` + 帧序列 rc=1。
+- **rtcl**：`return -code error` 静默 rc=0（main.rs 把 is_return 当成功）；
+  `break` 打印裸 `break` rc=1。REPL 侧已对齐（REPL-TCLSH-PARITY.md），
+  仅 -f 文件模式错。
+- **复现**：`printf 'return -code error boom\n' > /tmp/t.tcl; rtcl -f /tmp/t.tcl`
+- **严重度**：中。
+
+### dict 面（dict.allium + specs/dict-deep.probes）
+
+### D-12 `dict get` 无 key 不校验 dict 形（spec [D-11]）
+- **Tcl 8.6**：`dict get {a b c}`（奇数长）报 `missing value to go with key`。
+- **rtcl**：原样返回 "a b c"。
+- **严重度**：低。
+
+### D-13 `dict set a(1) k v` 创建数组元素（spec [D-12]）
+- **Tcl 8.6**：`can't set "a(1)": variable isn't array`。
+- **rtcl**：成功创建元素 a(1)={k v}。
+- **严重度**：低。
+
+### D-14 `dict incr` / `dict lappend` 对坏现值静默重置（spec [D-13]）
+- **Tcl 8.6**：incr 现值非整数 → `expected integer but got "abc"`（dict
+  不变）；lappend 现值坏列表 → `unmatched open brace in list`（dict 不变）。
+- **rtcl**：静默丢弃现值重置（{k 1} / {k z}）。
+- **严重度**：中（静默丢数据）。
+
+### D-15 `dict for` 返回值 / `dict map` break 保留（spec [D-14]）
+- **Tcl 8.6**：dict for 恒返回 ""；dict map break 丢弃已累积，返回空 dict。
+- **rtcl**：for 返回 body 末值；map break 保留已累积。
+- **严重度**：低。
+
+### D-16 `dict update` 变量不存在（spec [D-15]）
+- **Tcl 8.6**：立即报 `can't read "novar": no such variable`。
+- **rtcl**：当空 dict 跑 body，不创建变量不报错。
+- **严重度**：低。
+
+### D-17 dict 子命令面（打包）（spec [D-16]）
+- **Tcl 8.6**：① 唯一前缀分发（`dict cr`/`dict ge` 可用）；② unknown
+  消息 `unknown or ambiguous subcommand "zzz": must be ...`（errorCode
+  `TCL LOOKUP SUBCOMMAND`）；③ `dict info` 多行哈希统计；④ `key not
+  known` 带 `TCL LOOKUP DICT`、`dict for` 变量数错带 `TCL SYNTAX dict
+  for`；⑤ usage 用 dictVarName/.../script 措辞。
+- **rtcl**：仅精确匹配；`unknown dict subcommand: X`；info 一行；相关
+  errorCode 全 NONE；usage dictVariable/.../body。
+- **严重度**：低。
+
+### 匹配 / 格式面（matching.allium + specs/matching-deep.probes）
+
+### D-18 lookbehind：路由缺口泄漏内部错误 + 策略超集（spec [D-17]）
+- **Tcl 8.6**：`(?<=...)` / `(?<!...)` **不是** 8.6 ARE 语法，编译报
+  `couldn't compile regular expression pattern: quantifier operand invalid`。
+- **rtcl**：fast 引擎路由漏检 `(?<=` / `(?<!`，Rust regex-crate 的
+  "look-around ... not supported" 解析错误直接泄漏（rc=1）。修路由后 BT
+  引擎会答 0/1——超集行为，严格对齐应在 validate_are 拒绝。
+- **复现**：`puts [regexp {(?<!x)y} xy]`
+- **严重度**：中。
+
+### D-19 模式内 `\uXXXX` / `\x{...}` 被 rtcl 接受（spec [D-18]）
+- **Tcl 8.6**：invalid escape（`\x41` 两位十六进制合法）。
+- **rtcl**：接受并按 Unicode 语义匹配。
+- **严重度**：低（超集）。
+
+### D-20 惰性量词的匹配偏好语义（spec [D-19]）
+- **Tcl 8.6**：`regexp -inline {(a+?)(a*)} aaa` → `{a a {}}`（Spencer
+  引擎偏好：整体匹配停在惰性组最小展开）。
+- **rtcl**：`{aaa a aa}`（回溯引擎首个命中 = Perl 风格）。
+- **严重度**：中（BT 引擎需实现 Tcl 偏好序，非平凡）。
+
+### D-21 `\A` 在 `-lineanchor -start` 下被改写为 `^`（spec [D-20]）
+- **Tcl 8.6**：`\A` 只绑定 -start 偏移。
+- **rtcl**：fast 引擎把 `\A` 改写 `(?m)^`，行首误命中
+  （`regexp -lineanchor -start 1 {\Aa} "b\na"` → 1 vs tclsh 0）。
+- **严重度**：低。
+
+### D-22 `regsub -command` 为 rtcl 独有扩展（spec [D-21]）
+- **Tcl 8.6**：`bad option "-command": must be -all, -nocase, ...`。
+- **rtcl**：支持 -command（替换参数粗暴括引，值含 {} 时可能解析错乱）。
+- **严重度**：低（建议默认拒绝、开关开启）。
+
+### D-23 `string match` 参数面 + `-nocase` 折叠（spec [D-22]）
+- **Tcl 8.6**：① >3 词时首词按选项解析：`string match a b c` →
+  `bad option "a": must be -nocase`；② -nocase 逐字符简单折叠，
+  `string match -nocase İ i` → 1。
+- **rtcl**：① 返回 0；② 整串 Rust to_lowercase（İ 两字符展开）→ 0。
+- **严重度**：低。
+
+### D-24 `format %c` 无 BMP 截断（spec [D-23]）
+- **Tcl 8.6**：%c 按 Tcl_UniChar（16 位）渲染，65536 → U+FFFD。
+- **rtcl**：from_u32 直出星面字符 U+10000。
+- **严重度**：低。
+
+### D-25 clock：本地时区 / %z / scan 全缺（spec [D-24]）
+- **Tcl 8.6**：clock format 按进程本地时区渲染（TZ 生效，%Z/%z 出
+  缩写/偏移）；clock scan 支持 ISO/自由格式；clock add 存在。
+- **rtcl**：恒 UTC、无视 TZ；%z 未实现；scan 仅接受整数 epoch（错误
+  消息自造）；无 clock add；-gmt 布尔解析窄。
+- **复现**：`puts [clock format 0]; puts [clock scan 2000-01-01]`
+- **严重度**：高（时间类脚本系统性偏差；judge 语料因确定性要求未覆盖
+  clock，属盲区）。
+
+### D-26 glob：Rust glob crate 语义 + 排序（spec matching [D-25]）
+- **Tcl 8.6**：`**` 只是两个 `*`（无递归）、`{a,b}` 非交替、前导点不
+  被 `*` 匹配；返回顺序为目录读序（不排序）；`-tails` 存在。
+- **rtcl**：`**` 递归、`{a,b}` 交替、匹配前导点、结果字典序排序、
+  `-tails` 缺失（io-deep 探针实证 `**` 与 `.hid` 两例）。
+- **复现**：`glob -nocomplain /tmp/rt_gt/**`（含子目录时递归）
+- **严重度**：中。
+
+### D-27 string 族：码点语义 vs tclsh 8.6 码元（UCS-2）语义【策略级】
+- **Tcl 8.6**：string index/length/range 按内部 UTF-16 码元：
+  `string length "a𐀀c"` = 4；index 1 返回孤立代理项。
+- **rtcl**：按 Unicode 码点（= Tcl 8.7/9 语义）：length = 3，index 返回 𐀀。
+- **复现**：`puts [string length "a𐀀c"]`
+- **严重度**：策略分歧——rtcl 选择了 8.7/9 方向（更正确），但对 8.6
+  语料系统性偏差（judge 语料未含星面字符，属盲区）。需拍板：保持码点
+  （推荐，文档声明）或加 8.6 兼容模式。
+
+### IO / chan / file / encoding 面（io.allium + specs/io-deep.probes）
+
+### D-28 r+ 通道读写交错位置错乱（数据损坏级）
+- **Tcl 8.6**：r+ 通道单一共享位置：`puts AAAA; seek 0; read 2; puts B`
+  得 "AAB"（原地覆写）。
+- **rtcl**：得 "AAAA\nB"——FileChannel::ReadWrite 读用 BufReader
+  （预读使 fd 位置超前）、写直接 get_mut().write，读后写落到错误偏移
+  （channel.rs:460-524）。
+- **复现**：io-deep.probes 第 7 行。
+- **严重度**：**高**（数据损坏类；tclsh 位置语义是文档行为）。
+
+### D-29 `encoding` 命令整体缺失 + `-encoding` 不校验不使用（spec io [D-30]）
+- **Tcl 8.6**：`encoding convertfrom/convertto/names/system` 齐备
+  （names 90+）；`fconfigure -encoding bogus` 报 `unknown encoding "bogus"`。
+- **rtcl**：encoding 命令不存在（`invalid command name "encoding"`）；
+  fconfigure -encoding 任意字符串静默存取（查询回显 bogus）；无任何
+  转码实现；非 UTF-8 输入 read/gets 直接 io 错误。
+- **严重度**：高。
+
+### D-30 `read chan N` 按字节计数 + `read chan 0` 置 eof（spec io [D-31]）
+- **Tcl 8.6**：N 是**字符数**（"héllo" read 3 → 3 字符）；read 0 不置 eof。
+- **rtcl**：N 按字节分配 buffer + from_utf8_lossy（→ 2 字符）；read 0
+  把 at_eof 置位（后续 eof=1）。
+- **严重度**：中。
+
+### D-31 `-c` 模式 `exit N` 退出码错误（spec io [D-32]）
+- **tclsh**：`tclsh -c 'exit 7'` rc=7 无输出。
+- **rtcl**：打印 `Error: exit with value: 7` 且 rc=1（main.rs:111-122 未
+  特判 Exit 完成码；-f 文件模式 rc=N 正确，REPL 已对齐）。
+- **严重度**：中。
+
+### D-32 `vwait` 空队列报错而非阻塞（spec io [D-33]）
+- **tclsh**：vwait 永久阻塞（有事件循环）。
+- **rtcl**：`can't wait for variable "zz": would wait forever` rc=1
+  （无后台事件循环的设计后果；after 脚本仅 update/vwait 时执行）。
+- **严重度**：中（设计分歧，需文档声明或实现事件循环）。
+
+### D-33 file 族面（打包）（spec io [D-34]）
+- **Tcl 8.6**：① `file mtime name time` 设置并返回新值；② file stat 13
+  键（含 blksize blocks ctime）；③ `error copying "src" to "dst": file
+  already exists`；④ `file dirname /` = "/"；⑤ owned 按 uid 比较。
+- **rtcl**：① setter 静默忽略；② 10 键缺 blksize/blocks/ctime；③
+  `error copying "src": target exists`；④ dirname / = "."；⑤ owned 近似
+  （metadata 可读即 1）；⑥ copy/rename 不支持多源。
+- **严重度**：低-中。
+
+### D-34 IO 错误/解析消息面（打包）（spec io [D-35]）
+- **Tcl 8.6**：① open 失败 `no such file or directory`（小写、无
+  os-error 尾）；② access 支持 POSIX flag-list `{RDONLY}`；③
+  `seek stdin 0` → `invalid seek`；④ fileevent 校验通道方向
+  （`channel is not readable`）。
+- **rtcl**：① Rust io::Error 原文 `No such file or directory (os error 2)`；
+  ② flag-list 报 `bad access mode "RDONLY"`；③ `stdin is not seekable`；
+  ④ fileevent 是 tailcall 假命令（把句柄当命令调 → `invalid command
+  name "stdout"`）；⑤ `puts stderr -nonewline msg` 4 参静默接受
+  （tclsh wrong # args）；⑥ source 不支持 -encoding、不更新 info
+  script、错误帧标主文件名；⑦ open 管道句柄 `file<pid>` 命名易撞名。
+- **严重度**：低（消息面/边缘面）。
+
+## rtcl 有意扩展（超集，非 bug，parity 语料不应使用）
+
+- `dict create -ordered/-unordered`、`dict getdef`/`getwithdefault`、
+  `regsub -command`（D-22）、readdir 命令。
+- BT 正则引擎支持 lookbehind（tclsh 8.6 不支持，见 D-18 策略项）、
+  `\uXXXX`/`\x{...}` 模式转义（D-19）。
+- string 族码点语义（D-27，8.7/9 方向）。
 
 ## 非分歧（tclsh 侧上下文失败，rtcl 严格对齐）
 
 ### gen_namespace-old 2.3 / 6.10 / 6.13 / 6.16 / 6.19（5 例）
-- **现象**：tclsh 8.6.17 独立运行语料时自身 FAIL；rtcl 逐字节复现相同
-  失败输出（全文件 diff 为空）。
-- **根因**：提取器未包含前序 case 的跨 case setup——6.12 重定义
-  `trigger` 并创建 `test_ns_cache1::test_ns_cache_var`（6.13/6.16/6.19
-  依赖）；2.3 依赖被跳过的 `test_ns_simple::test_ns_x/y` setup。官方
-  套件带 harness 运行亦有 3 例 FAIL（8.6.17 自身状态）。
-- **结论**：rtcl 与 tclsh 严格对齐（含失败行为）；非 rtcl 缺陷。
-  若追求语料自洽，可在 extract.py 补跨 case setup 提取（协议变更，
-  需谨慎）。
+- tclsh 8.6.17 独立运行语料自身 FAIL（提取器未含跨 case setup）；
+  rtcl 逐字节复现相同失败输出。非 rtcl 缺陷。
 
 ## FIXED
 
+### [FIXED 2026-11-03] D-2 ns eval 体中自删后的 set 复活 ns 变量表
+- 体中自删后限定查询守卫 + ns_eval 退出清扫（commit d72465c）。
+- variables-deep.probes 17/17 SAME 复核通过（2026-11-03）。
+
+### [FIXED 2026-11-03（1dd2d81，工作区→已提交）] variables 深水区 3 例
+- DIFF-6 `upvar 0 ::a(e) x` 元素写丢失；DIFF-7 `upvar 0 ::d::v`（ns 已删）
+  静默建链；DIFF-8 ns eval 体 flat alias 泄漏外层帧。
+
 ### [FIXED 2026-10-07] 整数溢出 f64 提升（vs Tcl bignum）
-- 原残留：整数溢出提升为 f64；现与 Tcl 一致提升为**精确 BigInt**
-  （`numeric_binop` 的 wide 臂 + 立即数路径的 i63 范围守卫宽化）。
-- 验证：`bench/scripts/` 的数值探针 + gen_expr expr-23.5x 大数幂
-  用例逐字节一致。
+- 现与 Tcl 一致提升为精确 BigInt。
 
 ### [FIXED 2026-10-07] gen_namespace-old 的 5 个 case 级失败
-- 原状态（2026-10-03）：namespace/lsort/variable/proc 边缘组合 5 例。
-- 现状态：**逐字节一致**（2026-10-07 实测 diff 为空；HANDOFF §3 的
-  5-case 计数已过时，judge case 级 4072/4072）。
+- 逐字节一致（judge case 级 4072/4072）。
 
-### D-2 ns eval 体中自删后的 set 复活 ns 变量表（2026-11-03，深水探针）[FIXED 2026-11-03]
-- **行为**：`namespace eval d { namespace delete [namespace current]; set y 3 }`
-  ——体中自删后继续跑的体的 set 落**已删 ns 的帧视图**（随体消亡）。
-- **Tcl 8.6**：`info exists d::y` → 0（变量随 ns 销毁，set 只在帧视图）。
-- **rtcl**：`info exists d::y` → 1（set 复活了 d 的变量表条目）。
-- **复现**：specs/variables-deep.probes 第 12 行；variables.allium
-  SelfDeleteBodyKeepsRunning。
-- **严重度**：低（自删后继续用体的形状罕见；体语义其余部分——
-  current 保持、读已删变量 keep-alive——一致）。
-- **修复**（oracle sd1-sd3 探全后）：①get_var/var_exists 限定名死父
-  ns 守卫（限定读 → can't read: no such variable、exists → 0——体内
-  体外一致；keep-alive 裸名链接不受影响）②ns_eval 退出清扫死者前缀
-  的 globals/array_globals 残留（体帧视图随体消亡；体中重建该 ns 则
-  跳过）。守卫的父键须先剥前导 ::（根 ns 下 canonical 原样返回
-  '::d::x'，直接 rsplit 拼 '::::d'——gen_namespace-46.3 回归实证）。
+## 2026-11-03 深水区复核确认一致的高风险面（正向保证）
+
+- errorInfo 帧格式族（proc 链 / namespace eval / uplevel / foreach /
+  lmap / 命令替换 / `(file ...)` 顶层）逐字节一致；catch-rethrow 链、
+  `error ... info` 替换+帧抑制、errorCode 派生与持久化、wrong # args
+  消息（builtin+proc）一致。
+- try 的 finally 顺序/出错覆盖、handler 变量作用域、on 空变量表、
+  无匹配重抛一致。
+- dict：COW 无别名错误（嵌套取出/共享值/alias 三例）；update/with 写回
+  与 break/continue/return 语义；解析错误消息逐字一致。
+- regexp：BT 引擎后向引用/环视/非贪婪基本机制、`\y \m \M \A \z`、
+  `-all -inline -indices` 组合、`***=` 字面、regsub `& \0 \1 \\` 展开；
+  fast/BT 路由对后向引用与前瞻正确。
+- binary：t/n/m 大端正确（早前嫌疑为误报）、a/A/b/B/h/H 填充矩阵、
+  scan 短输入变量不动、format/scan 校验器。
+- trace：变量 trace read/write/unset/array 四操作语义。
+- list 深角（lindex 多层/lset/linsert 负界/lreplace 越界/lsort -unique
+  -integer/split/join/concat）与 string 深角（map 空值/空键、trim、
+  first 负索引、totitle、reverse）全部一致。
+- io：gets EOF 三元组（-1/置空/eof 时序）、seek 越界+tell+read、
+  fconfigure 未知选项消息、gets 后 seek current 位置。

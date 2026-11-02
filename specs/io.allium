@@ -1,0 +1,190 @@
+-- allium: 3
+-- io.allium
+-- Behaviour spec: channels, IO, file, encoding — open/puts/gets/read/
+-- seek/eof/close/fconfigure/chan/file/glob/source, CLI exit semantics.
+-- Oracle: tclsh 8.6.17. 2026-11-03 deep-water round.
+-- rtcl divergences from this spec are tracked in DIVERGENCES.md
+-- (D-29 … D-35; glob also D-27).
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── gets / read / eof ─────────────────────────────────────────────
+
+rule GetsAtEofReturnsMinusOneAndEmptiesVar {
+    -- gets at EOF returns -1 and (with varName) sets the variable to
+    -- ""; eof is 1 only after the read that hit EOF.
+    when: Evaluates("list $n $v $e1 $n2 $e2 [info exists v]")
+    -- after: set f [open F w]; puts $f hello; close $f;
+    --        set f [open F r]; set n [gets $f v]; set e1 [eof $f];
+    --        set n2 [gets $f v]; set e2 [eof $f]
+    ensures: completion.code = ok
+    ensures: completion.value = "5 hello 0 -1 1 1"
+}
+
+rule ReadCountIsCharactersNotBytes {
+    -- read chan N reads N characters through the channel encoding, not
+    -- N bytes.
+    when: Evaluates("string length [read $f 3]")
+    -- after: file contains "héllo" (6 bytes UTF-8)
+    ensures: completion.code = ok
+    ensures: completion.value = "3"
+    -- rtcl: 2 (reads 3 bytes = "hé")  [D-31]
+}
+
+rule ReadZeroDoesNotSetEof {
+    when: Evaluates("eof $f")
+    -- after: read $f 0 on a channel with data remaining
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- rtcl: 1 (read 0 marks at_eof)  [D-31]
+}
+
+rule ReadWriteFileInterleavesAtOnePosition {
+    -- An r+ channel has ONE shared position: after reading 2 chars the
+    -- next write overwrites in place ("AAB"), not appends.
+    when: Evaluates("[read $f]")
+    -- after: open w+; puts AAAA; seek 0; read 2; puts B; close; read back
+    ensures: completion.code = ok
+    ensures: completion.value = "AAB"
+    -- rtcl: "AAAA\nB" — BufReader prefetch desyncs the write offset
+    -- (data-corruption class)  [D-29]
+}
+
+rule SeekOnNonseekableChannelMessage {
+    when: Evaluates("catch {seek stdin 0} m; set m")
+    ensures: completion.code = ok
+    -- oracle: error during seek on "stdin": invalid seek
+    -- rtcl: ... : stdin is not seekable  [D-35]
+}
+
+-- ── open / access ─────────────────────────────────────────────────
+
+rule OpenMissingFileMessage {
+    when: Evaluates("catch {open /tmp/rt_absent_zz r} m; set m")
+    ensures: completion.code = ok
+    -- oracle: couldn't open "/tmp/rt_absent_zz": no such file or directory
+    -- rtcl: ...: No such file or directory (os error 2)
+    -- (Rust io::Error Display leaks; tclsh is lowercase, no os-error tail)  [D-35]
+}
+
+rule OpenAcceptsPosixFlagList {
+    -- The access argument may be a POSIX flag list like {RDONLY}.
+    when: Evaluates("catch {open /tmp/rt_absent_zz {RDONLY}} m; set m")
+    ensures: completion.code = ok
+    -- oracle: couldn't open "/tmp/rt_absent_zz": no such file or directory
+    --   (access parsed OK, file simply missing)
+    -- rtcl: bad access mode "RDONLY"  [D-35]
+}
+
+-- ── puts ──────────────────────────────────────────────────────────
+
+rule PutsRejectsFlagAfterChannel {
+    -- puts -nonewline stderr msg (flag after the channel) is a
+    -- wrong-#-args error.
+    when: Evaluates("puts stderr -nonewline hi")
+    ensures: completion.code = error
+    -- oracle: wrong # args: should be "puts ?-nonewline? ?channelId? string"
+    -- rtcl: prints "hi\n" (4-arg form silently accepted)  [D-35]
+}
+
+-- ── fconfigure / encoding ─────────────────────────────────────────
+
+rule FconfigureEncodingMustBeKnown {
+    when: Evaluates("catch {fconfigure stdout -encoding bogus} m; set m")
+    ensures: completion.code = ok
+    -- oracle: unknown encoding "bogus"
+    -- rtcl: silently accepts and stores (query echoes "bogus")  [D-30]
+}
+
+rule EncodingCommandExists {
+    -- The encoding command exists with convertfrom/convertto/names/system.
+    when: Evaluates("llength [encoding names]")
+    ensures: completion.code = ok
+    -- oracle: 90+ encodings
+    -- rtcl: invalid command name "encoding" — command entirely missing,
+    --   fconfigure -encoding is stored but never used for transcoding  [D-30]
+}
+
+-- ── file ──────────────────────────────────────────────────────────
+
+rule FileMtimeSetterSets {
+    -- file mtime name time sets the mtime and returns it.
+    when: Evaluates("file mtime F 1000    -- then: file mtime F")
+    ensures: completion.code = ok
+    ensures: completion.value = "1000"
+    -- rtcl: setter silently ignored (returns current time)  [D-34]
+}
+
+rule FileStatFieldSet {
+    -- file stat fills atime blksize blocks ctime dev gid ino mode mtime
+    -- nlink size type uid.
+    when: Evaluates("lsort [array names a]")
+    -- after: file stat F a
+    ensures: completion.code = ok
+    -- oracle: 13 keys incl. blksize blocks ctime
+    -- rtcl: 10 keys — missing blksize blocks ctime  [D-34]
+}
+
+rule FileCopyExistsMessage {
+    when: Evaluates("catch {file copy SRC DST} m; set m    -- DST exists")
+    ensures: completion.code = ok
+    -- oracle: error copying "SRC" to "DST": file already exists
+    -- rtcl: error copying "SRC": target exists  [D-34]
+}
+
+rule FileDirnameOfRoot {
+    when: Evaluates("file dirname /")
+    ensures: completion.code = ok
+    ensures: completion.value = "/"
+    -- rtcl: "."  [D-34]
+}
+
+-- ── glob ──────────────────────────────────────────────────────────
+
+rule GlobStarDoesNotMatchLeadingDot {
+    when: Evaluates("glob -nocomplain -directory D *    -- D contains .hid")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- rtcl: matches .hid (glob crate require_literal_leading_dot=false)  [D-27]
+}
+
+rule GlobStarStarIsNotRecursive {
+    -- ** in tclsh is two *s: no directory recursion.
+    when: Evaluates("glob -nocomplain /tmp/rt_gt/**    -- with /tmp/rt_gt/a/b dir")
+    ensures: completion.code = ok
+    -- oracle: matches /tmp/rt_gt/a only
+    -- rtcl: recurses into a and b  [D-27]
+}
+
+-- ── fileevent / vwait ─────────────────────────────────────────────
+
+rule FileeventValidatesChannelDirection {
+    when: Evaluates("catch {fileevent stdout readable {}} m; set m")
+    ensures: completion.code = ok
+    -- oracle: channel is not readable
+    -- rtcl: invalid command name "stdout" (fileevent is a tailcall stub
+    --   that treats the handle as a command)  [D-35]
+}
+
+rule VwaitBlocksUntilVariableSet {
+    -- vwait waits indefinitely for the variable; an empty event queue
+    -- blocks rather than erroring.
+    when: Evaluates("vwait zz    -- zz never set, empty queue")
+    ensures: completion.code = ok
+    -- oracle: blocks forever
+    -- rtcl: error can't wait for variable "zz": would wait forever  [D-33]
+}
+
+-- ── CLI exit semantics ────────────────────────────────────────────
+
+rule CommandModeExitPropagatesCode {
+    -- rtcl -c 'exit N' must exit with status N like tclsh.
+    when: Evaluates("exit 7    -- in -c mode")
+    ensures: completion.code = ok
+    -- oracle (tclsh): no output, process rc=7
+    -- rtcl: "Error: exit with value: 7" on stderr, rc=1  [D-32]
+}

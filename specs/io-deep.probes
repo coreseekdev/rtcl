@@ -1,0 +1,22 @@
+# io/chan/file/encoding 深水探针（io-deep;probe.sh 差分;末式一律 puts）
+puts stdout
+puts stderr -nonewline hi; puts ok
+set f [open /tmp/rt_io1 w]; puts $f hello; close $f; set f [open /tmp/rt_io1 r]; set n [gets $f v]; set e1 [eof $f]; set n2 [gets $f v]; set e2 [eof $f]; puts [list $n $v $e1 $n2 $e2 [info exists v]]
+set f [open /tmp/rt_io2 w]; puts -nonewline $f "héllo"; close $f; set f [open /tmp/rt_io2 r]; puts [string length [read $f 3]]
+set f [open /tmp/rt_io3 w]; puts $f abc; close $f; set f [open /tmp/rt_io3 r]; read $f 0; puts [eof $f]
+catch {open /tmp/rt_absent_zz r} m; puts $m
+set f [open /tmp/rt_io4 w+]; puts $f AAAA; seek $f 0; set c [read $f 2]; puts $f B; close $f; set f [open /tmp/rt_io4 r]; puts [read $f]
+set f [open /tmp/rt_io5 w]; puts $f 0123456789; close $f; set f [open /tmp/rt_io5 r]; seek $f 100; puts [list [tell $f] [read $f] [eof $f]]
+catch {seek stdin 0} m; puts $m
+catch {fconfigure stdout -foo} m; puts $m
+catch {fconfigure stdout -encoding bogus} m; puts [fconfigure stdout -encoding]
+catch {encoding names} m; puts $m
+file mkdir /tmp/rt_gt/a/b; close [open /tmp/rt_gt/a/f2 w]; puts [lsort [glob -nocomplain /tmp/rt_gt/**]]
+file mkdir /tmp/rt_gt2; close [open /tmp/rt_gt2/.hid w]; puts [glob -nocomplain -directory /tmp/rt_gt2 *]
+close [open /tmp/rt_c1 w]; close [open /tmp/rt_c2 w]; catch {file copy /tmp/rt_c1 /tmp/rt_c2} m; puts $m
+close [open /tmp/rt_m w]; file mtime /tmp/rt_m 1000; puts [file mtime /tmp/rt_m]
+puts [list [file dirname /] [file tail /] [file rootname x.txt]]
+catch {fileevent stdout readable {}} m; puts $m
+close [open /tmp/rt_s w]; file stat /tmp/rt_s a; puts [lsort [array names a]]
+set f [open /tmp/rt_io6 w]; puts $f x; close $f; set f [open /tmp/rt_io6 r]; gets $f; seek $f 0 current; puts [tell $f]
+catch {open /tmp/rt_io7 {RDONLY}} m; puts $m

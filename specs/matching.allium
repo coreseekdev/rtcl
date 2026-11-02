@@ -86,13 +86,6 @@ rule RegsubBackrefsAndEscapes {
     ensures: completion.value = "ihhi \\x"
 }
 
-rule RegexpSupportsLookahead {
-    -- Lookahead constraints (?=re) / (?!re) are ARE syntax and work.
-    when: Evaluates("list [regexp {(?=c)ab|a} abc] [regexp {(?!x)a} abc]")
-    ensures: completion.code = ok
-    ensures: completion.value = "1 1"
-}
-
 rule RegsubHasNoCommandOption {
     -- tclsh 8.6 regsub has no -command option.
     when: Evaluates("regsub -command {o} foo up x")

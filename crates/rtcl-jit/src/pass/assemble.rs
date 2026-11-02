@@ -617,9 +617,9 @@ fn fast_gate(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
 
 fn fast_gate_inner(l2: &L2, l3: &L3, code: &ByteCode) -> Option<usize> {
     use crate::ir::Instr;
-    // 顶层 slot 单元（C4）暂缓：分派中 lmap/continue 的体作用域在
-    // fast tier 下与解释器分歧（preexist_wasmi_f000137：rtcl 报
-    // can't read n / fast 静默 rc=0）。恢复拒绝至该语义面解决。
+    // 顶层 slot 单元（C4 重开）：foreach/lmap 已在编译侧排除
+    //（eval.rs has_foreach → 非 slot 编译），分派中 lmap/continue 的
+    // 体作用域分歧源已消除。既有 flush/resync 纪律覆盖全局别名。
     let np = match code.params_aligned {
         Some(np) => np,
         None => {

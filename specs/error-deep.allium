@@ -5,7 +5,7 @@
 -- errorInfo frames, errorCode lifecycle.
 -- Oracle: tclsh 8.6.17. 2026-11-03 deep-water round.
 -- Known rtcl divergences from this spec are tracked in DIVERGENCES.md
--- (D-2 … D-8).
+-- (D-3 … D-10；台账为准).
 
 use "./interp.allium" as interp
 
@@ -35,9 +35,9 @@ rule CatchNonErrorOptionsLevel {
     ensures: completion.code = ok
     ensures: completion.value = "-code 0 -level 1"
     -- probe: proc f {} {return hi}; catch {f} v o; puts $o
-    -- rtcl: -code 2 -level 0  [D-3]
+    -- rtcl: -code 2 -level 0  [D-3 FIXED 2026-11-03]
     -- probe: catch {break} v o; puts $o  =>  -code 3 -level 0
-    -- rtcl: -level 1  [D-3]
+    -- rtcl: -level 1  [D-3 FIXED 2026-11-03]
 }
 
 rule CatchReturnCodeErrorViaProcIsError {
@@ -48,7 +48,7 @@ rule CatchReturnCodeErrorViaProcIsError {
     ensures: completion.code = ok
     ensures: completion.value = "2"
     -- oracle $o: -code 1 -level 1 -errorcode NONE
-    -- rtcl: -code 2 -level 0 (undecoded)  [D-3]
+    -- rtcl: -code 2 -level 0 (undecoded)  [D-3 FIXED 2026-11-03]
 }
 
 rule CatchReturnCodeIntegerAbove4 {
@@ -58,7 +58,7 @@ rule CatchReturnCodeIntegerAbove4 {
     ensures: completion.code = ok
     ensures: completion.value = "2"
     -- oracle $o: -code 7 -level 1
-    -- rtcl: catch reports 7 directly  [D-4]
+    -- rtcl: catch reports 7 directly  [D-4 FIXED 2026-11-03]
 }
 
 rule ReturnLevelTwoValueEscapesTwoFrames {
@@ -94,7 +94,7 @@ rule ReturnErrorcodeDoesNotPolluteGlobalErrorCode {
     when: Evaluates("set errorCode    -- after: proc p {} {return -errorcode {A B} v}; catch p; catch {expr 1/0}")
     ensures: completion.code = error
     -- oracle value: ARITH DIVZERO {divide by zero}
-    -- rtcl: A B (return -errorcode wrote ::errorCode even on ok)  [D-6]
+    -- rtcl: A B (return -errorcode wrote ::errorCode even on ok)  [D-6 FIXED 2026-11-03]
     -- probe: proc p {} {return -errorcode {A B} v}; catch p; catch {expr 1/0}; puts $errorCode
 }
 
@@ -106,7 +106,7 @@ rule ExitIsNotCatchable {
     when: Evaluates("catch {exit 3} m; puts after")
     ensures: completion.code = error
     -- oracle: prints nothing, process exit code 3
-    -- rtcl: prints "after", exit code 0 (exit is catchable)  [D-7]
+    -- rtcl: prints "after", exit code 0 (exit is catchable)  [D-7 FIXED 2026-11-03]
 }
 
 rule ThrowIsTip388ErrorCodeMessage {
@@ -116,7 +116,7 @@ rule ThrowIsTip388ErrorCodeMessage {
     ensures: completion.code = ok
     -- oracle value: msg {E C}
     -- rtcl: jimtcl-style throw code ?msg? — errors with
-    --   bad completion code "E C"  [D-8]
+    --   bad completion code "E C"  [D-8 FIXED 2026-11-03]
 }
 
 -- ── try ───────────────────────────────────────────────────────────

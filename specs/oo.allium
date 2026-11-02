@@ -1,0 +1,262 @@
+-- allium: 3
+-- oo.allium
+-- Behaviour spec: TclOO — oo::object / oo::class / oo::define /
+-- oo::objdefine / oo::copy, method resolution (C3), next, filters,
+-- unknown dispatch, info object / info class, object lifecycle and
+-- rename interop.  Oracle: tclsh 8.6.17.  2026-11-03 distillation
+-- round (probes: specs/oo-deep.probes; divergences D-40 … D-43 in
+-- DIVERGENCES.md).
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── object model (verified consistent) ───────────────────────────
+
+rule ObjectsAreCommandsWithOwnNamespace {
+    -- Every object is a command backed by its own ::oo::ObjN namespace,
+    -- for both create and new, whatever the object's name.
+    when: Evaluates("namespace eval n {oo::object create ::abs}; info object namespace ::abs")
+    ensures: completion.code = ok
+    -- oracle: ::oo::ObjN (auto-generated even for absolute names)
+}
+
+rule CreateDuplicateNameErrors {
+    when: Evaluates("catch {oo::object create a} m; set m    -- after: oo::object create a")
+    ensures: completion.code = ok
+    ensures: completion.value = "can't create object \"a\": command already exists with that name"
+}
+
+rule MethodResolutionIsOwnThenObjectMixinsThenClassChain {
+    -- Chain order: the object's own methods, the object's mixins (C3),
+    -- then the class chain (C3) with each chain class's mixins ahead of
+    -- the class.  A class-level mixin beats a superclass.
+}
+
+rule OnlyLowercaseMethodsAreExported {
+    -- Exported method names start with a lowercase letter; the
+    -- unknown-method error lists the exported chain methods plus
+    -- destroy, sorted, `a, b or c` join, with `new` suppressed on
+    -- ::oo::class itself.
+    when: Evaluates("catch {o nosuch} m; set m    -- with an instance of a class exposing one method m")
+    ensures: completion.code = ok
+    -- oracle: unknown method "nosuch": must be destroy or m
+}
+
+rule DefineScriptErrorsCarryDefinitionFrame {
+    -- Errors inside oo::define C { ... } gain an
+    -- (in definition script for class "::C" line N) frame; the
+    -- multi-word form (oo::define C method nm {a} {b}) adds no frame.
+}
+
+-- ── constructor / destructor chains ──────────────────────────────
+
+rule DestructorRunsMostSpecificOnly {
+    -- Destroying an object runs ONLY the most specific destructor; the
+    -- base class's destructor runs only when the derived one calls
+    -- `next`.
+    when: Evaluates("out    -- after: A{dtor prints A}; B{super A, dtor prints B}; [B create o] destroy")
+    ensures: completion.code = ok
+    -- oracle: B E   (A's destructor did NOT run)
+    -- rtcl: runs the whole dtor chain unconditionally (B A E) and runs
+    --   A twice when the derived dtor calls next (B A A E)  [D-40]
+}
+
+rule InheritedConstructorRuns {
+    -- A subclass without its own constructor inherits the most specific
+    -- constructor on the chain; create args are NOT silently dropped.
+    when: Evaluates("b get    -- after: A{variable x; constructor {y} {set x $y}}; B{super A}; B create b 5")
+    ensures: completion.code = ok
+    ensures: completion.value = "5"
+    -- rtcl: only looks at the instance class's own constructor; args
+    --   dropped (can't read "x")  [D-40]
+}
+
+rule ConstructorVariableLinksToDefiningClass {
+    -- A constructor's `variable` links to the class DEFINING that
+    -- constructor, not the instance class: a base constructor writes
+    -- the base's variable even for a subclass instance.
+    when: Evaluates("b ga    -- after: A{variable va; constructor {} {set va 1}; method ga {return $va}}; B{super A; variable vb}; B create b")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- rtcl: links by instance class — can't read "va"  [D-40]
+}
+
+rule NextForwardsWithoutArgs {
+    -- `next` with no arguments invokes the next implementation with NO
+    -- arguments (tclsh 8.6 does not re-forward the current call's
+    -- arguments).
+    when: Evaluates("o m q    -- after: A m{args}{return \"A:$args\"}; B{super A} m{x}{return [next]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "A:"
+    -- rtcl: re-forwards the caller's args ("A:q")  [D-40]
+    -- level 0 inside a next frame is `next <args>`; an exhausted
+    -- DESTRUCTOR reports `no next destructor implementation`
+    -- (rtcl: "no next method implementation")  [D-40]
+}
+
+rule EmptySuperclassResetsToObject {
+    -- oo::define C {superclass} with no names resets the superclass
+    -- list to ::oo::object (an instance then still has destroy).
+    when: Evaluates("info class superclasses C    -- after: oo::define C {superclass}")
+    ensures: completion.code = ok
+    ensures: completion.value = "::oo::object"
+    -- rtcl: leaves the list empty  [D-40]
+}
+
+rule MixinCycleDetectedAtDefinition {
+    -- An indirect mixin cycle (M mixins A, A's superclass is M) is an
+    -- error at definition time.
+    when: Evaluates("catch {oo::define M {mixin A}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "may not mix a class into itself"
+    -- rtcl: accepts; linearize truncates silently at depth 64  [D-41]
+}
+
+-- ── method dispatch surface ──────────────────────────────────────
+
+rule UnknownMethodDispatchesToUnknownHandler {
+    -- A method miss is dispatched to the class's `unknown` method when
+    -- one exists; the unknown-method error only fires without one.
+    when: Evaluates("o whatever x    -- with C{method unknown {args} {...}}; C create o")
+    ensures: completion.code = ok
+    -- oracle: the unknown method receives the name and args
+    -- rtcl: no fallback — unknown-method error  [D-41]
+}
+
+rule FiltersRunAndReplaceResult {
+    -- A registered filter runs before the method it screens; its return
+    -- value replaces the method's result.
+    when: Evaluates("o m    -- after: C{method f {args} {puts F; return}}; oo::define C {filter f; method m {} {return M}}; C create o")
+    ensures: completion.code = ok
+    -- oracle: prints F, method body never runs (result empty)
+    -- rtcl: filter words are stored but never executed ("M")  [D-41]
+}
+
+rule ClassNewIsNotAMethod {
+    -- oo::class has only create and destroy: `oo::class new` is an
+    -- unknown-method error, never an object creation.
+    when: Evaluates("catch {oo::class new} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown method \"new\": must be create or destroy"
+    -- rtcl: creates a plain non-class object (::oo::ObjN)  [D-41]
+}
+
+rule MetaclassSubclassCreateEvaluatesDefinitionScript {
+    -- A user metaclass (K{superclass oo::class}) runs its create
+    -- definition script like oo::class does.
+    when: Evaluates("i m    -- after: K create CC {method m {} {return 1}}; CC create i")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- rtcl: script silently dropped as constructor args  [D-41]
+}
+
+rule ObjectUnexportHidesInherited {
+    -- oo::objdefine o {unexport m} hides an INHERITED method m, not
+    -- just the object's own.
+    when: Evaluates("catch {o m} m2; set m2    -- after: C{method m}; C create o; oo::objdefine o {unexport m}")
+    ensures: completion.code = ok
+    -- oracle: unknown method "m": must be destroy
+    -- rtcl: no-op — m still callable  [D-41]
+}
+
+rule NoVisibleMethodsMessage {
+    -- With every method hidden (unexport destroy), the unknown-method
+    -- error is `object "::o" has no visible methods`.
+    when: Evaluates("catch {o nosuch} m; set m    -- after: oo::define C {unexport destroy}; C create o")
+    ensures: completion.code = ok
+    -- rtcl: unknown method "nosuch": must be destroy  [D-41]
+}
+
+-- ── lifecycle & rename interop ───────────────────────────────────
+
+rule RenameToEmptyDestroysObject {
+    -- `rename o ""` runs the object's destructor like my destroy.
+    when: Evaluates("out    -- after: C{destructor {puts DTOR}}; C create o; rename o \"\"")
+    ensures: completion.code = ok
+    -- oracle: DTOR E
+    -- rtcl: deletes the command only, destructor never runs  [D-42]
+}
+
+rule RenameObjectKeepsItUsable {
+    -- `rename o o2` moves the object: o2 keeps working (methods, my,
+    -- next) — the object does not die with its old command name.
+    when: Evaluates("o2 m    -- after: C{method m {return 1}}; C create o; rename o o2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- rtcl: o2 invalid — rename is not OO-aware  [D-42]
+}
+
+rule CopySupportsClassesAndTargetNamespaceForm {
+    -- oo::copy copies classes too; the 3-arg form requires the target
+    -- namespace NOT to exist and uses it as the copy's underlying
+    -- namespace while placing the command in the current namespace.
+    when: Evaluates("catch {oo::copy C D} m; set m    -- C is a class")
+    ensures: completion.code = ok
+    -- oracle: ::D
+    -- rtcl: C does not refer to an object; 3-arg form places the
+    --   command inside the target namespace and skips the
+    --   already-exists check  [D-42]
+}
+
+-- ── info surface ─────────────────────────────────────────────────
+
+rule InfoObjectIsaOnMissingNameIsZero {
+    -- info object isa <kind> <name> returns 0 for a name that is not an
+    -- object, never an error.
+    when: Evaluates("info object isa class nosuch")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- rtcl: nosuch does not refer to an object  [D-43]
+}
+
+rule InfoClassSubclassesExcludesSelf {
+    -- info class subclasses lists direct subclasses AND mixin user
+    -- classes, but never C itself.
+    when: Evaluates("info class subclasses C    -- with a bare C")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- rtcl: includes C itself; misses mixin users  [D-43]
+}
+
+rule InfoClassMethodsAllIncludesMixins {
+    -- info class methods C -all includes methods from the class's
+    -- mixins, and never lists hidden names.
+    when: Evaluates("info class methods C -all    -- with C{mixin M}, M has method mm")
+    ensures: completion.code = ok
+    -- oracle: destroy mm
+    -- rtcl: destroy (superclass walk only)  [D-43]
+}
+
+rule InfoObjectVariablesListsDeclarations {
+    -- info object variables lists DECLARED variables (oo::objdefine
+    -- o {variable ov}), including ones never assigned; info object
+    -- vars accepts a pattern argument.
+    when: Evaluates("info object variables o    -- after: oo::objdefine o {variable ov}")
+    ensures: completion.code = ok
+    ensures: completion.value = "ov"
+    -- rtcl: lists only live namespace variables  [D-43]
+}
+
+rule MyVariableIsACoreMethod {
+    -- oo::object instances have the private methods variable and
+    -- varname: `my variable v` declares an instance variable inside a
+    -- method.
+    when: Evaluates("o m    -- with C{method m {} {my variable v; set v 3; return $v}}; C create o")
+    ensures: completion.code = ok
+    ensures: completion.value = "3"
+    -- rtcl: unknown method "variable"  [D-43]
+}
+
+rule InfoStubbedSubcommands {
+    -- info class constructor/destructor/forward/methodtype/definition
+    -- and info object filters/forward/methodtype/definition are all
+    -- implemented in tclsh 8.6 (empty result when unset; definition's
+    -- usage is objName methodName).
+    when: Evaluates("catch {info object filters o} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- rtcl: unknown subcommand errors for the whole stub set  [D-43]
+}

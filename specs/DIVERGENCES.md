@@ -2,9 +2,10 @@
 
 > 格式：行为声明 | Tcl 8.6 行为 | rtcl 行为 | 复现 | 严重度。
 > 修复后标 `[FIXED YYYY-MM-DD]`。最近盘点：**2026-11-03 深水区全量建模**
-> （error-deep / dict / matching / io 四份新 allium 规格 + 四套深水探针
-> 差分实证）。条目后括注对应规格的 spec-local 标签（规格文件内的
-> [D-x] 注释是 spec-local 编号，以本台账为准）。
+> （error-deep / dict / matching / io / trace / oo 六份新 allium 规格
+> + 探针套件差分实证；trace 蒸馏暴露致命级 D-36 崩溃，oo 蒸馏暴露
+> D-40/41 构造析构与分派面）。条目后括注的
+> spec [D-x] 是规格文件内的 spec-local 编号，以本台账为准。
 
 ## OPEN
 
@@ -268,6 +269,114 @@
   script、错误帧标主文件名；⑦ open 管道句柄 `file<pid>` 命名易撞名。
 - **严重度**：低（消息面/边缘面）。
 
+### D-35 `array unset a`（整体形式）不移除数组变量本身（2026-11-03 规格复查发现）
+- **Tcl 8.6**：`array set a {x 1}; array unset a; info exists a` → 0
+  （无 pattern 的 array unset 删除变量本身）。
+- **rtcl**：info exists → 1（数组壳残留）。
+- **复现**：`array set a {x 1}; array unset a; puts [info exists a]`
+- **对照**：元素形式（`array unset a x`）、pattern 形式（`array unset
+  a y*`）、对不存在名的 no-op 三者与 tclsh 一致。
+- **严重度**：低-中。
+
+### trace 面（trace.allium + specs/trace-deep.probes；2026-11-03 蒸馏轮）
+
+### D-36 trace 回调重入无守卫——**原生栈溢出崩溃**【致命】
+- **Tcl 8.6**：VAR_TRACE_ACTIVE 重入守卫——回调内读写被追踪变量不再
+  触发；`trace add variable x write {set x 9;#}; set v [set x 0]` → `9 9`。
+- **rtcl**：`fire_traces`（vars.rs:1848-1863）无重入守卫，eval_depth
+  无上限、max_call_depth 只拦 proc 调用 → **栈溢出 abort（rc 134,
+  core dumped）**。read 版同样崩溃。
+- **复现**：探针 trace-deep.probes 第 11/12 行。
+- **严重度**：**致命**（可由纯脚本触发进程崩溃；judge 语料未含
+  trace 面，属盲区）。修复建议：fire_traces 入口 per-var 重入位 +
+  eval 深度兜底上限。
+
+### D-37 变量 trace 触发面语义（打包）
+- **Tcl 8.6**：① op 渲染固定序 read,write,unset,array（info/vinfo）；
+  ② remove 每次删一条（重复注册逐条删）；③ `unset a`（整数组）逐元素
+  触发 {a k unset}；④ `array unset a` = 一次整体 {a {} unset}；⑤ 对
+  缺失变量/元素的 unset 仍触发（元素还抹记录）；⑥ array op 触发面：
+  array set 对已存在数组增元素、array get/names/size/exists 对缺失
+  数组、array unset 均触发；⑦ 整变量 trace 先于元素 trace；⑧ upvar
+  链接的读写触发且 name1=别名名。
+- **rtcl**：① 词表序 array,read,unset,write；② retain 全删；③④⑧
+  缺失触发；⑤ 标量 missing 不触发但抹记录、元素 missing 不触发不抹；
+  ⑥ 仅创建时 array set + array names 缺失；⑦ 反序（E1A1 vs A1E1）。
+- **严重度**：中（trace 触发面系统性偏差；⑦⑧ 影响回调语义）。
+
+### D-38 legacy trace 形态（打包）
+- **Tcl 8.6**：① `trace variable x q cb` → `bad operations "q": should
+  be one or more of rwua`，空 op 串也报错；② `trace variable a(k) w cb`
+  注册元素 trace，元素写触发。
+- **rtcl**：① 报新式消息、空 op 静默登记；② a(k) 当整体标量名，永不
+  触发（vinfo 显示正常）。
+- **严重度**：低。
+
+### D-39 execution trace 触发面（打包）
+- **Tcl 8.6**：① enter/leave 覆盖一切命令（内建/apply/namespace eval）；
+  ② leave 在 body 以 return 结束也触发（`foo 0 1 leave`）；③ 回调
+  出错替换命令结果且保留记录；④ enterstep/leavestep 覆盖栈上所有被
+  追踪 proc 的动态范围。
+- **rtcl**：① 仅挂 call_proc（内建/apply 不触发）；② return 完成不
+  触发 leave（call.rs:710-716）；③ 吞错且删记录（仅 enter 传播）；
+  ④ 只匹配最内层帧（exec_step_stack.last()）。
+- **严重度**：中。注：trace.rs 头注 "stored-but-not-fired" 已过时
+  （command/execution trace 实际触发但面窄），本轮已改。
+
+### TclOO 面（oo.allium + specs/oo-deep.probes；2026-11-03 蒸馏轮）
+
+### D-40 构造/析构链语义【高】
+- **Tcl 8.6**：① 析构只跑最具体一个，靠 `next` 链；② 子类无 ctor 时
+  沿链跑最具体继承 ctor（create 参数不丢）；③ ctor 的 variable 链到
+  **定义该 ctor 的类**（基类 ctor 写基类变量）；④ `next` 无参=以无参
+  调下一实现（不转发当前实参）；⑤ next 帧 level0=`next <args>`；⑥
+  析构 next 用尽报 `no next destructor implementation`；⑦
+  `oo::define C {superclass}`（空）重置为 ::oo::object。
+- **rtcl**：① 无条件跑全 dtor 链 + next 双跑（B A A E vs B A E）；②
+  只查实例类自身 ctor（参数静默丢）；③ 链到实例类（can't read "va"）；
+  ④ 重传实参（A:q vs A:）；⑤ level0=`o m 7`；⑥ 统一 method 消息；
+  ⑦ 置空（实例从此无 destroy）。
+- **严重度**：高（TclOO 构造/析构语义核心；judge oo_probe 钉的是链序
+  与报错文本，未覆盖此四处）。
+
+### D-41 方法分派面（打包）
+- **Tcl 8.6**：① 未命中转调类 `unknown` 方法；② filter 先跑并以返回
+  值替换结果（objdefine filter 对对象也生效）；③ `oo::class new` 报
+  unknown method（不造对象）；④ 用户元类的 create 定义脚本照常求值；
+  ⑤ 对象级 unexport 隐藏继承方法；⑥ 全隐藏时报
+  `object "::o" has no visible methods`；⑦ 间接 mixin 环定义时即报
+  `may not mix a class into itself`。
+- **rtcl**：① 无 unknown 回退；② filter 只存不执行（对象目标被静默
+  吞）；③ 造出非类普通对象；④ 脚本当 ctor 参数丢（仅 ::oo::class
+  精确匹配 is_meta）；⑤ no-op；⑥ must-be 无条件 append destroy；⑦
+  接受（linearize 深度 64 截断静默）。
+- **严重度**：高。
+
+### D-42 对象生命周期与别名（打包）
+- **Tcl 8.6**：① `rename o ""` 触发析构；② `rename o o2` 后 o2 可用
+  （OO 与 rename 联动）；③ oo::copy 支持类；④ copy 三参形式要求目标
+  ns 不存在、作为副本底层 ns，命令放当前 ns。
+- **rtcl**：① 仅删命令（析构器不跑）；② o2 invalid；③ 报 does not
+  refer to an object；④ 命令放 targetNS 内且不查已存在。
+- **严重度**：中-高。
+
+### D-43 info 面与私有方法（打包）
+- **Tcl 8.6**：① `info object isa *` 对缺失名返回 0；② subclasses
+  不含自身、含 mixin 用户类；③ `info class methods C -all` 含 mixin
+  方法、不含 hidden；④ `info object variables` 列声明（未赋值也列）、
+  vars 支持.pattern；⑤ oo::object 有私有方法 `my variable/varname`
+  （及 `<cloned>` eval unknown）；⑥ `self call`/`self next` 的
+  owner 词与形状（`{<描述符> <index>}` / 两元 `::A m`）；⑦
+  filters/forward/methodtype/definition/constructor/destructor 子命令
+  全实现（8.6.17）；⑧ `info object methods` 校验 -all/-localprivate/
+  -private。
+- **rtcl**：① 抛 does not refer to an object；② 含自身、缺 mixin
+  用户；③ 只走 superclass 链、列 hidden；④ 只列活变量、vars 恰 4 参；
+  ⑤ 缺 variable/varname；⑥ owner 词空串/四元描述符；⑦ 全 stub；⑧
+  任意 -flag 静默忽略。
+- **严重度**：中（信息面/内省面）。**外观差异（非分歧）**：::oo::ObjN
+  编号计数与 tclsh 不同（元对象预占号），脚本不应依赖。
+
 ## rtcl 有意扩展（超集，非 bug，parity 语料不应使用）
 
 - `dict create -ordered/-unordered`、`dict getdef`/`getwithdefault`、
@@ -319,3 +428,14 @@
   first 负索引、totitle、reverse）全部一致。
 - io：gets EOF 三元组（-1/置空/eof 时序）、seek 越界+tell+read、
   fconfigure 未知选项消息、gets 后 seek current 位置。
+- trace：变量 trace 基本 rwua 触发/参数（name/elem/op、整变量 elem=""）、
+  同表 latest-first、write trace 出错后写入已落地、unset trace 错误被吞、
+  info 再列表化、trace on 未创建变量、unset 抹记录、command trace
+  rename/delete 参数序与 trace 随移、exec leave 参数序（cmdLine code
+  result op）、enterstep 的 cmdtext 规范化。
+- TclOO：C3 链序与 mixin 优先级、must-be 列表（排序+destroy 附加+
+  oo::class 抑制 new）、小写导出与 export/unexport/deletemethod/
+  renamemethod、方法与构造器 wrong#args 文本、info call 描述符全形
+  （filter 项/unknown 项/owner 词/errorCode）、定义脚本错误帧与多词
+  形无帧、create 重名、copy 保留面与 <cloned>、namespace delete 级联、
+  析构错误先删后抛。

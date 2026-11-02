@@ -2,8 +2,12 @@
 -- string.allium
 -- Behaviour spec: Tcl string commands. Oracle: tclsh 8.6.17.
 --
--- Indices in Tcl strings are character (Unicode code point) indices,
--- never byte offsets.
+-- Indices in Tcl strings are character-based, never byte offsets.  For
+-- the BMP (all of tclsh 8.6's practical surface) tclsh counts UCS-2
+-- code units and rtcl counts Unicode code points — these agree except
+-- for astral-plane characters, where tclsh 8.6 counts a surrogate pair
+-- as 2 and rtcl as 1 (deliberate 8.7/9-style policy, DIVERGENCES.md
+-- D-27; string length "a𐀀c" => 4 in tclsh, 3 in rtcl).
 
 use "./interp.allium" as interp
 

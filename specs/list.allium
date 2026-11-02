@@ -72,6 +72,24 @@ rule LsetOutOfRangeErrors {
     -- oracle message: list index out of range
 }
 
+rule LinsertPastEndAppends {
+    -- An insert index past the end appends; a negative one clamps to
+    -- the front (linsert {a b} 5 X => "a b X", linsert {a b} -1 X => "X a b").
+    when: Evaluates("linsert {a b} 5 X")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b X"
+}
+
+rule LreplaceNegativeStartClampsToHead {
+    -- lreplace replaces the inclusive index range; a start below zero
+    -- clamps to 0 (lreplace {a b} -1 0 X => "X b").
+    when: Evaluates("lreplace {a b} -1 0 X")
+    ensures: completion.code = ok
+    ensures: completion.value = "X b"
+    -- a start past the end deletes nothing and appends the new items
+    -- (lreplace {a b c} 5 6 X => "a b c X")
+}
+
 -- ── lsort / lsearch ───────────────────────────────────────────────
 
 rule LsortDefaultIsAscendingAscii {

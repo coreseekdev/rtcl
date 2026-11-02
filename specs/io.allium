@@ -4,7 +4,7 @@
 -- seek/eof/close/fconfigure/chan/file/glob/source, CLI exit semantics.
 -- Oracle: tclsh 8.6.17. 2026-11-03 deep-water round.
 -- rtcl divergences from this spec are tracked in DIVERGENCES.md
--- (D-29 … D-35; glob also D-27).
+-- (D-29 … D-34；glob 归 D-26；台账为准).
 
 use "./interp.allium" as interp
 
@@ -186,5 +186,5 @@ rule CommandModeExitPropagatesCode {
     when: Evaluates("exit 7    -- in -c mode")
     ensures: completion.code = ok
     -- oracle (tclsh): no output, process rc=7
-    -- rtcl: "Error: exit with value: 7" on stderr, rc=1  [D-32]
+    -- rtcl: "Error: exit with value: 7" on stderr, rc=1  [D-32 FIXED 2026-11-03]
 }

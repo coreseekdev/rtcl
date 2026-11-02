@@ -4,7 +4,7 @@
 -- iteration, update/with scoping, error surfaces.
 -- Oracle: tclsh 8.6.17. 2026-11-03 deep-water round.
 -- rtcl divergences from this spec are tracked in DIVERGENCES.md
--- (D-11 … D-16).
+-- (D-12 … D-17；台账为准).
 
 use "./interp.allium" as interp
 
@@ -43,7 +43,7 @@ rule DictGetNoKeyMustValidateDict {
     when: Evaluates("catch {dict get {a b c}} m; set m")
     ensures: completion.code = ok
     -- oracle: missing value to go with key
-    -- rtcl: returns "a b c" unvalidated  [D-11]
+    -- rtcl: returns "a b c" unvalidated  [D-11 FIXED 2026-11-03]
 }
 
 -- ── paths ─────────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ rule DictSetRejectsArrayElementName {
     when: Evaluates("catch {dict set a(1) k v} m; set m")
     ensures: completion.code = ok
     -- oracle: can't set "a(1)": variable isn't array
-    -- rtcl: creates array element a(1) = {k v}  [D-12]
+    -- rtcl: creates array element a(1) = {k v}  [D-12 FIXED 2026-11-03]
 }
 
 -- ── value mutation edges ──────────────────────────────────────────
@@ -83,7 +83,7 @@ rule DictIncrNonIntegerErrors {
     when: Evaluates("set d {k abc}; catch {dict incr d k} m; list $m $d")
     ensures: completion.code = ok
     -- oracle: expected integer but got "abc" | k abc  (dict unchanged)
-    -- rtcl: silently resets to {k 1}  [D-13]
+    -- rtcl: silently resets to {k 1}  [D-13 FIXED 2026-11-03]
 }
 
 rule DictLappendBadListErrors {
@@ -92,7 +92,7 @@ rule DictLappendBadListErrors {
     when: Evaluates("set v \"x{ y\"; set d [dict create k $v]; catch {dict lappend d k z} m; list $m $d")
     ensures: completion.code = ok
     -- oracle: unmatched open brace in list | k "x{ y"
-    -- rtcl: silently resets to {k z}  [D-13]
+    -- rtcl: silently resets to {k z}  [D-13 FIXED 2026-11-03]
 }
 
 -- ── iteration ─────────────────────────────────────────────────────
@@ -103,7 +103,7 @@ rule DictForReturnsEmpty {
     when: Evaluates("dict for {k v} {a 1 b 2} {expr {$v+5}}")
     ensures: completion.code = ok
     ensures: completion.value = ""
-    -- rtcl: returns the body's last result ("7")  [D-14]
+    -- rtcl: returns the body's last result ("7")  [D-14 FIXED 2026-11-03]
 }
 
 rule DictMapBreakDiscardsAccumulated {
@@ -112,7 +112,7 @@ rule DictMapBreakDiscardsAccumulated {
     when: Evaluates("dict map {k v} {a 1 b 2 c 3} {if {$k==\"c\"} {break}; expr {$v*10}}")
     ensures: completion.code = ok
     ensures: completion.value = ""
-    -- rtcl: keeps accumulated pairs ("a 10 b 20")  [D-14]
+    -- rtcl: keeps accumulated pairs ("a 10 b 20")  [D-14 FIXED 2026-11-03]
 }
 
 -- ── update / with ─────────────────────────────────────────────────
@@ -122,7 +122,7 @@ rule DictUpdateRequiresExistingVariable {
     when: Evaluates("catch {dict update novar k v {set v 5}} m; set m")
     ensures: completion.code = ok
     -- oracle: can't read "novar": no such variable
-    -- rtcl: treats as empty dict, runs body, does not create variable  [D-15]
+    -- rtcl: treats as empty dict, runs body, does not create variable  [D-15 FIXED 2026-11-03]
 }
 
 rule DictUpdateWritesBackOnAnyCompletion {
@@ -148,7 +148,7 @@ rule DictUnknownSubcommandMessage {
     --   create, exists, filter, for, get, incr, info, keys, lappend, map,
     --   merge, remove, replace, set, size, unset, update, values, or with
     --   (errorCode TCL LOOKUP SUBCOMMAND)
-    -- rtcl: unknown dict subcommand: zzz  [D-16]
+    -- rtcl: unknown dict subcommand: zzz  [D-16 FIXED 2026-11-03]
 }
 
 rule DictUniquePrefixDispatch {
@@ -157,7 +157,7 @@ rule DictUniquePrefixDispatch {
     when: Evaluates("dict cr a 1")
     ensures: completion.code = ok
     ensures: completion.value = "a 1"
-    -- rtcl: no prefix dispatch (falls through to proc lookup)  [D-16]
+    -- rtcl: no prefix dispatch (falls through to proc lookup)  [D-16 FIXED 2026-11-03]
 }
 
 rule DictInfoReportsHashStats {

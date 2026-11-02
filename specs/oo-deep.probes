@@ -1,0 +1,40 @@
+# oo 深水探针（oo-deep;probe.sh 差分;对应 oo.allium D-40..D-43）
+# ── 基线段（2026-11-03 实测 SAME——回归锚点）──
+# 注：info object namespace 的 ::oo::ObjN 编号与 tclsh 不同（tclsh 为元
+# 对象预占号，::oo::Obj11 vs rtcl ::oo::Obj3）——外观差异，勿入基线。
+oo::object create a; catch {oo::object create a} m; puts $m
+oo::class create C {method m {} {return 1}}; C create o; catch {o nosuch} e; puts $e
+oo::class create A {method mm {} {return mm}}; oo::class create B {mixin A}; B create b; catch {b zz} e; puts $e
+oo::class create C {method foo-bar {a b} {return x}}; C create o; catch {o foo-bar} e; puts $e
+oo::class create K {method m {} {error boom}}; K create o; catch {o m} e; puts $::errorInfo
+oo::class create C {}; oo::define C {method m1 {} {}}; C create o; puts [info object methods o]
+oo::class create A {variable va; constructor {} {set va 1}}; A create a; puts [info object vars a]
+oo::class create C {method m {} {return [self object]}}; C create o; puts [o m]
+oo::class create C {}; puts [info class instances C]
+# ── 分歧段（D-40 构造/析构链）──
+oo::class create A {destructor {puts A}}; oo::class create B {superclass A; destructor {puts B; next}}; [B create o] destroy; puts E
+oo::class create A {destructor {puts A}}; oo::class create B {superclass A; destructor {puts B}}; [B create o] destroy; puts E
+oo::class create A {variable va; constructor {} {set va 1}; method ga {} {return $va}}; oo::class create B {superclass A; variable vb}; B create b; catch {b ga} e; puts $e
+oo::class create A {variable x; constructor {y} {set x $y}; method get {} {return $x}}; oo::class create B {superclass A}; B create b 5; catch {b get} e; puts $e
+oo::class create A {method m {args} {return "A:$args"}}; oo::class create B {superclass A; method m {x} {return [next]}}; B create o; puts [o m q]
+oo::class create A {method m {x} {return [info level 0]}}; oo::class create B {superclass A; method m {x} {return [next 7]}}; B create o; puts [o m q]
+oo::class create A {}; oo::class create B {superclass A; destructor {next}}; catch {[B create o] destroy} e; puts $e
+oo::class create C {}; oo::define C {superclass}; puts [info class superclasses C]
+# ── 分歧段（D-41 分派面）──
+catch {oo::class new} e; puts $e
+oo::class create K {superclass oo::class}; K create CC {method m {} {return 1}}; CC create i; catch {i m} e; puts $e
+oo::class create C {method unknown {args} {return "got:$args"}}; C create o; puts [o whatever x]
+oo::class create C {method f {args} {puts F; return}}; oo::define C {filter f; method m {} {return M}}; C create o; puts [o m]
+oo::class create C {method m {} {return 1}}; C create o; oo::objdefine o {unexport m}; catch {o m} e; puts $e
+oo::class create C {}; oo::define C {unexport destroy}; C create o; catch {o nosuch} e; puts $e
+oo::class create M {method mm {} {return mm}}; oo::class create A {superclass M}; oo::define M {mixin A}; M create x; catch {x mm} e; puts $e
+# ── 分歧段（D-42 生命周期/别名）──
+oo::class create C {destructor {puts DTOR}}; C create o; rename o ""; puts E
+oo::class create C {method m {} {return 1}}; C create o; rename o o2; catch {o2 m} e; puts $e
+oo::class create C {method m {} {return 1}}; catch {oo::copy C D} e; puts $e
+namespace eval n {}; oo::class create C {}; C create o; catch {oo::copy o t ::nnn2} e; puts [list $e [info commands ::t]]
+# ── 分歧段（D-43 info 面）──
+oo::class create C {}; puts [info class subclasses C]; puts [info object isa class nosuch]
+oo::class create M {method mm {} {return mm}}; oo::class create C {mixin M}; puts [info class methods C -all]
+oo::class create C {method m {} {my variable v; set v 3; return $v}}; C create o; catch {o m} e; puts $e
+oo::class create C {}; C create o; catch {info object filters o} e; puts $e

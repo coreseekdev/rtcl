@@ -1,0 +1,24 @@
+# trace 深水探针（trace-deep;probe.sh 差分;对应 trace.allium D-36..D-39）
+# ── 基线段（2026-11-03 实测 SAME——回归锚点）──
+set f {}; proc w {n e o} {append ::f W}; trace add variable x write w; set x 2; puts [set f]
+set f {}; proc r {n e o} {append ::f R}; trace add variable x read r; set x 5; puts $x; puts [set f]
+set f {}; proc u {n e o} {append ::f [list $n $e $o]}; set x 1; trace add variable x unset u; unset x; puts [set f]
+set f {}; proc c {args} {append ::f [list $args]}; proc cp {} {}; trace add command cp delete c; rename cp {}; puts [set f]
+proc foo {} {expr 1+1}; set f {}; trace add execution foo enter {append ::f E}; trace add execution foo leave {append ::f L}; foo; puts [set f]
+# ── 分歧段 ──
+proc cb {} {}; trace add variable x {write unset} cb; puts [trace info variable x]
+proc cb {} {}; trace variable x au cb; puts [trace vinfo x]
+catch {trace variable x q cb} m; puts $m
+proc cb {} {}; trace add variable x write cb; trace add variable x write cb; trace remove variable x write cb; puts [llength [trace info variable x]]
+trace add variable x write {set x 9;#}; set v [set x 0]; puts [list $v [set x]]
+set n 0; trace add variable x read {incr ::n; set y $x;#}; set x 1; catch {set x} m; puts [list $m [set n]]
+proc u {n e o} {lappend ::log [list $n $e $o]}; set a(1) 1; trace add variable a(1) unset u; unset a; puts [set log]
+proc u {n e o} {lappend ::log [list $n $e $o]}; set a(1) 1; set a(2) 2; trace add variable a unset u; array unset a; puts [set log]
+proc u {n e o} {lappend ::log L}; trace add variable nosuch unset u; catch {unset nosuch}; puts [set log]
+proc w {args} {lappend ::log A}; set a(1) 1; trace add variable a array w; array set a {2 2}; puts [set log]
+set log {}; trace add variable a write {append ::log A1;#}; trace add variable a(k) write {append ::log E1;#}; set a(k) 1; puts [set log]
+set g 0; proc w {args} {lappend ::log W}; proc p {} {upvar 1 g y; set y 5}; trace add variable g write w; p; puts [set log]
+proc cb {args} {lappend ::log R}; trace variable a(k) w cb; set a(k) 1; puts [set log]
+proc foo {} {set a 1; return $a}; trace add execution foo leave {lappend ::got}; foo; puts [set got]
+proc bar {} {set q 1}; proc foo {} {bar}; trace add execution foo enterstep {lappend ::got}; foo; puts [set got]
+trace add execution set enter {lappend ::got}; set x 1; puts [set got]

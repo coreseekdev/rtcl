@@ -1,0 +1,219 @@
+-- allium: 3
+-- trace.allium
+-- Behaviour spec: the trace command — variable traces (read/write/
+-- unset/array), command traces (rename/delete), execution traces
+-- (enter/leave/enterstep/leavestep), and the legacy rwua forms.
+-- Oracle: tclsh 8.6.17. 2026-11-03 distillation round (trace-deep
+-- probes live in specs/trace-deep.probes; divergences D-36 … D-39 in
+-- DIVERGENCES.md).
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── variable traces: registration & info ─────────────────────────
+
+rule TraceOnUncreatedVariableAllowed {
+    -- Traces may be registered before the variable exists; they fire
+    -- when it comes into being. `unset` (even of a missing variable)
+    -- removes the variable's trace records.
+    when: Evaluates("llength [trace info variable x]")
+    -- after: trace add variable x write cb; unset x
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+}
+
+rule TraceInfoRoundTripsAndOrdersOps {
+    -- trace info variable returns re-listable {{opList callback} ...};
+    -- the op list renders in the fixed order read, write, unset, array
+    -- regardless of registration order (legacy vinfo likewise: ua, not au).
+    when: Evaluates("trace info variable x    -- after: trace add variable x {write unset} cb")
+    ensures: completion.code = ok
+    ensures: completion.value = "{write unset} cb"
+    -- rtcl renders {unset write} (wordlist order)  [D-37]
+    -- probe: trace variable x au cb; puts [trace vinfo x]  =>  {ua cb}
+    -- rtcl: {au cb}  [D-38]
+}
+
+rule TraceRemoveRemovesOneExactMatch {
+    -- remove deletes ONE registration per call (exact op-list +
+    -- callback-prefix match); duplicate registrations each need their
+    -- own remove. No match is a silent no-op.
+    when: Evaluates("llength [trace info variable x]")
+    -- after: two identical `trace add variable x write cb`; one remove
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- rtcl: retain wipes all duplicates => 0  [D-37]
+}
+
+rule TraceFiresNewestFirst {
+    -- Within one variable, the most recently added trace fires first.
+    when: Evaluates("set log    -- after: two write traces T1 then T2; set x 0")
+    ensures: completion.code = ok
+    -- oracle: T2 T1
+}
+
+-- ── variable traces: firing semantics ────────────────────────────
+
+rule WriteTraceRunsAfterCommit {
+    -- A write trace runs after the write is committed: on trace error
+    -- the value is still set (error can't set "x"), and a callback that
+    -- writes the variable changes the final visible value.
+    when: Evaluates("set v [set x 0]    -- with write trace {set x 9;#}")
+    ensures: completion.code = ok
+    ensures: completion.value = "9"
+    -- probe: puts [list $v [set x]]  =>  9 9   (tclsh)
+    -- rtcl: native stack overflow abort (rc 134) — no re-entrancy
+    --   guard  [D-36, 致命]
+}
+
+rule TraceReentrancyDoesNotRefire {
+    -- tclsh guards re-entrant access (VAR_TRACE_ACTIVE): a read/write
+    -- of the traced variable from inside its own trace callback does
+    -- not re-fire the trace.
+    when: Evaluates("set n    -- after: read trace {incr ::n; set y $x;#}; set x 1; set x")
+    ensures: completion.code = ok
+    -- oracle: n = 1 (one fire, inner read silent)
+    -- rtcl: crashes (same D-36 root cause)
+}
+
+rule TraceErrorSemantics {
+    -- write-trace error => can't set "x": <e>, write committed;
+    -- read-trace error => can't read "x": <e>;
+    -- unset-trace errors are swallowed and the unset proceeds.
+}
+
+rule UnsetTraceFiresEvenOnFailure {
+    -- An unset that names a missing variable still fires unset traces
+    -- (and removes the records); for elements, a missing-element unset
+    -- fires {a k unset} and drops the element's records.
+    when: Evaluates("set log    -- after: trace on nosuch unset; catch {unset nosuch}")
+    ensures: completion.code = ok
+    ensures: completion.value = "{nosuch {} unset}"
+    -- rtcl: scalar missing => no fire; element missing => no fire and
+    --   record kept  [D-37]
+}
+
+rule UnsetWholeArrayFiresElementTraces {
+    -- `unset a` fires the unset trace of every element ({a k unset} for
+    -- each k) in addition to whole-array traces.
+    when: Evaluates("set log    -- after: trace on a(1) unset; unset a")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a 1 unset}"
+    -- rtcl: whole-array unset skips element traces  [D-37]
+}
+
+rule ArrayUnsetFiresWholeNotElements {
+    -- `array unset a` (no pattern) behaves like `unset a`: ONE whole-
+    -- variable {a {} unset} fire, not per-element fires.
+    when: Evaluates("set log    -- after: trace on a unset; array unset a")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a {} unset}"
+    -- rtcl: per-element fires {a 1 unset} {a 2 unset}, no whole fire  [D-37]
+    --   (whole-array shell also survives: DIVERGENCES.md D-35)
+}
+
+rule ArrayOpFiringSurface {
+    -- The array op fires: when array set adds to an ALREADY existing
+    -- array; when array get / names / size / exists name a MISSING
+    -- array (one fire each); and on array unset.
+    when: Evaluates("set log    -- after: trace on a array w; array set a {2 2}    -- a existed with (1)")
+    ensures: completion.code = ok
+    -- oracle: log = A  (one fire)
+    -- rtcl: fires only on array-creation array set; missing-array
+    --   queries fire only for array names  [D-37]
+}
+
+rule WholeVarThenElementOrder {
+    -- When a write fires both whole-variable and element traces, whole-
+    -- variable traces run first, element traces second.
+    when: Evaluates("set log    -- after: write traces A1 on a, E1 on a(k); set a(k) 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "A1E1"
+    -- rtcl: E1A1 (reversed)  [D-37]
+}
+
+rule UpvarLinkedAccessFiresTraces {
+    -- Reads/writes/unsets through an upvar link fire the target's
+    -- traces with the ALIAS name as name1 (upvar 1 g y; set y 5 fires
+    -- {y {} write} on g's trace).
+    when: Evaluates("set log    -- after: trace on g write w; proc p {} {upvar 1 g y; set y 5}; p")
+    ensures: completion.code = ok
+    ensures: completion.value = "y"
+    -- rtcl: writes/reads through links bypass fire_traces entirely  [D-37]
+}
+
+rule LegacyElementTraceFires {
+    -- The legacy form `trace variable a(k) w cb` registers an element
+    -- trace and fires on element writes.
+    when: Evaluates("set log    -- after: trace variable a(k) w cb; set a(k) 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "R"
+    -- rtcl: treats a(k) as a whole scalar name; never fires  [D-38]
+}
+
+rule LegacyBadOpsMessage {
+    -- Legacy non-rwua operations: bad operations "q": should be one or
+    -- more of rwua; an empty op string is also an error.
+    when: Evaluates("catch {trace variable x q cb} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad operations \"q\": should be one or more of rwua"
+    -- rtcl: new-style message `bad operation "q": must be array, read,
+    --   unset, or write`; empty op string silently registers  [D-38]
+}
+
+-- ── command traces ───────────────────────────────────────────────
+
+rule CommandTracesFireOnRenameAndDelete {
+    -- trace add command requires an existing command; the callback sees
+    -- {oldName newName op} — {::old ::new rename} on rename (trace
+    -- moves with the command) and {::old {} delete} on delete. Redefining
+    -- a proc silently drops its traces.
+    when: Evaluates("set got    -- after: trace on cp delete; rename cp {}")
+    ensures: completion.code = ok
+    ensures: completion.value = "::cp {} delete"
+}
+
+-- ── execution traces ─────────────────────────────────────────────
+
+rule ExecTracesCoverAllCommands {
+    -- enter/leave fire for EVERY command invocation (builtins, apply,
+    -- namespace eval bodies), not just procs; enterstep/leavestep do
+    -- not fire at top level (both sides agree there).
+    when: Evaluates("set got    -- after: trace on `set` enter; set x 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "{set x 1} enter"
+    -- rtcl: hooks only proc calls (call_proc)  [D-39]
+}
+
+rule ExecLeaveArgsAndReturnCompletion {
+    -- leave receives {cmdLine code result op} (op last); a body ending
+    -- in `return v` still reports code 0 with result v.
+    when: Evaluates("set got    -- after: proc foo {} {set a 1; return $a}; leave trace; foo")
+    ensures: completion.code = ok
+    ensures: completion.value = "foo 0 1 leave"
+    -- rtcl: no leave fire on return completions  [D-39]
+}
+
+rule ExecTraceHandlerErrorPropagates {
+    -- An error inside a leave/enterstep/leavestep handler replaces the
+    -- command's result with the error and KEEPS the trace registration.
+    when: Evaluates("list $m [llength [trace info execution foo]]")
+    -- after: leave handler errors; catch {foo} m
+    ensures: completion.code = ok
+    ensures: completion.value = "LE 1"
+    -- rtcl: swallows the error, returns the command result, DELETES the
+    --   record  [D-39]
+}
+
+rule ExecEnterstepCoversStackRange {
+    -- enterstep/leavestep fire for every traced proc on the call stack
+    -- (dynamic range): when traced foo calls bar, foo's enterstep also
+    -- reports commands inside bar.
+    when: Evaluates("set got    -- after: enterstep trace on foo; foo calls bar; bar runs {set q 1}")
+    ensures: completion.code = ok
+    -- oracle includes: bar enterstep {set q 1} enterstep
+    -- rtcl: matches only the innermost frame's records  [D-39]
+}

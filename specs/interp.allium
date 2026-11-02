@@ -10,9 +10,10 @@
 entity Completion {
     -- Every evaluation of a script (or expression) ends in exactly one
     -- completion. This is Tcl's fundamental result contract.
-    code: ok | error | return | break | continue
+    code: ok | error | return | break | continue | exit
     -- For ok: the result value. For error: the error message.
     -- For return: the payload value. For break/continue: empty.
+    -- For exit: the process exit code as text.
     value: String
 }
 

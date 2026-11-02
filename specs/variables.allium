@@ -80,6 +80,45 @@ rule ArrayElementsAreVariables {
     ensures: completion.value = "x"
 }
 
+-- ── arrays ────────────────────────────────────────────────────────
+
+rule ArrayNamesListsKeys {
+    -- array names lists element names (pattern-filtered when given);
+    -- a wholly missing array yields the empty list.
+    when: Evaluates("array names a    -- after: array set a {b 2 a 1}")
+    ensures: completion.code = ok
+    -- oracle value: "a b" (tclsh 8.6.17 order for this shape; large
+    -- tables are hash order — consumers must not rely on ordering)
+}
+
+rule ArrayExistsAndSize {
+    when: Evaluates("list [array exists a] [array exists nope] [array size a]")
+    -- after: array set a {x 1 y 2}
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 2"
+    -- also: array set a {}; array size a => 0 (empty array EXISTS as array)
+}
+
+rule UnsetElementShrinksArray {
+    -- Unsetting the last element of an array leaves the array variable
+    -- itself existing (with zero elements).
+    when: Evaluates("list [array size a] [info exists a]")
+    -- after: array set a {x 1 y 2}; unset a(x)
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+rule ArrayUnsetWholeRemovesVariable {
+    -- `array unset a` without a pattern removes the array variable
+    -- itself: info exists a => 0 afterwards.
+    when: Evaluates("info exists a    -- after: array set a {x 1}; array unset a")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- rtcl: leaves the variable (info exists => 1)  [D-35]
+    -- element (array unset a x) and pattern (array unset a y*) forms
+    -- match tclsh; array unset on an absent name is a silent no-op.
+}
+
 -- ── namespaces ────────────────────────────────────────────────────
 
 rule NamespaceEvalQualifiesVariables {

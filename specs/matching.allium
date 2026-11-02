@@ -4,7 +4,7 @@
 -- regsub (Tcl ARE), string match (glob), format / scan, binary, clock.
 -- Oracle: tclsh 8.6.17. 2026-11-03 deep-water round.
 -- rtcl divergences from this spec are tracked in DIVERGENCES.md
--- (D-17 … D-26).
+-- (D-18 … D-27；台账为准).
 
 use "./interp.allium" as interp
 
@@ -45,6 +45,7 @@ rule RegexpRejectsNonCapturingGroups {
     when: Evaluates("regexp {(?:ab|a)(?=c)} abc")
     ensures: completion.code = error
     -- oracle: couldn't compile regular expression pattern: quantifier operand invalid
+    -- rtcl: accepts (?: via the regex crate — superset, same family as D-18)
 }
 
 rule RegexpRejectsUnicodeEscapes {

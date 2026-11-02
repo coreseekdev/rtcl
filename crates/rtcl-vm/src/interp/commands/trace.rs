@@ -1,7 +1,9 @@
 //! The `trace` command (tclsh traceCmd.c): add / remove / info over
-//! variable traces, plus stored-but-not-fired command and execution
-//! traces. Legacy `trace variable|vdelete|vinfo` forms use character
-//! ops (rwua).
+//! variable, command and execution traces.  Variable traces fire fully;
+//! command traces fire on rename/delete; execution traces fire at proc
+//! boundaries only (tclsh covers every command — see specs/trace.allium
+//! and DIVERGENCES.md D-36..D-39 for the divergence ledger).  Legacy
+//! `trace variable|vdelete|vinfo` forms use character ops (rwua).
 
 use crate::error::{Error, Result};
 use crate::interp::commands::list;

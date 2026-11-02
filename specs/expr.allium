@@ -49,10 +49,23 @@ rule ExprMixedFloatResultStaysFloat {
 }
 
 rule ExprDivisionByZeroErrors {
+    -- INTEGER division/modulo by zero is an error. FLOAT division by
+    -- zero follows IEEE: 1.0/0.0 => Inf, -1.0/0.0 => -Inf (no error);
+    -- NaN-producing forms (0.0/0.0) are a domain error.
     when: Evaluates("expr {1 / 0}")
     ensures: completion.code = error
     ensures: completion.value = "divide by zero"
-    -- float divide by zero errors too: expr {1.0 / 0.0}
+    -- probe: puts [expr {1.0/0.0}]   =>  Inf     (tclsh 8.6.17, 2026-11-03 实证)
+    -- probe: puts [expr {-1.0/0.0}]  =>  -Inf
+    -- probe: puts [expr {0.0/0.0}]   =>  domain error: argument not in valid range
+}
+
+rule ExprFloatNaNIsDomainError {
+    -- Operations with no IEEE-representable value (0.0/0.0) raise a
+    -- domain error rather than producing NaN.
+    when: Evaluates("expr {0.0 / 0.0}")
+    ensures: completion.code = error
+    -- oracle: domain error: argument not in valid range
 }
 
 rule ExprIntegersAreArbitraryPrecision {
@@ -93,6 +106,23 @@ rule ExprEqualityFallsBackToString {
     when: Evaluates("expr {\"abc\" == \"abc\"}")
     ensures: completion.code = ok
     ensures: completion.value = "1"
+}
+
+rule ExprEqNeCompareAsString {
+    -- eq / ne ALWAYS compare as strings: a numeric string never equals
+    -- its canonicalised form ("1.0" ne "1"), unlike ==.
+    when: Evaluates("list [expr {\"1.0\" == 1}] [expr {\"1.0\" eq \"1\"}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+    -- also: expr {"abc" < "abd"} => 1 (relational operators compare
+    -- numerically when both operands are numeric, else as strings)
+}
+
+rule ExprExponentIsRightAssociative {
+    -- ** groups right to left.
+    when: Evaluates("expr {2 ** 3 ** 2}")
+    ensures: completion.code = ok
+    ensures: completion.value = "512"
 }
 
 -- ── Bitwise and shift operators ───────────────────────────────────

@@ -2272,3 +2272,15 @@ C4 fast 执行的组合让**整个脚本**（不只 proc 体）享受编译执�
 
 门禁双引擎全绿：judge 88/88×2、battery 33/33×2、probes 18/18×2、
 fuzz 800 例 0 分歧×2、towasm 6/6、rtcl-vm 809。
+
+## fuzz f000137 定性（359e76d 后复查，2026-11-03）
+
+preexist_wasmi_f000137（lmap 体 $n 读）：三方 = tclsh 静默成功 /
+rtcl 报 can't read n（rtcl 自身的 lmap 体词法作用域 quirk，preexist
+rtcl≠tclsh）/ jitsh 静默成功 = **与 tclsh 一致（更正确）**。fuzz 门
+的 jit==rtcl 判据把该例计为分歧——实为 jit 修正了 rtcl 的 quirk。
+非本系列回归（C1/C4 前后均为 rtcl 错、jit 对）。
+
+附带发现：`time {...}` 体是嵌套 eval（深度≥2）→ 非 slot 编译——
+所有包 time 的基准从未测过顶层 slot 路径（测量方法学修正：裸循环
+文件墙钟）。

@@ -62,7 +62,57 @@ impl Interp {
     /// Value of slot `slot` in the current frame, when it holds one
     /// (unset slots and name-keyed frames both miss — the callers fall
     /// back to the name path).
+    /// 顶层 slot 边界（C2'）：ts set 槽 → 全局（分派读/链接写见最新）。
+    pub(crate) fn top_flush(&mut self) {
+        let Some(ts) = self.top_slots.as_ref() else { return };
+        for i in 0..ts.names.len() {
+            let v = &ts.values[i];
+            if !v.is_unset() {
+                self.globals.insert(ts.names[i].clone(), v.clone());
+            }
+        }
+    }
+
+    /// 顶层 slot 边界（C2'）：全槽 invalidate（分派可能改全局——槽读
+    /// 回落全局拉新）。数组名标记 aliased（槽写回落名路径 → is-array
+    /// 错误归属全链）。
+    pub(crate) fn top_invalidate(&mut self) {
+        let Some(ts) = self.top_slots.as_mut() else { return };
+        for i in 0..ts.names.len() {
+            ts.aliased[i] = !self.array_globals.is_empty()
+                && self.array_globals.contains(&ts.names[i]);
+            ts.values[i] = Value::unset();
+        }
+    }
+
+    /// 顶层 slot 单元（C2'）：单槽失效（纯 op 回落名路径写全局后——
+    /// 下一次槽读拉回全局真值）。
+    pub(crate) fn top_slot_invalidate_one(&mut self, slot: usize) {
+        let Some(ts) = self.top_slots.as_mut() else { return };
+        if let Some(cell) = ts.values.get_mut(slot) {
+            *cell = Value::unset();
+        }
+    }
+
+    /// 顶层 slot 单元（C2'）：名路径读后填槽（cache-fill）。
+    pub(crate) fn top_slot_fill(&mut self, slot: usize, value: &Value) {
+        let Some(ts) = self.top_slots.as_mut() else { return };
+        let Some(cell) = ts.values.get_mut(slot) else { return };
+        if cell.is_unset() {
+            *cell = value.clone();
+        }
+    }
+
     pub(crate) fn frame_slot_value(&self, slot: usize) -> Option<Value> {
+        // 顶层 slot 单元（C2'）：ts 权威读；unset → 名路径（全局拉取/
+        // 错误归属）。
+        if let Some(ts) = &self.top_slots {
+            let v = ts.values.get(slot)?;
+            if v.is_unset() || ts.aliased.get(slot).copied().unwrap_or(false) {
+                return None;
+            }
+            return Some(v.clone());
+        }
         let f = self.frames.last()?;
         if f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false) {
             // Global link: ONE probe with the canonical key (the name
@@ -83,6 +133,16 @@ impl Interp {
     /// bump happens only on the write, so a caller whose fallback consumes
     /// the value pays nothing extra on the attempt.
     pub(crate) fn frame_slot_write(&mut self, slot: usize, value: &Value) -> bool {
+        // 顶层 slot 单元（C2'）：ts 写（数组化槽 → 名路径，is-array
+        // 错误归属全链）。
+        if let Some(ts) = self.top_slots.as_mut() {
+            let Some(cell) = ts.values.get_mut(slot) else { return false };
+            if ts.aliased.get(slot).copied().unwrap_or(false) {
+                return false;
+            }
+            *cell = value.clone();
+            return true;
+        }
         let aliased = self
             .frames
             .last()
@@ -133,6 +193,16 @@ impl Interp {
         slot: usize,
         value: Value,
     ) -> core::result::Result<(), Value> {
+        if let Some(ts) = self.top_slots.as_mut() {
+            let Some(cell) = ts.values.get_mut(slot) else {
+                return Err(value);
+            };
+            if ts.aliased.get(slot).copied().unwrap_or(false) {
+                return Err(value);
+            }
+            *cell = value;
+            return Ok(());
+        }
         let aliased = self
             .frames
             .last()
@@ -182,6 +252,25 @@ impl Interp {
         if !self.var_traces.is_empty() {
             return false;
         }
+        // 顶层 slot 单元（C2'）：ts 读改写——**仅 list rep 直推**。
+        // unset/string-rep 槽一律回落名路径（边界 invalidate 后全局是
+        // 最新——lappend 的 CREATE 从零建表会丢全局累积元素，while
+        // llength 恒 1 死循环实证）；名路径读写全局后槽保持 unset，
+        // 下一次 LoadLocal 再拉回 ✓。
+        if let Some(ts) = self.top_slots.as_mut() {
+            let Some(cell) = ts.values.get_mut(slot) else { return false };
+            if ts.aliased.get(slot).copied().unwrap_or(false) {
+                return false; // 链接退化 → 名路径（链接语义归属）
+            }
+            if cell.is_unset() {
+                return false; // invalidate 后：全局是最新 → 名路径
+            }
+            if let Some(items) = cell.as_list_mut() {
+                items.push(value.clone());
+                return true;
+            }
+            return false; // string rep：名路径（严格解析错误归属）
+        }
         let Some(f) = self.frames.last_mut() else {
             return false;
         };
@@ -207,6 +296,16 @@ impl Interp {
     pub(crate) fn frame_slot_incr(&mut self, slot: usize, amount: i64) -> Option<Value> {
         if !self.var_traces.is_empty() {
             return None;
+        }
+        if let Some(ts) = self.top_slots.as_mut() {
+            let cell = ts.values.get_mut(slot)?;
+            if cell.is_unset() || ts.aliased.get(slot).copied().unwrap_or(false) {
+                return None;
+            }
+            let current = cell.as_int()?;
+            let next = current.checked_add(amount)?;
+            cell.set_int_rep(next);
+            return Some(cell.clone());
         }
         {
             let f = self.frames.last()?;
@@ -863,6 +962,46 @@ impl Interp {
     // ── public API ─────────────────────────────────────────────
 
     pub fn get_var(&self, name: &str) -> Result<&Value> {
+        // 顶层 slot 单元（C2'）：ts 分支——标量直读 / 数组-标量归属 /
+        // ::-资格读（顶层槽 = 全局，::leaf 同名可见）。
+        if let Some(ts) = &self.top_slots {
+            if !has_ns_sep(name) {
+                if let Some((base, _)) = split_array_ref(name) {
+                    // 数组读：base 在 ts 且 set（标量）→ is-array 错误。
+                    if let Some(i) = ts.names.iter().position(|n| n == base) {
+                        if !ts.aliased[i] && !ts.values[i].is_unset() {
+                            return Err(Error::runtime(
+                                format!("can't read \"{}\": variable isn't array", name),
+                                crate::error::ErrorCode::Generic,
+                            ));
+                        }
+                    }
+                } else if !name.contains('(') {
+                    // 标量槽名：直读（unset → 落全局链）。
+                    if let Some(i) = ts.names.iter().position(|n| n == name) {
+                        if !ts.aliased[i] {
+                            let v = &ts.values[i];
+                            if !v.is_unset() {
+                                return Ok(v);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // ::-资格读：leaf = 顶层槽名 → ts 值（全局别名 ✓）。
+                let leaf = name.rsplit("::").next().unwrap_or(name);
+                if !leaf.contains('(') {
+                    if let Some(i) = ts.names.iter().position(|n| n == leaf) {
+                        if !ts.aliased[i] {
+                            let v = &ts.values[i];
+                            if !v.is_unset() {
+                                return Ok(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let Some((array_name, index)) = split_array_ref(name) {
             let mut loc = self.resolve_loc(array_name);
             if !self.loc_is_array(&loc)
@@ -1000,6 +1139,40 @@ impl Interp {
     }
 
     pub fn set_var(&mut self, name: &str, value: Value) -> Result<Value> {
+        // 顶层 slot 单元（C2'）：ts 分支——标量写 / 数组-标量归属 /
+        // ::-leaf 写（顶层槽 = 全局）。
+        if let Some(ts) = self.top_slots.as_mut() {
+            if !has_ns_sep(name) {
+                if let Some((base, _)) = split_array_ref(name) {
+                    if let Some(i) = ts.names.iter().position(|n| n == base) {
+                        if !ts.aliased[i] && !ts.values[i].is_unset() {
+                            return Err(Error::runtime(
+                                format!("can't set \"{}\": variable isn't array", name),
+                                crate::error::ErrorCode::Generic,
+                            ));
+                        }
+                    }
+                } else if !name.contains('(') {
+                    if let Some(i) = ts.names.iter().position(|n| n == name) {
+                        if !ts.aliased[i] {
+                            ts.values[i] = value.clone();
+                            return Ok(value);
+                        }
+                    }
+                }
+            } else {
+                // ::-资格写：leaf = 顶层槽名 → ts 写。
+                let leaf = name.rsplit("::").next().unwrap_or(name);
+                if !leaf.contains('(') {
+                    if let Some(i) = ts.names.iter().position(|n| n == leaf) {
+                        if !ts.aliased[i] {
+                            ts.values[i] = value.clone();
+                            return Ok(value);
+                        }
+                    }
+                }
+            }
+        }
         // A write through an alias whose target namespace/array was
         // destroyed errors (var-1.15/1.16/1.17); reads keep working.
         if let Some(elem) = self.dead_link_error(name) {
@@ -1019,6 +1192,14 @@ impl Interp {
             // the name-keyed store (element keys are flat map entries; the
             // slot model has no element form).
             self.degrade_frame_local_here(array_name);
+            // 顶层 slot 单元（C2'）：ts 名数组化 → 槽标记 aliased（后续
+            // 槽写回落名路径——`set x 7` 的 is-array 错误归属与 tclsh
+            // 一致；标记漏发会让槽写静默覆盖）。
+            if let Some(ts) = self.top_slots.as_mut() {
+                if let Some(i) = ts.names.iter().position(|n| n == array_name) {
+                    ts.aliased[i] = true;
+                }
+            }
             let base = array_name.to_string();
             let idx = index.to_string();
             let loc = self.resolve_loc(array_name);
@@ -1271,6 +1452,25 @@ impl Interp {
             || !self.dead_flat.is_empty()
         {
             return None;
+        }
+        // 顶层 slot 单元（C2'）：名路径 incr——ts 权威 RMW。
+        if let Some(ts) = self.top_slots.as_mut() {
+            if self.frames.is_empty() && self.current_namespace.as_ref() == "::" {
+                if let Some(i) = ts.names.iter().position(|n| n == name) {
+                    if ts.aliased[i] {
+                        return None;
+                    }
+                    let cell = &mut ts.values[i];
+                    if cell.is_unset() {
+                        return None; // 真 incr 从 0 创建（cmd_incr → set_var ts 臂）
+                    }
+                    let current = cell.as_int()?;
+                    let next = current.checked_add(amount)?;
+                    cell.set_int_rep(next);
+                    return Some(cell.clone());
+                }
+                // 非槽名 → 落下方全局路径
+            }
         }
         let slot = if let Some(frame) = self.frames.last_mut() {
             if !frame.upvars.is_empty() && frame.upvars.contains_key(name) {

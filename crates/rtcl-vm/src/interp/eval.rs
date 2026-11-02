@@ -90,7 +90,15 @@ impl Interp {
                     // 嵌套体 eval（dict update/with、eval 命令）的变量
                     // 链接语义依赖非 slot 编译。foreach/lmap/catch 保持
                     // 顶层分派语义（compile_unit_toplevel）。
-                    let code = if self.eval_depth == 1 {
+                    // foreach/lmap 排除：其分派语义面（bind 写帧/体作
+                    // 用域）在顶层 slot 单元未覆盖 → 非 slot 编译（classic
+                    // 或解释器路径，正确性优先）。
+                    let has_foreach = rc.commands.iter().any(|c| {
+                        c.words.first().map(|w| {
+                            matches!(w, rtcl_parser::Word::Literal(n) if n == "foreach" || n == "lmap")
+                        }) == Some(true)
+                    });
+                    let code = if self.eval_depth == 1 && !has_foreach {
                         Rc::new(Compiler::compile_unit_toplevel(
                             Rc::clone(&rc.source),
                             &rc.commands,

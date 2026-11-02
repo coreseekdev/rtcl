@@ -407,6 +407,40 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
     // left installed (e.g. a `while` body rebased by cmd_while).
     interp.line_offset = entry_offset;
 
+    // 顶层 slot 单元（C2'）：ts 建立（守卫集 = 全语义分岔条件；任一
+    // 命中 → 槽 op 走 fallback 名路径 = C1 行为，正确不加速）。作用域
+    // = 本单元：嵌套执行前 take 悬挂，退出恢复。悬挂前 flush——嵌套
+    // 单元直写全局，其变更必须叠加在 pending 值之上（e.tcl 实证：缺
+    // flush 时 restore 的 stale 槽副本会在下一边界反向覆盖嵌套写入）。
+    if interp.top_slots.is_some() {
+        interp.top_flush();
+    }
+    let ts_saved = interp.top_slots.take();
+    let top_active = code.toplevel_slots
+        && interp.frames.is_empty()
+        && interp.current_namespace.as_ref() == "::"
+        && interp.var_traces.is_empty()
+        && interp.dead_flat.is_empty()
+        && interp.flat_aliases.is_empty();
+    if top_active {
+        let n = code.locals().len();
+        // aliased 初值 = 已是全局数组的名字（与 top_invalidate 同一规则
+        // ——槽 op 对数组名一律回落名路径，is-array 错误归属全链）。
+        let aliased: Vec<bool> = if interp.array_globals.is_empty() {
+            vec![false; n]
+        } else {
+            code.locals()
+                .iter()
+                .map(|nm| interp.array_globals.contains(nm.as_str()))
+                .collect()
+        };
+        interp.top_slots = Some(crate::interp::TopSlots {
+            names: code.locals().to_vec(),
+            values: vec![crate::value::Value::unset(); n],
+            aliased,
+        });
+    }
+
     // The executor state comes from the interp's pool: a proc call pays no
     // fresh allocations for the stack/loops/bodies/scratch Vecs (the pool
     // keeps their capacity).  Depth is naturally bounded by recursion —
@@ -447,6 +481,18 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
         interp.vm_pool.give(st);
         r
     };
+    if top_active {
+        // 单元退出 flush：槽写落全局（Ok/Err 双路——错误前写入持久，
+        // REPL/下一条 eval 必须看见）。
+        interp.top_flush();
+    }
+    interp.top_slots = ts_saved;
+    // 恢复悬挂的 ts 后 invalidate：嵌套单元直写全局（绕过 ts）——恢复
+    // 的槽副本已 stale，全槽回落全局拉新。此处**不可 flush**（stale
+    // 副本反向覆盖嵌套写入——e.tcl 的 lappend 丢失实证）。
+    if interp.top_slots.is_some() {
+        interp.top_invalidate();
+    }
 
     interp.cur_source = saved_source;
     interp.cur_cmd_text = saved_text;
@@ -504,6 +550,172 @@ fn redispatch_target(
     Some((unit, idx))
 }
 
+/// 顶层 slot 边界分类（C2'）：
+/// - Pure(0)：栈/算术/比较/跳转/标记/槽变量及其全部融合形态——零全局
+///   触达，ts 缓存不失效。回落链（unset/非整/非 list rep → 名路径或
+///   分派）各自持 ts 臂或前置 flush（op_store_local/op_incr_local/
+///   lappend 两臂），热路径零边界开销。
+/// - FlushOnly(1)：名键读——flush 后全局完整，直通咽喉
+///   （read_var_scalar_top）与 get_var ts 臂读到最新；读不写 → 无需
+///   失效。
+/// - FlushInvalidate(2)：可执行 Tcl 代码/按名写任意变量（分派、unset、
+///   名写、数组化）——flush + 全槽失效（失效先于 op：名路径全部落
+///   全局，嵌套树走查/分派体一致；槽读回落全局拉新）。
+/// 匹配穷举：新增 OpCode 变体在此编译失败 → 强制显式分类（优于静默
+/// fail-safe）。
+fn top_op_class(op: &OpCode) -> u8 {
+    match op {
+        // ── 名键读（FlushOnly）：flush 后全局完整 ──────────────────────
+        OpCode::EvalExpr { .. }
+        | OpCode::LoadVar(_)
+        | OpCode::LoadArrayElem(_)
+        | OpCode::VarExists(_)
+        | OpCode::AddVarVar(..)
+        | OpCode::AddVarImm(..)
+        | OpCode::CmpVarVar(..)
+        | OpCode::CmpVarImm(..)
+        | OpCode::CmpVarVarJumpTrue(..)
+        | OpCode::CmpVarVarJumpFalse(..)
+        | OpCode::CmpVarImmJumpTrue(..)
+        | OpCode::CmpVarImmJumpFalse(..) => 1,
+        // ── 分派/名写/作用域（FlushInvalidate）——显式列出仅为文档；
+        //    fail-safe 兜底同一类 ─────────────────────────────────────
+        OpCode::Call { .. }
+        | OpCode::DynCall { .. }
+        | OpCode::CallExpand { .. }
+        | OpCode::DynCallExpand { .. }
+        | OpCode::CallProc { .. }
+        | OpCode::TailCallProc { .. }
+        | OpCode::SubEndDynCall(..)
+        | OpCode::SubEndCall { .. }
+        | OpCode::EvalScript { .. }
+        | OpCode::CatchStart(_)
+        | OpCode::CatchEnd
+        | OpCode::UnsetVar(_)
+        | OpCode::StoreVar(_)
+        | OpCode::StoreVarPop(_)
+        | OpCode::SubEndStoreVarPop(_)
+        | OpCode::IncrVar(..)
+        | OpCode::IncrVarPop(..)
+        | OpCode::BeginCmdIncrVarPop(..)
+        | OpCode::ForNextIncrVar(..)
+        | OpCode::AppendVar(_)
+        | OpCode::LappendVar(_)
+        | OpCode::LappendVarVar(..)
+        | OpCode::StoreArrayElem(_)
+        | OpCode::VarSetAddVV { .. }
+        | OpCode::PushFrame(_)
+        | OpCode::PopFrame
+        | OpCode::UpVar { .. }
+        | OpCode::Global(_)
+        | OpCode::Exit(_)
+        | OpCode::ForeachStart { .. }
+        | OpCode::ForeachNext { .. }
+        | OpCode::ForeachNextClose(..)
+        | OpCode::ForeachCollect
+        | OpCode::ForeachEnd => 2,
+        // ── 纯 op（零全局触达）────────────────────────────────────────
+        // 栈/常量
+        OpCode::PushConst(_)
+        | OpCode::PushConstWide(_)
+        | OpCode::PushEmpty
+        | OpCode::PushInt(_)
+        | OpCode::PushFloat(_)
+        | OpCode::PushTrue
+        | OpCode::PushFalse
+        | OpCode::Pop
+        | OpCode::Dup
+        // 算术/比较/逻辑/位
+        | OpCode::Add
+        | OpCode::Sub
+        | OpCode::Mul
+        | OpCode::Div
+        | OpCode::Mod
+        | OpCode::Pow
+        | OpCode::Neg
+        | OpCode::Eq
+        | OpCode::Ne
+        | OpCode::Lt
+        | OpCode::Gt
+        | OpCode::Le
+        | OpCode::Ge
+        | OpCode::StrEq
+        | OpCode::StrNe
+        | OpCode::And
+        | OpCode::Or
+        | OpCode::Not
+        | OpCode::BitAnd
+        | OpCode::BitOr
+        | OpCode::BitXor
+        | OpCode::BitNot
+        | OpCode::Shl
+        | OpCode::Shr
+        // 栈上 list/str 原语
+        | OpCode::Concat(_)
+        | OpCode::MakeList(_)
+        | OpCode::ListAppend
+        | OpCode::ListIndex
+        | OpCode::ListLength
+        | OpCode::StrLen
+        | OpCode::StrIndex
+        | OpCode::ExpandList
+        | OpCode::ExpandMark
+        // 跳转/控制/信号（ unwind 出单元 → 退出 flush 兜底）
+        | OpCode::Jump(_)
+        | OpCode::JumpTrue(_)
+        | OpCode::JumpFalse(_)
+        | OpCode::LoopEnter { .. }
+        | OpCode::LoopExit
+        | OpCode::Break
+        | OpCode::Continue
+        | OpCode::Return
+        | OpCode::ReturnCode(_)
+        // 区域标记/元信息
+        | OpCode::BodyMark
+        | OpCode::BodyMarkFramed
+        | OpCode::NextMark
+        | OpCode::SubMark
+        | OpCode::SubEnd
+        | OpCode::ExprMark
+        | OpCode::SwapToNextMark
+        | OpCode::Line(_)
+        | OpCode::Nop
+        | OpCode::BeginCmd(_)
+        | OpCode::BeginCmdSubMark(_)
+        | OpCode::ExprMarkBeginCmd(_)
+        | OpCode::BeginCmdPushConst(..)
+        | OpCode::PushConstSubMark(_)
+        | OpCode::SubMarkBeginCmd(_)
+        | OpCode::ExprMarkBeginPushConst(..)
+        | OpCode::NextMarkBeginCmd(_)
+        // 槽 op（ts 权威读写；回落持 ts 臂）
+        | OpCode::LoadLocal(_)
+        | OpCode::StoreLocal(_)
+        | OpCode::StoreLocalPop(_)
+        | OpCode::IncrLocal(..)
+        | OpCode::IncrLocalPop(..)
+        | OpCode::LappendLocal(_)
+        | OpCode::LappendSlotSlot(..)
+        // 槽超算/融合
+        | OpCode::AddSlotSlot(..)
+        | OpCode::AddSlotImm(..)
+        | OpCode::SubSlotImm(..)
+        | OpCode::SubSlotSlot(..)
+        | OpCode::CmpSlotSlot(..)
+        | OpCode::CmpSlotImm(..)
+        | OpCode::CmpSlotSlotJumpTrue(..)
+        | OpCode::CmpSlotSlotJumpFalse(..)
+        | OpCode::CmpSlotImmJumpTrue(..)
+        | OpCode::CmpSlotImmJumpFalse(..)
+        | OpCode::SubEndStoreLocalPop(_)
+        | OpCode::SubEndAdd
+        | OpCode::SubEndReturn
+        | OpCode::BeginCmdIncrLocalPop(..)
+        | OpCode::ForNextIncrLocal(..)
+        | OpCode::SlotSetAddSS { .. } => 0,
+    }
+}
+
 fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<Value> {
     let ops = code.ops();
 
@@ -533,6 +745,28 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                 }
             }
         }
+        // ── 顶层 slot 边界（C2'）：非纯 op 前 flush+invalidate ─────────
+        // 纯 op = 栈/算术/比较/跳转/槽变量——零全局触达。白名单外
+        //（分派/名键读/eval…）先 flush（ts → 全局，分派读/链接写见
+        // 最新）再 invalidate（槽读回落全局拉新——分派写不丢）。
+        // fail-safe：未列举 op 默认非纯。另：单元中途注册 trace →
+        // flush + 永久降级（ts 写绕过 trace 触发不可接受）。
+        if interp.top_slots.is_some() {
+            if !interp.var_traces.is_empty() || !interp.dead_flat.is_empty() {
+                interp.top_flush();
+                interp.top_slots = None;
+            } else {
+                match top_op_class(op) {
+                    1 => interp.top_flush(),
+                    2 => {
+                        interp.top_flush();
+                        interp.top_invalidate();
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // ── Hot lane ────────────────────────────────────────────────────
         // The ops a compiled loop body is made of run inline: the
         // `exec_op` call + its second dispatch was the exec-side profile's
@@ -1072,7 +1306,14 @@ fn load_local_value(interp: &mut Interp, code: &ByteCode, slot: u16) -> Result<V
         Some(v) => Ok(v),
         None => {
             let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
-            interp.eval_var_ref(name)
+            // ts 激活：名路径读后填槽（后续读命中 ts；边界 invalidate
+            // 会清掉——分派写全局后重拉 ✓）。
+            let filled = interp.top_slots.is_some();
+            let v = interp.eval_var_ref(name)?;
+            if filled {
+                interp.top_slot_fill(slot, &v);
+            }
+            Ok(v)
         }
     }
 }
@@ -1092,6 +1333,8 @@ fn op_store_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: 
     if !interp.frame_slot_write(slot, &v) {
         let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
         interp.set_var(name, v)?;
+        // 名路径写全局 → ts 槽失效（下一次 LoadLocal 拉回全局真值）。
+        interp.top_slot_invalidate_one(slot);
     }
     Ok(())
 }
@@ -1111,6 +1354,8 @@ fn op_store_local_pop(
     if let Err(v) = interp.frame_slot_write_move(slot, v) {
         let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
         interp.set_var(name, v)?;
+        // 名路径写全局 → ts 槽失效。
+        interp.top_slot_invalidate_one(slot);
     }
     Ok(())
 }
@@ -1533,7 +1778,11 @@ fn incr_local_value(
     match interp.frame_slot_incr(slot, amount) {
         Some(v) => Ok(v),
         None => match interp.incr_var_fast(name(), amount) {
-            Some(v) => Ok(v),
+            Some(v) => {
+                // 名路径写全局 → ts 槽失效。
+                interp.top_slot_invalidate_one(slot);
+                Ok(v)
+            }
             None => {
                 let args = [
                     Value::from_str("incr"),
@@ -1872,6 +2121,12 @@ fn op_lappend_slot_slot(interp: &mut Interp, code: &ByteCode, src: u16, dst: u16
         return Ok(());
     }
     let name = code.locals().get(dst).map(String::as_str).unwrap_or("");
+    // 回落 = cmd_lappend 全语义——同 LappendLocal 臂：ts 激活先全量
+    // 同步（flush + invalidate），槽 pending 值落全局，名路径纯全局。
+    if interp.top_slots.is_some() {
+        interp.top_flush();
+        interp.top_invalidate();
+    }
     let args = [
         Value::from_str("lappend"),
         Value::from_str(name),
@@ -2271,6 +2526,14 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                     .unwrap_or_else(Value::empty);
                 st.stack.push(result);
             } else {
+                // 回落 = cmd_lappend 全语义（take_var_fast 全局直取 +
+                // set_var）——ts 激活时先全量同步（flush + invalidate）：
+                // 槽 pending 值落全局（stale-base 写丢 lappend 的实证
+                // w2），失效后名路径纯全局运行。
+                if interp.top_slots.is_some() {
+                    interp.top_flush();
+                    interp.top_invalidate();
+                }
                 // The name is only needed on the fallback path — keep the
                 // hot path free of the per-iteration String materialization.
                 let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
@@ -2821,6 +3084,18 @@ fn dispatch_dynamic(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// linked-slot resolution, canonical errors — all owned by the name path).
 #[inline(always)]
 fn slot_read_or_name(interp: &mut Interp, code: &ByteCode, slot: usize) -> Result<Value> {
+    // 顶层 slot 单元（C2'）：ts 权威读；unset → 名路径（全局拉取）。
+    if let Some(ts) = &interp.top_slots {
+        let Some(v) = ts.values.get(slot) else {
+            let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
+            return interp.eval_var_ref(name);
+        };
+        if v.is_unset() {
+            let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
+            return interp.eval_var_ref(name);
+        }
+        return Ok(v.clone());
+    }
     if let Some(f) = interp.frames.last() {
         if !(f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false)) {
             if let Some(v) = f.slots.get(slot) {

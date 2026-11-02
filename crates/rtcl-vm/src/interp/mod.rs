@@ -423,9 +423,22 @@ pub(crate) struct ExecStepCtx {
 }
 
 /// Tcl interpreter.
+/// 顶层 slot 单元的槽缓存（C2'）：values 仅归**单元槽 op**读写；
+/// 名路径（分派中的 set_var/get_var/…）只触全局。同步 = 边界
+///（非纯 op 前）flush（set 槽 → 全局）+ invalidate（全槽 → unset，
+/// 读回落全局拉新）。纯 op 循环零全局触达 = 提速来源。
+pub(crate) struct TopSlots {
+    pub names: Vec<String>,
+    pub values: Vec<Value>,
+    /// 名已数组化/链接（槽 op 回落名路径，is-array 错误归属全链）。
+    pub aliased: Vec<bool>,
+}
+
 pub struct Interp {
     /// Variables (global scope).
     pub(crate) globals: VarMap<Value>,
+    /// 顶层 slot 单元执行中（Some = 激活；exec_bytecode 进出管理）。
+    pub(crate) top_slots: Option<TopSlots>,
     /// Names in `globals` that are arrays (scalar/array distinction).
     pub(crate) array_globals: VarSet,
     /// True while `array_globals` holds ONLY the startup arrays
@@ -842,6 +855,7 @@ impl Interp {
             err_from_subst: false,
             lexical_body: false,
             eval_depth: 0,
+            top_slots: None,
             next_eval_lexical: false,
             err_pending_top: None,
             ns_level0: Vec::new(),

@@ -338,7 +338,19 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Marks for the eval-level variable links this body creates — they
     // die with it (tclsh's ns-eval varFrame pops).
     let prev = std::mem::replace(&mut interp.current_namespace, Rc::from(qualified.clone()));
+    // 顶层 slot 单元（C2'）：ns 体运行期间悬挂 ts——ns 体变量的解析规则
+    // 是 ns 表（ts 分支会劫持，gen_basic 实证）。悬挂前 flush（pending
+    // 落全局，ns 体变更叠加其上）；恢复后 invalidate（ns 体直写全局，
+    // 恢复副本 stale——flush 会反向覆盖，只能失效拉新）。
+    if interp.top_slots.is_some() {
+        interp.top_flush();
+    }
+    let saved_ts = interp.top_slots.take();
     let result = interp.eval(&body);
+    interp.top_slots = saved_ts;
+    if interp.top_slots.is_some() {
+        interp.top_invalidate();
+    }
     interp.current_namespace = prev;
     interp.ns_stack.pop();
     interp.ns_level0.pop();

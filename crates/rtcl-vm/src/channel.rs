@@ -448,17 +448,22 @@ enum FileMode {
 struct FileChannel {
     mode: FileMode,
     at_eof: bool,
+    /// ReadWrite 的共享逻辑位置（tclsh r+ 单一位置语义，D-28）：读经
+    /// BufReader 预读使底层 fd 位置超前于逻辑位，写前必须把 fd 回卷到
+    /// 逻辑位（弃缓冲）再写，否则读后写落到错误偏移。Read/Write 模式
+    /// 单向，无此问题（None）。
+    rw_pos: Option<u64>,
 }
 
 impl FileChannel {
     fn new_read(f: std::fs::File) -> Self {
-        FileChannel { mode: FileMode::Read(BufReader::new(f)), at_eof: false }
+        FileChannel { mode: FileMode::Read(BufReader::new(f)), at_eof: false, rw_pos: None }
     }
     fn new_write(f: std::fs::File) -> Self {
-        FileChannel { mode: FileMode::Write(f), at_eof: false }
+        FileChannel { mode: FileMode::Write(f), at_eof: false, rw_pos: None }
     }
     fn new_readwrite(f: std::fs::File) -> Self {
-        FileChannel { mode: FileMode::ReadWrite(BufReader::new(f)), at_eof: false }
+        FileChannel { mode: FileMode::ReadWrite(BufReader::new(f)), at_eof: false, rw_pos: Some(0) }
     }
 }
 
@@ -466,7 +471,13 @@ impl Channel for FileChannel {
     fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = match &mut self.mode {
             FileMode::Read(r) => r.read(buf)?,
-            FileMode::ReadWrite(r) => r.read(buf)?,
+            FileMode::ReadWrite(r) => {
+                let n = r.read(buf)?;
+                if let Some(pos) = self.rw_pos.as_mut() {
+                    *pos += n as u64;
+                }
+                n
+            }
             FileMode::Write(_) => return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied, "channel wasn't opened for reading",
             )),
@@ -478,7 +489,13 @@ impl Channel for FileChannel {
         let mut line = String::new();
         let n = match &mut self.mode {
             FileMode::Read(r) => r.read_line(&mut line)?,
-            FileMode::ReadWrite(r) => r.read_line(&mut line)?,
+            FileMode::ReadWrite(r) => {
+                let n = r.read_line(&mut line)?;
+                if let Some(pos) = self.rw_pos.as_mut() {
+                    *pos += n as u64;
+                }
+                n
+            }
             FileMode::Write(_) => return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied, "channel wasn't opened for reading",
             )),
@@ -491,7 +508,14 @@ impl Channel for FileChannel {
         let mut s = String::new();
         match &mut self.mode {
             FileMode::Read(r) => { r.read_to_string(&mut s)?; }
-            FileMode::ReadWrite(r) => { r.read_to_string(&mut s)?; }
+            FileMode::ReadWrite(r) => {
+                r.read_to_string(&mut s)?;
+                // 整读后逻辑位 = fd 位（EOF）：BufReader 可能还持缓冲，
+                // 但底层 fd 已到真 EOF。
+                if let Some(pos) = self.rw_pos.as_mut() {
+                    *pos = r.get_mut().stream_position()?;
+                }
+            }
             FileMode::Write(_) => return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied, "channel wasn't opened for reading",
             )),
@@ -502,7 +526,15 @@ impl Channel for FileChannel {
     fn write_bytes(&mut self, data: &[u8]) -> io::Result<usize> {
         match &mut self.mode {
             FileMode::Write(f) => f.write(data),
-            FileMode::ReadWrite(r) => r.get_mut().write(data),
+            FileMode::ReadWrite(r) => {
+                // D-28：写前把 fd 回卷到共享逻辑位——BufReader::seek 弃
+                // 预读缓冲并把 fd 定位到逻辑位，写后逻辑位 = fd 位。
+                let pos = self.rw_pos.unwrap_or(0);
+                r.seek(io::SeekFrom::Start(pos))?;
+                let n = r.get_mut().write(data)?;
+                self.rw_pos = Some(pos + n as u64);
+                Ok(n)
+            }
             FileMode::Read(_) => Err(io::Error::new(
                 io::ErrorKind::PermissionDenied, "channel wasn't opened for writing",
             )),
@@ -516,13 +548,23 @@ impl Channel for FileChannel {
         }
     }
     fn seek(&mut self, whence: io::SeekFrom) -> io::Result<u64> {
-        match &mut self.mode {
-            FileMode::Read(r) => r.seek(whence),
-            FileMode::Write(f) => f.seek(whence),
-            FileMode::ReadWrite(r) => r.seek(whence),
-        }
+        let pos = match &mut self.mode {
+            FileMode::Read(r) => r.seek(whence)?,
+            FileMode::Write(f) => f.seek(whence)?,
+            FileMode::ReadWrite(r) => {
+                let p = r.seek(whence)?;
+                self.rw_pos = Some(p);
+                p
+            }
+        };
+        Ok(pos)
     }
     fn tell(&mut self) -> io::Result<u64> {
+        // ReadWrite 的逻辑位由 rw_pos 记账（BufReader 预读使 fd 位超前，
+        // seek(Current 0) 探到的是 fd 位而非 tclsh 语义的通道位）。
+        if let Some(pos) = self.rw_pos {
+            return Ok(pos);
+        }
         self.seek(io::SeekFrom::Current(0))
     }
     fn eof(&self) -> bool { self.at_eof }

@@ -334,6 +334,17 @@ impl Error {
         matches!(self, Error::ControlFlow { kind: ControlFlow::Return, .. })
     }
 
+    /// The completion code a deferred Return carries in its `level` slot
+    /// (return_with_code): 0=ok, 1=error, 2=return, 3=break, 4=continue;
+    /// negative encodes an explicit `-level N` value form as −(N+1).
+    /// Distinct from [`Error::return_code`] (the flow kind as a Tcl code).
+    pub fn deferred_code(&self) -> i32 {
+        match self {
+            Error::ControlFlow { kind: ControlFlow::Return, level, .. } => *level,
+            _ => 0,
+        }
+    }
+
     /// Check if this is a break
     pub fn is_break(&self) -> bool {
         matches!(self, Error::ControlFlow { kind: ControlFlow::Break, .. })

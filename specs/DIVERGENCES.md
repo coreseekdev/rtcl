@@ -77,15 +77,20 @@
 - **复现**：`try {error y} on error {m o} {puts $::errorInfo}`
 - **严重度**：低。
 
-### D-11 文件模式顶层 `return -code error` / `break` 收尾语义
+### D-11 文件模式顶层 `return -code error` / `break` 收尾语义 [FIXED 2026-11-03]
 - **Tcl 8.6**：顶层 `return -code error boom` 打印完整 errorInfo（含
   `(file ...)` 帧）rc=1；顶层 `break` 打印
   `invoked "break" outside of a loop` + 帧序列 rc=1。
-- **rtcl**：`return -code error` 静默 rc=0（main.rs 把 is_return 当成功）；
-  `break` 打印裸 `break` rc=1。REPL 侧已对齐（REPL-TCLSH-PARITY.md），
-  仅 -f 文件模式错。
-- **复现**：`printf 'return -code error boom\n' > /tmp/t.tcl; rtcl -f /tmp/t.tcl`
-- **严重度**：中。
+- **rtcl 原状**：`return -code error` 静默 rc=0；`break` 打印裸 `break`。
+- **修复**：`Interp::decode_toplevel_flow`（eval.rs）+ 双引擎
+  `defer_flow_frame`/unwind_subs(flow) 帧延迟——按 -code 解码顶层
+  return（error/break/continue→错误，值形式→正常完成），帧归属=
+  「看到该完成的命令」（最外层胜）。-f/-c/REPL 三面统一；t1/t2/t3/
+  t5/t6/ns 七形状与 tclsh 逐字节一致（foreach 体归属亦一致）。
+- **精化项（OPEN，先前即有）**：proc 内 break 经 call.rs 出口转换后
+  跨内联 if 体仍缺 `invoked from within "if {1} {f}"` 帧（
+  err_fresh-attribution：转换错误不应享受体内错误的抑制）。
+- **严重度**：已关闭（精化项低）。
 
 ### dict 面（dict.allium + specs/dict-deep.probes）
 
@@ -198,14 +203,14 @@
 
 ### IO / chan / file / encoding 面（io.allium + specs/io-deep.probes）
 
-### D-28 r+ 通道读写交错位置错乱（数据损坏级）
+### D-28 r+ 通道读写交错位置错乱（数据损坏级）[FIXED 2026-11-03]
 - **Tcl 8.6**：r+ 通道单一共享位置：`puts AAAA; seek 0; read 2; puts B`
   得 "AAB"（原地覆写）。
-- **rtcl**：得 "AAAA\nB"——FileChannel::ReadWrite 读用 BufReader
-  （预读使 fd 位置超前）、写直接 get_mut().write，读后写落到错误偏移
-  （channel.rs:460-524）。
-- **复现**：io-deep.probes 第 7 行。
-- **严重度**：**高**（数据损坏类；tclsh 位置语义是文档行为）。
+- **rtcl 原状**：得 "AAAA\nB"——BufReader 预读使 fd 位置超前。
+- **修复**：FileChannel 记账 `rw_pos` 共享逻辑位——写前 BufReader::seek
+  回卷弃缓冲、写后逻辑位=fd 位；tell 返回逻辑位；read_all 后同步到
+  EOF。读写交错/覆写/tell 三探针与 tclsh 逐字节一致。
+- **严重度**：已关闭。
 
 ### D-29 `encoding` 命令整体缺失 + `-encoding` 不校验不使用（spec io [D-30]）
 - **Tcl 8.6**：`encoding convertfrom/convertto/names/system` 齐备
@@ -221,11 +226,19 @@
   把 at_eof 置位（后续 eof=1）。
 - **严重度**：中。
 
-### D-31 `-c` 模式 `exit N` 退出码错误（spec io [D-32]）
+### D-31 `-c` 模式 `exit N` 退出码错误（spec io [D-32]）[FIXED 2026-11-03]
 - **tclsh**：`tclsh -c 'exit 7'` rc=7 无输出。
-- **rtcl**：打印 `Error: exit with value: 7` 且 rc=1（main.rs:111-122 未
-  特判 Exit 完成码；-f 文件模式 rc=N 正确，REPL 已对齐）。
-- **严重度**：中。
+- **rtcl 原状**：打印 `Error: exit with value: 7` 且 rc=1。
+- **修复**：run_command is_exit→rc=N 静默、is_return→正常完成（2026-11-03
+  工作区）；顶层 return 解码归 D-11。
+- **严重度**：已关闭。
+
+### 在途观察（2026-11-03 记）：并行会话批次
+- error-deep 探针显示 D-4/D-6/D-7/D-8 已转 SAME（catch options 解码、
+  -errorcode 污染、exit 不可捕获、TIP 388 throw）；dict-deep DIFF 由
+  12→5。控制面批次（control.rs/dict.rs/stdlib.tcl/mod.rs）仍在途：
+  **judge gen_join/gen_split/gen_ioCmd 三例 errorCode 送达回归
+  （TCL WRONGARGS / TCL LOOKUP CHANNEL → NONE），待其收官验证**。
 
 ### D-32 `vwait` 空队列报错而非阻塞（spec io [D-33]）
 - **tclsh**：vwait 永久阻塞（有事件循环）。

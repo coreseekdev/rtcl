@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 
 use super::{Interp, Rc};
-use crate::error::{Error, Result};
+use crate::error::{ControlFlow, Error, Result};
 use crate::parser::{Command, Word};
 use crate::value::Value;
 use rtcl_parser::Compiler;
@@ -255,6 +255,9 @@ impl Interp {
                 tcl_log_excerpt(&script[start..end])
             ));
             self.err_line = pe.line;
+            // 一个新错误的 errorInfo 是全新的（tclsh ERR_LOGGED 语义）：
+            // 之前被循环吞掉的控制流完成留下的延迟帧在此作废。
+            self.err_pending_top = None;
         }
         Error::syntax(&pe.message, pe.line, pe.column)
     }
@@ -520,6 +523,15 @@ impl Interp {
             if self.err_is_error(e) {
                 let msg = e.message_text();
                 self.err_harness_frame(&msg, cmd.text.slice(&unit.source), cmd.line + self.line_offset);
+            } else if e.is_break()
+                || e.is_continue()
+                || e.is_return() && matches!(e.deferred_code(), 1 | 3 | 4)
+            {
+                // D-11：顶层将升级为错误的控制流完成在本命令帧上延迟
+                // （tclsh 在转换点记录看到该完成的命令；最外层胜）。
+                // catch/try 消费路径由既有 err_pending_top 清理兜底。
+                self.err_pending_top = Some(Rc::from(cmd.text.slice(&unit.source)));
+                self.err_line = cmd.line + self.line_offset;
             }
         }
         self.cur_source = saved_source;
@@ -874,6 +886,76 @@ impl Interp {
             }
         }
         e.to_string()
+    }
+
+    /// Top-level control-flow completion decoding (tclsh main-loop
+    /// semantics, D-11): with no enclosing catch/proc/loop left, a
+    /// deferred `return -code error/break/continue` and a bare
+    /// break/continue ARE errors.  Converts in place, seeding errorInfo
+    /// with the deferred converting-command frame (tclsh logs the frame
+    /// of the command whose dispatch saw the completion); a `-errorinfo`
+    /// option replaces the auto base (TclProcessReturn).  Plain value
+    /// returns and exit pass through untouched.
+    pub fn decode_toplevel_flow(&mut self, e: Error) -> Error {
+        if self.err_is_error(&e) || e.is_exit() {
+            return e;
+        }
+        let (is_flow_error, msg) = match &e {
+            Error::ControlFlow { kind: ControlFlow::Break, .. } => (
+                true,
+                "invoked \"break\" outside of a loop".to_string(),
+            ),
+            Error::ControlFlow { kind: ControlFlow::Continue, .. } => (
+                true,
+                "invoked \"continue\" outside of a loop".to_string(),
+            ),
+            Error::ControlFlow { kind: ControlFlow::Return, level, .. } => match *level {
+                1 => (true, e.message_text()),
+                3 => (
+                    true,
+                    "invoked \"break\" outside of a loop".to_string(),
+                ),
+                4 => (
+                    true,
+                    "invoked \"continue\" outside of a loop".to_string(),
+                ),
+                _ => (false, String::new()),
+            },
+            _ => (false, String::new()),
+        };
+        if !is_flow_error {
+            return e;
+        }
+        // The errorInfo base: a -errorinfo option replaces it wholesale;
+        // otherwise the deferred converting-command frame starts the
+        // trace (tclsh logs it at the conversion point).
+        let error_info = match &e {
+            Error::ControlFlow { error_info: Some(info), .. } => {
+                self.err_pending_top = None;
+                Some(info.clone())
+            }
+            _ => self.err_pending_top.take().map(|text| {
+                format!(
+                    "{}\n    while executing\n\"{}\"",
+                    msg,
+                    tcl_log_excerpt(&text)
+                )
+            }),
+        };
+        if let Some(info) = &error_info {
+            self.err_info = Some(info.clone());
+            self.err_fresh = false;
+        }
+        Error::ControlFlow {
+            kind: ControlFlow::Error,
+            value: Some(Value::from_str(&msg)),
+            level: 1,
+            error_info,
+            error_code: match &e {
+                Error::ControlFlow { error_code, .. } => error_code.clone(),
+                _ => None,
+            },
+        }
     }
 
     /// Evaluate a word to get its value.

@@ -304,7 +304,13 @@ fn loop_signal(st: &mut VmState, e: Error) -> Result<()> {
 /// case, `expr {[if {1} {error x}]}`).  Body/next regions crossed add
 /// nothing (their constructs log no frames of their own, the err_fresh
 /// suppression).
-fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error) {
+///
+/// `flow=true` marks a control-flow completion that will become an error
+/// at the top level (D-11): tclsh logs the frame of the command whose
+/// dispatch saw the completion, so EVERY region kind overwrites the
+/// pending slot with its owner command's text (outermost wins) instead
+/// of the error-path's suppress/append behaviour.
+fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error, flow: bool) {
     while let Some(region) = st.bodies.last().copied() {
         st.bodies.pop();
         match region {
@@ -318,23 +324,62 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                 let site = &code.sites[site_idx];
                 let text = site.text.slice(&code.source);
                 let line = st.entry_offset + site.line as usize;
-                let msg = e.message_text();
-                interp.err_harness_frame(&msg, text, line);
+                if flow {
+                    interp.err_pending_top = Some(Rc::from(text));
+                    interp.err_line = line;
+                } else {
+                    let msg = e.message_text();
+                    interp.err_harness_frame(&msg, text, line);
+                }
             }
-            Region::Body(_) | Region::Next(_) => {}
+            Region::Body(site_idx) | Region::Next(site_idx) => {
+                if flow {
+                    let site = &code.sites[site_idx];
+                    interp.err_pending_top =
+                        Some(Rc::from(site.text.slice(&code.source)));
+                    interp.err_line = st.entry_offset + site.line as usize;
+                }
+            }
             Region::BodyFramed(site_idx, lmap) => {
                 let site = &code.sites[site_idx];
                 let text = site.text.slice(&code.source);
                 let line = st.entry_offset + site.line as usize;
-                let tag = if lmap { "\"lmap\" body" } else { "\"foreach\" body" };
-                interp.err_exit_frame(tag);
-                // The foreach command's own harness frame follows
-                // immediately (`invoked from within`) — tclsh logs it
-                // before the error escapes the foreach command.
-                interp.err_harness_frame(e.message_text().as_str(), text, line);
+                if flow {
+                    interp.err_pending_top = Some(Rc::from(text));
+                    interp.err_line = line;
+                } else {
+                    let tag = if lmap { "\"lmap\" body" } else { "\"foreach\" body" };
+                    interp.err_exit_frame(tag);
+                    // The foreach command's own harness frame follows
+                    // immediately (`invoked from within`) — tclsh logs it
+                    // before the error escapes the foreach command.
+                    interp.err_harness_frame(e.message_text().as_str(), text, line);
+                }
             }
         }
     }
+}
+
+/// D-11: a control-flow completion that will become an error at the top
+/// level (bare break/continue, deferred `return -code error/break/
+/// continue`) defers its converting-command frame — tclsh logs the frame
+/// of the command whose dispatch saw the completion (outermost deferral
+/// wins, same discipline as word-subst frames; catch/try consumption
+/// clears the pending slot).  Open Sub regions keep overwriting via
+/// `unwind_subs` with the substitution owner's command text.
+fn defer_flow_frame(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error) {
+    let flow = e.is_break()
+        || e.is_continue()
+        || e.is_return() && matches!(e.deferred_code(), 1 | 3 | 4);
+    if !flow {
+        return;
+    }
+    if st.cur_site != usize::MAX {
+        let site = &code.sites[st.cur_site];
+        interp.err_pending_top = Some(Rc::from(site.text.slice(&code.source)));
+        interp.err_line = st.entry_offset + site.line as usize;
+    }
+    unwind_subs(interp, code, st, e, true);
 }
 
 /// Process-level JIT hook for proc bodies (M2 seam).
@@ -1033,10 +1078,16 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             if !interp.err_is_error(&e) && (e.is_break() || e.is_continue()) {
                 match loop_signal(st, e) {
                     Ok(()) => continue,
-                    Err(e) => return Err(e),
+                    // 无循环消费（顶层裸 break/continue）：D-11 帧延迟
+                    // 与下方 gate 同款，再传播。
+                    Err(e) => {
+                        defer_flow_frame(interp, code, st, &e);
+                        return Err(e);
+                    }
                 }
             }
             if !interp.err_is_error(&e) {
+                defer_flow_frame(interp, code, st, &e);
                 return Err(e);
             }
             // A unit whose FIRST `BeginCmd` failed the recursion guard
@@ -1057,7 +1108,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                 .last()
                 .is_some_and(|r| r.site() == st.cur_site)
             {
-                unwind_subs(interp, code, st, &e);
+                unwind_subs(interp, code, st, &e, false);
                 return Err(e);
             }
             // Everything else appends this command's harness frame —
@@ -1080,7 +1131,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             // the top level (the tree-walk's CommandSub word boundary, the
             // outermost deferral winning); each expression-operand owner
             // appends its harness frame.
-            unwind_subs(interp, code, st, &e);
+            unwind_subs(interp, code, st, &e, false);
             return Err(e);
         }
     };

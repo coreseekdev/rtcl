@@ -1,0 +1,18 @@
+# 深水区探针（对应 variables.allium "namespaces deep water" 节；probe.sh 差分）
+namespace eval d { proc p {} {set x 1} }; d::p; puts [info exists d::x]
+namespace eval d { proc p {} {variable x 5; incr x} }; d::p; d::p; puts [set ::d::x]
+proc p {} {set z 9}; namespace eval d {p}; puts [info exists d::z]
+namespace eval d { proc p {} {global g; set g 42} }; d::p; puts $g
+namespace eval d { proc p {} {return 1} }; puts [catch p]
+set g 0; namespace eval d {upvar 1 g l; set l 5}; puts $g
+set a(e) 1; proc p {} {upvar 0 ::a(e) x; set x 7}; p; puts $a(e)
+namespace eval d {variable v 5}; proc mk {} {upvar 0 ::d::v l; set l 9}; namespace delete d; catch {mk} m; puts $m
+set s 1; namespace eval o {variable s 9; namespace eval i {set s 2}}; puts [list $::o::s $s]
+set s 1; namespace eval o {variable s 9; set s 8}; puts [list $::o::s $s]
+namespace eval d {set x 5}; namespace delete d; puts [info exists d::x]
+namespace eval d {namespace delete [namespace current]; set y 3}; puts [info exists d::y]
+set g 1; namespace eval d {puts [namespace which -variable g]}
+set w 1; namespace eval d {set d2 [incr w]}; puts [list $w [info exists d2] [info exists d::d2]]
+set k 1; proc bump {} {global k; incr k}; bump; namespace eval d {incr k}; puts $k
+set a(x) 1; namespace eval d {set a(y) 2}; puts [list $a(x) $a(y)]
+namespace eval d {variable v; puts [namespace which -variable v]}

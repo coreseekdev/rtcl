@@ -608,7 +608,25 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let other_var = args[i].as_str();
             let local_var = args[i + 1].as_str();
             let target_key = if target_ns == "::" {
-                other_var.to_string()
+                // 根 ns 目标：同帧路径的规范化 + 死父 ns 检查。
+                let key = other_var.strip_prefix("::").unwrap_or(other_var);
+                if let Some((p, _)) = key.rsplit_once("::") {
+                    let parent = format!("::{}", p);
+                    if parent != "::" && !interp.namespaces.contains_key(&parent) {
+                        set_error_code(
+                            interp,
+                            &format!("TCL LOOKUP VARNAME {}", other_var),
+                        );
+                        return Err(Error::runtime(
+                            format!(
+                                "can't access \"{}\": parent namespace doesn't exist",
+                                other_var
+                            ),
+                            crate::error::ErrorCode::Generic,
+                        ));
+                    }
+                }
+                key.to_string()
             } else {
                 interp.canonical_global_in(&target_ns, other_var)
             };
@@ -673,14 +691,67 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // target (upvar-4.2: p3 aliases p2's alias of p1's local;
         // upvar-8.5: the reverse link closes a cycle onto itself).
         let mut link = match &target {
-            UpvarTarget::GlobalNs => UpvarLink::Global(Rc::from(other_var.as_str())),
+            UpvarTarget::GlobalNs => {
+                // 根 ns 目标键规范化：剥前导 ::——元素形式 a(e) 的下游
+                // 写路径按无 :: 的全局键路由（深水探针 DIFF-6：
+                // `upvar 0 ::a(e) x` 原落到 "::a(e)" 键，元素写丢失）。
+                let key = other_var.strip_prefix("::").unwrap_or(&other_var);
+                // 建链目标的父 ns 必须存在（tclsh：can't access
+                // "::d::v": parent namespace doesn't exist——深水探针
+                // DIFF-7：原对已删 ns 静默建链）。
+                if let Some((p, _)) = key.rsplit_once("::") {
+                    let parent = format!("::{}", p);
+                    if parent != "::" && !interp.namespaces.contains_key(&parent) {
+                        set_error_code(
+                            interp,
+                            &format!("TCL LOOKUP VARNAME {}", other_var),
+                        );
+                        return Err(Error::runtime(
+                            format!(
+                                "can't access \"{}\": parent namespace doesn't exist",
+                                other_var
+                            ),
+                            crate::error::ErrorCode::Generic,
+                        ));
+                    }
+                }
+                UpvarLink::Global(Rc::from(key))
+            }
             UpvarTarget::Ns(ns) => {
                 UpvarLink::Global(Rc::from(interp.canonical_global_in(ns, &other_var)))
             }
-            UpvarTarget::Frame(fi) => UpvarLink::Frame {
-                frame_index: *fi,
-                var_name: other_var.clone(),
-            },
+            UpvarTarget::Frame(fi) => {
+                // 帧目标的**根限定**名穿 ns 规则解析（tclsh level-N 帧
+                // 的 ::x = 全局变量，不是帧局部字面名——深水探针
+                // DIFF-6/7 公共根因：`upvar 0 ::d::v l` 原 Rel(0) 落
+                // Frame{var_name: "::d::v"} 静默建帧局部，ns 检查与
+                // 元素路由全被绕过）。
+                match other_var.strip_prefix("::") {
+                    Some(key) => {
+                        if let Some((p, _)) = key.rsplit_once("::") {
+                            let parent = format!("::{}", p);
+                            if parent != "::" && !interp.namespaces.contains_key(&parent) {
+                                set_error_code(
+                                    interp,
+                                    &format!("TCL LOOKUP VARNAME {}", other_var),
+                                );
+                                return Err(Error::runtime(
+                                    format!(
+                                        "can't access \"{}\": parent namespace doesn't exist",
+                                        other_var
+                                    ),
+                                    crate::error::ErrorCode::Generic,
+                                ));
+                            }
+                        }
+                        UpvarLink::Global(Rc::from(key))
+                    }
+                    None => UpvarLink::Frame {
+                        frame_index: *fi,
+                        var_name: other_var.clone(),
+                    },
+                }
+            }
         };
         for _ in 0..=interp.frames.len() {
             let next = match &link {

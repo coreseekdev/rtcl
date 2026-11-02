@@ -102,3 +102,145 @@ rule NamespaceVariableCommandLinksNamespaceVar {
     ensures: completion.code = ok
     ensures: completion.value = "7"
 }
+
+-- ── namespaces deep water: ns × proc × upvar × delete ────────────
+-- 2026-11-03 深水区检测（C2'/链修复后的语义面）。每条 rule 附完整
+-- probe 行（specs/variables-deep.probes 同源，probe.sh 差分）。
+
+rule ProcSetCreatesFrameLocalNotNsVar {
+    -- proc 体是严格局部帧：ns 内定义的 proc 调用时 set 建**帧局部**，
+    -- 定义 ns 的变量表不出现该名（proc 的 ns 只影响命令解析与
+    -- variable 链目标）。
+    when: Evaluates("info exists d::x    -- after: namespace eval d {proc p {} {set x 1}}; p")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- probe: namespace eval d { proc p {} {set x 1} }; p; puts [info exists d::x]
+}
+
+rule ProcVariableDeclAccumulatesAcrossCalls {
+    -- proc 内 variable 声明链到**定义 ns** 的变量表；initializer 只在
+    -- 创建时生效（变量已存在则保留现值）——跨调用累积。
+    when: Evaluates("set ::d::x    -- after: namespace eval d {proc p {} {variable x 5; incr x}}; p; p")
+    ensures: completion.code = ok
+    ensures: completion.value = "7"
+    -- probe: namespace eval d { proc p {} {variable x 5; incr x} }; p; p; puts [set ::d::x]
+}
+
+rule ProcCalledFromNsBodyStillStrictLocal {
+    -- 调用点在 ns eval 体内也不改变 proc 的严格局部性。
+    when: Evaluates("info exists d::z    -- after: proc p {} {set z 9}; namespace eval d {p}")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- probe: proc p {} {set z 9}; namespace eval d {p}; puts [info exists d::z]
+}
+
+rule ProcGlobalTargetsRootNamespace {
+    -- global 恒链**根 ns**，与 proc 的定义 ns 无关。
+    when: Evaluates("set g    -- after: namespace eval d {proc p {} {global g; set g 42}}; p")
+    ensures: completion.code = ok
+    ensures: completion.value = "42"
+    -- probe: namespace eval d { proc p {} {global g; set g 42} }; p; puts $g
+}
+
+rule UpvarThroughNsEvalFrame {
+    -- ns eval 体是帧：upvar 1 从体链到**调用 namespace eval 的帧**
+    -- （顶层的 g 是全局 g）。
+    when: Evaluates("set g    -- after: set g 0; namespace eval d {upvar 1 g l; set l 5}")
+    ensures: completion.code = ok
+    ensures: completion.value = "5"
+    -- probe: set g 0; namespace eval d {upvar 1 g l; set l 5}; puts $g
+}
+
+rule UpvarElementQualifiedTarget {
+    -- upvar 0 链元素目标（限定名绕过 proc 帧局部解析）。
+    when: Evaluates("set a(e)    -- after: set a(e) 1; proc p {} {upvar 0 ::a(e) x; set x 7}; p")
+    ensures: completion.code = ok
+    ensures: completion.value = "7"
+    -- probe: set a(e) 1; proc p {} {upvar 0 ::a(e) x; set x 7}; p; puts $a(e)
+}
+
+rule UpvarToDeletedNsVariable {
+    -- ns delete 后对已销毁 ns 变量建 upvar 链：建链时刻目标的父 ns
+    -- 必须存在，否则报 can't access（var-1.15 族深水）。oracle 实证
+    -- 2026-11-03；rtcl 原静默建帧局部（Frame 臂字面名）已修。
+    when: Evaluates("catch {mk} m; set m    -- after: namespace eval d {variable v 5}; proc mk {} {upvar 0 ::d::v l; set l 9}; namespace delete d")
+    ensures: completion.code = ok
+    ensures: completion.value = "can't access \"::d::v\": parent namespace doesn't exist"
+    -- probe: namespace eval d {variable v 5}; proc mk {} {upvar 0 ::d::v l; set l 9}; namespace delete d; catch {mk} m; puts $m
+}
+
+rule VariableLinkIsPerEvalBodyFrame {
+    -- variable 声明是**体帧瞬态**：内层 ns eval 体无链接；其裸名 set
+    -- 走两级链 → 全局（父 ns 不在链上）。外层声明只影响本帧。
+    when: Evaluates("list $::o::s $s    -- after: set s 1; namespace eval o {variable s 9; namespace eval i {set s 2}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "9 2"
+    -- probe: set s 1; namespace eval o {variable s 9; namespace eval i {set s 2}}; puts [list $::o::s $s]
+}
+
+rule NsBodySetHitsDeclaredLink {
+    -- 同帧内声明后的裸名 set 落链接目标（ns 变量），全局不动。
+    when: Evaluates("list $::o::s $s    -- after: set s 1; namespace eval o {variable s 9; set s 8}")
+    ensures: completion.code = ok
+    ensures: completion.value = "8 1"
+    -- probe: set s 1; namespace eval o {variable s 9; set s 8}; puts [list $::o::s $s]
+}
+
+rule NsDeleteDestroysVariables {
+    when: Evaluates("info exists d::x    -- after: namespace eval d {set x 5}; namespace delete d")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- probe: namespace eval d {set x 5}; namespace delete d; puts [info exists d::x]
+}
+
+rule SelfDeleteBodyKeepsRunning {
+    -- 体中自删：body 继续跑、[namespace current] 保持到体退出
+    --（tclsh 34.x）；之后的 set 落已删 ns 的**帧视图**（随体消亡，
+    -- ns 变量表不复活）。oracle 实证 2026-11-03：info exists d::y = 0。
+    -- rtcl 把 y 写进了 d 的表（DIVERGENCES.md D-2 OPEN）。
+    when: Evaluates("info exists d::y    -- after: namespace eval d {namespace delete [namespace current]; set y 3}")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- probe: namespace eval d {namespace delete [namespace current]; set y 3}; puts [info exists d::y]
+    -- rtcl: 1（OPEN 分歧，见 specs/DIVERGENCES.md D-2）
+}
+
+rule WhichVariableFollowsChain {
+    -- namespace which -variable 沿同一两级链报告**找到的位置**。
+    when: Evaluates("namespace eval d {namespace which -variable g}    -- after: set g 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "::g"
+    -- probe: set g 1; namespace eval d {puts [namespace which -variable g]}
+}
+
+rule NsBodyChainIncrGlobalSlot {
+    -- C2' 桥：顶层槽变量经 ns 体 incr（链 → 全局）后，外层槽读见
+    -- 新值（悬挂 invalidate 生效）。
+    when: Evaluates("list $w $d2    -- after: set w 1; namespace eval d {set d2 [incr w]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 3"
+    -- probe: set w 1; namespace eval d {set d2 [incr w]}; puts [list $w $d2]
+}
+
+rule ProcGlobalWriteThenNsBodyIncr {
+    -- global 写 + ns 体链 incr 叠加于同一全局。
+    when: Evaluates("set k    -- after: set k 1; proc bump {} {global k; incr k}; bump; namespace eval d {incr k}")
+    ensures: completion.code = ok
+    ensures: completion.value = "3"
+    -- probe: set k 1; proc bump {} {global k; incr k}; bump; namespace eval d {incr k}; puts $k
+}
+
+rule NsBodyArrayElementChain {
+    -- 数组元素链（L 形状）：ns 体元素写落**全局基**；顶层槽/名读双见。
+    when: Evaluates("list $a(x) $a(y)    -- after: set a(x) 1; namespace eval d {set a(y) 2}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2"
+    -- probe: set a(x) 1; namespace eval d {set a(y) 2}; puts [list $a(x) $a(y)]
+}
+
+rule WhichVariableReportsNsVar {
+    when: Evaluates("namespace eval d {namespace which -variable v}")
+    ensures: completion.code = ok
+    ensures: completion.value = "::d::v"
+    -- probe: namespace eval d {variable v; puts [namespace which -variable v]}
+}

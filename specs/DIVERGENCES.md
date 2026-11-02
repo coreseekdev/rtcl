@@ -39,3 +39,13 @@
 - 原状态（2026-10-03）：namespace/lsort/variable/proc 边缘组合 5 例。
 - 现状态：**逐字节一致**（2026-10-07 实测 diff 为空；HANDOFF §3 的
   5-case 计数已过时，judge case 级 4072/4072）。
+
+### D-2 ns eval 体中自删后的 set 复活 ns 变量表（2026-11-03，深水探针）
+- **行为**：`namespace eval d { namespace delete [namespace current]; set y 3 }`
+  ——体中自删后继续跑的体的 set 落**已删 ns 的帧视图**（随体消亡）。
+- **Tcl 8.6**：`info exists d::y` → 0（变量随 ns 销毁，set 只在帧视图）。
+- **rtcl**：`info exists d::y` → 1（set 复活了 d 的变量表条目）。
+- **复现**：specs/variables-deep.probes 第 12 行；variables.allium
+  SelfDeleteBodyKeepsRunning。
+- **严重度**：低（自删后继续用体的形状罕见；体语义其余部分——
+  current 保持、读已删变量 keep-alive——一致）。

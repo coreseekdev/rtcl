@@ -255,14 +255,18 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // keep-alive marker (dropped when this `namespace eval`
             // exits).
             if !raw_name.contains("::") {
+                // 瞬态链接挂 ns_transient（体帧作用域——ns eval 体入口
+                // take/退出恢复），不进 flat_aliases：upvar 的 eval 级
+                // 别名是持久链接（var-3.10），variable 链接随声明体帧
+                // 生灭、不漏入嵌套体（DIFF-8）。
                 let existing = interp
-                    .flat_aliases
+                    .ns_transient
                     .iter_mut()
                     .find(|(k, _)| *k == raw_name);
                 match existing {
                     Some((_, t)) => *t = qualified.to_string(),
                     None => interp
-                        .flat_aliases
+                        .ns_transient
                         .push((raw_name.to_string(), qualified.to_string())),
                 }
                 if !interp.ns_variable_links.iter().any(|x| x.as_str() == &*qualified) {
@@ -346,7 +350,13 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         interp.top_flush();
     }
     let saved_ts = interp.top_slots.take();
+    // 体帧瞬态作用域（深水探针 DIFF-8）：variable 的瞬态链接是帧作用
+    // 域——体的声明不入外层、外层声明对体不可见。ns_transient 入口
+    // take 清空、退出恢复。upvar 的 eval 级别名在 flat_aliases 持久
+    // （var-3.10），不在此作用域内。
+    let saved_transient = std::mem::take(&mut interp.ns_transient);
     let result = interp.eval(&body);
+    interp.ns_transient = saved_transient;
     interp.top_slots = saved_ts;
     if interp.top_slots.is_some() {
         interp.top_invalidate();

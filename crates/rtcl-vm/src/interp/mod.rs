@@ -655,6 +655,11 @@ pub struct Interp {
     /// deletes ITSELF leaves the declared variable readable for the rest
     /// of the body — var-1.16/1.17's `set result` after the self-delete).
     pub(crate) ns_variable_links: Vec<String>,
+    /// `variable` 命令在 eval 级装的**瞬态**链接（裸名 → ns 变量键）：
+    /// 体帧作用域（var-3.10 与 DIFF-8 的分野——upvar 的 eval 级别名链
+    /// 接两个持久 ns 变量、随 flat_aliases 持久；variable 链接随声明
+    /// 体帧生灭、不漏入嵌套体）。ns eval 体入口 take 清空、退出恢复。
+    pub(crate) ns_transient: Vec<(String, String)>,
     /// Namespace variables kept alive past `namespace delete` because a
     /// live variable link still references them; dropped when the
     /// declaring `namespace eval` exits.
@@ -842,6 +847,7 @@ impl Interp {
             flat_aliases: Vec::new(),
             dead_flat: Vec::new(),
             ns_variable_links: Vec::new(),
+            ns_transient: Vec::new(),
             ns_eval_keep: Vec::new(),
             err_info: None,
             err_fresh: false,

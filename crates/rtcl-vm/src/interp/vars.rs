@@ -506,9 +506,15 @@ impl Interp {
     }
 
     /// Follow an eval-level `upvar` alias (global level): the alias's flat
-    /// key maps to the target's flat key.
+    /// key maps to the target's flat key.  `variable` 命令的瞬态链接
+    /// （ns_transient——体帧作用域）同一重定向语义。
     fn redirect_flat(&self, key: String) -> String {
         for (k, t) in &self.flat_aliases {
+            if *k == key {
+                return t.clone();
+            }
+        }
+        for (k, t) in &self.ns_transient {
             if *k == key {
                 return t.clone();
             }
@@ -1344,6 +1350,17 @@ impl Interp {
                 return Ok(value);
             }
             let loc = self.resolve_loc(name);
+            // 链接/别名目标为元素形式（深水 DIFF-6：upvar 0 ::a(e) x 的
+            // 链接写原按裸键直插，数组标记/元素路由全失）——以限定元素
+            // 名重入，走数组元素写全链，与直接 `set ::a(e)` 同形。良构
+            // 守卫：须以 ) 收尾（set-old-4.5 的 `a(bcd` 半开名是标量，
+            // 递归即无穷）。
+            if let VarLoc::Global(k) = &loc {
+                if k.ends_with(')') && k.contains('(') {
+                    let q = format!("::{}", k);
+                    return self.set_var(&q, value);
+                }
+            }
             if self.loc_is_array(&loc) {
                 return Err(Error::runtime(
                     format!("can't set \"{}\": variable is array", name),

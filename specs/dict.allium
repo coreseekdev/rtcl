@@ -1,0 +1,177 @@
+-- allium: 3
+-- dict.allium
+-- Behaviour spec: dictionaries — construction, key semantics, paths,
+-- iteration, update/with scoping, error surfaces.
+-- Oracle: tclsh 8.6.17. 2026-11-03 deep-water round.
+-- rtcl divergences from this spec are tracked in DIVERGENCES.md
+-- (D-11 … D-16).
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── construction & keys ───────────────────────────────────────────
+
+rule DictCreateDuplicateKeyLastWins {
+    when: Evaluates("dict create a 1 a 2")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 2"
+    -- also: dict size [dict create a 1 a 2] => 1
+}
+
+rule DictKeysAreExactStrings {
+    -- Keys compare as exact strings: 1 vs 1.0 vs 01 vs 0x10 are all
+    -- distinct; "" is a legal key.
+    when: Evaluates("dict get [dict create 1 a 1.0 b] 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "a"
+    -- probe: dict get [dict create 08 x 0x10 y] 8  =>  key "8" not known in dictionary
+}
+
+rule DictCreateRejectsOddArgs {
+    when: Evaluates("catch {dict create a} m; set m")
+    ensures: completion.code = ok
+    -- oracle: wrong # args: should be "dict create ?key value ...?"
+    -- (no -ordered/-unordered switches exist in tclsh: they parse as keys)
+}
+
+rule DictGetNoKeyMustValidateDict {
+    -- `dict get dictvalue` with no key still requires the value to be a
+    -- valid even-length dict.
+    when: Evaluates("catch {dict get {a b c}} m; set m")
+    ensures: completion.code = ok
+    -- oracle: missing value to go with key
+    -- rtcl: returns "a b c" unvalidated  [D-11]
+}
+
+-- ── paths ─────────────────────────────────────────────────────────
+
+rule DictSetCreatesIntermediates {
+    when: Evaluates("set d {}; dict set d a b x 1; set d")
+    ensures: completion.code = ok
+    ensures: completion.value = "a {b {x 1}}"
+}
+
+rule DictUnsetKeepsEmptyIntermediates {
+    -- Unsetting the last leaf of a nested path leaves the intermediate
+    -- dicts in place (as empty dicts).
+    when: Evaluates("set d {a {x 1}}; dict unset d a x; set d")
+    ensures: completion.code = ok
+    ensures: completion.value = "a {}"
+}
+
+rule DictUnsetMissingSingleKeyIsNoop {
+    when: Evaluates("set d {a 1}; dict unset d zz; set d")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 1"
+}
+
+rule DictSetRejectsArrayElementName {
+    -- dict set's varName is a plain variable name; array-element syntax
+    -- is rejected by the variable layer.
+    when: Evaluates("catch {dict set a(1) k v} m; set m")
+    ensures: completion.code = ok
+    -- oracle: can't set "a(1)": variable isn't array
+    -- rtcl: creates array element a(1) = {k v}  [D-12]
+}
+
+-- ── value mutation edges ──────────────────────────────────────────
+
+rule DictIncrNonIntegerErrors {
+    when: Evaluates("set d {k abc}; catch {dict incr d k} m; list $m $d")
+    ensures: completion.code = ok
+    -- oracle: expected integer but got "abc" | k abc  (dict unchanged)
+    -- rtcl: silently resets to {k 1}  [D-13]
+}
+
+rule DictLappendBadListErrors {
+    -- dict lappend on a value that is not a valid list is an error and
+    -- leaves the dict unchanged.
+    when: Evaluates("set v \"x{ y\"; set d [dict create k $v]; catch {dict lappend d k z} m; list $m $d")
+    ensures: completion.code = ok
+    -- oracle: unmatched open brace in list | k "x{ y"
+    -- rtcl: silently resets to {k z}  [D-13]
+}
+
+-- ── iteration ─────────────────────────────────────────────────────
+
+rule DictForReturnsEmpty {
+    -- dict for always completes with the empty string, whatever the
+    -- body's last result.
+    when: Evaluates("dict for {k v} {a 1 b 2} {expr {$v+5}}")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- rtcl: returns the body's last result ("7")  [D-14]
+}
+
+rule DictMapBreakDiscardsAccumulated {
+    -- dict map discards everything accumulated before a break; the
+    -- result is the empty dict.
+    when: Evaluates("dict map {k v} {a 1 b 2 c 3} {if {$k==\"c\"} {break}; expr {$v*10}}")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- rtcl: keeps accumulated pairs ("a 10 b 20")  [D-14]
+}
+
+-- ── update / with ─────────────────────────────────────────────────
+
+rule DictUpdateRequiresExistingVariable {
+    -- dict update on a variable that does not exist is a read error.
+    when: Evaluates("catch {dict update novar k v {set v 5}} m; set m")
+    ensures: completion.code = ok
+    -- oracle: can't read "novar": no such variable
+    -- rtcl: treats as empty dict, runs body, does not create variable  [D-15]
+}
+
+rule DictUpdateWritesBackOnAnyCompletion {
+    -- dict update writes the mapped keys back on ok, error, return,
+    -- break and continue completions alike.
+    when: Evaluates("set d {a 1}; catch {dict update d a v {set v 5; error boom}}; set d")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 5"
+}
+
+rule DictUpdateUnsetInBodyRemovesKey {
+    when: Evaluates("set d {a 1 b 2}; dict update d a v {unset v}; set d")
+    ensures: completion.code = ok
+    ensures: completion.value = "b 2"
+}
+
+-- ── subcommand dispatch ───────────────────────────────────────────
+
+rule DictUnknownSubcommandMessage {
+    when: Evaluates("catch {dict zzz} m; set m")
+    ensures: completion.code = ok
+    -- oracle: unknown or ambiguous subcommand "zzz": must be append,
+    --   create, exists, filter, for, get, incr, info, keys, lappend, map,
+    --   merge, remove, replace, set, size, unset, update, values, or with
+    --   (errorCode TCL LOOKUP SUBCOMMAND)
+    -- rtcl: unknown dict subcommand: zzz  [D-16]
+}
+
+rule DictUniquePrefixDispatch {
+    -- Unique prefix matching selects subcommands: dict cr == create,
+    -- dict ge == get.
+    when: Evaluates("dict cr a 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 1"
+    -- rtcl: no prefix dispatch (falls through to proc lookup)  [D-16]
+}
+
+rule DictInfoReportsHashStats {
+    -- dict info prints the hash-table statistics block (multi-line,
+    -- buckets/distribution/search distance).
+    when: Evaluates("catch {dict info {a 1}} m; set m")
+    ensures: completion.code = ok
+    -- oracle: "1 entries in table, 4 buckets\nnumber of buckets with..." (multi-line)
+    -- rtcl: "1 entries in ordered dict"  [D-16]
+}
+
+rule DictLookupErrorCarriesErrorCode {
+    when: Evaluates("catch {dict get {a 1} b} m o; dict get $o -errorcode")
+    ensures: completion.code = ok
+    ensures: completion.value = "TCL LOOKUP DICT b"
+    -- rtcl: NONE  [D-16]
+}

@@ -1,0 +1,150 @@
+-- allium: 3
+-- error-deep.allium
+-- Behaviour spec: exception semantics deep water — catch options dict,
+-- return -code/-level interplay, exit, throw (TIP 388), try trap,
+-- errorInfo frames, errorCode lifecycle.
+-- Oracle: tclsh 8.6.17. 2026-11-03 deep-water round.
+-- Known rtcl divergences from this spec are tracked in DIVERGENCES.md
+-- (D-2 … D-8).
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── catch options dict ────────────────────────────────────────────
+
+rule CatchErrorOptionsDictHasSixKeys {
+    -- On an error completion the options dict carries exactly six keys:
+    -- -code -level -errorcode -errorinfo -errorstack -errorline.
+    when: Evaluates("dict keys $o    -- after: catch {error boom} m o")
+    ensures: completion.code = ok
+    -- oracle value: -errorcode -code -level -errorstack -errorinfo -errorline
+    -- (key order unspecified; all six must be present)
+    -- rtcl: only 4 keys — missing -errorstack and -errorline  [D-2]
+    -- probe: catch {error boom} m o; puts [dict keys $o]
+}
+
+rule CatchNonErrorOptionsLevel {
+    -- Level bookkeeping in the options dict counts the frame the
+    -- completion crossed: a caught `return hi` is -code 0 -level 1
+    -- (the return was converted to ok at the proc boundary); caught
+    -- break/continue are -code 3/4 -level 0.
+    when: Evaluates("set o    -- after: catch {return hi} v o    -- proc call")
+    ensures: completion.code = ok
+    ensures: completion.value = "-code 0 -level 1"
+    -- probe: proc f {} {return hi}; catch {f} v o; puts $o
+    -- rtcl: -code 2 -level 0  [D-3]
+    -- probe: catch {break} v o; puts $o  =>  -code 3 -level 0
+    -- rtcl: -level 1  [D-3]
+}
+
+rule CatchReturnCodeErrorViaProcIsError {
+    -- `return -code error msg` caught through a proc boundary reports
+    -- catch code 2 (a return completion) but the options dict shows the
+    -- decoded form: -code 1 -level 1 -errorcode NONE.
+    when: Evaluates("catch {f} m o    -- with proc f {} {return -code error boom}")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+    -- oracle $o: -code 1 -level 1 -errorcode NONE
+    -- rtcl: -code 2 -level 0 (undecoded)  [D-3]
+}
+
+rule CatchReturnCodeIntegerAbove4 {
+    -- return -code N for integer N > 4 is caught as code 2 (return);
+    -- the raw N lands only in the options dict (-code N -level 1).
+    when: Evaluates("catch {return -code 7 x} m o")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+    -- oracle $o: -code 7 -level 1
+    -- rtcl: catch reports 7 directly  [D-4]
+}
+
+rule ReturnLevelTwoValueEscapesTwoFrames {
+    -- return -level 2 v (value form) unwinds two frames; caught at the
+    -- top it is -code 0 -level 2 in the options dict.
+    when: Evaluates("catch {return -level 2 v} m o")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+    -- oracle $m: v ; oracle $o: -code 0 -level 2
+    -- rtcl: -code 2 -level 0  [D-5]
+}
+
+rule ReturnLevelWithCodeErrorMaterialisesAboveNFrames {
+    -- return -level N -code error materialises the error N frames above
+    -- the thrower: errorInfo shows only frames above the Nth.
+    when: Evaluates("catch {f1} m    -- with f1 {f2}; f2 {return -level 2 -code error deep}")
+    ensures: completion.code = ok
+    ensures: completion.value = "deep"
+    -- oracle errorInfo:
+    --   deep
+    --       while executing
+    --   "f1"
+    -- rtcl errorInfo materialises one level early (includes
+    --   "f2" + (procedure "f1" line 1) frames)  [D-5]
+}
+
+-- ── errorCode lifecycle ───────────────────────────────────────────
+
+rule ReturnErrorcodeDoesNotPolluteGlobalErrorCode {
+    -- return -errorcode on a NON-error completion must not write
+    -- ::errorCode; the variable stays unset until a real error, so the
+    -- next error's code is its own.
+    when: Evaluates("set errorCode    -- after: proc p {} {return -errorcode {A B} v}; catch p; catch {expr 1/0}")
+    ensures: completion.code = error
+    -- oracle value: ARITH DIVZERO {divide by zero}
+    -- rtcl: A B (return -errorcode wrote ::errorCode even on ok)  [D-6]
+    -- probe: proc p {} {return -errorcode {A B} v}; catch p; catch {expr 1/0}; puts $errorCode
+}
+
+-- ── exit / throw ──────────────────────────────────────────────────
+
+rule ExitIsNotCatchable {
+    -- exit terminates the process immediately; catch cannot intercept it
+    -- and nothing after it runs.
+    when: Evaluates("catch {exit 3} m; puts after")
+    ensures: completion.code = error
+    -- oracle: prints nothing, process exit code 3
+    -- rtcl: prints "after", exit code 0 (exit is catchable)  [D-7]
+}
+
+rule ThrowIsTip388ErrorCodeMessage {
+    -- throw (TIP 388) takes errorCode first, message second:
+    -- throw {E C} msg raises msg with errorCode E C.
+    when: Evaluates("catch {throw {E C} msg} m; list $m $::errorCode")
+    ensures: completion.code = ok
+    -- oracle value: msg {E C}
+    -- rtcl: jimtcl-style throw code ?msg? — errors with
+    --   bad completion code "E C"  [D-8]
+}
+
+-- ── try ───────────────────────────────────────────────────────────
+
+rule TryTrapMatchesErrorCodePrefix {
+    -- try supports the trap handler: its pattern list is matched as a
+    -- prefix against errorCode.
+    when: Evaluates("try {expr 1/0} trap {ARITH DIVZERO *} {m} {set m}")
+    ensures: completion.code = ok
+    ensures: completion.value = "divide by zero"
+    -- rtcl: bad handler type "trap"  [D-9]
+}
+
+rule TryBodyErrorsCarryTryFrame {
+    -- An error inside a try body gains a ("try" body line N) frame in
+    -- errorInfo.
+    when: Evaluates("try {error y} on error {m o} {set ::errorInfo}")
+    ensures: completion.code = ok
+    -- oracle value contains:
+    --   ("try" body line 1)
+    -- rtcl: frame missing  [D-10]
+}
+
+rule TryOnHandlerVarListOptional {
+    -- The on handler's varList is optional: `on error {} {...}` with an
+    -- empty list binds nothing; the 3-word form after the code word is
+    -- legal.
+    when: Evaluates("catch {try {error x} on error {} {} finally {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}

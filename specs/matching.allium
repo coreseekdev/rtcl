@@ -1,0 +1,185 @@
+-- allium: 3
+-- matching.allium
+-- Behaviour spec: pattern matching and value formatting — regexp /
+-- regsub (Tcl ARE), string match (glob), format / scan, binary, clock.
+-- Oracle: tclsh 8.6.17. 2026-11-03 deep-water round.
+-- rtcl divergences from this spec are tracked in DIVERGENCES.md
+-- (D-17 … D-26).
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── regexp: Tcl ARE surface ───────────────────────────────────────
+
+rule RegexpSupportsBackreferences {
+    -- Backreferences \1..\9 are ARE syntax and must work.
+    when: Evaluates("list [regexp {(a+)\\1} aaaa] [regexp {(a)\\1} a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+rule RegexpSupportsLookahead {
+    -- Lookahead constraints (?=re) / (?!re) are ARE syntax and work.
+    when: Evaluates("list [regexp {(?=c)ab|a} abc] [regexp {(?!x)a} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+rule RegexpLookbehindIsCompileError {
+    -- Lookbehind constraints (?<=re) / (?<!re) do not exist in tclsh
+    -- 8.6 ARE; both fail to compile.
+    when: Evaluates("regexp {(?<!x)y} xy")
+    ensures: completion.code = error
+    -- oracle: couldn't compile regular expression pattern: quantifier operand invalid
+    -- rtcl: fast-engine routing misses (?<= / (?<! and leaks the Rust
+    --   regex-crate parse error; the BT fallback would answer 0/1
+    --   (a superset of tclsh)  [D-17]
+}
+
+rule RegexpRejectsNonCapturingGroups {
+    -- Tcl ARE has no (?:...) syntax: tclsh rejects it as
+    -- "quantifier operand invalid".
+    when: Evaluates("regexp {(?:ab|a)(?=c)} abc")
+    ensures: completion.code = error
+    -- oracle: couldn't compile regular expression pattern: quantifier operand invalid
+}
+
+rule RegexpRejectsUnicodeEscapes {
+    -- \uXXXX / \x{...} inside a pattern are invalid escapes in tclsh
+    -- 8.6 ARE (\x41 two-digit hex IS valid).
+    when: Evaluates("regexp {\\u0041} A")
+    ensures: completion.code = error
+    -- oracle: couldn't compile regular expression pattern: invalid escape \ sequence
+    -- rtcl: accepts, matches literal 'A'  [D-18]
+}
+
+rule RegexpLazyQuantifierPreference {
+    -- Tcl's engine preference for (a+?)(a*) on "aaa": the lazy group
+    -- takes its minimum and the match stops there — the full match is
+    -- "a", not "aaa".
+    when: Evaluates("regexp -inline {(a+?)(a*)} aaa")
+    ensures: completion.code = ok
+    ensures: completion.value = "a a {}"
+    -- rtcl: "aaa a aa" (backtracking-first semantics)  [D-19]
+}
+
+rule RegexpLineanchorDoesNotMoveA {
+    -- \A binds to the -start offset only; -lineanchor must not turn \A
+    -- into a line-start assertion.
+    when: Evaluates("regexp -lineanchor -start 1 {\\Aa} \"b\\na\"")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- rtcl: 1 (rewrites \A to (?m)^ inside the fast engine)  [D-20]
+    -- probe without -lineanchor: regexp -start 2 {\Aa} "b\na" => 1 (both)
+}
+
+-- ── regsub ────────────────────────────────────────────────────────
+
+rule RegsubBackrefsAndEscapes {
+    -- \1..\9 are group refs, & is the whole match, \\ is a literal
+    -- backslash in the replacement.
+    when: Evaluates("list [regsub {(\\w)(\\w)} hi {\\2\\1&}] [regsub {x} x {\\\\&}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "ihhi \\x"
+}
+
+rule RegexpSupportsLookahead {
+    -- Lookahead constraints (?=re) / (?!re) are ARE syntax and work.
+    when: Evaluates("list [regexp {(?=c)ab|a} abc] [regexp {(?!x)a} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+rule RegsubHasNoCommandOption {
+    -- tclsh 8.6 regsub has no -command option.
+    when: Evaluates("regsub -command {o} foo up x")
+    ensures: completion.code = error
+    -- oracle: bad option "-command": must be -all, -nocase, -expanded,
+    --   -line, -linestop, -lineanchor, -start, or --
+    -- rtcl: -command is an rtcl-only extension  [D-21]
+}
+
+-- ── string match ──────────────────────────────────────────────────
+
+rule StringMatchRejectsExtraArgsAsOptions {
+    -- With more than 3 words tclsh parses the first extra word as an
+    -- option and reports it.
+    when: Evaluates("string match a b c")
+    ensures: completion.code = error
+    -- oracle: bad option "a": must be -nocase
+    -- rtcl: returns 0 (silently treats words as pattern/string)  [D-22]
+}
+
+rule StringMatchNocaseIsPerCharSimpleFold {
+    -- -nocase folds per character (simple case mapping): İ (U+0130)
+    -- matches i.
+    when: Evaluates("string match -nocase İ i")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- rtcl: 0 (whole-string Rust to_lowercase gives two-char expansion)  [D-22]
+}
+
+-- ── format / scan ─────────────────────────────────────────────────
+
+rule FormatCIsBmpOnly {
+    -- %c renders Tcl_UniChar (16-bit) values: 65536 wraps to U+FFFD
+    -- territory — no astral-plane character is produced.
+    when: Evaluates("format %c 65536")
+    ensures: completion.code = ok
+    -- oracle: U+FFFD (replacement char, bytes ef bf bd)
+    -- rtcl: U+10000 astral char (f0 90 80 80)  [D-23]
+}
+
+-- ── binary ────────────────────────────────────────────────────────
+
+rule BinaryNetworkFieldsAreBigEndian {
+    -- t/n/m (16/32/64-bit network order) are big-endian on both format
+    -- and scan. (Verified: binary scan [binary format n 1] H* => 00000001.)
+    when: Evaluates("binary scan [binary format t 1 m 1] H* h")
+    ensures: completion.code = ok
+    -- oracle h: 00010000000000000000000000000000 ... (t big-endian, then m)
+    -- rtcl matches tclsh here (earlier suspicion of LE bug was wrong)
+}
+
+rule BinaryScanShortInputLeavesVarsUnset {
+    when: Evaluates("set r [binary scan ab a5 v]; list $r [info exists v]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+}
+
+-- ── clock ─────────────────────────────────────────────────────────
+
+rule ClockFormatUsesLocalTimezone {
+    -- clock format renders in the process's local timezone (%Z/%z give
+    -- its abbreviation/offset); TZ is honoured.
+    when: Evaluates("clock format 0")
+    ensures: completion.code = ok
+    -- oracle (TZ=Asia/Shanghai): Thu Jan 01 08:00:00 CST 1970
+    -- rtcl: always UTC "Thu Jan 01 00:00:00 UTC 1970"  [D-24]
+    -- probe: clock format 0 -format "%Z %z"  =>  CST +0800
+    -- rtcl: "UTC %z" — %z conversion is also missing  [D-24]
+}
+
+rule ClockScanSupportsIsoDates {
+    -- clock scan parses ISO and free-form dates.
+    when: Evaluates("clock scan 2000-01-01")
+    ensures: completion.code = ok
+    -- oracle: 946656000
+    -- rtcl: "clock scan: format parsing not yet implemented"  [D-24]
+}
+
+-- ── glob ──────────────────────────────────────────────────────────
+
+rule GlobMatchesTclGlobSemantics {
+    -- glob uses Tcl's glob rules: ** is two *s (no recursion), {a,b}
+    -- is NOT alternation, leading dots are not matched by *.
+    when: Evaluates("glob -nocomplain {a,b}")
+    ensures: completion.code = ok
+    -- oracle: {} (literal braces as filename chars)
+    -- rtcl: uses the Rust glob crate: ** recursion + {} alternation +
+    --   leading-dot matching diverge  [D-25]
+    -- probe: glob -nocomplain **/*.md  — rtcl recurses; tclsh does not
+}

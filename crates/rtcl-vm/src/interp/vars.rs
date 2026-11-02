@@ -516,6 +516,35 @@ impl Interp {
         key
     }
 
+    /// eval 级裸名链命中（名字解析专项 2026-11-03）：tclsh 的变量解析
+    /// 链两级——当前 ns 表 → 全局（**父 ns 不在链上**，nr2.tcl G/H
+    /// 实证）。当前 ns 的基名「存在」（globals 值或 `variable` 声明记
+    /// 录——valueless 声明也截链）→ None（写/删落当前 ns）；否则全局
+    /// 裸键存在 → Some(全局裸键)（写/删落全局）；否则 None（创建点 =
+    /// 当前 ns，B/F-fresh 形状）。proc 帧、限定名、根 ns、dead-alias
+    /// 环境恒 None（现状行为不变）。
+    fn ns_chain_global(&self, bare_name: &str) -> Option<String> {
+        if !self.frames.is_empty()
+            || self.current_namespace.as_ref() == "::"
+            || bare_name.contains("::")
+            || !self.dead_flat.is_empty()
+        {
+            return None;
+        }
+        let ns_key = self.canonical_global(bare_name);
+        let ns_has = self.globals.contains_key(ns_key.as_str())
+            || self
+                .namespaces
+                .get(self.current_namespace.as_ref())
+                .map(|i| i.variables.contains(&ns_key))
+                .unwrap_or(false);
+        if ns_has {
+            return None;
+        }
+        let gkey = self.redirect_flat(bare_name.to_string());
+        self.globals.contains_key(gkey.as_str()).then_some(gkey)
+    }
+
     /// Dead-link write check (tclsh 8.6.17): only WRITES through an alias
     /// whose target was destroyed error; reads/`info exists`/unset keep the
     /// pre-deletion behavior against the seeded local copy.  Returns
@@ -988,9 +1017,13 @@ impl Interp {
                     }
                 }
             } else {
-                // ::-资格读：leaf = 顶层槽名 → ts 值（全局别名 ✓）。
-                let leaf = name.rsplit("::").next().unwrap_or(name);
-                if !leaf.contains('(') {
+                // ::-资格读：仅**根限定**（::leaf——leaf 与槽同名 = 同一
+                // 全局变量）→ ts 值。非根 ns::leaf 是别的变量，leaf 撞名
+                // 不得劫持（nr4 P1 实证：$d7::s 读成槽 s 的值 1）。
+                if let Some(leaf) = name
+                    .strip_prefix("::")
+                    .filter(|rest| !rest.contains("::") && !rest.contains('('))
+                {
                     if let Some(i) = ts.names.iter().position(|n| n == leaf) {
                         if !ts.aliased[i] {
                             let v = &ts.values[i];
@@ -1161,9 +1194,12 @@ impl Interp {
                     }
                 }
             } else {
-                // ::-资格写：leaf = 顶层槽名 → ts 写。
-                let leaf = name.rsplit("::").next().unwrap_or(name);
-                if !leaf.contains('(') {
+                // ::-资格写：仅**根限定**（::leaf）→ ts 写（同读臂——
+                // 非根 ns::leaf 是别的变量，leaf 撞名不得劫持）。
+                if let Some(leaf) = name
+                    .strip_prefix("::")
+                    .filter(|rest| !rest.contains("::") && !rest.contains('('))
+                {
                     if let Some(i) = ts.names.iter().position(|n| n == leaf) {
                         if !ts.aliased[i] {
                             ts.values[i] = value.clone();
@@ -1202,7 +1238,13 @@ impl Interp {
             }
             let base = array_name.to_string();
             let idx = index.to_string();
-            let loc = self.resolve_loc(array_name);
+            let mut loc = self.resolve_loc(array_name);
+            // eval 级数组基链（tclsh L 形状）：当前 ns 基无 + 全局基有
+            // → 全局基（元素读写同链；全局基标量 → 既有 isn't-array
+            // 错误归属；全新名建当前 ns 数组不变）。
+            if let Some(gkey) = self.ns_chain_global(array_name) {
+                loc = VarLoc::Global(gkey);
+            }
             if self.loc_is_array(&loc) {
                 let key = loc.element_key(index);
                 let existed = self.loc_get(&loc, &key).is_some();
@@ -1284,6 +1326,22 @@ impl Interp {
                     }
                     return Ok(value);
                 }
+            }
+            // eval 级裸名链（tclsh A 形状）：当前 ns 无此名 + 全局有 →
+            // 写全局（全局是数组 → is-array 错误归属照旧；valueless
+            // variable 声明截链）。
+            if let Some(gkey) = self.ns_chain_global(name) {
+                if self.loc_is_array(&VarLoc::Global(gkey.clone())) {
+                    return Err(Error::runtime(
+                        format!("can't set \"{}\": variable is array", name),
+                        ErrorCode::Generic,
+                    ));
+                }
+                self.globals.insert(gkey, value.clone());
+                self.fire_traces(name, None, "write").map_err(|e| {
+                    Error::runtime(format!("can't set \"{}\": {}", name, e), ErrorCode::Generic)
+                })?;
+                return Ok(value);
             }
             let loc = self.resolve_loc(name);
             if self.loc_is_array(&loc) {
@@ -1511,7 +1569,12 @@ impl Interp {
         if let Some((array_name, index)) = split_array_ref(name) {
             let base = array_name.to_string();
             let idx = index.to_string();
-            let loc = self.resolve_loc(array_name);
+            let mut loc = self.resolve_loc(array_name);
+            // eval 级数组基链（tclsh E/L 同链）：当前 ns 基无 + 全局基
+            // 有 → 全局基上删（元素/整基同链）。
+            if let Some(gkey) = self.ns_chain_global(array_name) {
+                loc = VarLoc::Global(gkey);
+            }
             if self.loc_is_array(&loc) {
                 let key = loc.element_key(index);
                 if self.loc_remove(&loc, &key) {
@@ -1553,7 +1616,14 @@ impl Interp {
             }
         } else {
             let given = name.to_string();
-            let loc = self.resolve_loc(name);
+            let mut loc = self.resolve_loc(name);
+            // eval 级裸名链（tclsh E 形状）：当前 ns 无此名 + 全局有 →
+            // 全局键上删。remove_var 的 ns 规范化会删当前 ns 键——链
+            // 命中由下方直删全局键。
+            let chained = self.ns_chain_global(name);
+            if let Some(gkey) = &chained {
+                loc = VarLoc::Global(gkey.clone());
+            }
             if self.loc_is_array(&loc) {
                 self.loc_remove_array(&loc);
                 // Element aliases into this array now error on write
@@ -1572,7 +1642,13 @@ impl Interp {
                 self.trace_phantoms.remove(&sk);
                 Ok(())
             } else if self.loc_base_exists(&loc) {
-                self.remove_var(name);
+                if let Some(gkey) = &chained {
+                    // 链命中：直删全局键（当前 ns 无此名，声明表无项可
+                    // 忘；remove_var 会按 ns 规范化删错键）。
+                    self.globals.remove(gkey.as_str());
+                } else {
+                    self.remove_var(name);
+                }
                 // set-old-7.7..7.9: removing the target retires every
                 // frame's seeded mirror (stale reads) while the links
                 // stay live so writes recreate the global.

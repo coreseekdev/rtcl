@@ -196,13 +196,13 @@ rule NsDeleteDestroysVariables {
 rule SelfDeleteBodyKeepsRunning {
     -- 体中自删：body 继续跑、[namespace current] 保持到体退出
     --（tclsh 34.x）；之后的 set 落已删 ns 的**帧视图**（随体消亡，
-    -- ns 变量表不复活）。oracle 实证 2026-11-03：info exists d::y = 0。
-    -- rtcl 把 y 写进了 d 的表（DIVERGENCES.md D-2 OPEN）。
+    -- ns 变量表不复活——限定查询恒不可见，裸名 keep-alive 链接除外
+    --）。oracle 实证 2026-11-03：info exists d::y = 0。rtcl 修复 =
+    -- 限定名死父 ns 守卫 + ns_eval 退出清扫（D-2 FIXED）。
     when: Evaluates("info exists d::y    -- after: namespace eval d {namespace delete [namespace current]; set y 3}")
     ensures: completion.code = ok
     ensures: completion.value = "0"
     -- probe: namespace eval d {namespace delete [namespace current]; set y 3}; puts [info exists d::y]
-    -- rtcl: 1（OPEN 分歧，见 specs/DIVERGENCES.md D-2）
 }
 
 rule WhichVariableFollowsChain {

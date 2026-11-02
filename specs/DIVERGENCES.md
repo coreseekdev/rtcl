@@ -40,7 +40,7 @@
 - 现状态：**逐字节一致**（2026-10-07 实测 diff 为空；HANDOFF §3 的
   5-case 计数已过时，judge case 级 4072/4072）。
 
-### D-2 ns eval 体中自删后的 set 复活 ns 变量表（2026-11-03，深水探针）
+### D-2 ns eval 体中自删后的 set 复活 ns 变量表（2026-11-03，深水探针）[FIXED 2026-11-03]
 - **行为**：`namespace eval d { namespace delete [namespace current]; set y 3 }`
   ——体中自删后继续跑的体的 set 落**已删 ns 的帧视图**（随体消亡）。
 - **Tcl 8.6**：`info exists d::y` → 0（变量随 ns 销毁，set 只在帧视图）。
@@ -49,3 +49,9 @@
   SelfDeleteBodyKeepsRunning。
 - **严重度**：低（自删后继续用体的形状罕见；体语义其余部分——
   current 保持、读已删变量 keep-alive——一致）。
+- **修复**（oracle sd1-sd3 探全后）：①get_var/var_exists 限定名死父
+  ns 守卫（限定读 → can't read: no such variable、exists → 0——体内
+  体外一致；keep-alive 裸名链接不受影响）②ns_eval 退出清扫死者前缀
+  的 globals/array_globals 残留（体帧视图随体消亡；体中重建该 ns 则
+  跳过）。守卫的父键须先剥前导 ::（根 ns 下 canonical 原样返回
+  '::d::x'，直接 rsplit 拼 '::::d'——gen_namespace-46.3 回归实证）。

@@ -1041,6 +1041,24 @@ impl Interp {
                 }
             }
         }
+        // 限定名父 ns 不存在 → 变量不可见（D-2：ns delete——含体中自
+        // 删——后的帧视图对限定访问不可见，sd1-B/sd3 实证；裸名
+        // keep-alive 链接不受影响）。
+        if name.contains("::") {
+            let key = self.canonical_global(name);
+            // 剥前导 :: 再取父（根 ns 下 canonical 原样返回 '::d::x'，
+            // 直接 rsplit 会拼出 '::::d'——gen_namespace-46.3 回归实证）。
+            let key = key.strip_prefix("::").unwrap_or(&key);
+            if let Some((p, _)) = key.rsplit_once("::") {
+                let parent = format!("::{}", p);
+                if parent != "::" && !self.namespaces.contains_key(&parent) {
+                    return Err(Error::runtime(
+                        format!("can't read \"{}\": no such variable", name),
+                        ErrorCode::NotFound,
+                    ));
+                }
+            }
+        }
         if let Some((array_name, index)) = split_array_ref(name) {
             let mut loc = self.resolve_loc(array_name);
             if !self.loc_is_array(&loc)
@@ -1706,6 +1724,18 @@ impl Interp {
     }
 
     pub fn var_exists(&self, name: &str) -> bool {
+        // 限定名父 ns 不存在 → 不存在（D-2：同 get_var 守卫——tclsh
+        // `info exists e::y` 对已删 ns 恒 0，sd1-B/C/sd2 实证）。
+        if name.contains("::") {
+            let key = self.canonical_global(name);
+            let key = key.strip_prefix("::").unwrap_or(&key);
+            if let Some((p, _)) = key.rsplit_once("::") {
+                let parent = format!("::{}", p);
+                if parent != "::" && !self.namespaces.contains_key(&parent) {
+                    return false;
+                }
+            }
+        }
         if let Some((array_name, index)) = split_array_ref(name) {
             let mut loc = self.resolve_loc(array_name);
             if !self.loc_is_array(&loc)

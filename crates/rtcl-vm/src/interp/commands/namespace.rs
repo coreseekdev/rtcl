@@ -386,6 +386,30 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 i += 1;
             }
         }
+        // D-2（帧视图）：体中自删 → 死者 ns 名下的 globals 残留 = 体
+        // 帧视图，随体消亡（ns_delete 已清 pre-delete 键；此处清
+        // post-delete 写入——tclsh sd1-A/E 实证 info globals 无残留）。
+        // 体中重建该 ns 则跳过（重建后的变量合法）。
+        if interp.namespaces.get(&*qualified).is_none() {
+            let dead_keys: Vec<String> = interp
+                .globals
+                .keys()
+                .filter(|k| k.starts_with(flat_prefix.as_str()))
+                .cloned()
+                .collect();
+            for k in dead_keys {
+                interp.globals.remove(&k);
+            }
+            let dead_arrays: Vec<String> = interp
+                .array_globals
+                .iter()
+                .filter(|k| k.starts_with(flat_prefix.as_str()))
+                .cloned()
+                .collect();
+            for k in dead_arrays {
+                interp.array_globals.remove(k.as_str());
+            }
+        }
     }
     if let Err(e) = &result {
         if interp.err_is_error(e) {

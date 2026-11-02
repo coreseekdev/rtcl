@@ -1,0 +1,21 @@
+# dict 深水探针（dict-deep;probe.sh 差分）
+puts [dict for {k v} {a 1 b 2} {expr {$v+5}}]
+dict map {k v} {a 1 b 2 c 3} {if {$k=="c"} {break}; expr {$v*10}}
+set d {k abc}; catch {dict incr d k} m; puts "$m | $d"
+catch {dict update novar k v {set v 5}} m; puts "$m | [info exists novar]"
+catch {dict get {a b c}} m; puts "$m"
+set v "x{ y"; set d [dict create k $v]; catch {dict lappend d k z} m; puts "$m | $d"
+catch {dict zzz} m; puts $m
+catch {dict cr a 1} m; puts $m
+puts [dict info {a 1}]
+catch {dict set a(1) k v} m; puts "$m | [info exists a(1)]"
+catch {dict get {a 1} b} m o; puts [dict get $o -errorcode]
+catch {dict update d} m; puts $m
+puts [dict size [dict create -unordered a 1 b 2 c 3]]
+puts [catch {dict getdef {a 1} b 9} m]; puts $m
+set d {k {x 1}}; set sub [dict get $d k]; dict set d k y 2; puts "$sub | $d"
+set d {a 1 b 2}; dict update d a v {unset v}; puts $d
+set d {a {x 1}}; dict unset d a x; puts $d
+set d {a 1}; catch {dict update d a v {set v 5; error boom}}; puts $d
+set v {x 1}; set d [dict create a $v b $v]; dict set d a y 2; puts "[dict get $d b] | [dict get $d a]"
+catch {dict for {k} {a 1} {}} m o; puts [dict get $o -errorcode]

@@ -32,9 +32,7 @@ rule TraceInfoRoundTripsAndOrdersOps {
     when: Evaluates("trace info variable x    -- after: trace add variable x {write unset} cb")
     ensures: completion.code = ok
     ensures: completion.value = "{write unset} cb"
-    -- rtcl renders {unset write} (wordlist order)  [D-37]
-    -- probe: trace variable x au cb; puts [trace vinfo x]  =>  {ua cb}
-    -- rtcl: {au cb}  [D-38]
+    -- rtcl: {au cb} wordlist order  [D-38 FIXED 2026-11-04（随 D-37 渲染序）]
 }
 
 rule TraceRemoveRemovesOneExactMatch {
@@ -45,7 +43,7 @@ rule TraceRemoveRemovesOneExactMatch {
     -- after: two identical `trace add variable x write cb`; one remove
     ensures: completion.code = ok
     ensures: completion.value = "1"
-    -- rtcl: retain wipes all duplicates => 0  [D-37]
+    -- rtcl: retain wipes all duplicates => 0  [D-37 FIXED 2026-11-04]
 }
 
 rule TraceFiresNewestFirst {
@@ -76,7 +74,7 @@ rule TraceReentrancyDoesNotRefire {
     when: Evaluates("set n    -- after: read trace {incr ::n; set y $x;#}; set x 1; set x")
     ensures: completion.code = ok
     -- oracle: n = 1 (one fire, inner read silent)
-    -- rtcl: crashes (same D-36 root cause)
+    -- rtcl: FIXED 2026-11-04（同 D-36）
 }
 
 rule TraceErrorSemantics {
@@ -132,7 +130,7 @@ rule WholeVarThenElementOrder {
     when: Evaluates("set log    -- after: write traces A1 on a, E1 on a(k); set a(k) 1")
     ensures: completion.code = ok
     ensures: completion.value = "A1E1"
-    -- rtcl: E1A1 (reversed)  [D-37]
+    -- rtcl: E1A1 (reversed)  [D-37 FIXED 2026-11-04]
 }
 
 rule UpvarLinkedAccessFiresTraces {

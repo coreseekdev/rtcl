@@ -13,6 +13,10 @@ use crate::value::Value;
 
 const TRACE_SUBCMDS: &[&str] = &["add", "info", "remove", "variable", "vdelete", "vinfo"];
 const VAR_OPS: &[&str] = &["array", "read", "unset", "write"];
+/// info/vinfo 的渲染序（tclsh traceCmd.c 的固定序，与 VAR_OPS 的错误
+/// 文本序不同——bad-operation 消息是 "array, read, unset, or write"，
+/// info 渲染是 read,write,unset,array；legacy 单字符序 r,w,u,a）。
+const VAR_OPS_RENDER: &[&str] = &["read", "write", "unset", "array"];
 const CMD_OPS: &[&str] = &["delete", "rename"];
 const EXEC_OPS: &[&str] = &["enter", "enterstep", "leave", "leavestep"];
 
@@ -99,6 +103,21 @@ fn format_ops_vocab(vocab: &[&str]) -> String {
     }
 }
 
+/// Store/info 渲染序规范化（read,write,unset,array；D-37）。remove 的
+/// 精确匹配两边同规范化，行为不受序影响。
+fn canon_var_ops(mut ops: Vec<String>) -> Vec<String> {
+    ops.sort_by_key(|o| VAR_OPS_RENDER.iter().position(|v| v == o).unwrap());
+    ops
+}
+
+/// D-37：remove 每次只删第一条精确匹配（tclsh 逐条删，重复注册需
+/// 逐条 remove）。
+fn remove_first_trace(v: &mut Vec<VarTrace>, ops: &[String], script: &str) {
+    if let Some(i) = v.iter().position(|t| t.ops == ops && t.script == script) {
+        v.remove(i);
+    }
+}
+
 /// Split `name` into (base, Some(elem)) when it is an element reference.
 fn split_elem(name: &str) -> Option<(&str, &str)> {
     let open = name.find('(')?;
@@ -123,7 +142,7 @@ fn add_variable(interp: &mut Interp, rest: &[Value]) -> Result<Value> {
         ));
     }
     let name = rest[0].as_str().to_string();
-    let ops = parse_ops(interp, &rest[1], VAR_OPS)?;
+    let ops = canon_var_ops(parse_ops(interp, &rest[1], VAR_OPS)?);
     let script = rest[2].as_str().to_string();
     let trace = VarTrace { ops, script };
     // A traced frame-local name leaves the slot model: slot writes don't
@@ -169,7 +188,7 @@ fn remove_variable(interp: &mut Interp, rest: &[Value]) -> Result<Value> {
         ));
     }
     let name = rest[0].as_str().to_string();
-    let ops = parse_ops(interp, &rest[1], VAR_OPS)?;
+    let ops = canon_var_ops(parse_ops(interp, &rest[1], VAR_OPS)?);
     let script = rest[2].as_str().to_string();
     if let Some((base, elem)) = split_elem(&name) {
         let base = base.to_string();
@@ -177,7 +196,7 @@ fn remove_variable(interp: &mut Interp, rest: &[Value]) -> Result<Value> {
         let elem = elem.to_string();
         if let Some(map) = interp.elem_traces.get_mut(&key) {
             if let Some(v) = map.get_mut(&elem) {
-                v.retain(|t| t.script != script || t.ops != ops);
+                remove_first_trace(v, &ops, &script);
                 if v.is_empty() {
                     map.remove(&elem);
                 }
@@ -186,7 +205,7 @@ fn remove_variable(interp: &mut Interp, rest: &[Value]) -> Result<Value> {
     } else {
         let key = interp.array_stamp_key(&name);
         if let Some(v) = interp.var_traces.get_mut(&key) {
-            v.retain(|t| t.script != script || t.ops != ops);
+            remove_first_trace(v, &ops, &script);
         }
     }
     Ok(Value::empty())
@@ -572,7 +591,9 @@ fn remove_stored(
     // (trace-27.2, trace-27.3).
     let key = stored_command_key(interp, &name)?;
     if let Some(v) = table.get_mut(&key) {
-        v.retain(|(o, s)| *o != ops || *s != script);
+        if let Some(i) = v.iter().position(|(o, s)| *o == ops && *s == script) {
+            v.remove(i);
+        }
     }
     Ok(Value::empty())
 }
@@ -597,7 +618,9 @@ fn remove_exec_trace(
     let script = rest[2].as_str().to_string();
     let key = stored_command_key(interp, &name)?;
     if let Some(v) = table.get_mut(&key) {
-        v.retain(|t| t.ops != ops || t.script != script);
+        if let Some(i) = v.iter().position(|t| t.ops == ops && t.script == script) {
+            v.remove(i);
+        }
     }
     Ok(Value::empty())
 }
@@ -723,7 +746,7 @@ fn legacy_trace(interp: &mut Interp, sub: &str, rest: &[Value]) -> Result<Value>
                     ops.push(op.to_string());
                 }
             }
-            ops.sort_by_key(|o| VAR_OPS.iter().position(|v| v == o).unwrap());
+            ops.sort_by_key(|o| VAR_OPS_RENDER.iter().position(|v| v == o).unwrap());
             let script = rest[2].as_str().to_string();
             if sub == "variable" {
                 let key = interp.array_stamp_key(&name);
@@ -733,7 +756,7 @@ fn legacy_trace(interp: &mut Interp, sub: &str, rest: &[Value]) -> Result<Value>
                     .or_default()
                     .push(VarTrace { ops, script });
             } else if let Some(v) = interp.var_traces.get_mut(&interp.array_stamp_key(&name)) {
-                v.retain(|t| t.script != script || t.ops != ops);
+                remove_first_trace(v, &ops, &script);
             }
             Ok(Value::empty())
         }

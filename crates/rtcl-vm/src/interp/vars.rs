@@ -1344,9 +1344,13 @@ impl Interp {
                 }
                 if wrote {
                     if !self.var_traces.is_empty() {
-                        self.fire_traces(name, None, "write").map_err(|e| {
+                        let fired = self.fire_traces(name, None, "write").map_err(|e| {
                             Error::runtime(format!("can't set \"{}\": {}", name, e), ErrorCode::Generic)
                         })?;
+                        // tclsh：write trace 改写后返回改写值（D-36）。
+                        if fired {
+                            return Ok(self.get_var(name).map(|v| v.clone()).unwrap_or_default());
+                        }
                     }
                     return Ok(value);
                 }
@@ -1362,9 +1366,12 @@ impl Interp {
                     ));
                 }
                 self.globals.insert(gkey, value.clone());
-                self.fire_traces(name, None, "write").map_err(|e| {
+                let fired = self.fire_traces(name, None, "write").map_err(|e| {
                     Error::runtime(format!("can't set \"{}\": {}", name, e), ErrorCode::Generic)
                 })?;
+                if fired {
+                    return Ok(self.get_var(name).map(|v| v.clone()).unwrap_or_default());
+                }
                 return Ok(value);
             }
             let loc = self.resolve_loc(name);
@@ -1386,9 +1393,16 @@ impl Interp {
                 ));
             }
             self.store_var(name, value.clone());
-            self.fire_traces(name, None, "write").map_err(|e| {
+            let fired = self.fire_traces(name, None, "write").map_err(|e| {
                 Error::runtime(format!("can't set \"{}\": {}", name, e), ErrorCode::Generic)
             })?;
+            // tclsh：write trace 改写变量后 set 返回改写后的值（trace
+            // 落地后重读；trace 若删了变量则回空串）。
+            return Ok(if fired {
+                self.get_var(name).map(|v| v.clone()).unwrap_or_default()
+            } else {
+                value
+            });
         }
         Ok(value)
     }
@@ -1845,51 +1859,86 @@ impl Interp {
     /// Fire variable traces for `op` on (base, elem). Callback scripts run
     /// in the current scope with `name1 name2 op` appended (tclsh passes
     /// name2 as an empty string for whole-variable ops).
-    pub(crate) fn fire_traces(&mut self, base: &str, elem: Option<&str>, op: &str) -> Result<()> {
+    ///
+    /// Returns whether any script actually fired (callers use this to
+    /// re-read the written value, tclsh: a write trace that modifies the
+    /// variable changes `set`'s result, D-36).
+    ///
+    /// Re-entrancy guard (tclsh VAR_TRACE_ACTIVE): while a target's
+    /// traces fire, a nested fire on the SAME target is skipped — a
+    /// callback writing its own traced variable must not recurse into
+    /// the trace machinery (native stack overflow without this, D-36).
+    /// The guard is per exact target: whole-var fires and element fires
+    /// guard independently (tclsh guards per Var record), so a whole-var
+    /// write inside an element's callback still fires the whole-var
+    /// traces, and vice versa.
+    pub(crate) fn fire_traces(&mut self, base: &str, elem: Option<&str>, op: &str) -> Result<bool> {
         let key = self.array_stamp_key(base);
-        let scripts = self.collect_trace_scripts(&key, elem, op);
-        for s in scripts.into_iter().rev() {
-            // Most-recent-registered fires first (tclsh prepends to the
-            // trace list: T2 T1 for two write traces). The script string
-            // gets the args appended (so scripts can end in `;#` to
-            // swallow them) and is evaluated as a script.
-            let q = |v: &str| {
-                Value::from_list(&[Value::from_str(v)]).as_str().to_string()
-            };
+        let guard = match elem {
+            Some(e) => format!("E\x00{}\x00{}", key, e),
+            None => format!("W\x00{}", key),
+        };
+        if !self.trace_active.insert(guard.clone()) {
+            return Ok(false);
+        }
+        let fired = self.fire_traces_inner(&key, base, elem, op);
+        self.trace_active.remove(&guard);
+        fired
+    }
+
+    fn fire_traces_inner(
+        &mut self,
+        key: &str,
+        base: &str,
+        elem: Option<&str>,
+        op: &str,
+    ) -> Result<bool> {
+        let (whole, elems) = self.collect_trace_scripts(key, elem, op);
+        let fired = !(whole.is_empty() && elems.is_empty());
+        // Most-recent-registered fires first within each group (tclsh
+        // prepends to the trace list: T2 T1 for two write traces), and
+        // the whole-variable group fires BEFORE the element group
+        // (tclsh order A1E1, D-37).  The script string gets the args
+        // appended (so scripts can end in `;#` to swallow them) and is
+        // evaluated as a script.
+        let q = |v: &str| Value::from_list(&[Value::from_str(v)]).as_str().to_string();
+        for s in whole.into_iter().rev().chain(elems.into_iter().rev()) {
             let cmd = format!("{} {} {} {}", s, q(base), q(elem.unwrap_or("")), op);
             self.eval(&cmd)?;
         }
-        Ok(())
+        Ok(fired)
     }
 
     /// Trace scripts registered for `op` on (base-key `key`, optional
-    /// element): whole-var traces first, then the element's own.
+    /// element): (whole-var scripts, element scripts), each in stored
+    /// (oldest-first) order.
     fn collect_trace_scripts(
         &self,
         key: &str,
         elem: Option<&str>,
         op: &str,
-    ) -> Vec<String> {
-        let mut scripts: Vec<String> = Vec::new();
+    ) -> (Vec<String>, Vec<String>) {
+        let mut whole: Vec<String> = Vec::new();
         if let Some(trs) = self.var_traces.get(key) {
             for t in trs {
                 if t.ops.iter().any(|o| o == op) {
-                    scripts.push(t.script.clone());
+                    whole.push(t.script.clone());
                 }
             }
         }
+        let mut elems: Vec<String> = Vec::new();
         if let Some(e) = elem {
             if let Some(map) = self.elem_traces.get(key) {
                 if let Some(trs) = map.get(e) {
                     for t in trs {
                         if t.ops.iter().any(|o| o == op) {
-                            scripts.push(t.script.clone());
+                            elems.push(t.script.clone());
                         }
                     }
                 }
             }
         }
-        scripts
+        (whole, elems)
     }
 
     /// Read one element for `array get`: fire its read traces one script
@@ -1918,10 +1967,12 @@ impl Interp {
             Some(i) => t.frames.get(i).map(|f| f.locals.contains_key(base)),
             None => Some(t.globals.contains_key(base)),
         };
-        let scripts = self.collect_trace_scripts(&key, Some(elem), "read");
+        let (whole, elems) = self.collect_trace_scripts(&key, Some(elem), "read");
         let q = |v: &str| Value::from_list(&[Value::from_str(v)]).as_str().to_string();
         let mut recreated = false;
-        for s in scripts.into_iter().rev() {
+        // 元素读取 trace：整变量组先、元素组后（A1E1 同序），组内
+        // latest-first（tclsh per-Var 触发、Tcl 列表序）。
+        for s in whole.into_iter().rev().chain(elems.into_iter().rev()) {
             let cmd = format!("{} {} {} {}", s, q(base), q(elem), "read");
             if self.eval(&cmd).is_err() {
                 return Ok(None);

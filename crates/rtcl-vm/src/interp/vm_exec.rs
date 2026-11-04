@@ -1312,7 +1312,12 @@ fn op_store_var(
     if interp.scalar_top_write_ok(name) {
         interp.set_var_scalar_top(name, v);
     } else {
-        interp.set_var(name, v)?;
+        // set_var 的返回 = trace 落地后的变量值（tclsh：write trace
+        // 改写变量会改 set 的结果，D-36）——keep 时回写栈顶。
+        let r = interp.set_var(name, v)?;
+        if keep {
+            *st.stack.last_mut().expect("store keeps a value") = r;
+        }
     }
     Ok(())
 }
@@ -1383,7 +1388,10 @@ fn op_store_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: 
     let v = st.top_val();
     if !interp.frame_slot_write(slot, &v) {
         let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
-        interp.set_var(name, v)?;
+        let r = interp.set_var(name, v)?;
+        // set_var 的返回 = trace 落地后的变量值（tclsh：write trace 改
+        // 写变量会改 set 的结果，D-36）——回写栈顶。
+        *st.stack.last_mut().expect("store keeps a value") = r;
         // 名路径写全局 → ts 槽失效（下一次 LoadLocal 拉回全局真值）。
         interp.top_slot_invalidate_one(slot);
     }

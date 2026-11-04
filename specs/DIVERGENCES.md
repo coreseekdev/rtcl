@@ -280,28 +280,35 @@
 
 ### trace 面（trace.allium + specs/trace-deep.probes；2026-11-03 蒸馏轮）
 
-### D-36 trace 回调重入无守卫——**原生栈溢出崩溃**【致命】
+### D-36 trace 回调重入无守卫——**原生栈溢出崩溃**【致命】[FIXED 2026-11-04]
 - **Tcl 8.6**：VAR_TRACE_ACTIVE 重入守卫——回调内读写被追踪变量不再
   触发；`trace add variable x write {set x 9;#}; set v [set x 0]` → `9 9`。
 - **rtcl**：`fire_traces`（vars.rs:1848-1863）无重入守卫，eval_depth
   无上限、max_call_depth 只拦 proc 调用 → **栈溢出 abort（rc 134,
   core dumped）**。read 版同样崩溃。
 - **复现**：探针 trace-deep.probes 第 11/12 行。
-- **严重度**：**致命**（可由纯脚本触发进程崩溃；judge 语料未含
-  trace 面，属盲区）。修复建议：fire_traces 入口 per-var 重入位 +
-  eval 深度兜底上限。
+- **严重度**：已关闭（2026-11-04）。修复：Interp.trace_active
+  重入位（tclsh VAR_TRACE_ACTIVE 语义，per-exact-target：整变量
+  W\0key / 元素 E\0key\0elem 各自独立守卫——整/元素互不遮蔽，与
+  per-Var 语义一致）+ write trace 触发后 set 返回值重读（tclsh
+  `9 9` 语义；vars.rs 三写路径 + op_store_var/op_store_local 回写
+  栈顶）+ unset-in-trace 边缘（get_var 失败回空串）。五形状探针
+  逐字节一致；judge 无新回归、cargo lib 零新增失败。
 
 ### D-37 变量 trace 触发面语义（打包）
-- **Tcl 8.6**：① op 渲染固定序 read,write,unset,array（info/vinfo）；
+- **Tcl 8.6**：① op 渲染固定序 read,write,unset,array（info/vinfo）
+  **[①②⑦ 已修 2026-11-04]**；
   ② remove 每次删一条（重复注册逐条删）；③ `unset a`（整数组）逐元素
   触发 {a k unset}；④ `array unset a` = 一次整体 {a {} unset}；⑤ 对
   缺失变量/元素的 unset 仍触发（元素还抹记录）；⑥ array op 触发面：
   array set 对已存在数组增元素、array get/names/size/exists 对缺失
   数组、array unset 均触发；⑦ 整变量 trace 先于元素 trace；⑧ upvar
   链接的读写触发且 name1=别名名。
-- **rtcl**：① 词表序 array,read,unset,write；② retain 全删；③④⑧
+- **rtcl**：① 词表序 array,read,unset,write 【已修：VAR_OPS_RENDER
+  渲染序 + legacy r,w,u,a 序】；② retain 全删 【已修：逐条删】；③④⑧
   缺失触发；⑤ 标量 missing 不触发但抹记录、元素 missing 不触发不抹；
-  ⑥ 仅创建时 array set + array names 缺失；⑦ 反序（E1A1 vs A1E1）。
+  ⑥ 仅创建时 array set + array names 缺失；⑦ 反序 【已修：分组
+  latest-first + 整组先于元素组（A1E1）】。OPEN=③④⑤⑥⑧。
 - **严重度**：中（trace 触发面系统性偏差；⑦⑧ 影响回调语义）。
 
 ### D-38 legacy trace 形态（打包）

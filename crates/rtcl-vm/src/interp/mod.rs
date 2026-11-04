@@ -610,6 +610,11 @@ pub struct Interp {
     pub(crate) elem_traces: HashMap<String, HashMap<String, Vec<VarTrace>>>,
     /// Elements that exist only to carry a trace (traced but never set).
     pub(crate) trace_phantoms: HashMap<String, std::collections::HashSet<String>>,
+    /// Currently-firing trace targets (tclsh's VAR_TRACE_ACTIVE, D-36):
+    /// `W\0{stamp}` for whole-variable fires, `E\0{stamp}\0{elem}` for
+    /// element fires.  A fire on an active target is skipped, so a
+    /// callback reading/writing its own traced variable cannot recurse.
+    pub(crate) trace_active: std::collections::HashSet<String>,
     /// `trace add command` registrations (stored; rename/delete traces).
     pub(crate) cmd_traces: HashMap<String, Vec<(Vec<String>, String)>>,
     /// `trace add execution` registrations (stored; enter/leave/step traces).
@@ -838,6 +843,7 @@ impl Interp {
             var_traces: HashMap::new(),
             elem_traces: HashMap::new(),
             trace_phantoms: HashMap::new(),
+            trace_active: std::collections::HashSet::new(),
             cmd_traces: HashMap::new(),
             exec_traces: HashMap::new(),
             exec_trace_ids: 0,

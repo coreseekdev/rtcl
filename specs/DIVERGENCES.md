@@ -373,11 +373,19 @@
   ⑤ 对象级 unexport 隐藏继承方法；⑥ 全隐藏时报
   `object "::o" has no visible methods`；⑦ 间接 mixin 环定义时即报
   `may not mix a class into itself`。
-- **rtcl**：① 无 unknown 回退；② filter 只存不执行（对象目标被静默
-  吞）；③ 造出非类普通对象；④ 脚本当 ctor 参数丢（仅 ::oo::class
-  精确匹配 is_meta）；⑤ no-op；⑥ must-be 无条件 append destroy；⑦
-  接受（linearize 深度 64 截断静默）。
-- **严重度**：高。
+- **rtcl 修复态（2026-11-05）**：① 链空转调 `unknown` 方法（实参
+  {原方法名 实参...}；filter 存在时 filter 先拦截——D-41①② 交互）✓；
+  ② filter 前置进链（对象 filters 最先、类链 linearize 序；filter 的
+  `next` 顺真实方法链；**未知方法调用也进 filter**——tclsh 实测
+  `o whatever` 走 FILTERED）✓；对象级 filter 落 OoObject.filters
+  （objdefine 双形态）✓；③ `oo::class new` 拒绝 ✓；④ is_meta 改
+  链含 ::oo::class 判定（chain_contains——用户元类脚本求值）✓；⑤
+  对象 unexport → OoObject.hidden（set_export 对象臂：自有方法翻
+  exported 位——oo-4.1 export Foo 转正；未定义名进 hidden）✓；⑥
+  全隐藏时 `object "::o" has no visible methods` ✓；⑦ 间接 mixin 环
+  定义时报（DFS mixin+superclass 边；seen 不预置目标——预置会挡回边，
+  实测踩坑）✓。
+- **严重度**：已关闭（oo-deep 16→21/32）。
 
 ### D-42 对象生命周期与别名（打包）
 - **Tcl 8.6**：① `rename o ""` 触发析构；② `rename o o2` 后 o2 可用

@@ -194,6 +194,12 @@ pub(crate) struct OoObject {
     pub mixins: Vec<String>,
     /// Per-object methods in definition order.
     pub methods: Vec<(String, MethodDef)>,
+    /// Object-level filters（oo::objdefine o {filter ...}，D-41②——
+    /// 原静默吞掉）。
+    pub filters: Vec<String>,
+    /// Object-level hidden（oo::objdefine o {unexport m}——隐藏继承
+    /// 方法，D-41⑤；原 no-op）。
+    pub hidden: Vec<String>,
     /// `variable` declarations (definition order).  `Rc`: the method-call
     /// fast path memoises on this list's identity (a declaration replaces
     /// the whole vector, so a pointer compare detects it).
@@ -820,18 +826,36 @@ fn render_or_list(items: &[String]) -> String {
 /// `unknown method "x": must be ...` — exported chain names + `destroy`,
 /// with `new` suppressed on `::oo::class` itself.
 fn unknown_method_error(interp: &Interp, key: &str, typed: &str, method: &str) -> Error {
+    let hidden: Vec<String> = interp
+        .oo
+        .objects
+        .get(key)
+        .map(|o| o.hidden.clone())
+        .unwrap_or_default();
     let mut names: Vec<String> = Vec::new();
     for (name, entry) in full_walk(interp, key) {
-        if entry.def.exported && !names.contains(&name) {
-            names.push(name);
+        if entry.def.exported
+            && !hidden.contains(&name)
+            && !names.contains(&name)
+        {
+            names.push(name.clone());
         }
     }
-    names.push("destroy".to_string());
+    if !hidden.contains(&"destroy".to_string()) {
+        names.push("destroy".to_string());
+    }
     if key == "::oo::class" {
         names.retain(|n| n != "new");
     }
     names.sort();
     names.dedup();
+    // D-41⑥：全部可见方法被隐藏（如 unexport destroy）时的消息。
+    if names.is_empty() {
+        return Error::Msg(format!(
+            "object \"{}\" has no visible methods",
+            typed
+        ));
+    }
     let _ = typed;
     Error::Msg(format!(
         "unknown method \"{}\": must be {}",
@@ -1181,8 +1205,88 @@ fn invoke_method(
     typed_val: &Value,
     include_private: bool,
 ) -> Result<Value> {
-    let (chain, method_rc) = chain_for(interp, key, method, include_private);
+    // D-41⑤：对象级 hidden 的方法对外部调用视同未定义（my 私有调用
+    // 不受限——tclsh unexport 只对外）。
+    if !include_private {
+        if let Some(o) = interp.oo.objects.get(key.as_ref()) {
+            if o.hidden.iter().any(|h| h == method) {
+                return Err(unknown_method_error(interp, key, typed, method));
+            }
+        }
+    }
+    let (chain0, method_rc) = chain_for(interp, key, method, include_private);
+    // D-41②：filter 前置进链——对象 filters 最先、类链 filter 按
+    // linearize 序（最具体先），每个 filter 名在对象全链上解析取其
+    // 最具体实现。filter 体内 `next` 顺着 (filter…→真实方法) 走，
+    // 无 next 则其返回值即调用结果（tclsh probe: F + 空结果）。filter
+    // 拦截**未知方法**调用（tclsh: filter 存在时 o whatever 也进
+    // filter——D-41①② 交互）；链空且无 filter 才走 unknown 转调。
+    // create/new/destroy 与私有调用不过滤。
+    let chain = if !include_private
+        && !matches!(method, "create" | "new" | "destroy" | "destructor" | "constructor")
+    {
+        let mut flist: Vec<String> = interp
+            .oo
+            .objects
+            .get(key.as_ref())
+            .map(|o| o.filters.clone())
+            .unwrap_or_default();
+        // filter 随**类链**收（对象键先取其类；linearize 不吃对象键）。
+        let chain_root = interp
+            .oo
+            .objects
+            .get(key.as_ref())
+            .map(|o| o.class.clone())
+            .unwrap_or_else(|| key.to_string());
+        for c in linearize(interp, &chain_root) {
+            if let Some(cls) = interp.oo.classes.get(&c) {
+                for f in &cls.filters {
+                    if !flist.contains(f) {
+                        flist.push(f.clone());
+                    }
+                }
+            }
+        }
+        if flist.is_empty() {
+            chain0
+        } else {
+            let mut prepended: Vec<ChainEntry> = Vec::new();
+            for f in flist.iter().rev() {
+                let (fchain, _) = chain_for(interp, key, f, include_private);
+                if let Some(entry) = fchain.first() {
+                    prepended.push(entry.clone());
+                }
+            }
+            if prepended.is_empty() {
+                chain0
+            } else {
+                prepended.extend(chain0.iter().cloned());
+                Rc::new(prepended)
+            }
+        }
+    } else {
+        chain0
+    };
     if chain.is_empty() {
+        // D-41①：未命中转调类的 `unknown` 方法（tclsh 语义——unknown
+        // 收到 {原方法名 实参...}）；unknown 自身未命中才报
+        // unknown-method 错误（此处不再二次转调，防递归）。
+        let (uchain, umethod) = chain_for(interp, key, "unknown", include_private);
+        if !uchain.is_empty() {
+            let mut uargs: Vec<Value> = vec![Value::from_str(method)];
+            uargs.extend_from_slice(call_args);
+            return exec_chain_entry(
+                interp,
+                key,
+                &umethod,
+                0,
+                &uchain,
+                &uargs,
+                typed,
+                typed_val,
+                false,
+            );
+        }
         return Err(unknown_method_error(interp, key, typed, method));
     }
     if include_private {
@@ -1606,7 +1710,11 @@ fn attach_object(interp: &mut Interp, key: &str, ns: &str) {
 }
 
 fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) -> Result<Value> {
-    let is_meta = class_key == "::oo::class";
+    // D-41④：元类判定 = 类链含 ::oo::class（用户元类 K{superclass
+    // oo::class} 的 create 定义脚本照常求值；::oo::class 自身线性化
+    // 含自身，天然为真）。
+    let is_meta = class_key == "::oo::class"
+        || chain_contains(interp, class_key, "::oo::class");
     if rest.is_empty() {
         let usage = if is_meta {
             "create objectName ?definitionScript?"
@@ -1693,6 +1801,13 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
 }
 
 fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value]) -> Result<Value> {
+    // D-41③：oo::class 自身只有 create/destroy——`oo::class new` 会
+    // 造出非类对象（info object isa class = 0 的坏实例），tclsh 拒绝。
+    if class_key == "::oo::class" {
+        return Err(Error::Msg(
+            "unknown method \"new\": must be create or destroy".to_string(),
+        ));
+    }
     let name = next_ns(interp);
     let ns: Rc<str> = Rc::from(name.as_str());
     interp.oo.objects.insert(
@@ -2055,6 +2170,44 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                 }
                 mixins.push(canonical.to_string());
             }
+            // D-41⑦：间接环（M mixin A、A 的 superclass 是 M）在定义时
+            // 即报——沿 mixin+superclass 边从新 mixin 名单出发，回到
+            // 目标类即环（linearize 的深度 64 截断不再静默吞）。
+            if let DefineTarget::Class(cname) = &target {
+                // seen 不预置目标——目标由 c == cname 判定（预置会把
+                // 回边挡掉，环永远查不出来）。
+                let mut seen: Vec<String> = Vec::new();
+                let mut frontier = mixins.clone();
+                let mut cyc = false;
+                let mut depth = 0;
+                while !frontier.is_empty() && depth < 64 {
+                    depth += 1;
+                    let mut next: Vec<String> = Vec::new();
+                    for c in &frontier {
+                        if c == cname {
+                            cyc = true;
+                            break;
+                        }
+                        if let Some(cls) = interp.oo.classes.get(c) {
+                            for m in cls.mixins.iter().chain(cls.superclasses.iter()) {
+                                if !seen.contains(m) {
+                                    seen.push(m.clone());
+                                    next.push(m.clone());
+                                }
+                            }
+                        }
+                    }
+                    if cyc {
+                        break;
+                    }
+                    frontier = next;
+                }
+                if cyc {
+                    return Err(Error::Msg(
+                        "may not mix a class into itself".to_string(),
+                    ));
+                }
+            }
             match target {
                 DefineTarget::Object(name) => {
                     if let Some(o) = interp.oo.objects.get_mut(&name) {
@@ -2236,9 +2389,17 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             Ok(Value::empty())
         }
         "filter" => {
-            if let DefineTarget::Class(name) = target {
-                if let Some(c) = interp.oo.classes.get_mut(&name) {
-                    c.filters = rest.iter().map(|v| v.as_str().to_string()).collect();
+            match target {
+                DefineTarget::Class(name) => {
+                    if let Some(c) = interp.oo.classes.get_mut(&name) {
+                        c.filters = rest.iter().map(|v| v.as_str().to_string()).collect();
+                    }
+                }
+                // D-41②：对象级 filter 也生效（原静默吞掉）。
+                DefineTarget::Object(name) => {
+                    if let Some(o) = interp.oo.objects.get_mut(name.as_str()) {
+                        o.filters = rest.iter().map(|v| v.as_str().to_string()).collect();
+                    }
                 }
             }
             interp.oo.mutation_ctr += 1;
@@ -2322,6 +2483,29 @@ fn find_table_mut<'a>(
 
 fn set_export(interp: &mut Interp, target: &DefineTarget, name: &str, exported: bool) -> bool {
     interp.oo.mutation_ctr += 1;
+    // D-41⑤：对象目标的 unexport 隐藏（继承方法也藏——hidden 名单），
+    // export 解除。类目标的同名方法仍走 exported 位。
+    if let DefineTarget::Object(oname) = target {
+        if let Some(o) = interp.oo.objects.get_mut(oname.as_str()) {
+            // 对象自有方法：exported 位是权威（method Foo 定义的私有
+            // 方法经 export Foo 转正——oo-4.1）。
+            if let Some(slot) = o.methods.iter_mut().find(|(n, _)| n == name) {
+                slot.1.exported = exported;
+                if exported {
+                    o.hidden.retain(|h| h != name);
+                }
+                return true;
+            }
+            // 未定义名：unexport 隐藏继承实现；export 解除隐藏。
+            if exported {
+                o.hidden.retain(|h| h != name);
+            } else if !o.hidden.iter().any(|h| h == name) {
+                o.hidden.push(name.to_string());
+            }
+            return true;
+        }
+        return false;
+    }
     if let Some(table) = find_table_mut(interp, target) {
         if let Some(slot) = table.iter_mut().find(|(n, _)| n == name) {
             slot.1.exported = exported;

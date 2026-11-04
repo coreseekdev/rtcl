@@ -112,7 +112,7 @@ rule MixinCycleDetectedAtDefinition {
     when: Evaluates("catch {oo::define M {mixin A}} m; set m")
     ensures: completion.code = ok
     ensures: completion.value = "may not mix a class into itself"
-    -- rtcl: accepts; linearize truncates silently at depth 64  [D-41]
+    -- rtcl: FIXED 2026-11-05（DFS mixin+superclass 边）[D-41]
 }
 
 -- ── method dispatch surface ──────────────────────────────────────
@@ -123,7 +123,7 @@ rule UnknownMethodDispatchesToUnknownHandler {
     when: Evaluates("o whatever x    -- with C{method unknown {args} {...}}; C create o")
     ensures: completion.code = ok
     -- oracle: the unknown method receives the name and args
-    -- rtcl: no fallback — unknown-method error  [D-41]
+    -- rtcl: FIXED 2026-11-05（链空转调 unknown）[D-41]
 }
 
 rule FiltersRunAndReplaceResult {
@@ -132,7 +132,8 @@ rule FiltersRunAndReplaceResult {
     when: Evaluates("o m    -- after: C{method f {args} {puts F; return}}; oo::define C {filter f; method m {} {return M}}; C create o")
     ensures: completion.code = ok
     -- oracle: prints F, method body never runs (result empty)
-    -- rtcl: filter words are stored but never executed ("M")  [D-41]
+    -- rtcl: FIXED 2026-11-05（filter 前置进链 + next 链；未知方法
+    --   调用也进 filter）[D-41]
 }
 
 rule ClassNewIsNotAMethod {
@@ -141,7 +142,7 @@ rule ClassNewIsNotAMethod {
     when: Evaluates("catch {oo::class new} m; set m")
     ensures: completion.code = ok
     ensures: completion.value = "unknown method \"new\": must be create or destroy"
-    -- rtcl: creates a plain non-class object (::oo::ObjN)  [D-41]
+    -- rtcl: FIXED 2026-11-05（拒绝）[D-41]
 }
 
 rule MetaclassSubclassCreateEvaluatesDefinitionScript {
@@ -150,7 +151,7 @@ rule MetaclassSubclassCreateEvaluatesDefinitionScript {
     when: Evaluates("i m    -- after: K create CC {method m {} {return 1}}; CC create i")
     ensures: completion.code = ok
     ensures: completion.value = "1"
-    -- rtcl: script silently dropped as constructor args  [D-41]
+    -- rtcl: FIXED 2026-11-05（is_meta 链判定）[D-41]
 }
 
 rule ObjectUnexportHidesInherited {
@@ -159,7 +160,8 @@ rule ObjectUnexportHidesInherited {
     when: Evaluates("catch {o m} m2; set m2    -- after: C{method m}; C create o; oo::objdefine o {unexport m}")
     ensures: completion.code = ok
     -- oracle: unknown method "m": must be destroy
-    -- rtcl: no-op — m still callable  [D-41]
+    -- rtcl: FIXED 2026-11-05（OoObject.hidden + 自有方法 exported
+    --   位——oo-4.1 export Foo 转正）[D-41]
 }
 
 rule NoVisibleMethodsMessage {
@@ -167,7 +169,7 @@ rule NoVisibleMethodsMessage {
     -- error is `object "::o" has no visible methods`.
     when: Evaluates("catch {o nosuch} m; set m    -- after: oo::define C {unexport destroy}; C create o")
     ensures: completion.code = ok
-    -- rtcl: unknown method "nosuch": must be destroy  [D-41]
+    -- rtcl: FIXED 2026-11-05 [D-41]
 }
 
 -- ── lifecycle & rename interop ───────────────────────────────────

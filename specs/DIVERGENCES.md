@@ -269,10 +269,11 @@
   script、错误帧标主文件名；⑦ open 管道句柄 `file<pid>` 命名易撞名。
 - **严重度**：低（消息面/边缘面）。
 
-### D-35 `array unset a`（整体形式）不移除数组变量本身（2026-11-03 规格复查发现）
+### D-35 `array unset a`（整体形式）不移除数组变量本身（2026-11-03 规格复查发现）[FIXED 2026-11-05]
 - **Tcl 8.6**：`array set a {x 1}; array unset a; info exists a` → 0
   （无 pattern 的 array unset 删除变量本身）。
-- **rtcl**：info exists → 1（数组壳残留）。
+- **rtcl**：info exists → 1（数组壳残留）。**已修 2026-11-05**：
+  array unset 无 pattern 委托 unset_var 全链（变量移除 + {a {} unset}）。
 - **复现**：`array set a {x 1}; array unset a; puts [info exists a]`
 - **对照**：元素形式（`array unset a x`）、pattern 形式（`array unset
   a y*`）、对不存在名的 no-op 三者与 tclsh 一致。
@@ -295,7 +296,7 @@
   栈顶）+ unset-in-trace 边缘（get_var 失败回空串）。五形状探针
   逐字节一致；judge 无新回归、cargo lib 零新增失败。
 
-### D-37 变量 trace 触发面语义（打包）
+### D-37 变量 trace 触发面语义（打包）[①-⑧ 全部 FIXED 2026-11-04/05]
 - **Tcl 8.6**：① op 渲染固定序 read,write,unset,array（info/vinfo）
   **[①②⑦ 已修 2026-11-04]**；
   ② remove 每次删一条（重复注册逐条删）；③ `unset a`（整数组）逐元素
@@ -305,18 +306,28 @@
   数组、array unset 均触发；⑦ 整变量 trace 先于元素 trace；⑧ upvar
   链接的读写触发且 name1=别名名。
 - **rtcl**：① 词表序 array,read,unset,write 【已修：VAR_OPS_RENDER
-  渲染序 + legacy r,w,u,a 序】；② retain 全删 【已修：逐条删】；③④⑧
-  缺失触发；⑤ 标量 missing 不触发但抹记录、元素 missing 不触发不抹；
-  ⑥ 仅创建时 array set + array names 缺失；⑦ 反序 【已修：分组
-  latest-first + 整组先于元素组（A1E1）】。OPEN=③④⑤⑥⑧。
+  渲染序 + legacy r,w,u,a 序】；② retain 全删 【已修：逐条删】；
+  ③ 整数组 unset 缺元素 trace 【已修 2026-11-05：删除前枚举元素、
+  fire_traces_elem_only 专用通道（元素扫描不发整组——实测 tclsh 整组
+  恰一次 {a {} unset} 来自末尾整变量 fire）】；④ array unset 无
+  pattern 【已修：委托 unset_var 全链】；⑤ 缺失变量/元素 unset 不
+  触发 【已修：scalar 触发后抹、元素触发+抹记录】；⑥ array op 触发
+  面 【已修：分派级恒触发（set/get/names/size/exists/unset 五子命令、
+  无论存在与否——2026-11-05 实测矩阵推翻 array.rs 旧注释的 trace-5.8
+  解读），移除创建时/names 缺失时的散点 fire】；⑦ 反序 【已修：分组
+  latest-first + 整组先于元素组（A1E1）】；⑧ upvar 链接写绕过
+  【已修：frame_slot_write/_move 的 aliased 分支在有 trace 时回落名
+  路径（别名名触发 + 重读语义），_move 变体 Err(value) 句柄归还】。
+  OPEN=无。
 - **严重度**：中（trace 触发面系统性偏差；⑦⑧ 影响回调语义）。
 
-### D-38 legacy trace 形态（打包）
+### D-38 legacy trace 形态（打包）[FIXED 2026-11-05]
 - **Tcl 8.6**：① `trace variable x q cb` → `bad operations "q": should
   be one or more of rwua`，空 op 串也报错；② `trace variable a(k) w cb`
   注册元素 trace，元素写触发。
-- **rtcl**：① 报新式消息、空 op 静默登记；② a(k) 当整体标量名，永不
-  触发（vinfo 显示正常）。
+- **rtcl**：① 报新式消息、空 op 静默登记 【已修：bad operations
+  "q" 文本 + 空 op 串同报错】；② a(k) 当整体标量名 【已修：legacy
+  variable/vdelete/vinfo 三子命令 split_elem 路由到 elem_traces】。
 - **严重度**：低。
 
 ### D-39 execution trace 触发面（打包）

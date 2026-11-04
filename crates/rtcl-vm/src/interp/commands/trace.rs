@@ -695,9 +695,22 @@ fn legacy_trace(interp: &mut Interp, sub: &str, rest: &[Value]) -> Result<Value>
                 ));
             }
             let name = rest[0].as_str();
-            // Render whole-var traces with character ops (tclsh legacy).
-            let key = interp.array_stamp_key(name);
-            let traces = interp.var_traces.get(&key).cloned().unwrap_or_default();
+            // Render whole-var traces with character ops (tclsh legacy);
+            // element forms look up the element's table（D-38②）。
+            let (base, elem) = match split_elem(name) {
+                Some((b, e)) => (b, Some(e)),
+                None => (name, None),
+            };
+            let key = interp.array_stamp_key(base);
+            let traces = match elem {
+                Some(e) => interp
+                    .elem_traces
+                    .get(&key)
+                    .and_then(|m| m.get(e))
+                    .cloned()
+                    .unwrap_or_default(),
+                None => interp.var_traces.get(&key).cloned().unwrap_or_default(),
+            };
             let mut out: Vec<Value> = Vec::new();
             for t in traces {
                 let chars: String = t
@@ -735,9 +748,11 @@ fn legacy_trace(interp: &mut Interp, sub: &str, rest: &[Value]) -> Result<Value>
                     'w' => "write",
                     'u' => "unset",
                     'a' => "array",
+                    // tclsh legacy 文本（D-38①）：bad operations "q":
+                    // should be one or more of rwua（整个 op 串入文）。
                     _ => {
                         return Err(Error::runtime(
-                            format!("bad operation \"{}\": must be array, read, unset, or write", c),
+                            format!("bad operations \"{raw}\": should be one or more of rwua"),
                             crate::error::ErrorCode::Generic,
                         ))
                     }
@@ -746,15 +761,44 @@ fn legacy_trace(interp: &mut Interp, sub: &str, rest: &[Value]) -> Result<Value>
                     ops.push(op.to_string());
                 }
             }
+            if ops.is_empty() {
+                return Err(Error::runtime(
+                    format!("bad operations \"{raw}\": should be one or more of rwua"),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
             ops.sort_by_key(|o| VAR_OPS_RENDER.iter().position(|v| v == o).unwrap());
             let script = rest[2].as_str().to_string();
             if sub == "variable" {
-                let key = interp.array_stamp_key(&name);
-                interp
-                    .var_traces
-                    .entry(key)
-                    .or_default()
-                    .push(VarTrace { ops, script });
+                // D-38②：legacy 同样路由元素形式（trace variable a(k) w cb
+                // 注册的是元素 trace，元素写触发）。
+                if let Some((base, elem)) = split_elem(&name) {
+                    let key = interp.array_stamp_key(base);
+                    interp
+                        .elem_traces
+                        .entry(key)
+                        .or_default()
+                        .entry(elem.to_string())
+                        .or_default()
+                        .push(VarTrace { ops, script });
+                } else {
+                    let key = interp.array_stamp_key(&name);
+                    interp
+                        .var_traces
+                        .entry(key)
+                        .or_default()
+                        .push(VarTrace { ops, script });
+                }
+            } else if let Some((base, elem)) = split_elem(&name) {
+                let key = interp.array_stamp_key(base);
+                if let Some(map) = interp.elem_traces.get_mut(&key) {
+                    if let Some(v) = map.get_mut(elem) {
+                        remove_first_trace(v, &ops, &script);
+                        if v.is_empty() {
+                            map.remove(elem);
+                        }
+                    }
+                }
             } else if let Some(v) = interp.var_traces.get_mut(&interp.array_stamp_key(&name)) {
                 remove_first_trace(v, &ops, &script);
             }

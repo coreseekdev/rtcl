@@ -149,6 +149,14 @@ impl Interp {
             .map(|f| f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false))
             .unwrap_or(true);
         if aliased {
+            // D-37⑧：链接写（global/upvar 别名）在有 trace 时回落名路径
+            // ——set_var 以别名名触发 trace 并承担写后重读语义（tclsh
+            // name1=别名名）。被 trace 的帧局部在注册时已移出槽模型，
+            // 此处只有链接直写需要拦。move 变体的 Err(value) 就是调用方
+            // 名路径的值句柄。
+            if !self.var_traces.is_empty() {
+                return false;
+            }
             // Global link: write the target directly through the cached
             // canonical key (one probe; creation goes through the name
             // path — the link install seeded the variable, so the hot
@@ -209,6 +217,13 @@ impl Interp {
             .map(|f| f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false))
             .unwrap_or(true);
         if aliased {
+            // D-37⑧：链接写（global/upvar 别名）在有 trace 时回落名路径
+            // ——set_var 以别名名触发 trace 并承担写后重读语义（tclsh
+            // name1=别名名）。被 trace 的帧局部在注册时已移出槽模型，
+            // 此处只有链接直写需要拦。
+            if !self.var_traces.is_empty() {
+                return Err(value);
+            }
             // Global link: write the target directly through the cached
             // canonical key (one probe; creation goes through the name
             // path — the link install seeded the variable, so the hot
@@ -1635,6 +1650,20 @@ impl Interp {
                     let _ = self.fire_traces(&base, Some(&idx), "unset");
                     Ok(())
                 } else {
+                    // tclsh：对缺失元素的 unset 仍触发 unset trace（且抹
+                    // 该元素的记录——trace-14.17 族，D-37⑤）。
+                    let sk = stamp_key(&loc);
+                    let _ = self.fire_traces(&base, Some(&idx), "unset");
+                    if let Some(map) = self.elem_traces.get_mut(&sk) {
+                        map.remove(&idx);
+                        if map.is_empty() {
+                            self.elem_traces.remove(&sk);
+                        }
+                    }
+                    self.trace_phantoms
+                        .entry(sk)
+                        .or_default()
+                        .remove(&idx);
                     crate::interp::commands::list::set_error_code(
                         self,
                         &format!("TCL LOOKUP ELEMENT {}", idx),
@@ -1674,6 +1703,13 @@ impl Interp {
                 loc = VarLoc::Global(gkey.clone());
             }
             if self.loc_is_array(&loc) {
+                // tclsh：整数组 unset 逐元素触发 {a k unset}（D-37③，
+                // per-Var 销毁序——元素 trace 先于整变量 trace）。元素名
+                // 必须在删除前枚举。
+                let elems = self.array_element_names(&given);
+                for e in elems {
+                    let _ = self.fire_traces_elem_only(&given, &e, "unset");
+                }
                 self.loc_remove_array(&loc);
                 // Element aliases into this array now error on write
                 // (var-1.17: `upvar 0 arr(1) foo; unset arr; set foo(3)` →
@@ -1720,7 +1756,9 @@ impl Interp {
             } else {
                 // tclsh deletes a missing variable's trace records too
                 // (`unset` on an untraced-existence variable still wipes
-                // its registrations — trace-14.17/14.19/33.1).
+                // its registrations — trace-14.17/14.19/33.1) AND fires
+                // the unset traces on the way (D-37⑤).
+                let _ = self.fire_traces(&given, None, "unset");
                 let sk = stamp_key(&loc);
                 self.var_traces.remove(&sk);
                 self.elem_traces.remove(&sk);
@@ -1873,6 +1911,30 @@ impl Interp {
     /// write inside an element's callback still fires the whole-var
     /// traces, and vice versa.
     pub(crate) fn fire_traces(&mut self, base: &str, elem: Option<&str>, op: &str) -> Result<bool> {
+        self.fire_traces_impl(base, elem, op, true)
+    }
+
+    /// Element-only fire：不触发整变量组（tclsh 整数组 unset 的逐元素
+    /// 扫描只发元素 Var 的 trace——2026-11-05 实测：trace on a(unset)
+    /// 在 `array unset a`/`unset a` 时恰一次 {a {} unset}、来自末尾的
+    /// 整变量 fire，元素扫描不发整组，D-37③）。
+    #[allow(dead_code)]
+    pub(crate) fn fire_traces_elem_only(
+        &mut self,
+        base: &str,
+        elem: &str,
+        op: &str,
+    ) -> Result<bool> {
+        self.fire_traces_impl(base, Some(elem), op, false)
+    }
+
+    fn fire_traces_impl(
+        &mut self,
+        base: &str,
+        elem: Option<&str>,
+        op: &str,
+        include_whole: bool,
+    ) -> Result<bool> {
         let key = self.array_stamp_key(base);
         let guard = match elem {
             Some(e) => format!("E\x00{}\x00{}", key, e),
@@ -1881,7 +1943,7 @@ impl Interp {
         if !self.trace_active.insert(guard.clone()) {
             return Ok(false);
         }
-        let fired = self.fire_traces_inner(&key, base, elem, op);
+        let fired = self.fire_traces_inner(&key, base, elem, op, include_whole);
         self.trace_active.remove(&guard);
         fired
     }
@@ -1892,8 +1954,10 @@ impl Interp {
         base: &str,
         elem: Option<&str>,
         op: &str,
+        include_whole: bool,
     ) -> Result<bool> {
         let (whole, elems) = self.collect_trace_scripts(key, elem, op);
+        let whole: Vec<String> = if include_whole { whole } else { Vec::new() };
         let fired = !(whole.is_empty() && elems.is_empty());
         // Most-recent-registered fires first within each group (tclsh
         // prepends to the trace list: T2 T1 for two write traces), and

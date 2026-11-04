@@ -32,7 +32,7 @@ rule TraceInfoRoundTripsAndOrdersOps {
     when: Evaluates("trace info variable x    -- after: trace add variable x {write unset} cb")
     ensures: completion.code = ok
     ensures: completion.value = "{write unset} cb"
-    -- rtcl: {au cb} wordlist order  [D-38 FIXED 2026-11-04（随 D-37 渲染序）]
+    -- rtcl: FIXED 2026-11-05（legacy 渲染序 r,w,u,a）
 }
 
 rule TraceRemoveRemovesOneExactMatch {
@@ -43,7 +43,7 @@ rule TraceRemoveRemovesOneExactMatch {
     -- after: two identical `trace add variable x write cb`; one remove
     ensures: completion.code = ok
     ensures: completion.value = "1"
-    -- rtcl: retain wipes all duplicates => 0  [D-37 FIXED 2026-11-04]
+    -- rtcl: FIXED 2026-11-04（逐条删）
 }
 
 rule TraceFiresNewestFirst {
@@ -63,8 +63,7 @@ rule WriteTraceRunsAfterCommit {
     ensures: completion.code = ok
     ensures: completion.value = "9"
     -- probe: puts [list $v [set x]]  =>  9 9   (tclsh)
-    -- rtcl: native stack overflow abort (rc 134) — no re-entrancy
-    --   guard  [D-36, 致命]
+    -- rtcl: FIXED 2026-11-04（trace_active 重入位 + 写后重读）
 }
 
 rule TraceReentrancyDoesNotRefire {
@@ -90,8 +89,7 @@ rule UnsetTraceFiresEvenOnFailure {
     when: Evaluates("set log    -- after: trace on nosuch unset; catch {unset nosuch}")
     ensures: completion.code = ok
     ensures: completion.value = "{nosuch {} unset}"
-    -- rtcl: scalar missing => no fire; element missing => no fire and
-    --   record kept  [D-37]
+    -- rtcl: FIXED 2026-11-05（两条路径都触发；元素还抹记录）
 }
 
 rule UnsetWholeArrayFiresElementTraces {
@@ -100,7 +98,7 @@ rule UnsetWholeArrayFiresElementTraces {
     when: Evaluates("set log    -- after: trace on a(1) unset; unset a")
     ensures: completion.code = ok
     ensures: completion.value = "{a 1 unset}"
-    -- rtcl: whole-array unset skips element traces  [D-37]
+    -- rtcl: FIXED 2026-11-05（删除前枚举元素，elem-only 扫描通道）
 }
 
 rule ArrayUnsetFiresWholeNotElements {
@@ -109,8 +107,7 @@ rule ArrayUnsetFiresWholeNotElements {
     when: Evaluates("set log    -- after: trace on a unset; array unset a")
     ensures: completion.code = ok
     ensures: completion.value = "{a {} unset}"
-    -- rtcl: per-element fires {a 1 unset} {a 2 unset}, no whole fire  [D-37]
-    --   (whole-array shell also survives: DIVERGENCES.md D-35)
+    -- rtcl: FIXED 2026-11-05（无 pattern 委托 unset_var 全链；D-35 同修）
 }
 
 rule ArrayOpFiringSurface {
@@ -120,8 +117,8 @@ rule ArrayOpFiringSurface {
     when: Evaluates("set log    -- after: trace on a array w; array set a {2 2}    -- a existed with (1)")
     ensures: completion.code = ok
     -- oracle: log = A  (one fire)
-    -- rtcl: fires only on array-creation array set; missing-array
-    --   queries fire only for array names  [D-37]
+    -- rtcl: FIXED 2026-11-05（五子命令分派级恒触发；旧 array.rs 注释
+    --   的 trace-5.8 解读被实测矩阵推翻）
 }
 
 rule WholeVarThenElementOrder {
@@ -130,7 +127,7 @@ rule WholeVarThenElementOrder {
     when: Evaluates("set log    -- after: write traces A1 on a, E1 on a(k); set a(k) 1")
     ensures: completion.code = ok
     ensures: completion.value = "A1E1"
-    -- rtcl: E1A1 (reversed)  [D-37 FIXED 2026-11-04]
+    -- rtcl: FIXED 2026-11-04（整组先元素组）
 }
 
 rule UpvarLinkedAccessFiresTraces {
@@ -140,7 +137,7 @@ rule UpvarLinkedAccessFiresTraces {
     when: Evaluates("set log    -- after: trace on g write w; proc p {} {upvar 1 g y; set y 5}; p")
     ensures: completion.code = ok
     ensures: completion.value = "y"
-    -- rtcl: writes/reads through links bypass fire_traces entirely  [D-37]
+    -- rtcl: FIXED 2026-11-05（aliased 槽分支 trace 时回落名路径）
 }
 
 rule LegacyElementTraceFires {
@@ -149,7 +146,7 @@ rule LegacyElementTraceFires {
     when: Evaluates("set log    -- after: trace variable a(k) w cb; set a(k) 1")
     ensures: completion.code = ok
     ensures: completion.value = "R"
-    -- rtcl: treats a(k) as a whole scalar name; never fires  [D-38]
+    -- rtcl: FIXED 2026-11-05（legacy 三子命令 split_elem 路由）
 }
 
 rule LegacyBadOpsMessage {
@@ -158,8 +155,7 @@ rule LegacyBadOpsMessage {
     when: Evaluates("catch {trace variable x q cb} m; set m")
     ensures: completion.code = ok
     ensures: completion.value = "bad operations \"q\": should be one or more of rwua"
-    -- rtcl: new-style message `bad operation "q": must be array, read,
-    --   unset, or write`; empty op string silently registers  [D-38]
+    -- rtcl: FIXED 2026-11-05（bad operations 文本 + 空 op 同报错）
 }
 
 -- ── command traces ───────────────────────────────────────────────

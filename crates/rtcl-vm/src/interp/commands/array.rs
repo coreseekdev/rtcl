@@ -118,6 +118,19 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let subcmd = resolve_array_subcmd(args[1].as_str())?;
     let array_name = if args.len() > 2 { args[2].as_str() } else { "" };
 
+    // 'array' op 的触发面（2026-11-05 对 tclsh 8.6.17 实测矩阵，D-37⑥）：
+    // 恰在 array 子命令分派处——set/get/names/size/exists/unset 恒触发、
+    // 无论数组存在与否；纯变量机制（set a(k)、$a(k)、info exists、整数组
+    // unset a）不触发。先于子命令体（trace 脚本可建元素并出现在列表，
+    // trace-5.8 序）。search 族（anymore/donesearch/nextelement）rtcl 无
+    // 触发面，tclsh 行为未钉，不覆盖。
+    if matches!(subcmd.as_str(), "set" | "get" | "names" | "size" | "exists" | "unset")
+        && !array_name.is_empty()
+    {
+        let n = array_name.to_string();
+        let _ = interp.fire_traces(&n, None, "array");
+    }
+
     match subcmd.as_str() {
         "anymore" | "donesearch" | "nextelement" => {
             if args.len() != 4 {
@@ -242,17 +255,11 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             if created && list.is_empty() {
                 interp.mark_array(array_name)?;
-                // 'array' traces fire when `array set` creates the
-                // array (tclsh probe: not on plain element writes).
-                let _ = interp.fire_traces(array_name, None, "array");
                 return Ok(Value::empty());
             }
             for chunk in list.chunks(2) {
                 let var_name = format!("{}({})", array_name, chunk[0].as_str());
                 interp.set_var(&var_name, chunk[1].clone())?;
-            }
-            if created {
-                let _ = interp.fire_traces(array_name, None, "array");
             }
             Ok(Value::empty())
         }
@@ -335,13 +342,6 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     // `array names a -regexp` matches the element "-regexp").
                     pattern = Some(first);
                 }
-            }
-            // tclsh quirk: `array names` on a MISSING array still fires
-            // 'array' traces (trace-5.8); size/get do not. The trace script
-            // may create elements, which then show up in the listing.
-            if !interp.is_array_semantic(array_name) && !interp.var_exists(array_name) {
-                let name = array_name.to_string();
-                let _ = interp.fire_traces(&name, None, "array");
             }
             let prefix = format!(
                 "{}(",
@@ -464,6 +464,14 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 })
                 .cloned()
                 .collect();
+            if pattern.is_none() {
+                // tclsh：无 pattern 的 array unset = 整数组 unset——变量
+                // 本身移除（D-35）、一次 {a {} unset} + 分派处 array op；
+                // 元素 unset trace 随整数组 unset 逐元素触发（D-37③，
+                // unset_var 全链）。
+                interp.unset_var(array_name)?;
+                return Ok(Value::empty());
+            }
             for k in keys_to_remove {
                 let _ = interp.unset_var(&k);
             }

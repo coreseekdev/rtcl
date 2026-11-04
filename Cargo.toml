@@ -46,6 +46,9 @@ clap = { version = "4.5", features = ["derive"] }
 rustyline = "14.0"
 colored = "2.1"
 annotate-snippets = "0.11"
+# jemalloc 剖析分配器（rtcl-cli 的 jemalloc feature；profiling =
+# --enable-prof，供 MALLOC_CONF 堆快照 + jeprof 报表）。
+tikv-jemallocator = { version = "0.6", default-features = false, features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 regex = "1"
 regex-lite = "0.1"
 num-bigint = "0.4"

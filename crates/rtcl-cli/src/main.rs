@@ -10,6 +10,14 @@ use std::path::PathBuf;
 
 mod repl;
 
+// D-40 后续的剖析基建（bench/profile-heap.sh）：jemalloc 全局分配器，
+// 仅在 --features jemalloc 且 Linux 时启用。profiling feature 让
+// jemalloc 以 --enable-prof 构建——运行期 MALLOC_CONF="prof:true,..."
+// 即可出堆快照，jeprof 折叠后接 FlameGraph。默认构建零影响。
+#[cfg(all(target_os = "linux", feature = "jemalloc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "rtcl", about, version)]
 struct Args {

@@ -57,3 +57,4 @@ crates/rtcl-wasm/pkg/
 !docs/JIT-WASM-GC.md
 !docs/JIT-OPCODE-DELTA.md
 !TASK-JIT-WASM.md
+bench/profile-out/

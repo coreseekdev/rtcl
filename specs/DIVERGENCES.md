@@ -19,18 +19,23 @@
 
 ### 异常面（error-deep.allium + specs/error-deep.probes）
 
-### D-3 catch options 字典缺 `-errorline` / `-errorstack`（spec [D-2]）[errorline FIXED / errorstack OPEN 2026-11-05]
+### D-3 catch options 字典缺 `-errorline` / `-errorstack`（spec [D-2]）[FIXED 2026-11-05]
 - **Tcl 8.6**：error 完成的 options 字典 6 键齐全（含 -errorstack 的
   `INNER {invokeStk1 ...}` 栈项与 -errorline 行号）。
-- **rtcl 修复态**：5 键（+`-errorline`=错误命令行号，2026-11-05）。
-  `-errorstack` **OPEN**——形状已钉（tclsh 实测）：
-  `error boom` → `INNER {returnImm boom {}}`；proc 内 error →
-  `INNER {returnImm x {}} CALL p1`；nosuchcmd → `INNER {invokeStk1
-  nosuchcmd a}`。实现需 err_last_cmd 捕获 + raise 边界清理（cmd_error
-  的 returnImm 标记会被自身 dispatch 的 harness 帧覆写——需
-  err_code_raised 门控），留专项。
+- **rtcl 修复态（2026-11-05）**：六键齐 + 键序按错误种类三分对齐
+  （error 命令 raise → code-level-es-ec-ei-el；invalid command/一般
+  失败 → ec-code-level-es-ei-el；ARITH → code-level-ec-ei-el-es——
+  tclsh 的 dict 构造路径各有插入序，四形状实测稳定）。-errorstack =
+  平铺 [INNER, <体>, CALL, <名>, ...]：INNER 体 = returnImm（cmd_error
+  经 err_pending_inner 一次性预装，防被自身 dispatch harness 帧覆写）/
+  invokeStk1（其余失败，harness 首帧捕获）；CALL = 错误传播离开的
+  proc 帧（call_proc 错误出口 push，传播序）。六形状探针全 SAME
+  （含全字典字节一致）。
 - **复现**：`catch {error boom} m o; puts [dict keys $o]`
-- **严重度**：低-中（errorstack 为诊断面）。
+- **严重度**：已关闭。残差：ns eval 的 CALL 条目（tclsh 报
+  `CALL {namespace eval ...}` 命令文本，rtcl 无该帧边界——低频）；expr
+  错误的 INNER 形（tclsh = syntax {msg} {opts} 特形，rtcl =
+  invokeStk1——诊断面）。
 
 ### D-4 非 error 完成的 options 字典 -code/-level 未按 proc 边界解码（spec [D-3]）
 - **Tcl 8.6**：catch {f}（f 内 `return hi`）→ `-code 0 -level 1`；

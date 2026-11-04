@@ -846,7 +846,7 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if let Some(ov) = opts_var {
                 let opts = if code == 1 {
                     // Tcl error completions carry -errorcode and -errorinfo.
-                    error_options_dict(1, 0, &e, script, &error_info, interp.err_line)
+                    error_options_dict(1, 0, &e, script, &error_info, interp.err_line, interp)
                 } else if e.is_return() {
                     // return 信号：-level 1、-code = return 自身的码；
                     // 带 -errorcode 载荷时键序 errorcode 在前（tclsh
@@ -901,18 +901,50 @@ fn error_options_dict(
     _script: &str,
     accumulated: &str,
     err_line: usize,
+    interp: &Interp,
 ) -> Value {
     let error_code = err.tcl_error_code();
-    // D-3 部分：-errorline（错误命令行号；-errorstack 待 errorstack
-    // 基建——形状已钉：INNER {returnImm|invokeStkN ...} + CALL name）。
-    Value::from_str(&format!(
-        "-code {} -level {} -errorcode {} -errorinfo {} -errorline {}",
-        code,
-        level,
-        crate::value::tcl_quote(&error_code),
-        crate::value::tcl_quote(accumulated),
-        err_line
-    ))
+    let errorstack = interp.error_stack_render();
+    // D-3：-errorline + -errorstack（INNER/CALL 条目，tclsh 实测形状）。
+    // 键序按错误种类三分（tclsh 的 dict 构造路径各有插入序——四形状
+    // 实测稳定）：error 命令 raise → code-level-es-ec-ei-el；invalid
+    // command/一般 invokeStk 失败 → ec-code-level-es-ei-el；ARITH
+    // （expr）→ code-level-ec-ei-el-es（errorstack 垫底）。
+    let order = match &interp.err_inner {
+        Some(b) if b.starts_with("returnImm") => 0,
+        _ if error_code.starts_with("ARITH") => 2,
+        _ => 1,
+    };
+    let body = match order {
+        0 => format!(
+            "-code {} -level {} -errorstack {} -errorcode {} -errorinfo {} -errorline {}",
+            code,
+            level,
+            crate::value::tcl_quote(&errorstack),
+            crate::value::tcl_quote(&error_code),
+            crate::value::tcl_quote(accumulated),
+            err_line
+        ),
+        1 => format!(
+            "-errorcode {} -code {} -level {} -errorstack {} -errorinfo {} -errorline {}",
+            crate::value::tcl_quote(&error_code),
+            code,
+            level,
+            crate::value::tcl_quote(&errorstack),
+            crate::value::tcl_quote(accumulated),
+            err_line
+        ),
+        _ => format!(
+            "-code {} -level {} -errorcode {} -errorinfo {} -errorline {} -errorstack {}",
+            code,
+            level,
+            crate::value::tcl_quote(&error_code),
+            crate::value::tcl_quote(accumulated),
+            err_line,
+            crate::value::tcl_quote(&errorstack)
+        ),
+    };
+    Value::from_str(&body)
 }
 
 pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -932,6 +964,14 @@ pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let code = error_code.clone().unwrap_or_else(|| "NONE".to_string());
     let _ = interp.set_var("::errorCode", Value::from_str(&code));
     interp.err_code_raised = true;
+    // D-3 -errorstack：error 命令的 INNER 条目 = returnImm <msg> <info>
+    // （tclsh 实测：error boom → INNER {returnImm boom {}}）。一次性
+    // 预装，harness 首帧消费（防被自身 dispatch 帧覆写成 invokeStk）。
+    {
+        let info = error_info.clone().unwrap_or_default();
+        interp.err_pending_inner =
+            Some(format!("returnImm {} {}", msg, crate::value::tcl_quote(&info)));
+    }
     // A non-empty info argument REPLACES the accumulated errorInfo and
     // suppresses the next harness frame (25.7: the `while executing
     // "error ..."` frame is absent).  Without info the error behaves like
@@ -941,6 +981,10 @@ pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             interp.err_info = Some(info.clone());
             interp.err_fresh = true;
             interp.err_pending_top = None;
+            // info 抑制路径不经 harness 首帧——returnImm 形直接消费
+            // （err_calls 同步清：新错误的 CALL 从此处重新累计）。
+            interp.err_inner = interp.err_pending_inner.take();
+            interp.err_calls.clear();
         }
     }
     if error_info.is_none() && error_code.is_none() {
@@ -1036,7 +1080,7 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                                         .get_var("::errorInfo")
                                         .map(|v| v.as_str().to_string())
                                         .unwrap_or_default();
-                                    error_options_dict(exit_code as i64, 0, e, body, &accumulated, interp.err_line)
+                                    error_options_dict(exit_code as i64, 0, e, body, &accumulated, interp.err_line, interp)
                                 }
                                 _ => return_options_dict(exit_code as i64, 0),
                             };
@@ -1111,6 +1155,7 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                                         body,
                                         &accumulated,
                                         interp.err_line,
+                                        interp,
                                     );
                                     interp.set_var(opts_var, opts)?;
                                 }

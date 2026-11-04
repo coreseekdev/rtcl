@@ -747,6 +747,15 @@ pub struct Interp {
     /// report then adds `invoked from within "<text>"` (tclsh logs the
     /// enclosing command only when nothing else consumed the log).
     pub(crate) err_pending_top: Option<Rc<str>>,
+    /// D-3 -errorstack：当前错误的 INNER 条目体（"returnImm x {}" /
+    /// "invokeStk1 <cmdtext>"）；新错误在 harness 首帧处重建。
+    pub(crate) err_inner: Option<String>,
+    /// cmd_error 预装的 returnImm 形（一次性，harness 首帧消费——否则
+    /// 会被自身 dispatch 的 harness 帧覆写成 invokeStk 形）。
+    pub(crate) err_pending_inner: Option<String>,
+    /// 错误传播途中离开的 proc 帧（CALL 条目，内层先）——call_proc 错
+    /// 误出口 push，fresh 错误清空。
+    pub(crate) err_calls: Vec<String>,
     /// Current script name (for info script).
     #[cfg(feature = "std")]
     pub(crate) script_name: String,
@@ -869,6 +878,9 @@ impl Interp {
             top_slots: None,
             next_eval_lexical: false,
             err_pending_top: None,
+            err_inner: None,
+            err_pending_inner: None,
+            err_calls: Vec::new(),
             ns_level0: Vec::new(),
             ns_stack: Vec::new(),
             frames: Vec::new(),

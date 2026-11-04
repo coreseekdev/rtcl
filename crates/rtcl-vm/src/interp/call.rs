@@ -574,6 +574,13 @@ impl Interp {
         // 器/析构器帧用 tclsh 的 `(class "::K" method "m" line N)` 形状
         // （D-43 errorInfo 族，2026-11-05 实测钉形）。
         if let Err(e) = &final_result {
+            if self.err_is_error(e) {
+                // D-3 -errorstack：错误传播离开本 proc 帧 → CALL 条目
+                // （内层先——传播序 push）。
+                // CALL 条目 = tag+名两个平铺元素（tclsh：CALL p1）。
+                self.err_calls.push("CALL".to_string());
+                self.err_calls.push(current_proc_name.to_string());
+            }
             if self.err_is_error(e) && current_proc_name != "apply lambdaExpr" {
                 let tag = super::commands::oo::oo_method_exit_tag(self)
                     .unwrap_or_else(|| format!("procedure \"{}\"", current_proc_name));

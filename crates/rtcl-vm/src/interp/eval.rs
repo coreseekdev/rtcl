@@ -305,6 +305,13 @@ impl Interp {
                     tcl_log_excerpt(text)
                 ));
                 self.err_line = line;
+                // D-3 -errorstack：新错误的 INNER 条目——cmd_error 预装
+                // 的 returnImm 形优先（一次性），其余失败为 invokeStk1
+                // <命令文本>；CALL 条目随传播在 call_proc 错误出口收集。
+                self.err_calls.clear();
+                self.err_inner = Some(self.err_pending_inner.take().unwrap_or_else(
+                    || format!("invokeStk1 {}", tcl_log_excerpt(text)),
+                ));
             }
         }
         // A normal harness log means the substitution boundary's
@@ -910,6 +917,29 @@ impl Interp {
                 Err(Error::invalid_command(name))
             }
         }
+    }
+
+    /// D-3 `-errorstack` 值：INNER 条目（returnImm/invokeStk 形）+
+    /// 传播序 CALL 条目。tclsh 形状实测：`error boom` →
+    /// `INNER {returnImm boom {}}`；proc 内 error →
+    /// `INNER {returnImm x {}} CALL p1`；nosuchcmd →
+    /// `INNER {invokeStk1 nosuchcmd a}`；双层 proc →
+    /// `INNER {invokeStk1 nosuch z} CALL p1 CALL outer`。
+    pub(crate) fn error_stack_render(&self) -> String {
+        // -errorstack 值 = 平铺 [INNER, <体>, CALL, <名>, ...]（tclsh
+        // 实测：dict get 出 `INNER {returnImm x {}} CALL p1`——条目的
+        // tag 与载荷是独立元素，载荷由列表渲染自动括引）。
+        let mut el: Vec<String> = Vec::new();
+        if let Some(inner) = &self.err_inner {
+            el.push("INNER".to_string());
+            el.push(inner.clone());
+        }
+        for c in &self.err_calls {
+            el.push(c.clone());
+        }
+        Value::from_list(&el.iter().map(|v| Value::from_str(v)).collect::<Vec<_>>())
+            .as_str()
+            .to_string()
     }
 
     /// Full uncaught-error report for the `-f`/`-c` top level: the

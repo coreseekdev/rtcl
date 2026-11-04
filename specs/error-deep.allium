@@ -17,13 +17,29 @@ given {
 
 rule CatchErrorOptionsDictHasSixKeys {
     -- On an error completion the options dict carries exactly six keys:
-    -- -code -level -errorcode -errorinfo -errorstack -errorline.
+    -- -code -level -errorcode -errorinfo -errorstack -errorline.  The
+    -- KEY ORDER varies by error kind (tclsh's dict construction paths):
+    -- error-command raise => code-level-es-ec-ei-el; invalid-command /
+    -- invokeStk failures => ec-code-level-es-ei-el; ARITH => 
+    -- code-level-ec-ei-el-es (errorstack last).  2026-11-05 pinned.
     when: Evaluates("dict keys $o    -- after: catch {error boom} m o")
     ensures: completion.code = ok
-    -- oracle value: -errorcode -code -level -errorstack -errorinfo -errorline
-    -- (key order unspecified; all six must be present)
-    -- rtcl: only 4 keys — missing -errorstack and -errorline  [D-2]
+    -- oracle value: -code -level -errorstack -errorcode -errorinfo -errorline
+    -- rtcl: FIXED 2026-11-05（六键 + 三序别）[D-2]
     -- probe: catch {error boom} m o; puts [dict keys $o]
+}
+
+rule ErrorstackEntries {
+    -- -errorstack = flat list [INNER, <body>, CALL, <name>, ...]:
+    --   error boom => INNER {returnImm boom {}}
+    --   proc p1 {error x}; catch p1 => INNER {returnImm x {}} CALL p1
+    --   nosuchcmd a => INNER {invokeStk1 nosuchcmd a}
+    --   two-proc => INNER {invokeStk1 nosuch z} CALL p1 CALL outer
+    -- (2026-11-05 pinned; rtcl FIXED — err_pending_inner one-shot +
+    --  call_proc error-exit CALL collection.)
+    when: Evaluates("dict get $o -errorstack    -- after: proc p1 {} {error x}; catch {p1} m o")
+    ensures: completion.code = ok
+    ensures: completion.value = "INNER {returnImm x {}} CALL p1"
 }
 
 rule CatchNonErrorOptionsLevel {

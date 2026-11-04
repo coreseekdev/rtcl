@@ -179,7 +179,7 @@ rule RenameToEmptyDestroysObject {
     when: Evaluates("out    -- after: C{destructor {puts DTOR}}; C create o; rename o \"\"")
     ensures: completion.code = ok
     -- oracle: DTOR E
-    -- rtcl: deletes the command only, destructor never runs  [D-42]
+    -- rtcl: FIXED 2026-11-05（cmd_rename OO 分支）[D-42]
 }
 
 rule RenameObjectKeepsItUsable {
@@ -188,7 +188,7 @@ rule RenameObjectKeepsItUsable {
     when: Evaluates("o2 m    -- after: C{method m {return 1}}; C create o; rename o o2")
     ensures: completion.code = ok
     ensures: completion.value = "1"
-    -- rtcl: o2 invalid — rename is not OO-aware  [D-42]
+    -- rtcl: FIXED 2026-11-05（oo_rename 重键）[D-42]
 }
 
 rule CopySupportsClassesAndTargetNamespaceForm {
@@ -198,9 +198,7 @@ rule CopySupportsClassesAndTargetNamespaceForm {
     when: Evaluates("catch {oo::copy C D} m; set m    -- C is a class")
     ensures: completion.code = ok
     -- oracle: ::D
-    -- rtcl: C does not refer to an object; 3-arg form places the
-    --   command inside the target namespace and skips the
-    --   already-exists check  [D-42]
+    -- rtcl: FIXED 2026-11-05（类源 clone + 三参语义）[D-42]
 }
 
 -- ── info surface ─────────────────────────────────────────────────
@@ -211,7 +209,7 @@ rule InfoObjectIsaOnMissingNameIsZero {
     when: Evaluates("info object isa class nosuch")
     ensures: completion.code = ok
     ensures: completion.value = "0"
-    -- rtcl: nosuch does not refer to an object  [D-43]
+    -- rtcl: FIXED 2026-11-05 [D-43]
 }
 
 rule InfoClassSubclassesExcludesSelf {
@@ -220,7 +218,7 @@ rule InfoClassSubclassesExcludesSelf {
     when: Evaluates("info class subclasses C    -- with a bare C")
     ensures: completion.code = ok
     ensures: completion.value = ""
-    -- rtcl: includes C itself; misses mixin users  [D-43]
+    -- rtcl: FIXED 2026-11-05（直系判定）[D-43]
 }
 
 rule InfoClassMethodsAllIncludesMixins {
@@ -249,7 +247,7 @@ rule MyVariableIsACoreMethod {
     when: Evaluates("o m    -- with C{method m {} {my variable v; set v 3; return $v}}; C create o")
     ensures: completion.code = ok
     ensures: completion.value = "3"
-    -- rtcl: unknown method "variable"  [D-43]
+    -- rtcl: FIXED 2026-11-05（私有核心方法）[D-43]
 }
 
 rule InfoStubbedSubcommands {
@@ -260,5 +258,6 @@ rule InfoStubbedSubcommands {
     when: Evaluates("catch {info object filters o} m; set m")
     ensures: completion.code = ok
     ensures: completion.value = ""
-    -- rtcl: unknown subcommand errors for the whole stub set  [D-43]
+    -- rtcl: FIXED 2026-11-05（filters/constructor/destructor；
+    --   恒空形状为 oracle 实测）[D-43]
 }

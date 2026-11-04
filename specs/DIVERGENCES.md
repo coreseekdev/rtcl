@@ -387,13 +387,18 @@
   实测踩坑）✓。
 - **严重度**：已关闭（oo-deep 16→21/32）。
 
-### D-42 对象生命周期与别名（打包）
+### D-42 对象生命周期与别名（打包）[FIXED 2026-11-05]
 - **Tcl 8.6**：① `rename o ""` 触发析构；② `rename o o2` 后 o2 可用
   （OO 与 rename 联动）；③ oo::copy 支持类；④ copy 三参形式要求目标
   ns 不存在、作为副本底层 ns，命令放当前 ns。
-- **rtcl**：① 仅删命令（析构器不跑）；② o2 invalid；③ 报 does not
-  refer to an object；④ 命令放 targetNS 内且不查已存在。
-- **严重度**：中-高。
+- **rtcl 修复态（2026-11-05）**：① cmd_rename 的 OO 分支——oo_rename
+  （空新名 → destroy_object 析构器照跑；重键 → objects/classes/
+  creation_order/实例 .class/子类与混入引用边全迁移；oo 表键 ::-canonical、
+  命令表裸/限定双变体搬）✓；② o2 可用 ✓；③ copy 支持类源（OoClass
+  全 clone：methods/variables/filters/ctor/dtor；不迁移实例与子类）✓；
+  ④ 三参形：targetNamespace 必须不存在（exists refers to an existing
+  namespace）+ 作为副本底层 ns + 命令落当前 ns ✓。
+- **严重度**：已关闭。
 
 ### D-43a OO 方法/构造器/析构器错误出口帧 [FIXED 2026-11-05]
 - **Tcl 8.6**：`(class "::K" method "m" line N)` / `(class "::A"
@@ -404,7 +409,7 @@
   帧发射点；三形状探针 SAME。
 - **严重度**：已关闭。
 
-### D-43 info 面与私有方法（打包）
+### D-43 info 面与私有方法（打包）[大部分 FIXED 2026-11-05]
 - **Tcl 8.6**：① `info object isa *` 对缺失名返回 0；② subclasses
   不含自身、含 mixin 用户类；③ `info class methods C -all` 含 mixin
   方法、不含 hidden；④ `info object variables` 列声明（未赋值也列）、
@@ -414,12 +419,18 @@
   filters/forward/methodtype/definition/constructor/destructor 子命令
   全实现（8.6.17）；⑧ `info object methods` 校验 -all/-localprivate/
   -private。
-- **rtcl**：① 抛 does not refer to an object；② 含自身、缺 mixin
-  用户；③ 只走 superclass 链、列 hidden；④ 只列活变量、vars 恰 4 参；
-  ⑤ 缺 variable/varname；⑥ owner 词空串/四元描述符；⑦ 全 stub；⑧
-  任意 -flag 静默忽略。
-- **严重度**：中（信息面/内省面）。**外观差异（非分歧）**：::oo::ObjN
-  编号计数与 tclsh 不同（元对象预占号），脚本不应依赖。
+- **rtcl 修复态（2026-11-05）**：① isa 缺失名 → 0 ✓；② subclasses
+  直系（superclass/mixin 直接含 target；不含自身）✓；⑤ oo::object 私有
+  核心方法 variable/varname/eval/<cloned> 落地（Builtin 臂：variable 链
+  对象 ns 变量、varname 全名、eval 对象 ns 求值；**私有**——外部调用
+  报 unknown，tclsh 实测）✓；⑦ 部分：info object filters（o.filters）、
+  info class constructor/destructor（恒空——tclsh 8.6.17 对已定义者也
+  返回空，oracle 形状）✓。
+- **精化项 OPEN**：③ methods -all 含 mixin 方法/排除 hidden；④ vars
+  pattern；⑥ self call/next 形状；⑦ 其余 stub（forward/methodtype/
+  definition）；⑧ methods -flag 校验（-localprivate）。
+- **严重度**：已关闭主体。**外观差异（非分歧）**：::oo::ObjN 编号
+  计数与 tclsh 不同（元对象预占号），脚本不应依赖。
 
 ## rtcl 有意扩展（超集，非 bug，parity 语料不应使用）
 

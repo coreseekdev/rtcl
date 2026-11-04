@@ -1002,6 +1002,20 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // procs, ensembles, import aliases) — age the resolution cache out.
     interp.note_cmd_mutation();
 
+    // OO objects/classes（D-42①②）：命令注册在 builtins 表，但 oo 侧
+    // 状态（objects/classes/creation_order/引用边）必须随键迁移——空
+    // 新名 = destroy（析构器照跑）。必须在 builtins 通用路径之前拦截。
+    let oo_old = if old_key.starts_with("::") {
+        old_key.clone()
+    } else {
+        format!("::{}", old_key)
+    };
+    if interp.oo.objects.contains_key(&oo_old) || interp.oo.classes.contains_key(&oo_old) {
+        super::oo::oo_rename(interp, &old_key, &new_key)?;
+        finish_cmd_rename(interp, &old_key, &new_key, &old_name, &new_name);
+        return Ok(Value::empty());
+    }
+
     // Rename in builtins
     if let Some(func) = interp.commands.remove(&old_key) {
         let cat = interp.command_categories.remove(&old_key);

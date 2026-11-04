@@ -396,6 +396,14 @@ pub(crate) fn init(interp: &mut Interp) {
     interp.oo.next_obj_id = id;
     let mut root = OoClass { ns: Rc::from(format!("::oo::Obj{}", id)), ..Default::default() };
     root.methods.push(("destroy".to_string(), builtin_method("destroy")));
+    // D-43⑤：oo::object 私有核心方法（tclsh must-be 清单含它们）。
+    // D-43⑤：这四个是**私有**核心方法（tclsh：外部 o varname 报
+    // unknown；must-be 清单仅在 my 私有调用路径列出）。
+    for core in ["variable", "varname", "eval", "<cloned>"] {
+        let mut md = builtin_method(core);
+        md.exported = false;
+        root.methods.push((core.to_string(), md));
+    }
     interp.oo.classes.insert("::oo::object".to_string(), root);
     interp.oo.creation_order.push("::oo::object".to_string());
 
@@ -900,6 +908,37 @@ fn exec_chain_entry(
             }
             "create" => oo_create(interp, key, call_args, typed),
             "new" => oo_new(interp, key, call_args),
+            // D-43⑤：my variable / my varname / my eval——对象 ns 语义
+            // （variable 链接对象 ns 变量进当前帧；varname 出全名；eval
+            // 在对象 ns 求值）。<cloned> 为复制钩子占位（oo::copy 另走
+            // build_chain 探测）。
+            "variable" => {
+                let ns = object_ns_of(interp, key);
+                let prev = std::mem::replace(&mut interp.current_namespace, Rc::from(ns));
+                let mut a: Vec<Value> = vec![Value::from_str("variable")];
+                a.extend_from_slice(call_args);
+                let r = interp.dispatch_values(&a);
+                interp.current_namespace = prev;
+                r
+            }
+            "varname" => {
+                let ns = object_ns_of(interp, key);
+                let name = call_args.first().map(|v| v.as_str()).unwrap_or("");
+                Ok(Value::from_str(&format!("{}::{}", ns, name)))
+            }
+            "eval" => {
+                let ns = object_ns_of(interp, key);
+                let prev = std::mem::replace(&mut interp.current_namespace, Rc::from(ns));
+                let script = call_args
+                    .iter()
+                    .map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let r = interp.eval(&script);
+                interp.current_namespace = prev;
+                r
+            }
+            "<cloned>" => Ok(Value::empty()),
             _ => Ok(Value::empty()),
         },
         MethodKind::Forward { cmd, prefix } => {
@@ -2534,6 +2573,85 @@ fn delete_method(interp: &mut Interp, target: &DefineTarget, name: &str) {
     }
 }
 
+// ── rename interop（D-42①②）───────────────────────────────────────────
+
+/// `rename` 的 OO 侧：对象/类命令改名时 oo 侧表（objects/classes/
+/// creation_order/引用边）随键迁移；新名为空 = destroy（析构器照跑，
+/// 命令摘除）。类重键同时清扫实例 .class 与子类/混入引用边。
+pub(crate) fn oo_rename(interp: &mut Interp, old_key: &str, new_key: &str) -> Result<()> {
+    // oo 表键恒为 ::-canonical；命令表则裸/限定双注册（顶层对象）——
+    // 两个变体都搬。
+    let canon = |k: &str| {
+        if k.starts_with("::") {
+            k.to_string()
+        } else {
+            format!("::{}", k)
+        }
+    };
+    let oo_old = canon(old_key);
+    if new_key.is_empty() {
+        destroy_object(interp, &oo_old, false)?;
+        return Ok(());
+    }
+    let oo_new = canon(new_key);
+    interp.oo.mutation_ctr += 1;
+    interp.oo.chain_memo.clear();
+    interp.oo.chain_memo_priv.clear();
+    let move_cmd = |interp: &mut Interp, old_key: &str, new_key: &str| {
+        for ov in [old_key.to_string(), canon(old_key)] {
+            if let Some(func) = interp.commands.remove(&ov) {
+                for nv in [new_key.to_string(), canon(new_key)] {
+                    interp.commands.insert(nv.clone(), func.clone());
+                    if let Some(c) = interp.command_categories.remove(&ov).clone() {
+                        interp.command_categories.insert(nv.clone(), c);
+                    }
+                    if let Some(m) = interp.command_meta.remove(&ov).clone() {
+                        interp.command_meta.insert(nv, m);
+                    }
+                    break;
+                }
+                break;
+            }
+        }
+        if let Some(p) = interp
+            .oo
+            .creation_order
+            .iter_mut()
+            .find(|k| k.as_str() == canon(old_key))
+        {
+            *p = canon(new_key);
+        }
+    };
+    if let Some(o) = interp.oo.objects.remove(&oo_old) {
+        interp.oo.objects.insert(oo_new.clone(), o);
+        move_cmd(interp, old_key, new_key);
+        return Ok(());
+    }
+    if let Some(mut c) = interp.oo.classes.remove(&oo_old) {
+        for o in interp.oo.objects.values_mut() {
+            if o.class == oo_old {
+                o.class = oo_new.clone();
+            }
+        }
+        for cl in interp.oo.classes.values_mut() {
+            for s in cl.superclasses.iter_mut() {
+                if s == &oo_old {
+                    *s = oo_new.clone();
+                }
+            }
+            for m in cl.mixins.iter_mut() {
+                if m == &oo_old {
+                    *m = oo_new.clone();
+                }
+            }
+        }
+        interp.oo.classes.insert(oo_new, c);
+        move_cmd(interp, old_key, new_key);
+        return Ok(());
+    }
+    Ok(())
+}
+
 // ── oo::copy ───────────────────────────────────────────────────────────
 
 extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -2547,22 +2665,32 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     }
     let src_typed = args[1].as_str().to_string();
     let src = match resolve_object_key(interp, &src_typed) {
-        Some(k) if interp.oo.objects.contains_key(k.as_ref()) => k,
+        Some(k) if interp.oo.objects.contains_key(k.as_ref()) || interp.oo.classes.contains_key(k.as_ref()) => k,
         _ => return Err(does_not_refer(true, &src_typed)),
     };
-    let (target_typed, full) = if args.len() == 4 {
+    let is_class_src = interp.oo.classes.contains_key(src.as_ref());
+    let (target_typed, full, ns_override) = if args.len() == 4 {
         let name = args[2].as_str().to_string();
         let ns = args[3].as_str().to_string();
-        let full = qualify(&ns, &name);
-        (name, full)
+        // D-42④：tclsh 语义——targetNamespace 必须不存在（存在即报），
+        // 作为副本的**底层命名空间**；命令落在当前 ns。
+        let canon_ns = if ns.starts_with("::") { ns.clone() } else { format!("::{}", ns) };
+        if interp.namespaces.contains_key(&canon_ns) {
+            return Err(Error::Msg(format!(
+                "{} refers to an existing namespace",
+                ns
+            )));
+        }
+        let full = qualify(&interp.current_namespace, &name);
+        (name, full, Some(canon_ns))
     } else if args.len() == 3 {
         let name = args[2].as_str().to_string();
         let full = qualify(&interp.current_namespace, &name);
-        (name, full)
+        (name, full, None)
     } else {
         interp.oo.next_obj_id += 1;
         let name = format!("::oo::Obj{}", interp.oo.next_obj_id);
-        (name.clone(), name)
+        (name.clone(), name, None)
     };
     if command_exists_any(interp, &full) {
         return Err(Error::Msg(format!(
@@ -2571,12 +2699,26 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
         )));
     }
 
+    // D-42③：类源也复制（方法/变量/constructor/destructor/mixins/
+    // superclasses 全 clone；不迁移实例与子类关系）。D-42④：三参形
+    // 的副本底层 ns = targetNamespace（新建），命令在当前 ns。
+    if is_class_src {
+        let mut c = interp.oo.classes.get(src.as_ref()).cloned().unwrap_or_default();
+        interp.oo.next_obj_id += 1;
+        let new_ns = ns_override.unwrap_or_else(|| format!("::oo::Obj{}", interp.oo.next_obj_id));
+        c.ns = Rc::from(new_ns.as_str());
+        interp.oo.classes.insert(full.clone(), c);
+        interp.oo.creation_order.push(full.clone());
+        interp.oo.mutation_ctr += 1;
+        attach_object(interp, &full, &new_ns);
+        return Ok(Value::from_str(&full));
+    }
     let (source, ns) = {
         let o = &interp.oo.objects[src.as_ref()];
         (o.clone(), o.ns.clone())
     };
     interp.oo.next_obj_id += 1;
-    let new_ns = format!("::oo::Obj{}", interp.oo.next_obj_id);
+    let new_ns = ns_override.unwrap_or_else(|| format!("::oo::Obj{}", interp.oo.next_obj_id));
     let mut copy = source.clone();
     copy.ns = Rc::from(new_ns.as_str());
     interp.oo.objects.insert(full.clone(), copy);
@@ -2999,7 +3141,11 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let typed = args[4].as_str();
-            let key = resolve_object_arg(interp, typed)?;
+            // D-43①：缺失名 → 0（tclsh 不报错）。
+            let key = match resolve_object_key(interp, typed) {
+                Some(k) => k.to_string(),
+                None => return Ok(Value::from_str("0")),
+            };
             let result = match category {
                 "class" => interp.oo.classes.contains_key(&key),
                 "object" => interp.oo.objects.contains_key(&key) || interp.oo.classes.contains_key(&key),
@@ -3039,6 +3185,26 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 _ => false,
             };
             Ok(Value::from_bool(result))
+        }
+        // D-43⑦（部分）：object filters = 对象级 filter 名单。
+        "filters" => {
+            if args.len() != 4 {
+                return Err(Error::wrong_args_with_usage(
+                    "info object filters",
+                    4,
+                    args.len(),
+                    "objName",
+                ));
+            }
+            let key = resolve_object_key(interp, args[3].as_str())
+                .ok_or_else(|| does_not_refer(true, args[3].as_str()))?;
+            let items = interp
+                .oo
+                .objects
+                .get(key.as_ref())
+                .map(|o| o.filters.clone())
+                .unwrap_or_default();
+            Ok(Value::from_list(&items.iter().map(|v| Value::from_str(v)).collect::<Vec<_>>()))
         }
         "call" => {
             // tclsh 8.6 `info object call objName methodName`: exactly two
@@ -3124,10 +3290,18 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let key = resolve_class_arg(interp, args[3].as_str())?;
+            // D-43②：直系子类/混入用户（不含自身——linearize 含自身）。
             let mut out: Vec<String> = Vec::new();
             for k in &interp.oo.creation_order {
-                if interp.oo.classes.contains_key(k) && linearize(interp, k).iter().any(|c| c == &key) {
-                    out.push(k.clone());
+                if k == &key {
+                    continue;
+                }
+                if let Some(c) = interp.oo.classes.get(k) {
+                    if c.superclasses.iter().any(|s| s == &key)
+                        || c.mixins.iter().any(|m| m == &key)
+                    {
+                        out.push(k.clone());
+                    }
                 }
             }
             Ok(Value::from_list(&out.iter().map(|v| Value::from_str(v)).collect::<Vec<_>>()))
@@ -3171,6 +3345,23 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             Ok(class_methods_listing(interp, &key, all, private))
         }
+        // D-43⑦（部分）：constructor/destructor → {args body} / {body} / 空。
+        "constructor" | "destructor" => {
+            if args.len() != 4 {
+                return Err(Error::wrong_args_with_usage(
+                    format!("info class {}", sub),
+                    4,
+                    args.len(),
+                    "className",
+                ));
+            }
+            let key = resolve_class_arg(interp, args[3].as_str())?;
+            let cls = interp.oo.classes.get(&key);
+            // tclsh 8.6.17 实测：这两个子命令恒返回空（即便 ctor/dtor
+            // 已定义）——oracle 形状如此。
+            let items: Vec<String> = Vec::new();
+            Ok(Value::from_list(&items.iter().map(|v| Value::from_str(v)).collect::<Vec<_>>()))
+        }
         "mixins" | "variables" | "filters" => {
             if args.len() != 4 {
                 return Err(Error::wrong_args_with_usage(
@@ -3185,6 +3376,18 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let items: Vec<String> = match (sub, cls) {
                 ("mixins", Some(c)) => c.mixins.clone(),
                 ("variables", Some(c)) => (*c.variables).clone(),
+                // D-43⑦（部分）：constructor/destructor → {args body} 或空。
+                ("constructor", Some(c)) => match &c.constructor {
+                    Some(d) => vec![
+                        d.params.iter().map(|p| p.0.as_str()).collect::<Vec<_>>().join(" "),
+                        d.body.to_string(),
+                    ],
+                    None => vec![],
+                },
+                ("destructor", Some(c)) => match &c.destructor {
+                    Some(d) => vec![d.body.to_string()],
+                    None => vec![],
+                },
                 ("filters", Some(c)) => c.filters.clone(),
                 _ => vec![],
             };

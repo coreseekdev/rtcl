@@ -504,21 +504,29 @@ impl Interp {
         // before dispatch; leavestep after, with the completion code and
         // result (trace-28.6).  Control-flow completions (return/break/
         // continue) skip the step end.
-        let step = self.exec_step_begin(&args);
+        let step = self.exec_step_begin(&args)?;
         let r = self.dispatch_values(&args);
-        if let Some(ctx) = step {
-            match &r {
+        let r = match &step {
+            Some(ctx) => match &r {
                 Ok(v) => {
                     let res = v.as_str().to_string();
-                    self.exec_step_end(&ctx, "0", &res);
+                    // D-39③：leavestep handler 错误替换命令结果。
+                    match self.exec_step_end(ctx, "0", &res) {
+                        Ok(()) => r,
+                        Err(le) => Err(le),
+                    }
                 }
                 Err(e) if self.err_is_error(e) => {
                     let msg = e.message_text().to_string();
-                    self.exec_step_end(&ctx, "1", &msg);
+                    match self.exec_step_end(ctx, "1", &msg) {
+                        Ok(()) => r,
+                        Err(le) => Err(le),
+                    }
                 }
-                _ => {}
-            }
-        }
+                _ => r,
+            },
+            None => r,
+        };
         if let Err(e) = &r {
             if self.err_is_error(e) {
                 let msg = e.message_text();
@@ -539,6 +547,54 @@ impl Interp {
         self.cur_cmd_line = saved_line;
         self.cur_cmd_word_srcs = saved_srcs;
         r
+    }
+
+    /// D-39①：builtin 命令的 enter/leave 括号（cache 命中臂与慢链共用）。
+    /// enter 先行且其错误替换本次调用（trace-40.1）；leave 带解码后的
+    /// (code, result)，handler 错误替换命令结果且记录保留（D-39③）。
+    /// exec_fire_* 的 exec_step_running 守卫挡掉回调内重入。注册键经
+    /// 命名空间规范化（与 call_proc 的 exec_key 同一解析）。字节码内联
+    /// 的 set/incr/lappend/expr/while/foreach/槽 op 不经过分派——缺口
+    /// 记台账 D-39① 精化项。
+    fn invoke_builtin_traced(
+        &mut self,
+        cmd_name: &str,
+        args: &[Value],
+        f: crate::command::CommandFunc,
+    ) -> Result<Value> {
+        let traced = !self.exec_traces.is_empty() && self.exec_step_running == 0;
+        let (exec_key, cmdtext) = if traced {
+            let key = super::commands::proc::resolve_command_key(self, cmd_name)
+                .unwrap_or_else(|| cmd_name.to_string());
+            if self.exec_traces.contains_key(&key) {
+                let t = Value::from_list(args).as_str().to_string();
+                (Some(key), Some(t))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+        if let (Some(k), Some(t)) = (&exec_key, &cmdtext) {
+            self.exec_fire_enter(k, t)?;
+        }
+        self.call_depth += 1;
+        let result = f(self, args);
+        self.call_depth -= 1;
+        let result = self.fill_wrong_args(cmd_name, result);
+        if let (Some(k), Some(t)) = (&exec_key, &cmdtext) {
+            let (code, res) = match &result {
+                Ok(v) => ("0", v.as_str().to_string()),
+                Err(e) if self.err_is_error(e) => ("1", e.message_text().to_string()),
+                Err(e) if e.is_break() => ("3", String::new()),
+                Err(e) if e.is_continue() => ("4", String::new()),
+                Err(e) => ("1", e.message_text()),
+            };
+            if let Err(le) = self.exec_fire_leave(k, t, code, &res) {
+                return Err(le);
+            }
+        }
+        result
     }
 
     /// Dispatch an already-evaluated argument vector: procs, ensembles,
@@ -566,10 +622,7 @@ impl Interp {
         // fall straight through to the full chain.
         match self.cmd_cache_get(cmd_name) {
             Some(super::ResolvedCmd::Builtin(f)) => {
-                self.call_depth += 1;
-                let result = f(self, args);
-                self.call_depth -= 1;
-                return self.fill_wrong_args(cmd_name, result);
+                return self.invoke_builtin_traced(cmd_name, args, f);
             }
             Some(super::ResolvedCmd::Proc(key)) => {
                 // A generation-valid hit implies the key is still
@@ -735,10 +788,7 @@ impl Interp {
         match func {
             Some(f) => {
                 self.cmd_cache_put(cmd_name, super::ResolvedCmd::Builtin(f));
-                self.call_depth += 1;
-                let result = f(self, args);
-                self.call_depth -= 1;
-                self.fill_wrong_args(cmd_name, result)
+                self.invoke_builtin_traced(cmd_name, args, f)
             }
             None => {
                 // Expr functions double as commands: `::tcl::mathfunc::abs -0`

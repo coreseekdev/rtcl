@@ -179,7 +179,9 @@ rule ExecTracesCoverAllCommands {
     when: Evaluates("set got    -- after: trace on `set` enter; set x 1")
     ensures: completion.code = ok
     ensures: completion.value = "{set x 1} enter"
-    -- rtcl: hooks only proc calls (call_proc)  [D-39]
+    -- rtcl: FIXED 2026-11-05 for dispatched builtins
+    --   (invoke_builtin_traced bracket); bytecode-inlined ops
+    --   (set/incr/lappend/expr/while/foreach, slots) remain OPEN [D-39①]
 }
 
 rule ExecLeaveArgsAndReturnCompletion {
@@ -188,7 +190,25 @@ rule ExecLeaveArgsAndReturnCompletion {
     when: Evaluates("set got    -- after: proc foo {} {set a 1; return $a}; leave trace; foo")
     ensures: completion.code = ok
     ensures: completion.value = "foo 0 1 leave"
-    -- rtcl: no leave fire on return completions  [D-39]
+    -- rtcl: FIXED 2026-11-05（deferred return 解码后进 leave）[D-39]
+}
+
+rule ExecTraceFiringOrder {
+    -- enter/enterstep fire NEWEST-first; leave/leavestep fire in
+    -- registration order (oldest first) — the opposite of variable
+    -- traces' uniform latest-first (2026-11-05 file-mode matrix).
+    when: Evaluates("set got    -- after: two leave records A B; foo")
+    ensures: completion.code = ok
+    -- oracle: A's args appear before B's
+    -- (enter/enterstep reversed: B before A)
+}
+
+rule ExecTraceRecordRemovedMidfireStaysSilent {
+    -- A record removed by an earlier callback during the same firing
+    -- does not fire (trace-34.1 identity rule, all ops — trace-34.2/34.3).
+    when: Evaluates("catch {foo} m    -- with bar (older leave record) removing soom (newer)")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
 }
 
 rule ExecTraceHandlerErrorPropagates {
@@ -198,8 +218,7 @@ rule ExecTraceHandlerErrorPropagates {
     -- after: leave handler errors; catch {foo} m
     ensures: completion.code = ok
     ensures: completion.value = "LE 1"
-    -- rtcl: swallows the error, returns the command result, DELETES the
-    --   record  [D-39]
+    -- rtcl: FIXED 2026-11-05（恒传播 + 记录保留）[D-39]
 }
 
 rule ExecEnterstepCoversStackRange {
@@ -209,5 +228,5 @@ rule ExecEnterstepCoversStackRange {
     when: Evaluates("set got    -- after: enterstep trace on foo; foo calls bar; bar runs {set q 1}")
     ensures: completion.code = ok
     -- oracle includes: bar enterstep {set q 1} enterstep
-    -- rtcl: matches only the innermost frame's records  [D-39]
+    -- rtcl: FIXED 2026-11-05（ExecStepCtx.steps 收全栈）[D-39]
 }

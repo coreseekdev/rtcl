@@ -3116,21 +3116,29 @@ fn dispatch_call(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// Full dispatch — `dispatch_values` with the execution-step trace
 /// bracketing `eval_command` provides.
 fn dispatch_dynamic(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    let step = interp.exec_step_begin(args);
+    let step = interp.exec_step_begin(args)?;
     let r = interp.dispatch_values(args);
-    if let Some(ctx) = step {
-        match &r {
+    let r = match &step {
+        Some(ctx) => match &r {
             Ok(v) => {
                 let res = v.as_str().to_string();
-                interp.exec_step_end(&ctx, "0", &res);
+                // D-39③：leavestep handler 错误替换命令结果。
+                match interp.exec_step_end(ctx, "0", &res) {
+                    Ok(()) => r,
+                    Err(le) => Err(le),
+                }
             }
             Err(e) if interp.err_is_error(e) => {
                 let msg = e.message_text().to_string();
-                interp.exec_step_end(&ctx, "1", &msg);
+                match interp.exec_step_end(ctx, "1", &msg) {
+                    Ok(()) => r,
+                    Err(le) => Err(le),
+                }
             }
-            _ => {}
-        }
-    }
+            _ => r,
+        },
+        None => r,
+    };
     r
 }
 

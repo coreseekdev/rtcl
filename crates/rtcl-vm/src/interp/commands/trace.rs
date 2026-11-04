@@ -337,9 +337,11 @@ impl Interp {
 
     /// Fire one batch of execution-trace records by id (most-recent
     /// first).  `extra` carries the op-specific middle arguments (result /
-    /// code for leave-style ops).  When `propagate` is set the callback's
-    /// error aborts the traced command; otherwise the error is discarded
-    /// and the errored record is auto-removed (tclsh 8.6.17).
+    /// code for leave-style ops).  Handler errors ALWAYS propagate and
+    /// REPLACE the traced command's outcome while the record stays
+    /// registered (tclsh 8.6.17 dual-probed: leave handler error →
+    /// `catch {foo}` = LE, record count 1 — D-39③; the former
+    /// discard+auto-remove read of traceCmd.c was wrong).
     fn exec_fire_ids(
         &mut self,
         key: &str,
@@ -347,7 +349,6 @@ impl Interp {
         cmdtext: &str,
         op: &str,
         extra: &[&str],
-        propagate: bool,
     ) -> Result<()> {
         let records: Vec<(u64, String)> = match self.exec_traces.get(key) {
             Some(v) => v
@@ -358,7 +359,27 @@ impl Interp {
             None => return Ok(()),
         };
         let q = |v: &str| Value::from_list(&[Value::from_str(v)]).as_str().to_string();
-        for (id, script) in records.into_iter().rev() {
+        // exec trace 触发序（2026-11-05 文件模式实测矩阵）：enter/
+        // enterstep = 最新先（B A），leave/leavestep = 注册序最旧先
+        // （A B——trace-34.2 自洽所需，bar 先跑才能摘掉 soom）。与
+        // 变量 trace 的统一 latest-first 不同。
+        let ordered = if op == "leave" || op == "leavestep" {
+            records
+        } else {
+            records.into_iter().rev().collect()
+        };
+        for (id, script) in ordered {
+            // firing 途中被别的回调 remove 的记录不再触发（trace-34.1
+            // 恒等式语义全 op 通用——34.2/34.3：leave/enterstep handler
+            // 里 trace remove 另一条记录，后者即哑）。快照只为顺序，
+            // 存活以注册表为准。
+            if let Some(v) = self.exec_traces.get(key) {
+                if !v.iter().any(|t| t.id == id) {
+                    continue;
+                }
+            } else {
+                break;
+            }
             let mut cmd = format!("{} {}", script, q(cmdtext));
             for e in extra {
                 cmd.push(' ');
@@ -370,13 +391,7 @@ impl Interp {
             let r = self.eval_isolated(&cmd);
             self.exec_step_running -= 1;
             if let Err(e) = r {
-                if propagate {
-                    return Err(e);
-                }
-                // Errored trace record is removed (tclsh).
-                if let Some(v) = self.exec_traces.get_mut(key) {
-                    v.retain(|t| t.id != id);
-                }
+                return Err(e);
             }
         }
         Ok(())
@@ -392,58 +407,73 @@ impl Interp {
             Some(v) => v.iter().map(|t| t.id).collect(),
             None => return Ok(()),
         };
-        self.exec_fire_ids(key, &ids, cmdtext, "enter", &[], true)
+        self.exec_fire_ids(key, &ids, cmdtext, "enter", &[])
     }
 
-    /// Fire the `leave` execution traces for `key`; errors are background
-    /// errors (discarded; errored record removed).
-    pub(crate) fn exec_fire_leave(&mut self, key: &str, cmdtext: &str, code: &str, result: &str) {
+    /// Fire the `leave` execution traces for `key`; a handler error
+    /// propagates and becomes the command's outcome (D-39③).
+    pub(crate) fn exec_fire_leave(
+        &mut self,
+        key: &str,
+        cmdtext: &str,
+        code: &str,
+        result: &str,
+    ) -> Result<()> {
         if self.exec_step_running > 0 || self.exec_traces.is_empty() {
-            return;
+            return Ok(());
         }
         let ids: Vec<u64> = match self.exec_traces.get(key) {
             Some(v) => v.iter().map(|t| t.id).collect(),
-            None => return,
+            None => return Ok(()),
         };
-        let _ = self.exec_fire_ids(key, &ids, cmdtext, "leave", &[code, result], false);
+        self.exec_fire_ids(key, &ids, cmdtext, "leave", &[code, result])
     }
 
-    /// Enterstep half of a command about to dispatch inside a traced
-    /// proc's body: snapshot the caller's enterstep/leavestep records,
-    /// fire enterstep (errors discarded).  `None` when nothing can fire —
-    /// no step bookkeeping needed.
-    pub(crate) fn exec_step_begin(&mut self, args: &[Value]) -> Option<ExecStepCtx> {
+    /// Enterstep half of a command about to dispatch inside traced procs'
+    /// bodies: snapshot EVERY traced proc on the stack (tclsh dynamic
+    /// range — foo calling bar fires foo's enterstep for bar's commands
+    /// too, D-39④) and fire enterstep.  Handler errors propagate and
+    /// replace the command (D-39③).  `None` when nothing can fire — no
+    /// step bookkeeping needed.
+    pub(crate) fn exec_step_begin(&mut self, args: &[Value]) -> Result<Option<ExecStepCtx>> {
         if self.exec_step_running > 0 || self.exec_traces.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let key = self.exec_step_stack.last()?.clone();
-        let snapshot: Vec<u64> = self
-            .exec_traces
-            .get(&key)?
-            .iter()
-            .map(|t| t.id)
-            .collect();
+        if self.exec_step_stack.is_empty() {
+            return Ok(None);
+        }
         let cmdtext = Value::from_list(args).as_str().to_string();
-        let _ = self.exec_fire_ids(&key, &snapshot, &cmdtext, "enterstep", &[], false);
-        Some(ExecStepCtx { key, cmdtext, snapshot })
+        let mut steps: Vec<(String, Vec<u64>)> = Vec::new();
+        for key in &self.exec_step_stack {
+            if let Some(v) = self.exec_traces.get(key) {
+                let ids: Vec<u64> = v.iter().map(|t| t.id).collect();
+                if !ids.is_empty() {
+                    steps.push((key.clone(), ids));
+                }
+            }
+        }
+        if steps.is_empty() {
+            return Ok(None);
+        }
+        for (key, ids) in &steps {
+            self.exec_fire_ids(key, ids, &cmdtext, "enterstep", &[])?;
+        }
+        Ok(Some(ExecStepCtx { steps, cmdtext }))
     }
 
-    /// Leavestep half: fire the snapshot's records that are *still
-    /// registered* under the caller's key (trace-34.1: a record removed
-    /// and re-added inside the enterstep callback must NOT fire — identity
-    /// is the registration, not the tuple).
-    pub(crate) fn exec_step_end(&mut self, ctx: &ExecStepCtx, code: &str, result: &str) {
+    /// Leavestep half: fire each snapshot's records that are *still
+    /// registered* under its key (trace-34.1: a record removed and
+    /// re-added inside the enterstep callback must NOT fire — identity
+    /// is the registration, not the tuple).  Handler errors propagate
+    /// and replace the command's outcome (D-39③).
+    pub(crate) fn exec_step_end(&mut self, ctx: &ExecStepCtx, code: &str, result: &str) -> Result<()> {
         if self.exec_step_running > 0 {
-            return;
+            return Ok(());
         }
-        let _ = self.exec_fire_ids(
-            &ctx.key,
-            &ctx.snapshot,
-            &ctx.cmdtext,
-            "leavestep",
-            &[code, result],
-            false,
-        );
+        for (key, ids) in &ctx.steps {
+            self.exec_fire_ids(key, ids, &ctx.cmdtext, "leavestep", &[code, result])?;
+        }
+        Ok(())
     }
 
     /// Fire command traces for `op` ("rename" | "delete"): each callback

@@ -699,10 +699,13 @@ impl Interp {
         self.call_depth -= 1;
 
         // Execution traces: the frame is gone; `leave` fires with the
-        // completion code and result (errors are background errors).
-        // Only a traced entry pushed a context (and has the key/cmdtext
-        // to report); a trace registered mid-body does not fire for the
-        // already-running invocation (tclsh-probed above).
+        // completion code and result — deferred returns decode first
+        // (tclsh: a body ending `return $a` reports `foo 0 1 leave`,
+        // D-39②).  A handler error REPLACES the command's outcome while
+        // the record stays registered (D-39③).  Only a traced entry
+        // pushed a context (and has the key/cmdtext to report); a trace
+        // registered mid-body does not fire for the already-running
+        // invocation (tclsh-probed above).
         if traced_entry {
             self.exec_step_stack.pop();
             if !self.exec_traces.is_empty() {
@@ -712,10 +715,30 @@ impl Interp {
                         Err(e) if self.err_is_error(e) => {
                             Some(("1", e.message_text().to_string()))
                         }
+                        Err(e) if e.is_return() => {
+                            let code = e.deferred_code();
+                            if code == 0 || code < 0 {
+                                Some(("0", e.message_text()))
+                            } else if code == 1 {
+                                Some(("1", e.message_text()))
+                            } else if code == 3 {
+                                Some(("3", String::new()))
+                            } else if code == 4 {
+                                Some(("4", String::new()))
+                            } else {
+                                None
+                            }
+                        }
+                        Err(e) if e.is_break() => Some(("3", String::new())),
+                        Err(e) if e.is_continue() => Some(("4", String::new())),
                         _ => None,
                     };
                     if let Some((code, res)) = pair {
-                        self.exec_fire_leave(exec_key, exec_cmdtext, code, &res);
+                        if let Err(le) =
+                            self.exec_fire_leave(exec_key, exec_cmdtext, code, &res)
+                        {
+                            return Err(le);
+                        }
                     }
                 }
             }

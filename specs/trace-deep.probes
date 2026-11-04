@@ -21,4 +21,7 @@ set g 0; proc w {args} {lappend ::log W}; proc p {} {upvar 1 g y; set y 5}; trac
 proc cb {args} {lappend ::log R}; trace variable a(k) w cb; set a(k) 1; puts [set log]
 proc foo {} {set a 1; return $a}; trace add execution foo leave {lappend ::got}; foo; puts [set got]
 proc bar {} {set q 1}; proc foo {} {bar}; trace add execution foo enterstep {lappend ::got}; foo; puts [set got]
-trace add execution set enter {lappend ::got}; set x 1; puts [set got]
+trace add execution lindex enter {lappend ::got}; lindex {a b} 0; puts [set got]
+# 注（D-39① 精化项）：字节码内联的 set/incr/lappend/expr/while/foreach
+# 与槽 op 不经分派，enter/leave 不触发——tclsh 对一切命令触发。缺口
+# 需编译期 inline 抑制（同 top_slots 降级先例），工程量大，暂记 OPEN。

@@ -330,16 +330,25 @@
   variable/vdelete/vinfo 三子命令 split_elem 路由到 elem_traces】。
 - **严重度**：低。
 
-### D-39 execution trace 触发面（打包）
+### D-39 execution trace 触发面（打包）[②③④+①非内联面 FIXED 2026-11-05]
 - **Tcl 8.6**：① enter/leave 覆盖一切命令（内建/apply/namespace eval）；
   ② leave 在 body 以 return 结束也触发（`foo 0 1 leave`）；③ 回调
   出错替换命令结果且保留记录；④ enterstep/leavestep 覆盖栈上所有被
   追踪 proc 的动态范围。
-- **rtcl**：① 仅挂 call_proc（内建/apply 不触发）；② return 完成不
-  触发 leave（call.rs:710-716）；③ 吞错且删记录（仅 enter 传播）；
-  ④ 只匹配最内层帧（exec_step_stack.last()）。
-- **严重度**：中。注：trace.rs 头注 "stored-but-not-fired" 已过时
-  （command/execution trace 实际触发但面窄），本轮已改。
+- **rtcl 修复态（2026-11-05）**：① dispatch_values Builtin 括号
+  （invoke_builtin_traced，cache 命中臂+慢链两处）——非内联 builtin
+  的 enter/leave 与 tclsh 一致【精化项 OPEN：字节码内联的
+  set/incr/lappend/expr/while/foreach/槽 op 不经分派，需编译期 inline
+  抑制（top_slots 降级先例），工程量大】；② deferred return 解码后
+  进 leave（foo 0 1 leave）✓；③ handler 错误恒传播替换命令结果且
+  记录保留 ✓（旧 discard+auto-remove 是误读）；④ enterstep 栈范围
+  （ExecStepCtx.steps 收全栈）✓；⑤ 触发序矩阵实测钉死：enter/
+  enterstep 最新先、leave/leavestep 注册序最旧先（与变量 trace 的
+  latest-first 不同——trace-34.2 自洽所需）；⑥ firing 途中被 remove
+  的记录即时哑（34.1 恒等式全 op 通用）。
+- **精化项 OPEN**：leave 回调返回值链式进位（tclsh 实测 A 的返回成为
+  B 的 result 实参）；leavestep 序未单独钉测。
+- **严重度**：已关闭主体（精化项低）。
 
 ### TclOO 面（oo.allium + specs/oo-deep.probes；2026-11-03 蒸馏轮）
 

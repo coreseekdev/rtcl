@@ -414,12 +414,11 @@ pub(crate) struct ExecTrace {
 /// Enterstep bookkeeping for one dispatching command (see
 /// [`Interp::exec_step_begin`], implemented in `commands::trace`).
 pub(crate) struct ExecStepCtx {
-    /// Resolved key of the enclosing proc.
-    pub key: String,
+    /// Resolved keys of EVERY traced proc on the stack (tclsh dynamic
+    /// range, D-39④) with their enterstep-time record ids.
+    pub steps: Vec<(String, Vec<u64>)>,
     /// The command's words, list-rendered (tclsh's substituted text).
     pub cmdtext: String,
-    /// Ids of the caller's step records at enterstep time.
-    pub snapshot: Vec<u64>,
 }
 
 /// Tcl interpreter.

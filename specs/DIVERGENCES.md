@@ -426,9 +426,15 @@
   报 unknown，tclsh 实测）✓；⑦ 部分：info object filters（o.filters）、
   info class constructor/destructor（恒空——tclsh 8.6.17 对已定义者也
   返回空，oracle 形状）✓。
-- **精化项 OPEN**：③ methods -all 含 mixin 方法/排除 hidden；④ vars
-  pattern；⑥ self call/next 形状；⑦ 其余 stub（forward/methodtype/
-  definition）；⑧ methods -flag 校验（-localprivate）。
+- **精化项收口（2026-11-05 第二批）**：③ methods -all 含 mixin 方法
+  （build_chain 同款遍历）+ hidden 排除 ✓；⑧ methods -flag 校验
+  （bad option ... must be -all, -localprivate, or -private；object/
+  class 双命令）+ -localprivate（本类私有）✓；⑥ self call =
+  {全链描述符列表 index}、self next = 平铺**紧邻一对** {定义类 方法}
+  （Cc→B→A 链实测只报 ::B m）✓；D-40⑤ 精化：next 帧 level0 =
+  `next <args>`（frame_level0_args 一次性覆写通道，apply 同款）✓。
+  **余量 OPEN**：④ vars pattern；⑦ 其余 stub（forward/methodtype/
+  definition）。
 - **严重度**：已关闭主体。**外观差异（非分歧）**：::oo::ObjN 编号
   计数与 tclsh 不同（元对象预占号），脚本不应依赖。
 

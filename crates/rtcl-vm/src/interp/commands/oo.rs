@@ -840,16 +840,21 @@ fn unknown_method_error(interp: &Interp, key: &str, typed: &str, method: &str) -
         .get(key)
         .map(|o| o.hidden.clone())
         .unwrap_or_default();
+    let walk = full_walk(interp, key);
+    let fw: Vec<String> = walk.iter().map(|(n, _)| n.clone()).collect();
     let mut names: Vec<String> = Vec::new();
-    for (name, entry) in full_walk(interp, key) {
+    for (name, entry) in &walk {
         if entry.def.exported
-            && !hidden.contains(&name)
-            && !names.contains(&name)
+            && !hidden.contains(name)
+            && !names.contains(name)
         {
             names.push(name.clone());
         }
     }
-    if !hidden.contains(&"destroy".to_string()) {
+    // destroy 的可见性与 full_walk 一致——类链 hidden（unexport
+    // destroy）已在 walk 里排除，这里不能凭对象 hidden 无条件重推
+    // （否则全隐藏判定永不触发——实测回归点）。
+    if fw.iter().any(|n| n == "destroy") {
         names.push("destroy".to_string());
     }
     if key == "::oo::class" {
@@ -858,10 +863,11 @@ fn unknown_method_error(interp: &Interp, key: &str, typed: &str, method: &str) -
     names.sort();
     names.dedup();
     // D-41⑥：全部可见方法被隐藏（如 unexport destroy）时的消息。
+    // 键用 canonical（tclsh ::o）。
     if names.is_empty() {
         return Error::Msg(format!(
             "object \"{}\" has no visible methods",
-            typed
+            key
         ));
     }
     let _ = typed;
@@ -1558,16 +1564,29 @@ extern "Rust" fn cmd_oo_self(interp: &mut Interp, args: &[Value]) -> Result<Valu
         "namespace" => Ok(Value::from_str(&object_ns_of(interp, &act.obj))),
         "method" => Ok(Value::from_str(&act.method)),
         "call" => {
-            let entry = &act.chain[act.index];
+            // tclsh 形状（D-43⑥ 深链实测）：{全链描述符列表 当前索引}
+            // ——描述符覆盖整条调用链（B 的链含 A 的条目）。
+            let descs: Vec<Value> = act
+                .chain
+                .iter()
+                .map(|e| chain_desc(e, act.method.as_ref()))
+                .collect();
             Ok(Value::from_list(&[
-                chain_desc(entry, &act.method),
+                Value::from_list(&descs),
                 Value::from_int(act.index as i64),
             ]))
         }
         "next" => {
-            let mut items = Vec::new();
-            for e in act.chain.iter().skip(act.index + 1) {
-                items.push(chain_desc(e, &act.method));
+            // tclsh 形状（实测）：仅**紧邻下一实现**一对 {定义类 方法}——
+            // 平铺两元素（Cc→B→A 链上只报 ::B m，不含更远）。
+            let mut items: Vec<Value> = Vec::new();
+            if let Some(e) = act.chain.get(act.index + 1) {
+                let owner = match &e.owner {
+                    Owner::Object => String::new(),
+                    Owner::Class(c) => c.clone(),
+                };
+                items.push(Value::from_str(&owner));
+                items.push(Value::from_str(act.method.as_ref()));
             }
             Ok(Value::from_list(&items))
         }
@@ -1611,6 +1630,11 @@ extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Valu
     } else {
         Vec::new()
     };
+    // D-40⑤ 精化：下一实现的 level0 = `next <args>`（tclsh 形状）——
+    // 借 frame_level0_args 一次性覆写通道（apply 同款）。
+    let mut l0 = vec![Value::from_str("next")];
+    l0.extend(args[1..].iter().cloned());
+    interp.frame_level0_args = Some(l0);
     // The as-typed object word, as recorded in the current level0.
     let l0 = interp
         .frames
@@ -2838,18 +2862,59 @@ fn methods_listing(
 }
 
 /// Instance-method names of a class (own, or the full chain with `-all`).
-fn class_methods_listing(interp: &Interp, key: &str, all: bool, private: bool) -> Value {
+fn class_methods_listing(
+    interp: &Interp,
+    key: &str,
+    all: bool,
+    private: bool,
+    local_private: bool,
+) -> Value {
     let mut names: Vec<String> = Vec::new();
-    let classes: Vec<String> = if all {
-        linearize(interp, key)
-    } else {
-        vec![key.to_string()]
-    };
-    for c in classes {
-        if let Some(cls) = interp.oo.classes.get(&c) {
+    let mut hidden: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if local_private {
+        // -localprivate：仅本类自己的私有方法（tclsh 语义）。
+        if let Some(cls) = interp.oo.classes.get(key) {
             for (name, def) in &cls.methods {
-                if (def.exported || private) && !names.contains(name) {
+                if !def.exported {
                     names.push(name.clone());
+                }
+            }
+        }
+    } else {
+        // -all：链上每类的 mixin 方法一并计入（build_chain 同款遍历）；
+        // hidden（unexport 继承实现）排除。
+        let classes: Vec<String> = if all {
+            let mut out: Vec<String> = Vec::new();
+            for c in linearize(interp, key) {
+                if let Some(cls) = interp.oo.classes.get(&c) {
+                    for h in &cls.hidden {
+                        hidden.insert(h.clone());
+                    }
+                    for mx in &cls.mixins {
+                        for c2 in linearize(interp, mx) {
+                            if !out.contains(&c2) {
+                                out.push(c2.clone());
+                            }
+                        }
+                    }
+                }
+                if !out.contains(&c) {
+                    out.push(c.clone());
+                }
+            }
+            out
+        } else {
+            vec![key.to_string()]
+        };
+        for c in classes {
+            if let Some(cls) = interp.oo.classes.get(&c) {
+                for h in &cls.hidden {
+                    hidden.insert(h.clone());
+                }
+                for (name, def) in &cls.methods {
+                    if (def.exported || private) && !hidden.contains(name) && !names.contains(name) {
+                        names.push(name.clone());
+                    }
                 }
             }
         }
@@ -3064,7 +3129,13 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         match flag.as_str() {
                             "-all" => all = true,
                             "-private" => private = true,
-                            _ => {}
+                            "-localprivate" => private = true,
+                            _ => {
+                                return Err(Error::Msg(format!(
+                                    "bad option \"{}\": must be -all, -localprivate, or -private",
+                                    flag.as_str()
+                                )))
+                            }
                         }
                     }
                     Ok(methods_listing(interp, &key, all, private))
@@ -3336,14 +3407,21 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let key = resolve_class_arg(interp, args[3].as_str())?;
             let mut all = false;
             let mut private = false;
+            let mut local_private = false;
             for flag in &args[4..] {
                 match flag.as_str() {
                     "-all" => all = true,
                     "-private" => private = true,
-                    _ => {}
+                    "-localprivate" => local_private = true,
+                    _ => {
+                        return Err(Error::Msg(format!(
+                            "bad option \"{}\": must be -all, -localprivate, or -private",
+                            flag.as_str()
+                        )))
+                    }
                 }
             }
-            Ok(class_methods_listing(interp, &key, all, private))
+            Ok(class_methods_listing(interp, &key, all, private, local_private))
         }
         // D-43⑦（部分）：constructor/destructor → {args body} / {body} / 空。
         "constructor" | "destructor" => {

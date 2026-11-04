@@ -27,7 +27,7 @@ oo::class create C {method unknown {args} {return "got:$args"}}; C create o; put
 oo::class create C {method f {args} {puts F; return}}; oo::define C {filter f; method m {} {return M}}; C create o; puts [o m]
 oo::class create C {method m {} {return 1}}; C create o; oo::objdefine o {unexport m}; catch {o m} e; puts $e
 oo::class create C {}; oo::define C {unexport destroy}; C create o; catch {o nosuch} e; puts $e
-oo::class create M {method mm {} {return mm}}; oo::class create A {superclass M}; oo::define M {mixin A}; M create x; catch {x mm} e; puts $e
+oo::class create M {method mm {} {return mm}}; oo::class create A {superclass M}; catch {oo::define M {mixin A}} m; puts $m
 # ── 分歧段（D-42 生命周期/别名）──
 oo::class create C {destructor {puts DTOR}}; C create o; rename o ""; puts E
 oo::class create C {method m {} {return 1}}; C create o; rename o o2; catch {o2 m} e; puts $e

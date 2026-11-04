@@ -60,8 +60,7 @@ rule DestructorRunsMostSpecificOnly {
     when: Evaluates("out    -- after: A{dtor prints A}; B{super A, dtor prints B}; [B create o] destroy")
     ensures: completion.code = ok
     -- oracle: B E   (A's destructor did NOT run)
-    -- rtcl: runs the whole dtor chain unconditionally (B A E) and runs
-    --   A twice when the derived dtor calls next (B A A E)  [D-40]
+    -- rtcl: FIXED 2026-11-05（exec_chain_entry 单入口 + next 链）[D-40]
 }
 
 rule InheritedConstructorRuns {
@@ -70,8 +69,7 @@ rule InheritedConstructorRuns {
     when: Evaluates("b get    -- after: A{variable x; constructor {y} {set x $y}}; B{super A}; B create b 5")
     ensures: completion.code = ok
     ensures: completion.value = "5"
-    -- rtcl: only looks at the instance class's own constructor; args
-    --   dropped (can't read "x")  [D-40]
+    -- rtcl: FIXED 2026-11-05（ctor_chain 最具体项）[D-40]
 }
 
 rule ConstructorVariableLinksToDefiningClass {
@@ -81,7 +79,7 @@ rule ConstructorVariableLinksToDefiningClass {
     when: Evaluates("b ga    -- after: A{variable va; constructor {} {set va 1}; method ga {return $va}}; B{super A; variable vb}; B create b")
     ensures: completion.code = ok
     ensures: completion.value = "1"
-    -- rtcl: links by instance class — can't read "va"  [D-40]
+    -- rtcl: FIXED 2026-11-05（owner 路径）[D-40]
 }
 
 rule NextForwardsWithoutArgs {
@@ -91,10 +89,12 @@ rule NextForwardsWithoutArgs {
     when: Evaluates("o m q    -- after: A m{args}{return \"A:$args\"}; B{super A} m{x}{return [next]}")
     ensures: completion.code = ok
     ensures: completion.value = "A:"
-    -- rtcl: re-forwards the caller's args ("A:q")  [D-40]
-    -- level 0 inside a next frame is `next <args>`; an exhausted
-    -- DESTRUCTOR reports `no next destructor implementation`
-    -- (rtcl: "no next method implementation")  [D-40]
+    -- rtcl: FIXED 2026-11-05（无参不转发）[D-40]
+    -- an exhausted DESTRUCTOR/CONSTRUCTOR reports
+    --   `no next destructor/constructor implementation`
+    --   (rtcl: FIXED 2026-11-05，按方法名)  [D-40]
+    -- level0 inside a next frame: tclsh `next <args>`, rtcl `o m 7`
+    --   (frame-level level0 override needed)  [D-40 精化项]
 }
 
 rule EmptySuperclassResetsToObject {
@@ -103,7 +103,7 @@ rule EmptySuperclassResetsToObject {
     when: Evaluates("info class superclasses C    -- after: oo::define C {superclass}")
     ensures: completion.code = ok
     ensures: completion.value = "::oo::object"
-    -- rtcl: leaves the list empty  [D-40]
+    -- rtcl: FIXED 2026-11-05（回填 ::oo::object）[D-40]
 }
 
 rule MixinCycleDetectedAtDefinition {

@@ -352,7 +352,7 @@
 
 ### TclOO 面（oo.allium + specs/oo-deep.probes；2026-11-03 蒸馏轮）
 
-### D-40 构造/析构链语义【高】
+### D-40 构造/析构链语义【高】[FIXED 2026-11-05]
 - **Tcl 8.6**：① 析构只跑最具体一个，靠 `next` 链；② 子类无 ctor 时
   沿链跑最具体继承 ctor（create 参数不丢）；③ ctor 的 variable 链到
   **定义该 ctor 的类**（基类 ctor 写基类变量）；④ `next` 无参=以无参
@@ -386,6 +386,15 @@
 - **rtcl**：① 仅删命令（析构器不跑）；② o2 invalid；③ 报 does not
   refer to an object；④ 命令放 targetNS 内且不查已存在。
 - **严重度**：中-高。
+
+### D-43a OO 方法/构造器/析构器错误出口帧 [FIXED 2026-11-05]
+- **Tcl 8.6**：`(class "::K" method "m" line N)` / `(class "::A"
+  destructor line N)` / `(class "::B" constructor line N)`（method 带
+  引号，destructor/constructor 不带；类 = 当前链条目定义类）。
+- **rtcl**：曾 `(procedure "o" line N)`。已修：oo_method_exit_tag
+  （ActiveMethod 栈顶 + frame_depth+1==len 活性判据）挂 call.rs 出口
+  帧发射点；三形状探针 SAME。
+- **严重度**：已关闭。
 
 ### D-43 info 面与私有方法（打包）
 - **Tcl 8.6**：① `info object isa *` 对缺失名返回 0；② subclasses

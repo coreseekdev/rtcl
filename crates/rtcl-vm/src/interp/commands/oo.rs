@@ -140,6 +140,28 @@ pub(crate) enum Owner {
     Class(String),
 }
 
+/// D-43（errorInfo 族）：OO 方法/构造器/析构器帧的错误出口帧——
+/// tclsh 形状 `(class "::K" method "m" line N)` / `(class "::A"
+/// destructor line N)`（method 带引号，destructor/constructor 不带）。
+/// 类 = 当前 ActiveMethod 链条目的 owner（定义类）。非 OO 帧（或
+/// 对象自有方法）返回 None 回落 procedure 帧。
+pub(crate) fn oo_method_exit_tag(interp: &Interp) -> Option<String> {
+    let a = interp.oo.active.last()?;
+    // 出口帧发射点：调用帧仍在栈上（len = depth + 1，与 cleanup_active
+    // 的 depth >= len 弹出判据互补）。
+    if a.frame_depth + 1 != interp.frames.len() {
+        return None;
+    }
+    match &a.chain.get(a.index)?.owner {
+        Owner::Class(c) => Some(match a.method.as_ref() {
+            "destructor" => format!("class \"{}\" destructor", c),
+            "constructor" => format!("class \"{}\" constructor", c),
+            m => format!("class \"{}\" method \"{}\"", c, m),
+        }),
+        Owner::Object => None,
+    }
+}
+
 /// One resolvable link in a method chain.
 #[derive(Debug, Clone)]
 pub(crate) struct ChainEntry {
@@ -1429,24 +1451,22 @@ extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Valu
     };
     let next_index = act.index + 1;
     if next_index >= act.chain.len() {
-        return Err(Error::Msg("no next method implementation".to_string()));
+        // D-40⑤：用尽消息按方法名（tclsh：析构器/构造器各有其文）。
+        return Err(Error::Msg(
+            match act.method.as_ref() {
+                "destructor" => "no next destructor implementation",
+                "constructor" => "no next constructor implementation",
+                _ => "no next method implementation",
+            }
+            .to_string(),
+        ));
     }
+    // D-40④：`next` 无参 = 以无参调下一实现（tclsh 8.6 不重转发当前
+    // 实参）；显式实参照转。
     let call_args: Vec<Value> = if args.len() > 1 {
         args[1..].to_vec()
     } else {
-        // Re-pass the current invocation's arguments (level0 words minus
-        // the object and method words).
-        let l0 = interp
-            .frames
-            .last()
-            .map(|f| crate::interp::frame_level0(f))
-            .unwrap_or_default();
-        let words = Value::from_str(&l0).as_list().unwrap_or_default();
-        if words.len() > 2 {
-            words[2..].to_vec()
-        } else {
-            Vec::new()
-        }
+        Vec::new()
     };
     // The as-typed object word, as recorded in the current level0.
     let l0 = interp
@@ -1641,42 +1661,28 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
         }
     }
 
-    // Constructor.
+    // Constructor.  D-40②③：沿链找最具体的构造器（子类无 ctor 时继承
+    // 链上的——create 参数不再静默丢弃），其 variable 链接到**定义该
+    // 构造器的类**（memoised_proc_def 的 owner 路径），`next` 与普通
+    // 方法同机制。
     if !is_meta {
-        let ctor = interp
-            .oo
-            .classes
-            .get(class_key)
-            .and_then(|c| c.constructor.clone());
-        if let Some(ctor) = ctor {
-            let mut params: Vec<(String, Option<String>)> =
-                vec![("constructor".to_string(), None)];
-            params.extend(ctor.params.iter().cloned());
-            let vars = interp
-                .oo
-                .classes
-                .get(class_key)
-                .map(|c| (*c.variables).clone())
-                .unwrap_or_default();
-            let body = format!("{}{}", link_prefix(&vars, &ctor.params), ctor.body);
-            let proc_def = ProcDef {
-                params: super::super::Rc::new(params),
-                body: super::super::Rc::from(body),
-                statics: super::super::Rc::new(HashMap::new()),
-                compiled: None,
-            };
-            let mut args: Vec<Value> =
-                vec![Value::from_str(&name_typed), Value::from_str("constructor")];
-            args.extend_from_slice(&rest[1..]);
-            interp.oo.active.push(ActiveMethod {
-                obj: Rc::from(canonical.as_str()),
-                method: Rc::from("constructor"),
-                chain: Rc::new(ctor_chain(interp, class_key)),
-                index: 0,
-                frame_depth: interp.frames.len(),
-            });
-            let r = interp.call_proc(&proc_def, &args, &name_typed, Some(Rc::clone(&ns)));
-            cleanup_active(interp);
+        let chain = Rc::new(ctor_chain(interp, class_key));
+        if !chain.is_empty() {
+            let method: Rc<str> = Rc::from("constructor");
+            let canonical_rc: Rc<str> = Rc::from(canonical.as_str());
+            let typed_val = Value::from_str(&name_typed);
+            let call_args: Vec<Value> = rest[1..].to_vec();
+            let r = exec_chain_entry(
+                interp,
+                &canonical_rc,
+                &method,
+                0,
+                &chain,
+                &call_args,
+                &name_typed,
+                &typed_val,
+                false,
+            );
             if let Err(e) = r {
                 detach_object(interp, &canonical, &ns, false);
                 return Err(e);
@@ -1696,35 +1702,24 @@ fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value]) -> Result<Value>
     interp.oo.mutation_ctr += 1;
     attach_object(interp, &name, &ns);
 
-    let ctor = interp.oo.classes.get(class_key).and_then(|c| c.constructor.clone());
-    if let Some(ctor) = ctor {
-        let mut params: Vec<(String, Option<String>)> = vec![("constructor".to_string(), None)];
-        params.extend(ctor.params.iter().cloned());
-        let vars = interp
-            .oo
-            .classes
-            .get(class_key)
-            .map(|c| (*c.variables).clone())
-            .unwrap_or_default();
-        let body = format!("{}{}", link_prefix(&vars, &ctor.params), ctor.body);
-        let proc_def = ProcDef {
-            params: super::super::Rc::new(params),
-            body: super::super::Rc::from(body),
-            statics: super::super::Rc::new(HashMap::new()),
-            compiled: None,
-        };
-        let typed = name.clone();
-        let mut args: Vec<Value> = vec![Value::from_str(&typed), Value::from_str("constructor")];
-        args.extend_from_slice(rest);
-        interp.oo.active.push(ActiveMethod {
-            obj: Rc::from(name.as_str()),
-            method: Rc::from("constructor"),
-            chain: Rc::new(ctor_chain(interp, class_key)),
-            index: 0,
-            frame_depth: interp.frames.len(),
-        });
-        let r = interp.call_proc(&proc_def, &args, &typed, Some(Rc::clone(&ns)));
-        cleanup_active(interp);
+    // D-40②③：与 oo_create 同——链上最具体构造器 + owner 变量链接。
+    let chain = Rc::new(ctor_chain(interp, class_key));
+    if !chain.is_empty() {
+        let method: Rc<str> = Rc::from("constructor");
+        let name_rc: Rc<str> = Rc::from(name.as_str());
+        let typed_val = Value::from_str(&name);
+        let call_args: Vec<Value> = rest.to_vec();
+        let r = exec_chain_entry(
+            interp,
+            &name_rc,
+            &method,
+            0,
+            &chain,
+            &call_args,
+            &name,
+            &typed_val,
+            false,
+        );
         if let Err(e) = r {
             detach_object(interp, &name, &ns, false);
             return Err(e);
@@ -1836,37 +1831,29 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
             destroy_object(interp, &v, false)?;
         }
     } else {
+        // D-40①：只跑最具体一个析构器，`next` 沿链继续（tclsh 语义；
+        // rtcl 原无条件跑全链，析构器内调 next 时链上析构器双跑）。走
+        // exec_chain_entry——ActiveMethod/index、链上每个析构器自己的
+        // variable 链接（memoised_proc_def 的 owner 路径）与 next 全部
+        // 与普通方法同机制。析构错误在对象移除后抛出（不变）。
         let class_key = interp.oo.objects.get(key).map(|o| o.class.clone()).unwrap_or_default();
         let chain = Rc::new(dtor_chain(interp, &class_key));
-        for (i, entry) in chain.iter().enumerate() {
-            let vars = match &entry.owner {
-                Owner::Class(c) => interp
-                    .oo
-                    .classes
-                    .get(c)
-                    .map(|cls| (*cls.variables).clone())
-                    .unwrap_or_default(),
-                Owner::Object => vec![],
-            };
-            let body = format!("{}{}", link_prefix(&vars, &[]), entry.def.body);
-            let proc_def = ProcDef {
-                params: super::super::Rc::new(vec![("destructor".to_string(), None)]),
-                body: super::super::Rc::from(body),
-                statics: super::super::Rc::new(HashMap::new()), compiled: None,
-            };
-            let args = vec![Value::from_str(key), Value::from_str("destructor")];
-            interp.oo.active.push(ActiveMethod {
-                obj: Rc::from(key),
-                method: Rc::from("destructor"),
-                chain: Rc::clone(&chain),
-                index: i,
-                frame_depth: interp.frames.len(),
-            });
-            let r = interp.call_proc(&proc_def, &args, key, Some(object_ns_of(interp, key)));
-            cleanup_active(interp);
-            if let Err(e) = r {
+        if !chain.is_empty() {
+            let method: Rc<str> = Rc::from("destructor");
+            let key_rc: Rc<str> = Rc::from(key);
+            let typed_val = Value::from_str(key);
+            if let Err(e) = exec_chain_entry(
+                interp,
+                &key_rc,
+                &method,
+                0,
+                &chain,
+                &[],
+                key,
+                &typed_val,
+                false,
+            ) {
                 dtor_error = Some(e);
-                break;
             }
         }
     }
@@ -2111,6 +2098,11 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             }
             if let DefineTarget::Class(name) = target {
                 if let Some(c) = interp.oo.classes.get_mut(&name) {
+                    // D-40⑥：`oo::define C {superclass}`（空名单）重置为
+                    // ::oo::object（tclsh 语义——实例从此保有 destroy）。
+                    if supers.is_empty() {
+                        supers.push("::oo::object".to_string());
+                    }
                     c.superclasses = supers;
                 }
             }

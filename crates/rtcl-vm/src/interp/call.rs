@@ -570,10 +570,13 @@ impl Interp {
         // `(procedure "name" line N)` frame when the body errored — the
         // line is the erroring command's line within the body, recorded by
         // the body's script harness.  Lambda bodies (apply) get the
-        // `(lambda term ...)` tag from cmd_apply instead.
+        // `(lambda term ...)` tag from cmd_apply instead.  OO 方法/构造
+        // 器/析构器帧用 tclsh 的 `(class "::K" method "m" line N)` 形状
+        // （D-43 errorInfo 族，2026-11-05 实测钉形）。
         if let Err(e) = &final_result {
             if self.err_is_error(e) && current_proc_name != "apply lambdaExpr" {
-                let tag = format!("procedure \"{}\"", current_proc_name);
+                let tag = super::commands::oo::oo_method_exit_tag(self)
+                    .unwrap_or_else(|| format!("procedure \"{}\"", current_proc_name));
                 self.err_exit_frame(&tag);
             }
         }

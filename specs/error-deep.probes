@@ -7,7 +7,7 @@ puts [catch {return -code error boom} m o] ; puts $o
 catch {exit 3} m ; puts after
 proc p {} {return -errorcode {A B} v} ; catch p ; catch {expr 1/0} ; puts $errorCode
 try {error y} on error {m o} {puts $::errorInfo}
-try {expr 1/0} trap {ARITH DIVZERO *} {m} {puts TRAP:$m}
+catch {try {expr 1/0} trap {ARITH DIVZERO *} {m} {puts TRAP:$m}} m2; puts $m2
 catch {throw {E C} msg} m ; puts "$m|$::errorCode"
 proc p2 {} {break} ; catch p2 m ; puts "$m|$::errorInfo"
 catch {try {error x} finally {error finErr}} m ; puts $m
@@ -15,7 +15,7 @@ set errorCode STALE ; set z 1 ; puts $errorCode
 proc q2 {} {error m2 info2 C} ; catch q2 ; puts "$::errorInfo|$::errorCode"
 catch {nosuchcmd a} m o ; puts "$m | [dict keys $o]"
 proc d2 {} {error i2} ; proc d1 {} {catch {d2} ; error re} ; catch d1 ; puts $::errorInfo
-namespace eval ::n {error inside}
+catch {namespace eval ::n {error inside}} m; puts $m
 proc f2 {} {return -level 2 -code error deep} ; proc f1 {} {f2} ; catch f1 m ; puts "$m|$::errorInfo"
 puts [catch {return -level 2 v} m o] ; puts "$m|$o"
 catch {try {error x} on error {} {} finally {}} m ; puts $m

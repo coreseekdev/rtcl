@@ -846,16 +846,24 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if let Some(ov) = opts_var {
                 let opts = if code == 1 {
                     // Tcl error completions carry -errorcode and -errorinfo.
-                    error_options_dict(1, 0, &e, script, &error_info)
+                    error_options_dict(1, 0, &e, script, &error_info, interp.err_line)
                 } else if e.is_return() {
                     // return 信号：-level 1、-code = return 自身的码；
                     // 带 -errorcode 载荷时键序 errorcode 在前（tclsh
                     // ec2 实证 `-errorcode {A B} -code 0 -level 1`），
                     // 无载荷且码为 error 补 `-errorcode NONE`。
+                    // D-5②：显式 -level N（slot=-(N+1) 负编码）→
+                    // `-code 0 -level N`（tclsh：catch {return -level 2 v}
+                    // → -code 0 -level 2）。
                     let rc = match &e {
                         Error::ControlFlow { level, .. } => *level as i64,
                         _ => 0,
                     };
+                    if rc < 0 {
+                        let lvl = -(rc + 1);
+                        interp.set_var(ov, return_options_dict(0, lvl))?;
+                        return Ok(Value::from_int(code));
+                    }
                     match &e {
                         Error::ControlFlow { error_code: Some(c), .. } => Value::from_str(
                             &format!("-errorcode {} -code {} -level 1",
@@ -886,14 +894,24 @@ fn return_options_dict(code: i64, level: i64) -> Value {
 
 /// Tcl return-options dict for an error completion: adds `-errorcode`
 /// and `-errorinfo` next to `-code`/`-level`.
-fn error_options_dict(code: i64, level: i64, err: &Error, _script: &str, accumulated: &str) -> Value {
+fn error_options_dict(
+    code: i64,
+    level: i64,
+    err: &Error,
+    _script: &str,
+    accumulated: &str,
+    err_line: usize,
+) -> Value {
     let error_code = err.tcl_error_code();
+    // D-3 部分：-errorline（错误命令行号；-errorstack 待 errorstack
+    // 基建——形状已钉：INNER {returnImm|invokeStkN ...} + CALL name）。
     Value::from_str(&format!(
-        "-code {} -level {} -errorcode {} -errorinfo {}",
+        "-code {} -level {} -errorcode {} -errorinfo {} -errorline {}",
         code,
         level,
         crate::value::tcl_quote(&error_code),
         crate::value::tcl_quote(accumulated),
+        err_line
     ))
 }
 
@@ -955,6 +973,10 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // same way catch does (writes ::errorInfo, resets the accumulator).
     if let Err(e) = &body_result {
         if interp.err_is_error(e) {
+            // D-10：体错误的 errorInfo 带 ("try" body line N) 出口帧
+            // （tclsh；帧行号 = 体错误命令行，err_line 已由体 harness
+            // 记好）。先加帧再落 ::errorInfo——handler 读到的即完整形。
+            interp.err_exit_frame("\"try\" body");
             let info = interp.err_info.take().unwrap_or_else(|| e.message_text());
             let _ = interp.set_var("::errorInfo", Value::from_str(&info));
         }
@@ -1014,7 +1036,7 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                                         .get_var("::errorInfo")
                                         .map(|v| v.as_str().to_string())
                                         .unwrap_or_default();
-                                    error_options_dict(exit_code as i64, 0, e, body, &accumulated)
+                                    error_options_dict(exit_code as i64, 0, e, body, &accumulated, interp.err_line)
                                 }
                                 _ => return_options_dict(exit_code as i64, 0),
                             };
@@ -1060,11 +1082,14 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     let tec_list: Vec<String> = crate::value::parse_dict_full(&tec)
                         .map(|vs| vs.iter().map(|v| v.as_str().to_string()).collect())
                         .unwrap_or_else(|_| vec![tec.clone()]);
-                    let matched = pats.len() == tec_list.len()
+                    // tclsh 8.6.17 实测：元素级**精确前缀**——{E} 匹配
+                    // [E C]、{A B *X} 不匹配 [A B C]（glob 是 Tcl 9 语义；
+                    // {ARITH DIVZERO *} 惯用法在 8.6 本就不匹配）。
+                    let matched = pats.len() <= tec_list.len()
                         && pats
                             .iter()
                             .zip(&tec_list)
-                            .all(|(p, w)| super::super::util::glob_match(p, w));
+                            .all(|(p, w)| p == w);
                     if matched {
                         let vars: Vec<&str> = var_list.split_whitespace().collect();
                         if let Some(msg_var) = vars.first() {
@@ -1085,6 +1110,7 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                                         e,
                                         body,
                                         &accumulated,
+                                        interp.err_line,
                                     );
                                     interp.set_var(opts_var, opts)?;
                                 }

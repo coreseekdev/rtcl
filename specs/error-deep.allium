@@ -121,13 +121,16 @@ rule ThrowIsTip388ErrorCodeMessage {
 
 -- ── try ───────────────────────────────────────────────────────────
 
-rule TryTrapMatchesErrorCodePrefix {
-    -- try supports the trap handler: its pattern list is matched as a
-    -- prefix against errorCode.
-    when: Evaluates("try {expr 1/0} trap {ARITH DIVZERO *} {m} {set m}")
+rule TryTrapMatchesElementWiseExactPrefix {
+    -- try supports trap, but the pattern matching is ELEMENT-WISE EXACT
+    -- PREFIX (no glob!): {E} matches [E C]; {E *} does NOT match [E C];
+    -- the {ARITH DIVZERO *} idiom does not fire in 8.6 (glob is Tcl 9).
+    -- 2026-11-05 oracle reversal: tclsh 8.6.17 dual-probed.
+    when: Evaluates("try {error msg2 {} {E C}} trap {E} {m} {set m}")
     ensures: completion.code = ok
-    ensures: completion.value = "divide by zero"
-    -- rtcl: bad handler type "trap"  [D-9]
+    ensures: completion.value = "msg2"
+    -- also: trap {E *} on [E C] => the error propagates (no match)
+    -- rtcl: FIXED 2026-11-05（原 glob 超集 → 元素级精确前缀）[D-9]
 }
 
 rule TryBodyErrorsCarryTryFrame {
@@ -137,7 +140,7 @@ rule TryBodyErrorsCarryTryFrame {
     ensures: completion.code = ok
     -- oracle value contains:
     --   ("try" body line 1)
-    -- rtcl: frame missing  [D-10]
+    -- rtcl: FIXED 2026-11-05（体错误先加帧再落 ::errorInfo）[D-10]
 }
 
 rule TryOnHandlerVarListOptional {

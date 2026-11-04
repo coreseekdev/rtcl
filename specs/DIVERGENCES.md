@@ -19,12 +19,18 @@
 
 ### 异常面（error-deep.allium + specs/error-deep.probes）
 
-### D-3 catch options 字典缺 `-errorline` / `-errorstack`（spec [D-2]）
+### D-3 catch options 字典缺 `-errorline` / `-errorstack`（spec [D-2]）[errorline FIXED / errorstack OPEN 2026-11-05]
 - **Tcl 8.6**：error 完成的 options 字典 6 键齐全（含 -errorstack 的
   `INNER {invokeStk1 ...}` 栈项与 -errorline 行号）。
-- **rtcl**：仅 4 键（-code -level -errorcode -errorinfo）。
+- **rtcl 修复态**：5 键（+`-errorline`=错误命令行号，2026-11-05）。
+  `-errorstack` **OPEN**——形状已钉（tclsh 实测）：
+  `error boom` → `INNER {returnImm boom {}}`；proc 内 error →
+  `INNER {returnImm x {}} CALL p1`；nosuchcmd → `INNER {invokeStk1
+  nosuchcmd a}`。实现需 err_last_cmd 捕获 + raise 边界清理（cmd_error
+  的 returnImm 标记会被自身 dispatch 的 harness 帧覆写——需
+  err_code_raised 门控），留专项。
 - **复现**：`catch {error boom} m o; puts [dict keys $o]`
-- **严重度**：中。
+- **严重度**：低-中（errorstack 为诊断面）。
 
 ### D-4 非 error 完成的 options 字典 -code/-level 未按 proc 边界解码（spec [D-3]）
 - **Tcl 8.6**：catch {f}（f 内 `return hi`）→ `-code 0 -level 1`；
@@ -35,7 +41,7 @@
 - **复现**：`proc f {} {return hi}; catch {f} v o; puts $o`
 - **严重度**：中。
 
-### D-5 `return -level N` 层级丢失（spec [D-4]/[D-5]）
+### D-5 `return -level N` 层级丢失（spec [D-4]/[D-5]）[② FIXED / ③ OPEN 2026-11-05]
 - **Tcl 8.6**：① `return -code N`（N>4 整数）catch 报 2，原始 N 落
   options（-code 7 -level 1）；② 值形式 `return -level 2 v` 越两层，
   catch 得 `-code 0 -level 2`；③ `return -level 2 -code error` 在 N 层
@@ -65,18 +71,22 @@
 - **复现**：`catch {throw {E C} msg} m; puts "$m|$::errorCode"`
 - **严重度**：中。
 
-### D-9 `try` 无 `trap` handler（spec [D-9]）
-- **Tcl 8.6**：`try {...} trap {ARITH DIVZERO *} {m} {...}` 按 errorCode
-  前缀匹配。
-- **rtcl**：`bad handler type "trap"`。
-- **复现**：`try {expr 1/0} trap {ARITH DIVZERO *} {m} {puts $m}`
-- **严重度**：高（8.6 核心语法缺失）。
+### D-9 `try` trap：语义反转【超集→已对齐 2026-11-05】
+- **tclsh 8.6.17 实测反转**：trap 是 8.6 的**保留字但匹配语义为元素级
+  精确前缀**（无 glob！）——{E} 匹配 [E C]、{E *} 不匹配 [E C]、
+  {ARITH DIVZERO *} **不匹配** [ARITH DIVZERO divide by zero]（glob
+  是 Tcl 9 语义；{ARITH DIVZERO *} 惯用法在 8.6 本就不命中）。rtcl 原
+  两种状态都偏：先 bad handler 拒绝，后 glob 实现（超集）。
+- **修复**：元素级精确前缀（pats.len() <= ec.len() 且逐元素 ==）；
+  未匹配错误照常传播。
+- **严重度**：已对齐。
 
-### D-10 try body 错误缺 `("try" body line N)` errorInfo 帧（spec [D-10]）
+### D-10 try body 错误缺 `("try" body line N)` errorInfo 帧（spec [D-10]）[FIXED 2026-11-05]
 - **Tcl 8.6**：errorInfo 含 `("try" body line 1)` 出口帧。
-- **rtcl**：帧缺失。
+- **rtcl**：帧缺失。**已修**：体错误先 err_exit_frame("\"try\" body")
+  再落 ::errorInfo（handler 读到的即完整形）。
 - **复现**：`try {error y} on error {m o} {puts $::errorInfo}`
-- **严重度**：低。
+- **严重度**：已关闭。
 
 ### D-11 文件模式顶层 `return -code error` / `break` 收尾语义 [FIXED 2026-11-03]
 - **Tcl 8.6**：顶层 `return -code error boom` 打印完整 errorInfo（含

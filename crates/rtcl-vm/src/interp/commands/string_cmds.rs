@@ -153,6 +153,12 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 match args[i].as_str() {
                     "-nocase" => { nocase = true; i += 1; }
                     other => {
+                        // tclsh：Tcl_GetIndexFromObj 系错误 →
+                        // TCL LOOKUP INDEX option <word>。
+                        super::list::set_error_code(
+                            _interp,
+                            &format!("TCL LOOKUP INDEX option {}", other),
+                        );
                         return Err(Error::Msg(format!(
                             "bad option \"{}\": must be -nocase",
                             other
@@ -162,6 +168,10 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             if args.len() - i != 2 {
                 let bad = args[i].as_str();
+                super::list::set_error_code(
+                    _interp,
+                    &format!("TCL LOOKUP INDEX option {}", bad),
+                );
                 return Err(Error::Msg(format!(
                     "bad option \"{}\": must be -nocase",
                     bad

@@ -942,16 +942,18 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 start_offset = Some(args[i + 1].as_str().to_string());
                 i += 2;
             }
-            "-command" => { command_mode = true; i += 1; }
             "--" => { i += 1; break; }
             s => {
-                return Err(Error::runtime(
-                    format!(
-                        "bad option \"{}\": must be -all, -nocase, -expanded, -line, \
-                         -linestop, -lineanchor, -start, or --", s
-                    ),
-                    ErrorCode::Generic,
-                ));
+                // D-21 对齐：-command 非 8.6 regsub 选项（tclsh 拒绝；
+                // 原 rtcl 扩展按 parity 原则移除——错误形状与 tclsh 一致）。
+                super::list::set_error_code(
+                    interp,
+                    &format!("TCL LOOKUP INDEX option {}", s),
+                );
+                return Err(Error::Msg(format!(
+                    "bad option \"{}\": must be -all, -nocase, -expanded, -line, \
+                     -linestop, -lineanchor, -start, or --", s
+                )));
             }
         }
     }
@@ -1333,23 +1335,19 @@ mod tests {
         assert_eq!(result.as_str(), "aXb");
     }
 
-    // ── regsub -command tests ──────────────────────────────────────────────────
+    // ── regsub -command（D-21 对齐：非 8.6 选项，tclsh 拒绝）──────
 
     #[test]
-    fn test_regsub_command() {
+    fn test_regsub_command_rejected() {
         let mut interp = Interp::new();
-        // Use a proc to transform matches — without -all, only first match replaced
-        interp.eval("proc double s { return [string cat $s $s] }").unwrap();
-        let result = interp.eval("regsub -command {\\d+} {a12b34} double").unwrap();
-        assert_eq!(result.as_str(), "a1212b34");
-    }
-
-    #[test]
-    fn test_regsub_command_all() {
-        let mut interp = Interp::new();
-        interp.eval("proc up s { string toupper $s }").unwrap();
-        let result = interp.eval("regsub -all -command {[a-z]} {abc} up").unwrap();
-        assert_eq!(result.as_str(), "ABC");
+        let err = interp
+            .eval("regsub -command {\\d+} {a12b34} double")
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("bad option \"-command\""),
+            "{}",
+            err
+        );
     }
 
     // ── regsub backreference tests ─────────────────────────────────────────────
@@ -1459,11 +1457,16 @@ mod tests {
     // ── regsub -command -all with capture groups ──────────────────────────────
 
     #[test]
-    fn test_regsub_command_all_captures() {
+    fn test_regsub_command_all_captures_rejected() {
         let mut interp = Interp::new();
-        interp.eval("proc double s { return [string cat $s $s] }").unwrap();
-        let result = interp.eval("regsub -all -command {\\d+} {a12b34} double").unwrap();
-        assert_eq!(result.as_str(), "a1212b3434");
+        let err = interp
+            .eval("regsub -all -command {[a-z]} {abc} up")
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("bad option \"-command\""),
+            "{}",
+            err
+        );
     }
 
     // ── regsub no match returns original ──────────────────────────────────────

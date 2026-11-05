@@ -176,8 +176,11 @@
 
 ### D-22 `regsub -command` 为 rtcl 独有扩展（spec [D-21]）
 - **Tcl 8.6**：`bad option "-command": must be -all, -nocase, ...`。
-- **rtcl**：支持 -command（替换参数粗暴括引，值含 {} 时可能解析错乱）。
-- **严重度**：低（建议默认拒绝、开关开启）。
+- **rtcl 修复态（2026-11-06）**：-command 臂移除（parity 对齐）——
+  bad option "-command": must be -all, ... 错误 + TCL LOOKUP INDEX
+  option -command（string match 的 bad-option 同批加码）。相关测试
+  改钉拒绝语义。command_mode 死代码保留（不可达，后续清理）。
+- **严重度**：已关闭。
 
 ### D-23 `string match` 参数面 + `-nocase` 折叠（spec [D-22]）
 - **Tcl 8.6**：① >3 词时首词按选项解析：`string match a b c` →

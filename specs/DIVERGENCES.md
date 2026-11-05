@@ -19,7 +19,7 @@
 
 ### 异常面（error-deep.allium + specs/error-deep.probes）
 
-### D-3 catch options 字典缺 `-errorline` / `-errorstack`（spec [D-2]）[FIXED 2026-11-05]
+### D-3 catch options 字典缺 `-errorline` / `-errorstack`（spec [D-2]）[FIXED 2026-11-05；CALL/UP 模型 2026-11-06]
 - **Tcl 8.6**：error 完成的 options 字典 6 键齐全（含 -errorstack 的
   `INNER {invokeStk1 ...}` 栈项与 -errorline 行号）。
 - **rtcl 修复态（2026-11-05）**：六键齐 + 键序按错误种类三分对齐
@@ -28,14 +28,40 @@
   tclsh 的 dict 构造路径各有插入序，四形状实测稳定）。-errorstack =
   平铺 [INNER, <体>, CALL, <名>, ...]：INNER 体 = returnImm（cmd_error
   经 err_pending_inner 一次性预装，防被自身 dispatch harness 帧覆写）/
-  invokeStk1（其余失败，harness 首帧捕获）；CALL = 错误传播离开的
-  proc 帧（call_proc 错误出口 push，传播序）。六形状探针全 SAME
-  （含全字典字节一致）。
+  invokeStk1（其余失败，harness 首帧捕获，载荷用**已求值调用词**——
+  tclsh 的 pc/tos 内省；≤255 词 invokeStk1、更多 invokeStk）。
+- **D-3 收口（2026-11-06，tclsh TclLogCommandInfo 模型）**：CALL/UP
+  条目改为**每次错误日志事件**（err_harness_frame 两臂）按当前活动
+  帧追加——不再是"proc 错误出口"模型：
+  * 普通帧 = `info level 0` 渲染（调用词，含实参；proc / OO 方法 /
+    ns-eval 帧各取自己的调用词；ns eval 用重建词不是源文本）；
+  * uplevel 求值期间 = `UP <delta>`（delta = 弹出的 proc/ns 作用域数）；
+  * 根帧不记；objc=0 特殊帧（析构器）不记且 level0 为空。
+  由此自动获得：同一 proc 帧在**被内层 catch 捕获前**也已记入（tclsh
+  实测 `proc p {} {catch {error x}}` → CALL p）；eval/uplevel/动态
+  构造体的 invoker 日志事件各带一条；apply 的 CALL 用 `apply {term} ...`
+  （level0 含 term）；tailcall 目标绑定失败 INNER = 目标调用词（无
+  invokeStk1 词缀）；`next` 自身分派失败 INNER = `tclooNext`；`next`
+  帧 usage 词 = `next`（`wrong # args: should be "next x"`，合成方法
+  名参数不进 usage）。
+  同时对齐的构造错误出口形（实测钉形）：`if`/`while`/`for` 字面体
+  内联（无体帧）vs 动态体（`("while"/"for" body line N)` + invoker；
+  if 只有 invoker）；`for` 的 loop-end 脚本 = `("for" loop-end
+  command)`（无行号）；catch 动态体在 proc/ns 帧内多记 invoker 帧；
+  try 编译态（proc 体）不加 `("try" body line N)`、handler/finally
+  错误另起帧序，派发态（顶层/eval）加；构造器帧 level0 = 类命令调用
+  词（`K create o 5` / `K new 5`）；对象编号与 tclsh 对齐（核心消耗到
+  Obj10，用户对象从 ::oo::Obj11 起）。
 - **复现**：`catch {error boom} m o; puts [dict keys $o]`
-- **严重度**：已关闭。残差：ns eval 的 CALL 条目（tclsh 报
-  `CALL {namespace eval ...}` 命令文本，rtcl 无该帧边界——低频）；expr
-  错误的 INNER 形（tclsh = syntax {msg} {opts} 特形，rtcl =
-  invokeStk1——诊断面）。
+- **严重度**：已关闭。残差（均为 bytecode 内省形，诊断面低频）：
+  * INNER 的**操作码名**形：替换失败 = `loadStk`/`loadScalar1`；
+    尾位置分派失败（ensemble 编译）= `invokeReplace`；`{*}` 多词展开
+    = `invokeExpanded`；tailcall 内置/arity 失败 = 裸目标词——rtcl
+    均记 invokeStk1...；
+  * 对象自有方法帧 `(object "::oo::ObjN" method "m" line N)` 出口帧
+    与对象自有方法 `next` 的 tclsh 8.6 怪形（丢实参、level0=对象调用）；
+  * `return -level 0 -code error -errorinfo EI boom` 的 INNER
+    （tclsh `invokeStk1 t2`）。
 
 ### D-4 非 error 完成的 options 字典 -code/-level 未按 proc 边界解码（spec [D-3]）
 - **Tcl 8.6**：catch {f}（f 内 `return hi`）→ `-code 0 -level 1`；

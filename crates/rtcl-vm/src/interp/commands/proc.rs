@@ -312,6 +312,7 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // `info level 0` inside the lambda shows `apply {<term>} <args...>`:
     // the term as ONE list element (brace-wrapped) plus the arguments.
+    // CALL 条目也取这一渲染（err_log_call 用帧 level0）。
     let mut level0 = vec![Value::from_str("apply"), args[1].clone()];
     level0.extend(args[2..].iter().cloned());
     interp.frame_level0_args = Some(level0);
@@ -485,7 +486,18 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let saved_l0: Vec<_> = interp.ns_level0.split_off(ns_trim);
     let saved_ns = interp.current_namespace.clone();
     interp.current_namespace = Rc::from(target_ns);
+    // D-3 -errorstack：uplevel 求值期间的错误日志事件记
+    // `UP <framePtr.level - varFramePtr.level>`（tclsh Tcl_LogCommandInfo
+    // 的 varFramePtr 分支），delta = 弹出的作用域数（proc 帧 + ns eval
+    // ——split_off 之前算，saved_ns_stack.len() 即被裁掉的数量）。
+    let up_delta = num_to_pop_frames + saved_ns_stack.len();
+    if up_delta > 0 {
+        interp.err_uplevel.push(up_delta);
+    }
     let result = eval_tagged(interp, &script, "uplevel");
+    if up_delta > 0 {
+        interp.err_uplevel.pop();
+    }
     interp.current_namespace = saved_ns;
     interp.ns_level0.extend(saved_l0);
     interp.ns_stack.extend(saved_ns_stack);

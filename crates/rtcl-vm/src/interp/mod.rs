@@ -756,6 +756,23 @@ pub struct Interp {
     /// 错误传播途中离开的 proc 帧（CALL 条目，内层先）——call_proc 错
     /// 误出口 push，fresh 错误清空。
     pub(crate) err_calls: Vec<String>,
+    /// 最近一次 call_proc 的错误是否来自**体执行**（true）而非入口
+    /// 绑定/分派失败（false）。`next` 用它区分"目标方法体出错"
+    /// （正常 INNER）与"next 自身分派失败"（INNER=tclooNext）。
+    pub(crate) err_call_body: bool,
+    /// 活动 `uplevel` 的跨层数（栈；每次错误日志事件追加
+    /// `UP <delta>`，tclsh Tcl_LogCommandInfo 的 varFramePtr 判定）。
+    pub(crate) err_uplevel: Vec<usize>,
+    /// 每个活动 `namespace eval` 的调用词重建文本（CALL 条目载荷；
+    /// 与 [`Interp::ns_stack`] 平行），不是 ns_level0 的源文本。
+    pub(crate) ns_call_text: Vec<String>,
+    /// 下一次 call_proc 是否由 `next` 调起：tclsh 的下一实现帧 usage
+    /// 词是 `next`（`wrong # args: should be "next x"`），且合成的方法
+    /// 名参数不进 usage。
+    pub(crate) frame_next_call: bool,
+    /// 下一次 call_proc 建 **objc=0 特殊帧**（tclsh 析构器帧）：
+    /// `info level 0` 为空、错误日志事件不追加 CALL。
+    pub(crate) frame_level0_empty: bool,
     /// Current script name (for info script).
     #[cfg(feature = "std")]
     pub(crate) script_name: String,
@@ -881,6 +898,11 @@ impl Interp {
             err_inner: None,
             err_pending_inner: None,
             err_calls: Vec::new(),
+            err_call_body: false,
+            err_uplevel: Vec::new(),
+            ns_call_text: Vec::new(),
+            frame_next_call: false,
+            frame_level0_empty: false,
             ns_level0: Vec::new(),
             ns_stack: Vec::new(),
             frames: Vec::new(),

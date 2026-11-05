@@ -339,6 +339,11 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         .ns_level0
         .push(interp.cur_cmd_text.slice(&interp.cur_source).to_string());
     interp.ns_stack.push(qualified.clone());
+    // CALL 条目载荷 = 本次 ns-eval 的**调用词**重建（tclsh 用
+    // framePtr 的 objv；与 info level 0 的源文本可能不同）。
+    interp
+        .ns_call_text
+        .push(Value::from_list(args).as_str().to_string());
     // Marks for the eval-level variable links this body creates — they
     // die with it (tclsh's ns-eval varFrame pops).
     let prev = std::mem::replace(&mut interp.current_namespace, Rc::from(qualified.clone()));
@@ -364,6 +369,7 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     interp.current_namespace = prev;
     interp.ns_stack.pop();
     interp.ns_level0.pop();
+    interp.ns_call_text.pop();
     // Drop the variable links that belong to THIS namespace's variable
     // table: `variable`-declared bare-name links (transient — created for
     // this body) and any kept-alive variables of a self-deleted
@@ -413,6 +419,8 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     if let Err(e) = &result {
         if interp.err_is_error(e) {
+            // CALL 条目由体内日志事件按 ns-eval 调用词追加；这里只挂
+            // 错误出口的特殊帧。
             let tag = format!("in namespace eval \"{}\" script", qualified);
             interp.err_exit_frame(&tag);
         }

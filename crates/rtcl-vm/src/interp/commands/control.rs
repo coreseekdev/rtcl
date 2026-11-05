@@ -28,6 +28,7 @@ fn eval_arm_body(
     word_idx: usize,
     script: &str,
     same_unit: bool,
+    inline_shape: bool,
 ) -> Result<Value> {
     let saved_offset = interp.line_offset;
     let offset = match interp.body_is_verbatim_script(word_idx, script) {
@@ -48,7 +49,12 @@ fn eval_arm_body(
         // an append, and arming `fresh` for it would leak into the NEXT
         // error's framing, swallowing one of its harness frames
         // (`if {...; continue}` followed by an unrelated error).
-        if interp.err_is_error(e) {
+        //
+        // tclsh 的抑制只对**内联**体成立（字面量体编进同一单元，if 自己
+        // 不产生日志事件）；动态体是单独求值的脚本，错误回到 if 命令
+        // 站点时记 invoker 帧（`invoked from within "if {1} $q"`）——
+        // 不布防 fresh，让站点 harness 正常记。
+        if interp.err_is_error(e) && inline_shape {
             interp.err_fresh = true;
         }
     }
@@ -69,12 +75,15 @@ fn if_inline_body_indices(interp: &Interp, args: &[Value]) -> Option<Vec<usize>>
     };
     let n = args.len();
     let mut idxs = Vec::new();
-    let mut i = 2usize;
+    // args[1] 是首个条件词；每个分支体词在其后（可跳过 `then`）。
+    let mut cond = 1usize;
     loop {
-        if i >= n {
-            return None; // dangling keyword / no body
+        // 条件词必须字面——TclCompileIfCmd 的内联门（动态条件时整条
+        // if 走 DynCall，体不内联）。
+        if cond >= n || !interp.word_is_plain_literal(cond, args[cond].as_str()) {
+            return None;
         }
-        i += 1; // past the condition
+        let mut i = cond + 1;
         if is_kw(i, "then") {
             i += 1;
         }
@@ -87,7 +96,7 @@ fn if_inline_body_indices(interp: &Interp, args: &[Value]) -> Option<Vec<usize>>
             break;
         }
         if is_kw(i, "elseif") {
-            i += 1;
+            cond = i + 1;
         } else if is_kw(i, "else") {
             i += 1;
             if i + 1 != n {
@@ -112,10 +121,13 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // The compiler's all-or-nothing inline decision, evaluated before any
     // arm runs: every body of a structurally inlinable `if` is part of
     // the proc's unit, so all of them keep the lexical context.
-    let same_unit = interp.lexical_body
-        && if_inline_body_indices(interp, args).is_some_and(|idxs| {
-            idxs.iter().all(|&bi| interp.body_would_compile(bi, args[bi].as_str()))
-        });
+    // inline_shape = 分支/条件全字面（tclsh 编译器的 if 内联门）——它
+    // 同时决定错误出口语义：内联体不出 if 帧，派发体在 if 站点记
+    // invoker 帧。
+    let inline_shape = if_inline_body_indices(interp, args).is_some_and(|idxs| {
+        idxs.iter().all(|&bi| interp.body_would_compile(bi, args[bi].as_str()))
+    });
+    let same_unit = interp.lexical_body && inline_shape;
 
     let expr = args[1].as_str();
     let cond = interp.eval_expr(expr)?;
@@ -134,7 +146,7 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     if crate::types::expr_funcs::strict_bool(&cond)? {
-        return eval_arm_body(interp, i, args[i].as_str(), same_unit);
+        return eval_arm_body(interp, i, args[i].as_str(), same_unit, inline_shape);
     }
     i += 1;
 
@@ -162,7 +174,7 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     )));
                 }
                 if crate::types::expr_funcs::strict_bool(&cond)? {
-                    return eval_arm_body(interp, i, args[i].as_str(), same_unit);
+                    return eval_arm_body(interp, i, args[i].as_str(), same_unit, inline_shape);
                 }
                 i += 1;
             }
@@ -177,10 +189,10 @@ pub fn cmd_if(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         "wrong # args: extra words after \"else\" clause in \"if\" command",
                     ));
                 }
-                return eval_arm_body(interp, i + 1, args[i + 1].as_str(), same_unit);
+                return eval_arm_body(interp, i + 1, args[i + 1].as_str(), same_unit, inline_shape);
             }
             _ => {
-                return eval_arm_body(interp, i, word, same_unit);
+                return eval_arm_body(interp, i, word, same_unit, inline_shape);
             }
         }
     }
@@ -781,6 +793,18 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if e.is_exit() {
                 return Err(e);
             }
+            // D-3：**动态**体（词源非字面量）的体错误在 proc/ns 帧内
+            // 多记一次 invoker 帧（tclsh TIP #280：错误日志事件用发起
+            // 命令的源码文本），随日志事件追加 CALL；顶层（根帧）不记。
+            // 字面量体被编译进同一单元，无此帧。
+            if interp.err_is_error(&e)
+                && interp.body_is_verbatim_script(1, script).is_none()
+                && (!interp.frames.is_empty() || !interp.ns_stack.is_empty())
+            {
+                let text = interp.cur_cmd_text.slice(&interp.cur_source).to_string();
+                let line = interp.cur_cmd_line.max(1);
+                interp.err_harness_frame(&e.message_text(), &text, line);
+            }
             // A `tailcall` completion caught here: the deferred command
             // stays armed on the frame marker and fires at frame exit;
             // the completion itself reports as a `return` (code 2) with
@@ -1057,12 +1081,21 @@ pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let _ = interp.set_var("::errorCode", Value::from_str(&code));
     interp.err_code_raised = true;
     // D-3 -errorstack：error 命令的 INNER 条目 = returnImm <msg> <info>
-    // （tclsh 实测：error boom → INNER {returnImm boom {}}）。一次性
-    // 预装，harness 首帧消费（防被自身 dispatch 帧覆写成 invokeStk）。
+    // （tclsh 实测：error boom → INNER {returnImm boom {}}）。它是
+    // **Tcl 列表** [returnImm, msg, info]（TclGetInnerContext 的
+    // INST_RETURN_IMM 臂），元素各自 list 转义——msg 含空格时为
+    // `returnImm {in P} {}`。一次性预装，harness 首帧消费。
     {
         let info = error_info.clone().unwrap_or_default();
-        interp.err_pending_inner =
-            Some(format!("returnImm {} {}", msg, crate::value::tcl_quote(&info)));
+        interp.err_pending_inner = Some(
+            Value::from_list(&[
+                Value::from_str("returnImm"),
+                Value::from_str(&msg),
+                Value::from_str(&info),
+            ])
+            .as_str()
+            .to_string(),
+        );
     }
     // A non-empty info argument REPLACES the accumulated errorInfo and
     // suppresses the next harness frame (25.7: the `while executing
@@ -1077,6 +1110,7 @@ pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // （err_calls 同步清：新错误的 CALL 从此处重新累计）。
             interp.err_inner = interp.err_pending_inner.take();
             interp.err_calls.clear();
+            interp.err_call_body = false;
         }
     }
     if error_info.is_none() && error_code.is_none() {
@@ -1105,18 +1139,33 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Execute the body
     let body = args[1].as_str();
     let body_result = interp.eval(body);
-    // try swallows body errors: consume the accumulated errorInfo the
-    // same way catch does (writes ::errorInfo, resets the accumulator).
+    // tclsh 的 try 有两条路径：
+    // * **编译态**（compiledLocals 上下文——proc 体里；TclCompileTryCmd
+    //   用 AnonymousLocal，顶层/eval 里退化为 C 实现）：体/处理器/收尾
+    //   脚本编进同一单元，错误**不加** ("try" body) 帧，try 自身也不
+    //   在其命令站点记帧；
+    // * **派发态**（顶层、eval 字符串）：C 实现追加 ("try" body line N)
+    //   出口帧，错误回到 try 站点时记 invoker 帧。
+    // 两种路径都会把体错误的 errorInfo 落 ::errorInfo（handler 读它）。
+    let compiled_ctx = interp.lexical_body || interp.in_locals_unit;
+    // 体词是字面量还是动态：编译态里**动态体**是单独求值的脚本，错误
+    // 回到 try 站点时记 invoker 帧；字面体编进同一单元，不记。
+    let body_verbatim = interp.body_is_verbatim_script(1, body).is_some();
+    let suppress_site = compiled_ctx && body_verbatim;
     if let Err(e) = &body_result {
         if interp.err_is_error(e) {
-            // D-10：体错误的 errorInfo 带 ("try" body line N) 出口帧
-            // （tclsh；帧行号 = 体错误命令行，err_line 已由体 harness
-            // 记好）。先加帧再落 ::errorInfo——handler 读到的即完整形。
-            interp.err_exit_frame("\"try\" body");
-            let info = interp.err_info.take().unwrap_or_else(|| e.message_text());
+            if !compiled_ctx {
+                interp.err_exit_frame("\"try\" body");
+            }
+            // 快照（不 take）：无匹配 handler 时错误要带帧继续传播；
+            // 处理器执行前再清累加器（处理器的错误另起新帧序）。
+            let info = interp.err_info.clone().unwrap_or_else(|| e.message_text());
             let _ = interp.set_var("::errorInfo", Value::from_str(&info));
+            // 编译态 + 字面体：try 站点不记帧（同一单元已记过）。
+            interp.err_fresh = suppress_site;
+        } else {
+            interp.err_fresh = false;
         }
-        interp.err_fresh = false;
     }
 
     // Determine the exit code and result value
@@ -1179,7 +1228,19 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                             interp.set_var(opts_var, opts)?;
                         }
                     }
-                    handler_result = Some(interp.eval(handler_body));
+                    handler_result = Some({
+                        // 处理器错误另起帧序（tclsh：errorInfo 只含处理器
+                        // 自己的帧）；编译态再由 err_fresh 抑制 try 站点帧。
+                        interp.err_info = None;
+                        interp.err_fresh = false;
+                        let r = interp.eval(handler_body);
+                        if let Err(he) = &r {
+                            if interp.err_is_error(he) && suppress_site {
+                                interp.err_fresh = true;
+                            }
+                        }
+                        r
+                    });
                 }
                 i += 4;
             }
@@ -1253,7 +1314,19 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                                 }
                             }
                         }
-                        handler_result = Some(interp.eval(handler_body));
+                        handler_result = Some({
+                        // 处理器错误另起帧序（tclsh：errorInfo 只含处理器
+                        // 自己的帧）；编译态再由 err_fresh 抑制 try 站点帧。
+                        interp.err_info = None;
+                        interp.err_fresh = false;
+                        let r = interp.eval(handler_body);
+                        if let Err(he) = &r {
+                            if interp.err_is_error(he) && suppress_site {
+                                interp.err_fresh = true;
+                            }
+                        }
+                        r
+                    });
                     }
                 }
                 i += 4;
@@ -1267,9 +1340,23 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
-    // Execute finally script if present
+    // Execute finally script if present.  tclsh：收尾脚本自身出错时错误
+    // 取代体错误（帧序另起）；收尾成功则体错误的帧原样保留传播。
     if let Some(script) = finally_script {
-        interp.eval(script)?;
+        let saved_info = interp.err_info.take();
+        interp.err_fresh = false;
+        let fr = interp.eval(script);
+        let fr_ok = fr.is_ok();
+        if let Err(fe) = &fr {
+            if interp.err_is_error(fe) && suppress_site {
+                interp.err_fresh = true;
+            }
+        }
+        if fr_ok {
+            interp.err_info = saved_info;
+            interp.err_fresh = suppress_site;
+        }
+        fr?;
     }
 
     // Determine the final result
@@ -1277,7 +1364,8 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // Handler was executed — its result is the return value
         hr
     } else {
-        // No handler matched — re-raise original error/result
+        // No handler matched — re-raise original error/result（累加器未
+        // 被 take：体帧随错误继续传播）
         body_result
     }
 }

@@ -50,6 +50,25 @@ impl Interp {
         let mut current_proc_name = Cow::Borrowed(proc_name);
         let mut ns_override = ns_override;
 
+        // `next` 调起的帧：usage 词 "next"、合成方法名参数不进 usage
+        // （tclsh：`wrong # args: should be "next x"`）。只认 OO 方法帧
+        // （Forward 等中转的 proc 调用不吃这个旗标）。
+        let want_next = std::mem::take(&mut self.frame_next_call);
+        let next_frame = want_next
+            && self
+                .oo
+                .active
+                .last()
+                .map(|a| a.frame_depth == self.frames.len())
+                .unwrap_or(false);
+        // 本帧体是否已开始执行——`next` 用它区分"目标方法体出错"
+        // （正常 INNER）与"next 自身分派失败"（INNER=tclooNext）。
+        let mut body_entered = false;
+        // tailcall 状态：重绑过目标（INNER 用目标调用词）与目标为内置
+        // （错误在目标分派期，记 INNER 目标词）。
+        let mut tailcall_rebound = false;
+        let mut tailcall_builtin_text: Option<String> = None;
+
         // Execution traces (tclsh 8.6.17): `enter` fires before the frame
         // exists and its callback's error REPLACES this invocation
         // (trace-40.1); `leave` fires after the frame is gone.  The
@@ -89,6 +108,8 @@ impl Interp {
         } else {
             None
         };
+        // objc=0 特殊帧（tclsh 析构器）：info level 0 空、不记 CALL。
+        let level0_special = std::mem::take(&mut self.frame_level0_empty);
         // The OO dispatcher's one-shot variable links (consumed here for
         // the same leak reason; installed at frame setup below).
         let prelink = self.frame_prelink.take();
@@ -277,6 +298,11 @@ impl Interp {
                     };
                     let mut usage = name_word;
                     for (i, (p, d)) in def.params.iter().enumerate() {
+                        // `next` 帧：params[0] 是合成的方法名参数（实参
+                        // 里的方法词），tclsh 的 usage 不含它。
+                        if next_frame && i == 0 {
+                            continue;
+                        }
                         usage.push(' ');
                         if has_args && i == def.params.len() - 1 {
                             usage.push_str("?arg ...?");
@@ -351,7 +377,7 @@ impl Interp {
             // per-call Vec (the old code moved a fresh to_vec allocation
             // in here and dropped it at frame teardown).
             let frame = self.frames.last_mut().unwrap();
-            if frame.level0.is_empty() {
+            if frame.level0.is_empty() && !level0_special {
                 frame.level0.extend(cur.iter().cloned());
             }
 
@@ -417,6 +443,7 @@ impl Interp {
             // frames (min4: `(procedure "P" line 3)` instead of line 1).
             let saved_body_offset = self.line_offset;
             self.line_offset = 0;
+            body_entered = true;
             // A named proc's body compiled once at `proc` time runs
             // op-by-op here — same errors, same frames, no per-call
             // re-parse.  Everything else (non-parsing bodies, trace-
@@ -518,6 +545,9 @@ impl Interp {
                         tc_def = Some(new_proc);
                         current_proc_name = Cow::Owned(cmd_name.clone());
                         owned_args = Some(tc_args.into_iter().map(|s| Value::from_str(&s)).collect());
+                        // 重绑后本帧的 level0 由绑定步骤改写为目标调用
+                        // 词（CALL 条目跟随）。
+                        tailcall_rebound = true;
                         // The reused frame's enterstep context now names the
                         // tail-call target (corpus-free: no extra enter/leave
                         // fires for the switched-to command).  Only a traced
@@ -531,11 +561,18 @@ impl Interp {
                                 *top = new_key;
                             }
                         }
+                        // 重绑后的迭代：体尚未执行（目标若在绑定/分派期
+                        // 失败，本帧不算"体已执行"）。
+                        body_entered = false;
                         continue;
                     } else {
                         // Target is a built-in — evaluate and return
                         let tc_values: Vec<Value> =
                             tc_args.iter().map(|s| Value::from_str(s)).collect();
+                        // 内置目标的分派期错误：INNER 记目标调用词
+                        // （tclsh：`tailcall error x3` → `INNER {error x3}`）。
+                        tailcall_builtin_text =
+                            Some(Value::from_list(&tc_values).as_str().to_string());
                         break self.invoke_builtin_or_eval(&tc_values);
                     }
                 }
@@ -574,19 +611,38 @@ impl Interp {
         // 器/析构器帧用 tclsh 的 `(class "::K" method "m" line N)` 形状
         // （D-43 errorInfo 族，2026-11-05 实测钉形）。
         if let Err(e) = &final_result {
-            if self.err_is_error(e) {
-                // D-3 -errorstack：错误传播离开本 proc 帧 → CALL 条目
-                // （内层先——传播序 push）。
-                // CALL 条目 = tag+名两个平铺元素（tclsh：CALL p1）。
-                self.err_calls.push("CALL".to_string());
-                self.err_calls.push(current_proc_name.to_string());
+            let is_err = self.err_is_error(e);
+            if is_err {
+                // D-3 -errorstack：CALL/UP 条目由每次**错误日志事件**
+                // （err_harness_frame）按当前活动帧追加，proc 出口不再
+                // 手推（tclsh 的 CALL 是 framePtr 的 objv，不是出口
+                // 点）。这里只处理 tailcall 的 INNER 特殊形。
+                if let Some(t) = &tailcall_builtin_text {
+                    // tailcall 内置目标：错误在目标分派期 → INNER 记
+                    // 目标调用词（tclsh `INNER {error x3}`）。
+                    self.err_pending_inner = Some(t.clone());
+                } else if !body_entered && tailcall_rebound {
+                    // tailcall 目标绑定失败：INNER = 目标调用词（无
+                    // invokeStk1 词缀；tclsh 实测 `{f 9}`）。
+                    self.err_pending_inner = Some(
+                        Value::from_list(owned_args.as_deref().unwrap_or(args))
+                            .as_str()
+                            .to_string(),
+                    );
+                }
+                // 原始入口的绑定失败（arity 错）：外层 harness 记
+                // `invokeStk1 <源片段>`（tclsh 同）。
             }
-            if self.err_is_error(e) && current_proc_name != "apply lambdaExpr" {
+            if is_err && current_proc_name != "apply lambdaExpr" {
                 let tag = super::commands::oo::oo_method_exit_tag(self)
                     .unwrap_or_else(|| format!("procedure \"{}\"", current_proc_name));
                 self.err_exit_frame(&tag);
             }
         }
+        // OO 调用边界的 CALL 判据：错误来自体执行才记（分派/绑定期
+        // 失败不记——tclsh 只留 INNER）。每次出口都写，防陈旧。
+        self.err_call_body = body_entered
+            && matches!(&final_result, Err(e) if self.err_is_error(e));
 
         // Write back static variables to the proc definition
         if !current_statics.is_empty() {

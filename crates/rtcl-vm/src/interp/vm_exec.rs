@@ -1155,7 +1155,19 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                 interp.err_line = line;
             } else {
                 let msg = e.message_text();
-                interp.err_harness_frame(&msg, text, line);
+                // 调用类 op：INNER 的 invokeStk1 载荷用栈上**已求值
+                // 词**（tclsh 的 pc/tos 内省），其余 op 回落源码片段。
+                let words: Option<&[Value]> = match op {
+                    OpCode::Call { .. }
+                    | OpCode::CallExpand { .. }
+                    | OpCode::CallProc { .. }
+                    | OpCode::DynCall { .. }
+                    | OpCode::DynCallExpand { .. }
+                    | OpCode::SubEndDynCall(_)
+                    | OpCode::SubEndCall { .. } => Some(&st.scratch),
+                    _ => None,
+                };
+                interp.err_harness_frame_words(&msg, text, line, words);
             }
             // The error then crosses every still-open inlined `[...]`
             // region: each word-bracket-owning command defers its frame to
@@ -3742,7 +3754,9 @@ mod foreach_inline_tests {
         );
         assert_eq!(
             ev("proc p {b} { set a(0) 44; catch $b m; set ::errorInfo }; p {lmap a {1 2 3} {}}"),
-            "can't set \"a\": variable is array\n    (setting lmap loop variable \"a\")\n    invoked from within\n\"lmap a {1 2 3} {}\"",
+            // 动态体脚本的错误在 proc 帧内多记一次 invoker 帧（tclsh
+            // 8.6.17 实测：`invoked from within "catch $b m"`）。
+            "can't set \"a\": variable is array\n    (setting lmap loop variable \"a\")\n    invoked from within\n\"lmap a {1 2 3} {}\"\n    invoked from within\n\"catch $b m\"",
         );
     }
 

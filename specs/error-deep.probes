@@ -19,3 +19,20 @@ catch {namespace eval ::n {error inside}} m; puts $m
 proc f2 {} {return -level 2 -code error deep} ; proc f1 {} {f2} ; catch f1 m ; puts "$m|$::errorInfo"
 puts [catch {return -level 2 v} m o] ; puts "$m|$o"
 catch {try {error x} on error {} {} finally {}} m ; puts $m
+# ── D-3 CALL/UP 条目形（2026-11-06 对齐：调用词重建 + 每次日志事件一帧）──
+proc caf {a b} {error x} ; catch {caf {a b} {c d}} m o ; puts [dict get $o -errorstack]
+proc cap {} {error x} ; catch {apply {{q} {error x}} {a b}} m o ; puts [dict get $o -errorstack]
+proc cup {} {uplevel 1 {error x}} ; catch {cup} m o ; puts [dict get $o -errorstack]
+proc ccat {} {set s "error x" ; catch $s m o ; puts [dict get $o -errorstack]} ; ccat
+proc ccat2 {} {set s "error x" ; catch $s m o ; puts [dict get $o -errorinfo]} ; ccat2
+catch {namespace eval nn {namespace eval mm {error x}}} m o ; puts [dict get $o -errorstack]
+proc cif {} {set q {error x} ; if 1 $q} ; catch {cif} m o ; puts $::errorInfo
+proc cwh {} {set q {error x} ; while 1 $q} ; catch {cwh} m o ; puts [dict get $o -errorstack]
+proc cfo {} {set q {error x} ; for {} 1 {} $q} ; catch {cfo} m o ; puts [dict get $o -errorstack]
+proc cfo2 {} {set q {error x} ; for {} 1 $q {}} ; catch {cfo2} m o ; puts [dict get $o -errorinfo]
+proc ctry {} {set q {error x} ; try $q} ; catch {ctry} m o ; puts [dict get $o -errorstack]
+proc ch1 {} {try {error x} on error {m o} {error h}} ; catch {ch1} m o ; puts [dict get $o -errorstack]
+proc cno {} {namespace eval nn {error x}} ; catch {cno} m o ; puts [dict get $o -errorstack]
+proc cta {} {tailcall caf2 9} ; proc caf2 {a b} {} ; catch {cta} m o ; puts [dict get $o -errorstack]
+proc cw {} {set x 5 ; nosuch $x} ; catch {cw} m o ; puts [dict get $o -errorstack]
+proc cw2 {} {nosuch [expr {1+1}]} ; catch {cw2} m o ; puts [dict get $o -errorstack]

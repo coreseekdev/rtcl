@@ -1,7 +1,7 @@
 # oo 深水探针（oo-deep;probe.sh 差分;对应 oo.allium D-40..D-43）
 # ── 基线段（2026-11-03 实测 SAME——回归锚点）──
-# 注：info object namespace 的 ::oo::ObjN 编号与 tclsh 不同（tclsh 为元
-# 对象预占号，::oo::Obj11 vs rtcl ::oo::Obj3）——外观差异，勿入基线。
+# 注：对象编号已与 tclsh 对齐（2026-11-06：基线计数器消耗到 Obj10，
+# 用户对象从 ::oo::Obj11 起；见文件尾部 D-3/D-43 段）。
 oo::object create a; catch {oo::object create a} m; puts $m
 oo::class create C {method m {} {return 1}}; C create o; catch {o nosuch} e; puts $e
 oo::class create A {method mm {} {return mm}}; oo::class create B {mixin A}; B create b; catch {b zz} e; puts $e
@@ -38,3 +38,13 @@ oo::class create C {}; puts [info class subclasses C]; puts [info object isa cla
 oo::class create M {method mm {} {return mm}}; oo::class create C {mixin M}; puts [info class methods C -all]
 oo::class create C {method m {} {my variable v; set v 3; return $v}}; C create o; catch {o m} e; puts $e
 oo::class create C {}; C create o; catch {info object filters o} e; puts $e
+# ── D-3/D-43 对象编号与调用词帧（2026-11-06 对齐 tclsh 8.6.17：用户对象从 Obj11 起）──
+oo::class create K ; set ko [K create ko] ; puts $ko
+oo::class create K ; puts [oo::object new]
+oo::class create K {constructor {a} {set ::l0a [info level 0]}} ; K create kc 5 ; puts $::l0a
+oo::class create KD {destructor {puts "l0=[info level 0]"}} ; set kd [KD new] ; $kd destroy
+oo::class create K {method m {a} {error x}} ; set ko2 [K new] ; catch {$ko2 m 1} m o ; puts [dict get $o -errorstack]
+oo::class create KD {destructor {error dt}} ; set kd [KD new] ; catch {$kd destroy} m o ; puts [dict get $o -errorstack]
+oo::class create KC {constructor {} {error ct}} ; catch {KC new} m o ; puts [dict get $o -errorstack]
+oo::class create KP {method m {} {error inP}} ; oo::class create KQ {superclass KP ; method m {} {next}} ; set kq [KQ new] ; catch {$kq m} m o ; puts [dict get $o -errorstack]
+oo::class create KM {method a {} {my b} ; method b {} {error hb}} ; set km [KM new] ; catch {$km a} m o ; puts [dict get $o -errorstack]

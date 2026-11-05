@@ -287,6 +287,20 @@ impl Interp {
     /// failing command, not the frameless construct that re-raised it).
     /// Non-error completions (return/break/continue/exit) never reach this.
     pub(crate) fn err_harness_frame(&mut self, msg: &str, text: &str, line: usize) {
+        self.err_harness_frame_words(msg, text, line, None);
+    }
+
+    /// 同 [`Interp::err_harness_frame`]，但首帧 INNER 的
+    /// `invokeStk1` 载荷可用**已求值调用词**重建（tclsh 的 pc/tos
+    /// 内省：`Tcl_NewListObj` 里是栈上的词，不是源码片段——`f $x`
+    /// 记 `invokeStk1 f 5`）。`None` 时回落源码片段。
+    pub(crate) fn err_harness_frame_words(
+        &mut self,
+        msg: &str,
+        text: &str,
+        line: usize,
+        words: Option<&[Value]>,
+    ) {
         match (&mut self.err_info, self.err_fresh) {
             (Some(_), true) => {
                 self.err_fresh = false;
@@ -297,6 +311,7 @@ impl Interp {
                     tcl_log_excerpt(text)
                 ));
                 self.err_line = line;
+                self.err_log_call();
             }
             (None, _) => {
                 self.err_info = Some(format!(
@@ -307,17 +322,60 @@ impl Interp {
                 self.err_line = line;
                 // D-3 -errorstack：新错误的 INNER 条目——cmd_error 预装
                 // 的 returnImm 形优先（一次性），其余失败为 invokeStk1
-                // <命令文本>；CALL 条目随传播在 call_proc 错误出口收集。
+                // <命令文本>；CALL/UP 条目随本次日志事件追加。
                 self.err_calls.clear();
-                self.err_inner = Some(self.err_pending_inner.take().unwrap_or_else(
-                    || format!("invokeStk1 {}", tcl_log_excerpt(text)),
-                ));
+                self.err_call_body = false;
+                self.err_inner = Some(self.err_pending_inner.take().unwrap_or_else(|| {
+                    match words {
+                        Some(w) if !w.is_empty() => {
+                            // tclsh：≤255 词用 invokeStk1（1 字节操作数），
+                            // 更多用 invokeStk（4 字节）。
+                            let tag =
+                                if w.len() <= 255 { "invokeStk1" } else { "invokeStk" };
+                            format!("{} {}", tag, Value::from_list(w).as_str())
+                        }
+                        _ => format!("invokeStk1 {}", tcl_log_excerpt(text)),
+                    }
+                }));
+                self.err_log_call();
             }
         }
         // A normal harness log means the substitution boundary's
         // deferred enclosing-command frame was superseded (tclsh's
         // ERR_ALREADY_LOGGED is consumed by one level).
         self.err_pending_top = None;
+    }
+
+    /// D-3 -errorstack 的 CALL/UP 追加——每次错误日志事件（tclsh
+    /// `Tcl_LogCommandInfo` 的 TIP #348 段）：
+    /// * `uplevel` 上下文：`UP <framePtr.level - varFramePtr.level>`；
+    /// * 否则当前最内层作用域（proc / OO 方法 / `namespace eval`）的
+    ///   **调用词**（= `info level 0` 的渲染，tclsh 用 framePtr 的
+    ///   objv 重建）；
+    /// * 根帧（顶层脚本）不记。
+    pub(crate) fn err_log_call(&mut self) {
+        if let Some(&delta) = self.err_uplevel.last() {
+            self.err_calls.push("UP".to_string());
+            self.err_calls.push(delta.to_string());
+            return;
+        }
+        let frame_ns_depth = self.frames.last().map(|f| f.ns_depth).unwrap_or(0);
+        if self.ns_stack.len() > frame_ns_depth {
+            // 最内层作用域是 namespace eval（它的 varFrame 未随 proc
+            // 帧记录）。
+            if let Some(words) = self.ns_call_text.last() {
+                self.err_calls.push("CALL".to_string());
+                self.err_calls.push(words.clone());
+            }
+        } else if let Some(f) = self.frames.last() {
+            let words = crate::interp::frame_level0(f);
+            // 空 level0 = tclsh 的 objc==0 特殊帧（析构器）：
+            // "Special frame, nothing to report"。
+            if !words.is_empty() {
+                self.err_calls.push("CALL".to_string());
+                self.err_calls.push(words);
+            }
+        }
     }
 
     /// Construct-exit frame append — `(procedure "x" line N)`,
@@ -327,6 +385,13 @@ impl Interp {
     pub(crate) fn err_exit_frame(&mut self, tag: &str) {
         if let Some(info) = &mut self.err_info {
             info.push_str(&format!("\n    ({} line {})", tag, self.err_line));
+        }
+    }
+
+    /// 无行号的错误出口帧（tclsh：`("for" loop-end command)`）。
+    pub(crate) fn err_exit_frame_raw(&mut self, text: &str) {
+        if let Some(info) = &mut self.err_info {
+            info.push_str(&format!("\n    ({})", text));
         }
     }
 
@@ -537,7 +602,12 @@ impl Interp {
         if let Err(e) = &r {
             if self.err_is_error(e) {
                 let msg = e.message_text();
-                self.err_harness_frame(&msg, cmd.text.slice(&unit.source), cmd.line + self.line_offset);
+                self.err_harness_frame_words(
+                    &msg,
+                    cmd.text.slice(&unit.source),
+                    cmd.line + self.line_offset,
+                    Some(&args),
+                );
             } else if e.is_break()
                 || e.is_continue()
                 || e.is_return() && matches!(e.deferred_code(), 1 | 3 | 4)

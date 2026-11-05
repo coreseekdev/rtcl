@@ -146,12 +146,10 @@ pub(crate) enum Owner {
 /// 类 = 当前 ActiveMethod 链条目的 owner（定义类）。非 OO 帧（或
 /// 对象自有方法）返回 None 回落 procedure 帧。
 pub(crate) fn oo_method_exit_tag(interp: &Interp) -> Option<String> {
-    let a = interp.oo.active.last()?;
-    // 出口帧发射点：调用帧仍在栈上（len = depth + 1，与 cleanup_active
-    // 的 depth >= len 弹出判据互补）。
-    if a.frame_depth + 1 != interp.frames.len() {
+    if !oo_method_frame(interp) {
         return None;
     }
+    let a = interp.oo.active.last()?;
     match &a.chain.get(a.index)?.owner {
         Owner::Class(c) => Some(match a.method.as_ref() {
             "destructor" => format!("class \"{}\" destructor", c),
@@ -160,6 +158,18 @@ pub(crate) fn oo_method_exit_tag(interp: &Interp) -> Option<String> {
         }),
         Owner::Object => None,
     }
+}
+
+/// 当前出口帧是否为 OO 方法实现帧（类或对象自有方法，含 `next` 目标
+/// 帧）。CALL 条目抑制与出口帧 tag 共用同一判据：调用帧仍在栈上
+/// （len = depth + 1，与 cleanup_active 的 depth >= len 弹出判据互补）。
+pub(crate) fn oo_method_frame(interp: &Interp) -> bool {
+    interp
+        .oo
+        .active
+        .last()
+        .map(|a| a.frame_depth + 1 == interp.frames.len())
+        .unwrap_or(false)
 }
 
 /// One resolvable link in a method chain.
@@ -438,6 +448,12 @@ pub(crate) fn init(interp: &mut Interp) {
         );
     }
     interp.note_cmd_mutation();
+
+    // tclsh 的 ObjN 计数器在用户代码前已消耗到 10（核心内部对象
+    // Obj3..Obj10；可观察的核心名仍是 oo::object=Obj1 / oo::class=
+    // Obj2），首个用户对象是 ::oo::Obj11（实测 tclsh 8.6.17）。基线
+    // 对齐让对象名、info object namespace、errorstack 文本逐字一致。
+    interp.oo.next_obj_id = 10;
 }
 
 // ── namespace helpers ──────────────────────────────────────────────────
@@ -913,7 +929,7 @@ fn exec_chain_entry(
                 Ok(Value::empty())
             }
             "create" => oo_create(interp, key, call_args, typed),
-            "new" => oo_new(interp, key, call_args),
+            "new" => oo_new(interp, key, call_args, typed),
             // D-43⑤：my variable / my varname / my eval——对象 ns 语义
             // （variable 链接对象 ns 变量进当前帧；varname 出全名；eval
             // 在对象 ns 求值）。<cloned> 为复制钩子占位（oo::copy 另走
@@ -1418,7 +1434,7 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
                     Rc::clone(&c.method_rc),
                     Rc::clone(&c.chain),
                 );
-                return exec_chain_entry(
+                let r = exec_chain_entry(
                     interp,
                     &key,
                     &method_rc,
@@ -1429,6 +1445,7 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
                     &args[0],
                     true,
                 );
+                return r;
             }
         }
     }
@@ -1609,11 +1626,16 @@ fn object_class_of(interp: &Interp, key: &str) -> String {
 extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let act = match top_active(interp) {
         Some(a) => a,
-        None => return Err(Error::Msg("no next method implementation".to_string())),
+        None => {
+            set_tcloo_next_inner(interp);
+            return Err(Error::Msg("no next method implementation".to_string()));
+        }
     };
     let next_index = act.index + 1;
     if next_index >= act.chain.len() {
         // D-40⑤：用尽消息按方法名（tclsh：析构器/构造器各有其文）。
+        // D-3：next 自身的分派失败 → INNER 记为 tclooNext（tclsh 实测）。
+        set_tcloo_next_inner(interp);
         return Err(Error::Msg(
             match act.method.as_ref() {
                 "destructor" => "no next destructor implementation",
@@ -1635,27 +1657,37 @@ extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Valu
     let mut l0 = vec![Value::from_str("next")];
     l0.extend(args[1..].iter().cloned());
     interp.frame_level0_args = Some(l0);
-    // The as-typed object word, as recorded in the current level0.
-    let l0 = interp
-        .frames
-        .last()
-        .map(|f| crate::interp::frame_level0(f))
-        .unwrap_or_default();
-    let typed = Value::from_str(&l0)
-        .as_list()
-        .and_then(|l| l.first().map(|v| v.as_str().to_string()))
-        .unwrap_or_else(|| act.obj.to_string());
-    exec_chain_entry(
+    // D-3：下一实现帧的 usage 词是 `next`，且合成方法名参数不进
+    // usage（tclsh：`wrong # args: should be "next x"`）——不再从
+    // level0 首词取对象名（next 帧的 level0 首词就是 "next"）。
+    interp.frame_next_call = true;
+    let typed = "next";
+    let r = exec_chain_entry(
         interp,
         &act.obj,
         &act.method,
         next_index,
         &act.chain,
         &call_args,
-        &typed,
-        &Value::from_str(&typed),
+        typed,
+        &Value::from_str(typed),
         false,
-    )
+    );
+    // D-3：next 目标的**分派/绑定失败**（无下一实现、目标 arity 错）
+    // 只留 INNER=tclooNext（CALL 条目由外层日志事件按帧追加）；
+    // 目标方法体出错则 INNER 已由体内事件给出，不动。
+    if let Err(e) = &r {
+        if interp.err_is_error(e) && !interp.err_call_body {
+            set_tcloo_next_inner(interp);
+        }
+    }
+    r
+}
+
+/// next 自身分派失败时的 INNER（tclsh 的内部命令名，实测原样单词）。
+fn set_tcloo_next_inner(interp: &mut Interp) {
+    interp.err_pending_inner = Some("tclooNext".to_string());
+    interp.err_call_body = false;
 }
 
 // ── create / new / destroy builtins ────────────────────────────────────
@@ -1843,6 +1875,13 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
             let canonical_rc: Rc<str> = Rc::from(canonical.as_str());
             let typed_val = Value::from_str(&name_typed);
             let call_args: Vec<Value> = rest[1..].to_vec();
+            // tclsh 构造器帧的 level0 = **类命令调用词**（实测
+            // `CC create xyz 5`），CALL 条目同源。
+            {
+                let mut l0 = vec![Value::from_str(typed), Value::from_str("create")];
+                l0.extend(rest.iter().cloned());
+                interp.frame_level0_args = Some(l0);
+            }
             let r = exec_chain_entry(
                 interp,
                 &canonical_rc,
@@ -1863,7 +1902,7 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
     Ok(Value::from_str(&canonical))
 }
 
-fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value]) -> Result<Value> {
+fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) -> Result<Value> {
     // D-41③：oo::class 自身只有 create/destroy——`oo::class new` 会
     // 造出非类对象（info object isa class = 0 的坏实例），tclsh 拒绝。
     if class_key == "::oo::class" {
@@ -1887,6 +1926,12 @@ fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value]) -> Result<Value>
         let name_rc: Rc<str> = Rc::from(name.as_str());
         let typed_val = Value::from_str(&name);
         let call_args: Vec<Value> = rest.to_vec();
+        // tclsh 构造器帧的 level0 = 类命令调用词（`FF new 5`）。
+        {
+            let mut l0 = vec![Value::from_str(typed), Value::from_str("new")];
+            l0.extend(rest.iter().cloned());
+            interp.frame_level0_args = Some(l0);
+        }
         let r = exec_chain_entry(
             interp,
             &name_rc,
@@ -2020,6 +2065,10 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
             let method: Rc<str> = Rc::from("destructor");
             let key_rc: Rc<str> = Rc::from(key);
             let typed_val = Value::from_str(key);
+            // tclsh 析构器帧是 **objc=0 特殊帧**（TclLogCommandInfo 的
+            // "Special frame, nothing to report"）：info level 0 为空、
+            // 错误日志事件不追加 CALL。
+            interp.frame_level0_empty = true;
             if let Err(e) = exec_chain_entry(
                 interp,
                 &key_rc,
@@ -3568,7 +3617,7 @@ mod tests {
             eval("set r [list [oo::object create foo]]; foo destroy; lappend r [info commands foo]; set r"),
             "::foo {}"
         );
-        assert_eq!(eval("oo::object new"), "::oo::Obj3");
+        assert_eq!(eval("oo::object new"), "::oo::Obj11");
     }
 
     #[test]

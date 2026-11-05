@@ -35,9 +35,11 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // proc's unit, so each per-iteration eval keeps the lexical context
     // and a foreach dispatched from inside the body takes the compiled
     // semantics, matching the unit the compiler would have built.
-    let same_unit = interp.lexical_body
-        && interp.word_is_plain_literal(1, test)
+    // inline_shape 不含 lexical_body：顶层脚本里字面体同样"内联"（无
+    // 体帧），动态体则派发（`("while" body line N)` + invoker 帧）。
+    let inline_shape = interp.word_is_plain_literal(1, test)
         && interp.body_would_compile(2, body.as_str());
+    let same_unit = interp.lexical_body && inline_shape;
 
     loop {
         // A1 步数预算：每迭代计一步（回退兜底：即使此内建不被编译为
@@ -71,8 +73,15 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // the suppression — a return/exit completion never reaches
                 // an append, and a leaked `fresh` would swallow a harness
                 // frame of the NEXT error in the interp.
+                // 仅**字面量体**（内联进同一单元）：动态体是独立求值的
+                // 脚本，tclsh 给它挂 `("while" body line N)` 出口帧并在
+                // while 命令站点记 invoker 帧。
                 if interp.err_is_error(&e) {
-                    interp.err_fresh = true;
+                    if inline_shape {
+                        interp.err_fresh = true;
+                    } else {
+                        interp.err_exit_frame("\"while\" body");
+                    }
                 }
                 return Err(e);
             }
@@ -96,11 +105,12 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // `Compiler::compile_for`'s inline gates: literal condition word +
     // inlinable start/next/body scripts — all four words belong to the
     // proc's unit, so their evals keep the lexical context.
-    let same_unit = interp.lexical_body
-        && interp.word_is_plain_literal(2, test)
+    // inline_shape 不含 lexical_body（顶层同样内联字面体）。
+    let inline_shape = interp.word_is_plain_literal(2, test)
         && interp.body_would_compile(1, start)
         && interp.body_would_compile(3, next.as_str())
         && interp.body_would_compile(4, body.as_str());
+    let same_unit = interp.lexical_body && inline_shape;
 
     if same_unit {
         interp.next_eval_lexical = true;
@@ -129,8 +139,14 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 else {
                     // tclsh compiles for inline like while: frameless.
                     // True errors only — see the while-arm note above.
+                    // 派发体（动态词）挂 `("for" body line N)` 出口帧，
+                    // 由 for 命令站点的 harness 记 invoker 帧。
                     if interp.err_is_error(&e) {
-                        interp.err_fresh = true;
+                        if inline_shape {
+                            interp.err_fresh = true;
+                        } else {
+                            interp.err_exit_frame("\"for\" body");
+                        }
                     }
                     return Err(e);
                 }
@@ -159,8 +175,14 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 else {
                     // True errors only — see the while-arm note above.
+                    // 派发的 loop-end 脚本：tclsh 挂无行号的
+                    // `("for" loop-end command)` 出口帧。
                     if interp.err_is_error(&e) {
-                        interp.err_fresh = true;
+                        if inline_shape {
+                            interp.err_fresh = true;
+                        } else {
+                            interp.err_exit_frame_raw("\"for\" loop-end command");
+                        }
                     }
                     return Err(e);
                 }

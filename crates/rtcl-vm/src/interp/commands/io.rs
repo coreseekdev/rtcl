@@ -1242,8 +1242,14 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             'c' => {
                 let v = int_arg!(arg);
+                // D-23：%c 是 16 位 Tcl_UniChar——>0xFFFF 直接 U+FFFD
+                // （tclsh 实测 65536 → 替换符，无 16 位回绕）。
                 let cp = if size_h { v as u16 as u32 } else { v as u32 };
-                char::from_u32(cp).unwrap_or('\u{FFFD}').to_string()
+                if cp > 0xFFFF {
+                    '\u{FFFD}'.to_string()
+                } else {
+                    char::from_u32(cp).unwrap_or('\u{FFFD}').to_string()
+                }
             }
             'f' => {
                 let v = fmt_double_value(interp, arg)?;

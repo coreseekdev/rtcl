@@ -145,12 +145,41 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() < 4 {
                 return Err(Error::wrong_args("string match", 4, args.len()));
             }
-            // -nocase support
-            let (nocase, _length, pattern, text) = parse_string_opts(args)?;
+            // D-22①：tclsh 的 string match 不认 --——所有位置词之外
+            // 的词都按选项解析（3 个位置词时首词报 bad option）。
+            let mut i = 2;
+            let mut nocase = false;
+            while i < args.len() && args[i].as_str().starts_with('-') {
+                match args[i].as_str() {
+                    "-nocase" => { nocase = true; i += 1; }
+                    other => {
+                        return Err(Error::Msg(format!(
+                            "bad option \"{}\": must be -nocase",
+                            other
+                        )))
+                    }
+                }
+            }
+            if args.len() - i != 2 {
+                let bad = args[i].as_str();
+                return Err(Error::Msg(format!(
+                    "bad option \"{}\": must be -nocase",
+                    bad
+                )));
+            }
+            let pattern = args[i].as_str();
+            let text = args[i + 1].as_str();
+            // D-22②：-nocase 逐字符简单折叠（原整串 to_lowercase——
+            // İ 两字符展开与 tclsh 的单字符折叠相悖）。
+            let fold = |s: &str| -> String {
+                // 简单折叠：单字符（tclsh 的 İ→i；Rust 全折叠会出
+                // i̇ 两字符——串 match 的逐字语义不兼容）。
+                s.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect()
+            };
             if nocase {
-                Ok(Value::from_bool(glob_match(&pattern.to_lowercase(), &text.to_lowercase())))
+                Ok(Value::from_bool(glob_match(&fold(pattern), &fold(text))))
             } else {
-                Ok(Value::from_bool(glob_match(&pattern, &text)))
+                Ok(Value::from_bool(glob_match(pattern, text)))
             }
         }
         "first" => {

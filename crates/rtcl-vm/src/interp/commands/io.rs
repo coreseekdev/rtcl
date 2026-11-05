@@ -2170,8 +2170,9 @@ mod tests {
         let dstr = dir.to_string_lossy().replace('\\', "/");
         let result = interp.eval(&format!("glob -nocomplain -directory {{{}}} -- **/*.rs", dstr)).unwrap();
         let items = result.as_list().unwrap();
-        // ** matches zero-or-more directories, so all 3 .rs files are found
-        assert_eq!(items.len(), 3, "got: {:?}", items.iter().map(|v| v.as_str()).collect::<Vec<_>>());
+        // D-26：tclsh 的 ** 只是两个 *（无递归）——**/*.rs 命中
+        // sub/mid.rs 一项（tclsh 8.6.17 实测同形）。
+        assert_eq!(items.len(), 1, "got: {:?}", items.iter().map(|v| v.as_str()).collect::<Vec<_>>());
         cleanup(&dir);
     }
 

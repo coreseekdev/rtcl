@@ -764,9 +764,16 @@ impl Interp {
                             // -errorinfo only rides along with an actual
                             // error completion (a `return -code ok
                             // -errorinfo ...` leaves ::errorInfo alone).
+                            // D-6 回归修复：-errorcode 仅在**实际 error
+                            // 完成**（-code error）时落 ::errorCode——
+                            // 原实现无差别写入，`return -errorcode {A B} v`
+                            // 把抬升点码污染到下一错误（tclsh ec1/ec2：
+                            // return 的 -errorcode 不写全局）。
                             if let Some(code) = error_code {
-                                let _ = self.set_var("::errorCode", Value::from_str(code));
-                                self.err_code_raised = true;
+                                if *level == 1 {
+                                    let _ = self.set_var("::errorCode", Value::from_str(code));
+                                    self.err_code_raised = true;
+                                }
                             }
                             let val = value.clone().unwrap_or_default();
                             match *level {
@@ -1275,9 +1282,12 @@ impl Interp {
                 if e.is_return() {
                     match &e {
                         Error::ControlFlow { level, value, error_info, error_code, .. } => {
+                            // D-6：-errorcode 仅在实际 error 完成时落全局。
                             if let Some(code) = error_code {
-                                let _ = self.set_var("::errorCode", Value::from_str(code));
-                                self.err_code_raised = true;
+                                if *level == 1 {
+                                    let _ = self.set_var("::errorCode", Value::from_str(code));
+                                    self.err_code_raised = true;
+                                }
                             }
                             let val = value.clone().unwrap_or_default();
                             match *level {

@@ -481,6 +481,29 @@ impl Error {
             Error::WrongNumArgs { .. } | Error::WrongArgsMsg(_) => {
                 "TCL WRONGARGS".to_string()
             }
+            // D-3 收尾：list.rs::tcl_err 系（47 处 wrong_args/命令错误）
+            // 把 wrong-args 包成 Msg/Runtime——按消息形状识别（join-2.1/
+            // split-2.1 回归根因）。channel 找不到 → TCL LOOKUP CHANNEL
+            // <名>（iocmd-14.1）。
+            Error::Msg(m) if m.starts_with("wrong # args") => "TCL WRONGARGS".to_string(),
+            Error::Msg(m) if m.starts_with("unknown or ambiguous subcommand \"") => {
+                // dict/chan 系未知子命令 → TCL LOOKUP SUBCOMMAND <word>
+                // （tclsh：dict getwithdefault → TCL LOOKUP SUBCOMMAND
+                // getwithdefault）。
+                let rest = &m["unknown or ambiguous subcommand \"".len()..];
+                let word = rest.split('"').next().unwrap_or("");
+                format!("TCL LOOKUP SUBCOMMAND {}", word)
+            }
+            Error::Runtime { message: m, .. } if m.starts_with("wrong # args") => {
+                "TCL WRONGARGS".to_string()
+            }
+            Error::Runtime { message: m, code: ErrorCode::Io }
+                if m.starts_with("can not find channel named \"") =>
+            {
+                let rest = &m["can not find channel named \"".len()..];
+                let name = rest.split('"').next().unwrap_or("");
+                format!("TCL LOOKUP CHANNEL {}", name)
+            }
             _ => "NONE".to_string(),
         }
     }

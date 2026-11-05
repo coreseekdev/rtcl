@@ -834,27 +834,49 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // tclsh resets the code for every new error (rename-3.1) and
             // the var always exists after an error (fresh interp:
             // `info exists errorCode` → 0 until then).
-            if interp.err_code_raised {
-                // 抬升点装的 errorCode 标志按**每次抬升**消费（原只在
-                // code==1 消费——`catch {return -errorcode X}` 留下武装
-                // 标志，下一个错误的派生码被吞：error-deep 探针 A B
-                // 残留实证）。tclsh 对 return 的 -errorcode 不落
-                // ::errorCode（ec1/ec2 实证）。
-                interp.err_code_raised = false;
-            }
+            // D-3 收尾：抬升点装的 errorCode（list.rs::set_error_code
+            // 系 117 处——TCL VALUE LIST BRACE / TCL WRONGARGS / TCL
+            // LOOKUP CHANNEL ...）**优先于**变体派生——原实现只消费
+            // 标志却在 code==1 无条件重派生，把抬升点码打回 NONE
+            // （join-2.3 回归根因）。无抬升码才走变体派生。
+            let raised_code = if interp.err_code_raised {
+                let rc = interp
+                    .globals
+                    .get("errorCode")
+                    .map(|v| v.as_str().to_string());
+                // return -errorcode 载荷不落 ::errorCode（tclsh ec1/ec2
+                // 实证）——其经 return_with_options 的 error_code 槽
+                // 随错误对象走，不走全局。
+                if e.is_return() {
+                    None
+                } else {
+                    rc
+                }
+            } else {
+                None
+            };
+            interp.err_code_raised = false;
             if code == 1 {
-                // Derived codes: tclsh stamps a code on every error —
-                // wrong-args (TCL WRONGARGS), arithmetic (ARITH ...),
-                // var lookups (TCL LOOKUP/READ VARNAME), unknown
-                // commands (TCL LOOKUP COMMAND); plain errors reset
-                // the var to NONE.
-                let tec = e.tcl_error_code();
+                // Derived codes (fallback): tclsh stamps a code on every
+                // error — wrong-args (TCL WRONGARGS), arithmetic
+                // (ARITH ...), var lookups (TCL LOOKUP/READ VARNAME),
+                // unknown commands (TCL LOOKUP COMMAND); plain errors
+                // reset the var to NONE.
+                let tec = raised_code.clone().unwrap_or_else(|| e.tcl_error_code());
                 let _ = interp.set_var("::errorCode", Value::from_str(&tec));
             }
             if let Some(ov) = opts_var {
                 let opts = if code == 1 {
                     // Tcl error completions carry -errorcode and -errorinfo.
-                    error_options_dict(1, 0, &e, script, &error_info, interp.err_line, interp)
+                    let tec_override = if code == 1 {
+                        raised_code.clone()
+                    } else {
+                        None
+                    };
+                    match tec_override {
+                        Some(tec) => error_options_dict_with_ec(1, 0, tec, &error_info, interp.err_line, interp),
+                        None => error_options_dict(1, 0, &e, script, &error_info, interp.err_line, interp),
+                    }
                 } else if e.is_return() {
                     // return 信号：-level 1、-code = return 自身的码；
                     // 带 -errorcode 载荷时键序 errorcode 在前（tclsh
@@ -964,6 +986,50 @@ fn error_options_dict(
             "-code {} -level {} -errorcode {} -errorinfo {} -errorline {} -errorstack {}",
             code,
             level,
+            crate::value::tcl_quote(&error_code),
+            crate::value::tcl_quote(accumulated),
+            err_line,
+            crate::value::tcl_quote(&errorstack)
+        ),
+    };
+    Value::from_str(&body)
+}
+
+/// 同 [`error_options_dict`]，但 -errorcode 直接取抬升点解析值。
+fn error_options_dict_with_ec(
+    code: i64,
+    level: i64,
+    error_code: String,
+    accumulated: &str,
+    err_line: usize,
+    interp: &Interp,
+) -> Value {
+    let errorstack = interp.error_stack_render();
+    let order = match &interp.err_inner {
+        Some(b) if b.starts_with("returnImm") => 0,
+        _ if error_code.starts_with("ARITH") => 2,
+        _ => 1,
+    };
+    let body = match order {
+        0 => format!(
+            "-code {} -level {} -errorstack {} -errorcode {} -errorinfo {} -errorline {}",
+            code, level,
+            crate::value::tcl_quote(&errorstack),
+            crate::value::tcl_quote(&error_code),
+            crate::value::tcl_quote(accumulated),
+            err_line
+        ),
+        1 => format!(
+            "-errorcode {} -code {} -level {} -errorstack {} -errorinfo {} -errorline {}",
+            crate::value::tcl_quote(&error_code),
+            code, level,
+            crate::value::tcl_quote(&errorstack),
+            crate::value::tcl_quote(accumulated),
+            err_line
+        ),
+        _ => format!(
+            "-code {} -level {} -errorcode {} -errorinfo {} -errorline {} -errorstack {}",
+            code, level,
             crate::value::tcl_quote(&error_code),
             crate::value::tcl_quote(accumulated),
             err_line,

@@ -456,7 +456,27 @@
 - **rtcl**：曾 `(procedure "o" line N)`。已修：oo_method_exit_tag
   （ActiveMethod 栈顶 + frame_depth+1==len 活性判据）挂 call.rs 出口
   帧发射点；三形状探针 SAME。
+- **2026-11-06 补**：对象自有方法（oo::objdefine）出口帧 =
+  `(object "::oo::ObjN" method "m" line N)`（原回落 procedure 帧）；
+  析构器帧为 tclsh 的 **objc=0 特殊帧**——`info level 0` 为空、错误
+  日志事件不记 CALL（frame_level0_empty 一次性旗标）。
 - **严重度**：已关闭。
+
+### D-41a 对象自有方法 vs 对象 mixin 的解析序 [FIXED 2026-11-06]
+- **Tcl 8.6.17 实测**：`oo::objdefine o method m` 与
+  `oo::objdefine o mixin P`（P 也有 m）并存时，**mixin 的 m 先跑**，
+  其 `next` 落到对象自有方法、再类链（`$o m` → MIXIN OWN CLASS）；
+  类对象（`oo::objdefine Q method m` + `oo::objdefine Q mixin R`）同序
+  （`Q m` → RMIXIN QOWN）。`my` 分派未命中时的 must-be 清单是**私有
+  视图**：链上全部方法名（含 unexport/对象级 hidden）+ 核心私有
+  （`<cloned>`/eval/variable/varname）+ 恒在的 `unknown`，字节序排序。
+- **rtcl**：build_chain/full_walk 原为"对象自有方法先于 mixin"；`my`
+  清单只列导出方法。已修（顺序对调；include_private 列表按私有视图）。
+- **复现**：`oo::class create K {method m {} {puts CLASS}}; set o [K new];
+  oo::objdefine $o method m {} {puts OWN; next};
+  oo::class create P {method m {} {puts MIXIN; next}};
+  oo::objdefine $o mixin P; $o m`
+- **严重度**：已关闭（语义序，不只是诊断面）。
 
 ### D-43 info 面与私有方法（打包）[大部分 FIXED 2026-11-05]
 - **Tcl 8.6**：① `info object isa *` 对缺失名返回 0；② subclasses

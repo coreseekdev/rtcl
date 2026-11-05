@@ -156,7 +156,12 @@ pub(crate) fn oo_method_exit_tag(interp: &Interp) -> Option<String> {
             "constructor" => format!("class \"{}\" constructor", c),
             m => format!("class \"{}\" method \"{}\"", c, m),
         }),
-        Owner::Object => None,
+        Owner::Object => Some(format!(
+            // 对象自有方法（oo::objdefine）：tclsh 出口帧用对象名——
+            // `(object "::oo::Obj12" method "m" line N)`。
+            "object \"{}\" method \"{}\"",
+            a.obj, a.method
+        )),
     }
 }
 
@@ -650,6 +655,14 @@ fn build_chain(interp: &Interp, key: &str, method: &str, include_private: bool) 
     let mut hidden: HashSet<String> = HashSet::new();
 
     if let Some(obj) = interp.oo.objects.get(key) {
+        // tclsh 8.6.17 解析序（实测钉形）：**对象 mixin 先于对象自有
+        // 方法**，再类链——`oo::objdefine o method m` 与 mixin 同名时
+        // mixin 的 m 先跑，其 `next` 落到对象自有方法（随后类链）。
+        for m in &obj.mixins {
+            for c in linearize(interp, m) {
+                push_class_entry(interp, &c, method, include_private, &mut hidden, &mut out);
+            }
+        }
         if let Some((_, def)) = obj.methods.iter().find(|(n, _)| n == method) {
             if def.exported || include_private {
                 out.push(ChainEntry {
@@ -657,11 +670,6 @@ fn build_chain(interp: &Interp, key: &str, method: &str, include_private: bool) 
                     owner: Owner::Object,
                     def: def.clone(),
                 });
-            }
-        }
-        for m in &obj.mixins {
-            for c in linearize(interp, m) {
-                push_class_entry(interp, &c, method, include_private, &mut hidden, &mut out);
             }
         }
         for c in linearize(interp, &obj.class) {
@@ -677,8 +685,13 @@ fn build_chain(interp: &Interp, key: &str, method: &str, include_private: bool) 
     }
 
     if let Some(cls) = interp.oo.classes.get(key) {
-        // The class as an object: its own per-object table, per-object
-        // mixins, then the metaclass chain.
+        // The class as an object: its per-object mixins first, then its
+        // own per-object table, then the metaclass chain（与实例同序）。
+        for m in &cls.obj_mixins {
+            for c in linearize(interp, m) {
+                push_class_entry(interp, &c, method, include_private, &mut hidden, &mut out);
+            }
+        }
         if let Some((_, def)) = cls.obj_methods.iter().find(|(n, _)| n == method) {
             if def.exported || include_private {
                 out.push(ChainEntry {
@@ -686,11 +699,6 @@ fn build_chain(interp: &Interp, key: &str, method: &str, include_private: bool) 
                     owner: Owner::Object,
                     def: def.clone(),
                 });
-            }
-        }
-        for m in &cls.obj_mixins {
-            for c in linearize(interp, m) {
-                push_class_entry(interp, &c, method, include_private, &mut hidden, &mut out);
             }
         }
         for c in linearize(interp, "::oo::class") {
@@ -734,6 +742,11 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
     }
 
     if let Some(obj) = interp.oo.objects.get(key) {
+        for m in &obj.mixins {
+            for c in linearize(interp, m) {
+                take_class!(c);
+            }
+        }
         for (name, def) in &obj.methods {
             if !out.iter().any(|(n, _)| n == name) {
                 out.push((name.clone(), ChainEntry {
@@ -741,11 +754,6 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
                     owner: Owner::Object,
                     def: def.clone(),
                 }));
-            }
-        }
-        for m in &obj.mixins {
-            for c in linearize(interp, m) {
-                take_class!(c);
             }
         }
         for c in linearize(interp, &obj.class) {
@@ -761,6 +769,11 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
     }
 
     if let Some(cls) = interp.oo.classes.get(key) {
+        for m in &cls.obj_mixins {
+            for c in linearize(interp, m) {
+                take_class!(c);
+            }
+        }
         for (name, def) in &cls.obj_methods {
             if !out.iter().any(|(n, _)| n == name) {
                 out.push((name.clone(), ChainEntry {
@@ -768,11 +781,6 @@ fn full_walk(interp: &Interp, key: &str) -> Vec<(String, ChainEntry)> {
                     owner: Owner::Object,
                     def: def.clone(),
                 }));
-            }
-        }
-        for m in &cls.obj_mixins {
-            for c in linearize(interp, m) {
-                take_class!(c);
             }
         }
         for c in linearize(interp, "::oo::class") {
@@ -849,7 +857,19 @@ fn render_or_list(items: &[String]) -> String {
 
 /// `unknown method "x": must be ...` — exported chain names + `destroy`,
 /// with `new` suppressed on `::oo::class` itself.
-fn unknown_method_error(interp: &Interp, key: &str, typed: &str, method: &str) -> Error {
+///
+/// `include_private`（`my` 分派）：清单是**私有视图**——链上全部方法名
+/// （含 unexport / 对象级 hidden）、核心私有方法（`<cloned>`/`eval`/
+/// `variable`/`varname`）与始终存在的 `unknown`（tclsh 8.6.17 实测：
+/// `<cloned>, a, destroy, eval, own, unknown, variable or varname`，
+/// 字节序排序）；外部调用只见导出方法 + destroy。
+fn unknown_method_error(
+    interp: &Interp,
+    key: &str,
+    typed: &str,
+    method: &str,
+    include_private: bool,
+) -> Error {
     let hidden: Vec<String> = interp
         .oo
         .objects
@@ -860,17 +880,19 @@ fn unknown_method_error(interp: &Interp, key: &str, typed: &str, method: &str) -
     let fw: Vec<String> = walk.iter().map(|(n, _)| n.clone()).collect();
     let mut names: Vec<String> = Vec::new();
     for (name, entry) in &walk {
-        if entry.def.exported
-            && !hidden.contains(name)
-            && !names.contains(name)
-        {
+        let visible = entry.def.exported && !hidden.contains(name);
+        if (visible || include_private) && !names.contains(name) {
             names.push(name.clone());
         }
     }
-    // destroy 的可见性与 full_walk 一致——类链 hidden（unexport
-    // destroy）已在 walk 里排除，这里不能凭对象 hidden 无条件重推
-    // （否则全隐藏判定永不触发——实测回归点）。
-    if fw.iter().any(|n| n == "destroy") {
+    if include_private {
+        // 核心私有方法与全部链名已由上面的 include_private 分支收齐；
+        // `unknown` 无实体也进清单（`my` 的转调兜底名）。
+        names.push("unknown".to_string());
+    } else if fw.iter().any(|n| n == "destroy") {
+        // destroy 的可见性与 full_walk 一致——类链 hidden（unexport
+        // destroy）已在 walk 里排除，这里不能凭对象 hidden 无条件重推
+        // （否则全隐藏判定永不触发——实测回归点）。
         names.push("destroy".to_string());
     }
     if key == "::oo::class" {
@@ -1271,7 +1293,7 @@ fn invoke_method(
     if !include_private {
         if let Some(o) = interp.oo.objects.get(key.as_ref()) {
             if o.hidden.iter().any(|h| h == method) {
-                return Err(unknown_method_error(interp, key, typed, method));
+                return Err(unknown_method_error(interp, key, typed, method, include_private));
             }
         }
     }
@@ -1348,7 +1370,7 @@ fn invoke_method(
                 false,
             );
         }
-        return Err(unknown_method_error(interp, key, typed, method));
+        return Err(unknown_method_error(interp, key, typed, method, include_private));
     }
     if include_private {
         let idx = (interp.oo.my_cache_next & 1) as usize;

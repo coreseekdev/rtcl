@@ -253,12 +253,27 @@
     逗号 vs 逗号列表）——逐字对齐。
   * 修 clock scan 带时刻 ISO 形的既有 bug（小时字段错读 4 字符，
     `{YYYY-MM-DD HH:MM:SS}` 一律 syntax error）。
+  * **clock scan -format（strptime 面）**：%Y（恰 4 位）/%y（1-2 位，
+    窗口 00-37→20xx、38-99→19xx）/%m/%d/%e/%H/%I/%M/%S/%j/%b/%h/%B/
+    %p/%a/%A/%z/%Z/%s/%%/%n/%t + 字面与空白匹配；字段合成规则按
+    tclsh 8.6.17 实测：年只在**月+日**（或 %j）同时出现时生效，日可
+    单独生效，单独年/月忽略；时间只有 %H/%I 出现才整体生效；格式
+    缺席的日期字段取 -base、时间默认 0；输入两端多余空白忽略、格式
+    内空白须有对应输入空白；日期归一化（Feb 30 → Mar 1、13 月 → 次年
+    1 月）；mismatch = `input string does not match supplied format`
+    + CLOCK badInputString；%z 支持 +HHMM/+HH:MM 并回推。
+  * **儒略历/格里历切换**（tclsh 8.6.17 实测：1582-10-15 切换，JDN
+    2299161；1752 前后无跳变）：scan/format/add 的日期换算走
+    jdn_from_civil/civil_from_jdn（<切换点用儒略公式与儒略闰年），
+    `0001-01-01` → -62135769600、1582-10-04 与 1752 日期逐字一致。
 - **复现**：`puts [clock format 0]; puts [clock scan 2000-01-01];
   puts [clock add 0 1 month]`
 - **严重度**：已关闭（32/37 matching-deep；15 条 clock 探针全 SAME）。
   残差：自由格式 scan（`next Friday`/`5 minutes ago`/"x"→now 等
-  tclClock.c 相对语法）；clock 错误的 errorInfo 含 tclsh Tcl 实现
-  （::tcl::clock::add 等）的 proc 帧；-locale 只接受不参与格式。
+  tclClock.c 相对语法）；scan 的 %Z 缩写只消费不查表（tclsh 按
+  zoneinfo 名查 EST/CET 等并应用偏移，未知缩写报
+  `time zone "xyz" not found`）；clock 错误的 errorInfo 含 tclsh Tcl
+  实现（::tcl::clock::add 等）的 proc 帧；-locale 只接受不参与格式。
 
 ### D-26 glob：Rust glob crate 语义 + 排序（spec matching [D-25]）[FIXED 2026-11-05]
 - **Tcl 8.6**：`**` 只是两个 `*`（无递归）、`{a,b}` 非交替、前导点不

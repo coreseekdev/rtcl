@@ -211,6 +211,8 @@ fn clock_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let input = args[2].as_str().to_string();
     let mut use_gmt = false;
     let mut zone: Option<String> = None;
+    let mut format: Option<String> = None;
+    let mut base: Option<i64> = None;
     let mut i = 3;
     while i < args.len() {
         let w = args[i].as_str();
@@ -227,13 +229,17 @@ fn clock_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         })?;
                     }
                     "-timezone" => zone = Some(parse_zone(interp, val)?),
+                    "-format" => format = Some(val.to_string()),
                     "-base" => {
                         // tclsh 的 scan -base 坏值不带错误码（ec=NONE）。
-                        if Value::from_str(val).as_int().is_none() {
-                            return Err(Error::Msg(format!(
-                                "expected integer but got \"{}\"",
-                                val
-                            )));
+                        match Value::from_str(val).as_int() {
+                            Some(b) => base = Some(b),
+                            None => {
+                                return Err(Error::Msg(format!(
+                                    "expected integer but got \"{}\"",
+                                    val
+                                )))
+                            }
                         }
                     }
                     _ => {}
@@ -255,11 +261,325 @@ fn clock_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::Msg("cannot use -gmt and -timezone in same call".to_string()));
     }
 
+    // 显式 -format：按格式解析（tclsh 的 strptime 面）。
+    if let Some(fmt) = format {
+        let base_epoch = base.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        });
+        let parsed = with_zone(zone.as_deref(), || {
+            scan_with_format(&input, &fmt, base_epoch, use_gmt)
+        });
+        return match parsed {
+            Some(epoch) => Ok(Value::from_int(epoch)),
+            None => {
+                set_error_code(interp, "CLOCK badInputString");
+                Err(Error::Msg(
+                    "input string does not match supplied format".to_string(),
+                ))
+            }
+        };
+    }
+
     // 纯整数：按 epoch 秒直通（tclsh 同）。
     if let Some(n) = args[2].as_int() {
         return Ok(Value::from_int(n));
     }
     with_zone(zone.as_deref(), || scan_iso(&input, use_gmt))
+}
+
+/// 按 `-format` 解析（strptime 面的 Tcl 语义，2026-11-06 实测）：
+/// * 数字字段跳过前导空白、1-2 位（%Y 恰 4 位、%j 1-3 位）；
+/// * 格式里的空白要求输入至少一个空白并吞掉整段（格式化串尾随空格
+///   须有对应输入空白）；
+/// * 格式中缺席的日期字段从 `-base` 取，缺席的时间字段默认 0；
+/// * %y 窗口：00-37→20xx、38-99→19xx（Tcl 的 32 位 time_t 安全窗）；
+/// * %B/%b 收全称与缩写、大小写不敏感；%a/%A 解析但忽略（不做一致性
+///   校验）；%p 参与 12 小时换算；%z 支持 +HHMM/+HH:MM 并回推；
+///   %Z 消费字母并忽略；%s 直接取 epoch；%% 字面。
+/// * 日期归一化交给 mktime / days_from_civil（Feb 30 → Mar 1、13 月
+///   → 次年 1 月，tclsh 同）。
+fn scan_with_format(input: &str, fmt: &str, base: i64, gmt: bool) -> Option<i64> {
+    #[derive(Default)]
+    struct F {
+        y: Option<i64>,
+        y2: Option<i64>,
+        mo: Option<i64>,
+        d: Option<i64>,
+        yd: Option<i64>,
+        h: Option<i64>,
+        mi: Option<i64>,
+        se: Option<i64>,
+        pm: Option<bool>,
+        epoch: Option<i64>,
+        tz: Option<i64>,
+    }
+    let chars: Vec<char> = input.chars().collect();
+    let mut pos = 0usize;
+    let mut f = F::default();
+    // tclsh：输入两端的多余空白忽略（格式内空白仍须有输入空白对应）。
+    while pos < chars.len() && chars[pos].is_whitespace() {
+        pos += 1;
+    }
+    let fmt_chars: Vec<char> = fmt.chars().collect();
+    let mut fi = 0usize;
+
+    let skip_ws = |pos: &mut usize| {
+        while *pos < chars.len() && chars[*pos].is_whitespace() {
+            *pos += 1;
+        }
+    };
+    let digits = |pos: &mut usize, min: usize, max: usize| -> Option<i64> {
+        let start = *pos;
+        while *pos < chars.len() && *pos - start < max && chars[*pos].is_ascii_digit() {
+            *pos += 1;
+        }
+        if *pos - start < min {
+            return None;
+        }
+        chars[start..*pos].iter().collect::<String>().parse::<i64>().ok()
+    };
+    let word = |pos: &mut usize| -> Option<String> {
+        let start = *pos;
+        while *pos < chars.len() && chars[*pos].is_ascii_alphabetic() {
+            *pos += 1;
+        }
+        if *pos == start {
+            return None;
+        }
+        Some(chars[start..*pos].iter().collect::<String>().to_ascii_lowercase())
+    };
+
+    while fi < fmt_chars.len() {
+        let c = fmt_chars[fi];
+        fi += 1;
+        if c == '%' {
+            if fi >= fmt_chars.len() {
+                return None;
+            }
+            let spec = fmt_chars[fi];
+            fi += 1;
+            match spec {
+                'Y' => {
+                    skip_ws(&mut pos);
+                    f.y = Some(digits(&mut pos, 4, 4)?);
+                }
+                'y' => {
+                    skip_ws(&mut pos);
+                    f.y2 = Some(digits(&mut pos, 1, 2)?);
+                }
+                'm' => {
+                    skip_ws(&mut pos);
+                    f.mo = Some(digits(&mut pos, 1, 2)?);
+                }
+                'd' | 'e' => {
+                    skip_ws(&mut pos);
+                    f.d = Some(digits(&mut pos, 1, 2)?);
+                }
+                'H' => {
+                    skip_ws(&mut pos);
+                    f.h = Some(digits(&mut pos, 1, 2)?);
+                }
+                'I' => {
+                    skip_ws(&mut pos);
+                    f.h = Some(digits(&mut pos, 1, 2)?);
+                }
+                'M' => {
+                    skip_ws(&mut pos);
+                    f.mi = Some(digits(&mut pos, 1, 2)?);
+                }
+                'S' => {
+                    skip_ws(&mut pos);
+                    f.se = Some(digits(&mut pos, 1, 2)?);
+                }
+                'j' => {
+                    skip_ws(&mut pos);
+                    f.yd = Some(digits(&mut pos, 1, 3)?);
+                }
+                'p' => {
+                    skip_ws(&mut pos);
+                    let w = word(&mut pos)?;
+                    f.pm = Some(match w.as_str() {
+                        "am" => false,
+                        "pm" => true,
+                        _ => return None,
+                    });
+                }
+                'b' | 'h' | 'B' => {
+                    skip_ws(&mut pos);
+                    let w = word(&mut pos)?;
+                    f.mo = Some(match_month_name(&w)?);
+                }
+                'a' | 'A' => {
+                    skip_ws(&mut pos);
+                    let w = word(&mut pos)?;
+                    if !WEEKDAY_NAMES.iter().any(|n| n.starts_with(&w)) {
+                        return None;
+                    }
+                }
+                's' => {
+                    skip_ws(&mut pos);
+                    let neg = pos < chars.len() && chars[pos] == '-';
+                    if neg {
+                        pos += 1;
+                    }
+                    let v = digits(&mut pos, 1, 18)?;
+                    f.epoch = Some(if neg { -v } else { v });
+                }
+                'z' => {
+                    skip_ws(&mut pos);
+                    let sign = match chars.get(pos) {
+                        Some('+') => 1i64,
+                        Some('-') => -1,
+                        _ => return None,
+                    };
+                    pos += 1;
+                    let hh = digits(&mut pos, 2, 2)?;
+                    if chars.get(pos) == Some(&':') {
+                        pos += 1;
+                    }
+                    let mm = digits(&mut pos, 2, 2)?;
+                    f.tz = Some(sign * (hh * 3600 + mm * 60));
+                }
+                'Z' => {
+                    skip_ws(&mut pos);
+                    let _ = word(&mut pos)?;
+                }
+                '%' => {
+                    if chars.get(pos) != Some(&'%') {
+                        return None;
+                    }
+                    pos += 1;
+                }
+                'n' => {
+                    if chars.get(pos) != Some(&'\n') {
+                        return None;
+                    }
+                    pos += 1;
+                }
+                't' => {
+                    if chars.get(pos) != Some(&'\t') {
+                        return None;
+                    }
+                    pos += 1;
+                }
+                _ => return None,
+            }
+        } else if c.is_whitespace() {
+            // 格式空白：输入须有至少一个空白，吞掉整段。
+            if pos >= chars.len() || !chars[pos].is_whitespace() {
+                return None;
+            }
+            skip_ws(&mut pos);
+        } else {
+            if chars.get(pos) != Some(&c) {
+                return None;
+            }
+            pos += 1;
+        }
+    }
+    // 尾随空白忽略；其余尾随文本 → mismatch（tclsh 同）。
+    while pos < chars.len() && chars[pos].is_whitespace() {
+        pos += 1;
+    }
+    if pos != chars.len() {
+        return None;
+    }
+    if let Some(e) = f.epoch {
+        return Some(e);
+    }
+
+    // -base 的历法分解（年/月/日兜底）。
+    let Some((by, bmo, bd, _, _, _)) = clock_civil(base, gmt) else {
+        return None;
+    };
+    let has_y = f.y.or_else(|| f.y2.map(map_two_digit_year));
+
+    // tclsh 8.6.17 实测的字段合成规则：
+    // * 年只有与**月+日**（或 %j）同时出现才生效；单给年/月都忽略；
+    // * 日可单独生效（年/月取 base）；
+    // * %j 单独生效（年取 base）；
+    // * 时间字段只有 %H/%I 出现才整体生效（单给 %M/%S 忽略）。
+    let (yy, mo, dd) = if let (Some(y), Some(yd)) = (has_y, f.yd) {
+        let (a, b, c) = civil_from_jdn(jdn_from_civil(y, 1, 1) + yd - 1);
+        (a, b, c)
+    } else if f.mo.is_some() && f.d.is_some() {
+        (has_y.unwrap_or(by), f.mo.unwrap(), f.d.unwrap())
+    } else if let Some(d) = f.d {
+        (by, bmo, d)
+    } else if let Some(yd) = f.yd {
+        let (a, b, c) = civil_from_jdn(jdn_from_civil(by, 1, 1) + yd - 1);
+        let _ = a;
+        (by, b, c)
+    } else {
+        (by, bmo, bd)
+    };
+
+    let (mut hour, mut minute, mut second) = (0i64, 0i64, 0i64);
+    if f.h.is_some() {
+        hour = f.h.unwrap();
+        if let Some(pm) = f.pm {
+            // 12 小时制换算（%I 后接 %p）：12 AM → 0，12 PM → 12。
+            let h12 = hour % 12;
+            hour = if pm { h12 + 12 } else { h12 };
+        }
+        minute = f.mi.unwrap_or(0);
+        second = f.se.unwrap_or(0);
+    }
+
+    let epoch = if let Some(off) = f.tz {
+        // %z：字段按 UTC 解释后减去偏移。
+        epoch_from_jdn(jdn_from_civil(yy, mo, dd), hour, minute, second) - off
+    } else {
+        clock_epoch(yy, mo, dd, hour, minute, second, gmt)
+    };
+    Some(epoch)
+}
+
+/// %y → 世纪：Tcl 的 32 位 time_t 安全窗（00-37 → 2000+，38-99 → 1900+）。
+fn map_two_digit_year(y: i64) -> i64 {
+    if y <= 37 {
+        2000 + y
+    } else {
+        1900 + y
+    }
+}
+
+const MONTH_NAMES: [&str; 12] = [
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+];
+
+const WEEKDAY_NAMES: [&str; 7] = [
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+];
+
+/// 月份名匹配：全称或缩写前缀（大小写不敏感，已 lower）。
+fn match_month_name(w: &str) -> Option<i64> {
+    for (i, name) in MONTH_NAMES.iter().enumerate() {
+        if name.starts_with(w) {
+            return Some(i as i64 + 1);
+        }
+    }
+    None
 }
 
 /// ISO 形（YYYY-MM-DD[ T]HH:MM:SS）——本地时区（-gmt 时 UTC），两遍法
@@ -291,8 +611,7 @@ fn scan_iso(input: &str, use_gmt: bool) -> Result<Value> {
         Some((y, mo, d, h, mi, se))
     };
     if let Some((y, mo, d, h, mi, se)) = parse_iso(input) {
-        let days = days_from_civil(y, mo, d);
-        let utc_guess = days * 86400 + h * 3600 + mi * 60 + se;
+        let utc_guess = epoch_from_jdn(jdn_from_civil(y, mo, d), h, mi, se);
         let epoch = if use_gmt {
             utc_guess
         } else {
@@ -440,34 +759,35 @@ fn apply_add(mut epoch: i64, pairs: &[(i64, String)], gmt: bool) -> i64 {
                     // UTC 无 DST：固定秒数（tclsh 对 -gmt 同）。
                     epoch = epoch.saturating_add(days.saturating_mul(86400));
                 } else {
-                    let Some((y, mo, d, h, mi, s)) = local_civil(epoch) else { continue };
-                    let (ny, nm, nd) = civil_from_days(days_from_civil(y, mo, d) + days);
-                    epoch = local_from_civil(ny, nm, nd, h, mi, s);
+                    let Some((y, mo, d, h, mi, s)) = clock_civil(epoch, false) else { continue };
+                    let (ny, nm, nd) = civil_from_jdn(jdn_from_civil(y, mo, d) + days);
+                    epoch = clock_epoch(ny, nm, nd, h, mi, s, false);
                 }
             }
             _ => {
                 // 年 / 月：日历月运算 + 月末夹取（tclsh：Jan 31 +1m =
                 // Feb 29、Feb 29 +1y = Feb 28）。
                 let months = if unit.starts_with("year") { n.saturating_mul(12) } else { *n };
-                let (y, mo, d, h, mi, s) = if gmt {
-                    let (y, mo, d) = civil_from_days(epoch.div_euclid(86400));
-                    let secs = epoch.rem_euclid(86400);
-                    (y, mo, d, secs / 3600, (secs % 3600) / 60, secs % 60)
-                } else {
-                    match local_civil(epoch) {
-                        Some(t) => t,
-                        None => continue,
-                    }
+                let (y, mo, d, h, mi, s) = match clock_civil(epoch, gmt) {
+                    Some(t) => t,
+                    None => continue,
                 };
                 let total = y.saturating_mul(12).saturating_add(mo - 1).saturating_add(months);
                 let ny = total.div_euclid(12);
                 let nm = total.rem_euclid(12) + 1;
-                let nd = d.min(days_in_month(ny, nm));
-                epoch = if gmt {
-                    days_from_civil(ny, nm, nd) * 86400 + h * 3600 + mi * 60 + s
+                // 月末夹取：儒略历区（<1582-10-15）用儒略闰年规则。
+                let calendar_jdn = jdn_from_civil(ny, nm, 1);
+                let dim = if nm == 2 {
+                    if calendar_jdn < GREGORIAN_CHANGE_JDN {
+                        days_in_month_julian(ny, 2)
+                    } else {
+                        days_in_month(ny, 2)
+                    }
                 } else {
-                    local_from_civil(ny, nm, nd, h, mi, s)
+                    days_in_month(ny, nm)
                 };
+                let nd = d.min(dim);
+                epoch = clock_epoch(ny, nm, nd, h, mi, s, gmt);
             }
         }
     }
@@ -610,6 +930,105 @@ fn days_in_month(y: i64, m: i64) -> i64 {
     }
 }
 
+// ── 儒略历/格里历切换（tclsh 8.6.17 实测：1582-10-15 切换）──────────────
+
+/// JDN of the Posix epoch day (1970-01-01).
+const JDN_POSIX_EPOCH: i64 = 2440588;
+/// 1582-10-15（格里历）的 JDN——此日之前用儒略历，之后用格里历
+/// （tclsh 8.6.17 实测：1582-10-04 Julian = JDN 2299160，1582-10-15
+/// Gregorian = 2299161；1752 年前后无跳变）。
+const GREGORIAN_CHANGE_JDN: i64 = 2299161;
+
+/// 格里历 JDN（不处理切换）。
+fn gregorian_jdn(y: i64, m: i64, d: i64) -> i64 {
+    days_from_civil(y, m, d) + JDN_POSIX_EPOCH
+}
+
+/// 儒略历 JDN（Tcl `GetJulianDayFromEraYearMonthDay` 的 Julian 臂）。
+fn julian_jdn(y: i64, m: i64, d: i64) -> i64 {
+    let ym1 = y - 1;
+    let mut prior = 0i64;
+    for mm in 1..m {
+        prior += days_in_month_julian(y, mm);
+    }
+    1721424 - 1 + d + prior + 365 * ym1 + ym1.div_euclid(4)
+}
+
+fn days_in_month_julian(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if y.rem_euclid(4) == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 31,
+    }
+}
+
+/// 民用历 → JDN：先按格里历算，落在切换点之前改用儒略历（Tcl 语义）；
+/// 月份先按 Tcl 的方式归约（13 月 → 次年 1 月）。
+fn jdn_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let q = (m - 1).div_euclid(12);
+    let y = y + q;
+    let m = (m - 1).rem_euclid(12) + 1;
+    let greg = gregorian_jdn(y, m, d);
+    if greg < GREGORIAN_CHANGE_JDN {
+        julian_jdn(y, m, d)
+    } else {
+        greg
+    }
+}
+
+/// JDN → 民用历（切换点之前用儒略历逆式，之后格里历）。
+fn civil_from_jdn(jdn: i64) -> (i64, i64, i64) {
+    if jdn < GREGORIAN_CHANGE_JDN {
+        // Julian inverse（Richards）。
+        let c = jdn + 32082;
+        let d1 = (4 * c + 3) / 1461;
+        let e = c - 1461 * d1 / 4;
+        let m = (5 * e + 2) / 153;
+        let day = e - (153 * m + 2) / 5 + 1;
+        let month = m + 3 - 12 * (m / 10);
+        (d1 - 4800 + m / 10, month, day)
+    } else {
+        civil_from_days(jdn - JDN_POSIX_EPOCH)
+    }
+}
+
+fn epoch_from_jdn(jdn: i64, h: i64, mi: i64, s: i64) -> i64 {
+    (jdn - JDN_POSIX_EPOCH) * 86400 + h * 3600 + mi * 60 + s
+}
+
+/// epoch 的日历分解（tclsh 的儒略/格里历切换；gmt=纯 UTC）。
+fn clock_civil(epoch: i64, gmt: bool) -> Option<(i64, i64, i64, i64, i64, i64)> {
+    let local = if gmt {
+        epoch
+    } else {
+        epoch + local_offset_name(epoch)?.0 as i64
+    };
+    let days = local.div_euclid(86400);
+    let secs = local.rem_euclid(86400);
+    let (y, mo, d) = civil_from_jdn(days + JDN_POSIX_EPOCH);
+    Some((y, mo, d, secs / 3600, (secs % 3600) / 60, secs % 60))
+}
+
+/// 日历字段 → epoch（现代日期走 mktime 以保留 DST 消解；古日期用
+/// JDN + 该时刻的本地偏移）。
+fn clock_epoch(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64, gmt: bool) -> i64 {
+    if gmt {
+        epoch_from_jdn(jdn_from_civil(y, mo, d), h, mi, s)
+    } else if y >= 1583 {
+        local_from_civil(y, mo, d, h, mi, s)
+    } else {
+        let utc = epoch_from_jdn(jdn_from_civil(y, mo, d), h, mi, s);
+        utc - local_offset_name(utc).map(|o| o.0 as i64).unwrap_or(0)
+    }
+}
+
 /// 当前（调用方已设时区）的历法分解。
 #[cfg(unix)]
 fn local_civil(epoch: i64) -> Option<(i64, i64, i64, i64, i64, i64)> {
@@ -707,26 +1126,23 @@ fn epoch_to_datetime(epoch: i64, _gmt: bool) -> DateTime {
     let minute = (day_secs % 3600) / 60;
     let second = day_secs % 60;
 
-    // Days since 0000-03-01 (March epoch trick)
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097) as u32; // day of era
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if m <= 2 { y + 1 } else { y };
+    // D-25：儒略历/格里历切换（tclsh 8.6.17：<1582-10-15 用儒略历）。
+    let jdn = days + JDN_POSIX_EPOCH;
+    let (year, m, d) = civil_from_jdn(jdn);
+    let julian = jdn < GREGORIAN_CHANGE_JDN;
 
-    // Day of week: 0=Sunday
-    let wday = ((days + 4).rem_euclid(7)) as u32; // 1970-01-01 is Thursday (4)
+    // Day of week: 0=Sunday（JDN 连续，切换无关）。
+    let wday = ((jdn + 1).rem_euclid(7)) as u32;
 
-    // Day of year
-    let is_leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    // Day of year（闰年规则随历法）。
+    let leap = if julian {
+        year.rem_euclid(4) == 0
+    } else {
+        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    };
     let month_days: [u32; 12] = [
         31,
-        if is_leap { 29 } else { 28 },
+        if leap { 29 } else { 28 },
         31,
         30,
         31,
@@ -738,20 +1154,20 @@ fn epoch_to_datetime(epoch: i64, _gmt: bool) -> DateTime {
         30,
         31,
     ];
-    let mut yday = d;
+    let mut yday = d as i64;
     for &md in &month_days[..(m as usize - 1)] {
-        yday += md;
+        yday += md as i64;
     }
 
     DateTime {
         year,
-        month: m,
-        day: d,
+        month: m as u32,
+        day: d as u32,
         hour,
         minute,
         second,
         wday,
-        yday: yday - 1,
+        yday: yday as u32 - 1,
     }
 }
 

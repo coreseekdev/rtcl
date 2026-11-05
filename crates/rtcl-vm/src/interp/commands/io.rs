@@ -1450,6 +1450,7 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut nocomplain = false;
     let mut directory: Option<String> = None;
     let mut types: Option<String> = None;
+    let mut tails = false;
 
     while i < args.len() && args[i].as_str().starts_with('-') {
         match args[i].as_str() {
@@ -1462,6 +1463,7 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     return Err(Error::wrong_args("glob", 2, args.len()));
                 }
             }
+            "-tails" => { tails = true; i += 1; }
             "-types" | "-type" => {
                 if i + 1 < args.len() {
                     types = Some(args[i + 1].as_str().to_ascii_lowercase());
@@ -1475,43 +1477,111 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
+    // D-26：Tcl glob 语义（弃 glob crate——其 ** 递归 / {a,b} 交替 /
+    // 前导点匹配 / 排序输出全部与 tclsh 相悖）：
+    //   * 模式段用 string match 语义（* ? [...]）
+    //   * `*`/`?`/`[...]` 不匹配前导点（除非模式段字面以 . 开头）
+    //   * 目录遍历按 read_dir 序（tclsh 不排序——同文件系统上与
+    //     readdir 输出字节对齐）
+    //   * 无 ** 递归、无 {a,b} 交替（字面字符）
+    fn seg_match(pattern: &str, name: &str) -> bool {
+        if name.starts_with('.') && !pattern.starts_with('.') {
+            return false;
+        }
+        crate::interp::util::glob_match(pattern, name)
+    }
+
+    fn join(dir: &str, seg: &str) -> String {
+        if dir == "/" {
+            format!("/{}", seg)
+        } else if dir.is_empty() {
+            seg.to_string()
+        } else {
+            format!("{}/{}", dir, seg)
+        }
+    }
+
+    fn collect_entry(
+        path: &str,
+        rest: &[&str],
+        types: &Option<String>,
+        out: &mut Vec<String>,
+    ) {
+        if rest.is_empty() {
+            let is_dir = std::path::Path::new(path).is_dir();
+            if let Some(ty) = types {
+                let want_dir = ty.contains('d');
+                let want_file = ty.contains('f');
+                if want_dir && !is_dir {
+                    return;
+                }
+                if want_file && is_dir {
+                    return;
+                }
+            }
+            out.push(path.to_string());
+            return;
+        }
+        if std::path::Path::new(path).is_dir() {
+            walk_dir(path, rest, types, out);
+        }
+    }
+
+    fn walk_dir(
+        dir: &str,
+        segs: &[&str],
+        types: &Option<String>,
+        out: &mut Vec<String>,
+    ) {
+        let (seg, rest) = (segs[0], &segs[1..]);
+        let literal = !seg.contains('*') && !seg.contains('?') && !seg.contains('[');
+        if literal {
+            let path = join(dir, seg);
+            if seg_match(seg, seg) && std::path::Path::new(&path).exists() {
+                collect_entry(&path, rest, types, out);
+            }
+            return;
+        }
+        let read_dir_path = if dir.is_empty() { ".".to_string() } else { dir.to_string() };
+        let rd = match std::fs::read_dir(&read_dir_path) {
+            Ok(rd) => rd,
+            Err(_) => return,
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !seg_match(seg, &name) {
+                continue;
+            }
+            let path = join(dir, &name);
+            collect_entry(&path, rest, types, out);
+        }
+    }
+
     let mut results: Vec<Value> = Vec::new();
     for j in i..args.len() {
         let raw_pattern = args[j].as_str();
 
-        // Build the full pattern: prepend -directory when given.
         let full_pattern = match &directory {
             Some(dir) => format!("{}/{}", dir, raw_pattern),
             None => raw_pattern.to_string(),
         };
-
-        // Delegate to the `glob` crate which handles `**` recursion,
-        // `[...]` character classes, `{a,b}` alternation, etc.
-        let paths = glob::glob(&full_pattern).map_err(|e| {
-            Error::runtime(
-                format!("bad glob pattern \"{}\": {}", full_pattern, e),
-                crate::error::ErrorCode::Generic,
-            )
-        })?;
-
-        for entry in paths {
-            let path = entry.map_err(|e| {
-                Error::runtime(
-                    format!("glob: {}", e),
-                    crate::error::ErrorCode::Io,
-                )
-            })?;
-
-            // Apply -types filter if requested.
-            if let Some(ref ty) = types {
-                let dominated = ty.contains('d') || ty.contains("directory");
-                let file_only = ty.contains('f') || (ty.contains("file") && !ty.contains("directory"));
-                if dominated && !path.is_dir() { continue; }
-                if file_only && !path.is_file() { continue; }
-            }
-
-            // Normalise to forward slashes for cross-platform consistency.
-            let s = path.to_string_lossy().replace('\\', "/");
+        let segs: Vec<&str> = full_pattern.split('/').filter(|s| !s.is_empty()).collect();
+        if segs.is_empty() {
+            continue;
+        }
+        let absolute = full_pattern.starts_with('/');
+        let mut matched: Vec<String> = Vec::new();
+        if absolute {
+            walk_dir("/", &segs, &types, &mut matched);
+        } else {
+            walk_dir("", &segs, &types, &mut matched);
+        }
+        for p in matched {
+            let s = if tails {
+                p.rsplit('/').next().unwrap_or(&p).to_string()
+            } else {
+                p
+            };
             results.push(Value::from_str(&s));
         }
     }
@@ -2101,5 +2171,114 @@ mod tests {
         let result = interp.eval(&format!("glob -directory {{{}}} -- *.nonexistent", dstr));
         assert!(result.is_err());
         cleanup(&dir);
+    }
+}
+
+
+// ── encoding 命令（D-29）────────────────────────────────────────────
+
+/// rtcl 支持的编码集（tclsh 8.6 有 90+——子集分歧记台账）。
+pub(crate) const ENCODINGS: &[&str] = &[
+    "ascii", "binary", "identity", "iso8859-1", "utf-8",
+];
+
+pub(crate) fn encoding_known(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ENCODINGS.iter().any(|e| *e == n)
+}
+
+/// 字节串 ↔ 字符串的双向转换（rtcl 的 String 值以 char 承载字节）。
+fn enc_decode(name: &str, data: &str) -> String {
+    match name {
+        "utf-8" | "identity" => data.to_string(),
+        "ascii" => data.chars().map(|c| {
+            if (c as u32) < 128 { c } else { '?' }
+        }).collect(),
+        // iso8859-1 / binary：char ↔ 字节直映（cp1252 差异记台账）。
+        _ => data.chars().map(|c| {
+            let u = c as u32;
+            if u < 256 { c } else { '?' }
+        }).collect(),
+    }
+}
+
+fn enc_encode(name: &str, text: &str) -> String {
+    match name {
+        "utf-8" | "identity" => text.to_string(),
+        "ascii" => text.chars().map(|c| {
+            if (c as u32) < 128 { c } else { '?' }
+        }).collect(),
+        _ => text.chars().map(|c| {
+            let u = c as u32;
+            if u < 256 { c } else { '?' }
+        }).collect(),
+    }
+}
+
+pub fn cmd_encoding(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::wrong_args_with_usage(
+            "encoding", 2, args.len(),
+            "option ?arg ...?",
+        ));
+    }
+    let resolve = |w: &str| -> Result<&'static str> {
+        const SUBS: &[&str] = &["convertfrom", "convertto", "dirs", "names", "system"];
+        let hits: Vec<&str> = SUBS.iter().filter(|s| s.starts_with(w)).copied().collect();
+        match hits.len() {
+            1 => Ok(hits[0]),
+            _ => {
+                let joined = match SUBS.len() {
+                    1 => SUBS[0].to_string(),
+                    2 => format!("{} or {}", SUBS[0], SUBS[1]),
+                    _ => format!(
+                        "{}, or {}",
+                        SUBS[..SUBS.len() - 1].join(", "),
+                        SUBS[SUBS.len() - 1]
+                    ),
+                };
+                Err(Error::Msg(format!(
+                    "unknown or ambiguous subcommand \"{}\": must be {}",
+                    w,
+                    joined
+                )))
+            }
+        }
+    };
+    match resolve(args[1].as_str())? {
+        "names" => Ok(Value::from_list(
+            &ENCODINGS.iter().map(|e| Value::from_str(e)).collect::<Vec<_>>(),
+        )),
+        "system" => {
+            if args.len() == 3 {
+                let name = args[2].as_str();
+                if !encoding_known(name) {
+                    return Err(Error::Msg(format!("unknown encoding \"{}\"", name)));
+                }
+                return Ok(Value::empty());
+            }
+            Ok(Value::from_str("utf-8"))
+        }
+        "convertfrom" | "convertto" => {
+            if args.len() < 3 || args.len() > 4 {
+                return Err(Error::wrong_args_with_usage(
+                    if args[1].as_str().starts_with("conv") { "encoding convertfrom" } else { "encoding convertto" },
+                    3, args.len(),
+                    "encodingName data",
+                ));
+            }
+            let name = args[2].as_str().to_ascii_lowercase();
+            if !encoding_known(&name) {
+                return Err(Error::Msg(format!("unknown encoding \"{}\"", name)));
+            }
+            let data = if args.len() == 4 { args[3].as_str() } else { "" };
+            Ok(Value::from_str(&if args[1].as_str().starts_with("conv") && args[1].as_str().ends_with("from") {
+                enc_decode(&name, data)
+            } else {
+                enc_encode(&name, data)
+            }))
+        }
+        "dirs" => Ok(Value::empty()),
+        _ => unreachable!(),
     }
 }

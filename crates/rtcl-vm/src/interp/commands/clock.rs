@@ -140,8 +140,75 @@ fn clock_scan(args: &[Value]) -> Result<Value> {
         return Ok(Value::from_int(n));
     }
 
+    // D-24：ISO 形（YYYY-MM-DD[ T]HH:MM:SS）——本地时区（-gmt 时 UTC），
+    // 两遍法解偏移（先猜 UTC 求该时刻的本地偏移，再回推）。
+    let input = args[2].as_str();
+    let mut use_gmt = false;
+    let mut i = 3;
+    while i < args.len() {
+        if args[i].as_str() == "-gmt" {
+            i += 1;
+            if i < args.len() {
+                use_gmt = matches!(args[i].as_str(), "1" | "true" | "yes");
+            }
+        }
+        i += 1;
+    }
+    let parse_iso = |s: &str| -> Option<(i64, i64, i64, i64, i64, i64)> {
+        let b: Vec<char> = s.chars().collect();
+        if b.len() < 10 {
+            return None;
+        }
+        let num = |a: usize, n: usize| -> Option<i64> {
+            s.get(a..a + n)?.parse::<i64>().ok()
+        };
+        if b[4] != '-' || b[7] != '-' {
+            return None;
+        }
+        let y = num(0, 4)?;
+        let mo = num(5, 2)?;
+        let d = num(8, 2)?;
+        let (h, mi, se) = if b.len() >= 19 && (b[10] == ' ' || b[10] == 'T') && b[13] == ':' && b[16] == ':' {
+            (num(11, 4)?, num(14, 2)?, num(17, 2)?)
+        } else if b.len() == 10 {
+            (0, 0, 0)
+        } else {
+            return None;
+        };
+        Some((y, mo, d, h, mi, se))
+    };
+    if let Some((y, mo, d, h, mi, se)) = parse_iso(input) {
+        // 天 → epoch 的反向民用历（同 formatter 的 March epoch 技巧）。
+        let days_from_civil = |y: i64, m: i64, dd: i64| -> i64 {
+            let y = if m <= 2 { y - 1 } else { y };
+            let era = y.div_euclid(400);
+            let yoe = y - era * 400;
+            let mp = if m > 2 { m - 3 } else { m + 9 };
+            let doy = (153 * mp + 2) / 5 + dd - 1;
+            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            era * 146097 + doe - 719468
+        };
+        let days = days_from_civil(y, mo as i64, d as i64);
+        let utc_guess = days * 86400 + h * 3600 + mi * 60 + se;
+        let epoch = if use_gmt {
+            utc_guess
+        } else {
+            match local_offset_name(utc_guess) {
+                Some((off, _)) => utc_guess - off as i64,
+                None => utc_guess,
+            }
+        };
+        return Ok(Value::from_int(epoch));
+    }
+
+    // tclsh 尾巴："syntax error (characters 0-7)"（0..len-1 的消费跨度）。
+    let last = input.chars().count().saturating_sub(1);
     Err(Error::runtime(
-        "clock scan: format parsing not yet implemented",
+        format!(
+            "unable to convert date-time string \"{}\": syntax error (characters 0-{})",
+            input,
+            last
+        ),
         crate::error::ErrorCode::InvalidOp,
     ))
 }
@@ -158,6 +225,39 @@ struct DateTime {
     second: u32,  // 0..=59
     wday: u32,    // 0=Sunday
     yday: u32,    // 0..=365
+}
+
+/// D-24：本地时区（unix = libc localtime_r：/etc/localtime + TZ 环境变
+/// 量 + DST/历史转换全部由 C 库承担）。返回 (偏移秒, 缩写)。
+#[cfg(unix)]
+fn local_offset_name(epoch: i64) -> Option<(i32, String)> {
+    let t = epoch as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::localtime_r(&t, &mut tm) };
+    if ok.is_null() {
+        return None;
+    }
+    let off = tm.tm_gmtoff as i32;
+    let name = if tm.tm_zone.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }
+            .to_string_lossy()
+            .to_string()
+    };
+    Some((off, name))
+}
+
+#[cfg(not(unix))]
+fn local_offset_name(_epoch: i64) -> Option<(i32, String)> {
+    None
+}
+
+/// gmtoff 秒 → "+HHMM"（%z 形状）。
+fn render_z(off: i32) -> String {
+    let sign = if off < 0 { '-' } else { '+' };
+    let a = off.unsigned_abs();
+    format!("{}{:02}{:02}", sign, a / 3600, (a % 3600) / 60)
 }
 
 fn epoch_to_datetime(epoch: i64, _gmt: bool) -> DateTime {
@@ -197,7 +297,17 @@ fn epoch_to_datetime(epoch: i64, _gmt: bool) -> DateTime {
 }
 
 fn format_timestamp(epoch: i64, fmt: &str, gmt: bool) -> String {
-    let dt = epoch_to_datetime(epoch, gmt);
+    // D-24：非 -gmt 时按本地时区偏移折算（历史 DST 由 localtime_r 的
+    // 转换表承担）；%Z 出缩写、%z 出 +HHMM（原 %z 未实现原样输出）。
+    let (eff_epoch, tz_name, tz_off) = if gmt {
+        (epoch, "GMT".to_string(), 0)
+    } else {
+        match local_offset_name(epoch) {
+            Some((off, name)) => (epoch + off as i64, name, off),
+            None => (epoch, "UTC".to_string(), 0),
+        }
+    };
+    let dt = epoch_to_datetime(eff_epoch, gmt);
     let mut result = String::new();
     let chars: Vec<char> = fmt.chars().collect();
     let mut i = 0;
@@ -232,7 +342,8 @@ fn format_timestamp(epoch: i64, fmt: &str, gmt: bool) -> String {
                 'B' => result.push_str(full_months[(dt.month - 1) as usize]),
                 'j' => result.push_str(&format!("{:03}", dt.yday + 1)),
                 'w' => result.push_str(&format!("{}", dt.wday)),
-                'Z' => result.push_str(if gmt { "GMT" } else { "UTC" }),
+                'Z' => result.push_str(&tz_name),
+                'z' => result.push_str(&render_z(tz_off)),
                 'n' => result.push('\n'),
                 't' => result.push('\t'),
                 '%' => result.push('%'),

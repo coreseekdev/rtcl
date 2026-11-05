@@ -603,6 +603,17 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         } else {
             None
         };
+        // D-29：-encoding 值在 cfg 借用前校验（tclsh：unknown encoding）。
+        if opt == "-encoding" && !super::io::encoding_known(val) {
+            super::list::set_error_code(
+                interp,
+                &format!("TCL LOOKUP ENCODING {}", val),
+            );
+            return Err(super::list::tcl_err(&format!(
+                "unknown encoding \"{}\"",
+                val
+            )));
+        }
 let cfg = interp.channels.config_mut(chan_id).unwrap();
         match opt {
             "-blocking" => {

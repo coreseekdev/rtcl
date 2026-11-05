@@ -18,7 +18,7 @@ mod eval;
 mod call;
 mod vm_bridge;
 mod vm_exec;
-mod util;
+pub(crate) mod util;
 mod varmap;
 
 // Re-export utilities so command modules can reach them via `super::super::glob_match`

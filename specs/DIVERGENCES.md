@@ -200,7 +200,7 @@
 - **严重度**：高（时间类脚本系统性偏差；judge 语料因确定性要求未覆盖
   clock，属盲区）。
 
-### D-26 glob：Rust glob crate 语义 + 排序（spec matching [D-25]）
+### D-26 glob：Rust glob crate 语义 + 排序（spec matching [D-25]）[FIXED 2026-11-05]
 - **Tcl 8.6**：`**` 只是两个 `*`（无递归）、`{a,b}` 非交替、前导点不
   被 `*` 匹配；返回顺序为目录读序（不排序）；`-tails` 存在。
 - **rtcl**：`**` 递归、`{a,b}` 交替、匹配前导点、结果字典序排序、
@@ -228,13 +228,18 @@
   EOF。读写交错/覆写/tell 三探针与 tclsh 逐字节一致。
 - **严重度**：已关闭。
 
-### D-29 `encoding` 命令整体缺失 + `-encoding` 不校验不使用（spec io [D-30]）
+### D-29 `encoding` 命令整体缺失 + `-encoding` 不校验不使用（spec io [D-30]）[大部分 FIXED 2026-11-05]
 - **Tcl 8.6**：`encoding convertfrom/convertto/names/system` 齐备
   （names 90+）；`fconfigure -encoding bogus` 报 `unknown encoding "bogus"`。
-- **rtcl**：encoding 命令不存在（`invalid command name "encoding"`）；
-  fconfigure -encoding 任意字符串静默存取（查询回显 bogus）；无任何
-  转码实现；非 UTF-8 输入 read/gets 直接 io 错误。
-- **严重度**：高。
+- **rtcl 修复态（2026-11-05）**：encoding 命令落地（names/system/
+  convertfrom/convertto；前缀分发）；支持集 ascii/binary/identity/
+  iso8859-1/utf-8（convertto/from 双向 + 不可编码字符 '?' 替换）；
+  fconfigure -encoding 校验（unknown encoding "bogus" +
+  TCL LOOKUP ENCODING）。
+- **残差**：tclsh 86+ 编码表的宽覆盖（rtcl 5 种——子集分歧记有意
+  扩展清单的对立面）；-encoding 的**实际转码**（通道读写仍按
+  UTF-8——fconfigure -encoding 存而校验不转码）；非 UTF-8 文件读。
+- **严重度**：已关闭主体（命令面/校验面）。
 
 ### D-30 `read chan N` 按字节计数 + `read chan 0` 置 eof（spec io [D-31]）
 - **Tcl 8.6**：N 是**字符数**（"héllo" read 3 → 3 字符）；read 0 不置 eof。

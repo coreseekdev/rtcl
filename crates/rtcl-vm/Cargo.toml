@@ -7,6 +7,11 @@ description = "rtcl VM — Value/Error/VmContext runtime core plus the interpret
 keywords = ["tcl", "vm", "bytecode", "interpreter", "embedded"]
 categories = ["parser-implementations"]
 
+# D-24：clock 本地时区（libc localtime_r——/etc/localtime + TZ/DST
+# 全部由 C 库承担）。仅 unix 目标；wasm 走纯 UTC 路径。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dependencies]
 rtcl-ir.workspace = true
 rtcl-parser.workspace = true

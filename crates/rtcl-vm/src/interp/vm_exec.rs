@@ -1090,6 +1090,37 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                 defer_flow_frame(interp, code, st, &e);
                 return Err(e);
             }
+            // D-3 残差：expr 错误的 INNER 条目 = syntax 特形（tclsh：
+            // `INNER {syntax {msg} {完整 options 形}}`）。DivisionByZero
+            // 是 expr 专属变体——在此预装；其他 expr 错误（非法函数等）
+            // 仍走 invokeStk 形（诊断面残差记台账）。
+            if matches!(e, crate::error::Error::DivisionByZero) && st.cur_site != usize::MAX {
+                let site = &code.sites[st.cur_site];
+                let line = st.entry_offset + site.line as usize;
+                let msg = "divide by zero";
+                let tec = "ARITH DIVZERO {divide by zero}";
+                // opts 以列表构造（errorcode 三元素自动括引——与 tclsh
+                // 的 dict 渲染一致）。
+                let opts = crate::value::Value::from_list(&[
+                    crate::value::Value::from_str("-code"),
+                    crate::value::Value::from_str("1"),
+                    crate::value::Value::from_str("-level"),
+                    crate::value::Value::from_str("0"),
+                    crate::value::Value::from_str("-errorcode"),
+                    crate::value::Value::from_str(tec),
+                    crate::value::Value::from_str("-errorinfo"),
+                    crate::value::Value::from_str(msg),
+                    crate::value::Value::from_str("-errorline"),
+                    crate::value::Value::from_int(line as i64),
+                ])
+                .as_str()
+                .to_string();
+                interp.err_pending_inner = Some(format!(
+                    "syntax {} {}",
+                    crate::value::tcl_quote(msg),
+                    crate::value::tcl_quote(&opts)
+                ));
+            }
             // A unit whose FIRST `BeginCmd` failed the recursion guard
             // never opened a command: no site is current and no region is
             // open, so there is no frame to append — the error propagates

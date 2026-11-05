@@ -126,6 +126,20 @@ pub(crate) fn validate_are(pattern: &str) -> Option<(&'static str, String)> {
                 prev = ArePrev::Operand;
             }
             b'(' => {
+                // D-17 对齐：lookbehind（(?<= / (?<!) 非 8.6 ARE 语法——
+                // tclsh 编译报 quantifier operand invalid（REG_BADRPT）。
+                // 前瞻 (?= / (?! 合法（lb3/lb4 实测）。
+                if i + 2 < b.len()
+                    && b[i + 1] == b'?'
+                    && (b[i + 2] == b'<' || b[i + 2] == b'=' || b[i + 2] == b'!')
+                {
+                    if b[i + 2] == b'<' {
+                        return Some((
+                            "REG_BADRPT",
+                            "quantifier operand invalid".to_string(),
+                        ));
+                    }
+                }
                 depth += 1;
                 i += 1;
                 prev = ArePrev::None;

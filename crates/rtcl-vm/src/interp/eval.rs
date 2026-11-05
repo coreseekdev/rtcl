@@ -1083,7 +1083,24 @@ impl Interp {
 
     /// Evaluate an expression.
     pub fn eval_expr(&mut self, expr: &str) -> Result<Value> {
-        crate::types::expr::eval_expr(self, expr)
+        let r = crate::types::expr::eval_expr(self, expr);
+        if let Err(e) = &r {
+            // D-3 残差：expr 错误的 INNER 条目 = syntax 特形——
+            // `syntax {msg} {opts-dict}`（tclsh 实测；opts 为该错误自身
+            // 的完整 options 形）。一次性预装同 cmd_error 通道。
+            let tec = e.tcl_error_code();
+            let msg = e.message_text();
+            let line = self.err_line;
+            let opts = format!(
+                "-code 1 -level 0 -errorcode {} -errorinfo {} -errorline {}",
+                crate::value::tcl_quote(&tec),
+                crate::value::tcl_quote(&msg),
+                line
+            );
+            self.err_pending_inner =
+                Some(format!("syntax {} {}", crate::value::tcl_quote(&msg), crate::value::tcl_quote(&opts)));
+        }
+        r
     }
 
     /// Read the variable a `$name` word refers to.  Shared by

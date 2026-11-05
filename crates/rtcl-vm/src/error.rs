@@ -189,12 +189,31 @@ impl Error {
     /// encodes the explicit level as −(N+1) so it cannot collide with the
     /// -code completion codes.
     pub fn ret_level(level: i32, value: Option<Value>) -> Self {
+        // D-5③ 复合编码：slot = -(ret_level * 10 + code)——值形式
+        // code=0；-level N 与 -code C 的组合不再互斥。
         Error::ControlFlow {
             kind: ControlFlow::Return,
             value,
-            level: -(level + 1),
+            level: -(level * 10),
             error_info: None,
             error_code: None,
+        }
+    }
+
+    /// `return -level N -code C`：复合编码构造（D-5③）。
+    pub fn ret_level_code(
+        level: i32,
+        code: i32,
+        value: Option<Value>,
+        error_info: Option<String>,
+        error_code: Option<String>,
+    ) -> Self {
+        Error::ControlFlow {
+            kind: ControlFlow::Return,
+            value,
+            level: -(level * 10 + code),
+            error_info,
+            error_code,
         }
     }
 
@@ -336,11 +355,28 @@ impl Error {
 
     /// The completion code a deferred Return carries in its `level` slot
     /// (return_with_code): 0=ok, 1=error, 2=return, 3=break, 4=continue;
-    /// negative encodes an explicit `-level N` value form as −(N+1).
-    /// Distinct from [`Error::return_code`] (the flow kind as a Tcl code).
+    /// negative slots are the D-5③ 复合编码 -(ret_level*10 + code)，
+    /// 此处解码出 code。Distinct from [`Error::return_code`] (the flow
+    /// kind as a Tcl code).
     pub fn deferred_code(&self) -> i32 {
         match self {
-            Error::ControlFlow { kind: ControlFlow::Return, level, .. } => *level,
+            Error::ControlFlow { kind: ControlFlow::Return, level, .. } => {
+                if *level < 0 {
+                    (-level) % 10
+                } else {
+                    *level
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// 复合编码的 ret_level（剩余层级；正 slot = 0）。
+    pub fn deferred_ret_level(&self) -> i32 {
+        match self {
+            Error::ControlFlow { kind: ControlFlow::Return, level, .. } if *level < 0 => {
+                (-level) / 10
+            }
             _ => 0,
         }
     }

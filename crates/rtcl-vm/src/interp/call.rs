@@ -775,10 +775,45 @@ impl Interp {
                                     Ok(val)
                                 }
                                 n if n < 0 => {
-                                    // Explicit -level N encoded as -(N+1): any of
-                                    // these leaves this proc with its value
-                                    // (rtcl has no multi-level proc return).
-                                    Ok(val)
+                                    // D-5③ 复合编码 -(ret_level*10 + code)：每过
+                                    // 一个 proc 边界 ret_level 降 1；降到 1 的
+                                    // 边界按 code 物化（tclsh：-level 2 -code
+                                    // error 在两层之上物化）。
+                                    let (ret_level, code) = ((-n) / 10, (-n) % 10);
+                                    if ret_level > 1 {
+                                        Err(Error::ControlFlow {
+                                            kind: crate::error::ControlFlow::Return,
+                                            value: value.clone(),
+                                            level: -((ret_level - 1) * 10 + code),
+                                            error_info: error_info.clone(),
+                                            error_code: error_code.clone(),
+                                        })
+                                    } else {
+                                        match code {
+                                            1 => Err(Error::ControlFlow {
+                                                kind: crate::error::ControlFlow::Error,
+                                                value: Some(val),
+                                                level: 1,
+                                                error_info: error_info.clone(),
+                                                error_code: error_code.clone(),
+                                            }),
+                                            3 => Err(Error::ControlFlow {
+                                                kind: crate::error::ControlFlow::Break,
+                                                value: Some(val),
+                                                level: 1,
+                                                error_info: None,
+                                                error_code: None,
+                                            }),
+                                            4 => Err(Error::ControlFlow {
+                                                kind: crate::error::ControlFlow::Continue,
+                                                value: Some(val),
+                                                level: 1,
+                                                error_info: None,
+                                                error_code: None,
+                                            }),
+                                            _ => Ok(val),
+                                        }
+                                    }
                                 }
                                 1 => {
                                     // return -code error "msg" → propagate as error,

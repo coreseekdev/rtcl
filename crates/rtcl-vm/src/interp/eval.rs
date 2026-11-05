@@ -989,7 +989,7 @@ impl Interp {
                 true,
                 "invoked \"continue\" outside of a loop".to_string(),
             ),
-            Error::ControlFlow { kind: ControlFlow::Return, level, .. } => match *level {
+            Error::ControlFlow { kind: ControlFlow::Return, .. } => match e.deferred_code() {
                 1 => (true, e.message_text()),
                 3 => (
                     true,

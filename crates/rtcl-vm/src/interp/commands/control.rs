@@ -674,6 +674,14 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     match code {
         Some(c) => {
+            // D-5③：-level N 与 -code C 组合 → 复合编码，proc 边界按
+            // ret_level 降级物化（tclsh：-level 2 -code error 在两层
+            // 之上物化）。
+            if level >= 1 {
+                return Err(Error::ret_level_code(
+                    level, c, result, error_info, error_code,
+                ));
+            }
             // `-level 0` fires the completion right here (tclsh:
             // TclProcessReturn at level 0 materializes the code
             // immediately — probed: `catch {return -level 0 -code
@@ -702,7 +710,7 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if error_info.is_some() || error_code.is_some() {
                 Err(Error::return_with_options(0, result, error_info, error_code))
             } else if level_given {
-                // Explicit -level (>= 1 here): encoded as -(N+1).
+                // Explicit -level (>= 1 here): 复合编码 -(N*10)（code 0）。
                 Err(Error::ret_level(level, result))
             } else {
                 Err(Error::ret(result))
@@ -860,8 +868,26 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         _ => 0,
                     };
                     if rc < 0 {
-                        let lvl = -(rc + 1);
-                        interp.set_var(ov, return_options_dict(0, lvl))?;
+                        // D-5③ 复合槽解码：ret_level=(-rc)/10、
+                        // code=(-rc)%10 → options -code <code> -level
+                        // <ret_level>（tclsh：catch {return -code error
+                        // boom} → 2 / -code 1 -level 1 -errorcode NONE；
+                        // 值形式 → -code 0 -level N）。
+                        let lvl = (-rc) / 10;
+                        let cd = (-rc) % 10;
+                        // -code error（码 1）无 -errorcode 载荷时补
+                        // -errorcode NONE（tclsh 形状）。
+                        let has_payload = matches!(
+                            &e,
+                            Error::ControlFlow { error_code: Some(_), .. }
+                        );
+                        let opts = if cd == 1 && !has_payload {
+                            return_options_dict(cd, lvl).as_str().to_string()
+                                + " -errorcode NONE"
+                        } else {
+                            return_options_dict(cd, lvl).as_str().to_string()
+                        };
+                        interp.set_var(ov, Value::from_str(&opts))?;
                         return Ok(Value::from_int(code));
                     }
                     match &e {

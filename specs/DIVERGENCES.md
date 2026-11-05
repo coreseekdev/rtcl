@@ -46,7 +46,7 @@
 - **复现**：`proc f {} {return hi}; catch {f} v o; puts $o`
 - **严重度**：中。
 
-### D-5 `return -level N` 层级丢失（spec [D-4]/[D-5]）[② FIXED / ③ OPEN 2026-11-05]
+### D-5 `return -level N` 层级丢失（spec [D-4]/[D-5]）[FIXED 2026-11-05]
 - **Tcl 8.6**：① `return -code N`（N>4 整数）catch 报 2，原始 N 落
   options（-code 7 -level 1）；② 值形式 `return -level 2 v` 越两层，
   catch 得 `-code 0 -level 2`；③ `return -level 2 -code error` 在 N 层

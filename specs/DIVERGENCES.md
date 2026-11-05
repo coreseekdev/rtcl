@@ -220,14 +220,45 @@
 - **rtcl**：from_u32 直出星面字符 U+10000。
 - **严重度**：低。
 
-### D-25 clock：本地时区 / %z / scan 全缺（spec [D-24]）
+### D-25 clock：本地时区 / %z / scan 全缺（spec [D-24]）[FIXED 2026-11-06]
 - **Tcl 8.6**：clock format 按进程本地时区渲染（TZ 生效，%Z/%z 出
   缩写/偏移）；clock scan 支持 ISO/自由格式；clock add 存在。
 - **rtcl**：恒 UTC、无视 TZ；%z 未实现；scan 仅接受整数 epoch（错误
   消息自造）；无 clock add；-gmt 布尔解析窄。
-- **复现**：`puts [clock format 0]; puts [clock scan 2000-01-01]`
-- **严重度**：高（时间类脚本系统性偏差；judge 语料因确定性要求未覆盖
-  clock，属盲区）。
+- **rtcl 修复态（2026-11-06）**：
+  * 子命令派发：Tcl_GetIndexFromObj 语义（精确/唯一前缀，歧义报
+    `unknown or ambiguous subcommand`，码 TCL LOOKUP SUBCOMMAND）；
+    seconds/microseconds/milliseconds 的 arity、clicks 的
+    `?-switch?`（-milliseconds/-microseconds 前缀匹配 + TCL LOOKUP
+    INDEX option）对齐。
+  * `clock add` 落地：单位 year(s)/month(s)/week(s)/day(s)/hour(s)/
+    minute(s)/second(s)，**按给定顺序**顺序作用（Jan 30 +1d +1m =
+    Feb 29，+1m +1d = Mar 1）；年/月/日/周按目标时区**日历**运算
+    （月末夹取 Jan 31 +1m = Feb 29、Feb 29 +1y = Feb 28；DST 下
+    +1 day 保持墙钟、+24 hours 定长秒）；错误形/码逐字对齐
+    （`unknown unit "...", must be  years, months,...` 双空格 +
+    CLOCK badUnit、bad option 短语 + CLOCK badOption、布尔
+    `expected boolean value but got "2"` ec=NONE、`cannot use -gmt and
+    -timezone in same call` CLOCK gmtWithTimezone、长短两套 wrong #
+    args：CLOCK wrongNumArgs/TCL WRONGARGS）；-gmt 严格布尔（含
+    t/f/y/n 前缀、o 歧义拒）；-locale 值接受忽略。
+  * `-timezone`（format/scan/add 共用）：zoneinfo 名校验（
+    `time zone ":X" not found` + CLOCK badTimeZone :X），unix 下经
+    libc TZ/tzset/localtime_r/mktime 求值——与 tclsh 的转换表同源
+    （America/New_York、Europe/Berlin、Asia/Shanghai、Australia/
+    Sydney 的格式/add 实测逐字一致，含 DST 跳变 02:30 +1d → 03:30）。
+    format 的 `-gmt` 是 expr 布尔（整数 0/nonzero 收，坏词错误码
+    TCL VALUE NUMBER），scan/add 是 Tcl_GetBoolean（整数 2 拒，
+    ec=NONE）；format/scan 的 bad option 短语各自不同源（冒号+牛津
+    逗号 vs 逗号列表）——逐字对齐。
+  * 修 clock scan 带时刻 ISO 形的既有 bug（小时字段错读 4 字符，
+    `{YYYY-MM-DD HH:MM:SS}` 一律 syntax error）。
+- **复现**：`puts [clock format 0]; puts [clock scan 2000-01-01];
+  puts [clock add 0 1 month]`
+- **严重度**：已关闭（32/37 matching-deep；15 条 clock 探针全 SAME）。
+  残差：自由格式 scan（`next Friday`/`5 minutes ago`/"x"→now 等
+  tclClock.c 相对语法）；clock 错误的 errorInfo 含 tclsh Tcl 实现
+  （::tcl::clock::add 等）的 proc 帧；-locale 只接受不参与格式。
 
 ### D-26 glob：Rust glob crate 语义 + 排序（spec matching [D-25]）[FIXED 2026-11-05]
 - **Tcl 8.6**：`**` 只是两个 `*`（无递归）、`{a,b}` 非交替、前导点不

@@ -21,3 +21,19 @@ catch {binary format c 4294967296} m; puts $m
 puts "[binary scan ab a5 v] [info exists v]"
 catch {clock scan 2000-01-01} m2; puts $m2
 catch {clock format 86400 -format %z -gmt 1} m3; puts $m3
+# ── D-25 clock add / -timezone（2026-11-06 实测钉形；日历夹取/顺序/DST）──
+puts [clock add 0 1 day]
+puts [clock add 0 1 month]
+puts [clock format [clock add [clock scan 2000-01-31 -gmt 1] 1 month] -gmt 1 -format %Y-%m-%d]
+puts [clock format [clock add [clock scan 2000-03-31 -gmt 1] -1 month] -gmt 1 -format %Y-%m-%d]
+puts [clock format [clock add [clock scan 2000-01-30 -gmt 1] 1 day 1 month] -gmt 1 -format %Y-%m-%d]
+puts [clock format [clock add [clock scan 2000-01-30 -gmt 1] 1 month 1 day] -gmt 1 -format %Y-%m-%d]
+puts [clock add 0 1 week 1 day]
+puts [clock add 0 -1 month]
+catch {clock add 0 1 fortnight} m o ; puts "$m|[dict get $o -errorcode]"
+catch {clock add 0 1 day -gmt 1 -timezone :UTC} m ; puts $m
+catch {clock add 0 1 day -timezone Bogus/Zone} m o ; puts "$m|[dict get $o -errorcode]"
+puts [clock format 0 -timezone :America/New_York -format {%Y-%m-%d %H:%M %Z %z}]
+puts [clock add [clock scan 2024-03-09 -gmt 1] 3 days]
+puts [clock scan {2021-03-13 12:00:00} -format {%Y-%m-%d %H:%M:%S} -gmt 1]
+puts [clock format [clock add [clock scan {2021-03-13 12:00:00} -format {%Y-%m-%d %H:%M:%S}] 1 day -timezone :America/New_York] -timezone :America/New_York -format {%Y-%m-%d %H:%M:%S %Z %z}]

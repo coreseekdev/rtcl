@@ -253,6 +253,10 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             ))
         }
         "dirname" | "dir" => {
+            // tclsh：`file dirname /` = "/"（根的 parent 是根）。
+            if path == "/" {
+                return Ok(Value::from_str("/"));
+            }
             let p = std::path::Path::new(path);
             Ok(Value::from_str(
                 p.parent().and_then(|s| s.to_str()).unwrap_or("."),
@@ -374,6 +378,10 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.set_var(&format!("{}(uid)", var_name), Value::from_int(meta.uid() as i64))?;
                 interp.set_var(&format!("{}(gid)", var_name), Value::from_int(meta.gid() as i64))?;
                 interp.set_var(&format!("{}(mode)", var_name), Value::from_int(meta.mode() as i64))?;
+                // D-33：补 blksize/blocks/ctime（tclsh 13 键全形）。
+                interp.set_var(&format!("{}(blksize)", var_name), Value::from_int(meta.blksize() as i64))?;
+                interp.set_var(&format!("{}(blocks)", var_name), Value::from_int(meta.blocks() as i64))?;
+                interp.set_var(&format!("{}(ctime)", var_name), Value::from_int(meta.ctime() as i64))?;
             }
             Ok(Value::empty())
         }
@@ -456,7 +464,10 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let dst = args[start + 1].as_str();
             if !force && std::path::Path::new(dst).exists() {
                 return Err(Error::runtime(
-                    format!("error renaming \"{}\": target exists", src),
+                    format!(
+                        "error renaming \"{}\" to \"{}\": file already exists",
+                        src, dst
+                    ),
                     crate::error::ErrorCode::Io,
                 ));
             }
@@ -488,7 +499,12 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let dst = args[start + 1].as_str();
             if !force && std::path::Path::new(dst).exists() {
                 return Err(Error::runtime(
-                    format!("error copying \"{}\": target exists", src),
+                    // tclsh 消息形状（D-33）：error copying "src" to
+                    // "dst": file already exists。
+                    format!(
+                        "error copying \"{}\" to \"{}\": file already exists",
+                        src, dst
+                    ),
                     crate::error::ErrorCode::Io,
                 ));
             }

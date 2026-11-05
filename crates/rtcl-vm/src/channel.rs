@@ -63,9 +63,40 @@ pub(crate) fn channel_write_str(ch: &mut dyn Channel, s: &str) -> io::Result<()>
 
 /// Extension: read exactly `count` chars (UTF-8 bytes) and return as String.
 pub(crate) fn channel_read_chars(ch: &mut dyn Channel, count: usize) -> io::Result<String> {
-    let mut buf = vec![0u8; count];
-    let n = ch.read_bytes(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
+    // D-30：count 是**字符数**（原按字节读 + lossy——多字节文本短读）；
+    // 逐字节增量解码（UTF-8 不完整尾继续读、无效序列按 lossy 单字符
+    // 计）。count=0 不触碰 at_eof（tclsh：read ch 0 不置 EOF）。
+    if count == 0 {
+        return Ok(String::new());
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut pending = 0usize; // out 中未完成字符的起始字节
+    let mut chars = 0usize;
+    let mut byte = [0u8; 1];
+    while chars < count {
+        let n = ch.read_bytes(&mut byte)?;
+        if n == 0 {
+            break;
+        }
+        out.push(byte[0]);
+        loop {
+            match std::str::from_utf8(&out[pending..]) {
+                Ok(s) => {
+                    chars += s.chars().count();
+                    pending = out.len();
+                    break;
+                }
+                Err(e) if e.error_len().is_none() => break, // 还差字节
+                Err(_) => {
+                    // 无效序列：lossy 替换符按 1 字符计，丢弃该字节。
+                    chars += 1;
+                    pending = out.len();
+                    break;
+                }
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 // ═══════════════════════════════════════════════════════════════════════

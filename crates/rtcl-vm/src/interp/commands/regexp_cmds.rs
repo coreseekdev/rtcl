@@ -300,6 +300,13 @@ pub(crate) enum Engine {
     Full(super::regexp_bt::BtProg),
 }
 
+impl Engine {
+    /// D-20：串锚模式（含 \A/\z——\A 绑 -start 偏移而非尝试起点）。
+    pub(crate) fn is_string_anchored(&self) -> bool {
+        matches!(self, Engine::Fast { anch: Some(_), .. })
+    }
+}
+
 /// Does the pattern use constructs whose membership follows tclsh's Unicode
 /// category tables? POSIX `[[:class:]]` bracket classes are ASCII-only in the
 /// `regex` crate but Unicode-aware in Tcl, and `\w`/`\W`/`\s`/`\S` disagree
@@ -385,11 +392,16 @@ pub(crate) fn engine_attempt(eng: &Engine, full_string: &str, p: usize) -> Optio
         }
         Engine::Fast { re, anch } => match anch {
             Some(ra) => {
+                // D-20：串锚匹配必须**起于 slice 0**——captures 会命中
+                // slice 内部的 (?m)^ 行首（全串偏移越界泄漏），故过滤。
                 let off = char_to_byte(full_string, p);
-                regex_caps_at(ra, &full_string[off..], 0).map(|groups| {
-                    groups
-                        .into_iter()
-                        .map(|g| g.map(|(s, e)| (s + off, e + off)))
+                let slice = &full_string[off..];
+                let caps = ra
+                    .captures(slice)
+                    .filter(|c| c.get(0).map(|m| m.start() == 0).unwrap_or(false));
+                caps.map(|caps| {
+                    (0..caps.len())
+                        .map(|j| caps.get(j).map(|m| (m.start() + off, m.end() + off)))
                         .collect()
                 })
             }
@@ -450,11 +462,15 @@ pub(crate) fn compile_engine(
 pub(crate) fn engine_attempt(eng: &Engine, full_string: &str, p: usize) -> Option<GroupRanges> {
     match &eng.anch {
         Some(ra) => {
+            // D-20：同上——串锚捕获起于 slice 0。
             let off = char_to_byte(full_string, p);
-            regex_caps_at(ra, &full_string[off..], 0).map(|groups| {
-                groups
-                    .into_iter()
-                    .map(|g| g.map(|(s, e)| (s + off, e + off)))
+            let slice = &full_string[off..];
+            let caps = ra
+                .captures(slice)
+                .filter(|c| c.get(0).map(|m| m.start() == 0).unwrap_or(false));
+            caps.map(|caps| {
+                (0..caps.len())
+                    .map(|j| caps.get(j).map(|m| (m.start() + off, m.end() + off)))
                     .collect()
             })
         }
@@ -778,7 +794,15 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let eng = compile_engine_tc(interp, pattern_str, nocase, expanded, lineanchor, linestop)
         .map_err(|e| Error::runtime(e, ErrorCode::Generic))?;
 
-    let attempt = |p: usize| -> Option<GroupRanges> { engine_attempt(&eng, full_string, p) };
+    // D-20：\A/\z 串锚模式只允许在 -start 偏移命中一次——后续位置
+    // 的尝试被禁（tclsh 实测 -start 1 {\Aa} aba → 0）。
+    let anchored = eng.is_string_anchored();
+    let attempt = |p: usize| -> Option<GroupRanges> {
+        if anchored && p != char_start {
+            return None;
+        }
+        engine_attempt(&eng, full_string, p)
+    };
     let matches = collect_matches(full_string, attempt, char_len, char_start, all);
 
     // Build a per-match list element: the group's text, or its
@@ -941,7 +965,13 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if command_mode {
         // -command: evaluate sub_spec as command prefix for each match
         // (rtcl extension; not exercised under -start by the corpus).
-        let attempt = |p: usize| -> Option<GroupRanges> { engine_attempt(&eng, full_string, p) };
+        let anchored = eng.is_string_anchored();
+        let attempt = |p: usize| -> Option<GroupRanges> {
+            if anchored && p != char_start {
+                return None;
+            }
+            engine_attempt(&eng, full_string, p)
+        };
         let matches = collect_matches(full_string, attempt, char_len, char_start, all);
         let mut result = String::from(&full_string[..byte_start]);
         let mut last = byte_start;
@@ -981,7 +1011,15 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Standard mode: Tcl substitution spec applied to the matches the
     // -start/-all scan yields.  regsub assigns varName unconditionally,
     // even when nothing is replaced.
-    let attempt = |p: usize| -> Option<GroupRanges> { engine_attempt(&eng, full_string, p) };
+    // D-20：\A/\z 串锚模式只允许在 -start 偏移命中一次——后续位置
+    // 的尝试被禁（tclsh 实测 -start 1 {\Aa} aba → 0）。
+    let anchored = eng.is_string_anchored();
+    let attempt = |p: usize| -> Option<GroupRanges> {
+        if anchored && p != char_start {
+            return None;
+        }
+        engine_attempt(&eng, full_string, p)
+    };
     let matches = collect_matches(full_string, attempt, char_len, char_start, all);
 
     let mut result = String::from(&full_string[..byte_start]);

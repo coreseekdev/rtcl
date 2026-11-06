@@ -6,6 +6,76 @@ use crate::error::{Error, Result};
 use crate::interp::Interp;
 use crate::value::Value;
 
+// ---------- POSIX 错误形 ----------
+
+/// errno → (Tcl 小写 strerror 文本, 错误码名)。
+#[cfg(feature = "std")]
+pub(crate) fn errno_text(code: i32) -> Option<(&'static str, &'static str)> {
+    Some(match code {
+        2 => ("no such file or directory", "ENOENT"),
+        9 => ("bad file descriptor", "EBADF"),
+        11 => ("resource temporarily unavailable", "EAGAIN"),
+        13 => ("permission denied", "EACCES"),
+        17 => ("file already exists", "EEXIST"),
+        20 => ("not a directory", "ENOTDIR"),
+        21 => ("is a directory", "EISDIR"),
+        22 => ("invalid argument", "EINVAL"),
+        24 => ("too many open files", "EMFILE"),
+        28 => ("no space left on device", "ENOSPC"),
+        29 => ("invalid seek", "ESPIPE"),
+        30 => ("read-only file system", "EROFS"),
+        32 => ("broken pipe", "EPIPE"),
+        36 => ("file name too long", "ENAMETOOLONG"),
+        40 => ("too many levels of symbolic links", "ELOOP"),
+        _ => return None,
+    })
+}
+
+/// io::Error → Tcl/POSIX 文本（去 Rust 的 "(os error N)" 后缀并小写首字母）。
+#[cfg(feature = "std")]
+pub(crate) fn io_error_text(e: &std::io::Error, fallback: &str) -> String {
+    if let Some((text, _)) = e.raw_os_error().and_then(errno_text) {
+        return text.to_string();
+    }
+    let s = e.to_string();
+    let s = match s.find(" (os error ") {
+        Some(i) => &s[..i],
+        None => s.as_str(),
+    };
+    if s.is_empty() {
+        return fallback.to_string();
+    }
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
+        None => fallback.to_string(),
+    }
+}
+
+/// 构造 POSIX 错误（消息 = `<prefix>: <text>`，并装 `POSIX <NAME> {text}`）。
+#[cfg(feature = "std")]
+pub(crate) fn posix_error(interp: &mut Interp, prefix: String, e: &std::io::Error) -> Error {
+    let text = io_error_text(e, "i/o error");
+    if let Some((_, name)) = e.raw_os_error().and_then(errno_text) {
+        super::list::set_error_code(interp, &format!("POSIX {} {{{}}}", name, text));
+    }
+    Error::runtime(format!("{}: {}", prefix, text), crate::error::ErrorCode::Io)
+}
+
+/// seek 失败形：非 seekable（ESPIPE/Unsupported）→ `invalid seek`；
+/// 其余按 POSIX 文本。
+#[cfg(feature = "std")]
+pub(crate) fn seek_error(interp: &mut Interp, chan: &str, e: &std::io::Error) -> Error {
+    if e.raw_os_error() == Some(29) || e.kind() == std::io::ErrorKind::Unsupported {
+        super::list::set_error_code(interp, "POSIX ESPIPE {invalid seek}");
+        return Error::runtime(
+            format!("error during seek on \"{}\": invalid seek", chan),
+            crate::error::ErrorCode::Io,
+        );
+    }
+    posix_error(interp, format!("error during seek on \"{}\"", chan), e)
+}
+
 // ---------- puts ----------
 
 #[cfg(feature = "std")]
@@ -31,12 +101,18 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
         4 => {
-            if args[1].as_str() == "-nonewline" {
-                nonewline = true;
-                chan_id = args[2].as_str();
-            } else {
-                chan_id = args[1].as_str();
+            // 4 词形只允许 `puts -nonewline ?channelId? string`；
+            // `puts stderr -nonewline hi` 在 tclsh 是 wrong # args。
+            if args[1].as_str() != "-nonewline" {
+                return Err(Error::wrong_args_with_usage(
+                    "puts",
+                    2,
+                    args.len(),
+                    "?-nonewline? ?channelId? string",
+                ));
             }
+            nonewline = true;
+            chan_id = args[2].as_str();
             msg = args[3].as_str();
         }
         _ => return Err(Error::wrong_args_with_usage("puts", 2, args.len(), "?-nonewline? ?channelId? string")),
@@ -320,21 +396,13 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
         // ── metadata ────────────────────────────────────────────────
         "size" => {
-            let meta = std::fs::metadata(path).map_err(|e| {
-                Error::runtime(
-                    format!("could not stat \"{}\": {}", path, e),
-                    crate::error::ErrorCode::Io,
-                )
-            })?;
+            let meta = std::fs::metadata(path)
+                .map_err(|e| posix_error(interp, format!("could not read \"{}\"", path), &e))?;
             Ok(Value::from_int(meta.len() as i64))
         }
         "atime" => {
-            let meta = std::fs::metadata(path).map_err(|e| {
-                Error::runtime(
-                    format!("could not stat \"{}\": {}", path, e),
-                    crate::error::ErrorCode::Io,
-                )
-            })?;
+            let meta = std::fs::metadata(path)
+                .map_err(|e| posix_error(interp, format!("could not read \"{}\"", path), &e))?;
             let t = meta.accessed().map_err(|e| {
                 Error::runtime(format!("could not get atime: {}", e), crate::error::ErrorCode::Io)
             })?;
@@ -343,12 +411,40 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::from_int(secs as i64))
         }
         "mtime" => {
-            let meta = std::fs::metadata(path).map_err(|e| {
-                Error::runtime(
-                    format!("could not stat \"{}\": {}", path, e),
-                    crate::error::ErrorCode::Io,
-                )
-            })?;
+            if args.len() > 4 {
+                return Err(Error::wrong_args_with_usage(
+                    "file mtime",
+                    4,
+                    args.len(),
+                    "name ?time?",
+                ));
+            }
+            if args.len() == 4 {
+                // file mtime name time —— 设置 mtime（atime 不变）。
+                let secs = match args[3].as_int() {
+                    Some(v) => v,
+                    None => {
+                        super::list::set_error_code(interp, "TCL VALUE NUMBER");
+                        return Err(Error::runtime(
+                            format!("expected integer but got \"{}\"", args[3].as_str()),
+                            crate::error::ErrorCode::Generic,
+                        ));
+                    }
+                };
+                let t = std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(secs.max(0) as u64);
+                let ft = std::fs::FileTimes::new().set_modified(t);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .and_then(|f| f.set_times(ft))
+                    .map_err(|e| {
+                        posix_error(interp, format!("could not set \"{}\"", path), &e)
+                    })?;
+                return Ok(Value::empty());
+            }
+            let meta = std::fs::metadata(path)
+                .map_err(|e| posix_error(interp, format!("could not read \"{}\"", path), &e))?;
             let t = meta.modified().map_err(|e| {
                 Error::runtime(format!("could not get mtime: {}", e), crate::error::ErrorCode::Io)
             })?;
@@ -370,12 +466,8 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             } else {
                 std::fs::metadata(path)
             };
-            let meta = meta.map_err(|e| {
-                Error::runtime(
-                    format!("could not stat \"{}\": {}", path, e),
-                    crate::error::ErrorCode::Io,
-                )
-            })?;
+            let meta = meta
+                .map_err(|e| posix_error(interp, format!("could not read \"{}\"", path), &e))?;
             let size = meta.len() as i64;
             let mtime = meta.modified().ok()
                 .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())

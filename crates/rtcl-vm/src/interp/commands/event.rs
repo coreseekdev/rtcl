@@ -23,6 +23,77 @@ fn now_ms(interp: &Interp) -> u64 {
     interp.clock.now_ms() as u64
 }
 
+// ---------- fileevent ----------
+
+/// `fileevent channelId readable|writable ?script?`
+///
+/// rtcl 没有 OS 事件循环；这里做 tclsh 兼容的命令面：校验通道方向、
+/// 保存/查询处理器脚本（不派发）。方向错误/未知通道的错误形与
+/// tclsh 一致（TCL LOOKUP CHANNEL / TCL LOOKUP INDEX {event name}）。
+pub fn cmd_fileevent(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 3 || args.len() > 4 {
+        return Err(Error::wrong_args_with_usage(
+            "fileevent",
+            3,
+            args.len(),
+            "channelId event ?script?",
+        ));
+    }
+    let chan_id = args[1].as_str();
+    if !interp.channels.contains(chan_id) {
+        return Err(super::chan_io::chan_not_found(interp, chan_id));
+    }
+    let event = args[2].as_str();
+    let (readable, writable) = {
+        let ch = interp.channels.get(chan_id).unwrap();
+        (ch.is_readable(), ch.is_writable())
+    };
+    match event {
+        "readable" => {
+            if !readable {
+                super::list::set_error_code(interp, "NONE");
+                return Err(Error::runtime(
+                    "channel is not readable",
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+            let cfg = interp.channels.config_mut(chan_id).unwrap();
+            if args.len() == 4 {
+                cfg.read_handler = args[3].as_str().to_string();
+                Ok(Value::empty())
+            } else {
+                Ok(Value::from_str(&cfg.read_handler))
+            }
+        }
+        "writable" => {
+            if !writable {
+                super::list::set_error_code(interp, "NONE");
+                return Err(Error::runtime(
+                    "channel is not writable",
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+            let cfg = interp.channels.config_mut(chan_id).unwrap();
+            if args.len() == 4 {
+                cfg.write_handler = args[3].as_str().to_string();
+                Ok(Value::empty())
+            } else {
+                Ok(Value::from_str(&cfg.write_handler))
+            }
+        }
+        other => {
+            super::list::set_error_code(
+                interp,
+                &format!("TCL LOOKUP INDEX {{event name}} {}", other),
+            );
+            Err(Error::Msg(format!(
+                "bad event name \"{}\": must be readable or writable",
+                other
+            )))
+        }
+    }
+}
+
 // ---------- after ----------
 
 /// `after ms ?script ...?`

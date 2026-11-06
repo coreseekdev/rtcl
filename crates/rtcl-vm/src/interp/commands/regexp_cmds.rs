@@ -25,6 +25,85 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
+/// 把 Tcl ARE 的 `\uHHHH`/`\UHHHHHHHH`/`\xHH` 转成引擎可吃的字面字符
+/// （regex crate 只认 `\x{...}`，BT 引擎的 unescape 不认 `\u`）。
+/// 合法码点用 `regex_escape` 输出（保持元字符的字面语义）；代理区
+/// （U+D800..DFFF）在 Tcl 里永不匹配：类外输出 `(?!)`、类内直接省略。
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+fn expand_unicode_escapes(pat: &str) -> String {
+    let b = pat.as_bytes();
+    let mut out = String::with_capacity(pat.len());
+    let mut i = 0usize;
+    let mut in_class = false;
+    while i < b.len() {
+        if b[i] == b'[' && !in_class {
+            in_class = true;
+            out.push('[');
+            i += 1;
+            continue;
+        }
+        if b[i] == b']' && in_class {
+            in_class = false;
+            out.push(']');
+            i += 1;
+            continue;
+        }
+        if b[i] != b'\\' {
+            let ch = pat[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        let Some(ech) = pat[i + 1..].chars().next() else {
+            out.push('\\');
+            break;
+        };
+        if ech == 'u' || ech == 'U' || ech == 'x' {
+            let max = if ech == 'u' {
+                4
+            } else if ech == 'U' {
+                8
+            } else {
+                2
+            };
+            let mut j = i + 2;
+            let mut v = 0u32;
+            let mut n = 0;
+            while n < max && j < b.len() {
+                let d = (b[j] as char).to_digit(16);
+                match d {
+                    Some(d) => {
+                        v = v * 16 + d;
+                        j += 1;
+                        n += 1;
+                    }
+                    None => break,
+                }
+            }
+            if n == 0 {
+                out.push('\\');
+                out.push(ech);
+                i += 2;
+                continue;
+            }
+            match char::from_u32(v) {
+                Some(ch) => out.push_str(&regex_escape(&ch.to_string())),
+                // 代理区（U+D800..DFFF）在 Tcl 中永不匹配；Rust 字符串
+                // 也不能含代理。类内没有"永不匹配元素"的表示，用
+                // U+10FFFF 占位（实际文本几乎不会包含）。
+                None if in_class => out.push_str("\\x{10FFFF}"),
+                None => out.push_str("(?!)"),
+            }
+            i = j;
+            continue;
+        }
+        out.push('\\');
+        out.push(ech);
+        i += 1 + ech.len_utf8();
+    }
+    out
+}
+
 /// Quantifier-arrival state for the ARE scan: a quantifier must follow an
 /// operand; `?` right after a quantifier is its lazy marker.
 #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
@@ -45,6 +124,51 @@ enum ArePrev {
 /// these.  Only the six rejection classes are detected; everything else
 /// keeps the engines' own behavior.
 #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+/// 校验一个反斜杠转义（`b[i] == b'\\'`），返回转义后的位置。
+/// Tcl 8.6.17 ARE 实测：`\u` 收 1-4 hex、`\U` 收 1-8 hex、`\x` 收
+/// 1-2 hex；`\x{...}` **不是** 8.6 语法（invalid escape）；其余字母
+/// 转义必须在 Tcl 的已知表内，标点转义按字面。
+fn are_escape_end(b: &[u8], i: usize) -> std::result::Result<usize, (&'static str, &'static str)> {
+    let err = || ("REG_EESCAPE", "invalid escape \\ sequence");
+    if i + 1 >= b.len() {
+        return Err(err());
+    }
+    let esc = b[i + 1];
+    match esc {
+        b'u' | b'U' | b'x' => {
+            let max = if esc == b'u' {
+                4
+            } else if esc == b'U' {
+                8
+            } else {
+                2
+            };
+            if esc == b'x' && i + 2 < b.len() && b[i + 2] == b'{' {
+                return Err(err());
+            }
+            let mut j = i + 2;
+            let mut n = 0;
+            while n < max && j < b.len() && b[j].is_ascii_hexdigit() {
+                j += 1;
+                n += 1;
+            }
+            if n == 0 {
+                return Err(err());
+            }
+            Ok(j)
+        }
+        _ => {
+            if esc.is_ascii_alphanumeric()
+                && !esc.is_ascii_digit()
+                && !b"dDsSwWbBAZzmMyYCNceNntrfv".contains(&esc)
+            {
+                return Err(err());
+            }
+            Ok(i + 2)
+        }
+    }
+}
+
 pub(crate) fn validate_are(pattern: &str) -> Option<(&'static str, String)> {
     const POSIX_CLASSES: &[&str] = &[
         "alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space",
@@ -61,28 +185,13 @@ pub(crate) fn validate_are(pattern: &str) -> Option<(&'static str, String)> {
     let mut depth = 0usize;
     while i < b.len() {
         match b[i] {
-            b'\\' => {
-                if i + 1 >= b.len() {
-                    return Some((
-                        "REG_EESCAPE",
-                        "invalid escape \\ sequence".to_string(),
-                    ));
+            b'\\' => match are_escape_end(b, i) {
+                Ok(j) => {
+                    i = j;
+                    prev = ArePrev::Operand;
                 }
-                // Alphanumeric escapes must be ones Tcl's ARE knows
-                // (`\Q..\E` quoting is Perl-only — tclsh rejects it;
-                // `\u` likewise absent from 8.6.17 ARE — matching-deep
-                // 探针 oracle); punctuation escapes are literal.
-                let esc = b[i + 1];
-                if esc.is_ascii_alphanumeric() && !esc.is_ascii_digit() && !b"dDsSwWbBAZzmMyYCNceNntrfvUx".contains(&esc)
-                {
-                    return Some((
-                        "REG_EESCAPE",
-                        "invalid escape \\ sequence".to_string(),
-                    ));
-                }
-                i += 2;
-                prev = ArePrev::Operand;
-            }
+                Err((code, msg)) => return Some((code, msg.to_string())),
+            },
             b'[' => {
                 // Bracket expression: scan to its `]` (a leading `]`,
                 // after optional `^`, is a literal), validating
@@ -114,7 +223,14 @@ pub(crate) fn validate_are(pattern: &str) -> Option<(&'static str, String)> {
                             continue;
                         }
                     }
-                    j += if b[j] == b'\\' { 2 } else { 1 };
+                    if b[j] == b'\\' {
+                        match are_escape_end(b, j) {
+                            Ok(nj) => j = nj,
+                            Err((code, msg)) => return Some((code, msg.to_string())),
+                        }
+                    } else {
+                        j += 1;
+                    }
                 }
                 if !closed {
                     return Some((
@@ -367,6 +483,8 @@ pub(crate) fn compile_engine(
     lineanchor: bool,
     linestop: bool,
 ) -> std::result::Result<Engine, String> {
+    let expanded_pattern = expand_unicode_escapes(pattern);
+    let pattern = expanded_pattern.as_str();
     // Tcl-Unicode class semantics live only in the backtracking engine.
     if uses_tcl_unicode_classes(pattern) {
         return super::regexp_bt::bt_compile(pattern, nocase, expanded, lineanchor, linestop)
@@ -466,6 +584,8 @@ pub(crate) fn compile_engine(
     lineanchor: bool,
     linestop: bool,
 ) -> std::result::Result<Engine, String> {
+    let expanded_pattern = expand_unicode_escapes(pattern);
+    let pattern = expanded_pattern.as_str();
     let built = build_pattern(pattern, nocase, expanded, lineanchor, linestop);
     let re = regex_lite::Regex::new(&built).map_err(|e| e.to_string())?;
     let anch = if has_string_anchor(pattern) {

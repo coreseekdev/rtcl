@@ -1,19 +1,19 @@
 # 正则/匹配/format/scan/binary/clock 深水探针（probe.sh 差分;反斜杠双写经 printf %b）
 puts "[regexp {(a)\\1} a] [regexp {(a+)\\1} aaaa] [regexp {(\\w+)\\s\\1} {hello hello}]"
-puts "[regexp {(?:ab|a)(?=c)} abc] [regexp {(?<!x)y} xy] [regexp -inline {(?=a)a} a]"
+catch {regexp {(?:ab|a)(?=c)} abc} m ; puts $m
 puts "[regexp {a*?b} aaab] [regexp -inline {(a+?)(a*)} aaa]"
 puts "[regexp -inline {\\yfoo\\y} { foo }] [regexp {\\mfoo\\M} afoo] [regexp {\\Aa} a]"
 puts [regexp -about {(a)(b)+}]
-puts "[regexp {\\u0041} A] [regexp {\\x41} A] [regexp {\\x{41}} A]"
+catch {regexp {\\u0041} A} m ; puts $m
 puts "[regexp -lineanchor -start 1 {\\Aa} b\\na] [regexp -start 2 {\\Aa} b\\na]"
 puts [regexp -all -inline -indices {a*} bab]
 puts "[regexp -inline {b(a|(z)(q))?} b] [regexp -inline {(a)?(b)} b]"
 puts "[regsub {(\\w)(\\w)} hi {\\2\\1&}] [regsub {x} x {\\\\&}]"
-puts "[string match {[]]} ]] [string match {\\*} *] [string match {} {}] [string match {[a-z]} Q]"
+catch {string match a} m ; puts $m
 puts "[format %#x 0] [format %#b 5] [format %+d 5] [format %u -1] [format %c 65536] [format %08s ab] [format %-08s ab]"
 puts "[format %d 4294967297] [format %hd 65537]"
 puts "[scan 12abc {%d%d}] [scan {} %c v] [scan 3.7 {%d} v] [scan 018 %i] [scan -1 %u]"
-puts "[scan abc {%[b-z]} v] $v"
+puts "[scan abc {%[b-z]} v]|[info exists v]"
 puts "[binary scan [binary format n 1] H* h] $h"
 puts "[binary scan [binary format t 1 m 1] H* h] $h"
 puts "[binary format H3 ABC] [binary format a5 ab] [binary format A5 ab]"

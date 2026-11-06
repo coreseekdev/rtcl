@@ -240,16 +240,29 @@
 - **复现**：`puts [regexp {(?<!x)y} xy]`
 - **严重度**：中。
 
-### D-19 模式内 `\uXXXX` / `\x{...}` 被 rtcl 接受（spec [D-18]）
-- **Tcl 8.6**：invalid escape（`\x41` 两位十六进制合法）。
-- **rtcl**：接受并按 Unicode 语义匹配。
-- **严重度**：低（超集）。
+### D-19 模式内十六进制转义语义（spec [D-18]）[FIXED 2026-11-06]
+- **Tcl 8.6.17**（braced pattern 实测）：`\u` 收 **1-4** 位 hex、
+  `\U` 收 **1-8** 位、`\x` 收 **1-2** 位（`\u0041`/`\u041` → A，
+  `\u00041` = U+0004 + "1"，`\x4` = U+0004）；`\x{41}` **不是**
+  8.6 语法（`invalid escape \ sequence` + REG_EESCAPE）；无 hex
+  数字的 `\u`/`\U`/`\x` 同样 invalid。
+- **rtcl 修复态**：`are_escape_end` 在 validate_are（含字符类内部）
+  统一校验并给出 REG_EESCAPE；`expand_unicode_escapes` 把合法转义
+  展开为 `regex_escape` 后的字面字符（fast/BT 两引擎共用）；
+  代理区码点（U+D800..DFFF，Tcl 中永不匹配）类外展开为 `(?!)`，
+  类内用 U+10FFFF 占位（Rust 字符串不可能含代理的近似）。
+  regex-escapes.tcl 差分全 SAME。
+- **严重度**：已关闭。
 
 ### D-20 惰性量词的匹配偏好语义（spec [D-19]）
 - **Tcl 8.6**：`regexp -inline {(a+?)(a*)} aaa` → `{a a {}}`（Spencer
   引擎偏好：整体匹配停在惰性组最小展开）。
 - **rtcl**：`{aaa a aa}`（回溯引擎首个命中 = Perl 风格）。
 - **严重度**：中（BT 引擎需实现 Tcl 偏好序，非平凡）。
+- **残余说明（2026-11-06）**：matching-deep 的其余 4 条 DIFF 已确认
+  是 probe harness 伪差（未 catch 的顶层错误：tclsh stdin rc=0 无
+  "Error: " 前缀 vs rtcl -c rc=1 自带前缀），探针已改为 catch/结构化
+  断言；**唯一真实残差就是本条**（119 SAME / 1 DIFF）。
 
 ### D-21 `\A` 在 `-lineanchor -start` 下被改写为 `^`（spec [D-20]）
 - **Tcl 8.6**：`\A` 只绑定 -start 偏移。
@@ -738,6 +751,34 @@
   definition）。
 - **严重度**：已关闭主体。**外观差异（非分歧）**：::oo::ObjN 编号
   计数与 tclsh 不同（元对象预占号），脚本不应依赖。
+
+### D-45 io 命令面：POSIX 错误文本/访问模式/mtime/fileevent（2026-11-06）[FIXED]
+- **Tcl 8.6.17 实测**：
+  * `open` 失败 → `couldn't open "P": <小写 strerror>` +
+    `POSIX <ERR> {<text>}`；`file size/atime/mtime/type/stat` 失败 →
+    `could not read "P": <text>` + 同 errorCode。
+  * `open name {RDONLY CREAT}` 等 POSIX 标志列表合法（RDONLY/WRONLY/
+    RDWR/APPEND/BINARY/CREAT/EXCL/NOCTTY/NONBLOCK/TRUNC）；未知词 →
+    `invalid access mode "X": must be ...`（ec=NONE）。BINARY 打开后
+    encoding=binary、translation=lf。
+  * `seek` 非 seekable → `error during seek on "c": invalid seek` +
+    `POSIX ESPIPE {invalid seek}`；负 start 偏移 → EINVAL。
+  * `file mtime name time` 设置 mtime（bad time → TCL VALUE NUMBER）。
+  * `fileevent ch readable|writable ?script?` 查询/设置处理器；未知
+    通道 → TCL LOOKUP CHANNEL；方向不符 → `channel is not readable/
+    writable`（ec=NONE）；坏事件名 → TCL LOOKUP INDEX {event name}。
+  * `puts stderr -nonewline hi`（4 词且首词非 -nonewline）→ wrong #
+    args。
+  * `dict for/map/filter` 变量表非二元 → `TCL SYNTAX dict <sub>`。
+- **rtcl 修复态**：新增 errno 文本/码表与 `posix_error`（消息去
+  "(os error N)" 后缀并小写首字母；errorCode `POSIX <NAME> {text}`）；
+  open 支持 POSIX 标志列表；seek/mtime/fileevent 原生命令（fileevent
+  取代 stdlib tailcall shim，处理器保存/查询不派发）；puts 4 词
+  校验；dict 三处变量表错误装 TCL SYNTAX。io-deep **62/0**。
+- **残差**：`dict info` 的 Tcl 哈希表桶统计（1 entries/4 buckets…）
+  不复刻；`dict create -unordered`/`dict getdef` 仍是台账声明的
+  有意扩展（dict-deep 17/3）。
+- **严重度**：已关闭（io 面）。
 
 ## rtcl 有意扩展（超集，非 bug，parity 语料不应使用）
 

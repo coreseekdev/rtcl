@@ -405,9 +405,9 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let var_list = super::list::strict_list(interp, &args[2])?;
             if var_list.len() != 2 {
-                return Err(Error::runtime(
-                    "must have exactly two variable names",
-                    crate::error::ErrorCode::InvalidOp,
+                super::list::set_error_code(interp, "TCL SYNTAX dict for");
+                return Err(Error::Msg(
+                    "must have exactly two variable names".to_string(),
                 ));
             }
             let key_var = var_list[0].as_str().to_string();
@@ -711,9 +711,9 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     let var_list =
                         super::list::strict_list(interp, &args[4])?;
                     if var_list.len() != 2 {
-                        return Err(Error::runtime(
-                            "must have exactly two variable names",
-                            crate::error::ErrorCode::Generic,
+                        super::list::set_error_code(interp, "TCL SYNTAX dict filter");
+                        return Err(Error::Msg(
+                            "must have exactly two variable names".to_string(),
                         ));
                     }
                     let key_var = var_list[0].as_str().to_string();
@@ -766,9 +766,9 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let var_list = super::list::strict_list(interp, &args[2])?;
             if var_list.len() != 2 {
-                return Err(Error::runtime(
-                    "must have exactly two variable names",
-                    crate::error::ErrorCode::Generic,
+                super::list::set_error_code(interp, "TCL SYNTAX dict map");
+                return Err(Error::Msg(
+                    "must have exactly two variable names".to_string(),
                 ));
             }
             let key_var = var_list[0].as_str().to_string();

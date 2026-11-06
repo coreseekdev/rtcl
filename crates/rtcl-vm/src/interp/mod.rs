@@ -1665,12 +1665,19 @@ mod tests {
     }
 
     #[test]
-    fn test_stdlib_fileevent_shim() {
+    fn test_fileevent_native_surface() {
         let mut interp = Interp::new();
-        // fileevent is a shim that just tailcalls its args
-        // We just verify it doesn't error when called with a known command
-        let result = interp.eval("fileevent set x 42").unwrap();
-        assert_eq!(result.as_str(), "42");
+        // 查询/设置/查询 + 方向与未知通道错误（原生命令，不再是 shim）。
+        assert_eq!(interp.eval("fileevent stdin readable").unwrap().as_str(), "");
+        assert_eq!(
+            interp.eval("fileevent stdin readable {puts hi}").unwrap().as_str(),
+            ""
+        );
+        assert_eq!(interp.eval("fileevent stdin readable").unwrap().as_str(), "puts hi");
+        assert_eq!(interp.eval("fileevent stdout writable").unwrap().as_str(), "");
+        assert!(interp.eval("fileevent nosuch readable {}").is_err());
+        assert!(interp.eval("fileevent stdout readable {}").is_err());
+        assert!(interp.eval("fileevent stdin writable {}").is_err());
     }
 
     #[test]

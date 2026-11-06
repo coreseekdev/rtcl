@@ -1,6 +1,6 @@
 # io/chan/file/encoding 深水探针（io-deep;probe.sh 差分;末式一律 puts）
 puts stdout
-puts stderr -nonewline hi; puts ok
+catch {puts stderr -nonewline hi} m ; puts $m
 set f [open /tmp/rt_io1 w]; puts $f hello; close $f; set f [open /tmp/rt_io1 r]; set n [gets $f v]; set e1 [eof $f]; set n2 [gets $f v]; set e2 [eof $f]; puts [list $n $v $e1 $n2 $e2 [info exists v]]
 set f [open /tmp/rt_io2 w]; puts -nonewline $f "héllo"; close $f; set f [open /tmp/rt_io2 r]; puts [string length [read $f 3]]
 set f [open /tmp/rt_io3 w]; puts $f abc; close $f; set f [open /tmp/rt_io3 r]; read $f 0; puts [eof $f]

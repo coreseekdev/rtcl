@@ -506,6 +506,11 @@ pub struct ChannelConfig {
     pub(crate) dec_state: u32,
     /// 输出编码是否已写过首串（E 编码的 init 只发一次）。
     pub(crate) enc_started: bool,
+    /// `fileevent ch readable script` 的当前脚本（查询用；rtcl 无事件
+    /// 循环，处理器只保存不派发）。
+    pub(crate) read_handler: String,
+    /// `fileevent ch writable script` 的当前脚本。
+    pub(crate) write_handler: String,
 }
 
 impl ChannelConfig {
@@ -535,6 +540,8 @@ impl Default for ChannelConfig {
             read_chars: VecDeque::new(),
             dec_state: 0,
             enc_started: false,
+            read_handler: String::new(),
+            write_handler: String::new(),
         }
     }
 }
@@ -542,6 +549,55 @@ impl Default for ChannelConfig {
 // ═══════════════════════════════════════════════════════════════════════
 //  ChannelTable
 // ═══════════════════════════════════════════════════════════════════════
+
+/// Tcl/POSIX open 访问标志（`open name {RDONLY CREAT}` 形式）。
+#[derive(Default, Clone, Copy)]
+struct PosixAccess {
+    read: bool,
+    write: bool,
+    append: bool,
+    create: bool,
+    truncate: bool,
+    exclusive: bool,
+    binary: bool,
+}
+
+/// 解析 POSIX 标志列表；未知词 → None（调用方报 invalid access mode）。
+fn parse_posix_access(mode: &str) -> Option<PosixAccess> {
+    let mut acc = PosixAccess::default();
+    let mut any = false;
+    for tok in mode.split_whitespace() {
+        any = true;
+        match tok {
+            "RDONLY" => acc.read = true,
+            "WRONLY" => acc.write = true,
+            "RDWR" => {
+                acc.read = true;
+                acc.write = true;
+            }
+            "APPEND" => {
+                acc.append = true;
+                acc.write = true;
+            }
+            "CREAT" => acc.create = true,
+            "EXCL" => acc.exclusive = true,
+            "TRUNC" => {
+                acc.truncate = true;
+                acc.write = true;
+            }
+            "BINARY" => acc.binary = true,
+            "NOCTTY" | "NONBLOCK" => {}
+            _ => return None,
+        }
+    }
+    if !any {
+        return None;
+    }
+    if !acc.read && !acc.write {
+        acc.read = true; // 默认 RDONLY
+    }
+    Some(acc)
+}
 
 /// The channel table — maps handle strings to open channels.
 pub struct ChannelTable {
@@ -606,6 +662,7 @@ impl ChannelTable {
     }
 
     pub fn open_file(&mut self, path: &str, mode: &str) -> io::Result<ChannelId> {
+        let mut binary = false;
         let file = match mode {
             "r" => {
                 let f = std::fs::File::open(path)?;
@@ -633,10 +690,36 @@ impl ChannelTable {
                     .read(true).append(true).create(true).open(path)?;
                 Box::new(FileChannel::new_readwrite(f)) as Box<dyn Channel>
             }
-            _ => return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("bad access mode \"{}\"", mode),
-            )),
+            _ => {
+                // POSIX 标志列表（Tcl 8.6：RDONLY/WRONLY/RDWR/APPEND/
+                // BINARY/CREAT/EXCL/NOCTTY/NONBLOCK/TRUNC 的列表）。
+                let Some(acc) = parse_posix_access(mode) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "invalid access mode \"{}\": must be RDONLY, WRONLY, RDWR, APPEND, BINARY, CREAT, EXCL, NOCTTY, NONBLOCK, or TRUNC",
+                            mode
+                        ),
+                    ));
+                };
+                binary = acc.binary;
+                let mut opts = std::fs::OpenOptions::new();
+                opts.read(acc.read).write(acc.write);
+                if acc.append {
+                    opts.append(true);
+                }
+                if acc.create {
+                    opts.create(true);
+                }
+                if acc.truncate {
+                    opts.truncate(true);
+                }
+                if acc.exclusive && acc.create {
+                    opts.create_new(true);
+                }
+                let f = opts.open(path)?;
+                Box::new(FileChannel::new_readwrite(f)) as Box<dyn Channel>
+            }
         };
         let id = format!("file{}", self.next_id);
         self.next_id += 1;
@@ -645,7 +728,21 @@ impl ChannelTable {
         // 文件通道默认：输入 auto、输出平台（unix lf）——与 tclsh 的
         // fconfigure 查询一致（读通道显示 auto，写通道显示 lf）。
         self.configs.insert(id.clone(), ChannelConfig {
-            encoding: self.system_encoding.clone(),
+            encoding: if binary {
+                "binary".to_string()
+            } else {
+                self.system_encoding.clone()
+            },
+            translation_in: if binary {
+                TranslationMode::Lf
+            } else {
+                TranslationMode::Auto
+            },
+            translation_out: if binary {
+                TranslationMode::Lf
+            } else {
+                platform_translation()
+            },
             ..ChannelConfig::default()
         });
         Ok(id)

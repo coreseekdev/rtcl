@@ -233,6 +233,7 @@ static CMD_TABLE_ENV: &[CmdEntry] = &[
 #[cfg(feature = "std")]
 static CMD_TABLE_EVENT: &[CmdEntry] = &[
     CmdEntry { name: "after",   func: event::cmd_after,   cat: Extension, cmd_id: Some(CmdId::After  as u16), usage: "option ?arg ...?",    help: "Schedule or sleep" },
+    CmdEntry { name: "fileevent", func: event::cmd_fileevent, cat: Extension, cmd_id: None, usage: "channelId event ?script?", help: "Channel event handler (stored; no event loop)" },
     CmdEntry { name: "vwait",   func: event::cmd_vwait,   cat: Extension, cmd_id: Some(CmdId::Vwait  as u16), usage: "name",             help: "Wait for variable change" },
     CmdEntry { name: "update",  func: event::cmd_update,  cat: Extension, cmd_id: Some(CmdId::Update as u16), usage: "?idletasks?",         help: "Process pending events" },
     CmdEntry { name: "interp",  func: interp_cmd::cmd_interp, cat: Extension, cmd_id: Some(CmdId::InterpCmd as u16), usage: "cmd ?arg ...?", help: "Create a child interpreter" },

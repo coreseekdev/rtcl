@@ -79,7 +79,15 @@ pub fn cmd_open(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     let id = interp.channels.open_file(path, mode).map_err(|e| {
-        io_err_str(format!("couldn't open \"{}\": {}", path, e))
+        let msg = e.to_string();
+        if e.kind() == std::io::ErrorKind::InvalidInput
+            && msg.starts_with("invalid access mode")
+        {
+            super::list::set_error_code(interp, "NONE");
+            Error::Msg(msg)
+        } else {
+            super::io::posix_error(interp, format!("couldn't open \"{}\"", path), &e)
+        }
     })?;
     Ok(Value::from_str(&id))
 }
@@ -327,16 +335,17 @@ pub fn cmd_seek(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let ch = interp.channels.get_mut(chan_id).unwrap();
     if negative_start {
-        // TclSeek: a negative offset from "start" is EINVAL.
+        // TclSeek: a negative offset from "start" is EINVAL。
+        super::list::set_error_code(interp, "POSIX EINVAL {invalid argument}");
         return Err(Error::runtime(
             format!("error during seek on \"{}\": invalid argument", chan_id),
             crate::error::ErrorCode::InvalidOp,
         ));
     }
-    ch.seek(origin).map_err(|e| Error::runtime(
-        format!("error during seek on \"{}\": {}", chan_id, e),
-        crate::error::ErrorCode::InvalidOp,
-    ))?;
+    let seek_result = ch.seek(origin);
+    if let Err(e) = seek_result {
+        return Err(super::io::seek_error(interp, chan_id, &e));
+    }
     Ok(Value::empty())
 }
 

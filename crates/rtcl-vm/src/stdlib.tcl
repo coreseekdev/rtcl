@@ -165,14 +165,6 @@ proc {file delete force} {path} {
     file delete $path
 }
 
-# ── fileevent (shim) ────────────────────────────────────────────────────
-
-# fileevent — Compatibility shim. Not needed in rtcl.
-# jimtcl: tclcompat.tcl
-proc fileevent {args} {
-    tailcall {*}$args
-}
-
 # ── stackdump / errorInfo ───────────────────────────────────────────────
 
 # stackdump — Human-readable stack trace formatter.

@@ -198,8 +198,9 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   4000 例字符类/排序元素语料（`gen-class-fuzz.py`）、5000 例
   Unicode -nocase 折叠语料（`gen-fold-fuzz.py`）、3000 例
   -expanded 空白/注释语料（`gen-expanded-fuzz.py`，BRE/ERE 同样
-  生效）与 10000 例编译错误码/消息语料（`gen-error-fuzz.py`）
-  **0 差异**。内嵌 `(?i)` 生效后的 options 会传给 NFA/匹配器；
+  生效）、10000 例编译错误码/消息语料（`gen-error-fuzz.py`）、
+  5000 例受限语法的回引匹配/捕获语料（`gen-backref-fuzz.py`）与
+  4000 例 regsub 替换串展开语料（`gen-regsub-fuzz.py`）**0 差异**。内嵌 `(?i)` 生效后的 options 会传给 NFA/匹配器；
   环视内括号保留分组层（`(?=(^){1,2})` 可量化）；环视子式的
   偏好位不向父节点传播（Lacon 是零宽约束，`(?=..)[^ab]*?` 的
   SHORTER 不被内层 LONGER 覆盖）；惰性子节点的重复组末次迭代

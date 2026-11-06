@@ -412,11 +412,22 @@
     按对读（奇尾 → U+FFFD）；`-translation binary` 按 tclsh 耦合为
     `-translation lf + -encoding binary`（查询显示 lf），`-encoding
     binary` 不改 translation；fconfigure 校验收 `binary`。
-- **残差**：iconv 缺名的编码（macGreek/macIceland/macRomania/
-  macTurkish/macCroatian/macUkraine/macThai/macJapan/jis0201/0208/
-  0212/cns11643/gb12345/gb2312-raw/symbol/dingbats/ebcdic/cp165/
-  cp860…）解码按字节直映兜底、编码按 `?` 兜底（tclsh 有真表）；
-  ISO-2022-KR 等有状态编码的逐字符慢路径字节形可能不同。
+  * **.enc 表后端（2026-11-06 第三批收口）**：非内建编码优先解析
+    `encoding dirs`（默认 `$TCL_LIBRARY/encoding` 或
+    `/usr/share/tcltk/tcl8.6/encoding`）下的 `*.enc`——与 tclsh
+    **同一批文件、同一张表**：S（单字节）/D（双字节，全字节为首
+    字节）/M（多字节页表，含 symbol 特殊映射与 M 反斜杠补映射）/
+    E（iso2022-* 转义驱动，子表复用 S/D/M；init/final/子表切换、
+    END 时切回 subTables[0] 再写 final）。84 个非内建名（含
+    iconv 缺名的 macGreek/macTurkish/jis0201/0208/0212/cns11643/
+    gb12345/gb2312-raw/symbol/dingbats/ebcdic/cp165 与
+    iso2022/iso2022-jp/iso2022-kr）在 86 名 × 强样本矩阵
+    （decode 8 字节 + encode 8 码点）上与 tclsh 逐字节一致；
+    通道 gets/read/puts 对 E 编码保持转义状态（init 只随首写）。
+    `encoding dirs` 设置会清空表缓存。
+- **残差**：无文件系统环境（wasm32-unknown-unknown、no_std、
+  自定义 dirs 无 .enc）回退 iconv（若编入）/字节直映与 `?`；E 编码
+  的通道写状态在 fconfigure -encoding 变更时重置（tclsh 同语义）。
 - **严重度**：已关闭。
 
 ### D-44 `-translation` 的 EOL 实际改写未落地（原 D-29 残差）[FIXED 2026-11-06]

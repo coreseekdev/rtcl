@@ -133,11 +133,15 @@ rename 遮蔽过程后旧名解析、`interp alias {} name {} target` 形式、
 
 | feature | 默认 | 作用 | 关闭时 |
 |---|---|---|---|
-| `iconv` | 开 | encoding 宽表（shiftjis/gb2312/big5/...）经 libc iconv | 非内建编码解码按字节直映、编码按 UTF-8 直传；86 名表与命令面不变 |
+| `iconv` | 开 | libc iconv 兜底（`.enc` 表不可用时） | 无 iconv：std + encoding dirs 仍用 Tcl `.enc` 表；无文件系统（wasm/no_std）才字节直映/UTF-8 直传 |
 | `clock` | 开 | clock 命令；unix 下经 libc localtime/mktime 支持本地时区 | 无 clock 命令；不链接 libc |
 | `file`/`io`/`exec`/`env`/`signal`/`package` | 开 | 对应 Tcl 标准扩展 | 命令不注册 |
 | `regexp` / `regexp-lite` | `regexp` 开 | 正则后端二选一（lite 用于小体积 wasm） | 无 regexp/regsub |
 
+- 宽表编码优先用 Tcl `.enc` 表后端（与 tclsh 同一批文件：`encoding
+  dirs` 默认 `$TCL_LIBRARY/encoding` 或 `/usr/share/tcltk/tcl8.6/encoding`；
+  S/D/M/E 四种格式全支持，含 iso2022-*），表不可用时才回退 iconv/
+  字节直映。
 - `libc` 依赖只在 unix 且 `clock` 开启时引入；iconv 后端仅在
   `cfg(all(unix, feature = "iconv"))` 下编译（wasm 天然关闭）。
 - wasm32 构建（rtcl-wasm）用 `default-features = false` 的安全子集，

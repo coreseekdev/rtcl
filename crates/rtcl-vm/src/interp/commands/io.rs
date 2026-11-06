@@ -2299,6 +2299,14 @@ pub fn cmd_encoding(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             if args.len() == 3 {
                 interp.channels.encoding_dirs = args[2].as_str().to_string();
+                // tclsh 的 encoding dirs 是进程级搜索路径：同步 .enc 表
+                // 后端并清空已加载缓存。
+                let list = Value::from_str(args[2].as_str())
+                    .as_list()
+                    .unwrap_or_else(|| vec![args[2].clone()]);
+                let dirs: Vec<String> =
+                    list.iter().map(|v| v.as_str().to_string()).collect();
+                crate::encoding::set_table_dirs(&dirs);
                 return Ok(Value::empty());
             }
             Ok(Value::from_list(&[Value::from_str(

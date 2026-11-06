@@ -738,6 +738,9 @@ let cfg = interp.channels.config_mut(chan_id).unwrap();
             }
             "-encoding" => {
                 cfg.encoding = val.to_string();
+                // 转义编码的读写状态按新编码重置。
+                cfg.dec_state = 0;
+                cfg.enc_started = false;
             }
             "-eofchar" => {
                 // Validated above, before the config was borrowed.
@@ -752,6 +755,8 @@ let cfg = interp.channels.config_mut(chan_id).unwrap();
                 cfg.translation_out = out_mode;
                 if binary {
                     cfg.encoding = "binary".to_string();
+                    cfg.dec_state = 0;
+                    cfg.enc_started = false;
                 }
             }
             _ => unreachable!(),

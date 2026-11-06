@@ -86,15 +86,12 @@ fn write_all_bytes(ch: &mut dyn Channel, bytes: &[u8]) -> io::Result<()> {
 /// 写串：按通道 `-translation`（输出侧）翻译，再按 `-encoding` 编码。
 pub(crate) fn channel_write_str_cfg(
     ch: &mut dyn Channel,
-    cfg: &ChannelConfig,
+    cfg: &mut ChannelConfig,
     s: &str,
 ) -> io::Result<usize> {
     let translated = translate_output(s, cfg.translation_out);
-    let encoded = if cfg.encoding == "utf-8" {
-        translated.as_bytes().to_vec()
-    } else {
-        crate::encoding::encode(&translated, &cfg.encoding)
-    };
+    let encoded = crate::encoding::encode_cont(&translated, &cfg.encoding, !cfg.enc_started);
+    cfg.enc_started = true;
     write_all_bytes(ch, &encoded)?;
     Ok(encoded.len())
 }
@@ -184,12 +181,17 @@ impl<'a> ChannelReader<'a> {
                 Some(char::from_u32(u).unwrap_or('\u{FFFD}'))
             }
             _ => {
-                #[cfg(all(unix, feature = "iconv"))]
-                {
-                    if let Some((text, consumed)) =
-                        crate::encoding::iconv_decode_step(&self.cfg.read_bytes, enc)
-                    {
-                        self.cfg.read_bytes.drain(..consumed);
+                // .enc 表 / iconv / 字节直映统一走 decode_step；空文本
+                // + consumed 表示只消费了转义序列（iso2022），继续解析。
+                loop {
+                    if let Some((text, consumed)) = crate::encoding::decode_step(
+                        &self.cfg.read_bytes,
+                        enc,
+                        &mut self.cfg.dec_state,
+                    ) {
+                        if consumed > 0 {
+                            self.cfg.read_bytes.drain(..consumed);
+                        }
                         let mut it = text.chars();
                         let first = it.next();
                         for c in it {
@@ -198,17 +200,12 @@ impl<'a> ChannelReader<'a> {
                         if first.is_some() {
                             return first;
                         }
-                        // 消费了字节但没产出字符：继续解析剩余尾巴。
-                        return None;
+                        if self.cfg.read_bytes.is_empty() || consumed == 0 {
+                            return None;
+                        }
+                        continue;
                     }
-                    None
-                }
-                #[cfg(not(all(unix, feature = "iconv")))]
-                {
-                    // 无 iconv 后端：逐字节直映（与 encoding::decode 兜底一致）。
-                    let b = self.cfg.read_bytes[0];
-                    self.cfg.read_bytes.drain(..1);
-                    Some(b as char)
+                    return None;
                 }
             }
         }
@@ -224,25 +221,24 @@ impl<'a> ChannelReader<'a> {
             self.cfg.read_bytes.clear();
             return Some('\u{FFFD}');
         }
-        #[cfg(all(unix, feature = "iconv"))]
-        {
-            if !matches!(
+        if !matches!(
+            enc,
+            "utf-8" | "ascii" | "iso8859-1" | "identity" | "binary" | "unicode"
+        ) {
+            if let Some((text, consumed)) = crate::encoding::decode_step(
+                &self.cfg.read_bytes,
                 enc,
-                "utf-8" | "ascii" | "iso8859-1" | "identity" | "binary" | "unicode"
+                &mut self.cfg.dec_state,
             ) {
-                if let Some((text, consumed)) =
-                    crate::encoding::iconv_decode_step(&self.cfg.read_bytes, enc)
-                {
-                    if consumed > 0 {
-                        self.cfg.read_bytes.drain(..consumed);
-                        let mut it = text.chars();
-                        let first = it.next();
-                        for c in it {
-                            self.cfg.read_chars.push_back(c);
-                        }
-                        if first.is_some() {
-                            return first;
-                        }
+                if consumed > 0 {
+                    self.cfg.read_bytes.drain(..consumed);
+                    let mut it = text.chars();
+                    let first = it.next();
+                    for c in it {
+                        self.cfg.read_chars.push_back(c);
+                    }
+                    if first.is_some() {
+                        return first;
                     }
                 }
             }
@@ -506,6 +502,10 @@ pub struct ChannelConfig {
     pub(crate) read_bytes: Vec<u8>,
     /// 解码器一次产出的多余字符（iconv 多字符输出）。
     pub(crate) read_chars: VecDeque<char>,
+    /// 转义编码（iso2022-*）的当前子表状态（跨 read/gets 保持）。
+    pub(crate) dec_state: u32,
+    /// 输出编码是否已写过首串（E 编码的 init 只发一次）。
+    pub(crate) enc_started: bool,
 }
 
 impl ChannelConfig {
@@ -514,6 +514,8 @@ impl ChannelConfig {
         self.read_pending.clear();
         self.read_bytes.clear();
         self.read_chars.clear();
+        self.dec_state = 0;
+        self.enc_started = false;
     }
 }
 
@@ -531,6 +533,8 @@ impl Default for ChannelConfig {
             read_pending: VecDeque::new(),
             read_bytes: Vec::new(),
             read_chars: VecDeque::new(),
+            dec_state: 0,
+            enc_started: false,
         }
     }
 }
@@ -1576,7 +1580,7 @@ mod tests {
         let mut table = ChannelTable::new();
         table.set_stdout(Box::new(MemoryOutputPipe::from_shared(capture.clone(), usize::MAX)));
         let ch = table.get_mut("stdout").unwrap();
-        channel_write_str_cfg(ch.as_mut(), &ChannelConfig::default(), "captured!\n").unwrap();
+        channel_write_str_cfg(ch.as_mut(), &mut ChannelConfig::default(), "captured!\n").unwrap();
         assert_eq!(capture.lock().unwrap().as_slice(), b"captured!\n");
     }
 

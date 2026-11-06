@@ -47,6 +47,813 @@ pub fn known_for_channel(name: &str) -> bool {
 /// 的构建为 false——非内建编码走字节直映兜底）。
 pub const ICONV_BACKEND: bool = cfg!(all(unix, feature = "iconv"));
 
+// ── Tcl .enc 表后端（S/D/M/E）───────────────────────────────────────
+//
+// tclsh 的宽表编码全部来自 `$TCL_LIBRARY/encoding/*.enc`（或安装目录
+// 的 encoding/）。这里直接解析同一批文件，保证与 oracle 同一张表：
+//   S  单字节；D  双字节（所有字节都是首字节）；M  多字节（页内字节
+//   为首字节，其余走 page 0）；E  转义序列驱动（iso2022-*），子表
+//   复用 S/D/M 表。
+// 文件格式：注释行 → 类型行 → S/D/M: `fallback symbol numPages` → 每页
+// `hi` + 16×64 hex → 可选 `R` 反查段；E: key/value 行（init/final/
+// 子表名+转义字节）。仅 std 构建可用；wasm/无文件系统回退 iconv。
+#[cfg(feature = "std")]
+mod table {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+    pub struct TableEncoding {
+        fallback: u16,
+        prefix: [bool; 256],
+        /// page[hi]：首字节 hi 的 256 项解码页；None = 该字节走 page 0。
+        to: Vec<Option<Box<[u16; 256]>>>,
+        /// Unicode → 编码 word（hi<<8|lo；hi=0 即单字节）。
+        from: HashMap<u16, u16>,
+    }
+
+    impl TableEncoding {
+        /// 解码整串（convertfrom 语义：非法/截断按字节值出字符）。
+        pub fn decode(&self, bytes: &[u8]) -> String {
+            let mut out = String::with_capacity(bytes.len());
+            let mut i = 0usize;
+            while i < bytes.len() {
+                let b = bytes[i] as usize;
+                if self.prefix[b] {
+                    if i + 1 >= bytes.len() {
+                        out.push(b as u8 as char);
+                        i += 1;
+                        continue;
+                    }
+                    let ch = self
+                        .to[b]
+                        .as_ref()
+                        .map(|p| p[bytes[i + 1] as usize])
+                        .unwrap_or(0);
+                    if ch == 0 && b != 0 {
+                        out.push(b as u8 as char);
+                        i += 1;
+                    } else {
+                        out.push(char::from_u32(ch as u32).unwrap_or('\u{FFFD}'));
+                        i += 2;
+                    }
+                } else {
+                    let ch = self.page0(b);
+                    if ch == 0 && b != 0 {
+                        out.push(b as u8 as char);
+                    } else {
+                        out.push(char::from_u32(ch as u32).unwrap_or('\u{FFFD}'));
+                    }
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        fn page0(&self, b: usize) -> u16 {
+            self.to[0].as_ref().map(|p| p[b]).unwrap_or(0)
+        }
+
+        /// 增量解码一步（通道用）；None = 需要更多字节。
+        pub fn decode_step(&self, bytes: &[u8]) -> Option<(String, usize)> {
+            if bytes.is_empty() {
+                return None;
+            }
+            let b = bytes[0] as usize;
+            if self.prefix[b] {
+                if bytes.len() < 2 {
+                    return None;
+                }
+                let ch = self
+                    .to[b]
+                    .as_ref()
+                    .map(|p| p[bytes[1] as usize])
+                    .unwrap_or(0);
+                if ch == 0 && b != 0 {
+                    Some(((b as u8 as char).to_string(), 1))
+                } else {
+                    let c = char::from_u32(ch as u32).unwrap_or('\u{FFFD}');
+                    Some((c.to_string(), 2))
+                }
+            } else {
+                let ch = self.page0(b);
+                if ch == 0 && b != 0 {
+                    Some(((b as u8 as char).to_string(), 1))
+                } else {
+                    let c = char::from_u32(ch as u32).unwrap_or('\u{FFFD}');
+                    Some((c.to_string(), 1))
+                }
+            }
+        }
+
+        /// 编码整串：未收录字符 → fallback word（tclsh 同）。
+        pub fn encode(&self, text: &str) -> Vec<u8> {
+            let mut out = Vec::with_capacity(text.len());
+            for c in text.chars() {
+                let u = c as u32;
+                let mut word = if u <= 0xFFFF {
+                    self.from.get(&(u as u16)).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                if word == 0 && u != 0 {
+                    word = self.fallback;
+                }
+                if self.prefix[(word >> 8) as usize] {
+                    out.push((word >> 8) as u8);
+                    out.push(word as u8);
+                } else {
+                    out.push(word as u8);
+                }
+            }
+            out
+        }
+    }
+
+    /// 转义序列编码（iso2022 / iso2022-jp / iso2022-kr）。
+    pub struct EscapeEncoding {
+        init: Vec<u8>,
+        fin: Vec<u8>,
+        /// (escape 字节, 子表)；顺序即 tclsh 的候选序。
+        subs: Vec<(Vec<u8>, Arc<TableEncoding>)>,
+        prefix: [bool; 256],
+    }
+
+    impl EscapeEncoding {
+        /// 解码整串：转义序列切换子表；未知转义 → U+FFFD；子表查不到
+        /// 的字节对 → NUL（Tcl EscapeToUtfProc 不回落字节值）。
+        pub fn decode(&self, bytes: &[u8]) -> String {
+            let mut out = String::with_capacity(bytes.len());
+            let mut i = 0usize;
+            let mut state = 0usize;
+            while i < bytes.len() {
+                let b = bytes[i] as usize;
+                if self.prefix[b] {
+                    let cur = &bytes[i..];
+                    if !self.init.is_empty() && cur.starts_with(&self.init) {
+                        i += self.init.len();
+                        continue;
+                    }
+                    if !self.fin.is_empty() && cur.starts_with(&self.fin) {
+                        i += self.fin.len();
+                        continue;
+                    }
+                    let mut matched = false;
+                    let mut partial = false;
+                    let mut longest = self.init.len().max(self.fin.len());
+                    for (si, (seq, _)) in self.subs.iter().enumerate() {
+                        longest = longest.max(seq.len());
+                        if cur.starts_with(seq) {
+                            state = si;
+                            i += seq.len();
+                            matched = true;
+                            break;
+                        }
+                        if seq.starts_with(cur) {
+                            partial = true;
+                        }
+                    }
+                    if matched {
+                        continue;
+                    }
+                    out.push('\u{FFFD}');
+                    if partial {
+                        i = bytes.len();
+                    } else {
+                        i += longest.min(cur.len()).max(1);
+                    }
+                    continue;
+                }
+                let table = &self.subs[state].1;
+                if table.prefix[b] {
+                    if i + 1 >= bytes.len() {
+                        out.push('\u{FFFD}');
+                        i = bytes.len();
+                        continue;
+                    }
+                    let ch = table
+                        .to[b]
+                        .as_ref()
+                        .map(|p| p[bytes[i + 1] as usize])
+                        .unwrap_or(0);
+                    out.push(char::from_u32(ch as u32).unwrap_or('\0'));
+                    i += 2;
+                } else {
+                    let ch = table.page0(b);
+                    out.push(char::from_u32(ch as u32).unwrap_or('\0'));
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        /// 编码整串：先试当前子表，未收录则按表序找候选并插入其
+        /// 转义序列；都找不到 → 当前子表 fallback（不换状态）。
+        pub fn encode(&self, text: &str, emit_init: bool) -> Vec<u8> {
+            let mut out = Vec::new();
+            if emit_init {
+                out.extend_from_slice(&self.init);
+            }
+            let mut state = 0usize;
+            for c in text.chars() {
+                let mut u = c as u32;
+                if u > 0xFFFF {
+                    u = 0xFFFD;
+                }
+                let key = u as u16;
+                let mut word = self.subs[state]
+                    .1
+                    .from
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0);
+                if word == 0 && u != 0 {
+                    let old = state;
+                    let mut found = false;
+                    for (si, (_, tab)) in self.subs.iter().enumerate() {
+                        if let Some(w) = tab.from.get(&key).copied() {
+                            if w != 0 {
+                                state = si;
+                                word = w;
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !found {
+                        state = old;
+                        word = self.subs[state].1.fallback;
+                    } else if state != old {
+                        out.extend_from_slice(&self.subs[state].0);
+                    }
+                }
+                let tab = &self.subs[state].1;
+                if tab.prefix[(word >> 8) as usize] {
+                    out.push((word >> 8) as u8);
+                    out.push(word as u8);
+                } else {
+                    out.push(word as u8);
+                }
+            }
+            // END：非默认子表时先切回 subTables[0] 的转义序列，
+            // 再写 final（iso2022-jp 的 ESC(B / iso2022-kr 的 SI）。
+            if state != 0 {
+                out.extend_from_slice(&self.subs[0].0);
+            }
+            out.extend_from_slice(&self.fin);
+            out
+        }
+
+        /// 增量解码一步；空文本 + consumed 表示只消费了转义序列。
+        pub fn decode_step(&self, bytes: &[u8], state: &mut u32) -> Option<(String, usize)> {
+            if bytes.is_empty() {
+                return None;
+            }
+            let b = bytes[0] as usize;
+            if self.prefix[b] {
+                if !self.init.is_empty() {
+                    if bytes.starts_with(&self.init) {
+                        return Some((String::new(), self.init.len()));
+                    }
+                    if self.init.starts_with(bytes) {
+                        return None;
+                    }
+                }
+                if !self.fin.is_empty() {
+                    if bytes.starts_with(&self.fin) {
+                        return Some((String::new(), self.fin.len()));
+                    }
+                    if self.fin.starts_with(bytes) {
+                        return None;
+                    }
+                }
+                let mut longest = self.init.len().max(self.fin.len());
+                let mut partial = false;
+                for (si, (seq, _)) in self.subs.iter().enumerate() {
+                    longest = longest.max(seq.len());
+                    if bytes.starts_with(seq) {
+                        *state = si as u32;
+                        return Some((String::new(), seq.len()));
+                    }
+                    if seq.starts_with(bytes) {
+                        partial = true;
+                    }
+                }
+                if partial {
+                    return None;
+                }
+                return Some((
+                    "\u{FFFD}".to_string(),
+                    longest.min(bytes.len()).max(1),
+                ));
+            }
+            let table = &self.subs[*state as usize].1;
+            if table.prefix[b] {
+                if bytes.len() < 2 {
+                    return None;
+                }
+                let ch = table
+                    .to[b]
+                    .as_ref()
+                    .map(|p| p[bytes[1] as usize])
+                    .unwrap_or(0);
+                Some((
+                    char::from_u32(ch as u32).unwrap_or('\0').to_string(),
+                    2,
+                ))
+            } else {
+                let ch = table.page0(b);
+                Some((
+                    char::from_u32(ch as u32).unwrap_or('\0').to_string(),
+                    1,
+                ))
+            }
+        }
+    }
+
+    pub enum Codec {
+        Table(TableEncoding),
+        Escape(EscapeEncoding),
+    }
+
+    impl Codec {
+        pub fn decode(&self, bytes: &[u8]) -> String {
+            match self {
+                Codec::Table(t) => t.decode(bytes),
+                Codec::Escape(e) => e.decode(bytes),
+            }
+        }
+        pub fn encode(&self, text: &str, emit_init: bool) -> Vec<u8> {
+            match self {
+                Codec::Table(t) => t.encode(text),
+                Codec::Escape(e) => e.encode(text, emit_init),
+            }
+        }
+        pub fn decode_step(
+            &self,
+            bytes: &[u8],
+            state: &mut u32,
+        ) -> Option<(String, usize)> {
+            match self {
+                Codec::Table(t) => t.decode_step(bytes),
+                Codec::Escape(e) => e.decode_step(bytes, state),
+            }
+        }
+    }
+
+    fn default_dirs() -> Vec<PathBuf> {
+        if let Ok(lib) = std::env::var("TCL_LIBRARY") {
+            vec![PathBuf::from(lib).join("encoding")]
+        } else {
+            vec![PathBuf::from("/usr/share/tcltk/tcl8.6/encoding")]
+        }
+    }
+
+    fn dirs() -> &'static RwLock<Vec<PathBuf>> {
+        static DIRS: OnceLock<RwLock<Vec<PathBuf>>> = OnceLock::new();
+        DIRS.get_or_init(|| RwLock::new(default_dirs()))
+    }
+
+    fn cache() -> &'static Mutex<HashMap<String, Option<Arc<Codec>>>> {
+        static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<Codec>>>>> =
+            OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn table_cache() -> &'static Mutex<HashMap<String, Option<Arc<TableEncoding>>>> {
+        static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<TableEncoding>>>>> =
+            OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// `encoding dirs` 设置：更新全局搜索路径并清空已加载缓存
+    /// （tclsh 的 encoding dirs 也是进程级的）。
+    pub fn set_dirs(list: &[String]) {
+        let paths: Vec<PathBuf> = list.iter().map(PathBuf::from).collect();
+        if let Ok(mut d) = dirs().write() {
+            *d = paths;
+        }
+        if let Ok(mut c) = cache().lock() {
+            c.clear();
+        }
+        if let Ok(mut c) = table_cache().lock() {
+            c.clear();
+        }
+    }
+
+    fn read_enc(name: &str) -> Option<String> {
+        let dirs = dirs().read().ok()?;
+        for dir in dirs.iter() {
+            let path = dir.join(format!("{}.enc", name));
+            if let Ok(d) = std::fs::read_to_string(&path) {
+                return Some(d);
+            }
+        }
+        None
+    }
+
+    fn file_type(data: &str) -> Option<&str> {
+        data.lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+    }
+
+    /// 取（并缓存）某编码的 codec；文件不存在/解析失败 → None。
+    pub fn load(name: &str) -> Option<Arc<Codec>> {
+        if let Ok(c) = cache().lock() {
+            if let Some(e) = c.get(name) {
+                return e.clone();
+            }
+        }
+        let codec = (|| -> Option<Codec> {
+            let data = read_enc(name)?;
+            match file_type(&data)? {
+                "S" | "D" | "M" => Some(Codec::Table(parse_table(&data)?)),
+                "E" => Some(Codec::Escape(parse_escape(&data)?)),
+                _ => None,
+            }
+        })()
+        .map(Arc::new);
+        if let Ok(mut c) = cache().lock() {
+            c.insert(name.to_string(), codec.clone());
+        }
+        codec
+    }
+
+    fn load_table(name: &str) -> Option<Arc<TableEncoding>> {
+        if let Ok(c) = table_cache().lock() {
+            if let Some(e) = c.get(name) {
+                return e.clone();
+            }
+        }
+        let t = (|| -> Option<TableEncoding> {
+            let data = read_enc(name)?;
+            match file_type(&data)? {
+                "S" | "D" | "M" => parse_table(&data),
+                _ => None,
+            }
+        })()
+        .map(Arc::new);
+        if let Ok(mut c) = table_cache().lock() {
+            c.insert(name.to_string(), t.clone());
+        }
+        t
+    }
+
+    fn hex4(s: &str) -> Option<u16> {
+        u16::from_str_radix(s, 16).ok()
+    }
+
+    fn parse_table(data: &str) -> Option<TableEncoding> {
+        let mut lines = data.lines();
+        let typ = loop {
+            let l = lines.next()?.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            break l.to_string();
+        };
+        if typ != "S" && typ != "D" && typ != "M" {
+            return None;
+        }
+        let header = loop {
+            let l = lines.next()?.trim();
+            if l.is_empty() {
+                continue;
+            }
+            break l.to_string();
+        };
+        let h: Vec<&str> = header.split_whitespace().collect();
+        if h.len() < 3 {
+            return None;
+        }
+        let fallback = hex4(h[0])?;
+        let symbol = h[1].parse::<i64>().ok()? != 0;
+        let num_pages = h[2].parse::<i64>().ok()?.clamp(0, 256) as usize;
+
+        let rest: Vec<&str> = lines
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut idx = 0usize;
+        let mut to: Vec<Option<Box<[u16; 256]>>> = vec![None; 256];
+        for _ in 0..num_pages {
+            let hi = u8::from_str_radix(*rest.get(idx)?, 16).ok()? as usize;
+            idx += 1;
+            let mut page = Box::new([0u16; 256]);
+            for g in 0..16 {
+                let tok = *rest.get(idx)?;
+                idx += 1;
+                if tok.len() != 64 {
+                    return None;
+                }
+                for k in 0..16 {
+                    page[g * 16 + k] = hex4(&tok[k * 4..k * 4 + 4])?;
+                }
+            }
+            to[hi] = Some(page);
+        }
+
+        let mut prefix = [false; 256];
+        if typ == "D" {
+            prefix = [true; 256];
+        } else {
+            for hi in 1..256usize {
+                prefix[hi] = to[hi].is_some();
+            }
+        }
+
+        // 反查表（Unicode → word）；后面的页覆盖前面的同码点（tclsh 同）。
+        let mut from: HashMap<u16, u16> = HashMap::new();
+        for hi in 0..256usize {
+            if let Some(page) = to[hi].as_ref() {
+                for lo in 0..256usize {
+                    let ch = page[lo];
+                    if ch != 0 {
+                        from.insert(ch, ((hi as u16) << 8) | lo as u16);
+                    }
+                }
+            }
+        }
+        if typ == "M" {
+            from.entry(0x5C).or_insert(0x5C);
+        }
+        if symbol {
+            if let Some(page) = to[0].as_ref() {
+                for lo in 0..256usize {
+                    if page[lo] != 0 {
+                        from.insert(lo as u16, lo as u16);
+                    }
+                }
+            }
+        }
+
+        // 可选 R 反查段：行首 4 hex 为目标 word，随后 4 hex 为源码点。
+        if rest.get(idx).map(|s| *s == "R").unwrap_or(false) {
+            idx += 1;
+            while let Some(line) = rest.get(idx) {
+                idx += 1;
+                let toks: Vec<&str> = line.split_whitespace().collect();
+                if toks.len() < 2 {
+                    continue;
+                }
+                let Some(to_word) = hex4(toks[0]) else { continue };
+                if to_word == 0 {
+                    continue;
+                }
+                for t in &toks[1..] {
+                    if let Some(from_ch) = hex4(t) {
+                        if from_ch != 0 {
+                            from.insert(from_ch, to_word);
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(TableEncoding {
+            fallback,
+            prefix,
+            to,
+            from,
+        })
+    }
+
+    fn parse_escape(data: &str) -> Option<EscapeEncoding> {
+        let mut init: Vec<u8> = Vec::new();
+        let mut fin: Vec<u8> = Vec::new();
+        let mut subs_raw: Vec<(Vec<u8>, String)> = Vec::new();
+        let mut first = true;
+        for line in data.lines() {
+            let l = line.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            if first {
+                first = false;
+                if l == "E" {
+                    continue;
+                }
+                return None;
+            }
+            let mut it = l.split_whitespace();
+            let key = it.next()?;
+            let val = it.next()?;
+            let seq = if val == "{}" {
+                Vec::new()
+            } else {
+                unescape(val)
+            };
+            match key {
+                "name" => {}
+                "init" => init = seq,
+                "final" => fin = seq,
+                other => subs_raw.push((seq, other.to_string())),
+            }
+        }
+        let mut subs = Vec::new();
+        for (seq, name) in subs_raw {
+            let tab = load_table(&name)?;
+            subs.push((seq, tab));
+        }
+        if subs.is_empty() {
+            return None;
+        }
+        // 只有各序列的**首字节**是转义前缀（Tcl LoadEscapeEncoding
+        // 同款——把 init/final 的所有字节都当 prefix 会把 ")" 等普通
+        // 字节误判成转义起点）。
+        let mut prefix = [false; 256];
+        if let Some(&b) = init.first() {
+            prefix[b as usize] = true;
+        }
+        if let Some(&b) = fin.first() {
+            prefix[b as usize] = true;
+        }
+        for (seq, _) in &subs {
+            if let Some(&b) = seq.first() {
+                prefix[b as usize] = true;
+            }
+        }
+        Some(EscapeEncoding {
+            init,
+            fin,
+            subs,
+            prefix,
+        })
+    }
+
+    /// Tcl 列表字面量的反斜杠解码（编码文件只用到 \xHH/\uHHHH/\NNN
+    /// 与常见控制字符）。
+    fn unescape(s: &str) -> Vec<u8> {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if chars[i] != '\\' {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(chars[i].encode_utf8(&mut buf).as_bytes());
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if i >= chars.len() {
+                out.push(b'\\');
+                break;
+            }
+            match chars[i] {
+                'x' => {
+                    i += 1;
+                    let mut v = 0u32;
+                    let mut n = 0;
+                    while n < 2 && i < chars.len() {
+                        if let Some(d) = chars[i].to_digit(16) {
+                            v = v * 16 + d;
+                            i += 1;
+                            n += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    out.push(v as u8);
+                }
+                'u' => {
+                    i += 1;
+                    let mut v = 0u32;
+                    let mut n = 0;
+                    while n < 4 && i < chars.len() {
+                        if let Some(d) = chars[i].to_digit(16) {
+                            v = v * 16 + d;
+                            i += 1;
+                            n += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(c) = char::from_u32(v) {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                }
+                '0'..='7' => {
+                    let mut v = 0u32;
+                    let mut n = 0;
+                    while n < 3 && i < chars.len() {
+                        if let Some(d) = chars[i].to_digit(8) {
+                            v = v * 8 + d;
+                            i += 1;
+                            n += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    out.push(v as u8);
+                }
+                'n' => {
+                    out.push(b'\n');
+                    i += 1;
+                }
+                'r' => {
+                    out.push(b'\r');
+                    i += 1;
+                }
+                't' => {
+                    out.push(b'\t');
+                    i += 1;
+                }
+                'a' => {
+                    out.push(7);
+                    i += 1;
+                }
+                'b' => {
+                    out.push(8);
+                    i += 1;
+                }
+                'f' => {
+                    out.push(12);
+                    i += 1;
+                }
+                'v' => {
+                    out.push(11);
+                    i += 1;
+                }
+                '\\' => {
+                    out.push(b'\\');
+                    i += 1;
+                }
+                other => {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 非内建编码的整串解码：优先 .enc 表（tclsh 同源），再 iconv，最后
+/// 字节直映。
+fn wide_decode(bytes: &[u8], enc: &str) -> String {
+    #[cfg(feature = "std")]
+    if let Some(t) = table::load(enc) {
+        return t.decode(bytes);
+    }
+    #[cfg(all(unix, feature = "iconv"))]
+    {
+        iconv_decode(bytes, enc)
+    }
+    #[cfg(not(all(unix, feature = "iconv")))]
+    {
+        bytes.iter().map(|&b| b as char).collect()
+    }
+}
+
+fn wide_encode(text: &str, enc: &str, emit_init: bool) -> Vec<u8> {
+    #[cfg(feature = "std")]
+    if let Some(t) = table::load(enc) {
+        return t.encode(text, emit_init);
+    }
+    #[cfg(all(unix, feature = "iconv"))]
+    {
+        iconv_encode(text, enc)
+    }
+    #[cfg(not(all(unix, feature = "iconv")))]
+    {
+        text.as_bytes().to_vec()
+    }
+}
+
+/// 增量解码一步（通道用）：优先 .enc 表（含 iso2022 转义状态），再
+/// iconv。`state` 仅转义编码使用（调用方持久化）。
+pub fn decode_step(bytes: &[u8], enc: &str, state: &mut u32) -> Option<(String, usize)> {
+    #[cfg(feature = "std")]
+    if let Some(t) = table::load(enc) {
+        return t.decode_step(bytes, state);
+    }
+    #[cfg(all(unix, feature = "iconv"))]
+    {
+        let _ = state;
+        iconv_decode_step(bytes, enc)
+    }
+    #[cfg(not(all(unix, feature = "iconv")))]
+    {
+        let _ = state;
+        if bytes.is_empty() {
+            None
+        } else {
+            Some(((bytes[0] as char).to_string(), 1))
+        }
+    }
+}
+
+/// 设置 .enc 表搜索目录（`encoding dirs` 设置时调用；std 构建）。
+pub fn set_table_dirs(list: &[String]) {
+    #[cfg(feature = "std")]
+    table::set_dirs(list);
+    #[cfg(not(feature = "std"))]
+    let _ = list;
+}
+
 /// 字节串 → 字符（Tcl 的字节值直映约定：每个输入字节出 0..255 的字符）。
 pub fn decode(bytes: &[u8], enc: &str) -> String {
     match enc {
@@ -55,16 +862,7 @@ pub fn decode(bytes: &[u8], enc: &str) -> String {
             bytes.iter().map(|&b| b as char).collect()
         }
         "unicode" => decode_ucs2le(bytes),
-        _ => {
-            #[cfg(all(unix, feature = "iconv"))]
-            {
-                iconv_decode(bytes, enc)
-            }
-            #[cfg(not(all(unix, feature = "iconv")))]
-            {
-                bytes.iter().map(|&b| b as char).collect()
-            }
-        }
+        _ => wide_decode(bytes, enc),
     }
 }
 
@@ -99,16 +897,43 @@ pub fn encode(text: &str, enc: &str) -> Vec<u8> {
             }
             out
         }
-        _ => {
-            #[cfg(all(unix, feature = "iconv"))]
-            {
-                iconv_encode(text, enc)
+        _ => wide_encode(text, enc, true),
+    }
+}
+
+/// 通道写串：`emit_init=false` 时省掉 E 编码的起始转义（tclsh 的
+/// channel encoder 只在首次写时发 init；后续写直接延续状态）。
+pub fn encode_cont(text: &str, enc: &str, emit_init: bool) -> Vec<u8> {
+    match enc {
+        "utf-8" => text.as_bytes().to_vec(),
+        "ascii" => text
+            .chars()
+            .map(|c| if (c as u32) < 128 { c as u8 } else { b'?' })
+            .collect(),
+        "iso8859-1" => text
+            .chars()
+            .map(|c| {
+                let u = c as u32;
+                if u < 256 { u as u8 } else { b'?' }
+            })
+            .collect(),
+        "identity" => text.as_bytes().to_vec(),
+        "binary" => text.chars().map(|c| (c as u32 & 0xFF) as u8).collect(),
+        "unicode" => {
+            let mut out = Vec::with_capacity(text.len() * 2);
+            for c in text.chars() {
+                let u = c as u32;
+                if u <= 0xFFFF {
+                    out.push((u & 0xFF) as u8);
+                    out.push((u >> 8) as u8);
+                } else {
+                    out.push(0xFD);
+                    out.push(0xFF);
+                }
             }
-            #[cfg(not(all(unix, feature = "iconv")))]
-            {
-                text.as_bytes().to_vec()
-            }
+            out
         }
+        _ => wide_encode(text, enc, emit_init),
     }
 }
 
@@ -363,9 +1188,13 @@ mod tests {
 
     #[cfg(not(all(unix, feature = "iconv")))]
     #[test]
-    fn missing_iconv_backend_falls_back_to_byte_pass_through() {
+    fn missing_iconv_uses_table_or_byte_pass_through() {
         assert!(!ICONV_BACKEND);
-        assert_eq!(decode(b"\x82\xa0", "shiftjis"), "\u{82}\u{a0}");
-        assert_eq!(encode("あ", "shiftjis"), "あ".as_bytes());
+        // std 构建 + encoding 目录可用时，.enc 表后端与 iconv 无关地
+        // 保持精确；无文件系统（wasm/no_std）才退回字节直映。
+        let dec = decode(b"\x82\xa0", "shiftjis");
+        assert!(dec == "あ" || dec == "\u{82}\u{a0}", "got {dec:?}");
+        let enc = encode("あ", "shiftjis");
+        assert!(enc == b"\x82\xa0" || enc == "あ".as_bytes(), "got {enc:?}");
     }
 }

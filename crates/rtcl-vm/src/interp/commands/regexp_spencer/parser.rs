@@ -224,8 +224,10 @@ impl Parser {
     }
 
     fn skip_ws(&mut self) {
-        // Expanded 是 ARE 扩展；BRE/ERE 里空白与 # 都是普通字符。
-        if !self.opts.expanded || self.mode() != Mode::Are {
+        // -expanded 是命令级 REG_EXPANDED：BRE/ERE 下同样忽略空白
+        // 与 `#` 注释（tclsh 实测），`***=` 字面模式在 prefixes
+        // 里已把 expanded 清掉。
+        if !self.opts.expanded {
             return;
         }
         loop {

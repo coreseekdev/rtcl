@@ -188,12 +188,17 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   `regsub` 的循环是 offset<=length（非空匹配到串尾后仍补一次空
   匹配），且 `-start` 越过串尾时不执行。`regexp -start` 越过串尾按
   虚拟空串匹配并保留原偏移（`-start 9 {$} ba` → 索引 `9 8`）。
+  `-start` 索引语法按 Tcl：C 风格整数（0x/0o/0b/前导 0 八进制）、
+  外层空白、`int±int`（尾项可带符号）、`end±int`，结果按 32 位
+  回绕（`-2147483649`→2147483647，`4294967296` 报错）。
   验证：3500 + 12000 + 15000 三组 seed 的命令面随机语料（开关组合/
   match vars/regsub 替换串/空匹配/越界 -start）**0 差异**，另有
   5000 例 Unicode/多字节文本命令面语料、15000 例嵌套语法层语料
   （环视/分组/量词/内嵌选项，`specs/regex/gen-deep-fuzz.py`）、
-  4000 例字符类/排序元素语料（`gen-class-fuzz.py`）与 5000 例
-  Unicode -nocase 折叠语料（`gen-fold-fuzz.py`）**0 差异**。内嵌 `(?i)` 生效后的 options 会传给 NFA/匹配器；
+  4000 例字符类/排序元素语料（`gen-class-fuzz.py`）、5000 例
+  Unicode -nocase 折叠语料（`gen-fold-fuzz.py`）与 3000 例
+  -expanded 空白/注释语料（`gen-expanded-fuzz.py`，BRE/ERE 同样
+  生效）**0 差异**。内嵌 `(?i)` 生效后的 options 会传给 NFA/匹配器；
   环视内括号保留分组层（`(?=(^){1,2})` 可量化）；环视子式的
   偏好位不向父节点传播（Lacon 是零宽约束，`(?=..)[^ab]*?` 的
   SHORTER 不被内层 LONGER 覆盖）；惰性子节点的重复组末次迭代

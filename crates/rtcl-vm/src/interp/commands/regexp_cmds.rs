@@ -918,6 +918,61 @@ pub(crate) fn engine_group_count(_eng: &Engine, pattern: &str) -> usize {
 /// `end` to the string *length* here (not length-1), so `-start end-1`
 /// points at the last character.
 #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+/// Tcl 索引整数语法：可选符号 + C 风格进制（0x/0o/0b/前导 0 八进制），
+/// 返回 i64；最终由 `wrap_tcl_index` 做 32 位回绕（tclsh 行为）。
+fn parse_index_int(t: &str) -> Option<i64> {
+    if t.is_empty() {
+        return None;
+    }
+    let (neg, body) = match t.as_bytes()[0] {
+        b'+' => (false, &t[1..]),
+        b'-' => (true, &t[1..]),
+        _ => (false, t),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let (radix, digits) = if let Some(r) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        (16, r)
+    } else if let Some(r) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        (8, r)
+    } else if let Some(r) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        (2, r)
+    } else if body.len() > 1 && body.starts_with('0') {
+        (8, &body[1..])
+    } else {
+        (10, body)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for c in digits.chars() {
+        let d = c.to_digit(radix)? as u64;
+        v = v.checked_mul(radix as u64)?.checked_add(d)?;
+    }
+    if neg {
+        Some(-(v as i64))
+    } else {
+        Some(v as i64)
+    }
+}
+
+/// tclsh 的 -start 解析结果是 32 位整数：|v| <= 2^32-1 时按 i32 回绕，
+/// 超出则报 bad index（`-2147483649`→2147483647、`4294967296`→错误）。
+fn wrap_tcl_index(v: i64) -> Option<i64> {
+    const LIMIT: i64 = 4_294_967_295;
+    if v < -LIMIT || v > LIMIT {
+        None
+    } else {
+        Some(v as i32 as i64)
+    }
+}
+
+/// Parse a `-start` index with Tcl's index grammar
+/// (`integer?[+-]integer?` or `end?[+-]integer?`).  tclsh resolves
+/// `end` to the string *length* here (not length-1), so `-start end-1`
+/// points at the last character.
 fn parse_start_index(s: &str, len: usize) -> std::result::Result<usize, String> {
     let bad = || {
         format!(
@@ -925,33 +980,54 @@ fn parse_start_index(s: &str, len: usize) -> std::result::Result<usize, String> 
             s
         )
     };
-    let (head, tail) = if let Some(rest) = s.strip_prefix("end") {
-        (len as i64, rest)
-    } else if let Ok(n) = s.parse::<i64>() {
-        // Plain integer, including negatives (tclsh clamps to 0).
-        (n, "")
-    } else {
-        // `int+int` / `int-int` — the sign separator is never the
-        // leading minus of the number itself.
-        match s[1..].find(['+', '-']).map(|i| i + 1) {
-            Some(i) => {
-                let h = s[..i].parse::<i64>().map_err(|_| bad())?;
-                (h, &s[i..])
+    let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    if t.is_empty() {
+        return Err(bad());
+    }
+    let idx = if let Some(rest) = t.strip_prefix("end") {
+        let base = len as i64;
+        if rest.is_empty() {
+            base
+        } else {
+            let op = rest.as_bytes()[0];
+            if op != b'+' && op != b'-' {
+                return Err(bad());
             }
+            let n = parse_index_int(&rest[1..]).ok_or_else(bad)?;
+            if op == b'+' {
+                base + n
+            } else {
+                base - n
+            }
+        }
+    } else if let Some(v) = parse_index_int(t) {
+        v
+    } else {
+        // int+int / int-int：分隔符后的部分本身可带符号
+        // （`1+-2` = 1 + (-2)，`1--2` = 1 - (-2)）。
+        let mut found = None;
+        for (i, c) in t.char_indices() {
+            if i == 0 || (c != '+' && c != '-') {
+                continue;
+            }
+            let head = match parse_index_int(&t[..i]) {
+                Some(v) => v,
+                None => continue,
+            };
+            let tail = match parse_index_int(&t[i + 1..]) {
+                Some(v) => v,
+                None => continue,
+            };
+            found = Some(if c == '+' { head + tail } else { head - tail });
+            break;
+        }
+        match found {
+            Some(v) => v,
             None => return Err(bad()),
         }
     };
-    let idx = if tail.is_empty() {
-        head
-    } else {
-        let n: i64 = tail[1..].parse().map_err(|_| bad())?;
-        if tail.starts_with('+') {
-            head + n
-        } else {
-            head - n
-        }
-    };
-    Ok(idx.max(0) as usize)
+    let v = wrap_tcl_index(idx).ok_or_else(bad)?;
+    Ok(v.max(0) as usize)
 }
 
 #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
@@ -2007,6 +2083,24 @@ pub fn cmd_regsub(_interp: &mut Interp, _args: &[Value]) -> Result<Value> {
 #[cfg(all(test, feature = "regexp"))]
 mod tests {
     use crate::interp::Interp;
+
+    #[test]
+    fn parse_start_index_tcl_grammar() {
+        use super::parse_start_index;
+        assert_eq!(parse_start_index("0x10", 3), Ok(16));
+        assert_eq!(parse_start_index("010", 3), Ok(8));
+        assert_eq!(parse_start_index("0b10", 3), Ok(2));
+        assert_eq!(parse_start_index("end+1", 3), Ok(4));
+        assert_eq!(parse_start_index("end-100", 3), Ok(0));
+        assert_eq!(parse_start_index("1+-2", 3), Ok(0));
+        assert_eq!(parse_start_index("1--2", 3), Ok(3));
+        assert_eq!(parse_start_index(" 1 ", 3), Ok(1));
+        assert_eq!(parse_start_index("-2147483649", 3), Ok(2147483647));
+        assert!(parse_start_index("4294967296", 3).is_err());
+        assert!(parse_start_index("", 3).is_err());
+        assert!(parse_start_index("1 + 2", 3).is_err());
+        assert!(parse_start_index("0d10", 3).is_err());
+    }
 
     // ── basic regexp tests ─────────────────────────────────────────────────────
 

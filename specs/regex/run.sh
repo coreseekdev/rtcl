@@ -30,7 +30,7 @@ for f in specs/regex/semantics.tcl specs/regex/random-4000.tcl; do
 done
 
 # BRE/ERE 方言与 -about re_info 标志（Spencer 默认引擎）。
-for f in specs/regex/dialect-probes.tcl specs/regex/about-probes.tcl; do
+for f in specs/regex/dialect-probes.tcl specs/regex/about-probes.tcl specs/regex/start-probes.tcl; do
     base=$(basename "$f" .tcl)
     tclsh "$f" > "/tmp/rtcl-regex-$base-o.txt" 2>&1
     "$RTCL" -f "$f" > "/tmp/rtcl-regex-$base-r.txt" 2>&1
@@ -65,7 +65,7 @@ if command -v python3 >/dev/null 2>&1; then
         diff /tmp/rtcl-regex-deepfuzz-o.txt /tmp/rtcl-regex-deepfuzz-r.txt | head -20
     fi
     # 字符类/排序元素/等价类 + Unicode -nocase 折叠。
-    for g in gen-class-fuzz gen-fold-fuzz; do
+    for g in gen-class-fuzz gen-fold-fuzz gen-expanded-fuzz; do
         python3 "specs/regex/$g.py" > "/tmp/rtcl-regex-$g.tcl"
         tclsh "/tmp/rtcl-regex-$g.tcl" > "/tmp/rtcl-regex-$g-o.txt" 2>&1
         "$RTCL" -f "/tmp/rtcl-regex-$g.tcl" > "/tmp/rtcl-regex-$g-r.txt" 2>&1

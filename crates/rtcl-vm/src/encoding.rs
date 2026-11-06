@@ -11,6 +11,11 @@
 //! * `unicode` = UCS-2LE（>U+FFFF → U+FFFD；奇尾字节 → U+FFFD）；
 //! * 其余（iconv 覆盖的多数编码）：解码经 libc iconv；无效字节按字节值
 //!   出字符继续；编码失败字符 → `?` 继续。
+//!
+//! iconv 后端是**可选的原生能力**（feature `iconv`，默认开；见
+//! Cargo.toml）：仅在 unix + feature 同时成立时编译。wasm/无 libc 目标
+//! 或关闭 feature 时，非内建编码退化为字节直映（decode）/UTF-8 直传
+//! （encode），名字表与命令面保持完整。
 
 /// tclsh 8.6 `encoding names` 的精确顺序（86 项）。
 pub const NAMES: [&str; 86] = [
@@ -38,6 +43,10 @@ pub fn known_for_channel(name: &str) -> bool {
     name == "binary" || known(name)
 }
 
+/// 是否编入 libc iconv 后端（native 默认；wasm / 无 libc / 关闭 feature
+/// 的构建为 false——非内建编码走字节直映兜底）。
+pub const ICONV_BACKEND: bool = cfg!(all(unix, feature = "iconv"));
+
 /// 字节串 → 字符（Tcl 的字节值直映约定：每个输入字节出 0..255 的字符）。
 pub fn decode(bytes: &[u8], enc: &str) -> String {
     match enc {
@@ -47,11 +56,11 @@ pub fn decode(bytes: &[u8], enc: &str) -> String {
         }
         "unicode" => decode_ucs2le(bytes),
         _ => {
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "iconv"))]
             {
                 iconv_decode(bytes, enc)
             }
-            #[cfg(not(unix))]
+            #[cfg(not(all(unix, feature = "iconv")))]
             {
                 bytes.iter().map(|&b| b as char).collect()
             }
@@ -91,11 +100,11 @@ pub fn encode(text: &str, enc: &str) -> Vec<u8> {
             out
         }
         _ => {
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "iconv"))]
             {
                 iconv_encode(text, enc)
             }
-            #[cfg(not(unix))]
+            #[cfg(not(all(unix, feature = "iconv")))]
             {
                 text.as_bytes().to_vec()
             }
@@ -158,7 +167,7 @@ pub fn is_single_byte(enc: &str) -> bool {
 // ── iconv 后端（libc）────────────────────────────────────────────────
 
 /// Tcl 名 → iconv 名（其余同名直接交给 iconv 的别名表）。
-#[cfg(unix)]
+#[cfg(all(unix, feature = "iconv"))]
 fn iconv_name(enc: &str) -> &str {
     match enc {
         "shiftjis" => "SHIFT_JIS",
@@ -178,7 +187,7 @@ fn iconv_name(enc: &str) -> &str {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "iconv"))]
 mod iconv_ffi {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int, c_void};
@@ -247,7 +256,7 @@ mod iconv_ffi {
 
 /// 增量解码一步（通道用）：返回 (本次解出的文本, 消费的输入字节数)。
 /// `None` = 输入还是不完整序列，需要继续读。
-#[cfg(unix)]
+#[cfg(all(unix, feature = "iconv"))]
 pub fn iconv_decode_step(bytes: &[u8], enc: &str) -> Option<(String, usize)> {
     if bytes.is_empty() {
         return None;
@@ -270,7 +279,7 @@ pub fn iconv_decode_step(bytes: &[u8], enc: &str) -> Option<(String, usize)> {
 
 /// 解码：iconv 到 UTF-8；非法字节按字节值出字符继续；末尾不完整序列
 /// 的剩余字节同样按字节值出字符（Tcl 的字节直映约定）。
-#[cfg(unix)]
+#[cfg(all(unix, feature = "iconv"))]
 fn iconv_decode(bytes: &[u8], enc: &str) -> String {
     let from = iconv_name(enc);
     let mut out = String::new();
@@ -297,7 +306,7 @@ fn iconv_decode(bytes: &[u8], enc: &str) -> String {
 
 /// 编码：逐字符转换；不可编码字符 → `?` 继续（状态保持在同一 iconv 句柄
 /// 由整串调用承担——失败时退回逐字符）。
-#[cfg(unix)]
+#[cfg(all(unix, feature = "iconv"))]
 fn iconv_encode(text: &str, enc: &str) -> Vec<u8> {
     let to = iconv_name(enc);
     match iconv_ffi::convert(text.as_bytes(), "UTF-8", to) {
@@ -328,5 +337,35 @@ fn iconv_encode(text: &str, enc: &str) -> Vec<u8> {
             }
             out
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_are_the_tcl_8_6_table() {
+        assert_eq!(NAMES.len(), 86);
+        assert!(known("utf-8"));
+        assert!(!known("UTF-8")); // Tcl 名大小写敏感
+        assert!(known_for_channel("binary"));
+        assert!(!known("binary"));
+    }
+
+    #[cfg(all(unix, feature = "iconv"))]
+    #[test]
+    fn iconv_backend_converts_wide_encodings() {
+        assert!(ICONV_BACKEND);
+        assert_eq!(decode(b"\x82\xa0", "shiftjis"), "あ");
+        assert_eq!(encode("あ", "shiftjis"), b"\x82\xa0");
+    }
+
+    #[cfg(not(all(unix, feature = "iconv")))]
+    #[test]
+    fn missing_iconv_backend_falls_back_to_byte_pass_through() {
+        assert!(!ICONV_BACKEND);
+        assert_eq!(decode(b"\x82\xa0", "shiftjis"), "\u{82}\u{a0}");
+        assert_eq!(encode("あ", "shiftjis"), "あ".as_bytes());
     }
 }

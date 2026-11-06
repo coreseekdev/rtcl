@@ -32,7 +32,7 @@ wasm-bindgen = { version = "0.2", optional = true }
 # 单独构建 --bin jitsh 时 switch/lsearch -regexp 消失（gen_switch/
 # gen_regexp 差分实证——曾经的"绿门禁"跑的是 workspace 联编产物）。
 rtcl-core = { path = "../rtcl-core", optional = true, default-features = false, features = [
-    "std", "regexp", "clock", "file", "io", "package",
+    "std", "regexp", "clock", "file", "io", "package", "iconv",
 ] }
 rtcl-parser = { path = "../rtcl-parser", optional = true }
 # default-features=false：JIT 只用解释器核心（dispatch/charge/帧入口），
@@ -41,7 +41,7 @@ rtcl-parser = { path = "../rtcl-parser", optional = true }
 # 同上：安全子集（regexp 全量——switch/lsearch -regexp 的运行时；
 # wasm32 下 regex crate 纯 Rust 可编译）。
 rtcl-vm = { path = "../rtcl-vm", optional = true, default-features = false, features = [
-    "std", "regexp", "clock", "file", "io", "package",
+    "std", "regexp", "clock", "file", "io", "package", "iconv",
 ] }
 wasmi = { version = "2.0", optional = true }
 wasmtime = { version = "49", optional = true }

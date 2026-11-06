@@ -281,7 +281,6 @@ fn clock_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return match parsed {
             Some(epoch) => Ok(Value::from_int(epoch)),
             None => match fail {
-                ScanFail::Other(msg) => Err(Error::Msg(msg)),
                 ScanFail::BadZone(name) => {
                     set_error_code(interp, &format!("CLOCK badTZName {}", name));
                     Err(Error::Msg(format!("time zone \"{}\" not found", name)))
@@ -322,7 +321,6 @@ fn clock_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 enum ScanFail {
     Mismatch,
     BadZone(String),
-    Other(String),
 }
 
 fn scan_with_format(
@@ -878,13 +876,11 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
                     return Err(p);
                 }
                 h = meridian(h, false);
-                p = t.len();
             } else if let Some(tail) = rest.strip_prefix("pm") {
                 if !tail.is_empty() {
                     return Err(p);
                 }
                 h = meridian(h, true);
-                p = t.len();
             } else {
                 return Err(p);
             }
@@ -1185,9 +1181,6 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
             }
             if !cs.is_empty() && cs[0].is_ascii_digit() {
                 let ndig = cs.iter().take_while(|c| c.is_ascii_digit()).count();
-                let ys: String = cs[..ndig].iter().collect();
-                let v: i64 = ys.parse().ok().unwrap_or(0);
-                ordinal_year = Some(if ys.len() <= 2 { map_two_digit_year(v) } else { v });
                 let g = toks[ti].0 + ndig;
                 let end = if chars.get(g) == Some(&':') {
                     g
@@ -2016,29 +2009,6 @@ fn clock_epoch(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64, gmt: bool) -> i
         let utc = epoch_from_jdn(jdn_from_civil(y, mo, d), h, mi, s);
         utc - local_offset_name(utc).map(|o| o.0 as i64).unwrap_or(0)
     }
-}
-
-/// 当前（调用方已设时区）的历法分解。
-#[cfg(unix)]
-fn local_civil(epoch: i64) -> Option<(i64, i64, i64, i64, i64, i64)> {
-    let t = epoch as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
-        return None;
-    }
-    Some((
-        tm.tm_year as i64 + 1900,
-        tm.tm_mon as i64 + 1,
-        tm.tm_mday as i64,
-        tm.tm_hour as i64,
-        tm.tm_min as i64,
-        tm.tm_sec as i64,
-    ))
-}
-
-#[cfg(not(unix))]
-fn local_civil(_epoch: i64) -> Option<(i64, i64, i64, i64, i64, i64)> {
-    None
 }
 
 /// 历法分解 → epoch（调用方已设时区；tm_isdst=-1 让 libc 自行消解

@@ -8,9 +8,10 @@ keywords = ["tcl", "vm", "bytecode", "interpreter", "embedded"]
 categories = ["parser-implementations"]
 
 # D-24：clock 本地时区（libc localtime_r——/etc/localtime + TZ/DST
-# 全部由 C 库承担）。仅 unix 目标；wasm 走纯 UTC 路径。
+# 全部由 C 库承担）。仅 unix 目标、且只在 clock feature 打开时引入；
+# wasm 走纯 UTC 路径。
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 [dependencies]
 rtcl-ir.workspace = true
@@ -21,10 +22,6 @@ indexmap.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
 num-integer.workspace = true
-
-[dependencies.glob]
-workspace = true
-optional = true
 
 [dependencies.regex]
 workspace = true
@@ -39,21 +36,26 @@ workspace = true
 optional = true
 
 [features]
-default = ["rtcl_std"]
+default = ["rtcl_std", "iconv"]
 # OS-level platform features (time, hostname, channels, filesystem)
 std = []
 # Tcl standard library — all extensions combined
 rtcl_std = ["file", "io", "exec", "clock", "regexp", "env", "signal", "package"]
 # Individual Tcl extensions (each implies Rust std)
-file = ["std", "dep:glob"]        # file, cd, pwd, glob, readdir, source
+file = ["std"]                    # file, cd, pwd, glob (自实现), readdir, source
 io = ["std"]                      # channel I/O: open, close, read, gets, seek, tell, eof, flush, fconfigure, pid
 exec = ["std"]                    # exec, wait
-clock = ["std"]                   # clock seconds/clicks/format/scan
+clock = ["std", "dep:libc"]       # clock seconds/clicks/format/scan (+ unix 本地时区)
 regexp = ["std", "dep:regex"]     # regexp, regsub
 regexp-lite = ["std", "dep:regex-lite"]  # regexp, regsub (smaller WASM binary)
 env = ["std"]                     # $env array from OS environment
 package = ["file"]                # package provide/require/names/forget
 signal = ["std"]                  # kill, sleep
+# 外部 libc iconv 后端（encoding module 的宽表编码转换）。默认开；wasm /
+# 无 libc 目标或显式 --no-default-features 时关闭，编码走字节直映兜底
+# （名字表仍完整，convertfrom/to 对非内建编码退化为逐字节/UTF-8 直传）。
+# 编码 backend 仅在 cfg(all(unix, feature = "iconv")) 下编译。
+iconv = []
 # For embedded/no-std targets
 alloc = []
 embedded = ["alloc", "dep:spin"]

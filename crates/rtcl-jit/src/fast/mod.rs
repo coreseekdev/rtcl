@@ -3,6 +3,9 @@
 
 pub(crate) mod shared;
 pub(crate) mod wasmi;
+// wasmtime 驱动（feature jit-native）：jit-exec-only 构建（jitsh/wasmi）
+// 不编入，否则 use wasmtime 在无该依赖时失败。
+#[cfg(feature = "jit-native")]
 pub(crate) mod wt;
 
 use rtcl_core::Interp;
@@ -29,6 +32,7 @@ pub(crate) fn set_fast_in_call(v: bool) {
 }
 
 pub(crate) use wasmi::fast_try;
+#[cfg(feature = "jit-native")]
 pub(crate) use wt::fast_try_wt;
 
 /// 顶层单元的 fast 执行（C4）：引擎分派 + JitRun 映射。None → classic

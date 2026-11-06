@@ -57,9 +57,13 @@
 ## 3. WASM 部署（主目标场景）
 
 - **构建**：`crates/rtcl-wasm/build.sh`（wasm-bindgen web 目标）
-- **体积**：1.6MB（release，未压缩）
-- **测试**：node 套件 **18/18 通过** — exec/JS 命令注册/多参/隔离性/
-  注销/puts 路由/JS 错误传播
+- **体积**：~2.1MB（wasm-bindgen 产物，release 未压缩）
+- **外部依赖**：零 C 库——iconv 宽表编码与 libc 本地时区都是 native
+  可选 feature（`rtcl-vm` 的 `iconv`/`clock`），wasm 构建走
+  `default-features = false` 的安全子集；`puts` 经 HostConsole 落
+  JS 回调
+- **测试**：node 套件 **24/24 通过** — exec/JS 命令注册/多参/隔离性/
+  注销/puts 路由/JS 错误传播/is_complete 多行判定
 - **API**：`RtclHandle::new/exec/register_command/unregister_command/
   set_output_handler`；Rust 宿主侧另有原生 `CommandFunc` 注册栈
 - **验证**：所有表示层改造（标记 Value/立即数/Cell/freelist/Fx 表）均

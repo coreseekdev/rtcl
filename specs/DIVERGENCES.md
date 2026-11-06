@@ -228,15 +228,34 @@
 - **rtcl 修复态（2026-11-06）**：-command 臂移除（parity 对齐）——
   bad option "-command": must be -all, ... 错误 + TCL LOOKUP INDEX
   option -command（string match 的 bad-option 同批加码）。相关测试
-  改钉拒绝语义。command_mode 死代码保留（不可达，后续清理）。
+  改钉拒绝语义；command_mode 死分支已随清理删除（2026-11-06）。
 - **严重度**：已关闭。
 
-### D-23 `string match` 参数面 + `-nocase` 折叠（spec [D-22]）
-- **Tcl 8.6**：① >3 词时首词按选项解析：`string match a b c` →
-  `bad option "a": must be -nocase`；② -nocase 逐字符简单折叠，
-  `string match -nocase İ i` → 1。
-- **rtcl**：① 返回 0；② 整串 Rust to_lowercase（İ 两字符展开）→ 0。
-- **严重度**：低。
+### D-23 `string match` 参数面 + 选项解析（spec [D-22]）[FIXED 2026-11-06]
+- **Tcl 8.6.17**（三形状实测钉死）：
+  * **位置词数必须 2 或 3**；否则
+    `wrong # args: should be "string match ?-nocase? pattern string"`
+    （不是 `subcommand ?arg ...?`）。
+  * 只有 **3 个位置词**时首词按选项解析：Tcl C 的条件
+    `length > 1 && strncmp(word, "-nocase", length) == 0`——大小写
+    敏感、长度 >1 的唯一前缀（-n/-no/-noc/-nocas/-nocase）可；
+    `-`/`--`/`-NOCASE`/`-nocasex` → `bad option "<word>": must be
+    -nocase` + `TCL LOOKUP INDEX option <word>`。
+  * **2 个位置词时不解析选项**：首词即使写成 `-nocase`/`-*`/`-x`
+    也按 pattern 处理（`string match -* $opt` 合法——ui.tcl 依赖）。
+  * `-nocase` 逐字符简单折叠（`string match -nocase İ i` → 1；Rust
+    整串 to_lowercase 的 İ→两字符展开相悖）。
+- **rtcl 旧态**：① 任何以 '-' 开头的词都按选项解析（`string match
+  -x abc` 误报 bad option）；② 只认精确 `-nocase`（前缀 -noc 被拒）；
+  ③ 4 词（`string match a b c`）报 bad option 而非 wrong # args；
+  ④ 折叠整串 to_lowercase。
+- **rtcl 修复态**：按位置词数分支（npos==3 才解析，前缀大小写敏感、
+  长度>1），2 词直接 pattern/string；arity 用
+  `wrong_args_with_usage("string match", 4, len, "?-nocase? pattern
+  string")`；折叠逐字符。9 条新探针（含 proc 体内/动态词）全 SAME。
+- **发现途径**：wasm node 套件的 ui.tcl 加载（`string match -* $opt`）
+  暴露——native 判官语料未覆盖 2 词首词带 '-' 的形状。
+- **严重度**：已关闭。
 
 ### D-24 `format %c` 无 BMP 截断（spec [D-23]）
 - **Tcl 8.6**：%c 按 Tcl_UniChar（16 位）渲染，65536 → U+FFFD。

@@ -11,7 +11,8 @@ pub mod binary;
 pub mod proc;
 pub mod io;
 pub mod misc;
-#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+// 回溯引擎只服务全量 regexp 引擎（regexp-lite 构建没有 Full 分支）。
+#[cfg(feature = "regexp")]
 pub mod regexp_bt;
 pub mod regexp_cmds;
 #[cfg(feature = "clock")]

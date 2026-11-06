@@ -15,8 +15,6 @@ rtcl-parser.workspace = true
 clap.workspace = true
 rustyline.workspace = true
 colored.workspace = true
-anyhow.workspace = true
-annotate-snippets.workspace = true
 
 [features]
 default = []

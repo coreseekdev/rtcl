@@ -314,6 +314,7 @@ pub(crate) enum Engine {
     Full(super::regexp_bt::BtProg),
 }
 
+#[cfg(feature = "regexp")]
 impl Engine {
     /// D-20：串锚模式（含 \A/\z——\A 绑 -start 偏移而非尝试起点）。
     pub(crate) fn is_string_anchored(&self) -> bool {
@@ -447,6 +448,14 @@ pub(crate) fn engine_group_count(eng: &Engine, pattern: &str) -> usize {
 pub(crate) struct Engine {
     re: regex_lite::Regex,
     anch: Option<regex_lite::Regex>,
+}
+
+#[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
+impl Engine {
+    /// D-20：串锚模式（lite 引擎的 \A 在编译期替换为 `^`，存于 `anch`）。
+    pub(crate) fn is_string_anchored(&self) -> bool {
+        self.anch.is_some()
+    }
 }
 
 #[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
@@ -923,7 +932,6 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut lineanchor = false;
     let mut linestop = false;
     let mut start_offset: Option<String> = None;
-    let mut command_mode = false;
 
     while i < args.len() && args[i].as_str().starts_with('-') {
         match args[i].as_str() {
@@ -977,52 +985,6 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let eng = compile_engine_tc(interp, pattern_str, nocase, expanded, lineanchor, linestop)
         .map_err(|e| Error::runtime(e, ErrorCode::Generic))?;
-
-    if command_mode {
-        // -command: evaluate sub_spec as command prefix for each match
-        // (rtcl extension; not exercised under -start by the corpus).
-        let anchored = eng.is_string_anchored();
-        let attempt = |p: usize| -> Option<GroupRanges> {
-            if anchored && p != char_start {
-                return None;
-            }
-            engine_attempt(&eng, full_string, p)
-        };
-        let matches = collect_matches(full_string, attempt, char_len, char_start, all);
-        let mut result = String::from(&full_string[..byte_start]);
-        let mut last = byte_start;
-        let mut count = 0i64;
-
-        for groups in &matches {
-            let Some((bs, be)) = groups[0] else { continue };
-            result.push_str(&full_string[last..bs]);
-
-            // Build command: subSpec fullMatch capture1 capture2 ...
-            let mut cmd_str = sub_spec.to_string();
-            // Iterate the ranges directly — every group contributes an
-            // argument (empty `{}` for a non-participating group), so a
-            // `flatten()` here would silently drop arguments.
-            for g in groups {
-                let m = g.map(|(s, e)| &full_string[s..e]).unwrap_or("");
-                cmd_str.push(' ');
-                // Quote the argument for Tcl eval
-                cmd_str.push('{');
-                cmd_str.push_str(m);
-                cmd_str.push('}');
-            }
-            let replacement = interp.eval(&cmd_str)?;
-            result.push_str(replacement.as_str());
-            last = be;
-            count += 1;
-        }
-        result.push_str(&full_string[last..]);
-
-        if let Some(var) = var_name {
-            interp.set_var(var, Value::from_str(&result))?;
-            return Ok(Value::from_int(count));
-        }
-        return Ok(Value::from_str(&result));
-    }
 
     // Standard mode: Tcl substitution spec applied to the matches the
     // -start/-all scan yields.  regsub assigns varName unconditionally,

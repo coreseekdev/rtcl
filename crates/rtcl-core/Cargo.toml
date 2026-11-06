@@ -25,7 +25,7 @@ rtcl-vm = { path = "../rtcl-vm", default-features = false }
 # so existing dependents keep their feature names. Each std-requiring
 # passthrough also enables the local `std` so facade-gated re-exports
 # (`channel` etc.) keep their master-era visibility.
-default = ["rtcl_std"]
+default = ["rtcl_std", "iconv"]
 std = ["rtcl-vm/std"]
 rtcl_std = ["rtcl-vm/rtcl_std", "std"]
 file = ["rtcl-vm/file", "std"]
@@ -37,6 +37,8 @@ regexp-lite = ["rtcl-vm/regexp-lite", "std"]
 env = ["rtcl-vm/env", "std"]
 package = ["rtcl-vm/package", "std"]
 signal = ["rtcl-vm/signal", "std"]
+# 原生 libc iconv 后端（默认开；wasm 依赖方 default-features=false 关闭）。
+iconv = ["rtcl-vm/iconv"]
 alloc = ["rtcl-vm/alloc"]
 embedded = ["rtcl-vm/embedded"]
 debug = ["rtcl-vm/debug"]

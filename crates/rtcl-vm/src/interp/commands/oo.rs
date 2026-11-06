@@ -1070,24 +1070,6 @@ fn exec_chain_entry(
     }
 }
 
-/// `variable a b;` prefix that auto-links the defining class's declared
-/// variables into a method/constructor/destructor body (TclOO links them
-/// without an explicit `variable` statement).  Names bound as parameters
-/// are skipped.
-fn link_prefix(vars: &[String], params: &[(String, Option<String>)]) -> String {
-    let names: Vec<&str> = params.iter().map(|(p, _)| p.as_str()).collect();
-    let link: Vec<&str> = vars.iter().map(|s| s.as_str()).filter(|v| !names.contains(v)).collect();
-    // ONE `variable` command per name: `variable a b` at the Tcl level is
-    // the PAIRED declare-with-initial-value form (b is a's initial value),
-    // not a two-name declaration — a multi-name prefix used to clobber the
-    // first variable with the literal second name (probed tclsh 8.6.17:
-    // native TclOO links each name separately).
-    link
-        .iter()
-        .map(|n| format!("variable {};", n))
-        .collect()
-}
-
 /// Build the synthetic method [`ProcDef`] for `body` (already carrying
 /// any `variable` link prefix).  The first parameter carries the invoked
 /// method's name so arity errors read `wrong # args: should be
@@ -2722,7 +2704,7 @@ pub(crate) fn oo_rename(interp: &mut Interp, old_key: &str, new_key: &str) -> Re
         move_cmd(interp, old_key, new_key);
         return Ok(());
     }
-    if let Some(mut c) = interp.oo.classes.remove(&oo_old) {
+    if let Some(c) = interp.oo.classes.remove(&oo_old) {
         for o in interp.oo.objects.values_mut() {
             if o.class == oo_old {
                 o.class = oo_new.clone();
@@ -3504,8 +3486,8 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "className",
                 ));
             }
-            let key = resolve_class_arg(interp, args[3].as_str())?;
-            let cls = interp.oo.classes.get(&key);
+            // 校验类名存在（tclsh 对不存在类报 unknown），结果恒空。
+            let _key = resolve_class_arg(interp, args[3].as_str())?;
             // tclsh 8.6.17 实测：这两个子命令恒返回空（即便 ctor/dtor
             // 已定义）——oracle 形状如此。
             let items: Vec<String> = Vec::new();

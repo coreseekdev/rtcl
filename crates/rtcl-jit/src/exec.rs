@@ -195,13 +195,24 @@ pub fn run_top_with(
     // /分派边界 flush+resync 既有机制覆盖全局别名。None → classic 回落。
     if let Some(meta) = &module.fast {
         let mut interp_mut = interp;
-        if let Some(run) = crate::fast::execute_fast_top(
+        // jit-native 多一个引擎选择参数（wasmtime/wasmi 分派）；jit-exec
+        // 构建只有 wasmi 驱动。
+        #[cfg(feature = "jit-native")]
+        let fast_run = crate::fast::execute_fast_top(
             &mut interp_mut,
             &bc,
             &module,
             meta.clone(),
             engine,
-        ) {
+        );
+        #[cfg(not(feature = "jit-native"))]
+        let fast_run = crate::fast::execute_fast_top(
+            &mut interp_mut,
+            &bc,
+            &module,
+            meta.clone(),
+        );
+        if let Some(run) = fast_run {
             return (interp_mut, run);
         }
         interp = interp_mut;

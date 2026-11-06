@@ -46,6 +46,9 @@ thread_local! {
 
 /// 当前 JIT 会话：arena + 常量池 + 站点表 + pending 错误 + 解释器指针
 /// （scope 内由持柄者保证存活；单线程 wasm 模型）。
+/// sites/lines/source 是 ABI v2 的站点元数据（错误映射用，当前宿主侧
+/// 还没消费）——保留登记，避免每次会话重建时丢协议形状。
+#[allow(dead_code)]
 struct Session {
     interp: *mut Interp,
     arena: Vec<Value>,
@@ -368,7 +371,6 @@ impl RtclHandle {
         consts: js_sys::Array,
         fuel_chunk: i64,
     ) -> Result<(), wasm_bindgen::JsValue> {
-        use wasm_bindgen::JsCast;
         let mut pool: Vec<String> = Vec::new();
         for i in 0..consts.length() {
             let s = consts

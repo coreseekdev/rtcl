@@ -115,3 +115,13 @@ catch {clock scan {1-2} -gmt 1} m ; puts $m
 catch {clock scan {2000.01.02} -gmt 1} m ; puts $m
 catch {clock scan {est5edt} -gmt 1} m ; puts $m
 catch {clock scan {12:00 est5edt} -gmt 1} m ; puts $m
+# ── string match 选项解析（8.6.17 三形状：只有 3 个位置词才解析选项）──
+catch {string match -x abc} m ; puts $m
+catch {string match -* abc} m ; puts $m
+proc smopt {} {string match -* $::t} ; set t -nocase ; catch {smopt} m ; puts $m
+catch {string match -noc ABC abc} m ; puts $m
+catch {string match -NOCASE ABC abc} m o ; puts "$m|[dict get $o -errorcode]"
+catch {string match a} m ; puts $m
+catch {string match -nocase} m ; puts $m
+catch {string match a b c} m ; puts $m
+catch {string match -nocase a b c} m ; puts $m

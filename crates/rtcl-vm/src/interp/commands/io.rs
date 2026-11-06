@@ -71,6 +71,30 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // ── io 构建：完整通道栈（反射通道、变换、缓冲与 flush）──────
     #[cfg(feature = "io")]
     {
+        // wasm 宿主：内置 stdout/stderr 落到宿主控制台（OsStdout 在
+        // wasm32-unknown-unknown 上是对 std::io::stdout 的空转发）。
+        // 宿主经 set_console 注入的 JsConsole 才看得到 puts 输出；
+        // 其余通道仍走完整通道栈。
+        #[cfg(target_family = "wasm")]
+        {
+            if chan_id == "stdout" || chan_id == "stderr" {
+                let newline = if nonewline { "" } else { "\n" };
+                let out = format!("{}{}", msg, newline);
+                let r = if chan_id == "stdout" {
+                    interp.console.write_stdout(&out)
+                } else {
+                    interp.console.write_stderr(&out)
+                };
+                r.map_err(|e| {
+                    Error::runtime(
+                        format!("error writing \"{}\": {}", chan_id, e),
+                        crate::error::ErrorCode::Io,
+                    )
+                })?;
+                return Ok(Value::empty());
+            }
+        }
+
         if !interp.channels.contains(chan_id) {
             return Err(chan_io::chan_not_found(interp, chan_id));
         }
@@ -2204,10 +2228,6 @@ mod tests {
 
 
 // ── encoding 命令（D-29 宽表）──────────────────────────────────────
-
-pub(crate) fn encoding_known(name: &str) -> bool {
-    crate::encoding::known_for_channel(name)
-}
 
 /// 字节串（每字符一字节）→ Vec<u8>。
 fn byte_str_to_bytes(data: &str) -> Vec<u8> {

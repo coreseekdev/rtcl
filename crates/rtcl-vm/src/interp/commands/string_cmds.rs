@@ -142,41 +142,40 @@ pub fn cmd_string(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }))
         }
         "match" => {
-            if args.len() < 4 {
-                return Err(Error::wrong_args("string match", 4, args.len()));
+            // tclsh 8.6.17 实测（三形状钉死）：位置词必须 2 或 3 个；
+            // 只有 3 个位置词时首词才是选项（Tcl C：
+            // `length > 1 && strncmp(word, "-nocase", length) == 0`，
+            // 大小写敏感、唯一前缀 -n/-noc/-nocas 可）。
+            // 2 个位置词时首词即使写成 -nocase/-x 也按 pattern 处理
+            // （`string match -* $opt` 合法，ui.tcl 依赖）。
+            let npos = args.len().saturating_sub(2);
+            if !(2..=3).contains(&npos) {
+                return Err(Error::wrong_args_with_usage(
+                    "string match",
+                    4,
+                    args.len(),
+                    "?-nocase? pattern string",
+                ));
             }
-            // D-22①：tclsh 的 string match 不认 --——所有位置词之外
-            // 的词都按选项解析（3 个位置词时首词报 bad option）。
-            let mut i = 2;
-            let mut nocase = false;
-            while i < args.len() && args[i].as_str().starts_with('-') {
-                match args[i].as_str() {
-                    "-nocase" => { nocase = true; i += 1; }
-                    other => {
-                        // tclsh：Tcl_GetIndexFromObj 系错误 →
-                        // TCL LOOKUP INDEX option <word>。
-                        super::list::set_error_code(
-                            _interp,
-                            &format!("TCL LOOKUP INDEX option {}", other),
-                        );
-                        return Err(Error::Msg(format!(
-                            "bad option \"{}\": must be -nocase",
-                            other
-                        )))
-                    }
+            let (nocase, i) = if npos == 3 {
+                let word = args[2].as_str();
+                if word.len() > 1 && "-nocase".starts_with(word) {
+                    (true, 3)
+                } else {
+                    // tclsh：Tcl_GetIndexFromObj 系前缀匹配失败 →
+                    // TCL LOOKUP INDEX option <word>。
+                    super::list::set_error_code(
+                        _interp,
+                        &format!("TCL LOOKUP INDEX option {}", word),
+                    );
+                    return Err(Error::Msg(format!(
+                        "bad option \"{}\": must be -nocase",
+                        word
+                    )));
                 }
-            }
-            if args.len() - i != 2 {
-                let bad = args[i].as_str();
-                super::list::set_error_code(
-                    _interp,
-                    &format!("TCL LOOKUP INDEX option {}", bad),
-                );
-                return Err(Error::Msg(format!(
-                    "bad option \"{}\": must be -nocase",
-                    bad
-                )));
-            }
+            } else {
+                (false, 2)
+            };
             let pattern = args[i].as_str();
             let text = args[i + 1].as_str();
             // D-22②：-nocase 逐字符简单折叠（原整串 to_lowercase——

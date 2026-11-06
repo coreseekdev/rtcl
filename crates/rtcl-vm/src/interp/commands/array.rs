@@ -5,9 +5,6 @@ use crate::error::{Error, Result};
 use crate::interp::{glob_match, split_array_ref, ArraySearch, ArraySearchList, Interp};
 use crate::value::Value;
 
-#[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
-use regex_lite::Regex;
-
 /// tclsh 8.6.17's `array` subcommand list, in the order it prints on an
 /// unknown-or-ambiguous error.
 const ARRAY_SUBCMDS: &[&str] = &[

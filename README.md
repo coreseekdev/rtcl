@@ -12,7 +12,9 @@
 - **双引擎**：字节码 VM（主）+ 树遍历（语义回退），`judge/sweep.sh`
   双引擎差分 0 分歧
 - **WASM 主目标**：wasm-bindgen 绑定（exec / JS 命令注册 / puts 路由 /
-  实例隔离），release 1.6MB，node 测试 18/18
+  实例隔离），wasm-bindgen 产物 ~2.1MB，node 测试 24/24；原生外部能力
+  （iconv 宽表编码、libc 本地时区）均为**可选 feature**，wasm 构建不
+  依赖任何外部 C 库
 - **性能**：算术/自增/字符串/字典微基准反超 tclsh（0.6-0.8×）；
   过程调用开销反超（0.52×）；重型基准 1.05-2.26×（详见
   bench/BASELINE.md）
@@ -35,7 +37,7 @@ cargo build --release
 ```bash
 cd crates/rtcl-wasm
 ./build.sh            # wasm-bindgen web 目标 -> pkg/
-node test.js          # node 测试套件（18 项断言）
+node test.js          # node 测试套件（24 项断言）
 ```
 
 ```js
@@ -99,10 +101,13 @@ rtcl/
 ## 质量门槛（提交纪律）
 
 ```bash
-cargo test --workspace                      # 1143 测试
-./judge/run.sh                              # 87/87 文件逐字节
+cargo test --workspace                      # 全 workspace 测试
+./judge/run.sh                              # 88 文件逐字节（judge(interp): 88/88）
 ./judge/sweep.sh                            # 双引擎差分 0 分歧
-cargo check -p rtcl-core --target wasm32-unknown-unknown --no-default-features --features std
+# wasm 主目标：默认特性裁剪，零外部 C 依赖（iconv 不编入）
+cargo build -p rtcl-wasm --target wasm32-unknown-unknown
+# 关闭可选外部后端（iconv）的 native 构建也必须绿
+cargo test -p rtcl-vm --no-default-features --features rtcl_std --lib
 ```
 
 四门全绿才可提交；判官/差分必须用刚构建的二进制（防陈旧二进制假绿）。
@@ -118,9 +123,26 @@ rename 遮蔽过程后旧名解析、`interp alias {} name {} target` 形式、
 | 目标 | 状态 |
 |---|---|
 | 原生（Linux/macOS/Windows） | ✅ |
-| wasm32-unknown-unknown（主目标） | ✅ 1.6MB + node 套件 18/18 |
+| wasm32-unknown-unknown（主目标） | ✅ ~2.1MB（wasm-bindgen 产物）+ node 套件 24/24 |
 | wasm32-wasip1 | ✅ |
 | no_std + alloc（embedded 特性） | ⚠️ 已知破损（记录在案） |
+
+### 可选特性（外部依赖开关）
+
+外部原生能力都收在 Cargo features 后面，默认构建行为不变：
+
+| feature | 默认 | 作用 | 关闭时 |
+|---|---|---|---|
+| `iconv` | 开 | encoding 宽表（shiftjis/gb2312/big5/...）经 libc iconv | 非内建编码解码按字节直映、编码按 UTF-8 直传；86 名表与命令面不变 |
+| `clock` | 开 | clock 命令；unix 下经 libc localtime/mktime 支持本地时区 | 无 clock 命令；不链接 libc |
+| `file`/`io`/`exec`/`env`/`signal`/`package` | 开 | 对应 Tcl 标准扩展 | 命令不注册 |
+| `regexp` / `regexp-lite` | `regexp` 开 | 正则后端二选一（lite 用于小体积 wasm） | 无 regexp/regsub |
+
+- `libc` 依赖只在 unix 且 `clock` 开启时引入；iconv 后端仅在
+  `cfg(all(unix, feature = "iconv"))` 下编译（wasm 天然关闭）。
+- wasm32 构建（rtcl-wasm）用 `default-features = false` 的安全子集，
+  不含 iconv/libc；`puts` 经 HostConsole 落 JS 回调。
+- 无用的 `glob`/`anyhow`/`annotate-snippets` 依赖已移除。
 
 ## 许可
 

@@ -70,11 +70,6 @@ pub(crate) fn channel_write_str_enc(
     Ok(())
 }
 
-/// 默认（UTF-8）写串，保留旧调用点。
-pub(crate) fn channel_write_str(ch: &mut dyn Channel, s: &str) -> io::Result<()> {
-    channel_write_str_enc(ch, s, "utf-8")
-}
-
 /// 按 `enc` 读一整行（gets 用）。
 pub(crate) fn channel_read_line(
     ch: &mut dyn Channel,
@@ -115,11 +110,6 @@ pub(crate) fn channel_read_all(ch: &mut dyn Channel, enc: &str) -> io::Result<St
         buf.extend_from_slice(&chunk[..n]);
     }
     Ok(crate::encoding::decode(&buf, enc))
-}
-
-/// Extension: read exactly `count` chars and return as String (UTF-8).
-pub(crate) fn channel_read_chars(ch: &mut dyn Channel, count: usize) -> io::Result<String> {
-    channel_read_chars_enc(ch, count, "utf-8")
 }
 
 /// 按 `enc` 读 `count` 个**字符**（D-30/D-29）。
@@ -216,9 +206,10 @@ fn read_chars_utf8(ch: &mut dyn Channel, count: usize) -> io::Result<String> {
 }
 
 /// iconv 后端的多字节通道解码：逐字节喂入，不完整序列继续读；
-/// EOF 时剩余字节按字节值出字符（Tcl 语义）。
+/// EOF 时剩余字节按字节值出字符（Tcl 语义）。无 iconv 后端时退化为
+/// 逐字节直映（与 encoding::decode 的兜底一致）。
 fn read_chars_iconv(ch: &mut dyn Channel, count: usize, enc: &str) -> io::Result<String> {
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "iconv"))]
     {
         let mut pending: Vec<u8> = Vec::new();
         let mut out = String::new();
@@ -255,8 +246,9 @@ fn read_chars_iconv(ch: &mut dyn Channel, count: usize, enc: &str) -> io::Result
         }
         Ok(out)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, feature = "iconv")))]
     {
+        let _ = enc;
         let mut out = String::new();
         let mut byte = [0u8; 1];
         while out.chars().count() < count {
@@ -1358,7 +1350,7 @@ mod tests {
         let mut table = ChannelTable::new();
         table.set_stdout(Box::new(MemoryOutputPipe::from_shared(capture.clone(), usize::MAX)));
         let ch = table.get_mut("stdout").unwrap();
-        channel_write_str(ch.as_mut(), "captured!\n").unwrap();
+        channel_write_str_enc(ch.as_mut(), "captured!\n", "utf-8").unwrap();
         assert_eq!(capture.lock().unwrap().as_slice(), b"captured!\n");
     }
 

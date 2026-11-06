@@ -290,4 +290,21 @@ mod tests {
         let m = matcher::find_from(&prog, &chars, 0, 0).unwrap();
         assert_eq!((m.start, m.end), (0, 3));
     }
+
+    #[test]
+    fn negated_shorthand_newline_stop() {
+        // -linestop/-line 下 \W/\D 等否定简写不匹配换行（同 [^...]）。
+        let nl = Options {
+            nlstop: true,
+            ..Options::default()
+        };
+        let prog = compile(r"\W", nl).unwrap();
+        assert!(!is_match(&prog, "\n", 0));
+        let prog = compile(r"\W", Options::default()).unwrap();
+        assert!(is_match(&prog, "\n", 0));
+        // ARE 字符类内只允许小写 \d\s\w。
+        assert_eq!(compile(r"[\W]", Options::default()).unwrap_err().code, "REG_EESCAPE");
+        assert_eq!(compile(r"[\D]", Options::default()).unwrap_err().code, "REG_EESCAPE");
+        assert!(compile(r"[\W]", bre()).is_ok());
+    }
 }

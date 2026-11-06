@@ -793,11 +793,24 @@ impl Parser {
         self.i += 1;
         match c {
             'd' => Ok(Node::class(CharSet::new(false, false, vec![Item::Pred(Pred::Digit)]))),
-            'D' => Ok(Node::class(CharSet::new(false, false, vec![Item::Pred(Pred::NotDigit)]))),
+            // REG_NLSTOP：否定简写与 `[^...]` 一样不匹配换行。
+            'D' => Ok(Node::class(CharSet::new(
+                false,
+                self.opts.class_stops_newline(),
+                vec![Item::Pred(Pred::NotDigit)],
+            ))),
             's' => Ok(Node::class(CharSet::new(false, false, vec![Item::Pred(Pred::Space)]))),
-            'S' => Ok(Node::class(CharSet::new(false, false, vec![Item::Pred(Pred::NotSpace)]))),
+            'S' => Ok(Node::class(CharSet::new(
+                false,
+                self.opts.class_stops_newline(),
+                vec![Item::Pred(Pred::NotSpace)],
+            ))),
             'w' => Ok(Node::class(CharSet::new(false, false, vec![Item::Pred(Pred::Word)]))),
-            'W' => Ok(Node::class(CharSet::new(false, false, vec![Item::Pred(Pred::NotWord)]))),
+            'W' => Ok(Node::class(CharSet::new(
+                false,
+                self.opts.class_stops_newline(),
+                vec![Item::Pred(Pred::NotWord)],
+            ))),
             'm' => Ok(Node::assert(AssertKind::WordStart)),
             'M' => Ok(Node::assert(AssertKind::WordEnd)),
             'y' => Ok(Node::assert(AssertKind::WordB)),
@@ -1119,11 +1132,13 @@ impl Parser {
         self.i += 1;
         match e {
             'd' => Ok(ClassAtom::Pred(Pred::Digit)),
-            'D' => Ok(ClassAtom::Pred(Pred::NotDigit)),
+            // ARE 字符类里只允许小写 \d\s\w；大写否定简写是非法
+            // 转义（tclsh：invalid escape \ sequence）。
+            'D' | 'S' | 'W' => {
+                Err(Self::err("REG_EESCAPE", "invalid escape \\ sequence"))
+            }
             's' => Ok(ClassAtom::Pred(Pred::Space)),
-            'S' => Ok(ClassAtom::Pred(Pred::NotSpace)),
             'w' => Ok(ClassAtom::Pred(Pred::Word)),
-            'W' => Ok(ClassAtom::Pred(Pred::NotWord)),
             'b' => Ok(ClassAtom::Char('\u{8}')),
             'B' => Ok(ClassAtom::Char('\\')),
             'a' => Ok(ClassAtom::Char('\u{7}')),

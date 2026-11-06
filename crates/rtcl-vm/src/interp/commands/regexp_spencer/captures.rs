@@ -224,8 +224,16 @@ impl<'a> Dissect<'a> {
         if count >= max_count {
             return false;
         }
-        // 贪婪：子节点匹配的最长端点优先。
-        for ep in (pos + 1..=end).rev() {
+        // 迭代端点优先级跟随子节点偏好：贪婪子节点取最长端点，
+        // 惰性子节点（仅记录捕获时）取最短端点——tclsh
+        // `(a{1,2}?){0,2}` 的末次迭代取最长剩余段。
+        let ascending = record && child.flags.shorter;
+        let endpoints: Vec<usize> = if ascending {
+            (pos + 1..=end).collect()
+        } else {
+            (pos + 1..=end).rev().collect()
+        };
+        for ep in endpoints {
             let save = caps.clone();
             if record {
                 self.zap(child, caps);

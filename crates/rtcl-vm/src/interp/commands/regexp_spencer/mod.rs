@@ -39,8 +39,8 @@ pub use parser::Options;
 
 /// 编译为 NFA（M2：不含回引/lookahead）。
 pub fn compile(pattern: &str, opts: Options) -> Result<Prog, Error> {
-    let tree = parser::parse(pattern, opts)?;
-    nfa::compile(&tree, opts.icase)
+    let (tree, effective) = parser::parse_with_options(pattern, opts)?;
+    nfa::compile(&tree, effective.icase)
 }
 
 /// 运行时选择。Spencer 移植已是默认引擎；`RTCL_REGEX_ENGINE=fast`
@@ -306,5 +306,39 @@ mod tests {
         assert_eq!(compile(r"[\W]", Options::default()).unwrap_err().code, "REG_EESCAPE");
         assert_eq!(compile(r"[\D]", Options::default()).unwrap_err().code, "REG_EESCAPE");
         assert!(compile(r"[\W]", bre()).is_ok());
+    }
+
+    #[test]
+    fn embedded_options_affect_matcher() {
+        // `(?i)` 是 pattern 内嵌选项：必须传给 NFA/匹配器，不能只看
+        // 调用方传入的 Options::icase。
+        let prog = compile("(?i)A{0,2}", Options::default()).unwrap();
+        assert!(is_match(&prog, "aaa", 0));
+        let m = find(&prog, "aaa", 0).unwrap();
+        assert_eq!((m.start, m.end), (0, 2));
+        // 非 ASCII 大小写也使用生效后的 icase。
+        let prog = compile("(?i)é", Options::default()).unwrap();
+        assert!(is_match(&prog, "É", 0));
+    }
+
+    #[test]
+    fn lacon_group_is_quantifiable() {
+        // 环视内括号非捕获但保留分组层，`(^){1,2}` 可被量化
+        //（tclsh 允许；曾误报 quantifier operand invalid）。
+        for p in [r"(?=(^){1,2})", r"(?!(^){0,2}(?:[[:space:]]{2}|\n))"] {
+            let prog = compile(p, Options::default()).unwrap();
+            assert!(is_match(&prog, "", 0));
+        }
+    }
+
+    #[test]
+    fn lazy_child_repeat_capture_prefers_short_first() {
+        // `(a{1,2}?){0,2}` @ "aaa"：tclsh 末次迭代取最长剩余段
+        //（组 1..3），而不是前一次贪到最长、末次剩 1 字符。
+        let prog = compile(r"(a{1,2}?){0,2}", Options::default()).unwrap();
+        let chars: Vec<char> = "aaa".chars().collect();
+        let caps = captures::exec(&prog, &chars, 0, 0).unwrap();
+        assert_eq!(caps.spans[0], Some((0, 3)));
+        assert_eq!(caps.spans[1], Some((1, 3)));
     }
 }

@@ -85,7 +85,7 @@ impl Parser {
         }
     }
 
-    pub fn parse(mut self) -> Result<Node, Error> {
+    pub fn parse(mut self) -> Result<(Node, Options), Error> {
         self.prefixes()?;
         if self.opts.quote {
             let mut parts = Vec::new();
@@ -93,7 +93,8 @@ impl Parser {
                 self.i += 1;
                 parts.push(Node::char(c as u32));
             }
-            return Ok(Node::concat(parts));
+            let opts = self.opts;
+            return Ok((Node::concat(parts), opts));
         }
         let node = self.parse_alt()?;
         if self.i < self.chars.len() {
@@ -103,7 +104,7 @@ impl Parser {
                 "parentheses () not balanced",
             ));
         }
-        Ok(node)
+        Ok((node, self.opts))
     }
 
     fn peek(&self) -> Option<char> {
@@ -793,7 +794,9 @@ impl Parser {
                 if !self.eat(')') {
                     return Err(Self::err("REG_EPAREN", "parentheses () not balanced"));
                 }
-                return Ok(inner);
+                // 非捕获但保留分组层：`(?=(^){1,2})` 里的 (^) 可被
+                // 量化（tclsh 允许），但内部捕获按 Tcl 规则不记录。
+                return Ok(Node::no_record(inner));
             }
             let subno = self.next_sub;
             self.next_sub += 1;
@@ -1276,5 +1279,11 @@ fn has_capture(n: &Node) -> bool {
 
 /// 解析入口。
 pub fn parse(pattern: &str, opts: Options) -> Result<Node, Error> {
+    parse_with_options(pattern, opts).map(|(node, _)| node)
+}
+
+/// 解析并返回前缀/内嵌选项生效后的最终 options（`(?i)` 等需要
+/// 传给 NFA/匹配器的 icase 不能只看调用方传入值）。
+pub fn parse_with_options(pattern: &str, opts: Options) -> Result<(Node, Options), Error> {
     Parser::new(pattern, opts).parse()
 }

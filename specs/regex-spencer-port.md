@@ -190,7 +190,11 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   虚拟空串匹配并保留原偏移（`-start 9 {$} ba` → 索引 `9 8`）。
   验证：3500 + 12000 + 15000 三组 seed 的命令面随机语料（开关组合/
   match vars/regsub 替换串/空匹配/越界 -start）**0 差异**，另有
-  5000 例 Unicode/多字节文本命令面语料 **0 差异**。`-linestop/-line`
+  5000 例 Unicode/多字节文本命令面语料与 15000 例嵌套语法层语料
+  （环视/分组/量词/内嵌选项，`specs/regex/gen-deep-fuzz.py`）
+  **0 差异**。内嵌 `(?i)` 生效后的 options 会传给 NFA/匹配器；
+  环视内括号保留分组层（`(?=(^){1,2})` 可量化）；惰性子节点的
+  重复组末次迭代取最长剩余段（`(a{1,2}?){0,2}` 组 1..3）。`-linestop/-line`
   下否定简写 `\W/\D/\S` 与 `[^...]` 一样不匹配换行；ARE 字符类内
   仅允许小写 `\d\s\w`（大写 → REG_EESCAPE，BRE/ERE 为字面）。
   回引回溯的 concat 去重按

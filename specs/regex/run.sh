@@ -54,4 +54,14 @@ if command -v python3 >/dev/null 2>&1; then
         echo "== cmd-fuzz: DIFF =="
         diff /tmp/rtcl-regex-cmdfuzz-o.txt /tmp/rtcl-regex-cmdfuzz-r.txt | head -20
     fi
+    # 嵌套语法层 fuzz（环视/分组/量词/内嵌选项；不含回引）。
+    python3 specs/regex/gen-deep-fuzz.py > /tmp/rtcl-regex-deepfuzz.tcl
+    tclsh /tmp/rtcl-regex-deepfuzz.tcl > /tmp/rtcl-regex-deepfuzz-o.txt 2>&1
+    "$RTCL" -f /tmp/rtcl-regex-deepfuzz.tcl > /tmp/rtcl-regex-deepfuzz-r.txt 2>&1
+    if diff -q /tmp/rtcl-regex-deepfuzz-o.txt /tmp/rtcl-regex-deepfuzz-r.txt >/dev/null; then
+        echo "== deep-fuzz: diff=0 =="
+    else
+        echo "== deep-fuzz: DIFF =="
+        diff /tmp/rtcl-regex-deepfuzz-o.txt /tmp/rtcl-regex-deepfuzz-r.txt | head -20
+    fi
 fi

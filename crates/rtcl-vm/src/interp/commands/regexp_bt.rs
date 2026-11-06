@@ -758,16 +758,26 @@ fn resolve_digits(n: Node, ngroups: usize) -> Node {
     match n {
         Node::Digits(run) => {
             let chars: Vec<char> = run.chars().collect();
-            // Longest valid backref prefix (group numbers start at 1).
+            // Tcl ARE 启发式（Spencer）：**整个数字串**作为一个数——
+            // 若为非零且 ≤ 组数 → 反向引用；否则按最多 3 位八进制
+            // 转义 + 其余字面（`\12` 在 1 组时是换行，不是 \1+'2'）。
             let mut best: Option<(usize, usize)> = None; // (num, digits_used)
-            for take in (1..=chars.len()).rev() {
-                if chars[0] == '0' {
-                    break;
+            if chars[0] != '0' {
+                let mut num = 0usize;
+                let mut overflow = false;
+                for c in &chars {
+                    match c.to_digit(10) {
+                        Some(d) => {
+                            num = num.saturating_mul(10).saturating_add(d as usize);
+                            if num == usize::MAX {
+                                overflow = true;
+                            }
+                        }
+                        None => break,
+                    }
                 }
-                let num: usize = chars[..take].iter().collect::<String>().parse().unwrap_or(0);
-                if num <= ngroups {
-                    best = Some((num, take));
-                    break;
+                if !overflow && num >= 1 && num <= ngroups {
+                    best = Some((num, chars.len()));
                 }
             }
             let mut items: Vec<Node> = Vec::new();

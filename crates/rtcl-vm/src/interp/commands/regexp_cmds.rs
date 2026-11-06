@@ -30,19 +30,42 @@ fn regex_escape(s: &str) -> String {
 /// 合法码点用 `regex_escape` 输出（保持元字符的字面语义）；代理区
 /// （U+D800..DFFF）在 Tcl 里永不匹配：类外输出 `(?!)`、类内直接省略。
 #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
-fn expand_unicode_escapes(pat: &str) -> String {
+fn expand_unicode_escapes(pat: &str) -> (String, bool) {
     let b = pat.as_bytes();
     let mut out = String::with_capacity(pat.len());
     let mut i = 0usize;
     let mut in_class = false;
+    // 反向引用需要 BT 引擎（fast 引擎不支持）；同时用于 Tcl 的
+    // 八进制/反向引用启发式（多位数按已闭合组数判定）。
+    let mut needs_bt = false;
+    let mut paren_stack: Vec<bool> = Vec::new();
+    let mut groups_closed = 0usize;
     while i < b.len() {
-        if b[i] == b'[' && !in_class {
-            in_class = true;
-            out.push('[');
-            i += 1;
-            continue;
-        }
-        if b[i] == b']' && in_class {
+        if !in_class {
+            match b[i] {
+                b'[' => {
+                    in_class = true;
+                    out.push('[');
+                    i += 1;
+                    continue;
+                }
+                b'(' => {
+                    paren_stack.push(b.get(i + 1) != Some(&b'?'));
+                    out.push('(');
+                    i += 1;
+                    continue;
+                }
+                b')' => {
+                    if paren_stack.pop().unwrap_or(false) {
+                        groups_closed += 1;
+                    }
+                    out.push(')');
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        } else if b[i] == b']' {
             in_class = false;
             out.push(']');
             i += 1;
@@ -58,6 +81,76 @@ fn expand_unicode_escapes(pat: &str) -> String {
             out.push('\\');
             break;
         };
+        // Tcl ARE 的八进制/反向引用启发式：整个数字串作为一个数——
+        // 非零且 ≤ 已闭合组数 → 反向引用（留给 BT）；否则八进制
+        // （最多 3 位）+ 其余字面。单个非零数字总是反向引用。
+        if ech.is_ascii_digit() {
+            let mut j = i + 2;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let run = &b[i + 1..j];
+            let leading_zero = run[0] == b'0';
+            let oct_start = (b'0'..=b'7').contains(&run[0]);
+            let mut val = 0usize;
+            let mut overflow = false;
+            for d in run {
+                val = val.saturating_mul(10).saturating_add((d - b'0') as usize);
+                if val == usize::MAX {
+                    overflow = true;
+                }
+            }
+            let backref = !in_class
+                && !leading_zero
+                && (run.len() == 1 || (!overflow && val >= 1 && val <= groups_closed));
+            if backref {
+                needs_bt = true;
+                out.push('\\');
+                out.push_str(std::str::from_utf8(run).unwrap_or(""));
+                i = j;
+                continue;
+            }
+            if !leading_zero && !oct_start {
+                // 校验阶段已拒绝（invalid escape）；保守保留原文。
+                out.push('\\');
+                out.push_str(std::str::from_utf8(run).unwrap_or(""));
+                i = j;
+                continue;
+            }
+            let mut k = i + 1;
+            let mut oct = 0u32;
+            let mut n = 0;
+            while n < 3 && k < b.len() && (b[k] as char).is_digit(8) {
+                oct = oct * 8 + (b[k] - b'0') as u32;
+                k += 1;
+                n += 1;
+            }
+            if let Some(c) = char::from_u32(oct) {
+                out.push_str(&regex_escape(&c.to_string()));
+            }
+            for d in &b[k..j] {
+                out.push(*d as char);
+            }
+            i = j;
+            continue;
+        }
+        // 字符入口转义：\b = backspace、\B = 反斜杠、\a = bell
+        // （与 Perl 的 word-boundary 语义不同）。
+        if ech == 'b' {
+            out.push_str("\\x08");
+            i += 2;
+            continue;
+        }
+        if ech == 'B' {
+            out.push_str("\\\\");
+            i += 2;
+            continue;
+        }
+        if ech == 'a' {
+            out.push_str("\\x07");
+            i += 2;
+            continue;
+        }
         if ech == 'u' || ech == 'U' || ech == 'x' {
             let max = if ech == 'u' {
                 4
@@ -101,7 +194,7 @@ fn expand_unicode_escapes(pat: &str) -> String {
         out.push(ech);
         i += 1 + ech.len_utf8();
     }
-    out
+    (out, needs_bt)
 }
 
 /// Quantifier-arrival state for the ARE scan: a quantifier must follow an
@@ -115,14 +208,6 @@ enum ArePrev {
     Lazy,
 }
 
-/// Left-to-right Tcl-ARE compile-time validation: `Some((REG code,
-/// message))` for patterns tclsh's regexp compiler rejects before
-/// matching — `regexp {a**} x` → "quantifier operand invalid"
-/// (REG_BADRPT), `{a{2,1}}` → REG_BADBR, `{a\}` → REG_EESCAPE, `{[[:foo:]]}`
-/// → REG_ECTYPE, unbalanced `(`/`[` → REG_EPAREN/REG_EBRACK.  rtcl's
-/// engines alone are more lenient and would silently accept some of
-/// these.  Only the six rejection classes are detected; everything else
-/// keeps the engines' own behavior.
 #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 /// 校验一个反斜杠转义（`b[i] == b'\\'`），返回转义后的位置。
 /// Tcl 8.6.17 ARE 实测：`\u` 收 1-4 hex、`\U` 收 1-8 hex、`\x` 收
@@ -158,17 +243,29 @@ fn are_escape_end(b: &[u8], i: usize) -> std::result::Result<usize, (&'static st
             Ok(j)
         }
         _ => {
-            if esc.is_ascii_alphanumeric()
-                && !esc.is_ascii_digit()
-                && !b"dDsSwWbBAZzmMyYCNceNntrfv".contains(&esc)
-            {
-                return Err(err());
+            if esc.is_ascii_alphanumeric() && !esc.is_ascii_digit() {
+                // 8.6.17：`\z` 不是合法转义（\Z 才是串尾）；字符入口
+                // 转义含 \a（bell）、\b（backspace）、\B（反斜杠）。
+                if esc == b'z'
+                    || !b"adDsSwWbBAZzmMyYCNceNntrfve".contains(&esc)
+                {
+                    return Err(err());
+                }
             }
             Ok(i + 2)
         }
     }
 }
 
+/// Left-to-right Tcl-ARE compile-time validation: `Some((REG code,
+/// message))` for patterns tclsh's regexp compiler rejects before
+/// matching — `regexp {a**} x` → "quantifier operand invalid"
+/// (REG_BADRPT), `{a{2,1}}` → REG_BADBR, `{a\}` → REG_EESCAPE, `{[[:foo:]]}`
+/// → REG_ECTYPE, unbalanced `(`/`[` → REG_EPAREN/REG_EBRACK.  rtcl's
+/// engines alone are more lenient and would silently accept some of
+/// these.  Only the six rejection classes are detected; everything else
+/// keeps the engines' own behavior.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 pub(crate) fn validate_are(pattern: &str) -> Option<(&'static str, String)> {
     const POSIX_CLASSES: &[&str] = &[
         "alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space",
@@ -183,10 +280,54 @@ pub(crate) fn validate_are(pattern: &str) -> Option<(&'static str, String)> {
     let mut i = 0usize;
     let mut prev = ArePrev::None;
     let mut depth = 0usize;
+    // 捕获组栈：`)` 闭合时 groups_closed += 1；反向引用只能指向
+    // **已经闭合**的组（tclsh 8.6.17：`(\1)` 报 invalid backreference）。
+    let mut paren_stack: Vec<bool> = Vec::new();
+    let mut groups_closed = 0usize;
     while i < b.len() {
         match b[i] {
             b'\\' => match are_escape_end(b, i) {
                 Ok(j) => {
+                    let esc = b[i + 1];
+                    if esc.is_ascii_digit() && esc != b'0' {
+                        // 整个数字串：≤ 已闭合组数 → 反向引用；否则按
+                        // 八进制转义（Spencer 启发式）。单个非零数字
+                        // 必为反向引用（无合法组 → REG_ESUBREG）。
+                        let mut j = i + 2;
+                        while j < b.len() && b[j].is_ascii_digit() {
+                            j += 1;
+                        }
+                        let run = &b[i + 1..j];
+                        let mut val = 0usize;
+                        let mut overflow = false;
+                        for d in run {
+                            val = val.saturating_mul(10).saturating_add((d - b'0') as usize);
+                            if val == usize::MAX {
+                                overflow = true;
+                            }
+                        }
+                        if run.len() == 1 {
+                            if !overflow && val > groups_closed {
+                                return Some((
+                                    "REG_ESUBREG",
+                                    "invalid backreference number".to_string(),
+                                ));
+                            }
+                        } else {
+                            let valid_backref =
+                                !overflow && val <= groups_closed;
+                            // 非反向引用的多位数：按最多 3 位八进制 +
+                            // 余字面；以 8/9 开头则无八进制数字 → invalid。
+                            if !valid_backref
+                                && !(b'0'..=b'7').contains(&run[0])
+                            {
+                                return Some((
+                                    "REG_EESCAPE",
+                                    "invalid escape \\ sequence".to_string(),
+                                ));
+                            }
+                        }
+                    }
                     i = j;
                     prev = ArePrev::Operand;
                 }
@@ -225,7 +366,28 @@ pub(crate) fn validate_are(pattern: &str) -> Option<(&'static str, String)> {
                     }
                     if b[j] == b'\\' {
                         match are_escape_end(b, j) {
-                            Ok(nj) => j = nj,
+                            Ok(nj) => {
+                                // 类内：\0.. 与多位数按八进制；单个非零
+                                // 数字是非法反向引用 → invalid escape；
+                                // 多位含 8/9 也无法作八进制。
+                                let esc = b[j + 1];
+                                if esc.is_ascii_digit() && esc != b'0' {
+                                    let mut k = j + 2;
+                                    while k < b.len() && b[k].is_ascii_digit() {
+                                        k += 1;
+                                    }
+                                    // 单个非零数字=非法反向引用；多位以
+                                    // 8/9 开头无法按八进制 → invalid
+                                    // escape；否则前 3 位八进制 + 余字面。
+                                    if k == j + 2 || !(b'0'..=b'7').contains(&esc) {
+                                        return Some((
+                                            "REG_EESCAPE",
+                                            "invalid escape \\ sequence".to_string(),
+                                        ));
+                                    }
+                                }
+                                j = nj;
+                            }
                             Err((code, msg)) => return Some((code, msg.to_string())),
                         }
                     } else {
@@ -256,6 +418,7 @@ pub(crate) fn validate_are(pattern: &str) -> Option<(&'static str, String)> {
                         ));
                     }
                 }
+                paren_stack.push(b.get(i + 1) != Some(&b'?'));
                 depth += 1;
                 i += 1;
                 prev = ArePrev::None;
@@ -268,6 +431,9 @@ pub(crate) fn validate_are(pattern: &str) -> Option<(&'static str, String)> {
                     ));
                 }
                 depth -= 1;
+                if paren_stack.pop().unwrap_or(false) {
+                    groups_closed += 1;
+                }
                 i += 1;
                 prev = ArePrev::Operand;
             }
@@ -483,8 +649,12 @@ pub(crate) fn compile_engine(
     lineanchor: bool,
     linestop: bool,
 ) -> std::result::Result<Engine, String> {
-    let expanded_pattern = expand_unicode_escapes(pattern);
+    let (expanded_pattern, needs_bt) = expand_unicode_escapes(pattern);
     let pattern = expanded_pattern.as_str();
+    if needs_bt {
+        return super::regexp_bt::bt_compile(pattern, nocase, expanded, lineanchor, linestop)
+            .map(Engine::Full);
+    }
     // Tcl-Unicode class semantics live only in the backtracking engine.
     if uses_tcl_unicode_classes(pattern) {
         return super::regexp_bt::bt_compile(pattern, nocase, expanded, lineanchor, linestop)
@@ -584,7 +754,7 @@ pub(crate) fn compile_engine(
     lineanchor: bool,
     linestop: bool,
 ) -> std::result::Result<Engine, String> {
-    let expanded_pattern = expand_unicode_escapes(pattern);
+    let (expanded_pattern, _needs_bt) = expand_unicode_escapes(pattern);
     let pattern = expanded_pattern.as_str();
     let built = build_pattern(pattern, nocase, expanded, lineanchor, linestop);
     let re = regex_lite::Regex::new(&built).map_err(|e| e.to_string())?;

@@ -27,6 +27,7 @@ Thumbs.db
 !Agent.md
 !Claude.md
 !Cargo.toml
+!specs/regex-engine-eval.md
 
 # Task output files
 tasks/*.output

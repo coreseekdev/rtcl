@@ -251,7 +251,18 @@
   展开为 `regex_escape` 后的字面字符（fast/BT 两引擎共用）；
   代理区码点（U+D800..DFFF，Tcl 中永不匹配）类外展开为 `(?!)`，
   类内用 U+10FFFF 占位（Rust 字符串不可能含代理的近似）。
-  regex-escapes.tcl 差分全 SAME。
+  * 字符入口转义：`\b` = backspace、`\B` = 反斜杠、`\a` = bell
+    （不是 Perl 的 word-boundary）；`\z` 在 8.6.17 非法（`\Z`
+    才是串尾），均按 oracle 钉死。
+  * 数字转义（Spencer 启发式，oracle 矩阵实测）：**整个数字串**
+    作为一个数——非零且 ≤ 已闭合捕获组数 → 反向引用（留给 BT
+    引擎）；否则按最多 3 位八进制 + 余字面（`\3161573148` =
+    U+00CE + "1573148"；`(a)\12` 在 1 组时 = "a" + 换行）。
+    单个非零数字总是反向引用（无组 → REG_ESUBREG）；多位以 8/9
+    开头无法八进制 → REG_EESCAPE；类内单非零数字同样 invalid。
+    fast 引擎会把八进制误读（`\12` 当 U+000C），现已由展开层
+    统一改写为 `\x{...}` 字面；含反向引用的模式显式路由 BT。
+  regex-escapes.tcl / oct*.tcl / bref.tcl 差分全 SAME。
 - **严重度**：已关闭。
 
 ### D-20 惰性量词的匹配偏好语义（spec [D-19]）
@@ -263,6 +274,11 @@
   是 probe harness 伪差（未 catch 的顶层错误：tclsh stdin rc=0 无
   "Error: " 前缀 vs rtcl -c rc=1 自带前缀），探针已改为 catch/结构化
   断言；**唯一真实残差就是本条**（119 SAME / 1 DIFF）。
+- **量化评估**：见 `specs/regex-engine-eval.md`（定向 759 例 62 差异
+  = 8.2%，随机 4000 例 523 差异 = 13.1%；惰性/SHORTER 约 87%、
+  leftmost-longest 约 9%、POSIX 子匹配约 4%）。sregex 类
+  Perl 兼容流式引擎**不能**修复本条，不建议复刻；路线建议（BT 精确化
+  / Spencer 移植）见该文档。
 
 ### D-21 `\A` 在 `-lineanchor -start` 下被改写为 `^`（spec [D-20]）
 - **Tcl 8.6**：`\A` 只绑定 -start 偏移。
@@ -779,6 +795,20 @@
   不复刻；`dict create -unordered`/`dict getdef` 仍是台账声明的
   有意扩展（dict-deep 17/3）。
 - **严重度**：已关闭（io 面）。
+
+### D-46 POSIX leftmost-longest vs leftmost-first（2026-11-06 评估）[OPEN]
+- **Tcl 8.6.17**（Spencer `regexec`）：默认同一位置取**最长**整体匹配
+  （`a|ab` 在 `ab` 上 → `ab`；`(a|ab)` 捕获 `ab`）；子匹配按 POSIX
+  消歧（`(a*)+` 在 `a` 上整体 `a`、组 `{}`）。
+- **rtcl**：fast 引擎（Rust `regex` crate）与 BT 引擎均为
+  leftmost-first（Perl）：`a|ab` → `a`；重复组捕获取贪婪迭代
+  （`(a*)+` → 组 `a`）。
+- **影响面**：随机 4000 例语料 47 例纯最长差异 + 21 例子匹配差异；
+  与 D-20（惰性/SHORTER）合计 523/4000（13.1%）。
+- **评估**：`specs/regex-engine-eval.md`（含 sregex 复刻取舍：Perl
+  语义 + octet-only + 无回引/环视，不能修本条，不建议引入）。
+- **严重度**：中（需要 Spencer 语义引擎或 POSIX-longest 引擎 +
+  子匹配消歧；与 D-20 同批收口）。
 
 ## rtcl 有意扩展（超集，非 bug，parity 语料不应使用）
 

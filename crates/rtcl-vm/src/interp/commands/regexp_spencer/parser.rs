@@ -60,6 +60,8 @@ pub struct Parser {
     opts: Options,
     /// 已闭合的捕获组（1-based）。
     closed: Vec<bool>,
+    /// 各捕获组首/末字符词性集合（闭合时记录，供回引 -about 分析）。
+    cap_words: Vec<(u8, u8)>,
     /// 下一个捕获组编号。
     next_sub: usize,
     /// lookahead 嵌套层数：内部括号非捕获，回引非法。
@@ -76,6 +78,7 @@ impl Parser {
             i: 0,
             opts,
             closed: vec![false],
+            cap_words: vec![(3, 3)],
             next_sub: 1,
             lacon: 0,
             depth: 0,
@@ -411,9 +414,17 @@ impl Parser {
         if consecutive {
             return Err(Self::err("REG_BADRPT", "quantifier operand invalid"));
         }
-        if let super::ast::NodeKind::Backref { subno, .. } = atom.kind {
+        if let super::ast::NodeKind::Backref {
+            subno,
+            first_word,
+            last_word,
+            ..
+        } = &atom.kind
+        {
             // 量化回引：把 min/max 放进回引节点本身（Spencer 特例）。
-            return Ok(Node::backref(subno, min, max, qprefer));
+            return Ok(Node::backref(
+                *subno, min, max, qprefer, *first_word, *last_word,
+            ));
         }
         if min >= 1 {
             // Spencer 编译器改写（regcomp.c）：x{m,n}（m>0，无回引）
@@ -651,6 +662,10 @@ impl Parser {
             self.closed.resize(subno + 1, false);
         }
         self.closed[subno] = true;
+        if self.cap_words.len() <= subno {
+            self.cap_words.resize(subno + 1, (3, 3));
+        }
+        self.cap_words[subno] = super::ast::word_bounds(&inner);
         Ok(Node::capture(inner, subno))
     }
 
@@ -695,6 +710,10 @@ impl Parser {
                     self.closed.resize(subno + 1, false);
                 }
                 self.closed[subno] = true;
+                if self.cap_words.len() <= subno {
+                    self.cap_words.resize(subno + 1, (3, 3));
+                }
+                self.cap_words[subno] = super::ast::word_bounds(&inner);
                 Ok(Node::capture(inner, subno))
             }
             '1'..='9' => {
@@ -713,7 +732,12 @@ impl Parser {
                         "invalid backreference number",
                     ));
                 }
-                Ok(Node::backref(subno, 1, 1, Flags::NONE))
+                let (fw, lw) = self
+                    .cap_words
+                    .get(subno)
+                    .copied()
+                    .unwrap_or((3, 3));
+                Ok(Node::backref(subno, 1, 1, Flags::NONE, fw, lw))
             }
             '<' => Ok(Node::assert(AssertKind::WordStart)),
             '>' => Ok(Node::assert(AssertKind::WordEnd)),
@@ -781,6 +805,10 @@ impl Parser {
                 self.closed.resize(subno + 1, false);
             }
             self.closed[subno] = true;
+            if self.cap_words.len() <= subno {
+                self.cap_words.resize(subno + 1, (3, 3));
+            }
+            self.cap_words[subno] = super::ast::word_bounds(&inner);
             Ok(Node::capture(inner, subno))
         }
     }
@@ -914,7 +942,8 @@ impl Parser {
                         "invalid backreference number",
                     ));
                 }
-                return Ok(Node::backref(val, 1, 1, Flags::NONE));
+                let (fw, lw) = self.cap_words.get(val).copied().unwrap_or((3, 3));
+                return Ok(Node::backref(val, 1, 1, Flags::NONE, fw, lw));
             }
             if !(first as u8).is_ascii_octal() {
                 return Err(Self::err("REG_EESCAPE", "invalid escape \\ sequence"));

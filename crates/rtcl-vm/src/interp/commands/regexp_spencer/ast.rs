@@ -154,6 +154,9 @@ pub enum NodeKind {
         subno: usize,
         min: u32,
         max: u32,
+        /// 被引用捕获文本的首/末字符词性集合（-about 词约束分析）。
+        first_word: u8,
+        last_word: u8,
     },
     /// 前向断言（`(?=)` / `(?!)`）。内部捕获按 Tcl 规则视为非捕获。
     Look {
@@ -236,11 +239,24 @@ impl Node {
         )
     }
 
-    pub fn backref(subno: usize, min: u32, max: u32, qprefer: Flags) -> Node {
+    pub fn backref(
+        subno: usize,
+        min: u32,
+        max: u32,
+        qprefer: Flags,
+        first_word: u8,
+        last_word: u8,
+    ) -> Node {
         let mut flags = Flags::BACKR;
         flags = Flags::combine(qprefer, flags);
         Node::new(
-            NodeKind::Backref { subno, min, max },
+            NodeKind::Backref {
+                subno,
+                min,
+                max,
+                first_word,
+                last_word,
+            },
             flags,
         )
     }
@@ -377,6 +393,11 @@ fn wordness(n: &Node) -> WordKind {
     }
 }
 
+/// 捕获组首/末字符的词性集合（parser 在闭合组时记录，供回引分析）。
+pub(crate) fn word_bounds(n: &Node) -> (u8, u8) {
+    (first_wordness_if_consumes(n), last_wordness_if_consumes(n))
+}
+
 const WS_WORD: u8 = 1;
 const WS_NON: u8 = 2;
 const WS_ANY: u8 = 3;
@@ -390,10 +411,10 @@ fn word_mask(k: WordKind) -> u8 {
 }
 
 /// 该节点一旦消耗字符，**最后一个**字符的词性集合。
-fn last_wordness_if_consumes(n: &Node) -> u8 {
+pub(crate) fn last_wordness_if_consumes(n: &Node) -> u8 {
     match &n.kind {
         NodeKind::Char(_) | NodeKind::Class(_) => word_mask(wordness(n)),
-        NodeKind::Backref { .. } => WS_ANY,
+        NodeKind::Backref { last_word, .. } => *last_word,
         NodeKind::NoRecord(inner) | NodeKind::Capture { node: inner, .. } => {
             last_wordness_if_consumes(inner)
         }
@@ -423,10 +444,10 @@ fn last_wordness_if_consumes(n: &Node) -> u8 {
 }
 
 /// 该节点一旦消耗字符，**第一个**字符的词性集合。
-fn first_wordness_if_consumes(n: &Node) -> u8 {
+pub(crate) fn first_wordness_if_consumes(n: &Node) -> u8 {
     match &n.kind {
         NodeKind::Char(_) | NodeKind::Class(_) => word_mask(wordness(n)),
-        NodeKind::Backref { .. } => WS_ANY,
+        NodeKind::Backref { first_word, .. } => *first_word,
         NodeKind::NoRecord(inner) | NodeKind::Capture { node: inner, .. } => {
             first_wordness_if_consumes(inner)
         }
@@ -722,6 +743,23 @@ fn impossible_ctx(n: &Node, empty: bool) -> bool {
     }
 }
 
+/// 空路径上所有必执行零宽约束（忽略可消耗节点）是否可同时成立：
+/// 空匹配时全部消耗节点都跳过，词约束落在同一位置。
+fn nullable_path_constraints_feasible(v: &[Node]) -> bool {
+    let mut asserts = Vec::new();
+    let mut prev_fixed = false;
+    let mut next_fixed = false;
+    for p in v {
+        collect_zero_width_constraints(p, &mut prev_fixed, &mut next_fixed, &mut asserts);
+    }
+    if asserts.is_empty() {
+        return true;
+    }
+    let prev_set = if prev_fixed { WS_NON } else { WS_ANY };
+    let next_set = if next_fixed { WS_NON } else { WS_ANY };
+    word_run_feasible(&asserts, prev_set, next_set)
+}
+
 /// `-about` 的 REG_UEMPTYMATCH 口径：结构可空且该空路径不是
 /// 不可命中的（剔除 word 约束在 `^...$` 强制空串下必然失败的路径）。
 pub fn nullable_matchable(tree: &Node) -> bool {
@@ -778,6 +816,9 @@ fn nullable_m(n: &Node, groups: &mut Vec<Option<bool>>) -> bool {
         }
         NodeKind::Concat(v) => {
             let all = v.iter().all(|p| nullable_m(p, groups));
+            if all && !nullable_path_constraints_feasible(v) {
+                return false;
+            }
             if all
                 && concat_has_abs_start_and_eos(v)
                 && !v.iter().any(necessarily_consumes)

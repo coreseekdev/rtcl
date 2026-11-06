@@ -108,7 +108,7 @@ impl<'a> Dissect<'a> {
             NodeKind::Repeat { node, min, max } => {
                 self.repeat(node, *min, *max, begin, end, record, caps)
             }
-            NodeKind::Backref { subno, min, max } => self.backref(*subno, *min, *max, begin, end, caps),
+            NodeKind::Backref { subno, min, max, .. } => self.backref(*subno, *min, *max, begin, end, caps),
             NodeKind::Look { negative, node } => {
                 let Ok(sub) = nfa::compile(node, self.prog.icase) else {
                     return false;

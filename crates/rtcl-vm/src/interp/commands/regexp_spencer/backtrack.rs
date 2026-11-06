@@ -106,7 +106,7 @@ impl<'a> Bt<'a> {
             NodeKind::Repeat { node, min, max } => {
                 self.repeat(node, *min, *max, pos, record, caps, out)
             }
-            NodeKind::Backref { subno, min, max } => {
+            NodeKind::Backref { subno, min, max, .. } => {
                 let Some(Some((cs, ce))) = caps.get(*subno).copied() else {
                     return;
                 };

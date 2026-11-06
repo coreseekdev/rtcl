@@ -1071,7 +1071,26 @@ impl Parser {
                     }
                 }
             }
-            let lo = self.parse_class_char()?;
+            let class_start = self.i;
+            let lo = match self.parse_class_char() {
+                Ok(v) => v,
+                Err(e) => {
+                    // 已发现坏范围时，只有“紧跟在坏范围之后”的类
+                    // 语法错误优先报 EESCAPE（`[z-a\q`）；若错误前
+                    // 还有字符且已到串尾，tclsh 报 ERANGE
+                    //（`[{-n+\`、`[z-a+\q`）。
+                    if bad_range
+                        && self.i == self.chars.len()
+                        && class_start != bad_range_at
+                    {
+                        return Err(Self::err(
+                            "REG_ERANGE",
+                            "invalid character range",
+                        ));
+                    }
+                    return Err(e);
+                }
+            };
             // 范围：Char '-' Char（'-' 在末尾/开头时是字面）。
             let lo_char = match lo {
                 ClassAtom::Char(c) => Some(c),

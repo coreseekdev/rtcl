@@ -196,9 +196,10 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   5000 例 Unicode/多字节文本命令面语料、15000 例嵌套语法层语料
   （环视/分组/量词/内嵌选项，`specs/regex/gen-deep-fuzz.py`）、
   4000 例字符类/排序元素语料（`gen-class-fuzz.py`）、5000 例
-  Unicode -nocase 折叠语料（`gen-fold-fuzz.py`）与 3000 例
+  Unicode -nocase 折叠语料（`gen-fold-fuzz.py`）、3000 例
   -expanded 空白/注释语料（`gen-expanded-fuzz.py`，BRE/ERE 同样
-  生效）**0 差异**。内嵌 `(?i)` 生效后的 options 会传给 NFA/匹配器；
+  生效）与 10000 例编译错误码/消息语料（`gen-error-fuzz.py`）
+  **0 差异**。内嵌 `(?i)` 生效后的 options 会传给 NFA/匹配器；
   环视内括号保留分组层（`(?=(^){1,2})` 可量化）；环视子式的
   偏好位不向父节点传播（Lacon 是零宽约束，`(?=..)[^ab]*?` 的
   SHORTER 不被内层 LONGER 覆盖）；惰性子节点的重复组末次迭代
@@ -208,7 +209,9 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   转义展开成多字面字符时，后续量词只绑定最后一个字符
   （`\1010{2}` = `A 0{2}`）。排序/等价元素名必须是单字符
   （`[[=ab=]]`/`[[.ab.]]` → REG_ECOLLATE / invalid collating
-  element）。`-linestop/-line`
+  element）。字符类错误优先级：坏范围后的类语法错误通常让位于
+  ERANGE，但紧跟在坏范围后的 escape（`[z-a\q`）仍报 EESCAPE；
+  类内非法转义/未闭合等优先级按 tclsh 探针（`error-probes.tcl`）。`-linestop/-line`
   下否定简写 `\W/\D/\S` 与 `[^...]` 一样不匹配换行；ARE 字符类内
   仅允许小写 `\d\s\w`（大写 → REG_EESCAPE，BRE/ERE 为字面）。
   回引回溯的 concat 去重按

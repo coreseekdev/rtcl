@@ -2242,7 +2242,7 @@ pub fn cmd_encoding(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage(
             "encoding", 2, args.len(),
-            "option ?arg ...?",
+            "subcommand ?arg ...?",
         ));
     }
     let resolve = |w: &str| -> Result<&'static str> {

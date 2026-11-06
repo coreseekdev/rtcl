@@ -36,3 +36,21 @@ proc cno {} {namespace eval nn {error x}} ; catch {cno} m o ; puts [dict get $o 
 proc cta {} {tailcall caf2 9} ; proc caf2 {a b} {} ; catch {cta} m o ; puts [dict get $o -errorstack]
 proc cw {} {set x 5 ; nosuch $x} ; catch {cw} m o ; puts [dict get $o -errorstack]
 proc cw2 {} {nosuch [expr {1+1}]} ; catch {cw2} m o ; puts [dict get $o -errorstack]
+# ── D-3 残差收口：INNER 的 bytecode 操作码形（2026-11-06 实测钉形）──
+proc p1 {} {set y $undefined} ; catch {p1} m o ; puts [dict get $o -errorstack]
+proc p2 {} {set y $::undefined} ; catch {p2} m o ; puts [dict get $o -errorstack]
+proc p3 {} {set y $undef(1)} ; catch {p3} m o ; puts [dict get $o -errorstack]
+proc p4 {} {set y $undef($k)} ; catch {p4} m o ; puts [dict get $o -errorstack]
+proc p5 {} {$cmd arg} ; catch {p5} m o ; puts [dict get $o -errorstack]
+proc d1 {s} {catch $s m o ; puts [dict get $o -errorstack]} ; d1 {set y $undefined}
+proc d2 {s} {catch $s m o ; puts [dict get $o -errorstack]} ; d2 {set y $undef(1)}
+proc e1 {} {namespace eval nn} ; catch {e1} m o ; puts [dict get $o -errorstack]
+proc e2 {} {string length ; set x 1} ; catch {e2} m o ; puts [dict get $o -errorstack]
+proc e3 {} {dict get} ; catch {e3} m o ; puts [dict get $o -errorstack]
+proc e4 {} {file} ; catch {e4} m o ; puts [dict get $o -errorstack]
+proc e5 {} {encoding} ; catch {e5} m o ; puts [dict get $o -errorstack]
+proc x1 {} {set x {1 2} ; nosuch {*}$x} ; catch {x1} m o ; puts [dict get $o -errorstack]
+proc x2 {} {nosuch {*}{a b}} ; catch {x2} m o ; puts [dict get $o -errorstack]
+proc x3 {} {set x {} ; string length {*}$x} ; catch {x3} m o ; puts [dict get $o -errorstack]
+proc x4 {} {namespace {*}{eval}} ; catch {x4} m o ; puts [dict get $o -errorstack]
+proc x5 {} {set cmd string ; $cmd {*}{length}} ; catch {x5} m o ; puts [dict get $o -errorstack]

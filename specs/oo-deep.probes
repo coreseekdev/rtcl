@@ -53,3 +53,7 @@ oo::class create K {method m {} {puts CLASS}} ; set o [K new] ; oo::objdefine $o
 oo::class create R {method m {} {puts RMIXIN ; next}} ; oo::class create Q ; oo::objdefine Q method m {} {puts QOWN ; next} ; oo::objdefine Q mixin R ; catch {Q m} mm ; puts $mm
 oo::class create C {method a {} {}} ; set o [C new] ; oo::objdefine $o method own {} {catch {my nosuch} e ; return $e} ; puts [$o own]
 oo::class create C {method a {} {}} ; set o [C new] ; oo::objdefine $o method pm {} {error ownerr} ; catch {$o pm} mm oo2 ; puts [dict get $oo2 -errorinfo]
+# ── D-41a 补：对象自有方法 + 类链 next（mixin 遮蔽场景由解析序修复）──
+oo::class create C {method m {args} {return "C args=[list $args] l0=[info level 0]"}} ; set o [C new] ; oo::objdefine $o method m {args} {return "obj: [next 5 6]"} ; puts [$o m]
+oo::class create C {method m {args} {return "C args=[list $args] l0=[info level 0]"}} ; set o [C new] ; oo::objdefine $o method m {args} {return "obj: [next 5 6]"} ; puts [$o m 1 2]
+oo::class create C {method n {args} {return "Cn args=[list $args] l0=[info level 0]"}} ; set o [C new] ; oo::objdefine $o method n {args} {return "objn: [next]"} ; puts [$o n 9]

@@ -310,6 +310,83 @@ fn loop_signal(st: &mut VmState, e: Error) -> Result<()> {
 /// dispatch saw the completion, so EVERY region kind overwrites the
 /// pending slot with its owner command's text (outermost wins) instead
 /// of the error-path's suppress/append behaviour.
+// ── D-3 残差：INNER 的 bytecode 操作码形（vm 路径）─────────────────
+
+/// 命令词的源码是否编译期已知字面（tclsh TclWordKnownAtCompileTime 近似）。
+fn src_word_is_literal(src: &str) -> bool {
+    if src.len() >= 2 && src.starts_with('{') && src.ends_with('}') {
+        return true;
+    }
+    if src.len() >= 2 && src.starts_with('"') && src.ends_with('"') {
+        let inner = &src[1..src.len() - 1];
+        return !inner.contains('$') && !inner.contains('[');
+    }
+    !src.contains('$') && !src.contains('[') && !src.contains('\\') && !src.starts_with("{*}")
+}
+
+/// 命令调用面的 INNER 形：动态 `{*}` 展开优先（invokeExpanded），其次
+/// 字面命令词 + ensemble（invokeReplace）；否则 None → invokeStk1。
+fn call_inner_hint(
+    source: &str,
+    word_srcs: &[rtcl_parser::SrcSpan],
+    words: &[Value],
+) -> Option<&'static str> {
+    let expanded_dynamic = word_srcs.iter().any(|ws| {
+        let src = ws.slice(source);
+        match src.strip_prefix("{*}") {
+            Some(rest) => !(rest.starts_with('{') && rest.ends_with('}')),
+            None => false,
+        }
+    });
+    if expanded_dynamic {
+        return Some("invokeExpanded");
+    }
+    let cmd_name = words.first().map(|v| v.as_str()).unwrap_or("");
+    let literal_cmd = word_srcs
+        .first()
+        .map(|ws| src_word_is_literal(ws.slice(source)))
+        .unwrap_or(false);
+    if literal_cmd && super::eval::is_ensemble_name(cmd_name) {
+        return Some("invokeReplace");
+    }
+    None
+}
+
+/// 变量读取失败的操作码名（vm 局部槽位 / 名键单元直接由 op 决定）。
+fn word_op_inner_hint(code: &ByteCode, op: &OpCode, msg: &str) -> Option<&'static str> {
+    let quoted = msg.strip_prefix("can't read \"")?.split('"').next()?;
+    match op {
+        OpCode::LoadLocal(slot) => Some(if *slot < 256 { "loadScalar1" } else { "loadScalar" }),
+        OpCode::LoadArrayElem(slot) => {
+            Some(if *slot < 256 { "loadArray1" } else { "loadArray" })
+        }
+        OpCode::LappendLocal(slot) => {
+            Some(if *slot < 256 { "loadScalar1" } else { "loadScalar" })
+        }
+        OpCode::LappendVar(_) | OpCode::LappendVarVar(_, _) => {
+            // 源变量读取失败：locals 单元按隐式局部槽（loadScalar1），
+            // 名键单元 loadStk。
+            Some(if code.locals_mode { "loadScalar1" } else { "loadStk" })
+        }
+        OpCode::LoadVar(idx) => {
+            let name = code.get_const(*idx).unwrap_or("");
+            let qualified = name.contains("::");
+            let array_ref = name.contains('(') && name.ends_with(')');
+            if qualified {
+                // 限定名永远走通用变量装载（loadStk）。
+                Some("loadStk")
+            } else if array_ref && name == quoted {
+                // 数组元素整体读取失败：locals 单元隐式局部数组槽。
+                Some(if code.locals_mode { "loadArray1" } else { "loadArrayStk" })
+            } else {
+                // 普通标量 / 下标变量读取失败。
+                Some(if code.locals_mode { "loadScalar1" } else { "loadStk" })
+            }
+        }
+        _ => None,
+    }
+}
+
 fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error, flow: bool) {
     while let Some(region) = st.bodies.last().copied() {
         st.bodies.pop();
@@ -329,7 +406,7 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                     interp.err_line = line;
                 } else {
                     let msg = e.message_text();
-                    interp.err_harness_frame(&msg, text, line);
+                    interp.err_harness_frame_words(&msg, text, line, None, None);
                 }
             }
             Region::Body(site_idx) | Region::Next(site_idx) => {
@@ -353,7 +430,7 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                     // The foreach command's own harness frame follows
                     // immediately (`invoked from within`) — tclsh logs it
                     // before the error escapes the foreach command.
-                    interp.err_harness_frame(e.message_text().as_str(), text, line);
+                    interp.err_harness_frame_words(e.message_text().as_str(), text, line, None, None);
                 }
             }
         }
@@ -1148,8 +1225,16 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             let site = &code.sites[st.cur_site];
             let text = site.text.slice(&code.source);
             let line = st.entry_offset + site.line as usize;
-            let is_word_op =
-                matches!(op, OpCode::LoadVar(_) | OpCode::LoadLocal(_) | OpCode::EvalScript);
+            let is_word_op = matches!(
+                op,
+                OpCode::LoadVar(_)
+                    | OpCode::LoadLocal(_)
+                    | OpCode::LoadArrayElem(_)
+                    | OpCode::LappendLocal(_)
+                    | OpCode::LappendVar(_)
+                    | OpCode::LappendVarVar(_, _)
+                    | OpCode::EvalScript
+            );
             if is_word_op && std::mem::take(&mut interp.err_from_subst) {
                 interp.err_pending_top = Some(Rc::from(text));
                 interp.err_line = line;
@@ -1157,17 +1242,24 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                 let msg = e.message_text();
                 // 调用类 op：INNER 的 invokeStk1 载荷用栈上**已求值
                 // 词**（tclsh 的 pc/tos 内省），其余 op 回落源码片段。
-                let words: Option<&[Value]> = match op {
+                let is_call_op = matches!(
+                    op,
                     OpCode::Call { .. }
-                    | OpCode::CallExpand { .. }
-                    | OpCode::CallProc { .. }
-                    | OpCode::DynCall { .. }
-                    | OpCode::DynCallExpand { .. }
-                    | OpCode::SubEndDynCall(_)
-                    | OpCode::SubEndCall { .. } => Some(&st.scratch),
-                    _ => None,
+                        | OpCode::CallExpand { .. }
+                        | OpCode::CallProc { .. }
+                        | OpCode::DynCall { .. }
+                        | OpCode::DynCallExpand { .. }
+                        | OpCode::SubEndDynCall(_)
+                        | OpCode::SubEndCall { .. }
+                );
+                let words: Option<&[Value]> = if is_call_op { Some(&st.scratch) } else { None };
+                // D-3 残差：INNER 的 bytecode 操作码形。
+                let hint = if is_call_op {
+                    call_inner_hint(&code.source, &site.word_srcs, &st.scratch)
+                } else {
+                    word_op_inner_hint(code, op, &msg)
                 };
-                interp.err_harness_frame_words(&msg, text, line, words);
+                interp.err_harness_frame_words(&msg, text, line, words, hint);
             }
             // The error then crosses every still-open inlined `[...]`
             // region: each word-bracket-owning command defers its frame to

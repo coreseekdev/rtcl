@@ -269,9 +269,20 @@
 - **复现**：`puts [clock format 0]; puts [clock scan 2000-01-01];
   puts [clock add 0 1 month]`
 - **严重度**：已关闭（32/37 matching-deep；15 条 clock 探针全 SAME）。
-  残差：自由格式 scan（`next Friday`/`5 minutes ago`/"x"→now 等
-  tclClock.c 相对语法）；scan 的 %Z 缩写只消费不查表（tclsh 按
-  zoneinfo 名查 EST/CET 等并应用偏移，未知缩写报
+  * **自由格式 scan 落地（2026-11-06，tclsh ClockFreeScan 常用子集）**：
+    空串/now/today（= base）、tomorrow/yesterday、ISO/YYYYMMDD/M\/D\/Y/
+    月名/日名与 D-Mon-YYYY 日期、时刻（H:MM[:SS][am|pm]、3pm、3 pm、裸
+    数字≤4 位按 HHMM）、数字时区 ±HHMM、UTC/GMT、星期名（可带
+    next/last；Plain=当天或之后）、相对短语（`<n> <unit>[s] [ago]`、
+    next|last `<unit>`；单位 second/minute/hour/day/week/fortnight/
+    month/year，sec/secs 亦收；ago 否定其**之前**未否定的全部相对项）。
+    组合规则：缺日期取 base；有日期或非零日级相对量时时刻归零（显式
+    时刻优先）；相对量按序施加（月/年夹月末）。裸数字不再按 epoch
+    （`clock scan 123` = 今日 01:23）。35 条 -base 固定探针全 SAME。
+  残差：军事单字母时区（T=+7 等）与双字母时区（AT）；`next|last
+  <月名>` 的 tclsh 怪值；畸形数字日期（`1-2-2000` → 2007-06-23 等）；
+  部分错误字符位（EST 尾随、`2000-060`）；scan 的 %Z 缩写只消费不查表
+  （tclsh 按 zoneinfo 名查 EST/CET 等并应用偏移，未知缩写报
   `time zone "xyz" not found`）；clock 错误的 errorInfo 含 tclsh Tcl
   实现（::tcl::clock::add 等）的 proc 帧；-locale 只接受不参与格式。
 

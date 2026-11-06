@@ -287,19 +287,26 @@ impl Interp {
     /// failing command, not the frameless construct that re-raised it).
     /// Non-error completions (return/break/continue/exit) never reach this.
     pub(crate) fn err_harness_frame(&mut self, msg: &str, text: &str, line: usize) {
-        self.err_harness_frame_words(msg, text, line, None);
+        self.err_harness_frame_words(msg, text, line, None, None);
     }
 
     /// 同 [`Interp::err_harness_frame`]，但首帧 INNER 的
     /// `invokeStk1` 载荷可用**已求值调用词**重建（tclsh 的 pc/tos
     /// 内省：`Tcl_NewListObj` 里是栈上的词，不是源码片段——`f $x`
     /// 记 `invokeStk1 f 5`）。`None` 时回落源码片段。
+    ///
+    /// `hint` 覆盖 INNER 为 tclsh 的 bytecode 操作码形（D-3 残差收口）：
+    /// `invokeReplace`（字面命令词且为 ensemble 的派发错误）、
+    /// `invokeExpanded`（动态 `{*}` 展开的派发错误）、以及变量读取
+    /// 失败的 `loadScalar1`/`loadScalar`/`loadArray1`/`loadArray`/
+    /// `loadArrayStk`/`loadStk`。
     pub(crate) fn err_harness_frame_words(
         &mut self,
         msg: &str,
         text: &str,
         line: usize,
         words: Option<&[Value]>,
+        hint: Option<&'static str>,
     ) {
         match (&mut self.err_info, self.err_fresh) {
             (Some(_), true) => {
@@ -325,18 +332,21 @@ impl Interp {
                 // <命令文本>；CALL/UP 条目随本次日志事件追加。
                 self.err_calls.clear();
                 self.err_call_body = false;
-                self.err_inner = Some(self.err_pending_inner.take().unwrap_or_else(|| {
-                    match words {
-                        Some(w) if !w.is_empty() => {
-                            // tclsh：≤255 词用 invokeStk1（1 字节操作数），
-                            // 更多用 invokeStk（4 字节）。
-                            let tag =
-                                if w.len() <= 255 { "invokeStk1" } else { "invokeStk" };
-                            format!("{} {}", tag, Value::from_list(w).as_str())
-                        }
-                        _ => format!("invokeStk1 {}", tcl_log_excerpt(text)),
-                    }
-                }));
+                self.err_inner = Some(
+                    self.err_pending_inner
+                        .take()
+                        .or_else(|| hint.map(|h| h.to_string()))
+                        .unwrap_or_else(|| match words {
+                            Some(w) if !w.is_empty() => {
+                                // tclsh：≤255 词用 invokeStk1（1 字节操作数），
+                                // 更多用 invokeStk（4 字节）。
+                                let tag =
+                                    if w.len() <= 255 { "invokeStk1" } else { "invokeStk" };
+                                format!("{} {}", tag, Value::from_list(w).as_str())
+                            }
+                            _ => format!("invokeStk1 {}", tcl_log_excerpt(text)),
+                        }),
+                );
                 self.err_log_call();
             }
         }
@@ -536,10 +546,14 @@ impl Interp {
                             self.err_line = cmd.line + self.line_offset;
                         } else {
                             let msg = e.message_text();
-                            self.err_harness_frame(
+                            let local_slots = self.lexical_body || self.in_locals_unit;
+                            let hint = word_var_read_hint(word, &msg, local_slots);
+                            self.err_harness_frame_words(
                                 &msg,
                                 cmd.text.slice(&unit.source),
                                 cmd.line + self.line_offset,
+                                None,
+                                hint,
                             );
                         }
                     }
@@ -602,11 +616,14 @@ impl Interp {
         if let Err(e) = &r {
             if self.err_is_error(e) {
                 let msg = e.message_text();
+                let cmd_name = args.first().map(|v| v.as_str()).unwrap_or("");
+                let hint = command_inner_hint(&cmd.words, cmd_name);
                 self.err_harness_frame_words(
                     &msg,
                     cmd.text.slice(&unit.source),
                     cmd.line + self.line_offset,
                     Some(&args),
+                    hint,
                 );
             } else if e.is_break()
                 || e.is_continue()
@@ -1324,4 +1341,90 @@ fn resolve_proc_key(interp: &Interp, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+// ── D-3 残差：INNER 的 bytecode 操作码形 ──────────────────────────────
+
+/// tclsh 8.6 的 ensemble 命令集：这些命令的**派发期**错误（arity/未知
+/// 子命令）在编译单元里由 ensemble 编译器记 `invokeReplace`。
+pub(crate) fn is_ensemble_name(name: &str) -> bool {
+    let bare = name.strip_prefix("::").unwrap_or(name);
+    matches!(
+        bare,
+        "namespace" | "string" | "info" | "dict" | "array" | "file" | "binary" | "chan"
+            | "encoding"
+    )
+}
+
+/// AST 词是否编译期已知字面（tclsh TclWordKnownAtCompileTime 近似）。
+fn ast_word_literal(w: &rtcl_parser::Word) -> bool {
+    match w {
+        rtcl_parser::Word::Literal(_) => true,
+        rtcl_parser::Word::Concat(parts) => parts.iter().all(ast_word_literal),
+        _ => false,
+    }
+}
+
+/// 命令调用面的 INNER 形：动态 `{*}` 展开优先（invokeExpanded），
+/// 其次"字面命令词 + ensemble"（invokeReplace）；否则 None（invokeStk1）。
+fn command_inner_hint(
+    words_ast: &[rtcl_parser::Word],
+    cmd_name: &str,
+) -> Option<&'static str> {
+    let dynamic_expand = words_ast
+        .iter()
+        .any(|w| matches!(w, rtcl_parser::Word::Expand(inner) if !ast_word_literal(inner)));
+    if dynamic_expand {
+        return Some("invokeExpanded");
+    }
+    let literal_cmd = words_ast.first().map(ast_word_literal).unwrap_or(false);
+    if literal_cmd && is_ensemble_name(cmd_name) {
+        return Some("invokeReplace");
+    }
+    None
+}
+
+/// 变量读取失败的操作码名（消息形 `can't read "NAME": ...`）：
+/// * 数组引用整体失败 → loadArray1/loadArrayStk（按本地槽位）；
+/// * 下标变量读取失败（消息名是下标里的简单名）→ loadScalar1/loadStk；
+/// * 普通标量 → loadScalar1/loadStk。
+fn word_var_read_hint(
+    word: &rtcl_parser::Word,
+    msg: &str,
+    local_slots: bool,
+) -> Option<&'static str> {
+    let quoted = msg.strip_prefix("can't read \"")?.split('"').next()?;
+    fn walk(
+        w: &rtcl_parser::Word,
+        quoted: &str,
+        local_slots: bool,
+    ) -> Option<Option<&'static str>> {
+        match w {
+            rtcl_parser::Word::VarRef(n) => {
+                let array_ref = n.contains('(') && n.ends_with(')');
+                if array_ref {
+                    if n == quoted {
+                        return Some(Some(if local_slots { "loadArray1" } else { "loadArrayStk" }));
+                    }
+                    // 下标内的变量读取失败。
+                    return Some(Some(if local_slots { "loadScalar1" } else { "loadStk" }));
+                }
+                if n == quoted {
+                    return Some(Some(if local_slots { "loadScalar1" } else { "loadStk" }));
+                }
+                Some(None)
+            }
+            rtcl_parser::Word::Concat(parts) => {
+                for p in parts {
+                    if let Some(h) = walk(p, quoted, local_slots)? {
+                        return Some(Some(h));
+                    }
+                }
+                Some(None)
+            }
+            rtcl_parser::Word::Expand(inner) => walk(inner, quoted, local_slots),
+            _ => Some(None),
+        }
+    }
+    walk(word, quoted, local_slots).flatten()
 }

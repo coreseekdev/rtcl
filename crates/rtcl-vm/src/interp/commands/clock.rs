@@ -283,11 +283,15 @@ fn clock_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         };
     }
 
-    // 纯整数：按 epoch 秒直通（tclsh 同）。
-    if let Some(n) = args[2].as_int() {
-        return Ok(Value::from_int(n));
-    }
-    with_zone(zone.as_deref(), || scan_iso(&input, use_gmt))
+    // 自由格式（tclsh ClockFreeScan 常用子集）：裸数字按 HHMM 时刻，
+    // 不按 epoch 秒（tclsh `clock scan 123` = 今日 01:23）。
+    let base_epoch = base.unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    });
+    with_zone(zone.as_deref(), || scan_free(&input, base_epoch, use_gmt))
 }
 
 /// 按 `-format` 解析（strptime 面的 Tcl 语义，2026-11-06 实测）：
@@ -582,56 +586,709 @@ fn match_month_name(w: &str) -> Option<i64> {
     None
 }
 
-/// ISO 形（YYYY-MM-DD[ T]HH:MM:SS）——本地时区（-gmt 时 UTC），两遍法
-/// 解偏移（先猜 UTC 求该时刻的本地偏移，再回推）。调用方已设好 zone。
-fn scan_iso(input: &str, use_gmt: bool) -> Result<Value> {
-    let parse_iso = |s: &str| -> Option<(i64, i64, i64, i64, i64, i64)> {
-        let b: Vec<char> = s.chars().collect();
-        if b.len() < 10 {
-            return None;
+/// 自由格式 `clock scan`（tclsh ClockFreeScan 的常用子集，2026-11-06
+/// 实测钉形）：
+/// * 空串/`now`/`today` → base 原值；`tomorrow`/`yesterday` → ±1 天 00:00；
+/// * 绝对日期：ISO（YYYY-MM-DD[ T]HH:MM[:SS][Z|±HHMM]）、YYYYMMDD、
+///   M/D[/Y[Y]]、Mon D[, YYYY] / D Mon [YYYY] / D-Mon-YYYY；
+/// * 时刻：H:MM[:SS][am|pm] / 3pm / 3 pm / 裸数字（≤4 位按 HHMM）；
+/// * 星期名（唯一前缀，可带 next/last；单独出现取 base 之后/之前）；
+/// * 相对短语：`<n> <unit>[s] [ago]`、`next|last <unit>`；单位
+///   second/minute/hour/day/week/fortnight/month/year（sec/secs 亦收）；
+/// * 数字时区 ±HHMM 与 UTC/GMT；`Z` 单独出现视为 UTC。
+/// 组合规则：缺席日期取 base；有日期或**非零日级相对量**时时刻归零
+/// （显式时刻优先）；相对量按序施加（月/年夹到月末）；weekday 单独
+/// 出现时 weekday 的 Plain 语义 = base 当天或之后（含当天），next =
+/// 下一周同名日，last = 严格之前最近一天。
+fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
+    let chars: Vec<char> = input.chars().collect();
+    // 空白分词（记字符区间）。
+    let mut toks: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i].is_whitespace() {
+            i += 1;
+            continue;
         }
-        let num = |a: usize, n: usize| -> Option<i64> { s.get(a..a + n)?.parse::<i64>().ok() };
-        if b[4] != '-' || b[7] != '-' {
-            return None;
+        let st = i;
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
         }
-        let y = num(0, 4)?;
-        let mo = num(5, 2)?;
-        let d = num(8, 2)?;
-        let (h, mi, se) = if b.len() >= 19
-            && (b[10] == ' ' || b[10] == 'T')
-            && b[13] == ':'
-            && b[16] == ':'
-        {
-            (num(11, 2)?, num(14, 2)?, num(17, 2)?)
-        } else if b.len() == 10 {
-            (0, 0, 0)
-        } else {
-            return None;
-        };
-        Some((y, mo, d, h, mi, se))
-    };
-    if let Some((y, mo, d, h, mi, se)) = parse_iso(input) {
-        let utc_guess = epoch_from_jdn(jdn_from_civil(y, mo, d), h, mi, se);
-        let epoch = if use_gmt {
-            utc_guess
-        } else {
-            match local_offset_name(utc_guess) {
-                Some((off, _)) => utc_guess - off as i64,
-                None => utc_guess,
-            }
-        };
-        return Ok(Value::from_int(epoch));
+        toks.push((st, i));
+    }
+    let joined = |t: (usize, usize)| -> String { chars[t.0..t.1].iter().collect() };
+    if toks.is_empty() {
+        return Ok(Value::from_int(base));
     }
 
-    // tclsh 尾巴："syntax error (characters 0-7)"（0..len-1 的消费跨度）。
-    let last = input.chars().count().saturating_sub(1);
-    Err(Error::runtime(
-        format!(
-            "unable to convert date-time string \"{}\": syntax error (characters 0-{})",
-            input, last
-        ),
-        crate::error::ErrorCode::InvalidOp,
-    ))
+    fn digits_of(cs: &[char]) -> Option<i64> {
+        if cs.is_empty() || !cs.iter().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        cs.iter().collect::<String>().parse::<i64>().ok()
+    }
+    fn take_num(cs: &[char], p: &mut usize, min: usize, max: usize) -> Option<i64> {
+        let st = *p;
+        while *p < cs.len() && *p - st < max && cs[*p].is_ascii_digit() {
+            *p += 1;
+        }
+        if *p - st < min {
+            return None;
+        }
+        digits_of(&cs[st..*p])
+    }
+    /// ISO token 解析：Ok(None) = 不是 ISO 形；Ok(Some(..)) 成功；
+    /// Err(pos) = 前缀像 ISO 但尾部有无法消费的字符（字符位相对 token）。
+    fn parse_iso_tok(t: &[char]) -> std::result::Result<
+        Option<(i64, i64, i64, i64, i64, i64, Option<i64>)>,
+        usize,
+    > {
+        let mut p = 0usize;
+        let Some(y) = take_num(t, &mut p, 4, 4) else {
+            return Ok(None);
+        };
+        if t.get(p) != Some(&'-') {
+            return Ok(None);
+        }
+        p += 1;
+        let Some(mo) = take_num(t, &mut p, 1, 2) else {
+            return Ok(None);
+        };
+        if t.get(p) != Some(&'-') {
+            return Ok(None);
+        }
+        p += 1;
+        let Some(d) = take_num(t, &mut p, 1, 2) else {
+            return Ok(None);
+        };
+        let (mut h, mut mi, mut se, mut zone) = (0i64, 0i64, 0i64, None);
+        if p < t.len() {
+            let sep = t[p];
+            if sep == 'T' || sep == 't' || sep == ' ' {
+                p += 1;
+                let Some(hh) = take_num(t, &mut p, 1, 2) else {
+                    return Err(p);
+                };
+                if t.get(p) != Some(&':') {
+                    return Err(p);
+                }
+                p += 1;
+                let Some(mm) = take_num(t, &mut p, 1, 2) else {
+                    return Err(p);
+                };
+                h = hh;
+                mi = mm;
+                if t.get(p) == Some(&':') {
+                    p += 1;
+                    let Some(ss) = take_num(t, &mut p, 1, 2) else {
+                        return Err(p);
+                    };
+                    se = ss;
+                }
+                if p < t.len() {
+                    match t[p] {
+                        'Z' | 'z' => {
+                            zone = Some(0);
+                            p += 1;
+                        }
+                        '+' | '-' => {
+                            let sign = if t[p] == '+' { 1i64 } else { -1 };
+                            p += 1;
+                            let Some(zh) = take_num(t, &mut p, 2, 2) else {
+                                return Err(p);
+                            };
+                            let Some(zm) = take_num(t, &mut p, 2, 2) else {
+                                return Err(p);
+                            };
+                            zone = Some(sign * (zh * 3600 + zm * 60));
+                        }
+                        _ => return Err(p),
+                    }
+                }
+            } else {
+                return Err(p);
+            }
+        }
+        if p != t.len() {
+            return Err(p);
+        }
+        Ok(Some((y, mo, d, h, mi, se, zone)))
+    }
+    /// 时刻 token：H:MM[:SS] 可带紧贴的 am/pm。Err(pos) 为尾部垃圾位。
+    fn parse_time_tok(t: &[char]) -> std::result::Result<Option<(i64, i64, i64)>, usize> {
+        let mut p = 0usize;
+        let Some(h) = take_num(t, &mut p, 1, 2) else {
+            return Ok(None);
+        };
+        if t.get(p) != Some(&':') {
+            // 无冒号：只有紧贴 am/pm 才是时刻（"3pm"）。
+            if p < t.len() {
+                let rest: String = t[p..].iter().collect::<String>().to_ascii_lowercase();
+                if rest == "am" || rest == "pm" {
+                    return Ok(Some((meridian(h, rest == "pm"), 0, 0)));
+                }
+            }
+            return Ok(None);
+        }
+        p += 1;
+        let Some(mi) = take_num(t, &mut p, 1, 2) else {
+            return Err(p);
+        };
+        let mut se = 0i64;
+        if t.get(p) == Some(&':') {
+            p += 1;
+            let Some(x) = take_num(t, &mut p, 1, 2) else {
+                return Err(p);
+            };
+            se = x;
+        }
+        let mut h = h;
+        if p < t.len() {
+            let rest: String = t[p..].iter().collect::<String>().to_ascii_lowercase();
+            if let Some(tail) = rest.strip_prefix("am") {
+                if !tail.is_empty() {
+                    return Err(p);
+                }
+                h = meridian(h, false);
+                p = t.len();
+            } else if let Some(tail) = rest.strip_prefix("pm") {
+                if !tail.is_empty() {
+                    return Err(p);
+                }
+                h = meridian(h, true);
+                p = t.len();
+            } else {
+                return Err(p);
+            }
+        }
+        Ok(Some((h, mi, se)))
+    }
+    fn meridian(h: i64, pm: bool) -> i64 {
+        if pm {
+            if h < 12 {
+                h + 12
+            } else {
+                h
+            }
+        } else if h == 12 {
+            0
+        } else {
+            h
+        }
+    }
+
+    // ── 状态 ──
+    let mut adate: Option<(Option<i64>, i64, i64)> = None; // (year?, month, day)
+    let mut tset: Option<(i64, i64, i64)> = None;
+    let mut zone: Option<i64> = None;
+    let mut weekday: Option<(usize, WdMode)> = None;
+    let mut rel: Vec<(i64, FreeUnit)> = Vec::new();
+    let mut ago_watermark: usize = 0;
+    let syntax_err = |input: &str, a: usize, b: usize| -> Error {
+        Error::runtime(
+            format!(
+                "unable to convert date-time string {:?}: syntax error (characters {}-{})",
+                input, a, b
+            ),
+            crate::error::ErrorCode::InvalidOp,
+        )
+    };
+    let span_of = |ti: usize| -> (usize, usize) {
+        let (st, en) = toks[ti];
+        if st > 0 {
+            (st - 1, en - 1)
+        } else {
+            (0, en - 1)
+        }
+    };
+    let more_than_one_time = || {
+        Error::Msg(format!(
+            "unable to convert date-time string {:?}: more than one time of day in string",
+            input
+        ))
+    };
+
+    let mut ti = 0usize;
+    while ti < toks.len() {
+        let raw = joined(toks[ti]);
+        let lower = raw.to_ascii_lowercase();
+        let core = lower.trim_end_matches(',').to_string();
+        let had_comma = core.len() != lower.len();
+
+        // 1) ISO 日期
+        let tok_chars: Vec<char> = raw.chars().collect();
+        match parse_iso_tok(&tok_chars) {
+            Ok(Some((y, mo, d, h, mi, se, z))) => {
+                adate = Some((Some(y), mo, d));
+                if h != 0 || mi != 0 || se != 0 || raw.len() > 10 {
+                    if tset.is_some() {
+                        return Err(more_than_one_time());
+                    }
+                    tset = Some((h, mi, se));
+                }
+                if let Some(zz) = z {
+                    zone = Some(zz);
+                }
+                ti += 1;
+                continue;
+            }
+            Err(pos) => {
+                let g = toks[ti].0 + pos;
+                return Err(syntax_err(input, g, g));
+            }
+            Ok(None) => {}
+        }
+        // 2) 8 位数字日期 YYYYMMDD
+        if core.len() == 8 && core.chars().all(|c| c.is_ascii_digit()) {
+            let y: i64 = core[0..4].parse().unwrap();
+            let mo: i64 = core[4..6].parse().unwrap();
+            let d: i64 = core[6..8].parse().unwrap();
+            adate = Some((Some(y), mo, d));
+            ti += 1;
+            continue;
+        }
+        // 3) 斜杠日期 M/D[/Y[Y]]
+        if core.contains('/') {
+            let parts: Vec<&str> = core.split('/').collect();
+            if parts.len() == 2
+                && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            {
+                let mo: i64 = parts[0].parse().unwrap();
+                let d: i64 = parts[1].parse().unwrap();
+                adate = Some((None, mo, d));
+                ti += 1;
+                continue;
+            }
+            if parts.len() == 3
+                && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            {
+                let mo: i64 = parts[0].parse().unwrap();
+                let d: i64 = parts[1].parse().unwrap();
+                let ys = parts[2];
+                let y = if ys.len() <= 2 {
+                    map_two_digit_year(ys.parse().unwrap())
+                } else {
+                    ys.parse().unwrap()
+                };
+                adate = Some((Some(y), mo, d));
+                ti += 1;
+                continue;
+            }
+        }
+        // 4) D-Mon-YYYY 形（token 内含 '-' 与月份名）
+        if core.contains('-') {
+            let parts: Vec<&str> = core.split('-').collect();
+            if parts.len() == 3
+                && parts[0].chars().all(|c| c.is_ascii_digit())
+                && !parts[0].is_empty()
+            {
+                if let Some(mo) = free_month(parts[1]) {
+                    let d: i64 = parts[0].parse().unwrap();
+                    let y: i64 = if parts[2].chars().all(|c| c.is_ascii_digit()) {
+                        let p2: i64 = parts[2].parse().unwrap();
+                        if parts[2].len() <= 2 {
+                            map_two_digit_year(p2)
+                        } else {
+                            p2
+                        }
+                    } else {
+                        return Err(syntax_err(input, toks[ti].0, toks[ti].1 - 1));
+                    };
+                    adate = Some((Some(y), mo, d));
+                    ti += 1;
+                    continue;
+                }
+            }
+        }
+        // 5) 月名优先（Mon D[, YYYY]）
+        if let Some(mo) = free_month(&core) {
+            let Some(nt) = toks.get(ti + 1).copied() else {
+                let e = toks[ti].1;
+                return Err(syntax_err(input, e, e));
+            };
+            let nraw = joined(nt);
+            let ncore = nraw.trim_end_matches(',').to_string();
+            let ncomma = ncore.len() != nraw.len();
+            let Some(d) = digits_of(&ncore.chars().collect::<Vec<char>>()) else {
+                return Err(syntax_err(input, toks[ti].0, toks[ti].1 - 1));
+            };
+            let mut adv = 2usize;
+            let mut year: Option<i64> = None;
+            if ncomma {
+                if let Some(yt) = toks.get(ti + 2).copied() {
+                    let ys = joined(yt);
+                    if ys.chars().all(|c| c.is_ascii_digit()) && !ys.is_empty() {
+                        let p2: i64 = ys.parse().unwrap();
+                        year = Some(if ys.len() <= 2 { map_two_digit_year(p2) } else { p2 });
+                        adv = 3;
+                    }
+                }
+            } else if let Some(yt) = toks.get(ti + 2).copied() {
+                let ys = joined(yt);
+                // tclsh 怪形：无逗号的 4 位数字——尚未出现时刻时记作
+                // HHMM 时刻（"Jan 2 2000" = Jan 2 20:00），已有时刻则
+                // 当成年份（"3:04 PM Jan 2 2000"）。
+                if ys.len() == 4 && ys.chars().all(|c| c.is_ascii_digit()) {
+                    let v: i64 = ys.parse().unwrap();
+                    if tset.is_some() {
+                        year = Some(v);
+                    } else {
+                        tset = Some((v / 100, v % 100, 0));
+                    }
+                    adv = 3;
+                }
+            }
+            adate = Some((year, mo, d));
+            ti += adv;
+            continue;
+        }
+        // 6) 日优先：D Mon [YYYY]
+        if let Some(d) = digits_of(&core.chars().collect::<Vec<char>>()) {
+            if let Some(nt) = toks.get(ti + 1).copied() {
+                let nlow = joined(nt).to_ascii_lowercase();
+                if let Some(mo) = free_month(&nlow) {
+                    let mut adv = 2usize;
+                    let mut year: Option<i64> = None;
+                    if let Some(yt) = toks.get(ti + 2).copied() {
+                        let ys = joined(yt);
+                        if ys.chars().all(|c| c.is_ascii_digit()) && !ys.is_empty() {
+                            let p2: i64 = ys.parse().unwrap();
+                            year =
+                                Some(if ys.len() <= 2 { map_two_digit_year(p2) } else { p2 });
+                            adv = 3;
+                        }
+                    }
+                    adate = Some((year, mo, d));
+                    ti += adv;
+                    continue;
+                }
+            }
+        }
+        // 7) next / last
+        if core == "next" || core == "last" {
+            let mode = if core == "next" { WdMode::Next } else { WdMode::Last };
+            let Some(nt) = toks.get(ti + 1).copied() else {
+                return Err(syntax_err(input, toks[ti].0, toks[ti].1 - 1));
+            };
+            let nlow = joined(nt).to_ascii_lowercase();
+            if let Some(dow) = free_weekday(&nlow) {
+                weekday = Some((dow, mode));
+                ti += 2;
+                continue;
+            }
+            if let Some(u) = free_unit(&nlow) {
+                let n = if core == "next" { 1 } else { -1 };
+                rel.push((n, u));
+                ti += 2;
+                continue;
+            }
+            return Err(syntax_err(input, toks[ti].0, toks[ti].1 - 1));
+        }
+        // 8) 星期名
+        if let Some(dow) = free_weekday(&core) {
+            weekday = Some((dow, WdMode::Plain));
+            ti += 1;
+            continue;
+        }
+        // 9) now / today / tomorrow / yesterday
+        match core.as_str() {
+            "now" | "today" => {
+                ti += 1;
+                continue;
+            }
+            "tomorrow" => {
+                rel.push((1, FreeUnit::Day));
+                ti += 1;
+                continue;
+            }
+            "yesterday" => {
+                rel.push((-1, FreeUnit::Day));
+                ti += 1;
+                continue;
+            }
+            _ => {}
+        }
+        // 10) 时区 token
+        if core == "utc" || core == "gmt" {
+            zone = Some(0);
+            ti += 1;
+            continue;
+        }
+        if core == "z" {
+            if adate.is_none() && tset.is_none() && zone.is_none() {
+                zone = Some(0);
+                ti += 1;
+                continue;
+            }
+            let (a, b) = span_of(ti);
+            return Err(syntax_err(input, a, b));
+        }
+        {
+            let cs: Vec<char> = core.chars().collect();
+            if cs.len() == 5
+                && (cs[0] == '+' || cs[0] == '-')
+                && cs[1..].iter().all(|c| c.is_ascii_digit())
+            {
+                let sign = if cs[0] == '+' { 1i64 } else { -1 };
+                let zh = (cs[1] as i64 - '0' as i64) * 10 + (cs[2] as i64 - '0' as i64);
+                let zm = (cs[3] as i64 - '0' as i64) * 10 + (cs[4] as i64 - '0' as i64);
+                zone = Some(sign * (zh * 3600 + zm * 60));
+                ti += 1;
+                continue;
+            }
+        }
+        // 11) 时刻 token（其后可跟独立的 am/pm）
+        match parse_time_tok(&tok_chars) {
+            Ok(Some((mut h, mi, se))) => {
+                let mut adv = 1usize;
+                if let Some(nt) = toks.get(ti + 1).copied() {
+                    let nlow = joined(nt).to_ascii_lowercase();
+                    if nlow == "am" || nlow == "pm" {
+                        h = meridian(h, nlow == "pm");
+                        adv = 2;
+                    }
+                }
+                if tset.is_some() {
+                    return Err(more_than_one_time());
+                }
+                tset = Some((h, mi, se));
+                ti += adv;
+                continue;
+            }
+            Err(pos) => {
+                let g = toks[ti].0 + pos;
+                return Err(syntax_err(input, g, g));
+            }
+            Ok(None) => {}
+        }
+        // 12) 数字 + 单位（相对） / 数字 + am|pm / 裸数字（HHMM）
+        let signed: Option<i64> = {
+            let mut cs: &[char] = &tok_chars;
+            let mut neg = false;
+            if cs.first() == Some(&'-') {
+                neg = true;
+                cs = &cs[1..];
+            }
+            digits_of(cs).map(|v| if neg { -v } else { v })
+        };
+        if let Some(n) = signed {
+            // 数字 + am/pm（"3 pm"）
+            if let Some(nt) = toks.get(ti + 1).copied() {
+                let nlow = joined(nt).to_ascii_lowercase();
+                if nlow == "am" || nlow == "pm" {
+                    if tset.is_some() {
+                        return Err(more_than_one_time());
+                    }
+                    tset = Some((meridian(n, nlow == "pm"), 0, 0));
+                    ti += 2;
+                    continue;
+                }
+                if let Some(u) = free_unit(&nlow) {
+                    let mut adv = 2usize;
+                    rel.push((n, u));
+                    // "ago" 否定**此前**（尚未被否定过的）全部相对项：
+                    // "2 days 3 hours ago" = -(2d+3h)，"2 days ago 3 hours"
+                    // 只否定 2 days（tclsh 实测）。
+                    if let Some(agt) = toks.get(ti + 2).copied() {
+                        if joined(agt).to_ascii_lowercase() == "ago" {
+                            for t in &mut rel[ago_watermark..] {
+                                t.0 = -t.0;
+                            }
+                            ago_watermark = rel.len();
+                            adv = 3;
+                        }
+                    }
+                    ti += adv;
+                    continue;
+                }
+            }
+            // 裸数字：≤4 位按 HHMM 时刻（"2000" → 20:00）。
+            if !had_comma && n >= 0 && core.len() <= 4 {
+                if tset.is_some() {
+                    return Err(more_than_one_time());
+                }
+                tset = Some((n / 100, n % 100, 0));
+                ti += 1;
+                continue;
+            }
+        }
+        // 无法识别（若 token 以数字开头，错误位从首个非数字字符起，
+        // tclsh 的 "1st day" → characters 1-2）。
+        let (a, b) = span_of(ti);
+        let mut a = a;
+        let tb = &tok_chars;
+        let mut q = 0usize;
+        while q < tb.len() && tb[q].is_ascii_digit() {
+            q += 1;
+        }
+        if q > 0 && q < tb.len() {
+            a = toks[ti].0 + q;
+        }
+        let _ = had_comma;
+        return Err(syntax_err(input, a, b));
+    }
+
+    // ── 组合 ──
+    let Some((by, bmo, bd, bh, bmi, bs)) = clock_civil(base, use_gmt) else {
+        return Ok(Value::from_int(base));
+    };
+    let mut y = by;
+    let mut mo = bmo;
+    let mut d = bd;
+    let mut h = bh;
+    let mut mi = bmi;
+    let mut s = bs;
+
+    let (base_jdn, base_wd) = {
+        let jdn = jdn_from_civil(by, bmo, bd);
+        (jdn, ((jdn + 1).rem_euclid(7)) as usize)
+    };
+    if let Some((ay, amo, ad)) = adate {
+        y = ay.unwrap_or(by);
+        mo = amo;
+        d = ad;
+    } else if let Some((dow, mode)) = weekday {
+        let delta: i64 = match mode {
+            WdMode::Plain => ((dow + 7 - base_wd) % 7) as i64,
+            WdMode::Next => (((dow + 7 - base_wd) % 7) + 7) as i64,
+            WdMode::Last => {
+                let mut delta = (base_wd + 7 - dow) % 7;
+                if delta == 0 {
+                    delta = 7;
+                }
+                -(delta as i64)
+            }
+        };
+        let (ny, nm, nd) = civil_from_jdn(base_jdn + delta);
+        y = ny;
+        mo = nm;
+        d = nd;
+    }
+
+    let day_scale_nonzero = rel.iter().any(|(n, u)| {
+        *n != 0
+            && !matches!(u, FreeUnit::Sec | FreeUnit::Min | FreeUnit::Hour)
+    });
+    if adate.is_some() || weekday.is_some() || day_scale_nonzero {
+        h = 0;
+        mi = 0;
+        s = 0;
+    }
+    if let Some((th, tm, tsx)) = tset {
+        h = th;
+        mi = tm;
+        s = tsx;
+    }
+
+    // 相对量：日历级（日/周/双周/月/年）改字段，时间级（时/分/秒）改秒数。
+    let mut small_secs = 0i64;
+    for (n, u) in &rel {
+        match u {
+            FreeUnit::Sec => small_secs = small_secs.saturating_add(*n),
+            FreeUnit::Min => small_secs = small_secs.saturating_add(n.saturating_mul(60)),
+            FreeUnit::Hour => small_secs = small_secs.saturating_add(n.saturating_mul(3600)),
+            FreeUnit::Day | FreeUnit::Week | FreeUnit::Fortnight => {
+                let days = match u {
+                    FreeUnit::Day => *n,
+                    FreeUnit::Week => n.saturating_mul(7),
+                    _ => n.saturating_mul(14),
+                };
+                let (ny, nm, nd) = civil_from_jdn(jdn_from_civil(y, mo, d) + days);
+                y = ny;
+                mo = nm;
+                d = nd;
+            }
+            FreeUnit::Month | FreeUnit::Year => {
+                let months = if matches!(u, FreeUnit::Year) {
+                    n.saturating_mul(12)
+                } else {
+                    *n
+                };
+                let total = y.saturating_mul(12).saturating_add(mo - 1).saturating_add(months);
+                let ny = total.div_euclid(12);
+                let nm = total.rem_euclid(12) + 1;
+                let dim = if nm == 2 {
+                    if jdn_from_civil(ny, nm, 1) < GREGORIAN_CHANGE_JDN {
+                        days_in_month_julian(ny, 2)
+                    } else {
+                        days_in_month(ny, 2)
+                    }
+                } else {
+                    days_in_month(ny, nm)
+                };
+                let nd = d.min(dim);
+                y = ny;
+                mo = nm;
+                d = nd;
+            }
+        }
+    }
+
+    let epoch = if let Some(off) = zone {
+        epoch_from_jdn(jdn_from_civil(y, mo, d), h, mi, s) - off
+    } else {
+        clock_epoch(y, mo, d, h, mi, s, use_gmt)
+    };
+    Ok(Value::from_int(epoch.saturating_add(small_secs)))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FreeUnit {
+    Sec,
+    Min,
+    Hour,
+    Day,
+    Week,
+    Fortnight,
+    Month,
+    Year,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum WdMode {
+    Plain,
+    Next,
+    Last,
+}
+
+fn free_unit(w: &str) -> Option<FreeUnit> {
+    match w {
+        "second" | "seconds" | "sec" | "secs" => Some(FreeUnit::Sec),
+        "minute" | "minutes" => Some(FreeUnit::Min),
+        "hour" | "hours" => Some(FreeUnit::Hour),
+        "day" | "days" => Some(FreeUnit::Day),
+        "week" | "weeks" => Some(FreeUnit::Week),
+        "fortnight" | "fortnights" => Some(FreeUnit::Fortnight),
+        "month" | "months" => Some(FreeUnit::Month),
+        "year" | "years" => Some(FreeUnit::Year),
+        _ => None,
+    }
+}
+
+fn free_weekday(w: &str) -> Option<usize> {
+    let mut hit: Option<usize> = None;
+    for (i, name) in WEEKDAY_NAMES.iter().enumerate() {
+        if name.starts_with(w) {
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(i);
+        }
+    }
+    hit
+}
+
+fn free_month(w: &str) -> Option<i64> {
+    // tclsh 只收全称、三字母缩写与 "sept"（"Ja"/"Janu" 均拒，实测）。
+    const ABBREV: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    for (i, (name, ab)) in MONTH_NAMES.iter().zip(ABBREV.iter()).enumerate() {
+        if w == *name || w == *ab || (i == 8 && w == "sept") {
+            return Some(i as i64 + 1);
+        }
+    }
+    None
 }
 
 // ── clock add ──────────────────────────────────────────────────────────

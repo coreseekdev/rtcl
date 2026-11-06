@@ -12,6 +12,8 @@ pub enum Trans {
     Eps(usize),
     Char(CharSet, usize),
     Assert(AssertKind, usize),
+    /// 前向断言（子 Prog 从当前位置起做 anchored 匹配）。
+    Lacon { negative: bool, prog: usize, to: usize },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -39,10 +41,16 @@ pub struct Prog {
     pub tree: Node,
     /// 捕获组数（最大 subno）。
     pub nsubs: usize,
+    /// lookahead 子程序（Lacon 弧按索引引用）。
+    pub lacons: Vec<Box<Prog>>,
+    /// 含反向引用（需要回溯执行；NFA/DFA 不支持）。
+    pub has_backref: bool,
 }
 
 struct Builder {
     states: Vec<State>,
+    lacons: Vec<Box<Prog>>,
+    icase: bool,
 }
 
 impl Builder {
@@ -96,10 +104,21 @@ impl Builder {
             NodeKind::Repeat { node, min, max } => {
                 self.compile_repeat(node, *min, *max, next)
             }
-            NodeKind::Backref { .. } | NodeKind::Look { .. } => Err(Error::new(
-                "RTCL_SPENCER_UNSUPPORTED",
-                "backref/lookahead not implemented yet",
-            )),
+            NodeKind::Look { negative, node } => {
+                let sub = compile(node, self.icase)?;
+                let idx = self.lacons.len();
+                self.lacons.push(Box::new(sub));
+                let st = self.new_state();
+                self.states[st].trans.push(Trans::Lacon {
+                    negative: *negative,
+                    prog: idx,
+                    to: next,
+                });
+                Ok(st)
+            }
+            // 回引是非正则构造：NFA 只建 epsilon 占位；实际执行由
+            // Searcher 检测 has_backref 后路由 backtrack.rs。
+            NodeKind::Backref { .. } => Ok(next),
         }
     }
 
@@ -143,6 +162,8 @@ impl Builder {
 pub fn compile(node: &Node, icase: bool) -> Result<Prog, Error> {
     let mut b = Builder {
         states: Vec::new(),
+        lacons: Vec::new(),
+        icase,
     };
     let accept = b.new_state();
     let start = b.compile(node, accept)?;
@@ -162,6 +183,8 @@ pub fn compile(node: &Node, icase: bool) -> Result<Prog, Error> {
         pure_literal,
         tree: node.clone(),
         nsubs: max_subno(node),
+        lacons: b.lacons,
+        has_backref: has_backref(node),
     })
 }
 
@@ -208,8 +231,8 @@ fn first_sets(states: &[State], start: usize, accept: usize) -> Option<Vec<CharS
         for t in &states[s].trans {
             match t {
                 Trans::Eps(to) => stack.push(*to),
-                // 断言依赖位置，首字符集不可静态判定。
-                Trans::Assert(_, _) => return None,
+                // 断言/前向断言依赖位置，首字符集不可静态判定。
+                Trans::Assert(_, _) | Trans::Lacon { .. } => return None,
                 Trans::Char(set, _) => {
                     if !sets.iter().any(|x| x == set) {
                         sets.push(set.clone());
@@ -276,5 +299,17 @@ fn max_subno(n: &Node) -> usize {
         NodeKind::Repeat { node, .. } => max_subno(node),
         NodeKind::Look { node, .. } => max_subno(node),
         _ => 0,
+    }
+}
+
+fn has_backref(n: &Node) -> bool {
+    match &n.kind {
+        NodeKind::Backref { .. } => true,
+        NodeKind::Concat(v) | NodeKind::Alt(v) => v.iter().any(has_backref),
+        NodeKind::Repeat { node, .. }
+        | NodeKind::Capture { node, .. }
+        | NodeKind::NoRecord(node)
+        | NodeKind::Look { node, .. } => has_backref(node),
+        _ => false,
     }
 }

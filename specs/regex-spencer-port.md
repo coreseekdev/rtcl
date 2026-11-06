@@ -157,8 +157,14 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   空迭代；回引按已捕获文本比较。`specs/regex/spencer-captures.py`
   对随机 4000 例 `-indices -inline` **差异=0**（默认选项，不含
   lookahead；lookahead 执行、BRE/ERE 属 M4）。
-- **M4 待做**：lookahead/LACON 执行、BRE/ERE/expanded 全量；
-  M5：默认路由与 go/no-go（`-inline/-indices/-all` 接线随 M4/M5）。
+- **M4 核心完成**：lookahead 编译为 Lacon 子 Prog（NFA 闭包执行、
+  DFA 自动禁用；捕获按非捕获处理）；反向引用走 `backtrack.rs`
+  回溯执行（枚举 AST 终点 + 捕获快照 + 预算上限，空捕获回引按
+  Spencer "matched trivially" 处理）。随机 4000 例与定向 759 例
+  （含 lookahead/回引/\y/断言）捕获均 **0 差异**。
+- **M4 剩余**：BRE/ERE（`(?b)`/`(?e)`/`***:` 的方言语法；当前按
+  ARE 解析）、`-about` 等命令面；M5：`regexp/regsub` 路由接线、
+  `-inline/-indices/-all/-start` 全量、默认化与 go/no-go。
 - 验证命令：
   `cargo test -p rtcl-vm --lib --features regexp-spencer regexp_spencer`
   （7/7）；`specs/tclmem.sh 'python3 specs/regex/spencer-overall.py'`

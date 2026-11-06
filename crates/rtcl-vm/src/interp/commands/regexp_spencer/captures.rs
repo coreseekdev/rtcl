@@ -12,8 +12,8 @@
 //! 暂不支持（返回 false）。
 
 use super::ast::{Node, NodeKind, DUPINF};
-use super::matcher::{assert_ok, find_from, Match};
-use super::nfa::Prog;
+use super::matcher::{assert_ok, find_from, matches_at, Match};
+use super::nfa::{self, Prog};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Captures {
@@ -96,7 +96,13 @@ impl<'a> Dissect<'a> {
                 self.repeat(node, *min, *max, begin, end, record, caps)
             }
             NodeKind::Backref { subno, min, max } => self.backref(*subno, *min, *max, begin, end, caps),
-            NodeKind::Look { .. } => false, // M4
+            NodeKind::Look { negative, node } => {
+                let Ok(sub) = nfa::compile(node, self.prog.icase) else {
+                    return false;
+                };
+                let found = matches_at(&sub, self.text, begin, self.search_start);
+                begin == end && found != *negative
+            }
         }
     }
 
@@ -270,8 +276,8 @@ impl<'a> Dissect<'a> {
         let unit = &self.text[cs..ce];
         let ulen = unit.len();
         if ulen == 0 {
-            // 空捕获：可以重复任意次，但必须是 min..=max 中的次数。
-            return begin == end && min == 0;
+            // 空捕获重复任意次仍是空串（Spencer "matched trivially"）。
+            return begin == end;
         }
         let span = end - begin;
         if span % ulen != 0 {

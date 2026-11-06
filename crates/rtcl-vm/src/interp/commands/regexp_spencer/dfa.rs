@@ -51,7 +51,7 @@ impl ColorInfo {
                         };
                         arcs[si].push((1u64 << idx, *to));
                     }
-                    Trans::Assert(_, _) => return None,
+                    Trans::Assert(_, _) | Trans::Lacon { .. } => return None,
                     Trans::Eps(_) => {}
                 }
             }

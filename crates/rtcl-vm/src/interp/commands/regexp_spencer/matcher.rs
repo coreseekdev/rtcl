@@ -116,6 +116,9 @@ impl<'a> Searcher<'a> {
     }
 
     fn scan(&mut self, text: &[char], from: usize, search_start: usize) -> Option<Match> {
+        if self.prog.has_backref {
+            return super::backtrack::find(self.prog, text, from, search_start);
+        }
         if let Some(mut dfa) = self.dfa.take() {
             match dfa_scan(self.prog, &mut dfa, &mut self.scratch, text, from, search_start) {
                 Ok(found) => {
@@ -343,6 +346,39 @@ fn nfa_scan(prog: &Prog, text: &[char], from: usize, search_start: usize) -> Opt
     best
 }
 
+/// lookahead：子 Prog 是否在 `pos` 起有 anchored 匹配（不要求到串尾）。
+pub(crate) fn matches_at(prog: &Prog, text: &[char], pos: usize, search_start: usize) -> bool {
+    let mut sc = Scanner::new(prog, text, search_start);
+    let mut seeds = vec![(prog.start, 0usize)];
+    sc.closure(&seeds, pos);
+    if sc.cur.contains(&prog.accept) {
+        return true;
+    }
+    let mut p = pos;
+    while p < text.len() {
+        let ch = text[p];
+        seeds.clear();
+        for &s in &sc.cur {
+            for t in &prog.states[s].trans {
+                if let Trans::Char(set, to) = t {
+                    if set.matches(ch, prog.icase) {
+                        seeds.push((*to, 0));
+                    }
+                }
+            }
+        }
+        p += 1;
+        if seeds.is_empty() {
+            return false;
+        }
+        sc.closure(&seeds, p);
+        if sc.cur.contains(&prog.accept) {
+            return true;
+        }
+    }
+    false
+}
+
 struct Scanner<'a> {
     prog: &'a Prog,
     text: &'a [char],
@@ -397,6 +433,17 @@ impl<'a> Scanner<'a> {
                     Trans::Eps(to) => self.stack.push((*to, start)),
                     Trans::Assert(k, to) => {
                         if assert_ok(*k, pos, self.text, self.search_start) {
+                            self.stack.push((*to, start));
+                        }
+                    }
+                    Trans::Lacon { negative, prog, to } => {
+                        let ok = matches_at(
+                            &self.prog.lacons[*prog],
+                            self.text,
+                            pos,
+                            self.search_start,
+                        );
+                        if ok != *negative {
                             self.stack.push((*to, start));
                         }
                     }

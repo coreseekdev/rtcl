@@ -15,18 +15,72 @@ PAIRS = re.compile(r"^t \{(.*?)\} \{(.*?)\}$")
 GROUP = re.compile(r"\{(-?\d+) (-?\d+)\}")
 
 
-def parse_pairs():
+def _braced_block(text: str, key: str):
+    i = text.index(key)
+    i = text.index("{", i) + 1
+    depth = 1
+    start = i
+    while i < len(text) and depth:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+        i += 1
+    return text[start:i - 1]
+
+
+def _braced_tokens(block: str):
     out = []
-    with open("specs/regex/random-4000.tcl", encoding="utf-8") as f:
-        for line in f:
-            m = PAIRS.match(line.rstrip("\n"))
-            if m:
-                out.append((m.group(1), m.group(2)))
+    i = 0
+    while i < len(block):
+        while i < len(block) and block[i].isspace():
+            i += 1
+        if i >= len(block):
+            break
+        if block[i] == "{":
+            depth = 1
+            j = i + 1
+            while j < len(block) and depth:
+                if block[j] == "{":
+                    depth += 1
+                elif block[j] == "}":
+                    depth -= 1
+                j += 1
+            out.append(block[i + 1:j - 1])
+            i = j
+        else:
+            j = i
+            while j < len(block) and not block[j].isspace():
+                j += 1
+            tok = block[i:j]
+            i = j
+            if tok == '""':
+                tok = ""
+            out.append(tok)
+    return out
+
+
+def parse_pairs(path="specs/regex/random-4000.tcl"):
+    out = []
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    if "set pats {" in text:
+        pats = _braced_tokens(_braced_block(text, "set pats"))
+        strs = _braced_tokens(_braced_block(text, "set strs"))
+        for p in pats:
+            for st in strs:
+                out.append((p, st))
+        return out
+    for line in text.splitlines():
+        m = PAIRS.match(line.rstrip("\n"))
+        if m:
+            out.append((m.group(1), m.group(2)))
     return out
 
 
 def main() -> int:
-    pairs = parse_pairs()
+    corpus = sys.argv[1] if len(sys.argv) > 1 else "specs/regex/random-4000.tcl"
+    pairs = parse_pairs(corpus)
     with open("/tmp/spencer_cap_pairs.tsv", "w", encoding="utf-8") as f:
         for pat, text in pairs:
             f.write(pat + "\t" + text.encode("utf-8").hex() + "\n")
@@ -58,6 +112,8 @@ def main() -> int:
     def norm_oracle(line: str) -> str:
         if not line:
             return "NONE"
+        if line == "ERR":
+            return "ERR"
         groups = GROUP.findall(line)
         if not groups:
             return "ERR:" + line

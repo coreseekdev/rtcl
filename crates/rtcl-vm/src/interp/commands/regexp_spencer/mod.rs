@@ -5,6 +5,7 @@
 //! M3/M4 落地。feature `regexp-spencer` 默认关闭，验证完成后转默认。
 
 pub mod ast;
+mod backtrack;
 pub mod captures;
 pub mod charset;
 mod dfa;

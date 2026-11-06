@@ -68,3 +68,7 @@ debug = []
 [[example]]
 name = "spencer_span"
 required-features = ["regexp-spencer"]
+
+[[example]]
+name = "spencer_bench"
+required-features = ["regexp-spencer"]

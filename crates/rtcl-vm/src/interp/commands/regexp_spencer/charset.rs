@@ -82,47 +82,64 @@ pub struct CharSet {
     pub neg: bool,
     pub no_newline: bool,
     pub items: Vec<Item>,
+    /// ASCII 0..127 的成员位图（性能结构：常见文本热路径免逐项扫描）。
+    ascii: [u64; 4],
 }
 
 impl CharSet {
-    pub fn any() -> CharSet {
+    pub fn new(neg: bool, no_newline: bool, items: Vec<Item>) -> CharSet {
+        let mut ascii = [0u64; 4];
+        for u in 0..128u32 {
+            let c = char::from_u32(u).unwrap();
+            if items.iter().any(|it| item_matches(it, c)) {
+                ascii[(u >> 6) as usize] |= 1u64 << (u & 63);
+            }
+        }
         CharSet {
-            neg: false,
-            no_newline: false,
-            items: vec![Item::Range(0, 0x10FFFF)],
+            neg,
+            no_newline,
+            items,
+            ascii,
         }
     }
 
+    pub fn any() -> CharSet {
+        CharSet::new(false, false, vec![Item::Range(0, 0x10FFFF)])
+    }
+
     pub fn dot(newline_stop: bool) -> CharSet {
-        CharSet {
-            neg: false,
-            no_newline: newline_stop,
-            items: vec![Item::Range(0, 0x10FFFF)],
-        }
+        CharSet::new(false, newline_stop, vec![Item::Range(0, 0x10FFFF)])
     }
 
     pub fn from_char(c: char) -> CharSet {
         let u = c as u32;
-        CharSet {
-            neg: false,
-            no_newline: false,
-            items: vec![Item::Range(u, u)],
-        }
+        CharSet::new(false, false, vec![Item::Range(u, u)])
     }
 
     pub fn matches(&self, c: char, icase: bool) -> bool {
         if self.no_newline && c == '\n' {
             return false;
         }
+        let u = c as u32;
+        if u < 128 {
+            let mut hit = self.ascii[(u >> 6) as usize] & (1u64 << (u & 63)) != 0;
+            if !hit && icase {
+                for v in fold_variants(c) {
+                    if v != c && self.ascii[((v as u32) >> 6) as usize]
+                        & (1u64 << ((v as u32) & 63))
+                        != 0
+                    {
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            return if self.neg { !hit } else { hit };
+        }
         let mut hit = self.items.iter().any(|it| item_matches(it, c));
         if !hit && icase {
             // 简单折叠：同时试单字符 lower/upper 形式。
-            let mut variants = [None, None];
-            let mut it = c.to_lowercase();
-            variants[0] = it.next();
-            let mut it = c.to_uppercase();
-            variants[1] = it.next();
-            for v in variants.into_iter().flatten() {
+            for v in fold_variants(c) {
                 if v != c && self.items.iter().any(|it| item_matches(it, v)) {
                     hit = true;
                     break;
@@ -135,6 +152,12 @@ impl CharSet {
             hit
         }
     }
+}
+
+fn fold_variants(c: char) -> impl Iterator<Item = char> {
+    let lo = c.to_lowercase().next();
+    let up = c.to_uppercase().next();
+    [lo, up].into_iter().flatten()
 }
 
 fn item_matches(it: &Item, c: char) -> bool {

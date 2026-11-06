@@ -30,6 +30,23 @@
 - 不改变 `string` 的码点语义策略（D-27）；Spencer 引擎内部按
   Tcl_UniChar（UCS-2）语义处理，边界转换在适配层统一。
 
+## 1.5 现成引擎调研（2026-11-06）
+
+结论：**没有现成的 Rust 引擎具备 Tcl/Spencer 语义**，B 路径的自研
+移植成立。
+
+| 候选 | 语义 | 是否可用 |
+|---|---|---|
+| Tcl 源码 `regcomp.c`/`regexec.c` | Spencer：POSIX longest + SHORTER + POSIX 子匹配 + ARE | C 参考实现（BSD），仅可移植 |
+| glibc POSIX `regcomp/regexec` | POSIX longest/子匹配，但无 ARE/惰性/回引/环视 | C、非 wasm、语法面不足 |
+| RE2（C++）/ Go `regexp`（Longest） | leftmost-longest 但 Perl 语法子集，无 ARE/惰性 SHORTER/回引 | C++/Go，非 wasm 可嵌入 |
+| Rust `regex` / `regex-automata` | leftmost-first（Perl），无 POSIX longest/回引/环视 | 语义不符（当前 fast 引擎） |
+| Rust `fancy-regex` / `onig` / `pcre2` | Perl/PCRE 语义（回溯或绑定 C） | 语义不符、非纯 Rust/非 wasm |
+| Rust `posix-regex`（Redox） | POSIX 正则**解析器**（无匹配引擎） | 不可用 |
+| openresty/sregex（C） | Perl 兼容、octet-only、无回引/环视、流式 | 语义不符（见评估文档） |
+
+因此选择以 Spencer C 源码为规范、Rust 重实现（本文件）。
+
 ## 2. 参考实现与许可
 
 - 参考：`.refer/tcl/generic/{regcomp.c,regexec.c,regc_lex.c,
@@ -126,6 +143,11 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   leftmost-longest / SHORTER）；`specs/regex/spencer-overall.py`
   对 tclsh 8.6.17 的随机 4000 例**整体 span 差异 = 0**（默认选项，
   不含回引/lookahead）。
+- **行为规格**：`specs/regex-spencer.allium`（23 条规则，oracle 值
+  实测校准；`allium check` 0 error）作为 M2/M3/M4 的验收口径。
+- **性能（M2，见 §8）**：单趟起点跟踪 NFA + ASCII 位图 + 纯字面/前缀
+  预过滤；1 MiB 全扫描类模式 22-69 MB/s（对 `regex` 2.6-4.2×），
+  纯字面 4.7 GB/s（快路径）。CNFA/color/lazy DFA 列为 M2.5。
 - **M3 待做**：捕获 dissect（POSIX 子匹配/迭代/回引）与
   `-inline/-indices/-all` 接线；M4：lookahead/LACON、回引执行、
   BRE/ERE/expanded 全量；M5：默认路由与 go/no-go。
@@ -134,7 +156,57 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   （7/7）；`specs/tclmem.sh 'python3 specs/regex/spencer-overall.py'`
   （4000/4000）。
 
-## 8. 工程约定
+## 8. 性能结构（Rust 版）
+
+Spencer 原引擎的性能来自四层结构：color/byte-tree 字符等价类 →
+compacted NFA（小整数弧表）→ lazy DFA 缓存 → dissect 复用。Rust 移植
+按同样分层推进，先保证语义，再逐层补性能：
+
+### 已落地（M2）
+
+- **单趟起点跟踪扫描**（`matcher.rs`）：所有起点线程同时推进，每个
+  NFA 状态只保留最小起点（leftmost 优先）；不再每个起点重启模拟
+  （旧版最坏 O(n²·m)）。
+- **零分配热路径**：代际标记（stamp/start_of）+ 复用 stack/cur/seed
+  Vec；每位置只做一次 epsilon/断言闭包。
+- **ASCII 位图**：`CharSet` 对 0..127 预计算 4×u64 成员表；常见
+  ASCII 文本不做逐项谓词扫描。
+- **预过滤**：纯字面模式直接子串搜索；字面前缀 / 首字符集跳过
+  不可能起点（断言可达时自动禁用首字符集）。
+
+### 实测（1 MiB 文本，全匹配扫描；`examples/spencer_bench.rs`）
+
+| 模式 | Spencer Rust | Rust `regex` crate | 比值 |
+|---|---|---|---|
+| `a+` | 35 MB/s | 94 MB/s | 2.7× |
+| `[a-z]+` | 38 MB/s | 156 MB/s | 4.1× |
+| `\w+` | 37 MB/s | 149 MB/s | 4.0× |
+| `(a\|ab)+` | 22 MB/s | 92 MB/s | 4.2× |
+| `(a+?)(a*)` | 23 MB/s | 94 MB/s | 4.1× |
+| 纯字面 `abab abab` | 4737 MB/s | 1284 MB/s | 0.27×（快路径） |
+| `\s+` | 69 MB/s | 177 MB/s | 2.6× |
+| UTF-8→char 转换 | 2.4-3.3 GB/s | — | 每次 regexp 调用一次性 |
+
+### 待做（M2.5 / M3）
+
+1. **Color map + CNFA**：把 CharSet 归并为颜色类（ASCII 预计算，
+   Unicode 按谓词惰性分类并缓存），弧表压成 `(color, to)` 小整数数组
+   ——对应 Spencer `regc_color.c`/`regc_nfa.c`。
+2. **lazy DFA 缓存**：DFA 状态 = NFA 状态位集（u64 数组）+ 代际哈希，
+   转移表按 color 缓存；带状态上限（防内存膨胀）和失效策略。
+   目标：类模式 ≥ 1 GB/s（当前 35-40 MB/s），与 `regex` 差距 ≤ 1.5×。
+3. **UTF-8 直读 + 字面 memmem**：公共 `find(&str)` 对纯 ASCII/纯字面
+   走字节路径（避免每次调用的一次性 `Vec<char>` 转换），只对非 ASCII
+   /需要 Unicode 语义的输入转 chars。
+4. **dissect 复用**：M3 捕获拆分复用同一 DFA/NFA 缓存，避免回溯爆炸。
+5. 内存上限：DFA 缓存按状态数/字节数封顶；编译空间预算对应
+   `REG_MAX_COMPILE_SPACE`。
+
+性能验收口径：正确性门禁（4000 例差异=0）优先；性能目标为常见类
+模式 ≥1 GB/s、纯字面不低于 `regex` 的 0.5×、无病态回溯（NFA/DFA
+路径无指数行为）。
+
+## 9. 工程约定
 
 - 新引擎不 panic：所有失败走 `Error { code, message }`；
   编译空间上限（Spencer `REG_MAX_COMPILE_SPACE` 语义）用预算参数。

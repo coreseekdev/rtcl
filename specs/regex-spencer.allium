@@ -1,0 +1,177 @@
+-- allium: 3
+-- regex-spencer.allium
+-- Behaviour spec: Spencer/Tcl-ARE 正则引擎（B 路径 Rust 移植）。
+-- Oracle: tclsh 8.6.17. 目标：语义逐字对齐；实现见
+-- crates/rtcl-vm/src/interp/commands/regexp_spencer/ 与
+-- specs/regex-spencer-port.md。性能结构不在此层（见该文档 §性能）。
+--
+-- 本 spec 是 M2/M3/M4 的验收口径：每条规则的 oracle 结果均来自
+-- tclsh 8.6.17 实测；rtcl 现状/差异注释保留。
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── 整体匹配：POSIX leftmost-longest ──────────────────────────────
+
+rule AlternationPrefersLongestOverall {
+    -- Spencer 引擎默认 leftmost-longest：同一位置取最长整体匹配，
+    -- 不按分支书写顺序（Perl leftmost-first）。
+    when: Evaluates("list [regexp -inline {a|ab} ab] [regexp -inline {ab|a} ab]")
+    ensures: completion.code = ok
+    ensures: completion.value = "ab ab"
+}
+
+rule RepetitionOfAlternationIsLongest {
+    when: Evaluates("list [regexp -inline {(a|ab)+} abab] [regexp -inline {(a|ab)*} ab]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{abab ab} {ab ab}"
+}
+
+rule ConcatOfAlternationsIsLongest {
+    when: Evaluates("regexp -inline {(a|ab)(c|bcd)} abcd")
+    ensures: completion.code = ok
+    ensures: completion.value = "abcd a bcd"
+}
+
+-- ── SHORTER：任一非贪婪量词 → 整体最短 ────────────────────────────
+
+rule LazyQuantifierSwitchesToShortest {
+    -- 根偏好含 SHORTER（Spencer REG_USHORTEST）：整体取最短，
+    -- 后续贪婪组不再扩展。
+    when: Evaluates("list [regexp -inline {(a+?)(a*)} aaa] [regexp -inline {(a*?)(a*)} aaa]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a a {}} {{} {} {}}"
+}
+
+rule GreedyPrefixStillConsumesBeforeLazy {
+    -- COMBINE 偏好序：贪婪前缀先按自身贪婪展开，整体仍得 aaa。
+    when: Evaluates("regexp -inline {(a+)(a*?)} aaa")
+    ensures: completion.code = ok
+    ensures: completion.value = "aaa aaa {}"
+}
+
+rule LazyBothSidesMinimalButSatisfy {
+    when: Evaluates("list [regexp -inline {(a+?)(a+)} aaa] [regexp -inline {(a+?)(a*)b} aaab]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{aa a a} {aaab a aa}"
+}
+
+-- ── POSIX 子匹配消歧（重复组取最后一次迭代）──────────────────────
+
+rule RepeatedGroupCaptureIsLastIteration {
+    -- 整体相同但捕获不同：重复组取最后一次迭代（可为空）。
+    when: Evaluates("list [regexp -inline {(a*)+} a] [regexp -inline {(a+)+} aa]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a {}} {aa a}"
+}
+
+rule OptionalGroupCaptureEmpty {
+    when: Evaluates("regexp -inline {(a)?(b)} b")
+    ensures: completion.code = ok
+    ensures: completion.value = "b {} b"
+}
+
+-- ── 断言 / 锚点 ──────────────────────────────────────────────────
+
+rule AnchorsAreStringOrLinePerOptions {
+    -- 默认 newline 不敏感：^ $ 只锚整串；-lineanchor 才按行。
+    when: Evaluates("list [regexp {^a+} baa] [regexp {a+$} baa] [regexp -lineanchor {^b} \"a\\nb\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1 1"
+}
+
+rule StringAnchorsBindSearchStart {
+    -- \A 绑定 -start 偏移；-lineanchor 不得把 \A 变成行首。
+    when: Evaluates("list [regexp -start 1 {\\Aa} \"ba\"] [regexp -lineanchor -start 1 {\\Aa} \"b\\na\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+rule WordAndWordStartAssertions {
+    when: Evaluates("list [regexp {\\ya+} \" baa\"] [regexp {\\ma+} \" baa\"] [regexp {\\Ma} \"ba a\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1"
+}
+
+-- ── 字符类 / 转义（D-19 口径）────────────────────────────────────
+
+rule CharacterClassAndPosixNames {
+    when: Evaluates("list [regexp {[a-c]+} xabcx] [regexp {[[:alpha:]]+} 12ab3] [regexp {[^a]+} aaab]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1"
+}
+
+rule CaseInsensitiveOption {
+    when: Evaluates("list [regexp -nocase {ABC} xabc] [regexp {(?i)ABC} xabc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+rule HexAndOctalEscapes {
+    -- \u(1-4)/\U(1-8)/\x(1-2)；\3161573148 = U+00CE + "1573148"。
+    when: Evaluates("list [regexp {\\u0041} A] [regexp {\\U00000041} A] [regexp {\\x41} A] [regexp {\\3161573148} \"\\u00ce1573148\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1"
+}
+
+rule BackslashBIsBackspaceAndCapitalBIsBackslash {
+    when: Evaluates("list [regexp {\\b} \"\\u0008\"] [regexp {\\B} \"\\\\\"] [regexp {\\y} \" a\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1"
+}
+
+rule BackreferenceRequiresClosedGroup {
+    -- \1 只能引用已闭合组；无组 → invalid backreference number。
+    when: Evaluates("list [regexp {(a)\\1} aa] [catch {regexp 	{(\\1)} AA} m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+-- ── 编译错误（REG_* / 消息）────────────────────────────────────
+
+rule QuantifierWithoutOperandIsBadRpt {
+    when: Evaluates("list [catch {regexp {*} x} m] [catch {regexp {a**} x} m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+rule BoundsValidateDupMax {
+    -- {m,n} m>n / 超过 DUPMAX(255) → invalid repetition count(s)。
+    when: Evaluates("list [catch {regexp {a{2,1}} x} m] [catch {regexp {a{256}} x} m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+rule ParensAndBracketsBalance {
+    when: Evaluates("list [catch {regexp {(} x} m] [catch {regexp {[a} x} m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+rule InvalidEmbeddedOption {
+    when: Evaluates("catch {regexp {(?z)} x} m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule LookbehindRejectedIn86 {
+    when: Evaluates("catch {regexp {(?<=a)b} x} m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule LiteralPrefixQuoteMode {
+    -- ***= 之后全部按字面。
+    when: Evaluates("list [regexp {***=a.c} a.c] [regexp {***=a.c} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+rule ExpandedModeIgnoresWhitespaceAndComments {
+    when: Evaluates("regexp -expanded {a # comment\\n b} ab")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}

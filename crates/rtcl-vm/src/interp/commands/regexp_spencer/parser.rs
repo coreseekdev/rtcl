@@ -436,36 +436,12 @@ impl Parser {
         };
         self.i += 1;
         match c {
-            'd' => Ok(Node::class(CharSet {
-                neg: false,
-                no_newline: false,
-                items: vec![Item::Pred(Pred::Digit)],
-            })),
-            'D' => Ok(Node::class(CharSet {
-                neg: false,
-                no_newline: false,
-                items: vec![Item::Pred(Pred::NotDigit)],
-            })),
-            's' => Ok(Node::class(CharSet {
-                neg: false,
-                no_newline: false,
-                items: vec![Item::Pred(Pred::Space)],
-            })),
-            'S' => Ok(Node::class(CharSet {
-                neg: false,
-                no_newline: false,
-                items: vec![Item::Pred(Pred::NotSpace)],
-            })),
-            'w' => Ok(Node::class(CharSet {
-                neg: false,
-                no_newline: false,
-                items: vec![Item::Pred(Pred::Word)],
-            })),
-            'W' => Ok(Node::class(CharSet {
-                neg: false,
-                no_newline: false,
-                items: vec![Item::Pred(Pred::NotWord)],
-            })),
+            'd' => Ok(Node::class(CharSet::new(false, false, vec![Item::Pred(Pred::Digit)]))),
+            'D' => Ok(Node::class(CharSet::new(false, false, vec![Item::Pred(Pred::NotDigit)]))),
+            's' => Ok(Node::class(CharSet::new(false, false, vec![Item::Pred(Pred::Space)]))),
+            'S' => Ok(Node::class(CharSet::new(false, false, vec![Item::Pred(Pred::NotSpace)]))),
+            'w' => Ok(Node::class(CharSet::new(false, false, vec![Item::Pred(Pred::Word)]))),
+            'W' => Ok(Node::class(CharSet::new(false, false, vec![Item::Pred(Pred::NotWord)]))),
             'm' => Ok(Node::assert(AssertKind::WordStart)),
             'M' => Ok(Node::assert(AssertKind::WordEnd)),
             'y' => Ok(Node::assert(AssertKind::WordB)),
@@ -655,11 +631,11 @@ impl Parser {
                 ClassAtom::Pred(p) => items.push(Item::Pred(p)),
             }
         }
-        Ok(Node::class(CharSet {
+        Ok(Node::class(CharSet::new(
             neg,
-            no_newline: neg && self.opts.class_stops_newline(),
+            neg && self.opts.class_stops_newline(),
             items,
-        }))
+        )))
     }
 
     fn parse_posix_or_collate(&mut self) -> Result<Option<Item>, Error> {

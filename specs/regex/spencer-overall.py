@@ -38,12 +38,21 @@ def main() -> int:
             f.write("if {$rc} { puts ERR } else { puts $m }\n")
     subprocess.run(["tclsh", "/tmp/spencer_oracle.tcl"], check=True,
                    stdout=open("/tmp/spencer_oracle.out", "w"))
-    subprocess.run(
-        ["cargo", "run", "-q", "-p", "rtcl-vm", "--features", "regexp-spencer",
-         "--example", "spencer_span"],
-        check=True, stdin=open("/tmp/spencer_pairs.tsv"),
-        stdout=open("/tmp/spencer_ours.out", "w"),
-    )
+    # 优先预构建二进制（避免在 512M cgroup 里跑 rustc）；没有则 cargo run。
+    bin_path = "target/release/examples/spencer_span"
+    if not os.path.exists(bin_path):
+        bin_path = "target/debug/examples/spencer_span"
+    if os.path.exists(bin_path):
+        subprocess.run([bin_path], check=True,
+                       stdin=open("/tmp/spencer_pairs.tsv"),
+                       stdout=open("/tmp/spencer_ours.out", "w"))
+    else:
+        subprocess.run(
+            ["cargo", "run", "-q", "-p", "rtcl-vm", "--features", "regexp-spencer",
+             "--example", "spencer_span"],
+            check=True, stdin=open("/tmp/spencer_pairs.tsv"),
+            stdout=open("/tmp/spencer_ours.out", "w"),
+        )
     oracle = [l.rstrip("\n") for l in open("/tmp/spencer_oracle.out", encoding="utf-8")]
     ours = [l.rstrip("\n") for l in open("/tmp/spencer_ours.out", encoding="utf-8")]
 

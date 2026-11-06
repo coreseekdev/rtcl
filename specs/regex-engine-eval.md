@@ -164,7 +164,14 @@ Rust 复刻它的语义影响：
 3. **sregex 复刻不立项**，除非出现明确的 GB 级流式正则需求；届时
    单独评估"流式 API + 内存上限 + 吞吐"指标，而不是拿它当语义修复。
 
-## 7. 复现与资产
+## 7. 后续（B 路径已立项）
+
+决策：按 **B（Spencer Rust 移植）** 正式实施，计划/里程碑/验收见
+`specs/regex-spencer-port.md`。M0-M2 已完成（解析器 + NFA + 整体
+匹配），随机 4000 例整体 span 已与 tclsh 0 差异；M3（捕获 dissect）
+完成后 D-20/D-46 才能关闭。
+
+## 8. 复现与资产
 
 - `specs/regex/semantics.tcl` —— 定向 759 例。
 - `specs/regex/random-4000.tcl` —— 随机 4000 例（seed 20261106）。

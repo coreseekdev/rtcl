@@ -51,6 +51,9 @@ regexp-lite = ["std", "dep:regex-lite"]  # regexp, regsub (smaller WASM binary)
 env = ["std"]                     # $env array from OS environment
 package = ["file"]                # package provide/require/names/forget
 signal = ["std"]                  # kill, sleep
+# Henry Spencer 正则引擎的 Rust 移植（B 路径；specs/regex-spencer-port.md）。
+# 默认关闭，M5 验证后转默认。
+regexp-spencer = []
 # 外部 libc iconv 后端（encoding module 的宽表编码转换）。默认开；wasm /
 # 无 libc 目标或显式 --no-default-features 时关闭，编码走字节直映兜底
 # （名字表仍完整，convertfrom/to 对非内建编码退化为逐字节/UTF-8 直传）。
@@ -61,3 +64,7 @@ alloc = []
 embedded = ["alloc", "dep:spin"]
 # Enable extra diagnostics
 debug = []
+
+[[example]]
+name = "spencer_span"
+required-features = ["regexp-spencer"]

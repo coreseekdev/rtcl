@@ -807,6 +807,10 @@
   与 D-20（惰性/SHORTER）合计 523/4000（13.1%）。
 - **评估**：`specs/regex-engine-eval.md`（含 sregex 复刻取舍：Perl
   语义 + octet-only + 无回引/环视，不能修本条，不建议引入）。
+- **进展（B 路径，2026-11-06）**：Spencer Rust 移植 M0-M2 完成
+  （`specs/regex-spencer-port.md`）——ARE 解析 + NFA + POSIX
+  longest/SHORTER 整体匹配；随机 4000 例整体 span 与 tclsh **0 差异**。
+  捕获 dissect（M3）尚未接线，故本条仍 OPEN。
 - **严重度**：中（需要 Spencer 语义引擎或 POSIX-longest 引擎 +
   子匹配消歧；与 D-20 同批收口）。
 

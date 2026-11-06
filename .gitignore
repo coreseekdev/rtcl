@@ -28,6 +28,7 @@ Thumbs.db
 !Claude.md
 !Cargo.toml
 !specs/regex-engine-eval.md
+!specs/regex-spencer-port.md
 
 # Task output files
 tasks/*.output

@@ -15,6 +15,8 @@ pub mod misc;
 #[cfg(feature = "regexp")]
 pub mod regexp_bt;
 pub mod regexp_cmds;
+#[cfg(feature = "regexp-spencer")]
+pub mod regexp_spencer;
 #[cfg(feature = "clock")]
 pub mod clock;
 #[cfg(feature = "package")]

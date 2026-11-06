@@ -212,7 +212,9 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   （`[[=ab=]]`/`[[.ab.]]` → REG_ECOLLATE / invalid collating
   element）。字符类错误优先级：坏范围后的类语法错误通常让位于
   ERANGE，但紧跟在坏范围后的 escape（`[z-a\q`）仍报 EESCAPE；
-  类内非法转义/未闭合等优先级按 tclsh 探针（`error-probes.tcl`）。`-linestop/-line`
+  首个 `]` 可作为 range 起点（`[]-a]`）、未闭合类里 range 后的
+  尾部 `-` 报 ERANGE（`[a-b-`，闭合则字面）；类内非法转义/未闭合
+  等优先级按 tclsh 探针（`error-probes.tcl`）。`-linestop/-line`
   下否定简写 `\W/\D/\S` 与 `[^...]` 一样不匹配换行；ARE 字符类内
   仅允许小写 `\d\s\w`（大写 → REG_EESCAPE，BRE/ERE 为字面）。
   回引回溯的 concat 去重按

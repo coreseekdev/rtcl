@@ -47,3 +47,22 @@ t 5b5b2e61622e5d5d
 t 283f7a29
 t 283f3c3d612962
 t 617b32
+
+# 首个 ] 作为 range 起点 / 未闭合类尾随 - / escape 优先级。
+t 5b5d2d615d
+t 5b5d2d61
+t 5b612d5d5d
+t 5b5d2d3e5c5d
+t 5b5d2d3e5c7b
+t 5b5d2d295c5d
+t 5b7a2d615c5d
+t 5b5d2d3e5d
+t 5b5d295c2d5d
+t 5b5d2d615c
+t 5b5d2d615c715d
+t 5b612d622d
+t 5b612d622d63
+t 5b612d
+t 5b61622d
+t 5b612d622d5d
+t 5b612d622d635d

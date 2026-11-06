@@ -996,11 +996,8 @@ impl Parser {
         self.i += 1; // '['
         let neg = self.eat('^');
         let mut items: Vec<Item> = Vec::new();
-        // 首个 ']' 是字面。
-        if self.peek() == Some(']') {
-            items.push(Item::Range(']' as u32, ']' as u32));
-            self.i += 1;
-        }
+        // 首个 ']' 是字面，但仍可作为 range 起点（`[]-a]`）。
+        let mut first_content = true;
         // 紧跟在 range 后的 `-x` 会与前一 range 共享端点（`[a-b-c]`），
         // tclsh 报 invalid character range。范围错误延迟到 `]` 之后
         // 再报——未闭合的括号优先报 EBRACK（tclsh 实测 `[z-a`）。
@@ -1023,7 +1020,7 @@ impl Parser {
                     }
                     return Err(Self::err("REG_EBRACK", "brackets [] not balanced"));
                 }
-                Some(']') => {
+                Some(']') if !first_content => {
                     self.i += 1;
                     break;
                 }
@@ -1059,15 +1056,27 @@ impl Parser {
                     // class 元素后面跟 `-x` 也是非法 range
                     //（tclsh：`[[:digit:]-a]` → invalid character range）。
                     just_range = true;
+                    first_content = false;
                     continue;
                 }
                 _ => {}
             }
             if just_range && self.peek() == Some('-') {
-                if let Some(n) = self.at(1) {
-                    if n != ']' && !bad_range {
-                        bad_range = true;
-                        bad_range_at = self.i;
+                match self.at(1) {
+                    Some(']') => {}
+                    Some(_) => {
+                        if !bad_range {
+                            bad_range = true;
+                            bad_range_at = self.i;
+                        }
+                    }
+                    None => {
+                        // 未闭合类里 range 后的尾部 `-`：tclsh 报
+                        // ERANGE（`[a-b-`），闭合时则是字面。
+                        if !bad_range {
+                            bad_range = true;
+                            bad_range_at = self.i;
+                        }
                     }
                 }
             }
@@ -1079,10 +1088,7 @@ impl Parser {
                     // 语法错误优先报 EESCAPE（`[z-a\q`）；若错误前
                     // 还有字符且已到串尾，tclsh 报 ERANGE
                     //（`[{-n+\`、`[z-a+\q`）。
-                    if bad_range
-                        && self.i == self.chars.len()
-                        && class_start != bad_range_at
-                    {
+                    if bad_range && class_start != bad_range_at {
                         return Err(Self::err(
                             "REG_ERANGE",
                             "invalid character range",
@@ -1123,6 +1129,7 @@ impl Parser {
                             bad_range = true;
                         }
                     }
+                    first_content = false;
                     continue;
                 }
             } else if self.peek() == Some('-')
@@ -1136,6 +1143,7 @@ impl Parser {
                 bad_range = true;
             }
             just_range = false;
+            first_content = false;
             match lo {
                 ClassAtom::Char(c) => items.push(Item::Range(c as u32, c as u32)),
                 ClassAtom::Pred(p) => items.push(Item::Pred(p)),

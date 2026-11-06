@@ -1059,11 +1059,14 @@ impl Parser {
         if bad_range {
             return Err(Self::err("REG_ERANGE", "invalid character range"));
         }
-        Ok(Node::class(CharSet::new(
-            neg,
-            neg && self.opts.class_stops_newline(),
-            items,
-        )))
+        Ok(Node::new(
+            NodeKind::Class(CharSet::new(
+                neg,
+                neg && self.opts.class_stops_newline(),
+                items,
+            )),
+            Flags::BRACKET,
+        ))
     }
 
     fn parse_posix_or_collate(&mut self) -> Result<Option<Item>, Error> {

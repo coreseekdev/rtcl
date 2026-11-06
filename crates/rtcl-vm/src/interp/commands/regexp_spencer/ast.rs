@@ -20,6 +20,9 @@ pub struct Flags {
     pub mixed: bool,
     pub cap: bool,
     pub backr: bool,
+    /// 来自 `[...]` 字符类（区别于 `.` / `\d` 等内部 Class 节点），
+    /// 供 -about 的 UUNPORT 范围检测使用。
+    pub bracket: bool,
 }
 
 impl Flags {
@@ -29,6 +32,7 @@ impl Flags {
         mixed: false,
         cap: false,
         backr: false,
+        bracket: false,
     };
     pub const LONGER: Flags = Flags {
         longer: true,
@@ -46,6 +50,10 @@ impl Flags {
         backr: true,
         ..Flags::NONE
     };
+    pub const BRACKET: Flags = Flags {
+        bracket: true,
+        ..Flags::NONE
+    };
 
     fn pref_bits(self) -> u8 {
         (if self.longer { 1 } else { 0 }) | (if self.shorter { 2 } else { 0 })
@@ -60,6 +68,7 @@ impl Flags {
             mixed: self.mixed || (self.longer && self.shorter),
             cap: self.cap,
             backr: self.backr,
+            bracket: self.bracket,
         }
     }
 
@@ -71,6 +80,7 @@ impl Flags {
             mixed: a.mixed || b.mixed,
             cap: a.cap || b.cap,
             backr: a.backr || b.backr,
+            bracket: a.bracket || b.bracket,
         }
         .up();
         let pref = if a.pref_bits() != 0 {
@@ -367,50 +377,171 @@ fn wordness(n: &Node) -> WordKind {
     }
 }
 
-/// 跳过零宽节点，取相邻原子词性；串边界视为 Unknown。
-fn neighbor_wordness(parts: &[Node], from: usize, forward: bool) -> WordKind {
-    let mut i = from;
-    loop {
-        let idx = if forward {
-            if i >= parts.len() {
-                return WordKind::Unknown;
-            }
-            i
-        } else {
-            if i == 0 {
-                return WordKind::Unknown;
-            }
-            i - 1
-        };
-        let n = &parts[idx];
-        if matches!(
-            &n.kind,
-            NodeKind::Empty | NodeKind::Assert(_) | NodeKind::Look { .. }
-        ) {
-            if forward {
-                i += 1;
-            } else {
-                i -= 1;
-            }
-            continue;
-        }
-        return wordness(n);
+const WS_WORD: u8 = 1;
+const WS_NON: u8 = 2;
+const WS_ANY: u8 = 3;
+
+fn word_mask(k: WordKind) -> u8 {
+    match k {
+        WordKind::Word => WS_WORD,
+        WordKind::NonWord => WS_NON,
+        WordKind::Unknown => WS_ANY,
     }
 }
 
-/// `\y \Y \m \M` 与相邻已知词性冲突 → 不可命中。
-fn word_assert_impossible(k: AssertKind, prev: WordKind, next: WordKind) -> bool {
-    match k {
-        AssertKind::WordB => prev != WordKind::Unknown && prev == next,
-        AssertKind::NotWordB => {
-            prev != WordKind::Unknown
-                && next != WordKind::Unknown
-                && prev != next
+/// 该节点一旦消耗字符，**最后一个**字符的词性集合。
+fn last_wordness_if_consumes(n: &Node) -> u8 {
+    match &n.kind {
+        NodeKind::Char(_) | NodeKind::Class(_) => word_mask(wordness(n)),
+        NodeKind::Backref { .. } => WS_ANY,
+        NodeKind::NoRecord(inner) | NodeKind::Capture { node: inner, .. } => {
+            last_wordness_if_consumes(inner)
         }
-        AssertKind::WordStart => prev == WordKind::Word || next == WordKind::NonWord,
-        AssertKind::WordEnd => prev == WordKind::NonWord || next == WordKind::Word,
-        _ => false,
+        NodeKind::Concat(v) => {
+            let mut acc = 0u8;
+            for p in v.iter().rev() {
+                if !can_consume(p) {
+                    continue;
+                }
+                acc |= last_wordness_if_consumes(p);
+                if necessarily_consumes(p) {
+                    return acc;
+                }
+            }
+            acc
+        }
+        NodeKind::Alt(v) => v.iter().map(last_wordness_if_consumes).fold(0, |a, b| a | b),
+        NodeKind::Repeat { node, max, .. } => {
+            if *max > 0 {
+                last_wordness_if_consumes(node)
+            } else {
+                0
+            }
+        }
+        _ => 0,
     }
+}
+
+/// 该节点一旦消耗字符，**第一个**字符的词性集合。
+fn first_wordness_if_consumes(n: &Node) -> u8 {
+    match &n.kind {
+        NodeKind::Char(_) | NodeKind::Class(_) => word_mask(wordness(n)),
+        NodeKind::Backref { .. } => WS_ANY,
+        NodeKind::NoRecord(inner) | NodeKind::Capture { node: inner, .. } => {
+            first_wordness_if_consumes(inner)
+        }
+        NodeKind::Concat(v) => {
+            let mut acc = 0u8;
+            for p in v {
+                if !can_consume(p) {
+                    continue;
+                }
+                acc |= first_wordness_if_consumes(p);
+                if necessarily_consumes(p) {
+                    return acc;
+                }
+            }
+            acc
+        }
+        NodeKind::Alt(v) => v.iter().map(first_wordness_if_consumes).fold(0, |a, b| a | b),
+        NodeKind::Repeat { node, max, .. } => {
+            if *max > 0 {
+                first_wordness_if_consumes(node)
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// 位置前一个字符的候选词性集合（可选节点可按“跳过”或“消耗”展开）。
+fn prev_word_candidates(parts: &[Node], end: usize) -> u8 {
+    let mut acc = 0u8;
+    for p in parts[..end].iter().rev() {
+        if !can_consume(p) {
+            continue;
+        }
+        acc |= last_wordness_if_consumes(p);
+        if necessarily_consumes(p) {
+            return acc;
+        }
+    }
+    // 全部可跳过时，前一个字符来自匹配之外的上下文（任一可能）。
+    acc | WS_ANY
+}
+
+fn next_word_candidates(parts: &[Node], start: usize) -> u8 {
+    let mut acc = 0u8;
+    for p in &parts[start..] {
+        if !can_consume(p) {
+            continue;
+        }
+        acc |= first_wordness_if_consumes(p);
+        if necessarily_consumes(p) {
+            return acc;
+        }
+    }
+    acc | WS_ANY
+}
+
+/// 收集同一位置上的零宽约束（穿透分组；可选重复/环视不强制）。
+fn collect_zero_width_constraints(
+    n: &Node,
+    prev_fixed: &mut bool,
+    next_fixed: &mut bool,
+    asserts: &mut Vec<AssertKind>,
+) {
+    match &n.kind {
+        NodeKind::Assert(k) => match k {
+            AssertKind::Bos | AssertKind::Bot | AssertKind::Bol => *prev_fixed = true,
+            AssertKind::Eos | AssertKind::Eol => *next_fixed = true,
+            AssertKind::WordB
+            | AssertKind::NotWordB
+            | AssertKind::WordStart
+            | AssertKind::WordEnd => asserts.push(*k),
+        },
+        NodeKind::Empty | NodeKind::Look { .. } => {}
+        NodeKind::NoRecord(inner) | NodeKind::Capture { node: inner, .. } => {
+            collect_zero_width_constraints(inner, prev_fixed, next_fixed, asserts)
+        }
+        NodeKind::Concat(v) => {
+            for p in v {
+                collect_zero_width_constraints(p, prev_fixed, next_fixed, asserts);
+            }
+        }
+        NodeKind::Repeat { node, min, .. } if *min > 0 => {
+            collect_zero_width_constraints(node, prev_fixed, next_fixed, asserts)
+        }
+        _ => {}
+    }
+}
+
+fn word_assert_holds(k: AssertKind, prev: u8, next: u8) -> bool {
+    match k {
+        AssertKind::WordB => prev != next,
+        AssertKind::NotWordB => prev == next,
+        AssertKind::WordStart => prev == WS_NON && next == WS_WORD,
+        AssertKind::WordEnd => prev == WS_WORD && next == WS_NON,
+        _ => true,
+    }
+}
+
+fn word_run_feasible(asserts: &[AssertKind], prev_set: u8, next_set: u8) -> bool {
+    for prev in [WS_WORD, WS_NON] {
+        if prev_set & prev == 0 {
+            continue;
+        }
+        for next in [WS_WORD, WS_NON] {
+            if next_set & next == 0 {
+                continue;
+            }
+            if asserts.iter().all(|k| word_assert_holds(*k, prev, next)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_end_anchor(k: AssertKind) -> bool {
@@ -426,35 +557,6 @@ fn can_consume(n: &Node) -> bool {
         NodeKind::Concat(v) => v.iter().any(can_consume),
         NodeKind::Alt(v) => v.iter().any(can_consume),
         NodeKind::Repeat { node, max, .. } => *max > 0 && can_consume(node),
-    }
-}
-
-/// 紧邻（跳过 Empty/Look）的断言种类。
-fn adjacent_anchor(parts: &[Node], from: usize, forward: bool) -> Option<AssertKind> {
-    let mut i = from;
-    loop {
-        let idx = if forward {
-            if i >= parts.len() {
-                return None;
-            }
-            i
-        } else {
-            if i == 0 {
-                return None;
-            }
-            i - 1
-        };
-        match &parts[idx].kind {
-            NodeKind::Assert(k) => return Some(*k),
-            NodeKind::Empty | NodeKind::Look { .. } => {
-                if forward {
-                    i += 1;
-                } else {
-                    i -= 1;
-                }
-            }
-            _ => return None,
-        }
     }
 }
 
@@ -568,47 +670,42 @@ fn impossible_ctx(n: &Node, empty: bool) -> bool {
                 if ends_with_end_anchor(part) && v[i + 1..].iter().any(necessarily_consumes) {
                     return true;
                 }
-                if child_empty {
-                    continue;
-                }
-                if let NodeKind::Assert(k) = part.kind {
-                    let mut prev = neighbor_wordness(v, i, false);
-                    let mut next = neighbor_wordness(v, i + 1, true);
-                    // 紧邻的绝对/行锚点决定当前位置的虚拟邻字符：
-                    // 串首侧前邻是非词，串尾侧后邻是非词。
-                    let prev_anchor = adjacent_anchor(v, i, false);
-                    let next_anchor = adjacent_anchor(v, i + 1, true);
-                    if matches!(
-                        prev_anchor,
-                        Some(AssertKind::Bos | AssertKind::Bot | AssertKind::Bol)
-                    ) || matches!(
-                        next_anchor,
-                        Some(AssertKind::Bos | AssertKind::Bot | AssertKind::Bol)
-                    ) {
-                        prev = WordKind::NonWord;
+            }
+            if !child_empty {
+                // 同一位置上的零宽约束（\y \Y \m \M + 锚点）联立
+                // 求解：前/后字符词性候选集合中不存在满足全部约束的
+                // 组合 → 不可命中。
+                let mut i = 0usize;
+                while i < v.len() {
+                    if can_consume(&v[i]) {
+                        i += 1;
+                        continue;
                     }
-                    if matches!(prev_anchor, Some(AssertKind::Eos | AssertKind::Eol))
-                        || matches!(next_anchor, Some(AssertKind::Eos | AssertKind::Eol))
-                    {
-                        next = WordKind::NonWord;
+                    let start = i;
+                    let mut asserts = Vec::new();
+                    let mut prev_fixed = false;
+                    let mut next_fixed = false;
+                    while i < v.len() && !can_consume(&v[i]) {
+                        collect_zero_width_constraints(
+                            &v[i],
+                            &mut prev_fixed,
+                            &mut next_fixed,
+                            &mut asserts,
+                        );
+                        i += 1;
                     }
-                    // `\m` 紧邻串/行尾没有下一个词字符；`\M` 紧邻
-                    // 串/行首没有上一个词字符。
-                    if k == AssertKind::WordStart
-                        && matches!(next_anchor, Some(AssertKind::Eos | AssertKind::Eol))
-                    {
-                        return true;
-                    }
-                    if k == AssertKind::WordEnd
-                        && matches!(
-                            prev_anchor,
-                            Some(AssertKind::Bos | AssertKind::Bot | AssertKind::Bol)
-                        )
-                    {
-                        return true;
-                    }
-                    if word_assert_impossible(k, prev, next) {
-                        return true;
+                    if !asserts.is_empty() {
+                        let mut prev_set = prev_word_candidates(v, start);
+                        let mut next_set = next_word_candidates(v, i);
+                        if prev_fixed {
+                            prev_set = WS_NON;
+                        }
+                        if next_fixed {
+                            next_set = WS_NON;
+                        }
+                        if !word_run_feasible(&asserts, prev_set, next_set) {
+                            return true;
+                        }
                     }
                 }
             }
@@ -619,7 +716,8 @@ fn impossible_ctx(n: &Node, empty: bool) -> bool {
         NodeKind::NoRecord(inner) | NodeKind::Capture { node: inner, .. } => {
             impossible_ctx(inner, empty)
         }
-        NodeKind::Look { node, .. } => impossible_ctx(node, empty),
+        // lookahead 内部消耗不占匹配长度；负环视在空串上还可成立。
+        NodeKind::Look { .. } => false,
         _ => false,
     }
 }
@@ -699,5 +797,25 @@ fn nullable_m(n: &Node, groups: &mut Vec<Option<bool>>) -> bool {
             any
         }
         NodeKind::Repeat { node, min, .. } => *min == 0 || nullable_m(node, groups),
+    }
+}
+
+/// `regexp -about` 的 REG_UUNPORT：字符类里存在真正的范围
+/// （`[a-c]`；`[ab]`/`[a\-c]` 不算，后者由方言决定）。
+pub fn has_bracket_range(n: &Node) -> bool {
+    match &n.kind {
+        NodeKind::Class(set) => {
+            n.flags.bracket
+                && set.items.iter().any(|it| match it {
+                    super::charset::Item::Range(lo, hi) => lo < hi,
+                    _ => false,
+                })
+        }
+        NodeKind::Concat(v) | NodeKind::Alt(v) => v.iter().any(has_bracket_range),
+        NodeKind::Repeat { node, .. }
+        | NodeKind::NoRecord(node)
+        | NodeKind::Capture { node, .. }
+        | NodeKind::Look { node, .. } => has_bracket_range(node),
+        _ => false,
     }
 }

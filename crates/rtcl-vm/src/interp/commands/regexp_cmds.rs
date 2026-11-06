@@ -1360,6 +1360,32 @@ fn about_valid_bre_bound(b: &[u8], i: usize) -> Option<usize> {
     Some(j + 2)
 }
 
+/// 字符类里出现反斜杠（任意方言）→ REG_UBBS。`***=` 字面模式除外。
+fn pattern_has_class_backslash(pat: &str) -> bool {
+    if pat.starts_with("***=") {
+        return false;
+    }
+    let b = pat.as_bytes();
+    let mut in_class = false;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'[' if !in_class => {
+                in_class = true;
+                i += 1;
+            }
+            b']' if in_class => {
+                in_class = false;
+                i += 1;
+            }
+            b'\\' if in_class => return true,
+            b'\\' => i += 2,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// 扫描 pattern（跳过前缀/字符类/转义）收集 -about 语法位。
 fn about_lex(pat: &str) -> AboutLex {
     let mut out = AboutLex::default();
@@ -1503,7 +1529,7 @@ fn about_lex(pat: &str) -> AboutLex {
 
 /// -about 的 REG_UEMPTYMATCH / REG_UIMPOSSIBLE / REG_USHORTEST：
 /// 用 Spencer parser 重新解析获得 subre 树（与命令实际引擎无关）。
-/// 返回 (可空, 不可命中, 根偏好 SHORTER)。
+/// 返回 (可空, 不可命中, 根偏好 SHORTER, 类内范围)。
 #[cfg(all(feature = "regexp-spencer", any(feature = "regexp", feature = "regexp-lite")))]
 fn engine_about_bits(
     _eng: &Engine,
@@ -1512,7 +1538,7 @@ fn engine_about_bits(
     expanded: bool,
     lineanchor: bool,
     linestop: bool,
-) -> (bool, bool, bool) {
+) -> (bool, bool, bool, bool) {
     match super::regexp_spencer::compile(
         pat,
         spencer_options(nocase, expanded, lineanchor, linestop),
@@ -1521,8 +1547,9 @@ fn engine_about_bits(
             super::regexp_spencer::ast::nullable_matchable(&p.tree),
             super::regexp_spencer::ast::impossible(&p.tree),
             p.flags.shorter,
+            super::regexp_spencer::ast::has_bracket_range(&p.tree),
         ),
-        Err(_) => (false, false, false),
+        Err(_) => (false, false, false, false),
     }
 }
 
@@ -1534,8 +1561,8 @@ fn engine_about_bits(
     _expanded: bool,
     _lineanchor: bool,
     _linestop: bool,
-) -> (bool, bool, bool) {
-    (false, false, false)
+) -> (bool, bool, bool, bool) {
+    (false, false, false, false)
 }
 
 /// `regexp ?switches? exp string ?matchVar? ?subMatchVar ...?`
@@ -1602,6 +1629,10 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             .map_err(|e| Error::runtime(e, ErrorCode::Generic))?;
         let nongreedy = pattern_is_nongreedy(pattern_str);
         let lex = about_lex(pattern_str);
+        let (empty_ok, impossible, shortest, bracket_range) = engine_about_bits(
+            &eng, pattern_str, nocase, expanded, lineanchor, linestop,
+        );
+        let ubbs = pattern_has_class_backslash(pattern_str);
         let mut flags: Vec<&str> = Vec::new();
         // 输出顺序与 tclsh 的 re_info 位序一致：
         // UBACKREF → ULOOKAHEAD → UBOUNDS → UBRACES → UPBOTCH →
@@ -1624,19 +1655,22 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if pattern_has_upbotch(pattern_str) {
             flags.push("REG_UPBOTCH");
         }
-        if pattern_is_nonposix(pattern_str, nongreedy) {
+        if ubbs {
+            flags.push("REG_UBBS");
+        }
+        if ubbs || pattern_is_nonposix(pattern_str, nongreedy) {
             flags.push("REG_UNONPOSIX");
         }
         if lex.unspec {
             flags.push("REG_UUNSPEC");
         }
+        if bracket_range {
+            flags.push("REG_UUNPORT");
+        }
         // -nocase 本身不置 ULOCALE；只有 Unicode 依赖的类才置。
         if pattern_uses_ulocale(pattern_str) {
             flags.push("REG_ULOCALE");
         }
-        let (empty_ok, impossible, shortest) = engine_about_bits(
-            &eng, pattern_str, nocase, expanded, lineanchor, linestop,
-        );
         // 不可命中的模式 tclsh 不再置 UEMPTYMATCH。
         if empty_ok && !impossible {
             flags.push("REG_UEMPTYMATCH");

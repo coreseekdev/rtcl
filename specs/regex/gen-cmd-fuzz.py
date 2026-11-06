@@ -16,9 +16,9 @@ import random, sys
 seed = int(sys.argv[1]) if len(sys.argv) > 1 else 20261107
 count = int(sys.argv[2]) if len(sys.argv) > 2 else 3500
 random.seed(seed)
-atoms = ["a","b",".","[ab]","[^a]","[a-c]",r"\d",r"\w",r"\s","(a)","(a|b)","(a*)","(a+)","a?","a*","a+","a{1,2}","^","$",r"\y",r"\m","(?=a)","(?:a)","(a)\\1","a*?",r"(a+?)(a*)","[[:alpha:]]"]
-texts = ["", "a", "aa", "ab", "abc", "a\nb", " a ", "A", "1", "abab", "ba", "a b", "xa", "\n", "aaa", "a1b2", "\u00e9a", "ab\ncd"]
-specs = ["X", "&", r"\1", r"[\1]", r"\0", r"\&", r"\\", "pre&post", r"\1\1", "", "a\\b"]
+atoms = ["a","b",".","[ab]","[^a]","[a-c]",r"\d",r"\w",r"\s","(a)","(a|b)","(a*)","(a+)","a?","a*","a+","a{1,2}","a{0,2}","^","$",r"\y",r"\m",r"\M",r"\Y","(?=a)","(?:a)","(a)\\1","a*?",r"(a+?)(a*)","[[:alpha:]]","[[:digit:]]","[^a-c]","()","(a|)","a|b",r"\A",r"\Z"]
+texts = ["", "a", "aa", "ab", "abc", "a\nb", " a ", "A", "1", "abab", "ba", "a b", "xa", "\n", "aaa", "a1b2", "\u00e9a", "ab\ncd", "A1", "a\tb", "\u00e9", "\r\n", "abc\n", "()"]
+specs = ["X", "&", r"\1", r"[\1]", r"\0", r"\&", r"\\", "pre&post", r"\1\1", "", "a\\b", r"\2", r"&\1", r"x\1y"]
 def pat():
     n=random.randint(1,4)
     p="".join(random.choice(atoms) for _ in range(n))

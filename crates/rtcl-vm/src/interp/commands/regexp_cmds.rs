@@ -1030,9 +1030,11 @@ fn collect_matches(
     char_len: usize,
     char_start: usize,
     all: bool,
+    include_end: bool,
 ) -> Vec<GroupRanges> {
     let mut out: Vec<GroupRanges> = Vec::new();
-    if char_start > char_len {
+    // regsub 的 -start 越过串尾时不执行（tclsh：原样返回）。
+    if include_end && char_start > char_len {
         return out;
     }
     if !all {
@@ -1041,18 +1043,25 @@ fn collect_matches(
         }
         return out;
     }
-    if char_len == 0 {
-        if let Some(groups) = attempt(0) {
-            out.push(groups);
-        }
-        return out;
-    }
+    // regsub -all 的循环是 offset <= length（非空匹配到串尾后仍会
+    // 再尝试一次空匹配）；regexp -all 只在首个位置允许 offset==length。
     let mut p = char_start;
     // 匹配端点单调递增：用游标增量换算字节→字符，避免每个匹配都
     // O(n) 重扫前缀（-all 密集匹配的 1 MiB 性能瓶颈）。
     let mut cursor_byte = char_to_byte(full, char_start);
     let mut cursor_char = char_start;
-    while p < char_len {
+    let mut first = true;
+    loop {
+        if !first {
+            if include_end {
+                if p > char_len {
+                    break;
+                }
+            } else if p >= char_len {
+                break;
+            }
+        }
+        first = false;
         match attempt(p) {
             Some(groups) => {
                 let (s, e) = groups[0].unwrap_or((0, 0));
@@ -1686,11 +1695,19 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // `\A` 绑定每次尝试的搜索起点：非 -all 只尝试 -start（故
     // `-start 1 {\Aa} aba` → 0）；-all 每次向后推进时，新起点成为
     // 虚拟串首（tclsh 16.4：`regsub -all {\A(\w)}` 逐字符替换）。
+    // -start 越过串尾时 tclsh 在“虚拟空串”上匹配并保留原偏移
+    //（`-start 9 {$} ba` → 索引 9 8），故按串尾执行并给索引加 delta。
+    let virtual_start = char_start > char_len;
+    let effective_start = char_start.min(char_len);
+    let index_delta = (char_start - effective_start) as i64;
     let mut char_cache = CharCache::new();
     let attempt = |p: usize| -> Option<GroupRanges> {
-        engine_attempt(&eng, full_string, p, p, &mut char_cache)
+        // 越过串尾的 -start 把原偏移作为虚拟搜索起点（\A 命中串尾，
+        // 词断言/^ 看不到串尾之前的字符）。
+        let ss = if virtual_start { char_start } else { p };
+        engine_attempt(&eng, full_string, p, ss, &mut char_cache)
     };
-    let matches = collect_matches(full_string, attempt, char_len, char_start, all);
+    let matches = collect_matches(full_string, attempt, char_len, effective_start, all, false);
 
     // Build a per-match list element: the group's text, or its
     // inclusive `start end` index pair under -indices.
@@ -1700,8 +1717,8 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 if indices {
                     Value::from_str(&format!(
                         "{} {}",
-                        byte_to_char(full_string, s),
-                        byte_to_char(full_string, e) as i64 - 1
+                        byte_to_char(full_string, s) as i64 + index_delta,
+                        byte_to_char(full_string, e) as i64 - 1 + index_delta
                     ))
                 } else {
                     Value::from_str(&full_string[s..e])
@@ -1731,14 +1748,14 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if all {
         // -all: return count of matches; set vars to last match
         if let Some(last) = matches.last() {
-            set_match_var_groups(interp, last, var_args, indices, full_string)?;
+            set_match_var_groups(interp, last, var_args, indices, full_string, index_delta)?;
         }
         return Ok(Value::from_int(matches.len() as i64));
     }
 
     // Normal mode: match vars are only assigned on a successful match.
     if let Some(groups) = matches.first() {
-        set_match_var_groups(interp, groups, var_args, indices, full_string)?;
+        set_match_var_groups(interp, groups, var_args, indices, full_string, index_delta)?;
         Ok(Value::from_int(1))
     } else {
         Ok(Value::from_int(0))
@@ -1753,6 +1770,7 @@ fn set_match_var_groups(
     var_args: &[Value],
     indices: bool,
     full: &str,
+    index_delta: i64,
 ) -> Result<()> {
     for (vi, var) in var_args.iter().enumerate() {
         match groups.get(vi).and_then(|g| *g) {
@@ -1762,8 +1780,8 @@ fn set_match_var_groups(
                         var.as_str(),
                         Value::from_str(&format!(
                             "{} {}",
-                            byte_to_char(full, s),
-                            byte_to_char(full, e) as i64 - 1
+                            byte_to_char(full, s) as i64 + index_delta,
+                            byte_to_char(full, e) as i64 - 1 + index_delta
                         )),
                     )?;
                 } else {
@@ -1860,7 +1878,7 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let attempt = |p: usize| -> Option<GroupRanges> {
         engine_attempt(&eng, full_string, p, p, &mut char_cache)
     };
-    let matches = collect_matches(full_string, attempt, char_len, char_start, all);
+    let matches = collect_matches(full_string, attempt, char_len, char_start, all, true);
 
     let mut result = String::from(&full_string[..byte_start]);
     let mut last = byte_start;

@@ -41,3 +41,17 @@ for f in specs/regex/dialect-probes.tcl specs/regex/about-probes.tcl; do
         diff "/tmp/rtcl-regex-$base-o.txt" "/tmp/rtcl-regex-$base-r.txt" | head -20
     fi
 done
+
+# regexp/regsub 命令面随机差分（3500 例，含 -start/-all/-indices/
+# match vars/regsub 替换串）。
+if command -v python3 >/dev/null 2>&1; then
+    python3 specs/regex/gen-cmd-fuzz.py > /tmp/rtcl-regex-cmdfuzz.tcl
+    tclsh /tmp/rtcl-regex-cmdfuzz.tcl > /tmp/rtcl-regex-cmdfuzz-o.txt 2>&1
+    "$RTCL" -f /tmp/rtcl-regex-cmdfuzz.tcl > /tmp/rtcl-regex-cmdfuzz-r.txt 2>&1
+    if diff -q /tmp/rtcl-regex-cmdfuzz-o.txt /tmp/rtcl-regex-cmdfuzz-r.txt >/dev/null; then
+        echo "== cmd-fuzz: diff=0 =="
+    else
+        echo "== cmd-fuzz: DIFF =="
+        diff /tmp/rtcl-regex-cmdfuzz-o.txt /tmp/rtcl-regex-cmdfuzz-r.txt | head -20
+    fi
+fi

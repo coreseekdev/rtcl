@@ -249,4 +249,24 @@ mod tests {
         // BRE 里 (?...) 全是普通字符（tclsh 实测能编译、不匹配）。
         assert_eq!(m_mode("(?b)(?i)a", "a", Options::default()), None);
     }
+
+    fn find_ss(pat: &str, text: &str, from: usize) -> Option<(usize, usize)> {
+        let prog = compile(pat, Options::default()).unwrap();
+        let chars: Vec<char> = text.chars().collect();
+        matcher::find_from(&prog, &chars, from, from).map(|m| (m.start, m.end))
+    }
+
+    #[test]
+    fn start_slice_assertion_context() {
+        // -start 起点是虚拟串首：词断言看不到前一个字符。
+        assert_eq!(find_ss(r"\y", "ab", 1), Some((1, 1)));
+        assert_eq!(find_ss(r"\m", "ab", 1), Some((1, 1)));
+        assert_eq!(find_ss(r"\M", "ab", 1), Some((2, 2)));
+        assert_eq!(find_ss(r"\Y", "ab", 1), None);
+        // `^` 非 newline 模式通常锚绝对串首，但在切片起点且前一个
+        // 字符为换行时 tclsh 允许命中。
+        assert_eq!(find_ss("^", "\na", 1), Some((1, 1)));
+        assert_eq!(find_ss("^", "ba", 1), None);
+        assert_eq!(find_ss(r"\A", "ba", 1), Some((1, 1)));
+    }
 }

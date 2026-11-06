@@ -175,10 +175,20 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   -regexp`/`lsort -regexp`/switch 等 `engine_is_match` 消费者同步。
   默认特征并入 `rtcl_std`；`RTCL_REGEX_ENGINE=fast` 可退回旧
   fast/BT 路径做差分。门禁：judge 88/88、probes 失败集与基线逐项
-  相同（111 个存量非正则项）、4000+759 捕获 0 差异、单元测试 9/9。
+  相同（111 个存量非正则项）、4000+759 捕获 0 差异、单元测试 10/10。
+- **`-start` 切片语义（命令级，tclsh 实测）**：搜索起点是虚拟串首——
+  `\A` 在起点命中；词断言（`\y\m\M\Y`）在起点看不到前一个字符
+  （`-start 1 {\m}` 对 "ab" 命中、`\M` 要到串尾）；非 `-lineanchor`
+  的 `^` 在起点且前一字符为换行时也命中；`$`/`\Z` 仍锚原串尾。
+  `regexp -all` 首位置允许 offset==length，后续仅在串内继续；
+  `regsub` 的循环是 offset<=length（非空匹配到串尾后仍补一次空
+  匹配），且 `-start` 越过串尾时不执行。`regexp -start` 越过串尾按
+  虚拟空串匹配并保留原偏移（`-start 9 {$} ba` → 索引 `9 8`）。
+  验证：3500 例命令面随机语料（开关组合/match vars/regsub 替换串）
+  **0 差异**（`specs/regex/gen-cmd-fuzz.py`）。
 - 验证命令：
   `cargo test -p rtcl-vm --lib --features regexp,regexp-spencer regexp_spencer`
-  （9/9）；`specs/tclmem.sh 'python3 specs/regex/spencer-overall.py'`
+  （10/10）；`specs/tclmem.sh 'python3 specs/regex/spencer-overall.py'`
   （4000/4000）；`specs/regex/dialect-probes.tcl` + `judge/run.sh`。
 
 ## 8. 性能结构（Rust 版）

@@ -491,25 +491,36 @@ fn word_at(text: &[char], pos: usize) -> bool {
 }
 
 pub(crate) fn assert_ok(k: AssertKind, pos: usize, text: &[char], search_start: usize) -> bool {
+    // Tcl 的 -start 语义把搜索起点当虚拟串首：其前一个字符只用于
+    // 判断 `^` 是否处于行首，词断言看不到它（\y/\m/\M/\Y 视为串首）。
+    let prev_word = pos > search_start && word_at(text, pos - 1);
     match k {
-        // `^`（非 newline 模式）锚绝对串首；`\A` 锚 -start 偏移
-        // （tclsh 把搜索起点当虚拟串首）。
-        AssertKind::Bos => pos == 0,
-        AssertKind::Bot => pos == search_start,
+        // `^`（非 newline 模式）锚绝对串首；-start 起点的前一个字符
+        // 恰为换行时，tclsh 也允许在起点命中（切片起点视为行首）。
+        AssertKind::Bos => {
+            search_start <= text.len()
+                && (pos == 0
+                    || (pos == search_start
+                        && search_start > 0
+                        && text.get(search_start - 1) == Some(&'\n')))
+        }
+        AssertKind::Bot => {
+            // -start 越过串尾时按“虚拟空串”处理：\A 在串尾命中。
+            pos == search_start
+                || (search_start > text.len() && pos == text.len())
+        }
         AssertKind::Eos => pos == text.len(),
         AssertKind::Bol => pos == 0 || text.get(pos - 1) == Some(&'\n'),
         AssertKind::Eol => pos == text.len() || text.get(pos) == Some(&'\n'),
-        AssertKind::WordStart => word_at(text, pos) && (pos == 0 || !word_at(text, pos - 1)),
-        AssertKind::WordEnd => pos > 0 && word_at(text, pos - 1) && !word_at(text, pos),
+        AssertKind::WordStart => word_at(text, pos) && !prev_word,
+        AssertKind::WordEnd => prev_word && !word_at(text, pos),
         AssertKind::WordB => {
-            let before = pos > 0 && word_at(text, pos - 1);
             let after = word_at(text, pos);
-            before != after
+            prev_word != after
         }
         AssertKind::NotWordB => {
-            let before = pos > 0 && word_at(text, pos - 1);
             let after = word_at(text, pos);
-            before == after
+            prev_word == after
         }
     }
 }

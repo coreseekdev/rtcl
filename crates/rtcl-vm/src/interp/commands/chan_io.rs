@@ -195,12 +195,13 @@ pub fn cmd_read(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if let Some(t) = &transform {
         if t.methods.iter().any(|m| m == "read") {
             let want = count.unwrap_or(4096).max(0) as usize;
+            let enc = chan_encoding(interp, chan_id);
             let raw = {
                 let ch = interp.channels.get_mut(chan_id).unwrap();
                 if want == 0 {
                     String::new()
                 } else {
-                    crate::channel::channel_read_chars(ch.as_mut(), want).map_err(io_err)?
+                    crate::channel::channel_read_chars_enc(ch.as_mut(), want, &enc).map_err(io_err)?
                 }
             };
             let mut data = transform_through_read(interp, t, &raw)?;
@@ -214,6 +215,7 @@ pub fn cmd_read(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
+    let enc = chan_encoding(interp, chan_id);
     let ch = interp.channels.get_mut(chan_id).unwrap();
 
     if !ch.is_readable() {
@@ -221,11 +223,12 @@ pub fn cmd_read(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     if let Some(count) = count {
-        let s = crate::channel::channel_read_chars(ch.as_mut(), count as usize).map_err(io_err)?;
+        let s = crate::channel::channel_read_chars_enc(ch.as_mut(), count as usize, &enc)
+            .map_err(io_err)?;
         Ok(Value::from_str(&s))
     } else {
         // read channelId  (read all)
-        let mut s = ch.read_all().map_err(io_err)?;
+        let mut s = crate::channel::channel_read_all(ch.as_mut(), &enc).map_err(io_err)?;
         if nonewline && s.ends_with('\n') {
             s.pop();
             if s.ends_with('\r') { s.pop(); }
@@ -260,9 +263,10 @@ pub fn cmd_gets(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let transform = interp.transforms.get(chan_id).cloned();
     if let Some(t) = &transform {
         if t.methods.iter().any(|m| m == "read") {
+            let enc = chan_encoding(interp, chan_id);
             let line = {
                 let ch = interp.channels.get_mut(chan_id).unwrap();
-                ch.read_line().map_err(io_err)?
+                crate::channel::channel_read_line(ch.as_mut(), &enc).map_err(io_err)?
             };
             let line = match line {
                 Some(s) => Some(transform_through_read(interp, t, &s)?),
@@ -272,13 +276,14 @@ pub fn cmd_gets(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
+    let enc = chan_encoding(interp, chan_id);
     let ch = interp.channels.get_mut(chan_id).unwrap();
 
     if !ch.is_readable() {
         return Err(not_opened(interp, chan_id, true));
     }
 
-    let line = ch.read_line().map_err(io_err)?;
+    let line = crate::channel::channel_read_line(ch.as_mut(), &enc).map_err(io_err)?;
     finish_gets(interp, args, line.as_deref())
 }
 
@@ -416,6 +421,15 @@ pub fn cmd_fblocked(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Reads are synchronous/blocking, so a channel is only "blocked" while
     // a non-blocking read left data pending — never the case here.
     Ok(Value::from_bool(false))
+}
+
+/// 通道当前 `-encoding`（D-29 转码）。
+fn chan_encoding(interp: &Interp, chan_id: &str) -> String {
+    interp
+        .channels
+        .config(chan_id)
+        .map(|c| c.encoding.clone())
+        .unwrap_or_else(|| "utf-8".to_string())
 }
 
 // ---------- fconfigure ----------
@@ -603,8 +617,9 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         } else {
             None
         };
-        // D-29：-encoding 值在 cfg 借用前校验（tclsh：unknown encoding）。
-        if opt == "-encoding" && !super::io::encoding_known(val) {
+        // D-29：-encoding 值在 cfg 借用前校验（tclsh：unknown encoding；
+        // 通道另收 `binary` 特名）。
+        if opt == "-encoding" && !crate::encoding::known_for_channel(val) {
             super::list::set_error_code(
                 interp,
                 &format!("TCL LOOKUP ENCODING {}", val),
@@ -676,7 +691,12 @@ let cfg = interp.channels.config_mut(chan_id).unwrap();
                     "lf" => crate::channel::TranslationMode::Lf,
                     "crlf" => crate::channel::TranslationMode::CrLf,
                     "cr" => crate::channel::TranslationMode::Cr,
-                    "binary" => crate::channel::TranslationMode::Binary,
+                    "binary" => {
+                        // tclsh：-translation binary == -translation lf +
+                        // -encoding binary（查询显示 lf）。
+                        cfg.encoding = "binary".to_string();
+                        crate::channel::TranslationMode::Lf
+                    }
                     _ => {
                         super::list::set_error_code(interp, "NONE");
                         return Err(super::list::tcl_err(
@@ -1390,9 +1410,10 @@ fn chan_copy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if want == 0 {
             break;
         }
+        let enc_from = chan_encoding(interp, &from);
         let chunk = {
             let ch = interp.channels.get_mut(&from).unwrap();
-            crate::channel::channel_read_chars(ch.as_mut(), want)
+            crate::channel::channel_read_chars_enc(ch.as_mut(), want, &enc_from)
         };
         let chunk = match chunk {
             Ok(c) if c.is_empty() => break,
@@ -1406,8 +1427,9 @@ fn chan_copy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         };
         let n = chunk.len() as i64;
         {
+            let enc_to = chan_encoding(interp, &to);
             let ch = interp.channels.get_mut(&to).unwrap();
-            if let Err(e) = crate::channel::channel_write_str(ch.as_mut(), &chunk) {
+            if let Err(e) = crate::channel::channel_write_str_enc(ch.as_mut(), &chunk, &enc_to) {
                 return Err(Error::runtime(
                     format!("error writing \"{}\": {}", to, e),
                     crate::error::ErrorCode::Io,

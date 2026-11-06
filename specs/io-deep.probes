@@ -20,3 +20,20 @@ catch {fileevent stdout readable {}} m; puts $m
 close [open /tmp/rt_s w]; file stat /tmp/rt_s a; puts [lsort [array names a]]
 set f [open /tmp/rt_io6 w]; puts $f x; close $f; set f [open /tmp/rt_io6 r]; gets $f; seek $f 0 current; puts [tell $f]
 catch {open /tmp/rt_io7 {RDONLY}} m; puts $m
+# ── D-29 编码宽表 + 通道转码（2026-11-06 实测钉形）──
+puts [llength [encoding names]]
+puts [encoding system]
+puts [encoding convertto iso8859-1 "é"]
+puts [encoding convertfrom utf-8 [encoding convertto utf-8 "中文"]]
+puts [encoding convertto cp1252 "€"]
+puts [encoding convertfrom shiftjis [encoding convertto shiftjis "あ"]]
+puts [encoding convertto gb2312 [encoding convertfrom gb2312 "中"]]
+catch {encoding convertto UTF-8 A} m ; puts $m
+catch {encoding convertto bogus A} m o ; puts "$m|[dict get $o -errorcode]"
+set f [open /tmp/rt_enc1.txt w] ; fconfigure $f -encoding iso8859-1 ; puts -nonewline $f "é" ; close $f ; set f [open /tmp/rt_enc1.txt r] ; fconfigure $f -encoding iso8859-1 ; set s [read $f] ; close $f ; puts "[string length $s]|[scan $s %c]" ; file delete /tmp/rt_enc1.txt
+set f [open /tmp/rt_enc2.txt w] ; fconfigure $f -translation binary ; puts "e=[fconfigure $f -encoding] t=[fconfigure $f -translation]" ; close $f ; file delete /tmp/rt_enc2.txt
+set f [open /tmp/rt_enc3.txt w] ; fconfigure $f -encoding binary ; puts -nonewline $f [encoding convertfrom utf-8 "é"] ; close $f ; set f [open /tmp/rt_enc3.txt r] ; fconfigure $f -encoding binary ; set s [read $f] ; close $f ; puts [string length $s] ; file delete /tmp/rt_enc3.txt
+set f [open /tmp/rt_enc4.txt w] ; fconfigure $f -encoding shiftjis ; puts $f "あい" ; puts $f "う" ; close $f ; set f [open /tmp/rt_enc4.txt r] ; fconfigure $f -encoding shiftjis ; set a [gets $f] ; set b [gets $f] ; close $f ; puts "$a|$b" ; file delete /tmp/rt_enc4.txt
+set f [open /tmp/rt_enc5.txt w] ; fconfigure $f -encoding binary ; puts -nonewline $f [binary format H* ffe9] ; close $f ; set f [open /tmp/rt_enc5.txt r] ; set s [read $f] ; close $f ; puts "[string length $s]|[scan $s %c]" ; file delete /tmp/rt_enc5.txt
+encoding system iso8859-1 ; set f [open /tmp/rt_enc6.txt w] ; puts [fconfigure $f -encoding] ; close $f ; encoding system utf-8 ; file delete /tmp/rt_enc6.txt
+set f [open /tmp/rt_enc7.txt w] ; fconfigure $f -encoding unicode ; puts -nonewline $f "AB" ; close $f ; set f [open /tmp/rt_enc7.txt r] ; fconfigure $f -encoding binary ; set s [read $f] ; close $f ; puts [string length $s] ; file delete /tmp/rt_enc7.txt

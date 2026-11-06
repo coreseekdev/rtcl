@@ -47,9 +47,18 @@ pub trait Channel: Send {
     fn pids(&self) -> Vec<u32> { vec![] }
 }
 
-/// Extension: write a full string, delegates to `write_bytes`.
-pub(crate) fn channel_write_str(ch: &mut dyn Channel, s: &str) -> io::Result<()> {
-    let bytes = s.as_bytes();
+/// Extension: write a full string through `enc`（通道 `-encoding`）。
+pub(crate) fn channel_write_str_enc(
+    ch: &mut dyn Channel,
+    s: &str,
+    enc: &str,
+) -> io::Result<()> {
+    let encoded = if enc == "utf-8" {
+        s.as_bytes().to_vec()
+    } else {
+        crate::encoding::encode(s, enc)
+    };
+    let bytes = &encoded[..];
     let mut offset = 0;
     while offset < bytes.len() {
         let n = ch.write_bytes(&bytes[offset..])?;
@@ -61,16 +70,113 @@ pub(crate) fn channel_write_str(ch: &mut dyn Channel, s: &str) -> io::Result<()>
     Ok(())
 }
 
-/// Extension: read exactly `count` chars (UTF-8 bytes) and return as String.
+/// 默认（UTF-8）写串，保留旧调用点。
+pub(crate) fn channel_write_str(ch: &mut dyn Channel, s: &str) -> io::Result<()> {
+    channel_write_str_enc(ch, s, "utf-8")
+}
+
+/// 按 `enc` 读一整行（gets 用）。
+pub(crate) fn channel_read_line(
+    ch: &mut dyn Channel,
+    enc: &str,
+) -> io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut saw = false;
+    let mut b = [0u8; 1];
+    loop {
+        let n = ch.read_bytes(&mut b)?;
+        if n == 0 {
+            break;
+        }
+        saw = true;
+        if b[0] == b'\n' {
+            break;
+        }
+        buf.push(b[0]);
+    }
+    if !saw {
+        return Ok(None);
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Ok(Some(crate::encoding::decode(&buf, enc)))
+}
+
+/// 按 `enc` 读到 EOF（read 无数量用）。
+pub(crate) fn channel_read_all(ch: &mut dyn Channel, enc: &str) -> io::Result<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = ch.read_bytes(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(crate::encoding::decode(&buf, enc))
+}
+
+/// Extension: read exactly `count` chars and return as String (UTF-8).
 pub(crate) fn channel_read_chars(ch: &mut dyn Channel, count: usize) -> io::Result<String> {
-    // D-30：count 是**字符数**（原按字节读 + lossy——多字节文本短读）；
-    // 逐字节增量解码（UTF-8 不完整尾继续读、无效序列按 lossy 单字符
-    // 计）。count=0 不触碰 at_eof（tclsh：read ch 0 不置 EOF）。
+    channel_read_chars_enc(ch, count, "utf-8")
+}
+
+/// 按 `enc` 读 `count` 个**字符**（D-30/D-29）。
+pub(crate) fn channel_read_chars_enc(
+    ch: &mut dyn Channel,
+    count: usize,
+    enc: &str,
+) -> io::Result<String> {
+    // D-30：count 是**字符数**；D-29：按通道 `-encoding` 转码。
+    // count=0 不触碰 at_eof（tclsh：read ch 0 不置 EOF）。
     if count == 0 {
         return Ok(String::new());
     }
+    match enc {
+        "utf-8" => read_chars_utf8(ch, count),
+        "ascii" | "iso8859-1" | "identity" | "binary" => {
+            // 单字节编码：逐字节直映（一个字节一个字符）。
+            let mut out = String::new();
+            let mut byte = [0u8; 1];
+            while out.chars().count() < count {
+                let n = ch.read_bytes(&mut byte)?;
+                if n == 0 {
+                    break;
+                }
+                out.push(byte[0] as char);
+            }
+            Ok(out)
+        }
+        "unicode" => {
+            // UCS-2LE：两字节一字符；EOF 的奇尾字节 → U+FFFD。
+            let mut out = String::new();
+            let mut byte = [0u8; 1];
+            while out.chars().count() < count {
+                let n = ch.read_bytes(&mut byte)?;
+                if n == 0 {
+                    break;
+                }
+                let lo = byte[0] as u32;
+                let n2 = ch.read_bytes(&mut byte)?;
+                if n2 == 0 {
+                    out.push('\u{FFFD}');
+                    break;
+                }
+                let u = lo | ((byte[0] as u32) << 8);
+                out.push(char::from_u32(u).unwrap_or('\u{FFFD}'));
+            }
+            Ok(out)
+        }
+        _ => read_chars_iconv(ch, count, enc),
+    }
+}
+
+/// UTF-8 通道解码：Tcl 的 modified-UTF-8（无效字节按字节值出字符；
+/// EOF 截断尾同样按字节值逐个出字符）。
+fn read_chars_utf8(ch: &mut dyn Channel, count: usize) -> io::Result<String> {
     let mut out: Vec<u8> = Vec::new();
-    let mut pending = 0usize; // out 中未完成字符的起始字节
+    let mut pending = 0usize;
     let mut chars = 0usize;
     let mut byte = [0u8; 1];
     while chars < count {
@@ -86,17 +192,82 @@ pub(crate) fn channel_read_chars(ch: &mut dyn Channel, count: usize) -> io::Resu
                     pending = out.len();
                     break;
                 }
-                Err(e) if e.error_len().is_none() => break, // 还差字节
-                Err(_) => {
-                    // 无效序列：lossy 替换符按 1 字符计，丢弃该字节。
-                    chars += 1;
-                    pending = out.len();
-                    break;
+                Err(e) if e.error_len().is_none() => break,
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        // SAFETY: 前缀已由 from_utf8 确认合法。
+                        chars += unsafe {
+                            std::str::from_utf8_unchecked(&out[pending..pending + valid])
+                        }
+                        .chars()
+                        .count();
+                        pending += valid;
+                    } else {
+                        // 无效字节：按字节值出一个字符。
+                        chars += 1;
+                        pending += 1;
+                    }
                 }
             }
         }
     }
-    Ok(String::from_utf8_lossy(&out).into_owned())
+    Ok(crate::encoding::decode(&out, "utf-8"))
+}
+
+/// iconv 后端的多字节通道解码：逐字节喂入，不完整序列继续读；
+/// EOF 时剩余字节按字节值出字符（Tcl 语义）。
+fn read_chars_iconv(ch: &mut dyn Channel, count: usize, enc: &str) -> io::Result<String> {
+    #[cfg(unix)]
+    {
+        let mut pending: Vec<u8> = Vec::new();
+        let mut out = String::new();
+        let mut chars = 0usize;
+        let mut byte = [0u8; 1];
+        let mut eof = false;
+        while chars < count {
+            let n = ch.read_bytes(&mut byte)?;
+            if n == 0 {
+                eof = true;
+            } else {
+                pending.push(byte[0]);
+            }
+            loop {
+                match crate::encoding::iconv_decode_step(&pending, enc) {
+                    Some((text, consumed)) => {
+                        let nchars = text.chars().count();
+                        out.push_str(&text);
+                        chars += nchars;
+                        pending.drain(..consumed);
+                        if nchars == 0 || chars >= count || pending.is_empty() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            if eof {
+                for &b in &pending {
+                    out.push(b as char);
+                }
+                break;
+            }
+        }
+        Ok(out)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut out = String::new();
+        let mut byte = [0u8; 1];
+        while out.chars().count() < count {
+            let n = ch.read_bytes(&mut byte)?;
+            if n == 0 {
+                break;
+            }
+            out.push(byte[0] as char);
+        }
+        Ok(out)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -165,6 +336,10 @@ impl Default for ChannelConfig {
 pub struct ChannelTable {
     channels: HashMap<ChannelId, Box<dyn Channel>>,
     configs: HashMap<ChannelId, ChannelConfig>,
+    /// 系统编码（`encoding system`）：新开通道的默认 `-encoding`。
+    pub system_encoding: String,
+    /// `encoding dirs` 的值。
+    pub encoding_dirs: String,
     next_id: u32,
     /// Registration order of live channels (`chan names` is not sorted —
     /// tclsh reports channels in creation order).
@@ -186,6 +361,10 @@ impl ChannelTable {
         let mut table = ChannelTable {
             channels: HashMap::new(),
             configs: HashMap::new(),
+            system_encoding: "utf-8".to_string(),
+            encoding_dirs: std::env::var("TCL_LIBRARY")
+                .map(|p| format!("{}/encoding", p))
+                .unwrap_or_else(|_| "/usr/share/tcltk/tcl8.6/encoding".to_string()),
             next_id: 1,
             order: Vec::new(),
             refl_counter: 0,
@@ -260,6 +439,7 @@ impl ChannelTable {
             } else {
                 crate::channel::TranslationMode::Lf
             },
+            encoding: self.system_encoding.clone(),
             ..ChannelConfig::default()
         });
         Ok(id)
@@ -267,7 +447,11 @@ impl ChannelTable {
 
     /// Register a channel with a specific ID (used for pipe channels from exec).
     pub fn register(&mut self, id: ChannelId, channel: Box<dyn Channel>) {
-        self.configs.entry(id.clone()).or_default();
+        let sys = self.system_encoding.clone();
+        self.configs.entry(id.clone()).or_insert_with(|| ChannelConfig {
+            encoding: sys,
+            ..ChannelConfig::default()
+        });
         self.track(id.clone());
         self.channels.insert(id, channel);
     }

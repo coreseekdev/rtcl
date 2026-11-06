@@ -90,6 +90,11 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let newline = if nonewline { String::new() } else { "\n".to_string() };
         let out = if newline.is_empty() { out } else { format!("{}{}", out, newline) };
 
+        let enc = interp
+            .channels
+            .config(chan_id)
+            .map(|c| c.encoding.clone())
+            .unwrap_or_else(|| "utf-8".to_string());
         let ch = interp.channels.get_mut(chan_id)
             .ok_or_else(|| Error::runtime(
                 format!("can not find channel named \"{}\"", chan_id),
@@ -99,7 +104,7 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             return Err(chan_io::not_opened(interp, chan_id, false));
         }
 
-        crate::channel::channel_write_str(ch.as_mut(), &out).map_err(|e| Error::runtime(
+        crate::channel::channel_write_str_enc(ch.as_mut(), &out, &enc).map_err(|e| Error::runtime(
             format!("error writing \"{}\": {}", chan_id, e),
             crate::error::ErrorCode::Io,
         ))?;
@@ -2198,47 +2203,23 @@ mod tests {
 }
 
 
-// ── encoding 命令（D-29）────────────────────────────────────────────
-
-/// rtcl 支持的编码集（tclsh 8.6 有 90+——子集分歧记台账）。
-pub(crate) const ENCODINGS: &[&str] = &[
-    "ascii", "binary", "identity", "iso8859-1", "utf-8",
-];
+// ── encoding 命令（D-29 宽表）──────────────────────────────────────
 
 pub(crate) fn encoding_known(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    ENCODINGS.iter().any(|e| *e == n)
+    crate::encoding::known_for_channel(name)
 }
 
-/// 字节串 ↔ 字符串的双向转换（rtcl 的 String 值以 char 承载字节）。
-fn enc_decode(name: &str, data: &str) -> String {
-    match name {
-        "utf-8" | "identity" => data.to_string(),
-        "ascii" => data.chars().map(|c| {
-            if (c as u32) < 128 { c } else { '?' }
-        }).collect(),
-        // iso8859-1 / binary：char ↔ 字节直映（cp1252 差异记台账）。
-        _ => data.chars().map(|c| {
-            let u = c as u32;
-            if u < 256 { c } else { '?' }
-        }).collect(),
-    }
+/// 字节串（每字符一字节）→ Vec<u8>。
+fn byte_str_to_bytes(data: &str) -> Vec<u8> {
+    data.chars().map(|c| (c as u32 & 0xFF) as u8).collect()
 }
 
-fn enc_encode(name: &str, text: &str) -> String {
-    match name {
-        "utf-8" | "identity" => text.to_string(),
-        "ascii" => text.chars().map(|c| {
-            if (c as u32) < 128 { c } else { '?' }
-        }).collect(),
-        _ => text.chars().map(|c| {
-            let u = c as u32;
-            if u < 256 { c } else { '?' }
-        }).collect(),
-    }
+/// Vec<u8> → 字节串（每字节一个 0..255 的字符）。
+fn bytes_to_byte_str(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
 }
 
-pub fn cmd_encoding(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_encoding(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage(
             "encoding", 2, args.len(),
@@ -2270,38 +2251,71 @@ pub fn cmd_encoding(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
     match resolve(args[1].as_str())? {
         "names" => Ok(Value::from_list(
-            &ENCODINGS.iter().map(|e| Value::from_str(e)).collect::<Vec<_>>(),
+            &crate::encoding::NAMES
+                .iter()
+                .map(|e| Value::from_str(e))
+                .collect::<Vec<_>>(),
         )),
         "system" => {
+            if args.len() > 3 {
+                return Err(Error::wrong_args_with_usage(
+                    "encoding system", 2, args.len(), "?encodingName?",
+                ));
+            }
             if args.len() == 3 {
                 let name = args[2].as_str();
-                if !encoding_known(name) {
+                if !crate::encoding::known(name) {
+                    super::list::set_error_code(
+                        interp,
+                        &format!("TCL LOOKUP ENCODING {}", name),
+                    );
                     return Err(Error::Msg(format!("unknown encoding \"{}\"", name)));
                 }
+                interp.channels.system_encoding = name.to_string();
                 return Ok(Value::empty());
             }
-            Ok(Value::from_str("utf-8"))
+            Ok(Value::from_str(&interp.channels.system_encoding.clone()))
+        }
+        "dirs" => {
+            if args.len() > 3 {
+                return Err(Error::wrong_args_with_usage(
+                    "encoding dirs", 2, args.len(), "?dirList?",
+                ));
+            }
+            if args.len() == 3 {
+                interp.channels.encoding_dirs = args[2].as_str().to_string();
+                return Ok(Value::empty());
+            }
+            Ok(Value::from_list(&[Value::from_str(
+                &interp.channels.encoding_dirs.clone(),
+            )]))
         }
         "convertfrom" | "convertto" => {
-            if args.len() < 3 || args.len() > 4 {
+            let from = args[1].as_str().ends_with("from");
+            if args.len() < 4 || args.len() > 4 {
                 return Err(Error::wrong_args_with_usage(
-                    if args[1].as_str().starts_with("conv") { "encoding convertfrom" } else { "encoding convertto" },
-                    3, args.len(),
+                    if from { "encoding convertfrom" } else { "encoding convertto" },
+                    4, args.len(),
                     "encodingName data",
                 ));
             }
-            let name = args[2].as_str().to_ascii_lowercase();
-            if !encoding_known(&name) {
+            let name = args[2].as_str();
+            if !crate::encoding::known(name) {
+                super::list::set_error_code(
+                    interp,
+                    &format!("TCL LOOKUP ENCODING {}", name),
+                );
                 return Err(Error::Msg(format!("unknown encoding \"{}\"", name)));
             }
-            let data = if args.len() == 4 { args[3].as_str() } else { "" };
-            Ok(Value::from_str(&if args[1].as_str().starts_with("conv") && args[1].as_str().ends_with("from") {
-                enc_decode(&name, data)
+            let data = args[3].as_str();
+            if from {
+                let bytes = byte_str_to_bytes(data);
+                Ok(Value::from_str(&crate::encoding::decode(&bytes, name)))
             } else {
-                enc_encode(&name, data)
-            }))
+                let bytes = crate::encoding::encode(data, name);
+                Ok(Value::from_str(&bytes_to_byte_str(&bytes)))
+            }
         }
-        "dirs" => Ok(Value::empty()),
         _ => unreachable!(),
     }
 }

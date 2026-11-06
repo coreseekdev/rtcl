@@ -29,6 +29,7 @@ pub mod types;
 pub mod interp;
 #[cfg(feature = "std")]
 pub mod channel;
+pub mod encoding;
 
 pub use error::{Error, Result, ErrorCode, ControlFlow};
 pub use value::Value;

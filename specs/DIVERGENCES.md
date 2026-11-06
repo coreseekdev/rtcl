@@ -322,10 +322,34 @@
   iso8859-1/utf-8（convertto/from 双向 + 不可编码字符 '?' 替换）；
   fconfigure -encoding 校验（unknown encoding "bogus" +
   TCL LOOKUP ENCODING）。
-- **残差**：tclsh 86+ 编码表的宽覆盖（rtcl 5 种——子集分歧记有意
-  扩展清单的对立面）；-encoding 的**实际转码**（通道读写仍按
-  UTF-8——fconfigure -encoding 存而校验不转码）；非 UTF-8 文件读。
-- **严重度**：已关闭主体（命令面/校验面）。
+- **D-29 收口（2026-11-06）**：**86 名宽表 + 通道实际转码**。
+  * `encoding names` 返回 tclsh 8.6 的**精确 86 名与顺序**；名字区分
+    大小写（`UTF-8` → `unknown encoding "UTF-8"` + TCL LOOKUP
+    ENCODING）。
+  * `convertfrom/convertto`：utf-8 用 Tcl 的 modified-UTF-8（无效/截断
+    字节按**字节值**出字符）；ascii/iso8859-1/identity 按字节直映，
+    编码不可表示 → `?`；identity 编码 = 内部 UTF-8 字节；binary 仅通道
+    特名（解码逐字节、编码取低字节）；unicode = UCS-2LE（>U+FFFF →
+    U+FFFD、奇尾 → U+FFFD）；其余经 libc iconv（SHIFT_JIS/GB2312/
+    BIG5/EUC-JP/EUC-KR/KOI8/CP8xx/CP12xx/ISO8859-*/ISO-2022-JP…），
+    解码非法字节按字节值继续、编码失败字符 → `?`，ISO-2022-JP 末尾补
+    `ESC ( B` 复位（tclsh 同）。
+  * `encoding system` 取/设（新通道默认 -encoding；既有通道不变）、
+    `encoding dirs` 取/设。
+  * **通道转码**：`-encoding` 实际作用于 `read ?n?` / `gets` / `puts` /
+    `chan copy`（文件/管道/内存通道统一走 cfg 编码）；UTF-8 走
+    modified 解（无效字节 e9 → U+00E9，回写 UTF-8 为 c3a9）；多字节
+    iconv 编码增量解码（不完整尾续读、EOF 余字节按字节值）；unicode
+    按对读（奇尾 → U+FFFD）；`-translation binary` 按 tclsh 耦合为
+    `-translation lf + -encoding binary`（查询显示 lf），`-encoding
+    binary` 不改 translation；fconfigure 校验收 `binary`。
+- **残差**：iconv 缺名的编码（macGreek/macIceland/macRomania/
+  macTurkish/macCroatian/macUkraine/macThai/macJapan/jis0201/0208/
+  0212/cns11643/gb12345/gb2312-raw/symbol/dingbats/ebcdic/cp165/
+  cp860…）解码按字节直映兜底、编码按 `?` 兜底（tclsh 有真表）；
+  ISO-2022-KR 等有状态编码的逐字符慢路径字节形可能不同；
+  -translation 的 EOL 实际改写仍缺（既有残差）。
+- **严重度**：已关闭。
 
 ### D-30 `read chan N` 按字节计数 + `read chan 0` 置 eof（spec io [D-31]）
 - **Tcl 8.6**：N 是**字符数**（"héllo" read 3 → 3 字符）；read 0 不置 eof。

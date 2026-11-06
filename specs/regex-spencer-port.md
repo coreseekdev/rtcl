@@ -184,8 +184,11 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   `regsub` 的循环是 offset<=length（非空匹配到串尾后仍补一次空
   匹配），且 `-start` 越过串尾时不执行。`regexp -start` 越过串尾按
   虚拟空串匹配并保留原偏移（`-start 9 {$} ba` → 索引 `9 8`）。
-  验证：3500 例命令面随机语料（开关组合/match vars/regsub 替换串）
-  **0 差异**（`specs/regex/gen-cmd-fuzz.py`）。
+  验证：3500 + 12000 + 15000 三组 seed 的命令面随机语料（开关组合/
+  match vars/regsub 替换串/空匹配/越界 -start）**0 差异**
+  （`specs/regex/gen-cmd-fuzz.py`）。回引回溯的 concat 去重按
+  (终点, 捕获快照) 而非仅终点——`a?(a*)[^a](a)\1` 在 "abab" 上
+  leftmost 匹配 0..3（不同捕获路径不能合并）。
 - 验证命令：
   `cargo test -p rtcl-vm --lib --features regexp,regexp-spencer regexp_spencer`
   （10/10）；`specs/tclmem.sh 'python3 specs/regex/spencer-overall.py'`

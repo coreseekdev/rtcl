@@ -510,7 +510,10 @@ pub(crate) fn assert_ok(k: AssertKind, pos: usize, text: &[char], search_start: 
                 || (search_start > text.len() && pos == text.len())
         }
         AssertKind::Eos => pos == text.len(),
-        AssertKind::Bol => pos == 0 || text.get(pos - 1) == Some(&'\n'),
+        AssertKind::Bol => {
+            search_start <= text.len()
+                && (pos == 0 || text.get(pos - 1) == Some(&'\n'))
+        }
         AssertKind::Eol => pos == text.len() || text.get(pos) == Some(&'\n'),
         AssertKind::WordStart => word_at(text, pos) && !prev_word,
         AssertKind::WordEnd => prev_word && !word_at(text, pos),

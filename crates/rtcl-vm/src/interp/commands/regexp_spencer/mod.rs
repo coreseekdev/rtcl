@@ -268,5 +268,26 @@ mod tests {
         assert_eq!(find_ss("^", "\na", 1), Some((1, 1)));
         assert_eq!(find_ss("^", "ba", 1), None);
         assert_eq!(find_ss(r"\A", "ba", 1), Some((1, 1)));
+        // -start 越过串尾的虚拟空串：行首约束不得借前一个换行命中。
+        let prog = compile(
+            "^",
+            Options {
+                nlanch: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let chars: Vec<char> = "\n".chars().collect();
+        assert_eq!(matcher::find_from(&prog, &chars, 1, 2), None);
+    }
+
+    #[test]
+    fn backref_keeps_distinct_capture_paths() {
+        // a? 的两条路径到达同一终点但 (a*) 捕获不同；去重不能只按
+        // 终点，否则回引路径被错误丢弃（leftmost 0..3）。
+        let prog = compile(r"a?(a*)[^a](a)\1", Options::default()).unwrap();
+        let chars: Vec<char> = "abab".chars().collect();
+        let m = matcher::find_from(&prog, &chars, 0, 0).unwrap();
+        assert_eq!((m.start, m.end), (0, 3));
     }
 }

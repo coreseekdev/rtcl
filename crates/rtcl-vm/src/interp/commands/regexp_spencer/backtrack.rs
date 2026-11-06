@@ -163,9 +163,11 @@ impl<'a> Bt<'a> {
                     break;
                 }
             }
-            // 去重（同一终点保留首个捕获快照）。
+            // 去重：同一终点但捕获快照不同时不能合并——后续回引
+            // 依赖具体捕获（`a?(a*)[^a](a)\1` 在 "abab" 上，
+            // a? 两条路径到同一终点但 (a*) 捕获不同）。
             let mut seen = std::collections::HashSet::new();
-            next.retain(|(e, _)| seen.insert(*e));
+            next.retain(|s| seen.insert(s.clone()));
             states = next;
             if states.is_empty() {
                 break;

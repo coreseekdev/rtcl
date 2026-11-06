@@ -6,14 +6,16 @@ match vars、regsub 替换串、BRE/ERE/ARE 前缀、空匹配与 -start 越界�
 pattern/string/spec 以 UTF-8 十六进制传入，输出行带 C<编号> 标签，
 便于 tclsh 与 rtcl 逐例 diff。
 
-用法:
-  python3 specs/regex/gen-cmd-fuzz.py > /tmp/cmdfuzz.tcl
+用法（可选 seed/count）:
+  python3 specs/regex/gen-cmd-fuzz.py [seed] [count] > /tmp/cmdfuzz.tcl
   tclsh /tmp/cmdfuzz.tcl > o.txt
   ./target/release/rtcl -f /tmp/cmdfuzz.tcl > r.txt
   diff o.txt r.txt
 """
 import random, sys
-random.seed(20261107)
+seed = int(sys.argv[1]) if len(sys.argv) > 1 else 20261107
+count = int(sys.argv[2]) if len(sys.argv) > 2 else 3500
+random.seed(seed)
 atoms = ["a","b",".","[ab]","[^a]","[a-c]",r"\d",r"\w",r"\s","(a)","(a|b)","(a*)","(a+)","a?","a*","a+","a{1,2}","^","$",r"\y",r"\m","(?=a)","(?:a)","(a)\\1","a*?",r"(a+?)(a*)","[[:alpha:]]"]
 texts = ["", "a", "aa", "ab", "abc", "a\nb", " a ", "A", "1", "abab", "ba", "a b", "xa", "\n", "aaa", "a1b2", "\u00e9a", "ab\ncd"]
 specs = ["X", "&", r"\1", r"[\1]", r"\0", r"\&", r"\\", "pre&post", r"\1\1", "", "a\\b"]
@@ -39,7 +41,7 @@ def flags(for_regsub=False):
     return f
 def hx(s): return s.encode().hex()
 cases=[]
-for i in range(3500):
+for i in range(count):
     p=pat(); s=random.choice(texts); f=flags()
     mode=random.choices(["inline","count","vars","indices","regsub","regsub_novar"],[3,2,2,1.5,2,1])[0]
     if mode in ("inline","count","vars","indices"):

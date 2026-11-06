@@ -367,12 +367,31 @@ impl Compiler {
     /// table holds the name (proc bodies only), the name-keyed op otherwise
     /// (the executor's name path consults the slot table at runtime, so
     /// both forms observe the same variable).
+    /// 数组元素引用让**基名**占据一个局部槽位（tclsh 的编译局部表
+    /// 同样把数组变量算作一个 local）：槽号只影响 INNER 诊断的操作码
+    /// 选择（loadArray1/4）；运行期数组元素仍走名键路径，数组化时既有
+    /// degrade 机制会把帧槽迁移回名存储。
+    fn note_array_base(&mut self, name: &str) {
+        if !self.locals_mode {
+            return;
+        }
+        let Some(base) = name.strip_suffix(')') else { return };
+        let Some((base, _)) = base.split_once('(') else { return };
+        if slot_candidate(base) {
+            self.bytecode.add_local(base);
+        }
+    }
+
     fn emit_var_read(&mut self, name: &str, line: u32) {
+        self.note_array_base(name);
         if self.locals_mode && slot_candidate(name) {
-            if let Some(slot) = self.bytecode.find_local(name) {
-                self.bytecode.emit(OpCode::LoadLocal(slot), line);
-                return;
-            }
+            // tclsh 的编译局部表对**读**也占槽（首次引用即登记）：
+            // 未定义名读取失败时操作码按槽号选 loadScalar1/4。运行期
+            // 未命中槽即报 can't read（proc 作用域无全局回落），链接
+            // 变量由槽 aliased 路径回落名解析。
+            let slot = self.bytecode.add_local(name);
+            self.bytecode.emit(OpCode::LoadLocal(slot), line);
+            return;
         }
         let idx = self.bytecode.add_const(name);
         self.bytecode.emit(OpCode::LoadVar(idx), line);
@@ -383,6 +402,7 @@ impl Compiler {
     /// first slots; `set` targets append in compilation order — the same
     /// order the tree-walk would insert them at runtime).
     fn emit_var_store(&mut self, name: &str, line: u32) {
+        self.note_array_base(name);
         if self.locals_mode && slot_candidate(name) {
             let slot = self.bytecode.add_local(name);
             self.bytecode.emit(OpCode::StoreLocal(slot), line);
@@ -925,6 +945,7 @@ impl Compiler {
             return self.compile_dyncall(cmd);
         }
         if let Word::Literal(var_name) = &cmd.words[1] {
+            self.note_array_base(var_name);
             if self.locals_mode && slot_candidate(var_name) {
                 let slot = self.bytecode.add_local(var_name);
                 self.compile_word_spanned(&cmd.words[2], line, cmd, 2);
@@ -963,6 +984,7 @@ impl Compiler {
             // A plain-name `incr` target in a proc body takes a slot too
             // (writes discover, like `set`): the hot loop counter then
             // mutates the slot's int rep in place, no name probe at all.
+            self.note_array_base(var_name);
             if self.locals_mode && slot_candidate(var_name) {
                 let slot = self.bytecode.add_local(var_name);
                 self.bytecode.emit(OpCode::IncrLocal(slot, amount), line);

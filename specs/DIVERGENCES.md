@@ -77,14 +77,21 @@
   * 融合 lappend 读失败槽位精确化：编译路径按 `code.locals()` 查槽
     选 `loadScalar1`/`loadScalar4`、`loadArray1`/`loadArray4`（>255
     槽脚本实测 SAME）。
+- **D-3 第四批收口（2026-11-06，局部槽位补全）**：编译局部表此前
+  只登记标量写目标，数组基名与普通读名缺席，导致 >255 槽 / 数组
+  交错时 INNER 操作码退回 `loadScalar1`/`loadArray1`。现按 tclsh 的
+  编译局部表口径补全：数组元素引用的**基名**占一个局部槽（首次
+  引用登记）；普通名的**读**也登记槽（未定义名读取失败按槽号选
+  loadScalar1/4）。数组化时既有 degrade 机制把帧槽迁回名存储；
+  链接变量走槽 aliased 回落。slots3（loadArray4）/slots4
+  （数组先于标量 → loadScalar4；混合数组错误文本）逐字 SAME；
+  多行脚本 specs/scripts/slot-hints.tcl 固化。
 - **余留残差**（低频，有意保留）：
   * clock 错误的 errorInfo/errorstack 含 tclsh 的 **Tcl 实现帧**
     （`::tcl::clock::add` line 98、`::tcl::clock::scan` + `UP 1`、
     `::tcl::clock::format` 等）。tclsh 的 clock 是 Tcl 脚本库，报错帧
     反映其内部实现；rtcl 为 native 实现，无法在不伪造脚本帧栈的前提下
     逐字复现。仅 clock 的**错误消息/errorcode** 对齐，帧链有意不匹配。
-  * tree-walk 引擎无槽表（大函数体不编译）时，>255 槽位仍按
-    `loadScalar1`/`loadArray1` 近似（编译路径已精确）。
 
 ### D-4 非 error 完成的 options 字典 -code/-level 未按 proc 边界解码（spec [D-3]）
 - **Tcl 8.6**：catch {f}（f 内 `return hi`）→ `-code 0 -level 1`；

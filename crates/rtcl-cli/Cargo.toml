@@ -18,6 +18,9 @@ colored.workspace = true
 
 [features]
 default = []
+# Spencer 正则引擎（已默认经 rtcl_std 开启）：显式打开供
+# --no-default-features 构建；RTCL_REGEX_ENGINE=fast 可回退旧引擎。
+regexp-spencer = ["rtcl-core/regexp-spencer"]
 expect = ["rtcl-expect"]
 # 可选 JIT（主线 opt-in）：proc-body fast-tier 直呼——命中 fast 形状
 # （纯参数读/无循环/无变量写的 proc）走 wasm 直呼，其余形状保持

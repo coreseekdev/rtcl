@@ -548,6 +548,27 @@ pub(crate) fn compile_engine_tc(
     lineanchor: bool,
     linestop: bool,
 ) -> std::result::Result<Engine, String> {
+    // M5：默认整条 regexp/regsub 路径走 Spencer 移植（其 parser 自带
+    // tclsh 同源的校验与 REG_* 码）；lite 构建保持单一 regex_lite。
+    #[cfg(all(feature = "regexp", feature = "regexp-spencer"))]
+    if super::regexp_spencer::engine_selected() {
+        return match super::regexp_spencer::compile(
+            pattern,
+            spencer_options(nocase, expanded, lineanchor, linestop),
+        ) {
+            Ok(prog) => Ok(Engine::Spencer(Box::new(prog))),
+            Err(e) => {
+                super::list::set_error_code(
+                    interp,
+                    &format!("REGEXP {} {{{}}}", e.code, e.message),
+                );
+                Err(format!(
+                    "couldn't compile regular expression pattern: {}",
+                    e.message
+                ))
+            }
+        };
+    }
     if let Some((code, msg)) = validate_are(pattern) {
         super::list::set_error_code(interp, &format!("REGEXP {} {{{}}}", code, msg));
         return Err(format!(
@@ -556,6 +577,23 @@ pub(crate) fn compile_engine_tc(
         ));
     }
     compile_engine(pattern, nocase, expanded, lineanchor, linestop)
+}
+
+/// 命令行开关 → Spencer `Options`。`-line` 同时置 nlanch/nlstop。
+#[cfg(feature = "regexp-spencer")]
+fn spencer_options(
+    nocase: bool,
+    expanded: bool,
+    lineanchor: bool,
+    linestop: bool,
+) -> super::regexp_spencer::Options {
+    super::regexp_spencer::Options {
+        icase: nocase,
+        expanded,
+        nlanch: lineanchor,
+        nlstop: linestop,
+        ..Default::default()
+    }
 }
 
 /// Build regex pattern string from flags.  Tcl's newline sensitivity
@@ -594,14 +632,10 @@ pub(crate) enum Engine {
         anch: Option<regex::Regex>,
     },
     Full(super::regexp_bt::BtProg),
-}
-
-#[cfg(feature = "regexp")]
-impl Engine {
-    /// D-20：串锚模式（含 \A/\z——\A 绑 -start 偏移而非尝试起点）。
-    pub(crate) fn is_string_anchored(&self) -> bool {
-        matches!(self, Engine::Fast { anch: Some(_), .. })
-    }
+    /// Henry Spencer 引擎 Rust 移植（M5：feature `regexp-spencer`
+    /// + `RTCL_REGEX_ENGINE=spencer` 灰度路由）。
+    #[cfg(feature = "regexp-spencer")]
+    Spencer(Box<super::regexp_spencer::Prog>),
 }
 
 /// Does the pattern use constructs whose membership follows tclsh's Unicode
@@ -649,6 +683,19 @@ pub(crate) fn compile_engine(
     lineanchor: bool,
     linestop: bool,
 ) -> std::result::Result<Engine, String> {
+    // 无 Interp 的消费者（array names -regexp、lsort -regexp）也
+    // 遵循同一灰度开关，保证整进程语义一致。
+    #[cfg(feature = "regexp-spencer")]
+    if super::regexp_spencer::engine_selected() {
+        return super::regexp_spencer::compile(
+            pattern,
+            spencer_options(nocase, expanded, lineanchor, linestop),
+        )
+        .map(|prog| Engine::Spencer(Box::new(prog)))
+        .map_err(|e| {
+            format!("couldn't compile regular expression pattern: {}", e.message)
+        });
+    }
     let (expanded_pattern, needs_bt) = expand_unicode_escapes(pattern);
     let pattern = expanded_pattern.as_str();
     if needs_bt {
@@ -679,11 +726,79 @@ pub(crate) fn compile_engine(
     }
 }
 
+/// `-all` 扫描期间复用的字符/字节偏移与 Matcher（DFA 缓存）缓存。
+/// 避免每个起点都从 UTF-8 重建 Vec<char>、重建 DFA 缓存。
+#[cfg(all(feature = "regexp-spencer", feature = "regexp"))]
+pub(crate) struct CharCache {
+    text: Option<(Vec<char>, Vec<usize>)>,
+    matcher: Option<super::regexp_spencer::matcher::Matcher>,
+}
+
+#[cfg(all(feature = "regexp-spencer", feature = "regexp"))]
+impl CharCache {
+    pub(crate) fn new() -> CharCache {
+        CharCache {
+            text: None,
+            matcher: None,
+        }
+    }
+}
+
+#[cfg(not(all(feature = "regexp-spencer", feature = "regexp")))]
+pub(crate) struct CharCache;
+
+#[cfg(not(all(feature = "regexp-spencer", feature = "regexp")))]
+impl CharCache {
+    pub(crate) fn new() -> CharCache {
+        CharCache
+    }
+}
+
 /// Attempt one match at char index `p` of `full_string`; returns capture
-/// ranges in full-string byte offsets, group 0 first.
+/// ranges in full-string byte offsets, group 0 first.  `search_start` is
+/// the `-start` char offset: `\A` binds it (Spencer Bot assertion), while
+/// `^` stays anchored to absolute position 0.
 #[cfg(feature = "regexp")]
-pub(crate) fn engine_attempt(eng: &Engine, full_string: &str, p: usize) -> Option<GroupRanges> {
+pub(crate) fn engine_attempt(
+    eng: &Engine,
+    full_string: &str,
+    p: usize,
+    search_start: usize,
+    cache: &mut CharCache,
+) -> Option<GroupRanges> {
+    let _ = &cache;
     match eng {
+        #[cfg(feature = "regexp-spencer")]
+        Engine::Spencer(prog) => {
+            if cache.text.is_none() {
+                let chars: Vec<char> = full_string.chars().collect();
+                let mut byte_at: Vec<usize> = full_string
+                    .char_indices()
+                    .map(|(b, _)| b)
+                    .collect();
+                byte_at.push(full_string.len());
+                cache.text = Some((chars, byte_at));
+            }
+            if cache.matcher.is_none() {
+                cache.matcher =
+                    Some(super::regexp_spencer::matcher::Matcher::new(prog));
+            }
+            let (chars, byte_at) = cache.text.as_ref().unwrap();
+            let matcher = cache.matcher.as_mut().unwrap();
+            let caps = super::regexp_spencer::captures::exec_with(
+                prog,
+                chars,
+                p,
+                search_start,
+                matcher,
+            )?;
+            Some(
+                caps.spans
+                    .into_iter()
+                    .map(|g| g.map(|(s, e)| (byte_at[s], byte_at[e])))
+                    .collect(),
+            )
+        }
         Engine::Full(prog) => {
             let off = char_to_byte(full_string, p);
             super::regexp_bt::bt_caps_at(prog, &full_string[off..]).map(|groups| {
@@ -718,6 +833,8 @@ pub(crate) fn engine_is_match(eng: &Engine, s: &str) -> bool {
     match eng {
         Engine::Fast { re, .. } => re.is_match(s),
         Engine::Full(p) => super::regexp_bt::bt_is_match(p, s),
+        #[cfg(feature = "regexp-spencer")]
+        Engine::Spencer(p) => super::regexp_spencer::is_match(p, s, 0),
     }
 }
 
@@ -726,6 +843,8 @@ pub(crate) fn engine_group_count(eng: &Engine, pattern: &str) -> usize {
     match eng {
         Engine::Fast { .. } => count_groups(pattern),
         Engine::Full(p) => p.ngroups,
+        #[cfg(feature = "regexp-spencer")]
+        Engine::Spencer(p) => p.nsubs,
     }
 }
 
@@ -736,14 +855,6 @@ pub(crate) fn engine_group_count(eng: &Engine, pattern: &str) -> usize {
 pub(crate) struct Engine {
     re: regex_lite::Regex,
     anch: Option<regex_lite::Regex>,
-}
-
-#[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
-impl Engine {
-    /// D-20：串锚模式（lite 引擎的 \A 在编译期替换为 `^`，存于 `anch`）。
-    pub(crate) fn is_string_anchored(&self) -> bool {
-        self.anch.is_some()
-    }
 }
 
 #[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
@@ -772,7 +883,13 @@ pub(crate) fn compile_engine(
 /// Attempt one match at char index `p` of `full_string`; returns capture
 /// ranges in full-string byte offsets, group 0 first.
 #[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
-pub(crate) fn engine_attempt(eng: &Engine, full_string: &str, p: usize) -> Option<GroupRanges> {
+pub(crate) fn engine_attempt(
+    eng: &Engine,
+    full_string: &str,
+    p: usize,
+    _search_start: usize,
+    _cache: &mut CharCache,
+) -> Option<GroupRanges> {
     match &eng.anch {
         Some(ra) => {
             // D-20：同上——串锚捕获起于 slice 0。
@@ -849,6 +966,11 @@ fn char_to_byte(s: &str, ci: usize) -> usize {
 #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 /// Char index of byte offset `bi` (which must lie on a char boundary).
 fn byte_to_char(s: &str, bi: usize) -> usize {
+    // ASCII 快路径：字节下标即字符下标（大串 -indices/-all 的
+    // 每个匹配都重扫前缀会让输出退化为 O(n²)）。
+    if s.is_ascii() {
+        return bi;
+    }
     s[..bi].chars().count()
 }
 
@@ -926,14 +1048,28 @@ fn collect_matches(
         return out;
     }
     let mut p = char_start;
+    // 匹配端点单调递增：用游标增量换算字节→字符，避免每个匹配都
+    // O(n) 重扫前缀（-all 密集匹配的 1 MiB 性能瓶颈）。
+    let mut cursor_byte = char_to_byte(full, char_start);
+    let mut cursor_char = char_start;
     while p < char_len {
         match attempt(p) {
             Some(groups) => {
                 let (s, e) = groups[0].unwrap_or((0, 0));
                 out.push(groups);
+                if s >= cursor_byte {
+                    cursor_char += full[cursor_byte..s].chars().count();
+                    cursor_byte = s;
+                }
+                let start_char = cursor_char;
+                if e >= cursor_byte {
+                    cursor_char += full[cursor_byte..e].chars().count();
+                    cursor_byte = e;
+                }
+                let end_char = cursor_char;
                 // An empty match restarts one char past its position;
                 // a non-empty one right after its end.
-                p = byte_to_char(full, e).max(byte_to_char(full, s) + 1);
+                p = end_char.max(start_char + 1);
             }
             None => break,
         }
@@ -983,6 +1119,10 @@ fn pattern_is_nonposix(pat: &str, nongreedy: bool) -> bool {
     if nongreedy {
         return true;
     }
+    // `***=` / `***:` 元语法本身就是非 POSIX 扩展。
+    if pat.starts_with("***=") || pat.starts_with("***:") {
+        return true;
+    }
     let b = pat.as_bytes();
     let (mut in_class, mut i) = (false, 0);
     while i < b.len() {
@@ -1000,6 +1140,393 @@ fn pattern_is_nonposix(pat: &str, nongreedy: bool) -> bool {
         }
     }
     false
+}
+
+/// `(?=` / `(?!` outside classes and escapes（-about 的
+/// REG_ULOOKAHEAD；语法上是 non-POSIX，与 REG_UNONPOSIX 并列输出）。
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+fn pattern_has_lookahead(pat: &str) -> bool {
+    if pat.starts_with("***=") {
+        return false;
+    }
+    let (bre, ere) = about_dialect(pat);
+    if bre || ere {
+        return false;
+    }
+    let b = pat.as_bytes();
+    let (mut in_class, mut i) = (false, 0);
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'[' => { in_class = true; i += 1; }
+            b']' => { in_class = false; i += 1; }
+            b'(' if !in_class => {
+                if b.get(i + 1) == Some(&b'?')
+                    && matches!(b.get(i + 2), Some(b'=') | Some(b'!'))
+                {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// Tcl 里 REG_ULOCALE 表示用到了 Unicode 依赖的类：Perl 类
+/// `\d\s\w` 及其反集、词断言 `\y\m\M\Y`、POSIX `[[:class:]]`。
+/// `-nocase` 本身不产生该标志（tclsh 8.6.17 实测）。
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+fn pattern_uses_ulocale(pat: &str) -> bool {
+    if pat.starts_with("***=") {
+        return false;
+    }
+    let (bre, ere) = about_dialect(pat);
+    let escapes_locale = !bre && !ere;
+    let b = pat.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if i + 1 < b.len() => {
+                if escapes_locale
+                    && matches!(
+                        b[i + 1],
+                        b'd' | b'D' | b's' | b'S' | b'w' | b'W' | b'y' | b'm' | b'M' | b'Y'
+                    )
+                {
+                    return true;
+                }
+                i += 2;
+            }
+            b'[' => {
+                // `[[:alpha:]]`：POSIX 类名（Unicode 表）。
+                if b.get(i + 1) == Some(&b'[') && b.get(i + 2) == Some(&b':') {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// ERE 方言（`(?e)` / `***:(?e)`）下存在多余的 `)`——tclsh 把它当
+/// 字面字符并在 -about 里报 REG_UPBOTCH。
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+fn pattern_has_upbotch(pat: &str) -> bool {
+    let p = pat.strip_prefix("***:").unwrap_or(pat);
+    let Some(rest) = p.strip_prefix("(?") else {
+        return false;
+    };
+    let Some(end) = rest.find(')') else {
+        return false;
+    };
+    let letters = &rest[..end];
+    if !letters.contains('e') || letters.contains('b') {
+        return false;
+    }
+    let b = rest[end + 1..].as_bytes();
+    let (mut depth, mut in_class, mut i) = (0usize, false, 0usize);
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'[' => { in_class = true; i += 1; }
+            b']' => { in_class = false; i += 1; }
+            b'(' if !in_class => { depth += 1; i += 1; }
+            b')' if !in_class => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// `-about` 的语法扫描结果（与 tclsh 的 re_info 位一一对应）。
+#[derive(Default)]
+struct AboutLex {
+    backref: bool,
+    bounds: bool,
+    braces: bool,
+    ubsalnum: bool,
+    unspec: bool,
+}
+
+/// 前缀里声明的方言：`(bre, ere)`；默认 ARE。
+fn about_dialect(pat: &str) -> (bool, bool) {
+    let p = pat.strip_prefix("***:").unwrap_or(pat);
+    if let Some(rest) = p.strip_prefix("(?") {
+        if let Some(end) = rest.find(')') {
+            let letters = &rest[..end];
+            if letters.chars().all(|c| c.is_ascii_alphabetic()) {
+                let bre = letters.contains('b');
+                let ere = !bre && letters.contains('e');
+                return (bre, ere);
+            }
+        }
+    }
+    (false, false)
+}
+
+/// `{m}` / `{m,}` / `{m,n}`（ARE/ERE），返回 `}` 之后的位置。
+fn about_valid_bound(b: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    let start = j;
+    let mut m = 0u32;
+    while j < b.len() && b[j].is_ascii_digit() {
+        m = m.saturating_mul(10).saturating_add((b[j] - b'0') as u32);
+        j += 1;
+    }
+    if j == start {
+        return None;
+    }
+    let mut n = m;
+    let mut unbounded = false;
+    if j < b.len() && b[j] == b',' {
+        j += 1;
+        let ds = j;
+        let mut v = 0u32;
+        while j < b.len() && b[j].is_ascii_digit() {
+            v = v.saturating_mul(10).saturating_add((b[j] - b'0') as u32);
+            j += 1;
+        }
+        if j == ds {
+            unbounded = true;
+        } else {
+            n = v;
+        }
+    }
+    if j >= b.len() || b[j] != b'}' {
+        return None;
+    }
+    if m > 255 || (!unbounded && n > 255) || m > n {
+        return None;
+    }
+    Some(j + 1)
+}
+
+/// BRE `\{m,n\}`，返回 `\}` 之后的位置（m 可省略）。
+fn about_valid_bre_bound(b: &[u8], i: usize) -> Option<usize> {
+    if i + 1 >= b.len() || b[i] != b'\\' || b[i + 1] != b'{' {
+        return None;
+    }
+    let mut j = i + 2;
+    let mut m = 0u32;
+    let ds = j;
+    while j < b.len() && b[j].is_ascii_digit() {
+        m = m.saturating_mul(10).saturating_add((b[j] - b'0') as u32);
+        j += 1;
+    }
+    let had_m = j > ds;
+    let mut n = m;
+    let mut unbounded = false;
+    if j < b.len() && b[j] == b',' {
+        j += 1;
+        let ds2 = j;
+        let mut v = 0u32;
+        while j < b.len() && b[j].is_ascii_digit() {
+            v = v.saturating_mul(10).saturating_add((b[j] - b'0') as u32);
+            j += 1;
+        }
+        if j == ds2 {
+            unbounded = true;
+        } else {
+            n = v;
+        }
+    } else if !had_m {
+        return None;
+    }
+    if j + 1 >= b.len() || b[j] != b'\\' || b[j + 1] != b'}' {
+        return None;
+    }
+    if m > 255 || (!unbounded && n > 255) || m > n {
+        return None;
+    }
+    Some(j + 2)
+}
+
+/// 扫描 pattern（跳过前缀/字符类/转义）收集 -about 语法位。
+fn about_lex(pat: &str) -> AboutLex {
+    let mut out = AboutLex::default();
+    let b = pat.as_bytes();
+    let mut i = 0usize;
+    let mut quoted = false;
+    if pat.starts_with("***=") {
+        quoted = true;
+        i = 4;
+    } else if pat.starts_with("***:") {
+        i = 4;
+    }
+    let mut bre = false;
+    let mut ere = false;
+    // 开头的内嵌选项组（(?b) / (?e) / (?i) ...）。
+    if !quoted {
+        let (bflag, eflag) = about_dialect(pat);
+        bre = bflag;
+        ere = eflag;
+        if b.get(i) == Some(&b'(') && b.get(i + 1) == Some(&b'?') {
+            let mut j = i + 2;
+            while j < b.len() && b[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            if b.get(j) == Some(&b')') {
+                i = j + 1;
+            }
+        }
+    }
+    if quoted {
+        out.unspec = i >= b.len();
+        return out;
+    }
+    let are = !bre && !ere;
+    if i >= b.len() {
+        out.unspec = true;
+        return out;
+    }
+    let mut in_class = false;
+    // 上一个 token 是否可作分支端点（用于空分支 UUNSPEC）。
+    let mut prev_atom = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_class {
+            if c == b']' {
+                in_class = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'[' => {
+                in_class = true;
+                i += 1;
+                prev_atom = true;
+            }
+            b'\\' if i + 1 < b.len() => {
+                let e = b[i + 1];
+                if bre {
+                    if e.is_ascii_digit() && e != b'0' {
+                        out.backref = true;
+                    } else if e.is_ascii_alphanumeric() {
+                        // BRE 没有 `\d` 等转义：`\`+字母数字是
+                        // 未指定语法（tclsh: UBSALNUM + UUNSPEC）。
+                        out.ubsalnum = true;
+                        out.unspec = true;
+                    }
+                    if e == b'{' {
+                        if let Some(end) = about_valid_bre_bound(b, i) {
+                            out.bounds = true;
+                            i = end;
+                            prev_atom = true;
+                            continue;
+                        }
+                    }
+                    if e == b'(' && b.get(i + 2) == Some(&b'\\')
+                        && b.get(i + 3) == Some(&b')')
+                    {
+                        out.unspec = true;
+                    }
+                    i += 2;
+                    prev_atom = true;
+                } else {
+                    if are && e.is_ascii_digit() && e != b'0' {
+                        out.backref = true;
+                    } else if ere && e.is_ascii_alphanumeric() {
+                        out.ubsalnum = true;
+                        out.unspec = true;
+                    }
+                    i += 2;
+                    prev_atom = true;
+                }
+            }
+            b'{' if !bre => {
+                if let Some(end) = about_valid_bound(b, i) {
+                    out.bounds = true;
+                    i = end;
+                } else {
+                    out.braces = true;
+                    out.unspec = true;
+                    i += 1;
+                }
+                prev_atom = true;
+            }
+            b'(' if !bre => {
+                // 空组 `()` / `(?:)` 是 POSIX 未指定行为。
+                if b.get(i + 1) == Some(&b')')
+                    || (b.get(i + 1) == Some(&b'?')
+                        && b.get(i + 2) == Some(&b':')
+                        && b.get(i + 3) == Some(&b')'))
+                {
+                    out.unspec = true;
+                }
+                i += 1;
+                prev_atom = false;
+            }
+            b')' if !bre => {
+                i += 1;
+                prev_atom = true;
+            }
+            b'|' if !bre => {
+                let next = b.get(i + 1).copied();
+                if !prev_atom
+                    || next.is_none()
+                    || next == Some(b'|')
+                    || next == Some(b')')
+                {
+                    out.unspec = true;
+                }
+                i += 1;
+                prev_atom = false;
+            }
+            _ => {
+                i += 1;
+                prev_atom = true;
+            }
+        }
+    }
+    out
+}
+
+/// -about 的 REG_UEMPTYMATCH / REG_UIMPOSSIBLE / REG_USHORTEST：
+/// 用 Spencer parser 重新解析获得 subre 树（与命令实际引擎无关）。
+/// 返回 (可空, 不可命中, 根偏好 SHORTER)。
+#[cfg(all(feature = "regexp-spencer", any(feature = "regexp", feature = "regexp-lite")))]
+fn engine_about_bits(
+    _eng: &Engine,
+    pat: &str,
+    nocase: bool,
+    expanded: bool,
+    lineanchor: bool,
+    linestop: bool,
+) -> (bool, bool, bool) {
+    match super::regexp_spencer::compile(
+        pat,
+        spencer_options(nocase, expanded, lineanchor, linestop),
+    ) {
+        Ok(p) => (
+            super::regexp_spencer::ast::nullable(&p.tree),
+            super::regexp_spencer::ast::impossible(&p.tree),
+            p.flags.shorter,
+        ),
+        Err(_) => (false, false, false),
+    }
+}
+
+#[cfg(all(not(feature = "regexp-spencer"), any(feature = "regexp", feature = "regexp-lite")))]
+fn engine_about_bits(
+    _eng: &Engine,
+    _pat: &str,
+    _nocase: bool,
+    _expanded: bool,
+    _lineanchor: bool,
+    _linestop: bool,
+) -> (bool, bool, bool) {
+    (false, false, false)
 }
 
 /// `regexp ?switches? exp string ?matchVar? ?subMatchVar ...?`
@@ -1065,20 +1592,68 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let eng = compile_engine_tc(interp, pattern_str, nocase, expanded, lineanchor, linestop)
             .map_err(|e| Error::runtime(e, ErrorCode::Generic))?;
         let nongreedy = pattern_is_nongreedy(pattern_str);
+        let lex = about_lex(pattern_str);
         let mut flags: Vec<&str> = Vec::new();
+        // 输出顺序与 tclsh 的 re_info 位序一致：
+        // UBACKREF → ULOOKAHEAD → UBOUNDS → UBRACES → UPBOTCH →
+        // UNONPOSIX → UUNSPEC → ULOCALE → UEMPTYMATCH → USHORTEST。
+        if lex.backref {
+            flags.push("REG_UBACKREF");
+        }
+        if pattern_has_lookahead(pattern_str) {
+            flags.push("REG_ULOOKAHEAD");
+        }
+        if lex.bounds {
+            flags.push("REG_UBOUNDS");
+        }
+        if lex.braces {
+            flags.push("REG_UBRACES");
+        }
+        if lex.ubsalnum {
+            flags.push("REG_UBSALNUM");
+        }
+        if pattern_has_upbotch(pattern_str) {
+            flags.push("REG_UPBOTCH");
+        }
         if pattern_is_nonposix(pattern_str, nongreedy) {
             flags.push("REG_UNONPOSIX");
         }
-        if nongreedy {
-            flags.push("REG_USHORTEST");
+        if lex.unspec {
+            flags.push("REG_UUNSPEC");
         }
-        if nocase {
+        // -nocase 本身不置 ULOCALE；只有 Unicode 依赖的类才置。
+        if pattern_uses_ulocale(pattern_str) {
             flags.push("REG_ULOCALE");
         }
+        let (empty_ok, impossible, shortest) = engine_about_bits(
+            &eng, pattern_str, nocase, expanded, lineanchor, linestop,
+        );
+        if empty_ok {
+            flags.push("REG_UEMPTYMATCH");
+        }
+        if impossible {
+            flags.push("REG_UIMPOSSIBLE");
+        }
+        // Spencer 根偏好 SHORTER 才置位（`(a+)(a*?)` 虽含懒惰量词，
+        // COMBINE 结果仍是 LONGER，tclsh 不置 REG_USHORTEST）。
+        let shortest_flag = if cfg!(feature = "regexp-spencer") {
+            shortest
+        } else {
+            nongreedy
+        };
+        if shortest_flag {
+            flags.push("REG_USHORTEST");
+        }
+        // Tcl 列表规范形：空 `{}`、单元素裸词、多元素 `{a b}`。
+        let flag_str = match flags.len() {
+            0 => "{}".to_string(),
+            1 => flags[0].to_string(),
+            _ => format!("{{{}}}", flags.join(" ")),
+        };
         return Ok(Value::from_str(&format!(
-            "{} {{{}}}",
+            "{} {}",
             engine_group_count(&eng, pattern_str),
-            flags.join(" ")
+            flag_str
         )));
     }
 
@@ -1107,14 +1682,12 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let eng = compile_engine_tc(interp, pattern_str, nocase, expanded, lineanchor, linestop)
         .map_err(|e| Error::runtime(e, ErrorCode::Generic))?;
 
-    // D-20：\A/\z 串锚模式只允许在 -start 偏移命中一次——后续位置
-    // 的尝试被禁（tclsh 实测 -start 1 {\Aa} aba → 0）。
-    let anchored = eng.is_string_anchored();
+    // `\A` 绑定每次尝试的搜索起点：非 -all 只尝试 -start（故
+    // `-start 1 {\Aa} aba` → 0）；-all 每次向后推进时，新起点成为
+    // 虚拟串首（tclsh 16.4：`regsub -all {\A(\w)}` 逐字符替换）。
+    let mut char_cache = CharCache::new();
     let attempt = |p: usize| -> Option<GroupRanges> {
-        if anchored && p != char_start {
-            return None;
-        }
-        engine_attempt(&eng, full_string, p)
+        engine_attempt(&eng, full_string, p, p, &mut char_cache)
     };
     let matches = collect_matches(full_string, attempt, char_len, char_start, all);
 
@@ -1279,14 +1852,12 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Standard mode: Tcl substitution spec applied to the matches the
     // -start/-all scan yields.  regsub assigns varName unconditionally,
     // even when nothing is replaced.
-    // D-20：\A/\z 串锚模式只允许在 -start 偏移命中一次——后续位置
-    // 的尝试被禁（tclsh 实测 -start 1 {\Aa} aba → 0）。
-    let anchored = eng.is_string_anchored();
+    // `\A` 绑定每次尝试的搜索起点：非 -all 只尝试 -start（故
+    // `-start 1 {\Aa} aba` → 0）；-all 每次向后推进时，新起点成为
+    // 虚拟串首（tclsh 16.4：`regsub -all {\A(\w)}` 逐字符替换）。
+    let mut char_cache = CharCache::new();
     let attempt = |p: usize| -> Option<GroupRanges> {
-        if anchored && p != char_start {
-            return None;
-        }
-        engine_attempt(&eng, full_string, p)
+        engine_attempt(&eng, full_string, p, p, &mut char_cache)
     };
     let matches = collect_matches(full_string, attempt, char_len, char_start, all);
 

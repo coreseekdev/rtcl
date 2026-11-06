@@ -29,6 +29,11 @@ pub struct Match {
 /// 可复用的搜索引擎（DFA 缓存在多次 `find` 间保持）。
 pub struct Searcher<'a> {
     prog: &'a Prog,
+    inner: Matcher,
+}
+
+/// 不借用 `Prog` 的匹配器（DFA 缓存/扫描缓冲可跨多次命令级尝试复用）。
+pub struct Matcher {
     dfa: Option<DfaCache>,
     scratch: DfaScratch,
 }
@@ -62,22 +67,26 @@ impl DfaScratch {
     }
 }
 
-impl<'a> Searcher<'a> {
-    pub fn new(prog: &'a Prog) -> Searcher<'a> {
+impl Matcher {
+    pub fn new(prog: &Prog) -> Matcher {
         let dfa = if std::env::var_os("RTCL_SPENCER_NFA").is_some() {
             None
         } else {
             DfaCache::new(prog)
         };
-        Searcher {
-            prog,
+        Matcher {
             dfa,
             scratch: DfaScratch::new(),
         }
     }
 
-    pub fn find(&mut self, text: &[char], from: usize, search_start: usize) -> Option<Match> {
-        let prog = self.prog;
+    pub fn find(
+        &mut self,
+        prog: &Prog,
+        text: &[char],
+        from: usize,
+        search_start: usize,
+    ) -> Option<Match> {
         let from = from.min(text.len());
         if let Some(lit) = &prog.pure_literal {
             if !prog.icase {
@@ -104,7 +113,7 @@ impl<'a> Searcher<'a> {
             let mut k = from;
             while k + needle.len() <= text.len() {
                 if text[k] == first && text[k + 1..k + needle.len()] == needle[1..] {
-                    if let Some(m) = self.scan(text, k, search_start) {
+                    if let Some(m) = self.scan(prog, text, k, search_start) {
                         return Some(m);
                     }
                 }
@@ -112,15 +121,21 @@ impl<'a> Searcher<'a> {
             }
             return None;
         }
-        self.scan(text, from, search_start)
+        self.scan(prog, text, from, search_start)
     }
 
-    fn scan(&mut self, text: &[char], from: usize, search_start: usize) -> Option<Match> {
-        if self.prog.has_backref {
-            return super::backtrack::find(self.prog, text, from, search_start);
+    fn scan(
+        &mut self,
+        prog: &Prog,
+        text: &[char],
+        from: usize,
+        search_start: usize,
+    ) -> Option<Match> {
+        if prog.has_backref {
+            return super::backtrack::find(prog, text, from, search_start);
         }
         if let Some(mut dfa) = self.dfa.take() {
-            match dfa_scan(self.prog, &mut dfa, &mut self.scratch, text, from, search_start) {
+            match dfa_scan(prog, &mut dfa, &mut self.scratch, text, from, search_start) {
                 Ok(found) => {
                     self.dfa = Some(dfa);
                     return found;
@@ -131,7 +146,20 @@ impl<'a> Searcher<'a> {
                 }
             }
         }
-        nfa_scan(self.prog, text, from, search_start)
+        nfa_scan(prog, text, from, search_start)
+    }
+}
+
+impl<'a> Searcher<'a> {
+    pub fn new(prog: &'a Prog) -> Searcher<'a> {
+        Searcher {
+            prog,
+            inner: Matcher::new(prog),
+        }
+    }
+
+    pub fn find(&mut self, text: &[char], from: usize, search_start: usize) -> Option<Match> {
+        self.inner.find(self.prog, text, from, search_start)
     }
 }
 
@@ -464,7 +492,10 @@ fn word_at(text: &[char], pos: usize) -> bool {
 
 pub(crate) fn assert_ok(k: AssertKind, pos: usize, text: &[char], search_start: usize) -> bool {
     match k {
-        AssertKind::Bos => pos == search_start,
+        // `^`（非 newline 模式）锚绝对串首；`\A` 锚 -start 偏移
+        // （tclsh 把搜索起点当虚拟串首）。
+        AssertKind::Bos => pos == 0,
+        AssertKind::Bot => pos == search_start,
         AssertKind::Eos => pos == text.len(),
         AssertKind::Bol => pos == 0 || text.get(pos - 1) == Some(&'\n'),
         AssertKind::Eol => pos == text.len() || text.get(pos) == Some(&'\n'),

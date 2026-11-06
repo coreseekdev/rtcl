@@ -40,7 +40,7 @@ default = ["rtcl_std", "iconv"]
 # OS-level platform features (time, hostname, channels, filesystem)
 std = []
 # Tcl standard library — all extensions combined
-rtcl_std = ["file", "io", "exec", "clock", "regexp", "env", "signal", "package"]
+rtcl_std = ["file", "io", "exec", "clock", "regexp", "regexp-spencer", "env", "signal", "package"]
 # Individual Tcl extensions (each implies Rust std)
 file = ["std"]                    # file, cd, pwd, glob (自实现), readdir, source
 io = ["std"]                      # channel I/O: open, close, read, gets, seek, tell, eof, flush, fconfigure, pid
@@ -52,7 +52,7 @@ env = ["std"]                     # $env array from OS environment
 package = ["file"]                # package provide/require/names/forget
 signal = ["std"]                  # kill, sleep
 # Henry Spencer 正则引擎的 Rust 移植（B 路径；specs/regex-spencer-port.md）。
-# 默认关闭，M5 验证后转默认。
+# 已并入 rtcl_std 默认开启；RTCL_REGEX_ENGINE=fast 可退回旧引擎。
 regexp-spencer = []
 # 外部 libc iconv 后端（encoding module 的宽表编码转换）。默认开；wasm /
 # 无 libc 目标或显式 --no-default-features 时关闭，编码走字节直映兜底

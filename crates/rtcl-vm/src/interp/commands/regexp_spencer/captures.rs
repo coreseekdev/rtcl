@@ -12,7 +12,7 @@
 //! 暂不支持（返回 false）。
 
 use super::ast::{Node, NodeKind, DUPINF};
-use super::matcher::{assert_ok, find_from, matches_at, Match};
+use super::matcher::{assert_ok, matches_at, Match, Matcher};
 use super::nfa::{self, Prog};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,7 +28,20 @@ pub fn exec(
     from: usize,
     search_start: usize,
 ) -> Option<Captures> {
-    let m: Match = find_from(prog, text, from, search_start)?;
+    let mut m = Matcher::new(prog);
+    exec_with(prog, text, from, search_start, &mut m)
+}
+
+/// 复用 `Matcher`（DFA 缓存/扫描缓冲）执行捕获匹配——命令级 `-all`
+/// 循环用，避免每个起点重建 DFA 缓存。
+pub fn exec_with(
+    prog: &Prog,
+    text: &[char],
+    from: usize,
+    search_start: usize,
+    matcher: &mut Matcher,
+) -> Option<Captures> {
+    let m: Match = matcher.find(prog, text, from, search_start)?;
     let mut spans = vec![None; prog.nsubs + 1];
     spans[0] = Some((m.start, m.end));
     let d = Dissect {

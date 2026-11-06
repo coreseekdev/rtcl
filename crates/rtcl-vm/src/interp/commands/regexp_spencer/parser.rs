@@ -4,7 +4,7 @@
 //! 消息与 `REG_*` 码按 tclsh 8.6.17 实测钉死（见 D-19 与
 //! `specs/regex-engine-eval.md`）。
 
-use super::ast::{AssertKind, Flags, Node, DUPINF, DUPMAX};
+use super::ast::{AssertKind, Flags, Node, NodeKind, DUPINF, DUPMAX};
 use super::charset::{CharSet, Item, Pred};
 use super::Error;
 
@@ -45,6 +45,15 @@ enum ClassAtom {
     Pred(Pred),
 }
 
+/// 正则方言：默认 ARE；`(?e)` 切 POSIX ERE，`(?b)` 切 POSIX BRE。
+/// 方言在整条 pattern 内固定（tclsh 只识别 pattern 开头的切换）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Are,
+    Ere,
+    Bre,
+}
+
 pub struct Parser {
     chars: Vec<char>,
     i: usize,
@@ -55,6 +64,9 @@ pub struct Parser {
     next_sub: usize,
     /// lookahead 嵌套层数：内部括号非捕获，回引非法。
     lacon: usize,
+    /// ERE 的分组深度：POSIX ERE 里未匹配的 `)` 是普通字符
+    /// （tclsh 8.6.17 实测），只有深度 > 0 时才结束分支。
+    depth: usize,
 }
 
 impl Parser {
@@ -66,6 +78,7 @@ impl Parser {
             closed: vec![false],
             next_sub: 1,
             lacon: 0,
+            depth: 0,
         }
     }
 
@@ -92,6 +105,16 @@ impl Parser {
 
     fn peek(&self) -> Option<char> {
         self.chars.get(self.i).copied()
+    }
+
+    fn mode(&self) -> Mode {
+        if self.opts.bre {
+            Mode::Bre
+        } else if self.opts.ere {
+            Mode::Ere
+        } else {
+            Mode::Are
+        }
     }
 
     fn at(&self, off: usize) -> Option<char> {
@@ -197,7 +220,8 @@ impl Parser {
     }
 
     fn skip_ws(&mut self) {
-        if !self.opts.expanded {
+        // Expanded 是 ARE 扩展；BRE/ERE 里空白与 # 都是普通字符。
+        if !self.opts.expanded || self.mode() != Mode::Are {
             return;
         }
         loop {
@@ -219,6 +243,10 @@ impl Parser {
     // ── 分支/交替 ────────────────────────────────────────────────
 
     fn parse_alt(&mut self) -> Result<Node, Error> {
+        // BRE 没有交替：`|` 是普通字符。
+        if self.mode() == Mode::Bre {
+            return self.parse_branch();
+        }
         let mut branches = vec![self.parse_branch()?];
         loop {
             self.skip_ws();
@@ -233,43 +261,132 @@ impl Parser {
     }
 
     fn parse_branch(&mut self) -> Result<Node, Error> {
+        let bre = self.mode() == Mode::Bre;
         let mut parts = Vec::new();
         loop {
             self.skip_ws();
             match self.peek() {
-                None | Some('|') | Some(')') => break,
-                _ => parts.push(self.parse_quantified()?),
+                None => break,
+                Some('|') if !bre => break,
+                Some(')') if !bre && (self.mode() != Mode::Ere || self.depth > 0) => break,
+                // BRE 的子表达式以 `\)` 结束。
+                Some('\\') if bre && self.at(1) == Some(')') => break,
+                _ => {}
             }
+            // BRE 的 ^ 只在 RE/子表达式开头是约束；$ 只在结尾是约束。
+            if bre && parts.is_empty() && self.peek() == Some('^') {
+                self.i += 1;
+                parts.push(Node::assert(if self.opts.anchors_by_line() {
+                    AssertKind::Bol
+                } else {
+                    AssertKind::Bos
+                }));
+                continue;
+            }
+            if bre && self.peek() == Some('$') && self.bre_dollar_at_end() {
+                self.i += 1;
+                parts.push(Node::assert(if self.opts.anchors_by_line() {
+                    AssertKind::Eol
+                } else {
+                    AssertKind::Eos
+                }));
+                continue;
+            }
+            parts.push(self.parse_quantified()?);
         }
         Ok(Node::concat(parts))
+    }
+
+    /// BRE 中 `$` 后面是 RE 结尾或子表达式结尾（`\)`）时才是锚点。
+    fn bre_dollar_at_end(&self) -> bool {
+        match self.at(1) {
+            None => true,
+            Some('\\') => self.at(2) == Some(')'),
+            _ => false,
+        }
     }
 
     /// 一个原子 + 可选量词（Spencer `parseqatom`）。
     fn parse_quantified(&mut self) -> Result<Node, Error> {
         let atom = self.parse_atom()?;
         self.skip_ws();
-        let (min, max, qprefer) = match self.peek() {
-            Some('*') => {
-                self.i += 1;
-                (0, DUPINF, Flags::LONGER)
+        let mode = self.mode();
+        // 约束（^ $ \A \Z \y ... 与 lookahead）不得带量词。
+        let begins_quantifier = match mode {
+            Mode::Bre => {
+                self.peek() == Some('*')
+                    || (self.peek() == Some('\\') && self.at(1) == Some('{'))
             }
-            Some('+') => {
-                self.i += 1;
-                (1, DUPINF, Flags::LONGER)
+            _ => {
+                matches!(self.peek(), Some('*') | Some('+') | Some('?'))
+                    || (self.peek() == Some('{')
+                        && self.at(1).map(|c| c.is_ascii_digit()).unwrap_or(false))
             }
-            Some('?') => {
-                self.i += 1;
-                (0, 1, Flags::LONGER)
-            }
-            Some('{') if self.at(1).map(|c| c.is_ascii_digit()).unwrap_or(false) => {
-                let (m, n, comma) = self.scan_bound()?;
-                let pref = if comma { Flags::LONGER } else { Flags::NONE };
-                (m, n, pref)
-            }
-            _ => return Ok(atom),
         };
-        // 惰性后缀。
-        let qprefer = if self.peek() == Some('?') {
+        if begins_quantifier
+            && matches!(
+                atom.kind,
+                super::ast::NodeKind::Assert(_) | super::ast::NodeKind::Look { .. }
+            )
+        {
+            return Err(Self::err("REG_BADRPT", "quantifier operand invalid"));
+        }
+        let (min, max, qprefer) = match mode {
+            Mode::Bre => {
+                if self.peek() == Some('*') {
+                    self.i += 1;
+                    (0, DUPINF, Flags::LONGER)
+                } else if self.peek() == Some('\\') && self.at(1) == Some('{') {
+                    let (m, n, comma) = self.scan_bre_bound()?;
+                    let pref = if comma { Flags::LONGER } else { Flags::NONE };
+                    (m, n, pref)
+                } else {
+                    return Ok(atom);
+                }
+            }
+            Mode::Ere => match self.peek() {
+                Some('*') => {
+                    self.i += 1;
+                    (0, DUPINF, Flags::LONGER)
+                }
+                Some('+') => {
+                    self.i += 1;
+                    (1, DUPINF, Flags::LONGER)
+                }
+                Some('?') => {
+                    self.i += 1;
+                    (0, 1, Flags::LONGER)
+                }
+                Some('{') if self.at(1).map(|c| c.is_ascii_digit()).unwrap_or(false) => {
+                    let (m, n, comma) = self.scan_bound()?;
+                    let pref = if comma { Flags::LONGER } else { Flags::NONE };
+                    (m, n, pref)
+                }
+                _ => return Ok(atom),
+            },
+            Mode::Are => match self.peek() {
+                Some('*') => {
+                    self.i += 1;
+                    (0, DUPINF, Flags::LONGER)
+                }
+                Some('+') => {
+                    self.i += 1;
+                    (1, DUPINF, Flags::LONGER)
+                }
+                Some('?') => {
+                    self.i += 1;
+                    (0, 1, Flags::LONGER)
+                }
+                Some('{') if self.at(1).map(|c| c.is_ascii_digit()).unwrap_or(false) => {
+                    let (m, n, comma) = self.scan_bound()?;
+                    let pref = if comma { Flags::LONGER } else { Flags::NONE };
+                    (m, n, pref)
+                }
+                _ => return Ok(atom),
+            },
+        };
+        // 惰性后缀（ARE 专有；ERE 里 `a+?` 是 BADRPT，BRE 里 ? 是字面）。
+        let qprefer = if mode == Mode::Are && self.peek() == Some('?') {
             self.i += 1;
             match qprefer {
                 Flags::LONGER => Flags::SHORTER,
@@ -278,12 +395,20 @@ impl Parser {
         } else {
             qprefer
         };
-        // 连续量词（a**）→ BADRPT。
+        // 连续量词（a** / a+? / a\{2\}\{3\}）→ BADRPT。
         self.skip_ws();
-        if matches!(self.peek(), Some('*') | Some('+') | Some('?'))
-            || (self.peek() == Some('{')
-                && self.at(1).map(|c| c.is_ascii_digit()).unwrap_or(false))
-        {
+        let consecutive = match mode {
+            Mode::Bre => {
+                self.peek() == Some('*')
+                    || (self.peek() == Some('\\') && self.at(1) == Some('{'))
+            }
+            _ => {
+                matches!(self.peek(), Some('*') | Some('+') | Some('?'))
+                    || (self.peek() == Some('{')
+                        && self.at(1).map(|c| c.is_ascii_digit()).unwrap_or(false))
+            }
+        };
+        if consecutive {
             return Err(Self::err("REG_BADRPT", "quantifier operand invalid"));
         }
         if let super::ast::NodeKind::Backref { subno, .. } = atom.kind {
@@ -319,6 +444,7 @@ impl Parser {
         }
         let mut comma = false;
         let mut n = m;
+        let mut unbounded = false;
         if self.eat(',') {
             comma = true;
             if self.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
@@ -333,12 +459,64 @@ impl Parser {
                 n = v;
             } else {
                 n = DUPINF;
+                unbounded = true;
             }
         }
         if !self.eat('}') {
+            // 到串尾仍无 `}` → EBRACE；其他杂字符 → BADBR。
+            if self.peek().is_none() {
+                return Err(Self::err("REG_EBRACE", "braces {} not balanced"));
+            }
             return Err(bad());
         }
-        if m > DUPMAX || n > DUPMAX || m > n {
+        if m > DUPMAX || (!unbounded && n > DUPMAX) || m > n {
+            return Err(bad());
+        }
+        Ok((m, n, comma))
+    }
+
+    /// BRE 边界 `\{m\}` / `\{m,\}` / `\{,n\}` / `\{m,n\}`（`\{` 已确认）。
+    fn scan_bre_bound(&mut self) -> Result<(u32, u32, bool), Error> {
+        let bad = || Self::err("REG_BADBR", "invalid repetition count(s)");
+        self.i += 2; // '\{'
+        let mut m = 0u32;
+        while let Some(c) = self.peek() {
+            if !c.is_ascii_digit() {
+                break;
+            }
+            m = m.saturating_mul(10).saturating_add(c as u32 - '0' as u32);
+            self.i += 1;
+        }
+        let mut comma = false;
+        let mut n = m;
+        let mut unbounded = false;
+        if self.eat(',') {
+            comma = true;
+            if self.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                let mut v = 0u32;
+                while let Some(c) = self.peek() {
+                    if !c.is_ascii_digit() {
+                        break;
+                    }
+                    v = v.saturating_mul(10).saturating_add(c as u32 - '0' as u32);
+                    self.i += 1;
+                }
+                n = v;
+            } else {
+                n = DUPINF;
+                unbounded = true;
+            }
+        }
+        // 结束符 `\}`；缺 `}` 是 EBRACE，其他杂字符是 BADBR
+        //（tclsh 实测：`a\{2` → braces {} not balanced）。
+        if self.peek() == Some('\\') && self.at(1) == Some('}') {
+            self.i += 2;
+        } else if self.peek().is_none() {
+            return Err(Self::err("REG_EBRACE", "braces {} not balanced"));
+        } else {
+            return Err(bad());
+        }
+        if m > DUPMAX || (!unbounded && n > DUPMAX) || m > n {
             return Err(bad());
         }
         Ok((m, n, comma))
@@ -351,6 +529,11 @@ impl Parser {
             Some(c) => c,
             None => return Ok(Node::empty()),
         };
+        match self.mode() {
+            Mode::Bre => return self.parse_atom_bre(c),
+            Mode::Ere => return self.parse_atom_ere(c),
+            Mode::Are => {}
+        }
         match c {
             '(' => self.parse_group(),
             '[' => self.parse_class(),
@@ -390,6 +573,157 @@ impl Parser {
         }
     }
 
+    /// POSIX ERE：括号/交替/量词与 ARE 相同，但没有 ARE 扩展。
+    fn parse_atom_ere(&mut self, c: char) -> Result<Node, Error> {
+        match c {
+            '(' => self.parse_ere_group(),
+            '[' => self.parse_class(),
+            '.' => {
+                self.i += 1;
+                Ok(Node::class(CharSet::dot(self.opts.dot_stops_newline())))
+            }
+            '^' => {
+                self.i += 1;
+                Ok(Node::assert(if self.opts.anchors_by_line() {
+                    AssertKind::Bol
+                } else {
+                    AssertKind::Bos
+                }))
+            }
+            '$' => {
+                self.i += 1;
+                Ok(Node::assert(if self.opts.anchors_by_line() {
+                    AssertKind::Eol
+                } else {
+                    AssertKind::Eos
+                }))
+            }
+            '\\' => {
+                self.i += 1;
+                self.parse_quote_escape()
+            }
+            '*' | '+' | '?' => Err(Self::err("REG_BADRPT", "quantifier operand invalid")),
+            '{' if self.at(1).map(|c| c.is_ascii_digit()).unwrap_or(false) => {
+                Err(Self::err("REG_BADRPT", "quantifier operand invalid"))
+            }
+            ')' if self.depth == 0 => {
+                // POSIX ERE：没有对应 `(` 的 `)` 是普通字符。
+                self.i += 1;
+                Ok(Node::char(')' as u32))
+            }
+            ')' => Err(Self::err("REG_EPAREN", "parentheses () not balanced")),
+            _ => {
+                self.i += 1;
+                Ok(Node::char(c as u32))
+            }
+        }
+    }
+
+    /// ERE 的 `\x`：反斜杠只取消下一个字符的特殊含义（`\1` 是字面
+    /// `1`，`\A` 是字面 `A`；ERE 无回引/Perl 类/约束转义）。
+    fn parse_quote_escape(&mut self) -> Result<Node, Error> {
+        match self.peek() {
+            Some(c) => {
+                self.i += 1;
+                Ok(Node::char(c as u32))
+            }
+            None => Err(Self::err("REG_EESCAPE", "invalid escape \\ sequence")),
+        }
+    }
+
+    fn parse_ere_group(&mut self) -> Result<Node, Error> {
+        self.i += 1; // '('
+        // ERE 没有 `(?:` / `(?=` / `(?i` 等扩展：`?` 紧跟 `(` 是
+        // 没有操作数的量词（tclsh 报 quantifier operand invalid）。
+        if self.peek() == Some('?') {
+            return Err(Self::err("REG_BADRPT", "quantifier operand invalid"));
+        }
+        let subno = self.next_sub;
+        self.next_sub += 1;
+        self.depth += 1;
+        let inner = self.parse_alt();
+        self.depth -= 1;
+        let inner = inner?;
+        if !self.eat(')') {
+            return Err(Self::err("REG_EPAREN", "parentheses () not balanced"));
+        }
+        if self.closed.len() <= subno {
+            self.closed.resize(subno + 1, false);
+        }
+        self.closed[subno] = true;
+        Ok(Node::capture(inner, subno))
+    }
+
+    /// POSIX BRE：`( ) | + ? { }` 普通；`\(`/`\)` 分组、
+    /// `\{`/`\}` 边界、`\1`-`\9` 回引、`\<`/`\>` 词边界。
+    fn parse_atom_bre(&mut self, c: char) -> Result<Node, Error> {
+        match c {
+            '\\' => {
+                self.i += 1;
+                self.parse_bre_escape_atom()
+            }
+            '[' => self.parse_class(),
+            '.' => {
+                self.i += 1;
+                Ok(Node::class(CharSet::dot(self.opts.dot_stops_newline())))
+            }
+            _ => {
+                // ^ 只在分支/子表达式开头（已由 parse_branch 处理）；
+                // 其余特殊字符在 BRE 里都是普通字符。
+                self.i += 1;
+                Ok(Node::char(c as u32))
+            }
+        }
+    }
+
+    fn parse_bre_escape_atom(&mut self) -> Result<Node, Error> {
+        let e = match self.peek() {
+            Some(e) => e,
+            None => return Err(Self::err("REG_EESCAPE", "invalid escape \\ sequence")),
+        };
+        self.i += 1;
+        match e {
+            '(' => {
+                let subno = self.next_sub;
+                self.next_sub += 1;
+                let inner = self.parse_alt()?;
+                if !(self.peek() == Some('\\') && self.at(1) == Some(')')) {
+                    return Err(Self::err("REG_EPAREN", "parentheses () not balanced"));
+                }
+                self.i += 2;
+                if self.closed.len() <= subno {
+                    self.closed.resize(subno + 1, false);
+                }
+                self.closed[subno] = true;
+                Ok(Node::capture(inner, subno))
+            }
+            '1'..='9' => {
+                // 只允许单数字回引；`\10` 是 invalid backreference。
+                if self.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    return Err(Self::err(
+                        "REG_ESUBREG",
+                        "invalid backreference number",
+                    ));
+                }
+                let subno = e as usize - '0' as usize;
+                let closed = self.closed.get(subno).copied().unwrap_or(false);
+                if !closed {
+                    return Err(Self::err(
+                        "REG_ESUBREG",
+                        "invalid backreference number",
+                    ));
+                }
+                Ok(Node::backref(subno, 1, 1, Flags::NONE))
+            }
+            '<' => Ok(Node::assert(AssertKind::WordStart)),
+            '>' => Ok(Node::assert(AssertKind::WordEnd)),
+            // `\{` 在原子位置没有可量化的对象。
+            '{' => Err(Self::err("REG_BADRPT", "quantifier operand invalid")),
+            // 其余 `\x` 一律是字面 x（`\d`→d、`\n`→n、`\}`→}）。
+            _ => Ok(Node::char(e as u32)),
+        }
+    }
+
     fn parse_group(&mut self) -> Result<Node, Error> {
         self.i += 1; // '('
         if self.peek() == Some('?') {
@@ -401,7 +735,14 @@ impl Parser {
                     if !self.eat(')') {
                         return Err(Self::err("REG_EPAREN", "parentheses () not balanced"));
                     }
-                    Ok(inner)
+                    // 非捕获组保留包裹层：`(?:\M)+` 可被量化（tclsh
+                    // 允许），但不能被误判成「量化约束」。内部无捕获
+                    // 时用 NoRecord 包裹（语义透明、记录行为不变）。
+                    if has_capture(&inner) {
+                        Ok(inner)
+                    } else {
+                        Ok(Node::no_record(inner))
+                    }
                 }
                 Some('=') | Some('!') => {
                     let negative = self.peek() == Some('!');
@@ -416,19 +757,22 @@ impl Parser {
                     Ok(Node::look(negative, inner))
                 }
                 Some('<') => Err(Self::err("REG_BADRPT", "quantifier operand invalid")),
-                _ => Err(Self::err("REG_BADOPT", "invalid embedded option")),
+                // `(?` 出现在 pattern 中间（或 `(?-i)` 这类不是内嵌
+                // 选项的写法）时，tclsh 把它当缺操作数的量词。
+                _ => Err(Self::err("REG_BADRPT", "quantifier operand invalid")),
             }
         } else {
-            let subno = self.next_sub;
-            self.next_sub += 1;
             if self.lacon > 0 {
-                // lookahead 内所有括号非捕获。
+                // lookahead 内所有括号非捕获，且不占用组号（tclsh：
+                // `(?=(a))(a)` 的 (a) 仍是第 1 组）。
                 let inner = self.parse_alt()?;
                 if !self.eat(')') {
                     return Err(Self::err("REG_EPAREN", "parentheses () not balanced"));
                 }
                 return Ok(inner);
             }
+            let subno = self.next_sub;
+            self.next_sub += 1;
             let inner = self.parse_alt()?;
             if !self.eat(')') {
                 return Err(Self::err("REG_EPAREN", "parentheses () not balanced"));
@@ -458,7 +802,7 @@ impl Parser {
             'M' => Ok(Node::assert(AssertKind::WordEnd)),
             'y' => Ok(Node::assert(AssertKind::WordB)),
             'Y' => Ok(Node::assert(AssertKind::NotWordB)),
-            'A' => Ok(Node::assert(AssertKind::Bos)),
+            'A' => Ok(Node::assert(AssertKind::Bot)),
             'Z' => Ok(Node::assert(AssertKind::Eos)),
             'z' => Err(Self::err("REG_EESCAPE", "invalid escape \\ sequence")),
             'b' => Ok(Node::char(0x08)),
@@ -591,20 +935,75 @@ impl Parser {
             items.push(Item::Range(']' as u32, ']' as u32));
             self.i += 1;
         }
+        // 紧跟在 range 后的 `-x` 会与前一 range 共享端点（`[a-b-c]`），
+        // tclsh 报 invalid character range。范围错误延迟到 `]` 之后
+        // 再报——未闭合的括号优先报 EBRACK（tclsh 实测 `[z-a`）。
+        let mut just_range = false;
+        let mut bad_range = false;
+        // 第一处 range 错误结束的位置：若错误正好结束于串尾，tclsh
+        // 报 EBRACK（`[z-a`），后面还有字符则报 ERANGE（`[z-ab`）。
+        let mut bad_range_at = 0usize;
         loop {
             match self.peek() {
-                None => return Err(Self::err("REG_EBRACK", "brackets [] not balanced")),
+                None => {
+                    // 串尾是 `[` 且紧跟在坏 range 之后时，tclsh 先报
+                    // 括号未闭合（`[z-a[`）；否则报范围错误。
+                    if bad_range
+                        && bad_range_at < self.i
+                        && !(bad_range_at + 1 == self.i
+                            && self.chars.get(bad_range_at) == Some(&'['))
+                    {
+                        return Err(Self::err("REG_ERANGE", "invalid character range"));
+                    }
+                    return Err(Self::err("REG_EBRACK", "brackets [] not balanced"));
+                }
                 Some(']') => {
                     self.i += 1;
                     break;
                 }
                 Some('[') if matches!(self.at(1), Some(':') | Some('.') | Some('=')) => {
-                    if let Some(item) = self.parse_posix_or_collate()? {
-                        items.push(item);
+                    // 已发现坏 range 时，后续 class 元素的错误不再
+                    // 抢先（tclsh：`[z-a[:x:]` → invalid character range）。
+                    match self.parse_posix_or_collate() {
+                        Ok(item) => {
+                            if let Some(item) = item {
+                                items.push(item);
+                            }
+                        }
+                        Err(e) => {
+                            if bad_range {
+                                return Err(Self::err(
+                                    "REG_ERANGE",
+                                    "invalid character range",
+                                ));
+                            }
+                            // 外层 class 没有闭合 `]` 时，tclsh 先报
+                            // EBRACK（`[a-b[:foo:]`）。
+                            if e.code == "REG_ECTYPE"
+                                && !self.chars[self.i..].contains(&']')
+                            {
+                                return Err(Self::err(
+                                    "REG_EBRACK",
+                                    "brackets [] not balanced",
+                                ));
+                            }
+                            return Err(e);
+                        }
                     }
+                    // class 元素后面跟 `-x` 也是非法 range
+                    //（tclsh：`[[:digit:]-a]` → invalid character range）。
+                    just_range = true;
                     continue;
                 }
                 _ => {}
+            }
+            if just_range && self.peek() == Some('-') {
+                if let Some(n) = self.at(1) {
+                    if n != ']' && !bad_range {
+                        bad_range = true;
+                        bad_range_at = self.i;
+                    }
+                }
             }
             let lo = self.parse_class_char()?;
             // 范围：Char '-' Char（'-' 在末尾/开头时是字面）。
@@ -621,27 +1020,44 @@ impl Parser {
                     match self.parse_class_char()? {
                         ClassAtom::Char(hi_c) => {
                             if (lo_c as u32) > (hi_c as u32) {
-                                return Err(Self::err(
-                                    "REG_ERANGE",
-                                    "invalid range in brackets",
-                                ));
+                                if !bad_range {
+                                    bad_range_at = self.i;
+                                }
+                                bad_range = true;
+                            } else {
+                                items.push(Item::Range(lo_c as u32, hi_c as u32));
+                                just_range = true;
                             }
-                            items.push(Item::Range(lo_c as u32, hi_c as u32));
                         }
-                        ClassAtom::Pred(p) => {
-                            // Tcl 对 [a-\d] 的处理：'-' 与谓词分别字面/谓词。
-                            items.push(Item::Range(lo_c as u32, lo_c as u32));
-                            items.push(Item::Range('-' as u32, '-' as u32));
-                            items.push(Item::Pred(p));
+                        ClassAtom::Pred(_) => {
+                            // class 端点不能构成 range（tclsh：
+                            // `[a-\d]` → invalid character range）。
+                            if !bad_range {
+                                bad_range_at = self.i;
+                            }
+                            bad_range = true;
                         }
                     }
                     continue;
                 }
+            } else if self.peek() == Some('-')
+                && self.at(1).is_some()
+                && self.at(1) != Some(']')
+            {
+                // `[\d-a]`：谓词端点同样非法。
+                if !bad_range {
+                    bad_range_at = self.i;
+                }
+                bad_range = true;
             }
+            just_range = false;
             match lo {
                 ClassAtom::Char(c) => items.push(Item::Range(c as u32, c as u32)),
                 ClassAtom::Pred(p) => items.push(Item::Pred(p)),
             }
+        }
+        if bad_range {
+            return Err(Self::err("REG_ERANGE", "invalid character range"));
         }
         Ok(Node::class(CharSet::new(
             neg,
@@ -687,6 +1103,11 @@ impl Parser {
         self.i += 1;
         if c != '\\' {
             return Ok(ClassAtom::Char(c));
+        }
+        // BRE/ERE 的方括号里反斜杠没有转义作用，是普通字符
+        //（tclsh 实测：`[\n]` 匹配反斜杠或 n，`[\\]` 匹配一个反斜杠）。
+        if self.mode() != Mode::Are {
+            return Ok(ClassAtom::Char('\\'));
         }
         let e = match self.peek() {
             Some(e) => e,
@@ -791,6 +1212,18 @@ trait AsciiOctal {
 impl AsciiOctal for u8 {
     fn is_ascii_octal(self) -> bool {
         (b'0'..=b'7').contains(&self)
+    }
+}
+
+/// 子树是否含捕获组（决定 `(?:...)` 能否用 NoRecord 包裹）。
+fn has_capture(n: &Node) -> bool {
+    match &n.kind {
+        NodeKind::Capture { .. } => true,
+        NodeKind::Concat(v) | NodeKind::Alt(v) => v.iter().any(has_capture),
+        NodeKind::Repeat { node, .. }
+        | NodeKind::NoRecord(node)
+        | NodeKind::Look { node, .. } => has_capture(node),
+        _ => false,
     }
 }
 

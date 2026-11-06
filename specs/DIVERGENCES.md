@@ -265,25 +265,32 @@
   regex-escapes.tcl / oct*.tcl / bref.tcl 差分全 SAME。
 - **严重度**：已关闭。
 
-### D-20 惰性量词的匹配偏好语义（spec [D-19]）
+### D-20 惰性量词的匹配偏好语义（spec [D-19]）[FIXED 2026-11-06]
 - **Tcl 8.6**：`regexp -inline {(a+?)(a*)} aaa` → `{a a {}}`（Spencer
   引擎偏好：整体匹配停在惰性组最小展开）。
 - **rtcl**：`{aaa a aa}`（回溯引擎首个命中 = Perl 风格）。
-- **严重度**：中（BT 引擎需实现 Tcl 偏好序，非平凡）。
+- **关闭（B 路径）**：Spencer 移植的 subre `COMBINE` 偏好序
+  已复刻（`(a+?)(a*)` → `{a a {}}`、`(a+)(a*?)` → `aaa`），
+  且 `regexp`/`regsub` 默认走新引擎（`RTCL_REGEX_ENGINE=fast`
+  可退回旧路径）。759 例定向语料捕获 0 差异。
 - **残余说明（2026-11-06）**：matching-deep 的其余 4 条 DIFF 已确认
   是 probe harness 伪差（未 catch 的顶层错误：tclsh stdin rc=0 无
   "Error: " 前缀 vs rtcl -c rc=1 自带前缀），探针已改为 catch/结构化
-  断言；**唯一真实残差就是本条**（119 SAME / 1 DIFF）。
+  断言；**唯一真实残差就是本条**（119 SAME / 1 DIFF），现已关闭。
 - **量化评估**：见 `specs/regex-engine-eval.md`（定向 759 例 62 差异
   = 8.2%，随机 4000 例 523 差异 = 13.1%；惰性/SHORTER 约 87%、
   leftmost-longest 约 9%、POSIX 子匹配约 4%）。sregex 类
   Perl 兼容流式引擎**不能**修复本条，不建议复刻；路线建议（BT 精确化
   / Spencer 移植）见该文档。
 
-### D-21 `\A` 在 `-lineanchor -start` 下被改写为 `^`（spec [D-20]）
+### D-21 `\A` 在 `-lineanchor -start` 下被改写为 `^`（spec [D-20]）[FIXED 2026-11-06]
 - **Tcl 8.6**：`\A` 只绑定 -start 偏移。
 - **rtcl**：fast 引擎把 `\A` 改写 `(?m)^`，行首误命中
   （`regexp -lineanchor -start 1 {\Aa} "b\na"` → 1 vs tclsh 0）。
+- **关闭（B 路径）**：Spencer 断言拆成 `Bos`（`^`，绝对串首）与
+  `Bot`（`\A`，绑定 `search_start`/`-start`）；`-lineanchor` 下
+  `\A` 不再变行首。`regexp -start 1 {\Aa} ba` → 1、
+  `-start 1 {^a} ba` → 0 与 tclsh 一致。
 - **严重度**：低。
 
 ### D-22 `regsub -command` 为 rtcl 独有扩展（spec [D-21]）
@@ -796,23 +803,23 @@
   有意扩展（dict-deep 17/3）。
 - **严重度**：已关闭（io 面）。
 
-### D-46 POSIX leftmost-longest vs leftmost-first（2026-11-06 评估）[OPEN]
+### D-46 POSIX leftmost-longest vs leftmost-first（2026-11-06 评估）[FIXED 2026-11-06]
 - **Tcl 8.6.17**（Spencer `regexec`）：默认同一位置取**最长**整体匹配
   （`a|ab` 在 `ab` 上 → `ab`；`(a|ab)` 捕获 `ab`）；子匹配按 POSIX
   消歧（`(a*)+` 在 `a` 上整体 `a`、组 `{}`）。
-- **rtcl**：fast 引擎（Rust `regex` crate）与 BT 引擎均为
+- **rtcl 旧引擎**：fast 引擎（Rust `regex` crate）与 BT 引擎均为
   leftmost-first（Perl）：`a|ab` → `a`；重复组捕获取贪婪迭代
   （`(a*)+` → 组 `a`）。
 - **影响面**：随机 4000 例语料 47 例纯最长差异 + 21 例子匹配差异；
   与 D-20（惰性/SHORTER）合计 523/4000（13.1%）。
+- **关闭（B 路径）**：Spencer Rust 移植 M0-M3 完成——ARE 解析 +
+  NFA/DFA + POSIX-leftmost-longest/SHORTER 整体匹配 + `cdissect`
+  捕获消歧；随机 4000 例 `-inline`（整体+全部捕获）与 tclsh
+  **0 差异**，定向 759 例 0 差异。`regexp`/`regsub` 已默认路由新引擎
+  （`RTCL_REGEX_ENGINE=fast` 退回旧引擎）。
 - **评估**：`specs/regex-engine-eval.md`（含 sregex 复刻取舍：Perl
   语义 + octet-only + 无回引/环视，不能修本条，不建议引入）。
-- **进展（B 路径，2026-11-06）**：Spencer Rust 移植 M0-M2 完成
-  （`specs/regex-spencer-port.md`）——ARE 解析 + NFA + POSIX
-  longest/SHORTER 整体匹配；随机 4000 例整体 span 与 tclsh **0 差异**。
-  捕获 dissect（M3）尚未接线，故本条仍 OPEN。
-- **严重度**：中（需要 Spencer 语义引擎或 POSIX-longest 引擎 +
-  子匹配消歧；与 D-20 同批收口）。
+- **严重度**：已关闭。
 
 ## rtcl 有意扩展（超集，非 bug，parity 语料不应使用）
 

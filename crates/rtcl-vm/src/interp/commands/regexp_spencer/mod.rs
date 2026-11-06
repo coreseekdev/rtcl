@@ -43,6 +43,16 @@ pub fn compile(pattern: &str, opts: Options) -> Result<Prog, Error> {
     nfa::compile(&tree, opts.icase)
 }
 
+/// 运行时选择。Spencer 移植已是默认引擎；`RTCL_REGEX_ENGINE=fast`
+///（或 `0`/`off`）可退回旧的 fast/BT 路径（差分/应急用），
+/// `spencer`/`1` 显式选择新引擎。
+pub fn engine_selected() -> bool {
+    !matches!(
+        std::env::var("RTCL_REGEX_ENGINE").as_deref(),
+        Ok("fast") | Ok("0") | Ok("off")
+    )
+}
+
 /// 解析为 `subre` 树（解析器单测/调试入口）。
 pub fn parse(pattern: &str, opts: Options) -> Result<Node, Error> {
     parser::parse(pattern, opts)
@@ -173,5 +183,70 @@ mod tests {
         {
             let _ = parse(p, Options::default());
         }
+    }
+
+    fn m_mode(pat: &str, text: &str, opts: Options) -> Option<(usize, usize)> {
+        let prog = compile(pat, opts).unwrap();
+        find(&prog, text, 0).map(|m| (m.start, m.end))
+    }
+
+    fn bre() -> Options {
+        Options { bre: true, ..Options::default() }
+    }
+
+    fn ere() -> Options {
+        Options { ere: true, ..Options::default() }
+    }
+
+    #[test]
+    fn bre_dialect() {
+        // | + ? ( ) { } 普通；\( \) \( \{ \) 是运算符。
+        assert_eq!(m_mode("a|b", "a|b", bre()), Some((0, 3)));
+        assert_eq!(m_mode("a|b", "a", bre()), None);
+        assert_eq!(m_mode(r"a\+", "aaa", bre()), None);
+        assert_eq!(m_mode(r"a\{2,3\}", "aaaa", bre()), Some((0, 3)));
+        assert_eq!(m_mode(r"a\{,2\}", "aa", bre()), Some((0, 2)));
+        assert_eq!(m_mode(r"\(a\)\1", "aa", bre()), Some((0, 2)));
+        assert_eq!(m_mode("a^b", "a^b", bre()), Some((0, 3)));
+        assert_eq!(m_mode("$a", "$a", bre()), Some((0, 2)));
+        assert_eq!(m_mode(r"\(^a\)", "a", bre()), Some((0, 1)));
+        assert_eq!(m_mode("*a*", "*aa", bre()), Some((0, 3)));
+        assert_eq!(m_mode(r"\d", "d", bre()), Some((0, 1)));
+        assert_eq!(m_mode(r"\[", "[", bre()), Some((0, 1)));
+        assert_eq!(m_mode(r"[\n]", "\\", bre()), Some((0, 1)));
+        assert_eq!(
+            compile(r"a\{2", bre()).unwrap_err().code,
+            "REG_EBRACE"
+        );
+        assert_eq!(
+            compile(r"a\{2,1\}", bre()).unwrap_err().code,
+            "REG_BADBR"
+        );
+        assert_eq!(compile(r"\10", bre()).unwrap_err().code, "REG_ESUBREG");
+    }
+
+    #[test]
+    fn ere_dialect() {
+        // ERE 无 Perl 类/回引/懒惰量词/内嵌选项；\x 一律字面 x。
+        assert_eq!(m_mode(r"\d", "d", ere()), Some((0, 1)));
+        assert_eq!(m_mode(r"(a)\1", "a1", ere()), Some((0, 2)));
+        assert_eq!(m_mode(r"\{", "{", ere()), Some((0, 1)));
+        assert_eq!(m_mode(r"[\n]", "\\", ere()), Some((0, 1)));
+        assert_eq!(m_mode(r"(?e)a|b", "a", Options::default()), Some((0, 1)));
+        assert!(compile(r"a+?", ere()).is_err());
+        assert_eq!(
+            compile("(?e)(?i)a", Options::default()).unwrap_err().code,
+            "REG_BADRPT"
+        );
+        assert_eq!(
+            compile("(?e)(?:a)", Options::default()).unwrap_err().code,
+            "REG_BADRPT"
+        );
+        assert_eq!(
+            compile("(?e)(?=a)", Options::default()).unwrap_err().code,
+            "REG_BADRPT"
+        );
+        // BRE 里 (?...) 全是普通字符（tclsh 实测能编译、不匹配）。
+        assert_eq!(m_mode("(?b)(?i)a", "a", Options::default()), None);
     }
 }

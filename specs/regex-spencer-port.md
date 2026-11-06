@@ -72,10 +72,10 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
 
 与现有引擎的关系：
 
-- 新增 feature `regexp-spencer`（默认关闭，验证后转默认）。
-- `regexp_cmds` 在 feature 开启或 `RTCL_REGEX_ENGINE=spencer` 时
-  路由到新引擎；其余保持现状（避免未完成期回归）。
-- fast 引擎保留为"无歧义模式"的加速路径（M4 再评估）。
+- 新增 feature `regexp-spencer`（已并入 `rtcl_std` 默认开启）。
+- `regexp_cmds` 默认路由到新引擎；`RTCL_REGEX_ENGINE=fast` 退回旧
+  fast/BT 路径（差分/应急）。
+- fast 引擎保留为旧语义对照路径（不再是默认）。
 
 ## 4. 语义清单（验收口径）
 
@@ -134,7 +134,7 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
 ## 7. 实施状态（2026-11-06）
 
 - **M0 完成**：模块骨架/feature 门控/API（`regexp_spencer::{compile,
-  parse,find,is_match}`；`regexp-spencer` 默认关闭）。
+  parse,find,is_match}`；M5 后默认开启）。
 - **M1 完成**：ARE 解析器（`parser.rs`）覆盖字符/类/量词（含惰性/
   `{m,n}`）/交替/捕获/非捕获/lookahead（解析层）/断言/转义
   （`\u\U\x`、八进制/回引启发式、`\b\B\a`、`\z` 拒绝）/
@@ -162,13 +162,24 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   回溯执行（枚举 AST 终点 + 捕获快照 + 预算上限，空捕获回引按
   Spencer "matched trivially" 处理）。随机 4000 例与定向 759 例
   （含 lookahead/回引/\y/断言）捕获均 **0 差异**。
-- **M4 剩余**：BRE/ERE（`(?b)`/`(?e)`/`***:` 的方言语法；当前按
-  ARE 解析）、`-about` 等命令面；M5：`regexp/regsub` 路由接线、
-  `-inline/-indices/-all/-start` 全量、默认化与 go/no-go。
+- **M4 完成（方言 + 命令面）**：BRE/ERE 语法（`(?b)`/`(?e)`/`***:`
+  下的分组/量词/回引/转义/锚点位置规则/类内反斜杠字面/错误优先级）
+  按 tclsh 探针钉死；`regexp -about` 的 re_info 标志面
+  （UBACKREF/ULOOKAHEAD/UBOUNDS/UBRACES/UBSALNUM/UPBOTCH/UNONPOSIX/
+  UUNSPEC/ULOCALE/UEMPTYMATCH/UIMPOSSIBLE/USHORTEST）按位序复刻。
+  验证：BRE/ERE 定向探针 + 2500 pattern × 21 string 随机方言语料
+  **0 差异**；`-about` 3000 pattern 随机语料仅余 2 例 `\y` 与
+  `^$` 空串推理的极端不可命中标志（记录为已知边界）。
+- **M5 完成（默认化）**：`regexp`/`regsub`（`-inline/-indices/-all/
+  -start/-about` 与 `regsub` 替换）走 Spencer 引擎；`array names
+  -regexp`/`lsort -regexp`/switch 等 `engine_is_match` 消费者同步。
+  默认特征并入 `rtcl_std`；`RTCL_REGEX_ENGINE=fast` 可退回旧
+  fast/BT 路径做差分。门禁：judge 88/88、probes 失败集与基线逐项
+  相同（111 个存量非正则项）、4000+759 捕获 0 差异、单元测试 9/9。
 - 验证命令：
-  `cargo test -p rtcl-vm --lib --features regexp-spencer regexp_spencer`
-  （7/7）；`specs/tclmem.sh 'python3 specs/regex/spencer-overall.py'`
-  （4000/4000）。
+  `cargo test -p rtcl-vm --lib --features regexp,regexp-spencer regexp_spencer`
+  （9/9）；`specs/tclmem.sh 'python3 specs/regex/spencer-overall.py'`
+  （4000/4000）；`specs/regex/dialect-probes.tcl` + `judge/run.sh`。
 
 ## 8. 性能结构（Rust 版）
 
@@ -212,7 +223,22 @@ compacted NFA（小整数弧表）→ lazy DFA 缓存 → dissect 复用。Rust 
 UTF-8→char 转换：2.4-3.3 GB/s（每次 regexp 调用一次性成本）。
 DFA 缓存：颜色类 ≤64、状态 ≤4096；断言模式自动回退 NFA。
 
-### 待做（M2.5 / M3）
+### 命令级实测（M5，1 MiB，`regexp -all`）
+
+| 模式（匹配数） | tclsh 8.6.17 | rtcl Spencer |
+|---|---|---|
+| 纯字面 `abab abab`（104860） | 55 ms | 41 ms |
+| `[a-z]+`（209720） | 38 ms | 79 ms |
+| `\w+`（209720） | 39 ms | 51 ms |
+| `(a+?)(a*)`（419440） | 66 ms | 64 ms |
+| `[a-z]*z`（0，全串扫描） | 2 ms | 9 ms |
+
+旧 fast 路径同机 `-all` 为 16 s / 32 s（逐匹配重扫前缀），已不默认。
+关键修复：`collect_matches` 的字节→字符换算改成**单调游标**
+（每个匹配不再 O(n) 重扫，整体 O(n)）；命令级 `CharCache` 复用
+`Vec<char>`/字节表与 `Matcher` 的 DFA 缓存（`captures::exec_with`）。
+
+### 待做（M2.5 后续）
 
 1. **search 预过滤 DFA（Spencer `simpleFind` 两段式）**：先用
    `search` NFA 的 shortest 扫出可能起点区间，再对候选起点做 anchored
@@ -220,7 +246,8 @@ DFA 缓存：颜色类 ≤64、状态 ≤4096；断言模式自动回退 NFA。
 2. **UTF-8 直读 + 字面 memmem**：公共 `find(&str)` 对纯 ASCII/纯字面
    走字节路径（避免每次调用的一次性 `Vec<char>` 转换），只对非 ASCII
    /需要 Unicode 语义的输入转 chars。
-3. **dissect 复用**：M3 捕获拆分复用同一 DFA/NFA 缓存，避免回溯爆炸。
+3. **dissect 复用**：已完成——`Matcher` + `CharCache` 在命令级
+   `-all` 循环复用 DFA/扫描缓冲。
 4. **趋势目标**：密集匹配与 `regex` ≤1.5×（当前 1.0-1.9×）；
    全串无匹配 ≥500 MB/s；纯字面 ≥0.5× regex（当前更快）。
 5. 内存上限：DFA 缓存按状态数/字节数封顶；编译空间预算对应
@@ -234,7 +261,7 @@ DFA 缓存：颜色类 ≤64、状态 ≤4096；断言模式自动回退 NFA。
 
 - 新引擎不 panic：所有失败走 `Error { code, message }`；
   编译空间上限（Spencer `REG_MAX_COMPILE_SPACE` 语义）用预算参数。
-- 每里程碑独立提交；`regexp-spencer` 默认关闭直至 M5。
+- 每里程碑独立提交；M5 完成默认化（`RTCL_REGEX_ENGINE=fast` 可回退）。
 - 测试三层：
   1. 单元（lexer/parser/NFA/matcher 每层）；
   2. oracle 定向（新增 `specs/regex/*.tcl` 语料）；

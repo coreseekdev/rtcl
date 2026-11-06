@@ -34,6 +34,9 @@ exec = ["rtcl-vm/exec", "std"]
 clock = ["rtcl-vm/clock", "std"]
 regexp = ["rtcl-vm/regexp", "std"]
 regexp-lite = ["rtcl-vm/regexp-lite", "std"]
+# Spencer 引擎移植（B 路径）：已随 rtcl_std 默认开启；单独开启需
+# 同时启用 regexp 才参与命令路由。
+regexp-spencer = ["rtcl-vm/regexp-spencer", "std"]
 env = ["rtcl-vm/env", "std"]
 package = ["rtcl-vm/package", "std"]
 signal = ["rtcl-vm/signal", "std"]

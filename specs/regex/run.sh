@@ -28,3 +28,16 @@ for f in specs/regex/semantics.tcl specs/regex/random-4000.tcl; do
     echo "== $base =="
     python3 specs/regex/analyze.py "/tmp/rtcl-regex-$base-o.txt" "/tmp/rtcl-regex-$base-r.txt"
 done
+
+# BRE/ERE 方言与 -about re_info 标志（Spencer 默认引擎）。
+for f in specs/regex/dialect-probes.tcl specs/regex/about-probes.tcl; do
+    base=$(basename "$f" .tcl)
+    tclsh "$f" > "/tmp/rtcl-regex-$base-o.txt" 2>&1
+    "$RTCL" -f "$f" > "/tmp/rtcl-regex-$base-r.txt" 2>&1
+    if diff -q "/tmp/rtcl-regex-$base-o.txt" "/tmp/rtcl-regex-$base-r.txt" >/dev/null; then
+        echo "== $base: diff=0 =="
+    else
+        echo "== $base: DIFF =="
+        diff "/tmp/rtcl-regex-$base-o.txt" "/tmp/rtcl-regex-$base-r.txt" | head -20
+    fi
+done

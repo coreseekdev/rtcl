@@ -1509,7 +1509,7 @@ fn engine_about_bits(
         spencer_options(nocase, expanded, lineanchor, linestop),
     ) {
         Ok(p) => (
-            super::regexp_spencer::ast::nullable(&p.tree),
+            super::regexp_spencer::ast::nullable_matchable(&p.tree),
             super::regexp_spencer::ast::impossible(&p.tree),
             p.flags.shorter,
         ),
@@ -1628,7 +1628,8 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let (empty_ok, impossible, shortest) = engine_about_bits(
             &eng, pattern_str, nocase, expanded, lineanchor, linestop,
         );
-        if empty_ok {
+        // 不可命中的模式 tclsh 不再置 UEMPTYMATCH。
+        if empty_ok && !impossible {
             flags.push("REG_UEMPTYMATCH");
         }
         if impossible {

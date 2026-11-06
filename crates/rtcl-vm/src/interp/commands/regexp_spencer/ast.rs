@@ -417,6 +417,47 @@ fn is_end_anchor(k: AssertKind) -> bool {
     matches!(k, AssertKind::Eos | AssertKind::Eol)
 }
 
+/// 节点是否存在消耗字符的路径（可选重复也算）。
+fn can_consume(n: &Node) -> bool {
+    match &n.kind {
+        NodeKind::Empty | NodeKind::Assert(_) | NodeKind::Look { .. } => false,
+        NodeKind::Char(_) | NodeKind::Class(_) | NodeKind::Backref { .. } => true,
+        NodeKind::NoRecord(inner) | NodeKind::Capture { node: inner, .. } => can_consume(inner),
+        NodeKind::Concat(v) => v.iter().any(can_consume),
+        NodeKind::Alt(v) => v.iter().any(can_consume),
+        NodeKind::Repeat { node, max, .. } => *max > 0 && can_consume(node),
+    }
+}
+
+/// 紧邻（跳过 Empty/Look）的断言种类。
+fn adjacent_anchor(parts: &[Node], from: usize, forward: bool) -> Option<AssertKind> {
+    let mut i = from;
+    loop {
+        let idx = if forward {
+            if i >= parts.len() {
+                return None;
+            }
+            i
+        } else {
+            if i == 0 {
+                return None;
+            }
+            i - 1
+        };
+        match &parts[idx].kind {
+            NodeKind::Assert(k) => return Some(*k),
+            NodeKind::Empty | NodeKind::Look { .. } => {
+                if forward {
+                    i += 1;
+                } else {
+                    i -= 1;
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// 节点是否必定以串/行首约束开始（穿透空节点与分组）。
 fn starts_with_start_anchor(n: &Node) -> bool {
     match &n.kind {
@@ -467,13 +508,58 @@ fn ends_with_end_anchor(n: &Node) -> bool {
     }
 }
 
+/// Concat 是否被串首/串尾约束强制成空匹配：串首约束之前只有可跳过
+/// 节点，串首与串尾之间没有可消耗节点（`^...$` 路径只能为空）。
+fn concat_forced_empty(parts: &[Node]) -> bool {
+    for s in 0..parts.len() {
+        if !matches!(
+            &parts[s].kind,
+            NodeKind::Assert(AssertKind::Bos | AssertKind::Bot)
+        ) {
+            continue;
+        }
+        // 串首约束前若必然消耗，模式另有 impossible 判定。
+        if parts[..s].iter().any(necessarily_consumes) {
+            continue;
+        }
+        let Some(e) = (s + 1..parts.len()).find(|&i| {
+            matches!(&parts[i].kind, NodeKind::Assert(AssertKind::Eos))
+        }) else {
+            continue;
+        };
+        if !parts[s + 1..e].iter().any(can_consume) {
+            return true;
+        }
+    }
+    false
+}
+
 /// 编译期不可命中分析（`regexp -about` 的 REG_UIMPOSSIBLE）：
-/// 串首/行首约束前有消耗、串尾/行尾约束后有消耗，或所有分支都不可命中。
+/// 串首/行首约束前有消耗、串尾/行尾约束后有消耗、`^...$` 强制空串下
+/// 的词约束，或所有分支都不可命中。`empty` 表示当前处于强制空匹配
+/// 上下文（不能消耗任何字符）。
 pub fn impossible(tree: &Node) -> bool {
-    match &tree.kind {
+    impossible_ctx(tree, false)
+}
+
+fn impossible_ctx(n: &Node, empty: bool) -> bool {
+    // 强制空串上下文里不能出现任何必然消耗的节点。
+    if empty && necessarily_consumes(n) {
+        return true;
+    }
+    match &n.kind {
+        NodeKind::Assert(k) => {
+            empty
+                && matches!(
+                    k,
+                    AssertKind::WordB | AssertKind::WordStart | AssertKind::WordEnd
+                )
+        }
         NodeKind::Concat(v) => {
+            let forced = concat_forced_empty(v);
+            let child_empty = empty || forced;
             for (i, part) in v.iter().enumerate() {
-                if impossible(part) {
+                if impossible_ctx(part, child_empty) {
                     return true;
                 }
                 if starts_with_start_anchor(part) && v[..i].iter().any(necessarily_consumes) {
@@ -482,24 +568,136 @@ pub fn impossible(tree: &Node) -> bool {
                 if ends_with_end_anchor(part) && v[i + 1..].iter().any(necessarily_consumes) {
                     return true;
                 }
+                if child_empty {
+                    continue;
+                }
                 if let NodeKind::Assert(k) = part.kind {
-                    if word_assert_impossible(
-                        k,
-                        neighbor_wordness(v, i, false),
-                        neighbor_wordness(v, i + 1, true),
+                    let mut prev = neighbor_wordness(v, i, false);
+                    let mut next = neighbor_wordness(v, i + 1, true);
+                    // 紧邻的绝对/行锚点决定当前位置的虚拟邻字符：
+                    // 串首侧前邻是非词，串尾侧后邻是非词。
+                    let prev_anchor = adjacent_anchor(v, i, false);
+                    let next_anchor = adjacent_anchor(v, i + 1, true);
+                    if matches!(
+                        prev_anchor,
+                        Some(AssertKind::Bos | AssertKind::Bot | AssertKind::Bol)
+                    ) || matches!(
+                        next_anchor,
+                        Some(AssertKind::Bos | AssertKind::Bot | AssertKind::Bol)
                     ) {
+                        prev = WordKind::NonWord;
+                    }
+                    if matches!(prev_anchor, Some(AssertKind::Eos | AssertKind::Eol))
+                        || matches!(next_anchor, Some(AssertKind::Eos | AssertKind::Eol))
+                    {
+                        next = WordKind::NonWord;
+                    }
+                    // `\m` 紧邻串/行尾没有下一个词字符；`\M` 紧邻
+                    // 串/行首没有上一个词字符。
+                    if k == AssertKind::WordStart
+                        && matches!(next_anchor, Some(AssertKind::Eos | AssertKind::Eol))
+                    {
+                        return true;
+                    }
+                    if k == AssertKind::WordEnd
+                        && matches!(
+                            prev_anchor,
+                            Some(AssertKind::Bos | AssertKind::Bot | AssertKind::Bol)
+                        )
+                    {
+                        return true;
+                    }
+                    if word_assert_impossible(k, prev, next) {
                         return true;
                     }
                 }
             }
             false
         }
-        NodeKind::Alt(v) => !v.is_empty() && v.iter().all(impossible),
-        NodeKind::Repeat { node, min, .. } => *min > 0 && impossible(node),
+        NodeKind::Alt(v) => !v.is_empty() && v.iter().all(|b| impossible_ctx(b, empty)),
+        NodeKind::Repeat { node, min, .. } => *min > 0 && impossible_ctx(node, empty),
         NodeKind::NoRecord(inner) | NodeKind::Capture { node: inner, .. } => {
-            impossible(inner)
+            impossible_ctx(inner, empty)
         }
-        NodeKind::Look { node, .. } => impossible(node),
+        NodeKind::Look { node, .. } => impossible_ctx(node, empty),
         _ => false,
+    }
+}
+
+/// `-about` 的 REG_UEMPTYMATCH 口径：结构可空且该空路径不是
+/// 不可命中的（剔除 word 约束在 `^...$` 强制空串下必然失败的路径）。
+pub fn nullable_matchable(tree: &Node) -> bool {
+    if impossible(tree) {
+        return false;
+    }
+    let mut groups: Vec<Option<bool>> = Vec::new();
+    nullable_m(tree, &mut groups)
+}
+
+/// 空路径上必然经过、且在空串处必然失败的词约束。
+fn mandatory_empty_word_fails(n: &Node) -> bool {
+    match &n.kind {
+        NodeKind::Assert(
+            AssertKind::WordB | AssertKind::WordStart | AssertKind::WordEnd,
+        ) => true,
+        NodeKind::Concat(v) => v.iter().any(mandatory_empty_word_fails),
+        NodeKind::Alt(v) => !v.is_empty() && v.iter().all(mandatory_empty_word_fails),
+        NodeKind::Repeat { node, min, .. } => *min > 0 && mandatory_empty_word_fails(node),
+        NodeKind::NoRecord(inner) | NodeKind::Capture { node: inner, .. } => {
+            mandatory_empty_word_fails(inner)
+        }
+        _ => false,
+    }
+}
+
+fn concat_has_abs_start_and_eos(v: &[Node]) -> bool {
+    v.iter()
+        .any(|n| matches!(&n.kind, NodeKind::Assert(AssertKind::Bos | AssertKind::Bot)))
+        && v.iter()
+            .any(|n| matches!(&n.kind, NodeKind::Assert(AssertKind::Eos)))
+}
+
+fn nullable_m(n: &Node, groups: &mut Vec<Option<bool>>) -> bool {
+    if impossible_ctx(n, false) {
+        return false;
+    }
+    match &n.kind {
+        NodeKind::Empty | NodeKind::Assert(_) => true,
+        NodeKind::Char(_) | NodeKind::Class(_) => false,
+        NodeKind::Look { .. } => false,
+        NodeKind::NoRecord(inner) => nullable_m(inner, groups),
+        NodeKind::Capture { subno, node } => {
+            let v = nullable_m(node, groups);
+            if groups.len() <= *subno {
+                groups.resize(subno + 1, None);
+            }
+            let slot = &mut groups[*subno];
+            *slot = Some(slot.unwrap_or(false) || v);
+            v
+        }
+        NodeKind::Backref { subno, min, .. } => {
+            *min == 0 || groups.get(*subno).copied().flatten().unwrap_or(false)
+        }
+        NodeKind::Concat(v) => {
+            let all = v.iter().all(|p| nullable_m(p, groups));
+            if all
+                && concat_has_abs_start_and_eos(v)
+                && !v.iter().any(necessarily_consumes)
+                && v.iter().any(mandatory_empty_word_fails)
+            {
+                return false;
+            }
+            all
+        }
+        NodeKind::Alt(v) => {
+            let mut any = false;
+            for b in v {
+                if nullable_m(b, groups) {
+                    any = true;
+                }
+            }
+            any
+        }
+        NodeKind::Repeat { node, min, .. } => *min == 0 || nullable_m(node, groups),
     }
 }

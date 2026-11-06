@@ -168,8 +168,8 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   （UBACKREF/ULOOKAHEAD/UBOUNDS/UBRACES/UBSALNUM/UPBOTCH/UNONPOSIX/
   UUNSPEC/ULOCALE/UEMPTYMATCH/UIMPOSSIBLE/USHORTEST）按位序复刻。
   验证：BRE/ERE 定向探针 + 2500 pattern × 21 string 随机方言语料
-  **0 差异**；`-about` 3000 pattern 随机语料仅余 2 例 `\y` 与
-  `^$` 空串推理的极端不可命中标志（记录为已知边界）。
+  **0 差异**；`-about` 3000 pattern 随机语料 **0 差异**（含
+  `^...$` 强制空串下的 `\y\m\M`、锚点邻接词性冲突等边界）。
 - **M5 完成（默认化）**：`regexp`/`regsub`（`-inline/-indices/-all/
   -start/-about` 与 `regsub` 替换）走 Spencer 引擎；`array names
   -regexp`/`lsort -regexp`/switch 等 `engine_is_match` 消费者同步。

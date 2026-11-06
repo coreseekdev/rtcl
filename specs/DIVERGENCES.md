@@ -86,6 +86,33 @@
   链接变量走槽 aliased 回落。slots3（loadArray4）/slots4
   （数组先于标量 → loadScalar4；混合数组错误文本）逐字 SAME；
   多行脚本 specs/scripts/slot-hints.tcl 固化。
+- **D-3 第五批收口（2026-11-06，特化命令 INNER 指令名）**：
+  tclsh 编译器把 `set`/`incr`/`lappend`/`append`/`unset`/`regexp`
+  编译成专用指令，运行期失败时 INNER 记录**指令名**而非 invokeStk1。
+  按 tclsh 8.6.17 指令表逐类对齐（lexical = proc 局部槽；stk =
+  eval/uplevel 脚本）：
+  * set → `storeScalar1/4`、`storeArray1/4`（stk：`storeStk`/
+    `storeArrayStk`）；
+  * incr → `incrScalar1Imm`/`incrScalar1`、`incrArray1Imm`/
+    `incrArray1`；槽 ≥256 或脚本体落 `incrStk(Imm)`/
+    `incrArrayStk(Imm)`（无 4 字节名）；动态增量去 Imm；
+  * lappend → `lappendScalar1/4`、`lappendArray1/4`（stk：
+    `lappendListStk`/`lappendListArrayStk`）；
+  * append → `appendScalar1/4`、`appendArray1/4`（stk：`appendStk`/
+    `appendArrayStk`）；
+  * unset → `unsetScalar`/`unsetArray`（stk：`unsetStk`/
+    `unsetArrayStk`，无宽度）；
+  * regexp 字面命令的 **pattern 编译失败** → INNER 为已求值词列表
+    本身（无操作码名）；arity/bad option/-start 错误仍是 invokeStk1。
+  融合指令（StoreVarPop/IncrLocalPop/LappendVarVar/ForNextIncr* 等）
+  同样按目标槽/名映射；tree-walk（eval/apply）按语法选 stk 名
+  （lexical 体无槽表时宽度按 1 近似）。
+  同时修正 `incr` 类型冲突方向：标量目标实际为数组 → `can't set
+  "...": variable is array` + `TCL WRITE VARNAME`（旧为 can't read）；
+  数组元素目标基名为标量仍为 `can't read ... variable isn't array`
+  + TCL LOOKUP VARNAME。
+  error-deep +10 探针全 SAME（70/70）；opbat/innerbat/unsetbat/
+  slots/bt 各差分脚本全 SAME；specs/scripts/opcode-inner.tcl 固化。
 - **余留残差**（低频，有意保留）：
   * clock 错误的 errorInfo/errorstack 含 tclsh 的 **Tcl 实现帧**
     （`::tcl::clock::add` line 98、`::tcl::clock::scan` + `UP 1`、

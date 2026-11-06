@@ -337,7 +337,7 @@ impl Interp {
                     self.err_inner = Some(
                         self.err_pending_inner
                             .take()
-                            .or_else(|| hint.map(|h| h.to_string()))
+                            .or_else(|| inner_hint_text(hint, words, text))
                             .unwrap_or_else(|| match words {
                                 Some(w) if !w.is_empty() => {
                                     let tag = if w.len() <= 255 {
@@ -370,7 +370,7 @@ impl Interp {
                 self.err_inner = Some(
                     self.err_pending_inner
                         .take()
-                        .or_else(|| hint.map(|h| h.to_string()))
+                        .or_else(|| inner_hint_text(hint, words, text))
                         .unwrap_or_else(|| match words {
                             Some(w) if !w.is_empty() => {
                                 // tclsh：≤255 词用 invokeStk1（1 字节操作数），
@@ -652,7 +652,8 @@ impl Interp {
             if self.err_is_error(e) {
                 let msg = e.message_text();
                 let cmd_name = args.first().map(|v| v.as_str()).unwrap_or("");
-                let hint = command_inner_hint(&cmd.words, cmd_name);
+                let local_slots = self.lexical_body || self.in_locals_unit;
+                let hint = command_inner_hint(&cmd.words, cmd_name, &args, &msg, local_slots);
                 self.err_harness_frame_words(
                     &msg,
                     cmd.text.slice(&unit.source),
@@ -1403,11 +1404,101 @@ fn ast_word_literal(w: &rtcl_parser::Word) -> bool {
     }
 }
 
-/// 命令调用面的 INNER 形：动态 `{*}` 展开优先（invokeExpanded），
-/// 其次"字面命令词 + ensemble"（invokeReplace）；否则 None（invokeStk1）。
+/// INNER 载荷 = 已求值词列表本身（不带操作码名）。tclsh 对字面
+/// `regexp` 的 pattern 编译失败使用该形（编译器直接内联正则）。
+pub(crate) const INNER_RAW_WORDS: &str = "\u{0}raw-words";
+
+/// 从 hint 构造 INNER 串：RAW 哨兵展开为 `Value::from_list(words)`。
+fn inner_hint_text(
+    hint: Option<&'static str>,
+    words: Option<&[Value]>,
+    text: &str,
+) -> Option<String> {
+    match hint {
+        Some(h) if h == INNER_RAW_WORDS => Some(match words {
+            Some(w) if !w.is_empty() => Value::from_list(w).as_str().to_string(),
+            _ => tcl_log_excerpt(text),
+        }),
+        Some(h) => Some(h.to_string()),
+        None => None,
+    }
+}
+
+/// 命令调用面的 INNER 形：
+/// * 动态 `{*}` → invokeExpanded；
+/// * 字面命令词 + ensemble → invokeReplace；
+/// * tclsh 编译特化的字面命令（regexp/unset/set/incr/lappend/append）
+///   的运行期失败 → 对应操作码名（Tcl 8.6.17 指令名）；tree-walk
+///   无槽号，lexical 体按 1 字节名近似（>255 的 apply 体极罕见）。
+/// 其余 None（invokeStk1）。
+fn target_is_array(name: &str) -> bool {
+    name.contains('(') && name.ends_with(')')
+}
+
+fn store_hint_name(local_slots: bool, is_array: bool) -> &'static str {
+    match (local_slots, is_array) {
+        (true, false) => "storeScalar1",
+        (true, true) => "storeArray1",
+        (false, false) => "storeStk",
+        (false, true) => "storeArrayStk",
+    }
+}
+
+fn incr_hint_name(local_slots: bool, is_array: bool, imm: bool) -> &'static str {
+    match (local_slots, is_array, imm) {
+        (true, false, true) => "incrScalar1Imm",
+        (true, false, false) => "incrScalar1",
+        (true, true, true) => "incrArray1Imm",
+        (true, true, false) => "incrArray1",
+        (false, false, true) => "incrStkImm",
+        (false, false, false) => "incrStk",
+        (false, true, true) => "incrArrayStkImm",
+        (false, true, false) => "incrArrayStk",
+    }
+}
+
+fn lappend_hint_name(local_slots: bool, is_array: bool) -> &'static str {
+    match (local_slots, is_array) {
+        (true, false) => "lappendScalar1",
+        (true, true) => "lappendArray1",
+        (false, false) => "lappendListStk",
+        (false, true) => "lappendListArrayStk",
+    }
+}
+
+fn append_hint_name(local_slots: bool, is_array: bool) -> &'static str {
+    match (local_slots, is_array) {
+        (true, false) => "appendScalar1",
+        (true, true) => "appendArray1",
+        (false, false) => "appendStk",
+        (false, true) => "appendArrayStk",
+    }
+}
+
+fn unset_hint_name(local_slots: bool, is_array: bool) -> &'static str {
+    match (local_slots, is_array) {
+        (true, false) => "unsetScalar",
+        (true, true) => "unsetArray",
+        (false, false) => "unsetStk",
+        (false, true) => "unsetArrayStk",
+    }
+}
+
+fn load_hint_name(local_slots: bool, is_array: bool) -> &'static str {
+    match (local_slots, is_array) {
+        (true, false) => "loadScalar1",
+        (true, true) => "loadArray1",
+        (false, false) => "loadStk",
+        (false, true) => "loadArrayStk",
+    }
+}
+
 fn command_inner_hint(
     words_ast: &[rtcl_parser::Word],
     cmd_name: &str,
+    args: &[Value],
+    msg: &str,
+    local_slots: bool,
 ) -> Option<&'static str> {
     let dynamic_expand = words_ast
         .iter()
@@ -1419,7 +1510,56 @@ fn command_inner_hint(
     if literal_cmd && is_ensemble_name(cmd_name) {
         return Some("invokeReplace");
     }
-    None
+    if !literal_cmd {
+        return None;
+    }
+    let word = |i: usize| args.get(i).map(|v| v.as_str()).unwrap_or("");
+    let literal = |i: usize| words_ast.get(i).map(ast_word_literal).unwrap_or(false);
+    match cmd_name {
+        "regexp" => {
+            if msg.starts_with("couldn't compile regular expression pattern") {
+                Some(INNER_RAW_WORDS)
+            } else {
+                None
+            }
+        }
+        "set" => {
+            if msg.starts_with("can't read \"") && args.len() == 2 && literal(1) {
+                Some(load_hint_name(local_slots, target_is_array(word(1))))
+            } else if msg.starts_with("can't set \"") && args.len() == 3 && literal(1) {
+                Some(store_hint_name(local_slots, target_is_array(word(1))))
+            } else {
+                None
+            }
+        }
+        "append" => {
+            if msg.starts_with("can't set \"") && literal(1) {
+                Some(append_hint_name(local_slots, target_is_array(word(1))))
+            } else {
+                None
+            }
+        }
+        "incr" => {
+            if (2..=3).contains(&args.len()) && literal(1) {
+                let imm = args.len() == 2 || literal(2);
+                Some(incr_hint_name(local_slots, target_is_array(word(1)), imm))
+            } else {
+                None
+            }
+        }
+        "lappend" => {
+            if args.len() >= 2 && literal(1) {
+                Some(lappend_hint_name(local_slots, target_is_array(word(1))))
+            } else {
+                None
+            }
+        }
+        "unset" => {
+            let quoted = msg.strip_prefix("can't unset \"")?.split('"').next()?;
+            Some(unset_hint_name(local_slots, target_is_array(quoted)))
+        }
+        _ => None,
+    }
 }
 
 /// 变量读取失败的操作码名（消息形 `can't read "NAME": ...`）：

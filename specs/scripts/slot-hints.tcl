@@ -536,3 +536,20 @@ proc p1 {} {
 proc p2 {} { set zz 1 ; set zz(1) 2 }
 catch {p1} m o; puts "P1: [es $o]"
 catch {p2} m o; puts "P2: $m"
+
+# ── 写类 op 的 4 字节操作码名（槽 ≥256）──
+proc wt {label body} {
+    proc p {} $body
+    catch {p} m o
+    puts "$label => $m || [expr {[dict exists $o -errorstack]?[lindex [dict get $o -errorstack] 1]:"<none>"}]"
+}
+set pad {}
+for {set i 0} {$i < 256} {incr i} { append pad "set v$i 1\n" }
+wt store-array4 "${pad}set late 1\nset late(1) 2"
+wt store-scalar4 "${pad}set arr(1) 1\nset arr 2"
+wt incr-array-stk "${pad}set aa(1) abc\nincr aa(1)"
+wt incr-array-stk-var "${pad}set aa(1) abc\nset d 2\nincr aa(1) \$d"
+wt lappend-array4 "${pad}set a 1\nlappend a(1) x"
+wt append-scalar4 "${pad}set arr(1) 1\nappend arr x"
+wt append-array4 "${pad}set a 1\nappend a(1) x"
+wt unset-array-slot "${pad}unset q(1)"

@@ -324,13 +324,166 @@ fn src_word_is_literal(src: &str) -> bool {
     !src.contains('$') && !src.contains('[') && !src.contains('\\') && !src.starts_with("{*}")
 }
 
+/// 编译特化命令（set/incr/lappend/append/unset）的运行期失败操作码名。
+/// 槽宽规则（tclsh 8.6.17 实测）：store/lappend/append 按槽 <256 用 1、
+/// ≥256 用 4；incr 只在槽 <256 用 1，≥256 落入 Stk 名；unset 无宽度。
+fn local4(slot: Option<usize>) -> bool {
+    matches!(slot, Some(s) if s >= 256)
+}
+
+fn store_name(code: &ByteCode, is_array: bool, slot: Option<usize>) -> &'static str {
+    if code.locals_mode {
+        match (is_array, local4(slot)) {
+            (false, false) => "storeScalar1",
+            (false, true) => "storeScalar4",
+            (true, false) => "storeArray1",
+            (true, true) => "storeArray4",
+        }
+    } else if is_array {
+        "storeArrayStk"
+    } else {
+        "storeStk"
+    }
+}
+
+fn incr_name(
+    code: &ByteCode,
+    is_array: bool,
+    slot: Option<usize>,
+    imm: bool,
+) -> &'static str {
+    if code.locals_mode {
+        match (is_array, local4(slot), imm) {
+            (false, false, true) => "incrScalar1Imm",
+            (false, false, false) => "incrScalar1",
+            (false, true, true) => "incrStkImm",
+            (false, true, false) => "incrStk",
+            (true, false, true) => "incrArray1Imm",
+            (true, false, false) => "incrArray1",
+            (true, true, true) => "incrArrayStkImm",
+            (true, true, false) => "incrArrayStk",
+        }
+    } else {
+        match (is_array, imm) {
+            (false, true) => "incrStkImm",
+            (false, false) => "incrStk",
+            (true, true) => "incrArrayStkImm",
+            (true, false) => "incrArrayStk",
+        }
+    }
+}
+
+fn lappend_name(code: &ByteCode, is_array: bool, slot: Option<usize>) -> &'static str {
+    if code.locals_mode {
+        match (is_array, local4(slot)) {
+            (false, false) => "lappendScalar1",
+            (false, true) => "lappendScalar4",
+            (true, false) => "lappendArray1",
+            (true, true) => "lappendArray4",
+        }
+    } else if is_array {
+        "lappendListArrayStk"
+    } else {
+        "lappendListStk"
+    }
+}
+
+fn append_name(code: &ByteCode, is_array: bool, slot: Option<usize>) -> &'static str {
+    if code.locals_mode {
+        match (is_array, local4(slot)) {
+            (false, false) => "appendScalar1",
+            (false, true) => "appendScalar4",
+            (true, false) => "appendArray1",
+            (true, true) => "appendArray4",
+        }
+    } else if is_array {
+        "appendArrayStk"
+    } else {
+        "appendStk"
+    }
+}
+
+fn unset_name(code: &ByteCode, is_array: bool) -> &'static str {
+    match (code.locals_mode, is_array) {
+        (true, false) => "unsetScalar",
+        (true, true) => "unsetArray",
+        (false, false) => "unsetStk",
+        (false, true) => "unsetArrayStk",
+    }
+}
+
+fn array_base_slot(code: &ByteCode, name: &str) -> Option<usize> {
+    let base = name.split('(').next().unwrap_or(name);
+    local_slot_of(code, base)
+}
+
+/// 写类 op（store/incr/lappend 及其融合形）失败时的 INNER 名。
+fn write_op_inner_hint(code: &ByteCode, op: &OpCode) -> Option<&'static str> {
+    let name_at = |i: u16| code.get_const(i).unwrap_or("");
+    let is_array = |n: &str| n.contains('(') && n.ends_with(')');
+    match op {
+        OpCode::StoreLocal(s)
+        | OpCode::StoreLocalPop(s)
+        | OpCode::SubEndStoreLocalPop(s) => {
+            Some(store_name(code, false, Some(*s as usize)))
+        }
+        OpCode::StoreVar(i)
+        | OpCode::StoreVarPop(i)
+        | OpCode::SubEndStoreVarPop(i) => {
+            let name = name_at(*i);
+            let arr = is_array(name);
+            let slot = if arr {
+                array_base_slot(code, name)
+            } else {
+                local_slot_of(code, name)
+            };
+            Some(store_name(code, arr, slot))
+        }
+        OpCode::IncrLocal(s, _)
+        | OpCode::IncrLocalPop(s, _)
+        | OpCode::BeginCmdIncrLocalPop(_, s, _)
+        | OpCode::ForNextIncrLocal(_, s, _, _) => {
+            Some(incr_name(code, false, Some(*s as usize), true))
+        }
+        OpCode::IncrVar(i, _)
+        | OpCode::IncrVarPop(i, _)
+        | OpCode::BeginCmdIncrVarPop(_, i, _)
+        | OpCode::ForNextIncrVar(_, i, _, _) => {
+            let name = name_at(*i);
+            let arr = is_array(name);
+            let slot = if arr {
+                array_base_slot(code, name)
+            } else {
+                local_slot_of(code, name)
+            };
+            Some(incr_name(code, arr, slot, true))
+        }
+        OpCode::LappendLocal(s) | OpCode::LappendSlotSlot(_, s) => {
+            Some(lappend_name(code, false, Some(*s as usize)))
+        }
+        OpCode::LappendVar(i) | OpCode::LappendVarVar(_, i) => {
+            let name = name_at(*i);
+            let arr = is_array(name);
+            let slot = if arr {
+                array_base_slot(code, name)
+            } else {
+                local_slot_of(code, name)
+            };
+            Some(lappend_name(code, arr, slot))
+        }
+        _ => None,
+    }
+}
+
 /// 命令调用面的 INNER 形：动态 `{*}` 展开优先（invokeExpanded），其次
 /// 字面命令词 + ensemble（invokeReplace）；否则 None → invokeStk1。
 fn call_inner_hint(
-    source: &str,
+    code: &ByteCode,
     word_srcs: &[rtcl_parser::SrcSpan],
     words: &[Value],
+    msg: &str,
 ) -> Option<&'static str> {
+    let source = &code.source;
     let expanded_dynamic = word_srcs.iter().any(|ws| {
         let src = ws.slice(source);
         match src.strip_prefix("{*}") {
@@ -349,7 +502,59 @@ fn call_inner_hint(
     if literal_cmd && super::eval::is_ensemble_name(cmd_name) {
         return Some("invokeReplace");
     }
-    None
+    if !literal_cmd {
+        return None;
+    }
+    let literal_word = |i: usize| {
+        word_srcs
+            .get(i)
+            .map(|ws| src_word_is_literal(ws.slice(source)))
+            .unwrap_or(false)
+    };
+    let word = |i: usize| words.get(i).map(|v| v.as_str()).unwrap_or("");
+    match cmd_name {
+        "regexp" => {
+            if msg.starts_with("couldn't compile regular expression pattern") {
+                Some(super::eval::INNER_RAW_WORDS)
+            } else {
+                None
+            }
+        }
+        "unset" => {
+            let quoted = msg.strip_prefix("can't unset \"")?.split('"').next()?;
+            let arr = quoted.contains('(') && quoted.ends_with(')');
+            Some(unset_name(code, arr))
+        }
+        "append" => {
+            if msg.starts_with("can't set \"") && literal_word(1) {
+                let name = word(1);
+                let arr = name.contains('(') && name.ends_with(')');
+                let slot = if arr {
+                    array_base_slot(code, name)
+                } else {
+                    local_slot_of(code, name)
+                };
+                Some(append_name(code, arr, slot))
+            } else {
+                None
+            }
+        }
+        "incr" => {
+            if words.len() == 3 && literal_word(1) && !literal_word(2) {
+                let name = word(1);
+                let arr = name.contains('(') && name.ends_with(')');
+                let slot = if arr {
+                    array_base_slot(code, name)
+                } else {
+                    local_slot_of(code, name)
+                };
+                Some(incr_name(code, arr, slot, false))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// 局部表里该名字的槽位（有则按 1/4 字节操作数选 loadScalar1/loadScalar）。
@@ -381,6 +586,9 @@ fn array_load_name(code: &ByteCode, name: &str) -> &'static str {
 
 /// 变量读取失败的操作码名（vm 局部槽位 / 名键单元直接由 op 决定）。
 fn word_op_inner_hint(code: &ByteCode, op: &OpCode, msg: &str) -> Option<&'static str> {
+    if let Some(h) = write_op_inner_hint(code, op) {
+        return Some(h);
+    }
     let quoted = msg.strip_prefix("can't read \"")?.split('"').next()?;
     match op {
         OpCode::LoadLocal(slot) => {
@@ -1293,7 +1501,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                 let words: Option<&[Value]> = if is_call_op { Some(&st.scratch) } else { None };
                 // D-3 残差：INNER 的 bytecode 操作码形。
                 let hint = if is_call_op {
-                    call_inner_hint(&code.source, &site.word_srcs, &st.scratch)
+                    call_inner_hint(code, &site.word_srcs, &st.scratch, &msg)
                 } else {
                     word_op_inner_hint(code, op, &msg)
                 };

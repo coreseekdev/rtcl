@@ -62,3 +62,14 @@ catch {return -level 0 -code error -errorcode {A B} boom} m o ; puts [dict get $
 catch {return -level 0 -code error -errorinfo {} -errorcode {A B} boom} m o ; puts [dict get $o -errorstack]
 proc r4 {} {return -level 2 -code error boom} ; proc r5 {} {r4} ; catch {r5} m o ; puts "[dict get $o -errorstack]|[dict get $o -errorinfo]"
 proc r6 {} {return -foo bar -level 0 -code error boom} ; catch {r6} m o ; puts [dict get $o -errorstack]
+# ── D-3 特化命令 INNER 操作码名（set/incr/lappend/append/unset/regexp）──
+proc op1 {} {regexp {(} x} ; catch {op1} m o ; puts [lindex [dict get $o -errorstack] 1]
+proc op2 {} {set a(1) 1; set a 2} ; catch {op2} m o ; puts [lindex [dict get $o -errorstack] 1]
+proc op3 {} {set a 1; set a(1) 2} ; catch {op3} m o ; puts [lindex [dict get $o -errorstack] 1]
+proc op4 {} {set x abc; incr x} ; catch {op4} m o ; puts [lindex [dict get $o -errorstack] 1]
+proc op5 {} {set x "a \\{"; lappend x b} ; catch {op5} m o ; puts [lindex [dict get $o -errorstack] 1]
+proc op6 {} {unset nope} ; catch {op6} m o ; puts [lindex [dict get $o -errorstack] 1]
+proc op7 {} {unset q(1)} ; catch {op7} m o ; puts [lindex [dict get $o -errorstack] 1]
+proc op8 {} {set a(1) 1; append a x} ; catch {op8} m o ; puts [lindex [dict get $o -errorstack] 1]
+proc op9 {} {eval {set a 1; set a(1) 2}} ; catch {op9} m o ; puts [lindex [dict get $o -errorstack] 1]
+proc op10 {} {set r regexp; $r {(} x} ; catch {op10} m o ; puts [lindex [dict get $o -errorstack] 1]

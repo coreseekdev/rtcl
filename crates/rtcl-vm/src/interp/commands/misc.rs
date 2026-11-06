@@ -509,9 +509,18 @@ pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             )
         })?,
         Err(e) => {
-            // Tcl: incr on a non-existent variable starts at 0, but a
-            // scalar/array type conflict propagates as a read error.
+            // Tcl: incr on a non-existent variable starts at 0。类型冲突
+            // 的方向不同：标量目标实际是数组 → 写路径错误
+            // `can't set ... variable is array`（TCL WRITE VARNAME）；
+            // 数组元素目标而基名是标量 → 读错误（TCL LOOKUP VARNAME）。
             if interp.var_exists(var_name) {
+                if e.message_text().contains("variable is array") {
+                    set_error_code(interp, "TCL WRITE VARNAME");
+                    return Err(Error::Msg(format!(
+                        "can't set \"{}\": variable is array",
+                        var_name
+                    )));
+                }
                 return Err(e);
             }
             // Element-of-scalar also conflicts even though `info exists`

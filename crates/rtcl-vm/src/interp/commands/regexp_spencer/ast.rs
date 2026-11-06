@@ -146,6 +146,9 @@ pub enum NodeKind {
         negative: bool,
         node: Box<Node>,
     },
+    /// 只匹配、不记录任何捕获（Spencer 编译器 `x{m-1,n-1}` 前缀等价
+    /// 的扁平节点；dissect 时 record=false）。
+    NoRecord(Box<Node>),
 }
 
 impl Node {
@@ -226,6 +229,11 @@ impl Node {
             NodeKind::Backref { subno, min, max },
             flags,
         )
+    }
+
+    pub fn no_record(node: Node) -> Node {
+        let flags = node.flags;
+        Node::new(NodeKind::NoRecord(Box::new(node)), flags)
     }
 
     pub fn look(negative: bool, node: Node) -> Node {

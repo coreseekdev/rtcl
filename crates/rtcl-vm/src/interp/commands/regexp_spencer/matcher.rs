@@ -415,7 +415,7 @@ fn word_at(text: &[char], pos: usize) -> bool {
     text.get(pos).map(|&c| is_word(c)).unwrap_or(false)
 }
 
-fn assert_ok(k: AssertKind, pos: usize, text: &[char], search_start: usize) -> bool {
+pub(crate) fn assert_ok(k: AssertKind, pos: usize, text: &[char], search_start: usize) -> bool {
     match k {
         AssertKind::Bos => pos == search_start,
         AssertKind::Eos => pos == text.len(),

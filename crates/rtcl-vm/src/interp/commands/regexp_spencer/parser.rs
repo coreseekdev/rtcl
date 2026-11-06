@@ -290,6 +290,18 @@ impl Parser {
             // 量化回引：把 min/max 放进回引节点本身（Spencer 特例）。
             return Ok(Node::backref(subno, min, max, qprefer));
         }
+        if min >= 1 {
+            // Spencer 编译器改写（regcomp.c）：x{m,n}（m>0，无回引）
+            // = x{m-1,n-1} x —— 最后一个 x 是独立的"最后迭代"，
+            // 捕获取它（`(a*)+` 的组是尾部空迭代）。
+            let pmax = if max >= super::ast::DUPINF {
+                super::ast::DUPINF
+            } else {
+                max - 1
+            };
+            let prefix = Node::no_record(Node::repeat(atom.clone(), min - 1, pmax, qprefer));
+            return Ok(Node::concat(vec![prefix, atom]));
+        }
         Ok(Node::repeat(atom, min, max, qprefer))
     }
 

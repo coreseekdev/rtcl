@@ -35,6 +35,10 @@ pub struct Prog {
     pub nullable: bool,
     /// 纯字面模式（无任何结构）：可直接子串搜索。
     pub pure_literal: Option<Vec<char>>,
+    /// 原始 subre 树（M3 捕获 dissect 用）。
+    pub tree: Node,
+    /// 捕获组数（最大 subno）。
+    pub nsubs: usize,
 }
 
 struct Builder {
@@ -86,7 +90,9 @@ impl Builder {
                 }
                 Ok(st)
             }
-            NodeKind::Capture { node, .. } => self.compile(node, next),
+            NodeKind::Capture { node, .. } | NodeKind::NoRecord(node) => {
+                self.compile(node, next)
+            }
             NodeKind::Repeat { node, min, max } => {
                 self.compile_repeat(node, *min, *max, next)
             }
@@ -154,6 +160,8 @@ pub fn compile(node: &Node, icase: bool) -> Result<Prog, Error> {
         first,
         nullable,
         pure_literal,
+        tree: node.clone(),
+        nsubs: max_subno(node),
     })
 }
 
@@ -256,5 +264,17 @@ fn pure_literal(node: &Node) -> Option<Vec<char>> {
         Some(out)
     } else {
         None
+    }
+}
+
+/// 最大捕获组编号。
+fn max_subno(n: &Node) -> usize {
+    match &n.kind {
+        NodeKind::Capture { subno, node } => (*subno).max(max_subno(node)),
+        NodeKind::NoRecord(node) => max_subno(node),
+        NodeKind::Concat(v) | NodeKind::Alt(v) => v.iter().map(max_subno).max().unwrap_or(0),
+        NodeKind::Repeat { node, .. } => max_subno(node),
+        NodeKind::Look { node, .. } => max_subno(node),
+        _ => 0,
     }
 }

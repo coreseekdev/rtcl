@@ -150,9 +150,15 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   颜色上限、断言回退）。1 MiB 密集匹配类模式 65-116 MB/s（对
   `regex` 1.0-1.9×），全串无匹配 114-127 MB/s（5-6×），纯字面
   3.1 GB/s。search 预过滤/UTF-8 直读列为下一轮。
-- **M3 待做**：捕获 dissect（POSIX 子匹配/迭代/回引）与
-  `-inline/-indices/-all` 接线；M4：lookahead/LACON、回引执行、
-  BRE/ERE/expanded 全量；M5：默认路由与 go/no-go。
+- **M3 完成（捕获 dissect）**：新增 `captures.rs`——concat 左最长
+  （左子树 SHORTER 时最短）、alternation 按书写序、iteration 贪婪
+  端点/重复组取最后迭代（每次 zap）；解析器按 Spencer 编译器改写
+  `x{m,n}`(m>0)=`NoRecord(x{m-1,n-1}) x`，解释 `(a*)+` 组为尾部
+  空迭代；回引按已捕获文本比较。`specs/regex/spencer-captures.py`
+  对随机 4000 例 `-indices -inline` **差异=0**（默认选项，不含
+  lookahead；lookahead 执行、BRE/ERE 属 M4）。
+- **M4 待做**：lookahead/LACON 执行、BRE/ERE/expanded 全量；
+  M5：默认路由与 go/no-go（`-inline/-indices/-all` 接线随 M4/M5）。
 - 验证命令：
   `cargo test -p rtcl-vm --lib --features regexp-spencer regexp_spencer`
   （7/7）；`specs/tclmem.sh 'python3 specs/regex/spencer-overall.py'`

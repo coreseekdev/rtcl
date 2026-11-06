@@ -5,6 +5,7 @@
 //! M3/M4 落地。feature `regexp-spencer` 默认关闭，验证完成后转默认。
 
 pub mod ast;
+pub mod captures;
 pub mod charset;
 mod dfa;
 pub mod matcher;
@@ -30,6 +31,7 @@ impl Error {
 
 pub use ast::{AssertKind, Flags, Node, DUPMAX, DUPINF};
 pub use charset::{CharSet, Item, Pred};
+pub use captures::Captures;
 pub use matcher::Match;
 pub use nfa::Prog;
 pub use parser::Options;
@@ -53,6 +55,12 @@ pub fn find(prog: &Prog, text: &str, from: usize) -> Option<Match> {
 
 pub fn is_match(prog: &Prog, text: &str, from: usize) -> bool {
     find(prog, text, from).is_some()
+}
+
+/// 匹配并返回捕获 span（0=整体；未参与组为 None）。
+pub fn captures(prog: &Prog, text: &str, from: usize) -> Option<Captures> {
+    let chars: Vec<char> = text.chars().collect();
+    captures::exec(prog, &chars, from, from)
 }
 
 #[cfg(test)]

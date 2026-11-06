@@ -1,18 +1,22 @@
 //! 整体匹配（Spencer `regexec.c` 的 DFA 层语义）。
 //!
-//! 性能结构（Rust 版）：
-//! * **单趟扫描**：所有起点线程同时推进，每个 NFA 状态只保留最小起点
-//!   （leftmost 优先）；不再对每个起点重启模拟（旧版 O(n²·m)）。
-//! * **零分配热路径**：bitset/代际标记 + 复用的状态/种子/栈 Vec；
-//!   每个位置只做一次 epsilon/断言闭包。
-//! * **ASCII 位图**：`CharSet` 对 0..127 用 4×u64 成员表，常见文本
-//!   不做逐项谓词扫描。
-//!
 //! 语义：默认 POSIX leftmost-longest；根偏好含 SHORTER（任一非贪婪
-//! 量词）时整体最短。捕获 dissect（M3）在后续层实现。
+//! 量词）时整体最短。
+//!
+//! 性能结构（Rust 版）：
+//! * **lazy DFA**（`dfa.rs`）：无断言模式用颜色类 + 转移缓存；
+//!   状态超限/含断言时回退 NFA。
+//! * **单趟起点跟踪**：所有起点线程同时推进，每状态保留最小起点
+//!   （leftmost 优先），不逐起点重启。
+//! * **零分配热路径**：代际标记 + 复用 Vec。
+//! * **预过滤**：纯字面直接子串搜索；字面前缀 / 首字符集跳过不可
+//!   能起点（断言可达时禁用首集，nullable 保护空匹配）。
+//!
+//! 捕获 dissect（M3）在后续层实现；本模块只保证整体 span。
 
 use super::ast::{AssertKind, Flags};
 use super::charset::CharSet;
+use super::dfa::DfaCache;
 use super::nfa::{Prog, Trans};
 use crate::interp::unicode;
 
@@ -20,6 +24,112 @@ use crate::interp::unicode;
 pub struct Match {
     pub start: usize,
     pub end: usize,
+}
+
+/// 可复用的搜索引擎（DFA 缓存在多次 `find` 间保持）。
+pub struct Searcher<'a> {
+    prog: &'a Prog,
+    dfa: Option<DfaCache>,
+    scratch: DfaScratch,
+}
+
+/// DFA 扫描的复用缓冲（跨多次 find 保持，减少密集匹配的每次分配）。
+struct DfaScratch {
+    stamp: Vec<u32>,
+    start_of: Vec<usize>,
+    cur: Vec<u32>,
+    next: Vec<u32>,
+    gen: u32,
+}
+
+impl DfaScratch {
+    fn new() -> DfaScratch {
+        DfaScratch {
+            stamp: Vec::new(),
+            start_of: Vec::new(),
+            cur: Vec::new(),
+            next: Vec::new(),
+            gen: 0,
+        }
+    }
+    fn next_gen(&mut self) -> u32 {
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.stamp.fill(0);
+            self.gen = 1;
+        }
+        self.gen
+    }
+}
+
+impl<'a> Searcher<'a> {
+    pub fn new(prog: &'a Prog) -> Searcher<'a> {
+        let dfa = if std::env::var_os("RTCL_SPENCER_NFA").is_some() {
+            None
+        } else {
+            DfaCache::new(prog)
+        };
+        Searcher {
+            prog,
+            dfa,
+            scratch: DfaScratch::new(),
+        }
+    }
+
+    pub fn find(&mut self, text: &[char], from: usize, search_start: usize) -> Option<Match> {
+        let prog = self.prog;
+        let from = from.min(text.len());
+        if let Some(lit) = &prog.pure_literal {
+            if !prog.icase {
+                if lit.is_empty() {
+                    return Some(Match { start: from, end: from });
+                }
+                let first = lit[0];
+                let mut k = from;
+                while k + lit.len() <= text.len() {
+                    if text[k] == first && text[k + 1..k + lit.len()] == lit[1..] {
+                        return Some(Match {
+                            start: k,
+                            end: k + lit.len(),
+                        });
+                    }
+                    k += 1;
+                }
+                return None;
+            }
+        }
+        if !prog.literal_prefix.is_empty() && !prog.icase {
+            let needle = &prog.literal_prefix;
+            let first = needle[0];
+            let mut k = from;
+            while k + needle.len() <= text.len() {
+                if text[k] == first && text[k + 1..k + needle.len()] == needle[1..] {
+                    if let Some(m) = self.scan(text, k, search_start) {
+                        return Some(m);
+                    }
+                }
+                k += 1;
+            }
+            return None;
+        }
+        self.scan(text, from, search_start)
+    }
+
+    fn scan(&mut self, text: &[char], from: usize, search_start: usize) -> Option<Match> {
+        if let Some(mut dfa) = self.dfa.take() {
+            match dfa_scan(self.prog, &mut dfa, &mut self.scratch, text, from, search_start) {
+                Ok(found) => {
+                    self.dfa = Some(dfa);
+                    return found;
+                }
+                Err(()) => {
+                    // 状态超限：永久回退 NFA（本 searcher 生命周期内）。
+                    self.dfa = None;
+                }
+            }
+        }
+        nfa_scan(self.prog, text, from, search_start)
+    }
 }
 
 pub fn find(prog: &Prog, text: &[char], from: usize) -> Option<Match> {
@@ -33,50 +143,138 @@ pub fn find_from(
     from: usize,
     search_start: usize,
 ) -> Option<Match> {
-    let from = from.min(text.len());
-    if let Some(lit) = &prog.pure_literal {
-        if prog.icase {
-            // 大小写不敏感：回退 NFA（字面折叠由 CharSet 处理）。
-        } else if lit.is_empty() {
-            return Some(Match {
-                start: from,
-                end: from,
-            });
-        } else {
-            let first = lit[0];
-            let mut k = from;
-            while k + lit.len() <= text.len() {
-                if text[k] == first && text[k + 1..k + lit.len()] == lit[1..] {
-                    return Some(Match {
-                        start: k,
-                        end: k + lit.len(),
-                    });
-                }
-                k += 1;
-            }
-            return None;
-        }
-    }
-    if !prog.literal_prefix.is_empty() && !prog.icase {
-        // 字面前缀预过滤：匹配必须从该前缀开始。
-        let needle = &prog.literal_prefix;
-        let first = needle[0];
-        let mut k = from;
-        while k + needle.len() <= text.len() {
-            // 首字符过滤 + 剩余比较（Vec<char> 无 memchr，先做廉价首字符）。
-            if text[k] == first && text[k + 1..k + needle.len()] == needle[1..] {
-                if let Some(m) = scan(prog, text, k, search_start) {
-                    return Some(m);
-                }
-            }
-            k += 1;
-        }
-        return None;
-    }
-    scan(prog, text, from, search_start)
+    let mut s = Searcher::new(prog);
+    s.find(text, from, search_start)
 }
 
-fn scan(prog: &Prog, text: &[char], from: usize, search_start: usize) -> Option<Match> {
+pub fn is_match(prog: &Prog, text: &[char], from: usize) -> bool {
+    find(prog, text, from).is_some()
+}
+
+// ── DFA 扫描 ─────────────────────────────────────────────────────
+
+fn dfa_scan(
+    prog: &Prog,
+    dfa: &mut DfaCache,
+    scratch: &mut DfaScratch,
+    text: &[char],
+    from: usize,
+    _search_start: usize,
+) -> Result<Option<Match>, ()> {
+    let shortest = prog.flags.has_shorter();
+    let start_id = dfa.start();
+    if scratch.stamp.len() < dfa.state_count() {
+        scratch.stamp.resize(dfa.state_count(), 0);
+        scratch.start_of.resize(dfa.state_count(), 0);
+    }
+    scratch.cur.clear();
+    scratch.next.clear();
+    let mut best: Option<Match> = None;
+
+    for p in from..=text.len() {
+        // 注入起点线程。若 start 状态仍在 cur 中，保留其更早起点
+        // （DFA 状态合并后 start 状态可能由更早线程到达）。
+        if best.map_or(true, |b| p < b.start) && inject_allowed(prog, text, p) {
+            if scratch.start_of.len() < dfa.state_count() {
+                scratch.stamp.resize(dfa.state_count(), 0);
+                scratch.start_of.resize(dfa.state_count(), 0);
+            }
+            if !scratch.cur.contains(&start_id) {
+                scratch.start_of[start_id as usize] = p;
+                scratch.cur.push(start_id);
+            }
+        }
+        if scratch.cur.is_empty() {
+            continue;
+        }
+
+        for &id in &scratch.cur {
+            if dfa.is_accept(id) {
+                let st = scratch.start_of[id as usize];
+                best = Some(match best {
+                    None => Match { start: st, end: p },
+                    Some(b) if st < b.start => Match { start: st, end: p },
+                    Some(b) if st == b.start => {
+                        if shortest {
+                            b
+                        } else {
+                            Match {
+                                start: b.start,
+                                end: b.end.max(p),
+                            }
+                        }
+                    }
+                    Some(b) => b,
+                });
+            }
+        }
+
+        if p == text.len() {
+            break;
+        }
+        let ch = text[p];
+        let color = dfa.color(ch);
+        let gen = scratch.next_gen();
+        scratch.next.clear();
+        for &id in &scratch.cur {
+            let st = scratch.start_of[id as usize];
+            if let Some(b) = best {
+                if st > b.start || (shortest && st == b.start) {
+                    continue;
+                }
+            }
+            match dfa.step(prog, id, color)? {
+                Some(ns) => {
+                    if scratch.stamp.len() < dfa.state_count() {
+                        scratch.stamp.resize(dfa.state_count(), 0);
+                        scratch.start_of.resize(dfa.state_count(), 0);
+                    }
+                    let ni = ns as usize;
+                    if scratch.stamp[ni] != gen {
+                        scratch.stamp[ni] = gen;
+                        scratch.start_of[ni] = st;
+                        scratch.next.push(ns);
+                    } else if st < scratch.start_of[ni] {
+                        scratch.start_of[ni] = st;
+                    }
+                }
+                None => {}
+            }
+        }
+        scratch.cur.clear();
+        std::mem::swap(&mut scratch.cur, &mut scratch.next);
+        if let Some(b) = best {
+            let useful = scratch
+                .cur
+                .iter()
+                .any(|&id| scratch.start_of[id as usize] < b.start
+                    || (!shortest && scratch.start_of[id as usize] == b.start));
+            if !useful {
+                break;
+            }
+        }
+    }
+    Ok(best)
+}
+
+fn inject_allowed(prog: &Prog, text: &[char], p: usize) -> bool {
+    match &prog.first {
+        None => true,
+        Some(sets) => {
+            if prog.nullable {
+                true
+            } else if p < text.len() {
+                sets.iter().any(|s| s.matches(text[p], prog.icase))
+            } else {
+                false
+            }
+        }
+    }
+}
+
+// ── NFA 回退扫描 ─────────────────────────────────────────────────
+
+fn nfa_scan(prog: &Prog, text: &[char], from: usize, search_start: usize) -> Option<Match> {
     let shortest = prog.flags.has_shorter();
     let mut sc = Scanner::new(prog, text, search_start);
     let mut best: Option<Match> = None;
@@ -86,30 +284,13 @@ fn scan(prog: &Prog, text: &[char], from: usize, search_start: usize) -> Option<
     for p in from..=text.len() {
         seeds.clear();
         seeds.extend(carried.drain(..));
-        // 新起点线程：一旦已有匹配，后续起点不可能更左。
-        if best.map_or(true, |b| p < b.start) {
-            let inject = match &prog.first {
-                None => true,
-                Some(sets) => {
-                    if prog.nullable {
-                        true
-                    } else if p < text.len() {
-                        sets.iter().any(|s| s.matches(text[p], prog.icase))
-                    } else {
-                        false
-                    }
-                }
-            };
-            if inject {
-                seeds.push((prog.start, p));
-            }
+        if best.map_or(true, |b| p < b.start) && inject_allowed(prog, text, p) {
+            seeds.push((prog.start, p));
         }
         if seeds.is_empty() {
             continue;
         }
         sc.closure(&seeds, p);
-
-        // 接受：leftmost 优先；同起点按全局偏好取最长/最短。
         for &s in &sc.cur {
             if s != prog.accept {
                 continue;
@@ -131,11 +312,9 @@ fn scan(prog: &Prog, text: &[char], from: usize, search_start: usize) -> Option<
                 Some(b) => b,
             });
         }
-
         if p == text.len() {
             break;
         }
-        // 推进一个字符：丢弃不可能改善 leftmost 的线程。
         let ch = text[p];
         for &s in &sc.cur {
             let st = sc.start_of[s];
@@ -162,11 +341,6 @@ fn scan(prog: &Prog, text: &[char], from: usize, search_start: usize) -> Option<
         }
     }
     best
-}
-
-/// `is_match` 语义（regexp 无捕获返回布尔）。
-pub fn is_match(prog: &Prog, text: &[char], from: usize) -> bool {
-    find(prog, text, from).is_some()
 }
 
 struct Scanner<'a> {
@@ -203,8 +377,6 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// epsilon/断言闭包。同一状态保留**最小起点**；起点变小时重新展开
-    /// 其出弧（下游可能因此拿到更左的起点）。
     fn closure(&mut self, seeds: &[(usize, usize)], pos: usize) {
         self.next_gen();
         self.cur.clear();
@@ -245,7 +417,6 @@ fn word_at(text: &[char], pos: usize) -> bool {
 
 fn assert_ok(k: AssertKind, pos: usize, text: &[char], search_start: usize) -> bool {
     match k {
-        // D-21：\A 绑定 -start 偏移（搜索起点），不是绝对串首。
         AssertKind::Bos => pos == search_start,
         AssertKind::Eos => pos == text.len(),
         AssertKind::Bol => pos == 0 || text.get(pos - 1) == Some(&'\n'),
@@ -265,12 +436,10 @@ fn assert_ok(k: AssertKind, pos: usize, text: &[char], search_start: usize) -> b
     }
 }
 
-/// 供后续 dissect 复用的字符集入口。
 pub fn class_matches(set: &CharSet, c: char, icase: bool) -> bool {
     set.matches(c, icase)
 }
 
-/// 根偏好（调试/测试）。
 pub fn root_flags(prog: &Prog) -> Flags {
     prog.flags
 }

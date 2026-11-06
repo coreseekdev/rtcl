@@ -145,9 +145,11 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   不含回引/lookahead）。
 - **行为规格**：`specs/regex-spencer.allium`（23 条规则，oracle 值
   实测校准；`allium check` 0 error）作为 M2/M3/M4 的验收口径。
-- **性能（M2，见 §8）**：单趟起点跟踪 NFA + ASCII 位图 + 纯字面/前缀
-  预过滤；1 MiB 全扫描类模式 22-69 MB/s（对 `regex` 2.6-4.2×），
-  纯字面 4.7 GB/s（快路径）。CNFA/color/lazy DFA 列为 M2.5。
+- **性能（M2/M2.5，见 §8）**：单趟起点跟踪 NFA + ASCII 位图 + 纯字面/
+  前缀预过滤 + **颜色类 lazy DFA**（每状态一行的颜色转移表、状态/
+  颜色上限、断言回退）。1 MiB 密集匹配类模式 65-116 MB/s（对
+  `regex` 1.0-1.9×），全串无匹配 114-127 MB/s（5-6×），纯字面
+  3.1 GB/s。search 预过滤/UTF-8 直读列为下一轮。
 - **M3 待做**：捕获 dissect（POSIX 子匹配/迭代/回引）与
   `-inline/-indices/-all` 接线；M4：lookahead/LACON、回引执行、
   BRE/ERE/expanded 全量；M5：默认路由与 go/no-go。
@@ -174,31 +176,41 @@ compacted NFA（小整数弧表）→ lazy DFA 缓存 → dissect 复用。Rust 
 - **预过滤**：纯字面模式直接子串搜索；字面前缀 / 首字符集跳过
   不可能起点（断言可达时自动禁用首字符集）。
 
-### 实测（1 MiB 文本，全匹配扫描；`examples/spencer_bench.rs`）
+### 实测（1 MiB 文本；`examples/spencer_bench.rs`）
+
+密集匹配（每 1-5 字节一个匹配，`find` 循环）：
 
 | 模式 | Spencer Rust | Rust `regex` crate | 比值 |
 |---|---|---|---|
-| `a+` | 35 MB/s | 94 MB/s | 2.7× |
-| `[a-z]+` | 38 MB/s | 156 MB/s | 4.1× |
-| `\w+` | 37 MB/s | 149 MB/s | 4.0× |
-| `(a\|ab)+` | 22 MB/s | 92 MB/s | 4.2× |
-| `(a+?)(a*)` | 23 MB/s | 94 MB/s | 4.1× |
-| 纯字面 `abab abab` | 4737 MB/s | 1284 MB/s | 0.27×（快路径） |
-| `\s+` | 69 MB/s | 177 MB/s | 2.6× |
-| UTF-8→char 转换 | 2.4-3.3 GB/s | — | 每次 regexp 调用一次性 |
+| `a+` | 65 MB/s | 92 MB/s | 1.4× |
+| `[a-z]+` | 82 MB/s | 155 MB/s | 1.9× |
+| `\w+` | 81 MB/s | 146 MB/s | 1.8× |
+| `(a\|ab)+` | 87 MB/s | 88 MB/s | 1.0× |
+| `(a+?)(a*)` | 66 MB/s | 93 MB/s | 1.4× |
+| `\s+` | 116 MB/s | 167 MB/s | 1.4× |
+| 纯字面 `abab abab` | 3112 MB/s | 1310 MB/s | 0.42×（快路径） |
+
+全串无匹配扫描（单次调用扫完 1MB，DFA 路径）：
+
+| 模式 | Spencer Rust | Rust `regex` | 比值 |
+|---|---|---|---|
+| `(a\|b)*z` | 114 MB/s | 608 MB/s | 5.4× |
+| `[a-z]*z` | 127 MB/s | 794 MB/s | 6.2× |
+
+UTF-8→char 转换：2.4-3.3 GB/s（每次 regexp 调用一次性成本）。
+DFA 缓存：颜色类 ≤64、状态 ≤4096；断言模式自动回退 NFA。
 
 ### 待做（M2.5 / M3）
 
-1. **Color map + CNFA**：把 CharSet 归并为颜色类（ASCII 预计算，
-   Unicode 按谓词惰性分类并缓存），弧表压成 `(color, to)` 小整数数组
-   ——对应 Spencer `regc_color.c`/`regc_nfa.c`。
-2. **lazy DFA 缓存**：DFA 状态 = NFA 状态位集（u64 数组）+ 代际哈希，
-   转移表按 color 缓存；带状态上限（防内存膨胀）和失效策略。
-   目标：类模式 ≥ 1 GB/s（当前 35-40 MB/s），与 `regex` 差距 ≤ 1.5×。
-3. **UTF-8 直读 + 字面 memmem**：公共 `find(&str)` 对纯 ASCII/纯字面
+1. **search 预过滤 DFA（Spencer `simpleFind` 两段式）**：先用
+   `search` NFA 的 shortest 扫出可能起点区间，再对候选起点做 anchored
+   longest/shortest；目标把全串无匹配从 114-127 MB/s 提到 ≥500 MB/s。
+2. **UTF-8 直读 + 字面 memmem**：公共 `find(&str)` 对纯 ASCII/纯字面
    走字节路径（避免每次调用的一次性 `Vec<char>` 转换），只对非 ASCII
    /需要 Unicode 语义的输入转 chars。
-4. **dissect 复用**：M3 捕获拆分复用同一 DFA/NFA 缓存，避免回溯爆炸。
+3. **dissect 复用**：M3 捕获拆分复用同一 DFA/NFA 缓存，避免回溯爆炸。
+4. **趋势目标**：密集匹配与 `regex` ≤1.5×（当前 1.0-1.9×）；
+   全串无匹配 ≥500 MB/s；纯字面 ≥0.5× regex（当前更快）。
 5. 内存上限：DFA 缓存按状态数/字节数封顶；编译空间预算对应
    `REG_MAX_COMPILE_SPACE`。
 

@@ -6,6 +6,7 @@
 
 pub mod ast;
 pub mod charset;
+mod dfa;
 pub mod matcher;
 pub mod nfa;
 pub mod parser;

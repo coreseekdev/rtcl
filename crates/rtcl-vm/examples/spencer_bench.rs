@@ -38,6 +38,8 @@ fn main() {
         r"\w+",
         "(a|ab)+",
         "(a+?)(a*)",
+        "(a|b)*z",
+        "[a-z]*z",
         "abab abab",
         r"\s+",
         "$",
@@ -54,13 +56,14 @@ fn main() {
             }
         };
         let chars: Vec<char> = text.chars().collect();
-        // 引擎核心（字符切片，排除 UTF-8→char 转换）：扫描全部匹配，
-        // 避免"首位置即命中"把耗时压到函数调用级别。
+        // 引擎核心（字符切片，排除 UTF-8→char 转换）；复用 Searcher
+        // 以保留 lazy DFA 缓存，扫描全部匹配。
+        let mut searcher = sp::matcher::Searcher::new(&prog);
         let spencer = bench(|| {
             let mut pos = 0usize;
             let mut n = 0usize;
             while pos <= chars.len() {
-                match sp::matcher::find(&prog, &chars, pos) {
+                match searcher.find(&chars, pos, pos) {
                     Some(m) => {
                         n += 1;
                         pos = if m.end > m.start { m.end } else { m.end + 1 };

@@ -53,15 +53,26 @@
   词（`K create o 5` / `K new 5`）；对象编号与 tclsh 对齐（核心消耗到
   Obj10，用户对象从 ::oo::Obj11 起）。
 - **复现**：`catch {error boom} m o; puts [dict keys $o]`
-- **严重度**：已关闭。残差（均为 bytecode 内省形，诊断面低频）：
-  * INNER 的**操作码名**形：替换失败 = `loadStk`/`loadScalar1`；
-    尾位置分派失败（ensemble 编译）= `invokeReplace`；`{*}` 多词展开
-    = `invokeExpanded`；tailcall 内置/arity 失败 = 裸目标词——rtcl
-    均记 invokeStk1...；
-  * 对象自有方法帧 `(object "::oo::ObjN" method "m" line N)` 出口帧
-    与对象自有方法 `next` 的 tclsh 8.6 怪形（丢实参、level0=对象调用）；
+- **严重度**：已关闭。
+- **D-3 残差收口（2026-11-06 第二批）**：INNER 的 bytecode 操作码形
+  全部落地——替换失败按上下文记 `loadScalar1`/`loadScalar`（局部槽位
+  含隐式局部）、`loadArray1`/`loadArray`/`loadArrayStk`（数组元素）、
+  `loadStk`（名键单元/限定名），tree-walk 与 bytecode 双引擎各按
+  自身现场判定；分派期失败记 `invokeReplace`（字面命令词且为 tclsh
+  ensemble：namespace/string/info/dict/array/file/binary/chan/
+  encoding）与 `invokeExpanded`（**动态** `{*}` 展开；字面展开 tclsh
+  折叠为普通调用）；tailcall 内置/arity 失败 = 裸目标词。对象自有
+  方法出口帧 `(object "::oo::ObjN" method "m" line N)` 已修；对象自有
+  方法 `next` 的"怪形"实为 D-41a 解析序（mixin 先于自有方法）的观测
+  假象，顺序修正后逐字一致。17 条操作码探针 + 3 条对象 next 探针全
+  SAME。
+- **余留残差**（低频）：
+  * clock 错误的 INNER 是 tclsh Tcl 实现帧（`::tcl::clock::scan`
+    + UP 1），native 实现对不上；
   * `return -level 0 -code error -errorinfo EI boom` 的 INNER
-    （tclsh `invokeStk1 t2`）。
+    （tclsh `invokeStk1 t2`）；
+  * 融合 lappend 读失败的槽位号近似（
+    槽 >255 的 loadScalar 选择）。
 
 ### D-4 非 error 完成的 options 字典 -code/-level 未按 proc 边界解码（spec [D-3]）
 - **Tcl 8.6**：catch {f}（f 内 `return hi`）→ `-code 0 -level 1`；

@@ -12,7 +12,7 @@
 //! - **MemoryOutputPipe** — writable to an `Arc<Mutex<Vec<u8>>>` buffer with capacity
 //! - **SinkChannel** — discards all writes (like `/dev/null`)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, Write};
 use std::sync::{Arc, Mutex};
 
@@ -47,18 +47,31 @@ pub trait Channel: Send {
     fn pids(&self) -> Vec<u32> { vec![] }
 }
 
-/// Extension: write a full string through `enc`（通道 `-encoding`）。
-pub(crate) fn channel_write_str_enc(
-    ch: &mut dyn Channel,
-    s: &str,
-    enc: &str,
-) -> io::Result<()> {
-    let encoded = if enc == "utf-8" {
-        s.as_bytes().to_vec()
-    } else {
-        crate::encoding::encode(s, enc)
-    };
-    let bytes = &encoded[..];
+/// 输出 EOL 翻译（写侧，字符级——编码之前）。
+fn translate_output(s: &str, mode: TranslationMode) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    match mode {
+        TranslationMode::Lf => Cow::Borrowed(s),
+        TranslationMode::Auto => translate_output(s, platform_translation()),
+        TranslationMode::Cr => {
+            if s.contains('\n') {
+                Cow::Owned(s.replace('\n', "\r"))
+            } else {
+                Cow::Borrowed(s)
+            }
+        }
+        TranslationMode::CrLf => {
+            if s.contains('\n') {
+                Cow::Owned(s.replace('\n', "\r\n"))
+            } else {
+                Cow::Borrowed(s)
+            }
+        }
+    }
+}
+
+/// 写完整字节串（处理短写）。
+fn write_all_bytes(ch: &mut dyn Channel, bytes: &[u8]) -> io::Result<()> {
     let mut offset = 0;
     while offset < bytes.len() {
         let n = ch.write_bytes(&bytes[offset..])?;
@@ -70,196 +83,351 @@ pub(crate) fn channel_write_str_enc(
     Ok(())
 }
 
-/// 按 `enc` 读一整行（gets 用）。
-pub(crate) fn channel_read_line(
+/// 写串：按通道 `-translation`（输出侧）翻译，再按 `-encoding` 编码。
+pub(crate) fn channel_write_str_cfg(
     ch: &mut dyn Channel,
-    enc: &str,
-) -> io::Result<Option<String>> {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut saw = false;
-    let mut b = [0u8; 1];
-    loop {
-        let n = ch.read_bytes(&mut b)?;
-        if n == 0 {
-            break;
-        }
-        saw = true;
-        if b[0] == b'\n' {
-            break;
-        }
-        buf.push(b[0]);
-    }
-    if !saw {
-        return Ok(None);
-    }
-    if buf.last() == Some(&b'\r') {
-        buf.pop();
-    }
-    Ok(Some(crate::encoding::decode(&buf, enc)))
+    cfg: &ChannelConfig,
+    s: &str,
+) -> io::Result<usize> {
+    let translated = translate_output(s, cfg.translation_out);
+    let encoded = if cfg.encoding == "utf-8" {
+        translated.as_bytes().to_vec()
+    } else {
+        crate::encoding::encode(&translated, &cfg.encoding)
+    };
+    write_all_bytes(ch, &encoded)?;
+    Ok(encoded.len())
 }
 
-/// 按 `enc` 读到 EOF（read 无数量用）。
-pub(crate) fn channel_read_all(ch: &mut dyn Channel, enc: &str) -> io::Result<String> {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        let n = ch.read_bytes(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    Ok(crate::encoding::decode(&buf, enc))
+/// 写串（翻译后按 **UTF-8 内部字节** 落盘，忽略 `-encoding`）。
+///
+/// `chan copy` 的 tclsh 怪形：目标 `-encoding binary` 时，若源通道是
+/// 真实编码（utf-8/iso8859-1/...），Tcl 把对象写为其 UTF-8 内部表示
+/// （c3 a9），只有源通道也是 binary（字节串对象）时才逐低字节写
+/// （e9）。`puts` 不适用此规则（仍走 `channel_write_str_cfg`）。
+pub(crate) fn channel_write_str_utf8_cfg(
+    ch: &mut dyn Channel,
+    cfg: &ChannelConfig,
+    s: &str,
+) -> io::Result<usize> {
+    let translated = translate_output(s, cfg.translation_out);
+    write_all_bytes(ch, translated.as_bytes())?;
+    Ok(translated.len())
 }
 
-/// 按 `enc` 读 `count` 个**字符**（D-30/D-29）。
-pub(crate) fn channel_read_chars_enc(
+/// 字符级通道读取器：负责按 `-encoding` 增量解码 + 按
+/// `-translation`（输入侧）翻译 EOL。未成形的多字节尾巴、CR 前瞻
+/// 回推字符都持久化在 [`ChannelConfig`] 中（跨 read/gets 调用）。
+struct ChannelReader<'a> {
+    ch: &'a mut dyn Channel,
+    cfg: &'a mut ChannelConfig,
+}
+
+impl<'a> ChannelReader<'a> {
+    fn new(ch: &'a mut dyn Channel, cfg: &'a mut ChannelConfig) -> Self {
+        ChannelReader { ch, cfg }
+    }
+
+    fn read_byte(&mut self) -> io::Result<Option<u8>> {
+        let mut b = [0u8; 1];
+        let n = self.ch.read_bytes(&mut b)?;
+        Ok(if n == 0 { None } else { Some(b[0]) })
+    }
+
+    /// 从字节尾巴里尝试解出一个字符；`None` = 需要更多字节。
+    fn try_decode(&mut self, enc: &str) -> Option<char> {
+        if self.cfg.read_bytes.is_empty() {
+            return None;
+        }
+        match enc {
+            "utf-8" => {
+                let (c, used) = {
+                    let bytes = &self.cfg.read_bytes;
+                    match std::str::from_utf8(bytes) {
+                        Ok(s) => {
+                            let c = s.chars().next().unwrap();
+                            (c, c.len_utf8())
+                        }
+                        Err(e) => {
+                            if e.valid_up_to() > 0 {
+                                let valid = e.valid_up_to();
+                                // SAFETY: from_utf8 已确认前缀合法。
+                                let s = unsafe {
+                                    std::str::from_utf8_unchecked(&bytes[..valid])
+                                };
+                                let c = s.chars().next().unwrap();
+                                (c, c.len_utf8())
+                            } else if e.error_len().is_some() {
+                                // 无效字节：按字节值出字符。
+                                (bytes[0] as char, 1)
+                            } else {
+                                return None; // 不完整序列：继续读
+                            }
+                        }
+                    }
+                };
+                self.cfg.read_bytes.drain(..used);
+                Some(c)
+            }
+            "ascii" | "iso8859-1" | "identity" | "binary" => {
+                let b = self.cfg.read_bytes[0];
+                self.cfg.read_bytes.drain(..1);
+                Some(b as char)
+            }
+            "unicode" => {
+                if self.cfg.read_bytes.len() < 2 {
+                    return None;
+                }
+                let u = (self.cfg.read_bytes[0] as u32)
+                    | ((self.cfg.read_bytes[1] as u32) << 8);
+                self.cfg.read_bytes.drain(..2);
+                Some(char::from_u32(u).unwrap_or('\u{FFFD}'))
+            }
+            _ => {
+                #[cfg(all(unix, feature = "iconv"))]
+                {
+                    if let Some((text, consumed)) =
+                        crate::encoding::iconv_decode_step(&self.cfg.read_bytes, enc)
+                    {
+                        self.cfg.read_bytes.drain(..consumed);
+                        let mut it = text.chars();
+                        let first = it.next();
+                        for c in it {
+                            self.cfg.read_chars.push_back(c);
+                        }
+                        if first.is_some() {
+                            return first;
+                        }
+                        // 消费了字节但没产出字符：继续解析剩余尾巴。
+                        return None;
+                    }
+                    None
+                }
+                #[cfg(not(all(unix, feature = "iconv")))]
+                {
+                    // 无 iconv 后端：逐字节直映（与 encoding::decode 兜底一致）。
+                    let b = self.cfg.read_bytes[0];
+                    self.cfg.read_bytes.drain(..1);
+                    Some(b as char)
+                }
+            }
+        }
+    }
+
+    /// EOF 处处理未成形的尾巴（Tcl 约定：按字节值 / U+FFFD）。
+    fn flush_eof(&mut self, enc: &str) -> Option<char> {
+        if self.cfg.read_bytes.is_empty() {
+            return None;
+        }
+        if enc == "unicode" {
+            // 奇尾字节 → U+FFFD。
+            self.cfg.read_bytes.clear();
+            return Some('\u{FFFD}');
+        }
+        #[cfg(all(unix, feature = "iconv"))]
+        {
+            if !matches!(
+                enc,
+                "utf-8" | "ascii" | "iso8859-1" | "identity" | "binary" | "unicode"
+            ) {
+                if let Some((text, consumed)) =
+                    crate::encoding::iconv_decode_step(&self.cfg.read_bytes, enc)
+                {
+                    if consumed > 0 {
+                        self.cfg.read_bytes.drain(..consumed);
+                        let mut it = text.chars();
+                        let first = it.next();
+                        for c in it {
+                            self.cfg.read_chars.push_back(c);
+                        }
+                        if first.is_some() {
+                            return first;
+                        }
+                    }
+                }
+            }
+        }
+        let b = self.cfg.read_bytes.remove(0);
+        Some(b as char)
+    }
+
+    /// 下一个原始（未翻译）字符。
+    fn next_raw(&mut self, enc: &str) -> io::Result<Option<char>> {
+        if let Some(c) = self.cfg.read_chars.pop_front() {
+            return Ok(Some(c));
+        }
+        loop {
+            if let Some(c) = self.try_decode(enc) {
+                return Ok(Some(c));
+            }
+            match self.read_byte()? {
+                Some(b) => self.cfg.read_bytes.push(b),
+                None => return Ok(self.flush_eof(enc)),
+            }
+        }
+    }
+
+    /// 原始字符 + CR 前瞻回推优先。
+    fn next_raw_or_pending(&mut self, enc: &str) -> io::Result<Option<char>> {
+        if let Some(c) = self.cfg.read_pending.pop_front() {
+            return Ok(Some(c));
+        }
+        self.next_raw(enc)
+    }
+
+    /// 下一个翻译后的字符（输入侧 EOL 归一）。
+    fn next_translated(&mut self, enc: &str) -> io::Result<Option<char>> {
+        let Some(c) = self.next_raw_or_pending(enc)? else {
+            return Ok(None);
+        };
+        match self.cfg.translation_in {
+            TranslationMode::Lf => Ok(Some(c)),
+            TranslationMode::Cr => Ok(Some(if c == '\r' { '\n' } else { c })),
+            TranslationMode::Auto | TranslationMode::CrLf => {
+                if c != '\r' {
+                    return Ok(Some(c));
+                }
+                let keep_cr = self.cfg.translation_in == TranslationMode::CrLf;
+                let term = if keep_cr { '\r' } else { '\n' };
+                match self.next_raw_or_pending(enc)? {
+                    Some('\n') => Ok(Some('\n')),
+                    Some(other) => {
+                        self.cfg.read_pending.push_back(other);
+                        Ok(Some(term))
+                    }
+                    None => Ok(Some(term)),
+                }
+            }
+        }
+    }
+}
+
+/// 按通道 `-encoding` 读 `count` 个**字符**（翻译后计数）。
+pub(crate) fn channel_read_chars_cfg(
     ch: &mut dyn Channel,
+    cfg: &mut ChannelConfig,
     count: usize,
-    enc: &str,
 ) -> io::Result<String> {
-    // D-30：count 是**字符数**；D-29：按通道 `-encoding` 转码。
     // count=0 不触碰 at_eof（tclsh：read ch 0 不置 EOF）。
     if count == 0 {
         return Ok(String::new());
     }
-    match enc {
-        "utf-8" => read_chars_utf8(ch, count),
-        "ascii" | "iso8859-1" | "identity" | "binary" => {
-            // 单字节编码：逐字节直映（一个字节一个字符）。
-            let mut out = String::new();
-            let mut byte = [0u8; 1];
-            while out.chars().count() < count {
-                let n = ch.read_bytes(&mut byte)?;
-                if n == 0 {
-                    break;
-                }
-                out.push(byte[0] as char);
-            }
-            Ok(out)
-        }
-        "unicode" => {
-            // UCS-2LE：两字节一字符；EOF 的奇尾字节 → U+FFFD。
-            let mut out = String::new();
-            let mut byte = [0u8; 1];
-            while out.chars().count() < count {
-                let n = ch.read_bytes(&mut byte)?;
-                if n == 0 {
-                    break;
-                }
-                let lo = byte[0] as u32;
-                let n2 = ch.read_bytes(&mut byte)?;
-                if n2 == 0 {
-                    out.push('\u{FFFD}');
-                    break;
-                }
-                let u = lo | ((byte[0] as u32) << 8);
-                out.push(char::from_u32(u).unwrap_or('\u{FFFD}'));
-            }
-            Ok(out)
-        }
-        _ => read_chars_iconv(ch, count, enc),
-    }
-}
-
-/// UTF-8 通道解码：Tcl 的 modified-UTF-8（无效字节按字节值出字符；
-/// EOF 截断尾同样按字节值逐个出字符）。
-fn read_chars_utf8(ch: &mut dyn Channel, count: usize) -> io::Result<String> {
-    let mut out: Vec<u8> = Vec::new();
-    let mut pending = 0usize;
+    let enc = cfg.encoding.clone();
+    let mut reader = ChannelReader::new(ch, cfg);
+    let mut out = String::new();
     let mut chars = 0usize;
-    let mut byte = [0u8; 1];
     while chars < count {
-        let n = ch.read_bytes(&mut byte)?;
-        if n == 0 {
-            break;
-        }
-        out.push(byte[0]);
-        loop {
-            match std::str::from_utf8(&out[pending..]) {
-                Ok(s) => {
-                    chars += s.chars().count();
-                    pending = out.len();
-                    break;
-                }
-                Err(e) if e.error_len().is_none() => break,
-                Err(e) => {
-                    let valid = e.valid_up_to();
-                    if valid > 0 {
-                        // SAFETY: 前缀已由 from_utf8 确认合法。
-                        chars += unsafe {
-                            std::str::from_utf8_unchecked(&out[pending..pending + valid])
-                        }
-                        .chars()
-                        .count();
-                        pending += valid;
-                    } else {
-                        // 无效字节：按字节值出一个字符。
-                        chars += 1;
-                        pending += 1;
-                    }
-                }
+        match reader.next_translated(&enc)? {
+            Some(c) => {
+                out.push(c);
+                chars += 1;
             }
+            None => break,
         }
     }
-    Ok(crate::encoding::decode(&out, "utf-8"))
+    Ok(out)
 }
 
-/// iconv 后端的多字节通道解码：逐字节喂入，不完整序列继续读；
-/// EOF 时剩余字节按字节值出字符（Tcl 语义）。无 iconv 后端时退化为
-/// 逐字节直映（与 encoding::decode 的兜底一致）。
-fn read_chars_iconv(ch: &mut dyn Channel, count: usize, enc: &str) -> io::Result<String> {
-    #[cfg(all(unix, feature = "iconv"))]
-    {
-        let mut pending: Vec<u8> = Vec::new();
-        let mut out = String::new();
-        let mut chars = 0usize;
-        let mut byte = [0u8; 1];
-        let mut eof = false;
-        while chars < count {
-            let n = ch.read_bytes(&mut byte)?;
-            if n == 0 {
-                eof = true;
-            } else {
-                pending.push(byte[0]);
-            }
-            loop {
-                match crate::encoding::iconv_decode_step(&pending, enc) {
-                    Some((text, consumed)) => {
-                        let nchars = text.chars().count();
-                        out.push_str(&text);
-                        chars += nchars;
-                        pending.drain(..consumed);
-                        if nchars == 0 || chars >= count || pending.is_empty() {
-                            break;
+/// 按通道 `-encoding`/`-translation` 读一整行（gets 用，返回不含行尾）。
+///
+/// gets 的行界由**原始字符流**上的 translation 模式决定（不是先翻译
+/// 再按 LF 切）：
+/// * lf    → 原始 LF 为界，CR 留在内容里；
+/// * cr    → 原始 CR 为界，LF 留在内容里；
+/// * crlf  → 原始 CRLF 为界，孤立 CR/LF 都留在内容里；
+/// * auto  → CRLF、单独 CR、单独 LF 均为界（CRLF 算一个界）。
+pub(crate) fn channel_read_line_cfg(
+    ch: &mut dyn Channel,
+    cfg: &mut ChannelConfig,
+) -> io::Result<Option<String>> {
+    let enc = cfg.encoding.clone();
+    let mode = cfg.translation_in;
+    let mut reader = ChannelReader::new(ch, cfg);
+    let mut out = String::new();
+    let mut saw = false;
+    loop {
+        let next = reader.next_raw_or_pending(&enc)?;
+        match mode {
+            TranslationMode::Lf => match next {
+                Some('\n') => {
+                    saw = true;
+                    break;
+                }
+                Some(c) => {
+                    saw = true;
+                    out.push(c);
+                }
+                None => break,
+            },
+            TranslationMode::Cr => match next {
+                Some('\r') => {
+                    saw = true;
+                    break;
+                }
+                Some(c) => {
+                    saw = true;
+                    out.push(c);
+                }
+                None => break,
+            },
+            TranslationMode::CrLf => match next {
+                Some('\r') => {
+                    saw = true;
+                    match reader.next_raw_or_pending(&enc)? {
+                        Some('\n') => break,
+                        Some(other) => {
+                            out.push('\r');
+                            reader.cfg.read_pending.push_back(other);
+                        }
+                        None => out.push('\r'),
+                    }
+                }
+                Some(c) => {
+                    saw = true;
+                    out.push(c);
+                }
+                None => break,
+            },
+            TranslationMode::Auto => match next {
+                Some('\r') => {
+                    saw = true;
+                    if let Some(other) = reader.next_raw_or_pending(&enc)? {
+                        if other != '\n' {
+                            reader.cfg.read_pending.push_back(other);
                         }
                     }
-                    None => break,
+                    break;
                 }
-            }
-            if eof {
-                for &b in &pending {
-                    out.push(b as char);
+                Some('\n') => {
+                    saw = true;
+                    break;
                 }
-                break;
-            }
+                Some(c) => {
+                    saw = true;
+                    out.push(c);
+                }
+                None => break,
+            },
         }
-        Ok(out)
     }
-    #[cfg(not(all(unix, feature = "iconv")))]
-    {
-        let _ = enc;
-        let mut out = String::new();
-        let mut byte = [0u8; 1];
-        while out.chars().count() < count {
-            let n = ch.read_bytes(&mut byte)?;
-            if n == 0 {
-                break;
-            }
-            out.push(byte[0] as char);
-        }
-        Ok(out)
+    if !saw {
+        return Ok(None);
     }
+    Ok(Some(out))
+}
+
+/// 按通道 `-encoding`/`-translation` 读到 EOF。
+pub(crate) fn channel_read_all_cfg(
+    ch: &mut dyn Channel,
+    cfg: &mut ChannelConfig,
+) -> io::Result<String> {
+    let enc = cfg.encoding.clone();
+    let mut reader = ChannelReader::new(ch, cfg);
+    let mut out = String::new();
+    while let Some(c) = reader.next_translated(&enc)? {
+        out.push(c);
+    }
+    Ok(out)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -267,19 +435,44 @@ fn read_chars_iconv(ch: &mut dyn Channel, count: usize, enc: &str) -> io::Result
 // ═══════════════════════════════════════════════════════════════════════
 
 /// End-of-line translation mode.
+///
+/// Tcl 的通道配置是**输入/输出两个独立模式**（fconfigure 可写
+/// `{in out}` 二元组）；`Auto` 只出现在输入侧（CRLF 与单 CR 都归一为
+/// LF），输出侧的 auto/platform 在设置时解析为平台默认
+/// （unix lf / windows crlf）。`Binary` 在设置时解析为 lf + encoding
+/// binary，不单独存储。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum TranslationMode {
-    /// Platform native (\r\n on Windows, \n on Unix).
+    /// 输入：CRLF 与单 CR → LF；输出：平台默认（unix LF）。
     #[default]
     Auto,
-    /// LF only.
+    /// LF only（输入/输出都不改写）。
     Lf,
-    /// CR+LF.
+    /// CR+LF（输入 CRLF→LF；输出 LF→CRLF）。
     CrLf,
-    /// CR only.
+    /// CR only（输入 CR→LF；输出 LF→CR）。
     Cr,
-    /// Raw binary (no translation).
-    Binary,
+}
+
+impl TranslationMode {
+    /// fconfigure 查询串（Auto 出现在输入侧时显示 auto）。
+    pub fn query_str(self) -> &'static str {
+        match self {
+            TranslationMode::Auto => "auto",
+            TranslationMode::Lf => "lf",
+            TranslationMode::CrLf => "crlf",
+            TranslationMode::Cr => "cr",
+        }
+    }
+}
+
+/// 平台默认 EOL（unix LF / windows CRLF）。
+pub fn platform_translation() -> TranslationMode {
+    if cfg!(windows) {
+        TranslationMode::CrLf
+    } else {
+        TranslationMode::Lf
+    }
 }
 
 /// Buffering strategy.
@@ -294,7 +487,10 @@ pub enum Buffering {
 /// Per-channel configuration.
 #[derive(Debug, Clone)]
 pub struct ChannelConfig {
-    pub translation: TranslationMode,
+    /// 输入 EOL 翻译（默认 Auto：CRLF/CR → LF）。
+    pub translation_in: TranslationMode,
+    /// 输出 EOL 翻译（默认平台：unix LF / windows CRLF）。
+    pub translation_out: TranslationMode,
     pub buffering: Buffering,
     pub buffer_size: usize,
     pub blocking: bool,
@@ -304,18 +500,37 @@ pub struct ChannelConfig {
     pub eofchar_in: Option<char>,
     /// Output end-of-file character (`fconfigure -eofchar`), if set.
     pub eofchar_out: Option<char>,
+    /// 已解码但被 CR 前瞻回推的字符（跨 read/gets 调用保持）。
+    pub(crate) read_pending: VecDeque<char>,
+    /// 未成形的多字节输入尾巴。
+    pub(crate) read_bytes: Vec<u8>,
+    /// 解码器一次产出的多余字符（iconv 多字符输出）。
+    pub(crate) read_chars: VecDeque<char>,
+}
+
+impl ChannelConfig {
+    /// 清空读取器的行/字节前瞻状态（换入新通道时用）。
+    pub fn clear_read_state(&mut self) {
+        self.read_pending.clear();
+        self.read_bytes.clear();
+        self.read_chars.clear();
+    }
 }
 
 impl Default for ChannelConfig {
     fn default() -> Self {
         ChannelConfig {
-            translation: TranslationMode::Auto,
+            translation_in: TranslationMode::Auto,
+            translation_out: platform_translation(),
             buffering: Buffering::Full,
             buffer_size: 4096,
             blocking: true,
             encoding: "utf-8".to_string(),
             eofchar_in: None,
             eofchar_out: None,
+            read_pending: VecDeque::new(),
+            read_bytes: Vec::new(),
+            read_chars: VecDeque::new(),
         }
     }
 }
@@ -423,14 +638,9 @@ impl ChannelTable {
         self.next_id += 1;
         self.track(id.clone());
         self.channels.insert(id.clone(), file);
-        // tclsh reports a file channel's translation resolved to the
-        // platform default ("lf" on Unix), not "auto".
+        // 文件通道默认：输入 auto、输出平台（unix lf）——与 tclsh 的
+        // fconfigure 查询一致（读通道显示 auto，写通道显示 lf）。
         self.configs.insert(id.clone(), ChannelConfig {
-            translation: if cfg!(windows) {
-                crate::channel::TranslationMode::CrLf
-            } else {
-                crate::channel::TranslationMode::Lf
-            },
             encoding: self.system_encoding.clone(),
             ..ChannelConfig::default()
         });
@@ -444,6 +654,9 @@ impl ChannelTable {
             encoding: sys,
             ..ChannelConfig::default()
         });
+        if let Some(cfg) = self.configs.get_mut(&id) {
+            cfg.clear_read_state();
+        }
         self.track(id.clone());
         self.channels.insert(id, channel);
     }
@@ -520,9 +733,22 @@ impl ChannelTable {
         self.configs.get_mut(id)
     }
 
+    /// 同时可变借用通道与其配置（两个独立 map，字段级拆分）。
+    pub fn channel_ctx_mut(
+        &mut self,
+        id: &str,
+    ) -> Option<(&mut dyn Channel, &mut ChannelConfig)> {
+        let ch = self.channels.get_mut(id)?;
+        let cfg = self.configs.get_mut(id)?;
+        Some((ch.as_mut(), cfg))
+    }
+
     /// Replace stdin with a custom channel (for embedders / testing).
     pub fn set_stdin(&mut self, channel: Box<dyn Channel>) {
         self.track("stdin".to_string());
+        if let Some(cfg) = self.configs.get_mut("stdin") {
+            cfg.clear_read_state();
+        }
         self.channels.insert("stdin".to_string(), channel);
     }
 
@@ -1350,7 +1576,7 @@ mod tests {
         let mut table = ChannelTable::new();
         table.set_stdout(Box::new(MemoryOutputPipe::from_shared(capture.clone(), usize::MAX)));
         let ch = table.get_mut("stdout").unwrap();
-        channel_write_str_enc(ch.as_mut(), "captured!\n", "utf-8").unwrap();
+        channel_write_str_cfg(ch.as_mut(), &ChannelConfig::default(), "captured!\n").unwrap();
         assert_eq!(capture.lock().unwrap().as_slice(), b"captured!\n");
     }
 

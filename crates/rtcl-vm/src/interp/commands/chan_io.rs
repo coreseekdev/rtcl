@@ -182,7 +182,6 @@ pub fn cmd_read(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let mut s = data;
         if nonewline && s.ends_with('\n') {
             s.pop();
-            if s.ends_with('\r') { s.pop(); }
         }
         return Ok(Value::from_str(&s));
     }
@@ -195,43 +194,37 @@ pub fn cmd_read(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if let Some(t) = &transform {
         if t.methods.iter().any(|m| m == "read") {
             let want = count.unwrap_or(4096).max(0) as usize;
-            let enc = chan_encoding(interp, chan_id);
             let raw = {
-                let ch = interp.channels.get_mut(chan_id).unwrap();
+                let (ch, cfg) = interp.channels.channel_ctx_mut(chan_id).unwrap();
                 if want == 0 {
                     String::new()
                 } else {
-                    crate::channel::channel_read_chars_enc(ch.as_mut(), want, &enc).map_err(io_err)?
+                    crate::channel::channel_read_chars_cfg(ch, cfg, want).map_err(io_err)?
                 }
             };
             let mut data = transform_through_read(interp, t, &raw)?;
             if nonewline && data.ends_with('\n') {
                 data.pop();
-                if data.ends_with('\r') {
-                    data.pop();
-                }
             }
             return Ok(Value::from_str(&data));
         }
     }
 
-    let enc = chan_encoding(interp, chan_id);
-    let ch = interp.channels.get_mut(chan_id).unwrap();
+    let (ch, cfg) = interp.channels.channel_ctx_mut(chan_id).unwrap();
 
     if !ch.is_readable() {
         return Err(not_opened(interp, chan_id, true));
     }
 
     if let Some(count) = count {
-        let s = crate::channel::channel_read_chars_enc(ch.as_mut(), count as usize, &enc)
+        let s = crate::channel::channel_read_chars_cfg(ch, cfg, count as usize)
             .map_err(io_err)?;
         Ok(Value::from_str(&s))
     } else {
         // read channelId  (read all)
-        let mut s = crate::channel::channel_read_all(ch.as_mut(), &enc).map_err(io_err)?;
+        let mut s = crate::channel::channel_read_all_cfg(ch, cfg).map_err(io_err)?;
         if nonewline && s.ends_with('\n') {
             s.pop();
-            if s.ends_with('\r') { s.pop(); }
         }
         Ok(Value::from_str(&s))
     }
@@ -263,10 +256,9 @@ pub fn cmd_gets(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let transform = interp.transforms.get(chan_id).cloned();
     if let Some(t) = &transform {
         if t.methods.iter().any(|m| m == "read") {
-            let enc = chan_encoding(interp, chan_id);
             let line = {
-                let ch = interp.channels.get_mut(chan_id).unwrap();
-                crate::channel::channel_read_line(ch.as_mut(), &enc).map_err(io_err)?
+                let (ch, cfg) = interp.channels.channel_ctx_mut(chan_id).unwrap();
+                crate::channel::channel_read_line_cfg(ch, cfg).map_err(io_err)?
             };
             let line = match line {
                 Some(s) => Some(transform_through_read(interp, t, &s)?),
@@ -276,14 +268,13 @@ pub fn cmd_gets(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
-    let enc = chan_encoding(interp, chan_id);
-    let ch = interp.channels.get_mut(chan_id).unwrap();
+    let (ch, cfg) = interp.channels.channel_ctx_mut(chan_id).unwrap();
 
     if !ch.is_readable() {
         return Err(not_opened(interp, chan_id, true));
     }
 
-    let line = crate::channel::channel_read_line(ch.as_mut(), &enc).map_err(io_err)?;
+    let line = crate::channel::channel_read_line_cfg(ch, cfg).map_err(io_err)?;
     finish_gets(interp, args, line.as_deref())
 }
 
@@ -423,15 +414,6 @@ pub fn cmd_fblocked(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::from_bool(false))
 }
 
-/// 通道当前 `-encoding`（D-29 转码）。
-fn chan_encoding(interp: &Interp, chan_id: &str) -> String {
-    interp
-        .channels
-        .config(chan_id)
-        .map(|c| c.encoding.clone())
-        .unwrap_or_else(|| "utf-8".to_string())
-}
-
 // ---------- fconfigure ----------
 
 /// The `-option` set fconfigure accepts, in Tcl's report order.
@@ -466,6 +448,25 @@ fn eofchar_query(ch_read: bool, ch_write: bool, in_c: Option<char>, out_c: Optio
     }
 }
 
+/// `-translation` 查询值（方向决定形状）。
+fn translation_query(
+    ch_read: bool,
+    ch_write: bool,
+    in_mode: crate::channel::TranslationMode,
+    out_mode: crate::channel::TranslationMode,
+) -> Value {
+    // 方向决定查询形状：rw 恒为二元组，ro/wo 只报自己一侧
+    // （tclsh 8.6.17 实测：rw 默认 "auto lf"，ro "auto"，wo "lf"）。
+    let s = |m: crate::channel::TranslationMode| Value::from_str(m.query_str());
+    if ch_read && ch_write {
+        Value::from_list(&[s(in_mode), s(out_mode)])
+    } else if ch_read {
+        s(in_mode)
+    } else {
+        s(out_mode)
+    }
+}
+
 /// Validate one `-eofchar` element: Tcl allows a single non-NUL ASCII char.
 fn eofchar_element(interp: &mut Interp, val: &str) -> std::result::Result<Option<char>, Error> {
     let mut chars = val.chars();
@@ -497,26 +498,38 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
 
     if args.len() == 2 {
-        // Query all options
+        // Query all options.  translation 的 rw 二元组与 rw eofchar
+        // 在 tclsh 的输出里带外层括引（`-translation {auto lf}` /
+        // `-eofchar {{} {}}`），其余为裸词。
         let cfg = interp.channels.config(chan_id).cloned().unwrap_or_default();
-        let translation = match cfg.translation {
-            crate::channel::TranslationMode::Auto => "auto",
-            crate::channel::TranslationMode::Lf => "lf",
-            crate::channel::TranslationMode::CrLf => "crlf",
-            crate::channel::TranslationMode::Cr => "cr",
-            crate::channel::TranslationMode::Binary => "binary",
-        };
         let buffering = match cfg.buffering {
             crate::channel::Buffering::Full => "full",
             crate::channel::Buffering::Line => "line",
             crate::channel::Buffering::None => "none",
         };
         let blocking = if cfg.blocking { "1" } else { "0" };
+        let trans = translation_query(
+            ch_read,
+            ch_write,
+            cfg.translation_in,
+            cfg.translation_out,
+        );
+        let trans = trans.as_str().to_string();
+        let trans_field = if ch_read && ch_write {
+            format!("{{{}}}", trans)
+        } else {
+            trans
+        };
+        let eof = eofchar_query(ch_read, ch_write, cfg.eofchar_in, cfg.eofchar_out);
+        let eof = eof.as_str().to_string();
+        let eof_field = if ch_read && ch_write {
+            format!("{{{}}}", eof)
+        } else {
+            eof
+        };
         let result = format!(
             "-blocking {} -buffering {} -buffersize {} -encoding {} -eofchar {} -translation {}",
-            blocking, buffering, cfg.buffer_size, cfg.encoding,
-            eofchar_query(ch_read, ch_write, cfg.eofchar_in, cfg.eofchar_out).as_str(),
-            translation,
+            blocking, buffering, cfg.buffer_size, cfg.encoding, eof_field, trans_field,
         );
         return Ok(Value::from_str(&result));
     }
@@ -545,13 +558,12 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "-buffersize" => Value::from_int(cfg.buffer_size as i64),
             "-encoding" => Value::from_str(&cfg.encoding),
             "-eofchar" => eofchar_query(ch_read, ch_write, cfg.eofchar_in, cfg.eofchar_out),
-            "-translation" => Value::from_str(match cfg.translation {
-                crate::channel::TranslationMode::Auto => "auto",
-                crate::channel::TranslationMode::Lf => "lf",
-                crate::channel::TranslationMode::CrLf => "crlf",
-                crate::channel::TranslationMode::Cr => "cr",
-                crate::channel::TranslationMode::Binary => "binary",
-            }),
+            "-translation" => translation_query(
+                ch_read,
+                ch_write,
+                cfg.translation_in,
+                cfg.translation_out,
+            ),
             _ => unreachable!(),
         };
         return Ok(val);
@@ -614,6 +626,60 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     ));
                 }
             })
+        } else {
+            None
+        };
+        // -translation 也在 cfg 借用前解析/校验（1-2 元素列表；错误
+        // 需要装 errorCode）。auto 输入侧保留 auto、输出侧解析为平台；
+        // platform 两侧都解析为平台；binary 解析为 lf + encoding binary。
+        let trans_pair: Option<(
+            crate::channel::TranslationMode,
+            crate::channel::TranslationMode,
+            bool,
+        )> = if opt == "-translation" {
+            use crate::channel::TranslationMode as Tm;
+            let elems = Value::from_str(val)
+                .as_list()
+                .unwrap_or_else(|| vec![Value::from_str(val)]);
+            if elems.len() != 1 && elems.len() != 2 {
+                super::list::set_error_code(interp, "NONE");
+                return Err(super::list::tcl_err(
+                    "bad value for -translation: must be a one or two element list",
+                ));
+            }
+            let platform = crate::channel::platform_translation();
+            let resolve = |s: &str, output: bool| -> Option<Tm> {
+                match s {
+                    "auto" if !output => Some(Tm::Auto),
+                    "auto" | "platform" => Some(platform),
+                    "lf" | "binary" => Some(Tm::Lf),
+                    "crlf" => Some(Tm::CrLf),
+                    "cr" => Some(Tm::Cr),
+                    _ => None,
+                }
+            };
+            let mut bad_elem = false;
+            for e in &elems {
+                let s = e.as_str();
+                if resolve(s, false).is_none() && resolve(s, true).is_none() {
+                    bad_elem = true;
+                }
+            }
+            if bad_elem {
+                super::list::set_error_code(interp, "NONE");
+                return Err(super::list::tcl_err(
+                    "bad value for -translation: must be one of auto, binary, cr, lf, crlf, or platform",
+                ));
+            }
+            let first = elems[0].as_str();
+            let in_mode = resolve(first, false).unwrap();
+            let out_mode = if elems.len() == 2 {
+                resolve(elems[1].as_str(), true).unwrap()
+            } else {
+                resolve(first, true).unwrap()
+            };
+            let binary = elems.iter().any(|e| e.as_str() == "binary");
+            Some((in_mode, out_mode, binary))
         } else {
             None
         };
@@ -680,30 +746,13 @@ let cfg = interp.channels.config_mut(chan_id).unwrap();
                 cfg.eofchar_out = out_c;
             }
             "-translation" => {
-                cfg.translation = match val {
-                    "auto" | "platform" => {
-                        if cfg!(windows) {
-                            crate::channel::TranslationMode::CrLf
-                        } else {
-                            crate::channel::TranslationMode::Lf
-                        }
-                    }
-                    "lf" => crate::channel::TranslationMode::Lf,
-                    "crlf" => crate::channel::TranslationMode::CrLf,
-                    "cr" => crate::channel::TranslationMode::Cr,
-                    "binary" => {
-                        // tclsh：-translation binary == -translation lf +
-                        // -encoding binary（查询显示 lf）。
-                        cfg.encoding = "binary".to_string();
-                        crate::channel::TranslationMode::Lf
-                    }
-                    _ => {
-                        super::list::set_error_code(interp, "NONE");
-                        return Err(super::list::tcl_err(
-                            "bad value for -translation: must be one of auto, binary, cr, lf, crlf, or platform",
-                        ));
-                    }
-                };
+                // 已在上方 cfg 借用前解析/校验。
+                let (in_mode, out_mode, binary) = trans_pair.unwrap();
+                cfg.translation_in = in_mode;
+                cfg.translation_out = out_mode;
+                if binary {
+                    cfg.encoding = "binary".to_string();
+                }
             }
             _ => unreachable!(),
         }
@@ -1410,10 +1459,9 @@ fn chan_copy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if want == 0 {
             break;
         }
-        let enc_from = chan_encoding(interp, &from);
         let chunk = {
-            let ch = interp.channels.get_mut(&from).unwrap();
-            crate::channel::channel_read_chars_enc(ch.as_mut(), want, &enc_from)
+            let (ch, cfg) = interp.channels.channel_ctx_mut(&from).unwrap();
+            crate::channel::channel_read_chars_cfg(ch, cfg, want)
         };
         let chunk = match chunk {
             Ok(c) if c.is_empty() => break,
@@ -1425,19 +1473,51 @@ fn chan_copy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ))
             }
         };
-        let n = chunk.len() as i64;
-        {
-            let enc_to = chan_encoding(interp, &to);
-            let ch = interp.channels.get_mut(&to).unwrap();
-            if let Err(e) = crate::channel::channel_write_str_enc(ch.as_mut(), &chunk, &enc_to) {
-                return Err(Error::runtime(
-                    format!("error writing \"{}\": {}", to, e),
-                    crate::error::ErrorCode::Io,
-                ));
-            }
+        // tclsh 的 chan copy 返回值：源/目的编码相同时按**字节**计数
+        // （同编码字节直通快路），否则按**字符**计数（msize 实测）。
+        let chars = chunk.chars().count() as i64;
+        let src_enc = interp
+            .channels
+            .config(&from)
+            .map(|c| c.encoding.clone())
+            .unwrap_or_else(|| "utf-8".to_string());
+        let dst_enc = interp
+            .channels
+            .config(&to)
+            .map(|c| c.encoding.clone())
+            .unwrap_or_else(|| "utf-8".to_string());
+        let same_enc = src_enc == dst_enc;
+        // binary 源读到的是字节串对象：写真实编码通道时 tclsh 用它的
+        // **字符串表示**（把字节按 UTF-8 解码）——c3 a9 → é →
+        // utf-8 c3a9 / iso8859-1 e9，而不是逐字节 0xC3 0xA9。
+        let chunk = if src_enc == "binary" && dst_enc != "binary" {
+            let raw: Vec<u8> = chunk.chars().map(|c| (c as u32 & 0xFF) as u8).collect();
+            crate::encoding::decode(&raw, "utf-8")
+        } else {
+            chunk
+        };
+        let written = {
+            let (ch, cfg) = interp.channels.channel_ctx_mut(&to).unwrap();
+            // 目标 binary + 源为真实编码：写 UTF-8 内部字节（tclsh
+            // Tcl_WriteObj 的字节串/字符串差异；puts 不适用）。
+            let write_res = if cfg.encoding == "binary" && src_enc != "binary" {
+                crate::channel::channel_write_str_utf8_cfg(ch, cfg, &chunk)
+            } else {
+                crate::channel::channel_write_str_cfg(ch, cfg, &chunk)
+            };
+            let n = match write_res {
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(Error::runtime(
+                        format!("error writing \"{}\": {}", to, e),
+                        crate::error::ErrorCode::Io,
+                    ))
+                }
+            };
             let _ = ch.flush();
-        }
-        copied += n;
+            n
+        };
+        copied += if same_enc { written as i64 } else { chars };
     }
     if command.is_some() {
         return Ok(Value::empty());

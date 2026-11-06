@@ -114,12 +114,7 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let newline = if nonewline { String::new() } else { "\n".to_string() };
         let out = if newline.is_empty() { out } else { format!("{}{}", out, newline) };
 
-        let enc = interp
-            .channels
-            .config(chan_id)
-            .map(|c| c.encoding.clone())
-            .unwrap_or_else(|| "utf-8".to_string());
-        let ch = interp.channels.get_mut(chan_id)
+        let (ch, cfg) = interp.channels.channel_ctx_mut(chan_id)
             .ok_or_else(|| Error::runtime(
                 format!("can not find channel named \"{}\"", chan_id),
                 crate::error::ErrorCode::Io,
@@ -128,7 +123,7 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             return Err(chan_io::not_opened(interp, chan_id, false));
         }
 
-        crate::channel::channel_write_str_enc(ch.as_mut(), &out, &enc).map_err(|e| Error::runtime(
+        crate::channel::channel_write_str_cfg(ch, cfg, &out).map_err(|e| Error::runtime(
             format!("error writing \"{}\": {}", chan_id, e),
             crate::error::ErrorCode::Io,
         ))?;

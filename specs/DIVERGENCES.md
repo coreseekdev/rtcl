@@ -416,8 +416,45 @@
   macTurkish/macCroatian/macUkraine/macThai/macJapan/jis0201/0208/
   0212/cns11643/gb12345/gb2312-raw/symbol/dingbats/ebcdic/cp165/
   cp860…）解码按字节直映兜底、编码按 `?` 兜底（tclsh 有真表）；
-  ISO-2022-KR 等有状态编码的逐字符慢路径字节形可能不同；
-  -translation 的 EOL 实际改写仍缺（既有残差）。
+  ISO-2022-KR 等有状态编码的逐字符慢路径字节形可能不同。
+- **严重度**：已关闭。
+
+### D-44 `-translation` 的 EOL 实际改写未落地（原 D-29 残差）[FIXED 2026-11-06]
+- **Tcl 8.6.17**（实测钉死）：
+  * 配置是**输入/输出两套模式**；fconfigure 值收 1 或 2 元素列表
+    （`{in out}`），单元素同时设两侧；非法列表 =
+    `must be a one or two element list`，非法元素 =
+    `must be one of auto, binary, cr, lf, crlf, or platform`（均
+    ec=NONE）。
+  * **auto 输入**：CRLF→LF、单独 CR→LF；**auto/platform 输出** =
+    平台默认（unix LF / windows CRLF）；**platform 输入** = 平台默认
+    （unix 不翻译，CR 原样保留）；lf/binary 两侧恒等；
+    cr 输入 CR→LF、输出 LF→CR；crlf 输入 CRLF→LF、输出 LF→CRLF。
+  * **查询形状按通道方向**：rw 恒二元组（`auto lf`），ro 只报输入
+    （`auto`），wo 只报输出（`lf`）；`fconfigure $f` 的 rw 输出带
+    括引（`-translation {auto lf}` / `-eofchar {{} {}}`）。
+  * **默认**：输入 auto、输出平台（所以 ro 查 auto、wo 查 lf，
+    而默认读行为是 auto 翻译）。
+  * `-translation binary` = lf + `-encoding binary`；列表中的
+    binary 元素同样置 encoding binary。
+  * **gets 的行界由原始字符流决定**（不是先翻译再按 LF 切）：lf 以
+    LF、cr 以 CR、crlf 以 CRLF、auto 以 CRLF/CR/LF 为界；非界的
+    CR/LF 原样留在返回行内容里（`gets` 内容不做 EOL 翻译）。
+  * **read ?n?/read all** 先解码再做输入翻译，N 按翻译后字符数；
+    `read -nonewline` 只去掉末尾一个 `\n`（lf 模式下保留其前的
+    `\r`）。
+  * **chan copy**：两侧各自 translation/encoding；返回值在源/目的
+    编码相同时按字节计数、不同时按字符计数；`-size` 按字符。
+    binary 源（字节串对象）写入真实编码通道时按 UTF-8 解释原始字节；
+    真实编码源写入 binary 通道时写 UTF-8 内部字节（Tcl_WriteObj
+    的字节串/字符串差异，`puts` 不适用）。
+- **rtcl 修复态**：ChannelConfig 拆 `translation_in/translation_out`
+  （含持久化的 CR 前瞻回推缓冲 `read_pending`/多字节尾
+  `read_bytes`/iconv 溢出 `read_chars`）；`ChannelReader` 做
+  编码增量解码 + 输入翻译，gets 单独按原始字符流切行；写侧字符级
+  翻译后编码；fconfigure 查询/设置/错误形按方向与列表语义对齐；
+  chan copy 按上述计数/字节串规则。17 条新探针（io-deep 31→48
+  SAME，余 6 条存量 DIFF）。
 - **严重度**：已关闭。
 
 ### D-30 `read chan N` 按字节计数 + `read chan 0` 置 eof（spec io [D-31]）

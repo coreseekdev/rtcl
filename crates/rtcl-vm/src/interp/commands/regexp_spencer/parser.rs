@@ -312,7 +312,7 @@ impl Parser {
 
     /// 一个原子 + 可选量词（Spencer `parseqatom`）。
     fn parse_quantified(&mut self) -> Result<Node, Error> {
-        let atom = self.parse_atom()?;
+        let mut atom = self.parse_atom()?;
         self.skip_ws();
         let mode = self.mode();
         // 约束（^ $ \A \Z \y ... 与 lookahead）不得带量词。
@@ -327,6 +327,24 @@ impl Parser {
                         && self.at(1).map(|c| c.is_ascii_digit()).unwrap_or(false))
             }
         };
+        // 八进制转义可能展开成多个字面字符（`\1010` = 'A' + '0'）；
+        // 后续量词只作用于最后一个字符（tclsh：`\1010{0,2}` 是
+        // `A 0{0,2}`，不是 `(A0){0,2}`）。
+        let mut leading: Option<Node> = None;
+        if begins_quantifier {
+            if let super::ast::NodeKind::Concat(parts) = &atom.kind {
+                if parts.len() > 1
+                    && parts
+                        .iter()
+                        .all(|p| matches!(p.kind, super::ast::NodeKind::Char(_)))
+                {
+                    let mut ps = parts.clone();
+                    let last = ps.pop().unwrap();
+                    leading = Some(Node::concat(ps));
+                    atom = last;
+                }
+            }
+        }
         if begins_quantifier
             && matches!(
                 atom.kind,
@@ -423,8 +441,9 @@ impl Parser {
         } = &atom.kind
         {
             // 量化回引：把 min/max 放进回引节点本身（Spencer 特例）。
-            return Ok(Node::backref(
-                *subno, min, max, qprefer, *first_word, *last_word,
+            return Ok(with_leading(
+                leading,
+                Node::backref(*subno, min, max, qprefer, *first_word, *last_word),
             ));
         }
         if min >= 1 {
@@ -437,9 +456,9 @@ impl Parser {
                 max - 1
             };
             let prefix = Node::no_record(Node::repeat(atom.clone(), min - 1, pmax, qprefer));
-            return Ok(Node::concat(vec![prefix, atom]));
+            return Ok(with_leading(leading, Node::concat(vec![prefix, atom])));
         }
-        Ok(Node::repeat(atom, min, max, qprefer))
+        Ok(with_leading(leading, Node::repeat(atom, min, max, qprefer)))
     }
 
     /// `{m}` / `{m,}` / `{m,n}`；调用方已确认 `{` 后是数字。
@@ -1262,6 +1281,13 @@ trait AsciiOctal {
 impl AsciiOctal for u8 {
     fn is_ascii_octal(self) -> bool {
         (b'0'..=b'7').contains(&self)
+    }
+}
+
+fn with_leading(leading: Option<Node>, tail: Node) -> Node {
+    match leading {
+        Some(l) => Node::concat(vec![l, tail]),
+        None => tail,
     }
 }
 

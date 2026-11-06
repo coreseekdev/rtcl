@@ -41,7 +41,11 @@ pub struct Matcher {
 /// DFA 扫描的复用缓冲（跨多次 find 保持，减少密集匹配的每次分配）。
 struct DfaScratch {
     stamp: Vec<u32>,
+    /// 当前状态集的起点（与 cur 对应）。
     start_of: Vec<usize>,
+    /// 下一状态集的起点（与 next 对应）。必须与 start_of 分离：
+    /// 转移写入下一集合时不能覆盖仍在遍历的当前状态起点。
+    start_next: Vec<usize>,
     cur: Vec<u32>,
     next: Vec<u32>,
     gen: u32,
@@ -52,6 +56,7 @@ impl DfaScratch {
         DfaScratch {
             stamp: Vec::new(),
             start_of: Vec::new(),
+            start_next: Vec::new(),
             cur: Vec::new(),
             next: Vec::new(),
             gen: 0,
@@ -197,6 +202,7 @@ fn dfa_scan(
     if scratch.stamp.len() < dfa.state_count() {
         scratch.stamp.resize(dfa.state_count(), 0);
         scratch.start_of.resize(dfa.state_count(), 0);
+        scratch.start_next.resize(dfa.state_count(), 0);
     }
     scratch.cur.clear();
     scratch.next.clear();
@@ -259,14 +265,15 @@ fn dfa_scan(
                     if scratch.stamp.len() < dfa.state_count() {
                         scratch.stamp.resize(dfa.state_count(), 0);
                         scratch.start_of.resize(dfa.state_count(), 0);
+                        scratch.start_next.resize(dfa.state_count(), 0);
                     }
                     let ni = ns as usize;
                     if scratch.stamp[ni] != gen {
                         scratch.stamp[ni] = gen;
-                        scratch.start_of[ni] = st;
+                        scratch.start_next[ni] = st;
                         scratch.next.push(ns);
-                    } else if st < scratch.start_of[ni] {
-                        scratch.start_of[ni] = st;
+                    } else if st < scratch.start_next[ni] {
+                        scratch.start_next[ni] = st;
                     }
                 }
                 None => {}
@@ -274,6 +281,7 @@ fn dfa_scan(
         }
         scratch.cur.clear();
         std::mem::swap(&mut scratch.cur, &mut scratch.next);
+        std::mem::swap(&mut scratch.start_of, &mut scratch.start_next);
         if let Some(b) = best {
             let useful = scratch
                 .cur

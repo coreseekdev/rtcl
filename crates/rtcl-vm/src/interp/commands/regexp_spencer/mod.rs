@@ -332,6 +332,30 @@ mod tests {
     }
 
     #[test]
+    fn octal_expansion_quantifier_binds_last_char() {
+        // `\101` = 'A'，多出的 '0' 是独立字面；`{2}` 只作用于 '0'。
+        let prog = compile(r"\1010{2}", Options::default()).unwrap();
+        assert!(is_match(&prog, "A00", 0));
+        assert!(!is_match(&prog, "A0A0", 0));
+        // `\1010{0,2}?^` = A 0{0,2}? ^：A 必消耗，^ 无法在起点命中。
+        let prog = compile(r"\1010{0,2}?^", Options::default()).unwrap();
+        assert!(!is_match(&prog, "A1_ ", 0));
+    }
+
+    #[test]
+    fn dfa_start_tracking_keeps_current_starts() {
+        // DFA 转移写入下一状态起点时不能复用当前 start_of：
+        // `(..)+` @ abc 应得整体 0..2（曾因状态起点被覆盖得到 0..3）。
+        let prog = compile(r"(..)+", Options::default()).unwrap();
+        let chars: Vec<char> = "abc".chars().collect();
+        let m = matcher::find_from(&prog, &chars, 0, 0).unwrap();
+        assert_eq!((m.start, m.end), (0, 2));
+        let caps = captures::exec(&prog, &chars, 0, 0).unwrap();
+        assert_eq!(caps.spans[0], Some((0, 2)));
+        assert_eq!(caps.spans[1], Some((0, 2)));
+    }
+
+    #[test]
     fn lookahead_does_not_leak_preference_flags() {
         // 环视内部子式的 LONGER 不得覆盖外层的 SHORTER：
         // `(?![^ab]{2}|$)[^ab]*?` 在位置 3 应取空匹配。

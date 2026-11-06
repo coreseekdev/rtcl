@@ -54,3 +54,11 @@ proc x2 {} {nosuch {*}{a b}} ; catch {x2} m o ; puts [dict get $o -errorstack]
 proc x3 {} {set x {} ; string length {*}$x} ; catch {x3} m o ; puts [dict get $o -errorstack]
 proc x4 {} {namespace {*}{eval}} ; catch {x4} m o ; puts [dict get $o -errorstack]
 proc x5 {} {set cmd string ; $cmd {*}{length}} ; catch {x5} m o ; puts [dict get $o -errorstack]
+# ── D-3 return -errorinfo/returnImm INNER + 帧边界物化（2026-11-06 实测钉形）──
+proc r1 {} {return -code error boom} ; catch {r1} m o ; puts [dict get $o -errorstack]
+proc r2 {} {return -code error -errorinfo EI boom} ; catch {r2} m o ; puts "[dict get $o -errorstack]|[dict get $o -errorinfo]"
+proc r3 {} {return -level 0 -code error -errorinfo EI boom} ; catch {r3} m o ; puts [dict get $o -errorstack]
+catch {return -level 0 -code error -errorcode {A B} boom} m o ; puts [dict get $o -errorstack]
+catch {return -level 0 -code error -errorinfo {} -errorcode {A B} boom} m o ; puts [dict get $o -errorstack]
+proc r4 {} {return -level 2 -code error boom} ; proc r5 {} {r4} ; catch {r5} m o ; puts "[dict get $o -errorstack]|[dict get $o -errorinfo]"
+proc r6 {} {return -foo bar -level 0 -code error boom} ; catch {r6} m o ; puts [dict get $o -errorstack]

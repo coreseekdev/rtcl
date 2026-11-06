@@ -308,19 +308,54 @@ impl Interp {
         words: Option<&[Value]>,
         hint: Option<&'static str>,
     ) {
+        // -errorinfo 物化点：return 命令站点不产生日志事件（无帧、
+        // 无 INNER、无 CALL）。
+        if std::mem::take(&mut self.err_skip_log) {
+            return;
+        }
         match (&mut self.err_info, self.err_fresh) {
             (Some(_), true) => {
                 self.err_fresh = false;
             }
             (Some(info), false) => {
+                let kw = if std::mem::take(&mut self.err_while_exec) {
+                    "while executing"
+                } else {
+                    "invoked from within"
+                };
                 info.push_str(&format!(
-                    "\n    invoked from within\n\"{}\"",
+                    "\n    {}\n\"{}\"",
+                    kw,
                     tcl_log_excerpt(text)
                 ));
                 self.err_line = line;
+                // -errorinfo 物化后的首个调用方站点：设 INNER 并清栈
+                // （tclsh resetErrorStack），随后照常记 CALL。
+                if std::mem::take(&mut self.err_force_inner) {
+                    self.err_calls.clear();
+                    self.err_call_body = false;
+                    self.err_inner = Some(
+                        self.err_pending_inner
+                            .take()
+                            .or_else(|| hint.map(|h| h.to_string()))
+                            .unwrap_or_else(|| match words {
+                                Some(w) if !w.is_empty() => {
+                                    let tag = if w.len() <= 255 {
+                                        "invokeStk1"
+                                    } else {
+                                        "invokeStk"
+                                    };
+                                    format!("{} {}", tag, Value::from_list(w).as_str())
+                                }
+                                _ => format!("invokeStk1 {}", tcl_log_excerpt(text)),
+                            }),
+                    );
+                }
                 self.err_log_call();
             }
             (None, _) => {
+                self.err_force_inner = false;
+                self.err_while_exec = false;
                 self.err_info = Some(format!(
                     "{}\n    while executing\n\"{}\"",
                     msg,
@@ -1064,6 +1099,9 @@ impl Interp {
     /// option replaces the auto base (TclProcessReturn).  Plain value
     /// returns and exit pass through untouched.
     pub fn decode_toplevel_flow(&mut self, e: Error) -> Error {
+        self.err_force_inner = false;
+        self.err_while_exec = false;
+        self.err_skip_log = false;
         if self.err_is_error(&e) || e.is_exit() {
             return e;
         }

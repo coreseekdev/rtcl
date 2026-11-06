@@ -55,24 +55,36 @@
 - **复现**：`catch {error boom} m o; puts [dict keys $o]`
 - **严重度**：已关闭。
 - **D-3 残差收口（2026-11-06 第二批）**：INNER 的 bytecode 操作码形
-  全部落地——替换失败按上下文记 `loadScalar1`/`loadScalar`（局部槽位
-  含隐式局部）、`loadArray1`/`loadArray`/`loadArrayStk`（数组元素）、
-  `loadStk`（名键单元/限定名），tree-walk 与 bytecode 双引擎各按
-  自身现场判定；分派期失败记 `invokeReplace`（字面命令词且为 tclsh
-  ensemble：namespace/string/info/dict/array/file/binary/chan/
-  encoding）与 `invokeExpanded`（**动态** `{*}` 展开；字面展开 tclsh
-  折叠为普通调用）；tailcall 内置/arity 失败 = 裸目标词。对象自有
-  方法出口帧 `(object "::oo::ObjN" method "m" line N)` 已修；对象自有
-  方法 `next` 的"怪形"实为 D-41a 解析序（mixin 先于自有方法）的观测
-  假象，顺序修正后逐字一致。17 条操作码探针 + 3 条对象 next 探针全
-  SAME。
-- **余留残差**（低频）：
-  * clock 错误的 INNER 是 tclsh Tcl 实现帧（`::tcl::clock::scan`
-    + UP 1），native 实现对不上；
-  * `return -level 0 -code error -errorinfo EI boom` 的 INNER
-    （tclsh `invokeStk1 t2`）；
-  * 融合 lappend 读失败的槽位号近似（
-    槽 >255 的 loadScalar 选择）。
+  全部落地——替换失败按上下文记 `loadScalar1`/`loadScalar4`（局部槽位
+  <256/≥256，含隐式局部）、`loadArray1`/`loadArray4`/`loadArrayStk`
+  （数组元素）、`loadStk`（名键单元/限定名），tree-walk 与 bytecode
+  双引擎各按自身现场判定；分派期失败记 `invokeReplace`（字面命令词
+  且为 tclsh ensemble：namespace/string/info/dict/array/file/binary/
+  chan/encoding）与 `invokeExpanded`（**动态** `{*}` 展开；字面展开
+  tclsh 折叠为普通调用）；tailcall 内置/arity 失败 = 裸目标词。对象
+  自有方法出口帧 `(object "::oo::ObjN" method "m" line N)` 已修；对象
+  自有方法 `next` 的"怪形"实为 D-41a 解析序（mixin 先于自有方法）的
+  观测假象，顺序修正后逐字一致。17 条操作码探针 + 3 条对象 next 探针
+  全 SAME。
+- **D-3 残差收口（2026-11-06 第三批）**：
+  * `return` 的 -errorinfo 特例全部对齐：`-level 0 -code error` 且
+    -errorinfo 为空/缺省 → 正常错误 + INNER `returnImm <msg> <显式
+    options 列表>`（按给定序，去 -code/-level，-options 已展开，未知
+    键照收，空 → `{}`）；-errorinfo 非空或 `-level>=1` 的 -code error
+    → 帧边界物化：基 = EI（非空）或 msg，本帧不加 procedure 帧，首个
+    调用方站点用 `while executing`（无 EI）/`invoked from within`（有
+    EI）+ INNER invokeStk1 调用方词 + CALL 调用方帧。
+  * 融合 lappend 读失败槽位精确化：编译路径按 `code.locals()` 查槽
+    选 `loadScalar1`/`loadScalar4`、`loadArray1`/`loadArray4`（>255
+    槽脚本实测 SAME）。
+- **余留残差**（低频，有意保留）：
+  * clock 错误的 errorInfo/errorstack 含 tclsh 的 **Tcl 实现帧**
+    （`::tcl::clock::add` line 98、`::tcl::clock::scan` + `UP 1`、
+    `::tcl::clock::format` 等）。tclsh 的 clock 是 Tcl 脚本库，报错帧
+    反映其内部实现；rtcl 为 native 实现，无法在不伪造脚本帧栈的前提下
+    逐字复现。仅 clock 的**错误消息/errorcode** 对齐，帧链有意不匹配。
+  * tree-walk 引擎无槽表（大函数体不编译）时，>255 槽位仍按
+    `loadScalar1`/`loadArray1` 近似（编译路径已精确）。
 
 ### D-4 非 error 完成的 options 字典 -code/-level 未按 proc 边界解码（spec [D-3]）
 - **Tcl 8.6**：catch {f}（f 内 `return hi`）→ `-code 0 -level 1`；
@@ -299,11 +311,30 @@
     %Z token 收字母+可选数字（zp4），优先于 -gmt/-timezone；未知缩写
     `time zone "<lower>" not found` + CLOCK badTZName。全表 70+ 项
     逐一 SAME。
-  残差：军事单字母时区（T=+7 等）与自由格式 scan 的双字母时区（AT）
-  语义；`next|last <月名>` 的 tclsh 怪值；畸形数字日期（`1-2-2000` →
-  2007-06-23 等）；部分错误字符位（`2000-060` 等）；clock 错误的
-  errorInfo 含 tclsh Tcl 实现（::tcl::clock::add 等）的 proc 帧；
-  -locale 只接受不参与格式。
+  * **自由格式 scan 怪值收口（2026-11-06 第二批）**：tclsh ClockFreeScan
+    的余下低频面全部逐字对齐——
+    * 军事单字母时区（a=-1h…m=-12h、n=+1h…y=+12h、z=0，j 未定义）与
+      全 zone_abbrev 表在自由 scan 生效（名字不分大小写）；日期后无
+      时刻仅 **DST 缩写**可接受（否则 `syntax_err(end,end)`），日期后
+      DST 半时区特例 ndt=+2h/cadt=-10h/eadt=-11h；
+    * 数值短横日期 `Y-M-D`（年 <100 走 %y 窗口、月/日越界归一化，
+      `0-0-0` = 1999-11-30；两段数值短横报 token 尾 syntax error）；
+    * `next|last <月名>` 怪值（last = (年,月,1) 前推 2 天；last 后数字
+      = 年份按 %y 窗口；last 后时刻报错且错误位按"年+剩余字符"规则；
+      last + 绝对日期 → `more than one time zone in string`）；
+    * 裸单位 = +1（`clock scan days` = 明日此刻）；裸数字 1-2 位 =
+      小时、3-4 位 = HHMM（`Jan 2 2000` 无逗号 4 位数字 = 20:00，
+      已有时刻则当年份）；
+    * 未知 token 错误位细化（数字前缀后字母段 → 到 token 尾、标点 →
+      单字符）；拼接缩写（`est5edt`）错误消息按有无 tset 二选一。
+    自由 scan 电池 fs_common/fs1-6/mil 全 SAME；matching-deep 追加
+    15 条（111 条中 106 SAME，5 条为存量 regex/string/scan 残差）。
+  残差（有意保留）：
+  * clock 错误的 errorInfo/errorstack 含 tclsh 的 Tcl 实现帧
+    （`::tcl::clock::add` line 98、`::tcl::clock::scan` + `UP 1` 等）——
+    tclsh 的 clock 是 Tcl 脚本库，native 实现无法逐字复现其内部帧链；
+    错误消息与 errorcode 已对齐，帧链有意不匹配。
+  * `-locale` 只接受值、不参与格式/解析。
 
 ### D-26 glob：Rust glob crate 语义 + 排序（spec matching [D-25]）[FIXED 2026-11-05]
 - **Tcl 8.6**：`**` 只是两个 `*`（无递归）、`{a,b}` 非交替、前导点不

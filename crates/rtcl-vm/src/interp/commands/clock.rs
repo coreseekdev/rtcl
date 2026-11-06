@@ -281,6 +281,7 @@ fn clock_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return match parsed {
             Some(epoch) => Ok(Value::from_int(epoch)),
             None => match fail {
+                ScanFail::Other(msg) => Err(Error::Msg(msg)),
                 ScanFail::BadZone(name) => {
                     set_error_code(interp, &format!("CLOCK badTZName {}", name));
                     Err(Error::Msg(format!("time zone \"{}\" not found", name)))
@@ -321,6 +322,7 @@ fn clock_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 enum ScanFail {
     Mismatch,
     BadZone(String),
+    Other(String),
 }
 
 fn scan_with_format(
@@ -601,6 +603,16 @@ fn scan_with_format(
     } else {
         compute(gmt)
     }
+}
+
+/// 该缩写是否 DST 变体（tclDate TimezoneTable 的 tDAYZONE 项）。
+fn zone_is_dst(name: &str) -> bool {
+    matches!(
+        name,
+        "bst" | "edt" | "cdt" | "mdt" | "pdt" | "ydt" | "akdt" | "hdt" | "adt" | "ndt"
+            | "cest" | "mest" | "sst" | "fst" | "wadt" | "cadt" | "eadt" | "jdt" | "kdt"
+            | "nzdt"
+    )
 }
 
 /// 时区缩写 → 偏移（epoch = 该墙钟按 UTC 解释 + off；off = -本地东向偏移）。
@@ -898,6 +910,9 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
     let mut tset: Option<(i64, i64, i64)> = None;
     let mut zone: Option<i64> = None;
     let mut weekday: Option<(usize, WdMode)> = None;
+    // next/last <月名> 的序号月请求：(月, 是否 next) 与显式年份。
+    let mut ordinal: Option<(i64, bool)> = None;
+    let mut ordinal_year: Option<i64> = None;
     let mut rel: Vec<(i64, FreeUnit)> = Vec::new();
     let mut ago_watermark: usize = 0;
     let syntax_err = |input: &str, a: usize, b: usize| -> Error {
@@ -931,10 +946,47 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
         let core = lower.trim_end_matches(',').to_string();
         let had_comma = core.len() != lower.len();
 
-        // 1) ISO 日期
         let tok_chars: Vec<char> = raw.chars().collect();
+
+        // 0.5) 数值短横日期 = **年-月-日**（tclsh 实测：年 <100 走 %y
+        // 窗口；月/日可越界归一化——"1-2-2000" = 2001-02-01 + 1999 天，
+        // "0-0-0" = 1999-11-30）。两段数值短横 → token 尾处 syntax error。
+        if core.contains('-') {
+            let parts: Vec<&str> = core.split('-').collect();
+            if parts.len() == 3
+                && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            {
+                let yv: i64 = parts[0].parse().unwrap();
+                let y = if yv < 100 { map_two_digit_year(yv) } else { yv };
+                let mo: i64 = parts[1].parse().unwrap();
+                let d: i64 = parts[2].parse().unwrap();
+                if matches!(ordinal, Some((_, false))) {
+                    return Err(Error::Msg(format!(
+                        "unable to convert date-time string {:?}: more than one time zone in string",
+                        input
+                    )));
+                }
+                adate = Some((Some(y), mo, d));
+                ti += 1;
+                continue;
+            }
+            if parts.len() == 2
+                && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            {
+                let e = toks[ti].1;
+                return Err(syntax_err(input, e, e));
+            }
+        }
+
+        // 1) ISO 日期（带 T 的时刻形；纯日期已由 0.5 覆盖）
         match parse_iso_tok(&tok_chars) {
             Ok(Some((y, mo, d, h, mi, se, z))) => {
+                if matches!(ordinal, Some((_, false))) {
+                    return Err(Error::Msg(format!(
+                        "unable to convert date-time string {:?}: more than one time zone in string",
+                        input
+                    )));
+                }
                 adate = Some((Some(y), mo, d));
                 if h != 0 || mi != 0 || se != 0 || raw.len() > 10 {
                     if tset.is_some() {
@@ -959,6 +1011,12 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
             let y: i64 = core[0..4].parse().unwrap();
             let mo: i64 = core[4..6].parse().unwrap();
             let d: i64 = core[6..8].parse().unwrap();
+            if matches!(ordinal, Some((_, false))) {
+                return Err(Error::Msg(format!(
+                        "unable to convert date-time string {:?}: more than one time zone in string",
+                        input
+                    )));
+            }
             adate = Some((Some(y), mo, d));
             ti += 1;
             continue;
@@ -971,6 +1029,12 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
             {
                 let mo: i64 = parts[0].parse().unwrap();
                 let d: i64 = parts[1].parse().unwrap();
+                if matches!(ordinal, Some((_, false))) {
+                    return Err(Error::Msg(format!(
+                        "unable to convert date-time string {:?}: more than one time zone in string",
+                        input
+                    )));
+                }
                 adate = Some((None, mo, d));
                 ti += 1;
                 continue;
@@ -986,6 +1050,12 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
                 } else {
                     ys.parse().unwrap()
                 };
+                if matches!(ordinal, Some((_, false))) {
+                    return Err(Error::Msg(format!(
+                        "unable to convert date-time string {:?}: more than one time zone in string",
+                        input
+                    )));
+                }
                 adate = Some((Some(y), mo, d));
                 ti += 1;
                 continue;
@@ -1010,6 +1080,12 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
                     } else {
                         return Err(syntax_err(input, toks[ti].0, toks[ti].1 - 1));
                     };
+                    if matches!(ordinal, Some((_, false))) {
+                        return Err(Error::Msg(format!(
+                        "unable to convert date-time string {:?}: more than one time zone in string",
+                        input
+                    )));
+                    }
                     adate = Some((Some(y), mo, d));
                     ti += 1;
                     continue;
@@ -1054,6 +1130,12 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
                     adv = 3;
                 }
             }
+            if matches!(ordinal, Some((_, false))) {
+                return Err(Error::Msg(format!(
+                        "unable to convert date-time string {:?}: more than one time zone in string",
+                        input
+                    )));
+            }
             adate = Some((year, mo, d));
             ti += adv;
             continue;
@@ -1074,10 +1156,45 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
                             adv = 3;
                         }
                     }
+                    if matches!(ordinal, Some((_, false))) {
+                        return Err(Error::Msg(format!(
+                        "unable to convert date-time string {:?}: more than one time zone in string",
+                        input
+                    )));
+                    }
                     adate = Some((year, mo, d));
                     ti += adv;
                     continue;
                 }
+            }
+        }
+        // 6.5) last <月名> 的后续数字 = 年份（%y 窗口）；同一 token 数字
+        // 后有剩余字符（"3pm"/"3:00"/"12:00"）→ syntax error 指向该字符
+        // （tclsh 8.6.17 实测）。
+        if let Some((_, false)) = ordinal {
+            let mut cs: &[char] = &tok_chars;
+            if cs.first() == Some(&'-') {
+                cs = &cs[1..];
+            }
+            if !cs.is_empty() && cs.iter().all(|c| c.is_ascii_digit()) {
+                let ys: String = cs.iter().collect();
+                let v: i64 = ys.parse().ok().unwrap_or(0);
+                ordinal_year = Some(if ys.len() <= 2 { map_two_digit_year(v) } else { v });
+                ti += 1;
+                continue;
+            }
+            if !cs.is_empty() && cs[0].is_ascii_digit() {
+                let ndig = cs.iter().take_while(|c| c.is_ascii_digit()).count();
+                let ys: String = cs[..ndig].iter().collect();
+                let v: i64 = ys.parse().ok().unwrap_or(0);
+                ordinal_year = Some(if ys.len() <= 2 { map_two_digit_year(v) } else { v });
+                let g = toks[ti].0 + ndig;
+                let end = if chars.get(g) == Some(&':') {
+                    g
+                } else {
+                    toks[ti].1.saturating_sub(1)
+                };
+                return Err(syntax_err(input, g, end));
             }
         }
         // 7) next / last
@@ -1098,7 +1215,54 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
                 ti += 2;
                 continue;
             }
+            if let Some(mo) = free_month(&nlow) {
+                // next/last <月名>：见组合段（last 的公式很怪，实测钉形）。
+                ordinal = Some((mo, core == "next"));
+                ti += 2;
+                continue;
+            }
             return Err(syntax_err(input, toks[ti].0, toks[ti].1 - 1));
+        }
+        // 7.5) 时区缩写（tclDate TimezoneTable，含军事单字母
+        // a=-1h…m=-12h、n=+1h…y=+12h、z=0；j 未定义）。tclsh 实测：
+        // * 无日期时可任意位置出现（时刻/相对量前后均可）；
+        // * 在**全日期之后**且尚无时刻时，只有 DST 缩写（tDAYZONE：
+        //   edt/cdt/…/bst）被接受，其余报 syntax error（指向 token 尾）；
+        // * 有时刻后（无论先后）全部接受；
+        // * epoch = 墙钟按 UTC 解释 + off。
+        if !core.is_empty() && core.chars().all(|c| c.is_ascii_alphabetic()) {
+            let mil: Option<i64> = if core.len() == 1 {
+                match core.as_bytes()[0] {
+                    b'a'..=b'i' => Some(-((core.as_bytes()[0] - b'a' + 1) as i64) * 3600),
+                    b'k'..=b'm' => Some(-((core.as_bytes()[0] - b'k' + 10) as i64) * 3600),
+                    b'n'..=b'y' => Some(((core.as_bytes()[0] - b'n' + 1) as i64) * 3600),
+                    b'z' => Some(0),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(off) = mil.or_else(|| zone_abbrev(&core)) {
+                if adate.is_some() && tset.is_none() && !zone_is_dst(&core) {
+                    let e = toks[ti].1;
+                    return Err(syntax_err(input, e, e));
+                }
+                // 日期后的半时区 DST 缩写：tclsh 8.6.17 的整数小时路径
+                // 与独立出现不同（实测 ndt=+2h、cadt=-10h、eadt=-11h）。
+                let off = if adate.is_some() && zone_is_dst(&core) {
+                    match core.as_str() {
+                        "ndt" => 7200,
+                        "cadt" => -36000,
+                        "eadt" => -39600,
+                        _ => off,
+                    }
+                } else {
+                    off
+                };
+                zone = Some(-off);
+                ti += 1;
+                continue;
+            }
         }
         // 8) 星期名
         if let Some(dow) = free_weekday(&core) {
@@ -1124,21 +1288,8 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
             }
             _ => {}
         }
-        // 10) 时区 token
-        if core == "utc" || core == "gmt" {
-            zone = Some(0);
-            ti += 1;
-            continue;
-        }
-        if core == "z" {
-            if adate.is_none() && tset.is_none() && zone.is_none() {
-                zone = Some(0);
-                ti += 1;
-                continue;
-            }
-            let (a, b) = span_of(ti);
-            return Err(syntax_err(input, a, b));
-        }
+
+
         {
             let cs: Vec<char> = core.chars().collect();
             if cs.len() == 5
@@ -1152,6 +1303,13 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
                 ti += 1;
                 continue;
             }
+        }
+        // 10.5) 裸单位 = +1 个单位（tclsh 实测："days" → +1 天，
+        // "hours" → +1 小时，与数字短语同规则）。
+        if let Some(u) = free_unit(&core) {
+            rel.push((1, u));
+            ti += 1;
+            continue;
         }
         // 11) 时刻 token（其后可跟独立的 am/pm）
         match parse_time_tok(&tok_chars) {
@@ -1218,18 +1376,46 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
                     continue;
                 }
             }
-            // 裸数字：≤4 位按 HHMM 时刻（"2000" → 20:00）。
+            // 裸数字：1-2 位 = 小时（"2" → 02:00），3-4 位按 HHMM
+            // （"2000" → 20:00，"123" → 01:23）。
             if !had_comma && n >= 0 && core.len() <= 4 {
                 if tset.is_some() {
                     return Err(more_than_one_time());
                 }
-                tset = Some((n / 100, n % 100, 0));
+                tset = if core.len() <= 2 {
+                    Some((n, 0, 0))
+                } else {
+                    Some((n / 100, n % 100, 0))
+                };
                 ti += 1;
                 continue;
             }
         }
-        // 无法识别（若 token 以数字开头，错误位从首个非数字字符起，
-        // tclsh 的 "1st day" → characters 1-2）。
+        // 拼接缩写形（"est5edt"）：字母段都是时区缩写 → tclsh 的
+        // "more than one time zone/time of day in string"。
+        {
+            let segs: Vec<String> = core
+                .split(|c: char| c.is_ascii_digit())
+                .filter(|p| !p.is_empty())
+                .map(|p| p.to_string())
+                .collect();
+            if segs.len() >= 2
+                && segs.iter().all(|p| zone_abbrev(p).is_some())
+            {
+                let msg = if tset.is_some() {
+                    "more than one time of day in string"
+                } else {
+                    "more than one time zone in string"
+                };
+                return Err(Error::Msg(format!(
+                    "unable to convert date-time string {:?}: {}",
+                    input, msg
+                )));
+            }
+        }
+        // 无法识别（若 token 以数字开头，错误位从首个非数字字符起：
+        // 字母段 → 覆盖到 token 尾（"1st" → 1-2），标点 → 单字符
+        // （"2000.01.02" → 4-4））。
         let (a, b) = span_of(ti);
         let mut a = a;
         let tb = &tok_chars;
@@ -1237,8 +1423,12 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
         while q < tb.len() && tb[q].is_ascii_digit() {
             q += 1;
         }
+        let mut b = b;
         if q > 0 && q < tb.len() {
             a = toks[ti].0 + q;
+            if !tb[q].is_ascii_alphabetic() {
+                b = a;
+            }
         }
         let _ = had_comma;
         return Err(syntax_err(input, a, b));
@@ -1279,13 +1469,39 @@ fn scan_free(input: &str, base: i64, use_gmt: bool) -> Result<Value> {
         y = ny;
         mo = nm;
         d = nd;
+    } else if let Some((mon, next)) = ordinal {
+        // next <月名>：目标月 > base 月则同年，否则次年；日 = base 日
+        // 夹到目标月长（tclsh 实测：next june 从 6 月 → 次年 6 月同日）。
+        // last <月名>：(年, 月, 1) - 2 天；显式年份时 - 1 天（怪但实测
+        // 钉形：last june → (Y,6,1)-2d；last june 2005 → 2005-05-31? 否
+        // ——实测 last june 5 → 2005-05-30 = -2d）。
+        if next {
+            let year = by + if mon <= bmo { 1 } else { 0 };
+            let j0 = jdn_from_civil(year, mon, 1);
+            let j1 = if mon == 12 {
+                jdn_from_civil(year + 1, 1, 1)
+            } else {
+                jdn_from_civil(year, mon + 1, 1)
+            };
+            let dim = j1 - j0;
+            let (ny, nm, nd) = civil_from_jdn(j0 + (bd - 1).min(dim - 1));
+            y = ny;
+            mo = nm;
+            d = nd;
+        } else {
+            let year = ordinal_year.unwrap_or(by);
+            let (ny, nm, nd) = civil_from_jdn(jdn_from_civil(year, mon, 1) - 2);
+            y = ny;
+            mo = nm;
+            d = nd;
+        }
     }
 
     let day_scale_nonzero = rel.iter().any(|(n, u)| {
         *n != 0
             && !matches!(u, FreeUnit::Sec | FreeUnit::Min | FreeUnit::Hour)
     });
-    if adate.is_some() || weekday.is_some() || day_scale_nonzero {
+    if adate.is_some() || weekday.is_some() || ordinal.is_some() || day_scale_nonzero {
         h = 0;
         mi = 0;
         s = 0;

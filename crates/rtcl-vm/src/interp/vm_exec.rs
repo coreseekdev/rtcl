@@ -352,21 +352,53 @@ fn call_inner_hint(
     None
 }
 
+/// 局部表里该名字的槽位（有则按 1/4 字节操作数选 loadScalar1/loadScalar）。
+fn local_slot_of(code: &ByteCode, name: &str) -> Option<usize> {
+    code.locals().iter().position(|l| l == name)
+}
+
+/// 标量读取失败的 opcode 名：locals 单元查槽位（>=256 → loadScalar），
+/// 名键单元 loadStk。
+fn scalar_load_name(code: &ByteCode, name: &str) -> &'static str {
+    if code.locals_mode {
+        match local_slot_of(code, name) {
+            Some(slot) if slot >= 256 => "loadScalar4",
+            _ => "loadScalar1",
+        }
+    } else {
+        "loadStk"
+    }
+}
+
+/// 数组元素整体读取失败的 opcode 名（locals 单元槽位 >255 → loadArray）。
+fn array_load_name(code: &ByteCode, name: &str) -> &'static str {
+    let base = name.split('(').next().unwrap_or(name);
+    match local_slot_of(code, base) {
+        Some(slot) if slot >= 256 => "loadArray4",
+        _ => "loadArray1",
+    }
+}
+
 /// 变量读取失败的操作码名（vm 局部槽位 / 名键单元直接由 op 决定）。
 fn word_op_inner_hint(code: &ByteCode, op: &OpCode, msg: &str) -> Option<&'static str> {
     let quoted = msg.strip_prefix("can't read \"")?.split('"').next()?;
     match op {
-        OpCode::LoadLocal(slot) => Some(if *slot < 256 { "loadScalar1" } else { "loadScalar" }),
+        OpCode::LoadLocal(slot) => {
+            Some(if *slot < 256 { "loadScalar1" } else { "loadScalar4" })
+        }
         OpCode::LoadArrayElem(slot) => {
-            Some(if *slot < 256 { "loadArray1" } else { "loadArray" })
+            Some(if *slot < 256 { "loadArray1" } else { "loadArray4" })
         }
         OpCode::LappendLocal(slot) => {
-            Some(if *slot < 256 { "loadScalar1" } else { "loadScalar" })
+            Some(if *slot < 256 { "loadScalar1" } else { "loadScalar4" })
         }
-        OpCode::LappendVar(_) | OpCode::LappendVarVar(_, _) => {
-            // 源变量读取失败：locals 单元按隐式局部槽（loadScalar1），
-            // 名键单元 loadStk。
-            Some(if code.locals_mode { "loadScalar1" } else { "loadStk" })
+        OpCode::LappendVar(idx) => {
+            let name = code.get_const(*idx).unwrap_or("");
+            Some(scalar_load_name(code, name))
+        }
+        OpCode::LappendVarVar(src, _) => {
+            let name = code.get_const(*src).unwrap_or("");
+            Some(scalar_load_name(code, name))
         }
         OpCode::LoadVar(idx) => {
             let name = code.get_const(*idx).unwrap_or("");
@@ -377,10 +409,16 @@ fn word_op_inner_hint(code: &ByteCode, op: &OpCode, msg: &str) -> Option<&'stati
                 Some("loadStk")
             } else if array_ref && name == quoted {
                 // 数组元素整体读取失败：locals 单元隐式局部数组槽。
-                Some(if code.locals_mode { "loadArray1" } else { "loadArrayStk" })
-            } else {
+                if code.locals_mode {
+                    Some(array_load_name(code, name))
+                } else {
+                    Some("loadArrayStk")
+                }
+            } else if code.locals_mode {
                 // 普通标量 / 下标变量读取失败。
-                Some(if code.locals_mode { "loadScalar1" } else { "loadStk" })
+                Some(scalar_load_name(code, name))
+            } else {
+                Some("loadStk")
             }
         }
         _ => None,

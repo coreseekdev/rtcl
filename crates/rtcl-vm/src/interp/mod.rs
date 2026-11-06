@@ -770,6 +770,18 @@ pub struct Interp {
     /// 词是 `next`（`wrong # args: should be "next x"`），且合成的方法
     /// 名参数不进 usage。
     pub(crate) frame_next_call: bool,
+    /// 跳过**下一次**错误日志事件（不追加 errorInfo 帧、不记 INNER/CALL）
+    /// ——`return -level 0 -code error -errorinfo <非空>` 的物化点
+    /// （tclsh：return 命令自身不产生日志事件）。
+    pub(crate) err_skip_log: bool,
+    /// 下一次日志事件（errorInfo 已有帧）仍要**设置 INNER 并清栈**——
+    /// 上述 -errorinfo 物化后的首个调用方站点（tclsh resetErrorStack
+    /// 在物化后的首个 Tcl_LogCommandInfo 生效）。
+    pub(crate) err_force_inner: bool,
+    /// 下一次 errorInfo 帧用 `while executing`（而非 invoked from
+    /// within）：帧边界物化的 `return -code error`（无显式 -errorinfo）
+    /// 由 msg 作基、errorInfo 内部为 NULL（tclsh 实测 B/I/J 形）。
+    pub(crate) err_while_exec: bool,
     /// 下一次 call_proc 建 **objc=0 特殊帧**（tclsh 析构器帧）：
     /// `info level 0` 为空、错误日志事件不追加 CALL。
     pub(crate) frame_level0_empty: bool,
@@ -903,6 +915,9 @@ impl Interp {
             ns_call_text: Vec::new(),
             frame_next_call: false,
             frame_level0_empty: false,
+            err_skip_log: false,
+            err_force_inner: false,
+            err_while_exec: false,
             ns_level0: Vec::new(),
             ns_stack: Vec::new(),
             frames: Vec::new(),

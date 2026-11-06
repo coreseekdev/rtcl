@@ -99,3 +99,19 @@ catch {clock scan "2000-01-01 XYZ" -format "%Y-%m-%d %Z"} m o ; puts "$m|[dict g
 puts [clock scan "2000-01-01 zp4" -format "%Y-%m-%d %Z"]
 catch {clock scan "2000-01-01 est5edt" -format "%Y-%m-%d %Z"} m o ; puts "$m|[dict get $o -errorcode]"
 puts [clock scan "2000-01-01 EST" -format "%Y-%m-%d %Z" -timezone :America/New_York]
+# ── D-25 free-scan quirks: military/abbrev zones, Y-M-D dash, next/last month, bare units ──
+puts [clock scan t -base 1623760496 -gmt 1]
+puts [clock scan {2000-01-02 edt} -gmt 1]
+puts [clock scan {2000-01-02 03:04:05 est} -gmt 1]
+puts [clock scan {1-2-2000} -gmt 1]
+puts [clock scan {0-0-0} -gmt 1]
+puts [clock scan {next june} -base 1623760496 -gmt 1]
+puts [clock scan {last june} -base 1623760496 -gmt 1]
+puts [clock scan {last june 2005} -base 1623760496 -gmt 1]
+puts [clock scan days -base 1623760496 -gmt 1]
+puts [clock scan {2 m} -base 1623760496 -gmt 1]
+catch {clock scan {2000-01-02 t} -gmt 1} m ; puts $m
+catch {clock scan {1-2} -gmt 1} m ; puts $m
+catch {clock scan {2000.01.02} -gmt 1} m ; puts $m
+catch {clock scan {est5edt} -gmt 1} m ; puts $m
+catch {clock scan {12:00 est5edt} -gmt 1} m ; puts $m

@@ -853,13 +853,33 @@ impl Interp {
                                         })
                                     } else {
                                         match code {
-                                            1 => Err(Error::ControlFlow {
-                                                kind: crate::error::ControlFlow::Error,
-                                                value: Some(val),
-                                                level: 1,
-                                                error_info: error_info.clone(),
-                                                error_code: error_code.clone(),
-                                            }),
+                                            1 => {
+                                                let base = match error_info.as_deref() {
+                                                    Some(s) if !s.is_empty() => s.to_string(),
+                                                    _ => val.as_str().to_string(),
+                                                };
+                                                self.err_info = Some(base);
+                                                self.err_fresh = false;
+                                                self.err_pending_top = None;
+                                                self.err_force_inner = true;
+                                                self.err_while_exec = error_info
+                                                    .as_deref()
+                                                    .map(|s| s.is_empty())
+                                                    .unwrap_or(true);
+                                                if let Some(info) = error_info {
+                                                    let _ = self.set_var(
+                                                        "::errorInfo",
+                                                        Value::from_str(info),
+                                                    );
+                                                }
+                                                Err(Error::ControlFlow {
+                                                    kind: crate::error::ControlFlow::Error,
+                                                    value: Some(val),
+                                                    level: 1,
+                                                    error_info: error_info.clone(),
+                                                    error_code: error_code.clone(),
+                                                })
+                                            },
                                             3 => Err(Error::ControlFlow {
                                                 kind: crate::error::ControlFlow::Break,
                                                 value: Some(val),
@@ -881,14 +901,20 @@ impl Interp {
                                 1 => {
                                     // return -code error "msg" → propagate as error,
                                     // preserving any -errorinfo / -errorcode options.
-                                    // A -errorinfo option REPLACES the auto-built
-                                    // `msg\n    while executing` base of the
-                                    // errorInfo (tclsh TclProcessReturn); the
-                                    // enclosing-command frames still append to it.
-                                    if let Some(info) = error_info {
-                                        self.err_info = Some(info.clone());
-                                        self.err_fresh = false;
-                                    }
+                                    // 帧边界物化：基 = EI（非空）或 msg；本帧不出
+                                    // procedure 帧；首个调用方站点设 INNER。
+                                    let base = match error_info.as_deref() {
+                                        Some(s) if !s.is_empty() => s.to_string(),
+                                        _ => val.as_str().to_string(),
+                                    };
+                                    self.err_info = Some(base);
+                                    self.err_fresh = false;
+                                    self.err_pending_top = None;
+                                    self.err_force_inner = true;
+                                    self.err_while_exec = error_info
+                                        .as_deref()
+                                        .map(|s| s.is_empty())
+                                        .unwrap_or(true);
                                     if let Some(info) = error_info {
                                         let _ = self.set_var("::errorInfo", Value::from_str(info));
                                     }
@@ -1351,6 +1377,12 @@ impl Interp {
                                 n if n < 0 => Ok(val),
                                 1 => {
                                     if let Some(info) = error_info {
+                                        if !info.is_empty() {
+                                            // 帧边界物化：本帧不加 procedure
+                                            // 帧，首个调用方站点设 INNER。
+        
+                                            self.err_force_inner = true;
+                                        }
                                         self.err_info = Some(info.clone());
                                         self.err_fresh = false;
                                     }

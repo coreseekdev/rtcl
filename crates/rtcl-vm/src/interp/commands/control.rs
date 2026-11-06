@@ -530,7 +530,7 @@ pub fn cmd_continue(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Err(Error::cont())
 }
 
-pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_return(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Tcl 8.6 Tcl_ReturnObjCmd: "An even number of words means an explicit
     // result argument is present" — objc counts the `return` word itself,
     // and the leading option words are consumed as key/value pairs.
@@ -589,7 +589,7 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // A malformed -options value is a RESULT-family error
             // (tclsh: `return -options {-code} x` → TCL RESULT
             // ILLEGAL_OPTIONS).
-            set_error_code(_interp, "TCL RESULT ILLEGAL_OPTIONS");
+            set_error_code(interp, "TCL RESULT ILLEGAL_OPTIONS");
         })?;
     }
 
@@ -613,7 +613,7 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             _ => match super::list::tcl_get_int(c) {
                 Some(v) => v as i32,
                 None => {
-                    set_error_code(_interp, "TCL RESULT ILLEGAL_CODE");
+                    set_error_code(interp, "TCL RESULT ILLEGAL_CODE");
                     return Err(Error::runtime(
                         format!("bad completion code \"{}\": must be ok, error, return, break, continue, or an integer", c),
                         crate::error::ErrorCode::Generic,
@@ -628,7 +628,7 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if let Some(v) = get("-level") {
         level = v.as_str().parse::<i32>().map_err(|_| {
             set_error_code(
-                _interp,
+                interp,
                 "TCL RESULT ILLEGAL_LEVEL",
             );
             Error::runtime(
@@ -640,7 +640,7 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             )
         })?;
         if level < 0 {
-            set_error_code(_interp, "TCL RESULT ILLEGAL_LEVEL");
+            set_error_code(interp, "TCL RESULT ILLEGAL_LEVEL");
             return Err(Error::runtime(
                 format!(
                     "bad -level value: expected non-negative integer but got \"{}\"",
@@ -662,7 +662,7 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // tclsh validates the value as a list before installing it
         // as errorCode (result-6.3).
         if v.as_list_strict().is_err() {
-            set_error_code(_interp, "TCL RESULT ILLEGAL_ERRORCODE");
+            set_error_code(interp, "TCL RESULT ILLEGAL_ERRORCODE");
             return Err(Error::runtime(
                 format!(
                     "bad -errorcode value: expected a list but got \"{}\"",
@@ -703,6 +703,40 @@ pub fn cmd_return(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // `-code return` and integer user codes pass through
             // unchanged (catch reports 2 / the code).
             if level == 0 {
+                // `return -level 0 -code error -errorinfo <非空>`：错误Info
+                // 已给定，物化点（return 命令站点）**不产生日志事件**；
+                // 首个调用方站点设 INNER 并清栈（tclsh 实测 A 形：
+                // INNER invokeStk1 caller + EI + (procedure) + invoked...）。
+                if c == 1 && error_info.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
+                    interp.err_info = error_info.clone();
+                    interp.err_fresh = false;
+                    interp.err_pending_top = None;
+                    interp.err_skip_log = true;
+                    interp.err_force_inner = true;
+                } else if c == 1 {
+                    // tclsh 的 returnImm INNER 形：<msg> <显式 options 列表>
+                    // （给定序、去掉 -code/-level；-options 已展开；未知键照收；
+                    // 空 options → {}）。
+                    let msg = result.as_ref().map(|v| v.as_str().to_string()).unwrap_or_default();
+                    let mut flat: Vec<Value> = Vec::new();
+                    for (k, v) in &opts {
+                        if k == "-code" || k == "-level" {
+                            continue;
+                        }
+                        flat.push(Value::from_str(k));
+                        flat.push(v.clone());
+                    }
+                    let opt_str = Value::from_list(&flat).as_str().to_string();
+                    interp.err_pending_inner = Some(
+                        Value::from_list(&[
+                            Value::from_str("returnImm"),
+                            Value::from_str(&msg),
+                            Value::from_str(&opt_str),
+                        ])
+                        .as_str()
+                        .to_string(),
+                    );
+                }
                 return Err(match c {
                     1 => Error::ControlFlow {
                         kind: crate::error::ControlFlow::Error,
@@ -804,6 +838,12 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 let text = interp.cur_cmd_text.slice(&interp.cur_source).to_string();
                 let line = interp.cur_cmd_line.max(1);
                 interp.err_harness_frame(&e.message_text(), &text, line);
+            }
+            // 消费错误：-errorinfo 物化的一次性旗标不得泄漏到下个错误。
+            if interp.err_is_error(&e) {
+                interp.err_force_inner = false;
+                interp.err_while_exec = false;
+                interp.err_skip_log = false;
             }
             // A `tailcall` completion caught here: the deferred command
             // stays armed on the frame marker and fires at frame exit;
@@ -1111,6 +1151,7 @@ pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             interp.err_inner = interp.err_pending_inner.take();
             interp.err_calls.clear();
             interp.err_call_body = false;
+            interp.err_force_inner = false;
         }
     }
     if error_info.is_none() && error_code.is_none() {

@@ -190,9 +190,10 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   虚拟空串匹配并保留原偏移（`-start 9 {$} ba` → 索引 `9 8`）。
   验证：3500 + 12000 + 15000 三组 seed 的命令面随机语料（开关组合/
   match vars/regsub 替换串/空匹配/越界 -start）**0 差异**，另有
-  5000 例 Unicode/多字节文本命令面语料与 15000 例嵌套语法层语料
-  （环视/分组/量词/内嵌选项，`specs/regex/gen-deep-fuzz.py`）
-  **0 差异**。内嵌 `(?i)` 生效后的 options 会传给 NFA/匹配器；
+  5000 例 Unicode/多字节文本命令面语料、15000 例嵌套语法层语料
+  （环视/分组/量词/内嵌选项，`specs/regex/gen-deep-fuzz.py`）、
+  4000 例字符类/排序元素语料（`gen-class-fuzz.py`）与 5000 例
+  Unicode -nocase 折叠语料（`gen-fold-fuzz.py`）**0 差异**。内嵌 `(?i)` 生效后的 options 会传给 NFA/匹配器；
   环视内括号保留分组层（`(?=(^){1,2})` 可量化）；环视子式的
   偏好位不向父节点传播（Lacon 是零宽约束，`(?=..)[^ab]*?` 的
   SHORTER 不被内层 LONGER 覆盖）；惰性子节点的重复组末次迭代
@@ -200,7 +201,9 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   独立的 `start_next` 缓冲（转移写入下一状态集时不得覆盖仍在
   遍历的当前起点，`(..)+` 曾因此返回 0..3 而非 0..2）；八进制
   转义展开成多字面字符时，后续量词只绑定最后一个字符
-  （`\1010{2}` = `A 0{2}`）。`-linestop/-line`
+  （`\1010{2}` = `A 0{2}`）。排序/等价元素名必须是单字符
+  （`[[=ab=]]`/`[[.ab.]]` → REG_ECOLLATE / invalid collating
+  element）。`-linestop/-line`
   下否定简写 `\W/\D/\S` 与 `[^...]` 一样不匹配换行；ARE 字符类内
   仅允许小写 `\d\s\w`（大写 → REG_EESCAPE，BRE/ERE 为字面）。
   回引回溯的 concat 去重按

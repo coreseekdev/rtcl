@@ -64,4 +64,16 @@ if command -v python3 >/dev/null 2>&1; then
         echo "== deep-fuzz: DIFF =="
         diff /tmp/rtcl-regex-deepfuzz-o.txt /tmp/rtcl-regex-deepfuzz-r.txt | head -20
     fi
+    # 字符类/排序元素/等价类 + Unicode -nocase 折叠。
+    for g in gen-class-fuzz gen-fold-fuzz; do
+        python3 "specs/regex/$g.py" > "/tmp/rtcl-regex-$g.tcl"
+        tclsh "/tmp/rtcl-regex-$g.tcl" > "/tmp/rtcl-regex-$g-o.txt" 2>&1
+        "$RTCL" -f "/tmp/rtcl-regex-$g.tcl" > "/tmp/rtcl-regex-$g-r.txt" 2>&1
+        if diff -q "/tmp/rtcl-regex-$g-o.txt" "/tmp/rtcl-regex-$g-r.txt" >/dev/null; then
+            echo "== $g: diff=0 =="
+        else
+            echo "== $g: DIFF =="
+            diff "/tmp/rtcl-regex-$g-o.txt" "/tmp/rtcl-regex-$g-r.txt" | head -20
+        fi
+    done
 fi

@@ -332,6 +332,21 @@ mod tests {
     }
 
     #[test]
+    fn collating_element_must_be_single_char() {
+        assert_eq!(
+            compile(r"[[=ab=]]", Options::default()).unwrap_err().code,
+            "REG_ECOLLATE"
+        );
+        assert_eq!(
+            compile(r"[[.ab.]]", Options::default()).unwrap_err().code,
+            "REG_ECOLLATE"
+        );
+        assert!(compile(r"[[=a=]]", Options::default()).is_ok());
+        assert!(compile(r"[[=é=]]", Options::default()).is_ok());
+        assert!(compile(r"[[.].]]", Options::default()).is_ok());
+    }
+
+    #[test]
     fn octal_expansion_quantifier_binds_last_char() {
         // `\101` = 'A'，多出的 '0' 是独立字面；`{2}` 只作用于 '0'。
         let prog = compile(r"\1010{2}", Options::default()).unwrap();

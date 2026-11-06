@@ -1147,10 +1147,16 @@ impl Parser {
                         None => Err(Self::err("REG_ECTYPE", "invalid character class")),
                     },
                     _ => {
-                        // 排序/等价元素：取首个字符作为字面（M4 细化）。
-                        match name.chars().next() {
-                            Some(c) => Ok(Some(Item::Range(c as u32, c as u32))),
-                            None => Ok(None),
+                        // 排序/等价元素名必须是单个字符（tclsh：
+                        // `[[=ab=]]`/`[[=].=]]` → invalid collating
+                        // element / REG_ECOLLATE）。
+                        let mut it = name.chars();
+                        match (it.next(), it.next()) {
+                            (Some(c), None) => Ok(Some(Item::Range(c as u32, c as u32))),
+                            _ => Err(Self::err(
+                                "REG_ECOLLATE",
+                                "invalid collating element",
+                            )),
                         }
                     }
                 };

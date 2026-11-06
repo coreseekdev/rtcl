@@ -89,3 +89,13 @@ puts [clock scan {2000-01-02 03:04:05 UTC} -gmt 1]
 puts [clock format [clock scan {Jan 2 2000} -base 1623760496 -gmt 1] -gmt 1 -format {%Y-%m-%d %H:%M}]
 puts [clock scan {3:04 PM Jan 2 2000} -gmt 1]
 puts [clock scan {next friday 3pm} -base 1623760496 -gmt 1]
+# ── D-25 clock scan timezone-abbrev table (2026-11-06; tclDate TimezoneTable) ──
+puts [clock scan "2000-01-01 EST" -format "%Y-%m-%d %Z" -gmt 0]
+puts [clock scan "2000-01-01 edt" -format "%Y-%m-%d %Z"]
+puts [clock scan "2000-01-01 CET" -format "%Y-%m-%d %Z"]
+puts [clock scan "2000-01-01 jst" -format "%Y-%m-%d %Z"]
+puts [clock scan "2000-01-01 IST" -format "%Y-%m-%d %Z"]
+catch {clock scan "2000-01-01 XYZ" -format "%Y-%m-%d %Z"} m o ; puts "$m|[dict get $o -errorcode]"
+puts [clock scan "2000-01-01 zp4" -format "%Y-%m-%d %Z"]
+catch {clock scan "2000-01-01 est5edt" -format "%Y-%m-%d %Z"} m o ; puts "$m|[dict get $o -errorcode]"
+puts [clock scan "2000-01-01 EST" -format "%Y-%m-%d %Z" -timezone :America/New_York]

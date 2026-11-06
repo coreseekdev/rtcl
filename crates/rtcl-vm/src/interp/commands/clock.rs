@@ -269,17 +269,29 @@ fn clock_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0)
         });
-        let parsed = with_zone(zone.as_deref(), || {
-            scan_with_format(&input, &fmt, base_epoch, use_gmt)
-        });
+        let mut fail = ScanFail::Mismatch;
+        let parsed = scan_with_format(
+            &input,
+            &fmt,
+            base_epoch,
+            use_gmt,
+            zone.as_deref(),
+            &mut fail,
+        );
         return match parsed {
             Some(epoch) => Ok(Value::from_int(epoch)),
-            None => {
-                set_error_code(interp, "CLOCK badInputString");
-                Err(Error::Msg(
-                    "input string does not match supplied format".to_string(),
-                ))
-            }
+            None => match fail {
+                ScanFail::BadZone(name) => {
+                    set_error_code(interp, &format!("CLOCK badTZName {}", name));
+                    Err(Error::Msg(format!("time zone \"{}\" not found", name)))
+                }
+                ScanFail::Mismatch => {
+                    set_error_code(interp, "CLOCK badInputString");
+                    Err(Error::Msg(
+                        "input string does not match supplied format".to_string(),
+                    ))
+                }
+            },
         };
     }
 
@@ -305,7 +317,20 @@ fn clock_scan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 ///   %Z 消费字母并忽略；%s 直接取 epoch；%% 字面。
 /// * 日期归一化交给 mktime / days_from_civil（Feb 30 → Mar 1、13 月
 ///   → 次年 1 月，tclsh 同）。
-fn scan_with_format(input: &str, fmt: &str, base: i64, gmt: bool) -> Option<i64> {
+/// `scan_with_format` 的失败种类（None 返回时的原因）。
+enum ScanFail {
+    Mismatch,
+    BadZone(String),
+}
+
+fn scan_with_format(
+    input: &str,
+    fmt: &str,
+    base: i64,
+    gmt: bool,
+    zone_opt: Option<&str>,
+    fail: &mut ScanFail,
+) -> Option<i64> {
     #[derive(Default)]
     struct F {
         y: Option<i64>,
@@ -319,6 +344,7 @@ fn scan_with_format(input: &str, fmt: &str, base: i64, gmt: bool) -> Option<i64>
         pm: Option<bool>,
         epoch: Option<i64>,
         tz: Option<i64>,
+        zone_name: Option<String>,
     }
     let chars: Vec<char> = input.chars().collect();
     let mut pos = 0usize;
@@ -449,7 +475,17 @@ fn scan_with_format(input: &str, fmt: &str, base: i64, gmt: bool) -> Option<i64>
                 }
                 'Z' => {
                     skip_ws(&mut pos);
-                    let _ = word(&mut pos)?;
+                    let mut w = word(&mut pos)?;
+                    // tclsh 的 %Z token 收字母后**可选一串数字**（zp4/
+                    // zp5/zp6；"est5edt" 仍 mismatch——数字后还有字母）。
+                    let dstart = pos;
+                    while pos < chars.len() && chars[pos].is_ascii_digit() {
+                        pos += 1;
+                    }
+                    if pos > dstart {
+                        w.push_str(&chars[dstart..pos].iter().collect::<String>());
+                    }
+                    f.zone_name = Some(w);
                 }
                 '%' => {
                     if chars.get(pos) != Some(&'%') {
@@ -495,8 +531,10 @@ fn scan_with_format(input: &str, fmt: &str, base: i64, gmt: bool) -> Option<i64>
         return Some(e);
     }
 
-    // -base 的历法分解（年/月/日兜底）。
-    let Some((by, bmo, bd, _, _, _)) = clock_civil(base, gmt) else {
+    // -base 的历法分解（年/月/日兜底）+ 组合；`gmt_eff` 决定 UTC/本地
+    // （%Z / -timezone 时在对应时区上下文里按本地历法求值）。
+    let fields_of = |gmt_eff: bool| -> Option<(i64, i64, i64, i64, i64, i64)> {
+    let Some((by, bmo, bd, _, _, _)) = clock_civil(base, gmt_eff) else {
         return None;
     };
     let has_y = f.y.or_else(|| f.y2.map(map_two_digit_year));
@@ -533,13 +571,91 @@ fn scan_with_format(input: &str, fmt: &str, base: i64, gmt: bool) -> Option<i64>
         second = f.se.unwrap_or(0);
     }
 
-    let epoch = if let Some(off) = f.tz {
-        // %z：字段按 UTC 解释后减去偏移。
-        epoch_from_jdn(jdn_from_civil(yy, mo, dd), hour, minute, second) - off
-    } else {
-        clock_epoch(yy, mo, dd, hour, minute, second, gmt)
+    Some((yy, mo, dd, hour, minute, second))
     };
-    Some(epoch)
+    let compute = |gmt_eff: bool| -> Option<i64> {
+        let (yy, mo, dd, hour, minute, second) = fields_of(gmt_eff)?;
+        Some(if let Some(off) = f.tz {
+            // %z：字段按 UTC 解释后减去偏移。
+            epoch_from_jdn(jdn_from_civil(yy, mo, dd), hour, minute, second) - off
+        } else {
+            clock_epoch(yy, mo, dd, hour, minute, second, gmt_eff)
+        })
+    };
+
+    // %Z：tclsh 8.6.17 实测的**时区缩写表**（名字不分大小写、消息用
+    // 小写；%Z 优先于 -gmt 与 -timezone；未知缩写 = badTZName）。
+    if let Some(name) = &f.zone_name {
+        match zone_abbrev(name) {
+            Some(off) => {
+                let (yy, mo, dd, hour, minute, second) = fields_of(true)?;
+                Some(epoch_from_jdn(jdn_from_civil(yy, mo, dd), hour, minute, second) + off)
+            }
+            None => {
+                *fail = ScanFail::BadZone(name.clone());
+                None
+            }
+        }
+    } else if let Some(z) = zone_opt {
+        with_zone(Some(z), || compute(gmt))
+    } else {
+        compute(gmt)
+    }
+}
+
+/// 时区缩写 → 偏移（epoch = 该墙钟按 UTC 解释 + off；off = -本地东向偏移）。
+/// 表按 tclsh 8.6.17 逐个实测（与 tclDate.c 的 TimezoneTable 同源，
+/// 但本机 oracle 的个别条目与 vendored 新版不同，以 oracle 为准）。
+fn zone_abbrev(lower: &str) -> Option<i64> {
+    let h = 3600i64;
+    Some(match lower {
+        "gmt" | "ut" | "utc" | "wet" => 0,
+        "bst" => -h,
+        "wat" => h,
+        "at" => 2 * h,
+        "nft" | "nst" => 7 * h / 2,
+        "ndt" => 5 * h / 2,
+        "ast" => 4 * h,
+        "adt" => 3 * h,
+        "est" => 5 * h,
+        "edt" => 4 * h,
+        "cst" => 6 * h,
+        "cdt" => 5 * h,
+        "mst" => 7 * h,
+        "mdt" => 6 * h,
+        "pst" => 8 * h,
+        "pdt" => 7 * h,
+        "yst" => 9 * h,
+        "ydt" => 8 * h,
+        "akst" => 9 * h,
+        "akdt" => 8 * h,
+        "hst" => 10 * h,
+        "hdt" => 9 * h,
+        "cat" | "ahst" => 10 * h,
+        "nt" => 11 * h,
+        "idlw" => 12 * h,
+        "cet" | "met" | "mewt" | "swt" | "fwt" => -h,
+        "cest" | "mest" | "sst" | "fst" | "eet" => -2 * h,
+        "bt" => -3 * h,
+        "it" => -7 * h / 2,
+        "zp4" => -4 * h,
+        "zp5" => -5 * h,
+        "ist" => -11 * h / 2,
+        "zp6" => -6 * h,
+        "wast" => -7 * h,
+        "wadt" => -8 * h,
+        "jt" => -15 * h / 2,
+        "cct" => -8 * h,
+        "jst" | "kst" => -9 * h,
+        "jdt" | "kdt" => -10 * h,
+        "cast" => -19 * h / 2,
+        "cadt" => -21 * h / 2,
+        "east" | "gst" => -10 * h,
+        "eadt" => -21 * h / 2,
+        "nzt" | "nzst" | "idle" => -12 * h,
+        "nzdt" => -13 * h,
+        _ => return None,
+    })
 }
 
 /// %y → 世纪：Tcl 的 32 位 time_t 安全窗（00-37 → 2000+，38-99 → 1900+）。

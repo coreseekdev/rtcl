@@ -279,12 +279,20 @@
     组合规则：缺日期取 base；有日期或非零日级相对量时时刻归零（显式
     时刻优先）；相对量按序施加（月/年夹月末）。裸数字不再按 epoch
     （`clock scan 123` = 今日 01:23）。35 条 -base 固定探针全 SAME。
-  残差：军事单字母时区（T=+7 等）与双字母时区（AT）；`next|last
-  <月名>` 的 tclsh 怪值；畸形数字日期（`1-2-2000` → 2007-06-23 等）；
-  部分错误字符位（EST 尾随、`2000-060`）；scan 的 %Z 缩写只消费不查表
-  （tclsh 按 zoneinfo 名查 EST/CET 等并应用偏移，未知缩写报
-  `time zone "xyz" not found`）；clock 错误的 errorInfo 含 tclsh Tcl
-  实现（::tcl::clock::add 等）的 proc 帧；-locale 只接受不参与格式。
+  * **clock scan %Z 时区缩写表（2026-11-06）**：tclsh 8.6.17 的
+    TimezoneTable（tclDate.c 同源，约 60 名：gmt/ut/utc/wet/bst/wat/
+    at/nft/nst/ndt/ast/adt/est/edt/cst/cdt/mst/mdt/pst/pdt/yst/ydt/
+    akst/akdt/hst/hdt/cat/ahst/nt/idlw/cet/cest/met/mewt/mest/swt/sst/
+    fwt/fst/eet/bt/it/zp4/zp5/ist/zp6/wast/wadt/jt/cct/jst/jdt/kst/kdt/
+    cast/cadt/east/eadt/gst/nzt/nzst/nzdt/idle）——名字不分大小写、
+    %Z token 收字母+可选数字（zp4），优先于 -gmt/-timezone；未知缩写
+    `time zone "<lower>" not found` + CLOCK badTZName。全表 70+ 项
+    逐一 SAME。
+  残差：军事单字母时区（T=+7 等）与自由格式 scan 的双字母时区（AT）
+  语义；`next|last <月名>` 的 tclsh 怪值；畸形数字日期（`1-2-2000` →
+  2007-06-23 等）；部分错误字符位（`2000-060` 等）；clock 错误的
+  errorInfo 含 tclsh Tcl 实现（::tcl::clock::add 等）的 proc 帧；
+  -locale 只接受不参与格式。
 
 ### D-26 glob：Rust glob crate 语义 + 排序（spec matching [D-25]）[FIXED 2026-11-05]
 - **Tcl 8.6**：`**` 只是两个 `*`（无递归）、`{a,b}` 非交替、前导点不

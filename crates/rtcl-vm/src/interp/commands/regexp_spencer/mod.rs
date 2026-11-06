@@ -332,6 +332,20 @@ mod tests {
     }
 
     #[test]
+    fn lookahead_does_not_leak_preference_flags() {
+        // 环视内部子式的 LONGER 不得覆盖外层的 SHORTER：
+        // `(?![^ab]{2}|$)[^ab]*?` 在位置 3 应取空匹配。
+        let prog = compile(r"(?![^ab]{2}|$)[^ab]*?", Options::default()).unwrap();
+        assert!(prog.flags.shorter);
+        let chars: Vec<char> = [0xF0u32, 0x9F, 0x98, 0x80, 0x61]
+            .iter()
+            .map(|c| char::from_u32(*c).unwrap())
+            .collect();
+        let m = matcher::find_from(&prog, &chars, 3, 3).unwrap();
+        assert_eq!((m.start, m.end), (3, 3));
+    }
+
+    #[test]
     fn lazy_child_repeat_capture_prefers_short_first() {
         // `(a{1,2}?){0,2}` @ "aaa"：tclsh 末次迭代取最长剩余段
         //（组 1..3），而不是前一次贪到最长、末次剩 1 字符。

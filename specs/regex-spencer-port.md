@@ -193,8 +193,10 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   5000 例 Unicode/多字节文本命令面语料与 15000 例嵌套语法层语料
   （环视/分组/量词/内嵌选项，`specs/regex/gen-deep-fuzz.py`）
   **0 差异**。内嵌 `(?i)` 生效后的 options 会传给 NFA/匹配器；
-  环视内括号保留分组层（`(?=(^){1,2})` 可量化）；惰性子节点的
-  重复组末次迭代取最长剩余段（`(a{1,2}?){0,2}` 组 1..3）。`-linestop/-line`
+  环视内括号保留分组层（`(?=(^){1,2})` 可量化）；环视子式的
+  偏好位不向父节点传播（Lacon 是零宽约束，`(?=..)[^ab]*?` 的
+  SHORTER 不被内层 LONGER 覆盖）；惰性子节点的重复组末次迭代
+  取最长剩余段（`(a{1,2}?){0,2}` 组 1..3）。`-linestop/-line`
   下否定简写 `\W/\D/\S` 与 `[^...]` 一样不匹配换行；ARE 字符类内
   仅允许小写 `\d\s\w`（大写 → REG_EESCAPE，BRE/ERE 为字面）。
   回引回溯的 concat 去重按

@@ -267,13 +267,14 @@ impl Node {
     }
 
     pub fn look(negative: bool, node: Node) -> Node {
-        let flags = node.flags;
+        // 环视是零宽约束：内部子式的偏好位不得传播到外层
+        //（否则 `(?=..)[^ab]*?` 的 SHORTER 会被内层 LONGER 覆盖）。
         Node::new(
             NodeKind::Look {
                 negative,
                 node: Box::new(node),
             },
-            flags,
+            Flags::NONE,
         )
     }
 }

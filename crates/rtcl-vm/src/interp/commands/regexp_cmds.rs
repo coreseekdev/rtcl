@@ -732,6 +732,8 @@ pub(crate) fn compile_engine(
 pub(crate) struct CharCache {
     text: Option<(Vec<char>, Vec<usize>)>,
     matcher: Option<super::regexp_spencer::matcher::Matcher>,
+    /// 全串是否 ASCII（必需字符预过滤可用字节 memchr 快路径）。
+    ascii: Option<bool>,
 }
 
 #[cfg(all(feature = "regexp-spencer", feature = "regexp"))]
@@ -740,6 +742,7 @@ impl CharCache {
         CharCache {
             text: None,
             matcher: None,
+            ascii: None,
         }
     }
 }
@@ -784,6 +787,33 @@ pub(crate) fn engine_attempt(
                     Some(super::regexp_spencer::matcher::Matcher::new(prog));
             }
             let (chars, byte_at) = cache.text.as_ref().unwrap();
+            // 必需字符预过滤：ASCII 文本用 str::contains（memchr），
+            // 避免无命中时启动 DFA 扫描。
+            if let Some(c) = prog.required_char {
+                if cache.ascii.is_none() {
+                    cache.ascii = Some(full_string.is_ascii());
+                }
+                let from = p.min(chars.len());
+                let found = if cache.ascii == Some(true) && c.is_ascii() {
+                    let suffix = &full_string[byte_at[from]..];
+                    let mut hit = suffix.contains(c);
+                    if !hit && prog.icase {
+                        hit = suffix.contains(c.to_ascii_lowercase())
+                            || suffix.contains(c.to_ascii_uppercase());
+                    }
+                    hit
+                } else {
+                    chars[from..].iter().any(|&ch| {
+                        ch == c
+                            || (prog.icase
+                                && (ch.to_lowercase().next() == Some(c)
+                                    || ch.to_uppercase().next() == Some(c)))
+                    })
+                };
+                if !found {
+                    return None;
+                }
+            }
             let matcher = cache.matcher.as_mut().unwrap();
             let caps = super::regexp_spencer::captures::exec_with(
                 prog,

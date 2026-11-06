@@ -332,6 +332,25 @@ mod tests {
     }
 
     #[test]
+    fn required_char_prefilter_is_sound() {
+        let prog = compile("[a-z]*z", Options::default()).unwrap();
+        assert_eq!(prog.required_char, Some('z'));
+        assert!(!is_match(&prog, "abc", 0));
+        assert!(is_match(&prog, "abz", 0));
+        // 可选/分支不同则不产生必需字符。
+        assert_eq!(compile("z?", Options::default()).unwrap().required_char, None);
+        assert_eq!(compile("(a|b)", Options::default()).unwrap().required_char, None);
+        assert_eq!(compile("(ab|ac)", Options::default()).unwrap().required_char, Some('a'));
+        // -nocase 下必需字符需按折叠变体匹配。
+        let ic = Options {
+            icase: true,
+            ..Options::default()
+        };
+        let prog = compile("z", ic).unwrap();
+        assert!(is_match(&prog, "Z", 0));
+    }
+
+    #[test]
     fn collating_element_must_be_single_char() {
         assert_eq!(
             compile(r"[[=ab=]]", Options::default()).unwrap_err().code,

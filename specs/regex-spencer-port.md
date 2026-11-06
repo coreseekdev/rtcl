@@ -275,18 +275,23 @@ DFA 缓存：颜色类 ≤64、状态 ≤4096；断言模式自动回退 NFA。
 | `[a-z]+`（209720） | 38 ms | 79 ms |
 | `\w+`（209720） | 39 ms | 51 ms |
 | `(a+?)(a*)`（419440） | 66 ms | 64 ms |
-| `[a-z]*z`（0，全串扫描） | 2 ms | 9 ms |
+| `[a-z]*z`（0，全串扫描） | 2 ms | 1 ms |
 
 旧 fast 路径同机 `-all` 为 16 s / 32 s（逐匹配重扫前缀），已不默认。
 关键修复：`collect_matches` 的字节→字符换算改成**单调游标**
 （每个匹配不再 O(n) 重扫，整体 O(n)）；命令级 `CharCache` 复用
-`Vec<char>`/字节表与 `Matcher` 的 DFA 缓存（`captures::exec_with`）。
+`Vec<char>`/字节表与 `Matcher` 的 DFA 缓存（`captures::exec_with`）；
+`Prog.required_char`（每个匹配必然消耗的一个字面字符）在 ASCII
+文本上用 `str::contains`（memchr）先排除无命中扫描，`-nocase` 时
+按折叠变体检查——`[a-z]*z` 无 `z` 的 1 MiB 全串从 9ms 降到 1ms
+（快于 tclsh 的 2ms）。
 
 ### 待做（M2.5 后续）
 
-1. **search 预过滤 DFA（Spencer `simpleFind` 两段式）**：先用
-   `search` NFA 的 shortest 扫出可能起点区间，再对候选起点做 anchored
-   longest/shortest；目标把全串无匹配从 114-127 MB/s 提到 ≥500 MB/s。
+1. **search 预过滤 DFA（Spencer `simpleFind` 两段式）**：当前
+   start-tracking DFA 已承担 search 层语义；`required_char` memchr
+   预过滤已覆盖常见“无命中大文本”场景（`[a-z]*z` 1MiB 1ms）。
+   剩余收益主要是无必需字面字符的模式，优先级降低。
 2. **UTF-8 直读 + 字面 memmem**：公共 `find(&str)` 对纯 ASCII/纯字面
    走字节路径（避免每次调用的一次性 `Vec<char>` 转换），只对非 ASCII
    /需要 Unicode 语义的输入转 chars。

@@ -45,6 +45,10 @@ pub struct Prog {
     pub lacons: Vec<Box<Prog>>,
     /// 含反向引用（需要回溯执行；NFA/DFA 不支持）。
     pub has_backref: bool,
+    /// 每个匹配必然消耗的一个字面字符（无则 None）。用于在扫描前
+    /// 用一次线性查找直接排除不可能命中的大文本（无 z 时
+    /// `[a-z]*z` 无需启动 DFA）。
+    pub required_char: Option<char>,
 }
 
 struct Builder {
@@ -185,7 +189,50 @@ pub fn compile(node: &Node, icase: bool) -> Result<Prog, Error> {
         nsubs: max_subno(node),
         lacons: b.lacons,
         has_backref: has_backref(node),
+        required_char: required_char(node),
     })
+}
+
+/// 每个成功匹配必然消耗的一个字面字符：Concat 任一子节点、
+/// min>0 重复的子节点、所有分支相同的 Alt；可选重复/断言/回引/
+/// 环视不贡献。
+fn required_char(node: &Node) -> Option<char> {
+    match &node.kind {
+        NodeKind::Char(c) => char::from_u32(*c),
+        NodeKind::Class(set) => {
+            if !set.neg && !set.no_newline {
+                match set.items.as_slice() {
+                    [super::charset::Item::Range(lo, hi)] if lo == hi => {
+                        char::from_u32(*lo)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        NodeKind::Concat(v) => v.iter().find_map(required_char),
+        NodeKind::Alt(v) => {
+            let mut it = v.iter().filter_map(required_char);
+            let first = it.next()?;
+            if v.iter().all(|b| required_char(b) == Some(first)) {
+                Some(first)
+            } else {
+                None
+            }
+        }
+        NodeKind::Repeat { node, min, .. } => {
+            if *min > 0 {
+                required_char(node)
+            } else {
+                None
+            }
+        }
+        NodeKind::Capture { node, .. } | NodeKind::NoRecord(node) => {
+            required_char(node)
+        }
+        _ => None,
+    }
 }
 
 /// 匹配必须开始于的字面前缀：连续 `Char`（穿过 Capture）。

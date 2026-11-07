@@ -102,8 +102,12 @@
   方向再解析选项、选项必须成对；`read` 计数错误 `TCL VALUE NUMBER`；
   `-eofchar` 取元素首字符；`chan event` 空前缀报 ambiguous。
   chan_io_p3/p10/p11/p13/p13b/p17/p18/p19/p20 通过。
+- 追加（957d81f/2bab128）：namespace resolver 的全局回退（读/写/
+  数组 + 根限定 `::x` 绕过裸名链接），`info vars` 同名去重；
+  reflected channel read 按 4096 请求并截断调用方计数（chan_io_p5）。
+  probes 80 → 77。
 
-剩余 80 例（其中 15 例为上述 `-f` 整脚本设计差异，需对齐 65 例）：
+剩余 77 例（其中 15 例为上述 `-f` 整脚本设计差异，需对齐 62 例）：
 1. 整脚本编译设计差异（15）：`globprobe`、`ix1/2/4`、`cases*`、
    `pidx*`、`t2/3/4`、`probe_round3`、`r3probe`。
 2. errorInfo/errorstack/return 帧（19）：`ei2`、`expr_bracket_*`、
@@ -118,8 +122,8 @@
    ::tcl::prefix/::tcl::pkgconfig` 等。
 4. OO（6）：`oo1`（缺 ::zlib/::oo::Slot 等）、`oo2`、`oo4`（命名空间
    子项/序）、`oo5`（info object/class 面）、`oo6`、`oo8`（方法内省）。
-5. IO（4）：`chan_io_p15`（chan names 哈希序）、`p2`（socket）、
-   `p5`（read 缓冲/编码）、`p9`（std 通道 seek/tell）。
+5. IO（3）：`chan_io_p15`（chan names 哈希序）、`p2`（socket 命令
+   缺失）、`p9`（std 通道 seek/tell）。
 6. dict/mathop 命令面（2）：`dict_p40`、`p40`（`::tcl::mathop::*`
    仅 +；`namespace eval tcl::mathop` 命令清单）。
 7. Unicode/8.6（5）：`probe4`、`probe6`、`probe7`、`utf_U_parsehex`、
@@ -129,8 +133,10 @@
 9. 大整数表示（2）：`bnprobe2`、`pbr3`。
 10. 汇编/调试（6）：`c5_dis`、`cmp_assemble`、`cmp_unsupported*`、
     `dbg_basic`、`dbg_trace`。
-11. namespace/变量/trace（6）：`vm3`/`namespace_varmodel`（unset 后
-    回退全局变量）、`trv_d13/p10/p11`、`trace_array_get_firing`。
+11. namespace/变量/trace（4）：`trv_d13/p10/p11`、
+    `trace_array_get_firing`。（`vm3`/`namespace_varmodel` 已修：
+    根限定 `::x` 不走裸名重定向；裸名 transient 目标 unset 后读/写/
+    数组回退到同名全局；`info vars` 去重。）
 
 ## OPEN
 

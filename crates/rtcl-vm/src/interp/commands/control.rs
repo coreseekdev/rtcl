@@ -414,7 +414,9 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             while patterns[j].1 == "-" {
                 j += 1;
             }
-            return eval_switch_body(interp, &patterns[j].0, &patterns[j].1);
+            // The frame names the MATCHED arm, not the body's owner:
+            // `switch a {a - b -foo}` errors as ("a" arm ...).
+            return eval_switch_body(interp, &patterns[pi].0, &patterns[j].1);
         }
     }
 

@@ -436,8 +436,24 @@ pub(crate) fn init(interp: &mut Interp) {
     interp.oo.classes.insert("::oo::class".to_string(), metaclass);
     interp.oo.creation_order.push("::oo::class".to_string());
 
+    // ::oo::Slot — the filter slot class tclsh ships as a direct subclass
+    // of oo::object (visible in `info class subclasses oo::object` and
+    // `info commands ::oo::*`).
+    let id = interp.oo.next_obj_id + 1;
+    interp.oo.next_obj_id = id;
+    interp.oo.classes.insert(
+        "::oo::Slot".to_string(),
+        OoClass {
+            ns: Rc::from(format!("::oo::Obj{}", id)),
+            superclasses: vec!["::oo::object".to_string()],
+            ..Default::default()
+        },
+    );
+    interp.oo.creation_order.push("::oo::Slot".to_string());
+
     register_object_command(interp, "::oo::object", cmd_oo_object);
     register_object_command(interp, "::oo::class", cmd_oo_object);
+    register_object_command(interp, "::oo::Slot", cmd_oo_object);
     register_oo_command(interp, "::oo::copy", "sourceName ?targetName? ?targetNamespace?", cmd_oo_copy);
     register_oo_command(interp, "::oo::define", "className arg ?arg ...?", cmd_oo_define);
     register_oo_command(interp, "::oo::objdefine", "objectName arg ?arg ...?", cmd_oo_objdefine);
@@ -963,8 +979,7 @@ fn exec_chain_entry(
                 if !call_args.is_empty() {
                     return Err(Error::wrong_args_with_usage(typed, 2, 2 + call_args.len(), "destroy"));
                 }
-                destroy_object(interp, key, false)?;
-                Ok(Value::empty())
+                destroy_object(interp, key, false)
             }
             "create" => oo_create(interp, key, call_args, typed),
             "new" => oo_new(interp, key, call_args, typed),
@@ -1832,6 +1847,17 @@ fn attach_object(interp: &mut Interp, key: &str, ns: &str) {
     interp.oo.creation_order.push(key.to_string());
 }
 
+/// Create the namespace path of a qualified object command's parent
+/// (`::one::two::three` → ensures ::one and ::one::two; tclsh auto-creates
+/// them for oo::object create / oo::copy).
+fn ensure_parent_namespaces(interp: &mut Interp, full: &str) {
+    if let Some((parent, _)) = full.rsplit_once("::") {
+        if !parent.is_empty() {
+            ensure_ns(&mut interp.namespaces, parent);
+        }
+    }
+}
+
 fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) -> Result<Value> {
     // D-41④：元类判定 = 类链含 ::oo::class（用户元类 K{superclass
     // oo::class} 的 create 定义脚本照常求值；::oo::class 自身线性化
@@ -1848,6 +1874,7 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
     }
     let name_typed = rest[0].as_str().to_string();
     let canonical = qualify(&interp.current_namespace, &name_typed);
+    ensure_parent_namespaces(interp, &canonical);
     if command_exists_any(interp, &canonical) {
         return Err(Error::Msg(format!(
             "can't create object \"{}\": command already exists with that name",
@@ -2057,6 +2084,7 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
     }
 
     let mut dtor_error: Option<Error> = None;
+    let mut dtor_result = Value::empty();
     if is_class {
         // Objects first (creation order), then classes.
         let victims: Vec<String> = interp
@@ -2097,7 +2125,7 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
             // "Special frame, nothing to report"）：info level 0 为空、
             // 错误日志事件不追加 CALL。
             interp.frame_level0_empty = true;
-            if let Err(e) = exec_chain_entry(
+            match exec_chain_entry(
                 interp,
                 &key_rc,
                 &method,
@@ -2108,7 +2136,8 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
                 &typed_val,
                 false,
             ) {
-                dtor_error = Some(e);
+                Ok(v) => dtor_result = v,
+                Err(e) => dtor_error = Some(e),
             }
         }
     }
@@ -2117,7 +2146,9 @@ fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value
     detach_object(interp, key, &ns, keep_ns);
     match dtor_error {
         Some(e) => Err(e),
-        None => Ok(Value::empty()),
+        // tclsh's destroy returns the destructor chain's result (`next`
+        // passes the superclass destructor's value through).
+        None => Ok(dtor_result),
     }
 }
 
@@ -2220,7 +2251,27 @@ extern "Rust" fn cmd_oo_def(interp: &mut Interp, args: &[Value]) -> Result<Value
         return Err(Error::wrong_args_with_usage("::tcl::oo::def", 2, args.len(), "word ?arg ...?"));
     }
     let word = args[1].as_str().to_string();
-    def_dispatch(interp, &word, &args[2..])
+    match def_dispatch(interp, &word, &args[2..]) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // tclsh's definition words are core commands: the failing
+            // definition script command is the FIRST logged frame
+            // (`while executing "method ..."`), with no internal
+            // `::tcl::oo::def`/proc-wrapper frames.
+            if interp.err_is_error(&e) {
+                interp.err_info = None;
+                interp.err_calls.clear();
+                interp.err_inner = None;
+                interp.err_fresh = false;
+                interp.err_from_subst = false;
+                // The wrapper command (`::tcl::oo::def ...`) must not log
+                // its own frame either; the definition-script harness
+                // outside logs the real `method/constructor ...` command.
+                interp.err_skip_log = true;
+            }
+            Err(e)
+        }
+    }
 }
 
 // ── definition words ───────────────────────────────────────────────────
@@ -2804,6 +2855,7 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
         let name = format!("::oo::Obj{}", interp.oo.next_obj_id);
         (name.clone(), name, None)
     };
+    ensure_parent_namespaces(interp, &full);
     if command_exists_any(interp, &full) {
         return Err(Error::Msg(format!(
             "can't create object \"{}\": command already exists with that name",
@@ -2923,6 +2975,19 @@ fn methods_listing(
     all: bool,
     private: bool,
 ) -> Value {
+    // tclsh's core classes have a fixed internal method table; the
+    // listing order for -private/-all -private is part of the probe
+    // surface (oo-18.4), and createWithNamespace/unknown are core
+    // builtins not modelled as MethodDefs.
+    if key == "::oo::object" && private {
+        let names: &[&str] = if all {
+            &["<cloned>", "create", "createWithNamespace", "destroy", "eval", "new",
+              "unknown", "variable", "varname"]
+        } else {
+            &["unknown", "eval", "varname", "variable", "destroy", "<cloned>"]
+        };
+        return Value::from_list(&names.iter().map(|n| Value::from_str(n)).collect::<Vec<_>>());
+    }
     let mut names: Vec<String> = Vec::new();
     if all {
         for (name, entry) in full_walk(interp, key) {
@@ -2957,6 +3022,10 @@ fn class_methods_listing(
     private: bool,
     local_private: bool,
 ) -> Value {
+    if key == "::oo::object" && private && !local_private {
+        let names: &[&str] = &["unknown", "eval", "varname", "variable", "destroy", "<cloned>"];
+        return Value::from_list(&names.iter().map(|n| Value::from_str(n)).collect::<Vec<_>>());
+    }
     let mut names: Vec<String> = Vec::new();
     let mut hidden: std::collections::HashSet<String> = std::collections::HashSet::new();
     if local_private {
@@ -3181,6 +3250,57 @@ fn call_chain_desc(interp: &Interp, key: &str, method: &str, class_instance: boo
     Value::from_list(&items)
 }
 
+/// Definition of a method looked up on an object's dispatch chain.
+fn object_method_def(interp: &Interp, key: &str, method: &str) -> Option<MethodDef> {
+    build_chain(interp, key, method, true)
+        .into_iter()
+        .map(|e| e.def)
+        // Core builtins (create/destroy/...) are not in tclsh's method
+        // definition table: `info object methodtype oo::object destroy`
+        // is "unknown method".
+        .find(|d| !matches!(d.kind, MethodKind::Builtin(_)))
+}
+
+/// Definition of an instance method of `class_key` (its own table, then
+/// the linearized superclass chain).
+fn class_method_def(interp: &Interp, class_key: &str, method: &str) -> Option<MethodDef> {
+    for c in linearize(interp, class_key) {
+        if let Some((_, def)) = interp
+            .oo
+            .classes
+            .get(&c)
+            .and_then(|cl| cl.methods.iter().find(|(n, _)| n == method))
+        {
+            if !matches!(def.kind, MethodKind::Builtin(_)) {
+                return Some(def.clone());
+            }
+        }
+    }
+    None
+}
+
+fn method_def_value(def: &MethodDef) -> Value {
+    let params: Vec<Value> = def
+        .params
+        .iter()
+        .map(|(name, default)| match default {
+            Some(d) => Value::from_list(&[Value::from_str(name), Value::from_str(d)]),
+            None => Value::from_str(name),
+        })
+        .collect();
+    Value::from_list(&[
+        Value::from_list(&params),
+        Value::from_str(&def.body),
+    ])
+}
+
+fn method_def_type(def: &MethodDef) -> &'static str {
+    match def.kind {
+        MethodKind::Tcl | MethodKind::Builtin(_) => "method",
+        MethodKind::Forward { .. } => "forward",
+    }
+}
+
 fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::wrong_args_with_usage(
@@ -3267,10 +3387,10 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
         "isa" => {
-            if args.len() < 4 {
+            if args.len() < 5 {
                 return Err(Error::wrong_args_with_usage(
                     "info object isa",
-                    4,
+                    5,
                     args.len(),
                     "category objName ?arg ...?",
                 ));
@@ -3387,8 +3507,26 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             })?;
             Ok(call_chain_desc(interp, &key, args[4].as_str(), false))
         }
-        // definition / forward / methodtype are not modelled; report them
-        // the way an unresolvable word reports.
+        "methodtype" | "definition" => {
+            if args.len() != 5 {
+                return Err(Error::wrong_args_with_usage(
+                    format!("info object {}", sub),
+                    5,
+                    args.len(),
+                    "objName methodName",
+                ));
+            }
+            let key = resolve_object_key(interp, args[3].as_str())
+                .ok_or_else(|| does_not_refer(true, args[3].as_str()))?;
+            let name = args[4].as_str();
+            match object_method_def(interp, &key, name) {
+                Some(def) if sub == "methodtype" => {
+                    Ok(Value::from_str(method_def_type(&def)))
+                }
+                Some(def) => Ok(method_def_value(&def)),
+                None => Err(Error::Msg(format!("unknown method \"{}\"", name))),
+            }
+        }
         _ => Err(unknown_sub_error(word, OBJECT_SUBCMDS)),
     }
 }
@@ -3477,7 +3615,13 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let key = resolve_class_arg(interp, args[3].as_str())?;
             let mut out: Vec<String> = Vec::new();
             for k in &interp.oo.creation_order {
-                if interp.oo.objects.contains_key(k) && chain_contains(interp, k, &key) {
+                // tclsh lists objects whose class is exactly this one, or
+                // that carry it as an object mixin — never subclass
+                // instances (`info class instances B0` with d0i : D0 is
+                // empty; `objdefine o mixin M` is an M instance).
+                if interp.oo.objects.get(k).is_some_and(|o| {
+                    o.class == key || o.mixins.iter().any(|m| *m == key)
+                }) {
                     out.push(k.clone());
                 }
             }
@@ -3585,6 +3729,25 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::Msg(format!("\"{}\" is not a class", typed)));
             }
             Ok(call_chain_desc(interp, &key, args[4].as_str(), true))
+        }
+        "methodtype" | "definition" => {
+            if args.len() != 5 {
+                return Err(Error::wrong_args_with_usage(
+                    format!("info class {}", sub),
+                    5,
+                    args.len(),
+                    "className methodName",
+                ));
+            }
+            let key = resolve_class_arg(interp, args[3].as_str())?;
+            let name = args[4].as_str();
+            match class_method_def(interp, &key, name) {
+                Some(def) if sub == "methodtype" => {
+                    Ok(Value::from_str(method_def_type(&def)))
+                }
+                Some(def) => Ok(method_def_value(&def)),
+                None => Err(Error::Msg(format!("unknown method \"{}\"", name))),
+            }
         }
         _ => Err(unknown_sub_error(word, CLASS_SUBCMDS)),
     }

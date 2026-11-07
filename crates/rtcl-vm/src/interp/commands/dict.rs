@@ -633,6 +633,11 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
 
             let result = interp.eval_body_value(body);
+            if let Err(e) = &result {
+                if interp.err_is_error(e) {
+                    interp.err_exit_frame_raw("body of \"dict with\"");
+                }
+            }
             // tclsh leaves the mapped variables in place on error and does
             // not write the dict back; break/continue still write back.
             match &result {
@@ -737,6 +742,9 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                                 }
                                 if e.is_continue() {
                                     continue;
+                                }
+                                if interp.err_is_error(&e) {
+                                    interp.err_exit_frame("\"dict filter\" script");
                                 }
                                 return Err(e);
                             }

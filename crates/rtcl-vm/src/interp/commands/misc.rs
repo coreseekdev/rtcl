@@ -572,10 +572,25 @@ pub fn cmd_unset(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     for arg in &args[start..] {
         let name = arg.as_str();
-        if let Err(e) = interp.unset_var(name) {
-            if !nocomplain {
-                return Err(e);
+        if nocomplain {
+            // A swallowed "no such variable" must not leave the lookup
+            // errorCode behind (tclsh: `unset -nocomplain missing` does not
+            // touch ::errorCode).
+            let saved_code = interp.globals.get("errorCode").cloned();
+            let saved_raised = interp.err_code_raised;
+            if interp.unset_var(name).is_err() {
+                match saved_code {
+                    Some(v) => {
+                        interp.globals.insert("errorCode".to_string(), v);
+                    }
+                    None => {
+                        interp.globals.remove("errorCode");
+                    }
+                }
+                interp.err_code_raised = saved_raised;
             }
+        } else {
+            interp.unset_var(name)?;
         }
     }
     Ok(Value::empty())
@@ -992,7 +1007,9 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "body" => {
             if args.len() != 3 {
-                return Err(Error::wrong_args("info body", 3, args.len()));
+                return Err(Error::wrong_args_with_usage(
+                    "info body", 3, args.len(), "procname",
+                ));
             }
             let name = args[2].as_str();
             if let Some(key) = resolve_proc_key(interp, name) {

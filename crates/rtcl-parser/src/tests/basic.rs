@@ -52,3 +52,18 @@ fn test_expand() {
         _ => panic!("expected expand"),
     }
 }
+
+#[test]
+fn incremental_reader_runs_prefix_before_later_syntax_error() {
+    let src = "set a 1\nputs $a\nset b {";
+    let mut reader = IncrementalScript::new(src);
+    let c1 = reader.next_command().unwrap().unwrap();
+    assert_eq!(c1.line, 1);
+    assert_eq!(c1.text.slice(src), "set a 1");
+    let c2 = reader.next_command().unwrap().unwrap();
+    assert_eq!(c2.line, 2);
+    assert_eq!(c2.text.slice(src), "puts $a");
+    let err = reader.next_command().unwrap_err();
+    assert_eq!(err.line, 3);
+    assert!(err.message.contains("close-brace"));
+}

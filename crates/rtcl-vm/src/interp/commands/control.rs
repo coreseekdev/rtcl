@@ -930,6 +930,24 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 let _ = interp.set_var("::errorCode", Value::from_str(&tec));
             }
             if let Some(ov) = opts_var {
+                // tclsh's -errorline for a caught error is the line of the
+                // catch command inside the enclosing proc/namespace unit
+                // (`catch {error boom}` on proc-body line 2 → 2).  At the
+                // root frame the body is its own unit, so the line stays
+                // the body's failing-command line.
+                // Inline body: -errorline is the body-relative failing
+                // line rebased by the catch command's line in the enclosing
+                // unit.  The frame lines themselves stay body-relative, so
+                // only the options value is rebased.
+                let opts_line = if code == 1
+                    && same_unit
+                    && (interp.call_depth > 0 || !interp.ns_stack.is_empty())
+                {
+                    let base = (interp.cur_cmd_line + interp.line_offset).max(1) - 1;
+                    interp.err_line + base
+                } else {
+                    interp.err_line
+                };
                 let opts = if code == 1 {
                     // Tcl error completions carry -errorcode and -errorinfo.
                     let tec_override = if code == 1 {
@@ -938,8 +956,8 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         None
                     };
                     match tec_override {
-                        Some(tec) => error_options_dict_with_ec(1, 0, tec, &error_info, interp.err_line, interp),
-                        None => error_options_dict(1, 0, &e, script, &error_info, interp.err_line, interp),
+                        Some(tec) => error_options_dict_with_ec(1, 0, tec, &error_info, opts_line, interp),
+                        None => error_options_dict(1, 0, &e, script, &error_info, opts_line, interp),
                     }
                 } else if e.is_return() {
                     // return 信号：-level 1、-code = return 自身的码；
@@ -1024,6 +1042,9 @@ fn error_options_dict(
     // （expr）→ code-level-ec-ei-el-es（errorstack 垫底）。
     let order = match &interp.err_inner {
         Some(b) if b.starts_with("returnImm") => 0,
+        // Parse failures: -code -level -errorcode -errorinfo -errorline
+        // -errorstack (tclsh TclEvalEx syntax completion).
+        _ if matches!(err, Error::Syntax { .. }) => 2,
         _ if error_code.starts_with("ARITH") => 2,
         _ => 1,
     };

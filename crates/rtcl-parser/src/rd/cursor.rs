@@ -34,6 +34,23 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// Cursor over `input` starting at byte `offset`, line `line` (1-based).
+    /// Spans stay absolute in `input`, so the incremental parser can quote
+    /// command text and report error positions against the whole script.
+    pub fn new_at(input: &'a str, offset: usize, line: usize) -> Self {
+        let mut tokenizer = Tokenizer::new_at(input, offset, line);
+        let token_start = tokenizer.pos();
+        let token_line = tokenizer.line();
+        let current = tokenizer.next_token();
+        Self {
+            input,
+            tokenizer,
+            current,
+            token_start,
+            token_line,
+        }
+    }
+
     #[inline]
     pub fn at_end(&self) -> bool {
         self.current == Token::Eof

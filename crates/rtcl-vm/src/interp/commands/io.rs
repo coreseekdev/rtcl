@@ -261,7 +261,18 @@ pub fn cmd_source(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             crate::error::ErrorCode::Io,
         )
     })?;
-    interp.eval(&contents)
+    // tclsh sources a file incrementally: earlier commands execute even if a
+    // later one has a syntax error (the compile-run entry point, `rtcl -f`,
+    // still parses the whole script by design).
+    let r = interp.eval_incremental(&contents);
+    if let Err(e) = &r {
+        if interp.err_is_error(e) {
+            // Sourced files unwind through tclsh's `(file "..." line N)`
+            // frame before the enclosing `source` command is named.
+            interp.err_exit_frame(&format!("file \"{}\"", path));
+        }
+    }
+    r
 }
 
 #[cfg(not(feature = "file"))]

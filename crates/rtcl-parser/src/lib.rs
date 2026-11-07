@@ -164,6 +164,7 @@ pub fn parse(source: &str) -> ParseResult<Vec<Command>> {
 
 // Re-export token types from rd module
 pub use rd::token::{Token, Tokenizer};
+pub use rd::IncrementalScript;
 
 /// Check whether `source` is a complete Tcl script (balanced braces, quotes,
 /// and brackets).  Returns `true` if the script can be parsed without needing

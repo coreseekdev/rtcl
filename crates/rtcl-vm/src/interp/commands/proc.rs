@@ -182,7 +182,9 @@ pub fn cmd_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// construct's exit frame — `("eval" body line N)` (F3) / `("uplevel"
 /// body line N)` (N1) — before the enclosing harness names the command.
 fn eval_tagged(interp: &mut Interp, script: &str, tag: &str) -> Result<Value> {
-    let r = interp.eval(script);
+    // Tcl_EvalEx parses one command at a time; an early command's output
+    // survives a later syntax error.
+    let r = interp.eval_incremental(script);
     if let Err(e) = &r {
         if interp.err_is_error(e) {
             if interp.err_info.is_none() {

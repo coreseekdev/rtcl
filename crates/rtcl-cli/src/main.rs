@@ -122,7 +122,9 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
 fn run_command(cmd: &str, quiet: bool) -> Result<(), String> {
     let mut interp = Interp::new();
 
-    let result = match interp.eval(cmd) {
+    // -c is eval-style interpretation (incremental), unlike -f's compiled
+    // whole-script run.
+    let result = match interp.eval_incremental(cmd) {
         Ok(r) => r,
         // -c 与 -f 同语义（error-deep 探针：tclsh `catch {exit 3}` 穿透
         // catch 以 3 退出——原 to_string() 把 exit 信号降级成错误文本）。
@@ -230,7 +232,7 @@ fn run_repl(quiet: bool) -> Result<i32, String> {
 /// script-mode behavior, see run_file). `Err(code)` is a top-level `exit`
 /// carrying its process exit code.
 fn eval_repl_line(interp: &mut Interp, script: &str) -> Result<(), i32> {
-    match interp.eval(script) {
+    match interp.eval_incremental(script) {
         Ok(result) => {
             if !result.is_empty() {
                 println!("{}", result);

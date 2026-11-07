@@ -1900,13 +1900,13 @@ fn format_float(n: f64) -> String {
 /// Quote a string for safe use as a Tcl word in a command.
 /// Uses braces when the string contains special chars.
 pub fn tcl_quote(s: &str) -> String {
-    if s.is_empty() {
-        return "{}".to_string();
-    }
-    if !needs_braces(s) {
-        return s.to_string();
-    }
-    format!("{{{}}}", s)
+    // Use the same scanner as list serialization: a blind `{...}` wrapper
+    // produces an unparsable element when `s` itself has unbalanced braces
+    // (e.g. an errorInfo excerpt quoting `set z {`).  Tcl falls back to
+    // backslash escaping in that case.
+    let mut out: Vec<u8> = Vec::with_capacity(s.len() + 2);
+    convert_element(&mut out, s.as_bytes(), true);
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 #[cfg(test)]

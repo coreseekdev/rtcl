@@ -23,6 +23,49 @@ pub fn parse(source: &str) -> ParseResult<Vec<Command>> {
     parse_script(&mut cur, false)
 }
 
+/// Incremental command reader, matching tclsh's eval model: each command is
+/// parsed only when the previous one has finished executing, so an earlier
+/// command runs (and prints) before a later syntax error is reported.
+///
+/// Spans and line numbers are absolute in the original `source`.
+pub struct IncrementalScript<'a> {
+    source: &'a str,
+    offset: usize,
+    line: usize,
+}
+
+impl<'a> IncrementalScript<'a> {
+    pub fn new(source: &'a str) -> Self {
+        Self { source, offset: 0, line: 1 }
+    }
+
+    /// Byte offset of the next unparsed command (after the last returned one).
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Parse and return the next command, or `None` at end of input.
+    pub fn next_command(&mut self) -> ParseResult<Option<Command>> {
+        if self.offset >= self.source.len() {
+            return Ok(None);
+        }
+        let mut cur = Cursor::new_at(self.source, self.offset, self.line);
+        skip_command_separators(&mut cur);
+        if cur.at_end() {
+            self.offset = self.source.len();
+            return Ok(None);
+        }
+        let cmd = parse_command(&mut cur, false)?;
+        let next = cur.pos();
+        self.line += self.source[self.offset..next]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count();
+        self.offset = next;
+        Ok(Some(cmd))
+    }
+}
+
 fn parse_script(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Vec<Command>> {
     let mut commands = Vec::new();
 

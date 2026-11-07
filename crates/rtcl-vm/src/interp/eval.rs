@@ -31,6 +31,59 @@ impl Interp {
         r
     }
 
+    /// Evaluate a script command-by-command, like tclsh's Tcl_EvalEx.
+    ///
+    /// The whole text is *not* parsed up front: a command runs before the
+    /// next one is even looked at, so `source`/`eval`/`uplevel` and the REPL
+    /// execute the prefix and only then report a later syntax error.  Line
+    /// numbers and command spans stay absolute in the original script.
+    ///
+    /// The compile-run path (`rtcl -f`, proc bodies) deliberately keeps the
+    /// whole-script parse: see `run_file`.
+    pub fn eval_incremental(&mut self, script: &str) -> Result<Value> {
+        self.eval_depth += 1;
+        let saved_lexical = self.lexical_body;
+        self.lexical_body = std::mem::take(&mut self.next_eval_lexical);
+        let saved_inl = self.in_locals_unit;
+        self.in_locals_unit = false;
+
+        let source: Rc<str> = Rc::from(script);
+        let mut reader = rtcl_parser::IncrementalScript::new(&source);
+        let mut result = Value::empty();
+        loop {
+            match reader.next_command() {
+                Ok(Some(cmd)) => {
+                    let unit = rtcl_parser::ScriptUnit {
+                        source: Rc::clone(&source),
+                        commands: vec![cmd],
+                    };
+                    match self.eval_commands(&unit) {
+                        Ok(v) => result = v,
+                        Err(e) => {
+                            self.lexical_body = saved_lexical;
+                            self.in_locals_unit = saved_inl;
+                            self.eval_depth -= 1;
+                            return Err(e);
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(pe) => {
+                    let e = self.seed_parse_error(&source, &pe);
+                    self.lexical_body = saved_lexical;
+                    self.in_locals_unit = saved_inl;
+                    self.eval_depth -= 1;
+                    return Err(e);
+                }
+            }
+        }
+        self.result = result.clone();
+        self.lexical_body = saved_lexical;
+        self.in_locals_unit = saved_inl;
+        self.eval_depth -= 1;
+        Ok(result)
+    }
+
     fn eval_impl(&mut self, script: &str) -> Result<Value> {
         // This eval IS the unit an armed "same unit" request names (a
         // construct's inline body, a `[...]` word): consume the flag for
@@ -249,11 +302,27 @@ impl Interp {
                 .rfind(['\n', ';'])
                 .map(|i| i + 1)
                 .unwrap_or(0);
-            self.err_info = Some(format!(
+            let partial = format!(
                 "{}\n    while executing\n\"{}\"",
                 pe.message,
                 tcl_log_excerpt(&script[start..end])
+            );
+            // -errorstack for a parse failure: a single INNER entry
+            // `{syntax <msg> {-code 1 -level 0 -errorcode NONE
+            // -errorinfo <partial> -errorline <line>}}` (tclsh's
+            // Tcl_AddErrorInfo on the syntax error completion).
+            let inner_opts = format!(
+                "-code 1 -level 0 -errorcode NONE -errorinfo {} -errorline {}",
+                crate::value::tcl_quote(&partial),
+                pe.line
+            );
+            self.err_inner = Some(format!(
+                "syntax {} {}",
+                crate::value::tcl_quote(&pe.message),
+                crate::value::tcl_quote(&inner_opts)
             ));
+            self.err_calls.clear();
+            self.err_info = Some(partial);
             self.err_line = pe.line;
             // 一个新错误的 errorInfo 是全新的（tclsh ERR_LOGGED 语义）：
             // 之前被循环吞掉的控制流完成留下的延迟帧在此作废。
@@ -1605,4 +1674,25 @@ fn word_var_read_hint(
         }
     }
     walk(word, quoted, local_slots).flatten()
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+
+    #[test]
+    fn eval_incremental_runs_prefix_before_later_syntax_error() {
+        let mut interp = Interp::new();
+        let err = interp
+            .eval_incremental("set x 1\nset y $x\nset z {")
+            .unwrap_err();
+        assert!(matches!(err, Error::Syntax { .. }));
+        // The two complete commands ran before the parse error was seen.
+        assert_eq!(interp.eval("set x").unwrap().as_str(), "1");
+        assert_eq!(interp.eval("set y").unwrap().as_str(), "1");
+        let info = interp.err_info.as_deref().unwrap_or("");
+        assert!(info.starts_with("missing close-brace"), "info={info}");
+        assert!(info.contains("set z {"), "info={info}");
+        assert!(interp.error_stack_render().starts_with("INNER {syntax "));
+    }
 }

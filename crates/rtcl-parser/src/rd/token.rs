@@ -133,6 +133,17 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
+    /// Start tokenizing at byte `pos`, whose source line is `line` (1-based).
+    /// Used by the incremental parser to resume at a command boundary.
+    pub fn new_at(input: &'a str, pos: usize, line: usize) -> Self {
+        Self {
+            input,
+            bytes: input.as_bytes(),
+            pos,
+            line,
+        }
+    }
+
     /// Peek the current byte without consuming it.
     #[inline]
     fn peek_byte(&self) -> Option<u8> {

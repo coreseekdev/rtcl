@@ -317,6 +317,10 @@ pub(crate) struct OoState {
     /// nothing for the argument vector.
     pub args_pool: Vec<Vec<Value>>,
     pub define_stack: Vec<DefineTarget>,
+    /// Multi-word `oo::define C <word> ...` / `oo::objdefine o <word> ...`
+    /// prefix used in that form's arity messages; `None` inside a
+    /// definition script, where tclsh names the bare word.
+    pub define_cmd_prefix: Option<String>,
     /// `my`/`self`/`next` command keys → owning object key.  Entries whose
     /// key no longer holds such a command were renamed away and are swept
     /// when their owner is destroyed (oo-1.20).
@@ -855,6 +859,18 @@ fn render_or_list(items: &[String]) -> String {
     }
 }
 
+/// Tcl_GetIndexFromObj-style alternatives: an Oxford comma for 3+ items
+/// (`a, b, or c`), no comma for 2.  TclOO's hand-built "unknown method"
+/// list instead uses [`render_or_list`] (no Oxford comma).
+fn render_or_list_oxford(items: &[String]) -> String {
+    match items.len() {
+        0 => String::new(),
+        1 => items[0].clone(),
+        2 => format!("{} or {}", items[0], items[1]),
+        n => format!("{}, or {}", items[..n - 1].join(", "), items[n - 1]),
+    }
+}
+
 /// `unknown method "x": must be ...` — exported chain names + `destroy`,
 /// with `new` suppressed on `::oo::class` itself.
 ///
@@ -917,11 +933,11 @@ fn unknown_method_error(
 }
 
 fn does_not_refer(kind_obj: bool, typed: &str) -> Error {
-    Error::Msg(format!(
-        "{} does not refer to an {}",
-        typed,
-        if kind_obj { "object" } else { "class" }
-    ))
+    Error::Msg(if kind_obj {
+        format!("{} does not refer to an object", typed)
+    } else {
+        format!("{} does not refer to a class", typed)
+    })
 }
 
 // ── method execution ───────────────────────────────────────────────────
@@ -1562,6 +1578,14 @@ extern "Rust" fn cmd_oo_self(interp: &mut Interp, args: &[Value]) -> Result<Valu
         };
     }
     let word = args[1].as_str();
+    // Every self subcommand rejects extra arguments with tclsh's generic
+    // usage (even `self next x`); `self` and `self <sub>` are the only
+    // accepted shapes.
+    if args.len() > 2 {
+        return Err(Error::wrong_args_with_usage(
+            "self", 2, args.len(), "subcommand",
+        ));
+    }
     let sub = match resolve_sub(word, SELF_SUBCMDS) {
         Some(s) => s,
         None => {
@@ -1569,7 +1593,7 @@ extern "Rust" fn cmd_oo_self(interp: &mut Interp, args: &[Value]) -> Result<Valu
                 format!(
                     "bad subcommand \"{}\": must be {}",
                     word,
-                    render_or_list(&SELF_SUBCMDS.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                    render_or_list_oxford(&SELF_SUBCMDS.iter().map(|s| s.to_string()).collect::<Vec<_>>())
                 ),
                 ErrorCode::Generic,
             ))
@@ -2149,9 +2173,11 @@ extern "Rust" fn cmd_oo_define(interp: &mut Interp, args: &[Value]) -> Result<Va
         // definition context, with no definition-script error frame
         // (tclsh: `oo::define C error foo` reports only the outer frame).
         interp.oo.define_stack.push(DefineTarget::Class(canonical.to_string()));
+        let prev_prefix = interp.oo.define_cmd_prefix.replace(format!("oo::define {}", typed));
         let prev = core::mem::replace(&mut interp.current_namespace, Rc::from("::oo::define"));
         let r = interp.dispatch_values(&args[2..]);
         interp.current_namespace = prev;
+        interp.oo.define_cmd_prefix = prev_prefix;
         interp.oo.define_stack.pop();
         r
     }
@@ -2177,9 +2203,11 @@ extern "Rust" fn cmd_oo_objdefine(interp: &mut Interp, args: &[Value]) -> Result
     } else {
         // Multi-word form — see cmd_oo_define.
         interp.oo.define_stack.push(DefineTarget::Object(canonical.to_string()));
+        let prev_prefix = interp.oo.define_cmd_prefix.replace(format!("oo::objdefine {}", typed));
         let prev = core::mem::replace(&mut interp.current_namespace, Rc::from("::oo::define"));
         let r = interp.dispatch_values(&args[2..]);
         interp.current_namespace = prev;
+        interp.oo.define_cmd_prefix = prev_prefix;
         interp.oo.define_stack.pop();
         r
     }
@@ -2230,11 +2258,18 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
         Some(t) => t.clone(),
         None => return Err(Error::invalid_command(word)),
     };
+    // Multi-word form: tclsh's arity messages name the outer definition
+    // command (`oo::define C method name args body`); inside a definition
+    // script the bare word is named instead.
+    let cmd_name = match &interp.oo.define_cmd_prefix {
+        Some(prefix) => format!("{} {}", prefix, word),
+        None => word.to_string(),
+    };
     match word {
         "method" => {
             if rest.len() != 3 {
                 return Err(Error::wrong_args_with_usage(
-                    word, 4, rest.len() + 1, "name args body",
+                    &cmd_name, 4, rest.len() + 1, "name args body",
                 ));
             }
             let name = rest[0].as_str().to_string();
@@ -2251,7 +2286,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
         "forward" => {
             if rest.len() < 2 {
                 return Err(Error::wrong_args_with_usage(
-                    word, 3, rest.len() + 1, "name cmdName ?arg ...?",
+                    &cmd_name, 3, rest.len() + 1, "name cmdName ?arg ...?",
                 ));
             }
             let name = rest[0].as_str().to_string();
@@ -2384,7 +2419,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             }
             if rest.len() != 2 {
                 return Err(Error::wrong_args_with_usage(
-                    word, 3, rest.len() + 1, "arguments body",
+                    &cmd_name, 3, rest.len() + 1, "arguments body",
                 ));
             }
             let params = parse_param_list(rest[0].as_str())?;
@@ -2407,7 +2442,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                 return Err(Error::invalid_command(word));
             }
             if rest.len() != 1 {
-                return Err(Error::wrong_args_with_usage(word, 2, rest.len() + 1, "body"));
+                return Err(Error::wrong_args_with_usage(&cmd_name, 2, rest.len() + 1, "body"));
             }
             if let DefineTarget::Class(name) = target {
                 if let Some(c) = interp.oo.classes.get_mut(&name) {
@@ -2425,7 +2460,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
         }
         "export" => {
             if rest.is_empty() {
-                return Err(Error::wrong_args_with_usage(word, 2, 1, "name ?name ...?"));
+                return Err(Error::wrong_args_with_usage(&cmd_name, 2, 1, "name ?name ...?"));
             }
             for arg in rest {
                 set_export(interp, &target, arg.as_str(), true);
@@ -2523,7 +2558,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
         }
         "renamemethod" => {
             if rest.len() != 2 {
-                return Err(Error::wrong_args_with_usage(word, 3, rest.len() + 1, "fromName toName"));
+                return Err(Error::wrong_args_with_usage(&cmd_name, 3, rest.len() + 1, "fromName toName"));
             }
             let from = rest[0].as_str().to_string();
             let to = rest[1].as_str().to_string();
@@ -2537,7 +2572,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
         }
         "self" => {
             if rest.is_empty() {
-                return Err(Error::wrong_args_with_usage(word, 2, 1, "arg ?arg ...?"));
+                return Err(Error::wrong_args_with_usage(&cmd_name, 2, 1, "arg ?arg ...?"));
             }
             interp.dispatch_values(rest)
         }
@@ -2872,7 +2907,7 @@ fn unknown_sub_error(word: &str, list: &[&str]) -> Error {
     Error::Msg(format!(
         "unknown or ambiguous subcommand \"{}\": must be {}",
         word,
-        render_or_list(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        render_or_list_oxford(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     ))
 }
 
@@ -3248,7 +3283,7 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     return Err(Error::Msg(format!(
                         "bad category \"{}\": must be {}",
                         cat,
-                        render_or_list(&ISA_CATS.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                        render_or_list_oxford(&ISA_CATS.iter().map(|s| s.to_string()).collect::<Vec<_>>())
                     )))
                 }
             };

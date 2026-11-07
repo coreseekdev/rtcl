@@ -106,22 +106,29 @@
   数组 + 根限定 `::x` 绕过裸名链接），`info vars` 同名去重；
   reflected channel read 按 4096 请求并截断调用方计数（chan_io_p5）。
   probes 80 → 77。
+- 追加（4847711/d1e56d4）：expr 括号替换错误抑制外层 expr/set 帧、
+  空串操作数文案、嵌套 expr 逐层抑制；switch 匹配臂帧；dict with/
+  filter 退出帧；unset -nocomplain 不改 ::errorCode；OO 的
+  methodtype/definition、core 方法表、destroy 返回析构结果、
+  instances 精确类+mixin、定义词内部帧抑制、子命名空间自动创建；
+  info body/isa 元数。probes 77 → 64。
 
-剩余 77 例（其中 15 例为上述 `-f` 整脚本设计差异，需对齐 62 例）：
+剩余 64 例（其中 15 例为上述 `-f` 整脚本设计差异，需对齐 49 例）：
 1. 整脚本编译设计差异（15）：`globprobe`、`ix1/2/4`、`cases*`、
    `pidx*`、`t2/3/4`、`probe_round3`、`r3probe`。
-2. errorInfo/errorstack/return 帧（19）：`ei2`、`expr_bracket_*`、
-   `h_*`、`loops_return_level0_loop_bodies`、`p25/p29/p31`、
-   `probe_catch`、`return_level0_codes`、`sub_inline_*`、
-   `namespace_uplevel*`。含命令替换 `[...]` 的行号归属、内联体帧、
-   dict with/filter 帧、return -code/-level 解码。
+2. errorInfo/errorstack/return 帧（9）：`ei2`、
+   `expr_bracket_multiline`（多行括号的 proc 行号）、
+   `loops_return_level0_loop_bodies`、`namespace_uplevel/2`、
+   `probe_catch`、`return_level0_codes`、`sub_inline_*`（未捕获顶层
+   替换帧链）。expr 括号帧、switch arm、dict with/filter、h_* 已修。
 3. 哈希/迭代序与命令面（12）：`array_names_regexp_backref`、`cmds`、
    `topcmds`、`ic/ic2`、`info2`、`tclns`、`p-uplevel-ns`、`u72`、
    `trv_p8`、`namespace_varmodel2`、`probe1`。Tcl 哈希插入序 vs
    rtcl 排序/Rust HashMap 随机种子；命令集超集 + 缺 `socket/tell/
    ::tcl::prefix/::tcl::pkgconfig` 等。
-4. OO（6）：`oo1`（缺 ::zlib/::oo::Slot 等）、`oo2`、`oo4`（命名空间
-   子项/序）、`oo5`（info object/class 面）、`oo6`、`oo8`（方法内省）。
+4. OO（3）：`oo1`（::zlib/标准类与哈希序）、`oo2`（info vars 序）、
+   `oo4`（::oo::Helpers 与命名空间内建命令集/序）。内省/可见性/
+   destroy 返回值等已修。
 5. IO（3）：`chan_io_p15`（chan names 哈希序）、`p2`（socket 命令
    缺失）、`p9`（std 通道 seek/tell）。
 6. dict/mathop 命令面（2）：`dict_p40`、`p40`（`::tcl::mathop::*`

@@ -181,11 +181,14 @@ pub(crate) fn resolve_var_link(interp: &mut Interp, ns: &str, raw_name: &str) ->
     }
     let qrc: Rc<str> = Rc::from(qualified.as_str());
     let nprc: Rc<str> = Rc::from(ns_part.as_str());
-    interp
-        .var_link_cache
-        .entry(ns.to_string())
-        .or_default()
-        .insert(raw_name.to_string(), (Rc::clone(&qrc), Rc::clone(&nprc)));
+    const VAR_LINK_NS_MAX: usize = 256;
+    let inner = interp.var_link_cache.entry(ns.to_string()).or_default();
+    if inner.len() >= VAR_LINK_NS_MAX {
+        // Per-namespace bound: the outer map is capped at 1024 namespaces,
+        // but a script can declare unbounded distinct names in one ns.
+        inner.clear();
+    }
+    inner.insert(raw_name.to_string(), (Rc::clone(&qrc), Rc::clone(&nprc)));
     (qrc, nprc)
 }
 

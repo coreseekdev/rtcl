@@ -26,6 +26,10 @@ pub(crate) struct Host {
     /// 有效（钩子同步执行，返回后 Host 即弃）。
     pub(crate) interp: *mut Interp,
     pub(crate) arena: Vec<Value>,
+    /// Arena length at construction (preloaded constants): fast-tier calls
+    /// truncate back to it after every top-level run, so host-tagged
+    /// temporaries do not accumulate in the persistent fast Store.
+    pub(crate) arena_base: usize,
     pub(crate) consts: Vec<String>,
     /// locals 名（slot 重写的伪常量槽——名字解析同 consts 公式延伸）。
     pub(crate) local_names: Vec<String>,
@@ -572,6 +576,7 @@ impl Host {
     pub fn new(interp: *mut Interp, arena: Vec<Value>, bc: &ByteCode, module: &emit::Module) -> Host {
         Host {
             interp,
+            arena_base: arena.len(),
             arena,
             consts: bc.constants().to_vec(),
             local_names: bc.locals().to_vec(),

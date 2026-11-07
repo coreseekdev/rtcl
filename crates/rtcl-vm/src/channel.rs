@@ -622,6 +622,20 @@ impl Default for ChannelTable {
     }
 }
 
+impl Drop for ChannelTable {
+    /// Closing the interpreter must not leave file descriptors open or
+    /// pipe children unreaped.  `close` runs each channel's own close
+    /// (FileChannel flush/close, PipeChannel drops the pipes and waits);
+    /// reflected/transform finalizers still require the interpreter and
+    /// are handled by explicit `close`, not here.
+    fn drop(&mut self) {
+        let ids: Vec<ChannelId> = self.channels.keys().cloned().collect();
+        for id in ids {
+            let _ = self.close(&id);
+        }
+    }
+}
+
 impl ChannelTable {
     pub fn new() -> Self {
         let mut table = ChannelTable {

@@ -532,6 +532,7 @@ fn execute_fast(
             let store = cell.as_mut().unwrap();
             if store.data().sh.interp != interp as *mut Interp {
                 *store = init_fast_store(interp);
+                FAST_MODULES.with(|m| m.borrow_mut().clear());
             }
         }
         let store = cell.as_mut().unwrap();
@@ -685,6 +686,12 @@ fn execute_fast(
         h.sh.pending = None;
         h.sh.stale_site = None;
         h.sh.last_fail = None;
+        // Fast Store 是 per-thread 常驻的：把本次调用 tag 进 arena 的
+        // Value 与 foreach 宿主态放掉，否则字符串/列表型 proc 会随调用
+        // 次数无界增长。返回的 Value 已 clone，截断安全。
+        let base = h.sh.hosts[slot].arena_base;
+        h.sh.hosts[slot].arena_truncate(base);
+        h.sh.hosts[slot].foreaches.clear();
         Some(out)
     })
 }

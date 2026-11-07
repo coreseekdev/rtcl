@@ -1,0 +1,173 @@
+-- allium: 3
+-- memory-lifecycle.allium
+-- Runtime resource-lifecycle contract for rtcl.
+--
+-- Scope: ownership and timely release of runtime resources — values,
+-- channels (files/pipes/reflected/transforms), call frames, OO objects,
+-- interpreter caches, and JIT modules/pools.  Observable Tcl behaviour is
+-- specified in interp.allium and the sibling domain specs; this file is
+-- the memory-hygiene contract a host embedding rtcl relies on.
+--
+-- The audit against this spec, with file:line evidence and the remaining
+-- late-release gaps, lives in specs/MEMORY-AUDIT.md.
+
+use "./interp.allium" as interp
+
+entity Runtime {
+    live_values: Integer
+    live_channels: Integer
+    live_frames: Integer
+    live_objects: Integer
+    live_jit_modules: Integer
+    caches: List<Cache>
+}
+
+entity ValueHandle {
+    bytes: Integer
+    state: live | released
+}
+
+entity Channel {
+    kind: file | pipe | reflected | transform | std
+    state: open | closed
+    os_handle_released: Boolean
+}
+
+entity Frame {
+    state: active | popped
+}
+
+entity Cache {
+    name: String
+    entries: Integer
+    limit: Integer
+}
+
+entity OoObject {
+    state: alive | destroyed
+}
+
+entity JitModule {
+    state: loaded | unloaded
+    bytes: Integer
+}
+
+surface RuntimeResources {
+    -- The host boundary: a host creates a runtime, evaluates scripts
+    -- through it, and eventually drops it.
+    facing host: Runtime
+
+    provides:
+        CreatesValue(runtime, value)
+        DropsLastValueHandle(runtime, value)
+        OpensChannel(runtime, channel)
+        ClosesChannel(runtime, channel)
+        PushesFrame(runtime, frame)
+        PopsFrame(runtime, frame)
+        InsertsCacheEntry(runtime, cache)
+        DestroysOoObject(runtime, object)
+        ShutsDown(runtime)
+}
+
+-- ── values ─────────────────────────────────────────────────────────
+
+rule CreatingValueCountsIt {
+    when: CreatesValue(runtime, value)
+    requires: value.state = live
+    ensures: runtime.live_values = runtime.live_values + 1
+}
+
+rule LastValueHandleReleasesPayload {
+    -- A heap Value is reference counted; the payload (string, list/dict
+    -- children, compiled representation) must be released on the last
+    -- handle drop, not deferred to interpreter shutdown.
+    when: DropsLastValueHandle(runtime, value)
+    requires: value.state = live
+    ensures: value.state = released
+    ensures: value.bytes = 0
+    ensures: runtime.live_values = runtime.live_values - 1
+}
+
+-- ── channels and OS resources ──────────────────────────────────────
+
+rule OpeningChannelCountsIt {
+    when: OpensChannel(runtime, channel)
+    requires: channel.state = open
+    ensures: runtime.live_channels = runtime.live_channels + 1
+}
+
+rule ClosingChannelReleasesOsHandle {
+    -- `close` (and interpreter teardown) must release the OS handle:
+    -- file descriptors closed, pipe children killed/reaped, reflected
+    -- finalizers/drains run.
+    when: ClosesChannel(runtime, channel)
+    requires: channel.state = open
+    ensures: channel.state = closed
+    ensures: channel.os_handle_released = true
+    ensures: runtime.live_channels = runtime.live_channels - 1
+}
+
+-- ── frames ─────────────────────────────────────────────────────────
+
+rule PoppingFrameReleasesLocals {
+    -- Locals, upvar links, local procs and deferred scripts belong to the
+    -- frame; popping it releases them (a recycled frame retains no Value
+    -- or link from the previous call).
+    when: PopsFrame(runtime, frame)
+    requires: frame.state = active
+    ensures: frame.state = popped
+    ensures: runtime.live_frames = runtime.live_frames - 1
+}
+
+-- ── caches ─────────────────────────────────────────────────────────
+
+rule CacheInsertionRespectsLimit {
+    -- Every long-lived cache is bounded: insertion either evicts or
+    -- clears at the declared limit; no script-controlled growth.
+    when: InsertsCacheEntry(runtime, cache)
+    ensures: cache.entries <= cache.limit
+}
+
+-- ── OO objects ─────────────────────────────────────────────────────
+
+rule DestroyingObjectReleasesGraph {
+    when: DestroysOoObject(runtime, object)
+    requires: object.state = alive
+    ensures: object.state = destroyed
+    ensures: runtime.live_objects = runtime.live_objects - 1
+}
+
+-- ── shutdown ───────────────────────────────────────────────────────
+
+rule ShutdownReleasesEverything {
+    -- Dropping the last runtime handle must release values, channels
+    -- (including pipe children), frames, OO objects, cached method
+    -- bodies and all JIT modules/pools.
+    when: ShutsDown(runtime)
+    ensures: runtime.live_values = 0
+    ensures: runtime.live_channels = 0
+    ensures: runtime.live_frames = 0
+    ensures: runtime.live_objects = 0
+    ensures: runtime.live_jit_modules = 0
+    ensures:
+        for c in runtime.caches:
+            c.entries = 0
+}
+
+-- ── invariants ─────────────────────────────────────────────────────
+
+invariant NoReleasedValueRetainsPayload {
+    for value in ValueHandle:
+        value.state = released implies value.bytes = 0
+}
+
+invariant NoClosedChannelRetainsOsHandle {
+    for channel in Channel:
+        channel.state = closed implies channel.os_handle_released = true
+}
+
+invariant CachesStayBounded {
+    for runtime in Runtime:
+        for cache in runtime.caches:
+            cache.entries <= cache.limit
+}

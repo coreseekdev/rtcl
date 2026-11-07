@@ -1759,8 +1759,24 @@ fn attach_ns_commands(interp: &mut Interp, key: &str, ns: &str) {
 
 /// Remove everything a create/new (or destroy) attached for `key`.
 fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
+    let was_class = interp.oo.classes.contains_key(key);
     super::super::vm_exec::note_tier1_mutation(interp, key);
     interp.note_cmd_mutation();
+    // Release the destroyed object/class's chains and method bodies now,
+    // not at the next dispatch: the single-slot dispatcher caches and the
+    // chain memos otherwise pin MethodDefs (body Rc<str>, proc_memo,
+    // head_cache Values) of a dead object.  Destroying a class also
+    // invalidates chains of its subclasses/instances, so clear both maps.
+    interp.oo.obj_cache = None;
+    interp.oo.my_cache = [None, None];
+    if was_class {
+        interp.oo.chain_memo.clear();
+        interp.oo.chain_memo_priv.clear();
+    } else {
+        interp.oo.chain_memo.remove(key);
+        interp.oo.chain_memo_priv.remove(key);
+    }
+    interp.oo.key_memo.borrow_mut().clear();
     interp.commands.remove(key);
     interp.command_categories.remove(key);
     interp.command_meta.remove(key);

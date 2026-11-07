@@ -25,13 +25,29 @@ impl Interp {
     /// `ns_override` pins the frame's namespace for `apply {p b ::ns}`
     /// (the lambda runs in `::ns` regardless of its synthetic name).
     pub(crate) fn call_proc(&mut self, proc_def: &ProcDef, args: &[Value], proc_name: &str, ns_override: Option<Rc<str>>) -> Result<Value> {
+
+        // Apply's one-shot `info level 0` word (consumed even when the
+        // arity check fails, so it can't leak into a later call).
+        // Same guard as the tailcall marker: `take()` on the (24-byte)
+        // Option is a full replace; `apply` frames are the only ones that
+        // ever arm it.
+        let level0_override = if self.frame_level0_args.is_some() {
+            self.frame_level0_args.take()
+        } else {
+            None
+        };
+        // objc=0 特殊帧（tclsh 析构器）：info level 0 空、不记 CALL。
+        let level0_special = std::mem::take(&mut self.frame_level0_empty);
+        // The OO dispatcher's one-shot variable links (consumed here for
+        // the same leak reason; installed at frame setup below).
+        let prelink = self.frame_prelink.take();
+        let mut prelink_done = prelink.is_none();
         if self.call_depth > self.max_call_depth {
             return Err(Error::runtime(
                 "maximum recursion depth exceeded",
                 crate::error::ErrorCode::StackOverflow,
             ));
         }
-
         // The def's params/body/compiled are read through a reference for
         // the whole call; only a tail-call rebind needs an owned def (the
         // loop's `tc_def`) — the three per-call Rc clones are gone.
@@ -98,22 +114,6 @@ impl Interp {
         // A proc executes in the namespace where it was defined (the
         // qualifiers of its registered name), not the caller's namespace.
         let prev_namespace = self.current_namespace.clone();
-        // Apply's one-shot `info level 0` word (consumed even when the
-        // arity check fails, so it can't leak into a later call).
-        // Same guard as the tailcall marker: `take()` on the (24-byte)
-        // Option is a full replace; `apply` frames are the only ones that
-        // ever arm it.
-        let level0_override = if self.frame_level0_args.is_some() {
-            self.frame_level0_args.take()
-        } else {
-            None
-        };
-        // objc=0 特殊帧（tclsh 析构器）：info level 0 空、不记 CALL。
-        let level0_special = std::mem::take(&mut self.frame_level0_empty);
-        // The OO dispatcher's one-shot variable links (consumed here for
-        // the same leak reason; installed at frame setup below).
-        let prelink = self.frame_prelink.take();
-        let mut prelink_done = prelink.is_none();
 
         // Push a new call frame (a recycled one when the pool has one —
         // the maps keep their allocation and capacity)

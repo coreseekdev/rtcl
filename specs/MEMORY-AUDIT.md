@@ -1,0 +1,145 @@
+# rtcl 运行时内存 / 资源生命周期审计（2026-11-08）
+
+- **行为规格**：[`specs/memory-lifecycle.allium`](memory-lifecycle.allium)
+  （allium 3.6.1，`allium check` 0 error；仅 unused 字段 warning）。
+- **方法**：allium 契约 + 代码审计（`rtcl-vm` / `rtcl-jit`）+
+  OO/通道 churn 探针（RSS 与残留命令/命名空间计数）。
+- **范围**：Value 引用计数、COW、调用帧、解释器缓存、OO 对象图、
+  通道/子进程、JIT host/pool/module。不含 Tcl 语义正确性
+  （见 `DIVERGENCES.md`）。
+
+## 结论（TL;DR）
+
+**Value/帧/错误路径的“即时释放”做得较好；解释器级 teardown、JIT
+线程级缓存、少数脚本可控注册表还不够谨慎。**
+
+- 已经足够谨慎的部分：
+  - `Value` 是手写非原子引用计数 + COW；最后一个 handle 立即
+    `drop_in_place`，list/dict 子值递归释放；盒子经线程级 FREELIST
+    复用（上限 8192）。
+  - 帧出栈会清空 `locals/array_locals/upvars/local_procs/
+    deferred_scripts/slots/level0`；帧池上限 32；`args_pool` 在错误
+    路径也归还。
+  - 普通 `?`/early-return 路径的 Rust 临时值会立即析构；未发现
+    Rc/refcount 环（MethodDef/proc_memo、head_cache、trace、upvar、
+    object<->class、channel handler 均无回指）。
+  - 显式 `close` 会跑 reflected `finalize`/transform `drain`，并
+    `PipeChannel::close` 关闭管道后 `child.wait()`。
+
+- 不够谨慎的部分（本轮已修 / 仍开放）：
+  - **[已修] Fast JIT host arena 无界增长**：fast Store 是线程常驻，
+    `Host::tag_value` 每次宿主结果追加 arena，而 fast 路径从不
+    `arena_truncate`；字符串/列表型 proc 随调用次数增长。
+  - **[已修] wasmtime fast Store 不随 Interp 重绑**：旧 `*mut Interp`
+    可能悬垂；wasmi 已有 rebind，wasmtime 缺失。
+  - **[已修] ChannelTable 无 Drop**：Interp 析构不关通道，pipe 子进程
+    不 wait。现 Drop 逐个 `close()`（文件 Flush/Close、pipe 关管道并
+    wait）。
+  - **[已修] OO 销毁不释放链缓存**：`chain_memo/obj_cache/my_cache/
+    key_memo` 继续持有已销毁对象/类的 `MethodDef`（body Rc、proc_memo、
+    head_cache Value）。
+  - **[已修] `call_proc` 深度检查前未消费一次性状态**：
+    `frame_prelink`/`frame_level0_args` 在超深调用时留在 Interp 上，
+    泄漏到下一次调用（也是正确性问题）。
+  - **[已修] `var_link_cache` 内层无上限**：外层 1024 ns，但单 ns 内
+    可被脚本写入无限多变量名。
+  - **[开放] JIT 线程级 pool/module/engine 无 teardown API**：模块、
+    `Store<Host>`、`Host.arena/consts/source` 上限 64 条后整表清空，
+    但可跨 Interp 存活；键含裸 Interp/ByteCode 指针（地址复用可能
+    假命中；已加 fast Store rebind，classic pool 未改）。
+  - **[开放] `exec &` 显式 `mem::forget(Child)`**：后台子进程 handle
+    永不回收/不 reap（前台成功路径会 wait，错误路径提前 return 也不
+    wait）。Tcl 语义是后台不阻塞，但需要 reaper/teardown。
+  - **[开放] `references` 只增不减**：`ref` 每个值插强引用表，
+    `collect` 是 no-op；脚本可无界持有 Value，直到 Interp drop。
+  - **[开放] `const_pool` 的 CmdSite 持有旧 `Rc<ProcDef>`**：仅 2048
+    条整表 clear 或解释器析构才释放；proc 重定义/删除后旧编译体
+    晚释放（有界但非即时）。
+  - **[开放] `namespace delete` 未清 exec traces**：命令 trace 表按
+    删除/fire 处理，但 `exec_traces` 在命名空间整删路径没有对应
+    wipe/rekey。
+  - **[开放] 线程级 FREELIST 在 thread 退出时不归还**：上限 8192 个
+    ValueInner；进程内线程结束即随 TLS 丢失（小而有界）。
+  - **[开放] `encoding` 全局缓存跨 Interp 无清理**：只有
+    `encoding dirs` 会清；多 Interp/多编码场景可增长。
+  - **[开放] CLI `process::exit` 绕过析构**：`exit`/顶层错误直接
+    `std::process::exit`，所有 Drop（含 ChannelTable close、pipe
+    wait）不执行；这与 Tcl 退出语义一致，但资源回收依赖 OS。
+
+## 契约要点（allium）
+
+`memory-lifecycle.allium` 把资源生命周期写成 8 条规则：
+
+1. `LastValueHandleReleasesPayload`：最后一个 Value handle 释放即清
+   payload（不是等解释器退出）。
+2. `ClosingChannelReleasesOsHandle`：close/teardown 必须释放 fd、
+   kill/wait pipe 子进程、跑 reflected finalizer。
+3. `PoppingFrameReleasesLocals`：出栈释放 locals/upvar/local procs/
+   deferred scripts，复用的帧不残留上一调用的 Value。
+4. `CacheInsertionRespectsLimit`：所有长生命周期缓存有上限，插入时
+   evict/clear，不允许脚本可控无界增长。
+5. `DestroyingObjectReleasesGraph`：销毁对象/类释放其方法体、编译体、
+   per-object 链缓存。
+6. `ShutdownReleasesEverything`：最后一个 Runtime handle drop 后
+   values/channels/frames/objects/JIT modules 归零、caches 清空。
+7. 两个 invariant：released Value 不保留 payload；closed channel 不
+   保留 OS handle；cache entries <= limit。
+
+## 证据（文件:行）
+
+| 关注点 | 证据 |
+|---|---|
+| Value 立即释放 | `crates/rtcl-vm/src/value.rs:566`（Drop）、`:595`（drop_last_owner）、`:514-531`（COW） |
+| 无 Rc 环 | `interp/commands/oo.rs:76-124`（proc_memo/head_cache）、`interp/call.rs`（UpvarLink 索引）、`interp/commands/trace.rs`（回调仅 String） |
+| 帧清理/池 | `interp/call.rs:728-750`、`:1426-1457`（pop + 清字段），`:106` 起（frame_pool） |
+| 一次性状态泄漏（已修） | `interp/call.rs:30-52`（take 移到 depth check 前） |
+| ChannelTable Drop（本轮新增） | `crates/rtcl-vm/src/channel.rs:625` |
+| Pipe close/wait | `channel.rs:1209-1214` |
+| OO 销毁清缓存（本轮新增） | `interp/commands/oo.rs:1765` 起 |
+| OO chain memo 结构/上限 | `interp/commands/oo.rs:349-358`、`:1411-1447` |
+| const_pool CmdSite 持有 ProcDef | `interp/mod.rs:320-347`、`:1273-1300` |
+| var_link 内层上限（本轮新增） | `interp/commands/namespace.rs:184-190` |
+| references 只增 | `interp/commands/introspect.rs:189-203`、`:233-240` |
+| fast arena 基线/截断（本轮新增） | `rtcl-jit/src/host.rs:32`、`:579`；`fast/wasmi.rs:692-694`；`fast/wt.rs:702-704` |
+| fast Store rebind（本轮补 wasmtime） | `fast/wasmi.rs:526-536`、`fast/wt.rs:541-555` |
+| JIT 线程级 pool/module 无 Drop | `classic/wasmi.rs:16-34`、`classic/wt.rs:35-48`、`fast/wasmi.rs:55-65`、`fast/wt.rs:66-82` |
+| exec & forget Child | `interp/commands/exec_cmd.rs:265-273` |
+| namespace delete 不清 exec_traces | `interp/commands/namespace.rs:532-588`（只 fire/retain，无 wipe_cmd_exec_traces） |
+| CLI 直接 exit | `crates/rtcl-cli/src/main.rs:75/80/104/114/131` |
+
+## 本轮修复与验证
+
+1. **ChannelTable Drop**（`channel.rs`）：Interp 析构时逐个 close；文件
+   flush/close、pipe 关管道并 `wait()`。显式 `close` 行为不变。
+2. **Fast JIT arena 截断**（`host.rs` + `fast/wasmi.rs` + `fast/wt.rs`）：
+   `Host.arena_base` 记录常量基线；每次顶层 fast 调用返回前
+   `arena_truncate(base)` 并清 `foreaches`。返回值已 clone，安全。
+3. **Fast Store rebind**：wasmtime fast store 发现 `sh.interp` 变化时
+   重建 store 并清 `WT_FAST_MODULES`；wasmi 路径同样清
+   `FAST_MODULES`，避免跨 Interp 悬垂/滞留。
+4. **OO 销毁即时释放**：`detach_object` 清 `obj_cache/my_cache`，
+   删/清 `chain_memo(_priv)`，清 `key_memo`。
+5. **一次性调用状态**：`call_proc` 在深度检查前 take
+   `frame_prelink/frame_level0_args/frame_level0_empty`，超深错误不再
+   把 Rc/Value 留到下一次调用。
+6. **var_link 内层上限**：单命名空间 256 个名字，超出整内层 clear。
+
+验证：`cargo test -p rtcl-vm --lib` 840/840；judge interp/jit
+88/88；probes 无回归（64 fail 基线）；jitsh fast-tier 三路 88/88；
+wasm32 构建通过。OO churn 探针在 480 次 create/call/destroy 后
+`info commands MemClass*/memobj*` 为 0、命名空间只剩 `::oo ::tcl`；
+RSS 的剩余增长主要来自分配器保留（对象/命令计数不增长），不是
+注册表泄漏。
+
+## 建议的后续优先级
+
+1. **P0**：给 `rtcl-jit` 增加显式 `teardown(interp)`（清该 Interp 的
+   pool/module 条目），CLI/embedder 在 Interp drop 时调用；classic
+   pool 键加 generation/keepalive，避免指针复用假命中。
+2. **P1**：`exec &` 子进程 reaper（每 event loop tick try_wait，Interp
+   drop 时 kill/wait 或显式 detach）；`references` 实现真正 collect
+   （至少 `collect` 统计并释放无外部 handle 的引用）。
+3. **P1**：`namespace delete` 清 `exec_traces`；`const_pool` 在 proc
+   redefine/delete 时移除对应 CmdSite 的 def 强引用（或改 Weak）。
+4. **P2**：`encoding` 缓存加 generation/上限；FREELIST 在 thread 退出
+   前主动释放（TLS destructor）。

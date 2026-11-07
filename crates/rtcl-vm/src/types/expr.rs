@@ -475,7 +475,25 @@ impl<'a> ExprParser<'a> {
             if self.interp.lexical_body {
                 self.interp.next_eval_lexical = true;
             }
-            return self.interp.eval(&cmd);
+            // TIP 280: the bracket script's line 1 is the source line of
+            // its `[`, so a failing command inside it reports the absolute
+            // line (multi-line expression operand).
+            let bracket_line = 1 + self.chars[..self.pos.saturating_sub(1)]
+                .iter()
+                .filter(|c| **c == '\n')
+                .count();
+            let base = (self.interp.cur_cmd_line + self.interp.line_offset).max(1);
+            let saved_offset = self.interp.line_offset;
+            self.interp.line_offset = base - 1 + bracket_line - 1;
+            let r = self.interp.eval(&cmd);
+            self.interp.line_offset = saved_offset;
+            if r.is_err() {
+                // tclsh suppresses the enclosing `expr {...}` frame for an
+                // error raised by a command substitution (the same
+                // word-substitution deferral as `set q [nosuch]`).
+                self.interp.err_from_subst = true;
+            }
+            return r;
         }
 
         // Variable reference
@@ -831,8 +849,23 @@ impl<'a> ExprParser<'a> {
                     }
                     '[' => {
                         self.advance();
+                        let bracket_line = 1 + self.chars[..self.pos.saturating_sub(1)]
+                            .iter()
+                            .filter(|c| **c == '\n')
+                            .count();
+                        let base = (self.interp.cur_cmd_line + self.interp.line_offset).max(1);
+                        let saved_offset = self.interp.line_offset;
+                        self.interp.line_offset = base - 1 + bracket_line - 1;
                         let cmd = self.collect_bracket_command();
-                        let val = self.interp.eval(&cmd)?;
+                        let val = match self.interp.eval(&cmd) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                self.interp.line_offset = saved_offset;
+                                self.interp.err_from_subst = true;
+                                return Err(e);
+                            }
+                        };
+                        self.interp.line_offset = saved_offset;
                         s.push_str(val.as_str());
                     }
                     _ => {

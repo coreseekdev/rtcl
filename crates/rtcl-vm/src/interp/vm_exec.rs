@@ -642,14 +642,28 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                 let text = site.text.slice(&code.source);
                 interp.err_pending_top = Some(Rc::from(text));
                 interp.err_line = st.entry_offset + site.line as usize;
+                // A word/operand bracket error is a substitution-origin
+                // error: an enclosing expr region must not append its own
+                // `expr {...}` frame (tclsh suppresses it).
+                interp.err_from_subst = true;
             }
             Region::Expr(site_idx) => {
                 let site = &code.sites[site_idx];
                 let text = site.text.slice(&code.source);
                 let line = st.entry_offset + site.line as usize;
-                if flow {
+                // An expr region appends its `expr {...}` frame only for
+                // the expr evaluator's own errors (no accumulated frames
+                // yet).  An error that already logged a frame came from a
+                // command substitution (or a nested expr), and tclsh
+                // suppresses every enclosing expr frame in that case.
+                let substitution_origin = interp.err_info.is_some()
+                    || std::mem::take(&mut interp.err_from_subst);
+                if flow || substitution_origin {
                     interp.err_pending_top = Some(Rc::from(text));
                     interp.err_line = line;
+                    if substitution_origin {
+                        interp.err_from_subst = true;
+                    }
                 } else {
                     let msg = e.message_text();
                     interp.err_harness_frame_words(&msg, text, line, None, None);
@@ -1480,6 +1494,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                     | OpCode::LappendVar(_)
                     | OpCode::LappendVarVar(_, _)
                     | OpCode::EvalScript
+                    | OpCode::EvalExpr
             );
             if is_word_op && std::mem::take(&mut interp.err_from_subst) {
                 interp.err_pending_top = Some(Rc::from(text));
@@ -3736,36 +3751,36 @@ mod sub_inline_tests {
 
     #[test]
     fn test_expr_inline_error_framing() {
-        // An error crossing an expr-operand bracket APPENDS the owning
-        // command's frame (eval_expr's bracket is a plain nested eval —
-        // no err_from_subst), unlike a word bracket, which defers.
+        // An error crossing an expr-operand bracket does NOT append the
+        // owning `expr {...}` frame: tclsh treats it as a substitution
+        // error (deferred), exactly like a word bracket.
         let mut interp = Interp::new();
         let r = interp.eval("expr {[nosuch a]}");
         assert!(r.is_err());
         assert_eq!(r.unwrap_err().message_text(), "invalid command name \"nosuch\"");
         let info = interp.err_info.take().unwrap_or_default();
         assert!(info.contains("\"nosuch a\""), "inner frame in {info}");
-        assert!(info.contains("\"expr {[nosuch a]}\""), "appended expr frame in {info}");
+        assert!(!info.contains("expr {[nosuch a]}"), "no expr frame in {info}");
+        assert_eq!(interp.err_pending_top.as_deref(), Some("expr {[nosuch a]}"));
 
-        // Mixed: word bracket defers, expr bracket inside it appends.
+        // Mixed: word bracket defers, and the expr inside it does too.
         let mut interp = Interp::new();
         let r = interp.eval("set x [expr {[nosuch a]}]");
         assert!(r.is_err());
         let info = interp.err_info.take().unwrap_or_default();
         assert!(info.contains("\"nosuch a\""), "inner frame in {info}");
-        assert!(info.contains("\"expr {[nosuch a]}\""), "expr frame in {info}");
+        assert!(!info.contains("expr {[nosuch a]}"), "no expr frame in {info}");
         assert_eq!(interp.err_pending_top.as_deref(), Some("set x [expr {[nosuch a]}]"));
 
-        // Transparent-body suppression: `if`'s body error adds no if frame;
-        // the expr frame still appends (both engines agree, verified vs
-        // tclsh modulo the recorded expr-frame divergence).
+        // Transparent-body suppression: `if`'s body error adds no if frame
+        // and no enclosing expr frame.
         let mut interp = Interp::new();
         let r = interp.eval("expr {1 + [if {1} {error mid}]}");
         assert!(r.is_err());
         assert_eq!(r.unwrap_err().message_text(), "mid");
         let info = interp.err_info.take().unwrap_or_default();
         assert!(info.contains("\"error mid\""), "inner frame in {info}");
-        assert!(info.contains("\"expr {1 + [if {1} {error mid}]}\""), "expr frame in {info}");
+        assert!(!info.contains("expr {1 +"), "no expr frame: {info}");
         assert!(!info.contains("\"if {1} {error mid}\""), "no if frame: {info}");
     }
 
@@ -3801,14 +3816,9 @@ mod sub_inline_tests {
             "catch {deep 3} m\nset ::errorInfo\n",
         ));
         let info = r.unwrap().as_str().to_string();
-        assert!(
-            info.contains("\"expr {[nosuch $n]}\""),
-            "inner expr frame present: {info}"
-        );
-        assert!(
-            info.contains("\"expr {[expr {[nosuch $n]}] + 1} "),
-            "outer expr frame present: {info}"
-        );
+        assert!(info.contains("\"nosuch $n\""), "inner frame: {info}");
+        assert!(!info.contains("\"expr {[nosuch $n]}\""), "no inner expr frame: {info}");
+        assert!(!info.contains("\"expr {[expr"), "no outer expr frame: {info}");
     }
 
     #[test]

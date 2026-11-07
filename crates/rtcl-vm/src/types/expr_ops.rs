@@ -29,6 +29,17 @@ pub(crate) fn as_int_val(v: &Value) -> Result<i64> {
 /// bignum (`9223372036854775807 + 1` is `9223372036854775808`,
 /// tclsh-style).  If either side is float, compute in f64 and the
 /// result stays a float.
+/// Operand type error: Tcl distinguishes the empty string from other
+/// non-numeric text (`can't use empty string as operand of "+"`).
+fn operand_error(empty: bool, op: &str) -> Error {
+    let kind = if empty { "empty" } else { "non-numeric" };
+    Error::Msg(format!("can't use {kind} string as operand of \"{op}\""))
+}
+
+fn pair_operand_error(left: &Value, right: &Value, op: &str) -> Error {
+    operand_error(left.as_str().is_empty() || right.as_str().is_empty(), op)
+}
+
 pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Value> {
     use num_bigint::BigInt;
     use super::bignum::{floor_div as big_div, int_rep, to_value};
@@ -161,9 +172,7 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
             };
             Ok(expr_funcs::float_value(result))
         }
-        _ => Err(Error::Msg(format!(
-            "can't use non-numeric string as operand of \"{op}\""
-        ))),
+        _ => Err(pair_operand_error(left, right, &op.to_string())),
     }
 }
 
@@ -264,9 +273,7 @@ pub(crate) fn int_shift(left: &Value, right: &Value, shl: bool) -> Result<Value>
             }
         }
         Some(IntRep::I64(a)) => Ok(Value::from_int(a >> (count as u32))),
-        None => Err(Error::Msg(format!(
-            "can't use non-numeric string as operand of \"{op}\""
-        ))),
+        None => Err(pair_operand_error(left, right, op)),
     }
 }
 

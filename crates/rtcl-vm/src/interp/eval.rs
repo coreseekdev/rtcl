@@ -636,6 +636,18 @@ impl Interp {
         // is deferred to the top-level report), but a plain variable-read
         // or word-parse failure logs this command's frame (tclsh:
         // `lindex $q [boomq]` with $q unset shows "lindex $q [boomq]").
+        // Expose the invocation for constructs that need the raw source
+        // (`info level 0` inside `namespace eval`) and its position/word
+        // sources (loop constructs recover their body's line offset).
+        // Nested evals swap these out, so each dispatch saves/restores —
+        // the source is one refcount bump, the spans plain copies.
+        let saved_source = std::mem::replace(&mut self.cur_source, Rc::clone(&unit.source));
+        let saved_text = std::mem::replace(&mut self.cur_cmd_text, cmd.text);
+        let saved_line = std::mem::replace(&mut self.cur_cmd_line, cmd.line);
+        let saved_srcs = std::mem::replace(
+            &mut self.cur_cmd_word_srcs,
+            super::util::WordSrcs::from_rc(&cmd.word_srcs),
+        );
         let mut args = Vec::with_capacity(cmd.words.len());
         for word in &cmd.words {
             let value = match self.eval_word(word) {
@@ -677,18 +689,6 @@ impl Interp {
             }
         }
 
-        // Expose the invocation for constructs that need the raw source
-        // (`info level 0` inside `namespace eval`) and its position/word
-        // sources (loop constructs recover their body's line offset).
-        // Nested evals swap these out, so each dispatch saves/restores —
-        // the source is one refcount bump, the spans plain copies.
-        let saved_source = std::mem::replace(&mut self.cur_source, Rc::clone(&unit.source));
-        let saved_text = std::mem::replace(&mut self.cur_cmd_text, cmd.text);
-        let saved_line = std::mem::replace(&mut self.cur_cmd_line, cmd.line);
-        let saved_srcs = std::mem::replace(
-            &mut self.cur_cmd_word_srcs,
-            super::util::WordSrcs::from_rc(&cmd.word_srcs),
-        );
         // Execution enterstep/leavestep traces (tclsh 8.6.17): fire
         // against the enclosing traced proc, if any.  enterstep runs
         // before dispatch; leavestep after, with the completion code and
@@ -719,6 +719,15 @@ impl Interp {
         };
         if let Err(e) = &r {
             if self.err_is_error(e) {
+                if std::mem::take(&mut self.err_from_subst) {
+                    // A command substitution inside this command (expr's
+                    // `[...]` operand) already logged its own frame;
+                    // tclsh does not append the enclosing `expr {...}` /
+                    // `set q [...]` frame.  Defer it to the top-level
+                    // report, where catch consumes it silently.
+                    self.err_pending_top = Some(Rc::from(cmd.text.slice(&unit.source)));
+                    self.err_line = cmd.line + self.line_offset;
+                } else {
                 let msg = e.message_text();
                 let cmd_name = args.first().map(|v| v.as_str()).unwrap_or("");
                 let local_slots = self.lexical_body || self.in_locals_unit;
@@ -730,6 +739,7 @@ impl Interp {
                     Some(&args),
                     hint,
                 );
+                }
             } else if e.is_break()
                 || e.is_continue()
                 || e.is_return() && matches!(e.deferred_code(), 1 | 3 | 4)

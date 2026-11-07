@@ -79,6 +79,59 @@
 
 非缺陷、不再修：`string byterange` 是 rtcl 扩展，tclsh 无此子命令。
 
+## 2026-11-08 增量求值落地 + 第二轮对齐（probes 97 → 80）
+
+设计定谳：**增量求值只属于解释执行路径**。REPL、`-c`、`eval`、
+`uplevel`、`source` 已改为逐命令解析执行（前缀先执行，后面的语法错误
+再报）；`rtcl -f` 是编译运行入口，仍整脚本解析——因此 `-f` 下
+`globprobe`/`pidx*`/`t2-t4` 等 15 个“先输出后语法错”探针是**设计差异，
+不再作为对齐目标**。
+
+本轮收口（commit c956f5b / 0cff469 / 327a960 / c1c3383）：
+- parser `IncrementalScript::next_command` + `Interp::eval_incremental`；
+  source 补 `(file ... line N)` 退出帧；解析错误 `-errorstack` 的
+  `INNER {syntax ...}` 与 catch options 键序；`tcl_quote` 对不平衡
+  花括号改用反斜杠转义（修复 catch options 字典不可解析）。
+- catch `-errorline` 对内联体按 catch 命令行重定基（proc/ns 内）。
+- `::tcl::dict::*` 集成命令可见（绝对键 + stdlib 建命名空间），
+  `dict_p35/p42`、`p35/p42` 通过；`tcl::mathop` 仅 `+`。
+- OO：`must be ... , or ...` 的 Oxford 逗号仅用于 GetIndex 风格列表；
+  `oo::define/objdefine` 多词形式的元数错误带 `oo::define <typed>`；
+  `self <sub>` 拒绝多余参数；`a class` 冠词。oo3/oo7/oo9/oo_dbg1 通过。
+- IO：fileN 取最小空闲号（stdio 占 0..2）；`chan copy` 先校验通道
+  方向再解析选项、选项必须成对；`read` 计数错误 `TCL VALUE NUMBER`；
+  `-eofchar` 取元素首字符；`chan event` 空前缀报 ambiguous。
+  chan_io_p3/p10/p11/p13/p13b/p17/p18/p19/p20 通过。
+
+剩余 80 例（其中 15 例为上述 `-f` 整脚本设计差异，需对齐 65 例）：
+1. 整脚本编译设计差异（15）：`globprobe`、`ix1/2/4`、`cases*`、
+   `pidx*`、`t2/3/4`、`probe_round3`、`r3probe`。
+2. errorInfo/errorstack/return 帧（19）：`ei2`、`expr_bracket_*`、
+   `h_*`、`loops_return_level0_loop_bodies`、`p25/p29/p31`、
+   `probe_catch`、`return_level0_codes`、`sub_inline_*`、
+   `namespace_uplevel*`。含命令替换 `[...]` 的行号归属、内联体帧、
+   dict with/filter 帧、return -code/-level 解码。
+3. 哈希/迭代序与命令面（12）：`array_names_regexp_backref`、`cmds`、
+   `topcmds`、`ic/ic2`、`info2`、`tclns`、`p-uplevel-ns`、`u72`、
+   `trv_p8`、`namespace_varmodel2`、`probe1`。Tcl 哈希插入序 vs
+   rtcl 排序/Rust HashMap 随机种子；命令集超集 + 缺 `socket/tell/
+   ::tcl::prefix/::tcl::pkgconfig` 等。
+4. OO（6）：`oo1`（缺 ::zlib/::oo::Slot 等）、`oo2`、`oo4`（命名空间
+   子项/序）、`oo5`（info object/class 面）、`oo6`、`oo8`（方法内省）。
+5. IO（4）：`chan_io_p15`（chan names 哈希序）、`p2`（socket）、
+   `p5`（read 缓冲/编码）、`p9`（std 通道 seek/tell）。
+6. dict/mathop 命令面（2）：`dict_p40`、`p40`（`::tcl::mathop::*`
+   仅 +；`namespace eval tcl::mathop` 命令清单）。
+7. Unicode/8.6（5）：`probe4`、`probe6`、`probe7`、`utf_U_parsehex`、
+   `utf_char_classes`。tclsh 8.6 的 UCS-2/CESU-8 表示、Unicode 表版本、
+   `format %c` 大码点替换、正则字符类名。
+8. 表达式词法（3）：`bn7/bn8`（nan()/inf()）、`bn13`（浮点移位）。
+9. 大整数表示（2）：`bnprobe2`、`pbr3`。
+10. 汇编/调试（6）：`c5_dis`、`cmp_assemble`、`cmp_unsupported*`、
+    `dbg_basic`、`dbg_trace`。
+11. namespace/变量/trace（6）：`vm3`/`namespace_varmodel`（unset 后
+    回退全局变量）、`trv_d13/p10/p11`、`trace_array_get_firing`。
+
 ## OPEN
 
 ### D-1 `interp alias` 的空解释器参数形式

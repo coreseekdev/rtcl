@@ -7,6 +7,78 @@
 > D-40/41 构造析构与分派面）。条目后括注的
 > spec [D-x] 是规格文件内的 spec-local 编号，以本台账为准。
 
+## 2026-11-07 对齐盘点（judge 88/88；probes 300 pass / 97 fail）
+
+本轮收口（commit 2f2e520）：
+- `string` 子命令改为 tclsh 的唯一前缀解析；未知名按
+  `unknown or ambiguous subcommand ...` + `TCL LOOKUP SUBCOMMAND`；
+  各子命令的最小/最大元数与 usage 文案对齐（含 `string cat` 零参、
+  `length/bytelength/reverse` 精确一元、`trim` 最多一元）。
+- `string compare/equal` 的 `-nocase`/`-length` 按 tclsh 的 argv 窗口
+  解析：恰两词时不解析选项（`string compare -nocase a` 比较字面量），
+  更多词时选项区逐词校验（`bad option "a"`、`--` 不接受、负 length
+  视为全文比较）；`map`/`match`/`is` 同样按词窗解析。
+- `string is` 全 21 类（补 `entier/false/true/wordchar`）与 tclsh 的
+  类名前缀/`ambiguous class`/`bad class` 文案；`-strict` 空串语义
+  （`list` 例外）、`-failindex` 失败字符下标（整数越界 -1、double
+  失败位置、boolean 0）；Tcl 整数（u32/u64/任意精度三档）与
+  double（Inf/NaN/0b/0o/0x/十进制指数）语法扫描。
+- `string tolower/toupper/totitle string ?first? ?last?` 区间语义。
+- 初始化全局：`tcl_patchLevel` 8.6.17、`tcl_rcFileName`、`tcl_pkgPath`；
+  `errorInfo` 延迟到首次错误；`info library`；`info vars/globals/locals`
+  不再枚举数组元素（`set a(1) x` 只报 `a`）。
+- 裸 `$` 变量名只吞 ASCII 字母数字/下划线：`$变量` 是字面量，
+  `${变量}` 仍是变量引用（parser 与 tclsh 8.6 一致）。
+- `update` 元数、`pid` usage 文案。
+
+剩余 97 例按根因分组（括号内为该类探针数）：
+1. **增量求值 vs 整脚本预解析（15）**：`globprobe`、`ix1/2/4`、
+   `cases/cases2`、`pidx/2/3/4`、`t2/t3/t4`、`probe_round3`、`r3probe`。
+   tclsh 边解析边执行，后续语法错误前已有输出；rtcl 先解析整文件。
+   需把 eval 改成流式（或至少顶层按命令边界增量解析/执行）。
+2. **errorInfo/errorstack/return 帧归属（19）**：`ei2`、
+   `expr_bracket_*`、`h_break_proc_boundary`、`h_info_call_chain`、
+   `h_return_options`、`h_teardown_trace_line`、
+   `loops_return_level0_loop_bodies`、`p25/p29/p31`、`probe_catch`、
+   `return_level0_codes`、`sub_inline_*`、`namespace_uplevel*`。
+   涉及内联体帧（if/while/for）、dict with/filter 帧、return -code/
+   -level 解码与 catch options 的帧记录顺序。
+3. **哈希/迭代序与命令面（11）**：`array_names_regexp_backref`、
+   `cmds`、`topcmds`、`ic/ic2`、`info2`、`tclns`、`p-uplevel-ns`、
+   `u72`、`trv_p8`、`namespace_varmodel2`。Tcl 用自研哈希表插入序，
+   rtcl 多为排序或 Rust HashMap（随机种子，跨进程抖动）；且 rtcl
+   命令集是 jimtcl 超集、缺 `::tcl::prefix`/`::tcl::pkgconfig` 等。
+4. **OO（10）**：`oo1`–`oo9`、`oo_dbg1`。namespace children 序、
+   方法可见性/self/next、`must be ... or ...` 连接词、methodtype、
+   objdefine 的 usage 上下文。
+5. **IO/通道（13）**：`chan_io_p2/3/5/9/10/11/13/13b/15/17/18/19/20`。
+   通道编号/复用（fileN 计数、chan names 序）、`read` 计数/
+   `fblocked` 元数、`copy` 方向/选项、`eofchar`、socket、只读/只写
+   方向错误、`-size/-command` 选项窗口。
+6. **dict 命令面（6）**：`dict_p35/p40/p42`、`p35/p40/p42`。
+   `::tcl::dict::*` 集成命令缺失（`info commands ::tcl::dict::*` 空）、
+   dict 子命令 errorCode/`dict info` 形态。
+7. **Unicode/8.6 UCS-2 语义（5）**：`probe4`、`probe6`、`probe7`、
+   `utf_char_classes`、`utf_U_parsehex`。`string length/index` 对增补
+   平面按码元计 2、`\U` 代理对（d842）、Unicode 类表版本差异、正则
+   `[[:class:]]` 对若干类报 invalid。
+8. **表达式词法（3）**：`bn7`、`bn8`、`bn13`。`nan()`/`inf()` 函数
+   识别、浮点 `<<`/`>>` 的操作数错误位置与消息。
+9. **大整数格式化/对象表示（2）**：`bnprobe2`、`pbr3`。`0x` 前缀与
+   十进制混排、refcount/指针/截断的 `tcl::unsupported::representation`
+   文案。
+10. **反汇编/字节码调试面（6）**：`c5_dis`、`cmp_assemble`、
+    `cmp_unsupported/2`、`dbg_basic`、`dbg_trace`。`disassemble` 头/
+    指令名/源码行、`::tcl::unsupported::assemble` 指令集与栈检查、
+    `debug`/`trace` 执行步。
+11. **namespace/变量/trace 模型（6）**：`vm3`（`variable` 无值后
+    unset 回退全局）、`namespace_varmodel`、`trv_d13`、`trv_p10`、
+    `trv_p11`、`trace_array_get_firing`（read trace 触发时机/顺序）。
+12. **命令集计数（1）**：`probe1` 的 `info commands` 计数因超集
+    命令与 `::tcl::*` 缺失而不同（与第 3 类同根）。
+
+非缺陷、不再修：`string byterange` 是 rtcl 扩展，tclsh 无此子命令。
+
 ## OPEN
 
 ### D-1 `interp alias` 的空解释器参数形式

@@ -1614,9 +1614,22 @@ fn reflected_read(interp: &mut Interp, chan_id: &str, count: Option<i64>) -> Res
     if !info.modes.iter().any(|m| m == "read") || !info.methods.iter().any(|m| m == "read") {
         return Err(not_opened(interp, chan_id, true));
     }
-    let want = count.unwrap_or(4096).max(0).to_string();
-    let data = invoke_handler(interp, &info.prefix, &["read", &info.handle, &want])?;
-    let data = data.as_str().to_string();
+    // Tcl always asks a reflected channel for a 4096-byte buffer; the
+    // caller's `read chan N` limit is applied to the returned data
+    // afterwards (`read $ch 2` invokes the handler with 4096 and returns
+    // the first two bytes).
+    let data = invoke_handler(interp, &info.prefix, &["read", &info.handle, "4096"])?;
+    let mut data = data.as_str().to_string();
+    if let Some(n) = count {
+        let n = n.max(0) as usize;
+        if data.len() > n {
+            let mut cut = n.min(data.len());
+            while cut > 0 && !data.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            data.truncate(cut);
+        }
+    }
     if let Some(r) = interp.reflected.get_mut(chan_id) {
         r.at_eof = data.is_empty();
     }

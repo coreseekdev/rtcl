@@ -373,3 +373,11 @@ proc ::tcl::tm::roots {paths} {
     }
     return
 }
+
+# tclsh exposes these as children of ::tcl.  The commands are registered
+# natively (CMD_TABLE_ENSEMBLE), but the namespaces must exist for
+# `info commands ::tcl::dict::*`, `namespace children ::tcl`, and
+# `namespace which` to resolve qualified names.
+namespace eval ::tcl::dict {}
+namespace eval ::tcl::mathop {}
+namespace eval ::tcl::unsupported {}

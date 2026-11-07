@@ -497,7 +497,11 @@ impl Interp {
     /// Resolve the owning scope of a variable name (upvar links followed).
     fn resolve_loc(&self, name: &str) -> VarLoc {
         if let Some(gname) = Self::split_global(name) {
-            return VarLoc::Global(self.redirect_flat(gname));
+            // Leading `::` is absolute: eval-level bare-name aliases
+            // (`variable`/`upvar` at namespace-eval level) never rename a
+            // root-qualified target (`set ::x` must see the global x even
+            // when a namespace body linked its bare `x`).
+            return VarLoc::Global(gname);
         }
         if let Some(frame) = self.frames.last() {
             if let Some(link) = frame.upvars.get(name) {
@@ -563,7 +567,16 @@ impl Interp {
             return None;
         }
         let gkey = self.redirect_flat(bare_name.to_string());
-        self.globals.contains_key(gkey.as_str()).then_some(gkey)
+        if self.globals.contains_key(gkey.as_str()) {
+            return Some(gkey);
+        }
+        // A stale `variable` transient link (its namespace target was
+        // unset) must not hide an existing global of the same bare name:
+        // tclsh's fallback is by name, not through the dead link.
+        if gkey != bare_name && self.globals.contains_key(bare_name) {
+            return Some(bare_name.to_string());
+        }
+        None
     }
 
     /// Dead-link write check (tclsh 8.6.17): only WRITES through an alias
@@ -787,7 +800,7 @@ impl Interp {
 
     fn resolve_var(&self, name: &str) -> Option<&Value> {
         if let Some(gname) = Self::split_global(name) {
-            return self.globals.get(self.redirect_flat(gname).as_str());
+            return self.globals.get(gname.as_str());
         }
         if let Some(frame) = self.frames.last() {
             if let Some(link) = frame.upvars.get(name) {
@@ -837,7 +850,18 @@ impl Interp {
                     return None;
                 }
             }
-            self.globals.get(self.redirect_flat(name.to_string()).as_str())
+            let redirected = self.redirect_flat(name.to_string());
+            if let Some(v) = self.globals.get(redirected.as_str()) {
+                return Some(v);
+            }
+            if redirected != name {
+                // A `variable` link whose target was unset: tclsh's bare
+                // name resolution falls through to the global namespace
+                // (`set x` in namespace eval after `unset x` reads the
+                // global x, when one exists).
+                return self.globals.get(name);
+            }
+            None
         }
     }
 
@@ -854,14 +878,21 @@ impl Interp {
     /// Set a variable in the current scope, following upvar links.
     pub(crate) fn store_var(&mut self, name: &str, value: Value) {
         if let Some(gname) = Self::split_global(name) {
-            let gname = self.redirect_flat(gname);
             self.globals.insert(gname, value);
             return;
         }
         if self.frames.is_empty() {
-            // Inside a namespace every write lands in that namespace's
-            // own variable (tclsh: `set x 9` in `namespace eval n` writes
-            // ::n::x; `variable`-declared names behave the same way).
+            // Bare names in a namespace eval body resolve current ns
+            // first, then the global namespace: an existing global wins
+            // even for writes (`set x 5` in `namespace eval C` writes the
+            // global x), while an absent name is created in the current
+            // namespace (`variable y` + `set y 9` → ::n::y).
+            if !name.contains('(') && !name.contains("::") {
+                if let Some(gkey) = self.ns_chain_global(name) {
+                    self.globals.insert(gkey, value);
+                    return;
+                }
+            }
             let key = self.redirect_flat(self.canonical_global(name));
             self.globals.insert(key, value);
             return;
@@ -963,7 +994,6 @@ impl Interp {
     /// Remove a variable from the current scope, following upvar links.
     fn remove_var(&mut self, name: &str) {
         if let Some(gname) = Self::split_global(name) {
-            let gname = self.redirect_flat(gname);
             self.globals.remove(gname.as_str());
             return;
         }
@@ -1082,13 +1112,12 @@ impl Interp {
                 && !array_name.contains("::")
             {
                 // Unqualified array read outside procs: the current
-                // namespace's `variable`-declared array shadows the global.
-                let alt = VarLoc::Global(format!(
-                    "{}::{}",
-                    &self.current_namespace[2..],
-                    array_name
-                ));
-                if self.loc_is_array(&alt) {
+                // namespace's array wins; otherwise the bare global array
+                // is visible (`set a(g)` in `namespace eval n` reads the
+                // global a).  A `variable a` declaration blocks the
+                // fallback, mirroring scalar resolution.
+                let alt = VarLoc::Global(array_name.to_string());
+                if !self.ns_var_declared(array_name) && self.loc_is_array(&alt) {
                     loc = alt;
                 }
             }
@@ -1504,7 +1533,7 @@ impl Interp {
         //     split_global arm short-circuits the frame walk).  Same
         //     key math, so take and put-back can't split.
         if let Some(gname) = Self::split_global(name) {
-            let key = self.redirect_flat(gname);
+            let key = gname;
             if key.contains('(')
                 || (!self.arrays_env_only && self.array_globals.contains(key.as_str()))
             {

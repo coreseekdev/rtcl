@@ -956,6 +956,10 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 })
                 .collect();
             vars.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            // A namespace variable and a same-named global both render as
+            // the bare tail inside `namespace eval`; tclsh lists the name
+            // once.
+            vars.dedup_by(|a, b| a.as_str() == b.as_str());
             Ok(Value::from_list(&vars))
         }
         "globals" => {

@@ -754,6 +754,15 @@ const INFO_CANONICAL_SUBCMDS: &[&str] = &[
     "sharedlibextension", "tclversion", "vars",
 ];
 
+/// Variable enumeration (`info vars/globals/locals`) lists variable names,
+/// not array elements: `set a(1) x` reports only `a` (tclsh 8.6.17).
+fn is_array_element_name(name: &str) -> bool {
+    name.rsplit("::")
+        .next()
+        .map(|last| last.contains('('))
+        .unwrap_or(false)
+}
+
 /// Resolve an `info` subcommand word: exact matches win (including the
 /// jimtflavored extras rtcl supports), otherwise a unique prefix of
 /// tclsh's canonical set resolves; anything else is tclsh's
@@ -761,7 +770,7 @@ const INFO_CANONICAL_SUBCMDS: &[&str] = &[
 fn resolve_info_subcmd(sub_raw: &str) -> Result<String> {
     const EXACT_KNOWN: &[&str] = &[
         "args", "body", "commands", "complete", "exists", "globals", "hostname", "level",
-        "locals", "nameofexecutable", "patchlevel", "procs", "script", "vars", "alias",
+        "locals", "nameofexecutable", "patchlevel", "library", "procs", "script", "vars", "alias",
         "aliases", "channels", "version", "help", "returncodes", "usage", "frame",
         "stacktrace", "references", "tainted", "statics", "source",
     ];
@@ -873,7 +882,11 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // links are link-only (no locals entry), but tclsh lists them
             // while the link's target exists (master listed them only
             // when an install-time seed had copied a value).
-            let mut names: Vec<String> = source.keys().cloned().collect();
+            let mut names: Vec<String> = source
+                .keys()
+                .filter(|name| !is_array_element_name(name))
+                .cloned()
+                .collect();
             if !qualified {
                 if let Some(frame) = interp.frames.last() {
                     for name in frame.upvars.keys() {
@@ -962,6 +975,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // Namespace variables are not globals (tclsh: `info globals
                 // q::*` on a namespace var returns empty).
                 .filter(|name| !name.contains("::"))
+                .filter(|name| !is_array_element_name(name))
                 .filter(|name| {
                     match_pat
                         .map(|p| super::super::glob_match(p, name))
@@ -1169,6 +1183,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             interp.degrade_frame_all();
             if let Some(frame) = interp.frames.last() {
                 let mut vars: Vec<Value> = frame.locals.keys()
+                    .filter(|name| !is_array_element_name(name))
                     .filter(|name| {
                         pattern.map(|p| super::super::glob_match(p, name)).unwrap_or(true)
                     })
@@ -1194,7 +1209,11 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::from_list(&chans))
         }
         "version" => Ok(Value::from_str("8.6")),
-        "patchlevel" => Ok(Value::from_str("8.6.0-rtcl")),
+        "patchlevel" => Ok(Value::from_str("8.6.17")),
+        "library" => Ok(interp
+            .get_var("::tcl_library")
+            .map(|v| v.clone())
+            .unwrap_or_else(|_| Value::from_str("/usr/share/tcltk/tcl8.6"))),
         "hostname" => {
             #[cfg(feature = "std")]
             {

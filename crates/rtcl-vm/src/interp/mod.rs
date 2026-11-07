@@ -1181,16 +1181,26 @@ impl Interp {
         // --- $tcl_interactive ---
         self.globals.insert("tcl_interactive".to_string(), Value::from_int(0));
 
-        // --- $errorInfo (empty until an error occurs); $errorCode does
-        // not exist until an error sets it (tclsh: info exists → 0) ---
-        self.globals.insert("errorInfo".to_string(), Value::from_str(""));
+        // --- $errorInfo / $errorCode: tclsh 在首个错误前不存在 ---
+
+        // --- $tcl_rcFileName / $tcl_pkgPath (tclsh 初始化值) ---
+        self.globals.insert(
+            "tcl_rcFileName".to_string(),
+            Value::from_str("~/.tclshrc"),
+        );
+        self.globals.insert(
+            "tcl_pkgPath".to_string(),
+            Value::from_str(
+                "/usr/local/lib/tcltk /usr/local/share/tcltk /usr/lib/tcltk/x86_64-linux-gnu /usr/lib/tcltk /usr/share/tcltk /usr/lib/tcltk/tcl8.6 /usr/lib",
+            ),
+        );
 
         // --- $auto_path (empty list — package system can populate later) ---
         self.globals.insert("auto_path".to_string(), Value::from_str(""));
 
         // --- $tcl_version, $tcl_patchLevel ---
         self.globals.insert("tcl_version".to_string(), Value::from_str("8.6"));
-        self.globals.insert("tcl_patchLevel".to_string(), Value::from_str("8.6.0-rtcl"));
+        self.globals.insert("tcl_patchLevel".to_string(), Value::from_str("8.6.17"));
         self.globals.insert("tcl_library".to_string(), Value::from_str("/usr/share/tcltk/tcl8.6"));
     }
 

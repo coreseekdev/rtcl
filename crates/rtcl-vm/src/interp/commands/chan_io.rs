@@ -1680,7 +1680,7 @@ pub fn cmd_pid(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::from_list(&pid_strs))
         }
     } else {
-        Err(Error::wrong_args_with_usage("pid", 1, args.len(), "pid ?channelId?"))
+        Err(Error::wrong_args_with_usage("pid", 1, args.len(), "?channelId?"))
     }
 }
 

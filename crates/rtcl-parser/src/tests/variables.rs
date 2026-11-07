@@ -145,10 +145,16 @@ fn test_array_unclosed_index_bare() {
 
 // --- Unicode content ---
 
-/// UTF-8 variable name (>= 0x80 bytes are valid varname chars).
+/// Tcl 8.6: bare `$` only consumes ASCII alnum/underscore, so a bare
+/// `$变量` stays literal; `${变量}` is still a variable reference.
 #[test]
 fn test_utf8_variable_name() {
     let cmds = parse("set x $变量").unwrap();
+    match &cmds[0].words[2] {
+        Word::Literal(s) => assert_eq!(s, "$变量"),
+        w => panic!("expected Literal($变量), got {:?}", w),
+    }
+    let cmds = parse("set x ${变量}").unwrap();
     match &cmds[0].words[2] {
         Word::VarRef(name) => assert_eq!(name, "变量"),
         w => panic!("expected VarRef(变量), got {:?}", w),

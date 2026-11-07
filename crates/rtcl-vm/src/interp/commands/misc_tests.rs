@@ -534,7 +534,7 @@ fn test_info_vars_global_via_qualified_pattern() {
             .eval("set errorCode NONE; info vars ::err*")
             .unwrap()
             .as_str(),
-        "::errorCode ::errorInfo"
+        "::errorCode"
     );
 }
 
@@ -553,7 +553,7 @@ fn test_info_globals_excludes_namespace_vars() {
             .eval("set errorCode NONE; info globals ::err*")
             .unwrap()
             .as_str(),
-        "errorCode errorInfo"
+        "errorCode"
     );
 }
 
@@ -1203,4 +1203,13 @@ fn test_format_xpg_zero_index_and_caps() {
         .eval(r#"set c [catch {format {%2$*d} 4 5 6} m]; list $c $m"#)
         .unwrap();
     assert_eq!(r.as_str(), "0 {    6}");
+}
+
+#[test]
+fn info_vars_hides_array_elements() {
+    let mut interp = Interp::new();
+    let r = interp
+        .eval("set a(1) x; list [info vars a] [info vars env]")
+        .unwrap();
+    assert_eq!(r.as_str(), "a env");
 }

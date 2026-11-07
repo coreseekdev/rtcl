@@ -189,14 +189,14 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// Is `ch` a valid variable-name character?
+    /// Is `ch` a variable-name character in a bare `$name` reference?
     ///
-    /// Non-ASCII letters (CJK etc.) extend rtcl beyond tclsh, whose bare
-    /// `$` scan is ASCII-only — but only *letters*: absorbing non-ASCII
-    /// symbols (`$ak→` reading the name as `ak→`) breaks standard Tcl
-    /// scripts that paste `$var` against arrows / full-width punctuation.
+    /// tclsh 8.6 scans only ASCII alphanumerics and `_` after a bare `$`;
+    /// non-ASCII names require braces (`${变量}`). Anything
+    /// else is left as literal text (e.g. `$var→` is the value of `var`
+    /// followed by the arrow).
     pub fn is_varname_char(ch: char) -> bool {
-        ch.is_ascii_alphanumeric() || ch == '_' || ch.is_alphabetic()
+        ch.is_ascii_alphanumeric() || ch == '_'
     }
 
     /// Make a parse error at the current position.

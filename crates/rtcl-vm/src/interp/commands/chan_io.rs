@@ -168,18 +168,19 @@ pub fn cmd_read(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // `read channelId numBytes`
     let count: Option<i64> = if i + 1 < args.len() {
-        let v = args[i + 1].as_int().ok_or_else(|| {
-            Error::runtime(
-                format!("expected non-negative integer but got \"{}\"", args[i + 1].as_str()),
-                crate::error::ErrorCode::Generic,
-            )
-        })?;
-        if v < 0 {
-            return Err(Error::runtime(
-                format!("expected non-negative integer but got \"{}\"", args[i + 1].as_str()),
-                crate::error::ErrorCode::Generic,
-            ));
-        }
+        let raw = args[i + 1].as_str();
+        let v = match args[i + 1].as_int() {
+            Some(v) if v >= 0 => v,
+            _ => {
+                // Tcl_GetInt/Tcl_GetWideInt failure at the command site:
+                // tclsh stamps TCL VALUE NUMBER.
+                super::list::set_error_code(interp, "TCL VALUE NUMBER");
+                return Err(Error::runtime(
+                    format!("expected non-negative integer but got \"{}\"", raw),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+        };
         Some(v)
     } else {
         None
@@ -386,7 +387,7 @@ pub fn cmd_eof(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_flush(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::wrong_args_with_usage("flush", 2, args.len(), "flush channelId"));
+        return Err(Error::wrong_args_with_usage("flush", 2, args.len(), "channelId"));
     }
     let chan_id = args[1].as_str();
     if !interp.channels.contains(chan_id) {
@@ -404,7 +405,7 @@ pub fn cmd_flush(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_fblocked(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::wrong_args_with_usage("fblocked", 2, args.len(), "fblocked channelId"));
+        return Err(Error::wrong_args_with_usage("fblocked", 2, args.len(), "channelId"));
     }
     let chan_id = args[1].as_str();
     if interp.reflected.contains_key(chan_id) {
@@ -479,9 +480,12 @@ fn translation_query(
 /// Validate one `-eofchar` element: Tcl allows a single non-NUL ASCII char.
 fn eofchar_element(interp: &mut Interp, val: &str) -> std::result::Result<Option<char>, Error> {
     let mut chars = val.chars();
+    // Tcl uses the first character of each element; the rest of the
+    // element is ignored (`-eofchar ab` means 0x61, and "ab cd" means
+    // input 'a', output 'c').
     match (chars.next(), chars.next()) {
+        (Some(c), _) if c != '\0' && (c as u32) <= 0x7f => Ok(Some(c)),
         (None, _) => Ok(None),
-        (Some(c), None) if c != '\0' && (c as u32) <= 0x7f => Ok(Some(c)),
         _ => {
             super::list::set_error_code(interp, "NONE");
             Err(super::list::tcl_err(
@@ -1047,7 +1051,13 @@ pub fn cmd_chan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 wrong_usage!("chan event channelId event ?script?");
             }
             let event = rest[1].as_str();
-            if resolve_prefix(&["readable", "writable"], event).is_err() {
+            const EVENTS: &[&str] = &["readable", "writable"];
+            let ambiguous = EVENTS
+                .iter()
+                .filter(|e| e.starts_with(event))
+                .count()
+                > 1;
+            if resolve_prefix(EVENTS, event).is_err() {
                 interp.globals.insert(
                     "errorCode".to_string(),
                     Value::from_str(&format!(
@@ -1056,8 +1066,14 @@ pub fn cmd_chan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     )),
                 );
                 interp.err_code_raised = true;
+                // Empty string (or any shared prefix) is ambiguous in
+                // Tcl_GetIndexFromObj; only a non-matching word is "bad".
+                let kind = if ambiguous { "ambiguous" } else { "bad" };
                 return Err(Error::runtime(
-                    format!("bad event name \"{}\": must be readable or writable", event),
+                    format!(
+                        "{} event name \"{}\": must be readable or writable",
+                        kind, event
+                    ),
                     crate::error::ErrorCode::Io,
                 ));
             }
@@ -1399,6 +1415,31 @@ fn chan_copy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 6 {
         return Err(wrong_args());
     }
+    // Options come in pairs; an odd trailing word is a usage error before
+    // any channel lookup (`chan copy a b -size 1 x` → wrong # args even
+    // when `a` is not a channel).
+    if (args.len() - 2) % 2 != 0 {
+        return Err(wrong_args());
+    }
+    let from = args[0].as_str().to_string();
+    let to = args[1].as_str().to_string();
+
+    // Source must be readable, target must be writable.
+    if !interp.channels.contains(&from) {
+        return Err(chan_not_found(interp, &from));
+    }
+    if !interp.channels.get(&from).map(|ch| ch.is_readable()).unwrap_or(false) {
+        return Err(not_opened(interp, &from, true));
+    }
+    if !interp.channels.contains(&to) {
+        return Err(chan_not_found(interp, &to));
+    }
+    if !interp.channels.get(&to).map(|ch| ch.is_writable()).unwrap_or(false) {
+        return Err(not_opened(interp, &to, false));
+    }
+    // tclsh validates the two channel words before looking at options:
+    // `chan copy -size 2 a b` blames channel "-size", and a direction error
+    // wins over a malformed -size value.
     let is_opt = |tok: &str, long: &str| {
         !tok.is_empty() && tok.len() <= long.len() && &long[..tok.len()] == tok
     };
@@ -1447,22 +1488,6 @@ fn chan_copy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             ));
         }
         return Err(wrong_args());
-    }
-    let from = args[0].as_str().to_string();
-    let to = args[1].as_str().to_string();
-
-    // Source must be readable, target must be writable.
-    if !interp.channels.contains(&from) {
-        return Err(chan_not_found(interp, &from));
-    }
-    if !interp.channels.get(&from).map(|ch| ch.is_readable()).unwrap_or(false) {
-        return Err(not_opened(interp, &from, true));
-    }
-    if !interp.channels.contains(&to) {
-        return Err(chan_not_found(interp, &to));
-    }
-    if !interp.channels.get(&to).map(|ch| ch.is_writable()).unwrap_or(false) {
-        return Err(not_opened(interp, &to, false));
     }
     // A negative -size means "no limit" in tclsh.
     let limit = size.filter(|s| *s >= 0);

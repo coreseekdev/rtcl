@@ -607,7 +607,6 @@ pub struct ChannelTable {
     pub system_encoding: String,
     /// `encoding dirs` 的值。
     pub encoding_dirs: String,
-    next_id: u32,
     /// Registration order of live channels (`chan names` is not sorted —
     /// tclsh reports channels in creation order).
     order: Vec<ChannelId>,
@@ -632,7 +631,6 @@ impl ChannelTable {
             encoding_dirs: std::env::var("TCL_LIBRARY")
                 .map(|p| format!("{}/encoding", p))
                 .unwrap_or_else(|_| "/usr/share/tcltk/tcl8.6/encoding".to_string()),
-            next_id: 1,
             order: Vec::new(),
             refl_counter: 0,
             trans_counter: 0,
@@ -721,8 +719,7 @@ impl ChannelTable {
                 Box::new(FileChannel::new_readwrite(f)) as Box<dyn Channel>
             }
         };
-        let id = format!("file{}", self.next_id);
-        self.next_id += 1;
+        let id = self.next_file_name();
         self.track(id.clone());
         self.channels.insert(id.clone(), file);
         // 文件通道默认：输入 auto、输出平台（unix lf）——与 tclsh 的
@@ -764,10 +761,23 @@ impl ChannelTable {
 
     /// Allocate a new file-style channel ID, register the channel, and return the ID.
     pub fn register_new(&mut self, channel: Box<dyn Channel>) -> ChannelId {
-        let id = format!("file{}", self.next_id);
-        self.next_id += 1;
+        let id = self.next_file_name();
         self.register(id.clone(), channel);
         id
+    }
+
+    /// Tcl's file-channel naming: stdio occupy 0..2, and each open takes
+    /// the lowest free `fileN` (closing `file3` makes the next open
+    /// `file3` again — tclsh 8.6.17).
+    fn next_file_name(&self) -> ChannelId {
+        let mut n: u32 = 3;
+        loop {
+            let id = format!("file{}", n);
+            if !self.channels.contains_key(&id) {
+                return id;
+            }
+            n += 1;
+        }
     }
 
     /// Next handle name for a reflected channel (`chan create`): `rc0`, `rc1`, ...

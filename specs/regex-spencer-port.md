@@ -271,11 +271,12 @@ DFA 缓存：颜色类 ≤64、状态 ≤4096；断言模式自动回退 NFA。
 
 | 模式（匹配数） | tclsh 8.6.17 | rtcl Spencer |
 |---|---|---|
-| 纯字面 `abab abab`（104860） | 55 ms | 41 ms |
-| `[a-z]+`（209720） | 38 ms | 79 ms |
-| `\w+`（209720） | 39 ms | 51 ms |
-| `(a+?)(a*)`（419440） | 66 ms | 64 ms |
-| `[a-z]*z`（0，全串扫描） | 2 ms | 1 ms |
+| 纯字面 `abab abab`（104860） | 55 ms | 8 ms |
+| `[a-z]+`（209720） | 38 ms | 21 ms |
+| `\w+`（209720） | 39 ms | 23 ms |
+| `(a+?)(a*)`（419440） | 66 ms | 59 ms |
+| `[a-z]*z`（0，全串扫描） | 2 ms | 3 ms |
+| `[a-z]*abc`（0，全串扫描） | 2 ms | 3 ms |
 
 旧 fast 路径同机 `-all` 为 16 s / 32 s（逐匹配重扫前缀），已不默认。
 关键修复：`collect_matches` 的字节→字符换算改成**单调游标**
@@ -283,8 +284,10 @@ DFA 缓存：颜色类 ≤64、状态 ≤4096；断言模式自动回退 NFA。
 `Vec<char>`/字节表与 `Matcher` 的 DFA 缓存（`captures::exec_with`）；
 `Prog.required_char`（每个匹配必然消耗的一个字面字符）在 ASCII
 文本上用 `str::contains`（memchr）先排除无命中扫描，`-nocase` 时
-按折叠变体检查——`[a-z]*z` 无 `z` 的 1 MiB 全串从 9ms 降到 1ms
-（快于 tclsh 的 2ms）。
+按折叠变体检查，`Prog.required_literal`（长度>1 的必需字面串）
+再做 memmem——`[a-z]*z`/`[a-z]*abc` 无命中的 1 MiB 全串从
+9/16ms 降到 3ms（tclsh 2ms）。无捕获组模式跳过 dissect 直接取整体
+span，使字面/类/`\w+` 的 `-all` 从 42/61/57ms 降到 8/21/23ms。
 
 ### 待做（M2.5 后续）
 

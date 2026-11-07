@@ -93,17 +93,29 @@ impl Matcher {
         search_start: usize,
     ) -> Option<Match> {
         let from = from.min(text.len());
-        // 必需字符预过滤：每个匹配都要消耗该字符；剩余文本没有它
-        // 就不可能命中（-nocase 时按折叠变体检查）。
-        if let Some(c) = prog.required_char {
-            let found = text[from..].iter().any(|&ch| {
-                ch == c
-                    || (prog.icase
-                        && (ch.to_lowercase().next() == Some(c)
-                            || ch.to_uppercase().next() == Some(c)))
-            });
-            if !found {
-                return None;
+        // 必需字面预过滤：每个匹配都要包含该字面串；剩余文本没有它
+        // 就不可能命中（-nocase 时退回单字符折叠检查）。
+        let mut filtered = false;
+        if !prog.icase {
+            if let Some(lit) = &prog.required_literal {
+                let lc: Vec<char> = lit.chars().collect();
+                if !text[from..].windows(lc.len()).any(|w| w == lc.as_slice()) {
+                    return None;
+                }
+                filtered = true;
+            }
+        }
+        if !filtered {
+            if let Some(c) = prog.required_char {
+                let found = text[from..].iter().any(|&ch| {
+                    ch == c
+                        || (prog.icase
+                            && (ch.to_lowercase().next() == Some(c)
+                                || ch.to_uppercase().next() == Some(c)))
+                });
+                if !found {
+                    return None;
+                }
             }
         }
         if let Some(lit) = &prog.pure_literal {

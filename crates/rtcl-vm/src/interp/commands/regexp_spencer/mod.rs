@@ -332,6 +332,26 @@ mod tests {
     }
 
     #[test]
+    fn required_literal_prefilter_is_sound() {
+        assert_eq!(
+            compile("[a-z]*abc", Options::default()).unwrap().required_literal.as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            compile("a.*bc", Options::default()).unwrap().required_literal.as_deref(),
+            Some("bc")
+        );
+        assert_eq!(
+            compile("(?:abc)", Options::default()).unwrap().required_literal.as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            compile("(ab|ac)", Options::default()).unwrap().required_literal,
+            None
+        );
+    }
+
+    #[test]
     fn required_char_prefilter_is_sound() {
         let prog = compile("[a-z]*z", Options::default()).unwrap();
         assert_eq!(prog.required_char, Some('z'));

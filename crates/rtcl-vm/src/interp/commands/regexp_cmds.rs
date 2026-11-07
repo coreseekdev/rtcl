@@ -787,34 +787,60 @@ pub(crate) fn engine_attempt(
                     Some(super::regexp_spencer::matcher::Matcher::new(prog));
             }
             let (chars, byte_at) = cache.text.as_ref().unwrap();
-            // 必需字符预过滤：ASCII 文本用 str::contains（memchr），
-            // 避免无命中时启动 DFA 扫描。
-            if let Some(c) = prog.required_char {
-                if cache.ascii.is_none() {
-                    cache.ascii = Some(full_string.is_ascii());
-                }
-                let from = p.min(chars.len());
-                let found = if cache.ascii == Some(true) && c.is_ascii() {
-                    let suffix = &full_string[byte_at[from]..];
-                    let mut hit = suffix.contains(c);
-                    if !hit && prog.icase {
-                        hit = suffix.contains(c.to_ascii_lowercase())
-                            || suffix.contains(c.to_ascii_uppercase());
+            // 必需字面预过滤：ASCII 非 -nocase 用 str::contains
+            // （memmem）；否则退回必需字符/折叠变体检查。
+            if cache.ascii.is_none() {
+                cache.ascii = Some(full_string.is_ascii());
+            }
+            let ascii = cache.ascii == Some(true);
+            let from = p.min(chars.len());
+            let mut filtered = false;
+            if !prog.icase {
+                if let Some(lit) = &prog.required_literal {
+                    let found = if ascii {
+                        full_string[byte_at[from]..].contains(lit.as_str())
+                    } else {
+                        let lc: Vec<char> = lit.chars().collect();
+                        chars[from..]
+                            .windows(lc.len())
+                            .any(|w| w == lc.as_slice())
+                    };
+                    if !found {
+                        return None;
                     }
-                    hit
-                } else {
-                    chars[from..].iter().any(|&ch| {
-                        ch == c
-                            || (prog.icase
-                                && (ch.to_lowercase().next() == Some(c)
-                                    || ch.to_uppercase().next() == Some(c)))
-                    })
-                };
-                if !found {
-                    return None;
+                    filtered = true;
+                }
+            }
+            if !filtered {
+                if let Some(c) = prog.required_char {
+                    let found = if ascii && c.is_ascii() {
+                        let suffix = &full_string[byte_at[from]..];
+                        let mut hit = suffix.contains(c);
+                        if !hit && prog.icase {
+                            hit = suffix.contains(c.to_ascii_lowercase())
+                                || suffix.contains(c.to_ascii_uppercase());
+                        }
+                        hit
+                    } else {
+                        chars[from..].iter().any(|&ch| {
+                            ch == c
+                                || (prog.icase
+                                    && (ch.to_lowercase().next() == Some(c)
+                                        || ch.to_uppercase().next() == Some(c)))
+                        })
+                    };
+                    if !found {
+                        return None;
+                    }
                 }
             }
             let matcher = cache.matcher.as_mut().unwrap();
+            // 无捕获组时跳过 dissect，只取整体 span（常见类/字面模式
+            // 的 -all 热路径）。
+            if prog.nsubs == 0 {
+                let m = matcher.find(prog, chars, p, search_start)?;
+                return Some(vec![Some((byte_at[m.start], byte_at[m.end]))]);
+            }
             let caps = super::regexp_spencer::captures::exec_with(
                 prog,
                 chars,

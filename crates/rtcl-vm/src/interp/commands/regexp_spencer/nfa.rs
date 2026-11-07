@@ -49,6 +49,8 @@ pub struct Prog {
     /// 用一次线性查找直接排除不可能命中的大文本（无 z 时
     /// `[a-z]*z` 无需启动 DFA）。
     pub required_char: Option<char>,
+    /// 每个匹配必然包含的字面串（长度 >1 时用于 memmem 预过滤）。
+    pub required_literal: Option<String>,
 }
 
 struct Builder {
@@ -190,7 +192,98 @@ pub fn compile(node: &Node, icase: bool) -> Result<Prog, Error> {
         lacons: b.lacons,
         has_backref: has_backref(node),
         required_char: required_char(node),
+        required_literal: required_literal(node).filter(|s| s.chars().count() > 1),
     })
+}
+
+/// 该节点是否只匹配一个固定字面串（用于把相邻纯字面拼成更长串）。
+fn pure_literal_of(node: &Node) -> Option<String> {
+    match &node.kind {
+        NodeKind::Char(c) => char::from_u32(*c).map(|c| c.to_string()),
+        NodeKind::Class(set) => {
+            if !set.neg && !set.no_newline {
+                match set.items.as_slice() {
+                    [super::charset::Item::Range(lo, hi)] if lo == hi => {
+                        char::from_u32(*lo).map(|c| c.to_string())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        NodeKind::Capture { node, .. } | NodeKind::NoRecord(node) => pure_literal_of(node),
+        NodeKind::Concat(v) => {
+            let mut out = String::new();
+            for p in v {
+                out.push_str(&pure_literal_of(p)?);
+            }
+            Some(out)
+        }
+        NodeKind::Repeat { node, min, max } if min == max && *min <= 32 => {
+            let inner = pure_literal_of(node)?;
+            Some(inner.repeat(*min as usize))
+        }
+        NodeKind::Alt(v) => {
+            let first = pure_literal_of(v.first()?)?;
+            if v.iter().all(|b| pure_literal_of(b).as_deref() == Some(first.as_str())) {
+                Some(first)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 每个成功匹配必然包含的字面子串：Concat 的最长纯字面 run、
+/// min>0 重复子节点或所有分支一致的 Alt；回引/环视/断言不贡献。
+fn required_literal(node: &Node) -> Option<String> {
+    match &node.kind {
+        NodeKind::Char(_) | NodeKind::Class(_) => pure_literal_of(node),
+        NodeKind::Capture { node, .. } | NodeKind::NoRecord(node) => required_literal(node),
+        NodeKind::Repeat { node, min, .. } => {
+            if *min > 0 {
+                required_literal(node)
+            } else {
+                None
+            }
+        }
+        NodeKind::Alt(v) => {
+            let first = required_literal(v.first()?)?;
+            if v.iter().all(|b| required_literal(b).as_deref() == Some(first.as_str())) {
+                Some(first)
+            } else {
+                None
+            }
+        }
+        NodeKind::Concat(v) => {
+            let mut best: Option<String> = None;
+            let mut run = String::new();
+            for p in v {
+                if let Some(lit) = pure_literal_of(p) {
+                    run.push_str(&lit);
+                } else {
+                    if run.chars().count() > best.as_ref().map_or(0, |b| b.chars().count()) {
+                        best = Some(run.clone());
+                    }
+                    run.clear();
+                    if let Some(lit) = required_literal(p) {
+                        if lit.chars().count()
+                            > best.as_ref().map_or(0, |b| b.chars().count())
+                        {
+                            best = Some(lit);
+                        }
+                    }
+                }
+            }
+            if run.chars().count() > best.as_ref().map_or(0, |b| b.chars().count()) {
+                best = Some(run);
+            }
+            best
+        }
+        _ => None,
+    }
 }
 
 /// 每个成功匹配必然消耗的一个字面字符：Concat 任一子节点、

@@ -26,3 +26,28 @@ foreach p [list {^$a*\y} {^$a*\Y} {^$\y} {^$\Y} {\A\y\Z} {\A\Y\Z} \
                {^$(\y)} {^$(\y|a)} {^$(\y|\Y)} {^$a*\y|b}] {
     ta $p
 }
+
+# -expanded 下的 -about：注释/空白内容不得贡献 bounds/braces/locale 等
+# 标志；实际忽略过空白或注释则置 REG_UNONPOSIX。
+proc te {hex} {
+    set pat [binary decode hex $hex]
+    if {[catch {regexp -about -expanded -- $pat} m]} {
+        puts "E<$hex> => ERR <$m>"
+    } else {
+        puts "E<$hex> => <$m>"
+    }
+}
+te 6162
+te 612062
+te 61202062
+te 610962
+te 610a62
+te 6123630a62
+te 612023630a2062
+te 23630a6162
+te 615c2062
+te 615b205d62
+te 612023205c645c6e2062
+te 61202320283f3d78295c6e2062
+te 612023207b322c337d0a2062
+te 612023205b5b3a616c7068613a5d5d0a2062

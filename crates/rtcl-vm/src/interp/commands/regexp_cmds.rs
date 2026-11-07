@@ -1389,6 +1389,16 @@ fn pattern_has_upbotch(pat: &str) -> bool {
     false
 }
 
+/// `-about` 需要的生效选项子集（不依赖 regexp_spencer 模块类型，
+/// lite/wasm 构建也能编译）。
+#[derive(Clone, Copy, Default)]
+struct AboutEff {
+    expanded: bool,
+    quote: bool,
+    bre: bool,
+    ere: bool,
+}
+
 /// `-about` 的语法扫描结果（与 tclsh 的 re_info 位一一对应）。
 #[derive(Default)]
 struct AboutLex {
@@ -1490,6 +1500,64 @@ fn about_valid_bre_bound(b: &[u8], i: usize) -> Option<usize> {
         return None;
     }
     Some(j + 2)
+}
+
+/// 去掉 expanded 模式忽略的空白与 `#` 注释（保留转义字符与字符类
+/// 内容），返回 (扫描串, 是否真的忽略过内容)。
+fn strip_expanded(pat: &str, escape_in_class: bool) -> (String, bool) {
+    let b = pat.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let (mut i, mut in_class, mut ignored) = (0usize, false, false);
+    while i < b.len() {
+        let c = b[i];
+        if in_class {
+            if c == b'\\' && escape_in_class && i + 1 < b.len() {
+                out.push(c);
+                out.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            out.push(c);
+            if c == b']' {
+                in_class = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'[' => {
+                in_class = true;
+                out.push(c);
+                i += 1;
+            }
+            b'\\' if i + 1 < b.len() => {
+                out.push(c);
+                out.push(b[i + 1]);
+                i += 2;
+            }
+            b'#' => {
+                ignored = true;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                if i < b.len() {
+                    i += 1;
+                }
+            }
+            c if c.is_ascii_whitespace() => {
+                ignored = true;
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    (
+        String::from_utf8(out).unwrap_or_else(|_| pat.to_string()),
+        ignored,
+    )
 }
 
 /// 字符类里出现反斜杠（任意方言）→ REG_UBBS。`***=` 字面模式除外。
@@ -1661,7 +1729,7 @@ fn about_lex(pat: &str) -> AboutLex {
 
 /// -about 的 REG_UEMPTYMATCH / REG_UIMPOSSIBLE / REG_USHORTEST：
 /// 用 Spencer parser 重新解析获得 subre 树（与命令实际引擎无关）。
-/// 返回 (可空, 不可命中, 根偏好 SHORTER, 类内范围)。
+/// 返回 (可空, 不可命中, 根偏好 SHORTER, 类内范围, 生效 Options)。
 #[cfg(all(feature = "regexp-spencer", any(feature = "regexp", feature = "regexp-lite")))]
 fn engine_about_bits(
     _eng: &Engine,
@@ -1670,18 +1738,24 @@ fn engine_about_bits(
     expanded: bool,
     lineanchor: bool,
     linestop: bool,
-) -> (bool, bool, bool, bool) {
-    match super::regexp_spencer::compile(
+) -> (bool, bool, bool, bool, Option<AboutEff>) {
+    match super::regexp_spencer::compile_with_options(
         pat,
         spencer_options(nocase, expanded, lineanchor, linestop),
     ) {
-        Ok(p) => (
+        Ok((p, effective)) => (
             super::regexp_spencer::ast::nullable_matchable(&p.tree),
             super::regexp_spencer::ast::impossible(&p.tree),
             p.flags.shorter,
             super::regexp_spencer::ast::has_bracket_range(&p.tree),
+            Some(AboutEff {
+                expanded: effective.expanded,
+                quote: effective.quote,
+                bre: effective.bre,
+                ere: effective.ere,
+            }),
         ),
-        Err(_) => (false, false, false, false),
+        Err(_) => (false, false, false, false, None),
     }
 }
 
@@ -1693,8 +1767,8 @@ fn engine_about_bits(
     _expanded: bool,
     _lineanchor: bool,
     _linestop: bool,
-) -> (bool, bool, bool, bool) {
-    (false, false, false, false)
+) -> (bool, bool, bool, bool, Option<AboutEff>) {
+    (false, false, false, false, None)
 }
 
 /// `regexp ?switches? exp string ?matchVar? ?subMatchVar ...?`
@@ -1759,12 +1833,20 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if about {
         let eng = compile_engine_tc(interp, pattern_str, nocase, expanded, lineanchor, linestop)
             .map_err(|e| Error::runtime(e, ErrorCode::Generic))?;
-        let nongreedy = pattern_is_nongreedy(pattern_str);
-        let lex = about_lex(pattern_str);
-        let (empty_ok, impossible, shortest, bracket_range) = engine_about_bits(
-            &eng, pattern_str, nocase, expanded, lineanchor, linestop,
-        );
-        let ubbs = pattern_has_class_backslash(pattern_str);
+        let (empty_ok, impossible, shortest, bracket_range, effective) =
+            engine_about_bits(&eng, pattern_str, nocase, expanded, lineanchor, linestop);
+        let eff_expanded = effective.map(|o| o.expanded).unwrap_or(expanded);
+        let quote = effective.map(|o| o.quote).unwrap_or(false);
+        let escape_in_class = effective.map(|o| !(o.bre || o.ere)).unwrap_or(true);
+        let (scan_owned, expanded_ignored) = if eff_expanded && !quote {
+            strip_expanded(pattern_str, escape_in_class)
+        } else {
+            (pattern_str.to_string(), false)
+        };
+        let scan = scan_owned.as_str();
+        let nongreedy = !quote && pattern_is_nongreedy(scan);
+        let lex = about_lex(scan);
+        let ubbs = pattern_has_class_backslash(scan);
         let mut flags: Vec<&str> = Vec::new();
         // 输出顺序与 tclsh 的 re_info 位序一致：
         // UBACKREF → ULOOKAHEAD → UBOUNDS → UBRACES → UPBOTCH →
@@ -1772,7 +1854,7 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if lex.backref {
             flags.push("REG_UBACKREF");
         }
-        if pattern_has_lookahead(pattern_str) {
+        if pattern_has_lookahead(scan) {
             flags.push("REG_ULOOKAHEAD");
         }
         if lex.bounds {
@@ -1784,13 +1866,13 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if lex.ubsalnum {
             flags.push("REG_UBSALNUM");
         }
-        if pattern_has_upbotch(pattern_str) {
+        if pattern_has_upbotch(scan) {
             flags.push("REG_UPBOTCH");
         }
         if ubbs {
             flags.push("REG_UBBS");
         }
-        if ubbs || pattern_is_nonposix(pattern_str, nongreedy) {
+        if ubbs || expanded_ignored || pattern_is_nonposix(scan, nongreedy) {
             flags.push("REG_UNONPOSIX");
         }
         if lex.unspec {
@@ -1800,7 +1882,7 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             flags.push("REG_UUNPORT");
         }
         // -nocase 本身不置 ULOCALE；只有 Unicode 依赖的类才置。
-        if pattern_uses_ulocale(pattern_str) {
+        if pattern_uses_ulocale(scan) {
             flags.push("REG_ULOCALE");
         }
         // 不可命中的模式 tclsh 不再置 UEMPTYMATCH。
@@ -1828,7 +1910,7 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         };
         return Ok(Value::from_str(&format!(
             "{} {}",
-            engine_group_count(&eng, pattern_str),
+            engine_group_count(&eng, scan),
             flag_str
         )));
     }

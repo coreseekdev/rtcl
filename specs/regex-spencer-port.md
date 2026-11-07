@@ -180,6 +180,10 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   默认特征并入 `rtcl_std`；`RTCL_REGEX_ENGINE=fast` 可退回旧
   fast/BT 路径做差分。门禁：judge 88/88、probes 失败集与基线逐项
   相同（111 个存量非正则项）、4000+759 捕获 0 差异、单元测试 10/10。
+- **`-about` 与 `-expanded`**：标志扫描使用生效选项（命令 `-expanded`
+  与 pattern 前缀 `(?x)/(?t)`、`***=` quote）；注释/被忽略空白不参与
+  bounds/braces/locale/lookahead/backref 等标志，实际忽略过空白或
+  注释则按 tclsh 置 REG_UNONPOSIX。
 - **`-start` 切片语义（命令级，tclsh 实测）**：搜索起点是虚拟串首——
   `\A` 在起点命中；词断言（`\y\m\M\Y`）在起点看不到前一个字符
   （`-start 1 {\m}` 对 "ab" 命中、`\M` 要到串尾）；非 `-lineanchor`

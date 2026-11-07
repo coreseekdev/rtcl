@@ -39,8 +39,17 @@ pub use parser::Options;
 
 /// 编译为 NFA（M2：不含回引/lookahead）。
 pub fn compile(pattern: &str, opts: Options) -> Result<Prog, Error> {
+    compile_with_options(pattern, opts).map(|(prog, _)| prog)
+}
+
+/// 编译并返回前缀/内嵌选项生效后的 Options（-about 需要判断
+/// expanded/quote 等最终状态）。
+pub fn compile_with_options(
+    pattern: &str,
+    opts: Options,
+) -> Result<(Prog, Options), Error> {
     let (tree, effective) = parser::parse_with_options(pattern, opts)?;
-    nfa::compile(&tree, effective.icase)
+    Ok((nfa::compile(&tree, effective.icase)?, effective))
 }
 
 /// 运行时选择。Spencer 移植已是默认引擎；`RTCL_REGEX_ENGINE=fast`

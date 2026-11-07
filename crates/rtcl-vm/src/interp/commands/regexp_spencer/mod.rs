@@ -341,6 +341,23 @@ mod tests {
     }
 
     #[test]
+    fn word_sequence_solver_impossible_edges() {
+        // 需要跨可选节点/混合词性类联立才能证明的不可命中模式。
+        for p in [r"\Ma?\m", r"\Ya*?^\m", r"\m[-a]\m", r"\m[a-]\ma+?\M"] {
+            let prog = compile(p, Options::default()).unwrap();
+            assert!(ast::impossible(&prog.tree), "expected impossible: {}", p);
+        }
+        // 不应误报：边界上下文（匹配前后字符）未知。
+        for p in [r"\M", r"\m", r"\M$", r"a$\y", r"(a)\1"] {
+            let prog = compile(p, Options::default()).unwrap();
+            assert!(!ast::impossible(&prog.tree), "unexpected impossible: {}", p);
+        }
+        // 词边界矛盾仍有不可命中。
+        let prog = compile(r"a$\Y", Options::default()).unwrap();
+        assert!(ast::impossible(&prog.tree));
+    }
+
+    #[test]
     fn required_literal_prefilter_is_sound() {
         assert_eq!(
             compile("[a-z]*abc", Options::default()).unwrap().required_literal.as_deref(),

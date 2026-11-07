@@ -170,10 +170,11 @@ crates/rtcl-vm/src/interp/commands/regexp_spencer/
   验证：BRE/ERE 定向探针 + 2500 pattern × 21 string 随机方言语料
   **0 差异**；`-about` 标准 atom 集 3000 pattern **0 差异**（含
   `^...$` 强制空串下的 `\y\m\M`、锚点邻接词性冲突等边界）。
-  扩展 atom 集 10000 pattern 余 4 例词约束联立边界（`\Ma?\m`、
-  `\m[-a]\m` 等需要“可选节点消耗/跳过 × 类内字符词性”联合
-  求解的 REG_UIMPOSSIBLE；仅 `-about` 标志差异，匹配语义无差异；
-  见 `specs/regex/gen-about-fuzz.py`）。
+  扩展 atom 集 10000 pattern **0 差异**，并额外跑 3 个 seed 共
+  30000 例 0 差异。词约束联立用小型词性序列 NFA 求解（字母表
+  {词,非词}；字符类/回引按过近似，因此“无见证 ⇒ 不可命中”可靠；
+  匹配前后字符词性未知、`$/\Z` 固定串尾非词、`^/\A` 固定串首）。
+  见 `specs/regex/gen-about-fuzz.py`。
 - **M5 完成（默认化）**：`regexp`/`regsub`（`-inline/-indices/-all/
   -start/-about` 与 `regsub` 替换）走 Spencer 引擎；`array names
   -regexp`/`lsort -regexp`/switch 等 `engine_is_match` 消费者同步。

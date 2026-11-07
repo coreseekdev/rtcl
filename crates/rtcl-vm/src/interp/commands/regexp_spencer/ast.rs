@@ -663,7 +663,7 @@ fn concat_forced_empty(parts: &[Node]) -> bool {
 /// 的词约束，或所有分支都不可命中。`empty` 表示当前处于强制空匹配
 /// 上下文（不能消耗任何字符）。
 pub fn impossible(tree: &Node) -> bool {
-    impossible_ctx(tree, false)
+    impossible_ctx(tree, false) || word_solver_says_impossible(tree)
 }
 
 fn impossible_ctx(n: &Node, empty: bool) -> bool {
@@ -860,4 +860,313 @@ pub fn has_bracket_range(n: &Node) -> bool {
         | NodeKind::Look { node, .. } => has_bracket_range(node),
         _ => false,
     }
+}
+
+// ── 词性序列可满足性（-about REG_UIMPOSSIBLE 的补充证明）───────────
+//
+// 把 AST 的“字符词性语言”建成小 NFA（字母表 {W,N}），再把
+// `\m \M \y \Y ^ $ \A \Z` 编码为边界谓词，搜索是否存在一条词性
+// 序列满足全部约束。字符类/回引按**过近似**处理（允许更多词性），
+// 因此“无见证 ⇒ 必然不可匹配”是可靠的；找到见证则不做结论。
+
+const WB_W: u8 = 1;
+const WB_N: u8 = 2;
+const WB_ANY: u8 = 3;
+const WB_MAX_STATES: usize = 8192;
+
+#[derive(Clone, Copy)]
+enum WTrans {
+    Eps(usize),
+    Sym(u8, usize),
+    Assert(AssertKind, usize),
+}
+
+struct WBuilder {
+    states: Vec<Vec<WTrans>>,
+    overflow: bool,
+}
+
+impl WBuilder {
+    fn new_state(&mut self) -> Option<usize> {
+        if self.states.len() >= WB_MAX_STATES {
+            self.overflow = true;
+            return None;
+        }
+        let id = self.states.len();
+        self.states.push(Vec::new());
+        Some(id)
+    }
+
+    fn push(&mut self, st: usize, t: WTrans) {
+        self.states[st].push(t);
+    }
+
+    fn compile(&mut self, node: &Node, next: usize) -> Option<usize> {
+        if self.overflow {
+            return None;
+        }
+        match &node.kind {
+            NodeKind::Empty => Some(next),
+            NodeKind::Char(c) => {
+                let c = char::from_u32(*c)?;
+                let mask = if char_word(c) { WB_W } else { WB_N };
+                let st = self.new_state()?;
+                self.push(st, WTrans::Sym(mask, next));
+                Some(st)
+            }
+            NodeKind::Class(set) => {
+                let mask = charset_word_mask(set);
+                let st = self.new_state()?;
+                self.push(st, WTrans::Sym(mask, next));
+                Some(st)
+            }
+            NodeKind::Assert(k) => {
+                let st = self.new_state()?;
+                self.push(st, WTrans::Assert(*k, next));
+                Some(st)
+            }
+            NodeKind::Concat(v) => {
+                let mut cur = next;
+                for p in v.iter().rev() {
+                    cur = self.compile(p, cur)?;
+                }
+                Some(cur)
+            }
+            NodeKind::Alt(v) => {
+                let st = self.new_state()?;
+                for b in v {
+                    let entry = self.compile(b, next)?;
+                    self.push(st, WTrans::Eps(entry));
+                }
+                Some(st)
+            }
+            NodeKind::Repeat { node, min, max } => {
+                self.compile_repeat(node, *min, *max, next)
+            }
+            NodeKind::Capture { node, .. } | NodeKind::NoRecord(node) => {
+                self.compile(node, next)
+            }
+            // 环视不消耗字符：忽略其内部约束（过近似）。
+            NodeKind::Look { .. } => Some(next),
+            // 回引：按任意长度的任意词性序列过近似（捕获文本可空）。
+            NodeKind::Backref { .. } => {
+                let loop_st = self.new_state()?;
+                self.push(loop_st, WTrans::Eps(next));
+                self.push(loop_st, WTrans::Sym(WB_ANY, loop_st));
+                Some(loop_st)
+            }
+        }
+    }
+
+    fn compile_repeat(
+        &mut self,
+        node: &Node,
+        min: u32,
+        max: u32,
+        next: usize,
+    ) -> Option<usize> {
+        if max >= DUPINF {
+            let loop_st = self.new_state()?;
+            let body = self.compile(node, loop_st)?;
+            self.push(loop_st, WTrans::Eps(body));
+            self.push(loop_st, WTrans::Eps(next));
+            let mut entry = loop_st;
+            for _ in 0..min {
+                entry = self.compile(node, entry)?;
+            }
+            Some(entry)
+        } else {
+            let mut cur = next;
+            for _ in 0..min {
+                cur = self.compile(node, cur)?;
+            }
+            for _ in 0..(max - min) {
+                let body = self.compile(node, cur)?;
+                let st = self.new_state()?;
+                self.push(st, WTrans::Eps(body));
+                self.push(st, WTrans::Eps(cur));
+                cur = st;
+            }
+            Some(cur)
+        }
+    }
+}
+
+/// 字符类可能的词性集合（**过近似**：不确定时返回 {W,N}）。
+fn charset_word_mask(set: &CharSet) -> u8 {
+    if set.neg {
+        return WB_ANY;
+    }
+    let mut mask = 0u8;
+    for it in &set.items {
+        let m = match it {
+            super::charset::Item::Range(lo, hi) if lo == hi => {
+                match char::from_u32(*lo) {
+                    Some(c) if char_word(c) => WB_W,
+                    Some(_) => WB_N,
+                    None => WB_ANY,
+                }
+            }
+            // 多字符范围可能跨越词/非词，保守取全集。
+            super::charset::Item::Range(_, _) => WB_ANY,
+            super::charset::Item::Pred(p) => pred_word_mask(*p),
+        };
+        mask |= m;
+    }
+    if mask == 0 {
+        // 实际不匹配任何字符（例如类为空）：给一个死符号。
+        return 0;
+    }
+    mask
+}
+
+fn pred_word_mask(p: super::charset::Pred) -> u8 {
+    use super::charset::Pred::*;
+    match p {
+        Word | Alnum | Alpha | Lower | Upper | Digit | XDigit => WB_W,
+        NotWord | Space | Blank | Punct | Cntrl => WB_N,
+        NotDigit | NotSpace | Graph | Print => WB_ANY,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct WState {
+    node: u32,
+    prev: u8,
+    consumed: bool,
+    /// 后续字符必须允许的词性（3=无约束，0=不允许任何字符）。
+    next_mask: u8,
+    /// 已经过 $/\Z：后面不允许再消耗字符。
+    at_end: bool,
+}
+
+fn word_solver_says_impossible(tree: &Node) -> bool {
+    let mut b = WBuilder {
+        states: Vec::new(),
+        overflow: false,
+    };
+    let accept = match b.new_state() {
+        Some(s) => s,
+        None => return false,
+    };
+    let start = match b.compile(tree, accept) {
+        Some(s) => s,
+        None => return false,
+    };
+    if b.overflow {
+        return false;
+    }
+
+    // 匹配起点前的字符词性未知（可在词/非词之后开始）；串首锚点
+    // 会通过 prev==N 约束排除词后起点。
+    let mut stack = vec![
+        WState {
+            node: start as u32,
+            prev: WB_N,
+            consumed: false,
+            next_mask: WB_ANY,
+            at_end: false,
+        },
+        WState {
+            node: start as u32,
+            prev: WB_W,
+            consumed: false,
+            next_mask: WB_ANY,
+            at_end: false,
+        },
+    ];
+    let mut seen: std::collections::HashSet<WState> = std::collections::HashSet::new();
+    while let Some(st) = stack.pop() {
+        if !seen.insert(st) {
+            continue;
+        }
+        let n = st.node as usize;
+        if n == accept {
+            // 未经过串尾锚点时，匹配后的下一个字符词性未知（W/N
+            // 均可）；经过 $/\Z 时只能是串尾虚拟非词。
+            let ok = if st.at_end {
+                st.next_mask & WB_N != 0
+            } else {
+                st.next_mask != 0
+            };
+            if ok {
+                return false;
+            }
+            continue;
+        }
+        for t in &b.states[n] {
+            match t {
+                WTrans::Eps(to) => stack.push(WState {
+                    node: *to as u32,
+                    ..st
+                }),
+                WTrans::Sym(mask, to) => {
+                    if st.at_end {
+                        continue;
+                    }
+                    for w in [WB_W, WB_N] {
+                        if mask & w == 0 {
+                            continue;
+                        }
+                        if st.next_mask & w == 0 {
+                            continue;
+                        }
+                        stack.push(WState {
+                            node: *to as u32,
+                            prev: w,
+                            consumed: true,
+                            next_mask: WB_ANY,
+                            at_end: false,
+                        });
+                    }
+                }
+                WTrans::Assert(k, to) => {
+                    let mut ns = st;
+                    let ok = match k {
+                        AssertKind::Bos | AssertKind::Bot => {
+                            !st.consumed && st.prev == WB_N
+                        }
+                        AssertKind::Bol => st.prev == WB_N,
+                        AssertKind::Eos => {
+                            ns.at_end = true;
+                            true
+                        }
+                        AssertKind::Eol => {
+                            ns.next_mask &= WB_N;
+                            true
+                        }
+                        AssertKind::WordStart => {
+                            if st.prev != WB_N {
+                                false
+                            } else {
+                                ns.next_mask &= WB_W;
+                                true
+                            }
+                        }
+                        AssertKind::WordEnd => {
+                            if st.prev != WB_W {
+                                false
+                            } else {
+                                ns.next_mask &= WB_N;
+                                true
+                            }
+                        }
+                        AssertKind::WordB => {
+                            ns.next_mask &= if st.prev == WB_W { WB_N } else { WB_W };
+                            true
+                        }
+                        AssertKind::NotWordB => {
+                            ns.next_mask &= st.prev;
+                            true
+                        }
+                    };
+                    if ok && ns.next_mask != 0 {
+                        ns.node = *to as u32;
+                        stack.push(ns);
+                    }
+                }
+            }
+        }
+    }
+    true
 }

@@ -37,6 +37,8 @@ pub enum WidgetKind {
     Notebook,
     /// `ttk::combobox`: an entry with a value list.
     Combobox,
+    /// `ttk::treeview`: headings plus a tree of items.
+    Treeview,
 }
 
 impl WidgetKind {
@@ -58,6 +60,7 @@ impl WidgetKind {
             "progressbar" => Self::Progressbar,
             "notebook" => Self::Notebook,
             "combobox" => Self::Combobox,
+            "treeview" => Self::Treeview,
             _ => return None,
         })
     }
@@ -81,6 +84,7 @@ impl WidgetKind {
             Self::Progressbar => "TProgressbar",
             Self::Notebook => "TNotebook",
             Self::Combobox => "TCombobox",
+            Self::Treeview => "Treeview",
         }
     }
 
@@ -1080,6 +1084,20 @@ const NOTEBOOK_OPTIONS: &[&str] = &[
     "-width",
 ];
 
+const TREEVIEW_OPTIONS: &[&str] = &[
+    "-columns",
+    "-cursor",
+    "-displaycolumns",
+    "-height",
+    "-padding",
+    "-selectmode",
+    "-show",
+    "-style",
+    "-takefocus",
+    "-xscrollcommand",
+    "-yscrollcommand",
+];
+
 const COMBOBOX_OPTIONS: &[&str] = &[
     "-background",
     "-cursor",
@@ -1120,6 +1138,7 @@ pub fn known_options(kind: WidgetKind) -> &'static [&'static str] {
         WidgetKind::Progressbar => PROGRESSBAR_OPTIONS,
         WidgetKind::Notebook => NOTEBOOK_OPTIONS,
         WidgetKind::Combobox => COMBOBOX_OPTIONS,
+        WidgetKind::Treeview => TREEVIEW_OPTIONS,
     }
 }
 
@@ -1147,6 +1166,7 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
             WidgetKind::Text => "24",
             WidgetKind::Listbox => "10",
             WidgetKind::Combobox => "10",
+            WidgetKind::Treeview => "10",
             _ => "0",
         },
         "-text" | "-label" | "-textvariable" | "-variable" | "-command" => "",
@@ -1190,7 +1210,10 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
         "-wrap" => "char",
         "-undo" | "-maxundo" | "-spacing1" | "-spacing2" | "-spacing3" | "-tabs" => "0",
         "-insertbackground" | "-selectbackground" | "-selectforeground" => "",
-        "-selectmode" => "browse",
+        "-selectmode" => match kind {
+            WidgetKind::Treeview => "extended",
+            _ => "browse",
+        },
         "-activestyle" => "underline",
         "-listvariable" | "-selectborderwidth" | "-setgrid" => "",
         "-indicatoron" => "1",

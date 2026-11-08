@@ -134,7 +134,7 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 | M1a ✅ | rtcl-vm `tk` 命令层：frame/label/button/entry/… 创建、configure/cget、pack/grid、destroy、winfo、wm/tk；per-widget 路径命令；teardown 自动清树；4 条单测 | `button .b -text Hi; cget .b -text` 等 Tcl 脚本语义通过 |
 | M1b ✅ | nsh 后端最小集（frame/label/button/entry）+ TkView；按钮 `-command` 执行 Tcl，按钮文本经 signal 刷新；GTK4 demo + headless 验收 | `nsh-testing`：初始 "Click me" 渲染 → press → "Clicked 1" → press → "Clicked 2"；`cargo run -p rtcl-tk-demo` 打开 GTK4 窗口 |
 | M2 ✅ | pack/grid/place、bind/event generate、after/update、`-textvariable` 双向、entry/text/listbox/scale 数据子命令、winfo/wm 扩展、ttk 别名、focus/raise/font/option；message/scrollbar/separator/progressbar；整树 dynamic 重建 | 经典 grid/pack 表单脚本通过（`classic_nsh`）；demo 双态截图；tk 单测 19 + headless 验收 2 |
-| M3 | ttk treeview、原生系统菜单栏、主题/DPI/IME/a11y 细化；notebook/combobox 已完成 | 设置页/表单/列表演示 |
+| M3 ◐ | ttk notebook/combobox/treeview ✅；原生系统菜单栏、主题/DPI/IME/a11y 细化待做 | 设置页/表单/列表演示（classic demo + headless 验收） |
 | M4 | 虚拟化 table/log/tree/chart + iOS/Android embed + 打包 | 手机/桌面同一 Tcl 脚本跑通 |
 
 ## 7. 主要风险
@@ -161,12 +161,12 @@ M1a/M1b/M2 已完成：
 - `apps/rtcl-tk-demo`：GTK4 runner + headless 验收
   （`tk_nsh`、`classic_nsh`）+ `shot` 截图 bin。
 
-## 9. 已实现命令面与差异（M2 + M3 起始）
+## 9. 已实现命令面与差异（M2/M3）
 
 **控件**：`toplevel/frame/label/button/entry/checkbutton/radiobutton/
 scale/text/listbox/message/scrollbar` + `ttk::{separator,progressbar,
-notebook,combobox,button,label,entry,frame,checkbutton,radiobutton,scale,
-text,listbox,scrollbar,message}` 别名。
+notebook,combobox,treeview,button,label,entry,frame,checkbutton,
+radiobutton,scale,text,listbox,scrollbar,message}` 别名。
 
 **命令**：`configure/cget/cget 前缀缩写/destroy/pack/grid/place/winfo/
 wm/tk/bind/bindtags/event generate/focus/raise/lower/font/option/bell/
@@ -174,7 +174,9 @@ tk_focusNext/tk_focusPrev/menu`；控件子命令含 `invoke/get/insert/delete/
 index/icursor/selection/size/curselection/step` 等；菜单子命令含
 `add/insert/delete/index/entrycget/entryconfigure/invoke/type/post/
 unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
-`ttk::combobox` 的 `get/set/current/values/post/unpost`；Tcl 侧的 `after/update/vwait` 沿用 rtcl-vm。
+`ttk::combobox` 的 `get/set/current/values/post/unpost`；
+`ttk::treeview` 的 `insert/delete/item/selection/focus/children/parent/
+index/heading/column/exists`；Tcl 侧的 `after/update/vwait` 沿用 rtcl-vm。
 
 **菜单**：`menu` 窗口与 `-menu` 关联的菜单栏在 app 内渲染为一行
 cascade 按钮 + 浮层下拉（command/checkbutton/radiobutton/separator/
@@ -191,7 +193,7 @@ flex 权重；place 支持绝对坐标与 `-relwidth/-relheight`，相对坐标�
 
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停
 绘制，长等待请用 `after` 回调）；未实现 Canvas、photo image、text tag、
-ttk treeview、多 toplevel 窗口；菜单栏是 app 内浮层
+多 toplevel 窗口；菜单栏是 app 内浮层
 而非 OS 原生菜单；`scrollbar` 目前是静态外观，不驱动 listbox/text
 滚动。
 
@@ -215,6 +217,6 @@ cargo run -p rtcl-tk-demo --bin shot -- /tmp/tk-classic.png --classic
 cargo test -p rtcl-tk-core -p rtcl-tk-runtime -p rtcl-tk-nsh -p rtcl-tk-demo
 ```
 
-下一步（M3）：`ttk::treeview`、原生
-系统菜单栏、`ttk::treeview`、滚动条联动、主题与 DPI、IME/无障碍细化；随后 iOS/Android
+下一步（M3 收尾）：原生
+系统菜单栏、滚动条联动、主题与 DPI、IME/无障碍细化；随后 iOS/Android
 platform crates 与真机。

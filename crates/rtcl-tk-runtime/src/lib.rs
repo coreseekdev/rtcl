@@ -59,6 +59,29 @@ pub struct TkRuntime {
     notebook_selected: BTreeMap<String, usize>,
     /// The combobox whose value list is dropped down.
     open_combobox: Option<String>,
+    /// `ttk::treeview` models.
+    treeviews: BTreeMap<String, TreeViewState>,
+}
+
+/// One row of a `ttk::treeview`.
+#[derive(Debug, Clone, Default)]
+pub struct TreeItem {
+    pub id: String,
+    pub parent: Option<String>,
+    pub text: String,
+    pub values: Vec<String>,
+    pub open: bool,
+}
+
+/// A `ttk::treeview`: columns, headings and items in insertion order.
+#[derive(Debug, Clone, Default)]
+pub struct TreeViewState {
+    pub columns: Vec<String>,
+    pub headings: BTreeMap<String, String>,
+    pub items: Vec<TreeItem>,
+    pub selected: BTreeSet<String>,
+    pub focus: Option<String>,
+    next_id: u64,
 }
 
 /// One entry of a Tk `menu`.
@@ -323,6 +346,8 @@ pub fn install(interp: &mut Interp) {
         "combobox",
         "ttk::notebook",
         "ttk::combobox",
+        "treeview",
+        "ttk::treeview",
     ] {
         interp.register_command(name, create_widget);
     }
@@ -595,6 +620,20 @@ fn initialize_widget(interp: &mut Interp, path: &str, kind: WidgetKind) -> Resul
                     });
                 }
             }
+        }
+        WidgetKind::Treeview => {
+            let columns = effective_option(interp, path, "-columns");
+            let columns = Value::from_str(&columns)
+                .as_list()
+                .map(|list| {
+                    list.iter()
+                        .map(|v| v.as_str().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            with_state_mut(interp, |rt| {
+                rt.treeviews.entry(path.to_string()).or_default().columns = columns;
+            });
         }
         _ => {}
     }
@@ -1018,6 +1057,195 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 _ => bad_subcommand(kind, sub),
             },
+            WidgetKind::Treeview => match sub {
+                "insert" => {
+                    if args.len() < 4 {
+                        return Err(wrong(
+                            "insert",
+                            "parent index ?-option value ...?",
+                            args.len(),
+                        ));
+                    }
+                    treeview_insert(interp, path, args[2].as_str(), &args[4..])
+                }
+                "delete" => {
+                    for a in &args[2..] {
+                        treeview_delete(interp, path, a.as_str())?;
+                    }
+                    Ok(Value::empty())
+                }
+                "item" => {
+                    if args.len() < 3 {
+                        return Err(wrong("item", "item ?-option? ?value ...?", args.len()));
+                    }
+                    treeview_item(interp, path, args[2].as_str(), &args[3..])
+                }
+                "exists" => Ok(Value::from_bool(args.get(2).is_some_and(|v| {
+                    with_state(interp, |rt| {
+                        rt.treeviews
+                            .get(path)
+                            .is_some_and(|tv| tv.items.iter().any(|i| i.id == v.as_str()))
+                    })
+                    .unwrap_or(false)
+                }))),
+                "children" => {
+                    if args.len() != 3 {
+                        return Err(wrong("children", "item", args.len()));
+                    }
+                    let parent = if args[2].as_str().is_empty() {
+                        None
+                    } else {
+                        Some(args[2].as_str().to_string())
+                    };
+                    let kids = with_state(interp, |rt| {
+                        rt.treeviews.get(path).map(|tv| {
+                            tv.items
+                                .iter()
+                                .filter(|i| i.parent == parent)
+                                .map(|i| i.id.clone())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .flatten()
+                    .unwrap_or_default();
+                    Ok(list_value(kids))
+                }
+                "parent" => {
+                    if args.len() != 3 {
+                        return Err(wrong("parent", "item", args.len()));
+                    }
+                    let parent = with_state(interp, |rt| {
+                        rt.treeviews.get(path).and_then(|tv| {
+                            tv.items
+                                .iter()
+                                .find(|i| i.id == args[2].as_str())
+                                .and_then(|i| i.parent.clone())
+                        })
+                    })
+                    .flatten()
+                    .unwrap_or_default();
+                    Ok(Value::from_str(&parent))
+                }
+                "index" => {
+                    if args.len() != 3 {
+                        return Err(wrong("index", "item", args.len()));
+                    }
+                    let index = with_state(interp, |rt| {
+                        rt.treeviews.get(path).and_then(|tv| {
+                            let item = tv.items.iter().find(|i| i.id == args[2].as_str())?;
+                            Some(
+                                tv.items
+                                    .iter()
+                                    .filter(|i| i.parent == item.parent)
+                                    .position(|i| i.id == item.id)
+                                    .unwrap_or(0) as i64,
+                            )
+                        })
+                    })
+                    .flatten()
+                    .unwrap_or(-1);
+                    Ok(Value::from_int(index))
+                }
+                "selection" => {
+                    if args.len() == 2 {
+                        let selected = with_state(interp, |rt| {
+                            rt.treeviews
+                                .get(path)
+                                .map(|tv| tv.selected.iter().cloned().collect::<Vec<_>>())
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                        return Ok(list_value(selected));
+                    }
+                    let op = args[2].as_str();
+                    let ids = args
+                        .get(3..)
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|v| v.as_str().to_string())
+                        .collect::<Vec<_>>();
+                    with_state_mut(interp, |rt| {
+                        if let Some(tv) = rt.treeviews.get_mut(path) {
+                            match op {
+                                "set" => {
+                                    tv.selected = ids.iter().cloned().collect();
+                                    tv.focus = ids.first().cloned();
+                                }
+                                "add" => tv.selected.extend(ids.iter().cloned()),
+                                "remove" => {
+                                    for id in &ids {
+                                        tv.selected.remove(id);
+                                    }
+                                }
+                                "toggle" => {
+                                    for id in &ids {
+                                        if !tv.selected.remove(id) {
+                                            tv.selected.insert(id.clone());
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            rt.bump();
+                        }
+                    });
+                    let selected = with_state(interp, |rt| {
+                        rt.treeviews
+                            .get(path)
+                            .map(|tv| tv.selected.iter().cloned().collect::<Vec<_>>())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                    Ok(list_value(selected))
+                }
+                "focus" => {
+                    let focus = with_state(interp, |rt| {
+                        rt.treeviews.get(path).and_then(|tv| tv.focus.clone())
+                    })
+                    .flatten()
+                    .unwrap_or_default();
+                    if args.len() > 2 {
+                        let id = args[2].as_str().to_string();
+                        with_state_mut(interp, |rt| {
+                            if let Some(tv) = rt.treeviews.get_mut(path) {
+                                tv.focus = Some(id);
+                                rt.bump();
+                            }
+                        });
+                        Ok(Value::empty())
+                    } else {
+                        Ok(Value::from_str(&focus))
+                    }
+                }
+                "heading" => {
+                    if args.len() < 3 {
+                        return Err(wrong("heading", "column ?-option? ?value?", args.len()));
+                    }
+                    let column = args[2].as_str().to_string();
+                    if args.len() == 3 {
+                        let text = with_state(interp, |rt| {
+                            rt.treeviews
+                                .get(path)
+                                .and_then(|tv| tv.headings.get(&column).cloned())
+                        })
+                        .flatten()
+                        .unwrap_or_default();
+                        return Ok(Value::from_str(&text));
+                    }
+                    if args.len() == 5 && args[3].as_str() == "-text" {
+                        let text = args[4].as_str().to_string();
+                        with_state_mut(interp, |rt| {
+                            if let Some(tv) = rt.treeviews.get_mut(path) {
+                                tv.headings.insert(column, text);
+                                rt.bump();
+                            }
+                        });
+                    }
+                    Ok(Value::empty())
+                }
+                "column" | "tag" | "see" | "xview" | "yview" => Ok(Value::empty()),
+                _ => bad_subcommand(kind, sub),
+            },
             _ => bad_subcommand(kind, sub),
         },
     }
@@ -1049,6 +1277,9 @@ fn bad_subcommand(kind: WidgetKind, sub: &str) -> Result<Value> {
             }
             WidgetKind::Combobox => {
                 "cget, configure, current, destroy, get, post, set, unpost, values"
+            }
+            WidgetKind::Treeview => {
+                "children, column, delete, exists, focus, heading, index, insert, item, parent, see, selection, tag"
             }
             _ => "cget, configure, destroy",
     };
@@ -1317,6 +1548,7 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
     }
     with_state_mut(interp, |rt| {
         rt.tree.destroy(path).map_err(tk_error)?;
+        rt.treeviews.remove(path);
         rt.bump();
         Ok::<(), Error>(())
     })
@@ -1725,6 +1957,7 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
                 }
             }
             WidgetKind::Frame | WidgetKind::Toplevel | WidgetKind::Notebook => (w_opt, h_opt),
+            WidgetKind::Treeview => (300, h_opt.max(1) * 22),
             WidgetKind::Scrollbar => {
                 if opt("-orient") == "horizontal" {
                     (100, 16)
@@ -3369,6 +3602,203 @@ pub fn scale_changed(path: &str, value: f64) {
     }
 }
 
+fn treeview_insert(interp: &mut Interp, path: &str, parent: &str, rest: &[Value]) -> Result<Value> {
+    let parent = if parent.is_empty() {
+        None
+    } else {
+        Some(parent.to_string())
+    };
+    let mut text = String::new();
+    let mut values = Vec::new();
+    let mut open = false;
+    let mut id = None;
+    for (k, v) in parse_pairs(rest, 0, "treeview insert")? {
+        match k.as_str() {
+            "-text" => text = v,
+            "-values" => {
+                values = Value::from_str(&v)
+                    .as_list()
+                    .map(|list| list.iter().map(|x| x.as_str().to_string()).collect())
+                    .unwrap_or_default();
+            }
+            "-open" => open = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+            "-id" => id = Some(v),
+            "-tags" | "-image" => {}
+            _ => return Err(bad_option(&k)),
+        }
+    }
+    let mut result = String::new();
+    with_state_mut(interp, |rt| {
+        let tv = rt.treeviews.entry(path.to_string()).or_default();
+        if let Some(parent) = &parent {
+            if !tv.items.iter().any(|i| i.id == *parent) {
+                return Err(generic(format!("item \"{parent}\" doesn't exist")));
+            }
+        }
+        let id = match id {
+            Some(id) => id,
+            None => {
+                tv.next_id += 1;
+                format!("I{:03}", tv.next_id)
+            }
+        };
+        if tv.items.iter().any(|i| i.id == id) {
+            return Err(generic(format!("item \"{id}\" already exists")));
+        }
+        tv.items.push(TreeItem {
+            id: id.clone(),
+            parent,
+            text,
+            values,
+            open,
+        });
+        rt.bump();
+        result = id;
+        Ok::<(), Error>(())
+    })
+    .ok_or_else(|| bad_window(path))??;
+    Ok(Value::from_str(&result))
+}
+
+fn treeview_delete(interp: &mut Interp, path: &str, id: &str) -> Result<()> {
+    with_state_mut(interp, |rt| {
+        if let Some(tv) = rt.treeviews.get_mut(path) {
+            let mut doomed = BTreeSet::new();
+            let mut stack = vec![id.to_string()];
+            while let Some(current) = stack.pop() {
+                if doomed.insert(current.clone()) {
+                    stack.extend(
+                        tv.items
+                            .iter()
+                            .filter(|i| i.parent.as_deref() == Some(current.as_str()))
+                            .map(|i| i.id.clone()),
+                    );
+                }
+            }
+            tv.items.retain(|i| !doomed.contains(&i.id));
+            tv.selected.retain(|i| !doomed.contains(i));
+            if tv.focus.as_ref().is_some_and(|f| doomed.contains(f)) {
+                tv.focus = None;
+            }
+            rt.bump();
+        }
+    });
+    Ok(())
+}
+
+fn treeview_item(interp: &mut Interp, path: &str, id: &str, rest: &[Value]) -> Result<Value> {
+    let exists = with_state(interp, |rt| {
+        rt.treeviews
+            .get(path)
+            .is_some_and(|tv| tv.items.iter().any(|i| i.id == id))
+    })
+    .unwrap_or(false);
+    if !exists {
+        return Err(generic(format!("item \"{id}\" doesn't exist")));
+    }
+    if rest.is_empty() {
+        let item = with_state(interp, |rt| {
+            rt.treeviews
+                .get(path)
+                .and_then(|tv| tv.items.iter().find(|i| i.id == id).cloned())
+        })
+        .flatten()
+        .unwrap_or_default();
+        let values = Value::from_list(
+            &item
+                .values
+                .iter()
+                .map(|v| Value::from_str(v))
+                .collect::<Vec<_>>(),
+        )
+        .as_str()
+        .to_string();
+        return Ok(list_value([
+            "-text".to_string(),
+            item.text,
+            "-values".to_string(),
+            values,
+            "-open".to_string(),
+            if item.open { "1" } else { "0" }.to_string(),
+        ]));
+    }
+    if rest.len() == 1 && rest[0].as_str().starts_with('-') {
+        let item = with_state(interp, |rt| {
+            rt.treeviews
+                .get(path)
+                .and_then(|tv| tv.items.iter().find(|i| i.id == id).cloned())
+        })
+        .flatten();
+        let Some(item) = item else {
+            return Ok(Value::empty());
+        };
+        return Ok(match rest[0].as_str() {
+            "-text" => Value::from_str(&item.text),
+            "-open" => Value::from_bool(item.open),
+            "-values" => list_value(item.values),
+            _ => Value::empty(),
+        });
+    }
+    let options = parse_pairs(rest, 0, "treeview item")?;
+    with_state_mut(interp, |rt| {
+        if let Some(tv) = rt.treeviews.get_mut(path) {
+            if let Some(item) = tv.items.iter_mut().find(|i| i.id == id) {
+                for (k, v) in options {
+                    match k.as_str() {
+                        "-text" => item.text = v,
+                        "-open" => item.open = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+                        "-values" => {
+                            item.values = Value::from_str(&v)
+                                .as_list()
+                                .map(|list| list.iter().map(|x| x.as_str().to_string()).collect())
+                                .unwrap_or_default();
+                        }
+                        "-tags" | "-image" => {}
+                        _ => return Err(bad_option(&k)),
+                    }
+                }
+                rt.bump();
+            }
+        }
+        Ok::<(), Error>(())
+    })
+    .ok_or_else(|| bad_window(path))??;
+    Ok(Value::empty())
+}
+
+/// Snapshot of a Treeview for the renderer.
+pub fn treeview_snapshot(path: &str) -> Option<TreeViewState> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| rt.treeviews.get(path).cloned()).flatten()
+}
+
+/// Select one Treeview row from the renderer.
+pub fn treeview_select(path: &str, id: &str) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    with_state_mut(interp, |rt| {
+        if let Some(tv) = rt.treeviews.get_mut(path) {
+            tv.selected = std::iter::once(id.to_string()).collect();
+            tv.focus = Some(id.to_string());
+            rt.bump();
+        }
+    });
+}
+
+/// Expand/collapse a Treeview row from the renderer.
+pub fn treeview_toggle(path: &str, id: &str) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    with_state_mut(interp, |rt| {
+        if let Some(tv) = rt.treeviews.get_mut(path) {
+            if let Some(item) = tv.items.iter_mut().find(|i| i.id == id) {
+                item.open = !item.open;
+                rt.bump();
+            }
+        }
+    });
+}
+
 fn notebook_add(
     interp: &mut Interp,
     notebook: &str,
@@ -4390,6 +4820,37 @@ mod tests {
         eval(&mut i, "ttk::button .b -text Go; ttk::label .l -text Hi");
         assert_eq!(eval(&mut i, "winfo class .b"), "Button");
         assert_eq!(eval(&mut i, "winfo class .l"), "Label");
+    }
+
+    #[test]
+    fn treeview_items_and_selection() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "ttk::treeview .tv -columns {size owner} -height 4; \
+             .tv heading #0 -text Folder; .tv heading size -text Size; \
+             .tv insert {} end -id root -text Project -open 1 -values {0 me}; \
+             .tv insert root end -id src -text src -values {3 me}; \
+             .tv insert root end -text README -values {1 me}",
+        );
+        assert_eq!(eval(&mut i, "winfo class .tv"), "Treeview");
+        assert_eq!(eval(&mut i, ".tv children {}"), "root");
+        assert_eq!(eval(&mut i, ".tv children root"), "src I001");
+        assert_eq!(eval(&mut i, ".tv item src -text"), "src");
+        assert_eq!(eval(&mut i, ".tv item src -values"), "3 me");
+        assert_eq!(eval(&mut i, ".tv parent src"), "root");
+        assert_eq!(eval(&mut i, ".tv index src"), "0");
+        assert_eq!(eval(&mut i, ".tv heading #0"), "Folder");
+        eval(&mut i, ".tv selection set src");
+        assert_eq!(eval(&mut i, ".tv selection"), "src");
+        assert_eq!(eval(&mut i, ".tv focus"), "src");
+        eval(&mut i, ".tv delete src");
+        assert_eq!(eval(&mut i, "winfo exists .tv"), "1");
+        assert_eq!(eval(&mut i, ".tv children root"), "I001");
+        let tv = treeview_snapshot(".tv").unwrap();
+        assert_eq!(tv.items.len(), 2);
+        assert_eq!(tv.columns, ["size", "owner"]);
     }
 
     #[test]

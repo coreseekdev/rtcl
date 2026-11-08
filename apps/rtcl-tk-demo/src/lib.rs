@@ -93,7 +93,7 @@ message .msg -textvariable ::message -width 320
 pack .msg -padx 8
 
 frame .listframe
-pack .listframe -fill both -expand 1 -padx 8
+pack .listframe -fill x -padx 8
 listbox .listframe.lb -height 4
 pack .listframe.lb -side left -fill both -expand 1
 scrollbar .listframe.sb -orient vertical -command {.listframe.lb yview}
@@ -114,6 +114,14 @@ pack .nb.advanced.note -padx 8 -pady 4
 set ::size "Medium"
 ttk::combobox .cb -values {Small Medium Large} -textvariable ::size
 pack .cb -padx 8 -pady 4
+
+ttk::treeview .tv -columns {size} -height 3 -show {tree headings}
+.tv heading #0 -text Folder
+.tv heading size -text Size
+.tv insert {} end -id root -text Project -open 1 -values {0 files}
+.tv insert root end -id src -text src -values {3 files}
+.tv insert root end -text README -values {1 file}
+pack .tv -fill x -padx 8 -pady 4
 
 ttk::separator .sep
 pack .sep -fill x -pady 4
@@ -166,6 +174,22 @@ pub fn DemoApp() -> impl IntoElement {
 }
 
 /// The [`CLASSIC`] form, for the regression test.
+
+/// Minimal treeview probe/regression app.
+pub const TREE: &str = r#"
+ttk::treeview .tv -columns {size} -height 3 -show {tree headings}
+.tv heading #0 -text Folder
+.tv heading size -text Size
+.tv insert {} end -id root -text Project -open 1 -values {0 files}
+.tv insert root end -id src -text src -values {3 files}
+pack .tv -fill x -padx 8 -pady 8
+"#;
+
+#[component]
+pub fn TreeApp() -> impl IntoElement {
+    ensure_tcl_script(TREE);
+    rtcl_tk_nsh::tk_view()
+}
 
 #[component]
 pub fn ClassicApp() -> impl IntoElement {

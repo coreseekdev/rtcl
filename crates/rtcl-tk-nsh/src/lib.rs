@@ -846,7 +846,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         .bg(AdaptiveColor::rgb(0xf3f4f6, 0x374151))
                         .disabled(disabled)
                         .child(
-                            text("▾")
+                            text("▼")
                                 .text_size(px(13.0))
                                 .text_color(AdaptiveColor::rgb(0x111827, 0xf9fafb)),
                         )
@@ -887,6 +887,134 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 column = column.child(list);
             }
             column.into_element()
+        }
+        WidgetKind::Treeview => {
+            let Some(tv) = rtcl_tk_runtime::treeview_snapshot(path) else {
+                return text("").into_element();
+            };
+            let heading = |column: &str, fallback: &str| {
+                tv.headings
+                    .get(column)
+                    .cloned()
+                    .unwrap_or_else(|| fallback.to_string())
+            };
+            let mut header = view()
+                .flex_row()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .px(px(6.0))
+                .py(px(3.0))
+                .bg(AdaptiveColor::rgb(0xe5e7eb, 0x374151));
+            header = header.child(
+                text(heading("#0", "Item"))
+                    .text_size(px(13.0))
+                    .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+            );
+            for column in &tv.columns {
+                header = header.child(
+                    text(heading(column, column))
+                        .text_size(px(13.0))
+                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                );
+            }
+            let mut body = view().flex_col().w_full().gap_1().p(px(4.0));
+            let mut order = Vec::new();
+            collect_treeview_rows(&tv, None, 0, &mut order);
+            for (item, depth) in order {
+                let path = path.to_string();
+                let id = item.id.clone();
+                let has_children = tv
+                    .items
+                    .iter()
+                    .any(|i| i.parent.as_deref() == Some(id.as_str()));
+                let selected = tv.selected.contains(&id);
+                let mut row = view().flex_row().w_full().items_center().gap_1();
+                if depth > 0 {
+                    row = row.child(view().w(px(16.0 * depth as f32)));
+                }
+                let mark = if has_children {
+                    if item.open {
+                        "▾ "
+                    } else {
+                        "▸ "
+                    }
+                } else {
+                    "  "
+                };
+                let mark = if has_children {
+                    if item.open {
+                        "▾ "
+                    } else {
+                        "▸ "
+                    }
+                } else {
+                    "  "
+                };
+                let select_path = path.clone();
+                let select_id = id.clone();
+                let mut cells = view().flex_row().w_full().items_center().gap_2();
+                cells = cells.child(
+                    text(mark.to_string())
+                        .text_size(px(12.0))
+                        .text_color(AdaptiveColor::rgb(0x2563eb, 0x60a5fa)),
+                );
+                cells = cells.child(
+                    text(item.text.clone())
+                        .text_size(px(13.0))
+                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                );
+                for value in &item.values {
+                    cells = cells.child(
+                        text(value.clone())
+                            .text_size(px(13.0))
+                            .text_color(AdaptiveColor::rgb(0x4b5563, 0xd1d5db)),
+                    );
+                }
+                let button = nsh_base::button()
+                    .w_full()
+                    .justify_start()
+                    .px(px(4.0))
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .bg(if selected {
+                        AdaptiveColor::rgb(0xdbeafe, 0x1e3a8a)
+                    } else {
+                        AdaptiveColor::rgb(0xffffff, 0x111827)
+                    })
+                    .child(cells);
+                row = row.child(button.on_press(move |_: &()| {
+                    if has_children {
+                        rtcl_tk_runtime::treeview_toggle(&select_path, &select_id);
+                    } else {
+                        rtcl_tk_runtime::treeview_select(&select_path, &select_id);
+                    }
+                }));
+                body = body.child(row);
+            }
+            view()
+                .flex_col()
+                .w_full()
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+                .child(header)
+                .child(body)
+                .into_element()
+        }
+    }
+}
+
+fn collect_treeview_rows<'a>(
+    tv: &'a rtcl_tk_runtime::TreeViewState,
+    parent: Option<&str>,
+    depth: usize,
+    out: &mut Vec<(&'a rtcl_tk_runtime::TreeItem, usize)>,
+) {
+    for item in tv.items.iter().filter(|i| i.parent.as_deref() == parent) {
+        out.push((item, depth));
+        if item.open {
+            collect_treeview_rows(tv, Some(item.id.as_str()), depth + 1, out);
         }
     }
 }

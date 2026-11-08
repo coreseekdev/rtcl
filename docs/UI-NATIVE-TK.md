@@ -176,7 +176,7 @@ index/icursor/selection/size/curselection/step` 等；菜单子命令含
 unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
 `ttk::combobox` 的 `get/set/current/values/post/unpost`；
 `ttk::treeview` 的 `insert/delete/item/selection/focus/children/parent/
-index/heading/column/exists`；Tcl 侧的 `after/update/vwait` 沿用 rtcl-vm。
+index/heading/column/exists`；listbox/treeview 按 `-height` 放进滚动视图（滚轮可滚）；Tcl 侧的 `after/update/vwait` 沿用 rtcl-vm。
 
 **菜单**：`menu` 窗口与 `-menu` 关联的菜单栏在 app 内渲染为一行
 cascade 按钮 + 浮层下拉（command/checkbutton/radiobutton/separator/

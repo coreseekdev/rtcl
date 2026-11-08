@@ -682,7 +682,16 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         }),
                 );
             }
-            list.into_element()
+            let rows = option(tree, path, "-height")
+                .parse::<f32>()
+                .unwrap_or(10.0)
+                .max(1.0);
+            scroll()
+                .w_full()
+                .h(px(rows * 28.0 + 8.0))
+                .scrollbar(true)
+                .child(list)
+                .into_element()
         }
         WidgetKind::Message => view()
             .w_full()
@@ -992,6 +1001,10 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 }));
                 body = body.child(row);
             }
+            let rows = option(tree, path, "-height")
+                .parse::<f32>()
+                .unwrap_or(10.0)
+                .max(1.0);
             view()
                 .flex_col()
                 .w_full()
@@ -999,7 +1012,13 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .border_1()
                 .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
                 .child(header)
-                .child(body)
+                .child(
+                    scroll()
+                        .w_full()
+                        .h(px(rows * 22.0 + 8.0))
+                        .scrollbar(true)
+                        .child(body),
+                )
                 .into_element()
         }
     }

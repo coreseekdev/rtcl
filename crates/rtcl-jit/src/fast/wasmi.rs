@@ -64,6 +64,11 @@ thread_local! {
     static DM_SEQ: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// Evict fast module entries for a retired proc body.
+pub(crate) fn retire_bytecode(ptr: usize) {
+    FAST_MODULES.with(|m| m.borrow_mut().retain(|k, _| k.1 != ptr));
+}
+
 /// Drop the thread-local fast store/modules when their interpreter dies.
 pub(crate) fn teardown_interp(ptr: usize) {
     FAST_STORE.with(|cell| {

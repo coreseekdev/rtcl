@@ -80,6 +80,11 @@ thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// Evict fast module entries for a retired proc body.
+pub(crate) fn retire_bytecode(ptr: usize) {
+    WT_FAST_MODULES.with(|m| m.borrow_mut().retain(|k, _| k.1 != ptr));
+}
+
 /// Drop the thread-local fast store/modules when their interpreter dies.
 pub(crate) fn teardown_interp(ptr: usize) {
     WT_FAST_STORE.with(|cell| {

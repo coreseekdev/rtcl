@@ -25,7 +25,7 @@ mod varmap;
 pub(crate) use util::{split_array_ref, glob_match};
 pub(crate) use varmap::{VarMap, VarSet};
 
-pub use vm_exec::{set_bytecode_disabled, set_interp_teardown_hook, set_proc_body_executor, InterpTeardownHook, ProcBodyExecutor};
+pub use vm_exec::{set_bytecode_disabled, set_bytecode_retire_hook, set_interp_teardown_hook, set_proc_body_executor, ByteCodeRetireHook, InterpTeardownHook, ProcBodyExecutor};
 
 use crate::command::{CommandFunc, CommandCategory, CommandMeta};
 use crate::value::Value;
@@ -1310,6 +1310,7 @@ impl Interp {
     pub(crate) fn purge_proc_artifacts(&mut self, def: &Rc<ProcDef>) {
         if let Some(code) = &def.compiled {
             self.const_pool.remove(&(Rc::as_ptr(code) as usize));
+            crate::interp::vm_exec::run_bytecode_retire_hook(Rc::as_ptr(code));
         }
         for entry in self.const_pool.values() {
             let mut sites = entry.sites.borrow_mut();

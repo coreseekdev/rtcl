@@ -6,7 +6,7 @@ use crate::abi;
 use crate::classic::compile_cached;
 use crate::exec;
 use rtcl_core::{Interp, Value};
-use rtcl_vm::interp::{set_interp_teardown_hook, set_proc_body_executor};
+use rtcl_vm::interp::{set_bytecode_retire_hook, set_interp_teardown_hook, set_proc_body_executor};
 use rtcl_ir::ByteCode;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
@@ -19,6 +19,21 @@ static FAST_ONLY: AtomicBool = AtomicBool::new(false);
 pub fn install() {
     set_proc_body_executor(Some(exec_proc_body));
     set_interp_teardown_hook(Some(teardown_interp));
+    set_bytecode_retire_hook(Some(retire_bytecode));
+}
+
+/// A proc's compiled unit is being dropped: evict module/pool entries
+/// keyed by its address so redefinition does not retain old bodies until
+/// the cache cap.
+fn retire_bytecode(code: *const rtcl_ir::ByteCode) {
+    let ptr = code as usize;
+    crate::classic::wasmi::retire_bytecode(ptr);
+    #[cfg(feature = "jit-native")]
+    crate::classic::wt::retire_bytecode(ptr);
+    crate::classic::retire_bytecode(ptr);
+    crate::fast::wasmi::retire_bytecode(ptr);
+    #[cfg(feature = "jit-native")]
+    crate::fast::wt::retire_bytecode(ptr);
 }
 
 /// `Interp` drop hook: release thread-local pools/modules keyed by the

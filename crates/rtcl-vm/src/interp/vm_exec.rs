@@ -761,6 +761,25 @@ pub(crate) fn run_interp_teardown_hook(interp: *mut Interp) {
     }
 }
 
+/// Retired-compiled-unit hook: called when a proc's `ByteCode` is dropped
+/// by the interpreter (redefinition/deletion/local-proc pop), so an
+/// external engine can evict module/pool entries keyed by that pointer
+/// instead of retaining them until its cache cap.
+pub type ByteCodeRetireHook = fn(*const ByteCode);
+
+static BYTECODE_RETIRE_HOOK: std::sync::OnceLock<Option<ByteCodeRetireHook>> =
+    std::sync::OnceLock::new();
+
+pub fn set_bytecode_retire_hook(hook: Option<ByteCodeRetireHook>) {
+    let _ = BYTECODE_RETIRE_HOOK.set(hook);
+}
+
+pub(crate) fn run_bytecode_retire_hook(code: *const ByteCode) {
+    if let Some(Some(f)) = BYTECODE_RETIRE_HOOK.get() {
+        f(code);
+    }
+}
+
 /// Site A hook probe: returns the JIT executor's result when one is
 /// installed and it accepts this body, `None` to run `exec_bytecode`.
 pub(crate) fn proc_body_executor(

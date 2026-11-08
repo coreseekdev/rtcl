@@ -21,6 +21,11 @@ thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// Evict the emitted module for a retired compiled unit.
+pub(crate) fn retire_bytecode(ptr: usize) {
+    PROC_MODULES.with(|c| c.borrow_mut().retain(|k, _| k.0 != ptr));
+}
+
 /// Emitted-module cache keys carry no interpreter identity (they are
 /// shared per thread), so a teardown clears the whole cache: entries can
 /// keep Rc<emit::Module> and ByteCode-derived metadata alive after the

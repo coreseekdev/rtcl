@@ -48,6 +48,16 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Evict entries for a retired proc body.
+#[cfg(feature = "jit-native")]
+pub(crate) fn retire_bytecode(ptr: usize) {
+    WT_MODULES.with(|m| m.borrow_mut().retain(|k, _| k.1 != ptr));
+    WT_POOL.with(|p| p.borrow_mut().retain(|(k, ..)| k.1 != ptr));
+}
+
+#[cfg(not(feature = "jit-native"))]
+pub(crate) fn retire_bytecode(_ptr: usize) {}
+
 /// Drop cached wasmtime modules/pool entries belonging to a dead Interp.
 #[cfg(feature = "jit-native")]
 pub(crate) fn teardown_interp(ptr: usize) {

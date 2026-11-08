@@ -34,6 +34,12 @@ thread_local! {
     > = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Evict entries for a retired proc body (ByteCode pointer component).
+pub(crate) fn retire_bytecode(ptr: usize) {
+    WASMI_MODULES.with(|m| m.borrow_mut().retain(|k, _| k.1 != ptr));
+    PROC_POOL.with(|p| p.borrow_mut().retain(|(k, ..)| k.1 != ptr));
+}
+
 /// Drop cached wasmi modules/pool entries belonging to a dead Interp.
 pub(crate) fn teardown_interp(ptr: usize) {
     WASMI_MODULES.with(|m| m.borrow_mut().retain(|k, _| k.0 != ptr));

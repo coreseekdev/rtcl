@@ -48,10 +48,16 @@
     泄漏到下一次调用（也是正确性问题）。
   - **[已修] `var_link_cache` 内层无上限**：外层 1024 ns，但单 ns 内
     可被脚本写入无限多变量名。
-  - **[开放] JIT 同一 Interp 内的旧 ByteCode 条目**：teardown 解决了
-    跨 Interp 存活；proc 重定义/删除后，classic pool/module 里旧
-    `(interp, ByteCode ptr, epoch)` 条目仍要等池满 64 清除。键含裸
-    ByteCode 指针，地址复用+epoch 相同理论上可假命中。
+  - **[已修] JIT 同一 Interp 内的旧 ByteCode 条目**：新增
+    ByteCodeRetireHook，proc 重定义/删除/local 出栈时按 ByteCode 指针
+    驱逐 classic wasmi/wasmtime pool/module、emit 模块与 fast module
+    缓存；不再等池满 64。
+  - **[开放] classic pool 键仍含裸指针**：驱逐消除了主要滞留，但
+    `(interp, ByteCode, epoch)` 地址复用 + epoch 相同的理论假命中仍在
+    （概率极低；彻底修复需 generation/keepalive）。
+  - **[开放] fast Store 的 Host 槽**：按 ByteCode 驱逐了 module，但
+    fast store 内的 Host（source Rc、arena 基线）仍随 store 存活到
+    Interp teardown / store rebind（slot 上限 64）。
   - **[开放] 后台子进程退出策略**：handle 已保留并 try_wait reap；
     Interp drop 时仍在运行的子进程不 kill（与 Tcl 一致，由 OS 接管）。
   - **[开放] `references` 只增不减**：`ref` 每个值插强引用表，
@@ -133,6 +139,12 @@
     旧 `ProcDef` 的 `def` 引用。
 13. **FREELIST TLS destructor**：回收盒在线程退出时 dealloc，不再把
     最多 8192 个 `ValueInner` 盒子留给进程生命周期。
+
+## 第四轮修复
+
+14. **ByteCode 退役钩子**：`ByteCodeRetireHook` + `rtcl-jit` 的
+    `retire_bytecode(ptr)`；`purge_proc_artifacts` 触发，驱逐 classic
+    wasmi/wasmtime pool/module、共享 emit 模块、fast module 缓存。
 
 ## 本轮修复与验证
 

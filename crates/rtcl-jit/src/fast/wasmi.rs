@@ -62,11 +62,55 @@ thread_local! {
         std::collections::HashMap<PoolKey, wasmi::Module>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
     static DM_SEQ: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// ByteCode retirements that arrived while the fast store was borrowed
+    /// (a host callback may redefine a proc).  Applied at the next
+    /// top-level fast entry or at interpreter teardown.
+    static PENDING_RETIRE: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Evict fast module entries for a retired proc body.
 pub(crate) fn retire_bytecode(ptr: usize) {
     FAST_MODULES.with(|m| m.borrow_mut().retain(|k, _| k.1 != ptr));
+    if crate::fast::fast_in_call() {
+        // The store is mutably borrowed by the active `tf.call`; defer
+        // host-slot clearing to the next fast entry/teardown.
+        PENDING_RETIRE.with(|p| p.borrow_mut().push(ptr));
+    } else {
+        retire_host(ptr);
+    }
+}
+
+fn retire_host(ptr: usize) {
+    FAST_STORE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let Some(store) = cell.as_mut() else { return };
+        let h = store.data_mut();
+        let owner = h.sh.interp as usize;
+        if owner == 0 {
+            return;
+        }
+        let removed: Vec<usize> = h
+            .sh
+            .slots
+            .iter()
+            .filter(|(k, _)| k.0 == owner && k.1 == ptr)
+            .map(|(_, i)| *i)
+            .collect();
+        h.sh.slots.retain(|k, _| !(k.0 == owner && k.1 == ptr));
+        for i in removed {
+            if let Some(host) = h.sh.hosts.get_mut(i) {
+                host.retire_code();
+            }
+        }
+    });
+}
+
+fn drain_pending_retire() {
+    let pending: Vec<usize> = PENDING_RETIRE.with(|p| p.borrow_mut().drain(..).collect());
+    for ptr in pending {
+        retire_host(ptr);
+    }
 }
 
 /// Drop the thread-local fast store/modules when their interpreter dies.
@@ -392,11 +436,12 @@ fn fast_ensure_slot(
         interp as *mut Interp as usize,
         Rc::as_ptr(code) as usize,
         code.epoch,
+        code.serial,
     );
     if let Some(s) = c.data().sh.slots.get(&pool_key) {
         return Some(*s);
     }
-    let module = compile_cached(code, (Rc::as_ptr(code) as usize, code.epoch))?;
+    let module = compile_cached(code, (Rc::as_ptr(code) as usize, code.epoch, code.serial))?;
     let _meta = module.fast?; // fast gate 不命中 → None（分派回落）
     let wmodule = FAST_MODULES.with(|m| {
         let mut m = m.borrow_mut();
@@ -523,7 +568,8 @@ pub(crate) fn fast_try(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_
     if crate::fast::fast_in_call() {
         return None;
     }
-    let key = (Rc::as_ptr(code) as usize, code.epoch);
+    drain_pending_retire();
+    let key = (Rc::as_ptr(code) as usize, code.epoch, code.serial);
     let module = compile_cached(code, key)?;
     let meta = module.fast?;
     execute_fast(interp, code, &module, meta)
@@ -541,6 +587,7 @@ fn execute_fast(
         interp as *mut Interp as usize,
         Rc::as_ptr(bc) as usize,
         bc.epoch,
+        bc.serial,
     );
     FAST_STORE.with(|f| {
         let mut cell = f.borrow_mut();

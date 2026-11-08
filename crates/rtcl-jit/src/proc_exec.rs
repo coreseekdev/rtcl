@@ -114,7 +114,7 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
         if let Some(r) = crate::classic::wt::execute_proc_wasmtime_pooled(interp, code) {
             return Some(r);
         }
-        let key = (Rc::as_ptr(code) as usize, code.epoch);
+        let key = (Rc::as_ptr(code) as usize, code.epoch, code.serial);
         let module = compile_cached(code, key)?;
         return Some(crate::classic::wt::execute_proc_wasmtime(interp, code, &module));
     }
@@ -122,7 +122,7 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
     if let Some(r) = crate::classic::wasmi::execute_proc_pooled(interp, code) {
         return Some(r);
     }
-    let key = (Rc::as_ptr(code) as usize, code.epoch);
+    let key = (Rc::as_ptr(code) as usize, code.epoch, code.serial);
     let module = compile_cached(code, key)?;
     // proc 语境的 case-b 帧协议已落地（rtcl-vm jit_err_* 公共入口 +
     // Host.proc_ctx 路由）——不再按 Cold 退回（f002196/f004860 的

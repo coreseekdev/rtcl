@@ -9,7 +9,7 @@ use rtcl_ir::ByteCode;
 use std::rc::Rc;
 
 /// 池 key 三元组（interp 指针, proc 体 Rc 指针, epoch）。
-pub(crate) type PoolKey = (usize, usize, u64);
+pub(crate) type PoolKey = (usize, usize, u64, u64);
 
 thread_local! {
     /// proc 体的发射产物缓存（M4「定义即编译」的雏形）：key =
@@ -17,7 +17,7 @@ thread_local! {
     /// 长期 Rc 保证；redefine 换新 Rc 且 epoch 变化，双重防陈旧命中。
     /// 上限 64 条，超出全清（进程级模块数有限；简单粗暴即可）。
     static PROC_MODULES: std::cell::RefCell<
-        std::collections::HashMap<(usize, u64), Rc<emit::Module>>,
+        std::collections::HashMap<(usize, u64, u64), Rc<emit::Module>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -35,7 +35,7 @@ pub(crate) fn teardown_interp(_ptr: usize) {
 }
 
 /// emit 编译缓存（key 二元组；未命中现编译，拒绝不缓存负项）。
-pub(crate) fn compile_cached(code: &ByteCode, key: (usize, u64)) -> Option<Rc<emit::Module>> {
+pub(crate) fn compile_cached(code: &ByteCode, key: (usize, u64, u64)) -> Option<Rc<emit::Module>> {
     PROC_MODULES.with(|c| {
         let mut c = c.borrow_mut();
         if let Some(m) = c.get(&key) {

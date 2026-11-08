@@ -78,6 +78,7 @@ pub(crate) fn execute_proc_wasmtime_pooled(
         interp as *mut Interp as usize,
         Rc::as_ptr(bc) as usize,
         code_epoch_key(bc),
+        bc.serial,
     );
     let pooled = WT_POOL.with(|p| {
         let mut p = p.borrow_mut();
@@ -164,6 +165,7 @@ pub(crate) fn execute_proc_wasmtime(
         interp as *mut Interp as usize,
         Rc::as_ptr(bc) as usize,
         code_epoch_key(bc),
+        bc.serial,
     );
     let mut host = Host::new(
         interp as *mut Interp,

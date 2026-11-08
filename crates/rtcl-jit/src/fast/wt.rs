@@ -27,7 +27,7 @@ use std::rc::Rc;
 
 use wasmtime::{AsContext, Caller, Linker, Val};
 
-type PoolKey = (usize, usize, u64);
+type PoolKey = (usize, usize, u64, u64);
 
 pub(crate) struct FastHostWt {
     /// 引擎无关共享层（逻辑真值——docs/JIT-ENGINE-MERGE.md P3-lite）。
@@ -83,6 +83,45 @@ thread_local! {
 /// Evict fast module entries for a retired proc body.
 pub(crate) fn retire_bytecode(ptr: usize) {
     WT_FAST_MODULES.with(|m| m.borrow_mut().retain(|k, _| k.1 != ptr));
+    if crate::fast::fast_in_call() {
+        PENDING_RETIRE.with(|p| p.borrow_mut().push(ptr));
+    } else {
+        retire_host(ptr);
+    }
+}
+
+thread_local! {
+    static PENDING_RETIRE: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn retire_host(ptr: usize) {
+    WT_FAST_STORE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let Some(store) = cell.as_mut() else { return };
+        let h = store.data_mut();
+        let owner = h.sh.interp as usize;
+        let removed: Vec<usize> = h
+            .sh
+            .slots
+            .iter()
+            .filter(|(k, _)| k.0 == owner && k.1 == ptr)
+            .map(|(_, i)| *i)
+            .collect();
+        h.sh.slots.retain(|k, _| !(k.0 == owner && k.1 == ptr));
+        for i in removed {
+            if let Some(host) = h.sh.hosts.get_mut(i) {
+                host.retire_code();
+            }
+        }
+    });
+}
+
+fn drain_pending_retire() {
+    let pending: Vec<usize> = PENDING_RETIRE.with(|p| p.borrow_mut().drain(..).collect());
+    for ptr in pending {
+        retire_host(ptr);
+    }
 }
 
 /// Drop the thread-local fast store/modules when their interpreter dies.
@@ -397,11 +436,12 @@ fn fast_ensure_slot_wt(
         interp as *mut Interp as usize,
         Rc::as_ptr(code) as usize,
         code.epoch,
+        code.serial,
     );
     if let Some(s) = c.data().sh.slots.get(&pool_key) {
         return Some(*s);
     }
-    let module = crate::classic::compile_cached(code, (Rc::as_ptr(code) as usize, code.epoch))?;
+    let module = crate::classic::compile_cached(code, (Rc::as_ptr(code) as usize, code.epoch, code.serial))?;
     let _meta = module.fast?; // fast gate 不命中 → None（分派回落）
     let engine = c.data().engine.clone();
     let wmodule = WT_FAST_MODULES.with(|m| {
@@ -538,7 +578,8 @@ pub(crate) fn fast_try_wt(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rt
     if crate::fast::fast_in_call() {
         return None;
     }
-    let key = (Rc::as_ptr(code) as usize, code.epoch);
+    drain_pending_retire();
+    let key = (Rc::as_ptr(code) as usize, code.epoch, code.serial);
     let module = crate::classic::compile_cached(code, key)?;
     let meta = module.fast?;
     execute_fast_wt(interp, code, &module, meta)
@@ -556,6 +597,7 @@ pub(crate) fn execute_fast_wt(
         interp as *mut Interp as usize,
         Rc::as_ptr(bc) as usize,
         bc.epoch,
+        bc.serial,
     );
     WT_FAST_STORE.with(|f| {
         let mut cell = f.borrow_mut();

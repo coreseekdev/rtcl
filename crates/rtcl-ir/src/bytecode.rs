@@ -93,7 +93,7 @@ pub struct ForeachInfo {
 }
 
 /// Compiled bytecode for a single compilation unit (script / proc body).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ByteCode {
     /// String constant pool — referenced by `PushConst`, `LoadGlobal`, etc.
     constants: Vec<String>,
@@ -140,6 +140,17 @@ pub struct ByteCode {
     /// later `proc set {...}` in any namespace must send the body back
     /// to the dynamically-resolving tree-walk (namespace-41.1).
     pub epoch: u64,
+    /// Process-unique identity of this compiled unit.  A fresh value is
+    /// assigned on every construction/clone, so JIT cache keys can
+    /// distinguish a freed unit's reused allocation from a new unit
+    /// (raw-pointer keys alone can alias).
+    pub serial: u64,
+}
+
+static NEXT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_serial() -> u64 {
+    NEXT_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Default for ByteCode {
@@ -157,6 +168,30 @@ impl Default for ByteCode {
             toplevel_slots: false,
             locals_mode: false,
             epoch: 0,
+            serial: next_serial(),
+        }
+    }
+}
+
+impl Clone for ByteCode {
+    /// A clone is a distinct compiled unit for cache-identity purposes
+    /// (`unfused` and test/tooling clones): assign a fresh serial so JIT
+    /// pools never alias an old allocation.
+    fn clone(&self) -> Self {
+        Self {
+            constants: self.constants.clone(),
+            ops: self.ops.clone(),
+            locals: self.locals.clone(),
+            line_map: self.line_map.clone(),
+            foreach_infos: self.foreach_infos.clone(),
+            sites: self.sites.clone(),
+            source: Rc::clone(&self.source),
+            fallback: self.fallback,
+            params_aligned: self.params_aligned,
+            toplevel_slots: self.toplevel_slots,
+            locals_mode: self.locals_mode,
+            epoch: self.epoch,
+            serial: next_serial(),
         }
     }
 }

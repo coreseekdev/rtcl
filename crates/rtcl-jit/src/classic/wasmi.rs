@@ -19,7 +19,7 @@ thread_local! {
     /// **每次新建**：wasmi Store 复用有状态残留（同 Store 第二次 run
     /// 提前 OK 退出——defarg 双调用实证），正确性优先。
     static WASMI_MODULES: std::cell::RefCell<
-        std::collections::HashMap<(usize, usize, u64), wasmi::Module>,
+        std::collections::HashMap<PoolKey, wasmi::Module>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
     pub(crate) static WASMI_ENGINE: std::cell::OnceCell<wasmi::Engine> = const { std::cell::OnceCell::new() };
     /// Store/Instance **池**（key 三元组）：复用免 instantiate——状态
@@ -56,6 +56,7 @@ pub(crate) fn execute_proc_pooled(interp: &mut Interp, bc: &Rc<ByteCode>) -> Opt
         interp as *mut Interp as usize,
         Rc::as_ptr(bc) as usize,
         code_epoch_key(bc),
+        bc.serial,
     );
     let pooled = PROC_POOL.with(|p| {
         let mut p = p.borrow_mut();
@@ -154,6 +155,7 @@ pub(crate) fn execute_proc(interp: &mut Interp, bc: &Rc<ByteCode>, module: &emit
         interp as *mut Interp as usize,
         Rc::as_ptr(bc) as usize,
         code_epoch_key(bc),
+        bc.serial,
     );
 
     // Engine 单例 + Module 编译缓存（key 三元组）。

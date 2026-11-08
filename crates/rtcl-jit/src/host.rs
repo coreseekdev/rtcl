@@ -621,15 +621,19 @@ impl Host {
     /// but keep the slot allocation itself (hosts are index-addressed and
     /// cannot be compacted safely while wasm tables reference slots).
     pub(crate) fn retire_code(&mut self) {
-        self.consts.clear();
-        self.local_names.clear();
-        self.fails.clear();
-        self.sites.clear();
-        self.lines.clear();
+        // Replace (not clear) the backing vectors: the slot is never
+        // reused for a new unit, so retaining capacities would keep the
+        // retired proc's arena/constants alive.
+        self.consts = Vec::new();
+        self.local_names = Vec::new();
+        self.fails = Vec::new();
+        self.sites = Vec::new();
+        self.lines = Vec::new();
         self.source = Rc::from("");
-        self.infos.clear();
-        self.foreaches.clear();
-        self.arena.truncate(self.arena_base);
+        self.infos = Vec::new();
+        self.foreaches = Vec::new();
+        self.arena = Vec::new();
+        self.arena_base = 0;
         self.result = None;
         self.pending = None;
         self.pending_exit = None;

@@ -67,6 +67,44 @@ pub struct TkRuntime {
     scaling: f64,
     /// `tk appname`.
     app_name: String,
+    /// `text` tags: widget path → tag name → options and character ranges.
+    text_tags: BTreeMap<String, BTreeMap<String, TextTag>>,
+    /// Photo images by Tk image name.
+    images: BTreeMap<String, PhotoImage>,
+    image_seq: u64,
+    /// Canvas item models.
+    canvases: BTreeMap<String, CanvasState>,
+}
+
+/// A canvas's items.
+#[derive(Debug, Clone, Default)]
+pub struct CanvasState {
+    pub items: Vec<CanvasItem>,
+    next_id: u64,
+}
+
+/// One canvas item (`rectangle`, `line`, `oval`, `text`, `polygon`).
+#[derive(Debug, Clone)]
+pub struct CanvasItem {
+    pub id: u64,
+    pub kind: String,
+    pub coords: Vec<f64>,
+    pub options: BTreeMap<String, String>,
+}
+
+/// A `photo` image: a file plus its reported size.
+#[derive(Debug, Clone, Default)]
+pub struct PhotoImage {
+    pub file: String,
+    pub width: i64,
+    pub height: i64,
+}
+
+/// A `text` tag: its options and the character ranges it covers.
+#[derive(Debug, Clone, Default)]
+pub struct TextTag {
+    pub options: BTreeMap<String, String>,
+    pub ranges: Vec<(usize, usize)>,
 }
 
 /// One row of a `ttk::treeview`.
@@ -358,6 +396,7 @@ pub fn install(interp: &mut Interp) {
         "ttk::labelframe",
         "chart",
         "::rtcl::chart",
+        "canvas",
     ] {
         interp.register_command(name, create_widget);
     }
@@ -384,6 +423,7 @@ pub fn install(interp: &mut Interp) {
         "tk_focusNext",
         "tk_focusPrev",
         "menu",
+        "image",
     ] {
         interp.register_command(name, global_command);
     }
@@ -634,6 +674,11 @@ fn initialize_widget(interp: &mut Interp, path: &str, kind: WidgetKind) -> Resul
                 }
             }
         }
+        WidgetKind::Canvas => {
+            with_state_mut(interp, |rt| {
+                rt.canvases.entry(path.to_string()).or_default();
+            });
+        }
         WidgetKind::Treeview => {
             let columns = effective_option(interp, path, "-columns");
             let columns = Value::from_str(&columns)
@@ -774,7 +819,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 "see" => Ok(Value::empty()),
                 "mark" => Ok(Value::empty()),
-                "tag" => Ok(Value::empty()),
+                "tag" => text_tag_command(interp, path, &args[2..]),
                 "edit" => Ok(Value::empty()),
                 "xview" | "yview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
@@ -1270,6 +1315,78 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "column" | "tag" | "see" | "xview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
+            WidgetKind::Canvas => match sub {
+                "create" => {
+                    if args.len() < 4 {
+                        return Err(wrong(
+                            "create",
+                            "type x y ?x y ...? ?-option value ...?",
+                            args.len(),
+                        ));
+                    }
+                    canvas_create(interp, path, args[2].as_str(), &args[3..])
+                }
+                "delete" => {
+                    for value in &args[2..] {
+                        if value.as_str() == "all" {
+                            with_state_mut(interp, |rt| {
+                                if let Some(canvas) = rt.canvases.get_mut(path) {
+                                    canvas.items.clear();
+                                    rt.bump();
+                                }
+                            });
+                        } else if let Ok(id) = value.as_str().parse::<u64>() {
+                            with_state_mut(interp, |rt| {
+                                if let Some(canvas) = rt.canvases.get_mut(path) {
+                                    canvas.items.retain(|item| item.id != id);
+                                    rt.bump();
+                                }
+                            });
+                        }
+                    }
+                    Ok(Value::empty())
+                }
+                "coords" => canvas_coords(interp, path, &args[2..]),
+                "itemcget" => {
+                    if args.len() != 4 {
+                        return Err(wrong("itemcget", "tagOrId -option", args.len()));
+                    }
+                    let id = args[2]
+                        .as_str()
+                        .parse::<u64>()
+                        .map_err(|_| generic("bad item id"))?;
+                    let value = with_state(interp, |rt| {
+                        rt.canvases
+                            .get(path)
+                            .and_then(|canvas| canvas.items.iter().find(|i| i.id == id))
+                            .and_then(|item| item.options.get(args[3].as_str()).cloned())
+                    })
+                    .flatten()
+                    .unwrap_or_default();
+                    Ok(Value::from_str(&value))
+                }
+                "itemconfigure" => canvas_itemconfigure(interp, path, &args[2..]),
+                "find" => {
+                    let ids = with_state(interp, |rt| {
+                        rt.canvases
+                            .get(path)
+                            .map(|canvas| {
+                                canvas
+                                    .items
+                                    .iter()
+                                    .map(|i| i.id.to_string())
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                    Ok(list_value(ids))
+                }
+                "bbox" => Ok(Value::empty()),
+                "bind" | "raise" | "lower" | "move" | "scale" | "focus" | "select" | "xview"
+                | "yview" => Ok(Value::empty()),
+                _ => bad_subcommand(kind, sub),
+            },
             _ => bad_subcommand(kind, sub),
         },
     }
@@ -1304,6 +1421,9 @@ fn bad_subcommand(kind: WidgetKind, sub: &str) -> Result<Value> {
             }
             WidgetKind::Treeview => {
                 "children, column, delete, exists, focus, heading, index, insert, item, parent, see, selection, tag"
+            }
+            WidgetKind::Canvas => {
+                "bbox, bind, coords, create, delete, find, itemcget, itemconfigure, move, scale, xview, yview"
             }
             _ => "cget, configure, destroy",
     };
@@ -1573,6 +1693,7 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
     with_state_mut(interp, |rt| {
         rt.tree.destroy(path).map_err(tk_error)?;
         rt.treeviews.remove(path);
+        rt.canvases.remove(path);
         rt.bump();
         Ok::<(), Error>(())
     })
@@ -3189,6 +3310,192 @@ fn parse_menu_entry(kind: &str, rest: &[Value]) -> Result<MenuItem> {
     })
 }
 
+fn image_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(wrong("image", "option ?arg ...?", args.len()));
+    }
+    match args[1].as_str() {
+        "create" => {
+            if args.len() < 3 {
+                return Err(wrong("image create", "type ?name? ?-option value ...?", args.len()));
+            }
+            if args[2].as_str() != "photo" {
+                return Err(generic(format!(
+                    "image type \"{}\" is not supported (only photo)",
+                    args[2].as_str()
+                )));
+            }
+            let named = args.get(3).filter(|v| !v.as_str().starts_with('-'));
+            let name = named
+                .map(|v| v.as_str().to_string())
+                .unwrap_or_else(|| {
+                    let seq = with_state_mut(interp, |rt| {
+                        rt.image_seq += 1;
+                        rt.image_seq
+                    })
+                    .unwrap_or(1);
+                    format!("image{seq}")
+                });
+            let start = if named.is_some() { 4 } else { 3 };
+            let mut image = PhotoImage::default();
+            for (key, value) in parse_pairs(args, start, "image create")? {
+                match key.as_str() {
+                    "-file" => image.file = value,
+                    "-width" => image.width = value.parse().unwrap_or(0),
+                    "-height" => image.height = value.parse().unwrap_or(0),
+                    "-data" | "-format" | "-gamma" | "-palette" => {}
+                    _ => return Err(bad_option(&key)),
+                }
+            }
+            with_state_mut(interp, |rt| {
+                rt.images.insert(name.clone(), image);
+                rt.bump();
+            });
+            interp.register_command(&name, photo_command);
+            Ok(Value::from_str(&name))
+        }
+        "delete" => {
+            for value in &args[2..] {
+                let name = value.as_str();
+                with_state_mut(interp, |rt| {
+                    rt.images.remove(name);
+                    rt.bump();
+                });
+                let _ = interp.delete_command(name);
+            }
+            Ok(Value::empty())
+        }
+        "names" => {
+            let names = with_state(interp, |rt| rt.images.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            Ok(list_value(names))
+        }
+        "types" => Ok(list_value(["photo"].map(str::to_string))),
+        "exists" => Ok(Value::from_bool(
+            args.get(2).is_some_and(|v| {
+                with_state(interp, |rt| rt.images.contains_key(v.as_str())).unwrap_or(false)
+            }),
+        )),
+        "type" => {
+            let name = args.get(2).map(|v| v.as_str()).unwrap_or("");
+            if with_state(interp, |rt| rt.images.contains_key(name)).unwrap_or(false) {
+                Ok(Value::from_str("photo"))
+            } else {
+                Err(generic(format!("image \"{name}\" doesn't exist")))
+            }
+        }
+        "width" | "height" => {
+            let name = args.get(2).map(|v| v.as_str()).unwrap_or("");
+            let size = with_state(interp, |rt| {
+                rt.images
+                    .get(name)
+                    .map(|i| if args[1].as_str() == "width" { i.width } else { i.height })
+            })
+            .flatten()
+            .ok_or_else(|| generic(format!("image \"{name}\" doesn't exist")))?;
+            Ok(Value::from_int(size))
+        }
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be create, delete, exists, names, type, types, width, or height"
+        ))),
+    }
+}
+
+fn photo_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let name = args[0].as_str();
+    if args.len() < 2 {
+        return Err(wrong(name, "option ?arg ...?", args.len()));
+    }
+    let sub = args[1].as_str();
+    let exists = with_state(interp, |rt| rt.images.contains_key(name)).unwrap_or(false);
+    if !exists {
+        return Err(generic(format!("image \"{name}\" doesn't exist")));
+    }
+    match sub {
+        "cget" => {
+            if args.len() != 3 {
+                return Err(wrong("cget", "-option", args.len()));
+            }
+            let image = with_state(interp, |rt| rt.images.get(name).cloned())
+                .flatten()
+                .unwrap_or_default();
+            let value = match args[2].as_str() {
+                "-file" => image.file,
+                "-width" => image.width.to_string(),
+                "-height" => image.height.to_string(),
+                other => return Err(bad_option(other)),
+            };
+            Ok(Value::from_str(&value))
+        }
+        "configure" | "config" => {
+            if args.len() == 2 {
+                let image = with_state(interp, |rt| rt.images.get(name).cloned())
+                    .flatten()
+                    .unwrap_or_default();
+                return Ok(list_value([
+                    "-file".to_string(),
+                    image.file,
+                    "-width".to_string(),
+                    image.width.to_string(),
+                    "-height".to_string(),
+                    image.height.to_string(),
+                ]));
+            }
+            let options = parse_pairs(args, 2, "configure")?;
+            with_state_mut(interp, |rt| {
+                if let Some(image) = rt.images.get_mut(name) {
+                    for (key, value) in options {
+                        match key.as_str() {
+                            "-file" => image.file = value,
+                            "-width" => image.width = value.parse().unwrap_or(0),
+                            "-height" => image.height = value.parse().unwrap_or(0),
+                            "-data" | "-format" | "-gamma" | "-palette" => {}
+                            _ => return Err(bad_option(&key)),
+                        }
+                    }
+                    rt.bump();
+                }
+                Ok::<(), Error>(())
+            })
+            .ok_or_else(|| bad_window(name))??;
+            Ok(Value::empty())
+        }
+        "width" | "height" => {
+            let image = with_state(interp, |rt| rt.images.get(name).cloned())
+                .flatten()
+                .unwrap_or_default();
+            Ok(Value::from_int(if sub == "width" {
+                image.width
+            } else {
+                image.height
+            }))
+        }
+        "put" | "read" | "write" | "copy" | "blank" | "transparency" | "data"
+        | "get" => Ok(Value::empty()),
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be blank, cget, configure, copy, data, get, height, put, read, transparency, width, or write"
+        ))),
+    }
+}
+
+/// The file behind a photo image.
+pub fn image_path(name: &str) -> Option<String> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| {
+        rt.images.get(name).map(|i| i.file.clone())
+    })
+    .flatten()
+}
+
+/// A photo image's reported size.
+pub fn image_dimensions(name: &str) -> Option<(i64, i64)> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| {
+        rt.images.get(name).map(|i| (i.width, i.height))
+    })
+    .flatten()
+}
+
 fn menu_create(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let cmd = args[0].as_str();
     if args.len() < 2 {
@@ -4592,6 +4899,319 @@ fn char_to_linecol(content: &str, index: usize) -> String {
     format!("{line}.{col}")
 }
 
+fn canvas_create(interp: &mut Interp, path: &str, kind: &str, rest: &[Value]) -> Result<Value> {
+    if !matches!(kind, "rectangle" | "oval" | "line" | "text" | "polygon") {
+        return Err(generic(format!(
+            "unknown or unsupported canvas item type \"{kind}\""
+        )));
+    }
+    let split = rest
+        .iter()
+        .position(|v| v.as_str().starts_with('-'))
+        .unwrap_or(rest.len());
+    let coords = rest[..split]
+        .iter()
+        .map(|v| parse_f64_str(v.as_str(), "coordinate"))
+        .collect::<Result<Vec<_>>>()?;
+    if coords.len() < 2 {
+        return Err(generic("wrong # coordinates: expected at least 2"));
+    }
+    let mut options = BTreeMap::new();
+    for (key, value) in parse_pairs(&rest[split..], 0, "create")? {
+        if !rtcl_tk_core::valid_option(&key) {
+            return Err(bad_option(&key));
+        }
+        options.insert(key, value);
+    }
+    let id = with_state_mut(interp, |rt| {
+        let canvas = rt.canvases.entry(path.to_string()).or_default();
+        canvas.next_id += 1;
+        let id = canvas.next_id;
+        canvas.items.push(CanvasItem {
+            id,
+            kind: kind.to_string(),
+            coords,
+            options,
+        });
+        rt.bump();
+        id
+    })
+    .ok_or_else(|| bad_window(path))?;
+    Ok(Value::from_int(id as i64))
+}
+
+fn canvas_coords(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong("coords", "tagOrId ?x y ...?", rest.len() + 2));
+    }
+    let id = rest[0]
+        .as_str()
+        .parse::<u64>()
+        .map_err(|_| generic("bad item id"))?;
+    if rest.len() == 1 {
+        let coords = with_state(interp, |rt| {
+            rt.canvases
+                .get(path)
+                .and_then(|canvas| canvas.items.iter().find(|i| i.id == id))
+                .map(|item| {
+                    item.coords
+                        .iter()
+                        .map(|v| format_number(*v))
+                        .collect::<Vec<_>>()
+                })
+        })
+        .flatten()
+        .unwrap_or_default();
+        return Ok(list_value(coords));
+    }
+    let coords = rest[1..]
+        .iter()
+        .map(|v| parse_f64_str(v.as_str(), "coordinate"))
+        .collect::<Result<Vec<_>>>()?;
+    with_state_mut(interp, |rt| {
+        if let Some(item) = rt
+            .canvases
+            .get_mut(path)
+            .and_then(|canvas| canvas.items.iter_mut().find(|i| i.id == id))
+        {
+            item.coords = coords;
+            rt.bump();
+        }
+    });
+    Ok(Value::empty())
+}
+
+fn canvas_itemconfigure(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong(
+            "itemconfigure",
+            "tagOrId ?-option? ?value ...?",
+            rest.len() + 2,
+        ));
+    }
+    let id = rest[0]
+        .as_str()
+        .parse::<u64>()
+        .map_err(|_| generic("bad item id"))?;
+    if rest.len() == 2 {
+        let value = with_state(interp, |rt| {
+            rt.canvases
+                .get(path)
+                .and_then(|canvas| canvas.items.iter().find(|i| i.id == id))
+                .and_then(|item| item.options.get(rest[1].as_str()).cloned())
+        })
+        .flatten()
+        .unwrap_or_default();
+        return Ok(Value::from_str(&value));
+    }
+    let options = parse_pairs(rest, 1, "itemconfigure")?;
+    with_state_mut(interp, |rt| {
+        if let Some(item) = rt
+            .canvases
+            .get_mut(path)
+            .and_then(|canvas| canvas.items.iter_mut().find(|i| i.id == id))
+        {
+            item.options.extend(options);
+            rt.bump();
+        }
+    });
+    Ok(Value::empty())
+}
+
+/// A canvas's items for the renderer.
+pub fn canvas_snapshot(path: &str) -> Option<CanvasState> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| rt.canvases.get(path).cloned()).flatten()
+}
+
+fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong("tag", "option ?arg ...?", rest.len() + 2));
+    }
+    let (content, cursor) = text_state(interp, path);
+    match rest[0].as_str() {
+        "configure" => {
+            if rest.len() < 2 {
+                return Err(wrong("tag configure", "tagName ?-option? ?value ...?", rest.len() + 2));
+            }
+            let name = rest[1].as_str().to_string();
+            if rest.len() == 2 {
+                let options = with_state(interp, |rt| {
+                    rt.text_tags
+                        .get(path)
+                        .and_then(|tags| tags.get(&name))
+                        .map(|tag| tag.options.clone())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+                return Ok(list_value(
+                    options
+                        .iter()
+                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            if rest.len() == 3 {
+                let option = rest[2].as_str();
+                let value = with_state(interp, |rt| {
+                    rt.text_tags
+                        .get(path)
+                        .and_then(|tags| tags.get(&name))
+                        .and_then(|tag| tag.options.get(option))
+                        .cloned()
+                })
+                .flatten()
+                .unwrap_or_default();
+                return Ok(Value::from_str(&value));
+            }
+            let options = parse_pairs(rest, 2, "tag configure")?;
+            with_state_mut(interp, |rt| {
+                let tag = rt
+                    .text_tags
+                    .entry(path.to_string())
+                    .or_default()
+                    .entry(name.clone())
+                    .or_default();
+                tag.options.extend(options);
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "cget" => {
+            if rest.len() != 3 {
+                return Err(wrong("tag cget", "tagName -option", rest.len() + 2));
+            }
+            let value = with_state(interp, |rt| {
+                rt.text_tags
+                    .get(path)
+                    .and_then(|tags| tags.get(rest[1].as_str()))
+                    .and_then(|tag| tag.options.get(rest[2].as_str()))
+                    .cloned()
+            })
+            .flatten()
+            .unwrap_or_default();
+            Ok(Value::from_str(&value))
+        }
+        "add" => {
+            if rest.len() < 3 || rest.len() > 4 {
+                return Err(wrong("tag add", "tagName index1 ?index2?", rest.len() + 2));
+            }
+            let start = text_index(rest[2].as_str(), &content, cursor)?;
+            let end = match rest.get(3) {
+                Some(last) => text_index(last.as_str(), &content, cursor)?,
+                None => (start + 1).min(content.chars().count()),
+            };
+            let (a, b) = (start.min(end), start.max(end));
+            let name = rest[1].as_str().to_string();
+            with_state_mut(interp, |rt| {
+                let tag = rt
+                    .text_tags
+                    .entry(path.to_string())
+                    .or_default()
+                    .entry(name.clone())
+                    .or_default();
+                tag.ranges.push((a, b));
+                tag.ranges.sort_unstable();
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "remove" => {
+            if rest.len() < 3 || rest.len() > 4 {
+                return Err(wrong("tag remove", "tagName index1 ?index2?", rest.len() + 2));
+            }
+            let start = text_index(rest[2].as_str(), &content, cursor)?;
+            let end = match rest.get(3) {
+                Some(last) => text_index(last.as_str(), &content, cursor)?,
+                None => (start + 1).min(content.chars().count()),
+            };
+            let (a, b) = (start.min(end), start.max(end));
+            let name = rest[1].as_str().to_string();
+            with_state_mut(interp, |rt| {
+                if let Some(tag) = rt
+                    .text_tags
+                    .get_mut(path)
+                    .and_then(|tags| tags.get_mut(&name))
+                {
+                    let mut next = Vec::new();
+                    for (start, end) in tag.ranges.drain(..) {
+                        if end <= a || start >= b {
+                            next.push((start, end));
+                        } else {
+                            if start < a {
+                                next.push((start, a));
+                            }
+                            if end > b {
+                                next.push((b, end));
+                            }
+                        }
+                    }
+                    tag.ranges = next;
+                }
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "names" => {
+            let index = match rest.get(1) {
+                Some(value) => Some(text_index(value.as_str(), &content, cursor)?),
+                None => None,
+            };
+            let names = with_state(interp, |rt| {
+                rt.text_tags
+                    .get(path)
+                    .map(|tags| {
+                        tags.iter()
+                            .filter(|(_, tag)| {
+                                index.is_none_or(|i| {
+                                    tag.ranges.iter().any(|(a, b)| i >= *a && i < *b)
+                                })
+                            })
+                            .map(|(name, _)| name.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+            Ok(list_value(names))
+        }
+        "ranges" => {
+            if rest.len() != 2 {
+                return Err(wrong("tag ranges", "tagName", rest.len() + 2));
+            }
+            let ranges = with_state(interp, |rt| {
+                rt.text_tags
+                    .get(path)
+                    .and_then(|tags| tags.get(rest[1].as_str()))
+                    .map(|tag| tag.ranges.clone())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+            let mut out = Vec::new();
+            for (start, end) in ranges {
+                out.push(char_to_linecol(&content, start));
+                out.push(char_to_linecol(&content, end));
+            }
+            Ok(list_value(out))
+        }
+        "delete" => {
+            with_state_mut(interp, |rt| {
+                if let Some(tags) = rt.text_tags.get_mut(path) {
+                    for value in &rest[1..] {
+                        tags.remove(value.as_str());
+                    }
+                    rt.bump();
+                }
+            });
+            Ok(Value::empty())
+        }
+        "bind" | "raise" | "lower" => Ok(Value::empty()),
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be add, bind, cget, configure, delete, names, ranges, or remove"
+        ))),
+    }
+}
+
 fn text_get(interp: &mut Interp, path: &str, first: &str, last: Option<&str>) -> Result<Value> {
     let (content, cursor) = text_state(interp, path);
     let start = text_index(first, &content, cursor)?;
@@ -5021,6 +5641,7 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "tk_focusNext" => tk_focus_impl(interp, args, true),
         "tk_focusPrev" => tk_focus_impl(interp, args, false),
         "menu" => menu_create(interp, args),
+        "image" => image_impl(interp, args),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -5291,6 +5912,55 @@ mod tests {
         assert_eq!(entry_value(".e"), "abc");
         assert_eq!(eval(&mut i, "winfo class .lf"), "TLabelframe");
         assert_eq!(eval(&mut i, "cget .lf -text"), "Options");
+    }
+
+    #[test]
+    fn text_tags_photo_images_and_canvas() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "text .t; .t insert 1.0 {hello world}");
+        eval(
+            &mut i,
+            ".t tag configure strong -foreground red; .t tag add strong 1.0 1.5",
+        );
+        assert_eq!(eval(&mut i, ".t tag ranges strong"), "1.0 1.5");
+        assert_eq!(eval(&mut i, ".t tag names 1.2"), "strong");
+        assert_eq!(eval(&mut i, ".t tag names 1.7"), "");
+        assert_eq!(eval(&mut i, ".t tag cget strong -foreground"), "red");
+        eval(&mut i, ".t tag remove strong 1.0 1.2");
+        assert_eq!(eval(&mut i, ".t tag ranges strong"), "1.2 1.5");
+        eval(&mut i, ".t tag delete strong");
+        assert_eq!(eval(&mut i, ".t tag names"), "");
+
+        assert_eq!(
+            eval(
+                &mut i,
+                "image create photo img -file /tmp/x.png -width 10 -height 20"
+            ),
+            "img"
+        );
+        assert_eq!(eval(&mut i, "image names"), "img");
+        assert_eq!(eval(&mut i, "image width img"), "10");
+        assert_eq!(eval(&mut i, "image type img"), "photo");
+        assert_eq!(eval(&mut i, "img cget -file"), "/tmp/x.png");
+        eval(&mut i, "image delete img");
+        assert_eq!(eval(&mut i, "image exists img"), "0");
+
+        eval(&mut i, "canvas .c -width 100 -height 80");
+        let id = eval(
+            &mut i,
+            ".c create rectangle 0 0 10 20 -fill red -outline blue",
+        );
+        eval(&mut i, &format!("set id {id}"));
+        assert_eq!(eval(&mut i, ".c coords $id"), "0 0 10 20");
+        assert_eq!(eval(&mut i, ".c itemcget $id -fill"), "red");
+        eval(&mut i, ".c itemconfigure $id -fill green");
+        assert_eq!(eval(&mut i, ".c itemcget $id -fill"), "green");
+        eval(&mut i, ".c coords $id 1 2 30 40");
+        assert_eq!(eval(&mut i, ".c coords $id"), "1 2 30 40");
+        assert_eq!(eval(&mut i, ".c find"), id);
+        eval(&mut i, ".c delete $id");
+        assert_eq!(eval(&mut i, ".c find"), "");
     }
 
     #[test]

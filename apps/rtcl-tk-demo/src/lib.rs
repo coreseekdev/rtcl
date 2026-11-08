@@ -146,6 +146,13 @@ pack .themed -padx 8 -pady 4
 ::rtcl::chart .chart -title "Sales" -values {3 7 5} -labels {A B C} -width 320 -height 140
 pack .chart -padx 8 -pady 4
 
+canvas .cv -width 240 -height 90 -background "#f8fafc"
+.cv create rectangle 10 10 110 70 -fill "#93c5fd" -outline "#1d4ed8"
+.cv create oval 130 10 220 70 -fill "#fca5a5"
+.cv create line 20 80 220 80 -fill "#111827" -width 2
+.cv create text 120 40 -text "Canvas"
+pack .cv -padx 8 -pady 4
+
 focus .form.nameEntry
 bind .form.nameEntry <Return> {.form.ok invoke}
 set ::message ""

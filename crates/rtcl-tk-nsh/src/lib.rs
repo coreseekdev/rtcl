@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use nsh_base::SliderValue;
 use nsh_core::element::desktop;
-use nsh_core::geometry::Axis;
+use nsh_core::geometry::{Axis, Point, Radians, Size};
 use nsh_core::prelude::*;
 use rtcl_tk_core::{Fill, PackSide, TkTree, WidgetKind};
 
@@ -68,6 +68,14 @@ fn revision_signal() -> Signal<u64> {
 pub fn TkView() -> impl IntoElement {
     start_event_pump();
     let revision = revision_signal();
+    if matches!(os(), nsh_core::platform::Os::MacOs) {
+        // Re-publish the Tk menu whenever the model changes, under the
+        // component's owner so the handlers outlive dynamic re-renders.
+        effect(move || {
+            let _ = revision.get();
+            sync_native_menu();
+        });
+    }
     view()
         .flex_col()
         .w_full()
@@ -84,10 +92,10 @@ pub fn TkView() -> impl IntoElement {
                             desktop::set_title(title);
                         }
                     }
-                    if native {
-                        sync_native_menu();
-                    } else if let Some(bar) = &bar {
-                        column = column.child(render_menu_bar(bar));
+                    if !native {
+                        if let Some(bar) = &bar {
+                            column = column.child(render_menu_bar(bar));
+                        }
                     }
                     column = column.child(render_children(&tree, "."));
                     // The dropdown floats over the content.
@@ -237,6 +245,27 @@ fn parse_color(value: &str) -> Option<AdaptiveColor> {
 fn option_color(tree: &TkTree, path: &str, name: &str) -> Option<AdaptiveColor> {
     let value = option(tree, path, name);
     (!value.is_empty()).then(|| parse_color(value)).flatten()
+}
+
+fn image_file_of(tree: &TkTree, path: &str) -> Option<String> {
+    let name = option(tree, path, "-image");
+    if name.is_empty() {
+        return None;
+    }
+    rtcl_tk_runtime::image_path(name)
+}
+
+fn sized_image(file: String, name: &str) -> AnyElement {
+    let mut element = nsh_core::element::image(file);
+    if let Some((width, height)) = rtcl_tk_runtime::image_dimensions(name) {
+        if width > 0 {
+            element = element.w(px(width as f32));
+        }
+        if height > 0 {
+            element = element.h(px(height as f32));
+        }
+    }
+    element.into_element()
 }
 
 fn font_of(tree: &TkTree, path: &str) -> (Option<SharedString>, f32, bool) {
@@ -633,6 +662,9 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             frame.child(render_children(tree, path)).into_element()
         }
         WidgetKind::Label => {
+            if let Some(file) = image_file_of(tree, path) {
+                return sized_image(file, option(tree, path, "-image"));
+            }
             let font = font_of(tree, path);
             let mut container = view().w_full().items_start();
             if let Some(bg) = option_color(tree, path, "-background") {
@@ -660,13 +692,17 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
                 .bg(option_color(tree, path.as_str(), "-background")
                     .unwrap_or(AdaptiveColor::rgb(0xf3f4f6, 0x374151)))
-                .disabled(disabled)
-                .child(styled_text(
+                .disabled(disabled);
+            button = if let Some(file) = image_file_of(tree, path.as_str()) {
+                button.child(sized_image(file, option(tree, path.as_str(), "-image")))
+            } else {
+                button.child(styled_text(
                     rtcl_tk_runtime::display_text(&path),
                     &font_of(tree, path.as_str()),
                     option_color(tree, path.as_str(), "-foreground")
                         .unwrap_or(AdaptiveColor::rgb(0x111827, 0xf9fafb)),
-                ));
+                ))
+            };
             if !disabled {
                 let press_path = path.clone();
                 button = button.on_press(move |_: &()| {
@@ -1164,6 +1200,121 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 column = column.child(list);
             }
             column.into_element()
+        }
+        WidgetKind::Canvas => {
+            let width = option(tree, path, "-width")
+                .parse::<f32>()
+                .unwrap_or(378.0)
+                .max(1.0);
+            let height = option(tree, path, "-height")
+                .parse::<f32>()
+                .unwrap_or(265.0)
+                .max(1.0);
+            let Some(model) = rtcl_tk_runtime::canvas_snapshot(path) else {
+                return view().into_element();
+            };
+            let mut painter = Painter::new();
+            for item in &model.items {
+                let coords = &item.coords;
+                let option =
+                    |name: &str| item.options.get(name).and_then(|value| parse_color(value));
+                match item.kind.as_str() {
+                    "rectangle" if coords.len() >= 4 => {
+                        let (x, y, w, h) = (
+                            coords[0] as f32,
+                            coords[1] as f32,
+                            (coords[2] - coords[0]) as f32,
+                            (coords[3] - coords[1]) as f32,
+                        );
+                        if let Some(fill) = option("-fill") {
+                            painter = painter.fill_color(fill.light).fill_rect(x, y, w, h);
+                        }
+                        if let Some(outline) = option("-outline") {
+                            painter = painter
+                                .stroke_color(outline.light)
+                                .line_width(1.0f32)
+                                .begin_path()
+                                .rect(nsh_core::geometry::Bounds::new(
+                                    Point::new(Points(coords[0] as f32), Points(coords[1] as f32)),
+                                    Size::new(Points(w), Points(h)),
+                                ))
+                                .stroke();
+                        }
+                    }
+                    "line" if coords.len() >= 4 => {
+                        let color = option("-fill")
+                            .or_else(|| option("-outline"))
+                            .unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
+                        let line_width = item
+                            .options
+                            .get("-width")
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .unwrap_or(1.0);
+                        painter = painter
+                            .stroke_color(color.light)
+                            .line_width(line_width)
+                            .begin_path()
+                            .move_to(coords[0] as f32, coords[1] as f32);
+                        for pair in coords[2..].chunks(2) {
+                            if pair.len() == 2 {
+                                painter = painter.line_to(pair[0] as f32, pair[1] as f32);
+                            }
+                        }
+                        painter = painter.stroke();
+                    }
+                    "oval" if coords.len() >= 4 => {
+                        let center = Point::new(
+                            Points(((coords[0] + coords[2]) / 2.0) as f32),
+                            Points(((coords[1] + coords[3]) / 2.0) as f32),
+                        );
+                        let radii = Size::new(
+                            Points(((coords[2] - coords[0]).abs() / 2.0) as f32),
+                            Points(((coords[3] - coords[1]).abs() / 2.0) as f32),
+                        );
+                        painter = painter.begin_path().ellipse(
+                            center,
+                            radii,
+                            Radians(0.0),
+                            Radians(0.0),
+                            Radians(std::f32::consts::TAU),
+                            false,
+                        );
+                        if let Some(fill) = option("-fill") {
+                            painter = painter.fill_color(fill.light).fill();
+                        }
+                        if let Some(outline) = option("-outline") {
+                            painter = painter
+                                .stroke_color(outline.light)
+                                .line_width(1.0f32)
+                                .stroke();
+                        }
+                    }
+                    "text" if coords.len() >= 2 => {
+                        let text = item.options.get("-text").cloned().unwrap_or_default();
+                        if !text.is_empty() {
+                            let color =
+                                option("-fill").unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
+                            painter = painter.fill_color(color.light).fill_text(
+                                &text,
+                                coords[0] as f32,
+                                coords[1] as f32,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut container = view().w(px(width)).h(px(height)).items_start();
+            if let Some(bg) = option_color(tree, path, "-background") {
+                container = container.bg(bg);
+            }
+            container
+                .child(
+                    nsh_core::element::canvas(painter)
+                        .w(px(width))
+                        .h(px(height)),
+                )
+                .into_element()
         }
         WidgetKind::Chart => {
             let width = option(tree, path, "-width")

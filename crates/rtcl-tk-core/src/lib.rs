@@ -43,6 +43,8 @@ pub enum WidgetKind {
     Labelframe,
     /// `::rtcl::chart`: a simple native bar chart.
     Chart,
+    /// `canvas`: static shapes drawn with nsh's canvas painter.
+    Canvas,
 }
 
 impl WidgetKind {
@@ -67,6 +69,7 @@ impl WidgetKind {
             "treeview" => Self::Treeview,
             "labelframe" => Self::Labelframe,
             "chart" => Self::Chart,
+            "canvas" => Self::Canvas,
             _ => return None,
         })
     }
@@ -93,6 +96,7 @@ impl WidgetKind {
             Self::Treeview => "Treeview",
             Self::Labelframe => "TLabelframe",
             Self::Chart => "Chart",
+            Self::Canvas => "Canvas",
         }
     }
 
@@ -1108,6 +1112,23 @@ const LABELFRAME_OPTIONS: &[&str] = &[
     "-width",
 ];
 
+const CANVAS_OPTIONS: &[&str] = &[
+    "-background",
+    "-borderwidth",
+    "-closeenough",
+    "-cursor",
+    "-height",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-relief",
+    "-scrollregion",
+    "-takefocus",
+    "-width",
+    "-xscrollcommand",
+    "-yscrollcommand",
+];
+
 const CHART_OPTIONS: &[&str] = &[
     "-background",
     "-cursor",
@@ -1178,6 +1199,7 @@ pub fn known_options(kind: WidgetKind) -> &'static [&'static str] {
         WidgetKind::Treeview => TREEVIEW_OPTIONS,
         WidgetKind::Labelframe => LABELFRAME_OPTIONS,
         WidgetKind::Chart => CHART_OPTIONS,
+        WidgetKind::Canvas => CANVAS_OPTIONS,
     }
 }
 
@@ -1200,6 +1222,7 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
             WidgetKind::Scale => "100",
             WidgetKind::Combobox => "20",
             WidgetKind::Chart => "300",
+            WidgetKind::Canvas => "378",
             _ => "0",
         },
         "-height" => match kind {
@@ -1208,6 +1231,7 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
             WidgetKind::Combobox => "10",
             WidgetKind::Treeview => "10",
             WidgetKind::Chart => "160",
+            WidgetKind::Canvas => "265",
             _ => "0",
         },
         "-text" | "-label" | "-textvariable" | "-variable" | "-command" => "",

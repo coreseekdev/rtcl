@@ -10,7 +10,7 @@
 //! Scope: Tk 8.6-compatible *widget model* for the native track described
 //! in `docs/UI-NATIVE-TK.md`.  The web/AI `ui::*` DSL is separate.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Widget kinds in the v1 native Tk surface.  `Toplevel` is also the root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +42,30 @@ impl WidgetKind {
             "listbox" => Self::Listbox,
             _ => return None,
         })
+    }
+
+    /// The Tk class name (`winfo class`).
+    pub fn class_name(self) -> &'static str {
+        match self {
+            Self::Toplevel => "Toplevel",
+            Self::Frame => "Frame",
+            Self::Label => "Label",
+            Self::Button => "Button",
+            Self::Entry => "Entry",
+            Self::Checkbutton => "Checkbutton",
+            Self::Radiobutton => "Radiobutton",
+            Self::Scale => "Scale",
+            Self::Text => "Text",
+            Self::Listbox => "Listbox",
+        }
+    }
+
+    /// Whether the widget displays `-text` / `-textvariable`.
+    pub fn has_text(self) -> bool {
+        matches!(
+            self,
+            Self::Label | Self::Button | Self::Checkbutton | Self::Radiobutton
+        )
     }
 }
 
@@ -127,6 +151,22 @@ pub struct WidgetNode {
     pub options: BTreeMap<String, String>,
     pub pack: Option<PackInfo>,
     pub grid: Option<GridInfo>,
+    /// Event bindings (`<Button-1>`) to Tcl scripts.
+    pub bindings: BTreeMap<String, String>,
+    /// Editable content of Entry/Text (not a Tk option).
+    pub content: String,
+    /// Items of a Listbox, and its selected indices.
+    pub items: Vec<String>,
+    pub selected: BTreeSet<usize>,
+    /// Value of a Scale.
+    pub value: f64,
+    /// State of a Checkbutton without a `-variable`.
+    pub checked: bool,
+    /// Insertion cursor of Entry/Text (a character index).
+    pub cursor: usize,
+    /// Selected character range of an Entry: `(from, to)`, empty when
+    /// equal.
+    pub selection: (usize, usize),
 }
 
 impl WidgetNode {
@@ -145,6 +185,9 @@ pub enum TkError {
     AlreadyExists(String),
     CannotDestroyRoot,
     DuplicateChild(String),
+    /// The widget's parent already has slaves managed by the other
+    /// geometry manager.
+    AlreadyManaged(String),
 }
 
 impl std::fmt::Display for TkError {
@@ -155,6 +198,10 @@ impl std::fmt::Display for TkError {
             Self::AlreadyExists(p) => write!(f, "window name \"{p}\" already exists"),
             Self::CannotDestroyRoot => write!(f, "cannot destroy \".\""),
             Self::DuplicateChild(p) => write!(f, "window \"{p}\" already exists"),
+            Self::AlreadyManaged(p) => write!(
+                f,
+                "cannot use geometry manager inside \"{p}\" which already has slaves managed by another geometry manager"
+            ),
         }
     }
 }
@@ -188,6 +235,14 @@ impl TkTree {
                 options: BTreeMap::new(),
                 pack: None,
                 grid: None,
+                bindings: BTreeMap::new(),
+                content: String::new(),
+                items: Vec::new(),
+                selected: BTreeSet::new(),
+                value: 0.0,
+                checked: false,
+                cursor: 0,
+                selection: (0, 0),
             },
         );
         Self { nodes, root }
@@ -269,6 +324,14 @@ impl TkTree {
                 options: BTreeMap::new(),
                 pack: None,
                 grid: None,
+                bindings: BTreeMap::new(),
+                content: String::new(),
+                items: Vec::new(),
+                selected: BTreeSet::new(),
+                value: 0.0,
+                checked: false,
+                cursor: 0,
+                selection: (0, 0),
             },
         );
         Ok(path.to_string())
@@ -331,7 +394,26 @@ impl TkTree {
         Ok(node.options.get(option).map(String::as_str))
     }
 
+    /// Pack `path` in its parent.  A parent's slaves all use one manager,
+    /// as in Tk.
     pub fn pack(&mut self, path: &str, info: PackInfo) -> Result<(), TkError> {
+        let parent = self
+            .nodes
+            .get(path)
+            .and_then(|n| n.parent.clone())
+            .ok_or_else(|| TkError::NotFound(path.to_string()))?;
+        let conflict = self
+            .nodes
+            .get(&parent)
+            .map(|p| {
+                p.children
+                    .iter()
+                    .any(|c| c != path && self.nodes.get(c).is_some_and(|n| n.grid.is_some()))
+            })
+            .unwrap_or(false);
+        if conflict {
+            return Err(TkError::AlreadyManaged(parent));
+        }
         let node = self
             .nodes
             .get_mut(path)
@@ -341,7 +423,25 @@ impl TkTree {
         Ok(())
     }
 
+    /// Grid `path` in its parent.
     pub fn grid(&mut self, path: &str, info: GridInfo) -> Result<(), TkError> {
+        let parent = self
+            .nodes
+            .get(path)
+            .and_then(|n| n.parent.clone())
+            .ok_or_else(|| TkError::NotFound(path.to_string()))?;
+        let conflict = self
+            .nodes
+            .get(&parent)
+            .map(|p| {
+                p.children
+                    .iter()
+                    .any(|c| c != path && self.nodes.get(c).is_some_and(|n| n.pack.is_some()))
+            })
+            .unwrap_or(false);
+        if conflict {
+            return Err(TkError::AlreadyManaged(parent));
+        }
         let node = self
             .nodes
             .get_mut(path)
@@ -351,11 +451,83 @@ impl TkTree {
         Ok(())
     }
 
+    /// `pack forget`: stop managing `path`, keeping its other options.
+    pub fn unpack(&mut self, path: &str) -> Result<(), TkError> {
+        let node = self
+            .nodes
+            .get_mut(path)
+            .ok_or_else(|| TkError::NotFound(path.to_string()))?;
+        node.pack = None;
+        Ok(())
+    }
+
+    /// `grid forget` / `grid remove`.
+    pub fn ungrid(&mut self, path: &str) -> Result<(), TkError> {
+        let node = self
+            .nodes
+            .get_mut(path)
+            .ok_or_else(|| TkError::NotFound(path.to_string()))?;
+        node.grid = None;
+        Ok(())
+    }
+
+    /// The parent's children managed by `pack` or by `grid`.
+    pub fn slaves(&self, path: &str, manager: &str) -> Result<Vec<String>, TkError> {
+        let node = self
+            .nodes
+            .get(path)
+            .ok_or_else(|| TkError::NotFound(path.to_string()))?;
+        Ok(node
+            .children
+            .iter()
+            .filter(|c| {
+                self.nodes.get(*c).is_some_and(|n| match manager {
+                    "pack" => n.pack.is_some(),
+                    "grid" => n.grid.is_some(),
+                    _ => false,
+                })
+            })
+            .cloned()
+            .collect())
+    }
+
     pub fn children(&self, path: &str) -> Result<&[String], TkError> {
         self.nodes
             .get(path)
             .map(|n| n.children.as_slice())
             .ok_or_else(|| TkError::NotFound(path.to_string()))
+    }
+
+    /// Set (or clear, with an empty script) a binding on `path`.  `"all"`
+    /// and class bindings are not part of the v1 model.
+    pub fn bind(&mut self, path: &str, sequence: &str, script: &str) -> Result<(), TkError> {
+        let node = self
+            .nodes
+            .get_mut(path)
+            .ok_or_else(|| TkError::NotFound(path.to_string()))?;
+        if script.is_empty() {
+            node.bindings.remove(sequence);
+        } else {
+            node.bindings
+                .insert(sequence.to_string(), script.to_string());
+        }
+        Ok(())
+    }
+
+    pub fn binding(&self, path: &str, sequence: &str) -> Result<Option<&str>, TkError> {
+        let node = self
+            .nodes
+            .get(path)
+            .ok_or_else(|| TkError::NotFound(path.to_string()))?;
+        Ok(node.bindings.get(sequence).map(String::as_str))
+    }
+
+    pub fn binding_sequences(&self, path: &str) -> Result<Vec<String>, TkError> {
+        let node = self
+            .nodes
+            .get(path)
+            .ok_or_else(|| TkError::NotFound(path.to_string()))?;
+        Ok(node.bindings.keys().cloned().collect())
     }
 }
 
@@ -394,6 +566,431 @@ pub fn valid_option(name: &str) -> bool {
         && name[1..]
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+const COMMON_OPTIONS: &[&str] = &[
+    "-background",
+    "-borderwidth",
+    "-cursor",
+    "-font",
+    "-foreground",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-relief",
+    "-takefocus",
+    "-padx",
+    "-pady",
+];
+
+const TOPLEVEL_OPTIONS: &[&str] = &[
+    "-background",
+    "-borderwidth",
+    "-class",
+    "-colormap",
+    "-container",
+    "-cursor",
+    "-height",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-menu",
+    "-padx",
+    "-pady",
+    "-relief",
+    "-screen",
+    "-takefocus",
+    "-use",
+    "-visual",
+    "-width",
+    // `wm` pseudo-options kept on the root node.
+    "-title",
+    "-geometry",
+    "-resizable",
+    "-minsize",
+    "-maxsize",
+    "-state",
+    "-withdrawn",
+    "-iconify",
+    "-protocol",
+];
+
+const FRAME_OPTIONS: &[&str] = &[
+    "-background",
+    "-borderwidth",
+    "-class",
+    "-colormap",
+    "-container",
+    "-cursor",
+    "-height",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-padx",
+    "-pady",
+    "-relief",
+    "-takefocus",
+    "-visual",
+    "-width",
+];
+
+const LABEL_OPTIONS: &[&str] = &[
+    "-anchor",
+    "-background",
+    "-bitmap",
+    "-borderwidth",
+    "-compound",
+    "-cursor",
+    "-font",
+    "-foreground",
+    "-height",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-image",
+    "-justify",
+    "-padx",
+    "-pady",
+    "-relief",
+    "-state",
+    "-takefocus",
+    "-text",
+    "-textvariable",
+    "-underline",
+    "-width",
+    "-wraplength",
+];
+
+const BUTTON_OPTIONS: &[&str] = &[
+    "-anchor",
+    "-background",
+    "-bitmap",
+    "-borderwidth",
+    "-command",
+    "-compound",
+    "-cursor",
+    "-default",
+    "-font",
+    "-foreground",
+    "-height",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-image",
+    "-justify",
+    "-overrelief",
+    "-padx",
+    "-pady",
+    "-relief",
+    "-state",
+    "-takefocus",
+    "-text",
+    "-textvariable",
+    "-underline",
+    "-width",
+    "-wraplength",
+];
+
+const ENTRY_OPTIONS: &[&str] = &[
+    "-background",
+    "-borderwidth",
+    "-cursor",
+    "-exportselection",
+    "-font",
+    "-foreground",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-invalidcommand",
+    "-justify",
+    "-padx",
+    "-pady",
+    "-relief",
+    "-show",
+    "-state",
+    "-takefocus",
+    "-textvariable",
+    "-validate",
+    "-validatecommand",
+    "-width",
+    "-xscrollcommand",
+];
+
+const CHECKBUTTON_OPTIONS: &[&str] = &[
+    "-anchor",
+    "-background",
+    "-bitmap",
+    "-borderwidth",
+    "-command",
+    "-compound",
+    "-cursor",
+    "-font",
+    "-foreground",
+    "-height",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-image",
+    "-indicatoron",
+    "-justify",
+    "-offvalue",
+    "-onvalue",
+    "-padx",
+    "-pady",
+    "-relief",
+    "-selectcolor",
+    "-selectimage",
+    "-state",
+    "-takefocus",
+    "-text",
+    "-textvariable",
+    "-underline",
+    "-variable",
+    "-width",
+    "-wraplength",
+];
+
+const RADIOBUTTON_OPTIONS: &[&str] = &[
+    "-anchor",
+    "-background",
+    "-bitmap",
+    "-borderwidth",
+    "-command",
+    "-compound",
+    "-cursor",
+    "-font",
+    "-foreground",
+    "-height",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-image",
+    "-indicatoron",
+    "-justify",
+    "-padx",
+    "-pady",
+    "-relief",
+    "-selectcolor",
+    "-selectimage",
+    "-state",
+    "-takefocus",
+    "-text",
+    "-textvariable",
+    "-underline",
+    "-value",
+    "-variable",
+    "-width",
+    "-wraplength",
+];
+
+const SCALE_OPTIONS: &[&str] = &[
+    "-activebackground",
+    "-background",
+    "-bigincrement",
+    "-borderwidth",
+    "-command",
+    "-cursor",
+    "-digits",
+    "-font",
+    "-foreground",
+    "-from",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-label",
+    "-length",
+    "-orient",
+    "-relief",
+    "-resolution",
+    "-showvalue",
+    "-sliderlength",
+    "-sliderrelief",
+    "-state",
+    "-takefocus",
+    "-tickinterval",
+    "-to",
+    "-troughcolor",
+    "-variable",
+    "-width",
+];
+
+const TEXT_OPTIONS: &[&str] = &[
+    "-background",
+    "-borderwidth",
+    "-cursor",
+    "-font",
+    "-foreground",
+    "-height",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-insertbackground",
+    "-maxundo",
+    "-padx",
+    "-pady",
+    "-relief",
+    "-selectbackground",
+    "-spacing1",
+    "-spacing2",
+    "-spacing3",
+    "-state",
+    "-tabs",
+    "-takefocus",
+    "-undo",
+    "-width",
+    "-wrap",
+    "-xscrollcommand",
+    "-yscrollcommand",
+];
+
+const LISTBOX_OPTIONS: &[&str] = &[
+    "-activestyle",
+    "-background",
+    "-borderwidth",
+    "-cursor",
+    "-exportselection",
+    "-font",
+    "-foreground",
+    "-height",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-listvariable",
+    "-relief",
+    "-selectbackground",
+    "-selectborderwidth",
+    "-selectforeground",
+    "-selectmode",
+    "-setgrid",
+    "-state",
+    "-takefocus",
+    "-width",
+    "-xscrollcommand",
+    "-yscrollcommand",
+];
+
+/// Options Tk 8.6 accepts for `kind` (including the ones kept on the node
+/// as `wm` pseudo-options for toplevels).
+pub fn known_options(kind: WidgetKind) -> &'static [&'static str] {
+    match kind {
+        WidgetKind::Toplevel => TOPLEVEL_OPTIONS,
+        WidgetKind::Frame => FRAME_OPTIONS,
+        WidgetKind::Label => LABEL_OPTIONS,
+        WidgetKind::Button => BUTTON_OPTIONS,
+        WidgetKind::Entry => ENTRY_OPTIONS,
+        WidgetKind::Checkbutton => CHECKBUTTON_OPTIONS,
+        WidgetKind::Radiobutton => RADIOBUTTON_OPTIONS,
+        WidgetKind::Scale => SCALE_OPTIONS,
+        WidgetKind::Text => TEXT_OPTIONS,
+        WidgetKind::Listbox => LISTBOX_OPTIONS,
+    }
+}
+
+/// The value Tk reports for an option a script never configured.
+pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
+    Some(match name {
+        "-background" => "#d9d9d9",
+        "-foreground" => "#000000",
+        "-highlightbackground" => "#d9d9d9",
+        "-highlightcolor" => "#000000",
+        "-font" => "TkDefaultFont",
+        "-relief" => "flat",
+        "-borderwidth" | "-highlightthickness" => "0",
+        "-cursor" | "-takefocus" => "",
+        "-padx" | "-pady" => "0",
+        "-width" => match kind {
+            WidgetKind::Entry => "20",
+            WidgetKind::Text => "80",
+            WidgetKind::Listbox => "20",
+            WidgetKind::Scale => "100",
+            _ => "0",
+        },
+        "-height" => match kind {
+            WidgetKind::Text => "24",
+            WidgetKind::Listbox => "10",
+            _ => "0",
+        },
+        "-text" | "-label" | "-textvariable" | "-variable" | "-command" => "",
+        "-anchor" => "center",
+        "-justify" => match kind {
+            WidgetKind::Button | WidgetKind::Checkbutton | WidgetKind::Radiobutton => "center",
+            _ => "left",
+        },
+        "-wraplength" | "-overrelief" | "-image" | "-bitmap" | "-show" => "",
+        "-compound" => "none",
+        "-underline" => "-1",
+        "-state" => "normal",
+        "-default" => "disabled",
+        "-onvalue" => "1",
+        "-offvalue" => "0",
+        "-value" => "",
+        "-from" => "0",
+        "-to" => "100",
+        "-resolution" => "1",
+        "-orient" => "vertical",
+        "-showvalue" => "1",
+        "-digits" => "0",
+        "-tickinterval" => "0",
+        "-sliderlength" => "30",
+        "-sliderrelief" => "raised",
+        "-bigincrement" => "0",
+        "-length" => "100",
+        "-troughcolor" | "-activebackground" => "#d9d9d9",
+        "-validate" => "none",
+        "-validatecommand" | "-invalidcommand" | "-xscrollcommand" | "-yscrollcommand" => "",
+        "-exportselection" => "1",
+        "-wrap" => "char",
+        "-undo" | "-maxundo" | "-spacing1" | "-spacing2" | "-spacing3" | "-tabs" => "0",
+        "-insertbackground" | "-selectbackground" | "-selectforeground" => "",
+        "-selectmode" => "browse",
+        "-activestyle" => "underline",
+        "-listvariable" | "-selectborderwidth" | "-setgrid" => "",
+        "-indicatoron" => "1",
+        "-selectcolor" => "#b03060",
+        "-selectimage" => "",
+        "-class" => "Frame",
+        "-colormap" | "-container" | "-screen" | "-use" | "-visual" | "-menu" => "",
+        "-title" | "-geometry" | "-maxsize" => "",
+        "-resizable" => "1 1",
+        "-minsize" => "0 0",
+        "-withdrawn" | "-iconify" => "0",
+        "-protocol" => "",
+        _ => return None,
+    })
+}
+
+/// How an option abbreviation resolves against a widget's known options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OptionLookup {
+    Found(String),
+    Ambiguous(Vec<String>),
+    Unknown,
+}
+
+/// Resolve Tk's unique-prefix option abbreviations (`-tex` → `-text`).
+/// `stored` are the keys already set on the node (all canonical).
+pub fn lookup_option<'a>(
+    kind: WidgetKind,
+    name: &str,
+    stored: impl IntoIterator<Item = &'a str>,
+) -> OptionLookup {
+    let mut all: Vec<String> = known_options(kind)
+        .iter()
+        .copied()
+        .chain(stored)
+        .map(|s| s.to_string())
+        .collect();
+    if let Some(exact) = all.iter().find(|o| o.as_str() == name) {
+        return OptionLookup::Found(exact.clone());
+    }
+    all.sort();
+    all.dedup();
+    let matches: Vec<String> = all.into_iter().filter(|o| o.starts_with(name)).collect();
+    match matches.len() {
+        0 => OptionLookup::Unknown,
+        1 => OptionLookup::Found(matches.into_iter().next().unwrap()),
+        _ => OptionLookup::Ambiguous(matches),
+    }
 }
 
 #[cfg(test)]

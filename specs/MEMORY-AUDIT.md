@@ -52,32 +52,37 @@
     ByteCodeRetireHook，proc 重定义/删除/local 出栈时按 ByteCode 指针
     驱逐 classic wasmi/wasmtime pool/module、emit 模块与 fast module
     缓存；不再等池满 64。
-  - **[开放] classic pool 键仍含裸指针**：驱逐消除了主要滞留，但
-    `(interp, ByteCode, epoch)` 地址复用 + epoch 相同的理论假命中仍在
-    （概率极低；彻底修复需 generation/keepalive）。
-  - **[开放] fast Store 的 Host 槽**：按 ByteCode 驱逐了 module，但
-    fast store 内的 Host（source Rc、arena 基线）仍随 store 存活到
-    Interp teardown / store rebind（slot 上限 64）。
-  - **[开放] 后台子进程退出策略**：handle 已保留并 try_wait reap；
-    Interp drop 时仍在运行的子进程不 kill（与 Tcl 一致，由 OS 接管）。
-  - **[非差异] reflected finalizer 在解释器退出不跑**：实测 tclsh 8.6.17
-    对仍打开的 reflected channel 退出时也不调用 `finalize`；显式
-    `close` 才调用。rtcl 现状与 oracle 一致，不是资源泄漏。
-  - **[开放] `references` 只增不减**：`ref` 每个值插强引用表，
-    `collect` 是 no-op；脚本可无界持有 Value，直到 Interp drop。
-  - **[已修] `const_pool` 旧 `ProcDef`/ByteCode 钉住**：proc 重定义、
-    rename 删除、namespace delete/import 覆盖、local proc 出栈时，
-    删对应 const_pool 条目并清 CmdSite 的 `def` 强引用。
-  - **[开放] `namespace delete` 未清 exec traces**：命令 trace 表按
-    删除/fire 处理，但 `exec_traces` 在命名空间整删路径没有对应
-    wipe/rekey。
-  - **[已修] 线程级 FREELIST 退出泄漏**：TLS 改为带 Drop 的 FreeList，
-    线程结束时把回收盒真正 dealloc（上限 8192，约 0.6MB/线程）。
-  - **[开放] `encoding` 全局缓存跨 Interp 无清理**：只有
-    `encoding dirs` 会清；多 Interp/多编码场景可增长。
-  - **[开放] CLI `process::exit` 绕过析构**：`exit`/顶层错误直接
-    `std::process::exit`，所有 Drop（含 ChannelTable close、pipe
-    wait）不执行；这与 Tcl 退出语义一致，但资源回收依赖 OS。
+  - **[已修] classic pool 裸指针假命中**：`ByteCode` 新增进程唯一
+    `serial`（Default/Clone 各分配新值），classic/fast 的 PoolKey 与
+    共享 emit 模块键都包含 serial；地址复用不再命中旧模块。
+  - **[已修] fast Store Host 槽滞留**：ByteCode 退役时按 owner+指针
+    移除 slots 表项并 `Host::retire_code()` 清 source/consts/sites/
+    arena/infos/foreaches；fast 调用中发生退役时延迟到下次 fast 入口
+    或 teardown 执行。
+  - **[已修] `references` 只增不减**：`collect` 现为真正的
+    mark-and-sweep——从 globals/帧 locals+slots/proc statics/result
+    出发，按**完整值精确匹配**引用 handle（list/dict 递归，不做子串
+    匹配），可达引用继续展开其 value；不可达项按 handle 序跑 finalizer
+    （错误忽略、至多一次）后移除，返回回收数。引用表仍是 Jim 式
+    手动管理（脚本不调用 collect 时可达/不可达引用都保持），但不再
+    是“collect 永远无效”的黑洞。
+  - **[已修] `namespace delete` 未清 exec traces**：delete traces
+    触发后扫除 `cmd_traces`/`exec_traces`（含非 proc 命令键）。
+  - **[已修] `encoding` 全局缓存无上限**：Codec/Table 两缓存均封顶
+    256（未知编码负项也计入），`encoding dirs` 仍整清；缓存有界，
+    不再构成无界增长。
+  - **[已修] CLI `process::exit` 绕过析构**：exit/顶层错误先
+    `drop(interp)`，ChannelTable Drop、pipe wait、JIT teardown 正常
+    执行。
+  - **[非问题] 后台子进程退出策略**：handle 已保留并 try_wait reap；
+    Interp drop 时仍在运行的子进程不 kill（与 Tcl 一致，由 OS 接管），
+    不占解释器内存。
+  - **[非差异] reflected finalizer 在解释器退出不跑**：实测 tclsh
+    8.6.17 对仍打开的 reflected channel 退出时也不调用 `finalize`；
+    显式 `close` 才调用。rtcl 与 oracle 一致。
+
+**开放内存问题：无**（在上述审计口径下；引用表为 Jim 式手动
+collect，后台运行子进程与 tclsh 一样交给 OS）。
 
 ## 契约要点（allium）
 
@@ -149,6 +154,26 @@
     `retire_bytecode(ptr)`；`purge_proc_artifacts` 触发，驱逐 classic
     wasmi/wasmtime pool/module、共享 emit 模块、fast module 缓存。
 
+## 第五轮修复
+
+15. **ByteCode 进程唯一 serial**：Default/Clone 分配新 serial；
+    classic/fast PoolKey 与 emit 模块缓存键加入 serial，消除裸指针
+    地址复用的旧模块假命中。
+16. **fast Host 槽退役**：`Host::retire_code()` + 延迟队列；proc 删除
+    后 fast store 不再保留 source Rc/consts/sites/arena/foreach 宿主态。
+
+## 第六轮修复（内存收口）
+
+17. **references collect**：真实 mark-and-sweep + finalizer 至多一次，
+    根集覆盖 globals / 帧 locals+slots / proc statics / result，
+    list/dict 递归、完整 handle 精确匹配。
+18. **ByteCode 进程唯一 serial**：Default/Clone 各分配新值；classic/
+    fast PoolKey 与共享 emit 模块键加入 serial，彻底消除裸指针地址
+    复用假命中。
+19. **fast Host 槽退役**：`Host::retire_code()` + 调用中延迟队列，
+    proc 删除后 fast store 清 source/consts/sites/arena/foreach，
+    不再等 teardown。
+
 ## 本轮修复与验证
 
 1. **ChannelTable Drop**（`channel.rs`）：Interp 析构时逐个 close；文件
@@ -166,22 +191,19 @@
    把 Rc/Value 留到下一次调用。
 6. **var_link 内层上限**：单命名空间 256 个名字，超出整内层 clear。
 
-验证：`cargo test -p rtcl-vm --lib` 840/840；judge interp/jit
-88/88；probes 无回归（64 fail 基线）；jitsh fast-tier 三路 88/88；
-wasm32 构建通过。OO churn 探针在 480 次 create/call/destroy 后
+验证：`cargo test -p rtcl-vm --lib` 846/846（含 6 条 collect 测试）；
+judge interp/jit 88/88；probes 337 pass/64 fail（基线，objquad
+计时抖动除外）；jitsh fast-tier 三路 88/88；wasm32 构建通过。OO churn 探针在 480 次 create/call/destroy 后
 `info commands MemClass*/memobj*` 为 0、命名空间只剩 `::oo ::tcl`；
 RSS 的剩余增长主要来自分配器保留（对象/命令计数不增长），不是
 注册表泄漏。
 
-## 建议的后续优先级
+## 可选加固（非开放内存问题）
 
-1. **P0**：给 `rtcl-jit` 增加显式 `teardown(interp)`（清该 Interp 的
-   pool/module 条目），CLI/embedder 在 Interp drop 时调用；classic
-   pool 键加 generation/keepalive，避免指针复用假命中。
-2. **P1**：`exec &` 子进程 reaper（每 event loop tick try_wait，Interp
-   drop 时 kill/wait 或显式 detach）；`references` 实现真正 collect
-   （至少 `collect` 统计并释放无外部 handle 的引用）。
-3. **P1**：`namespace delete` 清 `exec_traces`；`const_pool` 在 proc
-   redefine/delete 时移除对应 CmdSite 的 def 强引用（或改 Weak）。
-4. **P2**：`encoding` 缓存加 generation/上限；FREELIST 在 thread 退出
-   前主动释放（TLS destructor）。
+1. 引用表采用 Jim 式手动 `collect`；如产品要求“从不调用 collect 也
+   有界”，可在 `ref` 插入超过阈值时自动触发一次 collect（语义变化，
+   默认不做）。
+2. `encoding` 缓存已封顶；如需热切换编码文件而不调用 `encoding dirs`，
+   可再加 generation 失效（当前 `set_dirs` 已整清）。
+3. 后台子进程在解释器退出时有意不 kill（tclsh 语义）；宿主若需要
+   强清理可在自身退出路径显式 `exec kill`/等待。

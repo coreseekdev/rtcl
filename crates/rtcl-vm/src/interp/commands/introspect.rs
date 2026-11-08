@@ -4,6 +4,12 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::interp::Interp;
 use crate::value::Value;
 
+#[cfg(not(feature = "embedded"))]
+use std::collections::HashSet;
+
+#[cfg(feature = "embedded")]
+use alloc::collections::BTreeSet as HashSet;
+
 // ---------- exists ----------
 
 /// exists ?-var|-proc|-command|-alias? name
@@ -228,16 +234,118 @@ pub fn cmd_setref(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(old_value)
 }
 
-/// collect — Run finalizers on unreferenced values.
-/// In rtcl we don't have a GC, but we provide the command for compatibility.
+/// collect — run finalizers on unreferenced values.
+///
+/// Mark-and-sweep over the reference table: every value reachable from
+/// the interpreter state (globals, live frames, proc statics, `result`)
+/// is scanned for exact reference-handle strings; a referenced entry is
+/// kept only when its handle appears that way, either in a root value or
+/// in the value of another reachable entry.  Entries left unreachable
+/// have their finalizer evaluated (errors ignored, like trace
+/// callbacks), then are removed.  Returns the number of collected refs.
 pub fn cmd_collect(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::wrong_args("collect", 1, args.len()));
     }
-    // Simple mark-and-sweep: find references that aren't stored in any variable
-    // For now, just return 0 (no collection needed)
-    let _ = interp;
-    Ok(Value::from_int(0))
+
+    // Snapshot the roots first: the mark phase only needs clones, and
+    // finalizers below must run without any borrow of the tables held.
+    let mut work: Vec<Value> = Vec::new();
+    for value in interp.globals.values() {
+        work.push(value.clone());
+    }
+    for frame in &interp.frames {
+        for value in frame.locals.values() {
+            work.push(value.clone());
+        }
+        for value in &frame.slots {
+            if !value.is_unset() {
+                work.push(value.clone());
+            }
+        }
+    }
+    for def in interp.procs.values() {
+        for value in def.statics.values() {
+            work.push(value.clone());
+        }
+    }
+    work.push(interp.result.clone());
+
+    let handles: HashSet<String> = interp.references.keys().cloned().collect();
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut found: Vec<String> = Vec::new();
+    while let Some(value) = work.pop() {
+        found.clear();
+        scan_for_handles(&value, &handles, &mut found);
+        for handle in found.drain(..) {
+            // Each entry is scanned at most once; unreachable entries are
+            // never scanned, so a handle inside one cannot keep it alive.
+            if !reachable.insert(handle.clone()) {
+                continue;
+            }
+            if let Some(info) = interp.references.get(&handle) {
+                work.push(info.value.clone());
+            }
+        }
+    }
+
+    let mut dead: Vec<String> = interp
+        .references
+        .keys()
+        .filter(|handle| !reachable.contains(handle.as_str()))
+        .cloned()
+        .collect();
+    // Stable finalizer order (handle ids are zero-padded hex).
+    dead.sort();
+
+    let mut collected = 0;
+    for handle in dead {
+        // Take the finalizer before running it: a re-entrant `collect`
+        // then cannot fire the same finalizer twice.
+        let finalizer = interp
+            .references
+            .get_mut(&handle)
+            .and_then(|info| info.finalizer.take());
+        if let Some(script) = finalizer {
+            let _ = interp.eval_isolated(&script);
+        }
+        if interp.references.remove(&handle).is_some() {
+            collected += 1;
+        }
+    }
+
+    Ok(Value::from_int(collected))
+}
+
+/// Record every known reference handle that `value` holds.
+///
+/// Matching is on the value's own string, never on a substring of the
+/// rendered text: a handle only counts when a whole Value (or a dict key)
+/// is exactly that string.  Typed lists and dicts are walked through
+/// their cached elements so nesting does not hide a handle.
+fn scan_for_handles(value: &Value, handles: &HashSet<String>, found: &mut Vec<String>) {
+    if value.is_unset() {
+        return;
+    }
+    if let Some(map) = value.as_dict_ref() {
+        for (key, entry) in map.iter() {
+            if handles.contains(key.as_str()) {
+                found.push(key.clone());
+            }
+            scan_for_handles(entry, handles, found);
+        }
+        return;
+    }
+    if let Some(items) = value.as_list_ref() {
+        for item in items {
+            scan_for_handles(item, handles, found);
+        }
+        return;
+    }
+    let s = value.as_str();
+    if handles.contains(s) {
+        found.push(s.to_string());
+    }
 }
 
 /// finalize reference ?destructor?

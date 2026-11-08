@@ -1213,3 +1213,114 @@ fn info_vars_hides_array_elements() {
         .unwrap();
     assert_eq!(r.as_str(), "a env");
 }
+
+// ── collect / reference table ────────────────────────────────
+
+#[test]
+fn test_collect_keeps_bound_reference() {
+    let mut interp = Interp::new();
+    // `list` last: the eval result must not be the handle, so only the
+    // variable keeps the reference alive.
+    interp.eval("set h [ref hello mytag]; list").unwrap();
+    let handle = interp.get_var("h").unwrap().as_str().to_string();
+    assert!(handle.starts_with("<reference.mytag."));
+
+    let n = interp.eval("collect").unwrap();
+    assert_eq!(n.as_int(), Some(0));
+    assert!(interp
+        .eval("info references")
+        .unwrap()
+        .as_str()
+        .contains(&handle));
+    assert_eq!(interp.eval("getref $h").unwrap().as_str(), "hello");
+}
+
+#[test]
+fn test_collect_removes_unbound_reference() {
+    let mut interp = Interp::new();
+    interp.eval("set h [ref hello mytag]; list").unwrap();
+    let handle = interp.get_var("h").unwrap().as_str().to_string();
+
+    interp.eval("unset h").unwrap();
+    let n = interp.eval("collect").unwrap();
+    assert_eq!(n.as_int(), Some(1));
+    assert!(interp.eval(&format!("getref {{{}}}", handle)).is_err());
+    assert_eq!(interp.eval("info references").unwrap().as_str(), "");
+}
+
+#[test]
+fn test_collect_runs_finalizer_once() {
+    let mut interp = Interp::new();
+    // A bare `lappend ::fin` appends no element; the marker makes the
+    // number of finalizer runs observable.
+    interp
+        .eval("set h [ref v tag {lappend ::fin x}]; list")
+        .unwrap();
+
+    // A reachable reference is never finalized.
+    assert_eq!(interp.eval("collect").unwrap().as_int(), Some(0));
+    assert_eq!(interp.eval("info exists ::fin").unwrap().as_str(), "0");
+
+    interp.eval("unset h").unwrap();
+    assert_eq!(interp.eval("collect").unwrap().as_int(), Some(1));
+    assert_eq!(interp.eval("llength $::fin").unwrap().as_str(), "1");
+
+    // Nothing left to collect: the finalizer must not run a second time.
+    assert_eq!(interp.eval("collect").unwrap().as_int(), Some(0));
+    assert_eq!(interp.eval("llength $::fin").unwrap().as_str(), "1");
+}
+
+#[test]
+fn test_collect_keeps_nested_handle() {
+    let mut interp = Interp::new();
+    interp.eval("set h [ref deep tag]; list").unwrap();
+    interp.eval("set nested [list outer [list inner $h]]").unwrap();
+    interp.eval("set d [dict create key [dict create inner $h]]").unwrap();
+    interp.eval("unset h").unwrap();
+
+    // Both roots hold the handle in typed, nested containers.
+    assert_eq!(interp.eval("collect").unwrap().as_int(), Some(0));
+    assert_eq!(
+        interp
+            .eval("getref [lindex $nested 1 1]")
+            .unwrap()
+            .as_str(),
+        "deep"
+    );
+    assert_eq!(
+        interp
+            .eval("getref [dict get $d key inner]")
+            .unwrap()
+            .as_str(),
+        "deep"
+    );
+}
+
+#[test]
+fn test_collect_ignores_handle_substrings() {
+    let mut interp = Interp::new();
+    interp.eval("set h [ref v tag]; list").unwrap();
+    let handle = interp.get_var("h").unwrap().as_str().to_string();
+    interp
+        .eval(&format!("set s \"before{}after\"", handle))
+        .unwrap();
+    interp.eval("unset h").unwrap();
+
+    // The handle inside a longer string is not an exact match.
+    assert_eq!(interp.eval("collect").unwrap().as_int(), Some(1));
+}
+
+#[test]
+fn test_collect_follows_handles_inside_reachable_refs() {
+    let mut interp = Interp::new();
+    interp.eval("set h2 [ref inner t]; set h1 [ref $h2 t]; list").unwrap();
+    interp.eval("unset h2").unwrap();
+
+    // h1 is a root; its stored value holds h2's handle.
+    assert_eq!(interp.eval("collect").unwrap().as_int(), Some(0));
+    assert_eq!(interp.eval("getref [getref $h1]").unwrap().as_str(), "inner");
+
+    interp.eval("unset h1").unwrap();
+    assert_eq!(interp.eval("collect").unwrap().as_int(), Some(2));
+    assert_eq!(interp.eval("info references").unwrap().as_str(), "");
+}

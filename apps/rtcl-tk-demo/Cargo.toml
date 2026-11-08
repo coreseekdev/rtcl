@@ -18,3 +18,4 @@ nsh-testing = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nsh-platform-linux = { version = "0.4", default-features = false }
+gtk4 = { version = "0.11", features = ["v4_14"] }

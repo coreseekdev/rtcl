@@ -28,7 +28,9 @@ use rtcl_core::value::Value;
 use rtcl_core::{Error, Result};
 use rtcl_tk_core::OptionLookup;
 
-pub use rtcl_tk_core::{Fill, GridInfo, PackInfo, PackSide, Sticky, TkError, TkTree, WidgetKind};
+pub use rtcl_tk_core::{
+    Fill, GridInfo, PackInfo, PackSide, PlaceInfo, Sticky, TkError, TkTree, WidgetKind,
+};
 
 #[derive(Debug, Default)]
 pub struct TkRuntime {
@@ -266,6 +268,10 @@ pub fn install(interp: &mut Interp) {
         "scale",
         "text",
         "listbox",
+        "message",
+        "scrollbar",
+        "separator",
+        "progressbar",
         "ttk::toplevel",
         "ttk::frame",
         "ttk::label",
@@ -276,6 +282,10 @@ pub fn install(interp: &mut Interp) {
         "ttk::scale",
         "ttk::text",
         "ttk::listbox",
+        "ttk::message",
+        "ttk::scrollbar",
+        "ttk::separator",
+        "ttk::progressbar",
     ] {
         interp.register_command(name, create_widget);
     }
@@ -286,6 +296,7 @@ pub fn install(interp: &mut Interp) {
         "destroy",
         "pack",
         "grid",
+        "place",
         "winfo",
         "wm",
         "tk",
@@ -447,6 +458,16 @@ fn create_widget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     created?;
 
     initialize_widget(interp, &path, kind)?;
+    if kind == WidgetKind::Progressbar && effective_option(interp, &path, "-variable").is_empty() {
+        let value = effective_option(interp, &path, "-value")
+            .parse::<f64>()
+            .unwrap_or(0.0);
+        with_state_mut(interp, |rt| {
+            if let Some(n) = rt.tree.get_mut(&path) {
+                n.value = value;
+            }
+        });
+    }
     bump_active();
     interp.register_command(&path, widget_command);
     Ok(Value::from_str(&path))
@@ -494,6 +515,18 @@ fn initialize_widget(interp: &mut Interp, path: &str, kind: WidgetKind) -> Resul
                         n.checked = checked;
                     }
                 });
+            }
+        }
+        WidgetKind::Progressbar => {
+            let var = effective_option(interp, path, "-variable");
+            if !var.is_empty() {
+                if let Some(value) = var_value(&var).and_then(|v| v.trim().parse::<f64>().ok()) {
+                    with_state_mut(interp, |rt| {
+                        if let Some(n) = rt.tree.get_mut(path) {
+                            n.value = value;
+                        }
+                    });
+                }
             }
         }
         _ => {}
@@ -693,6 +726,57 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "identify" => Ok(Value::from_str("")),
                 _ => bad_subcommand(kind, sub),
             },
+            WidgetKind::Scrollbar => match sub {
+                "set" => {
+                    if args.len() < 3 || args.len() > 4 {
+                        return Err(wrong("set", "first ?last?", args.len()));
+                    }
+                    let first = parse_f64_str(args[2].as_str(), "first")?;
+                    let last = match args.get(3) {
+                        Some(v) => parse_f64_str(v.as_str(), "last")?,
+                        None => (first + 0.1).min(1.0),
+                    };
+                    with_state_mut(interp, |rt| {
+                        if let Some(n) = rt.tree.get_mut(path) {
+                            n.value = first.clamp(0.0, 1.0);
+                            n.content = format!("{last}");
+                            rt.bump();
+                        }
+                    })
+                    .ok_or_else(|| bad_window(path))?;
+                    Ok(Value::empty())
+                }
+                "get" => {
+                    let (first, last) = with_state(interp, |rt| {
+                        rt.tree
+                            .get(path)
+                            .map(|n| (n.value, n.content.parse::<f64>().unwrap_or(n.value + 0.1)))
+                    })
+                    .flatten()
+                    .ok_or_else(|| bad_window(path))?;
+                    Ok(list_value([format_number(first), format_number(last)]))
+                }
+                "fraction" => {
+                    let v = with_state(interp, |rt| rt.tree.get(path).map(|n| n.value))
+                        .flatten()
+                        .ok_or_else(|| bad_window(path))?;
+                    Ok(Value::from_str(&format_number(v)))
+                }
+                "activate" | "delta" | "identify" => Ok(Value::empty()),
+                _ => bad_subcommand(kind, sub),
+            },
+            WidgetKind::Progressbar => match sub {
+                "step" => {
+                    let amount = match args.get(2) {
+                        Some(v) => parse_f64_str(v.as_str(), "step")?,
+                        None => 1.0,
+                    };
+                    progressbar_step(interp, path, amount)?;
+                    Ok(Value::empty())
+                }
+                "start" | "stop" => Ok(Value::empty()),
+                _ => bad_subcommand(kind, sub),
+            },
             _ => bad_subcommand(kind, sub),
         },
     }
@@ -714,8 +798,12 @@ fn bad_subcommand(kind: WidgetKind, sub: &str) -> Result<Value> {
         WidgetKind::Listbox => {
             "activate, cget, configure, curselection, delete, destroy, get, index, insert, see, selection, size, xview, yview"
         }
-        WidgetKind::Scale => "cget, configure, coords, destroy, get, identify, set",
-        _ => "cget, configure, destroy",
+            WidgetKind::Scale => "cget, configure, coords, destroy, get, identify, set",
+            WidgetKind::Scrollbar => {
+                "activate, cget, configure, delta, destroy, fraction, get, identify, set"
+            }
+            WidgetKind::Progressbar => "cget, configure, destroy, start, step, stop",
+            _ => "cget, configure, destroy",
     };
     Err(generic(format!("bad option \"{sub}\": must be {must}")))
 }
@@ -1377,6 +1465,28 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
                 }
             }
             WidgetKind::Frame | WidgetKind::Toplevel => (w_opt, h_opt),
+            WidgetKind::Scrollbar => {
+                if opt("-orient") == "horizontal" {
+                    (100, 16)
+                } else {
+                    (16, 100)
+                }
+            }
+            WidgetKind::Separator => {
+                if opt("-orient") == "horizontal" {
+                    (100, 1)
+                } else {
+                    (1, 100)
+                }
+            }
+            WidgetKind::Progressbar => {
+                let length = opt("-length").parse::<i64>().unwrap_or(100);
+                if opt("-orient") == "horizontal" {
+                    (length, 8)
+                } else {
+                    (8, length)
+                }
+            }
             _ => {
                 let chars = if text_units == 0 {
                     opt("-text").chars().count() as i64
@@ -1391,6 +1501,130 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
         (w + padx * 2, h + pady * 2)
     })
     .unwrap_or((0, 0))
+}
+
+/// A `grid columnconfigure` / `rowconfigure` weight.
+pub fn grid_weight(parent: &str, index: i64, is_row: bool) -> i64 {
+    let Some(ptr) = active_interp() else {
+        return 0;
+    };
+    with_state(unsafe { &*ptr }, |rt| {
+        rt.grid_options
+            .get(&(parent.to_string(), index, is_row))
+            .map(|v| v.0)
+            .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+
+fn place_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(wrong("place", "option ?arg ...?", args.len()));
+    }
+    match args[1].as_str() {
+        "configure" | "config" => {
+            if args.len() < 3 {
+                return Err(wrong(
+                    "place configure",
+                    "window ?-option value ...?",
+                    args.len(),
+                ));
+            }
+            place_widget(interp, args[2].as_str(), &args[3..])
+        }
+        "forget" => {
+            if args.len() < 3 {
+                return Err(wrong("place forget", "window ?window ...?", args.len()));
+            }
+            for a in &args[2..] {
+                let path = a.as_str();
+                with_state_mut(interp, |rt| {
+                    rt.tree.unplace(path).map_err(tk_error)?;
+                    rt.bump();
+                    Ok::<(), Error>(())
+                })
+                .ok_or_else(|| bad_window(path))??;
+            }
+            Ok(Value::empty())
+        }
+        "info" => {
+            if args.len() != 3 {
+                return Err(wrong("place info", "window", args.len()));
+            }
+            let path = args[2].as_str();
+            let info = with_state(interp, |rt| rt.tree.get(path).and_then(|n| n.place.clone()))
+                .ok_or_else(|| bad_window(path))?
+                .ok_or_else(|| generic(format!("window \"{path}\" isn't placed")))?;
+            let mut out = vec![
+                "-x".to_string(),
+                format_number(info.x),
+                "-y".to_string(),
+                format_number(info.y),
+                "-relx".to_string(),
+                format_number(info.relx),
+                "-rely".to_string(),
+                format_number(info.rely),
+                "-anchor".to_string(),
+                info.anchor.clone(),
+            ];
+            if let Some(w) = info.width {
+                out.extend(["-width".to_string(), format_number(w)]);
+            }
+            if let Some(h) = info.height {
+                out.extend(["-height".to_string(), format_number(h)]);
+            }
+            if let Some(w) = info.relwidth {
+                out.extend(["-relwidth".to_string(), format_number(w)]);
+            }
+            if let Some(h) = info.relheight {
+                out.extend(["-relheight".to_string(), format_number(h)]);
+            }
+            Ok(list_value(out))
+        }
+        "slaves" => {
+            if args.len() != 3 {
+                return Err(wrong("place slaves", "window", args.len()));
+            }
+            let kids = with_state(interp, |rt| rt.tree.slaves(args[2].as_str(), "place"))
+                .and_then(|r| r.ok())
+                .ok_or_else(|| bad_window(args[2].as_str()))?;
+            Ok(list_value(kids))
+        }
+        _ => place_widget(interp, args[1].as_str(), &args[2..]),
+    }
+}
+
+fn place_widget(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    let mut info = with_state(interp, |rt| rt.tree.get(path).and_then(|n| n.place.clone()))
+        .flatten()
+        .unwrap_or_default();
+    for (k, v) in parse_pairs(rest, 0, "place")? {
+        match k.as_str() {
+            "-x" => info.x = parse_f64_str(&v, "x")?,
+            "-y" => info.y = parse_f64_str(&v, "y")?,
+            "-relx" => info.relx = parse_f64_str(&v, "relx")?,
+            "-rely" => info.rely = parse_f64_str(&v, "rely")?,
+            "-width" => info.width = Some(parse_f64_str(&v, "width")?),
+            "-height" => info.height = Some(parse_f64_str(&v, "height")?),
+            "-relwidth" => info.relwidth = Some(parse_f64_str(&v, "relwidth")?),
+            "-relheight" => info.relheight = Some(parse_f64_str(&v, "relheight")?),
+            "-anchor" => info.anchor = v,
+            "-bordermode" => {}
+            "-in" => {
+                return Err(generic(
+                    "place -in is not supported in the native Tk backend yet",
+                ))
+            }
+            _ => return Err(bad_option(&k)),
+        }
+    }
+    with_state_mut(interp, |rt| {
+        rt.tree.place(path, info).map_err(tk_error)?;
+        rt.bump();
+        Ok::<(), Error>(())
+    })
+    .ok_or_else(|| bad_window(path))??;
+    Ok(Value::empty())
 }
 
 fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -1475,9 +1709,9 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let path = args[2].as_str();
             let mapped = with_state(interp, |rt| {
-                rt.tree
-                    .get(path)
-                    .is_some_and(|n| n.pack.is_some() || n.grid.is_some() || path == ".")
+                rt.tree.get(path).is_some_and(|n| {
+                    n.pack.is_some() || n.grid.is_some() || n.place.is_some() || path == "."
+                })
             })
             .unwrap_or(false);
             Ok(Value::from_bool(mapped))
@@ -1493,6 +1727,8 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         "pack"
                     } else if n.grid.is_some() {
                         "grid"
+                    } else if n.place.is_some() {
+                        "place"
                     } else {
                         ""
                     }
@@ -2043,6 +2279,46 @@ pub fn scale_changed(path: &str, value: f64) {
     if let Err(e) = scale_set_value(interp, path, value) {
         record_error(e.to_string());
     }
+}
+
+/// A Progressbar's current value and maximum.
+pub fn progressbar_value(path: &str) -> (f64, f64) {
+    let Some(ptr) = active_interp() else {
+        return (0.0, 100.0);
+    };
+    let interp = unsafe { &*ptr };
+    let max = effective_option(interp, path, "-maximum")
+        .parse::<f64>()
+        .unwrap_or(100.0);
+    let value = if let Some(var) = qual_var_opt(interp, path, "-variable") {
+        var_value(&var)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+    } else {
+        with_state(interp, |rt| rt.tree.get(path).map(|n| n.value))
+            .flatten()
+            .unwrap_or(0.0)
+    };
+    (value, max)
+}
+
+fn progressbar_step(interp: &mut Interp, path: &str, amount: f64) -> Result<()> {
+    let (value, max) = progressbar_value(path);
+    let mut next = value + amount;
+    if max > 0.0 && next > max {
+        next = 0.0;
+    }
+    let var = qual_var_opt(interp, path, "-variable");
+    with_state_mut(interp, |rt| {
+        if let Some(n) = rt.tree.get_mut(path) {
+            n.value = next;
+            rt.bump();
+        }
+    });
+    if let Some(var) = var {
+        set_var(&var, &format_number(next))?;
+    }
+    Ok(())
 }
 
 fn scale_set_value(interp: &mut Interp, path: &str, value: f64) -> Result<Value> {
@@ -2616,6 +2892,7 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "pack" => pack_impl(interp, args),
         "grid" => grid_impl(interp, args),
+        "place" => place_impl(interp, args),
         "winfo" => winfo_impl(interp, args),
         "wm" => wm_impl(interp, args),
         "tk" => tk_impl(interp, args),
@@ -2829,6 +3106,51 @@ mod tests {
         eval(&mut i, "ttk::button .b -text Go; ttk::label .l -text Hi");
         assert_eq!(eval(&mut i, "winfo class .b"), "Button");
         assert_eq!(eval(&mut i, "winfo class .l"), "Label");
+    }
+
+    #[test]
+    fn place_manager_and_grid_weights() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "frame .f; label .l -text X; \
+             place .l -x 10 -y 20 -width 80 -height 24; \
+             grid .f -row 0 -column 0; \
+             grid columnconfigure . 1 -weight 3",
+        );
+        assert_eq!(eval(&mut i, "winfo manager .l"), "place");
+        assert_eq!(eval(&mut i, "lindex [place info .l] 1"), "10");
+        assert_eq!(eval(&mut i, "place slaves ."), ".l");
+        assert_eq!(eval(&mut i, "lindex [grid columnconfigure . 1] 5"), "3");
+        assert_eq!(grid_weight(".", 1, false), 3);
+        eval(&mut i, "place forget .l");
+        assert_eq!(eval(&mut i, "winfo manager .l"), "");
+    }
+
+    #[test]
+    fn message_scrollbar_separator_progressbar() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "message .m -text hello; \
+             scrollbar .s -orient vertical; \
+             ttk::separator .sep -orient horizontal; \
+             set ::pv 0; ttk::progressbar .p -variable ::pv -maximum 10",
+        );
+        assert_eq!(eval(&mut i, "winfo class .m"), "Message");
+        assert_eq!(eval(&mut i, "winfo class .s"), "Scrollbar");
+        assert_eq!(eval(&mut i, "winfo class .sep"), "TSeparator");
+        assert_eq!(eval(&mut i, "winfo class .p"), "TProgressbar");
+        eval(&mut i, ".s set 0.2 0.6");
+        assert_eq!(eval(&mut i, ".s get"), "0.2 0.6");
+        eval(&mut i, ".p step 3");
+        assert_eq!(eval(&mut i, "set ::pv"), "3");
+        // A step past the maximum wraps to zero, as ttk does.
+        eval(&mut i, ".p step 8");
+        assert_eq!(eval(&mut i, "set ::pv"), "0");
+        assert_eq!(progressbar_value(".p"), (0.0, 10.0));
     }
 
     #[test]

@@ -25,6 +25,14 @@ pub enum WidgetKind {
     Scale,
     Text,
     Listbox,
+    /// `message`: a label that wraps by default.
+    Message,
+    /// `scrollbar`: a trough and thumb (the renderer shows a static bar).
+    Scrollbar,
+    /// `ttk::separator`: a one-pixel rule.
+    Separator,
+    /// `ttk::progressbar`: a determinate progress fill.
+    Progressbar,
 }
 
 impl WidgetKind {
@@ -40,6 +48,10 @@ impl WidgetKind {
             "scale" => Self::Scale,
             "text" => Self::Text,
             "listbox" => Self::Listbox,
+            "message" => Self::Message,
+            "scrollbar" => Self::Scrollbar,
+            "separator" => Self::Separator,
+            "progressbar" => Self::Progressbar,
             _ => return None,
         })
     }
@@ -57,6 +69,10 @@ impl WidgetKind {
             Self::Scale => "Scale",
             Self::Text => "Text",
             Self::Listbox => "Listbox",
+            Self::Message => "Message",
+            Self::Scrollbar => "Scrollbar",
+            Self::Separator => "TSeparator",
+            Self::Progressbar => "TProgressbar",
         }
     }
 
@@ -64,7 +80,7 @@ impl WidgetKind {
     pub fn has_text(self) -> bool {
         matches!(
             self,
-            Self::Label | Self::Button | Self::Checkbutton | Self::Radiobutton
+            Self::Label | Self::Button | Self::Checkbutton | Self::Radiobutton | Self::Message
         )
     }
 }
@@ -116,6 +132,36 @@ pub struct Sticky {
     pub bottom: bool,
 }
 
+/// `place` geometry: absolute and relative offsets and sizes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaceInfo {
+    pub x: f64,
+    pub y: f64,
+    pub relx: f64,
+    pub rely: f64,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    pub relwidth: Option<f64>,
+    pub relheight: Option<f64>,
+    pub anchor: String,
+}
+
+impl Default for PlaceInfo {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            relx: 0.0,
+            rely: 0.0,
+            width: None,
+            height: None,
+            relwidth: None,
+            relheight: None,
+            anchor: "nw".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GridInfo {
     pub row: i64,
@@ -151,6 +197,7 @@ pub struct WidgetNode {
     pub options: BTreeMap<String, String>,
     pub pack: Option<PackInfo>,
     pub grid: Option<GridInfo>,
+    pub place: Option<PlaceInfo>,
     /// Event bindings (`<Button-1>`) to Tcl scripts.
     pub bindings: BTreeMap<String, String>,
     /// Editable content of Entry/Text (not a Tk option).
@@ -234,6 +281,7 @@ impl TkTree {
                 children: Vec::new(),
                 options: BTreeMap::new(),
                 pack: None,
+                place: None,
                 grid: None,
                 bindings: BTreeMap::new(),
                 content: String::new(),
@@ -323,6 +371,7 @@ impl TkTree {
                 children: Vec::new(),
                 options: BTreeMap::new(),
                 pack: None,
+                place: None,
                 grid: None,
                 bindings: BTreeMap::new(),
                 content: String::new(),
@@ -420,6 +469,7 @@ impl TkTree {
             .ok_or_else(|| TkError::NotFound(path.to_string()))?;
         node.pack = Some(info);
         node.grid = None;
+        node.place = None;
         Ok(())
     }
 
@@ -448,6 +498,29 @@ impl TkTree {
             .ok_or_else(|| TkError::NotFound(path.to_string()))?;
         node.grid = Some(info);
         node.pack = None;
+        node.place = None;
+        Ok(())
+    }
+
+    /// Place `path` with absolute/relative coordinates.
+    pub fn place(&mut self, path: &str, info: PlaceInfo) -> Result<(), TkError> {
+        let node = self
+            .nodes
+            .get_mut(path)
+            .ok_or_else(|| TkError::NotFound(path.to_string()))?;
+        node.place = Some(info);
+        node.pack = None;
+        node.grid = None;
+        Ok(())
+    }
+
+    /// `place forget`.
+    pub fn unplace(&mut self, path: &str) -> Result<(), TkError> {
+        let node = self
+            .nodes
+            .get_mut(path)
+            .ok_or_else(|| TkError::NotFound(path.to_string()))?;
+        node.place = None;
         Ok(())
     }
 
@@ -484,6 +557,7 @@ impl TkTree {
                 self.nodes.get(*c).is_some_and(|n| match manager {
                     "pack" => n.pack.is_some(),
                     "grid" => n.grid.is_some(),
+                    "place" => n.place.is_some(),
                     _ => false,
                 })
             })
@@ -869,6 +943,62 @@ const LISTBOX_OPTIONS: &[&str] = &[
     "-yscrollcommand",
 ];
 
+const MESSAGE_OPTIONS: &[&str] = &[
+    "-anchor",
+    "-aspect",
+    "-background",
+    "-borderwidth",
+    "-cursor",
+    "-font",
+    "-foreground",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-justify",
+    "-padx",
+    "-pady",
+    "-relief",
+    "-takefocus",
+    "-text",
+    "-textvariable",
+    "-width",
+];
+
+const SCROLLBAR_OPTIONS: &[&str] = &[
+    "-activebackground",
+    "-activerelief",
+    "-background",
+    "-borderwidth",
+    "-command",
+    "-cursor",
+    "-elementborderwidth",
+    "-highlightbackground",
+    "-highlightcolor",
+    "-highlightthickness",
+    "-jump",
+    "-orient",
+    "-relief",
+    "-repeatdelay",
+    "-repeatinterval",
+    "-takefocus",
+    "-troughcolor",
+    "-width",
+];
+
+const SEPARATOR_OPTIONS: &[&str] = &["-cursor", "-orient", "-takefocus"];
+
+const PROGRESSBAR_OPTIONS: &[&str] = &[
+    "-cursor",
+    "-length",
+    "-maximum",
+    "-mode",
+    "-orient",
+    "-phase",
+    "-takefocus",
+    "-value",
+    "-variable",
+];
+
 /// Options Tk 8.6 accepts for `kind` (including the ones kept on the node
 /// as `wm` pseudo-options for toplevels).
 pub fn known_options(kind: WidgetKind) -> &'static [&'static str] {
@@ -883,6 +1013,10 @@ pub fn known_options(kind: WidgetKind) -> &'static [&'static str] {
         WidgetKind::Scale => SCALE_OPTIONS,
         WidgetKind::Text => TEXT_OPTIONS,
         WidgetKind::Listbox => LISTBOX_OPTIONS,
+        WidgetKind::Message => MESSAGE_OPTIONS,
+        WidgetKind::Scrollbar => SCROLLBAR_OPTIONS,
+        WidgetKind::Separator => SEPARATOR_OPTIONS,
+        WidgetKind::Progressbar => PROGRESSBAR_OPTIONS,
     }
 }
 
@@ -936,6 +1070,13 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
         "-bigincrement" => "0",
         "-length" => "100",
         "-troughcolor" | "-activebackground" => "#d9d9d9",
+        "-activerelief" => "raised",
+        "-elementborderwidth" => "1",
+        "-jump" | "-repeatdelay" | "-repeatinterval" => "0",
+        "-aspect" => "150",
+        "-maximum" => "100",
+        "-mode" => "determinate",
+        "-phase" => "0",
         "-validate" => "none",
         "-validatecommand" | "-invalidcommand" | "-xscrollcommand" | "-yscrollcommand" => "",
         "-exportselection" => "1",

@@ -43,6 +43,8 @@ checkbutton .agree -text "I agree" -variable ::agreed -onvalue 1 -offvalue 0 -co
 }
 pack .agree -padx 12 -anchor w
 
+label .volume_label -text "Volume:"
+pack .volume_label -padx 12 -pady 2
 scale .volume -from 0 -to 100 -variable ::volume -command {
     set ::greeting "Volume $::volume"
 }
@@ -55,6 +57,16 @@ pack .colors -fill x -padx 12 -pady 4
 label .later -text "waiting for after"
 pack .later -padx 12 -pady 4
 after 80 {.later configure -text "Later fired"}
+
+# `shot` runs the app with RTCL_TK_AUTO=1 to capture an interacted state.
+if {[info exists ::env(RTCL_TK_AUTO)]} {
+    after 200 {
+        .b invoke
+        .agree invoke
+        .colors selection set 1
+        .volume set 65
+    }
+}
 "#;
 
 thread_local! {

@@ -84,4 +84,6 @@ fn classic_form_round_trip() {
         .expect("label -background/-foreground renders");
     app.wait_for("Sales").expect("chart title renders");
     app.wait_for("A").expect("chart labels render");
+    app.wait_for("normal ALERT tail")
+        .expect("text tag spans render (rich text view)");
 }

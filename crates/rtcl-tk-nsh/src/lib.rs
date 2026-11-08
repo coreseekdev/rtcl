@@ -247,6 +247,90 @@ fn option_color(tree: &TkTree, path: &str, name: &str) -> Option<AdaptiveColor> 
     (!value.is_empty()).then(|| parse_color(value)).flatten()
 }
 
+fn render_rich_text(
+    tree: &TkTree,
+    path: &str,
+    tags: &[rtcl_tk_runtime::TextTagView],
+) -> AnyElement {
+    let content = rtcl_tk_runtime::text_value(path);
+    let chars = content.chars().collect::<Vec<_>>();
+    let len = chars.len();
+    let mut bounds = vec![0usize, len];
+    for tag in tags {
+        for (start, end) in &tag.ranges {
+            bounds.push((*start).min(len));
+            bounds.push((*end).min(len));
+        }
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+    let base_size = 14.0f32;
+    let default_color =
+        option_color(tree, path, "-foreground").unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
+    let mut block = text("").text_size(px(base_size));
+    for pair in bounds.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if start >= end {
+            continue;
+        }
+        let segment = chars[start..end].iter().collect::<String>();
+        let mut color = default_color;
+        let mut background = None;
+        let mut family: Option<SharedString> = None;
+        let mut size = base_size;
+        let mut bold = false;
+        for tag in tags {
+            let covers = tag.ranges.iter().any(|(a, b)| start < *b && end > *a);
+            if !covers {
+                continue;
+            }
+            if let Some(value) = tag.options.get("-foreground") {
+                if let Some(parsed) = parse_color(value) {
+                    color = parsed;
+                }
+            }
+            if let Some(value) = tag.options.get("-background") {
+                if let Some(parsed) = parse_color(value) {
+                    background = Some(parsed);
+                }
+            }
+            if let Some(value) = tag.options.get("-font") {
+                if let Some((font_family, point_size, is_bold)) =
+                    rtcl_tk_runtime::resolve_font(value)
+                {
+                    if !font_family.is_empty() {
+                        family = Some(SharedString::from(font_family));
+                    }
+                    size = (point_size * 1.3333) as f32;
+                    bold = is_bold;
+                }
+            }
+        }
+        let mut span = text(segment).text_size(px(size)).text_color(color);
+        if let Some(background) = background {
+            span = span.bg(background);
+        }
+        if let Some(family) = family {
+            span = span.font_family(family);
+        }
+        if bold {
+            span = span.font_weight(FontWeight::BOLD);
+        }
+        block = block.child(span);
+    }
+    let height = option(tree, path, "-height")
+        .parse::<f32>()
+        .unwrap_or(24.0)
+        .clamp(1.0, 40.0);
+    let mut container = view().w_full().h(px(height * 18.0 + 8.0)).p(px(4.0));
+    if let Some(bg) = option_color(tree, path, "-background") {
+        container = container.bg(bg);
+    }
+    container
+        .child(scroll().w_full().child(block))
+        .into_element()
+}
+
 fn image_file_of(tree: &TkTree, path: &str) -> Option<String> {
     let name = option(tree, path, "-image");
     if name.is_empty() {
@@ -851,6 +935,10 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             row.into_element()
         }
         WidgetKind::Text => {
+            let tags = rtcl_tk_runtime::text_tags(path);
+            if !tags.is_empty() {
+                return render_rich_text(tree, path, &tags);
+            }
             let path = path.to_string();
             let disabled = is_disabled(tree, path.as_str());
             let change_path = path.clone();
@@ -1213,7 +1301,26 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let Some(model) = rtcl_tk_runtime::canvas_snapshot(path) else {
                 return view().into_element();
             };
+            let region = rtcl_core::value::Value::from_str(option(tree, path, "-scrollregion"))
+                .as_list()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|v| v.as_str().trim().parse::<f32>().ok())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let (x_off, y_off) = if region.len() >= 4 {
+                (
+                    model.xview as f32 * ((region[2] - region[0]) - width).max(0.0),
+                    model.yview as f32 * ((region[3] - region[1]) - height).max(0.0),
+                )
+            } else {
+                (0.0, 0.0)
+            };
             let mut painter = Painter::new();
+            if x_off != 0.0 || y_off != 0.0 {
+                painter = painter.translate(-x_off, -y_off);
+            }
             for item in &model.items {
                 let coords = &item.coords;
                 let option =
@@ -1308,11 +1415,19 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             if let Some(bg) = option_color(tree, path, "-background") {
                 container = container.bg(bg);
             }
+            let press_path = path.to_string();
             container
                 .child(
                     nsh_core::element::canvas(painter)
                         .w(px(width))
-                        .h(px(height)),
+                        .h(px(height))
+                        .on_press(move |e: &PressEvent| {
+                            rtcl_tk_runtime::canvas_press(
+                                &press_path,
+                                e.position.x.0 as f64,
+                                e.position.y.0 as f64,
+                            );
+                        }),
                 )
                 .into_element()
         }

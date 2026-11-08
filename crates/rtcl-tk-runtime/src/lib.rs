@@ -81,6 +81,11 @@ pub struct TkRuntime {
 pub struct CanvasState {
     pub items: Vec<CanvasItem>,
     next_id: u64,
+    /// Item/tag bindings (`bind <id|tag> <sequence> script`).
+    bindings: BTreeMap<String, BTreeMap<String, String>>,
+    /// `xview`/`yview` fractions inside `-scrollregion`.
+    pub xview: f64,
+    pub yview: f64,
 }
 
 /// One canvas item (`rectangle`, `line`, `oval`, `text`, `polygon`).
@@ -103,6 +108,14 @@ pub struct PhotoImage {
 /// A `text` tag: its options and the character ranges it covers.
 #[derive(Debug, Clone, Default)]
 pub struct TextTag {
+    pub options: BTreeMap<String, String>,
+    pub ranges: Vec<(usize, usize)>,
+}
+
+/// A text widget's tags, for the renderer.
+#[derive(Debug, Clone, Default)]
+pub struct TextTagView {
+    pub name: String,
     pub options: BTreeMap<String, String>,
     pub ranges: Vec<(usize, usize)>,
 }
@@ -1383,8 +1396,13 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     Ok(list_value(ids))
                 }
                 "bbox" => Ok(Value::empty()),
-                "bind" | "raise" | "lower" | "move" | "scale" | "focus" | "select" | "xview"
-                | "yview" => Ok(Value::empty()),
+                "move" => canvas_move(interp, path, &args[2..], false),
+                "scale" => canvas_move(interp, path, &args[2..], true),
+                "raise" | "lower" => canvas_raise(interp, path, &args[2..], sub == "raise"),
+                "bind" => canvas_bind(interp, path, &args[2..]),
+                "xview" => canvas_view(interp, path, &args[2..], true),
+                "yview" => canvas_view(interp, path, &args[2..], false),
+                "focus" | "select" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
             _ => bad_subcommand(kind, sub),
@@ -5018,6 +5036,324 @@ fn canvas_itemconfigure(interp: &mut Interp, path: &str, rest: &[Value]) -> Resu
     Ok(Value::empty())
 }
 
+fn canvas_move(interp: &mut Interp, path: &str, rest: &[Value], scale: bool) -> Result<Value> {
+    let needed = if scale { 5 } else { 3 };
+    if rest.len() != needed {
+        return Err(wrong(
+            if scale { "scale" } else { "move" },
+            if scale {
+                "tagOrId xOrigin yOrigin xScale yScale"
+            } else {
+                "tagOrId dx dy"
+            },
+            rest.len() + 2,
+        ));
+    }
+    let target = rest[0].as_str();
+    let numbers = rest[1..]
+        .iter()
+        .map(|v| parse_f64_str(v.as_str(), "number"))
+        .collect::<Result<Vec<_>>>()?;
+    with_state_mut(interp, |rt| {
+        if let Some(canvas) = rt.canvases.get_mut(path) {
+            for item in canvas.items.iter_mut() {
+                if target != "all" && item.id.to_string() != target {
+                    continue;
+                }
+                if scale {
+                    let (xo, yo, xs, ys) = (numbers[0], numbers[1], numbers[2], numbers[3]);
+                    for pair in item.coords.chunks_mut(2) {
+                        pair[0] = xo + (pair[0] - xo) * xs;
+                        if pair.len() == 2 {
+                            pair[1] = yo + (pair[1] - yo) * ys;
+                        }
+                    }
+                } else {
+                    for pair in item.coords.chunks_mut(2) {
+                        pair[0] += numbers[0];
+                        if pair.len() == 2 {
+                            pair[1] += numbers[1];
+                        }
+                    }
+                }
+            }
+            rt.bump();
+        }
+    });
+    Ok(Value::empty())
+}
+
+fn canvas_raise(interp: &mut Interp, path: &str, rest: &[Value], raise: bool) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong(
+            if raise { "raise" } else { "lower" },
+            "tagOrId ?aboveThis?",
+            rest.len() + 2,
+        ));
+    }
+    let target = rest[0].as_str();
+    with_state_mut(interp, |rt| {
+        if let Some(canvas) = rt.canvases.get_mut(path) {
+            if target == "all" {
+                return;
+            }
+            if let Some(index) = canvas
+                .items
+                .iter()
+                .position(|item| item.id.to_string() == target)
+            {
+                let item = canvas.items.remove(index);
+                if raise {
+                    canvas.items.push(item);
+                } else {
+                    canvas.items.insert(0, item);
+                }
+                rt.bump();
+            }
+        }
+    });
+    Ok(Value::empty())
+}
+
+fn canvas_bind(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong(
+            "bind",
+            "tagOrId ?sequence? ?+?script?",
+            rest.len() + 2,
+        ));
+    }
+    let target = rest[0].as_str();
+    let exists = with_state(interp, |rt| rt.canvases.contains_key(path)).unwrap_or(false);
+    if !exists {
+        return Err(bad_window(path));
+    }
+    if rest.len() == 1 {
+        let sequences = with_state(interp, |rt| {
+            rt.canvases
+                .get(path)
+                .and_then(|canvas| canvas.bindings.get(target))
+                .map(|map| map.keys().cloned().collect::<Vec<_>>())
+        })
+        .flatten()
+        .unwrap_or_default();
+        return Ok(list_value(sequences));
+    }
+    let sequence = normalize_sequence(rest[1].as_str());
+    let current = with_state(interp, |rt| {
+        rt.canvases
+            .get(path)
+            .and_then(|canvas| canvas.bindings.get(target))
+            .and_then(|map| map.get(&sequence))
+            .cloned()
+    })
+    .flatten()
+    .unwrap_or_default();
+    if rest.len() == 2 {
+        return Ok(Value::from_str(&current));
+    }
+    let script = rest[2].as_str();
+    let script = match script.strip_prefix('+') {
+        Some(more) if !current.is_empty() => {
+            format!("{}\n{}", current.trim_end_matches('\n'), more)
+        }
+        Some(more) => more.to_string(),
+        None => script.to_string(),
+    };
+    with_state_mut(interp, |rt| {
+        if let Some(canvas) = rt.canvases.get_mut(path) {
+            let map = canvas.bindings.entry(target.to_string()).or_default();
+            if script.is_empty() {
+                map.remove(&sequence);
+            } else {
+                map.insert(sequence.clone(), script.clone());
+            }
+            rt.bump();
+        }
+    });
+    Ok(Value::empty())
+}
+
+fn canvas_view(interp: &mut Interp, path: &str, rest: &[Value], horizontal: bool) -> Result<Value> {
+    let region = effective_option(interp, path, "-scrollregion");
+    let values = Value::from_str(&region)
+        .as_list()
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().trim().parse::<f64>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let (total, viewport) = if values.len() >= 4 {
+        let start = if horizontal { values[0] } else { values[1] };
+        let end = if horizontal { values[2] } else { values[3] };
+        (
+            (end - start).abs(),
+            effective_option(interp, path, if horizontal { "-width" } else { "-height" })
+                .parse::<f64>()
+                .unwrap_or(0.0),
+        )
+    } else {
+        (1.0, 1.0)
+    };
+    let total = total.max(1.0);
+    let viewport = viewport.max(1.0);
+    let max_first = (1.0 - viewport / total).max(0.0);
+    let fraction = with_state(interp, |rt| {
+        rt.canvases.get(path).map(|canvas| {
+            if horizontal {
+                canvas.xview
+            } else {
+                canvas.yview
+            }
+        })
+    })
+    .flatten()
+    .unwrap_or(0.0)
+    .clamp(0.0, max_first);
+    if rest.is_empty() {
+        let last = (fraction + viewport / total).min(1.0);
+        return Ok(list_value([
+            format_fraction(fraction),
+            format_fraction(last),
+        ]));
+    }
+    match rest[0].as_str() {
+        "moveto" => {
+            let target = rest
+                .get(1)
+                .map(|v| parse_f64_str(v.as_str(), "fraction"))
+                .transpose()?
+                .unwrap_or(0.0);
+            set_canvas_view(interp, path, horizontal, target.min(max_first));
+        }
+        "scroll" => {
+            let amount = rest.get(1).map(parse_int).transpose()?.unwrap_or(1);
+            let pages = rest.get(2).is_some_and(|v| v.as_str() == "pages");
+            let step = amount as f64 * viewport / if pages { total } else { total * 10.0 };
+            set_canvas_view(interp, path, horizontal, (fraction + step).min(max_first));
+        }
+        other => {
+            return Err(generic(format!(
+                "bad option \"{other}\": must be moveto or scroll"
+            )))
+        }
+    }
+    Ok(Value::empty())
+}
+
+fn set_canvas_view(interp: &mut Interp, path: &str, horizontal: bool, fraction: f64) {
+    with_state_mut(interp, |rt| {
+        if let Some(canvas) = rt.canvases.get_mut(path) {
+            if horizontal {
+                canvas.xview = fraction;
+            } else {
+                canvas.yview = fraction;
+            }
+            rt.bump();
+        }
+    });
+}
+
+fn canvas_item_contains(item: &CanvasItem, x: f64, y: f64) -> bool {
+    let c = &item.coords;
+    match item.kind.as_str() {
+        "rectangle" | "text" | "polygon" if c.len() >= 4 => {
+            x >= c[0].min(c[2]) && x <= c[0].max(c[2]) && y >= c[1].min(c[3]) && y <= c[1].max(c[3])
+        }
+        "oval" if c.len() >= 4 => {
+            let cx = (c[0] + c[2]) / 2.0;
+            let cy = (c[1] + c[3]) / 2.0;
+            let rx = ((c[2] - c[0]) / 2.0).abs().max(0.001);
+            let ry = ((c[3] - c[1]) / 2.0).abs().max(0.001);
+            ((x - cx) / rx).powi(2) + ((y - cy) / ry).powi(2) <= 1.0
+        }
+        "line" if c.len() >= 4 => {
+            let width = item
+                .options
+                .get("-width")
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(1.0);
+            c.chunks(2).collect::<Vec<_>>().windows(2).any(|pair| {
+                let (x1, y1, x2, y2) = (pair[0][0], pair[0][1], pair[1][0], pair[1][1]);
+                let dx = x2 - x1;
+                let dy = y2 - y1;
+                let len = (dx * dx + dy * dy).sqrt().max(0.001);
+                let dist = ((x - x1) * dy - (y - y1) * dx).abs() / len;
+                dist <= width / 2.0 + 4.0
+            })
+        }
+        _ => false,
+    }
+}
+
+/// A press on the canvas: run item/tag bindings of the topmost hit, then
+/// the canvas's own `<Button-1>` binding.
+pub fn canvas_press(path: &str, x: f64, y: f64) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    let (items, bindings) = with_state(interp, |rt| {
+        rt.canvases.get(path).map(|canvas| {
+            (
+                canvas
+                    .items
+                    .iter()
+                    .filter(|item| canvas_item_contains(item, x, y))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                canvas.bindings.clone(),
+            )
+        })
+    })
+    .flatten()
+    .unwrap_or_default();
+    let ctx = EventCtx {
+        path: path.to_string(),
+        x: x as i64,
+        y: y as i64,
+        button: 1,
+        ..EventCtx::default()
+    };
+    for item in items.iter().rev() {
+        let mut targets = vec![item.id.to_string()];
+        if let Some(tags) = item.options.get("-tags") {
+            targets.extend(tags.split_whitespace().map(str::to_string));
+        }
+        for target in targets {
+            if let Some(script) = bindings.get(&target).and_then(|map| map.get("<Button-1>")) {
+                let script = substitute_bindings(script, &ctx);
+                if let Err(e) = eval_active(&script) {
+                    record_error(e.to_string());
+                }
+            }
+        }
+    }
+    run_binding(path, "<Button-1>", &ctx);
+}
+
+/// A text widget's tags (name, options, character ranges).
+pub fn text_tags(path: &str) -> Vec<TextTagView> {
+    let Some(ptr) = active_interp() else {
+        return Vec::new();
+    };
+    with_state(unsafe { &*ptr }, |rt| {
+        rt.text_tags
+            .get(path)
+            .map(|tags| {
+                tags.iter()
+                    .filter(|(_, tag)| !tag.ranges.is_empty())
+                    .map(|(name, tag)| TextTagView {
+                        name: name.clone(),
+                        options: tag.options.clone(),
+                        ranges: tag.ranges.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    })
+    .unwrap_or_default()
+}
+
 /// A canvas's items for the renderer.
 pub fn canvas_snapshot(path: &str) -> Option<CanvasState> {
     let ptr = active_interp()?;
@@ -5924,6 +6260,7 @@ mod tests {
             ".t tag configure strong -foreground red; .t tag add strong 1.0 1.5",
         );
         assert_eq!(eval(&mut i, ".t tag ranges strong"), "1.0 1.5");
+        assert_eq!(text_tags(".t").len(), 1);
         assert_eq!(eval(&mut i, ".t tag names 1.2"), "strong");
         assert_eq!(eval(&mut i, ".t tag names 1.7"), "");
         assert_eq!(eval(&mut i, ".t tag cget strong -foreground"), "red");
@@ -5959,8 +6296,27 @@ mod tests {
         eval(&mut i, ".c coords $id 1 2 30 40");
         assert_eq!(eval(&mut i, ".c coords $id"), "1 2 30 40");
         assert_eq!(eval(&mut i, ".c find"), id);
+        eval(&mut i, "set ::hit 0; .c bind $id <Button-1> {incr ::hit}");
+        canvas_press(".c", 5.0, 5.0);
+        assert_eq!(eval(&mut i, "set ::hit"), "1");
+        eval(&mut i, ".c move $id 5 5");
+        assert_eq!(eval(&mut i, ".c coords $id"), "6 7 35 45");
+        eval(&mut i, ".c scale $id 0 0 2 2");
+        assert_eq!(eval(&mut i, ".c coords $id"), "12 14 70 90");
         eval(&mut i, ".c delete $id");
         assert_eq!(eval(&mut i, ".c find"), "");
+
+        eval(
+            &mut i,
+            "canvas .sv -width 100 -height 100 -scrollregion {0 0 400 400}; \
+             .sv create rectangle 0 0 400 400",
+        );
+        assert_eq!(eval(&mut i, ".sv xview"), "0 0.25");
+        eval(&mut i, ".sv xview moveto 1");
+        assert_eq!(eval(&mut i, "lindex [.sv xview] 0"), "0.75");
+        assert_eq!(eval(&mut i, ".sv yview"), "0 0.25");
+        eval(&mut i, ".sv yview scroll 1 pages");
+        assert_ne!(eval(&mut i, "lindex [.sv yview] 0"), "0");
     }
 
     #[test]

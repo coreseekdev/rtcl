@@ -151,7 +151,14 @@ canvas .cv -width 240 -height 90 -background "#f8fafc"
 .cv create oval 130 10 220 70 -fill "#fca5a5"
 .cv create line 20 80 220 80 -fill "#111827" -width 2
 .cv create text 120 40 -text "Canvas"
+.cv bind 1 <Button-1> {set ::canvas_hit 1}
 pack .cv -padx 8 -pady 4
+
+text .log -height 4
+.log insert end "normal ALERT tail"
+.log tag configure hot -foreground "#b91c1c" -background "#fee2e2"
+.log tag add hot 1.7 1.12
+pack .log -fill x -padx 8 -pady 4
 
 focus .form.nameEntry
 bind .form.nameEntry <Return> {.form.ok invoke}

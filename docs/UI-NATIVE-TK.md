@@ -189,6 +189,9 @@ separator/cascade），headless 同样用 app 内菜单以便测试；`-tearoff`
 flex 权重；place 支持绝对坐标与 `-relwidth/-relheight`，相对坐标按父
 容器比例解释。混合 side 的精确 Tk 收缩顺序是近似。
 
+**窗口**：`wm title` 在桌面后端实时写入原生窗口标题
+（`nsh desktop::set_title`）；其余 `wm geometry/state` 仅记录在模型。
+
 **Entry 校验**：`-validate key|all` + `-validatecommand`，支持 `%P/%s/
 %S/%v/%V/%W` 替换；返回 0 时拒绝编辑并回滚显示（错误则按 Tk 语义放行）。
 

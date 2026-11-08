@@ -79,6 +79,11 @@ pub fn TkView() -> impl IntoElement {
                     let mut column = view().flex_col().w_full().gap_2();
                     let native = matches!(os(), nsh_core::platform::Os::MacOs);
                     let bar = rtcl_tk_runtime::menu_bar();
+                    if is_desktop() {
+                        if let Some(title) = rtcl_tk_runtime::window_title() {
+                            desktop::set_title(title);
+                        }
+                    }
                     if native {
                         sync_native_menu();
                     } else if let Some(bar) = &bar {

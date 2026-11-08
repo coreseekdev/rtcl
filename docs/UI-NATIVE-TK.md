@@ -195,6 +195,10 @@ flex 权重；place 支持绝对坐标与 `-relwidth/-relheight`，相对坐标�
 （i/m/c/p 单位），`winfo screenmmwidth/screenmmheight` 有值。UI 的实际
 DPI 缩放由 nsh 平台层负责。
 
+**字体**：`-font` 支持命名字体（`font create`）与 Tk 描述串
+（`{DejaVu Sans} 12 bold`）；label/button/check/radio/message 应用
+family/size/bold（实际 DPI 缩放仍由 nsh 平台层负责）。
+
 **Entry 校验**：`-validate key|all` + `-validatecommand`，支持 `%P/%s/
 %S/%v/%V/%W` 替换；返回 0 时拒绝编辑并回滚显示（错误则按 Tk 语义放行）。
 

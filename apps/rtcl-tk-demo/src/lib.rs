@@ -71,6 +71,10 @@ after 80 {.later configure -text "Later fired"}
 
 /// A classic grid/pack form, close to what a Tk tutorial app looks like.
 pub const CLASSIC: &str = r#"
+font create Heading -family {DejaVu Sans} -size 18 -weight bold
+label .title -text "Classic Tk Demo" -font Heading
+pack .title -padx 8 -pady 4
+
 set ::name "World"
 proc greeting {name} {
     if {$name eq ""} { return "Hello, stranger" }

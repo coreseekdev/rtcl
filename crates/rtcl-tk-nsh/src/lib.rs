@@ -195,6 +195,36 @@ fn native_menu_items(menu_path: &str) -> Vec<desktop::MenuItem> {
     out
 }
 
+fn font_of(tree: &TkTree, path: &str) -> (Option<SharedString>, f32, bool) {
+    let spec = option(tree, path, "-font");
+    if spec.is_empty() {
+        return (None, 14.0, false);
+    }
+    match rtcl_tk_runtime::resolve_font(spec) {
+        Some((family, size, bold)) => (
+            (!family.is_empty()).then(|| SharedString::from(family)),
+            (size * 1.3333) as f32,
+            bold,
+        ),
+        None => (None, 14.0, false),
+    }
+}
+
+fn styled_text(
+    content: String,
+    font: &(Option<SharedString>, f32, bool),
+    color: AdaptiveColor,
+) -> AnyElement {
+    let mut element = text(content).text_size(px(font.1)).text_color(color);
+    if let Some(family) = &font.0 {
+        element = element.font_family(family.clone());
+    }
+    if font.2 {
+        element = element.font_weight(FontWeight::BOLD);
+    }
+    element.into_element()
+}
+
 fn render_menu_bar(menu_path: &str) -> AnyElement {
     let Some(menu) = rtcl_tk_runtime::menu_snapshot(menu_path) else {
         return view().into_element();
@@ -496,9 +526,13 @@ fn render_grid(tree: &TkTree, path: &str) -> AnyElement {
         }
     }
     let mut container = view().flex_col().gap_2();
-    for (_, mut cells) in rows {
+    for (row_index, mut cells) in rows {
         cells.sort_by_key(|(_, column)| *column);
         let mut row = view().flex_row().items_center().gap_2().w_full();
+        let row_weight = rtcl_tk_runtime::grid_weight(path, row_index, true);
+        if row_weight > 0 {
+            row = row.flex_grow(row_weight as f32);
+        }
         for (child, column) in cells {
             let weight = rtcl_tk_runtime::grid_weight(path, column, false).max(1) as f32;
             let mut cell = view().flex_grow(weight);
@@ -549,15 +583,18 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             }
             frame.child(render_children(tree, path)).into_element()
         }
-        WidgetKind::Label => view()
-            .w_full()
-            .items_start()
-            .child(
-                text(rtcl_tk_runtime::display_text(path))
-                    .text_size(px(14.0))
-                    .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
-            )
-            .into_element(),
+        WidgetKind::Label => {
+            let font = font_of(tree, path);
+            view()
+                .w_full()
+                .items_start()
+                .child(styled_text(
+                    rtcl_tk_runtime::display_text(path),
+                    &font,
+                    AdaptiveColor::rgb(0x111827, 0xf3f4f6),
+                ))
+                .into_element()
+        }
         WidgetKind::Button => {
             let path = path.to_string();
             let disabled = is_disabled(tree, path.as_str());
@@ -570,11 +607,11 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
                 .bg(AdaptiveColor::rgb(0xf3f4f6, 0x374151))
                 .disabled(disabled)
-                .child(
-                    text(rtcl_tk_runtime::display_text(&path))
-                        .text_size(px(14.0))
-                        .text_color(AdaptiveColor::rgb(0x111827, 0xf9fafb)),
-                );
+                .child(styled_text(
+                    rtcl_tk_runtime::display_text(&path),
+                    &font_of(tree, path.as_str()),
+                    AdaptiveColor::rgb(0x111827, 0xf9fafb),
+                ));
             if !disabled {
                 let press_path = path.clone();
                 button = button.on_press(move |_: &()| {
@@ -634,11 +671,11 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         box_style.bg(AdaptiveColor::rgb(0xffffff, 0x1f2937))
                     }
                 })
-                .child(
-                    text(label)
-                        .text_size(px(14.0))
-                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
-                );
+                .child(styled_text(
+                    label,
+                    &font_of(tree, path.as_str()),
+                    AdaptiveColor::rgb(0x111827, 0xf3f4f6),
+                ));
             if !disabled {
                 control = control.on_change(move |_: &bool| {
                     rtcl_tk_runtime::press_button(&press_path);
@@ -662,11 +699,11 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         .text_size(px(16.0))
                         .text_color(AdaptiveColor::rgb(0x2563eb, 0x60a5fa)),
                 )
-                .child(
-                    text(label)
-                        .text_size(px(14.0))
-                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
-                );
+                .child(styled_text(
+                    label,
+                    &font_of(tree, path.as_str()),
+                    AdaptiveColor::rgb(0x111827, 0xf3f4f6),
+                ));
             let mut control = nsh_base::radio()
                 .checked(checked)
                 .disabled(disabled)
@@ -792,15 +829,18 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .child(list)
                 .into_element()
         }
-        WidgetKind::Message => view()
-            .w_full()
-            .items_start()
-            .child(
-                text(rtcl_tk_runtime::display_text(path))
-                    .text_size(px(14.0))
-                    .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
-            )
-            .into_element(),
+        WidgetKind::Message => {
+            let font = font_of(tree, path);
+            view()
+                .w_full()
+                .items_start()
+                .child(styled_text(
+                    rtcl_tk_runtime::display_text(path),
+                    &font,
+                    AdaptiveColor::rgb(0x111827, 0xf3f4f6),
+                ))
+                .into_element()
+        }
         WidgetKind::Scrollbar => {
             let horizontal = option(tree, path, "-orient") == "horizontal";
             let track = if horizontal {

@@ -2889,6 +2889,46 @@ fn font_options(interp: &Interp, name: &str) -> Option<BTreeMap<String, String>>
     .flatten()
 }
 
+/// Resolve a `-font` value (a named font or a Tk font description) to
+/// family, point size and bold.
+pub fn resolve_font(spec: &str) -> Option<(String, f64, bool)> {
+    if spec.is_empty() {
+        return None;
+    }
+    let ptr = active_interp()?;
+    let interp = unsafe { &*ptr };
+    if let Some(options) = font_options(interp, spec) {
+        let family = options.get("-family").cloned().unwrap_or_default();
+        let size = options
+            .get("-size")
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .unwrap_or(10.0)
+            .abs();
+        let bold = options.get("-weight").is_some_and(|w| w == "bold");
+        return Some((family, size, bold));
+    }
+    let mut family = String::new();
+    let mut size = 10.0;
+    let mut bold = false;
+    for token in spec.split_whitespace() {
+        let token = token.trim_matches(|c| c == '{' || c == '}');
+        if let Ok(value) = token.parse::<f64>() {
+            size = value.abs();
+        } else if let Some(pixels) = token
+            .strip_prefix('-')
+            .and_then(|rest| rest.parse::<f64>().ok())
+        {
+            // Negative Tk sizes are pixels.
+            size = pixels.abs() * 0.75;
+        } else if token.eq_ignore_ascii_case("bold") {
+            bold = true;
+        } else if family.is_empty() {
+            family = token.to_string();
+        }
+    }
+    Some((family, size, bold))
+}
+
 fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(wrong("font", "option ?arg ...?", args.len()));

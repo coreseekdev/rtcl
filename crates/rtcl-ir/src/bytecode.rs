@@ -252,9 +252,7 @@ impl ByteCode {
         n += self.ops.len() * std::mem::size_of::<OpCode>();
         n += self.line_map.len() * std::mem::size_of::<u32>();
         n += self.sites.len() * std::mem::size_of::<CmdSite>();
-        for f in &self.foreach_infos {
-            n += std::mem::size_of::<ForeachInfo>();
-        }
+        n += self.foreach_infos.len() * std::mem::size_of::<ForeachInfo>();
         n
     }
 

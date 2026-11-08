@@ -131,7 +131,8 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | M0 ✅ | tk-core WidgetSpec/选项/布局/事件模型 + 纯模型单测；tk-runtime native-only 骨架 + `tk` feature 门禁；nsh GTK4 最小 app 构建/启动 | 无 GUI 下 `button .b ...; pack .b` 生成正确树；`cargo build -p rtcl-cli --features tk` 通过；wasm 目标对 tk-runtime 报 compile_error |
-| M1 | rtcl-vm 嵌入 + `tk` L0 命令 + nsh 后端最小集（frame/label/button/entry） | Linux/GPUI 或 headless demo：按钮点击执行 Tcl 命令 |
+| M1a ✅ | rtcl-vm `tk` 命令层：frame/label/button/entry/… 创建、configure/cget、pack/grid、destroy、winfo、wm/tk；per-widget 路径命令；teardown 自动清树；4 条单测 | `button .b -text Hi; cget .b -text` 等 Tcl 脚本语义通过 |
+| M1b | nsh 后端最小集（frame/label/button/entry） | Linux GTK4 或 headless demo：按钮点击执行 Tcl 命令 |
 | M2 | pack/grid、bind/after/update/vwait、textvariable、cget/configure/winfo | 经典 Tk 小脚本可直接跑（差异表外） |
 | M3 | ttk 常用控件 + listbox/menu/scrollbar + 主题/DPI/IME/a11y | 设置页/表单/列表演示 |
 | M4 | 虚拟化 table/log/tree/chart + iOS/Android embed + 打包 | 手机/桌面同一 Tcl 脚本跑通 |
@@ -151,10 +152,9 @@ M0 已完成：`rtcl-tk-core` 纯模型 + `rtcl-tk-runtime` native-only 骨架 +
 `rtcl-cli` 的 `tk` feature 门禁；nsh 0.4 `nsh-platform-linux` 最小 GTK4
 app 已在本机构建并启动。
 
-下一步 M1：
+M1a 已完成（`rtcl-tk-runtime` 命令层）。下一步 M1b：
 
-1. `rtcl-tk-runtime`：嵌入 rtcl-vm，注册
-   `button/label/entry/frame + pack 子集 + cget/configure/destroy`；
-2. `rtcl-tk-nsh`：把 WidgetSpec 映射到 nsh 组件，先用
+1. `rtcl-tk-nsh`：把 WidgetSpec 映射到 nsh 组件，先用
    `nsh-testing` headless 验证 Tcl `-command` → 事件 → 回调；
-3. 再接 `nsh-platform-linux` GTK4 窗口，随后 iOS/Android 真机。
+2. 再接 `nsh-platform-linux` GTK4 窗口，随后 iOS/Android 真机；
+3. Tcl 侧补 `-textvariable` 双向绑定、`bind`/`after`/`update`/`vwait`。

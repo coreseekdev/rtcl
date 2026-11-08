@@ -747,17 +747,32 @@ pub fn set_proc_body_executor(executor: Option<ProcBodyExecutor>) {
 /// pointer (no closure state), registered once like the executor hook.
 pub type InterpTeardownHook = fn(*mut Interp);
 
-static INTERP_TEARDOWN_HOOK: std::sync::OnceLock<Option<InterpTeardownHook>> =
+static INTERP_TEARDOWN_HOOKS: std::sync::OnceLock<std::sync::Mutex<Vec<InterpTeardownHook>>> =
     std::sync::OnceLock::new();
 
-/// Register the interpreter-teardown hook.  First call wins.
+/// Register an interpreter-teardown hook.  Hooks accumulate (JIT pools,
+/// the native Tk runtime, host extensions); every hook runs on Drop.
+pub fn add_interp_teardown_hook(hook: InterpTeardownHook) {
+    let hooks = INTERP_TEARDOWN_HOOKS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut hooks) = hooks.lock() {
+        hooks.push(hook);
+    }
+}
+
+/// Backward-compatible registration: `Some` adds a hook, `None` is a no-op.
 pub fn set_interp_teardown_hook(hook: Option<InterpTeardownHook>) {
-    let _ = INTERP_TEARDOWN_HOOK.set(hook);
+    if let Some(hook) = hook {
+        add_interp_teardown_hook(hook);
+    }
 }
 
 pub(crate) fn run_interp_teardown_hook(interp: *mut Interp) {
-    if let Some(Some(f)) = INTERP_TEARDOWN_HOOK.get() {
-        f(interp);
+    if let Some(hooks) = INTERP_TEARDOWN_HOOKS.get() {
+        if let Ok(hooks) = hooks.lock() {
+            for f in hooks.iter() {
+                f(interp);
+            }
+        }
     }
 }
 

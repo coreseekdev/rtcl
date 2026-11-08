@@ -25,7 +25,7 @@ mod varmap;
 pub(crate) use util::{split_array_ref, glob_match};
 pub(crate) use varmap::{VarMap, VarSet};
 
-pub use vm_exec::{set_bytecode_disabled, set_bytecode_retire_hook, set_interp_teardown_hook, set_proc_body_executor, ByteCodeRetireHook, InterpTeardownHook, ProcBodyExecutor};
+pub use vm_exec::{add_interp_teardown_hook, set_bytecode_disabled, set_bytecode_retire_hook, set_interp_teardown_hook, set_proc_body_executor, ByteCodeRetireHook, InterpTeardownHook, ProcBodyExecutor};
 
 use crate::command::{CommandFunc, CommandCategory, CommandMeta};
 use crate::value::Value;

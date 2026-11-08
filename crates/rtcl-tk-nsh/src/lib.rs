@@ -937,7 +937,49 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
         WidgetKind::Text => {
             let tags = rtcl_tk_runtime::text_tags(path);
             if !tags.is_empty() {
-                return render_rich_text(tree, path, &tags);
+                let editing = rtcl_tk_runtime::text_editing(path);
+                let toggle_path = path.to_string();
+                let toggle_label = if editing { "Done" } else { "Edit" };
+                let toggle = nsh_base::button()
+                    .self_start()
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(4.0))
+                    .bg(AdaptiveColor::rgb(0xe5e7eb, 0x374151))
+                    .child(
+                        text(toggle_label.to_string())
+                            .text_size(px(12.0))
+                            .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                    )
+                    .on_press(move |_: &()| {
+                        rtcl_tk_runtime::toggle_text_edit(&toggle_path);
+                    });
+                if editing {
+                    let edit_path = path.to_string();
+                    let change_path = edit_path.clone();
+                    return view()
+                        .flex_col()
+                        .w_full()
+                        .gap_1()
+                        .child(
+                            nsh_base::input()
+                                .multiline(true)
+                                .auto_focus(true)
+                                .value(rtcl_tk_runtime::text_value(&edit_path))
+                                .on_change(move |text: &str| {
+                                    rtcl_tk_runtime::text_changed(&change_path, text);
+                                }),
+                        )
+                        .child(toggle)
+                        .into_element();
+                }
+                return view()
+                    .flex_col()
+                    .w_full()
+                    .gap_1()
+                    .child(render_rich_text(tree, path, &tags))
+                    .child(toggle)
+                    .into_element();
             }
             let path = path.to_string();
             let disabled = is_disabled(tree, path.as_str());
@@ -1325,6 +1367,41 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 let coords = &item.coords;
                 let option =
                     |name: &str| item.options.get(name).and_then(|value| parse_color(value));
+                let center = match item.kind.as_str() {
+                    "rectangle" | "oval" if coords.len() >= 4 => (
+                        (coords[0] + coords[2]) as f32 / 2.0,
+                        (coords[1] + coords[3]) as f32 / 2.0,
+                    ),
+                    "line" | "polygon" if coords.len() >= 2 => {
+                        let n = (coords.len() / 2).max(1) as f32;
+                        let mut sx = 0.0f32;
+                        let mut sy = 0.0f32;
+                        for pair in coords.chunks(2) {
+                            sx += pair[0] as f32;
+                            sy += pair.get(1).copied().unwrap_or(0.0) as f32;
+                        }
+                        (sx / n, sy / n)
+                    }
+                    "image" if coords.len() >= 2 => {
+                        (coords[0] as f32 + 40.0, coords[1] as f32 + 40.0)
+                    }
+                    _ if coords.len() >= 2 => (coords[0] as f32, coords[1] as f32),
+                    _ => (0.0, 0.0),
+                };
+                let angle = item
+                    .options
+                    .get("-angle")
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .unwrap_or(0.0)
+                    .to_radians();
+                let rotated = angle != 0.0;
+                if rotated {
+                    painter = painter
+                        .save()
+                        .translate(center.0, center.1)
+                        .rotate(angle)
+                        .translate(-center.0, -center.1);
+                }
                 match item.kind.as_str() {
                     "rectangle" if coords.len() >= 4 => {
                         let (x, y, w, h) = (
@@ -1342,7 +1419,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                                 .line_width(1.0f32)
                                 .begin_path()
                                 .rect(nsh_core::geometry::Bounds::new(
-                                    Point::new(Points(coords[0] as f32), Points(coords[1] as f32)),
+                                    Point::new(Points(x), Points(y)),
                                     Size::new(Points(w), Points(h)),
                                 ))
                                 .stroke();
@@ -1357,14 +1434,34 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                             .get("-width")
                             .and_then(|v| v.parse::<f32>().ok())
                             .unwrap_or(1.0);
+                        let smooth = item
+                            .options
+                            .get("-smooth")
+                            .is_some_and(|v| !matches!(v.as_str(), "" | "0" | "false" | "raw"));
+                        let points = coords
+                            .chunks(2)
+                            .filter(|p| p.len() == 2)
+                            .map(|p| (p[0] as f32, p[1] as f32))
+                            .collect::<Vec<_>>();
                         painter = painter
                             .stroke_color(color.light)
                             .line_width(line_width)
                             .begin_path()
-                            .move_to(coords[0] as f32, coords[1] as f32);
-                        for pair in coords[2..].chunks(2) {
-                            if pair.len() == 2 {
-                                painter = painter.line_to(pair[0] as f32, pair[1] as f32);
+                            .move_to(points[0].0, points[0].1);
+                        if smooth && points.len() > 2 {
+                            for i in 1..points.len() - 1 {
+                                let (cx, cy) = points[i];
+                                let (nx, ny) = points[i + 1];
+                                painter = painter.quadratic_curve_to(
+                                    Point::new(Points(cx), Points(cy)),
+                                    Point::new(Points((cx + nx) / 2.0), Points((cy + ny) / 2.0)),
+                                );
+                            }
+                            let last = points[points.len() - 1];
+                            painter = painter.line_to(last.0, last.1);
+                        } else {
+                            for (x, y) in &points[1..] {
+                                painter = painter.line_to(*x, *y);
                             }
                         }
                         painter = painter.stroke();
@@ -1408,7 +1505,28 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                             );
                         }
                     }
+                    "image" if coords.len() >= 2 => {
+                        if let Some(name) = item.options.get("-image") {
+                            if let Some(file) = rtcl_tk_runtime::image_path(name) {
+                                let (iw, ih) =
+                                    rtcl_tk_runtime::image_dimensions(name).unwrap_or((80, 80));
+                                painter = painter.draw_image(
+                                    &file,
+                                    nsh_core::geometry::Bounds::new(
+                                        Point::new(
+                                            Points(coords[0] as f32),
+                                            Points(coords[1] as f32),
+                                        ),
+                                        Size::new(Points(iw as f32), Points(ih as f32)),
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     _ => {}
+                }
+                if rotated {
+                    painter = painter.restore();
                 }
             }
             let mut container = view().w(px(width)).h(px(height)).items_start();

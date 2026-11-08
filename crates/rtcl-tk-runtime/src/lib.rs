@@ -74,6 +74,8 @@ pub struct TkRuntime {
     image_seq: u64,
     /// Canvas item models.
     canvases: BTreeMap<String, CanvasState>,
+    /// Text widgets currently shown in plain edit mode (tags retained).
+    editing_text: BTreeSet<String>,
 }
 
 /// A canvas's items.
@@ -4111,11 +4113,85 @@ pub fn text_changed(path: &str, text: &str) {
     let Some(ptr) = active_interp() else { return };
     let interp = unsafe { &mut *ptr };
     with_state_mut(interp, |rt| {
+        let old = rt
+            .tree
+            .get(path)
+            .map(|n| n.content.clone())
+            .unwrap_or_default();
+        adjust_text_tag_ranges(&old, text, rt.text_tags.get_mut(path));
         if let Some(n) = rt.tree.get_mut(path) {
             n.content = text.to_string();
             n.cursor = text.chars().count();
             rt.bump();
         }
+    });
+}
+
+/// Shift tag ranges for an edit (`old` → `new`).
+fn adjust_text_tag_ranges(old: &str, new: &str, tags: Option<&mut BTreeMap<String, TextTag>>) {
+    let Some(tags) = tags else { return };
+    let old_chars = old.chars().collect::<Vec<_>>();
+    let new_chars = new.chars().collect::<Vec<_>>();
+    let mut prefix = 0;
+    while prefix < old_chars.len()
+        && prefix < new_chars.len()
+        && old_chars[prefix] == new_chars[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old_chars.len().saturating_sub(prefix)
+        && suffix < new_chars.len().saturating_sub(prefix)
+        && old_chars[old_chars.len() - 1 - suffix] == new_chars[new_chars.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let old_len = old_chars.len();
+    let new_len = new_chars.len();
+    let delta = new_len as isize - old_len as isize;
+    for tag in tags.values_mut() {
+        let mut ranges = Vec::new();
+        for (start, end) in tag.ranges.drain(..) {
+            let (start, end) = if end <= prefix {
+                (start, end)
+            } else if start >= old_len.saturating_sub(suffix) {
+                (
+                    (start as isize + delta).max(0) as usize,
+                    (end as isize + delta).max(0) as usize,
+                )
+            } else {
+                (
+                    start.min(prefix),
+                    ((end as isize + delta).max(0) as usize).max(prefix),
+                )
+            };
+            let start = start.min(new_len);
+            let end = end.min(new_len);
+            if start < end {
+                ranges.push((start, end));
+            }
+        }
+        tag.ranges = ranges;
+    }
+}
+
+/// Whether a tagged text widget is in plain edit mode.
+pub fn text_editing(path: &str) -> bool {
+    let Some(ptr) = active_interp() else {
+        return false;
+    };
+    with_state(unsafe { &*ptr }, |rt| rt.editing_text.contains(path)).unwrap_or(false)
+}
+
+/// Toggle a tagged text widget between rich display and plain editing.
+pub fn toggle_text_edit(path: &str) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    with_state_mut(interp, |rt| {
+        if !rt.editing_text.remove(path) {
+            rt.editing_text.insert(path.to_string());
+        }
+        rt.bump();
     });
 }
 
@@ -4918,7 +4994,10 @@ fn char_to_linecol(content: &str, index: usize) -> String {
 }
 
 fn canvas_create(interp: &mut Interp, path: &str, kind: &str, rest: &[Value]) -> Result<Value> {
-    if !matches!(kind, "rectangle" | "oval" | "line" | "text" | "polygon") {
+    if !matches!(
+        kind,
+        "rectangle" | "oval" | "line" | "text" | "polygon" | "image"
+    ) {
         return Err(generic(format!(
             "unknown or unsupported canvas item type \"{kind}\""
         )));
@@ -5258,6 +5337,7 @@ fn set_canvas_view(interp: &mut Interp, path: &str, horizontal: bool, fraction: 
 fn canvas_item_contains(item: &CanvasItem, x: f64, y: f64) -> bool {
     let c = &item.coords;
     match item.kind.as_str() {
+        "image" if c.len() >= 2 => x >= c[0] && x <= c[0] + 80.0 && y >= c[1] && y <= c[1] + 80.0,
         "rectangle" | "text" | "polygon" if c.len() >= 4 => {
             x >= c[0].min(c[2]) && x <= c[0].max(c[2]) && y >= c[1].min(c[3]) && y <= c[1].max(c[3])
         }
@@ -6261,6 +6341,8 @@ mod tests {
         );
         assert_eq!(eval(&mut i, ".t tag ranges strong"), "1.0 1.5");
         assert_eq!(text_tags(".t").len(), 1);
+        text_changed(".t", "hello brave world");
+        assert_eq!(text_tags(".t")[0].ranges, vec![(0, 5)]);
         assert_eq!(eval(&mut i, ".t tag names 1.2"), "strong");
         assert_eq!(eval(&mut i, ".t tag names 1.7"), "");
         assert_eq!(eval(&mut i, ".t tag cget strong -foreground"), "red");

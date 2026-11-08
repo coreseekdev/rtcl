@@ -86,4 +86,10 @@ fn classic_form_round_trip() {
     app.wait_for("A").expect("chart labels render");
     app.wait_for("normal ALERT tail")
         .expect("text tag spans render (rich text view)");
+    app.press("Edit").expect("enter plain edit mode");
+    app.type_text("normal ALERT tail", "!")
+        .expect("edit the tagged text");
+    app.press("Done").expect("leave edit mode");
+    app.wait_for("normal ALERT tail!")
+        .expect("edits keep tags and return to rich view");
 }

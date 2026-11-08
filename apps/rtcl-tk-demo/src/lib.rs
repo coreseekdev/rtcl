@@ -69,6 +69,48 @@ if {[info exists ::env(RTCL_TK_AUTO)]} {
 }
 "#;
 
+/// A classic grid/pack form, close to what a Tk tutorial app looks like.
+pub const CLASSIC: &str = r#"
+set ::name "World"
+proc greeting {name} {
+    if {$name eq ""} { return "Hello, stranger" }
+    return "Hello, $name"
+}
+
+frame .form -borderwidth 1 -relief groove
+label .form.nameLabel -text "Name:"
+entry .form.nameEntry -textvariable ::name -width 24
+button .form.ok -text OK -command {
+    set ::message [greeting $::name]
+}
+grid .form.nameLabel -row 0 -column 0 -sticky w
+grid .form.nameEntry -row 0 -column 1 -sticky ew -padx 4
+grid .form.ok -row 1 -column 1 -sticky e
+grid columnconfigure .form 1 -weight 1
+pack .form -fill x -padx 8 -pady 8
+
+message .msg -textvariable ::message -width 320
+pack .msg -padx 8
+
+frame .listframe
+pack .listframe -fill both -expand 1 -padx 8
+listbox .listframe.lb -height 4
+pack .listframe.lb -side left -fill both -expand 1
+scrollbar .listframe.sb -orient vertical -command {.listframe.lb yview}
+pack .listframe.sb -side right -fill y
+foreach color {Red Green Blue} { .listframe.lb insert end $color }
+
+ttk::separator .sep
+pack .sep -fill x -pady 4
+
+ttk::progressbar .pb -value 40 -maximum 100
+pack .pb -fill x -padx 8
+
+focus .form.nameEntry
+bind .form.nameEntry <Return> {.form.ok invoke}
+set ::message ""
+"#;
+
 thread_local! {
     /// The engine-thread interpreter.  Created on the first render so the
     /// GTK runner and headless nsh-testing share exactly one setup.
@@ -76,6 +118,10 @@ thread_local! {
 }
 
 pub fn ensure_tcl() {
+    ensure_tcl_script(DEMO);
+}
+
+pub fn ensure_tcl_script(script: &str) {
     let fresh = INTERP.with(|cell| {
         if cell.borrow().is_some() {
             return false;
@@ -87,7 +133,7 @@ pub fn ensure_tcl() {
         // dangling active pointer).
         let interp = slot.insert(Interp::new());
         rtcl_tk_runtime::install(interp);
-        if let Err(e) = interp.eval(DEMO) {
+        if let Err(e) = interp.eval(script) {
             eprintln!("demo script: {e}");
         }
         drop(slot);
@@ -101,5 +147,12 @@ pub fn ensure_tcl() {
 #[component]
 pub fn DemoApp() -> impl IntoElement {
     ensure_tcl();
+    rtcl_tk_nsh::tk_view()
+}
+
+/// The [`CLASSIC`] form, for the regression test.
+#[component]
+pub fn ClassicApp() -> impl IntoElement {
+    ensure_tcl_script(CLASSIC);
     rtcl_tk_nsh::tk_view()
 }

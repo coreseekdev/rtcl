@@ -514,6 +514,50 @@ impl TkTree {
         Ok(())
     }
 
+    /// Move `path` to the end of its parent's children (top of the
+    /// stacking order, as `raise`).
+    pub fn raise(&mut self, path: &str) -> Result<(), TkError> {
+        let parent = self
+            .nodes
+            .get(path)
+            .and_then(|n| n.parent.clone())
+            .ok_or_else(|| TkError::NotFound(path.to_string()))?;
+        if let Some(node) = self.nodes.get_mut(&parent) {
+            node.children.retain(|c| c != path);
+            node.children.push(path.to_string());
+        }
+        Ok(())
+    }
+
+    /// Move `path` to the start of its parent's children (`lower`).
+    pub fn lower(&mut self, path: &str) -> Result<(), TkError> {
+        let parent = self
+            .nodes
+            .get(path)
+            .and_then(|n| n.parent.clone())
+            .ok_or_else(|| TkError::NotFound(path.to_string()))?;
+        if let Some(node) = self.nodes.get_mut(&parent) {
+            node.children.retain(|c| c != path);
+            node.children.insert(0, path.to_string());
+        }
+        Ok(())
+    }
+
+    /// All widgets below `path`, depth first (for focus traversal).
+    pub fn descendants(&self, path: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        fn walk(tree: &TkTree, path: &str, out: &mut Vec<String>) {
+            if let Some(n) = tree.get(path) {
+                for c in &n.children {
+                    out.push(c.clone());
+                    walk(tree, c, out);
+                }
+            }
+        }
+        walk(self, path, &mut out);
+        out
+    }
+
     /// `place forget`.
     pub fn unplace(&mut self, path: &str) -> Result<(), TkError> {
         let node = self
@@ -641,21 +685,6 @@ pub fn valid_option(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
-
-const COMMON_OPTIONS: &[&str] = &[
-    "-background",
-    "-borderwidth",
-    "-cursor",
-    "-font",
-    "-foreground",
-    "-highlightbackground",
-    "-highlightcolor",
-    "-highlightthickness",
-    "-relief",
-    "-takefocus",
-    "-padx",
-    "-pady",
-];
 
 const TOPLEVEL_OPTIONS: &[&str] = &[
     "-background",

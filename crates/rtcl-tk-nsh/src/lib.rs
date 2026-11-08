@@ -131,23 +131,55 @@ fn render_children(tree: &TkTree, path: &str) -> AnyElement {
     {
         return render_grid(tree, path);
     }
-    let row = node.children.iter().any(|c| {
-        tree.get(c)
-            .and_then(|n| n.pack)
-            .is_some_and(|p| matches!(p.side, PackSide::Left | PackSide::Right))
-    });
-    let mut container = view().gap_2();
-    container = if row {
-        container.flex_row().items_center()
-    } else {
-        container.flex_col()
-    };
+    // Pack children flow in order; consecutive left/right children share
+    // a row, with the right-hand ones pushed to its end (a listbox and its
+    // scrollbar, for instance).
+    let mut container = view().flex_col().gap_2();
     let mut placed = Vec::new();
-    for child in &node.children {
+    let mut i = 0;
+    while i < node.children.len() {
+        let child = &node.children[i];
         if tree.get(child).is_some_and(|n| n.place.is_some()) {
             placed.push(child);
+            i += 1;
+            continue;
+        }
+        let side = tree
+            .get(child)
+            .and_then(|n| n.pack)
+            .map(|p| p.side)
+            .unwrap_or(PackSide::Top);
+        if matches!(side, PackSide::Left | PackSide::Right) {
+            let mut lefts = Vec::new();
+            let mut rights = Vec::new();
+            while i < node.children.len() {
+                let c = &node.children[i];
+                let s = tree
+                    .get(c)
+                    .and_then(|n| n.pack)
+                    .map(|p| p.side)
+                    .unwrap_or(PackSide::Top);
+                match s {
+                    PackSide::Left => lefts.push(c),
+                    PackSide::Right => rights.push(c),
+                    _ => break,
+                }
+                i += 1;
+            }
+            let mut row = view().flex_row().items_center().gap_2().w_full();
+            for c in lefts {
+                row = row.child(render_packed(tree, c));
+            }
+            if !rights.is_empty() {
+                row = row.child(view().flex_grow(1.0));
+                for c in rights {
+                    row = row.child(render_packed(tree, c));
+                }
+            }
+            container = container.child(row);
         } else {
             container = container.child(render_packed(tree, child));
+            i += 1;
         }
     }
     for child in placed {
@@ -291,6 +323,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let key_path = path.clone();
             nsh_base::input()
                 .value(rtcl_tk_runtime::entry_value(&path))
+                .auto_focus(rtcl_tk_runtime::focused(&path))
                 .masked(!show.is_empty())
                 .disabled(disabled)
                 .readonly(readonly)
@@ -425,6 +458,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let change_path = path.clone();
             nsh_base::input()
                 .multiline(true)
+                .auto_focus(rtcl_tk_runtime::focused(&path))
                 .value(rtcl_tk_runtime::text_value(&path))
                 .disabled(disabled)
                 .on_change(move |text: &str| {

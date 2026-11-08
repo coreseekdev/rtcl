@@ -43,6 +43,14 @@ pub struct TkRuntime {
     /// `grid columnconfigure` / `rowconfigure`: `(parent, index, is_row)`
     /// to `(weight, minsize)`.
     grid_options: BTreeMap<(String, i64, bool), (i64, i64)>,
+    /// `focus` target (a widget path).
+    focus: Option<String>,
+    /// `bindtags` overrides.
+    bindtags: BTreeMap<String, Vec<String>>,
+    /// Named fonts: name to its options.
+    fonts: BTreeMap<String, BTreeMap<String, String>>,
+    /// `option add` database entries, in insertion order.
+    option_db: Vec<(String, String)>,
 }
 
 impl TkRuntime {
@@ -302,6 +310,15 @@ pub fn install(interp: &mut Interp) {
         "tk",
         "bind",
         "event",
+        "focus",
+        "raise",
+        "lower",
+        "bindtags",
+        "font",
+        "option",
+        "bell",
+        "tk_focusNext",
+        "tk_focusPrev",
     ] {
         interp.register_command(name, global_command);
     }
@@ -2068,6 +2085,394 @@ pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) {
     }
 }
 
+fn focus_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let mut i = 1;
+    while i < args.len() && args[i].as_str().starts_with('-') {
+        match args[i].as_str() {
+            "-force" | "-lastfor" => i += 1,
+            "-displayof" => i += 2,
+            other => return Err(generic(format!("bad option \"{other}\""))),
+        }
+    }
+    if i >= args.len() {
+        let current =
+            with_state(interp, |rt| rt.focus.clone().unwrap_or_default()).unwrap_or_default();
+        return Ok(Value::from_str(&current));
+    }
+    let path = args[i].as_str();
+    if path.is_empty() {
+        with_state_mut(interp, |rt| {
+            rt.focus = None;
+            rt.bump();
+        });
+        return Ok(Value::empty());
+    }
+    if !with_state(interp, |rt| rt.tree.contains(path)).unwrap_or(false) {
+        return Err(bad_window(path));
+    }
+    with_state_mut(interp, |rt| {
+        rt.focus = Some(path.to_string());
+        rt.bump();
+    });
+    Ok(Value::empty())
+}
+
+/// Whether `path` is the current `focus`.
+pub fn focused(path: &str) -> bool {
+    let Some(ptr) = active_interp() else {
+        return false;
+    };
+    with_state(unsafe { &*ptr }, |rt| rt.focus.as_deref() == Some(path)).unwrap_or(false)
+}
+
+fn raise_lower_impl(interp: &mut Interp, args: &[Value], raise: bool) -> Result<Value> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(wrong(
+            if raise { "raise" } else { "lower" },
+            "window ?aboveThis?",
+            args.len(),
+        ));
+    }
+    let path = args[1].as_str();
+    with_state_mut(interp, |rt| {
+        if raise {
+            rt.tree.raise(path).map_err(tk_error)?;
+        } else {
+            rt.tree.lower(path).map_err(tk_error)?;
+        }
+        rt.bump();
+        Ok::<(), Error>(())
+    })
+    .ok_or_else(|| bad_window(path))??;
+    Ok(Value::empty())
+}
+
+fn bindtags_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(wrong("bindtags", "window ?tagList?", args.len()));
+    }
+    let path = args[1].as_str().to_string();
+    let (kind, top) = with_state(interp, |rt| {
+        rt.tree.get(&path).map(|n| {
+            let mut top = path.clone();
+            let mut p = path.clone();
+            while let Some(parent) = rt.tree.get(&p).and_then(|n| n.parent.clone()) {
+                p = parent;
+                top = p.clone();
+            }
+            (n.kind, top)
+        })
+    })
+    .flatten()
+    .ok_or_else(|| bad_window(&path))?;
+    if args.len() == 2 {
+        let tags = with_state(interp, |rt| rt.bindtags.get(&path).cloned())
+            .flatten()
+            .unwrap_or_else(|| {
+                vec![
+                    path.clone(),
+                    kind.class_name().to_string(),
+                    top.clone(),
+                    "all".to_string(),
+                ]
+            });
+        return Ok(list_value(tags));
+    }
+    // Tk takes one tag list: `bindtags .w {.w Button . all}`.
+    let tags = args[2]
+        .as_list()
+        .unwrap_or_else(|| vec![args[2].clone()])
+        .iter()
+        .map(|v| v.as_str().to_string())
+        .collect::<Vec<_>>();
+    with_state_mut(interp, |rt| {
+        rt.bindtags.insert(path, tags);
+        rt.bump();
+    });
+    Ok(Value::empty())
+}
+
+fn focusable(kind: WidgetKind) -> bool {
+    matches!(
+        kind,
+        WidgetKind::Entry
+            | WidgetKind::Text
+            | WidgetKind::Listbox
+            | WidgetKind::Button
+            | WidgetKind::Checkbutton
+            | WidgetKind::Radiobutton
+            | WidgetKind::Scale
+    )
+}
+
+fn tk_focus_impl(interp: &mut Interp, args: &[Value], next: bool) -> Result<Value> {
+    let path = args.last().map(|v| v.as_str()).unwrap_or(".");
+    let paths = with_state(interp, |rt| {
+        rt.tree
+            .descendants(".")
+            .into_iter()
+            .filter(|p| rt.tree.get(p).is_some_and(|n| focusable(n.kind)))
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    if paths.is_empty() {
+        return Ok(Value::from_str(""));
+    }
+    let index = paths.iter().position(|p| p == path);
+    let target = match index {
+        Some(i) if next => paths[(i + 1) % paths.len()].clone(),
+        Some(i) => paths[(i + paths.len() - 1) % paths.len()].clone(),
+        None if next => paths[0].clone(),
+        None => paths[paths.len() - 1].clone(),
+    };
+    Ok(Value::from_str(&target))
+}
+
+fn font_defaults() -> BTreeMap<String, String> {
+    [
+        ("-family", "DejaVu Sans"),
+        ("-size", "10"),
+        ("-weight", "normal"),
+        ("-slant", "roman"),
+        ("-underline", "0"),
+        ("-overstrike", "0"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+fn font_options(interp: &Interp, name: &str) -> Option<BTreeMap<String, String>> {
+    with_state(interp, |rt| {
+        rt.fonts
+            .get(name)
+            .cloned()
+            .or_else(|| (name == "TkDefaultFont" || name == "TkTextFont").then(font_defaults))
+    })
+    .flatten()
+}
+
+fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(wrong("font", "option ?arg ...?", args.len()));
+    }
+    match args[1].as_str() {
+        "create" => {
+            if args.len() < 3 {
+                return Err(wrong(
+                    "font create",
+                    "fontName ?-option value ...?",
+                    args.len(),
+                ));
+            }
+            let name = args[2].as_str().to_string();
+            if font_options(interp, &name).is_some() {
+                return Err(generic(format!("font \"{name}\" already exists")));
+            }
+            let mut options = font_defaults();
+            for (k, v) in parse_pairs(args, 3, "font create")? {
+                if !options.contains_key(&k) {
+                    return Err(bad_option(&k));
+                }
+                options.insert(k, v);
+            }
+            with_state_mut(interp, |rt| {
+                rt.fonts.insert(name.clone(), options);
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "configure" => {
+            if args.len() < 3 {
+                return Err(wrong(
+                    "font configure",
+                    "fontName ?-option value ...?",
+                    args.len(),
+                ));
+            }
+            let name = args[2].as_str();
+            let Some(mut options) = font_options(interp, name) else {
+                return Err(generic(format!("font \"{name}\" doesn't exist")));
+            };
+            if args.len() == 3 {
+                return Ok(list_value(
+                    options
+                        .iter()
+                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            if args.len() == 4 && args[3].as_str().starts_with('-') {
+                return Ok(Value::from_str(
+                    options
+                        .get(args[3].as_str())
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                ));
+            }
+            for (k, v) in parse_pairs(args, 3, "font configure")? {
+                if !options.contains_key(&k) {
+                    return Err(bad_option(&k));
+                }
+                options.insert(k, v);
+            }
+            with_state_mut(interp, |rt| {
+                rt.fonts.insert(name.to_string(), options);
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "actual" => {
+            if args.len() < 3 {
+                return Err(wrong("font actual", "font ?-option?", args.len()));
+            }
+            let name = args[2].as_str();
+            let Some(options) = font_options(interp, name) else {
+                return Err(generic(format!("font \"{name}\" doesn't exist")));
+            };
+            if args.len() >= 4 {
+                return Ok(Value::from_str(
+                    options
+                        .get(args[3].as_str())
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                ));
+            }
+            Ok(list_value(
+                options
+                    .iter()
+                    .flat_map(|(k, v)| [k.clone(), v.clone()])
+                    .collect::<Vec<_>>(),
+            ))
+        }
+        "families" => Ok(list_value(
+            ["DejaVu Sans", "Liberation Sans", "Noto Sans", "Sans"]
+                .into_iter()
+                .map(str::to_string),
+        )),
+        "names" => {
+            let names = with_state(interp, |rt| rt.fonts.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            Ok(list_value(names))
+        }
+        "delete" => {
+            if args.len() < 3 {
+                return Err(wrong("font delete", "fontName ?fontName ...?", args.len()));
+            }
+            with_state_mut(interp, |rt| {
+                for a in &args[2..] {
+                    rt.fonts.remove(a.as_str());
+                }
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "exists" => {
+            Ok(Value::from_bool(args.get(2).is_some_and(|v| {
+                font_options(interp, v.as_str()).is_some()
+            })))
+        }
+        "measure" => {
+            if args.len() < 4 {
+                return Err(wrong(
+                    "font measure",
+                    "font ?-displayof window? text",
+                    args.len(),
+                ));
+            }
+            let name = args[2].as_str();
+            let size = font_options(interp, name)
+                .and_then(|o| o.get("-size").and_then(|s| s.parse::<f64>().ok()))
+                .unwrap_or(10.0)
+                .abs();
+            let text = args[3].as_str();
+            Ok(Value::from_int(
+                (text.chars().count() as f64 * size * 0.6).ceil() as i64,
+            ))
+        }
+        "metrics" => {
+            if args.len() < 3 {
+                return Err(wrong("font metrics", "font ?-option?", args.len()));
+            }
+            let size = font_options(interp, args[2].as_str())
+                .and_then(|o| o.get("-size").and_then(|s| s.parse::<f64>().ok()))
+                .unwrap_or(10.0)
+                .abs();
+            let option = args.get(3).map(|v| v.as_str()).unwrap_or("-linespace");
+            let value = match option {
+                "-ascent" => (size * 0.8) as i64,
+                "-descent" => (size * 0.2) as i64,
+                "-linespace" => (size * 1.2) as i64,
+                "-fixed" => 0,
+                _ => 0,
+            };
+            Ok(Value::from_int(value))
+        }
+        other => Err(generic(format!("bad option \"{other}\""))),
+    }
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn walk(p: &[u8], t: &[u8]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some(b'*') => walk(&p[1..], t) || (!t.is_empty() && walk(p, &t[1..])),
+            Some(b'?') => !t.is_empty() && walk(&p[1..], &t[1..]),
+            Some(c) => t.first() == Some(c) && walk(&p[1..], &t[1..]),
+        }
+    }
+    walk(pattern.as_bytes(), text.as_bytes())
+}
+
+fn option_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(wrong("option", "option ?arg ...?", args.len()));
+    }
+    match args[1].as_str() {
+        "add" => {
+            if args.len() < 4 || args.len() > 5 {
+                return Err(wrong("option add", "pattern value ?priority?", args.len()));
+            }
+            let pattern = args[2].as_str().to_string();
+            let value = args[3].as_str().to_string();
+            with_state_mut(interp, |rt| {
+                rt.option_db.push((pattern, value));
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "get" => {
+            if args.len() < 5 {
+                return Err(wrong("option get", "window name class", args.len()));
+            }
+            let name = args[3].as_str();
+            let class = args[4].as_str();
+            let class_name = format!("{class}.{name}");
+            let found = with_state(interp, |rt| {
+                rt.option_db
+                    .iter()
+                    .rev()
+                    .find(|(p, _)| {
+                        glob_match(p, name) || glob_match(p, &class_name) || glob_match(p, class)
+                    })
+                    .map(|(_, v)| v.clone())
+            })
+            .flatten()
+            .unwrap_or_default();
+            Ok(Value::from_str(&found))
+        }
+        "clear" => {
+            with_state_mut(interp, |rt| {
+                rt.option_db.clear();
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "readfile" => Ok(Value::empty()),
+        other => Err(generic(format!("bad option \"{other}\""))),
+    }
+}
+
 fn event_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(wrong("event", "option ?arg ...?", args.len()));
@@ -2898,6 +3303,15 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "tk" => tk_impl(interp, args),
         "bind" => bind_impl(interp, args),
         "event" => event_impl(interp, args),
+        "focus" => focus_impl(interp, args),
+        "raise" => raise_lower_impl(interp, args, true),
+        "lower" => raise_lower_impl(interp, args, false),
+        "bindtags" => bindtags_impl(interp, args),
+        "font" => font_impl(interp, args),
+        "option" => option_impl(interp, args),
+        "bell" => Ok(Value::empty()),
+        "tk_focusNext" => tk_focus_impl(interp, args, true),
+        "tk_focusPrev" => tk_focus_impl(interp, args, false),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -3106,6 +3520,44 @@ mod tests {
         eval(&mut i, "ttk::button .b -text Go; ttk::label .l -text Hi");
         assert_eq!(eval(&mut i, "winfo class .b"), "Button");
         assert_eq!(eval(&mut i, "winfo class .l"), "Label");
+    }
+
+    #[test]
+    fn focus_bindtags_fonts_and_option_db() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "frame .f; entry .f.a; entry .f.b; focus .f.b; \
+             bindtags .f.a",
+        );
+        assert_eq!(eval(&mut i, "focus"), ".f.b");
+        assert!(focused(".f.b"));
+        assert_eq!(eval(&mut i, "lindex [bindtags .f.a] 1"), "Entry");
+        assert_eq!(eval(&mut i, "tk_focusNext .f.a"), ".f.b");
+        assert_eq!(eval(&mut i, "tk_focusPrev .f.a"), ".f.b");
+        eval(&mut i, "bindtags .f.a {.f.a Entry all}");
+        assert_eq!(eval(&mut i, "bindtags .f.a"), ".f.a Entry all");
+        eval(
+            &mut i,
+            "font create Title -family {DejaVu Sans} -size 20 -weight bold; \
+             option add *Entry.background red",
+        );
+        assert_eq!(eval(&mut i, "font actual Title -size"), "20");
+        assert_eq!(eval(&mut i, "option get .e background Entry"), "red");
+        assert_eq!(eval(&mut i, "font measure Title abc"), "36");
+    }
+
+    #[test]
+    fn raise_lower_reorder_siblings() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "frame .f; label .f.a -text A; label .f.b -text B");
+        assert_eq!(eval(&mut i, "winfo children .f"), ".f.a .f.b");
+        eval(&mut i, "raise .f.a");
+        assert_eq!(eval(&mut i, "winfo children .f"), ".f.b .f.a");
+        eval(&mut i, "lower .f.a");
+        assert_eq!(eval(&mut i, "winfo children .f"), ".f.a .f.b");
     }
 
     #[test]

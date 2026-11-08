@@ -33,6 +33,10 @@ pub enum WidgetKind {
     Separator,
     /// `ttk::progressbar`: a determinate progress fill.
     Progressbar,
+    /// `ttk::notebook`: tabbed pages (children are the pages).
+    Notebook,
+    /// `ttk::combobox`: an entry with a value list.
+    Combobox,
 }
 
 impl WidgetKind {
@@ -52,6 +56,8 @@ impl WidgetKind {
             "scrollbar" => Self::Scrollbar,
             "separator" => Self::Separator,
             "progressbar" => Self::Progressbar,
+            "notebook" => Self::Notebook,
+            "combobox" => Self::Combobox,
             _ => return None,
         })
     }
@@ -73,6 +79,8 @@ impl WidgetKind {
             Self::Scrollbar => "Scrollbar",
             Self::Separator => "TSeparator",
             Self::Progressbar => "TProgressbar",
+            Self::Notebook => "TNotebook",
+            Self::Combobox => "TCombobox",
         }
     }
 
@@ -546,6 +554,34 @@ impl TkTree {
         Ok(())
     }
 
+    /// Move `child` to `index` among `parent`'s children.
+    pub fn insert_child_at(
+        &mut self,
+        parent: &str,
+        child: &str,
+        index: usize,
+    ) -> Result<(), TkError> {
+        let node = self
+            .nodes
+            .get_mut(parent)
+            .ok_or_else(|| TkError::NotFound(parent.to_string()))?;
+        node.children.retain(|c| c != child);
+        let at = index.min(node.children.len());
+        node.children.insert(at, child.to_string());
+        Ok(())
+    }
+
+    /// Stop showing `child` under `parent` (notebook `forget`); the widget
+    /// itself stays alive.
+    pub fn detach(&mut self, parent: &str, child: &str) -> Result<(), TkError> {
+        let node = self
+            .nodes
+            .get_mut(parent)
+            .ok_or_else(|| TkError::NotFound(parent.to_string()))?;
+        node.children.retain(|c| c != child);
+        Ok(())
+    }
+
     /// All widgets below `path`, depth first (for focus traversal).
     pub fn descendants(&self, path: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -734,8 +770,12 @@ const FRAME_OPTIONS: &[&str] = &[
     "-highlightthickness",
     "-padx",
     "-pady",
+    "-padding",
     "-relief",
+    "-state",
+    "-style",
     "-takefocus",
+    "-text",
     "-visual",
     "-width",
 ];
@@ -1031,6 +1071,35 @@ const PROGRESSBAR_OPTIONS: &[&str] = &[
     "-variable",
 ];
 
+const NOTEBOOK_OPTIONS: &[&str] = &[
+    "-cursor",
+    "-height",
+    "-padding",
+    "-style",
+    "-takefocus",
+    "-width",
+];
+
+const COMBOBOX_OPTIONS: &[&str] = &[
+    "-background",
+    "-cursor",
+    "-exportselection",
+    "-font",
+    "-foreground",
+    "-height",
+    "-invalidcommand",
+    "-justify",
+    "-postcommand",
+    "-state",
+    "-style",
+    "-takefocus",
+    "-textvariable",
+    "-validate",
+    "-validatecommand",
+    "-values",
+    "-width",
+];
+
 /// Options Tk 8.6 accepts for `kind` (including the ones kept on the node
 /// as `wm` pseudo-options for toplevels).
 pub fn known_options(kind: WidgetKind) -> &'static [&'static str] {
@@ -1049,6 +1118,8 @@ pub fn known_options(kind: WidgetKind) -> &'static [&'static str] {
         WidgetKind::Scrollbar => SCROLLBAR_OPTIONS,
         WidgetKind::Separator => SEPARATOR_OPTIONS,
         WidgetKind::Progressbar => PROGRESSBAR_OPTIONS,
+        WidgetKind::Notebook => NOTEBOOK_OPTIONS,
+        WidgetKind::Combobox => COMBOBOX_OPTIONS,
     }
 }
 
@@ -1069,11 +1140,13 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
             WidgetKind::Text => "80",
             WidgetKind::Listbox => "20",
             WidgetKind::Scale => "100",
+            WidgetKind::Combobox => "20",
             _ => "0",
         },
         "-height" => match kind {
             WidgetKind::Text => "24",
             WidgetKind::Listbox => "10",
+            WidgetKind::Combobox => "10",
             _ => "0",
         },
         "-text" | "-label" | "-textvariable" | "-variable" | "-command" => "",
@@ -1110,7 +1183,9 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
         "-mode" => "determinate",
         "-phase" => "0",
         "-validate" => "none",
-        "-validatecommand" | "-invalidcommand" | "-xscrollcommand" | "-yscrollcommand" => "",
+        "-validatecommand" | "-invalidcommand" | "-xscrollcommand" | "-yscrollcommand"
+        | "-values" | "-postcommand" | "-style" => "",
+        "-padding" => "0",
         "-exportselection" => "1",
         "-wrap" => "char",
         "-undo" | "-maxundo" | "-spacing1" | "-spacing2" | "-spacing3" | "-tabs" => "0",

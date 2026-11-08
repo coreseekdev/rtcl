@@ -55,6 +55,10 @@ pub struct TkRuntime {
     menus: BTreeMap<String, Menu>,
     /// The open cascade menu (`None` when no menu is dropped down).
     open_menu: Option<String>,
+    /// Selected page index of each `ttk::notebook`.
+    notebook_selected: BTreeMap<String, usize>,
+    /// The combobox whose value list is dropped down.
+    open_combobox: Option<String>,
 }
 
 /// One entry of a Tk `menu`.
@@ -315,6 +319,10 @@ pub fn install(interp: &mut Interp) {
         "ttk::scrollbar",
         "ttk::separator",
         "ttk::progressbar",
+        "notebook",
+        "combobox",
+        "ttk::notebook",
+        "ttk::combobox",
     ] {
         interp.register_command(name, create_widget);
     }
@@ -516,7 +524,7 @@ fn create_widget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// content from `-textvariable`, checkbutton state).
 fn initialize_widget(interp: &mut Interp, path: &str, kind: WidgetKind) -> Result<()> {
     match kind {
-        WidgetKind::Entry => {
+        WidgetKind::Entry | WidgetKind::Combobox => {
             let var = effective_option(interp, path, "-textvariable");
             if !var.is_empty() {
                 let text = var_value(&var).unwrap_or_default();
@@ -836,6 +844,180 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "start" | "stop" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
+            WidgetKind::Notebook => match sub {
+                "add" => {
+                    if args.len() < 3 {
+                        return Err(wrong("add", "window ?-option value ...?", args.len()));
+                    }
+                    notebook_add(interp, path, args[2].as_str(), &args[3..], None)
+                }
+                "insert" => {
+                    if args.len() < 4 {
+                        return Err(wrong(
+                            "insert",
+                            "index window ?-option value ...?",
+                            args.len(),
+                        ));
+                    }
+                    let index = args[2].as_str().parse::<usize>().map_err(|_| {
+                        generic(format!("expected integer but got \"{}\"", args[2].as_str()))
+                    })?;
+                    notebook_add(interp, path, args[3].as_str(), &args[4..], Some(index))
+                }
+                "forget" => {
+                    if args.len() < 3 {
+                        return Err(wrong("forget", "window", args.len()));
+                    }
+                    notebook_forget(interp, path, args[2].as_str())?;
+                    Ok(Value::empty())
+                }
+                "tabs" => {
+                    let tabs = with_state(interp, |rt| rt.tree.children(path).map(|c| c.to_vec()))
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
+                    Ok(list_value(tabs))
+                }
+                "select" => {
+                    let pages = with_state(interp, |rt| rt.tree.children(path).map(|c| c.to_vec()))
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
+                    if args.len() == 2 {
+                        let index = notebook_selected(path);
+                        return Ok(Value::from_str(
+                            pages.get(index).map(String::as_str).unwrap_or(""),
+                        ));
+                    }
+                    let target = args[2].as_str();
+                    let index = pages
+                        .iter()
+                        .position(|p| p == target)
+                        .ok_or_else(|| generic(format!("page \"{target}\" is not in {path}")))?;
+                    select_notebook_tab(path, index);
+                    Ok(Value::empty())
+                }
+                "index" => {
+                    if args.len() != 3 {
+                        return Err(wrong("index", "window", args.len()));
+                    }
+                    let pages = with_state(interp, |rt| rt.tree.children(path).map(|c| c.to_vec()))
+                        .and_then(|r| r.ok())
+                        .unwrap_or_default();
+                    let i = pages
+                        .iter()
+                        .position(|p| p == args[2].as_str())
+                        .map(|i| i as i64)
+                        .unwrap_or(-1);
+                    Ok(Value::from_int(i))
+                }
+                "tab" => {
+                    if args.len() < 3 {
+                        return Err(wrong("tab", "window ?-option? ?value?", args.len()));
+                    }
+                    let page = args[2].as_str();
+                    if args.len() == 3 {
+                        let text = with_state(interp, |rt| {
+                            rt.tree
+                                .get(page)
+                                .and_then(|n| n.options.get("-text").cloned())
+                        })
+                        .flatten()
+                        .unwrap_or_default();
+                        return Ok(Value::from_str(&text));
+                    }
+                    if args.len() == 4 {
+                        let option = args[3].as_str();
+                        let value = with_state(interp, |rt| {
+                            rt.tree
+                                .get(page)
+                                .and_then(|n| n.options.get(option).cloned())
+                        })
+                        .flatten()
+                        .unwrap_or_default();
+                        return Ok(Value::from_str(&value));
+                    }
+                    let options = if args.len() == 5 {
+                        vec![(args[3].as_str().to_string(), args[4].as_str().to_string())]
+                    } else {
+                        return Err(wrong("tab", "window ?-option? ?value?", args.len()));
+                    };
+                    with_state_mut(interp, |rt| {
+                        rt.tree.configure(page, options).map_err(tk_error)?;
+                        rt.bump();
+                        Ok::<(), Error>(())
+                    })
+                    .ok_or_else(|| bad_window(page))??;
+                    Ok(Value::empty())
+                }
+                _ => bad_subcommand(kind, sub),
+            },
+            WidgetKind::Combobox => match sub {
+                "get" => Ok(Value::from_str(&entry_value(path))),
+                "set" => {
+                    if args.len() != 3 {
+                        return Err(wrong("set", "value", args.len()));
+                    }
+                    let value = args[2].as_str();
+                    update_entry(interp, path, value.to_string(), value.chars().count())?;
+                    Ok(Value::empty())
+                }
+                "post" => {
+                    with_state_mut(interp, |rt| {
+                        rt.open_combobox = Some(path.to_string());
+                        rt.bump();
+                    });
+                    Ok(Value::empty())
+                }
+                "unpost" => {
+                    with_state_mut(interp, |rt| {
+                        if rt.open_combobox.as_deref() == Some(path) {
+                            rt.open_combobox = None;
+                        }
+                        rt.bump();
+                    });
+                    Ok(Value::empty())
+                }
+                "values" => {
+                    if args.len() == 2 {
+                        let values = combobox_values(path);
+                        return Ok(list_value(values));
+                    }
+                    let value = args[2..]
+                        .iter()
+                        .map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    with_state_mut(interp, |rt| {
+                        rt.tree
+                            .configure(path, [("-values".to_string(), value)])
+                            .map_err(tk_error)?;
+                        rt.bump();
+                        Ok::<(), Error>(())
+                    })
+                    .ok_or_else(|| bad_window(path))??;
+                    Ok(Value::empty())
+                }
+                "current" => {
+                    let values = combobox_values(path);
+                    if args.len() == 2 {
+                        let current = entry_value(path);
+                        let i = values
+                            .iter()
+                            .position(|v| *v == current)
+                            .map(|i| i as i64)
+                            .unwrap_or(-1);
+                        return Ok(Value::from_int(i));
+                    }
+                    let index = args[2].as_str().parse::<usize>().map_err(|_| {
+                        generic(format!("expected integer but got \"{}\"", args[2].as_str()))
+                    })?;
+                    if let Some(value) = values.get(index).cloned() {
+                        update_entry(interp, path, value.clone(), value.chars().count())?;
+                        return Ok(Value::from_int(index as i64));
+                    }
+                    Ok(Value::from_int(-1))
+                }
+                _ => bad_subcommand(kind, sub),
+            },
             _ => bad_subcommand(kind, sub),
         },
     }
@@ -862,6 +1044,12 @@ fn bad_subcommand(kind: WidgetKind, sub: &str) -> Result<Value> {
                 "activate, cget, configure, delta, destroy, fraction, get, identify, set"
             }
             WidgetKind::Progressbar => "cget, configure, destroy, start, step, stop",
+            WidgetKind::Notebook => {
+                "add, cget, configure, destroy, forget, index, insert, select, tab, tabs"
+            }
+            WidgetKind::Combobox => {
+                "cget, configure, current, destroy, get, post, set, unpost, values"
+            }
             _ => "cget, configure, destroy",
     };
     Err(generic(format!("bad option \"{sub}\": must be {must}")))
@@ -1527,7 +1715,7 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
         let (w, h) = match node.kind {
             WidgetKind::Text => (w_opt.max(1) * 7, h_opt.max(1) * 18),
             WidgetKind::Listbox => (w_opt.max(1) * 7, h_opt.max(1) * 18),
-            WidgetKind::Entry => ((w_opt.max(1) * 7) + 8, 24),
+            WidgetKind::Entry | WidgetKind::Combobox => ((w_opt.max(1) * 7) + 8, 24),
             WidgetKind::Scale => {
                 let length = opt("-length").parse::<i64>().unwrap_or(100);
                 if opt("-orient") == "horizontal" {
@@ -1536,7 +1724,7 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
                     (24, length.max(1))
                 }
             }
-            WidgetKind::Frame | WidgetKind::Toplevel => (w_opt, h_opt),
+            WidgetKind::Frame | WidgetKind::Toplevel | WidgetKind::Notebook => (w_opt, h_opt),
             WidgetKind::Scrollbar => {
                 if opt("-orient") == "horizontal" {
                     (100, 16)
@@ -3181,6 +3369,160 @@ pub fn scale_changed(path: &str, value: f64) {
     }
 }
 
+fn notebook_add(
+    interp: &mut Interp,
+    notebook: &str,
+    page: &str,
+    rest: &[Value],
+    at: Option<usize>,
+) -> Result<Value> {
+    let is_child = with_state(interp, |rt| {
+        rt.tree
+            .get(page)
+            .is_some_and(|n| n.parent.as_deref() == Some(notebook))
+    })
+    .unwrap_or(false);
+    if !is_child {
+        return Err(generic(format!(
+            "window \"{page}\" is not a child of \"{notebook}\""
+        )));
+    }
+    let options = parse_pairs(rest, 0, "notebook add")?;
+    let options = options
+        .into_iter()
+        .filter(|(k, _)| {
+            matches!(
+                k.as_str(),
+                "-text" | "-state" | "-image" | "-compound" | "-padding"
+            )
+        })
+        .collect::<Vec<_>>();
+    let page = page.to_string();
+    let notebook = notebook.to_string();
+    with_state_mut(interp, |rt| {
+        if !options.is_empty() {
+            rt.tree.configure(&page, options).map_err(tk_error)?;
+        }
+        let len = rt.tree.children(&notebook).map(|c| c.len()).unwrap_or(0);
+        let index = at.unwrap_or(len).min(len);
+        rt.tree
+            .insert_child_at(&notebook, &page, index)
+            .map_err(tk_error)?;
+        let selected = rt.notebook_selected.get(&notebook).copied().unwrap_or(0);
+        if len == 0 {
+            rt.notebook_selected.insert(notebook.clone(), 0);
+        } else if index <= selected {
+            rt.notebook_selected.insert(notebook.clone(), selected + 1);
+        }
+        rt.bump();
+        Ok::<(), Error>(())
+    })
+    .ok_or_else(|| bad_window(&notebook))??;
+    Ok(Value::empty())
+}
+
+fn notebook_forget(interp: &mut Interp, notebook: &str, page: &str) -> Result<()> {
+    let index = with_state(interp, |rt| {
+        rt.tree
+            .children(notebook)
+            .ok()
+            .and_then(|pages| pages.iter().position(|p| p == page))
+    })
+    .flatten()
+    .ok_or_else(|| generic(format!("page \"{page}\" is not in {notebook}")))?;
+    with_state_mut(interp, |rt| {
+        rt.tree.detach(notebook, page).map_err(tk_error)?;
+        let len = rt.tree.children(notebook).map(|c| c.len()).unwrap_or(0);
+        let selected = rt.notebook_selected.get(notebook).copied().unwrap_or(0);
+        let next = if index < selected {
+            selected - 1
+        } else if index == selected {
+            selected.min(len.saturating_sub(1))
+        } else {
+            selected
+        };
+        rt.notebook_selected.insert(notebook.to_string(), next);
+        rt.bump();
+        Ok::<(), Error>(())
+    })
+    .ok_or_else(|| bad_window(notebook))??;
+    Ok(())
+}
+
+/// A Notebook's selected page index.
+pub fn notebook_selected(notebook: &str) -> usize {
+    let Some(ptr) = active_interp() else { return 0 };
+    with_state(unsafe { &*ptr }, |rt| {
+        rt.notebook_selected.get(notebook).copied().unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+
+/// Select a Notebook page from the renderer.
+pub fn select_notebook_tab(notebook: &str, index: usize) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    let len = with_state(interp, |rt| {
+        rt.tree.children(notebook).map(|c| c.len()).unwrap_or(0)
+    })
+    .unwrap_or(0);
+    with_state_mut(interp, |rt| {
+        rt.notebook_selected
+            .insert(notebook.to_string(), index.min(len.saturating_sub(1)));
+        rt.bump();
+    });
+}
+
+/// The values of a `ttk::combobox` (`-values` is a Tcl list).
+pub fn combobox_values(path: &str) -> Vec<String> {
+    let Some(ptr) = active_interp() else {
+        return Vec::new();
+    };
+    let interp = unsafe { &*ptr };
+    let raw = effective_option(interp, path, "-values");
+    Value::from_str(&raw)
+        .as_list()
+        .map(|list| list.iter().map(|v| v.as_str().to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// The combobox whose list is open.
+pub fn open_combobox() -> Option<String> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| rt.open_combobox.clone()).flatten()
+}
+
+/// Open/close a combobox's value list.
+pub fn toggle_combobox(path: &str) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    with_state_mut(interp, |rt| {
+        rt.open_combobox = if rt.open_combobox.as_deref() == Some(path) {
+            None
+        } else {
+            Some(path.to_string())
+        };
+        rt.bump();
+    });
+}
+
+/// Pick a combobox value from the renderer.
+pub fn press_combobox_item(path: &str, index: usize) {
+    let values = combobox_values(path);
+    let Some(value) = values.get(index).cloned() else {
+        return;
+    };
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    if let Err(e) = update_entry(interp, path, value.clone(), value.chars().count()) {
+        record_error(e.to_string());
+    }
+    with_state_mut(interp, |rt| {
+        rt.open_combobox = None;
+        rt.bump();
+    });
+}
+
 /// A Progressbar's current value and maximum.
 pub fn progressbar_value(path: &str) -> (f64, f64) {
     let Some(ptr) = active_interp() else {
@@ -4048,6 +4390,43 @@ mod tests {
         eval(&mut i, "ttk::button .b -text Go; ttk::label .l -text Hi");
         assert_eq!(eval(&mut i, "winfo class .b"), "Button");
         assert_eq!(eval(&mut i, "winfo class .l"), "Label");
+    }
+
+    #[test]
+    fn notebook_pages_and_combobox_values() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "ttk::notebook .nb; \
+             frame .nb.p1 -text One; frame .nb.p2 -text Two; \
+             .nb add .nb.p1; .nb add .nb.p2",
+        );
+        assert_eq!(eval(&mut i, "winfo class .nb"), "TNotebook");
+        assert_eq!(eval(&mut i, ".nb tabs"), ".nb.p1 .nb.p2");
+        assert_eq!(eval(&mut i, ".nb select"), ".nb.p1");
+        eval(&mut i, ".nb select .nb.p2");
+        assert_eq!(eval(&mut i, ".nb index .nb.p2"), "1");
+        assert_eq!(eval(&mut i, ".nb tab .nb.p1 -text"), "One");
+        eval(&mut i, ".nb insert 0 .nb.p2");
+        assert_eq!(eval(&mut i, ".nb tabs"), ".nb.p2 .nb.p1");
+        eval(&mut i, ".nb forget .nb.p2");
+        assert_eq!(eval(&mut i, ".nb tabs"), ".nb.p1");
+
+        eval(
+            &mut i,
+            "set ::choice a; ttk::combobox .cb -values {a b c} -textvariable ::choice",
+        );
+        assert_eq!(eval(&mut i, "winfo class .cb"), "TCombobox");
+        assert_eq!(combobox_values(".cb"), ["a", "b", "c"]);
+        assert_eq!(eval(&mut i, ".cb current"), "0");
+        eval(&mut i, ".cb current 2");
+        assert_eq!(eval(&mut i, "set ::choice"), "c");
+        eval(&mut i, ".cb set b");
+        assert_eq!(eval(&mut i, ".cb get"), "b");
+        assert_eq!(eval(&mut i, ".cb current"), "1");
+        eval(&mut i, ".cb values {x y}");
+        assert_eq!(combobox_values(".cb"), ["x", "y"]);
     }
 
     #[test]

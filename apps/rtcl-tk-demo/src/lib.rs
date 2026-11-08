@@ -67,17 +67,6 @@ menu .file -tearoff 0
 label .later -text "waiting for after"
 pack .later -padx 12 -pady 4
 after 80 {.later configure -text "Later fired"}
-
-# `shot` runs the app with RTCL_TK_AUTO=1 to capture an interacted state.
-if {[info exists ::env(RTCL_TK_AUTO)]} {
-    after 200 {
-        .b invoke
-        .agree invoke
-        .colors selection set 1
-        .volume set 65
-        .file post
-    }
-}
 "#;
 
 /// A classic grid/pack form, close to what a Tk tutorial app looks like.
@@ -110,6 +99,21 @@ pack .listframe.lb -side left -fill both -expand 1
 scrollbar .listframe.sb -orient vertical -command {.listframe.lb yview}
 pack .listframe.sb -side right -fill y
 foreach color {Red Green Blue} { .listframe.lb insert end $color }
+
+ttk::notebook .nb
+pack .nb -fill x -padx 8 -pady 6
+frame .nb.general -text "General"
+frame .nb.advanced -text "Advanced"
+label .nb.general.note -text "General page"
+pack .nb.general.note -padx 8 -pady 4
+label .nb.advanced.note -text "Advanced page"
+pack .nb.advanced.note -padx 8 -pady 4
+.nb add .nb.general
+.nb add .nb.advanced
+
+set ::size "Medium"
+ttk::combobox .cb -values {Small Medium Large} -textvariable ::size
+pack .cb -padx 8 -pady 4
 
 ttk::separator .sep
 pack .sep -fill x -pady 4
@@ -162,6 +166,7 @@ pub fn DemoApp() -> impl IntoElement {
 }
 
 /// The [`CLASSIC`] form, for the regression test.
+
 #[component]
 pub fn ClassicApp() -> impl IntoElement {
     ensure_tcl_script(CLASSIC);

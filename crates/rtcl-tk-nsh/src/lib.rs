@@ -450,9 +450,14 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             }
             frame.child(render_children(tree, path)).into_element()
         }
-        WidgetKind::Label => text(rtcl_tk_runtime::display_text(path))
-            .text_size(px(14.0))
-            .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6))
+        WidgetKind::Label => view()
+            .w_full()
+            .items_start()
+            .child(
+                text(rtcl_tk_runtime::display_text(path))
+                    .text_size(px(14.0))
+                    .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+            )
             .into_element(),
         WidgetKind::Button => {
             let path = path.to_string();
@@ -679,9 +684,14 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             }
             list.into_element()
         }
-        WidgetKind::Message => text(rtcl_tk_runtime::display_text(path))
-            .text_size(px(14.0))
-            .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6))
+        WidgetKind::Message => view()
+            .w_full()
+            .items_start()
+            .child(
+                text(rtcl_tk_runtime::display_text(path))
+                    .text_size(px(14.0))
+                    .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+            )
             .into_element(),
         WidgetKind::Scrollbar => {
             let horizontal = option(tree, path, "-orient") == "horizontal";
@@ -754,6 +764,129 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 )
             };
             track.into_element()
+        }
+        WidgetKind::Notebook => {
+            let pages = node.children.clone();
+            let selected = rtcl_tk_runtime::notebook_selected(path);
+            let mut tabs = view().flex_row().items_center().gap_1().w_full();
+            for (i, page) in pages.iter().enumerate() {
+                let label = tree
+                    .get(page)
+                    .and_then(|n| n.options.get("-text").cloned())
+                    .unwrap_or_else(|| page.rsplit('.').next().unwrap_or(page).to_string());
+                let notebook = path.to_string();
+                tabs = tabs.child(
+                    nsh_base::button()
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .rounded(px(5.0))
+                        .bg(if i == selected {
+                            AdaptiveColor::rgb(0x2563eb, 0x3b82f6)
+                        } else {
+                            AdaptiveColor::rgb(0xe5e7eb, 0x374151)
+                        })
+                        .child(
+                            text(label)
+                                .text_size(px(13.0))
+                                .text_color(if i == selected {
+                                    AdaptiveColor::rgb(0xffffff, 0xffffff)
+                                } else {
+                                    AdaptiveColor::rgb(0x111827, 0xf3f4f6)
+                                }),
+                        )
+                        .on_press(move |_: &()| {
+                            rtcl_tk_runtime::select_notebook_tab(&notebook, i);
+                        }),
+                );
+            }
+            let mut column = view().flex_col().gap_2().w_full().child(tabs);
+            // Keep every page mounted and hide the inactive ones: re-mounting
+            // the selected page on a switch loses its native widgets on GTK.
+            for (i, page) in pages.iter().enumerate() {
+                let body = view()
+                    .w_full()
+                    .items_start()
+                    .p(px(6.0))
+                    .child(render_node(tree, page));
+                column = column.child(if i == selected { body } else { body.hidden() });
+            }
+            column.into_element()
+        }
+        WidgetKind::Combobox => {
+            let path = path.to_string();
+            let values = rtcl_tk_runtime::combobox_values(&path);
+            let open = rtcl_tk_runtime::open_combobox().as_deref() == Some(path.as_str());
+            let disabled = is_disabled(tree, path.as_str());
+            let readonly = option(tree, path.as_str(), "-state") == "readonly";
+            let change_path = path.clone();
+            let toggle_path = path.clone();
+            let row = view()
+                .flex_row()
+                .justify_start()
+                .items_center()
+                .gap_1()
+                .child(
+                    view().w(px(200.0)).child(
+                        nsh_base::input()
+                            .value(rtcl_tk_runtime::entry_value(&path))
+                            .disabled(disabled)
+                            .readonly(readonly)
+                            .on_change(move |text: &str| {
+                                rtcl_tk_runtime::entry_changed(&change_path, text);
+                            }),
+                    ),
+                )
+                .child(
+                    nsh_base::button()
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded(px(5.0))
+                        .border_1()
+                        .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+                        .bg(AdaptiveColor::rgb(0xf3f4f6, 0x374151))
+                        .disabled(disabled)
+                        .child(
+                            text("▾")
+                                .text_size(px(13.0))
+                                .text_color(AdaptiveColor::rgb(0x111827, 0xf9fafb)),
+                        )
+                        .on_press(move |_: &()| {
+                            rtcl_tk_runtime::toggle_combobox(&toggle_path);
+                        }),
+                );
+            let mut column = view().flex_col().items_start().gap_1().child(row);
+            if open {
+                let mut list = view()
+                    .flex_col()
+                    .w(px(220.0))
+                    .p(px(3.0))
+                    .gap_1()
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+                    .bg(AdaptiveColor::rgb(0xffffff, 0x1f2937));
+                for (i, value) in values.iter().enumerate() {
+                    let value_path = path.clone();
+                    list = list.child(
+                        nsh_base::button()
+                            .w_full()
+                            .justify_start()
+                            .px(px(6.0))
+                            .py(px(3.0))
+                            .rounded(px(4.0))
+                            .child(
+                                text(value.clone())
+                                    .text_size(px(13.0))
+                                    .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                            )
+                            .on_press(move |_: &()| {
+                                rtcl_tk_runtime::press_combobox_item(&value_path, i);
+                            }),
+                    );
+                }
+                column = column.child(list);
+            }
+            column.into_element()
         }
     }
 }

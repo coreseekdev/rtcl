@@ -30,10 +30,21 @@ pub fn eval_expr(interp: &mut Interp, expr: &str) -> Result<Value> {
         None => {
             let v = super::expr_check::check_expr(expr);
             if expr.len() <= EXPR_CHECK_CACHE_MAX_EXPR {
-                if interp.expr_check_cache.len() >= EXPR_CHECK_CACHE_MAX {
+                let cost = expr.len().saturating_mul(2)
+                    + 128
+                    + match &v {
+                        Err(m) => m.len(),
+                        Ok(()) => 0,
+                    };
+                if interp.expr_check_cache.len() >= EXPR_CHECK_CACHE_MAX
+                    || interp.expr_check_cache_bytes + cost
+                        > crate::interp::EXPR_CACHE_BYTE_BUDGET
+                {
                     interp.expr_check_cache.clear();
+                    interp.expr_check_cache_bytes = 0;
                 }
                 interp.expr_check_cache.insert(expr.to_string(), v.clone());
+                interp.expr_check_cache_bytes += cost;
             }
             v
         }

@@ -526,6 +526,14 @@ pub struct Interp {
     /// is interchangeable with the AST walk.  Bound and cleared together
     /// with the parse cache (see `eval`).
     pub(crate) bytecode_cache: varmap::FxHashedMap<Rc<str>, Rc<rtcl_parser::ByteCode>>,
+    /// Approximate byte budgets for the compile caches (embedding
+    /// high-water guard): source/AST, bytecode, materialised literal
+    /// values, lambda bodies and expression-verdict entries.
+    pub(crate) parse_cache_bytes: usize,
+    pub(crate) bytecode_cache_bytes: usize,
+    pub(crate) const_pool_bytes: usize,
+    pub(crate) lambda_code_cache_bytes: usize,
+    pub(crate) expr_check_cache_bytes: usize,
     /// Loop-body memo: recent body `Value`s handed to
     /// [`Interp::eval_body_value`] plus their compiled forms — a pointer
     /// compare replaces `eval`'s two full-text cache hashes on every hit
@@ -943,6 +951,11 @@ impl Interp {
             cmd_generation: 0,
             parse_cache: HashMap::new(),
             bytecode_cache: varmap::FxHashedMap::default(),
+            parse_cache_bytes: 0,
+            bytecode_cache_bytes: 0,
+            const_pool_bytes: 0,
+            lambda_code_cache_bytes: 0,
+            expr_check_cache_bytes: 0,
             body_memo: Vec::new(),
             lambda_code_cache: HashMap::new(),
             const_pool: HashMap::default(),
@@ -1277,6 +1290,18 @@ impl Interp {
         }
     }
 
+    /// Clear every compile cache together and reset its byte counter.
+    /// Used by the count/byte high-water guards so a single eviction
+    /// cannot leave a half-evicted unit family behind.
+    pub(crate) fn clear_compile_caches(&mut self) {
+        self.parse_cache.clear();
+        self.bytecode_cache.clear();
+        self.const_pool.clear();
+        self.parse_cache_bytes = 0;
+        self.bytecode_cache_bytes = 0;
+        self.const_pool_bytes = 0;
+    }
+
     /// Materialise `code`'s constants into the literal pool (idempotent
     /// overwrite; units without constants skip the pool entirely).
     /// Called once at each compile seam — a cached unit then serves every
@@ -1289,14 +1314,21 @@ impl Interp {
         if code.constants().is_empty() {
             return;
         }
-        if self.const_pool.len() >= CONST_POOL_MAX {
-            self.const_pool.clear();
-        }
         let values: Rc<[Value]> = code
             .constants()
             .iter()
             .map(|s| Value::from_str(s))
             .collect();
+        let value_bytes: usize = values
+            .iter()
+            .map(|v| v.as_str().len() + 32)
+            .sum();
+        if self.const_pool.len() >= CONST_POOL_MAX
+            || self.const_pool_bytes + value_bytes > CONST_POOL_BYTE_BUDGET
+        {
+            self.const_pool.clear();
+            self.const_pool_bytes = 0;
+        }
         self.const_pool.insert(
             Rc::as_ptr(code) as usize,
             ConstPoolEntry {
@@ -1305,6 +1337,7 @@ impl Interp {
                 sites: Rc::default(),
             },
         );
+        self.const_pool_bytes += value_bytes;
     }
 
     /// Drop a dead proc's compiled unit from the literal/call-site pool and
@@ -1883,6 +1916,16 @@ pub fn jit_note_cross_frame() {
 pub fn jit_take_cross_frame() -> bool {
     JIT_CROSS_FRAME.with(|f| f.replace(false))
 }
+
+/// Embedding high-water budgets for the count-bounded caches.  They are
+/// deliberately conservative totals (not per-entry limits): a script can
+/// fill a count cap with maximum-size entries and otherwise reach hundreds
+/// of MB.  Clearing is whole-cache (no LRU), matching the existing policy.
+pub(crate) const PARSE_CACHE_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+pub(crate) const BYTECODE_CACHE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+pub(crate) const CONST_POOL_BYTE_BUDGET: usize = 32 * 1024 * 1024;
+pub(crate) const LAMBDA_CACHE_BYTE_BUDGET: usize = 16 * 1024 * 1024;
+pub(crate) const EXPR_CACHE_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 
 /// Dropping the last interpreter handle releases OS resources via field
 /// drops (ChannelTable's Drop closes files/pipes) and gives the optional

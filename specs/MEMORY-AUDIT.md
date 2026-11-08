@@ -193,6 +193,14 @@ collect，后台运行子进程与 tclsh 一样交给 OS）。
     清理 array search/stamp、cache 驱逐清 const_pool、fast store
     整丢弃 + PENDING_RETIRE teardown 清空。
 
+## 第八轮修复（embed 高水位）
+
+21. **compile cache 总字节预算**：parse 32 MiB、bytecode 64 MiB、
+    const_pool 32 MiB、lambda 16 MiB、expr verdict 16 MiB；任一超限即
+    `clear_compile_caches()`（parse+bytecode+const 同族整清），不再只
+    按 1024/2048 条数封顶。`ByteCode::estimated_heap_size()` 提供保守
+    占用估算（源/常量/ops/sites/foreach）。
+
 ## 本轮修复与验证
 
 1. **ChannelTable Drop**（`channel.rs`）：Interp 析构时逐个 close；文件

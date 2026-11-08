@@ -290,12 +290,18 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.tier1_epoch,
             );
             if let Some(code) = &c {
-                interp.const_pool_insert(code);
-                if interp.lambda_code_cache.len() >= 1024 {
+                let cost = code.estimated_heap_size() + args[1].as_str().len() * 2 + 64;
+                if interp.lambda_code_cache.len() >= 1024
+                    || interp.lambda_code_cache_bytes + cost
+                        > crate::interp::LAMBDA_CACHE_BYTE_BUDGET
+                {
                     interp.lambda_code_cache.clear();
+                    interp.lambda_code_cache_bytes = 0;
                 }
+                interp.const_pool_insert(code);
                 interp.lambda_code_cache
                     .insert(args[1].as_str().to_string(), Rc::clone(code));
+                interp.lambda_code_cache_bytes += cost;
             }
             c
         }

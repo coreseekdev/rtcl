@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use super::{Interp, Rc};
+use super::{Interp, Rc, BYTECODE_CACHE_BYTE_BUDGET, PARSE_CACHE_BYTE_BUDGET};
 use crate::error::{ControlFlow, Error, Result};
 use crate::parser::{Command, Word};
 use crate::value::Value;
@@ -122,16 +122,15 @@ impl Interp {
                     }
                 };
                 if script.len() <= PARSE_CACHE_MAX_SCRIPT {
-                    if self.parse_cache.len() >= PARSE_CACHE_MAX {
-                        self.parse_cache.clear();
-                        self.bytecode_cache.clear();
-                        // Top-level units evicted from the caches must not
-                        // keep const_pool entries (Rc<ByteCode> + literal
-                        // Value tables) until the 2048 cap.
-                        self.const_pool.clear();
+                    let parse_cost = script.len().saturating_mul(2) + 128;
+                    if self.parse_cache.len() >= PARSE_CACHE_MAX
+                        || self.parse_cache_bytes + parse_cost > PARSE_CACHE_BYTE_BUDGET
+                    {
+                        self.clear_compile_caches();
                     }
                     // Key shares the unit's source allocation (one Rc clone).
                     self.parse_cache.insert(Rc::clone(&rc.source), Rc::clone(&rc));
+                    self.parse_cache_bytes += parse_cost;
                     // Compiled once per cached text; the executor reproduces
                     // the tree-walk's frames, so the op loop is
                     // interchangeable with `eval_commands`.  Compiled units
@@ -163,8 +162,17 @@ impl Interp {
                     } else {
                         Rc::new(Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands))
                     };
+                    let byte_cost = code.estimated_heap_size();
+                    if self.bytecode_cache_bytes + byte_cost
+                        > BYTECODE_CACHE_BYTE_BUDGET
+                    {
+                        // Clears the parse entry inserted above with the
+                        // rest of the family; `rc` keeps this call alive.
+                        self.clear_compile_caches();
+                    }
                     self.const_pool_insert(&code);
                     self.bytecode_cache.insert(Rc::clone(&rc.source), code);
+                    self.bytecode_cache_bytes += byte_cost;
                 }
                 rc
             }
@@ -222,18 +230,26 @@ impl Interp {
                     }
                 };
                 if script.len() <= PARSE_CACHE_MAX_SCRIPT {
-                    if self.parse_cache.len() >= PARSE_CACHE_MAX {
-                        self.parse_cache.clear();
-                        self.bytecode_cache.clear();
-                        // Top-level units evicted from the caches must not
-                        // keep const_pool entries (Rc<ByteCode> + literal
-                        // Value tables) until the 2048 cap.
-                        self.const_pool.clear();
+                    let parse_cost = script.len().saturating_mul(2) + 128;
+                    if self.parse_cache.len() >= PARSE_CACHE_MAX
+                        || self.parse_cache_bytes + parse_cost > PARSE_CACHE_BYTE_BUDGET
+                    {
+                        self.clear_compile_caches();
                     }
                     self.parse_cache.insert(Rc::clone(&rc.source), Rc::clone(&rc));
+                    self.parse_cache_bytes += parse_cost;
                     let code = Rc::new(Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands));
+                    let byte_cost = code.estimated_heap_size();
+                    if self.bytecode_cache_bytes + byte_cost
+                        > BYTECODE_CACHE_BYTE_BUDGET
+                    {
+                        // Clears the parse entry inserted above with the
+                        // rest of the family; `rc` keeps this call alive.
+                        self.clear_compile_caches();
+                    }
                     self.const_pool_insert(&code);
                     self.bytecode_cache.insert(Rc::clone(&rc.source), code);
+                    self.bytecode_cache_bytes += byte_cost;
                 }
                 rc
             }

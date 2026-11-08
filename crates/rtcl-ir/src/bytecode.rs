@@ -237,6 +237,27 @@ fn cmp_cc_mirror(cc: u8) -> u8 {
 }
 
 impl ByteCode {
+    /// Rough heap footprint for cache budgets: the unit itself, source
+    /// text, string pools, instruction/site tables and foreach shapes.
+    /// Deliberately conservative (shared `source` may be counted twice
+    /// across caches); callers use it only for high-water eviction.
+    pub fn estimated_heap_size(&self) -> usize {
+        let mut n = std::mem::size_of::<Self>() + self.source.len();
+        for s in &self.constants {
+            n += s.len() + 24;
+        }
+        for s in &self.locals {
+            n += s.len() + 24;
+        }
+        n += self.ops.len() * std::mem::size_of::<OpCode>();
+        n += self.line_map.len() * std::mem::size_of::<u32>();
+        n += self.sites.len() * std::mem::size_of::<CmdSite>();
+        for f in &self.foreach_infos {
+            n += std::mem::size_of::<ForeachInfo>();
+        }
+        n
+    }
+
     /// Create a new, empty [`ByteCode`].
     pub fn new() -> Self {
         Self::default()

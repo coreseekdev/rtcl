@@ -616,31 +616,6 @@ impl Host {
         self.arena.len()
     }
 
-    /// A retired compiled unit's fast slot: drop the heavy per-proc state
-    /// (source Rc, constants, sites, foreach shapes, arena temporaries)
-    /// but keep the slot allocation itself (hosts are index-addressed and
-    /// cannot be compacted safely while wasm tables reference slots).
-    pub(crate) fn retire_code(&mut self) {
-        // Replace (not clear) the backing vectors: the slot is never
-        // reused for a new unit, so retaining capacities would keep the
-        // retired proc's arena/constants alive.
-        self.consts = Vec::new();
-        self.local_names = Vec::new();
-        self.fails = Vec::new();
-        self.sites = Vec::new();
-        self.lines = Vec::new();
-        self.source = Rc::from("");
-        self.infos = Vec::new();
-        self.foreaches = Vec::new();
-        self.arena = Vec::new();
-        self.arena_base = 0;
-        self.result = None;
-        self.pending = None;
-        self.pending_exit = None;
-        self.info = None;
-        self.pending_top = None;
-        self.last_fail = None;
-    }
 
     /// 实例池复用前的状态复位（arena 已在 run 后截回水位线；fuel/
     /// epoch/caching global 持续——语义一致）。

@@ -673,10 +673,7 @@ impl Interp {
     fn loc_mark_array(&mut self, loc: &VarLoc) {
         // Container generation bump (see loc_remove_array): recreation
         // counts as a container change for in-flight `array get` reads.
-        *self
-            .array_generations
-            .entry(stamp_key(loc))
-            .or_insert(0) += 1;
+        self.array_generation = self.array_generation.wrapping_add(1);
         match loc {
             VarLoc::Global(n) => {
                 if n != "env" && n != "tcl_platform" {
@@ -736,10 +733,7 @@ impl Interp {
         // Container generation bump: a destroyed array's snapshot entries
         // are invisible to an in-flight `array get` even when a callback
         // recreates same-named elements (tclsh holds the old Var).
-        *self
-            .array_generations
-            .entry(stamp_key(loc))
-            .or_insert(0) += 1;
+        self.array_generation = self.array_generation.wrapping_add(1);
     }
 
 
@@ -2055,7 +2049,7 @@ impl Interp {
         elem: &str,
     ) -> std::result::Result<Option<Value>, Error> {
         let key = self.array_stamp_key(base);
-        let gen0 = self.array_generations.get(&key).copied();
+        let gen0 = self.array_generation;
         let alive = |t: &Self| match owner_fi {
             Some(i) => t.frames.get(i).map(|f| f.locals.contains_key(base)),
             None => Some(t.globals.contains_key(base)),
@@ -2080,7 +2074,7 @@ impl Interp {
                 }
                 Some(true) => {}
             }
-            if self.array_generations.get(&key).copied() != gen0 {
+            if self.array_generation != gen0 {
                 recreated = true;
             }
         }

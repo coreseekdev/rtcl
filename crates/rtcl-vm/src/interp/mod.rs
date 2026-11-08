@@ -602,7 +602,11 @@ pub struct Interp {
     /// Container-generation counters per array, bumped on array-level
     /// create/destroy only (`array get` uses them to spot a callback that
     /// destroyed and recreated the array — snapshot elements then skip).
-    pub(crate) array_generations: HashMap<String, u64>,
+    /// Monotonic stamp bumped on every array container create/delete.
+    /// A single interpreter-wide counter replaces a per-array map (which
+    /// grew with array-name churn and had no removal path): `array get`
+    /// snapshots are conservatively invalidated by any array mutation.
+    pub(crate) array_generation: u64,
     /// Whole-variable traces keyed by the owning scope's stamp key.
     pub(crate) var_traces: HashMap<String, Vec<VarTrace>>,
     /// Element-specific traces: stamp key → element name → traces.
@@ -881,7 +885,7 @@ impl Interp {
             arrays_env_only: true,
             array_searches: HashMap::new(),
             array_stamps: HashMap::new(),
-            array_generations: HashMap::new(),
+            array_generation: 0,
             var_traces: HashMap::new(),
             elem_traces: HashMap::new(),
             trace_phantoms: HashMap::new(),

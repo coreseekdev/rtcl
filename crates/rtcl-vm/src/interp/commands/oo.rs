@@ -1440,9 +1440,18 @@ fn chain_for(
         if memo.len() >= CHAIN_MEMO_MAX {
             memo.clear();
         }
-        memo.entry(Rc::from(key))
-            .or_insert_with(FxMapK::default)
-            .insert(Rc::clone(&method_rc), (interp.oo.mutation_ctr, Rc::clone(&chain)));
+        const CHAIN_MEMO_INNER_MAX: usize = 64;
+        let inner = memo.entry(Rc::from(key)).or_insert_with(FxMapK::default);
+        if inner.len() >= CHAIN_MEMO_INNER_MAX {
+            // A long-lived object can be called with unbounded distinct
+            // method names (unknown-method probes memoise empty chains);
+            // bound the per-object map as well as the outer one.
+            inner.clear();
+        }
+        inner.insert(
+            Rc::clone(&method_rc),
+            (interp.oo.mutation_ctr, Rc::clone(&chain)),
+        );
     }
     (chain, method_rc)
 }

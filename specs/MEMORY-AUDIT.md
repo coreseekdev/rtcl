@@ -84,6 +84,19 @@
 **开放内存问题：无**（在上述审计口径下；引用表为 Jim 式手动
 collect，后台运行子进程与 tclsh 一样交给 OS）。
 
+补充收口（第七轮）：
+- `array_generations` 无界 map → 单解释器全局 generation 计数器
+  （`array get` 快照保守失效，无按数组名的累积表）。
+- `chain_memo` 内层按对象上限 64（长寿命对象被无限未知方法名调用
+  不再累积空链）。
+- 帧出栈额外清理 `array_searches`/`array_stamps` 的 `F{idx}:` 键
+  （proc 里 startsearch 未 donesearch 不再跨调用泄漏）。
+- parse/bytecode cache 整清时同步清 `const_pool`（顶层 eval 单元被
+  cache 驱逐后不再钉住字面量表到 2048 上限）。
+- fast Store 退役改为**整 Store 丢弃**（wasm table/runs 索引无法安全
+  压缩；丢整个 store 才能释放旧 Instance/Module/arena），下次 fast
+  入口惰性重建；`PENDING_RETIRE` 在 teardown 清空。
+
 ## 契约要点（allium）
 
 `memory-lifecycle.allium` 把资源生命周期写成 8 条规则：
@@ -173,6 +186,12 @@ collect，后台运行子进程与 tclsh 一样交给 OS）。
 19. **fast Host 槽退役**：`Host::retire_code()` + 调用中延迟队列，
     proc 删除后 fast store 清 source/consts/sites/arena/foreach，
     不再等 teardown。
+
+## 第七轮修复
+
+20. array generation 全局计数器、chain memo 内层 64 上限、帧出栈
+    清理 array search/stamp、cache 驱逐清 const_pool、fast store
+    整丢弃 + PENDING_RETIRE teardown 清空。
 
 ## 本轮修复与验证
 

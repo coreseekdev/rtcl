@@ -125,6 +125,10 @@ impl Interp {
                     if self.parse_cache.len() >= PARSE_CACHE_MAX {
                         self.parse_cache.clear();
                         self.bytecode_cache.clear();
+                        // Top-level units evicted from the caches must not
+                        // keep const_pool entries (Rc<ByteCode> + literal
+                        // Value tables) until the 2048 cap.
+                        self.const_pool.clear();
                     }
                     // Key shares the unit's source allocation (one Rc clone).
                     self.parse_cache.insert(Rc::clone(&rc.source), Rc::clone(&rc));
@@ -221,6 +225,10 @@ impl Interp {
                     if self.parse_cache.len() >= PARSE_CACHE_MAX {
                         self.parse_cache.clear();
                         self.bytecode_cache.clear();
+                        // Top-level units evicted from the caches must not
+                        // keep const_pool entries (Rc<ByteCode> + literal
+                        // Value tables) until the 2048 cap.
+                        self.const_pool.clear();
                     }
                     self.parse_cache.insert(Rc::clone(&rc.source), Rc::clone(&rc));
                     let code = Rc::new(Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands));

@@ -757,11 +757,18 @@ impl Interp {
         if !self.var_traces.is_empty()
             || !self.elem_traces.is_empty()
             || !self.trace_phantoms.is_empty()
+            || !self.array_searches.is_empty()
+            || !self.array_stamps.is_empty()
         {
             let fkey = format!("F{}:", self.frames.len());
             self.var_traces.retain(|k, _| !k.starts_with(&fkey));
             self.elem_traces.retain(|k, _| !k.starts_with(&fkey));
             self.trace_phantoms.retain(|k, _| !k.starts_with(&fkey));
+            // `array startsearch` iterations and mutation stamps belong to
+            // the frame: a proc that returns without `donesearch` must not
+            // leak them into the next call reusing this frame index.
+            self.array_searches.retain(|k, _| !k.starts_with(&fkey));
+            self.array_stamps.retain(|k, _| !k.starts_with(&fkey));
         }
         self.current_namespace = prev_namespace;
         self.call_depth -= 1;
@@ -1451,11 +1458,18 @@ impl Interp {
         if !self.var_traces.is_empty()
             || !self.elem_traces.is_empty()
             || !self.trace_phantoms.is_empty()
+            || !self.array_searches.is_empty()
+            || !self.array_stamps.is_empty()
         {
             let fkey = format!("F{}:", self.frames.len());
             self.var_traces.retain(|k, _| !k.starts_with(&fkey));
             self.elem_traces.retain(|k, _| !k.starts_with(&fkey));
             self.trace_phantoms.retain(|k, _| !k.starts_with(&fkey));
+            // `array startsearch` iterations and mutation stamps belong to
+            // the frame: a proc that returns without `donesearch` must not
+            // leak them into the next call reusing this frame index.
+            self.array_searches.retain(|k, _| !k.starts_with(&fkey));
+            self.array_stamps.retain(|k, _| !k.starts_with(&fkey));
         }
         self.current_namespace = prev_namespace;
     }

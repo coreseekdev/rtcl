@@ -96,23 +96,24 @@ thread_local! {
 }
 
 fn retire_host(ptr: usize) {
+    // A retired slot cannot be compacted safely: the wasm table/runs
+    // vector index it, and dropping only Host fields would leave the
+    // Instance/Module rooted by the table.  Dropping the whole fast Store
+    // releases every instance/arena; live procs re-instantiate lazily on
+    // the next fast call.  Retirements are proc redefinitions/deletions,
+    // so this is cold.
     WT_FAST_STORE.with(|cell| {
         let mut cell = cell.borrow_mut();
-        let Some(store) = cell.as_mut() else { return };
-        let h = store.data_mut();
+        let Some(store) = cell.as_ref() else { return };
+        let h = store.data();
         let owner = h.sh.interp as usize;
-        let removed: Vec<usize> = h
+        let hit = h
             .sh
             .slots
-            .iter()
-            .filter(|(k, _)| k.0 == owner && k.1 == ptr)
-            .map(|(_, i)| *i)
-            .collect();
-        h.sh.slots.retain(|k, _| !(k.0 == owner && k.1 == ptr));
-        for i in removed {
-            if let Some(host) = h.sh.hosts.get_mut(i) {
-                host.retire_code();
-            }
+            .keys()
+            .any(|k| k.0 == owner && k.1 == ptr);
+        if hit {
+            *cell = None;
         }
     });
 }
@@ -126,6 +127,7 @@ fn drain_pending_retire() {
 
 /// Drop the thread-local fast store/modules when their interpreter dies.
 pub(crate) fn teardown_interp(ptr: usize) {
+    PENDING_RETIRE.with(|p| p.borrow_mut().clear());
     WT_FAST_STORE.with(|cell| {
         let mut cell = cell.borrow_mut();
         if cell

@@ -39,6 +39,8 @@ pub enum WidgetKind {
     Combobox,
     /// `ttk::treeview`: headings plus a tree of items.
     Treeview,
+    /// `ttk::labelframe`: a frame with a label in its border.
+    Labelframe,
 }
 
 impl WidgetKind {
@@ -61,6 +63,7 @@ impl WidgetKind {
             "notebook" => Self::Notebook,
             "combobox" => Self::Combobox,
             "treeview" => Self::Treeview,
+            "labelframe" => Self::Labelframe,
             _ => return None,
         })
     }
@@ -85,6 +88,7 @@ impl WidgetKind {
             Self::Notebook => "TNotebook",
             Self::Combobox => "TCombobox",
             Self::Treeview => "Treeview",
+            Self::Labelframe => "TLabelframe",
         }
     }
 
@@ -1084,6 +1088,22 @@ const NOTEBOOK_OPTIONS: &[&str] = &[
     "-width",
 ];
 
+const LABELFRAME_OPTIONS: &[&str] = &[
+    "-background",
+    "-borderwidth",
+    "-class",
+    "-cursor",
+    "-height",
+    "-labelanchor",
+    "-padding",
+    "-relief",
+    "-style",
+    "-takefocus",
+    "-text",
+    "-underline",
+    "-width",
+];
+
 const TREEVIEW_OPTIONS: &[&str] = &[
     "-columns",
     "-cursor",
@@ -1139,6 +1159,7 @@ pub fn known_options(kind: WidgetKind) -> &'static [&'static str] {
         WidgetKind::Notebook => NOTEBOOK_OPTIONS,
         WidgetKind::Combobox => COMBOBOX_OPTIONS,
         WidgetKind::Treeview => TREEVIEW_OPTIONS,
+        WidgetKind::Labelframe => LABELFRAME_OPTIONS,
     }
 }
 
@@ -1171,6 +1192,7 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
         },
         "-text" | "-label" | "-textvariable" | "-variable" | "-command" => "",
         "-anchor" => "center",
+        "-labelanchor" => "nw",
         "-justify" => match kind {
             WidgetKind::Button | WidgetKind::Checkbutton | WidgetKind::Radiobutton => "center",
             _ => "left",

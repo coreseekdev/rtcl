@@ -450,6 +450,26 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             }
             frame.child(render_children(tree, path)).into_element()
         }
+        WidgetKind::Labelframe => {
+            let label = option(tree, path, "-text").to_string();
+            let mut frame = view()
+                .flex_col()
+                .items_start()
+                .w_full()
+                .gap_2()
+                .p(px(6.0))
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563));
+            if !label.is_empty() {
+                frame = frame.child(
+                    text(label)
+                        .text_size(px(12.0))
+                        .text_color(AdaptiveColor::rgb(0x4b5563, 0xd1d5db)),
+                );
+            }
+            frame.child(render_children(tree, path)).into_element()
+        }
         WidgetKind::Label => view()
             .w_full()
             .items_start()

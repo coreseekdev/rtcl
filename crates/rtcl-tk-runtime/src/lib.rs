@@ -348,6 +348,8 @@ pub fn install(interp: &mut Interp) {
         "ttk::combobox",
         "treeview",
         "ttk::treeview",
+        "labelframe",
+        "ttk::labelframe",
     ] {
         interp.register_command(name, create_widget);
     }
@@ -1956,7 +1958,10 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
                     (24, length.max(1))
                 }
             }
-            WidgetKind::Frame | WidgetKind::Toplevel | WidgetKind::Notebook => (w_opt, h_opt),
+            WidgetKind::Frame
+            | WidgetKind::Toplevel
+            | WidgetKind::Notebook
+            | WidgetKind::Labelframe => (w_opt, h_opt),
             WidgetKind::Treeview => (300, h_opt.max(1) * 22),
             WidgetKind::Scrollbar => {
                 if opt("-orient") == "horizontal" {
@@ -3507,10 +3512,78 @@ fn text_state(interp: &Interp, path: &str) -> (String, usize) {
     .unwrap_or_default()
 }
 
+/// Tk entry validation (`-validate key|all`, `-validatecommand`).
+fn entry_validation_passes(interp: &mut Interp, path: &str, proposed: &str) -> bool {
+    let mode = effective_option(interp, path, "-validate");
+    if mode != "key" && mode != "all" {
+        return true;
+    }
+    let command = effective_option(interp, path, "-validatecommand");
+    if command.is_empty() {
+        return true;
+    }
+    let old = entry_value(path);
+    let inserted = proposed
+        .strip_prefix(old.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let script = substitute_validation(
+        &command,
+        &[
+            ("%P", proposed),
+            ("%s", old.as_str()),
+            ("%S", inserted.as_str()),
+            ("%v", "key"),
+            ("%V", "key"),
+            ("%W", path),
+        ],
+    );
+    match eval_active_quiet(&script) {
+        Ok(value) => value.as_bool().unwrap_or(true),
+        Err(e) => {
+            // Tk disables a validation that errors; the edit goes through.
+            record_error(e.to_string());
+            true
+        }
+    }
+}
+
+fn substitute_validation(script: &str, pairs: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(script.len());
+    let mut chars = script.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let Some(next) = chars.next() else {
+            out.push('%');
+            break;
+        };
+        if next == '%' {
+            out.push('%');
+            continue;
+        }
+        let key = format!("%{next}");
+        if let Some((_, value)) = pairs.iter().find(|(k, _)| *k == key) {
+            out.push_str(value);
+        } else {
+            out.push('%');
+            out.push(next);
+        }
+    }
+    out
+}
+
 /// An Entry's text changed in the UI.
 pub fn entry_changed(path: &str, text: &str) {
     let Some(ptr) = active_interp() else { return };
     let interp = unsafe { &mut *ptr };
+    if !entry_validation_passes(interp, path, text) {
+        // Reject the edit: the controlled input re-reads the old value.
+        bump_active();
+        return;
+    }
     let var = qual_var_opt(interp, path, "-textvariable");
     with_state_mut(interp, |rt| {
         if let Some(n) = rt.tree.get_mut(path) {
@@ -4820,6 +4893,23 @@ mod tests {
         eval(&mut i, "ttk::button .b -text Go; ttk::label .l -text Hi");
         assert_eq!(eval(&mut i, "winfo class .b"), "Button");
         assert_eq!(eval(&mut i, "winfo class .l"), "Label");
+    }
+
+    #[test]
+    fn entry_validation_and_labelframe() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "entry .e -validate key -validatecommand {expr {[string length %P] <= 3}}; \
+             ttk::labelframe .lf -text Options",
+        );
+        entry_changed(".e", "abc");
+        assert_eq!(entry_value(".e"), "abc");
+        entry_changed(".e", "abcd");
+        assert_eq!(entry_value(".e"), "abc");
+        assert_eq!(eval(&mut i, "winfo class .lf"), "TLabelframe");
+        assert_eq!(eval(&mut i, "cget .lf -text"), "Options");
     }
 
     #[test]

@@ -134,7 +134,7 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 | M1a ✅ | rtcl-vm `tk` 命令层：frame/label/button/entry/… 创建、configure/cget、pack/grid、destroy、winfo、wm/tk；per-widget 路径命令；teardown 自动清树；4 条单测 | `button .b -text Hi; cget .b -text` 等 Tcl 脚本语义通过 |
 | M1b ✅ | nsh 后端最小集（frame/label/button/entry）+ TkView；按钮 `-command` 执行 Tcl，按钮文本经 signal 刷新；GTK4 demo + headless 验收 | `nsh-testing`：初始 "Click me" 渲染 → press → "Clicked 1" → press → "Clicked 2"；`cargo run -p rtcl-tk-demo` 打开 GTK4 窗口 |
 | M2 ✅ | pack/grid/place、bind/event generate、after/update、`-textvariable` 双向、entry/text/listbox/scale 数据子命令、winfo/wm 扩展、ttk 别名、focus/raise/font/option；message/scrollbar/separator/progressbar；整树 dynamic 重建 | 经典 grid/pack 表单脚本通过（`classic_nsh`）；demo 双态截图；tk 单测 19 + headless 验收 2 |
-| M3 ◐ | ttk notebook/combobox/treeview ✅；原生系统菜单栏、主题/DPI/IME/a11y 细化待做 | 设置页/表单/列表演示（classic demo + headless 验收） |
+| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、列表滚动 ✅；原生系统菜单栏、主题/DPI/IME/a11y 细化待做 | 设置页/表单/列表演示（classic demo + headless 验收） |
 | M4 | 虚拟化 table/log/tree/chart + iOS/Android embed + 打包 | 手机/桌面同一 Tcl 脚本跑通 |
 
 ## 7. 主要风险
@@ -165,7 +165,7 @@ M1a/M1b/M2 已完成：
 
 **控件**：`toplevel/frame/label/button/entry/checkbutton/radiobutton/
 scale/text/listbox/message/scrollbar` + `ttk::{separator,progressbar,
-notebook,combobox,treeview,button,label,entry,frame,checkbutton,
+notebook,combobox,treeview,labelframe,button,label,entry,frame,checkbutton,
 radiobutton,scale,text,listbox,scrollbar,message}` 别名。
 
 **命令**：`configure/cget/cget 前缀缩写/destroy/pack/grid/place/winfo/
@@ -186,6 +186,9 @@ cascade），不是 OS 原生菜单栏；`-tearoff` 接受但不绘制撕下菜�
 行（右侧项推到行尾）；grid 按行分组、`columnconfigure -weight` 进入
 flex 权重；place 支持绝对坐标与 `-relwidth/-relheight`，相对坐标按父
 容器比例解释。混合 side 的精确 Tk 收缩顺序是近似。
+
+**Entry 校验**：`-validate key|all` + `-validatecommand`，支持 `%P/%s/
+%S/%v/%V/%W` 替换；返回 0 时拒绝编辑并回滚显示（错误则按 Tk 语义放行）。
 
 **事件**：按钮 `<Button-1>/<ButtonRelease-1>`、entry `<Return>/<Key>`、
 `bind all`、`event generate`；`%W/%x/%y/%K/%A` 替换；`after` 由

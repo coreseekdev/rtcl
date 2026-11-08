@@ -65,4 +65,8 @@ fn classic_form_round_trip() {
     );
     app.press("Project").expect("expand the root row again");
     app.wait_for("README").expect("children are back");
+
+    app.wait_for("Options").expect("labelframe label renders");
+    app.wait_for("labelframe body")
+        .expect("labelframe children render");
 }

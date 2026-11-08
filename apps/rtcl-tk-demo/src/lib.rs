@@ -129,6 +129,11 @@ pack .sep -fill x -pady 4
 ttk::progressbar .pb -value 40 -maximum 100
 pack .pb -fill x -padx 8
 
+ttk::labelframe .lf -text "Options"
+pack .lf -fill x -padx 8 -pady 4
+label .lf.hint -text "labelframe body"
+pack .lf.hint -padx 6 -pady 2
+
 focus .form.nameEntry
 bind .form.nameEntry <Return> {.form.ok invoke}
 set ::message ""

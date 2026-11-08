@@ -5,6 +5,11 @@
 状态：草案（开发中）。本文件冻结 web shell 右侧面板的 UI DSL 契约，
 是 Tcl 词表层、Rust 桥接层、JS 运行时三方的共同依据。
 
+> **范围边界（2026-11-08）**：`ui::*` 是 **web page / WebView 内**的
+> AI 声明式 UI 协议（catalog + model + append-only op），不是原生应用
+> 工具包，也不追求 Tk 控件兼容。原生 iOS/Android/桌面应用与
+> “现代 Tk”另立 `docs/UI-NATIVE-TK.md` 轨道，二者不共用 op 协议。
+
 ## 1. 架构总览
 
 ```

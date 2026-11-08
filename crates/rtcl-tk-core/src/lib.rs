@@ -131,7 +131,10 @@ pub struct WidgetNode {
 
 impl WidgetNode {
     pub fn child(&self, path: &str) -> Option<&str> {
-        self.children.iter().find(|c| c.as_str() == path).map(|s| s.as_str())
+        self.children
+            .iter()
+            .find(|c| c.as_str() == path)
+            .map(|s| s.as_str())
     }
 }
 
@@ -247,8 +250,7 @@ impl TkTree {
         if self.nodes.contains_key(path) {
             return Err(TkError::AlreadyExists(path.to_string()));
         }
-        let parent = parent_path(path)
-            .ok_or_else(|| TkError::BadPath(path.to_string()))?;
+        let parent = parent_path(path).ok_or_else(|| TkError::BadPath(path.to_string()))?;
         let parent_node = self
             .nodes
             .get_mut(&parent)
@@ -379,7 +381,11 @@ pub fn parent_path(path: &str) -> Option<String> {
         return None;
     }
     let i = path.rfind('.')?;
-    Some(if i == 0 { ".".to_string() } else { path[..i].to_string() })
+    Some(if i == 0 {
+        ".".to_string()
+    } else {
+        path[..i].to_string()
+    })
 }
 
 pub fn valid_option(name: &str) -> bool {
@@ -431,7 +437,10 @@ mod tests {
         t.create(".", "b", WidgetKind::Button).unwrap();
         t.configure(
             ".b",
-            [("-text".to_string(), "Hi".to_string()), ("-state".to_string(), "normal".to_string())],
+            [
+                ("-text".to_string(), "Hi".to_string()),
+                ("-state".to_string(), "normal".to_string()),
+            ],
         )
         .unwrap();
         assert_eq!(t.cget(".b", "-text").unwrap(), Some("Hi"));
@@ -444,9 +453,24 @@ mod tests {
     fn pack_and_grid_are_mutually_exclusive() {
         let mut t = TkTree::new();
         t.create(".", "f", WidgetKind::Frame).unwrap();
-        t.pack(".f", PackInfo { expand: true, ..PackInfo::default() }).unwrap();
+        t.pack(
+            ".f",
+            PackInfo {
+                expand: true,
+                ..PackInfo::default()
+            },
+        )
+        .unwrap();
         assert!(t.get(".f").unwrap().grid.is_none());
-        t.grid(".f", GridInfo { row: 2, column: 3, ..GridInfo::default() }).unwrap();
+        t.grid(
+            ".f",
+            GridInfo {
+                row: 2,
+                column: 3,
+                ..GridInfo::default()
+            },
+        )
+        .unwrap();
         let n = t.get(".f").unwrap();
         assert!(n.pack.is_none());
         assert_eq!(n.grid.unwrap().row, 2);

@@ -19,25 +19,27 @@ compile_error!(
      exclusive with the wasm target. Use ui::* for web/WebView UI instead."
 );
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use rtcl_core::interp::{add_interp_teardown_hook, Interp};
 use rtcl_core::value::Value;
 use rtcl_core::{Error, Result};
 
-pub use rtcl_tk_core::{
-    Fill, GridInfo, PackInfo, PackSide, Sticky, TkError, TkTree, WidgetKind,
-};
+pub use rtcl_tk_core::{Fill, GridInfo, PackInfo, PackSide, Sticky, TkError, TkTree, WidgetKind};
 
 #[derive(Debug, Default)]
 pub struct TkRuntime {
     tree: TkTree,
+    revision: u64,
 }
 
 impl TkRuntime {
     pub fn new() -> Self {
-        Self { tree: TkTree::new() }
+        Self {
+            tree: TkTree::new(),
+            revision: 0,
+        }
     }
 
     pub fn tree(&self) -> &TkTree {
@@ -47,12 +49,60 @@ impl TkRuntime {
     pub fn tree_mut(&mut self) -> &mut TkTree {
         &mut self.tree
     }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Mark the shadow tree changed and notify the backend (if one is
+    /// attached).  Backends bump a reactive signal here to re-render.
+    fn bump(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        CHANGE_HOOK.with(|h| {
+            if let Some(f) = h.get() {
+                f();
+            }
+        });
+    }
 }
 
 thread_local! {
     /// One Tk state per live interpreter (Tcl is single-threaded).
     static STATES: RefCell<HashMap<usize, TkRuntime>> =
         RefCell::new(HashMap::new());
+    /// The interpreter the UI backend drives (last `install` on this thread).
+    static ACTIVE: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Backend change callback (nsh bumps its revision signal here).
+    static CHANGE_HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+}
+
+/// Attach/clear the backend's "shadow tree changed" callback.
+pub fn set_change_hook(hook: Option<fn()>) {
+    CHANGE_HOOK.with(|h| h.set(hook));
+}
+
+pub fn active_interp() -> Option<*mut Interp> {
+    ACTIVE.with(|a| a.get()).map(|p| p as *mut Interp)
+}
+
+/// Evaluate `script` on the active interpreter (button `-command`
+/// callbacks).  Errors are returned to the backend for `bgerror`.
+pub fn eval_active(script: &str) -> Result<Value> {
+    let ptr = active_interp().ok_or_else(|| {
+        Error::runtime(
+            "no active Tk interpreter",
+            rtcl_core::error::ErrorCode::Generic,
+        )
+    })?;
+    // Safety: Tcl is single-threaded and the pointer is the live Interp
+    // that called install() on this thread.
+    unsafe { (*ptr).eval(script) }
+}
+
+/// A snapshot of the active interpreter's shadow tree, for the renderer.
+pub fn snapshot_active() -> Option<TkTree> {
+    let ptr = active_interp()? as *const Interp;
+    STATES.with(|s| s.borrow().get(&(ptr as usize)).map(|rt| rt.tree.clone()))
 }
 
 fn key(interp: &Interp) -> usize {
@@ -64,6 +114,11 @@ fn teardown(interp: *mut Interp) {
     let _ = STATES.try_with(|s| {
         if let Ok(mut s) = s.try_borrow_mut() {
             s.remove(&(interp as usize));
+        }
+    });
+    ACTIVE.with(|a| {
+        if a.get() == Some(interp as usize) {
+            a.set(None);
         }
     });
 }
@@ -90,14 +145,32 @@ pub fn install(interp: &mut Interp) {
     STATES.with(|s| {
         s.borrow_mut().entry(key(interp)).or_default();
     });
+    ACTIVE.with(|a| a.set(Some(key(interp))));
     for name in [
-        "toplevel", "frame", "label", "button", "entry", "checkbutton",
-        "radiobutton", "scale", "text", "listbox",
+        "toplevel",
+        "frame",
+        "label",
+        "button",
+        "entry",
+        "checkbutton",
+        "radiobutton",
+        "scale",
+        "text",
+        "listbox",
     ] {
         interp.register_command(name, create_widget);
     }
     interp.register_command(".", widget_command);
-    for name in ["configure", "cget", "destroy", "pack", "grid", "winfo", "wm", "tk"] {
+    for name in [
+        "configure",
+        "cget",
+        "destroy",
+        "pack",
+        "grid",
+        "winfo",
+        "wm",
+        "tk",
+    ] {
         interp.register_command(name, global_command);
     }
 }
@@ -131,7 +204,10 @@ fn parse_pairs(args: &[Value], start: usize, what: &str) -> Result<Vec<(String, 
 
 fn parse_int(v: &Value) -> Result<i64> {
     v.as_int().ok_or_else(|| {
-        Error::runtime(format!("expected integer but got \"{}\"", v.as_str()), rtcl_core::error::ErrorCode::Generic)
+        Error::runtime(
+            format!("expected integer but got \"{}\"", v.as_str()),
+            rtcl_core::error::ErrorCode::Generic,
+        )
     })
 }
 
@@ -140,7 +216,10 @@ fn parse_float(v: &Value, what: &str) -> Result<f64> {
         return Ok(i as f64);
     }
     v.as_float().ok_or_else(|| {
-        Error::runtime(format!("bad {what} \"{}\": expected number", v.as_str()), rtcl_core::error::ErrorCode::Generic)
+        Error::runtime(
+            format!("bad {what} \"{}\": expected number", v.as_str()),
+            rtcl_core::error::ErrorCode::Generic,
+        )
     })
 }
 
@@ -157,8 +236,7 @@ fn parse_bool(v: &Value, what: &str) -> Result<bool> {
 
 fn create_widget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let cmd = args[0].as_str();
-    let kind = WidgetKind::from_tk_name(cmd)
-        .ok_or_else(|| Error::invalid_command(cmd))?;
+    let kind = WidgetKind::from_tk_name(cmd).ok_or_else(|| Error::invalid_command(cmd))?;
     if args.len() < 2 {
         return Err(wrong(cmd, "pathName ?-option value ...?", args.len()));
     }
@@ -167,10 +245,9 @@ fn create_widget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     STATES.with(|s| {
         let mut s = s.borrow_mut();
         let rt = s.entry(key(interp)).or_default();
-        rt.tree
-            .create_at(path, kind)
-            .map_err(tk_error)?;
+        rt.tree.create_at(path, kind).map_err(tk_error)?;
         rt.tree.configure(path, options).map_err(tk_error)?;
+        rt.bump();
         Ok(())
     })?;
     interp.register_command(path, widget_command);
@@ -283,17 +360,16 @@ fn configure_impl(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Val
     }
     let options = parse_pairs(rest, 0, "configure")?;
     STATES.with(|s| {
-        s.borrow_mut()
-            .get_mut(&key(interp))
-            .ok_or_else(|| {
-                Error::runtime(
-                    format!("bad window path name \"{path}\""),
-                    rtcl_core::error::ErrorCode::Generic,
-                )
-            })?
-            .tree
-            .configure(path, options)
-            .map_err(tk_error)
+        let mut s = s.borrow_mut();
+        let rt = s.get_mut(&key(interp)).ok_or_else(|| {
+            Error::runtime(
+                format!("bad window path name \"{path}\""),
+                rtcl_core::error::ErrorCode::Generic,
+            )
+        })?;
+        rt.tree.configure(path, options).map_err(tk_error)?;
+        rt.bump();
+        Ok::<(), Error>(())
     })?;
     Ok(Value::empty())
 }
@@ -316,12 +392,17 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
         ));
     }
     STATES.with(|s| {
-        s.borrow_mut()
-            .get_mut(&key(interp))
-            .map(|rt| rt.tree.destroy(path))
-    })
-    .unwrap_or(Ok(()))
-    .map_err(tk_error)?;
+        let mut s = s.borrow_mut();
+        let rt = s.get_mut(&key(interp)).ok_or_else(|| {
+            Error::runtime(
+                format!("bad window path name \"{path}\""),
+                rtcl_core::error::ErrorCode::Generic,
+            )
+        })?;
+        rt.tree.destroy(path).map_err(tk_error)?;
+        rt.bump();
+        Ok::<(), Error>(())
+    })?;
     for p in removed {
         let _ = interp.delete_command(&p);
     }
@@ -343,7 +424,12 @@ fn pack_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "bottom" => PackSide::Bottom,
                     "left" => PackSide::Left,
                     "right" => PackSide::Right,
-                    _ => return Err(Error::runtime(format!("bad side \"{v}\""), rtcl_core::error::ErrorCode::Generic)),
+                    _ => {
+                        return Err(Error::runtime(
+                            format!("bad side \"{v}\""),
+                            rtcl_core::error::ErrorCode::Generic,
+                        ))
+                    }
                 }
             }
             "-fill" => {
@@ -352,22 +438,36 @@ fn pack_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "x" => Fill::X,
                     "y" => Fill::Y,
                     "both" => Fill::Both,
-                    _ => return Err(Error::runtime(format!("bad fill \"{v}\""), rtcl_core::error::ErrorCode::Generic)),
+                    _ => {
+                        return Err(Error::runtime(
+                            format!("bad fill \"{v}\""),
+                            rtcl_core::error::ErrorCode::Generic,
+                        ))
+                    }
                 }
             }
             "-expand" => info.expand = parse_bool(&Value::from_str(&v), "expand")?,
             "-padx" => info.padx = parse_float(&Value::from_str(&v), "padx")?,
             "-pady" => info.pady = parse_float(&Value::from_str(&v), "pady")?,
-            _ => return Err(Error::runtime(format!("unknown option \"{k}\""), rtcl_core::error::ErrorCode::Generic)),
+            _ => {
+                return Err(Error::runtime(
+                    format!("unknown option \"{k}\""),
+                    rtcl_core::error::ErrorCode::Generic,
+                ))
+            }
         }
     }
     STATES.with(|s| {
-        s.borrow_mut()
-            .get_mut(&key(interp))
-            .ok_or_else(|| Error::runtime(format!("bad window path name \"{path}\""), rtcl_core::error::ErrorCode::Generic))?
-            .tree
-            .pack(path, info)
-            .map_err(tk_error)
+        let mut s = s.borrow_mut();
+        let rt = s.get_mut(&key(interp)).ok_or_else(|| {
+            Error::runtime(
+                format!("bad window path name \"{path}\""),
+                rtcl_core::error::ErrorCode::Generic,
+            )
+        })?;
+        rt.tree.pack(path, info).map_err(tk_error)?;
+        rt.bump();
+        Ok::<(), Error>(())
     })?;
     Ok(Value::empty())
 }
@@ -395,16 +495,25 @@ fn grid_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     bottom: v.contains('s'),
                 }
             }
-            _ => return Err(Error::runtime(format!("unknown option \"{k}\""), rtcl_core::error::ErrorCode::Generic)),
+            _ => {
+                return Err(Error::runtime(
+                    format!("unknown option \"{k}\""),
+                    rtcl_core::error::ErrorCode::Generic,
+                ))
+            }
         }
     }
     STATES.with(|s| {
-        s.borrow_mut()
-            .get_mut(&key(interp))
-            .ok_or_else(|| Error::runtime(format!("bad window path name \"{path}\""), rtcl_core::error::ErrorCode::Generic))?
-            .tree
-            .grid(path, info)
-            .map_err(tk_error)
+        let mut s = s.borrow_mut();
+        let rt = s.get_mut(&key(interp)).ok_or_else(|| {
+            Error::runtime(
+                format!("bad window path name \"{path}\""),
+                rtcl_core::error::ErrorCode::Generic,
+            )
+        })?;
+        rt.tree.grid(path, info).map_err(tk_error)?;
+        rt.bump();
+        Ok::<(), Error>(())
     })?;
     Ok(Value::empty())
 }
@@ -422,24 +531,40 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let path = args[2].as_str();
             let kids = with_state(interp, |rt| rt.tree.children(path).map(|c| c.to_vec()))
                 .and_then(|r| r.ok())
-                .ok_or_else(|| Error::runtime(format!("bad window path name \"{path}\""), rtcl_core::error::ErrorCode::Generic))?;
-            Ok(Value::from_list(&kids.iter().map(|s| Value::from_str(s)).collect::<Vec<_>>()))
+                .ok_or_else(|| {
+                    Error::runtime(
+                        format!("bad window path name \"{path}\""),
+                        rtcl_core::error::ErrorCode::Generic,
+                    )
+                })?;
+            Ok(Value::from_list(
+                &kids.iter().map(|s| Value::from_str(s)).collect::<Vec<_>>(),
+            ))
         }
         "exists" => {
             if args.len() != 3 {
                 return Err(wrong("winfo exists", "window", args.len()));
             }
             let path = args[2].as_str();
-            Ok(Value::from_bool(with_state(interp, |rt| rt.tree.contains(path)).unwrap_or(false)))
+            Ok(Value::from_bool(
+                with_state(interp, |rt| rt.tree.contains(path)).unwrap_or(false),
+            ))
         }
         "class" => {
             if args.len() != 3 {
                 return Err(wrong("winfo class", "window", args.len()));
             }
             let path = args[2].as_str();
-            let kind = with_state(interp, |rt| rt.tree.get(path).map(|n| format!("{:?}", n.kind)))
-                .flatten()
-                .ok_or_else(|| Error::runtime(format!("bad window path name \"{path}\""), rtcl_core::error::ErrorCode::Generic))?;
+            let kind = with_state(interp, |rt| {
+                rt.tree.get(path).map(|n| format!("{:?}", n.kind))
+            })
+            .flatten()
+            .ok_or_else(|| {
+                Error::runtime(
+                    format!("bad window path name \"{path}\""),
+                    rtcl_core::error::ErrorCode::Generic,
+                )
+            })?;
             Ok(Value::from_str(&kind))
         }
         "width" | "height" => {
@@ -450,10 +575,16 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if with_state(interp, |rt| rt.tree.contains(args[2].as_str())).unwrap_or(false) {
                 Ok(Value::from_int(0))
             } else {
-                Err(Error::runtime(format!("bad window path name \"{}\"", args[2].as_str()), rtcl_core::error::ErrorCode::Generic))
+                Err(Error::runtime(
+                    format!("bad window path name \"{}\"", args[2].as_str()),
+                    rtcl_core::error::ErrorCode::Generic,
+                ))
             }
         }
-        _ => Err(Error::runtime(format!("bad option \"{sub}\": must be children, class, exists, height, or width"), rtcl_core::error::ErrorCode::Generic)),
+        _ => Err(Error::runtime(
+            format!("bad option \"{sub}\": must be children, class, exists, height, or width"),
+            rtcl_core::error::ErrorCode::Generic,
+        )),
     }
 }
 
@@ -477,17 +608,28 @@ fn wm_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .map(|v| v.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
-            configure_impl(interp, path, &[Value::from_str(&option), Value::from_str(&value)])?;
+            configure_impl(
+                interp,
+                path,
+                &[Value::from_str(&option), Value::from_str(&value)],
+            )?;
             Ok(Value::empty())
         }
         "withdraw" | "deiconify" | "iconify" => {
             if args.len() != 3 {
                 return Err(wrong(&format!("wm {sub}"), "window", args.len()));
             }
-            configure_impl(interp, path, &[Value::from_str(&option), Value::from_str("1")])?;
+            configure_impl(
+                interp,
+                path,
+                &[Value::from_str(&option), Value::from_str("1")],
+            )?;
             Ok(Value::empty())
         }
-        _ => Err(Error::runtime(format!("bad option \"{sub}\""), rtcl_core::error::ErrorCode::Generic)),
+        _ => Err(Error::runtime(
+            format!("bad option \"{sub}\""),
+            rtcl_core::error::ErrorCode::Generic,
+        )),
     }
 }
 
@@ -533,7 +675,10 @@ mod tests {
     fn hierarchy_and_pack_grid() {
         let mut i = Interp::new();
         install(&mut i);
-        eval(&mut i, "frame .f; button .f.b -text X; pack .f -side left -expand 1");
+        eval(
+            &mut i,
+            "frame .f; button .f.b -text X; pack .f -side left -expand 1",
+        );
         assert_eq!(eval(&mut i, "winfo children ."), ".f");
         assert_eq!(eval(&mut i, "winfo children .f"), ".f.b");
         eval(&mut i, "grid .f.b -row 2 -column 3 -sticky nsew");

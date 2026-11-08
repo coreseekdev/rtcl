@@ -132,7 +132,7 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 |---|---|---|
 | M0 ✅ | tk-core WidgetSpec/选项/布局/事件模型 + 纯模型单测；tk-runtime native-only 骨架 + `tk` feature 门禁；nsh GTK4 最小 app 构建/启动 | 无 GUI 下 `button .b ...; pack .b` 生成正确树；`cargo build -p rtcl-cli --features tk` 通过；wasm 目标对 tk-runtime 报 compile_error |
 | M1a ✅ | rtcl-vm `tk` 命令层：frame/label/button/entry/… 创建、configure/cget、pack/grid、destroy、winfo、wm/tk；per-widget 路径命令；teardown 自动清树；4 条单测 | `button .b -text Hi; cget .b -text` 等 Tcl 脚本语义通过 |
-| M1b | nsh 后端最小集（frame/label/button/entry） | Linux GTK4 或 headless demo：按钮点击执行 Tcl 命令 |
+| M1b ✅ | nsh 后端最小集（frame/label/button/entry）+ TkView；按钮 `-command` 执行 Tcl，按钮文本经 signal 刷新；GTK4 demo + headless 验收 | `nsh-testing`：初始 "Click me" 渲染 → press → "Clicked 1" → press → "Clicked 2"；`cargo run -p rtcl-tk-demo` 打开 GTK4 窗口 |
 | M2 | pack/grid、bind/after/update/vwait、textvariable、cget/configure/winfo | 经典 Tk 小脚本可直接跑（差异表外） |
 | M3 | ttk 常用控件 + listbox/menu/scrollbar + 主题/DPI/IME/a11y | 设置页/表单/列表演示 |
 | M4 | 虚拟化 table/log/tree/chart + iOS/Android embed + 打包 | 手机/桌面同一 Tcl 脚本跑通 |
@@ -152,9 +152,18 @@ M0 已完成：`rtcl-tk-core` 纯模型 + `rtcl-tk-runtime` native-only 骨架 +
 `rtcl-cli` 的 `tk` feature 门禁；nsh 0.4 `nsh-platform-linux` 最小 GTK4
 app 已在本机构建并启动。
 
-M1a 已完成（`rtcl-tk-runtime` 命令层）。下一步 M1b：
+M1a/M1b 已完成：
 
-1. `rtcl-tk-nsh`：把 WidgetSpec 映射到 nsh 组件，先用
-   `nsh-testing` headless 验证 Tcl `-command` → 事件 → 回调；
-2. 再接 `nsh-platform-linux` GTK4 窗口，随后 iOS/Android 真机；
-3. Tcl 侧补 `-textvariable` 双向绑定、`bind`/`after`/`update`/`vwait`。
+- `rtcl-tk-runtime`：Tk 命令层 + shadow tree + active interpreter。
+- `rtcl-tk-nsh`：`TkView` 把 Toplevel/Frame/Label/Button/Entry 映射到
+  nsh 组件；Button `on_press` 执行 Tcl `-command`，并把 `-text` 变化
+  推入 signal 刷新。
+- `apps/rtcl-tk-demo`：GTK4 runner + `nsh-testing` headless 验收
+  （`cargo test -p rtcl-tk-demo --test tk_nsh`）。
+
+下一步：
+
+1. 整树 revision → nsh 重渲染（当前按钮文本用局部 signal，新增/删除
+   widget 需完整 mount）；`-textvariable` 双向绑定；
+2. `bind`/`after`/`update`/`vwait` 与 nsh 事件循环合一；
+3. iOS/Android platform crates 与真机；ttk 常用组件。

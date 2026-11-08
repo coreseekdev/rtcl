@@ -10,7 +10,8 @@ members = [
     "crates/rtcl-wasm",
     "crates/rtcl-jit",
     "crates/rtcl-towasm",
-    "crates/rtcl-data", "crates/rtcl-tk-core", "crates/rtcl-tk-runtime",
+    "crates/rtcl-data", "crates/rtcl-tk-core", "crates/rtcl-tk-runtime", "crates/rtcl-tk-nsh",
+    "apps/rtcl-tk-demo",
 ]
 
 [workspace.package]

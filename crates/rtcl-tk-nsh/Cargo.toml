@@ -1,0 +1,12 @@
+[package]
+name = "rtcl-tk-nsh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "nsh renderer for rtcl's native Tk-compatible widget tree"
+
+[dependencies]
+rtcl-tk-core = { path = "../rtcl-tk-core" }
+rtcl-tk-runtime = { path = "../rtcl-tk-runtime" }
+nsh-core = "0.4"
+nsh-base = { version = "0.4", default-features = false }

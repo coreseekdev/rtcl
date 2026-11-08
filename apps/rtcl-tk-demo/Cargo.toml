@@ -1,0 +1,20 @@
+[package]
+name = "rtcl-tk-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GTK4 demo of rtcl's native Tk-compatible UI"
+
+[dependencies]
+rtcl-core = { workspace = true }
+rtcl-tk-runtime = { path = "../../crates/rtcl-tk-runtime" }
+rtcl-tk-nsh = { path = "../../crates/rtcl-tk-nsh" }
+nsh-core = "0.4"
+nsh-base = { version = "0.4", default-features = false }
+nsh-engine = "0.4"
+
+[dev-dependencies]
+nsh-testing = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nsh-platform-linux = { version = "0.4", default-features = false }

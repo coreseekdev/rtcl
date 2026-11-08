@@ -60,6 +60,9 @@
     Interp teardown / store rebind（slot 上限 64）。
   - **[开放] 后台子进程退出策略**：handle 已保留并 try_wait reap；
     Interp drop 时仍在运行的子进程不 kill（与 Tcl 一致，由 OS 接管）。
+  - **[非差异] reflected finalizer 在解释器退出不跑**：实测 tclsh 8.6.17
+    对仍打开的 reflected channel 退出时也不调用 `finalize`；显式
+    `close` 才调用。rtcl 现状与 oracle 一致，不是资源泄漏。
   - **[开放] `references` 只增不减**：`ref` 每个值插强引用表，
     `collect` 是 no-op；脚本可无界持有 Value，直到 Interp drop。
   - **[已修] `const_pool` 旧 `ProcDef`/ByteCode 钉住**：proc 重定义、

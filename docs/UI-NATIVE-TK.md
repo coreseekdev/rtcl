@@ -191,7 +191,8 @@ flex 权重；place 支持绝对坐标与 `-relwidth/-relheight`，相对坐标�
 %S/%v/%V/%W` 替换；返回 0 时拒绝编辑并回滚显示（错误则按 Tk 语义放行）。
 
 **事件**：按钮 `<Button-1>/<ButtonRelease-1>`、entry `<Return>/<Key>`、
-`bind all`、`event generate`；`%W/%x/%y/%K/%A` 替换；`after` 由
+`bind all`、类名/`bind .` 标签绑定（按 `bindtags` 顺序：widget、class、
+toplevel、all）、`event generate`；`%W/%x/%y/%K/%A` 替换；`after` 由
 `TkView` 的 16 ms interval 泵入，错误进 `take_errors()`。
 
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停

@@ -38,6 +38,8 @@ pub struct TkRuntime {
     revision: u64,
     /// `bind all` scripts, run after the widget's own bindings.
     all_bindings: BTreeMap<String, String>,
+    /// Class/toplevel/arbitrary tag bindings (`bind Button`, `bind .`).
+    tag_bindings: BTreeMap<String, BTreeMap<String, String>>,
     /// `wm protocol` handlers, keyed by `(path, protocol name)`.
     protocols: BTreeMap<(String, String), String>,
     /// `grid columnconfigure` / `rowconfigure`: `(parent, index, is_row)`
@@ -2433,32 +2435,51 @@ fn bind_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(wrong("bind", "window ?sequence? ?+?script?", args.len()));
     }
     let target = args[1].as_str();
-    let all = target == "all";
-    if !all && !with_state(interp, |rt| rt.tree.contains(target)).unwrap_or(false) {
+    let is_widget = target != "."
+        && target != "all"
+        && with_state(interp, |rt| rt.tree.contains(target)).unwrap_or(false);
+    if !is_widget && target != "all" && target.starts_with('.') && target != "." {
         return Err(bad_window(target));
     }
     if args.len() == 2 {
-        let seqs: Vec<String> = if all {
-            with_state(interp, |rt| rt.all_bindings.keys().cloned().collect()).unwrap_or_default()
-        } else {
+        let seqs: Vec<String> = if is_widget {
             with_state(interp, |rt| rt.tree.binding_sequences(target))
                 .and_then(|r| r.ok())
                 .unwrap_or_default()
+        } else if target == "all" {
+            with_state(interp, |rt| rt.all_bindings.keys().cloned().collect()).unwrap_or_default()
+        } else {
+            with_state(interp, |rt| {
+                rt.tag_bindings
+                    .get(target)
+                    .map(|m| m.keys().cloned().collect())
+            })
+            .flatten()
+            .unwrap_or_default()
         };
         return Ok(list_value(seqs));
     }
     let sequence = normalize_sequence(args[2].as_str());
-    let current = if all {
-        with_state(interp, |rt| rt.all_bindings.get(&sequence).cloned())
-            .flatten()
-            .unwrap_or_default()
-    } else {
+    let current = if is_widget {
         with_state(interp, |rt| {
             rt.tree
                 .binding(target, &sequence)
                 .ok()
                 .flatten()
                 .map(str::to_string)
+        })
+        .flatten()
+        .unwrap_or_default()
+    } else if target == "all" {
+        with_state(interp, |rt| rt.all_bindings.get(&sequence).cloned())
+            .flatten()
+            .unwrap_or_default()
+    } else {
+        with_state(interp, |rt| {
+            rt.tag_bindings
+                .get(target)
+                .and_then(|m| m.get(&sequence))
+                .cloned()
         })
         .flatten()
         .unwrap_or_default()
@@ -2475,17 +2496,23 @@ fn bind_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         None => script.to_string(),
     };
     with_state_mut(interp, |rt| {
-        if all {
+        if is_widget {
+            rt.tree.bind(target, &sequence, &script).map_err(tk_error)?;
+        } else if target == "all" {
             if script.is_empty() {
                 rt.all_bindings.remove(&sequence);
             } else {
                 rt.all_bindings.insert(sequence.clone(), script.clone());
             }
-            rt.bump();
         } else {
-            rt.tree.bind(target, &sequence, &script).map_err(tk_error)?;
-            rt.bump();
+            let map = rt.tag_bindings.entry(target.to_string()).or_default();
+            if script.is_empty() {
+                map.remove(&sequence);
+            } else {
+                map.insert(sequence.clone(), script.clone());
+            }
         }
+        rt.bump();
         Ok::<(), Error>(())
     })
     .ok_or_else(|| bad_window(target))??;
@@ -2544,13 +2571,22 @@ fn substitute_bindings(script: &str, ctx: &EventCtx) -> String {
     out
 }
 
-fn binding_script(interp: &Interp, path: &str, sequence: &str) -> String {
+fn script_for_tag(interp: &Interp, tag: &str, sequence: &str) -> String {
     let exact = with_state(interp, |rt| {
-        rt.tree
-            .binding(path, sequence)
-            .ok()
-            .flatten()
-            .map(str::to_string)
+        if tag == "all" {
+            rt.all_bindings.get(sequence).cloned()
+        } else if tag.starts_with('.') && tag != "." && rt.tree.contains(tag) {
+            rt.tree
+                .binding(tag, sequence)
+                .ok()
+                .flatten()
+                .map(str::to_string)
+        } else {
+            rt.tag_bindings
+                .get(tag)
+                .and_then(|m| m.get(sequence))
+                .cloned()
+        }
     })
     .flatten()
     .unwrap_or_default();
@@ -2558,34 +2594,44 @@ fn binding_script(interp: &Interp, path: &str, sequence: &str) -> String {
         return exact;
     }
     // Generic key bindings: <Key> sees every key press.
-    if sequence == "<Return>" || sequence == "<KeyPress>" {
-        return with_state(interp, |rt| {
-            rt.tree
-                .binding(path, "<KeyPress>")
-                .ok()
-                .flatten()
-                .map(str::to_string)
-        })
-        .flatten()
-        .unwrap_or_default();
+    if sequence == "<Return>" {
+        return script_for_tag(interp, tag, "<KeyPress>");
     }
     String::new()
 }
 
-/// Run the bindings for `path` and `sequence` (then `bind all`), and
-/// re-render.  Errors go to [`take_errors`].
+/// Run the bindings for `path` in its bindtags order and re-render.
+/// Errors go to [`take_errors`].
 pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) {
     let sequence = normalize_sequence(sequence);
     let Some(ptr) = active_interp() else { return };
     // Safety: the pointer is the live engine-thread Interp.
     let interp = unsafe { &mut *ptr };
+    let tags = with_state(interp, |rt| rt.bindtags.get(path).cloned())
+        .flatten()
+        .unwrap_or_else(|| {
+            let (class, top) = with_state(interp, |rt| {
+                rt.tree.get(path).map(|n| {
+                    let mut top = path.to_string();
+                    let mut p = path.to_string();
+                    while let Some(parent) = rt.tree.get(&p).and_then(|n| n.parent.clone()) {
+                        p = parent;
+                        top = p.clone();
+                    }
+                    (n.kind.class_name().to_string(), top)
+                })
+            })
+            .flatten()
+            .unwrap_or_else(|| ("Widget".to_string(), ".".to_string()));
+            vec![path.to_string(), class, top, "all".to_string()]
+        });
+    let mut seen = std::collections::BTreeSet::new();
     let mut scripts = Vec::new();
-    let widget = binding_script(interp, path, &sequence);
-    if !widget.is_empty() {
-        scripts.push(widget);
-    }
-    if let Some(script) = with_state(interp, |rt| rt.all_bindings.get(&sequence).cloned()).flatten()
-    {
+    for tag in tags {
+        if !seen.insert(tag.clone()) {
+            continue;
+        }
+        let script = script_for_tag(interp, &tag, &sequence);
         if !script.is_empty() {
             scripts.push(script);
         }
@@ -4856,6 +4902,14 @@ mod tests {
         eval(&mut i, "bind all <Return> {incr ::n}");
         eval(&mut i, "entry .e; event generate .e <Key-Return>");
         assert_eq!(eval(&mut i, "set ::n"), "2");
+        // Class and toplevel tag bindings run in bindtags order.
+        eval(&mut i, "bind Entry <KeyPress> {incr ::n}");
+        eval(&mut i, "event generate .e <KeyPress>");
+        assert_eq!(eval(&mut i, "set ::n"), "3");
+        eval(&mut i, "bind . <FocusIn> {incr ::n}");
+        eval(&mut i, "event generate .e <FocusIn>");
+        assert_eq!(eval(&mut i, "set ::n"), "4");
+        assert_eq!(eval(&mut i, "bind Entry"), "<KeyPress>");
     }
 
     #[test]

@@ -285,7 +285,7 @@ fn render_children(tree: &TkTree, path: &str) -> AnyElement {
         }
         let side = tree
             .get(child)
-            .and_then(|n| n.pack)
+            .and_then(|n| n.pack.clone())
             .map(|p| p.side)
             .unwrap_or(PackSide::Top);
         if matches!(side, PackSide::Left | PackSide::Right) {
@@ -295,7 +295,7 @@ fn render_children(tree: &TkTree, path: &str) -> AnyElement {
                 let c = &node.children[i];
                 let s = tree
                     .get(c)
-                    .and_then(|n| n.pack)
+                    .and_then(|n| n.pack.clone())
                     .map(|p| p.side)
                     .unwrap_or(PackSide::Top);
                 match s {
@@ -352,11 +352,33 @@ fn render_placed(tree: &TkTree, path: &str) -> AnyElement {
     } else if let Some(h) = info.height {
         cell = cell.h(px(h as f32));
     }
+    // `-anchor` says which point of the widget the coordinates name.
+    let anchor = info.anchor.as_str();
+    let fx = if anchor.contains('e') && !anchor.contains('w') {
+        1.0f32
+    } else if anchor == "center" {
+        0.5
+    } else {
+        0.0
+    };
+    let fy = if anchor.contains('s') && !anchor.contains('n') {
+        1.0f32
+    } else if anchor == "center" {
+        0.5
+    } else {
+        0.0
+    };
+    if fx != 0.0 {
+        cell = cell.translate_x(relative(-fx));
+    }
+    if fy != 0.0 {
+        cell = cell.translate_y(relative(-fy));
+    }
     cell.child(render_node(tree, path)).into_element()
 }
 
 fn render_packed(tree: &TkTree, path: &str) -> AnyElement {
-    let pack = tree.get(path).and_then(|n| n.pack);
+    let pack = tree.get(path).and_then(|n| n.pack.clone());
     let mut cell = view();
     if let Some(p) = pack {
         if p.expand {
@@ -372,6 +394,11 @@ fn render_packed(tree: &TkTree, path: &str) -> AnyElement {
         }
         if p.padx > 0.0 || p.pady > 0.0 {
             cell = cell.px(px(p.padx as f32)).py(px(p.pady as f32));
+        }
+        if p.anchor.contains('w') && !p.anchor.contains('e') {
+            cell = cell.self_start();
+        } else if p.anchor.contains('e') && !p.anchor.contains('w') {
+            cell = cell.self_end();
         }
     }
     cell.child(render_node(tree, path)).into_element()

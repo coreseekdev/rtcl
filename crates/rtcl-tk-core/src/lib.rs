@@ -103,13 +103,15 @@ pub enum Fill {
     Both,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PackInfo {
     pub side: PackSide,
     pub fill: Fill,
     pub expand: bool,
     pub padx: f64,
     pub pady: f64,
+    /// `-anchor`: where the parcel sits in its cavity (`center`, `w`, ...).
+    pub anchor: String,
 }
 
 impl Default for PackInfo {
@@ -120,6 +122,7 @@ impl Default for PackInfo {
             expand: false,
             padx: 0.0,
             pady: 0.0,
+            anchor: "center".to_string(),
         }
     }
 }

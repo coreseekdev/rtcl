@@ -568,6 +568,26 @@ fn initialize_widget(interp: &mut Interp, path: &str, kind: WidgetKind) -> Resul
                 }
             }
         }
+        WidgetKind::Listbox => {
+            let var = effective_option(interp, path, "-listvariable");
+            if !var.is_empty() {
+                if let Some(items) = var_value(&var)
+                    .and_then(|s| Value::from_str(&s).as_list())
+                    .map(|list| {
+                        list.iter()
+                            .map(|v| v.as_str().to_string())
+                            .collect::<Vec<_>>()
+                    })
+                {
+                    with_state_mut(interp, |rt| {
+                        if let Some(n) = rt.tree.get_mut(path) {
+                            n.items = items;
+                            n.selected.clear();
+                        }
+                    });
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -1181,7 +1201,7 @@ fn pack_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 fn pack_widget(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
-    let mut info = with_state(interp, |rt| rt.tree.get(path).and_then(|n| n.pack))
+    let mut info = with_state(interp, |rt| rt.tree.get(path).and_then(|n| n.pack.clone()))
         .flatten()
         .unwrap_or_default();
     for (k, v) in parse_pairs(rest, 0, "pack")? {
@@ -1212,7 +1232,8 @@ fn pack_widget(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value>
                     "pack -in is not supported in the native Tk backend yet",
                 ))
             }
-            "-anchor" | "-ipadx" | "-ipady" => {}
+            "-anchor" => info.anchor = v,
+            "-ipadx" | "-ipady" => {}
             _ => return Err(bad_option(&k)),
         }
     }
@@ -1226,7 +1247,7 @@ fn pack_widget(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value>
 }
 
 fn pack_info(interp: &mut Interp, path: &str) -> Result<Value> {
-    let info = with_state(interp, |rt| rt.tree.get(path).map(|n| n.pack))
+    let info = with_state(interp, |rt| rt.tree.get(path).map(|n| n.pack.clone()))
         .flatten()
         .ok_or_else(|| bad_window(path))?
         .ok_or_else(|| generic(format!("window \"{path}\" isn't packed")))?;
@@ -1246,7 +1267,7 @@ fn pack_info(interp: &mut Interp, path: &str) -> Result<Value> {
         "-in".to_string(),
         ".".to_string(),
         "-anchor".to_string(),
-        "center".to_string(),
+        info.anchor.clone(),
         "-expand".to_string(),
         if info.expand { "1" } else { "0" }.to_string(),
         "-fill".to_string(),
@@ -3612,7 +3633,27 @@ fn listbox_insert(interp: &mut Interp, path: &str, index: &str, items: &[Value])
             rt.bump();
         }
     });
+    sync_listvariable(interp, path);
     Ok(Value::empty())
+}
+
+/// Write a Listbox's items back to its `-listvariable`, as Tk does after
+/// `insert`/`delete`.
+fn sync_listvariable(interp: &mut Interp, path: &str) {
+    let var = effective_option(interp, path, "-listvariable");
+    if var.is_empty() {
+        return;
+    }
+    let items = with_state(interp, |rt| {
+        rt.tree
+            .get(path)
+            .map(|n| n.items.clone())
+            .unwrap_or_default()
+    })
+    .unwrap_or_default();
+    let values = items.iter().map(|s| Value::from_str(s)).collect::<Vec<_>>();
+    let list = Value::from_list(&values).as_str().to_string();
+    let _ = set_var(&var, &list);
 }
 
 fn listbox_delete(
@@ -3644,6 +3685,7 @@ fn listbox_delete(
             rt.bump();
         }
     });
+    sync_listvariable(interp, path);
     Ok(Value::empty())
 }
 
@@ -3943,6 +3985,17 @@ mod tests {
         eval(&mut i, ".lb selection set 1");
         assert_eq!(eval(&mut i, ".lb curselection"), "1");
         assert_eq!(eval(&mut i, ".lb selection includes 1"), "1");
+
+        // -listvariable is read at creation and written after edits.
+        eval(
+            &mut i,
+            "set ::items {x y}; listbox .lv -listvariable ::items",
+        );
+        assert_eq!(eval(&mut i, ".lv size"), "2");
+        eval(&mut i, ".lv insert end z");
+        assert_eq!(eval(&mut i, "set ::items"), "x y z");
+        eval(&mut i, ".lv delete 0");
+        assert_eq!(eval(&mut i, "set ::items"), "y z");
     }
 
     #[test]

@@ -134,7 +134,7 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 | M1a ✅ | rtcl-vm `tk` 命令层：frame/label/button/entry/… 创建、configure/cget、pack/grid、destroy、winfo、wm/tk；per-widget 路径命令；teardown 自动清树；4 条单测 | `button .b -text Hi; cget .b -text` 等 Tcl 脚本语义通过 |
 | M1b ✅ | nsh 后端最小集（frame/label/button/entry）+ TkView；按钮 `-command` 执行 Tcl，按钮文本经 signal 刷新；GTK4 demo + headless 验收 | `nsh-testing`：初始 "Click me" 渲染 → press → "Clicked 1" → press → "Clicked 2"；`cargo run -p rtcl-tk-demo` 打开 GTK4 窗口 |
 | M2 ✅ | pack/grid/place、bind/event generate、after/update、`-textvariable` 双向、entry/text/listbox/scale 数据子命令、winfo/wm 扩展、ttk 别名、focus/raise/font/option；message/scrollbar/separator/progressbar；整树 dynamic 重建 | 经典 grid/pack 表单脚本通过（`classic_nsh`）；demo 双态截图；tk 单测 19 + headless 验收 2 |
-| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、列表滚动 ✅；原生系统菜单栏、主题/DPI/IME/a11y 细化待做 | 设置页/表单/列表演示（classic demo + headless 验收） |
+| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、列表滚动、macOS 系统菜单 ✅；主题/DPI/IME/a11y 细化待做 | 设置页/表单/列表演示（classic demo + headless 验收） |
 | M4 | 虚拟化 table/log/tree/chart + iOS/Android embed + 打包 | 手机/桌面同一 Tcl 脚本跑通 |
 
 ## 7. 主要风险
@@ -178,12 +178,14 @@ unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
 `ttk::treeview` 的 `insert/delete/item/selection/focus/children/parent/
 index/heading/column/exists`；listbox/treeview 按 `-height` 放进滚动视图（滚轮可滚）；Tcl 侧的 `after/update/vwait` 沿用 rtcl-vm。
 
-**菜单**：`menu` 窗口与 `-menu` 关联的菜单栏在 app 内渲染为一行
-cascade 按钮 + 浮层下拉（command/checkbutton/radiobutton/separator/
-cascade），不是 OS 原生菜单栏；`-tearoff` 接受但不绘制撕下菜单。
+**菜单**：`menu` 窗口与 `-menu` 关联的菜单栏。macOS 通过 nsh
+`desktop::set_application_menu` 映射到系统菜单；Linux/Windows 在 app 内
+渲染为一行 cascade 按钮 + 浮层下拉（command/checkbutton/radiobutton/
+separator/cascade），headless 同样用 app 内菜单以便测试；`-tearoff`
+接受但不绘制撕下菜单。
 
 **布局**：pack 按子控件顺序流式排列，连续 `-side left/right` 归入同一
-行（右侧项推到行尾）；grid 按行分组、`columnconfigure -weight` 进入
+行（右侧项推到行尾），不放 fill 的 parcel 从行/列首开始；grid 按行分组、`columnconfigure -weight` 进入
 flex 权重；place 支持绝对坐标与 `-relwidth/-relheight`，相对坐标按父
 容器比例解释。混合 side 的精确 Tk 收缩顺序是近似。
 

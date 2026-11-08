@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use nsh_base::SliderValue;
+use nsh_core::element::desktop;
 use nsh_core::geometry::Axis;
 use nsh_core::prelude::*;
 use rtcl_tk_core::{Fill, PackSide, TkTree, WidgetKind};
@@ -76,13 +77,16 @@ pub fn TkView() -> impl IntoElement {
             match rtcl_tk_runtime::snapshot_active() {
                 Some(tree) => {
                     let mut column = view().flex_col().w_full().gap_2();
+                    let native = matches!(os(), nsh_core::platform::Os::MacOs);
                     let bar = rtcl_tk_runtime::menu_bar();
-                    if let Some(bar) = &bar {
+                    if native {
+                        sync_native_menu();
+                    } else if let Some(bar) = &bar {
                         column = column.child(render_menu_bar(bar));
                     }
                     column = column.child(render_children(&tree, "."));
                     // The dropdown floats over the content.
-                    if bar.is_some() {
+                    if !native && bar.is_some() {
                         if let Some(open) = rtcl_tk_runtime::open_menu() {
                             column = column.child(render_menu_dropdown(&open));
                         }
@@ -130,6 +134,60 @@ fn effective(tree: &TkTree, path: &str, name: &str) -> String {
 
 fn is_disabled(tree: &TkTree, path: &str) -> bool {
     option(tree, path, "-state") == "disabled"
+}
+
+/// Publish the Tk `menu` tree as the platform's application menu (macOS's
+/// system menu, GTK's menu bar).  Headless runs keep the in-app bar.
+fn sync_native_menu() {
+    let items = rtcl_tk_runtime::menu_bar()
+        .map(|bar| native_menu_items(&bar))
+        .unwrap_or_default();
+    if items.is_empty() {
+        desktop::set_application_menu(None);
+    } else {
+        desktop::set_application_menu(items);
+    }
+}
+
+fn native_menu_items(menu_path: &str) -> Vec<desktop::MenuItem> {
+    let Some(menu) = rtcl_tk_runtime::menu_snapshot(menu_path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (i, item) in menu.items.iter().enumerate() {
+        if item.kind == "separator" {
+            out.push(desktop::MenuItem::separator());
+            continue;
+        }
+        let label = item.options.get("-label").cloned().unwrap_or_default();
+        let disabled = item.options.get("-state").is_some_and(|s| s == "disabled");
+        if item.kind == "cascade" {
+            if let Some(sub) = item.options.get("-menu").filter(|s| !s.is_empty()) {
+                out.push(
+                    desktop::MenuItem::submenu(label, native_menu_items(sub)).disabled(disabled),
+                );
+                continue;
+            }
+        }
+        let mut entry = desktop::MenuItem::new(label).disabled(disabled).on_select({
+            let path = menu_path.to_string();
+            move || rtcl_tk_runtime::press_menu_item(&path, i)
+        });
+        if item.kind == "checkbutton" || item.kind == "radiobutton" {
+            let var = item.options.get("-variable").cloned().unwrap_or_default();
+            let on = item
+                .options
+                .get("-onvalue")
+                .cloned()
+                .or_else(|| item.options.get("-value").cloned())
+                .unwrap_or_else(|| "1".to_string());
+            let checked =
+                !var.is_empty() && rtcl_tk_runtime::var_value(&var).is_some_and(|v| v == on);
+            entry = entry.checked(checked);
+        }
+        out.push(entry);
+    }
+    out
 }
 
 fn render_menu_bar(menu_path: &str) -> AnyElement {
@@ -307,17 +365,17 @@ fn render_children(tree: &TkTree, path: &str) -> AnyElement {
             }
             let mut row = view().flex_row().items_center().gap_2().w_full();
             for c in lefts {
-                row = row.child(render_packed(tree, c));
+                row = row.child(render_packed(tree, c, true));
             }
             if !rights.is_empty() {
                 row = row.child(view().flex_grow(1.0));
                 for c in rights {
-                    row = row.child(render_packed(tree, c));
+                    row = row.child(render_packed(tree, c, true));
                 }
             }
             container = container.child(row);
         } else {
-            container = container.child(render_packed(tree, child));
+            container = container.child(render_packed(tree, child, false));
             i += 1;
         }
     }
@@ -377,10 +435,10 @@ fn render_placed(tree: &TkTree, path: &str) -> AnyElement {
     cell.child(render_node(tree, path)).into_element()
 }
 
-fn render_packed(tree: &TkTree, path: &str) -> AnyElement {
+fn render_packed(tree: &TkTree, path: &str, in_row: bool) -> AnyElement {
     let pack = tree.get(path).and_then(|n| n.pack.clone());
     let mut cell = view();
-    if let Some(p) = pack {
+    if let Some(p) = &pack {
         if p.expand {
             cell = cell.flex_grow(1.0);
         }
@@ -401,7 +459,23 @@ fn render_packed(tree: &TkTree, path: &str) -> AnyElement {
             cell = cell.self_end();
         }
     }
-    cell.child(render_node(tree, path)).into_element()
+    let inner = cell.child(render_node(tree, path));
+    if !in_row
+        && pack
+            .as_ref()
+            .is_some_and(|p| !matches!(p.fill, Fill::X | Fill::Both))
+    {
+        // A parcel that does not fill starts at the leading edge; nsh's
+        // column default would align it to the end.
+        view()
+            .w_full()
+            .flex_row()
+            .justify_start()
+            .child(inner)
+            .into_element()
+    } else {
+        inner.into_element()
+    }
 }
 
 fn render_grid(tree: &TkTree, path: &str) -> AnyElement {

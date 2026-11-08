@@ -356,6 +356,8 @@ pub fn install(interp: &mut Interp) {
         "ttk::treeview",
         "labelframe",
         "ttk::labelframe",
+        "chart",
+        "::rtcl::chart",
     ] {
         interp.register_command(name, create_widget);
     }
@@ -517,7 +519,10 @@ fn effective_option(interp: &Interp, path: &str, name: &str) -> String {
 
 fn create_widget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let cmd = args[0].as_str();
-    let base = cmd.strip_prefix("ttk::").unwrap_or(cmd);
+    let base = cmd
+        .strip_prefix("ttk::")
+        .or_else(|| cmd.strip_prefix("::rtcl::"))
+        .unwrap_or(cmd);
     let kind = WidgetKind::from_tk_name(base).ok_or_else(|| Error::invalid_command(cmd))?;
     if args.len() < 2 {
         return Err(wrong(cmd, "pathName ?-option value ...?", args.len()));
@@ -824,7 +829,14 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     let i = listbox_index(args[2].as_str(), n)?;
                     Ok(Value::from_int(i as i64))
                 }
-                "activate" | "see" | "xview" | "yview" => Ok(Value::empty()),
+                "yview" => {
+                    let total = with_state(interp, |rt| {
+                        rt.tree.get(path).map(|n| n.items.len()).unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                    view_scroll_command(interp, path, &args[2..], total)
+                }
+                "activate" | "see" | "xview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
             WidgetKind::Scale => match sub {
@@ -1251,7 +1263,11 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     }
                     Ok(Value::empty())
                 }
-                "column" | "tag" | "see" | "xview" | "yview" => Ok(Value::empty()),
+                "yview" => {
+                    let total = treeview_visible_count(interp, path);
+                    view_scroll_command(interp, path, &args[2..], total)
+                }
+                "column" | "tag" | "see" | "xview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
             _ => bad_subcommand(kind, sub),
@@ -1969,6 +1985,7 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
             | WidgetKind::Notebook
             | WidgetKind::Labelframe => (w_opt, h_opt),
             WidgetKind::Treeview => (300, h_opt.max(1) * 22),
+            WidgetKind::Chart => (w_opt.max(1), h_opt.max(1)),
             WidgetKind::Scrollbar => {
                 if opt("-orient") == "horizontal" {
                     (100, 16)
@@ -4629,6 +4646,162 @@ fn listbox_index(spec: &str, len: usize) -> Result<usize> {
     }
 }
 
+fn format_fraction(value: f64) -> String {
+    let text = format!("{value:.4}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// The scroll fraction and visible row count of a listbox/treeview.
+fn scroll_state(interp: &Interp, path: &str) -> (f64, usize) {
+    let rows = effective_option(interp, path, "-height")
+        .parse::<usize>()
+        .unwrap_or(10)
+        .max(1);
+    let fraction = with_state(interp, |rt| rt.tree.get(path).map(|n| n.value))
+        .flatten()
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    (fraction, rows)
+}
+
+fn set_scroll_fraction(interp: &mut Interp, path: &str, fraction: f64) {
+    with_state_mut(interp, |rt| {
+        if let Some(n) = rt.tree.get_mut(path) {
+            n.value = fraction.clamp(0.0, 1.0);
+            rt.bump();
+        }
+    });
+}
+
+fn notify_yscroll(interp: &mut Interp, path: &str, total: usize) {
+    let command = effective_option(interp, path, "-yscrollcommand");
+    if command.is_empty() || total == 0 {
+        return;
+    }
+    let (fraction, rows) = scroll_state(interp, path);
+    let last = (fraction + rows as f64 / total as f64).min(1.0);
+    let script = format!(
+        "{command} {} {}",
+        format_fraction(fraction),
+        format_fraction(last)
+    );
+    if let Err(e) = eval_active(&script) {
+        record_error(e.to_string());
+    }
+}
+
+/// `yview` of a listbox/treeview: query or move the visible window.
+fn view_scroll_command(
+    interp: &mut Interp,
+    path: &str,
+    rest: &[Value],
+    total: usize,
+) -> Result<Value> {
+    let (fraction, rows) = scroll_state(interp, path);
+    let max_first = (1.0 - rows as f64 / total.max(1) as f64).max(0.0);
+    if rest.is_empty() {
+        let last = (fraction + rows as f64 / total.max(1) as f64).min(1.0);
+        return Ok(list_value([
+            format_fraction(fraction),
+            format_fraction(last),
+        ]));
+    }
+    match rest[0].as_str() {
+        "moveto" => {
+            let target = rest
+                .get(1)
+                .map(|v| parse_f64_str(v.as_str(), "fraction"))
+                .transpose()?
+                .unwrap_or(0.0);
+            set_scroll_fraction(interp, path, target.min(max_first));
+            notify_yscroll(interp, path, total);
+        }
+        "scroll" => {
+            let amount = rest.get(1).map(parse_int).transpose()?.unwrap_or(1);
+            let pages = rest.get(2).is_some_and(|v| v.as_str() == "pages");
+            let step = if pages {
+                amount as f64 * rows as f64
+            } else {
+                amount as f64
+            } / total.max(1) as f64;
+            set_scroll_fraction(interp, path, (fraction + step).min(max_first));
+            notify_yscroll(interp, path, total);
+        }
+        other => {
+            return Err(generic(format!(
+                "bad option \"{other}\": must be moveto or scroll"
+            )))
+        }
+    }
+    Ok(Value::empty())
+}
+
+fn treeview_visible_count(interp: &Interp, path: &str) -> usize {
+    with_state(interp, |rt| {
+        rt.treeviews.get(path).map(|tv| {
+            fn walk(tv: &TreeViewState, parent: Option<&str>) -> usize {
+                let mut count = 0;
+                for item in tv.items.iter().filter(|i| i.parent.as_deref() == parent) {
+                    count += 1;
+                    if item.open {
+                        count += walk(tv, Some(item.id.as_str()));
+                    }
+                }
+                count
+            }
+            walk(tv, None)
+        })
+    })
+    .flatten()
+    .unwrap_or(0)
+}
+
+/// The fraction a listbox/treeview is scrolled to.
+pub fn widget_scroll_fraction(path: &str) -> f64 {
+    let Some(ptr) = active_interp() else {
+        return 0.0;
+    };
+    with_state(unsafe { &*ptr }, |rt| rt.tree.get(path).map(|n| n.value))
+        .flatten()
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0)
+}
+
+/// A scrollbar's `(first, last)` fractions.
+pub fn scrollbar_fraction(path: &str) -> (f64, f64) {
+    let Some(ptr) = active_interp() else {
+        return (0.0, 0.1);
+    };
+    with_state(unsafe { &*ptr }, |rt| {
+        rt.tree.get(path).map(|n| {
+            let first = n.value.clamp(0.0, 1.0);
+            let last = n
+                .content
+                .parse::<f64>()
+                .unwrap_or(first + 0.1)
+                .clamp(first, 1.0);
+            (first, last)
+        })
+    })
+    .flatten()
+    .unwrap_or((0.0, 0.1))
+}
+
+/// A scrollbar arrow: run its `-command` with `scroll n units|pages`.
+pub fn scrollbar_step(path: &str, amount: i64, pages: bool) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    let command = effective_option(interp, path, "-command");
+    if command.is_empty() {
+        return;
+    }
+    let unit = if pages { "pages" } else { "units" };
+    let script = format!("{command} scroll {amount} {unit}");
+    if let Err(e) = eval_active(&script) {
+        record_error(e.to_string());
+    }
+}
+
 fn listbox_insert(interp: &mut Interp, path: &str, index: &str, items: &[Value]) -> Result<Value> {
     let len = with_state(interp, |rt| rt.tree.get(path).map(|n| n.items.len()))
         .flatten()
@@ -4643,6 +4816,11 @@ fn listbox_insert(interp: &mut Interp, path: &str, index: &str, items: &[Value])
         }
     });
     sync_listvariable(interp, path);
+    let total = with_state(interp, |rt| {
+        rt.tree.get(path).map(|n| n.items.len()).unwrap_or(0)
+    })
+    .unwrap_or(0);
+    notify_yscroll(interp, path, total);
     Ok(Value::empty())
 }
 
@@ -4695,6 +4873,11 @@ fn listbox_delete(
         }
     });
     sync_listvariable(interp, path);
+    let total = with_state(interp, |rt| {
+        rt.tree.get(path).map(|n| n.items.len()).unwrap_or(0)
+    })
+    .unwrap_or(0);
+    notify_yscroll(interp, path, total);
     Ok(Value::empty())
 }
 
@@ -5001,6 +5184,25 @@ mod tests {
         eval(&mut i, ".lb selection set 1");
         assert_eq!(eval(&mut i, ".lb curselection"), "1");
         assert_eq!(eval(&mut i, ".lb selection includes 1"), "1");
+
+        // A Tk scrollbar drives the listbox's yview and receives its
+        // -yscrollcommand fractions.
+        eval(
+            &mut i,
+            "listbox .ls -height 3 -yscrollcommand {.ss set}; \
+             scrollbar .ss -command {.ls yview}; \
+             foreach c {a b c d e f g h i j} { .ls insert end $c }",
+        );
+        assert_eq!(eval(&mut i, ".ls cget -height"), "3");
+        assert_eq!(eval(&mut i, ".ls size"), "10");
+        assert_eq!(eval(&mut i, ".ls yview"), "0 0.3");
+        assert_eq!(eval(&mut i, ".ss get"), "0 0.3");
+        scrollbar_step(".ss", 1, false);
+        let first = eval(&mut i, "lindex [.ls yview] 0");
+        assert_ne!(first, "0");
+        assert_eq!(eval(&mut i, "lindex [.ss get] 0"), first);
+        eval(&mut i, ".ls yview moveto 1");
+        assert_eq!(eval(&mut i, "lindex [.ls yview] 0"), "0.7");
 
         // -listvariable is read at creation and written after edits.
         eval(

@@ -70,7 +70,7 @@ after 80 {.later configure -text "Later fired"}
 "#;
 
 /// A classic grid/pack form, close to what a Tk tutorial app looks like.
-pub const CLASSIC: &str = r#"
+pub const CLASSIC: &str = r##"
 font create Heading -family {DejaVu Sans} -size 18 -weight bold
 label .title -text "Classic Tk Demo" -font Heading
 pack .title -padx 8 -pady 4
@@ -98,11 +98,14 @@ pack .msg -padx 8
 
 frame .listframe
 pack .listframe -fill x -padx 8
-listbox .listframe.lb -height 4
+listbox .listframe.lb -height 3
 pack .listframe.lb -side left -fill both -expand 1
 scrollbar .listframe.sb -orient vertical -command {.listframe.lb yview}
 pack .listframe.sb -side right -fill y
-foreach color {Red Green Blue} { .listframe.lb insert end $color }
+.listframe.lb configure -yscrollcommand {.listframe.sb set}
+foreach color {Red Green Blue Yellow Purple Orange Black White} {
+    .listframe.lb insert end $color
+}
 
 ttk::notebook .nb
 pack .nb -fill x -padx 8 -pady 6
@@ -137,11 +140,16 @@ ttk::labelframe .lf -text "Options"
 pack .lf -fill x -padx 8 -pady 4
 label .lf.hint -text "labelframe body"
 pack .lf.hint -padx 6 -pady 2
+label .themed -text "Themed label" -background "#ffe08a" -foreground "#7a1f1f"
+pack .themed -padx 8 -pady 4
+
+::rtcl::chart .chart -title "Sales" -values {3 7 5} -labels {A B C} -width 320 -height 140
+pack .chart -padx 8 -pady 4
 
 focus .form.nameEntry
 bind .form.nameEntry <Return> {.form.ok invoke}
 set ::message ""
-"#;
+"##;
 
 thread_local! {
     /// The engine-thread interpreter.  Created on the first render so the

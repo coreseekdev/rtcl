@@ -41,6 +41,8 @@ pub enum WidgetKind {
     Treeview,
     /// `ttk::labelframe`: a frame with a label in its border.
     Labelframe,
+    /// `::rtcl::chart`: a simple native bar chart.
+    Chart,
 }
 
 impl WidgetKind {
@@ -64,6 +66,7 @@ impl WidgetKind {
             "combobox" => Self::Combobox,
             "treeview" => Self::Treeview,
             "labelframe" => Self::Labelframe,
+            "chart" => Self::Chart,
             _ => return None,
         })
     }
@@ -89,6 +92,7 @@ impl WidgetKind {
             Self::Combobox => "TCombobox",
             Self::Treeview => "Treeview",
             Self::Labelframe => "TLabelframe",
+            Self::Chart => "Chart",
         }
     }
 
@@ -1104,6 +1108,19 @@ const LABELFRAME_OPTIONS: &[&str] = &[
     "-width",
 ];
 
+const CHART_OPTIONS: &[&str] = &[
+    "-background",
+    "-cursor",
+    "-font",
+    "-foreground",
+    "-height",
+    "-labels",
+    "-title",
+    "-type",
+    "-values",
+    "-width",
+];
+
 const TREEVIEW_OPTIONS: &[&str] = &[
     "-columns",
     "-cursor",
@@ -1160,6 +1177,7 @@ pub fn known_options(kind: WidgetKind) -> &'static [&'static str] {
         WidgetKind::Combobox => COMBOBOX_OPTIONS,
         WidgetKind::Treeview => TREEVIEW_OPTIONS,
         WidgetKind::Labelframe => LABELFRAME_OPTIONS,
+        WidgetKind::Chart => CHART_OPTIONS,
     }
 }
 
@@ -1181,6 +1199,7 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
             WidgetKind::Listbox => "20",
             WidgetKind::Scale => "100",
             WidgetKind::Combobox => "20",
+            WidgetKind::Chart => "300",
             _ => "0",
         },
         "-height" => match kind {
@@ -1188,6 +1207,7 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
             WidgetKind::Listbox => "10",
             WidgetKind::Combobox => "10",
             WidgetKind::Treeview => "10",
+            WidgetKind::Chart => "160",
             _ => "0",
         },
         "-text" | "-label" | "-textvariable" | "-variable" | "-command" => "",
@@ -1228,6 +1248,8 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
         "-validatecommand" | "-invalidcommand" | "-xscrollcommand" | "-yscrollcommand"
         | "-values" | "-postcommand" | "-style" => "",
         "-padding" => "0",
+        "-type" => "bar",
+        "-values" | "-labels" | "-title" => "",
         "-exportselection" => "1",
         "-wrap" => "char",
         "-undo" | "-maxundo" | "-spacing1" | "-spacing2" | "-spacing3" | "-tabs" => "0",

@@ -20,6 +20,17 @@ fn classic_form_round_trip() {
     app.wait_for("Red").expect("listbox renders");
     app.wait_for("OK").expect("button renders");
 
+    // Only the visible listbox slice is mounted, and the Tk scrollbar
+    // drives its yview.
+    assert!(
+        !app.shows("White"),
+        "off-screen rows are not mounted: {:?}",
+        app.screen().texts()
+    );
+    app.press("↓").expect("scroll the listbox down");
+    app.wait_for("Yellow")
+        .expect("the next row appears after scrolling");
+
     // Editing the entry writes ::name back and focuses it; Return then
     // runs the bind script, which invokes OK.
     app.type_text("text:World", "!")
@@ -69,4 +80,8 @@ fn classic_form_round_trip() {
     app.wait_for("Options").expect("labelframe label renders");
     app.wait_for("labelframe body")
         .expect("labelframe children render");
+    app.wait_for("Themed label")
+        .expect("label -background/-foreground renders");
+    app.wait_for("Sales").expect("chart title renders");
+    app.wait_for("A").expect("chart labels render");
 }

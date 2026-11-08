@@ -6,6 +6,7 @@ license.workspace = true
 description = "nsh renderer for rtcl's native Tk-compatible widget tree"
 
 [dependencies]
+rtcl-core = { workspace = true }
 rtcl-tk-core = { path = "../rtcl-tk-core" }
 rtcl-tk-runtime = { path = "../rtcl-tk-runtime" }
 nsh-core = "0.4"

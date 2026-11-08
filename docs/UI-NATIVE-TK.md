@@ -134,7 +134,7 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 | M1a ✅ | rtcl-vm `tk` 命令层：frame/label/button/entry/… 创建、configure/cget、pack/grid、destroy、winfo、wm/tk；per-widget 路径命令；teardown 自动清树；4 条单测 | `button .b -text Hi; cget .b -text` 等 Tcl 脚本语义通过 |
 | M1b ✅ | nsh 后端最小集（frame/label/button/entry）+ TkView；按钮 `-command` 执行 Tcl，按钮文本经 signal 刷新；GTK4 demo + headless 验收 | `nsh-testing`：初始 "Click me" 渲染 → press → "Clicked 1" → press → "Clicked 2"；`cargo run -p rtcl-tk-demo` 打开 GTK4 窗口 |
 | M2 ✅ | pack/grid/place、bind/event generate、after/update、`-textvariable` 双向、entry/text/listbox/scale 数据子命令、winfo/wm 扩展、ttk 别名、focus/raise/font/option；message/scrollbar/separator/progressbar；整树 dynamic 重建 | 经典 grid/pack 表单脚本通过（`classic_nsh`）；demo 双态截图；tk 单测 19 + headless 验收 2 |
-| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、列表滚动、macOS 系统菜单 ✅；主题/DPI/IME/a11y 细化待做 | 设置页/表单/列表演示（classic demo + headless 验收） |
+| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、虚拟化列表/树、Tk scrollbar 联动、主题色、macOS 系统菜单 ✅；IME/a11y 细化交给 nsh | 设置页/表单/列表演示（classic demo + headless 验收） |
 | M4 | 虚拟化 table/log/tree/chart + iOS/Android embed + 打包 | 手机/桌面同一 Tcl 脚本跑通 |
 
 ## 7. 主要风险
@@ -166,7 +166,8 @@ M1a/M1b/M2 已完成：
 **控件**：`toplevel/frame/label/button/entry/checkbutton/radiobutton/
 scale/text/listbox/message/scrollbar` + `ttk::{separator,progressbar,
 notebook,combobox,treeview,labelframe,button,label,entry,frame,checkbutton,
-radiobutton,scale,text,listbox,scrollbar,message}` 别名。
+radiobutton,scale,text,listbox,scrollbar,message}` 别名；扩展
+`::rtcl::chart`（原生柱状图，`-values/-labels/-title/-width/-height`）。
 
 **命令**：`configure/cget/cget 前缀缩写/destroy/pack/grid/place/winfo/
 wm/tk/bind/bindtags/event generate/focus/raise/lower/font/option/bell/
@@ -198,6 +199,16 @@ DPI 缩放由 nsh 平台层负责。
 **字体**：`-font` 支持命名字体（`font create`）与 Tk 描述串
 （`{DejaVu Sans} 12 bold`）；label/button/check/radio/message 应用
 family/size/bold（实际 DPI 缩放仍由 nsh 平台层负责）。
+
+**虚拟化/滚动**：listbox 与 treeview 只挂载可见行（按 `-height` 取窗口），
+`yview`/`-yscrollcommand` 与 Tk `scrollbar` 双向联动；列表/树表可滚动。
+`text` 原生输入自带滚动。table 用 treeview columns 表达，log 用高行数
+listbox 表达。
+
+**主题**：显式 `-background/-foreground`（`#rgb/#rrggbb` 与常用色名）
+应用到 label/button/frame/labelframe/message/listbox/treeview；
+`-selectbackground/-selectforeground` 控制列表选中色。未显式设置时用
+nsh 的自适应深色/浅色配色；DPI/IME/无障碍角色由 nsh 平台层提供。
 
 **Entry 校验**：`-validate key|all` + `-validatecommand`，支持 `%P/%s/
 %S/%v/%V/%W` 替换；返回 0 时拒绝编辑并回滚显示（错误则按 Tk 语义放行）。

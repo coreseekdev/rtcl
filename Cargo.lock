@@ -4295,6 +4295,7 @@ version = "0.1.0"
 dependencies = [
  "nsh-base",
  "nsh-core",
+ "rtcl-core",
  "rtcl-tk-core",
  "rtcl-tk-runtime",
 ]

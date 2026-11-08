@@ -191,6 +191,9 @@ flex 权重；place 支持绝对坐标与 `-relwidth/-relheight`，相对坐标�
 
 **窗口**：`wm title` 在桌面后端实时写入原生窗口标题
 （`nsh desktop::set_title`）；其余 `wm geometry/state` 仅记录在模型。
+`tk scaling`/`tk appname` 可读写；`winfo fpixels/pixels` 按 scaling 换算
+（i/m/c/p 单位），`winfo screenmmwidth/screenmmheight` 有值。UI 的实际
+DPI 缩放由 nsh 平台层负责。
 
 **Entry 校验**：`-validate key|all` + `-validatecommand`，支持 `%P/%s/
 %S/%v/%V/%W` 替换；返回 0 时拒绝编辑并回滚显示（错误则按 Tk 语义放行）。

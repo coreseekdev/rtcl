@@ -63,6 +63,10 @@ pub struct TkRuntime {
     open_combobox: Option<String>,
     /// `ttk::treeview` models.
     treeviews: BTreeMap<String, TreeViewState>,
+    /// `tk scaling`: pixels per point (0 means the 1.0 default).
+    scaling: f64,
+    /// `tk appname`.
+    app_name: String,
 }
 
 /// One row of a `ttk::treeview`.
@@ -2127,6 +2131,25 @@ fn place_widget(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value
     Ok(Value::empty())
 }
 
+/// Tk screen units: a number, optionally ending in `i` (inch), `m`
+/// (millimetre), `c` (centimetre) or `p` (point).
+fn parse_screen_units(value: &str, scaling: f64) -> f64 {
+    let value = value.trim();
+    let split = value
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+'))
+        .unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let number = number.parse::<f64>().unwrap_or(0.0);
+    let factor = match unit {
+        "i" => 72.0 * scaling,
+        "m" => 72.0 * scaling / 25.4,
+        "c" => 72.0 * scaling / 2.54,
+        "p" => scaling,
+        _ => 1.0,
+    };
+    number * factor
+}
+
 fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(wrong("winfo", "option ?arg ...?", args.len()));
@@ -2276,9 +2299,16 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "screen" => Ok(Value::from_str(".")),
         "screenwidth" | "vrootwidth" => Ok(Value::from_int(1920)),
         "screenheight" | "vrootheight" => Ok(Value::from_int(1080)),
-        "depth" | "fpixels" | "rpixels" | "cells" => {
-            Ok(Value::from_int(if sub == "depth" { 24 } else { 0 }))
+        "screenmmwidth" | "vrootmmwidth" => Ok(Value::from_int(508)),
+        "screenmmheight" | "vrootmmheight" => Ok(Value::from_int(286)),
+        "fpixels" | "pixels" => {
+            if args.len() != 4 {
+                return Err(wrong(&format!("winfo {sub}"), "window number", args.len()));
+            }
+            let value = parse_screen_units(args[3].as_str(), tk_scaling());
+            Ok(Value::from_int(value.round() as i64))
         }
+        "depth" | "rpixels" | "cells" => Ok(Value::from_int(if sub == "depth" { 24 } else { 0 })),
         "visual" => Ok(Value::from_str("truecolor")),
         "server" => Ok(Value::from_str("")),
         "interps" => Ok(Value::from_str("")),
@@ -2392,7 +2422,7 @@ fn set_root_option(interp: &mut Interp, path: &str, option: &str, value: &str) -
     Ok(())
 }
 
-fn tk_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+fn tk_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(wrong("tk", "option ?arg ...?", args.len()));
     }
@@ -2405,11 +2435,59 @@ fn tk_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "x11"
         })),
         "patchlevel" => Ok(Value::from_str("8.6")),
-        "appname" => Ok(Value::from_str("rtcl-tk")),
-        "scaling" => Ok(Value::from_str("1.0")),
-        "useinputmethods" | "inactive" | "caret" => Ok(Value::from_str("1")),
+        "appname" => {
+            if args.len() >= 3 {
+                with_state_mut(interp, |rt| {
+                    rt.app_name = args[2].as_str().to_string();
+                    rt.bump();
+                });
+                Ok(Value::empty())
+            } else {
+                let name = with_state(interp, |rt| {
+                    if rt.app_name.is_empty() {
+                        "rtcl-tk".to_string()
+                    } else {
+                        rt.app_name.clone()
+                    }
+                })
+                .unwrap_or_else(|| "rtcl-tk".to_string());
+                Ok(Value::from_str(&name))
+            }
+        }
+        "scaling" => {
+            if args.len() >= 3 {
+                let value = parse_f64_str(args[2].as_str(), "scaling")?;
+                if !(value > 0.0) {
+                    return Err(generic("bad scaling: must be positive"));
+                }
+                with_state_mut(interp, |rt| {
+                    rt.scaling = value;
+                    rt.bump();
+                });
+                Ok(Value::empty())
+            } else {
+                Ok(Value::from_str(&format_number(tk_scaling())))
+            }
+        }
+        "useinputmethods" => Ok(Value::from_str("1")),
+        "inactive" | "caret" => Ok(Value::from_str("1")),
         other => Err(generic(format!("bad option \"{other}\""))),
     }
+}
+
+/// `tk scaling`: pixels per point (1.0 unless a script set it).
+pub fn tk_scaling() -> f64 {
+    let Some(ptr) = active_interp() else {
+        return 1.0;
+    };
+    with_state(unsafe { &*ptr }, |rt| {
+        if rt.scaling > 0.0 {
+            rt.scaling
+        } else {
+            1.0
+        }
+    })
+    .unwrap_or(1.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -4790,6 +4868,13 @@ mod tests {
         assert_eq!(eval(&mut i, "wm title ."), "Hello");
         assert_eq!(eval(&mut i, "tk patchlevel"), "8.6");
         assert_eq!(eval(&mut i, "wm state ."), "normal");
+        assert_eq!(eval(&mut i, "tk scaling"), "1");
+        eval(&mut i, "tk scaling 2");
+        assert_eq!(eval(&mut i, "tk scaling"), "2");
+        assert_eq!(eval(&mut i, "winfo fpixels . 1i"), "144");
+        assert_eq!(eval(&mut i, "winfo fpixels . 10"), "10");
+        eval(&mut i, "tk appname MyApp");
+        assert_eq!(eval(&mut i, "tk appname"), "MyApp");
     }
 
     #[test]

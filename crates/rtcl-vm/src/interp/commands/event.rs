@@ -100,7 +100,9 @@ pub fn cmd_fileevent(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 pub fn cmd_after(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage(
-            "after", 2, args.len(),
+            "after",
+            2,
+            args.len(),
             "after option ?arg ...?",
         ));
     }
@@ -115,7 +117,10 @@ pub fn cmd_after(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // Try to parse as integer milliseconds
             let ms: u64 = sub.parse().map_err(|_| {
                 Error::runtime(
-                    format!("bad argument \"{}\": must be cancel, idle, info, or an integer", sub),
+                    format!(
+                        "bad argument \"{}\": must be cancel, idle, info, or an integer",
+                        sub
+                    ),
                     ErrorCode::Generic,
                 )
             })?;
@@ -124,9 +129,10 @@ pub fn cmd_after(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // after ms — synchronous sleep. Hosts that cannot block
                 // (browser Worker) reject it; there one must use the
                 // event-driven `after ms script` form instead.
-                interp.clock.sleep_ms(ms).map_err(|e| {
-                    Error::runtime(format!("after: {e}"), ErrorCode::Generic)
-                })?;
+                interp
+                    .clock
+                    .sleep_ms(ms)
+                    .map_err(|e| Error::runtime(format!("after: {e}"), ErrorCode::Generic))?;
                 Ok(Value::empty())
             } else {
                 // after ms script ?script ...? — schedule timed event
@@ -134,7 +140,8 @@ pub fn cmd_after(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     args[2].as_str().to_string()
                 } else {
                     // Concatenate remaining args
-                    args[2..].iter()
+                    args[2..]
+                        .iter()
                         .map(|v| v.as_str())
                         .collect::<Vec<_>>()
                         .join(" ")
@@ -149,7 +156,11 @@ pub fn cmd_after(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 fn schedule_event(interp: &mut Interp, delay_ms: u64, script: String, is_idle: bool) -> u64 {
     let id = interp.next_event_id;
     interp.next_event_id += 1;
-    let fire_at_ms = if is_idle { 0 } else { now_ms(interp) + delay_ms };
+    let fire_at_ms = if is_idle {
+        0
+    } else {
+        now_ms(interp) + delay_ms
+    };
     interp.event_queue.push(crate::interp::TimedEvent {
         id,
         fire_at_ms,
@@ -162,14 +173,17 @@ fn schedule_event(interp: &mut Interp, delay_ms: u64, script: String, is_idle: b
 fn after_idle(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::wrong_args_with_usage(
-            "after", 3, args.len(),
+            "after",
+            3,
+            args.len(),
             "after idle script ?script ...?",
         ));
     }
     let script = if args.len() == 3 {
         args[2].as_str().to_string()
     } else {
-        args[2..].iter()
+        args[2..]
+            .iter()
             .map(|v| v.as_str())
             .collect::<Vec<_>>()
             .join(" ")
@@ -181,7 +195,9 @@ fn after_idle(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 fn after_cancel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::wrong_args_with_usage(
-            "after", 3, args.len(),
+            "after",
+            3,
+            args.len(),
             "after cancel id|command",
         ));
     }
@@ -199,7 +215,8 @@ fn after_cancel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let script = if args.len() == 3 {
         target.to_string()
     } else {
-        args[2..].iter()
+        args[2..]
+            .iter()
             .map(|v| v.as_str())
             .collect::<Vec<_>>()
             .join(" ")
@@ -211,14 +228,18 @@ fn after_cancel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 fn after_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() > 3 {
         return Err(Error::wrong_args_with_usage(
-            "after", 2, args.len(),
+            "after",
+            2,
+            args.len(),
             "after info ?id?",
         ));
     }
 
     if args.len() == 2 {
         // List all pending event IDs
-        let ids: Vec<String> = interp.event_queue.iter()
+        let ids: Vec<String> = interp
+            .event_queue
+            .iter()
             .map(|ev| format!("after#{}", ev.id))
             .collect();
         return Ok(Value::from_str(&ids.join(" ")));
@@ -226,19 +247,26 @@ fn after_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // Query specific event
     let target = args[2].as_str();
-    let id = target.strip_prefix("after#")
+    let id = target
+        .strip_prefix("after#")
         .and_then(|s| s.parse::<u64>().ok())
-        .ok_or_else(|| Error::runtime(
-            format!("event \"{}\" doesn't exist", target),
-            ErrorCode::NotFound,
-        ))?;
+        .ok_or_else(|| {
+            Error::runtime(
+                format!("event \"{}\" doesn't exist", target),
+                ErrorCode::NotFound,
+            )
+        })?;
 
-    let ev = interp.event_queue.iter()
+    let ev = interp
+        .event_queue
+        .iter()
         .find(|ev| ev.id == id)
-        .ok_or_else(|| Error::runtime(
-            format!("event \"{}\" doesn't exist", target),
-            ErrorCode::NotFound,
-        ))?;
+        .ok_or_else(|| {
+            Error::runtime(
+                format!("event \"{}\" doesn't exist", target),
+                ErrorCode::NotFound,
+            )
+        })?;
 
     let kind = if ev.is_idle { "idle" } else { "timer" };
     Ok(Value::from_str(&format!("{} {}", ev.script, kind)))
@@ -253,7 +281,9 @@ fn after_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 pub fn cmd_vwait(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         return Err(Error::wrong_args_with_usage(
-            "vwait", 2, args.len(),
+            "vwait",
+            2,
+            args.len(),
             "vwait varName",
         ));
     }
@@ -277,12 +307,17 @@ pub fn cmd_vwait(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if interp.event_queue.is_empty() {
                 // No events pending at all — variable can only change if we break out
                 return Err(Error::runtime(
-                    format!("can't wait for variable \"{}\": would wait forever", varname),
+                    format!(
+                        "can't wait for variable \"{}\": would wait forever",
+                        varname
+                    ),
                     ErrorCode::Generic,
                 ));
             }
             // Sleep until the next timed event
-            let next_fire = interp.event_queue.iter()
+            let next_fire = interp
+                .event_queue
+                .iter()
                 .filter(|ev| !ev.is_idle)
                 .map(|ev| ev.fire_at_ms)
                 .min();
@@ -292,9 +327,10 @@ pub fn cmd_vwait(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     // Blocking wait. Hosts that cannot sleep (browser
                     // Worker) reject this — waiting on external events
                     // there must be event-driven, not `vwait`-driven.
-                    interp.clock.sleep_ms(fire_at - now).map_err(|e| {
-                        Error::runtime(format!("vwait: {e}"), ErrorCode::Generic)
-                    })?;
+                    interp
+                        .clock
+                        .sleep_ms(fire_at - now)
+                        .map_err(|e| Error::runtime(format!("vwait: {e}"), ErrorCode::Generic))?;
                 }
             } else {
                 // Only idle events — process them
@@ -316,7 +352,10 @@ pub fn cmd_update(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     interp.reap_background_children();
     if args.len() > 2 {
         return Err(Error::wrong_args_with_usage(
-            "update", 1, args.len(), "?idletasks?",
+            "update",
+            1,
+            args.len(),
+            "?idletasks?",
         ));
     }
     let idle_only = if args.len() >= 2 {
@@ -365,18 +404,42 @@ impl Interp {
     /// 返回，供宿主（wasm 桥）把 UI 回调错误呈现到 shell。
     /// 返回错误消息列表（空 = 全部成功）。
     pub fn pump_events(&mut self) -> Vec<String> {
+        self.pump_events_counted().1
+    }
+
+    /// Like [`Interp::pump_events`], also returning how many events fired.
+    /// UI hosts use the count to re-render only when a timer or idle script
+    /// actually ran.
+    pub fn pump_events_counted(&mut self) -> (usize, Vec<String>) {
         let mut errors = Vec::new();
+        let mut fired = 0;
         loop {
             match process_events(self, false, Some(&mut errors)) {
                 Ok(0) => break,
-                Ok(_) => {}
+                Ok(n) => fired += n,
                 Err(e) => {
                     errors.push(e.to_string());
                     break;
                 }
             }
         }
-        errors
+        (fired, errors)
+    }
+
+    /// Whether any `after` timer or idle callback is still queued.
+    pub fn has_scheduled_events(&self) -> bool {
+        !self.event_queue.is_empty()
+    }
+
+    /// Milliseconds until the earliest timed event (0 when one is ready
+    /// now), or `None` when only idle events (or none) are queued.
+    pub fn next_event_delay_ms(&self) -> Option<u64> {
+        let now = now_ms(self);
+        self.event_queue
+            .iter()
+            .filter(|ev| !ev.is_idle)
+            .map(|ev| ev.fire_at_ms.saturating_sub(now))
+            .min()
     }
 }
 
@@ -387,7 +450,11 @@ impl Interp {
 /// If `idle_only` is true, only idle events are processed.
 /// Script errors are ignored (like jimtcl's bgerror handling) unless
 /// `errors` is provided, in which case messages are collected there.
-fn process_events(interp: &mut Interp, idle_only: bool, mut errors: Option<&mut Vec<String>>) -> Result<usize> {
+fn process_events(
+    interp: &mut Interp,
+    idle_only: bool,
+    mut errors: Option<&mut Vec<String>>,
+) -> Result<usize> {
     let now = now_ms(interp);
     let mut fired = 0;
 
@@ -453,7 +520,9 @@ mod tests {
     fn test_after_cancel_by_id() {
         let mut interp = Interp::new();
         let id = interp.eval("after 100000 {set x 1}").unwrap();
-        interp.eval(&format!("after cancel {}", id.as_str())).unwrap();
+        interp
+            .eval(&format!("after cancel {}", id.as_str()))
+            .unwrap();
         let info = interp.eval("after info").unwrap();
         assert_eq!(info.as_str(), "");
     }

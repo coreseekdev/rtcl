@@ -4278,6 +4278,7 @@ version = "0.1.0"
 name = "rtcl-tk-demo"
 version = "0.1.0"
 dependencies = [
+ "gtk4",
  "nsh-base",
  "nsh-core",
  "nsh-engine",

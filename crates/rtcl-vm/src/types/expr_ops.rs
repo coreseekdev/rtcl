@@ -18,7 +18,8 @@ use super::expr_funcs;
 
 /// Convert `Value` to i64, returning an error if not numeric.
 pub(crate) fn as_int_val(v: &Value) -> Result<i64> {
-    v.as_int().or_else(|| v.as_float().map(|f| f as i64))
+    v.as_int()
+        .or_else(|| v.as_float().map(|f| f as i64))
         .ok_or_else(|| Error::type_mismatch("integer", v.as_str()))
 }
 
@@ -41,8 +42,8 @@ fn pair_operand_error(left: &Value, right: &Value, op: &str) -> Error {
 }
 
 pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Value> {
-    use num_bigint::BigInt;
     use super::bignum::{floor_div as big_div, int_rep, to_value};
+    use num_bigint::BigInt;
     // Immediate×immediate: untag, checked arithmetic, retag — no rep
     // parsing, no box, no refcount.  Overflow/div-edge falls into the
     // exact same widening arms the general path uses (i63 bounds keep
@@ -57,7 +58,12 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
                 '-' => to_value(IntRep::Big(ba - bb)),
                 '*' => to_value(IntRep::Big(ba * bb)),
                 '/' => to_value(IntRep::Big(big_div(&ba, &bb))),
-                _ => return Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
+                _ => {
+                    return Err(Error::runtime(
+                        "unknown op",
+                        crate::error::ErrorCode::InvalidOp,
+                    ))
+                }
             })
         };
         // The immediate tag only holds i63: a checked-i64 success can
@@ -86,7 +92,10 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
                 }
                 Ok(Value::from_imm(super::expr::floor_div(a, b)))
             }
-            _ => Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
+            _ => Err(Error::runtime(
+                "unknown op",
+                crate::error::ErrorCode::InvalidOp,
+            )),
         };
     }
     if let (Some(ia), Some(ib)) = (int_rep(left), int_rep(right)) {
@@ -120,7 +129,10 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
                     }
                     Ok(Value::from_int(super::expr::floor_div(*a, *b)))
                 }
-                _ => Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
+                _ => Err(Error::runtime(
+                    "unknown op",
+                    crate::error::ErrorCode::InvalidOp,
+                )),
             };
         }
         // At least one bignum operand: exact BigInt arithmetic.
@@ -135,7 +147,10 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
                 }
                 Ok(to_value(IntRep::Big(big_div(&ba, &bb))))
             }
-            _ => Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
+            _ => Err(Error::runtime(
+                "unknown op",
+                crate::error::ErrorCode::InvalidOp,
+            )),
         };
     }
     // NaN operands can't take part in arithmetic (`"nan" + 0` →
@@ -145,9 +160,7 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
     // string operand as a float before the int parse could even run
     // (double parse per `+` on bracket results — several percent of the
     // fib profile).
-    if left.as_float().is_some_and(|f| f.is_nan())
-        || right.as_float().is_some_and(|f| f.is_nan())
-    {
+    if left.as_float().is_some_and(|f| f.is_nan()) || right.as_float().is_some_and(|f| f.is_nan()) {
         return Err(Error::Msg(format!(
             "can't use non-numeric floating-point value as operand of \"{op}\""
         )));
@@ -168,7 +181,12 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
                     }
                     a / b
                 }
-                _ => return Err(Error::runtime("unknown op", crate::error::ErrorCode::InvalidOp)),
+                _ => {
+                    return Err(Error::runtime(
+                        "unknown op",
+                        crate::error::ErrorCode::InvalidOp,
+                    ))
+                }
             };
             Ok(expr_funcs::float_value(result))
         }
@@ -198,7 +216,9 @@ pub(crate) fn int_mod(left: &Value, right: &Value) -> Result<Value> {
     // non-numeric string as operand of "%").
     let a = int_operand(left, "%")?;
     let b = int_operand(right, "%")?;
-    if b == 0 { return Err(Error::DivisionByZero); }
+    if b == 0 {
+        return Err(Error::DivisionByZero);
+    }
     Ok(Value::from_int(if a == i64::MIN && b == -1 {
         0
     } else {
@@ -208,8 +228,8 @@ pub(crate) fn int_mod(left: &Value, right: &Value) -> Result<Value> {
 
 /// One `<<`/`>>` operation with Tcl's bignum-widening semantics.
 pub(crate) fn int_shift(left: &Value, right: &Value, shl: bool) -> Result<Value> {
-    use num_traits::Signed;
     use super::bignum::{int_rep, to_value};
+    use num_traits::Signed;
     let op = if shl { "<<" } else { ">>" };
     // tclsh shift operands must be integers: a float operand errors
     // with the operator named, separately from other non-numeric
@@ -261,28 +281,34 @@ pub(crate) fn int_shift(left: &Value, right: &Value, shl: bool) -> Result<Value>
             Ok(to_value(IntRep::Big(shifted)))
         }
         Some(IntRep::I64(a)) if shl => {
-            let wide = ((a as u64) << (count as u32)) as i64;
-            if count < 64 && (wide >> count) == a {
-                Ok(Value::from_int(wide))
+            if count < 64 {
+                let wide = ((a as u64) << (count as u32)) as i64;
+                if (wide >> count) == a {
+                    return Ok(Value::from_int(wide));
+                }
+            }
+            // Overflow (or a shift past the word): widen to an exact
+            // bignum (1 << 63 is 9223372036854775808, not i64::MIN).
+            Ok(to_value(IntRep::Big(
+                num_bigint::BigInt::from(a) << (count as usize),
+            )))
+        }
+        Some(IntRep::I64(a)) => {
+            if count >= 64 {
+                // An arithmetic shift past the word sign-extends: 0 for
+                // non-negative values, -1 for negative ones.
+                Ok(Value::from_int(if a < 0 { -1 } else { 0 }))
             } else {
-                // Overflow: widen to an exact bignum (1 << 63 is
-                // 9223372036854775808, not i64::MIN).
-                Ok(to_value(IntRep::Big(
-                    num_bigint::BigInt::from(a) << (count as usize),
-                )))
+                Ok(Value::from_int(a >> (count as u32)))
             }
         }
-        Some(IntRep::I64(a)) => Ok(Value::from_int(a >> (count as u32))),
         None => Err(pair_operand_error(left, right, op)),
     }
 }
 
 /// `&`, `|`, `^` — exact on bignum operands, error (not wrap) on floats.
 pub(crate) fn int_bitop(left: &Value, right: &Value, op: char) -> Result<Value> {
-    if let (Some(ia), Some(ib)) = (
-        super::bignum::int_rep(left),
-        super::bignum::int_rep(right),
-    ) {
+    if let (Some(ia), Some(ib)) = (super::bignum::int_rep(left), super::bignum::int_rep(right)) {
         // i64×i64 never overflows a bitwise op — no bignum conversion on
         // the common path (this used to widen BOTH operands on every
         // `&`/`|`/`^`).
@@ -294,13 +320,11 @@ pub(crate) fn int_bitop(left: &Value, right: &Value, op: char) -> Result<Value> 
             }));
         }
         let (a, b) = (ia.to_big(), ib.to_big());
-        return Ok(super::bignum::to_value(IntRep::Big(
-            match op {
-                '|' => a | b,
-                '^' => a ^ b,
-                _ => a & b,
-            },
-        )));
+        return Ok(super::bignum::to_value(IntRep::Big(match op {
+            '|' => a | b,
+            '^' => a ^ b,
+            _ => a & b,
+        })));
     }
     // Non-int operands: tclsh rejects floats and other non-numeric
     // strings with the operator in the message.
@@ -437,12 +461,9 @@ pub(crate) fn op_pow(base: Value, exp: Value) -> Result<Value> {
                 Some(r) => Ok(Value::from_int(r)),
                 // Overflow widens to an exact bignum (expr-23.48:
                 // 2**81 is 2417851639229258349412352).
-                None => Ok(bignum::to_value(
-                    bignum::IntRep::Big(
-                        num_bigint::BigInt::from(a)
-                            .pow(b as u32),
-                    ),
-                )),
+                None => Ok(bignum::to_value(bignum::IntRep::Big(
+                    num_bigint::BigInt::from(a).pow(b as u32),
+                ))),
             },
         };
     }
@@ -488,9 +509,7 @@ pub(crate) fn op_neg(val: &Value) -> Result<Value> {
                     num_bigint::BigInt::from(2i8).pow(63u32),
                 )),
             },
-            big => bignum::to_value(bignum::IntRep::Big(
-                -big.to_big(),
-            )),
+            big => bignum::to_value(bignum::IntRep::Big(-big.to_big())),
         });
     }
     match val.as_float() {

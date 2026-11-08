@@ -16,14 +16,14 @@ type WtPoolEntry = (
 );
 
 use crate::abi::{self, code};
-use crate::classic::PoolKey;
 use crate::classic::wasmi::code_epoch_key;
-use crate::fast::shared::{
-    sh_binary_op, sh_bool_test, sh_call_dispatch, sh_fail, sh_get_var,
-    sh_incr_var, sh_proc_exit_frame, sh_rc_to_i64, sh_set_var, sh_sync_var,
-};
+use crate::classic::PoolKey;
 use crate::emit;
 use crate::exec::Host;
+use crate::fast::shared::{
+    sh_binary_op, sh_bool_test, sh_call_dispatch, sh_fail, sh_get_var, sh_incr_var,
+    sh_proc_exit_frame, sh_rc_to_i64, sh_set_var, sh_sync_var,
+};
 use crate::pass::EmitConfig;
 use rtcl_core::value::Value;
 use rtcl_core::{Error, Interp};
@@ -33,10 +33,11 @@ use std::rc::Rc;
 use wasmi::Caller;
 
 thread_local! {
-    /// Cranelift Module 缓存（key 三元组同 wasmi 池）。
+    /// Cranelift Module 缓存（key 同 wasmi 池：interp / body / epoch /
+    /// serial）。
     #[cfg(feature = "jit-native")]
     static WT_MODULES: std::cell::RefCell<
-        std::collections::HashMap<(usize, usize, u64), wasmtime::Module>,
+        std::collections::HashMap<PoolKey, wasmtime::Module>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
     /// wasmtime Store+Instance+globals 池（key 三元组；上限 64）。globals
     /// 句柄随池条目保存——池命中必须**完整重置**（fuel=0 / epoch=本代 /
@@ -82,11 +83,15 @@ pub(crate) fn execute_proc_wasmtime_pooled(
     );
     let pooled = WT_POOL.with(|p| {
         let mut p = p.borrow_mut();
-        p.iter().position(|(k, ..)| *k == pool_key).map(|pos| p.remove(pos))
+        p.iter()
+            .position(|(k, ..)| *k == pool_key)
+            .map(|pos| p.remove(pos))
     })?;
     let (_, mut store, instance, globals, run) = pooled;
     pool_reset_wt(&mut store);
-    Some(run_and_decode_wt(interp, bc, store, instance, globals, run, pool_key))
+    Some(run_and_decode_wt(
+        interp, bc, store, instance, globals, run, pool_key,
+    ))
 }
 
 /// 池命中重置（wasmtime；wasm 序言承担 cache 清零 + caching=1）。
@@ -107,8 +112,6 @@ fn run_and_decode_wt(
     run: wasmtime::TypedFunc<(), i32>,
     pool_key: PoolKey,
 ) -> rtcl_core::Result<Value> {
-
-
     let watermark = store.data().arena_len();
 
     rtcl_vm::interp::set_jit_call_in_flight(true);
@@ -135,12 +138,13 @@ fn run_and_decode_wt(
         code::CONTINUE => Err(Error::cont()),
         // ④ 中途 bump 重分派（wasmi proc 路径同款）。
         code::STALE => {
-            let r = stale_site
-                .and_then(|site| interp.jit_redispatch_after(bc, site));
+            let r = stale_site.and_then(|site| interp.jit_redispatch_after(bc, site));
             match r {
                 Some((true, res)) => res,
                 Some((false, _)) => Ok(result.take().unwrap_or_else(Value::empty)),
-                None => Err(Error::Msg("jit proc wt: stale epoch at non-boundary".into())),
+                None => Err(Error::Msg(
+                    "jit proc wt: stale epoch at non-boundary".into(),
+                )),
             }
         }
         code::EXIT => Err(Error::exit(Some(pending_exit.unwrap_or(0)))),
@@ -167,12 +171,7 @@ pub(crate) fn execute_proc_wasmtime(
         code_epoch_key(bc),
         bc.serial,
     );
-    let mut host = Host::new(
-        interp as *mut Interp,
-        crate::exec::arena_of(bc),
-        bc,
-        module,
-    );
+    let mut host = Host::new(interp as *mut Interp, crate::exec::arena_of(bc), bc, module);
     host.proc_ctx = true;
     let wmodule = WT_MODULES.with(|m| {
         let mut m = m.borrow_mut();
@@ -180,8 +179,7 @@ pub(crate) fn execute_proc_wasmtime(
             return w.clone();
         }
         let engine = store_engine();
-        let w = wasmtime::Module::new(&engine, &module.bytes[..])
-            .expect("jit proc wt: module");
+        let w = wasmtime::Module::new(&engine, &module.bytes[..]).expect("jit proc wt: module");
         if m.len() >= 64 {
             m.clear();
         }
@@ -216,7 +214,6 @@ fn register_wasmtime_proc(
 ) {
     crate::exec_wasmtime::register_wasmtime_abi(store, epoch0, wmodule)
 }
-
 
 // ── fast-tier 驱动：共享 Store + funcref 表 + call_indirect 直呼 ──────────
 //

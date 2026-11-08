@@ -359,14 +359,31 @@ struct VPtr(NonNull<ValueInner>);
 /// boxes ≈ 0.6MB of hot ValueInner memory.
 const FREELIST_CAP: usize = 8192;
 
+struct FreeList(std::cell::RefCell<Vec<NonNull<ValueInner>>>);
+
+impl Drop for FreeList {
+    /// Thread exit: the recycled boxes are bare allocations (their payloads
+    /// were already dropped on recycle).  Returning them to the allocator
+    /// avoids leaking up to FREELIST_CAP boxes per thread.
+    fn drop(&mut self) {
+        for p in self.0.borrow_mut().drain(..) {
+            unsafe {
+                std::alloc::dealloc(
+                    p.as_ptr().cast::<u8>(),
+                    std::alloc::Layout::new::<ValueInner>(),
+                );
+            }
+        }
+    }
+}
+
 thread_local! {
-    static FREELIST: std::cell::RefCell<Vec<NonNull<ValueInner>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static FREELIST: FreeList = const { FreeList(std::cell::RefCell::new(Vec::new())) };
 }
 
 impl VPtr {
     fn new(inner: ValueInner) -> VPtr {
-        let recycled = FREELIST.try_with(|fl| fl.borrow_mut().pop());
+        let recycled = FREELIST.try_with(|fl| fl.0.borrow_mut().pop());
         match recycled {
             Ok(Some(ptr)) => {
                 // The box's payload was dropped when it was recycled; the
@@ -402,7 +419,7 @@ impl Drop for VPtr {
             // vecs), then recycle the box itself.
             std::ptr::drop_in_place(p);
             let pushed = FREELIST.try_with(|fl| {
-                let mut fl = fl.borrow_mut();
+                let mut fl = fl.0.borrow_mut();
                 if fl.len() < FREELIST_CAP {
                     fl.push(self.0);
                     true
@@ -603,7 +620,7 @@ impl Value {
             let p = bits as *mut ValueInner;
             std::ptr::drop_in_place(p);
             let pushed = FREELIST.try_with(|fl| {
-                let mut fl = fl.borrow_mut();
+                let mut fl = fl.0.borrow_mut();
                 if fl.len() < FREELIST_CAP {
                     fl.push(NonNull::new_unchecked(p));
                     true

@@ -1303,6 +1303,28 @@ impl Interp {
         );
     }
 
+    /// Drop a dead proc's compiled unit from the literal/call-site pool and
+    /// clear any CmdSite token that still points at its `ProcDef`.  Called
+    /// on redefinition/deletion so old bodies/bytecode are not pinned until
+    /// the 2048-entry pool clear.
+    pub(crate) fn purge_proc_artifacts(&mut self, def: &Rc<ProcDef>) {
+        if let Some(code) = &def.compiled {
+            self.const_pool.remove(&(Rc::as_ptr(code) as usize));
+        }
+        for entry in self.const_pool.values() {
+            let mut sites = entry.sites.borrow_mut();
+            for (_, site) in sites.iter_mut() {
+                if site
+                    .def
+                    .as_ref()
+                    .is_some_and(|d| Rc::ptr_eq(d, def))
+                {
+                    site.def = None;
+                }
+            }
+        }
+    }
+
     /// Pool probe for a unit being executed (one hash per `exec_bytecode`
     /// call, amortised over every PushConst and call-site token it uses):
     /// the literal slice plus the call-site token table.

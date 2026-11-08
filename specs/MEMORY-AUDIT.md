@@ -56,14 +56,14 @@
     Interp drop 时仍在运行的子进程不 kill（与 Tcl 一致，由 OS 接管）。
   - **[开放] `references` 只增不减**：`ref` 每个值插强引用表，
     `collect` 是 no-op；脚本可无界持有 Value，直到 Interp drop。
-  - **[开放] `const_pool` 的 CmdSite 持有旧 `Rc<ProcDef>`**：仅 2048
-    条整表 clear 或解释器析构才释放；proc 重定义/删除后旧编译体
-    晚释放（有界但非即时）。
+  - **[已修] `const_pool` 旧 `ProcDef`/ByteCode 钉住**：proc 重定义、
+    rename 删除、namespace delete/import 覆盖、local proc 出栈时，
+    删对应 const_pool 条目并清 CmdSite 的 `def` 强引用。
   - **[开放] `namespace delete` 未清 exec traces**：命令 trace 表按
     删除/fire 处理，但 `exec_traces` 在命名空间整删路径没有对应
     wipe/rekey。
-  - **[开放] 线程级 FREELIST 在 thread 退出时不归还**：上限 8192 个
-    ValueInner；进程内线程结束即随 TLS 丢失（小而有界）。
+  - **[已修] 线程级 FREELIST 退出泄漏**：TLS 改为带 Drop 的 FreeList，
+    线程结束时把回收盒真正 dealloc（上限 8192，约 0.6MB/线程）。
   - **[开放] `encoding` 全局缓存跨 Interp 无清理**：只有
     `encoding dirs` 会清；多 Interp/多编码场景可增长。
   - **[开放] CLI `process::exit` 绕过析构**：`exit`/顶层错误直接
@@ -124,6 +124,15 @@
     也会缓存负项，此前脚本可控无界）。
 11. **CLI exit 前 drop(interp)**：`exit`/顶层错误不再让
     `std::process::exit` 绕过 ChannelTable Drop 与 JIT teardown。
+
+## 第三轮修复
+
+12. **const_pool 即时清理**：新增 `purge_proc_artifacts(def)`；在
+    proc redefine、rename→空、namespace delete/import 覆盖、local
+    proc 出栈处删除旧编译单元的 pool 条目，并清所有 CmdSite 中指向
+    旧 `ProcDef` 的 `def` 引用。
+13. **FREELIST TLS destructor**：回收盒在线程退出时 dealloc，不再把
+    最多 8192 个 `ValueInner` 盒子留给进程生命周期。
 
 ## 本轮修复与验证
 

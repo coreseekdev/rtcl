@@ -553,6 +553,10 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             .cloned()
             .collect();
         dead_procs.sort();
+        let dead_defs: Vec<crate::interp::Rc<crate::interp::ProcDef>> = dead_procs
+            .iter()
+            .filter_map(|k| interp.procs.get(k).cloned())
+            .collect();
         if inside {
             interp.procs.retain(|k, _| k != &qualified && !k.starts_with(&prefix));
         }
@@ -575,6 +579,9 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         interp
             .cmd_traces
             .retain(|k, _| k != &qualified && !k.starts_with(&prefix));
+        for def in &dead_defs {
+            interp.purge_proc_artifacts(def);
+        }
 
         // Remove namespace-scoped global variables (flat keys, no leading
         // ::), except the ones a live variable link keeps alive.
@@ -1020,7 +1027,9 @@ fn ns_import(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         for key in removes {
             super::super::vm_exec::note_tier1_mutation(interp, &key);
-            interp.procs.remove(&key);
+            if let Some(def) = interp.procs.remove(&key) {
+                interp.purge_proc_artifacts(&def);
+            }
             interp.ensembles.remove(&key);
             move_alias_origins(interp, &key, "");
         }

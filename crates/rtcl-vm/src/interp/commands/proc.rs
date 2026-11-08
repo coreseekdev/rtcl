@@ -152,6 +152,9 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         || interp.import_aliases.contains_key(&name)
     {
         interp.wipe_cmd_exec_traces(&name);
+        if let Some(old) = interp.procs.get(&name).cloned() {
+            interp.purge_proc_artifacts(&old);
+        }
     }
     // A proc named like an inline-folded Tier1 command (`proc set {...}`)
     // invalidates every compiled body that folded that command.
@@ -1051,6 +1054,8 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if let Some(proc_def) = interp.procs.remove(&old_key) {
         if !new_key.is_empty() {
             interp.procs.insert(new_key.clone(), proc_def);
+        } else {
+            interp.purge_proc_artifacts(&proc_def);
         }
         move_alias_origins(interp, &old_key, &new_key);
         finish_cmd_rename(interp, &old_key, &new_key, &old_name, &new_name);

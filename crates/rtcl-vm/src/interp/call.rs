@@ -675,7 +675,9 @@ impl Interp {
             let procs_to_delete: Vec<String> = frame.local_procs.clone();
             for name in &procs_to_delete {
                 super::vm_exec::note_tier1_mutation(self, name);
-                self.procs.remove(name);
+                if let Some(def) = self.procs.remove(name) {
+                    self.purge_proc_artifacts(&def);
+                }
                 self.commands.remove(name);
                 self.aliases.remove(name);
             }
@@ -1320,7 +1322,9 @@ impl Interp {
             if !procs_to_delete.is_empty() {
                 for pname in &procs_to_delete {
                     super::vm_exec::note_tier1_mutation(self, pname);
-                    self.procs.remove(pname);
+                    if let Some(def) = self.procs.remove(pname) {
+                        self.purge_proc_artifacts(&def);
+                    }
                     self.commands.remove(pname);
                     self.aliases.remove(pname);
                 }

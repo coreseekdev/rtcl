@@ -51,6 +51,27 @@ pub struct TkRuntime {
     fonts: BTreeMap<String, BTreeMap<String, String>>,
     /// `option add` database entries, in insertion order.
     option_db: Vec<(String, String)>,
+    /// `menu` windows, which are not part of the packed widget tree.
+    menus: BTreeMap<String, Menu>,
+    /// The open cascade menu (`None` when no menu is dropped down).
+    open_menu: Option<String>,
+}
+
+/// One entry of a Tk `menu`.
+#[derive(Debug, Clone, Default)]
+pub struct MenuItem {
+    /// `command`, `separator`, `checkbutton`, `radiobutton`, `cascade`.
+    pub kind: String,
+    /// Entry options (`-label`, `-command`, `-variable`, ...).
+    pub options: BTreeMap<String, String>,
+}
+
+/// A Tk `menu` window.
+#[derive(Debug, Clone, Default)]
+pub struct Menu {
+    pub path: String,
+    pub items: Vec<MenuItem>,
+    pub options: BTreeMap<String, String>,
 }
 
 impl TkRuntime {
@@ -319,6 +340,7 @@ pub fn install(interp: &mut Interp) {
         "bell",
         "tk_focusNext",
         "tk_focusPrev",
+        "menu",
     ] {
         interp.register_command(name, global_command);
     }
@@ -1060,6 +1082,18 @@ fn configure_impl(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Val
 }
 
 fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
+    let is_menu = with_state(interp, |rt| rt.menus.contains_key(path)).unwrap_or(false);
+    if is_menu {
+        with_state_mut(interp, |rt| {
+            rt.menus.remove(path);
+            if rt.open_menu.as_deref() == Some(path) {
+                rt.open_menu = None;
+            }
+            rt.bump();
+        });
+        let _ = interp.delete_command(path);
+        return Ok(Value::empty());
+    }
     let mut removed = Vec::new();
     fn collect(tree: &TkTree, path: &str, out: &mut Vec<String>) {
         if let Some(n) = tree.get(path) {
@@ -1664,8 +1698,12 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() != 3 {
                 return Err(wrong("winfo exists", "window", args.len()));
             }
+            let path = args[2].as_str();
             Ok(Value::from_bool(
-                with_state(interp, |rt| rt.tree.contains(args[2].as_str())).unwrap_or(false),
+                with_state(interp, |rt| {
+                    rt.tree.contains(path) || rt.menus.contains_key(path)
+                })
+                .unwrap_or(false),
             ))
         }
         "class" => {
@@ -1673,9 +1711,14 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(wrong("winfo class", "window", args.len()));
             }
             let path = args[2].as_str();
-            let class = with_state(interp, |rt| rt.tree.get(path).map(|n| n.kind.class_name()))
-                .flatten()
-                .ok_or_else(|| bad_window(path))?;
+            let class = with_state(interp, |rt| {
+                rt.tree
+                    .get(path)
+                    .map(|n| n.kind.class_name())
+                    .or_else(|| rt.menus.contains_key(path).then_some("Menu"))
+            })
+            .flatten()
+            .ok_or_else(|| bad_window(path))?;
             Ok(Value::from_str(class))
         }
         "parent" | "toplevel" | "pathname" | "name" => {
@@ -1683,8 +1726,20 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(wrong(&format!("winfo {sub}"), "window", args.len()));
             }
             let path = args[2].as_str();
-            if !with_state(interp, |rt| rt.tree.contains(path)).unwrap_or(false) {
+            let known = with_state(interp, |rt| {
+                rt.tree.contains(path) || rt.menus.contains_key(path)
+            })
+            .unwrap_or(false);
+            if !known {
                 return Err(bad_window(path));
+            }
+            if with_state(interp, |rt| rt.menus.contains_key(path)).unwrap_or(false) {
+                let value = match sub {
+                    "parent" | "toplevel" => ".".to_string(),
+                    "name" => path.rsplit('.').next().unwrap_or("").to_string(),
+                    _ => path.to_string(),
+                };
+                return Ok(Value::from_str(&value));
             }
             let value = match sub {
                 "parent" => with_state(interp, |rt| {
@@ -1714,8 +1769,15 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(wrong(&format!("winfo {sub}"), "window", args.len()));
             }
             let path = args[2].as_str();
-            if !with_state(interp, |rt| rt.tree.contains(path)).unwrap_or(false) {
+            let known = with_state(interp, |rt| {
+                rt.tree.contains(path) || rt.menus.contains_key(path)
+            })
+            .unwrap_or(false);
+            if !known {
                 return Err(bad_window(path));
+            }
+            if with_state(interp, |rt| rt.menus.contains_key(path)).unwrap_or(false) {
+                return Ok(Value::from_int(0));
             }
             let (w, h) = requested_size(interp, path);
             Ok(Value::from_int(if sub.contains("width") { w } else { h }))
@@ -1726,9 +1788,10 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let path = args[2].as_str();
             let mapped = with_state(interp, |rt| {
-                rt.tree.get(path).is_some_and(|n| {
-                    n.pack.is_some() || n.grid.is_some() || n.place.is_some() || path == "."
-                })
+                rt.menus.contains_key(path)
+                    || rt.tree.get(path).is_some_and(|n| {
+                        n.pack.is_some() || n.grid.is_some() || n.place.is_some() || path == "."
+                    })
             })
             .unwrap_or(false);
             Ok(Value::from_bool(mapped))
@@ -1739,6 +1802,9 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let path = args[2].as_str();
             let manager = with_state(interp, |rt| {
+                if rt.menus.contains_key(path) {
+                    return Some("");
+                }
                 rt.tree.get(path).map(|n| {
                     if n.pack.is_some() {
                         "pack"
@@ -2471,6 +2537,414 @@ fn option_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "readfile" => Ok(Value::empty()),
         other => Err(generic(format!("bad option \"{other}\""))),
     }
+}
+
+fn parse_menu_entry(kind: &str, rest: &[Value]) -> Result<MenuItem> {
+    if !matches!(
+        kind,
+        "command" | "separator" | "checkbutton" | "radiobutton" | "cascade"
+    ) {
+        return Err(generic(format!(
+            "bad menu entry type \"{kind}\": must be cascade, checkbutton, command, radiobutton, or separator"
+        )));
+    }
+    let mut options = BTreeMap::new();
+    for (k, v) in parse_pairs(rest, 0, "menu add")? {
+        if !rtcl_tk_core::valid_option(&k) {
+            return Err(bad_option(&k));
+        }
+        options.insert(k, v);
+    }
+    Ok(MenuItem {
+        kind: kind.to_string(),
+        options,
+    })
+}
+
+fn menu_create(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let cmd = args[0].as_str();
+    if args.len() < 2 {
+        return Err(wrong(cmd, "pathName ?-option value ...?", args.len()));
+    }
+    let path = args[1].as_str().to_string();
+    let exists = with_state(interp, |rt| {
+        rt.tree.contains(&path) || rt.menus.contains_key(&path)
+    })
+    .unwrap_or(false);
+    if exists {
+        return Err(generic(format!("window name \"{path}\" already exists")));
+    }
+    if !rtcl_tk_core::valid_path(&path) {
+        return Err(bad_window(&path));
+    }
+    let options = parse_pairs(args, 2, cmd)?
+        .into_iter()
+        .filter(|(k, _)| {
+            matches!(
+                k.as_str(),
+                "-tearoff"
+                    | "-title"
+                    | "-type"
+                    | "-selectcolor"
+                    | "-background"
+                    | "-foreground"
+                    | "-font"
+                    | "-activebackground"
+                    | "-activeforeground"
+                    | "-disabledforeground"
+                    | "-borderwidth"
+                    | "-relief"
+                    | "-cursor"
+                    | "-takefocus"
+                    | "-postcommand"
+            )
+        })
+        .collect::<BTreeMap<String, String>>();
+    with_state_mut(interp, |rt| {
+        rt.menus.insert(
+            path.clone(),
+            Menu {
+                path: path.clone(),
+                items: Vec::new(),
+                options,
+            },
+        );
+        rt.bump();
+    });
+    interp.register_command(&path, menu_command);
+    Ok(Value::from_str(&path))
+}
+
+fn menu_item_index(spec: &str, len: usize) -> Result<usize> {
+    match spec {
+        "end" => Ok(len),
+        "active" | "none" => Ok(0),
+        _ => spec
+            .parse::<usize>()
+            .map_err(|_| generic(format!("bad menu entry index \"{spec}\""))),
+    }
+}
+
+fn menu_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let path = args[0].as_str().to_string();
+    if args.len() < 2 {
+        return Err(wrong(&path, "subcommand ?arg ...?", args.len()));
+    }
+    let sub = args[1].as_str();
+    let exists = with_state(interp, |rt| rt.menus.contains_key(&path)).unwrap_or(false);
+    if !exists {
+        return Err(bad_window(&path));
+    }
+    match sub {
+        "add" => {
+            if args.len() < 3 {
+                return Err(wrong("menu add", "type ?-option value ...?", args.len()));
+            }
+            let item = parse_menu_entry(args[2].as_str(), &args[3..])?;
+            with_state_mut(interp, |rt| {
+                if let Some(menu) = rt.menus.get_mut(&path) {
+                    menu.items.push(item);
+                    rt.bump();
+                }
+            });
+            Ok(Value::empty())
+        }
+        "insert" => {
+            if args.len() < 4 {
+                return Err(wrong(
+                    "menu insert",
+                    "index type ?-option value ...?",
+                    args.len(),
+                ));
+            }
+            let item = parse_menu_entry(args[3].as_str(), &args[4..])?;
+            let len = with_state(interp, |rt| {
+                rt.menus.get(&path).map(|m| m.items.len()).unwrap_or(0)
+            })
+            .unwrap_or(0);
+            let at = menu_item_index(args[2].as_str(), len)?.min(len);
+            with_state_mut(interp, |rt| {
+                if let Some(menu) = rt.menus.get_mut(&path) {
+                    menu.items.insert(at, item);
+                    rt.bump();
+                }
+            });
+            Ok(Value::empty())
+        }
+        "delete" => {
+            if args.len() < 3 || args.len() > 4 {
+                return Err(wrong("menu delete", "index1 ?index2?", args.len()));
+            }
+            let len = with_state(interp, |rt| {
+                rt.menus.get(&path).map(|m| m.items.len()).unwrap_or(0)
+            })
+            .unwrap_or(0);
+            let first = menu_item_index(args[2].as_str(), len)?;
+            let last = match args.get(3) {
+                Some(v) => menu_item_index(v.as_str(), len)?,
+                None => first,
+            };
+            let (a, b) = (first.min(last), first.max(last));
+            with_state_mut(interp, |rt| {
+                if let Some(menu) = rt.menus.get_mut(&path) {
+                    let end = (b + 1).min(menu.items.len());
+                    if a < end {
+                        menu.items.drain(a..end);
+                    }
+                    rt.bump();
+                }
+            });
+            Ok(Value::empty())
+        }
+        "index" => {
+            if args.len() != 3 {
+                return Err(wrong("menu index", "index", args.len()));
+            }
+            let len = with_state(interp, |rt| {
+                rt.menus.get(&path).map(|m| m.items.len()).unwrap_or(0)
+            })
+            .unwrap_or(0);
+            let i = menu_item_index(args[2].as_str(), len)?;
+            Ok(Value::from_int(i as i64))
+        }
+        "entrycget" => {
+            if args.len() != 4 {
+                return Err(wrong("menu entrycget", "index -option", args.len()));
+            }
+            let len = with_state(interp, |rt| {
+                rt.menus.get(&path).map(|m| m.items.len()).unwrap_or(0)
+            })
+            .unwrap_or(0);
+            let i = menu_item_index(args[2].as_str(), len)?;
+            let option = args[3].as_str();
+            let value = with_state(interp, |rt| {
+                rt.menus
+                    .get(&path)
+                    .and_then(|m| m.items.get(i))
+                    .and_then(|it| it.options.get(option).cloned())
+            })
+            .flatten()
+            .unwrap_or_default();
+            Ok(Value::from_str(&value))
+        }
+        "entryconfigure" | "entryconfig" => {
+            if args.len() < 3 {
+                return Err(wrong(
+                    "menu entryconfigure",
+                    "index ?-option value ...?",
+                    args.len(),
+                ));
+            }
+            let len = with_state(interp, |rt| {
+                rt.menus.get(&path).map(|m| m.items.len()).unwrap_or(0)
+            })
+            .unwrap_or(0);
+            let i = menu_item_index(args[2].as_str(), len)?;
+            if args.len() == 4 && args[3].as_str().starts_with('-') {
+                let value = with_state(interp, |rt| {
+                    rt.menus
+                        .get(&path)
+                        .and_then(|m| m.items.get(i))
+                        .and_then(|it| it.options.get(args[3].as_str()).cloned())
+                })
+                .flatten()
+                .unwrap_or_default();
+                return Ok(Value::from_str(&value));
+            }
+            if args.len() > 3 {
+                let options = parse_pairs(args, 3, "menu entryconfigure")?;
+                with_state_mut(interp, |rt| {
+                    if let Some(menu) = rt.menus.get_mut(&path) {
+                        if let Some(item) = menu.items.get_mut(i) {
+                            item.options.extend(options);
+                        }
+                        rt.bump();
+                    }
+                });
+            }
+            Ok(Value::empty())
+        }
+        "invoke" => {
+            if args.len() != 3 {
+                return Err(wrong("menu invoke", "index", args.len()));
+            }
+            let len = with_state(interp, |rt| {
+                rt.menus.get(&path).map(|m| m.items.len()).unwrap_or(0)
+            })
+            .unwrap_or(0);
+            let i = menu_item_index(args[2].as_str(), len)?;
+            invoke_menu_item(interp, &path, i)?;
+            Ok(Value::empty())
+        }
+        "type" => {
+            if args.len() != 3 {
+                return Err(wrong("menu type", "index", args.len()));
+            }
+            let len = with_state(interp, |rt| {
+                rt.menus.get(&path).map(|m| m.items.len()).unwrap_or(0)
+            })
+            .unwrap_or(0);
+            let i = menu_item_index(args[2].as_str(), len)?;
+            let kind = with_state(interp, |rt| {
+                rt.menus
+                    .get(&path)
+                    .and_then(|m| m.items.get(i))
+                    .map(|it| it.kind.clone())
+            })
+            .flatten()
+            .unwrap_or_default();
+            Ok(Value::from_str(&kind))
+        }
+        "post" => {
+            with_state_mut(interp, |rt| {
+                rt.open_menu = Some(path.clone());
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "unpost" => {
+            with_state_mut(interp, |rt| {
+                if rt.open_menu.as_deref() == Some(path.as_str()) {
+                    rt.open_menu = None;
+                }
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "activate" | "yposition" | "xposition" => Ok(Value::from_int(0)),
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be activate, add, delete, entrycget, entryconfigure, index, insert, invoke, post, type, unpost, or yposition"
+        ))),
+    }
+}
+
+fn invoke_menu_item(interp: &mut Interp, menu_path: &str, index: usize) -> Result<()> {
+    let item = with_state(interp, |rt| {
+        rt.menus
+            .get(menu_path)
+            .and_then(|m| m.items.get(index))
+            .cloned()
+    })
+    .flatten()
+    .ok_or_else(|| generic(format!("bad menu entry index \"{index}\"")))?;
+    let option = |name: &str| item.options.get(name).cloned().unwrap_or_default();
+    match item.kind.as_str() {
+        "separator" => {}
+        "cascade" => {
+            let sub = option("-menu");
+            with_state_mut(interp, |rt| {
+                rt.open_menu = (!sub.is_empty()).then_some(sub);
+                rt.bump();
+            });
+        }
+        "checkbutton" => {
+            let var = option("-variable");
+            if !var.is_empty() {
+                let on = if item.options.contains_key("-onvalue") {
+                    option("-onvalue")
+                } else {
+                    "1".to_string()
+                };
+                let off = if item.options.contains_key("-offvalue") {
+                    option("-offvalue")
+                } else {
+                    "0".to_string()
+                };
+                let current = var_value(&var).unwrap_or_default();
+                let next = if current == on { off } else { on };
+                set_var(&var, &next)?;
+            }
+            let command = option("-command");
+            if !command.is_empty() {
+                with_eval(|| unsafe {
+                    let ptr = active_interp().unwrap();
+                    (*ptr).eval(&command)
+                })?;
+            }
+        }
+        "radiobutton" => {
+            let var = option("-variable");
+            if !var.is_empty() {
+                set_var(&var, &option("-value"))?;
+            }
+            let command = option("-command");
+            if !command.is_empty() {
+                with_eval(|| unsafe {
+                    let ptr = active_interp().unwrap();
+                    (*ptr).eval(&command)
+                })?;
+            }
+        }
+        _ => {
+            let command = option("-command");
+            if !command.is_empty() {
+                with_eval(|| unsafe {
+                    let ptr = active_interp().unwrap();
+                    (*ptr).eval(&command)
+                })?;
+            }
+        }
+    }
+    with_state_mut(interp, |rt| rt.bump());
+    Ok(())
+}
+
+/// The menu attached to the main window (`configure . -menu`).
+pub fn menu_bar() -> Option<String> {
+    let ptr = active_interp()?;
+    let interp = unsafe { &*ptr };
+    let path = effective_option(interp, ".", "-menu");
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+/// A snapshot of one menu.
+pub fn menu_snapshot(path: &str) -> Option<Menu> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| rt.menus.get(path).cloned()).flatten()
+}
+
+/// The cascade currently dropped down, if any.
+pub fn open_menu() -> Option<String> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| rt.open_menu.clone()).flatten()
+}
+
+/// Open/close a cascade's menu from the renderer.
+pub fn toggle_menu(path: &str) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    with_state_mut(interp, |rt| {
+        rt.open_menu = if rt.open_menu.as_deref() == Some(path) {
+            None
+        } else {
+            Some(path.to_string())
+        };
+        rt.bump();
+    });
+}
+
+/// Run a menu entry from the renderer and close the dropdown.
+pub fn press_menu_item(menu_path: &str, index: usize) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    if let Err(e) = invoke_menu_item(interp, menu_path, index) {
+        record_error(e.to_string());
+    }
+    with_state_mut(interp, |rt| {
+        if rt
+            .menus
+            .get(menu_path)
+            .and_then(|m| m.items.get(index))
+            .is_some_and(|it| it.kind != "cascade" && it.kind != "separator")
+        {
+            rt.open_menu = None;
+        }
+        rt.bump();
+    });
 }
 
 fn event_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -3312,6 +3786,7 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "bell" => Ok(Value::empty()),
         "tk_focusNext" => tk_focus_impl(interp, args, true),
         "tk_focusPrev" => tk_focus_impl(interp, args, false),
+        "menu" => menu_create(interp, args),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -3520,6 +3995,41 @@ mod tests {
         eval(&mut i, "ttk::button .b -text Go; ttk::label .l -text Hi");
         assert_eq!(eval(&mut i, "winfo class .b"), "Button");
         assert_eq!(eval(&mut i, "winfo class .l"), "Label");
+    }
+
+    #[test]
+    fn menu_model_and_invoke() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "menu .menubar -tearoff 0; menu .file -tearoff 0; \
+             set ::hits 0; set ::checked 0; \
+             .file add command -label Open -command {incr ::hits}; \
+             .file add checkbutton -label Show -variable ::checked -onvalue 1 -offvalue 0; \
+             .file add separator; \
+             .file add cascade -label More -menu .more; \
+             menu .more; .more add command -label Deep -command {incr ::hits}; \
+             .menubar add cascade -label File -menu .file; \
+             . configure -menu .menubar",
+        );
+        assert_eq!(eval(&mut i, "winfo class .menubar"), "Menu");
+        assert_eq!(eval(&mut i, "winfo exists .file"), "1");
+        assert_eq!(eval(&mut i, "winfo manager .menubar"), "");
+        assert_eq!(menu_bar().as_deref(), Some(".menubar"));
+        assert_eq!(eval(&mut i, ".file entrycget 0 -label"), "Open");
+        eval(&mut i, ".file invoke 0");
+        assert_eq!(eval(&mut i, "set ::hits"), "1");
+        eval(&mut i, ".file invoke 1");
+        assert_eq!(eval(&mut i, "set ::checked"), "1");
+        eval(&mut i, ".menubar invoke 0");
+        assert_eq!(open_menu().as_deref(), Some(".file"));
+        eval(&mut i, ".file invoke 3");
+        assert_eq!(open_menu().as_deref(), Some(".more"));
+        eval(&mut i, "destroy .more");
+        assert_eq!(eval(&mut i, "winfo exists .more"), "0");
+        eval(&mut i, ".file delete 2");
+        assert_eq!(eval(&mut i, ".file index end"), "3");
     }
 
     #[test]

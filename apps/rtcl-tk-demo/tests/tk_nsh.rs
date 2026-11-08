@@ -47,6 +47,13 @@ fn tcl_widgets_render_and_react_to_native_input() {
     app.press("Red").expect("press a listbox row");
     app.wait_for("▶ ").expect("selected row marker rendered");
 
+    // The menubar drops its cascade down and its command runs.
+    app.press("File").expect("open the File menu");
+    app.wait_for("Reset").expect("menu entry rendered");
+    app.press("Reset").expect("press the menu entry");
+    app.wait_for("Reset from menu")
+        .expect("menu -command ran and closed the dropdown");
+
     // `after` timers are pumped by the renderer without `vwait`.
     app.wait_for("Later fired")
         .expect("after timer fired through the event pump");

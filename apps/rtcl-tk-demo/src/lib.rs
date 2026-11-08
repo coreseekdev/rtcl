@@ -54,6 +54,16 @@ listbox .colors -height 3
 pack .colors -fill x -padx 12 -pady 4
 .colors insert end Red Green Blue
 
+menu .menubar -tearoff 0
+menu .file -tearoff 0
+.file add command -label "Reset" -command {
+    set ::clicks 0
+    .b configure -text "Click me"
+    set ::greeting "Reset from menu"
+}
+.menubar add cascade -label "File" -menu .file
+. configure -menu .menubar
+
 label .later -text "waiting for after"
 pack .later -padx 12 -pady 4
 after 80 {.later configure -text "Later fired"}
@@ -65,6 +75,7 @@ if {[info exists ::env(RTCL_TK_AUTO)]} {
         .agree invoke
         .colors selection set 1
         .volume set 65
+        .file post
     }
 }
 "#;

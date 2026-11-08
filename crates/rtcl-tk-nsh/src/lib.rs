@@ -74,10 +74,21 @@ pub fn TkView() -> impl IntoElement {
         .child(dynamic(move || {
             let _revision = revision.get();
             match rtcl_tk_runtime::snapshot_active() {
-                Some(tree) => vec![view()
-                    .flex_col()
-                    .w_full()
-                    .child(render_children(&tree, "."))],
+                Some(tree) => {
+                    let mut column = view().flex_col().w_full().gap_2();
+                    let bar = rtcl_tk_runtime::menu_bar();
+                    if let Some(bar) = &bar {
+                        column = column.child(render_menu_bar(bar));
+                    }
+                    column = column.child(render_children(&tree, "."));
+                    // The dropdown floats over the content.
+                    if bar.is_some() {
+                        if let Some(open) = rtcl_tk_runtime::open_menu() {
+                            column = column.child(render_menu_dropdown(&open));
+                        }
+                    }
+                    vec![column]
+                }
                 None => vec![view()
                     .flex_col()
                     .child(text("Tk runtime is not installed").text_size(px(14.0)))],
@@ -92,7 +103,10 @@ fn start_event_pump() {
         return;
     }
     set_interval(Duration::from_millis(16), || {
-        rtcl_tk_runtime::pump_active();
+        // Idle apps wake for nothing: `after` work is rare.
+        if rtcl_tk_runtime::has_scheduled_events() {
+            rtcl_tk_runtime::pump_active();
+        }
     });
 }
 
@@ -116,6 +130,131 @@ fn effective(tree: &TkTree, path: &str, name: &str) -> String {
 
 fn is_disabled(tree: &TkTree, path: &str) -> bool {
     option(tree, path, "-state") == "disabled"
+}
+
+fn render_menu_bar(menu_path: &str) -> AnyElement {
+    let Some(menu) = rtcl_tk_runtime::menu_snapshot(menu_path) else {
+        return view().into_element();
+    };
+    let mut bar = view()
+        .flex_row()
+        .w_full()
+        .items_center()
+        .gap_1()
+        .pb(px(2.0))
+        .border_b(px(1.0))
+        .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563));
+    for (i, item) in menu.items.iter().enumerate() {
+        if item.kind == "separator" {
+            continue;
+        }
+        let label = item
+            .options
+            .get("-label")
+            .cloned()
+            .unwrap_or_else(|| "?".to_string());
+        let path = menu_path.to_string();
+        let submenu = item.options.get("-menu").cloned();
+        bar = bar.child(
+            nsh_base::button()
+                .px(px(8.0))
+                .py(px(3.0))
+                .rounded(px(4.0))
+                .child(
+                    text(label)
+                        .text_size(px(13.0))
+                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                )
+                .on_press(move |_: &()| match &submenu {
+                    Some(sub) if !sub.is_empty() => rtcl_tk_runtime::toggle_menu(sub),
+                    _ => rtcl_tk_runtime::press_menu_item(&path, i),
+                }),
+        );
+    }
+    bar.into_element()
+}
+
+fn render_menu_dropdown(menu_path: &str) -> AnyElement {
+    let Some(menu) = rtcl_tk_runtime::menu_snapshot(menu_path) else {
+        return view().into_element();
+    };
+    let mut panel = view()
+        .absolute()
+        .top(px(30.0))
+        .left(px(8.0))
+        .flex_col()
+        .w(px(220.0))
+        .p(px(4.0))
+        .gap_1()
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+        .bg(AdaptiveColor::rgb(0xffffff, 0x1f2937));
+    for (i, item) in menu.items.iter().enumerate() {
+        if item.kind == "separator" {
+            panel = panel.child(
+                view()
+                    .w_full()
+                    .h(px(1.0))
+                    .bg(AdaptiveColor::rgb(0xe5e7eb, 0x374151)),
+            );
+            continue;
+        }
+        let label = item.options.get("-label").cloned().unwrap_or_default();
+        let var = item.options.get("-variable").cloned().unwrap_or_default();
+        let on = item
+            .options
+            .get("-onvalue")
+            .cloned()
+            .unwrap_or_else(|| "1".to_string());
+        let value = item.options.get("-value").cloned().unwrap_or_default();
+        let mark = match item.kind.as_str() {
+            "checkbutton" => {
+                if rtcl_tk_runtime::var_value(&var).is_some_and(|v| v == on) {
+                    "☑ "
+                } else {
+                    "☐ "
+                }
+            }
+            "radiobutton" => {
+                if rtcl_tk_runtime::var_value(&var).is_some_and(|v| v == value) {
+                    "◉ "
+                } else {
+                    "○ "
+                }
+            }
+            "cascade" => "",
+            _ => "",
+        };
+        let suffix = if item.kind == "cascade" { " ▸" } else { "" };
+        let disabled = item.options.get("-state").is_some_and(|s| s == "disabled");
+        let path = menu_path.to_string();
+        if disabled {
+            panel = panel.child(
+                text(format!("{mark}{label}{suffix}"))
+                    .text_size(px(13.0))
+                    .text_color(AdaptiveColor::rgb(0x9ca3af, 0x6b7280)),
+            );
+            continue;
+        }
+        panel = panel.child(
+            nsh_base::button()
+                .w_full()
+                .justify_start()
+                .px(px(8.0))
+                .py(px(4.0))
+                .rounded(px(4.0))
+                .child(
+                    text(format!("{mark}{label}{suffix}"))
+                        .text_size(px(13.0))
+                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                )
+                .on_press(move |_: &()| {
+                    rtcl_tk_runtime::press_menu_item(&path, i);
+                }),
+        );
+    }
+    panel.into_element()
 }
 
 fn render_children(tree: &TkTree, path: &str) -> AnyElement {

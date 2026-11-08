@@ -508,6 +508,10 @@ impl Interp {
         }
         if op == "delete" {
             self.cmd_traces.remove(key);
+            // Execution traces are command traces too: a deleted command
+            // must not leave its handlers (and their captured scripts)
+            // registered.
+            self.exec_traces.remove(key);
         }
     }
 }

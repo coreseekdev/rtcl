@@ -474,7 +474,11 @@ mod table {
             }
         })()
         .map(Arc::new);
+        const ENCODING_CACHE_MAX: usize = 256;
         if let Ok(mut c) = cache().lock() {
+            if c.len() >= ENCODING_CACHE_MAX {
+                c.clear();
+            }
             c.insert(name.to_string(), codec.clone());
         }
         codec
@@ -494,7 +498,11 @@ mod table {
             }
         })()
         .map(Arc::new);
+        const ENCODING_CACHE_MAX: usize = 256;
         if let Ok(mut c) = table_cache().lock() {
+            if c.len() >= ENCODING_CACHE_MAX {
+                c.clear();
+            }
             c.insert(name.to_string(), t.clone());
         }
         t

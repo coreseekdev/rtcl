@@ -25,7 +25,7 @@ mod varmap;
 pub(crate) use util::{split_array_ref, glob_match};
 pub(crate) use varmap::{VarMap, VarSet};
 
-pub use vm_exec::{set_bytecode_disabled, set_proc_body_executor, ProcBodyExecutor};
+pub use vm_exec::{set_bytecode_disabled, set_interp_teardown_hook, set_proc_body_executor, InterpTeardownHook, ProcBodyExecutor};
 
 use crate::command::{CommandFunc, CommandCategory, CommandMeta};
 use crate::value::Value;
@@ -791,6 +791,11 @@ pub struct Interp {
     /// Channel table (stdin/stdout/stderr + opened files/pipes).
     #[cfg(feature = "std")]
     pub channels: crate::channel::ChannelTable,
+    /// Background `exec ... &` children: retained so their handles are not
+    /// leaked and so `try_wait` can reap zombies (Tcl's detached-process
+    /// reaper model, on the event-loop tick / before the next spawn).
+    #[cfg(feature = "exec")]
+    pub(crate) background_children: Vec<std::process::Child>,
     /// 宿主控制台服务：无 `io` 特性构建里 `puts` 的 stdout/stderr 落点
     /// （原生 stdio，或 wasm 宿主注入的 JS 实现）。
     pub(crate) console: Box<dyn crate::host::HostConsole>,
@@ -960,6 +965,8 @@ impl Interp {
             script_name: String::new(),
             #[cfg(feature = "std")]
             channels: crate::channel::ChannelTable::new(),
+            #[cfg(feature = "exec")]
+            background_children: Vec::new(),
             console: {
                 #[cfg(feature = "std")]
                 let c: Box<dyn crate::host::HostConsole> = Box::new(crate::host::NativeConsole);
@@ -1848,4 +1855,16 @@ pub fn jit_note_cross_frame() {
 /// 读取并清除跨帧写哨兵（fast linker 分派后调用）。
 pub fn jit_take_cross_frame() -> bool {
     JIT_CROSS_FRAME.with(|f| f.replace(false))
+}
+
+/// Dropping the last interpreter handle releases OS resources via field
+/// drops (ChannelTable's Drop closes files/pipes) and gives the optional
+/// JIT engine a chance to drop thread-local pools/modules keyed by this
+/// interpreter pointer.  No Tcl code runs here.
+impl Drop for Interp {
+    fn drop(&mut self) {
+        #[cfg(feature = "exec")]
+        self.reap_background_children();
+        crate::interp::vm_exec::run_interp_teardown_hook(self as *mut Interp);
+    }
 }

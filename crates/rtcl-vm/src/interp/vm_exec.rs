@@ -741,6 +741,26 @@ pub fn set_proc_body_executor(executor: Option<ProcBodyExecutor>) {
     let _ = PROC_BODY_EXECUTOR.set(executor);
 }
 
+/// Interpreter-teardown hook (optional JIT seam): called from
+/// `impl Drop for Interp` with the interpreter pointer, so an engine can
+/// drop thread-local pools/modules keyed by that interpreter.  A fn
+/// pointer (no closure state), registered once like the executor hook.
+pub type InterpTeardownHook = fn(*mut Interp);
+
+static INTERP_TEARDOWN_HOOK: std::sync::OnceLock<Option<InterpTeardownHook>> =
+    std::sync::OnceLock::new();
+
+/// Register the interpreter-teardown hook.  First call wins.
+pub fn set_interp_teardown_hook(hook: Option<InterpTeardownHook>) {
+    let _ = INTERP_TEARDOWN_HOOK.set(hook);
+}
+
+pub(crate) fn run_interp_teardown_hook(interp: *mut Interp) {
+    if let Some(Some(f)) = INTERP_TEARDOWN_HOOK.get() {
+        f(interp);
+    }
+}
+
 /// Site A hook probe: returns the JIT executor's result when one is
 /// installed and it accepts this body, `None` to run `exec_bytecode`.
 pub(crate) fn proc_body_executor(

@@ -80,6 +80,20 @@ thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// Drop the thread-local fast store/modules when their interpreter dies.
+pub(crate) fn teardown_interp(ptr: usize) {
+    WT_FAST_STORE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell
+            .as_ref()
+            .is_some_and(|store| store.data().sh.interp == ptr as *mut Interp)
+        {
+            *cell = None;
+        }
+    });
+    WT_FAST_MODULES.with(|m| m.borrow_mut().retain(|k, _| k.0 != ptr));
+}
+
 /// Caller 上读 cur_proc global（fast 模块 re-export，get_export 可见）。
 fn read_cur_wt(c: &mut Caller<'_, FastHostWt>) -> usize {
     if let Some(wasmtime::Extern::Global(g)) = c.get_export("cur_proc") {

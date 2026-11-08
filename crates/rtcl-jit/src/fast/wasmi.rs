@@ -64,6 +64,20 @@ thread_local! {
     static DM_SEQ: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// Drop the thread-local fast store/modules when their interpreter dies.
+pub(crate) fn teardown_interp(ptr: usize) {
+    FAST_STORE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell
+            .as_ref()
+            .is_some_and(|store| store.data().sh.interp == ptr as *mut Interp)
+        {
+            *cell = None;
+        }
+    });
+    FAST_MODULES.with(|m| m.borrow_mut().retain(|k, _| k.0 != ptr));
+}
+
 /// Caller 上读 cur_proc global（每宿主调用 ~few ns——全部冷路径）。
 fn read_cur(c: &mut wasmi::Caller<'_, FastHost>) -> usize {
     if let Some(wasmi::Extern::Global(g)) = c.get_export("cur_proc") {

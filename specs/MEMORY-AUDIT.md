@@ -27,6 +27,11 @@
     `PipeChannel::close` 关闭管道后 `child.wait()`。
 
 - 不够谨慎的部分（本轮已修 / 仍开放）：
+  - **[已修] JIT 无 teardown**：`Interp` Drop 现调用注册的 teardown hook；
+    classic wasmi/wasmtime pool/module 与 fast store/module 按 Interp
+    指针清理，共享 emit 缓存整清。
+  - **[已修] `exec &` 泄漏 Child**：后台 Child 进入
+    `Interp.background_children`，exec/update/Drop 用 try_wait reap。
   - **[已修] Fast JIT host arena 无界增长**：fast Store 是线程常驻，
     `Host::tag_value` 每次宿主结果追加 arena，而 fast 路径从不
     `arena_truncate`；字符串/列表型 proc 随调用次数增长。
@@ -43,13 +48,12 @@
     泄漏到下一次调用（也是正确性问题）。
   - **[已修] `var_link_cache` 内层无上限**：外层 1024 ns，但单 ns 内
     可被脚本写入无限多变量名。
-  - **[开放] JIT 线程级 pool/module/engine 无 teardown API**：模块、
-    `Store<Host>`、`Host.arena/consts/source` 上限 64 条后整表清空，
-    但可跨 Interp 存活；键含裸 Interp/ByteCode 指针（地址复用可能
-    假命中；已加 fast Store rebind，classic pool 未改）。
-  - **[开放] `exec &` 显式 `mem::forget(Child)`**：后台子进程 handle
-    永不回收/不 reap（前台成功路径会 wait，错误路径提前 return 也不
-    wait）。Tcl 语义是后台不阻塞，但需要 reaper/teardown。
+  - **[开放] JIT 同一 Interp 内的旧 ByteCode 条目**：teardown 解决了
+    跨 Interp 存活；proc 重定义/删除后，classic pool/module 里旧
+    `(interp, ByteCode ptr, epoch)` 条目仍要等池满 64 清除。键含裸
+    ByteCode 指针，地址复用+epoch 相同理论上可假命中。
+  - **[开放] 后台子进程退出策略**：handle 已保留并 try_wait reap；
+    Interp drop 时仍在运行的子进程不 kill（与 Tcl 一致，由 OS 接管）。
   - **[开放] `references` 只增不减**：`ref` 每个值插强引用表，
     `collect` 是 no-op；脚本可无界持有 Value，直到 Interp drop。
   - **[开放] `const_pool` 的 CmdSite 持有旧 `Rc<ProcDef>`**：仅 2048
@@ -106,6 +110,20 @@
 | exec & forget Child | `interp/commands/exec_cmd.rs:265-273` |
 | namespace delete 不清 exec_traces | `interp/commands/namespace.rs:532-588`（只 fire/retain，无 wipe_cmd_exec_traces） |
 | CLI 直接 exit | `crates/rtcl-cli/src/main.rs:75/80/104/114/131` |
+
+## 第二轮修复（cedd02c 之后）
+
+7. **JIT teardown hook**（`interp/vm_exec.rs` + `interp/mod.rs` +
+   `rtcl-jit/*`）：`Interp` Drop → 线程级 wasmi/wasmtime pool/module 按
+   Interp 指针 retain、fast store/module 清理、共享 emit 缓存整清。
+8. **后台 exec reaper**（`exec_cmd.rs`/`event.rs`/`mod.rs`）：不再
+   `mem::forget`；Child 入表，exec/update/Drop `try_wait` 回收。
+9. **namespace delete 清 exec/cmd traces**（在 delete trace 触发**之后**
+   扫除，避免破坏 trace-34.4/34.5）。
+10. **encoding 缓存上限 256**（Codec 与 Table 两个全局缓存；未知编码名
+    也会缓存负项，此前脚本可控无界）。
+11. **CLI exit 前 drop(interp)**：`exit`/顶层错误不再让
+    `std::process::exit` 绕过 ChannelTable Drop 与 JIT teardown。
 
 ## 本轮修复与验证
 

@@ -19,7 +19,23 @@ fn exec_err_str(msg: impl std::fmt::Display) -> Error {
 }
 
 /// `exec ?-ignorestderr? ?-keepnewline? ?--? cmd ?arg ...? ?| cmd ...? ?redirections?`
+impl Interp {
+    /// Reap finished background `exec &` children without blocking.
+    pub(crate) fn reap_background_children(&mut self) {
+        let mut i = 0;
+        while i < self.background_children.len() {
+            match self.background_children[i].try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    self.background_children.swap_remove(i);
+                }
+                Ok(None) => i += 1,
+            }
+        }
+    }
+}
+
 pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    interp.reap_background_children();
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage(
             "exec", 2, args.len(), "exec ?switches? arg ?arg ...?",
@@ -263,13 +279,11 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     if background {
-        // Return the PIDs of all spawned processes
+        // Return the PIDs; keep the handles so a later exec/update/Drop can
+        // try_wait them (Tcl's detached-process reaping), instead of
+        // leaking Child handles with mem::forget.
         let pids: Vec<String> = children.iter().map(|c| c.id().to_string()).collect();
-        // Don't wait — the children run in the background
-        // We intentionally leak them (they'll be cleaned up on exit)
-        for child in children {
-            std::mem::forget(child);
-        }
+        interp.background_children.extend(children);
         return Ok(Value::from_str(&pids.join(" ")));
     }
 

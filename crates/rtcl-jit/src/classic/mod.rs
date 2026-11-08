@@ -21,6 +21,14 @@ thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// Emitted-module cache keys carry no interpreter identity (they are
+/// shared per thread), so a teardown clears the whole cache: entries can
+/// keep Rc<emit::Module> and ByteCode-derived metadata alive after the
+/// owning interpreter is gone.
+pub(crate) fn teardown_interp(_ptr: usize) {
+    PROC_MODULES.with(|c| c.borrow_mut().clear());
+}
+
 /// emit 编译缓存（key 二元组；未命中现编译，拒绝不缓存负项）。
 pub(crate) fn compile_cached(code: &ByteCode, key: (usize, u64)) -> Option<Rc<emit::Module>> {
     PROC_MODULES.with(|c| {

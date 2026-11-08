@@ -48,6 +48,16 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Drop cached wasmtime modules/pool entries belonging to a dead Interp.
+#[cfg(feature = "jit-native")]
+pub(crate) fn teardown_interp(ptr: usize) {
+    WT_MODULES.with(|m| m.borrow_mut().retain(|k, _| k.0 != ptr));
+    WT_POOL.with(|p| p.borrow_mut().retain(|(k, ..)| k.0 != ptr));
+}
+
+#[cfg(not(feature = "jit-native"))]
+pub(crate) fn teardown_interp(_ptr: usize) {}
+
 /// 池快路径（wasmtime）：仅命中时执行——免模块查找（同 wasmi 池优先）。
 #[cfg(feature = "jit-native")]
 pub(crate) fn execute_proc_wasmtime_pooled(

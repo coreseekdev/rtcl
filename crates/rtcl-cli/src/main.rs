@@ -101,7 +101,11 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
         // `exit N` 以 N 退出且无输出。
         let e = interp.decode_toplevel_flow(e);
         if e.is_exit() {
-            std::process::exit(repl::exit_code_of(&e));
+            let code = repl::exit_code_of(&e);
+            // Run Drop (channel close / pipe wait / JIT teardown) before
+            // leaving; process::exit bypasses destructors.
+            drop(interp);
+            std::process::exit(code);
         }
         if e.is_return() {
             let _ = quiet;
@@ -110,6 +114,7 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
         // tclsh prints the full accumulated errorInfo (message + frames +
         // `(file ...)` tail) verbatim on stderr.
         let report = interp.error_report(&e, &path.to_string_lossy());
+        drop(interp);
         eprintln!("{}", report);
         std::process::exit(1);
     }
@@ -128,7 +133,11 @@ fn run_command(cmd: &str, quiet: bool) -> Result<(), String> {
         Ok(r) => r,
         // -c 与 -f 同语义（error-deep 探针：tclsh `catch {exit 3}` 穿透
         // catch 以 3 退出——原 to_string() 把 exit 信号降级成错误文本）。
-        Err(e) if e.is_exit() => std::process::exit(repl::exit_code_of(&e)),
+        Err(e) if e.is_exit() => {
+            let code = repl::exit_code_of(&e);
+            drop(interp);
+            std::process::exit(code)
+        }
         Err(e) if e.is_return() => return Ok(()),
         Err(e) => return Err(e.to_string()),
     };

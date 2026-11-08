@@ -312,6 +312,8 @@ pub fn cmd_vwait(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 ///
 /// Process pending events non-blocking.
 pub fn cmd_update(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    #[cfg(feature = "exec")]
+    interp.reap_background_children();
     if args.len() > 2 {
         return Err(Error::wrong_args_with_usage(
             "update", 1, args.len(), "?idletasks?",

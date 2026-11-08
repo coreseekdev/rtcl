@@ -34,6 +34,12 @@ thread_local! {
     > = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Drop cached wasmi modules/pool entries belonging to a dead Interp.
+pub(crate) fn teardown_interp(ptr: usize) {
+    WASMI_MODULES.with(|m| m.borrow_mut().retain(|k, _| k.0 != ptr));
+    PROC_POOL.with(|p| p.borrow_mut().retain(|(k, ..)| k.0 != ptr));
+}
+
 /// 池 key 的 epoch 分量（redefine 换 Rc + epoch 变化——双重防陈旧）。
 pub(crate) fn code_epoch_key(bc: &ByteCode) -> u64 {
     bc.epoch

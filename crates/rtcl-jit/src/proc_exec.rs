@@ -6,7 +6,7 @@ use crate::abi;
 use crate::classic::compile_cached;
 use crate::exec;
 use rtcl_core::{Interp, Value};
-use rtcl_vm::interp::set_proc_body_executor;
+use rtcl_vm::interp::{set_interp_teardown_hook, set_proc_body_executor};
 use rtcl_ir::ByteCode;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
@@ -18,6 +18,21 @@ static FAST_ONLY: AtomicBool = AtomicBool::new(false);
 /// 注册 proc-body 钩子（进程级一次性；`jitsh` main 调用）。
 pub fn install() {
     set_proc_body_executor(Some(exec_proc_body));
+    set_interp_teardown_hook(Some(teardown_interp));
+}
+
+/// `Interp` drop hook: release thread-local pools/modules keyed by the
+/// dying interpreter (classic wasmi/wasmtime pools + fast store/modules +
+/// shared emit cache).
+fn teardown_interp(interp: *mut Interp) {
+    let ptr = interp as usize;
+    crate::classic::wasmi::teardown_interp(ptr);
+    #[cfg(feature = "jit-native")]
+    crate::classic::wt::teardown_interp(ptr);
+    crate::classic::teardown_interp(ptr);
+    crate::fast::wasmi::teardown_interp(ptr);
+    #[cfg(feature = "jit-native")]
+    crate::fast::wt::teardown_interp(ptr);
 }
 /// 置位 fast-only（进程级，engine 注册时调用一次）。
 pub fn set_fast_only(v: bool) {

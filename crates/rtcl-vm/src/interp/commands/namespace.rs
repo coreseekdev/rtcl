@@ -566,6 +566,15 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if !inside {
             interp.procs.retain(|k, _| k != &qualified && !k.starts_with(&prefix));
         }
+        // After the delete traces fired, sweep their registrations for
+        // commands that disappeared with the namespace (including
+        // non-proc command keys that fire_cmd_traces never visits).
+        interp
+            .exec_traces
+            .retain(|k, _| k != &qualified && !k.starts_with(&prefix));
+        interp
+            .cmd_traces
+            .retain(|k, _| k != &qualified && !k.starts_with(&prefix));
 
         // Remove namespace-scoped global variables (flat keys, no leading
         // ::), except the ones a live variable link keeps alive.

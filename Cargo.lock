@@ -1324,6 +1324,7 @@ dependencies = [
  "rtcl-expect",
  "rtcl-jit",
  "rtcl-parser",
+ "rtcl-tk-runtime",
  "rustyline",
  "tikv-jemallocator",
 ]
@@ -1386,6 +1387,14 @@ dependencies = [
 [[package]]
 name = "rtcl-tk-core"
 version = "0.1.0"
+
+[[package]]
+name = "rtcl-tk-runtime"
+version = "0.1.0"
+dependencies = [
+ "rtcl-core",
+ "rtcl-tk-core",
+]
 
 [[package]]
 name = "rtcl-towasm"

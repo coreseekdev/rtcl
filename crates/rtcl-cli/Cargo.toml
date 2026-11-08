@@ -32,6 +32,15 @@ jit = ["dep:rtcl-jit"]
 # MALLOC_CONF="prof:true,prof_prefix=..." 出堆快照，jeprof 出
 # 火焰图/文本报表。见 bench/profile-heap.sh。默认构建不受影响。
 jemalloc = ["dep:tikv-jemallocator"]
+# Native Tk-compatible UI (nsh/GTK4).  Optional and native-only: enabling
+# it pulls the Tk runtime + selected nsh platform backend.  It is mutually
+# exclusive with wasm — rtcl-wasm never exposes this feature and the
+# runtime crate has a wasm32 compile_error.
+tk = ["dep:rtcl-tk-runtime"]
+
+[dependencies.rtcl-tk-runtime]
+path = "../rtcl-tk-runtime"
+optional = true
 
 [dependencies.rtcl-jit]
 workspace = true

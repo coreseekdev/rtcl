@@ -99,20 +99,30 @@ nsh 的 `NshAppView`/`NshView` 嵌入宿主。
 - Canvas 绘图、Tk 8.6 全部 photo/image、复杂 text tag、菜单栏/托盘。
 - 非白名单 Tk 选项：接受但告警/忽略，或直接报“not supported in modern Tk”。
 
-## 5. Crate 布局（建议）
+## 5. Crate 布局与 feature 门禁
 
 ```
 crates/rtcl-tk-core/     # WidgetSpec、选项 schema、布局、事件、shadow tree
 crates/rtcl-tk-runtime/  # rtcl-vm 嵌入 + tk 命令注册 + 事件循环桥
-crates/rtcl-tk-nsh/      # nsh-core/base 组件映射 + 平台封装
+crates/rtcl-tk-nsh/      # nsh-core/base 组件映射 + 平台封装（M1）
 crates/rtcl-tk-testing/  # headless 驱动（nsh-testing / 纯模型测试）
 apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 ```
 
+**可选 feature（与 wasm 互斥）**
+
+- `rtcl-cli` 的 `tk` 是 **opt-in feature**，默认关闭；开启才拉
+  `rtcl-tk-runtime` 与后续 nsh 后端。
+- `rtcl-tk-runtime` 是 **native-only** crate：`target_arch = "wasm32"`
+  下直接 `compile_error!`，不提供 wasm 构建。
+- `rtcl-wasm`/`ui::*` 永不依赖 Tk 轨道；二者不能在同一构建里混用。
+- 原生宿主也可直接依赖 `rtcl-tk-runtime`，不必经过 CLI feature。
+
 `rtcl-tk-core` 不依赖 nsh，可在 CI/无 GUI 环境用纯模型测试；nsh 只出现在
 后端 crate。原生平台编译矩阵：
 
-- Linux 开发需 GTK4 dev（当前环境未安装）；GPU/GPUI 后端可作 CI 桌面路径。
+- Linux 开发/CI 需 GTK4 dev（本机已装 `libgtk-4-dev` 4.22；
+  `nsh-platform-linux` 0.4 + 最小 GTK4 app 已构建并启动验证）。
 - iOS 需 macOS/Xcode；Android 需 NDK；二者走 nsh 的 embed 工程模板。
 - 无 GUI CI：`nsh-testing` headless + tk-core 模型测试。
 
@@ -120,7 +130,7 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| M0 | tk-core WidgetSpec/选项/布局/事件模型 + 纯模型单测 | 无 GUI 下 `button .b ...; pack .b` 生成正确树 |
+| M0 ✅ | tk-core WidgetSpec/选项/布局/事件模型 + 纯模型单测；tk-runtime native-only 骨架 + `tk` feature 门禁；nsh GTK4 最小 app 构建/启动 | 无 GUI 下 `button .b ...; pack .b` 生成正确树；`cargo build -p rtcl-cli --features tk` 通过；wasm 目标对 tk-runtime 报 compile_error |
 | M1 | rtcl-vm 嵌入 + `tk` L0 命令 + nsh 后端最小集（frame/label/button/entry） | Linux/GPUI 或 headless demo：按钮点击执行 Tcl 命令 |
 | M2 | pack/grid、bind/after/update/vwait、textvariable、cget/configure/winfo | 经典 Tk 小脚本可直接跑（差异表外） |
 | M3 | ttk 常用控件 + listbox/menu/scrollbar + 主题/DPI/IME/a11y | 设置页/表单/列表演示 |
@@ -129,7 +139,7 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 ## 7. 主要风险
 
 1. **nsh API 演进**：锁定 0.4.x，封装在 `rtcl-tk-nsh`，不让 tk-core 泄漏 nsh 类型。
-2. **桌面系统依赖**：GTK4/WebKit dev 包不在当前环境；CI 需预装或走 GPUI/headless。
+2. **桌面系统依赖**：本机 GTK4 已就绪；CI 需预装 `libgtk-4-dev`（WebKit 仅 WebView 特性需要）。
 3. **Tk 选项/布局语义差距**：pack 顺序敏感 vs flex 模型、grid 轨道/权重映射，需要差异表与回归脚本。
 4. **事件循环**：`vwait`/`update` 与 nsh 调度器整合是最大技术风险，M1 必须先验证。
 5. **移动端嵌入**：iOS/Android 工程、生命周期、键盘/安全区、签名打包。
@@ -137,12 +147,14 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 
 ## 8. 首个 spike（建议）
 
-在无 GTK4 的环境先做 **headless + GPUI** 两条中最容易的一条：
+M0 已完成：`rtcl-tk-core` 纯模型 + `rtcl-tk-runtime` native-only 骨架 +
+`rtcl-cli` 的 `tk` feature 门禁；nsh 0.4 `nsh-platform-linux` 最小 GTK4
+app 已在本机构建并启动。
 
-1. `rtcl-tk-core`：WidgetSpec 树 + `button/label/frame/entry` + pack 子集 + 单测。
-2. 一个 nsh Rust demo（`nsh-platform-gpui` 或 `nsh-testing`）渲染该树；
-   Tcl 脚本 `button .b -text Hi -command {puts clicked}; pack .b` 点击后
-   回调进入 Tcl。
-3. 通过后再接 iOS/Android 平台 crate 与真实设备。
+下一步 M1：
 
-在此之前不把 nsh 加入 workspace 依赖，先在独立 spike crate 验证 API/构建。
+1. `rtcl-tk-runtime`：嵌入 rtcl-vm，注册
+   `button/label/entry/frame + pack 子集 + cget/configure/destroy`；
+2. `rtcl-tk-nsh`：把 WidgetSpec 映射到 nsh 组件，先用
+   `nsh-testing` headless 验证 Tcl `-command` → 事件 → 回调；
+3. 再接 `nsh-platform-linux` GTK4 窗口，随后 iOS/Android 真机。

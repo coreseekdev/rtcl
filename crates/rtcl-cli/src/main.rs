@@ -8,6 +8,11 @@ use rustyline::history::DefaultHistory;
 use rustyline::{CompletionType, Config, EditMode, Editor};
 use std::path::PathBuf;
 
+// Native Tk runtime is linked only by the optional `tk` feature; importing
+// it here also marks the optional dependency as used for cargo's lint.
+#[cfg(feature = "tk")]
+use rtcl_tk_runtime as _;
+
 mod repl;
 
 // D-40 后续的剖析基建（bench/profile-heap.sh）：jemalloc 全局分配器，

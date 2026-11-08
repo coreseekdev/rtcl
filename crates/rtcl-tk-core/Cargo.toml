@@ -1,0 +1,8 @@
+[package]
+name = "rtcl-tk-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Tk-compatible widget model for rtcl (backend-agnostic)"
+
+[dependencies]

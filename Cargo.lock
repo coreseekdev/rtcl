@@ -1384,6 +1384,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtcl-tk-core"
+version = "0.1.0"
+
+[[package]]
 name = "rtcl-towasm"
 version = "0.1.0"
 dependencies = [

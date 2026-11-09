@@ -410,7 +410,9 @@ rotation×10）；`event generate` 接受 `-x/-y/-rootx/-rooty/-key/-keysym/
 因此二级 `toplevel` 以主窗口内的浮层卡片呈现（标题栏+关闭按钮、
 `wm title/-geometry/-width/-height`、`withdraw/iconify/deiconify`、
 关闭按钮走 `WM_DELETE_WINDOW` 协议否则 destroy；浮层可叠加，默认级联
-定位）；它们不是独立 OS 窗口，不能单独最小化/移动（标题栏拖动未实现），
+定位）；它们不是独立 OS 窗口，不能单独最小化（标题栏可拖动：
+runtime `move_window` 改写 `-geometry`，拖拽状态按窗口路径存 thread-local，
+跨重渲染存活）；
 `wm overrideredirect/transient/group` 仅保存不生效；Canvas 已支持
 旋转/贝塞尔/箭头/虚线/图片/arc/polygon/锚点与 bbox/find 查询；
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc

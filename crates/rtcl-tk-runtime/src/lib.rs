@@ -8340,6 +8340,41 @@ pub fn toplevel_windows() -> Vec<ToplevelView> {
     windows
 }
 
+/// Move a secondary toplevel (its title bar is being dragged): keeps the
+/// current size and rewrites `-geometry` with the new position.
+pub fn move_window(path: &str, x: f64, y: f64) {
+    let Some(ptr) = active_interp() else { return };
+    with_state_mut(unsafe { &mut *ptr }, |rt| {
+        let (width, height) = {
+            let Some(node) = rt.tree.get(path) else {
+                return;
+            };
+            let opt = |name: &str| node.options.get(name).cloned().unwrap_or_default();
+            let (width, height, _, _) = parse_window_geometry(&opt("-geometry"));
+            let width = width
+                .or_else(|| opt("-width").parse().ok().filter(|value| *value > 0.0))
+                .unwrap_or(320.0);
+            let height = height
+                .or_else(|| opt("-height").parse().ok().filter(|value| *value > 0.0))
+                .unwrap_or(240.0);
+            (width, height)
+        };
+        if let Some(node) = rt.tree.get_mut(path) {
+            node.options.insert(
+                "-geometry".to_string(),
+                format!(
+                    "{}x{}+{}+{}",
+                    width as i64,
+                    height as i64,
+                    x.max(0.0) as i64,
+                    y.max(0.0) as i64
+                ),
+            );
+            rt.bump();
+        }
+    });
+}
+
 /// The close button of a secondary toplevel: run its `WM_DELETE_WINDOW`
 /// protocol, else destroy it.
 pub fn close_window(path: &str) {
@@ -12468,6 +12503,45 @@ mod tests {
         assert_eq!(eval(&mut i, ".l nearest 1000"), "4");
         assert_eq!(eval(&mut i, ".l bbox 0"), "");
         assert_eq!(eval(&mut i, "listbox .e; .e nearest 5"), "");
+    }
+
+    #[test]
+    fn toplevel_geometry_move_and_state() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "toplevel .d; wm title .d T; label .d.l -text L; pack .d.l",
+        );
+        assert_eq!(
+            toplevel_windows()
+                .iter()
+                .find(|window| window.path == ".d")
+                .map(|window| (window.width, window.height, window.x, window.y)),
+            Some((320.0, 240.0, None, None))
+        );
+        eval(&mut i, "wm geometry .d 200x100+30+40");
+        assert_eq!(
+            toplevel_windows()
+                .iter()
+                .find(|window| window.path == ".d")
+                .map(|window| (window.width, window.height, window.x, window.y)),
+            Some((200.0, 100.0, Some(30.0), Some(40.0)))
+        );
+        move_window(".d", 60.0, 80.0);
+        assert_eq!(eval(&mut i, "wm geometry .d"), "200x100+60+80");
+        eval(&mut i, "wm withdraw .d");
+        assert!(toplevel_windows().iter().all(|window| window.path != ".d"));
+        eval(&mut i, "wm deiconify .d");
+        assert!(toplevel_windows().iter().any(|window| window.path == ".d"));
+        // The close button runs the WM protocol when set.
+        eval(
+            &mut i,
+            "set ::closed 0; wm protocol .d WM_DELETE_WINDOW {set ::closed 1; destroy .d}",
+        );
+        close_window(".d");
+        assert_eq!(eval(&mut i, "set ::closed"), "1");
+        assert!(i.eval("wm state .d").is_err());
     }
 
     #[test]

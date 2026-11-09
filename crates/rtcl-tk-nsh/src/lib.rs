@@ -395,6 +395,14 @@ fn message_box_gtk(request: &rtcl_tk_runtime::MessageBoxRequest) -> String {
     }
 }
 
+thread_local! {
+    /// Title-bar drags of the secondary toplevels: the page point the
+    /// press began at and the window position then, keyed by path (the
+    /// closures are rebuilt on every re-render).
+    static WINDOW_DRAGS: RefCell<BTreeMap<String, (f64, f64, f64, f64)>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
 fn revision_signal() -> Signal<u64> {
     REVISION.with(|r| {
         let mut slot = r.borrow_mut();
@@ -2012,7 +2020,14 @@ fn render_menubutton(tree: &TkTree, path: &str) -> AnyElement {
         .on_press(move |_: &()| {
             rtcl_tk_runtime::widget_press(&press_path, 0.0, 0.0, 1);
         });
-    let mut menu = menu().trigger(trigger);
+    let mut menu = menu()
+        .trigger(trigger)
+        .placement(match option(tree, path, "-direction") {
+            "above" => nsh_core::overlay::Placement::Top,
+            "left" => nsh_core::overlay::Placement::Left,
+            "right" => nsh_core::overlay::Placement::Right,
+            _ => nsh_core::overlay::Placement::Bottom,
+        });
     if !menu_path.is_empty() {
         for child in menubutton_menu_items(&menu_path) {
             menu = menu.child(child);
@@ -2054,8 +2069,10 @@ fn render_toplevel_window(
     window: &rtcl_tk_runtime::ToplevelView,
     index: usize,
 ) -> AnyElement {
-    let x = window.x.unwrap_or(40.0 + index as f64 * 26.0) as f32;
-    let y = window.y.unwrap_or(40.0 + index as f64 * 26.0) as f32;
+    let wx = window.x.unwrap_or(40.0 + index as f64 * 26.0);
+    let wy = window.y.unwrap_or(40.0 + index as f64 * 26.0);
+    let x = wx as f32;
+    let y = wy as f32;
     let width = window.width as f32;
     let height = window.height as f32;
     let path = window.path.clone();
@@ -2083,6 +2100,53 @@ fn render_toplevel_window(
                 .bg(AdaptiveColor::rgb(0xf3f4f6, 0x1f2937))
                 .border_b(px(1.0))
                 .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+                .cursor(Cursor::Move)
+                .on(EventKind::PressDown, {
+                    let drag_path = window.path.clone();
+                    move |p: &EventPayload| {
+                        if let EventPayload::Press(e) = p {
+                            WINDOW_DRAGS.with(|map| {
+                                map.borrow_mut().insert(
+                                    drag_path.clone(),
+                                    (
+                                        e.page_position.x.0 as f64,
+                                        e.page_position.y.0 as f64,
+                                        wx,
+                                        wy,
+                                    ),
+                                );
+                            });
+                        }
+                    }
+                })
+                .on(EventKind::PressUp, {
+                    let drag_path = window.path.clone();
+                    move |_: &EventPayload| {
+                        WINDOW_DRAGS.with(|map| {
+                            map.borrow_mut().remove(&drag_path);
+                        });
+                    }
+                })
+                .on(EventKind::MouseMove, {
+                    let drag_path = window.path.clone();
+                    move |p: &EventPayload| {
+                        let EventPayload::Mouse(e) = p else {
+                            return;
+                        };
+                        if !matches!(e.pressed_button, Some(nsh_core::MouseButton::Left)) {
+                            return;
+                        }
+                        let start = WINDOW_DRAGS.with(|map| map.borrow().get(&drag_path).copied());
+                        let Some((sx, sy, wx, wy)) = start else {
+                            return;
+                        };
+                        rtcl_tk_runtime::move_window(
+                            &drag_path,
+                            wx + (e.page_position.x.0 as f64 - sx),
+                            wy + (e.page_position.y.0 as f64 - sy),
+                        );
+                    }
+                })
                 .child(
                     text(window.title.clone())
                         .text_size(px(13.0))

@@ -1450,6 +1450,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let leave_path = path.clone();
             let move_path = path.clone();
             let layout_path = path.clone();
+            let wheel_path = path.clone();
             nsh_base::input()
                 .value(rtcl_tk_runtime::entry_value(&path))
                 .auto_focus(rtcl_tk_runtime::focused(&path))
@@ -1510,6 +1511,14 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         &layout_path,
                         b.size.width.0 as f64,
                         b.size.height.0 as f64,
+                    );
+                })
+                .on_wheel(move |e: &WheelEvent| {
+                    rtcl_tk_runtime::wheel_event(
+                        &wheel_path,
+                        -(e.delta.x.0 as f64),
+                        -(e.delta.y.0 as f64),
+                        tk_state(&e.modifiers),
                     );
                 })
                 .into_element()
@@ -1662,6 +1671,9 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let path = path.to_string();
             let disabled = is_disabled(tree, path.as_str());
             let change_path = path.clone();
+            let press_path = path.clone();
+            let focus_path = path.clone();
+            let wheel_path = path.clone();
             nsh_base::input()
                 .multiline(true)
                 .auto_focus(rtcl_tk_runtime::focused(&path))
@@ -1669,6 +1681,23 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .disabled(disabled)
                 .on_change(move |text: &str| {
                     rtcl_tk_runtime::text_changed(&change_path, text);
+                })
+                .on_press(move |e: &PressEvent| {
+                    rtcl_tk_runtime::widget_press(
+                        &press_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        e.clicks,
+                    );
+                    rtcl_tk_runtime::focus_widget(&focus_path);
+                })
+                .on_wheel(move |e: &WheelEvent| {
+                    rtcl_tk_runtime::wheel_event(
+                        &wheel_path,
+                        -(e.delta.x.0 as f64),
+                        -(e.delta.y.0 as f64),
+                        tk_state(&e.modifiers),
+                    );
                 })
                 .into_element()
         }
@@ -1835,7 +1864,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     })
                     .into_element()
             };
-            if horizontal {
+            let mut bar = if horizontal {
                 let width = 160.0f32;
                 let left = arrow("←", -1, path.to_string());
                 let right = arrow("→", 1, path.to_string());
@@ -1862,7 +1891,6 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                             ),
                     )
                     .child(right)
-                    .into_element()
             } else {
                 let height = 100.0f32;
                 let up = arrow("↑", -1, path.to_string());
@@ -1890,8 +1918,16 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                             ),
                     )
                     .child(down)
-                    .into_element()
-            }
+            };
+            let layout_path = path.to_string();
+            bar = bar.on_layout(move |b: &Bounds<Points>| {
+                rtcl_tk_runtime::configure_event(
+                    &layout_path,
+                    b.size.width.0 as f64,
+                    b.size.height.0 as f64,
+                );
+            });
+            bar.into_element()
         }
         WidgetKind::Separator => {
             let press_path = path.to_string();
@@ -2034,6 +2070,14 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     .child(render_node(tree, page));
                 column = column.child(if i == selected { body } else { body.hidden() });
             }
+            let layout_path = path.to_string();
+            column = column.on_layout(move |b: &Bounds<Points>| {
+                rtcl_tk_runtime::configure_event(
+                    &layout_path,
+                    b.size.width.0 as f64,
+                    b.size.height.0 as f64,
+                );
+            });
             column.into_element()
         }
         WidgetKind::Combobox => {
@@ -2045,6 +2089,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let change_path = path.clone();
             let toggle_path = path.clone();
             let press_path = path.clone();
+            let layout_path = path.clone();
             let row = view()
                 .flex_row()
                 .justify_start()
@@ -2080,7 +2125,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                             rtcl_tk_runtime::toggle_combobox(&toggle_path);
                         }),
                 );
-            let mut column = view().flex_col().items_start().gap_1().child(row);
+            let mut column = view().flex_col().items_start().w_full().gap_1().child(row);
             if open {
                 let mut list = view()
                     .flex_col()
@@ -2112,6 +2157,13 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 }
                 column = column.child(list);
             }
+            column = column.on_layout(move |b: &Bounds<Points>| {
+                rtcl_tk_runtime::configure_event(
+                    &layout_path,
+                    b.size.width.0 as f64,
+                    b.size.height.0 as f64,
+                );
+            });
             column.into_element()
         }
         WidgetKind::Canvas => {
@@ -2504,6 +2556,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             }
             let press_path = path.to_string();
             let layout_path = path.to_string();
+            let wheel_path = path.to_string();
             let enter_path = path.to_string();
             let leave_path = path.to_string();
             let move_path = path.to_string();
@@ -2521,6 +2574,14 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         &press_path,
                         e.position.x.0 as f64,
                         e.position.y.0 as f64,
+                    );
+                })
+                .on_wheel(move |e: &WheelEvent| {
+                    rtcl_tk_runtime::wheel_event(
+                        &wheel_path,
+                        -(e.delta.x.0 as f64),
+                        -(e.delta.y.0 as f64),
+                        tk_state(&e.modifiers),
                     );
                 })
                 .on_mouse_enter(move |e: &MouseEvent| {

@@ -64,6 +64,8 @@ url = "2"
 [patch.crates-io]
 nsh-core = { git = "ssh://git@github.com/coreseekdev/nsh", branch = "rtcl-tk" }
 nsh-base = { git = "ssh://git@github.com/coreseekdev/nsh", branch = "rtcl-tk" }
+nsh-engine = { git = "ssh://git@github.com/coreseekdev/nsh", branch = "rtcl-tk" }
+nsh-testing = { git = "ssh://git@github.com/coreseekdev/nsh", branch = "rtcl-tk" }
 
 [profile.release]
 opt-level = 3        # Optimize for speed

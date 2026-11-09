@@ -496,3 +496,75 @@ fn button_configure_fires_on_resize() {
     app.wait_for("big")
         .expect("the button's own <Configure> reported the filled width");
 }
+
+const NB_CB_CONFIGURE_APP: &str = r#"
+set ::nb ""
+set ::cb ""
+ttk::notebook .nb
+frame .nb.a -text A
+.nb add .nb.a
+pack .nb -fill x
+ttk::combobox .cb -values {A B}
+pack .cb -fill x
+label .nbo -textvariable ::nb
+pack .nbo
+label .cbo -textvariable ::cb
+pack .cbo
+bind .nb <Configure> {set ::nb nbcfg}
+bind .cb <Configure> {set ::cb cbcfg}
+"#;
+
+#[component]
+fn NbCbConfigureApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(NB_CB_CONFIGURE_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn notebook_and_combobox_configure_fire() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<NbCbConfigureApp>()))
+        .expect("headless engine starts");
+    app.set_viewport(Size::new(Points(500.0), Points(400.0)))
+        .expect("resize");
+    app.wait_for("A").expect("notebook/combobox render");
+    let _ = app.settle();
+    app.wait_for("nbcfg")
+        .expect("the notebook reported <Configure>");
+    app.wait_for("cbcfg")
+        .expect("the combobox reported <Configure>");
+}
+
+const WHEEL_BIND_APP: &str = r#"
+set ::value x
+set ::wheel ""
+set ::button ""
+entry .e -textvariable ::value
+pack .e
+label .wo -textvariable ::wheel
+pack .wo
+label .bo -textvariable ::button
+pack .bo
+bind .e <MouseWheel> {set ::wheel %D}
+bind .e <Button-5> {set ::button down}
+"#;
+
+#[component]
+fn WheelBindApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(WHEEL_BIND_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn wheel_bindings_fire_on_entry() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<WheelBindApp>()))
+        .expect("headless engine starts");
+    app.set_viewport(Size::new(Points(500.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("x").expect("entry renders");
+    app.wheel("text:x", Points(0.0), Points(100.0))
+        .expect("wheel over the entry");
+    app.wait_for("-120")
+        .expect("<MouseWheel> got Tk's %D for a down notch");
+    app.wait_for("down")
+        .expect("<Button-5> fired for the wheel");
+}

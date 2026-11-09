@@ -3409,16 +3409,8 @@ fn best_binding(interp: &Interp, tag: &str, event: &EventPattern) -> Option<Stri
     best_script(&bindings, event)
 }
 
-/// Run the bindings for `path` in its bindtags order and re-render.
-/// Errors go to [`take_errors`].
-pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) -> bool {
-    let Some(ptr) = active_interp() else {
-        return false;
-    };
-    // Safety: the pointer is the live engine-thread Interp.
-    let interp = unsafe { &mut *ptr };
-    let event = event_from(sequence, ctx);
-    let tags = with_state(interp, |rt| rt.bindtags.get(path).cloned())
+fn tags_for(interp: &Interp, path: &str) -> Vec<String> {
+    with_state(interp, |rt| rt.bindtags.get(path).cloned())
         .flatten()
         .unwrap_or_else(|| {
             let (class, top) = with_state(interp, |rt| {
@@ -3435,7 +3427,31 @@ pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) -> bool {
             .flatten()
             .unwrap_or_else(|| ("Widget".to_string(), ".".to_string()));
             vec![path.to_string(), class, top, "all".to_string()]
-        });
+        })
+}
+
+/// Whether any bindtag of `path` has a binding matching `sequence`.
+fn has_binding(interp: &Interp, path: &str, sequence: &str, ctx: &EventCtx) -> bool {
+    let event = event_from(sequence, ctx);
+    let mut seen = std::collections::BTreeSet::new();
+    tags_for(interp, path).into_iter().any(|tag| {
+        if !seen.insert(tag.clone()) {
+            return false;
+        }
+        best_binding(interp, &tag, &event).is_some()
+    })
+}
+
+/// Run the bindings for `path` in its bindtags order and re-render.
+/// Errors go to [`take_errors`].
+pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) -> bool {
+    let Some(ptr) = active_interp() else {
+        return false;
+    };
+    // Safety: the pointer is the live engine-thread Interp.
+    let interp = unsafe { &mut *ptr };
+    let event = event_from(sequence, ctx);
+    let tags = tags_for(interp, path);
     let mut seen = std::collections::BTreeSet::new();
     let mut scripts = Vec::new();
     for tag in tags {
@@ -5269,12 +5285,40 @@ fn wheel_scroll(interp: &mut Interp, path: &str, direction: f64) {
     notify_yscroll(interp, path, total);
 }
 
+thread_local! {
+    /// Last frame reported per widget, so a platform relayout that did not
+    /// change a widget's size does not fire `<Configure>` again (which
+    /// would ask for another render forever).
+    static LAST_CONFIGURE: RefCell<BTreeMap<String, (i64, i64)>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
 /// A widget's frame changed: `<Configure>` with `%w/%h`.
 pub fn configure_event(path: &str, width: f64, height: f64) {
+    let size = (width.round() as i64, height.round() as i64);
+    let changed = LAST_CONFIGURE.with(|last| {
+        let mut last = last.borrow_mut();
+        if last.get(path) == Some(&size) {
+            false
+        } else {
+            last.insert(path.to_string(), size);
+            true
+        }
+    });
+    if !changed {
+        return;
+    }
     let mut ctx = EventCtx::for_path(path);
-    ctx.width = width.round() as i64;
-    ctx.height = height.round() as i64;
+    ctx.width = size.0;
+    ctx.height = size.1;
+    let Some(ptr) = active_interp() else { return };
+    if !has_binding(unsafe { &*ptr }, path, "<Configure>", &ctx) {
+        return;
+    }
     run_binding(path, "<Configure>", &ctx);
+    // A Configure handler may change what the widget shows; request one
+    // render (the size dedupe above stops a layout loop).
+    bump_active();
 }
 
 /// A key in a rich-text editor: dispatch the text widget's Tk `<KeyPress>`

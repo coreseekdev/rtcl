@@ -2888,7 +2888,7 @@ dependencies = [
 [[package]]
 name = "nsh-base"
 version = "0.4.0"
-source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#34556ab86bffa142affbcc55e0ce2dc883b9eee4"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#73c24981b43404b1140998f3af2163dfa468fcb2"
 dependencies = [
  "chrono",
  "html5ever",
@@ -2917,7 +2917,7 @@ dependencies = [
 [[package]]
 name = "nsh-core"
 version = "0.4.0"
-source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#34556ab86bffa142affbcc55e0ce2dc883b9eee4"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#73c24981b43404b1140998f3af2163dfa468fcb2"
 dependencies = [
  "cap-std",
  "crc32fast",
@@ -2952,8 +2952,7 @@ dependencies = [
 [[package]]
 name = "nsh-engine"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a22f5b30bd9501790a6e487d07593e626117ce9b063fbf8ebdc7f44d1bd829c4"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#73c24981b43404b1140998f3af2163dfa468fcb2"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -2974,8 +2973,7 @@ dependencies = [
 [[package]]
 name = "nsh-js"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79e175909211c71b49591e2c56d255802d7a8a61ea7a948f46c265c5e6fad291"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#73c24981b43404b1140998f3af2163dfa468fcb2"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
@@ -2996,7 +2994,7 @@ dependencies = [
 [[package]]
 name = "nsh-macros"
 version = "0.4.0"
-source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#34556ab86bffa142affbcc55e0ce2dc883b9eee4"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#73c24981b43404b1140998f3af2163dfa468fcb2"
 dependencies = [
  "imagesize 0.15.0",
  "proc-macro2",
@@ -3009,8 +3007,7 @@ dependencies = [
 [[package]]
 name = "nsh-package"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad1562533ba286bad9a13f8790bc6a4c9ca6acc3977151bc513b5f6940909c11"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#73c24981b43404b1140998f3af2163dfa468fcb2"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3045,8 +3042,7 @@ dependencies = [
 [[package]]
 name = "nsh-testing"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa9f8c137cbd4bb5ef50d25c9ce38c88e470713c0b1f2fce6a0283b44a6a457e"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#73c24981b43404b1140998f3af2163dfa468fcb2"
 dependencies = [
  "crossbeam-channel",
  "log",

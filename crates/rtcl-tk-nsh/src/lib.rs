@@ -1881,7 +1881,16 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             button = pointer_events!(button, path);
             button.into_element()
         }
-        WidgetKind::Entry => render_entry_input(tree, path, false),
+        WidgetKind::Entry => view()
+            .w_full()
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+            .bg(AdaptiveColor::rgb(0xffffff, 0x111827))
+            .px(px(4.0))
+            .py(px(2.0))
+            .child(render_entry_input(tree, path, false))
+            .into_element(),
         WidgetKind::Spinbox => {
             let press_path = path.to_string();
             let up_path = path.to_string();
@@ -1889,15 +1898,29 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let focus_up = path.to_string();
             let focus_down = path.to_string();
             let disabled = is_disabled(tree, path);
-            let input = render_entry_input(tree, path, true);
-            let up = nsh_base::button()
+            let input = view()
+                .flex_1()
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+                .bg(AdaptiveColor::rgb(0xffffff, 0x111827))
                 .px(px(4.0))
-                .py(px(0.0))
-                .rounded(px(3.0))
-                .disabled(disabled)
+                .py(px(2.0))
+                .child(render_entry_input(tree, path, true));
+            let step_style = |button: nsh_base::ButtonElement| {
+                button
+                    .w(px(18.0))
+                    .h(px(11.0))
+                    .rounded(px(3.0))
+                    .border_1()
+                    .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+                    .bg(AdaptiveColor::rgb(0xf3f4f6, 0x374151))
+                    .disabled(disabled)
+            };
+            let up = step_style(nsh_base::button())
                 .child(
                     text("\u{25b4}")
-                        .text_size(px(10.0))
+                        .text_size(px(9.0))
                         .text_color(AdaptiveColor::rgb(0x374151, 0xd1d5db)),
                 )
                 .on_press(move |_: &()| {
@@ -1905,14 +1928,10 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     rtcl_tk_runtime::spinbox_step(&up_path, 1);
                     rtcl_tk_runtime::focus_widget(&focus_up);
                 });
-            let down = nsh_base::button()
-                .px(px(4.0))
-                .py(px(0.0))
-                .rounded(px(3.0))
-                .disabled(disabled)
+            let down = step_style(nsh_base::button())
                 .child(
                     text("\u{25be}")
-                        .text_size(px(10.0))
+                        .text_size(px(9.0))
                         .text_color(AdaptiveColor::rgb(0x374151, 0xd1d5db)),
                 )
                 .on_press(move |_: &()| {
@@ -1924,7 +1943,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .items_center()
                 .gap_1()
                 .w_full()
-                .child(view().flex_1().child(input))
+                .child(input)
                 .child(view().flex_col().gap(px(1.0)).child(up).child(down))
                 .into_element()
         }

@@ -510,6 +510,9 @@ pub fn install(interp: &mut Interp) {
         "clipboard",
         "selection",
         "tk_messageBox",
+        "tk_getOpenFile",
+        "tk_getSaveFile",
+        "tk_chooseDirectory",
     ] {
         interp.register_command(name, global_command);
     }
@@ -4164,6 +4167,136 @@ thread_local! {
     /// this app does not own it (implemented by the native platform).
     static CLIPBOARD_GETTER: std::cell::Cell<Option<fn() -> String>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// Which native file dialog `tk_getOpenFile`, `tk_getSaveFile`, or
+/// `tk_chooseDirectory` asks for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FileDialogKind {
+    #[default]
+    Open,
+    Save,
+    Directory,
+}
+
+/// A file-dialog request, handed to a backend that can show one natively.
+#[derive(Debug, Clone, Default)]
+pub struct FileDialogRequest {
+    pub kind: FileDialogKind,
+    pub title: String,
+    pub initial_dir: String,
+    pub initial_file: String,
+    /// Description and glob patterns, e.g. `("Text", [".txt", ".md"])`.
+    pub file_types: Vec<(String, Vec<String>)>,
+    pub multiple: bool,
+    pub confirm_overwrite: bool,
+    pub default_extension: String,
+    pub parent: String,
+}
+
+thread_local! {
+    /// The backend's native file dialog.
+    static FILE_DIALOG: std::cell::Cell<Option<fn(&FileDialogRequest) -> Option<Vec<String>>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Give the file-dialog commands a native dialog.  The handler blocks until
+/// the user answers and returns the chosen paths (`None`/empty when the
+/// dialog was cancelled).
+pub fn set_file_dialog_handler(handler: fn(&FileDialogRequest) -> Option<Vec<String>>) {
+    FILE_DIALOG.with(|cell| cell.set(Some(handler)));
+}
+
+fn file_dialog_impl(interp: &mut Interp, args: &[Value], kind: FileDialogKind) -> Result<Value> {
+    let command = match kind {
+        FileDialogKind::Open => "tk_getOpenFile",
+        FileDialogKind::Save => "tk_getSaveFile",
+        FileDialogKind::Directory => "tk_chooseDirectory",
+    };
+    let mut request = FileDialogRequest {
+        kind,
+        ..FileDialogRequest::default()
+    };
+    let mut type_variable: Option<String> = None;
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        let Some(value) = args.get(index + 1) else {
+            return Err(wrong(command, "?-option value ...?", args.len() + 1));
+        };
+        match option {
+            "-title" => request.title = value.as_str().to_string(),
+            "-initialdir" => request.initial_dir = value.as_str().to_string(),
+            "-initialfile" => request.initial_file = value.as_str().to_string(),
+            "-parent" => request.parent = value.as_str().to_string(),
+            "-defaultextension" => request.default_extension = value.as_str().to_string(),
+            "-multiple" => request.multiple = value.as_bool().unwrap_or(false),
+            "-confirmoverwrite" => request.confirm_overwrite = value.as_bool().unwrap_or(false),
+            "-mustexist" | "-typevariable" => {
+                if option == "-typevariable" {
+                    type_variable = Some(value.as_str().to_string());
+                }
+            }
+            "-filetypes" => {
+                let Some(types) = value.as_list() else {
+                    return Err(generic("bad -filetypes value: expected a list"));
+                };
+                for entry in types {
+                    let Some(pair) = entry.as_list() else {
+                        continue;
+                    };
+                    let description = pair
+                        .first()
+                        .map(|v| v.as_str().to_string())
+                        .unwrap_or_default();
+                    let patterns = pair
+                        .get(1)
+                        .and_then(|v| v.as_list())
+                        .map(|list| {
+                            list.iter()
+                                .map(|pattern| pattern.as_str().to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    request.file_types.push((description, patterns));
+                }
+            }
+            other => {
+                return Err(generic(format!(
+                    "bad option \"{other}\": must be -defaultextension, -filetypes, -initialdir, -initialfile, -multiple, -mustexist, -parent, -title, or -typevariable"
+                )));
+            }
+        }
+        index += 2;
+    }
+    let mut paths = FILE_DIALOG
+        .with(|cell| cell.get())
+        .and_then(|handler| handler(&request))
+        .unwrap_or_default();
+    if kind == FileDialogKind::Save && !request.default_extension.is_empty() {
+        let extension = &request.default_extension;
+        if let Some(path) = paths.first_mut() {
+            let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            if !name.contains('.') {
+                if !extension.starts_with('.') {
+                    path.push('.');
+                }
+                path.push_str(extension);
+            }
+        }
+    }
+    if let Some(name) = type_variable {
+        if let Some((description, _)) = request.file_types.first() {
+            let _ = interp.set_var(&name, Value::from_str(description));
+        }
+    }
+    if request.multiple {
+        Ok(list_value(paths))
+    } else {
+        Ok(Value::from_str(
+            paths.first().map(String::as_str).unwrap_or(""),
+        ))
+    }
 }
 
 thread_local! {
@@ -10082,6 +10215,9 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "clipboard" => clipboard_impl(interp, args),
         "selection" => selection_impl(interp, args),
         "tk_messageBox" => message_box_impl(interp, args),
+        "tk_getOpenFile" => file_dialog_impl(interp, args, FileDialogKind::Open),
+        "tk_getSaveFile" => file_dialog_impl(interp, args, FileDialogKind::Save),
+        "tk_chooseDirectory" => file_dialog_impl(interp, args, FileDialogKind::Directory),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -10676,6 +10812,66 @@ mod tests {
             "selection handle -selection CLIPBOARD -type STRING . {}",
         );
         assert_eq!(eval(&mut i, "selection get -selection CLIPBOARD"), "sys");
+    }
+
+    static LAST_FILE_DIALOG: std::sync::Mutex<Option<FileDialogRequest>> =
+        std::sync::Mutex::new(None);
+
+    fn choose_paths(request: &FileDialogRequest) -> Option<Vec<String>> {
+        *LAST_FILE_DIALOG.lock().unwrap() = Some(request.clone());
+        Some(vec!["/tmp/a.txt".to_string(), "/tmp/b.txt".to_string()])
+    }
+
+    fn choose_plain(_: &FileDialogRequest) -> Option<Vec<String>> {
+        Some(vec!["/tmp/name".to_string()])
+    }
+
+    #[test]
+    fn file_dialogs_parse_and_return_paths() {
+        let mut i = Interp::new();
+        install(&mut i);
+        assert_eq!(eval(&mut i, "tk_getOpenFile"), "");
+        assert_eq!(eval(&mut i, "tk_getOpenFile -multiple 1"), "");
+        set_file_dialog_handler(choose_paths);
+        assert_eq!(
+            eval(
+                &mut i,
+                "tk_getOpenFile -title T -initialdir /tmp -initialfile a.txt                 -filetypes {{Text {.txt .md}} {All *}}"
+            ),
+            "/tmp/a.txt"
+        );
+        let request = LAST_FILE_DIALOG.lock().unwrap().take().unwrap();
+        assert_eq!(request.kind, FileDialogKind::Open);
+        assert_eq!(request.title, "T");
+        assert_eq!(request.initial_dir, "/tmp");
+        assert_eq!(request.initial_file, "a.txt");
+        assert_eq!(
+            request.file_types,
+            vec![
+                (
+                    "Text".to_string(),
+                    vec![".txt".to_string(), ".md".to_string()]
+                ),
+                ("All".to_string(), vec!["*".to_string()]),
+            ]
+        );
+        assert_eq!(
+            eval(&mut i, "tk_getOpenFile -multiple 1"),
+            "/tmp/a.txt /tmp/b.txt"
+        );
+        // Save keeps an existing extension and appends a missing one.
+        assert_eq!(
+            eval(&mut i, "tk_getSaveFile -defaultextension .tcl"),
+            "/tmp/a.txt"
+        );
+        set_file_dialog_handler(choose_plain);
+        assert_eq!(
+            eval(&mut i, "tk_getSaveFile -defaultextension .tcl"),
+            "/tmp/name.tcl"
+        );
+        assert_eq!(eval(&mut i, "tk_chooseDirectory -title D"), "/tmp/name");
+        set_file_dialog_handler(|_| None);
+        assert_eq!(eval(&mut i, "tk_getSaveFile"), "");
     }
 
     static LAST_MESSAGE_BOX: std::sync::Mutex<Option<MessageBoxRequest>> =

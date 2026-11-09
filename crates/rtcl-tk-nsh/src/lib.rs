@@ -75,6 +75,139 @@ pub fn install_backend() {
     rtcl_tk_runtime::set_clipboard_getter(nsh_platform_linux::clipboard_text_blocking);
     #[cfg(target_os = "linux")]
     rtcl_tk_runtime::set_message_box_handler(message_box_gtk);
+    #[cfg(target_os = "linux")]
+    rtcl_tk_runtime::set_file_dialog_handler(file_dialog_gtk);
+}
+
+/// The visible GTK toplevel a modal dialog should parent to.
+#[cfg(target_os = "linux")]
+fn gtk_parent_window() -> Option<gtk4::Window> {
+    use gtk4::prelude::{Cast, WidgetExt};
+    gtk4::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk4::Window>().ok())
+        .find(|window| window.is_visible())
+}
+
+/// `tk_getOpenFile`/`tk_getSaveFile`/`tk_chooseDirectory` as GTK dialogs,
+/// blocking in a nested main context until the user answers.
+#[cfg(target_os = "linux")]
+fn file_dialog_gtk(request: &rtcl_tk_runtime::FileDialogRequest) -> Option<Vec<String>> {
+    use gtk4::gio::prelude::FileExt;
+    use gtk4::prelude::{Cast, ListModelExt};
+    use rtcl_tk_runtime::FileDialogKind;
+    if gtk4::init().is_err() {
+        return None;
+    }
+    let dialog = gtk4::FileDialog::builder().modal(true).build();
+    if !request.title.is_empty() {
+        dialog.set_title(&request.title);
+    }
+    if !request.initial_dir.is_empty() {
+        let folder = gtk4::gio::File::for_path(&request.initial_dir);
+        dialog.set_initial_folder(Some(&folder));
+    }
+    if !request.initial_file.is_empty() {
+        dialog.set_initial_name(Some(&request.initial_file));
+    }
+    if !request.file_types.is_empty() {
+        let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
+        for (description, patterns) in &request.file_types {
+            let filter = gtk4::FileFilter::new();
+            filter.set_name(Some(description));
+            for pattern in patterns {
+                let glob = if pattern == "*" {
+                    "*".to_string()
+                } else if pattern.starts_with('.') {
+                    format!("*{pattern}")
+                } else {
+                    pattern.clone()
+                };
+                filter.add_pattern(&glob);
+            }
+            filters.append(&filter);
+        }
+        dialog.set_filters(Some(&filters));
+        if let Some(first) = filters
+            .item(0)
+            .and_then(|object| object.downcast::<gtk4::FileFilter>().ok())
+        {
+            dialog.set_default_filter(Some(&first));
+        }
+    }
+    let picked: std::rc::Rc<std::cell::RefCell<Option<Vec<String>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let parent = gtk_parent_window();
+    let path_of =
+        |file: gtk4::gio::File| file.path().map(|path| path.to_string_lossy().to_string());
+    match request.kind {
+        FileDialogKind::Open if request.multiple => {
+            let done = picked.clone();
+            dialog.open_multiple(
+                parent.as_ref(),
+                None::<&gtk4::gio::Cancellable>,
+                move |result| {
+                    let paths = result
+                        .ok()
+                        .map(|model| {
+                            (0..model.n_items())
+                                .filter_map(|index| {
+                                    model.item(index).and_then(|object| {
+                                        object.downcast::<gtk4::gio::File>().ok()
+                                    })
+                                })
+                                .filter_map(|file| {
+                                    file.path().map(|p| p.to_string_lossy().to_string())
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    *done.borrow_mut() = Some(paths);
+                },
+            );
+        }
+        FileDialogKind::Open => {
+            let done = picked.clone();
+            dialog.open(
+                parent.as_ref(),
+                None::<&gtk4::gio::Cancellable>,
+                move |result| {
+                    *done.borrow_mut() = Some(result.ok().and_then(path_of).into_iter().collect());
+                },
+            );
+        }
+        FileDialogKind::Save => {
+            let done = picked.clone();
+            dialog.save(
+                parent.as_ref(),
+                None::<&gtk4::gio::Cancellable>,
+                move |result| {
+                    *done.borrow_mut() = Some(result.ok().and_then(path_of).into_iter().collect());
+                },
+            );
+        }
+        FileDialogKind::Directory => {
+            let done = picked.clone();
+            dialog.select_folder(
+                parent.as_ref(),
+                None::<&gtk4::gio::Cancellable>,
+                move |result| {
+                    *done.borrow_mut() = Some(result.ok().and_then(path_of).into_iter().collect());
+                },
+            );
+        }
+    }
+    let context = gtk4::glib::MainContext::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let answered = picked.borrow().is_some();
+        if answered || std::time::Instant::now() >= deadline {
+            break;
+        }
+        context.iteration(true);
+    }
+    let answer = picked.borrow_mut().take();
+    answer
 }
 
 /// `tk_messageBox` as a GTK modal alert.  The Tcl command blocks in a
@@ -135,11 +268,7 @@ fn message_box_gtk(request: &rtcl_tk_runtime::MessageBoxRequest) -> String {
     let dialog = builder.build();
     let answer = std::rc::Rc::new(std::cell::Cell::new(None::<i32>));
     let picked = answer.clone();
-    use gtk4::prelude::{Cast, WidgetExt};
-    let parent = gtk4::Window::list_toplevels()
-        .into_iter()
-        .filter_map(|widget| widget.downcast::<gtk4::Window>().ok())
-        .find(|window| window.is_visible());
+    let parent = gtk_parent_window();
     dialog.choose(
         parent.as_ref(),
         None::<&gtk4::gio::Cancellable>,

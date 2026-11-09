@@ -221,7 +221,7 @@ text/image 默认 `-anchor center`，渲染与 bbox 都按 `-anchor` 摆放。
 箭头未计入。
 `image create
 photo` + `label/button -image` 渲染文件图片。`text tag add/remove/
-configure/cget/ranges/names/delete` 维护区间；有标签的 text 用 nsh
+configure/cget/ranges/names/delete/nextrange/prevrange` 维护与遍历区间；有标签的 text 用 nsh
 `RichEditor`（ProseMirror starter schema + textStyle）渲染为**光标级
 WYSIWYG**：原生光标/选区/IME，标签映射为 color/backgroundColor/
 fontSize/fontFamily/bold 标记；编辑后的富文档（ProseMirror JSON）作为

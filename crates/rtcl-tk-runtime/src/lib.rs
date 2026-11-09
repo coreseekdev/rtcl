@@ -6682,6 +6682,52 @@ fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<V
             }
             Ok(list_value(out))
         }
+        "nextrange" | "prevrange" => {
+            if rest.len() < 3 || rest.len() > 4 {
+                return Err(wrong(
+                    if rest[0].as_str() == "nextrange" {
+                        "tag nextrange"
+                    } else {
+                        "tag prevrange"
+                    },
+                    "tagName index1 ?index2?",
+                    rest.len() + 2,
+                ));
+            }
+            let start = text_index(rest[2].as_str(), &content, cursor, &marks)?;
+            let limit = match rest.get(3) {
+                Some(value) => Some(text_index(value.as_str(), &content, cursor, &marks)?),
+                None => None,
+            };
+            let ranges = with_state(interp, |rt| {
+                rt.text_tags
+                    .get(path)
+                    .and_then(|tags| tags.get(rest[1].as_str()))
+                    .map(|tag| tag.ranges.clone())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+            let found = if rest[0].as_str() == "nextrange" {
+                ranges
+                    .into_iter()
+                    .filter(|(begin, end)| *begin >= start && limit.is_none_or(|limit| *end <= limit))
+                    .min_by_key(|(begin, _)| *begin)
+            } else {
+                ranges
+                    .into_iter()
+                    .filter(|(begin, end)| *begin < start && limit.is_none_or(|limit| *end > limit))
+                    .max_by_key(|(begin, _)| *begin)
+            };
+            let out = found
+                .map(|(begin, end)| {
+                    vec![
+                        char_to_linecol(&content, begin),
+                        char_to_linecol(&content, end),
+                    ]
+                })
+                .unwrap_or_default();
+            Ok(list_value(out))
+        }
         "delete" => {
             with_state_mut(interp, |rt| {
                 if let Some(tags) = rt.text_tags.get_mut(path) {
@@ -6695,7 +6741,7 @@ fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<V
         }
         "bind" | "raise" | "lower" => Ok(Value::empty()),
         other => Err(generic(format!(
-            "bad option \"{other}\": must be add, bind, cget, configure, delete, names, ranges, or remove"
+            "bad option \"{other}\": must be add, bind, cget, configure, delete, names, nextrange, prevrange, ranges, or remove"
         ))),
     }
 }
@@ -7984,6 +8030,27 @@ mod tests {
         eval(&mut i, ".n mark set insert 1.1");
         eval(&mut i, ".n insert 1.1 AA");
         assert_eq!(eval(&mut i, ".n index insert"), "1.1");
+    }
+
+    #[test]
+    fn text_tag_nextrange_and_prevrange() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "text .t2; .t2 insert 1.0 abcdefghij; \
+             .t2 tag add a 1.2 1.4; .t2 tag add a 1.6 1.8",
+        );
+        assert_eq!(eval(&mut i, ".t2 tag ranges a"), "1.2 1.4 1.6 1.8");
+        assert_eq!(eval(&mut i, ".t2 tag nextrange a 1.0"), "1.2 1.4");
+        assert_eq!(eval(&mut i, ".t2 tag nextrange a 1.3"), "1.6 1.8");
+        assert_eq!(eval(&mut i, ".t2 tag nextrange a 1.4"), "1.6 1.8");
+        assert_eq!(eval(&mut i, ".t2 tag nextrange a 1.9"), "");
+        assert_eq!(eval(&mut i, ".t2 tag nextrange a 1.0 1.5"), "1.2 1.4");
+        assert_eq!(eval(&mut i, ".t2 tag prevrange a 1.9"), "1.6 1.8");
+        assert_eq!(eval(&mut i, ".t2 tag prevrange a 1.7"), "1.6 1.8");
+        assert_eq!(eval(&mut i, ".t2 tag prevrange a 1.6"), "1.2 1.4");
+        assert_eq!(eval(&mut i, ".t2 tag prevrange a 1.2"), "");
     }
 
     #[test]

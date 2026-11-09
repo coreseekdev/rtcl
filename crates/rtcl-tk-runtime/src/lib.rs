@@ -1453,15 +1453,15 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     if args.len() != 4 {
                         return Err(wrong("itemcget", "tagOrId -option", args.len()));
                     }
-                    let id = args[2]
-                        .as_str()
-                        .parse::<u64>()
-                        .map_err(|_| generic("bad item id"))?;
+                    let target = args[2].as_str();
                     let value = with_state(interp, |rt| {
-                        rt.canvases
-                            .get(path)
-                            .and_then(|canvas| canvas.items.iter().find(|i| i.id == id))
-                            .and_then(|item| item.options.get(args[3].as_str()).cloned())
+                        rt.canvases.get(path).and_then(|canvas| {
+                            canvas
+                                .items
+                                .iter()
+                                .find(|item| canvas_item_matches(item, target))
+                                .and_then(|item| item.options.get(args[3].as_str()).cloned())
+                        })
                     })
                     .flatten()
                     .unwrap_or_default();
@@ -2861,10 +2861,12 @@ fn substitute_bindings(script: &str, ctx: &EventCtx) -> String {
         }
         match chars.next() {
             Some('%') => out.push('%'),
-            Some('W') | Some('w') => out.push_str(&ctx.path),
+            Some('W') => out.push_str(&ctx.path),
+            Some('w') | Some('h') => out.push_str("0"),
             Some('x') => out.push_str(&ctx.x.to_string()),
             Some('y') => out.push_str(&ctx.y.to_string()),
-            Some('X') | Some('Y') => out.push_str("0"),
+            Some('X') => out.push_str(&ctx.x.to_string()),
+            Some('Y') => out.push_str(&ctx.y.to_string()),
             Some('K') => out.push_str(&ctx.key),
             Some('A') => out.push_str(&ctx.character),
             Some('k') => out.push_str(&ctx.key),
@@ -5511,15 +5513,17 @@ fn canvas_coords(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Valu
     if rest.is_empty() {
         return Err(wrong("coords", "tagOrId ?x y ...?", rest.len() + 2));
     }
-    let id = rest[0]
-        .as_str()
-        .parse::<u64>()
-        .map_err(|_| generic("bad item id"))?;
+    let target = rest[0].as_str();
     if rest.len() == 1 {
         let coords = with_state(interp, |rt| {
             rt.canvases
                 .get(path)
-                .and_then(|canvas| canvas.items.iter().find(|i| i.id == id))
+                .and_then(|canvas| {
+                    canvas
+                        .items
+                        .iter()
+                        .find(|item| canvas_item_matches(item, target))
+                })
                 .map(|item| {
                     item.coords
                         .iter()
@@ -5536,12 +5540,12 @@ fn canvas_coords(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Valu
         .map(|v| parse_f64_str(v.as_str(), "coordinate"))
         .collect::<Result<Vec<_>>>()?;
     with_state_mut(interp, |rt| {
-        if let Some(item) = rt
-            .canvases
-            .get_mut(path)
-            .and_then(|canvas| canvas.items.iter_mut().find(|i| i.id == id))
-        {
-            item.coords = coords;
+        if let Some(canvas) = rt.canvases.get_mut(path) {
+            for item in canvas.items.iter_mut() {
+                if canvas_item_matches(item, target) {
+                    item.coords = coords.clone();
+                }
+            }
             rt.bump();
         }
     });
@@ -5556,16 +5560,16 @@ fn canvas_itemconfigure(interp: &mut Interp, path: &str, rest: &[Value]) -> Resu
             rest.len() + 2,
         ));
     }
-    let id = rest[0]
-        .as_str()
-        .parse::<u64>()
-        .map_err(|_| generic("bad item id"))?;
+    let target = rest[0].as_str();
     if rest.len() == 2 {
         let value = with_state(interp, |rt| {
-            rt.canvases
-                .get(path)
-                .and_then(|canvas| canvas.items.iter().find(|i| i.id == id))
-                .and_then(|item| item.options.get(rest[1].as_str()).cloned())
+            rt.canvases.get(path).and_then(|canvas| {
+                canvas
+                    .items
+                    .iter()
+                    .find(|item| canvas_item_matches(item, target))
+                    .and_then(|item| item.options.get(rest[1].as_str()).cloned())
+            })
         })
         .flatten()
         .unwrap_or_default();
@@ -5573,12 +5577,12 @@ fn canvas_itemconfigure(interp: &mut Interp, path: &str, rest: &[Value]) -> Resu
     }
     let options = parse_pairs(rest, 1, "itemconfigure")?;
     with_state_mut(interp, |rt| {
-        if let Some(item) = rt
-            .canvases
-            .get_mut(path)
-            .and_then(|canvas| canvas.items.iter_mut().find(|i| i.id == id))
-        {
-            item.options.extend(options);
+        if let Some(canvas) = rt.canvases.get_mut(path) {
+            for item in canvas.items.iter_mut() {
+                if canvas_item_matches(item, target) {
+                    item.options.extend(options.clone());
+                }
+            }
             rt.bump();
         }
     });
@@ -5606,7 +5610,7 @@ fn canvas_move(interp: &mut Interp, path: &str, rest: &[Value], scale: bool) -> 
     with_state_mut(interp, |rt| {
         if let Some(canvas) = rt.canvases.get_mut(path) {
             for item in canvas.items.iter_mut() {
-                if target != "all" && item.id.to_string() != target {
+                if !canvas_item_matches(item, target) {
                     continue;
                 }
                 if scale {
@@ -5643,19 +5647,24 @@ fn canvas_raise(interp: &mut Interp, path: &str, rest: &[Value], raise: bool) ->
     let target = rest[0].as_str();
     with_state_mut(interp, |rt| {
         if let Some(canvas) = rt.canvases.get_mut(path) {
-            if target == "all" {
-                return;
-            }
-            if let Some(index) = canvas
-                .items
-                .iter()
-                .position(|item| item.id.to_string() == target)
-            {
-                let item = canvas.items.remove(index);
-                if raise {
-                    canvas.items.push(item);
+            let mut selected = Vec::new();
+            let mut rest_items = Vec::new();
+            for item in canvas.items.drain(..) {
+                if canvas_item_matches(&item, target) {
+                    selected.push(item);
                 } else {
-                    canvas.items.insert(0, item);
+                    rest_items.push(item);
+                }
+            }
+            if selected.is_empty() {
+                canvas.items = rest_items;
+            } else {
+                if raise {
+                    rest_items.extend(selected);
+                    canvas.items = rest_items;
+                } else {
+                    selected.extend(rest_items);
+                    canvas.items = selected;
                 }
                 rt.bump();
             }
@@ -5819,6 +5828,21 @@ fn canvas_item_hidden(item: &CanvasItem) -> bool {
         .is_some_and(|state| state == "hidden")
 }
 
+/// Top-left offset of an anchored box (Tk `-anchor`, default `center`).
+fn anchor_offset(anchor: &str, width: f64, height: f64) -> (f64, f64) {
+    match anchor {
+        "n" => (-width / 2.0, 0.0),
+        "ne" => (-width, 0.0),
+        "e" => (-width, -height / 2.0),
+        "se" => (-width, -height),
+        "s" => (-width / 2.0, -height),
+        "sw" => (0.0, -height),
+        "w" => (0.0, -height / 2.0),
+        "nw" => (0.0, 0.0),
+        _ => (-width / 2.0, -height / 2.0),
+    }
+}
+
 /// An item's bounding box.  Text extents and line widths are approximated
 /// (the runtime has no font metrics; the renderer lays text out natively).
 fn canvas_item_bbox(
@@ -5835,7 +5859,10 @@ fn canvas_item_bbox(
                 .map_or((80.0, 80.0), |image| {
                     (image.width as f64, image.height as f64)
                 });
-            Some((coords[0], coords[1], coords[0] + width, coords[1] + height))
+            let anchor = item.options.get("-anchor").map_or("center", String::as_str);
+            let (dx, dy) = anchor_offset(anchor, width, height);
+            let (x, y) = (coords[0] + dx, coords[1] + dy);
+            Some((x, y, x + width, y + height))
         }
         "text" if coords.len() >= 2 => {
             let text = item.options.get("-text").map_or("", String::as_str);
@@ -5845,12 +5872,11 @@ fn canvas_item_bbox(
                 .map(|line| line.chars().count())
                 .max()
                 .unwrap_or(0) as f64;
-            Some((
-                coords[0],
-                coords[1],
-                coords[0] + cols * 8.0,
-                coords[1] + lines * 16.0,
-            ))
+            let (width, height) = (cols * 8.0, lines * 16.0);
+            let anchor = item.options.get("-anchor").map_or("center", String::as_str);
+            let (dx, dy) = anchor_offset(anchor, width, height);
+            let (x, y) = (coords[0] + dx, coords[1] + dy);
+            Some((x, y, x + width, y + height))
         }
         _ if coords.len() >= 2 => {
             let mut min_x = coords[0];
@@ -7505,6 +7531,14 @@ mod tests {
         eval(&mut i, "event generate .e <FocusIn>");
         assert_eq!(eval(&mut i, "set ::n"), "4");
         assert_eq!(eval(&mut i, "bind Entry"), "<KeyPress>");
+        // Event fields: %W path, %x/%y widget coords, %X/%Y root coords,
+        // %w/%h event size (0 for synthetic events).
+        eval(
+            &mut i,
+            "bind .b <ButtonRelease-1> {set ::ev \"%W %x %y %X %Y %w %h\"}; \
+             event generate .b <ButtonRelease-1> -x 2 -y 3",
+        );
+        assert_eq!(eval(&mut i, "set ::ev"), ".b 2 3 2 3 0 0");
     }
 
     #[test]
@@ -7659,6 +7693,30 @@ mod tests {
     }
 
     #[test]
+    fn canvas_operations_accept_tag_or_id() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "canvas .q -width 100 -height 100");
+        let a = eval(&mut i, ".q create rectangle 0 0 10 10 -tags {g}");
+        let b = eval(&mut i, ".q create rectangle 20 20 30 30 -tags {g}");
+        let c = eval(&mut i, ".q create oval 40 40 50 50 -tags {h}");
+        eval(&mut i, &format!("set a {a}; set b {b}; set c {c}"));
+        eval(&mut i, ".q move g 5 5");
+        assert_eq!(eval(&mut i, ".q coords $a"), "5 5 15 15");
+        assert_eq!(eval(&mut i, ".q coords $b"), "25 25 35 35");
+        eval(&mut i, ".q itemconfigure g -fill red");
+        assert_eq!(eval(&mut i, ".q itemcget $a -fill"), "red");
+        assert_eq!(eval(&mut i, ".q itemcget $b -fill"), "red");
+        eval(&mut i, ".q coords g 1 2 3 4");
+        assert_eq!(eval(&mut i, ".q coords $a"), "1 2 3 4");
+        assert_eq!(eval(&mut i, ".q coords $b"), "1 2 3 4");
+        eval(&mut i, ".q raise g");
+        assert_eq!(eval(&mut i, ".q find"), format!("{c} {a} {b}"));
+        eval(&mut i, ".q lower g");
+        assert_eq!(eval(&mut i, ".q find"), format!("{a} {b} {c}"));
+    }
+
+    #[test]
     fn text_marks_and_index_grammar() {
         let mut i = Interp::new();
         install(&mut i);
@@ -7762,6 +7820,17 @@ mod tests {
         eval(&mut i, ".k itemconfigure $a -state normal");
         canvas_press(".k", 20.0, 20.0);
         assert_eq!(eval(&mut i, "set ::pressed"), "1");
+        // Default anchor is center for text/image items.
+        eval(
+            &mut i,
+            "image create photo dot -file /tmp/x.png -width 10 -height 20",
+        );
+        let img = eval(&mut i, ".k create image 50 50 -image dot");
+        assert_eq!(eval(&mut i, &format!(".k bbox {img}")), "45 40 55 60");
+        eval(&mut i, &format!(".k itemconfigure {img} -anchor nw"));
+        assert_eq!(eval(&mut i, &format!(".k bbox {img}")), "50 50 60 70");
+        let label = eval(&mut i, ".k create text 30 40 -text ab");
+        assert_eq!(eval(&mut i, &format!(".k bbox {label}")), "22 32 38 48");
     }
 
     #[test]

@@ -26,6 +26,7 @@ use nsh_base::rich_editor::{
     view::{rich_editor, EditorSession, NodeViews, PartStyles, RichEditorStyles},
 };
 use nsh_base::SliderValue;
+use nsh_core::canvas::{CanvasTextAlign, CanvasTextBaseline};
 use nsh_core::element::desktop;
 use nsh_core::geometry::{Axis, Point, Radians, Size};
 use nsh_core::prelude::*;
@@ -1991,11 +1992,24 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         if !text.is_empty() {
                             let color =
                                 option("-fill").unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
-                            painter = painter.fill_color(color.light).fill_text(
-                                &text,
-                                coords[0] as f32,
-                                coords[1] as f32,
-                            );
+                            let anchor =
+                                item.options.get("-anchor").map_or("center", String::as_str);
+                            let (align, baseline) = match anchor {
+                                "n" => (CanvasTextAlign::Center, CanvasTextBaseline::Top),
+                                "ne" => (CanvasTextAlign::Right, CanvasTextBaseline::Top),
+                                "e" => (CanvasTextAlign::Right, CanvasTextBaseline::Middle),
+                                "se" => (CanvasTextAlign::Right, CanvasTextBaseline::Bottom),
+                                "s" => (CanvasTextAlign::Center, CanvasTextBaseline::Bottom),
+                                "sw" => (CanvasTextAlign::Left, CanvasTextBaseline::Bottom),
+                                "w" => (CanvasTextAlign::Left, CanvasTextBaseline::Middle),
+                                "nw" => (CanvasTextAlign::Left, CanvasTextBaseline::Top),
+                                _ => (CanvasTextAlign::Center, CanvasTextBaseline::Middle),
+                            };
+                            painter = painter
+                                .text_align(align)
+                                .text_baseline(baseline)
+                                .fill_color(color.light)
+                                .fill_text(&text, coords[0] as f32, coords[1] as f32);
                         }
                     }
                     "image" if coords.len() >= 2 => {
@@ -2003,12 +2017,25 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                             if let Some(file) = rtcl_tk_runtime::image_path(name) {
                                 let (iw, ih) =
                                     rtcl_tk_runtime::image_dimensions(name).unwrap_or((80, 80));
+                                let anchor =
+                                    item.options.get("-anchor").map_or("center", String::as_str);
+                                let (dx, dy) = match anchor {
+                                    "n" => (iw as f32 / 2.0, 0.0),
+                                    "ne" => (iw as f32, 0.0),
+                                    "e" => (iw as f32, ih as f32 / 2.0),
+                                    "se" => (iw as f32, ih as f32),
+                                    "s" => (iw as f32 / 2.0, ih as f32),
+                                    "sw" => (0.0, ih as f32),
+                                    "w" => (0.0, ih as f32 / 2.0),
+                                    "nw" => (0.0, 0.0),
+                                    _ => (iw as f32 / 2.0, ih as f32 / 2.0),
+                                };
                                 painter = painter.draw_image(
                                     &file,
                                     nsh_core::geometry::Bounds::new(
                                         Point::new(
-                                            Points(coords[0] as f32),
-                                            Points(coords[1] as f32),
+                                            Points(coords[0] as f32 - dx),
+                                            Points(coords[1] as f32 - dy),
                                         ),
                                         Size::new(Points(iw as f32), Points(ih as f32)),
                                     ),

@@ -212,9 +212,12 @@ move/scale/raise/lower/bind/xview/yview`；`-scrollregion` + xview/yview
 填充 + 描边）、image 项绘制图片。`delete` 与 `find` 接受 id、`all` 或
 空格分隔的 `-tags`（`find withtag/withtags`），即按 tag 批量删/查；
 `find closest x y ?halo?`、`find overlapping x1 y1 x2 y2`、`bbox
-?tagOrId ...?`（id/tag 的并集，按 Tk 向外取整）；`-state hidden` 的项
-不绘制、不参与 bbox/closest/overlapping/点击，但仍被 `find` 列出。
-bbox 对 text 用字数近似（runtime 无字体度量），line 箭头未计入。
+?tagOrId ...?`（id/tag 的并集，按 Tk 向外取整）；`move/scale/coords/
+itemconfigure/itemcget/raise/lower` 均接受 tagOrId（tag 命中全部项）；
+text/image 默认 `-anchor center`，渲染与 bbox 都按 `-anchor` 摆放。
+`-state hidden` 的项不绘制、不参与 bbox/closest/overlapping/点击，但仍
+被 `find` 列出。bbox 对 text 用字数近似（runtime 无字体度量），line
+箭头未计入。
 `image create
 photo` + `label/button -image` 渲染文件图片。`text tag add/remove/
 configure/cget/ranges/names/delete` 维护区间；有标签的 text 用 nsh
@@ -257,8 +260,9 @@ disabled/readonly 与 `-show` 密码已由原生输入呈现。
 
 **事件**：按钮 `<Button-1>/<ButtonRelease-1>`、entry `<Return>/<Key>`、
 `bind all`、类名/`bind .` 标签绑定（按 `bindtags` 顺序：widget、class、
-toplevel、all）、`event generate`；`%W/%x/%y/%K/%A` 替换；`after` 由
-`TkView` 的 16 ms interval 泵入，错误进 `take_errors()`。
+toplevel、all）、`event generate`；替换 `%W/%x/%y/%X/%Y/%b/%s/%K/%A`
+（合成事件无根坐标时 `%X/%Y` 取 widget 坐标，`%w/%h` 为 0）；`after`
+由 `TkView` 的 16 ms interval 泵入，错误进 `take_errors()`。
 
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停
 绘制，长等待请用 `after` 回调）；未实现多 toplevel 窗口；Canvas 已支持旋转/贝塞尔/箭头/虚线/图片项；

@@ -274,7 +274,8 @@ disabled/readonly 与 `-show` 密码已由原生输入呈现。
 
 **事件**：序列按 Tk 规则匹配——kind + 修饰键子集 + detail
 （`<Key>`/`<Key-a>`/`<Control-a>`/`<Button-1>`/`<Control-Button-1>`/
-`<Double-Button-1>`/`<FocusIn>`/`<FocusOut>`），同一 tag 取最具体的一条，
+`<Double-Button-1>`/`<Triple-Button-1>`/`<Quadruple-Button-1>`/
+`<FocusIn>`/`<FocusOut>`），同一 tag 取最具体的一条，
 `bindtags` 顺序 widget→class→toplevel→all；`event generate` 可带
 `-x/-y/-key/-button/-state`。点击派发 `<Button-1>`（第二次点击同时派发
 `<Double-Button-1>`）与 `<ButtonRelease-1>`，覆盖按钮、listbox/treeview
@@ -291,11 +292,14 @@ separator/chart 的空白区域、notebook 标签、combobox 箭头、treeview �
 滚轮：listbox/treeview 用原生 scroll view 取得 wheel/pan，派发
 `<MouseWheel>`、`<Button-4|5>`（横向 6/7，Shift 作用于
 `<Shift-MouseWheel>`），无类绑定时按行高滚动虚拟化切片（原生偏移每次
-事件复位，只挂可见行）。替换
-`%W/%x/%y/%X/%Y/%b/%s/%K/%A/%D`（合成事件无根坐标时 `%X/%Y` 取 widget
-坐标，`%w/%h` 为 0；`%D` 为滚轮 ±120、pan 位移、pinch×100、
-rotation×10）；`after` 由 `TkView` 的 16 ms interval 泵入，
-错误进 `take_errors()`。
+事件复位，只挂可见行）。替换 `%W/%x/%y/%X/%Y/%b/%s/%K/%A/%D/%f/%w/%h/%k/%N/%R/%t/%#/%E/%d/%m`
+（缺省用 Tk 的 `??`；`%D` 为滚轮 ±120、pan 位移、pinch×100、
+rotation×10）；`event generate` 接受 `-x/-y/-rootx/-rooty/-key/-keysym/
+-keycode/-button/-state/-delta/-width/-height/-time/-serial/-sendevent/
+-detail/-mode/-focus/-count`；`event add/delete/info` 管理虚拟事件，
+物理事件会自动触发映射到它的 `<<Name>>` 绑定；`destroy` 按子→父派发
+`<Destroy>`，点击链支持 Double/Triple/Quadruple。`after` 由 `TkView` 的
+16 ms interval 泵入，错误进 `take_errors()`。
 
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停
 绘制，长等待请用 `after` 回调）；未实现多 toplevel 窗口；Canvas 已支持
@@ -303,7 +307,8 @@ rotation×10）；`after` 由 `TkView` 的 16 ms interval 泵入，
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
 text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
-未实现；`<Configure>` 与虚拟事件（`<<Paste>>` 等）尚未从平台层派发；
+未实现；`<Configure>`/`<Map>`/`<Unmap>` 尚未从平台层派发，`<<Paste>>`
+等内置虚拟事件没有默认映射（可用 `event add` 自行定义）；
 滚轮绑定只在 listbox/treeview（有原生 scroll view）；canvas/text/entry
 的 wheel 未派发；entry/scale/text/scrollbar 的按下事件只走原生控件行为；
 其它控件的 hover/motion 未派发；

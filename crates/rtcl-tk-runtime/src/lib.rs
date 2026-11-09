@@ -80,6 +80,8 @@ pub struct TkRuntime {
     image_seq: u64,
     /// Canvas item models.
     canvases: BTreeMap<String, CanvasState>,
+    /// `event add`: virtual event name (without `<<>>`) → physical sequences.
+    virtual_events: BTreeMap<String, Vec<String>>,
     /// Persisted rich-text documents (ProseMirror JSON) of `text` widgets.
     rich_docs: BTreeMap<String, String>,
     /// `text edit modified` state: widgets with unsaved edits.
@@ -1840,6 +1842,10 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
     if removed.is_empty() {
         return Err(bad_window(path));
     }
+    // Tk sends <Destroy> to the children first, then the window itself.
+    for p in removed.iter().rev() {
+        run_binding(p, "<Destroy>", &EventCtx::for_path(p));
+    }
     with_state_mut(interp, |rt| {
         rt.tree.destroy(path).map_err(tk_error)?;
         rt.treeviews.remove(path);
@@ -2897,6 +2903,26 @@ pub struct EventCtx {
     pub state: String,
     /// `%D`: wheel/drag/gesture delta.
     pub delta: i64,
+    /// Root-window position (`%X/%Y`); widget position when unset.
+    pub root_x: i64,
+    pub root_y: i64,
+    pub has_root: bool,
+    /// `%w/%h` event window size (0 means unknown: `??`).
+    pub width: i64,
+    pub height: i64,
+    /// `%t` server time and `%#` serial.
+    pub time: i64,
+    pub serial: i64,
+    /// `%E` send_event, `%d` detail, `%m` mode.
+    pub send_event: i64,
+    pub detail: String,
+    pub mode: String,
+    /// `%f`: whether the event window has the focus.
+    pub focus: Option<i64>,
+    /// `%k`: hardware keycode.
+    pub keycode: i64,
+    /// Click count of a press (1 = single).
+    pub clicks: u32,
 }
 
 impl EventCtx {
@@ -2938,7 +2964,8 @@ struct EventPattern {
     detail: Option<String>,
     /// Tk state bits: Shift 1, Lock 2, Control 4, Mod1 8 ... Mod5 128.
     modifiers: u32,
-    double: bool,
+    /// 1 = plain press, 2 = double, 3 = triple, 4 = quadruple.
+    clicks: u8,
 }
 
 /// Parse a Tk event state string (Tk reports `%s` in decimal).
@@ -2966,6 +2993,7 @@ fn parse_sequence(sequence: &str) -> EventPattern {
         return EventPattern {
             kind: EventKind::Virtual,
             detail: Some(text[2..text.len() - 2].to_string()),
+            clicks: 1,
             ..EventPattern::default()
         };
     }
@@ -2983,7 +3011,10 @@ fn parse_sequence(sequence: &str) -> EventPattern {
         .split('-')
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
-    let mut pattern = EventPattern::default();
+    let mut pattern = EventPattern {
+        clicks: 1,
+        ..EventPattern::default()
+    };
     let mut index = 0usize;
     while index < tokens.len() {
         let token = tokens[index].to_ascii_lowercase();
@@ -2997,15 +3028,19 @@ fn parse_sequence(sequence: &str) -> EventPattern {
             "mod4" | "m4" => Some(64),
             "mod5" | "m5" => Some(128),
             "double" => {
-                pattern.double = true;
+                pattern.clicks = 2;
                 index += 1;
                 continue;
             }
-            "triple" | "quadruple" => {
-                return EventPattern {
-                    kind: EventKind::Other,
-                    ..EventPattern::default()
-                }
+            "triple" => {
+                pattern.clicks = 3;
+                index += 1;
+                continue;
+            }
+            "quadruple" => {
+                pattern.clicks = 4;
+                index += 1;
+                continue;
             }
             _ => None,
         };
@@ -3099,7 +3134,7 @@ impl EventPattern {
     /// matches any detail.
     fn matches(&self, event: &EventPattern) -> bool {
         self.kind == event.kind
-            && self.double == event.double
+            && self.clicks == event.clicks
             && (self.modifiers & !event.modifiers) == 0
             && self
                 .detail
@@ -3108,8 +3143,12 @@ impl EventPattern {
     }
 
     /// More modifier bits and an explicit detail are more specific.
-    fn specificity(&self) -> (u32, bool) {
-        (self.modifiers.count_ones(), self.detail.is_some())
+    fn specificity(&self) -> (u32, bool, u8) {
+        (
+            self.modifiers.count_ones(),
+            self.detail.is_some(),
+            self.clicks,
+        )
     }
 }
 
@@ -3118,6 +3157,9 @@ impl EventPattern {
 fn event_from(sequence: &str, ctx: &EventCtx) -> EventPattern {
     let pattern = parse_sequence(sequence);
     let mut event = pattern.clone();
+    if event.clicks == 0 {
+        event.clicks = 1;
+    }
     event.modifiers = parse_event_state(&ctx.state) | pattern.modifiers;
     if event.detail.is_none() {
         match event.kind {
@@ -3137,6 +3179,36 @@ fn event_from(sequence: &str, ctx: &EventCtx) -> EventPattern {
     event
 }
 
+/// Tk's keysym number (`%N`): Unicode for printable keysyms, X11 codes for
+/// the named keys.
+fn keysym_number(key: &str) -> i64 {
+    if key.chars().count() == 1 {
+        return key.chars().next().map_or(0, |c| i64::from(c as u32));
+    }
+    match key {
+        "Return" => 0xff0d,
+        "Escape" => 0xff1b,
+        "Tab" => 0xff09,
+        "BackSpace" => 0xff08,
+        "Delete" => 0xffff,
+        "Insert" => 0xff63,
+        "Left" => 0xff51,
+        "Up" => 0xff52,
+        "Right" => 0xff53,
+        "Down" => 0xff54,
+        "Home" => 0xff50,
+        "End" => 0xff57,
+        "Prior" => 0xff55,
+        "Next" => 0xff56,
+        "space" => 0x20,
+        name => name
+            .strip_prefix('F')
+            .and_then(|n| n.parse::<i64>().ok())
+            .filter(|n| (1..=35).contains(n))
+            .map_or(0, |n| 0xffbe + n - 1),
+    }
+}
+
 fn substitute_bindings(script: &str, ctx: &EventCtx) -> String {
     let mut out = String::with_capacity(script.len());
     let mut chars = script.chars().peekable();
@@ -3148,19 +3220,73 @@ fn substitute_bindings(script: &str, ctx: &EventCtx) -> String {
         match chars.next() {
             Some('%') => out.push('%'),
             Some('W') => out.push_str(&ctx.path),
-            Some('w') | Some('h') => out.push_str("0"),
+            Some('w') => out.push_str(&if ctx.width > 0 {
+                ctx.width.to_string()
+            } else {
+                "??".to_string()
+            }),
+            Some('h') => out.push_str(&if ctx.height > 0 {
+                ctx.height.to_string()
+            } else {
+                "??".to_string()
+            }),
             Some('x') => out.push_str(&ctx.x.to_string()),
             Some('y') => out.push_str(&ctx.y.to_string()),
-            Some('X') => out.push_str(&ctx.x.to_string()),
-            Some('Y') => out.push_str(&ctx.y.to_string()),
-            Some('K') => out.push_str(&ctx.key),
-            Some('A') => out.push_str(&ctx.character),
-            Some('k') => out.push_str(&ctx.key),
+            Some('X') => out.push_str(&(if ctx.has_root { ctx.root_x } else { ctx.x }).to_string()),
+            Some('Y') => out.push_str(&(if ctx.has_root { ctx.root_y } else { ctx.y }).to_string()),
+            Some('K') => out.push_str(&if ctx.key.is_empty() {
+                "??".to_string()
+            } else {
+                ctx.key.clone()
+            }),
+            Some('A') => out.push_str(&if ctx.character.is_empty() {
+                "??".to_string()
+            } else {
+                ctx.character.clone()
+            }),
+            Some('k') => out.push_str(&if ctx.keycode > 0 {
+                ctx.keycode.to_string()
+            } else {
+                "??".to_string()
+            }),
+            Some('N') => out.push_str(&if ctx.key.is_empty() {
+                "??".to_string()
+            } else {
+                keysym_number(&ctx.key).to_string()
+            }),
             Some('b') => out.push_str(&ctx.button.to_string()),
             Some('s') => out.push_str(&ctx.state),
-            Some('D') => out.push_str(&ctx.delta.to_string()),
-            Some('t') => out.push_str("0"),
-            Some('#') => out.push_str("0"),
+            Some('D') => out.push_str(&if ctx.delta == 0
+                && ctx.button == 0
+                && ctx.character.is_empty()
+            {
+                "??".to_string()
+            } else {
+                ctx.delta.to_string()
+            }),
+            Some('t') => out.push_str(&ctx.time.to_string()),
+            Some('#') => out.push_str(&ctx.serial.to_string()),
+            Some('E') => out.push_str(
+                &(ctx.send_event != 0)
+                    .to_string()
+                    .replace("true", "1")
+                    .replace("false", "0"),
+            ),
+            Some('R') => out.push_str("0x00000000"),
+            Some('f') => out.push_str(&match ctx.focus {
+                Some(value) => value.to_string(),
+                None => "??".to_string(),
+            }),
+            Some('d') => out.push_str(&if ctx.detail.is_empty() {
+                "??".to_string()
+            } else {
+                ctx.detail.clone()
+            }),
+            Some('m') => out.push_str(&if ctx.mode.is_empty() {
+                "??".to_string()
+            } else {
+                ctx.mode.clone()
+            }),
             Some(other) => {
                 out.push('%');
                 out.push(other);
@@ -3257,38 +3383,61 @@ pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) {
             Err(e) => record_error(e.to_string()),
         }
     }
+    // `event add <<Foo>> <Sequence>`: the physical event also fires the
+    // virtual event's bindings.
+    if event.kind != EventKind::Virtual {
+        let virtuals = with_state(interp, |rt| {
+            rt.virtual_events
+                .iter()
+                .filter(|(_, sequences)| {
+                    sequences
+                        .iter()
+                        .any(|sequence| parse_sequence(sequence).matches(&event))
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+        for name in virtuals {
+            run_binding(path, &format!("<<{name}>>"), ctx);
+        }
+    }
 }
 
 thread_local! {
-    /// Last press per widget, for Tk's 500 ms double-click detection.
-    static LAST_PRESS: RefCell<BTreeMap<String, std::time::Instant>> =
+    /// Last press per widget and its click count (Tk's 500 ms chain).
+    static LAST_PRESS: RefCell<BTreeMap<String, (std::time::Instant, u32)>> =
         const { RefCell::new(BTreeMap::new()) };
 }
 
-/// Whether this press completes a double click on `path`.
-fn register_press(path: &str) -> bool {
+/// The click count of this press on `path` (1 = single, 2 = double, ...).
+fn register_press(path: &str) -> u32 {
     let now = std::time::Instant::now();
     LAST_PRESS.with(|map| {
         let mut map = map.borrow_mut();
-        match map.get(path) {
-            Some(last) if now.duration_since(*last) < std::time::Duration::from_millis(500) => {
-                map.remove(path);
-                true
+        let count = match map.get(path) {
+            Some((last, count))
+                if now.duration_since(*last) < std::time::Duration::from_millis(500) =>
+            {
+                (count + 1).min(4)
             }
-            _ => {
-                map.insert(path.to_string(), now);
-                false
-            }
-        }
+            _ => 1,
+        };
+        map.insert(path.to_string(), (now, count));
+        count
     })
 }
 
 /// Dispatch a mouse press/release pair, adding `<Double-Button-1>` on the
 /// second click, the way Tk does.
 fn dispatch_click(path: &str, ctx: &EventCtx) {
+    let clicks = register_press(path);
     run_binding(path, "<Button-1>", ctx);
-    if register_press(path) {
-        run_binding(path, "<Double-Button-1>", ctx);
+    match clicks {
+        2 => run_binding(path, "<Double-Button-1>", ctx),
+        3 => run_binding(path, "<Triple-Button-1>", ctx),
+        4 => run_binding(path, "<Quadruple-Button-1>", ctx),
+        _ => {}
     }
     run_binding(path, "<ButtonRelease-1>", ctx);
 }
@@ -3301,8 +3450,11 @@ pub fn widget_press(path: &str, x: f64, y: f64, clicks: u32) {
     ctx.x = x as i64;
     ctx.y = y as i64;
     run_binding(path, "<Button-1>", &ctx);
-    if clicks >= 2 {
-        run_binding(path, "<Double-Button-1>", &ctx);
+    match clicks {
+        2 => run_binding(path, "<Double-Button-1>", &ctx),
+        3 => run_binding(path, "<Triple-Button-1>", &ctx),
+        4 => run_binding(path, "<Quadruple-Button-1>", &ctx),
+        _ => {}
     }
     run_binding(path, "<ButtonRelease-1>", &ctx);
 }
@@ -4398,9 +4550,28 @@ fn event_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 match args[i].as_str() {
                     "-x" => ctx.x = parse_int(&args[i + 1])?,
                     "-y" => ctx.y = parse_int(&args[i + 1])?,
-                    "-key" => ctx.key = args[i + 1].as_str().to_string(),
+                    "-rootx" => {
+                        ctx.root_x = parse_int(&args[i + 1])?;
+                        ctx.has_root = true;
+                    }
+                    "-rooty" => {
+                        ctx.root_y = parse_int(&args[i + 1])?;
+                        ctx.has_root = true;
+                    }
+                    "-key" | "-keysym" => ctx.key = args[i + 1].as_str().to_string(),
+                    "-keycode" => ctx.keycode = parse_int(&args[i + 1])?,
                     "-button" => ctx.button = parse_int(&args[i + 1])?,
                     "-state" => ctx.state = args[i + 1].as_str().to_string(),
+                    "-delta" => ctx.delta = parse_int(&args[i + 1])?,
+                    "-width" => ctx.width = parse_int(&args[i + 1])?,
+                    "-height" => ctx.height = parse_int(&args[i + 1])?,
+                    "-time" => ctx.time = parse_int(&args[i + 1])?,
+                    "-serial" => ctx.serial = parse_int(&args[i + 1])?,
+                    "-sendevent" => ctx.send_event = parse_int(&args[i + 1])?,
+                    "-detail" => ctx.detail = args[i + 1].as_str().to_string(),
+                    "-mode" => ctx.mode = args[i + 1].as_str().to_string(),
+                    "-focus" => ctx.focus = Some(parse_int(&args[i + 1])?),
+                    "-count" | "-clicks" => ctx.clicks = parse_int(&args[i + 1])?.max(1) as u32,
                     _ => {}
                 }
                 i += 2;
@@ -4419,7 +4590,83 @@ fn event_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             run_binding(&path, args[3].as_str(), &ctx);
             Ok(Value::empty())
         }
-        "info" => Ok(list_value(Vec::<String>::new())),
+        "add" | "delete" => {
+            if args.len() < 3 {
+                return Err(wrong(
+                    &format!("event {}", args[1].as_str()),
+                    "<<virtualEvent>> ?sequence ...?",
+                    args.len(),
+                ));
+            }
+            let name = args[2].as_str();
+            let Some(name) = name
+                .strip_prefix("<<")
+                .and_then(|inner| inner.strip_suffix(">>"))
+            else {
+                return Err(generic(format!(
+                    "bad virtual event \"{}\": must be <<name>>",
+                    args[2].as_str()
+                )));
+            };
+            let add = args[1].as_str() == "add";
+            let sequences: Vec<String> = args[3..]
+                .iter()
+                .map(|value| normalize_sequence(value.as_str()))
+                .collect();
+            with_state_mut(interp, |rt| {
+                if add {
+                    let mappings = rt.virtual_events.entry(name.to_string()).or_default();
+                    for sequence in sequences {
+                        if !mappings.contains(&sequence) {
+                            mappings.push(sequence);
+                        }
+                    }
+                } else if sequences.is_empty() {
+                    rt.virtual_events.remove(name);
+                } else if let Some(mappings) = rt.virtual_events.get_mut(name) {
+                    mappings.retain(|sequence| !sequences.contains(sequence));
+                    if mappings.is_empty() {
+                        rt.virtual_events.remove(name);
+                    }
+                }
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "info" => {
+            if args.len() > 3 {
+                return Err(wrong("event info", "?<<virtualEvent>>?", args.len()));
+            }
+            match args.get(2) {
+                Some(value) => {
+                    let name = value
+                        .as_str()
+                        .strip_prefix("<<")
+                        .and_then(|inner| inner.strip_suffix(">>"))
+                        .ok_or_else(|| {
+                            generic(format!(
+                                "bad virtual event \"{}\": must be <<name>>",
+                                value.as_str()
+                            ))
+                        })?;
+                    let sequences = with_state(interp, |rt| {
+                        rt.virtual_events.get(name).cloned().unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                    Ok(list_value(sequences))
+                }
+                None => {
+                    let names = with_state(interp, |rt| {
+                        rt.virtual_events
+                            .keys()
+                            .map(|name| format!("<<{name}>>"))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                    Ok(list_value(names))
+                }
+            }
+        }
         _ => Err(generic(format!("bad option \"{}\"", args[1].as_str()))),
     }
 }
@@ -7025,9 +7272,13 @@ pub fn canvas_press(path: &str, x: f64, y: f64) {
         ..EventCtx::default()
     };
     let press = event_from("<Button-1>", &ctx);
-    let double = register_press(path);
-    let mut double_event = press.clone();
-    double_event.double = true;
+    let clicks = register_press(path);
+    let click_sequences: Vec<&str> = match clicks {
+        2 => vec!["<Double-Button-1>"],
+        3 => vec!["<Triple-Button-1>"],
+        4 => vec!["<Quadruple-Button-1>"],
+        _ => Vec::new(),
+    };
     for item in items.iter().rev() {
         let mut targets = vec![item.id.to_string()];
         if let Some(tags) = item.options.get("-tags") {
@@ -7041,8 +7292,9 @@ pub fn canvas_press(path: &str, x: f64, y: f64) {
             if let Some(script) = best_script(map, &press) {
                 scripts.push(script);
             }
-            if double {
-                if let Some(script) = best_script(map, &double_event) {
+            for sequence in &click_sequences {
+                let event = event_from(sequence, &ctx);
+                if let Some(script) = best_script(map, &event) {
                     scripts.push(script);
                 }
             }
@@ -7055,8 +7307,8 @@ pub fn canvas_press(path: &str, x: f64, y: f64) {
         }
     }
     run_binding(path, "<Button-1>", &ctx);
-    if double {
-        run_binding(path, "<Double-Button-1>", &ctx);
+    for sequence in &click_sequences {
+        run_binding(path, sequence, &ctx);
     }
     run_binding(path, "<ButtonRelease-1>", &ctx);
 }
@@ -8923,7 +9175,7 @@ mod tests {
             "bind .b <ButtonRelease-1> {set ::ev \"%W %x %y %X %Y %w %h\"}; \
              event generate .b <ButtonRelease-1> -x 2 -y 3",
         );
-        assert_eq!(eval(&mut i, "set ::ev"), ".b 2 3 2 3 0 0");
+        assert_eq!(eval(&mut i, "set ::ev"), ".b 2 3 2 3 ?? ??");
     }
 
     #[test]
@@ -9253,6 +9505,73 @@ mod tests {
         assert_eq!(eval(&mut i, "set ::log"), "down wheel-120 classwheel");
         assert_eq!(eval(&mut i, "lindex [.l yview] 0"), "0.3");
         eval(&mut i, "bind Listbox <MouseWheel> {}");
+    }
+
+    #[test]
+    fn destroy_bindings_and_full_substitutions() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "frame .f; button .f.b -text B; set ::log {};
+             bind .f.b <Destroy> {lappend ::log child};
+             bind .f <Destroy> {lappend ::log parent}; destroy .f",
+        );
+        assert_eq!(eval(&mut i, "set ::log"), "child parent");
+
+        eval(
+            &mut i,
+            "button .b -text B;
+             bind .b <FocusIn> {set ::r \"%f|%w|%h|%t|%#|%E|%R|%N|%X|%Y|%A\"};
+             event generate .b <FocusIn> -focus 1 -width 30 -height 40 -time 55 \
+                -serial 7 -sendevent 1 -rootx 100 -rooty 200",
+        );
+        assert_eq!(
+            eval(&mut i, "set ::r"),
+            "1|30|40|55|7|1|0x00000000|??|100|200|??"
+        );
+        assert_eq!(
+            eval(
+                &mut i,
+                "bind .b <Key-a> {}; bind .b <Key-N> {}; event generate .b <Key-a>; set ::r"
+            ),
+            "1|30|40|55|7|1|0x00000000|??|100|200|??"
+        );
+    }
+
+    #[test]
+    fn click_counts_and_virtual_event_mappings() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "button .b -text B; set ::log {};
+             bind .b <Button-1> {lappend ::log b1};
+             bind .b <Double-Button-1> {lappend ::log b2};
+             bind .b <Triple-Button-1> {lappend ::log b3}",
+        );
+        press_button(".b");
+        press_button(".b");
+        press_button(".b");
+        assert_eq!(eval(&mut i, "set ::log"), "b1 b1 b2 b1 b3");
+
+        eval(
+            &mut i,
+            "set ::log {}; event add <<MyClick>> <Button-1>;
+             bind .b <<MyClick>> {lappend ::log virtual}",
+        );
+        eval(&mut i, "event generate .b <Button-1>");
+        assert_eq!(eval(&mut i, "set ::log"), "b1 virtual");
+        assert_eq!(eval(&mut i, "event info <<MyClick>>"), "<Button-1>");
+        assert_eq!(eval(&mut i, "event info"), "<<MyClick>>");
+        eval(&mut i, "set ::log {}; event generate .b <<MyClick>>");
+        assert_eq!(eval(&mut i, "set ::log"), "virtual");
+        eval(
+            &mut i,
+            "event delete <<MyClick>>; set ::log {}; event generate .b <Button-1>",
+        );
+        assert_eq!(eval(&mut i, "set ::log"), "b1");
+        assert_eq!(eval(&mut i, "event info"), "");
     }
 
     #[test]

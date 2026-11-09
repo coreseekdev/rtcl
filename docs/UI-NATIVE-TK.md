@@ -134,7 +134,7 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 | M1a ✅ | rtcl-vm `tk` 命令层：frame/label/button/entry/… 创建、configure/cget、pack/grid、destroy、winfo、wm/tk；per-widget 路径命令；teardown 自动清树；4 条单测 | `button .b -text Hi; cget .b -text` 等 Tcl 脚本语义通过 |
 | M1b ✅ | nsh 后端最小集（frame/label/button/entry）+ TkView；按钮 `-command` 执行 Tcl，按钮文本经 signal 刷新；GTK4 demo + headless 验收 | `nsh-testing`：初始 "Click me" 渲染 → press → "Clicked 1" → press → "Clicked 2"；`cargo run -p rtcl-tk-demo` 打开 GTK4 窗口 |
 | M2 ✅ | pack/grid/place、bind/event generate、after/update、`-textvariable` 双向、entry/text/listbox/scale 数据子命令、winfo/wm 扩展、ttk 别名、focus/raise/font/option；message/scrollbar/separator/progressbar；整树 dynamic 重建 | 经典 grid/pack 表单脚本通过（`classic_nsh`）；demo 双态截图；tk 单测 19 + headless 验收 2 |
-| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、虚拟化列表/树、Tk scrollbar 联动、主题色、macOS 系统菜单、Canvas 动态/绑定/滚动/旋转/平滑/图片、photo image、text tag 富文本+编辑 ✅；Windows/Linux 原生菜单受 nsh GTK 限制 | 设置页/表单/列表演示（classic demo + headless 验收） |
+| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、虚拟化列表/树、Tk scrollbar 联动、主题色、macOS 系统菜单、Canvas 动态/绑定/滚动/旋转/贝塞尔/箭头/虚线/图片、photo image、text tag 富文本+编辑 ✅；Windows/Linux 原生菜单受 nsh GTK 限制 | 设置页/表单/列表演示（classic demo + headless 验收） |
 | M4 | 虚拟化 table/log/tree/chart + iOS/Android embed + 打包 | 手机/桌面同一 Tcl 脚本跑通 |
 
 ## 7. 主要风险
@@ -204,11 +204,12 @@ family/size/bold（实际 DPI 缩放仍由 nsh 平台层负责）。
 polygon/image` 的 `create/delete/coords/itemconfigure/itemcget/find/
 move/scale/raise/lower/bind/xview/yview`；`-scrollregion` + xview/yview
 平移裁剪；item 或 tag 的 `<Button-1>` 绑定按命中项执行（近似 hit test）；
-`-angle` 旋转、line `-smooth` 二次曲线、image 项绘制图片。`image create
+`-angle` 旋转、line `-smooth true|bezier`（二次/三次贝塞尔）、`-dash`/
+`-dashoffset`、`-arrow first|last|both`、image 项绘制图片。`image create
 photo` + `label/button -image` 渲染文件图片。`text tag add/remove/
 configure/cget/ranges/names/delete` 维护区间；有标签的 text 先渲染富文本
-（颜色/背景/字体跨度），点 Edit 进入纯文本编辑、Done 回富文本，编辑时
-标签区间按增删自动平移。
+（颜色/背景/字体跨度），点 Edit 进入纯文本编辑并显示实时富文本预览，
+Done 回富文本；编辑时标签区间按增删自动平移（非光标级 WYSIWYG）。
 
 **虚拟化/滚动**：listbox 与 treeview 只挂载可见行（按 `-height` 取窗口），
 `yview`/`-yscrollcommand` 与 Tk `scrollbar` 双向联动；列表/树表可滚动。
@@ -229,8 +230,9 @@ toplevel、all）、`event generate`；`%W/%x/%y/%K/%A` 替换；`after` 由
 `TkView` 的 16 ms interval 泵入，错误进 `take_errors()`。
 
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停
-绘制，长等待请用 `after` 回调）；未实现多 toplevel 窗口、Canvas 的旋转/平滑曲线/图片项已支持（见上）；
-带 text tag 的文本编辑态为纯文本（非 WYSIWYG）；Windows/Linux 菜单栏仍是 app 内实现
+绘制，长等待请用 `after` 回调）；未实现多 toplevel 窗口；Canvas 已支持旋转/贝塞尔/箭头/虚线/图片项；
+带 text tag 的文本编辑态为纯文本+实时富预览（非光标级 WYSIWYG）；
+Windows/Linux 菜单栏仍是 app 内实现
 （macOS 用系统菜单；nsh GTK 的 set_application_menu 实测不显示）；
 scrollbar 已与 listbox/treeview 联动。
 

@@ -247,6 +247,30 @@ fn option_color(tree: &TkTree, path: &str, name: &str) -> Option<AdaptiveColor> 
     (!value.is_empty()).then(|| parse_color(value)).flatten()
 }
 
+fn arrow_head(
+    mut painter: Painter,
+    from: (f32, f32),
+    to: (f32, f32),
+    color: Hsla,
+    size: f32,
+) -> Painter {
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let len = (dx * dx + dy * dy).sqrt().max(0.001);
+    let (ux, uy) = (dx / len, dy / len);
+    let base = (to.0 - ux * size, to.1 - uy * size);
+    let (px, py) = (-uy * size * 0.45, ux * size * 0.45);
+    painter = painter
+        .fill_color(color)
+        .begin_path()
+        .move_to(to.0, to.1)
+        .line_to(base.0 + px, base.1 + py)
+        .line_to(base.0 - px, base.1 - py)
+        .close_path()
+        .fill();
+    painter
+}
+
 fn render_rich_text(
     tree: &TkTree,
     path: &str,
@@ -970,6 +994,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                                     rtcl_tk_runtime::text_changed(&change_path, text);
                                 }),
                         )
+                        .child(render_rich_text(tree, path, &tags))
                         .child(toggle)
                         .into_element();
                 }
@@ -1434,10 +1459,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                             .get("-width")
                             .and_then(|v| v.parse::<f32>().ok())
                             .unwrap_or(1.0);
-                        let smooth = item
-                            .options
-                            .get("-smooth")
-                            .is_some_and(|v| !matches!(v.as_str(), "" | "0" | "false" | "raw"));
+                        let smooth = item.options.get("-smooth").cloned().unwrap_or_default();
                         let points = coords
                             .chunks(2)
                             .filter(|p| p.len() == 2)
@@ -1448,7 +1470,27 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                             .line_width(line_width)
                             .begin_path()
                             .move_to(points[0].0, points[0].1);
-                        if smooth && points.len() > 2 {
+                        if smooth == "bezier" && points.len() > 2 {
+                            for i in 0..points.len() - 1 {
+                                let p1 = points[i];
+                                let p2 = points[i + 1];
+                                let p0 = if i == 0 { p1 } else { points[i - 1] };
+                                let p3 = if i + 2 < points.len() {
+                                    points[i + 2]
+                                } else {
+                                    p2
+                                };
+                                let c1 = (p1.0 + (p2.0 - p0.0) / 6.0, p1.1 + (p2.1 - p0.1) / 6.0);
+                                let c2 = (p2.0 - (p3.0 - p1.0) / 6.0, p2.1 - (p3.1 - p1.1) / 6.0);
+                                painter = painter.bezier_curve_to(
+                                    Point::new(Points(c1.0), Points(c1.1)),
+                                    Point::new(Points(c2.0), Points(c2.1)),
+                                    Point::new(Points(p2.0), Points(p2.1)),
+                                );
+                            }
+                        } else if !matches!(smooth.as_str(), "" | "0" | "false" | "raw")
+                            && points.len() > 2
+                        {
                             for i in 1..points.len() - 1 {
                                 let (cx, cy) = points[i];
                                 let (nx, ny) = points[i + 1];
@@ -1464,7 +1506,42 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                                 painter = painter.line_to(*x, *y);
                             }
                         }
+                        if let Some(dash) = item.options.get("-dash").filter(|d| !d.is_empty()) {
+                            let segments = rtcl_core::value::Value::from_str(dash)
+                                .as_list()
+                                .map(|list| {
+                                    list.iter()
+                                        .filter_map(|v| v.as_str().parse::<f32>().ok())
+                                        .map(Points)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            if !segments.is_empty() {
+                                painter = painter.line_dash(&segments);
+                            }
+                        }
+                        if let Some(offset) = item
+                            .options
+                            .get("-dashoffset")
+                            .and_then(|v| v.parse::<f32>().ok())
+                        {
+                            painter = painter.line_dash_offset(offset);
+                        }
                         painter = painter.stroke();
+                        let arrow = item.options.get("-arrow").cloned().unwrap_or_default();
+                        if matches!(arrow.as_str(), "last" | "both") && points.len() >= 2 {
+                            let n = points.len();
+                            painter = arrow_head(
+                                painter,
+                                points[n - 2],
+                                points[n - 1],
+                                color.light,
+                                10.0,
+                            );
+                        }
+                        if matches!(arrow.as_str(), "first" | "both") && points.len() >= 2 {
+                            painter = arrow_head(painter, points[1], points[0], color.light, 10.0);
+                        }
                     }
                     "oval" if coords.len() >= 4 => {
                         let center = Point::new(

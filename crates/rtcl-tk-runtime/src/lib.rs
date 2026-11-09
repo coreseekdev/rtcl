@@ -4460,6 +4460,9 @@ fn substitute_validation(script: &str, pairs: &[(&str, &str)]) -> String {
 pub fn entry_changed(path: &str, text: &str) {
     let Some(ptr) = active_interp() else { return };
     let interp = unsafe { &mut *ptr };
+    // Typing in an entry means it has the focus: keep the Tk focus model in
+    // step so Space/Return shortcuts do not fire on another widget.
+    set_tk_focus(interp, Some(path.to_string()));
     if !entry_validation_passes(interp, path, text) {
         // Reject the edit: the controlled input re-reads the old value.
         bump_active();
@@ -4483,6 +4486,9 @@ pub fn entry_changed(path: &str, text: &str) {
 /// A Text widget's content changed in the UI.
 pub fn text_changed(path: &str, text: &str) {
     if apply_text_change(path, text) {
+        if let Some(ptr) = active_interp() {
+            set_tk_focus(unsafe { &mut *ptr }, Some(path.to_string()));
+        }
         bump_active();
     }
 }
@@ -4584,6 +4590,9 @@ pub fn entry_submitted(path: &str) {
 /// A key was pressed in an Entry: `key` is a Tk keysym (`a`, `BackSpace`,
 /// `Return`), `character` the text it inserts (empty for control keys).
 pub fn entry_key(path: &str, key: &str, character: &str) {
+    if let Some(ptr) = active_interp() {
+        set_tk_focus(unsafe { &mut *ptr }, Some(path.to_string()));
+    }
     let mut ctx = EventCtx::for_path(path);
     ctx.key = key.to_string();
     ctx.character = character.to_string();

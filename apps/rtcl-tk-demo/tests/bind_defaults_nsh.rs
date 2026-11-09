@@ -207,3 +207,40 @@ fn arrow_keys_move_listbox_and_treeview_selection() {
     app.press_key("down").expect("move the treeview selection down");
     app.wait_for("T2").expect("the treeview reports T2");
 }
+
+const FOCUS_DESYNC_APP: &str = r#"
+set ::n 0
+set ::value x
+set ::report "n=0"
+button .b -text Go -command {incr ::n; set ::report "n=$::n"}
+label .l -textvariable ::report
+entry .e -textvariable ::value
+pack .b
+pack .l
+pack .e
+focus .b
+"#;
+
+#[component]
+fn FocusDesyncApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(FOCUS_DESYNC_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn typing_in_an_entry_does_not_trigger_a_focused_button() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<FocusDesyncApp>()))
+        .expect("headless engine starts");
+    app.set_viewport(Size::new(Points(600.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("Go").expect("button renders");
+    // The script focused the button, then the user clicks into the entry.
+    app.type_text("text:x", "").expect("focus the entry");
+    app.press_key("space").expect("space in the entry");
+    let _ = app.settle();
+    assert!(
+        !app.shows("n=1"),
+        "space went to the entry, not the Tk-focused button: {:?}",
+        app.screen().texts()
+    );
+}

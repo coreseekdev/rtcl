@@ -467,8 +467,9 @@ handler（`handlerCommand offset maxChars`），未拥有时回退到剪贴板�
 text/富文本路径经修饰键触发，plain entry/Spinbox 由 ambient
 `ctrl+c/x/v/a/z/y` 键（nsh 视为非编辑键，输入框聚焦时也触发）投递到
 聚焦控件的 `<<事件>>` 绑定；
-entry 选区拖动（`<B1-Motion>`）在桌面鼠标拖动时由平台 MouseMove 派发，
-headless 的 `drag` 是触摸模拟故不触发；菜单项/separator 等装饰控件的
+entry 选区拖动（`<B1-Motion>`）在桌面鼠标拖动时由平台 MouseMove 派发；
+headless `drag` 桌面环境下同样派发带左键的 MouseMove（fork 8e7c075），
+测试已覆盖；菜单项/separator 等装饰控件的
 hover 未单独接（菜单面板本身有 `<Enter>/<Leave>`）；
 Windows/Linux 菜单栏仍是 app 内实现
 （macOS 用系统菜单；GTK4 已无传统 menubar，nsh 的

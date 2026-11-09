@@ -489,6 +489,42 @@ fn rich_text_tag_bindings_fire_on_press() {
         .expect("the tag's <Enter> binding fired");
 }
 
+const ENTRY_DRAG_APP: &str = r##"
+set ::report ""
+entry .e
+.e insert 0 ready
+bind .e <B1-Motion> {append ::report "m"}
+pack .e
+label .out -textvariable ::report
+pack .out
+"##;
+
+#[component]
+fn EntryDragApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(ENTRY_DRAG_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn entry_drag_fires_b1_motion() {
+    let mut config = EngineConfig::new(Root::of::<EntryDragApp>());
+    config.environment.os = nsh_core::platform::Os::Linux;
+    let mut app = Headless::start(config).expect("headless engine starts");
+    app.set_viewport(Size::new(Points(500.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("ready").expect("the entry renders");
+    app.drag("ready", Point::new(Points(60.0), Points(0.0)))
+        .expect("drag inside the entry");
+    assert!(
+        app.screen()
+            .texts()
+            .iter()
+            .any(|text| text.starts_with('m')),
+        "the entry's <B1-Motion> binding streamed moves: {:?}",
+        app.screen().texts()
+    );
+}
+
 const ENTRY_VIRTUAL_APP: &str = r##"
 set ::c 0
 entry .e

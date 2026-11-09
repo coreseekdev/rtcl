@@ -605,6 +605,7 @@ pub fn install(interp: &mut Interp) {
         "ttk::style",
         "tk_popup",
         "vwait",
+        "tkwait",
     ] {
         interp.register_command(name, global_command);
     }
@@ -4782,6 +4783,124 @@ fn vwait_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if !native && !timers {
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
+    }
+}
+
+/// `tkwait variable varName` / `tkwait window path` / `tkwait visibility
+/// path`: Tk's modal waits over the nested event loop (same pump as
+/// [`vwait_impl`]).
+fn tkwait_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(wrong("tkwait", "option ?arg ...?", args.len()));
+    }
+    let sub = args[1].as_str().to_string();
+    match sub.as_str() {
+        "variable" => {
+            if args.len() != 3 {
+                return Err(wrong("tkwait variable", "varName", args.len()));
+            }
+            let varname = args[2].as_str().to_string();
+            let ptr = interp as *mut Interp;
+            let initial = unsafe {
+                (*ptr)
+                    .get_var(&varname)
+                    .ok()
+                    .map(|value| value.as_str().to_string())
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                let current = unsafe {
+                    (*ptr)
+                        .get_var(&varname)
+                        .ok()
+                        .map(|value| value.as_str().to_string())
+                };
+                if current != initial {
+                    return Ok(Value::empty());
+                }
+                if std::time::Instant::now() > deadline {
+                    return Err(Error::runtime(
+                        format!("can't wait for variable \"{varname}\": would wait forever"),
+                        rtcl_core::error::ErrorCode::Generic,
+                    ));
+                }
+                render_now();
+                let native = NATIVE_PUMP
+                    .with(|cell| cell.get())
+                    .map(|pump| pump())
+                    .unwrap_or(false);
+                let timers = pump_active();
+                if !native && !timers {
+                    std::thread::sleep(std::time::Duration::from_millis(8));
+                }
+            }
+        }
+        "window" => {
+            let window = args
+                .get(2)
+                .ok_or_else(|| wrong("tkwait window", "window", args.len()))?
+                .as_str()
+                .to_string();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                let gone = with_state(interp, |rt| !rt.tree.contains(&window)).unwrap_or(true);
+                if gone {
+                    return Ok(Value::empty());
+                }
+                if std::time::Instant::now() > deadline {
+                    return Err(Error::runtime(
+                        format!("tkwait window: \"{window}\" was never destroyed"),
+                        rtcl_core::error::ErrorCode::Generic,
+                    ));
+                }
+                render_now();
+                let native = NATIVE_PUMP
+                    .with(|cell| cell.get())
+                    .map(|pump| pump())
+                    .unwrap_or(false);
+                let timers = pump_active();
+                if !native && !timers {
+                    std::thread::sleep(std::time::Duration::from_millis(8));
+                }
+            }
+        }
+        "visibility" => {
+            let window = args
+                .get(2)
+                .ok_or_else(|| wrong("tkwait visibility", "window", args.len()))?
+                .as_str()
+                .to_string();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                let mapped = with_state(interp, |rt| {
+                    rt.tree
+                        .get(&window)
+                        .is_some_and(|n| n.pack.is_some() || n.grid.is_some() || n.place.is_some())
+                })
+                .unwrap_or(false);
+                if mapped {
+                    return Ok(Value::empty());
+                }
+                if std::time::Instant::now() > deadline {
+                    return Err(Error::runtime(
+                        format!("tkwait visibility: \"{window}\" was never mapped"),
+                        rtcl_core::error::ErrorCode::Generic,
+                    ));
+                }
+                render_now();
+                let native = NATIVE_PUMP
+                    .with(|cell| cell.get())
+                    .map(|pump| pump())
+                    .unwrap_or(false);
+                let timers = pump_active();
+                if !native && !timers {
+                    std::thread::sleep(std::time::Duration::from_millis(8));
+                }
+            }
+        }
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be variable, visibility, or window"
+        ))),
     }
 }
 
@@ -11092,6 +11211,7 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
     let (mut text, mut tags, mut dump_marks) = (false, false, false);
     let mut wanted_image = false;
     let mut wanted_window = false;
+    let mut command: Option<String> = None;
     let mut any = false;
     let mut index = 0;
     while index < rest.len() && rest[index].as_str().starts_with('-') {
@@ -11107,6 +11227,13 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
             "-mark" => dump_marks = true,
             "-image" => wanted_image = true,
             "-window" => wanted_window = true,
+            "-command" => {
+                let Some(script) = rest.get(index + 1) else {
+                    return Err(wrong("dump -command", "script", rest.len() + 2));
+                };
+                command = Some(script.as_str().to_string());
+                index += 1;
+            }
             "-window" => {}
             other => {
                 return Err(generic(format!(
@@ -11306,6 +11433,21 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
         }
     }
     entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    if let Some(script) = command {
+        // Tk invokes the script with key, value, index appended per element.
+        for entry in &entries {
+            let words = &entry.2;
+            let script = format!(
+                "{} {} {} {}",
+                script,
+                list_value(vec![words[0].clone()]),
+                list_value(vec![words[1].clone()]),
+                list_value(vec![words[2].clone()]),
+            );
+            interp.eval(&script)?;
+        }
+        return Ok(Value::empty());
+    }
     let flat = entries
         .into_iter()
         .flat_map(|(_, _, words)| words)
@@ -12485,6 +12627,7 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "ttk::style" => ttk_style_impl(interp, &args[1..]),
         "tk_popup" => tk_popup_impl(interp, args),
         "vwait" => vwait_impl(interp, args),
+        "tkwait" => tkwait_impl(interp, args),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -13278,6 +13421,42 @@ mod tests {
         assert_eq!(eval(&mut i, ".b count 1.0 end"), "3");
         assert_eq!(eval(&mut i, ".b count -lines 1.0 end"), "2");
         assert_eq!(eval(&mut i, ".b get {end -1c} end"), "");
+    }
+
+    #[test]
+    fn tkwait_and_dump_command() {
+        let mut i = Interp::new();
+        install(&mut i);
+        // tkwait variable returns when the variable is written.
+        eval(
+            &mut i,
+            "set done 0; after 30 {set done 1}; tkwait variable done",
+        );
+        assert_eq!(eval(&mut i, "set done"), "1");
+        // tkwait window returns when the window is destroyed.
+        eval(&mut i, "toplevel .w; label .w.l; pack .w.l");
+        eval(&mut i, "after 30 {destroy .w}; tkwait window .w");
+        assert!(i.eval("winfo exists .w").is_ok_and(|r| r.as_str() == "0"));
+        eval(&mut i, "toplevel .v; label .v.l; pack .v.l");
+        // tkwait visibility returns once packed.
+        eval(&mut i, "tkwait visibility .v.l");
+        // tkwait window with a window that never goes away hits the deadline
+        // (we don't test that — it would block for 300s).
+
+        // text dump -command invokes the script per element.
+        eval(&mut i, "text .t; .t insert 1.0 abc; .t tag add t 1.0 1.2");
+        eval(
+            &mut i,
+            "set ::log {}; .t dump -command {lappend ::log} -all 1.0 end",
+        );
+        let log = eval(&mut i, "set ::log");
+        assert!(
+            log.contains("tagon t 1.0")
+                && log.contains("text ab 1.0")
+                && log.contains("tagoff t 1.2")
+                && log.contains("mark insert 1.3"),
+            "dump -command streamed elements: {log:?}"
+        );
     }
 
     #[test]

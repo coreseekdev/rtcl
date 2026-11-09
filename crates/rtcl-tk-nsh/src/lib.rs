@@ -85,6 +85,24 @@ pub fn install_backend() {
     rtcl_tk_runtime::set_color_dialog_handler(color_dialog_gtk);
     #[cfg(target_os = "linux")]
     rtcl_tk_runtime::set_dialog_handler(dialog_gtk);
+    #[cfg(target_os = "linux")]
+    if gtk4::is_initialized() {
+        rtcl_tk_runtime::set_native_event_pump(pump_native_events);
+    }
+}
+
+/// One non-blocking pass over GTK's main context: delivers clicks, menus
+/// and input to the re-entrant evals a `vwait` nested loop waits for.
+#[cfg(target_os = "linux")]
+fn pump_native_events() -> bool {
+    let context = gtk4::glib::MainContext::default();
+    let mut pumped = false;
+    for _ in 0..4 {
+        if context.iteration(false) {
+            pumped = true;
+        }
+    }
+    pumped
 }
 
 /// `tk_dialog` as a GTK alert with the app's buttons, blocking until the

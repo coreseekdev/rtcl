@@ -326,6 +326,19 @@ fn flush_notify() {
     }
 }
 
+/// Force a render now, even mid-eval (`vwait`'s nested event loop paints
+/// between events).
+pub fn render_now() {
+    let pending = NOTIFY_PENDING.with(|p| p.replace(false));
+    if pending {
+        CHANGE_HOOK.with(|h| {
+            if let Some(f) = h.get() {
+                f();
+            }
+        });
+    }
+}
+
 /// Run `f` as one Tcl evaluation; the backend hook fires when the
 /// outermost one returns.
 fn with_eval<R>(f: impl FnOnce() -> R) -> R {
@@ -587,6 +600,7 @@ pub fn install(interp: &mut Interp) {
         "grab",
         "ttk::style",
         "tk_popup",
+        "vwait",
     ] {
         interp.register_command(name, global_command);
     }
@@ -4707,6 +4721,51 @@ fn grab_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
+/// `vwait varName`: Tk's nested event loop.  While the variable keeps its
+/// value we pump native events (clicks, menus), run due `after` timers,
+/// and repaint; a write to the variable (from any of those re-entrant
+/// evals) returns.  A long deadline guards against stuck scripts.
+fn vwait_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(wrong("vwait", "varName", args.len()));
+    }
+    let varname = args[1].as_str().to_string();
+    let ptr = interp as *mut Interp;
+    let initial = unsafe {
+        (*ptr)
+            .get_var(&varname)
+            .ok()
+            .map(|value| value.as_str().to_string())
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let current = unsafe {
+            (*ptr)
+                .get_var(&varname)
+                .ok()
+                .map(|value| value.as_str().to_string())
+        };
+        if current != initial {
+            return Ok(Value::empty());
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(Error::runtime(
+                format!("can't wait for variable \"{varname}\": would wait forever"),
+                rtcl_core::error::ErrorCode::Generic,
+            ));
+        }
+        render_now();
+        let native = NATIVE_PUMP
+            .with(|cell| cell.get())
+            .map(|pump| pump())
+            .unwrap_or(false);
+        let timers = pump_active();
+        if !native && !timers {
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+    }
+}
+
 /// `tk_popup menu x y ?entry?`: post `menu` at a point (the entry index
 /// only fine-tunes Tk's placement and is ignored here).
 fn tk_popup_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -5361,6 +5420,20 @@ fn file_dialog_impl(interp: &mut Interp, args: &[Value], kind: FileDialogKind) -
             paths.first().map(String::as_str).unwrap_or(""),
         ))
     }
+}
+
+thread_local! {
+    /// The backend's native event pump: one non-blocking pass over the
+    /// platform event loop (`vwait`'s nested loop uses it to deliver
+    /// clicks/menus while it waits).
+    static NATIVE_PUMP: std::cell::Cell<Option<fn() -> bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Give `vwait` a native event pump (Linux: a nested GTK main-context
+/// iteration).  Without one `vwait` only runs `after` timers.
+pub fn set_native_event_pump(pump: fn() -> bool) {
+    NATIVE_PUMP.with(|cell| cell.set(Some(pump)));
 }
 
 thread_local! {
@@ -11901,6 +11974,7 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "grab" => grab_impl(interp, args),
         "ttk::style" => ttk_style_impl(interp, &args[1..]),
         "tk_popup" => tk_popup_impl(interp, args),
+        "vwait" => vwait_impl(interp, args),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -12610,6 +12684,18 @@ mod tests {
         eval(&mut i, "set ::c 0");
         text_key_event(".t", "c", false, false, false, false);
         assert_eq!(eval(&mut i, "set ::c"), "0");
+    }
+
+    #[test]
+    fn vwait_returns_when_after_sets_the_variable() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "set done 0; after 30 {set done 1}; vwait done");
+        assert_eq!(eval(&mut i, "set done"), "1");
+        // Any re-entrant eval inside the loop returns the wait too —
+        // here an `after` script plays the role of a click.
+        eval(&mut i, "set go 0; after 30 {set go clicked}; vwait go");
+        assert_eq!(eval(&mut i, "set go"), "clicked");
     }
 
     #[test]

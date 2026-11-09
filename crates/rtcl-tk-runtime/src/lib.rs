@@ -5410,10 +5410,22 @@ pub fn focused_nav_key(key: &str) {
     let mut ctx = EventCtx::for_path(&path);
     ctx.key = key.to_string();
     run_binding(&path, "<KeyPress>", &ctx);
-    match kind {
-        Some(WidgetKind::Listbox) => listbox_nav(&path, key),
-        Some(WidgetKind::Treeview) => treeview_nav(&path, key),
-        _ => {}
+    // Tk's listbox/treeview class bindings move the selection; a user
+    // binding on the same class sequence replaces that default.
+    let event = event_from("<KeyPress>", &ctx);
+    let class = with_state(interp, |rt| rt.tree.get(&path).map(|n| n.kind.class_name()))
+        .flatten()
+        .unwrap_or("Widget");
+    let overridden = tag_binding_map(interp, class).iter().any(|(sequence, _)| {
+        let pattern = parse_sequence(sequence);
+        pattern.detail.is_some() && pattern.matches(&event)
+    });
+    if !overridden {
+        match kind {
+            Some(WidgetKind::Listbox) => listbox_nav(&path, key),
+            Some(WidgetKind::Treeview) => treeview_nav(&path, key),
+            _ => {}
+        }
     }
     run_binding(&path, "<KeyRelease>", &ctx);
 }
@@ -8826,6 +8838,17 @@ mod tests {
         assert_eq!(eval(&mut i, ".tv selection"), "b");
         focused_nav_key("Up");
         assert_eq!(eval(&mut i, ".tv selection"), "a");
+
+        // A user class binding for the same key replaces the default move.
+        eval(
+            &mut i,
+            "bind Listbox <Key-Down> {set ::nav blocked}; set ::nav {}",
+        );
+        listbox_select(".l", 0);
+        focused_nav_key("Down");
+        assert_eq!(eval(&mut i, ".l curselection"), "0");
+        assert_eq!(eval(&mut i, "set ::nav"), "blocked");
+        eval(&mut i, "bind Listbox <Key-Down> {}");
     }
 
     #[test]

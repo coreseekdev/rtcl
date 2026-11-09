@@ -452,6 +452,13 @@ thread_local! {
         const { RefCell::new(BTreeMap::new()) };
 }
 
+thread_local! {
+    /// Element refs of plain multiline text inputs, for `text see`'s
+    /// scroll-to-line.
+    static INPUT_REFS: RefCell<BTreeMap<String, ElementRef>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
 fn revision_signal() -> Signal<u64> {
     REVISION.with(|r| {
         let mut slot = r.borrow_mut();
@@ -2634,6 +2641,23 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let enter_path = path.clone();
             let leave_path = path.clone();
             let move_path = path.clone();
+            // `text see index` scrolls the native multiline input to the
+            // line (element ref's ScrollTo, delivered next frame after
+            // the view mounts).
+            let input_ref = element_ref();
+            INPUT_REFS.with(|map| map.borrow_mut().insert(path.clone(), input_ref.clone()));
+            if let Some(index) = rtcl_tk_runtime::take_text_see(path.as_str()) {
+                let line = rtcl_tk_runtime::text_value(path.as_str())
+                    .chars()
+                    .take(index)
+                    .filter(|c| *c == '\n')
+                    .count();
+                let scroll_ref = input_ref.clone();
+                spawn(async move {
+                    next_frame().await;
+                    scroll_ref.scroll_to(Point::new(px(0.0), px(line as f32 * 18.0)), false);
+                });
+            }
             nsh_base::input()
                 .multiline(true)
                 .auto_focus(rtcl_tk_runtime::focused(&path))
@@ -2673,6 +2697,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         e.position.y.0 as f64,
                     );
                 })
+                .element_ref(&input_ref)
                 .on_mouse_move(move |e: &MouseEvent| {
                     rtcl_tk_runtime::motion_event(
                         &move_path,

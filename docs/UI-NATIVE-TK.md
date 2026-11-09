@@ -321,8 +321,9 @@ Tcl 侧 `tag add/remove` 这类纯格式命令不单独入栈，但会随下一�
 } 1.3`）；`insert end` 插在它之前；用户自行插入的行尾换行是
 真实内容（`get 1.0 end` 保留）。索引整体在虚拟内容上运算（`L.C`、
 `end±Nc`、word/line 修饰符、越界钳制到 end）。
-`text see index` 在富文本编辑器里滚动到该字符位置（不移动 caret；普通
-text 无滚动模型时为 no-op）；`text dlineinfo index` 按 18px 行高模型返回
+`text see index` 滚动到该字符所在行：富文本经 fork 的
+`RichEditorApi::scroll_to`，普通 text 经 input 的 ElementRef `ScrollTo`
+命令滚到 `(line-1)×18px`（均不移动 caret）；`text dlineinfo index` 按 18px 行高模型返回
 `x y w h baseline`（x=3，w 为 -width 字符宽，行不可见/超出行数/end 位置
 返回空串）；`text count ?-chars|-indices|-lines|-update|-elide? index1 index2` 按选项
 顺序返回计数（默认 chars，`-lines` 为跨过的显示行数）；`text dump ?-all|-text|-tag|-mark|-image|

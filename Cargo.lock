@@ -2888,7 +2888,7 @@ dependencies = [
 [[package]]
 name = "nsh-base"
 version = "0.4.0"
-source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#869a31c3238f45324f916571f45829344012426a"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#930644ae391eb7d5c7c90e17bc2c1524e1538bea"
 dependencies = [
  "chrono",
  "html5ever",
@@ -2917,7 +2917,7 @@ dependencies = [
 [[package]]
 name = "nsh-core"
 version = "0.4.0"
-source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#869a31c3238f45324f916571f45829344012426a"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#930644ae391eb7d5c7c90e17bc2c1524e1538bea"
 dependencies = [
  "cap-std",
  "crc32fast",
@@ -2952,7 +2952,7 @@ dependencies = [
 [[package]]
 name = "nsh-engine"
 version = "0.4.0"
-source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#869a31c3238f45324f916571f45829344012426a"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#930644ae391eb7d5c7c90e17bc2c1524e1538bea"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -2973,7 +2973,7 @@ dependencies = [
 [[package]]
 name = "nsh-js"
 version = "0.4.0"
-source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#869a31c3238f45324f916571f45829344012426a"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#930644ae391eb7d5c7c90e17bc2c1524e1538bea"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
@@ -2994,7 +2994,7 @@ dependencies = [
 [[package]]
 name = "nsh-macros"
 version = "0.4.0"
-source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#869a31c3238f45324f916571f45829344012426a"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#930644ae391eb7d5c7c90e17bc2c1524e1538bea"
 dependencies = [
  "imagesize 0.15.0",
  "proc-macro2",
@@ -3007,7 +3007,7 @@ dependencies = [
 [[package]]
 name = "nsh-package"
 version = "0.4.0"
-source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#869a31c3238f45324f916571f45829344012426a"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#930644ae391eb7d5c7c90e17bc2c1524e1538bea"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3022,7 +3022,7 @@ dependencies = [
 [[package]]
 name = "nsh-platform-linux"
 version = "0.4.0"
-source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#869a31c3238f45324f916571f45829344012426a"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#930644ae391eb7d5c7c90e17bc2c1524e1538bea"
 dependencies = [
  "crossbeam-channel",
  "gtk4",
@@ -3041,7 +3041,7 @@ dependencies = [
 [[package]]
 name = "nsh-testing"
 version = "0.4.0"
-source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#869a31c3238f45324f916571f45829344012426a"
+source = "git+ssh://git@github.com/coreseekdev/nsh?branch=rtcl-tk#930644ae391eb7d5c7c90e17bc2c1524e1538bea"
 dependencies = [
  "crossbeam-channel",
  "log",

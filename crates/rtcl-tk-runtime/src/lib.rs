@@ -97,6 +97,8 @@ pub struct TkRuntime {
     selection_handlers: BTreeMap<(String, String), SelectionHandler>,
     /// `text -undo` stacks by widget path.
     text_undo: BTreeMap<String, TextUndo>,
+    /// Pending `text see` positions for the renderer.
+    text_see: BTreeMap<String, usize>,
     /// Persisted rich-text documents (ProseMirror JSON) of `text` widgets.
     rich_docs: BTreeMap<String, String>,
     /// `text edit modified` state: widgets with unsaved edits.
@@ -1028,7 +1030,19 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         char_to_linecol(&content, i)
                     )))
                 }
-                "see" => Ok(Value::empty()),
+                "see" => {
+                    if args.len() != 3 {
+                        return Err(wrong("see", "index", args.len()));
+                    }
+                    let (content, cursor) = text_state(interp, path);
+                    let marks = text_marks(interp, path);
+                    let index = text_index(args[2].as_str(), &content, cursor, &marks)?;
+                    with_state_mut(interp, |rt| {
+                        rt.text_see.insert(path.to_string(), index);
+                        rt.bump();
+                    });
+                    Ok(Value::empty())
+                }
                 "mark" => text_mark_command(interp, path, &args[2..]),
                 "tag" => text_tag_command(interp, path, &args[2..]),
                 "getdoc" => Ok(Value::from_str(&rich_doc(path).unwrap_or_default())),
@@ -1990,6 +2004,7 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
             rt.text_modified.remove(p);
             rt.rich_docs.remove(p);
             rt.text_undo.remove(p);
+            rt.text_see.remove(p);
             rt.paned.remove(p);
             for panes in rt.paned.values_mut() {
                 panes.retain(|pane| pane.path != *p);
@@ -9023,6 +9038,19 @@ pub fn rich_doc(path: &str) -> Option<String> {
     with_state(unsafe { &*ptr }, |rt| rt.rich_docs.get(path).cloned()).flatten()
 }
 
+/// Take the pending `text see` index for the renderer.
+pub fn take_text_see(path: &str) -> Option<usize> {
+    let ptr = active_interp()?;
+    with_state_mut(unsafe { &mut *ptr }, |rt| rt.text_see.remove(path)).flatten()
+}
+
+/// The ProseMirror position for a text widget's char index (for
+/// `text see` scrolling in the rich editor).
+pub fn text_index_doc_pos(path: &str, index: usize) -> Option<usize> {
+    let json = rich_doc(path)?;
+    text_offset_to_doc_pos(&json, index)
+}
+
 /// A rich document's plain text (blocks separated by newlines).
 pub fn rich_doc_text(json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
@@ -9106,6 +9134,38 @@ fn doc_pos_to_text_offset(json: &str, position: usize) -> Option<usize> {
         doc_pos += 1;
     }
     Some(text_offset)
+}
+
+/// Map a plain-text char offset to a ProseMirror document position.
+fn text_offset_to_doc_pos(json: &str, offset: usize) -> Option<usize> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let blocks = value.get("content")?.as_array()?;
+    let mut doc_pos = 0usize;
+    let mut text_offset = 0usize;
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 {
+            text_offset += 1;
+        }
+        doc_pos += 1;
+        let Some(nodes) = block.get("content").and_then(|v| v.as_array()) else {
+            doc_pos += 1;
+            continue;
+        };
+        for node in nodes {
+            if node.get("type").and_then(|v| v.as_str()) != Some("text") {
+                continue;
+            }
+            let content = node.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let length = content.chars().count();
+            if offset <= text_offset + length {
+                return Some(doc_pos + offset.saturating_sub(text_offset).min(length));
+            }
+            doc_pos += length;
+            text_offset += length;
+        }
+        doc_pos += 1;
+    }
+    Some(doc_pos)
 }
 
 fn merged_doc_json(json: &str, new_content: &str) -> Option<String> {
@@ -12018,6 +12078,15 @@ mod tests {
         assert_eq!(doc_pos_to_text_offset(doc, 3), Some(2));
         assert_eq!(doc_pos_to_text_offset(doc, 5), Some(3));
         assert_eq!(doc_pos_to_text_offset(doc, 6), Some(4));
+        assert_eq!(text_offset_to_doc_pos(doc, 0), Some(1));
+        assert_eq!(text_offset_to_doc_pos(doc, 1), Some(2));
+        assert_eq!(text_offset_to_doc_pos(doc, 3), Some(5));
+        assert_eq!(text_offset_to_doc_pos(doc, 4), Some(6));
+
+        // `text see` records a pending position for the rich renderer.
+        eval(&mut i, ".b see 1.2");
+        assert_eq!(take_text_see(".b"), Some(2));
+        assert_eq!(take_text_see(".b"), None);
     }
 
     #[test]

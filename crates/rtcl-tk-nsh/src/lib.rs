@@ -24,8 +24,8 @@ use nsh_base::rich_editor::{
     model::Schema,
     state::{EditorState, EditorStateConfig, KeyEvent, Plugin, PluginKey, PluginSpec, Transaction},
     view::{
-        rich_editor, EditorSession, NodeViews, PartStyles, RichEditorHover, RichEditorPress,
-        RichEditorSelection, RichEditorStyles,
+        rich_editor, EditorSession, NodeViews, PartStyles, RichEditor, RichEditorApi,
+        RichEditorHover, RichEditorPress, RichEditorSelection, RichEditorStyles,
     },
 };
 use nsh_base::{
@@ -57,6 +57,7 @@ struct WysiwygEntry {
     content: String,
     signature: String,
     session: EditorSession,
+    editor_ref: ComponentRef<RichEditor>,
 }
 
 fn notify_backend() {
@@ -1104,7 +1105,7 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                     Some(json) => wysiwyg_styles_from_doc(json),
                     None => wysiwyg_styles(tags),
                 };
-                return Some((entry.session.clone(), styles));
+                return Some((entry.session.clone(), styles, entry.editor_ref));
             }
         }
         // The rich document is the data: prefer it, shifting its marks
@@ -1118,34 +1119,49 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
             };
             if let Some((json, session)) = merged {
                 let styles = wysiwyg_styles_from_doc(&json);
+                let editor_ref = component_ref::<RichEditor>();
                 map.insert(
                     path.to_string(),
                     WysiwygEntry {
                         content,
                         signature,
                         session: session.clone(),
+                        editor_ref,
                     },
                 );
-                return Some((session, styles));
+                return Some((session, styles, editor_ref));
             }
         }
         let session = wysiwyg_session(path, &content, tags)?;
         let json = serde_json::to_string(&session.state().doc().to_json()).ok()?;
         rtcl_tk_runtime::set_rich_doc(path, json);
         let styles = wysiwyg_styles(tags);
+        let editor_ref = component_ref::<RichEditor>();
         map.insert(
             path.to_string(),
             WysiwygEntry {
                 content,
                 signature,
                 session: session.clone(),
+                editor_ref,
             },
         );
-        Some((session, styles))
+        Some((session, styles, editor_ref))
     });
-    let Some((session, styles)) = built else {
+    let Some((session, styles, editor_ref)) = built else {
         return render_rich_text(tree, path, tags);
     };
+    if let Some(index) = rtcl_tk_runtime::take_text_see(path) {
+        if let Some(position) = rtcl_tk_runtime::text_index_doc_pos(path, index) {
+            let editor_ref = editor_ref;
+            spawn(async move {
+                next_frame().await;
+                if let Some(api) = editor_ref.api::<RichEditorApi>() {
+                    api.scroll_to(position as u32);
+                }
+            });
+        }
+    }
     let change_path = path.to_string();
     let change_session = session.clone();
     let wheel_path = path.to_string();
@@ -1220,7 +1236,8 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                 })
                 .on_hover_out(move |_: &()| {
                     rtcl_tk_runtime::text_tag_hover_out(&hover_out_path);
-                }),
+                })
+                .component_ref(&editor_ref),
         )
         .into_element()
 }

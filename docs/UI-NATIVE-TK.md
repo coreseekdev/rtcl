@@ -292,7 +292,8 @@ tag 区间、mark 与富文档；`-autoseparators`（默认开）时 500ms 内�
 `-maxundo` 限制栈深（0 为不限，与 Tk 一致）；`edit reset` 同时清空历史。
 Tcl 侧 `tag add/remove` 这类纯格式命令不单独入栈，但会随下一次文本编辑的
 快照一起回滚。富编辑器内部的 Ctrl+Z 仍由编辑器自身的历史处理。
-`text count ?-chars|-indices|-lines|-update|-elide? index1 index2` 按选项
+`text see index` 在富文本编辑器里滚动到该字符位置（不移动 caret；普通
+text 无滚动模型时为 no-op）；`text count ?-chars|-indices|-lines|-update|-elide? index1 index2` 按选项
 顺序返回计数（默认 chars）；`text dump ?-all|-text|-tag|-mark|-image|
 -window? index1 ?index2?` 按位置输出 Tk 风格事件流：`tagon/tagoff <tag>
 <index>`、`mark <name> <index>`、`text <chars> <index>`，text 在 tag

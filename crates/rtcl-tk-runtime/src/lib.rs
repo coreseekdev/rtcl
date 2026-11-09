@@ -1362,21 +1362,19 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 "delete" => {
                     for value in &args[2..] {
-                        if value.as_str() == "all" {
-                            with_state_mut(interp, |rt| {
-                                if let Some(canvas) = rt.canvases.get_mut(path) {
+                        let target = value.as_str();
+                        with_state_mut(interp, |rt| {
+                            if let Some(canvas) = rt.canvases.get_mut(path) {
+                                if target == "all" {
                                     canvas.items.clear();
-                                    rt.bump();
+                                } else {
+                                    canvas
+                                        .items
+                                        .retain(|item| !canvas_item_matches(item, target));
                                 }
-                            });
-                        } else if let Ok(id) = value.as_str().parse::<u64>() {
-                            with_state_mut(interp, |rt| {
-                                if let Some(canvas) = rt.canvases.get_mut(path) {
-                                    canvas.items.retain(|item| item.id != id);
-                                    rt.bump();
-                                }
-                            });
-                        }
+                                rt.bump();
+                            }
+                        });
                     }
                     Ok(Value::empty())
                 }
@@ -1401,6 +1399,12 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 "itemconfigure" => canvas_itemconfigure(interp, path, &args[2..]),
                 "find" => {
+                    let target = match args.get(2).map(|v| v.as_str()) {
+                        Some("withtag") | Some("withtags") => {
+                            args.get(3).map(|v| v.as_str()).unwrap_or("all")
+                        }
+                        _ => "all",
+                    };
                     let ids = with_state(interp, |rt| {
                         rt.canvases
                             .get(path)
@@ -1408,6 +1412,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                                 canvas
                                     .items
                                     .iter()
+                                    .filter(|item| canvas_item_matches(item, target))
                                     .map(|i| i.id.to_string())
                                     .collect::<Vec<_>>()
                             })
@@ -5354,6 +5359,15 @@ fn set_canvas_view(interp: &mut Interp, path: &str, horizontal: bool, fraction: 
     });
 }
 
+fn canvas_item_matches(item: &CanvasItem, target: &str) -> bool {
+    target == "all"
+        || item.id.to_string() == target
+        || item
+            .options
+            .get("-tags")
+            .is_some_and(|tags| tags.split_whitespace().any(|tag| tag == target))
+}
+
 fn canvas_item_contains(item: &CanvasItem, x: f64, y: f64) -> bool {
     let c = &item.coords;
     match item.kind.as_str() {
@@ -6717,6 +6731,11 @@ mod tests {
         assert_eq!(eval(&mut i, ".c coords $id"), "12 14 70 90");
         eval(&mut i, ".c delete $id");
         assert_eq!(eval(&mut i, ".c find"), "");
+        let group = eval(&mut i, ".c create oval 0 0 5 5 -fill red -tags {g}");
+        assert_eq!(eval(&mut i, ".c find withtag g"), group);
+        assert_eq!(eval(&mut i, ".c find withtag other"), "");
+        eval(&mut i, ".c delete g");
+        assert_eq!(eval(&mut i, ".c find withtag g"), "");
 
         eval(
             &mut i,

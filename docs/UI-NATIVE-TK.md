@@ -134,7 +134,7 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 | M1a ✅ | rtcl-vm `tk` 命令层：frame/label/button/entry/… 创建、configure/cget、pack/grid、destroy、winfo、wm/tk；per-widget 路径命令；teardown 自动清树；4 条单测 | `button .b -text Hi; cget .b -text` 等 Tcl 脚本语义通过 |
 | M1b ✅ | nsh 后端最小集（frame/label/button/entry）+ TkView；按钮 `-command` 执行 Tcl，按钮文本经 signal 刷新；GTK4 demo + headless 验收 | `nsh-testing`：初始 "Click me" 渲染 → press → "Clicked 1" → press → "Clicked 2"；`cargo run -p rtcl-tk-demo` 打开 GTK4 窗口 |
 | M2 ✅ | pack/grid/place、bind/event generate、after/update、`-textvariable` 双向、entry/text/listbox/scale 数据子命令、winfo/wm 扩展、ttk 别名、focus/raise/font/option；message/scrollbar/separator/progressbar；整树 dynamic 重建 | 经典 grid/pack 表单脚本通过（`classic_nsh`）；demo 双态截图；tk 单测 19 + headless 验收 2 |
-| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、虚拟化列表/树、Tk scrollbar 联动、主题色、macOS 系统菜单、Canvas 动态/绑定/滚动/旋转/贝塞尔/箭头/虚线/图片、photo image、text tag 光标级 WYSIWYG + marks 数据持久化 ✅；Windows/Linux 原生菜单受 nsh GTK 限制 | 设置页/表单/列表演示（classic demo + headless 验收） |
+| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、虚拟化列表/树、Tk scrollbar 联动、主题色、macOS 系统菜单、Canvas 动态/绑定/滚动/旋转/贝塞尔/箭头/虚线/图片/polygon/按 tag 删查、photo image、text tag 光标级 WYSIWYG + marks 数据持久化、菜单 `-accelerator` ✅；Windows/Linux 原生菜单受 nsh GTK 限制 | 设置页/表单/列表演示（classic demo + headless 验收） |
 | M4 | 虚拟化 table/log/tree/chart + iOS/Android embed + 打包 | 手机/桌面同一 Tcl 脚本跑通 |
 
 ## 7. 主要风险
@@ -183,7 +183,10 @@ index/heading/column/exists`；listbox/treeview 按 `-height` 放进滚动视图
 `desktop::set_application_menu` 映射到系统菜单；Linux/Windows 在 app 内
 渲染为一行 cascade 按钮 + 浮层下拉（command/checkbutton/radiobutton/
 separator/cascade），headless 同样用 app 内菜单以便测试；`-tearoff`
-接受但不绘制撕下菜单。
+接受但不绘制撕下菜单。`-accelerator` 按 Tk 语义**只负责显示**：macOS
+菜单项写入原生快捷键（`Ctrl/Cmd`→mod、`Alt`→alt、`Shift`→shift、F1–F24
+与常用命名键），app 内下拉在标签右侧追加同样文本；不实现全局热键绑定
+（与 Tk 一致，需用户自行 `bind`）。
 
 **布局**：pack 按子控件顺序流式排列，连续 `-side left/right` 归入同一
 行（右侧项推到行尾），不放 fill 的 parcel 从行/列首开始；grid 按行分组、`columnconfigure -weight` 进入
@@ -205,7 +208,10 @@ polygon/image` 的 `create/delete/coords/itemconfigure/itemcget/find/
 move/scale/raise/lower/bind/xview/yview`；`-scrollregion` + xview/yview
 平移裁剪；item 或 tag 的 `<Button-1>` 绑定按命中项执行（近似 hit test）；
 `-angle` 旋转、line `-smooth true|bezier`（二次/三次贝塞尔）、`-dash`/
-`-dashoffset`、`-arrow first|last|both`、image 项绘制图片。`image create
+`-dashoffset`、`-arrow first|last|both`、polygon `-fill/-outline`（闭合
+填充 + 描边）、image 项绘制图片。`delete` 与 `find` 接受 id、`all` 或
+空格分隔的 `-tags`（`find withtag/withtags`），即按 tag 批量删/查。
+`image create
 photo` + `label/button -image` 渲染文件图片。`text tag add/remove/
 configure/cget/ranges/names/delete` 维护区间；有标签的 text 用 nsh
 `RichEditor`（ProseMirror starter schema + textStyle）渲染为**光标级

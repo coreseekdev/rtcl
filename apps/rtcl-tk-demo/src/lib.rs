@@ -150,6 +150,7 @@ canvas .cv -width 240 -height 90 -background "#f8fafc"
 .cv create rectangle 10 10 110 70 -fill "#93c5fd" -outline "#1d4ed8" -angle 12
 .cv create oval 130 10 220 70 -fill "#fca5a5"
 .cv create line 20 85 80 65 140 85 200 65 -fill "#111827" -width 2 -smooth bezier -dash {6 4} -arrow last
+.cv create polygon 175 86 195 58 220 86 -fill "#86efac" -outline "#166534"
 .cv create text 120 40 -text "Canvas"
 .cv bind 1 <Button-1> {set ::canvas_hit 1}
 pack .cv -padx 8 -pady 4

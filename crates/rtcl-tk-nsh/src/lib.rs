@@ -178,6 +178,53 @@ fn sync_native_menu() {
     }
 }
 
+fn tk_accelerator(accelerator: &str) -> Option<String> {
+    let parts = accelerator
+        .split('+')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+    let (key, modifiers) = parts.split_last()?;
+    let mut out = Vec::new();
+    for modifier in modifiers {
+        match modifier.as_str() {
+            "ctrl" | "control" | "cmd" | "command" | "meta" | "super" => {
+                out.push("mod".to_string())
+            }
+            "alt" | "option" => out.push("alt".to_string()),
+            "shift" => out.push("shift".to_string()),
+            _ => return None,
+        }
+    }
+    let valid_key = key.len() == 1 && key.chars().all(|c| c.is_ascii_alphanumeric())
+        || matches!(
+            key.as_str(),
+            "enter"
+                | "escape"
+                | "tab"
+                | "space"
+                | "backspace"
+                | "delete"
+                | "left"
+                | "right"
+                | "up"
+                | "down"
+                | "home"
+                | "end"
+                | "pageup"
+                | "pagedown"
+        )
+        || (key.starts_with('f') && key[1..].parse::<u8>().is_ok_and(|n| (1..=24).contains(&n)));
+    if !valid_key {
+        return None;
+    }
+    out.push(key.to_string());
+    Some(out.join("+"))
+}
+
 fn native_menu_items(menu_path: &str) -> Vec<desktop::MenuItem> {
     let Some(menu) = rtcl_tk_runtime::menu_snapshot(menu_path) else {
         return Vec::new();
@@ -213,6 +260,11 @@ fn native_menu_items(menu_path: &str) -> Vec<desktop::MenuItem> {
             let checked =
                 !var.is_empty() && rtcl_tk_runtime::var_value(&var).is_some_and(|v| v == on);
             entry = entry.checked(checked);
+        }
+        if let Some(accelerator) = item.options.get("-accelerator") {
+            if let Some(shortcut) = tk_accelerator(accelerator) {
+                entry = entry.shortcut(&shortcut);
+            }
         }
         out.push(entry);
     }
@@ -869,6 +921,12 @@ fn render_menu_dropdown(menu_path: &str) -> AnyElement {
             _ => "",
         };
         let suffix = if item.kind == "cascade" { " ▸" } else { "" };
+        let accelerator = item
+            .options
+            .get("-accelerator")
+            .map(|value| format!("    {value}"))
+            .unwrap_or_default();
+        let label = format!("{label}{accelerator}");
         let disabled = item.options.get("-state").is_some_and(|s| s == "disabled");
         let path = menu_path.to_string();
         if disabled {
@@ -1866,6 +1924,32 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         }
                         if matches!(arrow.as_str(), "first" | "both") && points.len() >= 2 {
                             painter = arrow_head(painter, points[1], points[0], color.light, 10.0);
+                        }
+                    }
+                    "polygon" if coords.len() >= 4 => {
+                        let points = coords
+                            .chunks(2)
+                            .filter(|p| p.len() == 2)
+                            .map(|p| (p[0] as f32, p[1] as f32))
+                            .collect::<Vec<_>>();
+                        if let Some(fill) = option("-fill") {
+                            painter = painter.fill_color(fill.light).begin_path();
+                            painter = painter.move_to(points[0].0, points[0].1);
+                            for (x, y) in &points[1..] {
+                                painter = painter.line_to(*x, *y);
+                            }
+                            painter = painter.close_path().fill();
+                        }
+                        if let Some(outline) = option("-outline") {
+                            painter = painter
+                                .stroke_color(outline.light)
+                                .line_width(1.0f32)
+                                .begin_path();
+                            painter = painter.move_to(points[0].0, points[0].1);
+                            for (x, y) in &points[1..] {
+                                painter = painter.line_to(*x, *y);
+                            }
+                            painter = painter.close_path().stroke();
                         }
                     }
                     "oval" if coords.len() >= 4 => {

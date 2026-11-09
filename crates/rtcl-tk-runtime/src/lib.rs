@@ -82,6 +82,8 @@ pub struct TkRuntime {
     canvases: BTreeMap<String, CanvasState>,
     /// Persisted rich-text documents (ProseMirror JSON) of `text` widgets.
     rich_docs: BTreeMap<String, String>,
+    /// `text edit modified` state: widgets with unsaved edits.
+    text_modified: BTreeSet<String>,
 }
 
 /// A canvas's items.
@@ -150,6 +152,7 @@ pub struct TreeItem {
     pub parent: Option<String>,
     pub text: String,
     pub values: Vec<String>,
+    pub tags: Vec<String>,
     pub open: bool,
 }
 
@@ -161,6 +164,8 @@ pub struct TreeViewState {
     pub items: Vec<TreeItem>,
     pub selected: BTreeSet<String>,
     pub focus: Option<String>,
+    /// Row tags (`tag configure`) and the items carrying them.
+    pub tags: BTreeMap<String, BTreeMap<String, String>>,
     next_id: u64,
 }
 
@@ -887,7 +892,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     sync_text_tags_from_doc(path);
                     Ok(Value::empty())
                 }
-                "edit" => Ok(Value::empty()),
+                "edit" => text_edit_command(interp, path, &args[2..]),
                 "xview" | "yview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
@@ -948,7 +953,18 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     .unwrap_or(0);
                     view_scroll_command(interp, path, &args[2..], total)
                 }
-                "activate" | "see" | "xview" => Ok(Value::empty()),
+                "see" => {
+                    if args.len() != 3 {
+                        return Err(wrong("see", "index", args.len()));
+                    }
+                    let len = with_state(interp, |rt| rt.tree.get(path).map(|n| n.items.len()))
+                        .flatten()
+                        .unwrap_or(0);
+                    let index = listbox_index(args[2].as_str(), len)?;
+                    scroll_to_row(interp, path, index, len);
+                    Ok(Value::empty())
+                }
+                "activate" | "xview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
             WidgetKind::Scale => match sub {
@@ -1379,7 +1395,28 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     let total = treeview_visible_count(interp, path);
                     view_scroll_command(interp, path, &args[2..], total)
                 }
-                "column" | "tag" | "see" | "xview" => Ok(Value::empty()),
+                "tag" => treeview_tag_command(interp, path, &args[2..]),
+                "see" => {
+                    if args.len() != 3 {
+                        return Err(wrong("see", "item", args.len()));
+                    }
+                    let target = args[2].as_str();
+                    let (row, total) = with_state(interp, |rt| {
+                        rt.treeviews.get(path).map(|tv| {
+                            (
+                                treeview_row_index(tv, target),
+                                treeview_visible_count_of(tv),
+                            )
+                        })
+                    })
+                    .flatten()
+                    .unwrap_or((None, 0));
+                    if let Some(row) = row {
+                        scroll_to_row(interp, path, row, total);
+                    }
+                    Ok(Value::empty())
+                }
+                "column" | "xview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
             WidgetKind::Canvas => match sub {
@@ -1489,6 +1526,9 @@ fn invoke_widget(interp: &mut Interp, path: &str) -> Result<Value> {
     let Some(kind) = with_state(interp, |rt| rt.tree.get(path).map(|n| n.kind)).flatten() else {
         return Err(bad_window(path));
     };
+    if effective_option(interp, path, "-state") == "disabled" {
+        return Ok(Value::empty());
+    }
     let command = effective_option(interp, path, "-command");
     match kind {
         WidgetKind::Button => {}
@@ -3818,6 +3858,9 @@ fn invoke_menu_item(interp: &mut Interp, menu_path: &str, index: usize) -> Resul
     .flatten()
     .ok_or_else(|| generic(format!("bad menu entry index \"{index}\"")))?;
     let option = |name: &str| item.options.get(name).cloned().unwrap_or_default();
+    if option("-state") == "disabled" {
+        return Ok(());
+    }
     match item.kind.as_str() {
         "separator" => {}
         "cascade" => {
@@ -4168,6 +4211,9 @@ fn apply_text_change(path: &str, text: &str) -> bool {
             .get(path)
             .map(|n| n.content.clone())
             .unwrap_or_default();
+        if old != text {
+            rt.text_modified.insert(path.to_string());
+        }
         adjust_text_tag_ranges(&old, text, rt.text_tags.get_mut(path));
         adjust_text_marks(&old, text, rt.text_marks.get_mut(path));
         if let Some(n) = rt.tree.get_mut(path) {
@@ -4303,6 +4349,7 @@ fn treeview_insert(interp: &mut Interp, path: &str, parent: &str, rest: &[Value]
     };
     let mut text = String::new();
     let mut values = Vec::new();
+    let mut tags = Vec::new();
     let mut open = false;
     let mut id = None;
     for (k, v) in parse_pairs(rest, 0, "treeview insert")? {
@@ -4314,9 +4361,12 @@ fn treeview_insert(interp: &mut Interp, path: &str, parent: &str, rest: &[Value]
                     .map(|list| list.iter().map(|x| x.as_str().to_string()).collect())
                     .unwrap_or_default();
             }
+            "-tags" => {
+                tags = v.split_whitespace().map(str::to_string).collect();
+            }
             "-open" => open = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
             "-id" => id = Some(v),
-            "-tags" | "-image" => {}
+            "-image" => {}
             _ => return Err(bad_option(&k)),
         }
     }
@@ -4343,6 +4393,7 @@ fn treeview_insert(interp: &mut Interp, path: &str, parent: &str, rest: &[Value]
             parent,
             text,
             values,
+            tags,
             open,
         });
         rt.bump();
@@ -4351,6 +4402,121 @@ fn treeview_insert(interp: &mut Interp, path: &str, parent: &str, rest: &[Value]
     })
     .ok_or_else(|| bad_window(path))??;
     Ok(Value::from_str(&result))
+}
+
+fn treeview_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong("tag", "option ?arg ...?", rest.len() + 2));
+    }
+    match rest[0].as_str() {
+        "configure" => {
+            if rest.len() < 2 {
+                return Err(wrong(
+                    "tag configure",
+                    "tagName ?-option? ?value ...?",
+                    rest.len() + 2,
+                ));
+            }
+            let name = rest[1].as_str().to_string();
+            if rest.len() == 2 {
+                let options = with_state(interp, |rt| {
+                    rt.treeviews
+                        .get(path)
+                        .and_then(|tv| tv.tags.get(&name))
+                        .map(|tag| tag.clone())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+                return Ok(list_value(
+                    options
+                        .iter()
+                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            if rest.len() == 3 {
+                let option = rest[2].as_str();
+                let value = with_state(interp, |rt| {
+                    rt.treeviews
+                        .get(path)
+                        .and_then(|tv| tv.tags.get(&name))
+                        .and_then(|tag| tag.get(option))
+                        .cloned()
+                })
+                .flatten()
+                .unwrap_or_default();
+                return Ok(Value::from_str(&value));
+            }
+            let options = parse_pairs(rest, 2, "tag configure")?;
+            with_state_mut(interp, |rt| {
+                if let Some(tv) = rt.treeviews.get_mut(path) {
+                    tv.tags.entry(name.clone()).or_default().extend(options);
+                    rt.bump();
+                }
+            });
+            Ok(Value::empty())
+        }
+        "cget" => {
+            if rest.len() != 3 {
+                return Err(wrong("tag cget", "tagName -option", rest.len() + 2));
+            }
+            let value = with_state(interp, |rt| {
+                rt.treeviews
+                    .get(path)
+                    .and_then(|tv| tv.tags.get(rest[1].as_str()))
+                    .and_then(|tag| tag.get(rest[2].as_str()))
+                    .cloned()
+            })
+            .flatten()
+            .unwrap_or_default();
+            Ok(Value::from_str(&value))
+        }
+        "names" => {
+            let names = with_state(interp, |rt| {
+                rt.treeviews
+                    .get(path)
+                    .map(|tv| tv.tags.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+            Ok(list_value(names))
+        }
+        "has" => {
+            if rest.len() < 2 || rest.len() > 3 {
+                return Err(wrong("tag has", "tagName ?item?", rest.len() + 2));
+            }
+            let name = rest[1].as_str();
+            let found = with_state(interp, |rt| {
+                let Some(tv) = rt.treeviews.get(path) else {
+                    return false;
+                };
+                match rest.get(2) {
+                    Some(item) => tv
+                        .items
+                        .iter()
+                        .find(|i| i.id == item.as_str())
+                        .is_some_and(|i| i.tags.iter().any(|tag| tag == name)),
+                    None => tv.tags.contains_key(name),
+                }
+            })
+            .unwrap_or(false);
+            Ok(Value::from_bool(found))
+        }
+        "delete" => {
+            with_state_mut(interp, |rt| {
+                if let Some(tv) = rt.treeviews.get_mut(path) {
+                    for value in &rest[1..] {
+                        tv.tags.remove(value.as_str());
+                    }
+                    rt.bump();
+                }
+            });
+            Ok(Value::empty())
+        }
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be cget, configure, delete, has, or names"
+        ))),
+    }
 }
 
 fn treeview_delete(interp: &mut Interp, path: &str, id: &str) -> Result<()> {
@@ -4411,6 +4577,8 @@ fn treeview_item(interp: &mut Interp, path: &str, id: &str, rest: &[Value]) -> R
             item.text,
             "-values".to_string(),
             values,
+            "-tags".to_string(),
+            item.tags.join(" "),
             "-open".to_string(),
             if item.open { "1" } else { "0" }.to_string(),
         ]));
@@ -4429,6 +4597,7 @@ fn treeview_item(interp: &mut Interp, path: &str, id: &str, rest: &[Value]) -> R
             "-text" => Value::from_str(&item.text),
             "-open" => Value::from_bool(item.open),
             "-values" => list_value(item.values),
+            "-tags" => list_value(item.tags),
             _ => Value::empty(),
         });
     }
@@ -4446,7 +4615,10 @@ fn treeview_item(interp: &mut Interp, path: &str, id: &str, rest: &[Value]) -> R
                                 .map(|list| list.iter().map(|x| x.as_str().to_string()).collect())
                                 .unwrap_or_default();
                         }
-                        "-tags" | "-image" => {}
+                        "-tags" => {
+                            item.tags = v.split_whitespace().map(str::to_string).collect();
+                        }
+                        "-image" => {}
                         _ => return Err(bad_option(&k)),
                     }
                 }
@@ -6462,6 +6634,7 @@ fn text_insert(
             n.content = new_content;
             n.cursor = cursor;
         }
+        rt.text_modified.insert(path.to_string());
         if let Some(tags) = &tags {
             let widget_tags = rt.text_tags.entry(path.to_string()).or_default();
             for name in tags.split_whitespace() {
@@ -6488,6 +6661,7 @@ fn text_delete(interp: &mut Interp, path: &str, first: &str, last: Option<&str>)
     with_state_mut(interp, |rt| {
         adjust_text_tag_ranges(&content, &new_content, rt.text_tags.get_mut(path));
         shift_marks_on_delete(rt.text_marks.get_mut(path), a, b);
+        rt.text_modified.insert(path.to_string());
         if let Some(n) = rt.tree.get_mut(path) {
             n.content = new_content;
             n.cursor = a;
@@ -6495,6 +6669,51 @@ fn text_delete(interp: &mut Interp, path: &str, first: &str, last: Option<&str>)
         }
     });
     Ok(Value::empty())
+}
+
+fn text_edit_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong("edit", "option ?arg ...?", rest.len() + 2));
+    }
+    match rest[0].as_str() {
+        "modified" => {
+            if rest.len() > 2 {
+                return Err(wrong("edit modified", "?boolean?", rest.len() + 2));
+            }
+            if let Some(value) = rest.get(1) {
+                let modified = value.as_bool().ok_or_else(|| {
+                    generic(format!(
+                        "expected boolean value but got \"{}\"",
+                        value.as_str()
+                    ))
+                })?;
+                with_state_mut(interp, |rt| {
+                    if modified {
+                        rt.text_modified.insert(path.to_string());
+                    } else {
+                        rt.text_modified.remove(path);
+                    }
+                });
+                Ok(Value::empty())
+            } else {
+                let modified =
+                    with_state(interp, |rt| rt.text_modified.contains(path)).unwrap_or(false);
+                Ok(Value::from_bool(modified))
+            }
+        }
+        "reset" => {
+            with_state_mut(interp, |rt| {
+                rt.text_modified.remove(path);
+            });
+            Ok(Value::empty())
+        }
+        "separator" => Ok(Value::empty()),
+        "undo" | "redo" => Ok(Value::empty()),
+        "canundo" | "canredo" => Ok(Value::from_bool(false)),
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be canredo, canundo, modified, redo, reset, separator, or undo"
+        ))),
+    }
 }
 
 fn text_mark_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
@@ -6671,6 +6890,25 @@ fn set_scroll_fraction(interp: &mut Interp, path: &str, fraction: f64) {
     });
 }
 
+/// Scroll a listbox/treeview so `index` (0-based row) is visible, moving as
+/// little as possible like Tk's `see`.
+fn scroll_to_row(interp: &mut Interp, path: &str, index: usize, total: usize) {
+    if total == 0 {
+        return;
+    }
+    let (fraction, rows) = scroll_state(interp, path);
+    let rows = rows.min(total);
+    let start = ((fraction * total as f64).round() as usize).min(total.saturating_sub(rows));
+    let index = index.min(total - 1);
+    if index < start {
+        set_scroll_fraction(interp, path, index as f64 / total as f64);
+    } else if index >= start + rows {
+        let first = index + 1 - rows;
+        set_scroll_fraction(interp, path, first as f64 / total as f64);
+    }
+    notify_yscroll(interp, path, total);
+}
+
 fn notify_yscroll(interp: &mut Interp, path: &str, total: usize) {
     let command = effective_option(interp, path, "-yscrollcommand");
     if command.is_empty() || total == 0 {
@@ -6732,6 +6970,37 @@ fn view_scroll_command(
         }
     }
     Ok(Value::empty())
+}
+
+fn treeview_visible_count_of(tv: &TreeViewState) -> usize {
+    fn walk(tv: &TreeViewState, parent: Option<&str>) -> usize {
+        let mut count = 0;
+        for item in tv.items.iter().filter(|i| i.parent.as_deref() == parent) {
+            count += 1;
+            if item.open {
+                count += walk(tv, Some(item.id.as_str()));
+            }
+        }
+        count
+    }
+    walk(tv, None)
+}
+
+fn treeview_row_index(tv: &TreeViewState, target: &str) -> Option<usize> {
+    fn walk(tv: &TreeViewState, parent: Option<&str>, target: &str, row: &mut usize) -> bool {
+        for item in tv.items.iter().filter(|i| i.parent.as_deref() == parent) {
+            if item.id == target {
+                return true;
+            }
+            *row += 1;
+            if item.open && walk(tv, Some(item.id.as_str()), target, row) {
+                return true;
+            }
+        }
+        false
+    }
+    let mut row = 0usize;
+    walk(tv, None, target, &mut row).then_some(row)
 }
 
 fn treeview_visible_count(interp: &Interp, path: &str) -> usize {
@@ -7442,6 +7711,15 @@ mod tests {
         eval(&mut i, ".n delete 1.0 1.2");
         assert_eq!(eval(&mut i, ".n tag ranges hot"), "1.0 1.3");
         assert_eq!(eval(&mut i, ".n index m"), "1.2");
+        // The modified flag tracks edits until `edit reset`.
+        assert_eq!(eval(&mut i, ".n edit modified"), "1");
+        eval(&mut i, ".n edit modified 0");
+        assert_eq!(eval(&mut i, ".n edit modified"), "0");
+        eval(&mut i, ".n insert end z");
+        assert_eq!(eval(&mut i, ".n edit modified"), "1");
+        assert_eq!(eval(&mut i, ".n edit canundo"), "0");
+        eval(&mut i, ".n edit reset");
+        assert_eq!(eval(&mut i, ".n edit modified"), "0");
         // insert gravity controls the insert mark itself
         eval(&mut i, ".n mark gravity insert left");
         eval(&mut i, ".n mark set insert 1.1");
@@ -7506,12 +7784,24 @@ mod tests {
         assert_eq!(eval(&mut i, ".tv parent src"), "root");
         assert_eq!(eval(&mut i, ".tv index src"), "0");
         assert_eq!(eval(&mut i, ".tv heading #0"), "Folder");
+        eval(
+            &mut i,
+            ".tv tag configure hot -foreground red -background yellow",
+        );
+        assert_eq!(eval(&mut i, ".tv tag names"), "hot");
+        assert_eq!(eval(&mut i, ".tv tag cget hot -foreground"), "red");
+        eval(&mut i, ".tv item src -tags {hot}");
+        assert_eq!(eval(&mut i, ".tv item src -tags"), "hot");
+        assert_eq!(eval(&mut i, ".tv tag has hot src"), "1");
+        assert_eq!(eval(&mut i, ".tv tag has hot root"), "0");
         eval(&mut i, ".tv selection set src");
         assert_eq!(eval(&mut i, ".tv selection"), "src");
         assert_eq!(eval(&mut i, ".tv focus"), "src");
         eval(&mut i, ".tv delete src");
         assert_eq!(eval(&mut i, "winfo exists .tv"), "1");
         assert_eq!(eval(&mut i, ".tv children root"), "I001");
+        eval(&mut i, ".tv tag delete hot");
+        assert_eq!(eval(&mut i, ".tv tag names"), "");
         let tv = treeview_snapshot(".tv").unwrap();
         assert_eq!(tv.items.len(), 2);
         assert_eq!(tv.columns, ["size", "owner"]);
@@ -7687,6 +7977,10 @@ mod tests {
 mod press_debug_tests {
     use super::*;
 
+    fn eval(interp: &mut Interp, script: &str) -> String {
+        interp.eval(script).unwrap().as_str().to_string()
+    }
+
     #[test]
     fn press_button_runs_the_command() {
         let mut i = Interp::new();
@@ -7698,5 +7992,53 @@ mod press_debug_tests {
         assert_eq!(display_text(".b"), "B");
         let errors = take_errors();
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn see_scrolls_listbox_and_treeview() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "listbox .lb -height 3; foreach n {0 1 2 3 4 5 6 7 8 9} {.lb insert end $n}",
+        );
+        eval(&mut i, ".lb see 8");
+        assert_eq!(eval(&mut i, "lindex [.lb yview] 0"), "0.6");
+        eval(&mut i, ".lb see 1");
+        assert_eq!(eval(&mut i, "lindex [.lb yview] 0"), "0.1");
+        // A visible row does not scroll at all.
+        eval(&mut i, ".lb see 2");
+        assert_eq!(eval(&mut i, "lindex [.lb yview] 0"), "0.1");
+
+        eval(
+            &mut i,
+            "ttk::treeview .tw -height 2;              foreach n {a b c d e} {.tw insert {} end -id $n -text $n}",
+        );
+        eval(&mut i, ".tw see d");
+        assert_eq!(eval(&mut i, "lindex [.tw yview] 0"), "0.4");
+        eval(&mut i, ".tw see a");
+        assert_eq!(eval(&mut i, "lindex [.tw yview] 0"), "0");
+    }
+
+    #[test]
+    fn disabled_button_and_menu_item_do_not_invoke() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "set ::n 0; button .b -text Go -state disabled \
+                -command {incr ::n}; .b invoke",
+        );
+        assert_eq!(eval(&mut i, "set ::n"), "0");
+        eval(&mut i, ".b configure -state normal; .b invoke");
+        assert_eq!(eval(&mut i, "set ::n"), "1");
+        eval(
+            &mut i,
+            "menu .m -tearoff 0; .m add command -label Go -state disabled \
+                -command {incr ::n}; .m invoke 0",
+        );
+        assert_eq!(eval(&mut i, "set ::n"), "1");
+        eval(&mut i, ".m entryconfigure 0 -state normal; .m invoke 0");
+        assert_eq!(eval(&mut i, "set ::n"), "2");
     }
 }

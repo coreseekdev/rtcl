@@ -128,6 +128,8 @@ ttk::treeview .tv -columns {size} -height 3 -show {tree headings}
 .tv insert {} end -id root -text Project -open 1 -values {0 files}
 .tv insert root end -id src -text src -values {3 files}
 .tv insert root end -text README -values {1 file}
+.tv tag configure folder -foreground "#1d4ed8"
+.tv item root -tags {folder}
 pack .tv -fill x -padx 8 -pady 4
 
 ttk::separator .sep

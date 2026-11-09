@@ -2180,6 +2180,19 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 } else {
                     "  "
                 };
+                // Row tags (`tag configure`) override the widget colours.
+                let mut row_fg = option_color(tree, &path, "-foreground");
+                let mut row_bg = None;
+                for tag in &item.tags {
+                    if let Some(options) = tv.tags.get(tag) {
+                        if let Some(value) = options.get("-foreground") {
+                            row_fg = parse_color(value);
+                        }
+                        if let Some(value) = options.get("-background") {
+                            row_bg = parse_color(value);
+                        }
+                    }
+                }
                 let select_path = path.clone();
                 let select_id = id.clone();
                 let mut cells = view().flex_row().w_full().items_center().gap_2();
@@ -2188,18 +2201,18 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         .text_size(px(12.0))
                         .text_color(AdaptiveColor::rgb(0x2563eb, 0x60a5fa)),
                 );
-                let text_color = option_color(tree, &path, "-foreground")
-                    .unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
+                let text_color = row_fg.unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
                 cells = cells.child(
                     text(item.text.clone())
                         .text_size(px(13.0))
                         .text_color(text_color),
                 );
                 for value in &item.values {
+                    let value_color = row_fg.unwrap_or(AdaptiveColor::rgb(0x4b5563, 0xd1d5db));
                     cells = cells.child(
                         text(value.clone())
                             .text_size(px(13.0))
-                            .text_color(AdaptiveColor::rgb(0x4b5563, 0xd1d5db)),
+                            .text_color(value_color),
                     );
                 }
                 let button = nsh_base::button()
@@ -2211,7 +2224,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     .bg(if selected {
                         AdaptiveColor::rgb(0xdbeafe, 0x1e3a8a)
                     } else {
-                        AdaptiveColor::rgb(0xffffff, 0x111827)
+                        row_bg.unwrap_or(AdaptiveColor::rgb(0xffffff, 0x111827))
                     })
                     .child(cells);
                 row = row.child(button.on_press(move |_: &()| {

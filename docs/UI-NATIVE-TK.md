@@ -232,11 +232,15 @@ JSON，可跨应用重启持久化。正文写回 Tcl 模型、标签区间按�
 index` 支持 `insert/end/line.col/line.end`、mark 名、`+/- N chars|
 indices|lines` 链与 `linestart/lineend/wordstart/wordend` 限定词；
 `mark set/unset/names/gravity/next/previous` 维护标记（`insert` 即光标，
-`current` 随编辑平移，gravity 控制插入点的贴边方向）。
+`current` 随编辑平移，gravity 控制插入点的贴边方向）；`edit
+modified ?0|1?`/`edit reset` 维护未保存标记（undo/redo 暂为 no-op）。
 
 **虚拟化/滚动**：listbox 与 treeview 只挂载可见行（按 `-height` 取窗口），
 `yview`/`-yscrollcommand` 与 Tk `scrollbar` 双向联动；列表/树表可滚动。
-`text` 原生输入自带滚动。table 用 treeview columns 表达，log 用高行数
+`text` 原生输入自带滚动。`see <index/item>` 让 listbox/treeview 以最小
+滚动量把目标行带入窗口。treeview 行标签：`tag configure/cget/names/
+has/delete` + `insert/item -tags`，`-foreground/-background` 覆盖整行
+颜色（选中色优先）。table 用 treeview columns 表达，log 用高行数
 listbox 表达。
 
 **主题**：显式 `-background/-foreground`（`#rgb/#rrggbb` 与常用色名）
@@ -246,6 +250,10 @@ nsh 的自适应深色/浅色配色；DPI/IME/无障碍角色由 nsh 平台层�
 
 **Entry 校验**：`-validate key|all` + `-validatecommand`，支持 `%P/%s/
 %S/%v/%V/%W` 替换；返回 0 时拒绝编辑并回滚显示（错误则按 Tk 语义放行）。
+
+**状态**：`-state disabled` 的 button/check/radio 不响应点击、`invoke`
+为空操作；菜单项 disabled 不 invoke、系统菜单置灰；entry 的
+disabled/readonly 与 `-show` 密码已由原生输入呈现。
 
 **事件**：按钮 `<Button-1>/<ButtonRelease-1>`、entry `<Return>/<Key>`、
 `bind all`、类名/`bind .` 标签绑定（按 `bindtags` 顺序：widget、class、

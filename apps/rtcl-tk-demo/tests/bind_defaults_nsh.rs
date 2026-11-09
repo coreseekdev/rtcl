@@ -380,6 +380,7 @@ fn entry_pointer_and_focus_bindings() {
 
 const RICH_KEY_APP: &str = r##"
 set ::report ""
+set ::wheel ""
 text .t -height 3
 .t insert end "hi"
 .t tag configure hot -foreground "#ef4444"
@@ -387,7 +388,10 @@ text .t -height 3
 pack .t
 label .out -textvariable ::report
 pack .out
+label .wo -textvariable ::wheel
+pack .wo
 bind .t <Key> {append ::report "key=%A"}
+bind .t <MouseWheel> {set ::wheel %D}
 "##;
 
 #[component]
@@ -412,6 +416,11 @@ fn rich_text_key_bindings_fire() {
         "the binding ran once: {:?}",
         app.screen().texts()
     );
+
+    app.wheel("hxi", Points(0.0), Points(100.0))
+        .expect("wheel over the rich editor");
+    app.wait_for("-120")
+        .expect("the text widget's <MouseWheel> binding fired");
 }
 
 const CONFIGURE_APP: &str = r#"

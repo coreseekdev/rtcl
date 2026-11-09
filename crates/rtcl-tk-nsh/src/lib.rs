@@ -788,6 +788,7 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
     };
     let change_path = path.to_string();
     let change_session = session.clone();
+    let wheel_path = path.to_string();
     let height = option(tree, path, "-height")
         .parse::<f32>()
         .unwrap_or(10.0)
@@ -818,6 +819,14 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                         }
                     });
                     rtcl_tk_runtime::request_render();
+                })
+                .on_wheel(move |delta: &Point<Points>| {
+                    rtcl_tk_runtime::wheel_event(
+                        &wheel_path,
+                        -(delta.x.0 as f64),
+                        -(delta.y.0 as f64),
+                        0,
+                    );
                 }),
         )
         .into_element()

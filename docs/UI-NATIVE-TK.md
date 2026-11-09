@@ -270,11 +270,19 @@ nsh 的自适应深色/浅色配色；DPI/IME/无障碍角色由 nsh 平台层�
 为空操作；菜单项 disabled 不 invoke、系统菜单置灰；entry 的
 disabled/readonly 与 `-show` 密码已由原生输入呈现。
 
-**事件**：按钮 `<Button-1>/<ButtonRelease-1>`、entry `<Return>/<Key>`、
-`bind all`、类名/`bind .` 标签绑定（按 `bindtags` 顺序：widget、class、
-toplevel、all）、`event generate`；替换 `%W/%x/%y/%X/%Y/%b/%s/%K/%A`
-（合成事件无根坐标时 `%X/%Y` 取 widget 坐标，`%w/%h` 为 0）；`after`
-由 `TkView` 的 16 ms interval 泵入，错误进 `take_errors()`。
+**事件**：序列按 Tk 规则匹配——kind + 修饰键子集 + detail
+（`<Key>`/`<Key-a>`/`<Control-a>`/`<Button-1>`/`<Control-Button-1>`/
+`<Double-Button-1>`/`<FocusIn>`/`<FocusOut>`），同一 tag 取最具体的一条，
+`bindtags` 顺序 widget→class→toplevel→all；`event generate` 可带
+`-x/-y/-key/-button/-state`。点击派发 `<Button-1>`（第二次点击同时派发
+`<Double-Button-1>`）与 `<ButtonRelease-1>`，覆盖按钮、listbox/treeview
+行、canvas 项/画布；`focus` 切换派发 `<FocusOut>/<FocusIn>`。
+`bind all`、类名/`bind .` 均可用。按钮默认类绑定 `<Key-space>` invoke
+（check/radio 另有 `<Key-Return>`），可由 `bind` 覆盖；listbox/treeview
+点击获得焦点，方向键/Home/End/Prior/Next 移动选择。替换
+`%W/%x/%y/%X/%Y/%b/%s/%K/%A`（合成事件无根坐标时 `%X/%Y` 取 widget
+坐标，`%w/%h` 为 0）；`after` 由 `TkView` 的 16 ms interval 泵入，
+错误进 `take_errors()`。
 
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停
 绘制，长等待请用 `after` 回调）；未实现多 toplevel 窗口；Canvas 已支持
@@ -282,7 +290,8 @@ toplevel、all）、`event generate`；替换 `%W/%x/%y/%X/%Y/%b/%s/%K/%A`
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
 text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
-未实现；
+未实现；`<Enter>/<Leave>/<Configure>` 与虚拟事件（`<<Paste>>` 等）尚未
+从平台层派发；entry/scale/text 的按下事件只走原生控件行为；
 Windows/Linux 菜单栏仍是 app 内实现
 （macOS 用系统菜单；nsh GTK 的 set_application_menu 实测不显示）；
 scrollbar 已与 listbox/treeview 联动。

@@ -472,6 +472,15 @@ pub fn install(interp: &mut Interp) {
     ] {
         interp.register_command(name, global_command);
     }
+    // Tk implements these in its Tcl library; the native renderer delegates
+    // keyboard activation back here so users can override them with bind.
+    let _ = interp.eval(
+        "bind Button <Key-space> {catch {%W invoke}}\n\
+         bind Checkbutton <Key-space> {catch {%W invoke}}\n\
+         bind Checkbutton <Key-Return> {catch {%W invoke}}\n\
+         bind Radiobutton <Key-space> {catch {%W invoke}}\n\
+         bind Radiobutton <Key-Return> {catch {%W invoke}}",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2869,6 +2878,201 @@ impl EventCtx {
     }
 }
 
+/// A Tk event kind, as far as binding dispatch needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum EventKind {
+    #[default]
+    KeyPress,
+    KeyRelease,
+    ButtonPress,
+    ButtonRelease,
+    FocusIn,
+    FocusOut,
+    Enter,
+    Leave,
+    Motion,
+    Configure,
+    /// Parsed but not dispatched by the native backend.
+    Other,
+}
+
+/// A parsed binding sequence (`<Control-Shift-Key-a>`, `<Double-Button-1>`,
+/// `<FocusIn>`, ...).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EventPattern {
+    kind: EventKind,
+    detail: Option<String>,
+    /// Tk state bits: Shift 1, Lock 2, Control 4, Mod1 8 ... Mod5 128.
+    modifiers: u32,
+    double: bool,
+}
+
+/// Parse a Tk event state string (Tk reports `%s` in decimal).
+fn parse_event_state(state: &str) -> u32 {
+    let state = state.trim();
+    if state.is_empty() {
+        return 0;
+    }
+    state
+        .parse::<u32>()
+        .ok()
+        .or_else(|| {
+            state
+                .strip_prefix("0x")
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Parse a Tk binding sequence.  Unknown spellings become `Other`, which
+/// never matches a dispatched event.
+fn parse_sequence(sequence: &str) -> EventPattern {
+    let text = sequence.trim();
+    let inner = text
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(text);
+    if inner.is_empty() {
+        return EventPattern {
+            kind: EventKind::Other,
+            ..EventPattern::default()
+        };
+    }
+    let tokens = inner
+        .split('-')
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let mut pattern = EventPattern::default();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = tokens[index].to_ascii_lowercase();
+        let modifier = match token.as_str() {
+            "shift" => Some(1u32),
+            "lock" => Some(2),
+            "control" | "ctrl" => Some(4),
+            "alt" | "option" | "mod1" | "m1" | "meta" => Some(8),
+            "mod2" | "m2" => Some(16),
+            "mod3" | "m3" => Some(32),
+            "mod4" | "m4" => Some(64),
+            "mod5" | "m5" => Some(128),
+            "double" => {
+                pattern.double = true;
+                index += 1;
+                continue;
+            }
+            "triple" | "quadruple" => {
+                return EventPattern {
+                    kind: EventKind::Other,
+                    ..EventPattern::default()
+                }
+            }
+            _ => None,
+        };
+        match modifier {
+            Some(bits) => {
+                pattern.modifiers |= bits;
+                index += 1;
+            }
+            None => break,
+        }
+    }
+    if index >= tokens.len() {
+        return EventPattern {
+            kind: EventKind::Other,
+            ..EventPattern::default()
+        };
+    }
+    let head = tokens[index].to_ascii_lowercase();
+    let rest = &tokens[index + 1..];
+    let joined = rest.join("-");
+    let detail = |value: &str| (!value.is_empty()).then(|| value.to_string());
+    match head.as_str() {
+        "key" | "keypress" => {
+            pattern.kind = EventKind::KeyPress;
+            pattern.detail = detail(&joined);
+        }
+        "keyrelease" => {
+            pattern.kind = EventKind::KeyRelease;
+            pattern.detail = detail(&joined);
+        }
+        "button" | "buttonpress" | "btn" => {
+            pattern.kind = EventKind::ButtonPress;
+            pattern.detail = detail(&joined);
+        }
+        "buttonrelease" => {
+            pattern.kind = EventKind::ButtonRelease;
+            pattern.detail = detail(&joined);
+        }
+        "focusin" => pattern.kind = EventKind::FocusIn,
+        "focusout" => pattern.kind = EventKind::FocusOut,
+        "enter" => pattern.kind = EventKind::Enter,
+        "leave" => pattern.kind = EventKind::Leave,
+        "motion" => pattern.kind = EventKind::Motion,
+        "configure" => pattern.kind = EventKind::Configure,
+        "destroy" | "expose" | "map" | "unmap" | "visibility" | "mousewheel" => {
+            pattern.kind = EventKind::Other
+        }
+        other if other.chars().all(|c| c.is_ascii_digit()) => {
+            pattern.kind = EventKind::ButtonPress;
+            pattern.detail = Some(tokens[index].to_string());
+        }
+        other => {
+            // A plain keysym: `<a>`, `<space>`, `<Return>`, `<F1>`.
+            pattern.kind = EventKind::KeyPress;
+            pattern.detail = Some(if rest.is_empty() {
+                tokens[index].to_string()
+            } else {
+                format!("{other}-{joined}")
+            });
+        }
+    }
+    pattern
+}
+
+impl EventPattern {
+    /// Tk matching: the event must have at least the binding's modifiers;
+    /// a binding detail must equal the event's, and a detail-less binding
+    /// matches any detail.
+    fn matches(&self, event: &EventPattern) -> bool {
+        self.kind == event.kind
+            && self.double == event.double
+            && (self.modifiers & !event.modifiers) == 0
+            && self
+                .detail
+                .as_ref()
+                .is_none_or(|detail| event.detail.as_ref() == Some(detail))
+    }
+
+    /// More modifier bits and an explicit detail are more specific.
+    fn specificity(&self) -> (u32, bool) {
+        (self.modifiers.count_ones(), self.detail.is_some())
+    }
+}
+
+/// Build the event being dispatched: generic sequences (`<KeyPress>`,
+/// `<Button-1>`) take their detail from the context.
+fn event_from(sequence: &str, ctx: &EventCtx) -> EventPattern {
+    let pattern = parse_sequence(sequence);
+    let mut event = pattern.clone();
+    event.modifiers = parse_event_state(&ctx.state) | pattern.modifiers;
+    if event.detail.is_none() {
+        match event.kind {
+            EventKind::KeyPress | EventKind::KeyRelease => {
+                if !ctx.key.is_empty() {
+                    event.detail = Some(ctx.key.clone());
+                }
+            }
+            EventKind::ButtonPress | EventKind::ButtonRelease => {
+                if ctx.button > 0 {
+                    event.detail = Some(ctx.button.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    event
+}
+
 fn substitute_bindings(script: &str, ctx: &EventCtx) -> String {
     let mut out = String::with_capacity(script.len());
     let mut chars = script.chars().peekable();
@@ -2902,42 +3106,54 @@ fn substitute_bindings(script: &str, ctx: &EventCtx) -> String {
     out
 }
 
-fn script_for_tag(interp: &Interp, tag: &str, sequence: &str) -> String {
-    let exact = with_state(interp, |rt| {
+fn tag_binding_map(interp: &Interp, tag: &str) -> BTreeMap<String, String> {
+    with_state(interp, |rt| {
         if tag == "all" {
-            rt.all_bindings.get(sequence).cloned()
+            Some(rt.all_bindings.clone())
         } else if tag.starts_with('.') && tag != "." && rt.tree.contains(tag) {
-            rt.tree
-                .binding(tag, sequence)
-                .ok()
-                .flatten()
-                .map(str::to_string)
+            let sequences = rt.tree.binding_sequences(tag).ok()?;
+            let mut map = BTreeMap::new();
+            for sequence in sequences {
+                if let Ok(Some(script)) = rt.tree.binding(tag, &sequence) {
+                    map.insert(sequence, script.to_string());
+                }
+            }
+            Some(map)
         } else {
-            rt.tag_bindings
-                .get(tag)
-                .and_then(|m| m.get(sequence))
-                .cloned()
+            rt.tag_bindings.get(tag).cloned()
         }
     })
     .flatten()
-    .unwrap_or_default();
-    if !exact.is_empty() {
-        return exact;
-    }
-    // Generic key bindings: <Key> sees every key press.
-    if sequence == "<Return>" {
-        return script_for_tag(interp, tag, "<KeyPress>");
-    }
-    String::new()
+    .unwrap_or_default()
+}
+
+fn best_script(bindings: &BTreeMap<String, String>, event: &EventPattern) -> Option<String> {
+    bindings
+        .iter()
+        .filter_map(|(sequence, script)| {
+            let pattern = parse_sequence(sequence);
+            pattern
+                .matches(event)
+                .then(|| (pattern.specificity(), script))
+        })
+        .max_by_key(|(specificity, _)| *specificity)
+        .map(|(_, script)| script.clone())
+}
+
+/// The most specific binding of `tag` matching `event` (Tk runs one script
+/// per tag: the most specific sequence wins).
+fn best_binding(interp: &Interp, tag: &str, event: &EventPattern) -> Option<String> {
+    let bindings = tag_binding_map(interp, tag);
+    best_script(&bindings, event)
 }
 
 /// Run the bindings for `path` in its bindtags order and re-render.
 /// Errors go to [`take_errors`].
 pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) {
-    let sequence = normalize_sequence(sequence);
     let Some(ptr) = active_interp() else { return };
     // Safety: the pointer is the live engine-thread Interp.
     let interp = unsafe { &mut *ptr };
+    let event = event_from(sequence, ctx);
     let tags = with_state(interp, |rt| rt.bindtags.get(path).cloned())
         .flatten()
         .unwrap_or_else(|| {
@@ -2962,9 +3178,10 @@ pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) {
         if !seen.insert(tag.clone()) {
             continue;
         }
-        let script = script_for_tag(interp, &tag, &sequence);
-        if !script.is_empty() {
-            scripts.push(script);
+        if let Some(script) = best_binding(interp, &tag, &event) {
+            if !script.is_empty() {
+                scripts.push(script);
+            }
         }
     }
     for script in scripts {
@@ -2972,6 +3189,58 @@ pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) {
         if let Err(e) = eval_active(&script) {
             record_error(e.to_string());
         }
+    }
+}
+
+thread_local! {
+    /// Last press per widget, for Tk's 500 ms double-click detection.
+    static LAST_PRESS: RefCell<BTreeMap<String, std::time::Instant>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Whether this press completes a double click on `path`.
+fn register_press(path: &str) -> bool {
+    let now = std::time::Instant::now();
+    LAST_PRESS.with(|map| {
+        let mut map = map.borrow_mut();
+        match map.get(path) {
+            Some(last) if now.duration_since(*last) < std::time::Duration::from_millis(500) => {
+                map.remove(path);
+                true
+            }
+            _ => {
+                map.insert(path.to_string(), now);
+                false
+            }
+        }
+    })
+}
+
+/// Dispatch a mouse press/release pair, adding `<Double-Button-1>` on the
+/// second click, the way Tk does.
+fn dispatch_click(path: &str, ctx: &EventCtx) {
+    run_binding(path, "<Button-1>", ctx);
+    if register_press(path) {
+        run_binding(path, "<Double-Button-1>", ctx);
+    }
+    run_binding(path, "<ButtonRelease-1>", ctx);
+}
+
+/// Set the Tk focus target and dispatch the FocusOut/FocusIn bindings.
+fn set_tk_focus(interp: &mut Interp, new: Option<String>) {
+    let old = with_state(interp, |rt| rt.focus.clone()).unwrap_or_default();
+    if old == new {
+        return;
+    }
+    with_state_mut(interp, |rt| {
+        rt.focus = new.clone();
+        rt.bump();
+    });
+    if let Some(old) = old {
+        run_binding(&old, "<FocusOut>", &EventCtx::for_path(&old));
+    }
+    if let Some(new) = new {
+        run_binding(&new, "<FocusIn>", &EventCtx::for_path(&new));
     }
 }
 
@@ -2991,19 +3260,13 @@ fn focus_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let path = args[i].as_str();
     if path.is_empty() {
-        with_state_mut(interp, |rt| {
-            rt.focus = None;
-            rt.bump();
-        });
+        set_tk_focus(interp, None);
         return Ok(Value::empty());
     }
     if !with_state(interp, |rt| rt.tree.contains(path)).unwrap_or(false) {
         return Err(bad_window(path));
     }
-    with_state_mut(interp, |rt| {
-        rt.focus = Some(path.to_string());
-        rt.bump();
-    });
+    set_tk_focus(interp, Some(path.to_string()));
     Ok(Value::empty())
 }
 
@@ -4025,9 +4288,21 @@ fn event_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "-y" => ctx.y = parse_int(&args[i + 1])?,
                     "-key" => ctx.key = args[i + 1].as_str().to_string(),
                     "-button" => ctx.button = parse_int(&args[i + 1])?,
+                    "-state" => ctx.state = args[i + 1].as_str().to_string(),
                     _ => {}
                 }
                 i += 2;
+            }
+            let pattern = parse_sequence(args[3].as_str());
+            if ctx.key.is_empty() {
+                if matches!(pattern.kind, EventKind::KeyPress | EventKind::KeyRelease) {
+                    if let Some(detail) = &pattern.detail {
+                        ctx.key = detail.clone();
+                    }
+                }
+            }
+            if ctx.character.is_empty() && ctx.key.chars().count() == 1 {
+                ctx.character = ctx.key.clone();
             }
             run_binding(&path, args[3].as_str(), &ctx);
             Ok(Value::empty())
@@ -4202,7 +4477,6 @@ pub fn entry_changed(path: &str, text: &str) {
             record_error(e.to_string());
         }
     }
-    run_binding(path, "<KeyRelease>", &EventCtx::for_path(path));
     bump_active();
 }
 
@@ -4313,6 +4587,10 @@ pub fn entry_key(path: &str, key: &str, character: &str) {
     let mut ctx = EventCtx::for_path(path);
     ctx.key = key.to_string();
     ctx.character = character.to_string();
+    if key.chars().count() == 1 && key.chars().next().is_some_and(char::is_uppercase) {
+        // Shift+a arrives as keysym "A" with the Shift state bit set.
+        ctx.state = "1".to_string();
+    }
     run_binding(
         path,
         if key == "Return" {
@@ -4322,6 +4600,49 @@ pub fn entry_key(path: &str, key: &str, character: &str) {
         },
         &ctx,
     );
+    run_binding(path, "<KeyRelease>", &ctx);
+}
+
+/// `space`/`return` pressed while a button-like Tk widget has the focus:
+/// the backend's global key handler routes it to that widget.
+pub fn focused_control_key(key: &str) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &*ptr };
+    let focus = with_state(interp, |rt| rt.focus.clone()).flatten();
+    let Some(path) = focus else { return };
+    let kind = with_state(interp, |rt| rt.tree.get(&path).map(|n| n.kind)).flatten();
+    if matches!(
+        kind,
+        Some(WidgetKind::Button) | Some(WidgetKind::Checkbutton) | Some(WidgetKind::Radiobutton)
+    ) {
+        control_key(&path, key);
+    }
+}
+
+/// Space/Return on a focused button-like control.  The Tk library's
+/// default class bindings (installed by [`install`]) invoke the widget;
+/// a user binding on the same sequence replaces them like in Tk.
+pub fn control_key(path: &str, key: &str) {
+    let mut ctx = EventCtx::for_path(path);
+    let sequence = match key {
+        " " | "space" | "Space" => "<Key-space>",
+        "Enter" | "Return" => "<Key-Return>",
+        other => {
+            ctx.character = if other.chars().count() == 1 {
+                other.to_string()
+            } else {
+                String::new()
+            };
+            "<KeyPress>"
+        }
+    };
+    ctx.key = match key {
+        " " | "space" | "Space" => "space".to_string(),
+        "Enter" | "Return" => "Return".to_string(),
+        other => other.to_string(),
+    };
+    run_binding(path, sequence, &ctx);
+    run_binding(path, "<KeyRelease>", &ctx);
 }
 
 /// A Button was pressed (or a checkbutton/radiobutton activated).
@@ -4340,8 +4661,7 @@ pub fn press_button(path: &str) {
     }
     let mut ctx = EventCtx::for_path(path);
     ctx.button = 1;
-    run_binding(path, "<Button-1>", &ctx);
-    run_binding(path, "<ButtonRelease-1>", &ctx);
+    dispatch_click(path, &ctx);
     if matches!(
         kind,
         Some(WidgetKind::Button) | Some(WidgetKind::Checkbutton) | Some(WidgetKind::Radiobutton)
@@ -4732,7 +5052,11 @@ pub fn treeview_snapshot(path: &str) -> Option<TreeViewState> {
 /// Select one Treeview row from the renderer.
 pub fn treeview_select(path: &str, id: &str) {
     let Some(ptr) = active_interp() else { return };
+    let mut ctx = EventCtx::for_path(path);
+    ctx.button = 1;
+    dispatch_click(path, &ctx);
     let interp = unsafe { &mut *ptr };
+    set_tk_focus(interp, Some(path.to_string()));
     with_state_mut(interp, |rt| {
         if let Some(tv) = rt.treeviews.get_mut(path) {
             tv.selected = std::iter::once(id.to_string()).collect();
@@ -4745,7 +5069,11 @@ pub fn treeview_select(path: &str, id: &str) {
 /// Expand/collapse a Treeview row from the renderer.
 pub fn treeview_toggle(path: &str, id: &str) {
     let Some(ptr) = active_interp() else { return };
+    let mut ctx = EventCtx::for_path(path);
+    ctx.button = 1;
+    dispatch_click(path, &ctx);
     let interp = unsafe { &mut *ptr };
+    set_tk_focus(interp, Some(path.to_string()));
     with_state_mut(interp, |rt| {
         if let Some(tv) = rt.treeviews.get_mut(path) {
             if let Some(item) = tv.items.iter_mut().find(|i| i.id == id) {
@@ -5055,7 +5383,11 @@ pub fn list_items(path: &str) -> (Vec<String>, BTreeSet<usize>) {
 /// A Listbox row was pressed: select it (`-selectmode browse`).
 pub fn listbox_select(path: &str, index: usize) {
     let Some(ptr) = active_interp() else { return };
+    let mut ctx = EventCtx::for_path(path);
+    ctx.button = 1;
+    dispatch_click(path, &ctx);
     let interp = unsafe { &mut *ptr };
+    set_tk_focus(interp, Some(path.to_string()));
     with_state_mut(interp, |rt| {
         if let Some(n) = rt.tree.get_mut(path) {
             n.selected.clear();
@@ -5063,6 +5395,122 @@ pub fn listbox_select(path: &str, index: usize) {
             rt.bump();
         }
     });
+}
+
+/// Arrow/Home/End/Page keys while a listbox or treeview has the Tk focus.
+pub fn focused_nav_key(key: &str) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    let focus = with_state(interp, |rt| rt.focus.clone()).flatten();
+    let Some(path) = focus else { return };
+    let kind = with_state(interp, |rt| rt.tree.get(&path).map(|n| n.kind)).flatten();
+    if !matches!(kind, Some(WidgetKind::Listbox) | Some(WidgetKind::Treeview)) {
+        return;
+    }
+    let mut ctx = EventCtx::for_path(&path);
+    ctx.key = key.to_string();
+    run_binding(&path, "<KeyPress>", &ctx);
+    match kind {
+        Some(WidgetKind::Listbox) => listbox_nav(&path, key),
+        Some(WidgetKind::Treeview) => treeview_nav(&path, key),
+        _ => {}
+    }
+    run_binding(&path, "<KeyRelease>", &ctx);
+}
+
+fn listbox_nav(path: &str, key: &str) {
+    let (len, selected, rows) = {
+        let Some(ptr) = active_interp() else { return };
+        let interp = unsafe { &*ptr };
+        let Some(node) = with_state(interp, |rt| rt.tree.get(path).cloned()).flatten() else {
+            return;
+        };
+        (
+            node.items.len(),
+            node.selected.clone(),
+            scroll_state(interp, path).1,
+        )
+    };
+    if len == 0 {
+        return;
+    }
+    let current = selected.iter().next().copied().unwrap_or(0) as isize;
+    let last = len as isize - 1;
+    let target = match key {
+        "Up" | "up" => current - 1,
+        "Down" | "down" => current + 1,
+        "Home" | "home" => 0,
+        "End" | "end" => last,
+        "Prior" | "prior" | "Page_Up" => current - rows as isize,
+        "Next" | "next" | "Page_Down" => current + rows as isize,
+        _ => return,
+    }
+    .clamp(0, last) as usize;
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    with_state_mut(interp, |rt| {
+        if let Some(n) = rt.tree.get_mut(path) {
+            n.selected.clear();
+            n.selected.insert(target);
+            rt.bump();
+        }
+    });
+    scroll_to_row(interp, path, target, len);
+}
+
+fn treeview_nav(path: &str, key: &str) {
+    let (ids, selected, rows) = {
+        let Some(ptr) = active_interp() else { return };
+        let interp = unsafe { &*ptr };
+        let Some(tv) = with_state(interp, |rt| rt.treeviews.get(path).cloned()).flatten() else {
+            return;
+        };
+        let ids = treeview_visible_ids(&tv);
+        (ids, tv.selected.clone(), scroll_state(interp, path).1)
+    };
+    if ids.is_empty() {
+        return;
+    }
+    let current = selected
+        .iter()
+        .next()
+        .and_then(|id| ids.iter().position(|candidate| candidate == id))
+        .unwrap_or(0) as isize;
+    let last = ids.len() as isize - 1;
+    let target = match key {
+        "Up" | "up" => current - 1,
+        "Down" | "down" => current + 1,
+        "Home" | "home" => 0,
+        "End" | "end" => last,
+        "Prior" | "prior" | "Page_Up" => current - rows as isize,
+        "Next" | "next" | "Page_Down" => current + rows as isize,
+        _ => return,
+    }
+    .clamp(0, last) as usize;
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    with_state_mut(interp, |rt| {
+        if let Some(tv) = rt.treeviews.get_mut(path) {
+            tv.selected = std::iter::once(ids[target].clone()).collect();
+            tv.focus = Some(ids[target].clone());
+            rt.bump();
+        }
+    });
+    scroll_to_row(interp, path, target, ids.len());
+}
+
+fn treeview_visible_ids(tv: &TreeViewState) -> Vec<String> {
+    fn walk(tv: &TreeViewState, parent: Option<&str>, out: &mut Vec<String>) {
+        for item in tv.items.iter().filter(|i| i.parent.as_deref() == parent) {
+            out.push(item.id.clone());
+            if item.open {
+                walk(tv, Some(item.id.as_str()), out);
+            }
+        }
+    }
+    let mut ids = Vec::new();
+    walk(tv, None, &mut ids);
+    ids
 }
 
 /// The window title from `wm title`.
@@ -6187,14 +6635,30 @@ pub fn canvas_press(path: &str, x: f64, y: f64) {
         button: 1,
         ..EventCtx::default()
     };
+    let press = event_from("<Button-1>", &ctx);
+    let double = register_press(path);
+    let mut double_event = press.clone();
+    double_event.double = true;
     for item in items.iter().rev() {
         let mut targets = vec![item.id.to_string()];
         if let Some(tags) = item.options.get("-tags") {
             targets.extend(tags.split_whitespace().map(str::to_string));
         }
         for target in targets {
-            if let Some(script) = bindings.get(&target).and_then(|map| map.get("<Button-1>")) {
-                let script = substitute_bindings(script, &ctx);
+            let Some(map) = bindings.get(&target) else {
+                continue;
+            };
+            let mut scripts = Vec::new();
+            if let Some(script) = best_script(map, &press) {
+                scripts.push(script);
+            }
+            if double {
+                if let Some(script) = best_script(map, &double_event) {
+                    scripts.push(script);
+                }
+            }
+            for script in scripts {
+                let script = substitute_bindings(&script, &ctx);
                 if let Err(e) = eval_active(&script) {
                     record_error(e.to_string());
                 }
@@ -6202,6 +6666,10 @@ pub fn canvas_press(path: &str, x: f64, y: f64) {
         }
     }
     run_binding(path, "<Button-1>", &ctx);
+    if double {
+        run_binding(path, "<Double-Button-1>", &ctx);
+    }
+    run_binding(path, "<ButtonRelease-1>", &ctx);
 }
 
 /// A text widget's persisted rich document (ProseMirror JSON), if any.
@@ -8260,6 +8728,104 @@ mod tests {
         eval(&mut i, ".n mark set insert 1.1");
         eval(&mut i, ".n insert 1.1 AA");
         assert_eq!(eval(&mut i, ".n index insert"), "1.1");
+    }
+
+    #[test]
+    fn binding_sequence_matching_and_specificity() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "button .b -text X; set ::log {};
+             bind .b <Key> {lappend ::log key};
+             bind .b <Key-a> {lappend ::log a};
+             bind .b <Control-a> {lappend ::log ctrl-a};
+             bind .b <Button-1> {lappend ::log click};
+             bind .b <Control-Button-1> {lappend ::log ctrlclick};
+             bind .b <Double-Button-1> {lappend ::log double}",
+        );
+        eval(&mut i, "event generate .b <Key-a>");
+        assert_eq!(eval(&mut i, "set ::log"), "a");
+        eval(&mut i, "event generate .b <Key-b>");
+        assert_eq!(eval(&mut i, "set ::log"), "a key");
+        // The most specific sequence wins, but generic ones still match
+        // events with extra modifiers when nothing is more specific.
+        eval(&mut i, "event generate .b <Control-a> -state 4");
+        assert_eq!(eval(&mut i, "set ::log"), "a key ctrl-a");
+        eval(&mut i, "event generate .b <Control-Button-1>");
+        assert_eq!(eval(&mut i, "set ::log"), "a key ctrl-a ctrlclick");
+        eval(&mut i, "event generate .b <Button-1>");
+        assert_eq!(eval(&mut i, "set ::log"), "a key ctrl-a ctrlclick click");
+        eval(&mut i, "event generate .b <Double-Button-1> -button 1");
+        assert_eq!(
+            eval(&mut i, "set ::log"),
+            "a key ctrl-a ctrlclick click double"
+        );
+        // An empty binding removes the sequence; <Key> matches again.
+        eval(&mut i, "bind .b <Key-a> {}; event generate .b <Key-a>");
+        assert_eq!(
+            eval(&mut i, "set ::log"),
+            "a key ctrl-a ctrlclick click double key"
+        );
+        // %K/%A are filled from the generated keysym.
+        eval(
+            &mut i,
+            "bind .b <Key-z> {set ::k \"%K/%A\"}; event generate .b <Key-z>",
+        );
+        assert_eq!(eval(&mut i, "set ::k"), "z/z");
+    }
+
+    #[test]
+    fn clicks_and_focus_dispatch_bindings() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "listbox .l -height 3; .l insert end a b c; set ::log {};
+             bind .l <Button-1> {lappend ::log lb};
+             bind .l <Double-Button-1> {lappend ::log lb2}",
+        );
+        listbox_select(".l", 1);
+        listbox_select(".l", 1);
+        // The second click runs both <Button-1> and <Double-Button-1>.
+        assert_eq!(eval(&mut i, "set ::log"), "lb lb lb2");
+        assert_eq!(eval(&mut i, ".l curselection"), "1");
+
+        eval(
+            &mut i,
+            "ttk::treeview .tv -height 3; .tv insert {} end -id a -text a;
+             .tv insert {} end -id b -text b; set ::log {};
+             bind .tv <Button-1> {lappend ::log tv}",
+        );
+        treeview_select(".tv", "b");
+        assert_eq!(eval(&mut i, "set ::log"), "tv");
+        assert_eq!(eval(&mut i, ".tv selection"), "b");
+
+        eval(
+            &mut i,
+            "button .b; entry .e; set ::log {};
+             bind .b <FocusOut> {lappend ::log out};
+             bind .e <FocusIn> {lappend ::log in}",
+        );
+        eval(&mut i, "focus .b; focus .e");
+        assert_eq!(eval(&mut i, "set ::log"), "out in");
+        assert_eq!(eval(&mut i, "focus"), ".e");
+
+        // Listbox/treeview take the focus on click; arrow keys move the
+        // selection, like Tk's class bindings.
+        listbox_select(".l", 0);
+        assert_eq!(eval(&mut i, "focus"), ".l");
+        focused_nav_key("Down");
+        assert_eq!(eval(&mut i, ".l curselection"), "1");
+        focused_nav_key("End");
+        assert_eq!(eval(&mut i, ".l curselection"), "2");
+        focused_nav_key("Home");
+        assert_eq!(eval(&mut i, ".l curselection"), "0");
+        treeview_select(".tv", "a");
+        focused_nav_key("Down");
+        assert_eq!(eval(&mut i, ".tv selection"), "b");
+        focused_nav_key("Up");
+        assert_eq!(eval(&mut i, ".tv selection"), "a");
     }
 
     #[test]

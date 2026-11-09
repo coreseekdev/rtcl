@@ -40,6 +40,8 @@ thread_local! {
     static REVISION: RefCell<Option<Signal<u64>>> = const { RefCell::new(None) };
     /// Set once per engine thread; `TkView` starts the one pump interval.
     static PUMP_STARTED: Cell<bool> = const { Cell::new(false) };
+    /// Tk's default button keyboard activation is bound once per app.
+    static KEYS_BOUND: Cell<bool> = const { Cell::new(false) };
     /// Rich-editor sessions for tagged text widgets, keyed by path.
     static WYSIWYG: RefCell<BTreeMap<String, WysiwygEntry>> =
         const { RefCell::new(BTreeMap::new()) };
@@ -84,6 +86,7 @@ fn revision_signal() -> Signal<u64> {
 #[component]
 pub fn TkView() -> impl IntoElement {
     start_event_pump();
+    bind_default_keys();
     let revision = revision_signal();
     if matches!(os(), nsh_core::platform::Os::MacOs) {
         // Re-publish the Tk menu whenever the model changes, under the
@@ -128,6 +131,33 @@ pub fn TkView() -> impl IntoElement {
                     .child(text("Tk runtime is not installed").text_size(px(14.0)))],
             }
         }))
+}
+
+/// Tk's default keyboard bindings for buttons: Space invokes the focused
+/// button/check/radio (Return for check/radio).  They are real class
+/// bindings, so a user `bind Button <Key-space>` replaces them.
+fn bind_default_keys() {
+    if KEYS_BOUND.with(|bound| bound.replace(true)) {
+        return;
+    }
+    on_key("space", |_| {
+        rtcl_tk_runtime::focused_control_key("space");
+    });
+    on_key("return", |_| {
+        rtcl_tk_runtime::focused_control_key("Return");
+    });
+    for (keystroke, tcl_key) in [
+        ("up", "Up"),
+        ("down", "Down"),
+        ("home", "Home"),
+        ("end", "End"),
+        ("pageup", "Prior"),
+        ("pagedown", "Next"),
+    ] {
+        on_key(keystroke, move |_| {
+            rtcl_tk_runtime::focused_nav_key(tcl_key);
+        });
+    }
 }
 
 /// Pump `after` timers on the engine thread.  The interval belongs to the

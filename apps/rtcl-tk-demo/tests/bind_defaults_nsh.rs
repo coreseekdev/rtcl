@@ -489,6 +489,35 @@ fn rich_text_tag_bindings_fire_on_press() {
         .expect("the tag's <Enter> binding fired");
 }
 
+const ENTRY_VIRTUAL_APP: &str = r##"
+set ::c 0
+entry .e
+focus .e
+bind .e <<Copy>> {set ::c 1}
+pack .e
+label .out -textvariable ::c
+pack .out
+"##;
+
+#[component]
+fn EntryVirtualApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(ENTRY_VIRTUAL_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn entry_editing_shortcuts_fire_virtual_events() {
+    let mut config = EngineConfig::new(Root::of::<EntryVirtualApp>());
+    config.environment.os = nsh_core::platform::Os::Linux;
+    let mut app = Headless::start(config).expect("headless engine starts");
+    app.set_viewport(Size::new(Points(500.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("0").expect("the entry renders");
+    app.press_key("ctrl+c").expect("press ctrl+c");
+    app.wait_for("1")
+        .expect("the entry's <<Copy>> binding fired");
+}
+
 const TK_POPUP_APP: &str = r##"
 set ::choice none
 menu .m -tearoff 0

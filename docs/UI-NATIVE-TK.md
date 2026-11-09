@@ -439,8 +439,9 @@ handler（`handlerCommand offset maxChars`），未拥有时回退到剪贴板�
 primary/wayland 选区）尚未接入，因此非本应用拥有的 PRIMARY 读取也走剪贴板；
 `<Configure>` 尚未覆盖菜单窗口；`<<Copy>>/<<Cut>>/<<Paste>>/<<SelectAll>>/<<Undo>>/<<Redo>>`
 已按 Tk init.tcl 预定义（`event info` 可见，物理 Ctrl+键自动触发其绑定）；
-修饰键经 text/富文本路径上报，plain entry 的原生输入暂不上报修饰键，
-因此 entry 上的这些虚拟事件需等输入事件补修饰键后才能触发；
+text/富文本路径经修饰键触发，plain entry/Spinbox 由 ambient
+`ctrl+c/x/v/a/z/y` 键（nsh 视为非编辑键，输入框聚焦时也触发）投递到
+聚焦控件的 `<<事件>>` 绑定；
 entry 选区拖动（`<B1-Motion>`）在桌面鼠标拖动时由平台 MouseMove 派发，
 headless 的 `drag` 是触摸模拟故不触发；菜单项/separator 等装饰控件的
 hover 未单独接（菜单面板本身有 `<Enter>/<Leave>`）；

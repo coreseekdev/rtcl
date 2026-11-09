@@ -479,6 +479,27 @@ fn bind_default_keys() {
     on_key("space", |_| {
         rtcl_tk_runtime::focused_control_key("space");
     });
+    // Tk's editing shortcuts are virtual events on the focused text
+    // widget; nsh delivers ctrl+<key> here even while an input edits.
+    for (keystroke, event) in [
+        ("ctrl+c", "Copy"),
+        ("ctrl+C", "Copy"),
+        ("ctrl+x", "Cut"),
+        ("ctrl+X", "Cut"),
+        ("ctrl+v", "Paste"),
+        ("ctrl+V", "Paste"),
+        ("ctrl+a", "SelectAll"),
+        ("ctrl+A", "SelectAll"),
+        ("ctrl+z", "Undo"),
+        ("ctrl+Z", "Undo"),
+        ("ctrl+y", "Redo"),
+        ("ctrl+Y", "Redo"),
+    ] {
+        let event = event.to_string();
+        on_key(keystroke, move |_: &str| {
+            rtcl_tk_runtime::focused_virtual_event(&event);
+        });
+    }
     on_key("return", |_| {
         rtcl_tk_runtime::focused_control_key("Return");
     });

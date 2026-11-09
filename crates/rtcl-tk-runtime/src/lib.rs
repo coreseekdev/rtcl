@@ -3925,6 +3925,23 @@ pub fn focused(path: &str) -> bool {
     with_state(unsafe { &*ptr }, |rt| rt.focus.as_deref() == Some(path)).unwrap_or(false)
 }
 
+/// An editing shortcut (Ctrl+C/X/V/A/Z/Y) reached the ambient key layer:
+/// fire the matching `<<Virtual>>` binding on the focused entry, spinbox
+/// or text (Tk's default keymap delivers these to text widgets).
+pub fn focused_virtual_event(name: &str) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &*ptr };
+    let focus = with_state(interp, |rt| rt.focus.clone()).flatten();
+    let Some(path) = focus else { return };
+    let kind = with_state(interp, |rt| rt.tree.get(&path).map(|n| n.kind)).flatten();
+    if matches!(
+        kind,
+        Some(WidgetKind::Entry) | Some(WidgetKind::Spinbox) | Some(WidgetKind::Text)
+    ) {
+        run_binding(&path, &format!("<<{name}>>"), &EventCtx::for_path(&path));
+    }
+}
+
 fn raise_lower_impl(interp: &mut Interp, args: &[Value], raise: bool) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(wrong(
@@ -12382,6 +12399,25 @@ mod tests {
             Some("red")
         );
         assert_eq!(ttk_style_value(".plain", "-background"), None);
+    }
+
+    #[test]
+    fn focused_virtual_event_targets_text_widgets() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "set ::e 0; set ::t 0; set ::b 0;             entry .e; bind .e <<Copy>> {set ::e 1};                 text .t; bind .t <<Copy>> {set ::t 1};                 button .b; bind .b <<Copy>> {set ::b 1}",
+        );
+        eval(&mut i, "focus .e");
+        focused_virtual_event("Copy");
+        assert_eq!(eval(&mut i, "set ::e"), "1");
+        eval(&mut i, "focus .t");
+        focused_virtual_event("Copy");
+        assert_eq!(eval(&mut i, "set ::t"), "1");
+        eval(&mut i, "focus .b");
+        focused_virtual_event("Copy");
+        assert_eq!(eval(&mut i, "set ::b"), "0");
     }
 
     #[test]

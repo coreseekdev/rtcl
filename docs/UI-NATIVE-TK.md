@@ -237,7 +237,11 @@ index` 支持 `insert/end/line.col/line.end`、mark 名、`+/- N chars|
 indices|lines` 链与 `linestart/lineend/wordstart/wordend` 限定词；
 `mark set/unset/names/gravity/next/previous` 维护标记（`insert` 即光标，
 `current` 随编辑平移，gravity 控制插入点的贴边方向）；`edit
-modified ?0|1?`/`edit reset` 维护未保存标记（undo/redo 暂为 no-op）。
+modified ?0|1?`/`edit reset` 维护未保存标记（undo/redo 暂为 no-op）；
+`text search ?-forward|-backward? ?-exact|-regexp? ?-nocase? ?-all?
+?-count varName? pattern index ?stopIndex?` 支持环绕搜索与 regexp
+（Rust regex 语法；Tcl ARE 的 \m/\M 等未覆盖），`stopIndex` 只限制
+匹配起点。
 
 **虚拟化/滚动**：listbox 与 treeview 只挂载可见行（按 `-height` 取窗口），
 listbox `itemconfigure/itemcget` 支持按行的 `-foreground/-background/

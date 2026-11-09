@@ -4305,6 +4305,7 @@ dependencies = [
 name = "rtcl-tk-runtime"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "rtcl-core",
  "rtcl-tk-core",
  "serde_json",

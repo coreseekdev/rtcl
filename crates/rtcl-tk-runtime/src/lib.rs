@@ -897,6 +897,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     Ok(Value::empty())
                 }
                 "edit" => text_edit_command(interp, path, &args[2..]),
+                "search" => text_search(interp, path, &args[2..]),
                 "xview" | "yview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
@@ -6822,6 +6823,180 @@ fn text_delete(interp: &mut Interp, path: &str, first: &str, last: Option<&str>)
     Ok(Value::empty())
 }
 
+/// Collect matches fully inside the character window `[from, to)`.
+fn text_search_region(
+    chars: &[char],
+    pattern: &str,
+    from: usize,
+    to: usize,
+    regexp: bool,
+    nocase: bool,
+) -> Result<Vec<(usize, usize)>> {
+    let mut out = Vec::new();
+    if to < from || from > chars.len() {
+        return Ok(out);
+    }
+    let to = to.min(chars.len());
+    if regexp {
+        let sub = chars[from..to].iter().collect::<String>();
+        let re = regex::RegexBuilder::new(pattern)
+            .case_insensitive(nocase)
+            .build()
+            .map_err(|e| generic(format!("couldn't compile regular expression pattern: {e}")))?;
+        for found in re.find_iter(&sub) {
+            let start = from + sub[..found.start()].chars().count();
+            let len = sub[found.start()..found.end()].chars().count();
+            out.push((start, start + len));
+        }
+    } else {
+        let needle = pattern.chars().collect::<Vec<_>>();
+        if needle.is_empty() {
+            out.push((from, from));
+        } else if needle.len() <= to - from {
+            for start in from..=(to - needle.len()) {
+                let equal = chars[start..start + needle.len()]
+                    .iter()
+                    .zip(needle.iter())
+                    .all(|(a, b)| {
+                        if nocase {
+                            a.to_lowercase().eq(b.to_lowercase())
+                        } else {
+                            a == b
+                        }
+                    });
+                if equal {
+                    out.push((start, start + needle.len()));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn text_search(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    let mut forward = true;
+    let mut regexp = false;
+    let mut nocase = false;
+    let mut all = false;
+    let mut count_var: Option<String> = None;
+    let mut pos = 0usize;
+    while pos < rest.len() {
+        let arg = rest[pos].as_str();
+        if arg == "--" {
+            pos += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            break;
+        }
+        let name = &arg[1..];
+        let switch = |full: &str| !name.is_empty() && full.starts_with(name);
+        if switch("forward") {
+            forward = true;
+        } else if switch("backward") {
+            forward = false;
+        } else if switch("exact") {
+            regexp = false;
+        } else if switch("regexp") {
+            regexp = true;
+        } else if switch("nocase") {
+            nocase = true;
+        } else if switch("all") {
+            all = true;
+        } else if switch("count") {
+            pos += 1;
+            let Some(value) = rest.get(pos) else {
+                return Err(wrong("search -count", "varName", rest.len() + 2));
+            };
+            count_var = Some(value.as_str().to_string());
+        } else {
+            return Err(generic(format!(
+                "bad switch \"{arg}\": must be -all, -backward, -count, -exact, -forward, -nocase, or -regexp"
+            )));
+        }
+        pos += 1;
+    }
+    if rest.len() <= pos {
+        return Err(wrong(
+            "search",
+            "?switches? pattern index ?stopIndex?",
+            rest.len() + 2,
+        ));
+    }
+    let pattern = rest[pos].as_str().to_string();
+    pos += 1;
+    if rest.len() <= pos {
+        return Err(wrong(
+            "search",
+            "?switches? pattern index ?stopIndex?",
+            rest.len() + 2,
+        ));
+    }
+    let (content, cursor) = text_state(interp, path);
+    let marks = text_marks(interp, path);
+    let index = text_index(rest[pos].as_str(), &content, cursor, &marks)?;
+    pos += 1;
+    let stop = match rest.get(pos) {
+        Some(value) => Some(text_index(value.as_str(), &content, cursor, &marks)?),
+        None => None,
+    };
+    let chars = content.chars().collect::<Vec<_>>();
+    let len = chars.len();
+    eprintln!("SEARCH rest={:?} pattern={pattern:?} index={index} stop={stop:?} all={all} regexp={regexp} len={len}", rest.iter().map(|v| v.as_str().to_string()).collect::<Vec<_>>());
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    if forward {
+        // `stopIndex` limits where a match may start, not where it ends.
+        let mut region = text_search_region(&chars, &pattern, index, len, regexp, nocase)?;
+        if let Some(stop) = stop {
+            region.retain(|(start, _)| *start < stop);
+        }
+        matches.extend(region);
+        if stop.is_none() {
+            let mut wrapped = text_search_region(&chars, &pattern, 0, len, regexp, nocase)?;
+            wrapped.retain(|(start, _)| *start < index);
+            matches.extend(wrapped);
+        }
+    } else {
+        let bound = stop.map_or(0, |stop| stop.min(len));
+        let mut region = text_search_region(&chars, &pattern, bound, len, regexp, nocase)?;
+        // A backward search starts strictly before `index`; a match at the
+        // index itself is only seen after wrapping around.
+        region.retain(|(start, _)| *start < index);
+        region.reverse();
+        matches.extend(region);
+        if stop.is_none() {
+            let mut wrapped = text_search_region(&chars, &pattern, 0, len, regexp, nocase)?;
+            wrapped.retain(|(start, _)| *start >= index);
+            wrapped.reverse();
+            matches.extend(wrapped);
+        }
+    }
+    eprintln!("SEARCH matches={matches:?}");
+    if let Some(var) = count_var {
+        let count = matches.first().map_or(0, |(start, end)| end - start);
+        if let Err(e) = set_var(&var, &count.to_string()) {
+            record_error(e.to_string());
+        }
+    }
+    let out = if all {
+        matches
+            .iter()
+            .map(|(start, _)| char_to_linecol(&content, *start))
+            .collect::<Vec<_>>()
+    } else {
+        matches
+            .first()
+            .map(|(start, _)| char_to_linecol(&content, *start))
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    Ok(if all {
+        list_value(out)
+    } else {
+        Value::from_str(out.first().map_or("", String::as_str))
+    })
+}
+
 fn text_edit_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
     if rest.is_empty() {
         return Err(wrong("edit", "option ?arg ...?", rest.len() + 2));
@@ -8030,6 +8205,31 @@ mod tests {
         eval(&mut i, ".n mark set insert 1.1");
         eval(&mut i, ".n insert 1.1 AA");
         assert_eq!(eval(&mut i, ".n index insert"), "1.1");
+    }
+
+    #[test]
+    fn text_search_exact_backward_regexp_and_count() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "text .s; .s insert 1.0 \"one two one\nthree ONE\"");
+        assert_eq!(eval(&mut i, ".s search one 1.0"), "1.0");
+        assert_eq!(eval(&mut i, ".s search one 1.1"), "1.8");
+        assert_eq!(eval(&mut i, ".s search -backward one 1.9"), "1.8");
+        // Without an explicit stop the search wraps around.
+        assert_eq!(eval(&mut i, ".s search -backward one 1.0"), "1.8");
+        assert_eq!(eval(&mut i, ".s search one 1.9"), "1.0");
+        assert_eq!(eval(&mut i, ".s search -nocase ONE 1.0"), "1.0");
+        assert_eq!(eval(&mut i, ".s search -all one 1.0"), "1.0 1.8");
+        assert_eq!(eval(&mut i, ".s search -all one 1.9"), "1.0 1.8");
+        assert_eq!(eval(&mut i, ".s search -regexp {t[a-z]+} 1.0"), "1.4");
+        assert_eq!(eval(&mut i, ".s search -all -regexp {o\\w} 1.0"), "1.0 1.8");
+        assert_eq!(eval(&mut i, "set n 0; .s search -count n one 1.0"), "1.0");
+        assert_eq!(eval(&mut i, "set n"), "3");
+        assert_eq!(eval(&mut i, ".s search {} 1.0"), "1.0");
+        assert_eq!(eval(&mut i, ".s search zzz 1.0"), "");
+        assert_eq!(eval(&mut i, ".s search one 1.0 1.1"), "1.0");
+        assert_eq!(eval(&mut i, ".s search one 1.9 1.1"), "");
+        assert_eq!(eval(&mut i, ".s search -backward one 1.9 1.4"), "1.8");
     }
 
     #[test]

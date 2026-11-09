@@ -244,3 +244,48 @@ fn typing_in_an_entry_does_not_trigger_a_focused_button() {
         app.screen().texts()
     );
 }
+
+const WHEEL_APP: &str = r#"
+listbox .l -height 3
+pack .l
+foreach item {I1 I2 I3 I4 I5 I6 I7 I8 I9 I10} {.l insert end $item}
+ttk::treeview .tv -height 3
+pack .tv
+foreach item {T1 T2 T3 T4 T5 T6 T7 T8 T9 T10} {.tv insert {} end -id $item -text $item}
+"#;
+
+#[component]
+fn WheelApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(WHEEL_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn wheel_scrolls_listbox_and_treeview() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<WheelApp>()))
+        .expect("headless engine starts");
+    app.set_viewport(Size::new(Points(600.0), Points(600.0)))
+        .expect("resize");
+    app.wait_for("I1").expect("listbox renders");
+    app.wait_for("T1").expect("treeview renders");
+
+    app.scroll("I1", Points(100.0))
+        .expect("wheel over the listbox");
+    app.wait_for("I5")
+        .expect("the listbox slice follows the wheel");
+    assert!(
+        !app.shows("I1"),
+        "the first row scrolled out: {:?}",
+        app.screen().texts()
+    );
+
+    app.scroll("T1", Points(100.0))
+        .expect("wheel over the treeview");
+    app.wait_for("T6")
+        .expect("the treeview slice follows the wheel");
+    assert!(
+        !app.shows("T1"),
+        "the first tree row scrolled out: {:?}",
+        app.screen().texts()
+    );
+}

@@ -196,6 +196,42 @@ fn is_disabled(tree: &TkTree, path: &str) -> bool {
     option(tree, path, "-state") == "disabled"
 }
 
+/// Tk event state bits from the platform's modifier keys.
+fn tk_state(modifiers: &nsh_core::keymap::Modifiers) -> u32 {
+    let mut state = 0;
+    if modifiers.shift {
+        state |= 1;
+    }
+    if modifiers.ctrl {
+        state |= 4;
+    }
+    if modifiers.alt {
+        state |= 8;
+    }
+    if modifiers.cmd {
+        state |= 64;
+    }
+    state
+}
+
+/// Tk button number for a platform mouse button.
+fn tk_button(button: Option<nsh_core::MouseButton>) -> Option<u8> {
+    match button {
+        Some(nsh_core::MouseButton::Left) => Some(1),
+        Some(nsh_core::MouseButton::Middle) => Some(2),
+        Some(nsh_core::MouseButton::Right) => Some(3),
+        Some(nsh_core::MouseButton::Back) => Some(8),
+        Some(nsh_core::MouseButton::Forward) => Some(9),
+        None => None,
+    }
+}
+
+thread_local! {
+    /// Widgets with a finger down, so moves become touch moves.
+    static TOUCH_ACTIVE: RefCell<std::collections::BTreeSet<String>> =
+        const { RefCell::new(std::collections::BTreeSet::new()) };
+}
+
 /// Publish the Tk `menu` tree as the platform's application menu (macOS's
 /// system menu, GTK's menu bar).  Headless runs keep the in-app bar.
 fn sync_native_menu() {
@@ -1446,17 +1482,14 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             } else {
                 0
             };
+            let viewport_height = rows as f32 * 28.0 + 8.0;
+            let content_height = (total as f32 * 28.0).max(viewport_height);
             let mut list = view()
                 .flex_col()
                 .w_full()
                 .gap_1()
                 .p(px(3.0))
-                .h(px(rows as f32 * 28.0 + 8.0))
-                .rounded(px(4.0))
-                .border_1()
-                .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
-                .bg(option_color(tree, path, "-background")
-                    .unwrap_or(AdaptiveColor::rgb(0xffffff, 0x111827)));
+                .h(px(content_height));
             let text_color = option_color(tree, path, "-foreground")
                 .unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
             let select_bg = option_color(tree, path, "-selectbackground")
@@ -1514,7 +1547,30 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         }),
                 );
             }
-            list.into_element()
+            // A native scroll view supplies the wheel/pan; the list itself
+            // stays virtualized (only the visible slice is mounted) and the
+            // scroll view's own offset is reset on every event.
+            let scroll_ref = element_ref();
+            let scroll_path = path.to_string();
+            nsh_core::element::scroll()
+                .w_full()
+                .h(px(viewport_height))
+                .scrollbar(false)
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+                .bg(option_color(tree, path, "-background")
+                    .unwrap_or(AdaptiveColor::rgb(0xffffff, 0x111827)))
+                .element_ref(&scroll_ref)
+                .on_scroll(move |e: &ScrollEvent| {
+                    let dy = e.offset.y.0 as f64;
+                    if dy != 0.0 {
+                        rtcl_tk_runtime::native_wheel(&scroll_path, dy, 28.0);
+                        scroll_ref.scroll_to(Point::new(Points(0.0), Points(0.0)), false);
+                    }
+                })
+                .child(list)
+                .into_element()
         }
         WidgetKind::Message => {
             let font = font_of(tree, path);
@@ -2174,20 +2230,136 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 container = container.bg(bg);
             }
             let press_path = path.to_string();
-            container
-                .child(
-                    nsh_core::element::canvas(painter)
-                        .w(px(width))
-                        .h(px(height))
-                        .on_press(move |e: &PressEvent| {
-                            rtcl_tk_runtime::canvas_press(
-                                &press_path,
-                                e.position.x.0 as f64,
-                                e.position.y.0 as f64,
-                            );
-                        }),
-                )
-                .into_element()
+            let enter_path = path.to_string();
+            let leave_path = path.to_string();
+            let move_path = path.to_string();
+            let down_path = path.to_string();
+            let up_path = path.to_string();
+            let long_path = path.to_string();
+            let pan_path = path.to_string();
+            let pinch_path = path.to_string();
+            let rotation_path = path.to_string();
+            let canvas = nsh_core::element::canvas(painter)
+                .w(px(width))
+                .h(px(height))
+                .on_press(move |e: &PressEvent| {
+                    rtcl_tk_runtime::canvas_press(
+                        &press_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                    );
+                })
+                .on_mouse_enter(move |e: &MouseEvent| {
+                    rtcl_tk_runtime::enter_event(
+                        &enter_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                    );
+                })
+                .on_mouse_leave(move |e: &MouseEvent| {
+                    rtcl_tk_runtime::leave_event(
+                        &leave_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                    );
+                })
+                .on_mouse_move(move |e: &MouseEvent| {
+                    let (x, y) = (e.position.x.0 as f64, e.position.y.0 as f64);
+                    let touch = TOUCH_ACTIVE.with(|active| active.borrow().contains(&move_path));
+                    if touch {
+                        rtcl_tk_runtime::touch_event(&move_path, x, y, "move");
+                    } else {
+                        rtcl_tk_runtime::motion_event(
+                            &move_path,
+                            x,
+                            y,
+                            tk_button(e.pressed_button),
+                            tk_state(&e.modifiers),
+                        );
+                    }
+                })
+                .on_press_down(move |e: &PressEvent| {
+                    TOUCH_ACTIVE.with(|active| {
+                        active.borrow_mut().insert(down_path.clone());
+                    });
+                    rtcl_tk_runtime::touch_event(
+                        &down_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        "start",
+                    );
+                })
+                .on_press_up(move |e: &PressEvent| {
+                    TOUCH_ACTIVE.with(|active| {
+                        active.borrow_mut().remove(&up_path);
+                    });
+                    rtcl_tk_runtime::touch_event(
+                        &up_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        "end",
+                    );
+                })
+                .on_long_press(move |e: &PressEvent| {
+                    rtcl_tk_runtime::long_press_event(
+                        &long_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                    );
+                })
+                .on_pan_start({
+                    let pan_start_path = pan_path.clone();
+                    move |e: &PanEvent| {
+                        rtcl_tk_runtime::pan_event(
+                            &pan_start_path,
+                            e.translation.x.0 as f64,
+                            e.translation.y.0 as f64,
+                            e.cancelled,
+                        );
+                    }
+                })
+                .on_pan_end({
+                    let pan_end_path = pan_path.clone();
+                    move |e: &PanEvent| {
+                        rtcl_tk_runtime::pan_event(
+                            &pan_end_path,
+                            e.translation.x.0 as f64,
+                            e.translation.y.0 as f64,
+                            e.cancelled,
+                        );
+                    }
+                })
+                .on_pinch_start({
+                    let pinch_start_path = pinch_path.clone();
+                    move |e: &GestureEvent| {
+                        rtcl_tk_runtime::pinch_event(&pinch_start_path, f64::from(e.value));
+                    }
+                })
+                .on_pinch_end({
+                    let pinch_end_path = pinch_path.clone();
+                    move |e: &GestureEvent| {
+                        rtcl_tk_runtime::pinch_event(&pinch_end_path, f64::from(e.value));
+                    }
+                })
+                .on_rotation_start({
+                    let rotation_start_path = rotation_path.clone();
+                    move |e: &GestureEvent<Radians>| {
+                        rtcl_tk_runtime::rotation_event(
+                            &rotation_start_path,
+                            f64::from(e.value.0.to_degrees()),
+                        );
+                    }
+                })
+                .on_rotation_end({
+                    let rotation_end_path = rotation_path.clone();
+                    move |e: &GestureEvent<Radians>| {
+                        rtcl_tk_runtime::rotation_event(
+                            &rotation_end_path,
+                            f64::from(e.value.0.to_degrees()),
+                        );
+                    }
+                });
+            container.child(canvas).into_element()
         }
         WidgetKind::Chart => {
             let width = option(tree, path, "-width")
@@ -2404,7 +2576,28 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 }));
                 body = body.child(row);
             }
-            let body = body.h(px(rows as f32 * 22.0 + 8.0));
+            let viewport_height = rows as f32 * 22.0 + 8.0;
+            let content_height = (total as f32 * 22.0).max(viewport_height);
+            let body = body.h(px(content_height));
+            let scroll_ref = element_ref();
+            let scroll_path = path.to_string();
+            let scroller = nsh_core::element::scroll()
+                .w_full()
+                .h(px(viewport_height))
+                .scrollbar(false)
+                .element_ref(&scroll_ref)
+                .on_scroll(move |e: &ScrollEvent| {
+                    let dy = e.offset.y.0 as f64;
+                    eprintln!(
+                        "TV SCROLL dy={dy} content={:?} size={:?}",
+                        e.content_size, e.size
+                    );
+                    if dy != 0.0 {
+                        rtcl_tk_runtime::native_wheel(&scroll_path, dy, 22.0);
+                        scroll_ref.scroll_to(Point::new(Points(0.0), Points(0.0)), false);
+                    }
+                })
+                .child(body);
             view()
                 .flex_col()
                 .w_full()
@@ -2412,7 +2605,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .border_1()
                 .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
                 .child(header)
-                .child(body)
+                .child(scroller)
                 .into_element()
         }
     }

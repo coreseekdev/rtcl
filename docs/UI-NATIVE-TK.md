@@ -279,9 +279,17 @@ disabled/readonly 与 `-show` 密码已由原生输入呈现。
 行、canvas 项/画布；`focus` 切换派发 `<FocusOut>/<FocusIn>`。
 `bind all`、类名/`bind .` 均可用。按钮默认类绑定 `<Key-space>` invoke
 （check/radio 另有 `<Key-Return>`），可由 `bind` 覆盖；listbox/treeview
-点击获得焦点，方向键/Home/End/Prior/Next 移动选择。替换
-`%W/%x/%y/%X/%Y/%b/%s/%K/%A`（合成事件无根坐标时 `%X/%Y` 取 widget
-坐标，`%w/%h` 为 0）；`after` 由 `TkView` 的 16 ms interval 泵入，
+点击获得焦点，方向键/Home/End/Prior/Next 移动选择。指针/触摸事件：
+`<Motion>`/`<B1-Motion>`（canvas 项也支持）、`<Enter>/<Leave>`、
+`<Touch>` 与 `<<TouchStart/Move/End>>`、`<<LongPress>>`、`<<Pan>>`、
+`<<Pinch>>`、`<<Rotation>>`；触摸轻点仍合成 `<Button-1>` 路径。
+滚轮：listbox/treeview 用原生 scroll view 取得 wheel/pan，派发
+`<MouseWheel>`、`<Button-4|5>`（横向 6/7，Shift 作用于
+`<Shift-MouseWheel>`），无类绑定时按行高滚动虚拟化切片（原生偏移每次
+事件复位，只挂可见行）。替换
+`%W/%x/%y/%X/%Y/%b/%s/%K/%A/%D`（合成事件无根坐标时 `%X/%Y` 取 widget
+坐标，`%w/%h` 为 0；`%D` 为滚轮 ±120、pan 位移、pinch×100、
+rotation×10）；`after` 由 `TkView` 的 16 ms interval 泵入，
 错误进 `take_errors()`。
 
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停
@@ -290,8 +298,10 @@ disabled/readonly 与 `-show` 密码已由原生输入呈现。
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
 text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
-未实现；`<Enter>/<Leave>/<Configure>` 与虚拟事件（`<<Paste>>` 等）尚未
-从平台层派发；entry/scale/text 的按下事件只走原生控件行为；
+未实现；`<Configure>` 与虚拟事件（`<<Paste>>` 等）尚未从平台层派发；
+滚轮绑定只在 listbox/treeview（有原生 scroll view）；canvas/text/entry
+的 wheel、entry/scale/text 的按下事件只走原生控件行为；其它控件的
+hover/motion 未派发；
 Windows/Linux 菜单栏仍是 app 内实现
 （macOS 用系统菜单；nsh GTK 的 set_application_menu 实测不显示）；
 scrollbar 已与 listbox/treeview 联动。

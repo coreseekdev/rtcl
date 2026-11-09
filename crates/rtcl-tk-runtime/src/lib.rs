@@ -2867,6 +2867,8 @@ pub struct EventCtx {
     pub character: String,
     pub button: i64,
     pub state: String,
+    /// `%D`: wheel/drag/gesture delta.
+    pub delta: i64,
 }
 
 impl EventCtx {
@@ -2891,6 +2893,10 @@ enum EventKind {
     Enter,
     Leave,
     Motion,
+    Wheel,
+    Touch,
+    /// `<<Name>>` virtual event.
+    Virtual,
     Configure,
     /// Parsed but not dispatched by the native backend.
     Other,
@@ -2928,6 +2934,13 @@ fn parse_event_state(state: &str) -> u32 {
 /// never matches a dispatched event.
 fn parse_sequence(sequence: &str) -> EventPattern {
     let text = sequence.trim();
+    if text.starts_with("<<") && text.ends_with(">>") && text.len() > 4 {
+        return EventPattern {
+            kind: EventKind::Virtual,
+            detail: Some(text[2..text.len() - 2].to_string()),
+            ..EventPattern::default()
+        };
+    }
     let inner = text
         .strip_prefix('<')
         .and_then(|s| s.strip_suffix('>'))
@@ -3008,9 +3021,32 @@ fn parse_sequence(sequence: &str) -> EventPattern {
         "enter" => pattern.kind = EventKind::Enter,
         "leave" => pattern.kind = EventKind::Leave,
         "motion" => pattern.kind = EventKind::Motion,
+        "mousewheel" => pattern.kind = EventKind::Wheel,
+        "touch" => pattern.kind = EventKind::Touch,
+        "pan" | "pinch" | "rotation" | "longpress" => {
+            pattern.kind = EventKind::Virtual;
+            pattern.detail = Some(
+                match head.as_str() {
+                    "longpress" => "LongPress",
+                    other => other,
+                }
+                .to_string(),
+            );
+        }
         "configure" => pattern.kind = EventKind::Configure,
         "destroy" | "expose" | "map" | "unmap" | "visibility" | "mousewheel" => {
             pattern.kind = EventKind::Other
+        }
+        other if other.len() == 2 && other.starts_with('b') && !rest.is_empty() => {
+            // <B1-Motion>: motion with button `1` down.
+            let button = &other[1..];
+            if rest[0].eq_ignore_ascii_case("motion") && button.chars().all(|c| c.is_ascii_digit())
+            {
+                pattern.kind = EventKind::Motion;
+                pattern.detail = Some(button.to_string());
+            } else {
+                pattern.kind = EventKind::Other;
+            }
         }
         other if other.chars().all(|c| c.is_ascii_digit()) => {
             pattern.kind = EventKind::ButtonPress;
@@ -3094,6 +3130,7 @@ fn substitute_bindings(script: &str, ctx: &EventCtx) -> String {
             Some('k') => out.push_str(&ctx.key),
             Some('b') => out.push_str(&ctx.button.to_string()),
             Some('s') => out.push_str(&ctx.state),
+            Some('D') => out.push_str(&ctx.delta.to_string()),
             Some('t') => out.push_str("0"),
             Some('#') => out.push_str("0"),
             Some(other) => {
@@ -3224,6 +3261,25 @@ fn dispatch_click(path: &str, ctx: &EventCtx) {
         run_binding(path, "<Double-Button-1>", ctx);
     }
     run_binding(path, "<ButtonRelease-1>", ctx);
+}
+
+/// Like [`set_tk_focus`] but without bumping the render revision: used
+/// while an input edit is being committed (a re-render there would reset
+/// the native field before its text reaches the model).
+fn set_tk_focus_quiet(interp: &mut Interp, new: Option<String>) {
+    let old = with_state(interp, |rt| rt.focus.clone()).unwrap_or_default();
+    if old == new {
+        return;
+    }
+    with_state_mut(interp, |rt| {
+        rt.focus = new.clone();
+    });
+    if let Some(old) = old {
+        run_binding(&old, "<FocusOut>", &EventCtx::for_path(&old));
+    }
+    if let Some(new) = new {
+        run_binding(&new, "<FocusIn>", &EventCtx::for_path(&new));
+    }
 }
 
 /// Set the Tk focus target and dispatch the FocusOut/FocusIn bindings.
@@ -4460,9 +4516,6 @@ fn substitute_validation(script: &str, pairs: &[(&str, &str)]) -> String {
 pub fn entry_changed(path: &str, text: &str) {
     let Some(ptr) = active_interp() else { return };
     let interp = unsafe { &mut *ptr };
-    // Typing in an entry means it has the focus: keep the Tk focus model in
-    // step so Space/Return shortcuts do not fire on another widget.
-    set_tk_focus(interp, Some(path.to_string()));
     if !entry_validation_passes(interp, path, text) {
         // Reject the edit: the controlled input re-reads the old value.
         bump_active();
@@ -4480,6 +4533,9 @@ pub fn entry_changed(path: &str, text: &str) {
             record_error(e.to_string());
         }
     }
+    // Typing in an entry means it has the focus: keep the Tk focus model in
+    // step so Space/Return shortcuts do not fire on another widget.
+    set_tk_focus_quiet(interp, Some(path.to_string()));
     bump_active();
 }
 
@@ -4487,7 +4543,7 @@ pub fn entry_changed(path: &str, text: &str) {
 pub fn text_changed(path: &str, text: &str) {
     if apply_text_change(path, text) {
         if let Some(ptr) = active_interp() {
-            set_tk_focus(unsafe { &mut *ptr }, Some(path.to_string()));
+            set_tk_focus_quiet(unsafe { &mut *ptr }, Some(path.to_string()));
         }
         bump_active();
     }
@@ -4591,7 +4647,7 @@ pub fn entry_submitted(path: &str) {
 /// `Return`), `character` the text it inserts (empty for control keys).
 pub fn entry_key(path: &str, key: &str, character: &str) {
     if let Some(ptr) = active_interp() {
-        set_tk_focus(unsafe { &mut *ptr }, Some(path.to_string()));
+        set_tk_focus_quiet(unsafe { &mut *ptr }, Some(path.to_string()));
     }
     let mut ctx = EventCtx::for_path(path);
     ctx.key = key.to_string();
@@ -4626,6 +4682,258 @@ pub fn focused_control_key(key: &str) {
     ) {
         control_key(&path, key);
     }
+}
+
+/// Whether the widget's class has a user binding matching `event` (used to
+/// decide whether a native default scroll still applies).
+fn class_has_binding(interp: &Interp, path: &str, event: &EventPattern) -> bool {
+    let class = with_state(interp, |rt| rt.tree.get(path).map(|n| n.kind.class_name()))
+        .flatten()
+        .unwrap_or("Widget");
+    best_script(&tag_binding_map(interp, class), event).is_some()
+}
+
+/// A wheel notch over a listbox/treeview (or any widget with a Tk binding):
+/// dispatch `<Button-4>/<Button-5>` and `<MouseWheel>` with `%D`, then
+/// scroll the widget like Tk's class bindings unless the user replaced them.
+pub fn wheel_event(path: &str, dx: f64, dy: f64, state: u32) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    if dy != 0.0 {
+        let up = dy > 0.0;
+        send_wheel(path, up, state);
+        let kind = with_state(interp, |rt| rt.tree.get(path).map(|n| n.kind)).flatten();
+        if matches!(kind, Some(WidgetKind::Listbox) | Some(WidgetKind::Treeview))
+            && !wheel_overridden(interp, path, up)
+        {
+            wheel_scroll(interp, path, if up { -1.0 } else { 1.0 });
+        }
+        return;
+    }
+    if dx != 0.0 {
+        let right = dx > 0.0;
+        let button = if right { 7 } else { 6 };
+        let mut ctx = EventCtx::for_path(path);
+        ctx.button = button;
+        ctx.delta = if right { 120 } else { -120 };
+        ctx.state = state.to_string();
+        let press = format!("<Button-{button}>");
+        let release = format!("<ButtonRelease-{button}>");
+        run_binding(path, &press, &ctx);
+        run_binding(path, &release, &ctx);
+        run_binding(path, "<Shift-MouseWheel>", &ctx);
+    }
+}
+
+/// Dispatch Tk's wheel bindings for one notch (no default scrolling).
+fn send_wheel(path: &str, up: bool, state: u32) {
+    let button = if up { 4 } else { 5 };
+    let delta = if up { 120 } else { -120 };
+    let mut ctx = EventCtx::for_path(path);
+    ctx.button = button;
+    ctx.delta = delta;
+    ctx.state = state.to_string();
+    let press = format!("<Button-{button}>");
+    let release = format!("<ButtonRelease-{button}>");
+    run_binding(path, &press, &ctx);
+    run_binding(path, &release, &ctx);
+    run_binding(path, "<MouseWheel>", &ctx);
+}
+
+fn wheel_overridden(interp: &Interp, path: &str, up: bool) -> bool {
+    let button = if up { 4 } else { 5 };
+    let mut ctx = EventCtx::for_path(path);
+    ctx.button = button;
+    ctx.delta = if up { 120 } else { -120 };
+    let wheel = event_from("<MouseWheel>", &ctx);
+    let press = event_from(&format!("<Button-{button}>"), &ctx);
+    class_has_binding(interp, path, &wheel) || class_has_binding(interp, path, &press)
+}
+
+thread_local! {
+    /// Wheel pixels accumulated per widget until a Tk notch (120) fires.
+    static WHEEL_ACC: RefCell<BTreeMap<String, f64>> = const { RefCell::new(BTreeMap::new()) };
+    /// Last raw content offset of each widget's wheel scroll view.
+    static WHEEL_LAST_OFFSET: RefCell<BTreeMap<String, f64>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+/// A native scroll view's content offset moved over `row_height`-tall rows.
+/// Dispatch a `<MouseWheel>`/`<Button-4|5>` binding every 120 points and
+/// scroll the listbox/treeview model by the exact row fraction, unless a
+/// user class binding replaced the default.  The view's offset is reset by
+/// the renderer after each event, so offsets may restart from zero.
+pub fn native_wheel(path: &str, offset: f64, row_height: f64) {
+    eprintln!(
+        "NATIVE ENTER path={path} offset={offset} row={row_height} active={}",
+        active_interp().is_some()
+    );
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    if offset == 0.0 {
+        WHEEL_LAST_OFFSET.with(|last| {
+            last.borrow_mut().insert(path.to_string(), 0.0);
+        });
+        return;
+    }
+    let delta = WHEEL_LAST_OFFSET.with(|last| {
+        let mut last = last.borrow_mut();
+        let previous = last.get(path).copied().unwrap_or(0.0);
+        let delta = if offset < previous {
+            offset
+        } else {
+            offset - previous
+        };
+        last.insert(path.to_string(), offset);
+        delta
+    });
+    if delta == 0.0 {
+        return;
+    }
+    let up = delta < 0.0;
+    let mut notches = 0;
+    WHEEL_ACC.with(|acc| {
+        let mut acc = acc.borrow_mut();
+        let accumulated = acc.entry(path.to_string()).or_insert(0.0);
+        *accumulated += delta;
+        while *accumulated >= 120.0 {
+            *accumulated -= 120.0;
+            notches += 1;
+        }
+        while *accumulated <= -120.0 {
+            *accumulated += 120.0;
+            notches += 1;
+        }
+    });
+    let overridden = wheel_overridden(interp, path, up);
+    for _ in 0..notches {
+        send_wheel(path, up, 0);
+    }
+    if overridden || row_height <= 0.0 {
+        return;
+    }
+    let total = with_state(interp, |rt| {
+        if let Some(tv) = rt.treeviews.get(path) {
+            Some(treeview_visible_count_of(tv))
+        } else {
+            rt.tree.get(path).map(|n| n.items.len())
+        }
+    })
+    .flatten()
+    .unwrap_or(0);
+    if total == 0 {
+        return;
+    }
+    let (fraction, rows) = scroll_state(interp, path);
+    let rows = rows.min(total);
+    let max_first = (1.0 - rows as f64 / total as f64).max(0.0);
+    let next = (fraction + delta / row_height / total as f64).clamp(0.0, max_first);
+    if (next - fraction).abs() > f64::EPSILON {
+        set_scroll_fraction(interp, path, next);
+        notify_yscroll(interp, path, total);
+    }
+}
+
+fn wheel_scroll(interp: &mut Interp, path: &str, direction: f64) {
+    let total = with_state(interp, |rt| {
+        if let Some(tv) = rt.treeviews.get(path) {
+            Some(treeview_visible_count_of(tv))
+        } else {
+            rt.tree.get(path).map(|n| n.items.len())
+        }
+    })
+    .flatten()
+    .unwrap_or(0);
+    if total == 0 {
+        return;
+    }
+    let (fraction, rows) = scroll_state(interp, path);
+    let rows = rows.min(total);
+    let step = 3.0 / total as f64;
+    let max_first = (1.0 - rows as f64 / total as f64).max(0.0);
+    let next = (fraction + direction * step).clamp(0.0, max_first);
+    if (next - fraction).abs() < f64::EPSILON {
+        return;
+    }
+    set_scroll_fraction(interp, path, next);
+    notify_yscroll(interp, path, total);
+}
+
+/// The pointer entered a widget: `<Enter>`.
+pub fn enter_event(path: &str, x: f64, y: f64) {
+    let mut ctx = EventCtx::for_path(path);
+    ctx.x = x as i64;
+    ctx.y = y as i64;
+    run_binding(path, "<Enter>", &ctx);
+}
+
+/// The pointer left a widget: `<Leave>`.
+pub fn leave_event(path: &str, x: f64, y: f64) {
+    let mut ctx = EventCtx::for_path(path);
+    ctx.x = x as i64;
+    ctx.y = y as i64;
+    run_binding(path, "<Leave>", &ctx);
+}
+
+/// Mouse motion (with or without a button down): `<Motion>` and, while
+/// button `n` is held, `<Bn-Motion>`.
+pub fn motion_event(path: &str, x: f64, y: f64, pressed_button: Option<u8>, state: u32) {
+    let mut ctx = EventCtx::for_path(path);
+    ctx.x = x as i64;
+    ctx.y = y as i64;
+    ctx.state = state.to_string();
+    run_binding(path, "<Motion>", &ctx);
+    if let Some(button) = pressed_button {
+        ctx.button = i64::from(button);
+        let sequence = format!("<B{button}-Motion>");
+        run_binding(path, &sequence, &ctx);
+    }
+}
+
+/// A touch at `x`,`y`: `<Touch>` plus the phase virtual events.
+pub fn touch_event(path: &str, x: f64, y: f64, phase: &str) {
+    let mut ctx = EventCtx::for_path(path);
+    ctx.x = x as i64;
+    ctx.y = y as i64;
+    run_binding(path, "<Touch>", &ctx);
+    let name = match phase {
+        "start" => "TouchStart",
+        "move" => "TouchMove",
+        "end" => "TouchEnd",
+        _ => return,
+    };
+    run_binding(path, &format!("<<{name}>>"), &ctx);
+}
+
+/// A long press (touch/force-touch): `<<LongPress>>`.
+pub fn long_press_event(path: &str, x: f64, y: f64) {
+    let mut ctx = EventCtx::for_path(path);
+    ctx.x = x as i64;
+    ctx.y = y as i64;
+    run_binding(path, "<<LongPress>>", &ctx);
+}
+
+/// A touch pan: `<<Pan>>` (`%D` is the vertical translation).
+pub fn pan_event(path: &str, dx: f64, dy: f64, cancelled: bool) {
+    let mut ctx = EventCtx::for_path(path);
+    ctx.delta = dy.round() as i64;
+    let name = if cancelled { "PanCancel" } else { "Pan" };
+    run_binding(path, &format!("<<{name}>>"), &ctx);
+    let _ = dx;
+}
+
+/// A pinch: `<<Pinch>>` (`%D` is scale × 100).
+pub fn pinch_event(path: &str, scale: f64) {
+    let mut ctx = EventCtx::for_path(path);
+    ctx.delta = (scale * 100.0).round() as i64;
+    run_binding(path, "<<Pinch>>", &ctx);
+}
+
+/// A two-finger rotation: `<<Rotation>>` (`%D` is degrees × 10).
+pub fn rotation_event(path: &str, degrees: f64) {
+    let mut ctx = EventCtx::for_path(path);
+    ctx.delta = (degrees * 10.0).round() as i64;
+    run_binding(path, "<<Rotation>>", &ctx);
 }
 
 /// Space/Return on a focused button-like control.  The Tk library's
@@ -6693,6 +7001,57 @@ pub fn canvas_press(path: &str, x: f64, y: f64) {
     run_binding(path, "<ButtonRelease-1>", &ctx);
 }
 
+/// Pointer motion over a canvas: item `<Motion>`/`<Bn-Motion>` bindings of
+/// the item under the pointer, then the canvas widget's own bindings.
+pub fn canvas_motion(path: &str, x: f64, y: f64, pressed_button: Option<u8>) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    let (items, bindings) = with_state(interp, |rt| {
+        rt.canvases.get(path).map(|canvas| {
+            (
+                canvas
+                    .items
+                    .iter()
+                    .filter(|item| !canvas_item_hidden(item) && canvas_item_contains(item, x, y))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                canvas.bindings.clone(),
+            )
+        })
+    })
+    .flatten()
+    .unwrap_or_default();
+    let mut ctx = EventCtx::for_path(path);
+    ctx.x = x as i64;
+    ctx.y = y as i64;
+    if let Some(button) = pressed_button {
+        ctx.button = i64::from(button);
+    }
+    let sequence = match pressed_button {
+        Some(button) => format!("<B{button}-Motion>"),
+        None => "<Motion>".to_string(),
+    };
+    let event = event_from(&sequence, &ctx);
+    for item in items.iter().rev() {
+        let mut targets = vec![item.id.to_string()];
+        if let Some(tags) = item.options.get("-tags") {
+            targets.extend(tags.split_whitespace().map(str::to_string));
+        }
+        for target in targets {
+            if let Some(script) = bindings
+                .get(&target)
+                .and_then(|map| best_script(map, &event))
+            {
+                let script = substitute_bindings(&script, &ctx);
+                if let Err(e) = eval_active(&script) {
+                    record_error(e.to_string());
+                }
+            }
+        }
+    }
+    run_binding(path, &sequence, &ctx);
+}
+
 /// A text widget's persisted rich document (ProseMirror JSON), if any.
 pub fn rich_doc(path: &str) -> Option<String> {
     let ptr = active_interp()?;
@@ -8749,6 +9108,80 @@ mod tests {
         eval(&mut i, ".n mark set insert 1.1");
         eval(&mut i, ".n insert 1.1 AA");
         assert_eq!(eval(&mut i, ".n index insert"), "1.1");
+    }
+
+    #[test]
+    fn canvas_item_motion_and_pointer_enter_leave() {
+        let mut i = Interp::new();
+        install(&mut i);
+        let id = eval(
+            &mut i,
+            "canvas .c -width 100 -height 100; .c create rectangle 0 0 50 50",
+        );
+        eval(&mut i, &format!("set id {id}"));
+        eval(
+            &mut i,
+            ".c bind $id <B1-Motion> {set ::drag \"%x,%y\"};
+             .c bind $id <Motion> {set ::move \"%x,%y\"};
+             bind .c <Enter> {set ::enter \"%x,%y\"};
+             bind .c <Leave> {set ::leave 1}",
+        );
+        canvas_motion(".c", 10.0, 20.0, Some(1));
+        assert_eq!(eval(&mut i, "set ::drag"), "10,20");
+        canvas_motion(".c", 30.0, 40.0, None);
+        assert_eq!(eval(&mut i, "set ::move"), "30,40");
+        enter_event(".c", 1.0, 2.0);
+        assert_eq!(eval(&mut i, "set ::enter"), "1,2");
+        leave_event(".c", 3.0, 4.0);
+        assert_eq!(eval(&mut i, "set ::leave"), "1");
+    }
+
+    #[test]
+    fn wheel_motion_touch_and_gesture_events() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "listbox .l -height 3; foreach n {0 1 2 3 4 5 6 7 8 9} {.l insert end $n};
+             set ::log {};
+             bind .l <MouseWheel> {lappend ::log wheel%D};
+             bind .l <Button-4> {lappend ::log up};
+             bind .l <Button-5> {lappend ::log down};
+             bind .l <B1-Motion> {lappend ::log drag};
+             bind .l <Motion> {lappend ::log move};
+             bind .l <<LongPress>> {lappend ::log long};
+             bind .l <<Pan>> {set ::pan %D};
+             bind .l <<Pinch>> {set ::pinch %D};
+             bind .l <Touch> {incr ::touch}",
+        );
+        wheel_event(".l", 0.0, 1.0, 0);
+        assert_eq!(eval(&mut i, "set ::log"), "up wheel120");
+        assert_eq!(eval(&mut i, "lindex [.l yview] 0"), "0");
+        wheel_event(".l", 0.0, -1.0, 0);
+        assert!(eval(&mut i, "set ::log").contains("down"));
+        assert_eq!(eval(&mut i, "lindex [.l yview] 0"), "0.3");
+        motion_event(".l", 5.0, 6.0, Some(1), 0);
+        assert!(eval(&mut i, "set ::log").contains("drag"));
+        motion_event(".l", 5.0, 6.0, None, 0);
+        assert!(eval(&mut i, "set ::log").contains("move"));
+        long_press_event(".l", 5.0, 6.0);
+        assert!(eval(&mut i, "set ::log").contains("long"));
+        pan_event(".l", 0.0, 12.0, false);
+        assert_eq!(eval(&mut i, "set ::pan"), "12");
+        pinch_event(".l", 1.5);
+        assert_eq!(eval(&mut i, "set ::pinch"), "150");
+        eval(&mut i, "set ::touch 0");
+        touch_event(".l", 5.0, 6.0, "start");
+        assert_eq!(eval(&mut i, "set ::touch"), "1");
+        // A user class wheel binding replaces the default scrolling.
+        eval(
+            &mut i,
+            "bind Listbox <MouseWheel> {lappend ::log classwheel}; set ::log {}",
+        );
+        wheel_event(".l", 0.0, -1.0, 0);
+        assert_eq!(eval(&mut i, "set ::log"), "down wheel-120 classwheel");
+        assert_eq!(eval(&mut i, "lindex [.l yview] 0"), "0.3");
+        eval(&mut i, "bind Listbox <MouseWheel> {}");
     }
 
     #[test]

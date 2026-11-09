@@ -509,6 +509,7 @@ pub fn install(interp: &mut Interp) {
         "image",
         "clipboard",
         "selection",
+        "tk_messageBox",
     ] {
         interp.register_command(name, global_command);
     }
@@ -4113,6 +4114,48 @@ fn parse_menu_entry(kind: &str, rest: &[Value]) -> Result<MenuItem> {
     })
 }
 
+/// A `tk_messageBox` request, handed to a backend that can show a native
+/// modal dialog.
+#[derive(Debug, Clone, Default)]
+pub struct MessageBoxRequest {
+    /// `-type`: ok, okcancel, yesno, yesnocancel, retrycancel, abortretryignore.
+    pub kind: String,
+    pub title: String,
+    pub message: String,
+    pub detail: String,
+    pub icon: String,
+    /// The symbolic name Tk returns when the user presses the default.
+    pub default: String,
+    /// The symbolic name for Escape/cancel.
+    pub cancel: String,
+    pub parent: String,
+}
+
+/// The buttons of a `tk_messageBox` type, in Tk's order; `None` for an
+/// unknown type.
+pub fn message_box_buttons(kind: &str) -> Option<&'static [&'static str]> {
+    match kind {
+        "ok" => Some(&["ok"]),
+        "okcancel" => Some(&["ok", "cancel"]),
+        "yesno" => Some(&["yes", "no"]),
+        "yesnocancel" => Some(&["yes", "no", "cancel"]),
+        "retrycancel" => Some(&["retry", "cancel"]),
+        "abortretryignore" => Some(&["abort", "retry", "ignore"]),
+        _ => None,
+    }
+}
+
+/// The button a host that cannot show a dialog reports: `-default` when it
+/// names one of the type's buttons, else the type's leftmost button.
+pub fn default_message_box_button(request: &MessageBoxRequest) -> String {
+    let buttons = message_box_buttons(&request.kind).unwrap_or(&["ok"]);
+    let chosen = request.default.to_ascii_lowercase();
+    if buttons.iter().any(|name| *name == chosen) {
+        return chosen;
+    }
+    buttons[0].to_string()
+}
+
 thread_local! {
     /// A synchronous announcement of the Tk clipboard's text (the native
     /// backend pushes it onto the system clipboard).
@@ -4121,6 +4164,72 @@ thread_local! {
     /// this app does not own it (implemented by the native platform).
     static CLIPBOARD_GETTER: std::cell::Cell<Option<fn() -> String>> =
         const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// The backend's native modal dialog (`tk_messageBox`).
+    static MESSAGE_BOX: std::cell::Cell<Option<fn(&MessageBoxRequest) -> String>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Give `tk_messageBox` a native modal dialog.  The handler must block
+/// until the user answers and return one of the type's symbolic button
+/// names (see [`message_box_buttons`]); without one the default button is
+/// returned at once.
+pub fn set_message_box_handler(handler: fn(&MessageBoxRequest) -> String) {
+    MESSAGE_BOX.with(|cell| cell.set(Some(handler)));
+}
+
+fn message_box_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let mut request = MessageBoxRequest {
+        kind: "ok".to_string(),
+        ..MessageBoxRequest::default()
+    };
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        let Some(value) = args.get(index + 1) else {
+            return Err(wrong(
+                "tk_messageBox",
+                "?-option value ...?",
+                args.len() + 1,
+            ));
+        };
+        match option {
+            "-type" => request.kind = value.as_str().to_ascii_lowercase(),
+            "-message" => request.message = value.as_str().to_string(),
+            "-detail" => request.detail = value.as_str().to_string(),
+            "-title" => request.title = value.as_str().to_string(),
+            "-icon" => request.icon = value.as_str().to_string(),
+            "-default" => request.default = value.as_str().to_string(),
+            "-cancel" => request.cancel = value.as_str().to_string(),
+            "-parent" => request.parent = value.as_str().to_string(),
+            other => {
+                return Err(generic(format!(
+                    "bad option \"{other}\": must be -default, -detail, -icon, -message, -parent, -title, or -type"
+                )));
+            }
+        }
+        index += 2;
+    }
+    let Some(buttons) = message_box_buttons(&request.kind) else {
+        return Err(generic(format!(
+            "bad -type \"{}\": must be abortretryignore, ok, okcancel, retrycancel, yesno, or yesnocancel",
+            request.kind
+        )));
+    };
+    let fallback = default_message_box_button(&request);
+    let answer = MESSAGE_BOX
+        .with(|cell| cell.get())
+        .map(|handler| handler(&request))
+        .unwrap_or_else(|| fallback.clone())
+        .to_ascii_lowercase();
+    let answer = if buttons.iter().any(|name| *name == answer) {
+        answer
+    } else {
+        fallback
+    };
+    Ok(Value::from_str(&answer))
 }
 
 /// The backend's synchronous clipboard reader (Linux: a nested main
@@ -9972,6 +10081,7 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "image" => image_impl(interp, args),
         "clipboard" => clipboard_impl(interp, args),
         "selection" => selection_impl(interp, args),
+        "tk_messageBox" => message_box_impl(interp, args),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -10566,6 +10676,56 @@ mod tests {
             "selection handle -selection CLIPBOARD -type STRING . {}",
         );
         assert_eq!(eval(&mut i, "selection get -selection CLIPBOARD"), "sys");
+    }
+
+    static LAST_MESSAGE_BOX: std::sync::Mutex<Option<MessageBoxRequest>> =
+        std::sync::Mutex::new(None);
+
+    fn choose_no(request: &MessageBoxRequest) -> String {
+        *LAST_MESSAGE_BOX.lock().unwrap() = Some(request.clone());
+        "no".to_string()
+    }
+
+    #[test]
+    fn message_box_types_and_defaults() {
+        let mut i = Interp::new();
+        install(&mut i);
+        // Without a backend handler the default button is reported.
+        assert_eq!(eval(&mut i, "tk_messageBox -message hi"), "ok");
+        assert_eq!(eval(&mut i, "tk_messageBox -type yesno"), "yes");
+        assert_eq!(eval(&mut i, "tk_messageBox -type yesno -default no"), "no");
+        assert_eq!(
+            eval(&mut i, "tk_messageBox -type retrycancel -default cancel"),
+            "cancel"
+        );
+        assert_eq!(
+            eval(&mut i, "tk_messageBox -type abortretryignore"),
+            "abort"
+        );
+        assert!(i
+            .eval("tk_messageBox -type nope")
+            .is_err_and(|e| e.to_string().contains("bad -type")));
+        assert!(i
+            .eval("tk_messageBox -bogus x")
+            .is_err_and(|e| e.to_string().contains("bad option")));
+
+        // A host handler sees the parsed request and its answer wins.
+        set_message_box_handler(choose_no);
+        assert_eq!(
+            eval(
+                &mut i,
+                "tk_messageBox -type yesno -title T -message M -detail D -icon warning -default yes"
+            ),
+            "no"
+        );
+        let request = LAST_MESSAGE_BOX.lock().unwrap().take().unwrap();
+        assert_eq!(request.kind, "yesno");
+        assert_eq!(request.title, "T");
+        assert_eq!(request.message, "M");
+        assert_eq!(request.detail, "D");
+        assert_eq!(request.icon, "warning");
+        assert_eq!(request.default, "yes");
+        set_message_box_handler(|request| default_message_box_button(request));
     }
 
     #[test]

@@ -73,6 +73,97 @@ pub fn install_backend() {
     rtcl_tk_runtime::set_clipboard_sink(|text| set_clipboard(text));
     #[cfg(target_os = "linux")]
     rtcl_tk_runtime::set_clipboard_getter(nsh_platform_linux::clipboard_text_blocking);
+    #[cfg(target_os = "linux")]
+    rtcl_tk_runtime::set_message_box_handler(message_box_gtk);
+}
+
+/// `tk_messageBox` as a GTK modal alert.  The Tcl command blocks in a
+/// nested main context until the user answers (like Tk's modal dialogs).
+#[cfg(target_os = "linux")]
+fn message_box_gtk(request: &rtcl_tk_runtime::MessageBoxRequest) -> String {
+    let fallback = rtcl_tk_runtime::default_message_box_button(request);
+    if gtk4::init().is_err() {
+        return fallback;
+    }
+    let Some(buttons) = rtcl_tk_runtime::message_box_buttons(&request.kind) else {
+        return fallback;
+    };
+    let labels = buttons
+        .iter()
+        .map(|name| match *name {
+            "ok" => "OK",
+            "cancel" => "Cancel",
+            "yes" => "Yes",
+            "no" => "No",
+            "retry" => "Retry",
+            "abort" => "Abort",
+            other => other,
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let default_index = buttons
+        .iter()
+        .position(|name| *name == fallback)
+        .unwrap_or(0) as i32;
+    let cancel_index = buttons
+        .iter()
+        .position(|name| matches!(*name, "cancel" | "no"))
+        .map(|index| index as i32)
+        .unwrap_or(-1);
+    let mut message = if !request.message.is_empty() {
+        request.message.clone()
+    } else if !request.detail.is_empty() {
+        request.detail.clone()
+    } else {
+        " ".to_string()
+    };
+    // GTK's AlertDialog has no window title; Tk's -title goes above it.
+    if !request.title.is_empty() {
+        message = format!("{}\n\n{message}", request.title);
+    }
+    let mut builder = gtk4::AlertDialog::builder()
+        .modal(true)
+        .message(message)
+        .buttons(labels)
+        .default_button(default_index);
+    if !request.detail.is_empty() {
+        builder = builder.detail(request.detail.clone());
+    }
+    if cancel_index >= 0 {
+        builder = builder.cancel_button(cancel_index);
+    }
+    let dialog = builder.build();
+    let answer = std::rc::Rc::new(std::cell::Cell::new(None::<i32>));
+    let picked = answer.clone();
+    use gtk4::prelude::{Cast, WidgetExt};
+    let parent = gtk4::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk4::Window>().ok())
+        .find(|window| window.is_visible());
+    dialog.choose(
+        parent.as_ref(),
+        None::<&gtk4::gio::Cancellable>,
+        move |result| {
+            picked.set(Some(result.unwrap_or(-1)));
+        },
+    );
+    let context = gtk4::glib::MainContext::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while answer.get().is_none() && std::time::Instant::now() < deadline {
+        context.iteration(true);
+    }
+    match answer.get() {
+        Some(index) if index >= 0 && (index as usize) < buttons.len() => {
+            buttons[index as usize].to_string()
+        }
+        _ => {
+            if cancel_index >= 0 {
+                buttons[cancel_index as usize].to_string()
+            } else {
+                fallback
+            }
+        }
+    }
 }
 
 fn revision_signal() -> Signal<u64> {

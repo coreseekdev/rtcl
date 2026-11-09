@@ -189,7 +189,7 @@ radiobutton,scale,text,listbox,scrollbar,message,canvas}` 别名（ttk
 
 **命令**：`configure/cget/cget 前缀缩写/destroy/pack/grid/place/winfo/
 wm/tk/bind/bindtags/event generate/focus/raise/lower/font/option/bell/
-tk_focusNext/tk_focusPrev/menu/clipboard/selection`；控件子命令含 `invoke/get/insert/delete/
+tk_focusNext/tk_focusPrev/menu/clipboard/selection/tk_messageBox`；控件子命令含 `invoke/get/insert/delete/
 index/icursor/selection/size/curselection/step` 等；菜单子命令含
 `add/insert/delete/index/entrycget/entryconfigure/invoke/type/post/
 unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
@@ -360,7 +360,11 @@ rotation×10）；`event generate` 接受 `-x/-y/-rootx/-rooty/-key/-keysym/
 旋转/贝塞尔/箭头/虚线/图片/arc/polygon/锚点与 bbox/find 查询；
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
-`tk_messageBox` 未实现；`clipboard
+`tk_messageBox` 由宿主回调提供原生模态框：Linux 后端注册 GTK
+`AlertDialog`（Tcl 命令在嵌套主循环里阻塞到用户选择，`-type` 六种按钮组、
+`-default/-cancel` 映射默认/Escape，返回 ok/cancel/yes/no/retry/abort/ignore；
+GTK 无窗口标题，`-title` 折进正文首行，`-parent` 暂忽略）；无后端或
+GTK 初始化失败时立即返回默认按钮，便于 headless/非 Linux；`clipboard
 clear/append/get` 维护应用自己的文本并同步到系统剪贴板；应用未拥有剪贴板
 时 `get` 通过后端的同步 getter 读取系统剪贴板（Linux：GTK 异步读包在嵌套
 主循环里，1s 超时；其它平台未接 getter 时返回空）；`selection

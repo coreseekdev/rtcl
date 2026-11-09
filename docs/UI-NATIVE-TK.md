@@ -298,8 +298,12 @@ separator/chart 的空白区域、notebook 标签、combobox 箭头、treeview �
 rotation×10）；`event generate` 接受 `-x/-y/-rootx/-rooty/-key/-keysym/
 -keycode/-button/-state/-delta/-width/-height/-time/-serial/-sendevent/
 -detail/-mode/-focus/-count`；`event add/delete/info` 管理虚拟事件，
-物理事件会自动触发映射到它的 `<<Name>>` 绑定；`destroy` 按子→父派发
-`<Destroy>`，点击链支持 Double/Triple/Quadruple。`after` 由 `TkView` 的
+物理事件会自动触发映射到它的 `<<Name>>` 绑定；内置虚拟事件
+`<<Invoke>>`（按钮/check/radio 默认 `invoke`）、`<<ListboxSelect>>`、
+`<<TreeviewSelect>>`、`<<TreeviewOpen>>/<<TreeviewClose>>`、
+`<<ComboboxSelected>>`、`<<NotebookTabChanged>>` 在对应状态变化时自动
+派发；`destroy` 按子→父派发 `<Destroy>`，点击链支持
+Double/Triple/Quadruple。`after` 由 `TkView` 的
 16 ms interval 泵入，错误进 `take_errors()`。
 
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停

@@ -154,6 +154,7 @@ canvas .cv -width 240 -height 90 -background "#f8fafc"
 .cv create line 20 85 80 65 140 85 200 65 -fill "#111827" -width 2 -smooth bezier -dash {6 4} -arrow last
 .cv create polygon 175 86 195 58 220 86 -fill "#86efac" -outline "#166534"
 .cv create text 120 40 -text "Canvas"
+.cv create arc 96 22 144 58 -start 30 -extent 280 -style arc -outline "#7c3aed" -width 2
 .cv bind 1 <Button-1> {set ::canvas_hit 1}
 pack .cv -padx 8 -pady 4
 

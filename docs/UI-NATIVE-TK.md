@@ -203,13 +203,14 @@ DPI 缩放由 nsh 平台层负责。
 （`{DejaVu Sans} 12 bold`）；label/button/check/radio/message 应用
 family/size/bold（实际 DPI 缩放仍由 nsh 平台层负责）。
 
-**Canvas/图片/文本标签**：`canvas` 支持 `rectangle/oval/line/text/
+**Canvas/图片/文本标签**：`canvas` 支持 `rectangle/oval/arc/line/text/
 polygon/image` 的 `create/delete/coords/itemconfigure/itemcget/find/
-move/scale/raise/lower/bind/xview/yview`；`-scrollregion` + xview/yview
+move/scale/raise/lower/bind/xview/yview`；arc 的 `-start/-extent`
+（度，逆时针）与 `-style arc|pieslice|chord` 映射到椭圆弧路径；`-scrollregion` + xview/yview
 平移裁剪；item 或 tag 的 `<Button-1>` 绑定按命中项执行（近似 hit test）；
 `-angle` 旋转、line `-smooth true|bezier`（二次/三次贝塞尔）、`-dash`/
-`-dashoffset`、`-arrow first|last|both`、polygon `-fill/-outline`（闭合
-填充 + 描边）、image 项绘制图片。`delete` 与 `find` 接受 id、`all` 或
+`-dashoffset`（逐 item 重置，不会泄漏到后续 item）、`-arrow first|last|
+both`、polygon `-fill/-outline`（闭合填充 + 描边）、image 项绘制图片。`delete` 与 `find` 接受 id、`all` 或
 空格分隔的 `-tags`（`find withtag/withtags`），即按 tag 批量删/查；
 `find closest x y ?halo?`、`find overlapping x1 y1 x2 y2`、`bbox
 ?tagOrId ...?`（id/tag 的并集，按 Tk 向外取整）；`move/scale/coords/

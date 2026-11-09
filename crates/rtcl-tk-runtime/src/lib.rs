@@ -5468,7 +5468,7 @@ fn char_to_linecol(content: &str, index: usize) -> String {
 fn canvas_create(interp: &mut Interp, path: &str, kind: &str, rest: &[Value]) -> Result<Value> {
     if !matches!(
         kind,
-        "rectangle" | "oval" | "line" | "text" | "polygon" | "image"
+        "rectangle" | "oval" | "arc" | "line" | "text" | "polygon" | "image"
     ) {
         return Err(generic(format!(
             "unknown or unsupported canvas item type \"{kind}\""
@@ -7831,6 +7831,13 @@ mod tests {
         assert_eq!(eval(&mut i, &format!(".k bbox {img}")), "50 50 60 70");
         let label = eval(&mut i, ".k create text 30 40 -text ab");
         assert_eq!(eval(&mut i, &format!(".k bbox {label}")), "22 32 38 48");
+        let arc = eval(
+            &mut i,
+            ".k create arc 0 0 100 50 -start 0 -extent 180 -style arc -outline red",
+        );
+        assert_eq!(eval(&mut i, &format!(".k itemcget {arc} -style")), "arc");
+        assert_eq!(eval(&mut i, &format!(".k itemcget {arc} -extent")), "180");
+        assert_eq!(eval(&mut i, &format!(".k bbox {arc}")), "-1 -1 101 51");
     }
 
     #[test]

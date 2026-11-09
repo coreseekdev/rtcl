@@ -1780,6 +1780,9 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 {
                     continue;
                 }
+                // Painter state is shared across items: reset the dash so a
+                // dashed line does not leak into the following shapes.
+                painter = painter.line_dash(&[]).line_dash_offset(0.0f32);
                 let coords = &item.coords;
                 let option =
                     |name: &str| item.options.get(name).and_then(|value| parse_color(value));
@@ -1958,6 +1961,78 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                                 painter = painter.line_to(*x, *y);
                             }
                             painter = painter.close_path().stroke();
+                        }
+                    }
+                    "arc" if coords.len() >= 4 => {
+                        let cx = ((coords[0] + coords[2]) / 2.0) as f32;
+                        let cy = ((coords[1] + coords[3]) / 2.0) as f32;
+                        let rx = ((coords[2] - coords[0]) / 2.0).abs() as f32;
+                        let ry = ((coords[3] - coords[1]) / 2.0).abs() as f32;
+                        let start = item
+                            .options
+                            .get("-start")
+                            .and_then(|value| value.parse::<f32>().ok())
+                            .unwrap_or(0.0)
+                            .to_radians();
+                        let extent = item
+                            .options
+                            .get("-extent")
+                            .and_then(|value| value.parse::<f32>().ok())
+                            .unwrap_or(90.0)
+                            .to_radians();
+                        let style = item
+                            .options
+                            .get("-style")
+                            .map_or("pieslice", String::as_str);
+                        // Tk angles go counterclockwise from 3 o'clock; the
+                        // canvas API measures clockwise in y-down coordinates.
+                        let theta = -start;
+                        let start_point = (cx + rx * theta.cos(), cy + ry * theta.sin());
+                        let (start_t, end_t) = (-start, -(start + extent));
+                        let arc_path = |painter: Painter| {
+                            painter.ellipse(
+                                Point::new(Points(cx), Points(cy)),
+                                Size::new(Points(rx), Points(ry)),
+                                Radians(0.0),
+                                Radians(start_t),
+                                Radians(end_t),
+                                extent > 0.0,
+                            )
+                        };
+                        let width = item
+                            .options
+                            .get("-width")
+                            .and_then(|value| value.parse::<f32>().ok())
+                            .unwrap_or(1.0);
+                        match style {
+                            "arc" => {
+                                if let Some(outline) = option("-outline") {
+                                    painter = arc_path(
+                                        painter
+                                            .stroke_color(outline.light)
+                                            .line_width(width)
+                                            .begin_path(),
+                                    )
+                                    .stroke();
+                                }
+                            }
+                            _ => {
+                                painter = if style == "chord" {
+                                    painter.begin_path().move_to(start_point.0, start_point.1)
+                                } else {
+                                    painter.begin_path().move_to(cx, cy)
+                                };
+                                painter = arc_path(painter).close_path();
+                                if let Some(fill) = option("-fill") {
+                                    painter = painter.fill_color(fill.light).fill();
+                                }
+                                if let Some(outline) = option("-outline") {
+                                    painter = painter
+                                        .stroke_color(outline.light)
+                                        .line_width(width)
+                                        .stroke();
+                                }
+                            }
                         }
                     }
                     "oval" if coords.len() >= 4 => {

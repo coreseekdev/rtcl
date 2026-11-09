@@ -74,6 +74,8 @@ pub struct TkRuntime {
     image_seq: u64,
     /// Canvas item models.
     canvases: BTreeMap<String, CanvasState>,
+    /// Persisted rich-text documents (ProseMirror JSON) of `text` widgets.
+    rich_docs: BTreeMap<String, String>,
 }
 
 /// A canvas's items.
@@ -833,6 +835,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "see" => Ok(Value::empty()),
                 "mark" => Ok(Value::empty()),
                 "tag" => text_tag_command(interp, path, &args[2..]),
+                "getdoc" => Ok(Value::from_str(&rich_doc(path).unwrap_or_default())),
                 "edit" => Ok(Value::empty()),
                 "xview" | "yview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
@@ -5410,6 +5413,21 @@ pub fn canvas_press(path: &str, x: f64, y: f64) {
     run_binding(path, "<Button-1>", &ctx);
 }
 
+/// A text widget's persisted rich document (ProseMirror JSON), if any.
+pub fn rich_doc(path: &str) -> Option<String> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| rt.rich_docs.get(path).cloned()).flatten()
+}
+
+/// Store a text widget's rich document as data (not Tk tags).
+pub fn set_rich_doc(path: &str, json: String) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    with_state_mut(interp, |rt| {
+        rt.rich_docs.insert(path.to_string(), json);
+    });
+}
+
 /// A text widget's tags (name, options, character ranges).
 pub fn text_tags(path: &str) -> Vec<TextTagView> {
     let Some(ptr) = active_interp() else {
@@ -6342,6 +6360,9 @@ mod tests {
         assert_eq!(text_tags(".t").len(), 1);
         text_changed(".t", "hello brave world");
         assert_eq!(text_tags(".t")[0].ranges, vec![(0, 5)]);
+        assert_eq!(eval(&mut i, ".t getdoc"), "");
+        set_rich_doc(".t", "{\"type\":\"doc\"}".to_string());
+        assert_eq!(eval(&mut i, ".t getdoc"), "{\"type\":\"doc\"}");
         assert_eq!(eval(&mut i, ".t tag names 1.2"), "strong");
         assert_eq!(eval(&mut i, ".t tag names 1.7"), "");
         assert_eq!(eval(&mut i, ".t tag cget strong -foreground"), "red");

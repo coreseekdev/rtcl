@@ -20,8 +20,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use nsh_base::rich_editor::{
-    commands::base_keymap,
-    extensions::{history::history, keymap::keymap, starter},
+    extensions::starter,
     model::Schema,
     state::{EditorState, EditorStateConfig},
     view::{rich_editor, EditorSession, NodeViews, PartStyles, RichEditorStyles},
@@ -402,6 +401,110 @@ fn wysiwyg_session(content: &str, tags: &[rtcl_tk_runtime::TextTagView]) -> Opti
     Some(EditorSession::new(state, NodeViews::new()))
 }
 
+fn wysiwyg_session_from_doc(json: &str) -> Option<(EditorSession, String)> {
+    let schema = wysiwyg_schema();
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let doc = schema.node_from_json(&value).ok()?;
+    let plugins = starter::plugins(&schema);
+    let state =
+        EditorState::create(EditorStateConfig::new(schema).doc(doc).plugins(plugins)).ok()?;
+    let session = EditorSession::new(state, NodeViews::new());
+    let state = session.state();
+    let doc = state.doc();
+    let text = doc.text_between(0, doc.content().size(), Some("\n"), None);
+    Some((session, text))
+}
+
+fn collect_doc_marks(
+    value: &serde_json::Value,
+    marks: &mut BTreeMap<String, nsh_core::element::Style>,
+) {
+    if let Some(items) = value.get("content").and_then(|v| v.as_array()) {
+        for item in items {
+            if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                if let Some(list) = item.get("marks").and_then(|v| v.as_array()) {
+                    for mark in list {
+                        let kind = mark.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if kind == "bold" {
+                            let style =
+                                nsh_core::element::Style::from_decls([nsh_core::StyleDecl::Set(
+                                    nsh_core::StyleKey::FontWeight,
+                                    nsh_core::PropertyValue::FontWeight(Some(700)),
+                                )]);
+                            marks.insert("bold".to_string(), style);
+                        }
+                        if kind == "textStyle" {
+                            let attrs = mark.get("attrs").and_then(|v| v.as_object());
+                            let Some(attrs) = attrs else { continue };
+                            if let Some(color) = attrs.get("color").and_then(|v| v.as_str()) {
+                                if !color.is_empty() {
+                                    if let Some(parsed) = parse_color(color) {
+                                        let style = nsh_core::element::Style::from_decls([
+                                            nsh_core::StyleDecl::Set(
+                                                nsh_core::StyleKey::Color,
+                                                nsh_core::PropertyValue::Color(Some(
+                                                    nsh_core::Color::from(parsed.light),
+                                                )),
+                                            ),
+                                        ]);
+                                        marks.insert(format!("textStyle[color={color}]"), style);
+                                    }
+                                }
+                            }
+                            if let Some(color) =
+                                attrs.get("backgroundColor").and_then(|v| v.as_str())
+                            {
+                                if !color.is_empty() {
+                                    if let Some(parsed) = parse_color(color) {
+                                        let style = nsh_core::element::Style::from_decls([
+                                            nsh_core::StyleDecl::Set(
+                                                nsh_core::StyleKey::BackgroundColor,
+                                                nsh_core::PropertyValue::Color(Some(
+                                                    nsh_core::Color::from(parsed.light),
+                                                )),
+                                            ),
+                                        ]);
+                                        marks.insert(
+                                            format!("textStyle[backgroundColor={color}]"),
+                                            style,
+                                        );
+                                    }
+                                }
+                            }
+                            if let Some(size) = attrs.get("fontSize").and_then(|v| v.as_str()) {
+                                if let Some(points) =
+                                    size.strip_suffix("px").and_then(|v| v.parse::<f32>().ok())
+                                {
+                                    let style = nsh_core::element::Style::from_decls([
+                                        nsh_core::StyleDecl::Set(
+                                            nsh_core::StyleKey::FontSize,
+                                            nsh_core::PropertyValue::OptPoints(Some(Points(
+                                                points,
+                                            ))),
+                                        ),
+                                    ]);
+                                    marks.insert(format!("textStyle[fontSize={size}]"), style);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            collect_doc_marks(item, marks);
+        }
+    }
+}
+
+fn wysiwyg_styles_from_doc(json: &str) -> RichEditorStyles {
+    let mut marks = BTreeMap::new();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+        collect_doc_marks(&value, &mut marks);
+    }
+    let mut styles = RichEditorStyles::default();
+    styles.marks = Some(PartStyles(marks));
+    styles
+}
+
 fn wysiwyg_styles(tags: &[rtcl_tk_runtime::TextTagView]) -> RichEditorStyles {
     let mut marks = BTreeMap::new();
     for tag in tags {
@@ -448,14 +551,39 @@ fn wysiwyg_styles(tags: &[rtcl_tk_runtime::TextTagView]) -> RichEditorStyles {
 fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagView]) -> AnyElement {
     let content = rtcl_tk_runtime::text_value(path);
     let signature = tags_signature(tags);
-    let session = WYSIWYG.with(|map| {
+    let cached = rtcl_tk_runtime::rich_doc(path);
+    let built = WYSIWYG.with(|map| {
         let mut map = map.borrow_mut();
         if let Some(entry) = map.get(path) {
             if entry.content == content && entry.signature == signature {
-                return Some(entry.session.clone());
+                let styles = match &cached {
+                    Some(json) => wysiwyg_styles_from_doc(json),
+                    None => wysiwyg_styles(tags),
+                };
+                return Some((entry.session.clone(), styles));
+            }
+        }
+        // The rich document is the data: prefer it when its text matches.
+        if let Some(json) = &cached {
+            if let Some((session, text)) = wysiwyg_session_from_doc(json) {
+                if text == content {
+                    let styles = wysiwyg_styles_from_doc(json);
+                    map.insert(
+                        path.to_string(),
+                        WysiwygEntry {
+                            content,
+                            signature,
+                            session: session.clone(),
+                        },
+                    );
+                    return Some((session, styles));
+                }
             }
         }
         let session = wysiwyg_session(&content, tags)?;
+        let json = serde_json::to_string(&session.state().doc().to_json()).ok()?;
+        rtcl_tk_runtime::set_rich_doc(path, json);
+        let styles = wysiwyg_styles(tags);
         map.insert(
             path.to_string(),
             WysiwygEntry {
@@ -464,12 +592,11 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                 session: session.clone(),
             },
         );
-        Some(session)
+        Some((session, styles))
     });
-    let Some(session) = session else {
+    let Some((session, styles)) = built else {
         return render_rich_text(tree, path, tags);
     };
-    let styles = wysiwyg_styles(tags);
     let change_path = path.to_string();
     let change_session = session.clone();
     let height = option(tree, path, "-height")
@@ -488,6 +615,9 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                     let state = change_session.state();
                     let doc = state.doc();
                     let text = doc.text_between(0, doc.content().size(), Some("\n"), None);
+                    if let Ok(json) = serde_json::to_string(&doc.to_json()) {
+                        rtcl_tk_runtime::set_rich_doc(&change_path, json);
+                    }
                     rtcl_tk_runtime::text_changed_editor(&change_path, &text);
                     let tags_now = rtcl_tk_runtime::text_tags(&change_path);
                     let signature = tags_signature(&tags_now);
@@ -1192,7 +1322,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
         }
         WidgetKind::Text => {
             let tags = rtcl_tk_runtime::text_tags(path);
-            if !tags.is_empty() {
+            if !tags.is_empty() || rtcl_tk_runtime::rich_doc(path).is_some() {
                 return render_wysiwyg(tree, path, &tags);
             }
             let path = path.to_string();

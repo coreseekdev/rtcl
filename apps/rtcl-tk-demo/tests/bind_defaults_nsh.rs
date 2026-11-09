@@ -489,6 +489,31 @@ fn rich_text_tag_bindings_fire_on_press() {
         .expect("the tag's <Enter> binding fired");
 }
 
+const PANEDWINDOW_APP: &str = r##"
+ttk::panedwindow .p -orient horizontal -width 300 -height 120
+label .p.left -text "Left pane"
+label .p.right -text "Right pane"
+.p add .p.left .p.right
+pack .p -fill both -expand 1
+"##;
+
+#[component]
+fn PanedwindowApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(PANEDWINDOW_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn panedwindow_renders_its_panes() {
+    let mut config = EngineConfig::new(Root::of::<PanedwindowApp>());
+    config.environment.os = nsh_core::platform::Os::Linux;
+    let mut app = Headless::start(config).expect("headless engine starts");
+    app.set_viewport(Size::new(Points(600.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("Left pane").expect("the first pane renders");
+    app.wait_for("Right pane").expect("the second pane renders");
+}
+
 const MENUBUTTON_APP: &str = r##"
 set ::choice none
 set ::bold 0

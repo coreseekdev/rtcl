@@ -62,6 +62,13 @@ pack .qty -fill x -padx 12 -pady 4
 tk_optionMenu .sort ::sort Name Size Date
 pack .sort -padx 12 -pady 4 -anchor w
 
+ttk::panedwindow .split -orient horizontal
+frame .split.left; frame .split.right
+label .split.left.t -text "Left pane"; pack .split.left.t
+label .split.right.t -text "Right pane"; pack .split.right.t
+.split add .split.left .split.right
+pack .split -fill x -padx 12 -pady 4
+
 listbox .colors -height 3
 pack .colors -fill x -padx 12 -pady 4
 .colors insert end Red Green Blue

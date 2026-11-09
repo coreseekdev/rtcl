@@ -183,7 +183,7 @@ M1a/M1b/M2 已完成：
 checkbutton/radiobutton/scale/text/listbox/message/scrollbar` + `ttk::{separator,
 progressbar,notebook,combobox,treeview,labelframe,button,menubutton,label,
 entry,spinbox,frame,checkbutton,radiobutton,scale,text,listbox,scrollbar,
-message,canvas,sizegrip}` 别名（ttk
+message,canvas,sizegrip,panedwindow}` 别名（ttk
 创建的控件带 Tk 的 T* 类名，如 `ttk::button` → `TButton`，因此
 `bindtags`/`bind TButton`/`winfo class` 与 tkinter 一致）；扩展
 `::rtcl::chart`（原生柱状图，`-values/-labels/-title/-width/-height`）。
@@ -208,6 +208,13 @@ command/checkbutton/radiobutton/separator/cascade 菜单项可选中并触发；
 
 **sizegrip**：`ttk::sizegrip`（`TSizegrip`）渲染右下角三角握把，无交互
 （窗口缩放由窗口管理器负责）。
+
+**panedwindow**：`panedwindow`/`ttk::panedwindow`（类名 `Panedwindow`/
+`TPanedwindow`），`add/insert/forget/panes/pane/paneconfigure/panecget/
+sashpos/sash/identify/state/instate`；`-orient` 决定 nsh
+`h_resizable/v_resizable` 分组，分栏用原生可拖动 sash，pane 的
+`-minsize/-width` 映射到 panel min_size/size；`-weight/-hide` 接受但暂不
+改变布局；classic 的 `-sashwidth/-sashrelief` 与 ttk 的 style 选项都接受。
 
 **spinbox**：`spinbox`/`ttk::spinbox`（类名 `Spinbox`/`TSpinbox`），
 子命令 `get/set/insert/delete/index/icursor/selection/validate/xview`；

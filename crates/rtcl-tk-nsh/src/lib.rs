@@ -28,7 +28,10 @@ use nsh_base::rich_editor::{
         RichEditorSelection, RichEditorStyles,
     },
 };
-use nsh_base::{menu, menu_item, menu_separator, submenu, SliderValue};
+use nsh_base::{
+    h_resizable, menu, menu_item, menu_separator, resizable_panel, submenu, v_resizable,
+    SliderValue,
+};
 use nsh_core::canvas::{CanvasTextAlign, CanvasTextBaseline};
 use nsh_core::element::desktop;
 use nsh_core::geometry::{Axis, Point, Radians, Size};
@@ -1834,6 +1837,50 @@ fn menubutton_menu_items(menu_path: &str) -> Vec<AnyElement> {
     items
 }
 
+/// A `panedwindow`: nsh resizable panels, one per pane, split by sashes.
+fn render_panedwindow(tree: &TkTree, path: &str) -> AnyElement {
+    let horizontal = option(tree, path, "-orient") == "horizontal";
+    let height = option(tree, path, "-height")
+        .parse::<f32>()
+        .ok()
+        .filter(|height| *height > 0.0)
+        .unwrap_or(200.0);
+    let mut group = if horizontal {
+        h_resizable()
+    } else {
+        v_resizable()
+    };
+    group = group.handle_style(move |s| {
+        if horizontal {
+            s.w(px(4.0)).bg(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+        } else {
+            s.h(px(4.0)).bg(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+        }
+    });
+    for pane in rtcl_tk_runtime::paned_panes(path).unwrap_or_default() {
+        let mut panel = resizable_panel().min_size(px(1.0));
+        if let Some(minsize) = pane
+            .options
+            .get("-minsize")
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|size| *size > 0.0)
+        {
+            panel = panel.min_size(px(minsize));
+        }
+        if let Some(width) = pane
+            .options
+            .get("-width")
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|size| *size > 0.0)
+        {
+            panel = panel.size(Some(px(width)));
+        }
+        panel = panel.child(render_node(tree, &pane.path));
+        group = group.child(panel);
+    }
+    view().w_full().h(px(height)).child(group).into_element()
+}
+
 /// A `menubutton`: a button that posts its `-menu` (nsh's menu component
 /// positions the dropdown and closes it on an outside press or Escape).
 fn render_menubutton(tree: &TkTree, path: &str) -> AnyElement {
@@ -2093,6 +2140,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .into_element()
         }
         WidgetKind::Menubutton => render_menubutton(tree, path),
+        WidgetKind::Panedwindow => render_panedwindow(tree, path),
         WidgetKind::Sizegrip => view()
             .w(px(14.0))
             .h(px(14.0))

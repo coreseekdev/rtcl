@@ -55,6 +55,8 @@ pub struct TkRuntime {
     option_db: Vec<(String, String)>,
     /// `menu` windows, which are not part of the packed widget tree.
     menus: BTreeMap<String, Menu>,
+    /// Pane lists of each `panedwindow`.
+    paned: BTreeMap<String, Vec<PanedPane>>,
     /// The open cascade menu (`None` when no menu is dropped down).
     open_menu: Option<String>,
     /// Selected page index of each `ttk::notebook`.
@@ -217,6 +219,14 @@ pub struct MenuItem {
     /// `command`, `separator`, `checkbutton`, `radiobutton`, `cascade`.
     pub kind: String,
     /// Entry options (`-label`, `-command`, `-variable`, ...).
+    pub options: BTreeMap<String, String>,
+}
+
+/// One pane of a `panedwindow`.
+#[derive(Debug, Clone, Default)]
+pub struct PanedPane {
+    pub path: String,
+    /// Pane options (`-minsize`, `-width`, `-weight`, `-stretch`, ...).
     pub options: BTreeMap<String, String>,
 }
 
@@ -483,6 +493,8 @@ pub fn install(interp: &mut Interp) {
         "ttk::labelframe",
         "sizegrip",
         "ttk::sizegrip",
+        "panedwindow",
+        "ttk::panedwindow",
         "chart",
         "::rtcl::chart",
         "canvas",
@@ -680,6 +692,7 @@ fn ttk_class(base: &str) -> Option<&'static str> {
     Some(match base {
         "button" => "TButton",
         "menubutton" => "TMenubutton",
+        "panedwindow" => "TPanedwindow",
         "checkbutton" => "TCheckbutton",
         "radiobutton" => "TRadiobutton",
         "entry" => "TEntry",
@@ -1044,6 +1057,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "xview" | "yview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
+            WidgetKind::Panedwindow => panedwindow_command(interp, path, &args[1..]),
             WidgetKind::Listbox => match sub {
                 "insert" => {
                     if args.len() < 4 {
@@ -1976,6 +1990,10 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
             rt.text_modified.remove(p);
             rt.rich_docs.remove(p);
             rt.text_undo.remove(p);
+            rt.paned.remove(p);
+            for panes in rt.paned.values_mut() {
+                panes.retain(|pane| pane.path != *p);
+            }
             let prefix = format!("{p}.");
             let menus = rt
                 .menus
@@ -2451,6 +2469,11 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
                 }
             }
             WidgetKind::Sizegrip => (14, 14),
+            WidgetKind::Panedwindow => {
+                let width = opt("-width").parse::<i64>().unwrap_or(0);
+                let height = opt("-height").parse::<i64>().unwrap_or(0);
+                (width.max(200), height.max(160))
+            }
             WidgetKind::Progressbar => {
                 let length = opt("-length").parse::<i64>().unwrap_or(100);
                 if opt("-orient") == "horizontal" {
@@ -4167,6 +4190,224 @@ fn option_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "readfile" => Ok(Value::empty()),
         other => Err(generic(format!("bad option \"{other}\""))),
+    }
+}
+
+/// The panes of a `panedwindow` (for the renderer).
+pub fn paned_panes(path: &str) -> Option<Vec<PanedPane>> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| rt.paned.get(path).cloned()).flatten()
+}
+
+fn panedwindow_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong("panedwindow", "option ?arg ...?", rest.len() + 2));
+    }
+    let sub = rest[0].as_str();
+    let mut parse_add = |tokens: &[Value]| -> Result<(Vec<String>, BTreeMap<String, String>)> {
+        let mut children = Vec::new();
+        let mut options = BTreeMap::new();
+        let mut index = 0;
+        while index < tokens.len() {
+            let token = tokens[index].as_str();
+            if token.starts_with('-') {
+                let Some(value) = tokens.get(index + 1) else {
+                    return Err(wrong(
+                        "panedwindow add",
+                        "window ?-option value ...?",
+                        tokens.len(),
+                    ));
+                };
+                options.insert(token.to_string(), value.as_str().to_string());
+                index += 2;
+            } else {
+                children.push(token.to_string());
+                index += 1;
+            }
+        }
+        Ok((children, options))
+    };
+    match sub {
+        "add" | "insert" => {
+            let (at, tokens) = if sub == "insert" {
+                let Some(position) = rest.get(1) else {
+                    return Err(wrong("insert", "index window ?-option value ...?", rest.len() + 2));
+                };
+                (Some(position.as_str().to_string()), &rest[2..])
+            } else {
+                (None, &rest[1..])
+            };
+            let (children, options) = parse_add(tokens)?;
+            if children.is_empty() {
+                return Err(wrong(sub, "window ?-option value ...?", rest.len() + 2));
+            }
+            for child in &children {
+                let parent = with_state(interp, |rt| {
+                    rt.tree.get(child).and_then(|node| node.parent.clone())
+                })
+                .flatten();
+                if parent.as_deref() != Some(path) {
+                    return Err(generic(format!(
+                        "can't add \"{child}\" as a pane: not a child of \"{path}\""
+                    )));
+                }
+            }
+            with_state_mut(interp, |rt| {
+                let panes = rt.paned.entry(path.to_string()).or_default();
+                let mut insert_at = match at.as_deref() {
+                    Some("end") | None => panes.len(),
+                    Some(index) => index.parse::<usize>().unwrap_or(panes.len()).min(panes.len()),
+                };
+                for child in children {
+                    panes.retain(|pane| pane.path != child);
+                    let pane = PanedPane {
+                        path: child,
+                        options: options.clone(),
+                    };
+                    let position = insert_at.min(panes.len());
+                    panes.insert(position, pane);
+                    insert_at = position + 1;
+                }
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "forget" => {
+            if rest.len() < 2 {
+                return Err(wrong("forget", "window ?window ...?", rest.len() + 2));
+            }
+            let children = rest[1..]
+                .iter()
+                .map(|value| value.as_str().to_string())
+                .collect::<Vec<_>>();
+            with_state_mut(interp, |rt| {
+                if let Some(panes) = rt.paned.get_mut(path) {
+                    panes.retain(|pane| !children.contains(&pane.path));
+                    rt.bump();
+                }
+            });
+            Ok(Value::empty())
+        }
+        "panes" => {
+            let panes = with_state(interp, |rt| {
+                rt.paned
+                    .get(path)
+                    .map(|panes| panes.iter().map(|pane| pane.path.clone()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+            Ok(list_value(panes))
+        }
+        "pane" | "paneconfigure" => {
+            if rest.len() < 2 {
+                return Err(wrong("pane", "window ?-option? ?value ...?", rest.len() + 2));
+            }
+            let child = rest[1].as_str().to_string();
+            let existing = with_state(interp, |rt| {
+                rt.paned
+                    .get(path)
+                    .and_then(|panes| panes.iter().find(|pane| pane.path == child))
+                    .map(|pane| pane.options.clone())
+            })
+            .flatten();
+            let Some(mut options) = existing else {
+                return Err(generic(format!("\"{child}\" is not a pane of \"{path}\"")));
+            };
+            if rest.len() == 2 {
+                return Ok(list_value(
+                    options
+                        .iter()
+                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            if rest.len() == 3 {
+                return Ok(Value::from_str(
+                    options.get(rest[2].as_str()).map(String::as_str).unwrap_or("0"),
+                ));
+            }
+            for pair in rest[2..].chunks(2) {
+                if let Some(value) = pair.get(1) {
+                    options.insert(pair[0].as_str().to_string(), value.as_str().to_string());
+                }
+            }
+            with_state_mut(interp, |rt| {
+                if let Some(pane) = rt
+                    .paned
+                    .get_mut(path)
+                    .and_then(|panes| panes.iter_mut().find(|pane| pane.path == child))
+                {
+                    pane.options = options;
+                    rt.bump();
+                }
+            });
+            Ok(Value::empty())
+        }
+        "panecget" => {
+            if rest.len() != 3 {
+                return Err(wrong("panecget", "window option", rest.len() + 2));
+            }
+            let value = with_state(interp, |rt| {
+                rt.paned
+                    .get(path)
+                    .and_then(|panes| panes.iter().find(|pane| pane.path == rest[1].as_str()))
+                    .and_then(|pane| pane.options.get(rest[2].as_str()).cloned())
+            })
+            .flatten()
+            .unwrap_or_else(|| "0".to_string());
+            Ok(Value::from_str(&value))
+        }
+        "sashpos" => {
+            if rest.len() < 2 || rest.len() > 3 {
+                return Err(wrong("sashpos", "index ?newpos?", rest.len() + 2));
+            }
+            // Without laid-out pixel sizes the sash sits at the widths the
+            // panes asked for; setting records the width.
+            if rest.len() == 3 {
+                let index = rest[1].as_str().parse::<usize>().unwrap_or(0);
+                let position = rest[2].as_str();
+                with_state_mut(interp, |rt| {
+                    if let Some(pane) = rt.paned.get_mut(path).and_then(|panes| panes.get_mut(index)) {
+                        pane.options
+                            .insert("-width".to_string(), position.to_string());
+                        rt.bump();
+                    }
+                });
+                return Ok(Value::from_int(0));
+            }
+            let position = with_state(interp, |rt| {
+                let index = rest[1].as_str().parse::<usize>().unwrap_or(0);
+                rt.paned
+                    .get(path)
+                    .map(|panes| {
+                        panes
+                            .iter()
+                            .take(index)
+                            .filter_map(|pane| {
+                                pane.options
+                                    .get("-width")
+                                    .and_then(|width| width.parse::<i64>().ok())
+                            })
+                            .sum::<i64>()
+                    })
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+            Ok(Value::from_int(position))
+        }
+        "sash" | "proxy" => Ok(Value::empty()),
+        "identify" => Ok(Value::from_str("")),
+        "state" => {
+            if rest.len() == 1 {
+                Ok(Value::from_str("normal"))
+            } else {
+                Ok(Value::empty())
+            }
+        }
+        "instate" => Ok(Value::from_int(1)),
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be add, forget, identify, insert, pane, panes, sash, or sashpos"
+        ))),
     }
 }
 
@@ -11430,6 +11671,32 @@ mod tests {
             ),
             "05"
         );
+    }
+
+    #[test]
+    fn panedwindow_panes_and_options() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "ttk::panedwindow .p -orient horizontal;             label .p.a -text A; label .p.b -text B;             .p add .p.a .p.b",
+        );
+        assert_eq!(eval(&mut i, "winfo class .p"), "TPanedwindow");
+        assert_eq!(eval(&mut i, ".p panes"), ".p.a .p.b");
+        eval(&mut i, ".p pane .p.a -minsize 20");
+        assert_eq!(eval(&mut i, ".p pane .p.a -minsize"), "20");
+        assert_eq!(eval(&mut i, ".p panecget .p.a -minsize"), "20");
+        eval(&mut i, "label .p.c -text C; .p insert 0 .p.c");
+        assert_eq!(eval(&mut i, ".p panes"), ".p.c .p.a .p.b");
+        assert_eq!(eval(&mut i, ".p sashpos 1"), "0");
+        eval(&mut i, ".p sashpos 0 30");
+        assert_eq!(eval(&mut i, ".p panecget .p.c -width"), "30");
+        eval(&mut i, ".p forget .p.a");
+        assert_eq!(eval(&mut i, ".p panes"), ".p.c .p.b");
+        assert!(i.eval("label .other -text X; .p add .other").is_err());
+        eval(&mut i, "panedwindow .q; label .q.a -text A; .q add .q.a");
+        assert_eq!(eval(&mut i, "winfo class .q"), "Panedwindow");
+        assert_eq!(eval(&mut i, ".q panes"), ".q.a");
     }
 
     #[test]

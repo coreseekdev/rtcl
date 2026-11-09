@@ -51,6 +51,8 @@ pub enum WidgetKind {
     Canvas,
     /// `ttk::sizegrip`: the resize grip in a window's corner.
     Sizegrip,
+    /// `panedwindow`: panes split by draggable sashes.
+    Panedwindow,
 }
 
 impl WidgetKind {
@@ -79,6 +81,7 @@ impl WidgetKind {
             "chart" => Self::Chart,
             "canvas" => Self::Canvas,
             "sizegrip" => Self::Sizegrip,
+            "panedwindow" => Self::Panedwindow,
             _ => return None,
         })
     }
@@ -109,6 +112,7 @@ impl WidgetKind {
             Self::Chart => "Chart",
             Self::Canvas => "Canvas",
             Self::Sizegrip => "TSizegrip",
+            Self::Panedwindow => "Panedwindow",
         }
     }
 
@@ -879,6 +883,26 @@ const BUTTON_OPTIONS: &[&str] = &[
 
 const SIZEGRIP_OPTIONS: &[&str] = &["-cursor", "-style", "-takefocus"];
 
+const PANEDWINDOW_OPTIONS: &[&str] = &[
+    "-background",
+    "-borderwidth",
+    "-cursor",
+    "-handlepad",
+    "-handlesize",
+    "-height",
+    "-opaqueresize",
+    "-orient",
+    "-proxybackground",
+    "-proxyborderwidth",
+    "-proxyrelief",
+    "-relief",
+    "-sashrelief",
+    "-sashwidth",
+    "-showhandle",
+    "-style",
+    "-width",
+];
+
 const MENUBUTTON_OPTIONS: &[&str] = &[
     "-anchor",
     "-background",
@@ -1294,6 +1318,7 @@ pub fn known_options(kind: WidgetKind) -> &'static [&'static str] {
         WidgetKind::Chart => CHART_OPTIONS,
         WidgetKind::Canvas => CANVAS_OPTIONS,
         WidgetKind::Sizegrip => SIZEGRIP_OPTIONS,
+        WidgetKind::Panedwindow => PANEDWINDOW_OPTIONS,
     }
 }
 
@@ -1311,6 +1336,7 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
         "-padx" | "-pady" => "0",
         "-width" => match kind {
             WidgetKind::Entry | WidgetKind::Spinbox => "20",
+            WidgetKind::Panedwindow => "0",
             WidgetKind::Text => "80",
             WidgetKind::Listbox => "20",
             WidgetKind::Scale => "100",
@@ -1392,6 +1418,14 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
         "-indicatoron" => "1",
         "-menu" => "",
         "-direction" => "below",
+        "-sashwidth" => "3",
+        "-sashrelief" => "flat",
+        "-showhandle" => "0",
+        "-opaqueresize" => "1",
+        "-handlepad" => "8",
+        "-handlesize" => "8",
+        "-proxyborderwidth" => "2",
+        "-proxyrelief" => "raised",
         "-selectcolor" => "#b03060",
         "-selectimage" => "",
         "-class" => "Frame",

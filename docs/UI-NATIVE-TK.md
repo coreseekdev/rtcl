@@ -244,7 +244,9 @@ modified ?0|1?`/`edit reset` 维护未保存标记（undo/redo 暂为 no-op）�
 `text` 原生输入自带滚动。`see <index/item>` 让 listbox/treeview 以最小
 滚动量把目标行带入窗口。treeview 行标签：`tag configure/cget/names/
 has/delete` + `insert/item -tags`，`-foreground/-background` 覆盖整行
-颜色（选中色优先）。table 用 treeview columns 表达，log 用高行数
+颜色（选中色优先）；`column` 读写 `-width/-minwidth/-stretch/-anchor/
+-id`（默认 width 200），`-width` 同时作用于表头与单元格；`-columns`
+之外的 `-values` 不显示。table 用 treeview columns 表达，log 用高行数
 listbox 表达。
 
 **主题**：显式 `-background/-foreground`（`#rgb/#rrggbb` 与常用色名）

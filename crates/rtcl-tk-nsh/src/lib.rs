@@ -2235,16 +2235,27 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .px(px(6.0))
                 .py(px(3.0))
                 .bg(AdaptiveColor::rgb(0xe5e7eb, 0x374151));
+            let width_of = |column: &str| {
+                tv.column_options
+                    .get(column)
+                    .and_then(|options| options.get("-width"))
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .unwrap_or(200.0)
+            };
             header = header.child(
-                text(heading("#0", "Item"))
-                    .text_size(px(13.0))
-                    .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                view().w(px(width_of("#0"))).child(
+                    text(heading("#0", "Item"))
+                        .text_size(px(13.0))
+                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                ),
             );
             for column in &tv.columns {
                 header = header.child(
-                    text(heading(column, column))
-                        .text_size(px(13.0))
-                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                    view().w(px(width_of(column))).child(
+                        text(heading(column, column))
+                            .text_size(px(13.0))
+                            .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                    ),
                 );
             }
             let mut body = view().flex_col().w_full().gap_1().p(px(4.0));
@@ -2270,9 +2281,6 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     .any(|i| i.parent.as_deref() == Some(id.as_str()));
                 let selected = tv.selected.contains(&id);
                 let mut row = view().flex_row().w_full().items_center().gap_1();
-                if *depth > 0 {
-                    row = row.child(view().w(px(16.0 * *depth as f32)));
-                }
                 let mark = if has_children {
                     if item.open {
                         "▾ "
@@ -2297,24 +2305,37 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 }
                 let select_path = path.clone();
                 let select_id = id.clone();
-                let mut cells = view().flex_row().w_full().items_center().gap_2();
-                cells = cells.child(
-                    text(mark.to_string())
-                        .text_size(px(12.0))
-                        .text_color(AdaptiveColor::rgb(0x2563eb, 0x60a5fa)),
-                );
+                let mut cells = view().flex_row().w_full().items_center().gap_1();
                 let text_color = row_fg.unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
-                cells = cells.child(
-                    text(item.text.clone())
-                        .text_size(px(13.0))
-                        .text_color(text_color),
-                );
-                for value in &item.values {
-                    let value_color = row_fg.unwrap_or(AdaptiveColor::rgb(0x4b5563, 0xd1d5db));
-                    cells = cells.child(
-                        text(value.clone())
+                let mut first_cell = view()
+                    .w(px(width_of("#0")))
+                    .flex_row()
+                    .items_center()
+                    .gap_1();
+                if *depth > 0 {
+                    first_cell = first_cell.child(view().w(px(16.0 * *depth as f32)));
+                }
+                first_cell = first_cell
+                    .child(
+                        text(mark.to_string())
+                            .text_size(px(12.0))
+                            .text_color(AdaptiveColor::rgb(0x2563eb, 0x60a5fa)),
+                    )
+                    .child(
+                        text(item.text.clone())
                             .text_size(px(13.0))
-                            .text_color(value_color),
+                            .text_color(text_color),
+                    );
+                cells = cells.child(first_cell);
+                for (i, value) in item.values.iter().take(tv.columns.len()).enumerate() {
+                    let value_color = row_fg.unwrap_or(AdaptiveColor::rgb(0x4b5563, 0xd1d5db));
+                    let column = tv.columns.get(i).map_or("#0", String::as_str);
+                    cells = cells.child(
+                        view().w(px(width_of(column))).child(
+                            text(value.clone())
+                                .text_size(px(13.0))
+                                .text_color(value_color),
+                        ),
                     );
                 }
                 let button = nsh_base::button()

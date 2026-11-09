@@ -122,14 +122,18 @@ set ::size "Medium"
 ttk::combobox .cb -values {Small Medium Large} -textvariable ::size
 pack .cb -padx 8 -pady 4
 
-ttk::treeview .tv -columns {size} -height 3 -show {tree headings}
+ttk::treeview .tv -columns {size kind} -height 3 -show {tree headings}
 .tv heading #0 -text Folder
 .tv heading size -text Size
+.tv heading kind -text Kind
 .tv insert {} end -id root -text Project -open 1 -values {0 files}
 .tv insert root end -id src -text src -values {3 files}
 .tv insert root end -text README -values {1 file}
 .tv tag configure folder -foreground "#1d4ed8"
 .tv item root -tags {folder}
+.tv column #0 -width 160
+.tv column size -width 120
+.tv column kind -width 100
 pack .tv -fill x -padx 8 -pady 4
 
 ttk::separator .sep

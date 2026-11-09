@@ -166,6 +166,8 @@ pub struct TreeViewState {
     pub focus: Option<String>,
     /// Row tags (`tag configure`) and the items carrying them.
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
+    /// `column` options by column name (`#0` is the tree column).
+    pub column_options: BTreeMap<String, BTreeMap<String, String>>,
     next_id: u64,
 }
 
@@ -1416,7 +1418,8 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     }
                     Ok(Value::empty())
                 }
-                "column" | "xview" => Ok(Value::empty()),
+                "column" => treeview_column_command(interp, path, &args[2..]),
+                "xview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
             WidgetKind::Canvas => match sub {
@@ -4404,6 +4407,78 @@ fn treeview_insert(interp: &mut Interp, path: &str, parent: &str, rest: &[Value]
     })
     .ok_or_else(|| bad_window(path))??;
     Ok(Value::from_str(&result))
+}
+
+fn treeview_column_default(option: &str) -> &'static str {
+    match option {
+        "-width" => "200",
+        "-minwidth" => "20",
+        "-stretch" => "1",
+        "-anchor" => "w",
+        _ => "",
+    }
+}
+
+fn treeview_column_options(tv: &TreeViewState, column: &str) -> BTreeMap<String, String> {
+    let mut options = ["-width", "-minwidth", "-stretch", "-anchor", "-id"]
+        .into_iter()
+        .map(|name| (name.to_string(), treeview_column_default(name).to_string()))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(extra) = tv.column_options.get(column) {
+        options.extend(extra.clone());
+    }
+    options
+}
+
+fn treeview_column_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong(
+            "column",
+            "column ?-option? ?value ...?",
+            rest.len() + 2,
+        ));
+    }
+    let name = rest[0].as_str().to_string();
+    let tv = with_state(interp, |rt| rt.treeviews.get(path).cloned())
+        .flatten()
+        .ok_or_else(|| bad_window(path))?;
+    if name != "#0" && !tv.columns.iter().any(|column| column == &name) {
+        return Err(generic(format!("Column \"{name}\" not found")));
+    }
+    if rest.len() == 1 {
+        let options = treeview_column_options(&tv, &name);
+        return Ok(list_value(
+            options
+                .iter()
+                .flat_map(|(k, v)| [k.clone(), v.clone()])
+                .collect::<Vec<_>>(),
+        ));
+    }
+    if rest.len() == 2 && rest[1].as_str().starts_with('-') {
+        let options = treeview_column_options(&tv, &name);
+        return Ok(Value::from_str(
+            options.get(rest[1].as_str()).map_or("", String::as_str),
+        ));
+    }
+    let pairs = parse_pairs(rest, 1, "column")?;
+    for (option, _) in &pairs {
+        if !matches!(
+            option.as_str(),
+            "-width" | "-minwidth" | "-stretch" | "-anchor" | "-id"
+        ) {
+            return Err(generic(format!("unknown option \"{option}\"")));
+        }
+    }
+    with_state_mut(interp, |rt| {
+        if let Some(tv) = rt.treeviews.get_mut(path) {
+            tv.column_options
+                .entry(name.clone())
+                .or_default()
+                .extend(pairs);
+            rt.bump();
+        }
+    });
+    Ok(Value::empty())
 }
 
 fn treeview_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
@@ -7860,6 +7935,12 @@ mod tests {
         assert_eq!(eval(&mut i, ".tv parent src"), "root");
         assert_eq!(eval(&mut i, ".tv index src"), "0");
         assert_eq!(eval(&mut i, ".tv heading #0"), "Folder");
+        assert_eq!(eval(&mut i, ".tv column #0 -width"), "200");
+        assert_eq!(eval(&mut i, ".tv column size -anchor"), "w");
+        assert_eq!(eval(&mut i, ".tv column #0 -stretch"), "1");
+        eval(&mut i, ".tv column size -width 80");
+        assert_eq!(eval(&mut i, ".tv column size -width"), "80");
+        assert_eq!(eval(&mut i, "catch {.tv column nope}"), "1");
         eval(
             &mut i,
             ".tv tag configure hot -foreground red -background yellow",

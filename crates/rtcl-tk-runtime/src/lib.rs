@@ -59,6 +59,8 @@ pub struct TkRuntime {
     paned: BTreeMap<String, Vec<PanedPane>>,
     /// Embedded images per text widget (`text image create`).
     text_images: BTreeMap<String, BTreeMap<String, (usize, BTreeMap<String, String>)>>,
+    /// Embedded windows per text widget (`text window create`).
+    text_windows: BTreeMap<String, BTreeMap<String, (usize, BTreeMap<String, String>)>>,
     /// Laid-out pane sizes in points (from drags/resizes), by window.
     paned_sizes: BTreeMap<String, Vec<f64>>,
     /// `ttk::style configure` options, by style name.
@@ -1157,6 +1159,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 "mark" => text_mark_command(interp, path, &args[2..]),
                 "image" => text_image_command(interp, path, &args[2..]),
+                "window" => text_window_command(interp, path, &args[2..]),
                 "tag" => text_tag_command(interp, path, &args[2..]),
                 "getdoc" => Ok(Value::from_str(&rich_doc(path).unwrap_or_default())),
                 "setdoc" => {
@@ -2171,7 +2174,7 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
             rt.text_see.remove(p);
             rt.paned.remove(p);
             rt.paned_sizes.remove(p);
-            rt.text_images.remove(p);
+            rt.text_windows.remove(p);
             for panes in rt.paned.values_mut() {
                 panes.retain(|pane| pane.path != *p);
             }
@@ -11037,6 +11040,7 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
     });
     let (mut text, mut tags, mut dump_marks) = (false, false, false);
     let mut wanted_image = false;
+    let mut wanted_window = false;
     let mut any = false;
     let mut index = 0;
     while index < rest.len() && rest[index].as_str().starts_with('-') {
@@ -11051,6 +11055,7 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
             "-tag" => tags = true,
             "-mark" => dump_marks = true,
             "-image" => wanted_image = true,
+            "-window" => wanted_window = true,
             "-window" => {}
             other => {
                 return Err(generic(format!(
@@ -11065,6 +11070,7 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
         tags = true;
         dump_marks = true;
         wanted_image = true;
+        wanted_window = true;
     }
     if rest.len() < index + 1 || rest.len() > index + 2 {
         return Err(wrong(
@@ -11195,6 +11201,36 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
                     index,
                     2,
                     vec!["image".to_string(), name, char_to_linecol(&content, index)],
+                ));
+            }
+        }
+    }
+    if wanted_window {
+        let windows: Vec<(String, String)> = with_state(interp, |rt| {
+            rt.text_windows
+                .get(path)
+                .map(|windows| {
+                    windows
+                        .keys()
+                        .map(|name| (name.clone(), window_mark_name(name)))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+        for (name, mark) in windows {
+            let index = marks.get(&mark).map(|m| m.index);
+            let live = index
+                .and_then(|index| chars.get(index))
+                .is_some_and(|c| *c == WINDOW_CHAR);
+            if let Some(index) = index.filter(|_| live) {
+                if index < a || index > b {
+                    continue;
+                }
+                entries.push((
+                    index,
+                    2,
+                    vec!["window".to_string(), name, char_to_linecol(&content, index)],
                 ));
             }
         }
@@ -11477,6 +11513,170 @@ fn text_image_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result
                         images.remove(name);
                     }
                     let mark = image_mark_name(name);
+                    if let Some(marks) = rt.text_marks.get_mut(path) {
+                        marks.remove(&mark);
+                    }
+                    rt.bump();
+                });
+            }
+            Ok(Value::empty())
+        }
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be cget, configure, create, delete, or names"
+        ))),
+    }
+}
+
+const WINDOW_CHAR: char = '\u{FFFA}';
+
+fn window_mark_name(name: &str) -> String {
+    format!("\u{0}win:{name}")
+}
+
+/// `text window create/cget/configure/delete/names` — the same
+/// placeholder-character model as embedded images (U+FFFA).
+fn text_window_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong("window", "option ?arg ...?", rest.len() + 2));
+    }
+    let sub = rest[0].as_str().to_string();
+    let content = content_of(interp, path);
+    let windows_at = |interp: &Interp, name: &str| -> Option<(usize, BTreeMap<String, String>)> {
+        let mark = window_mark_name(name);
+        let (index, options) = with_state(interp, |rt| {
+            let index = rt
+                .text_marks
+                .get(path)
+                .and_then(|marks| marks.get(&mark))
+                .map(|m| m.index);
+            let options = rt
+                .text_windows
+                .get(path)
+                .and_then(|windows| windows.get(name))
+                .map(|(_, options)| options.clone());
+            Some((index?, options?))
+        })??;
+        let chars: Vec<char> = content.chars().collect();
+        chars.get(index).filter(|c| **c == WINDOW_CHAR)?;
+        Some((index, options))
+    };
+    match sub.as_str() {
+        "create" => {
+            let index = text_index(
+                rest.get(1).map(|v| v.as_str()).unwrap_or("end"),
+                &content,
+                0,
+                &text_marks(interp, path),
+            )?;
+            let mut options = BTreeMap::new();
+            let mut i = 2;
+            while i + 1 < rest.len() {
+                options.insert(
+                    rest[i].as_str().to_string(),
+                    rest[i + 1].as_str().to_string(),
+                );
+                i += 2;
+            }
+            let name = with_state_mut(interp, |rt| {
+                let windows = rt.text_windows.entry(path.to_string()).or_default();
+                let mut serial = windows.len() + 1;
+                while windows.contains_key(&format!("window{serial}")) {
+                    serial += 1;
+                }
+                let name = format!("window{serial}");
+                let mark = window_mark_name(&name);
+                rt.text_marks.entry(path.to_string()).or_default().insert(
+                    mark,
+                    TextMark {
+                        index,
+                        gravity: MarkGravity::Left,
+                    },
+                );
+                windows.insert(name.clone(), (index, options));
+                name
+            })
+            .unwrap_or_default();
+            text_insert(interp, path, index, &WINDOW_CHAR.to_string(), None)?;
+            Ok(Value::from_str(&name))
+        }
+        "names" => {
+            let names = with_state(interp, |rt| {
+                rt.text_windows
+                    .get(path)
+                    .map(|windows| windows.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+            let live: Vec<String> = names
+                .into_iter()
+                .filter(|name| windows_at(interp, name).is_some())
+                .collect();
+            Ok(list_value(live))
+        }
+        "cget" => {
+            if rest.len() != 3 {
+                return Err(wrong("window cget", "name -option", rest.len() + 2));
+            }
+            let value = windows_at(interp, rest[1].as_str())
+                .and_then(|(_, options)| options.get(rest[2].as_str()).cloned())
+                .unwrap_or_default();
+            Ok(Value::from_str(&value))
+        }
+        "configure" => {
+            if rest.len() < 2 {
+                return Err(wrong(
+                    "window configure",
+                    "name ?-option? ?value ...?",
+                    rest.len() + 2,
+                ));
+            }
+            let name = rest[1].as_str().to_string();
+            if rest.len() == 2 {
+                let pairs = windows_at(interp, &name)
+                    .map(|(_, options)| options)
+                    .unwrap_or_default();
+                return Ok(list_value(
+                    pairs
+                        .iter()
+                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            if rest.len() == 3 {
+                let value = windows_at(interp, &name)
+                    .and_then(|(_, options)| options.get(rest[2].as_str()).cloned())
+                    .unwrap_or_default();
+                return Ok(Value::from_str(&value));
+            }
+            for pair in rest[2..].chunks(2) {
+                if let Some(value) = pair.get(1) {
+                    let (option, value) =
+                        (pair[0].as_str().to_string(), value.as_str().to_string());
+                    with_state_mut(interp, |rt| {
+                        if let Some((_, options)) = rt
+                            .text_windows
+                            .get_mut(path)
+                            .and_then(|windows| windows.get_mut(&name))
+                        {
+                            options.insert(option, value);
+                            rt.bump();
+                        }
+                    });
+                }
+            }
+            Ok(Value::empty())
+        }
+        "delete" => {
+            for name in &rest[1..] {
+                let name = name.as_str();
+                if let Some((index, _)) = windows_at(interp, name) {
+                    text_delete_range(interp, path, index, index + 1);
+                }
+                with_state_mut(interp, |rt| {
+                    if let Some(windows) = rt.text_windows.get_mut(path) {
+                        windows.remove(name);
+                    }
+                    let mark = window_mark_name(name);
                     if let Some(marks) = rt.text_marks.get_mut(path) {
                         marks.remove(&mark);
                     }
@@ -13014,6 +13214,28 @@ mod tests {
         assert_eq!(eval(&mut i, ".b count 1.0 end"), "3");
         assert_eq!(eval(&mut i, ".b count -lines 1.0 end"), "2");
         assert_eq!(eval(&mut i, ".b get {end -1c} end"), "");
+    }
+
+    #[test]
+    fn text_window_model_and_dump() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "text .t; .t insert 1.0 hello");
+        eval(&mut i, "frame .f");
+        eval(&mut i, ".t window create 1.2 -window .f");
+        assert_eq!(eval(&mut i, ".t window names"), "window1");
+        assert_eq!(eval(&mut i, ".t window cget window1 -window"), ".f");
+        // The embedded window occupies one character (U+FFFA).
+        assert_eq!(eval(&mut i, ".t get 1.2"), "\u{fffa}");
+        assert_eq!(eval(&mut i, ".t index end"), "2.0");
+        assert_eq!(
+            eval(&mut i, ".t dump -window 1.0 end"),
+            "window window1 1.2"
+        );
+        eval(&mut i, ".t window delete window1");
+        assert_eq!(eval(&mut i, ".t window names"), "");
+        assert_eq!(eval(&mut i, ".t dump -window 1.0 end"), "");
+        assert_eq!(eval(&mut i, ".t get 1.0 end"), "hello");
     }
 
     #[test]

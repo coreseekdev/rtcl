@@ -423,7 +423,7 @@ pub fn TkView() -> impl IntoElement {
     start_event_pump();
     bind_default_keys();
     let revision = revision_signal();
-    if matches!(os(), nsh_core::platform::Os::MacOs) {
+    if native_menu_platform() {
         // Re-publish the Tk menu whenever the model changes, under the
         // component's owner so the handlers outlive dynamic re-renders.
         effect(move || {
@@ -440,7 +440,7 @@ pub fn TkView() -> impl IntoElement {
             match rtcl_tk_runtime::snapshot_active() {
                 Some(tree) => {
                     let mut column = view().flex_col().w_full().gap_2();
-                    let native = matches!(os(), nsh_core::platform::Os::MacOs);
+                    let native = native_menu_platform();
                     let bar = rtcl_tk_runtime::menu_bar();
                     if is_desktop() {
                         if let Some(title) = rtcl_tk_runtime::window_title() {
@@ -633,6 +633,22 @@ thread_local! {
 
 /// Publish the Tk `menu` tree as the platform's application menu (macOS's
 /// system menu, GTK's menu bar).  Headless runs keep the in-app bar.
+/// Platforms with a native application menu: macOS always; Linux when a
+/// real GTK app is running (the fork installs a PopoverMenuBar in the
+/// window's menu slot).  Headless runs have no GTK app, so they keep the
+/// in-app menu bar the tests click.
+fn native_menu_platform() -> bool {
+    if matches!(os(), nsh_core::platform::Os::MacOs) {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        gtk4::is_initialized()
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
 fn sync_native_menu() {
     let items = rtcl_tk_runtime::menu_bar()
         .map(|bar| native_menu_items(&bar))

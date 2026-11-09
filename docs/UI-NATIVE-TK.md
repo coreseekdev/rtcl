@@ -244,7 +244,7 @@ sashpos/sash/identify/state/instate`；`-orient` 决定 nsh
 `desktop::set_application_menu` 映射到系统菜单；Linux/Windows 在 app 内
 渲染为一行 cascade 按钮 + 浮层下拉（command/checkbutton/radiobutton/
 separator/cascade），headless 同样用 app 内菜单以便测试；`-tearoff`
-接受但不绘制撕下菜单。`-accelerator` 按 Tk 语义**只负责显示**：macOS
+接受但不绘制撕下菜单。`-accelerator` 按 Tk 语义**只负责显示**：macOS/Linux
 菜单项写入原生快捷键（`Ctrl/Cmd`→mod、`Alt`→alt、`Shift`→shift、F1–F24
 与常用命名键），app 内下拉在标签右侧追加同样文本；不实现全局热键绑定
 （与 Tk 一致，需用户自行 `bind`）。

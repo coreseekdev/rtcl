@@ -57,6 +57,8 @@ pub struct TkRuntime {
     menus: BTreeMap<String, Menu>,
     /// Pane lists of each `panedwindow`.
     paned: BTreeMap<String, Vec<PanedPane>>,
+    /// Embedded images per text widget (`text image create`).
+    text_images: BTreeMap<String, BTreeMap<String, (usize, BTreeMap<String, String>)>>,
     /// Laid-out pane sizes in points (from drags/resizes), by window.
     paned_sizes: BTreeMap<String, Vec<f64>>,
     /// `ttk::style configure` options, by style name.
@@ -1154,6 +1156,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     Ok(Value::empty())
                 }
                 "mark" => text_mark_command(interp, path, &args[2..]),
+                "image" => text_image_command(interp, path, &args[2..]),
                 "tag" => text_tag_command(interp, path, &args[2..]),
                 "getdoc" => Ok(Value::from_str(&rich_doc(path).unwrap_or_default())),
                 "setdoc" => {
@@ -2168,6 +2171,7 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
             rt.text_see.remove(p);
             rt.paned.remove(p);
             rt.paned_sizes.remove(p);
+            rt.text_images.remove(p);
             for panes in rt.paned.values_mut() {
                 panes.retain(|pane| pane.path != *p);
             }
@@ -11032,6 +11036,7 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
         gravity: MarkGravity::Right,
     });
     let (mut text, mut tags, mut dump_marks) = (false, false, false);
+    let mut wanted_image = false;
     let mut any = false;
     let mut index = 0;
     while index < rest.len() && rest[index].as_str().starts_with('-') {
@@ -11045,7 +11050,8 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
             "-text" => text = true,
             "-tag" => tags = true,
             "-mark" => dump_marks = true,
-            "-image" | "-window" => {}
+            "-image" => wanted_image = true,
+            "-window" => {}
             other => {
                 return Err(generic(format!(
                     "bad option \"{other}\": must be -all, -image, -mark, -tag, -text, or -window"
@@ -11058,6 +11064,7 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
         text = true;
         tags = true;
         dump_marks = true;
+        wanted_image = true;
     }
     if rest.len() < index + 1 || rest.len() > index + 2 {
         return Err(wrong(
@@ -11158,6 +11165,29 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
                         name.clone(),
                         format!("{}", char_to_linecol(&content, end)),
                     ],
+                ));
+            }
+        }
+    }
+    if wanted_image {
+        let images = with_state(interp, |rt| {
+            rt.text_images.get(path).map(|images| {
+                images
+                    .iter()
+                    .map(|(name, (index, _))| (name.clone(), *index))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default();
+        for images_at in images {
+            for (name, index) in images_at {
+                if index < a || index > b {
+                    continue;
+                }
+                entries.push((
+                    index,
+                    2,
+                    vec!["image".to_string(), name, char_to_linecol(&content, index)],
                 ));
             }
         }
@@ -11281,6 +11311,140 @@ fn text_edit_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<
             "bad option \"{other}\": must be canredo, canundo, modified, redo, reset, separator, or undo"
         ))),
     }
+}
+
+/// `text image create/cget/configure/delete/names` — the embedded-image
+/// model (dump reports them; inline rendering is not drawn yet).
+fn text_image_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong("image", "option ?arg ...?", rest.len() + 2));
+    }
+    let sub = rest[0].as_str().to_string();
+    match sub.as_str() {
+        "create" => {
+            let index = text_index(
+                rest.get(1).map(|v| v.as_str()).unwrap_or("end"),
+                &content_of(interp, path),
+                0,
+                &text_marks(interp, path),
+            )?;
+            let mut options = BTreeMap::new();
+            let mut i = 2;
+            while i + 1 < rest.len() {
+                options.insert(
+                    rest[i].as_str().to_string(),
+                    rest[i + 1].as_str().to_string(),
+                );
+                i += 2;
+            }
+            let name = with_state_mut(interp, |rt| {
+                let images = rt.text_images.entry(path.to_string()).or_default();
+                let name = format!("image{}", images.len() + 1);
+                images.insert(name.clone(), (index, options));
+                name
+            })
+            .unwrap_or_default();
+            Ok(Value::from_str(&name))
+        }
+        "names" => {
+            let names = with_state(interp, |rt| {
+                rt.text_images
+                    .get(path)
+                    .map(|images| images.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+            Ok(list_value(names))
+        }
+        "cget" => {
+            if rest.len() != 3 {
+                return Err(wrong("image cget", "name -option", rest.len() + 2));
+            }
+            let value = with_state(interp, |rt| {
+                rt.text_images
+                    .get(path)
+                    .and_then(|images| images.get(rest[1].as_str()))
+                    .and_then(|(_, options)| options.get(rest[2].as_str()))
+                    .cloned()
+            })
+            .flatten()
+            .unwrap_or_default();
+            Ok(Value::from_str(&value))
+        }
+        "configure" => {
+            if rest.len() < 2 {
+                return Err(wrong(
+                    "image configure",
+                    "name ?-option? ?value ...?",
+                    rest.len() + 2,
+                ));
+            }
+            let name = rest[1].as_str().to_string();
+            if rest.len() == 2 {
+                let pairs = with_state(interp, |rt| {
+                    rt.text_images
+                        .get(path)
+                        .and_then(|images| images.get(&name))
+                        .map(|(_, options)| options.clone())
+                })
+                .flatten()
+                .unwrap_or_default();
+                return Ok(list_value(
+                    pairs
+                        .iter()
+                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            if rest.len() == 3 {
+                let value = with_state(interp, |rt| {
+                    rt.text_images
+                        .get(path)
+                        .and_then(|images| images.get(&name))
+                        .and_then(|(_, options)| options.get(rest[2].as_str()))
+                        .cloned()
+                })
+                .flatten()
+                .unwrap_or_default();
+                return Ok(Value::from_str(&value));
+            }
+            for pair in rest[2..].chunks(2) {
+                if let Some(value) = pair.get(1) {
+                    let (option, value) =
+                        (pair[0].as_str().to_string(), value.as_str().to_string());
+                    with_state_mut(interp, |rt| {
+                        if let Some((_, options)) = rt
+                            .text_images
+                            .get_mut(path)
+                            .and_then(|images| images.get_mut(&name))
+                        {
+                            options.insert(option, value);
+                            rt.bump();
+                        }
+                    });
+                }
+            }
+            Ok(Value::empty())
+        }
+        "delete" => {
+            with_state_mut(interp, |rt| {
+                if let Some(images) = rt.text_images.get_mut(path) {
+                    for name in &rest[1..] {
+                        images.remove(name.as_str());
+                    }
+                    rt.bump();
+                }
+            });
+            Ok(Value::empty())
+        }
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be cget, configure, create, delete, or names"
+        ))),
+    }
+}
+
+fn content_of(interp: &Interp, path: &str) -> String {
+    text_state(interp, path).0
 }
 
 fn text_mark_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
@@ -12800,6 +12964,23 @@ mod tests {
         assert_eq!(eval(&mut i, ".b count 1.0 end"), "3");
         assert_eq!(eval(&mut i, ".b count -lines 1.0 end"), "2");
         assert_eq!(eval(&mut i, ".b get {end -1c} end"), "");
+    }
+
+    #[test]
+    fn text_image_model_and_dump() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "text .t; .t insert 1.0 hello");
+        eval(&mut i, "image create photo pic -file /tmp/x.png");
+        eval(&mut i, ".t image create 1.2 -image pic");
+        assert_eq!(eval(&mut i, ".t image names"), "image1");
+        assert_eq!(eval(&mut i, ".t image cget image1 -image"), "pic");
+        eval(&mut i, ".t image configure image1 -align baseline");
+        assert_eq!(eval(&mut i, ".t image cget image1 -align"), "baseline");
+        assert_eq!(eval(&mut i, ".t dump -image 1.0 end"), "image image1 1.2");
+        eval(&mut i, ".t image delete image1");
+        assert_eq!(eval(&mut i, ".t image names"), "");
+        assert_eq!(eval(&mut i, ".t dump -image 1.0 end"), "");
     }
 
     #[test]

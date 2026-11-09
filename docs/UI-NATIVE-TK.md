@@ -327,8 +327,10 @@ text 无滚动模型时为 no-op）；`text dlineinfo index` 按 18px 行高模�
 返回空串）；`text count ?-chars|-indices|-lines|-update|-elide? index1 index2` 按选项
 顺序返回计数（默认 chars，`-lines` 为跨过的显示行数）；`text dump ?-all|-text|-tag|-mark|-image|
 -window? index1 ?index2?` 按位置输出 Tk 风格事件流：`tagon/tagoff <tag>
-<index>`、`mark <name> <index>`、`text <chars> <index>`，text 在 tag
-边界、mark 与行首处分段（image/window 项暂不输出）。
+<index>`、`mark <name> <index>`、`text <chars> <index>`、`image <name>
+<index>`，text 在 tag 边界、mark 与行首处分段；`text image
+create/cget/configure/delete/names` 维护嵌入图片模型（dump 可见；行内
+绘制暂未接入，且不占内容字符位，与 Tk 的索引偏移语义在此处仍有差异）。
 `tag bind tagName ?sequence? ?script?` 把事件绑定到 tag 区间：富文本编辑器
 按下时按指针下的文档位置映射成字符下标，命中区间的 tag 依次执行最具体的
 sequence（`<Button-1>`、Double/Triple/Quadruple、`<ButtonRelease-1>`、

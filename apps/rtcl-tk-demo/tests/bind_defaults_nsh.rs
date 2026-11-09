@@ -37,14 +37,13 @@ fn BindApp() -> impl IntoElement {
 
 #[test]
 fn key_and_return_bindings_fire_once() {
-    let mut app = Headless::start(EngineConfig::new(Root::of::<BindApp>()))
-        .expect("headless engine starts");
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<BindApp>())).expect("headless engine starts");
     app.set_viewport(Size::new(Points(600.0), Points(300.0)))
         .expect("resize");
 
     app.wait_for("start").expect("label renders");
-    app.type_text("text:x", "a")
-        .expect("type into the entry");
+    app.type_text("text:x", "a").expect("type into the entry");
     app.wait_for("keys=1 chars=a")
         .expect("<Key> fired with %K substitutions");
     app.press_key("b").expect("type a second key");
@@ -181,8 +180,8 @@ fn NavApp() -> impl IntoElement {
 
 #[test]
 fn arrow_keys_move_listbox_and_treeview_selection() {
-    let mut app = Headless::start(EngineConfig::new(Root::of::<NavApp>()))
-        .expect("headless engine starts");
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<NavApp>())).expect("headless engine starts");
     app.set_viewport(Size::new(Points(600.0), Points(500.0)))
         .expect("resize");
     app.wait_for("L1").expect("listbox renders");
@@ -199,12 +198,14 @@ fn arrow_keys_move_listbox_and_treeview_selection() {
     app.press("L1").expect("select the first row");
     app.wait_for("▶").expect("a row is selected");
     assert!(selected(&app, "L1"), "the clicked row is selected");
-    app.press_key("down").expect("move the listbox selection down");
+    app.press_key("down")
+        .expect("move the listbox selection down");
     app.wait_for("L2").expect("the next row renders");
     assert!(selected(&app, "L2"), "Down selects the next listbox row");
 
     app.press("T1").expect("select the first tree row");
-    app.press_key("down").expect("move the treeview selection down");
+    app.press_key("down")
+        .expect("move the treeview selection down");
     app.wait_for("T2").expect("the treeview reports T2");
 }
 
@@ -262,8 +263,8 @@ fn WheelApp() -> impl IntoElement {
 
 #[test]
 fn wheel_scrolls_listbox_and_treeview() {
-    let mut app = Headless::start(EngineConfig::new(Root::of::<WheelApp>()))
-        .expect("headless engine starts");
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<WheelApp>())).expect("headless engine starts");
     app.set_viewport(Size::new(Points(600.0), Points(600.0)))
         .expect("resize");
     app.wait_for("I1").expect("listbox renders");
@@ -335,8 +336,8 @@ fn PasteApp() -> impl IntoElement {
 
 #[test]
 fn paste_fires_virtual_event() {
-    let mut app = Headless::start(EngineConfig::new(Root::of::<PasteApp>()))
-        .expect("headless engine starts");
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<PasteApp>())).expect("headless engine starts");
     app.set_viewport(Size::new(Points(400.0), Points(300.0)))
         .expect("resize");
     app.wait_for("x").expect("entry renders");
@@ -344,9 +345,7 @@ fn paste_fires_virtual_event() {
     paste.text = "hi".to_string();
     app.paste("text:x", &paste).expect("paste");
     let _ = app.settle();
-    eprintln!("after paste: {:?}", app.screen().texts());
-    app.wait_for("pasted")
-        .expect("<<Paste>> binding fired");
+    app.wait_for("pasted").expect("<<Paste>> binding fired");
 }
 
 const ENTRY_POINTER_APP: &str = r#"
@@ -429,6 +428,43 @@ fn rich_text_key_bindings_fire() {
         .expect("the text widget's <Motion> binding fired");
 }
 
+const RICH_UNDO_APP: &str = r##"
+text .t -height 3 -undo 1
+.t insert end "hi"
+.t tag configure hot -foreground "#ef4444"
+.t tag add hot 1.0 1.2
+.t edit reset
+pack .t
+button .undo -text "undo" -command {.t edit undo}
+pack .undo
+"##;
+
+#[component]
+fn RichUndoApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(RICH_UNDO_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn rich_edits_enter_the_text_undo_stack() {
+    let mut config = EngineConfig::new(Root::of::<RichUndoApp>());
+    config.environment.os = nsh_core::platform::Os::Linux;
+    let mut app = Headless::start(config).expect("headless engine starts");
+    app.set_viewport(Size::new(Points(500.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("hi").expect("rich editor renders");
+    app.press("hi").expect("focus the editor");
+    app.press_key("x").expect("type in the editor");
+    app.wait_for("hxi").expect("the edit reaches the model");
+    app.press("undo").expect("run .t edit undo");
+    app.wait_for("hi").expect("undo restores the previous text");
+    assert!(
+        app.screen().texts().iter().any(|text| *text == "hi"),
+        "undo restored the text: {:?}",
+        app.screen().texts()
+    );
+}
+
 const CONFIGURE_APP: &str = r#"
 set ::report ""
 frame .f
@@ -474,8 +510,8 @@ fn ScaleApp() -> impl IntoElement {
 
 #[test]
 fn scale_press_binding_fires() {
-    let mut app = Headless::start(EngineConfig::new(Root::of::<ScaleApp>()))
-        .expect("headless engine starts");
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<ScaleApp>())).expect("headless engine starts");
     app.set_viewport(Size::new(Points(400.0), Points(300.0)))
         .expect("resize");
     let _ = app.settle();

@@ -87,6 +87,8 @@ pub struct TkRuntime {
     /// Whether this app owns the clipboard (its `get` answers `clipboard`,
     /// even empty, instead of asking the system).
     clipboard_owned: bool,
+    /// `text -undo` stacks by widget path.
+    text_undo: BTreeMap<String, TextUndo>,
     /// Persisted rich-text documents (ProseMirror JSON) of `text` widgets.
     rich_docs: BTreeMap<String, String>,
     /// `text edit modified` state: widgets with unsaved edits.
@@ -144,6 +146,27 @@ pub enum MarkGravity {
 pub struct TextMark {
     index: usize,
     gravity: MarkGravity,
+}
+
+/// Everything `text edit undo` restores for a widget.
+#[derive(Debug, Clone)]
+struct TextSnapshot {
+    content: String,
+    cursor: usize,
+    tags: BTreeMap<String, TextTag>,
+    marks: BTreeMap<String, TextMark>,
+    rich_doc: Option<String>,
+    modified: bool,
+}
+
+#[derive(Debug, Default)]
+struct TextUndo {
+    undo: Vec<TextSnapshot>,
+    redo: Vec<TextSnapshot>,
+    /// When the last edit was recorded (adjacent edits group).
+    last: Option<std::time::Instant>,
+    /// The next edit starts a group (`edit separator`).
+    force_new: bool,
 }
 
 /// A text widget's tags, for the renderer.
@@ -1879,8 +1902,15 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
     }
     with_state_mut(interp, |rt| {
         rt.tree.destroy(path).map_err(tk_error)?;
-        rt.treeviews.remove(path);
-        rt.canvases.remove(path);
+        for p in &removed {
+            rt.treeviews.remove(p);
+            rt.canvases.remove(p);
+            rt.text_tags.remove(p);
+            rt.text_marks.remove(p);
+            rt.text_modified.remove(p);
+            rt.rich_docs.remove(p);
+            rt.text_undo.remove(p);
+        }
         rt.bump();
         Ok::<(), Error>(())
     })
@@ -5059,6 +5089,7 @@ pub fn entry_changed(path: &str, text: &str) {
 
 /// A Text widget's content changed in the UI.
 pub fn text_changed(path: &str, text: &str) {
+    record_text_undo_if_changed(path, text);
     if apply_text_change(path, text) {
         if let Some(ptr) = active_interp() {
             set_tk_focus_quiet(unsafe { &mut *ptr }, Some(path.to_string()));
@@ -5097,6 +5128,20 @@ fn apply_text_change(path: &str, text: &str) -> bool {
         true
     })
     .unwrap_or(false)
+}
+
+/// Record the text widget's state before a host-side edit (the rich
+/// editor calls this before saving its new document).  Programmatic
+/// document updates report the current content again; those are skipped
+/// so they do not create undo steps or clear the redo stack.
+pub fn record_text_undo_if_changed(path: &str, text: &str) {
+    let Some(ptr) = active_interp() else { return };
+    with_state_mut(unsafe { &mut *ptr }, |rt| {
+        if rt.tree.get(path).is_some_and(|node| node.content == text) {
+            return;
+        }
+        record_text_undo(rt, path);
+    });
 }
 
 /// Ask the backend to render again (host-side model updates).
@@ -8253,6 +8298,93 @@ fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<V
     }
 }
 
+fn text_undo_enabled(rt: &TkRuntime, path: &str) -> bool {
+    rt.tree.get(path).is_some_and(|node| {
+        node.options
+            .get("-undo")
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+    })
+}
+
+fn text_snapshot(rt: &TkRuntime, path: &str) -> Option<TextSnapshot> {
+    let node = rt.tree.get(path)?;
+    Some(TextSnapshot {
+        content: node.content.clone(),
+        cursor: node.cursor,
+        tags: rt.text_tags.get(path).cloned().unwrap_or_default(),
+        marks: rt.text_marks.get(path).cloned().unwrap_or_default(),
+        rich_doc: rt.rich_docs.get(path).cloned(),
+        modified: rt.text_modified.contains(path),
+    })
+}
+
+/// Record the state before an edit (when `-undo` is on).  Adjacent edits
+/// within half a second group, as Tk's undo does; `edit separator` and
+/// `edit undo/redo` start a new group.
+fn record_text_undo(rt: &mut TkRuntime, path: &str) {
+    if !text_undo_enabled(rt, path) {
+        return;
+    }
+    let Some(snapshot) = text_snapshot(rt, path) else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let node = rt.tree.get(path);
+    let max = node
+        .and_then(|node| node.options.get("-maxundo"))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let autoseparators = node
+        .and_then(|node| node.options.get("-autoseparators"))
+        .is_none_or(|value| !matches!(value.as_str(), "0" | "false" | "no" | "off"));
+    let entry = rt.text_undo.entry(path.to_string()).or_default();
+    let grouped = autoseparators
+        && !entry.force_new
+        && entry
+            .last
+            .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(500));
+    if !grouped {
+        entry.undo.push(snapshot);
+        if max > 0 && entry.undo.len() > max {
+            entry.undo.remove(0);
+        }
+    }
+    entry.redo.clear();
+    entry.force_new = false;
+    entry.last = Some(now);
+}
+
+fn apply_text_snapshot(rt: &mut TkRuntime, path: &str, snapshot: &TextSnapshot) {
+    if let Some(node) = rt.tree.get_mut(path) {
+        node.content = snapshot.content.clone();
+        node.cursor = snapshot.cursor;
+    }
+    if snapshot.tags.is_empty() {
+        rt.text_tags.remove(path);
+    } else {
+        rt.text_tags.insert(path.to_string(), snapshot.tags.clone());
+    }
+    if snapshot.marks.is_empty() {
+        rt.text_marks.remove(path);
+    } else {
+        rt.text_marks
+            .insert(path.to_string(), snapshot.marks.clone());
+    }
+    match &snapshot.rich_doc {
+        Some(doc) => {
+            rt.rich_docs.insert(path.to_string(), doc.clone());
+        }
+        None => {
+            rt.rich_docs.remove(path);
+        }
+    }
+    if snapshot.modified {
+        rt.text_modified.insert(path.to_string());
+    } else {
+        rt.text_modified.remove(path);
+    }
+}
+
 fn text_get(interp: &mut Interp, path: &str, first: &str, last: Option<&str>) -> Result<Value> {
     let (content, cursor) = text_state(interp, path);
     let marks = text_marks(interp, path);
@@ -8294,6 +8426,9 @@ fn text_insert(
 ) -> Result<Value> {
     let (content, cursor_before) = text_state(interp, path);
     let at = at.min(content.chars().count());
+    if text.is_empty() && tag_list.is_none() {
+        return Ok(Value::empty());
+    }
     let new_content = replace_chars(&content, at, at, text);
     let len = text.chars().count();
     let gravity = with_state(interp, |rt| rt.insert_gravity.get(path).copied())
@@ -8302,6 +8437,7 @@ fn text_insert(
     let cursor = mark_after_insert(cursor_before, at, len, gravity);
     let tags = tag_list.map(str::to_string);
     with_state_mut(interp, |rt| {
+        record_text_undo(rt, path);
         adjust_text_tag_ranges(&content, &new_content, rt.text_tags.get_mut(path));
         shift_marks_on_insert(rt.text_marks.get_mut(path), at, len);
         if let Some(n) = rt.tree.get_mut(path) {
@@ -8344,6 +8480,7 @@ fn text_delete_range(interp: &mut Interp, path: &str, a: usize, b: usize) {
     }
     let new_content = replace_chars(&content, a, b, "");
     with_state_mut(interp, |rt| {
+        record_text_undo(rt, path);
         adjust_text_tag_ranges(&content, &new_content, rt.text_tags.get_mut(path));
         shift_marks_on_delete(rt.text_marks.get_mut(path), a, b);
         rt.text_modified.insert(path.to_string());
@@ -8581,12 +8718,64 @@ fn text_edit_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<
         "reset" => {
             with_state_mut(interp, |rt| {
                 rt.text_modified.remove(path);
+                rt.text_undo.remove(path);
             });
             Ok(Value::empty())
         }
-        "separator" => Ok(Value::empty()),
-        "undo" | "redo" => Ok(Value::empty()),
-        "canundo" | "canredo" => Ok(Value::from_bool(false)),
+        "separator" => {
+            with_state_mut(interp, |rt| {
+                if let Some(entry) = rt.text_undo.get_mut(path) {
+                    entry.force_new = true;
+                }
+            });
+            Ok(Value::empty())
+        }
+        "undo" | "redo" => {
+            let forward = rest[0].as_str() == "undo";
+            with_state_mut(interp, |rt| {
+                if !text_undo_enabled(rt, path) {
+                    return;
+                }
+                let current = text_snapshot(rt, path);
+                let Some(entry) = rt.text_undo.get_mut(path) else {
+                    return;
+                };
+                let (from, to) = if forward {
+                    (&mut entry.undo, &mut entry.redo)
+                } else {
+                    (&mut entry.redo, &mut entry.undo)
+                };
+                let Some(snapshot) = from.pop() else {
+                    return;
+                };
+                if let Some(current) = current {
+                    to.push(current);
+                }
+                entry.force_new = true;
+                entry.last = None;
+                apply_text_snapshot(rt, path, &snapshot);
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "canundo" | "canredo" => {
+            let forward = rest[0].as_str() == "canundo";
+            let can = with_state(interp, |rt| {
+                text_undo_enabled(rt, path)
+                    && rt
+                        .text_undo
+                        .get(path)
+                        .is_some_and(|entry| {
+                            if forward {
+                                !entry.undo.is_empty()
+                            } else {
+                                !entry.redo.is_empty()
+                            }
+                        })
+            })
+            .unwrap_or(false);
+            Ok(Value::from_bool(can))
+        }
         other => Err(generic(format!(
             "bad option \"{other}\": must be canredo, canundo, modified, redo, reset, separator, or undo"
         ))),
@@ -9770,6 +9959,81 @@ mod tests {
         eval(&mut i, ".n mark set insert 1.1");
         eval(&mut i, ".n insert 1.1 AA");
         assert_eq!(eval(&mut i, ".n index insert"), "1.1");
+    }
+
+    #[test]
+    fn text_undo_redo_separator_and_limits() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "text .u -undo 1");
+        assert_eq!(eval(&mut i, ".u edit canundo"), "0");
+        assert_eq!(eval(&mut i, ".u edit canredo"), "0");
+        eval(&mut i, ".u insert 1.0 abc");
+        eval(&mut i, ".u edit separator");
+        eval(&mut i, ".u insert end d");
+        assert_eq!(eval(&mut i, ".u get 1.0 end"), "abcd");
+        assert_eq!(eval(&mut i, ".u edit canundo"), "1");
+        assert_eq!(eval(&mut i, ".u edit canredo"), "0");
+        eval(&mut i, ".u edit undo");
+        assert_eq!(eval(&mut i, ".u get 1.0 end"), "abc");
+        assert_eq!(eval(&mut i, ".u edit canredo"), "1");
+        eval(&mut i, ".u edit undo");
+        assert_eq!(eval(&mut i, ".u get 1.0 end"), "");
+        assert_eq!(eval(&mut i, ".u edit canundo"), "0");
+        eval(&mut i, ".u edit redo");
+        assert_eq!(eval(&mut i, ".u get 1.0 end"), "abc");
+        eval(&mut i, ".u edit redo");
+        assert_eq!(eval(&mut i, ".u get 1.0 end"), "abcd");
+        assert_eq!(eval(&mut i, ".u edit canredo"), "0");
+        // A fresh edit clears the redo stack.
+        eval(&mut i, ".u edit undo");
+        eval(&mut i, ".u insert end X");
+        assert_eq!(eval(&mut i, ".u edit canredo"), "0");
+
+        // Tags and marks come back with the content they were attached to.
+        eval(&mut i, "text .v -undo 1");
+        eval(&mut i, ".v insert 1.0 hello");
+        eval(&mut i, ".v tag add hot 1.0 1.2");
+        eval(&mut i, ".v mark set m 1.2");
+        eval(&mut i, ".v edit separator");
+        eval(&mut i, ".v insert end X");
+        eval(&mut i, ".v tag add cold 1.0 end");
+        eval(&mut i, ".v mark set m 1.3");
+        eval(&mut i, ".v edit undo");
+        assert_eq!(eval(&mut i, ".v get 1.0 end"), "hello");
+        assert_eq!(eval(&mut i, ".v tag ranges hot"), "1.0 1.2");
+        assert_eq!(eval(&mut i, ".v tag ranges cold"), "");
+        assert_eq!(eval(&mut i, ".v index m"), "1.2");
+
+        // `-maxundo` caps the stack, `-undo 0` disables recording.
+        eval(&mut i, "text .w -undo 1 -maxundo 1");
+        eval(&mut i, ".w insert end a; .w edit separator");
+        eval(&mut i, ".w insert end b; .w edit separator");
+        eval(&mut i, ".w insert end c");
+        eval(&mut i, ".w edit undo");
+        assert_eq!(eval(&mut i, ".w get 1.0 end"), "ab");
+        eval(&mut i, ".w edit undo");
+        assert_eq!(eval(&mut i, ".w get 1.0 end"), "ab");
+        eval(&mut i, "text .x");
+        eval(&mut i, ".x insert 1.0 a");
+        assert_eq!(eval(&mut i, ".x edit canundo"), "0");
+        eval(&mut i, ".x edit undo");
+        assert_eq!(eval(&mut i, ".x get 1.0 end"), "a");
+
+        // `-autoseparators 0` makes every edit its own undo step.
+        eval(&mut i, "text .a -undo 1 -autoseparators 0");
+        eval(&mut i, ".a insert 1.0 a");
+        eval(&mut i, ".a insert end b");
+        eval(&mut i, ".a edit undo");
+        assert_eq!(eval(&mut i, ".a get 1.0 end"), "a");
+        eval(&mut i, ".a edit undo");
+        assert_eq!(eval(&mut i, ".a get 1.0 end"), "");
+
+        // `edit reset` drops history and the modified flag.
+        eval(&mut i, ".u edit reset");
+        assert_eq!(eval(&mut i, ".u edit canundo"), "0");
+        assert_eq!(eval(&mut i, ".u edit canredo"), "0");
+        assert_eq!(eval(&mut i, ".u edit modified"), "0");
     }
 
     #[test]

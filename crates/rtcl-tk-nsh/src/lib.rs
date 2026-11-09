@@ -844,6 +844,7 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                     let state = change_session.state();
                     let doc = state.doc();
                     let text = doc.text_between(0, doc.content().size(), Some("\n"), None);
+                    rtcl_tk_runtime::record_text_undo_if_changed(&change_path, &text);
                     if let Ok(json) = serde_json::to_string(&doc.to_json()) {
                         rtcl_tk_runtime::set_rich_doc(&change_path, json);
                     }

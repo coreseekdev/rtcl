@@ -79,6 +79,52 @@ pub fn install_backend() {
     rtcl_tk_runtime::set_file_dialog_handler(file_dialog_gtk);
     #[cfg(target_os = "linux")]
     rtcl_tk_runtime::set_color_dialog_handler(color_dialog_gtk);
+    #[cfg(target_os = "linux")]
+    rtcl_tk_runtime::set_dialog_handler(dialog_gtk);
+}
+
+/// `tk_dialog` as a GTK alert with the app's buttons, blocking until the
+/// user chooses (or the dialog closes: the default button).
+#[cfg(target_os = "linux")]
+fn dialog_gtk(request: &rtcl_tk_runtime::DialogRequest) -> Option<usize> {
+    if gtk4::init().is_err() {
+        return None;
+    }
+    let mut message = request.message.clone();
+    if !request.title.is_empty() {
+        message = format!("{}\n\n{message}", request.title);
+    }
+    if message.is_empty() {
+        message = " ".to_string();
+    }
+    let dialog = gtk4::AlertDialog::builder()
+        .modal(true)
+        .message(message)
+        .buttons(request.buttons.clone())
+        .default_button(request.default as i32)
+        .build();
+    let picked: std::rc::Rc<std::cell::Cell<Option<i32>>> =
+        std::rc::Rc::new(std::cell::Cell::new(None));
+    let done = picked.clone();
+    let parent = gtk_parent_window();
+    dialog.choose(
+        parent.as_ref(),
+        None::<&gtk4::gio::Cancellable>,
+        move |result| {
+            done.set(Some(result.unwrap_or(-1)));
+        },
+    );
+    let context = gtk4::glib::MainContext::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while picked.get().is_none() && std::time::Instant::now() < deadline {
+        context.iteration(true);
+    }
+    match picked.get() {
+        Some(index) if index >= 0 && (index as usize) < request.buttons.len() => {
+            Some(index as usize)
+        }
+        _ => Some(request.default),
+    }
 }
 
 /// `tk_chooseColor` as a GTK color dialog, blocking until the user picks.
@@ -1104,6 +1150,7 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
     let press_path = path.to_string();
     let selection_path = path.to_string();
     let hover_path = path.to_string();
+    let hover_out_path = path.to_string();
     let height = option(tree, path, "-height")
         .parse::<f32>()
         .unwrap_or(10.0)
@@ -1167,6 +1214,9 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                 })
                 .on_hover(move |h: &RichEditorHover| {
                     rtcl_tk_runtime::text_tag_hover(&hover_path, h.pos as usize, h.x, h.y);
+                })
+                .on_hover_out(move |_: &()| {
+                    rtcl_tk_runtime::text_tag_hover_out(&hover_out_path);
                 }),
         )
         .into_element()
@@ -2043,6 +2093,17 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .into_element()
         }
         WidgetKind::Menubutton => render_menubutton(tree, path),
+        WidgetKind::Sizegrip => view()
+            .w(px(14.0))
+            .h(px(14.0))
+            .items_center()
+            .justify_center()
+            .child(
+                text("\u{25e2}")
+                    .text_size(px(11.0))
+                    .text_color(AdaptiveColor::rgb(0x9ca3af, 0x6b7280)),
+            )
+            .into_element(),
         WidgetKind::Checkbutton => {
             let path = path.to_string();
             let checked = rtcl_tk_runtime::is_checked(&path);

@@ -481,6 +481,8 @@ pub fn install(interp: &mut Interp) {
         "ttk::treeview",
         "labelframe",
         "ttk::labelframe",
+        "sizegrip",
+        "ttk::sizegrip",
         "chart",
         "::rtcl::chart",
         "canvas",
@@ -519,6 +521,7 @@ pub fn install(interp: &mut Interp) {
         "tk_chooseDirectory",
         "tk_chooseColor",
         "tk_optionMenu",
+        "tk_dialog",
     ] {
         interp.register_command(name, global_command);
     }
@@ -2447,6 +2450,7 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
                     (1, 100)
                 }
             }
+            WidgetKind::Sizegrip => (14, 14),
             WidgetKind::Progressbar => {
                 let length = opt("-length").parse::<i64>().unwrap_or(100);
                 if opt("-orient") == "horizontal" {
@@ -4364,6 +4368,67 @@ fn option_menu_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     );
     interp.eval(&script)?;
     Ok(Value::from_str(&menu_path))
+}
+
+/// A `tk_dialog` request: a modal message with arbitrary buttons.
+#[derive(Debug, Clone, Default)]
+pub struct DialogRequest {
+    pub title: String,
+    pub message: String,
+    pub detail: String,
+    pub buttons: Vec<String>,
+    /// The index of the default button.
+    pub default: usize,
+    pub parent: String,
+}
+
+thread_local! {
+    /// The backend's native button dialog (`tk_dialog`).
+    static DIALOG: std::cell::Cell<Option<fn(&DialogRequest) -> Option<usize>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Give `tk_dialog` a native modal dialog.  The handler blocks until the
+/// user answers and returns the chosen button's index.
+pub fn set_dialog_handler(handler: fn(&DialogRequest) -> Option<usize>) {
+    DIALOG.with(|cell| cell.set(Some(handler)));
+}
+
+fn tk_dialog_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 6 {
+        return Err(wrong(
+            "tk_dialog",
+            "window title text bitmap default ?button ...?",
+            args.len(),
+        ));
+    }
+    let mut buttons = args[6..]
+        .iter()
+        .map(|value| value.as_str().to_string())
+        .collect::<Vec<_>>();
+    if buttons.is_empty() {
+        buttons.push("OK".to_string());
+    }
+    let default = args[5]
+        .as_str()
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(0)
+        .min(buttons.len() - 1);
+    let request = DialogRequest {
+        title: args[2].as_str().to_string(),
+        message: args[3].as_str().to_string(),
+        detail: String::new(),
+        buttons,
+        default,
+        parent: args[1].as_str().to_string(),
+    };
+    let answer = DIALOG
+        .with(|cell| cell.get())
+        .and_then(|handler| handler(&request))
+        .unwrap_or(default)
+        .min(request.buttons.len() - 1);
+    Ok(Value::from_int(answer as i64))
 }
 
 thread_local! {
@@ -6285,6 +6350,23 @@ pub fn text_tag_hover(path: &str, doc_pos: usize, x: f64, y: f64) {
         run_text_tag_named(interp, path, name, "<Enter>", &ctx);
     }
     run_text_tag_sequence(interp, path, index, "<Motion>", &ctx);
+}
+
+/// The pointer left a rich text editor: fire `<Leave>` for the tags it was
+/// over and forget them.
+pub fn text_tag_hover_out(path: &str) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    let previous = TEXT_HOVER_TAGS.with(|map| map.borrow_mut().remove(path).unwrap_or_default());
+    if previous.is_empty() {
+        return;
+    }
+    let mut ctx = EventCtx::for_path(path);
+    ctx.x = 0;
+    ctx.y = 0;
+    for name in previous {
+        run_text_tag_named(interp, path, &name, "<Leave>", &ctx);
+    }
 }
 
 /// A press over a rich text editor: run the tag bindings at the character
@@ -10742,6 +10824,7 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "tk_chooseDirectory" => file_dialog_impl(interp, args, FileDialogKind::Directory),
         "tk_chooseColor" => choose_color_impl(interp, args),
         "tk_optionMenu" => option_menu_impl(interp, args),
+        "tk_dialog" => tk_dialog_impl(interp, args),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -11350,6 +11433,21 @@ mod tests {
     }
 
     #[test]
+    fn sizegrip_creation_and_class() {
+        let mut i = Interp::new();
+        install(&mut i);
+        assert_eq!(eval(&mut i, "ttk::sizegrip .sg"), ".sg");
+        assert_eq!(eval(&mut i, "winfo class .sg"), "TSizegrip");
+        assert_eq!(eval(&mut i, ".sg cget -takefocus"), "");
+        assert_eq!(
+            eval(&mut i, "sizegrip .plain; winfo class .plain"),
+            "TSizegrip"
+        );
+        assert_eq!(eval(&mut i, "winfo width .sg"), "14");
+        assert_eq!(eval(&mut i, "winfo height .sg"), "14");
+    }
+
+    #[test]
     fn menubutton_and_menu_item_state() {
         let mut i = Interp::new();
         install(&mut i);
@@ -11451,6 +11549,32 @@ mod tests {
     fn choose_blue(request: &ColorDialogRequest) -> Option<String> {
         *LAST_COLOR_DIALOG.lock().unwrap() = Some(request.clone());
         Some("#0000ff".to_string())
+    }
+
+    static LAST_DIALOG: std::sync::Mutex<Option<DialogRequest>> = std::sync::Mutex::new(None);
+
+    fn choose_second(request: &DialogRequest) -> Option<usize> {
+        *LAST_DIALOG.lock().unwrap() = Some(request.clone());
+        Some(1)
+    }
+
+    #[test]
+    fn tk_dialog_returns_a_button_index() {
+        let mut i = Interp::new();
+        install(&mut i);
+        // Without a backend the default button's index is reported.
+        assert_eq!(eval(&mut i, "tk_dialog .d T M {} 0 Yes No"), "0");
+        assert_eq!(eval(&mut i, "tk_dialog .d T M {} 1 Yes No"), "1");
+        assert_eq!(eval(&mut i, "tk_dialog .d T M {} {}"), "0");
+        set_dialog_handler(choose_second);
+        assert_eq!(eval(&mut i, "tk_dialog .d Title Text {} 0 Yes No"), "1");
+        let request = LAST_DIALOG.lock().unwrap().take().unwrap();
+        assert_eq!(request.title, "Title");
+        assert_eq!(request.message, "Text");
+        assert_eq!(request.buttons, vec!["Yes", "No"]);
+        assert_eq!(request.default, 0);
+        assert_eq!(request.parent, ".d");
+        set_dialog_handler(|_| None);
     }
 
     #[test]
@@ -11611,6 +11735,13 @@ mod tests {
         assert_eq!(eval(&mut i, "set ::motion"), "12,7");
         assert_eq!(eval(&mut i, "set ::leave"), "0");
         text_tag_hover(".b", 8, 80.0, 7.0);
+        assert_eq!(eval(&mut i, "set ::leave"), "1");
+        eval(&mut i, "set ::enter 0; set ::leave 0");
+        text_tag_hover(".b", 2, 12.0, 7.0);
+        assert_eq!(eval(&mut i, "set ::enter"), "1");
+        text_tag_hover_out(".b");
+        assert_eq!(eval(&mut i, "set ::leave"), "1");
+        text_tag_hover_out(".b");
         assert_eq!(eval(&mut i, "set ::leave"), "1");
 
         // ProseMirror positions map onto the mirrored plain text.

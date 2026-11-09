@@ -183,7 +183,7 @@ M1a/M1b/M2 已完成：
 checkbutton/radiobutton/scale/text/listbox/message/scrollbar` + `ttk::{separator,
 progressbar,notebook,combobox,treeview,labelframe,button,menubutton,label,
 entry,spinbox,frame,checkbutton,radiobutton,scale,text,listbox,scrollbar,
-message,canvas}` 别名（ttk
+message,canvas,sizegrip}` 别名（ttk
 创建的控件带 Tk 的 T* 类名，如 `ttk::button` → `TButton`，因此
 `bindtags`/`bind TButton`/`winfo class` 与 tkinter 一致）；扩展
 `::rtcl::chart`（原生柱状图，`-values/-labels/-title/-width/-height`）。
@@ -191,7 +191,7 @@ message,canvas}` 别名（ttk
 **命令**：`configure/cget/cget 前缀缩写/destroy/pack/grid/place/winfo/
 wm/tk/bind/bindtags/event generate/focus/raise/lower/font/option/bell/
 tk_focusNext/tk_focusPrev/menu/clipboard/selection/tk_messageBox/
-tk_getOpenFile/tk_getSaveFile/tk_chooseDirectory/tk_chooseColor/tk_optionMenu`；控件子命令含 `invoke/get/insert/delete/
+tk_getOpenFile/tk_getSaveFile/tk_chooseDirectory/tk_chooseColor/tk_optionMenu/tk_dialog`；控件子命令含 `invoke/get/insert/delete/
 index/icursor/selection/size/curselection/step` 等；菜单子命令含
 `add/insert/delete/index/entrycget/entryconfigure/invoke/type/post/
 unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
@@ -205,6 +205,9 @@ index/heading/column/exists`；listbox/treeview 按 `-height` 放进滚动视图
 command/checkbutton/radiobutton/separator/cascade 菜单项可选中并触发；
 `tk_optionMenu w varName firstValue ?value ...?` 创建 `.w.menu` 单选菜单
 并返回菜单路径（`.w` 为 menubutton，textvariable 为 varName）。
+
+**sizegrip**：`ttk::sizegrip`（`TSizegrip`）渲染右下角三角握把，无交互
+（窗口缩放由窗口管理器负责）。
 
 **spinbox**：`spinbox`/`ttk::spinbox`（类名 `Spinbox`/`TSpinbox`），
 子命令 `get/set/insert/delete/index/icursor/selection/validate/xview`；
@@ -292,9 +295,11 @@ Tcl 侧 `tag add/remove` 这类纯格式命令不单独入栈，但会随下一�
 按下时按指针下的文档位置映射成字符下标，命中区间的 tag 依次执行最具体的
 sequence（`<Button-1>`、Double/Triple/Quadruple、`<ButtonRelease-1>`、
 `<Enter>`、`<Leave>`、`<Motion>`），`break` 停止后续 tag；键盘事件按
-`insert` 光标所在区间派发。`<Leave>` 覆盖 tag 之间的移动，指针直接移出
-编辑器外时暂不补发；`<ButtonRelease-1>` 与其他控件一致在按下派发后立即
-执行（后端没有独立的指针抬起钩子）。
+`insert` 光标所在区间派发。`<Leave>` 覆盖 tag 之间的移动，指针移出编辑器
+内容区时由 fork 的 `RichEditorEvent::HoverOut` 对当前 tag 补发（headless
+的 `hover` 帮助函数不模拟跨控件 Leave，测试以运行时单测覆盖）。
+`<ButtonRelease-1>` 与其他控件一致在按下派发后立即执行（后端没有独立的
+指针抬起钩子）。
 `text search ?-forward|-backward? ?-exact|-regexp? ?-nocase? ?-all?
 ?-count varName? pattern index ?stopIndex?` 支持环绕搜索与 regexp
 （Rust regex 语法；Tcl ARE 的 \m/\M 等未覆盖），`stopIndex` 只限制
@@ -386,7 +391,10 @@ text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/se
 `AlertDialog`（Tcl 命令在嵌套主循环里阻塞到用户选择，`-type` 六种按钮组、
 `-default/-cancel` 映射默认/Escape，返回 ok/cancel/yes/no/retry/abort/ignore；
 GTK 无窗口标题，`-title` 折进正文首行，`-parent` 暂忽略）；无后端或
-GTK 初始化失败时立即返回默认按钮，便于 headless/非 Linux；
+GTK 初始化失败时立即返回默认按钮，便于 headless/非 Linux；`tk_dialog
+window title text bitmap default ?button ...?` 用同一 GTK AlertDialog
+基础返回按钮下标（按钮数量自定义，关闭对话框返回 default 下标；window
+参数只作 parent 名记录，不创建可见 Toplevel）；
 `tk_getOpenFile/tk_getSaveFile/tk_chooseDirectory` 同样走宿主回调（Linux
 GTK `FileDialog`：`-initialdir/-initialfile/-filetypes` 转 native filter、
 `-multiple` 返回 Tcl 列表、保存时补 `-defaultextension`、`-confirmoverwrite`

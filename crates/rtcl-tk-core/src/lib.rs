@@ -49,6 +49,8 @@ pub enum WidgetKind {
     Chart,
     /// `canvas`: static shapes drawn with nsh's canvas painter.
     Canvas,
+    /// `ttk::sizegrip`: the resize grip in a window's corner.
+    Sizegrip,
 }
 
 impl WidgetKind {
@@ -76,6 +78,7 @@ impl WidgetKind {
             "labelframe" => Self::Labelframe,
             "chart" => Self::Chart,
             "canvas" => Self::Canvas,
+            "sizegrip" => Self::Sizegrip,
             _ => return None,
         })
     }
@@ -105,6 +108,7 @@ impl WidgetKind {
             Self::Labelframe => "TLabelframe",
             Self::Chart => "Chart",
             Self::Canvas => "Canvas",
+            Self::Sizegrip => "TSizegrip",
         }
     }
 
@@ -873,6 +877,8 @@ const BUTTON_OPTIONS: &[&str] = &[
     "-wraplength",
 ];
 
+const SIZEGRIP_OPTIONS: &[&str] = &["-cursor", "-style", "-takefocus"];
+
 const MENUBUTTON_OPTIONS: &[&str] = &[
     "-anchor",
     "-background",
@@ -1287,6 +1293,7 @@ pub fn known_options(kind: WidgetKind) -> &'static [&'static str] {
         WidgetKind::Labelframe => LABELFRAME_OPTIONS,
         WidgetKind::Chart => CHART_OPTIONS,
         WidgetKind::Canvas => CANVAS_OPTIONS,
+        WidgetKind::Sizegrip => SIZEGRIP_OPTIONS,
     }
 }
 

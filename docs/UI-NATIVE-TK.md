@@ -487,8 +487,15 @@ set_dialog_handler/set_clipboard_getter/set_clipboard_sink`；另有
 bell 静默。IME 与基础 a11y 由 nsh
 原生 input/RichEditor/按钮承担；自绘控件补了关键标签（spinbox
 Increment/Decrement、toplevel Close window），Canvas/Chart 仍是纯绘制、
-无逐项 a11y 语义。M4 移动端依赖 nsh 的 iOS/Android 工程模板与 SDK，本仓库
-只保证 runtime/headless 跨平台可编译。
+无逐项 a11y 语义。**Android port 进展**：本机有 SDK（`~/android-sdk`，NDK 29）+ cargo-ndk
+4.1.2；tk 全栈（core/runtime/nsh/demo）已通过
+`cargo ndk -t arm64-v8a --platform 24 check`（注意：serde_json 的
+android cfg 已随 linux 开）。fork 的 nsh-platform-android 完整存在
+（JNI libnsh.so + Java 运行时），nsh-cli 的 android.rs 能打 APK
+（classes.dex + libnsh.so per ABI + AppActivity 跑 Rust root）。
+剩余：建一个 Rust-only android app crate（`root!` + `ui_sets!` 注册
+rtcl 的 tk 组件注册表，`nsh run --target android` 打包），对话框/
+剪贴板等宿主钩子在 android 侧未注册（回退默认值）。
 
 **视觉验收（不用 TSX）**：Tcl 与 TSX 在同一生态位，因此截图走 Rust/GTK，
 不引入 `*.test.tsx` 或 nsh CLI：

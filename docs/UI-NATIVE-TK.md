@@ -277,9 +277,12 @@ toplevel、all）、`event generate`；替换 `%W/%x/%y/%X/%Y/%b/%s/%K/%A`
 由 `TkView` 的 16 ms interval 泵入，错误进 `take_errors()`。
 
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停
-绘制，长等待请用 `after` 回调）；未实现多 toplevel 窗口；Canvas 已支持旋转/贝塞尔/箭头/虚线/图片项；
+绘制，长等待请用 `after` 回调）；未实现多 toplevel 窗口；Canvas 已支持
+旋转/贝塞尔/箭头/虚线/图片/arc/polygon/锚点与 bbox/find 查询；
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
+text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
+未实现；
 Windows/Linux 菜单栏仍是 app 内实现
 （macOS 用系统菜单；nsh GTK 的 set_application_menu 实测不显示）；
 scrollbar 已与 listbox/treeview 联动。

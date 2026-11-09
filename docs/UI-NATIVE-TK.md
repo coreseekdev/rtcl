@@ -309,15 +309,22 @@ tag 区间、mark 与富文档；`-autoseparators`（默认开）时 500ms 内�
 `-maxundo` 限制栈深（0 为不限，与 Tk 一致）；`edit reset` 同时清空历史。
 Tcl 侧 `tag add/remove` 这类纯格式命令不单独入栈，但会随下一次文本编辑的
 快照一起回滚。富编辑器内部的 Ctrl+Z 仍由编辑器自身的历史处理。
+**隐式行尾换行已按 Tk 建模**：`end` 是虚拟内容（正文+行尾 `\n`）末尾
+（`index end` 对 "abc" 为 `2.0`）；`count 1.0 end` 含隐式换行（"abc" 为
+4），`get 1.0 end` 剥离它（`abc`）；隐式换行不可删除（`delete end-1c`
+静默忽略）、不可被 `search` 匹配；`dump 1.0 end` 会输出它
+（`text {
+} 1.3`）；`insert end` 插在它之前；用户自行插入的行尾换行是
+真实内容（`get 1.0 end` 保留）。索引整体在虚拟内容上运算（`L.C`、
+`end±Nc`、word/line 修饰符、越界钳制到 end）。
 `text see index` 在富文本编辑器里滚动到该字符位置（不移动 caret；普通
 text 无滚动模型时为 no-op）；`text dlineinfo index` 按 18px 行高模型返回
 `x y w h baseline`（x=3，w 为 -width 字符宽，行不可见/超出行数/end 位置
 返回空串）；`text count ?-chars|-indices|-lines|-update|-elide? index1 index2` 按选项
-顺序返回计数（默认 chars）；`text dump ?-all|-text|-tag|-mark|-image|
+顺序返回计数（默认 chars，`-lines` 为跨过的显示行数）；`text dump ?-all|-text|-tag|-mark|-image|
 -window? index1 ?index2?` 按位置输出 Tk 风格事件流：`tagon/tagoff <tag>
 <index>`、`mark <name> <index>`、`text <chars> <index>`，text 在 tag
-边界、mark 与行首处分段（image/window 项暂不输出；Tk 自带的行尾换行
-不参与本模型）。
+边界、mark 与行首处分段（image/window 项暂不输出）。
 `tag bind tagName ?sequence? ?script?` 把事件绑定到 tag 区间：富文本编辑器
 按下时按指针下的文档位置映射成字符下标，命中区间的 tag 依次执行最具体的
 sequence（`<Button-1>`、Double/Triple/Quadruple、`<ButtonRelease-1>`、

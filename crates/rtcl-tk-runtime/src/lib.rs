@@ -1086,11 +1086,6 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     let (content, cursor) = text_state(interp, path);
                     let marks = text_marks(interp, path);
                     let index = text_index(args[2].as_str(), &content, cursor, &marks)?;
-                    // Tk's `end` (just past the last character) shows no
-                    // display line.
-                    if !content.is_empty() && index >= content.chars().count() {
-                        return Ok(Value::from_str(""));
-                    }
                     let (line, _col) = match char_to_linecol(&content, index).split_once('.') {
                         Some((line, col)) => (
                             line.parse::<usize>().unwrap_or(1),
@@ -8696,6 +8691,10 @@ fn text_index(
     if rest.is_empty() {
         return Err(bad());
     }
+    // Tk's index arithmetic runs over the content plus its implicit
+    // trailing newline (`end` is one past it).
+    let virtual_content = format!("{content}\n");
+    let content = &virtual_content;
     let base_end = rest
         .char_indices()
         .find(|(i, c)| *i > 0 && (*c == '+' || *c == '-' || c.is_whitespace()))
@@ -8766,11 +8765,13 @@ fn text_index_base(
     cursor: usize,
     marks: &BTreeMap<String, TextMark>,
 ) -> Result<usize> {
+    // `content` is the virtual text (stored plus the implicit trailing
+    // newline), so `end` is exactly its length.
     let len = content.chars().count();
     let bad = || generic(format!("bad text index \"{spec}\""));
     match spec {
         "" => Err(bad()),
-        "insert" => Ok(cursor.min(len)),
+        "insert" => Ok(cursor.min(len.saturating_sub(1))),
         "end" => Ok(len),
         "current" => Ok(marks.get("current").map_or(0, |m| m.index.min(len))),
         _ => {
@@ -8796,11 +8797,16 @@ fn text_index_base(
     }
 }
 
+/// Line/column of a text index.  Tk's model appends one implicit
+/// newline after the stored text, so `end` (index `len + 1`) sits one
+/// line past the last character.
 fn char_linecol(content: &str, index: usize) -> (usize, usize) {
     let mut line = 1usize;
     let mut col = 0usize;
+    let len = content.chars().count();
+    let target = index.min(len + 1);
     for (i, c) in content.chars().enumerate() {
-        if i == index {
+        if i == target {
             return (line, col);
         }
         if c == '\n' {
@@ -8810,7 +8816,11 @@ fn char_linecol(content: &str, index: usize) -> (usize, usize) {
             col += 1;
         }
     }
-    (line, col)
+    if target == len + 1 {
+        (line + 1, 0)
+    } else {
+        (line, col)
+    }
 }
 
 fn line_start(content: &str, line: usize) -> usize {
@@ -8980,19 +8990,7 @@ fn text_marks(interp: &Interp, path: &str) -> BTreeMap<String, TextMark> {
 }
 
 fn char_to_linecol(content: &str, index: usize) -> String {
-    let mut line = 1usize;
-    let mut col = 0usize;
-    for (i, c) in content.chars().enumerate() {
-        if i == index {
-            return format!("{line}.{col}");
-        }
-        if c == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
+    let (line, col) = char_linecol(content, index);
     format!("{line}.{col}")
 }
 
@@ -10494,13 +10492,25 @@ fn apply_text_snapshot(rt: &mut TkRuntime, path: &str, snapshot: &TextSnapshot) 
 fn text_get(interp: &mut Interp, path: &str, first: &str, last: Option<&str>) -> Result<Value> {
     let (content, cursor) = text_state(interp, path);
     let marks = text_marks(interp, path);
+    let virtual_text = format!("{content}\n");
+    let vlen = virtual_text.chars().count();
     let start = text_index(first, &content, cursor, &marks)?;
     let end = match last {
         Some(last) => text_index(last, &content, cursor, &marks)?,
-        None => (start + 1).min(content.chars().count()),
+        None => (start + 1).min(vlen),
     };
-    let (a, b) = (start.min(end), start.max(end));
-    Ok(Value::from_str(&char_slice(&content, a, b)))
+    let (a, b) = (start.min(end).min(vlen), end.min(vlen));
+    if a >= b {
+        return Ok(Value::from_str(""));
+    }
+    let slice: String = virtual_text.chars().skip(a).take(b - a).collect();
+    // A range ending at `end` omits the implicit trailing newline.
+    let out = if b == vlen {
+        slice.chars().take(b - a - 1).collect::<String>()
+    } else {
+        slice
+    };
+    Ok(Value::from_str(&out))
 }
 
 /// Where a mark at `index` ends up after inserting at `at`.
@@ -10821,22 +10831,25 @@ fn text_count(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> 
     }
     let first = text_index(rest[index].as_str(), &content, cursor, &marks)?;
     let last = text_index(rest[index + 1].as_str(), &content, cursor, &marks)?;
-    let (a, b) = (first.min(last), first.max(last));
+    let len = content.chars().count();
+    let vlen = len + 1;
+    let (a, b) = (first.min(last).min(vlen), first.max(last).min(vlen));
     if wanted.is_empty() {
         wanted.push("chars");
     }
     let chars = content.chars().collect::<Vec<_>>();
     let slice = &chars[a.min(chars.len())..b.min(chars.len())];
-    let newlines = slice.iter().filter(|c| **c == '\n').count();
     let counts = wanted
         .iter()
         .map(|kind| match *kind {
-            "chars" | "indices" => slice.len(),
+            "chars" | "indices" => b - a,
             "lines" => {
-                if slice.is_empty() {
+                if b <= a {
                     0
                 } else {
-                    newlines + usize::from(slice.last().is_some_and(|c| *c != '\n'))
+                    char_linecol(&content, b.saturating_sub(1).min(len)).0
+                        - char_linecol(&content, a.min(len)).0
+                        + 1
                 }
             }
             _ => 0,
@@ -10845,7 +10858,6 @@ fn text_count(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> 
         .collect::<Vec<_>>();
     Ok(list_value(counts))
 }
-
 fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
     let (content, cursor) = text_state(interp, path);
     let mut marks = text_marks(interp, path);
@@ -10895,12 +10907,12 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
     let first = text_index(rest[index].as_str(), &content, cursor, &marks)?;
     let last = match rest.get(index + 1) {
         Some(value) => text_index(value.as_str(), &content, cursor, &marks)?,
-        None => content.chars().count(),
+        None => content.chars().count() + 1,
     };
-    let (a, b) = (first.min(last), first.max(last));
-    let chars = content.chars().collect::<Vec<_>>();
-    let a = a.min(chars.len());
-    let b = b.min(chars.len());
+    let vlen = content.chars().count() + 1;
+    let (a, b) = (first.min(last).min(vlen), first.max(last).min(vlen));
+    let virtual_text = format!("{content}\n");
+    let chars = virtual_text.chars().collect::<Vec<_>>();
 
     let mut entries: Vec<(usize, u8, Vec<String>)> = Vec::new();
     let tag_ranges = with_state(interp, |rt| {
@@ -12244,9 +12256,10 @@ mod tests {
         let mut i = Interp::new();
         install(&mut i);
         eval(&mut i, "text .m; .m insert 1.0 {hello world}");
-        assert_eq!(eval(&mut i, ".m index end"), "1.11");
-        assert_eq!(eval(&mut i, ".m index end-1c"), "1.10");
-        assert_eq!(eval(&mut i, ".m index {end - 2c}"), "1.9");
+        // Tk's text ends with an implicit newline: end is one past it.
+        assert_eq!(eval(&mut i, ".m index end"), "2.0");
+        assert_eq!(eval(&mut i, ".m index end-1c"), "1.11");
+        assert_eq!(eval(&mut i, ".m index {end - 2c}"), "1.10");
         assert_eq!(eval(&mut i, ".m index 1.end"), "1.11");
         assert_eq!(eval(&mut i, ".m index {1.2 wordstart}"), "1.0");
         assert_eq!(eval(&mut i, ".m index {1.2 wordend}"), "1.5");
@@ -12535,6 +12548,59 @@ mod tests {
         eval(&mut i, "set ::c 0");
         text_key_event(".t", "c", false, false, false, false);
         assert_eq!(eval(&mut i, "set ::c"), "0");
+    }
+
+    #[test]
+    fn text_end_implicit_newline_semantics() {
+        let mut i = Interp::new();
+        install(&mut i);
+        // An empty widget still has Tk's implicit trailing newline.
+        eval(&mut i, "text .e");
+        assert_eq!(eval(&mut i, ".e index end"), "2.0");
+        assert_eq!(eval(&mut i, ".e get 1.0 end"), "");
+        assert_eq!(eval(&mut i, ".e count 1.0 end"), "1");
+        assert_eq!(eval(&mut i, ".e dlineinfo end"), "");
+
+        eval(&mut i, "text .a; .a insert 1.0 abc");
+        assert_eq!(eval(&mut i, ".a index end"), "2.0");
+        assert_eq!(eval(&mut i, ".a index end-1c"), "1.3");
+        assert_eq!(eval(&mut i, ".a get 1.0 end"), "abc");
+        // `count 1.0 end` includes the implicit newline; ranges ending at
+        // `end` omit it from `get`.
+        assert_eq!(eval(&mut i, ".a count 1.0 end"), "4");
+        assert_eq!(eval(&mut i, ".a count 1.0 {end -1c}"), "3");
+        assert_eq!(eval(&mut i, ".a get {end -1c} end"), "");
+        assert_eq!(eval(&mut i, ".a get end"), "");
+        assert_eq!(eval(&mut i, ".a index 2.0"), "2.0");
+        assert_eq!(eval(&mut i, ".a index 9.9"), "2.0");
+        // The implicit newline cannot be deleted and is not searchable.
+        eval(&mut i, ".a delete {end -1c} end");
+        assert_eq!(eval(&mut i, ".a get 1.0 end"), "abc");
+        eval(&mut i, ".a delete end-1c");
+        assert_eq!(eval(&mut i, ".a get 1.0 end"), "abc");
+        assert_eq!(eval(&mut i, ".a search -forward {\n} 1.0"), "");
+        // `dump` shows it; `insert end` inserts before it; a mark at end
+        // stays at end.
+        assert_eq!(
+            eval(&mut i, ".a dump -text 1.0 end"),
+            "text abc 1.0 text {\n} 1.3"
+        );
+        eval(&mut i, ".a mark set m end; .a insert end X");
+        assert_eq!(eval(&mut i, ".a get 1.0 end"), "abcX");
+        assert_eq!(eval(&mut i, ".a index m"), "2.0");
+        assert_eq!(eval(&mut i, ".a index end"), "2.0");
+        eval(&mut i, ".a insert {end -1c} \"\\n\"");
+        assert_eq!(eval(&mut i, ".a get 1.0 end"), "abcX\n");
+        assert_eq!(eval(&mut i, ".a count -lines 1.0 end"), "2");
+
+        // User-inserted trailing newlines are real content: `get 1.0 end`
+        // keeps them and only the implicit one is stripped.
+        eval(&mut i, "text .b; .b insert 1.0 \"x\\n\"");
+        assert_eq!(eval(&mut i, ".b get 1.0 end"), "x\n");
+        assert_eq!(eval(&mut i, ".b index end"), "3.0");
+        assert_eq!(eval(&mut i, ".b count 1.0 end"), "3");
+        assert_eq!(eval(&mut i, ".b count -lines 1.0 end"), "2");
+        assert_eq!(eval(&mut i, ".b get {end -1c} end"), "");
     }
 
     #[test]
@@ -12999,7 +13065,7 @@ mod tests {
             &mut i,
             "text .c; .c insert 1.0 \"one\\ntwo\\nthree\"; .c tag add t 1.0 1.3; .c mark set insert 1.1; .c mark set m 2.1",
         );
-        assert_eq!(eval(&mut i, ".c count 1.0 end"), "13");
+        assert_eq!(eval(&mut i, ".c count 1.0 end"), "14");
         assert_eq!(eval(&mut i, ".c count -lines 1.0 end"), "3");
         assert_eq!(eval(&mut i, ".c count -chars -lines 1.0 2.0"), "4 1");
         assert_eq!(eval(&mut i, ".c count -lines -chars 1.0 2.0"), "1 4");

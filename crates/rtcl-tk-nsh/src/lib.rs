@@ -22,7 +22,7 @@ use std::time::Duration;
 use nsh_base::rich_editor::{
     extensions::starter,
     model::Schema,
-    state::{EditorState, EditorStateConfig},
+    state::{EditorState, EditorStateConfig, KeyEvent, Plugin, PluginKey, PluginSpec, Transaction},
     view::{rich_editor, EditorSession, NodeViews, PartStyles, RichEditorStyles},
 };
 use nsh_base::SliderValue;
@@ -511,20 +511,85 @@ fn wysiwyg_schema() -> Schema {
     Schema::new(starter::schema_spec()).expect("the WYSIWYG schema")
 }
 
-fn wysiwyg_session(content: &str, tags: &[rtcl_tk_runtime::TextTagView]) -> Option<EditorSession> {
+/// Forwards editor key presses to the text widget's Tk bindings before the
+/// editor's own keymap (Tk's widget tag runs before the class binding).
+struct TkKeyBindings {
+    path: String,
+}
+
+impl PluginSpec for TkKeyBindings {
+    fn key(&self) -> PluginKey {
+        PluginKey::new("rtcl-tk-key-bindings")
+    }
+
+    fn handle_key_down(
+        &self,
+        _state: &EditorState,
+        event: &KeyEvent,
+        _dispatch: &mut dyn FnMut(Transaction),
+    ) -> bool {
+        rtcl_tk_runtime::text_key_event(
+            &self.path,
+            &event.key,
+            event.shift,
+            event.ctrl,
+            event.alt,
+            event.meta,
+        )
+    }
+
+    fn handle_text_input(
+        &self,
+        _state: &EditorState,
+        _from: usize,
+        _to: usize,
+        text: &str,
+        _dispatch: &mut dyn FnMut(Transaction),
+    ) -> bool {
+        // Plain characters: Tk's <Key> bindings run before the insertion.
+        rtcl_tk_runtime::text_key_event(&self.path, text, false, false, false, false)
+    }
+
+    fn handle_paste(
+        &self,
+        _state: &EditorState,
+        _slice: &nsh_base::rich_editor::model::Slice,
+        _dispatch: &mut dyn FnMut(Transaction),
+    ) -> bool {
+        rtcl_tk_runtime::paste_event(&self.path);
+        false
+    }
+}
+
+fn wysiwyg_plugins(path: &str, schema: &Schema) -> Vec<Plugin> {
+    let mut plugins = starter::plugins(schema);
+    plugins.insert(
+        0,
+        std::sync::Arc::new(TkKeyBindings {
+            path: path.to_string(),
+        }),
+    );
+    plugins
+}
+
+fn wysiwyg_session(
+    path: &str,
+    content: &str,
+    tags: &[rtcl_tk_runtime::TextTagView],
+) -> Option<EditorSession> {
     let schema = wysiwyg_schema();
     let doc = schema.node_from_json(&wysiwyg_doc(content, tags)).ok()?;
-    let plugins = starter::plugins(&schema);
+    let plugins = wysiwyg_plugins(path, &schema);
     let state =
         EditorState::create(EditorStateConfig::new(schema).doc(doc).plugins(plugins)).ok()?;
     Some(EditorSession::new(state, NodeViews::new()))
 }
 
-fn wysiwyg_session_from_doc(json: &str) -> Option<(EditorSession, String)> {
+fn wysiwyg_session_from_doc(path: &str, json: &str) -> Option<(EditorSession, String)> {
     let schema = wysiwyg_schema();
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let doc = schema.node_from_json(&value).ok()?;
-    let plugins = starter::plugins(&schema);
+    let plugins = wysiwyg_plugins(path, &schema);
     let state =
         EditorState::create(EditorStateConfig::new(schema).doc(doc).plugins(plugins)).ok()?;
     let session = EditorSession::new(state, NodeViews::new());
@@ -685,10 +750,10 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
         // The rich document is the data: prefer it, shifting its marks
         // when the text was edited outside the editor.
         if let Some(json) = &cached {
-            let merged = match wysiwyg_session_from_doc(json) {
+            let merged = match wysiwyg_session_from_doc(path, json) {
                 Some((session, text)) if text == content => Some((json.clone(), session)),
                 _ => rtcl_tk_runtime::merge_rich_doc(path, &content).and_then(|merged| {
-                    wysiwyg_session_from_doc(&merged).map(|(session, _)| (merged, session))
+                    wysiwyg_session_from_doc(path, &merged).map(|(session, _)| (merged, session))
                 }),
             };
             if let Some((json, session)) = merged {
@@ -704,7 +769,7 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                 return Some((session, styles));
             }
         }
-        let session = wysiwyg_session(&content, tags)?;
+        let session = wysiwyg_session(path, &content, tags)?;
         let json = serde_json::to_string(&session.state().doc().to_json()).ok()?;
         rtcl_tk_runtime::set_rich_doc(path, json);
         let styles = wysiwyg_styles(tags);
@@ -1341,6 +1406,12 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let submit_path = path.clone();
             let key_path = path.clone();
             let paste_path = path.clone();
+            let press_path = path.clone();
+            let focus_path = path.clone();
+            let focus_in_path = path.clone();
+            let enter_path = path.clone();
+            let leave_path = path.clone();
+            let move_path = path.clone();
             nsh_base::input()
                 .value(rtcl_tk_runtime::entry_value(&path))
                 .auto_focus(rtcl_tk_runtime::focused(&path))
@@ -1360,6 +1431,41 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 })
                 .on_paste(move |_: &PasteEvent| {
                     rtcl_tk_runtime::paste_event(&paste_path);
+                })
+                .on_press(move |e: &PressEvent| {
+                    rtcl_tk_runtime::widget_press(
+                        &press_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        e.clicks,
+                    );
+                    rtcl_tk_runtime::focus_widget(&focus_path);
+                })
+                .on_focus(move |_: &()| {
+                    rtcl_tk_runtime::focus_widget(&focus_in_path);
+                })
+                .on_mouse_enter(move |e: &MouseEvent| {
+                    rtcl_tk_runtime::enter_event(
+                        &enter_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                    );
+                })
+                .on_mouse_leave(move |e: &MouseEvent| {
+                    rtcl_tk_runtime::leave_event(
+                        &leave_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                    );
+                })
+                .on_mouse_move(move |e: &MouseEvent| {
+                    rtcl_tk_runtime::motion_event(
+                        &move_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        tk_button(e.pressed_button),
+                        tk_state(&e.modifiers),
+                    );
                 })
                 .into_element()
         }

@@ -3411,8 +3411,10 @@ fn best_binding(interp: &Interp, tag: &str, event: &EventPattern) -> Option<Stri
 
 /// Run the bindings for `path` in its bindtags order and re-render.
 /// Errors go to [`take_errors`].
-pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) {
-    let Some(ptr) = active_interp() else { return };
+pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) -> bool {
+    let Some(ptr) = active_interp() else {
+        return false;
+    };
     // Safety: the pointer is the live engine-thread Interp.
     let interp = unsafe { &mut *ptr };
     let event = event_from(sequence, ctx);
@@ -3446,17 +3448,21 @@ pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) {
             }
         }
     }
+    let mut stopped = false;
     for script in scripts {
         let script = substitute_bindings(&script, ctx);
         match eval_active(&script) {
             Ok(_) => {}
-            Err(e) if binding_stopped(&e) => break,
+            Err(e) if binding_stopped(&e) => {
+                stopped = true;
+                break;
+            }
             Err(e) => record_error(e.to_string()),
         }
     }
     // `event add <<Foo>> <Sequence>`: the physical event also fires the
-    // virtual event's bindings.
-    if event.kind != EventKind::Virtual {
+    // virtual event's bindings (unless a binding returned break).
+    if event.kind != EventKind::Virtual && !stopped {
         let virtuals = with_state(interp, |rt| {
             rt.virtual_events
                 .iter()
@@ -3473,6 +3479,7 @@ pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) {
             run_binding(path, &format!("<<{name}>>"), ctx);
         }
     }
+    stopped
 }
 
 thread_local! {
@@ -3505,9 +3512,15 @@ fn dispatch_click(path: &str, ctx: &EventCtx) {
     let clicks = register_press(path);
     run_binding(path, "<Button-1>", ctx);
     match clicks {
-        2 => run_binding(path, "<Double-Button-1>", ctx),
-        3 => run_binding(path, "<Triple-Button-1>", ctx),
-        4 => run_binding(path, "<Quadruple-Button-1>", ctx),
+        2 => {
+            run_binding(path, "<Double-Button-1>", ctx);
+        }
+        3 => {
+            run_binding(path, "<Triple-Button-1>", ctx);
+        }
+        4 => {
+            run_binding(path, "<Quadruple-Button-1>", ctx);
+        }
         _ => {}
     }
     run_binding(path, "<ButtonRelease-1>", ctx);
@@ -3522,9 +3535,15 @@ pub fn widget_press(path: &str, x: f64, y: f64, clicks: u32) {
     ctx.y = y as i64;
     run_binding(path, "<Button-1>", &ctx);
     match clicks {
-        2 => run_binding(path, "<Double-Button-1>", &ctx),
-        3 => run_binding(path, "<Triple-Button-1>", &ctx),
-        4 => run_binding(path, "<Quadruple-Button-1>", &ctx),
+        2 => {
+            run_binding(path, "<Double-Button-1>", &ctx);
+        }
+        3 => {
+            run_binding(path, "<Triple-Button-1>", &ctx);
+        }
+        4 => {
+            run_binding(path, "<Quadruple-Button-1>", &ctx);
+        }
         _ => {}
     }
     run_binding(path, "<ButtonRelease-1>", &ctx);
@@ -5248,6 +5267,57 @@ fn wheel_scroll(interp: &mut Interp, path: &str, direction: f64) {
     }
     set_scroll_fraction(interp, path, next);
     notify_yscroll(interp, path, total);
+}
+
+/// A key in a rich-text editor: dispatch the text widget's Tk `<KeyPress>`
+/// bindings (the editor is the class behavior).  Returns true when a binding
+/// returned `break` (the editor should not handle the key).
+pub fn text_key_event(
+    path: &str,
+    key: &str,
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+) -> bool {
+    let mut ctx = EventCtx::for_path(path);
+    ctx.key = match key {
+        "Enter" => "Return".to_string(),
+        "ArrowUp" => "Up".to_string(),
+        "ArrowDown" => "Down".to_string(),
+        "ArrowLeft" => "Left".to_string(),
+        "ArrowRight" => "Right".to_string(),
+        " " => "space".to_string(),
+        other => other.to_string(),
+    };
+    if key.chars().count() == 1 {
+        ctx.character = key.to_string();
+    }
+    let mut state = 0u32;
+    if shift {
+        state |= 1;
+    }
+    if ctrl {
+        state |= 4;
+    }
+    if alt {
+        state |= 8;
+    }
+    if meta {
+        state |= 64;
+    }
+    ctx.state = state.to_string();
+    let stopped = run_binding(path, "<KeyPress>", &ctx);
+    run_binding(path, "<KeyRelease>", &ctx);
+    stopped
+}
+
+/// An input took the focus from the platform: make it the Tk focus (and
+/// dispatch `<FocusOut>/<FocusIn>`) without a re-render — the platform is
+/// mid-gesture (a press or paste) and a rebuild would reset its state.
+pub fn focus_widget(path: &str) {
+    let Some(ptr) = active_interp() else { return };
+    set_tk_focus_quiet(unsafe { &mut *ptr }, Some(path.to_string()));
 }
 
 /// A paste reached an input: `<<Paste>>`.
@@ -9806,6 +9876,10 @@ mod tests {
         );
         eval(&mut i, "event generate .b <Button-1>");
         assert_eq!(eval(&mut i, "set ::log"), "widget");
+        assert!(
+            run_binding(".b", "<Button-1>", &EventCtx::for_path(".b")),
+            "break is reported to the caller"
+        );
     }
 
     #[test]

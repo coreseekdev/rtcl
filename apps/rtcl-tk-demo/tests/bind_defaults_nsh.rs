@@ -343,6 +343,73 @@ fn paste_fires_virtual_event() {
     let mut paste = PasteEvent::default();
     paste.text = "hi".to_string();
     app.paste("text:x", &paste).expect("paste");
+    let _ = app.settle();
+    eprintln!("after paste: {:?}", app.screen().texts());
     app.wait_for("pasted")
         .expect("<<Paste>> binding fired");
+}
+
+const ENTRY_POINTER_APP: &str = r#"
+set ::value x
+set ::report ""
+entry .e -textvariable ::value
+pack .e
+label .out -textvariable ::report
+pack .out
+bind .e <Button-1> {set ::report click}
+bind .e <FocusIn> {append ::report " in"}
+"#;
+
+#[component]
+fn EntryPointerApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(ENTRY_POINTER_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn entry_pointer_and_focus_bindings() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<EntryPointerApp>()))
+        .expect("headless engine starts");
+    app.set_viewport(Size::new(Points(400.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("x").expect("entry renders");
+    app.press("text:x").expect("click into the entry");
+    app.wait_for("click in")
+        .expect("<Button-1> and <FocusIn> fired for the entry");
+}
+
+const RICH_KEY_APP: &str = r##"
+set ::report ""
+text .t -height 3
+.t insert end "hi"
+.t tag configure hot -foreground "#ef4444"
+.t tag add hot 1.0 1.2
+pack .t
+label .out -textvariable ::report
+pack .out
+bind .t <Key> {append ::report "key=%A"}
+"##;
+
+#[component]
+fn RichKeyApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(RICH_KEY_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn rich_text_key_bindings_fire() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<RichKeyApp>()))
+        .expect("headless engine starts");
+    app.set_viewport(Size::new(Points(500.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("hi").expect("rich editor renders");
+    app.press("hi").expect("focus the editor");
+    app.press_key("x").expect("type in the editor");
+    app.wait_for("key=x")
+        .expect("the text widget's <Key> binding fired");
+    assert!(
+        app.screen().texts().iter().any(|text| *text == "key=x"),
+        "the binding ran once: {:?}",
+        app.screen().texts()
+    );
 }

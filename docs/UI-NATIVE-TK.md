@@ -136,7 +136,9 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
   `RichEditorEvent::Wheel`（富文本编辑器内容区）、
   `MouseEnter/MouseLeave/MouseMove` 事件（Button/Checkbox/Radio/Slider
   组件，nsh-core 补了 `MouseEvent` 的 JsValue）、
-  `RichEditorEvent::Motion`（富文本内容区 hover/motion）。
+  `RichEditorEvent::Motion`（富文本内容区 hover/motion）、
+  `nsh-platform-linux::clipboard_text_blocking`（GTK 异步读 + 嵌套主循环
+  转同步，供 Tk `clipboard get`）。
 
 ## 6. 里程碑
 
@@ -345,7 +347,8 @@ text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/se
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
 text `undo/redo` 与 `tag bind` 暂为 no-op；`tk_messageBox` 与 `selection`
 命令未实现；`clipboard clear/append/get` 维护应用自己的文本并同步到系统
-剪贴板（`clipboard get` 只读回应用写入的内容，系统剪贴板的异步读取未接）；
+剪贴板；应用未拥有剪贴板时 `get` 通过后端的同步 getter 读取系统剪贴板
+（Linux：GTK 异步读包在嵌套主循环里，1s 超时；其它平台未接 getter 时返回空）；
 `<Configure>` 尚未覆盖菜单窗口；`<<Copy>>/<<Cut>>/<<SelectAll>>`
 等虚拟事件没有默认映射（可用 `event add` 自行定义）；
 entry 选区拖动（`<B1-Motion>`）在桌面鼠标拖动时由平台 MouseMove 派发，

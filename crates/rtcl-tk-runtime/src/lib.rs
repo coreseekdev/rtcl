@@ -84,6 +84,9 @@ pub struct TkRuntime {
     virtual_events: BTreeMap<String, Vec<String>>,
     /// The application's clipboard (`clipboard clear/append/get`).
     clipboard: String,
+    /// Whether this app owns the clipboard (its `get` answers `clipboard`,
+    /// even empty, instead of asking the system).
+    clipboard_owned: bool,
     /// Persisted rich-text documents (ProseMirror JSON) of `text` widgets.
     rich_docs: BTreeMap<String, String>,
     /// `text edit modified` state: widgets with unsaved edits.
@@ -4075,6 +4078,16 @@ thread_local! {
     /// A synchronous announcement of the Tk clipboard's text (the native
     /// backend pushes it onto the system clipboard).
     static CLIPBOARD_SINK: std::cell::Cell<Option<fn(&str)>> = const { std::cell::Cell::new(None) };
+    /// A synchronous read of the system clipboard for `clipboard get` when
+    /// this app does not own it (implemented by the native platform).
+    static CLIPBOARD_GETTER: std::cell::Cell<Option<fn() -> String>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The backend's synchronous clipboard reader (Linux: a nested main
+/// context around GTK's asynchronous read).
+pub fn set_clipboard_getter(getter: fn() -> String) {
+    CLIPBOARD_GETTER.with(|cell| cell.set(Some(getter)));
 }
 
 /// The backend's sink for [`clipboard`](clipboard_impl) changes: called with
@@ -4097,6 +4110,7 @@ fn clipboard_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "clear" => {
             with_state_mut(interp, |rt| {
                 rt.clipboard.clear();
+                rt.clipboard_owned = true;
             });
             announce_clipboard("");
             Ok(Value::empty())
@@ -4123,6 +4137,7 @@ fn clipboard_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .collect::<String>();
             let current = with_state_mut(interp, |rt| {
                 rt.clipboard.push_str(&text);
+                rt.clipboard_owned = true;
                 rt.clipboard.clone()
             })
             .unwrap_or_default();
@@ -4130,8 +4145,16 @@ fn clipboard_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::empty())
         }
         "get" => {
-            let text = with_state(interp, |rt| rt.clipboard.clone()).unwrap_or_default();
-            Ok(Value::from_str(&text))
+            let (owned, text) = with_state(interp, |rt| (rt.clipboard_owned, rt.clipboard.clone()))
+                .unwrap_or((false, String::new()));
+            if owned {
+                return Ok(Value::from_str(&text));
+            }
+            let from_system = CLIPBOARD_GETTER
+                .with(|cell| cell.get())
+                .map(|getter| getter())
+                .unwrap_or_default();
+            Ok(Value::from_str(&from_system))
         }
         other => Err(generic(format!(
             "bad option \"{other}\": must be append, clear, or get"
@@ -9971,17 +9994,26 @@ mod tests {
         fn sink(text: &str) {
             *SINKED.lock().unwrap() = text.to_string();
         }
+        static CALLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn getter() -> String {
+            CALLED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "external".to_string()
+        }
         set_clipboard_sink(sink);
+        set_clipboard_getter(getter);
 
         let mut i = Interp::new();
         install(&mut i);
-        eval(&mut i, "clipboard clear");
-        assert_eq!(eval(&mut i, "clipboard get"), "");
+        // Owning nothing, `get` asks the system (synchronously).
+        assert_eq!(eval(&mut i, "clipboard get"), "external");
         eval(&mut i, "clipboard append -type STRING Hel lo");
         assert_eq!(eval(&mut i, "clipboard get"), "Hello");
         assert_eq!(*SINKED.lock().unwrap(), "Hello");
+        let calls = CALLED.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(calls, 1, "own clipboard answers without the system");
         eval(&mut i, "clipboard clear");
         assert_eq!(eval(&mut i, "clipboard get"), "");
+        assert_eq!(CALLED.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(*SINKED.lock().unwrap(), "");
     }
 

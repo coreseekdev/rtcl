@@ -68,6 +68,8 @@ pub fn install_backend() {
     rtcl_tk_runtime::set_change_hook(Some(notify_backend));
     // Tk's clipboard is the system clipboard when the backend is present.
     rtcl_tk_runtime::set_clipboard_sink(|text| set_clipboard(text));
+    #[cfg(target_os = "linux")]
+    rtcl_tk_runtime::set_clipboard_getter(nsh_platform_linux::clipboard_text_blocking);
 }
 
 fn revision_signal() -> Signal<u64> {

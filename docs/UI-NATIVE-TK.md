@@ -187,7 +187,7 @@ radiobutton,scale,text,listbox,scrollbar,message,canvas}` 别名（ttk
 
 **命令**：`configure/cget/cget 前缀缩写/destroy/pack/grid/place/winfo/
 wm/tk/bind/bindtags/event generate/focus/raise/lower/font/option/bell/
-tk_focusNext/tk_focusPrev/menu/clipboard`；控件子命令含 `invoke/get/insert/delete/
+tk_focusNext/tk_focusPrev/menu/clipboard/selection`；控件子命令含 `invoke/get/insert/delete/
 index/icursor/selection/size/curselection/step` 等；菜单子命令含
 `add/insert/delete/index/entrycget/entryconfigure/invoke/type/post/
 unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
@@ -351,10 +351,14 @@ rotation×10）；`event generate` 接受 `-x/-y/-rootx/-rooty/-key/-keysym/
 旋转/贝塞尔/箭头/虚线/图片/arc/polygon/锚点与 bbox/find 查询；
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
-`tag bind` 暂为 no-op；`tk_messageBox` 与 `selection`
-命令未实现；`clipboard clear/append/get` 维护应用自己的文本并同步到系统
-剪贴板；应用未拥有剪贴板时 `get` 通过后端的同步 getter 读取系统剪贴板
-（Linux：GTK 异步读包在嵌套主循环里，1s 超时；其它平台未接 getter 时返回空）；
+`tag bind` 暂为 no-op；`tk_messageBox` 未实现；`clipboard
+clear/append/get` 维护应用自己的文本并同步到系统剪贴板；应用未拥有剪贴板
+时 `get` 通过后端的同步 getter 读取系统剪贴板（Linux：GTK 异步读包在嵌套
+主循环里，1s 超时；其它平台未接 getter 时返回空）；`selection
+own/clear/get/handle` 维护 PRIMARY/CLIPBOARD 所有权，拥有时 `get` 调用本地
+handler（`handlerCommand offset maxChars`），未拥有时回退到剪贴板文本，
+`-type TARGETS` 返回 `STRING UTF8_STRING`；系统 PRIMARY 选区桥（X11
+primary/wayland 选区）尚未接入，因此非本应用拥有的 PRIMARY 读取也走剪贴板；
 `<Configure>` 尚未覆盖菜单窗口；`<<Copy>>/<<Cut>>/<<SelectAll>>`
 等虚拟事件没有默认映射（可用 `event add` 自行定义）；
 entry 选区拖动（`<B1-Motion>`）在桌面鼠标拖动时由平台 MouseMove 派发，

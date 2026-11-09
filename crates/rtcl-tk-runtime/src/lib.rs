@@ -87,6 +87,12 @@ pub struct TkRuntime {
     /// Whether this app owns the clipboard (its `get` answers `clipboard`,
     /// even empty, instead of asking the system).
     clipboard_owned: bool,
+    /// The selection this app currently owns (`selection own`).
+    selection_owned: Option<String>,
+    /// The window named in `selection own`.
+    selection_window: Option<String>,
+    /// `selection handle` registrations keyed by (selection, type).
+    selection_handlers: BTreeMap<(String, String), SelectionHandler>,
     /// `text -undo` stacks by widget path.
     text_undo: BTreeMap<String, TextUndo>,
     /// Persisted rich-text documents (ProseMirror JSON) of `text` widgets.
@@ -500,6 +506,7 @@ pub fn install(interp: &mut Interp) {
         "menu",
         "image",
         "clipboard",
+        "selection",
     ] {
         interp.register_command(name, global_command);
     }
@@ -4126,6 +4133,13 @@ pub fn set_clipboard_sink(sink: fn(&str)) {
     CLIPBOARD_SINK.with(|cell| cell.set(Some(sink)));
 }
 
+#[derive(Debug, Clone)]
+struct SelectionHandler {
+    window: String,
+    command: String,
+    format: String,
+}
+
 fn announce_clipboard(text: &str) {
     if let Some(sink) = CLIPBOARD_SINK.with(|cell| cell.get()) {
         sink(text);
@@ -4188,6 +4202,169 @@ fn clipboard_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         other => Err(generic(format!(
             "bad option \"{other}\": must be append, clear, or get"
+        ))),
+    }
+}
+
+/// The clipboard's text, whether this app owns it or the system does.
+fn clipboard_text_value(interp: &Interp) -> String {
+    let (owned, text) = with_state(interp, |rt| (rt.clipboard_owned, rt.clipboard.clone()))
+        .unwrap_or((false, String::new()));
+    if owned {
+        return text;
+    }
+    CLIPBOARD_GETTER
+        .with(|cell| cell.get())
+        .map(|getter| getter())
+        .unwrap_or_default()
+}
+
+/// `selection` (PRIMARY/CLIPBOARD ownership and retrieval).  There is no
+/// X11 primary-selection bridge yet, so reads fall back to the clipboard
+/// text; handlers run locally when this app owns the selection.
+fn selection_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(wrong("selection", "option ?arg ...?", args.len()));
+    }
+    let sub = args[1].as_str().to_string();
+    let mut selection = "PRIMARY".to_string();
+    let mut kind = "STRING".to_string();
+    let mut displayof = None;
+    let mut command = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 2;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
+            "-selection" | "-type" | "-displayof" | "-format" | "-command" => {
+                let Some(value) = args.get(i + 1) else {
+                    return Err(wrong("selection", "option ?arg ...?", args.len()));
+                };
+                match arg {
+                    "-selection" => selection = value.as_str().to_string(),
+                    "-type" => kind = value.as_str().to_string(),
+                    "-displayof" => displayof = Some(value.as_str().to_string()),
+                    "-format" => {}
+                    _ => command = Some(value.as_str().to_string()),
+                }
+                i += 2;
+            }
+            other if other.starts_with('-') && positional.is_empty() => {
+                return Err(generic(format!(
+                    "bad option \"{other}\": must be -command, -displayof, -format, -selection, or -type"
+                )));
+            }
+            other => {
+                positional.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    match sub.as_str() {
+        "get" => {
+            if !positional.is_empty() {
+                return Err(wrong(
+                    "selection get",
+                    "?-selection sel? ?-type type?",
+                    args.len(),
+                ));
+            }
+            if kind == "TARGETS" {
+                return Ok(Value::from_str("STRING UTF8_STRING"));
+            }
+            let owned = with_state(interp, |rt| {
+                rt.selection_owned.as_deref() == Some(selection.as_str())
+            })
+            .unwrap_or(false);
+            let handler = with_state(interp, |rt| {
+                rt.selection_handlers
+                    .get(&(selection.clone(), kind.clone()))
+                    .or_else(|| {
+                        rt.selection_handlers
+                            .get(&(selection.clone(), "STRING".to_string()))
+                    })
+                    .cloned()
+            })
+            .flatten();
+            if owned {
+                if let Some(handler) = handler {
+                    return interp.eval(&format!("{} 0 2147483647", handler.command));
+                }
+            }
+            Ok(Value::from_str(&clipboard_text_value(interp)))
+        }
+        "own" => {
+            if positional.len() > 1 {
+                return Err(wrong(
+                    "selection own",
+                    "?-command command? ?selection?",
+                    args.len(),
+                ));
+            }
+            if let Some(name) = positional.first() {
+                selection = name.clone();
+            }
+            let window = displayof.unwrap_or_else(|| ".".to_string());
+            with_state_mut(interp, |rt| {
+                rt.selection_owned = Some(selection.clone());
+                rt.selection_window = Some(window.clone());
+                if let Some(script) = &command {
+                    rt.selection_handlers.insert(
+                        (selection.clone(), "STRING".to_string()),
+                        SelectionHandler {
+                            window: window.clone(),
+                            command: script.clone(),
+                            format: "STRING".to_string(),
+                        },
+                    );
+                }
+            });
+            Ok(Value::empty())
+        }
+        "clear" => {
+            if positional.len() > 1 {
+                return Err(wrong("selection clear", "?-selection sel?", args.len()));
+            }
+            if let Some(name) = positional.first() {
+                selection = name.clone();
+            }
+            with_state_mut(interp, |rt| {
+                if rt.selection_owned.as_deref() == Some(selection.as_str()) {
+                    rt.selection_owned = None;
+                    rt.selection_window = None;
+                }
+            });
+            Ok(Value::empty())
+        }
+        "handle" => {
+            if positional.len() != 2 {
+                return Err(wrong(
+                    "selection handle",
+                    "?options? window command",
+                    args.len(),
+                ));
+            }
+            let window = positional[0].clone();
+            let script = positional[1].clone();
+            with_state_mut(interp, |rt| {
+                if script.is_empty() {
+                    rt.selection_handlers
+                        .remove(&(selection.clone(), kind.clone()));
+                } else {
+                    rt.selection_handlers.insert(
+                        (selection.clone(), kind.clone()),
+                        SelectionHandler {
+                            window,
+                            command: script,
+                            format: "STRING".to_string(),
+                        },
+                    );
+                }
+            });
+            Ok(Value::empty())
+        }
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be clear, get, handle, or own"
         ))),
     }
 }
@@ -9480,6 +9657,7 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "menu" => menu_create(interp, args),
         "image" => image_impl(interp, args),
         "clipboard" => clipboard_impl(interp, args),
+        "selection" => selection_impl(interp, args),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -10034,6 +10212,46 @@ mod tests {
         assert_eq!(eval(&mut i, ".u edit canundo"), "0");
         assert_eq!(eval(&mut i, ".u edit canredo"), "0");
         assert_eq!(eval(&mut i, ".u edit modified"), "0");
+    }
+
+    #[test]
+    fn selection_own_handle_and_clipboard_fallback() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "proc selText {offset maxChars} {string range \"hello there\" $offset [expr {$offset + $maxChars - 1}]}",
+        );
+        assert_eq!(eval(&mut i, "selection get"), "");
+        eval(&mut i, "selection handle . selText");
+        // Handlers only serve reads while this app owns the selection.
+        assert_eq!(eval(&mut i, "selection get"), "");
+        eval(&mut i, "selection own");
+        assert_eq!(eval(&mut i, "selection get"), "hello there");
+        assert_eq!(
+            eval(&mut i, "selection get -type UTF8_STRING"),
+            "hello there"
+        );
+        assert_eq!(
+            eval(&mut i, "selection get -type TARGETS"),
+            "STRING UTF8_STRING"
+        );
+        eval(&mut i, "selection clear");
+        assert_eq!(eval(&mut i, "selection get"), "");
+        // The CLIPBOARD selection falls back to the clipboard text.
+        eval(&mut i, "clipboard clear; clipboard append sys");
+        assert_eq!(eval(&mut i, "selection get -selection CLIPBOARD"), "sys");
+        // `own -command` registers the handler in one step.
+        eval(
+            &mut i,
+            "proc ownedSel {offset maxChars} {string range owned $offset [expr {$offset + $maxChars - 1}]};             selection own -selection CLIPBOARD -command ownedSel",
+        );
+        assert_eq!(eval(&mut i, "selection get -selection CLIPBOARD"), "owned");
+        eval(
+            &mut i,
+            "selection handle -selection CLIPBOARD -type STRING . {}",
+        );
+        assert_eq!(eval(&mut i, "selection get -selection CLIPBOARD"), "sys");
     }
 
     #[test]

@@ -424,7 +424,8 @@ text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/se
 `tk_messageBox` 由宿主回调提供原生模态框：Linux 后端注册 GTK
 `AlertDialog`（Tcl 命令在嵌套主循环里阻塞到用户选择，`-type` 六种按钮组、
 `-default/-cancel` 映射默认/Escape，返回 ok/cancel/yes/no/retry/abort/ignore；
-GTK 无窗口标题，`-title` 折进正文首行，`-parent` 暂忽略）；无后端或
+GTK 无窗口标题，`-title` 折进正文首行；`-parent` 命名的 Tk 窗口里只有
+"." 是原生窗口，对话框固定挂主窗口——本模型下唯一可能的父窗口）；无后端或
 GTK 初始化失败时立即返回默认按钮，便于 headless/非 Linux；`tk_dialog
 window title text bitmap default ?button ...?` 用同一 GTK AlertDialog
 基础返回按钮下标（按钮数量自定义，关闭对话框返回 default 下标；window
@@ -441,8 +442,9 @@ clear/append/get` 维护应用自己的文本并同步到系统剪贴板；应�
 主循环里，1s 超时；其它平台未接 getter 时返回空）；`selection
 own/clear/get/handle` 维护 PRIMARY/CLIPBOARD 所有权，拥有时 `get` 调用本地
 handler（`handlerCommand offset maxChars`），未拥有时回退到剪贴板文本，
-`-type TARGETS` 返回 `STRING UTF8_STRING`；系统 PRIMARY 选区桥（X11
-primary/wayland 选区）尚未接入，因此非本应用拥有的 PRIMARY 读取也走剪贴板；
+`-type TARGETS` 返回 `STRING UTF8_STRING`；系统 PRIMARY 选区桥不可行
+（GTK4 不暴露 X11/Wayland 的 primary selection，gdk::Clipboard 只有默认
+选区），因此非本应用拥有的 PRIMARY 读取走剪贴板；
 `<Configure>` 尚未覆盖菜单窗口；`<<Copy>>/<<Cut>>/<<Paste>>/<<SelectAll>>/<<Undo>>/<<Redo>>`
 已按 Tk init.tcl 预定义（`event info` 可见，物理 Ctrl+键自动触发其绑定）；
 text/富文本路径经修饰键触发，plain entry/Spinbox 由 ambient

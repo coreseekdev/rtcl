@@ -199,6 +199,8 @@ unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
 `ttk::treeview` 的 `insert/delete/item/selection/focus/children/parent/
 index/heading/column/exists`；listbox 的 `nearest y`/`bbox index` 按
 渲染行高 18px 的模型近似（bbox 仅返回可见行，格式 `x y w h`）；
+滚动查询（listbox/treeview yview、text/entry/listbox xview）返回 Tk 的
+浮点样式（未滚动为 `0.0 1.0`，滚动条联动断言已同步）；
 listbox/treeview 按 `-height` 放进滚动视图（滚轮可滚）；Tcl 侧的 `after/update/vwait` 沿用 rtcl-vm。
 
 **弹出菜单**：`tk_popup menu x y ?entry?` 与 `menu post x y` 在指定点弹出
@@ -308,7 +310,9 @@ tag 区间、mark 与富文档；`-autoseparators`（默认开）时 500ms 内�
 Tcl 侧 `tag add/remove` 这类纯格式命令不单独入栈，但会随下一次文本编辑的
 快照一起回滚。富编辑器内部的 Ctrl+Z 仍由编辑器自身的历史处理。
 `text see index` 在富文本编辑器里滚动到该字符位置（不移动 caret；普通
-text 无滚动模型时为 no-op）；`text count ?-chars|-indices|-lines|-update|-elide? index1 index2` 按选项
+text 无滚动模型时为 no-op）；`text dlineinfo index` 按 18px 行高模型返回
+`x y w h baseline`（x=3，w 为 -width 字符宽，行不可见/超出行数/end 位置
+返回空串）；`text count ?-chars|-indices|-lines|-update|-elide? index1 index2` 按选项
 顺序返回计数（默认 chars）；`text dump ?-all|-text|-tag|-mark|-image|
 -window? index1 ?index2?` 按位置输出 Tk 风格事件流：`tagon/tagoff <tag>
 <index>`、`mark <name> <index>`、`text <chars> <index>`，text 在 tag

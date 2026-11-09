@@ -1013,7 +1013,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     Ok(Value::empty())
                 }
                 "selection" => entry_selection(interp, path, &args[2..]),
-                "xview" => Ok(Value::empty()),
+                "xview" => Ok(list_value(["0.0".to_string(), "1.0".to_string()])),
                 "validate" => Ok(Value::from_int(1)),
                 _ => bad_subcommand(kind, sub),
             },
@@ -1079,6 +1079,52 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         char_to_linecol(&content, i)
                     )))
                 }
+                "dlineinfo" => {
+                    if args.len() != 3 {
+                        return Err(wrong("dlineinfo", "index", args.len()));
+                    }
+                    let (content, cursor) = text_state(interp, path);
+                    let marks = text_marks(interp, path);
+                    let index = text_index(args[2].as_str(), &content, cursor, &marks)?;
+                    // Tk's `end` (just past the last character) shows no
+                    // display line.
+                    if !content.is_empty() && index >= content.chars().count() {
+                        return Ok(Value::from_str(""));
+                    }
+                    let (line, _col) = match char_to_linecol(&content, index).split_once('.') {
+                        Some((line, col)) => (
+                            line.parse::<usize>().unwrap_or(1),
+                            col.parse::<usize>().unwrap_or(0),
+                        ),
+                        None => (1, 0),
+                    };
+                    let lines = content.matches('\n').count() + 1;
+                    if line > lines {
+                        return Ok(Value::from_str(""));
+                    }
+                    // Tk hides lines scrolled out of view; our model keeps
+                    // the top at fraction 0, so lines past `-height` are
+                    // not displayed.
+                    let visible = effective_option(interp, path, "-height")
+                        .parse::<usize>()
+                        .unwrap_or(10)
+                        .max(1);
+                    if line > visible {
+                        return Ok(Value::from_str(""));
+                    }
+                    let width = effective_option(interp, path, "-width")
+                        .parse::<usize>()
+                        .unwrap_or(80)
+                        .max(1) as i64;
+                    let y = 3 + (line - 1) as i64 * 18;
+                    Ok(list_value([
+                        "3".to_string(),
+                        y.to_string(),
+                        width.to_string(),
+                        "18".to_string(),
+                        (y + 14).to_string(),
+                    ]))
+                }
                 "see" => {
                     if args.len() != 3 {
                         return Err(wrong("see", "index", args.len()));
@@ -1117,7 +1163,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "search" => text_search(interp, path, &args[2..]),
                 "count" => text_count(interp, path, &args[2..]),
                 "dump" => text_dump(interp, path, &args[2..]),
-                "xview" | "yview" => Ok(Value::empty()),
+                "xview" | "yview" => Ok(list_value(["0.0".to_string(), "1.0".to_string()])),
                 _ => bad_subcommand(kind, sub),
             },
             WidgetKind::Panedwindow => panedwindow_command(interp, path, &args[1..]),
@@ -1241,7 +1287,8 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         (LISTBOX_ROW_PX as i64).to_string(),
                     ]))
                 }
-                "activate" | "xview" => Ok(Value::empty()),
+                "activate" => Ok(Value::empty()),
+                "xview" => Ok(list_value(["0.0".to_string(), "1.0".to_string()])),
                 _ => bad_subcommand(kind, sub),
             },
             WidgetKind::Scale => match sub {
@@ -1787,7 +1834,7 @@ fn bad_subcommand(kind: WidgetKind, sub: &str) -> Result<Value> {
             "cget, configure, delete, destroy, get, icursor, index, insert, selection, set, validate, xview"
         }
         WidgetKind::Text => {
-            "cget, configure, delete, destroy, edit, get, index, insert, mark, see, tag, xview, yview"
+            "cget, configure, dlineinfo, delete, destroy, edit, get, index, insert, mark, see, tag, xview, yview"
         }
         WidgetKind::Listbox => {
             "activate, bbox, cget, configure, curselection, delete, destroy, get, index, insert, itemcget, itemconfigure, nearest, see, selection, size, xview, yview"
@@ -11211,7 +11258,12 @@ fn listbox_index(spec: &str, len: usize) -> Result<usize> {
 
 fn format_fraction(value: f64) -> String {
     let text = format!("{value:.4}");
-    text.trim_end_matches('0').trim_end_matches('.').to_string()
+    let trimmed = text.trim_end_matches('0').to_string();
+    if trimmed.ends_with('.') {
+        format!("{trimmed}0")
+    } else {
+        trimmed
+    }
 }
 
 /// The scroll fraction and visible row count of a listbox/treeview.
@@ -11949,7 +12001,7 @@ mod tests {
         );
         assert_eq!(eval(&mut i, ".ls cget -height"), "3");
         assert_eq!(eval(&mut i, ".ls size"), "10");
-        assert_eq!(eval(&mut i, ".ls yview"), "0 0.3");
+        assert_eq!(eval(&mut i, ".ls yview"), "0.0 0.3");
         assert_eq!(eval(&mut i, ".ss get"), "0 0.3");
         scrollbar_step(".ss", 1, false);
         let first = eval(&mut i, "lindex [.ls yview] 0");
@@ -12155,12 +12207,12 @@ mod tests {
             "canvas .sv -width 100 -height 100 -scrollregion {0 0 400 400}; \
              .sv create rectangle 0 0 400 400",
         );
-        assert_eq!(eval(&mut i, ".sv xview"), "0 0.25");
+        assert_eq!(eval(&mut i, ".sv xview"), "0.0 0.25");
         eval(&mut i, ".sv xview moveto 1");
         assert_eq!(eval(&mut i, "lindex [.sv xview] 0"), "0.75");
-        assert_eq!(eval(&mut i, ".sv yview"), "0 0.25");
+        assert_eq!(eval(&mut i, ".sv yview"), "0.0 0.25");
         eval(&mut i, ".sv yview scroll 1 pages");
-        assert_ne!(eval(&mut i, "lindex [.sv yview] 0"), "0");
+        assert_ne!(eval(&mut i, "lindex [.sv yview] 0"), "0.0");
     }
 
     #[test]
@@ -12483,6 +12535,25 @@ mod tests {
         eval(&mut i, "set ::c 0");
         text_key_event(".t", "c", false, false, false, false);
         assert_eq!(eval(&mut i, "set ::c"), "0");
+    }
+
+    #[test]
+    fn text_dlineinfo_and_view_queries() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "text .t -width 20 -height 5; .t insert 1.0 \"one\\ntwo\\nthree\"",
+        );
+        assert_eq!(eval(&mut i, ".t dlineinfo 1.0"), "3 3 20 18 17");
+        assert_eq!(eval(&mut i, ".t dlineinfo 2.1"), "3 21 20 18 35");
+        assert_eq!(eval(&mut i, ".t dlineinfo 5.0"), "");
+        assert_eq!(eval(&mut i, ".t yview"), "0.0 1.0");
+        assert_eq!(eval(&mut i, ".t xview"), "0.0 1.0");
+        eval(&mut i, "entry .e; listbox .l");
+        assert_eq!(eval(&mut i, ".e xview"), "0.0 1.0");
+        assert_eq!(eval(&mut i, ".l xview"), "0.0 1.0");
+        assert_eq!(eval(&mut i, ".l yview"), "0.0 1.0");
     }
 
     #[test]
@@ -12999,7 +13070,7 @@ mod tests {
         );
         wheel_event(".l", 0.0, 1.0, 0);
         assert_eq!(eval(&mut i, "set ::log"), "up wheel120");
-        assert_eq!(eval(&mut i, "lindex [.l yview] 0"), "0");
+        assert_eq!(eval(&mut i, "lindex [.l yview] 0"), "0.0");
         wheel_event(".l", 0.0, -1.0, 0);
         assert!(eval(&mut i, "set ::log").contains("down"));
         assert_eq!(eval(&mut i, "lindex [.l yview] 0"), "0.3");
@@ -13781,7 +13852,7 @@ mod press_debug_tests {
         eval(&mut i, ".tw see d");
         assert_eq!(eval(&mut i, "lindex [.tw yview] 0"), "0.4");
         eval(&mut i, ".tw see a");
-        assert_eq!(eval(&mut i, "lindex [.tw yview] 0"), "0");
+        assert_eq!(eval(&mut i, "lindex [.tw yview] 0"), "0.0");
     }
 
     #[test]

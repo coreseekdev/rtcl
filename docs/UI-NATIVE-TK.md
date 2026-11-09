@@ -337,9 +337,12 @@ names`）；dump -image 输出 `image <name> <index>`。**行内绘制已接入
 WYSIWYG**：渲染器把 doc 里的 U+FFFC 段拼接成 ProseMirror image 节点
 （attrs: src=photo 文件、width/height=image_dimensions），读回时 image
 节点经 leaf_text 映射回 U+FFFC（内容长度不漂移）；merge/dump/see 的
-位置映射同样感知 image 节点。GTK 截图里该段首帧尚未画出（nsh image
-异步解码 + 快照时序），交互运行时应可见——桌面视觉验收待交互截图
-工具（Wayland 下无 import/gnome-screenshot 可用）。
+位置映射同样感知 image 节点。`image create photo` 补了 `-data`
+（data:/base64 payload，Tk photo 原生特性；Tcl 脚本里 data URI 的 `;`
+必须用花括号引用）。**视觉验证状态**：桌面 GTK 快照与 Android 模拟器
+截图均未画出 inline image/label -image（Android 上 file 路径与 data:
+URI 均不显示，需查 nsh-platform-android 的 Images.java 加载管线；
+桌面快照受首帧局限）；文本/布局本身两端渲染正常。
 `tag bind tagName ?sequence? ?script?` 把事件绑定到 tag 区间：富文本编辑器
 按下时按指针下的文档位置映射成字符下标，命中区间的 tag 依次执行最具体的
 sequence（`<Button-1>`、Double/Triple/Quadruple、`<ButtonRelease-1>`、

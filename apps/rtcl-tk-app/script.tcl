@@ -7,7 +7,10 @@ button .go -text "Tap me" -command {
 }
 pack .go -padx 12
 
-image create photo demoimg -file /data/local/tmp/rtcl-demo.png
+image create photo demoimg -file /sdcard/Android/data/dev.rtcl.tkapp/files/rtcl-demo.png
+image create photo demoData -data {data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAAJUlEQVR4nGOQS771n5aYYdSCUQtGLRi1YNSCUQtGLRi1YGhYAACyjErMPxGm9gAAAABJRU5ErkJggg==}
+label .img -image demoData
+pack .img -padx 12
 text .doc -height 5
 .doc insert end "with embedded:"
 .doc insert end "\n"

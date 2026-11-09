@@ -5934,9 +5934,13 @@ fn image_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             for (key, value) in parse_pairs(args, start, "image create")? {
                 match key.as_str() {
                     "-file" => image.file = value,
+                    // A data URI (or base64 payload): the renderer's image
+                    // element treats the string as its source, and the
+                    // platforms' data-URI loaders decode it.
+                    "-data" => image.file = value,
                     "-width" => image.width = value.parse().unwrap_or(0),
                     "-height" => image.height = value.parse().unwrap_or(0),
-                    "-data" | "-format" | "-gamma" | "-palette" => {}
+                    "-format" | "-gamma" | "-palette" => {}
                     _ => return Err(bad_option(&key)),
                 }
             }

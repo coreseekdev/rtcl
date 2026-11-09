@@ -486,7 +486,13 @@ pub fn install(interp: &mut Interp) {
          bind TCheckbutton <Key-space> {catch {%W invoke}}\n\
          bind TCheckbutton <Key-Return> {catch {%W invoke}}\n\
          bind TRadiobutton <Key-space> {catch {%W invoke}}\n\
-         bind TRadiobutton <Key-Return> {catch {%W invoke}}",
+         bind TRadiobutton <Key-Return> {catch {%W invoke}}\n\
+         bind Button <<Invoke>> {catch {%W invoke}}\n\
+         bind TButton <<Invoke>> {catch {%W invoke}}\n\
+         bind Checkbutton <<Invoke>> {catch {%W invoke}}\n\
+         bind TCheckbutton <<Invoke>> {catch {%W invoke}}\n\
+         bind Radiobutton <<Invoke>> {catch {%W invoke}}\n\
+         bind TRadiobutton <<Invoke>> {catch {%W invoke}}",
     );
 }
 
@@ -1368,6 +1374,13 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         .iter()
                         .map(|v| v.as_str().to_string())
                         .collect::<Vec<_>>();
+                    let before = with_state(interp, |rt| {
+                        rt.treeviews
+                            .get(path)
+                            .map(|tv| tv.selected.iter().cloned().collect::<Vec<_>>())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
                     with_state_mut(interp, |rt| {
                         if let Some(tv) = rt.treeviews.get_mut(path) {
                             match op {
@@ -1400,6 +1413,9 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                             .unwrap_or_default()
                     })
                     .unwrap_or_default();
+                    if selected != before {
+                        fire_virtual(path, "TreeviewSelect");
+                    }
                     Ok(list_value(selected))
                 }
                 "focus" => {
@@ -3460,6 +3476,11 @@ pub fn widget_press(path: &str, x: f64, y: f64, clicks: u32) {
     run_binding(path, "<ButtonRelease-1>", &ctx);
 }
 
+/// Fire a Tk virtual event (`<<ListboxSelect>>`, ...) on `path`.
+fn fire_virtual(path: &str, name: &str) {
+    run_binding(path, &format!("<<{name}>>"), &EventCtx::for_path(path));
+}
+
 /// Tcl `break`/`continue` in a binding stops the event (tkinter's
 /// `return "break"`).
 fn binding_stopped(error: &Error) -> bool {
@@ -5294,9 +5315,9 @@ pub fn press_button(path: &str) {
         kind,
         Some(WidgetKind::Button) | Some(WidgetKind::Checkbutton) | Some(WidgetKind::Radiobutton)
     ) {
-        // Safety: the engine thread owns the interpreter.
-        let interp = unsafe { &mut *ptr };
-        let _ = invoke_widget(interp, path);
+        // Tk's ButtonUp class binding generates <<Invoke>>, whose class
+        // binding calls `$w invoke` (replaceable by a user binding).
+        run_binding(path, "<<Invoke>>", &ctx);
     }
 }
 
@@ -5692,6 +5713,7 @@ pub fn treeview_select(path: &str, id: &str) {
             rt.bump();
         }
     });
+    fire_virtual(path, "TreeviewSelect");
 }
 
 /// Expand/collapse a Treeview row from the renderer.
@@ -5702,6 +5724,13 @@ pub fn treeview_toggle(path: &str, id: &str) {
     dispatch_click(path, &ctx);
     let interp = unsafe { &mut *ptr };
     set_tk_focus(interp, Some(path.to_string()));
+    let opened = with_state(interp, |rt| {
+        rt.treeviews
+            .get(path)
+            .and_then(|tv| tv.items.iter().find(|item| item.id == id))
+            .map(|item| !item.open)
+    })
+    .flatten();
     with_state_mut(interp, |rt| {
         if let Some(tv) = rt.treeviews.get_mut(path) {
             if let Some(item) = tv.items.iter_mut().find(|i| i.id == id) {
@@ -5710,6 +5739,16 @@ pub fn treeview_toggle(path: &str, id: &str) {
             }
         }
     });
+    if let Some(opened) = opened {
+        fire_virtual(
+            path,
+            if opened {
+                "TreeviewOpen"
+            } else {
+                "TreeviewClose"
+            },
+        );
+    }
 }
 
 fn notebook_add(
@@ -5809,11 +5848,18 @@ pub fn select_notebook_tab(notebook: &str, index: usize) {
         rt.tree.children(notebook).map(|c| c.len()).unwrap_or(0)
     })
     .unwrap_or(0);
+    let index = index.min(len.saturating_sub(1));
+    let changed = with_state(interp, |rt| {
+        rt.notebook_selected.get(notebook).copied() != Some(index)
+    })
+    .unwrap_or(true);
     with_state_mut(interp, |rt| {
-        rt.notebook_selected
-            .insert(notebook.to_string(), index.min(len.saturating_sub(1)));
+        rt.notebook_selected.insert(notebook.to_string(), index);
         rt.bump();
     });
+    if changed {
+        fire_virtual(notebook, "NotebookTabChanged");
+    }
 }
 
 /// The values of a `ttk::combobox` (`-values` is a Tcl list).
@@ -5864,6 +5910,7 @@ pub fn press_combobox_item(path: &str, index: usize) {
         rt.open_combobox = None;
         rt.bump();
     });
+    fire_virtual(path, "ComboboxSelected");
 }
 
 /// A Progressbar's current value and maximum.
@@ -6023,6 +6070,7 @@ pub fn listbox_select(path: &str, index: usize) {
             rt.bump();
         }
     });
+    fire_virtual(path, "ListboxSelect");
 }
 
 /// Arrow/Home/End/Page keys while a listbox or treeview has the Tk focus.
@@ -6098,6 +6146,7 @@ fn listbox_nav(path: &str, key: &str) {
         }
     });
     scroll_to_row(interp, path, target, len);
+    fire_virtual(path, "ListboxSelect");
 }
 
 fn treeview_nav(path: &str, key: &str) {
@@ -6139,6 +6188,7 @@ fn treeview_nav(path: &str, key: &str) {
         }
     });
     scroll_to_row(interp, path, target, ids.len());
+    fire_virtual(path, "TreeviewSelect");
 }
 
 fn treeview_visible_ids(tv: &TreeViewState) -> Vec<String> {
@@ -8866,6 +8916,7 @@ fn listbox_selection(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<
                     rt.bump();
                 }
             });
+            fire_virtual(path, "ListboxSelect");
             Ok(Value::empty())
         }
         "clear" => {
@@ -8887,6 +8938,7 @@ fn listbox_selection(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<
                     rt.bump();
                 }
             });
+            fire_virtual(path, "ListboxSelect");
             Ok(Value::empty())
         }
         "includes" => {
@@ -9578,6 +9630,59 @@ mod tests {
         );
         assert_eq!(eval(&mut i, "set ::log"), "b1");
         assert_eq!(eval(&mut i, "event info"), "");
+    }
+
+    #[test]
+    fn builtin_virtual_events() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "listbox .l -height 3; .l insert end a b c; set ::log {};
+             bind .l <<ListboxSelect>> {lappend ::log lb}; set ::log {}",
+        );
+        listbox_select(".l", 1);
+        assert_eq!(eval(&mut i, "set ::log"), "lb");
+
+        eval(
+            &mut i,
+            "ttk::treeview .tv; .tv insert {} end -id root -text R;
+             set ::log {};
+             bind .tv <<TreeviewOpen>> {lappend ::log open};
+             bind .tv <<TreeviewClose>> {lappend ::log close};
+             bind .tv <<TreeviewSelect>> {lappend ::log sel}",
+        );
+        treeview_toggle(".tv", "root");
+        assert!(eval(&mut i, "set ::log").contains("open"));
+        treeview_select(".tv", "root");
+        assert!(eval(&mut i, "set ::log").contains("sel"));
+        treeview_toggle(".tv", "root");
+        assert!(eval(&mut i, "set ::log").contains("close"));
+
+        eval(
+            &mut i,
+            "ttk::combobox .cb -values {A B}; set ::log {};
+             bind .cb <<ComboboxSelected>> {lappend ::log picked}",
+        );
+        press_combobox_item(".cb", 1);
+        assert_eq!(eval(&mut i, "set ::log"), "picked");
+        assert_eq!(eval(&mut i, ".cb get"), "B");
+
+        eval(
+            &mut i,
+            "ttk::notebook .nb; frame .nb.a; frame .nb.b; .nb add .nb.a; .nb add .nb.b;
+             set ::log {}; bind .nb <<NotebookTabChanged>> {lappend ::log tab}",
+        );
+        select_notebook_tab(".nb", 1);
+        assert_eq!(eval(&mut i, "set ::log"), "tab");
+
+        eval(
+            &mut i,
+            "button .b -command {incr ::inv}; set ::inv 0; set ::log {};
+             bind .b <<Invoke>> {lappend ::log invoke}; event generate .b <<Invoke>>",
+        );
+        assert_eq!(eval(&mut i, "set ::inv"), "1");
+        assert_eq!(eval(&mut i, "set ::log"), "invoke");
     }
 
     #[test]

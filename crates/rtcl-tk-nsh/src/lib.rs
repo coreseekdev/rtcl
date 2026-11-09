@@ -20,7 +20,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use nsh_base::rich_editor::{
-    extensions::starter,
+    commands::base_keymap,
+    extensions::{history::history, keymap::keymap, starter},
     model::Schema,
     state::{EditorState, EditorStateConfig},
     view::{rich_editor, EditorSession, NodeViews, PartStyles, RichEditorStyles},

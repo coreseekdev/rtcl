@@ -1273,7 +1273,7 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
         | "-values" | "-postcommand" | "-style" => "",
         "-padding" => "0",
         "-type" => "bar",
-        "-values" | "-labels" | "-title" => "",
+        "-labels" => "",
         "-exportselection" => "1",
         "-wrap" => "char",
         "-undo" | "-maxundo" | "-spacing1" | "-spacing2" | "-spacing3" | "-tabs" => "0",

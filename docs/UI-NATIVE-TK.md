@@ -211,8 +211,10 @@ configure/cget/ranges/names/delete` 维护区间；有标签的 text 用 nsh
 `RichEditor`（ProseMirror starter schema + textStyle）渲染为**光标级
 WYSIWYG**：原生光标/选区/IME，标签映射为 color/backgroundColor/
 fontSize/fontFamily/bold 标记；编辑后正文写回 Tcl 模型，标签区间按
-增删平移。编辑器的格式化快捷键只改文档标记，不回写 Tk tag（tag 仍是
-样式来源）；外部 `insert/delete/tag` 会重建编辑器。
+增删平移。编辑器只做文本编辑（RichEditor 仅启用 base keymap/history，
+不启用格式快捷键与 Markdown 输入规则），样式始终以 Tk tag 为准，因此
+不会出现编辑器格式与 tag 不一致或重建后丢失；外部 `insert/delete/tag`
+会重建编辑器。
 
 **虚拟化/滚动**：listbox 与 treeview 只挂载可见行（按 `-height` 取窗口），
 `yview`/`-yscrollcommand` 与 Tk `scrollbar` 双向联动；列表/树表可滚动。
@@ -234,7 +236,7 @@ toplevel、all）、`event generate`；`%W/%x/%y/%K/%A` 替换；`after` 由
 
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停
 绘制，长等待请用 `after` 回调）；未实现多 toplevel 窗口；Canvas 已支持旋转/贝塞尔/箭头/虚线/图片项；
-text tag 已是光标级 WYSIWYG（格式化快捷键暂不回写 Tk tag）；
+text tag 已是光标级 WYSIWYG（格式由 Tk tag 决定，编辑器只编辑文本）；
 Windows/Linux 菜单栏仍是 app 内实现
 （macOS 用系统菜单；nsh GTK 的 set_application_menu 实测不显示）；
 scrollbar 已与 listbox/treeview 联动。

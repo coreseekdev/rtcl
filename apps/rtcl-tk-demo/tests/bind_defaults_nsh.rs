@@ -489,6 +489,37 @@ fn rich_text_tag_bindings_fire_on_press() {
         .expect("the tag's <Enter> binding fired");
 }
 
+const SPINBOX_APP: &str = r##"
+set ::v 0
+spinbox .s -textvariable ::v -from 0 -to 3
+pack .s
+label .out -textvariable ::v
+pack .out
+"##;
+
+#[component]
+fn SpinboxApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(SPINBOX_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn spinbox_steppers_change_the_value() {
+    let mut config = EngineConfig::new(Root::of::<SpinboxApp>());
+    config.environment.os = nsh_core::platform::Os::Linux;
+    let mut app = Headless::start(config).expect("headless engine starts");
+    app.set_viewport(Size::new(Points(500.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("0").expect("spinbox renders its -from value");
+    app.press("\u{25b4}").expect("press the increment button");
+    app.wait_for("1").expect("the spinbox stepped up");
+    assert!(
+        app.screen().texts().iter().any(|text| *text == "1"),
+        "the textvariable followed the step: {:?}",
+        app.screen().texts()
+    );
+}
+
 #[test]
 fn rich_edits_enter_the_text_undo_stack() {
     let mut config = EngineConfig::new(Root::of::<RichUndoApp>());

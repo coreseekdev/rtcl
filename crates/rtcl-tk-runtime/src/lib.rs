@@ -446,6 +446,7 @@ pub fn install(interp: &mut Interp) {
         "label",
         "button",
         "entry",
+        "spinbox",
         "checkbutton",
         "radiobutton",
         "scale",
@@ -460,6 +461,7 @@ pub fn install(interp: &mut Interp) {
         "ttk::label",
         "ttk::button",
         "ttk::entry",
+        "ttk::spinbox",
         "ttk::checkbutton",
         "ttk::radiobutton",
         "ttk::scale",
@@ -673,6 +675,7 @@ fn ttk_class(base: &str) -> Option<&'static str> {
         "checkbutton" => "TCheckbutton",
         "radiobutton" => "TRadiobutton",
         "entry" => "TEntry",
+        "spinbox" => "TSpinbox",
         "frame" => "TFrame",
         "label" => "TLabel",
         "scale" => "TScale",
@@ -734,7 +737,7 @@ fn create_widget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// content from `-textvariable`, checkbutton state).
 fn initialize_widget(interp: &mut Interp, path: &str, kind: WidgetKind) -> Result<()> {
     match kind {
-        WidgetKind::Entry | WidgetKind::Combobox => {
+        WidgetKind::Entry | WidgetKind::Combobox | WidgetKind::Spinbox => {
             let var = effective_option(interp, path, "-textvariable");
             if !var.is_empty() {
                 let text = var_value(&var).unwrap_or_default();
@@ -743,6 +746,30 @@ fn initialize_widget(interp: &mut Interp, path: &str, kind: WidgetKind) -> Resul
                         n.content = text;
                     }
                 });
+            } else if kind == WidgetKind::Spinbox {
+                // Tk starts a spinbox at its first -values entry, else
+                // at -from.
+                let empty = with_state(interp, |rt| {
+                    rt.tree.get(path).is_some_and(|n| n.content.is_empty())
+                })
+                .unwrap_or(false);
+                if empty {
+                    let values = effective_option(interp, path, "-values");
+                    let initial = Value::from_str(&values)
+                        .as_list()
+                        .and_then(|list| list.first().map(|v| v.as_str().to_string()))
+                        .unwrap_or_else(|| {
+                            let from = effective_option(interp, path, "-from")
+                                .parse::<f64>()
+                                .unwrap_or(0.0);
+                            format_number(from)
+                        });
+                    with_state_mut(interp, |rt| {
+                        if let Some(n) = rt.tree.get_mut(path) {
+                            n.content = initial;
+                        }
+                    });
+                }
             }
         }
         WidgetKind::Scale => {
@@ -863,7 +890,16 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "toggle" if kind == WidgetKind::Checkbutton => invoke_widget(interp, path),
                 _ => bad_subcommand(kind, sub),
             },
-            WidgetKind::Entry => match sub {
+            WidgetKind::Entry | WidgetKind::Spinbox => match sub {
+                "set" if kind == WidgetKind::Spinbox => {
+                    if args.len() != 3 {
+                        return Err(wrong("set", "value", args.len()));
+                    }
+                    let value = args[2].as_str().to_string();
+                    let cursor = value.chars().count();
+                    update_entry(interp, path, value, cursor)?;
+                    Ok(Value::empty())
+                }
                 "get" => {
                     if args.len() != 2 {
                         return Err(wrong("get", "", args.len()));
@@ -1609,6 +1645,9 @@ fn bad_subcommand(kind: WidgetKind, sub: &str) -> Result<Value> {
         WidgetKind::Entry => {
             "cget, configure, delete, destroy, get, icursor, index, insert, selection, validate, xview"
         }
+        WidgetKind::Spinbox => {
+            "cget, configure, delete, destroy, get, icursor, index, insert, selection, set, validate, xview"
+        }
         WidgetKind::Text => {
             "cget, configure, delete, destroy, edit, get, index, insert, mark, see, tag, xview, yview"
         }
@@ -2348,7 +2387,9 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
         let (w, h) = match node.kind {
             WidgetKind::Text => (w_opt.max(1) * 7, h_opt.max(1) * 18),
             WidgetKind::Listbox => (w_opt.max(1) * 7, h_opt.max(1) * 18),
-            WidgetKind::Entry | WidgetKind::Combobox => ((w_opt.max(1) * 7) + 8, 24),
+            WidgetKind::Entry | WidgetKind::Combobox | WidgetKind::Spinbox => {
+                ((w_opt.max(1) * 7) + 8, 24)
+            }
             WidgetKind::Scale => {
                 let length = opt("-length").parse::<i64>().unwrap_or(100);
                 if opt("-orient") == "horizontal" {
@@ -3778,6 +3819,7 @@ fn focusable(kind: WidgetKind) -> bool {
     matches!(
         kind,
         WidgetKind::Entry
+            | WidgetKind::Spinbox
             | WidgetKind::Text
             | WidgetKind::Listbox
             | WidgetKind::Button
@@ -7271,6 +7313,102 @@ fn update_entry(interp: &mut Interp, path: &str, content: String, cursor: usize)
         set_var(&var, &content)?;
     }
     Ok(())
+}
+
+/// Step a spinbox up (`direction` 1) or down (-1): the next `-values`
+/// entry, else the numeric value moved by `-increment` and held to
+/// `-from`/`-to` (wrapping with `-wrap`).  Runs `-command` on a change.
+pub fn spinbox_step(path: &str, direction: i32) {
+    with_eval(|| spinbox_step_inner(path, direction));
+}
+
+fn spinbox_step_inner(path: &str, direction: i32) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    let current = entry_value(path);
+    let wrap = matches!(
+        effective_option(interp, path, "-wrap").as_str(),
+        "1" | "true" | "yes" | "on"
+    );
+    let values = effective_option(interp, path, "-values");
+    let listed = Value::from_str(&values)
+        .as_list()
+        .filter(|values| !values.is_empty());
+    let next = if let Some(values) = listed {
+        let names = values
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect::<Vec<_>>();
+        let index = names.iter().position(|value| *value == current);
+        let next = match (index, direction) {
+            (Some(index), 1) if index + 1 < names.len() => index + 1,
+            (Some(_), 1) if wrap => 0,
+            (Some(index), 1) => index,
+            (Some(index), _) if index > 0 => index - 1,
+            (Some(_), _) if wrap => names.len() - 1,
+            (Some(index), _) => index,
+            (None, 1) => 0,
+            (None, _) => names.len() - 1,
+        };
+        names[next].clone()
+    } else {
+        let from = effective_option(interp, path, "-from")
+            .parse::<f64>()
+            .unwrap_or(0.0);
+        let to = effective_option(interp, path, "-to")
+            .parse::<f64>()
+            .unwrap_or(0.0);
+        let increment = effective_option(interp, path, "-increment")
+            .parse::<f64>()
+            .unwrap_or(1.0);
+        let low = from.min(to);
+        let high = from.max(to);
+        let value = current.trim().parse::<f64>().unwrap_or(from);
+        let mut next = value + f64::from(direction) * increment;
+        if wrap {
+            if next > high {
+                next = low;
+            } else if next < low {
+                next = high;
+            }
+        } else {
+            next = next.clamp(low, high);
+        }
+        let format = effective_option(interp, path, "-format");
+        if format.is_empty() {
+            format_number(next)
+        } else {
+            let script = format!(
+                "format {}",
+                list_value(vec![format.clone(), format_number(next)])
+            );
+            interp
+                .eval(&script)
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|_| format_number(next))
+        }
+    };
+    if next == current {
+        return;
+    }
+    let cursor = next.chars().count();
+    if update_entry(interp, path, next, cursor).is_ok() {
+        let command = effective_option(interp, path, "-command");
+        if !command.is_empty() {
+            let _ = eval_active(&command);
+        }
+    }
+}
+
+/// A key in a spinbox: the widget's bindings, then Up/Down step (Tk's
+/// Spinbox class binding).
+pub fn spinbox_key(path: &str, key: &str, character: &str) {
+    entry_key(path, key, character);
+    match key {
+        "Up" => spinbox_step(path, 1),
+        "Down" => spinbox_step(path, -1),
+        _ => {}
+    }
 }
 
 fn entry_insert(interp: &mut Interp, path: &str, index: &str, text: &str) -> Result<Value> {
@@ -10772,6 +10910,57 @@ mod tests {
         assert_eq!(eval(&mut i, ".u edit canundo"), "0");
         assert_eq!(eval(&mut i, ".u edit canredo"), "0");
         assert_eq!(eval(&mut i, ".u edit modified"), "0");
+    }
+
+    #[test]
+    fn spinbox_values_stepping_and_textvariable() {
+        let mut i = Interp::new();
+        install(&mut i);
+        assert_eq!(eval(&mut i, "spinbox .s -from 0 -to 10 -increment 2"), ".s");
+        assert_eq!(eval(&mut i, ".s get"), "0");
+        spinbox_step(".s", 1);
+        assert_eq!(eval(&mut i, ".s get"), "2");
+        spinbox_step(".s", -1);
+        assert_eq!(eval(&mut i, ".s get"), "0");
+        eval(&mut i, ".s set 9");
+        spinbox_step(".s", 1);
+        assert_eq!(eval(&mut i, ".s get"), "10");
+        eval(&mut i, ".s configure -wrap 1");
+        spinbox_step(".s", 1);
+        assert_eq!(eval(&mut i, ".s get"), "0");
+        assert_eq!(eval(&mut i, ".s index end"), "1");
+
+        // -values cycles through the list; -wrap decides at the ends.
+        eval(&mut i, "spinbox .v -values {a b c}");
+        assert_eq!(eval(&mut i, ".v get"), "a");
+        spinbox_step(".v", 1);
+        assert_eq!(eval(&mut i, ".v get"), "b");
+        eval(&mut i, ".v set c");
+        spinbox_step(".v", 1);
+        assert_eq!(eval(&mut i, ".v get"), "c");
+        eval(&mut i, ".v configure -wrap 1");
+        spinbox_step(".v", 1);
+        assert_eq!(eval(&mut i, ".v get"), "a");
+        spinbox_step(".v", -1);
+        assert_eq!(eval(&mut i, ".v get"), "c");
+
+        // -textvariable is written on steps and -command runs.
+        eval(
+            &mut i,
+            "set ::n 1; spinbox .t -textvariable ::n -from 0 -to 5 -format %.2f -command {set ::ran 1}",
+        );
+        assert_eq!(eval(&mut i, ".t get"), "1");
+        spinbox_step(".t", 1);
+        assert_eq!(eval(&mut i, ".t get"), "2.00");
+        assert_eq!(eval(&mut i, "set ::n"), "2.00");
+        assert_eq!(eval(&mut i, "set ::ran"), "1");
+        assert_eq!(
+            eval(
+                &mut i,
+                "spinbox .u -from 0 -to 2 -increment 1; .u insert end 5; .u get"
+            ),
+            "05"
+        );
     }
 
     #[test]

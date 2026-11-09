@@ -179,10 +179,11 @@ M1a/M1b/M2 已完成：
 
 ## 9. 已实现命令面与差异（M2/M3）
 
-**控件**：`toplevel/frame/label/button/entry/checkbutton/radiobutton/
-scale/text/listbox/message/scrollbar` + `ttk::{separator,progressbar,
-notebook,combobox,treeview,labelframe,button,label,entry,frame,checkbutton,
-radiobutton,scale,text,listbox,scrollbar,message,canvas}` 别名（ttk
+**控件**：`toplevel/frame/label/button/entry/spinbox/checkbutton/
+radiobutton/scale/text/listbox/message/scrollbar` + `ttk::{separator,
+progressbar,notebook,combobox,treeview,labelframe,button,label,entry,
+spinbox,frame,checkbutton,radiobutton,scale,text,listbox,scrollbar,
+message,canvas}` 别名（ttk
 创建的控件带 Tk 的 T* 类名，如 `ttk::button` → `TButton`，因此
 `bindtags`/`bind TButton`/`winfo class` 与 tkinter 一致）；扩展
 `::rtcl::chart`（原生柱状图，`-values/-labels/-title/-width/-height`）。
@@ -197,6 +198,13 @@ unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
 `ttk::combobox` 的 `get/set/current/values/post/unpost`；
 `ttk::treeview` 的 `insert/delete/item/selection/focus/children/parent/
 index/heading/column/exists`；listbox/treeview 按 `-height` 放进滚动视图（滚轮可滚）；Tcl 侧的 `after/update/vwait` 沿用 rtcl-vm。
+
+**spinbox**：`spinbox`/`ttk::spinbox`（类名 `Spinbox`/`TSpinbox`），
+子命令 `get/set/insert/delete/index/icursor/selection/validate/xview`；
+`-from/-to/-increment` 数值步进（`-wrap` 环绕、`-format` 经 Tcl
+`format`）、`-values` 列表步进、`-textvariable` 双向、`-command` 在
+步进改变后执行；渲染为输入框 + 上下按钮，Up/Down 键按 Tk Spinbox 类行为
+步进。初始值取 `-textvariable`，否则 `-values` 首项，否则 `-from`。
 
 **菜单**：`menu` 窗口与 `-menu` 关联的菜单栏。macOS 通过 nsh
 `desktop::set_application_menu` 映射到系统菜单；Linux/Windows 在 app 内

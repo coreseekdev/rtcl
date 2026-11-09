@@ -16,6 +16,7 @@ set ::name "World"
 set ::clicks 0
 set ::agreed 0
 set ::volume 30
+set ::qty 3
 
 label .greeting -textvariable ::greeting
 pack .greeting -padx 12 -pady 6
@@ -49,6 +50,13 @@ scale .volume -from 0 -to 100 -variable ::volume -command {
     set ::greeting "Volume $::volume"
 }
 pack .volume -fill x -padx 12 -pady 4
+
+label .qty_label -text "Quantity:"
+pack .qty_label -padx 12 -pady 2
+spinbox .qty -from 1 -to 10 -textvariable ::qty -command {
+    set ::greeting "Quantity $::qty"
+}
+pack .qty -fill x -padx 12 -pady 4
 
 listbox .colors -height 3
 pack .colors -fill x -padx 12 -pady 4

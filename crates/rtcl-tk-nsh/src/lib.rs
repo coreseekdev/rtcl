@@ -1596,6 +1596,92 @@ fn render_grid(tree: &TkTree, path: &str) -> AnyElement {
     container.into_element()
 }
 
+fn render_entry_input(tree: &TkTree, path: &str, spinbox: bool) -> AnyElement {
+    let path = path.to_string();
+    let show = option(tree, path.as_str(), "-show").to_string();
+    let disabled = is_disabled(tree, path.as_str());
+    let readonly = option(tree, path.as_str(), "-state") == "readonly";
+    let change_path = path.clone();
+    let submit_path = path.clone();
+    let key_path = path.clone();
+    let paste_path = path.clone();
+    let press_path = path.clone();
+    let focus_path = path.clone();
+    let focus_in_path = path.clone();
+    let enter_path = path.clone();
+    let leave_path = path.clone();
+    let move_path = path.clone();
+    let layout_path = path.clone();
+    let wheel_path = path.clone();
+    nsh_base::input()
+        .value(rtcl_tk_runtime::entry_value(&path))
+        .auto_focus(rtcl_tk_runtime::focused(&path))
+        .masked(!show.is_empty())
+        .disabled(disabled)
+        .readonly(readonly)
+        .on_change(move |text: &str| {
+            rtcl_tk_runtime::entry_changed(&change_path, text);
+        })
+        .on_submit(move |_: &str| {
+            rtcl_tk_runtime::entry_submitted(&submit_path);
+        })
+        .on_key_press(move |key: &str| {
+            let tcl_key = if key == "Enter" { "Return" } else { key };
+            let character = if key.chars().count() == 1 { key } else { "" };
+            if spinbox {
+                rtcl_tk_runtime::spinbox_key(&key_path, tcl_key, character);
+            } else {
+                rtcl_tk_runtime::entry_key(&key_path, tcl_key, character);
+            }
+        })
+        .on_paste(move |_: &PasteEvent| {
+            rtcl_tk_runtime::paste_event(&paste_path);
+        })
+        .on_press(move |e: &PressEvent| {
+            rtcl_tk_runtime::widget_press(
+                &press_path,
+                e.position.x.0 as f64,
+                e.position.y.0 as f64,
+                e.clicks,
+            );
+            rtcl_tk_runtime::focus_widget(&focus_path);
+        })
+        .on_focus(move |_: &()| {
+            rtcl_tk_runtime::focus_widget(&focus_in_path);
+        })
+        .on_mouse_enter(move |e: &MouseEvent| {
+            rtcl_tk_runtime::enter_event(&enter_path, e.position.x.0 as f64, e.position.y.0 as f64);
+        })
+        .on_mouse_leave(move |e: &MouseEvent| {
+            rtcl_tk_runtime::leave_event(&leave_path, e.position.x.0 as f64, e.position.y.0 as f64);
+        })
+        .on_mouse_move(move |e: &MouseEvent| {
+            rtcl_tk_runtime::motion_event(
+                &move_path,
+                e.position.x.0 as f64,
+                e.position.y.0 as f64,
+                tk_button(e.pressed_button),
+                tk_state(&e.modifiers),
+            );
+        })
+        .on_layout(move |b: &Bounds<Points>| {
+            rtcl_tk_runtime::configure_event(
+                &layout_path,
+                b.size.width.0 as f64,
+                b.size.height.0 as f64,
+            );
+        })
+        .on_wheel(move |e: &WheelEvent| {
+            rtcl_tk_runtime::wheel_event(
+                &wheel_path,
+                -(e.delta.x.0 as f64),
+                -(e.delta.y.0 as f64),
+                tk_state(&e.modifiers),
+            );
+        })
+        .into_element()
+}
+
 fn render_node(tree: &TkTree, path: &str) -> AnyElement {
     let Some(node) = tree.get(path) else {
         return text("").into_element();
@@ -1745,93 +1831,51 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             button = pointer_events!(button, path);
             button.into_element()
         }
-        WidgetKind::Entry => {
-            let path = path.to_string();
-            let show = option(tree, path.as_str(), "-show").to_string();
-            let disabled = is_disabled(tree, path.as_str());
-            let readonly = option(tree, path.as_str(), "-state") == "readonly";
-            let change_path = path.clone();
-            let submit_path = path.clone();
-            let key_path = path.clone();
-            let paste_path = path.clone();
-            let press_path = path.clone();
-            let focus_path = path.clone();
-            let focus_in_path = path.clone();
-            let enter_path = path.clone();
-            let leave_path = path.clone();
-            let move_path = path.clone();
-            let layout_path = path.clone();
-            let wheel_path = path.clone();
-            nsh_base::input()
-                .value(rtcl_tk_runtime::entry_value(&path))
-                .auto_focus(rtcl_tk_runtime::focused(&path))
-                .masked(!show.is_empty())
+        WidgetKind::Entry => render_entry_input(tree, path, false),
+        WidgetKind::Spinbox => {
+            let press_path = path.to_string();
+            let up_path = path.to_string();
+            let down_path = path.to_string();
+            let focus_up = path.to_string();
+            let focus_down = path.to_string();
+            let disabled = is_disabled(tree, path);
+            let input = render_entry_input(tree, path, true);
+            let up = nsh_base::button()
+                .px(px(4.0))
+                .py(px(0.0))
+                .rounded(px(3.0))
                 .disabled(disabled)
-                .readonly(readonly)
-                .on_change(move |text: &str| {
-                    rtcl_tk_runtime::entry_changed(&change_path, text);
-                })
-                .on_submit(move |_: &str| {
-                    rtcl_tk_runtime::entry_submitted(&submit_path);
-                })
-                .on_key_press(move |key: &str| {
-                    let tcl_key = if key == "Enter" { "Return" } else { key };
-                    let character = if key.chars().count() == 1 { key } else { "" };
-                    rtcl_tk_runtime::entry_key(&key_path, tcl_key, character);
-                })
-                .on_paste(move |_: &PasteEvent| {
-                    rtcl_tk_runtime::paste_event(&paste_path);
-                })
-                .on_press(move |e: &PressEvent| {
-                    rtcl_tk_runtime::widget_press(
-                        &press_path,
-                        e.position.x.0 as f64,
-                        e.position.y.0 as f64,
-                        e.clicks,
-                    );
-                    rtcl_tk_runtime::focus_widget(&focus_path);
-                })
-                .on_focus(move |_: &()| {
-                    rtcl_tk_runtime::focus_widget(&focus_in_path);
-                })
-                .on_mouse_enter(move |e: &MouseEvent| {
-                    rtcl_tk_runtime::enter_event(
-                        &enter_path,
-                        e.position.x.0 as f64,
-                        e.position.y.0 as f64,
-                    );
-                })
-                .on_mouse_leave(move |e: &MouseEvent| {
-                    rtcl_tk_runtime::leave_event(
-                        &leave_path,
-                        e.position.x.0 as f64,
-                        e.position.y.0 as f64,
-                    );
-                })
-                .on_mouse_move(move |e: &MouseEvent| {
-                    rtcl_tk_runtime::motion_event(
-                        &move_path,
-                        e.position.x.0 as f64,
-                        e.position.y.0 as f64,
-                        tk_button(e.pressed_button),
-                        tk_state(&e.modifiers),
-                    );
-                })
-                .on_layout(move |b: &Bounds<Points>| {
-                    rtcl_tk_runtime::configure_event(
-                        &layout_path,
-                        b.size.width.0 as f64,
-                        b.size.height.0 as f64,
-                    );
-                })
-                .on_wheel(move |e: &WheelEvent| {
-                    rtcl_tk_runtime::wheel_event(
-                        &wheel_path,
-                        -(e.delta.x.0 as f64),
-                        -(e.delta.y.0 as f64),
-                        tk_state(&e.modifiers),
-                    );
-                })
+                .child(
+                    text("\u{25b4}")
+                        .text_size(px(10.0))
+                        .text_color(AdaptiveColor::rgb(0x374151, 0xd1d5db)),
+                )
+                .on_press(move |_: &()| {
+                    rtcl_tk_runtime::widget_press(&press_path, 0.0, 0.0, 1);
+                    rtcl_tk_runtime::spinbox_step(&up_path, 1);
+                    rtcl_tk_runtime::focus_widget(&focus_up);
+                });
+            let down = nsh_base::button()
+                .px(px(4.0))
+                .py(px(0.0))
+                .rounded(px(3.0))
+                .disabled(disabled)
+                .child(
+                    text("\u{25be}")
+                        .text_size(px(10.0))
+                        .text_color(AdaptiveColor::rgb(0x374151, 0xd1d5db)),
+                )
+                .on_press(move |_: &()| {
+                    rtcl_tk_runtime::spinbox_step(&down_path, -1);
+                    rtcl_tk_runtime::focus_widget(&focus_down);
+                });
+            view()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .w_full()
+                .child(view().flex_1().child(input))
+                .child(view().flex_col().gap(px(1.0)).child(up).child(down))
                 .into_element()
         }
         WidgetKind::Checkbutton => {

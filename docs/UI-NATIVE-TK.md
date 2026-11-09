@@ -229,9 +229,13 @@ command/checkbutton/radiobutton/separator/cascade 菜单项可选中并触发；
 **panedwindow**：`panedwindow`/`ttk::panedwindow`（类名 `Panedwindow`/
 `TPanedwindow`），`add/insert/forget/panes/pane/paneconfigure/panecget/
 sashpos/sash/identify/state/instate`；`-orient` 决定 nsh
-`h_resizable/v_resizable` 分组，分栏用原生可拖动 sash，pane 的
-`-minsize/-width` 映射到 panel min_size/size；`-weight/-hide` 接受但暂不
-改变布局；classic 的 `-sashwidth/-sashrelief` 与 ttk 的 style 选项都接受。
+`h_resizable/v_resizable` 分组，分栏用原生可拖动 sash。拖动/`sashpos i
+new` 记录真实 pane 尺寸（`on_resize` 持久化），`sashpos i` 返回真实位置
+（pane 尺寸和 + i×sashwidth；未布局前只有 -width 求和）；`-weight`
+分布：`on_resize` 报告的尺寸按 weight 重新分配并持久化（Tk 的“额外空间
+按权重分配”近似）；`-hide` 的 pane 不渲染、`-stretch never` 固定面板；
+`-minsize/-width` 映射 panel min_size/size；classic 的
+`-sashwidth/-sashrelief` 与 ttk 的 style 选项都接受。
 
 **spinbox**：`spinbox`/`ttk::spinbox`（类名 `Spinbox`/`TSpinbox`），
 子命令 `get/set/insert/delete/index/icursor/selection/validate/xview`；

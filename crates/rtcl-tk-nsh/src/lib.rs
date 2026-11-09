@@ -1999,6 +1999,11 @@ fn render_panedwindow(tree: &TkTree, path: &str) -> AnyElement {
         panel = panel.child(render_node(tree, &pane.path));
         group = group.child(panel);
     }
+    let resize_path = path.to_string();
+    group = group.on_resize(move |sizes: &Vec<Points>| {
+        let sizes = sizes.iter().map(|size| size.0 as f64).collect::<Vec<_>>();
+        rtcl_tk_runtime::paned_set_sizes(&resize_path, sizes);
+    });
     view().w_full().h(px(height)).child(group).into_element()
 }
 

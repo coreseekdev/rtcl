@@ -57,6 +57,8 @@ pub struct TkRuntime {
     menus: BTreeMap<String, Menu>,
     /// Pane lists of each `panedwindow`.
     paned: BTreeMap<String, Vec<PanedPane>>,
+    /// Laid-out pane sizes in points (from drags/resizes), by window.
+    paned_sizes: BTreeMap<String, Vec<f64>>,
     /// `ttk::style configure` options, by style name.
     ttk_styles: BTreeMap<String, BTreeMap<String, String>>,
     /// `ttk::style layout` specifications, by style name.
@@ -2147,6 +2149,7 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
             rt.text_undo.remove(p);
             rt.text_see.remove(p);
             rt.paned.remove(p);
+            rt.paned_sizes.remove(p);
             for panes in rt.paned.values_mut() {
                 panes.retain(|pane| pane.path != *p);
             }
@@ -4723,6 +4726,24 @@ pub fn paned_panes(path: &str) -> Option<Vec<PanedPane>> {
     with_state(unsafe { &*ptr }, |rt| rt.paned.get(path).cloned()).flatten()
 }
 
+/// The laid-out pane sizes (points) of a `panedwindow`, for the renderer.
+pub fn paned_sizes(path: &str) -> Option<Vec<f64>> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| rt.paned_sizes.get(path).cloned()).flatten()
+}
+
+/// Record the laid-out pane sizes after a drag/resize of `panedwindow`.
+pub fn paned_set_sizes(path: &str, sizes: Vec<f64>) {
+    let Some(ptr) = active_interp() else { return };
+    with_state_mut(unsafe { &mut *ptr }, |rt| {
+        let changed = rt.paned_sizes.get(path).is_none_or(|old| old != &sizes);
+        if changed {
+            rt.paned_sizes.insert(path.to_string(), sizes.clone());
+            rt.bump();
+        }
+    });
+}
+
 fn panedwindow_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
     if rest.is_empty() {
         return Err(wrong("panedwindow", "option ?arg ...?", rest.len() + 2));
@@ -4885,39 +4906,80 @@ fn panedwindow_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Resul
             if rest.len() < 2 || rest.len() > 3 {
                 return Err(wrong("sashpos", "index ?newpos?", rest.len() + 2));
             }
-            // Without laid-out pixel sizes the sash sits at the widths the
-            // panes asked for; setting records the width.
+            let index = rest[1].as_str().parse::<usize>().unwrap_or(0);
+            // The sash sits after pane `index`: the sizes before it plus
+            // one sash width per earlier boundary.
+            let position_of = |sizes: Option<Vec<f64>>| -> i64 {
+                with_state(interp, |rt| {
+                    let panes = rt.paned.get(path).cloned().unwrap_or_default();
+                    // Before anything is laid out Tk reports 0-based widths
+                    // only; the sash widths join once sizes exist.
+                    let sash = if sizes.is_some() {
+                        effective_option(interp, path, "-sashwidth")
+                            .parse::<f64>()
+                            .unwrap_or(3.0)
+                    } else {
+                        0.0
+                    };
+                    let widths: Vec<f64> = panes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, pane)| {
+                            sizes
+                                .as_ref()
+                                .and_then(|sizes| sizes.get(i).copied())
+                                .or_else(|| {
+                                    pane.options
+                                        .get("-width")
+                                        .and_then(|width| width.parse::<f64>().ok())
+                                })
+                                .unwrap_or(0.0)
+                        })
+                        .collect();
+                    // Sash `index` sits after pane `index`.
+                    let before: f64 = widths.iter().take(index + 1).sum();
+                    (before + index as f64 * sash).round() as i64
+                })
+                .unwrap_or(0)
+            };
             if rest.len() == 3 {
-                let index = rest[1].as_str().parse::<usize>().unwrap_or(0);
-                let position = rest[2].as_str();
+                let new_position =
+                    parse_f64_str(rest[2].as_str(), "newpos").unwrap_or(0.0);
+                let old = position_of(paned_sizes(path));
+                let delta = new_position as f64 - old as f64;
                 with_state_mut(interp, |rt| {
-                    if let Some(pane) = rt.paned.get_mut(path).and_then(|panes| panes.get_mut(index)) {
-                        pane.options
-                            .insert("-width".to_string(), position.to_string());
-                        rt.bump();
+                    // Materialize sizes on first adjustment so a scripted
+                    // `sashpos` has real values to move.
+                    let defaults: Vec<f64> = rt
+                        .paned
+                        .get(path)
+                        .map(|panes| {
+                            panes
+                                .iter()
+                                .map(|pane| {
+                                    pane.options
+                                        .get("-width")
+                                        .and_then(|width| width.parse::<f64>().ok())
+                                        .unwrap_or(0.0)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let sizes = rt
+                        .paned_sizes
+                        .entry(path.to_string())
+                        .or_insert(defaults);
+                    if let Some(size) = sizes.get_mut(index) {
+                        *size += delta;
                     }
+                    if let Some(size) = sizes.get_mut(index + 1) {
+                        *size -= delta;
+                    }
+                    rt.bump();
                 });
-                return Ok(Value::from_int(0));
+                return Ok(Value::from_int(old));
             }
-            let position = with_state(interp, |rt| {
-                let index = rest[1].as_str().parse::<usize>().unwrap_or(0);
-                rt.paned
-                    .get(path)
-                    .map(|panes| {
-                        panes
-                            .iter()
-                            .take(index)
-                            .filter_map(|pane| {
-                                pane.options
-                                    .get("-width")
-                                    .and_then(|width| width.parse::<i64>().ok())
-                            })
-                            .sum::<i64>()
-                    })
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
-            Ok(Value::from_int(position))
+            Ok(Value::from_int(position_of(paned_sizes(path))))
         }
         "sash" | "proxy" => Ok(Value::empty()),
         "identify" => Ok(Value::from_str("")),
@@ -12717,8 +12779,15 @@ mod tests {
         eval(&mut i, "label .p.c -text C; .p insert 0 .p.c");
         assert_eq!(eval(&mut i, ".p panes"), ".p.c .p.a .p.b");
         assert_eq!(eval(&mut i, ".p sashpos 1"), "0");
+        // Dragging a sash (or `sashpos i new`) records real pane sizes.
         eval(&mut i, ".p sashpos 0 30");
-        assert_eq!(eval(&mut i, ".p panecget .p.c -width"), "30");
+        assert_eq!(eval(&mut i, ".p sashpos 0"), "30");
+        {
+            let sizes = paned_sizes(".p");
+            assert!(sizes
+                .as_ref()
+                .is_some_and(|sizes| sizes.first() == Some(&30.0)));
+        }
         eval(&mut i, ".p forget .p.a");
         assert_eq!(eval(&mut i, ".p panes"), ".p.c .p.b");
         assert!(i.eval("label .other -text X; .p add .other").is_err());

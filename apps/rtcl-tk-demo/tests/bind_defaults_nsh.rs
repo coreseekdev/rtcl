@@ -289,3 +289,30 @@ fn wheel_scrolls_listbox_and_treeview() {
         app.screen().texts()
     );
 }
+
+const WIDGET_BIND_APP: &str = r#"
+set ::report ""
+label .lab -text ClickMe
+pack .lab
+label .out -textvariable ::report
+pack .out
+bind .lab <Button-1> {set ::report clicked}
+"#;
+
+#[component]
+fn WidgetBindApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(WIDGET_BIND_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn label_click_bindings_fire() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<WidgetBindApp>()))
+        .expect("headless engine starts");
+    app.set_viewport(Size::new(Points(400.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("ClickMe").expect("label renders");
+    app.press("ClickMe").expect("click the label");
+    app.wait_for("clicked")
+        .expect("<Button-1> on a plain label runs");
+}

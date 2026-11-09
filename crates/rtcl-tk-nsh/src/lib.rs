@@ -1237,7 +1237,18 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             if node.kind == WidgetKind::Frame {
                 frame = frame.p(px(4.0));
             }
-            frame.child(render_children(tree, path)).into_element()
+            let press_path = path.to_string();
+            frame
+                .on_press(move |e: &PressEvent| {
+                    rtcl_tk_runtime::widget_press(
+                        &press_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        e.clicks,
+                    );
+                })
+                .child(render_children(tree, path))
+                .into_element()
         }
         WidgetKind::Labelframe => {
             let label = option(tree, path, "-text").to_string();
@@ -1273,7 +1284,16 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             }
             let color = option_color(tree, path, "-foreground")
                 .unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
+            let press_path = path.to_string();
             container
+                .on_press(move |e: &PressEvent| {
+                    rtcl_tk_runtime::widget_press(
+                        &press_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        e.clicks,
+                    );
+                })
                 .child(styled_text(
                     rtcl_tk_runtime::display_text(path),
                     &font,
@@ -1580,7 +1600,16 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             }
             let color = option_color(tree, path, "-foreground")
                 .unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
+            let press_path = path.to_string();
             container
+                .on_press(move |e: &PressEvent| {
+                    rtcl_tk_runtime::widget_press(
+                        &press_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        e.clicks,
+                    );
+                })
                 .child(styled_text(
                     rtcl_tk_runtime::display_text(path),
                     &font,
@@ -1664,17 +1693,36 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             }
         }
         WidgetKind::Separator => {
+            let press_path = path.to_string();
+            let press = move |e: &PressEvent| {
+                rtcl_tk_runtime::widget_press(
+                    &press_path,
+                    e.position.x.0 as f64,
+                    e.position.y.0 as f64,
+                    e.clicks,
+                );
+            };
             if option(tree, path, "-orient") == "horizontal" {
                 view()
                     .w_full()
                     .h(px(1.0))
                     .bg(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+                    .on_press(press)
                     .into_element()
             } else {
+                let press_path = path.to_string();
                 view()
                     .w(px(1.0))
                     .h(px(24.0))
                     .bg(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+                    .on_press(move |e: &PressEvent| {
+                        rtcl_tk_runtime::widget_press(
+                            &press_path,
+                            e.position.x.0 as f64,
+                            e.position.y.0 as f64,
+                            e.clicks,
+                        );
+                    })
                     .into_element()
             }
         }
@@ -1716,7 +1764,17 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         .bg(AdaptiveColor::rgb(0x2563eb, 0x3b82f6)),
                 )
             };
-            track.into_element()
+            let press_path = path.to_string();
+            track
+                .on_press(move |e: &PressEvent| {
+                    rtcl_tk_runtime::widget_press(
+                        &press_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        e.clicks,
+                    );
+                })
+                .into_element()
         }
         WidgetKind::Notebook => {
             let pages = node.children.clone();
@@ -1728,6 +1786,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     .and_then(|n| n.options.get("-text").cloned())
                     .unwrap_or_else(|| page.rsplit('.').next().unwrap_or(page).to_string());
                 let notebook = path.to_string();
+                let tab_path = path.to_string();
                 tabs = tabs.child(
                     nsh_base::button()
                         .px(px(10.0))
@@ -1748,6 +1807,9 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                                 }),
                         )
                         .on_press(move |_: &()| {
+                            // The tab button does not report where; %x/%y are
+                            // relative to the tab, not the notebook.
+                            rtcl_tk_runtime::widget_press(&tab_path, 0.0, 0.0, 1);
                             rtcl_tk_runtime::select_notebook_tab(&notebook, i);
                         }),
                 );
@@ -1773,6 +1835,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let readonly = option(tree, path.as_str(), "-state") == "readonly";
             let change_path = path.clone();
             let toggle_path = path.clone();
+            let press_path = path.clone();
             let row = view()
                 .flex_row()
                 .justify_start()
@@ -1804,6 +1867,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                                 .text_color(AdaptiveColor::rgb(0x111827, 0xf9fafb)),
                         )
                         .on_press(move |_: &()| {
+                            rtcl_tk_runtime::widget_press(&press_path, 0.0, 0.0, 1);
                             rtcl_tk_runtime::toggle_combobox(&toggle_path);
                         }),
                 );
@@ -2432,7 +2496,18 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
                 );
             }
-            chart.child(bars).into_element()
+            let press_path = path.to_string();
+            chart
+                .on_press(move |e: &PressEvent| {
+                    rtcl_tk_runtime::widget_press(
+                        &press_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        e.clicks,
+                    );
+                })
+                .child(bars)
+                .into_element()
         }
         WidgetKind::Treeview => {
             let Some(tv) = rtcl_tk_runtime::treeview_snapshot(path) else {
@@ -2444,6 +2519,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     .cloned()
                     .unwrap_or_else(|| fallback.to_string())
             };
+            let header_path = path.to_string();
             let mut header = view()
                 .flex_row()
                 .w_full()
@@ -2451,7 +2527,15 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .gap_2()
                 .px(px(6.0))
                 .py(px(3.0))
-                .bg(AdaptiveColor::rgb(0xe5e7eb, 0x374151));
+                .bg(AdaptiveColor::rgb(0xe5e7eb, 0x374151))
+                .on_press(move |e: &PressEvent| {
+                    rtcl_tk_runtime::widget_press(
+                        &header_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        e.clicks,
+                    );
+                });
             let width_of = |column: &str| {
                 tv.column_options
                     .get(column)

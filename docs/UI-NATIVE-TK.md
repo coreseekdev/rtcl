@@ -276,7 +276,10 @@ disabled/readonly 与 `-show` 密码已由原生输入呈现。
 `bindtags` 顺序 widget→class→toplevel→all；`event generate` 可带
 `-x/-y/-key/-button/-state`。点击派发 `<Button-1>`（第二次点击同时派发
 `<Double-Button-1>`）与 `<ButtonRelease-1>`，覆盖按钮、listbox/treeview
-行、canvas 项/画布；`focus` 切换派发 `<FocusOut>/<FocusIn>`。
+行、canvas 项/画布，以及 label/frame/labelframe/message/progressbar/
+separator/chart 的空白区域、notebook 标签、combobox 箭头、treeview 表头；
+`break`（tkinter 的 `return "break"`）会终止后续 bindtags；`focus`
+切换派发 `<FocusOut>/<FocusIn>`。
 `bind all`、类名/`bind .` 均可用。按钮默认类绑定 `<Key-space>` invoke
 （check/radio 另有 `<Key-Return>`），可由 `bind` 覆盖；listbox/treeview
 点击获得焦点，方向键/Home/End/Prior/Next 移动选择。指针/触摸事件：
@@ -300,8 +303,8 @@ text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/se
 text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
 未实现；`<Configure>` 与虚拟事件（`<<Paste>>` 等）尚未从平台层派发；
 滚轮绑定只在 listbox/treeview（有原生 scroll view）；canvas/text/entry
-的 wheel、entry/scale/text 的按下事件只走原生控件行为；其它控件的
-hover/motion 未派发；
+的 wheel 未派发；entry/scale/text/scrollbar 的按下事件只走原生控件行为；
+其它控件的 hover/motion 未派发；
 Windows/Linux 菜单栏仍是 app 内实现
 （macOS 用系统菜单；nsh GTK 的 set_application_menu 实测不显示）；
 scrollbar 已与 listbox/treeview 联动。

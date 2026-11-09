@@ -3223,8 +3223,10 @@ pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) {
     }
     for script in scripts {
         let script = substitute_bindings(&script, ctx);
-        if let Err(e) = eval_active(&script) {
-            record_error(e.to_string());
+        match eval_active(&script) {
+            Ok(_) => {}
+            Err(e) if binding_stopped(&e) => break,
+            Err(e) => record_error(e.to_string()),
         }
     }
 }
@@ -3261,6 +3263,39 @@ fn dispatch_click(path: &str, ctx: &EventCtx) {
         run_binding(path, "<Double-Button-1>", ctx);
     }
     run_binding(path, "<ButtonRelease-1>", ctx);
+}
+
+/// A pointer press on a non-invoking widget (label, frame, chart, ...):
+/// Tk bindings only, with the platform's click count for double clicks.
+pub fn widget_press(path: &str, x: f64, y: f64, clicks: u32) {
+    let mut ctx = EventCtx::for_path(path);
+    ctx.button = 1;
+    ctx.x = x as i64;
+    ctx.y = y as i64;
+    run_binding(path, "<Button-1>", &ctx);
+    if clicks >= 2 {
+        run_binding(path, "<Double-Button-1>", &ctx);
+    }
+    run_binding(path, "<ButtonRelease-1>", &ctx);
+}
+
+/// Tcl `break`/`continue` in a binding stops the event (tkinter's
+/// `return "break"`).
+fn binding_stopped(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::ControlFlow {
+            kind: rtcl_core::error::ControlFlow::Break | rtcl_core::error::ControlFlow::Continue,
+            ..
+        }
+    ) || matches!(
+        error,
+        Error::ControlFlow {
+            kind: rtcl_core::error::ControlFlow::Return,
+            value: Some(value),
+            ..
+        } if value.as_str() == "break"
+    )
 }
 
 /// Like [`set_tk_focus`] but without bumping the render revision: used
@@ -9182,6 +9217,27 @@ mod tests {
         assert_eq!(eval(&mut i, "set ::log"), "down wheel-120 classwheel");
         assert_eq!(eval(&mut i, "lindex [.l yview] 0"), "0.3");
         eval(&mut i, "bind Listbox <MouseWheel> {}");
+    }
+
+    #[test]
+    fn break_in_a_binding_stops_further_tags() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "button .b -text X; set ::log {};
+             bind Button <Button-1> {lappend ::log class};
+             bind all <Button-1> {lappend ::log all}",
+        );
+        eval(&mut i, "bind .b <Button-1> {lappend ::log widget}");
+        eval(&mut i, "event generate .b <Button-1>");
+        assert_eq!(eval(&mut i, "set ::log"), "widget class all");
+        eval(
+            &mut i,
+            "set ::log {}; bind .b <Button-1> {lappend ::log widget; break}",
+        );
+        eval(&mut i, "event generate .b <Button-1>");
+        assert_eq!(eval(&mut i, "set ::log"), "widget");
     }
 
     #[test]

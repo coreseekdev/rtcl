@@ -1191,6 +1191,56 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     scroll_to_row(interp, path, index, len);
                     Ok(Value::empty())
                 }
+                "nearest" => {
+                    if args.len() != 3 {
+                        return Err(wrong("nearest", "y", args.len()));
+                    }
+                    let y = parse_f64_str(args[2].as_str(), "y")?;
+                    let len = with_state(interp, |rt| rt.tree.get(path).map(|n| n.items.len()))
+                        .flatten()
+                        .unwrap_or(0);
+                    if len == 0 {
+                        return Ok(Value::from_str(""));
+                    }
+                    let (fraction, rows) = scroll_state(interp, path);
+                    let start = ((fraction * len as f64).round() as usize)
+                        .min(len.saturating_sub(rows.max(1)));
+                    let index = ((start as f64 + y / LISTBOX_ROW_PX).round() as i64)
+                        .clamp(0, len as i64 - 1) as usize;
+                    Ok(Value::from_int(index as i64))
+                }
+                "bbox" => {
+                    if args.len() != 3 {
+                        return Err(wrong("bbox", "index", args.len()));
+                    }
+                    let len = with_state(interp, |rt| rt.tree.get(path).map(|n| n.items.len()))
+                        .flatten()
+                        .unwrap_or(0);
+                    let index = listbox_index(args[2].as_str(), len)?;
+                    let (fraction, rows) = scroll_state(interp, path);
+                    let start = ((fraction * len as f64).round() as usize)
+                        .min(len.saturating_sub(rows.max(1)));
+                    if len == 0 || index < start || index >= start + rows {
+                        return Ok(Value::from_str(""));
+                    }
+                    let width = with_state(interp, |rt| {
+                        rt.tree
+                            .get(path)
+                            .map(|n| n.options.get("-width").cloned())
+                            .flatten()
+                    })
+                    .flatten()
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(20)
+                    .max(1) as i64;
+                    let y = ((index - start) as f64 * LISTBOX_ROW_PX) as i64;
+                    Ok(list_value([
+                        "0".to_string(),
+                        y.to_string(),
+                        width.to_string(),
+                        (LISTBOX_ROW_PX as i64).to_string(),
+                    ]))
+                }
                 "activate" | "xview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
@@ -1740,7 +1790,7 @@ fn bad_subcommand(kind: WidgetKind, sub: &str) -> Result<Value> {
             "cget, configure, delete, destroy, edit, get, index, insert, mark, see, tag, xview, yview"
         }
         WidgetKind::Listbox => {
-            "activate, cget, configure, curselection, delete, destroy, get, index, insert, itemcget, itemconfigure, see, selection, size, xview, yview"
+            "activate, bbox, cget, configure, curselection, delete, destroy, get, index, insert, itemcget, itemconfigure, nearest, see, selection, size, xview, yview"
         }
             WidgetKind::Scale => "cget, configure, coords, destroy, get, identify, set",
             WidgetKind::Scrollbar => {
@@ -11136,6 +11186,10 @@ fn set_scroll_fraction(interp: &mut Interp, path: &str, fraction: f64) {
 
 /// Scroll a listbox/treeview so `index` (0-based row) is visible, moving as
 /// little as possible like Tk's `see`.
+/// The listbox row height the renderer draws (an approximation of Tk's
+/// font metrics; `nearest`/`bbox` share it).
+const LISTBOX_ROW_PX: f64 = 18.0;
+
 fn scroll_to_row(interp: &mut Interp, path: &str, index: usize, total: usize) {
     if total == 0 {
         return;
@@ -12358,6 +12412,26 @@ mod tests {
         eval(&mut i, "set ::c 0");
         text_key_event(".t", "c", false, false, false, false);
         assert_eq!(eval(&mut i, "set ::c"), "0");
+    }
+
+    #[test]
+    fn listbox_nearest_and_bbox() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "listbox .l -height 3 -width 20; .l insert end a b c d e",
+        );
+        assert_eq!(eval(&mut i, ".l nearest 0"), "0");
+        assert_eq!(eval(&mut i, ".l nearest 40"), "2");
+        assert_eq!(eval(&mut i, ".l bbox 1"), "0 18 20 18");
+        assert_eq!(eval(&mut i, ".l bbox 4"), "");
+        eval(&mut i, ".l see 4");
+        assert_eq!(eval(&mut i, ".l nearest 0"), "2");
+        assert_eq!(eval(&mut i, ".l bbox 4"), "0 36 20 18");
+        assert_eq!(eval(&mut i, ".l nearest 1000"), "4");
+        assert_eq!(eval(&mut i, ".l bbox 0"), "");
+        assert_eq!(eval(&mut i, "listbox .e; .e nearest 5"), "");
     }
 
     #[test]

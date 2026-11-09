@@ -197,7 +197,9 @@ index/icursor/selection/size/curselection/step` 等；菜单子命令含
 unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
 `ttk::combobox` 的 `get/set/current/values/post/unpost`；
 `ttk::treeview` 的 `insert/delete/item/selection/focus/children/parent/
-index/heading/column/exists`；listbox/treeview 按 `-height` 放进滚动视图（滚轮可滚）；Tcl 侧的 `after/update/vwait` 沿用 rtcl-vm。
+index/heading/column/exists`；listbox 的 `nearest y`/`bbox index` 按
+渲染行高 18px 的模型近似（bbox 仅返回可见行，格式 `x y w h`）；
+listbox/treeview 按 `-height` 放进滚动视图（滚轮可滚）；Tcl 侧的 `after/update/vwait` 沿用 rtcl-vm。
 
 **弹出菜单**：`tk_popup menu x y ?entry?` 与 `menu post x y` 在指定点弹出
 菜单（nsh menu 组件以 1×1 不可见 trigger 锚定，受控打开；选项触发

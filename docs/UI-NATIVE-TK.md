@@ -191,7 +191,7 @@ message,canvas}` 别名（ttk
 **命令**：`configure/cget/cget 前缀缩写/destroy/pack/grid/place/winfo/
 wm/tk/bind/bindtags/event generate/focus/raise/lower/font/option/bell/
 tk_focusNext/tk_focusPrev/menu/clipboard/selection/tk_messageBox/
-tk_getOpenFile/tk_getSaveFile/tk_chooseDirectory`；控件子命令含 `invoke/get/insert/delete/
+tk_getOpenFile/tk_getSaveFile/tk_chooseDirectory/tk_chooseColor`；控件子命令含 `invoke/get/insert/delete/
 index/icursor/selection/size/curselection/step` 等；菜单子命令含
 `add/insert/delete/index/entrycget/entryconfigure/invoke/type/post/
 unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
@@ -378,7 +378,9 @@ GTK 初始化失败时立即返回默认按钮，便于 headless/非 Linux；
 GTK `FileDialog`：`-initialdir/-initialfile/-filetypes` 转 native filter、
 `-multiple` 返回 Tcl 列表、保存时补 `-defaultextension`、`-confirmoverwrite`
 由 GTK 处理；`-parent` 忽略，`-typevariable` 写第一个 filetype 描述；
-无后端时返回空串/空列表表示取消）；`clipboard
+无后端时返回空串/空列表表示取消）；`tk_chooseColor` 走宿主回调
+（Linux GTK `ColorDialog`，`-initialcolor` 解析 Tk 色名/#hex，返回
+`#rrggbb`，取消返回空串；无后端时返回 `-initialcolor`）；`clipboard
 clear/append/get` 维护应用自己的文本并同步到系统剪贴板；应用未拥有剪贴板
 时 `get` 通过后端的同步 getter 读取系统剪贴板（Linux：GTK 异步读包在嵌套
 主循环里，1s 超时；其它平台未接 getter 时返回空）；`selection

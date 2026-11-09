@@ -77,6 +77,56 @@ pub fn install_backend() {
     rtcl_tk_runtime::set_message_box_handler(message_box_gtk);
     #[cfg(target_os = "linux")]
     rtcl_tk_runtime::set_file_dialog_handler(file_dialog_gtk);
+    #[cfg(target_os = "linux")]
+    rtcl_tk_runtime::set_color_dialog_handler(color_dialog_gtk);
+}
+
+/// `tk_chooseColor` as a GTK color dialog, blocking until the user picks.
+#[cfg(target_os = "linux")]
+fn color_dialog_gtk(request: &rtcl_tk_runtime::ColorDialogRequest) -> Option<String> {
+    if gtk4::init().is_err() {
+        return None;
+    }
+    let mut builder = gtk4::ColorDialog::builder().modal(true).with_alpha(false);
+    if !request.title.is_empty() {
+        builder = builder.title(request.title.clone());
+    }
+    let dialog = builder.build();
+    let initial = parse_color(&request.initial).map(|color| {
+        let rgb = color.light.to_rgb();
+        gtk4::gdk::RGBA::new(rgb.r, rgb.g, rgb.b, 1.0)
+    });
+    let picked: std::rc::Rc<std::cell::RefCell<Option<Option<String>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let done = picked.clone();
+    let parent = gtk_parent_window();
+    dialog.choose_rgba(
+        parent.as_ref(),
+        initial.as_ref(),
+        None::<&gtk4::gio::Cancellable>,
+        move |result| {
+            let value = result.ok().map(|rgba| {
+                format!(
+                    "#{:02x}{:02x}{:02x}",
+                    (rgba.red() * 255.0).round() as u8,
+                    (rgba.green() * 255.0).round() as u8,
+                    (rgba.blue() * 255.0).round() as u8,
+                )
+            });
+            *done.borrow_mut() = Some(value);
+        },
+    );
+    let context = gtk4::glib::MainContext::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    loop {
+        let answered = picked.borrow().is_some();
+        if answered || std::time::Instant::now() >= deadline {
+            break;
+        }
+        context.iteration(true);
+    }
+    let answer = picked.borrow_mut().take();
+    answer.flatten()
 }
 
 /// The visible GTK toplevel a modal dialog should parent to.

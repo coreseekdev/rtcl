@@ -515,6 +515,7 @@ pub fn install(interp: &mut Interp) {
         "tk_getOpenFile",
         "tk_getSaveFile",
         "tk_chooseDirectory",
+        "tk_chooseColor",
     ] {
         interp.register_command(name, global_command);
     }
@@ -4234,6 +4235,62 @@ pub struct FileDialogRequest {
     pub confirm_overwrite: bool,
     pub default_extension: String,
     pub parent: String,
+}
+
+/// A `tk_chooseColor` request.
+#[derive(Debug, Clone, Default)]
+pub struct ColorDialogRequest {
+    pub title: String,
+    pub initial: String,
+    pub parent: String,
+}
+
+thread_local! {
+    /// The backend's native color dialog.
+    static COLOR_DIALOG: std::cell::Cell<Option<fn(&ColorDialogRequest) -> Option<String>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Give `tk_chooseColor` a native color dialog.  The handler blocks until
+/// the user answers and returns a Tk color (usually `#rrggbb`), or `None`
+/// when cancelled.
+pub fn set_color_dialog_handler(handler: fn(&ColorDialogRequest) -> Option<String>) {
+    COLOR_DIALOG.with(|cell| cell.set(Some(handler)));
+}
+
+fn choose_color_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let mut request = ColorDialogRequest::default();
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        let Some(value) = args.get(index + 1) else {
+            return Err(wrong(
+                "tk_chooseColor",
+                "?-option value ...?",
+                args.len() + 1,
+            ));
+        };
+        match option {
+            "-title" => request.title = value.as_str().to_string(),
+            "-initialcolor" => request.initial = value.as_str().to_string(),
+            "-parent" => request.parent = value.as_str().to_string(),
+            other => {
+                return Err(generic(format!(
+                    "bad option \"{other}\": must be -initialcolor, -parent, or -title"
+                )));
+            }
+        }
+        index += 2;
+    }
+    let picked = COLOR_DIALOG
+        .with(|cell| cell.get())
+        .and_then(|handler| handler(&request))
+        .or_else(|| {
+            // A host without a dialog leaves the initial color selected.
+            (!request.initial.is_empty()).then(|| request.initial.clone())
+        })
+        .unwrap_or_default();
+    Ok(Value::from_str(&picked))
 }
 
 thread_local! {
@@ -10356,6 +10413,7 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "tk_getOpenFile" => file_dialog_impl(interp, args, FileDialogKind::Open),
         "tk_getSaveFile" => file_dialog_impl(interp, args, FileDialogKind::Save),
         "tk_chooseDirectory" => file_dialog_impl(interp, args, FileDialogKind::Directory),
+        "tk_chooseColor" => choose_color_impl(interp, args),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -11013,6 +11071,37 @@ mod tests {
 
     fn choose_plain(_: &FileDialogRequest) -> Option<Vec<String>> {
         Some(vec!["/tmp/name".to_string()])
+    }
+
+    static LAST_COLOR_DIALOG: std::sync::Mutex<Option<ColorDialogRequest>> =
+        std::sync::Mutex::new(None);
+
+    fn choose_blue(request: &ColorDialogRequest) -> Option<String> {
+        *LAST_COLOR_DIALOG.lock().unwrap() = Some(request.clone());
+        Some("#0000ff".to_string())
+    }
+
+    #[test]
+    fn color_dialog_request_and_answer() {
+        let mut i = Interp::new();
+        install(&mut i);
+        assert_eq!(eval(&mut i, "tk_chooseColor"), "");
+        assert_eq!(eval(&mut i, "tk_chooseColor -initialcolor red"), "red");
+        set_color_dialog_handler(choose_blue);
+        assert_eq!(
+            eval(
+                &mut i,
+                "tk_chooseColor -title Pick -initialcolor #ff0000 -parent ."
+            ),
+            "#0000ff"
+        );
+        let request = LAST_COLOR_DIALOG.lock().unwrap().take().unwrap();
+        assert_eq!(request.title, "Pick");
+        assert_eq!(request.initial, "#ff0000");
+        assert_eq!(request.parent, ".");
+        assert!(i
+            .eval("tk_chooseColor -bogus x")
+            .is_err_and(|e| e.to_string().contains("bad option")));
     }
 
     #[test]

@@ -19,11 +19,18 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use nsh_base::rich_editor::{
+    extensions::starter,
+    model::Schema,
+    state::{EditorState, EditorStateConfig},
+    view::{rich_editor, EditorSession, NodeViews, PartStyles, RichEditorStyles},
+};
 use nsh_base::SliderValue;
 use nsh_core::element::desktop;
 use nsh_core::geometry::{Axis, Point, Radians, Size};
 use nsh_core::prelude::*;
 use rtcl_tk_core::{Fill, PackSide, TkTree, WidgetKind};
+use serde_json::json;
 
 thread_local! {
     /// The renderer's revision signal, created by the first [`TkView`]
@@ -32,6 +39,15 @@ thread_local! {
     static REVISION: RefCell<Option<Signal<u64>>> = const { RefCell::new(None) };
     /// Set once per engine thread; `TkView` starts the one pump interval.
     static PUMP_STARTED: Cell<bool> = const { Cell::new(false) };
+    /// Rich-editor sessions for tagged text widgets, keyed by path.
+    static WYSIWYG: RefCell<BTreeMap<String, WysiwygEntry>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+struct WysiwygEntry {
+    content: String,
+    signature: String,
+    session: EditorSession,
 }
 
 fn notify_backend() {
@@ -269,6 +285,221 @@ fn arrow_head(
         .close_path()
         .fill();
     painter
+}
+
+fn tags_signature(tags: &[rtcl_tk_runtime::TextTagView]) -> String {
+    format!("{tags:?}")
+}
+
+fn wysiwyg_mark_attrs(
+    tags: &[rtcl_tk_runtime::TextTagView],
+    start: usize,
+    end: usize,
+) -> (String, String, String, String, bool) {
+    let mut color = String::new();
+    let mut background = String::new();
+    let mut font_size = String::new();
+    let mut font_family = String::new();
+    let mut bold = false;
+    for tag in tags {
+        if !tag.ranges.iter().any(|(a, b)| start < *b && end > *a) {
+            continue;
+        }
+        if let Some(value) = tag.options.get("-foreground") {
+            color = value.clone();
+        }
+        if let Some(value) = tag.options.get("-background") {
+            background = value.clone();
+        }
+        if let Some(value) = tag.options.get("-font") {
+            if let Some((family, size, is_bold)) = rtcl_tk_runtime::resolve_font(value) {
+                if !family.is_empty() {
+                    font_family = family;
+                }
+                font_size = format!("{size}px");
+                bold = is_bold;
+            }
+        }
+    }
+    (color, background, font_size, font_family, bold)
+}
+
+fn wysiwyg_doc(content: &str, tags: &[rtcl_tk_runtime::TextTagView]) -> serde_json::Value {
+    let chars = content.chars().collect::<Vec<_>>();
+    let len = chars.len();
+    let mut paragraphs = Vec::new();
+    let mut line_start = 0usize;
+    for line in content.split('\n') {
+        let line_len = line.chars().count();
+        let line_end = (line_start + line_len).min(len);
+        let mut bounds = vec![line_start, line_end];
+        for tag in tags {
+            for (start, end) in &tag.ranges {
+                if *start < line_end && *end > line_start {
+                    bounds.push((*start).max(line_start));
+                    bounds.push((*end).min(line_end));
+                }
+            }
+        }
+        bounds.sort_unstable();
+        bounds.dedup();
+        let mut nodes = Vec::new();
+        for pair in bounds.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            if start >= end {
+                continue;
+            }
+            let text = chars[start..end].iter().collect::<String>();
+            let (color, background, font_size, font_family, bold) =
+                wysiwyg_mark_attrs(tags, start, end);
+            let mut marks = Vec::new();
+            let text_style = json!({
+                "type": "textStyle",
+                "attrs": {
+                    "color": color,
+                    "backgroundColor": background,
+                    "fontSize": font_size,
+                    "fontFamily": font_family,
+                }
+            });
+            if !color.is_empty()
+                || !background.is_empty()
+                || !font_size.is_empty()
+                || !font_family.is_empty()
+            {
+                marks.push(text_style);
+            }
+            if bold {
+                marks.push(json!({"type": "bold"}));
+            }
+            nodes.push(if marks.is_empty() {
+                json!({"type": "text", "text": text})
+            } else {
+                json!({"type": "text", "text": text, "marks": marks})
+            });
+        }
+        paragraphs.push(if nodes.is_empty() {
+            json!({"type": "paragraph"})
+        } else {
+            json!({"type": "paragraph", "content": nodes})
+        });
+        line_start = line_end + 1;
+    }
+    json!({"type": "doc", "content": paragraphs})
+}
+
+fn wysiwyg_schema() -> Schema {
+    Schema::new(starter::schema_spec()).expect("the WYSIWYG schema")
+}
+
+fn wysiwyg_session(content: &str, tags: &[rtcl_tk_runtime::TextTagView]) -> Option<EditorSession> {
+    let schema = wysiwyg_schema();
+    let doc = schema.node_from_json(&wysiwyg_doc(content, tags)).ok()?;
+    let plugins = starter::plugins(&schema);
+    let state =
+        EditorState::create(EditorStateConfig::new(schema).doc(doc).plugins(plugins)).ok()?;
+    Some(EditorSession::new(state, NodeViews::new()))
+}
+
+fn wysiwyg_styles(tags: &[rtcl_tk_runtime::TextTagView]) -> RichEditorStyles {
+    let mut marks = BTreeMap::new();
+    for tag in tags {
+        if let Some(value) = tag.options.get("-foreground") {
+            if let Some(color) = parse_color(value) {
+                let style = nsh_core::element::Style::from_decls([nsh_core::StyleDecl::Set(
+                    nsh_core::StyleKey::Color,
+                    nsh_core::PropertyValue::Color(Some(nsh_core::Color::from(color.light))),
+                )]);
+                marks.insert(format!("textStyle[color={value}]"), style);
+            }
+        }
+        if let Some(value) = tag.options.get("-background") {
+            if let Some(color) = parse_color(value) {
+                let style = nsh_core::element::Style::from_decls([nsh_core::StyleDecl::Set(
+                    nsh_core::StyleKey::BackgroundColor,
+                    nsh_core::PropertyValue::Color(Some(nsh_core::Color::from(color.light))),
+                )]);
+                marks.insert(format!("textStyle[backgroundColor={value}]"), style);
+            }
+        }
+        if let Some(value) = tag.options.get("-font") {
+            if let Some((_family, size, bold)) = rtcl_tk_runtime::resolve_font(value) {
+                let style = nsh_core::element::Style::from_decls([nsh_core::StyleDecl::Set(
+                    nsh_core::StyleKey::FontSize,
+                    nsh_core::PropertyValue::OptPoints(Some(Points((size * 1.3333) as f32))),
+                )]);
+                marks.insert(format!("textStyle[fontSize={size}px]"), style);
+                if bold {
+                    let style = nsh_core::element::Style::from_decls([nsh_core::StyleDecl::Set(
+                        nsh_core::StyleKey::FontWeight,
+                        nsh_core::PropertyValue::FontWeight(Some(700)),
+                    )]);
+                    marks.insert("bold".to_string(), style);
+                }
+            }
+        }
+    }
+    let mut styles = RichEditorStyles::default();
+    styles.marks = Some(PartStyles(marks));
+    styles
+}
+
+fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagView]) -> AnyElement {
+    let content = rtcl_tk_runtime::text_value(path);
+    let signature = tags_signature(tags);
+    let session = WYSIWYG.with(|map| {
+        let mut map = map.borrow_mut();
+        if let Some(entry) = map.get(path) {
+            if entry.content == content && entry.signature == signature {
+                return Some(entry.session.clone());
+            }
+        }
+        let session = wysiwyg_session(&content, tags)?;
+        map.insert(
+            path.to_string(),
+            WysiwygEntry {
+                content,
+                signature,
+                session: session.clone(),
+            },
+        );
+        Some(session)
+    });
+    let Some(session) = session else {
+        return render_rich_text(tree, path, tags);
+    };
+    let styles = wysiwyg_styles(tags);
+    let change_path = path.to_string();
+    let change_session = session.clone();
+    let height = option(tree, path, "-height")
+        .parse::<f32>()
+        .unwrap_or(10.0)
+        .clamp(3.0, 40.0);
+    view()
+        .w_full()
+        .h(px(height * 18.0 + 8.0))
+        .child(
+            rich_editor()
+                .editor(session)
+                .size_full()
+                .styles(styles)
+                .on_change(move |_: &_| {
+                    let state = change_session.state();
+                    let doc = state.doc();
+                    let text = doc.text_between(0, doc.content().size(), Some("\n"), None);
+                    rtcl_tk_runtime::text_changed_editor(&change_path, &text);
+                    let tags_now = rtcl_tk_runtime::text_tags(&change_path);
+                    let signature = tags_signature(&tags_now);
+                    WYSIWYG.with(|map| {
+                        if let Some(entry) = map.borrow_mut().get_mut(&change_path) {
+                            entry.content = text;
+                            entry.signature = signature;
+                        }
+                    });
+                    rtcl_tk_runtime::request_render();
+                }),
+        )
+        .into_element()
 }
 
 fn render_rich_text(
@@ -961,50 +1192,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
         WidgetKind::Text => {
             let tags = rtcl_tk_runtime::text_tags(path);
             if !tags.is_empty() {
-                let editing = rtcl_tk_runtime::text_editing(path);
-                let toggle_path = path.to_string();
-                let toggle_label = if editing { "Done" } else { "Edit" };
-                let toggle = nsh_base::button()
-                    .self_start()
-                    .px(px(8.0))
-                    .py(px(3.0))
-                    .rounded(px(4.0))
-                    .bg(AdaptiveColor::rgb(0xe5e7eb, 0x374151))
-                    .child(
-                        text(toggle_label.to_string())
-                            .text_size(px(12.0))
-                            .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
-                    )
-                    .on_press(move |_: &()| {
-                        rtcl_tk_runtime::toggle_text_edit(&toggle_path);
-                    });
-                if editing {
-                    let edit_path = path.to_string();
-                    let change_path = edit_path.clone();
-                    return view()
-                        .flex_col()
-                        .w_full()
-                        .gap_1()
-                        .child(
-                            nsh_base::input()
-                                .multiline(true)
-                                .auto_focus(true)
-                                .value(rtcl_tk_runtime::text_value(&edit_path))
-                                .on_change(move |text: &str| {
-                                    rtcl_tk_runtime::text_changed(&change_path, text);
-                                }),
-                        )
-                        .child(render_rich_text(tree, path, &tags))
-                        .child(toggle)
-                        .into_element();
-                }
-                return view()
-                    .flex_col()
-                    .w_full()
-                    .gap_1()
-                    .child(render_rich_text(tree, path, &tags))
-                    .child(toggle)
-                    .into_element();
+                return render_wysiwyg(tree, path, &tags);
             }
             let path = path.to_string();
             let disabled = is_disabled(tree, path.as_str());

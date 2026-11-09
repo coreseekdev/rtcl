@@ -11,3 +11,4 @@ rtcl-tk-core = { path = "../rtcl-tk-core" }
 rtcl-tk-runtime = { path = "../rtcl-tk-runtime" }
 nsh-core = "0.4"
 nsh-base = { version = "0.4", default-features = false }
+serde_json = "1"

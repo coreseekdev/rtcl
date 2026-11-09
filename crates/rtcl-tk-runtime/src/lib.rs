@@ -74,8 +74,6 @@ pub struct TkRuntime {
     image_seq: u64,
     /// Canvas item models.
     canvases: BTreeMap<String, CanvasState>,
-    /// Text widgets currently shown in plain edit mode (tags retained).
-    editing_text: BTreeSet<String>,
 }
 
 /// A canvas's items.
@@ -4110,7 +4108,22 @@ pub fn entry_changed(path: &str, text: &str) {
 
 /// A Text widget's content changed in the UI.
 pub fn text_changed(path: &str, text: &str) {
-    let Some(ptr) = active_interp() else { return };
+    if apply_text_change(path, text) {
+        bump_active();
+    }
+}
+
+/// A change made by the rich editor itself: the model is updated without
+/// re-rendering, so the editor keeps its session and caret (the caller
+/// renders once afterwards).
+pub fn text_changed_editor(path: &str, text: &str) {
+    let _ = apply_text_change(path, text);
+}
+
+fn apply_text_change(path: &str, text: &str) -> bool {
+    let Some(ptr) = active_interp() else {
+        return false;
+    };
     let interp = unsafe { &mut *ptr };
     with_state_mut(interp, |rt| {
         let old = rt
@@ -4122,9 +4135,15 @@ pub fn text_changed(path: &str, text: &str) {
         if let Some(n) = rt.tree.get_mut(path) {
             n.content = text.to_string();
             n.cursor = text.chars().count();
-            rt.bump();
         }
-    });
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Ask the backend to render again (host-side model updates).
+pub fn request_render() {
+    bump_active();
 }
 
 /// Shift tag ranges for an edit (`old` → `new`).
@@ -4173,26 +4192,6 @@ fn adjust_text_tag_ranges(old: &str, new: &str, tags: Option<&mut BTreeMap<Strin
         }
         tag.ranges = ranges;
     }
-}
-
-/// Whether a tagged text widget is in plain edit mode.
-pub fn text_editing(path: &str) -> bool {
-    let Some(ptr) = active_interp() else {
-        return false;
-    };
-    with_state(unsafe { &*ptr }, |rt| rt.editing_text.contains(path)).unwrap_or(false)
-}
-
-/// Toggle a tagged text widget between rich display and plain editing.
-pub fn toggle_text_edit(path: &str) {
-    let Some(ptr) = active_interp() else { return };
-    let interp = unsafe { &mut *ptr };
-    with_state_mut(interp, |rt| {
-        if !rt.editing_text.remove(path) {
-            rt.editing_text.insert(path.to_string());
-        }
-        rt.bump();
-    });
 }
 
 /// The return key was pressed in an Entry.

@@ -28,7 +28,7 @@ use nsh_base::rich_editor::{
         RichEditorSelection, RichEditorStyles,
     },
 };
-use nsh_base::SliderValue;
+use nsh_base::{menu, menu_item, menu_separator, submenu, SliderValue};
 use nsh_core::canvas::{CanvasTextAlign, CanvasTextBaseline};
 use nsh_core::element::desktop;
 use nsh_core::geometry::{Axis, Point, Radians, Size};
@@ -1732,6 +1732,101 @@ fn render_entry_input(tree: &TkTree, path: &str, spinbox: bool) -> AnyElement {
         .into_element()
 }
 
+/// The items of a Tk menu as nsh menu items (for `menubutton`).
+fn menubutton_menu_items(menu_path: &str) -> Vec<AnyElement> {
+    let Some(menu) = rtcl_tk_runtime::menu_snapshot(menu_path) else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    for (index, item) in menu.items.iter().enumerate() {
+        let label = item.options.get("-label").cloned().unwrap_or_default();
+        let disabled = item
+            .options
+            .get("-state")
+            .is_some_and(|state| state == "disabled");
+        match item.kind.as_str() {
+            "separator" => {
+                items.push(menu_separator().into_element());
+            }
+            "cascade" => {
+                let sub_path = item.options.get("-menu").cloned().unwrap_or_default();
+                let mut sub = submenu().trigger(
+                    text(label)
+                        .text_size(px(13.0))
+                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                );
+                if !sub_path.is_empty() {
+                    for child in menubutton_menu_items(&sub_path) {
+                        sub = sub.child(child);
+                    }
+                }
+                items.push(sub.into_element());
+            }
+            kind => {
+                let mut entry = menu_item().disabled(disabled).child(
+                    text(label)
+                        .text_size(px(13.0))
+                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                );
+                if matches!(kind, "checkbutton" | "radiobutton") {
+                    entry =
+                        entry.checked(Some(rtcl_tk_runtime::menu_item_checked(menu_path, index)));
+                }
+                let select_path = menu_path.to_string();
+                items.push(
+                    entry
+                        .on_select(move || rtcl_tk_runtime::press_menu_item(&select_path, index))
+                        .into_element(),
+                );
+            }
+        }
+    }
+    items
+}
+
+/// A `menubutton`: a button that posts its `-menu` (nsh's menu component
+/// positions the dropdown and closes it on an outside press or Escape).
+fn render_menubutton(tree: &TkTree, path: &str) -> AnyElement {
+    let label = rtcl_tk_runtime::display_text(path);
+    let disabled = is_disabled(tree, path);
+    let menu_path = option(tree, path, "-menu").to_string();
+    let press_path = path.to_string();
+    let trigger = nsh_base::button()
+        .px(px(8.0))
+        .py(px(3.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+        .bg(AdaptiveColor::rgb(0xf9fafb, 0x1f2937))
+        .disabled(disabled)
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(
+                    text(label)
+                        .text_size(px(13.0))
+                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                )
+                .child(
+                    text("\u{25be}")
+                        .text_size(px(8.0))
+                        .text_color(AdaptiveColor::rgb(0x6b7280, 0x9ca3af)),
+                ),
+        )
+        .on_press(move |_: &()| {
+            rtcl_tk_runtime::widget_press(&press_path, 0.0, 0.0, 1);
+        });
+    let mut menu = menu().trigger(trigger);
+    if !menu_path.is_empty() {
+        for child in menubutton_menu_items(&menu_path) {
+            menu = menu.child(child);
+        }
+    }
+    menu.into_element()
+}
+
 fn render_node(tree: &TkTree, path: &str) -> AnyElement {
     let Some(node) = tree.get(path) else {
         return text("").into_element();
@@ -1947,6 +2042,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .child(view().flex_col().gap(px(1.0)).child(up).child(down))
                 .into_element()
         }
+        WidgetKind::Menubutton => render_menubutton(tree, path),
         WidgetKind::Checkbutton => {
             let path = path.to_string();
             let checked = rtcl_tk_runtime::is_checked(&path);

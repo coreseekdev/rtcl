@@ -445,6 +445,7 @@ pub fn install(interp: &mut Interp) {
         "frame",
         "label",
         "button",
+        "menubutton",
         "entry",
         "spinbox",
         "checkbutton",
@@ -460,6 +461,7 @@ pub fn install(interp: &mut Interp) {
         "ttk::frame",
         "ttk::label",
         "ttk::button",
+        "ttk::menubutton",
         "ttk::entry",
         "ttk::spinbox",
         "ttk::checkbutton",
@@ -516,6 +518,7 @@ pub fn install(interp: &mut Interp) {
         "tk_getSaveFile",
         "tk_chooseDirectory",
         "tk_chooseColor",
+        "tk_optionMenu",
     ] {
         interp.register_command(name, global_command);
     }
@@ -673,6 +676,7 @@ fn effective_option(interp: &Interp, path: &str, name: &str) -> String {
 fn ttk_class(base: &str) -> Option<&'static str> {
     Some(match base {
         "button" => "TButton",
+        "menubutton" => "TMenubutton",
         "checkbutton" => "TCheckbutton",
         "radiobutton" => "TRadiobutton",
         "entry" => "TEntry",
@@ -1641,6 +1645,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 fn bad_subcommand(kind: WidgetKind, sub: &str) -> Result<Value> {
     let must = match kind {
         WidgetKind::Button => "cget, configure, destroy, flash, invoke",
+        WidgetKind::Menubutton => "cget, configure, destroy",
         WidgetKind::Checkbutton => {
             "cget, configure, deselect, destroy, invoke, select, toggle"
         }
@@ -1955,6 +1960,9 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
         }
         run_binding(p, "<Destroy>", &EventCtx::for_path(p));
     }
+    // Tk windows are named by hierarchy: destroying `.o` destroys `.o.menu`
+    // too.  Menus are not in the widget tree here, so collect them by name.
+    let mut removed_menus = Vec::new();
     with_state_mut(interp, |rt| {
         rt.tree.destroy(path).map_err(tk_error)?;
         for p in &removed {
@@ -1965,6 +1973,20 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
             rt.text_modified.remove(p);
             rt.rich_docs.remove(p);
             rt.text_undo.remove(p);
+            let prefix = format!("{p}.");
+            let menus = rt
+                .menus
+                .keys()
+                .filter(|menu| menu.as_str() == p || menu.starts_with(&prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            for menu in menus {
+                rt.menus.remove(&menu);
+                if rt.open_menu.as_deref() == Some(menu.as_str()) {
+                    rt.open_menu = None;
+                }
+                removed_menus.push(menu);
+            }
         }
         rt.bump();
         Ok::<(), Error>(())
@@ -1972,6 +1994,9 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
     .ok_or_else(|| bad_window(path))??;
     for p in removed {
         let _ = interp.delete_command(&p);
+    }
+    for menu in removed_menus {
+        let _ = interp.delete_command(&menu);
     }
     Ok(Value::empty())
 }
@@ -2381,6 +2406,7 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
         let text_units = match node.kind {
             WidgetKind::Label
             | WidgetKind::Button
+            | WidgetKind::Menubutton
             | WidgetKind::Checkbutton
             | WidgetKind::Radiobutton => opt("-text").chars().count().max(1) as i64,
             _ => 0,
@@ -4295,6 +4321,51 @@ fn choose_color_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::from_str(&picked))
 }
 
+/// `tk_optionMenu w varName firstValue ?value ...?`: a menubutton showing
+/// `varName` with a radiobutton menu; returns the menu's path.
+fn option_menu_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 4 {
+        return Err(wrong(
+            "tk_optionMenu",
+            "w varName firstValue ?value ...?",
+            args.len(),
+        ));
+    }
+    let window = args[1].as_str().to_string();
+    let variable = args[2].as_str().to_string();
+    let values = args[3..]
+        .iter()
+        .map(|value| value.as_str().to_string())
+        .collect::<Vec<_>>();
+    let menu_path = format!("{window}.menu");
+    let script = format!("menu {} -tearoff 0", list_value(vec![menu_path.clone()]));
+    interp.eval(&script)?;
+    for value in &values {
+        let script = format!(
+            "{} add radiobutton -label {} -variable {} -value {}",
+            menu_path,
+            list_value(vec![value.clone()]),
+            list_value(vec![variable.clone()]),
+            list_value(vec![value.clone()]),
+        );
+        interp.eval(&script)?;
+    }
+    let script = format!(
+        "menubutton {} -menu {} -textvariable {} -relief raised",
+        list_value(vec![window]),
+        list_value(vec![menu_path.clone()]),
+        list_value(vec![variable.clone()]),
+    );
+    interp.eval(&script)?;
+    let script = format!(
+        "set {} {}",
+        list_value(vec![variable]),
+        list_value(vec![values[0].clone()])
+    );
+    interp.eval(&script)?;
+    Ok(Value::from_str(&menu_path))
+}
+
 thread_local! {
     /// The backend's native file dialog.
     static FILE_DIALOG: std::cell::Cell<Option<fn(&FileDialogRequest) -> Option<Vec<String>>>> =
@@ -5267,6 +5338,39 @@ pub fn toggle_menu(path: &str) {
         };
         rt.bump();
     });
+}
+
+/// Whether a menu item's checkbutton/radiobutton value is on (for the
+/// menu renderer).
+pub fn menu_item_checked(menu_path: &str, index: usize) -> bool {
+    let Some(ptr) = active_interp() else {
+        return false;
+    };
+    let interp = unsafe { &*ptr };
+    let item = with_state(interp, |rt| {
+        rt.menus.get(menu_path).and_then(|menu| {
+            menu.items
+                .get(index)
+                .map(|item| (item.kind.clone(), item.options.clone()))
+        })
+    })
+    .flatten();
+    let Some((kind, options)) = item else {
+        return false;
+    };
+    let Some(variable) = options.get("-variable").filter(|v| !v.is_empty()) else {
+        return false;
+    };
+    let current = var_value(variable).unwrap_or_default();
+    let expected = if kind == "checkbutton" {
+        options
+            .get("-onvalue")
+            .cloned()
+            .unwrap_or_else(|| "1".to_string())
+    } else {
+        options.get("-value").cloned().unwrap_or_default()
+    };
+    current == expected
 }
 
 /// Run a menu entry from the renderer and close the dropdown.
@@ -10637,6 +10741,7 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "tk_getSaveFile" => file_dialog_impl(interp, args, FileDialogKind::Save),
         "tk_chooseDirectory" => file_dialog_impl(interp, args, FileDialogKind::Directory),
         "tk_chooseColor" => choose_color_impl(interp, args),
+        "tk_optionMenu" => option_menu_impl(interp, args),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -11242,6 +11347,50 @@ mod tests {
             ),
             "05"
         );
+    }
+
+    #[test]
+    fn menubutton_and_menu_item_state() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "menu .m -tearoff 0; .m add command -label A;             menubutton .mb -text Options -menu .m",
+        );
+        assert_eq!(eval(&mut i, ".mb cget -menu"), ".m");
+        assert_eq!(eval(&mut i, ".mb cget -text"), "Options");
+        assert_eq!(eval(&mut i, "winfo class .mb"), "Menubutton");
+        eval(&mut i, "ttk::menubutton .tm -text T -menu .m");
+        assert_eq!(eval(&mut i, "winfo class .tm"), "TMenubutton");
+        eval(
+            &mut i,
+            ".m add checkbutton -label B -variable ::b -onvalue 1 -offvalue 0;             .m add radiobutton -label R -variable ::r -value red;             set ::b 1; set ::r red",
+        );
+        assert!(menu_item_checked(".m", 1));
+        assert!(menu_item_checked(".m", 2));
+        eval(&mut i, "set ::b 0; set ::r blue");
+        assert!(!menu_item_checked(".m", 1));
+        assert!(!menu_item_checked(".m", 2));
+    }
+
+    #[test]
+    fn option_menu_builds_a_menubutton() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "set ::v b");
+        assert_eq!(eval(&mut i, "tk_optionMenu .o ::v a b c"), ".o.menu");
+        assert_eq!(eval(&mut i, ".o cget -menu"), ".o.menu");
+        assert_eq!(eval(&mut i, ".o cget -textvariable"), "::v");
+        assert_eq!(eval(&mut i, "winfo class .o"), "Menubutton");
+        assert_eq!(eval(&mut i, ".o.menu type 0"), "radiobutton");
+        assert_eq!(eval(&mut i, ".o.menu entrycget 0 -label"), "a");
+        assert_eq!(eval(&mut i, ".o.menu entrycget 2 -value"), "c");
+        assert_eq!(eval(&mut i, "set ::v"), "a");
+        press_menu_item(".o.menu", 2);
+        assert_eq!(eval(&mut i, "set ::v"), "c");
+        // Destroying the menubutton destroys its child menu by name.
+        eval(&mut i, "destroy .o");
+        assert!(i.eval(".o.menu type 0").is_err());
     }
 
     #[test]

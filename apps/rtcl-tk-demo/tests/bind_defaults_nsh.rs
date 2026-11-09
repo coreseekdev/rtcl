@@ -489,6 +489,46 @@ fn rich_text_tag_bindings_fire_on_press() {
         .expect("the tag's <Enter> binding fired");
 }
 
+const MENUBUTTON_APP: &str = r##"
+set ::choice none
+set ::bold 0
+menu .m -tearoff 0
+.m add command -label "Alpha" -command {set ::choice "chosen:Alpha"}
+.m add separator
+.m add checkbutton -label "Bold" -variable ::bold -onvalue 1 -offvalue 0
+menubutton .mb -text "Options" -menu .m
+pack .mb
+label .out -textvariable ::choice
+pack .out
+label .boldout -textvariable ::bold
+pack .boldout
+"##;
+
+#[component]
+fn MenubuttonApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(MENUBUTTON_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn menubutton_posts_its_menu_and_runs_items() {
+    let mut config = EngineConfig::new(Root::of::<MenubuttonApp>());
+    config.environment.os = nsh_core::platform::Os::Linux;
+    let mut app = Headless::start(config).expect("headless engine starts");
+    app.set_viewport(Size::new(Points(500.0), Points(320.0)))
+        .expect("resize");
+    app.wait_for("Options").expect("menubutton renders");
+    app.press("Options").expect("press the menubutton");
+    app.wait_for("Alpha").expect("the menu opens");
+    app.press("Alpha").expect("choose the command item");
+    app.wait_for("text:chosen:Alpha")
+        .expect("the menu item's command ran");
+    app.press("Options").expect("press the menubutton again");
+    app.wait_for("Bold").expect("the menu opens again");
+    app.press("Bold").expect("toggle the checkbutton item");
+    app.wait_for("1").expect("the checkbutton variable changed");
+}
+
 const SPINBOX_APP: &str = r##"
 set ::v 0
 spinbox .s -textvariable ::v -from 0 -to 3

@@ -17,6 +17,7 @@ set ::clicks 0
 set ::agreed 0
 set ::volume 30
 set ::qty 3
+set ::sort Name
 
 label .greeting -textvariable ::greeting
 pack .greeting -padx 12 -pady 6
@@ -57,6 +58,9 @@ spinbox .qty -from 1 -to 10 -textvariable ::qty -command {
     set ::greeting "Quantity $::qty"
 }
 pack .qty -fill x -padx 12 -pady 4
+
+tk_optionMenu .sort ::sort Name Size Date
+pack .sort -padx 12 -pady 4 -anchor w
 
 listbox .colors -height 3
 pack .colors -fill x -padx 12 -pady 4

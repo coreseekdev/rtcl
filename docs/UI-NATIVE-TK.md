@@ -179,10 +179,10 @@ M1a/M1b/M2 已完成：
 
 ## 9. 已实现命令面与差异（M2/M3）
 
-**控件**：`toplevel/frame/label/button/entry/spinbox/checkbutton/
-radiobutton/scale/text/listbox/message/scrollbar` + `ttk::{separator,
-progressbar,notebook,combobox,treeview,labelframe,button,label,entry,
-spinbox,frame,checkbutton,radiobutton,scale,text,listbox,scrollbar,
+**控件**：`toplevel/frame/label/button/menubutton/entry/spinbox/
+checkbutton/radiobutton/scale/text/listbox/message/scrollbar` + `ttk::{separator,
+progressbar,notebook,combobox,treeview,labelframe,button,menubutton,label,
+entry,spinbox,frame,checkbutton,radiobutton,scale,text,listbox,scrollbar,
 message,canvas}` 别名（ttk
 创建的控件带 Tk 的 T* 类名，如 `ttk::button` → `TButton`，因此
 `bindtags`/`bind TButton`/`winfo class` 与 tkinter 一致）；扩展
@@ -191,13 +191,20 @@ message,canvas}` 别名（ttk
 **命令**：`configure/cget/cget 前缀缩写/destroy/pack/grid/place/winfo/
 wm/tk/bind/bindtags/event generate/focus/raise/lower/font/option/bell/
 tk_focusNext/tk_focusPrev/menu/clipboard/selection/tk_messageBox/
-tk_getOpenFile/tk_getSaveFile/tk_chooseDirectory/tk_chooseColor`；控件子命令含 `invoke/get/insert/delete/
+tk_getOpenFile/tk_getSaveFile/tk_chooseDirectory/tk_chooseColor/tk_optionMenu`；控件子命令含 `invoke/get/insert/delete/
 index/icursor/selection/size/curselection/step` 等；菜单子命令含
 `add/insert/delete/index/entrycget/entryconfigure/invoke/type/post/
 unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
 `ttk::combobox` 的 `get/set/current/values/post/unpost`；
 `ttk::treeview` 的 `insert/delete/item/selection/focus/children/parent/
 index/heading/column/exists`；listbox/treeview 按 `-height` 放进滚动视图（滚轮可滚）；Tcl 侧的 `after/update/vwait` 沿用 rtcl-vm。
+
+**menubutton**：`menubutton`/`ttk::menubutton`（类名 `Menubutton`/
+`TMenubutton`），`-text/-textvariable/-menu/-state/-direction/-indicatoron`；
+点击后用 nsh menu 组件弹出 `-menu`（自动定位、外部点击/Escape 关闭），
+command/checkbutton/radiobutton/separator/cascade 菜单项可选中并触发；
+`tk_optionMenu w varName firstValue ?value ...?` 创建 `.w.menu` 单选菜单
+并返回菜单路径（`.w` 为 menubutton，textvariable 为 varName）。
 
 **spinbox**：`spinbox`/`ttk::spinbox`（类名 `Spinbox`/`TSpinbox`），
 子命令 `get/set/insert/delete/index/icursor/selection/validate/xview`；

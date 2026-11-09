@@ -82,6 +82,8 @@ pub struct TkRuntime {
     canvases: BTreeMap<String, CanvasState>,
     /// `event add`: virtual event name (without `<<>>`) → physical sequences.
     virtual_events: BTreeMap<String, Vec<String>>,
+    /// The application's clipboard (`clipboard clear/append/get`).
+    clipboard: String,
     /// Persisted rich-text documents (ProseMirror JSON) of `text` widgets.
     rich_docs: BTreeMap<String, String>,
     /// `text edit modified` state: widgets with unsaved edits.
@@ -471,6 +473,7 @@ pub fn install(interp: &mut Interp) {
         "tk_focusPrev",
         "menu",
         "image",
+        "clipboard",
     ] {
         interp.register_command(name, global_command);
     }
@@ -4066,6 +4069,74 @@ fn parse_menu_entry(kind: &str, rest: &[Value]) -> Result<MenuItem> {
         kind: kind.to_string(),
         options,
     })
+}
+
+thread_local! {
+    /// A synchronous announcement of the Tk clipboard's text (the native
+    /// backend pushes it onto the system clipboard).
+    static CLIPBOARD_SINK: std::cell::Cell<Option<fn(&str)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The backend's sink for [`clipboard`](clipboard_impl) changes: called with
+/// the whole Tk clipboard text.
+pub fn set_clipboard_sink(sink: fn(&str)) {
+    CLIPBOARD_SINK.with(|cell| cell.set(Some(sink)));
+}
+
+fn announce_clipboard(text: &str) {
+    if let Some(sink) = CLIPBOARD_SINK.with(|cell| cell.get()) {
+        sink(text);
+    }
+}
+
+fn clipboard_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(wrong("clipboard", "option ?arg ...?", args.len()));
+    }
+    match args[1].as_str() {
+        "clear" => {
+            with_state_mut(interp, |rt| {
+                rt.clipboard.clear();
+            });
+            announce_clipboard("");
+            Ok(Value::empty())
+        }
+        "append" => {
+            let mut start = 2;
+            while start < args.len() && args[start].as_str().starts_with('-') {
+                match args[start].as_str() {
+                    "-displayof" => start += 2,
+                    "-type" | "-format" => start += 2,
+                    _ => start += 1,
+                }
+            }
+            if start >= args.len() {
+                return Err(wrong(
+                    "clipboard append",
+                    "?-option value ...? data ?data ...?",
+                    args.len(),
+                ));
+            }
+            let text = args[start..]
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<String>();
+            let current = with_state_mut(interp, |rt| {
+                rt.clipboard.push_str(&text);
+                rt.clipboard.clone()
+            })
+            .unwrap_or_default();
+            announce_clipboard(&current);
+            Ok(Value::empty())
+        }
+        "get" => {
+            let text = with_state(interp, |rt| rt.clipboard.clone()).unwrap_or_default();
+            Ok(Value::from_str(&text))
+        }
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be append, clear, or get"
+        ))),
+    }
 }
 
 fn image_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -9196,6 +9267,7 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "tk_focusPrev" => tk_focus_impl(interp, args, false),
         "menu" => menu_create(interp, args),
         "image" => image_impl(interp, args),
+        "clipboard" => clipboard_impl(interp, args),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -9890,6 +9962,27 @@ mod tests {
         );
         assert_eq!(eval(&mut i, "set ::inv"), "1");
         assert_eq!(eval(&mut i, "set ::log"), "invoke");
+    }
+
+    #[test]
+    fn clipboard_commands_and_sink() {
+        use std::sync::Mutex;
+        static SINKED: Mutex<String> = Mutex::new(String::new());
+        fn sink(text: &str) {
+            *SINKED.lock().unwrap() = text.to_string();
+        }
+        set_clipboard_sink(sink);
+
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "clipboard clear");
+        assert_eq!(eval(&mut i, "clipboard get"), "");
+        eval(&mut i, "clipboard append -type STRING Hel lo");
+        assert_eq!(eval(&mut i, "clipboard get"), "Hello");
+        assert_eq!(*SINKED.lock().unwrap(), "Hello");
+        eval(&mut i, "clipboard clear");
+        assert_eq!(eval(&mut i, "clipboard get"), "");
+        assert_eq!(*SINKED.lock().unwrap(), "");
     }
 
     #[test]

@@ -66,6 +66,8 @@ pub fn install_backend() {
     PUMP_STARTED.with(|p| p.set(false));
     REVISION.with(|r| *r.borrow_mut() = None);
     rtcl_tk_runtime::set_change_hook(Some(notify_backend));
+    // Tk's clipboard is the system clipboard when the backend is present.
+    rtcl_tk_runtime::set_clipboard_sink(|text| set_clipboard(text));
 }
 
 fn revision_signal() -> Signal<u64> {

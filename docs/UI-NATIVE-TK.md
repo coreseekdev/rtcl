@@ -185,7 +185,7 @@ radiobutton,scale,text,listbox,scrollbar,message,canvas}` 别名（ttk
 
 **命令**：`configure/cget/cget 前缀缩写/destroy/pack/grid/place/winfo/
 wm/tk/bind/bindtags/event generate/focus/raise/lower/font/option/bell/
-tk_focusNext/tk_focusPrev/menu`；控件子命令含 `invoke/get/insert/delete/
+tk_focusNext/tk_focusPrev/menu/clipboard`；控件子命令含 `invoke/get/insert/delete/
 index/icursor/selection/size/curselection/step` 等；菜单子命令含
 `add/insert/delete/index/entrycget/entryconfigure/invoke/type/post/
 unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
@@ -343,8 +343,10 @@ rotation×10）；`event generate` 接受 `-x/-y/-rootx/-rooty/-key/-keysym/
 旋转/贝塞尔/箭头/虚线/图片/arc/polygon/锚点与 bbox/find 查询；
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
-text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
-未实现；`<Configure>` 尚未覆盖菜单窗口；`<<Copy>>/<<Cut>>/<<SelectAll>>`
+text `undo/redo` 与 `tag bind` 暂为 no-op；`tk_messageBox` 与 `selection`
+命令未实现；`clipboard clear/append/get` 维护应用自己的文本并同步到系统
+剪贴板（`clipboard get` 只读回应用写入的内容，系统剪贴板的异步读取未接）；
+`<Configure>` 尚未覆盖菜单窗口；`<<Copy>>/<<Cut>>/<<SelectAll>>`
 等虚拟事件没有默认映射（可用 `event add` 自行定义）；
 entry 选区拖动（`<B1-Motion>`）在桌面鼠标拖动时由平台 MouseMove 派发，
 headless 的 `drag` 是触摸模拟故不触发；菜单项/separator 等装饰控件的

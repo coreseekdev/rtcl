@@ -275,6 +275,12 @@ tag 区间、mark 与富文档；`-autoseparators`（默认开）时 500ms 内�
 `-maxundo` 限制栈深（0 为不限，与 Tk 一致）；`edit reset` 同时清空历史。
 Tcl 侧 `tag add/remove` 这类纯格式命令不单独入栈，但会随下一次文本编辑的
 快照一起回滚。富编辑器内部的 Ctrl+Z 仍由编辑器自身的历史处理。
+`text count ?-chars|-indices|-lines|-update|-elide? index1 index2` 按选项
+顺序返回计数（默认 chars）；`text dump ?-all|-text|-tag|-mark|-image|
+-window? index1 ?index2?` 按位置输出 Tk 风格事件流：`tagon/tagoff <tag>
+<index>`、`mark <name> <index>`、`text <chars> <index>`，text 在 tag
+边界、mark 与行首处分段（image/window 项暂不输出；Tk 自带的行尾换行
+不参与本模型）。
 `tag bind tagName ?sequence? ?script?` 把事件绑定到 tag 区间：富文本编辑器
 按下时按指针下的文档位置映射成字符下标，命中区间的 tag 依次执行最具体的
 sequence（`<Button-1>`、Double/Triple/Quadruple、`<ButtonRelease-1>`、

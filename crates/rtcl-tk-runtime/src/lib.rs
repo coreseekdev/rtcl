@@ -1032,6 +1032,8 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 "edit" => text_edit_command(interp, path, &args[2..]),
                 "search" => text_search(interp, path, &args[2..]),
+                "count" => text_count(interp, path, &args[2..]),
+                "dump" => text_dump(interp, path, &args[2..]),
                 "xview" | "yview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
             },
@@ -9613,6 +9615,227 @@ fn text_search(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value>
     })
 }
 
+fn text_count(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    let (content, cursor) = text_state(interp, path);
+    let marks = text_marks(interp, path);
+    let mut wanted: Vec<&str> = Vec::new();
+    let mut index = 0;
+    while index < rest.len() && rest[index].as_str().starts_with('-') {
+        match rest[index].as_str() {
+            "-chars" | "-indices" | "-lines" => wanted.push(match rest[index].as_str() {
+                "-chars" => "chars",
+                "-indices" => "indices",
+                _ => "lines",
+            }),
+            "-update" | "-elide" => {}
+            other => {
+                return Err(generic(format!(
+                    "bad option \"{other}\": must be -chars, -elide, -indices, -lines, or -update"
+                )));
+            }
+        }
+        index += 1;
+    }
+    if rest.len() != index + 2 {
+        return Err(wrong(
+            "count",
+            "?-option ...? index1 index2",
+            rest.len() + 2,
+        ));
+    }
+    let first = text_index(rest[index].as_str(), &content, cursor, &marks)?;
+    let last = text_index(rest[index + 1].as_str(), &content, cursor, &marks)?;
+    let (a, b) = (first.min(last), first.max(last));
+    if wanted.is_empty() {
+        wanted.push("chars");
+    }
+    let chars = content.chars().collect::<Vec<_>>();
+    let slice = &chars[a.min(chars.len())..b.min(chars.len())];
+    let newlines = slice.iter().filter(|c| **c == '\n').count();
+    let counts = wanted
+        .iter()
+        .map(|kind| match *kind {
+            "chars" | "indices" => slice.len(),
+            "lines" => {
+                if slice.is_empty() {
+                    0
+                } else {
+                    newlines + usize::from(slice.last().is_some_and(|c| *c != '\n'))
+                }
+            }
+            _ => 0,
+        })
+        .map(|count| count.to_string())
+        .collect::<Vec<_>>();
+    Ok(list_value(counts))
+}
+
+fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    let (content, cursor) = text_state(interp, path);
+    let mut marks = text_marks(interp, path);
+    marks.entry("insert".to_string()).or_insert(TextMark {
+        index: cursor,
+        gravity: MarkGravity::Right,
+    });
+    marks.entry("current".to_string()).or_insert(TextMark {
+        index: content.chars().count(),
+        gravity: MarkGravity::Right,
+    });
+    let (mut text, mut tags, mut dump_marks) = (false, false, false);
+    let mut any = false;
+    let mut index = 0;
+    while index < rest.len() && rest[index].as_str().starts_with('-') {
+        any = true;
+        match rest[index].as_str() {
+            "-all" => {
+                text = true;
+                tags = true;
+                dump_marks = true;
+            }
+            "-text" => text = true,
+            "-tag" => tags = true,
+            "-mark" => dump_marks = true,
+            "-image" | "-window" => {}
+            other => {
+                return Err(generic(format!(
+                    "bad option \"{other}\": must be -all, -image, -mark, -tag, -text, or -window"
+                )));
+            }
+        }
+        index += 1;
+    }
+    if !any {
+        text = true;
+        tags = true;
+        dump_marks = true;
+    }
+    if rest.len() < index + 1 || rest.len() > index + 2 {
+        return Err(wrong(
+            "dump",
+            "?-option ...? index1 ?index2?",
+            rest.len() + 2,
+        ));
+    }
+    let first = text_index(rest[index].as_str(), &content, cursor, &marks)?;
+    let last = match rest.get(index + 1) {
+        Some(value) => text_index(value.as_str(), &content, cursor, &marks)?,
+        None => content.chars().count(),
+    };
+    let (a, b) = (first.min(last), first.max(last));
+    let chars = content.chars().collect::<Vec<_>>();
+    let a = a.min(chars.len());
+    let b = b.min(chars.len());
+
+    let mut entries: Vec<(usize, u8, Vec<String>)> = Vec::new();
+    let tag_ranges = with_state(interp, |rt| {
+        rt.text_tags
+            .get(path)
+            .map(|tags| {
+                tags.iter()
+                    .rev()
+                    .flat_map(|(name, tag)| {
+                        tag.ranges
+                            .iter()
+                            .map(|(start, end)| (name.clone(), *start, *end))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    })
+    .unwrap_or_default();
+    if text {
+        let mut cuts = vec![a, b];
+        for (_, start, end) in &tag_ranges {
+            if *start > a && *start < b {
+                cuts.push(*start);
+            }
+            if *end > a && *end < b {
+                cuts.push(*end);
+            }
+        }
+        for mark in marks.values() {
+            if mark.index > a && mark.index < b {
+                cuts.push(mark.index);
+            }
+        }
+        // Tk starts a new text element at each line start too.
+        for (position, ch) in chars.iter().enumerate() {
+            let start = position + 1;
+            if *ch == '\n' && start > a && start < b {
+                cuts.push(start);
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for pair in cuts.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            if start >= end {
+                continue;
+            }
+            let value = chars[start..end].iter().collect::<String>();
+            entries.push((
+                start,
+                3,
+                vec![
+                    "text".to_string(),
+                    value,
+                    format!("{}", char_to_linecol(&content, start)),
+                ],
+            ));
+        }
+    }
+    if tags {
+        for (name, start, end) in &tag_ranges {
+            let (start, end) = (*start, *end);
+            if start >= a && start < b {
+                entries.push((
+                    start,
+                    0,
+                    vec![
+                        "tagon".to_string(),
+                        name.clone(),
+                        format!("{}", char_to_linecol(&content, start)),
+                    ],
+                ));
+            }
+            if end > a && end <= b {
+                entries.push((
+                    end,
+                    1,
+                    vec![
+                        "tagoff".to_string(),
+                        name.clone(),
+                        format!("{}", char_to_linecol(&content, end)),
+                    ],
+                ));
+            }
+        }
+    }
+    if dump_marks {
+        for (name, mark) in &marks {
+            if mark.index < a || mark.index > b {
+                continue;
+            }
+            entries.push((
+                mark.index,
+                2,
+                vec![
+                    "mark".to_string(),
+                    name.clone(),
+                    format!("{}", char_to_linecol(&content, mark.index)),
+                ],
+            ));
+        }
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let flat = entries
+        .into_iter()
+        .flat_map(|(_, _, words)| words)
+        .collect::<Vec<_>>();
+    Ok(list_value(flat))
+}
+
 fn text_edit_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
     if rest.is_empty() {
         return Err(wrong("edit", "option ?arg ...?", rest.len() + 2));
@@ -11248,6 +11471,39 @@ mod tests {
         assert_eq!(doc_pos_to_text_offset(doc, 3), Some(2));
         assert_eq!(doc_pos_to_text_offset(doc, 5), Some(3));
         assert_eq!(doc_pos_to_text_offset(doc, 6), Some(4));
+    }
+
+    #[test]
+    fn text_count_and_dump() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "text .c; .c insert 1.0 \"one\\ntwo\\nthree\"; .c tag add t 1.0 1.3; .c mark set insert 1.1; .c mark set m 2.1",
+        );
+        assert_eq!(eval(&mut i, ".c count 1.0 end"), "13");
+        assert_eq!(eval(&mut i, ".c count -lines 1.0 end"), "3");
+        assert_eq!(eval(&mut i, ".c count -chars -lines 1.0 2.0"), "4 1");
+        assert_eq!(eval(&mut i, ".c count -lines -chars 1.0 2.0"), "1 4");
+        assert_eq!(eval(&mut i, ".c count -indices 1.0 1.3"), "3");
+        assert_eq!(
+            eval(&mut i, ".c dump -text 1.0 1.3"),
+            "text o 1.0 text ne 1.1"
+        );
+        assert_eq!(
+            eval(&mut i, ".c dump -tag 1.0 1.3"),
+            "tagon t 1.0 tagoff t 1.3"
+        );
+        assert_eq!(eval(&mut i, ".c dump -tag 1.2 end"), "tagoff t 1.3");
+        assert_eq!(
+            eval(&mut i, ".c dump -text 1.3 3.0"),
+            "text {\n} 1.3 text t 2.0 text {wo\n} 2.1"
+        );
+        assert_eq!(eval(&mut i, ".c dump -mark 2.0 2.2"), "mark m 2.1");
+        assert!(
+            i.eval(".c count -bogus 1.0 end").is_err(),
+            "unknown count option errors"
+        );
     }
 
     #[test]

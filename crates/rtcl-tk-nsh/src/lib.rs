@@ -1772,6 +1772,13 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 painter = painter.translate(-x_off, -y_off);
             }
             for item in &model.items {
+                if item
+                    .options
+                    .get("-state")
+                    .is_some_and(|state| state == "hidden")
+                {
+                    continue;
+                }
                 let coords = &item.coords;
                 let option =
                     |name: &str| item.options.get(name).and_then(|value| parse_color(value));

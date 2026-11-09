@@ -69,6 +69,12 @@ pub struct TkRuntime {
     app_name: String,
     /// `text` tags: widget path → tag name → options and character ranges.
     text_tags: BTreeMap<String, BTreeMap<String, TextTag>>,
+    /// Custom `text` marks: widget path → mark name → position and gravity.
+    /// The built-in `insert` mark is the widget cursor; `current` is tracked
+    /// here so it shifts with edits.
+    text_marks: BTreeMap<String, BTreeMap<String, TextMark>>,
+    /// Gravity of each text widget's `insert` mark (Tk default: right).
+    insert_gravity: BTreeMap<String, MarkGravity>,
     /// Photo images by Tk image name.
     images: BTreeMap<String, PhotoImage>,
     image_seq: u64,
@@ -112,6 +118,21 @@ pub struct PhotoImage {
 pub struct TextTag {
     pub options: BTreeMap<String, String>,
     pub ranges: Vec<(usize, usize)>,
+}
+
+/// Which side of inserted text a `text` mark sticks to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MarkGravity {
+    Left,
+    #[default]
+    Right,
+}
+
+/// A custom `text` mark.  `insert` is stored as the widget cursor instead.
+#[derive(Debug, Clone, Copy)]
+pub struct TextMark {
+    index: usize,
+    gravity: MarkGravity,
 }
 
 /// A text widget's tags, for the renderer.
@@ -812,7 +833,18 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                             args.len(),
                         ));
                     }
-                    text_insert(interp, path, args[2].as_str(), args[3].as_str())
+                    let (content, cursor) = text_state(interp, path);
+                    let marks = text_marks(interp, path);
+                    let mut at = text_index(args[2].as_str(), &content, cursor, &marks)?;
+                    let mut pos = 3;
+                    while pos < args.len() {
+                        let chars = args[pos].as_str();
+                        let tags = args.get(pos + 1).map(|v| v.as_str());
+                        text_insert(interp, path, at, chars, tags)?;
+                        at += chars.chars().count();
+                        pos += if tags.is_some() { 2 } else { 1 };
+                    }
+                    Ok(Value::empty())
                 }
                 "delete" => {
                     if args.len() < 3 || args.len() > 4 {
@@ -826,14 +858,15 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         return Err(wrong("index", "index", args.len()));
                     }
                     let (content, cursor) = text_state(interp, path);
-                    let i = text_index(args[2].as_str(), &content, cursor)?;
+                    let marks = text_marks(interp, path);
+                    let i = text_index(args[2].as_str(), &content, cursor, &marks)?;
                     Ok(Value::from_str(&format!(
                         "{}",
                         char_to_linecol(&content, i)
                     )))
                 }
                 "see" => Ok(Value::empty()),
-                "mark" => Ok(Value::empty()),
+                "mark" => text_mark_command(interp, path, &args[2..]),
                 "tag" => text_tag_command(interp, path, &args[2..]),
                 "getdoc" => Ok(Value::from_str(&rich_doc(path).unwrap_or_default())),
                 "setdoc" => {
@@ -1398,30 +1431,8 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     Ok(Value::from_str(&value))
                 }
                 "itemconfigure" => canvas_itemconfigure(interp, path, &args[2..]),
-                "find" => {
-                    let target = match args.get(2).map(|v| v.as_str()) {
-                        Some("withtag") | Some("withtags") => {
-                            args.get(3).map(|v| v.as_str()).unwrap_or("all")
-                        }
-                        _ => "all",
-                    };
-                    let ids = with_state(interp, |rt| {
-                        rt.canvases
-                            .get(path)
-                            .map(|canvas| {
-                                canvas
-                                    .items
-                                    .iter()
-                                    .filter(|item| canvas_item_matches(item, target))
-                                    .map(|i| i.id.to_string())
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
-                    Ok(list_value(ids))
-                }
-                "bbox" => Ok(Value::empty()),
+                "find" => canvas_find(interp, path, &args[2..]),
+                "bbox" => canvas_bbox(interp, path, &args[2..]),
                 "move" => canvas_move(interp, path, &args[2..], false),
                 "scale" => canvas_move(interp, path, &args[2..], true),
                 "raise" | "lower" => canvas_raise(interp, path, &args[2..], sub == "raise"),
@@ -4158,6 +4169,7 @@ fn apply_text_change(path: &str, text: &str) -> bool {
             .map(|n| n.content.clone())
             .unwrap_or_default();
         adjust_text_tag_ranges(&old, text, rt.text_tags.get_mut(path));
+        adjust_text_marks(&old, text, rt.text_marks.get_mut(path));
         if let Some(n) = rt.tree.get_mut(path) {
             n.content = text.to_string();
             n.cursor = text.chars().count();
@@ -4216,6 +4228,7 @@ fn adjust_text_tag_ranges(old: &str, new: &str, tags: Option<&mut BTreeMap<Strin
                 ranges.push((start, end));
             }
         }
+        normalize_ranges(&mut ranges);
         tag.ranges = ranges;
     }
 }
@@ -4964,41 +4977,301 @@ fn entry_selection(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Va
     }
 }
 
-fn text_index(spec: &str, content: &str, cursor: usize) -> Result<usize> {
+/// Resolve a Tk text index: `insert`, `end`, `line.col`, `line.end`, mark
+/// names, and chains of `+/- count chars|indices|lines` and the
+/// `linestart`/`lineend`/`wordstart`/`wordend` qualifiers.
+fn text_index(
+    spec: &str,
+    content: &str,
+    cursor: usize,
+    marks: &BTreeMap<String, TextMark>,
+) -> Result<usize> {
+    let bad = || generic(format!("bad text index \"{spec}\""));
+    let mut rest = spec.trim();
+    if rest.is_empty() {
+        return Err(bad());
+    }
+    let base_end = rest
+        .char_indices()
+        .find(|(i, c)| *i > 0 && (*c == '+' || *c == '-' || c.is_whitespace()))
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len());
+    let mut idx = text_index_base(&rest[..base_end], content, cursor, marks).map_err(|_| bad())?;
+    rest = &rest[base_end..];
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let first = rest.chars().next().unwrap();
+        if first == '+' || first == '-' {
+            rest = &rest[first.len_utf8()..];
+            rest = rest.trim_start();
+            let digits = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            if digits == 0 {
+                return Err(bad());
+            }
+            let n: isize = rest[..digits].parse().map_err(|_| bad())?;
+            rest = &rest[digits..];
+            rest = rest.trim_start();
+            let unit_end = rest
+                .find(|c: char| c.is_whitespace() || c == '+' || c == '-')
+                .unwrap_or(rest.len());
+            let unit = &rest[..unit_end];
+            rest = &rest[unit_end..];
+            let signed = if first == '-' { -n } else { n };
+            match unit {
+                "c" | "chars" | "i" | "indices" => {
+                    let len = content.chars().count() as isize;
+                    idx = (idx as isize + signed).clamp(0, len) as usize;
+                }
+                "l" | "lines" => {
+                    let (line, col) = char_linecol(content, idx);
+                    let target = (line as isize + signed).max(1) as usize;
+                    idx = index_of_linecol(content, target, col);
+                }
+                _ => return Err(bad()),
+            }
+        } else {
+            let word_end = rest
+                .find(|c: char| c.is_whitespace() || c == '+' || c == '-')
+                .unwrap_or(rest.len());
+            let word = &rest[..word_end];
+            if word.is_empty() {
+                return Err(bad());
+            }
+            rest = &rest[word_end..];
+            idx = match word {
+                "linestart" => line_start_of(content, idx),
+                "lineend" => line_end_of(content, idx),
+                "wordstart" => word_start_at(content, idx),
+                "wordend" => word_end_at(content, idx),
+                _ => return Err(bad()),
+            };
+        }
+    }
+    Ok(idx)
+}
+
+fn text_index_base(
+    spec: &str,
+    content: &str,
+    cursor: usize,
+    marks: &BTreeMap<String, TextMark>,
+) -> Result<usize> {
     let len = content.chars().count();
     let bad = || generic(format!("bad text index \"{spec}\""));
     match spec {
+        "" => Err(bad()),
         "insert" => Ok(cursor.min(len)),
         "end" => Ok(len),
-        "end-1c" => Ok(len.saturating_sub(1)),
-        "end-2c" => Ok(len.saturating_sub(2)),
+        "current" => Ok(marks.get("current").map_or(0, |m| m.index.min(len))),
         _ => {
-            if let Some(delta) = spec.strip_prefix("end-") {
-                let n = delta
-                    .strip_suffix('c')
-                    .unwrap_or(delta)
-                    .parse::<usize>()
-                    .map_err(|_| bad())?;
-                return Ok(len.saturating_sub(n));
-            }
             if let Some((line, col)) = spec.split_once('.') {
-                let line: usize = line.parse().map_err(|_| bad())?;
-                let col: usize = col.parse().map_err(|_| bad())?;
-                if line == 0 {
-                    return Err(bad());
-                }
-                let mut index = 0usize;
-                for (i, l) in content.split('\n').enumerate() {
-                    if i + 1 == line {
-                        return Ok(index + col.min(l.chars().count()));
+                if !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()) {
+                    let line: usize = line.parse().map_err(|_| bad())?;
+                    if line == 0 {
+                        return Err(bad());
                     }
-                    index += l.chars().count() + 1;
+                    return if col == "end" {
+                        Ok(line_end(content, line))
+                    } else {
+                        let col: usize = col.parse().map_err(|_| bad())?;
+                        Ok(index_of_linecol(content, line, col))
+                    };
                 }
-                return Ok(len);
+            }
+            if let Some(mark) = marks.get(spec) {
+                return Ok(mark.index.min(len));
             }
             spec.parse::<usize>().map_err(|_| bad()).map(|i| i.min(len))
         }
     }
+}
+
+fn char_linecol(content: &str, index: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut col = 0usize;
+    for (i, c) in content.chars().enumerate() {
+        if i == index {
+            return (line, col);
+        }
+        if c == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+fn line_start(content: &str, line: usize) -> usize {
+    if line <= 1 {
+        return 0;
+    }
+    let mut current = 1usize;
+    for (i, c) in content.chars().enumerate() {
+        if c == '\n' {
+            current += 1;
+            if current == line {
+                return i + 1;
+            }
+        }
+    }
+    content.chars().count()
+}
+
+fn line_end(content: &str, line: usize) -> usize {
+    let start = line_start(content, line);
+    let len = content.chars().count();
+    if start >= len {
+        return len;
+    }
+    for (i, c) in content.chars().enumerate().skip(start) {
+        if c == '\n' {
+            return i;
+        }
+    }
+    len
+}
+
+fn index_of_linecol(content: &str, line: usize, col: usize) -> usize {
+    let start = line_start(content, line);
+    let end = line_end(content, line);
+    start + col.min(end.saturating_sub(start))
+}
+
+fn line_start_of(content: &str, index: usize) -> usize {
+    line_start(content, char_linecol(content, index).0)
+}
+
+fn line_end_of(content: &str, index: usize) -> usize {
+    line_end(content, char_linecol(content, index).0)
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn word_start_at(content: &str, index: usize) -> usize {
+    let chars = content.chars().collect::<Vec<_>>();
+    let mut i = index.min(chars.len());
+    while i > 0 && is_word_char(chars[i - 1]) {
+        i -= 1;
+    }
+    i
+}
+
+fn word_end_at(content: &str, index: usize) -> usize {
+    let chars = content.chars().collect::<Vec<_>>();
+    let mut i = index.min(chars.len());
+    while i < chars.len() && is_word_char(chars[i]) {
+        i += 1;
+    }
+    i
+}
+
+fn ensure_current_mark(marks: &mut BTreeMap<String, TextMark>) {
+    marks.entry("current".to_string()).or_insert(TextMark {
+        index: 0,
+        gravity: MarkGravity::Right,
+    });
+}
+
+/// Shift marks for text inserted at `at` (Tk mark gravity rules).
+fn shift_marks_on_insert(marks: Option<&mut BTreeMap<String, TextMark>>, at: usize, len: usize) {
+    let Some(marks) = marks else { return };
+    if len == 0 {
+        return;
+    }
+    ensure_current_mark(marks);
+    for mark in marks.values_mut() {
+        if mark.index > at || (mark.index == at && mark.gravity == MarkGravity::Right) {
+            mark.index += len;
+        }
+    }
+}
+
+/// Shift marks for the character range `[a, b)` being deleted.
+fn shift_marks_on_delete(marks: Option<&mut BTreeMap<String, TextMark>>, a: usize, b: usize) {
+    let Some(marks) = marks else { return };
+    if b <= a {
+        return;
+    }
+    ensure_current_mark(marks);
+    for mark in marks.values_mut() {
+        if mark.index >= a && mark.index <= b {
+            mark.index = a;
+        } else if mark.index > b {
+            mark.index -= b - a;
+        }
+    }
+}
+
+/// Shift marks for an edit that replaced `old` with `new` (editor path).
+fn adjust_text_marks(old: &str, new: &str, marks: Option<&mut BTreeMap<String, TextMark>>) {
+    let Some(marks) = marks else { return };
+    let old_chars = old.chars().collect::<Vec<_>>();
+    let new_chars = new.chars().collect::<Vec<_>>();
+    let mut prefix = 0;
+    while prefix < old_chars.len()
+        && prefix < new_chars.len()
+        && old_chars[prefix] == new_chars[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old_chars.len().saturating_sub(prefix)
+        && suffix < new_chars.len().saturating_sub(prefix)
+        && old_chars[old_chars.len() - 1 - suffix] == new_chars[new_chars.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let old_rest = old_chars.len() - prefix - suffix;
+    let new_rest = new_chars.len() - prefix - suffix;
+    match new_rest.cmp(&old_rest) {
+        std::cmp::Ordering::Greater => {
+            shift_marks_on_insert(Some(marks), prefix, new_rest - old_rest)
+        }
+        std::cmp::Ordering::Less => {
+            shift_marks_on_delete(Some(marks), prefix, prefix + old_rest - new_rest)
+        }
+        std::cmp::Ordering::Equal => {
+            if old_rest > 0 {
+                ensure_current_mark(marks);
+                for mark in marks.values_mut() {
+                    if mark.index > prefix && mark.index <= prefix + old_rest {
+                        mark.index = prefix;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Merge overlapping or adjacent tag ranges (Tk keeps one continuous range).
+fn normalize_ranges(ranges: &mut Vec<(usize, usize)>) {
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    *ranges = merged;
+}
+
+fn text_marks(interp: &Interp, path: &str) -> BTreeMap<String, TextMark> {
+    with_state(interp, |rt| rt.text_marks.get(path).cloned())
+        .flatten()
+        .unwrap_or_default()
 }
 
 fn char_to_linecol(content: &str, index: usize) -> String {
@@ -5368,6 +5641,204 @@ fn canvas_item_matches(item: &CanvasItem, target: &str) -> bool {
             .is_some_and(|tags| tags.split_whitespace().any(|tag| tag == target))
 }
 
+fn canvas_item_hidden(item: &CanvasItem) -> bool {
+    item.options
+        .get("-state")
+        .is_some_and(|state| state == "hidden")
+}
+
+/// An item's bounding box.  Text extents and line widths are approximated
+/// (the runtime has no font metrics; the renderer lays text out natively).
+fn canvas_item_bbox(
+    item: &CanvasItem,
+    images: &BTreeMap<String, PhotoImage>,
+) -> Option<(f64, f64, f64, f64)> {
+    let coords = &item.coords;
+    match item.kind.as_str() {
+        "image" if coords.len() >= 2 => {
+            let (width, height) = item
+                .options
+                .get("-image")
+                .and_then(|name| images.get(name))
+                .map_or((80.0, 80.0), |image| {
+                    (image.width as f64, image.height as f64)
+                });
+            Some((coords[0], coords[1], coords[0] + width, coords[1] + height))
+        }
+        "text" if coords.len() >= 2 => {
+            let text = item.options.get("-text").map_or("", String::as_str);
+            let lines = text.split('\n').count().max(1) as f64;
+            let cols = text
+                .split('\n')
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(0) as f64;
+            Some((
+                coords[0],
+                coords[1],
+                coords[0] + cols * 8.0,
+                coords[1] + lines * 16.0,
+            ))
+        }
+        _ if coords.len() >= 2 => {
+            let mut min_x = coords[0];
+            let mut min_y = coords[1];
+            let mut max_x = min_x;
+            let mut max_y = min_y;
+            for pair in coords.chunks(2).filter(|pair| pair.len() == 2) {
+                min_x = min_x.min(pair[0]);
+                min_y = min_y.min(pair[1]);
+                max_x = max_x.max(pair[0]);
+                max_y = max_y.max(pair[1]);
+            }
+            // Tk's bbox covers the outline; the stroke is centred on the path.
+            let width = item
+                .options
+                .get("-width")
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(1.0);
+            let half = width / 2.0;
+            Some((min_x - half, min_y - half, max_x + half, max_y + half))
+        }
+        _ => None,
+    }
+}
+
+fn bbox_distance(bbox: (f64, f64, f64, f64), x: f64, y: f64) -> f64 {
+    let dx = (bbox.0 - x).max(0.0).max(x - bbox.2);
+    let dy = (bbox.1 - y).max(0.0).max(y - bbox.3);
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn canvas_find(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    let (items, images) = with_state(interp, |rt| {
+        rt.canvases
+            .get(path)
+            .map(|canvas| (canvas.items.clone(), rt.images.clone()))
+    })
+    .flatten()
+    .unwrap_or_default();
+    let mode = rest.first().map_or("all", |value| value.as_str());
+    let mut ids = Vec::new();
+    match mode {
+        "all" => ids.extend(items.iter().map(|item| item.id.to_string())),
+        "withtag" | "withtags" => {
+            let target = rest.get(1).map_or("all", |value| value.as_str());
+            ids.extend(
+                items
+                    .iter()
+                    .filter(|item| canvas_item_matches(item, target))
+                    .map(|item| item.id.to_string()),
+            );
+        }
+        "closest" => {
+            if rest.len() < 3 {
+                return Err(wrong("find closest", "x y ?halo? ?start?", rest.len() + 2));
+            }
+            let x = parse_f64_str(rest[1].as_str(), "coordinate")?;
+            let y = parse_f64_str(rest[2].as_str(), "coordinate")?;
+            let halo = match rest.get(3) {
+                Some(value) => Some(parse_f64_str(value.as_str(), "halo")?),
+                None => None,
+            };
+            let mut best: Option<(f64, u64)> = None;
+            for item in items.iter().rev().filter(|item| !canvas_item_hidden(item)) {
+                let Some(bbox) = canvas_item_bbox(item, &images) else {
+                    continue;
+                };
+                let distance = bbox_distance(bbox, x, y);
+                if halo.is_none_or(|halo| distance <= halo)
+                    && best.is_none_or(|(closest, _)| distance < closest)
+                {
+                    best = Some((distance, item.id));
+                }
+            }
+            ids.extend(best.map(|(_, id)| id.to_string()));
+        }
+        "overlapping" => {
+            if rest.len() < 5 {
+                return Err(wrong(
+                    "find overlapping",
+                    "x1 y1 x2 y2 ?tagOrId ...?",
+                    rest.len() + 2,
+                ));
+            }
+            let mut x1 = parse_f64_str(rest[1].as_str(), "coordinate")?;
+            let mut y1 = parse_f64_str(rest[2].as_str(), "coordinate")?;
+            let mut x2 = parse_f64_str(rest[3].as_str(), "coordinate")?;
+            let mut y2 = parse_f64_str(rest[4].as_str(), "coordinate")?;
+            if x1 > x2 {
+                std::mem::swap(&mut x1, &mut x2);
+            }
+            if y1 > y2 {
+                std::mem::swap(&mut y1, &mut y2);
+            }
+            for item in items.iter().filter(|item| !canvas_item_hidden(item)) {
+                let Some((bx0, by0, bx1, by1)) = canvas_item_bbox(item, &images) else {
+                    continue;
+                };
+                if bx1 >= x1 && bx0 <= x2 && by1 >= y1 && by0 <= y2 {
+                    ids.push(item.id.to_string());
+                }
+            }
+        }
+        other => {
+            return Err(generic(format!(
+                "bad option \"{other}\": must be all, closest, overlapping, withtag, or withtags"
+            )))
+        }
+    }
+    Ok(list_value(ids))
+}
+
+fn canvas_bbox(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    let (items, images) = with_state(interp, |rt| {
+        rt.canvases
+            .get(path)
+            .map(|canvas| (canvas.items.clone(), rt.images.clone()))
+    })
+    .flatten()
+    .unwrap_or_default();
+    let targets: Vec<String> = if rest.is_empty() {
+        vec!["all".to_string()]
+    } else {
+        rest.iter()
+            .map(|value| value.as_str().to_string())
+            .collect()
+    };
+    let mut union: Option<(f64, f64, f64, f64)> = None;
+    for target in &targets {
+        for item in items
+            .iter()
+            .filter(|item| canvas_item_matches(item, target) && !canvas_item_hidden(item))
+        {
+            let Some(bbox) = canvas_item_bbox(item, &images) else {
+                continue;
+            };
+            // Tk reports integer pixel bounds, rounded outwards.
+            let bbox = (bbox.0.floor(), bbox.1.floor(), bbox.2.ceil(), bbox.3.ceil());
+            union = Some(match union {
+                None => bbox,
+                Some((x0, y0, x1, y1)) => (
+                    x0.min(bbox.0),
+                    y0.min(bbox.1),
+                    x1.max(bbox.2),
+                    y1.max(bbox.3),
+                ),
+            });
+        }
+    }
+    let Some((x0, y0, x1, y1)) = union else {
+        return Ok(Value::empty());
+    };
+    Ok(list_value(vec![
+        format!("{:.0}", x0.round()),
+        format!("{:.0}", y0.round()),
+        format!("{:.0}", x1.round()),
+        format!("{:.0}", y1.round()),
+    ]))
+}
+
 fn canvas_item_contains(item: &CanvasItem, x: f64, y: f64) -> bool {
     let c = &item.coords;
     match item.kind.as_str() {
@@ -5412,7 +5883,7 @@ pub fn canvas_press(path: &str, x: f64, y: f64) {
                 canvas
                     .items
                     .iter()
-                    .filter(|item| canvas_item_contains(item, x, y))
+                    .filter(|item| !canvas_item_hidden(item) && canvas_item_contains(item, x, y))
                     .cloned()
                     .collect::<Vec<_>>(),
                 canvas.bindings.clone(),
@@ -5768,6 +6239,7 @@ fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<V
         return Err(wrong("tag", "option ?arg ...?", rest.len() + 2));
     }
     let (content, cursor) = text_state(interp, path);
+    let marks = text_marks(interp, path);
     match rest[0].as_str() {
         "configure" => {
             if rest.len() < 2 {
@@ -5835,9 +6307,9 @@ fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<V
             if rest.len() < 3 || rest.len() > 4 {
                 return Err(wrong("tag add", "tagName index1 ?index2?", rest.len() + 2));
             }
-            let start = text_index(rest[2].as_str(), &content, cursor)?;
+            let start = text_index(rest[2].as_str(), &content, cursor, &marks)?;
             let end = match rest.get(3) {
-                Some(last) => text_index(last.as_str(), &content, cursor)?,
+                Some(last) => text_index(last.as_str(), &content, cursor, &marks)?,
                 None => (start + 1).min(content.chars().count()),
             };
             let (a, b) = (start.min(end), start.max(end));
@@ -5850,7 +6322,7 @@ fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<V
                     .entry(name.clone())
                     .or_default();
                 tag.ranges.push((a, b));
-                tag.ranges.sort_unstable();
+                normalize_ranges(&mut tag.ranges);
                 rt.bump();
             });
             Ok(Value::empty())
@@ -5859,9 +6331,9 @@ fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<V
             if rest.len() < 3 || rest.len() > 4 {
                 return Err(wrong("tag remove", "tagName index1 ?index2?", rest.len() + 2));
             }
-            let start = text_index(rest[2].as_str(), &content, cursor)?;
+            let start = text_index(rest[2].as_str(), &content, cursor, &marks)?;
             let end = match rest.get(3) {
-                Some(last) => text_index(last.as_str(), &content, cursor)?,
+                Some(last) => text_index(last.as_str(), &content, cursor, &marks)?,
                 None => (start + 1).min(content.chars().count()),
             };
             let (a, b) = (start.min(end), start.max(end));
@@ -5893,7 +6365,7 @@ fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<V
         }
         "names" => {
             let index = match rest.get(1) {
-                Some(value) => Some(text_index(value.as_str(), &content, cursor)?),
+                Some(value) => Some(text_index(value.as_str(), &content, cursor, &marks)?),
                 None => None,
             };
             let names = with_state(interp, |rt| {
@@ -5953,47 +6425,214 @@ fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<V
 
 fn text_get(interp: &mut Interp, path: &str, first: &str, last: Option<&str>) -> Result<Value> {
     let (content, cursor) = text_state(interp, path);
-    let start = text_index(first, &content, cursor)?;
+    let marks = text_marks(interp, path);
+    let start = text_index(first, &content, cursor, &marks)?;
     let end = match last {
-        Some(last) => text_index(last, &content, cursor)?,
+        Some(last) => text_index(last, &content, cursor, &marks)?,
         None => (start + 1).min(content.chars().count()),
     };
     let (a, b) = (start.min(end), start.max(end));
     Ok(Value::from_str(&char_slice(&content, a, b)))
 }
 
-fn text_insert(interp: &mut Interp, path: &str, index: &str, text: &str) -> Result<Value> {
-    let (content, cursor) = text_state(interp, path);
-    let at = text_index(index, &content, cursor)?;
-    let content = replace_chars(&content, at, at, text);
-    let cursor = at + text.chars().count();
+fn text_insert(
+    interp: &mut Interp,
+    path: &str,
+    at: usize,
+    text: &str,
+    tag_list: Option<&str>,
+) -> Result<Value> {
+    let (content, _) = text_state(interp, path);
+    let at = at.min(content.chars().count());
+    let new_content = replace_chars(&content, at, at, text);
+    let len = text.chars().count();
+    let gravity = with_state(interp, |rt| rt.insert_gravity.get(path).copied())
+        .flatten()
+        .unwrap_or_default();
+    let cursor = if gravity == MarkGravity::Left {
+        at
+    } else {
+        at + len
+    };
+    let tags = tag_list.map(str::to_string);
     with_state_mut(interp, |rt| {
+        adjust_text_tag_ranges(&content, &new_content, rt.text_tags.get_mut(path));
+        shift_marks_on_insert(rt.text_marks.get_mut(path), at, len);
         if let Some(n) = rt.tree.get_mut(path) {
-            n.content = content;
+            n.content = new_content;
             n.cursor = cursor;
-            rt.bump();
         }
+        if let Some(tags) = &tags {
+            let widget_tags = rt.text_tags.entry(path.to_string()).or_default();
+            for name in tags.split_whitespace() {
+                let tag = widget_tags.entry(name.to_string()).or_default();
+                tag.ranges.push((at, at + len));
+                normalize_ranges(&mut tag.ranges);
+            }
+        }
+        rt.bump();
     });
     Ok(Value::empty())
 }
 
 fn text_delete(interp: &mut Interp, path: &str, first: &str, last: Option<&str>) -> Result<Value> {
     let (content, cursor) = text_state(interp, path);
-    let start = text_index(first, &content, cursor)?;
+    let marks = text_marks(interp, path);
+    let start = text_index(first, &content, cursor, &marks)?;
     let end = match last {
-        Some(last) => text_index(last, &content, cursor)?,
+        Some(last) => text_index(last, &content, cursor, &marks)?,
         None => (start + 1).min(content.chars().count()),
     };
     let (a, b) = (start.min(end), start.max(end));
-    let content = replace_chars(&content, a, b, "");
+    let new_content = replace_chars(&content, a, b, "");
     with_state_mut(interp, |rt| {
+        adjust_text_tag_ranges(&content, &new_content, rt.text_tags.get_mut(path));
+        shift_marks_on_delete(rt.text_marks.get_mut(path), a, b);
         if let Some(n) = rt.tree.get_mut(path) {
-            n.content = content;
+            n.content = new_content;
             n.cursor = a;
             rt.bump();
         }
     });
     Ok(Value::empty())
+}
+
+fn text_mark_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong("mark", "option ?arg ...?", rest.len() + 2));
+    }
+    let (content, cursor) = text_state(interp, path);
+    let marks = text_marks(interp, path);
+    match rest[0].as_str() {
+        "set" => {
+            if rest.len() < 2 || rest.len() > 3 {
+                return Err(wrong("mark set", "markName ?index?", rest.len() + 2));
+            }
+            let name = rest[1].as_str().to_string();
+            let index = match rest.get(2) {
+                Some(value) => text_index(value.as_str(), &content, cursor, &marks)?,
+                None => cursor,
+            };
+            with_state_mut(interp, |rt| {
+                if name == "insert" {
+                    if let Some(n) = rt.tree.get_mut(path) {
+                        n.cursor = index;
+                    }
+                } else {
+                    let widget = rt.text_marks.entry(path.to_string()).or_default();
+                    let gravity = widget.get(&name).map_or(MarkGravity::Right, |m| m.gravity);
+                    widget.insert(name, TextMark { index, gravity });
+                }
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "unset" => {
+            if rest.len() < 2 {
+                return Err(wrong(
+                    "mark unset",
+                    "markName ?markName ...?",
+                    rest.len() + 2,
+                ));
+            }
+            with_state_mut(interp, |rt| {
+                if let Some(widget) = rt.text_marks.get_mut(path) {
+                    for value in &rest[1..] {
+                        match value.as_str() {
+                            "insert" => {}
+                            "current" => {
+                                if let Some(mark) = widget.get_mut("current") {
+                                    mark.index = 0;
+                                }
+                            }
+                            name => {
+                                widget.remove(name);
+                            }
+                        }
+                    }
+                }
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "names" => {
+            let mut names = vec!["insert".to_string(), "current".to_string()];
+            for name in marks.keys() {
+                if name != "insert" && name != "current" {
+                    names.push(name.clone());
+                }
+            }
+            Ok(list_value(names))
+        }
+        "gravity" => {
+            if rest.len() < 2 || rest.len() > 3 {
+                return Err(wrong(
+                    "mark gravity",
+                    "markName ?direction?",
+                    rest.len() + 2,
+                ));
+            }
+            let name = rest[1].as_str();
+            if let Some(direction) = rest.get(2) {
+                let gravity = match direction.as_str() {
+                    "left" => MarkGravity::Left,
+                    "right" => MarkGravity::Right,
+                    other => {
+                        return Err(generic(format!(
+                            "bad mark gravity \"{other}\": must be left or right"
+                        )))
+                    }
+                };
+                with_state_mut(interp, |rt| {
+                    if name == "insert" {
+                        rt.insert_gravity.insert(path.to_string(), gravity);
+                    } else {
+                        let widget = rt.text_marks.entry(path.to_string()).or_default();
+                        widget
+                            .entry(name.to_string())
+                            .and_modify(|mark| mark.gravity = gravity)
+                            .or_insert(TextMark { index: 0, gravity });
+                    }
+                });
+                Ok(Value::empty())
+            } else {
+                let gravity = if name == "insert" {
+                    with_state(interp, |rt| rt.insert_gravity.get(path).copied())
+                        .flatten()
+                        .unwrap_or_default()
+                } else {
+                    marks.get(name).map_or(MarkGravity::Right, |m| m.gravity)
+                };
+                Ok(Value::from_str(match gravity {
+                    MarkGravity::Left => "left",
+                    MarkGravity::Right => "right",
+                }))
+            }
+        }
+        "next" | "previous" => {
+            if rest.len() != 2 {
+                return Err(wrong("mark next|previous", "index", rest.len() + 2));
+            }
+            let at = text_index(rest[1].as_str(), &content, cursor, &marks)?;
+            let mut all = vec![("insert".to_string(), cursor)];
+            all.extend(marks.iter().map(|(name, mark)| (name.clone(), mark.index)));
+            let picked = if rest[0].as_str() == "next" {
+                all.into_iter()
+                    .filter(|(_, index)| *index > at)
+                    .min_by_key(|(_, index)| *index)
+            } else {
+                all.into_iter()
+                    .filter(|(_, index)| *index < at)
+                    .max_by_key(|(_, index)| *index)
+            };
+            Ok(Value::from_str(
+                picked.map(|(name, _)| name).unwrap_or_default().as_str(),
+            ))
+        }
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be gravity, names, next, previous, set, or unset"
+        ))),
+    }
 }
 
 fn listbox_index(spec: &str, len: usize) -> Result<usize> {
@@ -6748,6 +7387,103 @@ mod tests {
         assert_eq!(eval(&mut i, ".sv yview"), "0 0.25");
         eval(&mut i, ".sv yview scroll 1 pages");
         assert_ne!(eval(&mut i, "lindex [.sv yview] 0"), "0");
+    }
+
+    #[test]
+    fn text_marks_and_index_grammar() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "text .m; .m insert 1.0 {hello world}");
+        assert_eq!(eval(&mut i, ".m index end"), "1.11");
+        assert_eq!(eval(&mut i, ".m index end-1c"), "1.10");
+        assert_eq!(eval(&mut i, ".m index {end - 2c}"), "1.9");
+        assert_eq!(eval(&mut i, ".m index 1.end"), "1.11");
+        assert_eq!(eval(&mut i, ".m index {1.2 wordstart}"), "1.0");
+        assert_eq!(eval(&mut i, ".m index {1.2 wordend}"), "1.5");
+        eval(&mut i, "text .g; .g insert 1.0 \"aa\nbbb\nc\"");
+        assert_eq!(eval(&mut i, ".g index 2.end"), "2.3");
+        assert_eq!(eval(&mut i, ".g index {1.5+1l}"), "2.2");
+        assert_eq!(eval(&mut i, ".g index {2.1-1l}"), "1.1");
+        assert_eq!(eval(&mut i, ".g index {2.1+1l}"), "3.1");
+        assert_eq!(eval(&mut i, ".g index {1.0 lineend - 1c}"), "1.1");
+
+        // The insert mark is the widget cursor; custom marks shift with
+        // edits according to gravity.
+        assert_eq!(eval(&mut i, ".m mark names"), "insert current");
+        eval(&mut i, ".m mark set insert 1.2");
+        assert_eq!(eval(&mut i, ".m index insert"), "1.2");
+        eval(&mut i, ".m mark set my 1.1");
+        assert_eq!(eval(&mut i, ".m index my"), "1.1");
+        eval(&mut i, ".m mark gravity my left");
+        eval(&mut i, ".m insert 1.1 Q");
+        assert_eq!(eval(&mut i, ".m index my"), "1.1");
+        eval(&mut i, ".m mark gravity my right");
+        eval(&mut i, ".m insert 1.1 R");
+        assert_eq!(eval(&mut i, ".m index my"), "1.2");
+        assert_eq!(eval(&mut i, ".m get 1.0 end"), "hRQello world");
+        eval(&mut i, ".m mark set insert 1.6");
+        assert_eq!(eval(&mut i, ".m mark next 1.0"), "my");
+        assert_eq!(eval(&mut i, ".m mark previous 1.9"), "insert");
+        eval(&mut i, ".m mark unset my");
+        assert_eq!(eval(&mut i, ".m mark names"), "insert current");
+
+        // Inserted chars accept a tag list; tag ranges and marks shift on
+        // Tcl-side edits.
+        eval(
+            &mut i,
+            "text .n; .n insert 1.0 hello; .n tag add hot 1.0 1.2",
+        );
+        eval(&mut i, ".n insert 1.0 X");
+        assert_eq!(eval(&mut i, ".n tag ranges hot"), "1.1 1.3");
+        eval(&mut i, ".n insert 1.3 YZ hot");
+        assert_eq!(eval(&mut i, ".n tag ranges hot"), "1.1 1.5");
+        assert_eq!(eval(&mut i, ".n get 1.0 end"), "XheYZllo");
+        eval(&mut i, ".n mark set m 1.4");
+        eval(&mut i, ".n delete 1.0 1.2");
+        assert_eq!(eval(&mut i, ".n tag ranges hot"), "1.0 1.3");
+        assert_eq!(eval(&mut i, ".n index m"), "1.2");
+        // insert gravity controls the insert mark itself
+        eval(&mut i, ".n mark gravity insert left");
+        eval(&mut i, ".n mark set insert 1.1");
+        eval(&mut i, ".n insert 1.1 AA");
+        assert_eq!(eval(&mut i, ".n index insert"), "1.1");
+    }
+
+    #[test]
+    fn canvas_find_closest_overlapping_and_bbox() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "canvas .k -width 100 -height 100");
+        let a = eval(&mut i, ".k create rectangle 10 10 30 40");
+        let b = eval(&mut i, ".k create rectangle 50 50 90 90");
+        eval(&mut i, &format!("set a {a}; set b {b}"));
+        assert_eq!(eval(&mut i, ".k bbox $a"), "9 9 31 41");
+        assert_eq!(eval(&mut i, ".k bbox all"), "9 9 91 91");
+        assert_eq!(eval(&mut i, ".k find closest 0 0"), a);
+        assert_eq!(eval(&mut i, ".k find closest 95 95"), b);
+        assert_eq!(eval(&mut i, ".k find closest 1000 1000"), b);
+        assert_eq!(
+            eval(&mut i, ".k find overlapping 25 25 55 55"),
+            format!("{a} {b}")
+        );
+        assert_eq!(eval(&mut i, ".k find overlapping 31 41 49 49"), "");
+        // Hidden items keep existing and are still found by tag, but take
+        // no part in bbox/closest/overlapping and receive no presses.
+        eval(
+            &mut i,
+            "set ::pressed 0; .k bind $a <Button-1> {incr ::pressed}",
+        );
+        eval(&mut i, ".k itemconfigure $a -state hidden");
+        assert_eq!(eval(&mut i, ".k bbox $a"), "");
+        assert_eq!(eval(&mut i, ".k bbox all"), "49 49 91 91");
+        assert_eq!(eval(&mut i, ".k find withtag all"), format!("{a} {b}"));
+        assert_eq!(eval(&mut i, ".k find closest 0 0"), b);
+        assert_eq!(eval(&mut i, ".k find overlapping 0 0 100 100"), b);
+        canvas_press(".k", 20.0, 20.0);
+        assert_eq!(eval(&mut i, "set ::pressed"), "0");
+        eval(&mut i, ".k itemconfigure $a -state normal");
+        canvas_press(".k", 20.0, 20.0);
+        assert_eq!(eval(&mut i, "set ::pressed"), "1");
     }
 
     #[test]

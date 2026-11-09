@@ -134,7 +134,7 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 | M1a ✅ | rtcl-vm `tk` 命令层：frame/label/button/entry/… 创建、configure/cget、pack/grid、destroy、winfo、wm/tk；per-widget 路径命令；teardown 自动清树；4 条单测 | `button .b -text Hi; cget .b -text` 等 Tcl 脚本语义通过 |
 | M1b ✅ | nsh 后端最小集（frame/label/button/entry）+ TkView；按钮 `-command` 执行 Tcl，按钮文本经 signal 刷新；GTK4 demo + headless 验收 | `nsh-testing`：初始 "Click me" 渲染 → press → "Clicked 1" → press → "Clicked 2"；`cargo run -p rtcl-tk-demo` 打开 GTK4 窗口 |
 | M2 ✅ | pack/grid/place、bind/event generate、after/update、`-textvariable` 双向、entry/text/listbox/scale 数据子命令、winfo/wm 扩展、ttk 别名、focus/raise/font/option；message/scrollbar/separator/progressbar；整树 dynamic 重建 | 经典 grid/pack 表单脚本通过（`classic_nsh`）；demo 双态截图；tk 单测 19 + headless 验收 2 |
-| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、虚拟化列表/树、Tk scrollbar 联动、主题色、macOS 系统菜单、Canvas 动态/绑定/滚动/旋转/贝塞尔/箭头/虚线/图片/polygon/按 tag 删查、photo image、text tag 光标级 WYSIWYG + marks 数据持久化、菜单 `-accelerator` ✅；Windows/Linux 原生菜单受 nsh GTK 限制 | 设置页/表单/列表演示（classic demo + headless 验收） |
+| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、虚拟化列表/树、Tk scrollbar 联动、主题色、macOS 系统菜单、Canvas 动态/绑定/滚动/旋转/贝塞尔/箭头/虚线/图片/polygon/按 tag 删查/closest/overlapping/bbox/hidden、photo image、text tag 光标级 WYSIWYG + marks 数据持久化 + text marks/index 语法/tag 区间平移、菜单 `-accelerator` ✅；Windows/Linux 原生菜单受 nsh GTK 限制 | 设置页/表单/列表演示（classic demo + headless 验收） |
 | M4 | 虚拟化 table/log/tree/chart + iOS/Android embed + 打包 | 手机/桌面同一 Tcl 脚本跑通 |
 
 ## 7. 主要风险
@@ -210,7 +210,11 @@ move/scale/raise/lower/bind/xview/yview`；`-scrollregion` + xview/yview
 `-angle` 旋转、line `-smooth true|bezier`（二次/三次贝塞尔）、`-dash`/
 `-dashoffset`、`-arrow first|last|both`、polygon `-fill/-outline`（闭合
 填充 + 描边）、image 项绘制图片。`delete` 与 `find` 接受 id、`all` 或
-空格分隔的 `-tags`（`find withtag/withtags`），即按 tag 批量删/查。
+空格分隔的 `-tags`（`find withtag/withtags`），即按 tag 批量删/查；
+`find closest x y ?halo?`、`find overlapping x1 y1 x2 y2`、`bbox
+?tagOrId ...?`（id/tag 的并集，按 Tk 向外取整）；`-state hidden` 的项
+不绘制、不参与 bbox/closest/overlapping/点击，但仍被 `find` 列出。
+bbox 对 text 用字数近似（runtime 无字体度量），line 箭头未计入。
 `image create
 photo` + `label/button -image` 渲染文件图片。`text tag add/remove/
 configure/cget/ranges/names/delete` 维护区间；有标签的 text 用 nsh
@@ -222,7 +226,13 @@ JSON，可跨应用重启持久化。正文写回 Tcl 模型、标签区间按�
 把 marks 投影回 tags——样式 tag 区间按文档重算，能匹配的已有 tag（如
 `hot`）复用，新样式生成 `@rich-…` tag，非样式 tag 保留。因此
 `tag ranges/names` 能看到编辑器新格式；外部 tag 变化不覆盖 marks，外部
-正文改写按差分平移 marks。
+正文改写按差分平移 marks。`text insert index chars ?tagList ...?` 支持
+逐对文本/标签并在插入后把 tag 列表加到新区间；Tcl 侧 insert/delete 会
+平移已有的 tag 区间（相邻/重叠区间合并），与编辑器路径一致。`text
+index` 支持 `insert/end/line.col/line.end`、mark 名、`+/- N chars|
+indices|lines` 链与 `linestart/lineend/wordstart/wordend` 限定词；
+`mark set/unset/names/gravity/next/previous` 维护标记（`insert` 即光标，
+`current` 随编辑平移，gravity 控制插入点的贴边方向）。
 
 **虚拟化/滚动**：listbox 与 treeview 只挂载可见行（按 `-height` 取窗口），
 `yview`/`-yscrollcommand` 与 Tk `scrollbar` 双向联动；列表/树表可滚动。

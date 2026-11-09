@@ -18,6 +18,7 @@ set ::agreed 0
 set ::volume 30
 set ::qty 3
 set ::sort Name
+image create photo demoimg -file "__DEMO_PNG__"
 
 label .greeting -textvariable ::greeting
 pack .greeting -padx 12 -pady 6
@@ -68,6 +69,15 @@ wm geometry .about "190x110+350+140"
 label .about.text -text "This is a Toplevel window"
 pack .about.text -padx 12 -pady 12
 
+image create photo demoimg -file "__DEMO_PNG__"
+text .doc -height 4
+.doc insert end "with embedded:"
+.doc insert end "\n"
+.doc image create end -image demoimg
+.doc insert end "\n(inline above)"
+.doc tag add hot 1.0 end
+pack .doc -fill x -padx 12 -pady 4
+
 ttk::panedwindow .split -orient horizontal
 frame .split.left; frame .split.right
 label .split.left.t -text "Left pane"; pack .split.left.t
@@ -95,6 +105,9 @@ after 80 {.later configure -text "Later fired"}
 "#;
 
 /// A classic grid/pack form, close to what a Tk tutorial app looks like.
+/// A 24x24 blue PNG for the classic demo's embedded image.
+pub const DEMO_PNG: &[u8] = include_bytes!("assets/demo.png");
+
 pub const CLASSIC: &str = r##"
 font create Heading -family {DejaVu Sans} -size 18 -weight bold
 label .title -text "Classic Tk Demo" -font Heading
@@ -234,7 +247,12 @@ pub fn ensure_tcl_script(script: &str) {
 
 #[component]
 pub fn DemoApp() -> impl IntoElement {
-    ensure_tcl();
+    let photo = std::env::temp_dir().join("rtcl-demo.png");
+    std::fs::create_dir_all(std::env::temp_dir()).ok();
+    std::fs::write(&photo, DEMO_PNG).ok();
+    // Substitute BEFORE the first script install (ensure_tcl would install
+    // the unsubstituted demo and win the interp slot).
+    ensure_tcl_script(&DEMO.replace("__DEMO_PNG__", &photo.to_string_lossy()));
     rtcl_tk_nsh::tk_view()
 }
 
@@ -258,6 +276,15 @@ pub fn TreeApp() -> impl IntoElement {
 
 #[component]
 pub fn ClassicApp() -> impl IntoElement {
-    ensure_tcl_script(CLASSIC);
+    ensure_tcl_script(&classic_script());
     rtcl_tk_nsh::tk_view()
+}
+
+/// The [`CLASSIC`] form with runtime paths substituted (the embedded
+/// image's photo file).
+pub fn classic_script() -> String {
+    let photo = std::env::temp_dir().join("rtcl-demo.png");
+    std::fs::create_dir_all(std::env::temp_dir()).ok();
+    std::fs::write(&photo, DEMO_PNG).ok();
+    CLASSIC.replace("__DEMO_PNG__", &photo.to_string_lossy())
 }

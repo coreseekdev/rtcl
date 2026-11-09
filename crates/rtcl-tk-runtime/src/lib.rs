@@ -5961,6 +5961,34 @@ pub fn image_path(name: &str) -> Option<String> {
     .flatten()
 }
 
+/// An embedded image's placeholder position, the photo's file and its
+/// declared size, for the renderer's inline drawing.
+pub fn text_image_files(path: &str) -> Vec<(usize, String, i64, i64)> {
+    let Some(ptr) = active_interp() else {
+        return Vec::new();
+    };
+    with_state(unsafe { &*ptr }, |rt| {
+        let Some(images) = rt.text_images.get(path) else {
+            return Vec::new();
+        };
+        let marks = rt.text_marks.get(path);
+        images
+            .iter()
+            .filter_map(|(name, (index, options))| {
+                let mark = format!("\u{0}img:{name}");
+                let index = marks
+                    .and_then(|marks| marks.get(&mark))
+                    .map(|m| m.index)
+                    .unwrap_or(*index);
+                let image = rt.images.get(options.get("-image")?)?;
+                let (width, height) = (image.width, image.height);
+                Some((index, image.file.clone(), width, height))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// A photo image's reported size.
 pub fn image_dimensions(name: &str) -> Option<(i64, i64)> {
     let ptr = active_interp()?;
@@ -9933,6 +9961,12 @@ fn doc_runs(value: &serde_json::Value) -> Option<(String, Vec<DocRun>)> {
             continue;
         };
         for node in nodes {
+            if node.get("type").and_then(|v| v.as_str()) == Some("image") {
+                // An embedded image occupies one placeholder character.
+                text.push('\u{FFFC}');
+                position += 1;
+                continue;
+            }
             if node.get("type").and_then(|v| v.as_str()) != Some("text") {
                 continue;
             }
@@ -9974,11 +10008,19 @@ fn doc_pos_to_text_offset(json: &str, position: usize) -> Option<usize> {
             continue;
         };
         for node in nodes {
-            if node.get("type").and_then(|v| v.as_str()) != Some("text") {
+            let is_image = node.get("type").and_then(|v| v.as_str()) == Some("image");
+            if !is_image && node.get("type").and_then(|v| v.as_str()) != Some("text") {
                 continue;
             }
-            let content = node.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let length = content.chars().count();
+            let content = if is_image {
+                String::new()
+            } else {
+                node.get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let length = if is_image { 1 } else { content.chars().count() };
             let end = doc_pos + length;
             if position <= end {
                 let offset = position.saturating_sub(doc_pos).min(length);
@@ -10008,6 +10050,15 @@ fn text_offset_to_doc_pos(json: &str, offset: usize) -> Option<usize> {
             continue;
         };
         for node in nodes {
+            if node.get("type").and_then(|v| v.as_str()) == Some("image") {
+                // An embedded image occupies one placeholder character.
+                if offset <= text_offset {
+                    return Some(doc_pos);
+                }
+                doc_pos += 1;
+                text_offset += 1;
+                continue;
+            }
             if node.get("type").and_then(|v| v.as_str()) != Some("text") {
                 continue;
             }
@@ -11433,6 +11484,19 @@ fn text_image_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result
             })
             .unwrap_or_default();
             text_insert(interp, path, index, &IMAGE_CHAR.to_string(), None)?;
+            // `index` may have been clamped to the stored length (inserts
+            // at `end` sit before the implicit newline), and the insert
+            // shifted the mark past the placeholder: pin it back onto the
+            // character it stands for.
+            with_state_mut(interp, |rt| {
+                if let Some(m) = rt
+                    .text_marks
+                    .get_mut(path)
+                    .and_then(|marks| marks.get_mut(&image_mark_name(&name)))
+                {
+                    m.index = index.min(content.chars().count());
+                }
+            });
             Ok(Value::from_str(&name))
         }
         "names" => {

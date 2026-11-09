@@ -917,7 +917,85 @@ fn wysiwyg_mark_attrs(
     (color, background, font_size, font_family, bold)
 }
 
-fn wysiwyg_doc(content: &str, tags: &[rtcl_tk_runtime::TextTagView]) -> serde_json::Value {
+/// Replace U+FFFC placeholder characters in the doc's text nodes with
+/// inline image nodes pointing at the photo files (Tk's embedded images).
+fn splice_doc_images(doc: &mut serde_json::Value, images: &[(usize, String, i64, i64)]) {
+    eprintln!(
+        "DBG splice p2={}",
+        doc.get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.get(1))
+            .map(|p| p.to_string())
+            .unwrap_or_default()
+    );
+    let Some(paragraphs) = doc.get_mut("content").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let mut global = 0usize;
+    for (block_index, paragraph) in paragraphs.iter_mut().enumerate() {
+        // Block separators are newlines in the widget's content space.
+        if block_index > 0 {
+            global += 1;
+        }
+        let Some(nodes) = paragraph.get_mut("content").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        let mut out: Vec<serde_json::Value> = Vec::with_capacity(nodes.len());
+        for node in nodes.iter() {
+            if node.get("type").and_then(|v| v.as_str()) != Some("text") {
+                out.push(node.clone());
+                continue;
+            }
+            let text = node.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if !text.contains('\u{FFFC}') {
+                global += text.chars().count();
+                out.push(node.clone());
+                continue;
+            }
+            let mut segment = String::new();
+            for c in text.chars() {
+                if c == '\u{FFFC}' {
+                    if !segment.is_empty() {
+                        let mut run = node.clone();
+                        run["text"] = serde_json::Value::String(std::mem::take(&mut segment));
+                        out.push(run);
+                    }
+                    let (src, width, height) = images
+                        .iter()
+                        .find(|(index, ..)| *index == global)
+                        .map(|(_, file, width, height)| (file.clone(), *width, *height))
+                        .unwrap_or_default();
+                    let mut image_node = serde_json::json!({
+                        "type": "image",
+                        "attrs": { "src": src, "alt": "" }
+                    });
+                    if width > 0 {
+                        image_node["attrs"]["width"] = serde_json::Value::from(width);
+                    }
+                    if height > 0 {
+                        image_node["attrs"]["height"] = serde_json::Value::from(height);
+                    }
+                    out.push(image_node);
+                } else {
+                    segment.push(c);
+                }
+                global += 1;
+            }
+            if !segment.is_empty() {
+                let mut run = node.clone();
+                run["text"] = serde_json::Value::String(segment);
+                out.push(run);
+            }
+        }
+        *nodes = out;
+    }
+}
+
+fn wysiwyg_doc(
+    content: &str,
+    tags: &[rtcl_tk_runtime::TextTagView],
+    images: &[(usize, String, i64, i64)],
+) -> serde_json::Value {
     let chars = content.chars().collect::<Vec<_>>();
     let len = chars.len();
     let mut paragraphs = Vec::new();
@@ -978,7 +1056,17 @@ fn wysiwyg_doc(content: &str, tags: &[rtcl_tk_runtime::TextTagView]) -> serde_js
         });
         line_start = line_end + 1;
     }
-    json!({"type": "doc", "content": paragraphs})
+    let mut doc = json!({"type": "doc", "content": paragraphs});
+    splice_doc_images(&mut doc, images);
+    eprintln!(
+        "DBG splice after p2={}",
+        doc.get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.get(1))
+            .map(|p| p.to_string())
+            .unwrap_or_default()
+    );
+    doc
 }
 
 fn wysiwyg_schema() -> Schema {
@@ -1052,7 +1140,13 @@ fn wysiwyg_session(
     tags: &[rtcl_tk_runtime::TextTagView],
 ) -> Option<EditorSession> {
     let schema = wysiwyg_schema();
-    let doc = schema.node_from_json(&wysiwyg_doc(content, tags)).ok()?;
+    let doc = schema
+        .node_from_json(&wysiwyg_doc(
+            content,
+            tags,
+            &rtcl_tk_runtime::text_image_files(path),
+        ))
+        .ok()?;
     let plugins = wysiwyg_plugins(path, &schema);
     let state =
         EditorState::create(EditorStateConfig::new(schema).doc(doc).plugins(plugins)).ok()?;
@@ -1069,7 +1163,7 @@ fn wysiwyg_session_from_doc(path: &str, json: &str) -> Option<(EditorSession, St
     let session = EditorSession::new(state, NodeViews::new());
     let state = session.state();
     let doc = state.doc();
-    let text = doc.text_between(0, doc.content().size(), Some("\n"), None);
+    let text = doc.text_between(0, doc.content().size(), Some("\n"), Some("\u{FFFC}"));
     Some((session, text))
 }
 
@@ -1298,7 +1392,8 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                 .on_change(move |_: &_| {
                     let state = change_session.state();
                     let doc = state.doc();
-                    let text = doc.text_between(0, doc.content().size(), Some("\n"), None);
+                    let text =
+                        doc.text_between(0, doc.content().size(), Some("\n"), Some("\u{FFFC}"));
                     rtcl_tk_runtime::record_text_undo_if_changed(&change_path, &text);
                     if let Ok(json) = serde_json::to_string(&doc.to_json()) {
                         rtcl_tk_runtime::set_rich_doc(&change_path, json);

@@ -333,8 +333,13 @@ Tcl 侧 `tag add/remove` 这类纯格式命令不单独入栈，但会随下一�
 create/cget/configure/delete/names` 按 Tk 模型实现：嵌入图片占一个
 U+FFFC 字符位（索引随编辑平移、删除占位符即删除图片、undo 可回滚、
 `get`/`dump -text` 可见该字符），位置由内部 mark 携带（不进 `mark
-names`）；dump -image 输出 `image <name> <index>`。行内绘制暂未接入
-（纯文本显示占位字形）。
+names`）；dump -image 输出 `image <name> <index>`。**行内绘制已接入
+WYSIWYG**：渲染器把 doc 里的 U+FFFC 段拼接成 ProseMirror image 节点
+（attrs: src=photo 文件、width/height=image_dimensions），读回时 image
+节点经 leaf_text 映射回 U+FFFC（内容长度不漂移）；merge/dump/see 的
+位置映射同样感知 image 节点。GTK 截图里该段首帧尚未画出（nsh image
+异步解码 + 快照时序），交互运行时应可见——桌面视觉验收待交互截图
+工具（Wayland 下无 import/gnome-screenshot 可用）。
 `tag bind tagName ?sequence? ?script?` 把事件绑定到 tag 区间：富文本编辑器
 按下时按指针下的文档位置映射成字符下标，命中区间的 tag 依次执行最具体的
 sequence（`<Button-1>`、Double/Triple/Quadruple、`<ButtonRelease-1>`、

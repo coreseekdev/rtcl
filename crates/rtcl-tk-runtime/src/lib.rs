@@ -834,6 +834,16 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         args.get(3).map(|v| v.as_str()),
                     )
                 }
+                "replace" => {
+                    if args.len() < 5 {
+                        return Err(wrong(
+                            "replace",
+                            "index1 index2 chars ?tagList chars ...?",
+                            args.len(),
+                        ));
+                    }
+                    text_replace(interp, path, &args[2..])
+                }
                 "insert" => {
                     if args.len() < 4 {
                         return Err(wrong(
@@ -6759,6 +6769,26 @@ fn text_get(interp: &mut Interp, path: &str, first: &str, last: Option<&str>) ->
     Ok(Value::from_str(&char_slice(&content, a, b)))
 }
 
+/// Where a mark at `index` ends up after inserting at `at`.
+fn mark_after_insert(index: usize, at: usize, len: usize, gravity: MarkGravity) -> usize {
+    if index > at || (index == at && gravity == MarkGravity::Right) {
+        index + len
+    } else {
+        index
+    }
+}
+
+/// Where a mark at `index` ends up after deleting `[a, b)`.
+fn mark_after_delete(index: usize, a: usize, b: usize) -> usize {
+    if index >= a && index <= b {
+        a
+    } else if index > b {
+        index - (b - a)
+    } else {
+        index
+    }
+}
+
 fn text_insert(
     interp: &mut Interp,
     path: &str,
@@ -6766,18 +6796,14 @@ fn text_insert(
     text: &str,
     tag_list: Option<&str>,
 ) -> Result<Value> {
-    let (content, _) = text_state(interp, path);
+    let (content, cursor_before) = text_state(interp, path);
     let at = at.min(content.chars().count());
     let new_content = replace_chars(&content, at, at, text);
     let len = text.chars().count();
     let gravity = with_state(interp, |rt| rt.insert_gravity.get(path).copied())
         .flatten()
         .unwrap_or_default();
-    let cursor = if gravity == MarkGravity::Left {
-        at
-    } else {
-        at + len
-    };
+    let cursor = mark_after_insert(cursor_before, at, len, gravity);
     let tags = tag_list.map(str::to_string);
     with_state_mut(interp, |rt| {
         adjust_text_tag_ranges(&content, &new_content, rt.text_tags.get_mut(path));
@@ -6808,7 +6834,18 @@ fn text_delete(interp: &mut Interp, path: &str, first: &str, last: Option<&str>)
         Some(last) => text_index(last, &content, cursor, &marks)?,
         None => (start + 1).min(content.chars().count()),
     };
-    let (a, b) = (start.min(end), start.max(end));
+    text_delete_range(interp, path, start.min(end), start.max(end));
+    Ok(Value::empty())
+}
+
+fn text_delete_range(interp: &mut Interp, path: &str, a: usize, b: usize) {
+    let (content, _) = text_state(interp, path);
+    let len = content.chars().count();
+    let a = a.min(len);
+    let b = b.min(len);
+    if b <= a {
+        return;
+    }
     let new_content = replace_chars(&content, a, b, "");
     with_state_mut(interp, |rt| {
         adjust_text_tag_ranges(&content, &new_content, rt.text_tags.get_mut(path));
@@ -6816,10 +6853,28 @@ fn text_delete(interp: &mut Interp, path: &str, first: &str, last: Option<&str>)
         rt.text_modified.insert(path.to_string());
         if let Some(n) = rt.tree.get_mut(path) {
             n.content = new_content;
-            n.cursor = a;
+            n.cursor = mark_after_delete(n.cursor, a, b);
             rt.bump();
         }
     });
+}
+
+fn text_replace(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    let (content, cursor) = text_state(interp, path);
+    let marks = text_marks(interp, path);
+    let start = text_index(rest[0].as_str(), &content, cursor, &marks)?;
+    let end = text_index(rest[1].as_str(), &content, cursor, &marks)?;
+    let (a, b) = (start.min(end), start.max(end));
+    text_delete_range(interp, path, a, b);
+    let mut at = a;
+    let mut pos = 2;
+    while pos < rest.len() {
+        let chars = rest[pos].as_str();
+        let tags = rest.get(pos + 1).map(|value| value.as_str());
+        text_insert(interp, path, at, chars, tags)?;
+        at += chars.chars().count();
+        pos += if tags.is_some() { 2 } else { 1 };
+    }
     Ok(Value::empty())
 }
 
@@ -8205,6 +8260,42 @@ mod tests {
         eval(&mut i, ".n mark set insert 1.1");
         eval(&mut i, ".n insert 1.1 AA");
         assert_eq!(eval(&mut i, ".n index insert"), "1.1");
+    }
+
+    #[test]
+    fn text_replace_and_insert_mark_gravity() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "text .rp; .rp insert 1.0 abcdef; .rp tag add hot 1.0 1.2",
+        );
+        eval(&mut i, ".rp mark set m 1.4");
+        eval(&mut i, ".rp replace 1.1 1.3 XY");
+        assert_eq!(eval(&mut i, ".rp get 1.0 end"), "aXYdef");
+        assert_eq!(eval(&mut i, ".rp tag ranges hot"), "1.0 1.1");
+        assert_eq!(eval(&mut i, ".rp index m"), "1.4");
+        assert_eq!(eval(&mut i, ".rp index insert"), "1.6");
+        eval(&mut i, ".rp replace 1.0 1.2 ZZ hot");
+        assert_eq!(eval(&mut i, ".rp get 1.0 end"), "ZZYdef");
+        assert_eq!(eval(&mut i, ".rp tag ranges hot"), "1.0 1.2");
+        eval(&mut i, ".rp replace 1.2 1.2 Q");
+        assert_eq!(eval(&mut i, ".rp get 1.0 end"), "ZZQYdef");
+
+        // The insert mark is a right-gravity mark: edits before it shift it.
+        eval(&mut i, "text .cu; .cu insert 1.0 abcdef");
+        eval(&mut i, ".cu mark set insert 1.4; .cu insert 1.1 X");
+        assert_eq!(eval(&mut i, ".cu index insert"), "1.5");
+        eval(&mut i, ".cu mark set insert 1.1; .cu insert 1.1 Y");
+        assert_eq!(eval(&mut i, ".cu index insert"), "1.2");
+        eval(&mut i, ".cu mark gravity insert left");
+        eval(&mut i, ".cu mark set insert 1.1; .cu insert 1.1 Z");
+        assert_eq!(eval(&mut i, ".cu index insert"), "1.1");
+        eval(&mut i, ".cu mark gravity insert right");
+        eval(&mut i, ".cu mark set insert 1.2; .cu delete 1.0 1.1");
+        assert_eq!(eval(&mut i, ".cu index insert"), "1.1");
+        eval(&mut i, ".cu mark set insert 1.1; .cu delete 1.1 1.3");
+        assert_eq!(eval(&mut i, ".cu index insert"), "1.1");
     }
 
     #[test]

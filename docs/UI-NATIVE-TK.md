@@ -231,8 +231,10 @@ JSON，可跨应用重启持久化。正文写回 Tcl 模型、标签区间按�
 `hot`）复用，新样式生成 `@rich-…` tag，非样式 tag 保留。因此
 `tag ranges/names` 能看到编辑器新格式；外部 tag 变化不覆盖 marks，外部
 正文改写按差分平移 marks。`text insert index chars ?tagList ...?` 支持
-逐对文本/标签并在插入后把 tag 列表加到新区间；Tcl 侧 insert/delete 会
-平移已有的 tag 区间（相邻/重叠区间合并），与编辑器路径一致。`text
+逐对文本/标签并在插入后把 tag 列表加到新区间，`text replace index1
+index2 chars ?tagList ...?` 复用删除+插入路径；Tcl 侧 insert/delete/
+replace 会平移已有的 tag 区间（相邻/重叠区间合并）与 mark，insert 光标
+按 gravity 随编辑移动，与编辑器路径一致。`text
 index` 支持 `insert/end/line.col/line.end`、mark 名、`+/- N chars|
 indices|lines` 链与 `linestart/lineend/wordstart/wordend` 限定词；
 `mark set/unset/names/gravity/next/previous` 维护标记（`insert` 即光标，

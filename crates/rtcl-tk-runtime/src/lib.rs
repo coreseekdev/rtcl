@@ -1860,6 +1860,15 @@ fn destroy_impl(interp: &mut Interp, path: &str) -> Result<Value> {
     }
     // Tk sends <Destroy> to the children first, then the window itself.
     for p in removed.iter().rev() {
+        let mapped = with_state(interp, |rt| {
+            rt.tree
+                .get(p)
+                .is_some_and(|n| n.pack.is_some() || n.grid.is_some() || n.place.is_some())
+        })
+        .unwrap_or(false);
+        if mapped {
+            run_binding(p, "<Unmap>", &EventCtx::for_path(p));
+        }
         run_binding(p, "<Destroy>", &EventCtx::for_path(p));
     }
     with_state_mut(interp, |rt| {
@@ -1901,12 +1910,19 @@ fn pack_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             for a in &args[2..] {
                 let path = a.as_str();
+                let was_mapped =
+                    with_state(interp, |rt| rt.tree.get(path).map(|n| n.pack.is_some()))
+                        .flatten()
+                        .unwrap_or(false);
                 with_state_mut(interp, |rt| {
                     rt.tree.unpack(path).map_err(tk_error)?;
                     rt.bump();
                     Ok::<(), Error>(())
                 })
                 .ok_or_else(|| bad_window(path))??;
+                if was_mapped {
+                    fire_physical(path, "Unmap");
+                }
             }
             Ok(Value::empty())
         }
@@ -1938,6 +1954,9 @@ fn pack_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 fn pack_widget(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    let was_mapped = with_state(interp, |rt| rt.tree.get(path).map(|n| n.pack.is_some()))
+        .flatten()
+        .unwrap_or(false);
     let mut info = with_state(interp, |rt| rt.tree.get(path).and_then(|n| n.pack.clone()))
         .flatten()
         .unwrap_or_default();
@@ -1980,6 +1999,9 @@ fn pack_widget(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value>
         Ok::<(), Error>(())
     })
     .ok_or_else(|| bad_window(path))??;
+    if !was_mapped {
+        fire_physical(path, "Map");
+    }
     Ok(Value::empty())
 }
 
@@ -2051,12 +2073,19 @@ fn grid_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             for a in &args[2..] {
                 let path = a.as_str();
+                let was_mapped =
+                    with_state(interp, |rt| rt.tree.get(path).map(|n| n.grid.is_some()))
+                        .flatten()
+                        .unwrap_or(false);
                 with_state_mut(interp, |rt| {
                     rt.tree.ungrid(path).map_err(tk_error)?;
                     rt.bump();
                     Ok::<(), Error>(())
                 })
                 .ok_or_else(|| bad_window(path))??;
+                if was_mapped {
+                    fire_physical(path, "Unmap");
+                }
             }
             Ok(Value::empty())
         }
@@ -2164,6 +2193,9 @@ fn grid_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 fn grid_widget(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    let was_mapped = with_state(interp, |rt| rt.tree.get(path).map(|n| n.grid.is_some()))
+        .flatten()
+        .unwrap_or(false);
     let mut info = with_state(interp, |rt| rt.tree.get(path).and_then(|n| n.grid))
         .flatten()
         .unwrap_or_default();
@@ -2197,6 +2229,9 @@ fn grid_widget(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value>
         Ok::<(), Error>(())
     })
     .ok_or_else(|| bad_window(path))??;
+    if !was_mapped {
+        fire_physical(path, "Map");
+    }
     Ok(Value::empty())
 }
 
@@ -2352,12 +2387,19 @@ fn place_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             for a in &args[2..] {
                 let path = a.as_str();
+                let was_mapped =
+                    with_state(interp, |rt| rt.tree.get(path).map(|n| n.place.is_some()))
+                        .flatten()
+                        .unwrap_or(false);
                 with_state_mut(interp, |rt| {
                     rt.tree.unplace(path).map_err(tk_error)?;
                     rt.bump();
                     Ok::<(), Error>(())
                 })
                 .ok_or_else(|| bad_window(path))??;
+                if was_mapped {
+                    fire_physical(path, "Unmap");
+                }
             }
             Ok(Value::empty())
         }
@@ -2409,6 +2451,9 @@ fn place_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 fn place_widget(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    let was_mapped = with_state(interp, |rt| rt.tree.get(path).map(|n| n.place.is_some()))
+        .flatten()
+        .unwrap_or(false);
     let mut info = with_state(interp, |rt| rt.tree.get(path).and_then(|n| n.place.clone()))
         .flatten()
         .unwrap_or_default();
@@ -2438,6 +2483,9 @@ fn place_widget(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value
         Ok::<(), Error>(())
     })
     .ok_or_else(|| bad_window(path))??;
+    if !was_mapped {
+        fire_physical(path, "Map");
+    }
     Ok(Value::empty())
 }
 
@@ -2966,6 +3014,10 @@ enum EventKind {
     Motion,
     Wheel,
     Touch,
+    Map,
+    Unmap,
+    Destroy,
+    Expose,
     /// `<<Name>>` virtual event.
     Virtual,
     Configure,
@@ -3114,9 +3166,11 @@ fn parse_sequence(sequence: &str) -> EventPattern {
             );
         }
         "configure" => pattern.kind = EventKind::Configure,
-        "destroy" | "expose" | "map" | "unmap" | "visibility" | "mousewheel" => {
-            pattern.kind = EventKind::Other
-        }
+        "map" => pattern.kind = EventKind::Map,
+        "unmap" => pattern.kind = EventKind::Unmap,
+        "destroy" => pattern.kind = EventKind::Destroy,
+        "expose" => pattern.kind = EventKind::Expose,
+        "visibility" | "mousewheel" => pattern.kind = EventKind::Other,
         other if other.len() == 2 && other.starts_with('b') && !rest.is_empty() => {
             // <B1-Motion>: motion with button `1` down.
             let button = &other[1..];
@@ -3479,6 +3533,11 @@ pub fn widget_press(path: &str, x: f64, y: f64, clicks: u32) {
 /// Fire a Tk virtual event (`<<ListboxSelect>>`, ...) on `path`.
 fn fire_virtual(path: &str, name: &str) {
     run_binding(path, &format!("<<{name}>>"), &EventCtx::for_path(path));
+}
+
+/// Fire a physical event like `<Map>`/`<Unmap>` on `path`.
+fn fire_physical(path: &str, name: &str) {
+    run_binding(path, &format!("<{name}>"), &EventCtx::for_path(path));
 }
 
 /// Tcl `break`/`continue` in a binding stops the event (tkinter's
@@ -5189,6 +5248,11 @@ fn wheel_scroll(interp: &mut Interp, path: &str, direction: f64) {
     }
     set_scroll_fraction(interp, path, next);
     notify_yscroll(interp, path, total);
+}
+
+/// A paste reached an input: `<<Paste>>`.
+pub fn paste_event(path: &str) {
+    run_binding(path, "<<Paste>>", &EventCtx::for_path(path));
 }
 
 /// The pointer entered a widget: `<Enter>`.
@@ -9630,6 +9694,27 @@ mod tests {
         );
         assert_eq!(eval(&mut i, "set ::log"), "b1");
         assert_eq!(eval(&mut i, "event info"), "");
+    }
+
+    #[test]
+    fn map_and_unmap_events() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "frame .f; set ::log {};
+             bind .f <Map> {lappend ::log map};
+             bind .f <Unmap> {lappend ::log unmap};
+             bind .f <Destroy> {lappend ::log destroy};
+             pack .f",
+        );
+        assert_eq!(eval(&mut i, "set ::log"), "map");
+        eval(&mut i, "pack forget .f");
+        assert_eq!(eval(&mut i, "set ::log"), "map unmap");
+        eval(&mut i, "pack .f");
+        assert_eq!(eval(&mut i, "set ::log"), "map unmap map");
+        eval(&mut i, "destroy .f");
+        assert_eq!(eval(&mut i, "set ::log"), "map unmap map unmap destroy");
     }
 
     #[test]

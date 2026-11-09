@@ -316,3 +316,33 @@ fn label_click_bindings_fire() {
     app.wait_for("clicked")
         .expect("<Button-1> on a plain label runs");
 }
+
+const PASTE_APP: &str = r#"
+set ::value x
+set ::report ""
+entry .e -textvariable ::value
+pack .e
+label .out -textvariable ::report
+pack .out
+bind .e <<Paste>> {set ::report pasted}
+"#;
+
+#[component]
+fn PasteApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(PASTE_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn paste_fires_virtual_event() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<PasteApp>()))
+        .expect("headless engine starts");
+    app.set_viewport(Size::new(Points(400.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("x").expect("entry renders");
+    let mut paste = PasteEvent::default();
+    paste.text = "hi".to_string();
+    app.paste("text:x", &paste).expect("paste");
+    app.wait_for("pasted")
+        .expect("<<Paste>> binding fired");
+}

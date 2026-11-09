@@ -1340,6 +1340,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let change_path = path.clone();
             let submit_path = path.clone();
             let key_path = path.clone();
+            let paste_path = path.clone();
             nsh_base::input()
                 .value(rtcl_tk_runtime::entry_value(&path))
                 .auto_focus(rtcl_tk_runtime::focused(&path))
@@ -1356,6 +1357,9 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     let tcl_key = if key == "Enter" { "Return" } else { key };
                     let character = if key.chars().count() == 1 { key } else { "" };
                     rtcl_tk_runtime::entry_key(&key_path, tcl_key, character);
+                })
+                .on_paste(move |_: &PasteEvent| {
+                    rtcl_tk_runtime::paste_event(&paste_path);
                 })
                 .into_element()
         }
@@ -1625,11 +1629,13 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let thumb_color = AdaptiveColor::rgb(0x9ca3af, 0x6b7280);
             let track_color = AdaptiveColor::rgb(0xe5e7eb, 0x374151);
             let arrow = |label: &str, step: i64, path: String| {
+                let press_path = path.clone();
                 nsh_base::button()
                     .px(px(2.0))
                     .py(px(1.0))
                     .child(text(label.to_string()).text_size(px(10.0)))
                     .on_press(move |_: &()| {
+                        rtcl_tk_runtime::widget_press(&press_path, 0.0, 0.0, 1);
                         rtcl_tk_runtime::scrollbar_step(&path, step, false);
                     })
                     .into_element()

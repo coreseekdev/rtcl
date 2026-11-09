@@ -302,8 +302,11 @@ rotation×10）；`event generate` 接受 `-x/-y/-rootx/-rooty/-key/-keysym/
 `<<Invoke>>`（按钮/check/radio 默认 `invoke`）、`<<ListboxSelect>>`、
 `<<TreeviewSelect>>`、`<<TreeviewOpen>>/<<TreeviewClose>>`、
 `<<ComboboxSelected>>`、`<<NotebookTabChanged>>` 在对应状态变化时自动
-派发；`destroy` 按子→父派发 `<Destroy>`，点击链支持
-Double/Triple/Quadruple。`after` 由 `TkView` 的
+派发；`pack/grid/place` 首次映射派发 `<Map>`，`forget/remove` 与
+`destroy` 前派发 `<Unmap>`；`destroy` 按子→父派发 `<Destroy>`；entry
+收到粘贴时派发 `<<Paste>>`（原生输入负责实际插入），scrollbar 箭头
+点击派发 `<Button-1>`；点击链支持 Double/Triple/Quadruple。`after` 由
+`TkView` 的
 16 ms interval 泵入，错误进 `take_errors()`。
 
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停
@@ -312,8 +315,8 @@ Double/Triple/Quadruple。`after` 由 `TkView` 的
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
 text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
-未实现；`<Configure>`/`<Map>`/`<Unmap>` 尚未从平台层派发，`<<Paste>>`
-等内置虚拟事件没有默认映射（可用 `event add` 自行定义）；
+未实现；`<Configure>` 尚未从平台层派发；`<<Copy>>/<<Cut>>/<<SelectAll>>`
+等虚拟事件没有默认映射（可用 `event add` 自行定义）；
 滚轮绑定只在 listbox/treeview（有原生 scroll view）；canvas/text/entry
 的 wheel 未派发；entry/scale/text/scrollbar 的按下事件只走原生控件行为；
 其它控件的 hover/motion 未派发；

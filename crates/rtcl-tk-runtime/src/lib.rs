@@ -1123,13 +1123,17 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     if line > visible {
                         return Ok(Value::from_str(""));
                     }
+                    // Pixel geometry from the renderer's size model: 7px
+                    // per character column, 18px rows, ascent 14px.
                     let width = effective_option(interp, path, "-width")
                         .parse::<usize>()
                         .unwrap_or(80)
-                        .max(1) as i64;
-                    let y = 3 + (line - 1) as i64 * 18;
+                        .max(1) as i64
+                        * 7;
+                    let pad = 3;
+                    let y = pad + (line - 1) as i64 * 18;
                     Ok(list_value([
-                        "3".to_string(),
+                        pad.to_string(),
                         y.to_string(),
                         width.to_string(),
                         "18".to_string(),
@@ -12806,8 +12810,8 @@ mod tests {
             &mut i,
             "text .t -width 20 -height 5; .t insert 1.0 \"one\\ntwo\\nthree\"",
         );
-        assert_eq!(eval(&mut i, ".t dlineinfo 1.0"), "3 3 20 18 17");
-        assert_eq!(eval(&mut i, ".t dlineinfo 2.1"), "3 21 20 18 35");
+        assert_eq!(eval(&mut i, ".t dlineinfo 1.0"), "3 3 140 18 17");
+        assert_eq!(eval(&mut i, ".t dlineinfo 2.1"), "3 21 140 18 35");
         assert_eq!(eval(&mut i, ".t dlineinfo 5.0"), "");
         assert_eq!(eval(&mut i, ".t yview"), "0.0 1.0");
         assert_eq!(eval(&mut i, ".t xview"), "0.0 1.0");

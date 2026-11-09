@@ -200,7 +200,9 @@ separator/cascade），headless 同样用 app 内菜单以便测试；`-tearoff`
 **布局**：pack 按子控件顺序流式排列，连续 `-side left/right` 归入同一
 行（右侧项推到行尾），不放 fill 的 parcel 从行/列首开始；grid 按行分组、`columnconfigure -weight` 进入
 flex 权重；place 支持绝对坐标与 `-relwidth/-relheight`，相对坐标按父
-容器比例解释。混合 side 的精确 Tk 收缩顺序是近似。
+容器比例解释。button 的 `pack -fill x/-both` 与 grid `-sticky ew` 会
+横向拉伸到 parcel/cell（其余控件/方向仍按原生近似）。混合 side 的精确
+Tk 收缩顺序是近似。
 
 **窗口**：`wm title` 在桌面后端实时写入原生窗口标题
 （`nsh desktop::set_title`）；其余 `wm geometry/state` 仅记录在模型。

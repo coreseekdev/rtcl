@@ -475,7 +475,7 @@ button .b -text Hi
 pack .b -fill x
 label .out -textvariable ::report
 pack .out
-bind .b <Configure> {if {%w > 0} {set ::report configured}}
+bind .b <Configure> {if {%w > 500} {set ::report big}}
 "#;
 
 #[component]
@@ -493,6 +493,6 @@ fn button_configure_fires_on_resize() {
     let _ = app.settle();
     app.set_viewport(Size::new(Points(700.0), Points(400.0)))
         .expect("grow");
-    app.wait_for("configured")
-        .expect("the button's own <Configure> fired");
+    app.wait_for("big")
+        .expect("the button's own <Configure> reported the filled width");
 }

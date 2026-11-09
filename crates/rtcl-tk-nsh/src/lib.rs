@@ -1385,8 +1385,18 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
         WidgetKind::Button => {
             let path = path.to_string();
             let disabled = is_disabled(tree, path.as_str());
+            // A packed/gridded button whose parcel fills horizontally takes
+            // its width (Tk `-fill x` / `-sticky ew`); otherwise it hugs its
+            // content at the leading edge.
+            let stretches = node
+                .pack
+                .as_ref()
+                .is_some_and(|p| matches!(p.fill, Fill::X | Fill::Both))
+                || node
+                    .grid
+                    .as_ref()
+                    .is_some_and(|g| g.sticky.left && g.sticky.right);
             let mut button = nsh_base::button()
-                .self_start()
                 .px(px(12.0))
                 .py(px(6.0))
                 .rounded(px(6.0))
@@ -1395,6 +1405,9 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .bg(option_color(tree, path.as_str(), "-background")
                     .unwrap_or(AdaptiveColor::rgb(0xf3f4f6, 0x374151)))
                 .disabled(disabled);
+            if !stretches {
+                button = button.self_start();
+            }
             button = if let Some(file) = image_file_of(tree, path.as_str()) {
                 button.child(sized_image(file, option(tree, path.as_str(), "-image")))
             } else {

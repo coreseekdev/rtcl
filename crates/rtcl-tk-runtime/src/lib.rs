@@ -836,6 +836,23 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "mark" => Ok(Value::empty()),
                 "tag" => text_tag_command(interp, path, &args[2..]),
                 "getdoc" => Ok(Value::from_str(&rich_doc(path).unwrap_or_default())),
+                "setdoc" => {
+                    if args.len() < 3 {
+                        return Err(wrong("setdoc", "json", args.len()));
+                    }
+                    let json = args[2].as_str().to_string();
+                    let text = rich_doc_text(&json)
+                        .ok_or_else(|| generic("setdoc: not a rich document"))?;
+                    with_state_mut(interp, |rt| {
+                        if let Some(node) = rt.tree.get_mut(path) {
+                            node.content = text.clone();
+                            node.cursor = text.chars().count();
+                        }
+                        rt.rich_docs.insert(path.to_string(), json.clone());
+                        rt.bump();
+                    });
+                    Ok(Value::empty())
+                }
                 "edit" => Ok(Value::empty()),
                 "xview" | "yview" => Ok(Value::empty()),
                 _ => bad_subcommand(kind, sub),
@@ -5419,6 +5436,151 @@ pub fn rich_doc(path: &str) -> Option<String> {
     with_state(unsafe { &*ptr }, |rt| rt.rich_docs.get(path).cloned()).flatten()
 }
 
+/// A rich document's plain text (blocks separated by newlines).
+pub fn rich_doc_text(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    doc_runs(&value).map(|(text, _)| text)
+}
+
+struct DocRun {
+    start: usize,
+    end: usize,
+    marks: Vec<serde_json::Value>,
+}
+
+fn doc_runs(value: &serde_json::Value) -> Option<(String, Vec<DocRun>)> {
+    let blocks = value.get("content")?.as_array()?;
+    let mut text = String::new();
+    let mut runs = Vec::new();
+    let mut position = 0usize;
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 {
+            text.push('\n');
+            position += 1;
+        }
+        let Some(nodes) = block.get("content").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for node in nodes {
+            if node.get("type").and_then(|v| v.as_str()) != Some("text") {
+                continue;
+            }
+            let content = node.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let length = content.chars().count();
+            let marks = node
+                .get("marks")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if length > 0 {
+                runs.push(DocRun {
+                    start: position,
+                    end: position + length,
+                    marks,
+                });
+            }
+            text.push_str(content);
+            position += length;
+        }
+    }
+    Some((text, runs))
+}
+
+fn merged_doc_json(json: &str, new_content: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let (old_text, mut runs) = doc_runs(&value)?;
+    if old_text == new_content {
+        return Some(json.to_string());
+    }
+    let old_chars = old_text.chars().collect::<Vec<_>>();
+    let new_chars = new_content.chars().collect::<Vec<_>>();
+    let mut prefix = 0;
+    while prefix < old_chars.len()
+        && prefix < new_chars.len()
+        && old_chars[prefix] == new_chars[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old_chars.len().saturating_sub(prefix)
+        && suffix < new_chars.len().saturating_sub(prefix)
+        && old_chars[old_chars.len() - 1 - suffix] == new_chars[new_chars.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let old_len = old_chars.len();
+    let delta = new_chars.len() as isize - old_len as isize;
+    for run in &mut runs {
+        let (start, end) = if run.end <= prefix {
+            (run.start, run.end)
+        } else if run.start >= old_len.saturating_sub(suffix) {
+            (
+                (run.start as isize + delta).max(0) as usize,
+                (run.end as isize + delta).max(0) as usize,
+            )
+        } else {
+            (
+                run.start.min(prefix),
+                ((run.end as isize + delta).max(0) as usize).max(prefix),
+            )
+        };
+        run.start = start.min(new_chars.len());
+        run.end = end.min(new_chars.len());
+    }
+    let mut paragraphs = Vec::new();
+    let mut line_start = 0usize;
+    for line in new_content.split('\n') {
+        let line_len = line.chars().count();
+        let line_end = (line_start + line_len).min(new_chars.len());
+        let mut bounds = vec![line_start, line_end];
+        for run in &runs {
+            if run.end <= run.start {
+                continue;
+            }
+            if run.start < line_end && run.end > line_start {
+                bounds.push(run.start.max(line_start));
+                bounds.push(run.end.min(line_end));
+            }
+        }
+        bounds.sort_unstable();
+        bounds.dedup();
+        let mut nodes = Vec::new();
+        for pair in bounds.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            if start >= end {
+                continue;
+            }
+            let segment = new_chars[start..end].iter().collect::<String>();
+            let marks = runs
+                .iter()
+                .find(|run| start < run.end && end > run.start)
+                .map(|run| run.marks.clone())
+                .unwrap_or_default();
+            let mut node = serde_json::json!({"type": "text", "text": segment});
+            if !marks.is_empty() {
+                node["marks"] = serde_json::Value::Array(marks);
+            }
+            nodes.push(node);
+        }
+        paragraphs.push(if nodes.is_empty() {
+            serde_json::json!({"type": "paragraph"})
+        } else {
+            serde_json::json!({"type": "paragraph", "content": nodes})
+        });
+        line_start = line_end + 1;
+    }
+    serde_json::to_string(&serde_json::json!({"type": "doc", "content": paragraphs})).ok()
+}
+
+/// Update a persisted rich document for externally edited text, keeping
+/// its marks (shifted by the text diff).
+pub fn merge_rich_doc(path: &str, new_content: &str) -> Option<String> {
+    let json = rich_doc(path)?;
+    let merged = merged_doc_json(&json, new_content)?;
+    set_rich_doc(path, merged.clone());
+    Some(merged)
+}
+
 /// Store a text widget's rich document as data (not Tk tags).
 pub fn set_rich_doc(path: &str, json: String) {
     let Some(ptr) = active_interp() else { return };
@@ -6363,6 +6525,12 @@ mod tests {
         assert_eq!(eval(&mut i, ".t getdoc"), "");
         set_rich_doc(".t", "{\"type\":\"doc\"}".to_string());
         assert_eq!(eval(&mut i, ".t getdoc"), "{\"type\":\"doc\"}");
+        let rich = r##"{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"hello world","marks":[{"type":"textStyle","attrs":{"color":"#ff0000","backgroundColor":"","fontSize":"","fontFamily":""}}]}]}]}"##;
+        eval(&mut i, &format!(".t setdoc {{{rich}}}"));
+        assert_eq!(eval(&mut i, ".t get 1.0 end"), "hello world");
+        let merged = merge_rich_doc(".t", "hello brave world").unwrap();
+        assert_eq!(rich_doc_text(&merged).as_deref(), Some("hello brave world"));
+        assert!(merged.contains("#ff0000"));
         assert_eq!(eval(&mut i, ".t tag names 1.2"), "strong");
         assert_eq!(eval(&mut i, ".t tag names 1.7"), "");
         assert_eq!(eval(&mut i, ".t tag cget strong -foreground"), "red");

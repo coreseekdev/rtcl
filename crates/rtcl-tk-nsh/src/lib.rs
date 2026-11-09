@@ -563,21 +563,26 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                 return Some((entry.session.clone(), styles));
             }
         }
-        // The rich document is the data: prefer it when its text matches.
+        // The rich document is the data: prefer it, shifting its marks
+        // when the text was edited outside the editor.
         if let Some(json) = &cached {
-            if let Some((session, text)) = wysiwyg_session_from_doc(json) {
-                if text == content {
-                    let styles = wysiwyg_styles_from_doc(json);
-                    map.insert(
-                        path.to_string(),
-                        WysiwygEntry {
-                            content,
-                            signature,
-                            session: session.clone(),
-                        },
-                    );
-                    return Some((session, styles));
-                }
+            let merged = match wysiwyg_session_from_doc(json) {
+                Some((session, text)) if text == content => Some((json.clone(), session)),
+                _ => rtcl_tk_runtime::merge_rich_doc(path, &content).and_then(|merged| {
+                    wysiwyg_session_from_doc(&merged).map(|(session, _)| (merged, session))
+                }),
+            };
+            if let Some((json, session)) = merged {
+                let styles = wysiwyg_styles_from_doc(&json);
+                map.insert(
+                    path.to_string(),
+                    WysiwygEntry {
+                        content,
+                        signature,
+                        session: session.clone(),
+                    },
+                );
+                return Some((session, styles));
             }
         }
         let session = wysiwyg_session(&content, tags)?;

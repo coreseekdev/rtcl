@@ -8,3 +8,4 @@ description = "Tcl/Tk-compatible native UI runtime (optional tk feature; native 
 [dependencies]
 rtcl-core = { workspace = true }
 rtcl-tk-core = { path = "../rtcl-tk-core" }
+serde_json = "1"

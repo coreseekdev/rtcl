@@ -4307,6 +4307,7 @@ version = "0.1.0"
 dependencies = [
  "rtcl-core",
  "rtcl-tk-core",
+ "serde_json",
 ]
 
 [[package]]

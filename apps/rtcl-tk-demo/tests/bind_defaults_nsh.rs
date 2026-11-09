@@ -468,3 +468,31 @@ fn scale_press_binding_fires() {
     app.wait_for("pressed")
         .expect("<Button-1> fired for the scale");
 }
+
+const BUTTON_CONFIGURE_APP: &str = r#"
+set ::report ""
+button .b -text Hi
+pack .b -fill x
+label .out -textvariable ::report
+pack .out
+bind .b <Configure> {if {%w > 0} {set ::report configured}}
+"#;
+
+#[component]
+fn ButtonConfigureApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(BUTTON_CONFIGURE_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn button_configure_fires_on_resize() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<ButtonConfigureApp>()))
+        .expect("headless engine starts");
+    app.set_viewport(Size::new(Points(400.0), Points(300.0)))
+        .expect("resize");
+    let _ = app.settle();
+    app.set_viewport(Size::new(Points(700.0), Points(400.0)))
+        .expect("grow");
+    app.wait_for("configured")
+        .expect("the button's own <Configure> fired");
+}

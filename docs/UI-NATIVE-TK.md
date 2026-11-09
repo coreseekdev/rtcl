@@ -126,10 +126,12 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 - iOS 需 macOS/Xcode；Android 需 NDK；二者走 nsh 的 embed 工程模板。
 - 无 GUI CI：`nsh-testing` headless + tk-core 模型测试。
 - **nsh fork**：`Cargo.toml` 的 `[patch.crates-io]` 把 `nsh-core`/
-  `nsh-base` 指到 `coreseekdev/nsh` 的 `rtcl-tk` 分支（基于 v0.4.0）；
-  目前唯一的补丁是 `SliderEvent::PressStart`（Tk scale 的
-  `<Button-1>`）。后续若需平台级事件（canvas/text wheel、entry 选区
-  拖动）也在此 fork 上补。
+  `nsh-base` 指到 `coreseekdev/nsh` 的 `rtcl-tk` 分支（基于 v0.4.0，
+  ssh git 源）；补丁：
+  `SliderEvent::PressStart`（Tk scale 的 `<Button-1>`）与
+  Button/Checkbox/Radio/Slider 的 `Layout(Bounds)` 事件（组件根节点的
+  `<Configure>`）。后续平台级事件（canvas/text wheel、entry 选区拖动）
+  也在此 fork 上补。
 
 ## 6. 里程碑
 
@@ -298,8 +300,10 @@ text 的 `<Key>`/`<KeyRelease>` 绑定（`break` 阻止编辑器插入），粘�
 `<Touch>` 与 `<<TouchStart/Move/End>>`、`<<LongPress>>`、`<<Pan>>`、
 `<<Pinch>>`、`<<Rotation>>`；触摸轻点仍合成 `<Button-1>` 路径。
 `<Configure>` 在 frame/toplevel/label/message/progressbar/canvas/chart/
-entry/listbox/treeview 的布局变化时派发（`%w/%h` 为新尺寸）；scale 的
-按下派发 `<Button-1>`（fork 的 `SliderEvent::PressStart`）。
+entry/listbox/treeview 以及 button/checkbutton/radiobutton/scale 的
+**组件自身节点** 布局变化时派发（`%w/%h` 为新尺寸，fork 的
+`Layout(Bounds)` 事件）；scale 的按下派发 `<Button-1>`（fork 的
+`SliderEvent::PressStart`）。
 滚轮：listbox/treeview 用原生 scroll view 取得 wheel/pan，派发
 `<MouseWheel>`、`<Button-4|5>`（横向 6/7，Shift 作用于
 `<Shift-MouseWheel>`），无类绑定时按行高滚动虚拟化切片（原生偏移每次
@@ -325,9 +329,9 @@ rotation×10）；`event generate` 接受 `-x/-y/-rootx/-rooty/-key/-keysym/
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
 text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
-未实现；`<Configure>` 只在上述原生 View/Input 控件上派发（button/
-listbox/treeview 等复合控件未接 layout）；`<<Copy>>/<<Cut>>/<<SelectAll>>`
-等虚拟事件没有默认映射（可用 `event add` 自行定义）；
+未实现；`<Configure>` 尚未覆盖 notebook/combobox 等其余复合控件；
+`<<Copy>>/<<Cut>>/<<SelectAll>>` 等虚拟事件没有默认映射（可用
+`event add` 自行定义）；
 滚轮绑定只在 listbox/treeview（有原生 scroll view）；canvas/text/entry
 的 wheel 未派发；entry 选区拖动（`<B1-Motion>`）仍只有原生行为；
 其它控件的 hover/motion 未派发；

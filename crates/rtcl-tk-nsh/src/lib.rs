@@ -1411,6 +1411,14 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     rtcl_tk_runtime::press_button(&press_path);
                 });
             }
+            let layout_path = path.clone();
+            button = button.on_layout(move |b: &Bounds<Points>| {
+                rtcl_tk_runtime::configure_event(
+                    &layout_path,
+                    b.size.width.0 as f64,
+                    b.size.height.0 as f64,
+                );
+            });
             button.into_element()
         }
         WidgetKind::Entry => {
@@ -1527,6 +1535,14 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     rtcl_tk_runtime::press_button(&press_path);
                 });
             }
+            let layout_path = path.clone();
+            control = control.on_layout(move |b: &Bounds<Points>| {
+                rtcl_tk_runtime::configure_event(
+                    &layout_path,
+                    b.size.width.0 as f64,
+                    b.size.height.0 as f64,
+                );
+            });
             control.into_element()
         }
         WidgetKind::Radiobutton => {
@@ -1562,6 +1578,14 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     rtcl_tk_runtime::press_button(&press_path);
                 });
             }
+            let layout_path = path.clone();
+            control = control.on_layout(move |b: &Bounds<Points>| {
+                rtcl_tk_runtime::configure_event(
+                    &layout_path,
+                    b.size.width.0 as f64,
+                    b.size.height.0 as f64,
+                );
+            });
             control.into_element()
         }
         WidgetKind::Scale => {
@@ -1579,6 +1603,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let disabled = is_disabled(tree, path.as_str());
             let change_path = path.clone();
             let press_path = path.clone();
+            let layout_path = path.clone();
             let mut row = view().flex_row().items_center().gap_2();
             if !option(tree, path.as_str(), "-label").is_empty() {
                 row = row.child(text(option(tree, path.as_str(), "-label").to_string()));
@@ -1598,6 +1623,13 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         s.size(px(14.0))
                             .rounded_full()
                             .bg(AdaptiveColor::rgb(0x2563eb, 0x3b82f6))
+                    })
+                    .on_layout(move |b: &Bounds<Points>| {
+                        rtcl_tk_runtime::configure_event(
+                            &layout_path,
+                            b.size.width.0 as f64,
+                            b.size.height.0 as f64,
+                        );
                     })
                     .on_press_start(move |_: &()| {
                         rtcl_tk_runtime::widget_press(&press_path, 0.0, 0.0, 1);

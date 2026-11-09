@@ -475,7 +475,27 @@ pub fn with_state_mut<R>(interp: &Interp, f: impl FnOnce(&mut TkRuntime) -> R) -
 pub fn install(interp: &mut Interp) {
     ensure_hook();
     STATES.with(|s| {
-        s.borrow_mut().entry(key(interp)).or_default();
+        let mut states = s.borrow_mut();
+        let rt = states.entry(key(interp)).or_default();
+        // Tk's init.tcl defines these virtual events before any script
+        // runs; bindings on <<Copy>> etc. fire from the physical keys.
+        for (name, sequences) in [
+            ("Copy", ["<Control-c>", "<Control-C>"].as_slice()),
+            ("Cut", ["<Control-x>", "<Control-X>"].as_slice()),
+            ("Paste", ["<Control-v>", "<Control-V>"].as_slice()),
+            ("SelectAll", ["<Control-a>", "<Control-A>"].as_slice()),
+            ("Undo", ["<Control-z>", "<Control-Z>"].as_slice()),
+            ("Redo", ["<Control-y>", "<Control-Y>"].as_slice()),
+        ] {
+            rt.virtual_events
+                .entry(name.to_string())
+                .or_insert_with(|| {
+                    sequences
+                        .iter()
+                        .map(|sequence| sequence.to_string())
+                        .collect()
+                });
+        }
     });
     ACTIVE.with(|a| a.set(Some(key(interp))));
     for name in [
@@ -12311,6 +12331,36 @@ mod tests {
     }
 
     #[test]
+    fn default_editing_virtual_events_fire() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "text .t; .t insert 1.0 abc");
+        assert!(
+            eval(&mut i, "event info")
+                .split(' ')
+                .any(|name| name == "<<Copy>>"),
+            "event info lists the predefined virtual events: {:?}",
+            eval(&mut i, "event info")
+        );
+        assert_eq!(
+            eval(&mut i, "event info <<Copy>>"),
+            "<Control-c> <Control-C>"
+        );
+        eval(
+            &mut i,
+            "bind .t <<Copy>> {set ::c 1}; bind .t <<Paste>> {set ::p 1}",
+        );
+        text_key_event(".t", "c", false, true, false, false);
+        assert_eq!(eval(&mut i, "set ::c"), "1");
+        text_key_event(".t", "v", false, true, false, false);
+        assert_eq!(eval(&mut i, "set ::p"), "1");
+        // Without the modifier the physical key alone fires no virtual event.
+        eval(&mut i, "set ::c 0");
+        text_key_event(".t", "c", false, false, false, false);
+        assert_eq!(eval(&mut i, "set ::c"), "0");
+    }
+
+    #[test]
     fn tk_popup_and_menu_post_points() {
         let mut i = Interp::new();
         install(&mut i);
@@ -12849,7 +12899,13 @@ mod tests {
         eval(&mut i, "event generate .b <Button-1>");
         assert_eq!(eval(&mut i, "set ::log"), "b1 virtual");
         assert_eq!(eval(&mut i, "event info <<MyClick>>"), "<Button-1>");
-        assert_eq!(eval(&mut i, "event info"), "<<MyClick>>");
+        assert!(
+            eval(&mut i, "event info")
+                .split(' ')
+                .any(|name| name == "<<MyClick>>"),
+            "event info lists the user event among the predefined ones: {:?}",
+            eval(&mut i, "event info")
+        );
         eval(&mut i, "set ::log {}; event generate .b <<MyClick>>");
         assert_eq!(eval(&mut i, "set ::log"), "virtual");
         eval(
@@ -12857,7 +12913,13 @@ mod tests {
             "event delete <<MyClick>>; set ::log {}; event generate .b <Button-1>",
         );
         assert_eq!(eval(&mut i, "set ::log"), "b1");
-        assert_eq!(eval(&mut i, "event info"), "");
+        assert!(
+            !eval(&mut i, "event info")
+                .split(' ')
+                .any(|name| name == "<<MyClick>>"),
+            "event delete removes the user event: {:?}",
+            eval(&mut i, "event info")
+        );
     }
 
     #[test]

@@ -435,8 +435,10 @@ own/clear/get/handle` 维护 PRIMARY/CLIPBOARD 所有权，拥有时 `get` 调�
 handler（`handlerCommand offset maxChars`），未拥有时回退到剪贴板文本，
 `-type TARGETS` 返回 `STRING UTF8_STRING`；系统 PRIMARY 选区桥（X11
 primary/wayland 选区）尚未接入，因此非本应用拥有的 PRIMARY 读取也走剪贴板；
-`<Configure>` 尚未覆盖菜单窗口；`<<Copy>>/<<Cut>>/<<SelectAll>>`
-等虚拟事件没有默认映射（可用 `event add` 自行定义）；
+`<Configure>` 尚未覆盖菜单窗口；`<<Copy>>/<<Cut>>/<<Paste>>/<<SelectAll>>/<<Undo>>/<<Redo>>`
+已按 Tk init.tcl 预定义（`event info` 可见，物理 Ctrl+键自动触发其绑定）；
+修饰键经 text/富文本路径上报，plain entry 的原生输入暂不上报修饰键，
+因此 entry 上的这些虚拟事件需等输入事件补修饰键后才能触发；
 entry 选区拖动（`<B1-Motion>`）在桌面鼠标拖动时由平台 MouseMove 派发，
 headless 的 `drag` 是触摸模拟故不触发；菜单项/separator 等装饰控件的
 hover 未单独接（菜单面板本身有 `<Enter>/<Leave>`）；

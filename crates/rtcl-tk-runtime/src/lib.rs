@@ -11170,17 +11170,24 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
         }
     }
     if wanted_image {
-        let images = with_state(interp, |rt| {
-            rt.text_images.get(path).map(|images| {
-                images
-                    .iter()
-                    .map(|(name, (index, _))| (name.clone(), *index))
-                    .collect::<Vec<_>>()
-            })
+        let images: Vec<(String, String)> = with_state(interp, |rt| {
+            rt.text_images
+                .get(path)
+                .map(|images| {
+                    images
+                        .keys()
+                        .map(|name| (name.clone(), image_mark_name(name)))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
         })
         .unwrap_or_default();
-        for images_at in images {
-            for (name, index) in images_at {
+        for (name, mark) in images {
+            let index = marks.get(&mark).map(|m| m.index);
+            let live = index
+                .and_then(|index| chars.get(index))
+                .is_some_and(|c| *c == IMAGE_CHAR);
+            if let Some(index) = index.filter(|_| live) {
                 if index < a || index > b {
                     continue;
                 }
@@ -11194,6 +11201,9 @@ fn text_dump(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
     }
     if dump_marks {
         for (name, mark) in &marks {
+            if name.starts_with("\u{0}img:") {
+                continue;
+            }
             if mark.index < a || mark.index > b {
                 continue;
             }
@@ -11313,18 +11323,48 @@ fn text_edit_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<
     }
 }
 
-/// `text image create/cget/configure/delete/names` — the embedded-image
-/// model (dump reports them; inline rendering is not drawn yet).
+/// The internal mark key carrying an embedded image's position.
+fn image_mark_name(name: &str) -> String {
+    format!("\u{0}img:{name}")
+}
+
+const IMAGE_CHAR: char = '\u{FFFC}';
+
+/// `text image create/cget/configure/delete/names`.  Tk models an
+/// embedded image as ONE character (U+FFFC) in the content: we insert
+/// that character (all index arithmetic, undo and deletion then work) and
+/// carry its position in an internal mark.
 fn text_image_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
     if rest.is_empty() {
         return Err(wrong("image", "option ?arg ...?", rest.len() + 2));
     }
     let sub = rest[0].as_str().to_string();
+    let content = content_of(interp, path);
+    let images_at = |interp: &Interp, name: &str| -> Option<(usize, BTreeMap<String, String>)> {
+        let mark = image_mark_name(name);
+        let (index, options) = with_state(interp, |rt| {
+            let index = rt
+                .text_marks
+                .get(path)
+                .and_then(|marks| marks.get(&mark))
+                .map(|m| m.index);
+            let options = rt
+                .text_images
+                .get(path)
+                .and_then(|images| images.get(name))
+                .map(|(_, options)| options.clone());
+            Some((index?, options?))
+        })??;
+        // The image lives while its placeholder character does.
+        let chars: Vec<char> = content.chars().collect();
+        chars.get(index).filter(|c| **c == IMAGE_CHAR)?;
+        Some((index, options))
+    };
     match sub.as_str() {
         "create" => {
             let index = text_index(
                 rest.get(1).map(|v| v.as_str()).unwrap_or("end"),
-                &content_of(interp, path),
+                &content,
                 0,
                 &text_marks(interp, path),
             )?;
@@ -11339,11 +11379,24 @@ fn text_image_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result
             }
             let name = with_state_mut(interp, |rt| {
                 let images = rt.text_images.entry(path.to_string()).or_default();
-                let name = format!("image{}", images.len() + 1);
+                let mut serial = images.len() + 1;
+                while images.contains_key(&format!("image{serial}")) {
+                    serial += 1;
+                }
+                let name = format!("image{serial}");
+                let mark = image_mark_name(&name);
+                rt.text_marks.entry(path.to_string()).or_default().insert(
+                    mark,
+                    TextMark {
+                        index,
+                        gravity: MarkGravity::Left,
+                    },
+                );
                 images.insert(name.clone(), (index, options));
                 name
             })
             .unwrap_or_default();
+            text_insert(interp, path, index, &IMAGE_CHAR.to_string(), None)?;
             Ok(Value::from_str(&name))
         }
         "names" => {
@@ -11354,21 +11407,19 @@ fn text_image_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result
                     .unwrap_or_default()
             })
             .unwrap_or_default();
-            Ok(list_value(names))
+            let live: Vec<String> = names
+                .into_iter()
+                .filter(|name| images_at(interp, name).is_some())
+                .collect();
+            Ok(list_value(live))
         }
         "cget" => {
             if rest.len() != 3 {
                 return Err(wrong("image cget", "name -option", rest.len() + 2));
             }
-            let value = with_state(interp, |rt| {
-                rt.text_images
-                    .get(path)
-                    .and_then(|images| images.get(rest[1].as_str()))
-                    .and_then(|(_, options)| options.get(rest[2].as_str()))
-                    .cloned()
-            })
-            .flatten()
-            .unwrap_or_default();
+            let value = images_at(interp, rest[1].as_str())
+                .and_then(|(_, options)| options.get(rest[2].as_str()).cloned())
+                .unwrap_or_default();
             Ok(Value::from_str(&value))
         }
         "configure" => {
@@ -11381,14 +11432,9 @@ fn text_image_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result
             }
             let name = rest[1].as_str().to_string();
             if rest.len() == 2 {
-                let pairs = with_state(interp, |rt| {
-                    rt.text_images
-                        .get(path)
-                        .and_then(|images| images.get(&name))
-                        .map(|(_, options)| options.clone())
-                })
-                .flatten()
-                .unwrap_or_default();
+                let pairs = images_at(interp, &name)
+                    .map(|(_, options)| options)
+                    .unwrap_or_default();
                 return Ok(list_value(
                     pairs
                         .iter()
@@ -11397,15 +11443,9 @@ fn text_image_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result
                 ));
             }
             if rest.len() == 3 {
-                let value = with_state(interp, |rt| {
-                    rt.text_images
-                        .get(path)
-                        .and_then(|images| images.get(&name))
-                        .and_then(|(_, options)| options.get(rest[2].as_str()))
-                        .cloned()
-                })
-                .flatten()
-                .unwrap_or_default();
+                let value = images_at(interp, &name)
+                    .and_then(|(_, options)| options.get(rest[2].as_str()).cloned())
+                    .unwrap_or_default();
                 return Ok(Value::from_str(&value));
             }
             for pair in rest[2..].chunks(2) {
@@ -11427,14 +11467,22 @@ fn text_image_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result
             Ok(Value::empty())
         }
         "delete" => {
-            with_state_mut(interp, |rt| {
-                if let Some(images) = rt.text_images.get_mut(path) {
-                    for name in &rest[1..] {
-                        images.remove(name.as_str());
+            for name in &rest[1..] {
+                let name = name.as_str();
+                if let Some((index, _)) = images_at(interp, name) {
+                    text_delete_range(interp, path, index, index + 1);
+                }
+                with_state_mut(interp, |rt| {
+                    if let Some(images) = rt.text_images.get_mut(path) {
+                        images.remove(name);
+                    }
+                    let mark = image_mark_name(name);
+                    if let Some(marks) = rt.text_marks.get_mut(path) {
+                        marks.remove(&mark);
                     }
                     rt.bump();
-                }
-            });
+                });
+            }
             Ok(Value::empty())
         }
         other => Err(generic(format!(
@@ -11508,9 +11556,11 @@ fn text_mark_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<
         "names" => {
             let mut names = vec!["insert".to_string(), "current".to_string()];
             for name in marks.keys() {
-                if name != "insert" && name != "current" {
-                    names.push(name.clone());
+                // Internal marks (embedded images) are not Tk marks.
+                if name.starts_with('\u{0}') || name == "insert" || name == "current" {
+                    continue;
                 }
+                names.push(name.clone());
             }
             Ok(list_value(names))
         }
@@ -12972,15 +13022,35 @@ mod tests {
         install(&mut i);
         eval(&mut i, "text .t; .t insert 1.0 hello");
         eval(&mut i, "image create photo pic -file /tmp/x.png");
+        // The embedded image occupies one character (U+FFFC) at 1.2.
         eval(&mut i, ".t image create 1.2 -image pic");
         assert_eq!(eval(&mut i, ".t image names"), "image1");
         assert_eq!(eval(&mut i, ".t image cget image1 -image"), "pic");
         eval(&mut i, ".t image configure image1 -align baseline");
         assert_eq!(eval(&mut i, ".t image cget image1 -align"), "baseline");
+        // Indices shift like Tk: the image is one character.
+        assert_eq!(eval(&mut i, ".t get 1.2"), "\u{fffc}");
+        assert_eq!(eval(&mut i, ".t get 1.3"), "l");
+        assert_eq!(eval(&mut i, ".t index end"), "2.0");
         assert_eq!(eval(&mut i, ".t dump -image 1.0 end"), "image image1 1.2");
-        eval(&mut i, ".t image delete image1");
+        assert!(
+            eval(&mut i, ".t dump -text 1.0 end").contains("\u{fffc}"),
+            "dump -text includes the placeholder character"
+        );
+        // Inserting before the image shifts it.
+        eval(&mut i, ".t insert 1.0 X");
+        assert_eq!(eval(&mut i, ".t dump -image 1.0 end"), "image image1 1.3");
+        // Deleting the placeholder deletes the image (Tk semantics).
+        eval(&mut i, ".t delete 1.3");
         assert_eq!(eval(&mut i, ".t image names"), "");
         assert_eq!(eval(&mut i, ".t dump -image 1.0 end"), "");
+        // `image delete` removes the placeholder character again.
+        eval(&mut i, ".t image create 1.0 -image pic");
+        eval(&mut i, ".t image delete image2");
+        assert_eq!(eval(&mut i, ".t get 1.0"), "X");
+        // Internal marks stay out of `mark names`.
+        eval(&mut i, ".t image create 1.0 -image pic");
+        assert_eq!(eval(&mut i, ".t mark names"), "insert current");
     }
 
     #[test]

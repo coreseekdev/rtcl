@@ -329,8 +329,11 @@ text 无滚动模型时为 no-op）；`text dlineinfo index` 按 18px 行高模�
 -window? index1 ?index2?` 按位置输出 Tk 风格事件流：`tagon/tagoff <tag>
 <index>`、`mark <name> <index>`、`text <chars> <index>`、`image <name>
 <index>`，text 在 tag 边界、mark 与行首处分段；`text image
-create/cget/configure/delete/names` 维护嵌入图片模型（dump 可见；行内
-绘制暂未接入，且不占内容字符位，与 Tk 的索引偏移语义在此处仍有差异）。
+create/cget/configure/delete/names` 按 Tk 模型实现：嵌入图片占一个
+U+FFFC 字符位（索引随编辑平移、删除占位符即删除图片、undo 可回滚、
+`get`/`dump -text` 可见该字符），位置由内部 mark 携带（不进 `mark
+names`）；dump -image 输出 `image <name> <index>`。行内绘制暂未接入
+（纯文本显示占位字形）。
 `tag bind tagName ?sequence? ?script?` 把事件绑定到 tag 区间：富文本编辑器
 按下时按指针下的文档位置映射成字符下标，命中区间的 tag 依次执行最具体的
 sequence（`<Button-1>`、Double/Triple/Quadruple、`<ButtonRelease-1>`、

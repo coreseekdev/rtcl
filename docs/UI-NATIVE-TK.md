@@ -137,6 +137,8 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
   `MouseEnter/MouseLeave/MouseMove` 事件（Button/Checkbox/Radio/Slider
   组件，nsh-core 补了 `MouseEvent` 的 JsValue）、
   `RichEditorEvent::Motion`（富文本内容区 hover/motion）、
+  `RichEditorEvent::Press`/`Hover`/`Release`（内容区按下的文档位置、hover
+  的文档位置、抬起，供 text `tag bind` 命中）、
   `nsh-platform-linux::clipboard_text_blocking`（GTK 异步读 + 嵌套主循环
   转同步，供 Tk `clipboard get`）。
 
@@ -264,6 +266,13 @@ tag 区间、mark 与富文档；`-autoseparators`（默认开）时 500ms 内�
 `-maxundo` 限制栈深（0 为不限，与 Tk 一致）；`edit reset` 同时清空历史。
 Tcl 侧 `tag add/remove` 这类纯格式命令不单独入栈，但会随下一次文本编辑的
 快照一起回滚。富编辑器内部的 Ctrl+Z 仍由编辑器自身的历史处理。
+`tag bind tagName ?sequence? ?script?` 把事件绑定到 tag 区间：富文本编辑器
+按下时按指针下的文档位置映射成字符下标，命中区间的 tag 依次执行最具体的
+sequence（`<Button-1>`、Double/Triple/Quadruple、`<ButtonRelease-1>`、
+`<Enter>`、`<Leave>`、`<Motion>`），`break` 停止后续 tag；键盘事件按
+`insert` 光标所在区间派发。`<Leave>` 覆盖 tag 之间的移动，指针直接移出
+编辑器外时暂不补发；`<ButtonRelease-1>` 与其他控件一致在按下派发后立即
+执行（后端没有独立的指针抬起钩子）。
 `text search ?-forward|-backward? ?-exact|-regexp? ?-nocase? ?-all?
 ?-count varName? pattern index ?stopIndex?` 支持环绕搜索与 regexp
 （Rust regex 语法；Tcl ARE 的 \m/\M 等未覆盖），`stopIndex` 只限制
@@ -351,7 +360,7 @@ rotation×10）；`event generate` 接受 `-x/-y/-rootx/-rooty/-key/-keysym/
 旋转/贝塞尔/箭头/虚线/图片/arc/polygon/锚点与 bbox/find 查询；
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
-`tag bind` 暂为 no-op；`tk_messageBox` 未实现；`clipboard
+`tk_messageBox` 未实现；`clipboard
 clear/append/get` 维护应用自己的文本并同步到系统剪贴板；应用未拥有剪贴板
 时 `get` 通过后端的同步 getter 读取系统剪贴板（Linux：GTK 异步读包在嵌套
 主循环里，1s 超时；其它平台未接 getter 时返回空）；`selection

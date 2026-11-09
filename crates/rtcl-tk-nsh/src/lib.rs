@@ -23,7 +23,10 @@ use nsh_base::rich_editor::{
     extensions::starter,
     model::Schema,
     state::{EditorState, EditorStateConfig, KeyEvent, Plugin, PluginKey, PluginSpec, Transaction},
-    view::{rich_editor, EditorSession, NodeViews, PartStyles, RichEditorStyles},
+    view::{
+        rich_editor, EditorSession, NodeViews, PartStyles, RichEditorHover, RichEditorPress,
+        RichEditorSelection, RichEditorStyles,
+    },
 };
 use nsh_base::SliderValue;
 use nsh_core::canvas::{CanvasTextAlign, CanvasTextBaseline};
@@ -828,6 +831,9 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
     let change_session = session.clone();
     let wheel_path = path.to_string();
     let motion_path = path.to_string();
+    let press_path = path.to_string();
+    let selection_path = path.to_string();
+    let hover_path = path.to_string();
     let height = option(tree, path, "-height")
         .parse::<f32>()
         .unwrap_or(10.0)
@@ -876,6 +882,21 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                         tk_button(e.pressed_button),
                         tk_state(&e.modifiers),
                     );
+                })
+                .on_press(move |p: &RichEditorPress| {
+                    rtcl_tk_runtime::text_tag_press(
+                        &press_path,
+                        p.pos as usize,
+                        p.x,
+                        p.y,
+                        p.clicks,
+                    );
+                })
+                .on_selection_change(move |s: &RichEditorSelection| {
+                    rtcl_tk_runtime::text_selection_changed(&selection_path, s.head as usize);
+                })
+                .on_hover(move |h: &RichEditorHover| {
+                    rtcl_tk_runtime::text_tag_hover(&hover_path, h.pos as usize, h.x, h.y);
                 }),
         )
         .into_element()

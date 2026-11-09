@@ -445,6 +445,50 @@ fn RichUndoApp() -> impl IntoElement {
     rtcl_tk_nsh::tk_view()
 }
 
+const TAG_BIND_APP: &str = r##"
+set ::hit 0
+set ::enter 0
+set ::release 0
+text .t -height 3
+.t insert end "hi"
+.t tag configure hot -foreground "#ef4444"
+.t tag add hot 1.0 1.2
+.t tag bind hot <Button-1> {set ::hit clicked}
+.t tag bind hot <Enter> {set ::enter entered}
+.t tag bind hot <ButtonRelease-1> {set ::release released}
+pack .t
+label .out -textvariable ::hit
+pack .out
+label .en -textvariable ::enter
+pack .en
+label .rel -textvariable ::release
+pack .rel
+"##;
+
+#[component]
+fn TagBindApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(TAG_BIND_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn rich_text_tag_bindings_fire_on_press() {
+    let mut config = EngineConfig::new(Root::of::<TagBindApp>());
+    config.environment.os = nsh_core::platform::Os::Linux;
+    let mut app = Headless::start(config).expect("headless engine starts");
+    app.set_viewport(Size::new(Points(500.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("hi").expect("rich editor renders");
+    app.press("hi").expect("press the tagged text");
+    app.wait_for("clicked")
+        .expect("the tag's <Button-1> binding fired");
+    app.wait_for("released")
+        .expect("the tag's <ButtonRelease-1> binding fired");
+    app.hover("hi").expect("hover the tagged text");
+    app.wait_for("entered")
+        .expect("the tag's <Enter> binding fired");
+}
+
 #[test]
 fn rich_edits_enter_the_text_undo_stack() {
     let mut config = EngineConfig::new(Root::of::<RichUndoApp>());

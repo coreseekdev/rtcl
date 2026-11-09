@@ -137,6 +137,8 @@ pub struct PhotoImage {
 pub struct TextTag {
     pub options: BTreeMap<String, String>,
     pub ranges: Vec<(usize, usize)>,
+    /// `tag bind` scripts, by event sequence.
+    pub bindings: BTreeMap<String, String>,
 }
 
 /// Which side of inserted text a `text` mark sticks to.
@@ -5676,8 +5678,235 @@ pub fn text_key_event(
     }
     ctx.state = state.to_string();
     let stopped = run_binding(path, "<KeyPress>", &ctx);
+    if !stopped {
+        let index = active_interp()
+            .and_then(|ptr| {
+                with_state(unsafe { &*ptr }, |rt| {
+                    rt.tree.get(path).map(|node| node.cursor)
+                })
+            })
+            .flatten();
+        if let (Some(ptr), Some(index)) = (active_interp(), index) {
+            let interp = unsafe { &mut *ptr };
+            let tag_stopped = run_text_tag_sequence(interp, path, index, "<KeyPress>", &ctx);
+            if !tag_stopped {
+                run_text_tag_sequence(interp, path, index, "<KeyRelease>", &ctx);
+            }
+        }
+    }
     run_binding(path, "<KeyRelease>", &ctx);
     stopped
+}
+
+/// Run the tag bindings for `sequence` at `index` (Tk's text class binding:
+/// one script per tag, most specific sequence).
+fn run_text_tag_sequence(
+    interp: &mut Interp,
+    path: &str,
+    index: usize,
+    sequence: &str,
+    ctx: &EventCtx,
+) -> bool {
+    let event = event_from(sequence, ctx);
+    let scripts = with_state(interp, |rt| {
+        rt.text_tags
+            .get(path)
+            .map(|tags| {
+                tags.iter()
+                    .filter(|(_, tag)| {
+                        tag.ranges
+                            .iter()
+                            .any(|(start, end)| index >= *start && index < *end)
+                    })
+                    .filter_map(|(_, tag)| best_script(&tag.bindings, &event))
+                    .filter(|script| !script.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    })
+    .unwrap_or_default();
+    let mut stopped = false;
+    let mut ran = false;
+    for script in scripts {
+        ran = true;
+        let script = substitute_bindings(&script, ctx);
+        match interp.eval(&script) {
+            Ok(_) => {}
+            Err(e) if binding_stopped(&e) => {
+                stopped = true;
+                break;
+            }
+            Err(e) => record_error(e.to_string()),
+        }
+    }
+    if ran {
+        bump_active();
+    }
+    stopped
+}
+
+/// Run one tag's binding for `sequence` (crossing events target the tag
+/// entered or left, not every tag at the position).
+fn run_text_tag_named(
+    interp: &mut Interp,
+    path: &str,
+    name: &str,
+    sequence: &str,
+    ctx: &EventCtx,
+) -> bool {
+    let event = event_from(sequence, ctx);
+    let script = with_state(interp, |rt| {
+        rt.text_tags
+            .get(path)
+            .and_then(|tags| tags.get(name))
+            .and_then(|tag| best_script(&tag.bindings, &event))
+            .filter(|script| !script.is_empty())
+    })
+    .flatten();
+    let Some(script) = script else { return false };
+    let script = substitute_bindings(&script, ctx);
+    match interp.eval(&script) {
+        Ok(_) => {
+            bump_active();
+            false
+        }
+        Err(e) if binding_stopped(&e) => {
+            bump_active();
+            true
+        }
+        Err(e) => {
+            record_error(e.to_string());
+            bump_active();
+            false
+        }
+    }
+}
+
+thread_local! {
+    /// Tags the pointer is over in each text widget (`<Enter>/<Leave>`).
+    static TEXT_HOVER_TAGS: RefCell<BTreeMap<String, std::collections::BTreeSet<String>>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+/// The pointer moved over a rich text editor: fire `<Leave>` for the tags
+/// left, `<Enter>` for the tags entered, then `<Motion>` for the tag under
+/// the pointer (Tk's text tag crossing semantics).
+pub fn text_tag_hover(path: &str, doc_pos: usize, x: f64, y: f64) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    let length = with_state(interp, |rt| {
+        rt.tree.get(path).map(|node| node.content.chars().count())
+    })
+    .flatten()
+    .unwrap_or(0);
+    let index = with_state(interp, |rt| {
+        rt.rich_docs
+            .get(path)
+            .and_then(|json| doc_pos_to_text_offset(json, doc_pos))
+    })
+    .flatten()
+    .unwrap_or(doc_pos)
+    .min(length);
+    let current = with_state(interp, |rt| {
+        rt.text_tags
+            .get(path)
+            .map(|tags| {
+                tags.iter()
+                    .filter(|(_, tag)| {
+                        tag.ranges
+                            .iter()
+                            .any(|(start, end)| index >= *start && index < *end)
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .unwrap_or_default()
+    })
+    .unwrap_or_default();
+    let previous = TEXT_HOVER_TAGS.with(|map| {
+        map.borrow_mut()
+            .insert(path.to_string(), current.clone())
+            .unwrap_or_default()
+    });
+    let mut ctx = EventCtx::for_path(path);
+    ctx.x = x as i64;
+    ctx.y = y as i64;
+    for name in previous.difference(&current) {
+        run_text_tag_named(interp, path, name, "<Leave>", &ctx);
+    }
+    for name in current.difference(&previous) {
+        run_text_tag_named(interp, path, name, "<Enter>", &ctx);
+    }
+    run_text_tag_sequence(interp, path, index, "<Motion>", &ctx);
+}
+
+/// A press over a rich text editor: run the tag bindings at the character
+/// under the pointer.  `doc_pos` is ProseMirror's document position.
+pub fn text_tag_press(path: &str, doc_pos: usize, x: f64, y: f64, clicks: u32) {
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    let index = with_state(interp, |rt| {
+        rt.rich_docs
+            .get(path)
+            .and_then(|json| doc_pos_to_text_offset(json, doc_pos))
+    })
+    .flatten()
+    .unwrap_or(doc_pos);
+    let cursor = with_state(interp, |rt| {
+        rt.tree.get(path).map(|node| node.content.chars().count())
+    })
+    .flatten()
+    .unwrap_or(0);
+    let index = index.min(cursor);
+    with_state_mut(interp, |rt| {
+        if let Some(node) = rt.tree.get_mut(path) {
+            node.cursor = index;
+        }
+    });
+    let mut ctx = EventCtx::for_path(path);
+    ctx.button = 1;
+    ctx.x = x as i64;
+    ctx.y = y as i64;
+    ctx.clicks = clicks;
+    let stopped = run_text_tag_sequence(interp, path, index, "<Button-1>", &ctx);
+    if !stopped {
+        match clicks {
+            2 => {
+                run_text_tag_sequence(interp, path, index, "<Double-Button-1>", &ctx);
+            }
+            3 => {
+                run_text_tag_sequence(interp, path, index, "<Triple-Button-1>", &ctx);
+            }
+            4 => {
+                run_text_tag_sequence(interp, path, index, "<Quadruple-Button-1>", &ctx);
+            }
+            _ => {}
+        }
+        // Tk sends the release after the press; the plain-widget press path
+        // dispatches it the same way (the backend has no pointer-up hook for
+        // tag ranges).
+        run_text_tag_sequence(interp, path, index, "<ButtonRelease-1>", &ctx);
+    }
+}
+
+/// The editor's caret moved: mirror it in the text widget's `insert` index
+/// without a render (the editor owns the caret).
+pub fn text_selection_changed(path: &str, doc_pos: usize) {
+    let Some(ptr) = active_interp() else { return };
+    with_state_mut(unsafe { &mut *ptr }, |rt| {
+        let Some(length) = rt.tree.get(path).map(|node| node.content.chars().count()) else {
+            return;
+        };
+        let index = rt
+            .rich_docs
+            .get(path)
+            .and_then(|json| doc_pos_to_text_offset(json, doc_pos))
+            .unwrap_or(doc_pos)
+            .min(length);
+        if let Some(node) = rt.tree.get_mut(path) {
+            node.cursor = index;
+        }
+    });
 }
 
 /// An input took the focus from the platform: make it the Tk focus (and
@@ -7978,6 +8207,41 @@ fn doc_runs(value: &serde_json::Value) -> Option<(String, Vec<DocRun>)> {
     Some((text, runs))
 }
 
+/// Map a ProseMirror document position to the plain-text char offset used
+/// by text indices and tag ranges (blocks joined by newlines).
+fn doc_pos_to_text_offset(json: &str, position: usize) -> Option<usize> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let blocks = value.get("content")?.as_array()?;
+    let mut doc_pos = 0usize;
+    let mut text_offset = 0usize;
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 {
+            text_offset += 1;
+        }
+        doc_pos += 1;
+        let Some(nodes) = block.get("content").and_then(|v| v.as_array()) else {
+            doc_pos += 1;
+            continue;
+        };
+        for node in nodes {
+            if node.get("type").and_then(|v| v.as_str()) != Some("text") {
+                continue;
+            }
+            let content = node.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let length = content.chars().count();
+            let end = doc_pos + length;
+            if position <= end {
+                let offset = position.saturating_sub(doc_pos).min(length);
+                return Some(text_offset + offset);
+            }
+            doc_pos = end;
+            text_offset += length;
+        }
+        doc_pos += 1;
+    }
+    Some(text_offset)
+}
+
 fn merged_doc_json(json: &str, new_content: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let (old_text, mut runs) = doc_runs(&value)?;
@@ -8456,6 +8720,56 @@ fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<V
                 })
                 .unwrap_or_default();
             Ok(list_value(out))
+        }
+        "bind" => {
+            if rest.len() < 2 || rest.len() > 4 {
+                return Err(wrong(
+                    "tag bind",
+                    "tagName ?sequence? ?script?",
+                    rest.len() + 2,
+                ));
+            }
+            let name = rest[1].as_str().to_string();
+            if rest.len() == 2 {
+                let sequences = with_state(interp, |rt| {
+                    rt.text_tags
+                        .get(path)
+                        .and_then(|tags| tags.get(&name))
+                        .map(|tag| tag.bindings.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+                return Ok(list_value(sequences));
+            }
+            let sequence = rest[2].as_str().to_string();
+            if rest.len() == 3 {
+                let script = with_state(interp, |rt| {
+                    rt.text_tags
+                        .get(path)
+                        .and_then(|tags| tags.get(&name))
+                        .and_then(|tag| tag.bindings.get(&sequence))
+                        .cloned()
+                })
+                .flatten()
+                .unwrap_or_default();
+                return Ok(Value::from_str(&script));
+            }
+            let script = rest[3].as_str().to_string();
+            with_state_mut(interp, |rt| {
+                let tag = rt
+                    .text_tags
+                    .entry(path.to_string())
+                    .or_default()
+                    .entry(name.clone())
+                    .or_default();
+                if script.is_empty() {
+                    tag.bindings.remove(&sequence);
+                } else {
+                    tag.bindings.insert(sequence.clone(), script.clone());
+                }
+                rt.bump();
+            });
+            Ok(Value::empty())
         }
         "delete" => {
             with_state_mut(interp, |rt| {
@@ -10252,6 +10566,54 @@ mod tests {
             "selection handle -selection CLIPBOARD -type STRING . {}",
         );
         assert_eq!(eval(&mut i, "selection get -selection CLIPBOARD"), "sys");
+    }
+
+    #[test]
+    fn text_tag_bind_and_doc_position_mapping() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "text .b; .b insert 1.0 \"hello world\"; .b tag add link 1.0 1.5;             .b tag bind link <Button-1> {set ::hit [%W get 1.0 1.5]};             .b tag bind link <Double-Button-1> {set ::double 1};             .b tag bind link <ButtonRelease-1> {set ::release 1};             .b tag bind link <Enter> {set ::enter 1};             .b tag bind link <Leave> {set ::leave 1};             .b tag bind link <Motion> {set ::motion \"%x,%y\"}",
+        );
+        assert_eq!(
+            eval(&mut i, ".b tag bind link"),
+            "<Button-1> <ButtonRelease-1> <Double-Button-1> <Enter> <Leave> <Motion>"
+        );
+        assert_eq!(
+            eval(&mut i, ".b tag bind link <Button-1>"),
+            "set ::hit [%W get 1.0 1.5]"
+        );
+        // Inside a tagged range the tag bindings run; outside they do not.
+        text_tag_press(".b", 2, 10.0, 5.0, 1);
+        assert_eq!(eval(&mut i, "set ::hit"), "hello");
+        assert_eq!(eval(&mut i, "set ::release"), "1");
+        eval(&mut i, "set ::hit none; set ::double 0");
+        text_tag_press(".b", 8, 80.0, 5.0, 1);
+        assert_eq!(eval(&mut i, "set ::hit"), "none");
+        assert_eq!(eval(&mut i, "set ::double"), "0");
+        // The second click of a chain also fires <Double-Button-1>.
+        text_tag_press(".b", 2, 10.0, 5.0, 2);
+        assert_eq!(eval(&mut i, "set ::double"), "1");
+        eval(&mut i, ".b tag bind link <Button-1> {}");
+        assert_eq!(eval(&mut i, ".b tag bind link <Button-1>"), "");
+
+        // Crossing and motion bindings use the same tag ranges.
+        eval(&mut i, "set ::leave 0");
+        text_tag_hover(".b", 2, 12.0, 7.0);
+        assert_eq!(eval(&mut i, "set ::enter"), "1");
+        assert_eq!(eval(&mut i, "set ::motion"), "12,7");
+        assert_eq!(eval(&mut i, "set ::leave"), "0");
+        text_tag_hover(".b", 8, 80.0, 7.0);
+        assert_eq!(eval(&mut i, "set ::leave"), "1");
+
+        // ProseMirror positions map onto the mirrored plain text.
+        let doc = r#"{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"hi"}]},{"type":"paragraph","content":[{"type":"text","text":"there"}]}]}"#;
+        assert_eq!(doc_pos_to_text_offset(doc, 1), Some(0));
+        assert_eq!(doc_pos_to_text_offset(doc, 2), Some(1));
+        assert_eq!(doc_pos_to_text_offset(doc, 3), Some(2));
+        assert_eq!(doc_pos_to_text_offset(doc, 5), Some(3));
+        assert_eq!(doc_pos_to_text_offset(doc, 6), Some(4));
     }
 
     #[test]

@@ -282,7 +282,8 @@ disabled/readonly 与 `-show` 密码已由原生输入呈现。
 行、canvas 项/画布，以及 label/frame/labelframe/message/progressbar/
 separator/chart 的空白区域、notebook 标签、combobox 箭头、treeview 表头；
 `break`（tkinter 的 `return "break"`）会终止后续 bindtags；`focus`
-切换派发 `<FocusOut>/<FocusIn>`。
+切换派发 `<FocusOut>/<FocusIn>`；菜单窗口（`.menu`）也可 `bind`，点击/
+`.m invoke` 时派发。
 `bind all`、类名/`bind .` 均可用。按钮默认类绑定 `<Key-space>` invoke
 （check/radio 另有 `<Key-Return>`），可由 `bind` 覆盖；listbox/treeview
 点击获得焦点，方向键/Home/End/Prior/Next 移动选择。指针/触摸事件：

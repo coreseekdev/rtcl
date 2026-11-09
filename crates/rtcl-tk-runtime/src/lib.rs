@@ -2810,7 +2810,8 @@ fn bind_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let is_widget = target != "."
         && target != "all"
         && with_state(interp, |rt| rt.tree.contains(target)).unwrap_or(false);
-    if !is_widget && target != "all" && target.starts_with('.') && target != "." {
+    let is_menu = with_state(interp, |rt| rt.menus.contains_key(target)).unwrap_or(false);
+    if !is_widget && !is_menu && target != "all" && target.starts_with('.') && target != "." {
         return Err(bad_window(target));
     }
     if args.len() == 2 {
@@ -4510,6 +4511,7 @@ pub fn toggle_menu(path: &str) {
 /// Run a menu entry from the renderer and close the dropdown.
 pub fn press_menu_item(menu_path: &str, index: usize) {
     let Some(ptr) = active_interp() else { return };
+    widget_press(menu_path, 0.0, 0.0, 1);
     let interp = unsafe { &mut *ptr };
     if let Err(e) = invoke_menu_item(interp, menu_path, index) {
         record_error(e.to_string());
@@ -4541,7 +4543,11 @@ fn event_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let path = args[2].as_str().to_string();
-            if !with_state(interp, |rt| rt.tree.contains(&path)).unwrap_or(false) {
+            let known = with_state(interp, |rt| {
+                rt.tree.contains(&path) || rt.menus.contains_key(&path)
+            })
+            .unwrap_or(false);
+            if !known {
                 return Err(bad_window(&path));
             }
             let mut ctx = EventCtx::for_path(&path);
@@ -9572,6 +9578,23 @@ mod tests {
         );
         assert_eq!(eval(&mut i, "set ::log"), "b1");
         assert_eq!(eval(&mut i, "event info"), "");
+    }
+
+    #[test]
+    fn menu_windows_accept_bindings() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "menu .m -tearoff 0; .m add command -label A -command {set ::n 1};
+             set ::hit 0; set ::n 0; bind .m <Button-1> {incr ::hit}",
+        );
+        assert_eq!(eval(&mut i, "bind .m"), "<Button-1>");
+        eval(&mut i, "event generate .m <Button-1>");
+        assert_eq!(eval(&mut i, "set ::hit"), "1");
+        press_menu_item(".m", 0);
+        assert_eq!(eval(&mut i, "set ::hit"), "2");
+        assert_eq!(eval(&mut i, "set ::n"), "1");
     }
 
     #[test]

@@ -398,7 +398,12 @@ rotation×10）；`event generate` 接受 `-x/-y/-rootx/-rooty/-key/-keysym/
 16 ms interval 泵入，错误进 `take_errors()`。
 
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停
-绘制，长等待请用 `after` 回调）；未实现多 toplevel 窗口；Canvas 已支持
+绘制，长等待请用 `after` 回调）；**多 toplevel**：nsh 只提供一个平台窗口，
+因此二级 `toplevel` 以主窗口内的浮层卡片呈现（标题栏+关闭按钮、
+`wm title/-geometry/-width/-height`、`withdraw/iconify/deiconify`、
+关闭按钮走 `WM_DELETE_WINDOW` 协议否则 destroy；浮层可叠加，默认级联
+定位）；它们不是独立 OS 窗口，不能单独最小化/移动（标题栏拖动未实现），
+`wm overrideredirect/transient/group` 仅保存不生效；Canvas 已支持
 旋转/贝塞尔/箭头/虚线/图片/arc/polygon/锚点与 bbox/find 查询；
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；

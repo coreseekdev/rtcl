@@ -244,6 +244,18 @@ pub struct PanedPane {
     pub options: BTreeMap<String, String>,
 }
 
+/// A secondary `toplevel` window for the renderer.
+#[derive(Debug, Clone, Default)]
+pub struct ToplevelView {
+    pub path: String,
+    pub title: String,
+    pub width: f64,
+    pub height: f64,
+    /// `None` when `wm geometry` gave no position (the renderer cascades).
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+}
+
 /// A Tk `menu` window.
 #[derive(Debug, Clone, Default)]
 pub struct Menu {
@@ -8100,6 +8112,96 @@ pub fn window_close_command() -> Option<String> {
     })
     .flatten()
     .filter(|s| !s.is_empty())
+}
+
+/// Parse Tk's `WxH+X+Y` geometry (any part optional).
+fn parse_window_geometry(value: &str) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+    let value = value.trim().trim_start_matches('=');
+    let (size, place) = match value.find(['+', '-']) {
+        Some(index) => (&value[..index], &value[index..]),
+        None => (value, ""),
+    };
+    let mut width = None;
+    let mut height = None;
+    if let Some((w, h)) = size.split_once('x') {
+        width = w.trim().parse::<f64>().ok().filter(|value| *value > 0.0);
+        height = h.trim().parse::<f64>().ok().filter(|value| *value > 0.0);
+    }
+    let mut positions = place
+        .split(['+', '-'])
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<f64>().ok());
+    let x = positions.next().map(|value| value.max(8.0));
+    let y = positions.next().map(|value| value.max(8.0));
+    (width, height, x, y)
+}
+
+/// The mapped secondary toplevels, for the renderer's window overlays.
+pub fn toplevel_windows() -> Vec<ToplevelView> {
+    let Some(ptr) = active_interp() else {
+        return Vec::new();
+    };
+    let interp = unsafe { &*ptr };
+    let paths = with_state(interp, |rt| {
+        rt.tree
+            .descendants(".")
+            .into_iter()
+            .filter(|path| {
+                rt.tree
+                    .get(path)
+                    .is_some_and(|node| node.kind == WidgetKind::Toplevel)
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    let mut windows = Vec::new();
+    for path in paths {
+        let state = effective_option(interp, &path, "-state");
+        if matches!(state.as_str(), "withdrawn" | "iconic") {
+            continue;
+        }
+        let geometry = effective_option(interp, &path, "-geometry");
+        let (mut width, mut height, x, y) = parse_window_geometry(&geometry);
+        if width.is_none() {
+            width = effective_option(interp, &path, "-width")
+                .parse::<f64>()
+                .ok()
+                .filter(|value| *value > 0.0);
+        }
+        if height.is_none() {
+            height = effective_option(interp, &path, "-height")
+                .parse::<f64>()
+                .ok()
+                .filter(|value| *value > 0.0);
+        }
+        let title = effective_option(interp, &path, "-title");
+        windows.push(ToplevelView {
+            path: path.clone(),
+            title: if title.is_empty() { path } else { title },
+            width: width.unwrap_or(320.0),
+            height: height.unwrap_or(240.0),
+            x,
+            y,
+        });
+    }
+    windows
+}
+
+/// The close button of a secondary toplevel: run its `WM_DELETE_WINDOW`
+/// protocol, else destroy it.
+pub fn close_window(path: &str) {
+    let script = active_interp().and_then(|ptr| {
+        with_state(unsafe { &*ptr }, |rt| {
+            rt.protocols
+                .get(&(path.to_string(), "WM_DELETE_WINDOW".to_string()))
+                .cloned()
+        })
+        .flatten()
+        .filter(|script| !script.is_empty())
+    });
+    let script =
+        script.unwrap_or_else(|| format!("destroy {}", list_value(vec![path.to_string()])));
+    let _ = eval_active(&script);
 }
 
 // ---------------------------------------------------------------------------

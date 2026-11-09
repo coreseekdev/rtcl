@@ -62,6 +62,12 @@ pack .qty -fill x -padx 12 -pady 4
 tk_optionMenu .sort ::sort Name Size Date
 pack .sort -padx 12 -pady 4 -anchor w
 
+toplevel .about
+wm title .about "Secondary window"
+wm geometry .about "190x110+350+140"
+label .about.text -text "This is a Toplevel window"
+pack .about.text -padx 12 -pady 12
+
 ttk::panedwindow .split -orient horizontal
 frame .split.left; frame .split.right
 label .split.left.t -text "Left pane"; pack .split.left.t

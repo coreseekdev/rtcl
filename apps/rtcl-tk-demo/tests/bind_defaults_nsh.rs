@@ -489,11 +489,65 @@ fn rich_text_tag_bindings_fire_on_press() {
         .expect("the tag's <Enter> binding fired");
 }
 
+const TOPLEVEL_APP: &str = r##"
+label .main -text "Main window"
+pack .main
+toplevel .d
+wm title .d "Dialog"
+wm geometry .d "240x120+60+80"
+label .d.msg -text "In dialog"
+pack .d.msg
+toplevel .e
+wm title .e "Second"
+wm withdraw .e
+label .e.msg -text "Gone"
+pack .e.msg
+button .hide -text hide -command {wm withdraw .d}
+button .show -text show -command {wm deiconify .e}
+pack .hide
+pack .show
+"##;
+
+#[component]
+fn ToplevelApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(TOPLEVEL_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn toplevel_windows_overlay_and_withdraw() {
+    use std::time::Duration;
+
+    let mut config = EngineConfig::new(Root::of::<ToplevelApp>());
+    config.environment.os = nsh_core::platform::Os::Linux;
+    let mut app = Headless::start(config).expect("headless engine starts");
+    app.set_viewport(Size::new(Points(700.0), Points(500.0)))
+        .expect("resize");
+    app.wait_for("Main window")
+        .expect("the main window renders");
+    app.wait_for("Dialog").expect("the toplevel title renders");
+    app.wait_for("In dialog")
+        .expect("the toplevel body renders");
+    assert!(
+        !app.screen().texts().iter().any(|text| *text == "Gone"),
+        "a withdrawn toplevel is not shown: {:?}",
+        app.screen().texts()
+    );
+    app.press("hide").expect("withdraw the dialog");
+    app.wait_for_gone("In dialog", Duration::from_secs(3))
+        .expect("the withdrawn toplevel disappears");
+    app.press("show").expect("deiconify the second toplevel");
+    app.wait_for("Gone").expect("the second toplevel appears");
+}
+
 const PANEDWINDOW_APP: &str = r##"
 ttk::panedwindow .p -orient horizontal -width 300 -height 120
 label .p.left -text "Left pane"
+label .p.mid -text "Hidden pane"
 label .p.right -text "Right pane"
-.p add .p.left .p.right
+.p add .p.left -weight 1
+.p add .p.mid -hide 1
+.p add .p.right -weight 2
 pack .p -fill both -expand 1
 "##;
 
@@ -512,6 +566,14 @@ fn panedwindow_renders_its_panes() {
         .expect("resize");
     app.wait_for("Left pane").expect("the first pane renders");
     app.wait_for("Right pane").expect("the second pane renders");
+    assert!(
+        !app.screen()
+            .texts()
+            .iter()
+            .any(|text| text.contains("Hidden pane")),
+        "a hidden pane takes no space: {:?}",
+        app.screen().texts()
+    );
 }
 
 const MENUBUTTON_APP: &str = r##"

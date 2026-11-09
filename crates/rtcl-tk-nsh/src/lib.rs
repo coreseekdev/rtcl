@@ -451,7 +451,13 @@ pub fn TkView() -> impl IntoElement {
                             column = column.child(render_menu_dropdown(&open));
                         }
                     }
-                    vec![column]
+                    let mut stack = view().relative().w_full().child(column);
+                    for (index, window) in
+                        rtcl_tk_runtime::toplevel_windows().into_iter().enumerate()
+                    {
+                        stack = stack.child(render_toplevel_window(&tree, &window, index));
+                    }
+                    vec![stack]
                 }
                 None => vec![view()
                     .flex_col()
@@ -1543,6 +1549,14 @@ fn render_children(tree: &TkTree, path: &str) -> AnyElement {
     let mut i = 0;
     while i < node.children.len() {
         let child = &node.children[i];
+        if tree
+            .get(child)
+            .is_some_and(|n| n.kind == WidgetKind::Toplevel)
+        {
+            // Toplevels are windows, not packed children.
+            i += 1;
+            continue;
+        }
         if tree.get(child).is_some_and(|n| n.place.is_some()) {
             placed.push(child);
             i += 1;
@@ -1558,6 +1572,10 @@ fn render_children(tree: &TkTree, path: &str) -> AnyElement {
             let mut rights = Vec::new();
             while i < node.children.len() {
                 let c = &node.children[i];
+                if tree.get(c).is_some_and(|n| n.kind == WidgetKind::Toplevel) {
+                    i += 1;
+                    continue;
+                }
                 let s = tree
                     .get(c)
                     .and_then(|n| n.pack.clone())
@@ -1880,7 +1898,25 @@ fn render_panedwindow(tree: &TkTree, path: &str) -> AnyElement {
             s.h(px(4.0)).bg(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
         }
     });
-    for pane in rtcl_tk_runtime::paned_panes(path).unwrap_or_default() {
+    let panes = rtcl_tk_runtime::paned_panes(path).unwrap_or_default();
+    let hidden = |pane: &rtcl_tk_runtime::PanedPane| {
+        pane.options
+            .get("-hide")
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+    };
+    let weight_of = |pane: &rtcl_tk_runtime::PanedPane| {
+        pane.options
+            .get("-weight")
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|weight| *weight > 0.0)
+            .unwrap_or(0.0)
+    };
+    let total_weight: f32 = panes
+        .iter()
+        .filter(|pane| !hidden(pane))
+        .map(&weight_of)
+        .sum();
+    for pane in panes.iter().filter(|pane| !hidden(pane)) {
         let mut panel = resizable_panel().min_size(px(1.0));
         if let Some(minsize) = pane
             .options
@@ -1890,13 +1926,27 @@ fn render_panedwindow(tree: &TkTree, path: &str) -> AnyElement {
         {
             panel = panel.min_size(px(minsize));
         }
-        if let Some(width) = pane
+        let requested = pane
             .options
             .get("-width")
             .and_then(|value| value.parse::<f32>().ok())
-            .filter(|size| *size > 0.0)
-        {
+            .filter(|size| *size > 0.0);
+        if let Some(width) = requested {
             panel = panel.size(Some(px(width)));
+        } else if total_weight > 0.0 {
+            let weight = weight_of(pane);
+            if weight > 0.0 {
+                // nsh panels share space equally; approximate ttk's
+                // `-weight` by an initial weighted share.
+                panel = panel.size(Some(px((weight / total_weight * 400.0).max(40.0))));
+            }
+        }
+        if pane
+            .options
+            .get("-stretch")
+            .is_some_and(|value| value == "never")
+        {
+            panel = panel.fixed(true);
         }
         panel = panel.child(render_node(tree, &pane.path));
         group = group.child(panel);
@@ -1945,6 +1995,74 @@ fn render_menubutton(tree: &TkTree, path: &str) -> AnyElement {
         }
     }
     menu.into_element()
+}
+
+/// A secondary `toplevel`: an in-window floating card with a title bar
+/// and close button (nsh renders one platform window, so Tk's extra
+/// windows live over the main one).
+fn render_toplevel_window(
+    tree: &TkTree,
+    window: &rtcl_tk_runtime::ToplevelView,
+    index: usize,
+) -> AnyElement {
+    let x = window.x.unwrap_or(40.0 + index as f64 * 26.0) as f32;
+    let y = window.y.unwrap_or(40.0 + index as f64 * 26.0) as f32;
+    let width = window.width as f32;
+    let height = window.height as f32;
+    let path = window.path.clone();
+    let close_path = window.path.clone();
+    view()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(width))
+        .h(px(height))
+        .flex_col()
+        .overflow_hidden()
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(AdaptiveColor::rgb(0x9ca3af, 0x6b7280))
+        .bg(AdaptiveColor::rgb(0xffffff, 0x111827))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .px(px(8.0))
+                .py(px(4.0))
+                .bg(AdaptiveColor::rgb(0xf3f4f6, 0x1f2937))
+                .border_b(px(1.0))
+                .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+                .child(
+                    text(window.title.clone())
+                        .text_size(px(13.0))
+                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+                )
+                .child(
+                    nsh_base::button()
+                        .px(px(6.0))
+                        .py(px(1.0))
+                        .rounded(px(3.0))
+                        .child(
+                            text("\u{2715}")
+                                .text_size(px(11.0))
+                                .text_color(AdaptiveColor::rgb(0x6b7280, 0x9ca3af)),
+                        )
+                        .on_press(move |_: &()| {
+                            rtcl_tk_runtime::close_window(&close_path);
+                        }),
+                ),
+        )
+        .child(
+            view()
+                .flex_col()
+                .flex_1()
+                .w_full()
+                .p(px(6.0))
+                .child(render_children(tree, &path)),
+        )
+        .into_element()
 }
 
 fn render_node(tree: &TkTree, path: &str) -> AnyElement {

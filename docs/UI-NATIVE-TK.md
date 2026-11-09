@@ -212,10 +212,11 @@ configure/cget/ranges/names/delete` 维护区间；有标签的 text 用 nsh
 WYSIWYG**：原生光标/选区/IME，标签映射为 color/backgroundColor/
 fontSize/fontFamily/bold 标记；编辑后的富文档（ProseMirror JSON）作为
 **数据**保存在 runtime：`text getdoc` 导出、`text setdoc` 导入 ProseMirror
-JSON，可跨应用重启持久化。正文写回 Tcl 模型、标签区间按增删平移。Tk
-tag 是 Tcl 侧的样式投影/入口：初始文档由 tags 构建，之后编辑器 marks
-以富文档为准；外部 tag 变化不会覆盖 marks，外部正文改写按文本差分平移
-marks（保留编辑器格式）。
+JSON，可跨应用重启持久化。正文写回 Tcl 模型、标签区间按增删平移。Tk tag 是 Tcl 侧的样式投影/入口：初始文档由 tags 构建；编辑器每次变更
+把 marks 投影回 tags——样式 tag 区间按文档重算，能匹配的已有 tag（如
+`hot`）复用，新样式生成 `@rich-…` tag，非样式 tag 保留。因此
+`tag ranges/names` 能看到编辑器新格式；外部 tag 变化不覆盖 marks，外部
+正文改写按差分平移 marks。
 
 **虚拟化/滚动**：listbox 与 treeview 只挂载可见行（按 `-height` 取窗口），
 `yview`/`-yscrollcommand` 与 Tk `scrollbar` 双向联动；列表/树表可滚动。
@@ -238,7 +239,7 @@ toplevel、all）、`event generate`；`%W/%x/%y/%K/%A` 替换；`after` 由
 **已知差异**：`vwait` 仍会阻塞引擎线程（Tcl 语义如此；原生 UI 会暂停
 绘制，长等待请用 `after` 回调）；未实现多 toplevel 窗口；Canvas 已支持旋转/贝塞尔/箭头/虚线/图片项；
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
-可跨重启）；外部正文改写按差分平移 marks；
+可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
 Windows/Linux 菜单栏仍是 app 内实现
 （macOS 用系统菜单；nsh GTK 的 set_application_menu 实测不显示）；
 scrollbar 已与 listbox/treeview 联动。

@@ -851,6 +851,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         rt.rich_docs.insert(path.to_string(), json.clone());
                         rt.bump();
                     });
+                    sync_text_tags_from_doc(path);
                     Ok(Value::empty())
                 }
                 "edit" => Ok(Value::empty()),
@@ -5578,9 +5579,138 @@ pub fn merge_rich_doc(path: &str, new_content: &str) -> Option<String> {
     let json = rich_doc(path)?;
     let merged = merged_doc_json(&json, new_content)?;
     set_rich_doc(path, merged.clone());
+    sync_text_tags_from_doc(path);
     Some(merged)
 }
 
+fn style_options_from_marks(marks: &[serde_json::Value]) -> BTreeMap<String, String> {
+    let mut options = BTreeMap::new();
+    let mut family = String::new();
+    let mut size = String::new();
+    let mut bold = false;
+    let mut italic = false;
+    for mark in marks {
+        let kind = mark.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if kind == "bold" {
+            bold = true;
+        } else if kind == "italic" {
+            italic = true;
+        } else if kind == "textStyle" {
+            let Some(attrs) = mark.get("attrs").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            if let Some(color) = attrs.get("color").and_then(|v| v.as_str()) {
+                if !color.is_empty() {
+                    options.insert("-foreground".to_string(), color.to_string());
+                }
+            }
+            if let Some(color) = attrs.get("backgroundColor").and_then(|v| v.as_str()) {
+                if !color.is_empty() {
+                    options.insert("-background".to_string(), color.to_string());
+                }
+            }
+            if let Some(value) = attrs.get("fontFamily").and_then(|v| v.as_str()) {
+                if !value.is_empty() {
+                    family = value.to_string();
+                }
+            }
+            if let Some(value) = attrs.get("fontSize").and_then(|v| v.as_str()) {
+                if let Some(points) = value.strip_suffix("px") {
+                    size = points.to_string();
+                }
+            }
+        }
+    }
+    if bold || italic || !family.is_empty() || !size.is_empty() {
+        let mut font = String::new();
+        if family.is_empty() {
+            font.push_str("TkDefaultFont");
+        } else if family.contains(' ') {
+            font.push('{');
+            font.push_str(&family);
+            font.push('}');
+        } else {
+            font.push_str(&family);
+        }
+        font.push(' ');
+        font.push_str(if size.is_empty() { "10" } else { &size });
+        if bold {
+            font.push_str(" bold");
+        }
+        if italic {
+            font.push_str(" italic");
+        }
+        options.insert("-font".to_string(), font);
+    }
+    options
+}
+
+fn style_signature(options: &BTreeMap<String, String>) -> String {
+    options
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("\u{1f}")
+}
+
+fn has_style_options(options: &BTreeMap<String, String>) -> bool {
+    options.contains_key("-foreground")
+        || options.contains_key("-background")
+        || options.contains_key("-font")
+}
+
+/// Project a rich document's marks into Tk tags, so `tag ranges/names`
+/// see what the editor changed: style tags are cleared and re-ranged from
+/// the document, matching user tags by style and creating `@rich-…` ones
+/// for new styles. Tags without style options keep their ranges.
+pub fn sync_text_tags_from_doc(path: &str) {
+    let Some(json) = rich_doc(path) else { return };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return;
+    };
+    let Some((_text, runs)) = doc_runs(&value) else {
+        return;
+    };
+    let Some(ptr) = active_interp() else { return };
+    let interp = unsafe { &mut *ptr };
+    let _ = with_state_mut(interp, |rt| {
+        if !rt.tree.contains(path) {
+            return;
+        }
+        let tags = rt.text_tags.entry(path.to_string()).or_default();
+        let existing = tags
+            .iter()
+            .filter(|(_, tag)| has_style_options(&tag.options))
+            .map(|(name, tag)| (style_signature(&tag.options), name.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for tag in tags.values_mut() {
+            if has_style_options(&tag.options) {
+                tag.ranges.clear();
+            }
+        }
+        for run in &runs {
+            let options = style_options_from_marks(&run.marks);
+            if options.is_empty() || run.start >= run.end {
+                continue;
+            }
+            let signature = style_signature(&options);
+            let name = if let Some(name) = existing.get(&signature) {
+                name.clone()
+            } else {
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                use std::hash::{Hash, Hasher};
+                signature.hash(&mut hash);
+                format!("@rich-{:016x}", hash.finish())
+            };
+            let tag = tags.entry(name).or_default();
+            if tag.options.is_empty() {
+                tag.options = options;
+            }
+            tag.ranges.push((run.start, run.end));
+        }
+        tags.retain(|name, tag| !name.starts_with("@rich-") || !tag.ranges.is_empty());
+    });
+}
 /// Store a text widget's rich document as data (not Tk tags).
 pub fn set_rich_doc(path: &str, json: String) {
     let Some(ptr) = active_interp() else { return };
@@ -6525,12 +6655,24 @@ mod tests {
         assert_eq!(eval(&mut i, ".t getdoc"), "");
         set_rich_doc(".t", "{\"type\":\"doc\"}".to_string());
         assert_eq!(eval(&mut i, ".t getdoc"), "{\"type\":\"doc\"}");
+        eval(&mut i, "text .r");
         let rich = r##"{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"hello world","marks":[{"type":"textStyle","attrs":{"color":"#ff0000","backgroundColor":"","fontSize":"","fontFamily":""}}]}]}]}"##;
-        eval(&mut i, &format!(".t setdoc {{{rich}}}"));
-        assert_eq!(eval(&mut i, ".t get 1.0 end"), "hello world");
-        let merged = merge_rich_doc(".t", "hello brave world").unwrap();
+        eval(&mut i, &format!(".r setdoc {{{rich}}}"));
+        assert_eq!(eval(&mut i, ".r get 1.0 end"), "hello world");
+        let merged = merge_rich_doc(".r", "hello brave world").unwrap();
         assert_eq!(rich_doc_text(&merged).as_deref(), Some("hello brave world"));
         assert!(merged.contains("#ff0000"));
+        // Marks project into Tk tags: an existing style tag is reused, and
+        // a new style gets an @rich- tag.
+        eval(&mut i, "text .p; .p tag configure red -foreground #ff0000");
+        eval(&mut i, &format!(".p setdoc {{{rich}}}"));
+        assert_eq!(eval(&mut i, ".p tag ranges red"), "1.0 1.11");
+        assert!(eval(&mut i, ".p tag names 1.2").contains("red"));
+        let blue = rich.replace("#ff0000", "#0000ff");
+        eval(&mut i, &format!(".p setdoc {{{blue}}}"));
+        let names = eval(&mut i, ".p tag names 1.2");
+        assert!(names.contains("@rich-"), "{names}");
+        assert_eq!(eval(&mut i, ".p tag ranges red"), "");
         assert_eq!(eval(&mut i, ".t tag names 1.2"), "strong");
         assert_eq!(eval(&mut i, ".t tag names 1.7"), "");
         assert_eq!(eval(&mut i, ".t tag cget strong -foreground"), "red");

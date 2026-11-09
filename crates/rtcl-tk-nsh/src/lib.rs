@@ -624,6 +624,7 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                         rtcl_tk_runtime::set_rich_doc(&change_path, json);
                     }
                     rtcl_tk_runtime::text_changed_editor(&change_path, &text);
+                    rtcl_tk_runtime::sync_text_tags_from_doc(&change_path);
                     let tags_now = rtcl_tk_runtime::text_tags(&change_path);
                     let signature = tags_signature(&tags_now);
                     WYSIWYG.with(|map| {

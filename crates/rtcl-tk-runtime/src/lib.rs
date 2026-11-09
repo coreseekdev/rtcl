@@ -2974,8 +2974,16 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::from_int(0))
         }
         "screen" => Ok(Value::from_str(".")),
-        "screenwidth" | "vrootwidth" => Ok(Value::from_int(1920)),
-        "screenheight" | "vrootheight" => Ok(Value::from_int(1080)),
+        "screenwidth" | "vrootwidth" => Ok(Value::from_int(
+            SCREEN_METRICS
+                .with(|cell| cell.get())
+                .map_or(1920, |f| f().0),
+        )),
+        "screenheight" | "vrootheight" => Ok(Value::from_int(
+            SCREEN_METRICS
+                .with(|cell| cell.get())
+                .map_or(1080, |f| f().1),
+        )),
         "screenmmwidth" | "vrootmmwidth" => Ok(Value::from_int(508)),
         "screenmmheight" | "vrootmmheight" => Ok(Value::from_int(286)),
         "fpixels" | "pixels" => {
@@ -5428,6 +5436,21 @@ thread_local! {
     /// clicks/menus while it waits).
     static NATIVE_PUMP: std::cell::Cell<Option<fn() -> bool>> =
         const { std::cell::Cell::new(None) };
+    /// The screen size in pixels (`winfo screenwidth/screenheight`).
+    static SCREEN_METRICS: std::cell::Cell<Option<fn() -> (i64, i64)>> =
+        const { std::cell::Cell::new(None) };
+    /// The platform bell (`bell`).
+    static BELL: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
+/// Give `winfo screenwidth/screenheight` the real screen size in pixels.
+pub fn set_screen_metrics(metrics: fn() -> (i64, i64)) {
+    SCREEN_METRICS.with(|cell| cell.set(Some(metrics)));
+}
+
+/// Give `bell` the platform bell (Linux: a display beep).
+pub fn set_bell(bell: fn()) {
+    BELL.with(|cell| cell.set(Some(bell)));
 }
 
 /// Give `vwait` a native event pump (Linux: a nested GTK main-context
@@ -11957,7 +11980,12 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "bindtags" => bindtags_impl(interp, args),
         "font" => font_impl(interp, args),
         "option" => option_impl(interp, args),
-        "bell" => Ok(Value::empty()),
+        "bell" => {
+            if let Some(bell) = BELL.with(|cell| cell.get()) {
+                bell();
+            }
+            Ok(Value::empty())
+        }
         "tk_focusNext" => tk_focus_impl(interp, args, true),
         "tk_focusPrev" => tk_focus_impl(interp, args, false),
         "menu" => menu_create(interp, args),
@@ -12684,6 +12712,25 @@ mod tests {
         eval(&mut i, "set ::c 0");
         text_key_event(".t", "c", false, false, false, false);
         assert_eq!(eval(&mut i, "set ::c"), "0");
+    }
+
+    #[test]
+    fn winfo_screen_and_bell_hooks() {
+        let mut i = Interp::new();
+        install(&mut i);
+        // Defaults without a backend.
+        assert_eq!(eval(&mut i, "winfo screenwidth"), "1920");
+        assert_eq!(eval(&mut i, "winfo screenheight"), "1080");
+        set_screen_metrics(|| (2560, 1440));
+        assert_eq!(eval(&mut i, "winfo screenwidth"), "2560");
+        assert_eq!(eval(&mut i, "winfo screenheight"), "1440");
+        assert_eq!(eval(&mut i, "winfo vrootwidth"), "2560");
+        // `bell` runs the backend hook and stays a no-op without one.
+        static BELLS: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+        set_bell(|| *BELLS.lock().unwrap() += 1);
+        eval(&mut i, "bell; bell");
+        assert_eq!(*BELLS.lock().unwrap(), 2);
+        set_bell(|| {});
     }
 
     #[test]

@@ -88,6 +88,37 @@ pub fn install_backend() {
     #[cfg(target_os = "linux")]
     if gtk4::is_initialized() {
         rtcl_tk_runtime::set_native_event_pump(pump_native_events);
+        rtcl_tk_runtime::set_screen_metrics(screen_metrics);
+        rtcl_tk_runtime::set_bell(ring_bell);
+    }
+}
+
+/// The primary monitor's size in pixels (`winfo screenwidth/height`).
+#[cfg(target_os = "linux")]
+fn screen_metrics() -> (i64, i64) {
+    use gtk4::prelude::*;
+    let Some(display) = gtk4::gdk::Display::default() else {
+        return (1920, 1080);
+    };
+    let monitor = display
+        .monitors()
+        .item(0)
+        .and_downcast::<gtk4::gdk::Monitor>();
+    monitor.map_or((1920, 1080), |monitor| {
+        let geometry = monitor.geometry();
+        (
+            i64::from(geometry.width()) * i64::from(monitor.scale_factor().max(1)),
+            i64::from(geometry.height()) * i64::from(monitor.scale_factor().max(1)),
+        )
+    })
+}
+
+/// `bell`: the display's system beep.
+#[cfg(target_os = "linux")]
+fn ring_bell() {
+    use gtk4::prelude::DisplayExt;
+    if let Some(display) = gtk4::gdk::Display::default() {
+        display.beep();
     }
 }
 

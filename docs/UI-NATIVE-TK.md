@@ -471,9 +471,13 @@ set_application_menu 实测不显示，故此项无法在不嵌入平台 widget 
 
 **平台扩展点**：原生对话框/剪贴板由宿主回调注入
 `set_message_box_handler/set_file_dialog_handler/set_color_dialog_handler/
-set_dialog_handler/set_clipboard_getter/set_clipboard_sink`；内置实现目前
+set_dialog_handler/set_clipboard_getter/set_clipboard_sink`；另有
+`set_native_event_pump`（vwait 嵌套泵）、`set_screen_metrics`
+（`winfo screenwidth/height`，Linux 读主显示器像素）、`set_bell`
+（显示蜂鸣）。内置实现目前
 只有 Linux GTK4（本仓库验证环境），macOS/Windows 宿主可自行注册平台原生
-实现，未注册时对话框回退默认按钮/空路径/初始色。IME 与基础 a11y 由 nsh
+实现，未注册时对话框回退默认按钮/空路径/初始色、screen 1920×1080、
+bell 静默。IME 与基础 a11y 由 nsh
 原生 input/RichEditor/按钮承担；自绘控件补了关键标签（spinbox
 Increment/Decrement、toplevel Close window），Canvas/Chart 仍是纯绘制、
 无逐项 a11y 语义。M4 移动端依赖 nsh 的 iOS/Android 工程模板与 SDK，本仓库

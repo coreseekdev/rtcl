@@ -166,7 +166,9 @@ M1a/M1b/M2 已完成：
 **控件**：`toplevel/frame/label/button/entry/checkbutton/radiobutton/
 scale/text/listbox/message/scrollbar` + `ttk::{separator,progressbar,
 notebook,combobox,treeview,labelframe,button,label,entry,frame,checkbutton,
-radiobutton,scale,text,listbox,scrollbar,message,canvas}` 别名；扩展
+radiobutton,scale,text,listbox,scrollbar,message,canvas}` 别名（ttk
+创建的控件带 Tk 的 T* 类名，如 `ttk::button` → `TButton`，因此
+`bindtags`/`bind TButton`/`winfo class` 与 tkinter 一致）；扩展
 `::rtcl::chart`（原生柱状图，`-values/-labels/-title/-width/-height`）。
 
 **命令**：`configure/cget/cget 前缀缩写/destroy/pack/grid/place/winfo/

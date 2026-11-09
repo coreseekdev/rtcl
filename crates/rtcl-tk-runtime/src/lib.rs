@@ -479,7 +479,12 @@ pub fn install(interp: &mut Interp) {
          bind Checkbutton <Key-space> {catch {%W invoke}}\n\
          bind Checkbutton <Key-Return> {catch {%W invoke}}\n\
          bind Radiobutton <Key-space> {catch {%W invoke}}\n\
-         bind Radiobutton <Key-Return> {catch {%W invoke}}",
+         bind Radiobutton <Key-Return> {catch {%W invoke}}\n\
+         bind TButton <Key-space> {catch {%W invoke}}\n\
+         bind TCheckbutton <Key-space> {catch {%W invoke}}\n\
+         bind TCheckbutton <Key-Return> {catch {%W invoke}}\n\
+         bind TRadiobutton <Key-space> {catch {%W invoke}}\n\
+         bind TRadiobutton <Key-Return> {catch {%W invoke}}",
     );
 }
 
@@ -611,6 +616,22 @@ fn effective_option(interp: &Interp, path: &str, name: &str) -> String {
 // Widget creation
 // ---------------------------------------------------------------------------
 
+/// Tk's ttk class for widgets whose classic kind has another class name.
+fn ttk_class(base: &str) -> Option<&'static str> {
+    Some(match base {
+        "button" => "TButton",
+        "checkbutton" => "TCheckbutton",
+        "radiobutton" => "TRadiobutton",
+        "entry" => "TEntry",
+        "frame" => "TFrame",
+        "label" => "TLabel",
+        "scale" => "TScale",
+        "scrollbar" => "TScrollbar",
+        "toplevel" => "Toplevel",
+        _ => return None,
+    })
+}
+
 fn create_widget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let cmd = args[0].as_str();
     let base = cmd
@@ -630,6 +651,13 @@ fn create_widget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let rt = s.entry(key(interp)).or_default();
         rt.tree.create_at(&path, kind).map_err(tk_error)?;
         rt.tree.configure(&path, options).map_err(tk_error)?;
+        if cmd.starts_with("ttk::") {
+            if let Some(class) = ttk_class(base) {
+                if let Some(node) = rt.tree.get_mut(&path) {
+                    node.class = Some(class.to_string());
+                }
+            }
+        }
         rt.bump();
         Ok::<(), Error>(())
     });
@@ -2446,12 +2474,12 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let class = with_state(interp, |rt| {
                 rt.tree
                     .get(path)
-                    .map(|n| n.kind.class_name())
-                    .or_else(|| rt.menus.contains_key(path).then_some("Menu"))
+                    .map(|n| n.widget_class().to_string())
+                    .or_else(|| rt.menus.contains_key(path).then_some("Menu".to_string()))
             })
             .flatten()
             .ok_or_else(|| bad_window(path))?;
-            Ok(Value::from_str(class))
+            Ok(Value::from_str(&class))
         }
         "parent" | "toplevel" | "pathname" | "name" => {
             if args.len() != 3 {
@@ -3202,7 +3230,7 @@ pub fn run_binding(path: &str, sequence: &str, ctx: &EventCtx) {
                         p = parent;
                         top = p.clone();
                     }
-                    (n.kind.class_name().to_string(), top)
+                    (n.widget_class().to_string(), top)
                 })
             })
             .flatten()
@@ -3396,7 +3424,7 @@ fn bindtags_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(wrong("bindtags", "window ?tagList?", args.len()));
     }
     let path = args[1].as_str().to_string();
-    let (kind, top) = with_state(interp, |rt| {
+    let (kind, node_class, top) = with_state(interp, |rt| {
         rt.tree.get(&path).map(|n| {
             let mut top = path.clone();
             let mut p = path.clone();
@@ -3404,7 +3432,7 @@ fn bindtags_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 p = parent;
                 top = p.clone();
             }
-            (n.kind, top)
+            (n.kind, n.widget_class().to_string(), top)
         })
     })
     .flatten()
@@ -3412,14 +3440,7 @@ fn bindtags_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() == 2 {
         let tags = with_state(interp, |rt| rt.bindtags.get(&path).cloned())
             .flatten()
-            .unwrap_or_else(|| {
-                vec![
-                    path.clone(),
-                    kind.class_name().to_string(),
-                    top.clone(),
-                    "all".to_string(),
-                ]
-            });
+            .unwrap_or_else(|| vec![path.clone(), node_class, top.clone(), "all".to_string()]);
         return Ok(list_value(tags));
     }
     // Tk takes one tag list: `bindtags .w {.w Button . all}`.
@@ -4722,10 +4743,12 @@ pub fn focused_control_key(key: &str) {
 /// Whether the widget's class has a user binding matching `event` (used to
 /// decide whether a native default scroll still applies).
 fn class_has_binding(interp: &Interp, path: &str, event: &EventPattern) -> bool {
-    let class = with_state(interp, |rt| rt.tree.get(path).map(|n| n.kind.class_name()))
-        .flatten()
-        .unwrap_or("Widget");
-    best_script(&tag_binding_map(interp, class), event).is_some()
+    let class = with_state(interp, |rt| {
+        rt.tree.get(path).map(|n| n.widget_class().to_string())
+    })
+    .flatten()
+    .unwrap_or_else(|| "Widget".to_string());
+    best_script(&tag_binding_map(interp, &class), event).is_some()
 }
 
 /// A wheel notch over a listbox/treeview (or any widget with a Tk binding):
@@ -5765,10 +5788,12 @@ pub fn focused_nav_key(key: &str) {
     // Tk's listbox/treeview class bindings move the selection; a user
     // binding on the same class sequence replaces that default.
     let event = event_from("<KeyPress>", &ctx);
-    let class = with_state(interp, |rt| rt.tree.get(&path).map(|n| n.kind.class_name()))
-        .flatten()
-        .unwrap_or("Widget");
-    let overridden = tag_binding_map(interp, class).iter().any(|(sequence, _)| {
+    let class = with_state(interp, |rt| {
+        rt.tree.get(&path).map(|n| n.widget_class().to_string())
+    })
+    .flatten()
+    .unwrap_or_else(|| "Widget".to_string());
+    let overridden = tag_binding_map(interp, &class).iter().any(|(sequence, _)| {
         let pattern = parse_sequence(sequence);
         pattern.detail.is_some() && pattern.matches(&event)
     });
@@ -8933,9 +8958,20 @@ mod tests {
     fn ttk_aliases_create_the_same_kinds() {
         let mut i = Interp::new();
         install(&mut i);
-        eval(&mut i, "ttk::button .b -text Go; ttk::label .l -text Hi");
-        assert_eq!(eval(&mut i, "winfo class .b"), "Button");
-        assert_eq!(eval(&mut i, "winfo class .l"), "Label");
+        eval(
+            &mut i,
+            "ttk::button .b -text Go; ttk::label .l -text Hi; button .c -text C",
+        );
+        // ttk widgets carry Tk's T* class names (bind_class("TButton")).
+        assert_eq!(eval(&mut i, "winfo class .b"), "TButton");
+        assert_eq!(eval(&mut i, "winfo class .l"), "TLabel");
+        assert_eq!(eval(&mut i, "winfo class .c"), "Button");
+        assert_eq!(eval(&mut i, "bindtags .b"), ".b TButton . all");
+        eval(
+            &mut i,
+            "set ::n 0; bind TButton <Button-1> {incr ::n}; event generate .b <Button-1>",
+        );
+        assert_eq!(eval(&mut i, "set ::n"), "1");
     }
 
     #[test]

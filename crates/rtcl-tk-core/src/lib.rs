@@ -241,9 +241,19 @@ pub struct WidgetNode {
     /// Selected character range of an Entry: `(from, to)`, empty when
     /// equal.
     pub selection: (usize, usize),
+    /// Tk class override (`TButton` for a `ttk::button`); `None` uses the
+    /// kind's classic class.
+    pub class: Option<String>,
 }
 
 impl WidgetNode {
+    /// The widget's Tk class (`TButton` for ttk widgets).
+    pub fn widget_class(&self) -> &str {
+        self.class
+            .as_deref()
+            .unwrap_or_else(|| self.kind.class_name())
+    }
+
     pub fn child(&self, path: &str) -> Option<&str> {
         self.children
             .iter()
@@ -318,6 +328,7 @@ impl TkTree {
                 checked: false,
                 cursor: 0,
                 selection: (0, 0),
+                class: None,
             },
         );
         Self { nodes, root }
@@ -408,6 +419,7 @@ impl TkTree {
                 checked: false,
                 cursor: 0,
                 selection: (0, 0),
+                class: None,
             },
         );
         Ok(path.to_string())

@@ -135,7 +135,8 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
   也同时派发监听者，nsh-testing 提供 headless `wheel()`）、
   `RichEditorEvent::Wheel`（富文本编辑器内容区）、
   `MouseEnter/MouseLeave/MouseMove` 事件（Button/Checkbox/Radio/Slider
-  组件，nsh-core 补了 `MouseEvent` 的 JsValue）。
+  组件，nsh-core 补了 `MouseEvent` 的 JsValue）、
+  `RichEditorEvent::Motion`（富文本内容区 hover/motion）。
 
 ## 6. 里程碑
 
@@ -346,8 +347,8 @@ text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
 未实现；`<Configure>` 尚未覆盖菜单窗口；`<<Copy>>/<<Cut>>/<<SelectAll>>`
 等虚拟事件没有默认映射（可用 `event add` 自行定义）；
 entry 选区拖动（`<B1-Motion>`）在桌面鼠标拖动时由平台 MouseMove 派发，
-headless 的 `drag` 是触摸模拟故不触发；菜单项与富文本 text 内容区的
-`<Motion>` 未派发；separator 等纯装饰控件未接 hover；
+headless 的 `drag` 是触摸模拟故不触发；菜单项/separator 等装饰控件的
+hover 未单独接（菜单面板本身有 `<Enter>/<Leave>`）；
 Windows/Linux 菜单栏仍是 app 内实现
 （macOS 用系统菜单；nsh GTK 的 set_application_menu 实测不显示）；
 scrollbar 已与 listbox/treeview 联动。

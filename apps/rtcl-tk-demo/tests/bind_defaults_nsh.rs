@@ -392,6 +392,7 @@ label .wo -textvariable ::wheel
 pack .wo
 bind .t <Key> {append ::report "key=%A"}
 bind .t <MouseWheel> {set ::wheel %D}
+bind .t <Motion> {append ::report M}
 "##;
 
 #[component]
@@ -402,8 +403,9 @@ fn RichKeyApp() -> impl IntoElement {
 
 #[test]
 fn rich_text_key_bindings_fire() {
-    let mut app = Headless::start(EngineConfig::new(Root::of::<RichKeyApp>()))
-        .expect("headless engine starts");
+    let mut config = EngineConfig::new(Root::of::<RichKeyApp>());
+    config.environment.os = nsh_core::platform::Os::Linux;
+    let mut app = Headless::start(config).expect("headless engine starts");
     app.set_viewport(Size::new(Points(500.0), Points(300.0)))
         .expect("resize");
     app.wait_for("hi").expect("rich editor renders");
@@ -421,6 +423,10 @@ fn rich_text_key_bindings_fire() {
         .expect("wheel over the rich editor");
     app.wait_for("-120")
         .expect("the text widget's <MouseWheel> binding fired");
+
+    app.hover("hxi").expect("hover the rich editor");
+    app.wait_for("key=xM")
+        .expect("the text widget's <Motion> binding fired");
 }
 
 const CONFIGURE_APP: &str = r#"

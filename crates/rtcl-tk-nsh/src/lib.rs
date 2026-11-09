@@ -823,6 +823,7 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
     let change_path = path.to_string();
     let change_session = session.clone();
     let wheel_path = path.to_string();
+    let motion_path = path.to_string();
     let height = option(tree, path, "-height")
         .parse::<f32>()
         .unwrap_or(10.0)
@@ -860,6 +861,15 @@ fn render_wysiwyg(tree: &TkTree, path: &str, tags: &[rtcl_tk_runtime::TextTagVie
                         -(delta.x.0 as f64),
                         -(delta.y.0 as f64),
                         0,
+                    );
+                })
+                .on_motion(move |e: &MouseEvent| {
+                    rtcl_tk_runtime::motion_event(
+                        &motion_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        tk_button(e.pressed_button),
+                        tk_state(&e.modifiers),
                     );
                 }),
         )

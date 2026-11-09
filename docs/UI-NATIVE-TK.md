@@ -191,13 +191,20 @@ message,canvas,sizegrip,panedwindow}` 别名（ttk
 **命令**：`configure/cget/cget 前缀缩写/destroy/pack/grid/place/winfo/
 wm/tk/bind/bindtags/event generate/focus/raise/lower/font/option/bell/
 tk_focusNext/tk_focusPrev/menu/clipboard/selection/tk_messageBox/
-tk_getOpenFile/tk_getSaveFile/tk_chooseDirectory/tk_chooseColor/tk_optionMenu/tk_dialog`；控件子命令含 `invoke/get/insert/delete/
+tk_getOpenFile/tk_getSaveFile/tk_chooseDirectory/tk_chooseColor/tk_optionMenu/tk_dialog/grab/ttk::style`；控件子命令含 `invoke/get/insert/delete/
 index/icursor/selection/size/curselection/step` 等；菜单子命令含
 `add/insert/delete/index/entrycget/entryconfigure/invoke/type/post/
 unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
 `ttk::combobox` 的 `get/set/current/values/post/unpost`；
 `ttk::treeview` 的 `insert/delete/item/selection/focus/children/parent/
 index/heading/column/exists`；listbox/treeview 按 `-height` 放进滚动视图（滚轮可滚）；Tcl 侧的 `after/update/vwait` 沿用 rtcl-vm。
+
+**ttk::style**：`configure/lookup/map/layout/element create|names/theme
+names|use|settings` 维护样式/主题数据库；`theme use` 无参数返回当前主题
+（默认 default）。ttk 控件的 `-background/-foreground/-font` 未显式设置时
+回退到其 ttk 类名（如 `TButton`）的 `configure` 值；`map` 的状态映射会保存
+但不参与状态求值。`grab set ?-global? window/release/current/status` 维护
+Tk 抓取模型（不强制平台指针抓取）。
 
 **menubutton**：`menubutton`/`ttk::menubutton`（类名 `Menubutton`/
 `TMenubutton`），`-text/-textvariable/-menu/-state/-direction/-indicatoron`；

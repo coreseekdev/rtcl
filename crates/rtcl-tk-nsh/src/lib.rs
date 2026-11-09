@@ -740,7 +740,10 @@ fn parse_color(value: &str) -> Option<AdaptiveColor> {
 
 fn option_color(tree: &TkTree, path: &str, name: &str) -> Option<AdaptiveColor> {
     let value = option(tree, path, name);
-    (!value.is_empty()).then(|| parse_color(value)).flatten()
+    if !value.is_empty() {
+        return parse_color(value);
+    }
+    rtcl_tk_runtime::ttk_style_value(path, name).and_then(|value| parse_color(&value))
 }
 
 fn arrow_head(
@@ -1348,11 +1351,14 @@ fn sized_image(file: String, name: &str) -> AnyElement {
 }
 
 fn font_of(tree: &TkTree, path: &str) -> (Option<SharedString>, f32, bool) {
-    let spec = option(tree, path, "-font");
+    let mut spec = option(tree, path, "-font").to_string();
+    if spec.is_empty() {
+        spec = rtcl_tk_runtime::ttk_style_value(path, "-font").unwrap_or_default();
+    }
     if spec.is_empty() {
         return (None, 14.0, false);
     }
-    match rtcl_tk_runtime::resolve_font(spec) {
+    match rtcl_tk_runtime::resolve_font(&spec) {
         Some((family, size, bold)) => (
             (!family.is_empty()).then(|| SharedString::from(family)),
             (size * 1.3333) as f32,

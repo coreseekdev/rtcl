@@ -57,6 +57,18 @@ pub struct TkRuntime {
     menus: BTreeMap<String, Menu>,
     /// Pane lists of each `panedwindow`.
     paned: BTreeMap<String, Vec<PanedPane>>,
+    /// `ttk::style configure` options, by style name.
+    ttk_styles: BTreeMap<String, BTreeMap<String, String>>,
+    /// `ttk::style layout` specifications, by style name.
+    ttk_layouts: BTreeMap<String, Vec<String>>,
+    /// `ttk::style map` state specs, by style and option.
+    ttk_maps: BTreeMap<String, BTreeMap<String, String>>,
+    /// `ttk::style element create` registrations.
+    ttk_elements: BTreeMap<String, Vec<String>>,
+    /// The current ttk theme.
+    ttk_theme: String,
+    /// The window holding the pointer grab and whether it is global.
+    grab: Option<(String, bool)>,
     /// The open cascade menu (`None` when no menu is dropped down).
     open_menu: Option<String>,
     /// Selected page index of each `ttk::notebook`.
@@ -536,6 +548,8 @@ pub fn install(interp: &mut Interp) {
         "tk_chooseColor",
         "tk_optionMenu",
         "tk_dialog",
+        "grab",
+        "ttk::style",
     ] {
         interp.register_command(name, global_command);
     }
@@ -4205,6 +4219,344 @@ fn option_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "readfile" => Ok(Value::empty()),
         other => Err(generic(format!("bad option \"{other}\""))),
+    }
+}
+
+/// A `ttk::style configure` value for a widget's ttk class, when the
+/// widget itself does not set the option (the renderer's style fallback).
+pub fn ttk_style_value(widget_path: &str, option: &str) -> Option<String> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| {
+        let class = rt.tree.get(widget_path)?.class.as_ref()?;
+        rt.ttk_styles.get(class)?.get(option).cloned()
+    })
+    .flatten()
+}
+
+fn ttk_style_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Err(wrong("ttk::style", "option ?arg ...?", args.len() + 1));
+    }
+    let sub = args[0].as_str();
+    match sub {
+        "configure" => {
+            if args.len() == 1 {
+                let names = with_state(_interp, |rt| {
+                    rt.ttk_styles.keys().cloned().collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+                return Ok(list_value(names));
+            }
+            let style = args[1].as_str().to_string();
+            if args.len() == 2 {
+                let options = with_state(_interp, |rt| {
+                    rt.ttk_styles.get(&style).cloned().unwrap_or_default()
+                })
+                .unwrap_or_default();
+                return Ok(list_value(
+                    options
+                        .iter()
+                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .collect::<Vec<_>>(),
+                ));
+            }
+            if args.len() == 3 {
+                let value = with_state(_interp, |rt| {
+                    rt.ttk_styles
+                        .get(&style)
+                        .and_then(|options| options.get(args[2].as_str()))
+                        .cloned()
+                })
+                .flatten()
+                .unwrap_or_default();
+                return Ok(Value::from_str(&value));
+            }
+            let pairs = parse_pairs(args, 2, "ttk::style configure")?;
+            with_state_mut(_interp, |rt| {
+                rt.ttk_styles
+                    .entry(style.clone())
+                    .or_default()
+                    .extend(pairs);
+                rt.bump();
+            });
+            Ok(Value::empty())
+        }
+        "lookup" => {
+            if args.len() < 3 {
+                return Err(wrong(
+                    "ttk::style lookup",
+                    "style -option ?default?",
+                    args.len() + 1,
+                ));
+            }
+            let style = args[1].as_str();
+            let option = args[2].as_str();
+            let value = with_state(_interp, |rt| {
+                rt.ttk_styles
+                    .get(style)
+                    .and_then(|options| options.get(option))
+                    .cloned()
+            })
+            .flatten();
+            Ok(Value::from_str(
+                value
+                    .or_else(|| args.get(3).map(|value| value.as_str().to_string()))
+                    .as_deref()
+                    .unwrap_or(""),
+            ))
+        }
+        "map" => {
+            if args.len() < 3 {
+                return Err(wrong(
+                    "ttk::style map",
+                    "style ?-option? ?value ...?",
+                    args.len() + 1,
+                ));
+            }
+            if args.len() >= 4 {
+                let style = args[1].as_str().to_string();
+                with_state_mut(_interp, |rt| {
+                    let maps = rt.ttk_maps.entry(style).or_default();
+                    for pair in args[2..].chunks(2) {
+                        if let Some(value) = pair.get(1) {
+                            maps.insert(pair[0].as_str().to_string(), value.as_str().to_string());
+                        }
+                    }
+                });
+                return Ok(Value::empty());
+            }
+            let style = args[1].as_str();
+            let value = with_state(_interp, |rt| {
+                rt.ttk_maps
+                    .get(style)
+                    .and_then(|maps| maps.get(args[2].as_str()))
+                    .cloned()
+            })
+            .flatten()
+            .unwrap_or_default();
+            Ok(Value::from_str(&value))
+        }
+        "layout" => {
+            if args.len() < 2 {
+                return Err(wrong(
+                    "ttk::style layout",
+                    "style ?layoutSpec?",
+                    args.len() + 1,
+                ));
+            }
+            let style = args[1].as_str().to_string();
+            if args.len() == 2 {
+                let layout = with_state(_interp, |rt| rt.ttk_layouts.get(&style).cloned())
+                    .flatten()
+                    .unwrap_or_default();
+                return Ok(list_value(layout));
+            }
+            let mut spec = Vec::new();
+            for value in &args[2..] {
+                if let Some(list) = value.as_list() {
+                    spec.extend(list.iter().map(|item| item.as_str().to_string()));
+                } else {
+                    spec.push(value.as_str().to_string());
+                }
+            }
+            let layout = if spec.iter().all(|word| !word.starts_with('-')) {
+                spec.into_iter()
+                    .flat_map(|name| [name, "-sticky".to_string(), "nswe".to_string()])
+                    .collect::<Vec<_>>()
+            } else {
+                spec
+            };
+            with_state_mut(_interp, |rt| {
+                rt.ttk_layouts.insert(style, layout);
+            });
+            Ok(Value::empty())
+        }
+        "element" => {
+            if args.len() < 2 {
+                return Err(wrong(
+                    "ttk::style element",
+                    "option ?arg ...?",
+                    args.len() + 1,
+                ));
+            }
+            match args[1].as_str() {
+                "create" => {
+                    if args.len() < 3 {
+                        return Err(wrong(
+                            "ttk::style element create",
+                            "name ?type? ?-option value ...?",
+                            args.len() + 1,
+                        ));
+                    }
+                    let name = args[2].as_str().to_string();
+                    let spec = args[3..]
+                        .iter()
+                        .map(|value| value.as_str().to_string())
+                        .collect::<Vec<_>>();
+                    with_state_mut(_interp, |rt| {
+                        rt.ttk_elements.insert(name, spec);
+                    });
+                    Ok(Value::empty())
+                }
+                "names" => {
+                    let pattern = args.get(2).map(|value| value.as_str());
+                    let names = with_state(_interp, |rt| {
+                        rt.ttk_elements
+                            .keys()
+                            .filter(|name| pattern.is_none_or(|pattern| glob_match(pattern, name)))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                    Ok(list_value(names))
+                }
+                other => Err(generic(format!(
+                    "bad option \"{other}\": must be create, names, or configure"
+                ))),
+            }
+        }
+        "theme" => {
+            if args.len() < 2 {
+                return Err(wrong(
+                    "ttk::style theme",
+                    "option ?arg ...?",
+                    args.len() + 1,
+                ));
+            }
+            match args[1].as_str() {
+                "names" => Ok(list_value(["default".to_string()])),
+                "current" => {
+                    let theme = with_state(_interp, |rt| rt.ttk_theme.clone()).unwrap_or_default();
+                    Ok(Value::from_str(if theme.is_empty() {
+                        "default"
+                    } else {
+                        &theme
+                    }))
+                }
+                "use" if args.len() == 2 => {
+                    let theme = with_state(_interp, |rt| rt.ttk_theme.clone()).unwrap_or_default();
+                    Ok(Value::from_str(if theme.is_empty() {
+                        "default"
+                    } else {
+                        &theme
+                    }))
+                }
+                "use" => {
+                    with_state_mut(_interp, |rt| {
+                        rt.ttk_theme = args[2].as_str().to_string();
+                        rt.bump();
+                    });
+                    Ok(Value::empty())
+                }
+                "settings" => Ok(Value::empty()),
+                other => Err(generic(format!(
+                    "bad option \"{other}\": must be current, names, settings, or use"
+                ))),
+            }
+        }
+        other => Err(generic(format!(
+            "bad option \"{other}\": must be configure, element, layout, lookup, map, or theme"
+        ))),
+    }
+}
+
+fn grab_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let (mut global, mut index) = (false, 1);
+    if args
+        .get(index)
+        .is_some_and(|value| value.as_str() == "-global")
+    {
+        global = true;
+        index += 1;
+    }
+    let sub = args.get(index).map(|value| value.as_str()).unwrap_or("");
+    match sub {
+        "set" => {
+            let mut position = index + 1;
+            if args
+                .get(position)
+                .is_some_and(|value| value.as_str() == "-global")
+            {
+                global = true;
+                position += 1;
+            }
+            let Some(window) = args.get(position) else {
+                return Err(wrong("grab set", "?-global? window", args.len()));
+            };
+            if !with_state(interp, |rt| rt.tree.contains(window.as_str())).unwrap_or(false) {
+                return Err(bad_window(window.as_str()));
+            }
+            with_state_mut(interp, |rt| {
+                rt.grab = Some((window.as_str().to_string(), global));
+            });
+            Ok(Value::empty())
+        }
+        "release" => {
+            let Some(window) = args.get(index + 1) else {
+                return Err(wrong("grab release", "window", args.len()));
+            };
+            with_state_mut(interp, |rt| {
+                if rt
+                    .grab
+                    .as_ref()
+                    .is_some_and(|(held, _)| held == window.as_str())
+                {
+                    rt.grab = None;
+                }
+            });
+            Ok(Value::empty())
+        }
+        "current" => {
+            let current = with_state(interp, |rt| {
+                rt.grab
+                    .as_ref()
+                    .map(|(window, _)| window.clone())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+            match args.get(index + 1) {
+                Some(window) => Ok(Value::from_str(if window.as_str() == current {
+                    &current
+                } else {
+                    ""
+                })),
+                None => Ok(Value::from_str(&current)),
+            }
+        }
+        "status" => {
+            let Some(window) = args.get(index + 1) else {
+                return Err(wrong("grab status", "window", args.len()));
+            };
+            let status = with_state(interp, |rt| {
+                rt.grab.as_ref().map(|(held, global)| {
+                    if held == window.as_str() {
+                        if *global {
+                            "global"
+                        } else {
+                            "local"
+                        }
+                    } else {
+                        "none"
+                    }
+                })
+            })
+            .flatten()
+            .unwrap_or("none");
+            Ok(Value::from_str(status))
+        }
+        window => {
+            // Legacy `grab ?-global? window`.
+            if window.is_empty() {
+                return Err(wrong("grab", "?-global? window", args.len()));
+            }
+            if !with_state(interp, |rt| rt.tree.contains(window)).unwrap_or(false) {
+                return Err(bad_window(window));
+            }
+            with_state_mut(interp, |rt| {
+                rt.grab = Some((window.to_string(), global));
+            });
+            Ok(Value::empty())
+        }
     }
 }
 
@@ -11126,6 +11478,8 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "tk_chooseColor" => choose_color_impl(interp, args),
         "tk_optionMenu" => option_menu_impl(interp, args),
         "tk_dialog" => tk_dialog_impl(interp, args),
+        "grab" => grab_impl(interp, args),
+        "ttk::style" => ttk_style_impl(interp, &args[1..]),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -11731,6 +12085,60 @@ mod tests {
             ),
             "05"
         );
+    }
+
+    #[test]
+    fn ttk_style_database_and_grab() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "ttk::style configure TButton -background red -foreground white",
+        );
+        assert_eq!(eval(&mut i, "ttk::style lookup TButton -background"), "red");
+        assert_eq!(
+            eval(&mut i, "ttk::style lookup TButton -missing fallback"),
+            "fallback"
+        );
+        eval(&mut i, "ttk::style map TButton -background {active blue}");
+        assert_eq!(
+            eval(&mut i, "ttk::style configure TButton -background"),
+            "red"
+        );
+        assert_eq!(
+            eval(&mut i, "ttk::style map TButton -background"),
+            "active blue"
+        );
+        assert_eq!(eval(&mut i, "ttk::style theme use"), "default");
+        assert_eq!(eval(&mut i, "ttk::style theme names"), "default");
+        eval(&mut i, "ttk::style theme use clam");
+        assert_eq!(eval(&mut i, "ttk::style theme current"), "clam");
+        eval(
+            &mut i,
+            "ttk::style layout TButton {Button.border Button.focus}",
+        );
+        assert_eq!(
+            eval(&mut i, "ttk::style layout TButton"),
+            "Button.border -sticky nswe Button.focus -sticky nswe"
+        );
+        eval(&mut i, "ttk::style element create MyInd -type image");
+        assert_eq!(eval(&mut i, "ttk::style element names My*"), "MyInd");
+
+        eval(&mut i, "button .b");
+        eval(&mut i, "grab set .b");
+        assert_eq!(eval(&mut i, "grab status .b"), "local");
+        assert_eq!(eval(&mut i, "grab current"), ".b");
+        eval(&mut i, "grab set -global .b");
+        assert_eq!(eval(&mut i, "grab status .b"), "global");
+        eval(&mut i, "grab release .b");
+        assert_eq!(eval(&mut i, "grab current"), "");
+
+        eval(&mut i, "ttk::button .tb -text T; button .plain -text P");
+        assert_eq!(
+            ttk_style_value(".tb", "-background").as_deref(),
+            Some("red")
+        );
+        assert_eq!(ttk_style_value(".plain", "-background"), None);
     }
 
     #[test]

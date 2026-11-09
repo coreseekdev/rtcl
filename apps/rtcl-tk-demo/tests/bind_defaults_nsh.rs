@@ -489,6 +489,36 @@ fn rich_text_tag_bindings_fire_on_press() {
         .expect("the tag's <Enter> binding fired");
 }
 
+const TK_POPUP_APP: &str = r##"
+set ::choice none
+menu .m -tearoff 0
+.m add command -label "Popup item" -command {set ::choice "picked"}
+button .open -text "open" -command {tk_popup .m 100 100}
+pack .open
+label .out -textvariable ::choice
+pack .out
+"##;
+
+#[component]
+fn TkPopupApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(TK_POPUP_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn tk_popup_opens_a_menu_at_a_point() {
+    let mut config = EngineConfig::new(Root::of::<TkPopupApp>());
+    config.environment.os = nsh_core::platform::Os::Linux;
+    let mut app = Headless::start(config).expect("headless engine starts");
+    app.set_viewport(Size::new(Points(500.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("open").expect("the button renders");
+    app.press("open").expect("post the menu");
+    app.wait_for("Popup item").expect("the menu opens");
+    app.press("Popup item").expect("choose the item");
+    app.wait_for("text:picked").expect("the item's command ran");
+}
+
 const TOPLEVEL_APP: &str = r##"
 label .main -text "Main window"
 pack .main

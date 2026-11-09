@@ -191,13 +191,19 @@ message,canvas,sizegrip,panedwindow}` 别名（ttk
 **命令**：`configure/cget/cget 前缀缩写/destroy/pack/grid/place/winfo/
 wm/tk/bind/bindtags/event generate/focus/raise/lower/font/option/bell/
 tk_focusNext/tk_focusPrev/menu/clipboard/selection/tk_messageBox/
-tk_getOpenFile/tk_getSaveFile/tk_chooseDirectory/tk_chooseColor/tk_optionMenu/tk_dialog/grab/ttk::style`；控件子命令含 `invoke/get/insert/delete/
+tk_getOpenFile/tk_getSaveFile/tk_chooseDirectory/tk_chooseColor/tk_optionMenu/tk_dialog/grab/ttk::style/tk_popup`；控件子命令含 `invoke/get/insert/delete/
 index/icursor/selection/size/curselection/step` 等；菜单子命令含
 `add/insert/delete/index/entrycget/entryconfigure/invoke/type/post/
 unpost`；`ttk::notebook` 的 `add/insert/forget/tabs/select/index/tab`；
 `ttk::combobox` 的 `get/set/current/values/post/unpost`；
 `ttk::treeview` 的 `insert/delete/item/selection/focus/children/parent/
 index/heading/column/exists`；listbox/treeview 按 `-height` 放进滚动视图（滚轮可滚）；Tcl 侧的 `after/update/vwait` 沿用 rtcl-vm。
+
+**弹出菜单**：`tk_popup menu x y ?entry?` 与 `menu post x y` 在指定点弹出
+菜单（nsh menu 组件以 1×1 不可见 trigger 锚定，受控打开；选项触发
+command、checkbutton/radiobutton 更新变量并执行、外部点击/Escape 关闭并
+清状态；`?entry?` 忽略）。不带坐标的 `menu post` 仍是菜单栏 cascade 下拉；
+`menu unpost` 同时收起两种。
 
 **ttk::style**：`configure/lookup/map/layout/element create|names/theme
 names|use|settings` 维护样式/主题数据库；`theme use` 无参数返回当前主题

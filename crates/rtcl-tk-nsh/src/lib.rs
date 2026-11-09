@@ -29,7 +29,7 @@ use nsh_base::rich_editor::{
     },
 };
 use nsh_base::{
-    h_resizable, menu, menu_item, menu_separator, resizable_panel, submenu, v_resizable,
+    h_resizable, menu, menu_item, menu_separator, resizable_panel, submenu, v_resizable, MenuEvent,
     SliderValue,
 };
 use nsh_core::canvas::{CanvasTextAlign, CanvasTextBaseline};
@@ -456,6 +456,9 @@ pub fn TkView() -> impl IntoElement {
                         rtcl_tk_runtime::toplevel_windows().into_iter().enumerate()
                     {
                         stack = stack.child(render_toplevel_window(&tree, &window, index));
+                    }
+                    if let Some((menu_path, x, y)) = rtcl_tk_runtime::popup_menu() {
+                        stack = stack.child(render_popup_menu(&menu_path, x, y));
                     }
                     vec![stack]
                 }
@@ -1995,6 +1998,31 @@ fn render_menubutton(tree: &TkTree, path: &str) -> AnyElement {
         }
     }
     menu.into_element()
+}
+
+/// A menu posted at a point (`tk_popup`/`menu post x y`): an invisible
+/// 1×1 trigger at the point anchors nsh's menu overlay, opened under the
+/// runtime's control and closed by an item, a press outside or Escape.
+fn render_popup_menu(menu_path: &str, x: f64, y: f64) -> AnyElement {
+    let close_path = menu_path.to_string();
+    let mut posted = menu()
+        .open(Some(true))
+        .on_open_change(move |event: &MenuEvent| {
+            if let MenuEvent::OpenChange(false, _) = event {
+                rtcl_tk_runtime::close_popup_menu();
+            }
+        });
+    for child in menubutton_menu_items(menu_path) {
+        posted = posted.child(child);
+    }
+    view()
+        .absolute()
+        .left(px(x as f32))
+        .top(px(y as f32))
+        .w(px(1.0))
+        .h(px(1.0))
+        .child(posted)
+        .into_element()
 }
 
 /// A secondary `toplevel`: an in-window floating card with a title bar

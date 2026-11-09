@@ -69,6 +69,8 @@ pub struct TkRuntime {
     ttk_theme: String,
     /// The window holding the pointer grab and whether it is global.
     grab: Option<(String, bool)>,
+    /// A menu posted at a point (`tk_popup`/`menu post x y`).
+    popup_menu: Option<(String, f64, f64)>,
     /// The open cascade menu (`None` when no menu is dropped down).
     open_menu: Option<String>,
     /// Selected page index of each `ttk::notebook`.
@@ -562,6 +564,7 @@ pub fn install(interp: &mut Interp) {
         "tk_dialog",
         "grab",
         "ttk::style",
+        "tk_popup",
     ] {
         interp.register_command(name, global_command);
     }
@@ -4572,6 +4575,19 @@ fn grab_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
+/// `tk_popup menu x y ?entry?`: post `menu` at a point (the entry index
+/// only fine-tunes Tk's placement and is ignored here).
+fn tk_popup_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 4 {
+        return Err(wrong("tk_popup", "menu x y ?entry?", args.len()));
+    }
+    let menu = args[1].as_str().to_string();
+    let x = parse_f64_str(args[2].as_str(), "x")?;
+    let y = parse_f64_str(args[3].as_str(), "y")?;
+    popup_menu_at(&menu, x, y);
+    Ok(Value::empty())
+}
+
 /// The panes of a `panedwindow` (for the renderer).
 pub fn paned_panes(path: &str) -> Option<Vec<PanedPane>> {
     let ptr = active_interp()?;
@@ -5891,8 +5907,23 @@ fn menu_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::from_str(&kind))
         }
         "post" => {
+            // `menu post x y` posts at a point; bare `post` drops the
+            // menubar cascade down as before.
+            if args.len() >= 4 {
+                let x = parse_f64_str(args[2].as_str(), "x")?;
+                let y = parse_f64_str(args[3].as_str(), "y")?;
+                popup_menu_at(&path, x, y);
+                return Ok(Value::empty());
+            }
             with_state_mut(interp, |rt| {
                 rt.open_menu = Some(path.clone());
+                if rt
+                    .popup_menu
+                    .as_ref()
+                    .is_some_and(|(menu, _, _)| menu.as_str() == path)
+                {
+                    rt.popup_menu = None;
+                }
                 rt.bump();
             });
             Ok(Value::empty())
@@ -5901,6 +5932,13 @@ fn menu_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             with_state_mut(interp, |rt| {
                 if rt.open_menu.as_deref() == Some(path.as_str()) {
                     rt.open_menu = None;
+                }
+                if rt
+                    .popup_menu
+                    .as_ref()
+                    .is_some_and(|(menu, _, _)| menu.as_str() == path)
+                {
+                    rt.popup_menu = None;
                 }
                 rt.bump();
             });
@@ -6003,6 +6041,34 @@ pub fn menu_bar() -> Option<String> {
 pub fn menu_snapshot(path: &str) -> Option<Menu> {
     let ptr = active_interp()?;
     with_state(unsafe { &*ptr }, |rt| rt.menus.get(path).cloned()).flatten()
+}
+
+/// A menu posted at a point (`tk_popup`/`menu post x y`), if any.
+pub fn popup_menu() -> Option<(String, f64, f64)> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| rt.popup_menu.clone()).flatten()
+}
+
+/// Post `menu_path` at a point (Tk's `tk_popup`/`menu post x y`).
+pub fn popup_menu_at(menu_path: &str, x: f64, y: f64) {
+    let Some(ptr) = active_interp() else { return };
+    with_state_mut(unsafe { &mut *ptr }, |rt| {
+        rt.popup_menu = Some((menu_path.to_string(), x, y));
+        if rt.open_menu.as_deref() == Some(menu_path) {
+            rt.open_menu = None;
+        }
+        rt.bump();
+    });
+}
+
+/// The posted-point menu was closed (an item chose, or a press outside).
+pub fn close_popup_menu() {
+    let Some(ptr) = active_interp() else { return };
+    with_state_mut(unsafe { &mut *ptr }, |rt| {
+        if rt.popup_menu.take().is_some() {
+            rt.bump();
+        }
+    });
 }
 
 /// The cascade currently dropped down, if any.
@@ -11582,6 +11648,7 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "tk_dialog" => tk_dialog_impl(interp, args),
         "grab" => grab_impl(interp, args),
         "ttk::style" => ttk_style_impl(interp, &args[1..]),
+        "tk_popup" => tk_popup_impl(interp, args),
         _ => Err(Error::invalid_command(cmd)),
     }
 }
@@ -12241,6 +12308,26 @@ mod tests {
             Some("red")
         );
         assert_eq!(ttk_style_value(".plain", "-background"), None);
+    }
+
+    #[test]
+    fn tk_popup_and_menu_post_points() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "menu .m; .m add command -label A");
+        assert_eq!(popup_menu(), None);
+        eval(&mut i, "tk_popup .m 40 60");
+        assert_eq!(popup_menu(), Some((".m".to_string(), 40.0, 60.0)));
+        eval(&mut i, ".m unpost");
+        assert_eq!(popup_menu(), None);
+        eval(&mut i, ".m post 10 20");
+        assert_eq!(popup_menu(), Some((".m".to_string(), 10.0, 20.0)));
+        // Bare post drops the menubar cascade and supersedes the point.
+        eval(&mut i, ".m post");
+        assert_eq!(open_menu().as_deref(), Some(".m"));
+        assert_eq!(popup_menu(), None);
+        eval(&mut i, ".m unpost");
+        assert_eq!(open_menu(), None);
     }
 
     #[test]

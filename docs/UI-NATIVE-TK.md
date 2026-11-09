@@ -307,7 +307,8 @@ text 的 `<Key>`/`<KeyRelease>` 绑定（`break` 阻止编辑器插入），粘�
 entry/listbox/treeview/notebook/combobox/scrollbar 以及
 button/checkbutton/radiobutton/scale 的**组件自身节点**布局变化时派发
 （`%w/%h` 为新尺寸，fork 的 `Layout(Bounds)` 事件）；scale 的按下派发
-`<Button-1>`（fork 的 `SliderEvent::PressStart`）。
+`<Button-1>`（fork 的 `SliderEvent::PressStart`）；菜单下拉在打开时
+按其面板尺寸派发 `<Configure>`（`bind .file <Configure>`）。
 滚轮：listbox/treeview 用原生 scroll view 取得 wheel/pan，派发
 `<MouseWheel>`、`<Button-4|5>`（横向 6/7，Shift 作用于
 `<Shift-MouseWheel>`），无类绑定时按行高滚动虚拟化切片（原生偏移每次
@@ -337,9 +338,8 @@ text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/se
 text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
 未实现；`<Configure>` 尚未覆盖菜单窗口；`<<Copy>>/<<Cut>>/<<SelectAll>>`
 等虚拟事件没有默认映射（可用 `event add` 自行定义）；
-菜单窗口的 `<Configure>` 未派发；entry 选区拖动（`<B1-Motion>`）在桌面
-鼠标拖动时由平台 MouseMove 派发，headless 的 `drag` 是触摸模拟故不
-触发；其它控件的 hover/motion 未派发；
+entry 选区拖动（`<B1-Motion>`）在桌面鼠标拖动时由平台 MouseMove 派发，
+headless 的 `drag` 是触摸模拟故不触发；其它控件的 hover/motion 未派发；
 Windows/Linux 菜单栏仍是 app 内实现
 （macOS 用系统菜单；nsh GTK 的 set_application_menu 实测不显示）；
 scrollbar 已与 listbox/treeview 联动。

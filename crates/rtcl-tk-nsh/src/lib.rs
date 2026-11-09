@@ -1095,6 +1095,14 @@ fn render_menu_dropdown(menu_path: &str) -> AnyElement {
                 }),
         );
     }
+    let layout_path = menu_path.to_string();
+    panel = panel.on_layout(move |b: &Bounds<Points>| {
+        rtcl_tk_runtime::configure_event(
+            &layout_path,
+            b.size.width.0 as f64,
+            b.size.height.0 as f64,
+        );
+    });
     panel.into_element()
 }
 

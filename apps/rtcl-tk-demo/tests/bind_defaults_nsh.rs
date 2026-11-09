@@ -577,3 +577,33 @@ fn wheel_bindings_fire_on_entry() {
     app.wait_for("down")
         .expect("<Button-5> fired for the wheel");
 }
+
+const MENU_CONFIGURE_APP: &str = r#"
+set ::report ""
+menu .m -tearoff 0
+menu .file -tearoff 0
+.file add command -label Reset -command {}
+.m add cascade -label File -menu .file
+. configure -menu .m
+label .out -textvariable ::report
+pack .out
+bind .file <Configure> {set ::report cfg}
+"#;
+
+#[component]
+fn MenuConfigureApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(MENU_CONFIGURE_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn menu_dropdown_configure_fires() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<MenuConfigureApp>()))
+        .expect("headless engine starts");
+    app.set_viewport(Size::new(Points(500.0), Points(400.0)))
+        .expect("resize");
+    app.wait_for("File").expect("menubar renders");
+    app.press("File").expect("open the File menu");
+    app.wait_for("cfg")
+        .expect("the menu window's <Configure> fired");
+}

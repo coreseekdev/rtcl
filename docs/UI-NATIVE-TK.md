@@ -240,6 +240,9 @@ indices|lines` 链与 `linestart/lineend/wordstart/wordend` 限定词；
 modified ?0|1?`/`edit reset` 维护未保存标记（undo/redo 暂为 no-op）。
 
 **虚拟化/滚动**：listbox 与 treeview 只挂载可见行（按 `-height` 取窗口），
+listbox `itemconfigure/itemcget` 支持按行的 `-foreground/-background/
+-selectforeground/-selectbackground`，插入/删除会同步平移行选项与选中
+索引；
 `yview`/`-yscrollcommand` 与 Tk `scrollbar` 双向联动；列表/树表可滚动。
 `text` 原生输入自带滚动。`see <index/item>` 让 listbox/treeview 以最小
 滚动量把目标行带入窗口。treeview 行标签：`tag configure/cget/names/

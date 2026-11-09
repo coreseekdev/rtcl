@@ -84,6 +84,8 @@ pub struct TkRuntime {
     rich_docs: BTreeMap<String, String>,
     /// `text edit modified` state: widgets with unsaved edits.
     text_modified: BTreeSet<String>,
+    /// Listbox per-item options (`itemconfigure`): path → row → options.
+    listbox_item_options: BTreeMap<String, BTreeMap<usize, BTreeMap<String, String>>>,
 }
 
 /// A canvas's items.
@@ -937,6 +939,8 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     Ok(list_value(items.into_iter().map(|i| i.to_string())))
                 }
                 "selection" => listbox_selection(interp, path, &args[2..]),
+                "itemconfigure" => listbox_itemconfigure(interp, path, &args[2..]),
+                "itemcget" => listbox_itemcget(interp, path, &args[2..]),
                 "index" => {
                     if args.len() != 3 {
                         return Err(wrong("index", "index", args.len()));
@@ -1501,7 +1505,7 @@ fn bad_subcommand(kind: WidgetKind, sub: &str) -> Result<Value> {
             "cget, configure, delete, destroy, edit, get, index, insert, mark, see, tag, xview, yview"
         }
         WidgetKind::Listbox => {
-            "activate, cget, configure, curselection, delete, destroy, get, index, insert, see, selection, size, xview, yview"
+            "activate, cget, configure, curselection, delete, destroy, get, index, insert, itemcget, itemconfigure, see, selection, size, xview, yview"
         }
             WidgetKind::Scale => "cget, configure, coords, destroy, get, identify, set",
             WidgetKind::Scrollbar => {
@@ -7180,8 +7184,28 @@ fn listbox_insert(interp: &mut Interp, path: &str, index: &str, items: &[Value])
             for (i, item) in items.iter().enumerate() {
                 n.items.insert(at + i, item.as_str().to_string());
             }
-            rt.bump();
+            n.selected = n
+                .selected
+                .iter()
+                .map(|i| if *i >= at { i + items.len() } else { *i })
+                .collect();
         }
+        if let Some(rows) = rt.listbox_item_options.get_mut(path) {
+            *rows = rows
+                .iter()
+                .map(|(index, options)| {
+                    (
+                        if *index >= at {
+                            index + items.len()
+                        } else {
+                            *index
+                        },
+                        options.clone(),
+                    )
+                })
+                .collect();
+        }
+        rt.bump();
     });
     sync_listvariable(interp, path);
     let total = with_state(interp, |rt| {
@@ -7237,8 +7261,24 @@ fn listbox_delete(
                 .copied()
                 .map(|i| if i > b { i - (b + 1 - a) } else { i })
                 .collect();
-            rt.bump();
         }
+        if let Some(rows) = rt.listbox_item_options.get_mut(path) {
+            *rows = rows
+                .iter()
+                .filter(|(index, _)| !(**index >= a && **index <= b))
+                .map(|(index, options)| {
+                    (
+                        if *index > b {
+                            index - (b + 1 - a)
+                        } else {
+                            *index
+                        },
+                        options.clone(),
+                    )
+                })
+                .collect();
+        }
+        rt.bump();
     });
     sync_listvariable(interp, path);
     let total = with_state(interp, |rt| {
@@ -7272,6 +7312,92 @@ fn listbox_get(interp: &mut Interp, path: &str, first: &str, last: Option<&str>)
     .flatten()
     .unwrap_or_default();
     Ok(list_value(items))
+}
+
+fn listbox_itemconfigure(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.is_empty() {
+        return Err(wrong(
+            "itemconfigure",
+            "index ?-option? ?value ...?",
+            rest.len() + 2,
+        ));
+    }
+    let len = with_state(interp, |rt| rt.tree.get(path).map(|n| n.items.len()))
+        .flatten()
+        .ok_or_else(|| bad_window(path))?;
+    let index = listbox_index(rest[0].as_str(), len)?;
+    if rest.len() == 1 {
+        let options = with_state(interp, |rt| {
+            rt.listbox_item_options
+                .get(path)
+                .and_then(|rows| rows.get(&index))
+                .map(|options| {
+                    options
+                        .iter()
+                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .collect::<Vec<_>>()
+                })
+        })
+        .flatten()
+        .unwrap_or_default();
+        return Ok(list_value(options));
+    }
+    if rest.len() == 2 && rest[1].as_str().starts_with('-') {
+        let value = with_state(interp, |rt| {
+            rt.listbox_item_options
+                .get(path)
+                .and_then(|rows| rows.get(&index))
+                .and_then(|options| options.get(rest[1].as_str()))
+                .cloned()
+        })
+        .flatten()
+        .unwrap_or_default();
+        return Ok(Value::from_str(&value));
+    }
+    let options = parse_pairs(rest, 1, "itemconfigure")?;
+    with_state_mut(interp, |rt| {
+        rt.listbox_item_options
+            .entry(path.to_string())
+            .or_default()
+            .entry(index)
+            .or_default()
+            .extend(options);
+        rt.bump();
+    });
+    Ok(Value::empty())
+}
+
+fn listbox_itemcget(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
+    if rest.len() != 2 {
+        return Err(wrong("itemcget", "index -option", rest.len() + 2));
+    }
+    let len = with_state(interp, |rt| rt.tree.get(path).map(|n| n.items.len()))
+        .flatten()
+        .ok_or_else(|| bad_window(path))?;
+    let index = listbox_index(rest[0].as_str(), len)?;
+    let value = with_state(interp, |rt| {
+        rt.listbox_item_options
+            .get(path)
+            .and_then(|rows| rows.get(&index))
+            .and_then(|options| options.get(rest[1].as_str()))
+            .cloned()
+    })
+    .flatten()
+    .unwrap_or_default();
+    Ok(Value::from_str(&value))
+}
+
+/// One `listbox itemconfigure` option of a row (renderer hook).
+pub fn listbox_item_option(path: &str, index: usize, name: &str) -> Option<String> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| {
+        rt.listbox_item_options
+            .get(path)
+            .and_then(|rows| rows.get(&index))
+            .and_then(|options| options.get(name))
+            .cloned()
+    })
+    .flatten()
 }
 
 fn listbox_selection(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
@@ -7858,6 +7984,30 @@ mod tests {
         eval(&mut i, ".n mark set insert 1.1");
         eval(&mut i, ".n insert 1.1 AA");
         assert_eq!(eval(&mut i, ".n index insert"), "1.1");
+    }
+
+    #[test]
+    fn listbox_item_options_follow_index_shifts() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            "listbox .l -height 4; .l insert end one two three; .l selection set 1",
+        );
+        eval(
+            &mut i,
+            ".l itemconfigure 1 -foreground red -background yellow",
+        );
+        assert_eq!(eval(&mut i, ".l itemcget 1 -foreground"), "red");
+        assert!(eval(&mut i, ".l itemconfigure 1").contains("-background yellow"));
+        // Inserting before the row shifts both its options and the selection.
+        eval(&mut i, ".l insert 0 zero");
+        assert_eq!(eval(&mut i, ".l itemcget 2 -foreground"), "red");
+        assert_eq!(eval(&mut i, ".l itemcget 0 -foreground"), "");
+        assert_eq!(eval(&mut i, ".l curselection"), "2");
+        eval(&mut i, ".l delete 0");
+        assert_eq!(eval(&mut i, ".l itemcget 1 -background"), "yellow");
+        assert_eq!(eval(&mut i, ".l curselection"), "1");
     }
 
     #[test]

@@ -1436,6 +1436,17 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             for (i, item) in items.iter().enumerate().skip(start).take(rows) {
                 let selected = selected.contains(&i);
                 let prefix = if selected { "▶ " } else { "   " };
+                // Per-row `itemconfigure` colours win over the widget's.
+                let item_bg = rtcl_tk_runtime::listbox_item_option(path, i, "-background")
+                    .and_then(|value| parse_color(&value));
+                let item_fg = rtcl_tk_runtime::listbox_item_option(path, i, "-foreground")
+                    .and_then(|value| parse_color(&value));
+                let item_select_bg =
+                    rtcl_tk_runtime::listbox_item_option(path, i, "-selectbackground")
+                        .and_then(|value| parse_color(&value));
+                let item_select_fg =
+                    rtcl_tk_runtime::listbox_item_option(path, i, "-selectforeground")
+                        .and_then(|value| parse_color(&value));
                 let row_path = path.to_string();
                 list = list.child(
                     nsh_base::button()
@@ -1444,10 +1455,12 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         .py(px(3.0))
                         .rounded(px(4.0))
                         .bg(if selected {
-                            select_bg
+                            item_select_bg.unwrap_or(select_bg)
                         } else {
-                            option_color(tree, path, "-background")
-                                .unwrap_or(AdaptiveColor::rgb(0xffffff, 0x111827))
+                            item_bg.unwrap_or_else(|| {
+                                option_color(tree, path, "-background")
+                                    .unwrap_or(AdaptiveColor::rgb(0xffffff, 0x111827))
+                            })
                         })
                         .child(
                             view()
@@ -1458,11 +1471,13 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                                         .text_size(px(14.0))
                                         .text_color(AdaptiveColor::rgb(0x2563eb, 0x60a5fa)),
                                 )
-                                .child(
-                                    text(item.clone())
-                                        .text_size(px(14.0))
-                                        .text_color(if selected { select_fg } else { text_color }),
-                                ),
+                                .child(text(item.clone()).text_size(px(14.0)).text_color(
+                                    if selected {
+                                        item_select_fg.unwrap_or(select_fg)
+                                    } else {
+                                        item_fg.unwrap_or(text_color)
+                                    },
+                                )),
                         )
                         .on_press(move |_: &()| {
                             rtcl_tk_runtime::listbox_select(&row_path, i);

@@ -106,6 +106,7 @@ pack .listframe.sb -side right -fill y
 foreach color {Red Green Blue Yellow Purple Orange Black White} {
     .listframe.lb insert end $color
 }
+.listframe.lb itemconfigure 0 -foreground "#b91c1c"
 
 ttk::notebook .nb
 pack .nb -fill x -padx 8 -pady 6

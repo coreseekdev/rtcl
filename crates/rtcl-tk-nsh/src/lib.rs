@@ -1578,6 +1578,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .unwrap_or(1.0);
             let disabled = is_disabled(tree, path.as_str());
             let change_path = path.clone();
+            let press_path = path.clone();
             let mut row = view().flex_row().items_center().gap_2();
             if !option(tree, path.as_str(), "-label").is_empty() {
                 row = row.child(text(option(tree, path.as_str(), "-label").to_string()));
@@ -1597,6 +1598,9 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         s.size(px(14.0))
                             .rounded_full()
                             .bg(AdaptiveColor::rgb(0x2563eb, 0x3b82f6))
+                    })
+                    .on_press_start(move |_: &()| {
+                        rtcl_tk_runtime::widget_press(&press_path, 0.0, 0.0, 1);
                     })
                     .on_change(move |v: &SliderValue| {
                         rtcl_tk_runtime::scale_changed(&change_path, v.start());
@@ -1706,6 +1710,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             // scroll view's own offset is reset on every event.
             let scroll_ref = element_ref();
             let scroll_path = path.to_string();
+            let layout_path = path.to_string();
             nsh_core::element::scroll()
                 .w_full()
                 .h(px(viewport_height))
@@ -1716,6 +1721,13 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .bg(option_color(tree, path, "-background")
                     .unwrap_or(AdaptiveColor::rgb(0xffffff, 0x111827)))
                 .element_ref(&scroll_ref)
+                .on_layout(move |b: &Bounds<Points>| {
+                    rtcl_tk_runtime::configure_event(
+                        &layout_path,
+                        b.size.width.0 as f64,
+                        b.size.height.0 as f64,
+                    );
+                })
                 .on_scroll(move |e: &ScrollEvent| {
                     let dy = e.offset.y.0 as f64;
                     if dy != 0.0 {
@@ -2844,15 +2856,22 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     }
                 })
                 .child(body);
-            view()
+            let layout_path = path.to_string();
+            let mut tree = view()
                 .flex_col()
                 .w_full()
                 .rounded(px(4.0))
                 .border_1()
                 .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
-                .child(header)
-                .child(scroller)
-                .into_element()
+                .on_layout(move |b: &Bounds<Points>| {
+                    rtcl_tk_runtime::configure_event(
+                        &layout_path,
+                        b.size.width.0 as f64,
+                        b.size.height.0 as f64,
+                    );
+                });
+            tree = tree.child(header).child(scroller);
+            tree.into_element()
         }
     }
 }

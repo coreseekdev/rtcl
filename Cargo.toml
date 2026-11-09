@@ -59,6 +59,12 @@ hex = "0.4"
 serde_yaml = "0.9"
 url = "2"
 
+# Tk compatibility patches carried on the coreseekdev fork: the slider
+# reports PressStart so a Tk scale can dispatch <Button-1>.
+[patch.crates-io]
+nsh-core = { git = "https://github.com/coreseekdev/nsh", branch = "rtcl-tk" }
+nsh-base = { git = "https://github.com/coreseekdev/nsh", branch = "rtcl-tk" }
+
 [profile.release]
 opt-level = 3        # Optimize for speed
 lto = true           # Link-time optimization

@@ -2888,8 +2888,7 @@ dependencies = [
 [[package]]
 name = "nsh-base"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5298bbdc8874c2b5a1e6b99588cb120253d905d82628aed42ba799fecc5859bc"
+source = "git+https://github.com/coreseekdev/nsh?branch=rtcl-tk#7fc717091929845b5295610921eb56ce8e54e95a"
 dependencies = [
  "chrono",
  "html5ever",
@@ -2918,8 +2917,7 @@ dependencies = [
 [[package]]
 name = "nsh-core"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "171f17b402bedb0cead975d3abcefbf0e7963583fbdbf1dbcb03ef73ba11191d"
+source = "git+https://github.com/coreseekdev/nsh?branch=rtcl-tk#7fc717091929845b5295610921eb56ce8e54e95a"
 dependencies = [
  "cap-std",
  "crc32fast",
@@ -2998,8 +2996,7 @@ dependencies = [
 [[package]]
 name = "nsh-macros"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08e449212388f9e8352235b45c1b07a9acc192e86a375e19643a6c0849d56580"
+source = "git+https://github.com/coreseekdev/nsh?branch=rtcl-tk#7fc717091929845b5295610921eb56ce8e54e95a"
 dependencies = [
  "imagesize 0.15.0",
  "proc-macro2",

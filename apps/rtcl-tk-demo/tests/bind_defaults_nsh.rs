@@ -441,3 +441,30 @@ fn configure_fires_on_resize() {
     app.wait_for("big")
         .expect("<Configure> reported the new width");
 }
+
+const SCALE_APP: &str = r#"
+set ::report ""
+scale .s -from 0 -to 100 -variable ::v
+pack .s -fill x -padx 20 -pady 20
+label .out -textvariable ::report
+pack .out
+bind .s <Button-1> {set ::report pressed}
+"#;
+
+#[component]
+fn ScaleApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(SCALE_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn scale_press_binding_fires() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<ScaleApp>()))
+        .expect("headless engine starts");
+    app.set_viewport(Size::new(Points(400.0), Points(300.0)))
+        .expect("resize");
+    let _ = app.settle();
+    app.press("role:adjustable").expect("press the scale");
+    app.wait_for("pressed")
+        .expect("<Button-1> fired for the scale");
+}

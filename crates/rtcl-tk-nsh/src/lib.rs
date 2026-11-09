@@ -226,6 +226,40 @@ fn tk_button(button: Option<nsh_core::MouseButton>) -> Option<u8> {
     }
 }
 
+/// Attach Tk `<Enter>/<Leave>/<Motion>` to a widget's own element.  Works
+/// for plain views and for nsh-base components that emit the same events.
+macro_rules! pointer_events {
+    ($element:expr, $path:expr) => {{
+        let enter_path = $path.to_string();
+        let leave_path = $path.to_string();
+        let motion_path = $path.to_string();
+        $element
+            .on_mouse_enter(move |e: &MouseEvent| {
+                rtcl_tk_runtime::enter_event(
+                    &enter_path,
+                    e.position.x.0 as f64,
+                    e.position.y.0 as f64,
+                )
+            })
+            .on_mouse_leave(move |e: &MouseEvent| {
+                rtcl_tk_runtime::leave_event(
+                    &leave_path,
+                    e.position.x.0 as f64,
+                    e.position.y.0 as f64,
+                )
+            })
+            .on_mouse_move(move |e: &MouseEvent| {
+                rtcl_tk_runtime::motion_event(
+                    &motion_path,
+                    e.position.x.0 as f64,
+                    e.position.y.0 as f64,
+                    tk_button(e.pressed_button),
+                    tk_state(&e.modifiers),
+                )
+            })
+    }};
+}
+
 thread_local! {
     /// Widgets with a finger down, so moves become touch moves.
     static TOUCH_ACTIVE: RefCell<std::collections::BTreeSet<String>> =
@@ -1328,6 +1362,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     b.size.height.0 as f64,
                 );
             });
+            frame = pointer_events!(frame, path);
             frame
                 .on_press(move |e: &PressEvent| {
                     rtcl_tk_runtime::widget_press(
@@ -1361,6 +1396,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         .text_color(AdaptiveColor::rgb(0x4b5563, 0xd1d5db)),
                 );
             }
+            frame = pointer_events!(frame, path);
             frame.child(render_children(tree, path)).into_element()
         }
         WidgetKind::Label => {
@@ -1376,6 +1412,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
             let press_path = path.to_string();
             let layout_path = path.to_string();
+            container = pointer_events!(container, path);
             container
                 .on_layout(move |b: &Bounds<Points>| {
                     rtcl_tk_runtime::configure_event(
@@ -1449,6 +1486,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     b.size.height.0 as f64,
                 );
             });
+            button = pointer_events!(button, path);
             button.into_element()
         }
         WidgetKind::Entry => {
@@ -1582,6 +1620,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     b.size.height.0 as f64,
                 );
             });
+            control = pointer_events!(control, path);
             control.into_element()
         }
         WidgetKind::Radiobutton => {
@@ -1625,6 +1664,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     b.size.height.0 as f64,
                 );
             });
+            control = pointer_events!(control, path);
             control.into_element()
         }
         WidgetKind::Scale => {
@@ -1647,36 +1687,35 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             if !option(tree, path.as_str(), "-label").is_empty() {
                 row = row.child(text(option(tree, path.as_str(), "-label").to_string()));
             }
-            row = row.child(
-                nsh_base::slider()
-                    .value(move || SliderValue::Single(value))
-                    .min(from)
-                    .max(to)
-                    .step(step)
-                    .axis(Axis::Horizontal)
-                    .disabled(disabled)
-                    .track_style(|s| s.w(px(180.0)).h(px(24.0)).justify_center())
-                    .indicator_style(|s| s.h(px(4.0)).bg(AdaptiveColor::rgb(0xd1d5db, 0x4b5563)))
-                    .range_style(|s| s.h(px(4.0)).bg(AdaptiveColor::rgb(0x2563eb, 0x3b82f6)))
-                    .thumb_style(|s| {
-                        s.size(px(14.0))
-                            .rounded_full()
-                            .bg(AdaptiveColor::rgb(0x2563eb, 0x3b82f6))
-                    })
-                    .on_layout(move |b: &Bounds<Points>| {
-                        rtcl_tk_runtime::configure_event(
-                            &layout_path,
-                            b.size.width.0 as f64,
-                            b.size.height.0 as f64,
-                        );
-                    })
-                    .on_press_start(move |_: &()| {
-                        rtcl_tk_runtime::widget_press(&press_path, 0.0, 0.0, 1);
-                    })
-                    .on_change(move |v: &SliderValue| {
-                        rtcl_tk_runtime::scale_changed(&change_path, v.start());
-                    }),
-            );
+            let slider = nsh_base::slider()
+                .value(move || SliderValue::Single(value))
+                .min(from)
+                .max(to)
+                .step(step)
+                .axis(Axis::Horizontal)
+                .disabled(disabled)
+                .track_style(|s| s.w(px(180.0)).h(px(24.0)).justify_center())
+                .indicator_style(|s| s.h(px(4.0)).bg(AdaptiveColor::rgb(0xd1d5db, 0x4b5563)))
+                .range_style(|s| s.h(px(4.0)).bg(AdaptiveColor::rgb(0x2563eb, 0x3b82f6)))
+                .thumb_style(|s| {
+                    s.size(px(14.0))
+                        .rounded_full()
+                        .bg(AdaptiveColor::rgb(0x2563eb, 0x3b82f6))
+                })
+                .on_layout(move |b: &Bounds<Points>| {
+                    rtcl_tk_runtime::configure_event(
+                        &layout_path,
+                        b.size.width.0 as f64,
+                        b.size.height.0 as f64,
+                    );
+                })
+                .on_press_start(move |_: &()| {
+                    rtcl_tk_runtime::widget_press(&press_path, 0.0, 0.0, 1);
+                })
+                .on_change(move |v: &SliderValue| {
+                    rtcl_tk_runtime::scale_changed(&change_path, v.start());
+                });
+            row = row.child(pointer_events!(slider, path));
             row = row.child(text(format_number(value)).text_size(px(12.0)));
             row.into_element()
         }
@@ -1691,6 +1730,9 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let press_path = path.clone();
             let focus_path = path.clone();
             let wheel_path = path.clone();
+            let enter_path = path.clone();
+            let leave_path = path.clone();
+            let move_path = path.clone();
             nsh_base::input()
                 .multiline(true)
                 .auto_focus(rtcl_tk_runtime::focused(&path))
@@ -1713,6 +1755,29 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         &wheel_path,
                         -(e.delta.x.0 as f64),
                         -(e.delta.y.0 as f64),
+                        tk_state(&e.modifiers),
+                    );
+                })
+                .on_mouse_enter(move |e: &MouseEvent| {
+                    rtcl_tk_runtime::enter_event(
+                        &enter_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                    );
+                })
+                .on_mouse_leave(move |e: &MouseEvent| {
+                    rtcl_tk_runtime::leave_event(
+                        &leave_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                    );
+                })
+                .on_mouse_move(move |e: &MouseEvent| {
+                    rtcl_tk_runtime::motion_event(
+                        &move_path,
+                        e.position.x.0 as f64,
+                        e.position.y.0 as f64,
+                        tk_button(e.pressed_button),
                         tk_state(&e.modifiers),
                     );
                 })
@@ -1802,7 +1867,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let scroll_ref = element_ref();
             let scroll_path = path.to_string();
             let layout_path = path.to_string();
-            nsh_core::element::scroll()
+            let scroller = nsh_core::element::scroll()
                 .w_full()
                 .h(px(viewport_height))
                 .scrollbar(false)
@@ -1826,8 +1891,9 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         scroll_ref.scroll_to(Point::new(Points(0.0), Points(0.0)), false);
                     }
                 })
-                .child(list)
-                .into_element()
+                .child(list);
+            let scroller = pointer_events!(scroller, path);
+            scroller.into_element()
         }
         WidgetKind::Message => {
             let font = font_of(tree, path);
@@ -1839,6 +1905,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
             let press_path = path.to_string();
             let layout_path = path.to_string();
+            container = pointer_events!(container, path);
             container
                 .on_layout(move |b: &Bounds<Points>| {
                     rtcl_tk_runtime::configure_event(
@@ -1937,6 +2004,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     .child(down)
             };
             let layout_path = path.to_string();
+            bar = pointer_events!(bar, path);
             bar = bar.on_layout(move |b: &Bounds<Points>| {
                 rtcl_tk_runtime::configure_event(
                     &layout_path,
@@ -2020,6 +2088,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             };
             let press_path = path.to_string();
             let layout_path = path.to_string();
+            track = pointer_events!(track, path);
             track
                 .on_layout(move |b: &Bounds<Points>| {
                     rtcl_tk_runtime::configure_event(
@@ -2095,6 +2164,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     b.size.height.0 as f64,
                 );
             });
+            column = pointer_events!(column, path);
             column.into_element()
         }
         WidgetKind::Combobox => {
@@ -2142,6 +2212,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                             rtcl_tk_runtime::toggle_combobox(&toggle_path);
                         }),
                 );
+            let row = pointer_events!(row, path);
             let mut column = view().flex_col().items_start().w_full().gap_1().child(row);
             if open {
                 let mut list = view()
@@ -2794,6 +2865,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 );
             }
             let press_path = path.to_string();
+            chart = pointer_events!(chart, path);
             chart
                 .on_press(move |e: &PressEvent| {
                     rtcl_tk_runtime::widget_press(
@@ -2994,6 +3066,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     );
                 });
             tree = tree.child(header).child(scroller);
+            tree = pointer_events!(tree, path);
             tree.into_element()
         }
     }

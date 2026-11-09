@@ -133,7 +133,9 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
   `<Configure>`）、`EventKind::Wheel`（非 scroll 元素的 wheel，
   nsh-platform-linux 无 Scroll 祖先时投递给指针下监听者、有 Scroll 时
   也同时派发监听者，nsh-testing 提供 headless `wheel()`）、
-  `RichEditorEvent::Wheel`（富文本编辑器内容区）。
+  `RichEditorEvent::Wheel`（富文本编辑器内容区）、
+  `MouseEnter/MouseLeave/MouseMove` 事件（Button/Checkbox/Radio/Slider
+  组件，nsh-core 补了 `MouseEvent` 的 JsValue）。
 
 ## 6. 里程碑
 
@@ -303,6 +305,11 @@ text 的 `<Key>`/`<KeyRelease>` 绑定（`break` 阻止编辑器插入），粘�
 `<Motion>`/`<B1-Motion>`（canvas 项也支持）、`<Enter>/<Leave>`、
 `<Touch>` 与 `<<TouchStart/Move/End>>`、`<<LongPress>>`、`<<Pan>>`、
 `<<Pinch>>`、`<<Rotation>>`；触摸轻点仍合成 `<Button-1>` 路径。
+`<Enter>/<Leave>/<Motion>` 挂在各控件根节点（label/frame/labelframe/
+message/progressbar/canvas/chart/scrollbar/listbox/treeview/notebook/
+combobox/entry/text，以及 button/checkbutton/radiobutton/scale 的组件
+根节点）；headless 的 Enter 绑定若触发重渲染，紧随其后的首个 Motion
+可能落在旧节点，真实指针连续移动不受影响。
 `<Configure>` 在 frame/toplevel/label/message/progressbar/canvas/chart/
 entry/listbox/treeview/notebook/combobox/scrollbar 以及
 button/checkbutton/radiobutton/scale 的**组件自身节点**布局变化时派发
@@ -339,7 +346,8 @@ text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
 未实现；`<Configure>` 尚未覆盖菜单窗口；`<<Copy>>/<<Cut>>/<<SelectAll>>`
 等虚拟事件没有默认映射（可用 `event add` 自行定义）；
 entry 选区拖动（`<B1-Motion>`）在桌面鼠标拖动时由平台 MouseMove 派发，
-headless 的 `drag` 是触摸模拟故不触发；其它控件的 hover/motion 未派发；
+headless 的 `drag` 是触摸模拟故不触发；菜单项与富文本 text 内容区的
+`<Motion>` 未派发；separator 等纯装饰控件未接 hover；
 Windows/Linux 菜单栏仍是 app 内实现
 （macOS 用系统菜单；nsh GTK 的 set_application_menu 实测不显示）；
 scrollbar 已与 listbox/treeview 联动。

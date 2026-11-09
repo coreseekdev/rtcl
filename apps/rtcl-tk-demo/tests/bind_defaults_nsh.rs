@@ -607,3 +607,42 @@ fn menu_dropdown_configure_fires() {
     app.wait_for("cfg")
         .expect("the menu window's <Configure> fired");
 }
+
+const HOVER_APP: &str = r#"
+set ::log ""
+label .a -text HoverMe
+pack .a
+label .b -text Other
+pack .b
+label .out -textvariable ::log
+pack .out
+bind .a <Enter> {append ::log E}
+bind .a <Leave> {append ::log L}
+bind .a <Motion> {append ::log M}
+"#;
+
+#[component]
+fn HoverApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(HOVER_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn hover_and_motion_bindings_fire() {
+    let mut config = EngineConfig::new(Root::of::<HoverApp>());
+    config.environment.os = nsh_core::platform::Os::Linux;
+    let mut app = Headless::start(config).expect("headless engine starts");
+    app.set_viewport(Size::new(Points(400.0), Points(300.0)))
+        .expect("resize");
+    app.wait_for("HoverMe").expect("label renders");
+    app.hover("HoverMe").expect("hover the label");
+    // A render after the Enter handler can replace the node the first
+    // queued Motion targeted; a second move (as a real pointer sends) reaches
+    // the new one.
+    app.hover("HoverMe").expect("move over the label again");
+    app.wait_for("EM")
+        .expect("<Enter> and <Motion> fired on hover");
+    app.hover("Other").expect("hover the other label");
+    app.wait_for("EML")
+        .expect("<Leave> fired when the pointer left");
+}

@@ -1,0 +1,25 @@
+[package]
+name = "rtcl-tk-app-native"
+description = "The rtcl Tk demo as a Rust app (Android/iOS/desktop via nsh)."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+nsh-core = { version = "0.4", git = "ssh://git@github.com/coreseekdev/nsh", branch = "rtcl-tk" }
+nsh-base = { version = "0.4", default-features = false, git = "ssh://git@github.com/coreseekdev/nsh", branch = "rtcl-tk" }
+rtcl-tk-core = { path = "../../../crates/rtcl-tk-core" }
+rtcl-tk-runtime = { path = "../../../crates/rtcl-tk-runtime" }
+rtcl-tk-nsh = { path = "../../../crates/rtcl-tk-nsh" }
+rtcl-tk-demo = { path = "../../rtcl-tk-demo", package = "rtcl-tk-demo" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nsh-platform-linux = { version = "0.4", default-features = false, git = "ssh://git@github.com/coreseekdev/nsh", branch = "rtcl-tk" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = { version = "0.4", default-features = false, git = "ssh://git@github.com/coreseekdev/nsh", branch = "rtcl-tk" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nsh-platform-windows = { version = "0.4", default-features = false, git = "ssh://git@github.com/coreseekdev/nsh", branch = "rtcl-tk" }

@@ -1,0 +1,26 @@
+[package]
+name = "nsh-app-rtcl-tk-app-native-web"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "nsh_app_rtcl_tk_app_native_web"
+path = "lib.rs"
+crate-type = ["cdylib"]
+
+[features]
+# The runtime of published apps: TSX on the browser's JavaScript engine.
+browser = ["nsh-platform-web/browser"]
+# The development host's: hot updates, and what `nsh test --target web` asks about.
+dev = ["nsh-platform-web/dev"]
+                 # What `nsh package` links the app's runtime from (its relocations kept).
+linkable = ["nsh-platform-web/linkable"]
+
+[dependencies]
+nsh-core = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-core" }
+nsh-base = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-base", features = ["highlight"] }
+app_rtcl_tk_app_native = { package = "rtcl-tk-app-native", path = "/home/nzinfo/src.note/rtcl/apps/rtcl-tk-app/native" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+nsh-platform-web = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-platform-web", default-features = false }

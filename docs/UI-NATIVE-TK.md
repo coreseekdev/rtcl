@@ -493,9 +493,12 @@ Increment/Decrement、toplevel Close window），Canvas/Chart 仍是纯绘制、
 android cfg 已随 linux 开）。fork 的 nsh-platform-android 完整存在
 （JNI libnsh.so + Java 运行时），nsh-cli 的 android.rs 能打 APK
 （classes.dex + libnsh.so per ABI + AppActivity 跑 Rust root）。
-剩余：建一个 Rust-only android app crate（`root!` + `ui_sets!` 注册
-rtcl 的 tk 组件注册表，`nsh run --target android` 打包），对话框/
-剪贴板等宿主钩子在 android 侧未注册（回退默认值）。
+Android app crate 已建：`apps/rtcl-tk-app`（nsh.json `"rust": "native"`
++ `root: TclApp`；native crate 依赖 rtcl-tk-demo 的脚本装载 +
+`#[native_module]` 注册 TclApp；nsh 依赖直连 fork git 源——patch 不随
+生成的 .nsh/rust workspace 传播）。`nsh run --target android` 下 Rust
+crate 构建成功，止于"无连接设备/模拟器"（本机无 AVD/system-image）；
+宿主钩子（对话框/剪贴板）android 侧未注册，回退默认值。
 
 **视觉验收（不用 TSX）**：Tcl 与 TSX 在同一生态位，因此截图走 Rust/GTK，
 不引入 `*.test.tsx` 或 nsh CLI：

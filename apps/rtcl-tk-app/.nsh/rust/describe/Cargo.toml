@@ -1,0 +1,13 @@
+[package]
+name = "nsh-app-rtcl-tk-app-native-describe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "nsh-app-rtcl-tk-app-native-describe"
+path = "main.rs"
+
+[dependencies]
+nsh-core = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-core", features = ["declarations"] }
+app_rtcl_tk_app_native = { package = "rtcl-tk-app-native", path = "/home/nzinfo/src.note/rtcl/apps/rtcl-tk-app/native" }

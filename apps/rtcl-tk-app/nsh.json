@@ -1,0 +1,7 @@
+{
+  "name": "rtcl Tk",
+  "id": "dev.rtcl.tkapp",
+  "appearance": "system",
+  "rust": "native",
+  "root": "TclApp"
+}

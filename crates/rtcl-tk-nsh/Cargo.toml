@@ -9,8 +9,8 @@ description = "nsh renderer for rtcl's native Tk-compatible widget tree"
 rtcl-core = { workspace = true }
 rtcl-tk-core = { path = "../rtcl-tk-core" }
 rtcl-tk-runtime = { path = "../rtcl-tk-runtime" }
-nsh-core = "0.4"
-nsh-base = { version = "0.4", default-features = false }
+nsh-core = { version = "0.4", git = "ssh://git@github.com/coreseekdev/nsh", branch = "rtcl-tk" }
+nsh-base = { version = "0.4", default-features = false, git = "ssh://git@github.com/coreseekdev/nsh", branch = "rtcl-tk" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nsh-platform-linux = { version = "0.4", default-features = false }

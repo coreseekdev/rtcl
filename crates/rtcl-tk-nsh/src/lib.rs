@@ -2044,6 +2044,7 @@ fn render_toplevel_window(
                         .px(px(6.0))
                         .py(px(1.0))
                         .rounded(px(3.0))
+                        .accessibility_label("Close window")
                         .child(
                             text("\u{2715}")
                                 .text_size(px(11.0))
@@ -2251,6 +2252,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     .disabled(disabled)
             };
             let up = step_style(nsh_base::button())
+                .accessibility_label("Increment")
                 .child(
                     text("\u{25b4}")
                         .text_size(px(9.0))
@@ -2262,6 +2264,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     rtcl_tk_runtime::focus_widget(&focus_up);
                 });
             let down = step_style(nsh_base::button())
+                .accessibility_label("Decrement")
                 .child(
                     text("\u{25be}")
                         .text_size(px(9.0))

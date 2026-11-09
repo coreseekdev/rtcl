@@ -435,8 +435,19 @@ entry 选区拖动（`<B1-Motion>`）在桌面鼠标拖动时由平台 MouseMove
 headless 的 `drag` 是触摸模拟故不触发；菜单项/separator 等装饰控件的
 hover 未单独接（菜单面板本身有 `<Enter>/<Leave>`）；
 Windows/Linux 菜单栏仍是 app 内实现
-（macOS 用系统菜单；nsh GTK 的 set_application_menu 实测不显示）；
-scrollbar 已与 listbox/treeview 联动。
+（macOS 用系统菜单；GTK4 已无传统 menubar，nsh 的
+set_application_menu 实测不显示，故此项无法在不嵌入平台 widget 的前提下
+做成“原生”）；scrollbar 已与 listbox/treeview 联动。
+
+**平台扩展点**：原生对话框/剪贴板由宿主回调注入
+`set_message_box_handler/set_file_dialog_handler/set_color_dialog_handler/
+set_dialog_handler/set_clipboard_getter/set_clipboard_sink`；内置实现目前
+只有 Linux GTK4（本仓库验证环境），macOS/Windows 宿主可自行注册平台原生
+实现，未注册时对话框回退默认按钮/空路径/初始色。IME 与基础 a11y 由 nsh
+原生 input/RichEditor/按钮承担；自绘控件补了关键标签（spinbox
+Increment/Decrement、toplevel Close window），Canvas/Chart 仍是纯绘制、
+无逐项 a11y 语义。M4 移动端依赖 nsh 的 iOS/Android 工程模板与 SDK，本仓库
+只保证 runtime/headless 跨平台可编译。
 
 **视觉验收（不用 TSX）**：Tcl 与 TSX 在同一生态位，因此截图走 Rust/GTK，
 不引入 `*.test.tsx` 或 nsh CLI：

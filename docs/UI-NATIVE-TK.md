@@ -131,8 +131,9 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
   `SliderEvent::PressStart`（Tk scale 的 `<Button-1>`）、
   Button/Checkbox/Radio/Slider 的 `Layout(Bounds)` 事件（组件根节点的
   `<Configure>`）、`EventKind::Wheel`（非 scroll 元素的 wheel，
-  nsh-platform-linux 无 Scroll 祖先时投递给指针下监听者，nsh-testing
-  提供 headless `wheel()`）。entry 选区拖动仍在 fork 待补。
+  nsh-platform-linux 无 Scroll 祖先时投递给指针下监听者、有 Scroll 时
+  也同时派发监听者，nsh-testing 提供 headless `wheel()`）、
+  `RichEditorEvent::Wheel`（富文本编辑器内容区）。
 
 ## 6. 里程碑
 
@@ -310,9 +311,9 @@ button/checkbutton/radiobutton/scale 的**组件自身节点**布局变化时派
 滚轮：listbox/treeview 用原生 scroll view 取得 wheel/pan，派发
 `<MouseWheel>`、`<Button-4|5>`（横向 6/7，Shift 作用于
 `<Shift-MouseWheel>`），无类绑定时按行高滚动虚拟化切片（原生偏移每次
-事件复位，只挂可见行）；canvas/entry/普通 text 通过 fork 的
-`EventKind::Wheel` 收 `<MouseWheel>` 与 `<Button-4|5>`（无 Scroll
-祖先时平台投递给指针下控件）。替换 `%W/%x/%y/%X/%Y/%b/%s/%K/%A/%D/%f/%w/%h/%k/%N/%R/%t/%#/%E/%d/%m`
+事件复位，只挂可见行）；canvas/entry/text（含 RichEditor 富文本）通过
+fork 的 `EventKind::Wheel` 收 `<MouseWheel>` 与 `<Button-4|5>`（无
+Scroll 祖先时平台投递给指针下控件，有 Scroll 时滚动与绑定同时发生）。替换 `%W/%x/%y/%X/%Y/%b/%s/%K/%A/%D/%f/%w/%h/%k/%N/%R/%t/%#/%E/%d/%m`
 （缺省用 Tk 的 `??`；`%D` 为滚轮 ±120、pan 位移、pinch×100、
 rotation×10）；`event generate` 接受 `-x/-y/-rootx/-rooty/-key/-keysym/
 -keycode/-button/-state/-delta/-width/-height/-time/-serial/-sendevent/
@@ -336,8 +337,9 @@ text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/se
 text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
 未实现；`<Configure>` 尚未覆盖菜单窗口；`<<Copy>>/<<Cut>>/<<SelectAll>>`
 等虚拟事件没有默认映射（可用 `event add` 自行定义）；
-富文本 text（RichEditor）的 wheel 未派发；entry 选区拖动
-（`<B1-Motion>`）仍只有原生行为；其它控件的 hover/motion 未派发；
+菜单窗口的 `<Configure>` 未派发；entry 选区拖动（`<B1-Motion>`）在桌面
+鼠标拖动时由平台 MouseMove 派发，headless 的 `drag` 是触摸模拟故不
+触发；其它控件的 hover/motion 未派发；
 Windows/Linux 菜单栏仍是 app 内实现
 （macOS 用系统菜单；nsh GTK 的 set_application_menu 实测不显示）；
 scrollbar 已与 listbox/treeview 联动。

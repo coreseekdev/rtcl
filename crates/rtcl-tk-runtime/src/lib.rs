@@ -5269,6 +5269,14 @@ fn wheel_scroll(interp: &mut Interp, path: &str, direction: f64) {
     notify_yscroll(interp, path, total);
 }
 
+/// A widget's frame changed: `<Configure>` with `%w/%h`.
+pub fn configure_event(path: &str, width: f64, height: f64) {
+    let mut ctx = EventCtx::for_path(path);
+    ctx.width = width.round() as i64;
+    ctx.height = height.round() as i64;
+    run_binding(path, "<Configure>", &ctx);
+}
+
 /// A key in a rich-text editor: dispatch the text widget's Tk `<KeyPress>`
 /// bindings (the editor is the class behavior).  Returns true when a binding
 /// returned `break` (the editor should not handle the key).

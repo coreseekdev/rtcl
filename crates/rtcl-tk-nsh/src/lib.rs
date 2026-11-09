@@ -1303,6 +1303,14 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 frame = frame.p(px(4.0));
             }
             let press_path = path.to_string();
+            let layout_path = path.to_string();
+            frame = frame.on_layout(move |b: &Bounds<Points>| {
+                rtcl_tk_runtime::configure_event(
+                    &layout_path,
+                    b.size.width.0 as f64,
+                    b.size.height.0 as f64,
+                );
+            });
             frame
                 .on_press(move |e: &PressEvent| {
                     rtcl_tk_runtime::widget_press(
@@ -1350,7 +1358,15 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let color = option_color(tree, path, "-foreground")
                 .unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
             let press_path = path.to_string();
+            let layout_path = path.to_string();
             container
+                .on_layout(move |b: &Bounds<Points>| {
+                    rtcl_tk_runtime::configure_event(
+                        &layout_path,
+                        b.size.width.0 as f64,
+                        b.size.height.0 as f64,
+                    );
+                })
                 .on_press(move |e: &PressEvent| {
                     rtcl_tk_runtime::widget_press(
                         &press_path,
@@ -1412,6 +1428,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let enter_path = path.clone();
             let leave_path = path.clone();
             let move_path = path.clone();
+            let layout_path = path.clone();
             nsh_base::input()
                 .value(rtcl_tk_runtime::entry_value(&path))
                 .auto_focus(rtcl_tk_runtime::focused(&path))
@@ -1465,6 +1482,13 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         e.position.y.0 as f64,
                         tk_button(e.pressed_button),
                         tk_state(&e.modifiers),
+                    );
+                })
+                .on_layout(move |b: &Bounds<Points>| {
+                    rtcl_tk_runtime::configure_event(
+                        &layout_path,
+                        b.size.width.0 as f64,
+                        b.size.height.0 as f64,
                     );
                 })
                 .into_element()
@@ -1711,7 +1735,15 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let color = option_color(tree, path, "-foreground")
                 .unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
             let press_path = path.to_string();
+            let layout_path = path.to_string();
             container
+                .on_layout(move |b: &Bounds<Points>| {
+                    rtcl_tk_runtime::configure_event(
+                        &layout_path,
+                        b.size.width.0 as f64,
+                        b.size.height.0 as f64,
+                    );
+                })
                 .on_press(move |e: &PressEvent| {
                     rtcl_tk_runtime::widget_press(
                         &press_path,
@@ -1877,7 +1909,15 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 )
             };
             let press_path = path.to_string();
+            let layout_path = path.to_string();
             track
+                .on_layout(move |b: &Bounds<Points>| {
+                    rtcl_tk_runtime::configure_event(
+                        &layout_path,
+                        b.size.width.0 as f64,
+                        b.size.height.0 as f64,
+                    );
+                })
                 .on_press(move |e: &PressEvent| {
                     rtcl_tk_runtime::widget_press(
                         &press_path,
@@ -2406,6 +2446,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 container = container.bg(bg);
             }
             let press_path = path.to_string();
+            let layout_path = path.to_string();
             let enter_path = path.to_string();
             let leave_path = path.to_string();
             let move_path = path.to_string();
@@ -2535,7 +2576,16 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         );
                     }
                 });
-            container.child(canvas).into_element()
+            container
+                .on_layout(move |b: &Bounds<Points>| {
+                    rtcl_tk_runtime::configure_event(
+                        &layout_path,
+                        b.size.width.0 as f64,
+                        b.size.height.0 as f64,
+                    );
+                })
+                .child(canvas)
+                .into_element()
         }
         WidgetKind::Chart => {
             let width = option(tree, path, "-width")

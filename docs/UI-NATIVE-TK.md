@@ -292,6 +292,8 @@ text 的 `<Key>`/`<KeyRelease>` 绑定（`break` 阻止编辑器插入），粘�
 `<Motion>`/`<B1-Motion>`（canvas 项也支持）、`<Enter>/<Leave>`、
 `<Touch>` 与 `<<TouchStart/Move/End>>`、`<<LongPress>>`、`<<Pan>>`、
 `<<Pinch>>`、`<<Rotation>>`；触摸轻点仍合成 `<Button-1>` 路径。
+`<Configure>` 在 frame/toplevel/label/message/progressbar/canvas/chart/
+entry 的布局变化时派发（`%w/%h` 为新尺寸）。
 滚轮：listbox/treeview 用原生 scroll view 取得 wheel/pan，派发
 `<MouseWheel>`、`<Button-4|5>`（横向 6/7，Shift 作用于
 `<Shift-MouseWheel>`），无类绑定时按行高滚动虚拟化切片（原生偏移每次
@@ -317,7 +319,8 @@ rotation×10）；`event generate` 接受 `-x/-y/-rootx/-rooty/-key/-keysym/
 text tag 已是光标级 WYSIWYG，marks 以富文档数据持久化（getdoc/setdoc
 可跨重启），并镜像回 Tk tag（`@rich-…`）；外部正文改写按差分平移 marks；
 text `undo/redo` 与 `tag bind` 暂为 no-op，`tk_messageBox`/剪贴板命令
-未实现；`<Configure>` 尚未从平台层派发；`<<Copy>>/<<Cut>>/<<SelectAll>>`
+未实现；`<Configure>` 只在上述原生 View/Input 控件上派发（button/
+listbox/treeview 等复合控件未接 layout）；`<<Copy>>/<<Cut>>/<<SelectAll>>`
 等虚拟事件没有默认映射（可用 `event add` 自行定义）；
 滚轮绑定只在 listbox/treeview（有原生 scroll view）；canvas/text/entry
 的 wheel 未派发；scale 的按下事件、entry 选区拖动（`<B1-Motion>`）仍

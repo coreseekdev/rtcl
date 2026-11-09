@@ -413,3 +413,31 @@ fn rich_text_key_bindings_fire() {
         app.screen().texts()
     );
 }
+
+const CONFIGURE_APP: &str = r#"
+set ::report ""
+frame .f
+pack .f -fill both -expand 1
+label .out -textvariable ::report
+pack .out
+bind .f <Configure> {if {%w > 500} {set ::report big}}
+"#;
+
+#[component]
+fn ConfigureApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(CONFIGURE_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+#[test]
+fn configure_fires_on_resize() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<ConfigureApp>()))
+        .expect("headless engine starts");
+    app.set_viewport(Size::new(Points(400.0), Points(300.0)))
+        .expect("resize");
+    let _ = app.settle();
+    app.set_viewport(Size::new(Points(700.0), Points(400.0)))
+        .expect("grow");
+    app.wait_for("big")
+        .expect("<Configure> reported the new width");
+}

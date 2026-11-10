@@ -162,6 +162,13 @@ pub struct PhotoImage {
     pub natural: (i64, i64),
     /// What the renderer loads: the file path, or a `data:` URI.
     pub source: String,
+    /// The pixel array `put`/`copy`/`blank` maintain (RGBA, row-major);
+    /// empty until the first pixel command.  A file/data photo only
+    /// decodes its header (no runtime decoder): its pixels start
+    /// transparent.
+    pub pixels: Vec<u8>,
+    pub pixel_w: i64,
+    pub pixel_h: i64,
 }
 
 /// A `text` tag: its options and the character ranges it covers.
@@ -6198,8 +6205,478 @@ fn photo_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let (width, height) = photo_size(&image);
             Ok(Value::from_int(if sub == "width" { width } else { height }))
         }
-        "put" | "read" | "write" | "copy" | "blank" | "transparency" | "data"
-        | "get" => Ok(Value::empty()),
+        "put" => {
+            if args.len() < 3 {
+                return Err(wrong("put", "data ?-to x1 y1 x2 y2?", args.len()));
+            }
+            // Rows of colors; `-to` gives the region the data tiles into.
+            let mut to: Option<(i64, i64, Option<i64>, Option<i64>)> = None;
+            let mut index = 3;
+            while index < args.len() {
+                if args[index].as_str() == "-to" {
+                    let nums: Vec<i64> = args[index + 1..]
+                        .iter()
+                        .take_while(|v| v.as_str().parse::<i64>().is_ok())
+                        .filter_map(|v| v.as_str().parse().ok())
+                        .collect();
+                    if nums.len() < 2 {
+                        return Err(generic("put: -to needs coordinates"));
+                    }
+                    to = Some((nums[0], nums[1], nums.get(2).copied(), nums.get(3).copied()));
+                    index += 1 + nums.len();
+                } else {
+                    return Err(bad_option(args[index].as_str()));
+                }
+            }
+            let rows = Value::from_str(args[2].as_str())
+                .as_list()
+                .unwrap_or_default();
+            let mut grid: Vec<Vec<[u8; 4]>> = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let words = row.as_list().unwrap_or_default();
+                let mut line = Vec::with_capacity(words.len());
+                for word in &words {
+                    let color = photo_parse_color(word.as_str()).ok_or_else(|| {
+                        generic(format!("put: unrecognized color \"{}\"", word.as_str()))
+                    })?;
+                    line.push(color);
+                }
+                grid.push(line);
+            }
+            let rows_len = grid.len() as i64;
+            let cols_len = grid.first().map_or(0, |r| r.len() as i64);
+            let (tx, ty, tx2, ty2) = match to {
+                Some((x, y, x2, y2)) => (x, y, x2.unwrap_or(x + cols_len), y2.unwrap_or(y + rows_len)),
+                None => (0, 0, cols_len, rows_len),
+            };
+            let region_w = (tx2 - tx).max(1);
+            let region_h = (ty2 - ty).max(1);
+            with_state_mut(interp, |rt| {
+                let Some(image) = rt.images.get_mut(name) else {
+                    return Err(generic(format!("image \"{name}\" doesn't exist")));
+                };
+                photo_grow(
+                    image,
+                    (tx + region_w).max(tx + cols_len),
+                    (ty + region_h).max(ty + rows_len),
+                );
+                for y in ty..ty + region_h {
+                    for x in tx..tx + region_w {
+                        let color = grid
+                            .get(((y - ty) % rows_len.max(1)) as usize)
+                            .and_then(|row| row.get(((x - tx) % cols_len.max(1)) as usize))
+                            .copied();
+                        let Some(color) = color else { continue };
+                        let at =
+                            ((y * image.pixel_w + x) * 4) as usize;
+                        photo_over(&mut image.pixels[at..at + 4], color);
+                    }
+                }
+                photo_sync_pixels(image);
+                rt.bump();
+                Ok::<(), Error>(())
+            })
+            .ok_or_else(|| bad_window(name))??;
+            Ok(Value::empty())
+        }
+        "get" => {
+            // `get x y ?-withalpha?`: the pixel as "r g b" (+ alpha).
+            let x = args.get(2).and_then(|v| v.as_str().parse::<i64>().ok());
+            let y = args.get(3).and_then(|v| v.as_str().parse::<i64>().ok());
+            let (Some(x), Some(y)) = (x, y) else {
+                return Err(wrong("get", "x y", args.len()));
+            };
+            let with_alpha = args.get(4).is_some_and(|v| v.as_str() == "-withalpha");
+            let image = with_state(interp, |rt| rt.images.get(name).cloned())
+                .flatten()
+                .ok_or_else(|| generic(format!("image \"{name}\" doesn't exist")))?;
+            if x < 0 || y < 0 || x >= image.pixel_w || y >= image.pixel_h {
+                return Err(generic(format!(
+                    "image \"{name}\" get: coordinate \"{x},{y}\" outside {w}x{h} image",
+                    w = image.pixel_w,
+                    h = image.pixel_h
+                )));
+            }
+            let at = ((y * image.pixel_w + x) * 4) as usize;
+            let pixel = &image.pixels[at..at + 4];
+            let mut parts: Vec<String> =
+                pixel.iter().take(3).map(|c| c.to_string()).collect();
+            if with_alpha {
+                parts.push(pixel[3].to_string());
+            }
+            Ok(list_value(parts))
+        }
+        "blank" => {
+            with_state_mut(interp, |rt| {
+                if let Some(image) = rt.images.get_mut(name) {
+                    image.pixels.iter_mut().for_each(|b| *b = 0);
+                    photo_sync_pixels(image);
+                    rt.bump();
+                }
+            });
+            Ok(Value::empty())
+        }
+        "transparency" => {
+            if args.len() < 3 {
+                return Err(wrong(
+                    "transparency",
+                    "get x y | set x y ?boolean?",
+                    args.len(),
+                ));
+            }
+            let sub = args[2].as_str();
+            let num = |index: usize| -> Result<i64> {
+                args.get(index)
+                    .and_then(|v| v.as_str().parse::<i64>().ok())
+                    .ok_or_else(|| wrong(sub, "x y ?boolean?", args.len()))
+            };
+            match sub {
+                "get" => {
+                    let (x, y) = (num(3)?, num(4)?);
+                    let image = with_state(interp, |rt| rt.images.get(name).cloned())
+                        .flatten()
+                        .ok_or_else(|| generic(format!("image \"{name}\" doesn't exist")))?;
+                    if x < 0 || y < 0 || x >= image.pixel_w || y >= image.pixel_h {
+                        return Err(generic(format!(
+                            "image \"{name}\" transparency get: coordinate \"{x},{y}\" outside {w}x{h} image",
+                            w = image.pixel_w,
+                            h = image.pixel_h
+                        )));
+                    }
+                    let at = ((y * image.pixel_w + x) * 4 + 3) as usize;
+                    Ok(Value::from_int(i64::from(image.pixels[at] == 0)))
+                }
+                "set" => {
+                    let (x, y) = (num(3)?, num(4)?);
+                    let on = args
+                        .get(5)
+                        .map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"))
+                        .unwrap_or(true);
+                    with_state_mut(interp, |rt| {
+                        let Some(image) = rt.images.get_mut(name) else {
+                            return Err(generic(format!("image \"{name}\" doesn't exist")));
+                        };
+                        if x < 0 || y < 0 || x >= image.pixel_w || y >= image.pixel_h {
+                            return Err(generic(format!(
+                                "image \"{name}\" transparency set: coordinate \"{x},{y}\" outside {w}x{h} image",
+                                w = image.pixel_w,
+                                h = image.pixel_h
+                            )));
+                        }
+                        let at = ((y * image.pixel_w + x) * 4 + 3) as usize;
+                        image.pixels[at] = if on { 0 } else { 255 };
+                        photo_sync_pixels(image);
+                        rt.bump();
+                        Ok::<(), Error>(())
+                    })
+                    .ok_or_else(|| bad_window(name))??;
+                    Ok(Value::empty())
+                }
+                other => Err(generic(format!(
+                    "bad option \"{other}\": must be get or set"
+                ))),
+            }
+        }
+        "copy" => {
+            // `copy srcImg ?-from x1 y1 x2 y2? ?-to x y? ?-zoom sx ?sy??
+            // ?-subsample sx ?sy?? ?-shrink?` (subsample before zoom).
+            let mut from: Option<(i64, i64, i64, i64)> = None;
+            let mut to = (0, 0);
+            let mut zoom = (1i64, 1i64);
+            let mut subsample = (1i64, 1i64);
+            let mut shrink = false;
+            let mut index = 3;
+            let nums_after = |args: &[Value], index: usize| -> (Vec<i64>, usize) {
+                let values: Vec<i64> = args[index..]
+                    .iter()
+                    .take_while(|v| v.as_str().parse::<i64>().is_ok())
+                    .filter_map(|v| v.as_str().parse().ok())
+                    .collect();
+                (values.clone(), values.len())
+            };
+            while index < args.len() {
+                match args[index].as_str() {
+                    "-from" => {
+                        let (values, taken) = nums_after(args, index + 1);
+                        if values.len() < 4 {
+                            return Err(generic("copy: -from needs 4 coordinates"));
+                        }
+                        from = Some((values[0], values[1], values[2], values[3]));
+                        index += taken;
+                    }
+                    "-to" => {
+                        let (values, taken) = nums_after(args, index + 1);
+                        if values.len() < 2 {
+                            return Err(generic("copy: -to needs coordinates"));
+                        }
+                        to = (values[0], values[1]);
+                        index += taken;
+                    }
+                    "-zoom" => {
+                        let (values, taken) = nums_after(args, index + 1);
+                        if values.is_empty() {
+                            return Err(generic("copy: -zoom needs a factor"));
+                        }
+                        zoom = (values[0], *values.get(1).unwrap_or(&values[0]));
+                        index += taken;
+                    }
+                    "-subsample" => {
+                        let (values, taken) = nums_after(args, index + 1);
+                        if values.is_empty() {
+                            return Err(generic("copy: -subsample needs a factor"));
+                        }
+                        subsample = (values[0], *values.get(1).unwrap_or(&values[0]));
+                        index += taken;
+                    }
+                    "-shrink" => shrink = true,
+                    other => return Err(bad_option(other)),
+                }
+                index += 1;
+            }
+            if zoom.0 <= 0 || zoom.1 <= 0 || subsample.0 <= 0 || subsample.1 <= 0 {
+                return Err(generic(
+                    "copy: zoom and subsample factors must be positive",
+                ));
+            }
+            let source = with_state(interp, |rt| rt.images.get(name).cloned())
+                .flatten()
+                .ok_or_else(|| generic(format!("image \"{name}\" doesn't exist")))?;
+            let src_name = args[2].as_str();
+            let src = with_state(interp, |rt| rt.images.get(src_name).cloned())
+                .flatten()
+                .ok_or_else(|| generic(format!("image \"{src_name}\" doesn't exist")))?;
+            let (sx0, sy0, sx1, sy1) = from.unwrap_or((
+                0,
+                0,
+                src.pixel_w.max(src.natural.0),
+                src.pixel_h.max(src.natural.1),
+            ));
+            let out_w = (sx1 - sx0) / subsample.0 * zoom.0;
+            let out_h = (sy1 - sy0) / subsample.1 * zoom.1;
+            with_state_mut(interp, |rt| {
+                let Some(image) = rt.images.get_mut(name) else {
+                    return Err(generic(format!("image \"{name}\" doesn't exist")));
+                };
+                if image.pixels.is_empty() {
+                    // Copying onto a header-only photo starts its pixels.
+                    image.pixel_w = 0;
+                    image.pixel_h = 0;
+                }
+                photo_grow(image, to.0 + out_w, to.1 + out_h);
+                for oy in 0..out_h {
+                    for ox in 0..out_w {
+                        let sx = sx0 + ox / zoom.0 * subsample.0;
+                        let sy = sy0 + oy / zoom.1 * subsample.1;
+                        if sx < 0 || sy < 0 || sx >= src.pixel_w || sy >= src.pixel_h {
+                            continue;
+                        }
+                        let from_at = ((sy * src.pixel_w + sx) * 4) as usize;
+                        let at = (((to.1 + oy) * image.pixel_w + to.0 + ox) * 4) as usize;
+                        let pixel: [u8; 4] =
+                            src.pixels[from_at..from_at + 4].try_into().unwrap();
+                        photo_over(&mut image.pixels[at..at + 4], pixel);
+                    }
+                }
+                if shrink {
+                    image.pixel_w = to.0 + out_w;
+                    image.pixel_h = to.1 + out_h;
+                    let kept = (image.pixel_w * image.pixel_h * 4) as usize;
+                    image.pixels.truncate(kept.max(0));
+                }
+                photo_sync_pixels(image);
+                rt.bump();
+                Ok::<(), Error>(())
+            })
+            .ok_or_else(|| bad_window(name))??;
+            Ok(Value::empty())
+        }
+        "data" => {
+            // ?-background c? ?-format f? ?-from x1 y1 x2 y2?
+            // ?-grayscale bool?: color rows by default, base64 PNG for
+            // `-format png` (Tk returns binary; scripts that hand the
+            // value back to `configure -data` need the text form here).
+            let mut from: Option<(i64, i64, i64, i64)> = None;
+            let mut format = String::new();
+            let mut grayscale = false;
+            let mut index = 2;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "-from" => {
+                        let values: Vec<i64> = args[index + 1..]
+                            .iter()
+                            .take_while(|v| v.as_str().parse::<i64>().is_ok())
+                            .filter_map(|v| v.as_str().parse().ok())
+                            .collect();
+                        if values.len() < 4 {
+                            return Err(generic("data: -from needs 4 coordinates"));
+                        }
+                        from = Some((values[0], values[1], values[2], values[3]));
+                        index += 4;
+                    }
+                    "-format" => {
+                        format = args.get(index + 1).map(|v| v.as_str().to_ascii_lowercase())
+                            .unwrap_or_default();
+                        index += 1;
+                    }
+                    "-background" => index += 1,
+                    "-grayscale" => {
+                        grayscale = args
+                            .get(index + 1)
+                            .is_some_and(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"));
+                        index += 1;
+                    }
+                    other => return Err(bad_option(other)),
+                }
+                index += 1;
+            }
+            let image = with_state(interp, |rt| rt.images.get(name).cloned())
+                .flatten()
+                .ok_or_else(|| generic(format!("image \"{name}\" doesn't exist")))?;
+            if image.pixels.is_empty() {
+                return Ok(Value::from_str(""));
+            }
+            let (x0, y0, x1, y1) = from
+                .unwrap_or((0, 0, image.pixel_w, image.pixel_h))
+                ;
+            let (x1, y1) = (x1.min(image.pixel_w), y1.min(image.pixel_h));
+            if x0 < 0 || y0 < 0 || x1 <= x0 || y1 <= y0 {
+                return Ok(Value::from_str(""));
+            }
+            let mut rows: Vec<String> = Vec::with_capacity((y1 - y0) as usize);
+            match format.as_str() {
+                "" | "default" => {
+                    for y in y0..y1 {
+                        let mut row: Vec<String> = Vec::new();
+                        for x in x0..x1 {
+                            let at = ((y * image.pixel_w + x) * 4) as usize;
+                            let pixel = &image.pixels[at..at + 4];
+                            let channel = |value: u8| {
+                                if grayscale {
+                                    let luma = (u16::from(value) * 3
+                                        + u16::from(pixel[1]) * 4
+                                        + u16::from(pixel[2]))
+                                        / 8;
+                                    luma as u8
+                                } else {
+                                    value
+                                }
+                            };
+                            if pixel[3] == 255 {
+                                row.push(format!(
+                                    "#{:02x}{:02x}{:02x}",
+                                    channel(pixel[0]),
+                                    channel(pixel[1]),
+                                    channel(pixel[2])
+                                ));
+                            } else {
+                                row.push(format!(
+                                    "{{{} {} {} {}}}",
+                                    channel(pixel[0]),
+                                    channel(pixel[1]),
+                                    channel(pixel[2]),
+                                    pixel[3]
+                                ));
+                            }
+                        }
+                        rows.push(list_value(row).as_str().to_string());
+                    }
+                    Ok(list_value(rows))
+                }
+                "png" => {
+                    let mut rgba = Vec::with_capacity(((x1 - x0) * (y1 - y0) * 4) as usize);
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            let at = ((y * image.pixel_w + x) * 4) as usize;
+                            rgba.extend_from_slice(&image.pixels[at..at + 4]);
+                        }
+                    }
+                    let png = png_encode((x1 - x0) as u32, (y1 - y0) as u32, &rgba);
+                    Ok(Value::from_str(&encode_base64(&png)))
+                }
+                other => Err(generic(format!(
+                    "data: image format \"{other}\" is not supported (png, default)"
+                ))),
+            }
+        }
+        "write" => {
+            // fileName ?-format png? ?-from x1 y1 x2 y2? ?-grayscale bool?
+            let mut from: Option<(i64, i64, i64, i64)> = None;
+            let mut format = String::from("png");
+            let mut grayscale = false;
+            let mut index = 3;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "-from" => {
+                        let values: Vec<i64> = args[index + 1..]
+                            .iter()
+                            .take_while(|v| v.as_str().parse::<i64>().is_ok())
+                            .filter_map(|v| v.as_str().parse().ok())
+                            .collect();
+                        if values.len() < 4 {
+                            return Err(generic("write: -from needs 4 coordinates"));
+                        }
+                        from = Some((values[0], values[1], values[2], values[3]));
+                        index += 4;
+                    }
+                    "-format" => {
+                        format = args.get(index + 1).map(|v| v.as_str().to_ascii_lowercase())
+                            .unwrap_or_else(|| "png".into());
+                        index += 1;
+                    }
+                    "-background" => index += 1,
+                    "-grayscale" => {
+                        grayscale = args
+                            .get(index + 1)
+                            .is_some_and(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"));
+                        index += 1;
+                    }
+                    other => return Err(bad_option(other)),
+                }
+                index += 1;
+            }
+            if format != "png" {
+                return Err(generic(format!(
+                    "write: image format \"{format}\" is not supported (png)"
+                )));
+            }
+            let image = with_state(interp, |rt| rt.images.get(name).cloned())
+                .flatten()
+                .ok_or_else(|| generic(format!("image \"{name}\" doesn't exist")))?;
+            if image.pixels.is_empty() {
+                return Err(generic(format!(
+                    "image \"{name}\" has no pixel data to write"
+                )));
+            }
+            let (x0, y0, x1, y1) = from
+                .map(|(x0, y0, x1, y1)| {
+                    (x0, y0, x1.min(image.pixel_w), y1.min(image.pixel_h))
+                })
+                .unwrap_or((0, 0, image.pixel_w, image.pixel_h));
+            let mut rgba = Vec::with_capacity(((x1 - x0) * (y1 - y0) * 4) as usize);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let at = ((y * image.pixel_w + x) * 4) as usize;
+                    let pixel = &image.pixels[at..at + 4];
+                    if grayscale {
+                        let luma = |c: u8| {
+                            ((u16::from(pixel[0]) * 3 + u16::from(pixel[1]) * 4
+                                + u16::from(pixel[2]))
+                                / 8) as u8
+                        };
+                        let gray = luma(pixel[0]);
+                        rgba.extend_from_slice(&[gray, gray, gray, pixel[3]]);
+                    } else {
+                        rgba.extend_from_slice(pixel);
+                    }
+                }
+            }
+            let png = png_encode((x1 - x0) as u32, (y1 - y0) as u32, &rgba);
+            let file = args[2].as_str();
+            std::fs::write(file, &png)
+                .map_err(|e| generic(format!("couldn't write \"{file}\": {e}")))?;
+            Ok(Value::empty())
+        }
+        "read" | "redraw" => Ok(Value::empty()),
         other => Err(generic(format!(
             "bad option \"{other}\": must be blank, cget, configure, copy, data, get, height, put, read, transparency, width, or write"
         ))),
@@ -6244,12 +6721,233 @@ pub fn text_image_files(path: &str) -> Vec<(usize, String, i64, i64)> {
 }
 
 /// A photo's reported size: the configured `-width`/`-height` when nonzero,
-/// otherwise the intrinsic size of its data (Tk semantics).
+/// otherwise its pixel array when one exists, otherwise the intrinsic size
+/// of its data (Tk semantics).
 fn photo_size(image: &PhotoImage) -> (i64, i64) {
+    if image.width > 0 && image.height > 0 {
+        return (image.width, image.height);
+    }
+    if image.pixel_w > 0 && image.pixel_h > 0 {
+        return (image.pixel_w, image.pixel_h);
+    }
     (
         if image.width > 0 { image.width } else { image.natural.0 },
         if image.height > 0 { image.height } else { image.natural.1 },
     )
+}
+
+/// One put/copy color: `#rgb`, `#rrggbb`, `#rrggbbaa` or an `{r g b a}`
+/// list of 0–255 values.
+fn photo_parse_color(word: &str) -> Option<[u8; 4]> {
+    if let Some(hex) = word.strip_prefix('#') {
+        return match hex.len() {
+            3 => {
+                let v: Vec<u8> = hex
+                    .chars()
+                    .filter_map(|c| c.to_digit(16).map(|d| (d * 17) as u8))
+                    .collect();
+                (v.len() == 3).then(|| [v[0], v[1], v[2], 255])
+            }
+            6 | 8 => {
+                let v: Vec<u8> = (0..hex.len() / 2)
+                    .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+                    .collect();
+                match v.len() {
+                    3 => Some([v[0], v[1], v[2], 255]),
+                    4 => Some([v[0], v[1], v[2], v[3]]),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+    }
+    let stripped = word.trim_start_matches('{').trim_end_matches('}').trim();
+    let parts: Vec<u8> = Value::from_str(stripped)
+        .as_list()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().parse::<u8>().ok())
+        .collect();
+    match parts.len() {
+        3 => Some([parts[0], parts[1], parts[2], 255]),
+        4 => Some([parts[0], parts[1], parts[2], parts[3]]),
+        _ => None,
+    }
+}
+
+/// Blends `src` over `dst` in straight alpha (Tk's compositing rule for
+/// `put`): `out_a = a_s + a_d·(1−a_s)`, colors weighted accordingly.
+fn photo_over(dst: &mut [u8], src: [u8; 4]) {
+    let (sa, da) = (u32::from(src[3]), u32::from(dst[3]));
+    let oa = sa + da * (255 - sa) / 255;
+    if oa == 0 {
+        dst.copy_from_slice(&[0, 0, 0, 0]);
+    } else {
+        for channel in 0..3 {
+            dst[channel] =
+                ((u32::from(src[channel]) * sa + u32::from(dst[channel]) * da * (255 - sa) / 255)
+                    / oa) as u8;
+        }
+        dst[3] = oa.min(255) as u8;
+    }
+}
+
+/// Rebuilds a pixel photo's renderer source: its pixels as a PNG data URI
+/// (the pixel array is the display truth, like Tk's).
+fn photo_sync_pixels(image: &mut PhotoImage) {
+    if image.pixels.is_empty() {
+        return;
+    }
+    image.natural = (image.pixel_w, image.pixel_h);
+    let png = png_encode(image.pixel_w.max(0) as u32, image.pixel_h.max(0) as u32, &image.pixels);
+    image.source = format!(
+        "data:image/png;base64,{}",
+        encode_base64(&png)
+    );
+}
+
+/// Grows the pixel array to include the rectangle, transparent-filled.
+fn photo_grow(image: &mut PhotoImage, w: i64, h: i64) {
+    if w <= image.pixel_w && h <= image.pixel_h {
+        return;
+    }
+    let (nw, nh) = (w.max(image.pixel_w), h.max(image.pixel_h));
+    let mut pixels = vec![0u8; (nw * nh * 4).max(0) as usize];
+    for y in 0..image.pixel_h.max(0) {
+        let from = (y * image.pixel_w * 4) as usize;
+        let to = (y * nw * 4) as usize;
+        let row = (image.pixel_w * 4).max(0) as usize;
+        pixels[to..to + row].copy_from_slice(&image.pixels[from..from + row]);
+    }
+    image.pixels = pixels;
+    image.pixel_w = nw;
+    image.pixel_h = nh;
+}
+
+// --- A minimal PNG encoder: zlib with stored (uncompressed) deflate
+// blocks, so no compression crate is needed. ---
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut table = [0u32; 256];
+    for (i, entry) in table.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+        }
+        *entry = c;
+    }
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc = table[((crc ^ u32::from(byte)) & 0xff) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in data {
+        a = (a + u32::from(byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+/// Decodes the PNGs this runtime writes (8-bit RGBA, stored deflate,
+/// unfiltered rows); `None` for anything else, which the renderer still
+/// shows but the runtime cannot read pixels from.
+fn decode_stored_png(bytes: &[u8]) -> Option<(i64, i64, Vec<u8>)> {
+    let (mut width, mut height) = (0u32, 0u32);
+    let mut idat: Vec<u8> = Vec::new();
+    let mut at = 8;
+    while at + 8 <= bytes.len() {
+        let len = u32::from_be_bytes(bytes[at..at + 4].try_into().ok()?) as usize;
+        let kind = bytes.get(at + 4..at + 8)?;
+        let data = bytes.get(at + 8..at + 8 + len)?;
+        match kind {
+            b"IHDR" => {
+                width = u32::from_be_bytes(data[0..4].try_into().ok()?);
+                height = u32::from_be_bytes(data[4..8].try_into().ok()?);
+                if data[8] != 8 || data[9] != 6 || data[12] != 0 {
+                    return None; // not 8-bit RGBA non-interlaced
+                }
+            }
+            b"IDAT" => idat.extend_from_slice(data),
+            b"IEND" => break,
+            _ => {}
+        }
+        at += 12 + len;
+    }
+    if width == 0 || height == 0 || idat.len() < 2 {
+        return None;
+    }
+    // Stored-deflate blocks; ignore the zlib header and check nothing but
+    // the lengths (our encoder's output).
+    let mut raw: Vec<u8> = Vec::with_capacity((width * height * 4) as usize);
+    let mut at = 2;
+    while at < idat.len() {
+        let final_block = idat[at] & 1 == 1;
+        if idat[at] & 0xfe != 0 {
+            return None; // a compressed block: beyond this decoder
+        }
+        let len = u16::from_le_bytes(idat[at + 1..at + 3].try_into().ok()?) as usize;
+        // [type][LEN(2)][NLEN(2)] then the bytes.
+        raw.extend_from_slice(idat.get(at + 5..at + 5 + len)?);
+        at += 5 + len;
+        if final_block {
+            break;
+        }
+    }
+    let stride = (width * 4) as usize;
+    if raw.len() < height as usize * (stride + 1) {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity(raw.len());
+    for row in raw.chunks(stride + 1) {
+        if row[0] != 0 {
+            return None; // a filtered row: beyond this decoder
+        }
+        rgba.extend_from_slice(&row[1..]);
+    }
+    Some((width as i64, height as i64, rgba))
+}
+
+/// Encodes RGBA pixels as a PNG (8-bit RGBA, stored deflate).
+fn png_encode(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    // Raw scanlines with a "no filter" byte per row.
+    let mut raw = Vec::with_capacity((width * height * 4 + height) as usize);
+    for y in 0..height {
+        raw.push(0);
+        let start = (y * width * 4) as usize;
+        raw.extend_from_slice(&rgba[start..start + (width * 4) as usize]);
+    }
+    let mut zlib = vec![0x78, 0x01];
+    let chunks = raw.chunks(0xffff);
+    let last = chunks.len().saturating_sub(1);
+    for (i, block) in chunks.enumerate() {
+        zlib.push(if i == last { 1 } else { 0 });
+        let len = block.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+    let mut out = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let mut chunk = |out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]| {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let crc = crc32(&out[start..]);
+        out.extend_from_slice(&crc.to_be_bytes());
+    };
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &zlib);
+    chunk(&mut out, b"IEND", &[]);
+    out
 }
 
 /// A photo image's reported size.
@@ -6289,6 +6987,11 @@ fn photo_refresh(image: &mut PhotoImage) -> Result<()> {
     } else {
         return Ok(()); // no data configured yet: a blank 0-sized photo
     };
+    // A photo with runtime pixels shows those, whatever its source says.
+    if !image.pixels.is_empty() {
+        photo_sync_pixels(image);
+        return Ok(());
+    }
     let Some(size) = image_intrinsic_size(&bytes) else {
         return Err(generic(if file.is_empty() {
             "couldn't recognize image data".to_string()
@@ -6297,6 +7000,15 @@ fn photo_refresh(image: &mut PhotoImage) -> Result<()> {
         }));
     };
     image.natural = size;
+    // Our own stored-deflate PNGs decode back to real pixels, so a
+    // `data`/`write` round trip keeps `get`/`put` working.
+    if let Some((w, h, pixels)) = decode_stored_png(&bytes) {
+        image.pixels = pixels;
+        image.pixel_w = w;
+        image.pixel_h = h;
+        photo_sync_pixels(image);
+        return Ok(());
+    }
     image.source = if !file.is_empty() {
         file
     } else if let Some(rest) = data.strip_prefix("data:") {
@@ -13058,6 +13770,95 @@ mod tests {
     }
 
     #[test]
+    fn photo_pixels_put_get_copy_transparency_data_write() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "image create photo p");
+        assert_eq!(eval(&mut i, "image width p"), "0");
+
+        // put grows the photo: rows of colors, hex and {r g b a} lists.
+        eval(&mut i, "p put {{#ff0000 #008000} {#0000ff {250 0 0 128}}}");
+        assert_eq!(eval(&mut i, "image width p"), "2");
+        assert_eq!(eval(&mut i, "image height p"), "2");
+        assert_eq!(eval(&mut i, "p get 0 0"), "255 0 0");
+        assert_eq!(eval(&mut i, "p get 1 0"), "0 128 0");
+        assert_eq!(eval(&mut i, "p get 0 1"), "0 0 255");
+        assert_eq!(eval(&mut i, "p get 1 1 -withalpha"), "250 0 0 128");
+        assert!(i.eval("p get 5 5").is_err());
+
+        // The pixels are the display truth: a PNG data URI.
+        assert!(image_path("p")
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+
+        // put -to tiles the data and grows to the region's end.
+        eval(&mut i, "p put {{#ffffff}} -to 1 3 4 5");
+        assert_eq!(eval(&mut i, "image width p"), "4");
+        assert_eq!(eval(&mut i, "image height p"), "5");
+        assert_eq!(eval(&mut i, "p get 3 4"), "255 255 255");
+        // Grown area starts transparent, like Tk.
+        assert_eq!(eval(&mut i, "p get 3 0"), "0 0 0");
+        assert_eq!(eval(&mut i, "p transparency get 3 0"), "1");
+
+        // transparency
+        eval(&mut i, "p transparency set 0 0");
+        assert_eq!(eval(&mut i, "p transparency get 0 0"), "1");
+        assert_eq!(eval(&mut i, "p get 0 0 -withalpha"), "255 0 0 0");
+        eval(&mut i, "p transparency set 0 0 off");
+        assert_eq!(eval(&mut i, "p transparency get 0 0"), "0");
+
+        // copy: zoom and subsample.
+        eval(&mut i, "image create photo q");
+        eval(&mut i, "q copy p -from 0 0 2 2 -zoom 2");
+        assert_eq!(eval(&mut i, "image width q"), "4");
+        assert_eq!(eval(&mut i, "q get 1 1"), "255 0 0");
+        // zoom halves: (0,1) and (1,1) both sample p(0,0)… (1,0).
+        assert_eq!(eval(&mut i, "q get 0 2"), "0 0 255");
+        assert_eq!(eval(&mut i, "q get 2 0"), "0 128 0");
+        eval(&mut i, "image create photo r");
+        eval(&mut i, "r copy q -from 0 0 4 4 -subsample 2");
+        assert_eq!(eval(&mut i, "image width r"), "2");
+        assert_eq!(eval(&mut i, "r get 0 1"), "0 0 255");
+
+        // data (default form) round-trips through put, alpha included.
+        let data = eval(&mut i, "p data -from 0 0 2 2");
+        assert!(data.contains("{250 0 0 128}"), "{data}");
+        eval(&mut i, "image create photo s");
+        eval(&mut i, &format!("s put {{{data}}}"));
+        assert_eq!(
+            eval(&mut i, "s get 1 1 -withalpha"),
+            eval(&mut i, "p get 1 1 -withalpha")
+        );
+
+        // data -format png re-loads as a real photo; write produces the
+        // same bytes on disk.
+        let png = eval(&mut i, "p data -format png -from 0 0 2 2");
+        let png_bytes = decode_base64_payload(&png).unwrap();
+        eprintln!("PROBE decoded={:?}", decode_stored_png(&png_bytes).map(|(w,h,_)|(w,h)));
+        eval(&mut i, &format!("image create photo t -data {png}"));
+        assert_eq!(eval(&mut i, "image width t"), "2");
+        assert_eq!(eval(&mut i, "t get 0 1"), "0 0 255");
+        let path = std::env::temp_dir().join("rtcl-photo-write.png");
+        eval(&mut i, &format!("t write {}", path.to_string_lossy()));
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+        eval(
+            &mut i,
+            &format!("image create photo u -file {}", path.to_string_lossy()),
+        );
+        assert_eq!(eval(&mut i, "image width u"), "2");
+        assert_eq!(eval(&mut i, "u get 0 1"), "0 0 255");
+
+        // blank clears to transparent; grayscale data grays.
+        eval(&mut i, "p blank");
+        assert_eq!(eval(&mut i, "p get 0 0"), "0 0 0");
+        assert_eq!(eval(&mut i, "p transparency get 0 0"), "1");
+        eval(&mut i, "p put {{#ff0000 #ffffff}}");
+        let gray = eval(&mut i, "p data -grayscale 1 -from 0 0 2 1");
+        assert!(gray.contains("#5f0000") || gray.contains("#5f"), "red luma 0x5f in {gray}");
+    }
+
+    #[test]
     fn photo_intrinsic_size_and_sources() {
         // Header parsing: PNG, GIF, BMP and JPEG dimensions.
         assert_eq!(image_intrinsic_size(TINY_PNG), Some((1, 1)));
@@ -15382,5 +16183,25 @@ mod press_debug_tests {
         assert_eq!(eval(&mut i, "set ::n"), "1");
         eval(&mut i, ".m entryconfigure 0 -state normal; .m invoke 0");
         assert_eq!(eval(&mut i, "set ::n"), "2");
+    }
+}
+
+#[cfg(test)]
+mod png_probe {
+    use super::*;
+
+    #[test]
+    fn probe_png_roundtrip() {
+        let rgba = vec![255u8, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 250, 0, 0, 128];
+        let png = png_encode(2, 2, &rgba);
+        eprintln!("PROBE sig={:?}", &png[..8]);
+        let mut at = 8;
+        while at + 8 <= png.len() {
+            let len = u32::from_be_bytes(png[at..at + 4].try_into().unwrap()) as usize;
+            eprintln!("PROBE chunk kind={:?} len={len}", &png[at + 4..at + 8]);
+            at += 12 + len;
+        }
+        eprintln!("PROBE decode={:?}", decode_stored_png(&png).map(|(w, h, _)| (w, h)));
+        assert_eq!(decode_stored_png(&png).map(|(w, h, _)| (w, h)), Some((2, 2)));
     }
 }

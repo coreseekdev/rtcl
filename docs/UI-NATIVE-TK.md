@@ -353,6 +353,19 @@ Mounter→Images.request→fetch 管线本就完整，file:// 与 data: 均支�
 固有尺寸修复后已在模拟器复验：`label -image` 与 text 内联 image
 **均绘制**（x86_64 模拟器截图，2026-11-11）。桌面 GTK 快照仍受首帧
 局限（nsh image 异步解码后快照为空），交互运行时应可见。
+**photo 像素引擎（2026-11-11）**：`put`（行×颜色，`#rgb/#rrggbb/
+#rrggbbaa` 或 `{r g b a}` 列表；`-to` 区域内平铺、自动扩图、straight
+alpha 合成）、`get x y ?-withalpha?`（越界按 Tk 报错）、`blank`、
+`transparency get/set`、`copy src ?-from/-to/-zoom/-subsample/-shrink?`
+（先 subsample 后 zoom）、`data ?-from/-grayscale?`（默认颜色行列表，
+`-format png` 返回 base64——Tk 返回二进制，这里取文本形态以便
+`configure -data` 回灌）、`write file ?-format png/-from/-grayscale?`。
+runtime 自带无压缩 PNG 编码器（stored deflate + CRC32/Adler32，无新
+依赖）与对应解码器（只解自己写出的形态），像素数组即显示真相：有像素
+时渲染源是 `data:image/png;base64`，`data/write → -data/-file` 往返
+保留 `get/put` 能力；`-file/-data` 创建的照片头解析可读尺寸但**不解码
+像素**（像素操作从透明起算，与 Tk 的差异点）。`read` 仍为 no-op
+（需 GIF/PPM 解码器）。
 `tag bind tagName ?sequence? ?script?` 把事件绑定到 tag 区间：富文本编辑器
 按下时按指针下的文档位置映射成字符下标，命中区间的 tag 依次执行最具体的
 sequence（`<Button-1>`、Double/Triple/Quadruple、`<ButtonRelease-1>`、

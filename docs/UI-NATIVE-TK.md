@@ -510,19 +510,23 @@ Windows 的 `tk_messageBox` 是 `MessageBoxW`（`-type` 六组按钮、`-icon`
 `OFN_NOCHANGEDIR` 保持 cwd，返回路径转正斜杠——`file normalize` 的形态）；
 `tk_chooseDirectory` 是 `SHBrowseForFolderW`（BFFM_SETSELECTIONW 定位
 `-initialdir`，apartment 可用时带新建目录样式）；`tk_chooseColor` 是
-`ChooseColorW`（十六自定义色跨调用保留，返回 `#rrggbb`）；剪贴板 getter 读
+`ChooseColorW`（十六自定义色跨调用保留，返回 `#rrggbb`）；`tk_dialog`
+是内存 `DLGTEMPLATE` + `DialogBoxIndirectParamW`（消息在顶、按钮在底、
+default 获焦点、Esc/关闭返回 default——经典模板不需要 comctl32 v6；
+坑：经典模板的 DS_SETFONT 字体块只有 pointsize+typeface，几何忘传
+会得到 0×0 细条窗）；剪贴板 getter 读
 `CF_UNICODETEXT`；screen metrics 用 `GetSystemMetrics`；bell 用
-`MessageBeep`；vwait 泵走 `PeekMessageW/DispatchMessageW`。`tk_dialog`
-在 Windows 暂无原生实现（TaskDialog 需 comctl32 v6 manifest），回退
-default 按钮。**Windows 实机验证（2026-11-11，Vagrant Win11 VM，
+`MessageBeep`；vwait 泵走 `PeekMessageW/DispatchMessageW`。
+**Windows 实机验证（2026-11-11，Vagrant Win11 VM，
 x86_64-pc-windows-gnu + MSYS2）**：宿主机交叉编译整个 app（`cargo build
 -p rtcl-tk-app-native --target x86_64-pc-windows-gnu`，>0 错误即失败，
 strip 后仅依赖系统 DLL），截图确认原生 Win32 标题栏、`SetMenu` 菜单栏
 （File 菜单）、`tk_messageBox -type ok -icon information` 弹出
-MessageBoxW（标题/正文/图标/OK 全对）、label `-image` 与 text 内联
-image 均绘制（固有尺寸修复生效）；**OPEN**：entry `-width` 在
-Windows 渲染过窄（GTK 正常，nsh Input 的字符宽度待查）；
-`tk_dialog` Windows 原生实现仍缺。构建坑见仓库外记录：WinRM shell
+MessageBoxW（标题/正文/图标/OK 全对）、`tk_dialog` 弹出模板
+DialogBox（三按钮、default 获焦点）、entry `-width` 字符宽度下限生效
+（此前 Windows/Android 过窄：pack 非 fill 收缩时 w_full 塌缩，
+现按 ~8px/字符给 min_w，GTK 填充行为不变）、label `-image` 与 text
+内联 image 均绘制（固有尺寸修复生效）。构建坑见仓库外记录：WinRM shell
 默认 4GB 内存配额会杀死并行 rustc（构建须经计划任务跑）、fork 的
 WebView2 静态库是 MSVC 专用（fork 49b1afc 起非 MSVC 懒加载
 WebView2Loader.dll）。macOS 宿主可自行注册平台原生实现；未注册时对话框回退默认
@@ -549,8 +553,6 @@ label "Tapped!"（docs/images/tk-android*.png）。宿主钩子（对话框/
 剪贴板）android 侧未注册，回退默认值。**图片复验通过**（固有尺寸
 修复后）：label -image 与 text 内联 image 在 x86_64 模拟器均绘制；
 菜单以 app 内菜单栏呈现（Android 不经桌面 runner，未开原生菜单）。
-**OPEN（跨平台）**：entry `-width` 在 Windows/Android 均渲染过窄
-（GTK 正常，nsh Input 字符宽度待查）。
 
 **视觉验收（不用 TSX）**：Tcl 与 TSX 在同一生态位，因此截图走 Rust/GTK，
 不引入 `*.test.tsx` 或 nsh CLI：

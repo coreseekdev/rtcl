@@ -22,11 +22,13 @@ use windows::Win32::UI::Shell::{
     BROWSEINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetSystemMetrics, MessageBoxW, PeekMessageW, PostQuitMessage,
-    SendMessageW, TranslateMessage, MB_ABORTRETRYIGNORE, MB_DEFBUTTON1, MB_DEFBUTTON2,
-    MB_DEFBUTTON3, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
-    MB_OKCANCEL, MB_RETRYCANCEL, MB_YESNO, MB_YESNOCANCEL, MSG, PM_REMOVE, SM_CXSCREEN,
-    SM_CYSCREEN, WM_QUIT,
+    DispatchMessageW, DialogBoxIndirectParamW, EndDialog, GetSystemMetrics, MessageBoxW,
+    PeekMessageW, PostQuitMessage, SendMessageW, TranslateMessage, DLGPROC, DLGTEMPLATE,
+    DS_CENTER, DS_MODALFRAME, DS_SETFONT,
+    MB_ABORTRETRYIGNORE, MB_DEFBUTTON1, MB_DEFBUTTON2, MB_DEFBUTTON3, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_RETRYCANCEL,
+    MB_YESNO, MB_YESNOCANCEL, MSG, PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN, WM_CLOSE, WM_COMMAND,
+    WM_QUIT, WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 /// `CF_UNICODETEXT`.
@@ -391,4 +393,170 @@ pub fn pump_native_events() -> bool {
         pumped = true;
     }
     pumped
+}
+
+/// Button commands start at this dialog-item id; the index is the offset.
+const BUTTON_ID_BASE: i32 = 100;
+
+/// The accumulated words of an in-memory dialog template.
+struct DialogTemplate {
+    words: Vec<u16>,
+}
+
+impl DialogTemplate {
+    fn new(style: WINDOW_STYLE, items: u16, title: &str, rect: [i16; 4]) -> Self {
+        let mut words = Vec::new();
+        let mut push32 = |words: &mut Vec<u16>, value: u32| {
+            words.push(value as u16);
+            words.push((value >> 16) as u16);
+        };
+        push32(&mut words, style.0);
+        push32(&mut words, 0); // extended style
+        words.push(items);
+        words.extend(rect.map(|v| v as u16));
+        words.push(0); // no menu
+        words.push(0); // no window class
+        words.extend(title.encode_utf16());
+        words.push(0);
+        // A font block (DS_SETFONT on the classic template is just the
+        // point size followed by the typeface): 9 pt Segoe UI.
+        words.push(9);
+        words.extend("Segoe UI".encode_utf16());
+        words.push(0);
+        Self { words }
+    }
+
+    fn item(&mut self, style: WINDOW_STYLE, rect: [i16; 4], id: i32, class: u16, label: &str) {
+        // Items align on a DWORD boundary.
+        if self.words.len() % 2 == 1 {
+            self.words.push(0);
+        }
+        let mut push32 = |words: &mut Vec<u16>, value: u32| {
+            words.push(value as u16);
+            words.push((value >> 16) as u16);
+        };
+        push32(&mut self.words, style.0); // style
+        push32(&mut self.words, 0); // extended style
+        self.words.extend(rect.map(|v| v as u16));
+        self.words.push(id as u16);
+        self.words.push(0xFFFF);
+        self.words.push(class); // button = 0x0080, static = 0x0082
+        self.words.extend(label.encode_utf16());
+        self.words.push(0);
+        self.words.push(0); // no extra data
+    }
+
+    fn run(self, owner: Option<HWND>) -> i32 {
+        let proc: DLGPROC = Some(dialog_proc);
+        // SAFETY: the template outlives the modal call; the proc and the
+        // owner window are valid for it.
+        unsafe {
+            DialogBoxIndirectParamW(
+                None,
+                self.words.as_ptr() as *const DLGTEMPLATE,
+                owner,
+                proc,
+                LPARAM(0),
+            ) as i32
+        }
+    }
+}
+
+/// Ends the dialog on a button command or a close; Enter/Escape map to the
+/// default (the caller translates the id).
+unsafe extern "system" fn dialog_proc(hwnd: HWND, message: u32, w: WPARAM, _l: LPARAM) -> isize {
+    match message {
+        WM_COMMAND => {
+            let id = w.0 as i32 & 0xffff;
+            // SAFETY: hwnd is this live dialog.
+            unsafe { EndDialog(hwnd, id as isize) };
+            1
+        }
+        WM_CLOSE => {
+            // SAFETY: as above; IDCANCEL.
+            unsafe { EndDialog(hwnd, 2) };
+            1
+        }
+        _ => 0,
+    }
+}
+
+/// `tk_dialog` as a classic modal dialog box: the message on top, the app's
+/// buttons along the bottom (a memory template, so no comctl32 v6 is
+/// needed for `TaskDialogIndirect`).
+pub fn tk_dialog(request: &rtcl_tk_runtime::DialogRequest) -> Option<usize> {
+    if request.buttons.is_empty() {
+        return None;
+    }
+    let mut message = request.message.clone();
+    if !request.detail.is_empty() {
+        if !message.is_empty() {
+            message.push_str("\n\n");
+        }
+        message.push_str(&request.detail);
+    }
+    if message.is_empty() {
+        message = " ".to_string();
+    }
+    let lines = message.split('\n').count().max(1) as i32;
+    let longest = message.split('\n').map(str::chars).map(Iterator::count).max().unwrap_or(1) as i32;
+    // Dialog units: ~4 px wide, ~8 px tall at 96 dpi.
+    let width = ((longest * 2) + 20).clamp(110, 220);
+    let text_height = lines * 8 + 4;
+    let button_y = text_height + 10;
+    let count = request.buttons.len() as i32;
+    let button_width = 52;
+    let gap = 8;
+    let row = count * button_width + (count - 1) * gap;
+    let start = (width - row) / 2;
+
+    let title = if request.title.is_empty() {
+        " ".to_string()
+    } else {
+        request.title.clone()
+    };
+    let mut template = DialogTemplate::new(
+        WINDOW_STYLE(
+            (DS_MODALFRAME | DS_CENTER | DS_SETFONT) as u32
+                | WS_POPUP.0
+                | WS_CAPTION.0
+                | WS_SYSMENU.0,
+        ),
+        (count + 1) as u16,
+        &title,
+        [0, 0, width as i16, (button_y + 22) as i16],
+    );
+    template.item(
+        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0), // SS_LEFT = 0
+        [10, 6, (width - 20) as i16, text_height as i16],
+        0,
+        0x0082,
+        &message,
+    );
+    for (index, label) in request.buttons.iter().enumerate() {
+        // BS_* are button styles (i32): BS_PUSHBUTTON = 0, DEFBUTTON = 1.
+        let style = if index == request.default {
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | 0x0000_0001)
+        } else {
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0)
+        };
+        template.item(
+            style,
+            [
+                (start + index as i32 * (button_width + gap)) as i16,
+                button_y as i16,
+                button_width as i16,
+                14,
+            ],
+            BUTTON_ID_BASE + index as i32,
+            0x0080,
+            label,
+        );
+    }
+    let answer = template.run(owner());
+    match answer {
+        1 | 2 => Some(request.default), // Enter/Escape with no matching button
+        id if id >= BUTTON_ID_BASE => Some((id - BUTTON_ID_BASE) as usize),
+        _ => Some(request.default),
+    }
 }

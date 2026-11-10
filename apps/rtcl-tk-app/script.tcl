@@ -17,9 +17,12 @@ menu .m.file -tearoff 0
 .m add cascade -label "File" -menu .m.file -underline 0
 . configure -menu .m
 
-# The native message box (Win32 MessageBoxW here), self-dismissed by the
-# verification run killing the process while it is up.
-after 600 {tk_messageBox -type ok -title "About rtcl Tk" -message "rtcl native Tk on this platform" -icon information}
+# The native dialogs (Win32 MessageBoxW and a template DialogBox here),
+# self-dismissed by the verification run killing the process while up.
+after 600 {
+    tk_messageBox -type ok -title "About rtcl Tk" -message "rtcl native Tk on this platform" -icon information
+    tk_dialog .pick "Choose" "Pick one of the buttons" "" 1 Yes No Cancel
+}
 
 image create photo demoimg -file {__DEMO_PNG__}
 image create photo demoData -data {data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAAJUlEQVR4nGOQS771n5aYYdSCUQtGLRi1YNSCUQtGLRi1YGhYAACyjErMPxGm9gAAAABJRU5ErkJggg==}

@@ -97,6 +97,8 @@ pub fn install_backend() {
     #[cfg(target_os = "windows")]
     rtcl_tk_runtime::set_color_dialog_handler(win32::color_dialog);
     #[cfg(target_os = "windows")]
+    rtcl_tk_runtime::set_dialog_handler(win32::tk_dialog);
+    #[cfg(target_os = "windows")]
     rtcl_tk_runtime::set_clipboard_getter(win32::clipboard_text);
     #[cfg(target_os = "windows")]
     rtcl_tk_runtime::set_screen_metrics(win32::screen_metrics);
@@ -634,6 +636,18 @@ fn effective(tree: &TkTree, path: &str, name: &str) -> String {
 
 fn is_disabled(tree: &TkTree, path: &str) -> bool {
     option(tree, path, "-state") == "disabled"
+}
+
+/// A character-count `-width` as a pixel floor: Tk sizes entries/spinboxes
+/// by characters of the font; the renderer has no font metrics, so this is
+/// ~8 px per column (the canvas text approximation) plus the padding.
+/// `None` for width 0 (Tk: size to the contents).
+fn char_width_px(tree: &TkTree, path: &str) -> Option<f32> {
+    effective(tree, path, "-width")
+        .parse::<f32>()
+        .ok()
+        .filter(|chars| *chars > 0.0)
+        .map(|chars| chars * 8.0 + 10.0)
 }
 
 /// Tk event state bits from the platform's modifier keys.
@@ -2534,16 +2548,25 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             button = pointer_events!(button, path);
             button.into_element()
         }
-        WidgetKind::Entry => view()
-            .w_full()
-            .rounded(px(4.0))
-            .border_1()
-            .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
-            .bg(AdaptiveColor::rgb(0xffffff, 0x111827))
-            .px(px(4.0))
-            .py(px(2.0))
-            .child(render_entry_input(tree, path, false))
-            .into_element(),
+        WidgetKind::Entry => {
+            let mut entry = view()
+                .w_full()
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
+                .bg(AdaptiveColor::rgb(0xffffff, 0x111827))
+                .px(px(4.0))
+                .py(px(2.0));
+            // A pack without -fill shrink-wraps the tree, where w_full
+            // collapses to the input's intrinsic width; the Tk width keeps
+            // a floor (the entry may still stretch with -fill x).
+            if let Some(width) = char_width_px(tree, path) {
+                entry = entry.min_w(px(width));
+            }
+            entry
+                .child(render_entry_input(tree, path, false))
+                .into_element()
+        }
         WidgetKind::Spinbox => {
             let press_path = path.to_string();
             let up_path = path.to_string();
@@ -2551,15 +2574,18 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             let focus_up = path.to_string();
             let focus_down = path.to_string();
             let disabled = is_disabled(tree, path);
-            let input = view()
+            let mut input = view()
                 .flex_1()
                 .rounded(px(4.0))
                 .border_1()
                 .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
                 .bg(AdaptiveColor::rgb(0xffffff, 0x111827))
                 .px(px(4.0))
-                .py(px(2.0))
-                .child(render_entry_input(tree, path, true));
+                .py(px(2.0));
+            if let Some(width) = char_width_px(tree, path) {
+                input = input.min_w(px(width));
+            }
+            let input = input.child(render_entry_input(tree, path, true));
             let step_style = |button: nsh_base::ButtonElement| {
                 button
                     .w(px(18.0))

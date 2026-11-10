@@ -4152,6 +4152,44 @@ fn font_options(interp: &Interp, name: &str) -> Option<BTreeMap<String, String>>
 
 /// Resolve a `-font` value (a named font or a Tk font description) to
 /// family, point size and bold.
+thread_local! {
+    /// The backend's font measurer (pango on Linux): real text metrics
+    /// for the font queries and geometry that otherwise approximate.
+    static TEXT_MEASURER:
+        std::cell::Cell<Option<fn(&str, f64, bool, &str) -> TextMetrics>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Text measurements for one string in one Tk font, in pixels.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TextMetrics {
+    pub width: f64,
+    pub ascent: f64,
+    pub descent: f64,
+    /// Ascent + descent: what one line of this font occupies.
+    pub linespace: f64,
+}
+
+/// Gives the runtime a real font measurer.  The platform backend registers
+/// one on install (`fn(family, point size, bold, text)`); without it the
+/// font queries fall back to size-based approximations.
+pub fn set_text_measurer(measure: fn(&str, f64, bool, &str) -> TextMetrics) {
+    TEXT_MEASURER.with(|cell| cell.set(Some(measure)));
+}
+
+/// Measures `text` in the Tk font `spec`; `None` without a measurer.
+pub fn font_measure_text(spec: &str, text: &str) -> Option<TextMetrics> {
+    let (family, size, bold) = resolve_font(spec)?;
+    let measure = TEXT_MEASURER.with(|cell| cell.get())?;
+    Some(measure(&family, size, bold, text))
+}
+
+/// The width of "0" in a Tk font — Tk's per-character width for widgets
+/// whose `-width` counts characters; 8.0 without a measurer.
+pub fn char_width(spec: &str) -> f64 {
+    font_measure_text(spec, "0").map(|m| m.width).unwrap_or(8.0)
+}
+
 pub fn resolve_font(spec: &str) -> Option<(String, f64, bool)> {
     if spec.is_empty() {
         return None;
@@ -4311,40 +4349,100 @@ fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             })))
         }
         "measure" => {
-            if args.len() < 4 {
-                return Err(wrong(
-                    "font measure",
-                    "font ?-displayof window? text",
-                    args.len(),
-                ));
-            }
-            let name = args[2].as_str();
-            let size = font_options(interp, name)
-                .and_then(|o| o.get("-size").and_then(|s| s.parse::<f64>().ok()))
-                .unwrap_or(10.0)
-                .abs();
-            let text = args[3].as_str();
-            Ok(Value::from_int(
-                (text.chars().count() as f64 * size * 0.6).ceil() as i64,
-            ))
-        }
-        "metrics" => {
-            if args.len() < 3 {
-                return Err(wrong("font metrics", "font ?-option?", args.len()));
-            }
-            let size = font_options(interp, args[2].as_str())
-                .and_then(|o| o.get("-size").and_then(|s| s.parse::<f64>().ok()))
-                .unwrap_or(10.0)
-                .abs();
-            let option = args.get(3).map(|v| v.as_str()).unwrap_or("-linespace");
-            let value = match option {
-                "-ascent" => (size * 0.8) as i64,
-                "-descent" => (size * 0.2) as i64,
-                "-linespace" => (size * 1.2) as i64,
-                "-fixed" => 0,
-                _ => 0,
+            // `font measure font ?-displayof window? text`; the display
+            // only selects per-window font state this model shares.
+            let (spec, text) = if args.get(3).is_some_and(|v| v.as_str() == "-displayof") {
+                if args.len() < 6 {
+                    return Err(wrong(
+                        "font measure",
+                        "font ?-displayof window? text",
+                        args.len(),
+                    ));
+                }
+                (args[2].as_str(), args[5].as_str())
+            } else {
+                if args.len() < 4 {
+                    return Err(wrong(
+                        "font measure",
+                        "font ?-displayof window? text",
+                        args.len(),
+                    ));
+                }
+                (args[2].as_str(), args[3].as_str())
+            };
+            let value = match font_measure_text(spec, text) {
+                Some(m) => m.width.ceil() as i64,
+                None => {
+                    let size = font_options(interp, spec)
+                        .and_then(|o| o.get("-size").and_then(|s| s.parse::<f64>().ok()))
+                        .unwrap_or(10.0)
+                        .abs();
+                    (text.chars().count() as f64 * size * 0.6).ceil() as i64
+                }
             };
             Ok(Value::from_int(value))
+        }
+        "metrics" => {
+            // `font metrics font ?-displayof window? ?-option?`; with no
+            // option Tk returns the full list.
+            let mut index = 2;
+            let mut named: Option<String> = None;
+            while index < args.len() {
+                match args[index].as_str() {
+                    "-displayof" => index += 1,
+                    option if option.starts_with('-') && index > 2 => {
+                        named = Some(option.into());
+                    }
+                    _ => {} // the font itself and stray positionals
+                }
+                index += 1;
+            }
+            let spec_arg = args.get(2).map(|v| v.as_str()).unwrap_or("");
+            let fallback = |spec: &str| {
+                let size = font_options(interp, spec)
+                    .and_then(|o| o.get("-size").and_then(|s| s.parse::<f64>().ok()))
+                    .unwrap_or(10.0)
+                    .abs();
+                TextMetrics {
+                    width: size * 0.6,
+                    ascent: size * 0.8,
+                    descent: size * 0.2,
+                    linespace: size * 1.2,
+                }
+            };
+            // Tk reports the metrics of a space for the empty string.
+            let metrics = font_measure_text(spec_arg, "0 ")
+                .or_else(|| font_measure_text(spec_arg, " "))
+                .unwrap_or_else(|| fallback(spec_arg));
+            // Fixed pitch: "iiiii" measures exactly five "i"s.
+            let fixed = font_measure_text(spec_arg, "i").zip(font_measure_text(spec_arg, "iiiii"))
+                .map(|(one, five)| (five.width == one.width * 5.0) as i64);
+            let pairs = [
+                ("-ascent", metrics.ascent.round() as i64),
+                ("-descent", metrics.descent.round() as i64),
+                ("-linespace", metrics.linespace.round() as i64),
+                ("-fixed", fixed.unwrap_or(0)),
+            ];
+            match named.as_deref() {
+                Some(option) => {
+                    let value = pairs
+                        .iter()
+                        .find(|(name, _)| *name == option)
+                        .map(|(_, value)| *value)
+                        .ok_or_else(|| {
+                            generic(format!(
+                                "bad option \"{option}\": must be -ascent, -descent, -fixed, or -linespace"
+                            ))
+                        })?;
+                    Ok(Value::from_int(value))
+                }
+                None => Ok(list_value(
+                    pairs.iter().flat_map(|(name, value)| {
+                        [name.to_string(), value.to_string()]
+                    })
+                    .collect::<Vec<_>>(),
+                )),
+            }
         }
         other => Err(generic(format!("bad option \"{other}\""))),
     }
@@ -9940,13 +10038,27 @@ fn canvas_item_bbox(
         }
         "text" if coords.len() >= 2 => {
             let text = item.options.get("-text").map_or("", String::as_str);
-            let lines = text.split('\n').count().max(1) as f64;
-            let cols = text
-                .split('\n')
-                .map(|line| line.chars().count())
-                .max()
-                .unwrap_or(0) as f64;
-            let (width, height) = (cols * 8.0, lines * 16.0);
+            let spec = item
+                .options
+                .get("-font")
+                .map(String::as_str)
+                .unwrap_or("TkDefaultFont");
+            let lines: Vec<&str> = text.split('\n').collect();
+            // Measured when the platform provides a font measurer; the
+            // no-metrics approximation stays for headless runs.
+            let line_h = font_measure_text(spec, "0 ")
+                .map(|m| m.linespace)
+                .filter(|h| *h > 0.0)
+                .unwrap_or(16.0);
+            let width = lines
+                .iter()
+                .map(|line| {
+                    font_measure_text(spec, line)
+                        .map(|m| m.width)
+                        .unwrap_or_else(|| line.chars().count() as f64 * 8.0)
+                })
+                .fold(0.0_f64, f64::max);
+            let (width, height) = (width.max(8.0), lines.len() as f64 * line_h);
             let anchor = item.options.get("-anchor").map_or("center", String::as_str);
             let (dx, dy) = anchor_offset(anchor, width, height);
             let (x, y) = (coords[0] + dx, coords[1] + dy);
@@ -12888,6 +13000,61 @@ mod tests {
         let path = std::env::temp_dir().join("rtcl-tiny.png");
         std::fs::write(&path, TINY_PNG).ok();
         path.to_string_lossy().replace('\\', "/")
+    }
+
+    #[test]
+    fn font_measurer_drives_measure_metrics_and_canvas() {
+        let mut i = Interp::new();
+        install(&mut i);
+        // Without a measurer the size-based approximations hold.
+        assert_eq!(
+            eval(&mut i, "font measure {Helvetica 10} abc"),
+            "18"
+        );
+        assert_eq!(eval(&mut i, "font metrics {Helvetica 10} -ascent"), "8");
+
+        // A measurer replaces them everywhere: queries, canvas geometry.
+        set_text_measurer(|family, size, bold, text| {
+            let _ = (family, bold);
+            TextMetrics {
+                width: text.chars().count() as f64 * size,
+                ascent: size,
+                descent: size / 4.0,
+                linespace: size * 1.25,
+            }
+        });
+
+        // `font measure font ?-displayof win? text` uses the real width.
+        assert_eq!(eval(&mut i, "font measure {Helvetica 10} ab"), "20");
+        assert_eq!(
+            eval(&mut i, "font measure {Helvetica 10} -displayof . abc"),
+            "30"
+        );
+        assert!(i.eval("font measure {Helvetica 10}").is_err());
+
+        // `font metrics` returns named values and the full Tk list; with
+        // this linear measurer every glyph is "monospace" enough.
+        assert_eq!(eval(&mut i, "font metrics {Helvetica 8} -ascent"), "8");
+        assert_eq!(eval(&mut i, "font metrics {Helvetica 8} -descent"), "2");
+        assert_eq!(eval(&mut i, "font metrics {Helvetica 8} -linespace"), "10");
+        assert_eq!(eval(&mut i, "font metrics {Helvetica 8} -fixed"), "1");
+        let metrics = eval(&mut i, "font metrics {Helvetica 8}");
+        assert!(
+            metrics.contains("-ascent 8") && metrics.contains("-descent 2")
+                && metrics.contains("-linespace 10") && metrics.contains("-fixed 1"),
+            "{metrics}"
+        );
+
+        // The width of "0" is the character width for counting widgets.
+        assert_eq!(char_width("Helvetica 10"), 10.0);
+
+        // Canvas text bboxes measure their longest line (Tk rounds the
+        // bounds outwards).
+        eval(&mut i, "canvas .c -width 300 -height 200");
+        let id = eval(&mut i, ".c create text 50 50 -text abcd -font {Helvetica 10}");
+        assert_eq!(eval(&mut i, &format!(".c bbox {id}")), "30 43 70 57");
+        eval(&mut i, &format!(".c itemconfigure {id} -text {{a\nbc}}"));
+        assert_eq!(eval(&mut i, &format!(".c bbox {id}")), "40 37 60 63");
     }
 
     #[test]

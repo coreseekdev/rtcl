@@ -496,6 +496,17 @@ Win32 菜单栏**（fork 的 `SetMenu` 路径，CreateMenu/AppendMenuW 真系统
 测试保持 app 内菜单以便点击验证），桌面 runner（apps/rtcl-tk-app）已接；
 未打开时 Windows/Linux 维持 app 内实现；scrollbar 已与 listbox/treeview 联动。
 
+**字体度量（2026-11-11）**：runtime 增加 `set_text_measurer` 宿主钩子
+（`fn(family, point size, bold, text) -> TextMetrics`），Linux 后端注册
+pango 实现（pangocairo FontMap；Tk 正 -size 是磅、负 -size 是像素）。
+接入了 `font measure`（含 `-displayof`）、`font metrics`（含无参全列表
+`-ascent/-descent/-linespace/-fixed`，fixed 判据是 "iiiii" == 5×"i"）、
+canvas text bbox（最长行测量宽 × 行距高，Tk 向外取整）、entry/spinbox
+`-width`（字符数 × 实测 "0" 宽，Tk 的平均字符宽语义）。无 measurer 时
+（headless/其它平台）全部回退原近似（8px/字符、size×0.6 等），测试用
+fake measurer 覆盖。Windows/macOS 注册各自原生测量（DirectWrite/
+CoreText）即可同享。
+
 **平台扩展点**：原生对话框/剪贴板由宿主回调注入
 `set_message_box_handler/set_file_dialog_handler/set_color_dialog_handler/
 set_dialog_handler/set_clipboard_getter/set_clipboard_sink`；另有

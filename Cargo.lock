@@ -4425,6 +4425,7 @@ dependencies = [
  "nsh-base",
  "nsh-core",
  "nsh-platform-linux",
+ "pangocairo",
  "rtcl-core",
  "rtcl-tk-core",
  "rtcl-tk-runtime",

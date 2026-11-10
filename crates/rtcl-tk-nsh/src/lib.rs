@@ -111,6 +111,47 @@ pub fn install_backend() {
         rtcl_tk_runtime::set_native_event_pump(pump_native_events);
         rtcl_tk_runtime::set_screen_metrics(screen_metrics);
         rtcl_tk_runtime::set_bell(ring_bell);
+        rtcl_tk_runtime::set_text_measurer(measure_pango);
+    }
+}
+
+/// Real font metrics through pango, for `font measure`/`metrics`, canvas
+/// text geometry and the character-width of `-width`-counting widgets.
+#[cfg(target_os = "linux")]
+fn measure_pango(family: &str, size_pt: f64, bold: bool, text: &str) -> rtcl_tk_runtime::TextMetrics {
+    use pangocairo::prelude::*;
+    use gtk4::pango::SCALE;
+    let scale = f64::from(SCALE);
+    let font_map = pangocairo::FontMap::default();
+    let mut font = gtk4::pango::FontDescription::new();
+    if !family.is_empty() {
+        font.set_family(family);
+    }
+    // Tk: positive -size counts points, negative counts pixels.
+    font.set_size((size_pt * scale) as i32);
+    if bold {
+        font.set_weight(gtk4::pango::Weight::Bold);
+    }
+    let context = font_map.create_context();
+    let layout = gtk4::pango::Layout::new(&context);
+    layout.set_font_description(Some(&font));
+    layout.set_text(text);
+    let (width, height) = layout.pixel_size();
+    let language = context.language();
+    let font_metrics = context.metrics(Some(&font), language.as_ref());
+    let (ascent, descent) = if font_metrics.ascent() > 0 {
+        (
+            f64::from(font_metrics.ascent()) / scale,
+            f64::from(font_metrics.descent()) / scale,
+        )
+    } else {
+        (f64::from(height) * 0.8, f64::from(height) * 0.2)
+    };
+    rtcl_tk_runtime::TextMetrics {
+        width: f64::from(width),
+        ascent,
+        descent,
+        linespace: ascent + descent,
     }
 }
 
@@ -639,15 +680,15 @@ fn is_disabled(tree: &TkTree, path: &str) -> bool {
 }
 
 /// A character-count `-width` as a pixel floor: Tk sizes entries/spinboxes
-/// by characters of the font; the renderer has no font metrics, so this is
-/// ~8 px per column (the canvas text approximation) plus the padding.
-/// `None` for width 0 (Tk: size to the contents).
+/// by characters of the font — the measured width of "0", or ~8 px per
+/// column without a measurer — plus the padding.  `None` for width 0
+/// (Tk: size to the contents).
 fn char_width_px(tree: &TkTree, path: &str) -> Option<f32> {
     effective(tree, path, "-width")
         .parse::<f32>()
         .ok()
         .filter(|chars| *chars > 0.0)
-        .map(|chars| chars * 8.0 + 10.0)
+        .map(|chars| chars * rtcl_tk_runtime::char_width(&effective(tree, path, "-font")) as f32 + 10.0)
 }
 
 /// Tk event state bits from the platform's modifier keys.

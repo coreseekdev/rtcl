@@ -350,9 +350,9 @@ data URI（Tcl 脚本里 data URI 的 `;` 必须用花括号引用）；最后�
 rtcl 把 photo 报成 0×0（无 -width/-height 时），Android 的 ImageBox
 布局帧为 0、`loadImage` 直接返回，加载器根本没被请求（fork 的
 Mounter→Images.request→fetch 管线本就完整，file:// 与 data: 均支持）；
-固有尺寸修复后 size>0，链路应打通（模拟器复验因宿主机 VirtualBox
-KVM 后端与模拟器争用暂缓）。桌面 GTK 快照仍受首帧局限（nsh image
-异步解码后快照为空），交互运行时应可见。
+固有尺寸修复后已在模拟器复验：`label -image` 与 text 内联 image
+**均绘制**（x86_64 模拟器截图，2026-11-11）。桌面 GTK 快照仍受首帧
+局限（nsh image 异步解码后快照为空），交互运行时应可见。
 `tag bind tagName ?sequence? ?script?` 把事件绑定到 tag 区间：富文本编辑器
 按下时按指针下的文档位置映射成字符下标，命中区间的 tag 依次执行最具体的
 sequence（`<Button-1>`、Double/Triple/Quadruple、`<ButtonRelease-1>`、
@@ -546,7 +546,11 @@ Android 写进程包名自己的 files 目录）。`nsh run --target android` �
 QEMU2 支持）+ emulator 37.2 + AVD 后，出 APK（dev.rtcl.tkapp）安装并
 启动，Tcl 驱动的 label/entry/button 渲染正常，点按后 `-command` 改
 label "Tapped!"（docs/images/tk-android*.png）。宿主钩子（对话框/
-剪贴板）android 侧未注册，回退默认值。
+剪贴板）android 侧未注册，回退默认值。**图片复验通过**（固有尺寸
+修复后）：label -image 与 text 内联 image 在 x86_64 模拟器均绘制；
+菜单以 app 内菜单栏呈现（Android 不经桌面 runner，未开原生菜单）。
+**OPEN（跨平台）**：entry `-width` 在 Windows/Android 均渲染过窄
+（GTK 正常，nsh Input 字符宽度待查）。
 
 **视觉验收（不用 TSX）**：Tcl 与 TSX 在同一生态位，因此截图走 Rust/GTK，
 不引入 `*.test.tsx` 或 nsh CLI：

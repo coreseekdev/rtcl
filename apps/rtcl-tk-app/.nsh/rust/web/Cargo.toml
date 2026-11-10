@@ -18,9 +18,9 @@ dev = ["nsh-platform-web/dev"]
 linkable = ["nsh-platform-web/linkable"]
 
 [dependencies]
-nsh-core = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-core" }
-nsh-base = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-base", features = ["highlight"] }
+nsh-core = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-core" }
+nsh-base = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-base", features = ["highlight"] }
 app_rtcl_tk_app_native = { package = "rtcl-tk-app-native", path = "/home/nzinfo/src.note/rtcl/apps/rtcl-tk-app/native" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-nsh-platform-web = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-platform-web", default-features = false }
+nsh-platform-web = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-platform-web", default-features = false }

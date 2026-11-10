@@ -9,10 +9,10 @@ name = "nsh-app-rtcl-tk-app-native-rust-windows"
 path = "main.rs"
 
 [dependencies]
-nsh-windows-app = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-windows-app", default-features = false }
-nsh-core = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-core" }
-nsh-base = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-base", features = ["highlight"] }
+nsh-windows-app = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-windows-app", default-features = false }
+nsh-core = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-core" }
+nsh-base = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-base", features = ["highlight"] }
 app_rtcl_tk_app_native = { package = "rtcl-tk-app-native", path = "/home/nzinfo/src.note/rtcl/apps/rtcl-tk-app/native" }
 
 [target.'cfg(windows)'.dependencies]
-nsh-platform-windows = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-platform-windows", default-features = false }
+nsh-platform-windows = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-platform-windows", default-features = false }

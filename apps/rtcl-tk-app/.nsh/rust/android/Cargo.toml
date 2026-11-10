@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 dev = ["nsh-platform-android/dev"]
 
 [dependencies]
-nsh-core = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-core" }
-nsh-platform-android = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-platform-android" }
-nsh-base = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-base", features = ["highlight"] }
+nsh-core = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-core" }
+nsh-platform-android = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-platform-android" }
+nsh-base = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-base", features = ["highlight"] }
 app_rtcl_tk_app_native = { package = "rtcl-tk-app-native", path = "/home/nzinfo/src.note/rtcl/apps/rtcl-tk-app/native" }

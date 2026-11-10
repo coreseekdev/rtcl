@@ -9,7 +9,7 @@ name = "nsh-app-rtcl-tk-app-native-test"
 path = "main.rs"
 
 [dependencies]
-nsh-core = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-core" }
-nsh-testing = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-testing", features = ["js"] }
-nsh-base = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/8e7c075/crates/nsh-base" }
+nsh-core = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-core" }
+nsh-testing = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-testing", features = ["js"] }
+nsh-base = { path = "/home/nzinfo/.cargo/git/checkouts/nsh-11c23939abe4c0da/49b1afc/crates/nsh-base" }
 app_rtcl_tk_app_native = { package = "rtcl-tk-app-native", path = "/home/nzinfo/src.note/rtcl/apps/rtcl-tk-app/native" }

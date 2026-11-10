@@ -113,6 +113,24 @@ pub fn install_backend() {
         rtcl_tk_runtime::set_bell(ring_bell);
         rtcl_tk_runtime::set_text_measurer(measure_pango);
     }
+    // `wm attributes` reaches the real window (the main one; the model's
+    // secondary toplevels are in-window overlays).
+    rtcl_tk_runtime::set_window_attribute_hook(|path, attribute, old, new| {
+        if path != "." || old == new {
+            return;
+        }
+        match attribute {
+            "-fullscreen" => desktop::toggle_full_screen(),
+            "-topmost" => {
+                desktop::set_level(if new == "1" {
+                    nsh_core::desktop::WindowLevel::Floating
+                } else {
+                    nsh_core::desktop::WindowLevel::Normal
+                });
+            }
+            _ => {}
+        }
+    });
 }
 
 /// Real font metrics through pango, for `font measure`/`metrics`, canvas

@@ -520,7 +520,16 @@ canvas text bbox（最长行测量宽 × 行距高，Tk 向外取整）、entry/
 fake measurer 覆盖。Windows/macOS 注册各自原生测量（DirectWrite/
 CoreText）即可同享。
 
-**平台扩展点**：原生对话框/剪贴板由宿主回调注入
+**wm 窗口管理（2026-11-11）**：`wm attributes` 实现通用子集
+（`-alpha`（0–1 截断，默认 1.0）、`-fullscreen`、`-topmost`、`-type`、
+`-zoomed`、`-modified`、`-toolwindow`；无参返回全名值对），改动经
+`set_window_attribute_hook` 通知后端——nsh 后端把 `-fullscreen`
+映射 `toggle_full_screen`、`-topmost` 映射 `set_level(Floating/Normal)`
+（仅主窗口 "."，模型里的次级 toplevel 是窗口内 overlay）；Linux GTK
+可能忽略 level，Windows/macOS 生效。`wm stackorder` 按 tree 子序
+（raise 追加=置顶、lower 前插=置底）报从低到高的 toplevel 列表，
+支持 `isabove/below` 切片；`wm overrideredirect` 真实读写。`-alpha`
+暂无渲染通道（fork 无该桌面命令）。**平台扩展点**：原生对话框/剪贴板由宿主回调注入
 `set_message_box_handler/set_file_dialog_handler/set_color_dialog_handler/
 set_dialog_handler/set_clipboard_getter/set_clipboard_sink`；另有
 `set_native_event_pump`（vwait 嵌套泵）、`set_screen_metrics`

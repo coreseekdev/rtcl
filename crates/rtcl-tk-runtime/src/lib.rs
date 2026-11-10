@@ -3106,16 +3106,142 @@ fn wm_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::empty())
         }
         "attributes" => {
+            // `wm attributes w ?-attribute? ?value?` over Tk's common
+            // subset; -fullscreen/-topmost reach the renderer through the
+            // window-attribute hook.
+            const NAMES: &[&str] = &[
+                "-alpha",
+                "-fullscreen",
+                "-topmost",
+                "-type",
+                "-zoomed",
+                "-modified",
+                "-toolwindow",
+            ];
+            let default = |name: &str| match name {
+                "-alpha" => "1.0",
+                _ => "0",
+            };
+            let default = |name: &str| match name {
+                "-alpha" => "1.0",
+                _ => "0",
+            };
+            // Raw node options: these names are wm's own, so widget
+            // defaults (-type on a menu!) must not leak in.
+            let current = |interp: &mut Interp, name: &str| {
+                let value = with_state(interp, |rt| {
+                    rt.tree
+                        .get(&path)
+                        .and_then(|n| n.options.get(name))
+                        .cloned()
+                })
+                .flatten()
+                .unwrap_or_default();
+                if value.is_empty() {
+                    default(name).to_string()
+                } else {
+                    value
+                }
+            };
             if args.len() == 3 {
-                return Ok(Value::from_str(""));
+                let pairs: Vec<String> = NAMES
+                    .iter()
+                    .flat_map(|name| {
+                        [name.to_string(), current(interp, name)]
+                    })
+                    .collect();
+                return Ok(list_value(pairs));
             }
-            if args.len() == 4 && args[3].as_str().starts_with('-') {
-                return Ok(Value::from_str(""));
+            let name = args[3].as_str().to_string();
+            if !NAMES.contains(&name.as_str()) {
+                return Err(generic(format!(
+                    "bad attribute \"{name}\": must be one of {}",
+                    NAMES.iter().map(|n| &n[1..]).collect::<Vec<_>>().join(", ")
+                )));
+            }
+            if args.len() == 4 {
+                return Ok(Value::from_str(&current(interp, &name)));
+            }
+            let raw = args[4].as_str();
+            let value = match name.as_str() {
+                "-alpha" => {
+                    let alpha: f64 = raw
+                        .parse()
+                        .map_err(|_| generic(format!("bad -alpha value \"{raw}\"")))?;
+                    format!("{}", alpha.clamp(0.0, 1.0))
+                }
+                _ => (matches!(raw, "1" | "true" | "yes" | "on")).then(|| "1").unwrap_or("0")
+                    .to_string(),
+            };
+            let old = current(interp, &name);
+            if old != value {
+                set_root_option(interp, &path, &name, &value)?;
+                if let Some(hook) = WINDOW_ATTRIBUTE.with(|cell| cell.get()) {
+                    hook(&path, &name, &old, &value);
+                }
             }
             Ok(Value::empty())
         }
-        "overrideredirect" | "wait_visibility" | "deiconify_all" => Ok(Value::empty()),
-        "stackorder" => Ok(Value::from_str("")),
+        "stackorder" => {
+            // The tree's child order is the z-order: raise appends, lower
+            // prepends, so children go bottom → top.
+            let order: Vec<String> = with_state(interp, |rt| {
+                rt.tree
+                    .children(&path)
+                    .map(|children| children.to_vec())
+            })
+            .unwrap_or_else(|| Ok(Vec::new()))
+            .map_err(|_| bad_window(&path))?;
+            match args.get(3).map(|v| v.as_str()) {
+                None => Ok(list_value(order)),
+                Some(keyword @ ("isabove" | "below")) => {
+                    let other = args
+                        .get(4)
+                        .map(|v| v.as_str().to_string())
+                        .ok_or_else(|| {
+                            wrong(
+                                "wm stackorder",
+                                "window ?isabove|below window?",
+                                args.len(),
+                            )
+                        })?;
+                    let at = order
+                        .iter()
+                        .position(|w| *w == other)
+                        .ok_or_else(|| {
+                            generic(format!(
+                                "window \"{other}\" is not a toplevel of \"{path}\""
+                            ))
+                        })?;
+                    let range = match keyword {
+                        "isabove" => at + 1..order.len(),
+                        _ => 0..at,
+                    };
+                    Ok(list_value(order[range].to_vec()))
+                }
+                Some(other) => Err(generic(format!(
+                    "bad argument \"{other}\": must be isabove or below"
+                ))),
+            }
+        }
+        "overrideredirect" => {
+            if args.len() == 3 {
+                let value = with_state(interp, |rt| {
+                    rt.tree
+                        .get(&path)
+                        .and_then(|n| n.options.get("-overrideredirect"))
+                        .cloned()
+                })
+                .flatten()
+                .unwrap_or_else(|| "0".to_string());
+                return Ok(Value::from_str(&value));
+            }
+            let value = (matches!(args[3].as_str(), "1" | "true" | "yes" | "on"))
+                .then(|| "1")
+                .unwrap_or("0");
+            set_root_option(interp, &path, "-overrideredirect", value)?;
+            Ok(Value::empty())
+        }
         "frame" => Ok(Value::from_str("")),
         "manage" | "forget" => Ok(Value::empty()),
         _ => Err(generic(format!("bad option \"{sub}\""))),
@@ -4165,6 +4291,19 @@ thread_local! {
     static TEXT_MEASURER:
         std::cell::Cell<Option<fn(&str, f64, bool, &str) -> TextMetrics>> =
         const { std::cell::Cell::new(None) };
+    /// The backend's window-attribute applier: told when `wm attributes`
+    /// changes one on a toplevel, so -fullscreen/-topmost reach the real
+    /// window.
+    static WINDOW_ATTRIBUTE:
+        std::cell::Cell<Option<fn(&str, &str, &str, &str)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Gives the runtime a window-attribute applier: called with the toplevel
+/// path, the attribute name and its old and new values whenever
+/// `wm attributes` changes one.
+pub fn set_window_attribute_hook(hook: fn(&str, &str, &str, &str)) {
+    WINDOW_ATTRIBUTE.with(|cell| cell.set(Some(hook)));
 }
 
 /// Text measurements for one string in one Tk font, in pixels.
@@ -13693,6 +13832,12 @@ fn global_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Recorded window-attribute hook calls, for assertions.
+        static HOOK_LOG: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     fn eval(interp: &mut Interp, script: &str) -> String {
         interp.eval(script).unwrap().as_str().to_string()
     }
@@ -13767,6 +13912,55 @@ mod tests {
         assert_eq!(eval(&mut i, &format!(".c bbox {id}")), "30 43 70 57");
         eval(&mut i, &format!(".c itemconfigure {id} -text {{a\nbc}}"));
         assert_eq!(eval(&mut i, &format!(".c bbox {id}")), "40 37 60 63");
+    }
+
+    #[test]
+    fn wm_attributes_stackorder_and_overrideredirect() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "toplevel .a; toplevel .b");
+
+        // attributes: defaults, get, set with clamping and bools.
+        assert_eq!(eval(&mut i, "wm attributes .a"), "-alpha 1.0 -fullscreen 0 -topmost 0 -type 0 -zoomed 0 -modified 0 -toolwindow 0");
+        assert_eq!(eval(&mut i, "wm attributes .a -alpha"), "1.0");
+        eval(&mut i, "wm attributes .a -alpha 0.5");
+        assert_eq!(eval(&mut i, "wm attributes .a -alpha"), "0.5");
+        eval(&mut i, "wm attributes .a -alpha 9");
+        assert_eq!(eval(&mut i, "wm attributes .a -alpha"), "1");
+        eval(&mut i, "wm attributes .a -topmost yes");
+        assert_eq!(eval(&mut i, "wm attributes .a -topmost"), "1");
+        eval(&mut i, "wm attributes .a -topmost 0");
+        assert_eq!(eval(&mut i, "wm attributes .a -topmost"), "0");
+        assert!(i.eval("wm attributes .a -bogus 1").is_err());
+        assert!(i.eval("wm attributes .a -bogus").is_err());
+
+        // The hook sees real changes (recorded via a Tcl list).
+        eval(&mut i, "set ::log {}");
+        set_window_attribute_hook(|path, name, _old, new| {
+            HOOK_LOG.with(|log| log.borrow_mut().push(format!("{path} {name}={new}")));
+        });
+        HOOK_LOG.with(|log| log.borrow_mut().clear());
+        eval(&mut i, "wm attributes .a -fullscreen 1");
+        eval(&mut i, "wm attributes .a -fullscreen 1");
+        let hook: Vec<String> = HOOK_LOG.with(|log| log.borrow().clone());
+        assert_eq!(hook, vec![".a -fullscreen=1".to_string()]);
+        set_window_attribute_hook(|_, _, _, _| {});
+
+        // stackorder follows raise/lower; isabove/below slice it.
+        assert_eq!(eval(&mut i, "wm stackorder ."), ".a .b");
+        eval(&mut i, "raise .b");
+        assert_eq!(eval(&mut i, "wm stackorder ."), ".a .b");
+        eval(&mut i, "raise .a");
+        assert_eq!(eval(&mut i, "wm stackorder ."), ".b .a");
+        assert_eq!(eval(&mut i, "wm stackorder . isabove .b"), ".a");
+        assert_eq!(eval(&mut i, "wm stackorder . below .a"), ".b");
+
+        // overrideredirect get/set.
+        assert_eq!(eval(&mut i, "wm overrideredirect .a"), "0");
+        eval(&mut i, "wm overrideredirect .a on");
+        assert_eq!(eval(&mut i, "wm overrideredirect .a"), "1");
+        eval(&mut i, "wm overrideredirect .a 0");
+        assert_eq!(eval(&mut i, "wm overrideredirect .a"), "0");
     }
 
     #[test]

@@ -12,6 +12,9 @@ use nsh_platform_windows as platform;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn main() -> impl std::process::Termination {
     rtcl_tk_nsh::install_backend();
+    // A windowed app shows the Tk menu as the platform's menu bar (the
+    // Windows host builds a Win32 bar; macOS/Linux detect themselves).
+    rtcl_tk_nsh::set_native_menus(true);
     platform::set_ui_sets(vec![nsh_base::registry()]);
     platform::run_app(
         platform::AppSource::Rust(platform::Root::of::<rtcl_tk_app_native::TclApp>()),

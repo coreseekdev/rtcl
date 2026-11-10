@@ -4429,6 +4429,7 @@ dependencies = [
  "rtcl-tk-core",
  "rtcl-tk-runtime",
  "serde_json",
+ "windows",
 ]
 
 [[package]]

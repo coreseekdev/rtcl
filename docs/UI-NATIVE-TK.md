@@ -150,7 +150,7 @@ apps/rtcl-tk-demo/       # 原生 demo（Rust main + 示例 .tcl）
 | M1a ✅ | rtcl-vm `tk` 命令层：frame/label/button/entry/… 创建、configure/cget、pack/grid、destroy、winfo、wm/tk；per-widget 路径命令；teardown 自动清树；4 条单测 | `button .b -text Hi; cget .b -text` 等 Tcl 脚本语义通过 |
 | M1b ✅ | nsh 后端最小集（frame/label/button/entry）+ TkView；按钮 `-command` 执行 Tcl，按钮文本经 signal 刷新；GTK4 demo + headless 验收 | `nsh-testing`：初始 "Click me" 渲染 → press → "Clicked 1" → press → "Clicked 2"；`cargo run -p rtcl-tk-demo` 打开 GTK4 窗口 |
 | M2 ✅ | pack/grid/place、bind/event generate、after/update、`-textvariable` 双向、entry/text/listbox/scale 数据子命令、winfo/wm 扩展、ttk 别名、focus/raise/font/option；message/scrollbar/separator/progressbar；整树 dynamic 重建 | 经典 grid/pack 表单脚本通过（`classic_nsh`）；demo 双态截图；tk 单测 19 + headless 验收 2 |
-| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、虚拟化列表/树、Tk scrollbar 联动、主题色、macOS 系统菜单、Canvas 动态/绑定/滚动/旋转/贝塞尔/箭头/虚线/图片/polygon/按 tag 删查/closest/overlapping/bbox/hidden、photo image、text tag 光标级 WYSIWYG + marks 数据持久化 + text marks/index 语法/tag 区间平移、菜单 `-accelerator` ✅；Windows/Linux 原生菜单受 nsh GTK 限制 | 设置页/表单/列表演示（classic demo + headless 验收） |
+| M3 ◐ | ttk notebook/combobox/treeview/labelframe、entry 校验、虚拟化列表/树、Tk scrollbar 联动、主题色、macOS 系统菜单、Canvas 动态/绑定/滚动/旋转/贝塞尔/箭头/虚线/图片/polygon/按 tag 删查/closest/overlapping/bbox/hidden、photo image、text tag 光标级 WYSIWYG + marks 数据持久化 + text marks/index 语法/tag 区间平移、菜单 `-accelerator` ✅；Linux 原生菜单（GTK PopoverMenuBar，fork 已支持）、Windows 原生 Win32 菜单栏（真实窗口宿主开启） | 设置页/表单/列表演示（classic demo + headless 验收） |
 | M4 | 虚拟化 table/log/tree/chart + iOS/Android embed + 打包 | 手机/桌面同一 Tcl 脚本跑通 |
 
 ## 7. 主要风险
@@ -337,15 +337,22 @@ names`）；dump -image 输出 `image <name> <index>`。**行内绘制已接入
 WYSIWYG**：渲染器把 doc 里的 U+FFFC 段拼接成 ProseMirror image 节点
 （attrs: src=photo 文件、width/height=image_dimensions），读回时 image
 节点经 leaf_text 映射回 U+FFFC（内容长度不漂移）；merge/dump/see 的
-位置映射同样感知 image 节点。`image create photo` 补了 `-data`
-（data:/base64 payload，Tk photo 原生特性；Tcl 脚本里 data URI 的 `;`
-必须用花括号引用）。**视觉验证状态**：Android 模拟器（adb 截屏）实测
-`label -image` 与 text 内联 image 均不绘制——插桩确认
-`Images.java fetch()` 从未被调用，即 Label 组件的 `-image` prop 在
-nsh-platform-android 的 Mounter/encode 路径上根本没接图片加载器
-（仅 canvas DrawImage 与 `Image` 视图走 Images.java）；桌面 GTK 快照
-受首帧局限（nsh image 异步解码后快照为空），交互运行时应可见——
-两者均为 fork 平台层工作，rtcl 侧管线已完整。
+位置映射同样感知 image 节点。**photo 固有尺寸（Tk 语义）**：
+`image create photo` 现在从 PNG/GIF/BMP/JPEG 头读取数据自身尺寸
+（`image width/height`、`img width/height`、canvas image bbox、text
+内联图都按它报尺寸；`-width/-height` 非零时按 Tk 语义裁剪报告值，
+`cget -width/-height` 仍返回配置值）；`-data` 接受 Tk 的 base64
+payload（嗅探 mime 转成 `data:` URI 交给渲染器）、原始二进制或现成
+data URI（Tcl 脚本里 data URI 的 `;` 必须用花括号引用）；最后一个
+`-file`/`-data` 生效；文件缺失/无法识别按 Tk 报错且 configure 失败
+不改变图片。**Android 图片不绘制的根因修正**：此前插桩发现
+`Images.java fetch()` 从未被调用、误诊为 fork 平台层缺口——实际是
+rtcl 把 photo 报成 0×0（无 -width/-height 时），Android 的 ImageBox
+布局帧为 0、`loadImage` 直接返回，加载器根本没被请求（fork 的
+Mounter→Images.request→fetch 管线本就完整，file:// 与 data: 均支持）；
+固有尺寸修复后 size>0，链路应打通（模拟器复验因宿主机 VirtualBox
+KVM 后端与模拟器争用暂缓）。桌面 GTK 快照仍受首帧局限（nsh image
+异步解码后快照为空），交互运行时应可见。
 `tag bind tagName ?sequence? ?script?` 把事件绑定到 tag 区间：富文本编辑器
 按下时按指针下的文档位置映射成字符下标，命中区间的 tag 依次执行最具体的
 sequence（`<Button-1>`、Double/Triple/Quadruple、`<ButtonRelease-1>`、
@@ -482,38 +489,53 @@ entry 选区拖动（`<B1-Motion>`）在桌面鼠标拖动时由平台 MouseMove
 headless `drag` 桌面环境下同样派发带左键的 MouseMove（fork 8e7c075），
 测试已覆盖；菜单项/separator 等装饰控件的
 hover 未单独接（菜单面板本身有 `<Enter>/<Leave>`）；
-Windows/Linux 菜单栏仍是 app 内实现
-（macOS 用系统菜单；GTK4 已无传统 menubar，nsh 的
-set_application_menu 实测不显示，故此项无法在不嵌入平台 widget 的前提下
-做成“原生”）；scrollbar 已与 listbox/treeview 联动。
+菜单栏：macOS 系统菜单；Linux GTK app 原生 PopoverMenuBar（fork 平台层
+本就支持，rtcl 侧此前只在 macOS 同步是误判，已修）；**Windows 原生
+Win32 菜单栏**（fork 的 `SetMenu` 路径，CreateMenu/AppendMenuW 真系统
+菜单 + 加速键）：真实窗口宿主经 `set_native_menus(true)` 打开（headless
+测试保持 app 内菜单以便点击验证），桌面 runner（apps/rtcl-tk-app）已接；
+未打开时 Windows/Linux 维持 app 内实现；scrollbar 已与 listbox/treeview 联动。
 
 **平台扩展点**：原生对话框/剪贴板由宿主回调注入
 `set_message_box_handler/set_file_dialog_handler/set_color_dialog_handler/
 set_dialog_handler/set_clipboard_getter/set_clipboard_sink`；另有
 `set_native_event_pump`（vwait 嵌套泵）、`set_screen_metrics`
-（`winfo screenwidth/height`，Linux 读主显示器像素）、`set_bell`
-（显示蜂鸣）。内置实现目前
-只有 Linux GTK4（本仓库验证环境），macOS/Windows 宿主可自行注册平台原生
-实现，未注册时对话框回退默认按钮/空路径/初始色、screen 1920×1080、
-bell 静默。IME 与基础 a11y 由 nsh
+（`winfo screenwidth/height`）、`set_bell`
+（显示蜂鸣）。内置实现有 Linux GTK4 与 **Windows Win32**（本仓库验证环境）：
+Windows 的 `tk_messageBox` 是 `MessageBoxW`（`-type` 六组按钮、`-icon`
+四种、`-default` 映射 DEFBUTTON，Esc/关闭返回 cancel——与 Tk 在 Windows
+上的实现同源）；`tk_getOpenFile/tk_getSaveFile` 是
+`GetOpenFileNameW/GetSaveFileNameW`（`-filetypes` 转 filter 串、
+`-multiple` 解析多选 buffer、`-confirmoverwrite`/`-defaultextension`/
+`OFN_NOCHANGEDIR` 保持 cwd，返回路径转正斜杠——`file normalize` 的形态）；
+`tk_chooseDirectory` 是 `SHBrowseForFolderW`（BFFM_SETSELECTIONW 定位
+`-initialdir`，apartment 可用时带新建目录样式）；`tk_chooseColor` 是
+`ChooseColorW`（十六自定义色跨调用保留，返回 `#rrggbb`）；剪贴板 getter 读
+`CF_UNICODETEXT`；screen metrics 用 `GetSystemMetrics`；bell 用
+`MessageBeep`；vwait 泵走 `PeekMessageW/DispatchMessageW`。`tk_dialog`
+在 Windows 暂无原生实现（TaskDialog 需 comctl32 v6 manifest），回退
+default 按钮。macOS 宿主可自行注册平台原生实现；未注册时对话框回退默认
+按钮/空路径/初始色、screen 1920×1080、bell 静默。IME 与基础 a11y 由 nsh
 原生 input/RichEditor/按钮承担；自绘控件补了关键标签（spinbox
 Increment/Decrement、toplevel Close window），Canvas/Chart 仍是纯绘制、
 无逐项 a11y 语义。**Android port 进展**：本机有 SDK（`~/android-sdk`，NDK 29）+ cargo-ndk
 4.1.2；tk 全栈（core/runtime/nsh/demo）已通过
-`cargo ndk -t arm64-v8a --platform 24 check`（注意：serde_json 的
-android cfg 已随 linux 开）。fork 的 nsh-platform-android 完整存在
+`cargo ndk -t arm64-v8a --platform 24 check`（serde_json 已改为无条件依赖，
+android/windows 均可用）。fork 的 nsh-platform-android 完整存在
 （JNI libnsh.so + Java 运行时），nsh-cli 的 android.rs 能打 APK
 （classes.dex + libnsh.so per ABI + AppActivity 跑 Rust root）。
 Android app crate 已建：`apps/rtcl-tk-app`（nsh.json `"rust": "native"`
 + `root: TclApp`；native crate 依赖 rtcl-tk-demo 的脚本装载 +
 `#[native_module]` 注册 TclApp；nsh 依赖直连 fork git 源——patch 不随
-生成的 .nsh/rust workspace 传播）。`nsh run --target android` 端到端验证通过：装
+生成的 .nsh/rust workspace 传播；demo 脚本经 `__DEMO_PNG__` 替换注入
+`demo_png_path()`——路径统一正斜杠（Windows 反斜杠在 Tcl 词里是转义）、
+Android 写进程包名自己的 files 目录）。`nsh run --target android` 端到端验证通过：装
 `platforms;android-35`（javac classpath）与
 `system-images;android-28;default;x86_64`（arm64 镜像在 x86 主机不被
 QEMU2 支持）+ emulator 37.2 + AVD 后，出 APK（dev.rtcl.tkapp）安装并
 启动，Tcl 驱动的 label/entry/button 渲染正常，点按后 `-command` 改
 label "Tapped!"（docs/images/tk-android*.png）。宿主钩子（对话框/
-剪贴板）android 侧未注册，回退默认值；行内绘制同桌面。
+剪贴板）android 侧未注册，回退默认值。
 
 **视觉验收（不用 TSX）**：Tcl 与 TSX 在同一生态位，因此截图走 Rust/GTK，
 不引入 `*.test.tsx` 或 nsh CLI：

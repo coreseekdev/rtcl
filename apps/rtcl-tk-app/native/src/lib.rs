@@ -17,6 +17,6 @@ pub const SCRIPT: &str = include_str!("../../script.tcl");
 /// The root component: installs the Tcl interpreter and renders the tree.
 #[component]
 pub fn TclApp() -> impl IntoElement {
-    demo::ensure_tcl_script(SCRIPT);
+    demo::ensure_tcl_script(&SCRIPT.replace("__DEMO_PNG__", &demo::demo_png_path()));
     rtcl_tk_nsh::tk_view()
 }

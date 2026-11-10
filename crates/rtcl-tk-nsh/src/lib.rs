@@ -39,6 +39,11 @@ use nsh_core::prelude::*;
 use rtcl_tk_core::{Fill, PackSide, TkTree, WidgetKind};
 use serde_json::json;
 
+/// Tk's system services on Windows (dialogs, clipboard, screen, bell,
+/// event pump): the Win32 calls Tk itself makes.
+#[cfg(target_os = "windows")]
+mod win32;
+
 thread_local! {
     /// The renderer's revision signal, created by the first [`TkView`]
     /// render.  Tk mutations bump it from event callbacks, which schedules
@@ -85,6 +90,20 @@ pub fn install_backend() {
     rtcl_tk_runtime::set_color_dialog_handler(color_dialog_gtk);
     #[cfg(target_os = "linux")]
     rtcl_tk_runtime::set_dialog_handler(dialog_gtk);
+    #[cfg(target_os = "windows")]
+    rtcl_tk_runtime::set_message_box_handler(win32::message_box);
+    #[cfg(target_os = "windows")]
+    rtcl_tk_runtime::set_file_dialog_handler(win32::file_dialog);
+    #[cfg(target_os = "windows")]
+    rtcl_tk_runtime::set_color_dialog_handler(win32::color_dialog);
+    #[cfg(target_os = "windows")]
+    rtcl_tk_runtime::set_clipboard_getter(win32::clipboard_text);
+    #[cfg(target_os = "windows")]
+    rtcl_tk_runtime::set_screen_metrics(win32::screen_metrics);
+    #[cfg(target_os = "windows")]
+    rtcl_tk_runtime::set_bell(win32::ring_bell);
+    #[cfg(target_os = "windows")]
+    rtcl_tk_runtime::set_native_event_pump(win32::pump_native_events);
     #[cfg(target_os = "linux")]
     if gtk4::is_initialized() {
         rtcl_tk_runtime::set_native_event_pump(pump_native_events);
@@ -685,15 +704,30 @@ thread_local! {
     /// Widgets with a finger down, so moves become touch moves.
     static TOUCH_ACTIVE: RefCell<std::collections::BTreeSet<String>> =
         const { RefCell::new(std::collections::BTreeSet::new()) };
+    /// The host's choice of menu bar; `None` detects the platform.
+    static NATIVE_MENUS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Forces the platform's application menu on or off, instead of detecting
+/// it.  A windowed app's runner turns it on: Windows has no cheap way to
+/// tell a real window (whose host builds a Win32 menu bar) from a headless
+/// run, which must keep the in-app bar its tests click.
+pub fn set_native_menus(enabled: bool) {
+    NATIVE_MENUS.with(|cell| cell.set(Some(enabled)));
 }
 
 /// Publish the Tk `menu` tree as the platform's application menu (macOS's
-/// system menu, GTK's menu bar).  Headless runs keep the in-app bar.
+/// system menu, GTK's menu bar, the Win32 menu bar).  Headless runs keep
+/// the in-app bar.
 /// Platforms with a native application menu: macOS always; Linux when a
 /// real GTK app is running (the fork installs a PopoverMenuBar in the
-/// window's menu slot).  Headless runs have no GTK app, so they keep the
+/// window's menu slot); elsewhere when the host asked for it
+/// ([`set_native_menus`]).  Headless runs have no GTK app, so they keep the
 /// in-app menu bar the tests click.
 fn native_menu_platform() -> bool {
+    if let Some(enabled) = NATIVE_MENUS.with(std::cell::Cell::get) {
+        return enabled;
+    }
     if matches!(os(), nsh_core::platform::Os::MacOs) {
         return true;
     }

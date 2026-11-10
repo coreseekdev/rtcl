@@ -18,7 +18,7 @@ set ::agreed 0
 set ::volume 30
 set ::qty 3
 set ::sort Name
-image create photo demoimg -file "__DEMO_PNG__"
+image create photo demoimg -file {__DEMO_PNG__}
 
 label .greeting -textvariable ::greeting
 pack .greeting -padx 12 -pady 6
@@ -69,7 +69,7 @@ wm geometry .about "190x110+350+140"
 label .about.text -text "This is a Toplevel window"
 pack .about.text -padx 12 -pady 12
 
-image create photo demoimg -file "__DEMO_PNG__"
+image create photo demoimg -file {__DEMO_PNG__}
 text .doc -height 4
 .doc insert end "with embedded:"
 .doc insert end "\n"
@@ -219,7 +219,7 @@ thread_local! {
 }
 
 pub fn ensure_tcl() {
-    ensure_tcl_script(DEMO);
+    ensure_tcl_script(&DEMO.replace("__DEMO_PNG__", &demo_png_path()));
 }
 
 pub fn ensure_tcl_script(script: &str) {
@@ -245,14 +245,32 @@ pub fn ensure_tcl_script(script: &str) {
     }
 }
 
+/// Writes [`DEMO_PNG`] where the app can read it back and returns the path
+/// with forward slashes (a Windows path's backslashes are escapes in a Tcl
+/// word).  Android apps cannot write the system temp dir; their own files
+/// dir (named after the process, i.e. the package) always is writable.
+pub fn demo_png_path() -> String {
+    let dir = if cfg!(target_os = "android") {
+        let package = std::fs::read_to_string("/proc/self/cmdline")
+            .ok()
+            .and_then(|s| s.split(['\0', ':']).next().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "dev.rtcl.tkapp".to_string());
+        std::path::PathBuf::from(format!("/data/data/{package}/files"))
+    } else {
+        std::env::temp_dir()
+    };
+    std::fs::create_dir_all(&dir).ok();
+    let photo = dir.join("rtcl-demo.png");
+    std::fs::write(&photo, DEMO_PNG).ok();
+    photo.to_string_lossy().replace('\\', "/")
+}
+
 #[component]
 pub fn DemoApp() -> impl IntoElement {
-    let photo = std::env::temp_dir().join("rtcl-demo.png");
-    std::fs::create_dir_all(std::env::temp_dir()).ok();
-    std::fs::write(&photo, DEMO_PNG).ok();
     // Substitute BEFORE the first script install (ensure_tcl would install
     // the unsubstituted demo and win the interp slot).
-    ensure_tcl_script(&DEMO.replace("__DEMO_PNG__", &photo.to_string_lossy()));
+    ensure_tcl_script(&DEMO.replace("__DEMO_PNG__", &demo_png_path()));
     rtcl_tk_nsh::tk_view()
 }
 
@@ -283,8 +301,5 @@ pub fn ClassicApp() -> impl IntoElement {
 /// The [`CLASSIC`] form with runtime paths substituted (the embedded
 /// image's photo file).
 pub fn classic_script() -> String {
-    let photo = std::env::temp_dir().join("rtcl-demo.png");
-    std::fs::create_dir_all(std::env::temp_dir()).ok();
-    std::fs::write(&photo, DEMO_PNG).ok();
-    CLASSIC.replace("__DEMO_PNG__", &photo.to_string_lossy())
+    CLASSIC.replace("__DEMO_PNG__", &demo_png_path())
 }

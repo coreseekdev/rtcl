@@ -148,12 +148,20 @@ pub struct CanvasItem {
     pub options: BTreeMap<String, String>,
 }
 
-/// A `photo` image: a file plus its reported size.
+/// A `photo` image: its `-file`/`-data` source, the configured size and the
+/// intrinsic size read from the image header.
 #[derive(Debug, Clone, Default)]
 pub struct PhotoImage {
     pub file: String,
+    /// `-data` as given (base64, raw image bytes, or a `data:` URI).
+    pub data: String,
+    /// `-width`/`-height`: 0 fits the image data, like Tk.
     pub width: i64,
     pub height: i64,
+    /// The data's own (width, height); `(0, 0)` while the photo is empty.
+    pub natural: (i64, i64),
+    /// What the renderer loads: the file path, or a `data:` URI.
+    pub source: String,
 }
 
 /// A `text` tag: its options and the character ranges it covers.
@@ -5933,17 +5941,22 @@ fn image_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let mut image = PhotoImage::default();
             for (key, value) in parse_pairs(args, start, "image create")? {
                 match key.as_str() {
-                    "-file" => image.file = value,
-                    // A data URI (or base64 payload): the renderer's image
-                    // element treats the string as its source, and the
-                    // platforms' data-URI loaders decode it.
-                    "-data" => image.file = value,
+                    // Like Tk, the last of -file/-data configured wins.
+                    "-file" => {
+                        image.data.clear();
+                        image.file = value;
+                    }
+                    "-data" => {
+                        image.file.clear();
+                        image.data = value;
+                    }
                     "-width" => image.width = value.parse().unwrap_or(0),
                     "-height" => image.height = value.parse().unwrap_or(0),
                     "-format" | "-gamma" | "-palette" => {}
                     _ => return Err(bad_option(&key)),
                 }
             }
+            photo_refresh(&mut image)?;
             with_state_mut(interp, |rt| {
                 rt.images.insert(name.clone(), image);
                 rt.bump();
@@ -5984,9 +5997,10 @@ fn image_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "width" | "height" => {
             let name = args.get(2).map(|v| v.as_str()).unwrap_or("");
             let size = with_state(interp, |rt| {
-                rt.images
-                    .get(name)
-                    .map(|i| if args[1].as_str() == "width" { i.width } else { i.height })
+                rt.images.get(name).map(|i| {
+                    let (w, h) = photo_size(i);
+                    if args[1].as_str() == "width" { w } else { h }
+                })
             })
             .flatten()
             .ok_or_else(|| generic(format!("image \"{name}\" doesn't exist")))?;
@@ -6018,6 +6032,7 @@ fn photo_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .unwrap_or_default();
             let value = match args[2].as_str() {
                 "-file" => image.file,
+                "-data" => image.data,
                 "-width" => image.width.to_string(),
                 "-height" => image.height.to_string(),
                 other => return Err(bad_option(other)),
@@ -6032,6 +6047,8 @@ fn photo_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Ok(list_value([
                     "-file".to_string(),
                     image.file,
+                    "-data".to_string(),
+                    image.data,
                     "-width".to_string(),
                     image.width.to_string(),
                     "-height".to_string(),
@@ -6041,16 +6058,35 @@ fn photo_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let options = parse_pairs(args, 2, "configure")?;
             with_state_mut(interp, |rt| {
                 if let Some(image) = rt.images.get_mut(name) {
+                    let previous = image.clone();
+                    let mut refresh = false;
                     for (key, value) in options {
                         match key.as_str() {
-                            "-file" => image.file = value,
+                            "-file" => {
+                                image.data.clear();
+                                image.file = value;
+                                refresh = true;
+                            }
+                            "-data" => {
+                                image.file.clear();
+                                image.data = value;
+                                refresh = true;
+                            }
                             "-width" => image.width = value.parse().unwrap_or(0),
                             "-height" => image.height = value.parse().unwrap_or(0),
-                            "-data" | "-format" | "-gamma" | "-palette" => {}
+                            "-format" | "-gamma" | "-palette" => {}
                             _ => return Err(bad_option(&key)),
                         }
                     }
-                    rt.bump();
+                    // Like Tk, a bad source errors and leaves the photo as
+                    // it was.
+                    if let Err(e) = photo_refresh(image) {
+                        *image = previous;
+                        return Err(e);
+                    }
+                    if refresh {
+                        rt.bump();
+                    }
                 }
                 Ok::<(), Error>(())
             })
@@ -6061,11 +6097,8 @@ fn photo_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let image = with_state(interp, |rt| rt.images.get(name).cloned())
                 .flatten()
                 .unwrap_or_default();
-            Ok(Value::from_int(if sub == "width" {
-                image.width
-            } else {
-                image.height
-            }))
+            let (width, height) = photo_size(&image);
+            Ok(Value::from_int(if sub == "width" { width } else { height }))
         }
         "put" | "read" | "write" | "copy" | "blank" | "transparency" | "data"
         | "get" => Ok(Value::empty()),
@@ -6075,17 +6108,17 @@ fn photo_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
-/// The file behind a photo image.
+/// What the renderer loads for a photo: its file path, or a `data:` URI.
 pub fn image_path(name: &str) -> Option<String> {
     let ptr = active_interp()?;
     with_state(unsafe { &*ptr }, |rt| {
-        rt.images.get(name).map(|i| i.file.clone())
+        rt.images.get(name).map(|i| i.source.clone())
     })
     .flatten()
 }
 
-/// An embedded image's placeholder position, the photo's file and its
-/// declared size, for the renderer's inline drawing.
+/// An embedded image's placeholder position, the photo's source and its
+/// effective size, for the renderer's inline drawing.
 pub fn text_image_files(path: &str) -> Vec<(usize, String, i64, i64)> {
     let Some(ptr) = active_interp() else {
         return Vec::new();
@@ -6104,21 +6137,212 @@ pub fn text_image_files(path: &str) -> Vec<(usize, String, i64, i64)> {
                     .map(|m| m.index)
                     .unwrap_or(*index);
                 let image = rt.images.get(options.get("-image")?)?;
-                let (width, height) = (image.width, image.height);
-                Some((index, image.file.clone(), width, height))
+                let (width, height) = photo_size(image);
+                Some((index, image.source.clone(), width, height))
             })
             .collect()
     })
     .unwrap_or_default()
 }
 
+/// A photo's reported size: the configured `-width`/`-height` when nonzero,
+/// otherwise the intrinsic size of its data (Tk semantics).
+fn photo_size(image: &PhotoImage) -> (i64, i64) {
+    (
+        if image.width > 0 { image.width } else { image.natural.0 },
+        if image.height > 0 { image.height } else { image.natural.1 },
+    )
+}
+
 /// A photo image's reported size.
 pub fn image_dimensions(name: &str) -> Option<(i64, i64)> {
     let ptr = active_interp()?;
     with_state(unsafe { &*ptr }, |rt| {
-        rt.images.get(name).map(|i| (i.width, i.height))
+        rt.images.get(name).map(photo_size)
     })
     .flatten()
+}
+
+/// Re-reads a photo's configured source: its intrinsic size and the
+/// renderer's URI.  Like Tk, a missing file or unrecognized payload errors.
+fn photo_refresh(image: &mut PhotoImage) -> Result<()> {
+    use std::io::Read as _;
+    image.natural = (0, 0);
+    image.source.clear();
+    let file = image.file.clone();
+    let data = image.data.clone();
+    // The header scan only; the renderer reads the file itself.  The SOF
+    // segment of a JPEG sits behind any EXIF, so scan a few megabytes.
+    let bytes = if !file.is_empty() {
+        let mut bytes = Vec::new();
+        std::fs::File::open(&file)
+            .and_then(|mut f| f.take(4 << 20).read_to_end(&mut bytes))
+            .map_err(|e| generic(format!("couldn't open \"{file}\": {e}")))?;
+        bytes
+    } else if !data.is_empty() {
+        if let Some(rest) = data.strip_prefix("data:") {
+            let payload = rest.splitn(2, ',').nth(1).unwrap_or("");
+            decode_base64_payload(payload).ok_or_else(|| generic("couldn't recognize image data"))?
+        } else if image_intrinsic_size(data.as_bytes()).is_some() {
+            data.as_bytes().to_vec()
+        } else {
+            decode_base64_payload(&data).ok_or_else(|| generic("couldn't recognize image data"))?
+        }
+    } else {
+        return Ok(()); // no data configured yet: a blank 0-sized photo
+    };
+    let Some(size) = image_intrinsic_size(&bytes) else {
+        return Err(generic(if file.is_empty() {
+            "couldn't recognize image data".to_string()
+        } else {
+            format!("couldn't recognize data in image file \"{file}\"")
+        }));
+    };
+    image.natural = size;
+    image.source = if !file.is_empty() {
+        file
+    } else if let Some(rest) = data.strip_prefix("data:") {
+        // Already a URI; the renderer's loaders decode it.
+        format!("data:{rest}")
+    } else if image_intrinsic_size(data.as_bytes()).is_some() {
+        // Raw binary data: the renderer needs text, so encode it.
+        format!(
+            "data:{};base64,{}",
+            image_mime(&bytes),
+            encode_base64(data.as_bytes())
+        )
+    } else {
+        // Tk's -data is base64: reuse the payload, sniff the mime type.
+        format!("data:{};base64,{}", image_mime(&bytes), data)
+    };
+    Ok(())
+}
+
+/// The dimensions a PNG, GIF, BMP or JPEG header declares.
+fn image_intrinsic_size(bytes: &[u8]) -> Option<(i64, i64)> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, ..] => {
+            if bytes.len() < 24 || &bytes[12..16] != b"IHDR" {
+                return None;
+            }
+            let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+            let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+            Some((w as i64, h as i64))
+        }
+        [b'G', b'I', b'F', b'8', ..] => {
+            let w = bytes.get(6..8).and_then(|b| b.try_into().ok())?;
+            let h = bytes.get(8..10).and_then(|b| b.try_into().ok())?;
+            Some((u16::from_le_bytes(w) as i64, u16::from_le_bytes(h) as i64))
+        }
+        [b'B', b'M', ..] => {
+            let w = bytes.get(18..22).and_then(|b| b.try_into().ok())?;
+            let h = bytes.get(22..26).and_then(|b| b.try_into().ok())?;
+            // Height grows bottom-up in the classic header; negative means
+            // top-down.  Both report positive dimensions.
+            Some((
+                i32::from_le_bytes(w).max(0) as i64,
+                i32::from_le_bytes(h).unsigned_abs() as i64,
+            ))
+        }
+        [0xff, 0xd8, ..] => jpeg_size(bytes),
+        _ => None,
+    }
+}
+
+/// The first SOFn segment (baseline or progressive) of a JPEG.
+fn jpeg_size(bytes: &[u8]) -> Option<(i64, i64)> {
+    let mut i = 2usize;
+    while i + 4 <= bytes.len() {
+        if bytes[i] != 0xff {
+            i += 1;
+            continue;
+        }
+        let code = bytes[i + 1];
+        // Standalone markers carry no length.
+        if (0xd0..=0xd7).contains(&code) || code == 0x01 || code == 0xff {
+            i += 2;
+            continue;
+        }
+        let len = usize::from(u16::from_be_bytes(bytes[i + 2..i + 4].try_into().ok()?));
+        if len < 2 {
+            break;
+        }
+        // SOF0..SOF3, SOF5..SOF7, SOF9..SOF11, SOF13..SOF15; DHT (C4),
+        // JPG (C8) and DAC (CC) are the gaps.
+        if (0xc0..=0xcf).contains(&code) && code != 0xc4 && code != 0xc8 && code != 0xcc {
+            let at = i + 5; // marker(2) + length(2) + precision(1)
+            let p = bytes.get(at..at + 4)?;
+            let h = u16::from_be_bytes(p[0..2].try_into().ok()?);
+            let w = u16::from_be_bytes(p[2..4].try_into().ok()?);
+            return Some((w as i64, h as i64));
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+fn image_mime(bytes: &[u8]) -> &'static str {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        [b'G', b'I', b'F', b'8', ..] => "image/gif",
+        [0xff, 0xd8, ..] => "image/jpeg",
+        [b'B', b'M', ..] => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Lenient base64: standard or URL-safe alphabet, padding and whitespace
+/// optional.
+fn decode_base64_payload(text: &str) -> Option<Vec<u8>> {
+    fn value(b: u8) -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some((b - b'A') as u32),
+            b'a'..=b'z' => Some((b - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((b - b'0' + 52) as u32),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(text.len() / 4 * 3 + 3);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for b in text.bytes() {
+        if b.is_ascii_whitespace() || b == b'=' {
+            continue;
+        }
+        acc = (acc << 6) | value(b)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn encode_base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 fn menu_create(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -9706,7 +9930,8 @@ fn canvas_item_bbox(
                 .get("-image")
                 .and_then(|name| images.get(name))
                 .map_or((80.0, 80.0), |image| {
-                    (image.width as f64, image.height as f64)
+                    let (w, h) = photo_size(image);
+                    (w as f64, h as f64)
                 });
             let anchor = item.options.get("-anchor").map_or("center", String::as_str);
             let (dx, dy) = anchor_offset(anchor, width, height);
@@ -12648,6 +12873,122 @@ mod tests {
         interp.eval(script).unwrap().as_str().to_string()
     }
 
+    /// A 1x1 transparent PNG, for photo sources that must really exist.
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+        0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+        0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+        0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    /// Writes [`TINY_PNG`] to the temp dir, as a forward-slash path Tcl can
+    /// quote on any platform.
+    fn tiny_png() -> String {
+        let path = std::env::temp_dir().join("rtcl-tiny.png");
+        std::fs::write(&path, TINY_PNG).ok();
+        path.to_string_lossy().replace('\\', "/")
+    }
+
+    #[test]
+    fn photo_intrinsic_size_and_sources() {
+        // Header parsing: PNG, GIF, BMP and JPEG dimensions.
+        assert_eq!(image_intrinsic_size(TINY_PNG), Some((1, 1)));
+        let gif = {
+            let mut b = b"GIF89a".to_vec();
+            b.extend_from_slice(&3u16.to_le_bytes());
+            b.extend_from_slice(&7u16.to_le_bytes());
+            image_intrinsic_size(&b)
+        };
+        assert_eq!(gif, Some((3, 7)));
+        let bmp = {
+            // File size + reserved (8), data offset, DIB size, w, h.
+            let mut b = b"BM".to_vec();
+            b.extend_from_slice(&[0u8; 8]);
+            b.extend_from_slice(&[0u8; 4]);
+            b.extend_from_slice(&[0u8; 4]);
+            b.extend_from_slice(&5i32.to_le_bytes());
+            b.extend_from_slice(&(-9i32).to_le_bytes());
+            image_intrinsic_size(&b)
+        };
+        assert_eq!(bmp, Some((5, 9)));
+        let jpeg = {
+            let mut b = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00];
+            b.extend_from_slice(&[0u8; 13]);
+            // SOI, APP0 with a 16-byte segment, then SOF0: h=11 w=22.
+            b.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x0b, 0x00, 0x16]);
+            image_intrinsic_size(&b)
+        };
+        assert_eq!(jpeg, Some((22, 11)));
+        assert_eq!(image_intrinsic_size(b"not an image"), None);
+
+        // Tcl-level: a file photo reports the file's own size.
+        let mut i = Interp::new();
+        install(&mut i);
+        let png = tiny_png();
+        eval(&mut i, &format!("image create photo t -file {{{png}}}"));
+        assert_eq!(eval(&mut i, "image width t"), "1");
+        assert_eq!(eval(&mut i, "t height"), "1");
+        assert_eq!(eval(&mut i, "t cget -file"), png);
+
+        // -width/-height override the report; cget keeps what was configured.
+        eval(&mut i, &format!("image create photo c -file {{{png}}} -width 9 -height 8"));
+        assert_eq!(eval(&mut i, "image width c"), "9");
+        assert_eq!(eval(&mut i, "c height"), "8");
+        assert_eq!(eval(&mut i, "c cget -width"), "9");
+        eval(&mut i, "c configure -width 0 -height 0");
+        assert_eq!(eval(&mut i, "image width c"), "1");
+
+        // Tk's -data is base64: the mime is sniffed for the renderer.
+        let b64 = encode_base64(TINY_PNG);
+        eval(&mut i, &format!("image create photo d -data {b64}"));
+        assert_eq!(eval(&mut i, "image width d"), "1");
+        assert_eq!(eval(&mut i, "d cget -data"), b64);
+        assert_eq!(eval(&mut i, "d cget -file"), "");
+        assert_eq!(
+            image_path("d").as_deref(),
+            Some(&*format!("data:image/png;base64,{b64}"))
+        );
+
+        // A full data: URI passes through.
+        eval(&mut i, &format!("image create photo u -data {{{}}}", uri_of(&b64)));
+        assert_eq!(eval(&mut i, "image width u"), "1");
+        assert_eq!(eval(&mut i, "u cget -data"), uri_of(&b64));
+
+        // The last of -file/-data configured wins.
+        eval(&mut i, &format!("t configure -data {b64}"));
+        assert_eq!(eval(&mut i, "t cget -file"), "");
+        assert_eq!(eval(&mut i, "t cget -data"), b64);
+        assert_eq!(eval(&mut i, "image width t"), "1");
+
+        // Errors like Tk: missing file, unrecognized payload; a failed
+        // configure leaves the photo as it was.
+        let missing = i
+            .eval("image create photo nope -file /nonexistent/rtcl.png")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("couldn't open \"/nonexistent/rtcl.png\""),
+            "{missing}"
+        );
+        assert_eq!(eval(&mut i, "image exists nope"), "0");
+        let bad = i
+            .eval("image create photo bad -data !!!")
+            .unwrap_err()
+            .to_string();
+        assert!(bad.contains("couldn't recognize image data"), "{bad}");
+        assert!(i.eval("t configure -file /nonexistent/rtcl.png").is_err());
+        assert_eq!(eval(&mut i, "t cget -file"), "");
+        assert_eq!(eval(&mut i, "t cget -data"), b64);
+        assert_eq!(eval(&mut i, "image width t"), "1");
+    }
+
+    /// The data: URI form of the test PNG.
+    fn uri_of(b64: &str) -> String {
+        format!("data:image/png;base64,{b64}")
+    }
+
+
     #[test]
     fn widget_creation_configure_cget() {
         let mut i = Interp::new();
@@ -12965,17 +13306,18 @@ mod tests {
         eval(&mut i, ".t tag delete strong");
         assert_eq!(eval(&mut i, ".t tag names"), "");
 
+        let png = tiny_png();
         assert_eq!(
             eval(
                 &mut i,
-                "image create photo img -file /tmp/x.png -width 10 -height 20"
+                &format!("image create photo img -file {{{png}}} -width 10 -height 20")
             ),
             "img"
         );
         assert_eq!(eval(&mut i, "image names"), "img");
         assert_eq!(eval(&mut i, "image width img"), "10");
         assert_eq!(eval(&mut i, "image type img"), "photo");
-        assert_eq!(eval(&mut i, "img cget -file"), "/tmp/x.png");
+        assert_eq!(eval(&mut i, "img cget -file"), png);
         eval(&mut i, "image delete img");
         assert_eq!(eval(&mut i, "image exists img"), "0");
 
@@ -13490,7 +13832,10 @@ mod tests {
         let mut i = Interp::new();
         install(&mut i);
         eval(&mut i, "text .t; .t insert 1.0 hello");
-        eval(&mut i, "image create photo pic -file /tmp/x.png");
+        eval(
+            &mut i,
+            &format!("image create photo pic -file {{{}}}", tiny_png()),
+        );
         // The embedded image occupies one character (U+FFFC) at 1.2.
         eval(&mut i, ".t image create 1.2 -image pic");
         assert_eq!(eval(&mut i, ".t image names"), "image1");
@@ -14568,7 +14913,10 @@ mod tests {
         // Default anchor is center for text/image items.
         eval(
             &mut i,
-            "image create photo dot -file /tmp/x.png -width 10 -height 20",
+            &format!(
+                "image create photo dot -file {{{}}} -width 10 -height 20",
+                tiny_png()
+            ),
         );
         let img = eval(&mut i, ".k create image 50 50 -image dot");
         assert_eq!(eval(&mut i, &format!(".k bbox {img}")), "45 40 55 60");

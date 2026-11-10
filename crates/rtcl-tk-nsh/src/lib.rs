@@ -1699,6 +1699,36 @@ fn render_menu_bar(menu_path: &str) -> AnyElement {
     let Some(menu) = rtcl_tk_runtime::menu_snapshot(menu_path) else {
         return view().into_element();
     };
+    // Alt mnemonics, bound only for the letters the bar's labels actually
+    // use (`-underline`), while this bar is rendered. Always: they work
+    // from inside a focused entry, as Tk's do. Apple platforms have no
+    // menu mnemonics (Option+letter types characters), and the native
+    // menubars keep their own.
+    if !apple_keys() && !native_menu_platform() {
+        let mut seen = std::collections::BTreeSet::new();
+        for item in &menu.items {
+            let label = item.options.get("-label").cloned().unwrap_or_default();
+            let underline: usize = item
+                .options
+                .get("-underline")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let Some(ch) = label.chars().nth(underline) else {
+                continue;
+            };
+            let lower = ch.to_ascii_lowercase();
+            if !lower.is_ascii_alphanumeric() || !seen.insert(lower) {
+                continue;
+            }
+            let always = KeyOptions {
+                when: nsh_core::keymap::When::Always,
+                repeat: false,
+            };
+            on_key_with(&format!("alt+{lower}"), always, move |_: &str| {
+                rtcl_tk_runtime::menu_menubar_mnemonic(lower);
+            });
+        }
+    }
     let mut bar = view()
         .flex_row()
         .w_full()
@@ -1741,6 +1771,29 @@ fn render_menu_dropdown(menu_path: &str) -> AnyElement {
     let Some(menu) = rtcl_tk_runtime::menu_snapshot(menu_path) else {
         return view().into_element();
     };
+    // While a cascade is dropped down, its keys take over (registered
+    // here, so they exist only for this render and return to the widgets
+    // when it closes). Always: a posted menu takes the keyboard, Tk-like.
+    let always = |repeat| KeyOptions {
+        when: nsh_core::keymap::When::Always,
+        repeat,
+    };
+    for (keystroke, down) in [("down", true), ("up", false)] {
+        on_key_with(keystroke, always(true), move |_: &str| {
+            rtcl_tk_runtime::menu_open_move(down);
+        });
+    }
+    for (keystroke, next) in [("right", true), ("left", false)] {
+        on_key_with(keystroke, always(false), move |_: &str| {
+            rtcl_tk_runtime::menu_open_sibling(next);
+        });
+    }
+    on_key_with("return", always(false), |_: &str| {
+        rtcl_tk_runtime::menu_open_invoke();
+    });
+    on_key_with("escape", always(false), |_: &str| {
+        rtcl_tk_runtime::menu_open_close();
+    });
     let mut panel = view()
         .absolute()
         .top(px(30.0))
@@ -1798,6 +1851,9 @@ fn render_menu_dropdown(menu_path: &str) -> AnyElement {
         let label = format!("{label}{accelerator}");
         let disabled = item.options.get("-state").is_some_and(|s| s == "disabled");
         let path = menu_path.to_string();
+        // The keyboard-focused entry highlights like a hovered one.
+        let focused = rtcl_tk_runtime::menu_focused_item()
+            .is_some_and(|(path, index)| path == menu_path && index == i);
         if disabled {
             panel = panel.child(
                 text(format!("{mark}{label}{suffix}"))
@@ -1806,22 +1862,24 @@ fn render_menu_dropdown(menu_path: &str) -> AnyElement {
             );
             continue;
         }
-        panel = panel.child(
-            nsh_base::button()
-                .w_full()
-                .justify_start()
-                .px(px(8.0))
-                .py(px(4.0))
-                .rounded(px(4.0))
-                .child(
-                    text(format!("{mark}{label}{suffix}"))
-                        .text_size(px(13.0))
-                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
-                )
-                .on_press(move |_: &()| {
-                    rtcl_tk_runtime::press_menu_item(&path, i);
-                }),
-        );
+        let mut entry = nsh_base::button()
+            .w_full()
+            .justify_start()
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .child(
+                text(format!("{mark}{label}{suffix}"))
+                    .text_size(px(13.0))
+                    .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
+            )
+            .on_press(move |_: &()| {
+                rtcl_tk_runtime::press_menu_item(&path, i);
+            });
+        if focused {
+            entry = entry.bg(AdaptiveColor::rgb(0xe5e7eb, 0x374151));
+        }
+        panel = panel.child(entry);
     }
     let layout_path = menu_path.to_string();
     panel = panel.on_layout(move |b: &Bounds<Points>| {

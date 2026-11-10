@@ -79,6 +79,8 @@ pub struct TkRuntime {
     popup_menu: Option<(String, f64, f64)>,
     /// The open cascade menu (`None` when no menu is dropped down).
     open_menu: Option<String>,
+    /// The keyboard-focused menu entry while a cascade is dropped down.
+    menu_focus: Option<(String, usize)>,
     /// Selected page index of each `ttk::notebook`.
     notebook_selected: BTreeMap<String, usize>,
     /// The combobox whose value list is dropped down.
@@ -7709,8 +7711,244 @@ pub fn toggle_menu(path: &str) {
         } else {
             Some(path.to_string())
         };
+        rt.menu_focus = None;
         rt.bump();
     });
+}
+
+/// The menubar's path (the `-menu` of "."), for keyboard traversal.
+pub fn menu_bar_path() -> Option<String> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| {
+        rt.tree
+            .get(".")
+            .and_then(|n| n.options.get("-menu"))
+            .filter(|menu| !menu.is_empty())
+            .cloned()
+    })
+    .flatten()
+}
+
+/// Whether `index` is selectable for keyboard focus (not a separator and
+/// not disabled).
+fn menu_item_focusable(menu: &Menu, index: usize) -> bool {
+    menu.items
+        .get(index)
+        .is_some_and(|item| {
+            item.kind != "separator"
+                && item
+                    .options
+                    .get("-state")
+                    .map(|state| state != "disabled")
+                    .unwrap_or(true)
+        })
+}
+
+/// The keyboard focus of the open cascade, for the renderer's highlight.
+pub fn menu_focused_item() -> Option<(String, usize)> {
+    let ptr = active_interp()?;
+    with_state(unsafe { &*ptr }, |rt| rt.menu_focus.clone()).flatten()
+}
+
+/// Alt-mnemonic on the menubar: opens (or closes) the cascade whose
+/// `-label` character at `-underline` matches `key`.  Returns whether a
+/// cascade matched.
+pub fn menu_menubar_mnemonic(key: char) -> bool {
+    let Some(bar) = menu_bar_path() else {
+        return false;
+    };
+    let Some(ptr) = active_interp() else {
+        return false;
+    };
+    let interp = unsafe { &mut *ptr };
+    let hit = with_state(interp, |rt| {
+        rt.menus.get(&bar).and_then(|menu| {
+            menu.items.iter().position(|item| {
+                let label = item.options.get("-label").cloned().unwrap_or_default();
+                let underline: usize = item
+                    .options
+                    .get("-underline")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                label
+                    .chars()
+                    .nth(underline)
+                    .is_some_and(|ch| ch.eq_ignore_ascii_case(&key))
+            })
+        })
+    })
+    .flatten();
+    let Some(index) = hit else {
+        return false;
+    };
+    let target = with_state(interp, |rt| {
+        rt.menus
+            .get(&bar)
+            .and_then(|menu| menu.items.get(index))
+            .and_then(|item| item.options.get("-menu"))
+            .cloned()
+    })
+    .flatten();
+    with_state_mut(interp, |rt| {
+        let opening = match target {
+            Some(sub) => {
+                rt.open_menu = if rt.open_menu.as_deref() == Some(&sub) {
+                    None
+                } else {
+                    Some(sub)
+                };
+                rt.open_menu.is_some()
+            }
+            None => false,
+        };
+        rt.menu_focus = None;
+        rt.bump();
+    });
+    true
+}
+
+/// Moves the open cascade's keyboard focus (`down` or up), wrapping past
+/// separators and disabled entries.  Returns whether a menu was open.
+pub fn menu_open_move(down: bool) -> bool {
+    let Some(ptr) = active_interp() else {
+        return false;
+    };
+    let interp = unsafe { &mut *ptr };
+    let moved = with_state_mut(interp, |rt| {
+        let Some(open) = rt.open_menu.clone() else {
+            return false;
+        };
+        let Some(menu) = rt.menus.get(&open).cloned() else {
+            return false;
+        };
+        if menu.items.is_empty() {
+            return false;
+        }
+        let count = menu.items.len();
+        let mut index = match rt.menu_focus.as_ref() {
+            Some((path, index)) if *path == open => *index,
+            _ => {
+                if down {
+                    count - 1
+                } else {
+                    0
+                }
+            }
+        };
+        for _ in 0..count {
+            index = if down {
+                (index + 1) % count
+            } else {
+                (index + count - 1) % count
+            };
+            if menu_item_focusable(&menu, index) {
+                rt.menu_focus = Some((open, index));
+                rt.bump();
+                return true;
+            }
+        }
+        false
+    });
+    moved.unwrap_or(false)
+}
+
+/// Invokes the focused entry: cascades open their submenu, real entries
+/// run and close the dropdown.  Returns whether anything was focused.
+pub fn menu_open_invoke() -> bool {
+    let Some((path, index)) = menu_focused_item() else {
+        return false;
+    };
+    let Some(ptr) = active_interp() else {
+        return false;
+    };
+    let interp = unsafe { &mut *ptr };
+    let submenu = with_state(interp, |rt| {
+        rt.menus
+            .get(&path)
+            .and_then(|menu| menu.items.get(index))
+            .map(|item| {
+                (
+                    item.kind.clone(),
+                    item.options.get("-menu").cloned().unwrap_or_default(),
+                )
+            })
+    })
+    .flatten();
+    match submenu {
+        Some((kind, sub)) if kind == "cascade" && !sub.is_empty() => {
+            with_state_mut(interp, |rt| {
+                rt.open_menu = Some(sub);
+                rt.menu_focus = None;
+                rt.bump();
+            });
+        }
+        _ => press_menu_item(&path, index),
+    }
+    true
+}
+
+/// Closes the open cascade (Escape) and clears its keyboard focus.
+/// Returns whether a menu was open.
+pub fn menu_open_close() -> bool {
+    let Some(ptr) = active_interp() else {
+        return false;
+    };
+    let interp = unsafe { &mut *ptr };
+    let had = with_state_mut(interp, |rt| {
+        let had = rt.open_menu.is_some();
+        rt.open_menu = None;
+        rt.menu_focus = None;
+        rt.bump();
+        had
+    });
+    had.unwrap_or(false)
+}
+
+/// Steps between the menubar's cascades while one is dropped down
+/// (Left/Right).  Returns whether a cascade was open to step from.
+pub fn menu_open_sibling(next: bool) -> bool {
+    let Some(open) = open_menu() else {
+        return false;
+    };
+    let Some(bar) = menu_bar_path() else {
+        return false;
+    };
+    let Some(ptr) = active_interp() else {
+        return false;
+    };
+    let interp = unsafe { &mut *ptr };
+    let steps: Vec<String> = with_state(interp, |rt| {
+        rt.menus
+            .get(&bar)
+            .map(|menu| {
+                menu.items
+                    .iter()
+                    .filter_map(|item| {
+                        let sub = item.options.get("-menu")?;
+                        (item.kind == "cascade" && !sub.is_empty()).then(|| sub.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+    .unwrap_or_default();
+    if steps.len() < 2 {
+        return false;
+    }
+    let Some(at) = steps.iter().position(|path| *path == open) else {
+        return false;
+    };
+    let target = if next {
+        (at + 1) % steps.len()
+    } else {
+        (at + steps.len() - 1) % steps.len()
+    };
+    with_state_mut(interp, |rt| {
+        rt.open_menu = Some(steps[target].clone());
+        rt.menu_focus = None;
+        rt.bump();
+    });
+    true
 }
 
 /// Whether a menu item's checkbutton/radiobutton value is on (for the
@@ -13971,6 +14209,93 @@ mod tests {
         assert_eq!(eval(&mut i, &format!(".c bbox {id}")), "30 43 70 57");
         eval(&mut i, &format!(".c itemconfigure {id} -text {{a\nbc}}"));
         assert_eq!(eval(&mut i, &format!(".c bbox {id}")), "40 37 60 63");
+    }
+
+    #[test]
+    fn menu_keyboard_traversal() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(
+            &mut i,
+            r#"
+            set ::picked {}
+            menu .bar -tearoff 0
+            menu .bar.file -tearoff 0
+            .bar.file add command -label "New" -underline 0 -command {append ::picked N}
+            .bar.file add command -label "Open" -underline 0 -state disabled
+            .bar.file add separator
+            .bar.file add command -label "Save" -underline 0 -command {append ::picked S}
+            .bar add cascade -label "File" -underline 0 -menu .bar.file
+            menu .bar.edit -tearoff 0
+            .bar.edit add command -label "Copy" -command {append ::picked C}
+            .bar.edit add cascade -label "Options" -menu .bar.opts
+            menu .bar.opts -tearoff 0
+            .bar.opts add command -label "Wrap" -command {append ::picked W}
+            .bar add cascade -label "Edit" -underline 0 -menu .bar.edit
+            . configure -menu .bar
+        "#,
+        );
+        // Alt+F (the "File" underline) drops the cascade down.
+        assert!(menu_menubar_mnemonic('f'));
+        assert_eq!(open_menu().as_deref(), Some(".bar.file"));
+        assert!(menu_menubar_mnemonic('f')); // toggles back closed
+        assert_eq!(open_menu(), None);
+
+        menu_menubar_mnemonic('F'); // case-insensitive
+        assert_eq!(open_menu().as_deref(), Some(".bar.file"));
+        // No cascade for Alt+Z in the bar.
+        assert!(!menu_menubar_mnemonic('z'));
+
+        // Arrows walk selectable entries: the first Down picks New (0),
+        // the next skips the disabled "Open" (1) and the separator (2).
+        assert!(menu_open_move(true));
+        assert_eq!(menu_focused_item(), Some((".bar.file".into(), 0)));
+        assert!(menu_open_move(true));
+        assert_eq!(menu_focused_item(), Some((".bar.file".into(), 3)));
+        // Return runs "Save" and closes.
+        assert!(menu_open_invoke());
+        assert_eq!(eval(&mut i, "set ::picked"), "S");
+        assert_eq!(open_menu(), None);
+
+        // Up from nothing wraps to the bottom; disabled skipped.
+        menu_menubar_mnemonic('f');
+        assert!(menu_open_move(false));
+        assert_eq!(menu_focused_item(), Some((".bar.file".into(), 3)));
+
+        // Left/Right step between the bar's cascades.
+        assert!(menu_open_sibling(true));
+        assert_eq!(open_menu().as_deref(), Some(".bar.edit"));
+        assert!(menu_open_sibling(true));
+        assert_eq!(open_menu().as_deref(), Some(".bar.file"));
+        assert!(menu_open_sibling(false));
+        assert_eq!(open_menu().as_deref(), Some(".bar.edit"));
+
+        // Enter on a command runs it and closes; on a cascade it opens
+        // the submenu; Escape closes that.
+        menu_open_close();
+        menu_menubar_mnemonic('e');
+        assert!(menu_open_move(true));
+        assert!(menu_open_invoke());
+        assert_eq!(eval(&mut i, "set ::picked"), "SC");
+        assert_eq!(open_menu(), None);
+        // Re-open and walk to the "Options" cascade (Copy first), then
+        // Return opens its submenu instead of running anything.
+        menu_menubar_mnemonic('e');
+        assert!(menu_open_move(true));
+        assert!(menu_open_move(true));
+        assert_eq!(menu_focused_item(), Some((".bar.edit".into(), 1)));
+        assert!(menu_open_invoke());
+        assert_eq!(open_menu().as_deref(), Some(".bar.opts"));
+        assert!(menu_open_close());
+        assert_eq!(open_menu(), None);
+        assert!(!menu_open_close());
+
+        // With no menu open the traversal calls are no-ops.
+        assert!(!menu_open_move(true));
+        assert!(!menu_open_invoke());
+        assert!(!menu_open_sibling(true));
+        assert!(!menu_menubar_mnemonic('f') || open_menu().is_some());
+        menu_open_close();
     }
 
     #[test]

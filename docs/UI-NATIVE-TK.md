@@ -520,7 +520,20 @@ canvas text bbox（最长行测量宽 × 行距高，Tk 向外取整）、entry/
 fake measurer 覆盖。Windows/macOS 注册各自原生测量（DirectWrite/
 CoreText）即可同享。
 
-**text 高级特性（2026-11-11）**：`tag cget` 对已知未设选项返回 Tk
+**菜单键盘遍历（2026-11-11，app 内菜单栏）**：Alt+助记符（cascade
+`-label` 在 `-underline` 处的字母，大小写不敏感）下拉/收起对应 cascade；
+下拉期间 Down/Up 在可选项间循环（跳过 separator 与 `-state disabled`）、
+Return 执行聚焦项（cascade 则打开其子菜单）、Escape 关闭、Left/Right
+在菜单栏相邻 cascade 间切换；键盘聚焦项按 hover 样式高亮。**绑定按
+渲染作用域注册**：助记符只为菜单栏实际用到的字母、在菜单栏渲染期间
+绑定（`When::Always`，entry 聚焦时也生效，同 Tk）；方向键/Return/
+Escape 只在下拉渲染期间存在——nsh 的规则是同一按键"最新注册且可触发
+者胜出"并吞掉按键，所以它们不能全局绑定（会抢走输入框光标键和
+listbox/treeview 的 Up/Down 导航），下拉关闭即随作用域销毁、按键归还
+控件。Apple 平台不绑定助记符（Option+字母是输入字符；Mac 无菜单
+助记符惯例）；原生菜单栏（macOS/GTK/Win32）用各自的键盘遍历，不走此
+路径。未覆盖：`tk_popup`/menubutton 弹出的菜单、子菜单内 Left 返回
+上级。**text 高级特性（2026-11-11）**：`tag cget` 对已知未设选项返回 Tk
 默认值（-offset/-overstrike/-lmargin*/-spacing*/-elide/-underline 等为
 0、-justify left、-relief raised、-tabstyle tabular）；扩展选项
 （-tabs/-offset/-overstrike/-lmargin*/-rmargin/-spacing*/-tabstyle）

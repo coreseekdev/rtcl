@@ -985,3 +985,123 @@ fn hover_and_motion_bindings_fire() {
     app.wait_for("EML")
         .expect("<Leave> fired when the pointer left");
 }
+
+const MENU_KEYS_APP: &str = r#"
+set ::did "did-0"
+set ::value seed
+menu .bar -tearoff 0
+menu .bar.file -tearoff 0
+.bar.file add command -label "New" -command {set ::did "did-new"}
+.bar.file add command -label "Open" -state disabled
+.bar.file add separator
+.bar.file add command -label "Save" -command {set ::did "did-save"}
+.bar add cascade -label "File" -underline 0 -menu .bar.file
+menu .bar.edit -tearoff 0
+.bar.edit add command -label "Copy" -command {set ::did "did-copy"}
+.bar add cascade -label "Edit" -underline 0 -menu .bar.edit
+. configure -menu .bar
+label .status -textvariable ::did
+pack .status
+entry .e -textvariable ::value -width 12
+pack .e
+listbox .lb -height 3
+pack .lb -fill x
+.lb insert end L1 L2 L3
+"#;
+
+#[component]
+fn MenuKeysApp() -> impl IntoElement {
+    rtcl_tk_demo::ensure_tcl_script(MENU_KEYS_APP);
+    rtcl_tk_nsh::tk_view()
+}
+
+/// How long a closed menu may take to leave the screen.
+const GONE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The in-app menubar's keyboard traversal, through the real keymap: the
+/// bindings exist only while their menu is rendered, so the widgets get
+/// their keys back when it closes.
+#[test]
+fn menubar_keyboard_traversal() {
+    // Desktop Linux: the in-app bar with Alt mnemonics (on Apple platforms
+    // there are no menu mnemonics).
+    let mut config = EngineConfig::new(Root::of::<MenuKeysApp>());
+    config.environment.os = nsh_core::platform::Os::Linux;
+    let mut app = Headless::start(config).expect("headless engine starts");
+    app.set_viewport(Size::new(Points(600.0), Points(420.0)))
+        .expect("resize");
+    app.wait_for("did-0").expect("the app renders");
+    assert!(!app.shows("Save"), "no dropdown before a mnemonic");
+
+    // Alt+F drops "File" down; Down picks New, then skips the disabled
+    // Open and the separator to Save; Return runs it and closes.
+    app.press_key("alt+f").expect("Alt+F");
+    app.wait_for("Save").expect("the File cascade drops down");
+    app.press_key("down").expect("Down to New");
+    app.press_key("down").expect("Down past Open and the separator");
+    app.press_key("Return").expect("Return runs the entry");
+    app.wait_for("did-save").expect("Save ran, not the disabled Open");
+    app.wait_for_gone("Save", GONE).expect("running an entry closes the menu");
+
+    // With the menu closed the arrows are the widgets' again.
+    let selected = |app: &Headless, item: &str| {
+        let texts = app.screen().texts();
+        texts
+            .iter()
+            .position(|text| *text == item)
+            .and_then(|index| index.checked_sub(1))
+            .is_some_and(|index| texts[index].trim() == "▶")
+    };
+    app.press("L1").expect("select the first row");
+    app.wait_for("▶").expect("a row is selected");
+    app.press_key("down").expect("Down in the listbox");
+    app.wait_for("L2").expect("the listbox still renders");
+    assert!(
+        selected(&app, "L2"),
+        "Down moves the listbox selection once the menu is closed"
+    );
+
+    // Escape closes without running anything.
+    app.press_key("alt+f").expect("Alt+F again");
+    app.wait_for("Save").expect("dropped down again");
+    app.press_key("escape").expect("Escape");
+    app.wait_for_gone("Save", GONE).expect("Escape closes the menu");
+    assert!(app.shows("did-save"), "Escape ran nothing");
+
+    // Right steps to the next cascade of the bar.
+    app.press_key("alt+f").expect("Alt+F");
+    app.wait_for("Save").expect("File is down");
+    app.press_key("right").expect("Right");
+    app.wait_for("Copy").expect("Right opens Edit");
+    app.wait_for_gone("Save", GONE).expect("File closed for Edit");
+    app.press_key("down").expect("Down to Copy");
+    app.press_key("Return").expect("Return");
+    app.wait_for("did-copy").expect("Copy ran");
+
+    // A mnemonic works from inside a focused entry, as Tk's does.
+    app.type_text("text:seed", "x").expect("focus the entry");
+    app.press_key("alt+e").expect("Alt+E while editing");
+    app.wait_for("Copy")
+        .expect("the mnemonic fires with the entry focused");
+    app.press_key("escape").expect("Escape while editing");
+    app.wait_for_gone("Copy", GONE)
+        .expect("Escape closes the menu from the entry");
+}
+
+/// Apple platforms have no menu mnemonics: Option+letter types a
+/// character, so the bar must not claim it.
+#[test]
+fn menubar_mnemonics_are_not_bound_on_apple_platforms() {
+    let mut config = EngineConfig::new(Root::of::<MenuKeysApp>());
+    config.environment.os = nsh_core::platform::Os::MacOs;
+    let mut app = Headless::start(config).expect("headless engine starts");
+    app.set_viewport(Size::new(Points(600.0), Points(420.0)))
+        .expect("resize");
+    app.wait_for("did-0").expect("the app renders");
+    app.press_key("alt+f").expect("Option+F");
+    assert!(app.settle(), "the app goes quiet after the keystroke");
+    assert!(
+        !app.shows("Save"),
+        "Option+F opened the File menu on an Apple platform"
+    );
+}

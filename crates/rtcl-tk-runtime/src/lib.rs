@@ -87,8 +87,12 @@ pub struct TkRuntime {
     open_combobox: Option<String>,
     /// `ttk::treeview` models.
     treeviews: BTreeMap<String, TreeViewState>,
-    /// `tk scaling`: pixels per point (0 means the 1.0 default).
+    /// `tk scaling`: pixels per point (0 means the 96 dpi default).
     scaling: f64,
+    /// User-deleted fonts, so a deleted standard one stays gone.
+    deleted_fonts: std::collections::BTreeSet<String>,
+    /// The serial of Tk's auto-named fonts (`font1`, `font2`, ...).
+    font_serial: u64,
     /// `tk appname`.
     app_name: String,
     /// `text` tags: widget path → tag name → options and character ranges.
@@ -3315,19 +3319,20 @@ fn tk_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
-/// `tk scaling`: pixels per point (1.0 unless a script set it).
+/// `tk scaling`: pixels per point.  Unless a script set it, that of the
+/// 96 dpi logical display everything is laid out in, as Tk reports there.
 pub fn tk_scaling() -> f64 {
     let Some(ptr) = active_interp() else {
-        return 1.0;
+        return PIXELS_PER_POINT;
     };
     with_state(unsafe { &*ptr }, |rt| {
         if rt.scaling > 0.0 {
             rt.scaling
         } else {
-            1.0
+            PIXELS_PER_POINT
         }
     })
-    .unwrap_or(1.0)
+    .unwrap_or(PIXELS_PER_POINT)
 }
 
 // ---------------------------------------------------------------------------
@@ -4261,28 +4266,155 @@ fn tk_focus_impl(interp: &mut Interp, args: &[Value], next: bool) -> Result<Valu
     Ok(Value::from_str(&target))
 }
 
-fn font_defaults() -> BTreeMap<String, String> {
-    [
-        ("-family", "DejaVu Sans"),
-        ("-size", "10"),
-        ("-weight", "normal"),
-        ("-slant", "roman"),
-        ("-underline", "0"),
-        ("-overstrike", "0"),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect()
-}
-
 fn font_options(interp: &Interp, name: &str) -> Option<BTreeMap<String, String>> {
     with_state(interp, |rt| {
+        if rt.deleted_fonts.contains(name) {
+            return None;
+        }
         rt.fonts
             .get(name)
             .cloned()
-            .or_else(|| (name == "TkDefaultFont" || name == "TkTextFont").then(font_defaults))
+            .or_else(|| standard_font(name))
     })
     .flatten()
+}
+
+/// The font a spec names: a named font's configured options, or the
+/// description's words.  `None` only for an empty spec.
+fn font_spec_of(interp: &Interp, spec: &str) -> Option<FontSpec> {
+    if spec.is_empty() {
+        return None;
+    }
+    if let Some(options) = font_options(interp, spec) {
+        let number = |name: &str| {
+            options
+                .get(name)
+                .and_then(|value| value.trim().parse::<f64>().ok())
+        };
+        let flag = |name: &str| {
+            options
+                .get(name)
+                .is_some_and(|value| !matches!(value.as_str(), "0" | "false" | "no" | "off"))
+        };
+        return Some(FontSpec {
+            family: options.get("-family").cloned().unwrap_or_default(),
+            size: number("-size").unwrap_or(0.0),
+            bold: options.get("-weight").is_some_and(|weight| weight == "bold"),
+            italic: options.get("-slant").is_some_and(|slant| slant == "italic"),
+            underline: flag("-underline"),
+            overstrike: flag("-overstrike"),
+        });
+    }
+    Some(parse_font_description(spec))
+}
+
+/// A resolved font description: what `font actual` and the measurer see.
+#[derive(Debug, Clone, Default)]
+pub struct FontSpec {
+    /// The family as configured; empty is the default one.
+    pub family: String,
+    /// As configured: > 0 points, < 0 pixels, 0 the default size.
+    pub size: f64,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub overstrike: bool,
+}
+
+/// Parses a font description (`family ?size? ?style ...?`, or the
+/// `-family ...` option list) into the configured attributes.  Tk errors
+/// on some of the lenient shapes read here (an unbraced multi-word
+/// family); reading them as the family keeps such scripts working.
+fn parse_font_description(spec: &str) -> FontSpec {
+    let words: Vec<String> = Value::from_str(spec)
+        .as_list()
+        .map(|list| list.iter().map(|word| word.as_str().to_string()).collect())
+        .unwrap_or_else(|| spec.split_whitespace().map(str::to_string).collect());
+    let mut font = FontSpec::default();
+    // The option-list form: `-family Helvetica -size 12 -weight bold`.
+    if words
+        .first()
+        .is_some_and(|word| FONT_OPTIONS.contains(&word.as_str()))
+    {
+        let text = |name: &str| {
+            words
+                .iter()
+                .skip_while(|word| word.as_str() != name)
+                .nth(1)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let number = |name: &str| text(name).trim().parse::<f64>().ok();
+        return FontSpec {
+            family: text("-family"),
+            size: number("-size").unwrap_or(0.0),
+            bold: text("-weight").eq_ignore_ascii_case("bold"),
+            italic: text("-slant").eq_ignore_ascii_case("italic"),
+            underline: !matches!(text("-underline").as_str(), "" | "0" | "false" | "no" | "off"),
+            overstrike: !matches!(text("-overstrike").as_str(), "" | "0" | "false" | "no" | "off"),
+        };
+    }
+    // Tk's styles follow the size. Before it a word is the family's,
+    // "roman" included ("Times New Roman"): only the words no family has
+    // are read as styles there ("Courier bold").
+    let style = |word: &str, after_size: bool| {
+        let names: &[&str] = if after_size {
+            &["normal", "bold", "roman", "italic", "underline", "overstrike"]
+        } else {
+            &["normal", "bold", "italic", "underline", "overstrike"]
+        };
+        names.iter().any(|name| word.eq_ignore_ascii_case(name))
+    };
+    let mut in_family = true;
+    let mut after_size = false;
+    let mut words = words.into_iter().peekable();
+    while let Some(word) = words.next() {
+        if let Ok(value) = word.parse::<f64>() {
+            font.size = value;
+            in_family = false;
+            after_size = true;
+            continue;
+        }
+        if style(&word, after_size) {
+            match word.to_ascii_lowercase().as_str() {
+                "bold" => font.bold = true,
+                "normal" => font.bold = false,
+                "italic" => font.italic = true,
+                "roman" => font.italic = false,
+                flag @ ("underline" | "overstrike") => {
+                    // A bare keyword is on; an optional 0/1 overrides, and
+                    // anything else is the next style, left in place.
+                    let value = match words.peek() {
+                        Some(next)
+                            if matches!(
+                                next.as_str(),
+                                "0" | "1" | "true" | "false" | "yes" | "no" | "on" | "off"
+                            ) =>
+                        {
+                            let value = words.next();
+                            !matches!(value.as_deref(), Some("0" | "false" | "no" | "off"))
+                        }
+                        _ => true,
+                    };
+                    if flag == "underline" {
+                        font.underline = value;
+                    } else {
+                        font.overstrike = value;
+                    }
+                }
+                _ => {}
+            }
+            in_family = false;
+            continue;
+        }
+        if in_family {
+            if !font.family.is_empty() {
+                font.family.push(' ');
+            }
+            font.family.push_str(&word);
+        }
+    }
+    font
 }
 
 /// Resolve a `-font` value (a named font or a Tk font description) to
@@ -4339,41 +4471,35 @@ pub fn char_width(spec: &str) -> f64 {
 }
 
 pub fn resolve_font(spec: &str) -> Option<(String, f64, bool)> {
-    if spec.is_empty() {
-        return None;
-    }
     let ptr = active_interp()?;
-    let interp = unsafe { &*ptr };
-    if let Some(options) = font_options(interp, spec) {
-        let family = options.get("-family").cloned().unwrap_or_default();
-        let size = options
-            .get("-size")
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .unwrap_or(10.0)
-            .abs();
-        let bold = options.get("-weight").is_some_and(|w| w == "bold");
-        return Some((family, size, bold));
+    let font = font_spec_of(unsafe { &*ptr }, spec)?;
+    Some((font.family, font_points(font.size), font.bold))
+}
+
+/// The font options Tk's own `font create`/`configure` accept.
+const FONT_OPTIONS: &[&str] = &[
+    "-family",
+    "-size",
+    "-weight",
+    "-slant",
+    "-underline",
+    "-overstrike",
+];
+
+/// Pixels per point of the logical display (96 dpi): Tk's default
+/// `tk scaling`, and what a pixel-sized font (`-size -16`) is in points.
+pub const PIXELS_PER_POINT: f64 = 96.0 / 72.0;
+
+/// A Tk font size in points: positive sizes are points, negative ones
+/// pixels, and zero the default size (12, as Tk reports here).
+fn font_points(size: f64) -> f64 {
+    if size < 0.0 {
+        -size / PIXELS_PER_POINT
+    } else if size == 0.0 {
+        12.0
+    } else {
+        size
     }
-    let mut family = String::new();
-    let mut size = 10.0;
-    let mut bold = false;
-    for token in spec.split_whitespace() {
-        let token = token.trim_matches(|c| c == '{' || c == '}');
-        if let Ok(value) = token.parse::<f64>() {
-            size = value.abs();
-        } else if let Some(pixels) = token
-            .strip_prefix('-')
-            .and_then(|rest| rest.parse::<f64>().ok())
-        {
-            // Negative Tk sizes are pixels.
-            size = pixels.abs() * 0.75;
-        } else if token.eq_ignore_ascii_case("bold") {
-            bold = true;
-        } else if family.is_empty() {
-            family = token.to_string();
-        }
-    }
-    Some((family, size, bold))
 }
 
 fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -4382,50 +4508,72 @@ fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     match args[1].as_str() {
         "create" => {
-            if args.len() < 3 {
-                return Err(wrong(
-                    "font create",
-                    "fontName ?-option value ...?",
-                    args.len(),
-                ));
+            // `font create ?name? ?option value ...?`: without a name Tk
+            // picks `font1`, `font2`, ...
+            let named = args.get(2).filter(|v| !v.as_str().starts_with('-'));
+            let start = if named.is_some() { 3 } else { 2 };
+            let mut options = bare_font_options();
+            for (key, value) in font_pairs(args, start)? {
+                options.insert(key, value);
             }
-            let name = args[2].as_str().to_string();
-            if font_options(interp, &name).is_some() {
-                return Err(generic(format!("font \"{name}\" already exists")));
-            }
-            let mut options = font_defaults();
-            for (k, v) in parse_pairs(args, 3, "font create")? {
-                if !options.contains_key(&k) {
-                    return Err(bad_option(&k));
+            let name = match named {
+                Some(value) => value.as_str().to_string(),
+                None => {
+                    let serial = with_state_mut(interp, |rt| {
+                        loop {
+                            rt.font_serial += 1;
+                            let name = format!("font{}", rt.font_serial);
+                            if !rt.fonts.contains_key(&name) {
+                                return name;
+                            }
+                        }
+                    })
+                    .unwrap_or_else(|| "font1".to_string());
+                    serial
                 }
-                options.insert(k, v);
-            }
-            with_state_mut(interp, |rt| {
+            };
+            let taken = with_state_mut(interp, |rt| {
+                if rt.fonts.contains_key(&name) || standard_font(&name).is_some() {
+                    return Err(generic(format!("named font \"{name}\" already exists")));
+                }
                 rt.fonts.insert(name.clone(), options);
                 rt.bump();
-            });
-            Ok(Value::empty())
+                Ok::<(), Error>(())
+            })
+            .ok_or_else(|| bad_window(&name))??;
+            let _ = taken;
+            Ok(Value::from_str(&name))
         }
         "configure" => {
             if args.len() < 3 {
                 return Err(wrong(
                     "font configure",
-                    "fontName ?-option value ...?",
+                    "fontName ?-option? ?value option value ...?",
                     args.len(),
                 ));
             }
             let name = args[2].as_str();
-            let Some(mut options) = font_options(interp, name) else {
-                return Err(generic(format!("font \"{name}\" doesn't exist")));
+            // Only named fonts are configurable, standard ones included
+            // (the first change copies the standard's options in).
+            let mut options = match font_options(interp, name) {
+                Some(options) if named_font(interp, name) => options,
+                _ => {
+                    return Err(generic(format!("named font \"{name}\" doesn't exist")));
+                }
             };
+            // With no option, the six pairs in Tk's order, as configured
+            // (a pixel size stays negative).
             if args.len() == 3 {
                 return Ok(list_value(
-                    options
+                    FONT_OPTION_ORDER
                         .iter()
-                        .flat_map(|(k, v)| [k.clone(), v.clone()])
+                        .flat_map(|name| {
+                            [name.to_string(), options.get(*name).cloned().unwrap_or_default()]
+                        })
                         .collect::<Vec<_>>(),
                 ));
             }
+            // A lone option queries; Tk answers it even then.
             if args.len() == 4 && args[3].as_str().starts_with('-') {
                 return Ok(Value::from_str(
                     options
@@ -4434,10 +4582,7 @@ fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         .unwrap_or(""),
                 ));
             }
-            for (k, v) in parse_pairs(args, 3, "font configure")? {
-                if !options.contains_key(&k) {
-                    return Err(bad_option(&k));
-                }
+            for (k, v) in font_pairs(args, 3)? {
                 options.insert(k, v);
             }
             with_state_mut(interp, |rt| {
@@ -4447,36 +4592,71 @@ fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::empty())
         }
         "actual" => {
-            if args.len() < 3 {
-                return Err(wrong("font actual", "font ?-option?", args.len()));
+            // `font actual font ?-displayof window? ?option?`: works for
+            // any description, not only named fonts, and reports what the
+            // backend resolved the family to.
+            let mut index = 2;
+            let mut spec = "";
+            let mut option: Option<String> = None;
+            while index < args.len() {
+                let arg = args[index].as_str();
+                if arg == "-displayof" {
+                    index += 1;
+                } else if arg.starts_with('-') && !spec.is_empty() {
+                    option = Some(arg.to_string());
+                } else if spec.is_empty() {
+                    spec = arg;
+                } else {
+                    option = Some(arg.to_string());
+                }
+                index += 1;
             }
-            let name = args[2].as_str();
-            let Some(options) = font_options(interp, name) else {
-                return Err(generic(format!("font \"{name}\" doesn't exist")));
-            };
-            if args.len() >= 4 {
-                return Ok(Value::from_str(
-                    options
-                        .get(args[3].as_str())
-                        .map(String::as_str)
-                        .unwrap_or(""),
-                ));
+            if spec.is_empty() {
+                return Err(wrong("font actual", "font ?-displayof window? ?option?", args.len()));
             }
-            Ok(list_value(
-                options
-                    .iter()
-                    .flat_map(|(k, v)| [k.clone(), v.clone()])
-                    .collect::<Vec<_>>(),
-            ))
+            let values = font_actual_values(interp, spec);
+            match option.as_deref() {
+                Some(option) => {
+                    let at = FONT_OPTION_ORDER
+                        .iter()
+                        .position(|name| *name == option)
+                        .ok_or_else(|| generic(format!(
+                            "bad option \"{option}\": {FONT_OPTION_LIST}"
+                        )))?;
+                    Ok(Value::from_str(&values[at]))
+                }
+                None => Ok(list_value(
+                    FONT_OPTION_ORDER
+                        .iter()
+                        .zip(values)
+                        .flat_map(|(name, value)| [name.to_string(), value])
+                        .collect::<Vec<_>>(),
+                )),
+            }
         }
-        "families" => Ok(list_value(
-            ["DejaVu Sans", "Liberation Sans", "Noto Sans", "Sans"]
-                .into_iter()
-                .map(str::to_string),
-        )),
+        "families" => {
+            let families = FONT_FAMILIES
+                .with(|cell| cell.get())
+                .map(|families| families())
+                .unwrap_or_else(|| {
+                    ["DejaVu Sans", "Liberation Sans", "Noto Sans", "Sans"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                });
+            Ok(list_value(families))
+        }
         "names" => {
-            let names = with_state(interp, |rt| rt.fonts.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
+            let mut names = with_state(interp, |rt| {
+                rt.fonts
+                    .keys()
+                    .cloned()
+                    .chain(STANDARD_FONTS.iter().map(|name| name.to_string()))
+                    .filter(|name| !rt.deleted_fonts.contains(name))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+            names.sort_unstable();
             Ok(list_value(names))
         }
         "delete" => {
@@ -4484,11 +4664,24 @@ fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(wrong("font delete", "fontName ?fontName ...?", args.len()));
             }
             with_state_mut(interp, |rt| {
-                for a in &args[2..] {
-                    rt.fonts.remove(a.as_str());
+                for value in &args[2..] {
+                    let name = value.as_str();
+                    if !rt.fonts.contains_key(name) && !standard_font(name).is_some() {
+                        return Err(generic(format!("named font \"{name}\" doesn't exist")));
+                    }
+                }
+                for value in &args[2..] {
+                    let name = value.as_str();
+                    if standard_font(name).is_some() {
+                        rt.deleted_fonts.insert(name.to_string());
+                    } else {
+                        rt.fonts.remove(name);
+                    }
                 }
                 rt.bump();
-            });
+                Ok::<(), Error>(())
+            })
+            .ok_or_else(|| bad_window("."))??;
             Ok(Value::empty())
         }
         "exists" => {
@@ -4521,10 +4714,7 @@ fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let value = match font_measure_text(spec, text) {
                 Some(m) => m.width.ceil() as i64,
                 None => {
-                    let size = font_options(interp, spec)
-                        .and_then(|o| o.get("-size").and_then(|s| s.parse::<f64>().ok()))
-                        .unwrap_or(10.0)
-                        .abs();
+                    let size = resolve_font(spec).map_or(10.0, |(_, size, _)| size);
                     (text.chars().count() as f64 * size * 0.6).ceil() as i64
                 }
             };
@@ -4534,23 +4724,26 @@ fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // `font metrics font ?-displayof window? ?-option?`; with no
             // option Tk returns the full list.
             let mut index = 2;
+            let mut spec = "";
             let mut named: Option<String> = None;
             while index < args.len() {
-                match args[index].as_str() {
-                    "-displayof" => index += 1,
-                    option if option.starts_with('-') && index > 2 => {
-                        named = Some(option.into());
-                    }
-                    _ => {} // the font itself and stray positionals
+                let arg = args[index].as_str();
+                if arg == "-displayof" {
+                    index += 1;
+                } else if arg.starts_with('-') && !spec.is_empty() {
+                    named = Some(arg.to_string());
+                } else if spec.is_empty() {
+                    spec = arg;
+                } else {
+                    named = Some(arg.to_string());
                 }
                 index += 1;
             }
-            let spec_arg = args.get(2).map(|v| v.as_str()).unwrap_or("");
+            if spec.is_empty() {
+                return Err(wrong("font metrics", "font ?-displayof window? ?-option?", args.len()));
+            }
             let fallback = |spec: &str| {
-                let size = font_options(interp, spec)
-                    .and_then(|o| o.get("-size").and_then(|s| s.parse::<f64>().ok()))
-                    .unwrap_or(10.0)
-                    .abs();
+                let size = resolve_font(spec).map_or(10.0, |(_, size, _)| size);
                 TextMetrics {
                     width: size * 0.6,
                     ascent: size * 0.8,
@@ -4559,12 +4752,13 @@ fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
             };
             // Tk reports the metrics of a space for the empty string.
-            let metrics = font_measure_text(spec_arg, "0 ")
-                .or_else(|| font_measure_text(spec_arg, " "))
-                .unwrap_or_else(|| fallback(spec_arg));
-            // Fixed pitch: "iiiii" measures exactly five "i"s.
-            let fixed = font_measure_text(spec_arg, "i").zip(font_measure_text(spec_arg, "iiiii"))
-                .map(|(one, five)| (five.width == one.width * 5.0) as i64);
+            let metrics = font_measure_text(spec, "0 ")
+                .or_else(|| font_measure_text(spec, " "))
+                .unwrap_or_else(|| fallback(spec));
+            // Fixed pitch: narrow and wide glyphs advance alike.
+            let fixed = font_measure_text(spec, "iiiiiiiiii")
+                .zip(font_measure_text(spec, "WWWWWWWWWW"))
+                .map(|(narrow, wide)| (narrow.width > 0.0 && narrow.width == wide.width) as i64);
             let pairs = [
                 ("-ascent", metrics.ascent.round() as i64),
                 ("-descent", metrics.descent.round() as i64),
@@ -4577,11 +4771,9 @@ fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         .iter()
                         .find(|(name, _)| *name == option)
                         .map(|(_, value)| *value)
-                        .ok_or_else(|| {
-                            generic(format!(
-                                "bad option \"{option}\": must be -ascent, -descent, -fixed, or -linespace"
-                            ))
-                        })?;
+                        .ok_or_else(|| generic(format!(
+                            "bad option \"{option}\": must be -ascent, -descent, -fixed, or -linespace"
+                        )))?;
                     Ok(Value::from_int(value))
                 }
                 None => Ok(list_value(
@@ -4592,8 +4784,149 @@ fn font_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 )),
             }
         }
-        other => Err(generic(format!("bad option \"{other}\""))),
+        other => Err(generic(format!("bad option \"{other}\": must be actual, configure, create, delete, families, measure, metrics, or names"))),
     }
+}
+
+/// The font options Tk's own `font create`/`configure` accept.
+const FONT_OPTION_ORDER: [&str; 6] = [
+    "-family",
+    "-size",
+    "-weight",
+    "-slant",
+    "-underline",
+    "-overstrike",
+];
+const FONT_OPTION_LIST: &str =
+    "must be -family, -size, -weight, -slant, -underline, or -overstrike";
+
+/// A `font create`'s starting options: Tk's bare attributes.
+fn bare_font_options() -> BTreeMap<String, String> {
+    [
+        ("-family", ""),
+        ("-size", "0"),
+        ("-weight", "normal"),
+        ("-slant", "roman"),
+        ("-underline", "0"),
+        ("-overstrike", "0"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+/// Parses `font create`/`configure` option pairs, validating as Tk does.
+fn font_pairs(args: &[Value], start: usize) -> Result<BTreeMap<String, String>> {
+    let mut options = BTreeMap::new();
+    for (key, value) in parse_pairs(args, start, "font")? {
+        if !FONT_OPTION_ORDER.contains(&key.as_str()) {
+            return Err(generic(format!("bad option \"{key}\": {FONT_OPTION_LIST}")));
+        }
+        if key == "-weight"
+            && !value.eq_ignore_ascii_case("normal")
+            && !value.eq_ignore_ascii_case("bold")
+        {
+            return Err(generic(format!(
+                "bad -weight value \"{value}\": must be normal, or bold"
+            )));
+        }
+        if key == "-slant"
+            && !value.eq_ignore_ascii_case("roman")
+            && !value.eq_ignore_ascii_case("italic")
+        {
+            return Err(generic(format!(
+                "bad -slant value \"{value}\": must be roman, or italic"
+            )));
+        }
+        options.insert(key, value);
+    }
+    Ok(options)
+}
+
+/// Tk's standard named fonts, configured as Tk configures them (generic
+/// families resolve per system).
+const STANDARD_FONTS: [&str; 9] = [
+    "TkDefaultFont",
+    "TkTextFont",
+    "TkFixedFont",
+    "TkMenuFont",
+    "TkHeadingFont",
+    "TkCaptionFont",
+    "TkSmallCaptionFont",
+    "TkIconFont",
+    "TkTooltipFont",
+];
+
+fn standard_font(name: &str) -> Option<BTreeMap<String, String>> {
+    let (family, size, weight) = match name {
+        "TkDefaultFont" | "TkTextFont" | "TkMenuFont" | "TkIconFont" => ("sans-serif", "10", "normal"),
+        "TkFixedFont" => ("monospace", "10", "normal"),
+        "TkHeadingFont" => ("sans-serif", "10", "bold"),
+        "TkCaptionFont" => ("sans-serif", "12", "bold"),
+        "TkSmallCaptionFont" | "TkTooltipFont" => ("sans-serif", "9", "normal"),
+        _ => return None,
+    };
+    Some([
+        ("-family", family),
+        ("-size", size),
+        ("-weight", weight),
+        ("-slant", "roman"),
+        ("-underline", "0"),
+        ("-overstrike", "0"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect())
+}
+
+/// Whether `name` is a user-created or standard named font (as opposed to
+/// a font description).
+fn named_font(interp: &Interp, name: &str) -> bool {
+    with_state(interp, |rt| {
+        rt.fonts.contains_key(name)
+            || (standard_font(name).is_some() && !rt.deleted_fonts.contains(name))
+    })
+    .unwrap_or(false)
+}
+
+/// The values of `font actual` for a description or named font, in Tk's
+/// option order.  The family is the backend's resolved face.
+fn font_actual_values(interp: &Interp, spec: &str) -> Vec<String> {
+    let font = font_spec_of(interp, spec).unwrap_or_default();
+    let family = FAMILY_RESOLVER
+        .with(|cell| cell.get())
+        .map(|resolve| resolve(&font.family, font.bold, font.italic))
+        .unwrap_or_else(|| font.family.clone());
+    let on = |flag: bool| if flag { "1" } else { "0" };
+    vec![
+        family,
+        font_points(font.size).round().to_string(),
+        if font.bold { "bold".to_string() } else { "normal".to_string() },
+        if font.italic { "italic".to_string() } else { "roman".to_string() },
+        on(font.underline).to_string(),
+        on(font.overstrike).to_string(),
+    ]
+}
+
+thread_local! {
+    /// The backend's family resolver: what face a font description's
+    /// family actually names (`font actual`'s `-family`).
+    static FAMILY_RESOLVER: std::cell::Cell<Option<fn(&str, bool, bool) -> String>> =
+        const { std::cell::Cell::new(None) };
+    /// The backend's font family list (`font families`).
+    static FONT_FAMILIES: std::cell::Cell<Option<fn() -> Vec<String>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Gives the runtime a family resolver for `font actual` (`fn(family,
+/// bold, italic)` returning the face family that would be used).
+pub fn set_font_family_resolver(resolve: fn(&str, bool, bool) -> String) {
+    FAMILY_RESOLVER.with(|cell| cell.set(Some(resolve)));
+}
+
+/// Gives the runtime the system's font family list (`font families`).
+pub fn set_font_families(families: fn() -> Vec<String>) {
+    FONT_FAMILIES.with(|cell| cell.set(Some(families)));
 }
 
 fn glob_match(pattern: &str, text: &str) -> bool {
@@ -14157,6 +14490,57 @@ mod tests {
     }
 
     #[test]
+    fn font_descriptions_resolve_like_tk() {
+        let mut i = Interp::new();
+        install(&mut i);
+        let font = |spec: &str| resolve_font(spec).expect("a font");
+
+        // A description is a list: the braced family keeps its words.
+        assert_eq!(
+            font("{DejaVu Sans Mono} 10"),
+            ("DejaVu Sans Mono".to_string(), 10.0, false)
+        );
+        assert_eq!(
+            font("{DejaVu Sans} 10 bold"),
+            ("DejaVu Sans".to_string(), 10.0, true)
+        );
+        assert_eq!(font("Helvetica 14"), ("Helvetica".to_string(), 14.0, false));
+        // Styles other than bold are accepted and are not family words.
+        assert_eq!(
+            font("Times 12 italic underline"),
+            ("Times".to_string(), 12.0, false)
+        );
+        // Tk wants multi-word families braced; unbraced ones keep their
+        // words rather than losing all but the first.
+        assert_eq!(
+            font("Times New Roman 12"),
+            ("Times New Roman".to_string(), 12.0, false)
+        );
+        // A description without a size uses Tk's default size (12 here).
+        assert_eq!(font("Courier bold"), ("Courier".to_string(), 12.0, true));
+        // "roman" is a style only where Tk's grammar has styles: after
+        // the size.
+        assert_eq!(
+            font("{Nimbus Roman} 12 roman"),
+            ("Nimbus Roman".to_string(), 12.0, false)
+        );
+        assert_eq!(font("Helvetica 12 roman"), ("Helvetica".to_string(), 12.0, false));
+
+        // Negative sizes are pixels: 16 px is 12 pt at 96 dpi; zero is the
+        // default size.
+        assert_eq!(font("Helvetica -16"), ("Helvetica".to_string(), 12.0, false));
+        assert_eq!(font("Helvetica 0"), ("Helvetica".to_string(), 12.0, false));
+
+        // The option-list form, and named fonts, with the same size rule.
+        assert_eq!(
+            font("-family Courier -size -12 -weight bold"),
+            ("Courier".to_string(), 9.0, true)
+        );
+        eval(&mut i, "font create Big -family {DejaVu Sans} -size -20");
+        assert_eq!(font("Big"), ("DejaVu Sans".to_string(), 15.0, false));
+    }
+
+    #[test]
     fn font_measurer_drives_measure_metrics_and_canvas() {
         let mut i = Interp::new();
         install(&mut i);
@@ -14168,10 +14552,21 @@ mod tests {
         assert_eq!(eval(&mut i, "font metrics {Helvetica 10} -ascent"), "8");
 
         // A measurer replaces them everywhere: queries, canvas geometry.
+        // Its glyphs differ in width ("i" narrow, "W" wide) unless the
+        // family is a "Mono" one, so fixed pitch is something to detect.
         set_text_measurer(|family, size, bold, text| {
-            let _ = (family, bold);
+            let _ = bold;
+            let mono = family.contains("Mono");
+            let width: f64 = text
+                .chars()
+                .map(|ch| match ch {
+                    'i' if !mono => 0.5,
+                    'W' if !mono => 1.5,
+                    _ => 1.0,
+                })
+                .sum();
             TextMetrics {
-                width: text.chars().count() as f64 * size,
+                width: width * size,
                 ascent: size,
                 descent: size / 4.0,
                 linespace: size * 1.25,
@@ -14186,18 +14581,22 @@ mod tests {
         );
         assert!(i.eval("font measure {Helvetica 10}").is_err());
 
-        // `font metrics` returns named values and the full Tk list; with
-        // this linear measurer every glyph is "monospace" enough.
+        // `font metrics` returns named values and the full Tk list.
         assert_eq!(eval(&mut i, "font metrics {Helvetica 8} -ascent"), "8");
         assert_eq!(eval(&mut i, "font metrics {Helvetica 8} -descent"), "2");
         assert_eq!(eval(&mut i, "font metrics {Helvetica 8} -linespace"), "10");
-        assert_eq!(eval(&mut i, "font metrics {Helvetica 8} -fixed"), "1");
         let metrics = eval(&mut i, "font metrics {Helvetica 8}");
         assert!(
             metrics.contains("-ascent 8") && metrics.contains("-descent 2")
-                && metrics.contains("-linespace 10") && metrics.contains("-fixed 1"),
+                && metrics.contains("-linespace 10") && metrics.contains("-fixed 0"),
             "{metrics}"
         );
+        // Fixed pitch is narrow and wide glyphs advancing alike, not one
+        // glyph repeating linearly (which every font does).
+        assert_eq!(eval(&mut i, "font metrics {Helvetica 8} -fixed"), "0");
+        assert_eq!(eval(&mut i, "font metrics {{DejaVu Sans Mono} 8} -fixed"), "1");
+        assert_eq!(eval(&mut i, "font measure {Helvetica 10} iW"), "20");
+        assert_eq!(eval(&mut i, "font measure {Helvetica 10} WW"), "30");
 
         // The width of "0" is the character width for counting widgets.
         assert_eq!(char_width("Helvetica 10"), 10.0);
@@ -14626,7 +15025,9 @@ mod tests {
         assert_eq!(eval(&mut i, "wm title ."), "Hello");
         assert_eq!(eval(&mut i, "tk patchlevel"), "8.6");
         assert_eq!(eval(&mut i, "wm state ."), "normal");
-        assert_eq!(eval(&mut i, "tk scaling"), "1");
+        // The 96 dpi logical display: 4/3 pixels per point, as Tk reports.
+        assert_eq!(eval(&mut i, "tk scaling"), "1.3333333333333333");
+        assert_eq!(eval(&mut i, "winfo fpixels . 1i"), "96");
         eval(&mut i, "tk scaling 2");
         assert_eq!(eval(&mut i, "tk scaling"), "2");
         assert_eq!(eval(&mut i, "winfo fpixels . 1i"), "144");

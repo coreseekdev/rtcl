@@ -112,9 +112,9 @@ pub fn install_backend() {
         rtcl_tk_runtime::set_screen_metrics(screen_metrics);
         rtcl_tk_runtime::set_bell(ring_bell);
         rtcl_tk_runtime::set_text_measurer(measure_pango);
+        rtcl_tk_runtime::set_font_family_resolver(resolve_family_pango);
+        rtcl_tk_runtime::set_font_families(families_pango);
     }
-    // `wm attributes` reaches the real window (the main one; the model's
-    // secondary toplevels are in-window overlays).
     rtcl_tk_runtime::set_window_attribute_hook(|path, attribute, old, new| {
         if path != "." || old == new {
             return;
@@ -131,6 +131,44 @@ pub fn install_backend() {
             _ => {}
         }
     });
+}
+
+/// The face a font description's family names, through pango/fontconfig
+/// (`font actual` reports this, as Tk does: Helvetica is "Nimbus Sans"
+/// here; an unknown family falls back to the default sans).
+#[cfg(target_os = "linux")]
+fn resolve_family_pango(family: &str, bold: bool, italic: bool) -> String {
+    use pangocairo::prelude::*;
+    use gtk4::pango::SCALE;
+    let font_map = pangocairo::FontMap::default();
+    let context = font_map.create_context();
+    let mut font = gtk4::pango::FontDescription::new();
+    font.set_family(if family.is_empty() { "sans-serif" } else { family });
+    font.set_size(10 * SCALE);
+    if bold {
+        font.set_weight(gtk4::pango::Weight::Bold);
+    }
+    if italic {
+        font.set_style(gtk4::pango::Style::Italic);
+    }
+    font_map
+        .load_font(&context, &font)
+        .and_then(|font| font.describe().family().map(|name| name.to_string()))
+        .unwrap_or_else(|| family.to_string())
+}
+
+/// The system's font families, as `font families` lists.
+#[cfg(target_os = "linux")]
+fn families_pango() -> Vec<String> {
+    use pangocairo::prelude::*;
+    let Some(font_map) = Some(pangocairo::FontMap::default()) else {
+        return Vec::new();
+    };
+    font_map
+        .list_families()
+        .into_iter()
+        .filter_map(|family| Some(family.name().to_string()))
+        .collect()
 }
 
 /// Real font metrics through pango, for `font measure`/`metrics`, canvas

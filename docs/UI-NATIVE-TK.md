@@ -533,7 +533,37 @@ listbox/treeview 的 Up/Down 导航），下拉关闭即随作用域销毁、按
 控件。Apple 平台不绑定助记符（Option+字母是输入字符；Mac 无菜单
 助记符惯例）；原生菜单栏（macOS/GTK/Win32）用各自的键盘遍历，不走此
 路径。未覆盖：`tk_popup`/menubutton 弹出的菜单、子菜单内 Left 返回
-上级。**text 高级特性（2026-11-11）**：`tag cget` 对已知未设选项返回 Tk
+上级。**字体度量对照 wish（2026-11-11，specs/tk/）**：`apps/rtcl-tk-demo
+--bin tkprobe`（GTK 初始化 + 装后端跑脚本打印）与 wish 跑同一
+`specs/tk/font-metrics.tcl`，`specs/tk/run.sh` 按容差比对（Tk 报
+Xft.dpi 设备像素、rtcl 报 96dpi 逻辑像素，比例由 xrdb 的 Xft.dpi 给
+出，本机 2.0；宽度容差 = 0.5px/字形 + 4%——两端各自按整数 hinting
+取整；linespace 1.5px；ascent/descent 3px，Courier 的分割两库读表
+不同但和一致；`tk scaling`/空串宽 0/`-fixed` 精确）。对照暴露并修
+掉四组真 bug：①`font measure`/`metrics` 的族名解析只取首词——
+`{DejaVu Sans Mono} 10` 测成了默认字体（渲染同受影响，重写为 Tcl
+列表解析，花括号族名保词，未括的多词族名也连读，样式词按位置识别
+——"roman" 在尺寸前是族名）；②负 `-size`（像素）分支不可达（
+`-16` 先被当数解析取绝对值成 16 磅，大 33%），现 px/磅 = 96/72；③
+`-fixed` 判据 "iiiii"==5×"i" 对任何字体恒真（同字形线性），改
+"iiiiiiiiii"=="WWWWWWWWWW"；④`tk scaling` 默认 1.0 → 4/3（96dpi，
+与渲染器的磅→像素一致），`winfo fpixels . 1i` = 96。回归的
+`font actual` 差异一并修：接受任意描述（此前仅命名字体，报错）、
+`-family` 报后端解析后的真实 face（新 `set_font_family_resolver`
+pango 钩子，Helvetica→Nimbus Sans）、输出按 Tk 选项序、尺寸取整为
+磅、`-slant italic`/`-underline/-overstrike` 全支持；`font create`
+返回名字 + Tk 自动命名 `font1...`（此前返回空）、裸字体基础选项
+`-family {} -size 0`、标准九字体（TkDefaultFont/TkTextFont/
+TkFixedFont/TkMenuFont/TkHeadingFont/TkCaptionFont/
+TkSmallCaptionFont/TkIconFont/TkTooltipFont，generic 族名 sans-serif
+/monospace）进 `font names`、可 configure（首个改动拷贝入 rt.fonts）、
+可删除（删除标准字体不复活）；`font families` 经 pango（298 个 vs
+Xft 377 个，枚举差异）；`font configure` 无参按 Tk 顺序报配置值、
+单选项查询、错误消息同 Tk（bad option/bad -weight/named font ...
+doesn't exist/already exists）。`font actual` 的 `-family` 对
+"Courier" 报 pango 规范名 Nimbus Mono PS（Tk 保留请求名）——单一家
+族命名差异，记录在案。度量对照 127/127 在容差内；九标准字体的
+actual/fixed 与 wish 逐字节一致。**text 高级特性（2026-11-11）**：`tag cget` 对已知未设选项返回 Tk
 默认值（-offset/-overstrike/-lmargin*/-spacing*/-elide/-underline 等为
 0、-justify left、-relief raised、-tabstyle tabular）；扩展选项
 （-tabs/-offset/-overstrike/-lmargin*/-rmargin/-spacing*/-tabstyle）

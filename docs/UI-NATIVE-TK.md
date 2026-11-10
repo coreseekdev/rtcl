@@ -520,7 +520,15 @@ canvas text bbox（最长行测量宽 × 行距高，Tk 向外取整）、entry/
 fake measurer 覆盖。Windows/macOS 注册各自原生测量（DirectWrite/
 CoreText）即可同享。
 
-**wm 窗口管理（2026-11-11）**：`wm attributes` 实现通用子集
+**text 高级特性（2026-11-11）**：`tag cget` 对已知未设选项返回 Tk
+默认值（-offset/-overstrike/-lmargin*/-spacing*/-elide/-underline 等为
+0、-justify left、-relief raised、-tabstyle tabular）；扩展选项
+（-tabs/-offset/-overstrike/-lmargin*/-rmargin/-spacing*/-tabstyle）
+模型层存储/查询完整——渲染投影只覆盖颜色/字号/粗斜体/下划线（
+ProseMirror mark 语义之外的是布局属性，富文档无法表达，视觉近似）。
+`text search` 补 `-elide` 开关：默认跳过完全落进 -elide 标签的匹配
+（部分重叠同样跳过），`-elide` 才搜索隐藏文本；清理了两处遗留的
+SEARCH 调试输出。**wm 窗口管理（2026-11-11）**：`wm attributes` 实现通用子集
 （`-alpha`（0–1 截断，默认 1.0）、`-fullscreen`、`-topmost`、`-type`、
 `-zoomed`、`-modified`、`-toolwindow`；无参返回全名值对），改动经
 `set_window_attribute_hook` 通知后端——nsh 后端把 `-fullscreen`

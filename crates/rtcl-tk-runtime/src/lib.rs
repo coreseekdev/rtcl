@@ -11648,6 +11648,19 @@ pub fn canvas_snapshot(path: &str) -> Option<CanvasState> {
     with_state(unsafe { &*ptr }, |rt| rt.canvases.get(path).cloned()).flatten()
 }
 
+/// A `text` tag option's Tk default, reported by `tag cget` when unset.
+fn text_tag_default(option: &str) -> &'static str {
+    match option {
+        "-borderwidth" | "-lmargin1" | "-lmargin2" | "-rmargin" | "-spacing1"
+        | "-spacing2" | "-spacing3" | "-offset" | "-overstrike" | "-underline"
+        | "-elide" | "-wrap" => "0",
+        "-justify" => "left",
+        "-relief" => "raised",
+        "-tabstyle" => "tabular",
+        _ => "",
+    }
+}
+
 fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {
     if rest.is_empty() {
         return Err(wrong("tag", "option ?arg ...?", rest.len() + 2));
@@ -11687,7 +11700,13 @@ fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<V
                 })
                 .flatten()
                 .unwrap_or_default();
-                return Ok(Value::from_str(&value));
+                return Ok(Value::from_str(
+                    if value.is_empty() {
+                        text_tag_default(option)
+                    } else {
+                        &value
+                    },
+                ));
             }
             let options = parse_pairs(rest, 2, "tag configure")?;
             with_state_mut(interp, |rt| {
@@ -11715,7 +11734,11 @@ fn text_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<V
             })
             .flatten()
             .unwrap_or_default();
-            Ok(Value::from_str(&value))
+            Ok(Value::from_str(if value.is_empty() {
+                text_tag_default(rest[2].as_str())
+            } else {
+                &value
+            }))
         }
         "add" => {
             if rest.len() < 3 || rest.len() > 4 {
@@ -12159,6 +12182,31 @@ fn text_replace(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value
 }
 
 /// Collect matches fully inside the character window `[from, to)`.
+/// The character ranges covered by any tag whose `-elide` is on.
+fn text_elided_ranges(interp: &Interp, path: &str, content: &str) -> Vec<(usize, usize)> {
+    let truthy = |value: &str| matches!(value, "1" | "true" | "yes" | "on");
+    let mut ranges: Vec<(usize, usize)> = with_state(interp, |rt| {
+        rt.text_tags
+            .get(path)
+            .map(|tags| {
+                tags.iter()
+                    .filter(|(_, tag)| {
+                        tag.options
+                            .get("-elide")
+                            .is_some_and(|value| truthy(value))
+                    })
+                    .flat_map(|(_, tag)| tag.ranges.iter().copied())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    })
+    .unwrap_or_default();
+    ranges.retain(|(start, end)| {
+        *start < content.chars().count() && end > start
+    });
+    ranges
+}
+
 fn text_search_region(
     chars: &[char],
     pattern: &str,
@@ -12213,6 +12261,7 @@ fn text_search(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value>
     let mut regexp = false;
     let mut nocase = false;
     let mut all = false;
+    let mut include_elided = false;
     let mut count_var: Option<String> = None;
     let mut pos = 0usize;
     while pos < rest.len() {
@@ -12238,6 +12287,8 @@ fn text_search(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value>
             nocase = true;
         } else if switch("all") {
             all = true;
+        } else if switch("elide") {
+            include_elided = true;
         } else if switch("count") {
             pos += 1;
             let Some(value) = rest.get(pos) else {
@@ -12246,7 +12297,7 @@ fn text_search(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value>
             count_var = Some(value.as_str().to_string());
         } else {
             return Err(generic(format!(
-                "bad switch \"{arg}\": must be -all, -backward, -count, -exact, -forward, -nocase, or -regexp"
+                "bad switch \"{arg}\": must be -all, -backward, -count, -elide, -exact, -forward, -nocase, or -regexp"
             )));
         }
         pos += 1;
@@ -12277,7 +12328,6 @@ fn text_search(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value>
     };
     let chars = content.chars().collect::<Vec<_>>();
     let len = chars.len();
-    eprintln!("SEARCH rest={:?} pattern={pattern:?} index={index} stop={stop:?} all={all} regexp={regexp} len={len}", rest.iter().map(|v| v.as_str().to_string()).collect::<Vec<_>>());
     let mut matches: Vec<(usize, usize)> = Vec::new();
     if forward {
         // `stopIndex` limits where a match may start, not where it ends.
@@ -12306,7 +12356,16 @@ fn text_search(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value>
             matches.extend(wrapped);
         }
     }
-    eprintln!("SEARCH matches={matches:?}");
+    // Hidden text: matches inside tags with -elide are skipped unless
+    // the search was told to include them.
+    if !include_elided && !matches.is_empty() {
+        let elided = text_elided_ranges(interp, path, &content);
+        if !elided.is_empty() {
+            matches.retain(|(start, end)| {
+                !elided.iter().any(|(a, b)| *start < *b && *a < *end)
+            });
+        }
+    }
     if let Some(var) = count_var {
         let count = matches.first().map_or(0, |(start, end)| end - start);
         if let Err(e) = set_var(&var, &count.to_string()) {
@@ -13912,6 +13971,43 @@ mod tests {
         assert_eq!(eval(&mut i, &format!(".c bbox {id}")), "30 43 70 57");
         eval(&mut i, &format!(".c itemconfigure {id} -text {{a\nbc}}"));
         assert_eq!(eval(&mut i, &format!(".c bbox {id}")), "40 37 60 63");
+    }
+
+    #[test]
+    fn text_tag_defaults_and_search_elide() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "text .t; .t insert end {one two three four}");
+
+        // cget reports Tk defaults for known-but-unset options.
+        eval(&mut i, ".t tag add hidden 1.4 1.8");
+        assert_eq!(eval(&mut i, ".t tag cget hidden -elide"), "0");
+        assert_eq!(eval(&mut i, ".t tag cget hidden -offset"), "0");
+        assert_eq!(eval(&mut i, ".t tag cget hidden -overstrike"), "0");
+        assert_eq!(eval(&mut i, ".t tag cget hidden -lmargin1"), "0");
+        assert_eq!(eval(&mut i, ".t tag cget hidden -spacing3"), "0");
+        assert_eq!(eval(&mut i, ".t tag cget hidden -justify"), "left");
+        assert_eq!(eval(&mut i, ".t tag cget hidden -tabstyle"), "tabular");
+        assert_eq!(eval(&mut i, ".t tag cget hidden -tabs"), "");
+
+        // Extended options store and read back.
+        eval(
+            &mut i,
+            ".t tag configure big -offset 2 -overstrike 1 -lmargin1 4 -spacing3 6 -tabs {2c 4c}",
+        );
+        assert_eq!(eval(&mut i, ".t tag cget big -offset"), "2");
+        assert_eq!(eval(&mut i, ".t tag cget big -tabs"), "2c 4c");
+
+        // Elided text is skipped unless -elide is given ("hidden" covers
+        // chars 4..8: "two ").
+        eval(&mut i, ".t tag configure hidden -elide 1");
+        assert_eq!(eval(&mut i, ".t search two 1.0"), "");
+        assert_eq!(eval(&mut i, ".t search -elide two 1.0"), "1.4");
+        assert_eq!(eval(&mut i, ".t search -elide -count n two 1.0"), "1.4");
+        assert_eq!(eval(&mut i, "set n"), "3");
+        // -all respects the same rule ("o" at 1.0, 1.5, 1.15; 1.5 elided).
+        assert_eq!(eval(&mut i, ".t search -all o 1.0"), "1.0 1.15");
+        assert_eq!(eval(&mut i, ".t search -all -elide o 1.0"), "1.0 1.6 1.15");
     }
 
     #[test]

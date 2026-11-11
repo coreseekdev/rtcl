@@ -533,7 +533,16 @@ listbox/treeview 的 Up/Down 导航），下拉关闭即随作用域销毁、按
 控件。Apple 平台不绑定助记符（Option+字母是输入字符；Mac 无菜单
 助记符惯例）；原生菜单栏（macOS/GTK/Win32）用各自的键盘遍历，不走此
 路径。未覆盖：`tk_popup`/menubutton 弹出的菜单、子菜单内 Left 返回
-上级。**selection/虚拟事件对照（2026-11-11，specs/tk/selection-virtual.tcl，
+上级。**ttk 多主题（2026-11-12）**：`ttk::style theme names/use` 对齐 Tk
+（Linux 四主题 clam/alt/default/classic，按 Tk 的顺序；use 校验未知
+主题并报同文案错误）；configure/map/layout 按活动主题**分表作用域**
+（此前单全局表——在 clam 下 configure 的值会污染 default）；lookup
+读活动主题表 → 内置值（从 Tk 8.6 探出的每主题默认：TButton/TLabel/
+TEntry/TFrame 的 padding/background/foreground/borderwidth，如 clam
+#dcdad5 vs default #d9d9d9）→ 全局表；layout 查询补 TButton 的内置
+元素树（children 花括号形态与 Tk 逐字节一致）；configure 单选项查
+询回退内置值。渲染器仍读全局表（default 主题配置同步写入）——主题
+切换暂不改变视觉（近似样式的主题化是渲染器工作）。**selection/虚拟事件对照（2026-11-11，specs/tk/selection-virtual.tcl，
 run.sh 第四遍）**：selection 的 own/handle/get/clear 与虚拟事件的
 add/info/generate/delete 与 wish 精确比对（info 输出 lsort 归一）。
 修了两处：①`selection clear` 的 positional 是**窗口**（此前被当作

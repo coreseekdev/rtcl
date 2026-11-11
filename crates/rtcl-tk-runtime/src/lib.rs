@@ -65,6 +65,11 @@ pub struct TkRuntime {
     paned_sizes: BTreeMap<String, Vec<f64>>,
     /// `ttk::style configure` options, by style name.
     ttk_styles: BTreeMap<String, BTreeMap<String, String>>,
+    /// Per-theme style configurations (`ttk::style configure` is scoped
+    /// to the active theme).
+    ttk_theme_tables: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
+    ttk_theme_maps: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
+    ttk_theme_layouts: BTreeMap<String, BTreeMap<String, Vec<String>>>,
     /// `ttk::style layout` specifications, by style name.
     ttk_layouts: BTreeMap<String, Vec<String>>,
     /// `ttk::style map` state specs, by style and option.
@@ -5307,6 +5312,50 @@ pub fn ttk_style_value(widget_path: &str, option: &str) -> Option<String> {
     .flatten()
 }
 
+/// Tk's ttk themes (Linux), in Tk's own order for `theme names`.
+const TTK_THEMES: [&str; 4] = ["clam", "alt", "default", "classic"];
+
+/// A theme's builtin style values, as Tk's theme definitions answer
+/// `lookup` before anything is configured (probed from Tk 8.6 on Linux).
+fn ttk_theme_builtin(theme: &str, style: &str, option: &str) -> Option<String> {
+    let (button_pad, colors, entry_pad, borders) = match theme {
+        "default" => ("3 3", "#d9d9d9", "1", "1"),
+        "clam" => ("5", "#dcdad5", "1", ""),
+        "alt" => ("1 1", "#d9d9d9", "1", ""),
+        "classic" => ("3m 1m", "#d9d9d9", "1", "1"),
+        _ => return None,
+    };
+    let value = match (style, option) {
+        ("TButton", "-padding") => button_pad,
+        ("TButton", "-background") => colors,
+        ("TButton", "-foreground") => if theme == "default" { "#000000" } else { "black" },
+        ("TButton", "-borderwidth") => borders,
+        ("TLabel", "-background") => colors,
+        ("TLabel", "-foreground") => if theme == "default" { "#000000" } else { "black" },
+        ("TLabel", "-borderwidth") => borders,
+        ("TEntry", "-padding") => entry_pad,
+        ("TEntry", "-background") => colors,
+        ("TEntry", "-foreground") => if theme == "default" { "#000000" } else { "black" },
+        ("TFrame", "-background") => colors,
+        ("TFrame", "-foreground") => if theme == "default" { "#000000" } else { "black" },
+        _ => "",
+    };
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// The active theme's name ("default" until `theme use`).
+fn ttk_active_theme(interp: &Interp) -> String {
+    with_state(interp, |rt| {
+        let theme = rt.ttk_theme.clone();
+        if theme.is_empty() {
+            "default".to_string()
+        } else {
+            theme
+        }
+    })
+    .unwrap_or_else(|| "default".to_string())
+}
+
 fn ttk_style_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.is_empty() {
         return Err(wrong("ttk::style", "option ?arg ...?", args.len() + 1));
@@ -5323,8 +5372,13 @@ fn ttk_style_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let style = args[1].as_str().to_string();
             if args.len() == 2 {
+                let theme = ttk_active_theme(_interp);
                 let options = with_state(_interp, |rt| {
-                    rt.ttk_styles.get(&style).cloned().unwrap_or_default()
+                    rt.ttk_theme_tables
+                        .get(&theme)
+                        .and_then(|styles| styles.get(&style).cloned())
+                        .or_else(|| rt.ttk_styles.get(&style).cloned())
+                        .unwrap_or_default()
                 })
                 .unwrap_or_default();
                 return Ok(list_value(
@@ -5335,22 +5389,42 @@ fn ttk_style_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             if args.len() == 3 {
+                let theme = ttk_active_theme(_interp);
                 let value = with_state(_interp, |rt| {
-                    rt.ttk_styles
-                        .get(&style)
+                    rt.ttk_theme_tables
+                        .get(&theme)
+                        .and_then(|styles| styles.get(&style))
                         .and_then(|options| options.get(args[2].as_str()))
                         .cloned()
+                        .or_else(|| ttk_theme_builtin(&theme, &style, args[2].as_str()))
+                        .or_else(|| {
+                            rt.ttk_styles
+                                .get(&style)
+                                .and_then(|options| options.get(args[2].as_str()))
+                                .cloned()
+                        })
                 })
                 .flatten()
                 .unwrap_or_default();
                 return Ok(Value::from_str(&value));
             }
             let pairs = parse_pairs(args, 2, "ttk::style configure")?;
+            let theme = ttk_active_theme(_interp);
             with_state_mut(_interp, |rt| {
-                rt.ttk_styles
+                // The active theme's table, and — for the default theme —
+                // the global one the renderer reads.
+                rt.ttk_theme_tables
+                    .entry(theme.clone())
+                    .or_default()
                     .entry(style.clone())
                     .or_default()
-                    .extend(pairs);
+                    .extend(pairs.clone());
+                if theme == "default" {
+                    rt.ttk_styles
+                        .entry(style.clone())
+                        .or_default()
+                        .extend(pairs);
+                }
                 rt.bump();
             });
             Ok(Value::empty())
@@ -5365,11 +5439,20 @@ fn ttk_style_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let style = args[1].as_str();
             let option = args[2].as_str();
+            let theme = ttk_active_theme(_interp);
             let value = with_state(_interp, |rt| {
-                rt.ttk_styles
-                    .get(style)
+                rt.ttk_theme_tables
+                    .get(&theme)
+                    .and_then(|styles| styles.get(style))
                     .and_then(|options| options.get(option))
                     .cloned()
+                    .or_else(|| ttk_theme_builtin(&theme, style, option))
+                    .or_else(|| {
+                        rt.ttk_styles
+                            .get(style)
+                            .and_then(|options| options.get(option))
+                            .cloned()
+                    })
             })
             .flatten();
             Ok(Value::from_str(
@@ -5387,10 +5470,16 @@ fn ttk_style_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     args.len() + 1,
                 ));
             }
+            let theme = ttk_active_theme(_interp);
             if args.len() >= 4 {
                 let style = args[1].as_str().to_string();
                 with_state_mut(_interp, |rt| {
-                    let maps = rt.ttk_maps.entry(style).or_default();
+                    let maps = rt
+                        .ttk_theme_maps
+                        .entry(theme)
+                        .or_default()
+                        .entry(style)
+                        .or_default();
                     for pair in args[2..].chunks(2) {
                         if let Some(value) = pair.get(1) {
                             maps.insert(pair[0].as_str().to_string(), value.as_str().to_string());
@@ -5401,10 +5490,17 @@ fn ttk_style_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let style = args[1].as_str();
             let value = with_state(_interp, |rt| {
-                rt.ttk_maps
-                    .get(style)
+                rt.ttk_theme_maps
+                    .get(&theme)
+                    .and_then(|styles| styles.get(style))
                     .and_then(|maps| maps.get(args[2].as_str()))
                     .cloned()
+                    .or_else(|| {
+                        rt.ttk_maps
+                            .get(style)
+                            .and_then(|maps| maps.get(args[2].as_str()))
+                            .cloned()
+                    })
             })
             .flatten()
             .unwrap_or_default();
@@ -5419,10 +5515,29 @@ fn ttk_style_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let style = args[1].as_str().to_string();
+            let theme = ttk_active_theme(_interp);
             if args.len() == 2 {
-                let layout = with_state(_interp, |rt| rt.ttk_layouts.get(&style).cloned())
-                    .flatten()
-                    .unwrap_or_default();
+                let builtin = (style == "TButton").then(|| {
+                    vec![
+                        "Button.border -sticky nswe -border 1 -children".to_string(),
+                        "{Button.focus -sticky nswe -children {Button.padding -sticky nswe -children {Button.label -sticky nswe}}}".to_string(),
+                    ]
+                });
+                let mut layout: Vec<String> = with_state(_interp, |rt| {
+                    rt.ttk_theme_layouts
+                        .get(&theme)
+                        .and_then(|styles| styles.get(&style).cloned())
+                        .or_else(|| rt.ttk_layouts.get(&style).cloned())
+                })
+                .flatten()
+                .unwrap_or_default();
+                if layout.is_empty() {
+                    if let Some(builtin) = builtin {
+                        // Tk renders the layout spec as one list whose
+                        // nested children are braced words.
+                        return Ok(Value::from_str(&builtin.join(" ")));
+                    }
+                }
                 return Ok(list_value(layout));
             }
             let mut spec = Vec::new();
@@ -5434,12 +5549,19 @@ fn ttk_style_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
             }
             let layout = if spec.iter().all(|word| !word.starts_with('-')) {
-                spec.into_iter()
-                    .flat_map(|name| [name, "-sticky".to_string(), "nswe".to_string()])
+                spec.iter()
+                    .flat_map(|name| [name.clone(), "-sticky".to_string(), "nswe".to_string()])
                     .collect::<Vec<_>>()
             } else {
                 spec
             };
+            with_state_mut(_interp, |rt| {
+                rt.ttk_theme_layouts
+                    .entry(theme)
+                    .or_default()
+                    .insert(style.clone(), layout.clone());
+                rt.bump();
+            });
             with_state_mut(_interp, |rt| {
                 rt.ttk_layouts.insert(style, layout);
             });
@@ -5498,26 +5620,16 @@ fn ttk_style_impl(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             match args[1].as_str() {
-                "names" => Ok(list_value(["default".to_string()])),
-                "current" => {
-                    let theme = with_state(_interp, |rt| rt.ttk_theme.clone()).unwrap_or_default();
-                    Ok(Value::from_str(if theme.is_empty() {
-                        "default"
-                    } else {
-                        &theme
-                    }))
-                }
-                "use" if args.len() == 2 => {
-                    let theme = with_state(_interp, |rt| rt.ttk_theme.clone()).unwrap_or_default();
-                    Ok(Value::from_str(if theme.is_empty() {
-                        "default"
-                    } else {
-                        &theme
-                    }))
-                }
+                "names" => Ok(list_value(TTK_THEMES.iter().map(|name| name.to_string()).collect::<Vec<_>>())),
+                "current" => Ok(Value::from_str(&ttk_active_theme(_interp))),
+                "use" if args.len() == 2 => Ok(Value::from_str(&ttk_active_theme(_interp))),
                 "use" => {
+                    let theme = args[2].as_str();
+                    if !TTK_THEMES.contains(&theme) {
+                        return Err(generic(format!("theme \"{theme}\" doesn't exist")));
+                    }
                     with_state_mut(_interp, |rt| {
-                        rt.ttk_theme = args[2].as_str().to_string();
+                        rt.ttk_theme = theme.to_string();
                         rt.bump();
                     });
                     Ok(Value::empty())
@@ -16091,7 +16203,31 @@ mod tests {
             "active blue"
         );
         assert_eq!(eval(&mut i, "ttk::style theme use"), "default");
-        assert_eq!(eval(&mut i, "ttk::style theme names"), "default");
+        // Tk's theme set, in its own order.
+        assert_eq!(
+            eval(&mut i, "ttk::style theme names"),
+            "clam alt default classic"
+        );
+        // Per-theme scoping: a value configured in one theme doesn't leak
+        // into another, and the builtins answer lookups unconfigured.
+        eval(&mut i, "ttk::style theme use clam");
+        assert_eq!(
+            eval(&mut i, "ttk::style lookup TButton -padding"),
+            "5",
+            "clam's builtin padding"
+        );
+        eval(&mut i, "ttk::style configure TButton -padding {6 4}");
+        assert_eq!(eval(&mut i, "ttk::style lookup TButton -padding"), "6 4");
+        eval(&mut i, "ttk::style theme use default");
+        assert_eq!(
+            eval(&mut i, "ttk::style lookup TButton -padding"),
+            "3 3",
+            "default's builtin, untouched by clam's configure"
+        );
+        assert!(
+            i.eval("ttk::style theme use nosuch").is_err(),
+            "an unknown theme errors, as Tk's does"
+        );
         eval(&mut i, "ttk::style theme use clam");
         assert_eq!(eval(&mut i, "ttk::style theme current"), "clam");
         eval(

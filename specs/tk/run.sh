@@ -34,4 +34,27 @@ timeout 60 "$PROBE" specs/tk/geometry.tcl > "$out/geo-rtcl.out" 2> "$out/geo-rtc
 tclsh specs/tk/compare-geo.tcl "$out/geo-tk.out" "$out/geo-rtcl.out" "$scale"
 geo=$?
 
+# Third pass: event % substitutions, exact diff.  Two lines legitimately
+# diverge: an empty %A (Ctrl key, or Return) inside a list-form binding
+# keeps its empty ARGUMENT in Tk (which evaluates list objects per
+# element) but collapses in rtcl's textual evaluation — known difference,
+# see docs/UI-NATIVE-TK.md.
+timeout 60 "$PROBE" specs/tk/events.tcl > "$out/ev-rtcl.out" 2> "$out/ev-rtcl.err" \
+    || { echo "tk: tkprobe events failed" >&2; cat "$out/ev-rtcl.err" >&2; exit 2; }
+timeout 60 wish specs/tk/events.tcl > "$out/ev-tk.out" 2> "$out/ev-tk.err" \
+    || { echo "tk: wish events failed" >&2; cat "$out/ev-tk.err" >&2; exit 2; }
+# The two key-a/key-ret lines carry an empty %A, whose empty argument Tk
+# preserves (list-element evaluation) and rtcl's textual evaluation
+# collapses — the documented known difference, filtered on both sides.
+known='EV\\|key-(a|ret) N='
+ev_diff=$(diff \
+    <(tr -d '\r' < "$out/ev-tk.out" | grep -vE "$known") \
+    <(tr -d '\r' < "$out/ev-rtcl.out" | grep -vE "$known") \
+    || true)
+if [ -n "$ev_diff" ]; then
+    printf '%s\n' "$ev_diff"
+    echo "tk: events differ"
+    geo=1
+fi
+
 if [ "$metrics" -ne 0 ] || [ "$geo" -ne 0 ]; then exit 1; fi

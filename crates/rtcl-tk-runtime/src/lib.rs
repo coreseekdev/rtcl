@@ -3784,6 +3784,166 @@ fn keysym_number(key: &str) -> i64 {
     }
 }
 
+/// Tk's %s in decimal: the state may have been written as `0x4`.
+fn normalize_state(state: &str) -> String {
+    let trimmed = state.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x").or(trimmed.strip_prefix("0X")) {
+        return u64::from_str_radix(hex, 16)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| state.to_string());
+    }
+    if trimmed.is_empty() {
+        return "0".to_string();
+    }
+    trimmed.to_string()
+}
+
+fn parse_state_int(state: &str) -> Option<i64> {
+    let trimmed = state.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x").or(trimmed.strip_prefix("0X")) {
+        return i64::from_str_radix(hex, 16).ok();
+    }
+    trimmed.parse().ok()
+}
+
+/// The character a keysym names, for generated key events' %A (`space`,
+/// `Tab` and the punctuation keysyms; navigation keys name none).
+fn keysym_char(keysym: &str) -> Option<char> {
+    // A single alphanumeric keysym names its own character (letters
+    // lowercase, as X keysyms are for the unshifted key).
+    let mut chars = keysym.chars();
+    if let (Some(first), None) = (chars.next(), chars.next()) {
+        if first.is_ascii_alphanumeric() {
+            return Some(first.to_ascii_lowercase());
+        }
+    }
+    match keysym {
+        "space" => Some(' '),
+        "Tab" => Some('\t'),
+        "period" => Some('.'),
+        "comma" => Some(','),
+        "minus" => Some('-'),
+        "equal" => Some('='),
+        "slash" => Some('/'),
+        "grave" => Some('`'),
+        "quotedbl" => Some('"'),
+        "apostrophe" => Some('\''),
+        "less" => Some('<'),
+        "greater" => Some('>'),
+        "colon" => Some(':'),
+        "semicolon" => Some(';'),
+        "question" => Some('?'),
+        "exclam" => Some('!'),
+        "at" => Some('@'),
+        "numbersign" => Some('#'),
+        "dollar" => Some('$'),
+        "percent" => Some('%'),
+        "ampersand" => Some('&'),
+        "asterisk" => Some('*'),
+        "parenleft" => Some('('),
+        "parenright" => Some(')'),
+        "underscore" => Some('_'),
+        "plus" => Some('+'),
+        "braceleft" => Some('{'),
+        "braceright" => Some('}'),
+        "bracketleft" => Some('['),
+        "bracketright" => Some(']'),
+        "backslash" => Some('\\'),
+        "bar" => Some('|'),
+        "asciitilde" => Some('~'),
+        _ => None,
+    }
+}
+
+/// The X keycode of a keysym on this platform's keymap, as Tk's %k
+/// reports it (Linux evdev/pc105; a keysym outside the table leaves %k
+/// as ??).
+fn x_keycode(keysym: &str) -> Option<i64> {
+    let lower = keysym.to_ascii_lowercase();
+    if lower.len() == 1 {
+        if let Some(ch) = lower.chars().next() {
+            if ch.is_ascii_digit() {
+                return Some(match ch {
+                    '0' => 19,
+                    digit => 9 + digit as i64 - b'0' as i64,
+                });
+            }
+            if ch.is_ascii_lowercase() {
+                let code = match ch {
+                    'q' => 24,
+                    'w' => 25,
+                    'e' => 26,
+                    'r' => 27,
+                    't' => 28,
+                    'y' => 29,
+                    'u' => 30,
+                    'i' => 31,
+                    'o' => 32,
+                    'p' => 33,
+                    'a' => 38,
+                    's' => 39,
+                    'd' => 40,
+                    'f' => 41,
+                    'g' => 42,
+                    'h' => 43,
+                    'j' => 44,
+                    'k' => 45,
+                    'l' => 46,
+                    'z' => 52,
+                    'x' => 53,
+                    'c' => 54,
+                    'v' => 55,
+                    'b' => 56,
+                    'n' => 57,
+                    'm' => 58,
+                    _ => return None,
+                };
+                return Some(code);
+            }
+        }
+    }
+    Some(match keysym {
+        "Return" | "KP_Enter" => 36,
+        "space" => 65,
+        "Tab" | "KP_Tab" => 23,
+        "Escape" => 9,
+        "BackSpace" => 22,
+        "Delete" => 119,
+        "Prior" => 112,
+        "Next" => 117,
+        "Home" => 110,
+        "End" => 115,
+        "Left" => 113,
+        "Up" => 111,
+        "Right" => 114,
+        "Down" => 116,
+        "F1" => 67,
+        "F2" => 68,
+        "F3" => 69,
+        "F4" => 70,
+        "F5" => 71,
+        "F6" => 72,
+        "F7" => 73,
+        "F8" => 74,
+        "F9" => 75,
+        "F10" => 76,
+        "F11" => 95,
+        "F12" => 96,
+        "period" => 60,
+        "comma" => 59,
+        "minus" => 20,
+        "equal" => 21,
+        "slash" => 61,
+        "grave" => 49,
+        "ampersand" => 16,
+        "asterisk" => 17,
+        "quotedbl" => 48,
+        "parenleft" => 187,
+        "less" => 51,
+        _ => return None,
+    })
+}
+
 fn substitute_bindings(script: &str, ctx: &EventCtx) -> String {
     let mut out = String::with_capacity(script.len());
     let mut chars = script.chars().peekable();
@@ -3814,11 +3974,33 @@ fn substitute_bindings(script: &str, ctx: &EventCtx) -> String {
             } else {
                 ctx.key.clone()
             }),
-            Some('A') => out.push_str(&if ctx.character.is_empty() {
-                "??".to_string()
-            } else {
-                ctx.character.clone()
-            }),
+            Some('A') => {
+                // Tk's %A: the character the key produces — letters fold
+                // to control characters under Ctrl (Ctrl+A is \x01),
+                // shift gives the upper one; keysyms that name no
+                // character (arrows, F-keys) report {}.
+                let state = parse_state_int(&ctx.state).unwrap_or(0);
+                let ctrl = state & 4 != 0;
+                if ctrl {
+                    let folded = ctx
+                        .key
+                        .chars()
+                        .next()
+                        .filter(|ch| ch.is_ascii_lowercase())
+                        .map(|ch| (ch as u8 - b'a' + 1) as char);
+                    match folded {
+                        Some(ch) => out.push(ch),
+                        None if !ctx.key.is_empty() => out.push_str("{}"),
+                        _ => {}
+                    }
+                } else if !ctx.character.is_empty() {
+                    out.push_str(&ctx.character.clone());
+                } else if ctx.key == "Return" {
+                    // Tk's %A is empty for Return.
+                } else if !ctx.key.is_empty() && keysym_char(&ctx.key).is_none() {
+                    out.push_str("{}");
+                }
+            }
             Some('k') => out.push_str(&if ctx.keycode > 0 {
                 ctx.keycode.to_string()
             } else {
@@ -3830,7 +4012,7 @@ fn substitute_bindings(script: &str, ctx: &EventCtx) -> String {
                 keysym_number(&ctx.key).to_string()
             }),
             Some('b') => out.push_str(&ctx.button.to_string()),
-            Some('s') => out.push_str(&ctx.state),
+            Some('s') => out.push_str(&normalize_state(&ctx.state)),
             Some('D') => out.push_str(&if ctx.delta == 0
                 && ctx.button == 0
                 && ctx.character.is_empty()
@@ -8377,6 +8559,7 @@ fn event_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(bad_window(&path));
             }
             let mut ctx = EventCtx::for_path(&path);
+            let mut state_given = false;
             let mut i = 4;
             while i + 1 < args.len() {
                 match args[i].as_str() {
@@ -8393,7 +8576,10 @@ fn event_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "-key" | "-keysym" => ctx.key = args[i + 1].as_str().to_string(),
                     "-keycode" => ctx.keycode = parse_int(&args[i + 1])?,
                     "-button" => ctx.button = parse_int(&args[i + 1])?,
-                    "-state" => ctx.state = args[i + 1].as_str().to_string(),
+                    "-state" => {
+                        ctx.state = normalize_state(args[i + 1].as_str());
+                        state_given = true;
+                    }
                     "-delta" => ctx.delta = parse_int(&args[i + 1])?,
                     "-width" => ctx.width = parse_int(&args[i + 1])?,
                     "-height" => ctx.height = parse_int(&args[i + 1])?,
@@ -8404,7 +8590,17 @@ fn event_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "-mode" => ctx.mode = args[i + 1].as_str().to_string(),
                     "-focus" => ctx.focus = Some(parse_int(&args[i + 1])?),
                     "-count" | "-clicks" => ctx.clicks = parse_int(&args[i + 1])?.max(1) as u32,
-                    _ => {}
+                    // Accepted by Tk and carried on the event, but nothing
+                    // this model reads: -when, -data, -above,
+                    // -borderwidth, -override, -place, -root, -subwindow,
+                    // -warp, -window.
+                    "-when" | "-data" | "-above" | "-borderwidth" | "-override"
+                    | "-place" | "-root" | "-subwindow" | "-warp" | "-window" => {}
+                    other => {
+                        return Err(generic(format!(
+                            "bad option \"{other}\": must be -when, -above, -borderwidth, -button, -count, -data, -delta, -detail, -focus, -height, -keycode, -keysym, -mode, -override, -place, -root, -rootx, -rooty, -sendevent, -serial, -state, -subwindow, -time, -warp, -width, -window, -x, or -y"
+                        )));
+                    }
                 }
                 i += 2;
             }
@@ -8416,8 +8612,34 @@ fn event_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     }
                 }
             }
-            if ctx.character.is_empty() && ctx.key.chars().count() == 1 {
-                ctx.character = ctx.key.clone();
+            if ctx.character.is_empty() {
+                // `space`/`Tab` and the punctuation keysyms name characters;
+                // navigation and F-keys name none (Tk reports {} for %A).
+                if let Some(ch) = keysym_char(&ctx.key) {
+                    ctx.character = ch.to_string();
+                }
+            }
+            // Tk's %k is the X keycode of the keysym (this platform's map).
+            if ctx.keycode == 0
+                && matches!(pattern.kind, EventKind::KeyPress | EventKind::KeyRelease)
+            {
+                ctx.keycode = x_keycode(&ctx.key).unwrap_or(0);
+            }
+            // Focus and map events carry no state: Tk reports ?? for %s.
+            if !state_given
+                && matches!(
+                    pattern.kind,
+                    EventKind::FocusIn | EventKind::FocusOut | EventKind::Map | EventKind::Unmap
+                )
+            {
+                ctx.state = "??".to_string();
+            }
+            // Non-key events carry no character, and Tk's %A/%K then
+            // report ??.
+            if !matches!(pattern.kind, EventKind::KeyPress | EventKind::KeyRelease)
+                && ctx.character.is_empty()
+            {
+                ctx.character = "??".to_string();
             }
             run_binding(&path, args[3].as_str(), &ctx);
             Ok(Value::empty())

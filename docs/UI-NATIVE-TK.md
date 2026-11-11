@@ -533,7 +533,20 @@ listbox/treeview 的 Up/Down 导航），下拉关闭即随作用域销毁、按
 控件。Apple 平台不绑定助记符（Option+字母是输入字符；Mac 无菜单
 助记符惯例）；原生菜单栏（macOS/GTK/Win32）用各自的键盘遍历，不走此
 路径。未覆盖：`tk_popup`/menubutton 弹出的菜单、子菜单内 Left 返回
-上级。**字体度量对照 wish（2026-11-11，specs/tk/）**：`apps/rtcl-tk-demo
+上级。**事件域 wish 对照（2026-11-11，specs/tk/events.tcl，run.sh 第三遍）**：
+`event generate` 驱动 bind 的全部 % 替换，与 wish 逐行精确比对（键类
+两行豁免，见下）。修了三组：①`%s` 按十进制整数报（此前原样输出
+`-state 0x4` 的 "0x4"；FocusIn/FocusOut/Map/Unmap 无 state 时报
+`??`，同 Tk）；②`%k` 补 X keycode 表（Linux evdev/pc105：字母
+a=38…z=52、数字 0=19…9=18、Return 36、space 65、Tab 23、Escape 9、
+方向键/F 键等；表外 keysym 报 `??`——%k 本就平台相关）；③`%A`：
+字符键报字符（Ctrl 折叠为控制字符 Ctrl+A=\x01，Shift 大写，Alt 不
+影响），无字符键（方向键/F 键）报字面 `{}`，Return 报空；`event
+generate` 未知名选项按 Tk 全列表报错（`-when/-data/-above/…` 十个
+新增为接受忽略项）；`grab set/status/current/release` 已支持。**已
+知差异（豁免）**：键类绑定的空 %A——Tk 按列表对象逐元素求值保留空
+参数，rtcl 文本求值折叠（结构一致：字段数差一）；Xvfb 无 WM 时 Tk
+的 Key 生成事件不派发（对照跑在真实显示上）。**字体度量对照 wish（2026-11-11，specs/tk/）**：`apps/rtcl-tk-demo
 --bin tkprobe`（GTK 初始化 + 装后端跑脚本打印）与 wish 跑同一
 `specs/tk/font-metrics.tcl`，`specs/tk/run.sh` 按容差比对（Tk 报
 Xft.dpi 设备像素、rtcl 报 96dpi 逻辑像素，比例由 xrdb 的 Xft.dpi 给

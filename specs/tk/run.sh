@@ -115,4 +115,22 @@ if [ -n "$sc_diff" ]; then
     geo=1
 fi
 
+# Seventh pass: the wm command surface + tkwait forms, exact diff.  The
+# STACK line is exempt: Tk's stackorder reflects the window manager's
+# stacking of MAPPED windows (a transient-to-root toplevel never maps
+# here); rtcl reports its deterministic tree order.
+timeout 60 wish specs/tk/wm-sweep.tcl > "$out/wm-tk.out" 2> "$out/wm-tk.err" \
+    || { echo "tk: wish wm failed" >&2; cat "$out/wm-tk.err" >&2; exit 2; }
+timeout 60 "$PROBE" specs/tk/wm-sweep.tcl > "$out/wm-rtcl.out" 2> "$out/wm-rtcl.err" \
+    || { echo "tk: tkprobe wm failed" >&2; cat "$out/wm-rtcl.err" >&2; exit 2; }
+wm_diff=$(diff \
+    <(tr -d '\r' < "$out/wm-tk.out" | grep -v '^STACK') \
+    <(tr -d '\r' < "$out/wm-rtcl.out" | grep -v '^STACK') \
+    || true)
+if [ -n "$wm_diff" ]; then
+    printf '%s\n' "$wm_diff"
+    echo "tk: wm differs"
+    geo=1
+fi
+
 if [ "$metrics" -ne 0 ] || [ "$geo" -ne 0 ]; then exit 1; fi

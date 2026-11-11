@@ -548,7 +548,19 @@ set 返回**变化前标志列表**如 {!disabled}——Tk 语义；非法标志
 **已知差异（豁免）**：bbox 的绝对 y/宽度随设备缩放与实际布局宽度
 （Tk 40/600 设备 vs rtcl 24/300 逻辑）；configure 五字段的字符串化
 在 rtcl 的列表渲染下整体多一对花括号（字段值相同）。
-**全控件子命令面对照（2026-11-12，specs/tk/subcommands.tcl +
+**wm/tkwait 对照（2026-11-12，specs/tk/wm-sweep.tcl，run.sh 第七遍）**：
+wm 的 title/geometry/resizable/minsize/maxsize/transient/group/
+overrideredirect/focusmodel/iconname/protocol/state/attributes 与
+tkwait 的 variable/window 全表精确 diff。修了两处：`wm protocol`
+的单名查询形式（`protocol window ?name?` 返回已注册脚本——此前
+报 wrong # args）；`wm attributes` 的 Linux 集合对齐 Tk（5 项
+alpha/topmost/zoomed/fullscreen/type，错误文案同 Tk——此前含
+Windows 专属的 modified/toolwindow 且顺序不同）；wm 未知子命令报
+Tk 全列表原文（aspect..withdraw）。**已知差异（豁免）**：STACK——
+Tk 的 stackorder 反映 WM 的**已映射窗口**堆叠（transient-to-root
+的 toplevel 在此环境不映射，输出空；rtcl 报确定性树序）；`wm
+geometry` 查询是时序相关的异步值（Tk 在 WM 应答前报 1x1，探针已
+剔除）。**全控件子命令面对照（2026-11-12，specs/tk/subcommands.tcl +
 menu-surface.tcl，run.sh 第六遍）**：14 个控件的"未知子命令"错误清
 单逐字节 diff（entry/text/listbox/canvas/scale/scrollbar/message/
 spinbox/labelframe/notebook/combobox/progressbar/menubutton/menu）

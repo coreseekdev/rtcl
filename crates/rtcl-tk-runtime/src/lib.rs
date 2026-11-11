@@ -3779,6 +3779,18 @@ fn wm_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::empty())
         }
         "protocol" => {
+            if args.len() == 3 {
+                // Query: every registered protocol name of the window.
+                let names = with_state(interp, |rt| {
+                    rt.protocols
+                        .keys()
+                        .filter(|(window, _)| *window == path)
+                        .map(|(_, name)| name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+                return Ok(list_value(names));
+            }
             if args.len() < 4 {
                 return Err(wrong("wm protocol", "window ?name? ?command?", args.len()));
             }
@@ -3852,8 +3864,7 @@ fn wm_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let name = args[3].as_str().to_string();
             if !NAMES.contains(&name.as_str()) {
                 return Err(generic(format!(
-                    "bad attribute \"{name}\": must be one of {}",
-                    NAMES.iter().map(|n| &n[1..]).collect::<Vec<_>>().join(", ")
+                    "bad attribute \"{name}\": must be -alpha, -topmost, -zoomed, -fullscreen, or -type"
                 )));
             }
             if args.len() == 4 {
@@ -3941,7 +3952,9 @@ fn wm_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "frame" => Ok(Value::from_str("")),
         "manage" | "forget" => Ok(Value::empty()),
-        _ => Err(generic(format!("bad option \"{sub}\""))),
+        _ => Err(generic(format!(
+            "bad option \"{sub}\": must be aspect, attributes, client, colormapwindows, command, deiconify, focusmodel, forget, frame, geometry, grid, group, iconbitmap, iconify, iconmask, iconname, iconphoto, iconposition, iconwindow, manage, maxsize, minsize, overrideredirect, positionfrom, protocol, resizable, sizefrom, stackorder, state, title, transient, or withdraw"
+        ))),
     }
 }
 

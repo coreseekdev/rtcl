@@ -57,4 +57,20 @@ if [ -n "$ev_diff" ]; then
     geo=1
 fi
 
+# Fourth pass: selection ownership/handlers and the virtual event table,
+# exact diff (info outputs are lsort-ed inside the script).
+timeout 60 wish specs/tk/selection-virtual.tcl > "$out/sv-tk.out" 2> "$out/sv-tk.err" \
+    || { echo "tk: wish selection failed" >&2; cat "$out/sv-tk.err" >&2; exit 2; }
+timeout 60 "$PROBE" specs/tk/selection-virtual.tcl > "$out/sv-rtcl.out" 2> "$out/sv-rtcl.err" \
+    || { echo "tk: tkprobe selection failed" >&2; cat "$out/sv-rtcl.err" >&2; exit 2; }
+sv_diff=$(diff \
+    <(tr -d '\r' < "$out/sv-tk.out") \
+    <(tr -d '\r' < "$out/sv-rtcl.out") \
+    || true)
+if [ -n "$sv_diff" ]; then
+    printf '%s\n' "$sv_diff"
+    echo "tk: selection/virtual differ"
+    geo=1
+fi
+
 if [ "$metrics" -ne 0 ] || [ "$geo" -ne 0 ]; then exit 1; fi

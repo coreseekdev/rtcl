@@ -519,13 +519,41 @@ pub fn install(interp: &mut Interp) {
         let rt = states.entry(key(interp)).or_default();
         // Tk's init.tcl defines these virtual events before any script
         // runs; bindings on <<Copy>> etc. fire from the physical keys.
+        // The sequences are Tk's own Linux defaults (its X alias entries
+        // included), so `event info` matches real Tk.
         for (name, sequences) in [
-            ("Copy", ["<Control-c>", "<Control-C>"].as_slice()),
-            ("Cut", ["<Control-x>", "<Control-X>"].as_slice()),
-            ("Paste", ["<Control-v>", "<Control-V>"].as_slice()),
-            ("SelectAll", ["<Control-a>", "<Control-A>"].as_slice()),
-            ("Undo", ["<Control-z>", "<Control-Z>"].as_slice()),
-            ("Redo", ["<Control-y>", "<Control-Y>"].as_slice()),
+            ("ContextMenu", ["<Button-3>"].as_slice()),
+            ("Copy", ["<Control-Key-c>", "<Key-F16>", "<Control-Lock-Key-C>", "<Meta-Key-w>", "<Lock-Meta-Key-W>", "<Control-Key-Insert>"].as_slice()),
+            ("Cut", ["<Control-Key-x>", "<Key-F20>", "<Control-Lock-Key-X>", "<Control-Key-w>", "<Control-Lock-Key-W>", "<Shift-Key-Delete>"].as_slice()),
+            ("LineEnd", ["<Key-End>", "<Control-Key-e>", "<Control-Lock-Key-E>"].as_slice()),
+            ("LineStart", ["<Key-Home>", "<Control-Key-a>", "<Control-Lock-Key-A>"].as_slice()),
+            ("NextChar", ["<Key-Right>", "<Control-Key-f>", "<Control-Lock-Key-F>"].as_slice()),
+            ("NextLine", ["<Key-Down>", "<Control-Key-n>", "<Control-Lock-Key-N>"].as_slice()),
+            ("NextPara", ["<Control-Key-Down>"].as_slice()),
+            ("NextWindow", ["<Key-Tab>"].as_slice()),
+            ("NextWord", ["<Control-Key-Right>"].as_slice()),
+            ("Paste", ["<Control-Key-v>", "<Key-F18>", "<Control-Lock-Key-V>", "<Control-Key-y>", "<Control-Lock-Key-Y>", "<Shift-Key-Insert>"].as_slice()),
+            ("PasteSelection", ["<ButtonRelease-2>"].as_slice()),
+            ("PrevChar", ["<Key-Left>", "<Control-Key-b>", "<Control-Lock-Key-B>"].as_slice()),
+            ("PrevLine", ["<Key-Up>", "<Control-Key-p>", "<Control-Lock-Key-P>"].as_slice()),
+            ("PrevPara", ["<Control-Key-Up>"].as_slice()),
+            ("PrevWindow", ["<Key-ISO_Left_Tab>", "<Key-hpBackTab>", "<Shift-Key-Tab>"].as_slice()),
+            ("PrevWord", ["<Control-Key-Left>"].as_slice()),
+            ("Redo", ["<Control-Key-Z>", "<Control-Lock-Key-z>"].as_slice()),
+            ("SelectAll", ["<Control-Key-slash>"].as_slice()),
+            ("SelectLineEnd", ["<Shift-Key-End>", "<Control-Key-E>", "<Control-Lock-Key-e>"].as_slice()),
+            ("SelectLineStart", ["<Shift-Key-Home>", "<Control-Key-A>", "<Control-Lock-Key-a>"].as_slice()),
+            ("SelectNextChar", ["<Shift-Key-Right>", "<Control-Key-F>", "<Control-Lock-Key-f>"].as_slice()),
+            ("SelectNextLine", ["<Shift-Key-Down>", "<Control-Key-N>", "<Control-Lock-Key-n>"].as_slice()),
+            ("SelectNextPara", ["<Control-Shift-Key-Down>"].as_slice()),
+            ("SelectNextWord", ["<Control-Shift-Key-Right>"].as_slice()),
+            ("SelectNone", ["<Control-Key-backslash>"].as_slice()),
+            ("SelectPrevChar", ["<Shift-Key-Left>", "<Control-Key-B>", "<Control-Lock-Key-b>"].as_slice()),
+            ("SelectPrevLine", ["<Shift-Key-Up>", "<Control-Key-P>", "<Control-Lock-Key-p>"].as_slice()),
+            ("SelectPrevPara", ["<Control-Shift-Key-Up>"].as_slice()),
+            ("SelectPrevWord", ["<Control-Shift-Key-Left>"].as_slice()),
+            ("ToggleSelection", ["<Control-Button-1>"].as_slice()),
+            ("Undo", ["<Control-Key-z>", "<Control-Lock-Key-Z>"].as_slice()),
         ] {
             rt.virtual_events
                 .entry(name.to_string())
@@ -6611,20 +6639,43 @@ fn selection_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     return interp.eval(&format!("{} 0 2147483647", handler.command));
                 }
             }
-            Ok(Value::from_str(&clipboard_text_value(interp)))
+            // The clipboard fallback covers other applications' PRIMARY;
+            // when that is empty too, Tk's error (the selection has no
+            // data) is the honest answer.
+            let text = clipboard_text_value(interp);
+            if text.is_empty() {
+                return Err(generic(format!(
+                    "{selection} selection doesn't exist or form \"STRING\" not defined"
+                )));
+            }
+            Ok(Value::from_str(&text))
         }
         "own" => {
             if positional.len() > 1 {
                 return Err(wrong(
                     "selection own",
-                    "?-command command? ?selection?",
+                    "?-command command? ?-selection sel? ?window?",
                     args.len(),
                 ));
             }
-            if let Some(name) = positional.first() {
-                selection = name.clone();
+            // Tk's positional is the owning WINDOW.
+            let window = positional
+                .first()
+                .cloned()
+                .or_else(|| displayof.clone())
+                .unwrap_or_else(|| ".".to_string());
+            if positional.is_empty() {
+                // The query form: the windows that own selections.
+                let owners = with_state(interp, |rt| {
+                    rt.selection_owned
+                        .as_ref()
+                        .zip(rt.selection_window.as_ref())
+                        .map(|(_, window)| vec![window.clone()])
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+                return Ok(list_value(owners));
             }
-            let window = displayof.unwrap_or_else(|| ".".to_string());
             with_state_mut(interp, |rt| {
                 rt.selection_owned = Some(selection.clone());
                 rt.selection_window = Some(window.clone());
@@ -6645,14 +6696,16 @@ fn selection_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if positional.len() > 1 {
                 return Err(wrong("selection clear", "?-selection sel?", args.len()));
             }
-            if let Some(name) = positional.first() {
-                selection = name.clone();
-            }
+            // Tk's positional is the owning WINDOW (the selection itself
+            // comes from -selection and defaults to PRIMARY).
             with_state_mut(interp, |rt| {
                 if rt.selection_owned.as_deref() == Some(selection.as_str()) {
                     rt.selection_owned = None;
                     rt.selection_window = None;
                 }
+                // A cleared selection has no data: the handlers go with it.
+                rt.selection_handlers
+                    .retain(|key, _| key.0 != selection);
             });
             Ok(Value::empty())
         }
@@ -15895,7 +15948,8 @@ mod tests {
         );
         assert_eq!(
             eval(&mut i, "event info <<Copy>>"),
-            "<Control-c> <Control-C>"
+            "<Control-Key-c> <Key-F16> <Control-Lock-Key-C> <Meta-Key-w> \
+             <Lock-Meta-Key-W> <Control-Key-Insert>"
         );
         eval(
             &mut i,
@@ -16293,11 +16347,19 @@ mod tests {
             &mut i,
             "proc selText {offset maxChars} {string range \"hello there\" $offset [expr {$offset + $maxChars - 1}]}",
         );
-        assert_eq!(eval(&mut i, "selection get"), "");
+        // With no owner and no clipboard text, Tk's no-data error.
+        assert_eq!(
+            i.eval("selection get").unwrap_err().to_string(),
+            "PRIMARY selection doesn't exist or form \"STRING\" not defined"
+        );
         eval(&mut i, "selection handle . selText");
-        // Handlers only serve reads while this app owns the selection.
-        assert_eq!(eval(&mut i, "selection get"), "");
-        eval(&mut i, "selection own");
+        // Handlers only serve reads while this app owns the selection;
+        // without an owner there is no data, so Tk's no-data error.
+        assert_eq!(
+            i.eval("selection get").unwrap_err().to_string(),
+            "PRIMARY selection doesn't exist or form \"STRING\" not defined"
+        );
+        eval(&mut i, "selection own .");
         assert_eq!(eval(&mut i, "selection get"), "hello there");
         assert_eq!(
             eval(&mut i, "selection get -type UTF8_STRING"),
@@ -16308,14 +16370,19 @@ mod tests {
             "STRING UTF8_STRING"
         );
         eval(&mut i, "selection clear");
-        assert_eq!(eval(&mut i, "selection get"), "");
+        // Clearing drops ownership AND the handlers: the selection has no
+        // data again.
+        assert_eq!(
+            i.eval("selection get").unwrap_err().to_string(),
+            "PRIMARY selection doesn't exist or form \"STRING\" not defined"
+        );
         // The CLIPBOARD selection falls back to the clipboard text.
         eval(&mut i, "clipboard clear; clipboard append sys");
         assert_eq!(eval(&mut i, "selection get -selection CLIPBOARD"), "sys");
         // `own -command` registers the handler in one step.
         eval(
             &mut i,
-            "proc ownedSel {offset maxChars} {string range owned $offset [expr {$offset + $maxChars - 1}]};             selection own -selection CLIPBOARD -command ownedSel",
+            "proc ownedSel {offset maxChars} {string range owned $offset [expr {$offset + $maxChars - 1}]};             selection own -selection CLIPBOARD -command ownedSel .",
         );
         assert_eq!(eval(&mut i, "selection get -selection CLIPBOARD"), "owned");
         eval(

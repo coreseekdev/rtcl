@@ -533,7 +533,27 @@ listbox/treeview 的 Up/Down 导航），下拉关闭即随作用域销毁、按
 控件。Apple 平台不绑定助记符（Option+字母是输入字符；Mac 无菜单
 助记符惯例）；原生菜单栏（macOS/GTK/Win32）用各自的键盘遍历，不走此
 路径。未覆盖：`tk_popup`/menubutton 弹出的菜单、子菜单内 Left 返回
-上级。**事件域 wish 对照（2026-11-11，specs/tk/events.tcl，run.sh 第三遍）**：
+上级。**selection/虚拟事件对照（2026-11-11，specs/tk/selection-virtual.tcl，
+run.sh 第四遍）**：selection 的 own/handle/get/clear 与虚拟事件的
+add/info/generate/delete 与 wish 精确比对（info 输出 lsort 归一）。
+修了两处：①`selection clear` 的 positional 是**窗口**（此前被当作
+selection 名导致 clear 落空——既不清 ownership 也不清 handler 数据）；
+②`selection own` 无参是**查询**（返回 owner 窗口列表，此前被当作无
+参声明）；附带：无主且剪贴板为空时 `selection get` 报 Tk 的
+"PRIMARY selection doesn't exist or form \"STRING\" not defined"
+（剪贴板回退保留：非本应用持有的 PRIMARY 仍走剪贴板）。内置虚拟事
+件补齐 Tk 全表 32 项（ContextMenu/LineStart/LineEnd/NextChar/
+NextLine/NextPara/NextWindow/NextWord/PrevChar/PrevLine/PrevPara/
+PrevWindow/PrevWord/PasteSelection/SelectAll/SelectLineStart/
+SelectLineEnd/SelectNextChar/SelectNextLine/SelectNextPara/
+SelectNextWord/SelectNone/SelectPrevChar/SelectPrevLine/SelectPrevPara/
+SelectPrevWord/SelectNone/ToggleSelection 等，序列为 Tk Linux 默认值
+原样——含 F16/F18/F20 与 Lock/Meta 别名），`event info` 与 wish
+逐字节一致。**已知差异（豁免）**：虚拟事件的平台别名表——Tk 的
+<Control-Key-c> 展开别名（Key-F16/Control-Lock-Key-C/Meta-Key-w/
+Lock-Meta-Key-W）来自其 X 编译期映射，rtcl 折叠大小写变体
+（<Control-c>/<Control-C>）；`selection get` 无数据时报错而 rtcl
+剪贴板回退返回空串之外的系统剪贴板内容。**事件域 wish 对照（2026-11-11，specs/tk/events.tcl，run.sh 第三遍）**：
 `event generate` 驱动 bind 的全部 % 替换，与 wish 逐行精确比对（键类
 两行豁免，见下）。修了三组：①`%s` 按十进制整数报（此前原样输出
 `-state 0x4` 的 "0x4"；FocusIn/FocusOut/Map/Unmap 无 state 时报

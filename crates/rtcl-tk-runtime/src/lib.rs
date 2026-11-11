@@ -6639,9 +6639,14 @@ fn selection_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     return interp.eval(&format!("{} 0 2147483647", handler.command));
                 }
             }
-            // The clipboard fallback covers other applications' PRIMARY;
-            // when that is empty too, Tk's error (the selection has no
-            // data) is the honest answer.
+            // Tk keeps PRIMARY and CLIPBOARD separate: a selection with
+            // no owner and no handler has no data.  The system clipboard
+            // is what CLIPBOARD reads (other applications included).
+            if selection == "PRIMARY" {
+                return Err(generic(format!(
+                    "{selection} selection doesn't exist or form \"STRING\" not defined"
+                )));
+            }
             let text = clipboard_text_value(interp);
             if text.is_empty() {
                 return Err(generic(format!(

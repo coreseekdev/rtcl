@@ -569,7 +569,12 @@ generate` 未知名选项按 Tk 全列表报错（`-when/-data/-above/…` 十�
 坏 `;` 分隔脚本语义——列表渲染的引号选择改变语义，已回退）；Xvfb
 无 WM 时 Tk 的 Key 生成事件不派发（对照跑在真实显示上）；`event
 generate` 的选项接受集是各事件类型各自的子集（对照只验未知选项的
-报错文案）。**字体度量对照 wish（2026-11-11，specs/tk/）**：`apps/rtcl-tk-demo
+报错文案）。虚拟事件的平台别名已对齐 Tk（内置表种入其 X11 默认序
+列原样，含 F16/F18/F20 与 Lock/Meta 别名——此前 rtcl 折叠大小写变
+体的策略已废弃）。selection 与 Tk 对齐：PRIMARY 不再回退剪贴板
+（无主/无数据报 Tk 的 no-data 错误——此前非空的系统剪贴板内容会错
+误地顶替 PRIMARY）；CLIPBOARD 的 get 仍读系统剪贴板（即 Tk 的
+CLIPBOARD 语义，跨应用）。**字体度量对照 wish（2026-11-11，specs/tk/）**：`apps/rtcl-tk-demo
 --bin tkprobe`（GTK 初始化 + 装后端跑脚本打印）与 wish 跑同一
 `specs/tk/font-metrics.tcl`，`specs/tk/run.sh` 按容差比对（Tk 报
 Xft.dpi 设备像素、rtcl 报 96dpi 逻辑像素，比例由 xrdb 的 Xft.dpi 给

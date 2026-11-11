@@ -43,3 +43,24 @@ foreach {name spec} $fonts {
     destroy .lb
 }
 exit 0
+
+# Wrap: a word-wrapped text's display lines (the wrapped chunk is a
+# dlineinfo of a char inside the second display chunk).
+text .wt -font F1 -width 20 -height 5 -wrap word
+pack .wt
+.wt insert end "one two three four five six seven eight"
+update
+puts "DL|wrap L1|[.wt dlineinfo 1.2]"
+puts "DL|wrap L2|[.wt dlineinfo 1.24]"
+puts "DL|wrap end|[.t dlineinfo 9.0]"
+destroy .wt
+label .wl -text "hello world" -font F1
+pack .wl
+update
+puts "LW|label|[winfo reqwidth .wl]"
+destroy .wl
+button .wb -text "hello world" -font F1
+pack .wb
+update
+puts "LW|button|[winfo reqwidth .wb]"
+destroy .wb

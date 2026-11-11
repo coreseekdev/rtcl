@@ -1155,18 +1155,56 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     }
                     let (content, cursor) = text_state(interp, path);
                     let marks = text_marks(interp, path);
-                    let index = text_index(args[2].as_str(), &content, cursor, &marks)?;
-                    let (line, _col) = match char_to_linecol(&content, index).split_once('.') {
-                        Some((line, col)) => (
-                            line.parse::<usize>().unwrap_or(1),
-                            col.parse::<usize>().unwrap_or(0),
-                        ),
-                        None => (1, 0),
+                    // Tk caps a column past its logical line's length at
+                    // that length (dlineinfo 3.5 of a 1-char line 3 is
+                    // 3.1); the virtual end line still shows nothing.
+                    let requested = text_index(args[2].as_str(), &content, cursor, &marks)?;
+                    let total = content.chars().count();
+                    let logical_lines = content.split('\n').count();
+                    let (index, line_no) = if requested >= total {
+                        let (line_no, _) = char_to_linecol(&content, total.saturating_sub(1))
+                            .split_once('.')
+                            .map(|(line, _)| {
+                                (line.parse::<usize>().unwrap_or(1), 0usize)
+                            })
+                            .unwrap_or((1, 0));
+                        let wanted = args[2]
+                            .as_str()
+                            .split('.')
+                            .next()
+                            .and_then(|line| line.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        if wanted > logical_lines {
+                            return Ok(Value::from_str(""));
+                        }
+                        // The last character of the requested line.
+                        let line_text = content.split('\n').nth(wanted - 1).unwrap_or("");
+                        let before = content
+                            .split('\n')
+                            .take(wanted - 1)
+                            .map(|line| line.chars().count() + 1)
+                            .sum::<usize>();
+                        (
+                            before + line_text.chars().count().saturating_sub(1),
+                            wanted,
+                        )
+                    } else {
+                        let (line_no, _) = char_to_linecol(&content, requested)
+                            .split_once('.')
+                            .map(|(line, _)| {
+                                (line.parse::<usize>().unwrap_or(1), 0usize)
+                            })
+                            .unwrap_or((1, 0));
+                        (requested, line_no)
                     };
-                    let lines = content.matches('\n').count() + 1;
-                    if line > lines {
+                    let display = text_display_lines(interp, path, &content);
+                    let Some(number) = display
+                        .iter()
+                        .position(|(start, end, _)| index >= *start && index < *end)
+                        .map(|at| at + 1)
+                    else {
                         return Ok(Value::from_str(""));
-                    }
+                    };
                     // Tk hides lines scrolled out of view; our model keeps
                     // the top at fraction 0, so lines past `-height` are
                     // not displayed.
@@ -1174,15 +1212,12 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         .parse::<usize>()
                         .unwrap_or(10)
                         .max(1);
-                    if line > visible {
+                    if number > visible {
                         return Ok(Value::from_str(""));
                     }
-                    // The display line's own text, measured when the
-                    // backend provides font metrics (Tk returns the line's
-                    // extents, not the widget's width).
-                    let line_text = content.split('\n').nth(line - 1).unwrap_or("");
+                    let (_, _, line_text) = display[number - 1].clone();
                     let (x, y_base, width, height, ascent) =
-                        match font_measure_text(&effective_option(interp, path, "-font"), line_text)
+                        match font_measure_text(&effective_option(interp, path, "-font"), &line_text)
                         {
                             Some(m) => (1.5, 1.5, m.width, m.linespace, m.ascent),
                             None => (
@@ -1193,7 +1228,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                                 14.0,
                             ),
                         };
-                    let y = y_base + (line - 1) as f64 * height;
+                    let y = y_base + (number - 1) as f64 * height;
                     Ok(list_value([
                         format!("{x:.0}"),
                         format!("{y:.0}"),
@@ -2666,12 +2701,27 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
                 .or_else(|| rtcl_tk_core::option_default(node.kind, name).map(str::to_string))
                 .unwrap_or_default()
         };
+        // Text-bearing widgets: Tk measures the whole string, not a
+        // character count.
+        let text_of = |name: &str| {
+            node.options
+                .get(name)
+                .cloned()
+                .or_else(|| rtcl_tk_core::option_default(node.kind, name).map(str::to_string))
+                .unwrap_or_default()
+        };
         let text_units = match node.kind {
             WidgetKind::Label
             | WidgetKind::Button
             | WidgetKind::Menubutton
+            | WidgetKind::Message
             | WidgetKind::Checkbutton
-            | WidgetKind::Radiobutton => opt("-text").chars().count().max(1) as i64,
+            | WidgetKind::Radiobutton => {
+                let text = text_of("-text");
+                font_measure_text(&opt("-font"), &text)
+                    .map(|m| m.width.round() as i64)
+                    .unwrap_or_else(|| text.chars().count().max(1) as i64 * char_width(&opt("-font")) as i64)
+            }
             _ => 0,
         };
         let w_opt = opt("-width").parse::<i64>().unwrap_or(0);
@@ -2733,13 +2783,33 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
                     (8, length)
                 }
             }
-            _ => {
-                let chars = if text_units == 0 {
-                    opt("-text").chars().count() as i64
+            // Text-bearing widgets: text_units is the measured pixel width
+            // of the whole string; the chrome is Tk's own per widget
+            // (label 2, button 14 — its default padding and border).
+            WidgetKind::Label => ((text_units.max(4) + 2).max(4), 24),
+            WidgetKind::Message => {
+                // A message wraps at `-width` pixels (0: natural width),
+                // so the request is the widest wrapped line.
+                let width_opt = opt("-width").parse::<i64>().unwrap_or(0);
+                let natural = text_units.max(4);
+                if width_opt > 0 && natural > width_opt {
+                    let lines = ((natural + width_opt - 1) / width_opt).max(1);
+                    (width_opt, lines * 24)
                 } else {
-                    text_units
-                };
-                (chars.max(1) * 7 + 16, 24)
+                    (natural, 24)
+                }
+            }
+            WidgetKind::Button | WidgetKind::Menubutton => {
+                (text_units.max(1) + 14, 24)
+            }
+            WidgetKind::Checkbutton | WidgetKind::Radiobutton => {
+                // Tk adds the indicator (~20 px) beside the text.
+                (text_units.max(1) + 22, 24)
+            }
+            _ => {
+                // text_units is a measured pixel width for text widgets;
+                // the chrome constant covers the border and padding.
+                (text_units.max(1) + 16, 24)
             }
         };
         let padx: i64 = opt("-padx").parse().unwrap_or(0);
@@ -13077,6 +13147,95 @@ fn text_elided_ranges(interp: &Interp, path: &str, content: &str) -> Vec<(usize,
     ranges
 }
 
+/// The display lines of a text widget's content under its `-wrap` mode:
+/// `(start char offset, end char offset, text)`.  Tk wraps at the widget's
+/// width (`-width` characters measured with the "0" advance), breaking
+/// words at spaces (`word`), anywhere (`char`) or never (`none`); a word
+/// wider than the line stands alone, as Tk's does.
+fn text_display_lines(
+    interp: &Interp,
+    path: &str,
+    content: &str,
+) -> Vec<(usize, usize, String)> {
+    let font = effective_option(interp, path, "-font");
+    let wrap = effective_option(interp, path, "-wrap");
+    let chars_w = effective_option(interp, path, "-width")
+        .parse::<usize>()
+        .unwrap_or(80)
+        .max(1);
+    let width_px = (chars_w as f64 * char_width(&font)).round();
+    let measure = |text: &str| {
+        font_measure_text(&font, text)
+            .map(|m| m.width)
+            .unwrap_or_else(|| text.chars().count() as f64 * 8.0)
+    };
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for logical in content.split('\n') {
+        let logical_chars = logical.chars().count();
+        match wrap.as_str() {
+            "none" => out.push((start, start + logical_chars, logical.to_string())),
+            "char" => {
+                let mut at = 0usize;
+                let chars: Vec<char> = logical.chars().collect();
+                while at < logical_chars {
+                    let mut take = logical_chars - at;
+                    while take > 1
+                        && measure(&chars[at..at + take].iter().collect::<String>()) > width_px
+                    {
+                        take -= 1;
+                    }
+                    out.push((
+                        start + at,
+                        start + at + take,
+                        chars[at..at + take].iter().collect(),
+                    ));
+                    at += take;
+                }
+                if logical_chars == 0 {
+                    out.push((start, start, String::new()));
+                }
+            }
+            // "word": greedy fill, breaking at spaces; a word that does
+            // not fit stands alone on its line.
+            _ => {
+                let chars: Vec<char> = logical.chars().collect();
+                let mut line_at = 0usize;
+                let mut line_width = 0.0f64;
+                let mut index = 0usize;
+                while index < logical_chars {
+                    // A word runs to the next space (or the end).
+                    let begin = index;
+                    while index < logical_chars && chars[index] != ' ' {
+                        index += 1;
+                    }
+                    let word_w =
+                        measure(&chars[begin..index].iter().collect::<String>());
+                    let space_w = if line_at == begin { 0.0 } else { measure(" ") };
+                    if line_at != begin && line_width + space_w + word_w > width_px {
+                        // The line ends before the space that precedes
+                        // this word.
+                        let text: String = chars[line_at..begin - 1].iter().collect();
+                        out.push((start + line_at, start + begin - 1, text));
+                        line_at = begin;
+                        line_width = word_w;
+                    } else {
+                        line_width += space_w + word_w;
+                    }
+                    // The separating space belongs to the current line.
+                    if index < logical_chars && chars[index] == ' ' {
+                        index += 1;
+                    }
+                }
+                let text: String = chars[line_at..].iter().collect();
+                out.push((start + line_at, start + logical_chars, text));
+            }
+        }
+        start += logical_chars + 1;
+    }
+    out
+}
+
 fn text_search_region(
     chars: &[char],
     pattern: &str,
@@ -14995,6 +15154,40 @@ mod tests {
         assert!(!menu_open_sibling(true));
         assert!(!menu_menubar_mnemonic('f') || open_menu().is_some());
         menu_open_close();
+    }
+
+    #[test]
+    fn text_wrap_display_lines_partition_the_content() {
+        let mut i = Interp::new();
+        install(&mut i);
+        eval(&mut i, "text .t -width 20 -wrap word");
+        eval(&mut i, ".t insert end {one two three four five six seven}");
+        let (content, _) = text_state(&i, ".t");
+        let lines = text_display_lines(&i, ".t", &content);
+        // Word wrap at the measured width: whole words, no overlap, the
+        // ranges partitioning the content (the newline excluded).
+        for window in lines.windows(2) {
+            assert!(window[0].1 <= window[1].0, "overlapping {lines:?}");
+        }
+        assert_eq!(lines.last().unwrap().1, content.chars().count());
+        for (start, end, text) in &lines {
+            assert_eq!(
+                content.chars().skip(*start).take(end - start).collect::<String>(),
+                *text
+            );
+        }
+        // dlineinfo follows the display lines: the second wrapped chunk
+        // of the single logical line is still addressed as 1.<col>, and
+        // its y grows by the display line height.
+        let first = eval(&mut i, ".t dlineinfo 1.0");
+        let second = eval(&mut i, ".t dlineinfo 1.21");
+        let first_width: i64 = first.split(' ').nth(2).unwrap().parse().unwrap();
+        let second_y: i64 = second.split(' ').nth(1).unwrap().parse().unwrap();
+        let first_height: i64 = first.split(' ').nth(3).unwrap().parse().unwrap();
+        assert_eq!(second_y, 3 + first_height);
+        assert!(first_width > 0);
+        // Past the content: the virtual end line shows nothing.
+        assert_eq!(eval(&mut i, ".t dlineinfo 5.0"), "");
     }
 
     #[test]

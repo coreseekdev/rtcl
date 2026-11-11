@@ -604,7 +604,20 @@ Xft 377 个，枚举差异）；`font configure` 无参按 Tk 顺序报配置值
 doesn't exist/already exists）。`font actual` 的 `-family` 对
 "Courier" 报 pango 规范名 Nimbus Mono PS（Tk 保留请求名）——单一家
 族命名差异，记录在案。度量对照 127/127 在容差内；九标准字体的
-actual/fixed 与 wish 逐字节一致。**几何域 wish 对照（2026-11-11，specs/tk/geometry.tcl +
+actual/fixed 与 wish 逐字节一致。**text 换行显示行模型（2026-11-11）**：runtime 新增
+`text_display_lines`（内容 + `-wrap` none/char/word + `-width` 字符
+× 实测 "0" 宽 = 折行像素宽）——word 贪心断词（词间空格属于当前行，
+行尾空格吞掉）、char 按像素切块、none 恒等；`dlineinfo` 走显示行：
+按字符偏移定位显示行，宽度/linespace/ascent 按该显示行文本实测
+（此前按逻辑行——wrap word 下语义就错了），列超界截断到逻辑行长
+（Tk 语义：3.5 的 1 字符行=3.1），虚拟 end 行仍返回空。label/button/
+menubutton/checkbutton/radiobutton/message 的 `winfo reqwidth` 从
+"字符数 × 7" 改为**整串实测宽** + Tk 各自的 chrome（label +2 最低
+4、button/menubutton +14、check/radio +22 指示器、message 按
+`-width` 折行取最宽行/行数）——与 wish 对到 ±1.5 逻辑像素。
+`text_display_lines` 的贪心断词经 partition 单测锁定（无重叠、区间
+覆盖内容、dlineinfo 随显示行移动、虚拟 end 行为空）。
+**几何域 wish 对照（2026-11-11，specs/tk/geometry.tcl +
 compare-geo.tcl，已并入 run.sh 第二遍）**：canvas text bbox、text
 `dlineinfo`（三条真实行 + 越界行）、entry/listbox `winfo reqwidth`，
 三种字体。发现并修：`dlineinfo` 此前按控件列数×7 报宽度、18px 行高

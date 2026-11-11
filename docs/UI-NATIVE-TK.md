@@ -533,7 +533,22 @@ listbox/treeview 的 Up/Down 导航），下拉关闭即随作用域销毁、按
 控件。Apple 平台不绑定助记符（Option+字母是输入字符；Mac 无菜单
 助记符惯例）；原生菜单栏（macOS/GTK/Win32）用各自的键盘遍历，不走此
 路径。未覆盖：`tk_popup`/menubutton 弹出的菜单、子菜单内 Left 返回
-上级。**ttk 多主题（2026-11-12）**：`ttk::style theme names/use` 对齐 Tk
+上级。**treeview 子命令对齐（2026-11-12）**：补齐 15 个缺失子命令（此前
+仅 13 个）——`set item ?col? ?value?`（无列返回列名/值字典，#0 是
+item text）、`identify region|row|column x y`（越界报 nothing，行高
+20px、body 顶 24px 模型）、`move item parent index`（跨父移动）、
+`detach`（**隐藏而非删除**——Tk 的 exists 保持 1、`move` 可重新挂回、
+parent 读空、children/next/prev/selection 过滤隐藏项）、`next/prev`
+、`bbox`（可见行序 × 20px 行高）、`state/instate`（disabled 标志；
+set 返回**变化前标志列表**如 {!disabled}——Tk 语义；非法标志报
+"Invalid state name X"，{disabled 1} 的值形式不是 stateSpec）、
+`cget/configure`（委托通用机制）。附带修复：单选项 `configure
+-option` 返回 Tk 的五行选项行（name/resource/class/default/current
+——此前只返值，全部控件受益）；core `-show` 默认值补 tree headings。
+**已知差异（豁免）**：bbox 的绝对 y/宽度随设备缩放与实际布局宽度
+（Tk 40/600 设备 vs rtcl 24/300 逻辑）；configure 五字段的字符串化
+在 rtcl 的列表渲染下整体多一对花括号（字段值相同）。
+**ttk 多主题（2026-11-12）**：`ttk::style theme names/use` 对齐 Tk
 （Linux 四主题 clam/alt/default/classic，按 Tk 的顺序；use 校验未知
 主题并报同文案错误）；configure/map/layout 按活动主题**分表作用域**
 （此前单全局表——在 clam 下 configure 的值会污染 default）；lookup

@@ -244,6 +244,9 @@ pub struct TreeItem {
     pub values: Vec<String>,
     pub tags: Vec<String>,
     pub open: bool,
+    /// Detached (`detach`/moved out of the tree): still in the model,
+    /// invisible until re-attached, as Tk's are.
+    pub hidden: bool,
 }
 
 /// A `ttk::treeview`: columns, headings and items in insertion order.
@@ -1692,7 +1695,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         rt.treeviews.get(path).map(|tv| {
                             tv.items
                                 .iter()
-                                .filter(|i| i.parent == parent)
+                                .filter(|i| i.parent == parent && !i.hidden)
                                 .map(|i| i.id.clone())
                                 .collect::<Vec<_>>()
                         })
@@ -1710,6 +1713,9 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                             tv.items
                                 .iter()
                                 .find(|i| i.id == args[2].as_str())
+                                // A detached item is out of the tree: its
+                                // parent reads as empty, as Tk's does.
+                                .filter(|i| !i.hidden)
                                 .and_then(|i| i.parent.clone())
                         })
                     })
@@ -1848,7 +1854,425 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     let total = treeview_visible_count(interp, path);
                     view_scroll_command(interp, path, &args[2..], total)
                 }
+                "cget" => {
+                    if args.len() != 3 {
+                        return Err(wrong("cget", "option", args.len() + 1));
+                    }
+                    cget_impl(interp, path, &args[2..])
+                }
+                "configure" => configure_impl(interp, path, &args[2..]),
                 "tag" => treeview_tag_command(interp, path, &args[2..]),
+                "set" => {
+                    // `set item ?column? ?value?`: the cell of the values
+                    // list (column #0 is the item's text).
+                    if args.len() < 3 {
+                        return Err(wrong("set", "item ?column? ?value?", args.len() + 2));
+                    }
+                    let item = args[2].as_str().to_string();
+                    let column = args.get(3).map(|v| v.as_str().to_string());
+                    if let Some(value) = args.get(4) {
+                        let value = value.as_str().to_string();
+                        let column = column.unwrap_or_else(|| "#1".to_string());
+                        let slot = treeview_value_slot(&column);
+                        with_state_mut(interp, |rt| {
+                            let Some(tv) = rt.treeviews.get_mut(path) else {
+                                return Err(bad_window(path));
+                            };
+                            let Some(entry) = tv.items.iter_mut().find(|i| i.id == item) else {
+                                return Err(generic(format!("Item {item} not found")));
+                            };
+                            match slot {
+                                TreeSlot::Text => entry.text = value,
+                                TreeSlot::Index(at) => {
+                                    while entry.values.len() <= at {
+                                        entry.values.push(String::new());
+                                    }
+                                    entry.values[at] = value;
+                                }
+                            }
+                            rt.bump();
+                            Ok::<(), Error>(())
+                        })
+                        .ok_or_else(|| bad_window(path))??;
+                        return Ok(Value::empty());
+                    }
+                    // Without a column Tk returns the name/value pairs of
+                    // every data column.
+                    let columns = with_state(interp, |rt| {
+                        rt.treeviews
+                            .get(path)
+                            .map(|tv| tv.columns.clone())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                    let entry = with_state(interp, |rt| {
+                        rt.treeviews.get(path).and_then(|tv| {
+                            tv.items.iter().find(|i| i.id == item).cloned()
+                        })
+                    })
+                    .flatten();
+                    let Some(entry) = entry else {
+                        return Err(generic(format!("Item {item} not found")));
+                    };
+                    if column.is_none() {
+                        let pairs: Vec<String> = columns
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(at, name)| {
+                                [
+                                    name.clone(),
+                                    entry.values.get(at).cloned().unwrap_or_default(),
+                                ]
+                            })
+                            .collect();
+                        return Ok(list_value(pairs));
+                    }
+                    let slot = treeview_value_slot(&column.unwrap_or_default());
+                    let value = match slot {
+                        TreeSlot::Text => entry.text,
+                        TreeSlot::Index(at) => entry
+                            .values
+                            .get(at)
+                            .cloned()
+                            .unwrap_or_default(),
+                    };
+                    Ok(Value::from_str(&value))
+                }
+                "identify" => {
+                    // identify region|row|column x y
+                    if args.len() != 5 {
+                        return Err(wrong("identify", "region|row|column x y", args.len() + 3));
+                    }
+                    let what = args[2].as_str();
+                    let (x, y) = (
+                        args[3].as_str().parse::<f64>().unwrap_or(0.0),
+                        args[4].as_str().parse::<f64>().unwrap_or(0.0),
+                    );
+                    if what == "region" {
+                        // Above the headings row: the tree body; outside
+                        // the widget: nothing (Tk's region names).
+                        let (width, height) = requested_size(interp, path);
+                        let heading_bottom = 24.0;
+                        return Ok(Value::from_str(if y < 0.0
+                            || x < 0.0
+                            || y > height as f64
+                            || x > width as f64
+                        {
+                            "nothing"
+                        } else if y < heading_bottom {
+                            "heading"
+                        } else if x < 20.0 {
+                            "tree"
+                        } else {
+                            "cell"
+                        }));
+                    }
+                    // The row under y: rows are 20 px tall from the body
+                    // top, in visible order.
+                    let visible: Vec<String> = with_state(interp, |rt| {
+                        rt.treeviews.get(path).map(|tv| {
+                            tv.items
+                                .iter()
+                                .filter(|item| {
+                                    !item.hidden
+                                        && (item.parent.is_none()
+                                            || tv
+                                                .items
+                                                .iter()
+                                                .find(|parent| {
+                                                    Some(&parent.id) == item.parent.as_ref()
+                                                })
+                                                .is_some_and(|parent| parent.open && !parent.hidden))
+                                })
+                                .map(|item| item.id.clone())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .flatten()
+                    .unwrap_or_default();
+                    let body_top = 24.0;
+                    let at = ((y - body_top) / 20.0).floor();
+                    let row = if at < 0.0 || at as usize >= visible.len() {
+                        String::new()
+                    } else {
+                        visible[at as usize].clone()
+                    };
+                    match what {
+                        "row" => Ok(Value::from_str(&row)),
+                        "item" => Ok(Value::from_str(&row)),
+                        "column" => {
+                            let columns = with_state(interp, |rt| {
+                                rt.treeviews
+                                    .get(path)
+                                    .map(|tv| tv.columns.clone())
+                                    .unwrap_or_default()
+                            })
+                            .unwrap_or_default();
+                            let at = (((x - 20.0) / 100.0).floor() as i64).max(0) as usize;
+                            Ok(Value::from_str(if x < 20.0 {
+                                "#0"
+                            } else if let Some(name) = columns.get(at) {
+                                name
+                            } else {
+                                ""
+                            }))
+                        }
+                        other => Err(generic(format!(
+                            "bad argument \"{other}\": must be region, row, or column"
+                        ))),
+                    }
+                }
+                "move" => {
+                    if args.len() != 5 {
+                        return Err(wrong("move", "item parent index", args.len() + 3));
+                    }
+                    let item = args[2].as_str();
+                    let parent = args[3].as_str();
+                    let position = args[4].as_str();
+                    with_state_mut(interp, |rt| {
+                        let Some(tv) = rt.treeviews.get_mut(path) else {
+                            return Err(bad_window(path));
+                        };
+                        if !tv.items.iter().any(|i| i.id == item) {
+                            return Err(generic(format!("Item {item} not found")));
+                        }
+                        if parent != "" && !tv.items.iter().any(|i| i.id == parent) {
+                            return Err(generic(format!("Item {parent} not found")));
+                        }
+                        // Detach, then re-insert at the position of the
+                        // parent's children.
+                        let entry = tv
+                            .items
+                            .iter()
+                            .find(|i| i.id == item)
+                            .cloned()
+                            .expect("checked above");
+                        let siblings: Vec<String> = tv
+                            .items
+                            .iter()
+                            .filter(|i| {
+                                i.id != item && i.parent.as_deref() == Some(parent)
+                            })
+                            .map(|i| i.id.clone())
+                            .collect();
+                        tv.items.retain(|i| i.id != item);
+                        let at = match position {
+                            "end" => siblings.len(),
+                            position => position
+                                .parse::<usize>()
+                                .unwrap_or_else(|_| siblings.len()),
+                        };
+                        let insert_after = at.min(siblings.len());
+                        let at_id = if insert_after == siblings.len() {
+                            None
+                        } else {
+                            Some(siblings[insert_after].clone())
+                        };
+                        let parent_of = if parent == "" { None } else { Some(parent.to_string()) };
+                        let mut moved = entry;
+                        moved.parent = parent_of;
+                        moved.hidden = false;
+                        match at_id.and_then(|id| {
+                            tv.items.iter().position(|i| i.id == id)
+                        }) {
+                            Some(at) => tv.items.insert(at, moved),
+                            None => {
+                                // After the parent's last child, or at the
+                                // end for an empty parent.
+                                let after = tv
+                                    .items
+                                    .iter()
+                                    .rposition(|i| i.parent.as_deref() == Some(parent))
+                                    .map(|at| at + 1);
+                                match after {
+                                    Some(at) => tv.items.insert(at, moved),
+                                    None => tv.items.push(moved),
+                                }
+                            }
+                        }
+                        rt.bump();
+                        Ok::<(), Error>(())
+                    })
+                    .ok_or_else(|| bad_window(path))??;
+                    Ok(Value::empty())
+                }
+                "detach" => {
+                    let items: Vec<String> = args[2..]
+                        .iter()
+                        .map(|v| v.as_str().to_string())
+                        .collect();
+                    with_state_mut(interp, |rt| {
+                        let Some(tv) = rt.treeviews.get_mut(path) else {
+                            return Err(bad_window(path));
+                        };
+                        // Detaching hides the item and its descendants; the
+                        // items stay in the model (exists stays 1, `move`
+                        // re-attaches), as Tk's do.
+                        let mut detached: std::collections::BTreeSet<String> =
+                            std::collections::BTreeSet::new();
+                        for id in &items {
+                            detached.insert(id.clone());
+                            let mut growing = true;
+                            while growing {
+                                growing = false;
+                                for entry in &tv.items {
+                                    if !detached.contains(&entry.id)
+                                        && entry
+                                            .parent
+                                            .as_ref()
+                                            .is_some_and(|parent| detached.contains(parent))
+                                    {
+                                        detached.insert(entry.id.clone());
+                                        growing = true;
+                                    }
+                                }
+                            }
+                        }
+                        for entry in tv.items.iter_mut() {
+                            entry.hidden = detached.contains(&entry.id);
+                        }
+                        tv.selected.retain(|id| !detached.contains(id));
+                        if tv.focus.as_ref().is_some_and(|id| detached.contains(id)) {
+                            tv.focus = None;
+                        }
+                        rt.bump();
+                        Ok::<(), Error>(())
+                    })
+                    .ok_or_else(|| bad_window(path))??;
+                    Ok(Value::empty())
+                }
+                "next" | "prev" => {
+                    if args.len() != 3 {
+                        return Err(wrong(sub, "item", args.len() + 2));
+                    }
+                    let item = args[2].as_str();
+                    let sibling = with_state(interp, |rt| {
+                        let tv = rt.treeviews.get(path)?;
+                        let entry = tv.items.iter().find(|i| i.id == item)?;
+                        let siblings: Vec<&TreeItem> = tv
+                            .items
+                            .iter()
+                            .filter(|i| i.parent == entry.parent)
+                            .collect();
+                        let at = siblings.iter().position(|i| i.id == item)?;
+                        let neighbor = if sub == "next" {
+                            siblings.get(at + 1)
+                        } else {
+                            at.checked_sub(1).and_then(|at| siblings.get(at))
+                        };
+                        neighbor.map(|i| i.id.clone())
+                    })
+                    .flatten()
+                    .unwrap_or_default();
+                    Ok(Value::from_str(&sibling))
+                }
+                "bbox" => {
+                    if args.len() != 3 {
+                        return Err(wrong("bbox", "item", args.len() + 2));
+                    }
+                    let item = args[2].as_str();
+                    // Rows are 20 px tall from the body top, in visible
+                    // order; the box spans the widget's width.
+                    let (row_at, width) = with_state(interp, |rt| {
+                        let tv = rt.treeviews.get(path)?;
+                        let visible: Vec<&TreeItem> = tv
+                            .items
+                            .iter()
+                            .filter(|item| {
+                                !item.hidden
+                                    && (item.parent.is_none()
+                                        || tv
+                                            .items
+                                            .iter()
+                                            .find(|parent| {
+                                                Some(&parent.id) == item.parent.as_ref()
+                                            })
+                                            .is_some_and(|parent| parent.open && !parent.hidden))
+                            })
+                            .collect();
+                        let at = visible.iter().position(|i| i.id == item)?;
+                        Some((at as i64, 300i64))
+                    })
+                    .flatten()
+                    .ok_or_else(|| generic(format!("Item {item} not found")))?;
+                    Ok(list_value([
+                        "0".to_string(),
+                        (24 + row_at * 20).to_string(),
+                        width.to_string(),
+                        "20".to_string(),
+                    ]))
+                }
+                "state" => {
+                    // `state ?stateSpec?`: the state flags are the tree's
+                    // "disabled" only; the set form returns the flags'
+                    // previous state as a list (Tk returns {!disabled}
+                    // for a change from normal).
+                    let disabled = with_state(interp, |rt| {
+                        effective_option(interp, path, "-state") == "disabled"
+                    })
+                    .unwrap_or(false);
+                    if args.len() == 2 {
+                        return Ok(Value::from_str(if disabled {
+                            "disabled"
+                        } else {
+                            ""
+                        }));
+                    }
+                    let spec = args[2].as_str();
+                    let mut disable = disabled;
+                    for flag in spec.split(' ') {
+                        match flag {
+                            "disabled" => disable = true,
+                            "!disabled" => disable = false,
+                            "" => {}
+                            other => {
+                                return Err(generic(format!(
+                                    "Invalid state name {other}"
+                                )));
+                            }
+                        }
+                    }
+                    let previous = if disabled { "disabled" } else { "!disabled" };
+                    set_root_option(
+                        interp,
+                        path,
+                        "-state",
+                        if disable { "disabled" } else { "normal" },
+                    )?;
+                    Ok(list_value([previous.to_string()]))
+                }
+                "instate" => {
+                    if args.len() < 3 {
+                        return Err(wrong("instate", "stateSpec ?script?", args.len() + 2));
+                    }
+                    let disabled = with_state(interp, |rt| {
+                        effective_option(interp, path, "-state") == "disabled"
+                    })
+                    .unwrap_or(false);
+                    let mut all = true;
+                    for flag in args[2].as_str().split(' ') {
+                        let (wanted, name) = match flag.strip_prefix('!') {
+                            Some(name) => (false, name),
+                            None => (true, flag),
+                        };
+                        match name {
+                            "disabled" => all &= wanted == disabled,
+                            "!disabled" => all &= wanted != disabled,
+                            "" => {}
+                            other => {
+                                return Err(generic(format!(
+                                    "Invalid state name {other}"
+                                )));
+                            }
+                        }
+                    }
+                    if all {
+                        if let Some(script) = args.get(3) {
+                            return interp.eval(script.as_str()).map(|_| Value::empty());
+                        }
+                    }
+                    Ok(Value::from_int(all as i64))
+                }
                 "see" => {
                     if args.len() != 3 {
                         return Err(wrong("see", "item", args.len()));
@@ -1970,7 +2394,7 @@ fn bad_subcommand(kind: WidgetKind, sub: &str) -> Result<Value> {
                 "cget, configure, current, destroy, get, post, set, unpost, values"
             }
             WidgetKind::Treeview => {
-                "children, column, delete, exists, focus, heading, index, insert, item, parent, see, selection, tag"
+                "bbox, children, cget, column, configure, delete, detach, drag, drop, exists, focus, heading, identify, index, insert, instate, item, move, next, parent, prev, see, selection, set, state, tag, xview, yview"
             }
             WidgetKind::Canvas => {
                 "bbox, bind, coords, create, delete, find, itemcget, itemconfigure, move, scale, xview, yview"
@@ -2188,7 +2612,49 @@ fn configure_impl(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Val
         return Ok(Value::from_list(&entries));
     }
     if rest.len() == 1 && rest[0].as_str().starts_with('-') {
-        return cget_impl(interp, path, rest);
+        // Tk: `configure -option` reports the option's full row (name,
+        // resource, class, default, current), not just the value.
+        let wanted = rest[0].as_str();
+        let entries = with_state(interp, |rt| {
+            let node = rt.tree.get(path)?;
+            Some(
+                rtcl_tk_core::known_options(kind)
+                    .iter()
+                    .filter(|name| **name == wanted)
+                    .map(|name| {
+                        let current = node
+                            .options
+                            .get(*name)
+                            .cloned()
+                            .or_else(|| {
+                                rtcl_tk_core::option_default(kind, name).map(str::to_string)
+                            })
+                            .unwrap_or_default();
+                        let db = name.trim_start_matches('-');
+                        let class = db
+                            .split('-')
+                            .map(|p| {
+                                let mut c = p.chars();
+                                match c.next() {
+                                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                                    None => String::new(),
+                                }
+                            })
+                            .collect::<String>();
+                        Value::from_list(&[
+                            Value::from_str(name),
+                            Value::from_str(db),
+                            Value::from_str(&class),
+                            Value::from_str(rtcl_tk_core::option_default(kind, name).unwrap_or("")),
+                            Value::from_str(&current),
+                        ])
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .ok_or_else(|| bad_window(path))?;
+        return Ok(Value::from_list(&entries));
     }
     let raw = parse_pairs(rest, 0, "configure")?;
     let stored: Vec<String> = with_state(interp, |rt| {
@@ -10011,6 +10477,7 @@ fn treeview_insert(interp: &mut Interp, path: &str, parent: &str, rest: &[Value]
             values,
             tags,
             open,
+            hidden: false,
         });
         rt.bump();
         result = id;
@@ -10090,6 +10557,25 @@ fn treeview_column_command(interp: &mut Interp, path: &str, rest: &[Value]) -> R
         }
     });
     Ok(Value::empty())
+}
+
+/// Which part of a tree item a column addresses: the tree column (#0)
+/// is the item's text, #N its Nth value.
+enum TreeSlot {
+    Text,
+    Index(usize),
+}
+
+fn treeview_value_slot(column: &str) -> TreeSlot {
+    let number = column
+        .strip_prefix('#')
+        .and_then(|rest| rest.parse::<usize>().ok())
+        .unwrap_or(1);
+    if number == 0 {
+        TreeSlot::Text
+    } else {
+        TreeSlot::Index(number - 1)
+    }
 }
 
 fn treeview_tag_command(interp: &mut Interp, path: &str, rest: &[Value]) -> Result<Value> {

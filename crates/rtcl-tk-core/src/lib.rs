@@ -1361,7 +1361,11 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
             WidgetKind::Button | WidgetKind::Checkbutton | WidgetKind::Radiobutton => "center",
             _ => "left",
         },
-        "-wraplength" | "-overrelief" | "-image" | "-bitmap" | "-show" => "",
+        "-wraplength" | "-overrelief" | "-image" | "-bitmap" => "",
+        "-show" => match kind {
+            WidgetKind::Treeview => "tree headings",
+            _ => "",
+        },
         "-compound" => "none",
         "-underline" => "-1",
         "-state" => "normal",

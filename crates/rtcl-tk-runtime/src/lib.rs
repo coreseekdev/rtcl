@@ -8911,9 +8911,76 @@ fn menu_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             });
             Ok(Value::empty())
         }
-        "activate" | "yposition" | "xposition" => Ok(Value::from_int(0)),
+        "activate" => Ok(Value::from_int(0)),
+        // Tk's x/yposition for an unposted menu: entries sit at 1
+        // (clamped, whatever the index).
+        "yposition" | "xposition" => Ok(Value::from_int(1)),
+        "postcascade" => {
+            // Posts the cascade at index: non-cascades (or a bad index)
+            // are Tk errors/no-ops as probed.
+            if args.len() != 3 {
+                return Err(wrong("postcascade", "index", args.len() + 2));
+            }
+            let index: usize = args[2]
+                .as_str()
+                .parse()
+                .map_err(|_| generic(format!("bad menu entry index \"{}\"", args[2].as_str())))?;
+            let target = with_state(interp, |rt| {
+                rt.menus.get(&path).and_then(|menu| {
+                    menu.items.get(index).and_then(|item| {
+                        (item.kind == "cascade")
+                            .then(|| item.options.get("-menu").cloned().unwrap_or_default())
+                    })
+                })
+            })
+            .flatten();
+            if let Some(sub) = target.filter(|sub| !sub.is_empty()) {
+                with_state_mut(interp, |rt| {
+                    rt.open_menu = Some(sub);
+                    rt.bump();
+                });
+            }
+            Ok(Value::empty())
+        }
+        "clone" => {
+            // `clone newname ?menuType?`: a full copy under a new window
+            // path (menubar/tearoff clones share the entries).
+            if args.len() < 3 || args.len() > 4 {
+                return Err(wrong("clone", "newname ?menuType?", args.len() + 2));
+            }
+            let new_name = args[2].as_str();
+            let kind = args.get(3).map(|v| v.as_str().to_string());
+            if let Some(kind) = &kind {
+                if !matches!(kind.as_str(), "normal" | "tearoff" | "menubar") {
+                    return Err(generic(format!(
+                        "bad menu type \"{kind}\": must be normal, tearoff, or menubar"
+                    )));
+                }
+            }
+            if !new_name.starts_with('.') {
+                return Err(bad_window(new_name));
+            }
+            with_state_mut(interp, |rt| {
+                if rt.menus.contains_key(new_name) {
+                    return Err(bad_window(new_name));
+                }
+                if let Some(menu) = rt.menus.get(&path).cloned() {
+                    let mut menu = menu;
+                    menu.path = new_name.to_string();
+                    if let Some(kind) = &kind {
+                        menu.options.insert("-type".to_string(), kind.clone());
+                    }
+                    rt.menus.insert(new_name.to_string(), menu);
+                }
+                rt.bump();
+                Ok::<(), Error>(())
+            })
+            .ok_or_else(|| bad_window(&path))??;
+            interp.register_command(new_name, menu_command);
+            Ok(Value::empty())
+        }
         other => Err(generic(format!(
-            "bad option \"{other}\": must be activate, add, delete, entrycget, entryconfigure, index, insert, invoke, post, type, unpost, or yposition"
+            "bad option \"{other}\": must be activate, add, cget, clone, configure, delete, entrycget, entryconfigure, index, insert, invoke, post, postcascade, type, unpost, xposition, or yposition"
         ))),
     }
 }

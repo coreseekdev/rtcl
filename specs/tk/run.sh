@@ -95,4 +95,24 @@ if [ -n "$wi_diff" ]; then
     geo=1
 fi
 
+# Sixth pass: every widget's subcommand list + the menu surface
+# (clone/postcascade/x/yposition), exact diff.
+timeout 60 wish specs/tk/subcommands.tcl > "$out/sc-tk.out" 2> "$out/sc-tk.err" \
+    || { echo "tk: wish subcommands failed" >&2; cat "$out/sc-tk.err" >&2; exit 2; }
+timeout 60 "$PROBE" specs/tk/subcommands.tcl > "$out/sc-rtcl.out" 2> "$out/sc-rtcl.err" \
+    || { echo "tk: tkprobe subcommands failed" >&2; cat "$out/sc-rtcl.err" >&2; exit 2; }
+timeout 60 wish specs/tk/menu-surface.tcl > "$out/mn-tk.out" 2> "$out/mn-tk.err" \
+    || { echo "tk: wish menu failed" >&2; cat "$out/mn-tk.err" >&2; exit 2; }
+timeout 60 "$PROBE" specs/tk/menu-surface.tcl > "$out/mn-rtcl.out" 2> "$out/mn-rtcl.err" \
+    || { echo "tk: tkprobe menu failed" >&2; cat "$out/mn-rtcl.err" >&2; exit 2; }
+sc_diff=$(diff \
+    <(tr -d '\r' < "$out/sc-tk.out"; tr -d '\r' < "$out/mn-tk.out") \
+    <(tr -d '\r' < "$out/sc-rtcl.out"; tr -d '\r' < "$out/mn-rtcl.out") \
+    || true)
+if [ -n "$sc_diff" ]; then
+    printf '%s\n' "$sc_diff"
+    echo "tk: subcommand surfaces differ"
+    geo=1
+fi
+
 if [ "$metrics" -ne 0 ] || [ "$geo" -ne 0 ]; then exit 1; fi

@@ -548,6 +548,15 @@ set 返回**变化前标志列表**如 {!disabled}——Tk 语义；非法标志
 **已知差异（豁免）**：bbox 的绝对 y/宽度随设备缩放与实际布局宽度
 （Tk 40/600 设备 vs rtcl 24/300 逻辑）；configure 五字段的字符串化
 在 rtcl 的列表渲染下整体多一对花括号（字段值相同）。
+**全控件子命令面对照（2026-11-12，specs/tk/subcommands.tcl +
+menu-surface.tcl，run.sh 第六遍）**：14 个控件的"未知子命令"错误清
+单逐字节 diff（entry/text/listbox/canvas/scale/scrollbar/message/
+spinbox/labelframe/notebook/combobox/progressbar/menubutton/menu）
+——13 个已一致，menu 补了三个子命令：`xposition/yposition`（未 post
+的菜单条目位于 x/y=1，索引钳制不报错）、`postcascade index`（级联
+项打开其子菜单进 open_menu、非级联与坏索引按 Tk 报错/忽略）、
+`clone newname ?normal|tearoff|menubar?`（完整复制菜单到新窗口路径
+——类型校验先于路径校验，注册同名命令）；未知子命令错误清单同步。
 **winfo 家族对照（2026-11-12，specs/tk/winfo.tcl，run.sh 第五遍）**：
 补齐/修正——`winfo toplevel` 走链到**最近的 toplevel 祖先**（此前一
 路走到 "."）；`winfo manager` 对 root/toplevel 报 "wm"；`winfo

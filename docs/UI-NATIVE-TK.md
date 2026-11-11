@@ -533,7 +533,14 @@ listbox/treeview 的 Up/Down 导航），下拉关闭即随作用域销毁、按
 控件。Apple 平台不绑定助记符（Option+字母是输入字符；Mac 无菜单
 助记符惯例）；原生菜单栏（macOS/GTK/Win32）用各自的键盘遍历，不走此
 路径。未覆盖：`tk_popup`/menubutton 弹出的菜单、子菜单内 Left 返回
-上级。**treeview 子命令对齐（2026-11-12）**：补齐 15 个缺失子命令（此前
+上级。**treeview drag/drop 对照（2026-11-12，specs/tk/dnd.tcl，run.sh
+第七遍）**：Tk 8.6.17 的交互式表头拖拽子命令——`drag column
+xposition`（列右缘拖到 x 位置：宽度 = x − 前序列宽含树列，负值钳 1
+——Tk 的公式依赖实时控件宽度，模型用前序列宽近似）、`drop`（无参
+即完成拖拽；带参报 wrong # args）；错误文案逐字对齐（列校验先于整
+数解析、`Invalid column index X`、wrong # args 带完整窗口路径）。
+已知差异：拖拽的精确宽度分配依赖 Tk 的实时控件宽度（随屏幕缩放与
+布局变化），rtcl 用模型宽度近似。**treeview 子命令对齐（2026-11-12）**：补齐 15 个缺失子命令（此前
 仅 13 个）——`set item ?col? ?value?`（无列返回列名/值字典，#0 是
 item text）、`identify region|row|column x y`（越界报 nothing，行高
 20px、body 顶 24px 模型）、`move item parent index`（跨父移动）、

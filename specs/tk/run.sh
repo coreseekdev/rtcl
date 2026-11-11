@@ -115,7 +115,23 @@ if [ -n "$sc_diff" ]; then
     geo=1
 fi
 
-# Seventh pass: the wm command surface + tkwait forms, exact diff.  The
+# Seventh pass: treeview column drag/drop (Tk 8.6.17's interactive
+# heading-drag subcommands), exact diff.
+timeout 60 wish specs/tk/dnd.tcl > "$out/dd-tk.out" 2> "$out/dd-tk.err" \
+    || { echo "tk: wish dnd failed" >&2; cat "$out/dd-tk.err" >&2; exit 2; }
+timeout 60 "$PROBE" specs/tk/dnd.tcl > "$out/dd-rtcl.out" 2> "$out/dd-rtcl.err" \
+    || { echo "tk: tkprobe dnd failed" >&2; cat "$out/dd-rtcl.err" >&2; exit 2; }
+dd_diff=$(diff \
+    <(tr -d '\r' < "$out/dd-tk.out") \
+    <(tr -d '\r' < "$out/dd-rtcl.out") \
+    || true)
+if [ -n "$dd_diff" ]; then
+    printf '%s\n' "$dd_diff"
+    echo "tk: drag/drop differs"
+    geo=1
+fi
+
+# Eighth pass: the wm command surface + tkwait forms, exact diff.  The
 # STACK line is exempt: Tk's stackorder reflects the window manager's
 # stacking of MAPPED windows (a transient-to-root toplevel never maps
 # here); rtcl reports its deterministic tree order.

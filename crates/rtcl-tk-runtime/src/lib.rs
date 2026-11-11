@@ -2141,6 +2141,101 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     .ok_or_else(|| bad_window(path))??;
                     Ok(Value::empty())
                 }
+                "drag" => {
+                    // `drag column xposition`: Tk's interactive heading
+                    // drag — resizes the column so its right edge lands
+                    // at xposition (the widths of preceding columns are
+                    // subtracted; a negative result clamps to 1).
+                    if args.len() != 4 {
+                        return Err(wrong(path, "drag column xposition", args.len() + 2));
+                    }
+                    let column = args[2].as_str();
+                    let exists = with_state(interp, |rt| {
+                        rt.treeviews.get(path).is_some_and(|tv| {
+                            column == "#0"
+                                || tv.columns.iter().any(|name| *name == column)
+                        })
+                    })
+                    .unwrap_or(false);
+                    if !exists {
+                        return Err(generic(format!("Invalid column index {column}")));
+                    }
+                    let Ok(xposition) = args[3].as_str().parse::<i64>() else {
+                        return Err(generic(format!(
+                            "expected integer but got \"{}\"",
+                            args[3].as_str()
+                        )));
+                    };
+                    with_state_mut(interp, |rt| {
+                        let Some(tv) = rt.treeviews.get_mut(path) else {
+                            return Err(bad_window(path));
+                        };
+                        let name_of = |slot: usize| -> String {
+                            if slot == 0 {
+                                "#0".to_string()
+                            } else {
+                                tv.columns
+                                    .get(slot - 1)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("#{slot}"))
+                            }
+                        };
+                        let width_of = |name: &str| -> i64 {
+                            if name == "#0" {
+                                tv.column_options
+                                    .get("#0")
+                                    .and_then(|options| options.get("-width"))
+                                    .and_then(|width| width.parse().ok())
+                                    .unwrap_or(20)
+                            } else {
+                                tv.column_options
+                                    .get(name)
+                                    .and_then(|options| options.get("-width"))
+                                    .and_then(|width| width.parse().ok())
+                                    .unwrap_or(100)
+                            }
+                        };
+                        let mut before = 0i64;
+                        if tv
+                            .column_options
+                            .get("#0")
+                            .is_none_or(|options| options.get("-hide").map(|h| h != "1").unwrap_or(true))
+                        {
+                            before += width_of("#0");
+                        }
+                        for slot in 1.. {
+                            let name = name_of(slot);
+                            if name == column {
+                                break;
+                            }
+                            if tv.columns.iter().any(|existing| *existing == name) || name == "#0" {
+                                before += width_of(&name);
+                            }
+                            if slot > tv.columns.len() + 1 {
+                                break;
+                            }
+                        }
+                        let new_width = (xposition - before).max(1);
+                        let entry = tv
+                            .column_options
+                            .entry(column.to_string())
+                            .or_default();
+                        entry.insert("-width".to_string(), new_width.to_string());
+                        rt.bump();
+                        Ok::<(), Error>(())
+                    })
+                    .ok_or_else(|| bad_window(path))??;
+                    Ok(Value::empty())
+                }
+                "drop" => {
+                    // `drop`: finalizes Tk's interactive column drag.  The
+                    // model applies the resize immediately, so this is a
+                    // no-op; extra arguments are an error, as Tk's.
+                    if args.len() != 2 {
+                        return Err(wrong(path, "drop", args.len() + 2));
+                    }
+                    Ok(Value::empty())
+                }
                 "next" | "prev" => {
                     if args.len() != 3 {
                         return Err(wrong(sub, "item", args.len() + 2));

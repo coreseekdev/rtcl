@@ -3489,6 +3489,16 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let path = args[2].as_str();
             let class = with_state(interp, |rt| {
+                if path == "." {
+                    // Tk derives the root's class from the app name.
+                    let mut chars = rt.app_name.chars();
+                    let name = if rt.app_name.is_empty() {
+                        "Rtcl".to_string()
+                    } else {
+                        chars.next().map(|f| f.to_uppercase()).into_iter().flatten().chain(chars).collect()
+                    };
+                    return Some(name);
+                }
                 rt.tree
                     .get(path)
                     .map(|n| n.widget_class().to_string())
@@ -3527,12 +3537,23 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 })
                 .unwrap_or_default(),
                 "toplevel" => {
+                    // The nearest ancestor that is a toplevel (or the
+                    // window itself) — not the root unless reached.
                     let mut p = path.to_string();
-                    while let Some(parent) =
-                        with_state(interp, |rt| rt.tree.get(&p).and_then(|n| n.parent.clone()))
-                            .flatten()
-                    {
-                        p = parent;
+                    loop {
+                        let (parent, is_toplevel) = with_state(interp, |rt| {
+                            rt.tree.get(&p).map_or((None, true), |n| {
+                                (
+                                    n.parent.clone(),
+                                    n.kind == WidgetKind::Toplevel || p == ".",
+                                )
+                            })
+                        })
+                        .unwrap_or((None, true));
+                        if is_toplevel || parent.is_none() {
+                            break;
+                        }
+                        p = parent.expect("checked above");
                     }
                     p
                 }
@@ -3567,7 +3588,12 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let mapped = with_state(interp, |rt| {
                 rt.menus.contains_key(path)
                     || rt.tree.get(path).is_some_and(|n| {
-                        n.pack.is_some() || n.grid.is_some() || n.place.is_some() || path == "."
+                        n.kind == WidgetKind::Toplevel
+                            && effective_option(interp, path, "-state") != "withdrawn"
+                            || n.pack.is_some()
+                            || n.grid.is_some()
+                            || n.place.is_some()
+                            || path == "."
                     })
             })
             .unwrap_or(false);
@@ -3583,7 +3609,9 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     return Some("");
                 }
                 rt.tree.get(path).map(|n| {
-                    if n.pack.is_some() {
+                    if path == "." || n.kind == WidgetKind::Toplevel {
+                        "wm"
+                    } else if n.pack.is_some() {
                         "pack"
                     } else if n.grid.is_some() {
                         "grid"
@@ -3621,11 +3649,79 @@ fn winfo_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let value = parse_screen_units(args[3].as_str(), tk_scaling());
             Ok(Value::from_int(value.round() as i64))
         }
-        "depth" | "rpixels" | "cells" => Ok(Value::from_int(if sub == "depth" { 24 } else { 0 })),
+        "depth" | "rpixels" => Ok(Value::from_int(if sub == "depth" { 24 } else { 0 })),
+        "cells" => Ok(Value::from_int(256)),
         "visual" => Ok(Value::from_str("truecolor")),
         "server" => Ok(Value::from_str("")),
-        "interps" => Ok(Value::from_str("")),
-        _ => Err(generic(format!("bad option \"{sub}\""))),
+        "geometry" => {
+            if args.len() != 3 {
+                return Err(wrong(&format!("winfo {sub}"), "window", args.len()));
+            }
+            let path = args[2].as_str();
+            let (w, h) = requested_size(interp, path);
+            Ok(Value::from_str(&format!("{w}x{h}+0+0")))
+        }
+        // The layout position is the renderer's to report; the runtime
+        // model packs top-down from +0+0.
+        "x" | "y" | "rootx" | "rooty" => {
+            if args.len() != 3 {
+                return Err(wrong(&format!("winfo {sub}"), "window", args.len()));
+            }
+            Ok(Value::from_int(0))
+        }
+        "id" => {
+            if args.len() != 3 {
+                return Err(wrong(&format!("winfo {sub}"), "window", args.len()));
+            }
+            // A stable synthetic window id (the real one is the
+            // platform's X window / HWND).
+            let mut hash: u32 = 0x811c_9dc5;
+            for byte in args[2].as_str().as_bytes() {
+                hash ^= u32::from(*byte);
+                hash = hash.wrapping_mul(0x0100_0193);
+            }
+            Ok(Value::from_str(&format!("0x{hash:08x}")))
+        }
+        "interps" => {
+            let name = with_state(interp, |rt| {
+                if rt.app_name.is_empty() {
+                    None
+                } else {
+                    Some(rt.app_name.clone())
+                }
+            })
+            .flatten()
+            .unwrap_or_else(|| "rtcl".to_string());
+            Ok(list_value([name]))
+        }
+        "screendepth" | "screencells" => Ok(Value::from_int(
+            if sub == "screendepth" { 24 } else { 256 },
+        )),
+        "screenvisual" => Ok(Value::from_str("truecolor")),
+        "visualsavailable" => Ok(Value::from_str("{{truecolor 24}}")),
+        "colormapfull" => Ok(Value::from_int(0)),
+        "visualid" => Ok(Value::from_str("0x21")),
+        "screenmmwidth" | "screenmmheight" => {
+            // The screen's pixel size at the 96 dpi logical scale, in mm.
+            let pixels = SCREEN_METRICS
+                .with(|cell| cell.get())
+                .map_or(1920, |f| f().0);
+            Ok(Value::from_int(pixels * 254 / 96 / 10))
+        }
+        "vrootx" | "vrooty" => Ok(Value::from_int(0)),
+        "vrootwidth" => Ok(Value::from_int(
+            SCREEN_METRICS.with(|cell| cell.get()).map_or(1920, |f| f().0),
+        )),
+        "vrootheight" => Ok(Value::from_int(
+            SCREEN_METRICS.with(|cell| cell.get()).map_or(1080, |f| f().1),
+        )),
+        // The live pointer position is the platform's to report; the
+        // runtime has no global pointer model, so 0,0.
+        "pointerx" | "pointery" => Ok(Value::from_int(0)),
+        "pointerxy" => Ok(Value::from_str("0 0")),
+        _ => Err(generic(format!(
+            "bad option \"{sub}\": must be cells, children, class, colormapfull, depth, geometry, height, id, ismapped, manager, name, parent, pointerx, pointery, pointerxy, reqheight, reqwidth, rootx, rooty, screen, screencells, screendepth, screenheight, screenwidth, screenmmheight, screenmmwidth, screenvisual, server, toplevel, viewable, visual, visualid, vrootheight, vrootwidth, vrootx, vrooty, width, x, y, atom, atomname, containing, interps, pathname, exists, fpixels, pixels, rgb, or visualsavailable"
+        ))),
     }
 }
 

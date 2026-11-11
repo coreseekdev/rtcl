@@ -548,6 +548,20 @@ set 返回**变化前标志列表**如 {!disabled}——Tk 语义；非法标志
 **已知差异（豁免）**：bbox 的绝对 y/宽度随设备缩放与实际布局宽度
 （Tk 40/600 设备 vs rtcl 24/300 逻辑）；configure 五字段的字符串化
 在 rtcl 的列表渲染下整体多一对花括号（字段值相同）。
+**winfo 家族对照（2026-11-12，specs/tk/winfo.tcl，run.sh 第五遍）**：
+补齐/修正——`winfo toplevel` 走链到**最近的 toplevel 祖先**（此前一
+路走到 "."）；`winfo manager` 对 root/toplevel 报 "wm"；`winfo
+ismapped` 对 toplevel 报 1（除非 withdrawn）；新增 `geometry`
+（{reqw}x{reqh}+0+0——布局位置是渲染器的，运行时模型自 +0+0 起）、
+`x/y/rootx/rooty`（同近似）、`id`（按路径 FNV 合成的稳定假窗口
+id）、`interps`（自身 appname）、`screendepth/screencells/
+screenvisual/screenmm*/colormapfull/visualid/vroot*/visualsavailable/
+pointerx/y/xy`（X 特有的枚举/活指针按近似值报）；未知选项报 Tk 全
+列表原文（含 atom..visualsavailable 尾段）；root 的 class = appname
+首字母大写（Tk 由脚本名派生，机制一致值随 app）。**已知差异（豁
+免）**：root class 值随 app 名；默认字体族差（rtcl TkTextFont=
+DejaVu Sans vs Tk Noto Sans——WID/GEOM 随之 ~6%）；screen 像素值
+随 Xft.dpi（2× 显示 Tk 报设备像素）；X 视觉枚举数量。
 **ttk 多主题（2026-11-12）**：`ttk::style theme names/use` 对齐 Tk
 （Linux 四主题 clam/alt/default/classic，按 Tk 的顺序；use 校验未知
 主题并报同文案错误）；configure/map/layout 按活动主题**分表作用域**

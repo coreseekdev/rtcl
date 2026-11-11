@@ -73,4 +73,26 @@ if [ -n "$sv_diff" ]; then
     geo=1
 fi
 
+# Fifth pass: the winfo family, exact diff after scale normalization.
+# Known environment differences, filtered on both sides: the root
+# window's class (Tk derives it from the script's name), the default
+# font's family (rtcl's TkTextFont is DejaVu Sans, Tk's is Noto Sans —
+# WID/GEOM follow it), the screen's pixel size (Xft.dpi scaling) and
+# X's visuals enumeration.
+timeout 60 wish specs/tk/winfo.tcl > "$out/wi-tk.out" 2> "$out/wi-tk.err" \
+    || { echo "tk: wish winfo failed" >&2; cat "$out/wi-tk.err" >&2; exit 2; }
+timeout 60 "$PROBE" specs/tk/winfo.tcl > "$out/wi-rtcl.out" 2> "$out/wi-rtcl.err" \
+    || { echo "tk: tkprobe winfo failed" >&2; cat "$out/wi-rtcl.err" >&2; exit 2; }
+wi_norm() {
+    tr -d '\r' < "$1" | grep -vE '^CLS|^WID|^GEOM|^SCR|^VIS' | sed \
+        -e 's/[0-9]\+x[0-9]\++0+0/SIZExSIZE+0+0/' \
+        -e 's/bad option "nosuch": must be.*/BAD-OPTION-LIST/'
+}
+wi_diff=$(diff <(wi_norm "$out/wi-tk.out") <(wi_norm "$out/wi-rtcl.out") || true)
+if [ -n "$wi_diff" ]; then
+    printf '%s\n' "$wi_diff"
+    echo "tk: winfo differs"
+    geo=1
+fi
+
 if [ "$metrics" -ne 0 ] || [ "$geo" -ne 0 ]; then exit 1; fi

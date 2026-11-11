@@ -1149,21 +1149,29 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     if line > visible {
                         return Ok(Value::from_str(""));
                     }
-                    // Pixel geometry from the renderer's size model: 7px
-                    // per character column, 18px rows, ascent 14px.
-                    let width = effective_option(interp, path, "-width")
-                        .parse::<usize>()
-                        .unwrap_or(80)
-                        .max(1) as i64
-                        * 7;
-                    let pad = 3;
-                    let y = pad + (line - 1) as i64 * 18;
+                    // The display line's own text, measured when the
+                    // backend provides font metrics (Tk returns the line's
+                    // extents, not the widget's width).
+                    let line_text = content.split('\n').nth(line - 1).unwrap_or("");
+                    let (x, y_base, width, height, ascent) =
+                        match font_measure_text(&effective_option(interp, path, "-font"), line_text)
+                        {
+                            Some(m) => (1.5, 1.5, m.width, m.linespace, m.ascent),
+                            None => (
+                                3.0,
+                                3.0,
+                                line_text.chars().count() as f64 * 8.0,
+                                18.0,
+                                14.0,
+                            ),
+                        };
+                    let y = y_base + (line - 1) as f64 * height;
                     Ok(list_value([
-                        pad.to_string(),
-                        y.to_string(),
-                        width.to_string(),
-                        "18".to_string(),
-                        (y + 14).to_string(),
+                        format!("{x:.0}"),
+                        format!("{y:.0}"),
+                        format!("{width:.0}"),
+                        format!("{height:.0}"),
+                        format!("{:.0}", y + ascent),
                     ]))
                 }
                 "see" => {
@@ -2640,11 +2648,20 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
         };
         let w_opt = opt("-width").parse::<i64>().unwrap_or(0);
         let h_opt = opt("-height").parse::<i64>().unwrap_or(0);
+        // Character-count widths are measured the way Tk sizes them: the
+        // width of "0" in the widget's font (8 px without font metrics).
+        let char_w = char_width(&opt("-font"));
         let (w, h) = match node.kind {
-            WidgetKind::Text => (w_opt.max(1) * 7, h_opt.max(1) * 18),
-            WidgetKind::Listbox => (w_opt.max(1) * 7, h_opt.max(1) * 18),
+            WidgetKind::Text => (
+                (w_opt.max(1) as f64 * char_w).round() as i64 + 3,
+                h_opt.max(1) * 18,
+            ),
+            WidgetKind::Listbox => (
+                (w_opt.max(1) as f64 * char_w).round() as i64 + 2,
+                h_opt.max(1) * 18,
+            ),
             WidgetKind::Entry | WidgetKind::Combobox | WidgetKind::Spinbox => {
-                ((w_opt.max(1) * 7) + 8, 24)
+                ((w_opt.max(1) as f64 * char_w).round() as i64 + 3, 24)
             }
             WidgetKind::Scale => {
                 let length = opt("-length").parse::<i64>().unwrap_or(100);
@@ -11484,7 +11501,9 @@ fn canvas_item_bbox(
             let anchor = item.options.get("-anchor").map_or("center", String::as_str);
             let (dx, dy) = anchor_offset(anchor, width, height);
             let (x, y) = (coords[0] + dx, coords[1] + dy);
-            Some((x, y, x + width, y + height))
+            // Tk's text bounds extend one device pixel past the extents
+            // on each horizontal side (half a logical pixel here).
+            Some((x - 0.5, y, x + width + 0.5, y + height))
         }
         _ if coords.len() >= 2 => {
             let mut min_x = coords[0];
@@ -14605,9 +14624,10 @@ mod tests {
         // bounds outwards).
         eval(&mut i, "canvas .c -width 300 -height 200");
         let id = eval(&mut i, ".c create text 50 50 -text abcd -font {Helvetica 10}");
-        assert_eq!(eval(&mut i, &format!(".c bbox {id}")), "30 43 70 57");
+        // Tk's text bounds extend one device pixel horizontally.
+        assert_eq!(eval(&mut i, &format!(".c bbox {id}")), "29 43 71 57");
         eval(&mut i, &format!(".c itemconfigure {id} -text {{a\nbc}}"));
-        assert_eq!(eval(&mut i, &format!(".c bbox {id}")), "40 37 60 63");
+        assert_eq!(eval(&mut i, &format!(".c bbox {id}")), "39 37 61 63");
     }
 
     #[test]
@@ -15859,8 +15879,10 @@ mod tests {
             &mut i,
             "text .t -width 20 -height 5; .t insert 1.0 \"one\\ntwo\\nthree\"",
         );
-        assert_eq!(eval(&mut i, ".t dlineinfo 1.0"), "3 3 140 18 17");
-        assert_eq!(eval(&mut i, ".t dlineinfo 2.1"), "3 21 140 18 35");
+        // Headless: no font metrics, so the line's characters at the 8 px
+        // approximation over the border-plus-padding origin.
+        assert_eq!(eval(&mut i, ".t dlineinfo 1.0"), "3 3 24 18 17");
+        assert_eq!(eval(&mut i, ".t dlineinfo 2.1"), "3 21 24 18 35");
         assert_eq!(eval(&mut i, ".t dlineinfo 5.0"), "");
         assert_eq!(eval(&mut i, ".t yview"), "0.0 1.0");
         assert_eq!(eval(&mut i, ".t xview"), "0.0 1.0");
@@ -16907,7 +16929,7 @@ mod tests {
         eval(&mut i, &format!(".k itemconfigure {img} -anchor nw"));
         assert_eq!(eval(&mut i, &format!(".k bbox {img}")), "50 50 60 70");
         let label = eval(&mut i, ".k create text 30 40 -text ab");
-        assert_eq!(eval(&mut i, &format!(".k bbox {label}")), "22 32 38 48");
+        assert_eq!(eval(&mut i, &format!(".k bbox {label}")), "21 32 39 48");
         let arc = eval(
             &mut i,
             ".k create arc 0 0 100 50 -start 0 -extent 180 -style arc -outline red",

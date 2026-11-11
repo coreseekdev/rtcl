@@ -563,7 +563,21 @@ Xft 377 个，枚举差异）；`font configure` 无参按 Tk 顺序报配置值
 doesn't exist/already exists）。`font actual` 的 `-family` 对
 "Courier" 报 pango 规范名 Nimbus Mono PS（Tk 保留请求名）——单一家
 族命名差异，记录在案。度量对照 127/127 在容差内；九标准字体的
-actual/fixed 与 wish 逐字节一致。**text 高级特性（2026-11-11）**：`tag cget` 对已知未设选项返回 Tk
+actual/fixed 与 wish 逐字节一致。**几何域 wish 对照（2026-11-11，specs/tk/geometry.tcl +
+compare-geo.tcl，已并入 run.sh 第二遍）**：canvas text bbox、text
+`dlineinfo`（三条真实行 + 越界行）、entry/listbox `winfo reqwidth`，
+三种字体。发现并修：`dlineinfo` 此前按控件列数×7 报宽度、18px 行高
+14px ascent 常数——现按该显示行文本实测（宽度/linespace/ascent，
+x/y = 边框+内边距 1.5 逻辑像素；无测量器回退 8px/字符、18/14）；
+canvas text bbox 补 Tk 的水平 ±1 设备像素外扩（逻辑空间 ±0.5，与
+canvas_bbox 的 floor/ceil 出向取整配合后与 Tk 在 1×/2× 显示都一致）；
+entry/listbox/text 的 `winfo reqwidth` 字符宽度改实测 "0" 宽（text +3、
+listbox +2、entry +3 逻辑像素 chrome，与 wish 的 reqwidth 对上）。
+跨实现已知差异（对照豁免并记录）：Tk 8.6 的 `dlineinfo` baseline 对
+所有行恒报首行值（y 走 3/31/59 而 baseline 恒 20，其自身缺陷），
+rtcl 按数学定义 y+ascent；canvas text 宽度在 HiDPI（Xft.dpi=192）下
+Tk 报 canvas 单位的 2× 溢出（其著名缺陷），比较器按字体缩放归一。
+单测 canvas bbox 期望随 ±0.5 外扩更新。**text 高级特性（2026-11-11）**：`tag cget` 对已知未设选项返回 Tk
 默认值（-offset/-overstrike/-lmargin*/-spacing*/-elide/-underline 等为
 0、-justify left、-relief raised、-tabstyle tabular）；扩展选项
 （-tabs/-offset/-overstrike/-lmargin*/-rmargin/-spacing*/-tabstyle）

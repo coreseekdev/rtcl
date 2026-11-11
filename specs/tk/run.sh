@@ -25,3 +25,13 @@ timeout 60 "$PROBE" specs/tk/font-metrics.tcl > "$out/rtcl.out" 2> "$out/rtcl.er
     || { echo "tk: tkprobe failed" >&2; cat "$out/rtcl.err" >&2; exit 2; }
 
 tclsh specs/tk/compare.tcl "$out/tk.out" "$out/rtcl.out" "$scale"
+metrics=$?
+
+timeout 60 wish specs/tk/geometry.tcl > "$out/geo-tk.out" 2> "$out/geo-tk.err" \
+    || { echo "tk: wish geometry failed" >&2; cat "$out/geo-tk.err" >&2; exit 2; }
+timeout 60 "$PROBE" specs/tk/geometry.tcl > "$out/geo-rtcl.out" 2> "$out/geo-rtcl.err" \
+    || { echo "tk: tkprobe geometry failed" >&2; cat "$out/geo-rtcl.err" >&2; exit 2; }
+tclsh specs/tk/compare-geo.tcl "$out/geo-tk.out" "$out/geo-rtcl.out" "$scale"
+geo=$?
+
+if [ "$metrics" -ne 0 ] || [ "$geo" -ne 0 ]; then exit 1; fi

@@ -121,6 +121,44 @@
   用例逐字节一致）
 - [x] rename 遮蔽过程后旧名解析 —— 复核为两引擎一致（原记录有误）
 
+## 原生 Tk —— 需 nsh/fork 渲染侧升级的任务（2026-11-12）
+
+> rtcl 侧的纯语义差距已随 wish 对照（`specs/tk/run.sh` 八遍：字体
+> 度量/几何/事件/selection-虚拟/winfo/子命令面/wm-tkwait/drag-drop）
+> 基本清零。以下是需要 nsh fork 渲染器功能升级或平台工作的项——
+> rtcl 模型侧已就绪，对照基建（八遍脚本 + tkprobe）可随时回归。
+
+- [ ] **`-alpha` 渲染通道**（fork：nsh-platform-*/window）：wm
+  attributes 已存取 `-alpha` 值（runtime `wm attributes`），但 nsh 的
+  desktop 命令没有 set-opacity 通道——需 fork 加
+  `DesktopCommand::SetOpacity(f32)`（GTK: gtk window set opacity；
+  Win32: SetLayeredWindowAttributes；macOS: alphaValue），rtcl 的
+  attributes 钩子即可接线。
+- [ ] **字体栈统一**（fork：nsh 文本渲染）：渲染器字体栈与 rtcl
+  pango 测量的 face 不同——渲染行宽比模型窄约 15%（折行点一致，同
+  断词规则）。完全对齐需渲染器用与测量相同的字体解析（或 rtcl 测
+  量走渲染器的栈）。
+- [ ] **ttk 主题视觉化**（fork/渲染器）：`ttk::style theme
+  names/use/configure` 命令面已对齐 Tk（四主题、每主题作用域、内置
+  值、layout 元素树），但主题切换暂不改变视觉——渲染器仍读全局表
+  的近似样式。需渲染器把 widget 样式从全局表改为按活动主题选择。
+- [ ] **treeview drag/drop DnD 深度**：`drag column xposition`（列宽
+  拖拽）与 `drop` 子命令已实现（模型近似——宽度分配依赖实时控件宽
+  度）；Tk 8.6.17 的完整交互式表头拖拽视觉（拖动幽灵、实时重排）
+  需 fork 渲染器的表头拖拽处理。
+- [ ] **渲染器 wrap 一致性**：渲染折行点已与模型一致（截图验证），
+  但渲染行宽比模型窄约 15%（同字体栈问题）；`text_request_pixels`
+  已导出，渲染器按其约束 layout。
+- [ ] **a11y 深度**（fork：nsh-platform-* access）：Canvas/Chart 逐
+  项 a11y 语义、菜单键盘导航的 UIA/AT-SPI 树节点；自绘控件已有
+  关键标签（spinbox Increment/Decrement、toplevel Close）。
+- [ ] **IME 深度**（fork：nsh 原生 input/RichEditor）：组合中状态进
+  `%K/%A` 全语义（组合完成的字符已由原生 input 承担）。
+- [ ] **MSVC 构建矩阵**（平台）：Windows 目前是
+  x86_64-pc-windows-gnu + MSYS2 路线（全绿）；MSVC 工具链未测。
+- [ ] **macOS 平台**（硬件）：nsh-platform-macos 存在，未验证；
+  Homebrew/部署链待建。
+
 ## 基础设施
 
 - [ ] rtcl-core `embedded` no_std 构建修复（G5 起破损，~2200 错误；

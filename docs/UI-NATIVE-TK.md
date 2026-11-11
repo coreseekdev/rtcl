@@ -545,8 +545,11 @@ a=38…z=52、数字 0=19…9=18、Return 36、space 65、Tab 23、Escape 9、
 generate` 未知名选项按 Tk 全列表报错（`-when/-data/-above/…` 十个
 新增为接受忽略项）；`grab set/status/current/release` 已支持。**已
 知差异（豁免）**：键类绑定的空 %A——Tk 按列表对象逐元素求值保留空
-参数，rtcl 文本求值折叠（结构一致：字段数差一）；Xvfb 无 WM 时 Tk
-的 Key 生成事件不派发（对照跑在真实显示上）。**字体度量对照 wish（2026-11-11，specs/tk/）**：`apps/rtcl-tk-demo
+参数，rtcl 文本求值折叠（参数数差一；曾试验的列表重渲染修参数却破
+坏 `;` 分隔脚本语义——列表渲染的引号选择改变语义，已回退）；Xvfb
+无 WM 时 Tk 的 Key 生成事件不派发（对照跑在真实显示上）；`event
+generate` 的选项接受集是各事件类型各自的子集（对照只验未知选项的
+报错文案）。**字体度量对照 wish（2026-11-11，specs/tk/）**：`apps/rtcl-tk-demo
 --bin tkprobe`（GTK 初始化 + 装后端跑脚本打印）与 wish 跑同一
 `specs/tk/font-metrics.tcl`，`specs/tk/run.sh` 按容差比对（Tk 报
 Xft.dpi 设备像素、rtcl 报 96dpi 逻辑像素，比例由 xrdb 的 Xft.dpi 给

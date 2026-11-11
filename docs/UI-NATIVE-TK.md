@@ -604,7 +604,15 @@ Xft 377 个，枚举差异）；`font configure` 无参按 Tk 顺序报配置值
 doesn't exist/already exists）。`font actual` 的 `-family` 对
 "Courier" 报 pango 规范名 Nimbus Mono PS（Tk 保留请求名）——单一家
 族命名差异，记录在案。度量对照 127/127 在容差内；九标准字体的
-actual/fixed 与 wish 逐字节一致。**text 换行显示行模型（2026-11-11）**：runtime 新增
+actual/fixed 与 wish 逐字节一致。**text 渲染器 wrap 视觉对齐（2026-11-12）**：渲染器的 multiline
+input 此前无宽度约束（按窗口拉伸、整行渲染）——现按
+`text_request_pixels`（模型 reqwidth）显式设置宽高，GTK 截图验证：
+渲染折行点与模型显示行一致（"one two three four" 后断行，模型
+1.24 落第二行 y=21）。**已知差异**：渲染器的字体栈与 pango 测量的
+face 不同（渲染行宽 ~117 逻辑 vs 模型 144——约 15%；折行点仍一致，
+因两者断词规则同为"空格断行"且宽度差未越过词边界）。shot 支持
+`--script path.tcl`（自定义脚本截图，ScriptApp 组件）。
+**text 换行显示行模型（2026-11-11）**：runtime 新增
 `text_display_lines`（内容 + `-wrap` none/char/word + `-width` 字符
 × 实测 "0" 宽 = 折行像素宽）——word 贪心断词（词间空格属于当前行，
 行尾空格吞掉）、char 按像素切块、none 恒等；`dlineinfo` 走显示行：

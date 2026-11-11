@@ -2819,6 +2819,15 @@ fn requested_size(interp: &Interp, path: &str) -> (i64, i64) {
     .unwrap_or((0, 0))
 }
 
+/// A text widget's requested pixel size (its `-width`/`-height`
+/// characters, measured with its font), for the renderer's layout.
+pub fn text_request_pixels(path: &str) -> (i64, i64) {
+    let Some(ptr) = active_interp() else {
+        return (0, 0);
+    };
+    requested_size(unsafe { &*ptr }, path)
+}
+
 /// A `grid columnconfigure` / `rowconfigure` weight.
 pub fn grid_weight(parent: &str, index: i64, is_row: bool) -> i64 {
     let Some(ptr) = active_interp() else {

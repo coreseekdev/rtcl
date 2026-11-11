@@ -91,6 +91,16 @@ fn capture_once(path: std::path::PathBuf, done: std::sync::Arc<std::sync::Mutex<
     gtk4::glib::timeout_add_local_once(Duration::from_millis(500), move || fallback());
 }
 
+/// A one-off app whose Tcl script comes from `--script` (rendered through
+/// the same Tk view as the demos).
+#[cfg(target_os = "linux")]
+#[nsh_core::prelude::component]
+fn ScriptApp() -> impl nsh_core::prelude::IntoElement {
+    let script = std::env::var("RTCL_SHOT_SCRIPT").unwrap_or_default();
+    rtcl_tk_demo::ensure_tcl_script(&script);
+    rtcl_tk_nsh::tk_view()
+}
+
 #[cfg(target_os = "linux")]
 fn main() {
     use std::time::Duration;
@@ -99,12 +109,23 @@ fn main() {
 
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let classic = args.iter().any(|a| a == "--classic");
+    let script_arg = args
+        .iter()
+        .position(|a| a == "--script")
+        .and_then(|at| args.get(at + 1).cloned());
     let out = args
         .iter()
-        .find(|a| !a.starts_with("--"))
+        .find(|a| {
+            !a.starts_with("--")
+                && script_arg.as_deref().map(|path| path != a.as_str()).unwrap_or(true)
+        })
         .cloned()
         .unwrap_or_else(|| "tk-demo.png".to_string());
     let path = std::path::PathBuf::from(out);
+    if let Some(script) = &script_arg {
+        let script = std::fs::read_to_string(script).unwrap_or_default();
+        std::env::set_var("RTCL_SHOT_SCRIPT", script);
+    }
 
     // The shot must run on GTK's main thread, after the app has had time to
     // run its `after` work.
@@ -128,7 +149,9 @@ fn main() {
     });
 
     platform::set_ui_sets(vec![nsh_base::registry()]);
-    let source = if classic {
+    let source = if script_arg.is_some() {
+        platform::AppSource::Rust(platform::Root::of::<ScriptApp>())
+    } else if classic {
         platform::AppSource::Rust(platform::Root::of::<rtcl_tk_demo::ClassicApp>())
     } else {
         platform::AppSource::Rust(platform::Root::of::<rtcl_tk_demo::DemoApp>())

@@ -2968,8 +2968,13 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     scroll_ref.scroll_to(Point::new(px(0.0), px(line as f32 * 18.0)), false);
                 });
             }
+            // The widget's own width: Tk text wraps at its requested
+            // pixel width (-width characters measured), not the window's.
+            let (req_w, req_h) = rtcl_tk_runtime::text_request_pixels(path.as_str());
             nsh_base::input()
                 .multiline(true)
+                .w(px(req_w.max(40) as f32))
+                .h(px(req_h.max(24) as f32))
                 .auto_focus(rtcl_tk_runtime::focused(&path))
                 .value(rtcl_tk_runtime::text_value(&path))
                 .disabled(disabled)

@@ -296,6 +296,87 @@ json/regexp-spencer 移侧模块，其分派面随之出表）。
   不受影响）、wasm check 过。尺寸：wasm raw 2.84 → 2.74 MiB（-97
   KiB regexp-lite）；pkg（bindgen+wasm-opt）≈2.0 MiB。
 
+## 10tredecimus. 2026-11-13 Spencer 全集 wasm 侧模块——regexp 外置收官（41/41 真机）
+
+（485a7b2 + e06bf4c）
+
+字符串 ABI v2 的首个真实施场景：wasm 构建的 `regexp`/`regsub` 从
+regexpmod.js 语义子集升级为 **native 同源 Spencer 引擎**。
+
+### 三刀抽取
+
+1. `crates/rtcl-unicode`：tclUtf.c/tclUniData.c 分类/大小写表平移；
+   `interp::unicode` re-export（路径不变）。双端共用同一份 Tcl 语义表。
+2. `crates/rtcl-regexp-spencer`：引擎全集 5001 行平移（自带 Error，
+   外部依赖仅 rtcl-unicode）；`commands::regexp_spencer` re-export，
+   regexp_cmds 零改动。**两 crate 刻意不继承根 workspace**——跨
+   workspace 路径依赖（侧模块独立构建）需要独立包元数据。
+3. `crates/rtcl-regexp-spencer-side`：同一实现再出 cdylib 面
+   （独立 workspace + `[workspace]` 表，dynmod-side 同款；std +
+   panic=abort + opt z，产物 120 KB）。
+
+### 侧模块 ABI（数值 C ABI + envelope）
+
+- 导出：`spencer_abi()`(=1)、`exec(in_ptr, in_len)`、`alloc(len)`、
+  `res_ptr()`/`res_len()`（静态 RESULT——单线程 JS 安全）。
+- 输入 envelope：u32 记录表，args = [pattern, subject, flags, start,
+  all]（flags/start/all 十进制文本——统一 UTF-8 记录便于调试）。
+- flags 位（spencer_options 同映射）：1=nocase 2=linestop 4=lineanchor
+  8=expanded 16=include_end。**-line 在命令层只设 nlanch+nlstop**
+  （newline 不经命令面）；expanded 引擎原生支持——JS 子集缺失项
+  一并补齐。
+- 输出：tag 0 = ngroups + nmatches + **字符跨度**表（端点独占；
+  引擎内部 span 即字符索引，native 的 byte span 只是命令层中间量，
+  用户面 -indices/string range 皆字符单位）；tag 1 = REG_* code +
+  native 同文 message（node 直验 REG_EBRACK/REG_BADRPT 一致）。
+- -all 循环与 native collect_matches 精确同构：from = search_start =
+  p（\A 绑定扫描起点）、空匹配进一字符、regexp 首位允许 p==len、
+  include_end（regsub）允许尾空匹配。
+
+### js_dispatch v2 修复（本节根因级发现）
+
+`__dynmod:*` 分发路径（js_command.rs）是 v1 遗留形：**只取末词按
+\u0001 拆分**——v2 逐词直传被截断成单参（探针实证 rest=["e"]）。
+修复：新前缀 `__dynmodv2:` 逐词透传；`__dynmod:` 保持 v1 兼容；
+register_module/unregister_module 同步换前缀。教训：**v2 落地时只改
+了 rtcl-vm 侧 wrapper 模板，宿主 dispatch 面没跟**——ABI v2 真机用例
+当时走的是 Rust 桥（native 单测），没打到 wasm dispatch 路径。
+
+### worker 接线（rtcl-worker.js）
+
+- setupSpencerMod：fetch/instantiate（URL 带页面 ?v= 穿透 HTTP/
+  模块缓存）、v2 dynmod 注册、SPENCER_SETUP_TCL wrapper 安装；
+  wrapper 安装失败自动回退 regexpmod.js 子集（exec 抛错 → return
+  false）。
+- wrapper 全选项面（纯 Tcl）：选项解析（含未知选项 native 同文
+  错误）、变量写入（helper 需 **upvar 2**——upvar 1 落在 ::regexp
+  局部帧）、-all 变量取**末匹配**（native set_match_var_groups 同）、
+  -inline/-indices、regsub \0-\9/&/\\ 替换（反斜杠字面量用
+  `format %c 92` 规避 expr 层歧义）、虚拟起点 index delta。
+- 装载次序：spencermod 优先 → 不可用回退 JS 子集。
+
+### 真机与教训
+
+- **fs-opfs-test.html 41 pass / 0 fail**（O12 + R8 + S2 + E7 +
+  SP12：回引/前瞻/expanded/非 BMP 字符索引/-line 行锚/-all 末匹配
+  变量/regsub 捕获换位/编译错误同文/-about）。
+- 页面调试坑（复用价值）：
+  - **SAB 页必须 COOP/COEP 服务器**（/tmp/isolated_server.py，8933）；
+    无隔离头 → `SharedArrayBuffer is not defined`，页面脚本静默死亡。
+  - **python http.server 是单线程**（HTTPServer）：并发 wasm 传输时
+    后续请求排队挂起 → 用 ThreadingHTTPServer。
+  - **IAB worker 配额**：strict-durable 自动重载每轮泄漏 fs-worker
+    （永不 terminate）→ 页面 `new Worker` 抛异常、脚本静默死亡；
+    关陈旧标签释放。
+  - **JS 字符串 `\U` 不是转义**（未知转义丢反斜杠）：页面用例里
+    `\U0001F201` 变成 `U0001F201` 文本 → 不匹配 → 读到前一用例残留
+    的同名变量（假绿/假红都出过）——测试用例的转义与变量名要独立。
+- 回归：judge 88/88、rtcl-regexp-spencer 22/22、rtcl-vm 811/811+3、
+  wrapper Tcl native 桩回归全绿（R3 形状与 native 逐字对齐——
+  `-indices` 变量是二元列表，外层 list 渲染 `{1 4} {1 2} {3 4}`）。
+- pkg 重构建（wasm-opt -Oz ≈2.0 MiB）；spencermod.wasm 120 KB 入库
+  （www/，fetch 即用）。
+
 ## 10decimus. 2026-11-13 OPFS worker 形态——文件 io 真实持久化（12/12 真机）
 
 - **www/rtcl-worker.js**：rtcl 的 **worker 部署形态**——解释器+JS 桥

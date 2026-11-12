@@ -79,6 +79,19 @@
 
 非缺陷、不再修：`string byterange` 是 rtcl 扩展，tclsh 无此子命令。
 
+## 2026-11-12c dynmod：wasm `load`/`unload` 注册表形态（5 单测）
+
+- rtcl 的 `load` 增加**宿主注册表**形态（feature `dynmod`）：宿主
+  预实例化的侧 wasm 模块经 `Interp::register_dyn_module` 声明，
+  `load name` 同步安装 `::<name>::<cmd>` 包装命令（dispatch words 由
+  宿主给出——rtcl-wasm 经 `_js_dispatch` 接到模块 exports）。
+- 与 tclsh 的语义差异（本质性，非缺陷）：tclsh 的 .so 与解释器共享
+  地址空间、Init 自注册；wasm 模块隔离，**命令面由 rtcl 包装、参数
+  字符串进出**。路径形（`load /x/y.so`）未登记时回落 load-cmd 语义
+  （缺文件文案逐字；真 .so 报 dynamic loading not supported）。
+- 共有面与 tclsh 一致：load 幂等（已加载重 load 为 no-op）、unload
+  未加载报 `file "x" has never been loaded`、unload 解除命令绑定。
+
 ## 2026-11-12b 协程引擎落地 + wasm 可选特性门控（coroutine.probes 23/23）
 
 - **coroutine/yield/yieldto 全语义实现**：rtcl 的字节码执行器按单元

@@ -21,6 +21,7 @@ rtcl-vm = { path = "../rtcl-vm", default-features = false, features = [
     "clock",
     "package",
     "regexp-lite",
+    "dynmod",
 ] }
 # wasm32 JIT 接线（⑧ 重入哨兵已就位）：wasmi 是纯 Rust——在
 # wasm32 里跑 wasm（解释器套解释器，比 JS WebAssembly API 路径慢

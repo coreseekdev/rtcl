@@ -519,6 +519,11 @@ pub struct Interp {
     /// first; the collector moves it into the coroutine record.
     pub(crate) coro_chain:
         Vec<(Rc<rtcl_parser::ByteCode>, vm_exec::SuspendedState)>,
+    /// Host-declared extension modules (`dynmod`): pre-instantiated by
+    /// the host (wasm side modules via rtcl-wasm's `register_module`),
+    /// attached to the command table by `load` / detached by `unload`.
+    pub(crate) dyn_modules:
+        varmap::FxHashedMap<String, commands::dynmod::DynModule>,
     /// Command-name resolution cache (tclsh's resolved-command tokens):
     /// outer key = the namespace the resolution ran in, inner key = the
     /// invocation name as written.  Both levels probe with `&str`, so a
@@ -1023,6 +1028,7 @@ impl Interp {
             coroutines: VarMap::default(),
             coro_ctx: None,
             coro_chain: Vec::new(),
+            dyn_modules: varmap::FxHashedMap::default(),
             ensembles: HashMap::new(),
             #[cfg(feature = "std")]
             script_name: String::new(),

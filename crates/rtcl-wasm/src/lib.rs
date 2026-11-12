@@ -72,6 +72,63 @@ impl RtclHandle {
         Ok(())
     }
 
+    /// Declare a host-instantiated extension module (the wasm `load`).
+    ///
+    /// The side wasm module is instantiated by the JS host ahead of time
+    /// (web assembly cannot dlopen); `exports` is an object whose
+    /// function-valued properties become the module's commands.  A Tcl
+    /// `load <name>` (or `load <name>.wasm`) then installs
+    /// `::<name>::<export>` commands that dispatch to those functions —
+    /// `unload <name>` removes them.  Function results convert to Tcl
+    /// values via JS String(); arguments arrive as strings.
+    pub fn register_module(&mut self, name: &str, exports: js_sys::Object) -> Result<(), JsValue> {
+        if rtcl_vm::interp::jit_call_in_flight() {
+            return Err(JsValue::from_str(
+                "reentrant registration during JIT call is not supported",
+            ));
+        }
+        let mut commands: Vec<(String, Vec<String>)> = Vec::new();
+        let keys = js_sys::Object::keys(&exports);
+        for i in 0..keys.length() {
+            let key = keys.get(i);
+            let fname = key.as_string().unwrap_or_default();
+            let val = js_sys::Object::values(&exports).get(i);
+            if !val.is_function() {
+                continue;
+            }
+            let func = js_sys::Function::from(val);
+            // Internal registration name: unique per module+command.
+            let internal = format!("__dynmod:{}:{}", name, fname);
+            js_command::register_js_command(&mut self.interp, self.id, &internal, func);
+            commands.push((fname, vec![
+                "_js_dispatch".to_string(),
+                self.id.to_string(),
+                internal,
+            ]));
+        }
+        if commands.is_empty() {
+            return Err(JsValue::from_str(
+                "register_module: exports object has no function-valued properties",
+            ));
+        }
+        self.interp.register_dyn_module(name, rtcl_vm::interp::commands::dynmod::DynModuleDef { commands });
+        Ok(())
+    }
+
+    /// Drop a module declaration (and any commands a `load` installed).
+    pub fn unregister_module(&mut self, name: &str) -> Result<bool, JsValue> {
+        let bare = name.trim_start_matches("::").trim_end_matches(".wasm");
+        // Also free the internal JS callbacks.
+        let existed = self.interp.dyn_module_installed_commands(bare);
+        for full in existed {
+            if let Some(tail) = full.rsplit("::").next() {
+                let internal = format!("__dynmod:{}:{}", bare, tail);
+                js_command::unregister_js_command(&mut self.interp, self.id, &internal);
+            }
+        }
+        Ok(self.interp.unregister_dyn_module(bare))
+    }
+
     /// Remove a JS-registered command.
     pub fn unregister_command(&mut self, name: &str) -> Result<bool, JsValue> {
         if rtcl_vm::interp::jit_call_in_flight() {

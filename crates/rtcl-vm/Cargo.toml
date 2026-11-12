@@ -40,7 +40,7 @@ default = ["rtcl_std", "iconv"]
 # OS-level platform features (time, hostname, channels, filesystem)
 std = []
 # Tcl standard library — all extensions combined
-rtcl_std = ["file", "io", "exec", "clock", "regexp", "regexp-spencer", "env", "signal", "package", "net", "load-cmd"]
+rtcl_std = ["file", "io", "exec", "clock", "regexp", "regexp-spencer", "env", "signal", "package", "net", "load-cmd", "dynmod"]
 # Individual Tcl extensions (each implies Rust std)
 file = ["std"]                    # file, cd, pwd, glob (自实现), readdir, source
 io = ["std"]                      # channel I/O: open, close, read, gets, seek, tell, eof, flush, fconfigure, pid
@@ -53,6 +53,10 @@ net = ["std", "io"]               # socket (TCP client) — native only; wasm
                                   # has no sockets (可选特性：wasm 构建不含)
 load-cmd = ["std"]                # load/unload — dynamic loading is
                                   # meaningless on wasm (可选特性)
+dynmod = []                       # load/unload 的动态模块注册表形态：
+                                  # 宿主预实例化的 wasm/原生模块经
+                                  # register_dyn_module 登记，load 挂线
+                                  # （网页 dispatcher 的扩展面；wasm 默认含）
 package = ["file"]                # package provide/require/names/forget
 signal = ["std"]                  # kill, sleep
 # Henry Spencer 正则引擎的 Rust 移植（B 路径；specs/regex-spencer-port.md）。

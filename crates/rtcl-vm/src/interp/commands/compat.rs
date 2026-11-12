@@ -55,7 +55,7 @@ pub fn cmd_coroutine(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 /// Native-only: dynamic loading does not exist on wasm (feature "load-cmd").
 #[cfg(feature = "load-cmd")]
-pub fn cmd_load(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_load_dlopen(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // load ?-global? ?-lazy? ?--? fileName ?packageName? ?interp?
     let mut i = 1;
     while i < args.len() && args[i].as_str().starts_with('-') {
@@ -90,7 +90,7 @@ pub fn cmd_load(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 #[cfg(feature = "load-cmd")]
-pub fn cmd_unload(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_unload_dlopen(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage(
             "unload",
@@ -99,9 +99,12 @@ pub fn cmd_unload(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "?-switch ...? fileName ?packageName? ?interp?",
         ));
     }
+    // rtcl's dlopen form tracks no loaded files, so every unload target
+    // is "never loaded" — tclsh's exact message for that case.
+    let file = args[1].as_str();
     Err(Error::runtime(
-        "dynamic loading is not supported in this rtcl build",
-        ErrorCode::Io,
+        format!("file \"{}\" has never been loaded", file),
+        ErrorCode::Generic,
     ))
 }
 

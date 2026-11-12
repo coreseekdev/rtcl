@@ -186,6 +186,28 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10quater. 2026-11-12 第四轮：dynmod——wasm `load`/`unload` 扩展模块注册表（已完成）
+
+rtcl=网页 command dispatcher 的扩展面：wasm 里 dlopen 不存在，改为
+**宿主预实例化 + 注册表挂线**（`load` 是同步命令而 instantiate 异步）。
+
+- rtcl-vm（feature `dynmod`，入 rtcl_std 与 wasm 子集）：
+  `Interp::register_dyn_module(name, DynModuleDef{commands: Vec<(tail,
+  dispatch_words)>})` 声明；`load name|name.wasm|/path/to/name.so` 安装
+  `::<name>::<cmd>` 包装 proc（体 = dispatch_words + `{*}$args`，与
+  js_command 的 proc 包同形）；`unload name` 解包（未 load 过 → tclsh
+  原文 `file "x" has never been loaded`）；路径形未登记 → 回落
+  load-cmd dlopen 语义（缺文件文案逐字）。计数：原生 101、wasm 100
+  （socket 仍 net 门控；load/unload 回到全平台）。
+- rtcl-wasm：`register_module(name, exportsObj)` / `unregister_module`
+  ——exports 的函数值属性经 `_js_dispatch` 表接为回调；示例胶水
+  crates/rtcl-wasm/www/dynmod-bridge.js（数值 ABI → 字符串包装；
+  字符串/字节载荷走侧模块 rtcl_alloc/rtcl_free 交接，v2）。
+- 本体拆分路径：可拆=纯函数子系统（regexp-spencer/encoding 表/zlib/
+  json/chart——字符串进出）；拆不动=分派/变量表/帧模型（即本体）。
+- 测试：rtcl-vm dynmod 单测 5/5（host 假桥）；JS 侧需真机 smoke
+  （wasm-bindgen 测试基建暂无 browser harness）。
+
 ## 10ter. 2026-11-12 第三轮：协程引擎 + wasm 可选门控（已完成）
 
 - coroutine/yield/yieldto 落地（挂起链重放；specs/coroutine.probes

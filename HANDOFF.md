@@ -244,6 +244,39 @@ json/regexp-spencer 移侧模块，其分派面随之出表）。
 - **后续**：expand 拆词修复（正解）；regexp-spencer 外置（大刀，需
   字符串 ABI v2）；OPFS worker fs 形态。
 
+## 10undecimus. 2026-11-13 外置第二刀 regexp + encoding 命令面 + SAB durable 桥（29/29 真机）
+
+- **regexp 外置**（956648e + 7382ab4 + cdd3b71）：wasm 子集剔除
+  regexp-lite（净重 97 KiB raw）；www/regexpmod.js = Tcl ARE → JS
+  RegExp 语义子集（POSIX 类展开表、\y→\b、\m/\M/\</\> 近似、
+  quoting ***=、-nocase/-line/-lineanchor/-linestop/-all/-inline/
+  -indices/-start/-about 全支持）。**变量写入协议**：matchVar/
+  subMatchVar/varName 在解释器帧——JS 返回 __RXCAP/__RXIDX/__RS
+  结构化 Tcl 列表编码，::regexp/::regsub 语义 wrapper proc 解包 +
+  upvar 写变量 + 透传返回码。**-indices 组起止已升级 V8 hasIndices
+  （d flag）精确 [start,end)——嵌套 (a(b(c))) 与相邻重复 (a)(a)
+  与 native Spencer 同精度（indexOf 近似曾错位）**。
+- **三个高频 wrapper 错位**（真机逐一抓出，外置带变量命令的通用
+  教训）：① 命名空间——JS 面 fn 装 ::模块名::fn 名（::regsub::
+  regsub 是错名，正确 = ::regexp::regsub）；② __RS 解包顺序（v=
+  result、返回=count 易反置）；③ POSIX 类 `[[:name:]]` 前置检测
+  （外层 [ 内嵌 [:）。wrapper 定义后必须逐条真机验证。
+- **encoding 命令面外置**（feature `encoding` 门控，wasm 子集不含；
+  通道机制的 encoding.rs 保留）：www/encodingmod.js = 86 名宽表 →
+  WHATWG label 映射 + TextDecoder/TextEncoder 数据面（非 utf-8
+  encode 走反查表合成；symbol/iso2022 系/ebcdic 如实报
+  unsupported——全集仍在 native）。E1-E7 真机（names/system/
+  convertfrom/convertto latin-1 与 utf-8 与 cp936/dirs）。
+- **SAB 严格 durable 桥**（见 10decimus 后补段）：fs-worker.js
+  （OPFS 执行端，sync access handle + meta sidecar settimes）+
+  rtcl-worker bridge 模式（Atomics.wait 等回执，回执在写入完成后
+  发出）——terminate 后 strict 标记存活实证。
+- **fs-opfs-test.html 合计 29/29**（O 区 12 + R/S 区 10 + E 区 7），
+  均在 COOP/COEP 隔离服务器（/tmp/isolated_server.py，8933）。
+- 回归：native 全绿（test/judge/probes/scripts——native Spencer 面
+  不受影响）、wasm check 过。尺寸：wasm raw 2.84 → 2.74 MiB（-97
+  KiB regexp-lite）；pkg（bindgen+wasm-opt）≈2.0 MiB。
+
 ## 10decimus. 2026-11-13 OPFS worker 形态——文件 io 真实持久化（12/12 真机）
 
 - **www/rtcl-worker.js**：rtcl 的 **worker 部署形态**——解释器+JS 桥

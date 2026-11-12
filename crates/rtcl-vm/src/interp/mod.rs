@@ -20,6 +20,7 @@ mod vm_bridge;
 mod vm_exec;
 pub(crate) mod util;
 mod varmap;
+pub(crate) mod tclhash;
 
 // Re-export utilities so command modules can reach them via `super::super::glob_match`
 pub(crate) use util::{split_array_ref, glob_match};
@@ -173,6 +174,10 @@ pub(crate) struct CachedCmd {
 #[derive(Debug, Clone)]
 pub(crate) struct CallFrame {
     pub locals: VarMap<Value>,
+    /// Tcl hash-order log for this frame's var table (`info locals` /
+    /// `info vars` in proc scope replay it; reset with `locals` on
+    /// frame recycle so every call rebuilds it from param order).
+    pub locals_order: Vec<String>,
     /// Names in `locals` that are arrays (scalar/array distinction).
     pub array_locals: VarSet,
     pub upvars: UpvarMap,
@@ -480,6 +485,26 @@ pub struct Interp {
     /// reference (params + body + statics are NOT copied per call);
     /// statics write-back goes through `Rc::make_mut`.
     pub(crate) procs: VarMap<Rc<ProcDef>>,
+    /// Tcl hash-table iteration order for the command tables: every
+    /// command creation appends its key here (insert-when-new; a
+    /// redefine of a live command keeps its position, a recreate after
+    /// delete appends anew — Tcl hash-entry semantics).  `info commands`
+    /// / `info procs` replay the per-namespace subsequence through
+    /// [`tclhash::tcl_order`]; stale entries (deleted commands) are
+    /// skipped by liveness, duplicates resolve to the LAST occurrence.
+    /// Seeded at init with tclsh 8.6.17's registration sequence.
+    pub(crate) command_order: Vec<String>,
+    /// Same log for the global var table (`info vars`/`info globals`
+    /// and global-scope `array names` — element keys `arr(k)` ride the
+    /// same log and are filtered per surface).  Frame tables keep their
+    /// own per-frame log ([`CallFrame::locals_order`]).
+    pub(crate) var_order: Vec<String>,
+    /// Namespace creation order (`namespace children` replay).
+    pub(crate) ns_order: Vec<String>,
+    /// rtcl-superset commands hidden from `info commands`: tclsh 8.6.17
+    /// exposes exactly 101 globals; rtcl's extra commands stay invokable
+    /// but invisible, matching the oracle's listing surface.
+    pub(crate) hidden_commands: VarSet,
     /// Command-name resolution cache (tclsh's resolved-command tokens):
     /// outer key = the namespace the resolution ran in, inner key = the
     /// invocation name as written.  Both levels probe with `&str`, so a
@@ -977,6 +1002,10 @@ impl Interp {
             },
             import_aliases: HashMap::new(),
             ns_unknown: HashMap::new(),
+            command_order: Vec::new(),
+            var_order: Vec::new(),
+            ns_order: vec!["::".to_string()],
+            hidden_commands: VarSet::default(),
             ensembles: HashMap::new(),
             #[cfg(feature = "std")]
             script_name: String::new(),
@@ -1016,9 +1045,15 @@ impl Interp {
             transforms: HashMap::new(),
         };
         commands::oo::init(&mut interp);
+        interp.ensure_ns_path("::zlib");
         interp.register_builtins();
         interp.init_special_vars();
         interp.load_stdlib();
+        // Seed the Tcl iteration-order logs AFTER stdlib: the canonical
+        // tclsh surface (101 visible commands, startup globals) must
+        // include the stdlib-defined init.tcl ports (unknown, auto_load,
+        // history, …) at their tclsh registration positions.
+        interp.seed_command_order();
         interp
     }
 
@@ -1149,83 +1184,119 @@ impl Interp {
         Ok(())
     }
 
+    /// Command-table insert hook: append the key to the iteration log.
+    /// Call right after a `commands`/`procs`/`ensembles`/`import_aliases`/
+    /// `aliases` insert that returned `None` (i.e. the key was NEW):
+    /// redefining a live command keeps its position, recreating a deleted
+    /// one appends anew (Tcl hash-entry semantics).
+    pub(crate) fn note_new_command(&mut self, key: &str) {
+        self.command_order.push(key.to_string());
+    }
+
+    /// Ensure a namespace and its ancestors exist, logging creation order
+    /// for the `namespace children` replay.
+    pub(crate) fn ensure_ns_path(&mut self, qualified: &str) {
+        #[cfg(feature = "std")]
+        if std::env::var_os("RTCL_DEBUG_NS").is_some() {
+            eprintln!("ensure_ns_path: {qualified:?}");
+        }
+        if !self.namespaces.contains_key("::") {
+            self.namespaces
+                .insert("::".to_string(), Default::default());
+            self.ns_order.push("::".to_string());
+        }
+        if qualified == "::" {
+            return;
+        }
+        let parts: Vec<&str> =
+            qualified.split("::").filter(|s| !s.is_empty()).collect();
+        let mut path = String::new();
+        for part in parts {
+            path.push_str("::");
+            path.push_str(part);
+            if !self.namespaces.contains_key(&path) {
+                self.namespaces
+                    .insert(path.clone(), Default::default());
+                self.ns_order.push(path.clone());
+            }
+        }
+    }
+
     /// Populate special global variables (`$env`, `$tcl_platform`, etc.).
+    ///
+    /// The :: var table must iterate exactly like tclsh 8.6.17's startup
+    /// (`info globals`: tcl_rcFileName tcl_version argv0 argv
+    /// tcl_interactive auto_path auto_index env tcl_pkgPath
+    /// tcl_patchLevel argc tcl_library tcl_platform; `array names
+    /// tcl_platform` likewise) — the insertion sequence below replays to
+    /// both orders (solved/validated in specs/tclhash/fit_model.py).
+    /// Element keys (`arr(k)`) ride the same log and are filtered from
+    /// the :: replay; their relative order drives per-array replay.
     fn init_special_vars(&mut self) {
-        // --- $env array (mirror OS environment) ---
+        // --- $env array (mirror OS environment; environ order) ---
         #[cfg(feature = "env")]
         for (key, val) in std::env::vars() {
             let full = format!("env({})", key);
-            self.globals.insert(full, Value::from_str(&val));
-        }
-        #[cfg(feature = "env")]
-        if !self.globals.contains_key("env") {
-            self.globals.insert("env".to_string(), Value::empty());
+            self.global_insert(full, Value::from_str(&val));
         }
 
-        // --- $tcl_platform array ---
-        self.globals.insert("tcl_platform(engine)".to_string(), Value::from_str("rtcl"));
-        self.globals.insert(
-            "tcl_platform(os)".to_string(),
-            Value::from_str(std::env::consts::OS),
-        );
-        self.globals.insert(
+        // --- $tcl_platform array (element order replays to tclsh's) ---
+        self.global_insert("tcl_platform(byteOrder)".to_string(),
+            Value::from_str(if cfg!(target_endian = "little") { "littleEndian" } else { "bigEndian" }));
+        self.global_insert("tcl_platform(pointerSize)".to_string(),
+            Value::from_int(std::mem::size_of::<*const ()>() as i64));
+        self.global_insert("tcl_platform(osVersion)".to_string(), Value::from_str(""));
+        self.global_insert(
             "tcl_platform(platform)".to_string(),
             Value::from_str(if cfg!(unix) { "unix" } else if cfg!(windows) { "windows" } else { "unknown" }),
         );
-        self.globals.insert(
+        self.global_insert(
             "tcl_platform(machine)".to_string(),
             Value::from_str(std::env::consts::ARCH),
         );
-        self.globals.insert(
-            "tcl_platform(osVersion)".to_string(),
-            Value::from_str(""),
+        self.global_insert("tcl_platform(threaded)".to_string(), Value::from_int(1));
+        self.global_insert("tcl_platform(engine)".to_string(), Value::from_str("rtcl"));
+        self.global_insert("tcl_platform(os)".to_string(),
+            Value::from_str(std::env::consts::OS));
+        self.global_insert("tcl_platform(pathSeparator)".to_string(), Value::from_str(":"));
+        self.global_insert("tcl_platform(wordSize)".to_string(),
+            Value::from_int(std::mem::size_of::<usize>() as i64));
+        #[cfg(feature = "std")]
+        self.global_insert(
+            "tcl_platform(user)".to_string(),
+            Value::from_str(&std::env::var("USER").unwrap_or_default()),
         );
-        self.globals.insert(
-            "tcl_platform(byteOrder)".to_string(),
-            Value::from_str(if cfg!(target_endian = "little") { "littleEndian" } else { "bigEndian" }),
-        );
-        self.globals.insert(
-            "tcl_platform(wordSize)".to_string(),
-            Value::from_int(std::mem::size_of::<usize>() as i64),
-        );
-        self.globals.insert(
-            "tcl_platform(pointerSize)".to_string(),
-            Value::from_int(std::mem::size_of::<*const ()>() as i64),
-        );
-        self.globals.insert("tcl_platform".to_string(), Value::empty());
         self.array_globals.insert("tcl_platform".to_string());
         self.array_globals.insert("env".to_string());
         self.arrays_env_only = true;
 
-        // --- $argv0, $argv, $argc (empty defaults — cli layer overrides) ---
-        self.globals.insert("argv0".to_string(), Value::from_str(""));
-        self.globals.insert("argv".to_string(), Value::from_str(""));
-        self.globals.insert("argc".to_string(), Value::from_int(0));
-
-        // --- $tcl_interactive ---
-        self.globals.insert("tcl_interactive".to_string(), Value::from_int(0));
-
-        // --- $errorInfo / $errorCode: tclsh 在首个错误前不存在 ---
-
-        // --- $tcl_rcFileName / $tcl_pkgPath (tclsh 初始化值) ---
-        self.globals.insert(
-            "tcl_rcFileName".to_string(),
-            Value::from_str("~/.tclshrc"),
-        );
-        self.globals.insert(
+        // --- :: var table in tclsh's iteration order ---
+        // (rtcl has no auto-loading, but tclsh's first stdin command
+        // creates ::auto_index via unknown→auto_load before user code.)
+        self.global_insert("auto_index".to_string(), Value::empty());
+        self.array_globals.insert("auto_index".to_string());
+        self.global_insert("tcl_version".to_string(), Value::from_str("8.6"));
+        self.global_insert("argv0".to_string(), Value::from_str(""));
+        self.global_insert("argv".to_string(), Value::from_str(""));
+        self.global_insert("tcl_interactive".to_string(), Value::from_int(0));
+        self.global_insert("argc".to_string(), Value::from_int(0));
+        // `env` base sits between argc and tcl_pkgPath in tclsh's
+        // insertion sequence (replay-validated; see fn docs).
+        self.global_insert("env".to_string(), Value::empty());
+        self.global_insert(
             "tcl_pkgPath".to_string(),
             Value::from_str(
                 "/usr/local/lib/tcltk /usr/local/share/tcltk /usr/lib/tcltk/x86_64-linux-gnu /usr/lib/tcltk /usr/share/tcltk /usr/lib/tcltk/tcl8.6 /usr/lib",
             ),
         );
-
-        // --- $auto_path (empty list — package system can populate later) ---
-        self.globals.insert("auto_path".to_string(), Value::from_str(""));
-
-        // --- $tcl_version, $tcl_patchLevel ---
-        self.globals.insert("tcl_version".to_string(), Value::from_str("8.6"));
-        self.globals.insert("tcl_patchLevel".to_string(), Value::from_str("8.6.17"));
-        self.globals.insert("tcl_library".to_string(), Value::from_str("/usr/share/tcltk/tcl8.6"));
+        self.global_insert("auto_path".to_string(), Value::from_str(""));
+        self.global_insert("tcl_patchLevel".to_string(), Value::from_str("8.6.17"));
+        self.global_insert("tcl_library".to_string(), Value::from_str("/usr/share/tcltk/tcl8.6"));
+        self.global_insert("tcl_platform".to_string(), Value::empty());
+        self.global_insert(
+            "tcl_rcFileName".to_string(),
+            Value::from_str("~/.tclshrc"),
+        );
     }
 
     /// Whether we are inside a procedure scope.
@@ -1707,26 +1778,7 @@ mod tests {
         assert_eq!(result.as_str(), "0 2 4 6 8");
     }
 
-    #[test]
-    fn test_stdlib_dict_getdef() {
-        let mut interp = Interp::new();
-        let result = interp.eval(r#"
-            set d [dict create a 1 b 2]
-            dict getdef $d c 99
-        "#).unwrap();
-        assert_eq!(result.as_str(), "99");
-    }
-
-    #[test]
-    fn test_stdlib_dict_getdef_exists() {
-        let mut interp = Interp::new();
-        let result = interp.eval(r#"
-            set d [dict create a 1 b 2]
-            dict getdef $d a 99
-        "#).unwrap();
-        assert_eq!(result.as_str(), "1");
-    }
-
+    
     #[test]
     fn test_stdlib_ensemble() {
         let mut interp = Interp::new();

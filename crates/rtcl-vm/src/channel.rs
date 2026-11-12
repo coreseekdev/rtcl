@@ -600,6 +600,90 @@ fn parse_posix_access(mode: &str) -> Option<PosixAccess> {
 }
 
 /// The channel table — maps handle strings to open channels.
+/// TCP client socket channel (`socket host port`) — a `TcpStream` with
+/// the [`Channel`] surface.  rtcl names sockets `sock0`, `sock1`, …;
+/// tclsh derives names from the channel struct pointer (`sock4a2b…`)
+/// and is not reproducible (DIVERGENCES: socket).
+pub struct TcpChannel {
+    stream: std::net::TcpStream,
+    eof: bool,
+}
+
+impl TcpChannel {
+    pub fn new(stream: std::net::TcpStream) -> Self {
+        Self { stream, eof: false }
+    }
+}
+
+impl Channel for TcpChannel {
+    fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = io::Read::read(&mut self.stream, buf)?;
+        if n == 0 {
+            self.eof = true;
+        }
+        Ok(n)
+    }
+    fn read_line(&mut self) -> io::Result<Option<String>> {
+        let mut line = String::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match io::Read::read(&mut self.stream, &mut byte) {
+                Ok(0) => {
+                    self.eof = true;
+                    if line.is_empty() {
+                        return Ok(None);
+                    }
+                    break;
+                }
+                Ok(_) => {
+                    if byte[0] == b'\n' {
+                        if line.ends_with('\r') {
+                            line.pop();
+                        }
+                        break;
+                    }
+                    line.push(byte[0] as char);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Some(line))
+    }
+    fn read_all(&mut self) -> io::Result<String> {
+        let mut s = String::new();
+        io::Read::read_to_string(&mut self.stream, &mut s)?;
+        self.eof = true;
+        Ok(s)
+    }
+    fn write_bytes(&mut self, data: &[u8]) -> io::Result<usize> {
+        io::Write::write(&mut self.stream, data)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        io::Write::flush(&mut self.stream)
+    }
+    fn seek(&mut self, _whence: io::SeekFrom) -> io::Result<u64> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "channel is not seekable"))
+    }
+    fn tell(&mut self) -> io::Result<u64> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "channel is not seekable"))
+    }
+    fn eof(&self) -> bool {
+        self.eof
+    }
+    fn close(self: Box<Self>) -> io::Result<()> {
+        Ok(())
+    }
+    fn is_readable(&self) -> bool {
+        true
+    }
+    fn is_writable(&self) -> bool {
+        true
+    }
+    fn channel_type(&self) -> &'static str {
+        "tcp"
+    }
+}
+
 pub struct ChannelTable {
     channels: HashMap<ChannelId, Box<dyn Channel>>,
     configs: HashMap<ChannelId, ChannelConfig>,
@@ -759,6 +843,51 @@ impl ChannelTable {
         Ok(id)
     }
 
+    /// TCP client connect (`socket host port ?-myaddr ...? ?-myport ...?`).
+    /// Returns the new channel id (`sockN`).
+    pub fn open_socket(
+        &mut self,
+        host: &str,
+        port: &str,
+    ) -> std::result::Result<ChannelId, String> {
+        use std::net::TcpStream;
+        let port_n: u16 = port
+            .parse()
+            .map_err(|_| format!("couldn't open socket: invalid port \"{}\"", port))?;
+        let stream = TcpStream::connect((host, port_n)).map_err(|e| {
+            // tclsh reports the bare strerror ("connection refused",
+            // "Name or service not known"), not Rust's "(os error N)".
+            let s = e.to_string();
+            let bare = s.split(" (os error").next().unwrap_or(&s).to_string();
+            let mut c = bare.chars();
+            let lowered = match c.next() {
+                Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+                None => bare,
+            };
+            format!("couldn't open socket: {}", lowered)
+        })?;
+        let id = {
+            let mut n: u32 = 0;
+            loop {
+                let cand = format!("sock{}", n);
+                if !self.channels.contains_key(&cand) {
+                    break cand;
+                }
+                n += 1;
+            }
+        };
+        let sys = self.system_encoding.clone();
+        self.configs.insert(id.clone(), ChannelConfig {
+            encoding: sys,
+            translation_in: TranslationMode::Auto,
+            translation_out: platform_translation(),
+            ..ChannelConfig::default()
+        });
+        self.track(id.clone());
+        self.channels.insert(id.clone(), Box::new(TcpChannel::new(stream)));
+        Ok(id)
+    }
+
     /// Register a channel with a specific ID (used for pipe channels from exec).
     pub fn register(&mut self, id: ChannelId, channel: Box<dyn Channel>) {
         let sys = self.system_encoding.clone();
@@ -836,11 +965,18 @@ impl ChannelTable {
         self.channels.remove(id)
     }
 
-    pub fn channel_names(&self) -> Vec<&str> {
+    /// Live channel names in creation order.  tclsh's `chan names` walks
+    /// its per-interp channel hash table; for the stdio-only case that
+    /// order coincides with creation order (stdin stdout stderr).  The
+    /// general order depends on tclsh's channel registration history
+    /// (registration on first *access*, plus init-time channels that were
+    /// closed again) — see DIVERGENCES.md (chan_io_p15); reproducing it
+    /// needs a channel-registration log replay, not a plain hash replay.
+    pub fn channel_names(&self) -> Vec<String> {
         self.order
             .iter()
             .filter(|id| self.channels.contains_key(id.as_str()))
-            .map(|id| id.as_str())
+            .map(|id| id.as_str().to_string())
             .collect()
     }
 

@@ -581,7 +581,7 @@ pub fn cmd_unset(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if interp.unset_var(name).is_err() {
                 match saved_code {
                     Some(v) => {
-                        interp.globals.insert("errorCode".to_string(), v);
+                        interp.global_insert("errorCode".to_string(), v);
                     }
                     None => {
                         interp.globals.remove("errorCode");
@@ -694,61 +694,82 @@ fn list_commands_in(
         },
     };
 
-    // Every command, keyed as stored: builtins, procs, import aliases and
-    // ensembles.
-    let mut keys: Vec<&str> = interp
-        .procs
-        .keys()
-        .map(|s| s.as_str())
-        .chain(interp.import_aliases.keys().map(|s| s.as_str()))
-        .chain(interp.ensembles.keys().map(|s| s.as_str()))
-        .collect();
-    if builtins {
-        keys.extend(interp.commands.keys().map(|s| s.as_str()));
+    // Walk the Tcl-order log: keys currently live in any command table,
+    // visible (not hidden).  Dedup to the LAST log occurrence (recreates),
+    // replay the per-namespace subsequence through the Tcl hash-table
+    // mechanics (tclsh's iteration order), then filter by glob.
+    let live = |key: &str| -> bool {
+        let hit = |k: &str| {
+            interp.procs.contains_key(k)
+                || interp.import_aliases.contains_key(k)
+                || interp.ensembles.contains_key(k)
+                || (builtins && interp.commands.contains_key(k))
+        };
+        hit(key)
+            || (key.starts_with("::") && hit(&key[2..]))
+            || hit(&format!("::{}", key))
+    };
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, key) in interp.command_order.iter().enumerate() {
+        if live(key) && !interp.hidden_commands.contains(key.as_str()) {
+            seen.insert(key.as_str(), i);
+        }
     }
-    keys.sort_unstable();
-    keys.dedup();
-
-    let mut out: Vec<Value> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for key in &keys {
-        let (ns, tail) = split_key_ns(key);
-        if ns != eff {
+    // Collect (full key, table tail) pairs per target table — tclsh's
+    // namespace tables hash the command TAIL, so the replay runs on tails.
+    let mut eff_keys: Vec<(String, String)> = Vec::new();
+    let mut glob_keys: Vec<(String, String)> = Vec::new();
+    for (i, key) in interp.command_order.iter().enumerate() {
+        if seen.get(key.as_str()) != Some(&i) {
             continue;
         }
-        if let Some(sp) = &simple {
-            if !super::super::glob_match(sp, &tail) {
-                continue;
-            }
-        }
-        if seen.insert(tail.clone()) {
-            let rendered = if specific {
-                full_key(key)
-            } else {
-                tail.clone()
-            };
-            out.push(Value::from_str(&rendered));
+        let (ns, tail) = split_key_ns(key);
+        if ns == eff {
+            eff_keys.push((key.clone(), tail));
+        } else if merge_globals && ns == "::" {
+            glob_keys.push((key.clone(), tail));
         }
     }
-    // Non-global effective namespace, unqualified pattern: merge in global
-    // commands that aren't hidden by a local one.
-    if merge_globals && eff != "::" && !specific {
-        for key in &keys {
-            let (ns, tail) = split_key_ns(key);
-            if ns != "::" {
-                continue;
-            }
-            if let Some(sp) = &simple {
+    let mut out: Vec<Value> = Vec::new();
+    let mut listed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut push_matched = |keys: &[(String, String)], out: &mut Vec<Value>,
+                            listed: &mut std::collections::HashSet<String>,
+                            simple: Option<&String>, specific: bool| {
+        let tails: Vec<String> = keys.iter().map(|(_, t)| t.clone()).collect();
+        for tail in crate::interp::tclhash::tcl_order(&tails) {
+            if let Some(sp) = simple {
                 if !super::super::glob_match(sp, &tail) {
                     continue;
                 }
             }
-            if seen.insert(tail.clone()) {
-                out.push(Value::from_str(&tail));
+            if listed.insert(tail.clone()) {
+                // `::`-bearing patterns render the fully-qualified key
+                // (tclsh's InfoCommandsCmd); bare patterns the tail.
+                let rendered = if specific {
+                    keys.iter()
+                        .find(|(_, t)| *t == tail)
+                        .map(|(full, _)| {
+                            if full.starts_with("::") {
+                                full.clone()
+                            } else {
+                                format!("::{}", full)
+                            }
+                        })
+                        .unwrap_or_else(|| tail.clone())
+                } else {
+                    tail.clone()
+                };
+                out.push(Value::from_str(&rendered));
             }
         }
+    };
+    push_matched(&eff_keys, &mut out, &mut listed, simple.as_ref(), specific);
+    // Non-global effective namespace, unqualified pattern: merge in global
+    // commands that aren't hidden by a local one (global table's own
+    // replay order).
+    if merge_globals && eff != "::" && !specific {
+        push_matched(&glob_keys, &mut out, &mut listed, simple.as_ref(), false);
     }
-    out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     Ok(Value::from_list(&out))
 }
 
@@ -879,102 +900,168 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Some(p) => (Some(p.strip_prefix("::").unwrap_or(p)), p.starts_with("::")),
                 None => (None, false),
             };
-            // A `::`-qualified pattern searches the namespace/global table
-            // even from inside a proc (tclsh trace-18.4: a proc's
-            // `info vars ::ref::*` lists ::ref's variables — the frame's
-            // locals never carry a qualified name).
-            let source = if qualified {
-                &interp.globals
-            } else {
-                // Slot-compiled frames enumerate through the name-keyed
-                // store: migrate first (once per frame — later calls see
-                // empty slots and skip straight through).
-                interp.degrade_frame_all();
-                interp.scope_vars()
-            };
-            // Collect first: the filter below is pure name math, and the
-            // frame's link names join the pool here — `variable`/`global`
-            // links are link-only (no locals entry), but tclsh lists them
-            // while the link's target exists (master listed them only
-            // when an install-time seed had copied a value).
-            let mut names: Vec<String> = source
-                .keys()
-                .filter(|name| !is_array_element_name(name))
-                .cloned()
-                .collect();
-            if !qualified {
-                if let Some(frame) = interp.frames.last() {
-                    for name in frame.upvars.keys() {
-                        if !frame.locals.contains_key(&**name)
-                            && interp.get_var(name).is_ok()
-                        {
-                            names.push(name.to_string());
-                        }
-                    }
-                }
-            }
-            // At namespace scope the namespace's own variables report
-            // relative (tclsh: inside `namespace eval nn`, `info vars`
-            // lists `zz`, not `::nn::zz` — var-1.14); variables of child
-            // namespaces are not listed at all.
-            let ns_prefix = if interp.frames.is_empty() && interp.current_namespace.as_ref() != "::" {
+            // Pick the TABLE the query addresses, collect its live
+            // entries as (stored key, table tail), and replay the tails
+            // through the Tcl hash mechanics — tclsh's per-namespace var
+            // tables hash the short name, so the tail is the hash input.
+            //   - `::`-qualified pattern → the named namespace's table
+            //     (frame locals never carry a qualified name);
+            //   - inside a proc → the frame's table;
+            //   - inside `namespace eval nn` → ::nn's table;
+            //   - bare at global → ::'s table.
+            interp.degrade_frame_all();
+            let in_ns = interp.frames.is_empty()
+                && interp.current_namespace.as_ref() != "::";
+            let ns_prefix = if in_ns {
                 Some(format!("{}::", &interp.current_namespace[2..]))
             } else {
                 None
             };
-            let mut vars: Vec<Value> = names
-                .iter()
-                .filter_map(|name| {
-                    // Bare `info vars` at the global level lists only true
-                    // globals — namespace variables are invisible there
-                    // (`uplevel #0 {info vars}` == `info globals`,
-                    // namespace-old-7.4/7.7).  A pattern re-enables
-                    // qualified matching below.
-                    if ns_prefix.is_none() && match_pat.is_none() && name.contains("::") {
-                        return None;
-                    }
-                    let rel = match &ns_prefix {
-                        Some(pfx) => match name.strip_prefix(pfx.as_str()) {
-                            // This namespace's own variable: report the
-                            // tail.  Plain globals pass through; other
-                            // namespaces' (incl. child) vars are skipped.
-                            Some(rest) if !rest.contains("::") => rest,
-                            None if !name.contains("::") => name.as_str(),
-                            _ => return None,
-                        },
-                        None => name.as_str(),
+            let mut entries: Vec<(String, String)> = Vec::new();
+            let mut table_ns: Option<String> = None;
+            // A relative pattern carrying `::` (n::* at global) names a
+            // namespace's table just like a qualified one; results
+            // render qualified (tclsh: `info vars n::*` → `::n::v`).
+            let qualified = qualified
+                || match_pat.map(|p| p.contains("::")).unwrap_or(false);
+            if qualified {
+                // Walk the pattern's `::` qualifiers to the target table.
+                let stripped = pattern.unwrap().trim_start_matches(':').to_string();
+                let target_ns = match stripped.rfind("::") {
+                    Some(i) => format!("::{}", &stripped[..i]),
+                    None => "::".to_string(),
+                };
+                // No `namespaces.contains_key` gate: unset traces can
+                // run while the namespace itself is already deleted
+                // (trace-18.4) — the var table still answers.
+                {
+                    let prefix = if target_ns == "::" {
+                        String::new()
+                    } else {
+                        format!("{}::", &target_ns[2..])
                     };
-                    if let Some(p) = match_pat {
-                        // A `::`-bearing pattern can name the variable by
-                        // its stored key (1.11: `info vars
-                        // [namespace current]::*` inside the namespace).
-                        let hit = super::super::glob_match(p, rel)
-                            || (p.contains("::")
-                                && (super::super::glob_match(p, name)
-                                    || super::super::glob_match(
-                                        p, &format!("::{}", name),
-                                    )));
-                        if !hit {
-                            return None;
+                    for k in interp.var_order.iter() {
+                        if !interp.globals.contains_key(k.as_str())
+                            || is_array_element_name(k)
+                        {
+                            continue;
                         }
+                        let tail = match k.strip_prefix(prefix.as_str()) {
+                            Some(t) if !t.contains("::") => t.to_string(),
+                            _ => continue,
+                        };
+                        entries.push((k.clone(), tail));
                     }
-                    // Report qualified when the pattern asked for it, or
-                    // when the variable belongs to another namespace
-                    // (`info vars n::*` at global → `::n::v`).
-                    if qualified || (name.contains("::") && ns_prefix.is_none()) {
-                        if ns_prefix.is_some() && !name.contains("::") {
-                            return Some(Value::from_str(rel));
-                        }
-                        return Some(Value::from_str(&format!("::{}", name)));
+                    table_ns = Some(target_ns);
+                }
+            } else if !interp.frames.is_empty() {
+                let frame = interp.frames.last().unwrap();
+                for k in frame.locals_order.iter() {
+                    if !frame.locals.contains_key(k) || is_array_element_name(k) {
+                        continue;
                     }
-                    Some(Value::from_str(rel))
-                })
-                .collect();
-            vars.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-            // A namespace variable and a same-named global both render as
-            // the bare tail inside `namespace eval`; tclsh lists the name
-            // once.
-            vars.dedup_by(|a, b| a.as_str() == b.as_str());
+                    entries.push((k.clone(), k.clone()));
+                }
+                // `variable`/`global` links are link-only (no locals
+                // entry) but tclsh lists them while the target exists.
+                for name in frame.upvars.keys() {
+                    if !frame.locals.contains_key(&**name)
+                        && interp.get_var(name).is_ok()
+                    {
+                        entries.push((name.to_string(), name.to_string()));
+                    }
+                }
+            } else if let Some(pfx) = &ns_prefix {
+                // Namespace scope: that namespace's own table; plain
+                // globals are NOT listed bare here (tclsh var-1.14
+                // lists the ns's own variables as tails — the merge of
+                // visible globals is the render step's business).
+                for k in interp.var_order.iter() {
+                    if !interp.globals.contains_key(k.as_str())
+                        || is_array_element_name(k)
+                    {
+                        continue;
+                    }
+                    let tail = match k.strip_prefix(pfx.as_str()) {
+                        Some(t) if !t.contains("::") => t.to_string(),
+                        _ => continue,
+                    };
+                    entries.push((k.clone(), tail));
+                }
+            } else {
+                for k in interp.var_order.iter() {
+                    if interp.globals.contains_key(k.as_str())
+                        && !k.contains("::")
+                        && !is_array_element_name(k)
+                    {
+                        entries.push((k.clone(), k.clone()));
+                    }
+                }
+            }
+            // Frame tables iterate in insertion order (compiled locals
+            // array); global/ns tables replay the hash mechanics.
+            let ordered_tails = if !interp.frames.is_empty() && !qualified {
+                entries.iter().map(|(_, t)| t.clone()).collect()
+            } else {
+                let tails: Vec<String> =
+                    entries.iter().map(|(_, t)| t.clone()).collect();
+                super::super::tclhash::tcl_order(&tails)
+            };
+            let mut vars: Vec<Value> = Vec::new();
+            let mut listed: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for tail in ordered_tails {
+                let (stored, _) = entries
+                    .iter()
+                    .find(|(_, t)| *t == tail)
+                    .cloned()
+                    .unwrap_or((tail.clone(), tail.clone()));
+                let name = stored.as_str();
+                let rel = match &ns_prefix {
+                    Some(pfx) => match name.strip_prefix(pfx.as_str()) {
+                        Some(rest) if !rest.contains("::") => rest.to_string(),
+                        None if !name.contains("::") => name.to_string(),
+                        _ => continue,
+                    },
+                    None => tail.clone(),
+                };
+                if let Some(p) = match_pat {
+                    let hit = super::super::glob_match(p, &rel)
+                        || (p.contains("::")
+                            && (super::super::glob_match(p, name)
+                                || super::super::glob_match(p, &format!("::{}", name))));
+                    if !hit {
+                        continue;
+                    }
+                }
+                // Bare `info vars` at the global level lists only true
+                // globals (namespace-old-7.4/7.7); a pattern re-enables
+                // qualified matching below.
+                if table_ns.is_none()
+                    && ns_prefix.is_none()
+                    && !qualified
+                    && match_pat.is_none()
+                    && name.contains("::")
+                {
+                    continue;
+                }
+                // Report qualified when the pattern asked for it, or
+                // when the variable belongs to another namespace.
+                let rendered = if qualified
+                    || (name.contains("::") && ns_prefix.is_none())
+                {
+                    if ns_prefix.is_some() && !name.contains("::") {
+                        rel.clone()
+                    } else {
+                        format!("::{}", name)
+                    }
+                } else {
+                    rel
+                };
+                if listed.insert(rendered.clone()) {
+                    vars.push(Value::from_str(&rendered));
+                }
+            }
             Ok(Value::from_list(&vars))
         }
         "globals" => {
@@ -988,21 +1075,26 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
             let match_pat = pattern.map(|p| p.strip_prefix("::").unwrap_or(p));
-            let mut vars: Vec<Value> = interp
-                .globals
-                .keys()
-                // Namespace variables are not globals (tclsh: `info globals
-                // q::*` on a namespace var returns empty).
-                .filter(|name| !name.contains("::"))
-                .filter(|name| !is_array_element_name(name))
+            // :: var table in Tcl hash order: replay the insertion log
+            // (bare names only — namespace variables are not globals,
+            // tclsh: `info globals q::*` on a namespace var returns
+            // empty).
+            let names: Vec<String> = interp
+                .var_order
+                .iter()
+                .filter(|name| !name.contains("::") && !is_array_element_name(name))
+                .filter(|name| interp.globals.contains_key(name.as_str()))
+                .cloned()
+                .collect();
+            let vars: Vec<Value> = super::super::tclhash::tcl_order(&names)
+                .into_iter()
                 .filter(|name| {
                     match_pat
                         .map(|p| super::super::glob_match(p, name))
                         .unwrap_or(true)
                 })
-                .map(|name| Value::from_str(name))
+                .map(|name| Value::from_str(name.as_str()))
                 .collect();
-            vars.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             Ok(Value::from_list(&vars))
         }
         "body" => {
@@ -1203,14 +1295,25 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // (migrate first; later calls on the same frame skip through).
             interp.degrade_frame_all();
             if let Some(frame) = interp.frames.last() {
-                let mut vars: Vec<Value> = frame.locals.keys()
-                    .filter(|name| !is_array_element_name(name))
+                // Compiled procs keep locals in a linear array in table
+                // order (params first, then body locals) — `info locals`
+                // walks it in INSERTION order, not hash order.
+                let names: Vec<String> = frame
+                    .locals_order
+                    .iter()
+                    .filter(|name| {
+                        frame.locals.contains_key(name.as_str())
+                            && !is_array_element_name(name)
+                    })
+                    .cloned()
+                    .collect();
+                let vars: Vec<Value> = names
+                    .into_iter()
                     .filter(|name| {
                         pattern.map(|p| super::super::glob_match(p, name)).unwrap_or(true)
                     })
-                    .map(|name| Value::from_str(name))
+                    .map(|name| Value::from_str(name.as_str()))
                     .collect();
-                vars.sort_by(|a, b| a.as_str().cmp(b.as_str()));
                 Ok(Value::from_list(&vars))
             } else {
                 Ok(Value::from_str(""))
@@ -1222,9 +1325,9 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let mut chans: Vec<Value> = interp.channels.channel_names()
                 .into_iter()
                 .filter(|name| {
-                    pattern.map(|p| super::super::glob_match(p, name)).unwrap_or(true)
+                    pattern.map(|p| super::super::glob_match(p, name.as_str())).unwrap_or(true)
                 })
-                .map(Value::from_str)
+                .map(|name| Value::from_str(name.as_str()))
                 .collect();
             chans.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             Ok(Value::from_list(&chans))

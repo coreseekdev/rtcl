@@ -1029,6 +1029,46 @@ impl<'a> ExprParser<'a> {
     // -- Function calls ------------------------------------------------------
 
     fn parse_function_call(&mut self, name: &str) -> Result<Value> {
+        // tclsh lexes `nan`/`inf` as strobed CONSTANTS: a call syntax
+        // after them is operand + operator-less `(`, reported as
+        // "missing operator at _@_" with the mark right after the name —
+        // EXCEPT `nan(<integer>)`, which reaches the mathfunc and fails
+        // at conversion with the ARITH DOMAIN error (bn7/bn8 probes).
+        if name == "nan" || name == "inf" {
+            let src_text: String = self.chars.iter().collect();
+            let after: String = self.chars[self.pos.min(self.chars.len())..]
+                .iter()
+                .collect();
+            let int_arg = {
+                let t = after.trim_start();
+                let t = t.strip_prefix('(').unwrap_or("").trim();
+                let mut ok = !t.is_empty();
+                for (i, c) in t.chars().enumerate() {
+                    if c == ')' {
+                        ok = ok && i > 0;
+                        break;
+                    }
+                    if !(c.is_ascii_digit()
+                        || c == '-'
+                        || c == '+'
+                        || c == ' '
+                        || c == '\t')
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                ok
+            };
+            if !(name == "nan" && int_arg) {
+                // The mark sits right after the name's first occurrence.
+                let marked = src_text.replacen(name, &format!("{}_@_", name), 1);
+                return Err(Error::Msg(format!(
+                    "missing operator at _@_\nin expression \"{}\"",
+                    marked
+                )));
+            }
+        }
         self.expect("(")?;
         let mut args = Vec::new();
         self.func_arg_depth += 1;

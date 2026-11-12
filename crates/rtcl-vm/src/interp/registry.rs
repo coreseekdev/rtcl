@@ -33,6 +33,15 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "while",     func: loops::cmd_while,       cat: Language, cmd_id: None,                             usage: "test command",                        help: "Loop while condition is true" },
     CmdEntry { name: "for",       func: loops::cmd_for,         cat: Language, cmd_id: None,                             usage: "start test next command",              help: "C-style for loop" },
     CmdEntry { name: "break",     func: control::cmd_break,     cat: Language, cmd_id: None,                             usage: "?level?",                          help: "Break out of a loop" },
+    CmdEntry { name: "case",      func: control::cmd_case,      cat: Language, cmd_id: None,                             usage: "string ?in? ?pattern body ...?",     help: "Obsolete glob case dispatch (tclsh 8.6 keeps it)" },
+    CmdEntry { name: "coroutine", func: compat::cmd_coroutine,  cat: Standard, cmd_id: None,                             usage: "name cmd ?arg ...?",                 help: "Coroutine entry (engine stub; see DIVERGENCES)" },
+    CmdEntry { name: "fcopy",     func: chan_io::cmd_fcopy,     cat: Standard, cmd_id: None,                             usage: "input output ?-size size? ?-command callback?", help: "Copy between channels" },
+    CmdEntry { name: "load",      func: compat::cmd_load,       cat: Extension, cmd_id: None,                            usage: "?-global? ?-lazy? ?--? fileName ?packageName? ?interp?", help: "Load a binary extension (stub; no dynamic loader)" },
+    CmdEntry { name: "socket",    func: chan_io::cmd_socket,    cat: Extension, cmd_id: None,                            usage: "?-myaddr addr? ?-myport myport? ?-async? host port", help: "Open a TCP client connection" },
+    CmdEntry { name: "unload",    func: compat::cmd_unload,     cat: Extension, cmd_id: None,                            usage: "?-switch ...? fileName ?packageName? ?interp?", help: "Unload a loaded extension (stub)" },
+    CmdEntry { name: "yield",     func: compat::cmd_yield,      cat: Standard, cmd_id: None,                             usage: "?value?",                            help: "Yield from a coroutine (engine stub)" },
+    CmdEntry { name: "yieldto",   func: compat::cmd_yieldto,    cat: Standard, cmd_id: None,                             usage: "command ?arg ...?",                  help: "Yield with replacement command (engine stub)" },
+    CmdEntry { name: "zlib",      func: compat::cmd_zlib,       cat: Standard, cmd_id: None,                             usage: "subcommand ?arg ...?",               help: "Checksums real; compression stub (no DEFLATE)" },
     CmdEntry { name: "binary",    func: binary::cmd_binary,     cat: Standard, cmd_id: None,                             usage: "subcommand ?arg ...?",                help: "Convert between strings and binary data" },
     CmdEntry { name: "continue",  func: control::cmd_continue,  cat: Language, cmd_id: None,                             usage: "?level?",                          help: "Skip to next loop iteration" },
     CmdEntry { name: "return",    func: control::cmd_return,    cat: Language, cmd_id: None,                             usage: "?-code code? ?-level n? ?value?",  help: "Return from a procedure" },
@@ -151,7 +160,31 @@ static CMD_TABLE_ENSEMBLE: &[CmdEntry] = &[
     CmdEntry { name: "::tcl::dict::update", func: dict::cmd_dict_ens_update, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
     CmdEntry { name: "::tcl::dict::values", func: dict::cmd_dict_ens_values, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
     CmdEntry { name: "::tcl::dict::with", func: dict::cmd_dict_ens_with, cat: Standard, cmd_id: None, usage: "?arg ...?", help: "Dictionary operations (ensemble)" },
-    CmdEntry { name: "::tcl::mathop::+", func: misc::cmd_mathop_plus, cat: Standard, cmd_id: None, usage: "?value ...?", help: "Sum values (expr +)" },
+    // ::tcl::mathop operators, registered in tclsh 8.6.17's mathOpCmds[]
+    // order — the ::tcl::mathop namespace table iterates in this sequence.
+    CmdEntry { name: "::tcl::mathop::~", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "integer", help: "Bitwise not (expr ~)" },
+    CmdEntry { name: "::tcl::mathop::!", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "boolean", help: "Logical not (expr !)" },
+    CmdEntry { name: "::tcl::mathop::+", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "?value ...?", help: "Sum values (expr +)" },
+    CmdEntry { name: "::tcl::mathop::*", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "?value ...?", help: "Product (expr *)" },
+    CmdEntry { name: "::tcl::mathop::&", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "?integer ...?", help: "Bitwise and (expr &)" },
+    CmdEntry { name: "::tcl::mathop::|", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "?integer ...?", help: "Bitwise or (expr |)" },
+    CmdEntry { name: "::tcl::mathop::^", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "?integer ...?", help: "Bitwise xor (expr ^)" },
+    CmdEntry { name: "::tcl::mathop::**", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "?value ...?", help: "Power fold (expr **)" },
+    CmdEntry { name: "::tcl::mathop::<<", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "integer integer", help: "Shift left (expr <<)" },
+    CmdEntry { name: "::tcl::mathop::>>", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "integer integer", help: "Shift right (expr >>)" },
+    CmdEntry { name: "::tcl::mathop::%", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "integer integer", help: "Modulo (expr %)" },
+    CmdEntry { name: "::tcl::mathop::!=", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "Numeric != chain (expr !=)" },
+    CmdEntry { name: "::tcl::mathop::ne", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "String ne chain (expr ne)" },
+    CmdEntry { name: "::tcl::mathop::in", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value list", help: "List membership (expr in)" },
+    CmdEntry { name: "::tcl::mathop::ni", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value list", help: "Negated list membership (expr ni)" },
+    CmdEntry { name: "::tcl::mathop::-", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "Negate / subtract fold (expr -)" },
+    CmdEntry { name: "::tcl::mathop::/", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "Reciprocal / divide fold (expr /)" },
+    CmdEntry { name: "::tcl::mathop::<", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "Numeric < chain (expr <)" },
+    CmdEntry { name: "::tcl::mathop::<=", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "Numeric <= chain (expr <=)" },
+    CmdEntry { name: "::tcl::mathop::>", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "Numeric > chain (expr >)" },
+    CmdEntry { name: "::tcl::mathop::>=", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "Numeric >= chain (expr >=)" },
+    CmdEntry { name: "::tcl::mathop::==", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "Numeric == chain (expr ==)" },
+    CmdEntry { name: "::tcl::mathop::eq", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "String eq chain (expr eq)" },
     // ::tcl::pkgconfig — build-configuration query (tclPkgConfig.c parity);
     // keyed absolute so `::tcl::pkgconfig` resolves directly and the
     // relative `tcl::pkgconfig` falls through the `::`+name lookup.
@@ -242,7 +275,9 @@ static CMD_TABLE_EVENT: &[CmdEntry] = &[
 impl Interp {
     /// Insert a `CmdEntry` into the interpreter tables.
     fn register_entry(&mut self, entry: &CmdEntry) {
-        self.commands.insert(entry.name.to_string(), entry.func);
+        if self.commands.insert(entry.name.to_string(), entry.func).is_none() {
+            self.note_new_command(entry.name);
+        }
         self.command_categories.insert(entry.name.to_string(), entry.cat);
         self.command_meta.insert(entry.name.to_string(), CommandMeta {
             usage: entry.usage,
@@ -297,11 +332,148 @@ impl Interp {
         }
     }
 
+    /// tclsh 8.6.17's `::` command-table registration sequence, recovered
+    /// from tclBasic.c 8.6.17 + init.tcl + tclsh's stdin `history add`
+    /// auto-load, validated by replaying the Tcl hash-table mechanics
+    /// against the oracle's `info commands` (specs/tclhash/fit_model.py).
+    /// `info commands`/`info procs` replay the iteration order from this
+    /// sequence, so it must match tclsh exactly.
+    const TCL_INIT_CMD_ORDER: &[&str] = &[
+        // builtInCmds[] — generic core (8.6.17)
+        "append", "apply", "break", "case", "catch", "concat", "continue",
+        "coroutine", "error", "eval", "expr", "for", "foreach", "format",
+        "global", "if", "incr", "join", "lappend", "lassign", "lindex",
+        "linsert", "list", "llength", "lmap", "lrange", "lrepeat",
+        "lreplace", "lreverse", "lsearch", "lset", "lsort", "package",
+        "proc", "regexp", "regsub", "rename", "return", "scan", "set",
+        "split", "subst", "switch", "tailcall", "throw", "trace", "try",
+        "unset", "uplevel", "upvar", "variable", "while", "yield",
+        "yieldto",
+        // builtInCmds[] — OS interface
+        "after", "cd", "close", "eof", "exec", "exit", "fblocked",
+        "fconfigure", "fcopy", "fileevent", "flush", "gets", "glob",
+        "load", "open", "pid", "puts", "pwd", "read", "seek", "socket",
+        "source", "tell", "time", "unload", "update", "vwait",
+        // ensembles (TclInit*Cmd) + TclClockInit
+        "array", "binary", "chan", "dict", "encoding", "file", "info",
+        "namespace", "string", "clock",
+        // TclInterpInit, TclZlibInit
+        "interp", "zlib",
+        // init.tcl proc definitions (tclsh startup)
+        "tclLog", "unknown", "auto_load", "auto_load_index",
+        "auto_qualify", "auto_import", "auto_execok",
+        // tclsh stdin: RecordAndEvalObj's `history add` auto-loads history
+        // before the first user command
+        "history",
+    ];
+
+    /// Seed the command iteration order from [`Self::TCL_INIT_CMD_ORDER`]
+    /// (present builtins in tclsh sequence), then append rtcl's superset
+    /// commands and hide them from `info commands`.
+    pub(crate) fn seed_command_order(&mut self) {
+        self.hidden_commands.clear();
+        // The pre-seed log holds the REGISTRATION order (CMD_TABLE,
+        // stdlib defs, ensemble/proc creations) — keep it; the canonical
+        // names are re-emitted in tclsh's sequence first, the remaining
+        // entries follow in their original registration order (the
+        // ::tcl::mathop table must iterate exactly like tclsh's
+        // mathOpCmds[] sequence).
+        let old_log = std::mem::take(&mut self.command_order);
+
+        // Table keys may be stored bare or `::`-prefixed (stdlib
+        // `proc ::history` keeps its leading colons).
+        fn stored_key(interp: &Interp, k: &str) -> Option<String> {
+            let alt = format!("::{}", k);
+            for cand in [k, alt.as_str()] {
+                if interp.commands.contains_key(cand)
+                    || interp.procs.contains_key(cand)
+                    || interp.ensembles.contains_key(cand)
+                    || interp.import_aliases.contains_key(cand)
+                {
+                    return Some(cand.to_string());
+                }
+            }
+            None
+        }
+
+        // A key is hideable only when it names a :: TOP-LEVEL command
+        // outside the canonical set — namespaced commands (::q::p,
+        // ::tcl::tm::roots) are visible inside their namespaces, exactly
+        // like tclsh.
+        let canonical = |k: &str| Self::TCL_INIT_CMD_ORDER.contains(&k);
+        let hideable = |k: &str| -> bool {
+            let (ns, tail) = match k.rsplit_once("::") {
+                Some((p, t)) if !p.is_empty() => {
+                    (format!("::{}", p), t.to_string())
+                }
+                _ => (
+                    "::".to_string(),
+                    k.trim_start_matches("::").to_string(),
+                ),
+            };
+            ns == "::" && !canonical(&tail)
+        };
+
+        // Canonical pass: tclsh's registration sequence (the log carries
+        // the CANONICAL text; the listing walk maps stored `::`-prefixed
+        // variants back onto it).
+        let mut canonical_logged: Vec<String> = Vec::new();
+        for name in Self::TCL_INIT_CMD_ORDER {
+            if stored_key(self, name).is_some() {
+                self.command_order.push(name.to_string());
+                canonical_logged.push(name.to_string());
+            }
+        }
+
+        // Registration-order pass: every pre-seed live command joins the
+        // log; only the hideable ones (::-top-level non-canonical) are
+        // marked hidden — tclsh's visible :: surface is exactly the
+        // canonical 101.
+        let is_live = |interp: &Interp, k: &str| -> bool {
+            interp.commands.contains_key(k)
+                || interp.procs.contains_key(k)
+                || interp.ensembles.contains_key(k)
+                || interp.import_aliases.contains_key(k)
+                || {
+                    let alt = format!("::{}", k);
+                    interp.commands.contains_key(&alt)
+                        || interp.procs.contains_key(&alt)
+                        || interp.ensembles.contains_key(&alt)
+                        || interp.import_aliases.contains_key(&alt)
+                }
+        };
+        let canonical_names: std::collections::HashSet<&str> =
+            Self::TCL_INIT_CMD_ORDER.iter().copied().collect();
+        let mut seen: std::collections::HashSet<String> =
+            canonical_logged.iter().cloned().collect();
+        for k in &old_log {
+            if canonical_names.contains(k.as_str()) || seen.contains(k) {
+                continue;
+            }
+            if !is_live(self, k) {
+                continue;
+            }
+            seen.insert(k.clone());
+            if hideable(k) {
+                self.hidden_commands.insert(k.clone());
+            }
+            self.command_order.push(k.clone());
+        }
+    }
+
     // -- Command registration ------------------------------------------------
 
     /// Register an external command (always categorised as Extension).
+    /// Host-side extras are hidden from `info commands` (tclsh's visible
+    /// surface is exactly the canonical 101); a host overriding a
+    /// canonical name stays visible.
     pub fn register_command(&mut self, name: &str, func: CommandFunc) {
-        self.commands.insert(name.to_string(), func);
+        if self.commands.insert(name.to_string(), func).is_none() {
+            self.note_new_command(name);
+        }
+        if !Self::TCL_INIT_CMD_ORDER.contains(&name) {
+            self.hidden_commands.insert(name.to_string());
+        }
         self.command_categories.insert(name.to_string(), CommandCategory::Extension);
         // A host command shadowing a Tier-1 name (`set`/`if`/…) must
         // retire compiled bodies' inline folds, like the script-side
@@ -317,7 +489,12 @@ impl Interp {
         func: CommandFunc,
         meta: CommandMeta,
     ) {
-        self.commands.insert(name.to_string(), func);
+        if self.commands.insert(name.to_string(), func).is_none() {
+            self.note_new_command(name);
+        }
+        if !Self::TCL_INIT_CMD_ORDER.contains(&name) {
+            self.hidden_commands.insert(name.to_string());
+        }
         self.command_categories.insert(name.to_string(), CommandCategory::Extension);
         self.command_meta.insert(name.to_string(), meta);
         super::vm_exec::note_tier1_mutation(self, name);

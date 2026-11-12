@@ -80,19 +80,8 @@ proc curry {args} {
 # Note: rtcl already has native dict update via dict.rs, but this provides
 # the Tcl-level fallback if needed. We skip defining it if it already exists.
 
-# dict getdef — Get a value from a dict with a default if key doesn't exist.
-# Not in jimtcl but common in Tcl 8.7+.
-proc {dict getdef} {dictionary args} {
-    if {[llength $args] < 2} {
-        return -code error "wrong # args: should be \"dict getdef dictionary ?key ...? key default\""
-    }
-    set default [lindex $args end]
-    set keys [lrange $args 0 end-1]
-    if {[dict exists $dictionary {*}$keys]} {
-        return [dict get $dictionary {*}$keys]
-    }
-    return $default
-}
+# dict getdef (Tcl 8.7) intentionally absent — the oracle is tclsh
+# 8.6.17, where it is an unknown subcommand (DIVERGENCES dict trio).
 
 # ── ensemble ─────────────────────────────────────────────────────────────
 
@@ -381,3 +370,175 @@ proc ::tcl::tm::roots {paths} {
 namespace eval ::tcl::dict {}
 namespace eval ::tcl::mathop {}
 namespace eval ::tcl::unsupported {}
+
+# ── tclsh init.tcl surfaces (canonical registration order, rtcl port) ──
+# tclsh 8.6.17 defines these at startup in init.tcl; the iteration-order
+# corpus needs the same names visible in the same :: table.  rtcl is
+# self-contained (no filesystem auto_path scan): auto_load resolves only
+# explicit auto_index entries, auto_execs mirrors the trimmed exec search.
+
+proc tclLog {string} {
+    puts stderr $string
+}
+
+# [auto_qualify] — exact port of init.tcl's auto_qualify (candidate
+# names for a command in a namespace; two candidates when the namespace
+# is not global).
+proc auto_qualify {cmd namespace} {
+    # count separators and clean them up
+    # (making sure that foo:::::bar will be treated as foo::bar)
+    set n [regsub -all {::+} $cmd :: cmd]
+
+    # Ignore namespace if the name starts with ::
+    # Handle special case of only leading ::
+
+    if {[string match ::* $cmd]} {
+        if {$n > 1} {
+            # (::foo::bar , *) -> ::foo::bar
+            return [list $cmd]
+        } else {
+            # (::global , *) -> global
+            return [list [string range $cmd 2 end]]
+        }
+    }
+
+    # Potentially returning 2 elements to try:
+    if {$n == 0} {
+        if {$namespace eq "::"} {
+            # (nocolons , ::) -> nocolons
+            return [list $cmd]
+        } else {
+            # (nocolons , ::sub) -> ::sub::nocolons nocolons
+            return [list ${namespace}::$cmd $cmd]
+        }
+    } elseif {$namespace eq "::"} {
+        # (foo::bar , ::) -> ::foo::bar
+        return [list ::$cmd]
+    } else {
+        # (foo::bar , ::sub) -> ::sub::foo::bar ::foo::bar
+        return [list ${namespace}::$cmd ::$cmd]
+    }
+}
+
+# [auto_load_index] — tclsh scans tclIndex files on $auto_path; rtcl is
+# self-contained, so nothing is ever loaded (tclsh's "0" = not loaded).
+proc auto_load_index {} {
+    return 0
+}
+
+# [auto_load] — resolve via explicit auto_index entries only (tclsh's
+# filesystem tclIndex scan doesn't apply to the self-contained rtcl).
+proc auto_load {cmd {namespace {}}} {
+    global auto_index auto_path
+    if {$namespace eq ""} {
+        set namespace [uplevel 1 [list ::namespace current]]
+    }
+    set nameList [auto_qualify $cmd $namespace]
+    if {$cmd ni $nameList} {
+        lappend nameList $cmd
+    }
+    foreach name $nameList {
+        if {[info exists auto_index($name)]} {
+            namespace inscope :: $auto_index($name)
+            if {[namespace which -command $name] ne ""} {
+                return 1
+            }
+        }
+    }
+    if {![info exists auto_path]} {
+        return 0
+    }
+    return 0
+}
+
+# [auto_import] — invoked by [namespace import]; loads auto_index
+# entries matching the pattern (rtcl: explicit entries only).
+proc auto_import {pattern} {
+    global auto_index
+    foreach name [array names auto_index $pattern] {
+        if {[namespace which -command $name] eq ""} {
+            namespace inscope :: $auto_index($name)
+        }
+    }
+}
+
+# [auto_execs]/[auto_execok] — trimmed exec search over $env(PATH).
+variable auto_execs_arr
+proc auto_execok name {
+    variable auto_execs_arr
+    global env
+    if {[info exists auto_execs_arr($name)]} {
+        return $auto_execs_arr($name)
+    }
+    foreach dir [split [lindex [array get env PATH] 1] :] {
+        if {$dir eq ""} { continue }
+        set f [file join $dir $name]
+        if {[file executable $f]} {
+            set auto_execs_arr($name) [list $f]
+            return $auto_execs_arr($name)
+        }
+    }
+    set auto_execs_arr($name) ""
+    return ""
+}
+
+# [history] — trimmed port of tclsh 8.6 library/history.tcl: the event
+# list lives in ::tcl; add/event/info/keep are the observable surface.
+namespace eval ::tcl {
+    variable hist_events {}
+    variable hist_keep 20
+}
+proc ::history {args} {
+    # No subcommand: 'history info' (history.tcl's own preamble).
+    if {![llength $args]} {
+        set args info
+    }
+    tailcall ::tcl::history {*}$args
+}
+proc ::tcl::history {sub args} {
+    variable hist_events
+    variable hist_keep
+    switch -- $sub {
+        add {
+            set ev [lindex $args 0]
+            lappend hist_events $ev
+            if {[llength $hist_events] > $hist_keep} {
+                set hist_events [lrange $hist_events end-[expr {$hist_keep - 1}] end]
+            }
+        }
+        event {
+            set idx [lindex $args 0]
+            if {[string index $idx 0] eq "-"} {
+                set off [string range $idx 1 end]
+                if {$off == 0} { return [lindex $hist_events end] }
+                return [lindex $hist_events end-$off]
+            }
+            return [lindex $hist_events $idx]
+        }
+        info {
+            set out {}
+            set n [llength $hist_events]
+            set from [expr {$n > $hist_keep ? $n - $hist_keep : 0}]
+            for {set i $from} {$i < $n} {incr i} {
+                lappend out [format "%6d  %s" $i [lindex $hist_events $i]]
+            }
+            return [join $out \n]
+        }
+        keep {
+            set hist_keep [lindex $args 0]
+        }
+        clear {
+            set hist_events {}
+        }
+        nextid {
+            return [llength $hist_events]
+        }
+        change -
+        redo {
+            # Recorded-event editing has no interactive driver in rtcl.
+        }
+        default {
+            return -code error "bad option \"$sub\": must be add, change, clear, event, info, keep, nextid, or redo"
+        }
+    }
+}

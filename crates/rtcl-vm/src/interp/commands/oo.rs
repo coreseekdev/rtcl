@@ -372,7 +372,9 @@ fn builtin_method(name: &'static str) -> MethodDef {
 }
 
 fn register_object_command(interp: &mut Interp, key: &str, func: crate::command::CommandFunc) {
-    interp.commands.insert(key.to_string(), func);
+    if interp.commands.insert(key.to_string(), func).is_none() {
+        interp.note_new_command(key);
+    }
     interp
         .command_categories
         .insert(key.to_string(), crate::command::CommandCategory::Extension);
@@ -384,7 +386,9 @@ fn register_object_command(interp: &mut Interp, key: &str, func: crate::command:
 }
 
 fn register_oo_command(interp: &mut Interp, key: &str, usage: &'static str, func: crate::command::CommandFunc) {
-    interp.commands.insert(key.to_string(), func);
+    if interp.commands.insert(key.to_string(), func).is_none() {
+        interp.note_new_command(key);
+    }
     interp
         .command_categories
         .insert(key.to_string(), crate::command::CommandCategory::Extension);
@@ -405,8 +409,8 @@ const DEF_WORDS: &[&str] = &[
 
 /// Create the core classes and commands.  Called once from `Interp::new`.
 pub(crate) fn init(interp: &mut Interp) {
-    ensure_ns(&mut interp.namespaces, "::oo");
-    ensure_ns(&mut interp.namespaces, "::oo::define");
+    interp.ensure_ns_path("::oo");
+    interp.ensure_ns_path("::oo::define");
 
     // ::oo::object — the root class.  `destroy` is its own (core) method so
     // that `info class methods oo::object` shows it and every instance's
@@ -463,14 +467,16 @@ pub(crate) fn init(interp: &mut Interp) {
     for word in DEF_WORDS {
         let key = format!("::oo::define::{}", word);
         let body = format!("::tcl::oo::def {} {{*}}$args", word);
-        interp.procs.insert(
-            key,
+        if interp.procs.insert(
+            key.clone(),
             super::super::Rc::new(ProcDef {
                 params: super::super::Rc::new(vec![("args".to_string(), None)]),
                 body: super::super::Rc::from(body),
                 statics: super::super::Rc::new(HashMap::new()), compiled: None,
             }),
-        );
+        ).is_none() {
+            interp.note_new_command(&key);
+        }
     }
     interp.note_cmd_mutation();
 
@@ -485,23 +491,6 @@ pub(crate) fn init(interp: &mut Interp) {
 
 /// Ensure a namespace and its ancestors exist (local copy of the namespace
 /// module's `ensure_namespace`, which is private).
-fn ensure_ns(namespaces: &mut super::super::varmap::FxHashedMap<String, super::namespace::NamespaceInfo>, qualified: &str) {
-    namespaces.entry("::".to_string()).or_default();
-    if qualified == "::" {
-        return;
-    }
-    let parts: Vec<&str> = qualified.split("::").filter(|s| !s.is_empty()).collect();
-    let mut path = String::new();
-    for part in parts {
-        if path.is_empty() {
-            path = format!("::{}", part);
-        } else {
-            path = format!("{}::{}", path, part);
-        }
-        namespaces.entry(path.clone()).or_default();
-    }
-}
-
 /// Canonical candidates for an as-typed object name.
 fn object_key_candidates(interp: &Interp, typed: &str) -> Vec<String> {
     if typed.starts_with("::") {
@@ -1757,7 +1746,9 @@ fn attach_ns_commands(interp: &mut Interp, key: &str, ns: &str) {
             "self" => cmd_oo_self,
             _ => cmd_oo_next,
         };
-        interp.commands.insert(cmd_key.clone(), func);
+        if interp.commands.insert(cmd_key.clone(), func).is_none() {
+            interp.note_new_command(&cmd_key);
+        }
         interp
             .command_categories
             .insert(cmd_key.clone(), crate::command::CommandCategory::Extension);
@@ -1858,7 +1849,9 @@ fn attach_object(interp: &mut Interp, key: &str, ns: &str) {
     register_object_command(interp, key, cmd_oo_object);
     if parent_of(key) == "::" {
         let bare = key.trim_start_matches(':');
-        interp.commands.insert(bare.to_string(), cmd_oo_object);
+        if interp.commands.insert(bare.to_string(), cmd_oo_object).is_none() {
+            interp.note_new_command(bare);
+        }
         interp
             .command_categories
             .insert(bare.to_string(), crate::command::CommandCategory::Extension);
@@ -1867,7 +1860,7 @@ fn attach_object(interp: &mut Interp, key: &str, ns: &str) {
             crate::command::CommandMeta { usage: "methodName ?arg ...?", help: "Object command" },
         );
     }
-    ensure_ns(&mut interp.namespaces, ns);
+    interp.ensure_ns_path(ns);
     attach_ns_commands(interp, key, ns);
     interp.oo.creation_order.push(key.to_string());
 }
@@ -1878,7 +1871,7 @@ fn attach_object(interp: &mut Interp, key: &str, ns: &str) {
 fn ensure_parent_namespaces(interp: &mut Interp, full: &str) {
     if let Some((parent, _)) = full.rsplit_once("::") {
         if !parent.is_empty() {
-            ensure_ns(&mut interp.namespaces, parent);
+            interp.ensure_ns_path(parent);
         }
     }
 }
@@ -2789,7 +2782,9 @@ pub(crate) fn oo_rename(interp: &mut Interp, old_key: &str, new_key: &str) -> Re
         for ov in [old_key.to_string(), canon(old_key)] {
             if let Some(func) = interp.commands.remove(&ov) {
                 for nv in [new_key.to_string(), canon(new_key)] {
-                    interp.commands.insert(nv.clone(), func.clone());
+                    if interp.commands.insert(nv.clone(), func.clone()).is_none() {
+                        interp.note_new_command(&nv);
+                    }
                     if let Some(c) = interp.command_categories.remove(&ov).clone() {
                         interp.command_categories.insert(nv.clone(), c);
                     }
@@ -2926,7 +2921,7 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     for (k, v) in moving {
         let new_key = format!("{}{}", dst_prefix, &k[src_prefix.len()..]);
         let is_array = interp.array_globals.contains(&k);
-        interp.globals.insert(new_key.clone(), v);
+        interp.global_insert(new_key.clone(), v);
         if is_array {
             if new_key != "env" && new_key != "tcl_platform" {
                 interp.arrays_env_only = false;

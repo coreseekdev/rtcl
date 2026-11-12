@@ -186,6 +186,18 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10bis. 2026-11-12 第二轮收口：哈希/迭代序 + 命令面（已完成）
+
+§10.1 第 3/5/6 类 + 第 7 类部分已收口（见 DIVERGENCES.md 2026-11-12 节）：
+Tcl 哈希表序重放落地（`info commands` 101/101 全序一致、array names/
+vars/globals/locals、mathop 23 算子、dict info、-unordered/getdef 移除、
+nan/inf 词法、socket/fcopy/load/unload/zlib(crc32/adler32)/case/history
+等命令面补齐）。judge 88/88、probes 全 0 DIFF（新增 specs/order.probes
+48/48 + specs/expr-lex.probes 11/11）、cargo test 全绿。剩余 OPEN：
+coroutine/yield/yieldto 引擎、socket -async、zlib 压缩、chan names 的
+通道注册历史序、命令集再对齐时 hidden 表维护（host 桥用 namespace
+which 探测，勿用 info commands）。
+
 ## 10. 原生 Tk 与性能：下一 Session 待办（2026-11-12 交接）
 
 > perf/wave2 分支已合并回 master（`1017525`，283 提交）。原生 Tk 的

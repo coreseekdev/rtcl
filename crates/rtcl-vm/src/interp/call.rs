@@ -120,6 +120,7 @@ impl Interp {
         let mut frame = match self.frame_pool.pop() {
             Some(mut f) => {
                 f.locals.clear();
+                f.locals_order.clear();
                 f.array_locals.clear();
                 f.upvars.clear();
                 f.local_procs.clear();
@@ -133,6 +134,7 @@ impl Interp {
             }
             None => Box::new(CallFrame {
                 locals: VarMap::default(),
+                locals_order: Vec::new(),
                 array_locals: VarSet::default(),
                 upvars: UpvarMap::default(),
                 ns: None,
@@ -245,6 +247,7 @@ impl Interp {
                     frame.ns = Some(def_ns);
                 }
                 frame.locals.clear();
+                frame.locals_order.clear();
                 frame.array_locals.clear();
                 frame.upvars.clear();
                 // `info level 0` shows the invocation as dispatched: the
@@ -341,7 +344,7 @@ impl Interp {
                     if slot_mode {
                         frame.slots[i] = value;
                     } else {
-                        frame.locals.insert(param.clone(), value);
+                        super::vars::frame_local_insert(frame, param.clone(), value);
                     }
                 }
             }
@@ -367,8 +370,9 @@ impl Interp {
                     // `regular_params.len()` (params seeded in order, all
                     // candidates under the slot gate).
                     frame.slots[regular_params.len()] = Value::from_str(&list_str);
+                    frame.locals_order.push("args".to_string());
                 } else {
-                    frame.locals.insert("args".to_string(), Value::from_str(&list_str));
+                    super::vars::frame_local_insert(frame, "args".to_string(), Value::from_str(&list_str));
                 }
             }
 
@@ -430,7 +434,7 @@ impl Interp {
 
             // ── Inject static variables into the frame ─────────────
             for (sname, sval) in current_statics.iter() {
-                self.frames.last_mut().unwrap().locals.insert(sname.clone(), sval.clone());
+                super::vars::frame_local_insert(self.frames.last_mut().unwrap(), sname.clone(), sval.clone());
             }
 
             // ── Execute body ───────────────────────────────────────
@@ -706,6 +710,7 @@ impl Interp {
             if !traced.is_empty() {
                 if let Some(frame) = self.frames.last_mut() {
                     frame.locals.clear();
+                    frame.locals_order.clear();
                     frame.array_locals.clear();
                 }
                 // Trace callbacks must not disturb the error (if any) that is
@@ -729,6 +734,7 @@ impl Interp {
         // allocation).  Pool depth is naturally bounded by recursion.
         let mut popped = self.frames.pop().unwrap();
         popped.locals.clear();
+        popped.locals_order.clear();
         popped.array_locals.clear();
         popped.upvars.clear();
         popped.local_procs.clear();
@@ -1077,6 +1083,7 @@ impl Interp {
         let mut frame = match self.frame_pool.pop() {
             Some(mut f) => {
                 f.locals.clear();
+                f.locals_order.clear();
                 f.array_locals.clear();
                 f.upvars.clear();
                 f.local_procs.clear();
@@ -1090,6 +1097,7 @@ impl Interp {
             }
             None => Box::new(CallFrame {
                 locals: VarMap::default(),
+                locals_order: Vec::new(),
                 array_locals: VarSet::default(),
                 upvars: UpvarMap::default(),
                 ns: None,
@@ -1218,7 +1226,7 @@ impl Interp {
                 if slot_mode {
                     frame.slots[i] = value;
                 } else {
-                    frame.locals.insert(param.clone(), value);
+                    super::vars::frame_local_insert(frame, param.clone(), value);
                 }
             }
         }
@@ -1233,8 +1241,9 @@ impl Interp {
             let frame = self.frames.last_mut().unwrap();
             if slot_mode {
                 frame.slots[regular_params.len()] = Value::from_str(&list_str);
+                frame.locals_order.push("args".to_string());
             } else {
-                frame.locals.insert("args".to_string(), Value::from_str(&list_str));
+                super::vars::frame_local_insert(frame, "args".to_string(), Value::from_str(&list_str));
             }
         }
         {
@@ -1349,6 +1358,7 @@ impl Interp {
             if !traced.is_empty() {
                 if let Some(frame) = self.frames.last_mut() {
                     frame.locals.clear();
+                    frame.locals_order.clear();
                     frame.array_locals.clear();
                 }
                 let saved_info = self.err_info.take();
@@ -1439,6 +1449,7 @@ impl Interp {
     fn jit_frame_epilogue_pop(&mut self, prev_namespace: Rc<str>) {
         let mut popped = self.frames.pop().unwrap();
         popped.locals.clear();
+        popped.locals_order.clear();
         popped.array_locals.clear();
         popped.upvars.clear();
         popped.local_procs.clear();

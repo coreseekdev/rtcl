@@ -232,7 +232,7 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // `namespace eval n {variable v}; info exists n::v` → 0).
         let init_value = if i + 1 < args.len() {
             let val = args[i + 1].clone();
-            interp.globals.insert(qualified.to_string(), val);
+            interp.global_insert(qualified.to_string(), val);
             i += 2;
             Some(args[i - 1].clone())
         } else {
@@ -299,7 +299,11 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 None => interp.globals.get(&*qualified).cloned(),
             };
             if let Some(val) = seeded {
-                interp.frames[frame_idx].locals.insert(local_name, val);
+                super::super::vars::frame_local_insert(
+                    &mut interp.frames[frame_idx],
+                    local_name,
+                    val,
+                );
             }
         }
     }
@@ -321,7 +325,7 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let qualified = qualify(&interp.current_namespace, ns_name);
 
     // Ensure the namespace exists (create it and all ancestors)
-    ensure_namespace(&mut interp.namespaces, &qualified);
+    ensure_namespace(interp, &qualified);
 
     // Concatenate remaining args into the body
     let body = if args.len() == 4 {
@@ -685,23 +689,28 @@ fn ns_children(interp: &Interp, args: &[Value]) -> Result<Value> {
     let pattern = if args.len() >= 4 { Some(args[3].as_str()) } else { None };
 
     let prefix = if ns == "::" { "::".to_string() } else { format!("{}::", ns) };
-    let mut children = Vec::new();
-    for key in interp.namespaces.keys() {
-        if key == &ns { continue; }
-        // Direct child: starts with prefix and no further `::`
-        if let Some(tail) = key.strip_prefix(&prefix) {
-            if !tail.contains("::") {
-                if let Some(pat) = pattern {
-                    if crate::interp::glob_match(pat, tail) {
-                        children.push(key.as_str());
-                    }
-                } else {
-                    children.push(key.as_str());
-                }
-            }
-        }
-    }
-    children.sort();
+    // tclsh walks the parent namespace's child TABLE (Tcl hash order):
+    // replay the creation log filtered to direct children.
+    let live = |key: &str| -> bool {
+        key != ns.as_str()
+            && key.strip_prefix(prefix.as_str())
+                .map(|tail| !tail.contains("::"))
+                .unwrap_or(false)
+            && interp.namespaces.contains_key(key)
+    };
+    let children = super::super::vars::replay_order(&interp.ns_order, |k| live(k))
+        .into_iter()
+        .filter(|key| {
+            pattern
+                .map(|p| {
+                    crate::interp::glob_match(
+                        p,
+                        key.strip_prefix(prefix.as_str()).unwrap_or(key),
+                    )
+                })
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
     Ok(Value::from_str(&children.join(" ")))
 }
 
@@ -858,7 +867,8 @@ fn ns_export(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         given.push(pat.to_string());
     }
 
-    let info = interp.namespaces.entry(ns.to_string()).or_default();
+    ensure_namespace(interp, ns.as_ref());
+    let info = interp.namespaces.get_mut(ns.as_ref()).unwrap();
     if clear {
         info.export_patterns.clear();
     }
@@ -1035,7 +1045,9 @@ fn ns_import(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         for (target, full_name) in binds {
             super::super::vm_exec::note_tier1_mutation(interp, &target);
-            interp.import_aliases.insert(target, full_name);
+            if interp.import_aliases.insert(target.clone(), full_name).is_none() {
+                interp.note_new_command(&target);
+            }
         }
         interp.note_cmd_mutation();
     }
@@ -1397,7 +1409,9 @@ fn ens_create(interp: &mut Interp, opts: &[Value]) -> Result<Value> {
         }
         i += 2;
     }
-    interp.ensembles.insert(name, def);
+    if interp.ensembles.insert(name.clone(), def).is_none() {
+        interp.note_new_command(&name);
+    }
     interp.note_cmd_mutation();
     Ok(Value::empty())
 }
@@ -2135,27 +2149,11 @@ pub(crate) fn origin_of(interp: &Interp, name: &str) -> Option<String> {
     Some(key)
 }
 
-/// Ensure that a namespace and all its ancestors exist in the namespace table.
-pub(crate) fn ensure_namespace(
-    namespaces: &mut crate::interp::varmap::FxHashedMap<String, NamespaceInfo>,
-    qualified: &str,
-) {
-    // Always ensure "::" exists
-    namespaces.entry("::".to_string()).or_default();
-    if qualified == "::" {
-        return;
-    }
-    // Walk from root to leaf, creating any missing intermediate namespaces.
-    let parts: Vec<&str> = qualified.split("::").filter(|s| !s.is_empty()).collect();
-    let mut path = String::from("::");
-    for (i, part) in parts.iter().enumerate() {
-        if i == 0 {
-            path = format!("::{}", part);
-        } else {
-            path = format!("{}::{}", path, part);
-        }
-        namespaces.entry(path.clone()).or_default();
-    }
+/// Ensure that a namespace and all its ancestors exist in the namespace
+/// table (delegates to [`Interp::ensure_ns_path`], which also logs the
+/// creation order for the `namespace children` replay).
+pub(crate) fn ensure_namespace(interp: &mut Interp, qualified: &str) {
+    interp.ensure_ns_path(qualified);
 }
 
 #[cfg(test)]

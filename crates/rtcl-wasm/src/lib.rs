@@ -159,7 +159,14 @@ mod native_tests {
                 Ok(Value::from_str(&format!("native<{}>", args[1].as_str())))
             });
         assert_eq!(handle.exec("mk x").expect("exec"), "native<x>");
-        // _js_dispatch (registered internally) still present.
-        assert!(handle.exec("info commands _js_dispatch").expect("exec").contains("_js_dispatch"));
+        // _js_dispatch (registered internally) still present: host
+        // bridges register hidden from `info commands` (tclsh's visible
+        // :: surface is the canonical 101), so probe the tables.
+        assert_eq!(
+            handle
+                .exec("namespace which -command _js_dispatch")
+                .expect("exec"),
+            "::_js_dispatch"
+        );
     }
 }

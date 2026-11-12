@@ -1,0 +1,51 @@
+# Tcl hash-table iteration order — tclsh 8.6.17 vs rtcl (2026-11-12).
+# Covers: info commands/vars/globals/procs, array names/keys/values,
+# namespace children, tcl_platform elements, user command order.
+puts [llength [info commands]]
+puts [info commands]
+puts [info globals]
+puts [array names tcl_platform]
+array set a {b 1 a 2 c 3 z 4 y 5}; puts [array names a]
+array set a {one 1 two 2 three 3 four 4 five 5 six 6 seven 7 eight 8 nine 9 ten 10}; puts [array names a]
+array set a {q 1 w 2 e 3 r 4 t 5 y 6 u 7 i 8 o 9 p 10 a 11 s 12 d 13 f 14 g 15 h 16 j 17 k 18 l 19 z 20 x 21 c 22 v 23 b 24 n 25 m 26}; puts [array names a]
+array set a {one 1 two 2 three 3 four 4 five 5 six 6 seven 7 eight 8 nine 9 ten 10 eleven 11 twelve 12 thirteen 13 fourteen 14 fifteen 15}; puts [array names a]
+array set a {alpha 1 beta 2 gamma 3 delta 4 epsilon 5 zeta 6 eta 7 theta 8 iota 9 kappa 10 lambda 11 mu 12 nu 13 xi 14}; puts [array names a]
+array set a {k01 1 k02 2 k03 3 k04 4 k05 5 k06 6 k07 7 k08 8 k09 9 k10 10 k11 11 k12 12}; puts [array names a]
+array set z {k1 1 k2 2 k3 3 k4 4 k5 5 k6 6 k7 7 k8 8 k9 9 k10 10}; unset z(k3); puts [lsort [array names z]]
+proc zz_alpha {} {}; proc zz_beta {} {}; proc zz_gamma {} {}; puts [info commands zz_*]
+namespace eval q {variable v1 1; variable v2 2}; puts [info vars ::q::*]
+namespace eval q {variable a 1; variable b 2; variable c 3}; puts [info vars ::q::*]
+namespace eval n1 {}; namespace eval n2 {}; namespace eval n3 {}; puts [lsort [namespace children ::]]
+set b 1; set a 2; set c 3; puts [info vars]
+set g1 1; namespace eval m {variable v 5}; puts [info vars m::*]
+namespace eval nn {variable zz 9; set y 8}; puts [info vars]
+proc p {qq ww} {set e 1; return [info locals]}; puts [p 1 2]
+proc t1 {} {foreach a {b c} {}; return [info vars]}; puts [t1]
+dict create k1 1 k2 2 k3 3 k4 4 k5 5 k6 6 k7 7 k8 8; puts [dict keys [dict create k1 1 k2 2 k3 3 k4 4 k5 5 k6 6 k7 7 k8 8]]
+puts [dict info [dict create x 1]]
+puts [dict info [dict create a 1 b 2 c 3 d 4 e 5]]
+puts [auto_qualify ::foo::bar ::blue]
+puts [auto_qualify nocolons ::]
+puts [auto_qualify foo::bar ::sub]
+history add evt1; history add evt2; puts [history event -1]
+puts [zlib crc32 hello]
+puts [zlib adler32 hello]
+case a in a {puts hit1} default {puts miss}
+case x in {a b c} {puts multi} default {puts nomulti}
+case z {a 1}; catch {case z {a 1}} e; puts $e
+case q {a {puts no}} ; puts empty-ok
+puts [info commands ::tcl::mathop::*]
+puts [tcl::mathop::* ]
+puts [tcl::mathop::- 5]
+puts [tcl::mathop::/ 2]
+puts [tcl::mathop::/ 100 5 2]
+puts [tcl::mathop::< 1 2 3]
+puts [tcl::mathop::in 3 {1 2 3}]
+puts [tcl::mathop::** 2 3 2]
+puts [tcl::mathop::& ]
+puts [tcl::mathop::>> -8 1]
+catch {tcl::mathop::% 7} e; puts $e
+catch {tcl::mathop::in 3} e; puts $e
+puts [dict info [dict create x 1]]
+puts [dict info [dict create a 1 b 2 c 3 d 4 e 5]]
+catch {dict getdef {a 1} b 9} m; puts [list [catch {dict getdef {a 1} b 9} m] [string match {*unknown or ambiguous subcommand*} $m]]

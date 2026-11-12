@@ -878,7 +878,7 @@ fn validate_handler_methods(
         match resolve_prefix(table, name) {
             Ok(m) => methods.push(m.to_string()),
             Err(()) => {
-                interp.globals.insert(
+                interp.global_insert(
                     "errorCode".to_string(),
                     Value::from_str(&format!(
                         "TCL LOOKUP INDEX method {}",
@@ -902,6 +902,75 @@ fn validate_handler_methods(
     Ok(methods)
 }
 
+/// `fcopy input output ?-size size? ?-command callback?` — identical
+/// semantics to `chan copy` (tclsh: both share TclCopyChannel; only the
+/// usage text names the entry command).
+pub fn cmd_fcopy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let _ = args;
+    // chan_copy raises `chan copy ...` usage text; retag the few usage
+    // paths by pre-validating here with the fcopy text.
+    if args.len() < 2 || args.len() > 6 {
+        return Err(Error::wrong_args_msg(
+            "wrong # args: should be \"fcopy input output ?-size size? ?-command callback?\""
+                .to_string(),
+        ));
+    }
+    chan_copy(interp, args)
+}
+
+/// `socket ?-myaddr addr? ?-myport myport? ?-async? host port` /
+/// `socket -server command ?-myaddr addr? port` — client connections
+/// only in rtcl (server sockets need an accept loop; DIVERGENCES).
+pub fn cmd_socket(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::wrong_args_msg(
+            "wrong # args: should be \"socket ?-myaddr addr? ?-myport myport? ?-async? host port\" or \"socket -server command ?-myaddr addr? port\""
+                .to_string(),
+        ));
+    }
+    // Option window: leading -myaddr/-myport/-async words; `-server` is
+    // accepted as the two-form discriminator and rejected with tclsh's
+    // message only when it reaches the client path (server sockets are
+    // not supported).
+    let mut i = 1;
+    while i < args.len() && args[i].as_str().starts_with('-') {
+        let o = args[i].as_str();
+        if o == "-async" {
+            i += 1;
+        } else if o == "-myaddr" || o == "-myport" {
+            if i + 1 >= args.len() {
+                return Err(Error::wrong_args_msg(
+                    "wrong # args: should be \"socket ?-myaddr addr? ?-myport myport? ?-async? host port\" or \"socket -server command ?-myaddr addr? port\""
+                        .to_string(),
+                ));
+            }
+            i += 2;
+        } else if o == "-server" {
+            return Err(Error::runtime(
+                "server sockets are not supported in rtcl",
+                crate::error::ErrorCode::Io,
+            ));
+        } else {
+            return Err(Error::runtime(
+                format!("bad option \"{}\": must be -async, -myaddr, -myport, or -server", o),
+                crate::error::ErrorCode::Generic,
+            ));
+        }
+    }
+    if args.len() - i != 2 {
+        return Err(Error::wrong_args_msg(
+            "wrong # args: should be \"socket ?-myaddr addr? ?-myport myport? ?-async? host port\" or \"socket -server command ?-myaddr addr? port\""
+                .to_string(),
+        ));
+    }
+    let host = args[i].as_str();
+    let port = args[i + 1].as_str();
+    let id = interp.channels.open_socket(host, port).map_err(|msg| {
+        Error::runtime(msg, crate::error::ErrorCode::Io)
+    })?;
+    Ok(Value::from_str(id.as_str()))
+}
+
 /// Tcl's "must be a, b, or c" rendering of an option table.
 fn must_be_list(table: &[&str]) -> String {
     match table.len() {
@@ -922,7 +991,7 @@ pub fn cmd_chan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let resolved = match resolve_prefix(CHAN_SUBCOMMANDS, sub) {
         Ok(s) => s,
         Err(()) => {
-            interp.globals.insert(
+            interp.global_insert(
                 "errorCode".to_string(),
                 Value::from_str(&format!("TCL LOOKUP SUBCOMMAND {}", crate::value::tcl_quote(sub))),
             );
@@ -1058,7 +1127,7 @@ pub fn cmd_chan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .count()
                 > 1;
             if resolve_prefix(EVENTS, event).is_err() {
-                interp.globals.insert(
+                interp.global_insert(
                     "errorCode".to_string(),
                     Value::from_str(&format!(
                         "TCL LOOKUP INDEX {{event name}} {}",
@@ -1172,7 +1241,7 @@ pub fn cmd_chan(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 /// `chan postevent` on a non-reflected channel.
 fn chan_not_found_reflected(interp: &mut Interp, id: &str) -> Error {
-    interp.globals.insert(
+    interp.global_insert(
         "errorCode".to_string(),
         Value::from_str(&format!("TCL LOOKUP CHANNEL {}", crate::value::tcl_quote(id))),
     );
@@ -1195,8 +1264,8 @@ fn chan_names(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         .channels
         .channel_names()
         .into_iter()
-        .filter(|name| pattern.map(|p| super::super::glob_match(p, name)).unwrap_or(true))
-        .map(Value::from_str)
+        .filter(|name| pattern.map(|p| super::super::glob_match(p, name.as_str())).unwrap_or(true))
+        .map(|name| Value::from_str(name.as_str()))
         .collect();
     Ok(Value::from_list(&names))
 }
@@ -1214,7 +1283,7 @@ fn chan_pending(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         Ok("input") => true,
         Ok("output") => false,
         Err(()) | Ok(_) => {
-            interp.globals.insert(
+            interp.global_insert(
                 "errorCode".to_string(),
                 Value::from_str(&format!(
                     "TCL LOOKUP INDEX mode {}",
@@ -1266,7 +1335,7 @@ fn chan_create(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok("read") if !modes.iter().any(|x| x == "read") => modes.push("read".to_string()),
             Ok("write") if !modes.iter().any(|x| x == "write") => modes.push("write".to_string()),
             _ => {
-                interp.globals.insert(
+                interp.global_insert(
                     "errorCode".to_string(),
                     Value::from_str(&format!(
                         "TCL LOOKUP INDEX mode {}",

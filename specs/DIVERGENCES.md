@@ -79,6 +79,55 @@
 
 非缺陷、不再修：`string byterange` 是 rtcl 扩展，tclsh 无此子命令。
 
+## 2026-11-12 哈希/迭代序对齐 + 命令面补齐（judge 88/88；order.probes 48/48）
+
+本轮收口（Tcl 哈希表迭代序 —— 原 2026-11-08 清单第 3/5 类的序类根因）：
+
+- **tclhash 重放模型**（crates/rtcl-vm/src/interp/tclhash.rs）：忠实重放
+  tclsh 8.6.17 `Tcl_HashTable`（tclHash.c）——`h = h*9 + byte`（u64）、
+  `hash & mask` 索引、4 桶起步、rebuildSize=size×3、重建 ×4 且按旧表
+  桶序头插重排、迭代桶 0..N 链头→尾。Python 拟合经 20 例随机数组 +
+  letters26/words15（重建路径）+ `dict info` 桶直方图全验证；模型与
+  8.6.17 源码逐条对上（specs/tclhash/fit_model.py + init_order_8_6_17.txt）。
+- **插入序日志**：Interp 增加 command_order/var_order/ns_order 与
+  per-frame locals_order；写点经 global_insert/frame_local_insert/各
+  register/note 钩子记录。迭代面（info commands/procs/vars/globals/
+  locals、array names/keys/values/get、namespace children、dict info）
+  从排序输出改为**按表重放**：命名空间表按**尾名**哈希（tclsh 每 ns
+  一张表），帧表按**插入序**（tclsh 编译帧是线性局部数组，非哈希），
+  删除项惰性过滤、重复键取最后出现（Tcl delete+recreate 语义）。
+- **`info commands` 精确对齐**：canonical 101 命令注册序从 8.6.17
+  tclBasic.c builtInCmds[] + ensembleCommands + TclClockInit/
+  TclInterpInit/TclZlibInit + init.tcl proc 定义序 + tclsh stdin 的
+  `history add` auto-load 反推，重放验证 101/101 全序一致；rtcl 超集
+  命令（lambda/curry/parray/`dict getdef` 空格名注册等）标记
+  hidden——可调用但不出现在 info commands（host 桥同理；http.tcl 桥
+  探测改 namespace which）。`::tcl::mathop` 全 23 算子按
+  mathOpCmds[] 注册序落地（** 右折叠、一元 / 为实除 0.5、
+  in/ni/`%`/`<<`/`>>`/`~`/`!` 限元），命名空间表序与 tclsh 全同。
+- **init.tcl 面补齐**：tclLog/auto_qualify（逐分支移植）/auto_load/
+  auto_load_index/auto_import/auto_execok/history（裁剪移植）+
+  case 内建（tclCmdAH.c Tcl_CaseObjCmd 逐分支移植）+ socket（TCP
+  客户端；-async 不支持延迟报错，记 OPEN）/fcopy（=chan copy）/
+  load/unload（无动态加载器，缺文件文案逐字）/zlib（crc32/adler32
+  真实现；压缩记 OPEN）+ ::zlib 命名空间。`info commands` 计数
+  101 == tclsh。
+- **dict 三例收口**：`dict create -ordered/-unordered`（8.7/jimtcl
+  特性）移除——前导词就是键、奇数个即标准 arity 错；stdlib 空格名
+  proc `{dict getdef}`（8.7）删除（报 unknown or ambiguous）；`dict
+  info` 按 Tcl_HashStats 输出桶直方图 + 平均搜索距离（%.1f）。
+- **expr 词法**（bn7/bn8 族）：`nan`/`inf` 按 tclsh 词法处理为
+  **常量**——后随 `(` 即 missing operator at _@_（标记紧跟名字，
+  `nan(<整数>)` 例外：到达 mathfunc 报 ARITH DOMAIN）；未知函数报
+  `invalid command name "tcl::mathfunc::<name>"`（expr-38.12）。
+- **socket/chan**：socket TCP 客户端落地（错误前缀
+  `couldn't open socket: <strerror>` 与 tclsh 同式；通道名 rtcl 用
+  sockN、tclsh 用指针名——OPEN）；chan names 保持创建序（tclsh 的
+  通道表哈希序依赖注册历史，纯重放不吻合——见 2026-11-08 第 5 类，
+  记 OPEN）。
+
+新探针：specs/order.probes（48/48）、specs/expr-lex.probes（11/11）。
+
 ## 2026-11-08 增量求值落地 + 第二轮对齐（probes 97 → 80）
 
 设计定谳：**增量求值只属于解释执行路径**。REPL、`-c`、`eval`、

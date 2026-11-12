@@ -1,0 +1,14 @@
+# expr 词法小尾巴（DIVERGENCES bn7/bn8/bn13 族）——nan/inf 常量词法与
+# mathfunc 分派文案。
+catch {expr {nan()}} e; puts $e
+catch {expr {nan(1)}} e; puts $e
+catch {expr {nan(0.5)}} e; puts $e
+catch {expr {inf(1)}} e; puts $e
+catch {expr {foo()}} e; puts $e
+catch {expr {foo(1)}} e; puts $e
+catch {expr {sin()}} e; puts $e
+catch {expr {1 << 2.5}} e; puts $e
+catch {expr {4.0 >> 1}} e; puts $e
+catch {expr nan} e; puts $e
+puts [expr inf]
+puts [expr {-inf}]

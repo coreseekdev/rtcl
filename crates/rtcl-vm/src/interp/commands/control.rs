@@ -515,6 +515,85 @@ fn set_regexp_match_vars(
     Ok(())
 }
 
+/// `case string ?in? ?pattern body ...? ?default body?` — tclsh 8.6's
+/// obsolete-but-present `case` (tclCmdAH.c Tcl_CaseObjCmd port): each
+/// pattern is either a single glob pattern or a Tcl list of them;
+/// `default` (exact word) matches anything; a single lumped pair-list
+/// argument is split; no match returns an empty result (not an error).
+pub fn cmd_case(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 3 {
+        return Err(Error::wrong_args_with_usage(
+            "case",
+            1,
+            args.len(),
+            "string ?in? ?pattern body ...? ?default body?",
+        ));
+    }
+    let string = args[1].as_str().to_string();
+    let start = if args[2].as_str() == "in" { 3 } else { 2 };
+    let mut pairs: Vec<Value> = args[start..].to_vec();
+    if pairs.len() == 1 {
+        // All pattern/command pairs lumped into a single list argument.
+        pairs = pairs
+            .remove(0)
+            .as_list_strict()
+            .map_err(|e| Error::runtime(e.message, crate::error::ErrorCode::Generic))?;
+    }
+    let mut body: Option<usize> = None;
+    let mut i = 0;
+    while i < pairs.len() {
+        if i == pairs.len() - 1 {
+            interp.result = Value::empty();
+            return Err(Error::runtime(
+                "extra case pattern with no body",
+                crate::error::ErrorCode::Generic,
+            ));
+        }
+        let pat = pairs[i].as_str().to_string();
+        // Single pattern word without whitespace or backslash sequences.
+        let single = !pat.chars().any(|c| c.is_whitespace() || c == '\\');
+        let mut matched = false;
+        if single {
+            if pat == "default" {
+                body = Some(i + 1);
+            }
+            if crate::interp::glob_match(&pat, &string) {
+                body = Some(i + 1);
+                matched = true;
+            }
+        } else {
+            let alts = pairs[i]
+                .as_list_strict()
+                .map_err(|e| Error::runtime(e.message, crate::error::ErrorCode::Generic))?;
+            for alt in alts {
+                if crate::interp::glob_match(alt.as_str(), &string) {
+                    body = Some(i + 1);
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if matched {
+            break;
+        }
+        i += 2;
+    }
+    match body {
+        Some(b) => {
+            let arm = pairs[b - 1].as_str().to_string();
+            let r = interp.eval(pairs[b].as_str());
+            if let Err(e) = &r {
+                if interp.err_is_error(e) {
+                    interp.err_exit_frame(&format!("\"{}\" arm", arm));
+                }
+            }
+            r
+        }
+        // Nothing matched: return nothing.
+        None => Ok(Value::empty()),
+    }
+}
+
 pub fn cmd_break(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Tcl 8.6 `break` takes no arguments — any argument is an arity
     // error (`break foo` / `break 2` → wrong # args, for-3.1).

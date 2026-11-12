@@ -23,6 +23,8 @@ pub mod clock;
 pub mod package;
 #[cfg(feature = "io")]
 pub mod chan_io;
+pub mod compat;
+pub mod mathop;
 #[cfg(feature = "exec")]
 pub mod exec_cmd;
 pub mod namespace;

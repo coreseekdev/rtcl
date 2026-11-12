@@ -11,7 +11,7 @@ puts [dict info {a 1}]
 catch {dict set a(1) k v} m; puts "$m | [info exists a(1)]"
 catch {dict get {a 1} b} m o; puts [dict get $o -errorcode]
 catch {dict update d} m; puts $m
-puts [dict size [dict create -unordered a 1 b 2 c 3]]
+catch {dict size [dict create -unordered a 1 b 2 c 3]} e; puts $e
 puts [catch {dict getdef {a 1} b 9} m]; puts $m
 set d {k {x 1}}; set sub [dict get $d k]; dict set d k y 2; puts "$sub | $d"
 set d {a 1 b 2}; dict update d a v {unset v}; puts $d

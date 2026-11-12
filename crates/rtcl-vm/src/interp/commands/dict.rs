@@ -150,22 +150,12 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
     let subcmd = subcmd.as_str();
     match subcmd {
-        // ── dict create ?-ordered|-unordered? ?key value ...? ──
+        // ── dict create ?key value ...? ──────────────────────────
+        // No -ordered/-unordered options: those are Tcl 8.7/jimtcl
+        // extensions; 8.6 takes only pairs (a leading "-unordered" is
+        // just a key, and an odd count is the standard arity error).
         "create" => {
-            let mut start = 2;
-            let mut ordered = true;
-            if args.len() > 2 {
-                match args[2].as_str() {
-                    "-unordered" => {
-                        ordered = false;
-                        start = 3;
-                    }
-                    "-ordered" => {
-                        start = 3;
-                    }
-                    _ => {}
-                }
-            }
+            let start = 2;
             if !(args.len() - start).is_multiple_of(2) {
                 return Err(Error::wrong_args_with_usage(
                     "dict create",
@@ -174,11 +164,8 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "?key value ...?",
                 ));
             }
-            let mut entries = if ordered {
-                DictMap::ordered_with_capacity((args.len() - start) / 2)
-            } else {
-                DictMap::unordered_with_capacity((args.len() - start) / 2)
-            };
+            let mut entries =
+                DictMap::ordered_with_capacity((args.len() - start) / 2);
             for c in args[start..].chunks(2) {
                 entries.insert(c[0].as_str().to_string(), c[1].clone());
             }
@@ -817,13 +804,31 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "dictionary",
                 ));
             }
+            // tclsh's Tcl_HashStats over the dict's string-key table: the
+            // table is built inserting pairs in list order, so replay the
+            // keys through the hash mechanics (interp::tclhash).
             let entries = borrow_dict(interp, &args[2])?;
-            let kind = if entries.is_ordered() { "ordered" } else { "unordered" };
-            Ok(Value::from_str(&format!(
-                "{} entries in {} dict",
+            let keys: Vec<String> = entries
+                .iter()
+                .map(|(k, _)| k.to_string())
+                .collect();
+            let (buckets, hist, avg) = crate::interp::tclhash::tcl_table_stats(&keys);
+            let mut out = format!(
+                "{} entries in table, {} buckets\n",
                 entries.len(),
-                kind,
-            )))
+                buckets
+            );
+            const LABELS: [&str; 11] = [
+                "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10 or more",
+            ];
+            for (i, label) in LABELS.iter().enumerate() {
+                out.push_str(&format!(
+                    "number of buckets with {} entries: {}\n",
+                    label, hist[i]
+                ));
+            }
+            out.push_str(&format!("average search distance for entry: {:.1}", avg));
+            Ok(Value::from_str(&out))
         }
 
         // ── dict getwithdefault dictionary ?key ...? key default
@@ -1264,19 +1269,7 @@ mod tests {
         assert_eq!(r.as_str(), "15");
     }
 
-    #[test]
-    fn test_dict_getdef_tcl() {
-        let mut interp = Interp::new();
-        assert_eq!(
-            interp.eval(r#"dict getdef {a 1 b 2} c "fallback""#).unwrap().as_str(),
-            "fallback"
-        );
-        assert_eq!(
-            interp.eval(r#"dict getdef {a 1 b 2} a "fallback""#).unwrap().as_str(),
-            "1"
-        );
-    }
-
+    
     #[test]
     fn test_dict_filter_key() {
         let mut interp = Interp::new();
@@ -1621,15 +1614,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_dict_ordered_explicit_flag() {
-        let mut interp = Interp::new();
-        assert_eq!(
-            interp.eval("dict keys [dict create -ordered z 1 a 2 m 3]").unwrap().as_str(),
-            "z a m"
-        );
-    }
-
+    
     #[test]
     fn test_dict_ordered_for_preserves_order() {
         let mut interp = Interp::new();
@@ -1693,133 +1678,16 @@ mod tests {
 
     // ── Unordered dict tests ───────────────────────────────────
 
-    #[test]
-    fn test_dict_unordered_create() {
-        let mut interp = Interp::new();
-        // Create unordered — all keys/values should be present (order not guaranteed)
-        interp.eval("set d [dict create -unordered a 1 b 2 c 3]").unwrap();
-        assert_eq!(interp.eval("dict size $d").unwrap().as_str(), "3");
-        assert_eq!(interp.eval("dict get $d a").unwrap().as_str(), "1");
-        assert_eq!(interp.eval("dict get $d b").unwrap().as_str(), "2");
-        assert_eq!(interp.eval("dict get $d c").unwrap().as_str(), "3");
-    }
 
-    #[test]
-    fn test_dict_unordered_set_get() {
-        let mut interp = Interp::new();
-        interp.eval("set d [dict create -unordered]").unwrap();
-        interp.eval("dict set d x 10").unwrap();
-        interp.eval("dict set d y 20").unwrap();
-        assert_eq!(interp.eval("dict get $d x").unwrap().as_str(), "10");
-        assert_eq!(interp.eval("dict get $d y").unwrap().as_str(), "20");
-        assert_eq!(interp.eval("dict size $d").unwrap().as_str(), "2");
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
     }
-
-    #[test]
-    fn test_dict_unordered_exists() {
-        let mut interp = Interp::new();
-        interp.eval("set d [dict create -unordered a 1 b 2]").unwrap();
-        assert_eq!(interp.eval("dict exists $d a").unwrap().as_str(), "1");
-        assert_eq!(interp.eval("dict exists $d c").unwrap().as_str(), "0");
-    }
-
-    #[test]
-    fn test_dict_unordered_remove() {
-        let mut interp = Interp::new();
-        interp.eval("set d [dict create -unordered a 1 b 2 c 3]").unwrap();
-        let r = interp.eval("dict size [dict remove $d b]").unwrap();
-        assert_eq!(r.as_str(), "2");
-        assert_eq!(
-            interp.eval("dict exists [dict remove $d b] b").unwrap().as_str(),
-            "0"
-        );
-    }
-
-    #[test]
-    fn test_dict_unordered_incr() {
-        let mut interp = Interp::new();
-        interp.eval("set d [dict create -unordered count 5]").unwrap();
-        interp.eval("dict incr d count 3").unwrap();
-        assert_eq!(interp.eval("dict get $d count").unwrap().as_str(), "8");
-    }
-
-    #[test]
-    fn test_dict_unordered_replace() {
-        let mut interp = Interp::new();
-        interp.eval("set d [dict create -unordered a 1 b 2]").unwrap();
-        let r = interp.eval("dict get [dict replace $d b 99] b").unwrap();
-        assert_eq!(r.as_str(), "99");
-    }
-
-    #[test]
-    fn test_dict_unordered_for() {
-        let mut interp = Interp::new();
-        interp.eval("set d [dict create -unordered x 10 y 20]").unwrap();
-        interp.eval("set total 0").unwrap();
-        interp.eval("dict for {k v} $d { set total [expr {$total + $v}] }").unwrap();
-        assert_eq!(interp.eval("set total").unwrap().as_str(), "30");
-    }
-
-    #[test]
-    fn test_dict_unordered_merge() {
-        let mut interp = Interp::new();
-        interp.eval("set a [dict create -unordered x 1 y 2]").unwrap();
-        interp.eval("set b [dict create -unordered z 3]").unwrap();
-        let r = interp.eval("dict size [dict merge $a $b]").unwrap();
-        assert_eq!(r.as_str(), "3");
-    }
-
-    #[test]
-    fn test_dict_unordered_filter_key() {
-        let mut interp = Interp::new();
-        interp.eval("set d [dict create -unordered ab 1 ac 2 ba 3]").unwrap();
-        let r = interp.eval("dict size [dict filter $d key a*]").unwrap();
-        assert_eq!(r.as_str(), "2");
-    }
-
-    #[test]
-    fn test_dict_unordered_info() {
-        let mut interp = Interp::new();
-        interp.eval("set d [dict create -unordered a 1 b 2]").unwrap();
-        let r = interp.eval("dict info $d").unwrap();
-        assert!(r.as_str().contains("unordered"));
-        assert!(r.as_str().contains("2 entries"));
-    }
-
-    #[test]
-    fn test_dict_ordered_info() {
-        let mut interp = Interp::new();
-        let r = interp.eval("dict info {a 1 b 2}").unwrap();
-        assert!(r.as_str().contains("ordered"));
-        assert!(r.as_str().contains("2 entries"));
-    }
-
-    #[test]
-    fn test_dict_unordered_keys_values_contain_all() {
-        let mut interp = Interp::new();
-        interp.eval("set d [dict create -unordered x 10 y 20 z 30]").unwrap();
-        // We can't assert order, but we can assert all values are present
-        let keys = interp.eval("dict keys $d").unwrap();
-        let keys_str = keys.as_str();
-        assert!(keys_str.contains("x"));
-        assert!(keys_str.contains("y"));
-        assert!(keys_str.contains("z"));
-        let vals = interp.eval("dict values $d").unwrap();
-        let vals_str = vals.as_str();
-        assert!(vals_str.contains("10"));
-        assert!(vals_str.contains("20"));
-        assert!(vals_str.contains("30"));
-    }
-
-    #[test]
-    fn test_dict_unordered_serialization_roundtrip() {
-        let mut interp = Interp::new();
-        interp.eval("set d [dict create -unordered a 1 b 2 c 3]").unwrap();
-        // Serialize to string, then parse back — all keys should survive
-        interp.eval("set s [set d]").unwrap();
-        assert_eq!(interp.eval("dict size $s").unwrap().as_str(), "3");
-        assert_eq!(interp.eval("dict get $s a").unwrap().as_str(), "1");
-        assert_eq!(interp.eval("dict get $s b").unwrap().as_str(), "2");
-        assert_eq!(interp.eval("dict get $s c").unwrap().as_str(), "3");
-    }
-}

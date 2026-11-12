@@ -277,20 +277,11 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // Element-name snapshot: callbacks that add elements during
             // the get don't join this enumeration (trace-1.11: the read
             // trace's `set x(foo) 1` never shows up in the same get).
-            let vars: Vec<String> = table
-                .keys()
-                .filter_map(|k| {
-                    if k.starts_with(&prefix) && k.ends_with(')') {
-                        let elem = &k[prefix.len()..k.len() - 1];
-                        match pattern {
-                            Some(pat) if glob_match(pat, elem) => Some(elem.to_string()),
-                            Some(_) => None,
-                            None => Some(elem.to_string()),
-                        }
-                    } else {
-                        None
-                    }
-                })
+            // Tcl hash order via the scope's insertion-log replay.
+            let vars: Vec<String> = interp
+                .array_element_names(array_name)
+                .into_iter()
+                .filter(|elem| pattern.map(|pat| glob_match(pat, elem.as_str())).unwrap_or(true))
                 .collect();
             for elem in vars {
                 // Each element is read through the traced access path —
@@ -378,25 +369,14 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     },
                 }
             };
-            let (owner_fi, _) = interp.array_owner(array_name);
-            let table = match owner_fi {
-                Some(i) => &interp.frames[i].locals,
-                None => &interp.globals,
-            };
-            let names: Vec<Value> = table
-                .keys()
-                .filter_map(|k| {
-                    if k.starts_with(&prefix) && k.ends_with(')') {
-                        let elem = &k[prefix.len()..k.len() - 1];
-                        if matches_elem(elem) {
-                            Some(Value::from_str(elem))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
+            // Tcl hash-table iteration order (replayed from the scope's
+            // insertion log — tclsh's `array names` walks the array's
+            // bucket chains).
+            let names: Vec<Value> = interp
+                .array_element_names(array_name)
+                .into_iter()
+                .filter(|elem| matches_elem(elem.as_str()))
+                .map(|elem| Value::from_str(elem.as_str()))
                 .collect();
             Ok(Value::from_list(&names))
         }

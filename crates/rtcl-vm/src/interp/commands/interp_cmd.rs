@@ -33,10 +33,13 @@ pub fn cmd_interp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // Register a command with the handle name that dispatches subcommands
     let handle_for_cmd = handle.clone();
-    interp.commands.insert(
-        handle.clone(),
-        make_interp_dispatch(&handle_for_cmd),
-    );
+    if interp
+        .commands
+        .insert(handle.clone(), make_interp_dispatch(&handle_for_cmd))
+        .is_none()
+    {
+        interp.note_new_command(&handle);
+    }
     interp.note_cmd_mutation();
 
     Ok(Value::from_str(&handle))

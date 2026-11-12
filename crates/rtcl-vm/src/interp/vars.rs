@@ -5,9 +5,59 @@
 //! locals (or follow upvar links to globals / other frames).
 
 use super::util::{has_ns_sep, split_array_ref};
-use super::{Interp, Rc, UpvarLink};
+use super::{tclhash, CallFrame, Interp, Rc, UpvarLink};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
+
+impl Interp {
+    /// Insert into the global var table, appending the key to the
+    /// Tcl-order log when the insert was NEW (a re-set keeps its
+    /// position; a recreate after delete appends anew — Tcl hash-entry
+    /// semantics).
+    pub(crate) fn global_insert(&mut self, key: String, v: Value) {
+        if self.globals.insert(key.clone(), v).is_none() {
+            self.var_order.push(key);
+        }
+    }
+
+    /// Remove from the global var table (log entry becomes stale; the
+    /// iteration walk filters by table liveness and dedups to the last
+    /// occurrence).
+    pub(crate) fn global_remove(&mut self, key: &str) -> Option<Value> {
+        self.globals.remove(key)
+    }
+}
+
+/// Insert into a frame's locals, maintaining the frame's Tcl-order log.
+pub(crate) fn frame_local_insert(f: &mut CallFrame, key: String, v: Value) {
+    if f.locals.insert(key.clone(), v).is_none() {
+        f.locals_order.push(key);
+    }
+}
+
+/// Remove from a frame's locals (log entry goes stale, as above).
+pub(crate) fn frame_local_remove(f: &mut CallFrame, key: &str) -> Option<Value> {
+    f.locals.remove(key)
+}
+
+/// Replay the Tcl hash-order log (`order`) against the live key set
+/// (`live`): keep entries present in the table, dedup to the LAST
+/// occurrence (recreates), and replay the table mechanics.
+pub(crate) fn replay_order(order: &[String], live: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, k) in order.iter().enumerate() {
+        if live(k) {
+            seen.insert(k.as_str(), i);
+        }
+    }
+    let mut keys: Vec<String> = Vec::with_capacity(seen.len());
+    for (i, k) in order.iter().enumerate() {
+        if seen.get(k.as_str()) == Some(&i) {
+            keys.push(k.clone());
+        }
+    }
+    tclhash::tcl_order(&keys)
+}
 
 /// Where a resolved variable lives, after following upvar links and
 /// `::`-qualification to its *owning* scope.
@@ -64,12 +114,15 @@ impl Interp {
     /// back to the name path).
     /// 顶层 slot 边界（C2'）：ts set 槽 → 全局（分派读/链接写见最新）。
     pub(crate) fn top_flush(&mut self) {
-        let Some(ts) = self.top_slots.as_ref() else { return };
-        for i in 0..ts.names.len() {
-            let v = &ts.values[i];
-            if !v.is_unset() {
-                self.globals.insert(ts.names[i].clone(), v.clone());
-            }
+        let flush: Vec<(String, Value)> = {
+            let Some(ts) = self.top_slots.as_ref() else { return };
+            (0..ts.names.len())
+                .filter(|&i| !ts.values[i].is_unset())
+                .map(|i| (ts.names[i].clone(), ts.values[i].clone()))
+                .collect()
+        };
+        for (name, v) in flush {
+            self.global_insert(name, v);
         }
     }
 
@@ -366,6 +419,9 @@ impl Interp {
                     if !cv.is_unset() {
                         let taken = std::mem::replace(cv, Value::unset());
                         f.locals.insert(name.clone(), taken);
+                        if !f.locals_order.iter().any(|o| o == name.as_str()) {
+                            f.locals_order.push(name.as_str().to_string());
+                        }
                     }
                 }
             }
@@ -425,6 +481,9 @@ impl Interp {
         if !f.slots[i].is_unset() {
             let taken = std::mem::replace(&mut f.slots[i], Value::unset());
             f.locals.insert(base.to_string(), taken);
+            if !f.locals_order.iter().any(|o| o == base) {
+                f.locals_order.push(base.to_string());
+            }
         }
         if f.slot_aliased.len() != f.slots.len() {
             f.slot_aliased.clear();
@@ -468,6 +527,9 @@ impl Interp {
                     if !cv.is_unset() {
                         let taken = std::mem::replace(cv, Value::unset());
                         f.locals.insert(name.clone(), taken);
+                        if !f.locals_order.iter().any(|o| o == name.as_str()) {
+                            f.locals_order.push(name.as_str().to_string());
+                        }
                     }
                 }
             }
@@ -647,11 +709,11 @@ impl Interp {
     fn loc_insert(&mut self, loc: &VarLoc, key: String, value: Value) {
         match loc {
             VarLoc::Global(_) => {
-                self.globals.insert(key, value);
+                self.global_insert(key, value);
             }
             VarLoc::Frame(i, _) => {
                 if let Some(f) = self.frames.get_mut(*i) {
-                    f.locals.insert(key, value);
+                    frame_local_insert(f, key, value);
                 }
             }
         }
@@ -660,11 +722,11 @@ impl Interp {
     /// Remove a flat key in the scope owning `loc`; returns previous presence.
     fn loc_remove(&mut self, loc: &VarLoc, key: &str) -> bool {
         match loc {
-            VarLoc::Global(_) => self.globals.remove(key).is_some(),
+            VarLoc::Global(_) => self.global_remove(key).is_some(),
             VarLoc::Frame(i, _) => self
                 .frames
                 .get_mut(*i)
-                .map(|f| f.locals.remove(key).is_some())
+                .map(|f| frame_local_remove(f, key).is_some())
                 .unwrap_or(false),
         }
     }
@@ -872,7 +934,7 @@ impl Interp {
     /// Set a variable in the current scope, following upvar links.
     pub(crate) fn store_var(&mut self, name: &str, value: Value) {
         if let Some(gname) = Self::split_global(name) {
-            self.globals.insert(gname, value);
+            self.global_insert(gname, value);
             return;
         }
         if self.frames.is_empty() {
@@ -883,12 +945,12 @@ impl Interp {
             // namespace (`variable y` + `set y 9` → ::n::y).
             if !name.contains('(') && !name.contains("::") {
                 if let Some(gkey) = self.ns_chain_global(name) {
-                    self.globals.insert(gkey, value);
+                    self.global_insert(gkey, value);
                     return;
                 }
             }
             let key = self.redirect_flat(self.canonical_global(name));
-            self.globals.insert(key, value);
+            self.global_insert(key, value);
             return;
         }
         let frame_idx = self.frames.len() - 1;
@@ -903,18 +965,22 @@ impl Interp {
                     if let Some(slot) = self.globals.get_mut(&key) {
                         *slot = value;
                     } else {
-                        self.globals.insert(key, value);
+                        self.global_insert(key, value);
                     }
                 }
                 UpvarLink::Frame { frame_index, var_name } => {
                     if let Some(f) = self.frames.get_mut(frame_index) {
-                        f.locals.insert(var_name, value);
+                        frame_local_insert(f, var_name, value);
                     }
                 }
                 // Writes through dead links error in set_var before
                 // reaching here; keep the write local for safety.
                 UpvarLink::Dead { .. } => {
-                    self.frames[frame_idx].locals.insert(name.to_string(), value);
+                    frame_local_insert(
+                        &mut self.frames[frame_idx],
+                        name.to_string(),
+                        value,
+                    );
                 }
             }
         } else {
@@ -923,7 +989,7 @@ impl Interp {
                 // Slotted name: the slot is the canonical store.
                 Some(i) => f.slots[i] = value.clone(),
                 None => {
-                    f.locals.insert(name.to_string(), value);
+                    frame_local_insert(f, name.to_string(), value);
                 }
             }
         }
@@ -1403,7 +1469,7 @@ impl Interp {
                         ErrorCode::Generic,
                     ));
                 }
-                self.globals.insert(gkey, value.clone());
+                self.global_insert(gkey, value.clone());
                 let fired = self.fire_traces(name, None, "write").map_err(|e| {
                     Error::runtime(format!("can't set \"{}\": {}", name, e), ErrorCode::Generic)
                 })?;
@@ -2171,7 +2237,7 @@ impl Interp {
                 .get(key.as_str())
                 .or_else(|| self.globals.get(target.trim_start_matches(':')));
             if let Some(v) = v {
-                self.frames[fi].locals.insert(name.to_string(), v.clone());
+                frame_local_insert(&mut self.frames[fi], name.to_string(), v.clone());
             }
         }
     }
@@ -2274,7 +2340,7 @@ impl Interp {
     /// 顶层标量直写（守卫由 scalar_top_write_ok 前置；写 trace 已被
     /// var_traces 空守卫排除）。set_var 返回语义 = Ok(新值)。
     pub(crate) fn set_var_scalar_top(&mut self, name: &str, value: Value) {
-        self.globals.insert(name.to_string(), value);
+        self.global_insert(name.to_string(), value);
     }
 
     /// `info exists`, which fires read traces (tclsh probe: yes, even for
@@ -2332,31 +2398,39 @@ impl Interp {
         }
     }
 
-    /// Snapshot of the element names of the array at `name`.
+    /// Snapshot of the element names of the array at `name`, in Tcl
+    /// hash-table order (the element keys ride the scope's insertion log;
+    /// replaying their subsequence reproduces tclsh's `array names`).
     pub(crate) fn array_element_names(&self, name: &str) -> Vec<String> {
         let loc = self.resolve_loc(name);
         let prefix = format!("{}(", loc.base_name());
-        let mut out: Vec<String> = match &loc {
-            VarLoc::Global(_) => self
-                .globals
-                .keys()
-                .filter(|k| k.starts_with(&prefix) && k.ends_with(')'))
-                .map(|k| k[prefix.len()..k.len() - 1].to_string())
-                .collect(),
+        let is_element = |k: &str| k.starts_with(&prefix) && k.ends_with(')');
+        // The element table hashes the element NAME (the "a(k)" key's
+        // tail), so the replay runs on stripped names.
+        let collect = |order: &[String], live: &dyn Fn(&str) -> bool| -> Vec<String> {
+            let mut seen: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for (i, k) in order.iter().enumerate() {
+                if is_element(k) && live(k) {
+                    seen.insert(k.as_str(), i);
+                }
+            }
+            let keys: Vec<String> = order
+                .iter()
+                .enumerate()
+                .filter(|(i, k)| seen.get(k.as_str()) == Some(i))
+                .map(|(_, k)| k[prefix.len()..k.len() - 1].to_string())
+                .collect();
+            tclhash::tcl_order(&keys)
+        };
+        match &loc {
+            VarLoc::Global(_) => collect(&self.var_order, &|k| self.globals.contains_key(k)),
             VarLoc::Frame(i, _) => self
                 .frames
                 .get(*i)
-                .map(|f| {
-                    f.locals
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix) && k.ends_with(')'))
-                        .map(|k| k[prefix.len()..k.len() - 1].to_string())
-                        .collect()
-                })
+                .map(|f| collect(&f.locals_order, &|k| f.locals.contains_key(k)))
                 .unwrap_or_default(),
-        };
-        out.sort();
-        out
+        }
     }
 
     pub fn result(&self) -> &Value {

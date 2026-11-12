@@ -67,7 +67,9 @@ pub fn cmd_alias(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     });
 
     // Register a dispatcher command in the command table
-    interp.commands.insert(new_name.clone(), alias_dispatch);
+    if interp.commands.insert(new_name.clone(), alias_dispatch).is_none() {
+        interp.note_new_command(&new_name);
+    }
     interp.command_categories.insert(new_name, crate::command::CommandCategory::Extension);
     interp.note_cmd_mutation();
     Ok(Value::empty())

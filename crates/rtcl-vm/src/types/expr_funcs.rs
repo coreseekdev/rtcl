@@ -487,9 +487,18 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
                 )),
             }
         }
-        _ => Err(Error::runtime(
-            format!("unknown math function \"{}\"", name),
-            crate::error::ErrorCode::InvalidOp,
+        // `nan` (integer payload) reaches the mathfunc and fails at the
+        // NaN conversion — tclsh's TclExprFloatError (bn7/bn8).
+        "nan" => Err(Error::runtime(
+            "domain error: argument not in valid range",
+            crate::error::ErrorCode::Generic,
         )),
+        // tclsh dispatches unknown functions to ::tcl::mathfunc::<name>
+        // — rtcl has no mathfunc namespace, so the dispatch misses with
+        // tclsh's exact message (expr-38.12).
+        _ => Err(Error::Msg(format!(
+            "invalid command name \"tcl::mathfunc::{}\"",
+            name
+        ))),
     }
 }

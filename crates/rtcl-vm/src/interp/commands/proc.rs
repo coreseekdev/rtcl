@@ -160,7 +160,9 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // invalidates every compiled body that folded that command.
     super::super::vm_exec::note_tier1_mutation(interp, &name);
     interp.note_cmd_mutation();
-    interp.procs.insert(name, super::super::Rc::new(proc_def));
+    if interp.procs.insert(name.clone(), super::super::Rc::new(proc_def)).is_none() {
+        interp.note_new_command(&name);
+    }
     Ok(Value::empty())
 }
 
@@ -873,7 +875,7 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             UpvarLink::Dead { .. } => None,
         };
         if let Some(v) = mirror {
-            interp.frames[current_idx].locals.insert(local_var, v);
+            super::super::vars::frame_local_insert(&mut interp.frames[current_idx], local_var, v);
         } else {
             interp.frames[current_idx].locals.remove(&local_var);
         }
@@ -967,7 +969,7 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // exists; reads/writes still go through the link.
         if let Some(v) = interp.globals.get(&target) {
             let v = v.clone();
-            interp.frames[current_idx].locals.insert(local, v);
+            super::super::vars::frame_local_insert(&mut interp.frames[current_idx], local, v);
         }
     }
 
@@ -1011,7 +1013,7 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if !new_key.is_empty() && new_key.contains("::") {
         let cut = new_key.rfind("::").unwrap();
         let ns = if cut == 0 { "::" } else { &new_key[..cut] };
-        super::namespace::ensure_namespace(&mut interp.namespaces, ns);
+        interp.ensure_ns_path(ns);
     }
 
     // A rename touching a Tier1-named command — either end — invalidates
@@ -1044,7 +1046,9 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let cat = interp.command_categories.remove(&old_key);
         let meta = interp.command_meta.remove(&old_key);
         if !new_key.is_empty() {
-            interp.commands.insert(new_key.clone(), func);
+            if interp.commands.insert(new_key.clone(), func).is_none() {
+                interp.note_new_command(&new_key);
+            }
             if let Some(c) = cat {
                 interp.command_categories.insert(new_key.clone(), c);
             }
@@ -1059,7 +1063,9 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Rename in procs
     if let Some(proc_def) = interp.procs.remove(&old_key) {
         if !new_key.is_empty() {
-            interp.procs.insert(new_key.clone(), proc_def);
+            if interp.procs.insert(new_key.clone(), proc_def).is_none() {
+                interp.note_new_command(&new_key);
+            }
         } else {
             interp.purge_proc_artifacts(&proc_def);
         }
@@ -1071,7 +1077,9 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Rename a namespace ensemble command
     if let Some(def) = interp.ensembles.remove(&old_key) {
         if !new_key.is_empty() {
-            interp.ensembles.insert(new_key.clone(), def);
+            if interp.ensembles.insert(new_key.clone(), def).is_none() {
+                interp.note_new_command(&new_key);
+            }
         }
         move_alias_origins(interp, &old_key, &new_key);
         finish_cmd_rename(interp, &old_key, &new_key, &old_name, &new_name);
@@ -1087,7 +1095,9 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             } else {
                 format!("::{}", new_key)
             };
-            interp.import_aliases.insert(new_alias_key.clone(), origin);
+            if interp.import_aliases.insert(new_alias_key.clone(), origin).is_none() {
+                interp.note_new_command(&new_alias_key);
+            }
             // Aliases imported *from* this alias track the origin command,
             // not its name, so they follow the rename.
             let moved: Vec<String> = interp
@@ -1097,7 +1107,9 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .map(|(a, _)| a.clone())
                 .collect();
             for dep in moved {
-                interp.import_aliases.insert(dep, new_alias_key.clone());
+                if interp.import_aliases.insert(dep.clone(), new_alias_key.clone()).is_none() {
+                    interp.note_new_command(&dep);
+                }
             }
         } else {
             // Deleting the alias deletes its dependent re-imports too
@@ -1168,7 +1180,9 @@ pub(crate) fn move_alias_origins(interp: &mut Interp, old_key: &str, new_key: &s
             .map(|(a, _)| a.clone())
             .collect();
         for alias in moved {
-            interp.import_aliases.insert(alias, new_key.to_string());
+            if interp.import_aliases.insert(alias.clone(), new_key.to_string()).is_none() {
+                interp.note_new_command(&alias);
+            }
         }
     }
     // An ensemble renaming onto/away from an alias-resolved key is handled

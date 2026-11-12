@@ -27,7 +27,10 @@ namespace eval ::http {
 }
 
 proc ::http::_require_bridge {} {
-    if {[llength [info commands __rtcl_http]] == 0} {
+    # Table probe, not [info commands]: the host bridge registers
+    # hidden (not part of tclsh's canonical :: surface), so the listing
+    # won't show it — [namespace which] resolves through the tables.
+    if {[namespace which -command __rtcl_http] eq ""} {
         error "http: host bridge __rtcl_http is not registered\
                (wasm 侧用 www/http-bridge.js 安装)"
     }

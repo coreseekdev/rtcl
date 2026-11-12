@@ -47,13 +47,24 @@
 
 <div id="log"></div>
 
+<script>
+window.onerror = function(msg, src, line, col) {
+  var b = document.getElementById('banner');
+  if (b) { b.className = 'bad'; b.textContent = 'PAGE-ERR: ' + msg + ' @' + src + ':' + line + ':' + col; }
+};
+window.addEventListener('unhandledrejection', function(ev) {
+  var b = document.getElementById('banner');
+  if (b) { b.className = 'bad'; b.textContent = 'PAGE-REJ: ' + (ev.reason && ev.reason.stack || ev.reason); }
+});
+</script>
 <script type="module">
 // SAB 同步桥接线：fs-worker 执行真实 async OPFS，解释器 worker 的同步
 // HostFs 调用经 Atomics.wait 阻塞等待其回执——回执在 OPFS 写入完成后
 // 发出（严格 durable）。
 const sab = new SharedArrayBuffer(256 * 1024 + 64);
-const fsWorker = new Worker('fs-worker.js', { type: 'module' });
-const worker = new Worker('rtcl-worker.js', { type: 'module' });
+const V = location.search.replace('?v=', '') || String(Date.now());
+const fsWorker = new Worker('fs-worker.js?v=' + V, { type: 'module' });
+const worker = new Worker('rtcl-worker.js?v=' + V, { type: 'module' });
 // MessageChannel：interp worker（port1）↔ fs worker（port2）的调用通道
 const ch = new MessageChannel();
 fsWorker.postMessage({ sab, port: ch.port2 }, [ch.port2]);
@@ -105,7 +116,7 @@ const CASES = [
     want: 'aabb aa bb' },
   { name: 'R3 -indices 首末对（relay 渲染层多一层引用）',
     script: 'regexp -indices (a+)(b+) xaabbaac iv iv1 iv2; list $iv $iv1 $iv2',
-    want: '{{1 4}} {{1 2}} {{3 4}}' },
+    want: '{1 4} {1 2} {3 4}' },
   { name: 'R4 -inline',
     script: 'regexp -inline (a+)(b+) xaabbaac',
     want: 'aabb aa bb' },
@@ -127,6 +138,43 @@ const CASES = [
   { name: 'R8 -start 偏移',
     script: 'regexp -start 2 a xaxa',
     want: '1' },
+  // ── Spencer 全集侧模块（native 同源引擎；JS 子集做不到的）──────
+  { name: 'SP1 回引 (a+)\\1',
+    script: 'regexp {(a+)\\1} aa',
+    want: '1' },
+  { name: 'SP2 前瞻 a(?=b)',
+    script: 'regexp {a(?=b)} ab',
+    want: '1' },
+  { name: 'SP3 后顾 (?<=a)b（native 同报错，引擎对齐）',
+    script: 'catch {regexp {(?<=a)b} ab} e; string match {*quantifier operand invalid*} $e',
+    want: '1' },
+  { name: 'SP4 -expanded（空白/注释忽略，JS 子集缺）',
+    script: 'regexp -expanded {a b\n c} abc',
+    want: '1' },
+  { name: 'SP5 非 BMP 字符索引（native char 约定）',
+    script: 'regexp -indices {\\U0001F201} x🈁y iv5; set iv5',
+    want: '1 1' },
+  { name: 'SP6 -all -inline 平铺',
+    script: 'regexp -all -inline {\\d+} a1b22c333',
+    want: '1 22 333' },
+  { name: 'SP7 regsub 捕获换位',
+    script: 'regsub {(a)(b)} ab {\\2\\1} v; set v',
+    want: 'ba' },
+  { name: 'SP8 -line 行锚 ^$',
+    script: 'regexp -line {^b$} {a\nb}',
+    want: '1' },
+  { name: 'SP9 -expanded -nocase 组合',
+    script: 'regexp -expanded -nocase {HELLO   WORLD} helloworld',
+    want: '1' },
+  { name: 'SP10 编译错误如实传播',
+    script: 'catch {regexp {a[} x} e; string match {*compile regular expression*} $e',
+    want: '1' },
+  { name: 'SP11 -about 最小面',
+    script: 'regexp -about {(a)b}',
+    want: '(a)b' },
+  { name: 'SP12 -all 变量取末匹配（native 同）',
+    script: 'regexp -all (b) abcb v; set v',
+    want: 'b' },
   // ── encoding 外置（JS TextDecoder 数据面）────────────────────
   { name: 'E1 encoding names 86 名宽表',
     script: 'llength [encoding names]',

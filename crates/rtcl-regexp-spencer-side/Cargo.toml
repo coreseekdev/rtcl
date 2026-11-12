@@ -1,0 +1,21 @@
+[package]
+name = "spencermod"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+description = "rtcl dynmod 侧模块：Spencer 正则引擎全集（wasm32-unknown-unknown cdylib）"
+
+[lib]
+crate-type = ["cdylib"]
+
+# 独立编译（wasm32 侧模块，不入 rtcl workspace；dynmod-side 同款）。
+[workspace]
+
+[dependencies]
+rtcl-regexp-spencer = { path = "../rtcl-regexp-spencer" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true

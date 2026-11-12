@@ -100,7 +100,9 @@ impl RtclHandle {
             }
             let func = js_sys::Function::from(val);
             // Internal registration name: unique per module+command.
-            let internal = format!("__dynmod:{}:{}", name, fname);
+            // v2 前缀：dispatch 逐词透传（__dynmod: = v1 join 拆分，
+            // 兼容旧宿主）。
+            let internal = format!("__dynmodv2:{}:{}", name, fname);
             js_command::register_js_command(&mut self.interp, self.id, &internal, func);
             // Internal dispatch wrapper: invokable but invisible (it is
             // not part of the Tcl surface; ::name::cmd is the public face).
@@ -128,7 +130,7 @@ impl RtclHandle {
         let existed = self.interp.dyn_module_installed_commands(bare);
         for full in existed {
             if let Some(tail) = full.rsplit("::").next() {
-                let internal = format!("__dynmod:{}:{}", bare, tail);
+                let internal = format!("__dynmodv2:{}:{}", bare, tail);
                 js_command::unregister_js_command(&mut self.interp, self.id, &internal);
             }
         }

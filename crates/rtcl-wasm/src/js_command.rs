@@ -47,11 +47,14 @@ pub fn js_dispatch_cmd(_interp: &mut rtcl_core::Interp, args: &[Value]) -> rtcl_
     match callback {
         Some(func) => {
             let js_args = js_sys::Array::new();
-            // __dynmod:* 的调用形是 `_js_dispatch <id> <internal>
-            // [join $args "\u0001"]`——最后一个词是分隔符连接的参数串
-            // （\u0001 分隔；wrapper 侧 join 产出单词，任何展开路径都
-            // 不再拆）。拆开还原为 JS 参数。
-            if cmd_name.starts_with("__dynmod:") && args.len() >= 3 {
+            // __dynmodv2:*（v2 列表值单词协议）：wrapper 体 `{*}$args`
+            // 直传——args[3..] 逐词入 JS 参数（\u0001/空白/全 Unicode
+            // 保真）。__dynmod:*（v1 遗留形）保持 join 串拆分。
+            if cmd_name.starts_with("__dynmodv2:") {
+                for arg in &args[3..] {
+                    js_args.push(&JsValue::from_str(&arg.to_string()));
+                }
+            } else if cmd_name.starts_with("__dynmod:") && args.len() >= 3 {
                 let joined = args[args.len() - 1].to_string();
                 for part in joined.split('\u{0001}') {
                     js_args.push(&JsValue::from_str(part));

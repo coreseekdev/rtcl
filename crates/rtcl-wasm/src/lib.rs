@@ -1,4 +1,5 @@
 mod js_command;
+mod fs_bridge;
 mod clock;
 mod output;
 pub mod jit_abi;
@@ -130,6 +131,17 @@ impl RtclHandle {
             }
         }
         Ok(self.interp.unregister_dyn_module(bare))
+    }
+
+    /// Inject the JS filesystem data plane (HANDOFF §10quinter): the
+    /// object's methods serve `open`/`file`/`source`/`glob`/`cd`/`pwd`
+    /// — see fs_bridge.rs for the method contract.  The channel protocol
+    /// face stays native; a memory-fs or OPFS-worker implementation both
+    /// fit the same contract.
+    pub fn set_fs(&mut self, fs: js_sys::Object) -> Result<(), JsValue> {
+        let impl_ = fs_bridge::JsFs::register(fs);
+        self.interp.set_host_fs(Box::new(impl_));
+        Ok(())
     }
 
     /// Remove a JS-registered command.

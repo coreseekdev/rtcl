@@ -760,65 +760,14 @@ impl ChannelTable {
     }
 
     pub fn open_file(&mut self, path: &str, mode: &str) -> io::Result<ChannelId> {
-        let mut binary = false;
-        let file = match mode {
-            "r" => {
-                let f = std::fs::File::open(path)?;
-                Box::new(FileChannel::new_read(f)) as Box<dyn Channel>
-            }
-            "w" => {
-                let f = std::fs::File::create(path)?;
-                Box::new(FileChannel::new_write(f)) as Box<dyn Channel>
-            }
-            "a" => {
-                let f = std::fs::OpenOptions::new().append(true).create(true).open(path)?;
-                Box::new(FileChannel::new_write(f)) as Box<dyn Channel>
-            }
-            "r+" | "RDWR" => {
-                let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
-                Box::new(FileChannel::new_readwrite(f)) as Box<dyn Channel>
-            }
-            "w+" => {
-                let f = std::fs::OpenOptions::new()
-                    .read(true).write(true).create(true).truncate(true).open(path)?;
-                Box::new(FileChannel::new_readwrite(f)) as Box<dyn Channel>
-            }
-            "a+" => {
-                let f = std::fs::OpenOptions::new()
-                    .read(true).append(true).create(true).open(path)?;
-                Box::new(FileChannel::new_readwrite(f)) as Box<dyn Channel>
-            }
-            _ => {
-                // POSIX 标志列表（Tcl 8.6：RDONLY/WRONLY/RDWR/APPEND/
-                // BINARY/CREAT/EXCL/NOCTTY/NONBLOCK/TRUNC 的列表）。
-                let Some(acc) = parse_posix_access(mode) else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "invalid access mode \"{}\": must be RDONLY, WRONLY, RDWR, APPEND, BINARY, CREAT, EXCL, NOCTTY, NONBLOCK, or TRUNC",
-                            mode
-                        ),
-                    ));
-                };
-                binary = acc.binary;
-                let mut opts = std::fs::OpenOptions::new();
-                opts.read(acc.read).write(acc.write);
-                if acc.append {
-                    opts.append(true);
-                }
-                if acc.create {
-                    opts.create(true);
-                }
-                if acc.truncate {
-                    opts.truncate(true);
-                }
-                if acc.exclusive && acc.create {
-                    opts.create_new(true);
-                }
-                let f = opts.open(path)?;
-                Box::new(FileChannel::new_readwrite(f)) as Box<dyn Channel>
-            }
-        };
+        let (file, binary) = open_file_channel(path, mode)?;
+        self.install_opened(file, binary)
+    }
+
+    /// Install an already-constructed channel (the HostFs data-plane seam:
+    /// the host opens the file, the protocol face stays native).  Naming
+    /// (fileN), registration and the default fconfigure view live here.
+    pub fn install_opened(&mut self, file: Box<dyn Channel>, binary: bool) -> io::Result<ChannelId> {
         let id = self.next_file_name();
         self.track(id.clone());
         self.channels.insert(id.clone(), file);
@@ -1852,4 +1801,72 @@ mod tests {
         assert!(id.starts_with("file"));
         assert!(table.contains(&id));
     }
+}
+
+/// std::fs file-channel constructor — the NativeFs data plane (extracted
+/// from the former inline `open_file` body; behavior identical).
+pub(crate) fn open_file_channel(
+    path: &str,
+    mode: &str,
+) -> io::Result<(Box<dyn Channel>, bool)> {
+    let mut binary = false;
+    let file = match mode {
+        "r" => {
+            let f = std::fs::File::open(path)?;
+            Box::new(FileChannel::new_read(f)) as Box<dyn Channel>
+        }
+        "w" => {
+            let f = std::fs::File::create(path)?;
+            Box::new(FileChannel::new_write(f)) as Box<dyn Channel>
+        }
+        "a" => {
+            let f = std::fs::OpenOptions::new().append(true).create(true).open(path)?;
+            Box::new(FileChannel::new_write(f)) as Box<dyn Channel>
+        }
+        "r+" | "RDWR" => {
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+            Box::new(FileChannel::new_readwrite(f)) as Box<dyn Channel>
+        }
+        "w+" => {
+            let f = std::fs::OpenOptions::new()
+                .read(true).write(true).create(true).truncate(true).open(path)?;
+            Box::new(FileChannel::new_readwrite(f)) as Box<dyn Channel>
+        }
+        "a+" => {
+            let f = std::fs::OpenOptions::new()
+                .read(true).append(true).create(true).open(path)?;
+            Box::new(FileChannel::new_readwrite(f)) as Box<dyn Channel>
+        }
+        _ => {
+            // POSIX 标志列表（Tcl 8.6：RDONLY/WRONLY/RDWR/APPEND/
+            // BINARY/CREAT/EXCL/NOCTTY/NONBLOCK/TRUNC 的列表）。
+            let Some(acc) = parse_posix_access(mode) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "invalid access mode \"{}\": must be RDONLY, WRONLY, RDWR, APPEND, BINARY, CREAT, EXCL, NOCTTY, NONBLOCK, or TRUNC",
+                        mode
+                    ),
+                ));
+            };
+            binary = acc.binary;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(acc.read).write(acc.write);
+            if acc.append {
+                opts.append(true);
+            }
+            if acc.create {
+                opts.create(true);
+            }
+            if acc.truncate {
+                opts.truncate(true);
+            }
+            if acc.exclusive && acc.create {
+                opts.create_new(true);
+            }
+            let f = opts.open(path)?;
+            Box::new(FileChannel::new_readwrite(f)) as Box<dyn Channel>
+        }
+    };
+    Ok((file, binary))
 }

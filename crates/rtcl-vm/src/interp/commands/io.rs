@@ -255,7 +255,7 @@ pub fn cmd_source(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args("source", 2, args.len()));
     }
     let path = args[1].as_str();
-    let contents = std::fs::read_to_string(path).map_err(|e| {
+    let contents = interp.host_fs.read_file(path).map_err(|e| {
         Error::runtime(
             format!("couldn't read file \"{}\": {}", path, e),
             crate::error::ErrorCode::Io,
@@ -298,7 +298,7 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // Subcommands that need no path argument
     match subcmd {
-        "tempfile" => return file_tempfile(args),
+        "tempfile" => return file_tempfile(interp, args),
         "separator" | "sep" => {
             return Ok(Value::from_str(std::path::MAIN_SEPARATOR_STR));
         }
@@ -317,32 +317,29 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     match subcmd {
         // ── existence / type checks ─────────────────────────────────
-        "exists" => Ok(Value::from_bool(std::path::Path::new(path).exists())),
-        "isfile" => Ok(Value::from_bool(std::path::Path::new(path).is_file())),
-        "isdirectory" => Ok(Value::from_bool(std::path::Path::new(path).is_dir())),
-        "readable" => Ok(Value::from_bool(file_access(path, AccessCheck::Read))),
-        "writable" => Ok(Value::from_bool(file_access(path, AccessCheck::Write))),
-        "executable" => Ok(Value::from_bool(file_access(path, AccessCheck::Exec))),
+        "exists" => Ok(Value::from_bool(interp.host_fs.exists(path))),
+        "isfile" => Ok(Value::from_bool(interp.host_fs.is_file(path))),
+        "isdirectory" => Ok(Value::from_bool(interp.host_fs.is_dir(path))),
+        "readable" => Ok(Value::from_bool(interp.host_fs.readable(path))),
+        "writable" => Ok(Value::from_bool(interp.host_fs.writable(path))),
+        "executable" => Ok(Value::from_bool(interp.host_fs.executable(path))),
         "owned" => {
             // Approximate: check if the file exists and we can read its metadata.
             // A full implementation would compare uid, but that requires libc.
-            Ok(Value::from_bool(std::fs::metadata(path).is_ok()))
+            Ok(Value::from_bool(interp.host_fs.exists(path)))
         }
         "type" => {
-            let meta = std::fs::symlink_metadata(path).map_err(|e| {
-                Error::runtime(
-                    format!("could not read \"{}\": {}", path, e),
-                    crate::error::ErrorCode::Io,
-                )
-            })?;
-            let ft = meta.file_type();
-            let t = if ft.is_symlink() {
+            // 数据面：目录/文件判定走 HostFs；link 判定是 unix 深水面
+            //（symlink_metadata），留原生直连——HostFs 实现不支持时
+            // 统一报 "file"（tclsh 的回退类型）。
+            let link = std::fs::symlink_metadata(path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            let t = if link {
                 "link"
-            } else if ft.is_dir() {
+            } else if interp.host_fs.is_dir(path) {
                 "directory"
             } else {
-                // Regular files and character/block specials etc. all
-                // report as "file" (tclsh's fallback type).
                 "file"
             };
             Ok(Value::from_str(t))
@@ -407,18 +404,15 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
         // ── metadata ────────────────────────────────────────────────
         "size" => {
-            let meta = std::fs::metadata(path)
-                .map_err(|e| posix_error(interp, format!("could not read \"{}\"", path), &e))?;
-            Ok(Value::from_int(meta.len() as i64))
+            let n = interp.host_fs.size(path).map_err(|e| {
+                posix_error(interp, format!("could not read \"{}\"", path), &e)
+            })?;
+            Ok(Value::from_int(n as i64))
         }
         "atime" => {
-            let meta = std::fs::metadata(path)
-                .map_err(|e| posix_error(interp, format!("could not read \"{}\"", path), &e))?;
-            let t = meta.accessed().map_err(|e| {
-                Error::runtime(format!("could not get atime: {}", e), crate::error::ErrorCode::Io)
+            let secs = interp.host_fs.atime(path).map_err(|e| {
+                posix_error(interp, format!("could not read \"{}\"", path), &e)
             })?;
-            let secs = t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default().as_secs();
             Ok(Value::from_int(secs as i64))
         }
         "mtime" => {
@@ -454,13 +448,9 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     })?;
                 return Ok(Value::empty());
             }
-            let meta = std::fs::metadata(path)
-                .map_err(|e| posix_error(interp, format!("could not read \"{}\"", path), &e))?;
-            let t = meta.modified().map_err(|e| {
-                Error::runtime(format!("could not get mtime: {}", e), crate::error::ErrorCode::Io)
+            let secs = interp.host_fs.mtime(path).map_err(|e| {
+                posix_error(interp, format!("could not read \"{}\"", path), &e)
             })?;
-            let secs = t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default().as_secs();
             Ok(Value::from_int(secs as i64))
         }
         "stat" | "lstat" => {
@@ -536,20 +526,21 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             for j in start..args.len() {
                 let p = args[j].as_str();
-                let pp = std::path::Path::new(p);
-                if pp.is_dir() {
+                if interp.host_fs.is_dir(p) {
                     if force {
-                        std::fs::remove_dir_all(p).ok();
+                        let _ = interp.host_fs.delete(p);
                     } else {
-                        std::fs::remove_dir(p).map_err(|e| {
+                        // 目录的删除走 HostFs.delete（数据面）；非空
+                        // 目录的 remove_dir 语义由实现承载。
+                        interp.host_fs.delete(p).map_err(|e| {
                             Error::runtime(
                                 format!("error deleting \"{}\": {}", p, e),
                                 crate::error::ErrorCode::Io,
                             )
                         })?;
                     }
-                } else if pp.exists() {
-                    std::fs::remove_file(p).map_err(|e| {
+                } else if interp.host_fs.exists(p) {
+                    interp.host_fs.delete(p).map_err(|e| {
                         Error::runtime(
                             format!("error deleting \"{}\": {}", p, e),
                             crate::error::ErrorCode::Io,
@@ -562,7 +553,7 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "mkdir" => {
             for j in 2..args.len() {
                 let p = args[j].as_str();
-                std::fs::create_dir_all(p).map_err(|e| {
+                interp.host_fs.mkdir(p, true).map_err(|e| {
                     Error::runtime(
                         format!("couldn't create directory \"{}\": {}", p, e),
                         crate::error::ErrorCode::Io,
@@ -589,7 +580,7 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let src = args[start].as_str();
             let dst = args[start + 1].as_str();
-            if !force && std::path::Path::new(dst).exists() {
+            if !force && interp.host_fs.exists(dst) {
                 return Err(Error::runtime(
                     format!(
                         "error renaming \"{}\" to \"{}\": file already exists",
@@ -598,7 +589,7 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     crate::error::ErrorCode::Io,
                 ));
             }
-            std::fs::rename(src, dst).map_err(|e| {
+            interp.host_fs.rename(src, dst).map_err(|e| {
                 Error::runtime(
                     format!("couldn't rename \"{}\": {}", src, e),
                     crate::error::ErrorCode::Io,
@@ -624,7 +615,7 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let src = args[start].as_str();
             let dst = args[start + 1].as_str();
-            if !force && std::path::Path::new(dst).exists() {
+            if !force && interp.host_fs.exists(dst) {
                 return Err(Error::runtime(
                     // tclsh 消息形状（D-33）：error copying "src" to
                     // "dst": file already exists。
@@ -635,7 +626,7 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     crate::error::ErrorCode::Io,
                 ));
             }
-            std::fs::copy(src, dst).map_err(|e| {
+            interp.host_fs.copy(src, dst).map_err(|e| {
                 Error::runtime(
                     format!("couldn't copy \"{}\": {}", src, e),
                     crate::error::ErrorCode::Io,
@@ -709,29 +700,22 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 /// Create a temporary file, return its path.
 #[cfg(feature = "file")]
-fn file_tempfile(args: &[Value]) -> Result<Value> {
+fn file_tempfile(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let prefix = if args.len() >= 3 { args[2].as_str() } else { "tcl" };
-    let dir = std::env::temp_dir();
-    // Simple approach: use timestamp-based name
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let name = format!("{}{}", prefix, stamp);
-    let path = dir.join(name);
-    std::fs::File::create(&path).map_err(|e| {
+    let path = interp.host_fs.tempfile(prefix).map_err(|e| {
         Error::runtime(
             format!("couldn't create temp file: {}", e),
             crate::error::ErrorCode::Io,
         )
     })?;
-    Ok(Value::from_str(&path.to_string_lossy()))
+    Ok(Value::from_str(&path))
 }
 
-enum AccessCheck { Read, Write, Exec }
+#[derive(Clone, Copy)]
+pub(crate) enum AccessCheck { Read, Write, Exec }
 
 #[cfg(feature = "file")]
-fn file_access(path: &str, check: AccessCheck) -> bool {
+pub(crate) fn fs_access(path: &str, check: AccessCheck) -> bool {
     let p = std::path::Path::new(path);
     if !p.exists() { return false; }
     match check {
@@ -1590,7 +1574,7 @@ fn format_g(v: f64, prec: usize, upper: bool, hash: bool) -> String {
 // ---------- glob (file pattern matching) ----------
 
 #[cfg(feature = "file")]
-pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_glob(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args("glob", 2, args.len()));
     }
@@ -1651,13 +1635,14 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     fn collect_entry(
+        host: &dyn crate::host::HostFs,
         path: &str,
         rest: &[&str],
         types: &Option<String>,
         out: &mut Vec<String>,
     ) {
         if rest.is_empty() {
-            let is_dir = std::path::Path::new(path).is_dir();
+            let is_dir = host.is_dir(path);
             if let Some(ty) = types {
                 let want_dir = ty.contains('d');
                 let want_file = ty.contains('f');
@@ -1671,12 +1656,13 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             out.push(path.to_string());
             return;
         }
-        if std::path::Path::new(path).is_dir() {
-            walk_dir(path, rest, types, out);
+        if host.is_dir(path) {
+            walk_dir(host, path, rest, types, out);
         }
     }
 
     fn walk_dir(
+        host: &dyn crate::host::HostFs,
         dir: &str,
         segs: &[&str],
         types: &Option<String>,
@@ -1686,23 +1672,22 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let literal = !seg.contains('*') && !seg.contains('?') && !seg.contains('[');
         if literal {
             let path = join(dir, seg);
-            if seg_match(seg, seg) && std::path::Path::new(&path).exists() {
-                collect_entry(&path, rest, types, out);
+            if seg_match(seg, seg) && host.exists(&path) {
+                collect_entry(host, &path, rest, types, out);
             }
             return;
         }
         let read_dir_path = if dir.is_empty() { ".".to_string() } else { dir.to_string() };
-        let rd = match std::fs::read_dir(&read_dir_path) {
+        let rd = match host.list_dir(&read_dir_path) {
             Ok(rd) => rd,
             Err(_) => return,
         };
-        for entry in rd.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
+        for name in rd {
             if !seg_match(seg, &name) {
                 continue;
             }
             let path = join(dir, &name);
-            collect_entry(&path, rest, types, out);
+            collect_entry(host, &path, rest, types, out);
         }
     }
 
@@ -1721,9 +1706,9 @@ pub fn cmd_glob(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let absolute = full_pattern.starts_with('/');
         let mut matched: Vec<String> = Vec::new();
         if absolute {
-            walk_dir("/", &segs, &types, &mut matched);
+            walk_dir(interp.host_fs.as_ref(), "/", &segs, &types, &mut matched);
         } else {
-            walk_dir("", &segs, &types, &mut matched);
+            walk_dir(interp.host_fs.as_ref(), "", &segs, &types, &mut matched);
         }
         for p in matched {
             let s = if tails {

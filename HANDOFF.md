@@ -216,8 +216,26 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 无 regexp 构建的 `parse_index_int` cfg bug 修复。`(std,dynmod)` 与
 `(std,file,dynmod)` 均可编译（此前后者必败）。
 
-**下一轮**：HostFs trait + JsFs(OPFS) 桥 + dynmod-test.html 增设 file
-io 区段（open x w; puts; close; open r; gets 全链路真机）。
+**本轮已实现（HostFs 落地）**：
+- `host.rs`：`HostFs` trait（数据面 18 方法：open 通道工厂/stat 简面/
+  mkdir/delete/rename/copy/list_dir/cd/pwd/read_file/tempfile）+
+  `NativeFs`（std::fs 逐字行为）。stat 的 unix 深水键（dev/ino/uid/…）、
+  readlink、settimes 留原生直连。
+- `channel.rs`：open_file 拆为 `open_file_channel`（构造，NativeFs 调
+  用）+ `install_opened`（命名/config，cmd_open 与宿主通道共用）。
+- 路由：cmd_file（exists/type/size/atime/mtime/delete/mkdir/rename/
+  copy/owned）、cmd_open、source、glob 的 walk_dir/collect_entry、
+  os.rs cd/pwd/readdir——48 处 std::fs 直连点收敛到 host_fs。
+- rtcl-wasm：`fs_bridge.rs`（JsFs/JsChannel——thread_local 注册表承载
+  JS 对象，Rust 侧只持 u64 id 保 Send；字节走 latin-1 字符串，二进制
+  载荷 OPFS-worker 形态 v2）+ `RtclHandle::set_fs(jsObj)`。JS 方法契
+  约见 fs_bridge.rs 顶部注释。坑：apply(thisArg, args) 的 this 不进
+  参数数组（首版把 NULL 塞进 argv 导致参数后移一位——真机探针抓出）。
+- dynmod-test.html 增设 F1-F8 区段（内存 fs 桥 makeMemoryFs）：
+  open w/r/gets/read/file exists/size/type/mkdir/readdir/glob/rename/
+  copy/delete/source 全链路真机 **22/22 PASS**。
+- 回归：native 全绿（test/judge/probes/scripts——行为逐字保留）、
+  wasm check 过、(std,dynmod)/(std,file,dynmod) 可编译。
 
 ## 10quater. 2026-11-12 第四轮：dynmod——wasm `load`/`unload` 扩展模块注册表（已完成）
 

@@ -69,7 +69,7 @@ pub fn cmd_open(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return open_pipe(interp, cmd_str.trim(), mode);
     }
 
-    let id = interp.channels.open_file(path, mode).map_err(|e| {
+    let (chan, binary) = interp.host_fs.open(path, mode).map_err(|e| {
         let msg = e.to_string();
         if e.kind() == std::io::ErrorKind::InvalidInput
             && msg.starts_with("invalid access mode")
@@ -80,6 +80,12 @@ pub fn cmd_open(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             super::io::posix_error(interp, format!("couldn't open \"{}\"", path), &e)
         }
     })?;
+    let id = interp
+        .channels
+        .install_opened(chan, binary)
+        .map_err(|e| {
+            super::io::posix_error(interp, format!("couldn't open \"{}\"", path), &e)
+        })?;
     Ok(Value::from_str(&id))
 }
 

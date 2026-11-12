@@ -524,6 +524,12 @@ pub struct Interp {
     /// attached to the command table by `load` / detached by `unload`.
     pub(crate) dyn_modules:
         varmap::FxHashedMap<String, commands::dynmod::DynModule>,
+    /// 文件系统数据面服务（HostFs）：file/open/source/glob/cd/pwd 的
+    /// std::fs 直连点经此路由（§10quinter——通道协议面留原生，数据面
+    /// 走宿主）。默认 NativeFs（std::fs，行为与路由前逐字一致）；
+    /// wasm 宿主经 set_host_fs 注入 JS 实现。
+    #[cfg(any(feature = "file", feature = "io"))]
+    pub(crate) host_fs: Box<dyn crate::host::HostFs>,
     /// Command-name resolution cache (tclsh's resolved-command tokens):
     /// outer key = the namespace the resolution ran in, inner key = the
     /// invocation name as written.  Both levels probe with `&str`, so a
@@ -1029,6 +1035,8 @@ impl Interp {
             coro_ctx: None,
             coro_chain: Vec::new(),
             dyn_modules: varmap::FxHashedMap::default(),
+            #[cfg(any(feature = "file", feature = "io"))]
+            host_fs: Box::new(crate::host::NativeFs),
             ensembles: HashMap::new(),
             #[cfg(feature = "std")]
             script_name: String::new(),
@@ -1214,6 +1222,13 @@ impl Interp {
     /// one appends anew (Tcl hash-entry semantics).
     pub(crate) fn note_new_command(&mut self, key: &str) {
         self.command_order.push(key.to_string());
+    }
+
+    /// 注入文件系统数据面服务（wasm 宿主由此把 open/file/source 的
+    /// 数据面接到 JS——内存 fs / OPFS worker）。默认 NativeFs。
+    #[cfg(any(feature = "file", feature = "io"))]
+    pub fn set_host_fs(&mut self, fs: Box<dyn crate::host::HostFs>) {
+        self.host_fs = fs;
     }
 
     /// Hide a command from `info commands` (invokable but invisible —

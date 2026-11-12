@@ -67,7 +67,6 @@ impl HostConsole for NullConsole {}
 /// 文件系统服务：`file`、`open`/`close`/`read`/`gets`/`source`/`glob`
 /// 等 fs 侧能力的宿主接缝。浏览器（wasm）下由 JS 提供（例如挂载的
 /// 虚拟 FS、OPFS 或 localStorage 后端）。
-pub trait HostFs: Send {}
 
 /// 环境变量服务：`$env` 数组与 `info exists env(...)` 的宿主接缝。
 pub trait HostEnv: Send {}
@@ -106,3 +105,134 @@ impl HostClock for NativeClock {
 /// 进程执行服务：`exec`/`open |cmd` 的宿主接缝（浏览器下不存在，
 /// 对应 feature 在 wasm 组合里天然缺席）。
 pub trait HostExec: Send {}
+
+/// 文件系统数据面服务：`file`/`open`/`source`/`glob`/`cd`/`pwd` 的
+/// std::fs 直连点路由到本 trait（§10quinter 定调：通道协议面留原生，
+/// 数据面走宿主服务）。stat 的 unix 深水键（dev/ino/uid/…）、readlink、
+/// settimes 不在数据面，留原生实现。
+///
+/// 原生构建默认 [`NativeFs`]（std::fs 直连，行为与路由前逐字一致）；
+/// wasm 宿主经 `Interp::set_host_fs` 注入 JS 实现（浏览器内存 fs /
+/// OPFS worker），浏览器里 open/gets/puts/file 由此真正可用。
+pub trait HostFs: Send {
+    /// 打开文件通道。`mode` 为 Tcl access 串（r/w/a/r+/w+/a+ 及
+    /// PLATFORM 兼容的 RB/WB 组合变体）。返回 (通道, 是否二进制)。
+    fn open(&mut self, path: &str, mode: &str)
+        -> std::io::Result<(Box<dyn crate::channel::Channel>, bool)>;
+    fn exists(&self, path: &str) -> bool;
+    fn is_file(&self, path: &str) -> bool;
+    fn is_dir(&self, path: &str) -> bool;
+    fn size(&self, path: &str) -> std::io::Result<u64>;
+    fn mtime(&self, path: &str) -> std::io::Result<i64>;
+    fn atime(&self, path: &str) -> std::io::Result<i64>;
+    fn readable(&self, path: &str) -> bool;
+    fn writable(&self, path: &str) -> bool;
+    fn executable(&self, path: &str) -> bool;
+    fn mkdir(&mut self, path: &str, all: bool) -> std::io::Result<()>;
+    fn delete(&mut self, path: &str) -> std::io::Result<()>;
+    fn rename(&mut self, src: &str, dst: &str) -> std::io::Result<()>;
+    fn copy(&mut self, src: &str, dst: &str) -> std::io::Result<()>;
+    /// 目录列举（不含 `.`/`..`；glob 与 readdir 共用）。
+    fn list_dir(&self, path: &str) -> std::io::Result<Vec<String>>;
+    fn pwd(&self) -> String;
+    fn cd(&mut self, path: &str) -> std::io::Result<()>;
+    /// `source`/`file tempfile` 的整文件读取与临时路径。
+    fn read_file(&mut self, path: &str) -> std::io::Result<String>;
+    fn tempfile(&mut self, prefix: &str) -> std::io::Result<String>;
+}
+
+/// std 原生实现：逐字保留路由前的 std::fs 行为。
+#[cfg(feature = "std")]
+pub struct NativeFs;
+
+#[cfg(feature = "std")]
+impl HostFs for NativeFs {
+    fn open(&mut self, path: &str, mode: &str)
+        -> std::io::Result<(Box<dyn crate::channel::Channel>, bool)>
+    {
+        crate::channel::open_file_channel(path, mode)
+    }
+    fn exists(&self, path: &str) -> bool {
+        std::path::Path::new(path).exists()
+    }
+    fn is_file(&self, path: &str) -> bool {
+        std::path::Path::new(path).is_file()
+    }
+    fn is_dir(&self, path: &str) -> bool {
+        std::path::Path::new(path).is_dir()
+    }
+    fn size(&self, path: &str) -> std::io::Result<u64> {
+        Ok(std::fs::metadata(path)?.len())
+    }
+    fn mtime(&self, path: &str) -> std::io::Result<i64> {
+        let t = std::fs::metadata(path)?.modified()?;
+        Ok(t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default().as_secs() as i64)
+    }
+    fn atime(&self, path: &str) -> std::io::Result<i64> {
+        let t = std::fs::metadata(path)?.accessed()?;
+        Ok(t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default().as_secs() as i64)
+    }
+    fn readable(&self, path: &str) -> bool {
+        crate::interp::commands::io::fs_access(path, crate::interp::commands::io::AccessCheck::Read)
+    }
+    fn writable(&self, path: &str) -> bool {
+        crate::interp::commands::io::fs_access(path, crate::interp::commands::io::AccessCheck::Write)
+    }
+    fn executable(&self, path: &str) -> bool {
+        crate::interp::commands::io::fs_access(path, crate::interp::commands::io::AccessCheck::Exec)
+    }
+    fn mkdir(&mut self, path: &str, all: bool) -> std::io::Result<()> {
+        if all {
+            std::fs::create_dir_all(path)
+        } else {
+            std::fs::create_dir(path)
+        }
+    }
+    fn delete(&mut self, path: &str) -> std::io::Result<()> {
+        if std::path::Path::new(path).is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        }
+    }
+    fn rename(&mut self, src: &str, dst: &str) -> std::io::Result<()> {
+        std::fs::rename(src, dst)
+    }
+    fn copy(&mut self, src: &str, dst: &str) -> std::io::Result<()> {
+        std::fs::copy(src, dst).map(|_| ())
+    }
+    fn list_dir(&self, path: &str) -> std::io::Result<Vec<String>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            if let Some(s) = entry.file_name().to_str() {
+                out.push(s.to_string());
+            }
+        }
+        Ok(out)
+    }
+    fn pwd(&self) -> String {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+    fn cd(&mut self, path: &str) -> std::io::Result<()> {
+        std::env::set_current_dir(path)
+    }
+    fn read_file(&mut self, path: &str) -> std::io::Result<String> {
+        std::fs::read_to_string(path)
+    }
+    fn tempfile(&mut self, prefix: &str) -> std::io::Result<String> {
+        // 与路由前 file_tempfile 同形：temp 目录 + <prefix><纳秒时间戳>。
+        let dir = std::env::temp_dir();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = dir.join(format!("{}{}", prefix, stamp));
+        std::fs::File::create(&path)?;
+        Ok(path.to_string_lossy().to_string())
+    }
+}

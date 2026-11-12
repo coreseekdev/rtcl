@@ -7,7 +7,7 @@ use crate::value::Value;
 // ---------- cd ----------
 
 #[cfg(feature = "file")]
-pub fn cmd_cd(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_cd(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let dir = match args.len() {
         1 => {
             // cd with no args → go to HOME
@@ -18,7 +18,7 @@ pub fn cmd_cd(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         2 => args[1].as_str().to_string(),
         _ => return Err(Error::wrong_args_with_usage("cd", 1, args.len(), "?dirName?")),
     };
-    std::env::set_current_dir(&dir).map_err(|e| {
+    interp.host_fs.cd(&dir).map_err(|e| {
         Error::runtime(
             format!("couldn't change working directory to \"{}\": {}", dir, e),
             ErrorCode::Io,
@@ -30,14 +30,11 @@ pub fn cmd_cd(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 // ---------- pwd ----------
 
 #[cfg(feature = "file")]
-pub fn cmd_pwd(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_pwd(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 1 {
         return Err(Error::wrong_args("pwd", 1, args.len()));
     }
-    let cwd = std::env::current_dir().map_err(|e| {
-        Error::runtime(format!("error getting working directory: {}", e), ErrorCode::Io)
-    })?;
-    Ok(Value::from_str(&cwd.to_string_lossy()))
+    Ok(Value::from_str(&interp.host_fs.pwd()))
 }
 
 // ---------- sleep ----------
@@ -65,7 +62,7 @@ pub fn cmd_sleep(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 // ---------- readdir ----------
 
 #[cfg(feature = "file")]
-pub fn cmd_readdir(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub fn cmd_readdir(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(Error::wrong_args_with_usage("readdir", 2, args.len(), "?-nocomplain? dirPath"));
     }
@@ -78,8 +75,8 @@ pub fn cmd_readdir(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         (false, args[1].as_str())
     };
 
-    let entries = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
+    let mut names: Vec<Value> = match interp.host_fs.list_dir(dir) {
+        Ok(rd) => rd.into_iter().map(|s| Value::from_str(&s)).collect(),
         Err(e) => {
             if nocomplain {
                 return Ok(Value::from_str(""));
@@ -90,15 +87,6 @@ pub fn cmd_readdir(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
             ));
         }
     };
-
-    let mut names: Vec<Value> = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            Error::runtime(format!("error reading directory: {}", e), ErrorCode::Io)
-        })?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        names.push(Value::from_str(&name));
-    }
     names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     Ok(Value::from_list(&names))
 }

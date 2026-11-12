@@ -53,6 +53,137 @@ import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
 
 const SIDE_WASM_URL = './myext.wasm';
 
+// ── file-io 区段：内存 fs 桥（JS 数据面契约示例；OPFS worker 形态 v2）──
+// 契约见 crates/rtcl-wasm/src/fs_bridge.rs 顶部注释。
+function makeMemoryFs() {
+  const files = new Map();   // path -> {data, mtime}
+  const dirs = new Set(['/']);
+  let cwd = '/';
+  const norm = (p) => {
+    if (!p.startsWith('/')) p = (cwd === '/' ? '' : cwd) + '/' + p;
+    const parts = [];
+    for (const seg of p.split('/')) {
+      if (seg === '' || seg === '.') continue;
+      if (seg === '..') parts.pop(); else parts.push(seg);
+    }
+    return '/' + parts.join('/');
+  };
+  const parent = (p) => { const i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i); };
+  const base = (p) => p.slice(p.lastIndexOf('/') + 1);
+  const touchDir = (p) => { let d = norm(p); while (d && d !== '/') { dirs.add(d); d = parent(d); } };
+  return {
+    open(path, mode) {
+      path = norm(path);
+      const m = mode.toLowerCase();
+      const exists = files.has(path);
+      if (m.startsWith('r') && !m.includes('creat') && !exists) {
+        throw new Error("couldn't open \"" + path + "\": no such file or directory");
+      }
+      if (!exists) files.set(path, { data: '', mtime: Date.now() / 1000 | 0 });
+      const entry = files.get(path);
+      let pos = 0;
+      if (m.startsWith('a')) pos = entry.data.length;
+      if (m.startsWith('w')) { entry.data = ''; entry.mtime = Date.now() / 1000 | 0; }
+      const h = {
+        read(n) {
+          if (pos >= entry.data.length) return '';
+          const s = entry.data.slice(pos, pos + (n || 1));
+          pos += s.length;
+          return s;
+        },
+        readline() {
+          if (pos >= entry.data.length) return null;
+          const i = entry.data.indexOf('\n', pos);
+          let s;
+          if (i < 0) { s = entry.data.slice(pos); pos = entry.data.length; }
+          else { s = entry.data.slice(pos, i + 1); pos = i + 1; }
+          return s.replace(/\r?\n$/, '');
+        },
+        readall() { return entry.data; },
+        write(s) {
+          entry.data = entry.data.slice(0, pos) + s + entry.data.slice(pos + s.length);
+          pos += s.length;
+          entry.mtime = Date.now() / 1000 | 0;
+        },
+        flush() {},
+        seek(p, whence) {
+          const len = entry.data.length;
+          if (whence === 'set') pos = p;
+          else if (whence === 'cur') pos += p;
+          else pos = len + p;
+          pos = Math.max(0, Math.min(pos, len));
+          return pos;
+        },
+        tell() { return pos; },
+        eof() { return pos >= entry.data.length; },
+        close() {},
+      };
+      touchDir(parent(path));
+      return h;
+    },
+    stat(path) {
+      path = norm(path);
+      if (files.has(path)) {
+        const f = files.get(path);
+        return { size: f.data.length, mtime: f.mtime, atime: f.mtime, dir: false, file: true };
+      }
+      if (dirs.has(path)) {
+        return { size: 0, mtime: 0, atime: 0, dir: true, file: false };
+      }
+      return null;
+    },
+    access(path) {
+      path = norm(path);
+      const ok = files.has(path) || dirs.has(path);
+      return { read: ok, write: true, exec: false };
+    },
+    mkdir(path, all) {
+      path = norm(path);
+      if (!all && !dirs.has(parent(path))) throw new Error('no such directory');
+      touchDir(path);
+    },
+    delete(path) {
+      path = norm(path);
+      if (dirs.has(path)) {
+        for (const k of [...files.keys(), ...dirs]) {
+          if (k.startsWith(path + '/')) files.delete(k);
+        }
+        dirs.delete(path);
+      } else files.delete(path);
+    },
+    rename(src, dst) {
+      src = norm(src); dst = norm(dst);
+      if (files.has(src)) { files.set(dst, files.get(src)); files.delete(src); }
+      else throw new Error('no such file');
+    },
+    copy(src, dst) {
+      src = norm(src); dst = norm(dst);
+      if (!files.has(src)) throw new Error('no such file');
+      files.set(dst, { data: files.get(src).data, mtime: Date.now() / 1000 | 0 });
+    },
+    readdir(path) {
+      path = norm(path);
+      const out = [];
+      for (const k of dirs) if (parent(k) === path && k !== '/') out.push(base(k));
+      for (const k of files.keys()) if (parent(k) === path) out.push(base(k));
+      return out;
+    },
+    pwd() { return cwd; },
+    cd(path) { cwd = norm(path); },
+    readfile(path) {
+      path = norm(path);
+      if (!files.has(path)) throw new Error("couldn't read file \"" + path + "\"");
+      return files.get(path).data;
+    },
+    tempfile(prefix) {
+      const p = '/tmp/' + prefix + (Date.now() % 100000);
+      files.set(p, { data: '', mtime: 0 });
+      touchDir('/tmp');
+      return p;
+    },
+  };
+}
+
 const CASES = [
   // ── dynmod 全链路 ──────────────────────────────────────────────
   { id: 'T1', name: 'T1 register_module（宿主预实例化 → 注册表）',
@@ -99,6 +230,31 @@ const CASES = [
   { name: 'T14 dict info（Tcl_HashStats 形态）',
     script: 'lindex [split [dict info [dict create x 1]] \\n] 0',
     want: '1 entries in table, 4 buckets' },
+  // ── HostFs 数据面：file io 全链路（内存 fs 桥）────────────────
+  { name: 'F1 open w → puts → close（宿主数据面写；puts 无返回值）',
+    script: 'set f [open /demo/hello.txt w]; puts $f "hello jsfs"; close $f; set w1 [file exists /demo/hello.txt]; set w2 [file size /demo/hello.txt]; list $w1 $w2',
+    want: '1 11' },
+  { name: 'F2 open r → gets（宿主数据面读）',
+    script: 'set g [open /demo/hello.txt r]; set line [gets $g]; close $g; set line',
+    want: 'hello jsfs' },
+  { name: 'F3 read 全读（含 puts 的行尾换行）',
+    script: 'set h [open /demo/hello.txt r]; set s [read $h]; close $h; set s',
+    want: 'hello jsfs\n' },
+  { name: 'F4 file exists/size/type',
+    script: 'list [file exists /demo/hello.txt] [file size /demo/hello.txt] [file type /demo/hello.txt]',
+    want: '1 11 file' },
+  { name: 'F5 file mkdir/readdir（glob 共用 list_dir）',
+    script: 'file mkdir /demo/sub; set f [open /demo/sub/x.txt w]; close $f; lsort [readdir /demo]',
+    want: 'hello.txt sub' },
+  { name: 'F6 glob 经宿主数据面',
+    script: 'lsort [glob /demo/sub/*]',
+    want: '/demo/sub/x.txt' },
+  { name: 'F7 file rename/copy/delete',
+    script: 'file rename /demo/sub/x.txt /demo/sub/y.txt; file copy /demo/sub/y.txt /demo/sub/z.txt; list [file exists /demo/sub/x.txt] [file exists /demo/sub/y.txt] [file exists /demo/sub/z.txt]',
+    want: '0 1 1' },
+  { name: 'F8 source（宿主数据面）',
+    script: 'set f [open /demo/prog.tcl w]; puts $f {set loaded 42}; close $f; source /demo/prog.tcl; set loaded',
+    want: '42' },
 ];
 
 const rows = document.getElementById('rows');
@@ -140,7 +296,10 @@ async function main() {
     await init();
     handle = new RtclHandle();
     window.__rtcl = handle;              // 控制台/诊断入口
-    stRtcl.textContent = `ok (${handle.exec('info patchlevel')})`;
+    // HostFs 数据面注入：内存 fs 桥（浏览器里 open/file/source/glob
+    // 从"运行时必败"变为真正可用；通道协议面留原生 Rust）。
+    handle.set_fs(makeMemoryFs());
+    stRtcl.textContent = `ok (${handle.exec('info patchlevel')} + jsfs)`;
     const initial = handle.exec('llength [info commands]');
     window.__rtcl_initial_list = handle.exec('info commands');
     logln(`[rtcl] pkg loaded; info commands = ${initial}（清单已存 __rtcl_initial_list）`);

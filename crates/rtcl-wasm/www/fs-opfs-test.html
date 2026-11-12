@@ -48,7 +48,16 @@
 <div id="log"></div>
 
 <script type="module">
+// SAB 同步桥接线：fs-worker 执行真实 async OPFS，解释器 worker 的同步
+// HostFs 调用经 Atomics.wait 阻塞等待其回执——回执在 OPFS 写入完成后
+// 发出（严格 durable）。
+const sab = new SharedArrayBuffer(256 * 1024 + 64);
+const fsWorker = new Worker('fs-worker.js', { type: 'module' });
 const worker = new Worker('rtcl-worker.js', { type: 'module' });
+// MessageChannel：interp worker（port1）↔ fs worker（port2）的调用通道
+const ch = new MessageChannel();
+fsWorker.postMessage({ sab, port: ch.port2 }, [ch.port2]);
+worker.postMessage({ sab, fsPort: ch.port1 }, [ch.port1]);
 
 const CASES = [
   { name: 'O1 open w → puts → close（写入 OPFS 影子）',
@@ -133,14 +142,29 @@ worker.onmessage = async (ev) => {
     logln(`[worker] ready (fs=${ev.data.fs})`);
     // 持久化标记：上次运行留下的文件即证明 OPFS 落盘
     const marker = await send('catch {open /persist/marker.txt r} f; if {$f ne ""} { set s [read $f]; close $f; set s } else { set s "" }; set s');
-    const prev = marker.ok ? marker.result : '';
+    const prev = marker.ok ? marker.result.trim() : '';
+    const strictPrev = await send('catch {open /persist/strict.txt r} f; if {$f ne ""} { set s [read $f]; close $f; set s } else { set s "" }; set s');
+    const strictTxt = strictPrev.ok ? strictPrev.result.trim() : '';
     const stamp = Date.now();
     await send('file mkdir /persist; set f [open /persist/marker.txt w]; puts $f "' + stamp + '"; close $f');
-    document.getElementById('persist').textContent = prev
+    let persistNote = prev
       ? `🔁 持久化实证：读到上次运行写入的标记（时间戳 ${prev}）——OPFS 落盘生效`
       : '首次运行：/persist/marker.txt 已写入，刷新本页应显示上次的时间戳';
+    if (strictTxt) persistNote += ` | ✅ 严格 durable 实证：上次运行被立即终止后写入的 strict 标记仍在（${strictTxt}）`;
+    document.getElementById('persist').textContent = persistNote;
     await send('file delete -force /demo');   // 清场：保证可重复运行
+    await send('catch {file delete /__rtcl_meta.json} e1; catch {file delete /__rtcl_meta.json.crswap} e2; catch {file delete -force /demo} e3');  // 残留 sidecar/swap 清理
     await run();
+    // ── 严格 durable 实证：写 marker 后**立刻 terminate worker**——
+    // write-behind 形态下微任务未跑数据即丢；SAB 桥形态下 write 返回
+    // 时 OPFS 已落盘，数据必存。600ms 后自动重载验证。
+    const strict = await send('file mkdir /persist; set f [open /persist/strict.txt w]; puts $f "strict-' + Date.now() + '"; close $f; set ok [file exists /persist/strict.txt]; list $ok');
+    if (strict.ok && strict.result === '1 1') {
+      logln('[strict] marker written; terminating worker NOW');
+      worker.terminate();
+      document.getElementById('persist').textContent = '⏳ 严格 durable 实证：worker 已被立即终止，600ms 后重载验证 /persist/strict.txt…';
+      setTimeout(() => location.reload(), 600);
+    }
   }
 };
 
@@ -170,6 +194,15 @@ worker.onerror = (e) => {
   banner.className = 'bad';
   banner.textContent = 'worker 异常：' + (e.message || e);
 };
+worker.addEventListener('message', (ev) => {
+  if (ev.data.type === 'boot') logln('[worker boot] ' + (ev.data.stage || 'script loaded'));
+  if (ev.data.type === 'init-error') {
+    banner.className = 'bad';
+    banner.textContent = 'worker init 异常：' + ev.data.error;
+    logln('[worker init-error] ' + ev.data.error);
+  }
+  if (ev.data.type === 'fs') logln('[worker] fs mode: ' + ev.data.fs);
+});
 </script>
 </body>
 </html>

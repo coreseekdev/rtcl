@@ -263,8 +263,28 @@ json/regexp-spencer 移侧模块，其分派面随之出表）。
   /persist/marker.txt 每次运行写入时间戳、下次运行读回上次值
   （页内显示 🔁 标记）。清场步骤（file delete -force /demo）保证
   可重复运行。
-- 回归：native 全绿、wasm check 过。**后续**：SAB 同步桥（严格
-  durable）；regexp-spencer 外置（字符串 ABI v2）。
+- 回归：native 全绿、wasm check 过。
+
+**SAB 严格 durable 桥已实现（同日第二轮，fs-opfs-test.html 12/12）**：
+- www/fs-worker.js：OPFS 执行 worker（真实 async OPFS：sync access
+  handle 读写/flush/close + readdir + rename[move 回退读写删] +
+  meta sidecar /__rtcl_meta.json 持久化 settimes）。
+- rtcl-worker bridge 模式：Atomics.wait 阻塞等待 fs-worker 回执
+  （REQ_SEQ/PAYLOAD_LEN/REPLY_SEQ SAB 布局 + MessageChannel port 传
+  seq）——**回执在 OPFS 写入完成后发出**（write 返回即落盘）。契约
+  走 RtclHandle::set_fs（JsFs 包装，本 worker JS 对象为数据面）。
+- **真机实证**：O1-O12 全过 + **terminate 后 strict 标记存活**（写入
+  后立即 terminate worker，重载后标记仍在——write-behind 形态会丢）。
+- 坑（真机逐一抓出）：SAB 视图不可直接喂 TextDecoder（拷贝副本）；
+  JSON.stringify 拒 BigInt（Number 归一）；Worker 对象不可入
+  postMessage payload（DataCloneError → MessageChannel + transfer
+  port）；module worker 消息在 eval 完成后才派发（boot 队列 +
+  booted 门，fs 分支判断前重放，否则 bridge 静默降级直连）；COOP/
+  COEP 头必需（SharedArrayBuffer 需 crossOriginIsolated——本地服务器
+  /tmp/isolated_server.py 8933 端口）；node worker_threads 链无 OPFS
+  （仅作语法/装载护栏，真机以浏览器为准）。
+- 页面接线：fs-opfs-test.html = SAB 形态（严格 durable 实证区段）；
+  dynmod-test.html = write-behind 形态（原样保留，两形态并存）。
 
 **expand OPEN 项收口（同日定调）**：`{*}` 展开语义**双路径探针全绿**
 ——specs/expand.probes 11/11（eval/树走）+ specs/scripts/expand.tcl

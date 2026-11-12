@@ -1,27 +1,18 @@
+// 浏览器 worker 原生 postMessage/onmessage；node worker_threads 测试链
+// 路由 parentPort 提供（self/全局兼容垫片）。
+const BOOT_QUEUE = [];
+let booted = false;
+let __nodePort = null;
+if (typeof postMessage !== 'function') {
+  // node worker_threads（本仓测试链路）——ESM 顶层 await
+  const { parentPort } = await import('node:worker_threads');
+  globalThis.postMessage = (m) => parentPort.postMessage(m);
+  parentPort.on('message', (m) => globalThis.__recv({ data: m }));
+}
 // rtcl-worker.js — rtcl 的 worker 部署形态（网页 dispatcher 的真实运行
 // 结构）：解释器 + JS 桥全部在本 worker，主线程经消息协议投递脚本。
 //
-// 文件数据面 = **OPFS 影子权威 + write-behind**：
-//   - worker 启动时把 OPFS 树装载进影子索引（内容/目录/元数据）；
-//   - Tcl 同步操作（open/gets/puts/file/…）即时改影子（sync 契约无
-//     阻塞），同时入持久化队列；
-//   - worker 让出事件循环时异步回写 OPFS（createWritable 逐操作重放）。
-//   持久化时点 = exec 返回后的首个微任务；严格 durable（同步等 OPFS）
-//   需 SAB+Atomics.wait 桥（v3，见 HANDOFF）。元数据（mtime/atime）
-//   由影子持有——file mtime name time 等 settimes 全支持（OPFS 本身
-//   无 utimes API，影子是唯一权威）。
-//
-// 消息协议：
-//   主线程 → worker: {id, script}
-//   worker → 主线程: {type:'ready'} | {id, ok, result?, error?, output}
-
 import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
-
-let handle = null;
-let outputs = [];
-let outHandler = null;
-
-// ── OPFS 影子文件系统 ────────────────────────────────────────────────
 
 function makeOpfsFs(root) {
   const files = new Map();   // path -> {bytes: Uint8Array, mtime, atime}
@@ -266,36 +257,215 @@ function makeOpfsFs(root) {
 
 // ── worker 主体 ─────────────────────────────────────────────────────
 
-(async () => {
-  await init();
-  handle = new RtclHandle();
-  outHandler = (s) => outputs.push(s);
-  handle.set_output_handler(outHandler);
-
-  let fsNote = 'memory';
-  try {
-    if (typeof navigator !== 'undefined' && navigator.storage && navigator.storage.getDirectory) {
-      const root = await navigator.storage.getDirectory();
-      const fs = await makeOpfsFs(root);
-      await fs.loadTree();
-      handle.set_fs(fs.contract);
-      fsNote = 'opfs';
-    }
-  } catch (e) {
-    console.warn('[worker] OPFS unavailable, memory fs fallback:', e && e.message);
+// ── SAB 同步桥（bridge 模式的 fs 契约）：同步阻塞等待 fs-worker 的
+// OPFS 回执——每个 Tcl 文件操作在返回前完成 OPFS 落盘（严格 durable）。
+// ── SAB 严格 durable 形态的契约构造（fs-worker 为 OPFS 执行端）────
+function makeBridgeFs(sab, fsPort) {
+  const i32 = new Int32Array(sab);
+  const u8 = new Uint8Array(sab);
+  let seq = 0;
+  function callFs(op, params) {
+    seq += 1;
+    // BigInt（i64 实参）不可 JSON.stringify——统一 Number 归一
+    const safe = JSON.stringify({ op, params }, (_k, v) =>
+      typeof v === 'bigint' ? Number(v) : v);
+    const req = new TextEncoder().encode(safe);
+    u8.set(req.subarray(0, 256 * 1024 - 64), 64);
+    Atomics.store(i32, 2, req.length);          // PAYLOAD_LEN
+    Atomics.store(i32, 0, seq);                 // REQ_SEQ
+    Atomics.store(i32, 1, 0);                   // REPLY_SEQ 复位
+    fsPort.postMessage({ seq });
+    const r = Atomics.wait(i32, 1, 0);          // 阻塞至 fs worker 回执
+    if (r !== 'ok') throw new Error('fs bridge wait failed: ' + r);
+    const len = Atomics.load(i32, 2);
+    // SAB 视图不可直接喂 TextDecoder——拷贝
+    const copy = new Uint8Array(len);
+    copy.set(u8.subarray(64, 64 + len));
+    const reply = JSON.parse(new TextDecoder().decode(copy));
+    if (!reply.ok) throw new Error(reply.error);
+    return reply.result;
   }
-
-  handle.set_output_handler((s) => outputs.push(s));
-  self.postMessage({ type: 'ready', fs: fsNote });
-
-  self.onmessage = (ev) => {
-    const { id, script } = ev.data;
-    outputs = [];
-    try {
-      const result = handle.exec(script);
-      self.postMessage({ id, ok: true, result, output: outputs.join('') });
-    } catch (e) {
-      self.postMessage({ id, ok: false, error: String(e), output: outputs.join('') });
-    }
+  // 契约面（方法名 = fs_bridge.rs 的 JsFs 契约；open 返回句柄对象，
+  // JsChannel 经 FILE_OBJECTS 间接调用其 read/write/... 方法）。
+  return {
+    open(path, mode) {
+      const fid = String(callFs('open', { path, mode }));
+      return {
+        read(n) { return callFs('read', { fid, n: Number(n) }); },
+        readline() { return callFs('readline', { fid }); },
+        readall() { return callFs('readall', { fid }); },
+        write(s) { return callFs('write', { fid, data: s }); },
+        flush() { return callFs('flush', { fid }); },
+        seek(pos, whence) { return callFs('seek', { fid, pos: Number(pos), whence }); },
+        tell() { return callFs('tell', { fid }); },
+        eof() { return callFs('eof', { fid }); },
+        close() { return callFs('close', { fid }); },
+        _fid: fid,
+      };
+    },
+    stat(path) { return callFs('stat', { path }); },
+    statfull(path, follow) { return callFs('statfull', { path, follow }); },
+    access(path) { return callFs('access', { path }); },
+    mkdir(path, all) { return callFs('mkdir', { path, all }); },
+    delete(path) { return callFs('delete', { path }); },
+    rename(src, dst) { return callFs('rename', { src, dst }); },
+    copy(src, dst) { return callFs('copy', { src, dst }); },
+    readdir(path) { return callFs('readdir', { path }); },
+    pwd() { return callFs('pwd', {}); },
+    cd(path) { return callFs('cd', { path }); },
+    readfile(path) { return callFs('readfile', { path }); },
+    tempfile(prefix) { return callFs('tempfile', { prefix }); },
+    settimes(path, atime, mtime) { return callFs('settimes', { path, atime, mtime }); },
+    readlink(path) { return callFs('readlink', { path }); },
   };
+}
+
+// ── 模块级消息路由 ────────────────────────────────────────────────
+// module worker 规范：eval 完成前父线程投递的消息由浏览器排队，eval
+// 结束后才派发——所以 onmessage 必须在 eval 期间就位，消息入
+// BOOT_QUEUE，IIFE 在 fs 分支判断**前**重放（否则 bridge SAB/port 到
+// 达时 fs 模式已定为直连——stFs 静默降级的根因）。
+let handle = null;
+let bridgeSab = null;
+let bridgePort = null;
+let outputs = [];
+
+function handleControl(msg) {
+  if (msg.sab && msg.fsPort) {
+    bridgeSab = msg.sab;
+    bridgePort = msg.fsPort;
+    return true;
+  }
+  return false;
+}
+
+function dispatchExec({ id, script }) {
+  outputs = [];
+  try {
+    const result = handle.exec(script);
+    globalThis.postMessage({ id, ok: true, result, output: outputs.join('') });
+  } catch (e) {
+    globalThis.postMessage({ id, ok: false, error: String(e), output: outputs.join('') });
+  }
+}
+
+function dispatchAndControl(ev) {
+  const msg = ev.data;
+  if (msg.id !== undefined && msg.script !== undefined) dispatchExec(msg);
+  else handleControl(msg);
+}
+
+globalThis.onmessage = (ev) => {
+  if (booted) { dispatchAndControl(ev); return; }
+  BOOT_QUEUE.push(ev.data);
+};
+if (typeof globalThis.__recv !== 'function') {
+  globalThis.__recv = (ev) => {
+    if (booted) { dispatchAndControl(ev); return; }
+    BOOT_QUEUE.push(ev.data);
+  };
+}
+
+// ── 启动序列 ────────────────────────────────────────────────────────
+
+(async () => {
+  try {
+    await init();
+    handle = new RtclHandle();
+    handle.set_output_handler((s) => outputs.push(s));
+
+    // ① 重放排队的消息：控制消息（bridge SAB/port）先于 exec
+    const execQ = [];
+    while (BOOT_QUEUE.length) {
+      const msg = BOOT_QUEUE.shift();
+      if (msg.id !== undefined && msg.script !== undefined) execQ.push(msg);
+      else handleControl(msg);
+    }
+
+    // ② fs 模式判定（bridge → 直连 OPFS → 内存回落）
+    let fsNote = 'memory';
+    if (bridgeSab !== null) {
+      // SAB 严格 durable 形态：Atomics.wait 阻塞等待 fs-worker 的
+      // OPFS 回执（回执在写入完成之后发出）。契约对象经
+      // RtclHandle::set_fs → JsFs 包装（方法名 = fs_bridge.rs 契约）。
+      const i32 = new Int32Array(bridgeSab);
+      const u8 = new Uint8Array(bridgeSab);
+      let seq = 0;
+      function callFs(op, params) {
+        seq += 1;
+        const safe = JSON.stringify({ op, params }, (_k, v) =>
+          typeof v === 'bigint' ? Number(v) : v);
+        const req = new TextEncoder().encode(safe);
+        u8.set(req.subarray(0, 256 * 1024 - 64), 64);
+        Atomics.store(i32, 2, req.length);
+        Atomics.store(i32, 0, seq);
+        Atomics.store(i32, 1, 0);
+        bridgePort.postMessage({ seq });
+        const r = Atomics.wait(i32, 1, 0);
+        if (r !== 'ok') throw new Error('fs bridge wait failed: ' + r);
+        const len = Atomics.load(i32, 2);
+        // SAB 视图不可直接喂 TextDecoder——拷贝
+        const copy = new Uint8Array(len);
+        copy.set(u8.subarray(64, 64 + len));
+        const reply = JSON.parse(new TextDecoder().decode(copy));
+        if (!reply.ok) throw new Error(reply.error);
+        return reply.result;
+      }
+      const contract = {
+        open(path, mode) {
+          const h = callFs('open', { path, mode });
+          const fid = String(h);
+          return {
+            read(n) { return callFs('read', { fid, n: Number(n) }); },
+            readline() { return callFs('readline', { fid }); },
+            readall() { return callFs('readall', { fid }); },
+            write(s) { return callFs('write', { fid, data: s }); },
+            flush() { return callFs('flush', { fid }); },
+            seek(pos, whence) { return callFs('seek', { fid, pos: Number(pos), whence }); },
+            tell() { return callFs('tell', { fid }); },
+            eof() { return callFs('eof', { fid }); },
+            close() { return callFs('close', { fid }); },
+            _fid: fid,
+          };
+        },
+        stat(path) { return callFs('stat', { path }); },
+        statfull(path, follow) { return callFs('statfull', { path, follow }); },
+        access(path) { return callFs('access', { path }); },
+        mkdir(path, all) { return callFs('mkdir', { path, all }); },
+        delete(path) { return callFs('delete', { path }); },
+        rename(src, dst) { return callFs('rename', { src, dst }); },
+        copy(src, dst) { return callFs('copy', { src, dst }); },
+        readdir(path) { return callFs('readdir', { path }); },
+        pwd() { return callFs('pwd', {}); },
+        cd(path) { return callFs('cd', { path }); },
+        readfile(path) { return callFs('readfile', { path }); },
+        tempfile(prefix) { return callFs('tempfile', { prefix }); },
+        settimes(path, atime, mtime) { return callFs('settimes', { path, atime, mtime }); },
+        readlink(path) { return callFs('readlink', { path }); },
+      };
+      handle.set_fs(contract);
+      fsNote = 'opfs-sab';
+    } else {
+      try {
+        if (typeof navigator !== 'undefined' && navigator.storage && navigator.storage.getDirectory) {
+          const root = await navigator.storage.getDirectory();
+          const fs = await makeOpfsFs(root);
+          await fs.loadTree();
+          handle.set_fs(fs.contract);
+          fsNote = 'opfs';
+        }
+      } catch (e) {
+        console.warn('[worker] OPFS unavailable, memory fs fallback:', e && e.message);
+      }
+    }
+
+    handle.set_output_handler((s) => outputs.push(s));
+    globalThis.postMessage({ type: 'ready', fs: fsNote });
+
+    // ③ exec 队列补跑（bridge/direct 均就绪后）
+    booted = true;
+    for (const msg of execQ) dispatchExec(msg);
+  } catch (e) {
+    globalThis.postMessage({ type: 'init-error', error: String(e && e.stack || e) });
+  }
 })();

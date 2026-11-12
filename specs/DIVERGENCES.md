@@ -79,6 +79,18 @@
 
 非缺陷、不再修：`string byterange` 是 rtcl 扩展，tclsh 无此子命令。
 
+## 2026-11-13b regexp 外置（wasm 语义子集，R/S 区 22/22 真机）
+
+wasm 子集剔除 regexp-lite（净重 97KiB raw）；regexp/regsub 经 dynmod
+注入 www/regexpmod.js（Tcl ARE → JS RegExp **语义子集**）。已支持：
+POSIX 类展开、\y→\b、\m/\M/\</\> 近似、quoting ***=、-nocase/
+-line/-lineanchor/-linestop/-all/-inline/-indices/-start、捕获变量
+（__RXCAP/__RXIDX 结构化编码 + wrapper upvar）、regsub \1..\9/&。
+**子集边界（wasm 构建特有分歧）**：非贪婪支持 ✓（JS 原生）但 Tcl
+ARE 的 quoting 细目/collating 元素/反向引用组**起点偏移为 indexOf
+近似**；Spencer 全集（BT 引擎、精确 -indices 组起点、**/quoting）仍
+在 native（rtcl_std 默认）。eval/-f 双路径探针不受影响（跑 native）。
+
 ## 2026-11-13 file/io 外置评估（测量 + feature 图解耦，定调未实现）
 
 - file+io 净重 164KiB raw（≈56KiB gzip，本体 6%）——外置动机是浏览器

@@ -6,21 +6,22 @@ license.workspace = true
 description = "WASM bindings for rtcl Tcl interpreter"
 
 [dependencies]
-rtcl-core = { path = "../rtcl-core", default-features = false, features = ["std", "regexp-lite"] }
+rtcl-core = { path = "../rtcl-core", default-features = false, features = ["std"] }
 rtcl-parser = { path = "../rtcl-parser" }
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 # default-features=false：rtcl-vm 默认 rtcl_std 含 env（$env 镜像在
 # Interp::new 里 std::env::vars()——wasm32-unknown-unknown 无 env 支持，
 # 构造即 panic）。显式子集去掉 env/exec/signal（无 OS 语义）；stdlib
-# Tcl 的 file/io/clock/regexp/package 保留。
+# Tcl 的 file/io/clock/package 保留；regexp 外置（wasm 子集不含
+# regexp-lite——regexp/regsub 经 dynmod 注入 JS 实现，见
+# www/regexpmod.js；native 默认 rtcl_std 含 spencer/lite）。
 rtcl-vm = { path = "../rtcl-vm", default-features = false, features = [
     "std",
     "file",
     "io",
     "clock",
     "package",
-    "regexp-lite",
     "dynmod",
     "json",
 ] }

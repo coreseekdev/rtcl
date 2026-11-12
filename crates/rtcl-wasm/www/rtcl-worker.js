@@ -13,6 +13,47 @@ if (typeof postMessage !== 'function') {
 // 结构）：解释器 + JS 桥全部在本 worker，主线程经消息协议投递脚本。
 //
 import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+import { makeRegexpMod } from './regexpmod.js';
+
+// regexp 外置的语义 wrapper proc（::regexp/::regsub 解包结构化编码并
+// upvar 写变量；native 同面）。
+const REGEXP_SETUP_TCL = `
+proc ::regexp {args} {
+  set r [::regexp::regexp [join $args "\u0001"]]
+  if {[lindex $r 0] eq "__RXCAP"} {
+    set k [lindex $r 1]
+    set vals [lrange $r 2 end]
+    set i 0
+    foreach name [lrange $args [expr {[llength $args] - $k}] end] {
+      upvar 1 $name v
+      set v [lindex $vals $i]
+      incr i
+    }
+    return 1
+  }
+  if {[lindex $r 0] eq "__RXIDX"} {
+    set k [lindex $r 1]
+    set pairs [lrange $r 2 end]
+    set i 0
+    foreach name [lrange $args [expr {[llength $args] - $k}] end] {
+      upvar 1 $name v
+      set v [lindex $pairs $i]
+      incr i
+    }
+    return 1
+  }
+  return $r
+}
+proc ::regsub {args} {
+  set r [::regsub::regsub [join $args "\u0001"]]
+  if {[lindex $r 0] eq "__RS"} {
+    upvar 1 [lindex $args end] v
+    set v [lindex $r 1]
+    return [lindex $r 2]
+  }
+  return $r
+}
+`;
 
 function makeOpfsFs(root) {
   const files = new Map();   // path -> {bytes: Uint8Array, mtime, atime}
@@ -460,6 +501,15 @@ if (typeof globalThis.__recv !== 'function') {
     }
 
     handle.set_output_handler((s) => outputs.push(s));
+
+    // regexp 外置：注册 JS 面并 load + 装语义 wrapper（wasm 子集不含
+    // regexp-lite，native 命令面不存在——dynmod 注入同面实现）。
+    if (!handle.exec('namespace which -command ::regexp')) {
+      handle.register_module('regexp', makeRegexpMod());
+      handle.exec('load regexp');
+      handle.exec(REGEXP_SETUP_TCL);
+    }
+
     globalThis.postMessage({ type: 'ready', fs: fsNote });
 
     // ③ exec 队列补跑（bridge/direct 均就绪后）

@@ -1,0 +1,15 @@
+[package]
+name = "dynmod-side"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+
+# 独立编译（wasm32 侧模块，不入 rtcl workspace）
+[workspace]

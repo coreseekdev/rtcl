@@ -205,8 +205,17 @@ rtcl=网页 command dispatcher 的扩展面：wasm 里 dlopen 不存在，改为
   字符串/字节载荷走侧模块 rtcl_alloc/rtcl_free 交接，v2）。
 - 本体拆分路径：可拆=纯函数子系统（regexp-spencer/encoding 表/zlib/
   json/chart——字符串进出）；拆不动=分派/变量表/帧模型（即本体）。
-- 测试：rtcl-vm dynmod 单测 5/5（host 假桥）；JS 侧需真机 smoke
-  （wasm-bindgen 测试基建暂无 browser harness）。
+- 测试：rtcl-vm dynmod 单测 5/5（host 假桥）+ **真机 smoke 全绿**
+  （www/dynmod-test.html，14 用例：dynmod 全链路 8 + 平台抽查 6；
+  侧模块 crates/rtcl-wasm/examples/dynmod-side 为 no_std 纯 wasm32
+  crate——裸 wasm i64 参数是 BigInt，JS 胶水 BigInt/Math.trunc 交接）。
+  真机抓出并修复：__dynmod:* 内部包装 proc 走 cmd_proc 路径绕过了
+  register_command 的 hide 逻辑 → Interp::hide_command（trim ::）+
+  register_module 注册后隐藏；计数面结论：wasm 初始 = 99（无 socket
+  [net 门控] 无 exec [wasm 子集本就不含]），load 后 101，unload 回 99。
+  JS 侧需本地 HTTP（ES module + fetch 不能 file://）：
+  `cd crates/rtcl-wasm && python3 -m http.server 8932` →
+  /www/dynmod-test.html。
 
 ## 10ter. 2026-11-12 第三轮：协程引擎 + wasm 可选门控（已完成）
 

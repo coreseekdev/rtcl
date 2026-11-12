@@ -1216,6 +1216,18 @@ impl Interp {
         self.command_order.push(key.to_string());
     }
 
+    /// Hide a command from `info commands` (invokable but invisible —
+    /// the mechanism behind host bridges and internal dispatch wrappers;
+    /// probe with `namespace which`, not `info commands`).
+    pub fn hide_command(&mut self, name: &str) {
+        self.hidden_commands.insert(name.trim_start_matches("::").to_string());
+    }
+
+    /// Whether `name` is currently hidden from listings.
+    pub fn is_command_hidden(&self, name: &str) -> bool {
+        self.hidden_commands.contains(name.trim_start_matches("::"))
+    }
+
     /// Ensure a namespace and its ancestors exist, logging creation order
     /// for the `namespace children` replay.
     pub(crate) fn ensure_ns_path(&mut self, qualified: &str) {

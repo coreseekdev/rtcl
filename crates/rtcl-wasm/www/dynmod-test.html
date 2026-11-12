@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>rtcl dynmod 真机 smoke — wasm load/unload 扩展模块</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, "JetBrains Mono", Menlo, monospace;
+         background: #11141a; color: #d6deeb; margin: 0; padding: 24px; }
+  h1 { font-size: 18px; margin: 0 0 4px; color: #82aaff; }
+  .sub { color: #7f8c9b; margin-bottom: 18px; }
+  #bar { display: flex; gap: 12px; margin: 12px 0 18px; align-items: baseline; }
+  #bar .chip { padding: 2px 10px; border-radius: 12px; background: #1c2230; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 18px; }
+  td, th { padding: 6px 10px; border-bottom: 1px solid #232a38; text-align: left;
+           vertical-align: top; }
+  th { color: #82aaff; font-weight: 600; }
+  td.case { width: 40%; }
+  .pass { color: #7ee787; }
+  .fail { color: #ff7b72; }
+  .want, .got { color: #9fb0c3; white-space: pre-wrap; }
+  .script { color: #c792ea; white-space: pre-wrap; }
+  #log { background: #0c0f15; border: 1px solid #232a38; padding: 10px 14px;
+         white-space: pre-wrap; max-height: 260px; overflow: auto; }
+  #banner { padding: 8px 14px; border-radius: 8px; margin: 10px 0 18px;
+            font-weight: 700; }
+  #banner.ok  { background: #14301f; color: #7ee787; border: 1px solid #2ea043; }
+  #banner.bad { background: #3a1512; color: #ff7b72; border: 1px solid #f85149; }
+</style>
+</head>
+<body>
+<h1>rtcl dynmod 真机 smoke — wasm load/unload 扩展模块</h1>
+<div class="sub">宿主预实例化侧 wasm → register_module → Tcl load/分派/unload 全链路。
+  另附协程 / mathop / 哈希序平台抽查。</div>
+
+<div id="bar">
+  <span class="chip">rtcl: <b id="st-rtcl">…</b></span>
+  <span class="chip">侧模块: <b id="st-side">…</b></span>
+  <span class="chip" id="st-summary"></span>
+</div>
+
+<div id="banner">运行中…</div>
+
+<table>
+  <thead><tr><th>用例</th><th>结果</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+
+<div id="log"></div>
+
+<script type="module">
+import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+
+const SIDE_WASM_URL = './myext.wasm';
+
+const CASES = [
+  // ── dynmod 全链路 ──────────────────────────────────────────────
+  { id: 'T1', name: 'T1 register_module（宿主预实例化 → 注册表）',
+    script: null, // JS 侧步骤，run() 里按 id 特判
+    check: (r) => r.regOk === true },
+  { name: 'T2 load myext → myext::add 20 22',
+    script: 'load myext; myext::add 20 22',
+    want: '42' },
+  { name: 'T3 myext::version（数值 ABI → String）',
+    script: 'myext::version',
+    want: '1' },
+  { name: 'T4 info commands myext::* 列出安装的命令',
+    script: 'join [lsort [info commands myext::*]] ,',
+    want: '::myext::add,::myext::version' },
+  { name: 'T5 load 幂等（重复 load 为 no-op）',
+    script: 'load myext; load myext; myext::add 1 2',
+    want: '3' },
+  { name: 'T6 unload → 命令消失',
+    script: 'unload myext; catch {myext::add 1 1} e; set e',
+    want: 'invalid command name "myext::add"' },
+  { name: 'T7 unload 未加载 → tclsh 原文错误',
+    script: 'catch {unload myext} e; set e',
+    want: 'file "myext" has never been loaded' },
+  { name: 'T8 注册表仍在 → 重新 load 可用（用例尾 unload）',
+    script: 'load myext; myext::add 40 2; unload myext',
+    want: '' },
+  // ── 平台抽查（协程 / mathop / 哈希序 / info commands 计数）────
+  { id: 'T9', name: 'T9 unload 后命令计数回落到初始值（wasm 面，无 socket）',
+    script: 'llength [info commands]',
+    want: null, // 动态：main() 里以 load 前的初始计数为准
+    },
+  { name: 'T10 ::tcl::mathop 全集（wasm 23 算子）',
+    script: 'llength [info commands ::tcl::mathop::*]',
+    want: '23' },
+  { name: 'T11 mathop 语义（一元 / 实除、** 右折叠）',
+    script: 'list [tcl::mathop::/ 2] [tcl::mathop::** 2 3 2]',
+    want: '0.5 512' },
+  { name: 'T12 协程生成器（挂起链重放）',
+    script: 'proc g {n} {for {set i 1} {$i <= $n} {incr i} {yield $i}; return fin}; set r [list [coroutine c g 3]]; lappend r [c] [c] [c]; catch {c} e; lappend r $e; set r',
+    want: '1 2 3 fin {invalid command name "c"}' },
+  { name: 'T13 Tcl 哈希序（array names 桶序）',
+    script: 'array set a {b 1 a 2 c 3 z 4 y 5}; array names a',
+    want: 'y a z b c' },
+  { name: 'T14 dict info（Tcl_HashStats 形态）',
+    script: 'lindex [split [dict info [dict create x 1]] \\n] 0',
+    want: '1 entries in table, 4 buckets' },
+];
+
+const rows = document.getElementById('rows');
+const log  = document.getElementById('log');
+const banner = document.getElementById('banner');
+let nPass = 0, nFail = 0;
+
+function rowEl(c) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td class="case"><div>${c.name}</div>` +
+    (c.script ? `<div class="script">${esc(c.script)}</div>` : '') +
+    (c.want != null ? `<div class="want">期望: ${esc(String(c.want))}</div>`
+      : '<div class="want">期望: load 前初始命令计数</div>') +
+    `</td><td class="res">…</td>`;
+  rows.appendChild(tr);
+  return tr.querySelector('.res');
+}
+function esc(s) {
+  return String(s).replace(/[&<>]/g, (m) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));
+}
+function logln(s) {
+  log.textContent += s + '\n';
+  log.scrollTop = log.scrollHeight;
+}
+
+function mark(el, ok, got) {
+  el.innerHTML = ok
+    ? `<span class="pass">PASS</span>`
+    : `<span class="fail">FAIL</span><div class="got">实际: ${esc(got)}</div>`;
+  ok ? nPass++ : nFail++;
+}
+
+async function main() {
+  const stRtcl = document.getElementById('st-rtcl');
+  const stSide = document.getElementById('st-side');
+  let handle = null, exportsObj = null;
+
+  try {
+    await init();
+    handle = new RtclHandle();
+    window.__rtcl = handle;              // 控制台/诊断入口
+    stRtcl.textContent = `ok (${handle.exec('info patchlevel')})`;
+    const initial = handle.exec('llength [info commands]');
+    window.__rtcl_initial_list = handle.exec('info commands');
+    logln(`[rtcl] pkg loaded; info commands = ${initial}（清单已存 __rtcl_initial_list）`);
+  } catch (e) {
+    stRtcl.textContent = '加载失败';
+    banner.className = 'bad';
+    banner.textContent = 'rtcl pkg 加载失败：' + e;
+    return;
+  }
+
+  try {
+    const bytes = await (await fetch(SIDE_WASM_URL)).arrayBuffer();
+    const { instance } = await WebAssembly.instantiate(bytes, {});
+    const ex = instance.exports;
+    logln(`[side] exports: ${Object.keys(ex).join(', ')}`);
+    // 数值 ABI → 字符串包装（裸 wasm 的 i64 参数/返回是 BigInt）。
+    // v2 的字符串/字节载荷走 rtcl_alloc/rtcl_free 缓冲区交接。
+    exportsObj = {
+      add:     (a, b) => Number(ex.add(BigInt(Math.trunc(Number(a))), BigInt(Math.trunc(Number(b))))),
+      version: ()     => ex.version(),
+    };
+    stSide.textContent = `ok (add(2,3)=${Number(ex.add(2n,3n))})`;
+  } catch (e) {
+    stSide.textContent = '加载失败';
+    banner.className = 'bad';
+    banner.textContent = '侧模块 myext.wasm 加载失败：' + e;
+    return;
+  }
+
+  const initialCount = handle.exec('llength [info commands]');
+  logln(`[rtcl] 初始命令计数（wasm 面）= ${initialCount}`);
+  for (const c of CASES) {
+    const el = rowEl(c);
+    logln(`— ${c.name}`);
+    try {
+      if (c.id === 'T1') {
+        handle.register_module('myext', exportsObj);
+        // T1 的观感验证：注册表里有，但命令还没挂（未 load）
+        const listed = handle.exec('info commands myext::*');
+        mark(el, listed === '', `load 前 info commands myext::* = "${listed}"（应为空）`);
+      } else {
+        const want = c.want === null ? initialCount : c.want;
+        const got = handle.exec(c.script);
+        const ok = String(got) === String(want);
+        mark(el, ok, got);
+        logln(`  → ${ok ? 'PASS' : 'FAIL got: ' + got}`);
+      }
+    } catch (e) {
+      mark(el, false, String(e));
+      logln(`  → 异常: ${e}`);
+    }
+  }
+
+  const summary = document.getElementById('st-summary');
+  summary.textContent = `${nPass} pass / ${nFail} fail`;
+  banner.className = nFail === 0 ? 'ok' : 'bad';
+  banner.textContent = nFail === 0
+    ? '✅ 全部通过 — dynmod 全链路 + 平台抽查在真机可用'
+    : `❌ ${nFail} 例失败（见表格）`;
+}
+
+main();
+</script>
+</body>
+</html>

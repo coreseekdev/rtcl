@@ -711,7 +711,7 @@ fn list_commands_in(
     };
     let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for (i, key) in interp.command_order.iter().enumerate() {
-        if live(key) && !interp.hidden_commands.contains(key.as_str()) {
+        if live(key) && !interp.is_command_hidden(key) {
             seen.insert(key.as_str(), i);
         }
     }

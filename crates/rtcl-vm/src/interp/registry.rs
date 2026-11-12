@@ -481,7 +481,7 @@ impl Interp {
             self.note_new_command(name);
         }
         if !Self::TCL_INIT_CMD_ORDER.contains(&name) {
-            self.hidden_commands.insert(name.to_string());
+            self.hide_command(name);
         }
         self.command_categories.insert(name.to_string(), CommandCategory::Extension);
         // A host command shadowing a Tier-1 name (`set`/`if`/…) must

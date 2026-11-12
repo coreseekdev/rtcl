@@ -100,6 +100,9 @@ impl RtclHandle {
             // Internal registration name: unique per module+command.
             let internal = format!("__dynmod:{}:{}", name, fname);
             js_command::register_js_command(&mut self.interp, self.id, &internal, func);
+            // Internal dispatch wrapper: invokable but invisible (it is
+            // not part of the Tcl surface; ::name::cmd is the public face).
+            self.interp.hide_command(&internal);
             commands.push((fname, vec![
                 "_js_dispatch".to_string(),
                 self.id.to_string(),

@@ -29,6 +29,10 @@ pub fn next_interp_id() -> u64 {
 /// jit_call_in_flight` 哨兵以明确错误拒绝——重入检测集中在导出层，
 /// 此处不再重复拦截（JIT 于 wasm32 接线后如需收紧可在此补）。
 pub fn js_dispatch_cmd(_interp: &mut rtcl_core::Interp, args: &[Value]) -> rtcl_core::error::Result<Value> {
+    #[cfg(feature = "std")]
+    if std::env::var_os("RTCL_DEBUG_DISPATCH").is_some() {
+        eprintln!("[dispatch] n={} words={:?}", args.len(), args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+    }
     if args.len() < 3 {
         return Err(rtcl_core::error::Error::wrong_args("_js_dispatch", 3, args.len()));
     }
@@ -43,8 +47,22 @@ pub fn js_dispatch_cmd(_interp: &mut rtcl_core::Interp, args: &[Value]) -> rtcl_
     match callback {
         Some(func) => {
             let js_args = js_sys::Array::new();
-            for arg in &args[3..] {
-                js_args.push(&JsValue::from_str(&arg.to_string()));
+            // __dynmod:* 的调用形是 `_js_dispatch <id> <internal>
+            // [join $args "\u0001"]`——最后一个词是分隔符连接的参数串
+            // （\u0001 分隔；wrapper 侧 join 产出单词，任何展开路径都
+            // 不再拆）。拆开还原为 JS 参数。
+            if cmd_name.starts_with("__dynmod:") && args.len() >= 3 {
+                let joined = args[args.len() - 1].to_string();
+                for part in joined.split('\u{0001}') {
+                    js_args.push(&JsValue::from_str(part));
+                }
+                if js_args.length() == 0 {
+                    js_args.push(&JsValue::from_str(""));
+                }
+            } else {
+                for arg in &args[3..] {
+                    js_args.push(&JsValue::from_str(&arg.to_string()));
+                }
             }
 
             let result = func.apply(&JsValue::NULL, &js_args).map_err(|e| {

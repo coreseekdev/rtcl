@@ -139,11 +139,15 @@ pub fn cmd_load(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 call.push_str(&crate::value::tcl_quote(w));
                 call.push(' ');
             }
-            call.push_str("{*}$args");
+            // wrapper 体：`<words> [join $args "\u0001"]`——参数经分隔
+            // 符协议整词传递（{*}$args 的列表展开对含空白元素有重解析
+            // 缺口；join 产出的单词文本任何路径都不再拆），js_dispatch
+            // 侧按 \u0001 拆开还原。
+            call.push_str("[join $args \"\\u0001\"]");
             let script = format!(
                 "proc {} {{args}} {{ {} }}",
                 crate::value::tcl_quote(&full),
-                call
+                call.trim_end()
             );
             interp.eval(&script)?;
             installed.push(full);
@@ -223,14 +227,20 @@ mod tests {
 
     fn ev(script: &str) -> String {
         let mut interp = Interp::new();
+        // join 协议（wrapper 体 `[join $args "\u0001"]`）：dispatch
+        // words 是独立词，**最后一个词**是 \u0001 连接的调用参数串——
+        // native 宿主的 bridge 自行拆分（wasm 侧 js_dispatch 统一拆）。
         interp.register_command("fake_bridge", |_interp, args| {
             let words: Vec<String> = args.iter().map(|a| a.as_str().to_string()).collect();
-            BRIDGE_LOG.with(|log| log.borrow_mut().push(words));
-            // "myext add a b" → "a+b" style arithmetic for the probe.
-            // "fake_bridge myext add a b" → a+b for the probe.
-            if args.len() == 5 && args[2].as_str() == "add" {
-                let a: i64 = args[3].as_str().parse().unwrap_or(0);
-                let b: i64 = args[4].as_str().parse().unwrap_or(0);
+            BRIDGE_LOG.with(|log| log.borrow_mut().push(words.clone()));
+            // words = [fake_bridge, myext, add, "20\u{1}22"]
+            let params: Vec<&str> = words
+                .last()
+                .map(|w| w.split('\u{0001}').collect())
+                .unwrap_or_default();
+            if words.len() == 4 && words[2] == "add" && params.len() == 2 {
+                let a: i64 = params[0].parse().unwrap_or(0);
+                let b: i64 = params[1].parse().unwrap_or(0);
                 return Ok(Value::from_int(a + b));
             }
             Ok(Value::from_str("bridged"))

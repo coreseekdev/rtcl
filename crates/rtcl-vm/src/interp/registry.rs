@@ -141,8 +141,11 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "taint",     func: introspect::cmd_taint,      cat: Extension, cmd_id: None, usage: "varName",                    help: "Mark a variable as tainted" },
     CmdEntry { name: "untaint",   func: introspect::cmd_untaint,    cat: Extension, cmd_id: None, usage: "varName",                    help: "Remove taint from a variable" },
     // ── JSON extension ─────────────────────────────────────────────────────
+    #[cfg(feature = "json")]
     CmdEntry { name: "json",        func: json::cmd_json,            cat: Extension, cmd_id: None, usage: "subcommand ?arg ...?",       help: "JSON encode/decode" },
+    #[cfg(feature = "json")]
     CmdEntry { name: "json::decode", func: json::cmd_json_decode,    cat: Extension, cmd_id: None, usage: "?-index? ?-null string? ?-schema? json-string", help: "Decode JSON to Tcl value" },
+    #[cfg(feature = "json")]
     CmdEntry { name: "json::encode", func: json::cmd_json_encode,    cat: Extension, cmd_id: None, usage: "value ?schema?",             help: "Encode Tcl value to JSON" },
 ];
 

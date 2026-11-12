@@ -50,6 +50,7 @@
 
 <script type="module">
 import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
+import { makeJsonMod } from './jsonmod.js';
 
 const SIDE_WASM_URL = './myext.wasm';
 
@@ -210,6 +211,28 @@ function makeMemoryFs() {
 }
 
 const CASES = [
+  // ── json 外置（§10quater 首个命令族）：JS jsonmod 同面实现 ──────
+  { name: 'J1 load jsonmod → ::json::decode（对象→键值对）',
+    script: 'load json; ::json::decode {{ "a": 1, "b": [2, 3], "c": {"x": "y z"}, "n": null, "t": true, "pi": 3.14 }}',
+    want: 'a 1 b {2 3} c {x {y z}} n null t true pi 3.14' },
+  { name: 'J2 ::json::encode obj（无字段 schema=全 str，键排序）',
+    script: 'load json; set d [::json::decode {{ "a": 1, "b": [2, 3], "c": {"x": "y z"}, "n": null, "t": true, "pi": 3.14 }}]; ::json::encode $d obj',
+    want: '{"a": "1", "b": "2 3", "c": "x {y z}", "n": "null", "pi": "3.14", "t": "true"}' },
+  { name: 'J3 ::json::encode typed schema（num/list/bool 字段）',
+    script: 'load json; set d [::json::decode {{ "a": 1, "b": [2, 3], "c": {"x": "y z"}, "n": null, "t": true, "pi": 3.14 }}]; ::json::encode $d {obj a num b list c str n str t bool pi num}',
+    want: '{"a": 1, "b": ["2", "3"], "c": "x {y z}", "n": "null", "pi": 3.14, "t": true}' },
+  { name: 'J4 ::json::decode -index（数组→索引 dict）',
+    script: 'load json; set idx [::json::decode -index {[10, 20]}]; list [dict get $idx 0] [dict get $idx 1]',
+    want: '10 20' },
+  { name: 'J5 ::json::decode -null（null 替换）',
+    script: 'load json; ::json::decode -null MISSING {{ "q": null }}',
+    want: 'q MISSING' },
+  { name: 'J6 ::json::encode 嵌套 obj schema（递归）',
+    script: 'load json; ::json::encode {k {v 1 w 2}} {obj k {obj v num w num}}',
+    want: '{"k": {"v": 1, "w": 2}}' },
+  { name: 'J7 数字的原文保留（native 语义：1.50 不归一）',
+    script: 'load json; ::json::decode {{ "x": 1.50 }}',
+    want: 'x 1.50' },
   // ── dynmod 全链路 ──────────────────────────────────────────────
   { id: 'T1', name: 'T1 register_module（宿主预实例化 → 注册表）',
     script: null, // JS 侧步骤，run() 里按 id 特判
@@ -337,6 +360,14 @@ async function main() {
     // HostFs 数据面注入：内存 fs 桥（浏览器里 open/file/source/glob
     // 从"运行时必败"变为真正可用；通道协议面留原生 Rust）。
     handle.set_fs(makeMemoryFs());
+    // json 子系统外置：wasm 构建不含 native json（feature 门控），
+    // JS jsonmod 提供同面实现（§10quater 首个命令族外置）。
+    try {
+      handle.register_module('json', makeJsonMod());
+      logln('[json] jsonmod registered');
+    } catch (e) {
+      logln('[json] register_module ERR: ' + e);
+    }
     stRtcl.textContent = `ok (${handle.exec('info patchlevel')} + jsfs)`;
     const initial = handle.exec('llength [info commands]');
     window.__rtcl_initial_list = handle.exec('info commands');

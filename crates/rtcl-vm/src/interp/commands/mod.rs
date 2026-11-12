@@ -46,6 +46,7 @@ pub mod namespace;
 #[cfg(any(feature = "file", feature = "signal", feature = "exec"))]
 pub mod os;
 pub mod introspect;
+#[cfg(feature = "json")]
 pub mod json;
 pub mod trace;
 pub mod words;

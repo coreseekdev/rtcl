@@ -22,7 +22,10 @@ rtcl-vm = { path = "../rtcl-vm", default-features = false, features = [
     "package",
     "regexp-lite",
     "dynmod",
+    "json",
 ] }
+# json 外置：wasm 构建不含（页面经 register_module 注入 JS jsonmod，
+# 见 www/dynmod-test.html J 区段）；native 默认含（rtcl_std）。
 # wasm32 JIT 接线（⑧ 重入哨兵已就位）：wasmi 是纯 Rust——在
 # wasm32 里跑 wasm（解释器套解释器，比 JS WebAssembly API 路径慢
 # 但零 JS 侧代码，全量复用池/协议/错误帧）。默认关——wasm32 包体

@@ -216,6 +216,34 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 式 delegator，量级 <20 KiB）；§10quater 路线的子系统外置（chart/
 json/regexp-spencer 移侧模块，其分派面随之出表）。
 
+## 10septem. 2026-11-13 子系统外置第一刀：json → JS dynmod（33/33 真机）
+
+- **rtcl-vm**：`json` feature 门控（rtcl_std 含，native 不变；wasm
+  子集剔除——json::decode/encode/json 三条目 + 模块）。净重 38 KiB
+  raw（1102 行纯解析器，比 file+io 的 164KiB 小——外置收益第二梯队，
+  架构演示价值优先）。
+- **www/jsonmod.js**：JS 同面实现——JSON tokenizer **保留数字原文**
+  （JSON.parse 会把 1.50 归一成 1.5，native 是文本保留）+ Tcl 序列化
+  （对齐 serialize_list/tcl_quote：needsQuote/balanced/backslash）+
+  Tcl list 解析（encode 值输入）+ schema 语法全移植（str/num/bool/
+  obj/list/mixed + brace words）+ Inf/-Inf 原文输出。decode/encode/
+  -index/-null/-schema 全支持。
+- **dynmod 参数协议升级**（join 分隔符）：wrapper 体改为
+  `[join $args "\u0001"]`——**发现 rtcl 的 {*}$args 展开对含空白
+  元素有重解析拆词缺口**（`::json::decode {{...}}` 的 JSON 串被拆成
+  25 碎片；Tcl 语义 {*}$args 元素应整词传递）——join 产出的单词
+  任何路径都不再拆；js_dispatch 按分隔符拆开还原。**expand 拆词是
+  rtcl 通用正确性 bug**（judge 未覆盖 {*}+含空白元素组合），记 OPEN
+  待修（修后 wrapper 可回 [list {*}$args] 形）。
+- **真机 J1-J7**（dynmod-test.html）：decode/encode/-index/-null/
+  schema/嵌套 obj/数字原文保留全过，合计 **33/33**。中途真机抓出：
+  apply(thisArg,args) 的 this 不进参数数组（JS handler 需 rest 参数
+  `decode(...args)`）；CASES 数组被注入截断（node --check 语法护栏）。
+- 回归：native 全绿（test/judge/probes/scripts）、dynmod 单测按 join
+  契约更新（5/5）、wasm check 过。
+- **后续**：expand 拆词修复（正解）；regexp-spencer 外置（大刀，需
+  字符串 ABI v2）；OPFS worker fs 形态。
+
 ## 10quinter. 2026-11-13 第五轮：file/io 外置评估——测量 + feature 图解耦（定调）
 
 **测量**（raw 口径 = cargo 产物，bindgen 再剥 ~0.5MB → pkg 2.18MiB → gzip 774KiB）：

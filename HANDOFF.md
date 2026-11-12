@@ -244,6 +244,25 @@ json/regexp-spencer 移侧模块，其分派面随之出表）。
 - **后续**：expand 拆词修复（正解）；regexp-spencer 外置（大刀，需
   字符串 ABI v2）；OPFS worker fs 形态。
 
+## 10tertio. 2026-11-13 ABI v2——dynmod 参数协议升级（列表值单词直传）
+
+- **动机**：v1 join 协议（`[join $args "\u0001"]`）对**数据含
+  \u0001 的参数丢界**（分隔符歧义，宿主拆分处无法区分）。
+- **v2 协议**（DynAbi::V2List）：wrapper 体 `<dispatch words>
+  {*}$args`——参数经 rtcl 的 {*}$args 列表展开**逐词直传**（expand
+  元素感知，specs/expand.probes 双路径护栏），无分隔符——任意
+  Unicode / \u0001 / 空白数据整词保真。
+- **rtcl-vm**：DynAbi 枚举（V1Join/V2List）+ DynModuleDef.abi +
+  register_dyn_module_v2；load 模板按 abi 分支。
+- **rtcl-wasm**：register_module **默认 v2**（DynModuleDef.abi =
+  V2List）；js_command 的 __dynmod 分支按 v2 wrapper 传形逐词转发
+  JS fn（rest 参数契约）。
+- 真机 fs-opfs-test.html 29/29 维持（O/R/S/E 全矩阵回归）。
+- **共享内存零拷贝模式预留**：侧 wasm `--import-memory` 共享 rtcl
+  线性内存 + (ptr,len) 直调——版本握手（abi_version）已预留，真需
+  1MiB 级零拷贝时实现。
+- 规约：www/ABI-V2.md。
+
 ## 10undecimus. 2026-11-13 外置第二刀 regexp + encoding 命令面 + SAB durable 桥（29/29 真机）
 
 - **regexp 外置**（956648e + 7382ab4 + cdd3b71）：wasm 子集剔除

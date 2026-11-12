@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>rtcl OPFS worker 形态 — 文件 io 持久化真机测试</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, "JetBrains Mono", Menlo, monospace;
+         background: #11141a; color: #d6deeb; margin: 0; padding: 24px; }
+  h1 { font-size: 18px; margin: 0 0 4px; color: #82aaff; }
+  .sub { color: #7f8c9b; margin-bottom: 18px; }
+  #bar { display: flex; gap: 12px; margin: 12px 0 18px; align-items: baseline; flex-wrap: wrap; }
+  #bar .chip { padding: 2px 10px; border-radius: 12px; background: #1c2230; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 18px; }
+  td, th { padding: 6px 10px; border-bottom: 1px solid #232a38; text-align: left;
+           vertical-align: top; }
+  th { color: #82aaff; font-weight: 600; }
+  td.case { width: 42%; }
+  .pass { color: #7ee787; }
+  .fail { color: #ff7b72; }
+  .want, .got { color: #9fb0c3; white-space: pre-wrap; }
+  .script { color: #c792ea; white-space: pre-wrap; }
+  #banner { padding: 8px 14px; border-radius: 8px; margin: 10px 0 18px; font-weight: 700; }
+  #banner.ok  { background: #14301f; color: #7ee787; border: 1px solid #2ea043; }
+  #banner.bad { background: #3a1512; color: #ff7b72; border: 1px solid #f85149; }
+  #persist { color: #d2a8ff; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<h1>rtcl OPFS worker 形态 — 文件 io 持久化真机测试</h1>
+<div class="sub">解释器整体运行于 module worker（dispatcher 真实部署形态）；文件数据面 =
+  OPFS 影子权威 + write-behind 回写（exec 返回后微任务落盘）。settimes/stat
+  13 键由影子元数据全支持。</div>
+
+<div id="bar">
+  <span class="chip">worker: <b id="st-worker">…</b></span>
+  <span class="chip">fs: <b id="st-fs">…</b></span>
+  <span class="chip" id="st-summary"></span>
+</div>
+<div id="persist"></div>
+<div id="banner">等待 worker…</div>
+
+<table>
+  <thead><tr><th>用例</th><th>结果</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+
+<div id="log"></div>
+
+<script type="module">
+const worker = new Worker('rtcl-worker.js', { type: 'module' });
+
+const CASES = [
+  { name: 'O1 open w → puts → close（写入 OPFS 影子）',
+    script: 'file mkdir /demo; set f [open /demo/hello.txt w]; puts $f "hello opfs"; close $f; list [file exists /demo/hello.txt] [file size /demo/hello.txt]',
+    want: '1 11' },
+  { name: 'O2 open r → gets（读回）',
+    script: 'set g [open /demo/hello.txt r]; set line [gets $g]; close $g; set line',
+    want: 'hello opfs' },
+  { name: 'O3 read 全读（含行尾换行）',
+    script: 'set h [open /demo/hello.txt r]; set s [read $h]; close $h; set s',
+    want: 'hello opfs\n' },
+  { name: 'O4 file exists/size/type',
+    script: 'list [file exists /demo/hello.txt] [file size /demo/hello.txt] [file type /demo/hello.txt]',
+    want: '1 11 file' },
+  { name: 'O5 file mkdir/readdir（影子目录索引）',
+    script: 'file mkdir /demo/sub; set f [open /demo/sub/x.txt w]; close $f; lsort [readdir /demo]',
+    want: 'hello.txt sub' },
+  { name: 'O6 glob 经宿主数据面',
+    script: 'lsort [glob /demo/sub/*]',
+    want: '/demo/sub/x.txt' },
+  { name: 'O7 file mtime name time（settimes 影子元数据）',
+    script: 'file mtime /demo/hello.txt 1000000000; file mtime /demo/hello.txt',
+    want: '1000000000' },
+  { name: 'O8 file stat 13 键全形',
+    script: 'file stat /demo/hello.txt arr; list [llength [array names arr]] $arr(type) $arr(blksize)',
+    want: '13 file 4096' },
+  { name: 'O9 file rename/copy/delete',
+    script: 'file rename /demo/sub/x.txt /demo/sub/y.txt; file copy /demo/sub/y.txt /demo/sub/z.txt; list [file exists /demo/sub/x.txt] [file exists /demo/sub/y.txt] [file exists /demo/sub/z.txt]',
+    want: '0 1 1' },
+  { name: 'O10 source（宿主数据面 eval）',
+    script: 'set f [open /demo/prog.tcl w]; puts $f {set loaded 42}; close $f; source /demo/prog.tcl; set loaded',
+    want: '42' },
+  { name: 'O11 seek/tell（读写定位）',
+    script: 'set f [open /demo/seek.txt w]; puts $f "0123456789"; close $f; set g [open /demo/seek.txt r]; seek $g 4; set t [tell $g]; set c [read $g 2]; close $g; list $t $c',
+    want: '4 45' },
+  { name: 'O12 append 模式',
+    script: 'set f [open /demo/hello.txt a]; puts $f "more"; close $f; file size /demo/hello.txt',
+    want: '16' },
+];
+
+const rows = document.getElementById('rows');
+const log  = document.getElementById('log');
+const banner = document.getElementById('banner');
+let nPass = 0, nFail = 0;
+
+function esc(s) {
+  return String(s).replace(/[&<>]/g, (m) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));
+}
+function rowEl(c) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td class="case"><div>${esc(c.name)}</div>` +
+    `<div class="script">${esc(c.script)}</div>` +
+    (c.want != null ? `<div class="want">期望: ${esc(String(c.want))}</div>` : '') +
+    `</td><td class="res">…</td>`;
+  rows.appendChild(tr);
+  return tr.querySelector('.res');
+}
+function logln(s) { log.textContent += s + '\n'; log.scrollTop = log.scrollHeight; }
+function mark(el, ok, got) {
+  el.innerHTML = ok ? `<span class="pass">PASS</span>`
+    : `<span class="fail">FAIL</span><div class="got">实际: ${esc(got)}</div>`;
+  ok ? nPass++ : nFail++;
+}
+
+function send(script) {
+  return new Promise((resolve) => {
+    const id = Math.random().toString(36).slice(2);
+    const onMsg = (ev) => {
+      if (ev.data.id !== id) return;
+      worker.removeEventListener('message', onMsg);
+      resolve(ev.data);
+    };
+    worker.addEventListener('message', onMsg);
+    worker.postMessage({ id, script });
+  });
+}
+
+worker.onmessage = async (ev) => {
+  if (ev.data.type === 'ready') {
+    document.getElementById('st-worker').textContent = 'ok';
+    document.getElementById('st-fs').textContent = ev.data.fs;
+    logln(`[worker] ready (fs=${ev.data.fs})`);
+    // 持久化标记：上次运行留下的文件即证明 OPFS 落盘
+    const marker = await send('catch {open /persist/marker.txt r} f; if {$f ne ""} { set s [read $f]; close $f; set s } else { set s "" }; set s');
+    const prev = marker.ok ? marker.result : '';
+    const stamp = Date.now();
+    await send('file mkdir /persist; set f [open /persist/marker.txt w]; puts $f "' + stamp + '"; close $f');
+    document.getElementById('persist').textContent = prev
+      ? `🔁 持久化实证：读到上次运行写入的标记（时间戳 ${prev}）——OPFS 落盘生效`
+      : '首次运行：/persist/marker.txt 已写入，刷新本页应显示上次的时间戳';
+    await send('file delete -force /demo');   // 清场：保证可重复运行
+    await run();
+  }
+};
+
+async function run() {
+  for (const c of CASES) {
+    const el = rowEl(c);
+    logln(`— ${c.name}`);
+    const r = await send(c.script);
+    if (r.ok) {
+      const ok = String(r.result) === String(c.want);
+      mark(el, ok, r.result);
+      logln(`  → ${ok ? 'PASS' : 'FAIL got: ' + r.result}`);
+    } else {
+      mark(el, false, r.error);
+      logln(`  → 异常: ${r.error}`);
+    }
+  }
+  const summary = document.getElementById('st-summary');
+  summary.textContent = `${nPass} pass / ${nFail} fail`;
+  banner.className = nFail === 0 ? 'ok' : 'bad';
+  banner.textContent = nFail === 0
+    ? '✅ 全部通过 — OPFS worker 形态文件 io 全链路可用'
+    : `❌ ${nFail} 例失败（见表格）`;
+}
+
+worker.onerror = (e) => {
+  banner.className = 'bad';
+  banner.textContent = 'worker 异常：' + (e.message || e);
+};
+</script>
+</body>
+</html>

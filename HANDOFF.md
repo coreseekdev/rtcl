@@ -244,6 +244,28 @@ json/regexp-spencer 移侧模块，其分派面随之出表）。
 - **后续**：expand 拆词修复（正解）；regexp-spencer 外置（大刀，需
   字符串 ABI v2）；OPFS worker fs 形态。
 
+## 10decimus. 2026-11-13 OPFS worker 形态——文件 io 真实持久化（12/12 真机）
+
+- **www/rtcl-worker.js**：rtcl 的 **worker 部署形态**——解释器+JS 桥
+  整体运行于 module worker，主线程经消息协议投递脚本
+  （{id, script} → {id, ok, result/error, output}）。这是网页
+  dispatcher 的真实运行结构（UI 主线程 / 调度 worker 分离）。
+- **文件数据面 = OPFS 影子权威 + write-behind**：worker 启动装载
+  OPFS 树进影子索引（内容/目录/元数据）；Tcl 同步操作即时改影子，
+  入持久化队列，worker 让出事件循环时异步回写 OPFS
+  （createWritable 逐操作重放）。**持久化时点 = exec 返回后的首个
+  微任务**；严格 durable 需 SAB+Atomics.wait 桥（v3）。元数据
+  （mtime/atime）由影子持有——settimes/stat 13 键全支持（OPFS 本身
+  无 utimes API，影子是唯一权威）。OPFS 不可用时回落内存 fs。
+- **www/fs-opfs-test.html**：O1-O12 真机（open w/r/gets/read/seek/
+  tell/append/file 面/mkdir/readdir/glob/rename/copy/delete/source/
+  settimes/stat 13 键）**12/12 PASS**；**跨刷新持久化实证**——
+  /persist/marker.txt 每次运行写入时间戳、下次运行读回上次值
+  （页内显示 🔁 标记）。清场步骤（file delete -force /demo）保证
+  可重复运行。
+- 回归：native 全绿、wasm check 过。**后续**：SAB 同步桥（严格
+  durable）；regexp-spencer 外置（字符串 ABI v2）。
+
 **expand OPEN 项收口（同日定调）**：`{*}` 展开语义**双路径探针全绿**
 ——specs/expand.probes 11/11（eval/树走）+ specs/scripts/expand.tcl
 10 场景（-f/编译）——元素整词传递在两条路径均正确；**[list 版]

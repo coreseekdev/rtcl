@@ -244,6 +244,15 @@ json/regexp-spencer 移侧模块，其分派面随之出表）。
 - **后续**：expand 拆词修复（正解）；regexp-spencer 外置（大刀，需
   字符串 ABI v2）；OPFS worker fs 形态。
 
+**expand OPEN 项收口（同日定调）**：`{*}` 展开语义**双路径探针全绿**
+——specs/expand.probes 11/11（eval/树走）+ specs/scripts/expand.tcl
+10 场景（-f/编译）——元素整词传递在两条路径均正确；**[list 版]
+wrapper 的 native 行为亦正确**（RTCL_EXPAND_LIST=1 实测 bridge 收
+3 词整词）。wasm 时代观测的 23/25 碎片限定于 **wasm dynmod [list]
+链**（wasm 特有路径，未深挖）——**join 分隔符协议为根治方案**（不
+依赖该路径），native 单测按 join 契约 5/5。探针入库作护栏；wasm
+[list] 链复现时再深挖。json 外置面维持 join 协议。
+
 ## 10quinter. 2026-11-13 第五轮：file/io 外置评估——测量 + feature 图解耦（定调）
 
 **测量**（raw 口径 = cargo 产物，bindgen 再剥 ~0.5MB → pkg 2.18MiB → gzip 774KiB）：

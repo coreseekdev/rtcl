@@ -1,0 +1,13 @@
+# {*}$args 展开语义：元素应整词传递（Tcl 语义）。每行自包含 + puts
+# （stdin 模式不回显结果）。护栏：dynmod 曾观测含空白元素被重解析拆词。
+proc src {args} { return $args }; set L [src {a b {c d}}]; puts [list [llength $L] [llength [lindex $L 0]]]
+proc src {args} { return $args }; proc sink {args} { return [llength $args] }; set L [src {a b {c d}}]; puts [sink {*}$L]
+proc src {args} { return $args }; proc sink2 {args} { return $args }; set L [src {a b {c d}}]; set R [sink2 {*}$L]; puts [list [llength $R] [lindex $R 0]]
+proc sink3 {args} { return [llength $args] }; puts [sink3 {*}[list x y z]]
+set d {k {v 1 w 2}}; proc sink4 {args} { return $args }; set R [sink4 {*}[list $d]]; puts [list [llength $R] [llength [lindex $R 0]]]
+proc src {args} { return $args }; proc sink5 {args} { return [llength $args] }; set L [src {{ "a": 1, "b": [2, 3] }}]; puts [sink5 {*}$L]
+proc src {args} { return $args }; proc sink6 {args} { return [lindex $args 0] }; set L [src {{ "a": 1, "b": [2, 3] }}]; puts [sink6 {*}$L]
+proc inner {args} { return $args }; proc outer {args} { return [inner {*}$args] }; set R [outer {p q {r s}}]; puts [list [llength $R] [llength [lindex $R 0]]]
+proc sink9 {args} { return $args }; set R [sink9 {*}[list {{ "x": 1.50 }}]]; puts [list [llength $R] [lindex $R 0]]
+proc src {args} { return $args }; proc sink10 {a b} { return "$a|$b" }; set L2 [src {one two}]; catch {sink10 {*}$L2} e; puts $e
+proc src {args} { return $args }; proc sink11 {args} { return [llength $args] }; set L [src {a b {c d}}]; puts [sink11 {*}$L]; puts [sink11 {*}$L]

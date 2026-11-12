@@ -436,16 +436,9 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         ));
                     }
                 };
-                let t = std::time::SystemTime::UNIX_EPOCH
-                    + std::time::Duration::from_secs(secs.max(0) as u64);
-                let ft = std::fs::FileTimes::new().set_modified(t);
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(path)
-                    .and_then(|f| f.set_times(ft))
-                    .map_err(|e| {
-                        posix_error(interp, format!("could not set \"{}\"", path), &e)
-                    })?;
+                interp.host_fs.set_times(path, None, Some(secs)).map_err(|e| {
+                    posix_error(interp, format!("could not set \"{}\"", path), &e)
+                })?;
                 return Ok(Value::empty());
             }
             let secs = interp.host_fs.mtime(path).map_err(|e| {
@@ -462,54 +455,48 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let var_name = args[3].as_str();
-            let meta = if subcmd == "lstat" {
-                std::fs::symlink_metadata(path)
-            } else {
-                std::fs::metadata(path)
-            };
-            let meta = meta
-                .map_err(|e| posix_error(interp, format!("could not read \"{}\"", path), &e))?;
-            let size = meta.len() as i64;
-            let mtime = meta.modified().ok()
-                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64).unwrap_or(0);
-            let atime = meta.accessed().ok()
-                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64).unwrap_or(0);
-            let ft = meta.file_type();
-            let ftype = if ft.is_symlink() { "link" }
-                else if ft.is_dir() { "directory" }
+            let s = interp.host_fs.stat_full(path, subcmd != "lstat").map_err(|e| {
+                posix_error(interp, format!("could not read \"{}\"", path), &e)
+            })?;
+            let ftype = if s.is_link { "link" }
+                else if s.is_dir { "directory" }
                 else { "file" };
 
-            interp.set_var(&format!("{}(size)", var_name), Value::from_int(size))?;
-            interp.set_var(&format!("{}(mtime)", var_name), Value::from_int(mtime))?;
-            interp.set_var(&format!("{}(atime)", var_name), Value::from_int(atime))?;
+            interp.set_var(&format!("{}(size)", var_name), Value::from_int(s.size))?;
+            interp.set_var(&format!("{}(mtime)", var_name), Value::from_int(s.mtime))?;
+            interp.set_var(&format!("{}(atime)", var_name), Value::from_int(s.atime))?;
             interp.set_var(&format!("{}(type)", var_name), Value::from_str(ftype))?;
 
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                interp.set_var(&format!("{}(dev)", var_name), Value::from_int(meta.dev() as i64))?;
-                interp.set_var(&format!("{}(ino)", var_name), Value::from_int(meta.ino() as i64))?;
-                interp.set_var(&format!("{}(nlink)", var_name), Value::from_int(meta.nlink() as i64))?;
-                interp.set_var(&format!("{}(uid)", var_name), Value::from_int(meta.uid() as i64))?;
-                interp.set_var(&format!("{}(gid)", var_name), Value::from_int(meta.gid() as i64))?;
-                interp.set_var(&format!("{}(mode)", var_name), Value::from_int(meta.mode() as i64))?;
-                // D-33：补 blksize/blocks/ctime（tclsh 13 键全形）。
-                interp.set_var(&format!("{}(blksize)", var_name), Value::from_int(meta.blksize() as i64))?;
-                interp.set_var(&format!("{}(blocks)", var_name), Value::from_int(meta.blocks() as i64))?;
-                interp.set_var(&format!("{}(ctime)", var_name), Value::from_int(meta.ctime() as i64))?;
-            }
+            // D-33：13 键全形——dev/ino/…/ctime 从 FsStat 取（NativeFs
+            // unix 填真值与路由前逐字一致；宿主实现合成自洽值或如实
+            // 报错——tclsh 对一切文件系统同样如此）。
+            interp.set_var(&format!("{}(dev)", var_name), Value::from_int(s.dev))?;
+            interp.set_var(&format!("{}(ino)", var_name), Value::from_int(s.ino))?;
+            interp.set_var(&format!("{}(nlink)", var_name), Value::from_int(s.nlink))?;
+            interp.set_var(&format!("{}(uid)", var_name), Value::from_int(s.uid))?;
+            interp.set_var(&format!("{}(gid)", var_name), Value::from_int(s.gid))?;
+            interp.set_var(&format!("{}(mode)", var_name), Value::from_int(s.mode))?;
+            interp.set_var(&format!("{}(blksize)", var_name), Value::from_int(s.blksize))?;
+            interp.set_var(&format!("{}(blocks)", var_name), Value::from_int(s.blocks))?;
+            interp.set_var(&format!("{}(ctime)", var_name), Value::from_int(s.ctime))?;
             Ok(Value::empty())
         }
         "readlink" => {
-            let target = std::fs::read_link(path).map_err(|e| {
+            // tclsh 原文形状：could not read link "x": <strerror 小写>。
+            let target = interp.host_fs.read_link(path).map_err(|e| {
+                let text = super::io::io_error_text(&e, "invalid argument");
+                if let Some(code) = e.raw_os_error() {
+                    super::list::set_error_code(
+                        interp,
+                        &format!("POSIX ERRNO {{{}}}", code),
+                    );
+                }
                 Error::runtime(
-                    format!("could not readlink \"{}\": {}", path, e),
+                    format!("could not read link \"{}\": {}", path, text),
                     crate::error::ErrorCode::Io,
                 )
             })?;
-            Ok(Value::from_str(&target.to_string_lossy()))
+            Ok(Value::from_str(&target))
         }
 
         // ── file operations ─────────────────────────────────────────

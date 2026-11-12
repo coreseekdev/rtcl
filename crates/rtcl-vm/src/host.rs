@@ -114,6 +114,34 @@ pub trait HostExec: Send {}
 /// 原生构建默认 [`NativeFs`]（std::fs 直连，行为与路由前逐字一致）；
 /// wasm 宿主经 `Interp::set_host_fs` 注入 JS 实现（浏览器内存 fs /
 /// OPFS worker），浏览器里 open/gets/puts/file 由此真正可用。
+/// `file stat` 的 13 键全形（tclsh TclStatObj 形状）。NativeFs 从
+/// std::fs 逐字填充（unix 扩展键取 MetadataExt）；宿主实现（内存 fs /
+/// OPFS）合成自洽值或如实报错——值只需内部一致，tclsh 对一切文件系统
+/// 同样如此。
+#[derive(Clone, Debug, Default)]
+pub struct FsStat {
+    pub size: i64,
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+    pub dev: i64,
+    pub ino: i64,
+    pub nlink: i64,
+    pub uid: i64,
+    pub gid: i64,
+    pub mode: i64,
+    pub blksize: i64,
+    pub blocks: i64,
+    pub is_dir: bool,
+    pub is_file: bool,
+    /// symlink（lstat 语义）。
+    pub is_link: bool,
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+    pub owned: bool,
+}
+
 pub trait HostFs: Send {
     /// 打开文件通道。`mode` 为 Tcl access 串（r/w/a/r+/w+/a+ 及
     /// PLATFORM 兼容的 RB/WB 组合变体）。返回 (通道, 是否二进制)。
@@ -139,6 +167,19 @@ pub trait HostFs: Send {
     /// `source`/`file tempfile` 的整文件读取与临时路径。
     fn read_file(&mut self, path: &str) -> std::io::Result<String>;
     fn tempfile(&mut self, prefix: &str) -> std::io::Result<String>;
+    /// `file stat`/`lstat` 全形（follow=false 为 lstat 语义）。
+    /// NotFound 错误 = 不存在。
+    fn stat_full(&self, path: &str, follow: bool) -> std::io::Result<FsStat>;
+    /// `file mtime name time` / `file atime name time`（None = 不变）。
+    /// 宿主实现不支持时如实报错（OPFS 无 utimes API）。
+    fn set_times(
+        &mut self,
+        path: &str,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+    ) -> std::io::Result<()>;
+    /// `file readlink`（无 symlink 概念的实现报 invalid argument）。
+    fn read_link(&self, path: &str) -> std::io::Result<String>;
 }
 
 /// std 原生实现：逐字保留路由前的 std::fs 行为。
@@ -235,4 +276,90 @@ impl HostFs for NativeFs {
         std::fs::File::create(&path)?;
         Ok(path.to_string_lossy().to_string())
     }
+
+    fn stat_full(&self, path: &str, follow: bool) -> std::io::Result<FsStat> {
+        let meta = if follow {
+            std::fs::metadata(path)?
+        } else {
+            std::fs::symlink_metadata(path)?
+        };
+        let secs = |t: std::io::Result<std::time::SystemTime>| {
+            t.ok()
+                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        };
+        let ft = meta.file_type();
+        let mut s = FsStat {
+            size: meta.len() as i64,
+            mtime: secs(meta.modified()),
+            atime: secs(meta.accessed()),
+            is_dir: ft.is_dir(),
+            is_file: ft.is_file(),
+            is_link: ft.is_symlink(),
+            readable: crate::interp::commands::io::fs_access(path, crate::interp::commands::io::AccessCheck::Read),
+            writable: crate::interp::commands::io::fs_access(path, crate::interp::commands::io::AccessCheck::Write),
+            executable: crate::interp::commands::io::fs_access(path, crate::interp::commands::io::AccessCheck::Exec),
+            ..Default::default()
+        };
+        // `file stat` 的 13 键全形：unix 扩展键取 MetadataExt 真值
+        //（与路由前逐字一致）；非 unix 全 0（行为同路由前 cfg(not(unix))）。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            s.dev = meta.dev() as i64;
+            s.ino = meta.ino() as i64;
+            s.nlink = meta.nlink() as i64;
+            s.uid = meta.uid() as i64;
+            s.gid = meta.gid() as i64;
+            s.mode = meta.mode() as i64;
+            s.blksize = meta.blksize() as i64;
+            s.blocks = meta.blocks() as i64;
+            s.ctime = meta.ctime() as i64;
+            s.owned = s.uid == unsafe { libc_getuid() };
+        }
+        Ok(s)
+    }
+
+    fn set_times(
+        &mut self,
+        path: &str,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+    ) -> std::io::Result<()> {
+        use std::fs::FileTimes;
+        let mut ft = FileTimes::new();
+        if let Some(a) = atime {
+            ft = ft.set_accessed(std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(a.max(0) as u64));
+        }
+        if let Some(m) = mtime {
+            ft = ft.set_modified(std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(m.max(0) as u64));
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_times(ft))
+    }
+
+    fn read_link(&self, path: &str) -> std::io::Result<String> {
+        let t = std::fs::read_link(path)?;
+        Ok(t.to_string_lossy().to_string())
+    }
+}
+
+/// getuid without pulling libc into non-unix builds.
+#[cfg(unix)]
+unsafe fn libc_getuid() -> i64 {
+    unsafe { libc_getuid_impl() }
+}
+#[cfg(unix)]
+unsafe fn libc_getuid_impl() -> i64 {
+    // std exposes no uid accessor; use libc via the raw syscall shim the
+    // crate already links on unix (clock feature pulls libc).
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    getuid() as i64
 }

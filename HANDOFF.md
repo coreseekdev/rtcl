@@ -237,6 +237,25 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 - 回归：native 全绿（test/judge/probes/scripts——行为逐字保留）、
   wasm check 过、(std,dynmod)/(std,file,dynmod) 可编译。
 
+**完整支持面补全（同日第二轮）**：
+- HostFs 加宽：`FsStat`（13 键全形 struct）+ `stat_full(path, follow)`
+  + `set_times(atime, mtime)` + `read_link`；NativeFs 填 std::fs 真值
+  （unix 扩展键 MetadataExt 逐字；`owned` 走 getuid）。
+- 路由：file stat/lstat（13 键从 FsStat 取，非 unix 无 cfg 差异）、
+  file mtime name time（set_times）、readlink（错误文案对齐 tclsh 原文
+  `could not read link "x": invalid argument`，io_error_text 小写）。
+  原生 hfs2 差分（mtime set→读回/stat 13 键/readlink）与 tclsh 逐字同。
+- JsFs：stat_full（宿主 statfull 契约；缺省 fallback 由 stat 合成）+
+  set_times（JS settimes(path, atime|null, mtime|null)）+ read_link。
+  内存 fs：settimes 存 atime/mtime、statfull 合成 POSIX 形值（ino 路径
+  哈希/mode 按类型/blksize 4096/nlink 1/uid gid 1000）、readlink 抛
+  invalid argument。真机 F9-F12 过，合计 **26/26**。
+- 真机抓的坑：**JsValue::from(i64) 到 JS 是 BigInt**（settimes 数字需
+  Number() 归一，as_f64 对 BigInt 返 None）；对象字面量方法内 `this.X`
+  在 apply(null) 下失效（statFn 提为闭包变量）。OPFS 边界如实保留：
+  同步句柄无 utimes API——set_times 在 OPFS 形态由宿主报错（内存 fs
+  全支持）。
+
 ## 10quater. 2026-11-12 第四轮：dynmod——wasm `load`/`unload` 扩展模块注册表（已完成）
 
 rtcl=网页 command dispatcher 的扩展面：wasm 里 dlopen 不存在，改为

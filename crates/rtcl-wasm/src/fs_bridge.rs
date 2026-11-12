@@ -260,6 +260,78 @@ impl HostFs for JsFs {
             .as_string()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "fs.tempfile did not return a string"))
     }
+
+    fn stat_full(&self, path: &str, follow: bool) -> io::Result<rtcl_vm::host::FsStat> {
+        let obj = fs_obj(self.id)?;
+        let follow_v = JsValue::from_bool(follow);
+        let v = call_ret(&obj, "statfull", &[&JsValue::from_str(path), &follow_v])
+            .or_else(|_| {
+                // 契约的最小形：宿主只给 stat(path) 时由基础面合成。
+                call_ret(&obj, "stat", &[&JsValue::from_str(path)])
+            })?;
+        if !v.is_object() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such file or directory"));
+        }
+        let g = |k: &str| -> i64 {
+            js_sys::Reflect::get(&v, &JsValue::from_str(k))
+                .ok()
+                .and_then(|n| n.as_f64())
+                .unwrap_or(0.0) as i64
+        };
+        let truthy = |k: &str| -> bool {
+            js_sys::Reflect::get(&v, &JsValue::from_str(k))
+                .map(|b| b.is_truthy())
+                .unwrap_or(false)
+        };
+        let size = g("size");
+        let mtime = g("mtime");
+        let atime = g("atime");
+        let is_dir = truthy("dir");
+        let is_file = truthy("file");
+        let is_link = truthy("link");
+        Ok(rtcl_vm::host::FsStat {
+            size,
+            mtime,
+            atime,
+            ctime: g("ctime"),
+            dev: g("dev"),
+            ino: g("ino"),
+            nlink: g("nlink"),
+            uid: g("uid"),
+            gid: g("gid"),
+            mode: g("mode"),
+            blksize: g("blksize"),
+            blocks: g("blocks"),
+            is_dir,
+            is_file,
+            is_link,
+            readable: true,
+            writable: true,
+            executable: false,
+            owned: true,
+        })
+    }
+
+    fn set_times(
+        &mut self,
+        path: &str,
+        atime: Option<i64>,
+        mtime: Option<i64>,
+    ) -> io::Result<()> {
+        let obj = fs_obj(self.id)?;
+        let av = atime.map(|t| JsValue::from(t)).unwrap_or(JsValue::NULL);
+        let mv = mtime.map(|t| JsValue::from(t)).unwrap_or(JsValue::NULL);
+        call_unit(&obj, "settimes", &[&JsValue::from_str(path), &av, &mv])
+    }
+
+    fn read_link(&self, path: &str) -> io::Result<String> {
+        let obj = fs_obj(self.id)?;
+        call_ret(&obj, "readlink", &[&JsValue::from_str(path)])?
+            .as_string()
+            .ok_or_else(|| {
+                io::Error::from_raw_os_error(22)
+            })
+    }
 }
 
 fn file_obj(fid: u64) -> io::Result<js_sys::Object> {

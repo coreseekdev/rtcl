@@ -71,6 +71,17 @@ function makeMemoryFs() {
   const parent = (p) => { const i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i); };
   const base = (p) => p.slice(p.lastIndexOf('/') + 1);
   const touchDir = (p) => { let d = norm(p); while (d && d !== '/') { dirs.add(d); d = parent(d); } };
+  const statFn = (p) => {
+    p = norm(p);
+    if (files.has(p)) {
+      const f = files.get(p);
+      return { size: f.data.length, mtime: f.mtime, atime: f.mtime, dir: false, file: true };
+    }
+    if (dirs.has(p)) {
+      return { size: 0, mtime: 0, atime: 0, dir: true, file: false };
+    }
+    return null;
+  };
   return {
     open(path, mode) {
       path = norm(path);
@@ -121,16 +132,30 @@ function makeMemoryFs() {
       touchDir(parent(path));
       return h;
     },
-    stat(path) {
+    stat(path) { return statFn(path); },
+    statfull(path, follow) {
+      const s = files.has(path) || dirs.has(path) || true ? (statFn(path)) : null;
+      if (s === null) return null;
+      // 合成 POSIX 形值（自洽即可——tclsh 对一切文件系统同样如此）：
+      // ino 由路径哈希、mode 按类型（0o40755 目录 / 0o100644 文件）。
+      let ino = 0;
+      for (let i = 0; i < path.length; i++) ino = (ino * 31 + path.charCodeAt(i)) >>> 0;
+      const mode = s.dir ? 0o40755 : 0o100644;
+      return Object.assign({}, s, {
+        ctime: s.mtime, dev: 0, ino, nlink: 1, uid: 1000, gid: 1000,
+        mode, blksize: 4096, blocks: Math.ceil(s.size / 512), link: false,
+      });
+    },
+    settimes(path, atime, mtime) {
       path = norm(path);
-      if (files.has(path)) {
-        const f = files.get(path);
-        return { size: f.data.length, mtime: f.mtime, atime: f.mtime, dir: false, file: true };
-      }
-      if (dirs.has(path)) {
-        return { size: 0, mtime: 0, atime: 0, dir: true, file: false };
-      }
-      return null;
+      if (!files.has(path)) throw new Error("couldn't set time for \"" + path + "\": no such file");
+      const f = files.get(path);
+      // Rust i64 实参以 BigInt 到达——统一 Number() 归一。
+      if (atime !== null && atime !== undefined) f.atime = Number(atime);
+      if (mtime !== null && mtime !== undefined) f.mtime = Number(mtime);
+    },
+    readlink(path) {
+      throw new Error("invalid argument");   // 内存 fs 无 symlink
     },
     access(path) {
       path = norm(path);
@@ -255,6 +280,19 @@ const CASES = [
   { name: 'F8 source（宿主数据面）',
     script: 'set f [open /demo/prog.tcl w]; puts $f {set loaded 42}; close $f; source /demo/prog.tcl; set loaded',
     want: '42' },
+  // ── 完整支持面：settimes / stat 13 键 / readlink ─────────────
+  { name: 'F9 file mtime name time（settimes 数据面）',
+    script: 'file mtime /demo/hello.txt 1000000000; file mtime /demo/hello.txt',
+    want: '1000000000' },
+  { name: 'F10 file stat 13 键全形',
+    script: 'file stat /demo/hello.txt arr; llength [array names arr]',
+    want: '13' },
+  { name: 'F11 file stat 键值自洽（type/size/mode）',
+    script: 'file stat /demo/hello.txt arr; list $arr(type) $arr(size) $arr(blksize) $arr(uid) $arr(nlink)',
+    want: 'file 11 4096 1000 1' },
+  { name: 'F12 file readlink（无 symlink → tclsh 原文）',
+    script: 'catch {file readlink /demo/hello.txt} e; set e',
+    want: 'could not read link "/demo/hello.txt": invalid argument' },
 ];
 
 const rows = document.getElementById('rows');

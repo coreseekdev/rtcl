@@ -109,28 +109,45 @@ function translateAre(exp) {
       i += 2;
       continue;
     }
-    if (c === '[' && !inClass && body[i + 1] === ':') {
-      const end = body.indexOf(':]', i + 2);
-      if (end >= 0) {
-        const neg = body[i + 2] === '^';
-        const name = body.slice(i + (neg ? 3 : 2), end);
-        const t = POSIX[name];
-        if (t) {
-          out += '[^' + t + ']' // neg 处理下方覆盖
-          // 重建：正类 [t]；负类 [^t]
-          out = out.slice(0, -(neg ? 3 + name.length + 2 : 2 + name.length + 2));
-          out += neg ? '[^' + t + ']' : '[' + t + ']';
-          i = end + 2;
-          continue;
+    if (c === '[' && !inClass) {
+      // Tcl/POSIX 形 `[[:name:]]`：外层 [ 内嵌 [:name:]——整体替换为
+      // JS 类展开；非 POSIX 类则进入普通字符类透传。
+      if (body.startsWith('[[:', i)) {
+        const end = body.indexOf(':]', i + 3);
+        if (end >= 0 && body[end + 2] === ']') {
+          const inner = body.slice(i + 3, end);      // 可选 ^ + 类名
+          const neg = inner.startsWith('^');
+          const name = neg ? inner.slice(1) : inner;
+          const t = POSIX[name];
+          if (t) {
+            out += neg ? '[^' + t + ']' : '[' + t + ']';
+            i = end + 3;                             // 跳过 ':]' 与外层 ']'
+            continue;
+          }
         }
       }
+      inClass = true;
+      continue;
     }
+
     if (c === '[') inClass = true;
     else if (c === ']') inClass = false;
     out += c;
     i++;
   }
   return { source: out, literal };
+}
+
+
+// 入口参数规范：dynmod join 协议下可能收到单串（\u0001 分隔的整条
+// 命令行）——还原为原词数组。
+function normalizeArgs(rest) {
+  // JS 直调数组形态（rest[0] 为数组）→ 视作已拆原词
+  if (rest.length === 1 && Array.isArray(rest[0])) return rest[0];
+  if (rest.length === 1 && typeof rest[0] === 'string' && rest[0].includes('\u0001')) {
+    return rest[0].split('\u0001');
+  }
+  return rest;
 }
 
 export function makeRegexpMod() {
@@ -142,7 +159,7 @@ export function makeRegexpMod() {
       const a = args[i];
       if (a === '--') { i++; break; }
       if (a.startsWith('-') && a.length > 1) {
-        if (bools.includes(a)) { opts[a.slice(1)] = true; continue; }
+        if (bools.includes(a.slice(1))) { opts[a.slice(1)] = true; continue; }
         if (withStart && a === '-start') { opts.start = Number(args[++i]) || 0; continue; }
         break;
       }
@@ -153,15 +170,18 @@ export function makeRegexpMod() {
 
   function compile(exp, opts, sticky) {
     const { source, literal } = translateAre(exp);
+    // 统一 g 形：非 -all 调用只取首个 exec（搜索语义，tclsh 同）；
+    // -start 经 lastIndex 承载。sticky(y) 会锚定开头——错误。
+    void sticky;
     if (literal) {
       let lit = '';
       for (const c of source) if ('\\^$.|?*+()[]{}'.includes(c)) lit += '\\' + c; else lit += c;
-      return { re: new RegExp(lit, (opts.nocase ? 'i' : '') + (sticky ? 'y' : 'g')), literal: true };
+      return { re: new RegExp(lit, (opts.nocase ? 'i' : '') + 'g'), literal: true };
     }
-    let flags = '';
+    let flags = 'g';
     if (opts.nocase) flags += 'i';
     if (opts.lineanchor || opts.line) flags += 'm';
-    return { re: new RegExp(source, flags + (sticky ? 'y' : 'g')), literal: false };
+    return { re: new RegExp(source, flags), literal: false };
   }
 
   const encodeStr = (s) => jsonEscapeStr(s);
@@ -186,10 +206,12 @@ export function makeRegexpMod() {
   return {
     // regexp → 裸结果（0/1、inline 列表、count）或结构化编码
     // {__RXCAP mode vals...}（Tcl 列表字符串，wrapper 解包写变量）
-    regexp(...args) {
-      const { opts, rest } = parseOpts(args,
+    regexp(...rest) {
+      const args = normalizeArgs(rest);
+
+      const { opts, rest: parsed } = parseOpts(args,
         ['nocase', 'line', 'lineanchor', 'linestop', 'all', 'inline', 'indices', 'about'], true);
-      const [exp, string, ...capVars] = rest;
+      const [exp, string, ...capVars] = parsed;
       if (exp === undefined || string === undefined) {
         throw new Error('wrong # args: should be "regexp ?-option ...? exp string ?matchVar? ?subMatchVar ...?"');
       }
@@ -277,10 +299,15 @@ export function makeRegexpMod() {
     },
 
     // regsub → 裸 count（无 varName）或 {__RS count result} 编码
-    regsub(...args) {
-      const { opts, rest } = parseOpts(args,
+    probe(...args) {
+      return JSON.stringify({ n: args.length, a: args });
+    },
+
+    regsub(...rest) {
+      const args = normalizeArgs(rest);
+      const { opts, rest: parsed } = parseOpts(args,
         ['nocase', 'all', 'line', 'lineanchor', 'linestop'], true);
-      const [exp, string, subSpec, varName] = rest;
+      const [exp, string, subSpec, varName] = parsed;
       if (exp === undefined || string === undefined || subSpec === undefined) {
         throw new Error('wrong # args: should be "regsub ?-option ...? exp string subSpec varName"');
       }

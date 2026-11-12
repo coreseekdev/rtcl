@@ -225,6 +225,7 @@ static CMD_TABLE_FILE: &[CmdEntry] = &[
     CmdEntry { name: "source",  func: io::cmd_source,   cat: Extension, cmd_id: Some(CmdId::Source as u16), usage: "?-encoding name? fileName",       help: "Evaluate a file as a Tcl script" },
     CmdEntry { name: "file",    func: io::cmd_file,     cat: Extension, cmd_id: Some(CmdId::File   as u16), usage: "subcommand ?arg ...?", help: "File system operations" },
     CmdEntry { name: "glob",    func: io::cmd_glob,     cat: Extension, cmd_id: Some(CmdId::Glob   as u16), usage: "?options? pattern ?pattern ...?", help: "Return filenames matching patterns" },
+    #[cfg(feature = "encoding")]
     CmdEntry { name: "encoding", func: io::cmd_encoding, cat: Extension, cmd_id: None,                      usage: "option ?arg ...?",              help: "Encoding conversion and queries" },
     CmdEntry { name: "cd",      func: os::cmd_cd,       cat: Extension, cmd_id: None,                       usage: "?dirName?",      help: "Change working directory" },
     CmdEntry { name: "pwd",     func: os::cmd_pwd,      cat: Extension, cmd_id: None,                       usage: "",               help: "Return current working directory" },

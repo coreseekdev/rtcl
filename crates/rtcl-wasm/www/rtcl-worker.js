@@ -14,6 +14,7 @@ if (typeof postMessage !== 'function') {
 //
 import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
 import { makeRegexpMod } from './regexpmod.js';
+import { makeEncodingMod } from './encodingmod.js';
 
 // regexp 外置的语义 wrapper proc（::regexp/::regsub 解包结构化编码并
 // upvar 写变量；native 同面）。
@@ -45,11 +46,12 @@ proc ::regexp {args} {
   return $r
 }
 proc ::regsub {args} {
-  set r [::regsub::regsub [join $args "\u0001"]]
+  # JS 面的 regsub fn 装在 ::regexp 模块下（::regexp::regsub）
+  set r [::regexp::regsub [join $args "\u0001"]]
   if {[lindex $r 0] eq "__RS"} {
     upvar 1 [lindex $args end] v
-    set v [lindex $r 1]
-    return [lindex $r 2]
+    set v [lindex $r 2]
+    return [lindex $r 1]
   }
   return $r
 }
@@ -442,8 +444,16 @@ if (typeof globalThis.__recv !== 'function') {
         Atomics.store(i32, 0, seq);
         Atomics.store(i32, 1, 0);
         bridgePort.postMessage({ seq });
-        const r = Atomics.wait(i32, 1, 0);
-        if (r !== 'ok') throw new Error('fs bridge wait failed: ' + r);
+        // 等待 REPLY_SEQ === seq（旧回执迟到时 not-equal 早返——循环比对
+        // seq 精确匹配，读到旧回执会导致文件操作错乱）
+        for (;;) {
+          const cur = Atomics.load(i32, 1);
+          if (cur === seq) break;
+          const r = Atomics.wait(i32, 1, cur);
+          if (r === 'not-equal') {
+            if (Atomics.load(i32, 1) === seq) break;
+          }
+        }
         const len = Atomics.load(i32, 2);
         // SAB 视图不可直接喂 TextDecoder——拷贝
         const copy = new Uint8Array(len);
@@ -505,9 +515,18 @@ if (typeof globalThis.__recv !== 'function') {
     // regexp 外置：注册 JS 面并 load + 装语义 wrapper（wasm 子集不含
     // regexp-lite，native 命令面不存在——dynmod 注入同面实现）。
     if (!handle.exec('namespace which -command ::regexp')) {
-      handle.register_module('regexp', makeRegexpMod());
+      const mod = makeRegexpMod();
+      handle.register_module('regexp', mod);
       handle.exec('load regexp');
       handle.exec(REGEXP_SETUP_TCL);
+    }
+    // encoding 外置：wasm 子集不含 native encoding 命令（feature 门控）
+    // ——JS TextDecoder/TextEncoder 数据面（86 名宽表，映射见
+    // encodingmod.js；symbol/iso2022 系/ebcdic 如实报 unsupported）。
+    if (!handle.exec('namespace which -command ::encoding')) {
+      handle.register_module('encoding', makeEncodingMod());
+      handle.exec('proc ::encoding {args} { ::encoding::encoding {*}[join $args "\u0001"] }');
+      handle.exec('load encoding');
     }
 
     globalThis.postMessage({ type: 'ready', fs: fsNote });

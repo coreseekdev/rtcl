@@ -40,7 +40,7 @@ default = ["rtcl_std", "iconv"]
 # OS-level platform features (time, hostname, channels, filesystem)
 std = []
 # Tcl standard library — all extensions combined
-rtcl_std = ["file", "io", "exec", "clock", "regexp", "regexp-spencer", "env", "signal", "package", "net", "load-cmd", "dynmod", "json"]
+rtcl_std = ["file", "io", "exec", "clock", "regexp", "regexp-spencer", "env", "signal", "package", "net", "load-cmd", "dynmod", "json", "encoding"]
 # Individual Tcl extensions (each implies Rust std)
 file = ["std"]                    # file, cd, pwd, glob (自实现), readdir, source
 io = ["std"]                      # channel I/O: open, close, read, gets, seek, tell, eof, flush, fconfigure, pid
@@ -53,6 +53,10 @@ net = ["std", "io"]               # socket (TCP client) — native only; wasm
                                   # has no sockets (可选特性：wasm 构建不含)
 load-cmd = ["std"]                # load/unload — dynamic loading is
                                   # meaningless on wasm (可选特性)
+encoding = ["file"]               # `encoding` 命令面（convertfrom/convertto/
+                                  # names/system/dirs）。通道机制（encoding.rs
+                                  # 系统编码/翻译）不受影响——仅命令面外置：
+                                  # wasm 经 dynmod 注入 JS TextDecoder 实现
 json = ["std"]                    # json decode/encode（1102 行 Rust 面）——
                                   # 可外置：网页宿主经 dynmod 注入 JS 实现
                                   #（JSON.parse/stringify + 值翻译），见

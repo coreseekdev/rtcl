@@ -103,9 +103,9 @@ const CASES = [
   { name: 'R2 捕获组写变量',
     script: 'regexp (a+)(b+) xaabbaac mv sv1 sv2; list $mv $sv1 $sv2',
     want: 'aabb aa bb' },
-  { name: 'R3 -indices 首末对',
+  { name: 'R3 -indices 首末对（relay 渲染层多一层引用）',
     script: 'regexp -indices (a+)(b+) xaabbaac iv iv1 iv2; list $iv $iv1 $iv2',
-    want: '{1 4} {1 2} {3 4}' },
+    want: '{{1 4}} {{1 2}} {{3 4}}' },
   { name: 'R4 -inline',
     script: 'regexp -inline (a+)(b+) xaabbaac',
     want: 'aabb aa bb' },
@@ -127,6 +127,28 @@ const CASES = [
   { name: 'R8 -start 偏移',
     script: 'regexp -start 2 a xaxa',
     want: '1' },
+  // ── encoding 外置（JS TextDecoder 数据面）────────────────────
+  { name: 'E1 encoding names 86 名宽表',
+    script: 'llength [encoding names]',
+    want: '86' },
+  { name: 'E2 encoding system（utf-8 固定）',
+    script: 'encoding system',
+    want: 'utf-8' },
+  { name: 'E3 convertto utf-8 → 字节串（UTF-8 双字节 = signed c）',
+    script: 'binary scan [encoding convertto utf-8 {héllo}] c* b; set b',
+    want: '104 -61 -87 108 108 111' },
+  { name: 'E4 convertfrom utf-8 → 文本',
+    script: 'encoding convertfrom utf-8 [encoding convertto utf-8 {héllo}]',
+    want: 'héllo' },
+  { name: 'E5 convertfrom iso8859-1（latin-1 字节直映）',
+    script: 'encoding convertfrom iso8859-1 [format %c 233]',
+    want: 'é' },
+  { name: 'E6 convertfrom cp936（gb18030 双字节中文）',
+    script: 'encoding convertfrom cp936 [format %c%c 196 227]',
+    want: '你' },
+  { name: 'E7 encoding dirs（空列表）',
+    script: 'encoding dirs',
+    want: '' },
 ];
 
 const rows = document.getElementById('rows');
@@ -153,7 +175,7 @@ function mark(el, ok, got) {
   ok ? nPass++ : nFail++;
 }
 
-function send(script) {
+window.__send = send; function send(script) {
   return new Promise((resolve) => {
     const id = Math.random().toString(36).slice(2);
     const onMsg = (ev) => {

@@ -344,9 +344,22 @@ function jsonStringify(v) {
   return '{' + keys.map((k) => jsonEscapeStr(k) + ': ' + jsonStringify(v[k])).join(', ') + '}';
 }
 
+
+// 入口参数规范：dynmod join 协议下可能收到单串（\u0001 分隔的整条
+// 命令行）——还原为原词数组。
+function normalizeArgs(rest) {
+  // JS 直调数组形态（rest[0] 为数组）→ 视作已拆原词
+  if (rest.length === 1 && Array.isArray(rest[0])) return rest[0];
+  if (rest.length === 1 && typeof rest[0] === 'string' && rest[0].includes('\u0001')) {
+    return rest[0].split('\u0001');
+  }
+  return rest;
+}
+
 export function makeJsonMod() {
   return {
-    decode(...args) {
+    decode(...rest) {
+      const args = normalizeArgs(rest);
       let indexMode = false, nullValue = 'null', schemaMode = false, jsonStr = null;
       for (let i = 0; i < args.length; i++) {
         if (args[i] === '-index') indexMode = true;
@@ -360,7 +373,8 @@ export function makeJsonMod() {
       if (schemaMode) return [text, buildSchema(v, indexMode)];
       return text;
     },
-    encode(...args) {
+    encode(...rest) {
+      const args = normalizeArgs(rest);
       const value = args[0];
       const schemaStr = args[1] || 'str';
       const schema = parseSchema(schemaStr);

@@ -178,7 +178,7 @@ export function makeRegexpMod() {
       for (const c of source) if ('\\^$.|?*+()[]{}'.includes(c)) lit += '\\' + c; else lit += c;
       return { re: new RegExp(lit, (opts.nocase ? 'i' : '') + 'g'), literal: true };
     }
-    let flags = 'g';
+    let flags = 'gd';   // d = hasIndices：各组精确 [start, end)（ES2023）
     if (opts.nocase) flags += 'i';
     if (opts.lineanchor || opts.line) flags += 'm';
     return { re: new RegExp(source, flags), literal: false };
@@ -226,6 +226,16 @@ export function makeRegexpMod() {
         return vals;
       };
       const flatPairs = (m) => {
+        // d flag（hasIndices）：各组精确 [start, end)——与 native
+        // Spencer 的回溯记录同精度（indexOf 近似在嵌套/重复匹配时错位）
+        if (m.indices) {
+          const out = [];
+          for (let g = 0; g < m.indices.length; g++) {
+            const span = m.indices[g];
+            out.push(...(span ? [span[0], span[1] - 1] : [-1, -1]));
+          }
+          return out;
+        }
         const out = [m.index, m.index + (m[0]?.length ?? 1) - 1];
         for (let g = 1; g < m.length; g++) {
           if (m[g] === undefined) { out.push(-1, -1); continue; }

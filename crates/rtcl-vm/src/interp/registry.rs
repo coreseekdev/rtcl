@@ -34,13 +34,16 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "for",       func: loops::cmd_for,         cat: Language, cmd_id: None,                             usage: "start test next command",              help: "C-style for loop" },
     CmdEntry { name: "break",     func: control::cmd_break,     cat: Language, cmd_id: None,                             usage: "?level?",                          help: "Break out of a loop" },
     CmdEntry { name: "case",      func: control::cmd_case,      cat: Language, cmd_id: None,                             usage: "string ?in? ?pattern body ...?",     help: "Obsolete glob case dispatch (tclsh 8.6 keeps it)" },
-    CmdEntry { name: "coroutine", func: compat::cmd_coroutine,  cat: Standard, cmd_id: None,                             usage: "name cmd ?arg ...?",                 help: "Coroutine entry (engine stub; see DIVERGENCES)" },
+    CmdEntry { name: "coroutine", func: coro::cmd_coroutine,    cat: Standard, cmd_id: None,                             usage: "name cmd ?arg ...?",                 help: "Create a coroutine and run its first invocation" },
     CmdEntry { name: "fcopy",     func: chan_io::cmd_fcopy,     cat: Standard, cmd_id: None,                             usage: "input output ?-size size? ?-command callback?", help: "Copy between channels" },
+    #[cfg(feature = "load-cmd")]
     CmdEntry { name: "load",      func: compat::cmd_load,       cat: Extension, cmd_id: None,                            usage: "?-global? ?-lazy? ?--? fileName ?packageName? ?interp?", help: "Load a binary extension (stub; no dynamic loader)" },
+    #[cfg(feature = "net")]
     CmdEntry { name: "socket",    func: chan_io::cmd_socket,    cat: Extension, cmd_id: None,                            usage: "?-myaddr addr? ?-myport myport? ?-async? host port", help: "Open a TCP client connection" },
+    #[cfg(feature = "load-cmd")]
     CmdEntry { name: "unload",    func: compat::cmd_unload,     cat: Extension, cmd_id: None,                            usage: "?-switch ...? fileName ?packageName? ?interp?", help: "Unload a loaded extension (stub)" },
-    CmdEntry { name: "yield",     func: compat::cmd_yield,      cat: Standard, cmd_id: None,                             usage: "?value?",                            help: "Yield from a coroutine (engine stub)" },
-    CmdEntry { name: "yieldto",   func: compat::cmd_yieldto,    cat: Standard, cmd_id: None,                             usage: "command ?arg ...?",                  help: "Yield with replacement command (engine stub)" },
+    CmdEntry { name: "yield",     func: coro::cmd_yield,        cat: Standard, cmd_id: None,                             usage: "?value?",                            help: "Suspend the coroutine, returning value" },
+    CmdEntry { name: "yieldto",   func: coro::cmd_yieldto,      cat: Standard, cmd_id: None,                             usage: "command ?arg ...?",                  help: "Suspend and tailcall command in the outer context" },
     CmdEntry { name: "zlib",      func: compat::cmd_zlib,       cat: Standard, cmd_id: None,                             usage: "subcommand ?arg ...?",               help: "Checksums real; compression stub (no DEFLATE)" },
     CmdEntry { name: "binary",    func: binary::cmd_binary,     cat: Standard, cmd_id: None,                             usage: "subcommand ?arg ...?",                help: "Convert between strings and binary data" },
     CmdEntry { name: "continue",  func: control::cmd_continue,  cat: Language, cmd_id: None,                             usage: "?level?",                          help: "Skip to next loop iteration" },

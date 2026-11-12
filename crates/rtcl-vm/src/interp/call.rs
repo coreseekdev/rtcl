@@ -592,6 +592,12 @@ impl Interp {
         // message and the `(procedure "p" line 1)` frame reports line 1
         // (the interp's error line stays at its reset value), with
         // errorCode `TCL RESULT UNEXPECTED`.
+        // Coroutine suspension: freeze without epilogue (deferred
+        // scripts, statics write-back and the frame pop all belong to a
+        // completion the coroutine hasn't reached yet).
+        if matches!(&final_result, Err(e) if e.is_suspend()) {
+            return final_result;
+        }
         let final_result = match final_result {
             Err(e) if e.is_break() || e.is_continue() => {
                 let msg = if e.is_break() {
@@ -1272,6 +1278,15 @@ impl Interp {
                 self.eval(&def.body)
             }
         };
+
+        // Coroutine suspension: the frame stack above the coroutine
+        // base freezes into the record — no epilogue, no pop, no depth
+        // change (the resume replays this exact frame).
+        if let Err(e) = &result {
+            if e.is_suspend() {
+                return Some(Err(e.clone()));
+            }
+        }
 
         // ── Epilogue（call_proc 语义复刻）────────────────────────────
         // tailcall：弹帧后重分派（帧顶替、同深度、无 P 帧）。

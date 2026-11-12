@@ -75,6 +75,17 @@ pub enum Error {
         args: Vec<String>,
     },
 
+    /// Coroutine suspension (`yield`/`yieldto`): a frameless completion
+    /// like break/continue — the pending value lives on the coroutine
+    /// context ([`crate::interp::Interp::coro_ctx`]), the unwinding
+    /// bytecode levels freeze their state into the suspend chain, and
+    /// the frames above the coroutine base move into the coroutine
+    /// record.  Never surfaces as a script-visible error: every
+    /// uncaught-suspend boundary converts it (the `coroutine`/resume
+    /// command to Ok(value); a yield outside a coroutine is a plain
+    /// error raised by the builtin before this variant is constructed).
+    Suspend,
+
     /// Custom error with message
     Msg(String),
 }
@@ -391,6 +402,11 @@ impl Error {
         matches!(self, Error::ControlFlow { kind: ControlFlow::Continue, .. })
     }
 
+    /// Check if this is a coroutine suspension (`yield`/`yieldto`)
+    pub fn is_suspend(&self) -> bool {
+        matches!(self, Error::Suspend)
+    }
+
     /// For break/continue: get the loop level (number of remaining loops to exit).
     /// Returns 1 for a simple break/continue; >1 for multi-level.
     pub fn loop_level(&self) -> i32 {
@@ -430,6 +446,7 @@ impl Error {
             Error::DivisionByZero => -6,
             Error::ControlFlow { kind, .. } => *kind as i32,
             Error::TailCall { .. } => -7,
+            Error::Suspend => -8,
             Error::Msg(_) => -99,
         }
     }
@@ -546,6 +563,11 @@ impl fmt::Display for Error {
             }
             Error::DivisionByZero => {
                 write!(f, "divide by zero")
+            }
+            Error::Suspend => {
+                // Never script-visible: the coroutine machinery converts
+                // suspensions before they reach a result (see variant doc).
+                write!(f, "yield outside of a coroutine")
             }
             Error::ControlFlow { kind, value, .. } => {
                 match kind {

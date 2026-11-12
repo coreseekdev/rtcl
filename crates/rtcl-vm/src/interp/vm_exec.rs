@@ -811,7 +811,48 @@ pub(crate) fn proc_body_executor(
 /// return identically shaped [`Error`]s to the tree-walk so `call_proc`'s
 /// boundary handling (`(procedure …)` frames, return decoding, break →
 /// error conversion) needs no changes.
-pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<Value> {
+/// One frozen bytecode level of a suspended coroutine: the unit plus its
+/// executor state (pc mid-loop, operand stack, loop/foreach frames).
+/// Opaque outside this module; the coroutine machinery moves these
+/// between the suspend chain and the coroutine record.
+pub(crate) struct SuspendedState {
+    inner: Box<VmState>,
+}
+
+impl SuspendedState {
+    fn take(self) -> Box<VmState> {
+        self.inner
+    }
+    /// Push the resumed value onto the frozen operand stack — it becomes
+    /// the suspended command's return value (yield's resume result).
+    pub(crate) fn stack_push(&mut self, v: crate::value::Value) {
+        self.inner.stack.push(v);
+    }
+}
+
+/// Run `code`, adopting a previously frozen state instead of a pooled
+/// fresh one (coroutine resume).  On [`Error::Suspend`] the state freezes
+/// into [`Interp::coro_chain`] instead of returning to the pool.
+pub(crate) fn exec_bytecode(
+    interp: &mut Interp,
+    code: &Rc<ByteCode>,
+) -> Result<Value> {
+    exec_bytecode_with(interp, code, None)
+}
+
+pub(crate) fn exec_bytecode_adopt(
+    interp: &mut Interp,
+    code: &Rc<ByteCode>,
+    state: SuspendedState,
+) -> Result<Value> {
+    exec_bytecode_with(interp, code, Some(state.take()))
+}
+
+fn exec_bytecode_with(
+    interp: &mut Interp,
+    code: &Rc<ByteCode>,
+    adopt: Option<Box<VmState>>,
+) -> Result<Value> {
     // A compiled unit's DynCall'd foreach runs DISPATCHED (tclsh's
     // INST_CALL fallback): clear the lexical flag for the unit's
     // duration, restoring the enclosing unit's context afterwards.
@@ -881,8 +922,12 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
     // fresh allocations for the stack/loops/bodies/scratch Vecs (the pool
     // keeps their capacity).  Depth is naturally bounded by recursion —
     // a live VmState is never in the pool, so pooling cannot alias.
+    let mut frozen: Option<Box<VmState>> = None;
     let r = {
-        let mut st = interp.vm_pool.take(entry_offset);
+        let mut st = match adopt {
+            Some(s) => s,
+            None => interp.vm_pool.take(entry_offset),
+        };
         // Same-unit fast path: the state remembers which unit's literal
         // slice + call-site table it holds (recursion re-borrows its own
         // state).  A different unit (or a fresh state) falls to the pool
@@ -914,9 +959,20 @@ pub(crate) fn exec_bytecode(interp: &mut Interp, code: &Rc<ByteCode>) -> Result<
             st.consts_code = Some(Rc::clone(code));
         }
     let r = exec_inner(interp, code, &mut st);
-        interp.vm_pool.give(st);
+        if r.as_ref().err().map(|e| e.is_suspend()).unwrap_or(false) {
+            // Freeze this level; the tail restores below still run, and
+            // the state joins the suspend chain AFTER them (the coroutine
+            // collector moves it into the record).
+            frozen = Some(st);
+        } else {
+            interp.vm_pool.give(st);
+        }
         r
     };
+    if let Some(state) = frozen {
+        interp.coro_chain
+            .push((Rc::clone(code), SuspendedState { inner: state }));
+    }
     if top_active {
         // 单元退出 flush：槽写落全局（Ok/Err 双路——错误前写入持久，
         // REPL/下一条 eval 必须看见）。
@@ -1478,6 +1534,13 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                 }
             }
             if !interp.err_is_error(&e) {
+                if e.is_suspend() {
+                    // Coroutine suspension: the bytecode levels unwind
+                    // WITHOUT deferring script-body frames — each
+                    // exec_bytecode wrapper freezes its state into the
+                    // suspend chain (see exec_bytecode_with).
+                    return Err(e);
+                }
                 defer_flow_frame(interp, code, st, &e);
                 return Err(e);
             }

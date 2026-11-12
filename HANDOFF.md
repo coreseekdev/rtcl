@@ -186,6 +186,14 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10ter. 2026-11-12 第三轮：协程引擎 + wasm 可选门控（已完成）
+
+- coroutine/yield/yieldto 落地（挂起链重放；specs/coroutine.probes
+  23/23；AST-eval 边界内 yield 报错=唯一分歧）。rtcl 定调=网页
+  command dispatcher：wasm 无法支持的特性改为可选——`net`（socket）、
+  `load-cmd`（load/unload）默认仅原生；wasm info commands=98、
+  原生=101（可选差异）。wasm32-unknown-unknown check 过。
+
 ## 10bis. 2026-11-12 第二轮收口：哈希/迭代序 + 命令面（已完成）
 
 §10.1 第 3/5/6 类 + 第 7 类部分已收口（见 DIVERGENCES.md 2026-11-12 节）：

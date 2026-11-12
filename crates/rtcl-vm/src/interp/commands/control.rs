@@ -908,6 +908,11 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if e.is_exit() {
                 return Err(e);
             }
+            // 协程挂起同样穿透 catch（tclsh：catch {yield} 内部仍挂起
+            // ——挂起不是错误）。
+            if e.is_suspend() {
+                return Err(e);
+            }
             // D-3：**动态**体（词源非字面量）的体错误在 proc/ns 帧内
             // 多记一次 invoker 帧（tclsh TIP #280：错误日志事件用发起
             // 命令的源码文本），随日志事件追加 CALL；顶层（根帧）不记。

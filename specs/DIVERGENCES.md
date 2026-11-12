@@ -79,6 +79,30 @@
 
 非缺陷、不再修：`string byterange` 是 rtcl 扩展，tclsh 无此子命令。
 
+## 2026-11-12b 协程引擎落地 + wasm 可选特性门控（coroutine.probes 23/23）
+
+- **coroutine/yield/yieldto 全语义实现**：rtcl 的字节码执行器按单元
+  递归（每单元一个 Rust 栈帧），挂起无法冻结 Rust 续延——改为**挂起
+  链重放**：`Error::Suspend`（新补全码，帧lessly 传播、穿透 catch/
+  try、不记 errorInfo 帧）逐层把执行器状态（pc/操作栈/循环帧）冻结进
+  `Interp::coro_chain`；proc 出口对 Suspend 跳过 epilogue（deferred/
+  静态写回/弹帧全延迟）；收集器把帧栈移入协程记录。resume 从最内层
+  重放：resume 单参成为挂起 yield 的返回值，层完成把结果喂给下层并
+  弹掉该层帧——精确镜像展开时的返回路径。已对齐：coroutine 自身返回
+  首个 yield 值、resume ≤1 参（wrong # args: "name ?arg?"）、完成即
+  删命令（含 rename 后）、同名重建为替换、体错误销毁协程、catch 不拦
+  截挂起、嵌套 proc 挂起（链式）、yieldto 外层执行（其结果=resume 命
+  令结果，resume 参成为 yieldto 返回值）。探针 specs/coroutine.probes
+  23/23。
+- **分歧（记 OPEN）**：嵌套 `eval` 的 AST 脚本内 yield 无法冻结 AST
+  续延——报 `yield cannot suspend across an eval boundary`（字节码层
+  的 yield——proc 体/循环体/if 臂——任意深度均可挂起）。
+- **wasm 可选特性门控**（rtcl 定位=网页 command dispatcher）：`net`
+  （socket，TCP 仅原生）与 `load-cmd`（load/unload 动态加载）从
+  rtcl_std 拆出、默认仅原生；wasm 构建显式不含 → info commands 计数
+  wasm=98/原生=101（可选差异，记录于 HANDOFF）。纯 Rust/纯 Tcl 面
+  （coroutine/zlib crc32/adler32/fcopy/case/history）全平台保留。
+
 ## 2026-11-12 哈希/迭代序对齐 + 命令面补齐（judge 88/88；order.probes 48/48）
 
 本轮收口（Tcl 哈希表迭代序 —— 原 2026-11-08 清单第 3/5 类的序类根因）：

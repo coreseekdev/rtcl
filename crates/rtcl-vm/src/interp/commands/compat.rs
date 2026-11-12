@@ -53,6 +53,8 @@ pub fn cmd_coroutine(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     ))
 }
 
+/// Native-only: dynamic loading does not exist on wasm (feature "load-cmd").
+#[cfg(feature = "load-cmd")]
 pub fn cmd_load(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // load ?-global? ?-lazy? ?--? fileName ?packageName? ?interp?
     let mut i = 1;
@@ -87,6 +89,7 @@ pub fn cmd_load(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     ))
 }
 
+#[cfg(feature = "load-cmd")]
 pub fn cmd_unload(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage(

@@ -1,0 +1,25 @@
+# 协程语义差分（tclsh 8.6.17 对照；2026-11-12 引擎落地）。probe.sh
+# 逐行 -c 求值（每行独立解释器）——每条探针必须单行分号连接。
+catch {proc g {n} {for {set i 1} {$i <= $n} {incr i} {yield $i}; return fin}; set first [coroutine c1 g 3]; puts first:$first; puts [c1]; puts [c1]; puts [c1]; puts [c1]; catch {c1} e; puts e:$e}; puts probe-done
+catch {proc g2 {} {set v [yield a]; puts got:$v; set w [yield b]; puts got2:$w; return done}; coroutine c2 g2; puts [c2]; puts [c2 x]; puts [c2]; puts [c2 z]; catch {c2} e2; puts e2:$e2}; puts probe-done
+catch {proc g3 {} {yield; return r}; coroutine c3 g3; puts [c3]; catch {c3 x y} ar; puts ar}; puts probe-done
+catch {proc deep {} {yield from-deep; return deep-end}; proc wrapper {} {deep; return wrapper-end}; coroutine t2 wrapper; puts [t2]; puts [t2]; catch {t2} e4; puts e4:$e4}; puts probe-done
+catch {proc yt {} {set x [yieldto puts hello-yieldto]; puts got:$x; return yt-done}; coroutine t3 yt; puts [t3]; puts [t3 RESUMED]; catch {t3} e5; puts e5:$e5}; puts probe-done
+catch {proc cg {} {catch {yield inner}; return caught-end}; coroutine ck cg; puts [ck]; puts [ck]; catch {ck} e6; puts e6:$e6}; puts probe-done
+catch {proc boom {} {error boom-in-coroutine}; coroutine kb boom; catch {kb} e7; puts e7:$e7; puts gone:[catch {kb} e8]; puts gone-msg:$e8}; puts probe-done
+catch {proc p1 {} {return 1}; puts [coroutine kp p1]; puts gone2:[catch {kp} e9]; puts gone-msg:$e9}; puts probe-done
+catch {proc gg {t} {yield $t-1; yield $t-2; return $t-end}; coroutine ca gg A; coroutine cb gg B; puts [ca]; puts [cb]; puts [ca]; puts [cb]; puts [ca]; puts [cb]; catch {ca} e10; puts e10:$e10}; puts probe-done
+catch {proc gr {} {yield; return gend}; coroutine cr gr; puts [cr]; rename cr ""; catch {cr} e11; puts e11:$e11}; puts probe-done
+catch {proc g4 {n} {set acc {}; for {set i 1} {$i <= $n} {incr i} {lappend acc [yield s$i]}; return $acc}; coroutine kk g4 3; puts [kk]; puts [kk r1]; puts [kk r2]; puts [kk r3]; puts [kk r4]}; puts probe-done
+catch {proc dup {} {yield; return d}; coroutine c9 dup; puts [coroutine c9 dup]; catch {coroutine c9 dup} e12; puts e12:$e12}; puts probe-done
+catch {proc rec {n} {if {$n > 0} {yield depth$n; rec [expr {$n - 1}]} {return rec-end}}; coroutine r3 rec 3; puts [r3]; puts [r3]; puts [r3]; puts [r3]; catch {r3} e13; puts e13:$e13}; puts probe-done
+catch {proc errmid {} {yield first; error mid-error; return never}}; puts probe-done
+catch {coroutine ke errmid; puts [ke]; catch {ke} e14; puts e14:$e14; puts gone3:[catch {ke} e15]}; puts probe-done
+catch {proc loopy {} {set i 0; while 1 {incr i; if {$i > 3} {return loop-end}; yield $i}}}; puts probe-done
+catch {coroutine kl loopy; puts [kl]; puts [kl]; puts [kl]; puts [kl]; catch {kl} e16; puts e16:$e16}; puts probe-done
+catch {proc y2 {} {yieldto list 1 2 3; return after-y2}}; puts probe-done
+catch {coroutine k2 y2; puts k2-first:[k2]; puts k2-second:[k2]}; puts probe-done
+catch {proc inter {g} {set v [yield enter:$g]; puts inter-got:$v; return inter-end}}; puts probe-done
+catch {coroutine ci {inter VAL}}; puts probe-done
+catch {puts ci-first:[ci]}; puts probe-done
+catch {puts ci-second:[ci]}; puts probe-done

@@ -921,6 +921,8 @@ pub fn cmd_fcopy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// `socket ?-myaddr addr? ?-myport myport? ?-async? host port` /
 /// `socket -server command ?-myaddr addr? port` — client connections
 /// only in rtcl (server sockets need an accept loop; DIVERGENCES).
+/// Native-only: wasm32 has no sockets (feature "net").
+#[cfg(feature = "net")]
 pub fn cmd_socket(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_msg(

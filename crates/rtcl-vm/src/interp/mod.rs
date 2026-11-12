@@ -505,6 +505,20 @@ pub struct Interp {
     /// exposes exactly 101 globals; rtcl's extra commands stay invokable
     /// but invisible, matching the oracle's listing surface.
     pub(crate) hidden_commands: VarSet,
+    /// Live coroutines (`coroutine name cmd` → record).  A suspended
+    /// record owns the coroutine's frames and the frozen bytecode-level
+    /// chain (innermost last); a running record is empty (state lives in
+    /// [`Interp::coro_ctx`]).
+    pub(crate) coroutines: VarMap<crate::interp::commands::coro::Coroutine>,
+    /// Context of the coroutine currently RUNNING on this interpreter:
+    /// its record key, the frames-base at entry (frames above belong to
+    /// the coroutine) and the pending suspend value.
+    pub(crate) coro_ctx: Option<crate::interp::commands::coro::CoroCtx>,
+    /// Suspend chain: bytecode levels that unwound on
+    /// [`Error::Suspend`] freeze their executor state here, innermost
+    /// first; the collector moves it into the coroutine record.
+    pub(crate) coro_chain:
+        Vec<(Rc<rtcl_parser::ByteCode>, vm_exec::SuspendedState)>,
     /// Command-name resolution cache (tclsh's resolved-command tokens):
     /// outer key = the namespace the resolution ran in, inner key = the
     /// invocation name as written.  Both levels probe with `&str`, so a
@@ -1006,6 +1020,9 @@ impl Interp {
             var_order: Vec::new(),
             ns_order: vec!["::".to_string()],
             hidden_commands: VarSet::default(),
+            coroutines: VarMap::default(),
+            coro_ctx: None,
+            coro_chain: Vec::new(),
             ensembles: HashMap::new(),
             #[cfg(feature = "std")]
             script_name: String::new(),

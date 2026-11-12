@@ -25,6 +25,7 @@ pub mod package;
 pub mod chan_io;
 pub mod compat;
 pub mod mathop;
+pub mod coro;
 #[cfg(feature = "exec")]
 pub mod exec_cmd;
 pub mod namespace;

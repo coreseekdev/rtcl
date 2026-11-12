@@ -537,7 +537,12 @@ impl Interp {
     /// Control-flow completions (return/break/continue/exit, tail-call
     /// requests) propagate framelessly.
     pub(crate) fn err_is_error(&self, e: &Error) -> bool {
-        !(e.is_return() || e.is_break() || e.is_continue() || e.is_exit() || e.is_tail_call())
+        !(e.is_return()
+            || e.is_break()
+            || e.is_continue()
+            || e.is_exit()
+            || e.is_tail_call()
+            || e.is_suspend())
     }
 
     /// Confirms that word `idx` of the command currently dispatching is

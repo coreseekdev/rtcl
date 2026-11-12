@@ -599,22 +599,24 @@ fn parse_posix_access(mode: &str) -> Option<PosixAccess> {
     Some(acc)
 }
 
-/// The channel table — maps handle strings to open channels.
 /// TCP client socket channel (`socket host port`) — a `TcpStream` with
 /// the [`Channel`] surface.  rtcl names sockets `sock0`, `sock1`, …;
 /// tclsh derives names from the channel struct pointer (`sock4a2b…`)
 /// and is not reproducible (DIVERGENCES: socket).
+#[cfg(feature = "net")]
 pub struct TcpChannel {
     stream: std::net::TcpStream,
     eof: bool,
 }
 
+#[cfg(feature = "net")]
 impl TcpChannel {
     pub fn new(stream: std::net::TcpStream) -> Self {
         Self { stream, eof: false }
     }
 }
 
+#[cfg(feature = "net")]
 impl Channel for TcpChannel {
     fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = io::Read::read(&mut self.stream, buf)?;
@@ -844,6 +846,7 @@ impl ChannelTable {
     }
 
     /// TCP client connect (`socket host port ?-myaddr ...? ?-myport ...?`).
+    #[cfg(feature = "net")]
     /// Returns the new channel id (`sockN`).
     pub fn open_socket(
         &mut self,

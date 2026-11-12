@@ -186,6 +186,36 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10sexter. 2026-11-13 分派面 retain 优化：wasm-opt 接入 build.sh（-8.5%）
+
+"1.33 MiB 被 CommandFunc 表 retain"的语义澄清：elem 段本身仅 877 B
+（函数索引表）；1.33 MiB 是**只能经 fn 指针间接到达**的命令函数体
+——LLVM 看不到直接调用点，无法内联/常量折叠，各自独立成函数（含
+错误路径/参数校验），且不可与其他命令去重。这是**尺寸现象**而非
+死代码。
+
+**性能面证据**（间接调用≠瓶颈）：
+- 六基准已全部 ≤1.0x tclsh（fib 0.83/oo2 0.42/oovars 0.52，HANDOFF
+  §10.2）——热路径不踩这张表：Tier-1 命令（set/if/while/foreach/
+  incr/expr…）在 vm_exec 里已编译为操作码，循环体走 Inner/Special
+  指令，fn 指针只服务非编译命令与动态分派。
+- V8/wasmtime 对 call_indirect 做 inline cache（单一 callee 热点直接
+  内联）——单态分派点的间接调用开销接近直调。
+- 当前画像的真热点仍是 §10.2 五项（call_proc 帧准备/语句窗口/
+  word_srcs 借用化/空循环基线/vars 存储），与分派面无关。
+
+**尺寸优化已落**：`wasm-opt -Oz --all-features` 接入 build.sh（LLVM
+之后的第二轮清理：不可达分支/内存访问模式/函数体内去重）——pkg
+2,318,850 → **2,121,993 B（2.02 MiB，-196 KiB / -8.5%）**，gzip
+792 → 791 KiB（bindgen 已剥 name section，压缩面收益小）。真机 26/26
+全绿（--all-features 因产物含 trunc_sat/simd MVP 后指令）。profile
+已是满配（lto/codegen-units=1/panic=abort），LLVM 侧无再降空间。
+跳过开关：WASM_NO_OPT=1。
+
+**后续可挖**（均需真机回归护栏）：薄包装合并（cmd_fcopy→chan_copy
+式 delegator，量级 <20 KiB）；§10quater 路线的子系统外置（chart/
+json/regexp-spencer 移侧模块，其分派面随之出表）。
+
 ## 10quinter. 2026-11-13 第五轮：file/io 外置评估——测量 + feature 图解耦（定调）
 
 **测量**（raw 口径 = cargo 产物，bindgen 再剥 ~0.5MB → pkg 2.18MiB → gzip 774KiB）：

@@ -295,6 +295,13 @@ wrapper 的 native 行为亦正确**（RTCL_EXPAND_LIST=1 实测 bridge 收
 依赖该路径），native 单测按 join 契约 5/5。探针入库作护栏；wasm
 [list] 链复现时再深挖。json 外置面维持 join 协议。
 
+**regexp 外置收口教训（7382ab4 后补）**：dynmod 外置带变量命令
+（regexp/regsub）的 wrapper 定义有三个高频错位点，均真机抓出——
+① 命名空间：JS 面 fn 装在 `::模块名::fn名`（::regsub::regsub 是错
+名，正确=::regexp::regsub）；② __RS 类结构化编码的解包顺序（v=
+result、返回=count 易反置）；③ POSIX 类翻译的前置检测
+（[[:name:]] = 外层 [ 内嵌 [:）。wrapper 定义后必须逐条真机验证。
+
 ## 10quinter. 2026-11-13 第五轮：file/io 外置评估——测量 + feature 图解耦（定调）
 
 **测量**（raw 口径 = cargo 产物，bindgen 再剥 ~0.5MB → pkg 2.18MiB → gzip 774KiB）：

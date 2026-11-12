@@ -973,9 +973,11 @@ pub(crate) fn engine_group_count(_eng: &Engine, pattern: &str) -> usize {
 /// (`integer?[+-]integer?` or `end?[+-]integer?`).  tclsh resolves
 /// `end` to the string *length* here (not length-1), so `-start end-1`
 /// points at the last character.
-#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 /// Tcl 索引整数语法：可选符号 + C 风格进制（0x/0o/0b/前导 0 八进制），
 /// 返回 i64；最终由 `wrap_tcl_index` 做 32 位回绕（tclsh 行为）。
+/// （不 gate：regexp-lite-only 构建的 `-start` 路径也用；无 regexp 构建
+/// 由调用方的 cfg 覆盖。）
+#[cfg_attr(not(any(feature = "regexp", feature = "regexp-lite")), allow(dead_code))]
 fn parse_index_int(t: &str) -> Option<i64> {
     if t.is_empty() {
         return None;

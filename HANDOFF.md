@@ -186,6 +186,39 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10quinter. 2026-11-13 第五轮：file/io 外置评估——测量 + feature 图解耦（定调）
+
+**测量**（raw 口径 = cargo 产物，bindgen 再剥 ~0.5MB → pkg 2.18MiB → gzip 774KiB）：
+
+| 变体 | raw | 增量 |
+|---|---|---|
+| core `(std,dynmod)` | 2,551,625 (2.43 MiB) | — |
+| +file+io | 2,715,288 | **+164 KiB（file+io 净重）** |
+| full +clock+package+regexp-lite | 2,800,963 | +84 KiB |
+
+结论：file/io 净重仅 6%（160KiB raw ≈ 56KiB gzip），**尺寸不是外置动机**；
+动机是功能诚实性——浏览器里 std::fs stub 必败，这批命令当前是
+"编译进但运行时死"的状态。
+
+**外置形态定调**（与 socket 的 dynmod 形态不同档）：
+- **通道协议面留原生**（io feature）：chan/fconfigure/翻译/缓冲/反射
+  通道机制不动——通道状态在解释器里，搬 JS 会让整个通道语义分叉。
+- **数据面走宿主服务**：`HostFs` 服务 trait（HostConsole/HostClock 同
+  款缝——`set_console`/`set_clock` 已有先例）：open/file-exists/cd/pwd
+  等 std::fs 直连点（io.rs 48 处/channel.rs 14 处/os.rs 1 处）路由到
+  服务实现。native=std::fs（现状不变）；wasm=JsFs 桥（OPFS）→ 浏览器
+  里 open/gets/puts/file 真正可用。安装：`RtclHandle::set_fs(js_obj)`。
+- 尺寸收益放第二位：服务化后如果嵌入方完全不想要 file/io，feature
+  已可独立关闭（本轮 event→io 耦合修复后 `(std,dynmod)` 可编译）。
+
+**本轮已落**：feature 图解耦——`chan_not_found` 移到 feature-free
+（commands/mod.rs），event.rs 不再引用 chan_io；fcopy 条目按 io 门控；
+无 regexp 构建的 `parse_index_int` cfg bug 修复。`(std,dynmod)` 与
+`(std,file,dynmod)` 均可编译（此前后者必败）。
+
+**下一轮**：HostFs trait + JsFs(OPFS) 桥 + dynmod-test.html 增设 file
+io 区段（open x w; puts; close; open r; gets 全链路真机）。
+
 ## 10quater. 2026-11-12 第四轮：dynmod——wasm `load`/`unload` 扩展模块注册表（已完成）
 
 rtcl=网页 command dispatcher 的扩展面：wasm 里 dlopen 不存在，改为

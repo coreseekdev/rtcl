@@ -13,18 +13,9 @@ fn io_err_str(msg: impl std::fmt::Display) -> Error {
     Error::runtime(msg.to_string(), crate::error::ErrorCode::Io)
 }
 
-/// Tcl's `can not find channel named "x"` failure of `TclGetChannelFromObj`,
-/// which also installs `TCL LOOKUP CHANNEL x` as ::errorCode.
-pub(crate) fn chan_not_found(interp: &mut Interp, id: &str) -> Error {
-    super::list::set_error_code(
-        interp,
-        &format!("TCL LOOKUP CHANNEL {}", crate::value::tcl_quote(id)),
-    );
-    Error::runtime(
-        format!("can not find channel named \"{}\"", id),
-        crate::error::ErrorCode::Io,
-    )
-}
+/// Re-export: the helper lives feature-free in commands/mod.rs (event.rs
+/// needs it without the io feature).
+pub(crate) use super::chan_not_found;
 
 /// Tcl's direction mismatch failure: the channel exists but is not open
 /// for the requested access. No ::errorCode (tclsh leaves it at NONE).

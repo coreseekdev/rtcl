@@ -41,7 +41,7 @@ pub fn cmd_fileevent(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let chan_id = args[1].as_str();
     if !interp.channels.contains(chan_id) {
-        return Err(super::chan_io::chan_not_found(interp, chan_id));
+        return Err(super::chan_not_found(interp, chan_id));
     }
     let event = args[2].as_str();
     let (readable, writable) = {

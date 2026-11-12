@@ -27,6 +27,19 @@ pub mod compat;
 pub mod mathop;
 pub mod coro;
 pub mod dynmod;
+
+/// Tcl's `can not find channel named "x"` failure (feature-free home:
+/// event.rs needs it without the io feature; chan_io re-exports).
+pub(crate) fn chan_not_found(interp: &mut super::Interp, id: &str) -> crate::error::Error {
+    list::set_error_code(
+        interp,
+        &format!("TCL LOOKUP CHANNEL {}", crate::value::tcl_quote(id)),
+    );
+    crate::error::Error::runtime(
+        format!("can not find channel named \"{}\"", id),
+        crate::error::ErrorCode::Io,
+    )
+}
 #[cfg(feature = "exec")]
 pub mod exec_cmd;
 pub mod namespace;

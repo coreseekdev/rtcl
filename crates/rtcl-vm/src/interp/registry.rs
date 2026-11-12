@@ -35,6 +35,7 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "break",     func: control::cmd_break,     cat: Language, cmd_id: None,                             usage: "?level?",                          help: "Break out of a loop" },
     CmdEntry { name: "case",      func: control::cmd_case,      cat: Language, cmd_id: None,                             usage: "string ?in? ?pattern body ...?",     help: "Obsolete glob case dispatch (tclsh 8.6 keeps it)" },
     CmdEntry { name: "coroutine", func: coro::cmd_coroutine,    cat: Standard, cmd_id: None,                             usage: "name cmd ?arg ...?",                 help: "Create a coroutine and run its first invocation" },
+    #[cfg(feature = "io")]
     CmdEntry { name: "fcopy",     func: chan_io::cmd_fcopy,     cat: Standard, cmd_id: None,                             usage: "input output ?-size size? ?-command callback?", help: "Copy between channels" },
     #[cfg(feature = "dynmod")]
     CmdEntry { name: "load",      func: dynmod::cmd_load,       cat: Extension, cmd_id: None,                            usage: "?-global? ?-lazy? ?--? fileName ?packageName? ?interp?", help: "Attach a host-declared extension module (or dlopen a binary one)" },

@@ -79,6 +79,16 @@
 
 非缺陷、不再修：`string byterange` 是 rtcl 扩展，tclsh 无此子命令。
 
+## 2026-11-13 file/io 外置评估（测量 + feature 图解耦，定调未实现）
+
+- file+io 净重 164KiB raw（≈56KiB gzip，本体 6%）——外置动机是浏览器
+  里 std::fs 必败（功能诚实性），不是尺寸。
+- 外置形态：通道协议面留原生（反射通道机制已在），数据面走 HostFs
+  宿主服务（HostConsole/HostClock 同款缝）——详见 HANDOFF §10quinter。
+  尚未实现。
+- feature 图修复：event→io 解耦后 `(std,dynmod)` 构建可达（含无
+  regexp 构建的 parse_index_int cfg bug）。
+
 ## 2026-11-12c dynmod：wasm `load`/`unload` 注册表形态（5 单测）
 
 - rtcl 的 `load` 增加**宿主注册表**形态（feature `dynmod`）：宿主

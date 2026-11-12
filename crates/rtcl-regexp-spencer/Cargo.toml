@@ -1,0 +1,14 @@
+[package]
+name = "rtcl-regexp-spencer"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+description = "Henry Spencer ARE engine Rust port — parser/NFA/DFA/backtracker/captures, shared by the rtcl interpreter and the wasm side module"
+keywords = ["tcl", "regexp", "spencer"]
+categories = ["parser-implementations"]
+
+# 刻意不继承根 workspace（version.workspace 等）：wasm 侧模块
+# rtcl-regexp-spencer-side 以独立 workspace 路径依赖本 crate——被依赖
+# 方若声明 workspace 继承，跨 workspace 构建会解析失败。
+[dependencies]
+rtcl-unicode = { path = "../rtcl-unicode" }

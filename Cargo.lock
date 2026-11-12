@@ -4384,6 +4384,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtcl-regexp-spencer"
+version = "0.1.0"
+dependencies = [
+ "rtcl-unicode",
+]
+
+[[package]]
 name = "rtcl-tk-app-native"
 version = "0.1.0"
 dependencies = [
@@ -4455,6 +4462,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtcl-unicode"
+version = "0.1.0"
+
+[[package]]
 name = "rtcl-vm"
 version = "0.1.0"
 dependencies = [
@@ -4467,6 +4478,8 @@ dependencies = [
  "regex-lite",
  "rtcl-ir",
  "rtcl-parser",
+ "rtcl-regexp-spencer",
+ "rtcl-unicode",
  "smallvec",
  "spin",
 ]

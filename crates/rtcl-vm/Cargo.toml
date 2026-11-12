@@ -16,6 +16,7 @@ libc = { version = "0.2", optional = true }
 [dependencies]
 rtcl-ir.workspace = true
 rtcl-parser.workspace = true
+rtcl-unicode.workspace = true
 smallvec.workspace = true
 indexmap.workspace = true
 
@@ -28,6 +29,10 @@ workspace = true
 optional = true
 
 [dependencies.regex-lite]
+workspace = true
+optional = true
+
+[dependencies.rtcl-regexp-spencer]
 workspace = true
 optional = true
 
@@ -69,7 +74,7 @@ package = ["file"]                # package provide/require/names/forget
 signal = ["std"]                  # kill, sleep
 # Henry Spencer 正则引擎的 Rust 移植（B 路径；specs/regex-spencer-port.md）。
 # 已并入 rtcl_std 默认开启；RTCL_REGEX_ENGINE=fast 可退回旧引擎。
-regexp-spencer = []
+regexp-spencer = ["dep:rtcl-regexp-spencer"]
 # 外部 libc iconv 后端（encoding module 的宽表编码转换）。默认开；wasm /
 # 无 libc 目标或显式 --no-default-features 时关闭，编码走字节直映兜底
 # （名字表仍完整，convertfrom/to 对非内建编码退化为逐字节/UTF-8 直传）。

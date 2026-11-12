@@ -1,0 +1,10 @@
+[package]
+name = "rtcl-unicode"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+description = "Tcl's Unicode category predicates and case tables (tclUtf.c/tclUniData.c decode) — shared by the rtcl interpreter and the regexp engine"
+keywords = ["tcl", "unicode"]
+categories = ["parser-implementations"]
+
+[dependencies]

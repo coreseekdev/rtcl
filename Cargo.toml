@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/rtcl-ir",
     "crates/rtcl-parser",
+    "crates/rtcl-unicode",
+    "crates/rtcl-regexp-spencer",
     "crates/rtcl-vm",
     "crates/rtcl-core",
     "crates/rtcl-cli",
@@ -27,6 +29,8 @@ rust-version = "1.70"
 [workspace.dependencies]
 rtcl-ir = { path = "crates/rtcl-ir" }
 rtcl-parser = { path = "crates/rtcl-parser" }
+rtcl-unicode = { path = "crates/rtcl-unicode" }
+rtcl-regexp-spencer = { path = "crates/rtcl-regexp-spencer" }
 rtcl-vm = { path = "crates/rtcl-vm" }
 # 供 rtcl-cli 的可选 jit 特性经 workspace 继承引用（安全子集与
 # rtcl-jit 自身声明一致——env/exec/signal 排除）。

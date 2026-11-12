@@ -16,7 +16,9 @@ pub mod misc;
 pub mod regexp_bt;
 pub mod regexp_cmds;
 #[cfg(feature = "regexp-spencer")]
-pub mod regexp_spencer;
+// Spencer 引擎抽独立 crate：rtcl-vm（native）与 wasm 侧模块
+// spencermod（见 crates/rtcl-regexp-spencer-side）共用同一实现。
+pub use rtcl_regexp_spencer as regexp_spencer;
 #[cfg(feature = "clock")]
 pub mod clock;
 #[cfg(feature = "package")]

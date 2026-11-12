@@ -11,7 +11,9 @@
 //! - [`commands`] submodules: individual command implementations
 
 pub mod commands;
-pub mod unicode;
+// unicode 表已抽独立 crate（rtcl-regexp-spencer 双端共用同一份 Tcl
+// 分类/大小写表）——re-export 保持 crate::interp::unicode 路径不变。
+pub use rtcl_unicode as unicode;
 mod registry;
 mod vars;
 mod eval;

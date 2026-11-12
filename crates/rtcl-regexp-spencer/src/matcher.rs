@@ -18,7 +18,7 @@ use super::ast::{AssertKind, Flags};
 use super::charset::CharSet;
 use super::dfa::DfaCache;
 use super::nfa::{Prog, Trans};
-use crate::interp::unicode;
+use rtcl_unicode as unicode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Match {

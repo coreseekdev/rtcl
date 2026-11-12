@@ -4,7 +4,7 @@
 //! "范围 + Tcl Unicode 谓词" 表示，匹配时按成员关系判定。大小写
 //! 不敏感用简单折叠（与既有引擎的 `İ→i` 口径一致）。
 
-use crate::interp::unicode;
+use rtcl_unicode as unicode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pred {

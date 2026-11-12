@@ -186,6 +186,69 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10. 原生 Tk 与性能：下一 Session 待办（2026-11-12 交接）
+
+> perf/wave2 分支已合并回 master（`1017525`，283 提交）。原生 Tk 的
+> 兼容性工作经**八遍 wish 对照**（`bash specs/tk/run.sh` 一键回归：
+> 字体度量/几何/事件 % 替换/selection-虚拟/winfo/全控件子命令面/
+> wm-tkwait/treeview-drag）已把 rtcl 侧纯语义差距基本清零。对照在
+> 这轮累计修掉 15+ 组真 bug（字体族名解析、负 -size、-fixed 判据、
+> tk scaling 默认值、%s 十进制、%k keycode 表、%A Ctrl 控制字符折叠、
+> selection clear/own、wm protocol 查询、menu clone/postcascade、
+> treeview 15 子命令、text wrap 显示行模型、photo 像素引擎等）。
+
+### 10.1 语义域剩余（specs/DIVERGENCES.md，49 例需对齐 + 15 例 -f 设计差异）
+
+按根因分组（详细探针名见 DIVERGENCES.md 2026-11-03/11-08 节）：
+1. **errorInfo/errorstack/return 帧**（~9）：内联体帧（if/while/for）、
+   dict with/filter、return -code/-level 解码、catch options 键序——
+   涉及 rtcl 编译体的帧模型，最深的一组。
+2. **IO/通道**（~13）：通道编号/复用、read 计数、fblocked 元数、
+   chan copy 方向、socket、eofchar。
+3. **哈希/迭代序 + 命令面**（~11）：Tcl 自研哈希插入序 vs rtcl 排序/
+   随机哈希；缺 `::tcl::prefix`、`::tcl::pkgconfig`；info commands
+   计数不同（rtcl 是 jimtcl 超集）。
+4. **OO 可见性面**（~10）：namespace children 序、方法可见性细节、
+   methodtype。
+5. **Unicode UCS-2**（~5）：`string length/index` 对增补平面按码元计 2
+   （Tcl 8.6 是 UCS-2 非 UTF-8）、`\U` 代理对、部分 `[[:class:]]`。
+6. **dict 残差**（~6）：`dict info`（hash internals 不可复现）、
+   `dict getdef`（rtcl 多出的 8.7 特性）。
+7. 其余小尾巴：expr 词法（nan()/inf()）、representation 文案、
+   disassemble/assemble 面、trace 时机、`interp alias {}` 创建形式
+   （D-1，唯一 OPEN 语义分歧，严重度低）。
+
+### 10.2 性能需提升的（bench/BASELINE.md）
+
+六基准已全部 ≤1.0x tclsh（起点 fib 1.32 / fe 1.82 / dloop 1.01 /
+oo2 1.07 / oovars 1.59 / build 1.29）；当前：fib **0.83x**、oo2
+**0.42x**、oovars **0.52x**、fe/dloop/build ~持平。微套件 arith/
+var_incr/proc_fib 0.6-1.0x。剩余开销点（深水区，逐项 <2% 需组合）：
+1. **call_proc 帧准备四板点**：level0 每参 clone+push（~20 instr/调
+   用）、slot_mode 门禁的 `Rc::clone(code)`+`slots.resize`、
+   `ns_of_qualified`+两次 ns Rc clone、帧池收发与 11 项字段 clear。
+   画像方法：`CARGO_PROFILE_RELEASE_DEBUG=1` + perf record → python
+   自聚合（perf report 会超时，见 BASELINE Round AF）。
+2. **语句窗口扩展**：`incr x [expr {...}]`、`set x [cmd ...]`（含
+   bracket 结果窗口）、`[SubEnd, DynCall/Call]`——每迭代 op 数是真正
+   差距（per-op 语义体已是 tclsh 的 1.1x）。
+3. **`BEGIN_CMD` word_srcs 借用化**：`(*const SrcSpan, len)` 新型——
+   去 p_only 画像 8.7%（op_begin_cmd 5% + drop<Vec<SrcSpan>> 3.7%）。
+   unsafe，需严肃审跨嵌套 eval 的 saved 引用链。
+4. **空循环基线**：dispatch + region 簿记（Vec push/pop）——候选 =
+   bodies 预留 + unchecked push、`frames.last()` 缓存（~5-8%）。
+5. **vars 指针稳定存储**（残差 ~1.2× 目标）：VarMap newtype +
+   链接变量 `*const Value` 缓存（traced 走原路径）——方案存档
+   BASELINE G9f 节。
+6. JIT 已转主线（master `6db3724`）：剩余 = M1'（ABI v2 + Int 快车
+   道）+ fuel/epoch imported globals（`docs/JIT-WASM-GC.md` §3）。
+
+### 10.3 原生 Tk 需 nsh/fork 渲染侧的九项（详见 TODO.md 新节）
+
+`-alpha` 渲染通道、字体栈统一（渲染行宽 ~15% 偏差）、ttk 主题视觉
+化（命令面已对齐）、treeview 表头拖拽视觉、a11y 深度、IME 深度、
+MSVC 矩阵、macOS 平台——每项均标注 rtcl 侧已就绪的接线点。
+
 ## 8. 提交规约
 
 - 每轮修正一个 commit，message 格式：`fix: Round N divergence burndown — <主题>`，正文列条目，尾部署名 `Co-Authored-By: Claude <noreply@anthropic.com>`。

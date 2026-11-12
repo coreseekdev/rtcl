@@ -24,13 +24,27 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::interp::Interp;
 use crate::value::Value;
 
-/// One host-declared module: its commands and, per command, the fixed
-/// dispatch words that reach it.
+/// 调用参数传递协议（ABI 版本）。
+///
+/// - [`DynAbi::V1Join`]：wrapper 体 `[join $args "\u0001"]`——分隔符
+///   单词。数据含 \u0001 时会在宿主拆分处丢界（v1 限制）。
+/// - [`DynAbi::V2List`]（推荐）：wrapper 体 `<words> [llength $args]
+///   $args`——参数以**列表值单词**（rtcl 序列化，round-trip 安全）+
+///   前置词数传递，任意 Unicode / \u0001 数据保真。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DynAbi {
+    #[default]
+    V1Join,
+    V2List,
+}
+
 #[derive(Clone, Debug)]
 pub struct DynModuleDef {
     /// `(command tail, dispatch words)` — the wrapper body calls the
-    /// bridge as `<words...> {*}$args`.
+    /// bridge as `<words...> <args-form>`（按 [`DynAbi`] 取形）。
     pub commands: Vec<(String, Vec<String>)>,
+    /// 调用协议版本（v2 = [`DynAbi::V2List`]）。
+    pub abi: DynAbi,
 }
 
 /// Load state of a registered module.
@@ -48,6 +62,12 @@ impl Interp {
     pub fn register_dyn_module(&mut self, name: &str, def: DynModuleDef) {
         let key = name.trim_start_matches("::").to_string();
         self.dyn_modules.insert(key, DynModule { def, installed: Vec::new() });
+    }
+
+    /// v2 形态便捷注册：abi = [`DynAbi::V2List`]（列表值单词协议）。
+    pub fn register_dyn_module_v2(&mut self, name: &str, mut def: DynModuleDef) {
+        def.abi = DynAbi::V2List;
+        self.register_dyn_module(name, def);
     }
 
     /// Commands a loaded module installed (for host-side cleanup).
@@ -126,11 +146,10 @@ pub fn cmd_load(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // Already loaded: tclsh re-load of a loaded file is a no-op.
             return Ok(Value::empty());
         }
-        let snapshot = interp
-            .dyn_modules
-            .get(&key)
-            .map(|rec| rec.def.commands.clone())
-            .unwrap_or_default();
+        let (snapshot, abi) = {
+            let rec = interp.dyn_modules.get(&key).expect("record");
+            (rec.def.commands.clone(), rec.def.abi)
+        };
         let mut installed = Vec::new();
         for (cmd, words) in &snapshot {
             let full = format!("::{}::{}", key, cmd);
@@ -139,11 +158,13 @@ pub fn cmd_load(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 call.push_str(&crate::value::tcl_quote(w));
                 call.push(' ');
             }
-            // wrapper 体：`<words> [join $args "\u0001"]`——参数经分隔
-            // 符协议整词传递（{*}$args 的列表展开对含空白元素有重解析
-            // 缺口；join 产出的单词文本任何路径都不再拆），js_dispatch
-            // 侧按 \u0001 拆开还原。
-            call.push_str("[join $args \"\\u0001\"]");
+            match abi {
+                // v2：`{*}$args` 直传——expand 元素感知（expand.probes
+                // 11/11 已证整词保真），无分隔符歧义；宿主 bridge 逐词
+                // 收参（\u0001 数据安全，v1 join 的 \u0001 丢界解除）。
+                DynAbi::V2List => call.push_str("{*}$args"),
+                DynAbi::V1Join => call.push_str("[join $args \"\\u0001\"]"),
+            }
             let script = format!(
                 "proc {} {{args}} {{ {} }}",
                 crate::value::tcl_quote(&full),
@@ -217,7 +238,9 @@ pub fn cmd_unload(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::Error;
     use crate::interp::Interp;
+    use crate::interp::commands::dynmod::DynAbi;
     use crate::value::Value;
     use std::cell::RefCell;
 
@@ -254,6 +277,7 @@ mod tests {
                     ("version".to_string(),
                      vec!["fake_bridge".to_string(), "myext".to_string(), "version".to_string()]),
                 ],
+                abi: super::DynAbi::V1Join,
             },
         );
         interp.eval(script).unwrap().as_str().to_string()
@@ -293,6 +317,48 @@ mod tests {
     fn stem_lookup_via_path_form() {
         let out = ev("load /somewhere/myext.wasm; myext::add 1 2");
         assert_eq!(out, "3");
+    }
+
+    /// v2（列表值单词协议）数据保真：\u0001 / 空白 / 全 Unicode 词
+    /// 逐词到达宿主 bridge（v1 join 协议对 \u0001 数据丢界）。
+    #[test]
+    fn v2_abi_binary_and_unicode_safe() {
+        use std::cell::RefCell;
+        thread_local! {
+            static RX: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
+        }
+        let mut interp = Interp::new();
+        // v2 wrapper 逐词直传：bridge 收到的词（跳过前 3 个 dispatch
+        // 词）= 调用参数原词（\u0001 / 空白 / 全 Unicode 保真）。
+        interp.register_command("v2_bridge", |_interp, args| {
+            let words: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            RX.with(|log| log.borrow_mut().push(words[3..].to_vec()));
+            Ok(Value::from_str("v2ok"))
+        });
+        interp.register_dyn_module_v2(
+            "binmod",
+            super::DynModuleDef {
+                commands: vec![("echo".to_string(),
+                    vec!["v2_bridge".to_string(), "binmod".to_string(), "echo".to_string()])],
+                abi: DynAbi::V2List,
+            },
+        );
+        interp.eval("load binmod").unwrap();
+        // load 装 ::模块::命令（用户面入口是带命名空间的全名）；
+        // 逐条调用（数据含 \u0001 字面 / 空白 / 全 Unicode——v2 列表值
+        // 单词协议保真；v1 join 协议对 \u0001 数据丢界）
+        let cases: Vec<Vec<String>> = vec![
+            vec!["a\u{1}b".to_string(), "普通文本".to_string()],
+            vec!["日语🈁".to_string(), "x y z".to_string(), "".to_string()],
+        ];
+        for case in &cases {
+            let quoted: Vec<String> = case.iter().map(|c| crate::value::tcl_quote(c)).collect();
+            let script = format!("::binmod::echo {}", quoted.join(" "));
+            let out = interp.eval(&script).unwrap();
+            assert_eq!(out.as_str(), "v2ok");
+            let last = RX.with(|l| l.borrow().last().cloned().unwrap_or_default());
+            assert_eq!(&last, case, "v2 逐词保真: {last:?} vs {case:?}");
+        }
     }
 
     impl Interp {

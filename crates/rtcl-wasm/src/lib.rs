@@ -6,6 +6,7 @@ pub mod jit_abi;
 
 use wasm_bindgen::prelude::*;
 use rtcl_core::Interp;
+use rtcl_vm::interp::commands::dynmod::DynAbi;
 
 #[wasm_bindgen]
 pub struct RtclHandle {
@@ -115,7 +116,8 @@ impl RtclHandle {
                 "register_module: exports object has no function-valued properties",
             ));
         }
-        self.interp.register_dyn_module(name, rtcl_vm::interp::commands::dynmod::DynModuleDef { commands });
+        // v2 协议（列表值单词 + 前置词数）——二进制/Unicode 安全
+        self.interp.register_dyn_module_v2(name, rtcl_vm::interp::commands::dynmod::DynModuleDef { commands, abi: DynAbi::V2List });
         Ok(())
     }
 

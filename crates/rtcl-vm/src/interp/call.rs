@@ -915,7 +915,23 @@ impl Interp {
                                                 error_info: None,
                                                 error_code: None,
                                             }),
-                                            _ => Ok(val),
+                                            // 用户码（≥5 / 负数）：ret_level 1
+                                            // 的边界按原码物化（tclsh
+                                            // TclUpdateReturnInfo：returnLevel
+                                            // 归零后 code = returnCode 原样
+                                            // 返回——完成码 7 穿过此边界仍是
+                                            // 7，catch 报 7，options -level 0）。
+                                            // Return kind + level 槽 = 原码。
+                                            // code 0 = 普通 return（-level N
+                                            // 值形式）在此边界正常完成。
+                                            0 => Ok(val),
+                                            _ => Err(Error::ControlFlow {
+                                                kind: crate::error::ControlFlow::Return,
+                                                value: value.clone(),
+                                                level: code,
+                                                error_info: error_info.clone(),
+                                                error_code: error_code.clone(),
+                                            }),
                                         }
                                     }
                                 }
@@ -971,7 +987,10 @@ impl Interp {
                                         error_code: None,
                                     })
                                 }
-                                _ => Ok(val),
+                                // 已物化原码（level 槽 ≥5）：完成码穿透
+                                // proc 边界不解码（tclsh：非 TCL_RETURN
+                                // 完成码不触发 TclUpdateReturnInfo）。
+                                _ => Err(e),
                             }
                         }
                         _ => Ok(Value::empty()),
@@ -1447,7 +1466,8 @@ impl Interp {
                                     error_info: None,
                                     error_code: None,
                                 }),
-                                _ => Ok(val),
+                                // 已物化原码（level 槽 ≥5）原样穿透。
+                                _ => Err(e),
                             }
                         }
                         _ => Ok(Value::empty()),

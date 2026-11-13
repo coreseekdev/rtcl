@@ -771,7 +771,8 @@ impl Interp {
                 }
             } else if e.is_break()
                 || e.is_continue()
-                || e.is_return() && matches!(e.deferred_code(), 1 | 3 | 4)
+                || e.is_return()
+                    && (matches!(e.deferred_code(), 1 | 3 | 4) || e.deferred_code() >= 5)
             {
                 // D-11：顶层将升级为错误的控制流完成在本命令帧上延迟
                 // （tclsh 在转换点记录看到该完成的命令；最外层胜）。
@@ -1233,6 +1234,10 @@ impl Interp {
                     true,
                     "invoked \"continue\" outside of a loop".to_string(),
                 ),
+                // 已物化原码（-level 0 用户码）穿透到顶层：tclsh
+                // ProcessUnexpectedResult（TEOV_Exception / TclEvalEx
+                // numLevels==0）转错误。
+                n if n >= 5 => (true, format!("command returned bad code: {}", n)),
                 _ => (false, String::new()),
             },
             _ => (false, String::new()),

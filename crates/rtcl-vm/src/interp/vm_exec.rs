@@ -707,7 +707,8 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
 fn defer_flow_frame(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error) {
     let flow = e.is_break()
         || e.is_continue()
-        || e.is_return() && matches!(e.deferred_code(), 1 | 3 | 4);
+        || e.is_return()
+            && (matches!(e.deferred_code(), 1 | 3 | 4) || e.deferred_code() >= 5);
     if !flow {
         return;
     }

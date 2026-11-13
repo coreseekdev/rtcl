@@ -733,6 +733,17 @@ pub fn cmd_return(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         level_given = true;
     }
 
+    // TclMergeReturnOptions（tclResult.c 实测钉形）：`-code return` 一律
+    // 换形为 `-code ok -level+1` —— [return -code return -level X] 即
+    // [return -code ok -level X+1]。这就是 `catch {return -code return
+    // hi}` 报 2 而 options 是 `-code 0 -level 2` 的机制：完成码 TCL_RETURN
+    // 的 returnLevel/returnCode 已经是 (2, 0)，catch 的 options 渲染读
+    // 的是这两个内部量，不是原始 -code 词。
+    if code == Some(2) {
+        level += 1;
+        code = Some(0);
+    }
+
     let mut error_info: Option<String> = None;
     if let Some(v) = get("-errorinfo") {
         error_info = Some(v.as_str().to_string());
@@ -826,8 +837,27 @@ pub fn cmd_return(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         error_info,
                         error_code,
                     },
-                    3 => Error::brk(),
-                    4 => Error::cont(),
+                    // -level 0 的 break/continue：完成码直接物化，值随完成
+                    // 走（tclsh 实测 `catch {return -level 0 -code break zz}`
+                    // → 3 / c=zz / -level 0）。
+                    3 => Error::ControlFlow {
+                        kind: crate::error::ControlFlow::Break,
+                        value: result,
+                        level: 1,
+                        error_info: None,
+                        error_code: None,
+                    },
+                    4 => Error::ControlFlow {
+                        kind: crate::error::ControlFlow::Continue,
+                        value: result,
+                        level: 1,
+                        error_info: None,
+                        error_code: None,
+                    },
+                    // 其余码（≥5 / 负数用户码）：TclProcessReturn(level=0)
+                    // 原样返回码——完成码就是 c 本身（catch 报 c，options
+                    // -code c -level 0）。Return kind + level 槽 ≥5 为
+                    // "已物化原码" 约定，catch/call_proc 解码头识别。
                     _ => Error::return_with_options(c, result, error_info, error_code),
                 });
             }
@@ -951,8 +981,19 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             else if e.is_return() {
                 // return 信号恒报 2（error-deep 探针：tclsh 对
                 // `return -code 7` 也报 2——用户码随 options 的 -code
-                // 走，catch 结果码只区分完成类别）。
-                2
+                // 走，catch 结果码只区分完成类别）。例外：-level 0 的
+                // 物化原码（Return kind + level 槽 ≥5）——TclProcessReturn
+                // 在 level 0 直接返回码本身，catch 报原码（tclsh 实测
+                // `catch {return -level 0 -code 7 zz}` → 7）。
+                match &e {
+                    // 槽 ≥5 且在常规量级内 = 已物化原码；≥1e6 的正值槽
+                    // 留给复合编码的负数用户码折叠（-code 3000000000 截断
+                    // 为负 → 复合槽 -(10+c) 折回巨大正值），catch 仍报 2
+                    // （h_return_options-17 钉形）。
+                    Error::ControlFlow { level, .. }
+                        if *level >= 5 && *level < 1_000_000 => *level as i64,
+                    _ => 2,
+                }
             }
             else if e.is_break() { 3 }
             else if e.is_continue() { 4 }
@@ -1057,6 +1098,16 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         Error::ControlFlow { level, .. } => *level as i64,
                         _ => 0,
                     };
+                    if rc >= 5 && rc < 1_000_000 {
+                        // 已物化原码：options `-code <rc> -level 0`
+                        // （tclsh GetReturnOptions 对非 TCL_RETURN 完成
+                        // 恒置 -level 0）。
+                        interp.set_var(
+                            ov,
+                            Value::from_str(&format!("-code {} -level 0", rc)),
+                        )?;
+                        return Ok(Value::from_int(code));
+                    }
                     if rc < 0 {
                         // D-5③ 复合槽解码：ret_level=(-rc)/10、
                         // code=(-rc)%10 → options -code <code> -level

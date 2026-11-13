@@ -649,8 +649,22 @@ impl Interp {
                 // `invokeStk1 <源片段>`（tclsh 同）。
             }
             if is_err && current_proc_name != "apply lambdaExpr" {
+                // (procedure "name") 的 name = **调用词**（tclsh
+                // TclNRInterpProcCore(interp, objv[0], …, MakeProcError)：
+                // objv[0] 是分派词原文——`n1::show` 报 n1::show、ns 内裸名
+                // 调用报 show（namespace_uplevel 钉形）；rtcl 的注册键是
+                // 规范全名，帧上 level0[0] 才是调用词。lambda 帧的
+                // (lambda term …) 标签由 cmd_apply 出。
                 let tag = super::commands::oo::oo_method_exit_tag(self)
-                    .unwrap_or_else(|| format!("procedure \"{}\"", current_proc_name));
+                    .unwrap_or_else(|| {
+                        let invoked = self
+                            .frames
+                            .last()
+                            .and_then(|f| f.level0.first())
+                            .map(|v| v.as_str().to_string())
+                            .unwrap_or_else(|| current_proc_name.to_string());
+                        format!("procedure \"{}\"", invoked)
+                    });
                 self.err_exit_frame(&tag);
             }
         }

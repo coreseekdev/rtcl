@@ -678,17 +678,17 @@ impl Interp {
             super::util::WordSrcs::from_rc(&cmd.word_srcs),
         );
         let mut args = Vec::with_capacity(cmd.words.len());
-        for word in &cmd.words {
-            let value = match self.eval_word(word) {
+        for (word_idx, word) in cmd.words.iter().enumerate() {
+            let value = match self.eval_word_idx(word, Some(word_idx)) {
                 Ok(v) => v,
                 Err(e) => {
                     if self.err_is_error(&e) {
                         if std::mem::take(&mut self.err_from_subst) {
-                            self.err_pending_top = Some(Rc::from(cmd.text.slice(&unit.source)));
-                            // The construct-exit tags report the
-                            // enclosing command's line, not the
-                            // substitution-internal line.
-                            self.err_line = cmd.line + self.line_offset;
+                            // 行号随帧走：defer 时不动 err_line（构造
+                            // 出口帧读最内层日志命令的行，tclsh 的
+                            // errorLine 只在日志事件处更新）。
+                            self.err_pending_top =
+                                Some((Rc::from(cmd.text.slice(&unit.source)), cmd.line + self.line_offset));
                         } else {
                             let msg = e.message_text();
                             let local_slots = self.lexical_body || self.in_locals_unit;
@@ -754,8 +754,8 @@ impl Interp {
                     // tclsh does not append the enclosing `expr {...}` /
                     // `set q [...]` frame.  Defer it to the top-level
                     // report, where catch consumes it silently.
-                    self.err_pending_top = Some(Rc::from(cmd.text.slice(&unit.source)));
-                    self.err_line = cmd.line + self.line_offset;
+                    self.err_pending_top =
+                        Some((Rc::from(cmd.text.slice(&unit.source)), cmd.line + self.line_offset));
                 } else {
                 let msg = e.message_text();
                 let cmd_name = args.first().map(|v| v.as_str()).unwrap_or("");
@@ -777,8 +777,8 @@ impl Interp {
                 // D-11：顶层将升级为错误的控制流完成在本命令帧上延迟
                 // （tclsh 在转换点记录看到该完成的命令；最外层胜）。
                 // catch/try 消费路径由既有 err_pending_top 清理兜底。
-                self.err_pending_top = Some(Rc::from(cmd.text.slice(&unit.source)));
-                self.err_line = cmd.line + self.line_offset;
+                self.err_pending_top =
+                    Some((Rc::from(cmd.text.slice(&unit.source)), cmd.line + self.line_offset));
             }
         }
         self.cur_source = saved_source;
@@ -1184,12 +1184,15 @@ impl Interp {
             // A word-substitution error that escaped every enclosing
             // construct frameless gets its enclosing command's frame
             // here (tclsh logs it at the top level, after the skip).
-            if let Some(text) = self.err_pending_top.take() {
+            if let Some((text, line)) = self.err_pending_top.take() {
                 if let Some(info) = &mut self.err_info {
                     info.push_str(&format!(
                         "\n    invoked from within\n\"{}\"",
                         tcl_log_excerpt(&text)
                     ));
+                    // 追加即日志事件：errorLine 更新为该命令的行
+                    // （tclsh TclEvalEx 错误路径）。
+                    self.err_line = line;
                 }
             }
             self.err_exit_frame(&tag);
@@ -1253,7 +1256,8 @@ impl Interp {
                 self.err_pending_top = None;
                 Some(info.clone())
             }
-            _ => self.err_pending_top.take().map(|text| {
+            _ => self.err_pending_top.take().map(|(text, line)| {
+                self.err_line = line;
                 format!(
                     "{}\n    while executing\n\"{}\"",
                     msg,
@@ -1279,7 +1283,15 @@ impl Interp {
 
     /// Evaluate a word to get its value.
     pub(crate) fn eval_word(&mut self, word: &Word) -> Result<Value> {
-        self.eval_word_ctx(word, true)
+        self.eval_word_idx(word, None)
+    }
+
+    /// [`Interp::eval_word`] with the word's index in its command: the
+    /// whole-word `[...]` substitution rebases the nested eval's line
+    /// numbering onto the bracket's own line (tclsh's single line table —
+    /// the bracket content's line 1 is the line of its `[`).
+    pub(crate) fn eval_word_idx(&mut self, word: &Word, idx: Option<usize>) -> Result<Value> {
+        self.eval_word_ctx(word, true, idx)
     }
 
     /// [`Self::eval_word`] with the unit context: a WHOLE-WORD `[...]`
@@ -1289,7 +1301,7 @@ impl Interp {
     /// Concat part or a `{*}` word compiles through `compile_word` →
     /// `EvalScript` (a nested unit); those recurse with `same_unit = false`
     /// and their brackets start fresh, non-lexical units.
-    fn eval_word_ctx(&mut self, word: &Word, same_unit: bool) -> Result<Value> {
+    fn eval_word_ctx(&mut self, word: &Word, same_unit: bool, word_idx: Option<usize>) -> Result<Value> {
         match word {
             Word::Literal(s) => Ok(Value::from_str(s)),
             Word::VarRef(name) => self.eval_var_ref(name),
@@ -1297,7 +1309,8 @@ impl Interp {
                 if same_unit && self.lexical_body {
                     self.next_eval_lexical = true;
                 }
-                match self.eval(cmd) {
+                let r = self.eval(cmd);
+                match r {
                     Ok(v) => Ok(v),
                     Err(e) => {
                         // Mark the boundary: the enclosing command must not
@@ -1310,12 +1323,12 @@ impl Interp {
             Word::Concat(parts) => {
                 let mut result = String::new();
                 for part in parts {
-                    let value = self.eval_word_ctx(part, false)?;
+                    let value = self.eval_word_ctx(part, false, None)?;
                     result.push_str(value.as_str());
                 }
                 Ok(Value::from_str(&result))
             }
-            Word::Expand(inner) => self.eval_word_ctx(inner, false),
+            Word::Expand(inner) => self.eval_word_ctx(inner, false, None),
             Word::ExprSugar(expr) => self.eval_expr(expr),
         }
     }

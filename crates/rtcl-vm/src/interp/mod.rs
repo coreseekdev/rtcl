@@ -810,7 +810,7 @@ pub struct Interp {
     /// waiting to see if the error escapes uncaught — the top-level
     /// report then adds `invoked from within "<text>"` (tclsh logs the
     /// enclosing command only when nothing else consumed the log).
-    pub(crate) err_pending_top: Option<Rc<str>>,
+    pub(crate) err_pending_top: Option<(Rc<str>, usize)>,
     /// D-3 -errorstack：当前错误的 INNER 条目体（"returnImm x {}" /
     /// "invokeStk1 <cmdtext>"）；新错误在 harness 首帧处重建。
     pub(crate) err_inner: Option<String>,
@@ -1182,10 +1182,11 @@ impl Interp {
         self.err_exit_frame(tag);
     }
 
-    /// 同上：词括号 defer（pending 帧 + 行号）。
+    /// 同上：词括号 defer（pending 帧 + 行号——行号随帧走，defer 时
+    /// 不动 err_line：构造出口帧读的是最内层日志命令的行，tclsh 的
+    /// errorLine 只在日志事件处更新）。
     pub fn jit_err_set_pending(&mut self, text: &str, line: usize) {
-        self.err_pending_top = Some(Rc::from(text));
-        self.err_line = line;
+        self.err_pending_top = Some((Rc::from(text), line));
     }
 
     /// 同上：行号直设（exit_frame 前置读取的口径）。

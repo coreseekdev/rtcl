@@ -50,6 +50,13 @@ pub struct Compiler {
     /// Line number of the current text's first line (1-based Tcl lines;
     /// 0 at top level).  Absolute line = `line_base + command.line`.
     line_base: u32,
+    /// The inlining-context base that site.line_delta installs as
+    /// interp.line_offset while a command dispatches: nested fresh-unit
+    /// evals (catch/switch-arm/namespace bodies) inherit it.  Tracks
+    /// line_base except at inlined-bracket boundaries in TclEvalEx
+    /// contexts, where tclsh keeps the nested scripts' numbering
+    /// unit-relative (the bracket's inner lines are script-relative).
+    line_ctx: u32,
     /// True while compiling the *next* script region of an inline `for`:
     /// a literal `continue` there escapes the loop (for-8.2), so it
     /// compiles to `LoopExit` + `Continue` instead of the plain op.  Saved
@@ -137,6 +144,7 @@ impl Compiler {
             source: Rc::clone(&source),
             span_base: 0,
             line_base: 0,
+            line_ctx: 0,
             in_next: false,
             locals_mode,
             toplevel_slots,
@@ -279,7 +287,7 @@ impl Compiler {
             text: SrcSpan { start: cmd.text.start + base, end: cmd.text.end + base },
             line,
             line_rel: cmd.line as u32,
-            line_delta: self.line_base,
+            line_delta: self.line_ctx,
             word_srcs,
         });
         self.bytecode.emit(OpCode::BeginCmd(site_idx), line);
@@ -493,11 +501,17 @@ impl Compiler {
             return false;
         };
         let content_start = abs.start + 1;
-        let saved = (self.span_base, self.line_base);
+        let saved = (self.span_base, self.line_base, self.line_ctx);
         self.span_base = content_start;
-        // line_base is inherited unchanged: the tree-walk's nested eval
-        // runs with the enclosing offset still installed, so a command on
-        // the bracket's first line reports the same line either way.
+        // tclsh 在**编译 proc 体**里把括号内容内联进同一行表（行 = 单元
+        // 绝对行）；TclEvalEx 语境（文件/eval 顶层）逐命令执行，括号
+        // 内容是独立脚本（行 = 括号内相对行）。proc 体语境 = locals_mode
+        // 且非顶层 slot 单元（运行时 in_locals_unit 同款判据）。line_ctx
+        //（嵌套独立单元继承的行上下文）两种语境都保持外层值——文件
+        // 语境的嵌套体行号不随括号平移。
+        if self.locals_mode && !self.toplevel_slots {
+            self.line_base = count_lines(&self.source, content_start as usize);
+        }
         self.bytecode.emit(OpCode::SubMark, self.abs_line(cmd));
         if commands.is_empty() {
             self.bytecode.emit(OpCode::PushEmpty, self.abs_line(cmd));
@@ -507,6 +521,7 @@ impl Compiler {
         self.bytecode.emit(OpCode::SubEnd, self.abs_line(cmd));
         self.span_base = saved.0;
         self.line_base = saved.1;
+        self.line_ctx = saved.2;
         true
     }
 
@@ -1158,12 +1173,14 @@ impl Compiler {
                         // source line holding that byte.
                         let body_start =
                             self.span_base + cmd.word_srcs[word_idx].start + 1;
-                        let saved = (self.span_base, self.line_base);
+                        let saved = (self.span_base, self.line_base, self.line_ctx);
                         self.span_base = body_start;
                         self.line_base = count_lines(&self.source, body_start as usize);
+                        self.line_ctx = self.line_base;
                         self.compile_commands(&commands);
                         self.span_base = saved.0;
                         self.line_base = saved.1;
+                        self.line_ctx = saved.2;
                     }
                     return;
                 }
@@ -1263,11 +1280,11 @@ impl crate::expr_compile::ExprSink for Compiler {
         let Ok(commands) = crate::parse(script) else {
             return false;
         };
-        let saved = self.span_base;
+        let saved = (self.span_base, self.line_base, self.line_ctx);
         self.span_base = abs_start;
-        // line_base is inherited unchanged — same rule as whole-word
-        // brackets: the tree-walk's nested eval runs with the enclosing
-        // offset still installed.
+        if self.locals_mode && !self.toplevel_slots {
+            self.line_base = count_lines(&self.source, abs_start as usize);
+        }
         self.bytecode.emit(OpCode::ExprMark, line);
         if commands.is_empty() {
             self.bytecode.emit(OpCode::PushEmpty, line);
@@ -1275,7 +1292,9 @@ impl crate::expr_compile::ExprSink for Compiler {
             self.compile_commands(&commands);
         }
         self.bytecode.emit(OpCode::SubEnd, line);
-        self.span_base = saved;
+        self.span_base = saved.0;
+        self.line_base = saved.1;
+        self.line_ctx = saved.2;
         true
     }
 }

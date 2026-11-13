@@ -6,7 +6,9 @@ license = "BSD-2-Clause"
 description = "rtcl dynmod 侧模块：Spencer 正则引擎全集（wasm32-unknown-unknown cdylib）"
 
 [lib]
-crate-type = ["cdylib"]
+# cdylib = wasm 侧模块产物；rlib = 宿主集成测试（tests/about_align.rs
+# 快照护栏）可链接，wasm 构建不受影响。
+crate-type = ["cdylib", "rlib"]
 
 # 独立编译（wasm32 侧模块，不入 rtcl workspace；dynmod-side 同款）。
 [workspace]

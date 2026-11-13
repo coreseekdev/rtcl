@@ -567,7 +567,7 @@ which 探测，勿用 info commands）。
 > selection clear/own、wm protocol 查询、menu clone/postcascade、
 > treeview 15 子命令、text wrap 显示行模型、photo 像素引擎等）。
 
-### 10.1 语义域剩余（specs/DIVERGENCES.md，49 例需对齐 + 15 例 -f 设计差异）
+### 10.1 语义域剩余（specs/DIVERGENCES.md，33 例需对齐 + 15 例 -f 设计差异）
 
 按根因分组（详细探针名见 DIVERGENCES.md 2026-11-03/11-08 节）：
 1. **errorInfo/errorstack/return 帧**（~9）：内联体帧（if/while/for）、
@@ -575,18 +575,22 @@ which 探测，勿用 info commands）。
    涉及 rtcl 编译体的帧模型，最深的一组。
 2. **IO/通道**（~13）：通道编号/复用、read 计数、fblocked 元数、
    chan copy 方向、socket、eofchar。
-3. **哈希/迭代序 + 命令面**（~11）：Tcl 自研哈希插入序 vs rtcl 排序/
-   随机哈希；缺 `::tcl::prefix`、`::tcl::pkgconfig`；info commands
-   计数不同（rtcl 是 jimtcl 超集）。
-4. **OO 可见性面**（~10）：namespace children 序、方法可见性细节、
+3. **OO 可见性面**（~10）：namespace children 序、方法可见性细节、
    methodtype。
-5. **Unicode UCS-2**（~5）：`string length/index` 对增补平面按码元计 2
-   （Tcl 8.6 是 UCS-2 非 UTF-8）、`\U` 代理对、部分 `[[:class:]]`。
-6. **dict 残差**（~6）：`dict info`（hash internals 不可复现）、
+4. **dict 残差**（~6）：`dict info`（hash internals 不可复现）、
    `dict getdef`（rtcl 多出的 8.7 特性）。
-7. 其余小尾巴：expr 词法（nan()/inf()）、representation 文案、
+5. 其余小尾巴：expr 词法（nan()/inf()）、representation 文案、
    disassemble/assemble 面、trace 时机、`interp alias {}` 创建形式
    （D-1，唯一 OPEN 语义分歧，严重度低）。
+
+已收口/移出（原七组清单）：
+- **哈希/迭代序 + 命令面**（原组 3，~11）——**2026-11-12 第二轮收口**
+  （§10bis / d7cc38e：Tcl 自研哈希表插入序重放落地、info commands/
+  array names 全序一致、mathop 23 算子、命令面补齐；order.probes
+  48/48 护栏）。
+- **Unicode UCS-2**（原组 5，~5）——经定调归**设计差异**：`string
+  length/index` 对增补平面按码元计 2 等走 feature/选项开关（rtcl 的
+  UTF-8 内部形态是刻意选择），移入设计差异注记，不再列入对齐清单。
 
 ### 10.2 性能需提升的（bench/BASELINE.md）
 
@@ -610,7 +614,7 @@ var_incr/proc_fib 0.6-1.0x。剩余开销点（深水区，逐项 <2% 需组合�
 5. **vars 指针稳定存储**（残差 ~1.2× 目标）：VarMap newtype +
    链接变量 `*const Value` 缓存（traced 走原路径）——方案存档
    BASELINE G9f 节。
-6. JIT 已转主线（master `6db3724`）：剩余 = M1'（ABI v2 + Int 快车
+6. JIT 已转主线（master 现位 `99f30fc`）：剩余 = M1'（ABI v2 + Int 快车
    道）+ fuel/epoch imported globals（`docs/JIT-WASM-GC.md` §3）。
 
 ### 10.3 原生 Tk 需 nsh/fork 渲染侧的九项（详见 TODO.md 新节）

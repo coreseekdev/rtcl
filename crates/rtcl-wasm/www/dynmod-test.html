@@ -1,4 +1,12 @@
 <!DOCTYPE html>
+<!--
+  跑法（页头注释）：cd crates/rtcl-wasm && python3 -m http.server 8932
+  → http://127.0.0.1:8932/www/dynmod-test.html
+  本页 = write-behind 内存 fs 形态（set_fs 注入 makeMemoryFs），
+  不需要 COOP/COEP 隔离头；OPFS/SAB 严格 durable 形态见
+  fs-opfs-test.html（8933 隔离服务器）。注意 python http.server 为
+  单线程，自动化验证请用 ThreadingHTTPServer（并发 wasm 传输会挂请求）。
+-->
 <html lang="zh">
 <head>
 <meta charset="utf-8">
@@ -31,7 +39,8 @@
 <body>
 <h1>rtcl dynmod 真机 smoke — wasm load/unload 扩展模块</h1>
 <div class="sub">宿主预实例化侧 wasm → register_module → Tcl load/分派/unload 全链路。
-  另附协程 / mathop / 哈希序平台抽查。</div>
+  另附 v2 参数协议数据保真区（ABI-V2.md）与 spencermod（native 同源引擎）
+  展示区、协程 / mathop / 哈希序平台抽查。</div>
 
 <div id="bar">
   <span class="chip">rtcl: <b id="st-rtcl">…</b></span>
@@ -51,6 +60,9 @@
 <script type="module">
 import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
 import { makeJsonMod } from './jsonmod.js';
+// spencermod 装载胶水与 rtcl-worker.js 共用（单一注册源）——本页
+// handle 只 register 一次，勿重复注册。
+import { setupSpencerMod } from './spencermod.js';
 
 const SIDE_WASM_URL = './myext.wasm';
 
@@ -245,7 +257,7 @@ const CASES = [
     want: '1' },
   { name: 'T4 info commands myext::* 列出安装的命令',
     script: 'join [lsort [info commands myext::*]] ,',
-    want: '::myext::add,::myext::version' },
+    want: '::myext::add,::myext::argc,::myext::echo,::myext::version' },
   { name: 'T5 load 幂等（重复 load 为 no-op）',
     script: 'load myext; load myext; myext::add 1 2',
     want: '3' },
@@ -258,6 +270,35 @@ const CASES = [
   { name: 'T8 注册表仍在 → 重新 load 可用（用例尾 unload）',
     script: 'load myext; myext::add 40 2; unload myext',
     want: '' },
+  // ── v2 参数协议数据保真（www/ABI-V2.md；wasm 面 echo 类导出）────
+  // argc = "到达词数" oracle（v1 join 协议的拆词/丢界在此即刻现形），
+  // echo = 内容字节保真（UTF-8 往返侧模块线性内存）。
+  { name: 'V1 空白词整词到达（{*}$args 元素感知）',
+    script: 'load myext; myext::argc "a b  c"',
+    want: '1' },
+  { name: 'V2 \\u0001 字面整词到达（v1 join 协议的丢界解除）',
+    script: 'load myext; set s "a[format %c 1]b"; myext::argc $s',
+    want: '1' },
+  { name: 'V3 空串作为参数逐词到达（4 词各就各位）',
+    script: 'load myext; myext::argc "" x "" "y z"',
+    want: '4' },
+  { name: 'V4 全 Unicode 词内容保真',
+    script: 'load myext; myext::echo "héllo 🈁 ⟨中文⟩"',
+    want: 'héllo 🈁 ⟨中文⟩' },
+  { name: 'V5 \\u0001 与空白混合词内容保真（用例尾 unload）',
+    script: 'load myext; set s "a[format %c 1]b  c"; set r [myext::echo $s]; unload myext; set r',
+    want: 'a\u0001b  c' },
+  // ── spencermod 展示区（native 同源 Spencer 引擎；与 fs-opfs-test
+  //    SP 区同引擎，wrapper 经共用 setupSpencerMod 装载，勿重复注册）
+  { name: 'SP1 回引（native 同源引擎）',
+    script: 'regexp {(a+)\\1} aaaa',
+    want: '1' },
+  { name: 'SP2 前瞻（JS 子集缺失项）',
+    script: 'regexp {a(?=b)} ab',
+    want: '1' },
+  { name: 'SP3 -expanded（空白/注释忽略）',
+    script: 'regexp -expanded {a b\n c} abc',
+    want: '1' },
   // ── 平台抽查（协程 / mathop / 哈希序 / info commands 计数）────
   { id: 'T9', name: 'T9 unload 后命令计数回落到初始值（wasm 面，无 socket）',
     script: 'llength [info commands]',
@@ -385,10 +426,64 @@ async function main() {
     const ex = instance.exports;
     logln(`[side] exports: ${Object.keys(ex).join(', ')}`);
     // 数值 ABI → 字符串包装（裸 wasm 的 i64 参数/返回是 BigInt）。
-    // v2 的字符串/字节载荷走 rtcl_alloc/rtcl_free 缓冲区交接。
+    // v2 的字符串/字节载荷走 envelope 记录表 + 静态缓冲区交接
+    // （alloc 写入 → argc/echo_words 调用 → res_ptr/res_len 读出）。
+    const enc = new TextEncoder();
+    const dec = new TextDecoder();
+    const packWords = (words) => {
+      const parts = words.map((w) => enc.encode(String(w)));
+      let total = 4;
+      for (const p of parts) total += 4 + p.length;
+      const b = new Uint8Array(total);
+      const dv = new DataView(b.buffer);
+      dv.setUint32(0, parts.length, true);
+      let o = 4;
+      for (const p of parts) {
+        dv.setUint32(o, p.length, true);
+        b.set(p, o + 4);
+        o += 4 + p.length;
+      }
+      return b;
+    };
+    const callMyext = (fn, inBuf) => {
+      const ip = ex.alloc(inBuf.length);
+      new Uint8Array(ex.memory.buffer, ip, inBuf.length).set(inBuf);
+      const rc = fn(ip, inBuf.length);
+      const rp = ex.res_ptr();
+      const rl = ex.res_len();
+      return { rc, out: new Uint8Array(ex.memory.buffer, rp, rl) };
+    };
+    const unpackRecords = (u8) => {
+      const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+      const n = dv.getUint32(0, true);
+      const out = [];
+      let o = 4;
+      for (let i = 0; i < n; i++) {
+        const l = dv.getUint32(o, true);
+        o += 4;
+        out.push(dec.decode(new Uint8Array(u8.buffer, u8.byteOffset + o, l)));
+        o += l;
+      }
+      return out;
+    };
     exportsObj = {
       add:     (a, b) => Number(ex.add(BigInt(Math.trunc(Number(a))), BigInt(Math.trunc(Number(b))))),
       version: ()     => ex.version(),
+      // v2 数据保真面：argc 报"到达词数"（拆词/丢界即刻现形），
+      // echo 单词回显（逐词比对原词后返回内容）。
+      argc: (...words) => callMyext(ex.argc, packWords(words)).rc,
+      echo: (...words) => {
+        const { rc, out } = callMyext(ex.echo_words, packWords(words));
+        if (rc !== 0) throw new Error('echo_words 失败 rc=' + rc);
+        const recs = unpackRecords(out);
+        if (recs.length !== words.length) {
+          throw new Error('echo 词数不守恒: 发 ' + words.length + ' 回 ' + recs.length);
+        }
+        for (let i = 0; i < recs.length; i++) {
+          if (recs[i] !== words[i]) throw new Error('echo 内容失真 @' + i);
+        }
+        return recs[0];
+      },
     };
     stSide.textContent = `ok (add(2,3)=${Number(ex.add(2n,3n))})`;
   } catch (e) {
@@ -397,6 +492,19 @@ async function main() {
     banner.textContent = '侧模块 myext.wasm 加载失败：' + e;
     return;
   }
+
+  // spencermod：Spencer 全集侧模块（native 同源引擎）——与 worker 同一
+  // 装载胶水，register + load + wrapper 安装。装载在命令计数基线之前
+  //（T9 的"卸载后回落"以此为准）。
+  let spencerOk = false;
+  try {
+    spencerOk = await setupSpencerMod(handle);
+  } catch (e) {
+    logln('[spencermod] ERR: ' + e);
+  }
+  logln('[spencermod] ' + (spencerOk
+    ? 'loaded（native 同源引擎，::regexp/::regsub wrapper 就绪）'
+    : 'unavailable（SP 区用例将失败）'));
 
   const initialCount = handle.exec('llength [info commands]');
   logln(`[rtcl] 初始命令计数（wasm 面）= ${initialCount}`);

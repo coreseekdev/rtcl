@@ -4,8 +4,9 @@
 //   1. JS 宿主先把侧 wasm 模块实例化好（WebAssembly.instantiate 是异步的，
 //      而 Tcl 的 load 是同步命令——所以走"宿主预实例化 + 注册表挂线"）。
 //   2. `rtclHandle.register_module(name, exports)` 把 exports 的函数值属性
-//      声明为模块命令面；Tcl `load name` 生成 `::name::<fn>` 包装命令，
-//      参数以字符串到达，返回值经 JS String() 回来。
+//      声明为模块命令面；Tcl `load name` 生成 `::name::<fn>` 包装命令
+//      （v2 协议：体 `{*}$args` 逐词直传，www/ABI-V2.md），参数以
+//      字符串逐词到达（JS fn 用 rest 参数），返回值经 JS String() 回来。
 //   3. `unload name` 解除包装；`rtclHandle.unregister_module(name)` 连内部
 //      回调一起释放（实例引用由宿主丢弃 → GC）。
 //
@@ -21,8 +22,10 @@ export async function installDynmod(rtclHandle, moduleUrl) {
 
   // ② 侧模块的导出函数多数是数值 ABI；包装成"字符串进、字符串出"的
   //    JS 函数后交给 rtcl。数字结果 toString 即为 Tcl 值；更复杂的
-  //    载荷（字符串/字节）由该胶水层负责（通过侧模块导出的
-  //    rtcl_alloc/rtcl_free 做缓冲区交接——v1 先展示数值面）。
+  //    载荷（字符串/字节）由该胶水层负责：envelope 记录表
+  //    （u32 计数 + (u32 len + bytes)*n）经侧模块 alloc 静态区交接
+  //    ——spencermod 的 exec/about 与 dynmod-side 的 argc/echo_words
+  //    同形（v2 逐词协议下每个调用实参 = 一条记录）。
   const exportsObj = {
     add: (a, b) => ex.add(Number(a), Number(b)),
     version: () => ex.version(),

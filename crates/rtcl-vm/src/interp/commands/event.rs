@@ -458,6 +458,14 @@ fn process_events(
     let now = now_ms(interp);
     let mut fired = 0;
 
+    // 后台 `chan copy -command` 泵送（tclsh：update/vwait 驱动
+    // TclCopyChannel；通道事件非 idle 事件——update idletasks 不泵）。
+    // 文件类拷贝单次泵内排空、回调收累计总数；回调错误走 stderr
+    // 转储（tclsh bgerror）并终止任务。
+    if !idle_only {
+        fired += crate::interp::commands::chan_io::pump_chan_copies(interp, errors.as_deref_mut());
+    }
+
     // Collect indices of ready events (fire in order of scheduling)
     loop {
         // Find the next ready event

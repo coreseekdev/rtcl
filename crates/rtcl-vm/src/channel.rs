@@ -460,6 +460,122 @@ pub(crate) fn channel_read_all_cfg(
     Ok(out)
 }
 
+/// 读**翻译后的原始字节**（tclsh chan copy 同编码字节快路：EOL 翻译在
+/// 编码之下生效——CRLF→LF 照做——但编码不解、输出侧翻译/编码不套，
+/// 字节直通）。上限 `max` 字节；eofchar 在字节层检查（命中即置 EOF）。
+///
+/// 流水线状态衔接：先清 `read_chars`（此前字符路径的已解码积压——按
+/// 同编码回编成字节），再清 `read_bytes`（解码前残字），然后直读。
+/// 已知边界：CR 后紧跟非 ASCII 字节时回推字节以 char 暂存，跨管线
+/// 续读的重建在此不保真（tclsh 的翻译在编码下无此缝）。
+pub(crate) fn channel_read_translated_bytes_cfg(
+    ch: &mut dyn Channel,
+    cfg: &mut ChannelConfig,
+    max: usize,
+) -> io::Result<Vec<u8>> {
+    if max == 0 || ch.eof() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<u8> = Vec::new();
+    // 1) 字符管线积压：按同编码回编（utf-8 é→c3a9 / latin1 é→e9）。
+    if !cfg.read_chars.is_empty() {
+        let s: String = cfg.read_chars.drain(..).collect();
+        let enc = cfg.encoding.clone();
+        let bytes = crate::encoding::encode_cont(&s, &enc, !cfg.enc_started);
+        cfg.enc_started = true;
+        out.extend_from_slice(&bytes[..bytes.len().min(max.saturating_sub(out.len()))]);
+        if out.len() >= max {
+            return Ok(out);
+        }
+    }
+    // 2) 翻译回推/解码残字 + 新读字节，按字节层 EOL 翻译。
+    let mode = cfg.translation_in;
+    let eofc = cfg.eofchar_in;
+    let mut pending: VecDeque<char> = std::mem::take(&mut cfg.read_pending);
+    let mut raw: VecDeque<u8> = cfg.read_bytes.drain(..).collect();
+    loop {
+        if out.len() >= max {
+            break;
+        }
+        // 取下一原始字节（回推优先，再解码残字，再 OS 读）。
+        let next = if let Some(c) = pending.pop_front() {
+            if (c as u32) < 0x80 {
+                Some(c as u8)
+            } else {
+                // 非 ASCII 的 char 积压（字符路径推回的解码字符）：
+                // 按当前编码出字节，多字节拆放回 raw 队列。
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                let bs = s.as_bytes().to_vec();
+                let first = bs[0];
+                for b in bs.into_iter().rev() {
+                    raw.push_front(b);
+                }
+                Some(first)
+            }
+        } else if let Some(b) = raw.pop_front() {
+            Some(b)
+        } else {
+            let mut buf = [0u8; 1];
+            let n = ch.read_bytes(&mut buf)?;
+            if n == 0 {
+                ch.set_at_eof();
+                None
+            } else {
+                Some(buf[0])
+            }
+        };
+        let Some(b) = next else { break };
+        if Some(b as char) == eofc {
+            // eofchar 字节吞掉、不进内容，EOF 置位。
+            ch.set_at_eof();
+            break;
+        }
+        match mode {
+            TranslationMode::Lf => out.push(b),
+            TranslationMode::Cr => out.push(if b == b'\r' { b'\n' } else { b }),
+            TranslationMode::Auto | TranslationMode::CrLf => {
+                if b != b'\r' {
+                    out.push(b);
+                    continue;
+                }
+                // CR 前瞻：下一字节 \n → 归一（crlf 保 \r\n）。
+                let nxt = pending.pop_front().map(|c| c as u32).filter(|v| *v < 0x80).map(|v| v as u8).or_else(|| raw.pop_front()).or_else(|| {
+                    let mut buf = [0u8; 1];
+                    let n = ch.read_bytes(&mut buf).ok()?;
+                    if n == 0 { None } else { Some(buf[0]) }
+                });
+                match nxt {
+                    Some(b'\n') => {
+                        // 输入侧 CRLF（与孤立 CR）一律归一为 \n（Auto 与
+                        // CrLf 同；crlf 输出侧的展开是写路径的事）。
+                        out.push(b'\n');
+                    }
+                    Some(other) => {
+                        out.push(if mode == TranslationMode::CrLf { b'\r' } else { b'\n' });
+                        if (other as u32) < 0x80 {
+                            if other == eofc.map(|c| c as u8).unwrap_or(0) {
+                                ch.set_at_eof();
+                                break;
+                            }
+                            out.push(other);
+                        } else {
+                            raw.push_front(other);
+                        }
+                    }
+                    None => {
+                        out.push(if mode == TranslationMode::CrLf { b'\r' } else { b'\n' });
+                    }
+                }
+            }
+        }
+    }
+    // 剩余状态放回 cfg（跨调用续读）。
+    cfg.read_pending = pending;
+    cfg.read_bytes = raw.into_iter().collect();
+    Ok(out)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 //  Channel configuration (fconfigure)
 // ═══════════════════════════════════════════════════════════════════════

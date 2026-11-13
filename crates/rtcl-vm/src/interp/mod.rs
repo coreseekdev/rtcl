@@ -903,6 +903,10 @@ pub struct Interp {
     /// Next event ID counter for `after` scheduling.
     #[cfg(feature = "std")]
     pub(crate) next_event_id: u64,
+    /// 后台 `chan copy -command` 任务（tclsh TclCopyChannel 模型）：
+    /// 调度即挂起、事件循环（update/vwait）泵送、回调收累计数。
+    #[cfg(feature = "std")]
+    pub(crate) copy_jobs: Vec<commands::chan_io::ChanCopyJob>,
     /// Child interpreter table for `interp` command.
     #[cfg(feature = "std")]
     pub(crate) child_interps: HashMap<String, Box<Interp>>,
@@ -1082,6 +1086,7 @@ impl Interp {
             xtrace_callback: String::new(),
             #[cfg(feature = "std")]
             event_queue: Vec::new(),
+            copy_jobs: Vec::new(),
             #[cfg(feature = "std")]
             next_event_id: 1,
             #[cfg(feature = "std")]

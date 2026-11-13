@@ -137,6 +137,8 @@ pub fn cmd_close(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if !interp.channels.contains(id) {
         return Err(chan_not_found(interp, id));
     }
+    // tclsh：close 中止涉及该通道的后台拷贝（静默——无回调、无错误）。
+    cancel_copy_jobs(interp, id);
     close_reflected(interp, id)?;
     interp.channels.close(id).map_err(io_err)?;
     Ok(Value::empty())
@@ -216,11 +218,18 @@ pub fn cmd_read(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
-    let (ch, cfg) = interp.channels.channel_ctx_mut(chan_id).unwrap();
-
-    if !ch.is_readable() {
+    if !interp
+        .channels
+        .get(chan_id)
+        .map(|ch| ch.is_readable())
+        .unwrap_or(false)
+    {
         return Err(not_opened(interp, chan_id, true));
     }
+    if has_copy_job(interp, chan_id) {
+        return Err(copy_busy_error(interp, chan_id, true));
+    }
+    let (ch, cfg) = interp.channels.channel_ctx_mut(chan_id).unwrap();
 
     if let Some(count) = count {
         let s = crate::channel::channel_read_chars_cfg(ch, cfg, count as usize)
@@ -274,11 +283,18 @@ pub fn cmd_gets(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
-    let (ch, cfg) = interp.channels.channel_ctx_mut(chan_id).unwrap();
-
-    if !ch.is_readable() {
+    if !interp
+        .channels
+        .get(chan_id)
+        .map(|ch| ch.is_readable())
+        .unwrap_or(false)
+    {
         return Err(not_opened(interp, chan_id, true));
     }
+    if has_copy_job(interp, chan_id) {
+        return Err(copy_busy_error(interp, chan_id, true));
+    }
+    let (ch, cfg) = interp.channels.channel_ctx_mut(chan_id).unwrap();
 
     let line = crate::channel::channel_read_line_cfg(ch, cfg).map_err(io_err)?;
     finish_gets(interp, args, line.as_deref())
@@ -341,6 +357,14 @@ pub fn cmd_seek(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if !interp.channels.contains(chan_id) {
         return Err(chan_not_found(interp, chan_id));
     }
+    if has_copy_job(interp, chan_id) {
+        // tclsh：后台拷贝期间 seek → file busy（EC POSIX EBUSY）。
+        super::list::set_error_code(interp, "POSIX EBUSY {file busy}");
+        return Err(Error::runtime(
+            format!("error during seek on \"{}\": file busy", chan_id),
+            crate::error::ErrorCode::Io,
+        ));
+    }
     let ch = interp.channels.get_mut(chan_id).unwrap();
     if negative_start {
         // TclSeek: a negative offset from "start" is EINVAL。
@@ -366,6 +390,10 @@ pub fn cmd_tell(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let chan_id = args[1].as_str();
     if !interp.channels.contains(chan_id) {
         return Err(chan_not_found(interp, chan_id));
+    }
+    if has_copy_job(interp, chan_id) {
+        // tclsh：后台拷贝期间 tell 返回 -1（不抛错）。
+        return Ok(Value::from_int(-1));
     }
     let ch = interp.channels.get_mut(chan_id).unwrap();
     // tclsh：不可 seek 的通道 tell 返回 -1（Tcl_Tell 失败不抛错）——
@@ -600,6 +628,12 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(Error::wrong_args_with_usage(
             "fconfigure", 2, args.len(),
             "channelId ?-option value ...?",
+        ));
+    }
+    if args.len() > 3 && has_copy_job(interp, chan_id) {
+        // tclsh：后台拷贝期间禁止设置通道选项（查询不受限）。
+        return Err(super::list::tcl_err(
+            "unable to set channel options: background copy in progress".to_string(),
         ));
     }
 
@@ -837,6 +871,23 @@ pub struct ChannelTransform {
     pub handle: String,
     /// Methods the handler advertised (canonical names).
     pub methods: Vec<String>,
+}
+
+/// 后台 `chan copy -command` 任务（tclsh TclCopyChannel）。调度时挂起，
+/// `update`/`vwait` 泵送；回调收**累计**计数（同编码按字节、跨编码按
+/// 字符——与同步返回值同单位）。泵送期间两端 busy。
+#[derive(Debug, Clone)]
+pub(crate) struct ChanCopyJob {
+    pub from: String,
+    pub to: String,
+    /// `-size` 原值（负数 = 无限）。
+    pub size: Option<i64>,
+    /// 计数单位：true = 字节（同编码），false = 字符（跨编码）。
+    pub count_bytes: bool,
+    /// 回调命令前缀（按列表词拆好）。
+    pub callback: Vec<String>,
+    /// 已拷贝的累计单位数。
+    pub copied: i64,
 }
 
 /// Build a script string that invokes `prefix` with `args`, quoting each
@@ -1568,6 +1619,13 @@ fn chan_copy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if !interp.channels.get(&to).map(|ch| ch.is_writable()).unwrap_or(false) {
         return Err(not_opened(interp, &to, false));
     }
+    // 任一端被后台拷贝占用 → busy（读端形优先）。
+    if has_copy_job(interp, &from) {
+        return Err(copy_busy_error(interp, &from, true));
+    }
+    if has_copy_job(interp, &to) {
+        return Err(copy_busy_error(interp, &to, false));
+    }
     // tclsh validates the two channel words before looking at options:
     // `chan copy -size 2 a b` blames channel "-size", and a direction error
     // wins over a malformed -size value.
@@ -1623,76 +1681,275 @@ fn chan_copy(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // A negative -size means "no limit" in tclsh.
     let limit = size.filter(|s| *s >= 0);
 
+    let src_enc = interp
+        .channels
+        .config(&from)
+        .map(|c| c.encoding.clone())
+        .unwrap_or_else(|| "utf-8".to_string());
+    let dst_enc = interp
+        .channels
+        .config(&to)
+        .map(|c| c.encoding.clone())
+        .unwrap_or_else(|| "utf-8".to_string());
+    let same_enc = src_enc == dst_enc;
+
+    // `-command` 形 = 后台拷贝：调度即挂起（tclsh 调度时无可见副作用：
+    // eof=0、fblocked=0、目标 0 字节、无回调），由 `update`/`vwait` 泵
+    // 送；两端 busy（read/gets/puts/seek 报 file busy、fconfigure 设置
+    // 报 background copy in progress、tell 归 -1、close 静默中止）。
+    if let Some(cb) = command {
+        let words: Vec<String> = match Value::from_str(cb.as_str()).as_list_strict() {
+            Ok(ws) if !ws.is_empty() => ws.iter().map(|w| w.as_str().to_string()).collect(),
+            _ => vec![cb.as_str().to_string()],
+        };
+        interp.copy_jobs.push(ChanCopyJob {
+            from: from.clone(),
+            to: to.clone(),
+            size,
+            count_bytes: same_enc,
+            callback: words,
+            copied: 0,
+        });
+        return Ok(Value::empty());
+    }
+
     let mut copied: i64 = 0;
-    loop {
-        let want = limit.map(|s| (s - copied).clamp(0, 4096) as usize).unwrap_or(4096);
-        if want == 0 {
-            break;
-        }
-        let chunk = {
-            let (ch, cfg) = interp.channels.channel_ctx_mut(&from).unwrap();
-            crate::channel::channel_read_chars_cfg(ch, cfg, want)
-        };
-        let chunk = match chunk {
-            Ok(c) if c.is_empty() => break,
-            Ok(c) => c,
-            Err(e) => {
-                return Err(Error::runtime(
-                    format!("error reading \"{}\": {}", from, e),
-                    crate::error::ErrorCode::Io,
-                ))
+    if same_enc {
+        // tclsh 的**字节快路**：-size 按字节限制（可切在多字节序列中间，
+        // cut1：utf-8 "héllo" -size 2 → "h\xc3"）、返回字节计；输入侧
+        // EOL 翻译照做，输出侧翻译/编码不套（crlf 目的地也不展开）。
+        loop {
+            let want = limit.map(|s| (s - copied).clamp(0, 4096) as usize).unwrap_or(4096);
+            if want == 0 {
+                break;
             }
-        };
-        // tclsh 的 chan copy 返回值：源/目的编码相同时按**字节**计数
-        // （同编码字节直通快路），否则按**字符**计数（msize 实测）。
-        let chars = chunk.chars().count() as i64;
-        let src_enc = interp
-            .channels
-            .config(&from)
-            .map(|c| c.encoding.clone())
-            .unwrap_or_else(|| "utf-8".to_string());
-        let dst_enc = interp
-            .channels
-            .config(&to)
-            .map(|c| c.encoding.clone())
-            .unwrap_or_else(|| "utf-8".to_string());
-        let same_enc = src_enc == dst_enc;
-        // binary 源读到的是字节串对象：写真实编码通道时 tclsh 用它的
-        // **字符串表示**（把字节按 UTF-8 解码）——c3 a9 → é →
-        // utf-8 c3a9 / iso8859-1 e9，而不是逐字节 0xC3 0xA9。
-        let chunk = if src_enc == "binary" && dst_enc != "binary" {
-            let raw: Vec<u8> = chunk.chars().map(|c| (c as u32 & 0xFF) as u8).collect();
-            crate::encoding::decode(&raw, "utf-8")
-        } else {
-            chunk
-        };
-        let written = {
-            let (ch, cfg) = interp.channels.channel_ctx_mut(&to).unwrap();
-            // 目标 binary + 源为真实编码：写 UTF-8 内部字节（tclsh
-            // Tcl_WriteObj 的字节串/字符串差异；puts 不适用）。
-            let write_res = if cfg.encoding == "binary" && src_enc != "binary" {
-                crate::channel::channel_write_str_utf8_cfg(ch, cfg, &chunk)
-            } else {
-                crate::channel::channel_write_str_cfg(ch, cfg, &chunk)
+            let bytes = {
+                let (ch, cfg) = interp.channels.channel_ctx_mut(&from).unwrap();
+                crate::channel::channel_read_translated_bytes_cfg(ch, cfg, want)
             };
-            let n = match write_res {
-                Ok(n) => n,
+            let bytes = match bytes {
+                Ok(b) if b.is_empty() => break,
+                Ok(b) => b,
                 Err(e) => {
                     return Err(Error::runtime(
-                        format!("error writing \"{}\": {}", to, e),
+                        format!("error reading \"{}\": {}", from, e),
                         crate::error::ErrorCode::Io,
                     ))
                 }
             };
-            let _ = ch.flush();
-            n
-        };
-        copied += if same_enc { written as i64 } else { chars };
-    }
-    if command.is_some() {
-        return Ok(Value::empty());
+            let written = {
+                let (ch, _cfg) = interp.channels.channel_ctx_mut(&to).unwrap();
+                match ch.write_bytes(&bytes) {
+                    Ok(n) => {
+                        let _ = ch.flush();
+                        n
+                    }
+                    Err(e) => {
+                        return Err(Error::runtime(
+                            format!("error writing \"{}\": {}", to, e),
+                            crate::error::ErrorCode::Io,
+                        ))
+                    }
+                }
+            };
+            copied += written as i64;
+        }
+    } else {
+        // 字符路径（跨编码）：-size/返回值按字符计；binary 源读到的是
+        // 字节串对象：写真实编码通道时 tclsh 用它的**字符串表示**（把
+        // 字节按 UTF-8 解码）——c3 a9 → é → utf-8 c3a9 / iso8859-1 e9。
+        loop {
+            let want = limit.map(|s| (s - copied).clamp(0, 4096) as usize).unwrap_or(4096);
+            if want == 0 {
+                break;
+            }
+            let chunk = {
+                let (ch, cfg) = interp.channels.channel_ctx_mut(&from).unwrap();
+                crate::channel::channel_read_chars_cfg(ch, cfg, want)
+            };
+            let chunk = match chunk {
+                Ok(c) if c.is_empty() => break,
+                Ok(c) => c,
+                Err(e) => {
+                    return Err(Error::runtime(
+                        format!("error reading \"{}\": {}", from, e),
+                        crate::error::ErrorCode::Io,
+                    ))
+                }
+            };
+            let chars = chunk.chars().count() as i64;
+            let chunk = if src_enc == "binary" && dst_enc != "binary" {
+                let raw: Vec<u8> = chunk.chars().map(|c| (c as u32 & 0xFF) as u8).collect();
+                crate::encoding::decode(&raw, "utf-8")
+            } else {
+                chunk
+            };
+            let written = {
+                let (ch, cfg) = interp.channels.channel_ctx_mut(&to).unwrap();
+                // 目标 binary + 源为真实编码：写 UTF-8 内部字节（tclsh
+                // Tcl_WriteObj 的字节串/字符串差异；puts 不适用）。
+                let write_res = if cfg.encoding == "binary" && src_enc != "binary" {
+                    crate::channel::channel_write_str_utf8_cfg(ch, cfg, &chunk)
+                } else {
+                    crate::channel::channel_write_str_cfg(ch, cfg, &chunk)
+                };
+                let n = match write_res {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return Err(Error::runtime(
+                            format!("error writing \"{}\": {}", to, e),
+                            crate::error::ErrorCode::Io,
+                        ))
+                    }
+                };
+                let _ = ch.flush();
+                n
+            };
+            copied += if same_enc { written as i64 } else { chars };
+        }
     }
     Ok(Value::from_int(copied))
+}
+
+// ---------- 后台拷贝（chan copy -command） ----------
+
+/// 通道是否被后台拷贝占用（任一端）。
+pub(crate) fn has_copy_job(interp: &Interp, id: &str) -> bool {
+    interp.copy_jobs.iter().any(|j| j.from == id || j.to == id)
+}
+
+/// 撤掉涉及 `id` 的后台拷贝（close 静默中止：无回调、无错误）。
+pub(crate) fn cancel_copy_jobs(interp: &mut Interp, id: &str) {
+    interp.copy_jobs.retain(|j| j.from != id && j.to != id);
+}
+
+/// busy 错误形（read/gets/chan copy 的读端、puts/写端的写端）。
+pub(crate) fn copy_busy_error(interp: &mut Interp, id: &str, reading: bool) -> Error {
+    super::list::set_error_code(interp, "POSIX EBUSY {file busy}");
+    Error::runtime(
+        format!(
+            "{} \"{}\": file busy",
+            if reading { "error reading" } else { "error writing" },
+            id
+        ),
+        crate::error::ErrorCode::Io,
+    )
+}
+
+/// 泵送后台拷贝（LIFO——tclsh 三并发实测 C/B/A）。文件类通道一次泵
+/// 移完全部可移数据（tclsh 单次事件排空整个拷贝、单回调收累计总数）；
+/// 完成即回调并摘除任务。回调错误走后台错误转储（stderr 立即），
+/// 任务终止。通道已关 → 静默中止。
+pub(crate) fn pump_chan_copies(interp: &mut Interp, mut errors: Option<&mut Vec<String>>) -> usize {
+    let mut fired = 0;
+    while !interp.copy_jobs.is_empty() {
+        let mut job = interp.copy_jobs.pop().unwrap();
+        let outcome = run_copy_job(interp, &mut job);
+        match outcome {
+            Some(total) => {
+                fired += 1;
+                let invocation = handler_script(&job.callback, &[&total.to_string()]);
+                // 回调用**非隔离** eval（errorInfo 需累计到完整链），调用
+                // 方错误状态手动保存/恢复——等价 eval_isolated 的隔离语义。
+                let saved_info = interp.err_info.take();
+                let saved_fresh = std::mem::take(&mut interp.err_fresh);
+                let saved_subst = std::mem::take(&mut interp.err_from_subst);
+                let saved_pending = interp.err_pending_top.take();
+                if let Err(e) = interp.eval(&invocation) {
+                    // tclsh bgerror：errorInfo 全链 + 调用帧转储到 stderr。
+                    let info = interp
+                        .err_info
+                        .take()
+                        .unwrap_or_else(|| e.to_string());
+                    let mut dump = info;
+                    if !dump.contains("invoked from within") {
+                        dump.push_str(&format!(
+                            "\n    invoked from within\n\"{}\"",
+                            invocation
+                        ));
+                    }
+                    eprintln!("{}", dump);
+                    if let Some(sink) = errors.as_deref_mut() {
+                        sink.push(e.to_string());
+                    }
+                }
+                interp.err_info = saved_info;
+                interp.err_fresh = saved_fresh;
+                interp.err_from_subst = saved_subst;
+                interp.err_pending_top = saved_pending;
+            }
+            None => {
+                // 通道消失：静默中止，不回调。
+            }
+        }
+    }
+    fired
+}
+
+/// 推进一个后台拷贝任务到 EOF/-size 尽头。通道缺失返回 None（静默
+/// 中止）；读/写失败返回 Some(copied) 并终止任务（tclsh：拷贝结束）。
+fn run_copy_job(interp: &mut Interp, job: &mut ChanCopyJob) -> Option<i64> {
+    if !interp.channels.contains(&job.from) || !interp.channels.contains(&job.to) {
+        return None;
+    }
+    let limit = job.size.filter(|s| *s >= 0);
+    loop {
+        let want = limit
+            .map(|s| (s - job.copied).clamp(0, 4096) as usize)
+            .unwrap_or(4096);
+        if want == 0 {
+            return Some(job.copied);
+        }
+        if job.count_bytes {
+            let bytes = {
+                let (ch, cfg) = interp.channels.channel_ctx_mut(&job.from).unwrap();
+                crate::channel::channel_read_translated_bytes_cfg(ch, cfg, want)
+            };
+            match bytes {
+                Ok(b) if b.is_empty() => return Some(job.copied),
+                Ok(b) => {
+                    let (ch, _cfg) = interp.channels.channel_ctx_mut(&job.to).unwrap();
+                    if let Err(_e) = ch.write_bytes(&b) {
+                        return Some(job.copied);
+                    }
+                    let _ = interp.channels.get_mut(&job.to).unwrap().flush();
+                    job.copied += b.len() as i64;
+                }
+                Err(_) => return Some(job.copied),
+            }
+        } else {
+            let chunk = {
+                let (ch, cfg) = interp.channels.channel_ctx_mut(&job.from).unwrap();
+                crate::channel::channel_read_chars_cfg(ch, cfg, want)
+            };
+            match chunk {
+                Ok(c) if c.is_empty() => return Some(job.copied),
+                Ok(c) => {
+                    let src_enc = interp
+                        .channels
+                        .config(&job.from)
+                        .map(|x| x.encoding.clone())
+                        .unwrap_or_else(|| "utf-8".to_string());
+                    {
+                        let (ch, cfg) = interp.channels.channel_ctx_mut(&job.to).unwrap();
+                        // binary 目标 + 真实编码源：写 UTF-8 内部字节
+                        //（与同步路径同款 Tcl_WriteObj 形）。
+                        let res = if cfg.encoding == "binary" && src_enc != "binary" {
+                            crate::channel::channel_write_str_utf8_cfg(ch, cfg, &c)
+                        } else {
+                            crate::channel::channel_write_str_cfg(ch, cfg, &c)
+                        };
+                        if res.is_err() {
+                            return Some(job.copied);
+                        }
+                        let _ = ch.flush();
+                    }
+                    job.copied += c.chars().count() as i64;
+                }
+                Err(_) => return Some(job.copied),
+            }
+        }
+    }
 }
 
 /// `chan truncate channelId ?length?` — truncate a seekable channel.

@@ -190,14 +190,19 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let newline = if nonewline { String::new() } else { "\n".to_string() };
         let out = if newline.is_empty() { out } else { format!("{}{}", out, newline) };
 
+        if !interp.channels.get(chan_id).map(|ch| ch.is_writable()).unwrap_or(false) {
+            return Err(chan_io::not_opened(interp, chan_id, false));
+        }
+        if chan_io::has_copy_job(interp, chan_id) {
+            // tclsh：后台拷贝占用期间 puts → file busy（EC POSIX EBUSY）。
+            return Err(chan_io::copy_busy_error(interp, chan_id, false));
+        }
+
         let (ch, cfg) = interp.channels.channel_ctx_mut(chan_id)
             .ok_or_else(|| Error::runtime(
                 format!("can not find channel named \"{}\"", chan_id),
                 crate::error::ErrorCode::Io,
             ))?;
-        if !ch.is_writable() {
-            return Err(chan_io::not_opened(interp, chan_id, false));
-        }
 
         crate::channel::channel_write_str_cfg(ch, cfg, &out).map_err(|e| Error::runtime(
             format!("error writing \"{}\": {}", chan_id, e),

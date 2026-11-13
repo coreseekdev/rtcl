@@ -1083,7 +1083,16 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         None
                     };
                     match tec_override {
-                        Some(tec) => error_options_dict_with_ec(1, 0, tec, &error_info, opts_line, interp),
+                        Some(tec) => error_options_dict_with_ec(
+                            1,
+                            0,
+                            tec,
+                            &error_info,
+                            opts_line,
+                            interp,
+                            matches!(e, Error::InvalidCommand { .. })
+                                || matches!(e, Error::ControlFlow { error_code: Some(_), .. }),
+                        ),
                         None => error_options_dict(1, 0, &e, script, &error_info, opts_line, interp),
                     }
                 } else if e.is_return() {
@@ -1177,13 +1186,24 @@ fn error_options_dict(
     // 实测稳定）：error 命令 raise → code-level-es-ec-ei-el；invalid
     // command/一般 invokeStk 失败 → ec-code-level-es-ei-el；ARITH
     // （expr）→ code-level-ec-ei-el-es（errorstack 垫底）。
-    let order = match &interp.err_inner {
-        Some(b) if b.starts_with("returnImm") => 0,
-        // Parse failures: -code -level -errorcode -errorinfo -errorline
-        // -errorstack (tclsh TclEvalEx syntax completion).
-        _ if matches!(err, Error::Syntax { .. }) => 2,
-        _ if error_code.starts_with("ARITH") => 2,
-        _ => 1,
+    // 键序的根因模型（tclsh Tcl_GetReturnOptions + returnOpts 键位）：
+    // options 字典 = [用户 returnOpts 键位...] + 追加 -code/-level +
+    // -errorstack + (-errorcode/-errorinfo 原位更新) + -errorline。
+    // ec-first（序 1）当且仅当**return 式抬升带 -errorcode 载荷**——
+    // tclsh 的 invalid command 走 unknown proc 的
+    // `return -code error -errorcode {TCL LOOKUP COMMAND ...}`，载荷进
+    // returnOpts 键首位；`error msg info code` 与一般失败经
+    // Tcl_SetErrorCode（无 returnOpts）→ 序 0。
+    let order = if matches!(err, Error::InvalidCommand { .. })
+        || matches!(err, Error::ControlFlow { error_code: Some(_), .. })
+    {
+        1
+    // Parse failures: -code -level -errorcode -errorinfo -errorline
+    // -errorstack (tclsh TclEvalEx syntax completion).
+    } else if matches!(err, Error::Syntax { .. }) || error_code.starts_with("ARITH") {
+        2
+    } else {
+        0
     };
     let body = match order {
         0 => format!(
@@ -1218,6 +1238,8 @@ fn error_options_dict(
 }
 
 /// 同 [`error_options_dict`]，但 -errorcode 直接取抬升点解析值。
+/// `payload` = 错误对象是否带 return 式 -errorcode 载荷（键序判据，
+/// 见 [`error_options_dict`] 的注释）。
 fn error_options_dict_with_ec(
     code: i64,
     level: i64,
@@ -1225,12 +1247,15 @@ fn error_options_dict_with_ec(
     accumulated: &str,
     err_line: usize,
     interp: &Interp,
+    payload: bool,
 ) -> Value {
     let errorstack = interp.error_stack_render();
-    let order = match &interp.err_inner {
-        Some(b) if b.starts_with("returnImm") => 0,
-        _ if error_code.starts_with("ARITH") => 2,
-        _ => 1,
+    let order = if payload {
+        1
+    } else if error_code.starts_with("ARITH") {
+        2
+    } else {
+        0
     };
     let body = match order {
         0 => format!(
@@ -1320,7 +1345,11 @@ pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         value: Some(Value::from_str(&msg)),
         level: 1,
         error_info,
-        error_code,
+        // error 命令的 -errorcode 经 Tcl_SetErrorCode 落全局（上方
+        // set_var），**不带在错误对象上**——ControlFlow 的 error_code
+        // 载荷专属 return 式抬升（returnOpts 键位 → catch options 的
+        // ec-first 键序判据，见 error_options_dict）。
+        error_code: None,
     })
 }
 

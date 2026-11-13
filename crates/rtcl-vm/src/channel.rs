@@ -33,6 +33,8 @@ pub trait Channel: Send {
     fn seek(&mut self, whence: io::SeekFrom) -> io::Result<u64>;
     fn tell(&mut self) -> io::Result<u64>;
     fn eof(&self) -> bool;
+    /// 标记通道 EOF（`-eofchar` 命中——tclsh 的 eofchar 等价 EOF 位）。
+    fn set_at_eof(&mut self) {}
     fn close(self: Box<Self>) -> io::Result<()>;
     fn is_readable(&self) -> bool;
     fn is_writable(&self) -> bool;
@@ -664,14 +666,17 @@ impl Channel for TcpChannel {
         io::Write::flush(&mut self.stream)
     }
     fn seek(&mut self, _whence: io::SeekFrom) -> io::Result<u64> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "channel is not seekable"))
+        // tclsh：socket 通道驱动无 SeekProc，Tcl_Seek 报 EINVAL
+        //（区别于文件/管道的真实 lseek 失败 ESPIPE）。
+        Err(io::Error::from_raw_os_error(22))
     }
     fn tell(&mut self) -> io::Result<u64> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "channel is not seekable"))
+        Err(io::Error::from_raw_os_error(22))
     }
     fn eof(&self) -> bool {
         self.eof
     }
+    fn set_at_eof(&mut self) { self.eof = true; }
     fn close(self: Box<Self>) -> io::Result<()> {
         Ok(())
     }
@@ -981,6 +986,19 @@ impl ChannelTable {
 //  OS standard streams
 // ═══════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════
+//  stdio fd seek/tell — tclsh 的 seek/tell 直达 OS：重定向到文件、
+//  /dev/null 的 stdio 可 seek（lseek 成功）；管道/tty lseek 失败，
+//  seek 报 errno（ESPIPE），tell 返回 -1（不抛错，见 cmd_tell）。
+// ═══════════════════════════════════════════════════════════════════════
+
+/// 对 stdio fd 做真实 lseek（不接管所有权：ManuallyDrop 防关闭 fd）。
+fn std_fd_seek(fd: i32, whence: io::SeekFrom) -> io::Result<u64> {
+    use std::os::unix::io::FromRawFd;
+    let mut f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    f.seek(whence)
+}
+
 struct OsStdin {
     reader: BufReader<io::Stdin>,
     at_eof: bool,
@@ -1015,11 +1033,21 @@ impl Channel for OsStdin {
         Err(io::Error::new(io::ErrorKind::PermissionDenied, "channel \"stdin\" wasn't opened for writing"))
     }
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
-    fn seek(&mut self, _whence: io::SeekFrom) -> io::Result<u64> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "stdin is not seekable"))
+    fn seek(&mut self, whence: io::SeekFrom) -> io::Result<u64> {
+        // tclsh：seek 直达 OS。成功后弃预读缓冲并清 EOF 标志
+        //（Tcl_Seek 语义），失败把 errno 交上层（ESPIPE → invalid seek）。
+        let pos = std_fd_seek(0, whence)?;
+        self.reader = BufReader::new(io::stdin());
+        self.at_eof = false;
+        Ok(pos)
     }
-    fn tell(&mut self) -> io::Result<u64> { self.seek(io::SeekFrom::Current(0)) }
+    fn tell(&mut self) -> io::Result<u64> {
+        // 逻辑位 = fd 位 − BufReader 未消费缓冲。
+        let pos = std_fd_seek(0, io::SeekFrom::Current(0))?;
+        Ok(pos.saturating_sub(self.reader.buffer().len() as u64))
+    }
     fn eof(&self) -> bool { self.at_eof }
+    fn set_at_eof(&mut self) { self.at_eof = true; }
     fn close(self: Box<Self>) -> io::Result<()> { Ok(()) }
     fn is_readable(&self) -> bool { true }
     fn is_writable(&self) -> bool { false }
@@ -1042,10 +1070,14 @@ impl Channel for OsStdout {
         io::stdout().write(data)
     }
     fn flush(&mut self) -> io::Result<()> { io::stdout().flush() }
-    fn seek(&mut self, _whence: io::SeekFrom) -> io::Result<u64> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "stdout is not seekable"))
+    fn seek(&mut self, whence: io::SeekFrom) -> io::Result<u64> {
+        std_fd_seek(1, whence)
     }
-    fn tell(&mut self) -> io::Result<u64> { self.seek(io::SeekFrom::Current(0)) }
+    fn tell(&mut self) -> io::Result<u64> {
+        // LineWriter 可能持未落盘输出：先 flush 再探 fd 位。
+        io::stdout().flush()?;
+        std_fd_seek(1, io::SeekFrom::Current(0))
+    }
     fn eof(&self) -> bool { false }
     fn close(self: Box<Self>) -> io::Result<()> { Ok(()) }
     fn is_readable(&self) -> bool { false }
@@ -1069,10 +1101,13 @@ impl Channel for OsStderr {
         io::stderr().write(data)
     }
     fn flush(&mut self) -> io::Result<()> { io::stderr().flush() }
-    fn seek(&mut self, _whence: io::SeekFrom) -> io::Result<u64> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "stderr is not seekable"))
+    fn seek(&mut self, whence: io::SeekFrom) -> io::Result<u64> {
+        std_fd_seek(2, whence)
     }
-    fn tell(&mut self) -> io::Result<u64> { self.seek(io::SeekFrom::Current(0)) }
+    fn tell(&mut self) -> io::Result<u64> {
+        io::stderr().flush()?;
+        std_fd_seek(2, io::SeekFrom::Current(0))
+    }
     fn eof(&self) -> bool { false }
     fn close(self: Box<Self>) -> io::Result<()> { Ok(()) }
     fn is_readable(&self) -> bool { false }

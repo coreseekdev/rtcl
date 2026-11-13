@@ -314,6 +314,8 @@ pub fn cmd_seek(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let chan_id = args[1].as_str();
     let offset = args[2].as_int().ok_or_else(|| {
+        // Tcl_GetInt 失败：TCL VALUE NUMBER（read 计数同款）。
+        super::list::set_error_code(interp, "TCL VALUE NUMBER");
         Error::runtime(format!("expected integer but got \"{}\"", args[2].as_str()), crate::error::ErrorCode::Generic)
     })?;
     let (origin, negative_start) = if args.len() == 4 {
@@ -321,10 +323,16 @@ pub fn cmd_seek(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "start" => (std::io::SeekFrom::Start(offset.max(0) as u64), offset < 0),
             "current" => (std::io::SeekFrom::Current(offset), false),
             "end" => (std::io::SeekFrom::End(offset), false),
-            other => return Err(Error::runtime(
-                format!("bad origin \"{}\": must be start, current, or end", other),
-                crate::error::ErrorCode::InvalidOp,
-            )),
+            other => {
+                super::list::set_error_code(
+                    interp,
+                    &format!("TCL LOOKUP INDEX origin {}", crate::value::tcl_quote(other)),
+                );
+                return Err(Error::runtime(
+                    format!("bad origin \"{}\": must be start, current, or end", other),
+                    crate::error::ErrorCode::InvalidOp,
+                ));
+            }
         }
     } else {
         (std::io::SeekFrom::Start(offset.max(0) as u64), offset < 0)
@@ -360,8 +368,13 @@ pub fn cmd_tell(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(chan_not_found(interp, chan_id));
     }
     let ch = interp.channels.get_mut(chan_id).unwrap();
-    let pos = ch.tell().map_err(io_err)?;
-    Ok(Value::from_int(pos as i64))
+    // tclsh：不可 seek 的通道 tell 返回 -1（Tcl_Tell 失败不抛错）——
+    // 管道、socket、tty stdio 都是 -1；文件/重定向 stdio 给真实位。
+    let pos = match ch.tell() {
+        Ok(p) => p as i64,
+        Err(_) => -1,
+    };
+    Ok(Value::from_int(pos))
 }
 
 // ---------- eof ----------

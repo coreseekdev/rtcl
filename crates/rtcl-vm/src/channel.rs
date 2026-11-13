@@ -274,10 +274,17 @@ impl<'a> ChannelReader<'a> {
     }
 
     /// 下一个翻译后的字符（输入侧 EOL 归一）。
+    ///
+    /// eofchar 检查在**原始字符层**（先于 EOL 翻译，等价 tclsh 的字节层
+    /// CheckForEofChar）：命中即置通道 EOF 并以 None 收束。
     fn next_translated(&mut self, enc: &str) -> io::Result<Option<char>> {
         let Some(c) = self.next_raw_or_pending(enc)? else {
             return Ok(None);
         };
+        if self.cfg.eofchar_in == Some(c) {
+            self.ch.set_at_eof();
+            return Ok(None);
+        }
         match self.cfg.translation_in {
             TranslationMode::Lf => Ok(Some(c)),
             TranslationMode::Cr => Ok(Some(if c == '\r' { '\n' } else { c })),
@@ -310,6 +317,10 @@ pub(crate) fn channel_read_chars_cfg(
     if count == 0 {
         return Ok(String::new());
     }
+    // EOF 位已置的通道（eofchar 命中/真 EOF）：tclsh 后续读立即得空串。
+    if ch.eof() {
+        return Ok(String::new());
+    }
     let enc = cfg.encoding.clone();
     let mut reader = ChannelReader::new(ch, cfg);
     let mut out = String::new();
@@ -334,10 +345,17 @@ pub(crate) fn channel_read_chars_cfg(
 /// * cr    → 原始 CR 为界，LF 留在内容里；
 /// * crlf  → 原始 CRLF 为界，孤立 CR/LF 都留在内容里；
 /// * auto  → CRLF、单独 CR、单独 LF 均为界（CRLF 算一个界）。
+///
+/// eofchar 也是行界（先于 translation 检查，tclsh 字节层）：命中且行
+/// **非空** → 该行收束、EOF 置位；行**空** → EOF 形（gets 报 -1）。
 pub(crate) fn channel_read_line_cfg(
     ch: &mut dyn Channel,
     cfg: &mut ChannelConfig,
 ) -> io::Result<Option<String>> {
+    // EOF 位已置：gets 立即 -1（tclsh 状态机）。
+    if ch.eof() {
+        return Ok(None);
+    }
     let enc = cfg.encoding.clone();
     let mode = cfg.translation_in;
     let mut reader = ChannelReader::new(ch, cfg);
@@ -345,6 +363,16 @@ pub(crate) fn channel_read_line_cfg(
     let mut saw = false;
     loop {
         let next = reader.next_raw_or_pending(&enc)?;
+        if let Some(c) = next {
+            if reader.cfg.eofchar_in == Some(c) {
+                reader.ch.set_at_eof();
+                if out.is_empty() {
+                    return Ok(None);
+                }
+                saw = true;
+                break;
+            }
+        }
         match mode {
             TranslationMode::Lf => match next {
                 Some('\n') => {
@@ -419,6 +447,10 @@ pub(crate) fn channel_read_all_cfg(
     ch: &mut dyn Channel,
     cfg: &mut ChannelConfig,
 ) -> io::Result<String> {
+    // EOF 位已置：读立即空串（tclsh 状态机）。
+    if ch.eof() {
+        return Ok(String::new());
+    }
     let enc = cfg.encoding.clone();
     let mut reader = ChannelReader::new(ch, cfg);
     let mut out = String::new();
@@ -903,6 +935,18 @@ impl ChannelTable {
     }
 
     pub fn close(&mut self, id: &str) -> io::Result<()> {
+        // tclsh：out-eofchar 在 close 时一次性写出（flush 后、底层关闭
+        // 前；不是逐 puts/flush）——`fconfigure $f -eofchar {{} \x03}` +
+        // puts "X" + close → "X\x03"。
+        let eofc = self.configs.get(id).and_then(|c| c.eofchar_out);
+        if let Some(c) = eofc {
+            if let Some(ch) = self.channels.get_mut(id) {
+                if ch.is_writable() {
+                    let _ = ch.write_bytes(&[c as u8]);
+                    let _ = ch.flush();
+                }
+            }
+        }
         self.configs.remove(id);
         self.untrack(id);
         match self.channels.remove(id) {
@@ -1237,6 +1281,8 @@ impl Channel for FileChannel {
                 p
             }
         };
+        // tclsh：seek 清 EOF 位（seek 回退后可继续读）。
+        self.at_eof = false;
         Ok(pos)
     }
     fn tell(&mut self) -> io::Result<u64> {
@@ -1248,6 +1294,7 @@ impl Channel for FileChannel {
         self.seek(io::SeekFrom::Current(0))
     }
     fn eof(&self) -> bool { self.at_eof }
+    fn set_at_eof(&mut self) { self.at_eof = true; }
     fn close(self: Box<Self>) -> io::Result<()> { Ok(()) }
     fn is_readable(&self) -> bool {
         !matches!(self.mode, FileMode::Write(_))
@@ -1342,6 +1389,7 @@ impl Channel for PipeChannel {
     }
     fn tell(&mut self) -> io::Result<u64> { self.seek(io::SeekFrom::Current(0)) }
     fn eof(&self) -> bool { self.at_eof }
+    fn set_at_eof(&mut self) { self.at_eof = true; }
     fn close(mut self: Box<Self>) -> io::Result<()> {
         drop(self.writer.take());
         drop(self.reader.take());

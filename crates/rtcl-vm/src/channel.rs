@@ -917,13 +917,12 @@ impl ChannelTable {
         self.channels.remove(id)
     }
 
-    /// Live channel names in creation order.  tclsh's `chan names` walks
-    /// its per-interp channel hash table; for the stdio-only case that
-    /// order coincides with creation order (stdin stdout stderr).  The
-    /// general order depends on tclsh's channel registration history
-    /// (registration on first *access*, plus init-time channels that were
-    /// closed again) — see DIVERGENCES.md (chan_io_p15); reproducing it
-    /// needs a channel-registration log replay, not a plain hash replay.
+    /// Live channel names in creation order.  This is the **insertion
+    /// history** the `chan names` hash-order replay needs (close+reopen
+    /// moves a name to its last-insertion position, matching tclsh's
+    /// delete+re-create prepend).  The tclsh table keys are fd-based
+    /// (`file0/1/2` for the std trio); the display-name mapping lives in
+    /// the `chan names` implementation.
     pub fn channel_names(&self) -> Vec<String> {
         self.order
             .iter()

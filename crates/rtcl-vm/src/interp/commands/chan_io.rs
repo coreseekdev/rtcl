@@ -290,7 +290,9 @@ fn finish_gets(interp: &mut Interp, args: &[Value], line: Option<&str>) -> Resul
         let var_name = args[2].as_str();
         match line {
             Some(s) => {
-                let len = s.len() as i64;
+                // gets 的返回值按**字符**计数（tclsh Tcl_NumUtfChars），
+                // 不是 UTF-8 字节数。
+                let len = s.chars().count() as i64;
                 interp.set_var(var_name, Value::from_str(s))?;
                 Ok(Value::from_int(len))
             }
@@ -1259,12 +1261,60 @@ fn chan_names(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         ));
     }
     let pattern = args.first().map(|v| v.as_str());
-    let names: Vec<Value> = interp
-        .channels
-        .channel_names()
+    // tclsh 8.6.17 的通道表是 Tcl_HashTable（TCL_STRING_KEYS），但键是
+    // **fd 命名**：std 三件套注册为 file0/file1/file2（tclUnixChan.c
+    // `snprintf(channelName, "file%d", fd)`），`stdin/stdout/stderr` 只是
+    // MatchChannels 的显示层替换（按指针身份对照）。因此：
+    // * 迭代序 = 表键 [file0 file1 file2 fileN ...] 的 tclhash 桶序；
+    // * 模式过滤用**显示名**（`chan names file*` 不含 std 三件套）；
+    // * 无通配符且非 "std" 开头的模式走 Tcl_FindHashEntry 键直查快路
+    //   （`chan names file0` 命中表键 file0 → 返回 file0）。
+    fn table_key(name: &str) -> &str {
+        match name {
+            "stdin" => "file0",
+            "stdout" => "file1",
+            "stderr" => "file2",
+            other => other,
+        }
+    }
+    let live = interp.channels.channel_names();
+    if let Some(p) = pattern {
+        let trivial = !p.contains('*')
+            && !p.contains('?')
+            && !p.contains('[')
+            && !p.contains('\\')
+            && !p.starts_with("std");
+        if trivial {
+            let hit = live.iter().any(|n| table_key(n) == p);
+            return Ok(if hit {
+                Value::from_list(&[Value::from_str(p)])
+            } else {
+                Value::from_list(&[])
+            });
+        }
+    }
+    let keys: Vec<String> = live.iter().map(|n| table_key(n).to_string()).collect();
+    let order = super::super::tclhash::tcl_order(&keys);
+    let names: Vec<Value> = order
         .into_iter()
-        .filter(|name| pattern.map(|p| super::super::glob_match(p, name.as_str())).unwrap_or(true))
-        .map(|name| Value::from_str(name.as_str()))
+        .filter(|key| {
+            let display = match key.as_str() {
+                "file0" => "stdin",
+                "file1" => "stdout",
+                "file2" => "stderr",
+                other => other,
+            };
+            pattern.map(|p| super::super::glob_match(p, display)).unwrap_or(true)
+        })
+        .map(|key| {
+            let display = match key.as_str() {
+                "file0" => "stdin",
+                "file1" => "stdout",
+                "file2" => "stderr",
+                other => other,
+            };
+            Value::from_str(display)
+        })
         .collect();
     Ok(Value::from_list(&names))
 }

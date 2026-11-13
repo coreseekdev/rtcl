@@ -570,9 +570,16 @@ which 探测，勿用 info commands）。
 ### 10.1 语义域剩余（specs/DIVERGENCES.md，33 例需对齐 + 15 例 -f 设计差异）
 
 按根因分组（详细探针名见 DIVERGENCES.md 2026-11-03/11-08 节）：
-1. **errorInfo/errorstack/return 帧**（~9）：内联体帧（if/while/for）、
-   dict with/filter、return -code/-level 解码、catch options 键序——
-   涉及 rtcl 编译体的帧模型，最深的一组。
+1. **errorInfo/errorstack/return 帧**（~9）——**2026-11-14 收口**
+   （perf/wave2 90f4ad6..3ab5a1f，6 commit；DIVERGENCES.md 2026-11-14
+   节）：return -code/-level 解码（TclMergeReturnOptions 换形 +
+   -level 0 物化原码）、catch options 键序（returnOpts 键位模型）、
+   errorLine 归属（defer 帧带行号 + 括号行号单元化）、-f 文件执行
+   语境 if/while/for 帧（in_file_script + VM unwind 最外层体限定）、
+   uplevel ns-eval 帧保活（info level 计层）、procedure 帧名 = 调用词。
+   9 例全绿 + 5 个新固化探针；新发现残差 5 条记 DIVERGENCES.md
+   2026-11-14 节（uplevel -errorline、ARITH 关键词、expr 解析错误
+   INNER/errorCode、dictGet INNER、error 三参形）。
 2. **IO/通道**（~13）：通道编号/复用、read 计数、fblocked 元数、
    chan copy 方向、socket、eofchar。
 3. **OO 可见性面**（~10）：namespace children 序、方法可见性细节、

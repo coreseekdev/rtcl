@@ -832,7 +832,7 @@ pub struct Interp {
     pub(crate) err_call_body: bool,
     /// 活动 `uplevel` 的跨层数（栈；每次错误日志事件追加
     /// `UP <delta>`，tclsh Tcl_LogCommandInfo 的 varFramePtr 判定）。
-    pub(crate) err_uplevel: Vec<usize>,
+    pub(crate) err_uplevel: Vec<(usize, usize)>,
     /// 每个活动 `namespace eval` 的调用词重建文本（CALL 条目载荷；
     /// 与 [`Interp::ns_stack`] 平行），不是 ns_level0 的源文本。
     pub(crate) ns_call_text: Vec<String>,

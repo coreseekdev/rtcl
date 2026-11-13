@@ -7,6 +7,64 @@
 > D-40/41 构造析构与分派面）。条目后括注的
 > spec [D-x] 是规格文件内的 spec-local 编号，以本台账为准。
 
+## 2026-11-14 errorInfo/errorstack/return 帧组收口（judge 88/88；probes 340 → 349）
+
+§10.1 组 1（语义域最深一组）收口，6 个 commit：
+
+1. **90f4ad6 return 完成码解码**：TclMergeReturnOptions 的 `-code return`
+   换形（≡ `-code ok -level+1`）+ `-level 0` 物化原码（TclProcessReturn
+   level 0 直接返回码；break/continue 值随完成走）+ 原码穿透边界不解码。
+   `return -code return` 在 foreach/for/while 体不再被循环边界误转 OK。
+2. **ccbb24d catch options 键序**：根因 = tclsh GetReturnOptions 的
+   returnOpts 键位模型——ec-first 当且仅当 return 式抬升带 -errorcode
+   载荷（invalid command 实为 unknown proc 的
+   `return -code error -errorcode {...}`，init.tcl:275）；error 命令的
+   code 经 SetErrorCode 不进 returnOpts。error 命令抬升不再携带对象
+   载荷，ControlFlow.error_code 专属 return 式抬升。
+3. **e28c24a errorLine 归属**：err_pending_top 带 (text, line)，defer
+   不再覆写 err_line（构造出口帧读最内层已记日志命令的行）；Compiler
+   拆 line_ctx/line_base——proc 体语境括号内容行号单元化
+   （tclsh 编译单元行表），文件语境保持括号相对。
+4. **626ea6a -f 文件执行语境帧**：in_file_script（TclEvalEx 逐命令语义
+   判别，run_file/cmd_source 武装、eval_impl 逐单元消费、call_proc 体
+   截断）——文件级 if/while/for 字面体错误挂体出口帧 + invoker 帧
+   （体相对行、最外层体限定）；运行时 expr 括号行重定基改
+   cur_cmd_line_abs（单 Cmd token 表达式的运行时求值器路径）。
+5. **8055dd1 uplevel ns-eval 帧保活**：目标为 namespace eval 帧时
+   ns_level0/ns_stack 条目保留（tclsh 目标 varFrame 不销毁）——
+   info level 计层、info level 0 报 ns eval 调用词、跨 ns 帧 uplevel 2
+   层级算术（p7 D 形 bad level）。
+6. **3ab5a1f procedure 帧名 = 调用词**：TclNRInterpProcCore(interp,
+   objv[0])——帧 level0[0] 而非规范全名。
+
+收口探针（原 2026-11-08 清单第 2 类 9 例）：`ei2`、
+`expr_bracket_multiline`、`loops_return_level0_loop_bodies`、
+`namespace_uplevel`、`namespace_uplevel2`、`probe_catch`、
+`return_level0_codes`、`sub_inline_errors1`、`sub_inline_if_body` 全绿。
+新固化 judge 探针：`return_decode_matrix`（return 解码 + options 键序，
+-errorline 残差 scrub）、`return_flow_matrix`（循环体 return 传播）、
+`uplevel_ns_level`（level 计数矩阵）、`file_ctx_frames`（文件语境帧
+矩阵 + proc 体/eval/ns 对照）、`ei_line_attribution`（行号归属 +
+procedure 帧名矩阵）。
+
+**新发现残差**（相邻面，未修）：
+- uplevel 体错误的 -errorline：tclsh 在外围命令日志事件处更新
+  errorLine（即时），rtcl 的 defer 帧到顶层 append 才写——uplevel 体
+  错误被 catch 时差 1（t2 形钉探针在 return_decode_matrix 中 scrub）。
+- expr 1/0（ARITH 类）被 catch 后的 -errorinfo 首帧关键词：
+  tclsh `invoked from within`（内部双日志事件，首帧无命令可记）vs
+  rtcl `while executing`（单事件）。
+- `catch {expr {1 +}}`（expr **解析**错误）：-errorcode 应为
+  TCL PARSE EXPR MISSING 且 -errorstack 带 INNER syntax 特形；rtcl 报
+  NONE 且 INNER 陈旧（前一个错误的 INNER 泄漏——expr 解析错误抬升
+  点未装 INNER/errorCode）。
+- `dict get {a} b` 的 INNER：tclsh `dictGet`（dict 内部形）vs rtcl
+  `invokeReplace`。
+- `error msg info code` 三参形：tclsh 的 errorInfo 首帧 =
+  `"error boom "" {A B} "`（源文本含尾空格）且 INNER returnImm 带显式
+  options 列表 `{-errorinfo {} -errorcode {A B}}`、catch options 键序
+  -errorinfo/-errorcode 在前（returnOpts 键位）；rtcl 三处均未对齐。
+
 ## 2026-11-07 对齐盘点（judge 88/88；probes 300 pass / 97 fail）
 
 本轮收口（commit 2f2e520）：
@@ -224,7 +282,8 @@ ARE 的 quoting 细目/collating 元素/反向引用组**起点偏移为 indexOf
 剩余 64 例（其中 15 例为上述 `-f` 整脚本设计差异，需对齐 49 例）：
 1. 整脚本编译设计差异（15）：`globprobe`、`ix1/2/4`、`cases*`、
    `pidx*`、`t2/3/4`、`probe_round3`、`r3probe`。
-2. errorInfo/errorstack/return 帧（9）：`ei2`、
+2. errorInfo/errorstack/return 帧（9）——**2026-11-14 全收口**（见
+   2026-11-14 节，6 commit）：`ei2`、
    `expr_bracket_multiline`（多行括号的 proc 行号）、
    `loops_return_level0_loop_bodies`、`namespace_uplevel/2`、
    `probe_catch`、`return_level0_codes`、`sub_inline_*`（未捕获顶层

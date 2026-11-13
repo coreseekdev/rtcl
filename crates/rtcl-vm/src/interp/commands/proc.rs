@@ -508,7 +508,9 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // ——split_off 之前算，saved_ns_stack.len() 即被裁掉的数量）。
     let up_delta = num_to_pop_frames + saved_ns_stack.len();
     if up_delta > 0 {
-        interp.err_uplevel.push(up_delta);
+        // (delta, 帧基)：UP 条目只在 frames.len() == 帧基（当前帧仍是
+        // uplevel 帧）时记——uplevel 脚本里调用的 proc 帧记 CALL。
+        interp.err_uplevel.push((up_delta, interp.frames.len()));
     }
     let result = eval_tagged(interp, &script, "uplevel");
     if up_delta > 0 {

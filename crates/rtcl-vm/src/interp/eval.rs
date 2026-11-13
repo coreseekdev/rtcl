@@ -513,10 +513,17 @@ impl Interp {
     ///   objv 重建）；
     /// * 根帧（顶层脚本）不记。
     pub(crate) fn err_log_call(&mut self) {
-        if let Some(&delta) = self.err_uplevel.last() {
-            self.err_calls.push("UP".to_string());
-            self.err_calls.push(delta.to_string());
-            return;
+        if let Some(&(delta, base)) = self.err_uplevel.last() {
+            // UP 仅在当前帧仍是 uplevel 帧本体（其后未进 proc 帧）时记：
+            // tclsh Tcl_LogCommandInfo 的 varFramePtr 分支按
+            // framePtr.level != varFramePtr.level 判定，uplevel 脚本里
+            // 调用的 proc 帧（framePtr == varFramePtr）走 CALL 分支
+            // （probe return_decode_matrix N 形：CALL p7 UP 1 CALL …）。
+            if self.frames.len() == base {
+                self.err_calls.push("UP".to_string());
+                self.err_calls.push(delta.to_string());
+                return;
+            }
         }
         let frame_ns_depth = self.frames.last().map(|f| f.ns_depth).unwrap_or(0);
         if self.ns_stack.len() > frame_ns_depth {

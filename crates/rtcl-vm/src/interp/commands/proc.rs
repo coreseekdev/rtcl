@@ -440,12 +440,12 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // proc frames' `ns_depth` markers and the live ns-eval stack:
     // [ns evals below frame 0] frame 0 [ns evals between 0 and 1] …
     let scopes_total = interp.frames.len() + interp.ns_stack.len();
-    let (num_to_pop_frames, ns_trim, target_ns) = match &spec {
+    let (num_to_pop_frames, ns_trim, target_ns, target_is_ns) = match &spec {
         LevelSpec::Abs(n, word) => {
             // `#N` names the absolute Nth scope above the global level
             // (#0 = the global scope itself); past the top: bad level.
             if *n == 0 {
-                (interp.frames.len(), 0usize, "::".to_string())
+                (interp.frames.len(), 0usize, "::".to_string(), false)
             } else if *n > scopes_total {
                 return Err(bad_level(interp, word));
             } else {
@@ -463,7 +463,7 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let target = scopes_total as isize - m as isize - 1;
             if target < 0 {
-                (interp.frames.len(), 0usize, "::".to_string())
+                (interp.frames.len(), 0usize, "::".to_string(), false)
             } else {
                 uplevel_resolve(interp, target as usize)
             }
@@ -495,8 +495,11 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // then restore everything.
     let split_point = interp.frames.len() - num_to_pop_frames;
     let saved_frames: Vec<_> = interp.frames.split_off(split_point);
-    let saved_ns_stack: Vec<_> = interp.ns_stack.split_off(ns_trim);
-    let saved_l0: Vec<_> = interp.ns_level0.split_off(ns_trim);
+    // 目标是 ns eval 帧：split_off 保留到目标本体（含）——目标条目
+    // 存活（info level / info level 0 可见）；仅其上的 ns eval 随帧弹出。
+    let ns_keep = ns_trim + usize::from(target_is_ns);
+    let saved_ns_stack: Vec<_> = interp.ns_stack.split_off(ns_keep);
+    let saved_l0: Vec<_> = interp.ns_level0.split_off(ns_keep);
     let saved_ns = interp.current_namespace.clone();
     interp.current_namespace = Rc::from(target_ns);
     // D-3 -errorstack：uplevel 求值期间的错误日志事件记
@@ -521,7 +524,7 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// Locate the scope at chain index `target` (bottom→top over interleaved
 /// proc frames and open `namespace eval`s): returns the proc-frame split
 /// point or the ns-eval stack position plus the scope's namespace.
-fn uplevel_resolve(interp: &Interp, target: usize) -> (usize, usize, String) {
+fn uplevel_resolve(interp: &Interp, target: usize) -> (usize, usize, String, bool) {
     let mut idx = target;
     let mut split: Option<usize> = None;
     let mut ns_at: Option<usize> = None;
@@ -554,10 +557,15 @@ fn uplevel_resolve(interp: &Interp, target: usize) -> (usize, usize, String) {
                 .to_string();
             // Frames strictly above the target pop; `uplevel 0` stays in
             // the running frame.
-            (interp.frames.len() - fi - 1, depth, ns)
+            (interp.frames.len() - fi - 1, depth, ns, false)
         }
-        (None, Some(k)) => (interp.frames.len(), k, interp.ns_stack[k].clone()),
-        (None, None) => (interp.frames.len(), 0, "::".to_string()),
+        // 目标是 namespace eval 帧：该帧本身在 uplevel 求值期间保持
+        // 存活（tclsh 的 uplevel 把目标 varFrame 置为当前帧——目标
+        // 帧不销毁），ns_level0/ns_stack 的目标条目必须保留——`info
+        // level` 计它一层、`info level 0` 报 namespace eval 调用词
+        // （namespace_uplevel2 E、ei2 H 钉形）。
+        (None, Some(k)) => (interp.frames.len(), k, interp.ns_stack[k].clone(), true),
+        (None, None) => (interp.frames.len(), 0, "::".to_string(), false),
     }
 }
 pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {

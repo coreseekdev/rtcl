@@ -25,9 +25,18 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // A body that came from a variable keeps the unshifted numbering (its
     // origin is unknowable; tclsh in that case also numbers from 1).
     let saved_offset = interp.line_offset;
-    let body_offset = match interp.body_is_verbatim_script(2, body.as_str()) {
-        Some(extra) => Some(saved_offset + interp.cur_cmd_line.max(1) - 1 + extra),
-        None => None,
+    // 文件执行语境（tclsh TclEvalEx 逐命令）：while 经 TEOV 分派，体是
+    // 独立编译单元——行号**体相对**（不重定基），体错误挂
+    // ("while" body line N) 出口帧 + while 命令 invoker 帧。编译语境
+    // （proc 体/顶层编译单元）保持体绝对行重定基 + 无体帧（内联）。
+    let file_ctx = interp.in_file_script;
+    let body_offset = if file_ctx {
+        None
+    } else {
+        match interp.body_is_verbatim_script(2, body.as_str()) {
+            Some(extra) => Some(saved_offset + interp.cur_cmd_line.max(1) - 1 + extra),
+            None => None,
+        }
     };
 
     // The compiler inlines this while (verbatim body + literal condition
@@ -75,9 +84,10 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // frame of the NEXT error in the interp.
                 // 仅**字面量体**（内联进同一单元）：动态体是独立求值的
                 // 脚本，tclsh 给它挂 `("while" body line N)` 出口帧并在
-                // while 命令站点记 invoker 帧。
+                // while 命令站点记 invoker 帧。文件执行语境例外：字面体
+                // 同样经 TEOV 分派（体 = 独立单元），帧形与动态体一致。
                 if interp.err_is_error(&e) {
-                    if inline_shape {
+                    if inline_shape && !file_ctx {
                         interp.err_fresh = true;
                     } else {
                         interp.err_exit_frame("\"while\" body");
@@ -105,8 +115,11 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // `Compiler::compile_for`'s inline gates: literal condition word +
     // inlinable start/next/body scripts — all four words belong to the
     // proc's unit, so their evals keep the lexical context.
-    // inline_shape 不含 lexical_body（顶层同样内联字面体）。
-    let inline_shape = interp.word_is_plain_literal(2, test)
+    // inline_shape 不含 lexical_body（顶层同样内联字面体）。文件执行
+    // 语境不重定基（体行号体相对——体是独立单元）。
+    let file_ctx = interp.in_file_script;
+    let inline_shape = !file_ctx
+        && interp.word_is_plain_literal(2, test)
         && interp.body_would_compile(1, start)
         && interp.body_would_compile(3, next.as_str())
         && interp.body_would_compile(4, body.as_str());
@@ -140,9 +153,10 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     // tclsh compiles for inline like while: frameless.
                     // True errors only — see the while-arm note above.
                     // 派发体（动态词）挂 `("for" body line N)` 出口帧，
-                    // 由 for 命令站点的 harness 记 invoker 帧。
+                    // 由 for 命令站点的 harness 记 invoker 帧。文件执行
+                    // 语境字面体同形（体 = 独立单元）。
                     if interp.err_is_error(&e) {
-                        if inline_shape {
+                        if inline_shape && !file_ctx {
                             interp.err_fresh = true;
                         } else {
                             interp.err_exit_frame("\"for\" body");
@@ -176,9 +190,10 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 else {
                     // True errors only — see the while-arm note above.
                     // 派发的 loop-end 脚本：tclsh 挂无行号的
-                    // `("for" loop-end command)` 出口帧。
+                    // `("for" loop-end command)` 出口帧。文件执行语境
+                    // 字面 next 同形。
                     if interp.err_is_error(&e) {
-                        if inline_shape {
+                        if inline_shape && !file_ctx {
                             interp.err_fresh = true;
                         } else {
                             interp.err_exit_frame_raw("\"for\" loop-end command");

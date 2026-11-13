@@ -759,6 +759,12 @@ pub struct Interp {
     pub(crate) line_offset: usize,
     /// Line of the command currently dispatching (parse-relative).
     pub(crate) cur_cmd_line: usize,
+    /// Line of the command currently dispatching **absolute in the
+    /// current unit**（树走 = cmd.line + line_offset；VM = entry_offset +
+    /// site.line）——运行时 expr 求值器的括号行重定基以它为基
+    /// （tclsh 编译单元的行表 = 单元绝对行；site.line_rel 是括号内容
+    /// 相对行，单 Cmd token 表达式留在运行时求值器时以此为准）。
+    pub(crate) cur_cmd_line_abs: usize,
     /// Raw source of each word of the command currently dispatching,
     /// aligned with its arguments — braced/quoted script words carry their
     /// delimiters, letting constructs recover their body's line offset.
@@ -842,6 +848,18 @@ pub struct Interp {
     /// 上述 -errorinfo 物化后的首个调用方站点（tclsh resetErrorStack
     /// 在物化后的首个 Tcl_LogCommandInfo 生效）。
     pub(crate) err_force_inner: bool,
+    /// 当前脚本单元是否处于**文件执行语境**（tclsh 的 TclEvalEx 逐命令
+    /// 路径：`rtcl -f` 的文件、`source` 的文件）。tclsh 的文件脚本经
+    /// TclNREvalFile → TclEvalEx 逐命令执行：每条顶层命令经
+    /// Tcl_EvalObjv 分派，出错时由该命令所在脚本层的错误路径记帧
+    /// （tclBasic.c:5613）——文件级 if/while/for 字面体的体错误因此多记
+    /// `("while"/"for" body line N)` + 命令 invoker 帧；catch/proc 体等
+    /// 编译语境则全部内联、只记最内层命令。arm 由文件入口设置，
+    /// eval_impl 逐单元消费（嵌套 eval/catch 体 = 编译语境 = false）。
+    pub(crate) in_file_script: bool,
+    /// [`Interp::in_file_script`] 的入口武装位（文件入口 set，首个
+    /// eval_impl 消费）。
+    pub(crate) file_script_armed: bool,
     /// 下一次 errorInfo 帧用 `while executing`（而非 invoked from
     /// within）：帧边界物化的 `return -code error`（无显式 -errorinfo）
     /// 由 msg 作基、errorInfo 内部为 NULL（tclsh 实测 B/I/J 形）。
@@ -972,6 +990,9 @@ impl Interp {
             cur_source: Rc::from(""),
             err_from_subst: false,
             lexical_body: false,
+            in_file_script: false,
+            file_script_armed: false,
+            cur_cmd_line_abs: 0,
             eval_depth: 0,
             top_slots: None,
             next_eval_lexical: false,

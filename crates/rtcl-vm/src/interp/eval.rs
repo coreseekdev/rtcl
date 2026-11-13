@@ -31,6 +31,14 @@ impl Interp {
         r
     }
 
+    /// 武装下一个顶层 [`Interp::eval`] 为**文件执行语境**（tclsh
+    /// TclEvalEx 逐命令语义）：`rtcl -f` 的文件与 `source` 的文件。
+    /// 影响 errorInfo 的文件级 if/while/for 帧归属（见
+    /// [`Interp::in_file_script`]），不改变整脚本解析的入口语义。
+    pub fn arm_file_script(&mut self) {
+        self.file_script_armed = true;
+    }
+
     /// Evaluate a script command-by-command, like tclsh's Tcl_EvalEx.
     ///
     /// The whole text is *not* parsed up front: a command runs before the
@@ -93,6 +101,11 @@ impl Interp {
         // compiler's compile_unit (never locals_mode) for those texts.
         let saved_lexical = self.lexical_body;
         self.lexical_body = std::mem::take(&mut self.next_eval_lexical);
+        // 文件执行语境逐单元消费：武装位只覆盖最外层文件单元；嵌套
+        // eval/catch 体/循环体单元回到编译语境（tclsh：Tcl_EvalObjEx
+        // 编译单元，无文件级逐命令帧）。
+        let saved_file_ctx = self.in_file_script;
+        self.in_file_script = std::mem::take(&mut self.file_script_armed);
         // A fresh unit is a non-proc context (tclsh compiles eval'd texts
         // as standalone units with no compiledLocals): commands inside
         // must not see the enclosing proc context — a catch body here is
@@ -118,6 +131,7 @@ impl Interp {
                     Err(pe) => {
                         self.lexical_body = saved_lexical;
                         self.in_locals_unit = saved_inl;
+                        self.in_file_script = saved_file_ctx;
                         return Err(self.seed_parse_error(script, &pe));
                     }
                 };
@@ -192,6 +206,7 @@ impl Interp {
                     let r = super::vm_exec::exec_bytecode(self, &code);
                     self.lexical_body = saved_lexical;
                     self.in_locals_unit = saved_inl;
+                    self.in_file_script = saved_file_ctx;
                     return r;
                 }
             }
@@ -199,6 +214,7 @@ impl Interp {
         let r = self.eval_commands(&unit);
         self.lexical_body = saved_lexical;
         self.in_locals_unit = saved_inl;
+        self.in_file_script = saved_file_ctx;
         r
     }
 
@@ -215,6 +231,9 @@ impl Interp {
         self.lexical_body = true;
         let saved_inl = self.in_locals_unit;
         self.in_locals_unit = false;
+        // 编译语境（tclsh 内联 catch 体）：文件级逐命令帧不适用。
+        let saved_file_ctx = self.in_file_script;
+        self.in_file_script = false;
         const PARSE_CACHE_MAX: usize = 1024;
         const PARSE_CACHE_MAX_SCRIPT: usize = 262_144;
         let cached = self.parse_cache.get(script).cloned();
@@ -226,6 +245,7 @@ impl Interp {
                     Err(pe) => {
                         self.lexical_body = saved_lexical;
                         self.in_locals_unit = saved_inl;
+                        self.in_file_script = saved_file_ctx;
                         return Err(self.seed_parse_error(script, &pe));
                     }
                 };
@@ -257,6 +277,7 @@ impl Interp {
         let r = self.eval_commands(&unit);
         self.lexical_body = saved_lexical;
         self.in_locals_unit = saved_inl;
+        self.in_file_script = saved_file_ctx;
         r
     }
 
@@ -673,6 +694,8 @@ impl Interp {
         let saved_source = std::mem::replace(&mut self.cur_source, Rc::clone(&unit.source));
         let saved_text = std::mem::replace(&mut self.cur_cmd_text, cmd.text);
         let saved_line = std::mem::replace(&mut self.cur_cmd_line, cmd.line);
+        let saved_line_abs =
+            std::mem::replace(&mut self.cur_cmd_line_abs, cmd.line + self.line_offset);
         let saved_srcs = std::mem::replace(
             &mut self.cur_cmd_word_srcs,
             super::util::WordSrcs::from_rc(&cmd.word_srcs),
@@ -784,6 +807,7 @@ impl Interp {
         self.cur_source = saved_source;
         self.cur_cmd_text = saved_text;
         self.cur_cmd_line = saved_line;
+        self.cur_cmd_line_abs = saved_line_abs;
         self.cur_cmd_word_srcs = saved_srcs;
         r
     }

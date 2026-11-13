@@ -447,6 +447,10 @@ impl Interp {
             // frames (min4: `(procedure "P" line 3)` instead of line 1).
             let saved_body_offset = self.line_offset;
             self.line_offset = 0;
+            // proc 体 = 编译语境（tclsh 编译单元，体错误无文件级逐命令
+            // 帧）——文件执行语境在此截止。
+            let saved_file_ctx = self.in_file_script;
+            self.in_file_script = false;
             body_entered = true;
             // A named proc's body compiled once at `proc` time runs
             // op-by-op here — same errors, same frames, no per-call
@@ -489,6 +493,7 @@ impl Interp {
                 }
             };
             self.line_offset = saved_body_offset;
+            self.in_file_script = saved_file_ctx;
 
             // A tailcall whose completion an inner catch consumed leaves
             // the frame marker armed: it still fires at body end and

@@ -53,8 +53,9 @@ fn eval_arm_body(
         // tclsh 的抑制只对**内联**体成立（字面量体编进同一单元，if 自己
         // 不产生日志事件）；动态体是单独求值的脚本，错误回到 if 命令
         // 站点时记 invoker 帧（`invoked from within "if {1} $q"`）——
-        // 不布防 fresh，让站点 harness 正常记。
-        if interp.err_is_error(e) && inline_shape {
+        // 不布防 fresh，让站点 harness 正常记。文件执行语境（TclEvalEx
+        // 逐命令）字面体同样分派（体 = 独立单元），同动态体帧形。
+        if interp.err_is_error(e) && inline_shape && !interp.in_file_script {
             interp.err_fresh = true;
         }
     }

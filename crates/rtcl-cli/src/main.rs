@@ -96,6 +96,10 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
     let script = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read file '{}': {}", path.display(), e))?;
 
+    // 文件执行语境（tclsh TclNREvalFile → TclEvalEx 逐命令）：errorInfo
+    // 的文件级 if/while/for 帧归属以此判别（eval/proc 体等编译语境不
+    // 记）。整脚本解析入口语义不变。
+    interp.arm_file_script();
     let result = interp.eval(&script);
 
     if let Err(e) = result {

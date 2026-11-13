@@ -676,6 +676,99 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                         Rc::from(site.text.slice(&code.source)),
                         st.entry_offset + site.line as usize,
                     ));
+                } else if interp.in_file_script
+                    && !st
+                        .bodies
+                        .iter()
+                        .any(|r| matches!(r, Region::Body(_) | Region::Next(_) | Region::BodyFramed(_, _)))
+                {
+                    // 文件执行语境（tclsh TclEvalEx 逐命令）：文件级
+                    // if/while/for 字面体经 TEOV 分派，体错误在命令边界
+                    // 记帧——while/for 先挂 ("while"/"for" body line N)
+                    // / ("for" loop-end command) 出口帧，再由本帧的
+                    // harness append 记命令 invoker 帧（外层命令的帧走
+                    // 既有 Sub defer）。只有**最外层**体区域记帧：嵌套
+                    // 在别的体内的构造属于其编译单元（tclsh 内联），
+                    // 无帧（p20d 实测钉形）。
+                    let site = &code.sites[site_idx];
+                    let text = site.text.slice(&code.source);
+                    let first = site
+                        .word_srcs
+                        .first()
+                        .map(|sp| sp.slice(&code.source).to_string());
+                    let is_next = matches!(region, Region::Next(_));
+                    match first.as_deref() {
+                        Some("while") if !is_next => {
+                            // 体相对行 = err_line - 体首行 + 1（体首字 =
+                            // 最后一个词的源跨度）。
+                            let n = site
+                                .word_srcs
+                                .last()
+                                .map(|sp| {
+                                    let start = (sp.start as usize).min(code.source.len());
+                                    let open_line = 1
+                                        + code.source[..start].bytes().filter(|b| *b == b'\n').count();
+                                    interp.err_line.saturating_sub(open_line - 1)
+                                })
+                                .unwrap_or(interp.err_line);
+                            if let Some(info) = &mut interp.err_info {
+                                info.push_str(&format!("\n    (\"while\" body line {})", n));
+                            }
+                            let line = st.entry_offset + site.line as usize;
+                            interp.err_harness_frame_words(
+                                e.message_text().as_str(),
+                                text,
+                                line,
+                                None,
+                                None,
+                            );
+                        }
+                        Some("for") => {
+                            if is_next {
+                                // tclsh 的 loop-end 出口帧无行号
+                                // （p20a 实测钉形）。
+                                interp.err_exit_frame_raw("\"for\" loop-end command");
+                            } else {
+                                let n = site
+                                    .word_srcs
+                                    .last()
+                                    .map(|sp| {
+                                        let start = (sp.start as usize).min(code.source.len());
+                                        let open_line = 1
+                                            + code.source[..start]
+                                                .bytes()
+                                                .filter(|b| *b == b'\n')
+                                                .count();
+                                        interp.err_line.saturating_sub(open_line - 1)
+                                    })
+                                    .unwrap_or(interp.err_line);
+                                if let Some(info) = &mut interp.err_info {
+                                    info.push_str(&format!("\n    (\"for\" body line {})", n));
+                                }
+                            }
+                            let line = st.entry_offset + site.line as usize;
+                            interp.err_harness_frame_words(
+                                e.message_text().as_str(),
+                                text,
+                                line,
+                                None,
+                                None,
+                            );
+                        }
+                        Some("if") => {
+                            // if 只有命令 invoker 帧，无体帧（tclsh
+                            // Tcl_IfObjCmd 无 body appender；p6a/p20d）。
+                            let line = st.entry_offset + site.line as usize;
+                            interp.err_harness_frame_words(
+                                e.message_text().as_str(),
+                                text,
+                                line,
+                                None,
+                                None,
+                            );
+                        }
+                        _ => {}
+                    }
                 }
             }
             Region::BodyFramed(site_idx, lmap) => {
@@ -2981,6 +3074,7 @@ fn op_begin_cmd(
     interp.cur_cmd_line = site.line_rel as usize;
     interp.cur_cmd_word_srcs = super::util::WordSrcs::from_rc(&site.word_srcs);
     interp.line_offset = st.entry_offset + site.line_delta as usize;
+    interp.cur_cmd_line_abs = st.entry_offset + site.line as usize;
     st.cur_site = site_idx as usize;
     Ok(())
 }

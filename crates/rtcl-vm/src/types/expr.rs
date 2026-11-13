@@ -493,7 +493,17 @@ impl<'a> ExprParser<'a> {
                 .iter()
                 .filter(|c| **c == '\n')
                 .count();
-            let base = (self.interp.cur_cmd_line + self.interp.line_offset).max(1);
+            // 括号内容的行 1 = 其 `[` 所在行：基 = 命令在**当前单元**的
+            // 绝对行。文件执行语境（TclEvalEx 逐命令，括号内容是独立
+            // 编译单元）保持树走旧口径（cur_cmd_line + line_offset）；
+            // 编译语境用 cur_cmd_line_abs（site.line——tclsh 编译单元的
+            // 行表 = 单元绝对行，单 Cmd token 表达式留在运行时求值器
+            // 时 site.line_rel 是括号内容相对行，不可用）。
+            let base = if self.interp.in_file_script {
+                (self.interp.cur_cmd_line + self.interp.line_offset).max(1)
+            } else {
+                self.interp.cur_cmd_line_abs.max(1)
+            };
             let saved_offset = self.interp.line_offset;
             self.interp.line_offset = base - 1 + bracket_line - 1;
             let r = self.interp.eval(&cmd);
@@ -864,7 +874,17 @@ impl<'a> ExprParser<'a> {
                             .iter()
                             .filter(|c| **c == '\n')
                             .count();
-                        let base = (self.interp.cur_cmd_line + self.interp.line_offset).max(1);
+                        // 括号内容的行 1 = 其 `[` 所在行：基 = 命令在**当前单元**的
+            // 绝对行。文件执行语境（TclEvalEx 逐命令，括号内容是独立
+            // 编译单元）保持树走旧口径（cur_cmd_line + line_offset）；
+            // 编译语境用 cur_cmd_line_abs（site.line——tclsh 编译单元的
+            // 行表 = 单元绝对行，单 Cmd token 表达式留在运行时求值器
+            // 时 site.line_rel 是括号内容相对行，不可用）。
+            let base = if self.interp.in_file_script {
+                (self.interp.cur_cmd_line + self.interp.line_offset).max(1)
+            } else {
+                self.interp.cur_cmd_line_abs.max(1)
+            };
                         let saved_offset = self.interp.line_offset;
                         self.interp.line_offset = base - 1 + bracket_line - 1;
                         let cmd = self.collect_bracket_command();

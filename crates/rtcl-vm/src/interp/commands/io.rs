@@ -263,7 +263,10 @@ pub fn cmd_source(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     })?;
     // tclsh sources a file incrementally: earlier commands execute even if a
     // later one has a syntax error (the compile-run entry point, `rtcl -f`,
-    // still parses the whole script by design).
+    // still parses the whole script by design).  Sourced files run in the
+    // file-execution context (TclEvalEx per-command semantics — the
+    // file-level if/while/for errorInfo frames).
+    interp.arm_file_script();
     let r = interp.eval_incremental(&contents);
     if let Err(e) = &r {
         if interp.err_is_error(e) {

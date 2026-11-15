@@ -589,8 +589,15 @@ which 探测，勿用 info commands）。
    POSIX 面。新固化 judge/probes/chan_io_p23.tcl + specs/scripts
    四个回环/残余差分 harness。残余 OPEN：sockN 命名（不可复现）、
    socket -server（伺服面架构边界）。
-3. **OO 可见性面**（~10）：namespace children 序、方法可见性细节、
-   methodtype。
+3. **OO 可见性面**（~10）——**2026-11-16 收口**（perf/wave2，
+   DIVERGENCES.md 2026-11-16 节）：::oo bootstrap 形状（9 命令 + 5 子 ns
+   + Obj1..Obj10 核心 ns，children 插入序双态求解）、元类实例表、对象 ns
+   只露 my + ::oo::Helpers（nextto 新实现）、methodtype/forward 自有
+   作用域 + core method 形、ctor/dtor 实体（推翻 D-43⑦"恒空"）、
+   deletemethod/renamemethod 提及名单、filter 拦截未导出调用、
+   history 仅 stdin 注册（连带修复 order 组 7 挂账）、内部命令直调面、
+   Slot listing 截断点。oo2 r4（catch var/errorCode 全局物化序）定调
+   移交 var-order 组。新固化探针 judge/probes/oo21/oo22。
 4. **dict 残差**（~6）：`dict info`（hash internals 不可复现）、
    `dict getdef`（rtcl 多出的 8.7 特性）。
 5. 其余小尾巴：expr 词法（nan()/inf()）、representation 文案、

@@ -4,8 +4,105 @@
 > 修复后标 `[FIXED YYYY-MM-DD]`。最近盘点：**2026-11-03 深水区全量建模**
 > （error-deep / dict / matching / io / trace / oo 六份新 allium 规格
 > + 探针套件差分实证；trace 蒸馏暴露致命级 D-36 崩溃，oo 蒸馏暴露
-> D-40/41 构造析构与分派面）。条目后括注的
+> D-40/41 构造析构与分派面）。**2026-11-16 OO 可见性组收口**
+> （§10.1 组 3，本节）。条目后括注的
 > spec [D-x] 是规格文件内的 spec-local 编号，以本台账为准。
+
+## 2026-11-16 OO 可见性组收口（judge 88/88；probes 371 pass / 41 fail；order.probes 48/48；workspace tests 1425/0）
+
+HANDOFF §10.1 组 3（OO 可见性面，~10 例）全数定调入账。基线探针
+362/50 → 371/41：oo1、oo4 本组收口，**连带修复 order 组 7 个挂账**
+（cmds/dict_p40/ic/ic2/info2/p40/topcmds——根因同为 history 命令列名）。
+新固化探针 judge/probes/oo21.tcl（methodtype/forward/ctor-dtor/Slot 面）
++ oo22.tcl（对象 ns 可见性/内部命令直调/mention/nextto/filter 拦截/
+children 序/history 门控）。
+
+1. **::oo bootstrap 形状**（oo1 a5、oo4 x2/x3）[FIXED 2026-11-16]
+   - `info commands ::oo::*` 补齐 ::oo::UnknownDefinition / ::oo::InfoClass
+     / ::oo::InfoObject（9 命令，插入序 = UnknownDefinition class
+     objdefine InfoClass Slot object define copy InfoObject，tclhash 反推）。
+   - ::oo 子命名空间补齐 define/objdefine/Helpers/InfoClass/InfoObject +
+     Obj1..Obj10（核心对象 ns；Obj4..10 = 7 个 slot 实例
+     ::oo::define::filter/mixin/superclass/variable + ::oo::objdefine::
+     filter/mixin/variable，皆 ::oo::Slot 实例）。children 插入序
+     = Obj7 Obj6 define Obj10 Helpers Obj9 Obj2 InfoObject InfoClass
+     Obj5 Obj1 Obj3 Obj8 objdefine Obj4——用 tclhash 反推机对 **fresh-15
+     与 oo4-x2-33 双态**同时求解验证（单态解会被后续重建错位）。
+   - **坑（本轮最大）**：`ns_children` 的重放键此前按**全名**哈希，
+     tclsh 子表按**尾名**哈希——15 键状态巧合并无害，33 键桶位漂移即
+     显形（oo4 x2）；已改尾名重放（info commands 同款出口）。
+   - 失败的 `oo::copy` **泄漏目标 ns**（oo4 语境 ::oo::Obj21 活体）并烧
+     ObjN 号——rtcl 已同行为，编号链（Obj11..Obj30，Obj28/30 销毁）双态
+     逐字一致。
+2. **元类实例表**（oo1 a13）[FIXED]：`info class instances oo::class` =
+   `::oo::object ::oo::class ::oo::Slot` + 用户类（creation 序——类对象
+   的元类归属入列）；oo::Slot instances = 7 slot 对象。
+3. **对象命名空间可见性**（oo4 p4/p9/p12/p13）[FIXED]：对象 ns 只露
+   `my`（oo4 oracle）；self/next/nextto 以**隐藏命令**注册（列表面不
+   可见），`namespace which` 按归属重映射：对象 ns 内裸名 →
+   `::oo::Helpers::self/next`，显式限定名 `::oo::ObjN::self` → 空
+   （tclsh 无此命令）。::oo::Helpers ns 落地（self/next/nextto，
+   **nextto 新实现**——`nextto <class>` 以指定类实现为下一站、显式实参
+   调用，元数文案分形：0 参 `nextto class ?arg...?`、≥2 参
+   `nextto <给定类名>`）。host bridge 等 hidden 命令的 which **不**受
+   影响（http.tcl::_require_bridge 回归风险点，已钉 http_tcl 6/6）。
+4. **methodtype/definition 自有作用域** [FIXED]：`info class/object
+   methodtype` 只查**自有**方法表——继承一律 `unknown method "X"` 错误
+   （mt4/q1/x6）；自有核心方法 → `core method: "destroy"/"create"` 形
+   （mt8/mt9）。oo::Slot 面收口：自有 -clear/-append/-set（导出、
+   methodtype=method）、`::oo::Slot -clear` 仍是对象链 must-be
+   （create/destroy/new——类对象派发不吃自有方法表）。
+5. **info class/object forward** [FIXED]：新子命令；2 参形返回 forward
+   目标词（fw2 `::set k` / fw5 `::set q`）；1 参元数错误（fw1/fw4，
+   usage 词 = 调用名）；miss → `unknown method` 错误。
+6. **constructor/destructor 实体**（D-43⑦ 修正）[FIXED]：tclsh 8.6.17
+   对已定义者**返回实体**——ctor = `{参数 体}`（ct1 =
+   `{a {b 2}} {set v $a}`，逐参渲染保默认值）、dtor = **体字符串**
+   （ct2 = `my cleanup`）；未定义为空。D-43 原"恒空"系对核心类误测，
+   本轮以 oracle 推翻。
+7. **deletemethod/renamemethod 自有限定 + 提及名单**（oo7 d15）[FIXED]：
+   对继承名/未提及未知名 → `method X does not exist`（p12/p13/u5/u6/
+   n3/n4）；export/unexport **提及过**的未知名（tclsh 的 exportedMes/
+   hiddenMes 记账）→ deletemethod/renamemethod **静默消费**（oo7 d15/
+   u2/n2）。rtcl 新增 mentioned 记账字段。
+8. **filter 拦截未导出/hidden 调用**（cp4/uf2/g5-g7）[FIXED]：filter
+   名按**私有视图**解析——filter 方法自身被 unexport（oo7 g2/g3）或
+   对象级 hidden（p1）后拦截照常；对象级 hidden 方法调用不再提前报错
+   （filter 先行，用尽才落 unknown——D-41② 的未覆盖面）。
+9. **history 仅 stdin 注册**（oo4 p8）[FIXED]：tclsh **文件参数模式无
+   `history` 命令**（tclMain 的 RecordAndEvalObj `history add` 自动装载
+   只在 stdin/交互运行），-c 同（stock tclsh 无 -c；specs/probe.sh 的
+   oracle 是 `tclsh <<<`，语境 = stdin）。rtcl -f 时移除
+   （`Interp::drop_stdin_history`，::tcl::history 实现保留——tclsh 同），
+   -c/REPL 保留。**连带修复**：cmds/dict_p40/ic/ic2/info2/p40/topcmds。
+10. **内部命令直调面** [FIXED]：::oo::InfoClass/::oo::InfoObject 本体与
+    13/12 个 ::oo::InfoClass::X / ::oo::InfoObject::X 子命令 native
+    （info procs 空——tclsh 全为 native）；usage 词 = **调用名**（di8：
+    `::oo::InfoClass::forward` 不重复 forward 尾）；::oo::UnknownDefinition
+    0 参 `bad call of unknown handler`、带参语境错误（ud/ud2）；define
+    词 native 化后直调**元数先、语境后**（d1/d3/d5/d6 vs d7），slot 词
+    （variable/filter/mixin/superclass + objdefine 三槽）语境外一律
+    语境错误（sd/so/sc 批）；定义**脚本**内槽字经 eval 派发的 define
+    语境门遮蔽全局内建 `variable`（旧 proc 遮蔽同效，多词形帧抑制
+    分态保留——脚本形不抑制、多词形抑制，oo8 回归教训）。
+11. **isa typeof usage**：`info object isa typeof objName className`
+    （原 "objName arg"）。
+12. **方法列表序**：plain（无 -all）= 自有方法表 **Tcl 哈希序**
+    （sl1 = `-clear -append -set`，非排序非定义序）；-all = 排序 +
+    **oo::Slot 为链截断点**（穿 Slot 的继承不计 oo::object 方法——
+    Slot -all 无 destroy、Y(super oo::Slot) 同、Z(super oo::object) 有）。
+
+**遗留/移交定调**：
+- **oo2 r4**（catch 结果变量与 ::errorCode/::errorInfo 全局物化序 +
+  ::auto_index 首建时机）：tclsh 全局创建序 = e → errorCode → errorInfo
+  且 auto_index 惰性首建；rtcl 为抬升点记账 + 启动期建表。根因属
+  var materialization/哈希序组（2026-11-08 清单第 11 类），**不属 OO
+  可见性**，不动 catch/errorInfo 基线（2026-11-14 组语义）。oo2 全文件
+  其余标签已逐字一致。
+- **::oo::ObjN 编号已对齐**（D-43 原记"外观差异"由本轮 x2 钉形推翻为
+  可观察面——编号链含失败 create 的烧号与 oo::copy 泄漏，双态一致）。
+- we5/q114b/p-uplevel-ns/tclns/probe1/u72/namespace_varmodel2/trv_* 为
+  var/trace 组基线既有失败，本轮未触碰（基线二进制逐探针对照确认）。
 
 ## 2026-11-15 IO/通道组收口（judge 88/88；probes 362 pass / 50 fail——fail 均他组；workspace tests 1420/0）
 

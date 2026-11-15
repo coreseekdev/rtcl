@@ -1061,7 +1061,9 @@ fn wysiwyg_mark_attrs(
                 if !family.is_empty() {
                     font_family = family;
                 }
-                font_size = format!("{size}px");
+                // Tk point sizes are CSS px at 4/3 (96 dpi), as `font_of`
+                // renders widget text: the RichEditor draws at px scale.
+                font_size = format!("{:.1}px", size * 1.3333);
                 bold = is_bold;
             }
         }
@@ -1705,6 +1707,24 @@ fn sized_image(file: String, name: &str) -> AnyElement {
         }
     }
     element.into_element()
+}
+
+/// The canvas `text` item's font as the CSS shorthand the painter's
+/// `font` op parses: Tk draws canvas text in the item's `-font` (the
+/// canvas widget's when the item names none), whose point size the
+/// renderer needs in CSS px (4/3 per point at 96 dpi).  Without this the
+/// painter keeps its `10px sans-serif` canvas default, ~15% narrower than
+/// the model measured (`font measure`), which wraps the line.
+fn canvas_item_font(spec: &str) -> Option<String> {
+    let (family, size, bold) = rtcl_tk_runtime::resolve_font(spec)?;
+    let mut css = if bold { "bold ".to_string() } else { String::new() };
+    css.push_str(&format!("{}", size * 1.3333));
+    css.push_str("px");
+    if !family.is_empty() {
+        css.push(' ');
+        css.push_str(&family);
+    }
+    Some(css)
 }
 
 fn font_of(tree: &TkTree, path: &str) -> (Option<SharedString>, f32, bool) {
@@ -3546,6 +3566,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 // dashed line does not leak into the following shapes.
                 painter = painter.line_dash(&[]).line_dash_offset(0.0f32);
                 let coords = &item.coords;
+                let widget_font = option(tree, path, "-font").to_string();
                 let option =
                     |name: &str| item.options.get(name).and_then(|value| parse_color(value));
                 let center = match item.kind.as_str() {
@@ -3831,6 +3852,26 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                                 option("-fill").unwrap_or(AdaptiveColor::rgb(0x111827, 0xf3f4f6));
                             let anchor =
                                 item.options.get("-anchor").map_or("center", String::as_str);
+                            // Tk's canvas default (Helvetica 12) when neither
+                            // the item nor the widget names a font.  Set on
+                            // every text item: the painter's font, like its
+                            // dash state, persists across items.
+                            let css_font = item
+                                .options
+                                .get("-font")
+                                .cloned()
+                                .filter(|spec| !spec.is_empty())
+                                .unwrap_or(widget_font);
+                            let css_font = if css_font.is_empty() {
+                                // Tk's canvas default (Helvetica 12) when
+                                // neither the item nor the widget names one.
+                                canvas_item_font("Helvetica -12")
+                            } else {
+                                canvas_item_font(&css_font)
+                            };
+                            if let Some(css) = css_font {
+                                painter = painter.font(&css);
+                            }
                             let (align, baseline) = match anchor {
                                 "n" => (CanvasTextAlign::Center, CanvasTextBaseline::Top),
                                 "ne" => (CanvasTextAlign::Right, CanvasTextBaseline::Top),

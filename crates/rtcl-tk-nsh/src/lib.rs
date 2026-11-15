@@ -16,6 +16,7 @@
 //! its own event loop.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -4184,6 +4185,12 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     .unwrap_or_else(|| fallback.to_string())
             };
             let header_path = path.to_string();
+            // Tk's interactive heading drag: a heading cell held at its
+            // right edge resizes that column.  While one is held, the
+            // header's moves rewrite the column's width, so the layout
+            // follows the drag live (the same snapshot the Tcl `drag
+            // column` writes, re-rendered each move).
+            let drag: Rc<RefCell<Option<(String, f32)>>> = Rc::new(RefCell::new(None));
             let mut header = view()
                 .flex_row()
                 .w_full()
@@ -4200,6 +4207,27 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                         e.clicks,
                     );
                 });
+            {
+                let drag = drag.clone();
+                let move_path = path.to_string();
+                header = header.on_mouse_move(move |e: &MouseEvent| {
+                    let mut dragging = drag.borrow_mut();
+                    let Some((column, cell_x)) = dragging.as_ref() else {
+                        return;
+                    };
+                    if e.pressed_button.is_none() {
+                        *dragging = None;
+                        return;
+                    }
+                    // The pointer's x in the header is the column's new
+                    // right edge; minus the cell's layout x, its width.
+                    rtcl_tk_runtime::treeview_resize_column(
+                        &move_path,
+                        column,
+                        f64::from(e.position.x.0 - *cell_x),
+                    );
+                });
+            }
             let width_of = |column: &str| {
                 tv.column_options
                     .get(column)
@@ -4207,21 +4235,36 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     .and_then(|value| value.parse::<f32>().ok())
                     .unwrap_or(200.0)
             };
-            header = header.child(
-                view().w(px(width_of("#0"))).child(
-                    text(heading("#0", "Item"))
-                        .text_size(px(13.0))
-                        .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
-                ),
-            );
-            for column in &tv.columns {
-                header = header.child(
-                    view().w(px(width_of(column))).child(
-                        text(heading(column, column))
+            let heading_cell = |column: &str, fallback: &str| -> AnyElement {
+                let column = column.to_string();
+                let drag = drag.clone();
+                let cell_x: Rc<Cell<f32>> = Rc::new(Cell::new(0.0));
+                let track = cell_x.clone();
+                let mut c = view()
+                    .w(px(width_of(&column)))
+                    .on_layout(move |b: &Bounds<Points>| {
+                        track.set(b.origin.x.0);
+                    })
+                    .child(
+                        text(heading(&column, fallback))
                             .text_size(px(13.0))
                             .text_color(AdaptiveColor::rgb(0x111827, 0xf3f4f6)),
-                    ),
-                );
+                    );
+                let grab = drag.clone();
+                let grab_x = cell_x.clone();
+                let grab_column = column.clone();
+                c = c.on_press_down(move |_: &PressEvent| {
+                    *grab.borrow_mut() = Some((grab_column.clone(), grab_x.get()));
+                });
+                let release = drag.clone();
+                c = c.on_press_up(move |_: &PressEvent| {
+                    *release.borrow_mut() = None;
+                });
+                c.into_element()
+            };
+            header = header.child(heading_cell("#0", "Item"));
+            for column in &tv.columns {
+                header = header.child(heading_cell(column, column));
             }
             let mut body = view().flex_col().w_full().gap_1().p(px(4.0));
             let mut order = Vec::new();

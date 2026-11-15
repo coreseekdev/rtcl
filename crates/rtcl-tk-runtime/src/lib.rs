@@ -2238,12 +2238,7 @@ fn widget_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                             }
                         }
                         let new_width = (xposition - before).max(1);
-                        let entry = tv
-                            .column_options
-                            .entry(column.to_string())
-                            .or_default();
-                        entry.insert("-width".to_string(), new_width.to_string());
-                        rt.bump();
+                        treeview_set_column_width(rt, path, column, new_width)?;
                         Ok::<(), Error>(())
                     })
                     .ok_or_else(|| bad_window(path))??;
@@ -11397,6 +11392,55 @@ fn scale_set_value(interp: &mut Interp, path: &str, value: f64) -> Result<Value>
 }
 
 /// The numeric value of a Scale (its `-variable` when set).
+/// The shared write behind the Tcl `treeview drag column xposition` and
+/// the rendered header's interactive separator drag: sets one column's
+/// `-width` (clamped to 1, Tk's floor) and re-renders.
+fn treeview_set_column_width(
+    rt: &mut TkRuntime,
+    path: &str,
+    column: &str,
+    width: i64,
+) -> Result<()> {
+    let Some(tv) = rt.treeviews.get_mut(path) else {
+        return Err(bad_window(path));
+    };
+    let entry = tv.column_options.entry(column.to_string()).or_default();
+    entry.insert("-width".to_string(), width.max(1).to_string());
+    rt.bump();
+    Ok(())
+}
+
+/// Whether `column` names a column of the treeview at `path` (`#0` or one
+/// of the configured `-columns`).
+pub fn treeview_has_column(path: &str, column: &str) -> bool {
+    let Some(ptr) = active_interp() else {
+        return false;
+    };
+    let interp = unsafe { &*ptr };
+    with_state(interp, |rt| {
+        rt.treeviews.get(path).is_some_and(|tv| {
+            column == "#0" || tv.columns.iter().any(|name| *name == column)
+        })
+    })
+    .unwrap_or(false)
+}
+
+/// The interactive header-separator drag's width update (the renderer's
+/// gesture; Tcl's `drag column` reaches the same write through the
+/// subcommand arm).
+pub fn treeview_resize_column(path: &str, column: &str, width: f64) {
+    let Some(ptr) = active_interp() else {
+        return;
+    };
+    let interp = unsafe { &*ptr };
+    if !treeview_has_column(path, column) {
+        return;
+    }
+    let _ = with_state_mut(interp, |rt| {
+        treeview_set_column_width(rt, path, column, width.round() as i64)
+    });
+}
+
 pub fn scale_value(path: &str) -> f64 {
     let Some(ptr) = active_interp() else {
         return 0.0;

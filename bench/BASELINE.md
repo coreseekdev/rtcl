@@ -2430,3 +2430,90 @@ dict getdef（rtcl 多出的 8.7 特性）/errorstack+errorline+options 键序
 （catch {error boom} vs catch {nosuchcmd} 两种键序）/try 体 errorInfo
 帧/正则惰性量词组语义（Henry Spencer 最短整体匹配——(a+?)(a*) →
 "a a {}"）/lookahead 的 crate→bt 回退缺口/\\u 外转义文本。
+
+# ---------------------------------------------------------------------------
+# perf/wave2 深水区组合拳（2026-11-16，基线 7f2e0df）
+#
+# 起点重锚定：HANDOFF §10.2 的六基准数字（fib 0.83x 等）是
+# perf/interp-arch-opt-2 分支快照（Round AH 收口时点）。wave2 语义轮
+# （errorInfo/IO/OO 可见性/dict/expr，367 提交）落在其后，热径有新增
+# 簿记——本分支今日实测（指令数，确定性口径）：
+#
+# | bench        | rtcl instr    | tclsh instr   | 指令比 | wall 比 |
+# |---|---|---|---|---|
+# | fib25        | 578.67M       | 598.04M       | 0.97x  | 0.98x   |
+# | fe_bench     | 613.49M       | 624.01M       | 0.98x  | 0.83x   |
+# | dloop        | 4116.54M      | 4355.88M      | 0.95x  | 1.08x   |
+# | oo_bench2    | 5839.91M      | 9018.07M      | 0.65x  | 0.64x   |
+# | oo_bench2_vars| 7109.97M     | 9490.53M      | 0.75x  | 0.90x   |
+# | build_loop   | 128.36M       | —             | —      | —       |
+# | micro_base   | 392.72M       | 337.31M       | 1.16x  |         |
+# | micro_incr   | 557.73M       | 391.52M       | 1.42x  |         |
+#
+# 六基准指令比仍全 ≤1.0x；语义基线门禁：judge 88/88、probes 380/35
+# （同机态 A/B 复核锚定）。
+#
+# ## 板点 1（call_proc 帧准备）——落地（458c80e）
+#
+# 画像（fib25，perf script 自聚合 + perf annotate 行级）：call_proc
+# self ≈4.5%，其中池收发面（slot_table=None/upvars.clear/Vec len++）
+# ≈2.5%。落地「帧池不变式去双清」：两个 push 站点全清后才入池
+# （coroutine drain 不回池，审计确认）→ pool-pop 路径 11 项 clear
+# 全删；尾调用重绑门控（first_iter）——首遍 locals/order/array/upvars/
+# level0/slots/slot_aliased/link_keys 清除由不变式背书跳过，重绑遍
+# 保留；slots 改 resize 直填。jit_call_proc_direct 同款。
+#
+# 实测：fib25 **−5.66%**（578.67M→545.97M，0.97x→0.91x）；oo2
+# −2.26%；oovars −1.87%；fe/dloop/build 持平（proc 调用少/无 proc，
+# 符合改动面）。门禁：tests 1419/0、judge 88/88、probes 381/34
+# （唯一翻转 objquad = 坑清单在册的 15s 超时抖动探针，fail 集逐项
+# diff 同集）。
+#
+# ## 板点 2（语句窗口扩展 incr var [script]）——回退（负结果留档）
+#
+# 实现：4 新 op（IncrVarStack/IncrLocalStack + [SubEnd,*] 融合对）+
+# compile_incr 括号分支（try_compile_sub 内联 + 栈上增量）+
+# fuse_pairs 窗口 + unfused 展开 + top_op_class 分类 + INNER hint 臂。
+# 窗口发射确认（disassemble：8 op vs 原 10 op，去 incr 分派），语义
+# 探针 17 例对 tclsh 全同（含 errorCode/trace/errorInfo 归属），judge
+# 88/88、workspace 全绿、probes 381/34。
+#
+# **实测净负**：dloop 4116.5M→8513.2M（**+107%**）。三变体定位：
+# `incr acc [expr {$k}]` 861.4M→1835.9M（+113%）、`incr acc [string
+# trim …]` 979.1M→1962.2M（+100%）、无括号 `incr acc $k`（分派路径）
+# 持平——回归锁死在窗口发射的运行时。判别实验：仅关编译器分支（新
+# op 与热径臂保留）即回到基线 861.37M——排除热径加臂成本，坐实窗口
+# 运行时。带符号画像（新路径）见 ExprParser/match_op、Vec<char> lexer
+# （expr 逐迭代解析）、redirect_flat、collect_trace_scripts 与
+# malloc/free 风暴——但同款 EVAL_EXPR 与 ts flush/invalidate 序在旧
+# 形状同样存在，根因未收敛（两次尝试止损，按 Round Z/T 先例回退）。
+# ** reopen 线索**：下一步用 RTCL_DBG 环境门逐写点插桩（top_flush/
+# top_slot_fill/incr_var_fast→None 计数）对比新旧每迭代 flush 序。
+# 顺带发现（预存分歧，与本窗口无关，三路径同现）：incr 非 int 旧值
+# 的 errorCode（tclsh TCL VALUE INTEGER vs rtcl NONE）与 i64 溢出的
+# bignum 提升（tclsh 9223372036854775808 vs rtcl 回绕）。
+#
+# ## 板点 3（word_srcs 借用化）——已在册关闭
+#
+# Round L（2026-10-18）已落地：`util::WordSrcs（*const SrcSpan, len）`
+# 借用型在位（interp/mod.rs:779、util.rs:181）。§10.2 条目陈旧。
+#
+# ## 板点 4（空循环基线）——画像后关闭（不动）
+#
+# micro_base 新画像（1M 迭代 ×5，392.7M = 1.16x tclsh）：每迭代仅
+# 2 op（CMP_VI_JF + FOR_NEXT_INCR_V，Round U/H 融合已吃净）。残项
+# 叶占比：exec_inner 派发地板 ≈14%（pc/界检/epoch/ts 门/jump 表）、
+# Value::is_unset 5.7%（槽读 unset 门，语义必需）、frames.last 2.06%、
+# Region push(ptr::write) 1.58%。台账的「5-8%」估计系 Round V 时代
+# 数字（空循环 517→393 instr/迭代已消化大半）；剩余两项候选——
+# bodies unchecked push（省 ~1-2 instr/push，噪声级）与 VmState 帧指
+# 针缓存（需在全部 frames.push/pop 站点维护代数，unsafe 面 + 跨分派
+# realloc 正确性）——收益各 <2.5% 且风险结构不符，**不动作，关闭**。
+#
+# ## 板点 5（vars 指针稳定存储）——缓议（局面已变）
+#
+# 目标数字已消失：oovars 0.75x、oo2 0.65x（均 <1.0x，G13 链接槽键
+# 缓存 + Round Q/R/X/AA/Y/AG 已吃掉链接变量哈希面）。残余价值集中在
+# dloop 名扫描（split_array_ref/redirect_flat）与 dict IndexMap 固有
+# 大头——VarMap newtype 全消费面改造（Round S 实测 178 处机械修复）
+# 在当前板面下性价比为负，**缓议**，待 dloop/vars 重新放大后再评估。

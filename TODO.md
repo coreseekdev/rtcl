@@ -269,3 +269,25 @@
 
 **其余候选**：`call_proc` 帧准备之外的四板点（fib 0.85x / fe 0.92x / dloop 0.68x /
 build 0.72x）已在上一节定界；micro_add 0.89x、micro_lappend 0.72x（已 <1x）。
+
+**perf/wave2 深水区轮（2026-11-16，基线 7f2e0df，收口见 BASELINE「深水区组合拳」节）**：
+1. ✅ call_proc 帧池双清（458c80e）：池不变式成文（两 push 站点全清 +
+   coro drain 不回池）→ pool-pop 11 项 clear 全删 + first_iter 重绑门控
+   ——fib25 **−5.66%**（578.67M→545.97M，0.97x→0.91x）、oo2 −2.26%、
+   oovars −1.87%、fe/dloop/build 持平。门禁全绿（tests 1419/0、judge
+   88/88、probes 381/34=基线±objquad 抖动）。
+2. ❌ 语句窗口 `incr var [script]`：完整实现（4 op+编译器+融合窗）语义
+   全绿但**净负**（dloop +107%），判别实验坐实窗口运行时（关编译器分支
+   即回基线）；根因未收敛，两次止损回退。reopen 线索：RTCL_DBG 逐写点
+   插桩对比新旧每迭代 flush 序。
+3. ✅ 关闭：word_srcs 借用化 Round L 已落地（§10.2 条目陈旧）。
+4. ✅ 关闭（画像后不动）：micro_base 每迭代仅 2 op；残项 frames.last
+   2.06%/Region push 1.58%/is_unset 5.7%（语义必需）——台账 5-8% 估计
+   系 Round V 时代数字，结构性项不动作。
+5. ⏸ 缓议：vars 指针稳定存储——目标数字已消失（oovars 0.75x/oo2
+   0.65x 均 <1.0x），VarMap 全消费面改造（Round S 实测 178 处）性价比
+   为负；待 dloop/vars 重新放大再评估。
+
+**本轮后板面**（指令比 rtcl/tclsh）：fib **0.91x**、fe 0.98x、dloop
+0.95x、oo2 **0.63x**、oovars **0.74x**、build ~0.72x；micro_base 1.16x、
+micro_incr 1.42x（派发地板，见 BASELINE 板点 4 节）。

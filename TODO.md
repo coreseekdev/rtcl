@@ -128,32 +128,53 @@
 > 基本清零。以下是需要 nsh fork 渲染器功能升级或平台工作的项——
 > rtcl 模型侧已就绪，对照基建（八遍脚本 + tkprobe）可随时回归。
 
-- [ ] **`-alpha` 渲染通道**（fork：nsh-platform-*/window）：wm
-  attributes 已存取 `-alpha` 值（runtime `wm attributes`），但 nsh 的
-  desktop 命令没有 set-opacity 通道——需 fork 加
-  `DesktopCommand::SetOpacity(f32)`（GTK: gtk window set opacity；
-  Win32: SetLayeredWindowAttributes；macOS: alphaValue），rtcl 的
-  attributes 钩子即可接线。
-- [ ] **字体栈统一**（fork：nsh 文本渲染）：渲染器字体栈与 rtcl
-  pango 测量的 face 不同——渲染行宽比模型窄约 15%（折行点一致，同
-  断词规则）。完全对齐需渲染器用与测量相同的字体解析（或 rtcl 测
-  量走渲染器的栈）。
-- [ ] **ttk 主题视觉化**（fork/渲染器）：`ttk::style theme
-  names/use/configure` 命令面已对齐 Tk（四主题、每主题作用域、内置
-  值、layout 元素树），但主题切换暂不改变视觉——渲染器仍读全局表
-  的近似样式。需渲染器把 widget 样式从全局表改为按活动主题选择。
-- [ ] **treeview drag/drop DnD 深度**：`drag column xposition`（列宽
-  拖拽）与 `drop` 子命令已实现（模型近似——宽度分配依赖实时控件宽
-  度）；Tk 8.6.17 的完整交互式表头拖拽视觉（拖动幽灵、实时重排）
-  需 fork 渲染器的表头拖拽处理。
+- [x] **`-alpha` 渲染通道**（2026-11-16 收口）：fork 663210d 加
+  `DesktopCommand::SetOpacity`（Linux/GTK 窗口 set_opacity 落地；
+  Win32 分层窗口 / macOS alphaValue / GPUI 以 no-op+注释标注接线点，
+  本环境不可验）+ nsh-testing Screen 记录 opacity；rtcl 885a136 接线
+  attributes 钩子 + 读回格式修齐（Tcl double "1.0" 形态）。回归：
+  headless `alpha_nsh`（0.0/0.5/1.0 全链路）。wish 侧读回在无合成器
+  X11 上中间值异步归 1.0（Tk 8.6.17 实测），不适合精确 diff。
+- [x] **字体栈统一**（2026-11-16 收口，量化后小修 8bdbf95）：模型面
+  逐字已齐（font measure 139/151/161 vs wish 139/152/161）。~15% 渲
+  染偏差定位于 **canvas text**：fill_text 从未设置字体，painter 保持
+  `10px sans-serif` 默认（117.5 vs wish 139 = -15.5%）；修复走 item
+  `-font`→resolve_font→CSS shorthand（137.5，-1.1%）。label 路径本
+  有 4/3 点-像素换算（140 vs 140）；DejaVu/Courier 残差 3-6% 为 Xft
+  与 GTK pango hinting 差（方向相反，不追）。RichEditor 的 px/pt 混
+  用同修。模型侧零改动，度量遍无涟漪。
+- [x] **ttk 主题视觉化**（2026-11-16 小修 fbe82c9 + 残余交分析）：
+  截图对比发现脚本中断级缺口——ttk::scale 的 `-value` 被拒（整段脚
+  本创建处 abort，后续控件全部不渲染），补 SCALE_OPTIONS + 创建时
+  应用；按钮标签居中（Tk 默认）；progressbar 默认水平（option_default
+  补 -orient）+ 填充条从固定 px 改轨道份额。**残余（大改，不做）**：
+  四主题（default/alt/clam/classic）渲染同一套现代扁平样式——按主题
+  选样式表是渲染器侧样式系统重构；combobox 无输入区、disabled 未置
+  灰、radio 指示符形状等属该系统内的逐元素打磨。
+- [x] **treeview drag/drop DnD 深度**（2026-11-16 收口 3124e16）：
+  复验确认渲染面无入口（表头只有 on_press）。交互落地：runtime 抽
+  共享写核 + `treeview_resize_column`；表头单元格按住 + 表头移动 =
+  实时改列宽（模型 bump → 重渲染跟随）。dnd 对照遍绿（模型面零涟
+  漪）；手势本身 headless 无 mouse-move-with-button 原语可模拟，
+  live 才可验。简化：Tk 的调宽挂分隔线/表头按下是列移动重排，rtcl
+  v1 把调宽挂表头单元格（无分隔线元素与重排面）。
 - [ ] **渲染器 wrap 一致性**：渲染折行点已与模型一致（截图验证），
   但渲染行宽比模型窄约 15%（同字体栈问题）；`text_request_pixels`
   已导出，渲染器按其约束 layout。
-- [ ] **a11y 深度**（fork：nsh-platform-* access）：Canvas/Chart 逐
-  项 a11y 语义、菜单键盘导航的 UIA/AT-SPI 树节点；自绘控件已有
-  关键标签（spinbox Increment/Decrement、toplevel Close）。
-- [ ] **IME 深度**（fork：nsh 原生 input/RichEditor）：组合中状态进
-  `%K/%A` 全语义（组合完成的字符已由原生 input 承担）。
+- [ ] **a11y 深度**（fork：nsh-platform-* access；2026-11-16 评估）：
+  现状 = nsh 侧 per-view GtkAccessible 已通（access.rs 角色/标签/
+  description/announce），rtcl 桥接面仅 3 处关键标签（Close/
+  Increment/Decrement）。可行阶梯：A) 桥接批量补 accessibility_label
+  （从 -text/-label 提取，小改高值）；B) Canvas/Chart 逐项语义需 fork
+  canvas 暴露 per-item a11y 子树（canvas 是单元素自绘，AT-SPI 无逐项
+  节点）——fork API 设计题，大改；C) 菜单键盘导航 + AT-SPI 树验证需
+  读屏/accerciser 环境，本环境（Xvfb 无 AT-SPI 总线）不可完整验证。
+- [ ] **IME 深度**（fork：nsh 原生 input/RichEditor；2026-11-16 评估，
+  建议降级/收口）：Tk 8.6 的 XIM 语义 = 只在 commit 后产生 `<Key>`/
+  `%A` 事件，组合中状态不经 Tcl（XFilterEvent 吞掉中间态）；rtcl 的
+  组合完成字符已由 nsh 原生 input 承担——即残余的「组合中状态进
+  %K/%A」实际**超出** Tk 语义，做齐反而偏离对照基准。preedit 视觉
+  由 nsh 原生输入层负责，不经桥接。建议：确认对齐即可，不实现。
 - [ ] **MSVC 构建矩阵**（平台）：Windows 目前是
   x86_64-pc-windows-gnu + MSYS2 路线（全绿）；MSVC 工具链未测。
 - [ ] **macOS 平台**（硬件）：nsh-platform-macos 存在，未验证；

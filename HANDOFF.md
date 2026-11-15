@@ -580,8 +580,15 @@ which 探测，勿用 info commands）。
    9 例全绿 + 5 个新固化探针；新发现残差 5 条记 DIVERGENCES.md
    2026-11-14 节（uplevel -errorline、ARITH 关键词、expr 解析错误
    INNER/errorCode、dictGet INNER、error 三参形）。
-2. **IO/通道**（~13）：通道编号/复用、read 计数、fblocked 元数、
-   chan copy 方向、socket、eofchar。
+2. **IO/通道**（~13）——**2026-11-15 收口**（perf/wave2，DIVERGENCES.md
+   2026-11-15 节）：通道编号/复用、read 计数、fblocked 元数、chan copy
+   方向、eofchar 均差分实证全 SAME；socket -async 惰性连接落地
+   （socket 即建、I/O 补齐、失败终态 ENOTCONN）+ fconfigure
+   -peername/-sockname/-connecting 选项面 + 数据面 crlf 默认 +
+   ECONNRESET 归 EOF + 端口形（TclSockGetPort）+ 通道 IO 错误
+   POSIX 面。新固化 judge/probes/chan_io_p23.tcl + specs/scripts
+   四个回环/残余差分 harness。残余 OPEN：sockN 命名（不可复现）、
+   socket -server（伺服面架构边界）。
 3. **OO 可见性面**（~10）：namespace children 序、方法可见性细节、
    methodtype。
 4. **dict 残差**（~6）：`dict info`（hash internals 不可复现）、

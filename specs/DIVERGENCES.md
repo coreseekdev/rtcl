@@ -7,6 +7,86 @@
 > D-40/41 构造析构与分派面）。条目后括注的
 > spec [D-x] 是规格文件内的 spec-local 编号，以本台账为准。
 
+## 2026-11-15 IO/通道组收口（judge 88/88；probes 362 pass / 50 fail——fail 均他组；workspace tests 1420/0）
+
+§10.1 组 5（2026-11-08 清单第 5 类 13 例）全部定调：
+
+**已收口**（逐条 tclsh 差分实证，前 agent 11 提交 + 本轮 3 提交）：
+
+1. **通道编号/复用**：fileN 最小空闲号复用、chan names 表键哈希序
+   （4ef732c）——差分全 SAME（ids/close-reuse/names 序）。
+2. **read 计数**：字符计数（UTF-8 多字节边界逐字符/tell 字节位）、
+   binary 字节读、`-nonewline`、全读——全 SAME。
+3. **fblocked 元数**：阻塞读永不 blocked、arity 文案 + EC
+   TCL WRONGARGS、不存在通道 EC TCL LOOKUP CHANNEL——全 SAME。
+4. **chan copy -size/-command**：字节快路（751e071）+ -size 半量/
+   -size 0/tell-after/回读内容/同步 -command 形——全 SAME。
+5. **eofchar**：读侧 \x1a 截断置 EOF（gets/read 两形）、写侧 close
+   一次写出（68690a03 = "hi\n\x03"）、查询形状 ro `{}`/wo `{}`/rw
+   `{{} {}}`、设/清两形——全 SAME。
+6. **socket -async** [FIXED 2026-11-15，原 2026-11-12 记 OPEN]：
+   **socket 先建、连接后台化、完成惰性**——`socket -async` 经 libc
+   socket()+非阻塞 connect()（EINPROGRESS）即建通道返句柄；
+   `-sockname` 立即可查（socket 建出即绑临时端口，tclsh 同）；
+   首次真实 I/O（flush 带缓冲/读/`-peername`）poll(POLLOUT)+
+   SO_ERROR 补齐（`-blocking 1` 等连接完成语义）；补齐成功即外送
+   connecting 期缓冲（tclsh 连接完成事件自动 flush）；失败置终态，
+   后续 flush/gets/read/peername 一律
+   `socket is not connected`（EC POSIX ENOTCONN，不保留原始拒因——
+   tclsh 实测同形）且 close 仍成功；第二次 flush 空缓冲 rc=0
+   （失败 flush 弃缓冲）。puts 连接期只缓冲不尾随 flush
+   （`-buffering full` 用户态缓冲形）。
+7. **socket fconfigure 面**（新落地）：`-peername`/`-sockname` =
+   {数字地址 反解名 端口}（127.0.0.1 → localhost，getnameinfo
+   flags=0 + NI_NUMERICHOST 两调）；`-connecting` 查询以 poll(100ms)
+   有界探测近似 tclsh 的后台推进（回环实测 tclsh 立即为 0）；全查询
+   尾部追加 `-peername {…} -sockname {…}`，取不到的选项跳过不报错
+   （实测死路全查询只出 -sockname）；bad-option 文案 socket 表
+   9 项（…-translation, -connecting, -peername, or -sockname），
+   set 面只认基础 6 项（只读项 set 报基础表）。
+8. **socket 数据面默认** [FIXED 2026-11-15]：`-translation` 查询
+   `auto crlf`、写侧 \n 落线即 \r\n（binary 回读 hex 41420d0a43 双
+   解释器同）——原 rtcl 用文件的平台 lf。
+9. **ECONNRESET 归 EOF** [FIXED 2026-11-15]：server 收数据不读即
+   close（RST），client read 得空串 + eof=1，不抛错（tclsh 同）。
+10. **端口形** [FIXED 2026-11-15]（TclSockGetPort 形，实测差分）：
+    整数 >65535 → `couldn't open socket: port number too high`
+    （EC NONE）；整数 <0 → `couldn't open socket: Servname not
+    supported for ai_socktype`（EC NONE）；非整数先 getservbyname
+    （"http"→80，-async 同）未命中保留 GetInt 错误
+    `expected integer but got "<raw>"`（无 couldn't 前缀）+ EC
+    TCL VALUE INTEGER；DNS 失败 → `couldn't open socket: Name or
+    service not known`（剥 Rust lookup 包装文案，保 gai_strerror
+    原大小写）。
+11. **通道 IO 错误面** [FIXED 2026-11-15]：gets/read/flush/puts 的
+    真实 io 错误统一 `error reading/writing/flushing "<chan>":
+    <strerror>` + EC POSIX 随 errno（errno_text 补 ECONNRESET/
+    ENOTCONN/ETIMEDOUT/ECONNREFUSED/EADDRINUSE）——async 死路
+    gets 报 `error reading "sockX": socket is not connected`
+    与 tclsh 同字。
+
+**记 OPEN（设计差异，非缺陷）**：
+
+- **socket 通道名**：rtcl `sockN`（创建序）vs tclsh 指针名
+  （`sock646889354370`）——不可复现，探针归一化（quoted/裸名 +
+  `(?![a-z])` 防 "socket" 误吃）。判定探针 chan_io_p23 内置归一化。
+- **socket -server**：rtcl 不支持（TCP 客户端 only）——伺服面/事件
+  泵架构边界（wasm net feature 亦不含）。回环差分 harness 以 tclsh
+  当 server（specs/scripts/probe_sock_peer.sh、probe_sock_async_cmp.sh、
+  probe_sock_data.sh）。
+- **-async 无事件循环后台连接**：tclsh 的 async 连接由后台事件推进
+  （connect 完成即自动 flush）；rtcl 惰性补齐 + `-connecting` 有界
+  探测近似。慢网真实连接下 puts-without-flush 的数据要等下一次
+  flush/读/close 才外送——loopback 全窗一致，记行为边界。
+- **非 unix（net 特性可用的非 unix 平台）**：`-async` 回落 std 阻塞
+  连接（无 libc 非阻塞 connect 路径）；原生 linux 为准。
+
+**新固化**：judge/probes/chan_io_p23.tcl（28 断言：端口形矩阵/
+async 死路终态/fconfigure socket 选项表/全查询跳过形——self-contained
+死端口 0/1，无 server 依赖）；specs/scripts/probe_sock_peer.sh、
+probe_sock_async_cmp.sh、probe_sock_data.sh（live 回环差分，24+3 断
+言）、probe_io_residual.sh（文件面残余差分 24 断言，全 SAME）。
+
 ## 2026-11-14 errorInfo/errorstack/return 帧组收口（judge 88/88；probes 340 → 349）
 
 §10.1 组 1（语义域最深一组）收口，6 个 commit：
@@ -113,6 +193,9 @@ procedure 帧名矩阵）。
    通道编号/复用（fileN 计数、chan names 序）、`read` 计数/
    `fblocked` 元数、`copy` 方向/选项、`eofchar`、socket、只读/只写
    方向错误、`-size/-command` 选项窗口。
+   **[FIXED 2026-11-15]** 全组收口（11 提交 90f4ad6 前：4ef732c/713773f/
+   f2208f8/751e071 + 本轮 3 提交）——逐例定调见 2026-11-15 节；
+   残余 OPEN 仅 socket 命名/-server（设计差异）。
 6. **dict 命令面（6）**：`dict_p35/p40/p42`、`p35/p40/p42`。
    `::tcl::dict::*` 集成命令缺失（`info commands ::tcl::dict::*` 空）、
    dict 子命令 errorCode/`dict info` 形态。
@@ -225,7 +308,8 @@ ARE 的 quoting 细目/collating 元素/反向引用组**起点偏移为 indexOf
 - **init.tcl 面补齐**：tclLog/auto_qualify（逐分支移植）/auto_load/
   auto_load_index/auto_import/auto_execok/history（裁剪移植）+
   case 内建（tclCmdAH.c Tcl_CaseObjCmd 逐分支移植）+ socket（TCP
-  客户端；-async 不支持延迟报错，记 OPEN）/fcopy（=chan copy）/
+  客户端；-async 不支持延迟报错，记 OPEN
+  [FIXED 2026-11-15 惰性连接，见 2026-11-15 节]）/fcopy（=chan copy）/
   load/unload（无动态加载器，缺文件文案逐字）/zlib（crc32/adler32
   真实现；压缩记 OPEN）+ ::zlib 命名空间。`info commands` 计数
   101 == tclsh。
@@ -239,9 +323,10 @@ ARE 的 quoting 细目/collating 元素/反向引用组**起点偏移为 indexOf
   `invalid command name "tcl::mathfunc::<name>"`（expr-38.12）。
 - **socket/chan**：socket TCP 客户端落地（错误前缀
   `couldn't open socket: <strerror>` 与 tclsh 同式；通道名 rtcl 用
-  sockN、tclsh 用指针名——OPEN）；chan names 保持创建序（tclsh 的
-  通道表哈希序依赖注册历史，纯重放不吻合——见 2026-11-08 第 5 类，
-  记 OPEN）。
+  sockN、tclsh 用指针名——OPEN，现记设计差异）；chan names 保持创建
+  序（tclsh 的通道表哈希序依赖注册历史，纯重放不吻合——见
+  2026-11-08 第 5 类，记 OPEN [FIXED 2026-11-08 后 tclhash 重放模型，
+  2026-11-15 差分实证]）。
 
 新探针：specs/order.probes（48/48）、specs/expr-lex.probes（11/11）。
 

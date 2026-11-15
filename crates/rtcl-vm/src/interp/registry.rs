@@ -202,6 +202,11 @@ static CMD_TABLE_ENSEMBLE: &[CmdEntry] = &[
     // keyed absolute so `::tcl::pkgconfig` resolves directly and the
     // relative `tcl::pkgconfig` falls through the `::`+name lookup.
     CmdEntry { name: "::tcl::pkgconfig", func: misc::cmd_pkgconfig, cat: Standard, cmd_id: None, usage: "subcommand ?arg ...?", help: "Query Tcl build configuration" },
+    // ::tcl::prefix / ::tcl::Bgerror — tclsh 8.6.17 的 ::tcl 命名空间
+    // 命令面（probe1 `::tcl::*` 计数 + prefix 匹配/后台错误处理面；
+    // 2026-11-16 哈希轮挂账收口）。
+    CmdEntry { name: "::tcl::prefix", func: misc::cmd_tcl_prefix, cat: Standard, cmd_id: None, usage: "subcommand ?arg ...?", help: "Prefix matching utilities" },
+    CmdEntry { name: "::tcl::Bgerror", func: misc::cmd_tcl_bgerror, cat: Standard, cmd_id: None, usage: "msg options", help: "Default background error handler" },
     // ::tcl::unsupported::assemble — tclsh 8.6's bytecode assembler
     // (assemble-52.1 exception-range pattern; stack-machine interpreter).
     CmdEntry { name: "::tcl::unsupported::assemble", func: misc::cmd_assemble, cat: Extension, cmd_id: None, usage: "bytecodeList", help: "Assemble and execute bytecode instructions" },

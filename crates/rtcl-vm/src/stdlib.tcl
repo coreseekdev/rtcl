@@ -542,3 +542,65 @@ proc ::tcl::history {sub args} {
         }
     }
 }
+
+# ::tcl::CopyDirectory — init.tcl 的目录拷贝回退 proc（tclsh 启动即定义，
+# probe1 的 ::tcl::* 命令面计数）。逐行移植 init.tcl 525-583；rtcl 的
+# file copy 走原生快路不调它，保留 proc 体作可调用面。
+proc ::tcl::CopyDirectory {action src dest} {
+    set nsrc [file normalize $src]
+    set ndest [file normalize $dest]
+
+    if {$action eq "renaming"} {
+	# Can't rename volumes.  We could give a more precise
+	# error message here, but that would break the test suite.
+	set vols {}
+	catch {set vols [file volumes]}
+	if {$nsrc in $vols} {
+	    return -code error "error $action \"$src\" to\
+	      \"$dest\": trying to rename a volume or move a directory\
+	      into itself"
+	}
+    }
+    if {[file exists $dest]} {
+	if {$nsrc eq $ndest} {
+	    return -code error "error $action \"$src\" to\
+	      \"$dest\": trying to rename a volume or move a directory\
+	      into itself"
+	}
+	if {$action eq "copying"} {
+	    # -force 覆写语义：核心 copy 代码只在 -force 时调到这里。
+	} else {
+	    # '.', '..' 以外有文件即报 file exists。
+	    set existing [glob -nocomplain -directory $dest * .*]
+	    foreach s $existing {
+		if {[file tail $s] ni {. ..}} {
+		    return -code error "error $action \"$src\" to\
+		      \"$dest\": file exists"
+		}
+	    }
+	}
+    } else {
+	if {[string first $nsrc $ndest] >= 0} {
+	    set srclen [expr {[llength [file split $nsrc]] - 1}]
+	    set ndest [lindex [file split $ndest] $srclen]
+	    if {$ndest eq [file tail $nsrc]} {
+		return -code error "error $action \"$src\" to\
+		  \"$dest\": trying to rename a volume or move a directory\
+		  into itself"
+	    }
+	}
+	file mkdir $dest
+    }
+    # Have to be careful to capture both visible and hidden files.
+    # We will also be more generous to the file system and not
+    # assume the hidden and non-hidden lists are non-overlapping.
+    set filelist [concat [glob -nocomplain -directory $src *] \
+      [glob -nocomplain -directory $src -types hidden *]]
+
+    foreach s [lsort -unique $filelist] {
+	if {[file tail $s] ni {. ..}} {
+	    file copy -force -- $s [file join $dest [file tail $s]]
+	}
+    }
+    return
+}

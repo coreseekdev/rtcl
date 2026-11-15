@@ -16,6 +16,13 @@ use crate::value::Value;
 ///
 /// Returns a handle like "interp#1" that becomes a command in the parent.
 pub fn cmd_interp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    // D-1（2026-11-16 收口）：`interp alias {slavePath} slaveCmd
+    // ?masterPath masterCmd ?arg ...??` —— tclsh 的 slavePath 为 {} 即
+    // 主解释器自身：等价于 rtcl 的 `alias slaveCmd targetCmd ?arg ...?`
+    // 同一张别名表；查询形 `interp alias {} name` 返回 {target ?prefix...?}。
+    if args.len() >= 2 && args[1].as_str() == "alias" {
+        return interp_alias_main(interp, args);
+    }
     if args.len() > 1 {
         return Err(Error::wrong_args_with_usage(
             "interp", 1, args.len(),
@@ -43,6 +50,61 @@ pub fn cmd_interp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     interp.note_cmd_mutation();
 
     Ok(Value::from_str(&handle))
+}
+
+/// D-1: `interp alias {slavePath} slaveCmd ?masterPath masterCmd ?arg...??`
+/// — `{}` 路径即主解释器；创建形转投 `cmd_alias`，查询形读别名表。
+fn interp_alias_main(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    // args[0]=interp args[1]=alias args[2]=slavePath
+    if args.len() < 4 {
+        return Err(Error::wrong_args_with_usage(
+            "interp alias", 3, args.len().saturating_sub(2),
+            "slavePath slaveCmd ?masterPath masterCmd? ?arg ...?",
+        ));
+    }
+    let slave_path = args[2].as_str();
+    if !slave_path.is_empty() {
+        return Err(Error::runtime(
+            format!("could not find interpreter \"{}\"", slave_path),
+            ErrorCode::NotFound,
+        ));
+    }
+    let slave_cmd = args[3].as_str();
+    if args.len() == 4 {
+        // 查询形：返回 {targetCmd ?arg ...?}；未知名 → 报错（tclsh
+        // `alias "srcCmd" does not exist`）。
+        match interp.aliases.get(slave_cmd) {
+            Some(info) => {
+                let mut out = vec![Value::from_str(&info.target)];
+                for a in &info.prefix_args {
+                    out.push(Value::from_str(a));
+                }
+                Ok(Value::from_list_cached(out))
+            }
+            None => Err(Error::runtime(
+                format!("alias \"{}\" does not exist", slave_cmd),
+                ErrorCode::NotFound,
+            )),
+        }
+    } else {
+        // 创建形：`interp alias {} src {} target ?arg...?` == `alias src target ?arg...?`
+        if args.len() < 6 {
+            return Err(Error::wrong_args_with_usage(
+                "interp alias", 4, args.len() - 2,
+                "slavePath slaveCmd ?masterPath masterCmd? ?arg ...?",
+            ));
+        }
+        let master_path = args[4].as_str();
+        if !master_path.is_empty() {
+            return Err(Error::runtime(
+                format!("could not find interpreter \"{}\"", master_path),
+                ErrorCode::NotFound,
+            ));
+        }
+        let mut alias_args: Vec<Value> = vec![args[3].clone(), args[5].clone()];
+        alias_args.extend(args[6..].iter().cloned());
+        super::introspect::cmd_alias(interp, &alias_args)
+    }
 }
 
 /// Create a command function that dispatches `$handle eval/delete/alias`.

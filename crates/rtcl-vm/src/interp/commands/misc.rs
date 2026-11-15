@@ -2037,6 +2037,7 @@ enum AsmIns {
     Push(Value),
     Pop,
     Nop,
+    Over(i64),
     Invoke(usize),
     Jump(usize),
     BeginCatch(usize),
@@ -2049,6 +2050,7 @@ enum RawAsmIns {
     Push(Value),
     Pop,
     Nop,
+    Over(i64),
     Invoke(usize),
     Jump(String),
     BeginCatch(String),
@@ -2098,6 +2100,19 @@ pub fn cmd_assemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 raw.push(RawAsmIns::Push(v));
             }
             "pop" => raw.push(RawAsmIns::Pop),
+            "over" => {
+                if arity != 2 {
+                    return Err(Error::wrong_args_with_usage("over", 2, arity, "count"));
+                }
+                let text = assemble_operand(interp, &cmd.words[1])?;
+                let n = tcl_get_int(&text).ok_or_else(|| {
+                    Error::runtime(
+                        format!("expected integer but got \"{}\"", text),
+                        crate::error::ErrorCode::Generic,
+                    )
+                })?;
+                raw.push(RawAsmIns::Over(n));
+            }
             "nop" => raw.push(RawAsmIns::Nop),
             "invokeStk" => {
                 if arity != 2 {
@@ -2162,10 +2177,26 @@ pub fn cmd_assemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             labels.insert(name.clone(), i);
         }
     }
-    let resolve = |name: &str| -> Result<usize> {
+    // 重复 label 定义 → tclsh 同文错误（cmp_assemble a_dup_label）。
+    {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for ins in raw.iter() {
+            if let RawAsmIns::Label(name) = ins {
+                if !seen.insert(name.as_str()) {
+                    set_error_code(interp, "TCL OPERATION ASSEMBLE BADLABEL");
+                    return Err(Error::runtime(
+                        format!("duplicate definition of label \"{}\"", name),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+            }
+        }
+    }
+    let mut resolve = |name: &str| -> Result<usize> {
         labels.get(name).copied().ok_or_else(|| {
+            set_error_code(interp, "TCL OPERATION ASSEMBLE BADLABEL");
             Error::runtime(
-                format!("unknown label \"{}\"", name),
+                format!("undefined label \"{}\"", name),
                 crate::error::ErrorCode::NotFound,
             )
         })
@@ -2177,11 +2208,90 @@ pub fn cmd_assemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             RawAsmIns::Pop => AsmIns::Pop,
             RawAsmIns::Nop => AsmIns::Nop,
             RawAsmIns::Invoke(n) => AsmIns::Invoke(n),
+            RawAsmIns::Over(n) => AsmIns::Over(n),
             RawAsmIns::Jump(name) => AsmIns::Jump(resolve(&name)?),
             RawAsmIns::BeginCatch(name) => AsmIns::BeginCatch(resolve(&name)?),
             RawAsmIns::EndCatch => AsmIns::EndCatch,
             RawAsmIns::Label(_) => AsmIns::Label,
         });
+    }
+
+    // 异常语境一致性检查（tclAssembly.c ProcessCatchesInBasicBlock 的
+    // 指令级镜像）：每条指令的 (enclosing catch, state) 逐路径一致，
+    // 不一致 → "execution reaches an instruction in inconsistent
+    // exception contexts"（tclsh TCL ASSEM BADCATCH）。rtcl 子集 =
+    // jump/label/beginCatch/endCatch，逐指令传播即可覆盖。
+    {
+        const NONE: u8 = 0;
+        const INCATCH: u8 = 1;
+        const CAUGHT: u8 = 2;
+        let n = code.len();
+        let mut ctx: Vec<(Option<usize>, u8)> = vec![(None, NONE); n.max(1)];
+        // 三态：0=未访问。enclosing = 该路径上的 beginCatch 指令下标。
+        let mut visited: Vec<Option<(Option<usize>, u8)>> = vec![None; n];
+        if n > 0 {
+            let mut work = vec![(0usize, None::<usize>, NONE)];
+            while let Some((pc, enclosing, state)) = work.pop() {
+                if pc >= n {
+                    continue;
+                }
+                match visited[pc] {
+                    Some((old_enc, old_state)) => {
+                        if old_enc != enclosing {
+                            set_error_code(interp, "TCL ASSEM BADCATCH");
+                            return Err(Error::runtime(
+                                "execution reaches an instruction in inconsistent exception contexts".to_string(),
+                                crate::error::ErrorCode::Generic,
+                            ));
+                        }
+                        if state <= old_state {
+                            continue;
+                        }
+                    }
+                    None => {
+                        visited[pc] = Some((enclosing, state));
+                    }
+                }
+                ctx[pc] = (enclosing, state);
+                match &code[pc] {
+                    AsmIns::BeginCatch(target) => {
+                        // 直落：进入 catch 体；异常落点：CAUGHT。
+                        work.push((pc + 1, Some(pc), INCATCH));
+                        work.push((*target, Some(pc), CAUGHT));
+                    }
+                    AsmIns::EndCatch => {
+                        match enclosing {
+                            None => {
+                                set_error_code(interp, "TCL ASSEM BADENDCATCH");
+                                return Err(Error::runtime(
+                                    "endCatch without a corresponding beginCatch".to_string(),
+                                    crate::error::ErrorCode::Generic,
+                                ));
+                            }
+                            Some(b) => {
+                                // 退出后回到 beginCatch 自身的语境。
+                                let (outer_enc, outer_state) = ctx[b];
+                                work.push((pc + 1, outer_enc, outer_state));
+                            }
+                        }
+                    }
+                    AsmIns::Jump(target) => work.push((*target, enclosing, state)),
+                    _ => work.push((pc + 1, enclosing, state)),
+                }
+            }
+            // 代码收尾仍在 catch 内 → "catch still active on exit"。
+            let last = n - 1;
+            let (_, state) = ctx[last];
+            if state >= INCATCH
+                && !matches!(code[last], AsmIns::EndCatch | AsmIns::Jump(_))
+            {
+                set_error_code(interp, "TCL ASSEM UNCLOSEDCATCH");
+                return Err(Error::runtime(
+                    "catch still active on exit from assembly code".to_string(),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+        }
     }
 
     // Execute.
@@ -2203,6 +2313,19 @@ pub fn cmd_assemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
             }
             AsmIns::Nop | AsmIns::Label => {}
+            AsmIns::Over(depth) => {
+                // INST_OVER：操作数为立即数，压入栈顶下方 depth 处的
+                // 副本（0 = 复制栈顶；cmp_assemble a_over）。
+                let d = *depth;
+                if d < 0 || (d as usize) >= stack.len() {
+                    return Err(Error::runtime(
+                        "stack underflow".to_string(),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+                let v = stack[stack.len() - 1 - d as usize].clone();
+                stack.push(v);
+            }
             AsmIns::Jump(target) => pc = *target,
             AsmIns::BeginCatch(handler) => catches.push((*handler, stack.len())),
             AsmIns::EndCatch => {
@@ -3339,6 +3462,282 @@ fn pkgconfig_code(parts: &[&str]) -> String {
 fn pkgconfig_wrong(interp: &mut Interp, msg: String) -> Error {
     set_error_code(interp, "TCL WRONGARGS");
     tcl_err(msg)
+}
+
+// ── ::tcl::prefix（tclsh 8.6 ensemble，tclIndexObj.c）────────────────
+
+fn prefix_usage_error(interp: &mut Interp, invoked: &str, usage: &str) -> Error {
+    set_error_code(interp, "TCL WRONGARGS");
+    tcl_err(format!("wrong # args: should be \"{} {}\"", invoked, usage))
+}
+
+fn prefix_sub_not_found(interp: &mut Interp, sub: &str) -> Error {
+    set_error_code(interp, &format!("TCL LOOKUP SUBCOMMAND {}", sub));
+    tcl_err(format!(
+        "unknown or ambiguous subcommand \"{}\": must be all, longest, or match",
+        sub
+    ))
+}
+
+/// `::tcl::prefix all table string` — 以 string 为前缀的全部表元素。
+fn prefix_all(interp: &mut Interp, invoked: &str, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(prefix_usage_error(interp, invoked, "table string"));
+    }
+    let table = args[0]
+        .as_list()
+        .ok_or_else(|| {
+            set_error_code(interp, "TCL VALUE LIST");
+            tcl_err(format!("invalid list \"{}\"", args[0].as_str()))
+        })?;
+    let s = args[1].as_str();
+    let mut out = Vec::new();
+    for t in &table {
+        if t.as_str().starts_with(s) {
+            out.push(t.clone());
+        }
+    }
+    Ok(Value::from_list(&out))
+}
+
+/// `::tcl::prefix longest table string` — 匹配元素的最长公共前缀
+/// （Tcl_UtfPrev 语义：按字符截断到首个分歧行之前）。
+fn prefix_longest(interp: &mut Interp, invoked: &str, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(prefix_usage_error(interp, invoked, "table string"));
+    }
+    let table = args[0]
+        .as_list()
+        .ok_or_else(|| {
+            set_error_code(interp, "TCL VALUE LIST");
+            tcl_err(format!("invalid list \"{}\"", args[0].as_str()))
+        })?;
+    let s: Vec<char> = args[1].as_str().chars().collect();
+    let mut best: Option<Vec<char>> = None;
+    for t in &table {
+        let tc: Vec<char> = t.as_str().chars().collect();
+        if tc.len() < s.len() || tc[..s.len()] != s[..] {
+            continue;
+        }
+        best = Some(match best {
+            None => tc,
+            Some(b) => {
+                let n = b.len().min(tc.len());
+                let mut k = 0;
+                while k < n && b[k] == tc[k] {
+                    k += 1;
+                }
+                b[..k].to_vec()
+            }
+        });
+    }
+    Ok(Value::from_str(
+        &best.map(|b: Vec<char>| b.into_iter().collect::<String>())
+            .unwrap_or_default(),
+    ))
+}
+
+/// `::tcl::prefix match ?options? table string` — 唯一前缀匹配
+/// （TclGetIndexFromObjList 面：-error/-exact/-message）。
+fn prefix_match(interp: &mut Interp, invoked: &str, args: &[Value]) -> Result<Value> {
+    if args.is_empty() {
+        return Err(prefix_usage_error(interp, invoked, "?options? table string"));
+    }
+    let mut exact = false;
+    let mut message = "option".to_string();
+    let mut err_opts: Option<Vec<Value>> = None;
+    let mut i = 0usize;
+    while i + 2 < args.len() {
+        let opt = args[i].as_str();
+        match opt {
+            "-exact" => exact = true,
+            "-message" => {
+                if i + 3 >= args.len() {
+                    set_error_code(interp, "TCL OPERATION NOARG");
+                    return Err(tcl_err(format!(
+                        "missing value for -message"
+                    )));
+                }
+                i += 1;
+                message = args[i].as_str().to_string();
+            }
+            "-error" => {
+                if i + 3 >= args.len() {
+                    set_error_code(interp, "TCL OPERATION NOARG");
+                    return Err(tcl_err(format!("missing value for -error")));
+                }
+                i += 1;
+                let items = args[i]
+                    .as_list()
+                    .ok_or_else(|| {
+                        set_error_code(interp, "TCL VALUE LIST");
+                        tcl_err(format!("invalid list \"{}\"", args[i].as_str()))
+                    })?;
+                if items.len() % 2 != 0 {
+                    set_error_code(interp, "TCL VALUE DICTIONARY");
+                    return Err(tcl_err(
+                        "error options must have an even number of elements".to_string(),
+                    ));
+                }
+                err_opts = Some(items);
+            }
+            other => {
+                set_error_code(interp, "TCL LOOKUP INDEX option");
+                return Err(tcl_err(format!(
+                    "bad option \"{}\": must be -error, -exact, or -message",
+                    other
+                )));
+            }
+        }
+        i += 1;
+    }
+    if args.len() - i != 2 {
+        return Err(prefix_usage_error(interp, invoked, "?options? table string"));
+    }
+    let table = args[i]
+        .as_list()
+        .ok_or_else(|| {
+            set_error_code(interp, "TCL VALUE LIST");
+            tcl_err(format!("invalid list \"{}\"", args[i].as_str()))
+        })?;
+    let s = args[i + 1].as_str();
+    let mut hit: Option<Value> = None;
+    let mut ambiguous = false;
+    for (_, t) in table.iter().enumerate() {
+        let matched = if exact {
+            t.as_str() == s
+        } else {
+            t.as_str().starts_with(s)
+        };
+        if matched {
+            if hit.is_some() {
+                ambiguous = true;
+                break;
+            }
+            hit = Some(t.clone());
+        }
+    }
+    match hit {
+        Some(v) => Ok(v),
+        None => {
+            let kind = if ambiguous { "ambiguous" } else { "bad" };
+            set_error_code(interp, &format!("TCL LOOKUP INDEX {} {}", message, s));
+            let e = tcl_err(format!(
+                "{} option \"{}\": must be {}",
+                kind,
+                s,
+                table.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+            match err_opts {
+                None => Err(e),
+                Some(items) if items.is_empty() => {
+                    // -error {}：清结果、返 OK（tclsh ResetResult）。
+                    Ok(Value::empty())
+                }
+                Some(items) => {
+                    // -error dict：追加 -code <result> 后作为 return
+                    // options 载荷（Tcl_SetReturnOptions）。
+                    let mut d = items;
+                    d.push(Value::from_str("-code"));
+                    d.push(Value::from_int(1));
+                    Err(Error::ControlFlow {
+                        kind: crate::error::ControlFlow::Error,
+                        value: Some(Value::from_str(&e.message_text())),
+                        level: 1,
+                        error_info: None,
+                        error_code: Some(Value::from_list(&d).as_str().to_string()),
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// `::tcl::prefix` — tclsh 8.6 的 ::tcl 命名空间 ensemble（probe1 的
+/// `::tcl::*` 面 + prefix 匹配面）。
+pub fn cmd_tcl_prefix(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let invoked = args[0].as_str();
+    if args.len() < 2 {
+        return Err(prefix_usage_error(interp, invoked, "subcommand ?arg ...?"));
+    }
+    let sub = args[1].as_str().to_string();
+    match sub.as_str() {
+        "all" => prefix_all(interp, &format!("{} all", invoked), &args[2..]),
+        "longest" => prefix_longest(interp, &format!("{} longest", invoked), &args[2..]),
+        "match" => prefix_match(interp, &format!("{} match", invoked), &args[2..]),
+        other => Err(prefix_sub_not_found(interp, other)),
+    }
+}
+
+// ── ::tcl::Bgerror（tclEvent.c TclDefaultBgErrorHandlerObjCmd）────────
+
+/// 后台错误默认处理器。rtcl 无事件泵后台错误队列——可调用面对齐：
+/// 元数/options 校验、非 error 码的消息换形、-errorcode/-errorinfo
+/// 副作用，bgerror 命令存在即调用（无 handler 时 tclsh 8.6.17 实测
+/// 静默返回）。
+pub fn cmd_tcl_bgerror(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let invoked = args[0].as_str();
+    if args.len() != 3 {
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(tcl_err(format!(
+            "wrong # args: should be \"{} msg options\"",
+            invoked
+        )));
+    }
+    let mut get_opt = |interp: &mut Interp, key: &str| -> Result<(Value, i64)> {
+        let v = Value::from_str(args[2].as_str())
+            .as_dict()
+            .and_then(|d| d.get(key).cloned())
+            .ok_or_else(|| {
+                set_error_code(interp, "TCL ARGUMENT MISSING");
+                tcl_err(format!("missing return option \"{}\"", key))
+            })?;
+        let n = v.as_int().ok_or_else(|| {
+            set_error_code(interp, "TCL VALUE INTEGER");
+            tcl_err(format!("expected integer but got \"{}\"", v.as_str()))
+        })?;
+        Ok((v, n))
+    };
+    let (_, level) = get_opt(interp, "-level")?;
+    let (_, mut code) = get_opt(interp, "-code")?;
+    if level != 0 {
+        code = 2; // TCL_RETURN
+    }
+    if code == 0 {
+        return Ok(Value::empty());
+    }
+    let msg = match code {
+        1 => args[1].clone(),
+        3 => Value::from_str("invoked \"break\" outside of a loop"),
+        4 => Value::from_str("invoked \"continue\" outside of a loop"),
+        n => Value::from_str(&format!("command returned bad code: {}", n)),
+    };
+    if let Some(ec) = Value::from_str(args[2].as_str())
+        .as_dict()
+        .and_then(|d| d.get("-errorcode").cloned())
+    {
+        let _ = interp.set_var("::errorCode", ec);
+    }
+    if let Some(ei) = Value::from_str(args[2].as_str())
+        .as_dict()
+        .and_then(|d| d.get("-errorinfo").cloned())
+    {
+        if !ei.as_str().is_empty() {
+            let cur = interp
+                .get_var("::errorInfo")
+                .map(|v| v.as_str().to_string())
+                .unwrap_or_default();
+            let _ = interp.set_var(
+                "::errorInfo",
+                Value::from_str(&format!("{}\n{}", cur, ei.as_str())),
+            );
+        }
+    }
+    // bgerror handler 存在即调用（TCL_EVAL_GLOBAL，允许异常完成）；
+    // 缺失时 tclsh 8.6.17 实测静默返回（stderr 无输出）。
+    let handler_args = [Value::from_str("bgerror"), msg];
+    let _ = interp.dispatch_values(&handler_args);
+    Ok(Value::empty())
 }
 
 #[cfg(test)]

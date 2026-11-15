@@ -8,6 +8,20 @@
 > （§10.1 组 3，本节）。条目后括注的
 > spec [D-x] 是规格文件内的 spec-local 编号，以本台账为准。
 
+## 2026-11-16c incr 两预存分歧收口（性能轮 Agent 6 入账 → 本轮修复；judge 88/88；probes 380/35 + incr_widen 固化）
+
+1. **incr 坏旧值/坏增量的 errorCode**：rtcl 报 `expected integer but
+   got "..."` 文本正确但 errorCode 为空；tclsh 为 **TCL VALUE
+   INTEGER**（两处——读现值路径与 `(reading increment)` 增量解析
+   路径）。修复：set_error_code + Error::Msg（misc.rs cmd_incr）。
+2. **incr i64 溢出回绕**：tclsh 把溢出和提升为精确 bignum（i64::MAX
+   incr → 2^63；i64::MIN incr -1 → -2^63-1），rtcl 此前 wrapping
+   回绕。修复：checked_add 失败走 types/bignum BigInt 路径（expr 的
+   numeric_binop 同约定）。
+
+固化 judge/probes/incr_widen.tcl（六断言：坏旧值/坏增量/上溢/下溢/
+正常面/bothbad——tclsh 逐字 SAME）。
+
 ## 2026-11-16b 组 6/7 小尾巴 + 两轮移交残差收口（judge 88/88；probes 378/36——基线 373/41，翻绿 bn13/pbr3/probe1/ivars2/tclns；workspace tests 全绿）
 
 HANDOFF §10.1 组 4（dict 残差）+ 组 5（小尾巴）+ 2026-11-14 节 5 条 EI 相邻

@@ -502,12 +502,23 @@ pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // tclsh reads the variable first: a bad value there wins over a bad
     // increment (`incr x 1a` with x="1a" carries no increment frame).
     let current = match interp.get_var(var_name) {
-        Ok(v) => v.as_int().ok_or_else(|| {
-            Error::runtime(
-                format!("expected integer but got \"{}\"", v.as_str()),
-                crate::error::ErrorCode::Generic,
-            )
-        })?,
+        Ok(v) => {
+            let parsed = v.as_int();
+            let text = v.as_str().to_string();
+            match parsed {
+                Some(n) => n,
+                None => {
+                    // tclsh frames a bad current value as TCL VALUE
+                    // INTEGER (`incr x` with x="abc" → errorCode =
+                    // TCL VALUE INTEGER).
+                    set_error_code(interp, "TCL VALUE INTEGER");
+                    return Err(tcl_err(format!(
+                        "expected integer but got \"{}\"",
+                        text
+                    )));
+                }
+            }
+        }
         Err(e) => {
             // Tcl: incr on a non-existent variable starts at 0。类型冲突
             // 的方向不同：标量目标实际是数组 → 写路径错误
@@ -543,13 +554,23 @@ pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 if let Some(info) = &mut interp.err_info {
                     info.push_str("\n    (reading increment)");
                 }
-                return Err(Error::runtime(msg, crate::error::ErrorCode::Generic));
+                set_error_code(interp, "TCL VALUE INTEGER");
+                return Err(tcl_err(msg));
             }
         }
     } else {
         1
     };
-    let new_val = Value::from_int(current + amount);
+    // tclsh widens an overflowing i64 sum to an exact bignum (incr on
+    // i64::MAX grows to 2^63, it does not wrap); expr's `+` already
+    // goes through numeric_binop's BigInt path — same convention here.
+    let new_val = match current.checked_add(amount) {
+        Some(n) => Value::from_int(n),
+        None => {
+            let big = num_bigint::BigInt::from(current) + num_bigint::BigInt::from(amount);
+            crate::types::bignum::to_value(crate::types::bignum::IntRep::Big(big))
+        }
+    };
     interp.set_var(var_name, new_val)
 }
 

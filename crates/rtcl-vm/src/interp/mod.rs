@@ -1273,6 +1273,14 @@ impl Interp {
         self.hidden_commands.insert(name.trim_start_matches("::").to_string());
     }
 
+    /// Un-hide a command from `info commands` (the inverse of
+    /// `hide_command`): wish lists its widget constructors and paths
+    /// (`button`, `.b`, `.m` clone children) among the visible surface,
+    /// so a Tk host bridge opts its registrations back in.
+    pub fn show_command(&mut self, name: &str) {
+        self.hidden_commands.remove(name.trim_start_matches("::"));
+    }
+
     /// Whether `name` is currently hidden from listings.
     pub fn is_command_hidden(&self, name: &str) -> bool {
         self.hidden_commands.contains(name.trim_start_matches("::"))

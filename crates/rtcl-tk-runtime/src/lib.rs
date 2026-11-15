@@ -23,6 +23,7 @@ compile_error!(
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use rtcl_core::command::CommandFunc;
 use rtcl_core::interp::{add_interp_teardown_hook, Interp};
 use rtcl_core::value::Value;
 use rtcl_core::{Error, Result};
@@ -519,6 +520,15 @@ pub fn with_state_mut<R>(interp: &Interp, f: impl FnOnce(&mut TkRuntime) -> R) -
     out
 }
 
+/// Register a Tk command visible in `info commands`: wish lists its
+/// widget constructors and paths (`button`, `.b`, a menu clone child)
+/// among the visible surface, while the VM hides host commands by
+/// default (tclsh's canonical visible set carries none of these).
+fn register_visible(interp: &mut Interp, name: &str, func: CommandFunc) {
+    interp.register_command(name, func);
+    interp.show_command(name);
+}
+
 /// Register the Tk command surface on `interp` and create its tree.
 pub fn install(interp: &mut Interp) {
     ensure_hook();
@@ -623,9 +633,9 @@ pub fn install(interp: &mut Interp) {
         "::rtcl::chart",
         "canvas",
     ] {
-        interp.register_command(name, create_widget);
+        register_visible(interp, name, create_widget);
     }
-    interp.register_command(".", widget_command);
+    register_visible(interp, ".", widget_command);
     for name in [
         "configure",
         "cget",
@@ -664,7 +674,7 @@ pub fn install(interp: &mut Interp) {
         "vwait",
         "tkwait",
     ] {
-        interp.register_command(name, global_command);
+        register_visible(interp, name, global_command);
     }
     // Tk implements these in its Tcl library; the native renderer delegates
     // keyboard activation back here so users can override them with bind.
@@ -879,7 +889,7 @@ fn create_widget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         });
     }
     bump_active();
-    interp.register_command(&path, widget_command);
+    register_visible(interp, &path, widget_command);
     Ok(Value::from_str(&path))
 }
 
@@ -7658,7 +7668,7 @@ fn image_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 rt.images.insert(name.clone(), image);
                 rt.bump();
             });
-            interp.register_command(&name, photo_command);
+            register_visible(interp, &name, photo_command);
             Ok(Value::from_str(&name))
         }
         "delete" => {
@@ -8797,7 +8807,7 @@ fn menu_create(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         );
         rt.bump();
     });
-    interp.register_command(&path, menu_command);
+    register_visible(interp, &path, menu_command);
     Ok(Value::from_str(&path))
 }
 
@@ -9084,7 +9094,7 @@ fn menu_command(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Ok::<(), Error>(())
             })
             .ok_or_else(|| bad_window(&path))??;
-            interp.register_command(new_name, menu_command);
+            register_visible(interp, new_name, menu_command);
             Ok(Value::empty())
         }
         other => Err(generic(format!(

@@ -53,11 +53,10 @@ enum Lx {
     Ni,
     LeftShift,
     RightShift,
-    // rtcl extensions (not in tclsh 8.6): glob/regexp match and rotates.
+    // rtcl extensions (not in tclsh 8.6): glob/regexp match.  rotates
+    // (`<<<`/`>>>`) 已移除对齐 tclsh 词法（bn13）。
     GlobMatch,
     ReMatch,
-    RotLeft,
-    RotRight,
     Expon,
     Comma,
     Question,
@@ -109,7 +108,7 @@ impl Lx {
             | Lx::GlobMatch | Lx::ReMatch => P_EQUAL,
             Lx::Less | Lx::Greater | Lx::Leq | Lx::Geq | Lx::StrLt | Lx::StrGt
             | Lx::StrLe | Lx::StrGe => P_COMPARE,
-            Lx::LeftShift | Lx::RightShift | Lx::RotLeft | Lx::RotRight => P_SHIFT,
+            Lx::LeftShift | Lx::RightShift => P_SHIFT,
             Lx::Plus | Lx::Minus => P_ADD,
             Lx::Mult | Lx::Div | Lx::Mod => P_MULT,
             Lx::Expon => P_EXPON,
@@ -535,16 +534,11 @@ impl<'a> Checker<'a> {
             b'&' => Ok((Lx::BitAnd, 1, start)),
             b'|' if rest.len() > 1 && rest[1] == b'|' => Ok((Lx::Or, 2, start)),
             b'|' => Ok((Lx::BitOr, 1, start)),
-            // rtcl extensions: rotates scan before the shifts.
-            b'<' if rest.len() > 2 && rest[1] == b'<' && rest[2] == b'<' => {
-                Ok((Lx::RotLeft, 3, start))
-            }
+            // rotate 扩展（`<<<`/`>>>`）已移除——tclsh 词法把 `1 <<< 2`
+            // 解析为 `<<` 后随非法操作数（bn13）。
             b'<' if rest.len() > 1 && rest[1] == b'<' => Ok((Lx::LeftShift, 2, start)),
             b'<' if rest.len() > 1 && rest[1] == b'=' => Ok((Lx::Leq, 2, start)),
             b'<' => Ok((Lx::Less, 1, start)),
-            b'>' if rest.len() > 2 && rest[1] == b'>' && rest[2] == b'>' => {
-                Ok((Lx::RotRight, 3, start))
-            }
             b'>' if rest.len() > 1 && rest[1] == b'>' => Ok((Lx::RightShift, 2, start)),
             b'>' if rest.len() > 1 && rest[1] == b'=' => Ok((Lx::Geq, 2, start)),
             b'>' => Ok((Lx::Greater, 1, start)),

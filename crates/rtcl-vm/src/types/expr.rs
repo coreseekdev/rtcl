@@ -53,11 +53,46 @@ pub fn eval_expr(interp: &mut Interp, expr: &str) -> Result<Value> {
         interp.err_info =
             Some(format!("{}\n{}", msg, super::expr_check::parsing_frame(expr)));
         interp.err_fresh = false;
+        // C3（2026-11-16）：expr **解析**错误的 -errorcode =
+        // TCL PARSE EXPR <CLASS>（tclsh 8.6.17 实测分类：MISSING/
+        // UNBALANCED/BADCHAR/BAREWORD；原先 NONE 且 INNER 陈旧泄漏）。
+        let class = expr_parse_error_class(&msg);
+        crate::interp::commands::list::set_error_code(interp, class);
         return Err(Error::Msg(msg));
     }
     let mut parser = ExprParser::new(expr, interp);
-    let result = parser.parse_ternary()?;
-    canonicalize_result(result)
+    match parser.parse_ternary() {
+        Ok(v) => canonicalize_result(v),
+        Err(e) => {
+            // C2（2026-11-16）：ARITH 运行期错误的 tclsh **双日志事件**
+            // 模型——表达式机先记一次裸消息（无帧），expr 命令帧随后以
+            // `invoked from within` 追加（`expr {1/0}` 首帧关键词）。
+            // INNER 的 syntax 特形由 Interp::eval_expr 包装器预装，
+            // err_force_inner 使 (Some, false) 臂消费它。
+            if interp.err_info.is_none() && e.tcl_error_code().starts_with("ARITH") {
+                interp.err_info = Some(e.message_text());
+                interp.err_fresh = false;
+                interp.err_force_inner = true;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// C3：expr 解析错误消息首行 → TCL PARSE EXPR 的类别元素。
+fn expr_parse_error_class(msg: &str) -> &'static str {
+    let first = msg.lines().next().unwrap_or("");
+    if first.starts_with("unbalanced open paren") || first.starts_with("unbalanced close paren") {
+        "TCL PARSE EXPR UNBALANCED"
+    } else if first.starts_with("invalid character") {
+        "TCL PARSE EXPR BADCHAR"
+    } else if first.starts_with("invalid bareword") {
+        "TCL PARSE EXPR BAREWORD"
+    } else {
+        // missing operand / missing operator / missing function argument /
+        // empty subexpression / empty expression …
+        "TCL PARSE EXPR MISSING"
+    }
 }
 
 /// Tcl: when the result of an expression is a string that looks like a
@@ -73,12 +108,36 @@ fn canonicalize_result(v: Value) -> Result<Value> {
     if let Some(i) = v.as_int() {
         return Ok(Value::from_int(i));
     }
-    // A plain decimal integer beyond i64 is a Tcl bignum; keep its exact
-    // text rather than degrading it to a rounded double (E4).
+    // Bignum-range integers canonicalize to exact decimal text
+    // (tclsh Tcl_SetBignumObj replaces the string rep at parse: `expr {$x}`
+    // with x="0x10000000000000000" renders 18446744073709551616; pbr3).
+    // E4: never degrade to a rounded double — keep the exact value.
     let t = v.as_str().trim();
-    let digits = t.strip_prefix(['-', '+']).unwrap_or(t);
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(v);
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (radix, digits) = if body.len() > 2 && body.as_bytes()[0] == b'0' {
+        match body.as_bytes()[1] {
+            b'x' | b'X' => (16u32, &body[2..]),
+            b'o' | b'O' => (8u32, &body[2..]),
+            b'b' | b'B' => (2u32, &body[2..]),
+            _ => (10u32, body),
+        }
+    } else {
+        (10u32, body)
+    };
+    let digits_ok = !digits.is_empty()
+        && digits.chars().all(|c| match radix {
+            16 => c.is_ascii_hexdigit(),
+            _ => c.is_ascii_digit(),
+        });
+    if digits_ok {
+        if let Some(big) = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix) {
+            let mut s = if neg { "-".to_string() } else { String::new() };
+            s.push_str(&big.to_string());
+            return Ok(Value::from_str(&s));
+        }
     }
     if let Some(f) = v.as_float() {
         // A string that parses to NaN cannot canonicalize — tclsh raises
@@ -308,7 +367,7 @@ impl<'a> ExprParser<'a> {
         Ok(left)
     }
 
-    /// Shift: `<<`, `>>` (Tcl) plus rtcl extensions `<<<`, `>>>` (rotates).
+    /// Shift: `<<`, `>>` (Tcl).
     ///
     /// Tcl semantics (tclsh 8.6.17): a negative shift count errors with
     /// "negative shift argument"; `<<` widens to bignum when the result
@@ -316,26 +375,13 @@ impl<'a> ExprParser<'a> {
     /// arithmetic shift that saturates past the width (`-1 >> 64` is -1);
     /// shift counts so large the result exceeds the bignum range error
     /// with "integer value too large to represent".
+    /// rtcl 曾有 `<<<`/`>>>` rotate 扩展（jimtcl 血统）——tclsh 词法把
+    /// `1 <<< 2` 解析为 `<<` 后随非法操作数（missing operand at _@_，
+    /// bn13），扩展已移除对齐。
     fn parse_shift(&mut self) -> Result<Value> {
         let mut left = self.parse_additive()?;
         loop {
-            if self.match_op("<<<") {
-                let right = self.parse_additive()?;
-                let a = expr_ops::as_int_val(&left)? as u64;
-                let b = expr_ops::as_int_val(&right)? as u32;
-                let bits = 64u32;
-                let shift = b % bits;
-                let rotated = if shift == 0 { a } else { (a << shift) | (a >> (bits - shift)) };
-                left = Value::from_int(rotated as i64);
-            } else if self.match_op(">>>") {
-                let right = self.parse_additive()?;
-                let a = expr_ops::as_int_val(&left)? as u64;
-                let b = expr_ops::as_int_val(&right)? as u32;
-                let bits = 64u32;
-                let shift = b % bits;
-                let rotated = if shift == 0 { a } else { (a >> shift) | (a << (bits - shift)) };
-                left = Value::from_int(rotated as i64);
-            } else if self.match_op("<<") || self.match_op(">>") {
+            if self.match_op("<<") || self.match_op(">>") {
                 let shl = self.chars[self.pos - 1] == '<';
                 let right = self.parse_additive()?;
                 left = expr_ops::int_shift(&left, &right, shl)?;

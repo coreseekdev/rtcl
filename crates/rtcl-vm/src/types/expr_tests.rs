@@ -77,31 +77,23 @@ fn test_regexp_match_op() {
     assert_eq!(eval_expr(&mut interp, r#""hello123" =~ {\d+}"#).unwrap().as_bool(), Some(true));
 }
 
-// -- Rotate operators: <<<, >>> --
+// -- Shift lexing: `<<<`/`>>>` rotate extensions removed (tclsh 8.6.17
+//    lexes `<<` then errors on the stray third char, bn13) --
 
 #[test]
-fn test_rotate_left() {
+fn test_triple_angle_is_lex_error() {
     let mut interp = Interp::new();
-    // 1 <<< 1 = 2
-    assert_eq!(eval_expr(&mut interp, "1 <<< 1").unwrap().as_int(), Some(2));
-    // 1 <<< 63 should rotate to top bit position
-    let r = eval_expr(&mut interp, "1 <<< 63").unwrap().as_int().unwrap();
-    assert_eq!(r, i64::MIN); // bit 63 set = negative for signed
-}
-
-#[test]
-fn test_rotate_right() {
-    let mut interp = Interp::new();
-    // 2 >>> 1 = 1
-    assert_eq!(eval_expr(&mut interp, "2 >>> 1").unwrap().as_int(), Some(1));
-    // 1 >>> 1 should wrap high bit
-    let r = eval_expr(&mut interp, "1 >>> 1").unwrap().as_int().unwrap();
-    assert_eq!(r, i64::MIN); // wraps to MSB
+    // `1 <<< 2`: tclsh consumes `<<`, then the third `<` is an invalid
+    // operand position → missing operand, marker right after `<<`.
+    let err = eval_expr(&mut interp, "1 <<< 2").unwrap_err();
+    assert!(err.to_string().contains("missing operand at _@_"), "{}", err);
+    assert!(err.to_string().contains("1 <<_@_< 2"), "{}", err);
+    let err = eval_expr(&mut interp, "1 >>> 2").unwrap_err();
+    assert!(err.to_string().contains("1 >>_@_> 2"), "{}", err);
 }
 
 #[test]
 fn test_shift_still_works() {
-    // Ensure << and >> still work correctly after adding <<< and >>>
     let mut interp = Interp::new();
     assert_eq!(eval_expr(&mut interp, "1 << 4").unwrap().as_int(), Some(16));
     assert_eq!(eval_expr(&mut interp, "16 >> 2").unwrap().as_int(), Some(4));

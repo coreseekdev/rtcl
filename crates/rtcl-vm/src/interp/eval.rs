@@ -875,6 +875,17 @@ impl Interp {
     /// builtins/unknown）、无自身 harness 帧（调用方负责站点帧——
     /// vm_exec exec_inner 同款职责）。
     pub fn dispatch_values(&mut self, args: &[Value]) -> Result<Value> {
+        let r = self.dispatch_values_inner(args);
+        // C1：错误传播链上**最后一条失败命令**在其单元内的行——由内向外
+        // 逐层覆写，catch 读到的是 catch 体单元内最外层失败命令的行
+        // （tclsh errorLine 在每个外围命令日志事件处即时更新）。
+        if r.is_err() {
+            self.err_boundary_line = Some(self.cur_cmd_line.max(1));
+        }
+        r
+    }
+
+    fn dispatch_values_inner(&mut self, args: &[Value]) -> Result<Value> {
         if args.is_empty() {
             return Ok(Value::empty());
         }
@@ -1113,8 +1124,11 @@ impl Interp {
                         )
                     } else {
                         let sv = v.as_str();
-                        let head: String = sv.chars().take(40).collect();
-                        let dots = if sv.chars().count() > 40 { "..." } else { "" };
+                        // tclsh Tcl_AppendLimitedToObj(limit=16, "...")：
+                        // >16 字节截为前 13 字符 + "..."（UtfPrev 对齐，
+                        // ASCII = 13+3=16）。
+                        let head: String = sv.chars().take(13).collect();
+                        let dots = if sv.chars().count() > 16 { "..." } else { "" };
                         format!(
                             "value is a pure string with a refcount of 2, object pointer at 0x{ptr:x}, string representation \"{head}{dots}\""
                         )
@@ -1178,6 +1192,15 @@ impl Interp {
                         || self.ensembles.contains_key("unknown")
                         || self.ensembles.contains_key("::unknown");
                     if has_unknown {
+                        // ::auto_index 惰性首建（D 2026-11-16）：tclsh 的
+                        // unknown→auto_load 首次运行时由 auto_load_index
+                        // 创建该数组（ai*/oo2 r4 实测：文件模式启动不含，
+                        // 首个 unknown 命令触发）。rtcl 的 auto_load_index
+                        // 是自包含空实现，此处代为落表。
+                        if !self.globals.contains_key("auto_index") {
+                            self.global_insert("auto_index".to_string(), Value::empty());
+                            self.array_globals.insert("auto_index".to_string());
+                        }
                         let mut unknown_args = vec![Value::from_str("::unknown")];
                         unknown_args.extend(args.iter().cloned());
                         return self.dispatch_values(&unknown_args);
@@ -1385,13 +1408,25 @@ impl Interp {
             // D-3 残差：expr 错误的 INNER 条目 = syntax 特形——
             // `syntax {msg} {opts-dict}`（tclsh 实测；opts 为该错误自身
             // 的完整 options 形）。一次性预装同 cmd_error 通道。
-            let tec = e.tcl_error_code();
+            // C2/C3（2026-11-16）：-errorinfo 载荷 = 抬升点已预装的
+            // err_info（解析错误带 (parsing expression …) 帧、ARITH 带
+            // 裸消息）；-errorcode = 解析错误的 TCL PARSE EXPR <CLASS>
+            // 抬升码（err_code_raised 已装全局），其余按变体派生。
+            let tec = if self.err_code_raised {
+                self.globals
+                    .get("errorCode")
+                    .map(|v| v.as_str().to_string())
+                    .unwrap_or_else(|| e.tcl_error_code())
+            } else {
+                e.tcl_error_code()
+            };
             let msg = e.message_text();
             let line = self.err_line;
+            let ei = self.err_info.clone().unwrap_or_else(|| msg.clone());
             let opts = format!(
                 "-code 1 -level 0 -errorcode {} -errorinfo {} -errorline {}",
                 crate::value::tcl_quote(&tec),
-                crate::value::tcl_quote(&msg),
+                crate::value::tcl_quote(&ei),
                 line
             );
             self.err_pending_inner =
@@ -1479,6 +1514,14 @@ fn unsupported_bytecode_cmd(interp: &mut Interp, args: &[Value]) -> Result<Value
             if args.len() != 3 {
                 return Err(wrong("script script"));
             }
+            // tclsh 编译器对 `tcl::unsupported::assemble {<字面>}` 做
+            // **编译期装配**（getbytecode script 看到的是装配产物而非
+            // 调用指令）。push/nop 子集按 tclsh getbytecode 的 dict
+            // schema 复现（cmp_assemble a_getbc 钉形）；其余形状保持
+            // rtcl 自有清单（成功面 = 设计差异，见上注）。
+            if let Some(v) = getbytecode_assemble_shape(interp, args[2].as_str()) {
+                return Ok(v);
+            }
             compile(args[2].as_str())
         }
         "method" | "objmethod" => {
@@ -1522,6 +1565,121 @@ fn unsupported_bytecode_cmd(interp: &mut Interp, args: &[Value]) -> Result<Value
             other
         ))),
     }
+}
+
+/// `getbytecode script` 的编译期装配子集：script = 单条
+/// `tcl::unsupported::assemble {…}` 字面命令且指令全为 push/nop →
+/// 返回 tclsh getbytecode 的 dict schema（literals/variables/exception/
+/// instructions/auxiliary/commands/script/namespace/stackdepth/
+/// exceptdepth）。不匹配 → None（回落自有清单）。
+fn getbytecode_assemble_shape(interp: &mut Interp, script: &str) -> Option<Value> {
+    let commands = rtcl_parser::parse(script).ok()?;
+    if commands.len() != 1 {
+        return None;
+    }
+    let cmd = &commands[0];
+    if cmd.words.len() != 2 {
+        return None;
+    }
+    let op = match &cmd.words[0] {
+        crate::parser::Word::Literal(s) => s.strip_prefix("::").unwrap_or(s),
+        _ => return None,
+    };
+    if op != "tcl::unsupported::assemble" {
+        return None;
+    }
+    let body = match &cmd.words[1] {
+        crate::parser::Word::Literal(s) => s.as_str(),
+        _ => return None,
+    };
+    // 逐条指令：仅 push <字面> / nop。
+    let dirs = rtcl_parser::parse(body).ok()?;
+    let mut literals: Vec<String> = Vec::new();
+    let mut instructions: Vec<Value> = Vec::new();
+    let mut pc = 0usize;
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    for d in &dirs {
+        if d.words.is_empty() {
+            return None;
+        }
+        let head = match &d.words[0] {
+            crate::parser::Word::Literal(s) => s.as_str(),
+            _ => return None,
+        };
+        match head {
+            "nop" => {
+                if d.words.len() != 1 {
+                    return None;
+                }
+                instructions.push(Value::from_str(&pc.to_string()));
+                instructions.push(Value::from_str("nop1"));
+                pc += 1;
+            }
+            "push" => {
+                if d.words.len() != 2 {
+                    return None;
+                }
+                let v = match &d.words[1] {
+                    crate::parser::Word::Literal(s) => s.clone(),
+                    _ => return None,
+                };
+                let slot = match literals.iter().position(|l| l == &v) {
+                    Some(i) => i,
+                    None => {
+                        literals.push(v);
+                        literals.len() - 1
+                    }
+                };
+                instructions.push(Value::from_str(&pc.to_string()));
+                instructions.push(Value::from_str(&format!("push1 @{}", slot)));
+                pc += 2;
+                depth += 1;
+                max_depth = max_depth.max(depth);
+            }
+            _ => return None,
+        }
+    }
+    instructions.push(Value::from_str(&pc.to_string()));
+    instructions.push(Value::from_str("done"));
+    let script_text = script;
+    let commands_entry: Vec<Value> = vec![
+        Value::from_str("codefrom"),
+        Value::from_int(0),
+        Value::from_str("codeto"),
+        Value::from_int(literals.len() as i64),
+        Value::from_str("scriptfrom"),
+        Value::from_int(0),
+        Value::from_str("scriptto"),
+        // tclsh 的 span 是**含尾字符**的下标（a_getbc 钉形：35 字符
+        // script → scriptto 34）。
+        Value::from_int(script_text.chars().count() as i64 - 1),
+        Value::from_str("script"),
+        Value::from_str(script_text),
+    ];
+    let out = Value::from_list(&[
+        Value::from_str("literals"),
+        Value::from_int(literals.len() as i64),
+        Value::from_str("variables"),
+        Value::empty(),
+        Value::from_str("exception"),
+        Value::empty(),
+        Value::from_str("instructions"),
+        Value::from_list(&instructions),
+        Value::from_str("auxiliary"),
+        Value::empty(),
+        Value::from_str("commands"),
+        Value::from_list(&[Value::from_list(&commands_entry)]),
+        Value::from_str("script"),
+        Value::from_str(script_text),
+        Value::from_str("namespace"),
+        Value::from_str(interp.current_namespace.as_ref()),
+        Value::from_str("stackdepth"),
+        Value::from_int(max_depth as i64),
+        Value::from_str("exceptdepth"),
+        Value::from_int(0),
+    ]);
+    Some(out)
 }
 
 /// Resolve a name against the procedure table only, mirroring dispatch's

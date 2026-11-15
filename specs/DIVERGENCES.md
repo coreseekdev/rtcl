@@ -8,7 +8,7 @@
 > （§10.1 组 3，本节）。条目后括注的
 > spec [D-x] 是规格文件内的 spec-local 编号，以本台账为准。
 
-## 2026-11-16 OO 可见性组收口（judge 88/88；probes 371 pass / 41 fail；order.probes 48/48；workspace tests 1425/0）
+## 2026-11-16 OO 可见性组收口（judge 88/88；probes 373 pass / 41 fail（含新固化 oo21/oo22）；order.probes 48/48；workspace tests 1420/0）
 
 HANDOFF §10.1 组 3（OO 可见性面，~10 例）全数定调入账。基线探针
 362/50 → 371/41：oo1、oo4 本组收口，**连带修复 order 组 7 个挂账**

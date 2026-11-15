@@ -116,22 +116,16 @@ impl Interp {
         let prev_namespace = self.current_namespace.clone();
 
         // Push a new call frame (a recycled one when the pool has one —
-        // the maps keep their allocation and capacity)
+        // the maps keep their allocation and capacity).  INVARIANT (frame
+        // pool): every pooled frame is fully cleared — all Vecs empty,
+        // `has_aliased` false, `slot_table`/`tailcall` None, `level0`
+        // empty.  Both push sites (the call_proc epilogue below and
+        // `jit_frame_epilogue_pop`) clear before pushing, and the
+        // coroutine paths drain frames into the record (dropped, never
+        // pooled), so the pop path skips the clears the old code repeated
+        // here — a double clear per call.
         let mut frame = match self.frame_pool.pop() {
-            Some(mut f) => {
-                f.locals.clear();
-                f.locals_order.clear();
-                f.array_locals.clear();
-                f.upvars.clear();
-                f.local_procs.clear();
-                f.deferred_scripts.clear();
-                f.slots.clear();
-                f.slot_aliased.clear();
-                f.link_keys.clear();
-                f.has_aliased = false;
-                f.slot_table = None;
-                f
-            }
+            Some(f) => f,
             None => Box::new(CallFrame {
                 locals: VarMap::default(),
                 locals_order: Vec::new(),
@@ -162,12 +156,16 @@ impl Interp {
         if !matches!(&frame.call_ns, Some(n) if Rc::ptr_eq(n, &prev_namespace)) {
             frame.call_ns = Some(Rc::clone(&prev_namespace));
         }
-        frame.tailcall = None;
-        frame.level0.clear();
         frame.ns_depth = self.ns_level0.len();
         self.frames.push(frame);
 
+        // First pass through the tail-call loop: the frame came off the
+        // pool (or fresh) fully cleared per the invariant above, so the
+        // per-iteration reset clears only run from a tail-call rebind on.
+        let mut first_iter = true;
         let final_result = loop {
+            let first = first_iter;
+            first_iter = false;
             // The def this iteration runs: the called one, or a tail-call
             // target's (owned by `tc_def`).
             let def: &ProcDef = tc_def.as_deref().unwrap_or(proc_def);
@@ -205,24 +203,34 @@ impl Interp {
                     let table = Rc::clone(code);
                     let n = code.locals().len();
                     let frame = self.frames.last_mut().unwrap();
-                    frame.slots.clear();
+                    // First pass: the pooled frame's slot vectors are empty
+                    // (pool invariant) — resize fills with `unset` directly.
+                    // A tail-call rebind pass resets the previous target's
+                    // slot state first.
+                    if !first {
+                        frame.slots.clear();
+                    }
                     frame.slots.resize(n, Value::unset());
                     // The alias/`Global`-link side vectors build lazily:
                     // `degrade_frame_link` sizes them on first use, every
                     // reader probes with `.get(slot)` — no per-call resize
                     // of either.
-                    frame.slot_aliased.clear();
-                    frame.has_aliased = false;
-                    frame.link_keys.clear();
+                    if !first {
+                        frame.slot_aliased.clear();
+                        frame.link_keys.clear();
+                        frame.has_aliased = false;
+                    }
                     frame.slot_table = Some(table);
                     true
                 }
                 _ => {
                     let frame = self.frames.last_mut().unwrap();
-                    frame.slots.clear();
-                    frame.slot_aliased.clear();
-                    frame.has_aliased = false;
-                    frame.link_keys.clear();
+                    if !first {
+                        frame.slots.clear();
+                        frame.slot_aliased.clear();
+                        frame.has_aliased = false;
+                        frame.link_keys.clear();
+                    }
                     frame.slot_table = None;
                     false
                 }
@@ -246,10 +254,15 @@ impl Interp {
                 if !matches!(&frame.ns, Some(n) if Rc::ptr_eq(n, &def_ns)) {
                     frame.ns = Some(def_ns);
                 }
-                frame.locals.clear();
-                frame.locals_order.clear();
-                frame.array_locals.clear();
-                frame.upvars.clear();
+                // First pass: the frame's maps are empty (pool invariant);
+                // a tail-call rebind pass must empty the previous target's
+                // maps before binding its own.
+                if !first {
+                    frame.locals.clear();
+                    frame.locals_order.clear();
+                    frame.array_locals.clear();
+                    frame.upvars.clear();
+                }
                 // `info level 0` shows the invocation as dispatched: the
                 // as-typed command word plus the evaluated arguments
                 // (tclsh 47.1: `ns a b c` → `::ns::a b c`).  `apply`
@@ -258,7 +271,9 @@ impl Interp {
                 // is the frame's own (pool-carried capacity): each
                 // iteration rewrites it — the override wins, otherwise
                 // the binding step fills this iteration's words.
-                frame.level0.clear();
+                if !first {
+                    frame.level0.clear();
+                }
                 if let Some(l0) = &level0_override {
                     frame.level0.clone_from(l0);
                 }
@@ -1124,21 +1139,9 @@ impl Interp {
 
         // 定义命名空间（与 call_proc 同源：注册名的限定前缀）。
         let prev_namespace = self.current_namespace.clone();
+        // Pool invariant: popped frames are fully cleared (see call_proc).
         let mut frame = match self.frame_pool.pop() {
-            Some(mut f) => {
-                f.locals.clear();
-                f.locals_order.clear();
-                f.array_locals.clear();
-                f.upvars.clear();
-                f.local_procs.clear();
-                f.deferred_scripts.clear();
-                f.slots.clear();
-                f.slot_aliased.clear();
-                f.link_keys.clear();
-                f.has_aliased = false;
-                f.slot_table = None;
-                f
-            }
+            Some(f) => f,
             None => Box::new(CallFrame {
                 locals: VarMap::default(),
                 locals_order: Vec::new(),
@@ -1161,13 +1164,12 @@ impl Interp {
         if !matches!(&frame.call_ns, Some(n) if Rc::ptr_eq(n, &prev_namespace)) {
             frame.call_ns = Some(Rc::clone(&prev_namespace));
         }
-        frame.tailcall = None;
-        frame.level0.clear();
         frame.ns_depth = self.ns_level0.len();
         self.frames.push(frame);
 
         // slot-locals 门 + 种子（call_proc 同款——params 对齐 + 无
-        // statics；OO prelink 槽的 LOAD-BEARING 不变量同源）。
+        // statics；OO prelink 槽的 LOAD-BEARING 不变量同源）。池不变式：
+        // 槽向量已空，无需 clear。
         let slot_mode = match &def.compiled {
             Some(code)
                 if !code.fallback
@@ -1179,20 +1181,12 @@ impl Interp {
                 let table = Rc::clone(code);
                 let n = code.locals().len();
                 let frame = self.frames.last_mut().unwrap();
-                frame.slots.clear();
                 frame.slots.resize(n, Value::unset());
-                frame.slot_aliased.clear();
-                frame.has_aliased = false;
-                frame.link_keys.clear();
                 frame.slot_table = Some(table);
                 true
             }
             _ => {
                 let frame = self.frames.last_mut().unwrap();
-                frame.slots.clear();
-                frame.slot_aliased.clear();
-                frame.has_aliased = false;
-                frame.link_keys.clear();
                 frame.slot_table = None;
                 false
             }
@@ -1208,9 +1202,6 @@ impl Interp {
             if !matches!(&frame.ns, Some(n) if Rc::ptr_eq(n, &def_ns)) {
                 frame.ns = Some(def_ns);
             }
-            frame.locals.clear();
-            frame.array_locals.clear();
-            frame.upvars.clear();
         }
 
         let has_args = def.params.last().map(|(p, _)| p.as_str()) == Some("args");

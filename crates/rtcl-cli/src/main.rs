@@ -89,6 +89,8 @@ fn main() {
 
 fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
     let mut interp = Interp::new();
+    // tclsh 的 `history` 只在 stdin/交互运行注册（oo4 p8 钉形）。
+    interp.drop_stdin_history();
 
     // Set script name for info script command
     interp.set_script_name(&path.to_string_lossy());
@@ -134,6 +136,9 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
 }
 
 fn run_command(cmd: &str, quiet: bool) -> Result<(), String> {
+    // -c 对标 tclsh 的 **stdin** 求值语境（specs/probe.sh 的 oracle 用
+    // `tclsh <<< snippet`）：stdin 运行注册 `history`，故此处不移除
+    // （文件参数模式才移除，见 run_file / oo4 p8）。
     let mut interp = Interp::new();
 
     // -c is eval-style interpretation (incremental), unlike -f's compiled

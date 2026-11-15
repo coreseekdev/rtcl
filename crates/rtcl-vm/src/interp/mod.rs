@@ -1378,6 +1378,22 @@ impl Interp {
         );
     }
 
+    /// Drop the `history` command wrapper (tclsh registers it only for
+    /// stdin/interactive runs — tclMain's RecordAndEvalObj `history add`
+    /// auto-load; a **file-argument or `-c` run has no `history` command**,
+    /// 2026-11-15 实测)。Removes the `::history` proc (the `::tcl::history`
+    /// implementation stays, as in tclsh) and its command-order entries so
+    /// the `info commands` replay matches tclsh's file-mode table.
+    pub fn drop_stdin_history(&mut self) {
+        for key in ["::history", "history"] {
+            self.procs.remove(key);
+            self.commands.remove(key);
+            self.import_aliases.remove(key);
+            self.command_order.retain(|k| k != key);
+        }
+        self.note_cmd_mutation();
+    }
+
     /// Whether we are inside a procedure scope.
     #[allow(dead_code)]
     pub(crate) fn in_proc(&self) -> bool {

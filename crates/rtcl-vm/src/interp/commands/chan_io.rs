@@ -9,6 +9,18 @@ fn io_err(msg: std::io::Error) -> Error {
     Error::runtime(msg.to_string(), crate::error::ErrorCode::Io)
 }
 
+/// 读端 io::Error → tclsh 形：`error reading "<chan>": <strerror>` +
+/// POSIX errorCode（errno 已知时）。tclsh 实测：async 死路 gets →
+/// `error reading "sockX": socket is not connected`、EC POSIX ENOTCONN。
+fn read_io_err(interp: &mut Interp, id: &str, e: &std::io::Error) -> Error {
+    super::io::posix_error(interp, format!("error reading \"{}\"", id), e)
+}
+
+/// flush 端同形（`error flushing "<chan>": <strerror>`）。
+fn flush_io_err(interp: &mut Interp, id: &str, e: &std::io::Error) -> Error {
+    super::io::posix_error(interp, format!("error flushing \"{}\"", id), e)
+}
+
 fn io_err_str(msg: impl std::fmt::Display) -> Error {
     Error::runtime(msg.to_string(), crate::error::ErrorCode::Io)
 }
@@ -232,12 +244,15 @@ pub fn cmd_read(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let (ch, cfg) = interp.channels.channel_ctx_mut(chan_id).unwrap();
 
     if let Some(count) = count {
-        let s = crate::channel::channel_read_chars_cfg(ch, cfg, count as usize)
-            .map_err(io_err)?;
+        let r = crate::channel::channel_read_chars_cfg(ch, cfg, count as usize);
+        drop(cfg);
+        let s = r.map_err(|e| read_io_err(interp, chan_id, &e))?;
         Ok(Value::from_str(&s))
     } else {
         // read channelId  (read all)
-        let mut s = crate::channel::channel_read_all_cfg(ch, cfg).map_err(io_err)?;
+        let r = crate::channel::channel_read_all_cfg(ch, cfg);
+        drop(cfg);
+        let mut s = r.map_err(|e| read_io_err(interp, chan_id, &e))?;
         if nonewline && s.ends_with('\n') {
             s.pop();
         }
@@ -296,7 +311,9 @@ pub fn cmd_gets(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let (ch, cfg) = interp.channels.channel_ctx_mut(chan_id).unwrap();
 
-    let line = crate::channel::channel_read_line_cfg(ch, cfg).map_err(io_err)?;
+    let r = crate::channel::channel_read_line_cfg(ch, cfg);
+    drop(cfg);
+    let line = r.map_err(|e| read_io_err(interp, chan_id, &e))?;
     finish_gets(interp, args, line.as_deref())
 }
 
@@ -437,7 +454,9 @@ pub fn cmd_flush(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if !ch.is_writable() {
         return Err(not_opened(interp, chan_id, false));
     }
-    ch.flush().map_err(io_err)?;
+    let r = ch.flush();
+    drop(ch);
+    r.map_err(|e| flush_io_err(interp, chan_id, &e))?;
     Ok(Value::empty())
 }
 
@@ -475,6 +494,51 @@ const FCONFIGURE_OPTIONS: &[&str] = &[
     "-eofchar",
     "-translation",
 ];
+
+/// socket 通道的查询面（tclsh 8.6.17 实测 bad-option 文案序）：
+/// 基础六项 + `-connecting`/`-peername`/`-sockname`（查询专用——set 面
+/// 仍只认基础六项，tclsh 对只读项的 set 报基础表 bad option）。
+const FCONFIGURE_SOCKET_OPTIONS: &[&str] = &[
+    "-blocking",
+    "-buffering",
+    "-buffersize",
+    "-encoding",
+    "-eofchar",
+    "-translation",
+    "-connecting",
+    "-peername",
+    "-sockname",
+];
+
+/// `-peername`/`-sockname` 元素序（tclsh 8.6.17 实测）：{数字地址 主机名
+/// 端口}——第一元素是 NI_NUMERICHOST 数字、第二是 getnameinfo 反解名
+///（127.0.0.1 → localhost）。
+#[cfg(feature = "net")]
+fn sock_addr_value(addr: &std::net::SocketAddr) -> Value {
+    Value::from_list(&[
+        Value::from_str(&addr.ip().to_string()),
+        Value::from_str(&crate::channel::sock_hostname(addr)),
+        Value::from_int(addr.port() as i64),
+    ])
+}
+
+/// 非 net 构建：socket 通道不存在（sock_connecting 恒 None），不可达。
+#[cfg(not(feature = "net"))]
+fn sock_addr_value(_addr: &std::net::SocketAddr) -> Value {
+    Value::empty()
+}
+
+/// `can't get peername/sockname: …`（POSIX errorCode 随 errno）。
+#[cfg(feature = "net")]
+fn sock_addr_err(interp: &mut Interp, which: &str, e: &std::io::Error) -> Error {
+    super::io::posix_error(interp, format!("can't get {}", which), e)
+}
+
+/// 非 net 构建桩（不可达）。
+#[cfg(not(feature = "net"))]
+fn sock_addr_err(_interp: &mut Interp, _which: &str, _e: &std::io::Error) -> Error {
+    Error::runtime("sockets not built", crate::error::ErrorCode::Io)
+}
 
 /// Render an `-eofchar` query the way Tcl does: single-access channels
 /// report a one-element list, read/write channels a two-element list.
@@ -549,6 +613,13 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let ch = interp.channels.get(chan_id).unwrap();
         (ch.is_readable(), ch.is_writable())
     };
+    // socket 通道？（-peername/-sockname/-connecting 只对 socket 存在。）
+    let is_socket = interp
+        .channels
+        .get_mut(chan_id)
+        .unwrap()
+        .sock_connecting()
+        .is_some();
 
     if args.len() == 2 {
         // Query all options.  translation 的 rw 二元组与 rw eofchar
@@ -580,23 +651,44 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         } else {
             eof
         };
-        let result = format!(
+        let mut result = format!(
             "-blocking {} -buffering {} -buffersize {} -encoding {} -eofchar {} -translation {}",
             blocking, buffering, cfg.buffer_size, cfg.encoding, eof_field, trans_field,
         );
+        if is_socket {
+            // tclsh：socket 全查询尾部追加带括引的 -peername/-sockname
+            //（`-peername {127.0.0.1 localhost 36849}`）。取不到的选项
+            // 直接跳过、不报错（实测：async 死路全查询只出 -sockname，
+            // -peername 缺席，rc=0）；单选项查询才报 can't get peername。
+            let peer = interp.channels.get_mut(chan_id).unwrap().sock_peer_addr();
+            if let Some(Ok(peer_addr)) = peer {
+                result.push_str(&format!(" -peername {{{}}}", sock_addr_value(&peer_addr).as_str()));
+            }
+            let local = interp.channels.get(chan_id).unwrap().sock_local_addr();
+            if let Some(Ok(local_addr)) = local {
+                result.push_str(&format!(" -sockname {{{}}}", sock_addr_value(&local_addr).as_str()));
+            }
+        }
         return Ok(Value::from_str(&result));
     }
 
     if args.len() == 3 {
-        // Query a single option
-        let opt = match resolve_prefix(FCONFIGURE_OPTIONS, args[2].as_str()) {
+        // Query a single option. socket 通道解析面含 -connecting/
+        // -peername/-sockname（bad-option 文案按所在表渲染）。
+        let table: &[&str] = if is_socket {
+            FCONFIGURE_SOCKET_OPTIONS
+        } else {
+            FCONFIGURE_OPTIONS
+        };
+        let opt = match resolve_prefix(table, args[2].as_str()) {
             Ok(o) => o,
             Err(()) => {
                 // Tcl's fconfigure does not attach an errorCode here.
                 super::list::set_error_code(interp, "NONE");
                 return Err(super::list::tcl_err(format!(
-                    "bad option \"{}\": should be one of -blocking, -buffering, -buffersize, -encoding, -eofchar, or -translation",
-                    args[2].as_str()
+                    "bad option \"{}\": should be one of {}",
+                    args[2].as_str(),
+                    must_be_list(table)
                 )));
             }
         };
@@ -617,6 +709,35 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 cfg.translation_in,
                 cfg.translation_out,
             ),
+            "-connecting" => {
+                let connecting = interp
+                    .channels
+                    .get_mut(chan_id)
+                    .unwrap()
+                    .sock_connecting()
+                    .unwrap_or(false);
+                Value::from_str(if connecting { "1" } else { "0" })
+            }
+            "-peername" => {
+                let peer = interp.channels.get_mut(chan_id).unwrap().sock_peer_addr();
+                match peer {
+                    Some(Ok(addr)) => sock_addr_value(&addr),
+                    Some(Err(e)) => return Err(sock_addr_err(interp, "peername", &e)),
+                    None => unreachable!(),
+                }
+            }
+            "-sockname" => {
+                let local = interp
+                    .channels
+                    .get(chan_id)
+                    .unwrap()
+                    .sock_local_addr()
+                    .unwrap();
+                match local {
+                    Ok(addr) => sock_addr_value(&addr),
+                    Err(e) => return Err(sock_addr_err(interp, "sockname", &e)),
+                }
+            }
             _ => unreachable!(),
         };
         return Ok(val);
@@ -998,9 +1119,11 @@ pub fn cmd_socket(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // message only when it reaches the client path (server sockets are
     // not supported).
     let mut i = 1;
+    let mut is_async = false;
     while i < args.len() && args[i].as_str().starts_with('-') {
         let o = args[i].as_str();
         if o == "-async" {
+            is_async = true;
             i += 1;
         } else if o == "-myaddr" || o == "-myport" {
             if i + 1 >= args.len() {
@@ -1030,8 +1153,25 @@ pub fn cmd_socket(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let host = args[i].as_str();
     let port = args[i + 1].as_str();
-    let id = interp.channels.open_socket(host, port).map_err(|msg| {
-        Error::runtime(msg, crate::error::ErrorCode::Io)
+    // 建通道失败三面（tclsh 8.6.17 实测）：端口 GetInt 失败 → 无前缀
+    // 消息 + EC TCL VALUE INTEGER；越界/负端口 → couldn't open socket:
+    // …（EC NONE）；连接层 → couldn't open socket: <strerror>（EC POSIX
+    // 随 errno）。-async 走后台连接（socket 即建、句柄立即返回）。
+    let open_result = if is_async {
+        interp.channels.open_socket_async(host, port)
+    } else {
+        interp.channels.open_socket(host, port)
+    };
+    let id = open_result.map_err(|e| {
+        if e.value_error {
+            super::list::set_error_code(interp, "TCL VALUE INTEGER");
+            Error::runtime(e.message, crate::error::ErrorCode::Generic)
+        } else if let Some(ioe) = &e.os {
+            super::io::posix_error(interp, "couldn't open socket".to_string(), ioe)
+        } else {
+            super::list::set_error_code(interp, "NONE");
+            Error::runtime(e.message, crate::error::ErrorCode::Io)
+        }
     })?;
     Ok(Value::from_str(id.as_str()))
 }

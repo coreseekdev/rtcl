@@ -54,7 +54,7 @@ clock = ["std", "dep:libc"]       # clock seconds/clicks/format/scan (+ unix 本
 regexp = ["std", "dep:regex"]     # regexp, regsub
 regexp-lite = ["std", "dep:regex-lite"]  # regexp, regsub (smaller WASM binary)
 env = ["std"]                     # $env array from OS environment
-net = ["std", "io"]               # socket (TCP client) — native only; wasm
+net = ["std", "io", "dep:libc"]             # socket (TCP client) — native only; wasm
                                   # has no sockets (可选特性：wasm 构建不含)
 load-cmd = ["std"]                # load/unload — dynamic loading is
                                   # meaningless on wasm (可选特性)

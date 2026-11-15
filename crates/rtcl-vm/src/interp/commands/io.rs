@@ -26,6 +26,11 @@ pub(crate) fn errno_text(code: i32) -> Option<(&'static str, &'static str)> {
         30 => ("read-only file system", "EROFS"),
         32 => ("broken pipe", "EPIPE"),
         36 => ("file name too long", "ENAMETOOLONG"),
+        104 => ("connection reset by peer", "ECONNRESET"),
+        107 => ("socket is not connected", "ENOTCONN"),
+        110 => ("connection timed out", "ETIMEDOUT"),
+        111 => ("connection refused", "ECONNREFUSED"),
+        98 => ("address already in use", "EADDRINUSE"),
         40 => ("too many levels of symbolic links", "ELOOP"),
         _ => return None,
     })
@@ -38,6 +43,11 @@ pub(crate) fn io_error_text(e: &std::io::Error, fallback: &str) -> String {
         return text.to_string();
     }
     let s = e.to_string();
+    // Rust 的 getaddrinfo 包装文案去掉前缀后是 gai_strerror 原文——
+    // 保持原大小写（tclsh 报 "Name or service not known"，首字母大写）。
+    if let Some(rest) = s.strip_prefix("failed to lookup address information: ") {
+        return rest.to_string();
+    }
     let s = match s.find(" (os error ") {
         Some(i) => &s[..i],
         None => s.as_str(),
@@ -204,15 +214,17 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 crate::error::ErrorCode::Io,
             ))?;
 
-        crate::channel::channel_write_str_cfg(ch, cfg, &out).map_err(|e| Error::runtime(
-            format!("error writing \"{}\": {}", chan_id, e),
-            crate::error::ErrorCode::Io,
-        ))?;
-
-        ch.flush().map_err(|e| Error::runtime(
-            format!("error flushing \"{}\": {}", chan_id, e),
-            crate::error::ErrorCode::Io,
-        ))?;
+        let defer = ch.flush_deferred();
+        let wr = crate::channel::channel_write_str_cfg(ch, cfg, &out);
+        let fl = if wr.is_ok() && !defer { ch.flush().err() } else { None };
+        drop(ch);
+        drop(cfg);
+        // tclsh 形：`error writing "<chan>": <strerror>` /
+        // `error flushing "<chan>": <strerror>` + POSIX errorCode。
+        wr.map_err(|e| posix_error(interp, format!("error writing \"{}\"", chan_id), &e))?;
+        if let Some(e) = fl {
+            return Err(posix_error(interp, format!("error flushing \"{}\"", chan_id), &e));
+        }
 
         Ok(Value::empty())
     }

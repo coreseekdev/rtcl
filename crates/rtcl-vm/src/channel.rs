@@ -47,6 +47,29 @@ pub trait Channel: Send {
     fn channel_type(&self) -> &'static str;
     /// Return associated process IDs (for pipe channels). Empty list for non-pipe channels.
     fn pids(&self) -> Vec<u32> { vec![] }
+    /// socket 查询面。非 socket 通道三者皆 None。
+    /// `-peername`：会补齐惰性连接（活连接等到完成，死连接置 failed
+    /// 报 ENOTCONN——tclsh：async 失败后 `can't get peername: socket is
+    /// not connected`）。
+    fn sock_peer_addr(&mut self) -> Option<io::Result<std::net::SocketAddr>> {
+        None
+    }
+    /// `-sockname`：被动查询（不触发连接补齐；socket 建出即绑临时
+    /// 端口，tclsh async 死路实测 sockname 仍可查）。
+    fn sock_local_addr(&self) -> Option<io::Result<std::net::SocketAddr>> {
+        None
+    }
+    /// `-connecting` 值（async 连接进行中 = 1）。查询以非阻塞探测核对
+    /// 内核态（tclsh 后台连接事件推进的近似）。
+    fn sock_connecting(&mut self) -> Option<bool> {
+        None
+    }
+    /// 写出由驱动缓冲中（async connecting 期）：puts 不尾随 flush
+    ///（tclsh -buffering full：缓冲成功即返回，外送在 flush/读补齐/
+    /// close）。
+    fn flush_deferred(&self) -> bool {
+        false
+    }
 }
 
 /// 输出 EOL 翻译（写侧，字符级——编码之前）。
@@ -753,33 +776,317 @@ fn parse_posix_access(mode: &str) -> Option<PosixAccess> {
 /// the [`Channel`] surface.  rtcl names sockets `sock0`, `sock1`, …;
 /// tclsh derives names from the channel struct pointer (`sock4a2b…`)
 /// and is not reproducible (DIVERGENCES: socket).
+///
+/// `-async` = **socket 先建、连接后台化、完成惰性**：`socket -async` 即
+/// 创 socket（非阻塞 connect 已发起，EINPROGRESS）——`-sockname` 立即可
+/// 查（socket 已绑临时端口，tclsh 实测同）、`-peername` 在补齐连接前报
+/// ENOTCONN。首次真实 I/O（flush 带 buffered 数据/读/peername）把连接
+/// 补齐：poll(POLLOUT) + SO_ERROR——`-blocking 1` 语义（tclsh 文档：
+/// async 通道 I/O 阻塞到连接完成）。补齐失败置 `failed` 终态：后续 I/O
+/// 一律报 `socket is not connected`（EC POSIX ENOTCONN）——tclsh 的 async
+/// 连接失败不保留原始拒因，状态即 ENOTCONN（实测：flush/gets/read 均
+/// ENOTCONN、close 仍成功）。connecting 期间 puts 进 `out_buf`（tclsh
+/// 的用户态写缓冲，-buffering full），flush/关通道才外送。
 #[cfg(feature = "net")]
 pub struct TcpChannel {
-    stream: std::net::TcpStream,
+    stream: Option<std::net::TcpStream>,
+    /// `-async`：connect 已发起、未补齐（poll/SO_ERROR 待定）。
+    connecting: bool,
+    /// 连接终态失败：所有 I/O 报 ENOTCONN（见上文）。
+    failed: bool,
+    /// connecting 期间缓冲的写出（flush/关通道时外送）。
+    out_buf: Vec<u8>,
     eof: bool,
+}
+
+/// getnameinfo 的主机名（127.0.0.1 → "localhost"——tclsh -peername/-sockname
+/// 第二元素）。flags=0：反解失败自动落数字地址（与 tclsh 对未反解地址
+/// 的行为一致）。串行化：getnameinfo 非线程安全（POSIX 明示）。
+#[cfg(feature = "net")]
+pub(crate) fn sock_hostname(addr: &std::net::SocketAddr) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::raw::c_char;
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        let (sa_ptr, sa_len): (*const libc::sockaddr, libc::socklen_t) = match addr {
+            std::net::SocketAddr::V4(a) => {
+                sin.sin_family = libc::AF_INET as libc::sa_family_t;
+                sin.sin_port = a.port().to_be();
+                sin.sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
+                (
+                    std::ptr::addr_of!(sin) as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+            std::net::SocketAddr::V6(a) => {
+                sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                sin6.sin6_port = a.port().to_be();
+                sin6.sin6_flowinfo = a.flowinfo();
+                sin6.sin6_addr.s6_addr = a.ip().octets();
+                sin6.sin6_scope_id = a.scope_id();
+                (
+                    std::ptr::addr_of!(sin6) as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        };
+        let mut host = [0u8; 1025];
+        let rc = unsafe {
+            libc::getnameinfo(
+                sa_ptr,
+                sa_len,
+                host.as_mut_ptr() as *mut c_char,
+                host.len() as libc::socklen_t,
+                std::ptr::null_mut() as *mut c_char,
+                0,
+                0,
+            )
+        };
+        if rc == 0 {
+            let s = unsafe { std::ffi::CStr::from_ptr(host.as_ptr() as *const c_char) };
+            if let Ok(s) = s.to_str() {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+        addr.ip().to_string()
+    }
+    #[cfg(not(unix))]
+    {
+        addr.ip().to_string()
+    }
 }
 
 #[cfg(feature = "net")]
 impl TcpChannel {
     pub fn new(stream: std::net::TcpStream) -> Self {
-        Self { stream, eof: false }
+        Self { stream: Some(stream), connecting: false, failed: false, out_buf: Vec::new(), eof: false }
+    }
+
+    /// `-async`：先建 socket（非阻塞 connect 发起），句柄立即返回。
+    /// unix 走 raw socket（std 无未连接 TcpStream 构造面）；connect 立即
+    /// 失败（如 DNS 拒绝）→ 建通道失败（tclsh 同：getaddrinfo 同步）。
+    /// 非 unix 平台回落 std 阻塞连接（-async 退化为同步；native-only
+    /// 特性，wasm 构建不含 net）。
+    pub fn new_async(host: &str, port: u16) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let stream = Self::async_connect_unix(host, port)?;
+            Ok(Self {
+                stream: Some(stream),
+                connecting: true,
+                failed: false,
+                out_buf: Vec::new(),
+                eof: false,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let stream = std::net::TcpStream::connect((host, port))?;
+            Ok(Self::new(stream))
+        }
+    }
+
+    /// unix：socket() + 非阻塞 connect()（EINPROGRESS 即后台连接）。
+    #[cfg(unix)]
+    fn async_connect_unix(host: &str, port: u16) -> io::Result<std::net::TcpStream> {
+        use std::os::unix::io::FromRawFd;
+        // 地址解析在调度时同步完成（tclsh：socket -async 坏主机名立即
+        // 报 couldn't open socket）。
+        let addr: std::net::SocketAddr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))?
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address for host"))?;
+        let fd = unsafe {
+            libc::socket(
+                match addr {
+                    std::net::SocketAddr::V4(_) => libc::AF_INET,
+                    std::net::SocketAddr::V6(_) => libc::AF_INET6,
+                },
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let rc = unsafe {
+            match addr {
+                std::net::SocketAddr::V4(a) => {
+                    let sin = libc::sockaddr_in {
+                        sin_family: libc::AF_INET as libc::sa_family_t,
+                        sin_port: a.port().to_be(),
+                        sin_addr: libc::in_addr {
+                            s_addr: u32::from_ne_bytes(a.ip().octets()),
+                        },
+                        sin_zero: [0; 8],
+                    };
+                    libc::connect(
+                        fd,
+                        std::ptr::addr_of!(sin) as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                }
+                std::net::SocketAddr::V6(a) => {
+                    let sin6 = libc::sockaddr_in6 {
+                        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                        sin6_port: a.port().to_be(),
+                        sin6_flowinfo: a.flowinfo(),
+                        sin6_addr: libc::in6_addr { s6_addr: a.ip().octets() },
+                        sin6_scope_id: a.scope_id(),
+                    };
+                    libc::connect(
+                        fd,
+                        std::ptr::addr_of!(sin6) as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                    )
+                }
+            }
+        };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINPROGRESS) {
+                unsafe { libc::close(fd) };
+                return Err(e);
+            }
+        }
+        Ok(unsafe { std::net::TcpStream::from_raw_fd(fd) })
+    }
+
+    /// 连接补齐（connecting → connected）。阻塞语义：poll(POLLOUT) 至
+    /// 可写（`-blocking 1` 下的 I/O 等连接完成）；SO_ERROR 非 0 → 置
+    /// `failed` 终态并报 ENOTCONN（tclsh 不保留原始拒因）。补齐成功即
+    /// 外送 connecting 期间缓冲的写出（tclsh：连接完成事件自动 flush
+    /// 用户态写缓冲）。
+    fn ensure_connected(&mut self) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::from_raw_os_error(107)); // ENOTCONN
+        }
+        if self.connecting {
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let fd = self.stream.as_ref().unwrap().as_raw_fd();
+                let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+                let rc = unsafe { libc::poll(&mut pfd as *mut _, 1, -1) };
+                if rc < 0 {
+                    let e = io::Error::last_os_error();
+                    self.failed = true;
+                    self.connecting = false;
+                    return Err(e);
+                }
+                let mut err: libc::c_int = 0;
+                let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        &mut err as *mut _ as *mut libc::c_void,
+                        &mut len,
+                    );
+                }
+                if err != 0 {
+                    // tclsh：async 连接失败不保留拒因——状态即未连接。
+                    self.failed = true;
+                    self.connecting = false;
+                    return Err(io::Error::from_raw_os_error(107)); // ENOTCONN
+                }
+                // 恢复阻塞模式（-blocking 1 的通道语义）。
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
+                if flags >= 0 {
+                    unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                // 非 unix 无后台连接路径（new_async 已同步连好）。
+            }
+            self.connecting = false;
+            self.drain_out_buf()?;
+        }
+        Ok(())
+    }
+
+    /// 非阻塞连接状态核对（`-connecting` 查询面）：poll(100ms) 看内核
+    /// 态——就绪即补齐（完成/置 failed）。tclsh 的 async 连接由后台事件
+    /// 推进、-connecting 反映当前进度；rtcl 无后台事件，以有界探测近似
+    /// （回环上拒连/完成都是微秒级，实测 tclsh -connecting 立即为 0）。
+    /// 真网络慢连接仍在窗口内报 1——语义保持。
+    fn poll_connecting(&mut self) -> bool {
+        if !self.connecting {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self.stream.as_ref().unwrap().as_raw_fd();
+            let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+            let rc = unsafe { libc::poll(&mut pfd as *mut _, 1, 100) };
+            if rc > 0 && (pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP)) != 0 {
+                let _ = self.ensure_connected();
+            }
+        }
+        self.connecting
+    }
+
+    /// 外送 connecting 期间缓冲的写出。
+    fn drain_out_buf(&mut self) -> io::Result<()> {
+        if self.out_buf.is_empty() {
+            return Ok(());
+        }
+        let buf = std::mem::take(&mut self.out_buf);
+        let mut off = 0;
+        while off < buf.len() {
+            let n = io::Write::write(self.stream.as_mut().unwrap(), &buf[off..])?;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"));
+            }
+            off += n;
+        }
+        Ok(())
+    }
+
+    /// 真实 flush（trait flush 的内核：补连接 + 弃缓冲语义在其外壳）。
+    fn do_flush(&mut self) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::from_raw_os_error(107)); // ENOTCONN
+        }
+        self.ensure_connected()?;
+        io::Write::flush(self.stream.as_mut().unwrap())
     }
 }
 
 #[cfg(feature = "net")]
 impl Channel for TcpChannel {
     fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = io::Read::read(&mut self.stream, buf)?;
+        self.ensure_connected()?;
+        let n = match io::Read::read(self.stream.as_mut().unwrap(), buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                // 对端关闭（服务端 close 带未读数据 → RST）：tclsh 把
+                // ECONNRESET 读作 EOF（缓冲清空后返回 0），不抛错。
+                self.eof = true;
+                return Ok(0);
+            }
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             self.eof = true;
         }
         Ok(n)
     }
     fn read_line(&mut self) -> io::Result<Option<String>> {
+        self.ensure_connected()?;
         let mut line = String::new();
         let mut byte = [0u8; 1];
         loop {
-            match io::Read::read(&mut self.stream, &mut byte) {
+            let r = self.read_bytes(&mut byte);
+            match r {
                 Ok(0) => {
                     self.eof = true;
                     if line.is_empty() {
@@ -802,16 +1109,34 @@ impl Channel for TcpChannel {
         Ok(Some(line))
     }
     fn read_all(&mut self) -> io::Result<String> {
+        self.ensure_connected()?;
         let mut s = String::new();
-        io::Read::read_to_string(&mut self.stream, &mut s)?;
+        io::Read::read_to_string(self.stream.as_mut().unwrap(), &mut s)?;
         self.eof = true;
         Ok(s)
     }
     fn write_bytes(&mut self, data: &[u8]) -> io::Result<usize> {
-        io::Write::write(&mut self.stream, data)
+        // 连接未补齐/已失败：puts 只入 out_buf 并报成功（tclsh：
+        // -buffering full 的 socket puts 进用户态缓冲即成功——实测 async
+        // 死路 puts 仍 rc=0，flush 才触 ENOTCONN）。
+        if self.failed || self.connecting {
+            self.out_buf.extend_from_slice(data);
+            return Ok(data.len());
+        }
+        io::Write::write(self.stream.as_mut().unwrap(), data)
     }
     fn flush(&mut self) -> io::Result<()> {
-        io::Write::flush(&mut self.stream)
+        // tclsh：写缓冲为空的 flush 是 no-op——连接中/已失败都报成功
+        //（实测：死路第一次 flush 触错并弃缓冲，第二次 flush 空缓冲
+        // rc=0）。带缓冲才补连接并外送；失败即弃缓冲（tclsh 同）。
+        if self.out_buf.is_empty() && (self.connecting || self.failed) {
+            return Ok(());
+        }
+        let r = self.do_flush();
+        if r.is_err() {
+            self.out_buf.clear();
+        }
+        r
     }
     fn seek(&mut self, _whence: io::SeekFrom) -> io::Result<u64> {
         // tclsh：socket 通道驱动无 SeekProc，Tcl_Seek 报 EINVAL
@@ -825,7 +1150,15 @@ impl Channel for TcpChannel {
         self.eof
     }
     fn set_at_eof(&mut self) { self.eof = true; }
-    fn close(self: Box<Self>) -> io::Result<()> {
+    fn close(mut self: Box<Self>) -> io::Result<()> {
+        // 关通道外送连接期间的缓冲（tclsh close 前隐式 flush；flush 错误
+        // 在 close 面被吞——实测 async 死路 + 已缓冲 puts，close 仍成功）。
+        if !self.failed && self.connecting {
+            let _ = self.ensure_connected();
+        }
+        if !self.failed && !self.out_buf.is_empty() {
+            let _ = self.drain_out_buf();
+        }
         Ok(())
     }
     fn is_readable(&self) -> bool {
@@ -836,6 +1169,41 @@ impl Channel for TcpChannel {
     }
     fn channel_type(&self) -> &'static str {
         "tcp"
+    }
+    fn sock_peer_addr(&mut self) -> Option<io::Result<std::net::SocketAddr>> {
+        if let Err(e) = self.ensure_connected() {
+            return Some(Err(e));
+        }
+        self.stream.as_ref().map(|s| s.peer_addr())
+    }
+    fn sock_local_addr(&self) -> Option<io::Result<std::net::SocketAddr>> {
+        self.stream.as_ref().map(|s| s.local_addr())
+    }
+    fn flush_deferred(&self) -> bool {
+        self.connecting || self.failed
+    }
+    fn sock_connecting(&mut self) -> Option<bool> {
+        Some(self.poll_connecting())
+    }
+}
+
+/// `socket` 建通道失败面（tclsh 8.6.17 实测分形）：
+/// - `value_error`：端口非整数且非服务名——消息 `expected integer but
+///   got "<raw>"`（无 couldn't 前缀），EC `TCL VALUE INTEGER`；
+/// - 越界/负端口：message 自带 `couldn't open socket: …` 前缀，EC NONE；
+/// - 连接层（拒绝/DNS）：`os` 带 io::Error——`couldn't open socket:
+///   <strerror>`，EC POSIX 随 errno（DNS 无 errno → EC NONE）。
+#[cfg(feature = "net")]
+pub struct SocketOpenError {
+    pub message: String,
+    pub value_error: bool,
+    pub os: Option<io::Error>,
+}
+
+#[cfg(feature = "net")]
+impl std::fmt::Display for SocketOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
 }
 
@@ -947,30 +1315,98 @@ impl ChannelTable {
         Ok(id)
     }
 
+    /// 端口参数解析（tclsh 8.6.17 TclSockGetPort 形，实测差分）：
+    /// 1. 整数形：`>65535` → `couldn't open socket: port number too
+    ///    high`；`<0` → gai EAI_SERVICE 文案（Servname not supported…）；
+    ///    其余即用。
+    /// 2. 非整数：getservbyname 服务名（"http" → 80，tclsh 同）；
+    ///    未命中保留 GetInt 错误——`expected integer but got "<raw>"`
+    ///   （无 couldn't 前缀）+ EC TCL VALUE INTEGER。
+    #[cfg(feature = "net")]
+    fn resolve_socket_port(port: &str) -> std::result::Result<u16, SocketOpenError> {
+        if let Ok(p) = port.parse::<i64>() {
+            if p > 65535 {
+                return Err(SocketOpenError {
+                    message: "couldn't open socket: port number too high".to_string(),
+                    value_error: false,
+                    os: None,
+                });
+            }
+            if p < 0 {
+                return Err(SocketOpenError {
+                    message: "couldn't open socket: Servname not supported for ai_socktype"
+                        .to_string(),
+                    value_error: false,
+                    os: None,
+                });
+            }
+            return Ok(p as u16);
+        }
+        #[cfg(unix)]
+        {
+            if let Ok(cport) = std::ffi::CString::new(port) {
+                let sp = unsafe {
+                    libc::getservbyname(cport.as_ptr(), b"tcp\0".as_ptr() as *const std::os::raw::c_char)
+                };
+                if !sp.is_null() {
+                    return Ok(u16::from_be(unsafe { (*sp).s_port as u16 }));
+                }
+            }
+        }
+        Err(SocketOpenError {
+            message: format!("expected integer but got \"{}\"", port),
+            value_error: true,
+            os: None,
+        })
+    }
+
     /// TCP client connect (`socket host port ?-myaddr ...? ?-myport ...?`).
     #[cfg(feature = "net")]
-    /// Returns the new channel id (`sockN`).
+    /// Returns the new channel id (`sockN`). 建通道失败（连接拒绝/域名
+    /// 解析/端口形）以 [`SocketOpenError`] 返回——tclsh 分面：
+    /// GetInt 失败无前缀 + EC TCL VALUE INTEGER；越界/负端口/解析失败
+    /// `couldn't open socket: …` 无 EC；连接拒绝走 POSIX EC。
     pub fn open_socket(
         &mut self,
         host: &str,
         port: &str,
-    ) -> std::result::Result<ChannelId, String> {
+    ) -> std::result::Result<ChannelId, SocketOpenError> {
         use std::net::TcpStream;
-        let port_n: u16 = port
-            .parse()
-            .map_err(|_| format!("couldn't open socket: invalid port \"{}\"", port))?;
-        let stream = TcpStream::connect((host, port_n)).map_err(|e| {
-            // tclsh reports the bare strerror ("connection refused",
-            // "Name or service not known"), not Rust's "(os error N)".
-            let s = e.to_string();
-            let bare = s.split(" (os error").next().unwrap_or(&s).to_string();
-            let mut c = bare.chars();
-            let lowered = match c.next() {
-                Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
-                None => bare,
-            };
-            format!("couldn't open socket: {}", lowered)
+        let port_n = Self::resolve_socket_port(port)?;
+        let stream = TcpStream::connect((host, port_n)).map_err(|e| SocketOpenError {
+            message: String::new(),
+            value_error: false,
+            os: Some(e),
         })?;
+        let id = self.install_socket(TcpChannel::new(stream));
+        Ok(id)
+    }
+
+    /// TCP `-async` connect：socket 即建（非阻塞 connect 发起），句柄
+    /// 立即返回；真实 I/O 时补连接。端口形错误与同步路径同面（tclsh
+    /// `socket -async 127.0.0.1 99999` 同报 port number too high）；
+    /// 服务名端口（http）可解析建通道。
+    #[cfg(feature = "net")]
+    pub fn open_socket_async(
+        &mut self,
+        host: &str,
+        port: &str,
+    ) -> std::result::Result<ChannelId, SocketOpenError> {
+        let port_n = Self::resolve_socket_port(port)?;
+        let ch = TcpChannel::new_async(host, port_n).map_err(|e| SocketOpenError {
+            message: String::new(),
+            value_error: false,
+            os: Some(e),
+        })?;
+        let id = self.install_socket(ch);
+        Ok(id)
+    }
+
+    /// 注册 socket 通道（sockN、utf-8、translation auto/crlf——tclsh
+    /// socket 的 fconfigure 全查询实测 `auto crlf`，写侧 \n 落线即 CRLF，
+    /// 区别于文件的 auto/平台 lf）。
+    #[cfg(feature = "net")]
+    fn install_socket(&mut self, ch: TcpChannel) -> ChannelId {
         let id = {
             let mut n: u32 = 0;
             loop {
@@ -985,12 +1421,12 @@ impl ChannelTable {
         self.configs.insert(id.clone(), ChannelConfig {
             encoding: sys,
             translation_in: TranslationMode::Auto,
-            translation_out: platform_translation(),
+            translation_out: TranslationMode::CrLf,
             ..ChannelConfig::default()
         });
         self.track(id.clone());
-        self.channels.insert(id.clone(), Box::new(TcpChannel::new(stream)));
-        Ok(id)
+        self.channels.insert(id.clone(), Box::new(ch));
+        id
     }
 
     /// Register a channel with a specific ID (used for pipe channels from exec).

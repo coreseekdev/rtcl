@@ -215,6 +215,8 @@ pub(crate) struct OoObject {
     /// Object-level hidden（oo::objdefine o {unexport m}——隐藏继承
     /// 方法，D-41⑤；原 no-op）。
     pub hidden: Vec<String>,
+    /// 对象侧的同款提及名单（见 OoClass.mentioned）。
+    pub mentioned: Vec<String>,
     /// `variable` declarations (definition order).  `Rc`: the method-call
     /// fast path memoises on this list's identity (a declaration replaces
     /// the whole vector, so a pointer compare detects it).
@@ -235,6 +237,11 @@ pub(crate) struct OoClass {
     /// Names hidden by `unexport` of a method this class does not itself
     /// define (hides the inherited implementation).
     pub hidden: Vec<String>,
+    /// Names **mentioned** by `export`/`unexport` for which no own method
+    /// exists (tclsh 的 exportedMes/hiddenMes 记账)：`deletemethod`/
+    /// `renamemethod` 遇到名单上的名字静默消费（oo7 d15/u2/n2），不在
+    /// 名单上才报 `method X does not exist`（u5/u6/n3）。
+    pub mentioned: Vec<String>,
     pub constructor: Option<MethodDef>,
     pub destructor: Option<MethodDef>,
     /// `filter` names (stored; not executed).
@@ -325,6 +332,12 @@ pub(crate) struct OoState {
     /// key no longer holds such a command were renamed away and are swept
     /// when their owner is destroyed (oo-1.20).
     pub my_commands: FxMapK<String, String>,
+    /// Native OO namespace commands whose dispatch derives the def word or
+    /// info subcommand from the invoked key: `::oo::define::method` →
+    /// "method", `::oo::define::variable` → slot "variable",
+    /// `::oo::InfoClass::methods` → "methods", …  Populated at bootstrap
+    /// and never mutated afterwards.
+    pub slot_words: FxMapK<String, String>,
     /// Structural mutation stamp: bumped at EVERY mutation of the class /
     /// object tables (create, destroy, every define word — see the bump
     /// sites in this module).  [`OoState::chain_memo`] entries validate
@@ -399,25 +412,66 @@ fn register_oo_command(interp: &mut Interp, key: &str, usage: &'static str, func
     interp.note_cmd_mutation();
 }
 
-/// The definition words, registered as procs in `::oo::define` so that a
-/// definition script's `variable` shadows the builtin `variable` command
-/// (dispatch tries procs before builtins).
-const DEF_WORDS: &[&str] = &[
-    "method", "forward", "mixin", "superclass", "constructor", "destructor",
-    "export", "unexport", "variable", "filter", "deletemethod", "renamemethod", "self",
+/// The definition words.  tclsh 8.6.17 exposes them as *native* commands
+/// in `::oo::define` / `::oo::objdefine` (`info procs ::oo::define::*` is
+/// empty), with the four slot words (`variable`/`filter`/`mixin`/
+/// `superclass` and the objdefine triple minus `superclass`/`class`)
+/// implemented by slot *objects* — instances of `::oo::Slot`.  rtcl keeps
+/// the same shape: every word is a native command whose dispatcher defers
+/// to the def machinery; the slot objects additionally exist in the object
+/// table so `info object class ::oo::define::variable` → `::oo::Slot`.
+///
+/// Insertion order per namespace table (tclhash replay-verified against
+/// `info commands ::oo::define::*` / `::oo::objdefine::*`).
+const DEFINE_WORDS: &[&str] = &[
+    "method", "forward", "unexport", "mixin", "superclass", "variable", "self",
+    "renamemethod", "filter", "export", "deletemethod", "destructor", "constructor",
+];
+/// Slot words: implemented by `::oo::Slot` instance objects.
+const DEFINE_SLOTS: &[&str] = &["mixin", "superclass", "variable", "filter"];
+const OBJDEFINE_WORDS: &[&str] = &[
+    "class", "forward", "export", "method", "renamemethod", "filter", "variable",
+    "unexport", "deletemethod", "mixin",
+];
+const OBJDEFINE_SLOTS: &[&str] = &["filter", "variable", "mixin"];
+/// `::oo::Helpers` — the per-method helpers.  tclsh puts `self`/`next`/
+/// `nextto` in this namespace and puts it on every object namespace's
+/// path; rtcl keeps its per-object registration (dispatch-identical) but
+/// exposes the namespace with the same three commands and remaps
+/// `namespace which` (the visibility surface is what's user-visible).
+const HELPERS_ORDER: &[&str] = &["nextto", "self", "next"];
+/// `::oo::InfoClass` / `::oo::InfoObject` subcommand words, in the
+/// namespace-table insertion order (== iteration order; replay-verified).
+const INFOCLASS_ORDER: &[&str] = &[
+    "instances", "mixins", "subclasses", "variables", "definition", "filters",
+    "methodtype", "call", "forward", "superclasses", "constructor", "destructor",
+    "methods",
+];
+const INFOOBJECT_ORDER: &[&str] = &[
+    "mixins", "definition", "filters", "variables", "methodtype", "call",
+    "forward", "isa", "namespace", "methods", "vars", "class",
 ];
 
 /// Create the core classes and commands.  Called once from `Interp::new`.
 pub(crate) fn init(interp: &mut Interp) {
     interp.ensure_ns_path("::oo");
-    interp.ensure_ns_path("::oo::define");
+    // ::oo child-namespace insertion order — solved (specs/tclhash fit
+    // machinery) to reproduce tclsh 8.6.17's `namespace children ::oo` in
+    // BOTH the fresh-boot state (15 children) and the oo4 x2 state (33
+    // children after user objects); replay-verified.
+    for ns in [
+        "::oo::Obj7", "::oo::Obj6", "::oo::define", "::oo::Obj10", "::oo::Helpers",
+        "::oo::Obj9", "::oo::Obj2", "::oo::InfoObject", "::oo::InfoClass",
+        "::oo::Obj5", "::oo::Obj1", "::oo::Obj3", "::oo::Obj8", "::oo::objdefine",
+        "::oo::Obj4",
+    ] {
+        interp.ensure_ns_path(ns);
+    }
 
     // ::oo::object — the root class.  `destroy` is its own (core) method so
     // that `info class methods oo::object` shows it and every instance's
     // must-be list ends with `destroy`.
-    let id = interp.oo.next_obj_id + 1;
-    interp.oo.next_obj_id = id;
-    let mut root = OoClass { ns: Rc::from(format!("::oo::Obj{}", id)), ..Default::default() };
+    let mut root = OoClass { ns: Rc::from("::oo::Obj1"), ..Default::default() };
     root.methods.push(("destroy".to_string(), builtin_method("destroy")));
     // D-43⑤：oo::object 私有核心方法（tclsh must-be 清单含它们）。
     // D-43⑤：这四个是**私有**核心方法（tclsh：外部 o varname 报
@@ -430,61 +484,153 @@ pub(crate) fn init(interp: &mut Interp) {
     interp.oo.classes.insert("::oo::object".to_string(), root);
     interp.oo.creation_order.push("::oo::object".to_string());
 
-    // ::oo::class — the metaclass.
-    let id = interp.oo.next_obj_id + 1;
-    interp.oo.next_obj_id = id;
+    // ::oo::class — the metaclass.  Its instances are every class object:
+    // the bootstrap trio (oo::object, oo::class, oo::Slot — creation
+    // order, `info class instances oo::class` oracle) plus all user
+    // classes (classes resolve to the metaclass via object_class_of).
     let mut metaclass =
-        OoClass { ns: Rc::from(format!("::oo::Obj{}", id)), superclasses: vec!["::oo::object".to_string()], ..Default::default() };
+        OoClass { ns: Rc::from("::oo::Obj2"), superclasses: vec!["::oo::object".to_string()], ..Default::default() };
     metaclass.methods.push(("create".to_string(), builtin_method("create")));
     metaclass.methods.push(("new".to_string(), builtin_method("new")));
     interp.oo.classes.insert("::oo::class".to_string(), metaclass);
     interp.oo.creation_order.push("::oo::class".to_string());
 
-    // ::oo::Slot — the filter slot class tclsh ships as a direct subclass
-    // of oo::object (visible in `info class subclasses oo::object` and
-    // `info commands ::oo::*`).
-    let id = interp.oo.next_obj_id + 1;
-    interp.oo.next_obj_id = id;
+    // ::oo::Slot — the slot class tclsh ships as a direct subclass of
+    // oo::object.  Its exported methods are the slot operations
+    // (`-clear`/`-append`/`-set`, insertion order replaying to tclsh's
+    // `-clear -append -set` iteration); its instances are the seven slot
+    // objects below (creation order = tclsh's `info class instances
+    // oo::Slot`).
     interp.oo.classes.insert(
         "::oo::Slot".to_string(),
         OoClass {
-            ns: Rc::from(format!("::oo::Obj{}", id)),
+            ns: Rc::from("::oo::Obj3"),
             superclasses: vec!["::oo::object".to_string()],
+            methods: vec![
+                ("-clear".to_string(), plain_method("-clear")),
+                ("-set".to_string(), plain_method("-set")),
+                ("-append".to_string(), plain_method("-append")),
+            ],
             ..Default::default()
         },
     );
     interp.oo.creation_order.push("::oo::Slot".to_string());
 
-    register_object_command(interp, "::oo::object", cmd_oo_object);
+    // The seven slot objects (instances of ::oo::Slot, namespaces Obj4..10
+    // — tclsh burns Obj1..Obj10 on the bootstrap, so the first user object
+    // is ::oo::Obj11).  Creation order drives `info class instances
+    // oo::Slot`; each is a command whose dispatch defers to the def
+    // machinery inside a definition context and errors outside it.
+    // The seven slot objects (instances of ::oo::Slot, namespaces Obj4..10
+    // — tclsh burns Obj1..Obj10 on the bootstrap, so the first user object
+    // is ::oo::Obj11).  Creation order (drives `info class instances
+    // oo::Slot`) — their COMMAND registration notes land at the definition
+    // word positions below (the define/objdefine tables interleave slots
+    // and plain words; tclsh-verified orders).
+    let slots: [(&str, &str, &str); 7] = [
+        ("::oo::define::filter", "::oo::Obj4", "filter"),
+        ("::oo::define::mixin", "::oo::Obj5", "mixin"),
+        ("::oo::define::superclass", "::oo::Obj6", "superclass"),
+        ("::oo::define::variable", "::oo::Obj7", "variable"),
+        ("::oo::objdefine::filter", "::oo::Obj8", "filter"),
+        ("::oo::objdefine::mixin", "::oo::Obj9", "mixin"),
+        ("::oo::objdefine::variable", "::oo::Obj10", "variable"),
+    ];
+    for (key, ns, word) in slots {
+        interp.oo.objects.insert(
+            key.to_string(),
+            OoObject {
+                ns: Rc::from(ns),
+                class: "::oo::Slot".to_string(),
+                ..Default::default()
+            },
+        );
+        interp.oo.creation_order.push(key.to_string());
+        interp.oo.slot_words.insert(key.to_string(), word.to_string());
+        attach_ns_commands(interp, key, ns);
+    }
+
+    // ::oo commands, in the ::oo namespace-table insertion order
+    // (tclhash replay of `info commands ::oo::*`).
+    register_oo_command(interp, "::oo::UnknownDefinition", "?arg ...?", cmd_oo_unknown_definition);
     register_object_command(interp, "::oo::class", cmd_oo_object);
-    register_object_command(interp, "::oo::Slot", cmd_oo_object);
-    register_oo_command(interp, "::oo::copy", "sourceName ?targetName? ?targetNamespace?", cmd_oo_copy);
-    register_oo_command(interp, "::oo::define", "className arg ?arg ...?", cmd_oo_define);
     register_oo_command(interp, "::oo::objdefine", "objectName arg ?arg ...?", cmd_oo_objdefine);
+    register_oo_command(interp, "::oo::InfoClass", "subcommand ?arg ...?", cmd_oo_infoclass);
+    register_object_command(interp, "::oo::Slot", cmd_oo_object);
+    register_object_command(interp, "::oo::object", cmd_oo_object);
+    register_oo_command(interp, "::oo::define", "className arg ?arg ...?", cmd_oo_define);
+    register_oo_command(interp, "::oo::copy", "sourceName ?targetName? ?targetNamespace?", cmd_oo_copy);
+    register_oo_command(interp, "::oo::InfoObject", "subcommand ?arg ...?", cmd_oo_infoobject);
     register_oo_command(interp, "::tcl::oo::def", "word ?arg ...?", cmd_oo_def);
 
-    // Definition words as procs in ::oo::define.
-    for word in DEF_WORDS {
+    // Definition words as native commands in ::oo::define / ::oo::objdefine
+    // (tclsh: `info procs ::oo::define::*` is empty), in the namespace
+    // table insertion order; slot words register their slot OBJECT's
+    // command (cmd_oo_slot) at the word's position.
+    for word in DEFINE_WORDS {
         let key = format!("::oo::define::{}", word);
-        let body = format!("::tcl::oo::def {} {{*}}$args", word);
-        if interp.procs.insert(
-            key.clone(),
-            super::super::Rc::new(ProcDef {
-                params: super::super::Rc::new(vec![("args".to_string(), None)]),
-                body: super::super::Rc::from(body),
-                statics: super::super::Rc::new(HashMap::new()), compiled: None,
-            }),
-        ).is_none() {
-            interp.note_new_command(&key);
+        if DEFINE_SLOTS.contains(&word) {
+            register_object_command(interp, &key, cmd_oo_slot);
+        } else {
+            register_define_word(interp, "::oo::define", word);
         }
     }
-    interp.note_cmd_mutation();
+    for word in OBJDEFINE_WORDS {
+        let key = format!("::oo::objdefine::{}", word);
+        if OBJDEFINE_SLOTS.contains(&word) {
+            register_object_command(interp, &key, cmd_oo_slot);
+        } else {
+            register_define_word(interp, "::oo::objdefine", word);
+        }
+    }
+
+    // ::oo::Helpers — self/next/nextto (nextto newly implemented).
+    register_oo_command(interp, "::oo::Helpers::nextto", "className ?arg ...?", cmd_oo_nextto);
+    register_oo_command(interp, "::oo::Helpers::self", "subcommand ?arg ...?", cmd_oo_self);
+    register_oo_command(interp, "::oo::Helpers::next", "?arg ...?", cmd_oo_next);
+
+    // ::oo::InfoClass / ::oo::InfoObject subcommand natives — direct
+    // delegation to the info machinery with the invoked name as the usage
+    // prefix (tclsh: `::oo::InfoClass::forward A` names itself in wrong-args).
+    for word in INFOCLASS_ORDER {
+        let key = format!("::oo::InfoClass::{}", word);
+        register_oo_command(interp, &key, "?arg ...?", cmd_oo_infoclass_sub);
+        interp.oo.slot_words.insert(key, word.to_string());
+    }
+    for word in INFOOBJECT_ORDER {
+        let key = format!("::oo::InfoObject::{}", word);
+        register_oo_command(interp, &key, "?arg ...?", cmd_oo_infoobject_sub);
+        interp.oo.slot_words.insert(key, word.to_string());
+    }
 
     // tclsh 的 ObjN 计数器在用户代码前已消耗到 10（核心内部对象
     // Obj3..Obj10；可观察的核心名仍是 oo::object=Obj1 / oo::class=
     // Obj2），首个用户对象是 ::oo::Obj11（实测 tclsh 8.6.17）。基线
     // 对齐让对象名、info object namespace、errorstack 文本逐字一致。
     interp.oo.next_obj_id = 10;
+}
+
+/// Register one definition word as a native command under `ns`.
+fn register_define_word(interp: &mut Interp, ns: &str, word: &str) {
+    let key = format!("{}::{}", ns, word);
+    register_oo_command(interp, &key, "?arg ...?", cmd_oo_define_word);
+    interp.oo.slot_words.insert(key, word.to_string());
+}
+
+/// A plain (Tcl-bodied, exported) method with an empty body — the slot
+/// operations (-clear/-append/-set) are exported so `info class methods
+/// oo::Slot` lists them (tclsh oracle); they never execute via dispatch
+/// (the Slot object's own dispatch walks its class chain oo::class→
+/// oo::object, not its own method table — `::oo::Slot -clear` stays
+/// `unknown method "-clear": must be create, destroy or new`).
+fn plain_method(name: &'static str) -> MethodDef {
+    MethodDef {
+        params: Vec::new().into(),
+        body: Rc::from(""),
+        exported: true,
+        kind: MethodKind::Tcl,
+        proc_memo: fresh_memo(), head_cache: RefCell::new(None),
+    }
 }
 
 // ── namespace helpers ──────────────────────────────────────────────────
@@ -1216,6 +1362,12 @@ fn memoised_proc_def(
     (proc_def, links)
 }
 
+/// Object-namespace lookup for sibling modules (`namespace which`'s
+/// ::oo::Helpers remap).
+pub(crate) fn object_ns_owner(interp: &Interp, owner_key: &str) -> Rc<str> {
+    object_ns_of(interp, owner_key)
+}
+
 fn object_ns_of(interp: &Interp, key: &str) -> Rc<str> {
     if let Some(o) = interp.oo.objects.get(key) {
         return Rc::clone(&o.ns);
@@ -1291,14 +1443,10 @@ fn invoke_method(
     include_private: bool,
 ) -> Result<Value> {
     // D-41⑤：对象级 hidden 的方法对外部调用视同未定义（my 私有调用
-    // 不受限——tclsh unexport 只对外）。
-    if !include_private {
-        if let Some(o) = interp.oo.objects.get(key.as_ref()) {
-            if o.hidden.iter().any(|h| h == method) {
-                return Err(unknown_method_error(interp, key, typed, method, include_private));
-            }
-        }
-    }
+    // 不受限——tclsh unexport 只对外）。tclsh 实测（2026-11-15 p1/p2）：
+    // hidden 方法调用仍**先进 filter**（filter 链可含对象级 hidden 的
+    // 方法——filter 名在私有视图解析），filter 用尽才落 unknown 错误，
+    // 故此处不再提前返回，交给链空兜底。
     let (chain0, method_rc) = chain_for(interp, key, method, include_private);
     // D-41②：filter 前置进链——对象 filters 最先、类链 filter 按
     // linearize 序（最具体先），每个 filter 名在对象全链上解析取其
@@ -1337,7 +1485,10 @@ fn invoke_method(
         } else {
             let mut prepended: Vec<ChainEntry> = Vec::new();
             for f in flist.iter().rev() {
-                let (fchain, _) = chain_for(interp, key, f, include_private);
+                // filter 方法名按**私有视图**解析（tclsh g5/g6：filter
+                // +h 自身被 unexport 后照常拦截；p1：对象级 hidden 的
+                // filter 同样生效）。
+                let (fchain, _) = chain_for(interp, key, f, true);
                 if let Some(entry) = fchain.first() {
                     prepended.push(entry.clone());
                 }
@@ -1725,6 +1876,89 @@ extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Valu
     r
 }
 
+/// `::oo::Helpers::nextto className ?arg ...?` — 以**指定类**的实现为
+/// 下一站调用当前方法（nx1/nx3：N2+[nextto N1] → N1.m 以**显式实参**
+/// 调用，无实参即空参——与 next 一样不重转发）。元数错误按 tclsh
+/// nt1 形：`wrong # args: should be "nextto N1"`（usage 词 = `nextto`
+/// + 给定的类名实参）。
+extern "Rust" fn cmd_oo_nextto(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() != 2 {
+        // tclsh 元数文案分形：0 参 → `nextto class ?arg...?`（oo22 nt1）；
+        // ≥2 参 → usage 词带给定类名 `nextto N1`（早批 nt1 探针）。
+        if args.len() < 2 {
+            return Err(Error::Msg(
+                "wrong # args: should be \"nextto class ?arg...?\"".to_string(),
+            ));
+        }
+        return Err(Error::Msg(format!(
+            "wrong # args: should be \"nextto {}\"",
+            args[1].as_str()
+        )));
+    }
+    let act = match top_active(interp) {
+        Some(a) => a,
+        None => {
+            set_tcloo_next_inner(interp);
+            return Err(Error::Msg("no next method implementation".to_string()));
+        }
+    };
+    // 目标类按对象键解析（tclsh nt2/nt3：语境外的 nextto 不可见——
+    // 本命令仅在对象 ns path 上，方法体内可达）。
+    let typed = args[1].as_str();
+    let target = resolve_object_key(interp, typed)
+        .ok_or_else(|| does_not_refer(true, typed))?;
+    // 从当前实现的下一站起，找 owner == 目标类的首个链条目。
+    let start = act.index + 1;
+    let hit = act.chain[start..]
+        .iter()
+        .position(|e| match &e.owner {
+            Owner::Class(c) => c.as_str() == target.as_ref(),
+            Owner::Object => false,
+        })
+        .map(|p| start + p);
+    let next_index = match hit {
+        Some(i) => i,
+        None => {
+            set_tcloo_next_inner(interp);
+            return Err(Error::Msg(
+                match act.method.as_ref() {
+                    "destructor" => "no next destructor implementation",
+                    "constructor" => "no next constructor implementation",
+                    _ => "no next method implementation",
+                }
+                .to_string(),
+            ));
+        }
+    };
+    let call_args: Vec<Value> = if args.len() > 2 {
+        args[2..].to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut l0 = vec![Value::from_str("next")];
+    l0.extend(args[2..].iter().cloned());
+    interp.frame_level0_args = Some(l0);
+    interp.frame_next_call = true;
+    let typed_word = "next";
+    let r = exec_chain_entry(
+        interp,
+        &act.obj,
+        &act.method,
+        next_index,
+        &act.chain,
+        &call_args,
+        typed_word,
+        &Value::from_str(typed_word),
+        false,
+    );
+    if let Err(e) = &r {
+        if interp.err_is_error(e) && !interp.err_call_body {
+            set_tcloo_next_inner(interp);
+        }
+    }
+    r
+}
+
 /// next 自身分派失败时的 INNER（tclsh 的内部命令名，实测原样单词）。
 fn set_tcloo_next_inner(interp: &mut Interp) {
     interp.err_pending_inner = Some("tclooNext".to_string());
@@ -1739,11 +1973,12 @@ fn next_ns(interp: &mut Interp) -> String {
 }
 
 fn attach_ns_commands(interp: &mut Interp, key: &str, ns: &str) {
-    for role in ["my", "self", "next"] {
+    for role in ["my", "self", "next", "nextto"] {
         let cmd_key = format!("{}::{}", ns, role);
         let func: crate::command::CommandFunc = match role {
             "my" => cmd_oo_my,
             "self" => cmd_oo_self,
+            "nextto" => cmd_oo_nextto,
             _ => cmd_oo_next,
         };
         if interp.commands.insert(cmd_key.clone(), func).is_none() {
@@ -1752,6 +1987,17 @@ fn attach_ns_commands(interp: &mut Interp, key: &str, ns: &str) {
         interp
             .command_categories
             .insert(cmd_key.clone(), crate::command::CommandCategory::Extension);
+        // tclsh 的对象命名空间只**露** `my`（oo4 p4/p9：`info commands
+        // ::oo::ObjN::*` → 仅 my）；self/next 经 ::oo::Helpers（对象 ns
+        // 的 path）供给。rtcl 无 path 解析，保持 per-object 注册但对
+        // 列表面隐藏，`namespace which` 重映射到 ::oo::Helpers（见
+        // ns_which）。
+        if role != "my" {
+            // hidden 集合存的是去 `::` 前缀的键（is_command_hidden 统一
+            // trim 后探测）。self/next/nextto 三个经 Helpers 供给的词
+            // 全部列表面隐藏（oo4 p4/p9）。
+            interp.hidden_commands.insert(cmd_key.trim_start_matches("::").to_string());
+        }
         interp.oo.my_commands.insert(cmd_key, key.to_string());
     }
     interp.note_cmd_mutation();
@@ -1786,11 +2032,12 @@ fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
         interp.command_categories.remove(bare);
         interp.command_meta.remove(bare);
     }
-    for role in ["my", "self", "next"] {
+    for role in ["my", "self", "next", "nextto"] {
         let cmd_key = format!("{}::{}", ns, role);
         interp.commands.remove(&cmd_key);
         interp.command_categories.remove(&cmd_key);
         interp.command_meta.remove(&cmd_key);
+        interp.hidden_commands.remove(cmd_key.trim_start_matches("::"));
         interp.oo.my_commands.remove(&cmd_key);
     }
     // Renamed-away my/self/next commands (same dispatcher, key no longer
@@ -1801,7 +2048,8 @@ fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
         .filter(|(k, f)| {
             let is_oo = **f as usize == cmd_oo_my as *const () as usize
                 || **f as usize == cmd_oo_self as *const () as usize
-                || **f as usize == cmd_oo_next as *const () as usize;
+                || **f as usize == cmd_oo_next as *const () as usize
+                || **f as usize == cmd_oo_nextto as *const () as usize;
             is_oo && !interp.oo.my_commands.contains_key(*k)
         })
         .map(|(k, _)| k.clone())
@@ -2292,6 +2540,158 @@ extern "Rust" fn cmd_oo_def(interp: &mut Interp, args: &[Value]) -> Result<Value
     }
 }
 
+// ── the ::oo::define / ::oo::objdefine word commands ───────────────────
+
+/// The context error tclsh prints for every definition word / slot command
+/// invoked outside `oo::define`/`oo::objdefine`.
+const DEF_CONTEXT_ERR: &str = "this command may only be called from within the context of an ::oo::define or ::oo::objdefine command";
+
+/// `::oo::define::<word>` / `::oo::objdefine::<word>` — the definition
+/// words as native commands (tclsh's `info procs ::oo::define::*` is
+/// empty).  Inside a definition context the word defers to the def
+/// machinery; outside it, non-slot words check arity first (tclsh:
+/// `::oo::define::constructor x` → wrong # args naming the invoked
+/// command) and then raise the context error; slot words raise the
+/// context error immediately.
+extern "Rust" fn cmd_oo_define_word(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let key = args[0].as_str();
+    let word = interp
+        .oo
+        .slot_words
+        .get(key)
+        .map(|w| w.to_string())
+        .unwrap_or_else(|| key.rsplit("::").next().unwrap_or(key).to_string());
+    if interp.oo.define_stack.is_empty() {
+        // Arity shapes first for the words that check arity in-script
+        // (tclsh probes d1/d3/d5/d6); everything else goes straight to the
+        // context error (d7).
+        let n = args.len() - 1;
+        let bad = |usage: &str| {
+            Err(Error::wrong_args_with_usage(key, usage.split(' ').count() + 1, args.len(), usage))
+        };
+        return match word.as_str() {
+            "method" if n != 3 => bad("name args body"),
+            "forward" if n < 2 => bad("name cmdName ?arg ...?"),
+            "constructor" if n != 2 => bad("arguments body"),
+            "destructor" if n != 1 => bad("body"),
+            "export" if n < 1 => bad("name ?name ...?"),
+            _ => Err(Error::Msg(DEF_CONTEXT_ERR.to_string())),
+        };
+    }
+    run_def_word(interp, &word, &args[1..])
+}
+
+/// The slot objects (`::oo::define::variable` etc — instances of
+/// `::oo::Slot`).  Inside a definition context the slot defers to the def
+/// machinery; outside it, any call raises the context error (tclsh probes
+/// sd-*/so-*/sc0/sc1 — the arity is never reached).
+extern "Rust" fn cmd_oo_slot(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let key = args[0].as_str();
+    if interp.oo.define_stack.is_empty() {
+        return Err(Error::Msg(DEF_CONTEXT_ERR.to_string()));
+    }
+    let word = interp
+        .oo
+        .slot_words
+        .get(key)
+        .map(|w| w.to_string())
+        .unwrap_or_else(|| key.rsplit("::").next().unwrap_or(key).to_string());
+    run_def_word(interp, &word, &args[1..])
+}
+
+/// def_dispatch 的调用外壳：tclsh 的定义词是核心命令——出错时错误帧
+/// 直接以 `method/constructor …` 起头，包装命令（`::tcl::oo::def` 或
+/// native 的 define 词键）不记帧（cmd_oo_def 同款抑制，EI 帧基线）。
+fn run_def_word(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value> {
+    match def_dispatch(interp, word, rest) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // 多词形（oo::define C method …，define_cmd_prefix 在场）：
+            // tclsh 只报外层 `oo::define C <word> …` 帧——抑制内层（旧
+            // cmd_oo_def 单一漏斗的行为）。定义**脚本**语境（无 prefix）
+            // 的裸词：native 自身的派发帧就是 `method …` 首帧，**不**
+            // 抑制（抑制会连 `while executing "method …"` 一起丢——
+            // oo8 回归教训：旧漏斗的抑制针对 ::tcl::oo::def 包装帧，
+            // native 无包装帧，照搬会把首帧一起清掉）。
+            if interp.oo.define_cmd_prefix.is_some() && interp.err_is_error(&e) {
+                interp.err_info = None;
+                interp.err_calls.clear();
+                interp.err_inner = None;
+                interp.err_fresh = false;
+                interp.err_from_subst = false;
+                interp.err_skip_log = true;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// `::oo::UnknownDefinition` — tclsh's unknown-method machinery hook.
+/// Direct calls: 0 args → `bad call of unknown handler`; anything else →
+/// the define-context error (oracle ud/ud2).
+extern "Rust" fn cmd_oo_unknown_definition(interp: &mut Interp, _args: &[Value]) -> Result<Value> {
+    let _ = interp;
+    Err(Error::Msg(
+        if _args.len() <= 1 {
+            "bad call of unknown handler".to_string()
+        } else {
+            DEF_CONTEXT_ERR.to_string()
+        },
+    ))
+}
+
+/// `::oo::InfoClass` — direct alias of `info class` with the invoked name
+/// as the usage prefix (oracle ic2/a6).
+extern "Rust" fn cmd_oo_infoclass(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let mut sub: Vec<Value> = vec![args[0].clone(), Value::from_str("class")];
+    sub.extend_from_slice(&args[1..]);
+    info_class(interp, &sub, &args[0].as_str().to_string())
+}
+
+/// `::oo::InfoClass::<sub>` — delegation to the info-class machinery with
+/// the invoked name as the usage prefix (oracle a5/a6/a7).
+extern "Rust" fn cmd_oo_infoclass_sub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let key = args[0].as_str();
+    let word = interp
+        .oo
+        .slot_words
+        .get(key)
+        .map(|w| w.to_string())
+        .unwrap_or_else(|| key.rsplit("::").next().unwrap_or(key).to_string());
+    let mut sub: Vec<Value> = vec![
+        args[0].clone(),
+        Value::from_str("class"),
+        Value::from_str(word.as_str()),
+    ];
+    sub.extend_from_slice(&args[1..]);
+    info_class(interp, &sub, &args[0].as_str().to_string())
+}
+
+/// `::oo::InfoObject` — see [`cmd_oo_infoclass`].
+extern "Rust" fn cmd_oo_infoobject(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let mut sub: Vec<Value> = vec![args[0].clone(), Value::from_str("object")];
+    sub.extend_from_slice(&args[1..]);
+    info_object(interp, &sub, &args[0].as_str().to_string())
+}
+
+/// `::oo::InfoObject::<sub>` — see [`cmd_oo_infoclass_sub`].
+extern "Rust" fn cmd_oo_infoobject_sub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let key = args[0].as_str();
+    let word = interp
+        .oo
+        .slot_words
+        .get(key)
+        .map(|w| w.to_string())
+        .unwrap_or_else(|| key.rsplit("::").next().unwrap_or(key).to_string());
+    let mut sub: Vec<Value> = vec![
+        args[0].clone(),
+        Value::from_str("object"),
+        Value::from_str(word.as_str()),
+    ];
+    sub.extend_from_slice(&args[1..]);
+    info_object(interp, &sub, &args[0].as_str().to_string())
+}
+
 // ── definition words ───────────────────────────────────────────────────
 
 fn parse_param_list(text: &str) -> Result<Vec<(String, Option<String>)>> {
@@ -2319,6 +2719,73 @@ fn parse_param_list(text: &str) -> Result<Vec<(String, Option<String>)>> {
 
 fn name_exports(name: &str) -> bool {
     matches!(name.as_bytes().first(), Some(c) if c.is_ascii_lowercase())
+}
+
+/// Record an `export`/`unexport` mention of a name with no own method
+/// (the target's mentioned bookkeeping list).
+fn record_mention(interp: &mut Interp, target: &DefineTarget, name: &str) {
+    let own = take_method_place(interp, target, name);
+    if own {
+        return;
+    }
+    match target {
+        DefineTarget::Class(c) => {
+            if let Some(cl) = interp.oo.classes.get_mut(c) {
+                if !cl.mentioned.iter().any(|m| m == name) {
+                    cl.mentioned.push(name.to_string());
+                }
+            }
+        }
+        DefineTarget::Object(o) => {
+            if let Some(ob) = interp.oo.objects.get_mut(o) {
+                if !ob.mentioned.iter().any(|m| m == name) {
+                    ob.mentioned.push(name.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Consume a mention (deletemethod/renamemethod on a name that only
+/// export/unexport bookkept).  true ⇒ name was mentioned.
+fn take_mention(interp: &mut Interp, target: &DefineTarget, name: &str) -> bool {
+    match target {
+        DefineTarget::Class(c) => {
+            if let Some(cl) = interp.oo.classes.get_mut(c) {
+                if let Some(p) = cl.mentioned.iter().position(|m| m == name) {
+                    cl.mentioned.remove(p);
+                    return true;
+                }
+            }
+        }
+        DefineTarget::Object(o) => {
+            if let Some(ob) = interp.oo.objects.get_mut(o) {
+                if let Some(p) = ob.mentioned.iter().position(|m| m == name) {
+                    ob.mentioned.remove(p);
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Own-method existence probe (no take).
+fn take_method_place(interp: &mut Interp, target: &DefineTarget, name: &str) -> bool {
+    match target {
+        DefineTarget::Class(c) => interp
+            .oo
+            .classes
+            .get(c)
+            .map(|cl| cl.methods.iter().any(|(n, _)| n == name) || cl.obj_methods.iter().any(|(n, _)| n == name))
+            .unwrap_or(false),
+        DefineTarget::Object(o) => interp
+            .oo
+            .objects
+            .get(o)
+            .map(|ob| ob.methods.iter().any(|(n, _)| n == name))
+            .unwrap_or(false),
+    }
 }
 
 /// Apply a definition word to the open definition target.
@@ -2533,6 +3000,7 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             }
             for arg in rest {
                 set_export(interp, &target, arg.as_str(), true);
+                record_mention(interp, &target, arg.as_str());
             }
             Ok(Value::empty())
         }
@@ -2541,20 +3009,40 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                 if !set_export(interp, &target, arg.as_str(), false) {
                     // Hiding a method this class does not define shadows the
                     // inherited implementation.
-                    if let DefineTarget::Class(name) = &target {
-                        if let Some(c) = interp.oo.classes.get_mut(name) {
-                            if !c.hidden.iter().any(|h| h == arg.as_str()) {
-                                c.hidden.push(arg.as_str().to_string());
+                    match &target {
+                        DefineTarget::Class(name) => {
+                            if let Some(c) = interp.oo.classes.get_mut(name) {
+                                if !c.hidden.iter().any(|h| h == arg.as_str()) {
+                                    c.hidden.push(arg.as_str().to_string());
+                                }
+                            }
+                        }
+                        DefineTarget::Object(name) => {
+                            if let Some(o) = interp.oo.objects.get_mut(name) {
+                                if !o.hidden.iter().any(|h| h == arg.as_str()) {
+                                    o.hidden.push(arg.as_str().to_string());
+                                }
                             }
                         }
                     }
                 }
+                record_mention(interp, &target, arg.as_str());
             }
             interp.oo.mutation_ctr += 1;
             Ok(Value::empty())
         }
         "deletemethod" => {
             for arg in rest {
+                // 自有方法限定（tclsh p13：对继承名 deletemethod →
+                // `method m does not exist`，类创建脚本中止）。但
+                // export/unexport **提及过**的名字静默消费（oo7 d15/
+                // u2：unexport nosuchmeth 后 deletemethod 同名 → 无事；
+                // u5/u6/n3：未提及 → 报错）。
+                if take_method(interp, &target, arg.as_str()).is_none()
+                    && !take_mention(interp, &target, arg.as_str())
+                {
+                    return Err(Error::Msg(format!("method {} does not exist", arg.as_str())));
+                }
                 delete_method(interp, &target, arg.as_str());
             }
             Ok(Value::empty())
@@ -2631,11 +3119,18 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             }
             let from = rest[0].as_str().to_string();
             let to = rest[1].as_str().to_string();
+            // 自有方法限定（tclsh p12：对继承名 renamemethod →
+            // `method m does not exist`）。
             let def = take_method(interp, &target, &from);
-            if let Some(def) = def {
-                let mut def = def;
-                def.exported = name_exports(&to);
-                set_method(interp, &target, &to, def)?;
+            match def {
+                Some(mut def) => {
+                    def.exported = name_exports(&to);
+                    set_method(interp, &target, &to, def)?;
+                }
+                None if take_mention(interp, &target, &from) => {}
+                None => {
+                    return Err(Error::Msg(format!("method {} does not exist", from)));
+                }
             }
             Ok(Value::empty())
         }
@@ -2967,8 +3462,8 @@ const CLASS_SUBCMDS: &[&str] = &[
 pub(crate) extern "Rust" fn cmd_info_entry(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() >= 2 {
         match args[1].as_str() {
-            "object" | "o" | "ob" | "obj" | "obje" | "objec" => return info_object(interp, args),
-            "class" => return info_class(interp, args),
+            "object" | "o" | "ob" | "obj" | "obje" | "objec" => return info_object(interp, args, "info object"),
+            "class" => return info_class(interp, args, "info class"),
             _ => {}
         }
     }
@@ -3057,37 +3552,36 @@ fn class_methods_listing(
                 }
             }
         }
-    } else {
+    } else if all {
         // -all：链上每类的 mixin 方法一并计入（build_chain 同款遍历）；
         // hidden（unexport 继承实现）排除。
-        let classes: Vec<String> = if all {
-            let mut out: Vec<String> = Vec::new();
-            for c in linearize(interp, key) {
-                if let Some(cls) = interp.oo.classes.get(&c) {
-                    for h in &cls.hidden {
-                        hidden.insert(h.clone());
-                    }
-                    for mx in &cls.mixins {
-                        for c2 in linearize(interp, mx) {
-                            if !out.contains(&c2) {
-                                out.push(c2.clone());
-                            }
-                        }
-                    }
-                }
-                if !out.contains(&c) {
-                    out.push(c.clone());
-                }
-            }
-            out
-        } else {
-            vec![key.to_string()]
-        };
-        for c in classes {
+        let mut classes: Vec<String> = Vec::new();
+        for c in linearize(interp, key) {
             if let Some(cls) = interp.oo.classes.get(&c) {
                 for h in &cls.hidden {
                     hidden.insert(h.clone());
                 }
+                for mx in &cls.mixins {
+                    for c2 in linearize(interp, mx) {
+                        if !classes.contains(&c2) {
+                            classes.push(c2.clone());
+                        }
+                    }
+                }
+            }
+            if !classes.contains(&c) {
+                classes.push(c.clone());
+            }
+            // tclsh 的 oo::Slot 是 listing 链截断点：穿过 Slot 的继承
+            // 不再计入 oo::object 的方法（2026-11-15 实测：Slot -all =
+            // 自有 3 个；Y(super oo::Slot) -all 同样无 destroy；而
+            // Z(super oo::object) 有 destroy）。
+            if c == "::oo::Slot" {
+                break;
+            }
+        }
+        for c in classes {
+            if let Some(cls) = interp.oo.classes.get(&c) {
                 for (name, def) in &cls.methods {
                     if (def.exported || private) && !hidden.contains(name) && !names.contains(name) {
                         names.push(name.clone());
@@ -3095,8 +3589,39 @@ fn class_methods_listing(
                 }
             }
         }
+        names.sort();
+    } else {
+        // plain（无 -all）：自有方法表按 **Tcl 哈希序** 迭代（tclsh
+        // sl1 = `-clear -append -set`，非排序非定义序——方法名尾名
+        // 重放，定义序为插入序），可见性过滤后直接产出。
+        let own: Vec<String> = interp
+            .oo
+            .classes
+            .get(key)
+            .map(|cl| cl.methods.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default();
+        let chain_hidden = interp
+            .oo
+            .classes
+            .get(key)
+            .map(|cl| cl.hidden.clone())
+            .unwrap_or_default();
+        for name in crate::interp::tclhash::tcl_order(&own) {
+            let exported = interp
+                .oo
+                .classes
+                .get(key)
+                .and_then(|cl| cl.methods.iter().find(|(n, _)| *n == name))
+                .map(|(_, d)| d.exported)
+                .unwrap_or(false);
+            if (exported || private)
+                && !chain_hidden.iter().any(|h| h == &name)
+                && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
     }
-    names.sort();
     names.dedup();
     Value::from_list(&names.iter().map(|n| Value::from_str(n)).collect::<Vec<_>>())
 }
@@ -3272,17 +3797,30 @@ fn call_chain_desc(interp: &Interp, key: &str, method: &str, class_instance: boo
 
 /// Definition of a method looked up on an object's dispatch chain.
 fn object_method_def(interp: &Interp, key: &str, method: &str) -> Option<MethodDef> {
-    build_chain(interp, key, method, true)
-        .into_iter()
-        .map(|e| e.def)
-        // Core builtins (create/destroy/...) are not in tclsh's method
-        // definition table: `info object methodtype oo::object destroy`
-        // is "unknown method".
-        .find(|d| !matches!(d.kind, MethodKind::Builtin(_)))
+    // methodtype/definition/forward 的对象侧只看**对象自有**方法表
+    // （mt-b1-m/mt-b1-destroy/x4-x6/x11：继承面一律 `unknown method`）。
+    interp.oo.objects.get(key).and_then(|o| {
+        o.methods
+            .iter()
+            .find(|(n, _)| n == method)
+            .map(|(_, d)| d.clone())
+    })
+}
+
+/// methodtype/definition/forward 的类侧：只查**自有**方法表（含核心
+/// 方法——mt8/mt9 的 `core method: "…"` 形依赖此处不跳过 Builtin）。
+fn own_class_method_def(interp: &Interp, class_key: &str, method: &str) -> Option<MethodDef> {
+    interp.oo.classes.get(class_key).and_then(|cl| {
+        cl.methods
+            .iter()
+            .find(|(n, _)| n == method)
+            .map(|(_, d)| d.clone())
+    })
 }
 
 /// Definition of an instance method of `class_key` (its own table, then
-/// the linearized superclass chain).
+/// the linearized superclass chain) — dispatch-side helper (skips core
+/// builtins, which never enter the executable chain).
 fn class_method_def(interp: &Interp, class_key: &str, method: &str) -> Option<MethodDef> {
     for c in linearize(interp, class_key) {
         if let Some((_, def)) = interp
@@ -3314,17 +3852,53 @@ fn method_def_value(def: &MethodDef) -> Value {
     ])
 }
 
+/// usage 前缀拼接：`info class` + sub → "info class forward"；
+/// `::oo::InfoClass::forward`（自带 sub 尾）→ 原样（di8：不重复）。
+fn usage_of(prefix: &str, sub: &str) -> String {
+    if prefix.ends_with(sub) {
+        prefix.to_string()
+    } else {
+        format!("{} {}", prefix, sub)
+    }
+}
+
+/// methodtype 的结果值：自有核心方法 = `core method: "<name>"`（mt8/
+/// mt9 oracle 形），其余按 method_def_type。
+fn method_type_value(def: &MethodDef) -> Value {
+    if let MethodKind::Builtin(n) = def.kind {
+        return Value::from_str(&format!("core method: \"{}\"", n));
+    }
+    Value::from_str(method_def_type(def))
+}
+
+/// forward 的目标词列表（fw2 = `::set k` / fw5 = `::set q`）；非
+/// forward 定义在此不可达（forward 子命令只认自有 forward 名——其余
+/// 名在 miss 路径已报错，plain/ctor/dtor 类名字不会进这里——防御性
+/// 回退到 method_def_value）。
+fn method_forward_words(def: &MethodDef) -> Value {
+    if let MethodKind::Forward { cmd, prefix } = &def.kind {
+        let mut words = vec![Value::from_str(cmd)];
+        words.extend(prefix.iter().map(|w| Value::from_str(w)));
+        return Value::from_list(&words);
+    }
+    method_def_value(def)
+}
+
 fn method_def_type(def: &MethodDef) -> &'static str {
     match def.kind {
-        MethodKind::Tcl | MethodKind::Builtin(_) => "method",
+        MethodKind::Tcl => "method",
+        // 自有核心方法的 methodtype 形（mt8/mt9 oracle）：`core method:
+        // "destroy"` / `core method: "create"`——由调用方拼名字，此处
+        // 标记种类。
+        MethodKind::Builtin(_) => "core method",
         MethodKind::Forward { .. } => "forward",
     }
 }
 
-fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+fn info_object(interp: &mut Interp, args: &[Value], prefix: &str) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::wrong_args_with_usage(
-            "info object",
+            prefix,
             3,
             args.len(),
             "subcommand ?arg ...?",
@@ -3339,7 +3913,7 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "namespace" | "class" | "methods" | "mixins" | "vars" | "variables" => {
             if args.len() != 4 && !(sub == "methods" && args.len() >= 4) {
                 return Err(Error::wrong_args_with_usage(
-                    format!("info object {}", sub),
+                    usage_of(prefix, sub),
                     4,
                     args.len(),
                     "objName",
@@ -3409,7 +3983,7 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "isa" => {
             if args.len() < 5 {
                 return Err(Error::wrong_args_with_usage(
-                    "info object isa",
+                    &format!("{} isa", prefix),
                     5,
                     args.len(),
                     "category objName ?arg ...?",
@@ -3428,12 +4002,13 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
             };
             let (min_args, usage) = match category {
-                "mixin" | "typeof" => (6usize, "objName arg"),
+                "mixin" => (6usize, "objName className"),
+                "typeof" => (6usize, "objName className"),
                 _ => (5usize, "objName"),
             };
             if args.len() != min_args {
                 return Err(Error::wrong_args_with_usage(
-                    format!("info object isa {}", category),
+                    format!("{} {}", usage_of(prefix, "isa"), category),
                     min_args,
                     args.len(),
                     usage,
@@ -3489,7 +4064,7 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "filters" => {
             if args.len() != 4 {
                 return Err(Error::wrong_args_with_usage(
-                    "info object filters",
+                    &usage_of(prefix, "filters"),
                     4,
                     args.len(),
                     "objName",
@@ -3512,7 +4087,7 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // name is "does not refer to an object" (oo-call-1.17).
             if args.len() != 5 {
                 return Err(Error::wrong_args_with_usage(
-                    "info object call",
+                    &usage_of(prefix, "call"),
                     3,
                     args.len(),
                     "objName methodName",
@@ -3530,7 +4105,7 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "methodtype" | "definition" => {
             if args.len() != 5 {
                 return Err(Error::wrong_args_with_usage(
-                    format!("info object {}", sub),
+                    usage_of(prefix, sub),
                     5,
                     args.len(),
                     "objName methodName",
@@ -3541,9 +4116,28 @@ fn info_object(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let name = args[4].as_str();
             match object_method_def(interp, &key, name) {
                 Some(def) if sub == "methodtype" => {
-                    Ok(Value::from_str(method_def_type(&def)))
+                    Ok(method_type_value(&def))
                 }
                 Some(def) => Ok(method_def_value(&def)),
+                None => Err(Error::Msg(format!("unknown method \"{}\"", name))),
+            }
+        }
+        // D-43⑦ 新收口：info object forward —— 1 参元数错误（fw4），
+        // 命中 forward → 目标词（fw5 = `::set q`），miss → 错误（fw6）。
+        "forward" => {
+            if args.len() != 5 {
+                return Err(Error::wrong_args_with_usage(
+                    usage_of(prefix, "forward"),
+                    5,
+                    args.len(),
+                    "objName methodName",
+                ));
+            }
+            let key = resolve_object_key(interp, args[3].as_str())
+                .ok_or_else(|| does_not_refer(true, args[3].as_str()))?;
+            let name = args[4].as_str();
+            match object_method_def(interp, &key, name) {
+                Some(def) => Ok(method_forward_words(&def)),
                 None => Err(Error::Msg(format!("unknown method \"{}\"", name))),
             }
         }
@@ -3564,10 +4158,10 @@ fn resolve_class_arg(interp: &Interp, typed: &str) -> std::result::Result<String
     }
 }
 
-fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+fn info_class(interp: &mut Interp, args: &[Value], prefix: &str) -> Result<Value> {
     if args.len() < 3 {
         return Err(Error::wrong_args_with_usage(
-            "info class",
+            prefix,
             3,
             args.len(),
             "subcommand ?arg ...?",
@@ -3582,7 +4176,7 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "superclasses" => {
             if args.len() != 4 {
                 return Err(Error::wrong_args_with_usage(
-                    "info class superclasses",
+                    &usage_of(prefix, "superclasses"),
                     4,
                     args.len(),
                     "className",
@@ -3600,7 +4194,7 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "subclasses" => {
             if args.len() != 4 {
                 return Err(Error::wrong_args_with_usage(
-                    "info class subclasses",
+                    &format!("{} subclasses", prefix),
                     4,
                     args.len(),
                     "className",
@@ -3626,7 +4220,7 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "instances" => {
             if args.len() != 4 {
                 return Err(Error::wrong_args_with_usage(
-                    "info class instances",
+                    &format!("{} instances", prefix),
                     4,
                     args.len(),
                     "className",
@@ -3638,10 +4232,14 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // tclsh lists objects whose class is exactly this one, or
                 // that carry it as an object mixin — never subclass
                 // instances (`info class instances B0` with d0i : D0 is
-                // empty; `objdefine o mixin M` is an M instance).
+                // empty; `objdefine o mixin M` is an M instance).  类对象
+                // 自身也算其元类的实例（oo1 a13：instances oo::class =
+                // ::oo::object ::oo::class ::oo::Slot + 用户类 p11）。
                 if interp.oo.objects.get(k).is_some_and(|o| {
                     o.class == key || o.mixins.iter().any(|m| *m == key)
                 }) {
+                    out.push(k.clone());
+                } else if interp.oo.classes.contains_key(k) && object_class_of(interp, k) == key {
                     out.push(k.clone());
                 }
             }
@@ -3650,7 +4248,7 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "methods" => {
             if args.len() < 4 {
                 return Err(Error::wrong_args_with_usage(
-                    "info class methods",
+                    &format!("{} methods", prefix),
                     4,
                     args.len(),
                     "className",
@@ -3675,27 +4273,78 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             Ok(class_methods_listing(interp, &key, all, private, local_private))
         }
-        // D-43⑦（部分）：constructor/destructor → {args body} / {body} / 空。
+        // D-43⑦ 精化（2026-11-15 复测）：constructor/destructor 返回实体
+        // ——ctor = {参数列表 体}（ct1 = `{a {b 2}} {set v $a}`），dtor =
+        // {体}（ct2 = `my cleanup`）；未定义为空（ct3/ct4/ct5）。
         "constructor" | "destructor" => {
             if args.len() != 4 {
                 return Err(Error::wrong_args_with_usage(
-                    format!("info class {}", sub),
+                    usage_of(prefix, sub),
                     4,
                     args.len(),
                     "className",
                 ));
             }
-            // 校验类名存在（tclsh 对不存在类报 unknown），结果恒空。
-            let _key = resolve_class_arg(interp, args[3].as_str())?;
-            // tclsh 8.6.17 实测：这两个子命令恒返回空（即便 ctor/dtor
-            // 已定义）——oracle 形状如此。
-            let items: Vec<String> = Vec::new();
+            let key = resolve_class_arg(interp, args[3].as_str())?;
+            let cls = interp.oo.classes.get(&key);
+            // destructor 返回**体字符串**（ct2 = `my cleanup`，非单元素
+            // 列表）；constructor = {参数 体} 两元素列表（ct1）。
+            if sub == "destructor" {
+                return match cls.and_then(|c| c.destructor.as_ref()) {
+                    Some(d) => Ok(Value::from_str(&d.body)),
+                    None => Ok(Value::empty()),
+                };
+            }
+            let items: Vec<String> = match (sub, cls) {
+                ("constructor", Some(c)) => match &c.constructor {
+                    // 参数列表逐参渲染（默认值保持 {name default} 形——
+                    // ct1 = `{a {b 2}} {set v $a}`，join 会丢默认值）。
+                    Some(d) => {
+                        let params = Value::from_list(
+                            &d.params
+                                .iter()
+                                .map(|(name, default)| match default {
+                                    Some(v) => Value::from_list(&[
+                                        Value::from_str(name),
+                                        Value::from_str(v),
+                                    ]),
+                                    None => Value::from_str(name),
+                                })
+                                .collect::<Vec<_>>(),
+                        );
+                        vec![params.as_str().to_string(), d.body.to_string()]
+                    }
+                    None => vec![],
+                },
+                _ => vec![],
+            };
             Ok(Value::from_list(&items.iter().map(|v| Value::from_str(v)).collect::<Vec<_>>()))
+        }
+        // D-43⑦ 新收口：`info class forward className methodName` →
+        // forward 的目标词列表（fw2 = `::set k`）；1 参 → 元数错误
+        // （fw1）；miss（含继承 forward——x1/x7）→ 错误
+        // `unknown method "…"`（探针 harness 内层 catch 后消息进 e，
+        // 外层码 0——2026-11-15 复核确认为错误形）。
+        "forward" => {
+            if args.len() != 5 {
+                return Err(Error::wrong_args_with_usage(
+                    usage_of(prefix, "forward"),
+                    5,
+                    args.len(),
+                    "className methodName",
+                ));
+            }
+            let key = resolve_class_arg(interp, args[3].as_str())?;
+            let name = args[4].as_str();
+            match own_class_method_def(interp, &key, name) {
+                Some(def) => Ok(method_forward_words(&def)),
+                None => Err(Error::Msg(format!("unknown method \"{}\"", name))),
+            }
         }
         "mixins" | "variables" | "filters" => {
             if args.len() != 4 {
                 return Err(Error::wrong_args_with_usage(
-                    format!("info class {}", sub),
+                    usage_of(prefix, sub),
                     4,
                     args.len(),
                     "className",
@@ -3706,18 +4355,6 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let items: Vec<String> = match (sub, cls) {
                 ("mixins", Some(c)) => c.mixins.clone(),
                 ("variables", Some(c)) => (*c.variables).clone(),
-                // D-43⑦（部分）：constructor/destructor → {args body} 或空。
-                ("constructor", Some(c)) => match &c.constructor {
-                    Some(d) => vec![
-                        d.params.iter().map(|p| p.0.as_str()).collect::<Vec<_>>().join(" "),
-                        d.body.to_string(),
-                    ],
-                    None => vec![],
-                },
-                ("destructor", Some(c)) => match &c.destructor {
-                    Some(d) => vec![d.body.to_string()],
-                    None => vec![],
-                },
                 ("filters", Some(c)) => c.filters.clone(),
                 _ => vec![],
             };
@@ -3731,7 +4368,7 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // before any method lookup.
             if args.len() != 5 {
                 return Err(Error::wrong_args_with_usage(
-                    "info class call",
+                    &usage_of(prefix, "call"),
                     3,
                     args.len(),
                     "className methodName",
@@ -3753,7 +4390,7 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "methodtype" | "definition" => {
             if args.len() != 5 {
                 return Err(Error::wrong_args_with_usage(
-                    format!("info class {}", sub),
+                    usage_of(prefix, sub),
                     5,
                     args.len(),
                     "className methodName",
@@ -3761,9 +4398,13 @@ fn info_class(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             let key = resolve_class_arg(interp, args[3].as_str())?;
             let name = args[4].as_str();
-            match class_method_def(interp, &key, name) {
+            // methodtype 只看**自有**方法表（含核心方法：mt8/mt9 的
+            // `core method: "destroy"/"create"` 形）；继承一律 miss
+            // （mt4：B 继承 A 的 forward fw → 错误；q1：继承 plain 同）。
+            // definition（ic-def 钉形）与 miss 均为错误 `unknown method`。
+            match own_class_method_def(interp, &key, name) {
                 Some(def) if sub == "methodtype" => {
-                    Ok(Value::from_str(method_def_type(&def)))
+                    Ok(method_type_value(&def))
                 }
                 Some(def) => Ok(method_def_value(&def)),
                 None => Err(Error::Msg(format!("unknown method \"{}\"", name))),

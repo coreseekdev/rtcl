@@ -689,8 +689,10 @@ fn ns_children(interp: &Interp, args: &[Value]) -> Result<Value> {
     let pattern = if args.len() >= 4 { Some(args[3].as_str()) } else { None };
 
     let prefix = if ns == "::" { "::".to_string() } else { format!("{}::", ns) };
-    // tclsh walks the parent namespace's child TABLE (Tcl hash order):
-    // replay the creation log filtered to direct children.
+    // tclsh walks the parent namespace's child TABLE (Tcl hash order,
+    // keyed by the child's **tail** name — the same per-table tail hashing
+    // as `info commands`); replay the creation log filtered to direct
+    // children, hashing tails.
     let live = |key: &str| -> bool {
         key != ns.as_str()
             && key.strip_prefix(prefix.as_str())
@@ -698,17 +700,36 @@ fn ns_children(interp: &Interp, args: &[Value]) -> Result<Value> {
                 .unwrap_or(false)
             && interp.namespaces.contains_key(key)
     };
-    let children = super::super::vars::replay_order(&interp.ns_order, |k| live(k))
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, k) in interp.ns_order.iter().enumerate() {
+        if live(k) {
+            seen.insert(k.as_str(), i);
+        }
+    }
+    let pairs: Vec<(String, String)> = interp
+        .ns_order
+        .iter()
+        .enumerate()
+        .filter(|(i, k)| seen.get(k.as_str()) == Some(i))
+        .map(|(_, k)| {
+            let tail = k.strip_prefix(prefix.as_str()).unwrap_or(k).to_string();
+            (k.clone(), tail)
+        })
+        .collect();
+    let tails: Vec<String> = pairs.iter().map(|(_, t)| t.clone()).collect();
+    let children = crate::interp::tclhash::tcl_order(&tails)
         .into_iter()
-        .filter(|key| {
+        .filter(|tail| {
             pattern
-                .map(|p| {
-                    crate::interp::glob_match(
-                        p,
-                        key.strip_prefix(prefix.as_str()).unwrap_or(key),
-                    )
-                })
+                .map(|p| crate::interp::glob_match(p, tail))
                 .unwrap_or(true)
+        })
+        .map(|tail| {
+            format!(
+                "{}{}",
+                prefix,
+                tail
+            )
         })
         .collect::<Vec<_>>();
     Ok(Value::from_str(&children.join(" ")))
@@ -767,6 +788,26 @@ fn ns_which(interp: &Interp, args: &[Value]) -> Result<Value> {
                 || interp.import_aliases.contains_key(&qualified)
                 || interp.commands.contains_key(&qualified)
             {
+                // tclsh 的对象命名空间只露 `my`；`self`/`next` 经
+                // ::oo::Helpers（对象 ns 的 path）供给——裸名在对象 ns 内
+                // which 到 ::oo::Helpers::self/next（oo4 p12/p13），而
+                // 显式限定名 `::oo::ObjN::self` 在 tclsh 无此命令 → 空
+                // （2026-11-15 实测）。rtcl 无 path 解析，per-object
+                // self/next 以隐藏命令注册（列表面不可见）：which 时按
+                // my_commands 归属重映射/吞掉。**仅限** my_commands 键——
+                // 其余 hidden 命令（host bridge 等）照常 which 到
+                // （http.tcl::_require_bridge 依赖，不回归）。
+                if let Some(owner) = interp.oo.my_commands.get(&qualified) {
+                    let tail = qualified.rsplit("::").next().unwrap_or("");
+                    if matches!(tail, "self" | "next" | "nextto") {
+                        let owner_ns =
+                            crate::interp::commands::oo::object_ns_owner(interp, owner);
+                        if owner_ns.as_ref() == interp.current_namespace.as_ref() {
+                            return Ok(Value::from_str(&format!("::oo::Helpers::{}", tail)));
+                        }
+                        return Ok(Value::empty());
+                    }
+                }
                 Ok(Value::from_str(&qualified))
             } else if interp.procs.contains_key(name)
                 || interp.import_aliases.contains_key(name)

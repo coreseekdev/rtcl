@@ -1019,8 +1019,22 @@ impl Interp {
             );
         }
 
-        // Built-in commands
-        let func = self.commands.get(cmd_name).cloned().or_else(|| {
+        // Built-in commands.  定义语境的裸词直指 ::oo::define::<word> 的
+        // native 命令（tclsh：定义脚本在 ::oo::define ns 求值，`variable`
+        // 等槽字遮蔽全局内建——须先于全局裸名臂探测，否则 `variable`
+        // 落到全局内建 variable）。
+        let define_word_gate = if !self.oo.define_stack.is_empty()
+            && self.current_namespace.as_ref() == "::oo::define"
+            && !cmd_name.starts_with("::")
+            && !cmd_name.contains("::")
+        {
+            self.commands.get(&format!("::oo::define::{}", cmd_name)).cloned()
+        } else {
+            None
+        };
+        let func = define_word_gate.or_else(|| {
+            self.commands.get(cmd_name).cloned()
+        }).or_else(|| {
             if self.current_namespace.as_ref() != "::" && !cmd_name.starts_with("::") {
                 let qualified = crate::interp::commands::namespace::qualify(
                     &self.current_namespace, cmd_name,

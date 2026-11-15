@@ -296,6 +296,57 @@ json/regexp-spencer 移侧模块，其分派面随之出表）。
   不受影响）、wasm check 过。尺寸：wasm raw 2.84 → 2.74 MiB（-97
   KiB regexp-lite）；pkg（bindgen+wasm-opt）≈2.0 MiB。
 
+## 10quaterdecimus. 2026-11-14..16 subagent 串行队列七阶段——语义域清账 + 性能 + Tk fork（master 线 99f30fc → 267d49a）
+
+（并发=1 的 7+1 阶段 agent 队列；每阶段独立提交推送。队列细节见
+specs/DIVERGENCES.md 各日期节与 BASELINE 深水区节，此处只记台账级。）
+
+### 语义域（§10.1 从 33 例清到 ~5 条记账残差）
+
+- **errorInfo 帧组 9/9 对齐**（d596b61，7 commits）：return 完成码
+  解码（-level 0/循环体穿透）、catch options 键序（根因=returnOpts
+  键位模型）、errorLine 归属、-f 文件语境帧（TclEvalEx 逐命令分野）、
+  uplevel ns-eval 帧保活、procedure 帧名=调用词；5 探针固化。
+- **IO/通道组收口**（329060b/45e1ad4/5c9c77b）：**socket -async 落地**
+  （非阻塞 connect + 惰性补齐，哈希轮 OPEN 解除）、fconfigure socket
+  全面、ECONNRESET→EOF、端口形矩阵、错误面统一；4 例设计差异注记。
+- **OO 可见性 14 例**（bc3e91d..98656a5）：::oo:: 核心 ns/children
+  尾名哈希双态求解/元类实例表/my 独露/nextto 新实现/history 门控
+  （连带修 order 组 7 挂账）/Slot 链截断；D-43⑦ 旧账推翻（误测）。
+- **dict+小尾巴 22 条**（d4903f2..7f2e0df）：**D-1 CLOSED**（唯一
+  OPEN 语义分歧解除）、::tcl::prefix/pkgconfig/Bgerror/CopyDirectory
+  落地、expr `<<<` 移除、rep 文案 16 字符、assemble 面、EI 相邻
+  残差 4 对齐 1 缩窄、var-order 物化序对齐。
+- 队列后总账：judge 88/88 不回退；judge/probes **340 → 380 pass**
+  （fail 52→35，余为 var/trace 组基线既有 + ghost-insert 记账）。
+
+### 性能（aadb1cf；BASELINE 深水区节）
+
+- **六基准真实基线重锚定**（任务旧数字是 perf/interp-arch-opt-2
+  快照）：fib 0.97x 起。
+- **帧池去双清落地**：fib −5.66%（0.97x→0.91x）、oo2 −2.26%、
+  oovars −1.87%；word_srcs 确认已在册；空循环画像后关闭；vars 缓议
+  （目标已消失）。
+- 语句窗口 `incr var [script]` 完整实现后 dloop +107% → 止损回退
+  （负结果留档 + reopen 线索：新旧形状 EVAL_EXPR/ts flush 序纸面
+  等价但运行时不等价，需逐写点插桩对比）。
+- 顺带入账 2 预存分歧（incr errorCode/i64 溢出）→ **已修**（267d49a，
+  incr_widen 探针固化）。
+
+### Tk fork 渲染侧（rtcl d12f426..9624d8f + nsh fork 663210d/02a647b）
+
+- `-alpha` 渲染通道落地（fork SetOpacity + rtcl 钩子 + headless
+  alpha_nsh 测试）；**字体栈 15% 偏差定位修复**（canvas text 从不设
+  字体→137.5px vs wish 139，-1.1%）；ttk 视觉小修（scale -value/
+  progressbar 填充/按钮居中）+ 主题样式系统残差交 TODO 分析；
+  treeview 表头拖宽落地（runtime 共享写核 + resize_column）；
+  MSVC/macOS 不可做（接线点标注）；a11y/IME 评估成文（IME 建议
+  收口不实现——commit 后事件面已对齐）。
+- 前置修复：menu clone 被 info commands 隐藏（VM 宿主命令默认隐藏
+  vs wish 可见）→ show_command API，八遍恢复全绿。
+- 门禁：specs/tk/run.sh 八遍全绿、workspace 1420/0（+alpha_nsh）、
+  judge 88/88；fork nsh-core 983/0。
+
 ## 10tredecimus. 2026-11-13 Spencer 全集 wasm 侧模块——regexp 外置收官（41/41 真机）
 
 （485a7b2 + e06bf4c）

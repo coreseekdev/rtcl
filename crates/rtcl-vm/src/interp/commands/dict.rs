@@ -129,6 +129,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if interp.procs.contains_key(&format!("dict {}", raw)) {
                 raw.to_string()
             } else {
+                super::list::set_error_code(interp, &format!("TCL LOOKUP SUBCOMMAND {}", raw));
                 return Err(Error::runtime(
                     format!(
                         "unknown or ambiguous subcommand \"{}\": must be append, create, exists, filter, for, get, incr, info, keys, lappend, map, merge, remove, replace, set, size, unset, update, values, or with",
@@ -139,6 +140,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
         _ => {
+            super::list::set_error_code(interp, &format!("TCL LOOKUP SUBCOMMAND {}", raw));
             return Err(Error::runtime(
                 format!(
                     "unknown or ambiguous subcommand \"{}\": must be append, create, exists, filter, for, get, incr, info, keys, lappend, map, merge, remove, replace, set, size, unset, update, values, or with",
@@ -193,11 +195,13 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     Some(v) => Ok(v.clone()),
                     None => {
                         // tclsh：缺键 errorCode = TCL LOOKUP DICT <key>
-                        //（dict-deep 探针）。
+                        //（dict-deep 探针）；INNER = `dictGet`（编译的
+                        // INST_DICT_GET 指令名，eval 形同——C4 实测）。
                         super::list::set_error_code(
                             interp,
                             &format!("TCL LOOKUP DICT {}", crate::value::tcl_quote(key)),
                         );
+                        interp.err_pending_inner = Some("dictGet".to_string());
                         Err(Error::runtime(
                             format!("key \"{}\" not known in dictionary", key),
                             crate::error::ErrorCode::NotFound,
@@ -213,10 +217,15 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 match entries.get(key) {
                     Some(v) => current = v.clone(),
                     None => {
+                        super::list::set_error_code(
+                            interp,
+                            &format!("TCL LOOKUP DICT {}", crate::value::tcl_quote(key)),
+                        );
+                        interp.err_pending_inner = Some("dictGet".to_string());
                         return Err(Error::runtime(
                             format!("key \"{}\" not known in dictionary", key),
                             crate::error::ErrorCode::NotFound,
-                        ))
+                        ));
                     }
                 }
             }
@@ -524,6 +533,7 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // unwrap_or(0) 会静默覆盖成 1）。
             let cur = match entries.get(key) {
                 Some(v) => v.as_int().ok_or_else(|| {
+                    super::list::set_error_code(interp, "TCL VALUE INTEGER");
                     Error::runtime(
                         format!("expected integer but got \"{}\"", v.as_str()),
                         crate::error::ErrorCode::Generic,
@@ -551,10 +561,18 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let dict_val = interp.get_var(var_name).ok().cloned().unwrap_or_default();
             let mut entries = parse_dict(interp, &dict_val)?;
             let cur_val = entries.get(key).cloned().unwrap_or_default();
+            // D-14②：现存值坏列表 → `unmatched open brace in list` +
+            // TCL VALUE LIST BRACE，dict 不动（静默重置丢数据）。
             let mut list = if cur_val.is_empty() {
                 Vec::new()
             } else {
-                cur_val.as_list().unwrap_or_default()
+                match cur_val.as_list_strict() {
+                    Ok(l) => l,
+                    Err(e) => {
+                        super::list::set_error_code(interp, e.code);
+                        return Err(Error::runtime(e.message, crate::error::ErrorCode::Generic));
+                    }
+                }
             };
             for v in &args[4..] {
                 list.push(v.clone());

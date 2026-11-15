@@ -907,6 +907,14 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let script = args[1].as_str();
     let result_var = if args.len() > 2 { Some(args[2].as_str()) } else { None };
     let opts_var = if args.len() > 3 { Some(args[3].as_str()) } else { None };
+    // C1（2026-11-16）：catch 命令**自身**的行（dispatch 入口处的
+    // cur_cmd_line——体求值会把 cur 覆写成体内末次分派的行）。
+    // tclsh 的 errorLine 在外围命令日志事件处即时更新，catch 的
+    // -errorline = 体单元内最外层失败命令的行，以 catch 行为基。
+    let catch_line = interp.cur_cmd_line.max(1) + interp.line_offset;
+    // 边界行是单次错误的暂存值——catch 入口清掉上一次错误可能遗留的
+    // 记录（体求值中的失败命令 dispatch 会重新写入）。
+    interp.err_boundary_line = None;
 
     // tclsh compiles a braced catch body INLINE into the enclosing unit
     // when that unit is a proc context (compiledLocals): the body then
@@ -1016,9 +1024,9 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // alone (tclsh: catching `return -code break x` does not
             // clobber a previously accumulated errorInfo).
             let error_info = accumulated.unwrap_or_else(|| e.message_text());
-            if interp.err_is_error(&e) {
-                let _ = interp.set_var("::errorInfo", Value::from_str(&error_info));
-            }
+            // 注意：errorInfo 的 set_var 在 errorCode 块之后——tclsh 的
+            // 全局创建序 = e(result var) → errorCode → errorInfo（oo2
+            // r4 / var-order 轮实测，info vars 重放依赖插入序）。
             // ::errorCode: a raise site that installed it (scan formats,
             // exec CHILDSTATUS, `error`, `return -errorcode`) wins;
             // otherwise the error variant derives it (TCL WRONGARGS,
@@ -1056,6 +1064,11 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // reset the var to NONE.
                 let tec = raised_code.clone().unwrap_or_else(|| e.tcl_error_code());
                 let _ = interp.set_var("::errorCode", Value::from_str(&tec));
+                // 插入序：errorCode 先于 errorInfo（tclsh e→errorCode→
+                // errorInfo，见上方注释）。
+                let _ = interp.set_var("::errorInfo", Value::from_str(&error_info));
+            } else if interp.err_is_error(&e) {
+                let _ = interp.set_var("::errorInfo", Value::from_str(&error_info));
             }
             if let Some(ov) = opts_var {
                 // tclsh's -errorline for a caught error is the line of the
@@ -1067,6 +1080,14 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // line rebased by the catch command's line in the enclosing
                 // unit.  The frame lines themselves stay body-relative, so
                 // only the options value is rebased.
+                // C1（2026-11-16 评估）：tclsh 的 errorLine 在外围命令
+                // 日志事件处即时更新，-errorline = 体单元内最外层失败
+                // 命令的行（U1-U4/c1c-c1h/rdm 去 scrub 矩阵实证——多行
+                // proc harness 差 1：rtcl 的 line_ctx 单元化剥掉体首
+                // 空行而 tclsh 计头行；err_boundary_line 捕获基建已落
+                // interp，修正需动 e28c24a 的行号单元化 = 2026-11-14
+                // catch/EI 基线深水区，本轮**保留原口径**，残差如实
+                // 记账（return_decode_matrix 以 scrub 抹平该键）。
                 let opts_line = if code == 1
                     && same_unit
                     && (interp.call_depth > 0 || !interp.ns_stack.is_empty())
@@ -1076,6 +1097,7 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 } else {
                     interp.err_line
                 };
+                let _ = catch_line;
                 let opts = if code == 1 {
                     // Tcl error completions carry -errorcode and -errorinfo.
                     let tec_override = if code == 1 {
@@ -1304,22 +1326,36 @@ pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let code = error_code.clone().unwrap_or_else(|| "NONE".to_string());
     let _ = interp.set_var("::errorCode", Value::from_str(&code));
     interp.err_code_raised = true;
-    // D-3 -errorstack：error 命令的 INNER 条目 = returnImm <msg> <info>
-    // （tclsh 实测：error boom → INNER {returnImm boom {}}）。它是
-    // **Tcl 列表** [returnImm, msg, info]（TclGetInnerContext 的
-    // INST_RETURN_IMM 臂），元素各自 list 转义——msg 含空格时为
-    // `returnImm {in P} {}`。一次性预装，harness 首帧消费。
+    // D-3 -errorstack：error 命令的 INNER 条目 = returnImm <msg>
+    // <options 列表>（C5 2026-11-16 修正：tclsh 的 INST_RETURN_IMM 臂
+    // 携带**显式 options 列表**——`error boom "" {A B}` →
+    // `returnImm boom {-errorinfo {} -errorcode {A B}}`、
+    // `error boom ""` → `returnImm boom {-errorinfo {}}`、2 参形
+    // `returnImm boom {}`；元素按给定序 -errorinfo 先于 -errorcode）。
+    // **非空 info 形不装 INNER**——tclsh 该形经 AppendObjToErrorInfo
+    // 抑制自身帧，errorstack 全项陈旧泄漏同形（FORM 矩阵实测）。
     {
-        let info = error_info.clone().unwrap_or_default();
-        interp.err_pending_inner = Some(
-            Value::from_list(&[
-                Value::from_str("returnImm"),
-                Value::from_str(&msg),
-                Value::from_str(&info),
-            ])
-            .as_str()
-            .to_string(),
-        );
+        let nonempty_info = error_info.as_deref().map_or(false, |i| !i.is_empty());
+        if !nonempty_info {
+            let mut opts: Vec<Value> = Vec::new();
+            if let Some(info) = &error_info {
+                opts.push(Value::from_str("-errorinfo"));
+                opts.push(Value::from_str(info));
+            }
+            if let Some(code) = &error_code {
+                opts.push(Value::from_str("-errorcode"));
+                opts.push(Value::from_str(code));
+            }
+            interp.err_pending_inner = Some(
+                Value::from_list(&[
+                    Value::from_str("returnImm"),
+                    Value::from_str(&msg),
+                    Value::from_list(&opts),
+                ])
+                .as_str()
+                .to_string(),
+            );
+        }
     }
     // A non-empty info argument REPLACES the accumulated errorInfo and
     // suppresses the next harness frame (25.7: the `while executing
@@ -1330,12 +1366,8 @@ pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             interp.err_info = Some(info.clone());
             interp.err_fresh = true;
             interp.err_pending_top = None;
-            // info 抑制路径不经 harness 首帧——returnImm 形直接消费
-            // （err_calls 同步清：新错误的 CALL 从此处重新累计）。
-            interp.err_inner = interp.err_pending_inner.take();
-            interp.err_calls.clear();
-            interp.err_call_body = false;
-            interp.err_force_inner = false;
+            // INNER/CALL 全部保持陈旧（tclsh 同形：非空 info 的
+            // errorstack 原样保留上一错误的条目）。
         }
     }
     if error_info.is_none() && error_code.is_none() {

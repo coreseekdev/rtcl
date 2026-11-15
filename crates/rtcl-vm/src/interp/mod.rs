@@ -750,6 +750,11 @@ pub struct Interp {
     /// consumed by `(procedure ... line N)`, `(in namespace eval ...
     /// script line N)`, `("uplevel" body line N)`, `(file ... line N)`.
     pub(crate) err_line: usize,
+    /// C1（2026-11-16）：本次错误传播中**最后一条失败命令**在其单元内
+    /// 的行（dispatch_values 出错时捕获，传播由内向外逐层覆写 → catch
+    /// 读到的是 catch 体单元内最外层失败命令的行——tclsh 的 errorLine
+    /// 在每个日志事件处即时更新，catch 读到的是外围命令日志事件的行）。
+    pub(crate) err_boundary_line: Option<usize>,
     /// Newlines between the enclosing script's first line and the script
     /// currently being evaluated by a construct that re-evals a word of
     /// its own source (`while`/`for`/`foreach` bodies): a body command's
@@ -987,6 +992,7 @@ impl Interp {
             err_fresh: false,
             err_code_raised: false,
             err_line: 1,
+            err_boundary_line: None,
             line_offset: 0,
             cur_cmd_line: 0,
             cur_cmd_word_srcs: util::WordSrcs::empty(),
@@ -1350,10 +1356,10 @@ impl Interp {
         self.arrays_env_only = true;
 
         // --- :: var table in tclsh's iteration order ---
-        // (rtcl has no auto-loading, but tclsh's first stdin command
-        // creates ::auto_index via unknown→auto_load before user code.)
-        self.global_insert("auto_index".to_string(), Value::empty());
-        self.array_globals.insert("auto_index".to_string());
+        // ::auto_index 惰性首建（2026-11-16 var-order 轮）：tclsh 文件
+        // 模式启动不含 auto_index——unknown→auto_load 首次运行时由
+        // auto_load_index 创建（oo2 r4 / ai* 差分）。rtcl 的 stdlib
+        // auto_load_index 移植体在触发时同样 set auto_index(...)。
         self.global_insert("tcl_version".to_string(), Value::from_str("8.6"));
         self.global_insert("argv0".to_string(), Value::from_str(""));
         self.global_insert("argv".to_string(), Value::from_str(""));
@@ -1385,7 +1391,11 @@ impl Interp {
     /// implementation stays, as in tclsh) and its command-order entries so
     /// the `info commands` replay matches tclsh's file-mode table.
     pub fn drop_stdin_history(&mut self) {
-        for key in ["::history", "history"] {
+        // ::tcl::history 实体同随 stdin 语境消失（tclsh 文件模式
+        // `info commands ::tcl::*` = Bgerror/CopyDirectory/pkgconfig/
+        // prefix 四项——history proc 由 history add 触发 auto-load，
+        // probe1 面计数对齐）。
+        for key in ["::history", "history", "::tcl::history"] {
             self.procs.remove(key);
             self.commands.remove(key);
             self.import_aliases.remove(key);

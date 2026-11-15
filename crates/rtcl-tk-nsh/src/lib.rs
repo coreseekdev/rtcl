@@ -2699,7 +2699,9 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 .border_color(AdaptiveColor::rgb(0xd1d5db, 0x4b5563))
                 .bg(option_color(tree, path.as_str(), "-background")
                     .unwrap_or(AdaptiveColor::rgb(0xf3f4f6, 0x374151)))
-                .disabled(disabled);
+                .disabled(disabled)
+                // Tk centers a button's label in the widget.
+                .items_center();
             if !stretches {
                 button = button.self_start();
             }
@@ -3323,7 +3325,8 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
             } else {
                 0.0
             };
-            let horizontal = option(tree, path, "-orient") == "horizontal";
+            // Tk's progressbar is horizontal unless -orient says otherwise.
+            let horizontal = effective(tree, path, "-orient") == "horizontal";
             let mut track = if horizontal {
                 view()
                     .w_full()
@@ -3337,11 +3340,14 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                     .rounded_full()
                     .bg(AdaptiveColor::rgb(0xe5e7eb, 0x374151))
             };
+            // The indicator is the value's share of the track, not a
+            // fixed pixel width (a full-width track renders -value 60 as
+            // 60 px, a tenth of Tk's bar).
             track = if horizontal {
                 track.child(
                     view()
                         .h_full()
-                        .w(px(100.0 * fraction))
+                        .w(relative(fraction))
                         .rounded_full()
                         .bg(AdaptiveColor::rgb(0x2563eb, 0x3b82f6)),
                 )
@@ -3349,7 +3355,7 @@ fn render_node(tree: &TkTree, path: &str) -> AnyElement {
                 track.child(
                     view()
                         .w_full()
-                        .h(px(100.0 * fraction))
+                        .h(relative(fraction))
                         .rounded_full()
                         .bg(AdaptiveColor::rgb(0x2563eb, 0x3b82f6)),
                 )

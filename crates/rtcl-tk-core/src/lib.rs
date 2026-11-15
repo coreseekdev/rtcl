@@ -1087,7 +1087,7 @@ const SCALE_OPTIONS: &[&str] = &[
     "-to",
     "-troughcolor",
     "-variable",
-    "-width",
+    "-width",    "-value",
 ];
 
 const TEXT_OPTIONS: &[&str] = &[
@@ -1369,6 +1369,12 @@ pub fn option_default(kind: WidgetKind, name: &str) -> Option<&'static str> {
         "-compound" => "none",
         "-underline" => "-1",
         "-state" => "normal",
+        // ttk::progressbar draws horizontally unless told otherwise (Tk's
+        // default; the scrollbar stays vertical, its Tk default).
+        "-orient" => match kind {
+            WidgetKind::Progressbar => "horizontal",
+            _ => "",
+        },
         "-default" => "disabled",
         "-onvalue" => "1",
         "-offvalue" => "0",

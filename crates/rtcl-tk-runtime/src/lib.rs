@@ -878,7 +878,8 @@ fn create_widget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     created?;
 
     initialize_widget(interp, &path, kind)?;
-    if kind == WidgetKind::Progressbar && effective_option(interp, &path, "-variable").is_empty() {
+    if kind == WidgetKind::Progressbar && effective_option(interp, &path, "-variable").is_empty()
+    {
         let value = effective_option(interp, &path, "-value")
             .parse::<f64>()
             .unwrap_or(0.0);
@@ -887,6 +888,17 @@ fn create_widget(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 n.value = value;
             }
         });
+    }
+    // ttk::scale's -value seeds the position (the slider reads the node
+    // value); without it the midpoint default wins over an explicit one.
+    if kind == WidgetKind::Scale {
+        if let Ok(value) = effective_option(interp, &path, "-value").parse::<f64>() {
+            with_state_mut(interp, |rt| {
+                if let Some(n) = rt.tree.get_mut(&path) {
+                    n.value = value;
+                }
+            });
+        }
     }
     bump_active();
     register_visible(interp, &path, widget_command);

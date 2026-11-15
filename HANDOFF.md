@@ -569,6 +569,12 @@ which 探测，勿用 info commands）。
 
 ### 10.1 语义域剩余（specs/DIVERGENCES.md，33 例需对齐 + 15 例 -f 设计差异）
 
+> **2026-11-16b**（perf/wave2）：组 4/5 + 组 1 移交 5 残差 + var-order
+> 移交项全数定调收口（judge 88/88；probes 373/41 → 378/36：翻绿
+> bn13/pbr3/probe1/ivars2/tclns，固化 smallface_p24；workspace tests
+> 全绿）。逐例定调见 DIVERGENCES.md 2026-11-16b 节；剩余 OPEN 见该节
+> 10/11/15/22 条。
+
 按根因分组（详细探针名见 DIVERGENCES.md 2026-11-03/11-08 节）：
 1. **errorInfo/errorstack/return 帧**（~9）——**2026-11-14 收口**
    （perf/wave2 90f4ad6..3ab5a1f，6 commit；DIVERGENCES.md 2026-11-14
@@ -598,11 +604,22 @@ which 探测，勿用 info commands）。
    history 仅 stdin 注册（连带修复 order 组 7 挂账）、内部命令直调面、
    Slot listing 截断点。oo2 r4（catch var/errorCode 全局物化序）定调
    移交 var-order 组。新固化探针 judge/probes/oo21/oo22。
-4. **dict 残差**（~6）：`dict info`（hash internals 不可复现）、
-   `dict getdef`（rtcl 多出的 8.7 特性）。
-5. 其余小尾巴：expr 词法（nan()/inf()）、representation 文案、
-   disassemble/assemble 面、trace 时机、`interp alias {}` 创建形式
-   （D-1，唯一 OPEN 语义分歧，严重度低）。
+4. **dict 残差**（~6）——**2026-11-16b 复核定调**（perf/wave2，
+   DIVERGENCES.md 2026-11-16b 节）：`dict info` 已随 tclhash 重放对齐
+   （12/38 项含桶重建逐字节同）；`dict getdef` 已删（=8.6 无此命令）；
+   D-12/D-13 复核为已收口；D-14 incr/lappend 坏值 EC+错误落地；
+   d17 unknown 子命令 EC 补齐；`dict get` 缺键 INNER=dictGet。
+5. 其余小尾巴——**2026-11-16b 收口**（perf/wave2）：expr rotate 词法
+   （`<<<`/`>>>`）移除对齐（bn13）；representation 16 字符截断 +
+   bignum 结果规范化（pbr3/bnprobe2）；assemble over/undefined/
+   duplicate/异常语境检查 + getbytecode 装配子集 dict（cmp_assemble
+   全绿）；`::tcl::prefix`/`::tcl::Bgerror`/`::tcl::CopyDirectory`
+   落地 + -f 模式 ::tcl::history 移除（probe1）；`interp alias {}`
+   （D-1）收口。残差 OPEN：disassemble/getbytecode 成功清单（设计
+   差异）、dbg_basic（oracle SEGV 非分歧）、dbg_trace（提取残缺 +
+   trace 回调链帧）、uplevel -errorline 多行 harness 差 1（基建已落，
+   动 line_ctx 基线风险大）、oo2 r4 var-order 2 位置（ghost-insert
+   级不可精确重放）。
 
 已收口/移出（原七组清单）：
 - **哈希/迭代序 + 命令面**（原组 3，~11）——**2026-11-12 第二轮收口**

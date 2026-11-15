@@ -49,6 +49,13 @@ t entier_minf {expr entier(-Inf)}
 t intofbig {expr int(-9223372036854775808)}
 t boolbig {expr bool(2**63)}
 t notbig {expr !9223372036854775808}
-t repr {::tcl::unsupported::representation 9223372036854775808}
+# repr：refcount/object pointer 是实现细节（Tcl_Obj vs rtcl Rc），
+# 探针侧归一化后锁 16 字符截断形（tclsh Tcl_AppendLimitedToObj 16）。
+proc reprnorm {s} {
+    regsub {refcount of \d+} $s {refcount of N} s
+    regsub {object pointer at 0x[0-9a-f]+} $s {object pointer at 0xPTR} s
+    return $s
+}
+puts "repr|0|[reprnorm [::tcl::unsupported::representation 9223372036854775808]]"
 t powexp_too_big3 {expr {3**268435456}}
 t powexp_big2 {expr {2**1000}}

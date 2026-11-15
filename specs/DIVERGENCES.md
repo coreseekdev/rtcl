@@ -8,6 +8,126 @@
 > （§10.1 组 3，本节）。条目后括注的
 > spec [D-x] 是规格文件内的 spec-local 编号，以本台账为准。
 
+## 2026-11-16b 组 6/7 小尾巴 + 两轮移交残差收口（judge 88/88；probes 378/36——基线 373/41，翻绿 bn13/pbr3/probe1/ivars2/tclns；workspace tests 全绿）
+
+HANDOFF §10.1 组 4（dict 残差）+ 组 5（小尾巴）+ 2026-11-14 节 5 条 EI 相邻
+残差 + var-order 组移交的 oo2.r4，逐例三选一定调：
+
+**A. dict 残差**
+1. `dict info`【已收口（对齐）】：tclhash 重放模型下 12/38 项（含桶重建
+   边界）与 tclsh 逐字节一致（db 差分实证），哈希轮已收口，无需定调
+   设计差异。
+2. `dict getdef`【已收口（对齐=8.6 无此命令）】：rtcl 已随哈希轮删除
+   8.7 前瞻特性，`unknown or ambiguous subcommand "getdef"` 与 tclsh
+   同文；errorcode 缺失随本轮 d1 修复补齐。
+3. D-12（dict get 奇数长）【已收口】：复现脚本双端同错同 EC。
+4. D-13（dict set a(1)）【已收口】：8.6.17 实测双端均创建数组元素，
+   台账原记 tclsh 报错已过时（复核定调）。
+5. D-14【本轮收口】：incr 现值非整数 → EC 补 `TCL VALUE INTEGER`；
+   lappend 现值坏列表 → 由静默重置改为 `unmatched open brace in list`
+   + `TCL VALUE LIST BRACE` 且 dict 不动（as_list_strict 路径）。
+6. D-15/D-16/D-17 主体【已收口】：本轮复核一致；d17 的 unknown 子命令
+   EC 缺失随本轮补 `TCL LOOKUP SUBCOMMAND <name>`（d17b/gd1）。
+
+**B. 小尾巴**
+7. expr 词法 `<<<`/`>>>`【对齐】：移除 rtcl rotate 扩展（jimtcl 血统，
+   未列入有意扩展清单）——tclsh 词法把 `1 <<< 2` 解析为 `<<` 后随非法
+   操作数（missing operand at _@_，标记紧跟 `<<`）；bn13 全绿。nan/inf
+   接受面哈希轮已收口（本轮无残差）。
+8. representation 文案【对齐+归一】：截断从 40 改 16 字符 + "..."
+   （tclsh Tcl_AppendLimitedToObj(limit=16)）；refcount/object pointer
+   为实现细节不可复现，bnprobe2 探针侧归一化该两字段后全绿。
+9. 大整数结果规范化【对齐】：expr 结果为 bignum 范围整数时按
+   Tcl_SetBignumObj 语义重渲染十进制（`expr {$x}` x=0x10…00 →
+   18446744073709551616；pbr3 全绿）；十进制原文 E4 不降级语义保留。
+10. disassemble/assemble 面【部分对齐 + 设计差异定调】：
+    * `assemble`【对齐】：over（INST_OVER 立即数复制）、undefined
+      label 文案、duplicate label 检查、异常语境一致性检查
+      （ProcessCatchesInBasicBlock 的指令级镜像，TCL ASSEM BADCATCH）
+      全落地——cmp_assemble 全绿（含 getbytecode 装配子集 dict）。
+    * `getbytecode script` 对 `tcl::unsupported::assemble {push…}`
+      字面命令按 tclsh **编译期装配**复现 dict schema（literals/
+      instructions/commands/scriptto 含尾下标 34 钉形）。
+    * `disassemble`/`getbytecode` 成功清单（c5_dis/cmp_unsupported/2）
+      【设计差异】：tclsh 输出嵌 raw 指针/epoch 且指令表是 tclsh 自身
+      字节码——rtcl 自有 VM，清单形态为实现细节（校验/错误面已对齐，
+      eval.rs 注记）；两探针保留 DIFF 作诚实标记。
+    * dbg_basic【非分歧（oracle 崩溃）】：tclsh 8.6.17 在 basic-15.3
+      （namespace delete current 后再 proc）当场 SEGV（rc=139、单进程
+      复现），无有效 oracle；rtcl 语义（ns 存续=0）与 tclsh 崩溃前
+      可见行为无对照可言。
+    * dbg_trace【探针提取残缺 + 残差】：提取器丢了 traceExecute 回调
+      proc，tclsh 中途 abort（rc=1）——另实测 rtcl 变量 write trace
+      回调错误缺 `(write trace on "vv")` 退出帧、enter/enterstep/leave
+      回调错误归因链不同（tclsh 记回调命令链 + trace-on 帧）——记
+      OPEN 残差（B4，见下）。
+11. trace add 执行点【残差记账】：unset trace 回调错误吞掉已对齐；
+    write trace 回调错误的首帧已对齐；缺 `(write/read/unset trace on
+    "<name>")` 与 `(enter/leave/enterstep trace on "<cmd>")` 退出帧、
+    enter/enterstep/leave 回调错误的归因链（tclsh 记 `error eerr /
+    while executing "error eerr" / (procedure "bad" line 1) / invoked
+    from within "bad {foo q} enter" / (enter trace on "foo q")"`，rtcl
+    归因到 tracee 单帧）——trv_* 组基线不动的前提下未动 trace 帧机，
+    记 OPEN。
+12. `interp alias {}`（D-1）【对齐收口】：`interp alias {slavePath}
+    slaveCmd ?{masterPath} targetCmd ?arg...??` 落地——{} 路径即主解释
+    器，创建形转投别名表、查询形返回 {target ?prefix...?}；非空路径
+    报 `could not find interpreter`（smallface_p24 al1-al6）。
+13. `::tcl::prefix`【对齐落地】：ensemble 面 all/longest/match
+    （-error/-exact/-message、ambiguous/bad option 文案、TCL LOOKUP
+    INDEX/SUBCOMMAND、TCL OPERATION NOARG）+ `::tcl::Bgerror`
+    （元数/missing return option/-errorcode/-errorinfo 副作用/bgerror
+    调用，无 handler 时静默）+ `::tcl::CopyDirectory`（init.tcl 逐行
+    移植为 stdlib proc）——probe1 `::tcl::*` 计数 4 对齐（-f 模式
+    ::tcl::history 同随 stdin 语境消失）。
+14. `::tcl::pkgconfig`【已收口（哈希轮）】：本轮复核 list/get/bad
+    subcommand 面一致；get 值为安装配置面（各自构建的路径值），非语义
+    分歧。
+
+**C. 2026-11-14 移交的 5 条 EI 相邻残差**
+15. uplevel 体错误 -errorline【残差保留（机制钉死）】：tclsh 的
+    errorLine 在外围命令日志事件处**即时**更新，-errorline = 体单元内
+    最外层失败命令的行（U1-U4/c1c-c1h/rdm 去 scrub 矩阵实证；动态体
+    catch 读 catch 命令自身行）。rtcl 的 err_boundary_line 捕获基建已
+    落（dispatch_values 出错时记末次失败命令行），但行号换基撞上
+    line_ctx 单元化（e28c24a 剥体首空行 vs tclsh 计头行）——修正需动
+    2026-11-14 基线深水区，本轮保留原口径，return_decode_matrix 继续
+    scrub 该键，残差缩窄为「多行 proc harness 差 1」。
+16. ARITH 首帧关键词【对齐】：expr ARITH 运行期错误落 tclsh 双日志
+    事件模型（表达式机先记裸消息，expr 命令帧以 `invoked from within`
+    追加；INNER 由 err_force_inner 在 (Some,false) 臂消费）——
+    `expr {1/0}` 全矩阵同字。
+17. expr 解析错误 EC/INNER【对齐】：-errorcode = TCL PARSE EXPR
+    <CLASS>（MISSING/UNBALANCED/BADCHAR/BAREWORD 分类落地）；INNER
+    的 syntax 形 -errorinfo 载荷 = 抬升点预装 err_info（带 parsing
+    frame）、-errorcode = 抬升码——陈旧 INNER 泄漏同根修复。
+18. `dict get` INNER【对齐】：缺键错误装 INNER `dictGet`（eval 形同，
+    twokeys/odd 矩阵：odd 走 invokeReplace）。
+19. `error msg info code` 三参形【对齐】：INNER = `returnImm <msg>
+    <options 列表>`（{-errorinfo {} -errorcode <code>} 按给定序；
+    2 参 `returnImm msg {}`；空 info 3 参 `{-errorinfo {}}`）；非空
+    info 形不装 INNER（errorstack 陈旧泄漏与 tclsh 同形，FORM 矩阵
+    实测）。
+
+**D. var-order（oo2.r4 移交）**
+20. catch 结果变量与 ::errorCode/::errorInfo 物化序【对齐】：catch 的
+    全局创建序改为 e → errorCode → errorInfo（tclsh 实测序；不动
+    catch/EI 语义，仅 set_var 换序）——ivars2/tclns 翻绿。
+21. ::auto_index 惰性首建【对齐】：启动期建表移除；首个 unknown 命令
+    入口（dispatch 的 unknown 分派前）落表——tclsh 文件模式启动不含
+    auto_index、unknown→auto_load 首次运行创建（ai4/ai5/oo2 l7 二分
+    实证：oo2 的触发点 = `fw g` forward 到 nosuchcmd 走 unknown）。
+22. oo2 r4 残差【部分收口】：info vars 序剩 2 位置差（tcl_rcFileName
+    桶位 + e/auto_path 转置）——tclsh 全局表序含无法以「最终活键重放」
+    表出的插入历史（ghost insert/unset 级），tcl_order 模型（d7cc38e）
+    + 上述两项修复已收 ivars2/tclns，oo2 r4 单行残差如实记账，不追。
+
+**新固化**：judge/probes/smallface_p24.tcl（40+ 断言：prefix 12 形/
+Bgerror 4 形/CopyDirectory 存在性/pkgconfig 面/dict EC/error 三参 INNER
+矩阵/expr 解析 EC 分类/ARITH 首帧/assemble over-label-语境/getbytecode
+dict/alias 6 形）+ bnprobe2 repr 行归一化。probe 数字：373/41 →
+378/36（objquad 偶发超时抖动 ±1，与本轮无关）。
+
 ## 2026-11-16 OO 可见性组收口（judge 88/88；probes 373 pass / 41 fail（含新固化 oo21/oo22）；order.probes 48/48；workspace tests 1420/0）
 
 HANDOFF §10.1 组 3（OO 可见性面，~10 例）全数定调入账。基线探针
@@ -224,7 +344,9 @@ probe_sock_async_cmp.sh、probe_sock_data.sh（live 回环差分，24+3 断
 矩阵 + proc 体/eval/ns 对照）、`ei_line_attribution`（行号归属 +
 procedure 帧名矩阵）。
 
-**新发现残差**（相邻面，未修）：
+**新发现残差**（相邻面）——【2026-11-16b 全数定调，见 2026-11-16b
+节 15-19：ARITH 首帧/expr 解析 EC+INNER/dictGet INNER/error 三参形
+对齐；uplevel -errorline 基建落地、残差缩窄为多行 proc harness 差 1】：
 - uplevel 体错误的 -errorline：tclsh 在外围命令日志事件处更新
   errorLine（即时），rtcl 的 defer 帧到顶层 append 才写——uplevel 体
   错误被 catch 时差 1（t2 形钉探针在 return_decode_matrix 中 scrub）。
@@ -496,13 +618,16 @@ ARE 的 quoting 细目/collating 元素/反向引用组**起点偏移为 indexOf
 
 ## OPEN
 
-### D-1 `interp alias` 的空解释器参数形式
+### D-1 `interp alias` 的空解释器参数形式 [FIXED 2026-11-16]
 - **行为**：`interp alias {} myalias {} puts` —— 用空字符串占位源/目标
   解释器创建别名。
 - **Tcl 8.6**：接受，创建 `myalias` → `puts` 的别名。
-- **rtcl**：`wrong # args: should be "interp interp"`。
+- **rtcl 修复态**：`interp alias {slavePath} slaveCmd ?{masterPath}
+  targetCmd ?arg...??` 落地——{} 路径即主解释器，创建形转投别名表、
+  查询形返回 {target ?prefix...?}；非空路径报 could not find
+  interpreter（smallface_p24 al1-al6）。
 - **复现**：`interp alias {} myalias {} puts`
-- **严重度**：低。
+- **严重度**：已关闭。
 
 ### 异常面（error-deep.allium + specs/error-deep.probes）
 

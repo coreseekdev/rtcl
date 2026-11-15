@@ -3981,7 +3981,11 @@ fn wm_impl(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     let alpha: f64 = raw
                         .parse()
                         .map_err(|_| generic(format!("bad -alpha value \"{raw}\"")))?;
-                    format!("{}", alpha.clamp(0.0, 1.0))
+                    // Tcl doubles keep a decimal point in their string form
+                    // ("1.0", not "1" — tclsh's Tcl_PrintDouble, which
+                    // `format_float` ports): `wm attributes -alpha` reads
+                    // the value back as Tk stores it.
+                    Value::from_float(alpha.clamp(0.0, 1.0)).as_str().to_string()
                 }
                 _ => (matches!(raw, "1" | "true" | "yes" | "on")).then(|| "1").unwrap_or("0")
                     .to_string(),
@@ -16127,7 +16131,7 @@ mod tests {
         eval(&mut i, "wm attributes .a -alpha 0.5");
         assert_eq!(eval(&mut i, "wm attributes .a -alpha"), "0.5");
         eval(&mut i, "wm attributes .a -alpha 9");
-        assert_eq!(eval(&mut i, "wm attributes .a -alpha"), "1");
+        assert_eq!(eval(&mut i, "wm attributes .a -alpha"), "1.0");
         eval(&mut i, "wm attributes .a -topmost yes");
         assert_eq!(eval(&mut i, "wm attributes .a -topmost"), "1");
         eval(&mut i, "wm attributes .a -topmost 0");

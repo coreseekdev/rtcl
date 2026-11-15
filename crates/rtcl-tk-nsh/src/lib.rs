@@ -128,6 +128,13 @@ pub fn install_backend() {
                     nsh_core::desktop::WindowLevel::Normal
                 });
             }
+            "-alpha" => {
+                // Tk's `wm attributes . -alpha` is the window's opacity;
+                // the runtime already clamps to 0.0..1.0.
+                if let Ok(alpha) = new.parse::<f32>() {
+                    desktop::set_opacity(alpha);
+                }
+            }
             _ => {}
         }
     });

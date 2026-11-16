@@ -2470,6 +2470,8 @@ dict getdef（rtcl 多出的 8.7 特性）/errorstack+errorline+options 键序
 # diff 同集）。
 #
 # ## 板点 2（语句窗口扩展 incr var [script]）——回退（负结果留档）
+#（**2026-11-16 重开翻案：真因 = fallback 白名单缺失致整脚本树走查，
+# 非窗口运行时成本；修复后落地，见下方「板点 2 reopen」节。**)
 #
 # 实现：4 新 op（IncrVarStack/IncrLocalStack + [SubEnd,*] 融合对）+
 # compile_incr 括号分支（try_compile_sub 内联 + 栈上增量）+
@@ -2491,7 +2493,67 @@ dict getdef（rtcl 多出的 8.7 特性）/errorstack+errorline+options 键序
 # top_slot_fill/incr_var_fast→None 计数）对比新旧每迭代 flush 序。
 # 顺带发现（预存分歧，与本窗口无关，三路径同现）：incr 非 int 旧值
 # 的 errorCode（tclsh TCL VALUE INTEGER vs rtcl NONE）与 i64 溢出的
-# bignum 提升（tclsh 9223372036854775808 vs rtcl 回绕）。
+# bignum 提升（tclsh 9223372036854775808 vs rtcl 回绕）。（这两项已于
+# 267d49a 收口。）
+#
+# ## 板点 2 reopen（RTCL_DBG 插桩 + 白名单根修）——落地（2026-11-16 重开轮）
+#
+# 上轮回退的真因（RTCL_DBG 逐写点插桩钉死，feature `rtcl-dbg` + env
+# `RTCL_DBG[=seq[@N]]`，默认构建零剔除）：**不是窗口运行时**。重建的最
+# 小原型（4 op + compile_incr 括号分支 + fuse_pairs）精确复现 +101.3%
+# （dloop 4335.9M→8727.9M，同机同日基线 87c468e），插桩对比显示形状级
+# 翻倍的真身：`T unit 900010 vs 8`（每迭代 3 次 exec_bytecode 重进入）
+# + `T eval_expr 300001 vs 0` + ts flush/invalidate 全消——**整脚本被
+# 树走查**。根修点 = 新 op 未入 `Compiler::compile_unit` 的 fallback
+# 白名单 → `code.fallback=true` → eval_impl 门（`!code.fallback`）拒编
+# 译执行 → eval_commands 树走查（cond/body/next 三片段每迭代各自重解
+# 析重编译、ts 永不激活、expr 逐迭代重解析——上轮画像的 ExprParser/
+# Vec<char> lexer/redirect_flat/malloc 风暴全部是树走查特征）。上轮
+# 「判别实验仅关编译器分支即回基线」的机制 = 关分支→无新 op→无
+# fallback→编译恢复；**上轮的窗口运行时从未执行过**。教训入册：新增
+# op 必须同步入 fallback 白名单（与 top_op_class 同为穷举强制点，建议
+# 未来以编译期清单合并三处）。
+#
+# 白名单修复后窗口首次真跑（最终落位：枚举尾段连续 tag +
+# exec_op 主 match 前置范围预检 + 阶梯实现居 vars.rs
+# `incr_var_fast_stack`/`incr_local_slot_stack`）：
+#
+# | bench        | base(87c468e) | 窗口真跑      | 指令比 |
+# |---|---|---|---|
+# | dloop        | 4335.9M       | 3862.4M       | **0.891** |
+# | fib25        | 545.97M       | 548.86M       | 1.005 |
+# | fe_bench     | 613.49M       | 616.29M       | 1.005 |
+# | oo_bench2    | 6415.1M       | 6478.1M       | 1.010 |
+# | oo_bench2_vars| 7684.1M      | 7746.1M       | 1.008 |
+# | sum_only     | 616.2M        | 619.0M        | 1.005 |
+# | micro_incr   | 557.7M        | 585.7M        | 1.050 |
+# | v_expr 变体  | 2669.6M       | 1747.7M       | **0.655** |
+#
+# 窗口形状收益（同机 3 连测最优）：dloop **-10.9%**（热循环
+# `incr acc [dict get $d $k]`）、incr-bracket 微形状 -34.5%、100k dict
+# 形状 -11.6%、`[string trim]` 形状 -1.4%、无括号形状持平。
+#
+# 语义门：新增 28 形状探针（judge/probes/incr_window_p01..28，含
+# return/break/continue 出口、创建、bignum 提升、数组/命名空间/链接、
+# trace、tier1 中途重定义 e1-e3 类、next-script、`{*}` 展开与拼接形
+# 不入窗守卫）：25 例与 tclsh 8.6.17 全同，3 例失败为**预存分歧**
+# （基线同样失败：errorInfo INNER 帧归属、proc 内 ns 限定名 incr、
+# incr 读 trace）——非本窗口引入。judge 88/88、jitsh 差分 88/88、
+# workspace tests 1420/0、probes archive（含新 28）DIFF 集**与基线逐
+# 项一致**。
+#
+# 残留（已定位、止损接受）：**代码 gen 漂移**。窗口可执行分派代码的
+# 任何落位都使 fe/oo2/oovars/sum +0.42-0.58%、micro 矩阵 +2.1-5.0%
+# （micro_incr +2 分支/迭代 = 主 match 决策树形状改写）。证据链：本
+# 基准字节码逐字节同、RTCL_NO_WINDOW 关分支后漂移同在、stub-
+# unreachable 臂零漂移、惰性 canary（50 行 inline(never) 死代码）零
+# 漂移、RTCL_DBG 事件计数逐一相同——非执行路径成本，是 full-LTO
+# （codegen-units=1）下 5MB text 的全局重内联布局效应。六种落位
+# （热径臂/表分派臂/inline(never)/阶梯迁 vars.rs/枚举尾/预检门）漂移
+# 逐位相同 → 两次落位尝试 + 预检门变体后止损，接受为已知残留；wall
+# best-of-5 噪声（±5-8%，fe -5.1%~+7.9% 随构建翻转）掩盖其量级。尾段
+# 连续 tag + 预检门约定使未来窗口族可复用同一落位（主 match 保持基
+# 线形状）。
 #
 # ## 板点 3（word_srcs 借用化）——已在册关闭
 #

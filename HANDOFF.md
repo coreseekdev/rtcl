@@ -296,6 +296,95 @@ json/regexp-spencer 移侧模块，其分派面随之出表）。
   不受影响）、wasm check 过。尺寸：wasm raw 2.84 → 2.74 MiB（-97
   KiB regexp-lite）；pkg（bindgen+wasm-opt）≈2.0 MiB。
 
+## 10undequincesimus. 2026-11-16c JIT M3：epoch 接 Tier1 bump 信号（perf/wave2 @ 99fb254）
+
+### 盘点定谳（epoch 生命周期表）
+
+**bump 点**（写者，全部经 `note_tier1_mutation` 叶名过滤或
+`note_tier1_sweep` 无条件）：proc 定义（proc.rs）/rename 新旧双键
+（proc.rs，rename 的所有类型共用）/alias 创建（introspect）/宿主
+register_command×2 + delete_command（registry）/ns import 移除+绑定
+（namespace）/oo attach+detach（oo）/local proc 帧出口拆除（call.rs
+两处）/ns delete + ns forget sweep（namespace 两处）——**M3 新增两
+点**：`trace add execution` 成功路径 sweep（trace.rs）与
+`namespace ensemble create` 叶名过滤 bump（namespace.rs ns_ensemble，
+ensemble 注册在 dispatch 链 builtins **之前**，叶名撞折叠名单即从
+折叠 op 下方遮蔽内建）。
+
+**读点**（解释器）：eval.rs 单元入口门/体 memo 逐迭代门、call.rs
+Site A 四门（slot + 体执行）、vm_exec exec_bytecode **逐 op** epoch
+检查（083537a，bump 即从命令边界树走查重分派）、bytecode_applicable
+（exec_traces 活检，与 epoch 并列）。
+
+**读点**（JIT）：run_top_with 入口 gate（exec.rs:162）→ Fallback；
+proc 钩子防御重查（proc_exec.rs:67）；classic 面宿主分派回边比对
+（host.rs call_argv_raw Ok 臂，bump → STALE(5) → 驱动
+jit_redispatch_after 树走查续跑）；fast 面 sh_call_dispatch 同款
+（fast/shared.rs）；fast/classic 池 key 含 epoch（池命中隐含相等，
+global 免 set 依据）；wasm 内 epoch global 由 refresh_epoch 在 impure
+路由同步。**M3 新增**：run_top_with 与 execute_artifact_wasmi 入口
+`has_exec_traces()` 门（拦「trace 先于单元注册」的嵌入式窗口；
+jitsh 单文件单元里中途 add 由 bump/回边比对接住）。
+
+### 缺口定谳（三个正确性修复）+ 收窄评估
+
+- **件1 trace 可观察性**（876c382）：执行 trace 只在分派/树走查面
+  触发，折叠 op 绕过分派——单元中途 `trace add execution <折叠名>`
+  对其后折叠 op 全盲（h2b：interp 字节码漏触发；h5：JIT set 宿主臂
+  set_var 直写漏触发，incr 仅靠 call_argv 置 caching=0 的副作用走
+  站点 re-eval 侥幸可见）。bump 后逐 op 检查/回边比对同点重分派，
+  bytecode_applicable 活检压树走查（粒度=任意执行 trace 全关折叠
+  世界，与 tclsh traceCount>0 不编译同构）。
+- **件2 ensemble 遮蔽**（3e717f0）：`namespace eval incr {namespace
+  ensemble create}` 从折叠 op 下方遮蔽内建（h3：tclsh/树=unknown
+  subcommand，interp/jit=n=6）。叶名过滤保非 Tier1 名零成本。
+- **件3 遮蔽感知折叠**（8ed5e12+99fb254）：epoch 戳只防「编译后」
+  遮蔽（bump 退役既有单元）；**遮蔽存在时新定义的体盖章新 epoch 过
+  Site A 门**——折叠 op 绕过分派、遮蔽体不可见（h1：interp 字节码
+  与 JIT proc 钩子输出 6，tclsh/树=can't read "x"）。三个体编译点
+  全接（cmd_proc / apply lambda 缓存 / OO memoised_proc_def），
+  编译器 skip_folds 名单内名字 compile_dyncall（分派活绑定）。
+  **件3b 两重精确化**（99fb254，初版回归定谳）：内建经
+  register_builtins 全体落 commands 表（register_entry 直插不
+  bump）——逐叶名命中即满名单、折叠全体降级（rtcl-vm 内联帧族 3
+  测 + judge(jit) 86/88 实证）。修正 = ①内建本体非遮蔽
+  （registry::canonical_builtin_fn fn 指针对照，同表集同 cfg 门）；
+  ②裸名解析语境限定（键 ns ∈ {全局, 当前 ns}，与 dispatch 裸名链
+  同构——::tcl::dict::incr 与裸 incr 永不相交）；跨 ns 移动的
+  lambda 体用 any-ns 保守口径。
+- **折叠名单单源**：`rtcl-parser::compiler::TIER1_FOLD_LEAVES` 常量
+  （编译器折叠 match / note_tier1_mutation bump 表 / 遮蔽探测三处
+  共用）——lappend 漏网那类双表 KEEP-IN-SYNC 风险归零。
+- **收窄评估（结论：不做，保守 bump 是安全默认）**：现 bump 语义 =
+  「任意 Tier1 相关突变作废全部编译单元 + JIT 永久 Fallback（顶层）
+  /proc 体树走查（既有体）」。精确化方向（per-leaf 13 路 epoch 向量
+  或「体编译后新定义即重编译」）只在「突变 Tier1 叶名」的负载里有
+  收益，judge/battery/六主基准都不含该形状——收益不显著，记 reopen
+  （落点：ByteCode 加 per-leaf fold epochs 位图 + Site A 门逐叶
+  比对；compiler 需Interp 遮蔽集穿透才可能重启折叠）。
+
+### 探针与验收
+
+- 电池 b48-b52（47→52）：proc 重定义中途遮蔽（e1 现状固化——旧头注
+  vm_exec=6 已过时，083537a 重分派落地后四方=5）/rename 中途遮蔽/
+  trace add execution 到折叠名/ensemble 叶名遮蔽/遮蔽后 proc 体
+  （errorInfo 逐字节）。jit_epoch_probes.sh e1-e5 现状：四方一致
+  （e3/e5 的 tclsh unknown 自引用死循环 = 预存 unknown-handler 分歧，
+  非 epoch 面）。
+- **验收**：judge interp+jit 88/88×2、jit_battery 52/52 三方逐字节、
+  workspace tests 1420/0（dev）、release tests 816/0；微基准 sanity
+  arith_loop jit 12ms / fib25 7ms / var_incr 13ms（jit≥interp，无
+  折叠降级信号；六主基准 rtcl 侧零 JIT 天然不受影响）。顶
+  rtcl-shape 探针 p516b（proc-old-5.16 独立复现）三方逐字节。
+- **坑两枚**：① `cargo build -p rtcl-jit` 默认空特征**不产 jitsh**
+  （bin required-features = jit-exec）——构建必须 `-p rtcl-jit
+  --features jit-exec` 或 workspace 全量；拿陈旧/异特征 jitsh 跑
+  探针会得到「h5 miss」的假阴性（本轮实测）。② worktree 二分
+  （git worktree add /tmp/... <commit>）是「不切分支」约束下的
+  干净 bisect 法——F2/F3 worktree 各 6-7 分钟构建换定谳。
+- 工作树遗留观察：docs/UI-GENUI.md 有非本任务未提交改动（另一会话
+  的生态调研），未动未纳入。
+
 ## 10senioquincesimus. 2026-11-16b JIT M2 件1：slot 单态缓存（perf/wave2 @ 40bcae8）
 
 ### 盘点定谳（M2 开工前）

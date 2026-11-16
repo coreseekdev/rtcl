@@ -2517,3 +2517,69 @@ dict getdef（rtcl 多出的 8.7 特性）/errorstack+errorline+options 键序
 # dloop 名扫描（split_array_ref/redirect_flat）与 dict IndexMap 固有
 # 大头——VarMap newtype 全消费面改造（Round S 实测 178 处机械修复）
 # 在当前板面下性价比为负，**缓议**，待 dloop/vars 重新放大后再评估。
+
+# ---------------------------------------------------------------------------
+# M1' 收口：顶层 D-11 流解码 + while/for 体帧族对齐（perf/wave2，2026-11-16）
+#
+# 盘点：M1' 四件套在树内均已落地（ABI v2 import 面 + fuel/epoch globals =
+# abi.rs/exec{,_wasmtime}.rs/fast,classic；Int 快车道 = assemble.rs §4 全表
+# （比较免 untag、+/- 范围检查、* 高 32 位检查、div/mod 宿主、位运算、
+# IncrVar/IncrLocal）；nanopass 链 = pass/ 八 pass + check 校验器）。本
+# 轮 = 验收缺口的收口：解释器 errorInfo 大改（cf5e3d8 全包含）后 JIT 宿
+主/驱动面的语义漂移。
+#
+# ## 板点 A（顶层 D-11 流解码）——落地
+#
+# b12_bare_break 电池红（jit≠rtcl）揪出：裸 break/continue 与 deferred
+# `return -code error/break/continue` 在顶层是错误（c3bc477 D-11），
+# JIT 驱动 finish() 仍走旧 driver_report（输出裸 "break"/"return"）。
+# 修复面：
+# - FlowExit 新 IR（裸 break/continue 出口先 rtcl.fail 记点再返回
+#   BREAK/CONTINUE；alloc_locals 给单元级 break/continue 烘焙 fail 快照）
+# - finish() 三臂分流：BREAK/CONTINUE rc、case-a/case-b pending 中的
+#   deferred return → Host::decode_top_flow（vm defer_flow_frame 同款
+#   无条件覆写帧 = last_fail 的 site/bodies[0]）→ decode_toplevel_flow
+# - CallSite kind-1/2 无循环臂：单元 BREAK/CONTINUE（原落 ERROR 且
+#   pending 已被 take_fail 早退消费 = 空输出，f7/f10 实证）
+# - take_fail case-b deferred-return 早退（vm = defer_flow_frame，无帧
+#   机械；f9 的裸消息守卫同 build_case_a_report/fuzz f001026）
+# - jitsh：-f Fallback 分支 decode、-c 整面镜像 rtcl-cli run_command
+#   （eval_incremental——JIT 差分门禁全走 -f）
+# 23 形状 sweep（裸 break/continue、deferred break/continue/error/
+# return、词括号、if 体、eval 体、catch rc、循环内 deferred）+ -c 9 形
+# 状三方逐字节一致。
+#
+# ## 板点 B（while/for 体帧族）——落地（fuzz 41→5）
+#
+# fuzz seed0 500 例：HEAD 41 分歧 → 5。cf5e3d8 的解释器体帧语义落地后
+# JIT unwind 的 Body/Next 臂是空转（{}），fuzz 门在 HEAD 未复跑。修复面：
+# - unwind/proc-branch/sh_take_fail 三 sink 复刻 vm unwind_subs 的文件
+#   语境体帧（("while"/"for" body line N)、("for" loop-end command)、
+#   仅最外层体区；proc 体 = call_proc 强制编译语境，旗标自然 false）
+# - jitsh arm_file_script + jit_err_set_file_script（JIT 顶层单元不经
+#   eval_impl，arm 无消费点——直设与 rtcl-cli 消费 arm 后同状态）
+# - rtcl-vm jit_err hooks：in_file_script/get/set、exit_frame_raw、
+#   has_info、append_info_raw、has_pending、jit_err_line
+# - alloc_locals LoopExit 体区截断（环后 op 的 fail 快照携带已闭合环
+#   区——体帧臂对环外错误误触发，f000357 族；对 for-8.x eval-break 的
+#   不匹配 LoopExit 保持旧容忍——panic 实证）
+# 残余 5 分歧 = 全部 preexist（rtcl≠tclsh 形状，jit==tclsh）：体帧行号
+# 在词括号失败时的 provenance——vm 的 Sub defer 不动 err_line、而 jit
+# 驱动 harness 更新镜像——需要 vm 端行号语义专项（reopen 线索：
+# bench/scripts/jit_fuzz_findings/preexist_wasmi_f000{054,162,213,246,
+# 272}.tcl，family = ("while"/"for"/"foreach" body line N) 行差 1-2）。
+#
+# ## 验收数字（同窗钉核 best-of-5，含 spawn）
+#
+# | case        | tclsh | rtcl(interp) | jit@wasmi | jit@wt | vs bd3e169(249ms) |
+# |---|---|---|---|---|---|
+# | arith_loop  | 35    | 10           | 13        | 13     | 19.2×（门 ≥3×，<83ms） |
+# | var_incr    | 42    | 11           | 13        | 12     | — |
+#
+# jit@wasmi 13ms = 0.37× tclsh（门 ≤1.9×）。A/B（HEAD cf5e3d8 同窗）：
+# interp/jit 全部噪声级（oo 1434→1404、dloop 300→280、fib 15→15、
+# arith 11→10）——无回退。六主基准 + 微套件同窗复测无回退。
+#
+# 门禁：judge 88/88×2、battery 43/43（+b34-b43 流/体帧固化）、fuzz
+# seed0 500 例 5 分歧（HEAD 41；残余见上）、workspace tests 1420/0、
+# roundtrip（jit-exec）5/5。

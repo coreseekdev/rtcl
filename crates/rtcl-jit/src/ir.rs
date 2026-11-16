@@ -317,6 +317,10 @@ pub enum Instr {
     },
     /// `rtcl.fail(fail_id)` + 返回 TCL_ERROR。
     Fail { fail: u32 },
+    /// `rtcl.fail(fail_id)`（记录失败点）后按 `code` 返回——单元级
+    /// break/continue 出口的帧归属快照（D-11 顶层解码的 cur_site 源）。
+    /// 与 `Fail` 的差别：返回码是 BREAK/CONTINUE 而非 ERROR。
+    FlowExit { code: i32, fail: u32 },
     SetResult { src: Reg },
     ReturnCode { code: i32 },
     /// Exit op → 宿主终局（driver 复刻 rtcl 文件模式行为）。

@@ -36,6 +36,9 @@ pub(crate) struct Host {
     pub(crate) fails: Vec<FailInfo>,
     sites: Vec<rtcl_parser::SrcSpan>,
     lines: Vec<u32>,
+    /// 每站点的词源跨度（vm unwind_subs 体帧的 while/for/if 判别与
+    /// 体首行计算——fuzz f000022 族）。
+    site_words: Vec<std::rc::Rc<Vec<rtcl_parser::SrcSpan>>>,
     source: Rc<str>,
     pub(crate) result: Option<Value>,
     pub(crate) pending: Option<Pending>,
@@ -186,9 +189,9 @@ impl Host {
         // harness_frame 清除——外层帧吞掉词括号的 defer）；FIFO 顺序会
         // 反过来让 pending_top 存活到终局、exit_frame 行号取错源
         // （fuzz f000200 簇：尾部多 puts 帧 + ("foreach" body) 行差 1）。
-        for (kind, site) in bodies.iter().rev().map(|(k, s)| (*k, *s)) {
-            let text = self.site_text(site).to_string();
-            let line = self.lines.get(site as usize).copied().unwrap_or(0) as usize;
+        for (i, (kind, site)) in bodies.iter().enumerate().rev() {
+            let text = self.site_text(*site).to_string();
+            let line = self.lines.get(*site as usize).copied().unwrap_or(0) as usize;
             match kind {
                 crate::ir::BodyKind::Sub => {
                     self.pending_top = Some(text);
@@ -201,14 +204,86 @@ impl Host {
                 crate::ir::BodyKind::BodyFramed(lmap) => {
                     // vm_exec unwind_subs 的 BodyFramed 复刻：
                     // ("foreach"/"lmap" body line N) + 站点 harness 帧。
-                    let tag = if lmap { "\"lmap\" body" } else { "\"foreach\" body" };
+                    let tag = if *lmap { "\"lmap\" body" } else { "\"foreach\" body" };
                     self.exit_frame(tag);
                     let msg = e.message_text();
                     self.harness_frame(&msg, &text, line);
                 }
-                crate::ir::BodyKind::Body | crate::ir::BodyKind::Next => {}
+                crate::ir::BodyKind::Body | crate::ir::BodyKind::Next => {
+                    // vm unwind_subs 的文件语境体帧（fuzz f000022 族）：
+                    // 顶层 while/for/if 体错误的 ("while" body line N) /
+                    // ("for" loop-end command) / 站点 harness 帧。仅
+                    // **最外层**体区（下方无其他体区——vm 的 st.bodies
+                    // any 检查）且文件执行语境（proc 体 = 编译语境，
+                    // call.rs:468 强制 false——jit_err_in_file_script 同
+                    // 一旗标，宿主侧自动对齐）。
+                    let is_next = matches!(kind, crate::ir::BodyKind::Next);
+                    let outermost = !bodies[..i].iter().any(|(k, _)| {
+                        matches!(
+                            k,
+                            crate::ir::BodyKind::Body
+                                | crate::ir::BodyKind::Next
+                                | crate::ir::BodyKind::BodyFramed(_)
+                        )
+                    });
+                    if !outermost || !self.irp().jit_err_in_file_script() {
+                        continue;
+                    }
+                    let Some(first_word) = self.site_first_word(*site) else { continue };
+                    let msg = e.message_text();
+                    match first_word.as_str() {
+                        "while" if !is_next => {
+                            let n = self.err_line.saturating_sub(self.body_open_line(*site).saturating_sub(1));
+                            if let Some(info) = &mut self.info {
+                                info.push_str(&format!("\n    (\"while\" body line {n})"));
+                            }
+                            self.harness_frame(&msg, &text, line);
+                        }
+                        "for" => {
+                            if is_next {
+                                // tclsh loop-end 出口帧无行号（p20a）。
+                                if let Some(info) = &mut self.info {
+                                    info.push_str("\n    (\"for\" loop-end command)");
+                                }
+                            } else {
+                                let n = self
+                                    .err_line
+                                    .saturating_sub(self.body_open_line(*site).saturating_sub(1));
+                                if let Some(info) = &mut self.info {
+                                    info.push_str(&format!("\n    (\"for\" body line {n})"));
+                                }
+                            }
+                            self.harness_frame(&msg, &text, line);
+                        }
+                        "if" => {
+                            // if 无体帧（Tcl_IfObjCmd 无 body appender）。
+                            self.harness_frame(&msg, &text, line);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
+    }
+
+    /// 站点命令首词（vm 的 word_srcs.first 判别——while/for/if）。
+    fn site_first_word(&self, site: u32) -> Option<String> {
+        self.site_words
+            .get(site as usize)?
+            .first()
+            .map(|sp| sp.slice(&self.source).to_string())
+    }
+
+    /// 体首行 = 末词（花括号体 `{`）起始行（vm 的 word_srcs.last 换行
+    /// 计数同款）。
+    fn body_open_line(&self, site: u32) -> usize {
+        self.site_words
+            .get(site as usize)
+            .and_then(|ws| ws.last().map(|sp| {
+                let start = (sp.start as usize).min(self.source.len());
+                1 + self.source[..start].bytes().filter(|b| *b == b'\n').count()
+            }))
+            .unwrap_or(1)
     }
 
     /// case b 的 fail 处置：分类 + （错误时）帧追加。返回 kind。
@@ -256,6 +331,9 @@ impl Host {
             if kind != 0 {
                 return kind;
             }
+            // deferred return（classify 恒 0）也落此：帧已由嵌套 eval
+            // 的 defer 链种好（外层胜），无帧机械——原样回 pending
+            // （finish 顶层解码转错/透传）。
             self.pending = Some(Pending { err: e, from_eval: true });
             return 0;
         }
@@ -271,6 +349,14 @@ impl Host {
             }
             k => return k,
         };
+        if e.is_return() {
+            // D-11 deferred return（case b）：vm = defer_flow_frame——
+            // 无错误帧机械（harness/基底抽取都只属于真错误）；帧归属
+            // 由 finish 的 decode_top_flow 以 last_fail 快照种。这里仅
+            // 原样回置 pending + rc 0（wasm 落 ERROR 出口）。
+            self.pending = Some(Pending { err: e, from_eval: false });
+            return 0;
+        }
         let fi = self.fails.get(fail_id as usize).cloned();
         if self.proc_ctx {
             // 内联括号形（rd3/dp2 族）：EvalExpr 失败于 Sub region 内、
@@ -314,7 +400,7 @@ impl Host {
                 // ctx-append 之后又 set_pending 一次，最终 error_report
                 // 把它追加）。
                 let appended_here = fi.site != u32::MAX && !frameless;
-                for (kind, site) in fi.bodies.iter().rev() {
+                for (i, (kind, site)) in fi.bodies.iter().enumerate().rev() {
                     let text = self.site_text(*site).to_string();
                     let line = self.lines.get(*site as usize).copied().unwrap_or(0) as usize;
                     match kind {
@@ -335,7 +421,45 @@ impl Host {
                             let msg = e.message_text();
                             self.irp().jit_err_harness_frame(&msg, &text, line);
                         }
-                        crate::ir::BodyKind::Body | crate::ir::BodyKind::Next => {}
+                        crate::ir::BodyKind::Body | crate::ir::BodyKind::Next => {
+                            // 文件语境体帧（vm unwind_subs 同臂；仅最外层
+                            // 体区。proc 体 = 编译语境——call_proc 已强制
+                            // in_file_script=false，此臂自然不触发）。
+                            let is_next = matches!(kind, crate::ir::BodyKind::Next);
+                            let outermost = !fi.bodies[..i].iter().any(|(k, _)| {
+                                matches!(
+                                    k,
+                                    crate::ir::BodyKind::Body
+                                        | crate::ir::BodyKind::Next
+                                        | crate::ir::BodyKind::BodyFramed(_)
+                                )
+                            });
+                            if !outermost || !self.irp().jit_err_in_file_script() {
+                                continue;
+                            }
+                            let Some(w) = self.site_first_word(*site) else { continue };
+                            let msg = e.message_text();
+                            match w.as_str() {
+                                "while" if !is_next => {
+                                    let n = self.irp().jit_err_line().saturating_sub(self.body_open_line(*site).saturating_sub(1));
+                                    self.irp().jit_err_append_info_raw(&format!("\n    (\"while\" body line {n})"));
+                                    self.irp().jit_err_harness_frame(&msg, &text, line);
+                                }
+                                "for" => {
+                                    if is_next {
+                                        self.irp().jit_err_exit_frame_raw("\"for\" loop-end command");
+                                    } else {
+                                        let n = self.irp().jit_err_line().saturating_sub(self.body_open_line(*site).saturating_sub(1));
+                                        self.irp().jit_err_append_info_raw(&format!("\n    (\"for\" body line {n})"));
+                                    }
+                                    self.irp().jit_err_harness_frame(&msg, &text, line);
+                                }
+                                "if" => {
+                                    self.irp().jit_err_harness_frame(&msg, &text, line);
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
@@ -363,7 +487,15 @@ impl Host {
             let raw = self.irp().error_report(&e, SENT);
             let tail = format!("\n    (file \"{}\" line ", SENT);
             let base = match raw.rfind(&tail) {
-                Some(i) => Some(raw[..i].to_string()),
+                // 裸消息守卫（与 build_case_a_report 同款，fuzz f001026
+                // 首帧分支）：base == 裸消息 ⇒ 累积器为空——info 置
+                // None 让 harness_frame 走首帧分支（f9：deferred
+                // `-code error` 的 "boom / while executing / p"，裸消息
+                // 入 info 会把站点帧打成 invoked-from-within）。
+                Some(i) => {
+                    let b = raw[..i].to_string();
+                    if b.is_empty() || b == e.to_string() { None } else { Some(b) }
+                }
                 None if raw != e.to_string() => Some(raw),
                 None => None,
             };
@@ -480,6 +612,55 @@ impl Host {
             None => String::new(),
         }
     }
+
+    /// D-11 顶层控制流解码（JIT 驱动侧终点）：裸 break/continue 与
+    /// deferred return 在顶层就是错误（tclsh main 语义；vm_exec 的
+    /// defer_flow_frame + cli 的 decode_toplevel_flow 对应物）。
+    ///
+    /// 帧归属（「看到该完成的命令」）：以 last_fail 的快照无条件覆写
+    /// interp 的 defer 帧（vm 的 cur_site 同纪律，外层胜——嵌套 eval
+    /// 的 defer 是内层帧）；site = cur_site 快照，bodies[0] =
+    /// unwind_subs 弹栈终点（最外层开放 region 胜）。
+    pub(crate) fn decode_top_flow(&mut self, e: Error) -> FlowDecode {
+        // vm defer_flow_frame 纪律 = 无条件覆写（cur_site 快照 = 最外层
+        // 「看到该完成的命令」；嵌套 eval 的 defer 是内层帧，外层胜——
+        // j5：`eval {break}` 的帧是 eval 分派站点而非内层 break）。
+        let fi = self.last_fail.and_then(|f| self.fails.get(f as usize).cloned());
+        if let Some(fi) = fi {
+            let (site, line) = match fi.bodies.first() {
+                Some((_, s)) => (
+                    *s,
+                    self.lines.get(*s as usize).copied().unwrap_or(0) as usize,
+                ),
+                None => (
+                    fi.site,
+                    self.lines.get(fi.site as usize).copied().unwrap_or(0) as usize,
+                ),
+            };
+            if site != u32::MAX {
+                let text = self.site_text(site).to_string();
+                if !text.is_empty() {
+                    self.irp().jit_err_set_pending(&text, line);
+                }
+            }
+        }
+        self.last_fail = None;
+        let decoded = self.irp().decode_toplevel_flow(e);
+        if decoded.is_return() {
+            // 透传纯 return（`-code return` 解码不转换）：文件模式 =
+            // 正常完成 rc 0 静默（cli is_return 分支同款）。
+            FlowDecode::Return
+        } else {
+            FlowDecode::Error(decoded)
+        }
+    }
+}
+
+/// decode_top_flow 的结果：解码后的错误（jitsh 走 error_report），或
+/// 透传纯 return（文件模式静默成功）。
+pub(crate) enum FlowDecode {
+    Error(Error),
+    Return,
 }
 
 /// ④ 中途 bump 的 pending 标记（take_fail → kind 6）。
@@ -583,6 +764,7 @@ impl Host {
             fails: module.l2.fails.clone(),
             sites: bc.sites.iter().map(|s| s.text).collect(),
             lines: bc.sites.iter().map(|s| s.line).collect(),
+            site_words: bc.sites.iter().map(|s| Rc::clone(&s.word_srcs)).collect(),
             source: Rc::clone(&bc.source),
             result: None,
             pending: None,
@@ -640,6 +822,14 @@ impl Host {
     }
     pub(crate) fn lines_of(&self, site: u32) -> usize {
         self.lines.get(site as usize).copied().unwrap_or(0) as usize
+    }
+    /// 站点命令首词（fast-tier 体帧的 while/for/if 判别）。
+    pub(crate) fn site_first_word_of(&self, site: u32) -> Option<String> {
+        self.site_first_word(site)
+    }
+    /// 体首行（末词 `{` 起始行——fast-tier 体帧的相对行计算）。
+    pub(crate) fn body_open_line_of(&self, site: u32) -> usize {
+        self.body_open_line(site)
     }
     pub fn refuel_chunk(&self) -> i64 {
         self.refuel_chunk

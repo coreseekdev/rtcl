@@ -1226,11 +1226,58 @@ impl Interp {
         self.err_line = line;
     }
 
+    /// 同上：当前行号（体帧的 body-relative 行计算——vm unwind_subs
+    /// 的 n = err_line - (体首行 - 1) 同口径）。
+    pub fn jit_err_line(&self) -> usize {
+        self.err_line
+    }
+
     /// 同上：defer 帧清除（err_harness_frame 的 superseded 规则暴露给
     /// JIT 驱动——本层 harness 已 append 时，Sub defer 的外围命令帧
     /// 被顶替）。
     pub fn jit_err_clear_pending(&mut self) {
         self.err_pending_top = None;
+    }
+
+    /// 同上：defer 帧在位查询——顶层 D-11 解码（decode_toplevel_flow）
+    /// 的「外层胜」纪律：宿主分派路径的 defer 已种帧时，JIT 驱动不得
+    /// 以自己的 cur_site 快照顶替（i2：`if 1 {return -code break}` 的
+    /// 外围 if 帧由嵌套 eval 的 unwind_subs 种）。
+    pub fn jit_err_has_pending(&self) -> bool {
+        self.err_pending_top.is_some()
+    }
+
+    /// 同上：文件执行语境查询（unwind_subs 的体帧分支开关——rtcl-cli
+    /// run_file 经 arm_file_script 武装；JIT 驱动同口径）。
+    pub fn jit_err_in_file_script(&self) -> bool {
+        self.in_file_script
+    }
+
+    /// 同上：文件语境直设。JIT 顶层单元不经 eval_impl（arm 的消费点
+    /// 在那里）——wasm 单元须与「rtcl-cli 消费 arm 后的顶层单元」同
+    /// 状态起步（宿主分派的嵌套 eval 各自 save/false/restore，不受
+    /// 影响）。
+    pub fn jit_err_set_file_script(&mut self, v: bool) {
+        self.in_file_script = v;
+    }
+
+    /// 同上：无行号出口帧（vm 的 `("for" loop-end command)` 钉形）。
+    pub fn jit_err_exit_frame_raw(&mut self, text: &str) {
+        self.err_exit_frame_raw(text);
+    }
+
+    /// 同上：errorInfo 累积器在位查询（体帧 append 的 vm 语义 =
+    /// `if let Some(info)`——累积器为空时跳过，不造首帧）。
+    pub fn jit_err_has_info(&self) -> bool {
+        self.err_info.is_some()
+    }
+
+    /// 同上：累积器 raw append（体帧退出行 `("while" body line N)` 的
+    /// vm 形 = `if let Some(info) { info.push_str }`——空时跳过）。
+    pub fn jit_err_append_info_raw(&mut self, text: &str) {
+        if let Some(info) = &mut self.err_info {
+            info.push_str(text);
+        }
     }
 
     /// 每条命令分派计一步；超限抛错。解释器（`eval_command`）与 VM

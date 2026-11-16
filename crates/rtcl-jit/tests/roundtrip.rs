@@ -23,10 +23,23 @@ fn jit_file_mode(script: &str, file: &str) -> (String, i32) {
     match run.outcome {
         Outcome::Fallback => match interp.eval(script) {
             Ok(_) => (String::new(), 0),
-            Err(e) => (interp.error_report(&e, file), 1),
+            Err(e) => {
+                // jitsh main Fallback 分支同款：D-11 顶层解码。
+                let e = interp.decode_toplevel_flow(e);
+                if e.is_exit() {
+                    let code = e.message_text().trim().parse::<i32>().unwrap_or(0);
+                    return (rtcl_core::Error::exit(Some(code)).to_string(), 1);
+                }
+                if e.is_return() {
+                    return (String::new(), 0);
+                }
+                (interp.error_report(&e, file), 1)
+            }
         },
         Outcome::Completed { code, exit_code } => match code {
             0 | 5 => (String::new(), 0),
+            // 顶层 return = 正常完成（jitsh main：静默 rc 0）。
+            2 => (String::new(), 0),
             6 => (rtcl_core::Error::exit(Some(exit_code.unwrap_or(0))).to_string(), 1),
             _ => {
                 if let Some(e) = run.eval_error {
@@ -40,10 +53,23 @@ fn jit_file_mode(script: &str, file: &str) -> (String, i32) {
 }
 
 fn interp_file_mode(script: &str, file: &str) -> (String, i32) {
+    // rtcl-cli run_file 同款：eval → 顶层 D-11 解码（裸 break/continue
+    // 与 deferred return 在顶层是错误）→ exit 以 N 退出/return 静默
+    // rc 0/错误 error_report。
     let mut interp = Interp::new();
     match interp.eval(script) {
         Ok(_) => (String::new(), 0),
-        Err(e) => (interp.error_report(&e, file), 1),
+        Err(e) => {
+            let e = interp.decode_toplevel_flow(e);
+            if e.is_exit() {
+                let code = e.message_text().trim().parse::<i32>().unwrap_or(0);
+                return (rtcl_core::Error::exit(Some(code)).to_string(), 1);
+            }
+            if e.is_return() {
+                return (String::new(), 0);
+            }
+            (interp.error_report(&e, file), 1)
+        }
     }
 }
 

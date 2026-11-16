@@ -269,7 +269,7 @@ pub(crate) fn sh_take_fail(s: &mut FastShared, cur: usize, fail_id: u32) -> i32 
         irp.jit_err_set_line(line);
         irp.jit_err_harness_frame(&msg, &text, line);
     }
-    for (bkind, site) in fi.bodies.iter().rev() {
+    for (i, (bkind, site)) in fi.bodies.iter().enumerate().rev() {
         let text = s.hosts[cur].site_text_of(*site);
         let line = s.hosts[cur].lines_of(*site);
         match bkind {
@@ -284,7 +284,49 @@ pub(crate) fn sh_take_fail(s: &mut FastShared, cur: usize, fail_id: u32) -> i32 
                 let msg = e.message_text();
                 irp.jit_err_harness_frame(&msg, &text, line);
             }
-            BodyKind::Body | BodyKind::Next => {}
+            BodyKind::Body | BodyKind::Next => {
+                // 文件语境体帧（vm unwind_subs 同臂；仅最外层体区。proc
+                // 体 = 编译语境——call_proc 已强制 in_file_script=false，
+                // 此臂自然不触发）。
+                let is_next = matches!(bkind, BodyKind::Next);
+                let outermost = !fi.bodies[..i].iter().any(|(k, _)| {
+                    matches!(
+                        k,
+                        BodyKind::Body | BodyKind::Next | BodyKind::BodyFramed(_)
+                    )
+                });
+                if !outermost || !irp.jit_err_in_file_script() {
+                    continue;
+                }
+                let Some(first_word) = s.hosts[cur].site_first_word_of(*site) else {
+                    continue;
+                };
+                let msg = e.message_text();
+                match first_word.as_str() {
+                    "while" if !is_next => {
+                        let n = irp
+                            .jit_err_line()
+                            .saturating_sub(s.hosts[cur].body_open_line_of(*site).saturating_sub(1));
+                        irp.jit_err_append_info_raw(&format!("\n    (\"while\" body line {n})"));
+                        irp.jit_err_harness_frame(&msg, &text, line);
+                    }
+                    "for" => {
+                        if is_next {
+                            irp.jit_err_exit_frame_raw("\"for\" loop-end command");
+                        } else {
+                            let n = irp
+                                .jit_err_line()
+                                .saturating_sub(s.hosts[cur].body_open_line_of(*site).saturating_sub(1));
+                            irp.jit_err_append_info_raw(&format!("\n    (\"for\" body line {n})"));
+                        }
+                        irp.jit_err_harness_frame(&msg, &text, line);
+                    }
+                    "if" => {
+                        irp.jit_err_harness_frame(&msg, &text, line);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
     s.pending = Some(Pending { err: e, from_eval: false });

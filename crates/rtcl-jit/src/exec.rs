@@ -35,7 +35,7 @@ use rtcl_vm::VmContext;
 use std::rc::Rc;
 
 pub(crate) use crate::host::Host;
-pub(crate) use crate::host::{Pending, ForeachHost, STALE_MARK, arena_of, classify_control};
+pub(crate) use crate::host::{FlowDecode, Pending, ForeachHost, STALE_MARK, arena_of, classify_control};
 
 /// 顶层执行结果。
 pub enum Outcome {
@@ -579,43 +579,83 @@ fn execute(
 /// run() 返回后的共享终局：错误二分（case a/b）与报告构建。
 pub(crate) fn finish(mut host: Host, outcome_code: i32, file: &str) -> JitRun {
     let pending_exit = host.pending_exit.take();
+    let mut outcome_code = outcome_code;
     let (driver_report, eval_error) = match outcome_code {
         code::ERROR => {
             let is_case_a = host.pending.as_ref().is_some_and(|p| p.from_eval);
             if is_case_a {
                 let e = host.pending.take().unwrap().err;
-                // 需要驱动补帧的形态（EvalExpr 站点帧 / EvalScript
-                // pending / unwind 有 Sub/Expr/BodyFramed）；纯 Call 的
-                // 站点帧已由嵌套 eval 追加——走 error_report 原路。
-                let needs_extras = host.last_fail.is_some_and(|f| {
-                    host.fails.get(f as usize).is_some_and(|fi| {
-                        !matches!(fi.kind, crate::ir::FailKind::Call)
-                            || fi
-                                .bodies
-                                .iter()
-                                .any(|(k, _)| !matches!(
-                                    k,
-                                    crate::ir::BodyKind::Body | crate::ir::BodyKind::Next
-                                ))
-                    })
-                });
-                if needs_extras {
-                    let r = host.build_case_a_report(host.last_fail, &e, file);
-                    (Some(r), None)
+                // D-11 分流（case a）：控制流完成（eval 体的 break/
+                // continue 冒出、deferred return）顶层解码转错——帧已
+                // 由嵌套 eval 的 defer 链种好，不走驱动补帧机械。
+                if e.is_break() || e.is_continue() || e.is_return() {
+                    match host.decode_top_flow(e) {
+                        FlowDecode::Error(e) => (None, Some(e)),
+                        FlowDecode::Return => {
+                            outcome_code = code::RETURN;
+                            (None, None)
+                        }
+                    }
                 } else {
-                    (None, Some(e))
+                    // 需要驱动补帧的形态（EvalExpr 站点帧 / EvalScript
+                    // pending / unwind 有 Sub/Expr/BodyFramed）；纯 Call 的
+                    // 站点帧已由嵌套 eval 追加——走 error_report 原路。
+                    let needs_extras = host.last_fail.is_some_and(|f| {
+                        host.fails.get(f as usize).is_some_and(|fi| {
+                            !matches!(fi.kind, crate::ir::FailKind::Call)
+                                || fi
+                                    .bodies
+                                    .iter()
+                                    .any(|(k, _)| !matches!(
+                                        k,
+                                        crate::ir::BodyKind::Body | crate::ir::BodyKind::Next
+                                    ))
+                        })
+                    });
+                    if needs_extras {
+                        let r = host.build_case_a_report(host.last_fail, &e, file);
+                        (Some(r), None)
+                    } else {
+                        (None, Some(e))
+                    }
                 }
             } else {
-                let r = host.driver_report(file);
-                (Some(r), None)
+                // D-11 分流（case b）：pending 是控制流完成（deferred
+                // return / break / continue——非真错误）时，顶层解码为
+                // 错误（tclsh main 语义；帧归属见 decode_top_flow）。
+                let is_flow_completion = host.pending.as_ref().is_some_and(|p| {
+                    let e = &p.err;
+                    e.is_break() || e.is_continue() || e.is_return()
+                });
+                if is_flow_completion {
+                    let e = host.pending.take().unwrap().err;
+                    match host.decode_top_flow(e) {
+                        FlowDecode::Error(e) => (None, Some(e)),
+                        FlowDecode::Return => {
+                            outcome_code = code::RETURN;
+                            (None, None)
+                        }
+                    }
+                } else {
+                    let r = host.driver_report(file);
+                    (Some(r), None)
+                }
             }
         }
-        code::RETURN | code::BREAK | code::CONTINUE => {
-            let e = match outcome_code {
-                code::RETURN => Error::ret(host.result.clone()),
-                code::BREAK => Error::brk(),
-                _ => Error::cont(),
-            };
+        code::BREAK | code::CONTINUE => {
+            // 单元级裸 break/continue（FlowExit）：顶层解码是错误
+            // （D-11，rtcl-cli run_file 的 decode_toplevel_flow 同款）。
+            let e = if outcome_code == code::BREAK { Error::brk() } else { Error::cont() };
+            match host.decode_top_flow(e) {
+                FlowDecode::Error(e) => (None, Some(e)),
+                FlowDecode::Return => {
+                    outcome_code = code::RETURN;
+                    (None, None)
+                }
+            }
+        }
+        code::RETURN => {
+            let e = Error::ret(host.result.clone());
             host.pending = Some(Pending { err: e, from_eval: false });
             let r = host.driver_report(file);
             (Some(r), None)

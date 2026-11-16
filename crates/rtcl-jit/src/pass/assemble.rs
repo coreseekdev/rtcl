@@ -1650,6 +1650,18 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 f.instruction(&Instruction::I32Const(1));
                 f.instruction(&Instruction::I32Eq);
                 f.instruction(&Instruction::BrIf(d + 1));
+            } else {
+                // kind 1 无循环可落（deferred `return -code break` 跨
+                // proc 边界入单元——is_break 涵盖 deferred）：break 逃
+                // 出单元 → rc BREAK（顶层 D-11 解码转错；pending 已被
+                // take_fail 的早退消费，finish 由 rc+last_fail 重建）。
+                f.instruction(&Instruction::LocalGet(e.kind));
+                f.instruction(&Instruction::I32Const(1));
+                f.instruction(&Instruction::I32Eq);
+                f.instruction(&Instruction::If(BlockType::Empty));
+                f.instruction(&Instruction::I32Const(code::BREAK));
+                f.instruction(&Instruction::Return);
+                f.instruction(&Instruction::End);
             }
             if let Some(d) = cont_depth {
                 f.instruction(&Instruction::LocalGet(e.kind));
@@ -1660,6 +1672,15 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                     emit_fuel(e, f, *fail);
                 }
                 f.instruction(&Instruction::Br(d + 2));
+                f.instruction(&Instruction::End);
+            } else {
+                // kind 2 同上（无循环 → 单元 CONTINUE）。
+                f.instruction(&Instruction::LocalGet(e.kind));
+                f.instruction(&Instruction::I32Const(2));
+                f.instruction(&Instruction::I32Eq);
+                f.instruction(&Instruction::If(BlockType::Empty));
+                f.instruction(&Instruction::I32Const(code::CONTINUE));
+                f.instruction(&Instruction::Return);
                 f.instruction(&Instruction::End);
             }
             // ④ kind 6 = Tier1 中途 bump：整单元 return STALE，驱动侧
@@ -1954,6 +1975,20 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 ret_fast_sentinel(f, code::ERROR);
             } else {
                 f.instruction(&Instruction::I32Const(code::ERROR));
+                f.instruction(&Instruction::Return);
+            }
+        }
+        Instr::FlowExit { code, fail } => {
+            // 单元级裸 break/continue：记失败点（顶层 D-11 解码的帧
+            // 快照源——宿主 finish 用 last_fail 的 site/bodies），返回
+            // BREAK/CONTINUE。冷路径（循环 break/continue 走 Br）。
+            f.instruction(&Instruction::I32Const(*fail as i32));
+            f.instruction(&Instruction::Call(import::FAIL));
+            f.instruction(&Instruction::Drop);
+            if e.fast.is_some() {
+                ret_fast_sentinel(f, *code);
+            } else {
+                f.instruction(&Instruction::I32Const(*code));
                 f.instruction(&Instruction::Return);
             }
         }

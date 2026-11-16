@@ -349,12 +349,17 @@ fn seq(ctx: &mut Ctx, start: u32, end: u32) -> Result<L3, Unsupported> {
             OpCode::Break | OpCode::Continue => {
                 ctx.placed[pc as usize] = true;
                 let Some(&edge) = ctx.l2.edges[pc as usize].first() else {
-                    items.push(L3::Instr(Instr::ReturnCode {
-                        code: if matches!(op, OpCode::Break) {
-                            crate::abi::code::BREAK
-                        } else {
-                            crate::abi::code::CONTINUE
-                        },
+                    // 单元级裸 break/continue：顶层解码是错误（D-11），
+                    // 帧归属需要 fail 表的 site/bodies 快照——先 FAIL 记
+                    // 点再返回（FlowExit；宿主 finish 侧解码）。
+                    let code = if matches!(op, OpCode::Break) {
+                        crate::abi::code::BREAK
+                    } else {
+                        crate::abi::code::CONTINUE
+                    };
+                    items.push(L3::Instr(Instr::FlowExit {
+                        code,
+                        fail: ctx.l2.fail_of[pc as usize].expect("flow exit fail id"),
                     }));
                     pc += 1;
                     continue;

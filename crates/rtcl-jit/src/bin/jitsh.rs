@@ -31,6 +31,12 @@ fn main() {
     };
     let mut interp = Interp::new();
     interp.set_script_name(&file);
+    // 文件执行语境（rtcl-cli run_file 同款）：errorInfo 的文件级
+    // if/while/for 体帧归属以此判别（unwind_subs 的 in_file_script 臂
+    // ——proc 体在 call_proc 边界强制编译语境，不受影响）。arm 经
+    // eval_impl 消费；JIT 顶层单元不经 eval_impl，故直设同状态。
+    interp.arm_file_script();
+    interp.jit_err_set_file_script(true);
     let script = match std::fs::read_to_string(&file) {
         Ok(s) => s,
         Err(e) => {
@@ -42,6 +48,18 @@ fn main() {
     match run.outcome {
         Outcome::Fallback => {
             if let Err(e) = interp.eval(&script) {
+                // 顶层控制流解码（D-11，rtcl-cli run_file 同款）：
+                // `return -code error/break/continue` 与裸 break/
+                // continue 在顶层就是错误（完整 errorInfo rc 1），普通
+                // return 正常完成 rc 0 静默，`exit N` 以 N 退出。
+                let e = interp.decode_toplevel_flow(e);
+                if e.is_exit() {
+                    let code = e.message_text().trim().parse::<i32>().unwrap_or(0);
+                    std::process::exit(code);
+                }
+                if e.is_return() {
+                    return;
+                }
                 let report = interp.error_report(&e, &file);
                 eprintln!("{}", report);
                 std::process::exit(1);
@@ -76,37 +94,28 @@ fn main() {
 }
 
 fn run_command(cmd: &str) {
-    let interp = Interp::new();
-    let (mut interp, run) = exec::run_top(interp, cmd, "");
-    match run.outcome {
-        Outcome::Fallback => match interp.eval(cmd) {
-            Ok(v) => {
-                if !v.is_empty() {
-                    println!("{}", v);
-                }
-            }
-            Err(e) => {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            }
-        },
-        Outcome::Completed { code, .. } => {
-            if code == 0 {
-                if let Some(v) = &run.result {
-                    if !v.is_empty() {
-                        println!("{}", v);
-                    }
-                }
-            } else if let Some(e) = run.eval_error {
-                eprintln!("{}", e);
-                std::process::exit(1);
-            } else if let Some(r) = run.driver_report {
-                if !r.is_empty() {
-                    eprintln!("{}", r);
-                }
-                std::process::exit(1);
-            }
+    // -c 语境 = rtcl-cli run_command 同款：eval_incremental 增量求值
+    //（stdin 语义，非文件模式的整脚本编译执行），顶层处置相同——
+    // `exit N` 以 N 退出、return（含 deferred）正常完成 rc 0、break/
+    // continue 原文 `Error: <text>` rc 1、错误 `Error: <msg>`（无帧，
+    // 文件级帧归属只属 -f）。JIT 差分门禁全走 -f（judge/battery/
+    // probes/fuzz 的比较路径），-c 保留纯解释器探针面 + RTCL_JIT_
+    // ACCEPT 接受性判定。
+    let mut interp = Interp::new();
+    let result = match interp.eval_incremental(cmd) {
+        Ok(r) => r,
+        Err(e) if e.is_exit() => {
+            let code = e.message_text().trim().parse::<i32>().unwrap_or(0);
+            std::process::exit(code);
         }
+        Err(e) if e.is_return() => return,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if !result.is_empty() {
+        println!("{}", result);
     }
 }
 

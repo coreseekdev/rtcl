@@ -343,6 +343,11 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
                 FailKind::Cold,
                 &mut fails,
             )),
+            // 单元级裸 break/continue（无 enclosing loop）：顶层解码
+            // 是错误（D-11），帧归属快照（site/bodies）随 fail 表烘焙。
+            OpCode::Break | OpCode::Continue if loops.last().is_none() => {
+                Some(snap(pc, cur_site, &bodies, &loops, false, FailKind::Cold, &mut fails))
+            }
             _ => None,
         };
         fail_of.push(fail);
@@ -432,7 +437,15 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
                 loops.push((*cont, *brk, bodies.len(), cur_site));
             }
             OpCode::LoopExit => {
-                loops.pop();
+                // 体区随循环闭合截断（vm 的 loop-end Jump 弹区 + Break/
+                // Continue 臂同款）——否则环后 op 的 fail 快照携带已闭
+                // 合的环区，体帧臂对环外错误误触发（fuzz f000357 族）。
+                // 不匹配的 LoopExit（for-8.x 的 eval-break 线性模拟形）
+                // 保持旧容忍：仅弹 loops，不动 bodies。
+                if let Some((_, _, blen, owner)) = loops.pop() {
+                    bodies.truncate(blen);
+                    cur_site = owner;
+                }
             }
             OpCode::Break | OpCode::Continue => {
                 if let Some(l) = loops.last() {

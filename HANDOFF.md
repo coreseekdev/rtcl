@@ -296,6 +296,56 @@ json/regexp-spencer 移侧模块，其分派面随之出表）。
   不受影响）、wasm check 过。尺寸：wasm raw 2.84 → 2.74 MiB（-97
   KiB regexp-lite）；pkg（bindgen+wasm-opt）≈2.0 MiB。
 
+## 10senioquincesimus. 2026-11-16b JIT M2 件1：slot 单态缓存（perf/wave2 @ 40bcae8）
+
+### 盘点定谳（M2 开工前）
+
+- **M2 目标的「slot 缓存」在 fast tier 已大部存在**：C1/C4 波次落下
+  的 fast-tier per-depth 内存槽（PARAMS 区）+ 零检查守卫 + lazy-flush
+  脏位 + CallSite 边界 flush/resync，就是「slot 单态缓存」的内存形态
+  ——fast-tier LoadVar 每读 ~9 条 wasm 指令，缓存 local 化收益 ~3 条
+  ，不划算（件3 止损依据）。
+- **真正的缺口在 classic tier**（顶层 slot 单元）：LoadVar 每读走
+  `caching global 读 + VALUES mem load + 零检查`（~12 条），IncrVar
+  ~41 条——M2 件1 落点。
+
+### 件1 落地（40bcae8）
+
+- classic tier per-var icache（tagged i64）+ ivalid（i32）wasm-local
+  组；有效臂双门 `caching==1 && iv==1`；LoadVar/IncrVar 有效臂省
+  mem load + 零检查（IncrVar 在缓存字上 untag/add/range/retag，写同
+  步落 VALUES+STATE=2——保守每写落盘，写合并不做：b47 类 trace/
+  别名可观察性依赖逐 op interp 面）。
+- 失效完备清单：caching=1→0 的全部宿主 import（binary_op/call/
+  call_argv/foreach×2/eval×2/lappend）后整表 invalidate（哨兵分支
+  前——kind!=0 会 br 回循环）；caching=0 世界 icache 由 LoadVar/
+  StoreVar host 臂逐 op 镜像。**防抖不需要**：缓存态是单次调用局部
+  ，fill 4 条指令 vs 宿主调用 ~200ns，反复失效的额外成本 ~2%。
+- 坑两枚：① wasm local 索引跨类型组连续——i64 组扩容后 i32 侧全部
+  绝对基址要平移（fast_foreach_base/slot_base_local/bool_base/kind
+  +fb_ic）；② br_if 极性（非零跳转）——首版有效臂漏 `i32.eqz` 被
+  b16 差分电池抓出（foreach 循环变量读成垃圾→expr 空串错）。
+- 新基建：battery b44-b47（命令失效/upvar 别名/global 别名/trace
+  存在，43→47）；RTCL_JIT_DUMP=<path> 模块校验失败落盘。
+
+### 验收与数字
+
+- 门禁：judge 88/88×2、jit_battery 47/47 三方逐字节、workspace
+  tests 全绿、fuzz 400（seed 7）5 分歧全部预存（基线 c889caa 与
+  40bcae8 jitsh 输出逐字节一致）。
+- 数字（jitsh best-of-9 交错，ms）：var_incr 13→11（−15%）、
+  arith_loop 15→12（−20%）、fib25 23→22、proc_fib 10→8、
+  dloop/fe/build 噪声带持平；六主基准 rtcl 侧无回退（rtcl 纯解释
+  器构建不含 rtcl-jit，天然不受影响）。
+- **边际判断**：var_incr/arith_loop 的 JIT-vs-interp 差距已闭合
+  （jitsh 11/12ms vs interp 10/9-13ms）；件2（lane 类型化后端消除
+  Cmp/Arimm imm 守卫，估再 −15-25% 仅微形状）与件3（fast-tier 臂
+  ，估 ~5%）按止损规则记 reopen 线索——annotate_lane 的 out_lane
+  字段是件2 的天然落点。
+- jitsh oo2/oovars 3.3-4.3× tclsh 为 M2 前既有（execute_fast 每次
+  proc 调用全协议 ~1.4μs vs interp ~200ns）——独立于 slot 缓存，
+  reopen 归「fast 调用协议」专项。
+
 ## 10quincesimus. 2026-11-16 M1' 验收 + 语句窗口 reopen 翻案（perf/wave2 @ c3d407a，master 线 cf5e3d8 →）
 
 ### JIT M1'（87c468e）

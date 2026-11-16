@@ -750,6 +750,32 @@ pub enum OpCode {
 
     /// No operation.
     Nop,
+
+    // ── incr 语句窗口族（`incr var [script]`，重开轮落地）──────────────
+    // 变体必须保持在**枚举尾段且相互连续**：exec_op 用主 match 之前的
+    // 范围预检分派本族（LLVM 折成 1-2 条比较），主 match 保持与基线
+    // 逐字节同形——中段插入会平移既有 op 的 tag，改写热径 match 决策
+    // 树的形状（micro 矩阵 +2-5% 指令数漂移的定位与修复，BASELINE 深
+    // 水区节有完整记录）。
+
+    /// Statement-window `incr var [script]`: the bracket's result is the
+    /// increment amount, left ON THE STACK by `SubEnd`.  Pop it, increment
+    /// the name-keyed variable, push the new value (incr's result).
+    /// `IncrVar`'s fallback ladder verbatim — a non-int amount or any
+    /// fast-path guard failure delegates to the real `incr`, which owns
+    /// creation, bignum promotion, traces and the exact errors.
+    IncrVarStack(u16),
+
+    /// Fusion of `[SubEnd, IncrVarStack i]` — the `incr var [script]`
+    /// statement tail in one dispatch.
+    SubEndIncrVarStack(u16),
+
+    /// The slot twin of [`OpCode::IncrVarStack`]: pop the amount, increment
+    /// the slot, push the new value.
+    IncrLocalStack(u16),
+
+    /// Fusion of `[SubEnd, IncrLocalStack s]` — the slot twin.
+    SubEndIncrLocalStack(u16),
 }
 
 impl fmt::Display for OpCode {
@@ -967,6 +993,10 @@ impl fmt::Display for OpCode {
                 write!(f, "SUB_END_CALL {} {}", cmd_id, argc)
             }
             OpCode::SubEndAdd => write!(f, "SUB_END_ADD"),
+            OpCode::IncrVarStack(idx) => write!(f, "INCR_V_STACK {}", idx),
+            OpCode::IncrLocalStack(slot) => write!(f, "INCR_L_STACK {}", slot),
+            OpCode::SubEndIncrVarStack(idx) => write!(f, "SUB_END_INCR_V_STACK {}", idx),
+            OpCode::SubEndIncrLocalStack(slot) => write!(f, "SUB_END_INCR_L_STACK {}", slot),
             OpCode::BodyMark => write!(f, "BODY_MARK"),
             OpCode::NextMark => write!(f, "NEXT_MARK"),
             OpCode::SubMark => write!(f, "SUB_MARK"),

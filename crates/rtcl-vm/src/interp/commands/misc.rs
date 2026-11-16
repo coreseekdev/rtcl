@@ -498,6 +498,7 @@ pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(Error::wrong_args("incr", 2, args.len()));
     }
+    crate::interp::dbgtrace::event("cmd_incr", args[1].as_str());
     let var_name = args[1].as_str();
     // tclsh reads the variable first: a bad value there wins over a bad
     // increment (`incr x 1a` with x="1a" carries no increment frame).

@@ -1403,6 +1403,7 @@ impl Interp {
 
     /// Evaluate an expression.
     pub fn eval_expr(&mut self, expr: &str) -> Result<Value> {
+        crate::interp::dbgtrace::event("eval_expr", "");
         let r = crate::types::expr::eval_expr(self, expr);
         if let Err(e) = &r {
             // D-3 残差：expr 错误的 INNER 条目 = syntax 特形——

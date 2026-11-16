@@ -42,6 +42,8 @@ optional = true
 
 [features]
 default = ["rtcl_std", "iconv"]
+# RTCL_DBG 逐写点插桩（诊断专用；默认剔除，零常驻开销）
+rtcl-dbg = []
 # OS-level platform features (time, hostname, channels, filesystem)
 std = []
 # Tcl standard library — all extensions combined

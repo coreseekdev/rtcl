@@ -205,7 +205,7 @@ impl ForeachList {
 /// expression-owning command **append** its harness frame instead of
 /// deferring.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Region {
+pub(crate) enum Region {
     Body(usize),
     /// A foreach body region in a FRAMED unit (compiled outside a proc
     /// body): body errors crossing it gain the `("foreach" body line N)`
@@ -218,7 +218,7 @@ enum Region {
 }
 
 impl Region {
-    fn site(self) -> usize {
+    pub(crate) fn site(self) -> usize {
         match self {
             Region::Body(s) | Region::BodyFramed(s, _) | Region::Next(s) | Region::Sub(s)
             | Region::Expr(s) => s,
@@ -441,12 +441,16 @@ fn write_op_inner_hint(code: &ByteCode, op: &OpCode) -> Option<&'static str> {
         }
         OpCode::IncrLocal(s, _)
         | OpCode::IncrLocalPop(s, _)
+        | OpCode::IncrLocalStack(s)
+        | OpCode::SubEndIncrLocalStack(s)
         | OpCode::BeginCmdIncrLocalPop(_, s, _)
         | OpCode::ForNextIncrLocal(_, s, _, _) => {
             Some(incr_name(code, false, Some(*s as usize), true))
         }
         OpCode::IncrVar(i, _)
         | OpCode::IncrVarPop(i, _)
+        | OpCode::IncrVarStack(i)
+        | OpCode::SubEndIncrVarStack(i)
         | OpCode::BeginCmdIncrVarPop(_, i, _)
         | OpCode::ForNextIncrVar(_, i, _, _) => {
             let name = name_at(*i);
@@ -933,6 +937,7 @@ pub(crate) fn exec_bytecode(
     interp: &mut Interp,
     code: &Rc<ByteCode>,
 ) -> Result<Value> {
+    crate::interp::dbgtrace::event("unit", "");
     exec_bytecode_with(interp, code, None)
 }
 
@@ -1185,6 +1190,8 @@ fn top_op_class(op: &OpCode) -> u8 {
         | OpCode::SubEndStoreVarPop(_)
         | OpCode::IncrVar(..)
         | OpCode::IncrVarPop(..)
+        | OpCode::IncrVarStack(..)
+        | OpCode::SubEndIncrVarStack(..)
         | OpCode::BeginCmdIncrVarPop(..)
         | OpCode::ForNextIncrVar(..)
         | OpCode::AppendVar(_)
@@ -1282,6 +1289,8 @@ fn top_op_class(op: &OpCode) -> u8 {
         | OpCode::StoreLocalPop(_)
         | OpCode::IncrLocal(..)
         | OpCode::IncrLocalPop(..)
+        | OpCode::IncrLocalStack(..)
+        | OpCode::SubEndIncrLocalStack(..)
         | OpCode::LappendLocal(_)
         | OpCode::LappendSlotSlot(..)
         // 槽超算/融合
@@ -1404,6 +1413,11 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             OpCode::StoreVar(idx) => op_store_var(interp, code, st, *idx, true),
             OpCode::StoreVarPop(idx) => op_store_var(interp, code, st, *idx, false),
             OpCode::IncrVar(idx, amount) => op_incr_var(interp, code, st, *idx, *amount),
+            // 语句窗口四 op 不进热径 match——`_` 兜底已把它们路由到
+            // exec_op 的表分派臂。本 match 的形状与基线逐字节同（代码
+            // 增量会挪动 LLVM 内联预算：micro 矩阵 +2-5% 指令数漂移的
+            // 定位，见 BASELINE 深水区节），窗口 op 每迭代至多一次，
+            // exec_op 的 call+二次分派可忽略。
             OpCode::LoadLocal(slot) => op_load_local(interp, code, st, *slot),
             OpCode::StoreLocal(slot) => op_store_local(interp, code, st, *slot),
             OpCode::StoreLocalPop(slot) => op_store_local_pop(interp, code, st, *slot),
@@ -1748,8 +1762,8 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
     Ok(result)
 }
 
-struct VmState {
-    stack: Vec<Value>,
+pub(crate) struct VmState {
+    pub(crate) stack: Vec<Value>,
     loops: Vec<LoopFrame>,
     /// Active inline foreach/lmap frames (see [`ForeachFrame`]).
     foreaches: Vec<ForeachFrame>,
@@ -1757,7 +1771,7 @@ struct VmState {
     /// the construct that owns each (`if` arm / `while` body / `for` next
     /// script).  Pushed by not-taken condition jumps and the region marks,
     /// popped by the plain `Jump` that ends every body.
-    bodies: Vec<Region>,
+    pub(crate) bodies: Vec<Region>,
     /// Reusable argument buffer for the dispatch ops: entries are MOVED
     /// off the stack into it (drain), not cloned — one buffer per executor
     /// state instead of a fresh Vec per dispatched command.
@@ -1786,7 +1800,7 @@ struct VmState {
     /// Stack base of the current command's `{*}` expansion region.
     expand_base: usize,
     /// Site index of the `BeginCmd` most recently executed.
-    cur_site: usize,
+    pub(crate) cur_site: usize,
     entry_offset: usize,
     pc: usize,
 }
@@ -1959,6 +1973,7 @@ fn op_incr_var(
     }
     Ok(())
 }
+
 
 /// `LoadLocal`'s value, without the stack push — the fused
 /// `LoadLocal + JumpTrue/JumpFalse` and `LoadLocal + LappendLocal` arms
@@ -2990,6 +3005,7 @@ fn op_foreach_next(
     if idx < max {
         // A1 step budget: taken iteration edge = one step.
         interp.charge_step()?;
+        crate::interp::dbgtrace::event("foreach_next", "");
         st.foreaches.last_mut().unwrap().idx = idx;
         foreach_bind(interp, code, info_ref, st, idx)?;
         st.pc = body as usize;
@@ -3089,6 +3105,7 @@ fn op_body_mark_framed(st: &mut VmState) {
 
 #[inline]
 fn op_sub_end(st: &mut VmState) {
+    crate::interp::dbgtrace::event("sub_end", "");
     // Close the bracket region and restore its owning command as current:
     // the bracket's inner commands clobbered cur_site, and the owner's
     // remaining words / its own dispatch must attribute to the owner (e.g.
@@ -3133,6 +3150,20 @@ fn op_int_mod(st: &mut VmState) -> Result<()> {
 /// would produce for the same operation; the caller classifies them into
 /// errorInfo frames.
 fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) -> Result<()> {
+    // 语句窗口族分派：枚举尾段连续 tag 的范围预检，先于主 match——
+    // 主 match 保持与基线逐字节同形（决策树不被改写，热径零漂移）。
+    // exec_op 只接热径未覆盖的 op（微基准热循环全程不进此函数），
+    // 预检的 1-2 条比较在冷径上可忽略。
+    if matches!(
+        op,
+        OpCode::IncrVarStack(_)
+            | OpCode::SubEndIncrVarStack(_)
+            | OpCode::IncrLocalStack(_)
+            | OpCode::SubEndIncrLocalStack(_)
+    ) {
+        interp.exec_window_stmt(code, st, op)?;
+        return Ok(());
+    }
     match op {
         // ── Stack ───────────────────────────────────────────────────────
         // Literals come from the unit's pooled constants (one Rc bump);
@@ -3165,7 +3196,12 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             op_store_var(interp, code, st, *idx, keep)?
         }
         OpCode::IncrVar(idx, amount) => op_incr_var(interp, code, st, *idx, *amount)?,
-
+        // 语句窗口四 op（`incr var [script]`）：单一表分派臂。刻意不进
+        // exec_inner 的热径 match——本文件热径代码的任何增量都会挪动
+        // LLVM 内联预算（micro 矩阵 +2-5% 指令数漂移的定位与修复，见
+        // BASELINE 深水区节）；窗口 op 每迭代至多一次，exec_op 的
+        // call+二次分派相对省下的整次 incr 分派（DynCall 解析 +
+        // scratch + cmd_incr 咽喉）可忽略。
         // ── Slot locals (E2) ────────────────────────────────────────────
         // The slot ops only fire on slot-compiled frames; every fallback
         // goes through the name-keyed path, which consults the same table
@@ -3609,6 +3645,7 @@ fn dispatch_site(
     st: &mut VmState,
     full: fn(&mut Interp, &[Value]) -> Result<Value>,
 ) -> Result<Value> {
+    crate::interp::dbgtrace::event("dispatch", "");
     // A1 step budget: the single choke point for every compiled command
     // dispatch (builtin fn-pointer fast path, cached proc token, and the
     // `full` fallback all pass through here — one charge per dispatch,

@@ -23,6 +23,7 @@ mod vm_exec;
 pub(crate) mod util;
 mod varmap;
 pub(crate) mod tclhash;
+pub(crate) mod dbgtrace;
 
 // Re-export utilities so command modules can reach them via `super::super::glob_match`
 pub(crate) use util::{split_array_ref, glob_match};

@@ -226,6 +226,8 @@ impl Compiler {
             | OpCode::ExprMarkBeginPushConst(_, _)
             | OpCode::SubSlotImm(_, _) | OpCode::SubSlotSlot(_, _)
             | OpCode::SubEndDynCall(_) | OpCode::SubEndCall { .. } | OpCode::SubEndAdd
+            | OpCode::IncrVarStack(_) | OpCode::IncrLocalStack(_)
+            | OpCode::SubEndIncrVarStack(_) | OpCode::SubEndIncrLocalStack(_)
             | OpCode::BodyMark | OpCode::NextMark
             | OpCode::SubMark | OpCode::SubEnd | OpCode::ExprMark
             | OpCode::Call { .. } | OpCode::CallExpand { .. }
@@ -981,6 +983,28 @@ impl Compiler {
             return self.compile_dyncall(cmd); // too many args — cmd_incr errors
         }
         if let Word::Literal(var_name) = &cmd.words[1] {
+            // Statement window: `incr var [script]` — a whole-word bracket
+            // compiles inline (SubMark..SubEnd) and the increment runs off
+            // the bracket result on the stack (`Incr*Stack`); the DynCall
+            // of the real `incr` disappears.  `try_compile_sub` returns
+            // false for non-verbatim bracket source → DynCall, which owns
+            // the exact EvalScript semantics.  `fuse_pairs` then merges
+            // [SubEnd, Incr*Stack] into the statement tail.
+            if cmd.words.len() == 3 {
+                if let Word::CommandSub(script) = &cmd.words[2] {
+                    if self.try_compile_sub(script, cmd, 2) {
+                        self.note_array_base(var_name);
+                        if self.locals_mode && slot_candidate(var_name) {
+                            let slot = self.bytecode.add_local(var_name);
+                            self.bytecode.emit(OpCode::IncrLocalStack(slot), line);
+                        } else {
+                            let name_idx = self.bytecode.add_const(var_name);
+                            self.bytecode.emit(OpCode::IncrVarStack(name_idx), line);
+                        }
+                        return;
+                    }
+                }
+            }
             let amount = if cmd.words.len() == 3 {
                 if let Word::Literal(s) = &cmd.words[2] {
                     // Round-trip gate: `incr x 007` must add 7 (octal),

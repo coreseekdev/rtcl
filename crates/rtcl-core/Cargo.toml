@@ -28,6 +28,8 @@ rtcl-vm = { path = "../rtcl-vm", default-features = false }
 default = ["rtcl_std", "iconv"]
 std = ["rtcl-vm/std"]
 rtcl_std = ["rtcl-vm/rtcl_std", "std"]
+# RTCL_DBG 逐写点插桩透传（诊断专用）
+rtcl-dbg = ["rtcl-vm/rtcl-dbg"]
 file = ["rtcl-vm/file", "std"]
 io = ["rtcl-vm/io", "std"]
 exec = ["rtcl-vm/exec", "std"]

@@ -27,6 +27,8 @@ expect = ["rtcl-expect"]
 # 解释器（fast-only 策略，绝不落入比解释器慢的常规池路径；
 # RTCL_JIT_POOL=1 可全开）。默认构建零 JIT（不依赖 rtcl-jit）。
 jit = ["dep:rtcl-jit"]
+# RTCL_DBG 逐写点插桩透传（诊断专用；默认剔除）
+rtcl-dbg = ["rtcl-core/rtcl-dbg"]
 # 可选 jemalloc 分配器（剖析 opt-in）：内存剖析用——构建时带
 # --enable-prof（tikv-jemallocator 的 profiling feature），运行期
 # MALLOC_CONF="prof:true,prof_prefix=..." 出堆快照，jeprof 出

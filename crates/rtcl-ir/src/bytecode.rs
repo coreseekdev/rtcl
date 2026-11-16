@@ -637,6 +637,13 @@ impl ByteCode {
                 (OpCode::SubEnd, OpCode::Add) if !targets[i + 1] => {
                     Some((OpCode::SubEndAdd, 2))
                 }
+                // ── incr statement window (`incr var [script]`) ─────────
+                (OpCode::SubEnd, OpCode::IncrVarStack(idx)) if !targets[i + 1] => {
+                    Some((OpCode::SubEndIncrVarStack(*idx), 2))
+                }
+                (OpCode::SubEnd, OpCode::IncrLocalStack(slot)) if !targets[i + 1] => {
+                    Some((OpCode::SubEndIncrLocalStack(*slot), 2))
+                }
                 // ── statement windows (4-op) ────────────────────────────
                 (
                     OpCode::BeginCmdSubMark(s1),
@@ -860,6 +867,8 @@ impl ByteCode {
                     | OpCode::SubEndDynCall(..)
                     | OpCode::SubEndCall { .. }
                     | OpCode::SubEndAdd
+                    | OpCode::SubEndIncrVarStack(..)
+                    | OpCode::SubEndIncrLocalStack(..)
             )
         })
     }
@@ -1063,6 +1072,14 @@ impl ByteCode {
                 OpCode::SubEndAdd => {
                     out.push(OpCode::SubEnd);
                     out.push(OpCode::Add);
+                }
+                OpCode::SubEndIncrVarStack(idx) => {
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::IncrVarStack(*idx));
+                }
+                OpCode::SubEndIncrLocalStack(slot) => {
+                    out.push(OpCode::SubEnd);
+                    out.push(OpCode::IncrLocalStack(*slot));
                 }
                 // The name-keyed superinstructions themselves predate the
                 // fusion only as windows — expand them back too.
@@ -1685,6 +1702,8 @@ mod tests {
                 OpCode::SubEndDynCall(2),
                 OpCode::SubEndCall { cmd_id: 1, argc: 2 },
                 OpCode::SubEndAdd,
+                OpCode::SubEndIncrVarStack(2),
+                OpCode::SubEndIncrLocalStack(3),
                 OpCode::Return,
             ],
             false,

@@ -121,6 +121,7 @@ impl Interp {
                 .map(|i| (ts.names[i].clone(), ts.values[i].clone()))
                 .collect()
         };
+        crate::interp::dbgtrace::event("flush", &flush.len().to_string());
         for (name, v) in flush {
             self.global_insert(name, v);
         }
@@ -130,6 +131,7 @@ impl Interp {
     /// 回落全局拉新）。数组名标记 aliased（槽写回落名路径 → is-array
     /// 错误归属全链）。
     pub(crate) fn top_invalidate(&mut self) {
+        crate::interp::dbgtrace::event("invalidate", "");
         let Some(ts) = self.top_slots.as_mut() else { return };
         for i in 0..ts.names.len() {
             ts.aliased[i] = !self.array_globals.is_empty()
@@ -141,6 +143,7 @@ impl Interp {
     /// 顶层 slot 单元（C2'）：单槽失效（纯 op 回落名路径写全局后——
     /// 下一次槽读拉回全局真值）。
     pub(crate) fn top_slot_invalidate_one(&mut self, slot: usize) {
+        crate::interp::dbgtrace::event("inv1", "");
         let Some(ts) = self.top_slots.as_mut() else { return };
         if let Some(cell) = ts.values.get_mut(slot) {
             *cell = Value::unset();
@@ -149,6 +152,7 @@ impl Interp {
 
     /// 顶层 slot 单元（C2'）：名路径读后填槽（cache-fill）。
     pub(crate) fn top_slot_fill(&mut self, slot: usize, value: &Value) {
+        crate::interp::dbgtrace::event("fill", "");
         let Some(ts) = self.top_slots.as_mut() else { return };
         let Some(cell) = ts.values.get_mut(slot) else { return };
         if cell.is_unset() {
@@ -1102,6 +1106,7 @@ impl Interp {
     // ── public API ─────────────────────────────────────────────
 
     pub fn get_var(&self, name: &str) -> Result<&Value> {
+        crate::interp::dbgtrace::event("get_var", name);
         // 顶层 slot 单元（C2'）：ts 分支——标量直读 / 数组-标量归属 /
         // ::-资格读（顶层槽 = 全局，::leaf 同名可见）。
         if let Some(ts) = &self.top_slots {
@@ -1300,6 +1305,7 @@ impl Interp {
     }
 
     pub fn set_var(&mut self, name: &str, value: Value) -> Result<Value> {
+        crate::interp::dbgtrace::event("set_var", name);
         // 顶层 slot 单元（C2'）：ts 分支——标量写 / 数组-标量归属 /
         // ::-leaf 写（顶层槽 = 全局）。
         if let Some(ts) = self.top_slots.as_mut() {
@@ -1657,6 +1663,93 @@ impl Interp {
     /// variable, non-integer value, overflow), creation, and trace
     /// semantics.
     pub(crate) fn incr_var_fast(&mut self, name: &str, amount: i64) -> Option<Value> {
+        let r = self.incr_var_fast_impl(name, amount);
+        if r.is_some() {
+            crate::interp::dbgtrace::event("fast_ok", "");
+        } else {
+            crate::interp::dbgtrace::event("fast_none", name);
+        }
+        r
+    }
+
+    /// 语句窗口四 op 的执行体（exec_op 的单一分派臂转入）。整段实现
+    /// 屈居 vars.rs 而非 vm_exec——后者是热径分派单元，代码增量会挪动
+    /// LLVM 的内联预算（micro 矩阵 +2-5% 指令数漂移的定位与修复，见
+    /// BASELINE 深水区节）。VmState 的 stack/bodies/cur_site 已
+    /// pub(crate) 化以支撑此布局。
+    pub(crate) fn exec_window_stmt(
+        &mut self,
+        code: &rtcl_parser::ByteCode,
+        st: &mut super::vm_exec::VmState,
+        op: &rtcl_parser::OpCode,
+    ) -> Result<Value> {
+        use rtcl_parser::OpCode::*;
+        // SubEnd 前置（融合形）：关括号区域并还原属主命令现场——
+        // op_sub_end 的逐字（vars.rs 布局下 st 字段已可见）。
+        if matches!(op, SubEndIncrVarStack(_) | SubEndIncrLocalStack(_)) {
+            if let Some(region) = st.bodies.pop() {
+                st.cur_site = region.site();
+            }
+        }
+        let amount = st.stack.pop().unwrap_or_else(Value::empty);
+        let v = match op {
+            IncrVarStack(idx) | SubEndIncrVarStack(idx) => {
+                let name = code.get_const(*idx).unwrap_or("");
+                self.incr_var_fast_stack(name, amount)?
+            }
+            IncrLocalStack(slot) | SubEndIncrLocalStack(slot) => {
+                self.incr_local_slot_stack(*slot as usize, amount, code)?
+            }
+            _ => unreachable!("exec_window_stmt"),
+        };
+        st.stack.push(v);
+        Ok(Value::empty())
+    }
+
+    /// 语句窗口 `incr var [script]` 的名路径阶梯（`IncrVarStack` op 体
+    /// 屈居 vars.rs 而非 vm_exec——vm_exec 是热径分派单元，代码增量会
+    /// 挪动 LLVM 内联预算，micro 矩阵实测 +2-5% 指令数）。快径 = 小整
+    /// 数量 + `incr_var_fast` 守卫集；其余一律委托真 `incr`——创建、
+    /// bignum 提升、trace、`(reading increment)` 帧与精确错误全归它，
+    /// 与 DynCall 形的分派逐字同。
+    pub(crate) fn incr_var_fast_stack(&mut self, name: &str, amount: Value) -> Result<Value> {
+        if let Some(k) = amount.as_int() {
+            if let Some(v) = self.incr_var_fast(name, k) {
+                return Ok(v);
+            }
+        }
+        // dispatch 的 builtin 臂先复位（fresh error state）；回落同款。
+        self.err_code_raised = false;
+        let args = [Value::from_str("incr"), Value::from_str(name), amount];
+        super::commands::misc::cmd_incr(self, &args)
+    }
+
+    /// [`Self::incr_var_fast_stack`] 的槽孪生（`IncrLocalStack` op 体）：
+    /// 同 `IncrLocal` 的回落阶梯（槽快径 → 降级帧名快径 → 真 `incr`），
+    /// 增量取自栈上括号结果。
+    pub(crate) fn incr_local_slot_stack(
+        &mut self,
+        slot: usize,
+        amount_v: Value,
+        code: &rtcl_parser::ByteCode,
+    ) -> Result<Value> {
+        let name = || code.locals().get(slot).map(String::as_str).unwrap_or("");
+        if let Some(k) = amount_v.as_int() {
+            if let Some(v) = self.frame_slot_incr(slot, k) {
+                return Ok(v);
+            }
+            if let Some(v) = self.incr_var_fast(name(), k) {
+                // 名路径写全局 → ts 槽失效。
+                self.top_slot_invalidate_one(slot);
+                return Ok(v);
+            }
+        }
+        self.err_code_raised = false;
+        let args = [Value::from_str("incr"), Value::from_str(name()), amount_v];
+        super::commands::misc::cmd_incr(self, &args)
+    }
+
+    fn incr_var_fast_impl(&mut self, name: &str, amount: i64) -> Option<Value> {
         if has_ns_sep(name)
             || name.contains('(')
             || !self.var_traces.is_empty()
@@ -2308,6 +2401,7 @@ impl Interp {
     /// 下标检查与 scope-chain 步进。守卫集 = 全语义路径可能分岔的全
     /// 部条件；任一命中返回 None（调用方走 eval_var_ref 全链）。
     pub(crate) fn read_var_scalar_top(&self, name: &str) -> Option<&Value> {
+        crate::interp::dbgtrace::event("read_top", name);
         if name.contains('(')
             || has_ns_sep(name)
             || !self.var_traces.is_empty()

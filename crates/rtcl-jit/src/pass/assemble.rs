@@ -29,6 +29,14 @@ struct Env<'a> {
     epoch_home: u32,
     bool_base: u32,
     kind: u32,
+    /// M2 slot 单态缓存（classic tier）：per-var 的 wasm local 组——
+    /// `ic_base+var` = 缓存的 tagged 值（i64），`iv_base+var` = 有效位
+    /// （i32，1=有效）。有效不变式：ivalid=1 ⇒ caching==1 且缓存值 ==
+    /// interp 变量值。维护：fill 仅在 caching==1 语境；caching=1→0 的
+    /// 全部转移点（binary_op/call/call_argv/foreach×2/eval×2/lappend
+    /// 宿主 import）之后整表失效；StoreVar/IncrVar 写同步刷新。
+    ic_base: u32,
+    iv_base: u32,
     /// fast-tier（proc_main 发射中）：Some(ctx) 时——LoadVar(参数)→
     /// local.get；SetResult 免宿主直记寄存器；fail/出口返回
     /// (i64 哨兵, i32 rc) 多值；cur_site global 下标 = 4（多导入
@@ -103,19 +111,25 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
     let foreach_base = nv + 3;
     if std::env::var_os("JIT_FT").is_some() { eprintln!("[gate] {:?}", fast_gate(l2,l3,code)); }
     let nparams = fast_gate(l2, l3, code);
+    let nvars = l2.vars.len() as u32;
     let env = Env {
         l2,
         foreach_base,
         scratch: nv + 1,
         epoch_home: nv + 2,
-        bool_base: foreach_base + 2 * nf,
-        kind: foreach_base + 2 * nf + bregs,
+        // i64 组加了 icache（nvars 枚）——i32 侧全部绝对基址随之平移
+        // （wasm local 索引跨组连续；bool/kind/ivalid 不得撞 icache 区）。
+        bool_base: foreach_base + 2 * nf + nvars,
+        kind: foreach_base + 2 * nf + nvars + bregs,
+        // 缓存 local 组：icache 接在 i64 组末，ivalid 接在 i32 组末。
+        ic_base: nv + 3 + 2 * nf,
+        iv_base: nv + 3 + 2 * nf + nvars + bregs + 1,
         fast: None,
     };
 
     let mut body = Function::new(vec![
-        (nv + 3 + 2 * nf, I64), // 值栈 + 出口 + SCRATCH + EPOCH + foreach 对
-        (bregs + 1, I32),
+        (nv + 3 + 2 * nf + nvars, I64), // 值栈 + 出口 + SCRATCH + EPOCH + foreach 对 + icache
+        (bregs + 1 + nvars, I32),       // 布尔寄存器 + kind + ivalid
     ]);
 
     // ── 序言：cache 区清零 + caching=1（池重置的 wasm 侧承担）──────
@@ -126,7 +140,7 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
     // 运行起点成立；运行中的 impure 路由仍以 caching=0 失效整窗。
     // 变量数 = l2.vars.len()（名字键变量表）——nv 是值栈寄存器数，
     // 两者无关；少清会让池复用读到陈旧缓存（namespace-old-7.10 实证）。
-    let nvars = env.l2.vars.len() as u32;
+    // （nvars 已在 env 构造前计算。）
     // 地址风格 = 全文件约定：I32Const(0) + MemArg.offset（有效地址 =
     // addr + offset；双写会让清零落到 2×off——namespace-old-7.10 实证）。
     for var in 0..nvars {
@@ -256,15 +270,19 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
             }
         }
         let nvars = nvars2;
+        // M2 缓存组（fast 侧预留；classic 同字段）：icache 追加在 i64
+        // 组末（TMP64 之后）——i32 侧全部绝对基址随之平移（同 run 的
+        // 撞位教训）。
+        let fb_ic = l2.vars.len() as u32;
         // fast_impl 的 i64 组比 run 多一枚 TMP64（resync 临时，落位
         // nv+3+2nf）——fast 语境的全部寄存器基址随之 +1（WAT 反汇编
         // 实证：Env 沿用 run 基址时首个 i32 寄存器与 TMP64 撞位，
         // i64/i32 型错配 = 模块校验失败）。
-        let fast_foreach_base = nv + 5 + 2 * nf;
+        let fast_foreach_base = nv + 5 + 2 * nf + fb_ic;
         // 槽切片基址缓存 i32 local（入口算一次 = PARAMS + depth*STRIDE，
         // fast_impl 内恒定）：所有槽寻址 5 指令 → 1 local.get（fl 循环
         // 8 个寻址点/迭代，~35 指令/迭代）。
-        let slot_base_local = nv + 4 + 2 * nf;
+        let slot_base_local = nv + 4 + 2 * nf + fb_ic;
         let vnh = {
             let mut v = vec![0i32; l2.vars.len()];
             for (vi, vv) in l2.vars.iter().enumerate() {
@@ -337,6 +355,11 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
             epoch_home: nv + 2,
             bool_base: fast_foreach_base + 2 * nf,
             kind: fast_foreach_base + 2 * nf + bregs,
+            // fast 侧缓存组（件3 预留；classic 语义同字段）——icache
+            // 接在 TMP64（i64 组末）之后；ivalid 接在 kind（i32 组末）
+            // 之后。
+            ic_base: nv + 4 + 2 * nf,
+            iv_base: fast_foreach_base + 2 * nf + bregs + 1,
             fast: Some(FastCtx {
                 param_slot,
                 nparams: np as u32,
@@ -363,9 +386,10 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
             }),
         };
         // fast_impl：局部 = run 布局（无参数移位）+ slot_base i32
+        // + M2 缓存组（icache i64 × nvars、ivalid i32 × nvars）。
         let mut fb = Function::new(vec![
-            (nv + 4 + 2 * nf, I64), // +TMP64（resync 临时）
-            (bregs + 2 + 2 * nf, I32), // +slot_base（i32 组首位）
+            (nv + 4 + 2 * nf + fb_ic, I64), // +TMP64（resync 临时）+ icache
+            (bregs + 2 + 2 * nf + fb_ic, I32), // +slot_base（i32 组首位）+ ivalid
         ]);
         // 入口：slot_base = PARAMS + fast_depth * PARAM_STRIDE
         fb.instruction(&Instruction::I32Const(cache::PARAMS as i32));
@@ -1266,7 +1290,26 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             }
             let vals = cache::VALUES + var * 8;
             let state = cache::STATE + var;
+            // M2：缓存有效臂先行（local 读 vs 既有 mem 读 + 零检查）。
+            // 不变式：ivalid=1 ⇒ icache == interp 变量值（fill 只在
+            // var-op 成功后；caching=1→0 转移点整表失效——见
+            // invalidate_int_caches）。
+            let ic = e.ic_base + var;
+            let iv = e.iv_base + var;
             f.instruction(&Instruction::Block(BlockType::Empty)); // done
+            f.instruction(&Instruction::Block(BlockType::Empty)); // miss
+            // 有效臂双门：caching==1（读/写 trace、别名读全在 caching=0
+            // 世界走宿主——逐 op 可观察性不被缓存短路）且 iv==1。
+            f.instruction(&Instruction::GlobalGet(2)); // caching
+            f.instruction(&Instruction::I32Eqz);
+            f.instruction(&Instruction::BrIf(0)); // → miss
+            f.instruction(&Instruction::LocalGet(iv));
+            f.instruction(&Instruction::I32Eqz);
+            f.instruction(&Instruction::BrIf(0)); // iv==0（无效）→ miss
+            f.instruction(&Instruction::LocalGet(ic));
+            f.instruction(&Instruction::LocalSet(dst.0));
+            f.instruction(&Instruction::Br(1)); // → done
+            f.instruction(&Instruction::End); // miss:
             f.instruction(&Instruction::Block(BlockType::Empty)); // host
             f.instruction(&Instruction::GlobalGet(2)); // caching
             f.instruction(&Instruction::I32Eqz);
@@ -1277,6 +1320,12 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::BrIf(0)); // absent → host
             ld64(f, vals);
             f.instruction(&Instruction::LocalSet(dst.0));
+            // fill（caching==1 语境静态成立）。
+            f.instruction(&Instruction::LocalGet(dst.0));
+            f.instruction(&Instruction::LocalSet(ic));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::LocalSet(iv));
+            // host block 与 miss block 是兄弟——done 从 host 内是深度 1。
             f.instruction(&Instruction::Br(1)); // → done
             f.instruction(&Instruction::End); // host:
             f.instruction(&Instruction::I32Const(e.name_handle(var)));
@@ -1285,6 +1334,12 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             check_sentinel(e, f, dst.0, *fail);
             st64_local(f, vals, dst.0);
             st8(f, state, 1);
+            // fill（host 臂：caching==0 的逐 op 读也刷新——icache 镜像
+            // 「本 op 刚读到的值」，与 interp 恒一致）。
+            f.instruction(&Instruction::LocalGet(dst.0));
+            f.instruction(&Instruction::LocalSet(ic));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::LocalSet(iv));
             f.instruction(&Instruction::End); // done
         }
         Instr::StoreVar { src, var, keep: _, fail } => {
@@ -1307,6 +1362,8 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             }
             let vals = cache::VALUES + var * 8;
             let state = cache::STATE + var;
+            let ic = e.ic_base + var;
+            let iv = e.iv_base + var;
             f.instruction(&Instruction::Block(BlockType::Empty)); // done
             f.instruction(&Instruction::Block(BlockType::Empty)); // host
             f.instruction(&Instruction::GlobalGet(2));
@@ -1314,6 +1371,11 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::BrIf(0));
             st64_local(f, vals, src.0);
             st8(f, state, 2);
+            // fill：caching==1 语境（静态），写后缓存即镜像。
+            f.instruction(&Instruction::LocalGet(src.0));
+            f.instruction(&Instruction::LocalSet(ic));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::LocalSet(iv));
             f.instruction(&Instruction::Br(1));
             f.instruction(&Instruction::End); // host:
             f.instruction(&Instruction::I32Const(e.name_handle(var)));
@@ -1325,6 +1387,12 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::If(BlockType::Empty));
             fail_path(e, f, *fail);
             f.instruction(&Instruction::End);
+            // host 臂（caching==0）同样镜像——icache 恒等于「本 op 刚
+            // 写的值」，LoadVar 缓存臂读它不会陈旧。
+            f.instruction(&Instruction::LocalGet(src.0));
+            f.instruction(&Instruction::LocalSet(ic));
+            f.instruction(&Instruction::I32Const(1));
+            f.instruction(&Instruction::LocalSet(iv));
             f.instruction(&Instruction::End); // done
         }
         Instr::IncrVar { dst, var, amount, fail, site } => {
@@ -1406,7 +1474,39 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             }
             let vals = cache::VALUES + var * 8;
             let state = cache::STATE + var;
+            // M2：缓存有效臂（icache 持 tagged 值；imm 守卫保留——缓存
+            // 可能是句柄）。失效的 slow 跳转落进既有 host 路径。
+            let ic = e.ic_base + var;
+            let iv = e.iv_base + var;
             f.instruction(&Instruction::Block(BlockType::Empty)); // done
+            f.instruction(&Instruction::Block(BlockType::Empty)); // miss
+            // 有效臂双门（同 LoadVar）：caching==1 且 iv==1——caching=0
+            // 世界 incr 必须走宿主 CALL（interp 写 → trace/别名可观察）。
+            f.instruction(&Instruction::GlobalGet(2)); // caching
+            f.instruction(&Instruction::I32Eqz);
+            f.instruction(&Instruction::BrIf(0)); // → miss
+            f.instruction(&Instruction::LocalGet(iv));
+            f.instruction(&Instruction::I32Eqz);
+            f.instruction(&Instruction::BrIf(0)); // iv==0 → miss
+            f.instruction(&Instruction::LocalGet(ic));
+            f.instruction(&Instruction::LocalSet(dst.0));
+            imm_guard_br_slow(f, dst.0);
+            // n = untag + amount
+            f.instruction(&Instruction::LocalGet(dst.0));
+            f.instruction(&Instruction::I64Const(1));
+            f.instruction(&Instruction::I64ShrS);
+            f.instruction(&Instruction::I64Const(*amount));
+            f.instruction(&Instruction::I64Add);
+            f.instruction(&Instruction::LocalSet(dst.0));
+            range_guard_br_slow(f, dst.0);
+            retag_in_place(f, dst.0);
+            // cache 刷新 + 写落盘（保守：每写进 VALUES，STATE 置脏）。
+            f.instruction(&Instruction::LocalGet(dst.0));
+            f.instruction(&Instruction::LocalSet(ic));
+            st64_local(f, vals, dst.0);
+            st8(f, state, 2);
+            f.instruction(&Instruction::Br(1)); // → done
+            f.instruction(&Instruction::End); // miss:
             f.instruction(&Instruction::Block(BlockType::Empty)); // host
             f.instruction(&Instruction::GlobalGet(2));
             f.instruction(&Instruction::I32Eqz);
@@ -1428,7 +1528,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             retag_in_place(f, dst.0);
             st64_local(f, vals, dst.0);
             st8(f, state, 2);
-            f.instruction(&Instruction::Br(1));
+            f.instruction(&Instruction::Br(1)); // → done（host/miss 兄弟块）
             f.instruction(&Instruction::End); // host:
             // 降级走站点原文 eval 路由（rtcl.call 全语义）：incr_var
             // 公共入口的错误文本与 cmd_incr（tclsh 对齐面）不同
@@ -1443,6 +1543,10 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::Call(import::CALL));
             f.instruction(&Instruction::LocalSet(dst.0));
             check_sentinel(e, f, dst.0, *fail);
+            // rtcl.call 恒置 caching=0 → 全部缓存失效（宿主可能改写
+            // 任意变量；此后逐 op 宿主读，icache 由 LoadVar/StoreVar
+            // host 臂重新镜像）。
+            invalidate_int_caches(e, f);
             f.instruction(&Instruction::End); // done
         }
         Instr::CallSite { dst, cmd_id, argc, fail, site, srcs, cont_back, brk_depth, cont_depth, esc, esc_depth, .. } => {
@@ -1634,6 +1738,9 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
                 f.instruction(&Instruction::Call(import::CALL_ARGV));
             }
             f.instruction(&Instruction::LocalSet(dst.0));
+            // call/call_argv 闭包置 caching=0（命令可写任意变量）→
+            // M2 缓存整表失效（须在哨兵分支之前——kind!=0 会 br 回循环）。
+            invalidate_int_caches(e, f);
             // 哨兵 → rtcl.fail(id) 返回 kind：
             //   0=纯错误 → return TCL_ERROR；1=break(level1) → br 内层
             //   循环 brk；2=continue(level1) → br cont（回边先扣 fuel）；
@@ -1839,6 +1946,8 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::I32Const(srcs.len() as i32));
             f.instruction(&Instruction::Call(import::FOREACH_START));
             f.instruction(&Instruction::LocalSet(e.scratch));
+            // foreach_start 闭包置 caching=0（循环变量写 interp 帧）。
+            invalidate_int_caches(e, f);
             check_sentinel(e, f, e.scratch, *fail);
             // iters = untag(result); i = 0。
             f.instruction(&Instruction::LocalGet(e.scratch));
@@ -1890,6 +1999,8 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::I32WrapI64);
             f.instruction(&Instruction::Call(import::FOREACH_BIND));
             f.instruction(&Instruction::LocalSet(e.scratch));
+            // foreach_bind 闭包置 caching=0（bind 写帧变量）。
+            invalidate_int_caches(e, f);
             check_sentinel(e, f, e.scratch, *fail);
             // fast：bind 宿主侧写了帧变量（循环变量）——fast 槽 stale，
             // 定向 sync 循环变量拉回（无此步循环体 LoadVar 读旧值，
@@ -1911,6 +2022,8 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::LocalGet(src.0));
             f.instruction(&Instruction::Call(import::EVAL_SCRIPT));
             f.instruction(&Instruction::LocalSet(dst.0));
+            // eval 闭包置 caching=0（脚本可写任意变量）。
+            invalidate_int_caches(e, f);
             check_sentinel(e, f, dst.0, *fail);
         }
         Instr::EvalExpr { dst, src, fail } => {
@@ -1918,6 +2031,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::LocalGet(src.0));
             f.instruction(&Instruction::Call(import::EVAL_EXPR));
             f.instruction(&Instruction::LocalSet(dst.0));
+            invalidate_int_caches(e, f);
             check_sentinel(e, f, dst.0, *fail);
         }
         Instr::LappendVar { dst, src, var, fail } => {
@@ -1926,6 +2040,8 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::LocalGet(src.0));
             f.instruction(&Instruction::Call(import::LAPPEND_VAR));
             f.instruction(&Instruction::LocalSet(dst.0));
+            // lappend 闭包置 caching=0（写帧变量）。
+            invalidate_int_caches(e, f);
             check_sentinel(e, f, dst.0, *fail);
         }
         Instr::SetSite(k) => {
@@ -2032,7 +2148,25 @@ fn call_binary_op(op: BinOp, a: u32, b: u32, dst: u32, fail: u32, e: &Env, f: &m
     f.instruction(&Instruction::LocalGet(b));
     f.instruction(&Instruction::Call(import::BINARY_OP));
     f.instruction(&Instruction::LocalSet(dst));
+    // binary_op 闭包置 caching=0 → M2 缓存整表失效（表达式可含
+    // [cmd] 替换——宿主注释原文）。classic-only（fast 无 caching 语义）。
+    invalidate_int_caches(e, f);
     check_sentinel(e, f, dst, fail);
+}
+
+/// M2 slot 缓存整表失效：caching=1→0 的宿主 import（binary_op/call/
+/// call_argv/foreach_start/foreach_bind/eval_script/eval_expr/
+/// lappend_var）执行后，interp 变量可能已被任意改写——所有 ivalid
+/// 清零。此后 LoadVar/StoreVar 的 host 臂逐 op 重新镜像 icache。
+/// classic-only（fast tier 无 caching 语义，e.fast 判别）。
+fn invalidate_int_caches(e: &Env, f: &mut Function) {
+    if e.fast.is_some() {
+        return;
+    }
+    for var in 0..e.l2.vars.len() as u32 {
+        f.instruction(&Instruction::I32Const(0));
+        f.instruction(&Instruction::LocalSet(e.iv_base + var));
+    }
 }
 
 /// 缓存 flush：dirty 槽写回宿主（host set_var 全语义含 trace 触发）。

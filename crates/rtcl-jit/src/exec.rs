@@ -277,7 +277,13 @@ fn execute(
 
     let engine = Engine::default();
     let wmodule = match Module::new(&engine, &module.bytes[..]) {
-        Ok(m) => m,
+        Ok(m) => {
+            // 诊断开关：RTCL_JIT_DUMP=<path> 落盘模块（M2 调试用）。
+            if let Some(p) = std::env::var_os("RTCL_JIT_DUMP") {
+                let _ = std::fs::write(&p, &module.bytes[..]);
+            }
+            m
+        }
         Err(e) => panic!("jit: emitted module invalid: {e}"),
     };
     let mut store = Store::new(&engine, host);

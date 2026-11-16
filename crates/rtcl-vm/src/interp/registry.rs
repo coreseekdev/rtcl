@@ -351,6 +351,42 @@ impl Interp {
         }
     }
 
+    /// 内建名 → 内建本体 fn（M3 遮蔽感知折叠的判别基准）：`commands`
+    /// 表的同名条目 fn 与此相同 = 内建自身注册（register_builtins 落
+    /// 表，非遮蔽）；不同 = 注册后的覆盖（宿主 register_command /
+    /// alias dispatcher / oo 对象命令——都会经 note_tier1_mutation
+    /// bump，扫描期仍在册者即活遮蔽）。与 register_builtins 同表集
+    /// 同 cfg 门。
+    pub(crate) fn canonical_builtin_fn(&self, name: &str) -> Option<CommandFunc> {
+        fn in_table(table: &[CmdEntry], name: &str) -> Option<CommandFunc> {
+            table
+                .iter()
+                .find(|e| e.name == name)
+                .map(|e| e.func)
+        }
+        let f = in_table(CMD_TABLE, name);
+        #[cfg(feature = "package")]
+        let f = f.or_else(|| in_table(CMD_TABLE_PKG, name));
+        #[cfg(feature = "clock")]
+        let f = f.or_else(|| in_table(CMD_TABLE_CLOCK, name));
+        #[cfg(feature = "file")]
+        let f = f.or_else(|| in_table(CMD_TABLE_FILE, name));
+        #[cfg(feature = "io")]
+        let f = f.or_else(|| in_table(CMD_TABLE_IO, name));
+        #[cfg(feature = "exec")]
+        let f = f.or_else(|| in_table(CMD_TABLE_EXEC, name));
+        #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+        let f = f.or_else(|| in_table(CMD_TABLE_REGEXP, name));
+        #[cfg(feature = "signal")]
+        let f = f.or_else(|| in_table(CMD_TABLE_SIGNAL, name));
+        #[cfg(feature = "env")]
+        let f = f.or_else(|| in_table(CMD_TABLE_ENV, name));
+        #[cfg(feature = "std")]
+        let f = f.or_else(|| in_table(CMD_TABLE_EVENT, name));
+        let f = f.or_else(|| in_table(CMD_TABLE_ENSEMBLE, name));
+        f
+    }
+
     /// tclsh 8.6.17's `::` command-table registration sequence, recovered
     /// from tclBasic.c 8.6.17 + init.tcl + tclsh's stdin `history add`
     /// auto-load, validated by replaying the Tcl hash-table mechanics

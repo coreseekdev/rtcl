@@ -4638,36 +4638,72 @@ p 1";
 
 
 impl Interp {
-    /// M3 遮蔽感知折叠的探测面：Tier1 折叠名单中**当前被遮蔽**的叶名
-    /// （procs/commands/aliases/import_aliases/ensembles 任一表的键叶
-    /// 名命中即遮蔽——dispatch 解析链 procs → ensembles → builtins，
-    /// 任一在册绑定都先于内建命中）。proc 体/OO 方法体定义时传入
-    /// [`compile_proc_body`]，编译器对名单内名字分派活绑定。定义点
-    /// 非热路径（proc 定义/类定义，运行零成本）。
+    /// M3 遮蔽感知折叠的探测面：Tier1 折叠名单中**当前被遮蔽**的叶名。
+    /// 遮蔽判定与 dispatch 的裸名解析链同构（procs → ensembles →
+    /// builtins，procs/ensembles 先于内建命中）：键叶名命中折叠名单，
+    /// **且键的命名空间是全局（裸键/`::leaf`）或当前命名空间**——
+    /// 裸名解析只落在这两个语境（`::tcl::dict::incr` 一类全限定
+    /// 子命令键与裸 `incr` 永不相交，不计入——初版漏此限定把
+    /// foreach/while 折叠全体降级，rtcl-vm 内联帧族 3 测 + judge(jit)
+    /// gen/gen_namespace、gen/gen_proc-old 实证）。命名 proc/OO 方法
+    /// 体恒以定义命名空间运行（call_proc 设 def_ns），定义时点的
+    /// cur 语义即运行语义；编译后新出现的遮蔽由 epoch bump 退役。
+    /// 定义点非热路径。
     pub(crate) fn shadowed_tier1_folds(&self) -> Vec<String> {
+        self.shadowed_tier1_folds_in(Some(self.current_namespace.as_ref()))
+    }
+
+    /// [`Self::shadowed_tier1_folds`] 的保守口径（任意命名空间的叶名
+    /// 都算遮蔽）。供**跨命名空间移动的体**使用：apply lambda 体按词
+    /// 元缓存（lambda_code_cache），无第三元时随调用者命名空间运行
+    /// （proc.rs ns_override 臂）——定义时点无法钉住运行语境，按
+    /// any-ns 收窄折叠。保守正确（少折叠 = 多分派，语义不缺）。
+    pub(crate) fn shadowed_tier1_folds_any_ns(&self) -> Vec<String> {
+        self.shadowed_tier1_folds_in(None)
+    }
+
+    fn shadowed_tier1_folds_in(&self, cur: Option<&str>) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        let mut shadowed = |key: &str| {
+        let mut shadowed = |key: &str, is_canonical_builtin: bool| {
             let leaf = key.rsplit("::").next().unwrap_or(key);
-            if rtcl_parser::compiler::TIER1_FOLD_LEAVES.contains(&leaf)
-                && !out.iter().any(|s| s == leaf)
-            {
+            if !rtcl_parser::compiler::TIER1_FOLD_LEAVES.contains(&leaf) {
+                return;
+            }
+            let ns = match key.rfind("::") {
+                // `::leaf`（绝对全局）与 `a::leaf`（限定）分野。
+                Some(0) => "::",
+                Some(i) => &key[..i],
+                None => "::", // 裸键 = 全局
+            };
+            let visible = match cur {
+                Some(c) => ns == "::" || ns == c,
+                None => true,
+            };
+            // commands 表条目 fn == 内建本体 = register_builtins 的自身
+            // 注册（内建即折叠目标，非遮蔽）；!= = 注册后覆盖（宿主
+            // register_command / alias dispatcher / oo 对象命令）。
+            if visible && !is_canonical_builtin && !out.iter().any(|s| s == leaf) {
                 out.push(leaf.to_string());
             }
         };
         for k in self.procs.keys() {
-            shadowed(k);
+            shadowed(k, false);
         }
         for k in self.commands.keys() {
-            shadowed(k);
+            let shadow = match self.commands.get(k) {
+                Some(&f) => self.canonical_builtin_fn(k) != Some(f),
+                None => true,
+            };
+            shadowed(k, !shadow);
         }
         for k in self.aliases.keys() {
-            shadowed(k);
+            shadowed(k, false);
         }
         for k in self.import_aliases.keys() {
-            shadowed(k);
+            shadowed(k, false);
         }
         for k in self.ensembles.keys() {
-            shadowed(k);
+            shadowed(k, false);
         }
         out
     }

@@ -4,9 +4,74 @@
 > 修复后标 `[FIXED YYYY-MM-DD]`。最近盘点：**2026-11-03 深水区全量建模**
 > （error-deep / dict / matching / io / trace / oo 六份新 allium 规格
 > + 探针套件差分实证；trace 蒸馏暴露致命级 D-36 崩溃，oo 蒸馏暴露
-> D-40/41 构造析构与分派面）。**2026-11-16 OO 可见性组收口**
-> （§10.1 组 3，本节）。条目后括注的
+> D-40/41 构造析构与分派面）。**2026-11-17 体帧行号 provenance 收口**
+> （本节）。条目后括注的
 > spec [D-x] 是规格文件内的 spec-local 编号，以本台账为准。
+
+## 2026-11-17 体帧行号 provenance 收口 + err_from_subst 跨错误泄漏（judge 88/88×2；battery 52/52；workspace tests 1420/0；fuzz seed7 400 例 5→0、seed0 500 例 0；probes 407/37 → 412/36）
+
+M1' 验收轮（87c468e）fuzz 定谳的 5 条 preexist 分歧
+（findings preexist_wasmi_f000{054,162,213,246,272}，全部 jit==tclsh 而
+解释器路径行号不同）全数收口。
+
+**根因**（tclBasic.c TclLogCommandInfo 钉死：errorLine = 1 +
+换行计数(当前单元 script[0..失败命令起点)，每日志事件按最内层单元重
+算；体出口帧 ("while"/"for"/"foreach" body line N) 读边界处 errorLine）：
+tclsh 文件语境的循环体经迭代器分派 = **独立编译单元**，且词括号
+`[...]` **内联编进体单元**——最内层日志恰在体单元层，errorLine 天然 =
+体相对行。rtcl 的词括号失败在**新嵌套单元**记**括号相对**行
+（entry_offset = line_ctx = 体首行，tclsh 文件语境 errorLine 同为内层
+单元相对——k2 钉形 `catch {set x [expr …]} -errorline` = 1 双端一致），
+体臂的 `n = err_line - (体首行 - 1)` 拿到的是污染值。
+
+**修复**（vm_exec.rs unwind_subs）：体帧行基改用本次错误的**词括号
+defer 行**（`err_pending_top` —— exec_inner 的 word-op defer 与 Sub 臂
+同源：属主命令的绝对行），减体首行还原体相对行；无 defer（体内直接
+失败，err_line 已是绝对行）回落 err_line。BodyFramed（foreach/lmap）
+出口帧同臂。仅文件语境门控（in_file_script——proc 体编译语境的
+err_line 已是单元绝对行，保持 e28c24a 口径）。jit 三 sink 的
+`jit_err_set_line(fi.site)` 早已是同口径（属主站点行），本修复后
+解释器与 jit 逐字节对齐。
+
+- f000054（while 体括号 expr 失败 → body line 1，应 3）：最小形 =
+  `set k 0; while {$k < 6} { incr k; set m [expr {~($x)}] }`。
+- f000162（同形，体行 1 → 3）。
+- f000213（while 内嵌 for 体括号失败 → line 3，应 5；for 体无帧 p20d
+  不变）。
+- f000246（foreach 体 → line 1，应 2；BodyFramed 臂）。
+- f000272（for 体 → line 1，应 3）：行号面收口；**ARITH 首帧关键词残
+  差另账**（见下）。
+
+**err_from_subst 跨错误泄漏**（探针固化暴露的预存 bug，一并收口）：
+unwind_subs 的 Sub 臂为更外层消费方置位 `err_from_subst`，错误终止于
+catch/try 处理器时已无外层消费方——残留把**下一条**错误的首帧日志误判
+为替换起点而吞帧（钉形：`catch {set m [expr {~($x)}]}` 后跟同形未捕获
+错误，内层帧整体消失、只剩外圈命令帧）。修复：catch 消费点、try 两个
+处理器清点、seed_parse_error、decode_toplevel_flow 四处并入一次性旗标
+清除批。
+
+**新固化 judge/probes**：loop_body_err_line{,2,3,4}.tcl（while/嵌套
+for/foreach/for 四构形的 catch 无体帧钉段 + 尾段未捕获最小复现，tclsh
+逐字 SAME）。
+
+**残差记账**（本轮钉形实证、不修）：
+- **ARITH 首帧关键词（嵌套语境）**：expr ARITH 类错误
+  （`expr {1/0}`、`expr {true % "0x10"}`）在 while/for/foreach 体、
+  proc 体、顶层 catch 体内，tclsh 首帧关键词 = `invoked from within`
+  （errorInfo 先被裸消息置非空——空 append 即从 result 初始化，
+  tclUtil/tclResult 机制），rtcl 双引擎一致报 `while executing`（C2 的
+  双日志事件只在树走 catch+proc 矩阵装备；编译 EvalExpr 路径未装备）。
+  顶层直排/顶层括号词形双端同字（while executing）✓。双引擎共有、与
+  行号 provenance 正交；修正需钉死 8.6.17 的先行置位点并复验 378 探针
+  EI 基线，缓议。
+- **跨行词括号的体帧行**：`set m [\n    expr {~($x)}]`（属主命令行 ≠
+  括号内最内层命令行）——tclsh 报括号内最内层命令的体相对行（内联至
+  同单元），rtcl/jit 同报属主命令行（jit fi.site 同取属主）。双引擎
+  同形残差，单行括号（含全部 fuzz 样本）无差。
+- **多行 catch 体括号失败的 -errorline**：tclsh = 失败命令的 catch 体
+  相对行（内联日志），rtcl = 括号相对行（1）——#15（uplevel/catch
+  -errorline，2026-11-14/16b 记账「err_boundary_line 基建已落、修正需
+  动 e28c24a 行号单元化深水区」）的同族新实例，缓议。
 
 ## 2026-11-16c incr 两预存分歧收口（性能轮 Agent 6 入账 → 本轮修复；judge 88/88；probes 380/35 + incr_widen 固化）
 

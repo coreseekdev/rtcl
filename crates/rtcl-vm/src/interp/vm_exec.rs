@@ -701,9 +701,22 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                         .first()
                         .map(|sp| sp.slice(&code.source).to_string());
                     let is_next = matches!(region, Region::Next(_));
+                    // 体帧行基（fuzz f000054 族，perf/wave2）：err_line 是
+                    // **最内层日志命令**的行——rtcl 的词括号失败在内层新
+                    // 单元记**括号相对**行（tclsh 文件语境的 errorLine 同
+                    // 为内层单元相对——k2 钉形 -errorline=1），但 tclsh 的
+                    // 体是编译单元、括号词内联进同单元，体出口帧读到的
+                    // errorLine 恰为体相对行。结构差下 rtcl 改用本次错误
+                    // 的词括号 defer 行（属主命令的绝对行——exec_inner 的
+                    // word-op defer 与下方 Sub 臂同源同值）作基，减体首行
+                    // 还原体相对行；无 defer（体内直接失败，err_line 已
+                    // 是绝对行）回落 err_line。跨行括号的最内层内联命令
+                    // 行残差（l1 钉形）双引擎同形（jit fi.site 同取属主）。
+                    let pending_line =
+                        interp.err_pending_top.as_ref().map(|p| p.1);
                     match first.as_deref() {
                         Some("while") if !is_next => {
-                            // 体相对行 = err_line - 体首行 + 1（体首字 =
+                            // 体相对行 = 行基 - 体首行 + 1（体首字 =
                             // 最后一个词的源跨度）。
                             let n = site
                                 .word_srcs
@@ -712,9 +725,11 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                                     let start = (sp.start as usize).min(code.source.len());
                                     let open_line = 1
                                         + code.source[..start].bytes().filter(|b| *b == b'\n').count();
-                                    interp.err_line.saturating_sub(open_line - 1)
+                                    pending_line
+                                        .unwrap_or(interp.err_line)
+                                        .saturating_sub(open_line - 1)
                                 })
-                                .unwrap_or(interp.err_line);
+                                .unwrap_or_else(|| pending_line.unwrap_or(interp.err_line));
                             if let Some(info) = &mut interp.err_info {
                                 info.push_str(&format!("\n    (\"while\" body line {})", n));
                             }
@@ -743,9 +758,11 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                                                 .bytes()
                                                 .filter(|b| *b == b'\n')
                                                 .count();
-                                        interp.err_line.saturating_sub(open_line - 1)
+                                        pending_line
+                                            .unwrap_or(interp.err_line)
+                                            .saturating_sub(open_line - 1)
                                     })
-                                    .unwrap_or(interp.err_line);
+                                    .unwrap_or_else(|| pending_line.unwrap_or(interp.err_line));
                                 if let Some(info) = &mut interp.err_info {
                                     info.push_str(&format!("\n    (\"for\" body line {})", n));
                                 }
@@ -782,6 +799,23 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                 if flow {
                     interp.err_pending_top = Some((Rc::from(text), line));
                 } else {
+                    // 体帧行基 = 词括号 defer 行（见上方 Body/Next 臂注）：
+                    // foreach 体内词括号失败的 err_line 是内层括号单元的
+                    // 括号相对行（fuzz f000246），defer 行（属主命令绝对
+                    // 行）减体首行才是 tclsh 体相对行。仅文件语境（proc
+                    // 体编译语境的 err_line 已是单元绝对行，保持原口径）。
+                    if interp.in_file_script {
+                        let base = interp.err_pending_top.as_ref().map(|p| p.1);
+                        let n = site.word_srcs.last().map(|sp| {
+                            let start = (sp.start as usize).min(code.source.len());
+                            let open_line =
+                                1 + code.source[..start].bytes().filter(|b| *b == b'\n').count();
+                            base.unwrap_or(interp.err_line).saturating_sub(open_line - 1)
+                        });
+                        if let Some(n) = n {
+                            interp.err_line = n;
+                        }
+                    }
                     let tag = if lmap { "\"lmap\" body" } else { "\"foreach\" body" };
                     interp.err_exit_frame(tag);
                     // The foreach command's own harness frame follows

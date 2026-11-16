@@ -296,6 +296,42 @@ json/regexp-spencer 移侧模块，其分派面随之出表）。
   不受影响）、wasm check 过。尺寸：wasm raw 2.84 → 2.74 MiB（-97
   KiB regexp-lite）；pkg（bindgen+wasm-opt）≈2.0 MiB。
 
+## 10quincesimus. 2026-11-16 M1' 验收 + 语句窗口 reopen 翻案（perf/wave2 @ c3d407a，master 线 cf5e3d8 →）
+
+### JIT M1'（87c468e）
+
+- **盘点定谳：M1' 四件套全部已落**（abi.rs fuel/epoch globals + §3
+  import 面与哨兵 tagged word、assemble.rs §4 Int 快车道全表、
+  nanopass 八 pass + check.rs 校验器）——里程碑表条目已可关闭。
+- 真实缺口 = 解释器 errorInfo 大改（cf5e3d8）后的宿主/驱动面漂移：
+  顶层 D-11 流解码 + while/for 体帧族两板点补齐，fuzz 41→5。
+- **验收：arith_loop 19.2×**（jit 13ms vs ITS 基线 bd3e169 249ms，
+  门 ≥3×）；ratio 0.37× tclsh。judge 88/88×2、battery 43/43、
+  workspace 1420/0、六主基准 A/B 噪声级。
+- 残差：5 fuzz 分歧全部 preexist 且 jit==tclsh（vm 端词括号失败体帧行
+  号 provenance）——样本留 bench/scripts/jit_fuzz_findings/，归 var/
+  行号语义专项（非 JIT 面）。
+
+### 语句窗口 reopen（e462731 + c3d407a）——上轮 +107% 翻案
+
+- **真因不是窗口运行时**：上轮实现漏把 4 新 op 加入 compile_unit 的
+  fallback 白名单 → code.fallback=true → eval_impl 拒编译执行 →
+  **整脚本树走查**（插桩实证：unit 900,010 vs 8）。上轮「窗口运行时
+  从未执行过」，判别实验（关分支即回基线）与根因正交——误判。
+- 白名单根修后窗口首跑：**dloop −10.9%**（4335.9M→3862.4M）、
+  incr-bracket 微形状 **−34.5%**、dict 形状 −11.6%。
+- 语义门：28 形状探针（judge/probes/incr_window_p01..28）+ judge
+  88/88 + workspace 1420/0 + probes archive DIFF 集逐项一致。
+- 残留（止损接受）：full-LTO 全局重内联漂移 +0.42-0.98%（fe/oo2/
+  oovars/sum）——四重证据链证明非执行路径成本；最终落位=枚举尾段
+  连续 tag + 主 match 前置范围预检。
+- 新基建：feature `rtcl-dbg`（RTCL_DBG=seq@N 事件流/退出汇总，默认
+  剔除）。
+- 教训：**新增 op 有三处强制同步点**（fallback 白名单/top_op_class/
+  unfused has_fused_ops）——白名单漏配的症状是「性能」问题，实际是
+  「整个优化层被静默跳过」；判别实验设计与根因必须正交验证；诊断
+  前先在干净基线二进制上复现。
+
 ## 10quaterdecimus. 2026-11-14..16 subagent 串行队列七阶段——语义域清账 + 性能 + Tk fork（master 线 99f30fc → 267d49a）
 
 （并发=1 的 7+1 阶段 agent 队列；每阶段独立提交推送。队列细节见
@@ -703,8 +739,9 @@ var_incr/proc_fib 0.6-1.0x。剩余开销点（深水区，逐项 <2% 需组合�
 5. **vars 指针稳定存储**（残差 ~1.2× 目标）：VarMap newtype +
    链接变量 `*const Value` 缓存（traced 走原路径）——方案存档
    BASELINE G9f 节。
-6. JIT 已转主线（master 现位 `99f30fc`）：剩余 = M1'（ABI v2 + Int 快车
-   道）+ fuel/epoch imported globals（`docs/JIT-WASM-GC.md` §3）。
+6. JIT 已转主线；**M1' 已验收关闭**（arith_loop 19.2×，见
+   10quincesimus 节）：剩 M3（epoch 接 Tier1 bump）与 M2 slot 单态
+   缓存（`docs/JIT-WASM-GC.md` §4）。
 
 ### 10.3 原生 Tk 需 nsh/fork 渲染侧的九项（详见 TODO.md 新节）
 

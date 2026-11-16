@@ -965,10 +965,16 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.err_harness_frame(&e.message_text(), &text, line);
             }
             // 消费错误：-errorinfo 物化的一次性旗标不得泄漏到下个错误。
+            // err_from_subst 同批：unwind_subs 的 Sub 臂在错误穿过词括号
+            // 边界时置位，供更外层 dispatch/eval 边界消费——错误终止于
+            // catch 时已无外层消费方，残留会把**下一条**错误的首帧日志
+            // 误判为替换起点而吞帧（q5 钉形：catch {set m [expr …]} 后
+            // 跟同形未捕获错误，内层帧整体消失）。
             if interp.err_is_error(&e) {
                 interp.err_force_inner = false;
                 interp.err_while_exec = false;
                 interp.err_skip_log = false;
+                interp.err_from_subst = false;
             }
             // A `tailcall` completion caught here: the deferred command
             // stays armed on the frame marker and fires at frame exit;
@@ -1492,8 +1498,10 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     handler_result = Some({
                         // 处理器错误另起帧序（tclsh：errorInfo 只含处理器
                         // 自己的帧）；编译态再由 err_fresh 抑制 try 站点帧。
+                        // err_from_subst 同批（见 catch 消费点注）。
                         interp.err_info = None;
                         interp.err_fresh = false;
+                        interp.err_from_subst = false;
                         let r = interp.eval(handler_body);
                         if let Err(he) = &r {
                             if interp.err_is_error(he) && suppress_site {
@@ -1578,8 +1586,10 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         handler_result = Some({
                         // 处理器错误另起帧序（tclsh：errorInfo 只含处理器
                         // 自己的帧）；编译态再由 err_fresh 抑制 try 站点帧。
+                        // err_from_subst 同批（见 catch 消费点注）。
                         interp.err_info = None;
                         interp.err_fresh = false;
+                        interp.err_from_subst = false;
                         let r = interp.eval(handler_body);
                         if let Err(he) = &r {
                             if interp.err_is_error(he) && suppress_site {

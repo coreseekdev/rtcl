@@ -370,8 +370,10 @@ impl Interp {
             self.err_info = Some(partial);
             self.err_line = pe.line;
             // 一个新错误的 errorInfo 是全新的（tclsh ERR_LOGGED 语义）：
-            // 之前被循环吞掉的控制流完成留下的延迟帧在此作废。
+            // 之前被循环吞掉的控制流完成留下的延迟帧在此作废；词括号
+            // 替换旗标同批（不跨错误泄漏——见 catch 消费点注）。
             self.err_pending_top = None;
+            self.err_from_subst = false;
         }
         Error::syntax(&pe.message, pe.line, pe.column)
     }
@@ -1283,6 +1285,7 @@ impl Interp {
         self.err_force_inner = false;
         self.err_while_exec = false;
         self.err_skip_log = false;
+        self.err_from_subst = false;
         if self.err_is_error(&e) || e.is_exit() {
             return e;
         }

@@ -543,6 +543,21 @@ pub fn cmd_trace(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     let mut t = std::mem::take(&mut interp.exec_traces);
                     let r = store_exec_trace(interp, &mut t, "execution", EXEC_OPS, &args[3..]);
                     interp.exec_traces = t;
+                    if r.is_ok() {
+                        // M3：执行 trace 的注册改变「折叠 op 世界」的可
+                        // 观察性——trace 只在分派/树走查面触发，而折叠
+                        // op（set/incr/lappend…）绕过分派。不 bump 的
+                        // 窗口：同一编译单元内 add 之后的折叠 op 全部
+                        // 漏触发（h2/h5 探针定谳：interp 字节码与 JIT
+                        // set 宿主臂双方都漏）。bump 后 exec_bytecode
+                        // 的逐 op epoch 检查从 add 起重分派 →
+                        // bytecode_applicable 活检（exec_traces 非空）
+                        // 压到树走查；JIT classic/fast 面的回边 epoch
+                        // 比对同点 STALE。粒度对齐 bytecode_applicable
+                        //（任意执行 trace 全关字节码），非 Tier1 名的
+                        // trace 同样收窄世界——保守 sweep 正确且罕见。
+                        super::super::vm_exec::note_tier1_sweep(interp);
+                    }
                     r
                 }
                 _ => unreachable!(),

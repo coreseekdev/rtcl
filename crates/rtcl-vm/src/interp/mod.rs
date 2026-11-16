@@ -1201,6 +1201,16 @@ impl Interp {
         self.tier1_epoch
     }
 
+    /// 执行 trace 是否在册（只读）。与 [`Self::tier1_epoch`] 同族的
+    /// 嵌入式宿主/JIT 失效检查读取点：执行 trace 只在分派/树走查面
+    /// 触发，任何在册 trace 都使「折叠 op 世界」（字节码 VM/JIT 的
+    /// 内联 set/incr/lappend…）不可观察——与内部 `bytecode_applicable`
+    /// 的首个门同口径。JIT 顶层驱动在单元入口以此回退解释器
+    /// （M3：trace 先于单元注册的嵌入式窗口，h2/h5 探针面）。
+    pub fn has_exec_traces(&self) -> bool {
+        !self.exec_traces.is_empty()
+    }
+
     /// JIT/嵌入式执行器的错误帧写入口（case-b：宿主原语错误不在嵌套
     /// eval 内发生，帧须由外部执行器按 vm_exec exec_inner 的形状补进
     /// 本累积器——proc 语境的 (procedure …) 边界帧依赖它）。与内部

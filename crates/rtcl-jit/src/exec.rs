@@ -149,6 +149,20 @@ pub fn run_top_with(
     // 接受集/降级路径无需跟进修补（口径与替代方案见
     // docs/JIT-OPCODE-DELTA.md；将来做原生 lower 时删掉本展开即可）。
     let bc = Compiler::compile_unit(Rc::clone(&unit.source), &unit.commands).unfused();
+    // M3 执行 trace 入口门：trace 只在分派/树走查面触发，折叠 op
+    // （set/incr/lappend…）绕过分派——在册 trace 的世界里 wasm 折叠
+    // op 全部不可观察。先于 epoch gate（与 rtcl-vm 的
+    // bytecode_applicable 首门同口径；jitsh 单文件单元里 trace add
+    // 由 `trace add execution` 的 epoch bump 在回边比对点接住，此处
+    // 拦的是「trace 先于单元注册」的嵌入式窗口——h5 探针面）。
+    if interp.has_exec_traces() {
+        return (interp, JitRun {
+            outcome: Outcome::Fallback,
+            driver_report: None,
+            eval_error: None,
+            result: None,
+        })
+    }
     // M3 入口失效 gate —— 与 rtcl-vm eval.rs 的 bytecode_cache gate
     // 逐条对齐（!fallback 由 emit::compile 的拒绝路径等价承担）：
     // 单元编译时代的 `epoch` != 解释器当前 tier1_epoch ⇒ Tier1 折叠
@@ -251,6 +265,16 @@ pub fn execute_artifact_wasmi(
     module: &emit::Module,
     file: &str,
 ) -> (Interp, JitRun) {
+    // 产物回环入口与 run_top_with 同一门面（rtcl-towasm lib 同口径）：
+    // 在册执行 trace 的世界折叠 op 不可观察——整单元回解释器。
+    if interp.has_exec_traces() {
+        return (interp, JitRun {
+            outcome: Outcome::Fallback,
+            driver_report: None,
+            eval_error: None,
+            result: None,
+        })
+    }
     execute(interp, bc, module, file)
 }
 

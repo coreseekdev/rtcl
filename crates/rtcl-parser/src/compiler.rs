@@ -35,6 +35,16 @@ struct LoopCtx {
     break_patches: Vec<usize>,
 }
 
+/// Tier1 内联折叠名单（单源，M3）：编译器据 [`Compiler`] 的折叠分派
+/// 内联这些名字；rtcl-vm 的 `note_tier1_mutation` 据此 bump 失效代、
+/// proc 体编译据此探测「当前被遮蔽的折叠名」（M3 遮蔽感知折叠）。
+/// 历史上的编译器/解释器双表 KEEP-IN-SYNC 注记由此收拢——加折叠形状
+/// 时只改这一处。
+pub const TIER1_FOLD_LEAVES: &[&str] = &[
+    "set", "if", "while", "for", "expr", "incr", "return", "exit", "break", "continue",
+    "foreach", "lmap", "lappend",
+];
+
 /// Compiler state.
 pub struct Compiler {
     bytecode: ByteCode,
@@ -75,6 +85,13 @@ pub struct Compiler {
     /// 顶层 slot 单元（locals_mode 的槽位资格 + framed 错误帧保留 +
     /// foreach 保持分派 + 运行时非 proc 语境信号）。
     toplevel_slots: bool,
+    /// M3 遮蔽感知折叠：名单内的叶名**不内联折叠**（一律分派——
+    /// dispatch 运行时解析活绑定）。proc 体编译时由解释器传入当前
+    /// 被遮蔽的 Tier1 叶名：折叠 op 绕过分派，遮蔽体不可见；体编译
+    /// 时代的 epoch 戳只保证「编译后无新遮蔽」，不回溯既有遮蔽。
+    /// 顶层/eval 单元恒空单——它们只在 epoch 0（遮蔽从未发生的世界）
+    /// 通过消费门（gate: code.epoch == tier1_epoch）。
+    skip_folds: Vec<String>,
 }
 
 /// May a name of this shape live in a proc's compiled locals table?
@@ -108,7 +125,7 @@ impl Compiler {
     /// spans must point into `source` (as [`crate::ScriptUnit::parse`]
     /// produces).  Sites referencing the source are emitted per command.
     pub fn compile_unit(source: Rc<str>, commands: &[Command]) -> ByteCode {
-        Self::compile_impl(source, commands, false, &[], false)
+        Self::compile_impl(source, commands, false, &[], false, &[])
     }
 
     /// 顶层 slot 单元（top-level slot 化 C1）：locals_mode 的槽位资格
@@ -116,7 +133,7 @@ impl Compiler {
     /// 帧槽的顶层背衬 = C2）、运行时非 proc 语境信号
     ///（ByteCode.toplevel_slots）。
     pub fn compile_unit_toplevel(source: Rc<str>, commands: &[Command]) -> ByteCode {
-        Self::compile_impl(source, commands, true, &[], true)
+        Self::compile_impl(source, commands, true, &[], true, &[])
     }
 
     /// [`Self::compile_unit`] for a procedure body: `param_names` seed the
@@ -128,7 +145,18 @@ impl Compiler {
         commands: &[Command],
         param_names: &[&str],
     ) -> ByteCode {
-        Self::compile_impl(source, commands, true, param_names, false)
+        Self::compile_impl(source, commands, true, param_names, false, &[])
+    }
+
+    /// [`Self::compile_unit_locals`] + M3 遮蔽感知折叠：`skip_folds`
+    /// 里的叶名不内联折叠（分派活绑定）。见 [`Compiler::skip_folds`]。
+    pub fn compile_unit_locals_skipping(
+        source: Rc<str>,
+        commands: &[Command],
+        param_names: &[&str],
+        skip_folds: &[String],
+    ) -> ByteCode {
+        Self::compile_impl(source, commands, true, param_names, false, skip_folds)
     }
 
     fn compile_impl(
@@ -137,6 +165,7 @@ impl Compiler {
         locals_mode: bool,
         params: &[&str],
         toplevel_slots: bool,
+        skip_folds: &[String],
     ) -> ByteCode {
         let mut c = Compiler {
             bytecode: ByteCode::new(),
@@ -148,6 +177,7 @@ impl Compiler {
             in_next: false,
             locals_mode,
             toplevel_slots,
+            skip_folds: skip_folds.to_vec(),
         };
         if locals_mode {
             // Track the slot-gate's param/table alignment here, where the
@@ -299,10 +329,17 @@ impl Compiler {
         // dispatch of the real builtin (exact semantics over coverage).
         // Tier-1 folding assumes the name still resolves to the builtin at
         // runtime; the executor guards that with its invalidation epoch.
-        // KEEP IN SYNC: every name folded below must appear in
-        // `note_tier1_mutation`'s leaf list (rtcl-vm vm_exec.rs) — a name
-        // missing there keeps stale folds in already-compiled bodies.
+        // KEEP IN SYNC: the fold list below is [`TIER1_FOLD_LEAVES`] —
+        // `note_tier1_mutation` (rtcl-vm vm_exec.rs) bumps its invalidation
+        // epoch from the same single-source const.
         if let Word::Literal(name) = &cmd.words[0] {
+            // M3 遮蔽感知折叠：编译时已被遮蔽的折叠名不内联（epoch 戳
+            // 只防「编译后」的遮蔽；既有遮蔽在此点名分派——dispatch
+            // 运行时解析活绑定，遮蔽体/内建皆按 tclsh 语义可见）。
+            if self.skip_folds.iter().any(|s| s == name) {
+                self.compile_dyncall(cmd);
+                return;
+            }
             match name.as_str() {
                 // ── Tier 1: compiled to native opcodes ──────────────────
                 "set" if cmd.words.len() == 3 => return self.compile_set(cmd),

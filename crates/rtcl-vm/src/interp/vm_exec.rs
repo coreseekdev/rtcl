@@ -32,15 +32,21 @@ use std::sync::OnceLock;
 /// exactly (`seed_parse_error` runs on every uncached `eval`).
 /// `params` seed the compiled locals table (slot i = the i-th name), the
 /// contract the frame-side positional binding relies on.
+/// `skip_folds`：编译时已被遮蔽的 Tier1 叶名（M3，`Interp::
+/// shadowed_tier1_folds`）——这些名字不内联折叠，分派活绑定。epoch 戳
+/// 保证「编译后」的遮蔽经失效代退役；既有遮蔽必须在此点名，否则折叠
+/// op 绕过分派、遮蔽体不可见（h1 探针定谳的正确性缺口：interp 字节码
+/// 与 JIT proc 钩子双方输出 6，tclsh/树遍历报 can't read "x"）。
 pub(crate) fn compile_proc_body(
     params: &[(String, Option<String>)],
     body: &str,
     epoch: u64,
+    skip_folds: &[String],
 ) -> Option<Rc<ByteCode>> {
     let unit = rtcl_parser::ScriptUnit::parse(body).ok()?;
     let names: Vec<&str> = params.iter().map(|(n, _)| n.as_str()).collect();
     let mut code =
-        Compiler::compile_unit_locals(Rc::clone(&unit.source), &unit.commands, &names);
+        Compiler::compile_unit_locals_skipping(Rc::clone(&unit.source), &unit.commands, &names, skip_folds);
     if std::env::var_os("JIT_FT").is_some() {
         eprintln!(
             "[cg] params={:?} aligned={:?} nlocals={}",
@@ -59,16 +65,10 @@ pub(crate) fn compile_proc_body(
 /// through dispatch (`Call`/`DynCall`) and re-resolves per call.
 pub(crate) fn note_tier1_mutation(interp: &mut Interp, key: &str) {
     let leaf = key.rsplit("::").next().unwrap_or(key);
-    // KEEP IN SYNC with the compiler's Tier-1 fold list
-    // (`rtcl-parser/src/compiler.rs`, the `match` on folded command
-    // names): every name the compiler inline-folds must bump the epoch
-    // here, or a redefinition leaves stale folds in compiled bodies
-    // (`lappend` was the one gap — `compile_lappend` folds it).
-    if matches!(
-        leaf,
-        "set" | "if" | "while" | "for" | "expr" | "incr" | "return" | "exit" | "break"
-            | "continue" | "foreach" | "lmap" | "lappend"
-    ) {
+    // 单源名单：rtcl-parser 的 `TIER1_FOLD_LEAVES`（编译器折叠分派与
+    // 本 bump 表、M3 遮蔽探测三处共用）。历史上此处与编译器的折叠
+    // match 双表 KEEP-IN-SYNC（lappend 曾是漏网），M3 收拢为常量。
+    if rtcl_parser::compiler::TIER1_FOLD_LEAVES.contains(&leaf) {
         interp.tier1_epoch += 1;
     }
 }
@@ -4638,6 +4638,40 @@ p 1";
 
 
 impl Interp {
+    /// M3 遮蔽感知折叠的探测面：Tier1 折叠名单中**当前被遮蔽**的叶名
+    /// （procs/commands/aliases/import_aliases/ensembles 任一表的键叶
+    /// 名命中即遮蔽——dispatch 解析链 procs → ensembles → builtins，
+    /// 任一在册绑定都先于内建命中）。proc 体/OO 方法体定义时传入
+    /// [`compile_proc_body`]，编译器对名单内名字分派活绑定。定义点
+    /// 非热路径（proc 定义/类定义，运行零成本）。
+    pub(crate) fn shadowed_tier1_folds(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut shadowed = |key: &str| {
+            let leaf = key.rsplit("::").next().unwrap_or(key);
+            if rtcl_parser::compiler::TIER1_FOLD_LEAVES.contains(&leaf)
+                && !out.iter().any(|s| s == leaf)
+            {
+                out.push(leaf.to_string());
+            }
+        };
+        for k in self.procs.keys() {
+            shadowed(k);
+        }
+        for k in self.commands.keys() {
+            shadowed(k);
+        }
+        for k in self.aliases.keys() {
+            shadowed(k);
+        }
+        for k in self.import_aliases.keys() {
+            shadowed(k);
+        }
+        for k in self.ensembles.keys() {
+            shadowed(k);
+        }
+        out
+    }
+
     /// ④ JIT 驱动的中途 bump 重分派（rtcl-jit 跨 crate 公共入口）：
     /// `site` = bump 命令自身的 site——找到包含它的顶层命令，从其
     /// **下一条**起树走查（上下文保持：proc 语境的帧/命名空间/

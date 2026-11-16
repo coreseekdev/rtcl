@@ -1313,8 +1313,11 @@ fn memoised_proc_def(
     // Compile at the same seam named `proc`s use; the compiled form also
     // unlocks call_proc's slot-locals binding (empty statics, params
     // seeded in order — the synthetic name first, by construction).
+    // M3：遮蔽感知折叠与命名 proc 同源——方法体同样不得内联折叠
+    // 当前被遮蔽的 Tier1 叶名。
+    let shadows = interp.shadowed_tier1_folds();
     let compiled =
-        super::super::vm_exec::compile_proc_body(&pd.params, &def.body, interp.tier1_epoch);
+        super::super::vm_exec::compile_proc_body(&pd.params, &def.body, interp.tier1_epoch, &shadows);
     // The prelink list lands here — after the compiled body exists, so
     // each entry can carry the frame slot its name occupies (the install
     // then skips the locals-table scan).

@@ -131,8 +131,11 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
+    // M3：先扫描当前遮蔽的 Tier1 折叠名再编译——epoch 戳防「编译后」
+    // 遮蔽（bump 退役），既有遮蔽在此点名（分派活绑定）。
+    let shadows = interp.shadowed_tier1_folds();
     let compiled =
-        super::super::vm_exec::compile_proc_body(&defaults, &body, interp.tier1_epoch);
+        super::super::vm_exec::compile_proc_body(&defaults, &body, interp.tier1_epoch, &shadows);
     if let Some(code) = &compiled {
         interp.const_pool_insert(code);
     }
@@ -286,10 +289,14 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let compiled = match interp.lambda_code_cache.get(args[1].as_str()) {
         Some(c) => Some(Rc::clone(c)),
         None => {
+            // M3 遮蔽感知折叠与命名 proc 同源（lambda 体同洞：定义后
+            // epoch 戳只防新遮蔽，既有遮蔽在此点名）。
+            let shadows = interp.shadowed_tier1_folds();
             let c = super::super::vm_exec::compile_proc_body(
                 &defaults,
                 &body,
                 interp.tier1_epoch,
+                &shadows,
             );
             if let Some(code) = &c {
                 let cost = code.estimated_heap_size() + args[1].as_str().len() * 2 + 64;

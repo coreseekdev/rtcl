@@ -1450,6 +1450,14 @@ fn ens_create(interp: &mut Interp, opts: &[Value]) -> Result<Value> {
         }
         i += 2;
     }
+    // M3 失效完备清单补点：ensemble 命令注册进 dispatch 解析链（procs
+    // 之后、builtins **之前**——eval.rs dispatch_values_inner 顺序），
+    // 叶名撞上 Tier1 折叠名单（如 `namespace eval incr {namespace
+    // ensemble create}`）即从折叠 op 的下方遮蔽内建。不 bump 的窗口：
+    // 既有编译单元的折叠 incr 继续写变量，分派面却已解析到 ensemble
+    // （h3 探针定谳：tclsh/树遍历报 unknown subcommand，interp/jit=n=6）。
+    // note_tier1_mutation 自带叶名过滤——非 Tier1 名的 ensemble 零成本。
+    super::super::vm_exec::note_tier1_mutation(interp, &name);
     if interp.ensembles.insert(name.clone(), def).is_none() {
         interp.note_new_command(&name);
     }

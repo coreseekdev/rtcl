@@ -435,6 +435,68 @@ jitsh 单文件单元里中途 add 由 bump/回边比对接住）。
   proc 调用全协议 ~1.4μs vs interp ~200ns）——独立于 slot 缓存，
   reopen 归「fast 调用协议」专项。
 
+## 10septendecimus. 2026-11-17 树走查直呼单元 C1 误编译修复——eval_commands 深度占位（perf/wave2，他分支移交）
+
+**移交来源**：Gen UI 调研线（rtcl-designer worktree，ui/designer @fd70528）
+capture.rs 模块注 + 会话记忆移交的 parity bug（探针 S4 定谳："平凡 proc
+pp {a b} + 多行 braced 实参，$a 绑错值；VM 路径正常；ui.tcl 在
+eval_commands 下挂、VM 下过"）。其分支未修（设计加载走 eval() 规避），
+本节在 perf/wave2 收口。
+
+### 复现链（三层收窄）
+
+- **宿主暴露面**：ui.tcl 经 `ScriptUnit::parse` + 裸调
+  `Interp::eval_commands` 挂载（capture 流的加载形），随后词表命令
+  树走查分派——`ui::surface .s -title Demo` 落
+  `dict get $catalog $type`，键读成 `Surface {整个 catalog}`（实参
+  值串位）；tree-mount 侧 `::ui::define Surface {多行 braced spec}`
+  的 `type` 形参直接吃到 spec 文本。VM 挂载 + eval() 调用全程正常。
+- **最小形**（`crates/rtcl-vm/tests/probe_eval_commands_units.rs`
+  A1）：namespace eval 内定义 `proc define {type spec}`、体为
+  `dict for {opt entry} $spec { if {...} {set bad "...$type..." } }`、
+  顶层裸调面调用——`$type` 读到 spec、`$opt` 读到空、`$entry` 读到
+  `Surface`（**邻槽值**，帧槽表 params-first 序 vs 误装表错位）。
+- **平凡多行 braced 实参本身不错位**：`pp {\nfirst\n} {\nsecond\n}`
+  20 形矩阵双路径全对（错位需 proc 体走 `call.rs` `_` 臂的
+  `eval(def.body)` 旁落形——移交方"多行 braced"措辞来自 ui.tcl
+  define 调用形的表象）。
+
+### 根因（RTCL_NO_BYTECODE 双跑 + has_foreach 门对照钉死）
+
+裸调 `eval_commands` 不占 `eval_depth`（保持 0）；proc 体经 call_proc
+的 `_` 臂（体编译旁落/fallback）走 `eval(def.body)` 时深度恰为
+**1**——踩中 eval_impl 的 C1 门 `eval_depth == 1 && !has_foreach`，
+**体单元被误编译成顶层 slot 单元**（compile_unit_toplevel）：体内
+变量读写按 top_slots（C2'，单元自身 locals 序）路由，与 call_proc
+按 params-first 序播种的**帧槽表**错位 → 实参/局部读值串位。eval()
+面外层已占深度 1、体落深度 2 → compile_unit，故 VM 路径始终正常。
+旁证：`RTCL_NO_BYTECODE=1` 双路径全对（体走树走查词法路径，无
+toplevel 编译）；体里塞无害 foreach（has_foreach 门关闭 toplevel
+编译）与修复同效——机制钉形 H1 入库。
+
+### 修复（双路径语义收敛，非树走查单侧补丁）
+
+`eval_commands` / `eval_commands_from` 占住深度第 1 位（save/占用/
+restore，深度非 0 不动）：嵌套 eval ≥2 → compile_unit，与
+eval()/eval_incremental（本就自带占位）语义对齐。eval_commands_from
+注释先读（083535a/083537a 教训：调用方 namespace/词法/line_offset
+上下文一律未动——深度位与其正交，Tier1 重分派调用方语境深度已 ≥1
+时数值不变，仅对 jit 重分派直链等无占位语境兜底）。
+
+### 验收与护栏
+
+- `cargo test --workspace` 全绿（0 failed）；judge(interp) 88/88；
+  probes **412/36**（fail 集 var/trace 组基线既有，零新增）。
+- 新护栏 `crates/rtcl-vm/tests/probe_eval_commands_units.rs`（5 测）：
+  最小错位形 + H1 机制对照 + 变体（B/C/D/F1/A2）+ 多行 braced 实参
+  20 形矩阵（tclsh 8.6.17 oracle 逐形钉值）+ 构体内联语境 9 形
+  （proc 体/ns-eval/catch/while/foreach/if/switch/try/def-in-ns）+
+  ui.tcl 双挂载形（vm-mount/tree-mount + 树分派调用 + op 日志断言）。
+- **移交方受益**：rtcl-designer 分支 rebase 本修复后，capture 流的
+  ui.tcl `eval_commands` 挂载形自动生效（其 capture.rs 模块注
+  "已知分歧：树走查直呼路径……本分支不修"条目可除名，由该分支自行
+  处理）；本 checkout DIVERGENCES.md 无对应记账条目，不涉及。
+
 ## 10sexdecimus. 2026-11-16..17 JIT 线续：M2/M3/行号专项（perf/wave2 @ adb25e2）
 
 （继 M1' 验收后的第二轮 JIT 线队列；M2/M3 各自 HANDOFF 节见

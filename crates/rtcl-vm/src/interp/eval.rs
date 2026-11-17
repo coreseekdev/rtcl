@@ -651,6 +651,26 @@ impl Interp {
 
 
     pub fn eval_commands(&mut self, unit: &rtcl_parser::ScriptUnit) -> Result<Value> {
+        // 直呼单元语义 = 顶层单元：占住 eval 深度第 1 位。C1 顶层 slot
+        // 编译门（eval_impl 的 `eval_depth == 1`）只允许**最外层** eval
+        // 的单元走 toplevel 编译；eval()/eval_incremental 自带占位，裸
+        // 调 eval_commands 原先不占——其嵌套 eval（proc 体 `call_proc`
+        // 的 `_` 臂、namespace eval 体）恰落深度 1，体单元被误编译成
+        // 顶层 slot 单元：top_slots 变量路由与 proc 帧槽表（params
+        // first 序）错位，体内循环/分支读实参读到邻槽值（多行 braced
+        // 实参的 ui.tcl 挂载形定谳；VM 路径 eval() 正常——外层已占
+        // 位 1）。占位后嵌套 eval ≥2 → compile_unit，与 eval() 语义
+        // 收敛。深度非 0（本身已在 eval/exec 语境）不动。
+        let saved_depth = self.eval_depth;
+        if saved_depth == 0 {
+            self.eval_depth = 1;
+        }
+        let r = self.eval_commands_inner(unit);
+        self.eval_depth = saved_depth;
+        r
+    }
+
+    fn eval_commands_inner(&mut self, unit: &rtcl_parser::ScriptUnit) -> Result<Value> {
         let mut result = Value::empty();
         for cmd in &unit.commands {
             result = self.eval_command(unit, cmd)?;
@@ -663,7 +683,24 @@ impl Interp {
     /// **保留调用方（vm_exec）已就位的单元上下文**（namespace/词法/
     /// line_offset）——与 `eval(remaining)` 的"新单元重置语义"不同，
     /// 后者正是 083537a 实验回退的原因（ens/ens2 丢上下文差分）。
+    /// eval 深度同 [`Interp::eval_commands`] 占位（嵌套 eval 不得触发
+    /// C1 顶层 slot 编译门）；调用方语境深度已 ≥1 时数值不变，仅对
+    /// 嵌套在无占位语境（jit 重分派直链）的同款裸调形态兜底。
     pub(crate) fn eval_commands_from(
+        &mut self,
+        unit: &rtcl_parser::ScriptUnit,
+        k: usize,
+    ) -> Result<Value> {
+        let saved_depth = self.eval_depth;
+        if saved_depth == 0 {
+            self.eval_depth = 1;
+        }
+        let r = self.eval_commands_from_inner(unit, k);
+        self.eval_depth = saved_depth;
+        r
+    }
+
+    fn eval_commands_from_inner(
         &mut self,
         unit: &rtcl_parser::ScriptUnit,
         k: usize,

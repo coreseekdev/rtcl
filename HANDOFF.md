@@ -435,6 +435,49 @@ jitsh 单文件单元里中途 add 由 bump/回边比对接住）。
   proc 调用全协议 ~1.4μs vs interp ~200ns）——独立于 slot 缓存，
   reopen 归「fast 调用协议」专项。
 
+## 10sexdecimus. 2026-11-16..17 JIT 线续：M2/M3/行号专项（perf/wave2 @ adb25e2）
+
+（继 M1' 验收后的第二轮 JIT 线队列；M2/M3 各自 HANDOFF 节见
+10senioquincesimus/10undequincesimus，此处补行号专项 + 总账。）
+
+### M2 slot 单态缓存（40bcae8/8b0005a）
+
+- 盘点定谳：**fast tier 已有等价机制**（per-depth 内存槽 + 零检查守卫
+  + lazy-flush）——真正缺口在 classic tier（顶层 slot 单元，
+  IncrVar ~41 条）。落地 per-var icache（tagged i64 + ivalid 双门）
+  + 8 宿主 import 后整表失效清单；b47 探针实证修复「缓存臂绕过
+  interp 写致 trace 丢失」。
+- var_incr −15%、arith_loop −20%，**JIT-vs-interp 差距闭合**
+  （11/12ms vs interp 10ms 量级）；battery 43→47（+失效矩阵）。
+- reopen：lane 类型化后端（边际 −15-25% 仅微形状，目标案例已
+  0.22-0.35× tclsh）；**fast 调用协议回归**（jitsh oo2 3.32×——每
+  proc 调用 ~1.4μs 协议开销 vs interp ~200ns，独立专项候选）。
+
+### M3 epoch 接 Tier1 bump（6 commits，876c382..297b9b5）
+
+- epoch 生命周期表全盘点（bump 12 存量 + 2 新增/读点 interp+JIT
+  全录）——覆盖判定：突变经宿主分派必然被回边比对同点捕获。
+- 修 3 正确性缺口：trace add execution 中途盲区、ensemble 遮蔽内建、
+  **遮蔽感知折叠**（epoch 戳不防「编译前已遮蔽」——shadowed 扫描 +
+  skip_folds，折叠名单单源化 TIER1_FOLD_LEAVES）。收窄评估不做
+  （保守 bump = 安全默认）。
+- battery 47→**52**（b48-b52：重定义/rename/trace/遮蔽/遮蔽后体）；
+  judge 双引擎 88/88×2；workspace 1420/0。
+
+### 行号 provenance 专项（8f46703/adb25e2，M1' 验收遗留 5 条收口）
+
+- **fuzz 分歧 5→0**（seed7 400 例 / seed0 500 例均 0）：词括号失败
+  的体帧行号 = defer 行为基还原**体相对行**；err_from_subst 跨错误
+  泄漏（catch/try 终止点/seed_parse_error/顶层 D-11 四处并入一次性
+  旗标清除）。
+- 固化 loop_body_err_line 四件 + DIVERGENCES 2026-11-17 节；
+  probes 380/35 → **412/36**（fail 集为 var/trace 组基线既有）。
+
+### JIT 线余项
+
+- M4（默认 proc 定义即编译——Chez/Racket CS 模式重定位）未启动；
+  fast 调用协议专项（1.4μs/调用）候选；C-float/C-lazy 独立可选。
+
 ## 10quincesimus. 2026-11-16 M1' 验收 + 语句窗口 reopen 翻案（perf/wave2 @ c3d407a，master 线 cf5e3d8 →）
 
 ### JIT M1'（87c468e）

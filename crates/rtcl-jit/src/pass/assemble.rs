@@ -2249,8 +2249,9 @@ fn emit_unary(kind: BinOp, dst: u32, a: u32, fail: u32, e: &Env, f: &mut Functio
 }
 
 fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut Function) {
-    // 全走宿主的 §4 类别：div/mod（floor 语义与除零）、pow、字符串比较。
-    if matches!(kind, BinOp::Div | BinOp::Mod | BinOp::Pow | BinOp::StrEq | BinOp::StrNe) {
+    // 全走宿主的 §4 类别：pow、字符串比较（div/mod 件5 起双 imm 快臂
+    // 内联——floor 语义 wasm 直算，除零/非 imm 落宿主）。
+    if matches!(kind, BinOp::Pow | BinOp::StrEq | BinOp::StrNe) {
         call_binary_op(kind, a, b, dst, fail, e, f);
         return;
     }
@@ -2341,6 +2342,74 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
             }
             f.instruction(&Instruction::LocalGet(e.scratch));
             f.instruction(&Instruction::LocalSet(dst));
+        }
+        BinOp::Div | BinOp::Mod => {
+            // 件5 双 imm 快臂：floor 语义 wasm 直算（expr.rs floor_div/
+            // floor_mod 同构）。除零 → 宿主（"divide by zero" 全语义）。
+            // 操作数 imm ⇒ |v| < 2^62 ⇒ INT_MIN/-1 陷阱不可达；商修正只
+            // 减（|q| ≤ |va|）而 |r+vb| < |vb| ≤ 2^62-1 ⇒ 结果恒在 i63
+            // 域，免范围守卫——慢出口只剩 imm 守卫与除零，此后对 dst
+            // 直写安全（慢臂重新读 a/b 局部）。
+            // scratch = vb（守卫后就地复用）。
+            f.instruction(&Instruction::LocalGet(b));
+            f.instruction(&Instruction::I64Const(1));
+            f.instruction(&Instruction::I64ShrS);
+            f.instruction(&Instruction::LocalSet(e.scratch));
+            f.instruction(&Instruction::LocalGet(e.scratch));
+            f.instruction(&Instruction::I64Eqz);
+            f.instruction(&Instruction::BrIf(0)); // vb == 0 → slow（宿主）
+            // dst = 截断商/余数
+            f.instruction(&Instruction::LocalGet(a));
+            f.instruction(&Instruction::I64Const(1));
+            f.instruction(&Instruction::I64ShrS);
+            f.instruction(&Instruction::LocalGet(e.scratch));
+            f.instruction(if kind == BinOp::Div {
+                &Instruction::I64DivS
+            } else {
+                &Instruction::I64RemS
+            });
+            f.instruction(&Instruction::LocalSet(dst));
+            // floor 修正门：r != 0 && (r ^ vb) < 0（符号异）——两个门
+            // **串联**（r==0 臂空体即闭，符号臂随后；嵌套会让修正只在
+            // r==0 世界可达——b07 首版实证）。
+            // Div 语境 r = va - q*vb（截断恒等式，免第二次除/余）。
+            if kind == BinOp::Div {
+                f.instruction(&Instruction::LocalGet(a));
+                f.instruction(&Instruction::I64Const(1));
+                f.instruction(&Instruction::I64ShrS);
+                f.instruction(&Instruction::LocalGet(dst));
+                f.instruction(&Instruction::LocalGet(e.scratch));
+                f.instruction(&Instruction::I64Mul);
+                f.instruction(&Instruction::I64Sub);
+                f.instruction(&Instruction::I64Eqz);
+                f.instruction(&Instruction::If(BlockType::Empty)); // r==0
+                f.instruction(&Instruction::End); // r==0 臂闭（空体）
+            } else {
+                f.instruction(&Instruction::LocalGet(dst));
+                f.instruction(&Instruction::I64Eqz);
+                f.instruction(&Instruction::If(BlockType::Empty)); // r==0
+                f.instruction(&Instruction::End); // r==0 臂闭（空体）
+            }
+            f.instruction(&Instruction::LocalGet(dst));
+            f.instruction(&Instruction::LocalGet(e.scratch));
+            f.instruction(&Instruction::I64Xor);
+            f.instruction(&Instruction::I64Const(0));
+            f.instruction(&Instruction::I64LtS);
+            f.instruction(&Instruction::If(BlockType::Empty));
+            if kind == BinOp::Div {
+                // floor_div：q - 1
+                f.instruction(&Instruction::LocalGet(dst));
+                f.instruction(&Instruction::I64Const(1));
+                f.instruction(&Instruction::I64Sub);
+                f.instruction(&Instruction::LocalSet(dst));
+            } else {
+                // floor_mod：r + vb
+                f.instruction(&Instruction::LocalGet(dst));
+                f.instruction(&Instruction::LocalGet(e.scratch));
+                f.instruction(&Instruction::I64Add);
+                f.instruction(&Instruction::LocalSet(dst));
+            }
+            f.instruction(&Instruction::End);
         }
         BinOp::Eq | BinOp::Ne => {
             // §4：tagged 直接比较。

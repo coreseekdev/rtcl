@@ -15,9 +15,14 @@ thread_local! {
     /// proc 体的发射产物缓存（M4「定义即编译」的雏形）：key =
     /// (ByteCode 的 Rc 指针, epoch)——指针稳定性由 ProcDef.compiled 的
     /// 长期 Rc 保证；redefine 换新 Rc 且 epoch 变化，双重防陈旧命中。
-    /// 上限 64 条，超出全清（进程级模块数有限；简单粗暴即可）。
+    /// 值 = `Option<Rc<Module>>`：`None` 是编译拒绝的**负缓存**（M4——
+    /// emit::compile 对固定输入是纯函数，拒绝是决定性的；缓存后调用
+    /// 面不再每调用重跑一遍 emit 管线到拒绝点，拒绝 proc 调用时零
+    /// 编译延迟）。上限 1024 条，超出全清（per-proc 模块 <4KB → 全
+    /// 满 ~4MB 上界；stdlib 一次性加载的 proc 数量级数百，64 会把
+    /// 定义点预填的条目在定义期就冲掉，M4 覆盖面归零）。
     static PROC_MODULES: std::cell::RefCell<
-        std::collections::HashMap<(usize, u64, u64), Rc<emit::Module>>,
+        std::collections::HashMap<(usize, u64, u64), Option<Rc<emit::Module>>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -34,12 +39,14 @@ pub(crate) fn teardown_interp(_ptr: usize) {
     PROC_MODULES.with(|c| c.borrow_mut().clear());
 }
 
-/// emit 编译缓存（key 二元组；未命中现编译，拒绝不缓存负项）。
+/// emit 编译缓存（key 二元组；未命中现编译）。M4：拒绝结果落负缓存
+/// （`None` 条目）——emit 对固定输入决定性，重试只会重复同一拒绝；
+/// 调用面的 `?` 传播语义不变（None = 留解释器），只是不再付重试成本。
 pub(crate) fn compile_cached(code: &ByteCode, key: (usize, u64, u64)) -> Option<Rc<emit::Module>> {
     PROC_MODULES.with(|c| {
         let mut c = c.borrow_mut();
         if let Some(m) = c.get(&key) {
-            return Some(Rc::clone(m));
+            return m.clone();
         }
         // PR#2 融合超指令展开（BEGIN_CMD_PUSH_CONST / FOREACH_NEXT_CLOSE
         // / CMP_VI_JF …）——JIT 消费 unfused 规范形状（run_top_with
@@ -47,14 +54,20 @@ pub(crate) fn compile_cached(code: &ByteCode, key: (usize, u64, u64)) -> Option<
         let bc = code.unfused();
         match emit::compile(&bc, &EmitConfig::default()) {
             Ok(mm) => {
-                if c.len() >= 64 {
+                if c.len() >= 1024 {
                     c.clear();
                 }
                 let m = Rc::new(mm);
-                c.insert(key, Rc::clone(&m));
+                c.insert(key, Some(Rc::clone(&m)));
                 Some(m)
             }
-            Err(_) => None,
+            Err(_) => {
+                if c.len() >= 1024 {
+                    c.clear();
+                }
+                c.insert(key, None);
+                None
+            }
         }
     })
 }

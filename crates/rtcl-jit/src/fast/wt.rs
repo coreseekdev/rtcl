@@ -440,11 +440,11 @@ fn fast_ensure_slot_wt(
         code.epoch,
         code.serial,
     );
-    if let Some(s) = c.data().sh.slots.get(&pool_key) {
-        return Some(*s);
+    if let Some(s) = c.data().sh.slot_of(pool_key) {
+        return Some(s);
     }
     let module = crate::classic::compile_cached(code, (Rc::as_ptr(code) as usize, code.epoch, code.serial))?;
-    let _meta = module.fast?; // fast gate 不命中 → None（分派回落）
+    let meta = module.fast?; // fast gate 不命中 → None（分派回落）
     let engine = c.data().engine.clone();
     let wmodule = WT_FAST_MODULES.with(|m| {
         let mut m = m.borrow_mut();
@@ -485,12 +485,14 @@ fn fast_ensure_slot_wt(
         let fill = vec![0xFFu8; crate::abi::cache::SITE_STRIDE as usize];
         let _ = mem.write(&mut *c, scb as usize, &fill);
     }
+    let nparams = meta.nparams;
     let h = c.data_mut();
     h.sh.hosts.push(host);
     h.sh.scb_of.push(scb as i32);
     h.sh.codes.push(Rc::clone(code));
+    h.sh.nparams_of.push(nparams as u32);
     h.runs.push(f);
-    h.sh.slots.insert(pool_key, slot);
+    h.sh.slot_insert(pool_key, slot);
     Some(slot)
 }
 
@@ -572,7 +574,7 @@ pub(crate) fn execute_fast_top_wt(
     module: &crate::emit::Module,
     meta: crate::emit::FastMeta,
 ) -> Option<crate::exec::JitRun> {
-    let r = execute_fast_wt(interp, bc, module, meta)?;
+    let r = execute_fast_wt(interp, bc, Some((module, meta)))?;
     Some(crate::exec::map_fast_top_run(r))
 }
 
@@ -581,18 +583,31 @@ pub(crate) fn fast_try_wt(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rt
         return None;
     }
     drain_pending_retire();
-    let key = (Rc::as_ptr(code) as usize, code.epoch, code.serial);
-    let module = crate::classic::compile_cached(code, key)?;
+    // 槽命中快臂（wasmi fast_try 同款）：免 PROC_MODULES 哈希 + Rc 克隆。
+    let owner = interp as *mut Interp as usize;
+    let key = (owner, Rc::as_ptr(code) as usize, code.epoch, code.serial);
+    let cached = WT_FAST_STORE.with(|f| {
+        let cell = f.borrow();
+        let s = cell.as_ref()?;
+        if s.data().sh.interp != interp as *mut Interp {
+            return None;
+        }
+        s.data().sh.slot_of(key)
+    });
+    if cached.is_some() {
+        return execute_fast_wt(interp, code, None);
+    }
+    let key2 = (Rc::as_ptr(code) as usize, code.epoch, code.serial);
+    let module = crate::classic::compile_cached(code, key2)?;
     let meta = module.fast?;
-    execute_fast_wt(interp, code, &module, meta)
+    execute_fast_wt(interp, code, Some((&module, meta)))
 }
 
 /// fast-tier 外层驱动（wasmtime；execute_fast 同构）。
 pub(crate) fn execute_fast_wt(
     interp: &mut Interp,
     bc: &Rc<ByteCode>,
-    module: &crate::emit::Module,
-    meta: crate::emit::FastMeta,
+    ctx: Option<(&crate::emit::Module, crate::emit::FastMeta)>,
 ) -> Option<rtcl_core::Result<Value>> {
     let epoch = interp.tier1_epoch();
     let pool_key = (
@@ -630,11 +645,25 @@ pub(crate) fn execute_fast_wt(
             return Some(Err(e));
         }
         // slot 确保（驱动侧——resolve 闭包内另有 fast_ensure_slot_wt）
-        let slot = match store.data().sh.slots.get(&pool_key) {
-            Some(s) => *s,
+        let slot = match store.data().sh.slot_of(pool_key) {
+            Some(s) => s,
             None
                 if store.data().sh.hosts.len() < crate::abi::cache::MAX_FAST_SLOTS =>
             {
+                let fallback = match &ctx {
+                    Some(_) => None,
+                    None => {
+                        let key = (Rc::as_ptr(bc) as usize, bc.epoch, bc.serial);
+                        let m = crate::classic::compile_cached(bc, key)?;
+                        let mt = m.fast?;
+                        Some((m, mt))
+                    }
+                };
+                let (module, _meta) = match (&ctx, &fallback) {
+                    (Some((m, mt)), _) => (*m, *mt),
+                    (None, Some((m, mt))) => (m.as_ref(), *mt),
+                    (None, None) => return None,
+                };
                 let engine0 = store.data().engine.clone();
                 let wmodule = match WT_FAST_MODULES.with(|m| {
                     let mut m = m.borrow_mut();
@@ -680,38 +709,64 @@ pub(crate) fn execute_fast_wt(
                     let fill = vec![0xFFu8; crate::abi::cache::SITE_STRIDE as usize];
                     let _ = mem.write(&mut *store, scb as usize, &fill);
                 }
+                let np = _meta.nparams as u32;
                 let h = store.data_mut();
                 h.sh.hosts.push(host);
                 h.sh.scb_of.push(scb as i32);
                 h.sh.codes.push(Rc::clone(bc));
+                h.sh.nparams_of.push(np);
                 h.runs.push(tf);
-                h.sh.slots.insert(pool_key, slot);
+                h.sh.slot_insert(pool_key, slot);
                 slot
             }
             // 槽位上限：超出不 fast 化（回解释器）。
             None => return None,
         };
-        // 入口 globals：epoch/fuel/depth（句柄先克隆，避免借用冲突）
+        // 装箱参数数：快臂走实例化登记；编译路径走 meta。
+        let nparams = match &ctx {
+            Some((_, m)) => m.nparams,
+            None => *store
+                .data()
+                .sh
+                .nparams_of
+                .get(slot)
+                .expect("fast slot nparams registered") as usize,
+        };
+        // 入口 globals：epoch/fuel/depth（caching=1 冗余 set 删除——
+        // wasmi 驱动同款；fast Store 无 caching=0 写点，初值恒 1）。
         {
-            let (ge, gf, gd, gc) = {
+            let (ge, gf, gd) = {
                 let h = store.data();
-                (h.epoch_g(), h.fuel_g(), h.o_depth.clone().unwrap(), h.o_caching.clone().unwrap())
+                (h.epoch_g(), h.fuel_g(), h.o_depth.clone().unwrap())
             };
             let _ = ge.set(&mut *store, Val::I64(epoch as i64));
             let _ = gf.set(&mut *store, Val::I64(abi::REFUEL_CHUNK));
             let _ = gd.set(&mut *store, Val::I32(0));
-            let _ = gc.set(&mut *store, Val::I32(1));
         }
         // 参数 → per-depth 切片（wrapper depth++ 后 = 1 → base = PARAMS+STRIDE）
         let arg_base =
             (crate::abi::cache::PARAMS + crate::abi::cache::PARAM_STRIDE) as usize;
         {
-            let mut buf: Vec<u8> = Vec::with_capacity(meta.nparams * 8);
-            for i in 0..meta.nparams {
-                let name = bc.locals().get(i).cloned().unwrap_or_default();
-                let v = interp.get_var(&name).cloned().unwrap_or(Value::empty());
-                let tag = store.data_mut().sh.hosts[slot].tag_value(&v);
-                buf.extend_from_slice(&tag.to_le_bytes());
+            let mut buf: Vec<u8> = Vec::with_capacity(nparams * 8);
+            // 直读快臂（wasmi 驱动同款）：slot_mode 帧槽 params-first 直
+            // 拷，省逐名协议的每参数 String clone + get_var；回落 = 旧
+            // 逐名路径（apply/顶层/别名帧）。
+            let params = interp.jit_frame_param_values(bc, nparams);
+            match params {
+                Some(vals) => {
+                    for v in &vals {
+                        let tag = store.data_mut().sh.hosts[slot].tag_value(v);
+                        buf.extend_from_slice(&tag.to_le_bytes());
+                    }
+                }
+                None => {
+                    for i in 0..nparams {
+                        let name = bc.locals().get(i).cloned().unwrap_or_default();
+                        let v = interp.get_var(&name).cloned().unwrap_or(Value::empty());
+                        let tag = store.data_mut().sh.hosts[slot].tag_value(&v);
+                        buf.extend_from_slice(&tag.to_le_bytes());
+                    }
+                }
             }
             // wrapper 拷贝语义 = dispatch_values 形状（argv[0] 是命令名，
             // 参数在 argv+8 起）——外层驱动按同形暂存：参数写 arg_base+8。
@@ -720,7 +775,7 @@ pub(crate) fn execute_fast_wt(
         }
         let tf = store.data().runs[slot].clone();
         crate::fast::set_fast_in_call(true);
-        let r = tf.call(&mut *store, (slot as i32, meta.nparams as i32, arg_base as i32));
+        let r = tf.call(&mut *store, (slot as i32, nparams as i32, arg_base as i32));
         crate::fast::set_fast_in_call(false);
         let (val, rc) = match r {
             Ok(pair) => pair,

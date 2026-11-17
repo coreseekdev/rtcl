@@ -54,8 +54,23 @@ pub fn set_fast_only(v: bool) {
     FAST_ONLY.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// RTCL_JIT_POOL=1（classic 池显式 opt-in）。每 proc 调用两次的
+/// getenv → 进程级一次读（环境在进程生命周期内不变；judge/battery/
+/// bench 均为进程启动前设定——差分回归逃生口语义不受影响）。
+fn pool_optin() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::env_value("RTCL_JIT_POOL").as_deref() == Some("1"))
+}
+
+/// RTCL_JIT_FAST=0 关闭 fast tier（差分回归逃生口；默认开启）。
+/// 同上：每调用一次 getenv → 一次读。
+pub(crate) fn fast_tier_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::env_value("RTCL_JIT_FAST").as_deref() != Some("0"))
+}
+
 pub(crate) fn fast_only() -> bool {
-    if crate::env_value("RTCL_JIT_POOL").as_deref() == Some("1") {
+    if pool_optin() {
         return false;
     }
     FAST_ONLY.load(std::sync::atomic::Ordering::Relaxed)
@@ -73,7 +88,7 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
     // 路径也需要同一编译——零浪费）。
     // 默认开启（RTCL_JIT_FAST=0 关闭——差分回归逃生口）。judge 88/88
     // （fast=1）+ battery/probes + fib(2)-(30) 全深度三方一致后转正。
-    if crate::env_value("RTCL_JIT_FAST").as_deref() != Some("0") {
+    if fast_tier_enabled() {
         #[cfg(feature = "jit-native")]
         if crate::exec::engine_from_env() == crate::exec::EngineKind::Wasmtime {
             if let Some(r) = crate::fast::wt::fast_try_wt(interp, code) {
@@ -99,9 +114,7 @@ fn exec_proc_body(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_core:
     // 池 = 显式 opt-in（RTCL_JIT_POOL=1，旧行为全量保留）。
     // aggressive（wasm32）：JIT 产物宿主引擎原生编译 vs 解释器 wasm
     // 化——classic 保留（接近即保留，用户指令）。
-    if !crate::aggressive_tier()
-        && crate::env_value("RTCL_JIT_POOL").as_deref() != Some("1")
-    {
+    if !crate::aggressive_tier() && !pool_optin() {
         return None;
     }
     // 引擎分派（RTCL_JIT_ENGINE；默认 wasmi）。wasmtime 走 Cranelift

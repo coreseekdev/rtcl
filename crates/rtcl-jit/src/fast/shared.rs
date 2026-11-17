@@ -27,6 +27,12 @@ pub(crate) struct FastShared {
     /// slot → proc 体（名反查/jit_redispatch_after 用）。
     pub codes: Vec<Rc<ByteCode>>,
     pub slots: std::collections::HashMap<crate::classic::PoolKey, usize>,
+    /// slot → nparams（fast_try 槽命中快臂免编译查找时取 FastMeta 的
+    /// 装箱参数数；实例化时登记——与 codes 平行）。
+    pub nparams_of: Vec<u32>,
+    /// 一命中直查缓存（fib/oo 方法面 = 单 proc 反复调用，1 项即命中
+    /// 率 ~100%）：免 slots HashMap 的 4 元组哈希探测/调用。
+    pub last: Option<((usize, usize, u64, u64), usize)>,
     // 共享运行态
     pub pending: Option<Pending>,
     pub pending_exit: Option<i32>,
@@ -45,6 +51,8 @@ impl FastShared {
             hosts: Vec::new(),
             codes: Vec::new(),
             slots: std::collections::HashMap::new(),
+            nparams_of: Vec::new(),
+            last: None,
             pending: None,
             pending_exit: None,
             stale_site: None,
@@ -52,6 +60,36 @@ impl FastShared {
             last_fail: None,
             scb_of: Vec::new(),
         }
+    }
+
+    /// 槽直查（1 项缓存优先，未命中落 HashMap）。
+    pub(crate) fn slot_of(&self, key: (usize, usize, u64, u64)) -> Option<usize> {
+        if let Some((k, slot)) = &self.last {
+            if *k == key {
+                return Some(*slot);
+            }
+        }
+        self.slots.get(&key).copied()
+    }
+
+    /// 登记槽（slots 表 + 1 项缓存同步更新）。
+    pub(crate) fn slot_insert(&mut self, key: (usize, usize, u64, u64), slot: usize) {
+        self.slots.insert(key, slot);
+        self.last = Some((key, slot));
+    }
+
+    /// JIT_FT 诊断开关（fast tier 逐 op 跟踪打印）。曾以
+    /// `std::env::var_os` 直查——热路径每次宿主变量操作一次 getenv
+    /// （oo_bench2 画像 2.25% cycles）；环境进程内不变 → 一次读缓存。
+    pub(crate) fn ft_trace_on() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var_os("JIT_FT").is_some())
+    }
+
+    /// JIT_VM_TRACE 诊断开关（take_fail 跟踪）——同上一次读缓存。
+    pub(crate) fn vm_trace_on() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var_os("JIT_VM_TRACE").is_some())
     }
 
     /// execute_fast 入口态重置（防御性——下次入口也重置）。
@@ -86,7 +124,7 @@ pub(crate) fn sh_binary_op(s: &mut FastShared, cur: usize, op: i32, a: i64, b: i
 pub(crate) fn sh_get_var(s: &mut FastShared, cur: usize, name_h: i32) -> i64 {
     let name = s.hosts[cur].const_name(name_h);
     let r = s.irp().jit_read_var_ref(&name);
-    if std::env::var_os("JIT_FT").is_some() {
+    if FastShared::ft_trace_on() {
         eprintln!(
             "[ft] get_var cur={cur} name={name:?} -> {:?}",
             r.as_ref()
@@ -121,7 +159,7 @@ pub(crate) fn sh_fail(s: &mut FastShared, cur: usize, fail_id: i32) -> i32 {
     let fid = fail_id.max(0) as u32;
     s.last_fail = Some(fid);
     let r = sh_take_fail(s, cur, fid);
-    if std::env::var_os("JIT_FT").is_some() {
+    if FastShared::ft_trace_on() {
         eprintln!("[ft] fail cur={cur} fid={fid} -> {r}");
     }
     r
@@ -142,7 +180,7 @@ pub(crate) fn sh_bool_test(s: &mut FastShared, cur: usize, v: i64) -> i64 {
 
 pub(crate) fn sh_incr_var(s: &mut FastShared, cur: usize, name_h: i32, n: i64) -> i64 {
     let r = s.hosts[cur].incr_var_raw(name_h, n);
-    if std::env::var_os("JIT_FT").is_some() {
+    if FastShared::ft_trace_on() {
         eprintln!("[ft] incr_var cur={cur} n={n} -> {r}");
     }
     if r == abi::ERR_SENTINEL {
@@ -162,7 +200,7 @@ pub(crate) fn sh_sync_var(s: &mut FastShared, cur: usize, name_h: i32) -> i64 {
         Ok(v) => s.hosts[cur].tag_value(&v),
         Err(_) => 0,
     };
-    if std::env::var_os("JIT_FT").is_some() {
+    if FastShared::ft_trace_on() {
         let pv = if r == 0 {
             "<none>".into()
         } else {
@@ -232,7 +270,7 @@ pub(crate) fn sh_proc_exit_frame(s: &mut FastShared, slot: i32) {
 
 /// fast 版 take_fail（Host::take_fail 的 proc_ctx 臂复刻；pending 共享）。
 pub(crate) fn sh_take_fail(s: &mut FastShared, cur: usize, fail_id: u32) -> i32 {
-    if std::env::var_os("JIT_VM_TRACE").is_some() {
+    if FastShared::vm_trace_on() {
         eprintln!("[fast] take_fail cur={cur} fid={fail_id}");
     }
     use crate::ir::BodyKind;

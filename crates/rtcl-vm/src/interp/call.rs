@@ -1069,6 +1069,39 @@ fn ns_of_qualified(interp: &Interp, name: &str) -> Rc<str> {
 }
 
 impl Interp {
+    /// fast 入口参数直读（jit fast 装箱加速）：当前帧以 `code` 为槽表
+    /// （slot_mode 同源——call_proc 的 E2 门把这枚 Rc 装进 slot_table）
+    /// 且前 `n` 槽无链接别名时，返回这些槽的值拷贝（params-first 绑定
+    /// 序 == code.locals()[0..n]，slot[i] 即第 i 个实参/默认值/args 列
+    /// 表）。None = 非槽帧（apply/顶层/名键回落）/异源槽表/参数段含
+    /// upvar/global/variable 别名——调用方回落逐名 get_var（旧协议）。
+    /// 语义锚：slot_mode 帧里 get_var(locals[i]) 对未别名槽就走
+    /// slots[i]（slot_index_of 线性扫描）——直读与逐名同源。
+    pub fn jit_frame_param_values(
+        &self,
+        code: &Rc<rtcl_ir::bytecode::ByteCode>,
+        n: usize,
+    ) -> Option<Vec<crate::value::Value>> {
+        let f = self.frames.last()?;
+        {
+            let t = f.slot_table.as_ref()?;
+            if !Rc::ptr_eq(t, code) {
+                return None;
+            }
+        }
+        if f.slots.len() < n {
+            return None;
+        }
+        if f.has_aliased {
+            for st in f.slot_aliased.iter().take(n) {
+                if *st {
+                    return None;
+                }
+            }
+        }
+        Some(f.slots[..n].to_vec())
+    }
+
     /// 编译体 → 注册名反查（fast 错误冷路径的 (procedure "name") 帧）。
     pub fn jit_proc_name_of(&self, code: &Rc<rtcl_ir::bytecode::ByteCode>) -> Option<String> {
         for (k, def) in self.procs.iter() {

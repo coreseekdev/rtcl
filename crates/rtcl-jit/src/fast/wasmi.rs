@@ -323,7 +323,7 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
     }).unwrap();
     linker.func_wrap("rtcl", "foreach_bind", |mut c: Caller<'_, FastHost>, info: i32, idx: i32| -> i64 {
         let cur = read_cur(&mut c);
-        if std::env::var_os("JIT_FT").is_some() {
+        if crate::fast::shared::FastShared::ft_trace_on() {
             eprintln!("[ft] foreach_bind info={info} idx={idx}");
         }
         let h = &mut c.data_mut().sh.hosts[cur];
@@ -441,7 +441,7 @@ fn fast_ensure_slot(
         return Some(*s);
     }
     let module = compile_cached(code, (Rc::as_ptr(code) as usize, code.epoch, code.serial))?;
-    let _meta = module.fast?; // fast gate 不命中 → None（分派回落）
+    let meta = module.fast?; // fast gate 不命中 → None（分派回落）
     let wmodule = FAST_MODULES.with(|m| {
         let mut m = m.borrow_mut();
         if let Some(w) = m.get(&pool_key) {
@@ -488,12 +488,14 @@ fn fast_ensure_slot(
         let fill = vec![0xFFu8; crate::abi::cache::SITE_STRIDE as usize];
         let _ = mem.write(&mut *c, scb as usize, &fill);
     }
+    let nparams = meta.nparams;
     let h = c.data_mut();
     h.sh.hosts.push(host);
     h.sh.scb_of.push(scb as i32);
     h.sh.codes.push(Rc::clone(code));
+    h.sh.nparams_of.push(nparams as u32);
     h.runs.push(tf);
-    h.sh.slots.insert(pool_key, slot);
+    h.sh.slot_insert(pool_key, slot);
     Some(slot)
 }
 
@@ -559,7 +561,7 @@ pub(crate) fn execute_fast_top_wasmi(
     module: &emit::Module,
     meta: crate::emit::FastMeta,
 ) -> Option<crate::exec::JitRun> {
-    let r = execute_fast(interp, bc, module, meta)?;
+    let r = execute_fast(interp, bc, Some((module, meta)))?;
     Some(crate::exec::map_fast_top_run(r))
 }
 
@@ -568,18 +570,36 @@ pub(crate) fn fast_try(interp: &mut Interp, code: &Rc<ByteCode>) -> Option<rtcl_
         return None;
     }
     drain_pending_retire();
-    let key = (Rc::as_ptr(code) as usize, code.epoch, code.serial);
-    let module = compile_cached(code, key)?;
+    // 槽命中快臂：1 项缓存直查（fib/oo 单 proc 反复调用的形状）——
+    // 免 PROC_MODULES 哈希查找 + Rc<Module> 克隆（每次调用的纯开销，
+    // fib 差分剖析同款教训）。nparams 从 sh.nparams_of 取（实例化时
+    // 与 codes 平行登记）。未命中 → 编译查找走全协议。
+    let owner = interp as *mut Interp as usize;
+    let key = (owner, Rc::as_ptr(code) as usize, code.epoch, code.serial);
+    let cached = FAST_STORE.with(|f| {
+        let cell = f.borrow();
+        let s = cell.as_ref()?;
+        if s.data().sh.interp != interp as *mut Interp {
+            return None;
+        }
+        s.data().sh.slot_of(key)
+    });
+    if cached.is_some() {
+        return execute_fast(interp, code, None);
+    }
+    let key2 = (Rc::as_ptr(code) as usize, code.epoch, code.serial);
+    let module = compile_cached(code, key2)?;
     let meta = module.fast?;
-    execute_fast(interp, code, &module, meta)
+    execute_fast(interp, code, Some((&module, meta)))
 }
 
 /// fast-tier 外层驱动：exec_proc_body 的 fast 分支。None = 回落常规池。
+/// `ctx`：槽命中快臂传 None（nparams 走 sh.nparams_of 登记；module 不
+/// 触达）；未命中传 Some((module, meta)) 供实例化。
 fn execute_fast(
     interp: &mut Interp,
     bc: &Rc<ByteCode>,
-    module: &emit::Module,
-    meta: crate::emit::FastMeta,
+    ctx: Option<(&emit::Module, crate::emit::FastMeta)>,
 ) -> Option<rtcl_core::Result<Value>> {
     let epoch = interp.tier1_epoch();
     let pool_key = (
@@ -613,12 +633,30 @@ fn execute_fast(
         if let Err(e) = rtcl_vm::VmContext::charge_step(interp) {
             return Some(Err(e));
         }
-        // slot 确保（驱动侧——resolve 闭包内另有 fast_ensure_slot）
-        let slot = match store.data().sh.slots.get(&pool_key) {
-            Some(s) => *s,
+        // slot 确保（驱动侧——resolve 闭包内另有 fast_ensure_slot）。
+        // 1 项缓存优先（sh.slot_of）；未命中需要编译产物 —— 槽命中快臂
+        // （fast_try 传 ctx=None）在此不可达：compile_cached 回填。
+        let slot = match store.data().sh.slot_of(pool_key) {
+            Some(s) => s,
             None
                 if store.data().sh.hosts.len() < crate::abi::cache::MAX_FAST_SLOTS =>
             {
+                // 快臂误达 + 缓存缺席（retire 后重建窗口）：回编译
+                // 兜底（冷路径）。
+                let fallback = match &ctx {
+                    Some(_) => None,
+                    None => {
+                        let key = (Rc::as_ptr(bc) as usize, bc.epoch, bc.serial);
+                        let m = compile_cached(bc, key)?;
+                        let mt = m.fast?;
+                        Some((m, mt))
+                    }
+                };
+                let (module, _meta) = match (&ctx, &fallback) {
+                    (Some((m, mt)), _) => (*m, *mt),
+                    (None, Some((m, mt))) => (m.as_ref(), *mt),
+                    (None, None) => return None,
+                };
                 let engine0 = store.data().engine.clone();
                 let wmodule = match FAST_MODULES.with(|m| {
                     let mut m = m.borrow_mut();
@@ -655,7 +693,7 @@ fn execute_fast(
                     interp as *mut Interp,
                     crate::exec::arena_of(bc),
                     bc,
-                    module,
+                    &module,
                 );
                 let inst = linker.instantiate_and_start(&mut *store, &wmodule).ok()?;
                 let f = inst
@@ -669,38 +707,68 @@ fn execute_fast(
                     let fill = vec![0xFFu8; crate::abi::cache::SITE_STRIDE as usize];
                     let _ = mem.write(&mut *store, scb as usize, &fill);
                 }
+                let np = _meta.nparams as u32;
                 let h = store.data_mut();
                 h.sh.hosts.push(host);
                 h.sh.scb_of.push(scb as i32);
                 h.sh.codes.push(Rc::clone(bc));
+                h.sh.nparams_of.push(np);
                 h.runs.push(tf);
-                h.sh.slots.insert(pool_key, slot);
+                h.sh.slot_insert(pool_key, slot);
                 slot
             }
             // 槽位上限：超出不 fast 化（回解释器）。
             None => return None,
         };
-        // 入口 globals：epoch/fuel/depth（句柄先克隆，避免借用冲突）
+        // 装箱参数数：快臂（ctx=None）走实例化登记；编译路径走 meta。
+        let nparams = match &ctx {
+            Some((_, m)) => m.nparams,
+            None => *store
+                .data()
+                .sh
+                .nparams_of
+                .get(slot)
+                .expect("fast slot nparams registered") as usize,
+        };
+        // 入口 globals：epoch/fuel/depth（句柄先克隆，避免借用冲突）。
+        // caching=1 的重置已删：fast Store 侧无任何 caching=0 写点
+        // （classic 的写点在宿主闭包/rtcl.call 闭包；fast 模块 wasm 体
+        // 只在 run() 入口写 1——fast_impl/proc_main 不触达），初值 1
+        // 恒成立——此 set 本为每调用一次的冗余 Global 写。
         {
-            let (ge, gf, gd, gc) = {
+            let (ge, gf, gd) = {
                 let h = store.data();
-                (h.epoch_g(), h.fuel_g(), h.o_depth.clone().unwrap(), h.o_caching.clone().unwrap())
+                (h.epoch_g(), h.fuel_g(), h.o_depth.clone().unwrap())
             };
             let _ = ge.set(&mut *store, wasmi::Val::I64(epoch as i64));
             let _ = gf.set(&mut *store, wasmi::Val::I64(abi::REFUEL_CHUNK));
             let _ = gd.set(&mut *store, wasmi::Val::I32(0));
-            let _ = gc.set(&mut *store, wasmi::Val::I32(1));
         }
         // 参数 → per-depth 切片（wrapper depth++ 后 = 1 → base = PARAMS+STRIDE）
         let arg_base =
             (crate::abi::cache::PARAMS + crate::abi::cache::PARAM_STRIDE) as usize;
         {
-            let mut buf: Vec<u8> = Vec::with_capacity(meta.nparams * 8);
-            for i in 0..meta.nparams {
-                let name = bc.locals().get(i).cloned().unwrap_or_default();
-                let v = interp.get_var(&name).cloned().unwrap_or(Value::empty());
-                let tag = store.data_mut().sh.hosts[slot].tag_value(&v);
-                buf.extend_from_slice(&tag.to_le_bytes());
+            let mut buf: Vec<u8> = Vec::with_capacity(nparams * 8);
+            // 直读快臂：slot_mode 帧（slot_table 与本 code 同源 + 参数段
+            // 无链接别名）→ 帧槽 params-first 直拷——省逐名协议的每参数
+            // String clone + 全量 get_var 名字解析（oo 方法 2-4 参数 ×
+            // 1M 调用面）。回落 = 旧逐名路径（apply/顶层/别名帧）。
+            let params = interp.jit_frame_param_values(bc, nparams);
+            match params {
+                Some(vals) => {
+                    for v in &vals {
+                        let tag = store.data_mut().sh.hosts[slot].tag_value(v);
+                        buf.extend_from_slice(&tag.to_le_bytes());
+                    }
+                }
+                None => {
+                    for i in 0..nparams {
+                        let name = bc.locals().get(i).cloned().unwrap_or_default();
+                        let v = interp.get_var(&name).cloned().unwrap_or(Value::empty());
+                        let tag = store.data_mut().sh.hosts[slot].tag_value(&v);
+                        buf.extend_from_slice(&tag.to_le_bytes());
+                    }
+                }
             }
             // wrapper 拷贝语义 = dispatch_values 形状（argv[0] 是命令名，
             // 参数在 argv+8 起）——外层驱动按同形暂存：参数写 arg_base+8。
@@ -711,7 +779,7 @@ fn execute_fast(
         crate::fast::set_fast_in_call(true);
         let r = tf.call(
             &mut *store,
-            (slot as i32, meta.nparams as i32, arg_base as i32),
+            (slot as i32, nparams as i32, arg_base as i32),
         );
         crate::fast::set_fast_in_call(false);
         let (val, rc) = match r {

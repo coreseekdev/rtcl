@@ -435,6 +435,87 @@ jitsh 单文件单元里中途 add 由 bump/回边比对接住）。
   proc 调用全协议 ~1.4μs vs interp ~200ns）——独立于 slot 缓存，
   reopen 归「fast 调用协议」专项。
 
+## 10duodevicesimus. 2026-11-17 fast 调用协议专项——oo_bench2 3.40×→1.26× / oovars 4.11×→1.89× tclsh（perf/wave2）
+
+M2 验收钉死的实质回归（「jitsh 下 oo_bench2 3.32× / oovars 3.70×
+tclsh」）收口。画像推翻了「协议本身 1.4μs」的单因定谳——**大头在
+宿主算术回退的文本重建/重解析**，协议只占 ~7%。
+
+### 画像（CARGO_PROFILE_RELEASE_DEBUG=1 + perf，注意 strip=true 默认吞符号）
+
+jitsh oo_bench2 全样分布（修前）：ExprParser 系（match_op/
+parse_primary/parse_equality + Vec<char> 物化）~10.5%、fmt/format/
+as_str/memmove ~8%、call_proc 5.1%、execute_fast 3.8%、getenv
+2.3%（exec_proc_body 每 proc 调用 3 次 getenv：RTCL_JIT_POOL×2 +
+RTCL_JIT_FAST）、get_var 3.5%（参数装箱逐名）、wasmi 执行全貌
+~1.8%。根因链：oo 方法实参是**字符串形态**（"7"/"3"），Add 的
+imm 守卫不命中落宿主；Mod/Div 在 emit_arith 属「§4 全走宿主」类
+；宿主 binary_op 把操作数 expr_quote 进文本 `format!("{sa} + {sb}")
+` 再 eval_expr 全量重解析——每次宿主算术一轮 ExprParser（语义
+等价由「解析器逐层就是 expr_ops 的薄调用」构造保证）。
+
+### 逐件消减（每件 battery + judge --engine jit 验证，交替轮 best-of-5）
+
+- 件1 env 标志缓存：RTCL_JIT_FAST/RTCL_JIT_POOL/JIT_FT/JIT_VM_TRACE
+  OnceLock 一次读（进程内环境不变语义不变）。−3.5%（噪声带内，
+  getenv 2.3% cycles 摘除）。
+- 件2 宿主算术 expr_ops 直呼：binary_op 慢臂不再拼文本——直接调
+  rtcl_vm::types::expr_ops（numeric_binop/int_mod/int_shift/
+  int_bitop/op_eq/op_rel/op_pow/op_neg/…，pub 面扩容——模块 doc
+  本就预留「and later the JIT's runtime calls」）；And/Or 复刻
+  解析器短路结构（两侧已求值字面量，可观察面只剩 strict_bool 错
+  误）。**oo 1480→676ms（3.28→1.52×），oovars 1857→1317ms
+  （→2.95×）**——单件 −54%。
+- 件3 参数装箱帧槽直读：rtcl-vm 新公共 API `jit_frame_param_
+  values(code, n)`（slot_table 与 code 同源 + 参数段无链接别名 →
+  slots[..n] 直拷，params-first 绑定序 == locals 序）；回落逐名
+  get_var（apply/顶层/别名帧）。省每参数 String clone + 全量名解
+  析。wasmi/wt 双驱动同改。
+- 件4 协议瘦身：fast_try 槽命中快臂（FastShared 1 项 last 缓存 +
+  nparams_of 登记）——免 PROC_MODULES 哈希 + Rc<Module> 克隆与
+  execute_fast 内二查；入口 caching=1 set 删除（fast Store 无任何
+  clearing 写点，classic 的写点在宿主闭包/wasm run() 入口，均不
+  触达 fast——初值恒 1，set 本为冗余 Global 写）。fuel/depth 重置
+  保留（fuel 重置承载 max_steps 计账语义：无重置时 refuel 每
+  ~chunk 调用反复充值 = 计账翻倍）；epoch 重置保留（trap 后
+  fast_depth 残留防线同门）。**oo →528-580ms（→1.32×），oovars
+  →888-1012ms（→2.03×）**。
+- 件5 Div/Mod 双 imm 快臂：emit_arith 从「§4 全走宿主」摘出
+  Div/Mod——floor 语义 wasm 直算（floor_div=q-1 / floor_mod=r+vb
+  修正门，除零落宿主全语义）；imm ⇒ |v|<2^62 ⇒ INT_MIN/-1 陷阱
+  不可达、修正后结果恒在 i63 域免范围守卫。**oo →482-528ms
+  （→1.26×），oovars →826-864ms（→1.89×）**。
+- 止损留档：oovars 出口 flush 的 set_var（object `variable acc`
+  经 OO prelink 成链接槽——flush 是链接落盘的承重件）与参数数字
+  串装箱期强转（改值形态=语义变化）均评估后不做；PENDING_RETIRE
+  AtomicBool 门（~10ns）噪声级，记 reopen 线索。
+
+### 验收与数字
+
+- 门禁：jit_battery 52/52（b07 两轮证伪件5 首版：模块校验失败
+  （Mod 门漏 I64Eqz）→ If 嵌套倒置（符号臂被嵌进 r==0 空臂=修正
+  不可达）——差分电池双杀，机械复刻两处后全绿）、judge 双引擎
+  88/88×2、workspace tests 全绿、fuzz 400 seed7 **0 分歧**、
+  Div/Mod 符号矩阵 392 例（±7/±9/bignum 边界/除零 catch）三方逐
+  字节。
+- 数字（jitsh best-of-5 交替轮，ms）：oo_bench2 1459→**482**、
+  oo_bench2_vars 1907→**826**；tclsh 同轮 442/447 基准 → 比值
+  **3.40×→1.26× / 4.11×→1.89×**。jitsh vs rtcl 解释器（369-381ms）
+  = 1.31×/1.8×。
+
+### ≤1.0× 目标定调（结构性，数据支撑）
+
+oo_bench2 的 jitsh 开销余量 = 482−356(interp) = ~126ns/调用，构
+成：execute_fast 协议 ~60ns + wasmi 主机↔wasm 过桥 ~45ns
+（init_wasm_func_call/execute_func/args 转换，引擎下限）+ 体宿主
+Add×2（字符串参数 imm 守卫不可命中，expr_ops 直呼后的强制域下限
+~30ns）。而 ≤1.0× 需要 jitsh ≤ tclsh(383ms)=头部空间仅 23ms
+<协议+过桥单项。拓扑定调：callsite_in_loop 回落使每方法调用全
+额重入解释器分派（oo 机器 + call_proc 帧机器都是共享成本），fast
+协议只能在此之上**做加法**；把整循环留在 wasm 的形态已被 v5 gate
+按实测拒绝（dict_ops 23×/list_ops 9×，M2 前既有数据）。≤1.0× 归
+「oo 分派自身 wasm 化/M4 形态」 reopen 线索，非本协议面可达。
+
 ## 10septendecimus. 2026-11-17 树走查直呼单元 C1 误编译修复——eval_commands 深度占位（perf/wave2，他分支移交）
 
 **移交来源**：Gen UI 调研线（rtcl-designer worktree，ui/designer @fd70528）

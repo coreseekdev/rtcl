@@ -33,6 +33,20 @@ pub trait HostConsole: Send {
         let _ = s;
         Ok(())
     }
+    /// lazy-string 白名单钩子（§6「puts 到 console」）：写一个可能仍处
+    /// 宿主原生形态（`InternalRep::HostStr`）的值——实现若能直接消费宿
+    /// 形态（wasm 的 JsConsole 直取 JsString），返回 `Some(结果)`，puts
+    /// 跳过物化与来回转码（收益本体）；`None` = 不支持/值非宿主形态，
+    /// 调用方回退到物化 + [`HostConsole::write_stdout`]。
+    ///
+    /// `newline` = 是否补行尾换行（puts 无 -nonewline）；实现负责把换行
+    /// 附加到宿主形态上（回调契约不变：每次 puts 恰好一次回调，含行尾）。
+    fn write_value_stdout(&self, v: &crate::value::Value, newline: bool)
+        -> Option<Result<(), String>>
+    {
+        let _ = (v, newline);
+        None
+    }
 }
 
 /// std 原生控制台：直连进程的 stdout/stderr，写后即刷。

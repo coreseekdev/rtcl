@@ -332,7 +332,15 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             ));
         }
     }
-    let str_val = args.get(2).map(|v| v.as_str()).unwrap_or("");
+    // lazy-string（§6）：equal/compare/cat 的操作数可能持宿主句柄——主体
+    // 串对这三个子命令延迟物化（equal 有免物化快路径；compare 刻意物化，
+    // 见 host_string.rs 白名单表；cat 全折叠）。其余子命令照旧即时物化。
+    let lazy_subject = matches!(subcmd.as_str(), "equal" | "compare" | "cat");
+    let str_val = if lazy_subject {
+        ""
+    } else {
+        args.get(2).map(|v| v.as_str()).unwrap_or("")
+    };
 
     match subcmd.as_str() {
         "length" => Ok(Value::from_int(str_val.chars().count() as i64)),
@@ -392,6 +400,19 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
         "equal" => {
+            // lazy-string 白名单（§6）：裸形 `string equal s1 s2`（恰 4 词
+            // = 无 -nocase/-length）两操作数都持宿主句柄时免物化比较。
+            // UTF-8↔UTF-16 对合法标量值双射 → 深层相等安全；池内容恒为
+            // 合法标量值（入池孤立代理过滤，见 host_string.rs 契约）。
+            if args.len() == 4 {
+                if let (Some(a), Some(b)) =
+                    (args[2].host_str_handle(), args[3].host_str_handle())
+                {
+                    if let Some(eq) = crate::host_string::with_backing(|bk| bk.equal(a, b)) {
+                        return Ok(Value::from_bool(eq));
+                    }
+                }
+            }
             let (nocase, length, s1, s2) = parse_compare_args(interp, args, "equal")?;
             let a = truncate_chars(s1, length);
             let b = truncate_chars(s2, length);
@@ -676,6 +697,44 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "cat" => {
             // string cat str1 ?str2 ...?
+            // lazy-string 白名单（§6）：全宿主句柄且 ≥2 个时免物化折叠拼接
+            // （「拼接→转码 ≡ 转码→拼接」，合法标量值）；concat 产出新槽
+            // （1 引用起算，所有权移交 from_host_str）。单参数宿主形退化为
+            // 共享原值的克隆（Value 引用计数，不转手池引用）。其余形态走
+            // 既有物化路径。
+            if args.len() == 3 {
+                if args[2].host_str_handle().is_some() {
+                    return Ok(args[2].clone());
+                }
+            } else if args.len() > 3 {
+                let handles: Option<Vec<u32>> =
+                    args[2..].iter().map(Value::host_str_handle).collect();
+                if let Some(handles) = handles {
+                    // 折叠：首个 acc 借自参数（非持有）；每步产出新槽后
+                    // 释放上一轮**持有的**中间槽（concat 借用语义，见
+                    // HostStringBacking::concat）。≥2 参数时最终 acc 恒为
+                    // 持有态 → 所有权移交 from_host_str。
+                    let folded = crate::host_string::with_backing(|bk| {
+                        let mut it = handles.into_iter();
+                        let mut acc = it.next()?;
+                        let mut owned = false;
+                        for h in it {
+                            let next = bk.concat(acc, h);
+                            if owned {
+                                bk.release(acc);
+                            }
+                            acc = next;
+                            owned = true;
+                        }
+                        Some(acc)
+                    });
+                    // with_backing 的 R 本身已是 Option<u32>（闭包内的 ?），
+                    // 外层再 flatten 一层。
+                    if let Some(idx) = folded.flatten() {
+                        return Ok(Value::from_host_str(idx));
+                    }
+                }
+            }
             let mut result = String::new();
             for arg in &args[2..] {
                 result.push_str(arg.as_str());

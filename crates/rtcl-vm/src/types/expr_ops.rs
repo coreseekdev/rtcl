@@ -427,11 +427,25 @@ pub fn op_rel(left: &Value, right: &Value, op: &str) -> Value {
 }
 
 /// `eq` / `ne` — pure string comparison.
+///
+/// lazy-string 白名单（§6）：两个操作数都持宿主池句柄时走免物化比较
+/// （UTF-8↔UTF-16 对合法标量值双射，深层相等安全；Dual 态有字节缓存也
+/// 不影响等值判定）。其余形态走既有字节路径。
 pub fn op_str_eq(left: &Value, right: &Value) -> Value {
+    if let (Some(a), Some(b)) = (left.host_str_handle(), right.host_str_handle()) {
+        if let Some(eq) = crate::host_string::with_backing(|bk| bk.equal(a, b)) {
+            return Value::from_bool(eq);
+        }
+    }
     Value::from_bool(left.as_str() == right.as_str())
 }
 
 pub fn op_str_ne(left: &Value, right: &Value) -> Value {
+    if let (Some(a), Some(b)) = (left.host_str_handle(), right.host_str_handle()) {
+        if let Some(eq) = crate::host_string::with_backing(|bk| bk.equal(a, b)) {
+            return Value::from_bool(!eq);
+        }
+    }
     Value::from_bool(left.as_str() != right.as_str())
 }
 

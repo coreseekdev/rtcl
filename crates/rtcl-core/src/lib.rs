@@ -27,6 +27,7 @@ pub mod error;
 pub mod value;
 
 pub use rtcl_vm::host;
+pub use rtcl_vm::host_string;
 pub use rtcl_vm::parser;
 pub use rtcl_vm::interp;
 pub use rtcl_vm::command;

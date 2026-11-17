@@ -93,21 +93,23 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // puts ?-nonewline? ?channelId? string
     let mut nonewline = false;
     let mut chan_id = "stdout";
-    let msg;
+    // lazy-string（§6）：消息值保持未物化引用——wasm stdout 快路径直取
+    // 宿主形态；其余路径在使用点 `as_str()` 物化（ choke point 兜底）。
+    let msg_val: &Value;
 
     match args.len() {
         2 => {
-            msg = args[1].as_str();
+            msg_val = &args[1];
         }
         3 => {
             let first = args[1].as_str();
             if first == "-nonewline" {
                 nonewline = true;
-                msg = args[2].as_str();
+                msg_val = &args[2];
             } else {
                 // first is channelId
                 chan_id = first;
-                msg = args[2].as_str();
+                msg_val = &args[2];
             }
         }
         4 => {
@@ -123,7 +125,7 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             nonewline = true;
             chan_id = args[2].as_str();
-            msg = args[3].as_str();
+            msg_val = &args[3];
         }
         _ => return Err(Error::wrong_args_with_usage("puts", 2, args.len(), "?-nonewline? ?channelId? string")),
     }
@@ -134,7 +136,7 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     #[cfg(all(feature = "std", not(feature = "io")))]
     {
         let newline = if nonewline { "" } else { "\n" };
-        let out = format!("{}{}", msg, newline);
+        let out = format!("{}{}", msg_val.as_str(), newline);
         match chan_id {
             "stdout" => interp.console.write_stdout(&out).map_err(|e| {
                 Error::runtime(
@@ -165,11 +167,20 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         {
             if chan_id == "stdout" || chan_id == "stderr" {
                 let newline = if nonewline { "" } else { "\n" };
-                let out = format!("{}{}", msg, newline);
                 let r = if chan_id == "stdout" {
-                    interp.console.write_stdout(&out)
+                    // lazy-string 白名单（§6「puts 到 console」）：宿主形
+                    // 态值直达 console（零转码，JsConsole 实现消费
+                    // HostStr 句柄）；None 回退到物化字符串路径。
+                    match interp.console.write_value_stdout(msg_val, !nonewline) {
+                        Some(r) => r,
+                        None => interp
+                            .console
+                            .write_stdout(&format!("{}{}", msg_val.as_str(), newline)),
+                    }
                 } else {
-                    interp.console.write_stderr(&out)
+                    interp
+                        .console
+                        .write_stderr(&format!("{}{}", msg_val.as_str(), newline))
                 };
                 r.map_err(|e| {
                     Error::runtime(
@@ -180,6 +191,8 @@ pub fn cmd_puts(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Ok(Value::empty());
             }
         }
+
+        let msg = msg_val.as_str();
 
         if !interp.channels.contains(chan_id) {
             return Err(chan_io::chan_not_found(interp, chan_id));

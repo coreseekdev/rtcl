@@ -24,6 +24,7 @@ pub mod value;
 pub mod context;
 pub mod command;
 pub mod host;
+pub mod host_string;
 pub mod parser;
 pub mod types;
 pub mod interp;

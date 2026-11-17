@@ -115,7 +115,7 @@ const INLINE_SIZE: usize = 23;
 ///
 /// Mirrors jimtcl's `internalRep` union — a cached typed view of the
 /// underlying string value.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum InternalRep {
     /// Integer representation
     Int(i64),
@@ -127,8 +127,48 @@ pub enum InternalRep {
     List(Vec<Value>),
     /// Cached dict — supports both ordered (insertion-order) and unordered modes.
     Dict(DictMap),
+    /// 宿主字符串池索引（lazy-string §6）：JS 起源的串保持宿主原生形态
+    /// （wasm32 = externref JsString，池在 rtcl-wasm 的 `JsStringBacking`），
+    /// 首次字节级语义经 `as_str` choke point 物化；Tcl→宿主反向穿越缓存
+    /// 池索引（Dual 态）。无人注册背板时此 variant 无人构造（运行期不出
+    /// 现，零成本——注册表即 `lazy-string` 开关，见 `host_string.rs`）。
+    /// `Clone`/`Drop` 是手工实现：池槽位引用计数跟随 ValueInner 的 COW 深
+    /// 拷贝与回收。
+    HostStr(u32),
     /// No internal representation yet
     None,
+}
+
+impl Clone for InternalRep {
+    fn clone(&self) -> Self {
+        match self {
+            InternalRep::Int(n) => InternalRep::Int(*n),
+            InternalRep::Float(n) => InternalRep::Float(*n),
+            InternalRep::Bool(b) => InternalRep::Bool(*b),
+            InternalRep::List(v) => InternalRep::List(v.clone()),
+            InternalRep::Dict(m) => InternalRep::Dict(m.clone()),
+            InternalRep::None => InternalRep::None,
+            InternalRep::HostStr(idx) => {
+                // COW 深拷贝：两个 ValueInner 即将引用同一池槽位——加池引
+                // 用，配平各自的 release。背板缺位时（HostStr 只在有背板
+                // 时构造，此臂不可达）跳过；槽位泄漏给显式 acquire 不归还
+                // 的错误实现会在池侧暴露。
+                crate::host_string::with_backing(|b| b.acquire(*idx));
+                InternalRep::HostStr(*idx)
+            }
+        }
+    }
+}
+
+impl Drop for InternalRep {
+    fn drop(&mut self) {
+        if let InternalRep::HostStr(idx) = self {
+            // 值回收（VPtr 末主 drop_in_place）或 rep 覆写（set_int_rep
+            // 等赋值丢弃旧 rep）都汇到这里——即状态机的 ──mutation──→
+            // NativeOnly 转移，池引用归还。
+            crate::host_string::with_backing(|b| b.release(*idx));
+        }
+    }
 }
 
 // ── DictMap ────────────────────────────────────────────────────
@@ -782,6 +822,59 @@ impl Value {
         Self::from_list_cached(items.to_vec())
     }
 
+    // ── lazy-string（§6）：宿主字符串池三态 ─────────────────────
+
+    /// JsOnly 构造（lazy-string §6）：包一个宿主字符串池句柄为值。
+    ///
+    /// 字节 cell 保持空——首次字节级语义才经 `as_str` choke point 物化
+    /// （JsOnly → Dual）。`idx` 必须是**本调用新近取得的所有权**（backing
+    /// 的 `insert`/`concat` 返回值，或显式 `acquire` 后移交）：构造以 1 池
+    /// 引用起算。无背板注册时宿主侧根本拿不到 idx，此构造器不会被触达。
+    pub fn from_host_str(idx: u32) -> Self {
+        Value::from_vptr(VPtr::new(ValueInner {
+            string: OnceCell::new(), // JsOnly：字节未物化
+            rep: InternalRep::HostStr(idx),
+            rc: Cell::new(1),
+        }))
+    }
+
+    /// 读取宿主池句柄（不物化、不建池引用）。
+    ///
+    /// JsOnly/Dual 态返回 `Some(idx)`；其余 rep 返回 `None`。白名单操作
+    /// （equal/concat/回传 JS/puts）与 rtcl-wasm 边界的零转码取串都用它
+    /// 探测。
+    #[inline]
+    pub fn host_str_handle(&self) -> Option<u32> {
+        if self.is_imm() {
+            return None;
+        }
+        match unsafe { self.heap_inner() }.rep {
+            InternalRep::HostStr(idx) => Some(idx),
+            _ => None,
+        }
+    }
+
+    /// Tcl→JS 反向穿越（NativeOnly ──首次──→ Dual）：确保值持有宿主池
+    /// 句柄并返回它。
+    ///
+    /// - 已是 JsOnly/Dual：原句柄直返（二次穿越零成本）。
+    /// - NativeOnly 且背板已注册：先经 `as_str` 物化字节（Dual 保留字节，
+    ///   解释器侧不再重渲染），再 `insert` 入池、rep 指向槽位。
+    /// - 无背板：`None`（原生宿主没有 JS 形态可言）。
+    ///
+    /// COW 安全：`heap_make_mut` 的深拷贝会克隆字节 cell；此处旧 rep 恒非
+    /// HostStr（上面已早退），不触碰池引用计数。
+    pub fn to_host_str(&mut self) -> Option<u32> {
+        if let Some(idx) = self.host_str_handle() {
+            return Some(idx);
+        }
+        let bytes = self.as_str();
+        let idx = crate::host_string::with_backing(|b| b.insert(bytes.as_bytes()))?;
+        let inner = self.heap_make_mut();
+        inner.rep = InternalRep::HostStr(idx);
+        Some(idx)
+    }
+
     // ── Accessors ──────────────────────────────────────────────
 
     /// Get the string representation.
@@ -815,6 +908,16 @@ impl Value {
                 InternalRep::Float(n) => SmallVec::from_slice(format_float(*n).as_bytes()),
                 InternalRep::Bool(b) => {
                     SmallVec::from_slice(if *b { b"1" } else { b"0" })
+                }
+                // lazy-string choke point（§6）：JsOnly 态的宿主串在此一处
+                // 物化（JsOnly ──首次字节操作──→ Dual）。强制物化清单
+                // （list/dict parse、string map/match/…、regexp、expr、
+                // binary、eval）无需显式代码——它们全经 as_str 取字节。
+                // 背板缺位（理论不可达：HostStr 只在有背板时构造）兜底空
+                // 串，绝不 panic。
+                InternalRep::HostStr(idx) => {
+                    crate::host_string::with_backing(|b| b.to_bytes(*idx))
+                        .unwrap_or_default()
                 }
                 InternalRep::None => SmallVec::new(),
             }
@@ -1177,6 +1280,12 @@ impl Value {
                 InternalRep::List(items) => items.is_empty(),
                 InternalRep::Dict(map) => map.is_empty(),
                 InternalRep::None => true,
+                // JsOnly 态：免物化问池（合法串的字节空 ⇔ 宿主形态空）。
+                // `if $x` 等 is_true 兜底路径依赖空串为假。
+                InternalRep::HostStr(idx) => crate::host_string::with_backing(
+                    |b| b.is_empty(*idx),
+                )
+                .unwrap_or(true),
                 _ => false,
             }
         }
@@ -1239,6 +1348,8 @@ impl Value {
         let inner = unsafe { self.heap_inner() };
         match &inner.rep {
             InternalRep::None => "string",
+            // 宿主串就是 string rep 的宿主原生形态——对外类型名不变。
+            InternalRep::HostStr(_) => "string",
             InternalRep::Int(_) => "int",
             InternalRep::Float(_) => "float",
             InternalRep::Bool(_) => "bool",

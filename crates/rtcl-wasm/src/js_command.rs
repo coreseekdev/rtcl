@@ -50,9 +50,11 @@ pub fn js_dispatch_cmd(_interp: &mut rtcl_core::Interp, args: &[Value]) -> rtcl_
             // __dynmodv2:*（v2 列表值单词协议）：wrapper 体 `{*}$args`
             // 直传——args[3..] 逐词入 JS 参数（\u0001/空白/全 Unicode
             // 保真）。__dynmod:*（v1 遗留形）保持 join 串拆分。
+            // lazy-string（§6 转发面）：HostStr 参数直取池串零转码
+            // （value_to_js 对原生值保持既有 String() 语义）。
             if cmd_name.starts_with("__dynmodv2:") {
                 for arg in &args[3..] {
-                    js_args.push(&JsValue::from_str(&arg.to_string()));
+                    js_args.push(&crate::js_string::value_to_js(arg));
                 }
             } else if cmd_name.starts_with("__dynmod:") && args.len() >= 3 {
                 let joined = args[args.len() - 1].to_string();
@@ -64,7 +66,7 @@ pub fn js_dispatch_cmd(_interp: &mut rtcl_core::Interp, args: &[Value]) -> rtcl_
                 }
             } else {
                 for arg in &args[3..] {
-                    js_args.push(&JsValue::from_str(&arg.to_string()));
+                    js_args.push(&crate::js_string::value_to_js(arg));
                 }
             }
 
@@ -76,34 +78,14 @@ pub fn js_dispatch_cmd(_interp: &mut rtcl_core::Interp, args: &[Value]) -> rtcl_
                 )
             })?;
 
-            js_value_to_result(cmd_name, result)
+            // lazy-string（§6）：JS 返回值免转码入池（HostStr 形态），
+            // 含孤立代理的串经 value_from_js 的入口校验有损兜底。
+            crate::js_string::value_from_js(&cmd_name, result)
         }
         None => Err(rtcl_core::error::Error::runtime(
             format!("No JS callback registered for '{}'", cmd_name),
             rtcl_core::error::ErrorCode::NotFound
         ))
-    }
-}
-
-/// Convert a JS return value to a Tcl value via `String()` (JS ToString semantics).
-fn js_value_to_result(cmd_name: String, result: JsValue) -> rtcl_core::error::Result<Value> {
-    match result.as_string() {
-        Some(s) => Ok(Value::from(s)),
-        None => {
-            let string_fn = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("String"))
-                .map_err(|e| rtcl_core::error::Error::runtime(
-                    format!("global String() not available: {:?}", e),
-                    rtcl_core::error::ErrorCode::Generic
-                ))?;
-            let s = js_sys::Function::from(string_fn)
-                .call1(&JsValue::NULL, &result)
-                .map_err(|e| rtcl_core::error::Error::runtime(
-                    format!("JS command '{}' returned an unstringifiable value: {}",
-                            cmd_name, js_error_message(&e)),
-                    rtcl_core::error::ErrorCode::Generic
-                ))?;
-            Ok(Value::from(s.as_string().unwrap_or_default()))
-        }
     }
 }
 

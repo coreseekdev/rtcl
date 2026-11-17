@@ -38,6 +38,32 @@ impl HostConsole for JsConsole {
         self.write(s)
     }
 
+    /// lazy-string 白名单（§6「puts 到 console」）：宿主形态值直取池串
+    /// 回调 JS——零转码（收益本体路径之一）。换行按 puts 契约在 JS 侧
+    /// 拼上（回调每次 puts 恰好一次、含行尾）。非宿主形态值返回 None
+    /// 让调用方回退到物化字符串路径。
+    fn write_value_stdout(
+        &self,
+        v: &rtcl_core::Value,
+        newline: bool,
+    ) -> Option<Result<(), String>> {
+        if v.host_str_handle().is_none() {
+            return None;
+        }
+        let s = js_sys::JsString::unchecked_from_js(crate::js_string::value_to_js(v));
+        let out: JsValue = if newline {
+            s.concat(&js_sys::JsString::from("\n")).into()
+        } else {
+            s.into()
+        };
+        Some(
+            self.callback
+                .call1(&JsValue::NULL, &out)
+                .map(|_| ())
+                .map_err(|e| js_error_message(&e)),
+        )
+    }
+
     // 与既有 wasm 行为一致：stderr 保持静默（原生 wasm 的 stdio 落点
     // 本身也是无声丢弃）。需要 stderr 分流时给 HostConsole 增补第二个
     // 回调即可。

@@ -1589,10 +1589,21 @@ impl ChannelTable {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// 对 stdio fd 做真实 lseek（不接管所有权：ManuallyDrop 防关闭 fd）。
+///
+/// unix 限定（lseek 语义）；非 unix（wasm32）：stdio 无 fd 可言——恒
+/// Unsupported（cmd_seek 的 seek_error 把 Unsupported 归一为 tclsh 的
+/// `invalid seek` 错误面）。此前无 cfg 门（713773f 引入）曾把 wasm32
+/// 构建整个打断。
+#[cfg(unix)]
 fn std_fd_seek(fd: i32, whence: io::SeekFrom) -> io::Result<u64> {
     use std::os::unix::io::FromRawFd;
     let mut f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
     f.seek(whence)
+}
+
+#[cfg(not(unix))]
+fn std_fd_seek(_fd: i32, _whence: io::SeekFrom) -> io::Result<u64> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "invalid seek"))
 }
 
 struct OsStdin {

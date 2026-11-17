@@ -3,6 +3,7 @@ mod fs_bridge;
 mod clock;
 mod output;
 pub mod jit_abi;
+pub mod js_string;
 
 use wasm_bindgen::prelude::*;
 use rtcl_core::Interp;
@@ -18,6 +19,10 @@ pub struct RtclHandle {
 impl RtclHandle {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Result<RtclHandle, JsValue> {
+        // lazy-string（§6）：进程级注册 JsStringBacking（幂等）——此后
+        // JS 起源串保持 externref 形态，首次字节语义才物化；rtcl-wasm
+        // 默认 on 的开关即此注册。
+        js_string::ensure_backing();
         let mut handle = RtclHandle {
             interp: Interp::new(),
             id: js_command::next_interp_id(),
@@ -49,7 +54,11 @@ impl RtclHandle {
     }
 
     /// Execute a Tcl script and return the result as a string.
-    pub fn exec(&mut self, code: &str) -> Result<String, JsValue> {
+    ///
+    /// 返回类型是 JsValue（内容恒为 string，JS 调用方面不变）：lazy-string
+    /// 的回传面——宿主起源串（HostStr）直取池中 JsString 零转码；原生串
+    /// 走既有 String() 转码。
+    pub fn exec(&mut self, code: &str) -> Result<JsValue, JsValue> {
         // ⑧ 重入哨兵：JIT wasm 调用进行中（JS 命令回调里再调 exec），
         // 外层 wasm 帧仍持有解释器——明确拒绝而非未定义行为。
         if rtcl_vm::interp::jit_call_in_flight() {
@@ -59,7 +68,7 @@ impl RtclHandle {
         }
         self.interp
             .eval(code)
-            .map(|v| v.to_string())
+            .map(|v| js_string::value_to_js(&v))
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
@@ -223,7 +232,14 @@ mod native_tests {
                 let n = args[1].as_int().unwrap_or(0);
                 Ok(Value::from_int(n * 2))
             });
-        assert_eq!(handle.exec("hj_double 21").expect("exec"), "42");
+        // Rust 宿主面走 interp().eval：exec 的返回已是 JsValue（JS 边界
+        // 面，非 wasm32 目标上 wasm-bindgen 的 cast 层不可用——0.2.129
+        // 的非 wasm stub 对 JsValue 构造一律 panic，与本 crate 其余
+        // js_sys 路径一致）。
+        assert_eq!(
+            handle.interp().eval("hj_double 21").expect("eval").to_string(),
+            "42"
+        );
     }
 
     #[test]
@@ -234,14 +250,19 @@ mod native_tests {
             .register_command("mk", |_interp, args| {
                 Ok(Value::from_str(&format!("native<{}>", args[1].as_str())))
             });
-        assert_eq!(handle.exec("mk x").expect("exec"), "native<x>");
+        assert_eq!(
+            handle.interp().eval("mk x").expect("eval").to_string(),
+            "native<x>"
+        );
         // _js_dispatch (registered internally) still present: host
         // bridges register hidden from `info commands` (tclsh's visible
         // :: surface is the canonical 101), so probe the tables.
         assert_eq!(
             handle
-                .exec("namespace which -command _js_dispatch")
-                .expect("exec"),
+                .interp()
+                .eval("namespace which -command _js_dispatch")
+                .expect("eval")
+                .to_string(),
             "::_js_dispatch"
         );
     }

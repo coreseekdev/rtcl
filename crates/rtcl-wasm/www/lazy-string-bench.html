@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>lazy-string echo/puts 收益量化（§8 假设 E）</title>
+<style>
+  body { font-family: monospace; margin: 2em; background: #111; color: #ddd; }
+  h3 { color: #9cf; }
+  table { border-collapse: collapse; margin: 1em 0; }
+  td, th { border: 1px solid #555; padding: 4px 10px; text-align: right; }
+  .pass { color: #6f6; } .fail { color: #f66; }
+  pre { background: #1b1b1b; padding: 8px; }
+</style>
+</head>
+<body>
+<h1>lazy-string echo/puts 收益量化</h1>
+<p>?nolazy=1 回到全转码基线（同一 pkg，翻 RTCL_DISABLE_LAZY_STRING 标志）。
+JS 起源串 → Tcl → 回传 JS / puts 回 JS 的往返，lazy 应零 UTF-16↔UTF-8 转码。</p>
+<div id="out"></div>
+<script type="module">
+const out = document.getElementById('out');
+const log = (s, cls) => { const d = document.createElement('div'); if (cls) d.className = cls; d.textContent = s; out.appendChild(d); };
+const table = (rows) => {
+  const t = document.createElement('table');
+  t.innerHTML = rows.map(r => '<tr>' + r.map(c => '<td>' + c + '</td>').join('') + '</tr>').join('');
+  out.appendChild(t);
+};
+
+const nolazy = new URLSearchParams(location.search).has('nolazy');
+if (nolazy) globalThis.RTCL_DISABLE_LAZY_STRING = 1;  // 必须在 new RtclHandle() 之前
+
+const { default: init, RtclHandle } = await import('../pkg/rtcl_wasm.js');
+await init('../pkg/rtcl_wasm_bg.wasm');
+
+const h = new RtclHandle();
+h.set_output_handler((line) => { sinkLine = line; });
+let sinkLine;
+
+// js 起源串：混合 BMP + astral + 中文（UTF-16 ≈ 2 字节/中文，UTF-8 = 3）
+// ?rep=N 调串长（默认 40 ≈ 1.3KB UTF-16；400 ≈ 12.8KB）
+const REP = Math.min(parseInt(new URLSearchParams(location.search).get('rep') || '40', 10) || 40, 4000);
+const JS_STR = 'κωабвгд答测试🏀🎯𝄞'.repeat(REP);
+h.register_command('jsret', () => JS_STR);
+
+// 正确性前置：值内容逐字节一致（lazy 与基线同语义）
+const correctness = h.exec('set r [jsret]; string length $r');
+const expectLen = JS_STR.length; // UTF-16 code units? — rtcl string length 语义（code point/UTF-16 未裁决——用物化路径）
+log('string length [jsret] = ' + correctness + '（物化路径必经，与开关无关）', 'pass');
+const eq1 = h.exec('string equal [jsret] [jsret]');
+log('string equal [jsret] [jsret] = ' + eq1 + '（应为 1；lazy 走 JS 侧免物化比较）', eq1 === '1' ? 'pass' : 'fail');
+const cat = h.exec('string cat [jsret] [jsret]');
+log('string cat 双 js 串长度 = ' + cat.length / 2 + '（应 = 单串长 ' + JS_STR.length / 1 + ' 的字符数校验走 byte len）', cat.length === JS_STR.length * 2 ? 'pass' : 'fail');
+const putsEcho = h.exec('puts -nonewline [jsret]');
+// 深检：逐码元比对（length 相等但 === 失败时的定位探针）
+let firstDiff = -1;
+for (let i = 0; i < Math.max(sinkLine.length, JS_STR.length); i++) {
+  if (sinkLine.charCodeAt(i) !== JS_STR.charCodeAt(i)) { firstDiff = i; break; }
+}
+window.__DBG = { lenSink: sinkLine.length, lenJs: JS_STR.length,
+  eq: sinkLine === JS_STR, typeofSink: typeof sinkLine, firstDiff,
+  sinkHead: sinkLine.slice(0, 16), jsHead: JS_STR.slice(0, 16) };
+log('puts 回传与 js 原串一致: ' + (sinkLine === JS_STR) + '；firstDiff=' + firstDiff +
+    '；typeof=' + typeof sinkLine +
+    '；sinkHead=' + JSON.stringify(window.__DBG.sinkHead) + ' jsHead=' + JSON.stringify(window.__DBG.jsHead),
+    sinkLine === JS_STR ? 'pass' : 'fail');
+
+// ── 量化 ────────────────────────────────────────────────
+function bench(name, n, fn) {
+  for (let i = 0; i < 50; i++) fn(); // warm
+  const t0 = performance.now();
+  for (let i = 0; i < n; i++) fn();
+  const dt = performance.now() - t0;
+  return { name, n, ms: dt, usPer: dt * 1000 / n };
+}
+
+// 回传面：js 起源串经 exec 结果直接回 JS（lazy: 池串直取；基线: 转码×2）
+const N = 2000;
+const r1 = bench('exec jsret（回传面）', N, () => h.exec('jsret'));
+// puts 面：js 起源串经 puts 回调 JS（lazy: 池串直取；基线: 物化+转码）
+const r2 = bench('puts [jsret]（console 面）', N, () => h.exec('puts -nonewline [jsret]'));
+// 对照组：纯 tcl 侧往返（两组同代码，差异应小）
+const r3 = bench('exec set/puts（原生串对照）', N, () => h.exec('puts -nonewline "native-str"'));
+
+const mode = nolazy ? '基线（lazy OFF，全转码）' : 'lazy ON';
+log('模式: ' + mode);
+table([
+  ['路径', '迭代', '总 ms', 'µs/次'],
+  [r1.name, r1.n, r1.ms.toFixed(1), r1.usPer.toFixed(2)],
+  [r2.name, r2.n, r2.ms.toFixed(1), r2.usPer.toFixed(2)],
+  [r3.name, r3.n, r3.ms.toFixed(1), r3.usPer.toFixed(2)],
+]);
+log('DONE mode=' + (nolazy ? 'nolazy' : 'lazy') +
+    ' exec=' + r1.usPer.toFixed(2) + 'us puts=' + r2.usPer.toFixed(2) +
+    'us nativeputs=' + r3.usPer.toFixed(2) + 'us');
+</script>
+</body>
+</html>

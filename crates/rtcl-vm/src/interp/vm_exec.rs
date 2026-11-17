@@ -929,6 +929,41 @@ pub(crate) fn run_bytecode_retire_hook(code: *const ByteCode) {
     }
 }
 
+/// M4「定义即编译」seam（Chez/Racket CS 模式）：named proc 定义点
+/// （`cmd_proc`，bytecode 编译之后）调用，JIT 引擎（若注册）就地发射
+/// 并缓存 wasm 模块——首调用免编译延迟；编译拒绝的体落负缓存，调用
+/// 面不再每调用重试 emit。单线程同步执行（rtcl 语义）；定义线程 =
+/// 执行线程。运行门与 Site A 调用门同构（fallback/epoch/
+/// bytecode_applicable）——只有后续调用可能真正执行的体才值得预编译，
+/// 门失败的体静默跳过（解释器兜底，零风险面）。
+pub type ProcPrecompileHook = fn(&mut Interp, &Rc<ByteCode>);
+
+static PROC_PRECOMPILE_HOOK: std::sync::OnceLock<Option<ProcPrecompileHook>> =
+    std::sync::OnceLock::new();
+
+/// Register the definition-point precompile hook.  First call wins
+/// (`OnceLock` — the engine installs at process start); with no hook the
+/// interpreter behaves exactly as before (zero-change default).
+pub fn set_proc_precompile_hook(hook: Option<ProcPrecompileHook>) {
+    let _ = PROC_PRECOMPILE_HOOK.set(hook);
+}
+
+pub(crate) fn run_proc_precompile_hook(interp: &mut Interp, code: &Rc<ByteCode>) {
+    if code.fallback
+        || code.epoch != interp.tier1_epoch
+        || !bytecode_applicable(interp)
+        // 预置层（stdlib/ui.tcl）排除：每进程重放的同批定义，预发射是
+        // 纯启动税（见 in_rt_prelude 字段注）。字段在 Interp 构造器与
+        // 两个加载器之外无写点。
+        || interp.in_rt_prelude
+    {
+        return;
+    }
+    if let Some(Some(f)) = PROC_PRECOMPILE_HOOK.get() {
+        f(interp, code);
+    }
+}
+
 /// Site A hook probe: returns the JIT executor's result when one is
 /// installed and it accepts this body, `None` to run `exec_bytecode`.
 pub(crate) fn proc_body_executor(

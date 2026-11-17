@@ -29,7 +29,7 @@ pub(crate) mod dbgtrace;
 pub(crate) use util::{split_array_ref, glob_match};
 pub(crate) use varmap::{VarMap, VarSet};
 
-pub use vm_exec::{add_interp_teardown_hook, set_bytecode_disabled, set_bytecode_retire_hook, set_interp_teardown_hook, set_proc_body_executor, ByteCodeRetireHook, InterpTeardownHook, ProcBodyExecutor};
+pub use vm_exec::{add_interp_teardown_hook, set_bytecode_disabled, set_bytecode_retire_hook, set_interp_teardown_hook, set_proc_body_executor, set_proc_precompile_hook, ByteCodeRetireHook, InterpTeardownHook, ProcBodyExecutor, ProcPrecompileHook};
 
 use crate::command::{CommandFunc, CommandCategory, CommandMeta};
 use crate::value::Value;
@@ -497,6 +497,14 @@ pub struct Interp {
     /// skipped by liveness, duplicates resolve to the LAST occurrence.
     /// Seeded at init with tclsh 8.6.17's registration sequence.
     pub(crate) command_order: Vec<String>,
+    /// 运行时预置层加载中（内嵌 stdlib.tcl / ui.tcl 的 eval 期间置位）。
+    /// M4「定义即编译」的排除面：预置层是 rtcl 的 rumble 层对应物
+    /// （Racket CS 的 runtime 层构建期编译、不随进程重编）——每进程
+    /// `Interp::new` 都重放同一批 proc 定义，预发射只产生纯启动税
+    /// （实测 ~2-3ms/进程，29 个 stdlib proc × emit），且 stdlib proc
+    /// 极少是用户负载的热点；保持它们的调用时编译（既有路径）。用户
+    /// 脚本（含 source 的用户库）不受影响——定义即编译照常。
+    pub(crate) in_rt_prelude: bool,
     /// Same log for the global var table (`info vars`/`info globals`
     /// and global-scope `array names` — element keys `arr(k)` ride the
     /// same log and are filtered per surface).  Frame tables keep their
@@ -1109,6 +1117,7 @@ impl Interp {
             reflected: HashMap::new(),
             #[cfg(feature = "io")]
             transforms: HashMap::new(),
+            in_rt_prelude: false,
         };
         commands::oo::init(&mut interp);
         interp.ensure_ns_path("::zlib");
@@ -1124,9 +1133,14 @@ impl Interp {
     }
 
     /// Load the Tcl-level standard library (embedded at compile time).
+    /// M4：加载期置 [`Interp::in_rt_prelude`]——预置层 proc 定义不触发
+    /// JIT 定义点预编译（rumble 层口径，见字段注）。
     fn load_stdlib(&mut self) {
         const STDLIB_TCL: &str = include_str!("../stdlib.tcl");
-        if let Err(e) = self.eval(STDLIB_TCL) {
+        self.in_rt_prelude = true;
+        let r = self.eval(STDLIB_TCL);
+        self.in_rt_prelude = false;
+        if let Err(e) = r {
             panic!("stdlib.tcl failed to load: {e}");
         }
     }
@@ -1136,7 +1150,11 @@ impl Interp {
     /// 调用时才解析 `_ui`，所以注册可以晚于加载。
     pub fn load_ui(&mut self) -> crate::error::Result<()> {
         const UI_TCL: &str = include_str!("../ui.tcl");
-        self.eval(UI_TCL).map(|_| ())
+        // ui.tcl 同属预置层（见 in_rt_prelude 字段注）——同口径排除。
+        self.in_rt_prelude = true;
+        let r = self.eval(UI_TCL);
+        self.in_rt_prelude = false;
+        r.map(|_| ())
     }
 
     /// 加载 http::* 词表层（数据通道的 wasm 客户端，docs/ROADMAP.md

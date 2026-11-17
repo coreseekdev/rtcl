@@ -138,6 +138,11 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         super::super::vm_exec::compile_proc_body(&defaults, &body, interp.tier1_epoch, &shadows);
     if let Some(code) = &compiled {
         interp.const_pool_insert(code);
+        // M4「定义即编译」：JIT 引擎（若注册）就地发射 wasm 模块并缓存
+        // （拒绝落负缓存）——首调用零编译延迟。门在钩子运行侧
+        // （fallback/epoch/bytecode_applicable 与 Site A 同构）；无钩子
+        // 注册时此处零开销（解释器构建零变化）。
+        super::super::vm_exec::run_proc_precompile_hook(interp, code);
     }
     let proc_def = ProcDef {
         params: Rc::new(defaults),

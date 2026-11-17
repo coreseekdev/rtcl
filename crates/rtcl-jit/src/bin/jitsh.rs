@@ -16,6 +16,9 @@ fn main() {
         return;
     }
     // M2 seam：注册 proc-body JIT 钩子（jitsh 是 JIT 引擎执行体）。
+    // M4「定义即编译」默认档（env RTCL_JIT_AUTOCOMPILE=0 可关——逃生口
+    // 优先于本默认；judge/battery/fuzz 全门禁经 jitsh 走此路径）。
+    rtcl_jit::proc_exec::set_autocompile(true);
     rtcl_jit::proc_exec::install();
     let mut args = std::env::args().skip(1);
     let file = match (args.next().as_deref(), args.next()) {
@@ -41,6 +44,7 @@ fn main() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error: cannot read file '{}': {}", file, e);
+            rtcl_jit::proc_exec::dump_autocompile_stats();
             std::process::exit(1);
         }
     };
@@ -55,6 +59,7 @@ fn main() {
                 let e = interp.decode_toplevel_flow(e);
                 if e.is_exit() {
                     let code = e.message_text().trim().parse::<i32>().unwrap_or(0);
+                    rtcl_jit::proc_exec::dump_autocompile_stats();
                     std::process::exit(code);
                 }
                 if e.is_return() {
@@ -62,6 +67,7 @@ fn main() {
                 }
                 let report = interp.error_report(&e, &file);
                 eprintln!("{}", report);
+                rtcl_jit::proc_exec::dump_autocompile_stats();
                 std::process::exit(1);
             }
         }
@@ -76,6 +82,7 @@ fn main() {
             2 => {}
             6 => {
                 // exit N：以 N 退出且无输出（tclsh 对齐）。
+                rtcl_jit::proc_exec::dump_autocompile_stats();
                 std::process::exit(exit_code.unwrap_or(0));
             }
             _ => {
@@ -87,6 +94,7 @@ fn main() {
                         eprintln!("{}", r);
                     }
                 }
+                rtcl_jit::proc_exec::dump_autocompile_stats();
                 std::process::exit(1);
             }
         },

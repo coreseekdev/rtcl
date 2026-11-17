@@ -3,7 +3,7 @@
 pub(crate) mod bignum;
 pub mod expr;
 pub(crate) mod expr_check;
-pub(crate) mod expr_funcs;
-pub(crate) mod expr_ops;
+pub mod expr_funcs;
+pub mod expr_ops;
 
 pub use expr::eval_expr;

@@ -48,7 +48,7 @@ pub(crate) fn bool_from_string(s: &str) -> Option<bool> {
 /// must be a boolean word or unambiguous abbreviation. Anything else is an
 /// error, as in `while {$x}` with x="foo".
 #[inline]
-pub(crate) fn strict_bool(v: &Value) -> Result<bool> {
+pub fn strict_bool(v: &Value) -> Result<bool> {
     if let Some(i) = v.as_int() {
         return Ok(i != 0);
     }

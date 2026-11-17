@@ -17,7 +17,7 @@ use super::bignum::{self, IntRep};
 use super::expr_funcs;
 
 /// Convert `Value` to i64, returning an error if not numeric.
-pub(crate) fn as_int_val(v: &Value) -> Result<i64> {
+pub fn as_int_val(v: &Value) -> Result<i64> {
     v.as_int()
         .or_else(|| v.as_float().map(|f| f as i64))
         .ok_or_else(|| Error::type_mismatch("integer", v.as_str()))
@@ -41,7 +41,7 @@ fn pair_operand_error(left: &Value, right: &Value, op: &str) -> Error {
     operand_error(left.as_str().is_empty() || right.as_str().is_empty(), op)
 }
 
-pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Value> {
+pub fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Value> {
     use super::bignum::{floor_div as big_div, int_rep, to_value};
     use num_bigint::BigInt;
     // Immediate×immediate: untag, checked arithmetic, retag — no rep
@@ -195,7 +195,7 @@ pub(crate) fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Val
 }
 
 /// `%` with Tcl floor semantics; bignum operands stay exact.
-pub(crate) fn int_mod(left: &Value, right: &Value) -> Result<Value> {
+pub fn int_mod(left: &Value, right: &Value) -> Result<Value> {
     use super::bignum::{floor_mod as big_mod, int_rep, to_value};
     if let (Some(ia), Some(ib)) = (int_rep(left), int_rep(right)) {
         if ib.is_zero() {
@@ -227,7 +227,7 @@ pub(crate) fn int_mod(left: &Value, right: &Value) -> Result<Value> {
 }
 
 /// One `<<`/`>>` operation with Tcl's bignum-widening semantics.
-pub(crate) fn int_shift(left: &Value, right: &Value, shl: bool) -> Result<Value> {
+pub fn int_shift(left: &Value, right: &Value, shl: bool) -> Result<Value> {
     use super::bignum::{int_rep, to_value};
     use num_traits::Signed;
     let op = if shl { "<<" } else { ">>" };
@@ -307,7 +307,7 @@ pub(crate) fn int_shift(left: &Value, right: &Value, shl: bool) -> Result<Value>
 }
 
 /// `&`, `|`, `^` — exact on bignum operands, error (not wrap) on floats.
-pub(crate) fn int_bitop(left: &Value, right: &Value, op: char) -> Result<Value> {
+pub fn int_bitop(left: &Value, right: &Value, op: char) -> Result<Value> {
     if let (Some(ia), Some(ib)) = (super::bignum::int_rep(left), super::bignum::int_rep(right)) {
         // i64×i64 never overflows a bitwise op — no bignum conversion on
         // the common path (this used to widen BOTH operands on every
@@ -404,18 +404,18 @@ pub(crate) fn cmp_bool(left: &Value, right: &Value, cc: u8) -> bool {
 /// `==` — exact numeric comparison when both operands are numeric
 /// (int pairs compare as i64, no EPSILON tolerance); string comparison
 /// otherwise.  NaN compares unequal to everything (expr-22.9).
-pub(crate) fn op_eq(left: &Value, right: &Value) -> Value {
+pub fn op_eq(left: &Value, right: &Value) -> Value {
     Value::from_bool(cmp_bool(left, right, 4))
 }
 
 /// `!=` — negation of [`op_eq`]'s comparison, with NaN unequal to all.
-pub(crate) fn op_ne(left: &Value, right: &Value) -> Value {
+pub fn op_ne(left: &Value, right: &Value) -> Value {
     Value::from_bool(cmp_bool(left, right, 5))
 }
 
 /// `<`, `>`, `<=`, `>=` — numeric when both operands are numeric,
 /// string comparison otherwise; every comparison is false on NaN.
-pub(crate) fn op_rel(left: &Value, right: &Value, op: &str) -> Value {
+pub fn op_rel(left: &Value, right: &Value, op: &str) -> Value {
     let cc = match op {
         "<" => 0,
         ">" => 1,
@@ -427,18 +427,18 @@ pub(crate) fn op_rel(left: &Value, right: &Value, op: &str) -> Value {
 }
 
 /// `eq` / `ne` — pure string comparison.
-pub(crate) fn op_str_eq(left: &Value, right: &Value) -> Value {
+pub fn op_str_eq(left: &Value, right: &Value) -> Value {
     Value::from_bool(left.as_str() == right.as_str())
 }
 
-pub(crate) fn op_str_ne(left: &Value, right: &Value) -> Value {
+pub fn op_str_ne(left: &Value, right: &Value) -> Value {
     Value::from_bool(left.as_str() != right.as_str())
 }
 
 /// `**` — Tcl: two integer operands use integer exponentiation (units
 /// short-circuit, negative exponent yields 0, ≥2^28-bit results error);
 /// any float computes in f64.
-pub(crate) fn op_pow(base: Value, exp: Value) -> Result<Value> {
+pub fn op_pow(base: Value, exp: Value) -> Result<Value> {
     if let (Some(a), Some(b)) = (base.as_int(), exp.as_int()) {
         return match a {
             // Units short-circuit before any range check — tclsh
@@ -482,13 +482,13 @@ pub(crate) fn op_pow(base: Value, exp: Value) -> Result<Value> {
 }
 
 /// `!` — strict-boolean operand, integral result.
-pub(crate) fn op_not(val: &Value) -> Result<Value> {
+pub fn op_not(val: &Value) -> Result<Value> {
     Ok(Value::from_bool(!expr_funcs::not_operand(val)?))
 }
 
 /// `~` — two's-complement complement, exact on bignums
 /// (~2^63 is -9223372036854775809).
-pub(crate) fn op_bitnot(val: &Value) -> Result<Value> {
+pub fn op_bitnot(val: &Value) -> Result<Value> {
     if let Some(rep) = bignum::int_rep(val) {
         return Ok(bignum::to_value(bignum::IntRep::Big(
             -rep.to_big() - num_bigint::BigInt::from(1),
@@ -500,7 +500,7 @@ pub(crate) fn op_bitnot(val: &Value) -> Result<Value> {
 
 /// Unary `-` — integer operands stay integers (bignum-exact on
 /// overflow), float operands stay floats.
-pub(crate) fn op_neg(val: &Value) -> Result<Value> {
+pub fn op_neg(val: &Value) -> Result<Value> {
     if let Some(rep) = bignum::int_rep(val) {
         return Ok(match rep {
             bignum::IntRep::I64(i) => match i.checked_neg() {

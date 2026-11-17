@@ -1301,45 +1301,66 @@ impl Host {
 
     /// binary_op：宿主完整 Tcl 语义（§3）——`types::eval_expr` 原文路由。
     fn binary_op(&mut self, op: i32, a: i64, b: i64) -> Result<Value, Error> {
-        // 表达式可含命令替换（eval_expr 求值 [..]）——置位。
+        // 表达式可含命令替换（eval_expr 求值 [..]）——置位。（直呼
+        // expr_ops 不跑命令，置位是保守态——既有 take_var_fast 守卫集
+        // 维持激活，与旧文本路径同世界。）
         self.commands_ran = true;
         let kind = op;
         let va = self.value_of(a);
         let vb = self.value_of(b);
-        let sa = expr_quote(va.as_str());
-        let sb = expr_quote(vb.as_str());
-        let expr = match kind {
-            x if x == BinOp::Add as i32 => format!("{sa} + {sb}"),
-            x if x == BinOp::Sub as i32 => format!("{sa} - {sb}"),
-            x if x == BinOp::Mul as i32 => format!("{sa} * {sb}"),
-            x if x == BinOp::Div as i32 => format!("{sa} / {sb}"),
-            x if x == BinOp::Mod as i32 => format!("{sa} % {sb}"),
-            x if x == BinOp::Pow as i32 => format!("{sa} ** {sb}"),
-            // -(sa)：操作数可能是负数字面量（裸写）——"- -5" 形态的
-            // 拼接会破坏括号子表达式的字面量结构（f002484：NEG 慢路径
-            // 的 bignum 宽化 "--4611…" 非法词）。
-            x if x == BinOp::Neg as i32 => format!("-({sa})"),
-            x if x == BinOp::Not as i32 => format!("!{sa}"),
-            x if x == BinOp::BitNot as i32 => format!("~{sa}"),
-            x if x == BinOp::BitAnd as i32 => format!("{sa} & {sb}"),
-            x if x == BinOp::BitOr as i32 => format!("{sa} | {sb}"),
-            x if x == BinOp::BitXor as i32 => format!("{sa} ^ {sb}"),
-            x if x == BinOp::Shl as i32 => format!("{sa} << {sb}"),
-            x if x == BinOp::Shr as i32 => format!("{sa} >> {sb}"),
-            x if x == BinOp::Eq as i32 => format!("{sa} == {sb}"),
-            x if x == BinOp::Ne as i32 => format!("{sa} != {sb}"),
-            x if x == BinOp::Lt as i32 => format!("{sa} < {sb}"),
-            x if x == BinOp::Gt as i32 => format!("{sa} > {sb}"),
-            x if x == BinOp::Le as i32 => format!("{sa} <= {sb}"),
-            x if x == BinOp::Ge as i32 => format!("{sa} >= {sb}"),
-            x if x == BinOp::StrEq as i32 => format!("{sa} eq {sb}"),
-            x if x == BinOp::StrNe as i32 => format!("{sa} ne {sb}"),
-            x if x == BinOp::And as i32 => format!("{sa} && {sb}"),
-            x if x == BinOp::Or as i32 => format!("{sa} || {sb}"),
-            _ => return Err(Error::Msg("jit: bad binary_op".into())),
-        };
-        let _ = HARNESS_MAX;
-        self.irp().eval_expr(&expr)
+        // 慢路径直呼 expr_ops（rtcl_vm::types::expr_ops——解释器 expr
+        // 解析器与 vm_exec 字节码共用的单点语义源：「one implementation,
+        // two consumers」，JIT 宿主回退是第三个消费者）。旧实现把操作
+        // 数 expr_quote 进文本再 eval_expr 全量重解析——每次宿主算术
+        // 一轮 ExprParser（Vec<char> 物化 + 词法 + 递归下降），
+        // oo_bench2 画像 ~25% cycles；语义等价由「解析器逐层就是这些
+        // 函数的薄调用」构造保证（And/Or 短路两侧均为已求值字面量，
+        // 跳过/求值的可观察面 = strict_bool 错误，直呼实现同构复刻）。
+        use rtcl_vm::types::expr_ops as eo;
+        use rtcl_vm::types::expr_funcs::strict_bool;
+        match kind {
+            x if x == BinOp::Add as i32 => eo::numeric_binop(&va, &vb, '+'),
+            x if x == BinOp::Sub as i32 => eo::numeric_binop(&va, &vb, '-'),
+            x if x == BinOp::Mul as i32 => eo::numeric_binop(&va, &vb, '*'),
+            x if x == BinOp::Div as i32 => eo::numeric_binop(&va, &vb, '/'),
+            x if x == BinOp::Mod as i32 => eo::int_mod(&va, &vb),
+            x if x == BinOp::Pow as i32 => eo::op_pow(va, vb),
+            // -(sa)：旧文本路径对负字面量的保护（"- -5"）在直呼形态下
+            // 不存在——op_neg 直接作用于已求值操作数。
+            x if x == BinOp::Neg as i32 => eo::op_neg(&va),
+            x if x == BinOp::Not as i32 => eo::op_not(&va),
+            x if x == BinOp::BitNot as i32 => eo::op_bitnot(&va),
+            x if x == BinOp::BitAnd as i32 => eo::int_bitop(&va, &vb, '&'),
+            x if x == BinOp::BitOr as i32 => eo::int_bitop(&va, &vb, '|'),
+            x if x == BinOp::BitXor as i32 => eo::int_bitop(&va, &vb, '^'),
+            x if x == BinOp::Shl as i32 => eo::int_shift(&va, &vb, true),
+            x if x == BinOp::Shr as i32 => eo::int_shift(&va, &vb, false),
+            x if x == BinOp::Eq as i32 => Ok(eo::op_eq(&va, &vb)),
+            x if x == BinOp::Ne as i32 => Ok(eo::op_ne(&va, &vb)),
+            x if x == BinOp::Lt as i32 => Ok(eo::op_rel(&va, &vb, "<")),
+            x if x == BinOp::Gt as i32 => Ok(eo::op_rel(&va, &vb, ">")),
+            x if x == BinOp::Le as i32 => Ok(eo::op_rel(&va, &vb, "<=")),
+            x if x == BinOp::Ge as i32 => Ok(eo::op_rel(&va, &vb, ">=")),
+            x if x == BinOp::StrEq as i32 => Ok(eo::op_str_eq(&va, &vb)),
+            x if x == BinOp::StrNe as i32 => Ok(eo::op_str_ne(&va, &vb)),
+            // &&/||：两侧均已求值（wasm 局部），短路的可观察面只剩
+            // strict_bool 错误——左假/左真即右不查，解析器同构。
+            x if x == BinOp::And as i32 => {
+                if !strict_bool(&va)? {
+                    Ok(Value::from_bool(false))
+                } else {
+                    Ok(Value::from_bool(strict_bool(&vb)?))
+                }
+            }
+            x if x == BinOp::Or as i32 => {
+                if strict_bool(&va)? {
+                    Ok(Value::from_bool(true))
+                } else {
+                    Ok(Value::from_bool(strict_bool(&vb)?))
+                }
+            }
+            _ => Err(Error::Msg("jit: bad binary_op".into())),
+        }
     }
 
     /// strict_bool 复刻（expr_funcs::strict_bool 的公共 API 重实现：

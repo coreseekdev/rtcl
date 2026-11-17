@@ -435,6 +435,67 @@ jitsh 单文件单元里中途 add 由 bump/回边比对接住）。
   proc 调用全协议 ~1.4μs vs interp ~200ns）——独立于 slot 缓存，
   reopen 归「fast 调用协议」专项。
 
+## 10undevicesimus. 2026-11-17 JIT M4 定义即编译——用户 proc 定义点覆盖 92.7%、emit p50 19-64μs、启动税清零（perf/wave2 @ 0bf0564）
+
+里程碑表重定位版落地（docs/JIT-WASM-GC.md §9 M4 / §7.4 Chez/Racket
+CS 模式）：per-lambda 懒编译/tier-up 阈值已证伪降级，「默认 proc 定
+义即编译 + 解释器兜底」转正。热点计数仅驱动可选画像增强重编译——
+本节未做（reopen 线索，非默认路径）。
+
+### 现状盘点定谳（动手前核实）
+
+- rtcl-vm 字节码：proc 体**定义点编译早已存在**（cmd_proc →
+  compile_proc_body 无条件 + M3 skip_folds；apply lambda 调用点
+  memo；OO 方法体首调 memo——编译输入含调用期 owner variable 快照，
+  定义期不可得，维持现状记 NYI 保留项）。
+- JIT wasm 发射：**首调用**才发生（exec_proc_body → fast_try →
+  compile_cached），且拒绝不缓存负项——拒绝体每次调用重跑 emit 管
+  线到拒绝点。M4 的实际缺口 = 定义点发射 + 负缓存 + 预算护栏。
+
+### 逐件（b0044ba / 0bf0564）
+
+- 件1 负缓存：PROC_MODULES 值 Option 化——emit 对固定输入决定性，
+  拒绝落缓存后调用面零重试（问号传播语义不变=留解释器）；cap 64→
+  1024（预填条目在 stdlib 级定义量下会被 64 cap 冲掉）。
+- 件2 定义点预编译：rtcl-vm 新钩子（运行门与 Site A 同构：
+  fallback/epoch/bytecode_applicable）+ cmd_proc 定义点调用；jitsh
+  默认 on（RTCL_JIT_AUTOCOMPILE env 显式值优先=逃生口；rtcl-cli
+  --features jit/库默认 off——灰度先行，bench 证伪风险后再翻默认）；
+  同步编译 + PRECOMPILE_OPS_LIMIT=4096 op 护栏（PLT_CS_COMPILE_
+  LIMIT 的 rtcl 版；超限体保持调用时编译，语义零变化）。统计面
+  RTCL_JIT_AUTOCOMPILE_STATS=1（覆盖面/耗时分布/拒绝原因，exit+
+  teardown 双挂点一次性 dump）。
+- 件2 内的修正（启动税实测消减）：stdlib.tcl/ui.tcl 是每进程重放
+  的 rumble 层对应物——in_rt_prelude 排除后无预发射。无排除时 29
+  个 stdlib proc × emit = **+2-3ms/进程启动税**（最小脚本 10ms 级
+  进程被拖到 0.80×）；排除后启动双侧中位 10ms 持平。教训：Racket
+  CS 的「默认全编译」不含运行时层重编——rtcl 的内嵌预置层同口径。
+
+### 验收与数字
+
+- 门禁：jit_battery 52/52、judge 双引擎 88/88×2、cargo test
+  --workspace 全绿、fuzz 400 seed7 0 分歧（预置层排除后复跑）。
+- 覆盖面（定义即编译，jitsh + STATS）：judge corpus 用户 proc
+  **396/427=92.7%**、battery 10/10、jit_proc_probes 18/19、bench
+  cases 1/1；预算跳过 0（1500 语句探针正确落护栏）。拒绝 NYI 清单
+  （31 例）：array-element 变量引用为主（15）、stack discipline 特
+  形（2）、stack depth>128（1）——拒绝=留解释器，行为零差异（门禁
+  逐字节复核）。
+- 编译耗时分布（定义点 emit/proc）：p50 19-64μs、p90 31-120μs、
+  max 464μs——**全在 <1ms/proc 预算内**（§7.2 核算成立）。
+- 基准（jitsh 交替轮 best-of-5/best-of-10 vs 基线二进制交叉）：
+  六基准 + oo2/oovars 噪声带内（list_ops 10/10、var_incr 13/12、
+  arith_loop 12/14、oo2 99/99 ms）；负缓存收益探针（拒绝 proc
+  200k 调用）单带内（基线每调用 emit 重试 ~50-250ns）。proc 密集
+  负载受益为结构性（首调零发射延迟移到定义点），稳态 wall 无可见
+  变化（编译成本摊薄，符合预期）。
+
+### 余项/reopen
+
+- 热点计数画像增强重编译（M4 后半，可选非默认）未做；OO 方法体定
+  义点编译（编译输入调用期状态）；array-element 引用进 JIT 子集；
+  RTCL_JIT_AUTOCOMPILE 在 rtcl-cli 面翻默认（bench 证伪后）。
+
 ## 10duodevicesimus. 2026-11-17 fast 调用协议专项——oo_bench2 3.40×→1.26× / oovars 4.11×→1.89× tclsh（perf/wave2）
 
 M2 验收钉死的实质回归（「jitsh 下 oo_bench2 3.32× / oovars 3.70×

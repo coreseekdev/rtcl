@@ -546,7 +546,7 @@ interp / jit，`judge/run.sh --engine jit`）全绿为门。新增 probe：
 | M1' | ABI v2 整体切换 + Int 快车道 + fuel/epoch globals + emit.rs 按 §7.3 拆分为 nanopass 链 | 修订原 M1；步数预算缺口（TODO）在此补齐 |
 | M2 | proc body + 原语；slot 单态 int 缓存 | 不变 |
 | M3 | epoch 接 Tier1 bump 信号 | M1' 已埋线，此处接线 |
-| M4 | **重新定位**：默认 proc 定义即编译（Chez/Racket CS 模式，§7.4）；热点计数仅驱动可选的画像增强重编译，不作默认路径 | 修订：原「~50 阈值 tier-up」降级——per-lambda 懒编译已被 Racket CS 证伪 |
+| M4 | **重新定位**：默认 proc 定义即编译（Chez/Racket CS 模式，§7.4）；热点计数仅驱动可选的画像增强重编译，不作默认路径 | ✅ 定义点部分已完成（perf/wave2 0bf0564：定义点预编译 + 预置层排除 + 拒绝负缓存，HANDOFF 10undevicesimus）；画像增强重编译为可选余项 |
 | C-lazy | lazy-string（§6） | 新增；**独立于 JIT，可先行** |
 | C-float | jit-float-lane（§5） | 新增；依赖 ABI v2，默认 off |
 | C-str | js-string-builtins 两切口（§6） | 新增可选；依赖 StringMode 检测 |

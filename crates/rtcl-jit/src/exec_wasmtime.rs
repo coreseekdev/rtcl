@@ -356,6 +356,20 @@ pub(crate) fn register_wasmtime_abi(
     let instance = linker
         .instantiate(&mut *store, wmodule)
         .expect("wasmtime: instantiate");
+    // ABI 版本比对（docs/ABI-OPT-NOTES.md §3a）：本注册体为顶层与
+    // proc 池路径共用，两处实例化都在此拦截。in-process 发射恒匹配；
+    // 真实靶 = 跨构建/跨引擎产物消费方。fast 驱动不做检查（同理）。
+    {
+        let ver: TypedFunc<(), i32> = instance
+            .get_typed_func(&mut *store, "rtcl_abi_version")
+            .expect("wasmtime: no rtcl_abi_version export (pre-versioning artifact)");
+        let v = ver
+            .call(&mut *store, ())
+            .expect("wasmtime: rtcl_abi_version call");
+        if let Err(msg) = crate::abi::abi_version_compatible(v) {
+            panic!("jit: {msg}");
+        }
+    }
     (instance, (g_fuel, g_epoch, g_caching))
 }
 

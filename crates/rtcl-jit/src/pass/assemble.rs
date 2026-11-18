@@ -587,6 +587,12 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
         funcs.function(ty::PROC_IMPL);
         funcs.function(ty::PROC_MAIN);
     }
+    // ABI 版本 export（docs/ABI-OPT-NOTES.md §3a）：局部段末追加，
+    // 不触碰 import::RUN/FAST_IMPL 索引；复用 ty::RUN 签名 () -> i32。
+    // 索引：常规 = 28（RUN 27 之后）；fast = 30（RUN/fast_impl/
+    // proc_main 之后）。
+    let ver_idx = import::COUNT + 1 + if has_fast { 2 } else { 0 };
+    funcs.function(ty::RUN);
 
     let mut globals = GlobalSection::new();
     // 导入 global 数：常规 3（fuel/epoch/caching）→ cur_site=3；fast 7
@@ -600,6 +606,7 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
 
     let mut exports = ExportSection::new();
     exports.export("run", ExportKind::Func, import::RUN);
+    exports.export("rtcl_abi_version", ExportKind::Func, ver_idx);
     exports.export("cur_site", ExportKind::Global, if has_fast { 7 } else { 3 });
     exports.export("memory", ExportKind::Memory, 0);
     if has_fast {
@@ -626,6 +633,12 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
     if let Some(fw) = &fast_wrap {
         code_section.function(fw);
     }
+    // 版本函数体（与函数段追加序一致——局部段末）：const 返回
+    // ABI_VERSION，无参无 local。
+    let mut ver_body = Function::new(vec![]);
+    ver_body.instruction(&Instruction::I32Const(abi::ABI_VERSION));
+    ver_body.instruction(&Instruction::End);
+    code_section.function(&ver_body);
 
     let mut module = Module::new();
     module.section(&types);

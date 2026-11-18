@@ -9,6 +9,22 @@ use wasm_bindgen::prelude::*;
 use rtcl_core::Interp;
 use rtcl_vm::interp::commands::dynmod::DynAbi;
 
+/// ABI 版本 export（wasi 蓝本的版本协商模式移植，docs/ABI-OPT-NOTES.md
+/// §3a）。pkg 模块与 `www/rtcl-worker.js` 的配对面：worker 加载后
+/// 比对，不匹配 → init-error——防 HTTP 缓存旧模块 + 新 worker 的
+/// 错配（`?v=` 参数只是缓解，这是硬校验）。
+///
+/// 编码约定与 `rtcl_jit::abi::ABI_VERSION` 同款：低 16 位 minor /
+/// 高 16 位 major（`v2.0 = 0x0002_0000`）。pkg 的 wasm-bindgen 面与
+/// JIT 发射面同仓同发布，取单一版本空间（同值常量，独立声明避免
+/// 引擎依赖——jit_abi.rs 的 ERR_SENTINEL 同款处理）。
+pub const RTCL_ABI_VERSION: u32 = (2 << 16) | 0;
+
+#[wasm_bindgen]
+pub fn rtcl_abi_version() -> u32 {
+    RTCL_ABI_VERSION
+}
+
 #[wasm_bindgen]
 pub struct RtclHandle {
     interp: Interp,

@@ -35,8 +35,13 @@ function assertThrows(fn, substr, label) {
 }
 
 async function test() {
-    const { default: init, RtclHandle } = await import("./pkg/rtcl_wasm.js");
+    const { default: init, RtclHandle, rtcl_abi_version } = await import("./pkg/rtcl_wasm.js");
     await init({ module_or_path: readFileSync(join(__dirname, "pkg/rtcl_wasm_bg.wasm")) });
+
+    // ── ABI 版本 export（docs/ABI-OPT-NOTES.md §3a）────────────────────
+    // worker 加载链同款校验：pkg 与宿主配对面，严格相等 v2.0。
+    assertEq(typeof rtcl_abi_version, "function", "abi: rtcl_abi_version exported");
+    assertEq(rtcl_abi_version(), 0x00020000, "abi: version = v2.0 (0x00020000)");
 
     // ── Regression: core exec ────────────────────────────────────────────
     const rtcl = new RtclHandle();

@@ -14,9 +14,9 @@ if (typeof postMessage !== 'function') {
 //
 // 版本参数（页面 goto 带 ?v=）穿透 HTTP/模块缓存层——pkg 内容变更
 // 时同 URL 旧缓存可能钉住 import。动态 import（模块 worker 支持 TLA）。
-const params = new URLSearchParams(self.location?.search || '');
+const params = new URLSearchParams(globalThis.self?.location?.search || '');
 const PKG_V = params.get('v') || '';
-const { default: init, RtclHandle } = await import('../pkg/rtcl_wasm.js' + (PKG_V ? '?v=' + PKG_V : ''));
+const { default: init, RtclHandle, rtcl_abi_version } = await import('../pkg/rtcl_wasm.js' + (PKG_V ? '?v=' + PKG_V : ''));
 import { makeRegexpMod } from './regexpmod.js';
 import { makeEncodingMod } from './encodingmod.js';
 // spencermod：Spencer 全集侧模块装载胶水 + ::regexp/::regsub wrapper
@@ -420,7 +420,24 @@ if (typeof globalThis.__recv !== 'function') {
 
 (async () => {
   try {
-    await init();
+    // node worker_threads 链（装载护栏，真机以浏览器为准）：wasm-bindgen
+    // 默认走 fetch(import.meta.url)——node 无 HTTP 面直接读字节。
+    if (typeof process !== 'undefined' && process.versions?.node) {
+      const { readFileSync } = await import('node:fs');
+      await init({ module_or_path: readFileSync(new URL('../pkg/rtcl_wasm_bg.wasm', import.meta.url)) });
+    } else {
+      await init();
+    }
+    // ABI 版本校验（docs/ABI-OPT-NOTES.md §3a）：pkg 与 worker 同仓
+    // 发布，合法形态只有严格相等——不等（或旧模块无此 export，即
+    // 非 function）= HTTP 缓存钉住了旧 pkg。`?v=` 参数是缓解，此处
+    // 是硬校验：错配时 init-error 明确报错而非在深层 API 面炸开。
+    const WANT_ABI = 0x00020000; // (major<<16)|minor = v2.0，与 rtcl_jit::abi::ABI_VERSION 同款编码
+    const gotAbi = typeof rtcl_abi_version === 'function' ? rtcl_abi_version() : null;
+    if (gotAbi !== WANT_ABI) {
+      throw new Error('rtcl pkg ABI mismatch: module ' + gotAbi + ' != worker v2.0 (' + WANT_ABI + ')'
+        + ' — stale HTTP cache? hard-reload with a bumped ?v= parameter');
+    }
     handle = new RtclHandle();
     handle.set_output_handler((s) => outputs.push(s));
 

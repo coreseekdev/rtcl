@@ -35,6 +35,39 @@
 //!
 //! `run() -> i32` 返回 Tcl result code; `STALE = 5` 为 epoch 失效专用。
 
+/// ABI 版本 export（wasi 蓝本的版本协商模式移植，docs/ABI-OPT-NOTES.md
+/// §3a）：模块 export `rtcl_abi_version() -> i32`，宿主实例化后立即
+/// 调用比对，不匹配 → 明确报错拒绝执行。
+///
+/// 编码约定：**低 16 位 minor / 高 16 位 major**（`v2.0 = 0x0002_0000`）。
+/// 本家宿主与模块同构建发布（in-process 发射）从未需要版本字段；本
+/// 字段的消费面是两个「同构建」假设被打破的地方——towasm 产物（跨
+/// 引擎/跨构建消费）与 pkg/worker 配对（HTTP 缓存 skew）。当前 =
+/// v2.0（§3「ABI v2」；M0 三函数时代 = v1）。minor = 加法性扩展
+/// （M1' 的 refuel/fail… 与 M2 的 concat/foreach… 均未 breaking §3
+/// 签名），major = breaking 边界（宿主与模块的 import/export 契约
+/// 形状）。
+pub const ABI_VERSION: i32 = (2 << 16) | 0;
+
+/// 宿主侧比对规则：major 必须相等（breaking 边界）；模块 minor 超前
+/// → 拒绝（宿主不认识的新面）；模块 minor 更小 → 放行（minor =
+/// 加法性扩展，宿主向后兼容旧 minor 修补面）。
+pub fn abi_version_compatible(module: i32) -> Result<(), String> {
+    let (m_maj, m_min) = (module >> 16, module & 0xffff);
+    let (h_maj, h_min) = (ABI_VERSION >> 16, ABI_VERSION & 0xffff);
+    if m_maj != h_maj {
+        return Err(format!(
+            "ABI major mismatch: module v{m_maj}.{m_min} vs host v{h_maj}.{h_min} — rebuild the artifact"
+        ));
+    }
+    if m_min > h_min {
+        return Err(format!(
+            "ABI minor ahead: module v{m_maj}.{m_min} vs host v{h_maj}.{h_min} — update the host"
+        ));
+    }
+    Ok(())
+}
+
 /// Tcl result codes returned by the exported `run()`.
 pub mod code {
     pub const OK: i32 = 0;

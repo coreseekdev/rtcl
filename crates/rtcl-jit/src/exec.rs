@@ -535,6 +535,19 @@ fn execute(
     let instance = linker.instantiate_and_start(&mut store, &wmodule).unwrap_or_else(|e| {
         panic!("jit: instantiate failed: {e}")
     });
+    // ABI 版本比对（docs/ABI-OPT-NOTES.md §3a）：实例化后立即调用。
+    // in-process 发射恒匹配；真实靶 = towasm 产物与跨构建消费方
+    // （execute_artifact_wasmi 经此入口）。fast 驱动不做检查（同理
+    // in-process，无错配可能）。
+    let ver: TypedFunc<(), i32> = instance
+        .get_typed_func(&store, "rtcl_abi_version")
+        .expect("jit: no rtcl_abi_version export (pre-versioning artifact)");
+    let v = ver
+        .call(&mut store, ())
+        .unwrap_or_else(|t| panic!("jit: rtcl_abi_version trap: {t:?}"));
+    if let Err(msg) = abi::abi_version_compatible(v) {
+        panic!("jit: {msg}");
+    }
     let run: TypedFunc<(), i32> = instance.get_typed_func(&store, "run").unwrap();
 
 

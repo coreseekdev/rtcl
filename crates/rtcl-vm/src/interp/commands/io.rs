@@ -734,7 +734,11 @@ fn file_tempfile(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 #[derive(Clone, Copy)]
 pub(crate) enum AccessCheck { Read, Write, Exec }
 
-#[cfg(feature = "file")]
+// 门 `std`（原 `file`）：host::NativeFs（HostFs 的 std 实现）的
+// readable/writable/executable 探测也走它——std-without-file 组合
+// （wasm guest：std+regexp-lite+clock）需可用。实现纯 std
+// （exists/File::open/metadata），file 构建行为不变（file ⇒ std）。
+#[cfg(feature = "std")]
 pub(crate) fn fs_access(path: &str, check: AccessCheck) -> bool {
     let p = std::path::Path::new(path);
     if !p.exists() { return false; }

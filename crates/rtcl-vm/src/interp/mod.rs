@@ -931,7 +931,9 @@ pub struct Interp {
     pub(crate) next_event_id: u64,
     /// 后台 `chan copy -command` 任务（tclsh TclCopyChannel 模型）：
     /// 调度即挂起、事件循环（update/vwait）泵送、回调收累计数。
-    #[cfg(feature = "std")]
+    /// 门随类型走 `io`（chan_io 模块）；std-without-io 组合（wasm
+    /// guest：std+regexp-lite+clock）不携带。
+    #[cfg(feature = "io")]
     pub(crate) copy_jobs: Vec<commands::chan_io::ChanCopyJob>,
     /// Child interpreter table for `interp` command.
     #[cfg(feature = "std")]
@@ -1117,6 +1119,7 @@ impl Interp {
             xtrace_callback: String::new(),
             #[cfg(feature = "std")]
             event_queue: Vec::new(),
+            #[cfg(feature = "io")]
             copy_jobs: Vec::new(),
             #[cfg(feature = "std")]
             next_event_id: 1,

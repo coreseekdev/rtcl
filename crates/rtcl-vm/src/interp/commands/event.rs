@@ -462,6 +462,9 @@ fn process_events(
     // TclCopyChannel；通道事件非 idle 事件——update idletasks 不泵）。
     // 文件类拷贝单次泵内排空、回调收累计总数；回调错误走 stderr
     // 转储（tclsh bgerror）并终止任务。
+    // 门随 chan_io 模块走 `io`：std-without-io 组合（wasm guest）无
+    // 通道任务，泵送为空。
+    #[cfg(feature = "io")]
     if !idle_only {
         fired += crate::interp::commands::chan_io::pump_chan_copies(interp, errors.as_deref_mut());
     }

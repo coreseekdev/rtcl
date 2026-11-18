@@ -29,6 +29,11 @@ struct Env<'a> {
     epoch_home: u32,
     bool_base: u32,
     kind: u32,
+    /// C-float（§5）：f64 双暂存 local（操作数缓存），float lane on 时
+    /// 算术/比较的守卫-内联路径用。恒为该函数 local 末组。
+    float_lane: bool,
+    fa: u32,
+    fb: u32,
     /// M2 slot 单态缓存（classic tier）：per-var 的 wasm local 组——
     /// `ic_base+var` = 缓存的 tagged 值（i64），`iv_base+var` = 有效位
     /// （i32，1=有效）。有效不变式：ivalid=1 ⇒ caching==1 且缓存值 ==
@@ -101,7 +106,6 @@ impl<'a> Env<'a> {
 }
 
 pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Option<crate::emit::FastMeta>) {
-    let _ = cfg;
     let nv = l2.max_depth + 1;
     if std::env::var_os("JIT_L3").is_some() {
         eprintln!("=== L3 (sites={}) ===\n{}", code.sites.len(), l3);
@@ -124,12 +128,17 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
         // 缓存 local 组：icache 接在 i64 组末，ivalid 接在 i32 组末。
         ic_base: nv + 3 + 2 * nf,
         iv_base: nv + 3 + 2 * nf + nvars + bregs + 1,
+        // C-float：f64 组恒在该函数 local 末尾（2 枚：操作数 a/b 暂存）。
+        float_lane: cfg.float_lane,
+        fa: nv + 3 + 2 * nf + nvars + bregs + 1 + nvars,
+        fb: nv + 3 + 2 * nf + nvars + bregs + 1 + nvars + 1,
         fast: None,
     };
 
     let mut body = Function::new(vec![
         (nv + 3 + 2 * nf + nvars, I64), // 值栈 + 出口 + SCRATCH + EPOCH + foreach 对 + icache
         (bregs + 1 + nvars, I32),       // 布尔寄存器 + kind + ivalid
+        (2, ValType::F64),              // C-float 暂存（fa/fb）
     ]);
 
     // ── 序言：cache 区清零 + caching=1（池重置的 wasm 侧承担）──────
@@ -360,6 +369,11 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
             // 之后。
             ic_base: nv + 4 + 2 * nf,
             iv_base: fast_foreach_base + 2 * nf + bregs + 1,
+            // C-float：fast_impl 的 f64 组恒在其 local 末尾（与 classic
+            // 同型——i64 组 + i32 组之后追加 2 枚）。
+            float_lane: cfg.float_lane,
+            fa: nv + 4 + 2 * nf + fb_ic + bregs + 2 + 2 * nf + fb_ic,
+            fb: nv + 4 + 2 * nf + fb_ic + bregs + 2 + 2 * nf + fb_ic + 1,
             fast: Some(FastCtx {
                 param_slot,
                 nparams: np as u32,
@@ -390,6 +404,7 @@ pub fn run(l3: &L3, l2: &L2, code: &ByteCode, cfg: &EmitConfig) -> (Vec<u8>, Opt
         let mut fb = Function::new(vec![
             (nv + 4 + 2 * nf + fb_ic, I64), // +TMP64（resync 临时）+ icache
             (bregs + 2 + 2 * nf + fb_ic, I32), // +slot_base（i32 组首位）+ ivalid
+            (2, ValType::F64),              // C-float 暂存（fa/fb）
         ]);
         // 入口：slot_base = PARAMS + fast_depth * PARAM_STRIDE
         fb.instruction(&Instruction::I32Const(cache::PARAMS as i32));
@@ -1036,13 +1051,16 @@ fn retag_in_place(f: &mut Function, reg: u32) {
 
 /// SCRATCH = local.get(reg) >> 62；结果 in {0,-1} 时继续（br_if 跳过 slow）。
 /// 调用形态：`block $ok { <range ok> br_if $ok_inner... }`——这里给
-/// 「range 不 ok 则 fallthrough 到 slow」的复合片段：跳转目标 = 1（外层
-/// slow block 的内层 ok block 由调用方保证）。约定：调用方提供
-/// `block $ok { … }` 包裹快车道，range-bad 时 `br 1`（跳到 slow）。
-/// 范围检查（结果须落 [-2^62, 2^62)，即 >>62 ∈ {0,-1}）；不满足 →
-/// br 0（慢路径）。免临时寄存器（重算两次 shift——不占 scratch/
-/// epoch_home，避免与持有中的计算结果/epoch 快照冲突）。
-fn range_guard_br_slow(f: &mut Function, reg: u32) {
+/// 「range 不 ok 则落宿主」的守卫片段。`host_br` = 溢出时 br 的深度：
+/// classic 两层布局 [done, slow] 内 = 0（退出 slow → 宿主）；float-lane
+/// 四层布局 [done, host, flt, intp] 内 = 1（退出 intp+flt → 宿主）。
+/// **溢出必须落宿主**（wide/bignum 全语义）——落 float 路径会把溢出的
+/// int 收缩成 f64（4611686018427387903+4611686018427387903 会错成
+/// 9.22337203685478e18，tclsh 是精确 wide 9223372036854775806）。
+/// 范围检查（结果须落 [-2^62, 2^62)，即 >>62 ∈ {0,-1}）。
+/// 免临时寄存器（重算两次 shift——不占 scratch/epoch_home，避免与
+/// 持有中的计算结果/epoch 快照冲突）。
+fn range_guard_br(f: &mut Function, reg: u32, host_br: u32) {
     f.instruction(&Instruction::LocalGet(reg));
     f.instruction(&Instruction::I64Const(62));
     f.instruction(&Instruction::I64ShrS);
@@ -1054,7 +1072,7 @@ fn range_guard_br_slow(f: &mut Function, reg: u32) {
     f.instruction(&Instruction::I64Eq);
     f.instruction(&Instruction::I32Or);
     f.instruction(&Instruction::I32Eqz);
-    f.instruction(&Instruction::BrIf(0));
+    f.instruction(&Instruction::BrIf(host_br));
 }
 
 fn imm_guard_br_slow(f: &mut Function, reg: u32) {
@@ -1066,6 +1084,151 @@ fn imm_guard_br_slow(f: &mut Function, reg: u32) {
     // 跳过慢代码直达 done——M1' 遗留极性反转，长期被 Call-in-Sub 拒绝
     // 造成的回落掩盖）。
     f.instruction(&Instruction::BrIf(0));
+}
+
+/// C-float 操作数取值（§5）：Float rep → unbox_float；imm int →
+/// f64.convert_i64_s 提升（Tcl 混合运算语义：int+float=float，转换
+/// 舍入与 tclsh 的 int→double 一致）；其余（串 shimmer/bignum/整值
+/// 句柄）→ br 宿主兜底。调用方块布局 [done, host, flt]——本片段内
+/// 深度：imm=0, op=1, flt=2, host=3, done=4（$imm 内）。
+///
+/// **br 目标语义（2026-11-18 修正）**：br N = 跳到第 N 层块的末尾之后
+/// 继续执行。宿主代码在 flt 的 End 之后、host 的 End 之内——所以要
+/// **进入宿主代码**必须 br 到 flt 的 label（blk 内 = 3，op 内 = 1）；
+/// br 到 host 的 label（4）会连宿主代码一起跳过 → dst 不写 → 返回
+/// 操作数 a 原值（b1-b9 实证：`$r+1.0` 产出 1.5；imm_guard_br_slow 的
+/// 「br 0 落慢路径 / br 1 跳过慢代码」历史注释同构验证）。
+///
+/// `exact_only`（比较语境）：tclsh 对 int vs double 比较**精确裁决**
+/// （`9007199254740993 > 9007199254740992.0` = 1——wide/double 走
+/// TclCompareTwoNumbers 精确路径，不做 double 收缩）；而 f64 提升会
+/// 把 >2^53 的 imm 收缩成邻值 → 恒等分歧。故比较语境只放行 |v|<2^53
+/// 的 imm（IEEE 精确域），其余落宿主。算术语境不设限：tclsh 的
+/// int→double 算术提升同样舍入（`+0.0` 实证），convert 舍入一致。
+fn emit_float_operand(f: &mut Function, r: u32, dst_f: u32, exact_only: bool) {
+    f.instruction(&Instruction::Block(BlockType::Empty)); // $op
+    f.instruction(&Instruction::Block(BlockType::Empty)); // $imm
+    // **imm 检查前置**（2026-11-18 t3b/t3e SEGFAULT 教训）：unbox_float
+    // 的入参是 I32WrapI64——大 imm 的 tagged 值（如 2^54+3）截断成小
+    // 偶数 → 被当句柄探进 arena → clone 越界值 → SIGSEGV（2^62-1 截断
+    // 成 -1 探空侥幸存活）。imm 永非 Float rep，先分派：imm 直接走
+    // 提升/精确守卫，只有真句柄（even，wrap 精确）才调 unbox。
+    f.instruction(&Instruction::LocalGet(r));
+    f.instruction(&Instruction::I64Const(1));
+    f.instruction(&Instruction::I64And);
+    f.instruction(&Instruction::I64Eqz);
+    f.instruction(&Instruction::BrIf(0)); // 非 imm → 退出 $imm → unbox 路径
+    // imm 臂：
+    if exact_only {
+        // 精确域守卫：v = r>>1，|v| < 2^53 才提升（>>53 ∈ {0,-1}）；
+        // 越界（如 2^53 邻域的 wide imm）→ host 精确比较（tclsh 对
+        // wide/double 比较精确裁决，9007199254740993>9007199254740992.0
+        // = 1 实证）。
+        for (k, expect) in [(53i64, 0i64), (53, -1)] {
+            f.instruction(&Instruction::LocalGet(r));
+            f.instruction(&Instruction::I64Const(1));
+            f.instruction(&Instruction::I64ShrS);
+            f.instruction(&Instruction::I64Const(k));
+            f.instruction(&Instruction::I64ShrS);
+            if expect == 0 {
+                f.instruction(&Instruction::I64Eqz);
+            } else {
+                f.instruction(&Instruction::I64Const(expect));
+                f.instruction(&Instruction::I64Eq);
+            }
+        }
+        f.instruction(&Instruction::I32Or);
+        f.instruction(&Instruction::I32Eqz);
+        // $imm 内深度：imm=0, op=1, flt=2, host=3——br 2 = 退出 flt →
+        // 宿主代码（br 3 会连宿主一起跳过）。
+        f.instruction(&Instruction::BrIf(2)); // |v| ≥ 2^53 → 宿主精确裁决
+    }
+    // imm int 提升（f64.convert_i64_s 舍入与 tclsh int→double 一致）。
+    f.instruction(&Instruction::LocalGet(r));
+    f.instruction(&Instruction::I64Const(1));
+    f.instruction(&Instruction::I64ShrS);
+    f.instruction(&Instruction::F64ConvertI64S);
+    f.instruction(&Instruction::LocalSet(dst_f));
+    // 提升完成 → 跳过 unbox 与 NaN 检查（imm 产不出 NaN）：
+    // br 2 = 退出 $imm+$op → float 运算段。
+    f.instruction(&Instruction::Br(2));
+    f.instruction(&Instruction::End); // $imm
+    // unbox 路径（仅真句柄到达；even tagged → wrap 无损）：
+    f.instruction(&Instruction::LocalGet(r));
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::Call(import::UNBOX_FLOAT)); // [ok, v]
+    f.instruction(&Instruction::LocalSet(dst_f)); // [ok]
+    f.instruction(&Instruction::I32Eqz);
+    f.instruction(&Instruction::If(BlockType::Empty)); // ok==0：非 Float rep
+    // If 内深度：If=0, op=1, flt=2——br 2 = 退出 flt → 宿主代码。
+    f.instruction(&Instruction::Br(2)); // 串 shimmer/整值句柄/bignum → 宿主
+    f.instruction(&Instruction::End); // if
+    // NaN 操作数守卫：interp 的 binary_op 对 NaN 值操作数报错
+    //（"can't use non-numeric floating-point value as operand of"——
+    // NaN 可经 Inf*0.0 存在但禁再入算术；NaN 值比较=0、Neg=NaN 不报
+    // 错）。守卫统一落宿主：宿主就是 interp 本体，报错/结果自然对齐
+    // （NaN 值在栈上存在但不再入 f64 内联）。$op 内深度：op=0, flt=1,
+    // host=2, done=3——br 1 = 退出 flt → 宿主代码（br 2 会连宿主一起
+    // 跳过）。
+    f.instruction(&Instruction::LocalGet(dst_f));
+    f.instruction(&Instruction::LocalGet(dst_f));
+    f.instruction(&Instruction::F64Ne);
+    f.instruction(&Instruction::BrIf(1)); // NaN → 宿主代码
+    f.instruction(&Instruction::End); // $op
+}
+
+/// C-float 计算+边界：f64 运算 → box_float（走宿主 freelist，Inf/NaN
+/// 是合法值——§5 不用 NaN 哨兵）；比较 f64.cc → tag_bool（IEEE754 =
+/// C double 语义，NaN 比较恒假 = tclsh）。
+///
+/// `fused`（fast 融合表命中）：比较结果直写布尔寄存器 b(br) 而非 dst
+/// ——与 int 快臂/慢臂同约定。raw cmp 的 i32（1=真）与慢臂补写的
+/// `(tagged_dst != 1)`（tag(1)=3 → 1；tag(0)=1 → 0）真值一致，直写。
+fn emit_float_op(kind: BinOp, dst: u32, fused: Option<u32>, e: &Env, f: &mut Function) {
+    if kind == BinOp::Div {
+        // 0.0/0.0 → interp 报 domain error（tclsh 拒造 NaN 除法结果，
+        // expr_ops.rs：`b == 0.0 && a == 0.0` → domain_error）；f64 内联
+        // 会静默产 NaN。±0 的 F64Eq 恒等 → 覆盖 -0.0 组合。float path
+        // 裸区深度：If 内 If=0, flt=1, host=2——Br(1) = 退出 If+flt →
+        // 宿主（其余 NaN 产生源已被操作数 NaN 守卫拦在宿主侧）。
+        f.instruction(&Instruction::LocalGet(e.fa));
+        f.instruction(&Instruction::F64Const(0.0.into()));
+        f.instruction(&Instruction::F64Eq);
+        f.instruction(&Instruction::LocalGet(e.fb));
+        f.instruction(&Instruction::F64Const(0.0.into()));
+        f.instruction(&Instruction::F64Eq);
+        f.instruction(&Instruction::I32And);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::Br(1)); // → host（domain error 全语义）
+        f.instruction(&Instruction::End);
+    }
+    f.instruction(&Instruction::LocalGet(e.fa));
+    f.instruction(&Instruction::LocalGet(e.fb));
+    let op = match kind {
+        BinOp::Add => &Instruction::F64Add,
+        BinOp::Sub => &Instruction::F64Sub,
+        BinOp::Mul => &Instruction::F64Mul,
+        BinOp::Div => &Instruction::F64Div,
+        BinOp::Eq => &Instruction::F64Eq,
+        BinOp::Ne => &Instruction::F64Ne,
+        BinOp::Lt => &Instruction::F64Lt,
+        BinOp::Gt => &Instruction::F64Gt,
+        BinOp::Le => &Instruction::F64Le,
+        BinOp::Ge => &Instruction::F64Ge,
+        _ => unreachable!("float op kind"),
+    };
+    f.instruction(op);
+    if matches!(kind, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge) {
+        if let Some(br) = fused {
+            f.instruction(&Instruction::LocalSet(e.b(br))); // i32 在栈顶
+        } else {
+            tag_bool(f, dst); // i32 在栈顶
+        }
+    } else {
+        f.instruction(&Instruction::Call(import::BOX_FLOAT));
+        f.instruction(&Instruction::I64ExtendI32U);
+        f.instruction(&Instruction::LocalSet(dst));
+    }
 }
 
 /// retag( (i32 bool) → tagged i64 )：值在 i32 栈顶。
@@ -1498,7 +1661,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::I64Const(*amount));
             f.instruction(&Instruction::I64Add);
             f.instruction(&Instruction::LocalSet(dst.0));
-            range_guard_br_slow(f, dst.0);
+            range_guard_br(f, dst.0, 0);
             retag_in_place(f, dst.0);
             // cache 刷新 + 写落盘（保守：每写进 VALUES，STATE 置脏）。
             f.instruction(&Instruction::LocalGet(dst.0));
@@ -1524,7 +1687,7 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             f.instruction(&Instruction::I64Const(*amount));
             f.instruction(&Instruction::I64Add);
             f.instruction(&Instruction::LocalSet(dst.0));
-            range_guard_br_slow(f, dst.0);
+            range_guard_br(f, dst.0, 0);
             retag_in_place(f, dst.0);
             st64_local(f, vals, dst.0);
             st8(f, state, 2);
@@ -1833,6 +1996,81 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
         }
         Instr::Arith { kind, dst, a, b, fail } => emit_arith(*kind, dst.0, a.0, b.0, *fail, e, f),
         Instr::Cmp { cc, dst, a, b, fail } => {
+            let fused = e.fast.as_ref().and_then(|fc| fc.fused_cmp.get(&dst.0)).copied();
+            // C-float（§5）：float lane on 时同 emit_arith 的三段式——
+            // imm-imm → i64 单调比较；Float/混合 → f64 比较（IEEE754 =
+            // C double，NaN 恒假 = tclsh）；其余 → 宿主。融合表三臂贯通：
+            // int 快臂直写 b(br)、float 臂 raw cmp 直写 b(br)（真值与慢
+            // 臂 (tagged≠1) 一致）、慢臂 call_binary_op 后补写。比较语境
+            // exact_only=true——tclsh wide/double 比较精确（>2^53 imm 提
+            // 升会收缩成邻值，9007199254740993>9007199254740992.0 实证），
+            // 越界 imm 落宿主。imm 守卫 br 0 = 退出 intp → float path
+            // （br 1 是 flt label → 宿主区，半成品误写，2026-11-18 修正）。
+            if e.float_lane {
+                f.instruction(&Instruction::Block(BlockType::Empty)); // done
+                f.instruction(&Instruction::Block(BlockType::Empty)); // host
+                f.instruction(&Instruction::Block(BlockType::Empty)); // flt
+                f.instruction(&Instruction::Block(BlockType::Empty)); // intp
+                f.instruction(&Instruction::LocalGet(a.0));
+                f.instruction(&Instruction::I64Const(1));
+                f.instruction(&Instruction::I64And);
+                f.instruction(&Instruction::I64Eqz);
+                f.instruction(&Instruction::BrIf(0));
+                f.instruction(&Instruction::LocalGet(b.0));
+                f.instruction(&Instruction::I64Const(1));
+                f.instruction(&Instruction::I64And);
+                f.instruction(&Instruction::I64Eqz);
+                f.instruction(&Instruction::BrIf(0));
+                f.instruction(&Instruction::LocalGet(a.0));
+                f.instruction(&Instruction::LocalGet(b.0));
+                f.instruction(match cc {
+                    CmpOp::Lt => &Instruction::I64LtS,
+                    CmpOp::Gt => &Instruction::I64GtS,
+                    CmpOp::Le => &Instruction::I64LeS,
+                    CmpOp::Ge => &Instruction::I64GeS,
+                });
+                if let Some(br) = fused {
+                    f.instruction(&Instruction::LocalSet(e.b(br)));
+                } else {
+                    tag_bool(f, dst.0);
+                }
+                f.instruction(&Instruction::Br(3));
+                f.instruction(&Instruction::End); // intp 终 → float path
+                emit_float_operand(f, a.0, e.fa, true);
+                emit_float_operand(f, b.0, e.fb, true);
+                let fc = match cc {
+                    CmpOp::Lt => BinOp::Lt,
+                    CmpOp::Gt => BinOp::Gt,
+                    CmpOp::Le => BinOp::Le,
+                    CmpOp::Ge => BinOp::Ge,
+                };
+                emit_float_op(fc, dst.0, fused, e, f);
+                f.instruction(&Instruction::Br(2));
+                f.instruction(&Instruction::End); // flt 终 → host
+                call_binary_op(
+                    match cc {
+                        CmpOp::Lt => BinOp::Lt,
+                        CmpOp::Gt => BinOp::Gt,
+                        CmpOp::Le => BinOp::Le,
+                        CmpOp::Ge => BinOp::Ge,
+                    },
+                    a.0,
+                    b.0,
+                    dst.0,
+                    *fail,
+                    e,
+                    f,
+                );
+                if let Some(br) = fused {
+                    f.instruction(&Instruction::LocalGet(dst.0));
+                    f.instruction(&Instruction::I64Const(1));
+                    f.instruction(&Instruction::I64Ne);
+                    f.instruction(&Instruction::LocalSet(e.b(br)));
+                }
+                f.instruction(&Instruction::End); // host 终（同 arith 半成品漏写补）
+                f.instruction(&Instruction::End); // done
+                return;
+            }
             // §4：tagged word 单调，免 untag 直接比较。
             f.instruction(&Instruction::Block(BlockType::Empty)); // done
             f.instruction(&Instruction::Block(BlockType::Empty)); // slow
@@ -1840,7 +2078,6 @@ fn emit_instr(i: &Instr, e: &Env, f: &mut Function) {
             imm_guard_br_slow(f, b.0);
             f.instruction(&Instruction::LocalGet(a.0));
             f.instruction(&Instruction::LocalGet(b.0));
-            let fused = e.fast.as_ref().and_then(|fc| fc.fused_cmp.get(&dst.0)).copied();
             f.instruction(match cc {
                 CmpOp::Lt => &Instruction::I64LtS,
                 CmpOp::Gt => &Instruction::I64GtS,
@@ -2199,6 +2436,46 @@ fn emit_flush(e: &Env, f: &mut Function, fail: u32) {
 }
 
 fn emit_unary(kind: BinOp, dst: u32, a: u32, fail: u32, e: &Env, f: &mut Function) {
+    // C-float：Neg 三段式——Float rep → f64.neg（-0.0/NaN 语义 IEEE）；
+    // imm int → int neg（`-5` 是 int 不是 float）；其余宿主。
+    // imm 守卫 br 0 = 退出 intp → float path（同 arith/Cmp，2026-11-18
+    // 修正半成品的 br 1）；范围守卫 BrIf(2) = intp 内 host。
+    if e.float_lane && kind == BinOp::Neg {
+        f.instruction(&Instruction::Block(BlockType::Empty)); // done
+        f.instruction(&Instruction::Block(BlockType::Empty)); // host
+        f.instruction(&Instruction::Block(BlockType::Empty)); // flt
+        f.instruction(&Instruction::Block(BlockType::Empty)); // intp
+        f.instruction(&Instruction::LocalGet(a));
+        f.instruction(&Instruction::I64Const(1));
+        f.instruction(&Instruction::I64And);
+        f.instruction(&Instruction::I64Eqz);
+        f.instruction(&Instruction::BrIf(0));
+        f.instruction(&Instruction::I64Const(0));
+        f.instruction(&Instruction::LocalGet(a));
+        f.instruction(&Instruction::I64Const(1));
+        f.instruction(&Instruction::I64ShrS);
+        f.instruction(&Instruction::I64Sub);
+        f.instruction(&Instruction::LocalSet(e.scratch));
+        // 范围守卫：失败落 host（intp 内深度 host=2）。
+        range_guard_br(f, e.scratch, 2);
+        f.instruction(&Instruction::LocalGet(e.scratch));
+        f.instruction(&Instruction::LocalSet(dst));
+        retag_in_place(f, dst);
+        f.instruction(&Instruction::Br(3));
+        f.instruction(&Instruction::End); // intp 终 → float path
+        emit_float_operand(f, a, e.fa, false);
+        f.instruction(&Instruction::LocalGet(e.fa));
+        f.instruction(&Instruction::F64Neg);
+        f.instruction(&Instruction::Call(import::BOX_FLOAT));
+        f.instruction(&Instruction::I64ExtendI32U);
+        f.instruction(&Instruction::LocalSet(dst));
+        f.instruction(&Instruction::Br(2));
+        f.instruction(&Instruction::End); // flt 终 → host
+        call_binary_op(kind, a, a, dst, fail, e, f);
+        f.instruction(&Instruction::End); // host 终（同 arith 半成品漏写补）
+        f.instruction(&Instruction::End); // done
+        return;
+    }
     f.instruction(&Instruction::Block(BlockType::Empty)); // done
     f.instruction(&Instruction::Block(BlockType::Empty)); // slow
     imm_guard_br_slow(f, a);
@@ -2210,7 +2487,7 @@ fn emit_unary(kind: BinOp, dst: u32, a: u32, fail: u32, e: &Env, f: &mut Functio
             f.instruction(&Instruction::I64ShrS);
             f.instruction(&Instruction::I64Sub);
             f.instruction(&Instruction::LocalSet(e.scratch));
-            range_guard_br_slow(f, e.scratch);
+            range_guard_br(f, e.scratch, 0);
             f.instruction(&Instruction::LocalGet(e.scratch));
             f.instruction(&Instruction::LocalSet(dst));
         }
@@ -2230,7 +2507,7 @@ fn emit_unary(kind: BinOp, dst: u32, a: u32, fail: u32, e: &Env, f: &mut Functio
             f.instruction(&Instruction::I64ShrS);
             f.instruction(&Instruction::I64Xor);
             f.instruction(&Instruction::LocalSet(e.scratch));
-            range_guard_br_slow(f, e.scratch);
+            range_guard_br(f, e.scratch, 0);
             f.instruction(&Instruction::LocalGet(e.scratch));
             f.instruction(&Instruction::LocalSet(dst));
         }
@@ -2248,6 +2525,25 @@ fn emit_unary(kind: BinOp, dst: u32, a: u32, fail: u32, e: &Env, f: &mut Functio
     f.instruction(&Instruction::End); // done
 }
 
+/// C-float（§5）可走 f64 内联的二元集：加减乘除（IEEE 直算）+ 全比较
+/// （NaN/Inf = IEEE754 = C double）。pow 走宿主（transcendental 永远
+/// 宿主，ULP 单一事实来源）；div-int 的 floor 语义留在 int 快臂。
+fn float_capable(kind: BinOp) -> bool {
+    matches!(
+        kind,
+        BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Gt
+            | BinOp::Le
+            | BinOp::Ge
+    )
+}
+
 fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut Function) {
     // 全走宿主的 §4 类别：pow、字符串比较（div/mod 件5 起双 imm 快臂
     // 内联——floor 语义 wasm 直算，除零/非 imm 落宿主）。
@@ -2255,10 +2551,68 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
         call_binary_op(kind, a, b, dst, fail, e, f);
         return;
     }
+    // C-float 三段式（jit-float-lane on）：imm-imm → int 快臂；Float
+    // rep / imm-int 混合 → f64 内联（convert 提升）；其余（串 shimmer
+    // /bignum/整值句柄）→ binary_op 宿主。类型分派先于 opcode：
+    // `1/2` 走 int floor = 0，`1./2` 走 f64 = 0.5（§5 语义清单）。
+    // imm 守卫 br 0：退出 intp 即 float path 入口（intp 的 End 之后）；
+    // br 1 是 flt 的 label → 落宿主区（前 agent 半成品误写，float path
+    // 因此死码——2026-11-18 修正）。守卫失败（溢出/除零）经 slow_br=1
+    // 落宿主全语义。
+    if e.float_lane && float_capable(kind) {
+        let exact = matches!(kind, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge);
+        f.instruction(&Instruction::Block(BlockType::Empty)); // done
+        f.instruction(&Instruction::Block(BlockType::Empty)); // host
+        f.instruction(&Instruction::Block(BlockType::Empty)); // flt
+        f.instruction(&Instruction::Block(BlockType::Empty)); // intp
+        // imm 守卫：失败（非 imm）→ br 0 = 退出 intp → float path。
+        f.instruction(&Instruction::LocalGet(a));
+        f.instruction(&Instruction::I64Const(1));
+        f.instruction(&Instruction::I64And);
+        f.instruction(&Instruction::I64Eqz);
+        f.instruction(&Instruction::BrIf(0));
+        f.instruction(&Instruction::LocalGet(b));
+        f.instruction(&Instruction::I64Const(1));
+        f.instruction(&Instruction::I64And);
+        f.instruction(&Instruction::I64Eqz);
+        f.instruction(&Instruction::BrIf(0));
+        emit_int_inline(kind, dst, a, b, 1, e, f);
+        retag_in_place(f, dst);
+        // intp 内深度：intp=0, flt=1, host=2, done=3。
+        f.instruction(&Instruction::Br(3));
+        f.instruction(&Instruction::End); // intp 终 → 此处即 float path 入口
+        emit_float_operand(f, a, e.fa, exact);
+        emit_float_operand(f, b, e.fb, exact);
+        emit_float_op(kind, dst, None, e, f);
+        // float path 裸区深度：flt=0, host=1, done=2。
+        f.instruction(&Instruction::Br(2));
+        f.instruction(&Instruction::End); // flt 终 → host 兜底
+        call_binary_op(kind, a, b, dst, fail, e, f);
+        f.instruction(&Instruction::End); // host 终（半成品漏写——4 开 3 闭，
+        // wasm 校验 "control frames remain"，2026-11-18 补）
+        f.instruction(&Instruction::End); // done
+        return;
+    }
     f.instruction(&Instruction::Block(BlockType::Empty)); // done
     f.instruction(&Instruction::Block(BlockType::Empty)); // slow
     imm_guard_br_slow(f, a);
     imm_guard_br_slow(f, b);
+    emit_int_inline(kind, dst, a, b, 0, e, f);
+    retag_in_place(f, dst);
+    f.instruction(&Instruction::Br(1));
+    f.instruction(&Instruction::End); // slow:
+    call_binary_op(kind, a, b, dst, fail, e, f);
+    f.instruction(&Instruction::End); // done
+}
+
+/// int 快臂主体（无壳：守卫/retag/兜底脚手架由调用方负责）。
+///
+/// `slow_br` = 守卫失败落宿主的 br 深度：classic [done, slow] 内 = 0
+/// （退出 slow → 宿主）；float-lane [done, host, flt, intp] 内 = 1
+/// （退出 intp+flt → 宿主）。**所有守卫一律经此参数**——历史上 Mul
+/// 守卫硬编码 br 1（classic 里 = done，跳过宿主且 dst 不写），
+/// `3037000499*7` 实证产出陈旧 dst（2026-11-18 C-float 差分首曝）。
+fn emit_int_inline(kind: BinOp, dst: u32, a: u32, b: u32, slow_br: u32, e: &Env, f: &mut Function) {
     match kind {
         BinOp::Add | BinOp::Sub | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
             // 先算进 scratch（dst 与 a 别名——范围检查失败时慢路径还要
@@ -2277,12 +2631,13 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
                 _ => &Instruction::I64Xor,
             });
             f.instruction(&Instruction::LocalSet(e.scratch));
-            range_guard_br_slow(f, e.scratch);
+            range_guard_br(f, e.scratch, slow_br);
             f.instruction(&Instruction::LocalGet(e.scratch));
             f.instruction(&Instruction::LocalSet(dst));
         }
         BinOp::Mul => {
             // §4：高 32 位符号扩展检查（|a|,|b| < 2^31）→ 积 < 2^62。
+            // 守卫失败（|v| ≥ 2^31，如 3037000499）→ slow_br（宿主）。
             for r in [a, b] {
                 f.instruction(&Instruction::LocalGet(r));
                 f.instruction(&Instruction::I64Const(1));
@@ -2297,7 +2652,7 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
                 f.instruction(&Instruction::I64Eq);
                 f.instruction(&Instruction::I32Or);
                 f.instruction(&Instruction::I32Eqz);
-                f.instruction(&Instruction::BrIf(1));
+                f.instruction(&Instruction::BrIf(slow_br));
             }
             f.instruction(&Instruction::LocalGet(a));
             f.instruction(&Instruction::I64Const(1));
@@ -2310,6 +2665,8 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
         }
         BinOp::Shl | BinOp::Shr => {
             // 移位数 b_u ∈ [0, 63]（负数/超宽 → 宿主精确语义）。
+            // （Shl/Shr 非 float_capable，只在 classic 布局可达；深度仍
+            // 走 slow_br 便于统一——If 内再 +1。）
             for k in [0i64, 63] {
                 f.instruction(&Instruction::LocalGet(b));
                 f.instruction(&Instruction::I64Const(1));
@@ -2323,7 +2680,7 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
             }
             f.instruction(&Instruction::I32Or);
             f.instruction(&Instruction::If(BlockType::Empty));
-            f.instruction(&Instruction::Br(1)); // → slow
+            f.instruction(&Instruction::Br(slow_br + 1)); // → slow（宿主）
             f.instruction(&Instruction::End);
             f.instruction(&Instruction::LocalGet(a));
             f.instruction(&Instruction::I64Const(1));
@@ -2338,14 +2695,16 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
             });
             f.instruction(&Instruction::LocalSet(e.scratch));
             if kind == BinOp::Shl {
-                range_guard_br_slow(f, e.scratch);
+                range_guard_br(f, e.scratch, slow_br);
             }
             f.instruction(&Instruction::LocalGet(e.scratch));
             f.instruction(&Instruction::LocalSet(dst));
         }
         BinOp::Div | BinOp::Mod => {
             // 件5 双 imm 快臂：floor 语义 wasm 直算（expr.rs floor_div/
-            // floor_mod 同构）。除零 → 宿主（"divide by zero" 全语义）。
+            // floor_mod 同构）。除零 → 宿主（"divide by zero" 全语义；
+            // float-lane 里落 float 路径会算成 Inf/NaN——7/0 必须报错，
+            // 故除零守卫同样走 slow_br）。
             // 操作数 imm ⇒ |v| < 2^62 ⇒ INT_MIN/-1 陷阱不可达；商修正只
             // 减（|q| ≤ |va|）而 |r+vb| < |vb| ≤ 2^62-1 ⇒ 结果恒在 i63
             // 域，免范围守卫——慢出口只剩 imm 守卫与除零，此后对 dst
@@ -2357,7 +2716,7 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
             f.instruction(&Instruction::LocalSet(e.scratch));
             f.instruction(&Instruction::LocalGet(e.scratch));
             f.instruction(&Instruction::I64Eqz);
-            f.instruction(&Instruction::BrIf(0)); // vb == 0 → slow（宿主）
+            f.instruction(&Instruction::BrIf(slow_br)); // vb == 0 → 宿主
             // dst = 截断商/余数
             f.instruction(&Instruction::LocalGet(a));
             f.instruction(&Instruction::I64Const(1));
@@ -2440,9 +2799,4 @@ fn emit_arith(kind: BinOp, dst: u32, a: u32, b: u32, fail: u32, e: &Env, f: &mut
         }
         _ => unreachable!("arith kind"),
     }
-    retag_in_place(f, dst);
-    f.instruction(&Instruction::Br(1));
-    f.instruction(&Instruction::End); // slow:
-    call_binary_op(kind, a, b, dst, fail, e, f);
-    f.instruction(&Instruction::End); // done
 }

@@ -54,6 +54,9 @@ pub(crate) fn compile_cached(code: &ByteCode, key: (usize, u64, u64)) -> Option<
         let bc = code.unfused();
         match emit::compile(&bc, &EmitConfig::default()) {
             Ok(mm) => {
+                if let Some(p) = std::env::var_os("RTCL_JIT_DUMP_PROC") {
+                    let _ = std::fs::write(&p, &mm.bytes);
+                }
                 if c.len() >= 1024 {
                     c.clear();
                 }

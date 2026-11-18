@@ -186,6 +186,85 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10vicesimussecundus. 2026-11-19 feat/host-http 合并——native 宿主服务面（HostHttp / fd 表 exec / HostJobs）契约对齐（perf/wave2 @ f9101c9..）
+
+用户定调：合并 feat/host-http（native 侧进程自动化面）并把契约对齐到当前
+master。分支 fork 自 f25d2340（jit M2 收尾），17 提交，2026-10-20 收尾；
+分叉后 master 走了 ~470 提交（rtcl-core→facade、HostFs 13 键数据面、
+hidden 桥注册契约、exec native `&` 收割面）。文本 merge-tree 预检"仅
+Cargo.lock"是旧口径——实际冲突 8 文件 + 1 个 modify/delete。
+
+**合并结果**：
+- 冲突：`.gitignore` / `Cargo.lock`（重建）/ `Cargo.toml`（members）/
+  `rtcl-cli/{Cargo.toml,main.rs}` / `rtcl-core/{Cargo.toml,lib.rs}` /
+  `rtcl-data/src/yaml.rs`；
+- **modify/delete**：`rtcl-core/src/host.rs`——master 已把 interp/host 迁
+  rtcl-vm（git 对 interp 四文件识别 rename 自动并入，host.rs 两侧改动过大
+  未识别）。分支的 exec/job/http 契约段手工移植进 `rtcl-vm/src/host.rs`
+  （门面 `pub use rtcl_vm::host` 保住 `rtcl_core::host::*` 公开路径）。
+
+**契约对齐清单**（分支假设 → master 现状）：
+1. **HostFs::open 同名异构**：分支给 HostFs 加 `open(path, FdMode) ->
+   Box<dyn HostFd>`；master 数据面 HostFs（13 键）已是 `open(&mut self,
+   path, mode:&str) -> (Box<dyn Channel>, bool)`。**不并入、不重构宿主
+   抽象**——fd 表是 host.rs 的兄弟层：新增兄弟 trait `HostFdFs`（fd 视图
+   文件源），Interp 字段 `fd_fs` + `set_fd_fs`/`fd_fs`（分支的
+   `fs`/`set_fs`/`host_fs` 访问器撤销，master 的 `host_fs` 字段/数据面
+   原样）。docs/JOB-CONTROL.md 的 trait 清单同步改名。
+2. **exec 路径**：master native 路径（std::process + `background_children`
+   收割，10bis 轮）原样保留；分支 host-backed 面（`cmd_exec_host`/`job`
+   命令，fd 表驱动）在 `interp.host_exec()` 注入时才分派——rtcl-cli 不
+   注入，native `exec` 行为零变化。tty job prompt（SIGTSTP/SIGINT）随
+   exec feature 编译进 rtcl-vm：**rtcl-vm `exec = ["std", "dep:libc"]`**
+   （fork 时 libc 挂在 rtcl-core 的 target 段，随迁移归位）。
+3. **net 撞名**：rtcl-vm 的 `net` = TCP socket（10ter 轮）；分支 rtcl-core
+   的 `net` = HTTP 缝标记。门面 `net = ["std"]` 本地标记、**不做**
+   rtcl-vm/net passthrough（注释钉死两个 net 不是同一 feature）。
+4. **http.tcl 桥线格式 5→6 参**：分支加 `-headers`（缺省空串）；
+   `rtcl-core/tests/http_tcl.rs` 两处断言随改。**cancel 探测漂移**：分支
+   的 `::http::cancel` 用 `[info commands __rtcl_http_cancel]` 探测——
+   master 已把宿主桥注册为 hidden 命令（10ter 轮修 `_require_bridge` 同
+   款），native 桥下 cancel 恒报"not supported"；对齐为
+   `[namespace which -command]`。net 单测 7/7 抓出后修复。
+5. **feature 图**：rtcl-native 的 rtcl-core 依赖 `default-features=false +
+   ["std"]` 在 master 上编不过——10quinter 解耦后 rtcl-vm 纯 std 组合是
+   **master 既有缺口**（NativeFs→`io::fs_access`、chan_io 字段非门控），
+   与本合并无关但被 rtcl-native 暴露。rtcl-native 显式带
+   `std,file,io,json`（json = 门面新增 passthrough——合并后 http.tcl 的
+   opts 用 `json encode` 构造）。exec/env/signal 门控未动，wasm 子集
+   （std,file,io,clock,package,dynmod,json）不含 exec/net——`job` 命令
+   不进 wasm，计数面不变（wasm 初始 99）。
+6. **yaml_to_value 保留**：rtcl-data 的 wasm 宿主免 interp API，基于门面
+   `bridge`（null 语义与 `cmd_yaml` 一致）；与 register_entry 宿主 API
+   并行，CLI 面未动。
+7. `pipe.rs`（内存有界 SPSC）随 interp 迁 rtcl-vm/src/pipe.rs（std 门控）
+   + 门面 re-export 保 `rtcl_core::pipe` 路径；与 host.rs 的 `ExecIoError`
+   分层（运行时原语 vs 宿主 ABI 投影），channel.rs 无同类实现，不合并。
+
+**门禁数字（2026-11-19）**：
+- `cargo test --workspace`：**1451/0**（基线 1443 + host.rs fd/job 单测 4
+  + pipe.rs 单测 4；exec_cmd.rs 17 个 master 本就有）。
+- `cargo test -p rtcl-native --features net`：**7/7**（feature 门控，
+  workspace 默认构建不含；mock 服务器流式面）。
+- judge interp：**88/88**。
+- feature 组合：rtcl-vm `--no-default-features --features std,file,io,
+  dynmod`（无 exec）过；rtcl-core 门面 `std,file,io` 过（门面本就无
+  dynmod passthrough，master 既有状态）。
+- `cargo check -p rtcl-wasm --target wasm32-unknown-unknown`：过。
+- net 冒烟：`--features net` release 构建 + http 词表层装载过。
+
+**提交链**：merge commit（含全部契约对齐——原始 merge 树不编译，对齐是
+可编译性前提）+ 本节。DIVERGENCES 无新条目（无 tclsh 行为分歧，全部是
+Rust 宿主 ABI 面）。
+
+**坑**：
+- merge-tree 旧式（三参）输出截断看不全冲突，用 `--write-tree --name-only`。
+- git rename 检测对大改文件失效：`removed in local` 段落要人工核对落点。
+- 门面缺 vm 后加 feature 的 passthrough（json）——依赖方组合报
+  "does not have that feature" 时先查门面 manifest。
+- rtcl-native standalone 的 feature 组合是 rtcl-vm 纯 std 编译面的唯一
+  现役探针（workspace 构建被 rtcl-cli 全集掩盖）。
+
 ## 10vicesimusprimus. 2026-11-18 C-float——float 快车道全验收（jit-float-lane 默认 off；perf/wave2 @ e488372..）
 
 docs/JIT-WASM-GC.md §5 落地。前 agent 因宿主运行时崩溃中断于发射面半

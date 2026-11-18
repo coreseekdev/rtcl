@@ -60,13 +60,23 @@ pub fn run(code: &ByteCode) -> L1 {
         // 常量产出 lane。
         let out_lane = match op {
             OpCode::PushInt(_) | OpCode::PushTrue | OpCode::PushFalse => Lane::Imm,
-            OpCode::PushFloat(_) | OpCode::PushEmpty | OpCode::PushConst(_)
-            | OpCode::PushConstWide(_) => Lane::Any,
+            // C-float（§5）：PushFloat 直产 Float lane。
+            OpCode::PushFloat(_) => Lane::Float,
+            OpCode::PushEmpty | OpCode::PushConst(_) | OpCode::PushConstWide(_) => Lane::Any,
             other if lane_tracked(other) => {
-                if in_lanes == [Lane::Imm, Lane::Imm] {
-                    // 双立即数输入的算术仍可能走宿主（溢出宽化），结果
-                    // 保守记 Any——守卫省不掉，除非 plan_guards 常量折叠。
-                    Lane::Any
+                // C-float 类型规则：任一输入 Float → 加减乘除/Neg 产
+                // Float（int+float 提升语义）；比较/Eq/Ne 产 Imm（0/1
+                // tagged bool）；mod/位/移位对浮点非法 → Any（宿主管）。
+                // 汇合 meet 未做（线性近似，见 Lane::Float doc）——这
+                // 里只供展示/未来优化，plan_guards 不消费 out_lane。
+                if in_lanes.contains(&Lane::Float) {
+                    match other {
+                        OpCode::Eq | OpCode::Ne | OpCode::Lt | OpCode::Gt
+                        | OpCode::Le | OpCode::Ge => Lane::Imm,
+                        OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div
+                        | OpCode::Neg => Lane::Float,
+                        _ => Lane::Any,
+                    }
                 } else {
                     Lane::Any
                 }

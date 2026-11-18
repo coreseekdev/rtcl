@@ -1024,9 +1024,13 @@ impl Host {
         }
     }
 
+    /// `rtcl.unbox_float(h)` 的守卫语义（C-float §5）：只认 Float rep
+    /// （`as_float_rep`，不 shimmer）。字符串/整值/bignum 的类型分派由
+    /// binary_op 宿主兜底全语义裁决——守卫若认串，`"2"*"3"` 会被 JIT
+    /// 算成 6.0（tclsh 是 6）。float lane 未启用时无人调用本入口。
     pub fn unbox_float_raw(&self, h: i32) -> (i32, f64) {
         let v = self.arena.get((h >> 1) as usize).cloned().unwrap_or_else(Value::empty);
-        match v.as_float() {
+        match v.as_float_rep() {
             Some(f) => (1, f),
             None => (0, 0.0),
         }

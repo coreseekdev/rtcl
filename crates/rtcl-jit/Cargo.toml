@@ -59,6 +59,9 @@ required-features = ["jit-exec"]
 [features]
 default = []
 jit-wasm = ["dep:js-sys", "dep:wasm-bindgen"]
+# C-float（§5）：f64 快车道（EmitConfig.float_lane）。默认 off——语义
+# 不依赖开关、性能才依赖；三向差分全绿后才评估翻默认（本轮不翻）。
+jit-float-lane = []
 # wasmtime-backed native instantiation（M1' 起接线；3.4GB ulimit 下
 # -j2 构建可行，见任务回报）。需同时开 jit-exec（驱动侧共享）。
 jit-native = ["jit-exec", "dep:wasmtime"]

@@ -1035,6 +1035,21 @@ impl Value {
         f64::from_str(s).ok()
     }
 
+    /// Float-rep-only read（C-float 守卫专用，§5「类型分派先于 opcode」）：
+    /// 只有缓存 rep 恰为 Float 才给值——字符串/整值/布尔一律 None，不
+    /// shimmer。JIT 的 `unbox_float` 守卫据此分派：Float rep 走 f64 内
+    /// 联快车道；`"1.5"`、整数、bignum 的全语义裁决留给 binary_op 宿主
+    /// 兜底（`"2"*"3"` 产 6 而非 6.0 的分界面就在这里）。
+    pub fn as_float_rep(&self) -> Option<f64> {
+        if self.is_imm() {
+            return None;
+        }
+        match &unsafe { self.heap_inner() }.rep {
+            InternalRep::Float(n) => Some(*n),
+            _ => None,
+        }
+    }
+
     /// Try to get as boolean
     ///
     /// Tcl rules (TclGetBooleanFromObj): any numeric value coerces by

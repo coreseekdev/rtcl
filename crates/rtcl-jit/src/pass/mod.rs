@@ -24,7 +24,8 @@ use rtcl_ir::bytecode::ByteCode;
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmitConfig {
     /// f64 快车道（`jit-float-lane`，默认 off，属 C-float 里程碑）。
-    /// M1' 恒 false；字段先落地让开关矩阵可接线。
+    /// off = float 全走 binary_op（路线 A 行为）；on = float/mixed 算术
+    /// 比较发射 unbox_float 守卫 + f64 内联 + box_float 边界（§5）。
     pub float_lane: bool,
     /// fuel 充值块大小（backedge 计步粒度，见 `abi::REFUEL_CHUNK`）。
     pub refuel_chunk: i64,
@@ -32,7 +33,13 @@ pub struct EmitConfig {
 
 impl Default for EmitConfig {
     fn default() -> Self {
-        EmitConfig { float_lane: false, refuel_chunk: abi::REFUEL_CHUNK }
+        // float_lane 由 cargo feature `jit-float-lane` 驱动（默认 off，
+        // C-float §5：off = float 全走 binary_op 宿主兜底；on = float/
+        // 混合算术比较发射 unbox_float 守卫 + f64 内联 + box_float 边界）。
+        EmitConfig {
+            float_lane: cfg!(feature = "jit-float-lane"),
+            refuel_chunk: abi::REFUEL_CHUNK,
+        }
     }
 }
 

@@ -16,6 +16,11 @@ pub enum Lane {
     Imm,
     /// 运行时未知（变量读、宿主调用结果、…）。
     Any,
+    /// C-float（§5）：确定是 Float rep（PushFloat 直产；算术按类型规
+    /// 则传播）。**线性近似**——分支汇合点未做 meet（then 臂 Float、
+    /// else 臂 Any 时线性模拟取后至者），plan_guards 侧在引入任何
+    /// 「凭 lane 省守卫」的优化前必须先补汇合 meet，否则不可信任。
+    Float,
 }
 
 /// 一条标注后的 L1 指令。
@@ -43,6 +48,7 @@ impl fmt::Display for L1 {
             let lane = |l: Lane| match l {
                 Lane::Imm => "imm",
                 Lane::Any => "any",
+                Lane::Float => "f64",
             };
             writeln!(
                 f,

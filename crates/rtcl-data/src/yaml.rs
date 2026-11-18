@@ -74,6 +74,14 @@ fn yaml_decode_from(args: &[Value], start: usize) -> Result<Value> {
     Ok(bridge(&doc, &null_value))
 }
 
+/// Parse YAML text into a Tcl Value without a native interpreter.
+/// Hosts use this to expose YAML config to wasm guests.
+pub fn yaml_to_value(text: &str) -> std::result::Result<Value, String> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(text)
+        .map_err(|e| format!("yaml parse: {e}"))?;
+    Ok(bridge(&doc, "null"))
+}
+
 /// encode 实现 — 同 [`yaml_decode_from`]，`start` 由调用方显式给定。
 fn yaml_encode_from(args: &[Value], start: usize) -> Result<Value> {
     if args.len() <= start {

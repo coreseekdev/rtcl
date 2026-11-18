@@ -40,6 +40,9 @@ regexp-lite = ["rtcl-vm/regexp-lite", "std"]
 # 同时启用 regexp 才参与命令路由。
 regexp-spencer = ["rtcl-vm/regexp-spencer", "std"]
 env = ["rtcl-vm/env", "std"]
+# json passthrough（vm 侧 2026-11-12 轮新增，门面此前滞后）：http.tcl
+# 词表层用 `json encode` 构造桥 opts——rtcl-native 经它带上 json。
+json = ["rtcl-vm/json", "std"]
 package = ["rtcl-vm/package", "std"]
 signal = ["rtcl-vm/signal", "std"]
 # 原生 libc iconv 后端（默认开；wasm 依赖方 default-features=false 关闭）。
@@ -47,5 +50,11 @@ iconv = ["rtcl-vm/iconv"]
 alloc = ["rtcl-vm/alloc"]
 embedded = ["rtcl-vm/embedded"]
 debug = ["rtcl-vm/debug"]
+# Native HTTP 宿主服务接缝（rogo R0）：HostHttp trait 无条件编译（见
+# rtcl-vm/src/host.rs）；本 feature 只是 CLI 侧转发/门控标记，供
+# rtcl-native 的 reqwest 实现挂线。刻意**不进** rtcl_std——默认构建零
+# 变化，wasm 组合也不携带网络实现。注意与 rtcl-vm 的 `net`（TCP socket）
+# 不是同一 feature——门面此名不做 passthrough，避免误开 socket 面。
+net = ["std"]
 
 [dev-dependencies]

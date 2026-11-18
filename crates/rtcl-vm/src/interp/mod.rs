@@ -895,6 +895,18 @@ pub struct Interp {
     /// 宿主控制台服务：无 `io` 特性构建里 `puts` 的 stdout/stderr 落点
     /// （原生 stdio，或 wasm 宿主注入的 JS 实现）。
     pub(crate) console: Box<dyn crate::host::HostConsole>,
+    /// 宿主 HTTP 服务：`http::*` 词表层的 native 落点（缺省
+    /// [`crate::host::NullHttp`]——请求即报"网络服务不可用"；rtcl-cli 的
+    /// `net` feature 注入 reqwest 实现；wasm 走 JS 桥，不经此处）。
+    pub(crate) http: Box<dyn crate::host::HostHttp>,
+    /// 进程执行服务（wasm 外部命令）：`None` → 该宿主不提供 exec。
+    pub(crate) exec: Option<Box<dyn crate::host::HostExec>>,
+    /// 宿主文件 fd 源（[`crate::host::HostFdFs`]）：exec 重定向把路径
+    /// 变成 `HostFd` 放进子进程 fd 表（`None` → 该宿主不提供文件 fd）。
+    /// 与上方 `host_fs`（数据面通道服务）是平行的兄弟接缝，见 host.rs。
+    pub(crate) fd_fs: Option<Box<dyn crate::host::HostFdFs>>,
+    /// 宿主作业表（`exec &` / `job *`）；`None` → 不支持后台作业。
+    pub(crate) jobs: Option<Box<dyn crate::host::HostJobs>>,
     /// 时钟服务：`after`/`vwait`/`time` 的 now/sleep 落点
     /// （原生 `Instant`，或 wasm 宿主注入的 JS 实现）。
     #[cfg(feature = "std")]
@@ -1093,6 +1105,10 @@ impl Interp {
                 let c: Box<dyn crate::host::HostConsole> = Box::new(crate::host::NullConsole);
                 c
             },
+            http: Box::new(crate::host::NullHttp),
+            exec: None,
+            fd_fs: None,
+            jobs: None,
             aliases: HashMap::new(),
             references: HashMap::new(),
             next_ref_id: 0,
@@ -1185,6 +1201,49 @@ impl Interp {
     /// 原生构建默认已是 [`crate::host::NativeConsole`]，无需调用）。
     pub fn set_console(&mut self, console: Box<dyn crate::host::HostConsole>) {
         self.console = console;
+    }
+
+    /// 注入宿主 HTTP 实现（native `net` feature 由 rtcl-cli 注入 reqwest
+    /// 实现；wasm 宿主不经此路径——走 JS `__rtcl_http` 桥 + 事件回灌）。
+    pub fn set_http(&mut self, http: Box<dyn crate::host::HostHttp>) {
+        self.http = http;
+    }
+
+    /// 注入进程执行服务（宿主实现 `HostExec::spawn`；不注入 = exec 不可用）。
+    pub fn set_exec(&mut self, exec: Box<dyn crate::host::HostExec>) {
+        self.exec = Some(exec);
+    }
+
+    /// 只读访问进程执行服务（未注入 → `None`）。
+    pub fn host_exec(&self) -> Option<&dyn crate::host::HostExec> {
+        self.exec.as_deref()
+    }
+
+    /// 注入宿主文件 fd 源（exec 重定向/heredoc 的 fd 来源；数据面
+    /// `file`/`open` 仍走 `set_host_fs`，两层不同构）。
+    pub fn set_fd_fs(&mut self, fd_fs: Box<dyn crate::host::HostFdFs>) {
+        self.fd_fs = Some(fd_fs);
+    }
+
+    /// 只读访问宿主文件 fd 源（未注入 → `None`）。
+    pub fn fd_fs(&self) -> Option<&dyn crate::host::HostFdFs> {
+        self.fd_fs.as_deref()
+    }
+
+    /// 注入宿主作业表（`exec &` / `job *`）。
+    pub fn set_jobs(&mut self, jobs: Box<dyn crate::host::HostJobs>) {
+        self.jobs = Some(jobs);
+    }
+
+    /// 只读访问宿主作业表（未注入 → `None`）。
+    pub fn host_jobs(&self) -> Option<&dyn crate::host::HostJobs> {
+        self.jobs.as_deref()
+    }
+
+    /// 只读访问宿主 HTTP 服务。桥命令用：`request` 返回独立拥有的响应体，
+    /// 借用不跨越逐块读取循环，读取期间可 re-entrant `eval` 回调。
+    pub fn host_http(&self) -> &dyn crate::host::HostHttp {
+        &*self.http
     }
 
     /// 注入宿主时钟实现（wasm 宿主由此给 `after`/`vwait`/`time` 接上

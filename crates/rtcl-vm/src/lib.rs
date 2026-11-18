@@ -31,6 +31,9 @@ pub mod interp;
 #[cfg(feature = "std")]
 pub mod channel;
 pub mod encoding;
+/// 内存有界管道（POSIX pipe/read/write 语义子集）：解释器层的进程组合原语。
+#[cfg(feature = "std")]
+pub mod pipe;
 
 pub use error::{Error, Result, ErrorCode, ControlFlow};
 pub use value::Value;

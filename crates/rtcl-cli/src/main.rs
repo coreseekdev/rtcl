@@ -23,6 +23,21 @@ mod repl;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// 构建解释器：`net` feature 下注入 native 宿主服务（rtcl-native 的
+/// HostHttp 实现 + `__rtcl_http`/`__rtcl_http_cancel` 桥 + `http::*` 词表）。
+fn new_interp() -> Interp {
+    #[cfg(feature = "net")]
+    {
+        let mut interp = Interp::new();
+        rtcl_native::net::install(&mut interp);
+        interp
+    }
+    #[cfg(not(feature = "net"))]
+    {
+        Interp::new()
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "rtcl", about, version)]
 struct Args {
@@ -88,7 +103,7 @@ fn main() {
 }
 
 fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
-    let mut interp = Interp::new();
+    let mut interp = new_interp();
     // tclsh 的 `history` 只在 stdin/交互运行注册（oo4 p8 钉形）。
     interp.drop_stdin_history();
 
@@ -139,7 +154,7 @@ fn run_command(cmd: &str, quiet: bool) -> Result<(), String> {
     // -c 对标 tclsh 的 **stdin** 求值语境（specs/probe.sh 的 oracle 用
     // `tclsh <<< snippet`）：stdin 运行注册 `history`，故此处不移除
     // （文件参数模式才移除，见 run_file / oo4 p8）。
-    let mut interp = Interp::new();
+    let mut interp = new_interp();
 
     // -c is eval-style interpretation (incremental), unlike -f's compiled
     // whole-script run.
@@ -177,7 +192,7 @@ fn run_repl(quiet: bool) -> Result<i32, String> {
     let mut rl: Editor<(), DefaultHistory> = Editor::with_config(config)
         .map_err(|e| format!("failed to create editor: {}", e))?;
 
-    let mut interp = Interp::new();
+    let mut interp = new_interp();
 
     // tclsh's interactive main loop runs with tcl_interactive = 1.
     let _ = interp.eval("set tcl_interactive 1");

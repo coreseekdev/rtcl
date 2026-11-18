@@ -1,0 +1,29 @@
+[package]
+name = "rtcl-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native host services for rtcl (std-backed implementations of rtcl-core host traits)"
+
+[dependencies]
+# default-features = false：本 crate 只补宿主服务，不决定解释器能力面。
+# 消费方（rtcl-cli / rogo）各自组合 rtcl-core 的 feature；feature 统一
+# 由 Cargo 在最终构建中合并，rogo 的 default-features=false 沙箱面不受影响。
+# file/io 随 std 显式带上：master 的 feature 图解耦（10quinter）后，
+# rtcl-vm 的 host.rs 数据面（NativeFs→fs_access）与 chan_io 字段仍以
+# io/file 为编译前提——纯 std 组合是 master 既有缺口（与 rtcl-native
+# 无关）。本 crate 是 native-only（wasm 构建不依赖它），多带两个
+# 数据面 feature 不触碰 wasm/exec 门控面。
+rtcl-core = { path = "../rtcl-core", default-features = false, features = ["std", "file", "io", "json"] }
+# ↑ json：合并后的 http.tcl 词表层用 `json encode` 构造桥 opts
+#   （master 10ter 轮改进），load_http 因此需要 json 命令在集。
+
+[dependencies.reqwest]
+workspace = true
+optional = true
+
+[features]
+default = []
+# 网络宿主服务：HostHttp 的 reqwest（blocking + rustls）实现 +
+# `__rtcl_http` / `__rtcl_http_cancel` 桥命令。
+net = ["dep:reqwest", "rtcl-core/net"]

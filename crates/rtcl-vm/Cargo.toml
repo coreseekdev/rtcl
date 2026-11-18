@@ -51,7 +51,8 @@ rtcl_std = ["file", "io", "exec", "clock", "regexp", "regexp-spencer", "env", "s
 # Individual Tcl extensions (each implies Rust std)
 file = ["std"]                    # file, cd, pwd, glob (自实现), readdir, source
 io = ["std"]                      # channel I/O: open, close, read, gets, seek, tell, eof, flush, fconfigure, pid
-exec = ["std"]                    # exec, wait
+exec = ["std", "dep:libc"]        # exec, wait, job——exec & 的 job prompt
+                                  # （SIGTSTP/SIGINT）在 unix 非 wasm 目标要 libc
 clock = ["std", "dep:libc"]       # clock seconds/clicks/format/scan (+ unix 本地时区)
 regexp = ["std", "dep:regex"]     # regexp, regsub
 regexp-lite = ["std", "dep:regex-lite"]  # regexp, regsub (smaller WASM binary)

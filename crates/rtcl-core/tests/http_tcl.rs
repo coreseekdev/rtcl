@@ -1,10 +1,13 @@
 //! http.tcl 词表层的原生集成测试：`__rtcl_http` 桥换成记录器，
 //! 校验请求参数过桥、完成回灌（::http::_done）的回调/变量/复位、
 //! 参数与桥错误、JSON Lines 助手。契约见 docs/ROADMAP.md §3。
+//!
+//! 桥签名自 host-http 合并起为 `id method url body opts headers`
+//! （6 参；-headers 选项，缺省空串）。
 
 use rtcl_core::{Interp, Value};
 
-/// `__rtcl_http id method url body opts` 记录器：一行一次调用，
+/// `__rtcl_http id method url body opts headers` 记录器：一行一次调用，
 /// 字段用 `|` 连接存入 `::http_test_log`。
 fn bridge_recorder(interp: &mut Interp, args: &[Value]) -> rtcl_core::error::Result<Value> {
     let cur = interp
@@ -47,7 +50,7 @@ fn get_request_reaches_bridge_and_returns_id() {
     assert_eq!(id.as_str(), "1");
     assert_eq!(
         log(&mut interp),
-        "1|GET|http://127.0.0.1:9/lines||{\"timeout\":0,\"ctype\":\"application\\/json\"}"
+        "1|GET|http://127.0.0.1:9/lines||{\"timeout\":0,\"ctype\":\"application\\/json\"}|"
     );
     // 脚本没被阻塞：回调尚未跑（完成还没回灌）
     assert_eq!(interp.eval("info exists ::got").unwrap().as_str(), "0");
@@ -79,7 +82,7 @@ fn post_carries_body_and_content_type() {
         .unwrap();
     assert_eq!(
         log(&mut interp),
-        "1|POST|http://x/echo|{\"a\":1}|{\"timeout\":0,\"ctype\":\"text\\/plain\"}"
+        "1|POST|http://x/echo|{\"a\":1}|{\"timeout\":0,\"ctype\":\"text\\/plain\"}|"
     );
 }
 

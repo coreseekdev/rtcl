@@ -34,6 +34,9 @@ pub use rtcl_vm::command;
 pub use rtcl_vm::types;
 #[cfg(feature = "std")]
 pub use rtcl_vm::channel;
+/// 内存有界管道（POSIX pipe/read/write 语义子集）：解释器层的进程组合原语。
+#[cfg(feature = "std")]
+pub use rtcl_vm::pipe;
 
 // Re-exports for convenience
 pub use error::{Error, Result};

@@ -39,6 +39,9 @@ jemalloc = ["dep:tikv-jemallocator"]
 # exclusive with wasm — rtcl-wasm never exposes this feature and the
 # runtime crate has a wasm32 compile_error.
 tk = ["dep:rtcl-tk-runtime"]
+# native HTTP 宿主动力（rtcl-native 的 reqwest blocking 服务）。默认关闭，
+# 只有显式 `--features net` 的构建携带网络实现。
+net = ["dep:rtcl-native", "rtcl-native/net"]
 
 [dependencies.rtcl-tk-runtime]
 path = "../rtcl-tk-runtime"
@@ -57,5 +60,11 @@ optional = true
 features = ["profiling"]
 
 [dependencies.rtcl-expect]
+workspace = true
+optional = true
+
+# net feature：native 宿主服务（HostHttp + __rtcl_http 桥，实现在
+# crates/rtcl-native；rtcl-cli 只负责装配）。
+[dependencies.rtcl-native]
 workspace = true
 optional = true

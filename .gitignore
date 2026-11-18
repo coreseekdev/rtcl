@@ -58,5 +58,6 @@ crates/rtcl-wasm/pkg/
 !docs/UI-GENUI.md
 !docs/JIT-WASM-GC.md
 !docs/JIT-OPCODE-DELTA.md
+!docs/JOB-CONTROL.md
 !TASK-JIT-WASM.md
 bench/profile-out/

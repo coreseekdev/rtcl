@@ -186,6 +186,71 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10vicesimustertius. 2026-11-19 feat/rtcl-wasi rebase——WASI embed ABI 蓝本激活（perf/wave2 @ 0182b7c..）
+
+用户定调：origin/feat/rtcl-wasi（WASI embed ABI 设计资产，fork 自 d71ed32d，
+17 提交 2026-10-18..20）rebase 到新 master 使其成为**活体蓝本**——瘦身配方
++ abi-v2 版本协商是保留核心。rebase 在独立 worktree（/tmp/wasi-rb-wt，本地
+分支 wasi-rb）执行，主 checkout 未切分支。
+
+**rebase 结果**：17 提交 = 16 原样重放 + 1 skip + 1 新修复提交（cb55794）。
+停点仅 2 处（预期 3——wasm-size profile 提交 de4ba33 的 `[profile]` 段
+上下文恰好无冲突自动并入）：
+1. 3de75df 根 `Cargo.toml`：members 取 master 全量列表 + 追加
+   `crates/rtcl-wasi`；`Cargo.lock` git 自动合并（构建时 cargo 校正）。
+2. a0999c4（http.tcl 词表同步）：master 现形是演进超集（6 参格式 +
+   `namespace which` 探测，10vicesimussecundus 轮已收编同源）——**skip
+   丢弃**；wasi guest 桥说明随蓝本活在 rtcl-wasi 自带的 wasi-bridge.tcl
+   与 host.rs 注释里。
+wasi 线自身文件（rtcl-wasi crate + tools/rtcl-wasi-smoke）与原分支**零
+diff**——蓝本逐字节保留（C ABI 面 `rtcl_{abi_version,alloc,free,init,
+eval,result_len,result_copy,error_len,error_copy}`、host.call 帧协议、
+guest host.rs 绑定、wasm-size profile、abi-v2 feature 全部未动）。
+
+**编译对齐点**（rtcl-core API 面几乎零漂移，主战场在 rtcl-vm 特性门）：
+- `Interp::{new,eval,set_clock,load_http,register_command,set_var}`、
+  `Value::{as_str,from_str,empty,as_list}`、`Error::runtime(msg,
+  ErrorCode::Generic)`、`host::HostClock`（now_ms/sleep_ms + `Send`）、
+  门面 features `std/regexp-lite/clock`——master 全部在位，wasi 侧
+  无需改动。
+- **cb55794 fix(rtcl-vm)**：10vicesimussecundus 轮记录的"rtcl-vm 纯 std
+  组合既有缺口"正面修复（当时 rtcl-native 靠加 `std,file,io,json`
+  绕过）——`copy_jobs` 字段/初始化随类型走 `io` 门（chan_io 模块本身
+  io 门控，原 std 门漏了依赖）、`event.rs` process_events 的 chan copy
+  泵送块补 `io` 门、`io.rs` fs_access 门 `file`→`std`（纯 std 实现，
+  NativeFs 的 readable/writable/executable 探测需要；file⇒std，native
+  构建行为不变）。修复后 rtcl-wasi guest 面（std+regexp-lite+clock）与
+  rtcl-wasm 裸 std 面都能编译。
+
+**门禁数字（2026-11-19，wasm32-wasip1）**：
+- `cargo check -p rtcl-wasi --target wasm32-wasip1`：全绿（33 个警告全是
+  裁剪组合下 master 既有死代码）；宿主 `cargo check -p rtcl-vm`（默认
+  特性）全绿。
+- release 两构建面：不带 feature 与 `--features abi-v2` 均过；产物
+  rtcl_wasi.wasm 2.25MB（历史链 3.10→2.28MB 同族）。
+- smoke（wasmtime 48.0.6 独立 lock，与 workspace lock 无冲突）：
+  - plain：`ABI: 1` / expr=2 / puts 打印 hello-rtcl-wasi / bAnAnA /
+    100k loop=4999950000（~60ms）/ error status=1 "boom" / 1M loop=
+    499999500000（~583ms）——ALL PASS。
+  - abi-v2：`ABI: 2` 协商过（init(2)→handle 1），行为同上（~56ms/~555ms）
+    ——ALL PASS。
+  - 历史基线 14ms/145ms → 现 ~60ms/~580ms（≈4x：宿主机差异与 fork 后
+    解释器演进的综合漂移；**行为零分歧**）。
+
+**蓝本状态**：origin/feat/rtcl-wasi = cb55794（force-with-lease，
+e5b23c8→cb55794）。临时 worktree 已删、本地临时分支已删。
+
+**坑**：
+- `cargo … | tail` 管道吃退出码——编译失败时 tail 仍返 0，错误日志必须
+  落文件再 grep `^error`。
+- `--force-with-lease=<ref>:<expect>` 手写 expect 值易错（假性 rejected）；
+  无参形式以远程跟踪 ref 为基线即可。
+- `/home/nzinfo/src.note/rtcl-wasi` 现存 worktree 的本地 `feat/rtcl-wasi`
+  仍停在旧形态 e5b23c8——要用需 `git fetch && git reset --hard
+  origin/feat/rtcl-wasi`（= cb55794）。
+- wasm32-wasip1 与 wasm32-unknown-unknown 构建产物同写 target/ 不同
+  target 子目录，互不覆盖但都要占构建时间。
+
 ## 10vicesimussecundus. 2026-11-19 feat/host-http 合并——native 宿主服务面（HostHttp / fd 表 exec / HostJobs）契约对齐（perf/wave2 @ f9101c9..）
 
 用户定调：合并 feat/host-http（native 侧进程自动化面）并把契约对齐到当前

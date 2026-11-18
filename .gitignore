@@ -60,5 +60,6 @@ crates/rtcl-wasm/pkg/
 !docs/JIT-OPCODE-DELTA.md
 !docs/JOB-CONTROL.md
 !docs/ABI-OPT-NOTES.md
+!docs/MODULARIZATION.md
 !TASK-JIT-WASM.md
 bench/profile-out/

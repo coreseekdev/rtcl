@@ -85,5 +85,13 @@ codegen-units = 1    # Better optimization
 panic = "abort"      # Smaller binary
 strip = true         # Strip symbols
 
+# size 轨（wasi 招②增量，docs/MODULARIZATION.md §5）：opt-s 换尺寸——
+# wasi 线同族实测 opt3→opt-s raw −15%、运行时 −40-50%。只用于尺寸
+# 敏感的嵌入分发（build.sh --size 第二产物 *_size.wasm）；dispatcher
+# 真机面恒走 perf 轨（release）。
+[profile.wasm-size]
+inherits = "release"
+opt-level = "s"
+
 [profile.dev]
 opt-level = 0

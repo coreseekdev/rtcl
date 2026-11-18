@@ -186,6 +186,112 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10vicesimusprimus. 2026-11-18 C-float——float 快车道全验收（jit-float-lane 默认 off；perf/wave2 @ e488372..）
+
+docs/JIT-WASM-GC.md §5 落地。前 agent 因宿主运行时崩溃中断于发射面半
+成品（工作区 ~312 行未提交），本节接续完成并实证修复九处。
+
+### 交付面（e488372 件①基建 / a09cde9 件②发射 / fec274f 件③探针）
+
+- 开关：cargo feature `jit-float-lane`（默认 off）→
+  `EmitConfig::default().float_lane = cfg!(feature)`——全消费面
+  （jitsh/rtcl-cli/fast 协议/classic 池）自动接线。**语义不依赖开关、
+  性能才依赖**（off = float 全走 binary_op 路线 A 行为，探针/battery/
+  judge/fuzz off 轮全绿背书）。
+- 基建：`Value::as_float_rep`（Float-rep-only 读，is_imm → None、不
+  shimmer——解释器零调用，语义零变化）+ `unbox_float_raw` 改走守卫
+  语义 + `Lane::Float` 注记（annotate_lane 休眠 pass 的展示面落点，
+  plan_guards 不消费——汇合 meet 未做）。
+- 发射（assemble.rs）：Arith/Cmp/Neg 四层块 [done, host, flt, intp]，
+  imm-imm → int 快臂；Float rep/混合 → unbox_float 守卫 + f64 内联 +
+  box_float 边界；其余 → binary_op 宿主全语义。float_capable = 加减
+  乘除 + 全比较（IEEE754 = C double）；transcendental/pow/mod/位/移
+  位不进（宿主管，§5 语义清单）。
+
+### 接续修复九处（前三枚是前 agent 半成品的硬伤）
+
+1. **缺 End**：三个 float 分支 4 块开 3 闭 → wasm 校验拒绝（control
+   frames remain）——补 host 块 End。
+2. **imm 守卫 br 目标**：BrIf(1) 实落宿主区、float path 死码——br N
+   = 跳到第 N 层块**末尾之后**；float path 须 br 0（退出 intp）。
+3. **宿主入口目标**：操作数 fetch 落宿主写 BrIf(4)（= host label =
+   **连宿主代码一起跳过**）→ dst 不写 → 返回操作数 a 原值
+   （`$r+1.0` 产 1.5）——宿主代码在 flt End 之后，须 BrIf(3)。`br N`
+   语义与 imm_guard_br_slow 的历史注释（「br 0 落慢路径 / br 1 跳过
+   慢代码」）同构互证。
+4. **imm 检查前置**：unbox_float 入参经 I32WrapI64——大 imm tagged
+   值（2^54+3）截断成小偶数 → 被当句柄探进 arena → clone 越界值
+   SIGSEGV（2^62-1 截成 -1 探空侥幸存活）。重排：imm 先分派，真句柄
+   才 unbox。
+5. **Mul 守卫深度参数化（HEAD-era 潜在 bug 首曝）**：classic 布局内
+   硬编码 BrIf(1) = done——跳过宿主且 dst 不写，`3037000499*7` 产陈
+   旧 dst。emit_int_inline 挂 slow_br（classic=0 / float ctx=1），
+   Add/Sub 溢出、Mul 大操作数、Div/Mod 除零、Shl/Shr 移位域全部统一。
+6. **Div 0/0**：float-lane 落 f64 会把 `7/0` 算成 Inf——除零守卫落宿
+   主（报错全语义）；`7.0/0` 保持 IEEE Inf 内联；`0.0/0.0` → domain
+   error（tclsh 拒造 NaN 除法结果，与 expr_ops.rs 同款）。
+7. **比较语境 exact_only**：tclsh 对 wide/double 比较**精确裁决**
+   （`9007199254740993 > 9007199254740992.0` = 1，f64 提升会收缩成邻
+   值 → 恒等分歧）——比较语境 imm 提升仅限 |v|<2^53，越界落宿主；
+   算术语境不设限（tclsh int→double 算术提升同样舍入）。
+8. **NaN 操作数守卫**：interp binary_op 对 NaN 值操作数报错（NaN 可
+   经 Inf*0.0 存在但禁再入算术；NaN 比较 = 0、Neg = NaN 不报错）——
+   fa!=fa → 落宿主。
+9. **fused float 臂**：Cmp 融合表命中时 float 臂 raw cmp 直写 b(br)
+   （真值 ≡ 慢臂 (tagged≠1)），int 快臂/float 臂/慢臂三臂贯通。
+
+### 验收与数字
+
+- 门禁：float 探针 15/15×2（lane-off/on，tclsh 8.6.17 oracle）、
+  jit_battery 52/52×2、judge interp 88/88 + judge jit 88/88×2、
+  cargo test --workspace 全绿、fuzz seed7 双变体 0 分歧、六基准
+  （默认 off）两轮无回退（rtcl 纯解释器构建不含 rtcl-jit）。
+- 发射命中实证：RTCL_JIT_DUMP_PROC fast_impl f64 op 6 条 vs lane-off
+  1 条。新基建：`RTCL_JIT_DUMP_PROC=<path>`（proc 模块落盘——
+  RTCL_JIT_DUMP 只覆盖顶层单元，第 3/4 条修复靠它定位）。
+- 探针固化：bench/scripts/jit_float_probes.sh + f01-f15（类型分派/
+  混合提升/NaN-Inf/比较/循环/Neg/宽整提升/串渲染/while 条件/mod 报
+  错/transcendental/int 溢出/精确比较/除零分界面/NaN 生命周期）；
+  preexisting 首行标记机制与 jit_battery.sh 对齐（jit==rtcl 强制）。
+- **预存分歧记录**（非本节引入，预存面归 judge/specs）：tclsh 8.6
+  对 `Inf*0.0`/`Inf-Inf` 的 NaN 乘积报 domain error，rtcl interp 放
+  行 NaN（除法 0/0 的 domain error interp 已对齐）——f15 按电池惯例
+  标 preexisting。
+- 开关保持默认 off；翻默认需 fast 路径 float 微形状基准（当前 float
+  热点场景未成 bench 案例）——reopen 线索。
+
+## 10vicesimus. 2026-11-17 C-lazy——lazy-string 全验收（rtcl-wasm 默认 on，独立于 JIT；perf/wave2 @ e81c64a/01e1431）
+
+docs/JIT-WASM-GC.md §6 落地（两笔：件① rtcl-vm 基建 / 件② rtcl-wasm
+接线）。JS 起源字符串默认保持 externref JS 原生形态，首次字节操作才
+物化（JsOnly→Dual）；Tcl→JS 反向穿越缓存池索引（NativeOnly→Dual）。
+即「跨边界的 shimmer」。
+
+### 要点（详见两笔提交 body——本节为接管索引）
+
+- choke point：`Value::as_str` 的 OnceCell 物化收窄为唯一惰性钩子入
+  口——强制物化清单（list/dict parse、string map/match/…、regexp、
+  expr、binary、eval）零代码成本。
+- `InternalRep::HostStr(u32)` + `HostStringBacking` trait（thread_local
+  注册表 = 开关；非 JS 宿主无人注册 → 零成本）+ `JsStringPool`
+  （Vec<Option<Slot>> + 空闲栈 + 槽位 rc，Clone/Drop 手工实现跟随
+  COW 深拷贝/回收）。
+- **白名单裁决修正**：string compare 不进白名单——§6 原论证有误
+  （UTF-16 码元序不保码点序，astral 混合内容次序会分叉），等 specs
+  astral probe + judge 裁决后再评估；string length 照 §6 留强制物化
+  侧（JS .length 数 UTF-16 码元 vs rtcl 现状三语义未实测前不冒险）。
+- lone surrogate 防线：JS→Tcl 统一入口 is_valid_utf16() 一次校验，
+  含孤立代理立即有损转码（U+FFFD 兜底）永不入池。
+- 顺修：channel.rs std_fd_seek 补 cfg(unix) 门（713773f 起非 unix
+  构建断了三天）。
+- 量化（www/lazy-string-bench.html A/B 交替 3 轮中位数）：echo 回传
+  12.8KB −41%、puts console 1.3KB −32% / 12.8KB −56%、1.3KB echo 持
+  平（解析主导）——「转码次数 2→0」实证。
+- 真机：fs-opfs-test.html 41 pass / 0 fail；dynmod-test.html 81 PASS。
+- 门禁：workspace 全绿 + judge interp 88/88 + judge jit 88/88 +
+  jit_battery 52/52。RTCL_DISABLE_LAZY_STRING=1 = 全转码基线回退标志
+  （A/B 与保险共用）。
+
 ## 10sexter. 2026-11-13 分派面 retain 优化：wasm-opt 接入 build.sh（-8.5%）
 
 "1.33 MiB 被 CommandFunc 表 retain"的语义澄清：elem 段本身仅 877 B

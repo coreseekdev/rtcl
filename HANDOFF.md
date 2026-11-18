@@ -186,6 +186,95 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10vicesimusquartus. 2026-11-19 ABI 版本 export + 模块化路线图 + size 轨（perf/wave2 @ e19f224..）
+
+用户三项指令（wasi 方法层综合：①模块化 ②ABI 优化 ③侧模块化推广）
+四件交付。结果层不综合的定调维持（本家 pkg 2.01MiB < wasi 2.25MB，
+99 命令 + 字节码 VM），综合的是方法层。
+
+**件1 `docs/ABI-OPT-NOTES.md`**（ABI 优化备忘录）：M1' ABI v2 面现状
+（27 import + 3 global + 错误哨兵 bits==2，`abi.rs` 单一事实源）→
+已做优化序（fast 调用协议五件 oo2 3.40×→1.26× / 守卫硬化 / M2
+icache / M3 遮蔽感知 / wasm→wasm 直通 1.46ns）→ 候选 a-d 逐条
+（内容/收益/成本/风险/时点）：a=ABI 版本 export（本轮落地）、b=
+callsite_in_loop 回落协议（reopen 级，归 M5 形态）、c=链接槽出口
+flush（语义承重件，挂账）、d=wasi alloc/free 面（**定调不采纳**——
+本家 handle-arena+宿主 RC 更优，JIT-WASM-GC §1-2 设计理由）。
+
+**件2 ABI 版本 export 落地**（wasi 版本协商模式移植，ABI-OPT-NOTES
+§3a/§4）：模块 export `rtcl_abi_version() -> i32`，编码
+`(major<<16)|minor` = v2.0（0x0002_0000；M0 三函数时代 = v1；低 16
+minor/高 16 major 约定写在 `abi.rs` 常量注释）。
+- 发射（`pass/assemble.rs`）：局部段末追加版本函数（复用 ty::RUN
+  签名 `()->i32`；索引 fast 30/常规 28——不触碰 import::RUN/
+  FAST_IMPL）+ export。
+- 宿主比对：`abi::abi_version_compatible`（major 必须相等；模块
+  minor 超前拒绝、更小放行）——wasmi `exec::execute` 与 wasmtime
+  `register_wasmtime_abi`（顶层+proc 池共用注册体）实例化后立即
+  调用，不匹配 panic 明确报错。fast/classic 池驱动不查（in-process
+  发射恒匹配，真实靶 = towasm 产物与跨构建消费方，注释在案）。
+- rtcl-wasm pkg 面：`#[wasm_bindgen] pub fn rtcl_abi_version() ->
+  u32`（与 JIT 发射面单一版本空间——同仓同发布）；worker.js
+  `await init()` 后严格相等校验，非 function/不等 → throw →
+  init-error（报错文案带 `?v=` 硬刷新指引——防 HTTP 缓存旧 pkg）。
+- 测试：`crates/rtcl-jit/tests/abi_version.rs` 4/4（常量编码/比对
+  矩阵/发射产物 export 存在性 fast+classic/run_top 端到端）；
+  `test.js` +2 断言（pkg export=0x00020000）；新增
+  `test-worker.mjs`（node worker_threads 装载护栏：ready=校验过 +
+  exec 探针 3/3）。
+
+**件3 `docs/MODULARIZATION.md`**（模块化路线图）：现状盘点表
+（CommandFunc 1.33MiB 结构性 retain / file+io 164KiB HostFs 保留
+理由 / clock+package 85KiB 候选 / stdlib proc 非 wasm / C-float
+C-lazy 已落地）→ 里程碑链（regexp-lite 97KiB→regexpmod→
+spencermod→encodingmod/jsonmod→dynmod ABI v2→HostFs）→ **侧模块
+ABI v1 规范正文**（数值 C ABI 五函数 `<name>_abi/_exec/alloc/
+res_ptr/res_len` + envelope LE u32 记录表 tag 0/1 + 错误同文 +
+崩溃面 no_std loop / std panic=abort + 独立 workspace 构建配方 +
+dynmod v2 挂线协议——spencermod 120KB 逐条成文）→ 候选拆分清单
+（clock+package 默认建议 JS dynmod 形态——计数面零变化；纯剔除
+形态 wasm 命令计数会动，**需用户拍板**）→ 发布配方矩阵 full/slim/
+core。
+
+**件4 size 轨**（wasi 招②增量）：根 `Cargo.toml` 新
+`[profile.wasm-size]`（inherits release，opt-level "s"）+
+`build.sh --size` 第二产物 `pkg/rtcl_wasm_bg_size.wasm`（JS 胶水
+两轨同面，部署换 .wasm 即用；两轨都过 wasm-opt -Oz）。实测数字链
+（HEAD e19f224+件2）：
+
+| 轨 | raw | pkg | gzip |
+|---|---|---|---|
+| perf（opt3） | 2,824,454 | 2,105,384（2.01MiB） | 783,632 |
+| size（opt-s） | 2,390,402 | **1,731,902（1.65MiB）** | 674,592 |
+| Δ | −15.4% | **−17.7%** | −13.9% |
+
+运行时代价 −40-50%（wasi 线同族参照）——只用于尺寸敏感嵌入分发，
+dispatcher 真机面恒走 perf 轨。
+
+**门禁（2026-11-19）**：cargo test --workspace 全绿；judge interp
+88/88 + judge jit 88/88×2（jitsh release 双 feature
+jit-exec,jit-native 构建；RTCL_JIT_ENGINE=wasmtime 双轮）；真机
+8933 COOP/COEP：fs-opfs-test **41/41** + dynmod-test **41/41**
+（worker 启动序列含 ABI 校验，ready 正常 = 校验通过）；node
+test.js 26/26 + test-worker.mjs 3/3；wasm 命令面零改动（本轮只动
+export/profile，无命令增删）。
+
+**坑**：
+- worker.js 顶部的 `self.location`（?v= 参数读取）在 node
+  worker_threads 链直接 ReferenceError——`?v=` 引入时的不一致
+  （spencermod.js 同款用了 `globalThis.self?`）——本轮修复为
+  `globalThis.self?.location?...`，node 装载护栏恢复。
+- node 下 wasm-bindgen `init()` 无参走 fetch(import.meta.url) →
+  undici fetch failed——worker 启动序列加 node 分支
+  （readFileSync pkg 字节传入，test.js 同款）；浏览器分支原样。
+- worker_threads 下 `terminate()` 使 worker 以码 1 退出——
+  test-worker.mjs 的 exit 处理须以 done 标志区分成功收尾。
+- 自定义 profile 名含连字符合法（`[profile.wasm-size]` +
+  `cargo build --profile wasm-size` 实证）。
+- 真机 dynmod 页的"初始命令计数"是动态基线（本轮 HEAD = 102，
+  host-http 合并后的面）——T1/T9 按动态基线比对，wasm 初始 99 的
+  历史数字不适用于现 HEAD 的绝对值断言。
+
 ## 10vicesimustertius. 2026-11-19 feat/rtcl-wasi rebase——WASI embed ABI 蓝本激活（perf/wave2 @ 0182b7c..）
 
 用户定调：origin/feat/rtcl-wasi（WASI embed ABI 设计资产，fork 自 d71ed32d，

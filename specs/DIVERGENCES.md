@@ -518,6 +518,43 @@ procedure 帧名矩阵）。
 
 非缺陷、不再修：`string byterange` 是 rtcl 扩展，tclsh 无此子命令。
 
+## 2026-11-19 clock+package 外置（wasm 剥离 → JS dynmod 补回，K/P 区 21 例真机）
+
+wasm 构建剥离 clock/package feature（净重 85KiB raw；perf 轨 pkg
+−73,545 / size 轨 pkg −56,359）；命令面经 dynmod 注入
+www/clockpkgmod.js 同面补回（`::clock`/`::package` wrapper + clockpkg
+命名空间，计数面 99=99 逐字不变）。行为矩阵自 native clock.rs
+（D-24/D-25 收口态）逐条移植：format 规定符全集 / scan -format
+（strptime 面）/ 自由 scan 怪值收口 / add 顺序单位与月末夹取 /
+儒略-格里历切换 / 错误消息+errorCode 同文（__CLKERR 哨兵列表 +
+wrapper `return -code error -errorcode` 解包——JS 派发前缀不外泄）。
+118 例 node 差分（期望值 = rtcl release 探针钉定）全过。
+
+**wasm 构建特有升级（相对剥离前的 UTC-only stub，非分歧）**：
+clock format/scan/add 默认渲染 = 宿主本地时区（Date 偏移，DST 由引擎
+tzdata 承担——native unix 面 libc localtime_r 同源数据）；`-timezone`
+支持 IANA 名（Intl.DateTimeFormat 校验/求值——剥离前 wasm 恒报 not
+found）。tclsh 对齐度不降反升（如 `-timezone Asia/Shanghai` 的 %z）。
+
+**JS 面语义定调（wasm 构建特有分歧）**：
+- `%Z` 缩写：-gmt 恒 "GMT"；否则 Intl short 名（"UTC"/"GMT+8" 风格）
+  ——与 libc/tclsh 的缩写表（"CST" 式）不同文；%z（+HHMM 数字偏移）
+  两面同值。
+- `package require` 的 pkgIndex 扫描在 wrapper proc（Tcl 面）编排
+  （JS 命令回调无法重入解释器 source）；registry 状态在 JS 模块。
+  `package unknown`/`prefer`/`ifneeded`/`present`/`versions` 等 tclsh
+  子命令不在 native 面也不在 JS 面（native package.rs 六子命令同形）。
+- DST 消解：fold（秋拨双解）取转换前偏移（DST 支；tclsh 同）；gap
+  （春拨空档）落转换后墙钟（glibc mktime isdst=-1 同形）。native 的
+  with_zone 在同进程 gap 例之后 fold 会取反常值（glibc 状态泄漏，
+  P42 探针钉形 1636266600 vs 干净上下文 1636263000）——JS 恒取干净
+  值（tclsh 同）。
+- `clock scan -format` 的 `%Z` + `-base 0` 组合：JS 随 native
+  （61200）；tclsh 是 -25200（native 既有残差，非本轮引入）。
+- 错误 errorInfo 帧链含 wrapper proc 帧（clock 的 Tcl 实现帧残差
+  D-25 沿用）；`-locale` 收值忽略（native 同）；超出 Date/Intl 精度
+  域（|epoch| > 2^53 秒级/BC 年代 wall 场求值）退化 offset-0。
+
 ## 2026-11-13b regexp 外置（wasm 语义子集，R/S 区 22/22 真机）
 
 wasm 子集剔除 regexp-lite（净重 97KiB raw）；regexp/regsub 经 dynmod

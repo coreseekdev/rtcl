@@ -186,6 +186,107 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10vicesimusquintus. 2026-11-19 clock+package 剥离 → JS dynmod 补回（方案 a；perf/wave2 @ e2f956a..）
+
+用户拍板候选 #1 落地形态 = **方案 a（JS dynmod）**：clock/package 从
+wasm 构建剥离，JS 面注册同面命令补回——命令计数面零变化。
+
+**盘点结论（选型依据）**：
+- clock native 面 = clock.rs 2252 行（D-24/D-25 收口态：seconds/clicks/
+  microseconds/milliseconds/format/scan〔-format strptime 面 + 自由
+  scan 怪值收口〕/add；儒略-格里切换）。wasm 构建上 clock 全子命令在
+  但是 **UTC-only stub**（clock = ["std","dep:libc"]，libc 不进 wasm：
+  local_offset_name 恒 None、with_zone 恒等、-timezone 恒报 not found）。
+- package native 面 = package.rs 166 行（provide/require/names/forget/
+  vcompare/vsatisfies；require 的 pkgIndex 扫描走 file feature）。
+  `interp.packages` map 只被 package.rs 自用；stdlib.tcl（init.tcl 移植
+  的 auto_load/auto_path 面）**不调用 package 命令**——零内部依赖。
+  **选型 = 纯 JS 全实现**（最小内建 + 扩展形态无必要）：registry 状态
+  在 JS 模块；require 的 auto_path/pkgIndex 流程在 wrapper proc（Tcl
+  面）编排——JS 命令回调无法重入解释器 source，native pkg_require 的
+  逐步同构用 Tcl 写（registry get → auto_path foreach → file exists →
+  catch source → re-get → can't find package）。
+- JS 面优势（方案 a 的额外收益，**功能升级**）：format/scan/add 默认
+  渲染 = 宿主本地时区 + `-timezone` 支持 IANA 名（Intl tzdata 求值）
+  ——剥离前 wasm 是 UTC-only stub，两能力皆缺；tclsh 对齐度不降反升。
+
+**件1 `www/clockpkgmod.js`**（JS 同面实现，~1050 行）：
+- clock 面：子命令 Tcl_GetIndexFromObj 语义（精确/唯一前缀/歧义）、
+  format 规定符全集（%Y %y %m %d %e %H %I %M %S %p %P %a %A %b %h %B
+  %j %w %Z %z %n %t %% %s %c %D %T；未知原样）、scan -format（字段
+  合成规则/%y 窗口/%p/%z 回推/%Z 缩写表优先）、自由 scan（ISO/
+  YYYYMMDD/斜杠/月名/日名/D-Mon、时刻 am/pm/裸数字 HHMM、星期
+  next/last/Plain、相对短语 ago 否定域、军事单字母、TimezoneTable
+  全表、next|last <月名> 怪公式）、add 顺序单位 + 月末夹取 + 儒略
+  切换、错误消息+errorCode 同文（__CLKERR 哨兵列表，wrapper
+  `return -code error -errorcode` 解包重抛——"JS command
+  '__dynmodv2:…' error:" 派发前缀不外泄；正常值 __CLKOK 包裹消除
+  结果首词歧义）。
+- 时区缝：zone ctx 三态（gmt/IANA/本地）；wall 求值 = Intl
+  formatToParts（hourCycle h23）+ 自算 JDN 基（规避 Date.UTC 的
+  0-99 年 legacy 映射）；civil→epoch 双偏移候选回验（fold 取转换
+  前偏移 = DST 支〔tclsh 同〕、gap 落转换后墙钟〔glibc 同〕）。
+  %Z = Intl short 名（GMT/UTC/GMT+8 风格——DIVERGENCES 定调）。
+- package 面：六子命令 + `_registry_get` 内部查询面（公开面不带）；
+  arity 消息随 native 的 wrong_args_with_usage **双前缀**形态
+  （"package provide package provide name ?version?"）。
+
+**件2 wasm 剥离 + 挂线**：rtcl-wasm Cargo.toml features 去掉
+clock/package（rtcl-vm 侧 CMD_TABLE_CLOCK/PKG 已 cfg 门控，native
+rtcl-cli 不动）；rtcl-worker.js boot 序列 encoding 块后加 clockpkg
+块（`namespace which -command ::clock` 不存在 → register_module
+('clockpkg') + load + CLOCKPKG_SETUP_TCL〔::clock/::package wrapper +
+pkg_require 编排〕）；dynmod-test.html 同款挂线（T9 动态基线前）。
+
+**验证（全绿）**：
+- node 差分 118/118：期望值 = target/release/rtcl 探针钉定（两批
+  /tmp/clock_probe*.tcl），含 DST gap/fold（1615707000/1636263000）、
+  %Z 缩写表（est/z/军事单字母）、%y 窗口、儒略历 0001-01-01、
+  est5edt/裸月名/裸 HHMM 怪值、package 六子命令+arity 双前缀。
+- 计数面对表：worker boot 后 `info commands` 清单 99=99 **逐字相同**
+  （node worker_threads 探针 dump diff；clock/package 名称在列，
+  实现面换成 JS）。dynmod 页初始计数 102 不变。
+- 尺寸数字链（两轨，wasm-opt 后）：
+
+| 轨 | raw | pkg | gzip |
+|---|---|---|---|
+| perf 剥离前 | 2,824,454 | 2,105,384 | 783,632 |
+| perf 剥离后 | 2,739,147 | 2,031,839（1.94MiB） | 756,245 |
+| **Δ perf** | **−85,307**（预测 85KiB 命中） | **−73,545** | −27,387 |
+| size 剥离前 | 2,390,402 | 1,731,902 | 674,592 |
+| size 剥离后 | 2,324,340 | 1,675,543（1.60MiB） | 653,116 |
+| **Δ size** | −66,062 | **−56,359** | −21,476 |
+
+- 门禁：cargo test --workspace 全绿；judge interp 88/88 + judge jit
+  88/88（jitsh release 双 feature）；node test.js 26/26 +
+  test-worker.mjs 3/3；真机 8933 COOP/COEP + ThreadingHTTPServer：
+  fs-opfs-test **41/41**（worker 路径，红线 file/io/OPFS 0 变化）+
+  dynmod-test **62/62**（原 41 + 新 K1-K13 clock / P1-P8 package，
+  期望值 = native 探针钉定：格式矩阵抽测/错误码面/pkgIndex 扫描
+  全链路〔memory fs 写 pkgIndex.tcl → auto_path → source → require〕）。
+
+**坑**：
+- native 的 clock fold（秋拨）在同进程先跑过 gap 例后取反常值
+  （with_zone 的 glibc 状态泄漏：P42 = 1636266600 vs 干净上下文
+  1636263000 = tclsh 值）——JS 恒取干净值，探针钉值必须用干净上下文
+  （单独脚本跑），否则差分基线本身被污染。
+- `clock scan -format` + `%Z` + `-base 0`：native 61200 / tclsh
+  -25200——native 既有残差（D-25 缩写表探针未覆盖该组合），JS 随
+  native。
+- native package 的 arity 消息是 wrong_args_with_usage 的
+  command+usage 拼接 = **双前缀**（"package provide package provide
+  name ?version?"）——JS 面照抄（单前缀是直觉陷阱）。
+- tclsh 的 %D 是 4 位年（01/01/1970）、native 是 2 位年
+  （01/01/70）——native clock.rs 的 %D 用 year%100；JS 随 native。
+- parseTclInt 十进制臂必须测剥号后的 body（带号原文测 regex 会把
+  负数全拒——首轮差分 -62135769600/-1 两例即此坑）。
+- 文档节名顺延勘误：前人指令写 "10vicesimustertius"，但 tertius 节
+  已存在（line 278）——按序列本节为 **10vicesimusquintus**。
+
+文档同步：docs/MODULARIZATION.md（§1/§2/§4/§5 落地记录 + 数字链）、
+specs/DIVERGENCES.md（2026-11-19 clock+package 外置节：%Z 定调/
+require 编排/DST 消解/native 残差清单）。
+
 ## 10vicesimusquartus. 2026-11-19 ABI 版本 export + 模块化路线图 + size 轨（perf/wave2 @ e19f224..）
 
 用户三项指令（wasi 方法层综合：①模块化 ②ABI 优化 ③侧模块化推广）

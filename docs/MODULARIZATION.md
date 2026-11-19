@@ -1,9 +1,9 @@
 # rtcl 模块化路线图（wasm dispatcher 面收窄）
 
-> **状态**：定稿（2026-11-19）。本文是「执行模块化」的路线交付：现状
-> 盘点 + 里程碑链 + **侧模块 ABI v1 规范（正文）** + 候选拆分清单
-> （待用户定夺）+ 发布配方矩阵（size 轨数字由 `build.sh --size`
-> 供给）。
+> **状态**：定稿（2026-11-19；同日 clock+package 落地）。本文是「执行
+> 模块化」的路线交付：现状盘点 + 里程碑链 + **侧模块 ABI v1 规范（正
+> 文）** + 候选拆分清单（clock+package 已按方案 a 落地，余项状态在表）
+> + 发布配方矩阵（size 轨数字由 `build.sh --size` 供给）。
 > 方法层来源：feat/rtcl-wasi 瘦身四招（依赖声明层裁剪 / size profile
 > / 服务宿主化 / imports 最小化）——本路线取 ①③ 为主产线、②（size
 > profile）为增量；结果层不综合（master 产物已同时比 wasi 更小更强：
@@ -23,17 +23,18 @@ wasm-bindgen + wasm-opt -Oz 之后；gzip = pkg 压缩面。
 |---|---|---|---|
 | **CommandFunc 函数指针表** | **1.33MiB（58%）** | 结构性 retain：elem 段仅 877B（函数索引表），1.33MiB 是只能经 fn 指针间接到达的命令函数体——LLVM 看不到直接调用点，无法内联/常量折叠/去重。**尺寸现象而非死代码**（热路径不踩表：Tier-1 命令在 vm_exec 已编译为操作码；V8/wasmtime 对 call_indirect 做 inline cache） | 不可死剥离。限制内联已是现状（profile 满配：lto/codegen-units=1/panic=abort + wasm-opt -Oz）；薄包装合并（cmd_fcopy→chan_copy 式 delegator）量级 <20KiB，待真机回归护栏 |
 | **file+io（HostFs 服务化）** | 净重 **164KiB** raw（core 2,551,625 → 2,715,288） | **不可拆**——OPFS 文件面是 dispatcher 的功能（网页里 open/gets/puts/file/glob/source 真实可用），不是死重。尺寸不是外置动机（6% 净重），动机是功能诚实性；本轮已完成形态升级：通道协议面留原生（chan/fconfigure/缓冲/反射——通道状态在解释器里），数据面走 HostFs 服务 trait（48 处 std::fs 直连点收敛；native=NativeFs，wasm=JsFs→OPFS/SAB 桥） | 保留。嵌入方不要 file/io 时 feature 已可独立关（`(std,dynmod)` 可编译） |
-| **已外置 JS 面** | ~0（wasm 内已剔除） | regexp（regexpmod.js 语义子集 + spencermod.wasm 全集）、encoding（encodingmod.js，86 名宽表 TextDecoder/TextEncoder）、json（jsonmod.js，数字原文保留 + Tcl 序列化） | 完成。命令面经 dynmod 注入，wasm 初始计数不变 |
+| **已外置 JS 面** | ~0（wasm 内已剔除） | regexp（regexpmod.js 语义子集 + spencermod.wasm 全集）、encoding（encodingmod.js，86 名宽表 TextDecoder/TextEncoder）、json（jsonmod.js，数字原文保留 + Tcl 序列化）、**clock+package（clockpkgmod.js，2026-11-19 落地）** | 完成。命令面经 dynmod 注入，wasm 初始计数不变 |
 | **侧模块 spencermod.wasm** | **120KB**（独立构建） | 本体小 + 热路径侧载的样板：native 同源 Spencer 引擎，数值 ABI + envelope 交接；regsub/捕获/选项全集对齐 native | 完成（§3 规范正文以此为参照实现） |
-| **clock + package** | 与 regexp-lite 合计 **85KiB** raw | wasm 半死面：clock 在 wasm 是 UTC-only stub（无本地时区），package 是 pkgIndex 面（网页无文件系统包发现）——dispatcher 只用得上其中一小片 | **候选拆分**（§4，需用户拍板语义面） |
+| **clock + package** | 净重 **85KiB** raw（perf 轨剥离实测 −85,307） | ~~候选拆分~~ → **落地（2026-11-19，方案 a = JS dynmod）**：wasm 的 clock 本是 UTC-only stub（libc 不进 wasm），package 是 pkgIndex 面——JS 面（clockpkgmod.js）同面补回并**升级**：本地时区 + IANA `-timezone`（Intl tzdata 求值）+ 完整 D-24/D-25 行为矩阵移植 | 完成（§4 记录定调；计数面零变化） |
 | **stdlib proc** | 0（wasm） | ui/http/log/rules 等是 Tcl 源码（`load_*` 注入），非 wasm 代码 | 非议题 |
 | **C-float / C-lazy** | — | float 快车道（feature 默认 off，off 轮零成本）/ lazy-string（wasm 默认 on） | 已落地（HANDOFF §10vicesimusprimus / §10vicesimus） |
 
-本体数字链（perf 轨，wasm-opt 后）：raw **2.69MiB** → pkg **2.01MiB**
-（2,105,384 B）→ gzip **765KiB**（历史链：raw 2.74MiB → pkg 2.02MiB /
-2,121,993 B / gzip 791KiB @ 10sexter；host-http 合并后微缩）；wasm 命令计数
-**99**（无 socket [net 门控]、无 exec [wasm 子集本就不含]；load 后
-101、unload 回 99）。
+本体数字链（perf 轨，wasm-opt 后，2026-11-19 clock/package 剥离后）：
+raw **2.61MiB**（2,739,147）→ pkg **1.94MiB**（2,031,839）→ gzip
+**738KiB**（756,245）；历史链：raw 2.69MiB → pkg 2.01MiB（2,105,384）/ gzip
+765KiB（剥离前 @ 10vicesimusquartus）；wasm 命令计数 **99**（无 socket
+[net 门控]、无 exec [wasm 子集本就不含]；clock/package 由 clockpkgmod
+JS 面补回，`info commands` 逐字不变；load 后 101、unload 回 99）。
 
 ## 2. 已完成的模块化里程碑链
 
@@ -44,6 +45,8 @@ regexp-lite 剔除（97KiB raw，2.84→2.74MiB）
   → encodingmod/jsonmod     encoding 86 名宽表 + JSON 全面（JS dynmod）
   → dynmod ABI v2           列表值单词直传（join 分隔符协议退役）
   → HostFs                  file/io 数据面宿主服务化（OPFS/SAB 两形态）
+  → clockpkgmod.js          clock+package 剥离（85KiB raw）+ JS 同面补回
+                           （本地时区/IANA -timezone 升级，2026-11-19）
 ```
 
 配套机制：`load`/`unload` 宿主预实例化注册表（wasm 无 dlopen——
@@ -153,11 +156,11 @@ wrapper proc（Tcl 侧）负责选项解析/upvar 变量写入/输出形组装�
 语义 wrapper 与数值引擎分离，胶水不含选项逻辑（spencermod 的
 `SPENCER_SETUP_TCL` 即此层）。
 
-## 4. 候选拆分面清单（按收益/风险排序，待用户定夺）
+## 4. 候选拆分面清单（按收益/风险排序）
 
-| # | 候选 | 收益 | 成本/风险 | 建议 |
+| # | 候选 | 收益 | 成本/风险 | 状态 |
 |---|---|---|---|---|
-| 1 | **clock+package（85KiB raw）** | wasm 半死面剔除：clock stub（UTC-only）与 package pkgIndex 面在网页 dispatcher 无真实用户；JS 面易实现（Date.now 换算 + 内存注册表）或侧模块化 | **语义变化需拍板**：拆分后 wasm 命令计数 99→93（具体以拆分时实测为准），`info commands` 面/依赖此二命令的脚本行为变化；嵌入方 full 配方不再含（feature 已门控，slim 配方本就不含） | 拆分形态二选一：JS dynmod（低风险，worker 无条件装载 = 计数面不变）vs 纯剔除（收益满额，计数面变化）。**默认建议 JS dynmod 形态**——dispatcher 语义面零变化 |
+| 1 | **clock+package（85KiB raw）** | wasm 半死面剔除：clock stub（UTC-only）与 package pkgIndex 面在网页 dispatcher 无真实用户 | 计数面风险 → **JS dynmod 形态消除**：worker 无条件装载补回同面命令 | **落地（2026-11-19，用户拍板方案 a）**：wasm 剥离 + www/clockpkgmod.js 补回，`info commands` 面 99=99 逐字不变；JS 面行为矩阵自 native clock.rs/package.rs 逐条移植（118 例 node 差分 + 真机 K/P 区 21 例），并升级本地时区/IANA `-timezone`。require 的 pkgIndex 扫描在 wrapper proc（Tcl 面编排 source——JS 命令回调无法重入解释器），registry 状态在 JS 模块 |
 | 2 | CommandFunc 1.33MiB | —（结构性） | 不可死剥离（§1 定调）；薄包装合并 <20KiB 需真机回归护栏 | 挂账不动 |
 | 3 | file+io 164KiB | —（**不可拆**） | OPFS 文件面是 dispatcher 功能：`open/gets/puts/file/glob/source` 在网页真实可用（fs-opfs 41/41 真机）；服务化已完成（数据面 HostFs、协议面原生） | 不拆（理由见 §1） |
 | 4 | C-float/C-lazy | 已落地 | — | — |
@@ -166,22 +169,25 @@ wrapper proc（Tcl 侧）负责选项解析/upvar 变量写入/输出形组装�
 
 | 配方 | features | raw | pkg | gzip | 适用场景 |
 |---|---|---|---|---|---|
-| **full**（默认） | std,file,io,clock,package,dynmod,json | 2.69MiB（2,824,454） | **2.01MiB**（2,105,384） | 765KiB（783,632） | 网页 dispatcher 完整面（99 命令 + OPFS + spencermod/encodingmod/jsonmod 注入） |
-| **slim** | std,file,io,dynmod | 2.59MiB（10quinter 实测 2,715,288，历史口径含 json） | ~1.8MiB（估） | — | 嵌入变体：无 clock/package/json（json 走 JS 注入）；OPFS 保留 |
+| **full**（默认） | std,file,io,dynmod,json（clock/package 已剥离→JS 注入） | 2.61MiB（2,739,147） | **1.94MiB**（2,031,839） | 738KiB（756,245） | 网页 dispatcher 完整面（99 命令〔clock/package 由 clockpkgmod 补回〕+ OPFS + spencermod/encodingmod/jsonmod/clockpkgmod 注入） |
+| **slim** | std,file,io,dynmod | 2.59MiB（10quinter 实测 2,715,288，历史口径含 json） | ~1.8MiB（估） | — | 嵌入变体：无 json（走 JS 注入）；OPFS 保留 |
 | **core** | std,dynmod | 2.43MiB（10quinter 实测 2,551,625，历史口径含 json） | — | — | 极简面：嵌入方自带 fs/console 服务实现 |
 
 （slim/core 的现 HEAD 重测挂账——需临时改 Cargo.toml feature 组合，
-非本轮范围；表中数字为 10quinter 时的同口径链。）
+非本轮范围；表中数字为 10quinter 时的同口径链。full 行 = 2026-11-19
+clock/package 剥离后实测：raw −85,307 / pkg −73,545 / gzip −27,387。）
 
 **size 轨**（wasi 招②增量）：`./build.sh --size` 产出第二产物
 `rtcl_wasm_bg_size.wasm`（profile `wasm-size`，opt-level "s"）。
-实测数字链（2026-11-19，HEAD e19f224 + ABI 版本 export）：
+实测数字链（2026-11-19，clock/package 剥离后；括号内为剥离前
+10vicesimusquartus 口径）：
 
 | 轨 | raw | pkg（bindgen + wasm-opt -Oz） | gzip |
 |---|---|---|---|
-| perf 轨（release, opt3） | 2,824,454 | 2,105,384（2.01MiB） | 783,632 |
-| size 轨（wasm-size, opt-s） | 2,390,402 | **1,731,902（1.65MiB）** | **674,592** |
-| Δ | −15.4% | **−17.7%** | −13.9% |
+| perf 轨（release, opt3） | 2,739,147（2,824,454） | 2,031,839（2,105,384） | 756,245（783,632） |
+| size 轨（wasm-size, opt-s） | 2,324,340（2,390,402） | **1,675,543（1,731,902）** | **653,116（674,592）** |
+| 轨内 Δ | −15.1% | **−17.6%** | −13.6% |
+| 剥离 Δ（size 轨） | −66,062 | **−56,359** | −21,476 |
 
 **运行时代价 −40-50%**（wasi 线 opt3→opt-s 同族实测参照）——只用于
 尺寸敏感的嵌入分发；dispatcher 真机面恒走 perf 轨。JS 胶水两轨同面

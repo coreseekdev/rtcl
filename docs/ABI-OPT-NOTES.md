@@ -115,7 +115,14 @@
 - **时点**：reopen 线索挂账，须先有 upvar×OO×JIT 的差分专项护栏
   （现 judge 覆盖不针对 flush 时序）再议。
 
-### d. alloc/free 显式面（wasi 借鉴项）——**定调不采纳**
+### d. alloc/free 显式面（wasi 借鉴项）——**JIT 值交换面不采纳；JS 数据面已在用（用户定调澄清 2026-11-19）**
+
+> **范围澄清（用户确认）**：alloc/free 的 malloc/free 模式在 **JS ↔ wasm
+> 数据面是必要且已在用的标准做法**——spencermod 五函数（alloc/exec/
+> res_ptr/res_len）即显式 malloc/free；wasm-bindgen glue 的字符串跨界
+> 是隐式同款（写线性内存 → Rust 重建）；HostFs 数据面同型。侧模块
+> ABI v1 规范（MODULARIZATION.md）的五函数正是该模式。本条「不采纳」
+> **仅限 JIT ABI 的值交换面**——两个层面并存，互不替代。
 
 - **内容**：wasi 线 C ABI 面含 `rtcl_alloc`/`rtcl_free`——宿主侧
   显式管理 guest 线性内存的生命周期。本家对应面 = handle-arena +

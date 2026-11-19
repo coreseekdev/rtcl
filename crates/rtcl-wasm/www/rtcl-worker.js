@@ -19,6 +19,7 @@ const PKG_V = params.get('v') || '';
 const { default: init, RtclHandle, rtcl_abi_version } = await import('../pkg/rtcl_wasm.js' + (PKG_V ? '?v=' + PKG_V : ''));
 import { makeRegexpMod } from './regexpmod.js';
 import { makeEncodingMod } from './encodingmod.js';
+import { makeClockPkgMod, CLOCKPKG_SETUP_TCL } from './clockpkgmod.js';
 // spencermod：Spencer 全集侧模块装载胶水 + ::regexp/::regsub wrapper
 //（单一注册源；dynmod-test.html 同款 import——勿重复注册）。
 import { setupSpencerMod } from './spencermod.js';
@@ -560,6 +561,16 @@ if (typeof globalThis.__recv !== 'function') {
       handle.register_module('encoding', makeEncodingMod());
       handle.exec('proc ::encoding {args} { ::encoding::encoding {*}[join $args "\u0001"] }');
       handle.exec('load encoding');
+    }
+    // clock+package 外置（2026-11-19 方案 a：JS dynmod——wasm 构建不含
+    // native clock/package，feature 剥离；JS 面注册同面命令补回，命令
+    // 计数面零变化）。行为矩阵 = native clock.rs/package.rs 同形移植
+    //（clockpkgmod.js）；时区能力升级：本地时区 + IANA -timezone
+    //（wasm UTC-only stub 的功能增益，见 MODULARIZATION.md）。
+    if (!handle.exec('namespace which -command ::clock')) {
+      handle.register_module('clockpkg', makeClockPkgMod());
+      handle.exec('load clockpkg');
+      handle.exec(CLOCKPKG_SETUP_TCL);
     }
 
     globalThis.postMessage({ type: 'ready', fs: fsNote });

@@ -60,6 +60,7 @@
 <script type="module">
 import init, { RtclHandle } from '../pkg/rtcl_wasm.js';
 import { makeJsonMod } from './jsonmod.js';
+import { makeClockPkgMod, CLOCKPKG_SETUP_TCL } from './clockpkgmod.js';
 // spencermod 装载胶水与 rtcl-worker.js 共用（单一注册源）——本页
 // handle 只 register 一次，勿重复注册。
 import { setupSpencerMod } from './spencermod.js';
@@ -357,6 +358,75 @@ const CASES = [
   { name: 'F12 file readlink（无 symlink → tclsh 原文）',
     script: 'catch {file readlink /demo/hello.txt} e; set e',
     want: 'could not read link "/demo/hello.txt": invalid argument' },
+  // ── clock 外置（clockpkgmod；期望值 = native clock.rs 行为矩阵
+  //    差分钉定——/tmp 探针 × rtcl release 双跑，见 HANDOFF
+  //    10vicesimustertius）───────────────────────────────────────
+  { name: 'K1 format %Y-%m-%d -gmt（epoch 0）',
+    script: 'clock format 0 -format %Y-%m-%d -gmt 1',
+    want: '1970-01-01' },
+  { name: 'K2 format 默认形 -gmt（%Z = GMT）',
+    script: 'clock format 0 -gmt 1',
+    want: 'Thu Jan 01 00:00:00 GMT 1970' },
+  { name: 'K3 format %z -timezone（IANA 面升级）',
+    script: 'clock format 0 -format %z -timezone Asia/Shanghai',
+    want: '+0800' },
+  { name: 'K4 format 本地时区升级（%z = 宿主偏移）',
+    script: 'clock format 0 -format %z',
+    want: (() => { const o = -new Date(0).getTimezoneOffset();
+      return (o < 0 ? '-' : '+') + String(Math.floor(Math.abs(o) / 60)).padStart(2, '0') +
+        String(Math.abs(o) % 60).padStart(2, '0'); })() },
+  { name: 'K5 scan -format（strptime 面）',
+    script: 'clock scan 2000-01-01 -format %Y-%m-%d -gmt 1',
+    want: '946684800' },
+  { name: 'K6 scan 自由格式 ISO -gmt',
+    script: 'clock scan {2000-01-02 03:04:05} -gmt 1',
+    want: '946782245' },
+  { name: 'K7 scan 相对短语（2 days）',
+    script: 'clock scan {2 days} -base 0 -gmt 1',
+    want: '172800' },
+  { name: 'K8 scan %Z 缩写表（est = UTC-5）',
+    script: 'clock scan {12:00 est} -format {%H:%M %Z} -base 0',
+    want: '61200' },
+  { name: 'K9 add 月末夹取/顺序单位',
+    script: 'list [clock add 0 1 month -gmt 1] [clock add 949363200 1 day 1 month -gmt 1]',
+    want: '2678400 951955200' },
+  { name: 'K10 儒略历（0001-01-01）',
+    script: 'clock format -62135769600 -format %Y-%m-%d -gmt 1',
+    want: '0001-01-01' },
+  { name: 'K11 未知子命令错误（消息+errorCode 同 native）',
+    script: 'catch {clock foo} e; concat $e | $::errorCode',
+    want: 'unknown or ambiguous subcommand "foo": must be add, clicks, format, microseconds, milliseconds, scan, or seconds | TCL LOOKUP SUBCOMMAND foo' },
+  { name: 'K12 scan mismatch 错误',
+    script: 'catch {clock scan 2000-01-01 -format {%Y-%m-%d %H:%M}} e; concat $e | $::errorCode',
+    want: 'input string does not match supplied format | CLOCK badInputString' },
+  { name: 'K13 DST gap/fold（IANA tzdata 求值）',
+    script: 'list [clock format 1615705200 -format {%H:%M %Z} -timezone America/New_York] [clock scan {2021-11-07 01:30} -format {%Y-%m-%d %H:%M} -timezone America/New_York]',
+    want: '{03:00 EDT} 1636263000' },
+  // ── package 外置（registry 在 JS；require 经 wrapper 编排 source）──
+  { name: 'P1 provide + names 排序',
+    script: 'package provide tcllib 1.4; package provide xlib 0.9; package names',
+    want: 'tcllib xlib' },
+  { name: 'P2 provide 查询形',
+    script: 'package provide foo 2.0; package provide foo',
+    want: '2.0' },
+  { name: 'P3 require registry 命中',
+    script: 'package provide x 1.0; package require x',
+    want: '1.0' },
+  { name: 'P4 require 未提供 → native 同文错误',
+    script: 'catch {package require nosuch} e; set e',
+    want: 'can\'t find package nosuch' },
+  { name: 'P5 vcompare/vsatisfies',
+    script: 'list [package vcompare 1.2.3 1.10] [package vsatisfies 2.0 1.5]',
+    want: '-1 1' },
+  { name: 'P6 forget + names',
+    script: 'package provide a 1; package provide b 2; package forget a; package names',
+    want: 'b foo tcllib x xlib' },
+  { name: 'P7 pkgIndex 扫描（auto_path + source 编排）',
+    script: 'file mkdir /demo/lib; set f [open /demo/lib/pkgIndex.tcl w]; puts $f {package provide idxpkg 0.1}; close $f; set auto_path {/demo/lib}; package require idxpkg',
+    want: '0.1' },
+  { name: 'P8 未知子命令错误（native 六子命令消息）',
+    script: 'catch {package bogus} e; set e',
+    want: 'unknown package subcommand "bogus": must be forget, names, provide, require, vcompare, or vsatisfies' },
 ];
 
 const rows = document.getElementById('rows');
@@ -505,6 +575,20 @@ async function main() {
   logln('[spencermod] ' + (spencerOk
     ? 'loaded（native 同源引擎，::regexp/::regsub wrapper 就绪）'
     : 'unavailable（SP 区用例将失败）'));
+
+  // clock+package 外置：wasm 构建不含 native clock/package（feature
+  // 剥离，2026-11-19 方案 a）——JS clockpkgmod 补回同面命令（::clock/
+  // ::package wrapper + require 的 pkgIndex 编排）。装载在命令计数
+  // 基线之前（T9 的"卸载后回落"以此为据；计数面对照 = 剥离前 wasm
+  // 内建同名命令）。
+  try {
+    handle.register_module('clockpkg', makeClockPkgMod());
+    handle.exec('load clockpkg');
+    handle.exec(CLOCKPKG_SETUP_TCL);
+    logln('[clockpkg] registered + loaded（::clock/::package JS 面）');
+  } catch (e) {
+    logln('[clockpkg] ERR: ' + e);
+  }
 
   const initialCount = handle.exec('llength [info commands]');
   logln(`[rtcl] 初始命令计数（wasm 面）= ${initialCount}`);

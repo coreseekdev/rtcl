@@ -1390,8 +1390,50 @@ impl Interp {
     /// `aliases` insert that returned `None` (i.e. the key was NEW):
     /// redefining a live command keeps its position, recreating a deleted
     /// one appends anew (Tcl hash-entry semantics).
+    ///
+    /// 内存审计 2026-11-20：注册序日志是 push-only——删除路径（rename
+    /// away / 协程 destroy / namespace delete）不清条目，`info commands`
+    /// 端按表活性过滤（行为不可见、内存滞留）。命令 churn 工作负载
+    /// （协程 resume 命令、动态 proc 定义+rename away，oracle tclsh
+    /// 同型零增长）此前线性增长（~100B/命令）。护栏：条目数超 4096
+    /// 且超活命令数 4 倍时整表重建——保留活条目与注册次序（replay 序
+    /// 不变），孤儿批量剪枝，滞留上界 = max(4096, 4×live)。
     pub(crate) fn note_new_command(&mut self, key: &str) {
         self.command_order.push(key.to_string());
+        let live = self.commands.len()
+            + self.procs.len()
+            + self.ensembles.len()
+            + self.import_aliases.len();
+        if self.command_order.len() > 4096 && self.command_order.len() > 4 * live {
+            self.rebuild_command_order_live();
+        }
+    }
+
+    /// Rebuild [`Interp::command_order`] to live commands only (order
+    /// preserved); same for the hidden-command set's dead entries.
+    fn rebuild_command_order_live(&mut self) {
+        let Self {
+            command_order,
+            hidden_commands,
+            commands,
+            procs,
+            ensembles,
+            import_aliases,
+            ..
+        } = self;
+        let is_live = |k: &str| -> bool {
+            let alt = format!("::{}", k);
+            commands.contains_key(k)
+                || procs.contains_key(k)
+                || ensembles.contains_key(k)
+                || import_aliases.contains_key(k)
+                || commands.contains_key(&alt)
+                || procs.contains_key(&alt)
+                || ensembles.contains_key(&alt)
+                || import_aliases.contains_key(&alt)
+        };
+        command_order.retain(|k| is_live(k));
+        hidden_commands.retain(|k| is_live(k));
     }
 
     /// 注入文件系统数据面服务（wasm 宿主由此把 open/file/source 的

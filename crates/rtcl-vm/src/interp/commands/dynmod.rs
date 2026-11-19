@@ -78,6 +78,28 @@ impl Interp {
             .unwrap_or_default()
     }
 
+    /// Internal dispatch command names the module declaration carries
+    /// (`_js_dispatch` 桥的第三词)——宿主 unregister 时的 JS 回调清理
+    /// 名单。**与 installed 无关**：注册面（`register_module`）急切
+    /// 创建内部命令/回调，never-loaded（或已 unload）的声明同样持有
+    /// （内存审计 2026-11-20 B5 面：宿主只清 installed 时留下孤儿
+    /// 闭包与隐藏 proc）。
+    pub fn dyn_module_internal_commands(&self, name: &str) -> Vec<String> {
+        self.dyn_modules
+            .get(name.trim_start_matches("::"))
+            .map(|rec| {
+                rec.def
+                    .commands
+                    .iter()
+                    .filter(|(_, words)| {
+                        words.first().map(|w| w == "_js_dispatch").unwrap_or(false)
+                    })
+                    .filter_map(|(_, words)| words.get(2).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Drop a module declaration (host dropped the instance).
     pub fn unregister_dyn_module(&mut self, name: &str) -> bool {
         let key = name.trim_start_matches("::");

@@ -139,3 +139,17 @@ pub fn unregister_js_command(interp: &mut rtcl_core::Interp, interp_id: u64, nam
     let _ = interp.eval(&format!("rename {name} \"\""));
     existed
 }
+
+/// Drop an interpreter's whole callback bucket (handle drop path).
+///
+/// 内存审计 2026-11-20 B5 面：桶按 interpId 分隔，但此前没有任何
+/// 终点清理——长跑 worker 反复建/弃 `RtclHandle` 时桶按 id 单调增长，
+/// 桶里的 `js_sys::Function` 闭包把 JS 侧对象图钉住（GC 不可达回收）。
+/// `RtclHandle::drop` 调用（wasm-bindgen 在 JS GC 回收 wrapper 时执行
+/// Rust Drop）；显式 `unregister_command`/`unregister_module` 仍按条目
+/// 即时清理，两者互补。
+pub fn drop_interp_bucket(interp_id: u64) {
+    JS_COMMANDS.with(|cmds| {
+        cmds.borrow_mut().remove(&interp_id);
+    });
+}

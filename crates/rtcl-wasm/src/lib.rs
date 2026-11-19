@@ -151,13 +151,13 @@ impl RtclHandle {
     /// Drop a module declaration (and any commands a `load` installed).
     pub fn unregister_module(&mut self, name: &str) -> Result<bool, JsValue> {
         let bare = name.trim_start_matches("::").trim_end_matches(".wasm");
-        // Also free the internal JS callbacks.
-        let existed = self.interp.dyn_module_installed_commands(bare);
-        for full in existed {
-            if let Some(tail) = full.rsplit("::").next() {
-                let internal = format!("__dynmodv2:{}:{}", bare, tail);
-                js_command::unregister_js_command(&mut self.interp, self.id, &internal);
-            }
+        // Free ALL internal JS callbacks the declaration carries —
+        // `register_module` creates them eagerly, so a never-loaded (or
+        // already-unloaded) declaration holds its exports' closures in
+        // the JS_COMMANDS bucket; only cleaning `installed` entries left
+        // those pinned forever (内存审计 2026-11-20 B5 面).
+        for internal in self.interp.dyn_module_internal_commands(bare) {
+            js_command::unregister_js_command(&mut self.interp, self.id, &internal);
         }
         Ok(self.interp.unregister_dyn_module(bare))
     }
@@ -218,6 +218,17 @@ impl RtclHandle {
         } else {
             Err(JsValue::from_str(&errors.join("\n")))
         }
+    }
+}
+
+/// Handle 终点：清掉本解释器在 `JS_COMMANDS` 里的回调桶（内存审计
+/// 2026-11-20 B5 面）。wasm-bindgen 在 JS GC 回收 wrapper 对象时执行
+/// Rust Drop——桶里的 `js_sys::Function` 不再钉住 JS 侧对象图；长跑
+/// worker 反复建/弃 handle 时桶不再按 id 单调增长。条目级即时清理
+/// 仍由 `unregister_command`/`unregister_module` 提供，两者互补。
+impl Drop for RtclHandle {
+    fn drop(&mut self) {
+        js_command::drop_interp_bucket(self.id);
     }
 }
 

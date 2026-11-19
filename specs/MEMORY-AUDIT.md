@@ -1,5 +1,9 @@
 # rtcl 运行时内存 / 资源生命周期审计（2026-11-08）
 
+> **2026-11-20 增量轮**：2026-11-13..20 新面（M2/M3/M4/lazy-string
+> HostStr 池/JS dynmod glue/host-http 等）的逐面审计与 4 项 P1 修复
+> 见 [`MEMORY-AUDIT-20261120.md`](MEMORY-AUDIT-20261120.md)。
+
 - **行为规格**：[`specs/memory-lifecycle.allium`](memory-lifecycle.allium)
   （allium 3.6.1，`allium check` 0 error；仅 unused 字段 warning）。
 - **方法**：allium 契约 + 代码审计（`rtcl-vm` / `rtcl-jit`）+

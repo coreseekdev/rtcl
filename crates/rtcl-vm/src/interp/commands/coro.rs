@@ -39,6 +39,12 @@ pub(crate) struct CoroCtx {
     /// started — frames above belong to the coroutine and move into the
     /// record on suspension.
     pub frames_base: usize,
+    /// `interp.call_depth` at the same boundary — the suspension moves
+    /// the outstanding chain's depth units off the stack into the
+    /// record (memory audit 2026-11-20: a suspended-forever coroutine
+    /// used to leak its whole call_depth contribution, exhausting the
+    /// recursion budget after ~1000 create/suspend cycles).
+    pub depth_base: usize,
     pub pending: Option<Pending>,
 }
 
@@ -49,6 +55,16 @@ pub(crate) struct Coroutine {
     pub frames: Vec<Box<crate::interp::CallFrame>>,
     /// Frozen bytecode levels, innermost LAST (resume pops the tail).
     pub levels: Vec<(Rc<rtcl_parser::ByteCode>, crate::interp::vm_exec::SuspendedState)>,
+    /// Call-depth units the record's frame chain still owns: the stack
+    /// was restored at suspension, so these units live HERE, not on
+    /// [`Interp::call_depth`].  Resume moves them back onto the stack;
+    /// destroy releases them if the chain is still on-stack (resume
+    /// replay pops frames without the call_proc epilogue's depth
+    /// decrement — the subtraction happens once, at destroy).
+    pub depth: usize,
+    /// Whether the frame chain currently sits on `interp.frames` (resume
+    /// replay in flight) versus frozen in the record (suspended).
+    pub on_stack: bool,
 }
 
 use std::rc::Rc;
@@ -73,7 +89,7 @@ pub fn cmd_coroutine(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // new one replaces the old (its resume command is overwritten too).
     interp.coroutines.insert(
         name.clone(),
-        Coroutine { frames: Vec::new(), levels: Vec::new() },
+        Coroutine { frames: Vec::new(), levels: Vec::new(), depth: 0, on_stack: false },
     );
     // Register the resume command (visible, like any user command).
     let resume_name = name.trim_start_matches("::").to_string();
@@ -93,7 +109,7 @@ pub fn cmd_coroutine(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         Err(e) => {
             // Body errored (or a failed dispatch): the coroutine is gone
             // — tclsh deletes it (coro-4.1: the command name vanishes).
-            destroy(interp, &name);
+            destroy_record(interp, &name);
             Err(e)
         }
     }
@@ -104,6 +120,7 @@ fn run_coro_entry(interp: &mut Interp, name: &str, invocation: Vec<Value>) -> Re
     interp.coro_ctx = Some(CoroCtx {
         name: name.to_string(),
         frames_base: interp.frames.len(),
+        depth_base: interp.call_depth,
         pending: None,
     });
     let r = interp.dispatch_values(&invocation);
@@ -123,7 +140,7 @@ fn collect_suspend(interp: &mut Interp, name: &str, r: Result<Value>) -> Result<
             if chain.is_empty() {
                 // No bytecode level froze (AST-eval yield): the
                 // continuation is unrecoverable.
-                destroy(interp, name);
+                destroy_record(interp, name);
                 return Err(Error::runtime(
                     "yield cannot suspend across an eval boundary",
                     ErrorCode::Generic,
@@ -136,6 +153,13 @@ fn collect_suspend(interp: &mut Interp, name: &str, r: Result<Value>) -> Result<
             chain.reverse();
             record.levels = chain;
             record.frames = interp.frames.drain(ctx.frames_base..).collect();
+            // 深度位随帧走（内存审计 2026-11-20）：挂起链的 call_depth
+            // 单元移交 record，栈上恢复入口基线——挂起后永不 resume 的
+            // record 不再钉住深度预算（此前每次挂起永久 +N，约 1000 个
+            // 挂起即耗尽递归预算）。
+            record.depth = interp.call_depth.saturating_sub(ctx.depth_base);
+            interp.call_depth = ctx.depth_base;
+            record.on_stack = false;
             match pending {
                 Some(Pending::Yield(v)) => Ok(v),
                 Some(Pending::YieldTo(vals)) => {
@@ -150,19 +174,27 @@ fn collect_suspend(interp: &mut Interp, name: &str, r: Result<Value>) -> Result<
         Ok(v) => {
             // Body completed: the coroutine is done, its command deleted
             // (tclsh coro-2.7).
-            destroy(interp, name);
+            destroy_record(interp, name);
             Ok(v)
         }
         Err(e) => {
-            destroy(interp, name);
+            destroy_record(interp, name);
             Err(e)
         }
     }
 }
 
 /// Delete the coroutine record and its resume command.
-fn destroy(interp: &mut Interp, name: &str) {
-    interp.coroutines.remove(name);
+pub(crate) fn destroy_record(interp: &mut Interp, name: &str) {
+    if let Some(rec) = interp.coroutines.remove(name) {
+        // Resume replay pops frames without the call_proc epilogue's
+        // depth decrement, so the outstanding units come back here —
+        // exactly once, for a chain that was on-stack.  A suspended
+        // (off-stack) record had its units restored at suspension.
+        if rec.on_stack {
+            interp.call_depth = interp.call_depth.saturating_sub(rec.depth);
+        }
+    }
     let bare = name.trim_start_matches("::");
     if interp.commands.remove(bare).is_some() {
         interp.note_cmd_mutation();
@@ -219,18 +251,25 @@ fn resume_coro(interp: &mut Interp, name: &str, resume_arg: Value) -> Result<Val
     }
     // Push ALL frozen frames back; the base sits below the whole stack
     // (taken BEFORE the extend — frames above it belong to the coroutine).
-    let frames = interp
-        .coroutines
-        .get_mut(name)
-        .unwrap()
-        .frames
-        .drain(..)
-        .collect::<Vec<_>>();
+    // 深度位随帧回栈（内存审计 2026-11-20）：挂起时移交 record 的单元
+    // 重新上栈——adopted replay 的手工弹帧不带 epilogue 深度递减，单元
+    // 由 destroy 在终态一次性归还。
+    let (frames, depth) = {
+        let rec = interp.coroutines.get_mut(name).unwrap();
+        (rec.frames.drain(..).collect::<Vec<_>>(), rec.depth)
+    };
+    let depth_base = interp.call_depth;
+    interp.call_depth += depth;
     let frames_base = interp.frames.len();
     interp.frames.extend(frames);
+    {
+        let rec = interp.coroutines.get_mut(name).unwrap();
+        rec.on_stack = true;
+    }
     interp.coro_ctx = Some(CoroCtx {
         name: name.to_string(),
         frames_base,
+        depth_base,
         pending: None,
     });
     let mut feed = resume_arg;
@@ -246,8 +285,13 @@ fn resume_coro(interp: &mut Interp, name: &str, resume_arg: Value) -> Result<Val
             // Nothing frozen left but the body never signalled
             // completion — impossible (the innermost run either
             // suspends, errors, or completes).  Treat as done-empty.
+            // 回栈帧随终态丢弃（防残留帧钉住作用域/深度）。
+            let fb = interp.coro_ctx.as_ref().map(|c| c.frames_base);
+            if let Some(fb) = fb {
+                interp.frames.truncate(fb);
+            }
             interp.coro_ctx = None;
-            destroy(interp, name);
+            destroy_record(interp, name);
             return Ok(Value::empty());
         };
         // The resume argument is the suspended command's return value.
@@ -277,7 +321,10 @@ fn resume_coro(interp: &mut Interp, name: &str, resume_arg: Value) -> Result<Val
                 let chain = std::mem::take(&mut interp.coro_chain);
                 let pending = ctx.pending;
                 if chain.is_empty() {
-                    destroy(interp, name);
+                    // 回栈帧整段丢弃（与错误臂同口径——跨 eval 边界的
+                    // yield 不可恢复，协程即终态）。
+                    interp.frames.truncate(ctx.frames_base);
+                    destroy_record(interp, name);
                     return Err(Error::runtime(
                         "yield cannot suspend across an eval boundary",
                         ErrorCode::Generic,
@@ -288,6 +335,11 @@ fn resume_coro(interp: &mut Interp, name: &str, resume_arg: Value) -> Result<Val
                 chain.reverse();
                 record.levels.extend(chain);
                 record.frames = interp.frames.drain(ctx.frames_base..).collect();
+                // 再挂起：深度单元再度移交 record（与首挂起同口径——
+                // resume 回栈的单元 + replay 期间的净增量，一并离栈）。
+                record.depth = interp.call_depth.saturating_sub(ctx.depth_base);
+                interp.call_depth = ctx.depth_base;
+                record.on_stack = false;
                 return match pending {
                     Some(Pending::Yield(v)) => Ok(v),
                     Some(Pending::YieldTo(vals)) => interp.dispatch_values(&vals),
@@ -303,16 +355,25 @@ fn resume_coro(interp: &mut Interp, name: &str, resume_arg: Value) -> Result<Val
                 interp.frames.pop();
                 if interp.coroutines.get(name).map(|r| r.levels.is_empty()).unwrap_or(true) {
                     interp.coro_ctx = None;
-                    destroy(interp, name);
+                    destroy_record(interp, name);
                     return Ok(v);
                 }
                 feed = v;
             }
             Err(e) => {
-                // Error inside the coroutine: it is done; the restored
-                // frames unwind through their own epilogues.
+                // Error inside the coroutine: it is done — the frames it
+                // pushed at resume are discarded wholesale (tclsh: the
+                // coroutine dies).  此前依赖「restored frames unwind
+                // through their own epilogues」——实际外层 epilogue 逐层
+                // 弹的是**别人的帧**：残留帧破坏作用域解析（一轮即可让
+                // 顶层 `$var` 读失败）且无 epilogue 深度递减。truncate 回
+                // frames_base 把协程帧整段丢弃，深度单元由 destroy 归还。
+                let fb = interp.coro_ctx.as_ref().map(|c| c.frames_base);
+                if let Some(fb) = fb {
+                    interp.frames.truncate(fb);
+                }
                 interp.coro_ctx = None;
-                destroy(interp, name);
+                destroy_record(interp, name);
                 return Err(e);
             }
         }

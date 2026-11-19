@@ -1063,6 +1063,46 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Ok(Value::empty());
     }
 
+    // Coroutine records（内存审计 2026-11-20 A7 面）：resume 命令与
+    // 挂起 record 同生命周期——tclsh 语义：rename away = 协程删除
+    // （record/帧/冻结链释放，深度单元归还）；rename 新名 = record
+    // 随键平移（新名可续，tclsh 实测钉形）。此前两条路径都不触碰
+    // `interp.coroutines`——挂起 record 成孤儿（可脚本化无界增长，
+    // 帧链+冻结字节码滞留）且新名 resume 失效。必须在 builtins 通用
+    // 路径之前拦截（resume 命令注册在 commands 表）。
+    let is_coro_resume = interp
+        .commands
+        .get(&old_key)
+        .map(|f| *f == super::coro::cmd_coro_resume)
+        .unwrap_or(false);
+    if is_coro_resume {
+        let record_key = [
+            old_key.clone(),
+            format!("::{}", old_key.trim_start_matches("::")),
+            super::namespace::qualify(&interp.current_namespace, &old_name),
+        ]
+        .into_iter()
+        .find(|k| interp.coroutines.contains_key(k));
+        if let Some(record_key) = record_key {
+            if new_key.is_empty() {
+                super::coro::destroy_record(interp, &record_key);
+            } else {
+                let new_record_key =
+                    super::namespace::qualify(&interp.current_namespace, &new_name);
+                if let Some(rec) = interp.coroutines.remove(&record_key) {
+                    interp.coroutines.insert(new_record_key.clone(), rec);
+                }
+                if let Some(func) = interp.commands.remove(&old_key) {
+                    if interp.commands.insert(new_key.clone(), func).is_none() {
+                        interp.note_new_command(&new_key);
+                    }
+                }
+            }
+            finish_cmd_rename(interp, &old_key, &new_key, &old_name, &new_name);
+            return Ok(Value::empty());
+        }
+    }
+
     // Rename in builtins
     if let Some(func) = interp.commands.remove(&old_key) {
         let cat = interp.command_categories.remove(&old_key);

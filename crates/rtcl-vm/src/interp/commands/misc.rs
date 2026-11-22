@@ -1850,6 +1850,11 @@ fn run_bracket_script(
         let mut quote = false;
         let mut close = false;
         let mut terminated = false;
+        // tclParse.c word rules: `"` opens a quoted word only at word
+        // start — a mid-word quote is an ordinary character (pidx 钉形:
+        // `$foo([x"y])` 的下标命令名是 `x"y`，引号在词中不开引文；
+        // word_start 在命令起点、`[` 之后与空白之后置真).
+        let mut word_start = true;
         while *ci < chars.len() {
             let c = chars[*ci];
             if quote {
@@ -1861,6 +1866,7 @@ fn run_bracket_script(
                 }
                 if c == '"' {
                     quote = false;
+                    word_start = false;
                 }
                 cmd.push(c);
                 *ci += 1;
@@ -1883,10 +1889,12 @@ fn run_bracket_script(
                     cmd.push(c);
                     cmd.push(chars[*ci + 1]);
                     *ci += 2;
+                    word_start = false;
                 }
-                '"' => { quote = true; cmd.push(c); *ci += 1; }
+                '"' if word_start => { quote = true; cmd.push(c); *ci += 1; }
+                '"' => { cmd.push(c); *ci += 1; word_start = false; }
                 '{' => { brace = 1; cmd.push(c); *ci += 1; }
-                '[' => { bdepth += 1; cmd.push(c); *ci += 1; }
+                '[' => { bdepth += 1; cmd.push(c); *ci += 1; word_start = true; }
                 ']' if bdepth > 0 => { bdepth -= 1; cmd.push(c); *ci += 1; }
                 ']' => {
                     *ci += 1;
@@ -1899,7 +1907,8 @@ fn run_bracket_script(
                     terminated = true;
                     break;
                 }
-                _ => { cmd.push(c); *ci += 1; }
+                ' ' | '\t' | '\r' => { cmd.push(c); *ci += 1; word_start = true; }
+                _ => { cmd.push(c); *ci += 1; word_start = false; }
             }
         }
         if terminated && !cmd.trim().is_empty() {
@@ -1939,6 +1948,11 @@ fn run_bracket_script(
             return Ok(SubstOutcome::Done(result));
         }
         if !terminated {
+            // An open quoted word at EOF is the quote's error (tclsh
+            // `subst {[foo "bar baz]}` → missing ").
+            if quote {
+                return Err(Error::Msg("missing \"".to_string()));
+            }
             return Err(Error::Msg("missing close-bracket".to_string()));
         }
         // Terminated by `;`/newline — the next command of the same
@@ -1955,6 +1969,9 @@ fn check_bracket_tail(chars: &[char], ci: &mut usize, nobackslashes: bool) -> Re
     let mut brace = 0i32;
     let mut bdepth = 0i32;
     let mut quote = false;
+    // Word-start discipline for `"` — same rule as run_bracket_script
+    // (mid-word quotes are literal characters).
+    let mut word_start = true;
     while *ci < chars.len() {
         let c = chars[*ci];
         if quote {
@@ -1966,6 +1983,7 @@ fn check_bracket_tail(chars: &[char], ci: &mut usize, nobackslashes: bool) -> Re
             }
             if c == '"' {
                 quote = false;
+                word_start = false;
             }
             rest.push(c);
             *ci += 1;
@@ -1986,10 +2004,12 @@ fn check_bracket_tail(chars: &[char], ci: &mut usize, nobackslashes: bool) -> Re
                 rest.push(c);
                 rest.push(chars[*ci + 1]);
                 *ci += 2;
+                word_start = false;
             }
-            '"' => { quote = true; rest.push(c); *ci += 1; }
+            '"' if word_start => { quote = true; rest.push(c); *ci += 1; }
+            '"' => { rest.push(c); *ci += 1; word_start = false; }
             '{' => { brace = 1; rest.push(c); *ci += 1; }
-            '[' => { bdepth += 1; rest.push(c); *ci += 1; }
+            '[' => { bdepth += 1; rest.push(c); *ci += 1; word_start = true; }
             ']' if bdepth > 0 => { bdepth -= 1; rest.push(c); *ci += 1; }
             ']' => {
                 *ci += 1;
@@ -1998,8 +2018,12 @@ fn check_bracket_tail(chars: &[char], ci: &mut usize, nobackslashes: bool) -> Re
                 }
                 return Ok(());
             }
-            _ => { rest.push(c); *ci += 1; }
+            ' ' | '\t' | '\r' => { rest.push(c); *ci += 1; word_start = true; }
+            _ => { rest.push(c); *ci += 1; word_start = false; }
         }
+    }
+    if quote {
+        return Err(Error::Msg("missing \"".to_string()));
     }
     Err(Error::Msg("missing close-bracket".to_string()))
 }

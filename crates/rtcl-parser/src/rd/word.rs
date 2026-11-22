@@ -111,6 +111,8 @@ fn parse_braced_word(cur: &mut Cursor) -> ParseResult<Word> {
         // tclsh logs the partial command THROUGH the unclosed opener
         // (`set x {`) — report the opener's offset, not scan end.
         offset: start - 1,
+        cmd_start: None,
+        cmd_line: None,
     })
 }
 
@@ -170,6 +172,8 @@ fn parse_quoted_word(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Word> 
         column: 0,
         // tclsh logs the partial command through the opening quote.
         offset: opener,
+        cmd_start: None,
+        cmd_line: None,
     })
 }
 
@@ -497,6 +501,8 @@ pub fn parse_cmd_sub(cur: &mut Cursor, _bracket_term: bool) -> ParseResult<Strin
         // `set x [abc...` 未闭合,引文一律 `set x [`——opener 截断,
         // 与 missing close-brace 同规则)。
         offset: start - 1,
+        cmd_start: None,
+        cmd_line: None,
     })
 }
 
@@ -539,6 +545,8 @@ fn skip_braced(cur: &mut Cursor) -> ParseResult<()> {
             line: err_line,
             column: 0,
             offset: opener_pos,
+            cmd_start: None,
+            cmd_line: None,
         })
     } else {
         Ok(())
@@ -549,6 +557,7 @@ fn skip_braced(cur: &mut Cursor) -> ParseResult<()> {
 fn skip_quoted_in_cmd(cur: &mut Cursor) -> ParseResult<()> {
     debug_assert!(cur.is(Token::DoubleQuote));
     let err_line = cur.line();
+    let opener = cur.pos();
     cur.advance(); // skip opening '"'
 
     while !cur.at_end() {
@@ -579,6 +588,10 @@ fn skip_quoted_in_cmd(cur: &mut Cursor) -> ParseResult<()> {
         message: "missing \"".into(),
         line: err_line,
         column: 0,
-        offset: cur.pos(),
+        // tclsh logs the partial command THROUGH the opening quote
+        // (gp_2 钉形: `set x [foo "a[\nbar]` → 引文 `set x [foo "`).
+        offset: opener,
+        cmd_start: None,
+        cmd_line: None,
     })
 }

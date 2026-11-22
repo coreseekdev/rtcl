@@ -389,10 +389,19 @@ impl Interp {
             while end > 0 && !script.is_char_boundary(end) {
                 end -= 1;
             }
-            let start = script[..end]
-                .rfind(['\n', ';'])
-                .map(|i| i + 1)
-                .unwrap_or(0);
+            // tclsh 的引文起点 = **最外层命令**的起点（parse_command
+            // 失败上浮时盖章的 cmd_start——globprobe 的嵌套引文递归
+            // 产出跨行引文，150-cap 截断）；无章（错误不经命令词循环）
+            // 退回行首规则（单行命令同形）。
+            let start = pe.cmd_start.unwrap_or_else(|| {
+                let e = end.min(script.len());
+                script[..e]
+                    .rfind(['\n', ';'])
+                    .map(|i| i + 1)
+                    .unwrap_or(0)
+            });
+            let start = start.min(end);
+            let log_line = pe.cmd_line.unwrap_or(pe.line);
             let partial = format!(
                 "{}\n    while executing\n\"{}\"",
                 pe.message,
@@ -405,7 +414,7 @@ impl Interp {
             let inner_opts = format!(
                 "-code 1 -level 0 -errorcode NONE -errorinfo {} -errorline {}",
                 crate::value::tcl_quote(&partial),
-                pe.line
+                log_line
             );
             self.err_inner = Some(format!(
                 "syntax {} {}",
@@ -414,7 +423,7 @@ impl Interp {
             ));
             self.err_calls.clear();
             self.err_info = Some(partial);
-            self.err_line = pe.line;
+            self.err_line = log_line;
             // 一个新错误的 errorInfo 是全新的（tclsh ERR_LOGGED 语义）：
             // 之前被循环吞掉的控制流完成留下的延迟帧在此作废；词括号
             // 替换旗标同批（不跨错误泄漏——见 catch 消费点注）。

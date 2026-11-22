@@ -223,6 +223,8 @@ impl<'a> Cursor<'a> {
             line: self.line(),
             column: 0,
             offset: self.pos(),
+            cmd_start: None,
+            cmd_line: None,
         }
     }
 

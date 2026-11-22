@@ -135,7 +135,17 @@ fn parse_command(cur: &mut Cursor, bracket_term: bool) -> ParseResult<Command> {
 
     while !cur.at_end_of_command(bracket_term) {
         let wstart = cur.pos();
-        words.push(parse_next_word(cur, bracket_term)?);
+        words.push(parse_next_word(cur, bracket_term).map_err(|mut pe| {
+            // tclsh TclLogCommandInfo 的 parse 失败归属:错误上浮时改记
+            // **最外层**命令的起点/行号(TclEvalEx 的 parse 事件)——嵌套
+            // 引文/bracket 递归里死掉的错误保留外层命令跨度(globprobe
+            // 钉形: 引文 = 命令起点..最深 opener、150-cap 多行、行 7;
+            // 单行命令退化同形——b1/b2/b5 的 `set x [` 不变)。逐层
+            // 覆写使最外层 parse_command 的章最终生效。
+            pe.cmd_start = Some(start);
+            pe.cmd_line = Some(line);
+            pe
+        })?);
         word_srcs.push(SrcSpan { start: wstart as u32, end: cur.pos() as u32 });
         cur.skip_line_whitespace();
     }

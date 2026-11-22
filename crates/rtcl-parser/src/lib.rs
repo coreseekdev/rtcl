@@ -136,6 +136,15 @@ pub struct ParseError {
     pub column: usize,
     /// Byte offset into the source string where the error occurred.
     pub offset: usize,
+    /// Byte offset of the OUTERMOST command being parsed when the error
+    /// surfaced (stamped by `parse_command` on unwind — tclsh logs parse
+    /// failures against the command TclEvalEx was parsing, so a failure
+    /// inside nested quote/bracket recursion keeps the outer command's
+    /// span; `None` for errors raised outside a command word loop).
+    pub cmd_start: Option<usize>,
+    /// Line number of that outermost command (tclsh's errorLine for the
+    /// parse log event).
+    pub cmd_line: Option<usize>,
 }
 
 impl fmt::Display for ParseError {

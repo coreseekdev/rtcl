@@ -655,6 +655,18 @@ pub struct Interp {
     pub(crate) ns_root: Rc<str>,
     /// Known namespaces ("::" always present).
     pub(crate) namespaces: varmap::FxHashedMap<String, commands::namespace::NamespaceInfo>,
+    /// Namespaces in the visibility-removal phase of a two-phase teardown
+    /// (`namespace delete`, tclsh NS_DYING): `namespace exists`/require_ns
+    /// report them gone, but the entity stays in [`Self::namespaces`] until
+    /// the var/command delete traces have all fired — resolution walks the
+    /// parent's child table without a flag check (TclGetNamespaceForQualName),
+    /// so vars/commands of a dying tree stay reachable from trace callbacks.
+    pub(crate) ns_dying: std::collections::HashSet<String>,
+    /// Var flat keys inside the pending-unset window of a teardown (tclsh
+    /// UnsetVarStruct's "in-table but undefined" step): reads and `info vars`
+    /// miss them, `namespace which -variable` still resolves them (the Var
+    /// struct stays in the table until the trace returns).
+    pub(crate) var_nuke_pending: std::collections::HashSet<String>,
     /// `namespace import` aliases: fully-qualified alias name → the fully
     /// qualified name of the original command.  Aliases stay separate from
     /// `procs` so the origin's *current* body always dispatches (tclsh
@@ -1079,6 +1091,8 @@ impl Interp {
                 ns.insert("::".to_string(), commands::namespace::NamespaceInfo::default());
                 ns
             },
+            ns_dying: std::collections::HashSet::new(),
+            var_nuke_pending: std::collections::HashSet::new(),
             import_aliases: HashMap::new(),
             ns_unknown: HashMap::new(),
             command_order: Vec::new(),

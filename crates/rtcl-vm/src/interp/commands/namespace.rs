@@ -463,9 +463,29 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ErrorCode::NotFound,
             ));
         }
-        // Remove the namespace and all children
+        // Already on the teardown path (a trace callback deleting it
+        // again): tclsh's NS_TEARDOWN guard makes the second call a
+        // silent no-op.
+        if interp.ns_dying.contains(&qualified) {
+            continue;
+        }
+        // Remove the namespace and all children — two-phase (tclsh
+        // Tcl_DeleteNamespace/TclTeardownNamespace): from OUTSIDE, the
+        // namespace first only loses its *visibility* (NS_DYING: `exists`
+        // is 0, require_ns rejects) while the entity — command/var tables
+        // and the parent's child-table entry — stays live until the delete
+        // traces have all run (nukeQueue approximation: the deferred nuke
+        // lands at the end of this loop iteration).  A delete initiated
+        // from inside the tree (activationCount > 0 in tclsh) unlinks from
+        // the parent's child table immediately.
         let prefix = format!("{}::", qualified);
-        interp.namespaces.retain(|k, _| k != &qualified && !k.starts_with(&prefix));
+        let inside = interp.current_namespace.as_ref() == qualified
+            || interp.current_namespace.starts_with(&prefix);
+        if inside {
+            interp.namespaces.retain(|k, _| k != &qualified && !k.starts_with(&prefix));
+        } else {
+            interp.ns_dying.insert(qualified.clone());
+        }
         // ...and any names its ancestors declared pointing into it
         if let Some(parent) = interp.namespaces.get_mut("::") {
             let child_prefix = var_key(&prefix);
@@ -478,9 +498,7 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // still reports the deleted namespace both in the eval body and in
         // a proc frame; `namespace exists` is 0 for it).  Only the delete
         // trace callbacks below run fresh in `::` (34.4/34.5).
-        let inside = interp.current_namespace.as_ref() == qualified
-            || interp.current_namespace.starts_with(&prefix);
-
+        // (`inside` is computed above, at the visibility-removal step.)
         let var_prefix = var_key(&prefix);
 
         // Aliases pointing into the dying tree go dead first: reads keep
@@ -531,10 +549,14 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .array_globals
                 .iter()
                 .all(|k| k == "env" || k == "tcl_platform");
-            // Unset traces fire after the removal; a callback's `set` into
-            // the deleted namespace fails its parent-namespace check
-            // (18.4's catch=1) and cannot resurrect the variable.
+            // Unset traces fire after the removal; a callback's read of the
+            // var itself fails (undefined, 18.4's catch=1) and cannot
+            // resurrect it, but the key stays resolvable for
+            // `namespace which -variable` while its trace runs (tclsh
+            // keeps the Var in the table but marked undefined).
+            interp.var_nuke_pending.insert(base.clone());
             let _ = interp.fire_traces(&format!("::{}", base), None, "unset");
+            interp.var_nuke_pending.remove(&base);
         }
         // Trace registrations and searches living under the tree die with
         // it.
@@ -609,6 +631,15 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // sweep bump is cheaper than enumerating what just went away.
         super::super::vm_exec::note_tier1_sweep(interp);
         interp.note_cmd_mutation();
+        // Deferred nuke (outside delete): the entity tables go away now
+        // that every delete trace has returned — children/enums stop
+        // listing it and resolution paths lose the tree (tclsh unlinks the
+        // child-table entry last, but its nuke queue also drains before
+        // the next command; the observable boundary is identical).
+        if !inside {
+            interp.namespaces.retain(|k, _| k != &qualified && !k.starts_with(&prefix));
+            interp.ns_dying.remove(&qualified);
+        }
     }
     Ok(Value::empty())
 }
@@ -622,7 +653,12 @@ fn ns_exists(interp: &Interp, args: &[Value]) -> Result<Value> {
         ));
     }
     let qualified = qualify(&interp.current_namespace, args[2].as_str());
-    Ok(Value::from_bool(interp.namespaces.contains_key(&qualified)))
+    // NS_DYING reads as gone (GetNamespaceFromObj checks the flag) even
+    // while the entity is still on the teardown path.
+    Ok(Value::from_bool(
+        interp.namespaces.contains_key(&qualified)
+            && !interp.ns_dying.contains(&qualified),
+    ))
 }
 
 /// Validate that a named namespace exists, returning its qualified name.
@@ -631,7 +667,12 @@ fn ns_exists(interp: &Interp, args: &[Value]) -> Result<Value> {
 /// from relative ones (`namespace "x" not found in "::y"`).
 fn require_ns(interp: &Interp, raw: &str) -> Result<String> {
     let qualified = qualify(&interp.current_namespace, raw);
-    if interp.namespaces.contains_key(&qualified) {
+    // A dying namespace rejects new argument-resolution the same way a
+    // missing one does (GetNamespaceFromObj's NS_DYING check) — only
+    // command/var *lookups through* the tree keep working during teardown.
+    if interp.namespaces.contains_key(&qualified)
+        && !interp.ns_dying.contains(&qualified)
+    {
         return Ok(qualified);
     }
     if raw.starts_with("::") {
@@ -851,7 +892,10 @@ fn ns_which(interp: &Interp, args: &[Value]) -> Result<Value> {
                 .get(interp.current_namespace.as_ref())
                 .map(|info| info.variables.contains(&key))
                 .unwrap_or(false);
-            if interp.globals.contains_key(&key) || declared {
+            if interp.globals.contains_key(&key)
+                || interp.var_nuke_pending.contains(&key)
+                || declared
+            {
                 Ok(Value::from_str(&qualified))
             } else if interp.globals.contains_key(name) {
                 Ok(Value::from_str(&qualify("::", name)))

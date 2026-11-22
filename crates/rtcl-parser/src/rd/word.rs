@@ -493,7 +493,9 @@ pub fn parse_cmd_sub(cur: &mut Cursor, _bracket_term: bool) -> ParseResult<Strin
         message: "missing close-bracket".into(),
         line: err_line,
         column: 0,
-        // tclsh logs the partial command through the `[`.
+        // tclsh logs the partial command through the `[`(b1/b2/b5 钉形:
+        // `set x [abc...` 未闭合,引文一律 `set x [`——opener 截断,
+        // 与 missing close-brace 同规则)。
         offset: start - 1,
     })
 }
@@ -502,6 +504,10 @@ pub fn parse_cmd_sub(cur: &mut Cursor, _bracket_term: bool) -> ParseResult<Strin
 fn skip_braced(cur: &mut Cursor) -> ParseResult<()> {
     debug_assert!(cur.is(Token::LeftBrace));
     let err_line = cur.line();
+    // tclsh logs the partial command THROUGH the unclosed opener (`expr {`)
+    // — report the opener's offset, not the scan end (t2 钉形：命令替换内
+    // 未闭合 brace 词，引文截到 opener；同顶层 brace 词分支的 start-1)。
+    let opener_pos = cur.pos();
     cur.advance();
     let mut depth: u32 = 1;
 
@@ -532,7 +538,7 @@ fn skip_braced(cur: &mut Cursor) -> ParseResult<()> {
             message: "missing close-brace".into(),
             line: err_line,
             column: 0,
-            offset: cur.pos(),
+            offset: opener_pos,
         })
     } else {
         Ok(())
@@ -550,6 +556,12 @@ fn skip_quoted_in_cmd(cur: &mut Cursor) -> ParseResult<()> {
             Token::DoubleQuote => {
                 cur.advance();
                 return Ok(());
+            }
+            // 引号词内 `[` 开命令替换(tclsh 同,不要求词首)——递归
+            // scan 其内容到匹配 `]`(globprobe 行 7 `"a["` 钉形:不递归
+            // 会让引号词吞掉整个剩余脚本,报错形态错成 missing "）。
+            Token::LeftBracket => {
+                parse_cmd_sub(cur, false)?;
             }
             Token::Backslash => {
                 cur.advance();

@@ -92,8 +92,34 @@ impl Interp {
         Ok(result)
     }
 
+    /// 文件语境的整体 parse 失败回落(tclsh TclEvalEx 流式语义):逐条
+    /// 执行前缀命令直至 parse 失败点(或前缀中的执行错误),返回该错误。
+    /// 调用方保持文件语境状态(in_file_script 已置位),本函数只在
+    /// [`Interp::eval_impl`] 的整体 parse 失败分支使用。
+    fn eval_prefix_stream(&mut self, script: &str) -> Option<Error> {
+        let source: Rc<str> = Rc::from(script);
+        let mut reader = rtcl_parser::IncrementalScript::new(&source);
+        loop {
+            match reader.next_command() {
+                Ok(Some(cmd)) => {
+                    let unit = rtcl_parser::ScriptUnit {
+                        source: Rc::clone(&source),
+                        commands: vec![cmd],
+                    };
+                    if let Err(e) = self.eval_commands(&unit) {
+                        // 前缀中的执行错误直接传播(tclsh 同:执行错误
+                        // 先于后续任何 parse)。
+                        return Some(e);
+                    }
+                }
+                Ok(None) => return None,
+                Err(pe) => return Some(self.seed_parse_error(&source, &pe)),
+            }
+        }
+    }
+
     fn eval_impl(&mut self, script: &str) -> Result<Value> {
-        // This eval IS the unit an armed "same unit" request names (a
+        // This eval IS the unit an armed "same unit" request names (a        // This eval IS the unit an armed "same unit" request names (a
         // construct's inline body, a `[...]` word): consume the flag for
         // the unit's duration, restoring the enclosing unit's context on
         // every exit.  A nested eval nobody armed runs non-lexical — a
@@ -105,7 +131,8 @@ impl Interp {
         // eval/catch 体/循环体单元回到编译语境（tclsh：Tcl_EvalObjEx
         // 编译单元，无文件级逐命令帧）。
         let saved_file_ctx = self.in_file_script;
-        self.in_file_script = std::mem::take(&mut self.file_script_armed);
+        let was_file_armed = std::mem::take(&mut self.file_script_armed);
+        self.in_file_script = was_file_armed;
         // A fresh unit is a non-proc context (tclsh compiles eval'd texts
         // as standalone units with no compiledLocals): commands inside
         // must not see the enclosing proc context — a catch body here is
@@ -129,6 +156,25 @@ impl Interp {
                 let rc = match rtcl_parser::ScriptUnit::parse(script) {
                     Ok(unit) => Rc::new(unit),
                     Err(pe) => {
+                        // 文件语境(tclsh TclEvalEx 流式:parse 到哪执行
+                        // 到哪)整体 parse 失败时,**失败命令之前的前缀
+                        // 已经跑过**——brace 未闭合词吸收到 EOF 的钉形
+                        // (pidx/ix1/globprobe)下 tclsh 前缀语义照跑。
+                        // 逐条执行至失败点再抛同一 parse 错误。编译语境
+                        // (proc 体等整体编译单元)保持原样:编译失败 =
+                        // 定义失败,无前缀概念。
+                        if was_file_armed {
+                            let r = self.eval_prefix_stream(script);
+                            self.lexical_body = saved_lexical;
+                            self.in_locals_unit = saved_inl;
+                            self.in_file_script = saved_file_ctx;
+                            return match r {
+                                Some(e) => Err(e),
+                                // 理论不达(整体 parse 已失败,流式重放
+                                // 应在同一点失败):保底抛原始 parse 错误。
+                                None => Err(self.seed_parse_error(script, &pe)),
+                            };
+                        }
                         self.lexical_body = saved_lexical;
                         self.in_locals_unit = saved_inl;
                         self.in_file_script = saved_file_ctx;

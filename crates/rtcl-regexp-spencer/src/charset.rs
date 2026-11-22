@@ -51,9 +51,12 @@ impl Pred {
     /// POSIX 类名（小写）→ 谓词。
     pub fn from_posix(name: &str) -> Option<Pred> {
         Some(match name {
+            // tclsh 8.6 的 POSIX 类表（tclRegexp/Henry Spencer）不含
+            // `word`（ARE 扩展也无）——`[[:word:]]` 报 invalid character
+            // class（utf_char_classes 钉形）。rtcl 的 \w/wordchar 走
+            // Pred::Word 的转义词法，不经此处。
             "digit" => Pred::Digit,
             "space" => Pred::Space,
-            "word" => Pred::Word,
             "alnum" => Pred::Alnum,
             "alpha" => Pred::Alpha,
             "blank" => Pred::Blank,

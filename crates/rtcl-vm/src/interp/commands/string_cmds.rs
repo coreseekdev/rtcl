@@ -113,13 +113,19 @@ fn string_is_eval(class: &str, s: &str, strict: bool) -> (bool, Option<usize>) {
         "alpha" => char_class(unicode::is_alpha),
         "ascii" => char_class(|c| c.is_ascii()),
         "control" => char_class(unicode::is_control),
-        "digit" => char_class(unicode::is_digit),
+        // tclsh 8.6 的 `string is digit` = 手工滞后的 Nd 旧表（devanagari
+        // ९ = 1 而 mathematical 𝟘 U+1D7D8 / Adlam = 0——probe6 钉形）；
+        // 完整 Nd 保留给 \d/[[:digit:]] 的 regexp 面（re:digit 行）。
+        "digit" => char_class(unicode::is_digit_classic),
         "graph" => char_class(unicode::is_graph),
-        "lower" => char_class(|c| c.is_lowercase()),
+        // tclsh 8.6 分类 = 类别表本身（Lu/Ll），不是 Rust 的
+        // Other_Lowercase 扩集（modifier letter ˡ U+02E1 tclsh = 0，
+        // probe4 钉形）。
+        "lower" => char_class(unicode::is_ll),
         "print" => char_class(unicode::is_print),
         "punct" => char_class(unicode::is_punct),
         "space" => char_class(unicode::is_space),
-        "upper" => char_class(|c| c.is_uppercase()),
+        "upper" => char_class(unicode::is_lu),
         "wordchar" => char_class(unicode::is_word),
         "xdigit" => char_class(|c| c.is_ascii_hexdigit()),
         "boolean" => match tcl_boolean_value(s) {

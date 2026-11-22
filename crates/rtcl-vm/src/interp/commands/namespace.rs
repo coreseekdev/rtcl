@@ -743,7 +743,27 @@ fn ns_qualifiers(args: &[Value]) -> Result<Value> {
             "string",
         ));
     }
-    Ok(Value::from_str(split_colon_run(args[2].as_str()).0))
+    Ok(Value::from_str(split_colon_pair(args[2].as_str()).0))
+}
+
+/// `namespace tail`/`qualifiers` 命令层的分段：tclsh 的分隔符是
+/// **冒号串（≥2 个）**——单 `:` 是名字字符（trv_p11 钉形：
+/// `namespace tail a:b` → `a:b`、`a:::` → 空 + `a`）。变量/命令解析
+/// 面的分段沿用 [`split_colon_run`]，不在此收口。
+fn split_colon_pair(name: &str) -> (&str, &str) {
+    let bytes = name.as_bytes();
+    let mut i = name.len();
+    while i >= 2 && !(bytes[i - 1] == b':' && bytes[i - 2] == b':') {
+        i -= 1;
+    }
+    if i < 2 {
+        return ("", name);
+    }
+    let mut s = i - 2;
+    while s > 0 && bytes[s - 1] == b':' {
+        s -= 1;
+    }
+    (&name[..s], &name[i..])
 }
 
 /// `namespace tail string` — everything after the final colon run.
@@ -754,7 +774,7 @@ fn ns_tail(args: &[Value]) -> Result<Value> {
             "string",
         ));
     }
-    Ok(Value::from_str(split_colon_run(args[2].as_str()).1))
+    Ok(Value::from_str(split_colon_pair(args[2].as_str()).1))
 }
 
 /// `namespace which ?-command|-variable? name`

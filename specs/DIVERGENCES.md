@@ -8,6 +8,74 @@
 > （本节）。条目后括注的
 > spec [D-x] 是规格文件内的 spec-local 编号，以本台账为准。
 
+## 2026-11-22b known 16→12 深水修复轮（4 修复转绿出档 + 2 条残差收窄留档；judge 88/88；workspace tests 全绿；probes active 436 全绿 + known 12 归档）
+
+known 16 条中的 5 条深水修复（trv_d13/trv_p10、pidx、oo2、globprobe、
+we5）。4 条全修复转绿移回 active（trv_d13/trv_p10/pidx/we5），
+2 条残差收窄留档（oo2/globprobe）。终态：active 436 全绿、
+known 12。
+
+1. **ns delete 两阶段拆除（nukeQueue 近似）**（trv_d13/trv_p10，
+   9ef6f88）：tclsh 的 Tcl_DeleteNamespace 分两阶段——外部删先置
+   NS_DYING（exists=0）但 ns 实体（命令/变量表 + 父 childTable 挂链）
+   在全部 delete trace 走完前保持可见（TclTeardownNamespace 顺序：
+   变量逐个 unset → 命令逐个 delete → 最后 unlink）；trace 回调里
+   未处理变量仍可读、children 仍含 :foo、which -variable 仍解析
+   （UnsetVarStruct 的"表内 undefined"三步）。rtcl 曾单阶段拆除。
+   修复：ns_dying 集合（可见性摘除）+ ns 实体延迟到 trace 走完后
+   拆表；var_nuke_pending 窗口（which -variable 在 unset trace 期仍
+   解析）；dying ns 二次 delete = NS_TEARDOWN 静默跳过。自删
+   （activationCount>0 等价）维持立即摘除（in-del 钉形不回退）。
+2. **词首引号纪律（subst 括号扫描）**（pidx，9d9e971）：
+   tclParse.c 词规则——`"` 只在词首开引文。rtcl 的 subst 括号扫描
+   （run_bracket_script/check_bracket_tail）对任意位置 `"` 都置
+   quote 态——`expr $foo([x"y])` 的下标替换把命令名 `x"y` 的词中
+   引号当词首，吞 `]` 至 EOF。修复：word_start 跟踪（命令起点/
+   `[` 后/空白后置真）+ 引文开放到 EOF 报 missing \"。
+3. **::auto_index 惰性首建**（oo2 的 auto_index 行，2912c81）：
+   tclsh 默认 unknown（init.tcl）一进来就跑 auto_load——auto_index
+   **进入 auto_load 即建**（哪怕查找失败）；oo forward 缺目标走标准
+   not-found 链同样触发。rtcl 的首建挂在 has_unknown 臂（只认用户
+   proc/ensemble），默认 not-found 路径从不落表。修复：首建移到
+   unknown 臂入口两臂共用。oo2 的 r4 行 auto_index 落在与 tclsh
+   相同的桶位（errorInfo auto_index env）。
+4. **parse 错误归属最外层命令**（globprobe 归属半边，41a3337）：
+   tclsh TclLogCommandInfo 的 parse 失败引文 = **最外层命令**起点..
+   失败点（term = 最内层死点 opener 含）、150-cap 多行截断、行号 =
+   外层命令行。rtcl 曾按失败点所在行截引文 + 内层行号。修复：
+   ParseError 载荷增加 cmd_start/cmd_line（parse_command 失败上浮
+   逐层盖章）+ seed_parse_error 读章 + skip_quoted_in_cmd 的
+   missing " offset 改 opener（gp_2 引文 `set x [foo "`）。
+   **残差（留档）**：globprobe 的引文**终点**——tclsh term 在 4 层
+   互嵌套（引号⇄bracket）递归的最深 opener（行 11）；rtcl 在浅 2 层
+   （行 9）。归属行/引文起点/150-cap 已对齐；黑盒二分钉死为位置
+   敏感的扫描栈语义差（4 层互嵌套里某层引号闭合点不同），定位需
+   复刻 tclParseCommand 的嵌套引文/bracket 递归栈语义（引号词内
+   `[` 的错误立即传播、闭合点逐层配对）。重开条件：rd 扫描器的
+   嵌套栈改造（gp_1/gp_2/gp_3 最小形已绿，残差仅在 ≥4 层互嵌套）。
+5. **err_pending_top 单元相对行**（we5，378d980）：ns eval 体出口帧
+   defer 形态（`set r [boomq]` 的 `[boomq]` 词失败）读 stale 的
+   最内层日志行（boomq 体行 1）；tclsh = 体相对行 2。修复：
+   err_pending_top 载荷 (text, abs, unit_rel)——词替换 defer 位点
+   显式携带**体相对行** = 属主行 + 内层日志行 - 1（err_line 此刻 =
+   内容单元坐标；we5 `set r [boomq]`@2 + boomq 帧@1 → 2；
+   ei_line_attribution D `set x [`@1 + nosuch@2 → 2——两形折算同为
+   体行 2）；ns eval 体出口帧挂起在位读新字段、无挂起维持 err_line。
+   反向约束全数保持（ei_line_attribution A-J/file_ctx_frames/
+   loop_body_err_line×4 双端一致；catch -errorline 族不回退）。
+
+归档移档：trv_d13/trv_p10/pidx/we5 四探针双端逐字节绿，移回
+judge/probes/（active 432→436）。known 终态 12：
+c5_dis/cmp_unsupported×2（disassemble 设计差异）、dbg_basic
+（oracle SEGV）、globprobe（残差见上）、cases/cases2/probe_round3
+（parse 架构差异）、oo2（残差见下）、probe7（D-27 策略级）、
+trv_p11、utf_U_parsehex（D-27 策略级）。
+
+oo2 残差更新：auto_index 部分已修（3）；残差仅 r4 物化序一行——
+tclsh `clog e auto_path errorCode` vs rtcl `clog errorCode e
+auto_path`（同桶链 e/errorCode 的 ghost-insert 序，tcl_order 理论
+边界，2026-11-16 既有定调）。重开条件：哈希桶链逐位重放。
+
 ## 2026-11-22 probes 36 DIFF 清账（19 修复转绿 + dbg_trace 探针修正 + 16 归档移档；judge 88/88；workspace tests 全绿；probes active 432 全绿 + known 16 归档）
 
 36 条残差逐族定调（探针 → 根因 → 处置）。**口径落地**：`judge/
@@ -88,7 +156,9 @@ lands" 头注释移除（errorInfo 批早已落地）。known 每项在本节有
     已修；残差 = 嵌套引号替换跨行形态的 bracket 失败 errorInfo 归属
     （tclsh partial = 起点 150-cap 多行、行 7；rtcl = opener 截、
     行 9）——需复刻 tclParseCommand 的层级 scan。重开条件：parser
-    词层递归 scan 改造。
+    词层递归 scan 改造。**[更新 2026-11-22b]** 归属行/引文起点/
+    150-cap 已修（41a3337，gp_1/gp_2/gp_3 转绿）；残差仅引文终点
+    （≥4 层互嵌套递归的最深 opener 深度），见 2026-11-22b 节 4。
 14. **cases / cases2 / probe_round3**（parse 架构差异）：rtcl 命令替换
     词存惰性文本，parse 期错误（brace 词后多余 `}` → extra characters
     after close-brace）退化为执行期——帧链多一层内层 catch 帧、外层
@@ -97,11 +167,15 @@ lands" 头注释移除（errorInfo 批早已落地）。known 每项在本节有
 15. **oo2**（var-order 理论边界 + init 机制）：r4 行的 info vars
     物化序（tcl_order 理论边界，2026-11-16 轮既有定调）+ tclsh 的
     auto_index 数组由 auto_load 机制在 unknown→auto_load 首建
-    （rtcl 探针路径未触发）。
+    （rtcl 探针路径未触发）。**[更新 2026-11-22b]** auto_index 首建
+    已修（2912c81，桶位与 tclsh 一致）；残差仅 r4 的 e/errorCode
+    ghost-insert 序一行，见 2026-11-22b 节。
 16. **pidx**（expr 深水残差）：`expr $foo([x"y])` 下标替换路径的词中
     引号（词中 `"` 是普通字符）与报错归属——tclsh 报
     `invalid command name "x"y"`，rtcl 报 missing close-bracket。
     其余 pidx 面（pre-pass 主干）已对齐（pidx2/3/4 全绿）。
+    **[FIXED 2026-11-22b]**（9d9e971，词首引号纪律——探针移回
+    active）。
 17. **probe7**（D-27【策略级】+ 有意扩展）：len(𝟘)=2 / string first
     = 2 是 tclsh 8.6 UCS-2 码元语义（D-27 策略级，rtcl 码点语义
     定调不改）；`string byterange` 是 rtcl 有意扩展
@@ -111,12 +185,17 @@ lands" 头注释移除（errorInfo 批早已落地）。known 每项在本节有
     trace 回调里 `namespace children ::` 仍含 :foo、var unset trace
     回调里未处理变量仍可读（trv_d13 的 `set ::ref::var2` = BBB）；
     rtcl 单阶段拆除。18.4 计数形状（已绿）与此不冲突：变量在 trace
-    前已 detach。重开条件：nukeQueue 模型。
+    前已 detach。重开条件：nukeQueue 模型。**[FIXED 2026-11-22b]**
+    （9ef6f88，ns_dying + var_nuke_pending 两阶段模型——探针移回
+    active）。
 19. **we5**（行号 defer 深水）：ns eval 体出口帧行（`script line N`）
     在词替换 defer 形态（err_from_subst 臂不动 err_line）读 stale 的
     最内层日志行（boom 的 1）；tclsh = 体相对行 2。精确修需
     err_pending_top 载荷增加单元相对行字段——ei_line_attribution
     钉形反向约束（其 defer 行为已绿），直接改 defer 行值会翻红。
+    **[FIXED 2026-11-22b]**（378d980，载荷 (text, abs, unit_rel) +
+    体相对折算 = 属主行 + 内容日志行 - 1；D 钉形同式保持绿——探针
+    移回 active）。
 20. **utf_U_parsehex**（D-27【策略级】）：surrogate U+D842 在 tclsh
     8.6 内部可存为单码元（format %x 回读 d842）；rtcl（Rust char）
     替换为 U+FFFD——码元 vs 码点的策略级定调不改。

@@ -186,6 +186,57 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10vicesimussexdecimus. 2026-11-22 known 16→12 深水修复轮——ns delete 两阶段 / 词首引号 / auto_index / parse 归属 / we5 行号（perf/wave2 @ c1c1b19..）
+
+known 归档（probes-known）中 5 条深水的修复轮。4 条全修复转绿移回
+active（trv_d13/trv_p10/pidx/we5），globprobe/oo2 残差收窄留档。
+终态：**active 436 全绿、known 12**、judge 88/88、workspace tests
+1460/0。
+
+### 修复（每条一 commit）
+
+1. **9ef6f88 ns delete 两阶段拆除**（trv_d13/trv_p10）：tclsh
+   Tcl_DeleteNamespace 的 NS_DYING 可见性摘除先行、实体拆表延后
+   （TclTeardownNamespace 顺序：变量逐 unset → 命令逐 delete →
+   最后 unlink childTable）。rtcl 加 `ns_dying` 集合（exists/require_ns
+   报 gone、解析路径照常可达——TclGetNamespaceForQualName 不查
+   flag）+ `var_nuke_pending` 窗口（UnsetVarStruct 的表内 undefined：
+   which -variable 在 unset trace 期仍解析、读/info vars 照旧 miss、
+   18.4 计数形状不回退）；dying ns 二次 delete = NS_TEARDOWN 静默
+   跳过。自删路径（activationCount>0 等价）立即摘除不变。
+2. **9d9e971 词首引号纪律**（pidx）：subst 括号扫描
+   （run_bracket_script/check_bracket_tail）加 word_start 跟踪——词中
+   `"` 是普通字符（`expr $foo([x"y])` 的下标命令名 `x"y`）；引文开放
+   到 EOF 报 missing \"。
+3. **2912c81 ::auto_index 惰性首建**（oo2 auto_index 行）：tclsh 默认
+   unknown → auto_load 进入即建（T6/oo_ai7 钉形：查找失败也建）；
+   rtcl 首建从 has_unknown 臂（只认用户 proc）移到 unknown 臂入口
+   两臂共用。oo2 r4 行 auto_index 桶位与 tclsh 一致——残差仅剩
+   e/errorCode ghost-insert 物化序一行（tcl_order 理论边界，留档）。
+4. **41a3337 parse 错误归属最外层命令**（globprobe 归属半边）：
+   ParseError 增加 cmd_start/cmd_line 章（parse_command 失败上浮逐层
+   盖章）；seed_parse_error 引文起点/行号读章；skip_quoted_in_cmd 的
+   missing " offset 改 opener。gp_1/gp_2/gp_3 最小形全绿。
+   **残差留档**：globprobe 引文终点——tclsh term 在 ≥4 层引号⇄bracket
+   互嵌套递归的最深 opener，rtcl 浅 2 层；位置敏感的扫描栈语义差，
+   黑盒二分无法钉到单条规则，重开条件 = rd 扫描器嵌套栈改造。
+5. **378d980 err_pending_top 单元相对行**（we5）：载荷
+   (text, abs, unit_rel)——词替换 defer 位点携带体相对行 = 属主行 +
+   内层日志行 - 1（err_line 此刻 = 内容单元坐标；we5 `set r [boomq]`@2
+   + boomq 帧@1 → 2；ei D `set x [`@1 + nosuch@2 → 2——两形同式）；
+   ns eval 体出口帧挂起在位读新字段（err_exit_frame_at），无挂起
+   维持 err_line。flow 挂起位点带属主行、JIT 置 None（旧口径）。
+   ei_line_attribution A-J/file_ctx_frames/loop_body_err_line×4 全绿。
+
+### 教训
+
+- tclsh errorLine 是"按日志事件以当前单元坐标重算"的全局——rtcl 的
+  err_line 停在最内层日志单元坐标，跨单元出口帧（ns eval 体）需
+  显式折算载荷；折算式（属主行 + 内容日志行 - 1）对 D/we5/ng 三形
+  同一，未动 line_ctx/line_base 模型（adb25e2 口径不变）。
+- 归档探针双端逐字节转绿后**移回 active**（git mv），known 目录
+  只留真分歧；probes.sh 动态计数（active 436 / known 12）。
+
 ## 10vicesimusquintus. 2026-11-19 clock+package 剥离 → JS dynmod 补回（方案 a；perf/wave2 @ e2f956a..）
 
 用户拍板候选 #1 落地形态 = **方案 a（JS dynmod）**：clock/package 从

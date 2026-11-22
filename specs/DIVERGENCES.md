@@ -8,6 +8,119 @@
 > （本节）。条目后括注的
 > spec [D-x] 是规格文件内的 spec-local 编号，以本台账为准。
 
+## 2026-11-22 probes 36 DIFF 清账（19 修复转绿 + dbg_trace 探针修正 + 16 归档移档；judge 88/88；workspace tests 全绿；probes active 432 全绿 + known 16 归档）
+
+36 条残差逐族定调（探针 → 根因 → 处置）。**口径落地**：`judge/
+probes-known/` 归档目录 + `probes.sh` 改为「active 集必须全绿，
+known 单独展示」，过时的 "known-divergent until the errorInfo batch
+lands" 头注释移除（errorInfo 批早已落地）。known 每项在本节有
+定调条目；归档 = 设计差异/无有效 oracle/理论边界，非真分歧洗白。
+
+### 修复转绿（19 代码修复 + 1 探针修正）
+
+1. **流式 parse 前缀执行**（ix1/ix2/ix4/pidx2/pidx3/pidx4，6 条）：
+   tclsh 的文件执行（TclEvalEx）parse 到哪执行到哪——brace 未闭合词
+   吸收到 EOF 时**失败命令之前的前缀已经跑过**；rtcl 的 `-f` 整体
+   parse 失败则一条不执行。修复：`eval_impl` 的 parse 失败分支在
+   文件语境（was_file_armed）回落逐命令流（`eval_prefix_stream`，
+   语义同 eval_incremental），编译语境（proc 体等）保持整体报错。
+   sp1 钉形：`puts A\nputs B\nt {$foo({)` → tclsh/rtcl 均输出 A B。
+2. **parse 错误引文 opener 截断**（t2/t3/b5，3 条）：命令替换内的
+   brace 词未闭合（`puts [expr {"{" eq "{"}]`）引文应为 `puts [expr {`
+   （起点..opener 含）；rtcl 曾给空串（skip_braced 的 offset=scan
+   末端）。修复：skip_braced offset = opener_pos；missing close-bracket
+   回归 start-1（b1/b2/b5 钉形：`set x [abc...` 引文一律 `set x [`）。
+   注：globprobe 的 150-cap 多行引文形态与 opener 规则不可通约，见
+   移档条目。
+3. **expr in/ni 右操作数 list 校验**（t4）：`{"a" in $x}`（x=`{`）→
+   tclsh 报 `unmatched open brace in list`；rtcl 曾静默空表判 0。修复：
+   parse_equality 的 in/ni 臂走 strict_list。
+4. **proc 内相对 ns 限定名全局解析**（incr_window_p10_ns + 通用面）：
+   tclsh proc 内 `$n::v`/`set n::v` 一律按**全局**解析（nsq 钉形：
+   deep::r2 内 `$n::v` 读 `::n::v`——相对限定名的根是全局，与
+   current ns 无关）；rtcl 曾按字面名走 proc 局部（incr 从 0 起、
+   局部建变量）。修复：resolve_var/store_var 的 frame 分支对含 `::`
+   名直落 globals；get_var 的父 ns 检查按原样名剥前导（不拼
+   current ns）。
+5. **incr read trace**（incr_window_p11_trace）：tclsh incr 读现值
+   触发 read trace（Tcl_GetVarFromObj）；rtcl 走 get_var 无 trace。
+   修复：cmd_incr 读现值改 read_var。
+6. **info vars 全局 fallback + 全局表插入序**（namespace_varmodel2/
+   q114b/u72/p-uplevel-ns/trv_p8，5 条）：tclsh 的 `info vars` 在
+   非全局 ns 语境 = 当前 ns 表 + 全局表（proc 内仅局部——IVP 钉形
+   `argx a g1`）；两表各自 tcl_order 重放、当前表段在前（IVQ 钉形
+   A: `bb cc aa` + 全局段）。修复：misc.rs 的 ns 分支合并全局表
+   （global_split 分界）+ 分段重放。**全局表 rcFileName 序**：
+   tcl_rcFileName 是 Tcl_Main 在 init.tcl 批**之前**设的应用变量
+   （`info globals` 序以它为首，同桶链头位）——插入点移到 tcl_version
+   前，模拟 tcl_order 重放全序与 tclsh 逐字一致（python 数值验证）。
+7. **string is 分类表**（probe4/probe6）：tclsh 的 is upper/lower =
+   类别表 Lu/Ll 本身（Roman numeral Ⅷ U+2167 的 Other_Uppercase、
+   modifier letter ˡ U+02E1 的 Other_Lowercase 全 0——Rust
+   char::is_uppercase/is_lowercase 是扩集）；is digit = **手工滞后的
+   Nd 旧表**（devanagari ९ = 1 而 mathematical 𝟘 U+1D7D8 / Adlam
+   U+1E950 = 0；regexp 的 \d/[[:digit:]] 是完整 Nd，另一张表——
+   re:digit 行）。修复：rtcl-unicode 增 LU 表（is_lu）与
+   DIGIT_CLASSIC 表（is_digit_classic，31 段，tclsh 实测反推）。
+8. **regexp POSIX 类表裁剪**（utf_char_classes）：tclsh 8.6 的
+   `[[:word:]]` 不支持（报 invalid character class 终止）；rtcl 曾
+   接受为 \w 同义继续跑。修复：charset::from_posix 移除 "word"。
+9. **namespace tail/qualifiers 冒号语义**（trv_p11 部分行）：tclsh
+   的分隔符是冒号串（≥2）——`namespace tail a:b` = `a:b`（单 `:`
+   是名字字符）、`a:::` = 空。修复：命令层新 split_colon_pair
+   （变量/命令解析面的 split_colon_run 不动）。
+10. **dbg_trace 探针修正**（非 interp 面）：case trace-28.2/28.3 引用
+    extract.py 未提取的 traceExecute proc（tclsh 在 enterstep 触发时
+    `invalid command name` 终止、后续 case 无 oracle；rtcl enterstep
+    未触发继续跑）——剪除两个 case 后双端逐字节一致（含 rc）。
+    剪除的 28.2/28.3 记录在案：rtcl 的 execution trace enterstep
+    触发/错误传播面缺口仍是 OPEN 项（D-39 残差）。
+
+### 归档移档（16 条，judge/probes-known/）
+
+11. **c5_dis / cmp_unsupported / cmp_unsupported2**（disassemble 设计
+    差异）：错误面已全对齐（cmp_unsupported 前 30 行逐字同）；
+    成功 case 的 ByteCode dump = rtcl 自有指令集（Instructions/
+    constants 格式 vs tclsh 的 push1/invokeStk1 内部指令文本 + 指针
+    地址 + epoch）——逐字节兼容不可能。重开条件：无（架构差异）。
+12. **dbg_basic**（无有效 oracle）：tclsh 8.6.17 自身 SEGV（rc=139）。
+13. **globprobe**（parse 深水）：前缀执行、missing close-bracket 消息
+    已修；残差 = 嵌套引号替换跨行形态的 bracket 失败 errorInfo 归属
+    （tclsh partial = 起点 150-cap 多行、行 7；rtcl = opener 截、
+    行 9）——需复刻 tclParseCommand 的层级 scan。重开条件：parser
+    词层递归 scan 改造。
+14. **cases / cases2 / probe_round3**（parse 架构差异）：rtcl 命令替换
+    词存惰性文本，parse 期错误（brace 词后多余 `}` → extra characters
+    after close-brace）退化为执行期——帧链多一层内层 catch 帧、外层
+    引文完整；tclsh 前置整条命令 parse（单帧 + 出错点截断引文）。
+    重开条件：替换词主动 parse（架构级）。
+15. **oo2**（var-order 理论边界 + init 机制）：r4 行的 info vars
+    物化序（tcl_order 理论边界，2026-11-16 轮既有定调）+ tclsh 的
+    auto_index 数组由 auto_load 机制在 unknown→auto_load 首建
+    （rtcl 探针路径未触发）。
+16. **pidx**（expr 深水残差）：`expr $foo([x"y])` 下标替换路径的词中
+    引号（词中 `"` 是普通字符）与报错归属——tclsh 报
+    `invalid command name "x"y"`，rtcl 报 missing close-bracket。
+    其余 pidx 面（pre-pass 主干）已对齐（pidx2/3/4 全绿）。
+17. **probe7**（D-27【策略级】+ 有意扩展）：len(𝟘)=2 / string first
+    = 2 是 tclsh 8.6 UCS-2 码元语义（D-27 策略级，rtcl 码点语义
+    定调不改）；`string byterange` 是 rtcl 有意扩展
+    （STRING_EXTRA_SUBCMDS，8.6 报 unknown subcommand）。
+18. **trv_d13 / trv_p10**（ns delete 两阶段拆除）：tclsh 的 ns delete
+    拆除分两阶段（exists=0 后 nukeQueue 延迟清理）——command delete
+    trace 回调里 `namespace children ::` 仍含 :foo、var unset trace
+    回调里未处理变量仍可读（trv_d13 的 `set ::ref::var2` = BBB）；
+    rtcl 单阶段拆除。18.4 计数形状（已绿）与此不冲突：变量在 trace
+    前已 detach。重开条件：nukeQueue 模型。
+19. **we5**（行号 defer 深水）：ns eval 体出口帧行（`script line N`）
+    在词替换 defer 形态（err_from_subst 臂不动 err_line）读 stale 的
+    最内层日志行（boom 的 1）；tclsh = 体相对行 2。精确修需
+    err_pending_top 载荷增加单元相对行字段——ei_line_attribution
+    钉形反向约束（其 defer 行为已绿），直接改 defer 行值会翻红。
+20. **utf_U_parsehex**（D-27【策略级】）：surrogate U+D842 在 tclsh
+    8.6 内部可存为单码元（format %x 回读 d842）；rtcl（Rust char）
+    替换为 U+FFFD——码元 vs 码点的策略级定调不改。
+
 ## 2026-11-17 体帧行号 provenance 收口 + err_from_subst 跨错误泄漏（judge 88/88×2；battery 52/52；workspace tests 1420/0；fuzz seed7 400 例 5→0、seed0 500 例 0；probes 407/37 → 412/36）
 
 M1' 验收轮（87c468e）fuzz 定谳的 5 条 preexist 分歧

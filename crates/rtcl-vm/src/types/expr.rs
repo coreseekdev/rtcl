@@ -9,6 +9,7 @@
 use crate::error::{Error, Result};
 use super::expr_ops;
 use crate::interp::Interp;
+use crate::interp::commands::list::strict_list;
 use crate::value::Value;
 
 /// Evaluate a Tcl expression
@@ -319,12 +320,15 @@ impl<'a> ExprParser<'a> {
                 left = Value::from_bool(left.as_str() != right.as_str());
             } else if self.match_word_op("in") {
                 let right = self.parse_relational()?;
-                let items = right.as_list().unwrap_or_default();
+                // tclsh 对 in/ni 右操作数做 list 解析(坏 list 报
+                // `unmatched open brace in list`——t4 钉形 `{"a" in $x}`
+                // x="{"),不是静默空表。
+                let items = strict_list(self.interp, &right)?;
                 let found = items.iter().any(|v| v.as_str() == left.as_str());
                 left = Value::from_bool(found);
             } else if self.match_word_op("ni") {
                 let right = self.parse_relational()?;
-                let items = right.as_list().unwrap_or_default();
+                let items = strict_list(self.interp, &right)?;
                 let found = items.iter().any(|v| v.as_str() == left.as_str());
                 left = Value::from_bool(!found);
             } else if self.match_word_op("lt") {

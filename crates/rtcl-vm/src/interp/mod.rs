@@ -1545,6 +1545,13 @@ impl Interp {
         // 模式启动不含 auto_index——unknown→auto_load 首次运行时由
         // auto_load_index 创建（oo2 r4 / ai* 差分）。rtcl 的 stdlib
         // auto_load_index 移植体在触发时同样 set auto_index(...)。
+        // tcl_rcFileName 是 Tcl_Main 在 init.tcl 批**之前**设的应用
+        // 变量(IVQ 钉形:`info globals`/`info vars` 全局序以它为首,
+        // 同桶链头位)——先插,再进 init.tcl 批。
+        self.global_insert(
+            "tcl_rcFileName".to_string(),
+            Value::from_str("~/.tclshrc"),
+        );
         self.global_insert("tcl_version".to_string(), Value::from_str("8.6"));
         self.global_insert("argv0".to_string(), Value::from_str(""));
         self.global_insert("argv".to_string(), Value::from_str(""));
@@ -1563,10 +1570,6 @@ impl Interp {
         self.global_insert("tcl_patchLevel".to_string(), Value::from_str("8.6.17"));
         self.global_insert("tcl_library".to_string(), Value::from_str("/usr/share/tcltk/tcl8.6"));
         self.global_insert("tcl_platform".to_string(), Value::empty());
-        self.global_insert(
-            "tcl_rcFileName".to_string(),
-            Value::from_str("~/.tclshrc"),
-        );
     }
 
     /// Drop the `history` command wrapper (tclsh registers it only for

@@ -502,7 +502,9 @@ pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let var_name = args[1].as_str();
     // tclsh reads the variable first: a bad value there wins over a bad
     // increment (`incr x 1a` with x="1a" carries no increment frame).
-    let current = match interp.get_var(var_name) {
+    // 读取走 read_var(Tcl_GetVarFromObj 的 read trace 触发面:
+    // incr 读现值 fire read trace——incr_window_p11_trace 钉形)。
+    let current = match interp.read_var(var_name) {
         Ok(v) => {
             let parsed = v.as_int();
             let text = v.as_str().to_string();
@@ -941,6 +943,10 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             };
             let mut entries: Vec<(String, String)> = Vec::new();
             let mut table_ns: Option<String> = None;
+            // 非全局 ns 语境的全局 fallback 分界（tclsh InfoVarsCmd：
+            // 可见集 = 当前 ns 表 + :: 表，IVP/IVQ 钉形——前段当前表
+            // hash 序、后段全局表 hash 序分段拼接）。
+            let mut global_split: Option<usize> = None;
             // A relative pattern carrying `::` (n::* at global) names a
             // namespace's table just like a qualified one; results
             // render qualified (tclsh: `info vars n::*` → `::n::v`).
@@ -994,10 +1000,10 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     }
                 }
             } else if let Some(pfx) = &ns_prefix {
-                // Namespace scope: that namespace's own table; plain
-                // globals are NOT listed bare here (tclsh var-1.14
-                // lists the ns's own variables as tails — the merge of
-                // visible globals is the render step's business).
+                // Namespace scope: that namespace's own table, then the
+                // global :: table（tclsh InfoVarsCmd 的可见集合并——
+                // IVP 钉形 `argx a g1` 仅 proc 局部、IVQ 钉形 ns 体 =
+                // ns 表 + 全部全局裸名）。plain globals 列裸 tail。
                 for k in interp.var_order.iter() {
                     if !interp.globals.contains_key(k.as_str())
                         || is_array_element_name(k)
@@ -1009,6 +1015,15 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         _ => continue,
                     };
                     entries.push((k.clone(), tail));
+                }
+                global_split = Some(entries.len());
+                for k in interp.var_order.iter() {
+                    if interp.globals.contains_key(k.as_str())
+                        && !k.contains("::")
+                        && !is_array_element_name(k)
+                    {
+                        entries.push((k.clone(), k.clone()));
+                    }
                 }
             } else {
                 for k in interp.var_order.iter() {
@@ -1022,8 +1037,17 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             // Frame tables iterate in insertion order (compiled locals
             // array); global/ns tables replay the hash mechanics.
+            // ns 语境的全局 fallback 分段重放：当前表 hash 序在前、
+            // :: 表 hash 序在后（tclsh InfoVarsCmd 的双表遍历序——
+            // IVQ 钉形 A: `bb cc aa` + 全局段）。
             let ordered_tails = if !interp.frames.is_empty() && !qualified {
                 entries.iter().map(|(_, t)| t.clone()).collect()
+            } else if let Some(split) = global_split {
+                let tails: Vec<String> =
+                    entries.iter().map(|(_, t)| t.clone()).collect();
+                let mut o = super::super::tclhash::tcl_order(&tails[..split]);
+                o.extend(super::super::tclhash::tcl_order(&tails[split..]));
+                o
             } else {
                 let tails: Vec<String> =
                     entries.iter().map(|(_, t)| t.clone()).collect();

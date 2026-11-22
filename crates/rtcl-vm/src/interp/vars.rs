@@ -890,6 +890,13 @@ impl Interp {
             }
             // Slotted name: the slot is the canonical store (unset slots
             // fall through — the map never holds a table name).
+            // 相对 ns 限定名(n::v,非 :: 开头)不属于 proc 局部——
+            // tclsh 按全局解析(deep::r2 内 $n::v 读 ::n::v 钉形);
+            // 字面 frame 查找不适用,variable 链接已由 upvars 臂处理。
+            if name.contains("::") {
+                let key = self.redirect_flat(name.to_string());
+                return self.globals.get(key.as_str());
+            }
             frame
                 .slot_value(name)
                 .or_else(|| frame.locals.get(name))
@@ -987,6 +994,11 @@ impl Interp {
                     );
                 }
             }
+        } else if name.contains("::") {
+            // 相对 ns 限定名写全局(tclsh:proc 内 `set n::v 9` 写 ::n::v,
+            // 顶层 $n::v 可见钉形);局部名不含 `::`,字面 frame 写不适用。
+            let key = self.redirect_flat(name.to_string());
+            self.global_insert(key, value);
         } else {
             let f = &mut self.frames[frame_idx];
             match f.slot_index_of(name) {
@@ -1155,10 +1167,13 @@ impl Interp {
         // 删——后的帧视图对限定访问不可见，sd1-B/sd3 实证；裸名
         // keep-alive 链接不受影响）。
         if name.contains("::") {
-            let key = self.canonical_global(name);
+            // 相对限定名的解析根是全局(tclsh:deep::r2 内 `$n::v` 读
+            // ::n::v 钉形)——父 ns 检查按原样名剥前导 ::,不拼 current
+            // ns(ns 语境裸名的 canonical 在 resolve_var/store_var 的
+            // 非 frame 分支处理)。
+            let key = name.strip_prefix("::").unwrap_or(name);
             // 剥前导 :: 再取父（根 ns 下 canonical 原样返回 '::d::x'，
             // 直接 rsplit 会拼出 '::::d'——gen_namespace-46.3 回归实证）。
-            let key = key.strip_prefix("::").unwrap_or(&key);
             if let Some((p, _)) = key.rsplit_once("::") {
                 let parent = format!("::{}", p);
                 if parent != "::" && !self.namespaces.contains_key(&parent) {

@@ -1272,20 +1272,22 @@ impl Interp {
                 // with the qualified word `::unknown` — the original
                 // command's frame comes from the outer harness.
                 if cmd_name != "unknown" {
+                    // ::auto_index 惰性首建（D 2026-11-16 + 2026-11-22 oo2）：
+                    // tclsh 的**默认** unknown（init.tcl）一进来就跑
+                    // auto_load——auto_index 数组在**进入 auto_load 即建**
+                    // （T6/oo_ai7 钉形：查找失败也建）；oo2 的 l7
+                    // `fw g`（forward 目标缺命令走标准 not-found 链）靠
+                    // 它补齐 r4 行。默认臂此前不落表（has_unknown 只认
+                    // 用户 proc/ensemble）——移到两臂共用的前位。
+                    if !self.globals.contains_key("auto_index") {
+                        self.global_insert("auto_index".to_string(), Value::empty());
+                        self.array_globals.insert("auto_index".to_string());
+                    }
                     let has_unknown = self.procs.contains_key("unknown")
                         || self.procs.contains_key("::unknown")
                         || self.ensembles.contains_key("unknown")
                         || self.ensembles.contains_key("::unknown");
                     if has_unknown {
-                        // ::auto_index 惰性首建（D 2026-11-16）：tclsh 的
-                        // unknown→auto_load 首次运行时由 auto_load_index
-                        // 创建该数组（ai*/oo2 r4 实测：文件模式启动不含，
-                        // 首个 unknown 命令触发）。rtcl 的 auto_load_index
-                        // 是自包含空实现，此处代为落表。
-                        if !self.globals.contains_key("auto_index") {
-                            self.global_insert("auto_index".to_string(), Value::empty());
-                            self.array_globals.insert("auto_index".to_string());
-                        }
                         let mut unknown_args = vec![Value::from_str("::unknown")];
                         unknown_args.extend(args.iter().cloned());
                         return self.dispatch_values(&unknown_args);

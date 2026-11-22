@@ -53,6 +53,21 @@ known 12。
    复刻 tclParseCommand 的嵌套引文/bracket 递归栈语义（引号词内
    `[` 的错误立即传播、闭合点逐层配对）。重开条件：rd 扫描器的
    嵌套栈改造（gp_1/gp_2/gp_3 最小形已绿，残差仅在 ≥4 层互嵌套）。
+   **[FIXED 2026-11-22c]** 引文终点 = EOF 时**最深未闭合 `[`** 的
+   opener——白盒定谳（gdb 逐层 trace Tcl_ParseCommand 入口 +
+   frameprobe 逐帧重放）:tclParse.c ParseTokens bracket 分支把 `[`
+   内容按**逐命令循环**解析（Tcl_ParseCommand(nested=1) 反复调用），
+   仅当某条命令的 term == `]` 且 !incomplete 才算闭合；globprobe
+   行 9/11 的 `]` 都在引号内（`"]y"`/`"]z"`），bracket 一路吞行
+   10/11 直至 EOF，numBytes==0 处 term = tokenPtr->start = **当时
+   正在收命令的那层 `[`**（tclParse.c:1163），外层逐层原样上浮
+   （`parsePtr->term = nestedPtr->term`，tclParse.c:1136）。rtcl 的
+   平铺 depth 计数只能报本调用 opener。修复：parse_cmd_sub 的
+   depth 换 **opener 栈**，EOF 失败报栈顶（最深未闭合 `[`）——
+   引号/brace 吞吐边界与 tclsh 逐命令循环逐一相同，故栈顶 ≡ tclsh
+   的 EOF 失败层。globprobe 双端逐字节转绿移回 active（known
+   12→11）；gp_1/gp_2/gp_3、b1/b2/b5、t2/t3、sp1 全量重放不回退
+   （probes active 437 全绿）。
 5. **err_pending_top 单元相对行**（we5，378d980）：ns eval 体出口帧
    defer 形态（`set r [boomq]` 的 `[boomq]` 词失败）读 stale 的
    最内层日志行（boomq 体行 1）；tclsh = 体相对行 2。修复：
@@ -70,6 +85,8 @@ c5_dis/cmp_unsupported×2（disassemble 设计差异）、dbg_basic
 （oracle SEGV）、globprobe（残差见上）、cases/cases2/probe_round3
 （parse 架构差异）、oo2（残差见下）、probe7（D-27 策略级）、
 trv_p11、utf_U_parsehex（D-27 策略级）。
+**[更新 2026-11-22c]** globprobe 引文终点转绿（4，FIXED 见上），
+移回 judge/probes/（active 436→437，known 12→11）。
 
 oo2 残差更新：auto_index 部分已修（3）；残差仅 r4 物化序一行——
 tclsh `clog e auto_path errorCode` vs rtcl `clog errorCode e
@@ -159,6 +176,8 @@ lands" 头注释移除（errorInfo 批早已落地）。known 每项在本节有
     词层递归 scan 改造。**[更新 2026-11-22b]** 归属行/引文起点/
     150-cap 已修（41a3337，gp_1/gp_2/gp_3 转绿）；残差仅引文终点
     （≥4 层互嵌套递归的最深 opener 深度），见 2026-11-22b 节 4。
+    **[FIXED 2026-11-22c]** 引文终点转绿（opener 栈，见 2026-11-22b
+    节 4 的 FIXED 注），探针移回 judge/probes/。
 14. **cases / cases2 / probe_round3**（parse 架构差异）：rtcl 命令替换
     词存惰性文本，parse 期错误（brace 词后多余 `}` → extra characters
     after close-brace）退化为执行期——帧链多一层内层 catch 帧、外层

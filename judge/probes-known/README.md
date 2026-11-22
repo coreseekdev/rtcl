@@ -14,7 +14,6 @@
 | --- | --- | --- |
 | c5_dis / cmp_unsupported / cmp_unsupported2 | disassemble | 成功 case 的 ByteCode dump = rtcl 自有指令集格式，与 tclsh 内部指令文本逐字节不兼容（错误面已全对齐） |
 | dbg_basic | disassemble | tclsh 8.6.17 自身 SEGV（rc=139）——无有效 oracle |
-| globprobe | parse | bracket 失败的 errorInfo 引文归属：归属行/引文起点/150-cap 已修（2026-11-22b 41a3337，gp_1/2/3 转绿）；残差仅引文终点——≥4 层引号⇄bracket 互嵌套递归的最深 opener 深度（tclsh 行 11 处截、rtcl 行 9 处截），需复刻 tclParseCommand 嵌套递归栈语义 |
 | cases / cases2 / probe_round3 | parse | rtcl 命令替换词惰性文本使 parse 期错误退化为执行期（帧链多一层、引文完整）；tclsh 前置整条命令 parse（单帧 + 出错点截断引文） |
 | oo2 | var/trace | r4 行 var 物化序（tcl_order 理论边界）——auto_index 首建已修（2026-11-22b 2912c81，桶位一致）；残差仅 e/errorCode ghost-insert 序一行 |
 | probe7 | unicode | D-27【策略级】码元 vs 码点（len/index 对 astral 字符）+ `string byterange` 为 rtcl 有意扩展（STRING_EXTRA_SUBCMDS，8.6 无此子命令） |
@@ -24,3 +23,8 @@
 已修复移出（2026-11-22b，探针移回 judge/probes/）：trv_d13/trv_p10
 （9ef6f88 ns delete 两阶段拆除）、pidx（9d9e971 词首引号纪律）、
 we5（378d980 err_pending_top 单元相对行）。
+
+已修复移出（2026-11-22c，探针移回 judge/probes/）：globprobe
+（引文终点 = EOF 时最深未闭合 `[` 的 opener——parse_cmd_sub 开
+opener 栈钉定，白盒对照 tclParse.c ParseTokens bracket 分支逐命令
+循环 + term 上浮语义；known 12→11）。

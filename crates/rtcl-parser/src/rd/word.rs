@@ -445,21 +445,34 @@ fn try_parse_var_index(cur: &mut Cursor) -> Option<String> {
 pub fn parse_cmd_sub(cur: &mut Cursor, _bracket_term: bool) -> ParseResult<String> {
     debug_assert!(cur.is(Token::LeftBracket));
     let err_line = cur.line();
+    let opener = cur.pos();
     cur.advance(); // skip '['
     let start = cur.pos();
-    let mut depth: u32 = 1;
+    // Opener stack, not a scalar depth: on EOF failure tclsh reports the
+    // **deepest still-unclosed `[`**, not this call's own opener.  tclParse.c
+    // ParseTokens bracket branch parses the bracket content COMMAND BY
+    // COMMAND (Tcl_ParseCommand per command); the bracket only closes when a
+    // parsed command's term is `]` (a `]` inside quotes/braces never closes).
+    // When the loop runs out of input it errors with term = tokenPtr->start
+    // = the `[` of THAT innermost scanning bracket (tclParse.c:1163), and
+    // every enclosing level propagates it verbatim (`parsePtr->term =
+    // nestedPtr->term`, tclParse.c:1136).  A flat depth counter can only
+    // report its own opener — globprobe pinned the difference (tclsh 行 11/12
+    // 处截, rtcl 行 9).  The stack top at EOF = that innermost scanning
+    // bracket, because quote/brace consumption boundaries are identical.
+    let mut openers: Vec<usize> = vec![opener];
     let mut startofword = true;
 
-    while !cur.at_end() && depth > 0 {
+    while !cur.at_end() && !openers.is_empty() {
         match cur.peek() {
             Token::LeftBracket => {
-                depth += 1;
+                openers.push(cur.pos());
                 startofword = true;
                 cur.advance();
             }
             Token::RightBracket => {
-                depth -= 1;
-                if depth == 0 {
+                openers.pop();
+                if openers.is_empty() {
                     let content = cur.slice(start).to_string();
                     cur.advance(); // skip ']'
                     return Ok(content);
@@ -497,10 +510,12 @@ pub fn parse_cmd_sub(cur: &mut Cursor, _bracket_term: bool) -> ParseResult<Strin
         message: "missing close-bracket".into(),
         line: err_line,
         column: 0,
-        // tclsh logs the partial command through the `[`(b1/b2/b5 钉形:
-        // `set x [abc...` 未闭合,引文一律 `set x [`——opener 截断,
-        // 与 missing close-brace 同规则)。
-        offset: start - 1,
+        // tclsh logs the partial command through the **innermost still-open
+        // `[`** at EOF (ParseTokens bracket 分支 numBytes==0 时
+        // term = tokenPtr->start,嵌套失败逐层原样上浮)——单层退化同形
+        // (b1/b2/b5 钉形: `set x [abc...` 栈只剩 opener,引文 `set x [`
+        // 不变;globprobe gp11/13 多层形: 栈顶 = 行 11/12 的 `[`)。
+        offset: *openers.last().unwrap(),
         cmd_start: None,
         cmd_line: None,
     })

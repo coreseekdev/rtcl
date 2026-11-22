@@ -186,6 +186,91 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10vicesimusseptimusdecimus. 2026-11-22 globprobe 终局——parse_cmd_sub opener 栈，known 11（白盒对照 tclParse.c；perf/wave2）
+
+probes-known 最后一条 parse 深水（globprobe 引文终点）修复转绿移回
+active。终态：**active 437 全绿、known 11**。
+
+### 白盒方法论（本轮核心差异，黑盒二分失败后的正解）
+
+上轮（sexdecimus 节 4）黑盒二分钉不死"位置敏感的扫描栈语义差"。
+本轮直接以 oracle 内部为 ground truth，三条证据链：
+
+1. **gdb 逐层 trace**：`/usr/bin/tclsh` 无参符号（stripped）→ Python
+   API 在 libtcl 加载后 `break *base+0x106c90`（`nm -D` 取
+   Tcl_ParseCommand offset；gdb 默认关 ASLR，base 稳定），stop() 里读
+   $rsi/$rdx/$rcx 打印每次递归入口（ptr/bytes/nested + 内存头 16 字节
+   识别）。globprobe gp11 的递归树全部现形。
+2. **frameprobe 逐帧重放**（/tmp/wbparse/，tcl8.6-dev 头 + libtcl8.6
+   链接）：对递归树每帧的 (off, bytes, nested) 直接调
+   Tcl_ParseCommand 打印 term/errorType/incomplete——关键帧 [E]
+   （行 9 的 `string match {[]x]y} "]y"`）= OK term=**\n**
+   （不是 `]`！）。
+3. **读 .refer/tcl/generic/tclParse.c**（本地已有，无需网络）：上面
+   两条证据逐行对上 ParseTokens bracket 分支（1038..1258）。
+
+### 语义定谳（引文终点的权威规则）
+
+- ParseTokens bracket 分支 = **逐命令循环**：`[...]` 内容按
+  Tcl_ParseCommand(nested=1) 一条条解析，仅当某条命令的
+  `term == ']'` 且 !incomplete 才算 bracket 闭合；否则循环继续收下
+  一条命令。**引号/brace 里的 `]` 永不闭合**（`"]y"` 的 `]` 是引文
+  内容）——globprobe 行 9/11 视觉上"闭合"的 `]` 全在引号内，行 9
+  的 bracket 一路吞行 10/11。
+- EOF 时 numBytes==0：errorType=MISSING_BRACKET，
+  **term = tokenPtr->start = 当时正在收命令的那层 `[`**（
+  tclParse.c:1163），即**最深未闭合 `[` 的 opener**；外层逐层原样
+  上浮（`parsePtr->term = nestedPtr->term`，tclParse.c:1136）。
+- 引文 = Tcl_LogCommandInfo(script, commandStart, term+1-cmdStart)
+  的 150 字节 cap（tclBasic.c:5363 → tclNamesp.c Tcl_LogCommandInfo
+  limit=150，纯 verbatim 前缀 + `...`，无任何修饰/闭合装饰——此前
+  "display 插入 `"`"的错觉是**格式串的外层 wrap 引号**恰好贴着截断
+  点）。
+- term 可被 150-cap 掩盖（gp12/13 term=行 12 的 `[`，长度 165>150）；
+  用 frameprobe 直读 term 而非 errorInfo 推断。
+
+### 修复（word.rs parse_cmd_sub，单点）
+
+rtcl 平铺 depth 计数在 EOF 失败时只能报**本调用** opener（浅 2 层，
+行 9）——消费边界（skip_quoted/skip_braced 吞吐）与 tclsh 逐命令
+循环逐一相同，差的只是失败层记账。修复：depth 换 **opener 栈
+`Vec<usize>`**（`[` push、`]` pop），EOF 失败报 `openers.last()`。
+单层退化（b1/b2/b5 `set x [abc...`）栈只剩 opener，offset=start-1
+逐字节不变。
+
+### 验证与门禁
+
+- globprobe 双端逐字节一致（probes-known→active，git mv）；
+  gp7/gp11/gp11m/gp12/gp13 前缀变体全 AGREE；gp_2（`set x [foo
+  "a[<NL>bar]`）、b1/b2/b5、t2、sp1 最小形重放 AGREE。
+- probes：**active 437 全绿**（fail=0）、known 11（1 pass=原 globprobe
+  位）。judge 88/88、workspace tests 全绿（数字见门禁记录）。
+- known 终态 11：c5_dis/cmp_unsupported×2、dbg_basic、
+  cases/cases2/probe_round3、oo2、probe7、trv_p11、utf_U_parsehex。
+- 新发现预存形（**本轮不修**，留档）：`set x [[a]b]`（括号全闭合、
+  运行期 `invalid command name "a"`）——tclsh errorInfo 三帧
+  （`a` ← `[a]b` ← `set x [[a]b]`），rtcl 缺中间帧（词求值期出错时
+  替换词内层命令的帧）；与 archived cases 族同类（词求值帧链），
+  与本轮 parse 修复无关（修复只动 EOF 失败 Err 路径的 offset）。
+  另：objsec.tcl 是墙钟探针（clock seconds 跨秒边界），全量跑在
+  构建负载下会偶发 DIFF——静默机器 6 连全绿，与既往"负载下 judge
+  抖动"教训同源。
+
+### 教训
+
+- 黑盒二分的死角：该形态的错误面由**两层机制合成**（扫描栈决定
+  term、LogCommandInfo 决定截断），输出只见合成结果——单条规则反
+  推不可能。oracle 内部（gdb trace + 子进程逐帧重放）才是 ground
+  truth；.refer 源码用于把实测语义钉回代码行号。
+- tclsh 的 errorInfo 引文是 verbatim 前缀，任何"装饰字符"都应先
+  怀疑格式串 wrap（`"..."`）与 `...`——本例 `puts ["` 的 `"` 是
+  wrap，不是文本。
+- stripped 二进制打断点：pending bp + libtcl 加载后用 Python API
+  `break *base+offset`，寄存器取参（SysV: rdi/rsi/rdx/rcx/r8）。
+- .refer/tcl 是 Tcl 9 风格源码（Tcl_Size 签名），不能直接对系统
+  8.6 库编译——tcl8.6-dev 的 tcl-private 头 + 公共 API（Tcl_ParseCommand
+  是导出符号）够用。
+
 ## 10vicesimussexdecimus. 2026-11-22 known 16→12 深水修复轮——ns delete 两阶段 / 词首引号 / auto_index / parse 归属 / we5 行号（perf/wave2 @ c1c1b19..）
 
 known 归档（probes-known）中 5 条深水的修复轮。4 条全修复转绿移回

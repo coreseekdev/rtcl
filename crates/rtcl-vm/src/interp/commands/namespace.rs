@@ -427,9 +427,19 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if let Err(e) = &result {
         if interp.err_is_error(e) {
             // CALL 条目由体内日志事件按 ns-eval 调用词追加；这里只挂
-            // 错误出口的特殊帧。
+            // 错误出口的特殊帧。词替换 defer 形态（属主命令帧挂起，
+            // err_line 停在最内层日志单元——内容单元/嵌套 proc 体——的
+            // 坐标）读挂起帧载好的**体相对行**（挂起点已按
+            // 属主行 + 内容行 - 1 折算：we5 `set r [boomq]`@2 +
+            // boomq 帧@1 → 2；ei_line_attribution D `set x [`@1 +
+            // nosuch@2 → 2——两形同为体行 2，tclsh 一致）。无挂起
+            // （内层日志已顶替）维持 err_line 口径。
             let tag = format!("in namespace eval \"{}\" script", qualified);
-            interp.err_exit_frame(&tag);
+            let pending_rel = interp.err_pending_top.as_ref().and_then(|p| p.2);
+            match pending_rel {
+                Some(n) => interp.err_exit_frame_at(&tag, n),
+                None => interp.err_exit_frame(&tag),
+            }
         }
     }
     result

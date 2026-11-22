@@ -644,9 +644,13 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
             Region::Sub(site_idx) => {
                 let site = &code.sites[site_idx];
                 let text = site.text.slice(&code.source);
-                // 行号随帧走（append 时才更新 err_line）。
-                interp.err_pending_top =
-                    Some((Rc::from(text), st.entry_offset + site.line as usize));
+                // 行号随帧走（append 时才更新 err_line）。体相对行 =
+                // 属主行 + 内容坐标日志行 - 1（we5/D 双钉形同式）。
+                interp.err_pending_top = Some((
+                    Rc::from(text),
+                    st.entry_offset + site.line as usize,
+                    Some(site.line as usize + interp.err_line.saturating_sub(1)),
+                ));
                 // A word/operand bracket error is a substitution-origin
                 // error: an enclosing expr region must not append its own
                 // `expr {...}` frame (tclsh suppresses it).
@@ -664,7 +668,8 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                 let substitution_origin = interp.err_info.is_some()
                     || std::mem::take(&mut interp.err_from_subst);
                 if flow || substitution_origin {
-                    interp.err_pending_top = Some((Rc::from(text), line));
+                    interp.err_pending_top =
+                        Some((Rc::from(text), line, Some(site.line as usize)));
                     if substitution_origin {
                         interp.err_from_subst = true;
                     }
@@ -679,6 +684,7 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                     interp.err_pending_top = Some((
                         Rc::from(site.text.slice(&code.source)),
                         st.entry_offset + site.line as usize,
+                        Some(site.line as usize),
                     ));
                 } else if interp.in_file_script
                     && !st
@@ -797,7 +803,8 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                 let text = site.text.slice(&code.source);
                 let line = st.entry_offset + site.line as usize;
                 if flow {
-                    interp.err_pending_top = Some((Rc::from(text), line));
+                    interp.err_pending_top =
+                        Some((Rc::from(text), line, Some(site.line as usize)));
                 } else {
                     // 体帧行基 = 词括号 defer 行（见上方 Body/Next 臂注）：
                     // foreach 体内词括号失败的 err_line 是内层括号单元的
@@ -848,6 +855,7 @@ fn defer_flow_frame(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &
         interp.err_pending_top = Some((
             Rc::from(site.text.slice(&code.source)),
             st.entry_offset + site.line as usize,
+            Some(site.line as usize),
         ));
     }
     unwind_subs(interp, code, st, e, true);
@@ -1793,7 +1801,11 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                     | OpCode::EvalExpr
             );
             if is_word_op && std::mem::take(&mut interp.err_from_subst) {
-                interp.err_pending_top = Some((Rc::from(text), line));
+                interp.err_pending_top = Some((
+                    Rc::from(text),
+                    line,
+                    Some(site.line as usize + interp.err_line.saturating_sub(1)),
+                ));
             } else {
                 let msg = e.message_text();
                 // 调用类 op：INNER 的 invokeStk1 载荷用栈上**已求值
@@ -4028,14 +4040,14 @@ mod sub_inline_tests {
         assert!(r.is_err());
         let info = interp.err_info.take().unwrap_or_default();
         assert!(info.contains("\"nosuch a\""), "inner frame in {info}");
-        assert_eq!(interp.err_pending_top.as_ref().map(|(t, _)| t.as_ref()), Some("set x [nosuch a]"));
+        assert_eq!(interp.err_pending_top.as_ref().map(|(t, _, _)| t.as_ref()), Some("set x [nosuch a]"));
 
         // Nested: the outermost bracket's deferral wins.
         let mut interp = Interp::new();
         let r = interp.eval("set x [string length [nosuch a]]");
         assert!(r.is_err());
         assert_eq!(
-            interp.err_pending_top.as_ref().map(|(t, _)| t.as_ref()),
+            interp.err_pending_top.as_ref().map(|(t, _, _)| t.as_ref()),
             Some("set x [string length [nosuch a]]")
         );
     }
@@ -4080,7 +4092,7 @@ mod sub_inline_tests {
         let info = interp.err_info.take().unwrap_or_default();
         assert!(info.contains("\"nosuch a\""), "inner frame in {info}");
         assert!(!info.contains("expr {[nosuch a]}"), "no expr frame in {info}");
-        assert_eq!(interp.err_pending_top.as_ref().map(|(t, _)| t.as_ref()), Some("expr {[nosuch a]}"));
+        assert_eq!(interp.err_pending_top.as_ref().map(|(t, _, _)| t.as_ref()), Some("expr {[nosuch a]}"));
 
         // Mixed: word bracket defers, and the expr inside it does too.
         let mut interp = Interp::new();
@@ -4089,7 +4101,7 @@ mod sub_inline_tests {
         let info = interp.err_info.take().unwrap_or_default();
         assert!(info.contains("\"nosuch a\""), "inner frame in {info}");
         assert!(!info.contains("expr {[nosuch a]}"), "no expr frame in {info}");
-        assert_eq!(interp.err_pending_top.as_ref().map(|(t, _)| t.as_ref()), Some("set x [expr {[nosuch a]}]"));
+        assert_eq!(interp.err_pending_top.as_ref().map(|(t, _, _)| t.as_ref()), Some("set x [expr {[nosuch a]}]"));
 
         // Transparent-body suppression: `if`'s body error adds no if frame
         // and no enclosing expr frame.

@@ -611,6 +611,16 @@ impl Interp {
         }
     }
 
+    /// Same frame with an explicit line override — the ns-eval body exit
+    /// in the word-substitution defer shape reads the pending payload's
+    /// UNIT-RELATIVE line (we5: the innermost log line sits in the nested
+    /// proc's unit; tclsh's errorLine at that boundary is body-relative).
+    pub(crate) fn err_exit_frame_at(&mut self, tag: &str, line: usize) {
+        if let Some(info) = &mut self.err_info {
+            info.push_str(&format!("\n    ({} line {})", tag, line));
+        }
+    }
+
     /// 无行号的错误出口帧（tclsh：`("for" loop-end command)`）。
     pub(crate) fn err_exit_frame_raw(&mut self, text: &str) {
         if let Some(info) = &mut self.err_info {
@@ -811,8 +821,14 @@ impl Interp {
                             // 行号随帧走：defer 时不动 err_line（构造
                             // 出口帧读最内层日志命令的行，tclsh 的
                             // errorLine 只在日志事件处更新）。
-                            self.err_pending_top =
-                                Some((Rc::from(cmd.text.slice(&unit.source)), cmd.line + self.line_offset));
+                            // 体相对行折算：属主行 + 内层日志行 - 1
+                            // （err_line 此刻 = 内容单元坐标——替换帧/
+                            // 内容命令的行；we5/D 双钉形同式）。
+                            self.err_pending_top = Some((
+                                Rc::from(cmd.text.slice(&unit.source)),
+                                cmd.line + self.line_offset,
+                                Some(cmd.line + self.err_line.saturating_sub(1)),
+                            ));
                         } else {
                             let msg = e.message_text();
                             let local_slots = self.lexical_body || self.in_locals_unit;
@@ -878,8 +894,12 @@ impl Interp {
                     // tclsh does not append the enclosing `expr {...}` /
                     // `set q [...]` frame.  Defer it to the top-level
                     // report, where catch consumes it silently.
-                    self.err_pending_top =
-                        Some((Rc::from(cmd.text.slice(&unit.source)), cmd.line + self.line_offset));
+                    // 同上：属主行 + 内容坐标日志行 - 1 的体相对折算。
+                    self.err_pending_top = Some((
+                        Rc::from(cmd.text.slice(&unit.source)),
+                        cmd.line + self.line_offset,
+                        Some(cmd.line + self.err_line.saturating_sub(1)),
+                    ));
                 } else {
                 let msg = e.message_text();
                 let cmd_name = args.first().map(|v| v.as_str()).unwrap_or("");
@@ -901,8 +921,11 @@ impl Interp {
                 // D-11：顶层将升级为错误的控制流完成在本命令帧上延迟
                 // （tclsh 在转换点记录看到该完成的命令；最外层胜）。
                 // catch/try 消费路径由既有 err_pending_top 清理兜底。
-                self.err_pending_top =
-                    Some((Rc::from(cmd.text.slice(&unit.source)), cmd.line + self.line_offset));
+                self.err_pending_top = Some((
+                    Rc::from(cmd.text.slice(&unit.source)),
+                    cmd.line + self.line_offset,
+                    Some(cmd.line),
+                ));
             }
         }
         self.cur_source = saved_source;
@@ -1348,7 +1371,7 @@ impl Interp {
             // A word-substitution error that escaped every enclosing
             // construct frameless gets its enclosing command's frame
             // here (tclsh logs it at the top level, after the skip).
-            if let Some((text, line)) = self.err_pending_top.take() {
+            if let Some((text, line, _unit_rel)) = self.err_pending_top.take() {
                 if let Some(info) = &mut self.err_info {
                     info.push_str(&format!(
                         "\n    invoked from within\n\"{}\"",
@@ -1421,7 +1444,7 @@ impl Interp {
                 self.err_pending_top = None;
                 Some(info.clone())
             }
-            _ => self.err_pending_top.take().map(|(text, line)| {
+            _ => self.err_pending_top.take().map(|(text, line, _unit)| {
                 self.err_line = line;
                 format!(
                     "{}\n    while executing\n\"{}\"",

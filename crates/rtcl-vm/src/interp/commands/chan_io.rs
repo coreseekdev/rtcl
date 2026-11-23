@@ -1995,6 +1995,7 @@ pub(crate) fn pump_chan_copies(interp: &mut Interp, mut errors: Option<&mut Vec<
                 let saved_fresh = std::mem::take(&mut interp.err_fresh);
                 let saved_subst = std::mem::take(&mut interp.err_from_subst);
                 let saved_pending = interp.err_pending_top.take();
+                let saved_chain = std::mem::take(&mut interp.err_pending_chain);
                 if let Err(e) = interp.eval(&invocation) {
                     // tclsh bgerror：errorInfo 全链 + 调用帧转储到 stderr。
                     let info = interp
@@ -2016,6 +2017,7 @@ pub(crate) fn pump_chan_copies(interp: &mut Interp, mut errors: Option<&mut Vec<
                 interp.err_info = saved_info;
                 interp.err_fresh = saved_fresh;
                 interp.err_from_subst = saved_subst;
+                interp.err_pending_chain = saved_chain;
                 interp.err_pending_top = saved_pending;
             }
             None => {

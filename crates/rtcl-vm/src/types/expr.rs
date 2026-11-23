@@ -563,6 +563,7 @@ impl<'a> ExprParser<'a> {
                 // error raised by a command substitution (the same
                 // word-substitution deferral as `set q [nosuch]`).
                 self.interp.err_from_subst = true;
+                self.interp.err_expr_origin = true;
             }
             return r;
         }
@@ -943,6 +944,7 @@ impl<'a> ExprParser<'a> {
                             Err(e) => {
                                 self.interp.line_offset = saved_offset;
                                 self.interp.err_from_subst = true;
+                                self.interp.err_expr_origin = true;
                                 return Err(e);
                             }
                         };

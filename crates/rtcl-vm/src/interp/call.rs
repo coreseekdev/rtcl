@@ -759,12 +759,14 @@ impl Interp {
                 let saved_fresh = std::mem::take(&mut self.err_fresh);
                 let saved_raised = std::mem::take(&mut self.err_code_raised);
                 let saved_pending = self.err_pending_top.take();
+                let saved_chain = std::mem::take(&mut self.err_pending_chain);
                 for name in traced {
                     let _ = self.fire_traces(&name, None, "unset");
                 }
                 self.err_info = saved_info;
                 self.err_fresh = saved_fresh;
                 self.err_code_raised = saved_raised;
+                self.err_pending_chain = saved_chain;
                 self.err_pending_top = saved_pending;
             }
         }
@@ -916,6 +918,7 @@ impl Interp {
                                                 self.err_info = Some(base);
                                                 self.err_fresh = false;
                                                 self.err_pending_top = None;
+                                                self.err_pending_chain.clear();
                                                 self.err_force_inner = true;
                                                 self.err_while_exec = error_info
                                                     .as_deref()
@@ -981,6 +984,7 @@ impl Interp {
                                     self.err_info = Some(base);
                                     self.err_fresh = false;
                                     self.err_pending_top = None;
+                                    self.err_pending_chain.clear();
                                     self.err_force_inner = true;
                                     self.err_while_exec = error_info
                                         .as_deref()
@@ -1442,11 +1446,13 @@ impl Interp {
                 let saved_fresh = std::mem::take(&mut self.err_fresh);
                 let saved_raised = std::mem::take(&mut self.err_code_raised);
                 let saved_pending = self.err_pending_top.take();
+                let saved_chain = std::mem::take(&mut self.err_pending_chain);
                 for tname in traced {
                     let _ = self.fire_traces(&tname, None, "unset");
                 }
                 self.err_info = saved_info;
                 self.err_fresh = saved_fresh;
+                self.err_pending_chain = saved_chain;
                 self.err_code_raised = saved_raised;
                 self.err_pending_top = saved_pending;
             }

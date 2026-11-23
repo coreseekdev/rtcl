@@ -428,7 +428,9 @@ impl Interp {
             // 之前被循环吞掉的控制流完成留下的延迟帧在此作废；词括号
             // 替换旗标同批（不跨错误泄漏——见 catch 消费点注）。
             self.err_pending_top = None;
+            self.err_pending_chain.clear();
             self.err_from_subst = false;
+            self.err_expr_origin = false;
         }
         Error::syntax(&pe.message, pe.line, pe.column)
     }
@@ -441,11 +443,13 @@ impl Interp {
         let saved_fresh = std::mem::take(&mut self.err_fresh);
         let saved_subst = std::mem::take(&mut self.err_from_subst);
         let saved_pending = self.err_pending_top.take();
+        let saved_chain = std::mem::take(&mut self.err_pending_chain);
         let r = self.eval(script);
         self.err_info = saved_info;
         self.err_fresh = saved_fresh;
         self.err_from_subst = saved_subst;
         self.err_pending_top = saved_pending;
+        self.err_pending_chain = saved_chain;
         r
     }
 
@@ -558,8 +562,11 @@ impl Interp {
         }
         // A normal harness log means the substitution boundary's
         // deferred enclosing-command frame was superseded (tclsh's
-        // ERR_ALREADY_LOGGED is consumed by one level).
+        // ERR_ALREADY_LOGGED is consumed by one level).  链式载体同款
+        // 纪律（e8/e9）：直落帧消费掉整条内层链——proc/while 体边界
+        // 的 tclsh 形不带替换帧（P6/P9 钉形）。
         self.err_pending_top = None;
+        self.err_pending_chain.clear();
     }
 
     /// D-3 -errorstack 的 CALL/UP 追加——每次错误日志事件（tclsh
@@ -625,6 +632,34 @@ impl Interp {
     pub(crate) fn err_exit_frame_raw(&mut self, text: &str) {
         if let Some(info) = &mut self.err_info {
             info.push_str(&format!("\n    ({})", text));
+        }
+    }
+
+    /// [`Interp::err_pending_top`] 顶替纪律（e8/e9）：词级 defer / Sub
+    /// 区 unwind 覆写前调用——在位的**单元边界帧**移入
+    /// `err_pending_chain`（嵌套替换单元的出口帧，文件级退出逐帧兑
+    /// 现——tclsh `set x [[ [[a]b]c]d]` 五帧序）；非单元帧（expr 抑制
+    /// 臂置 false 的 pending）按旧口径静默丢弃。
+    pub(crate) fn err_pending_supersede(&mut self) {
+        if let Some((text, line, _)) = self.err_pending_top.take() {
+            if std::mem::take(&mut self.err_pending_unit_frame) {
+                self.err_pending_chain.push((text, line));
+            }
+        }
+    }
+
+    /// 链式载体提交（e8/e9）：`error_report` 的文件级退出——先链后顶
+    /// 逐帧追加 `invoked from within`（弹出序 = 内层先），行随帧走。
+    pub(crate) fn err_pending_chain_commit(&mut self) {
+        let chain = std::mem::take(&mut self.err_pending_chain);
+        for (text, line) in chain {
+            if let Some(info) = &mut self.err_info {
+                info.push_str(&format!(
+                    "\n    invoked from within\n\"{}\"",
+                    tcl_log_excerpt(&text)
+                ));
+                self.err_line = line;
+            }
         }
     }
 
@@ -824,11 +859,19 @@ impl Interp {
                             // 体相对行折算：属主行 + 内层日志行 - 1
                             // （err_line 此刻 = 内容单元坐标——替换帧/
                             // 内容命令的行；we5/D 双钉形同式）。
+                            // 顶替纪律：在位单元帧先入链（e8/e9）。
+                            self.err_pending_supersede();
                             self.err_pending_top = Some((
                                 Rc::from(cmd.text.slice(&unit.source)),
                                 cmd.line + self.line_offset,
                                 Some(cmd.line + self.err_line.saturating_sub(1)),
                             ));
+                            // expr 抑制臂（替换源错误不落 `expr {...}` 帧
+                            // ——tclsh 同）：origin 置位的 defer 不是单元
+                            // 边界帧（不参与链式顶替/提交）。与 vm_exec
+                            // word-op defer 同款消费纪律。
+                            self.err_pending_unit_frame =
+                                !std::mem::take(&mut self.err_expr_origin);
                         } else {
                             let msg = e.message_text();
                             let local_slots = self.lexical_body || self.in_locals_unit;
@@ -887,19 +930,24 @@ impl Interp {
             None => r,
         };
         if let Err(e) = &r {
-            if self.err_is_error(e) {
-                if std::mem::take(&mut self.err_from_subst) {
-                    // A command substitution inside this command (expr's
-                    // `[...]` operand) already logged its own frame;
-                    // tclsh does not append the enclosing `expr {...}` /
-                    // `set q [...]` frame.  Defer it to the top-level
-                    // report, where catch consumes it silently.
-                    // 同上：属主行 + 内容坐标日志行 - 1 的体相对折算。
-                    self.err_pending_top = Some((
-                        Rc::from(cmd.text.slice(&unit.source)),
-                        cmd.line + self.line_offset,
-                        Some(cmd.line + self.err_line.saturating_sub(1)),
-                    ));
+                if self.err_is_error(e) {
+                    if std::mem::take(&mut self.err_from_subst) {
+                        // A command substitution inside this command (expr's
+                        // `[...]` operand) already logged its own frame;
+                        // tclsh does not append the enclosing `expr {...}` /
+                        // `set q [...]` frame.  Defer it to the top-level
+                        // report, where catch consumes it silently.
+                        // 同上：属主行 + 内容坐标日志行 - 1 的体相对折算。
+                        // 顶替纪律：在位单元帧先入链（e8/e9）。
+                        self.err_pending_supersede();
+                        self.err_pending_top = Some((
+                            Rc::from(cmd.text.slice(&unit.source)),
+                            cmd.line + self.line_offset,
+                            Some(cmd.line + self.err_line.saturating_sub(1)),
+                        ));
+                        // expr 抑制臂同款（见上臂注）。
+                        self.err_pending_unit_frame =
+                            !std::mem::take(&mut self.err_expr_origin);
                 } else {
                 let msg = e.message_text();
                 let cmd_name = args.first().map(|v| v.as_str()).unwrap_or("");
@@ -926,6 +974,7 @@ impl Interp {
                     cmd.line + self.line_offset,
                     Some(cmd.line),
                 ));
+                self.err_pending_unit_frame = true;
             }
         }
         self.cur_source = saved_source;
@@ -1371,6 +1420,10 @@ impl Interp {
             // A word-substitution error that escaped every enclosing
             // construct frameless gets its enclosing command's frame
             // here (tclsh logs it at the top level, after the skip).
+            // 链式载体先行（e8/e9）：嵌套替换单元的出口帧按顶替序逐帧
+            // 落账（tclsh 文件级退出——`set x [[ [[a]b]c]d]` 五帧序：
+            // "[a]b"/"[[a]b]c"/"[ [[a]b]c]d"/"set x …"/file）。
+            self.err_pending_chain_commit();
             if let Some((text, line, _unit_rel)) = self.err_pending_top.take() {
                 if let Some(info) = &mut self.err_info {
                     info.push_str(&format!(
@@ -1403,6 +1456,7 @@ impl Interp {
         self.err_while_exec = false;
         self.err_skip_log = false;
         self.err_from_subst = false;
+        self.err_expr_origin = false;
         if self.err_is_error(&e) || e.is_exit() {
             return e;
         }
@@ -1442,16 +1496,22 @@ impl Interp {
         let error_info = match &e {
             Error::ControlFlow { error_info: Some(info), .. } => {
                 self.err_pending_top = None;
+                self.err_pending_chain.clear();
                 Some(info.clone())
             }
-            _ => self.err_pending_top.take().map(|(text, line, _unit)| {
-                self.err_line = line;
-                format!(
-                    "{}\n    while executing\n\"{}\"",
-                    msg,
-                    tcl_log_excerpt(&text)
-                )
-            }),
+            _ => {
+                // flow 转换不落替换链（tclsh `set x [break]`/`set x
+                // [[break]c]`：EI 只有 converting 命令帧 + file）。
+                self.err_pending_chain.clear();
+                self.err_pending_top.take().map(|(text, line, _unit)| {
+                    self.err_line = line;
+                    format!(
+                        "{}\n    while executing\n\"{}\"",
+                        msg,
+                        tcl_log_excerpt(&text)
+                    )
+                })
+            }
         };
         if let Some(info) = &error_info {
             self.err_info = Some(info.clone());
@@ -1501,6 +1561,16 @@ impl Interp {
                 match r {
                     Ok(v) => Ok(v),
                     Err(e) => {
+                        // 单元出口**不落账**（e8/e9 链式载体）：整词替换
+                        // 单元的命令帧是延迟帧（词级失败路径 defer 的
+                        // err_pending_top——`[[a]b]` 的 "[a]b"、
+                        // `[list [a]b]` 的 "list [a]b"），由外层词级
+                        // defer 顶替时移入 err_pending_chain（tclsh 只在
+                        // 文件级退出兑现整链——catch 形三帧不含替换帧、
+                        // proc/while 体边界一并丢弃）。early-commit（在
+                        // 此落账）会穿透 catch 边界——P4/P6/P9 钉形否决。
+                        // pending 为空 = 失败命令就是单元自身的命令
+                        // （`set x [a]` 的 "a"——分派路径已直落）。
                         // Mark the boundary: the enclosing command must not
                         // log its own frame (the nested eval just did).
                         self.err_from_subst = true;

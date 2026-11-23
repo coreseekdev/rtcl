@@ -804,6 +804,8 @@ pub fn cmd_return(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     interp.err_info = error_info.clone();
                     interp.err_fresh = false;
                     interp.err_pending_top = None;
+                    interp.err_pending_unit_frame = false;
+                    interp.err_pending_chain.clear();
                     interp.err_skip_log = true;
                     interp.err_force_inner = true;
                 } else if c == 1 {
@@ -1025,6 +1027,8 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // The catch consumed the propagation — no deferred
             // enclosing-command frame can reach the top-level report.
             interp.err_pending_top = None;
+            interp.err_pending_unit_frame = false;
+            interp.err_pending_chain.clear();
             // Only an ERROR completion touches ::errorInfo — a caught
             // break/continue/plain-return leaves whatever is in there
             // alone (tclsh: catching `return -code break x` does not
@@ -1372,6 +1376,8 @@ pub fn cmd_error(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             interp.err_info = Some(info.clone());
             interp.err_fresh = true;
             interp.err_pending_top = None;
+            interp.err_pending_unit_frame = false;
+            interp.err_pending_chain.clear();
             // INNER/CALL 全部保持陈旧（tclsh 同形：非空 info 的
             // errorstack 原样保留上一错误的条目）。
         }

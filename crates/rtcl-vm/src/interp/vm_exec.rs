@@ -638,12 +638,33 @@ fn word_op_inner_hint(code: &ByteCode, op: &OpCode, msg: &str) -> Option<&'stati
 }
 
 fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error, flow: bool) {
+    // expr 抑制臂出现过（本 unwind 内任一 Expr 区写了抑制 pending）
+    // ——其后所有 Sub 越界提交跳过（tclsh 对替换源错误不落 expr 帧，
+    // 其内层/外层替换帧一并抑制——E 钉形）。
+    let mut suppressed = false;
     while let Some(region) = st.bodies.last().copied() {
         st.bodies.pop();
         match region {
             Region::Sub(site_idx) => {
                 let site = &code.sites[site_idx];
                 let text = site.text.slice(&code.source);
+                // 顶替纪律（e8/e9 链式载体）：弹出 Sub 区 = 用本区属主
+                // 命令文本覆写 pending——在位的**单元边界帧**（内层单元
+                // 词级 defer 留下的 `[[a]b]` 的 "[a]b"、`[list [a]b]` 的
+                // "list [a]b"）先移入 err_pending_chain，由文件级退出逐
+                // 帧兑现（`set x [[ [[a]b]c]d]` 五帧序）。early-commit
+                //（在此落账）会穿透 catch/proc/while 边界——tclsh 的
+                // catch 形三帧不含替换帧（P4/P6/P9 钉形），否决。
+                // expr 抑制臂写的 pending（unit_frame=false）不属单元
+                // 帧，按旧口径丢弃。pending 为空无帧可移。仅错误流
+                //（flow=true——控制流完成不走 errorInfo，链不参与）。
+                if !flow && !suppressed {
+                    interp.err_pending_supersede();
+                } else if !flow {
+                    // expr 抑制后的覆写：旧 pending（抑制帧）丢弃。
+                    interp.err_pending_top = None;
+                    interp.err_pending_unit_frame = false;
+                }
                 // 行号随帧走（append 时才更新 err_line）。体相对行 =
                 // 属主行 + 内容坐标日志行 - 1（we5/D 双钉形同式）。
                 interp.err_pending_top = Some((
@@ -651,6 +672,7 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                     st.entry_offset + site.line as usize,
                     Some(site.line as usize + interp.err_line.saturating_sub(1)),
                 ));
+                interp.err_pending_unit_frame = true;
                 // A word/operand bracket error is a substitution-origin
                 // error: an enclosing expr region must not append its own
                 // `expr {...}` frame (tclsh suppresses it).
@@ -670,6 +692,12 @@ fn unwind_subs(interp: &mut Interp, code: &ByteCode, st: &mut VmState, e: &Error
                 if flow || substitution_origin {
                     interp.err_pending_top =
                         Some((Rc::from(text), line, Some(site.line as usize)));
+                    // expr 抑制帧：tclsh 对替换源错误不落 `expr {...}`
+                    // 帧——本 unwind 内后续 Sub 区的越界提交全部跳过
+                    // （e8/e9 与 expr 帧抑制的正交性；flag 同时标记
+                    // pending 非单元边界帧）。
+                    suppressed = true;
+                    interp.err_pending_unit_frame = false;
                     if substitution_origin {
                         interp.err_from_subst = true;
                     }
@@ -1801,11 +1829,24 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                     | OpCode::EvalExpr
             );
             if is_word_op && std::mem::take(&mut interp.err_from_subst) {
+                // 顶替纪律（e8/e9 链式载体）：在位单元边界帧先入链——
+                // 嵌套替换单元的出口帧（depth-2 trace 钉形：`set x [[
+                // [[a]b]c]d]` 的 [A]×3 → [B] → 报告五帧）。
+                interp.err_pending_supersede();
                 interp.err_pending_top = Some((
                     Rc::from(text),
                     line,
                     Some(site.line as usize + interp.err_line.saturating_sub(1)),
                 ));
+                // expr 操作数括号（运行时求值器路径）的 EvalScript
+                // defer：tclsh 对替换源错误不落 `expr {...}` 帧——该
+                // pending 不是单元边界帧（下游 Sub 区的越界提交必须
+                // 跳过；e8/e9 与 expr 帧抑制的正交性）。
+                // expr 操作数括号（运行时求值器路径）的词级 defer：
+                // tclsh 对替换源错误不落 `expr {...}` 帧——defer 的
+                // pending（外层命令文本）不是单元边界帧（下游 Sub 区的
+                // 越界提交必须跳过；e8/e9 与 expr 帧抑制的正交性）。
+                interp.err_pending_unit_frame = !std::mem::take(&mut interp.err_expr_origin);
             } else {
                 let msg = e.message_text();
                 // 调用类 op：INNER 的 invokeStk1 载荷用栈上**已求值

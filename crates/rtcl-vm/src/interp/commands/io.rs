@@ -1014,6 +1014,16 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         };
     }
+    // An XPG star width/precision consumes argv[idx+2] before the value
+    // does (`%3$*.*d 5 6 7` runs past the arguments) — tclsh reports the
+    // index, never a bounds fault.
+    macro_rules! star_available {
+        ($idx:expr) => {
+            if $idx + 2 >= args.len() {
+                return fmt_err!("\"%n$\" argument index out of range", "TCL FORMAT INDEXRANGE");
+            }
+        };
+    }
     macro_rules! not_enough {
         () => {
             return fmt_err!(
@@ -1219,6 +1229,7 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 let mut idx = n - 1;
                 if star_width {
+                    star_available!(idx);
                     let w = int_star_arg!(args[idx + 2]);
                     if w < 0 {
                         flag_minus = true;
@@ -1229,6 +1240,7 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     idx += 1;
                 }
                 if star_prec {
+                    star_available!(idx);
                     let pv = int_star_arg!(args[idx + 2]);
                     precision = Some((pv.max(0) as usize).min(FMT_WIDTH_CAP));
                     idx += 1;
@@ -1388,7 +1400,7 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 let s = if v.is_infinite() {
                     inf_text(v.is_sign_negative(), false)
                 } else {
-                    let mut s = format!("{:.*}", prec, v.abs());
+                    let mut s = fmt_fixed_pad(prec, v.abs());
                     if flag_hash && prec == 0 {
                         s.push('.');
                     }
@@ -1495,11 +1507,49 @@ fn apply_sign(v: f64, abs_str: &str, plus: bool, space: bool) -> String {
     }
 }
 
+/// Digits beyond this are all zeros for any finite double: the widest
+/// exact decimal expansion (a subnormal's) has 1074 fractional digits.
+const FMT_FLOAT_MAX_PREC: usize = 1100;
+
+/// `format!("{:.*}", prec, v)` for any precision. Rust's float formatter
+/// panics ("Formatting argument out of range") past 65535 digits, so
+/// format the head and zero-pad the tail — tclsh honours every precision
+/// (`format %.65536f 1.5` is a 65538-char result).
+fn fmt_fixed_pad(prec: usize, v: f64) -> String {
+    let p = prec.min(FMT_FLOAT_MAX_PREC);
+    let mut s = format!("{:.*}", p, v);
+    if prec > p {
+        s.reserve(prec - p);
+        for _ in 0..prec - p {
+            s.push('0');
+        }
+    }
+    s
+}
+
+/// `format!("{:.*e}", prec, v)` for any precision (zeros pad the mantissa).
+fn fmt_exp_pad(prec: usize, v: f64) -> String {
+    let p = prec.min(FMT_FLOAT_MAX_PREC);
+    let s = format!("{:.*e}", p, v);
+    if prec > p {
+        if let Some(pos) = s.find('e') {
+            let mut out = String::with_capacity(s.len() + prec - p);
+            out.push_str(&s[..pos]);
+            for _ in 0..prec - p {
+                out.push('0');
+            }
+            out.push_str(&s[pos..]);
+            return out;
+        }
+    }
+    s
+}
+
 fn format_exp(v: f64, prec: usize, upper: bool, hash: bool) -> String {
     // Rust's {:.*e} is correctly rounded; reassemble with C's exponent
     // layout (sign always present, at least two digits). '#' keeps the
     // decimal point even when the precision is 0 ("1.e+01").
-    let s = format!("{:.*e}", prec, v);
+    let s = fmt_exp_pad(prec, v);
     let (mant, exp) = s.split_once('e').unwrap_or((s.as_str(), "0"));
     let expn: i32 = exp.parse().unwrap_or(0);
     let e_char = if upper { 'E' } else { 'e' };
@@ -1563,7 +1613,9 @@ fn format_g(v: f64, prec: usize, upper: bool, hash: bool) -> String {
             "0".to_string()
         }
     } else {
-        let s_e = format!("{:.*e}", prec.saturating_sub(1), v);
+        // Only the exponent is read here; FMT_FLOAT_MAX_PREC digits are
+        // already the exact value, so the exponent is exact too.
+        let s_e = fmt_exp_pad(prec.saturating_sub(1), v);
         let exp: i32 = s_e
             .split_once('e')
             .and_then(|(_, e)| e.parse().ok())
@@ -1577,7 +1629,7 @@ fn format_g(v: f64, prec: usize, upper: bool, hash: bool) -> String {
             }
         } else {
             let fp = (prec as i32 - 1 - exp).max(0) as usize;
-            let s = format!("{:.*}", fp, v);
+            let s = fmt_fixed_pad(fp, v);
             if hash {
                 if s.contains('.') {
                     s

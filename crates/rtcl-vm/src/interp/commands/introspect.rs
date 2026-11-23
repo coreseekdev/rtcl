@@ -406,22 +406,33 @@ pub fn cmd_pack(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         )
     })?;
     let type_name = args[3].as_str();
-    let bit_width = args[4].as_int().ok_or_else(|| {
+    let bad_int = |v: &Value| {
         Error::runtime(
-            format!("expected integer but got \"{}\"", args[4].as_str()),
+            format!("expected integer but got \"{}\"", v.as_str()),
             ErrorCode::Generic,
         )
-    })? as usize;
-    let bit_offset = if args.len() == 6 {
-        args[5].as_int().ok_or_else(|| {
-            Error::runtime(
-                format!("expected integer but got \"{}\"", args[5].as_str()),
-                ErrorCode::Generic,
-            )
-        })? as usize
-    } else {
-        0
     };
+    let bit_width = args[4].as_int().ok_or_else(|| bad_int(&args[4]))?;
+    let bit_offset = match args.len() {
+        6 => args[5].as_int().ok_or_else(|| bad_int(&args[5]))?,
+        _ => 0,
+    };
+    // Widths and offsets are validated before they reach a size: the
+    // unchecked `as usize` turned `pack v 1 le 0 -1` into a 2^61-byte
+    // resize (an aborting allocation).
+    if !(1..=64).contains(&bit_width) {
+        return Err(Error::runtime(
+            format!("bad bitwidth \"{}\": must be 1..64", args[4].as_str()),
+            ErrorCode::Generic,
+        ));
+    }
+    if bit_offset < 0 {
+        return Err(Error::runtime(
+            format!("bad bitoffset \"{}\": must be >= 0", args[5].as_str()),
+            ErrorCode::Generic,
+        ));
+    }
+    let (bit_width, bit_offset) = (bit_width as usize, bit_offset as usize);
 
     // Get existing binary data or create empty
     let existing = match interp.get_var(var_name) {
@@ -429,9 +440,21 @@ pub fn cmd_pack(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         Err(_) => Vec::new(),
     };
 
-    let total_bytes = (bit_offset + bit_width).div_ceil(8);
+    let total_bytes = bit_offset
+        .checked_add(bit_width)
+        .map(|bits| bits.div_ceil(8))
+        .filter(|&n| n <= super::list::MAX_VALUE_BYTES)
+        .ok_or_else(|| {
+            super::list::set_error_code(interp, "TCL MEMORY");
+            Error::runtime(
+                "result exceeds max size for a Tcl value (2147483647 bytes)".to_string(),
+                ErrorCode::Generic,
+            )
+        })?;
     let mut data = existing;
     if data.len() < total_bytes {
+        data.try_reserve(total_bytes - data.len())
+            .map_err(|_| super::list::out_of_memory(interp, total_bytes))?;
         data.resize(total_bytes, 0);
     }
 

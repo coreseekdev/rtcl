@@ -611,10 +611,41 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     ))
                 }
             };
+            if count > i32::MAX as i64 || count < i32::MIN as i64 {
+                // tclsh parses the count as a C `int`.
+                super::list::set_error_code(
+                    interp,
+                    "ARITH IOVERFLOW {integer value too large to represent}",
+                );
+                return Err(Error::runtime(
+                    "integer value too large to represent".to_string(),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
             if count < 0 {
                 return Ok(Value::empty());
             }
-            Ok(Value::from_str(&str_val.repeat(count as usize)))
+            // Result length is checked up front (tclsh: `result exceeds max
+            // size for a Tcl value (2147483647 bytes)`) and the allocation
+            // is fallible: the unchecked `repeat` was a capacity panic or
+            // an aborting allocation on `string repeat x 4294967296`.
+            let total = match (count as usize).checked_mul(str_val.len()) {
+                Some(n) if n <= super::list::MAX_VALUE_BYTES => n,
+                _ => {
+                    super::list::set_error_code(interp, "TCL MEMORY");
+                    return Err(Error::runtime(
+                        "result exceeds max size for a Tcl value (2147483647 bytes)".to_string(),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+            };
+            let mut out = String::new();
+            out.try_reserve(total)
+                .map_err(|_| super::list::out_of_memory(interp, total))?;
+            for _ in 0..count {
+                out.push_str(&str_val);
+            }
+            Ok(Value::from_str(&out))
         }
         "reverse" => {
             Ok(Value::from_str(&str_val.chars().rev().collect::<String>()))

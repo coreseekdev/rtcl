@@ -125,6 +125,43 @@ pub(crate) fn tcl_get_int(s: &str) -> Option<i64> {
     if used == t.len() { Some(v) } else { None }
 }
 
+/// tclsh's static ceilings, both consequences of C-`int` sized lengths:
+/// a string value is at most INT_MAX bytes, a list at most 536870909
+/// elements. `string repeat` and `lrepeat` report an exceedance as a
+/// `TCL MEMORY` error instead of attempting the allocation.
+pub(crate) const MAX_VALUE_BYTES: usize = i32::MAX as usize;
+pub(crate) const MAX_LIST_ELEMENTS: usize = 536870909;
+
+/// A repeat/element count argument in tclsh's range (C `int`, either
+/// sign): outside it tclsh raises `integer value too large to represent`
+/// (`ARITH IOVERFLOW`) before anything is allocated. The unchecked
+/// product of such a count was a capacity panic or an aborting
+/// allocation here.
+pub(crate) fn tcl_count(interp: &mut Interp, v: &Value) -> Result<i64> {
+    match v.as_int() {
+        Some(n) if n >= i32::MIN as i64 && n <= i32::MAX as i64 => Ok(n),
+        Some(_) => {
+            set_error_code(
+                interp,
+                "ARITH IOVERFLOW {integer value too large to represent}",
+            );
+            Err(tcl_err("integer value too large to represent"))
+        }
+        None => Err(tcl_err(format!(
+            "expected integer but got \"{}\"",
+            v.as_str()
+        ))),
+    }
+}
+
+/// A fallible allocation that ran out of room (Rust's default handler
+/// aborts the process on a failed allocation, which Tcl `catch` cannot
+/// intercept).
+pub(crate) fn out_of_memory(interp: &mut Interp, bytes: usize) -> Error {
+    set_error_code(interp, "TCL MEMORY");
+    tcl_err(format!("not enough memory to allocate {} bytes", bytes))
+}
+
 /// Parse a Tcl index (`integer?[+-]integer?` or `end?[+-]integer?`),
 /// resolving `end` against `len`. The result may be negative or >= len;
 /// callers clamp or report out-of-range as appropriate.
@@ -365,16 +402,9 @@ pub fn cmd_lrepeat(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         set_error_code(interp, "TCL WRONGARGS");
         return Err(wrong_args("lrepeat", "count ?value ...?"));
     }
-    let count = match args[1].as_int() {
-        Some(n) => n,
-        None => {
-            return Err(tcl_err(format!(
-                "expected integer but got \"{}\"",
-                args[1].as_str()
-            )));
-        }
-    };
+    let count = tcl_count(interp, &args[1])?;
     if count < 0 {
+        set_error_code(interp, "TCL OPERATION LREPEAT NEGARG");
         return Err(tcl_err(format!(
             "bad count \"{}\": must be integer >= 0",
             args[1].as_str()
@@ -385,7 +415,19 @@ pub fn cmd_lrepeat(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if elements.is_empty() {
         return Ok(Value::empty());
     }
-    let mut result = Vec::with_capacity(count * elements.len());
+    // The result length is checked up front (tclsh: `max length of a Tcl
+    // list (536870909 elements) exceeded`), and the allocation is fallible.
+    let total = count
+        .checked_mul(elements.len())
+        .filter(|&n| n <= MAX_LIST_ELEMENTS)
+        .ok_or_else(|| {
+            set_error_code(interp, "TCL MEMORY");
+            tcl_err("max length of a Tcl list (536870909 elements) exceeded")
+        })?;
+    let mut result = Vec::new();
+    result
+        .try_reserve(total)
+        .map_err(|_| out_of_memory(interp, total * core::mem::size_of::<Value>()))?;
     for _ in 0..count {
         result.extend(elements.iter().cloned());
     }

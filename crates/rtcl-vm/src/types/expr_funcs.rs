@@ -149,9 +149,20 @@ fn abs_value(v: &Value) -> Result<Value> {
         Some(d) if d == 0.0 && d.is_sign_negative() => Ok(float_value(0.0)),
         Some(_) => Ok(v.clone()),
         None => Err(Error::Msg(format!(
-            "expected number but got \"{}\"",
-            v.as_str()
+            "expected number but got \"{}\"{}",
+            v.as_str(),
+            octal_hint(v)
         ))),
+    }
+}
+
+/// tclsh's suffix on a bad numeric argument shaped like `018`:
+/// `expected number but got "018" (looks like invalid octal number)`.
+fn octal_hint(v: &Value) -> &'static str {
+    if super::bignum::is_invalid_octal(v.as_str().trim()) {
+        " (looks like invalid octal number)"
+    } else {
+        ""
     }
 }
 
@@ -196,8 +207,9 @@ fn int_or_entier(v: &Value, keep_big: bool) -> Result<Value> {
             }
         }
         None => Err(Error::Msg(format!(
-            "expected number but got \"{}\"",
-            v.as_str()
+            "expected number but got \"{}\"{}",
+            v.as_str(),
+            octal_hint(v)
         ))),
     }
 }
@@ -271,8 +283,9 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
                 )),
                 Some(n) => Ok(float_value(n)),
                 None => Err(Error::Msg(format!(
-                    "expected number but got \"{}\"",
-                    args[0].as_str()
+                    "expected floating-point number but got \"{}\"{}",
+                    args[0].as_str(),
+                    octal_hint(&args[0])
                 ))),
             }
         }
@@ -321,8 +334,9 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
                 Some(n) if n >= 0.0 => Ok(float_value(n.sqrt())),
                 Some(_) => Err(domain_error()),
                 None => Err(Error::Msg(format!(
-                    "expected number but got \"{}\"",
-                    args[0].as_str()
+                    "expected number but got \"{}\"{}",
+                    args[0].as_str(),
+                    octal_hint(&args[0])
                 ))),
             }
         }
@@ -482,7 +496,7 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
                     crate::error::ErrorCode::InvalidOp,
                 )),
                 None => Err(Error::runtime(
-                    format!("expected number but got \"{}\"", args[0].as_str()),
+                    format!("expected number but got \"{}\"{}", args[0].as_str(), octal_hint(&args[0])),
                     crate::error::ErrorCode::Generic,
                 )),
             }

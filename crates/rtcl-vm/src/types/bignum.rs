@@ -44,20 +44,27 @@ impl IntRep {
 }
 
 /// Exact integer view of a Value (no float coercion).
-///
-/// Uses `as_int()` for the i64 path (hex / 0o / 0b / legacy octal
-/// prefixes included), then re-parses the string with the same Tcl
-/// literal grammar at unbounded width.
 pub fn int_rep(v: &Value) -> Option<IntRep> {
     if let Some(i) = v.as_int() {
         return Some(IntRep::I64(i));
     }
-    parse_literal(v.as_str().trim()).map(IntRep::Big)
+    // `as_int` already took every i64-range literal, so this is a bignum.
+    match parse_int(v.as_str().trim())? {
+        IntRep::Big(b) => Some(IntRep::Big(b)),
+        IntRep::I64(i) => Some(IntRep::I64(i)),
+    }
 }
 
-/// Parse a Tcl integer literal (optional sign, 0x/0X hex, 0o/0O octal,
-/// 0b/0B binary, leading-`0` legacy octal, decimal) at arbitrary width.
-pub fn parse_literal(s: &str) -> Option<BigInt> {
+/// The Tcl integer-literal grammar — the single implementation, shared by
+/// `Value::as_int`, [`int_rep`] and the expression result canonicalization
+/// (they used to carry four private copies that disagreed about legacy
+/// octal: one read `0777…` past 64 bits as decimal, another `018` as 18).
+///
+/// Optional sign; decimal; `0x`/`0X`, `0o`/`0O`, `0b`/`0B` prefixes; a
+/// leading `0` followed by more octal digits is legacy octal (`017` is
+/// 15), at any width. A leading `0` followed by a digit 8 or 9 is not a
+/// number at all (see [`is_invalid_octal`]).
+pub fn parse_int(s: &str) -> Option<IntRep> {
     let (neg, body) = match s.strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, s.strip_prefix('+').unwrap_or(s)),
@@ -65,32 +72,63 @@ pub fn parse_literal(s: &str) -> Option<BigInt> {
     if body.is_empty() {
         return None;
     }
-    let (radix, digits) = if body.len() > 2 {
-        match &body[..2] {
-            "0x" | "0X" => (16u32, &body[2..]),
-            "0o" | "0O" => (8, &body[2..]),
-            "0b" | "0B" => (2, &body[2..]),
-            _ => (10, body),
-        }
-    } else {
-        (10, body)
+    // The prefixes are ASCII, so dispatch on leading bytes: slicing the
+    // `&str` at a fixed byte offset panics when the offset falls inside a
+    // multi-byte character (`expr {"中a" + 1}` reached the old copy with
+    // any non-ASCII operand).
+    let b = body.as_bytes();
+    let (radix, digits) = match b {
+        [b'0', b'x' | b'X', rest @ ..] => (16u32, rest),
+        [b'0', b'o' | b'O', rest @ ..] => (8, rest),
+        [b'0', b'b' | b'B', rest @ ..] => (2, rest),
+        // Legacy octal: `017` is 15, at any width (a bare `0` is decimal).
+        [b'0', rest @ ..] if !rest.is_empty() && rest.iter().all(|d| (b'0'..=b'7').contains(d)) => (8, rest),
+        // `018` is an invalid octal number, never the decimal 18.
+        [b'0', rest @ ..] if !rest.is_empty() && rest.iter().all(|d| d.is_ascii_digit()) => return None,
+        _ => (10, b),
     };
-    let mag = if radix == 10 {
-        if !body.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
+    // Only an all-digit remainder can be a number at this point; the
+    // slice is ASCII then, so the view back to `&str` is unchecked-free.
+    let digits = core::str::from_utf8(digits).ok()?;
+    if digits.is_empty() || !digits.bytes().all(|d| (d as char).is_digit(radix)) {
+        return None;
+    }
+    // i64 first; the magnitude is non-negative so the signed form cannot
+    // overflow. Past i64 the same digits widen to a bignum.
+    if let Ok(mag) = i64::from_str_radix(digits, radix) {
+        return Some(IntRep::I64(if neg { -mag } else { mag }));
+    }
+    // `-9223372036854775808`: the magnitude is one past i64::MAX while the
+    // signed value fits (only this boundary takes the allocation).
+    if neg {
+        if let Ok(v) = format!("-{digits}").parse::<i64>() {
+            return Some(IntRep::I64(v));
         }
-        BigInt::parse_bytes(body.as_bytes(), 10)?
-    } else {
-        if digits.is_empty()
-            || !digits
-                .bytes()
-                .all(|b| b.is_ascii_digit() && (b as char).is_digit(radix))
-        {
-            return None;
-        }
-        BigInt::parse_bytes(digits.as_bytes(), radix)?
-    };
-    Some(if neg { -mag } else { mag })
+    }
+    let mag = BigInt::parse_bytes(digits.as_bytes(), radix)?;
+    Some(IntRep::Big(if neg { -mag } else { mag }))
+}
+
+/// A leading `0` followed by more decimal digits among which is an 8 or a
+/// 9: Tcl treats the text as an *invalid octal number* everywhere, never
+/// as the decimal it looks like (`expr {"018" + 0}` errors, `expr {"018"}`
+/// stays the string "018").
+pub fn is_invalid_octal(s: &str) -> bool {
+    let body = s.strip_prefix('-').or_else(|| s.strip_prefix('+')).unwrap_or(s);
+    let b = body.as_bytes();
+    b.len() > 1
+        && b[0] == b'0'
+        && b.iter().all(|d| d.is_ascii_digit())
+        && b.iter().any(|d| *d == b'8' || *d == b'9')
+}
+
+/// Parse a Tcl integer literal at arbitrary width (bignum form; an
+/// i64-range literal is widened to its `BigInt`).
+pub fn parse_literal(s: &str) -> Option<BigInt> {
+    Some(match parse_int(s)? {
+        IntRep::I64(i) => BigInt::from(i),
+        IntRep::Big(b) => b,
+    })
 }
 
 /// Build a Value from an exact integer (canonical decimal for bignums).

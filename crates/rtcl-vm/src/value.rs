@@ -962,45 +962,12 @@ impl Value {
     /// The string-rep arm of [`Self::as_int`], outlined.
     #[inline(never)]
     fn as_int_from_string(&self) -> Option<i64> {
-        let s = self.to_str();
-        let s = s.trim();
-        // Handle hex, octal, binary — with optional sign
-        // (`-0x1234` -> -4660, Tcl signed radix literals).
-        let (neg, body) = match s.strip_prefix('-') {
-            Some(r) => (true, r),
-            None => (false, s.strip_prefix('+').unwrap_or(s)),
-        };
-        let radix_parse = if let Some(rest) =
-            body.strip_prefix("0x").or_else(|| body.strip_prefix("0X"))
-        {
-            i64::from_str_radix(rest, 16).ok()
-        } else if let Some(rest) =
-            body.strip_prefix("0o").or_else(|| body.strip_prefix("0O"))
-        {
-            i64::from_str_radix(rest, 8).ok()
-        } else if let Some(rest) =
-            body.strip_prefix("0b").or_else(|| body.strip_prefix("0B"))
-        {
-            i64::from_str_radix(rest, 2).ok()
-        } else if body.len() > 1 && body.starts_with('0') {
-            // Legacy octal: `017` is 15 (tclsh); a digit 8/9 makes
-            // the text not-an-integer (`expr 018` errors).
-            let digits = &body[1..];
-            if digits.bytes().all(|d| (b'0'..=b'7').contains(&d)) {
-                return u64::from_str_radix(digits, 8)
-                    .ok()
-                    .map(|n| n as i64)
-                    .map(|n| if neg { n.wrapping_neg() } else { n });
-            }
-            None
-        } else {
-            // Plain decimal: parse the original text (sign included).
-            return i64::from_str(s).ok();
-        };
-        if neg {
-            radix_parse.map(|n| n.wrapping_neg())
-        } else {
-            radix_parse
+        // One grammar for every caller (types::bignum::parse_int): an
+        // i64-range literal here, `None` for bignums (the wide re-parse is
+        // the caller's) and for everything that is not an integer.
+        match crate::types::bignum::parse_int(self.to_str().trim())? {
+            crate::types::bignum::IntRep::I64(i) => Some(i),
+            crate::types::bignum::IntRep::Big(_) => None,
         }
     }
 
@@ -1031,6 +998,15 @@ impl Value {
             "-inf" | "-infinity" => return Some(f64::NEG_INFINITY),
             "nan" => return Some(f64::NAN),
             _ => {}
+        }
+        // `018` is an invalid octal number, not the double 18.0.
+        if crate::types::bignum::is_invalid_octal(s) {
+            return None;
+        }
+        // A wide integer literal is its exact value as a double: the
+        // digits of `0o777…` are not the decimal they look like.
+        if let Some(crate::types::bignum::IntRep::Big(b)) = crate::types::bignum::parse_int(s) {
+            return num_traits::ToPrimitive::to_f64(&b);
         }
         f64::from_str(s).ok()
     }

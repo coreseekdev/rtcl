@@ -56,70 +56,126 @@ pub(crate) fn resolve_proc_key(interp: &Interp, name: &str) -> Option<String> {
 
 // ---------- Arithmetic operator commands: +, -, *, / ----------
 
-/// `+ ?number ...?` — Sum all arguments (0 if none).
-pub fn cmd_add(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    let mut int_sum: i64 = 0;
-    let mut use_float = false;
-    let mut float_sum: f64 = 0.0;
+/// A fold in progress: the i64 fast path, the exact (bignum) accumulator
+/// an overflowing step switches to, or the float path.
+enum Acc {
+    Int(i64),
+    Wide(Value),
+    Float(f64),
+}
 
-    for arg in &args[1..] {
-        if use_float {
-            float_sum += arg.as_float().ok_or_else(|| {
-                Error::runtime(
-                    format!("expected number but got \"{}\"", arg.as_str()),
-                    crate::error::ErrorCode::Generic,
-                )
-            })?;
-        } else if let Some(i) = arg.as_int() {
-            int_sum += i;
-        } else if let Some(f) = arg.as_float() {
-            use_float = true;
-            float_sum = int_sum as f64 + f;
-        } else {
-            return Err(Error::runtime(
-                format!("expected number but got \"{}\"", arg.as_str()),
-                crate::error::ErrorCode::Generic,
-            ));
+impl Acc {
+    fn value(self) -> Value {
+        match self {
+            Acc::Int(i) => Value::from_int(i),
+            Acc::Wide(v) => v,
+            Acc::Float(f) => Value::from_float(f),
         }
     }
-    if use_float {
-        Ok(Value::from_float(float_sum))
-    } else {
-        Ok(Value::from_int(int_sum))
+}
+
+fn not_a_number(arg: &Value) -> Error {
+    Error::runtime(
+        format!("expected number but got \"{}\"", arg.as_str()),
+        crate::error::ErrorCode::Generic,
+    )
+}
+
+fn zero_divisor() -> Error {
+    Error::runtime("Division by zero", crate::error::ErrorCode::Generic)
+}
+
+fn is_zero_number(arg: &Value) -> bool {
+    arg.as_float() == Some(0.0)
+}
+
+/// One fold step `acc op arg`. The i64 step is checked: an overflow moves
+/// to the exact accumulator instead of wrapping (`+ 9223372036854775807 1`
+/// used to give INT64_MIN) or panicking (`/ INT64_MIN -1` is a divide
+/// overflow in Rust). Division keeps jimtcl's truncating integer form.
+fn fold_step(acc: Acc, arg: &Value, op: char) -> Result<Acc> {
+    Ok(match acc {
+        Acc::Float(a) => {
+            let b = arg.as_float().ok_or_else(|| not_a_number(arg))?;
+            Acc::Float(match op {
+                '+' => a + b,
+                '-' => a - b,
+                '*' => a * b,
+                _ => {
+                    if b == 0.0 {
+                        return Err(zero_divisor());
+                    }
+                    a / b
+                }
+            })
+        }
+        Acc::Int(a) => {
+            if let Some(b) = arg.as_int() {
+                if op == '/' && b == 0 {
+                    return Err(zero_divisor());
+                }
+                let fast = match op {
+                    '+' => a.checked_add(b),
+                    '-' => a.checked_sub(b),
+                    '*' => a.checked_mul(b),
+                    _ => a.checked_div(b),
+                };
+                match fast {
+                    Some(v) => Acc::Int(v),
+                    None => Acc::Wide(crate::types::expr_ops::numeric_binop(
+                        &Value::from_int(a),
+                        &Value::from_int(b),
+                        op,
+                    )?),
+                }
+            } else if let Some(b) = arg.as_float() {
+                Acc::Float(match op {
+                    '+' => a as f64 + b,
+                    '-' => a as f64 - b,
+                    '*' => a as f64 * b,
+                    _ => {
+                        if b == 0.0 {
+                            return Err(zero_divisor());
+                        }
+                        a as f64 / b
+                    }
+                })
+            } else {
+                return Err(not_a_number(arg));
+            }
+        }
+        Acc::Wide(w) => {
+            if op == '/' && is_zero_number(arg) {
+                return Err(zero_divisor());
+            }
+            let next = crate::types::expr_ops::numeric_binop(&w, arg, op).map_err(|_| not_a_number(arg))?;
+            // An integer result (i64 or bignum) stays exact; a float one
+            // moves the fold to the float path.
+            if crate::types::bignum::int_rep(&next).is_some() {
+                Acc::Wide(next)
+            } else {
+                Acc::Float(next.as_float().unwrap_or(0.0))
+            }
+        }
+    })
+}
+
+fn fold(init: Acc, rest: &[Value], op: char) -> Result<Value> {
+    let mut acc = init;
+    for arg in rest {
+        acc = fold_step(acc, arg, op)?;
     }
+    Ok(acc.value())
+}
+
+/// `+ ?number ...?` — Sum all arguments (0 if none).
+pub fn cmd_add(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    fold(Acc::Int(0), &args[1..], '+')
 }
 
 /// `* ?number ...?` — Multiply all arguments (1 if none).
 pub fn cmd_mul(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    let mut int_prod: i64 = 1;
-    let mut use_float = false;
-    let mut float_prod: f64 = 1.0;
-
-    for arg in &args[1..] {
-        if use_float {
-            float_prod *= arg.as_float().ok_or_else(|| {
-                Error::runtime(
-                    format!("expected number but got \"{}\"", arg.as_str()),
-                    crate::error::ErrorCode::Generic,
-                )
-            })?;
-        } else if let Some(i) = arg.as_int() {
-            int_prod *= i;
-        } else if let Some(f) = arg.as_float() {
-            use_float = true;
-            float_prod = int_prod as f64 * f;
-        } else {
-            return Err(Error::runtime(
-                format!("expected number but got \"{}\"", arg.as_str()),
-                crate::error::ErrorCode::Generic,
-            ));
-        }
-    }
-    if use_float {
-        Ok(Value::from_float(float_prod))
-    } else {
-        Ok(Value::from_int(int_prod))
-    }
+    fold(Acc::Int(1), &args[1..], '*')
 }
 
 /// `- number ?number ...?` — Unary negation (1 arg) or subtract remaining from first.
@@ -127,63 +183,17 @@ pub fn cmd_sub(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage("-", 2, args.len(), "number ?number ...?"));
     }
-
     if args.len() == 2 {
-        // Unary negation
-        if let Some(i) = args[1].as_int() {
-            return Ok(Value::from_int(-i));
-        }
-        if let Some(f) = args[1].as_float() {
-            return Ok(Value::from_float(-f));
-        }
-        return Err(Error::runtime(
-            format!("expected number but got \"{}\"", args[1].as_str()),
-            crate::error::ErrorCode::Generic,
-        ));
+        // Unary negation is 0 - x, exact for INT64_MIN too.
+        return fold(Acc::Int(0), &args[1..], '-');
     }
-
-    // Multi-arg: subtract from first
-    let mut use_float = false;
-    let mut int_val: i64 = 0;
-    let mut float_val: f64 = 0.0;
-
-    if let Some(i) = args[1].as_int() {
-        int_val = i;
-    } else if let Some(f) = args[1].as_float() {
-        use_float = true;
-        float_val = f;
-    } else {
-        return Err(Error::runtime(
-            format!("expected number but got \"{}\"", args[1].as_str()),
-            crate::error::ErrorCode::Generic,
-        ));
-    }
-
-    for arg in &args[2..] {
-        if use_float {
-            float_val -= arg.as_float().ok_or_else(|| {
-                Error::runtime(
-                    format!("expected number but got \"{}\"", arg.as_str()),
-                    crate::error::ErrorCode::Generic,
-                )
-            })?;
-        } else if let Some(i) = arg.as_int() {
-            int_val -= i;
-        } else if let Some(f) = arg.as_float() {
-            use_float = true;
-            float_val = int_val as f64 - f;
-        } else {
-            return Err(Error::runtime(
-                format!("expected number but got \"{}\"", arg.as_str()),
-                crate::error::ErrorCode::Generic,
-            ));
-        }
-    }
-    if use_float {
-        Ok(Value::from_float(float_val))
-    } else {
-        Ok(Value::from_int(int_val))
-    }
+    // a - b - c folds from the first operand (not from 0 - a).
+    let first = match (args[1].as_int(), args[1].as_float()) {
+        (Some(i), _) => Acc::Int(i),
+        (None, Some(f)) => Acc::Float(f),
+        (None, None) => return Err(not_a_number(&args[1])),
+    };
+    fold(first, &args[2..], '-')
 }
 
 /// `/ number ?number ...?` — Reciprocal (1 arg) or divide first by remaining.
@@ -193,71 +203,20 @@ pub fn cmd_div(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     if args.len() == 2 {
-        // Reciprocal: 1/x
-        let f = args[1].as_float().ok_or_else(|| {
-            Error::runtime(
-                format!("expected number but got \"{}\"", args[1].as_str()),
-                crate::error::ErrorCode::Generic,
-            )
-        })?;
+        // Reciprocal: 1/x is real division, also for integers.
+        let f = args[1].as_float().ok_or_else(|| not_a_number(&args[1]))?;
         if f == 0.0 {
-            return Err(Error::runtime("Division by zero", crate::error::ErrorCode::Generic));
+            return Err(zero_divisor());
         }
         return Ok(Value::from_float(1.0 / f));
     }
 
-    // Multi-arg: divide first by remaining
-    let mut use_float = false;
-    let mut int_val: i64 = 0;
-    let mut float_val: f64 = 0.0;
-
-    if let Some(i) = args[1].as_int() {
-        int_val = i;
-    } else if let Some(f) = args[1].as_float() {
-        use_float = true;
-        float_val = f;
-    } else {
-        return Err(Error::runtime(
-            format!("expected number but got \"{}\"", args[1].as_str()),
-            crate::error::ErrorCode::Generic,
-        ));
-    }
-
-    for arg in &args[2..] {
-        if use_float {
-            let d = arg.as_float().ok_or_else(|| {
-                Error::runtime(
-                    format!("expected number but got \"{}\"", arg.as_str()),
-                    crate::error::ErrorCode::Generic,
-                )
-            })?;
-            if d == 0.0 {
-                return Err(Error::runtime("Division by zero", crate::error::ErrorCode::Generic));
-            }
-            float_val /= d;
-        } else if let Some(d) = arg.as_int() {
-            if d == 0 {
-                return Err(Error::runtime("Division by zero", crate::error::ErrorCode::Generic));
-            }
-            int_val /= d;
-        } else if let Some(d) = arg.as_float() {
-            if d == 0.0 {
-                return Err(Error::runtime("Division by zero", crate::error::ErrorCode::Generic));
-            }
-            use_float = true;
-            float_val = int_val as f64 / d;
-        } else {
-            return Err(Error::runtime(
-                format!("expected number but got \"{}\"", arg.as_str()),
-                crate::error::ErrorCode::Generic,
-            ));
-        }
-    }
-    if use_float {
-        Ok(Value::from_float(float_val))
-    } else {
-        Ok(Value::from_int(int_val))
-    }
+    let first = match (args[1].as_int(), args[1].as_float()) {
+        (Some(i), _) => Acc::Int(i),
+        (None, Some(f)) => Acc::Float(f),
+        (None, None) => return Err(not_a_number(&args[1])),
+    };
+    fold(first, &args[2..], '/')
 }
 
 // ---------- env ----------
@@ -1250,7 +1209,10 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     "wrong # args: should be \"info tclversion\"",
                 ));
             }
-            Ok(interp.globals["tcl_version"].clone())
+            // Reads the variable like tclsh (after `unset tcl_version`:
+            // `can't read "tcl_version"`), not a map entry whose absence
+            // panicked.
+            interp.get_var("::tcl_version").cloned()
         }
         "level" => {
             if args.len() > 3 {

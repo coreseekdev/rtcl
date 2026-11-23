@@ -146,8 +146,11 @@ const P_EXPON: u8 = 17;
 const P_UNARY: u8 = 18;
 
 /// Tcl bareword characters: alphanumerics, underscore, all bytes >= 0x80.
+/// tclsh's lexer: a bareword is ASCII alphanumerics and `_`. A non-ASCII
+/// byte is an INVALID character (`expr 有` → `invalid character "有"`),
+/// never a bareword.
 fn is_bareword(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 fn is_tcl_ws(b: u8) -> bool {
@@ -375,8 +378,24 @@ enum BarewordResolve {
 }
 
 impl<'a> Checker<'a> {
+    /// `e[a..b]` with the byte offsets tclsh's layout computes. They can
+    /// fall inside a multi-byte character; both offsets back up to a
+    /// character start, so the quote never shows half a character (the
+    /// same rule tclsh applies: its 22-byte window over CJK text keeps
+    /// the 7 whole characters that fit).
     fn slice(&self, a: usize, b: usize) -> String {
-        String::from_utf8_lossy(&self.e[a.min(self.e.len())..b.min(self.e.len())]).to_string()
+        let e = self.e;
+        // Offset `i` opens a character iff its byte is not a continuation.
+        let opens_char = |i: usize| i >= e.len() || e[i] & 0xC0 != 0x80;
+        let mut a = a.min(e.len());
+        let mut b = b.min(e.len());
+        while a > 0 && !opens_char(a) {
+            a -= 1;
+        }
+        while b > a && !opens_char(b) {
+            b -= 1;
+        }
+        String::from_utf8_lossy(&e[a..b]).into_owned()
     }
 
     /// The annotated `in expression "..."` message.  Layout follows the
@@ -393,8 +412,9 @@ impl<'a> Checker<'a> {
         let n = self.e.len();
         let head_dots = start >= LIMIT;
         let head_start = if head_dots { start - HEAD } else { 0 };
-        let mid_dots = scanned > HEAD;
-        let mid_end = start + scanned.min(HEAD);
+        // The lexeme itself is quoted in full below LIMIT bytes.
+        let mid_dots = scanned >= LIMIT;
+        let mid_end = start + if mid_dots { scanned.min(HEAD) } else { scanned };
         let tail_dots = start + scanned + LIMIT <= n;
         let tail_end = if tail_dots { start + scanned + HEAD } else { n };
         let mut msg = format!("{reason}\nin expression \"");
@@ -479,8 +499,17 @@ impl<'a> Checker<'a> {
                 return BarewordResolve::Numeric;
             }
         }
-        let d = if word.len() >= LIMIT { "..." } else { "" };
-        let w = &word[..word.len().min(HEAD)];
+        // tclsh quotes the whole word below LIMIT bytes, else its first
+        // HEAD bytes (never splitting a character) and an ellipsis.
+        let (w, d): (&str, &str) = if word.len() >= LIMIT {
+            let mut cut = HEAD;
+            while !word.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            (&word[..cut], "...")
+        } else {
+            (word.as_str(), "")
+        };
         let post = format!("should be \"${w}{d}\" or \"{{{w}{d}}}\" or \"{w}{d}(...)\" or ...");
         let reason = format!("invalid bareword \"{w}{d}\"");
         BarewordResolve::Error(self.build(&reason, start, scanned, false, Some(&post)))

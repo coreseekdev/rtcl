@@ -1966,16 +1966,24 @@ fn jdn_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// JDN → 民用历（切换点之前用儒略历逆式，之后格里历）。
+///
+/// 儒略历逆式（Richards）必须用向下取整的除法：截断除法对负 JDN
+/// （公元前的日期，如 `clock format -100000000000000000`）会算出负的
+/// 月分量，调用方随后用它切 `month_days` 即越界 panic。中间量用 i128，
+/// `4 * c` 在 i64 两端不回绕。
 fn civil_from_jdn(jdn: i64) -> (i64, i64, i64) {
     if jdn < GREGORIAN_CHANGE_JDN {
-        // Julian inverse（Richards）。
-        let c = jdn + 32082;
-        let d1 = (4 * c + 3) / 1461;
-        let e = c - 1461 * d1 / 4;
-        let m = (5 * e + 2) / 153;
+        let c = jdn as i128 + 32082;
+        let d1 = (4 * c + 3).div_euclid(1461);
+        let e = c - (1461 * d1).div_euclid(4);
+        let m = (5 * e + 2).div_euclid(153);
         let day = e - (153 * m + 2) / 5 + 1;
         let month = m + 3 - 12 * (m / 10);
-        (d1 - 4800 + m / 10, month, day)
+        (
+            (d1 - 4800 + m / 10) as i64,
+            month.clamp(1, 12) as i64,
+            day.clamp(1, 31) as i64,
+        )
     } else {
         civil_from_days(jdn - JDN_POSIX_EPOCH)
     }

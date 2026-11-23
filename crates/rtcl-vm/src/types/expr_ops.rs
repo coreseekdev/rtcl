@@ -38,6 +38,14 @@ fn operand_error(empty: bool, op: &str) -> Error {
 }
 
 fn pair_operand_error(left: &Value, right: &Value, op: &str) -> Error {
+    // tclsh names the reason for a `018`-shaped operand.
+    if super::bignum::is_invalid_octal(left.as_str().trim())
+        || super::bignum::is_invalid_octal(right.as_str().trim())
+    {
+        return Error::Msg(format!(
+            "can't use invalid octal number as operand of \"{op}\""
+        ));
+    }
     operand_error(left.as_str().is_empty() || right.as_str().is_empty(), op)
 }
 

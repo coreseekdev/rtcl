@@ -55,7 +55,16 @@ pub fn cmd_sleep(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if secs < 0.0 {
         return Err(Error::runtime("sleep time must be non-negative".to_string(), ErrorCode::Generic));
     }
-    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+    // `Duration::from_secs_f64` panics on NaN / Inf / overflow (`sleep
+    // inf`, `sleep 1e30`); no Duration expresses them, so like any other
+    // bad argument they are an error.
+    let dur = std::time::Duration::try_from_secs_f64(secs).map_err(|_| {
+        Error::runtime(
+            format!("sleep time is out of range: \"{}\"", secs_str),
+            ErrorCode::Generic,
+        )
+    })?;
+    std::thread::sleep(dur);
     Ok(Value::empty())
 }
 

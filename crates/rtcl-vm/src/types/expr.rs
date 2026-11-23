@@ -112,33 +112,10 @@ fn canonicalize_result(v: Value) -> Result<Value> {
     // Bignum-range integers canonicalize to exact decimal text
     // (tclsh Tcl_SetBignumObj replaces the string rep at parse: `expr {$x}`
     // with x="0x10000000000000000" renders 18446744073709551616; pbr3).
-    // E4: never degrade to a rounded double — keep the exact value.
-    let t = v.as_str().trim();
-    let (neg, body) = match t.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, t.strip_prefix('+').unwrap_or(t)),
-    };
-    let (radix, digits) = if body.len() > 2 && body.as_bytes()[0] == b'0' {
-        match body.as_bytes()[1] {
-            b'x' | b'X' => (16u32, &body[2..]),
-            b'o' | b'O' => (8u32, &body[2..]),
-            b'b' | b'B' => (2u32, &body[2..]),
-            _ => (10u32, body),
-        }
-    } else {
-        (10u32, body)
-    };
-    let digits_ok = !digits.is_empty()
-        && digits.chars().all(|c| match radix {
-            16 => c.is_ascii_hexdigit(),
-            _ => c.is_ascii_digit(),
-        });
-    if digits_ok {
-        if let Some(big) = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix) {
-            let mut s = if neg { "-".to_string() } else { String::new() };
-            s.push_str(&big.to_string());
-            return Ok(Value::from_str(&s));
-        }
+    // E4: never degrade to a rounded double — keep the exact value. The
+    // grammar is types::bignum::parse_int (legacy octal included).
+    if let Some(super::bignum::IntRep::Big(big)) = super::bignum::parse_int(v.as_str().trim()) {
+        return Ok(Value::from_str(&big.to_string()));
     }
     if let Some(f) = v.as_float() {
         // A string that parses to NaN cannot canonicalize — tclsh raises

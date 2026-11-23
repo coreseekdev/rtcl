@@ -104,6 +104,7 @@ rtcl/
 cargo test --workspace                      # 全 workspace 测试
 ./judge/run.sh                              # 88 文件逐字节（judge(interp): 88/88）
 ./judge/sweep.sh                            # 双引擎差分 0 分歧
+./judge/crash-gate.sh                       # 脚本可触发的崩溃/挂起/静默错误（judge/crash-probes/）
 # wasm 主目标：默认特性裁剪，零外部 C 依赖（iconv 不编入）
 cargo build -p rtcl-wasm --target wasm32-unknown-unknown
 # 关闭可选外部后端（iconv）的 native 构建也必须绿

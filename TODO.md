@@ -312,3 +312,95 @@ build 0.72x）已在上一节定界；micro_add 0.89x、micro_lappend 0.72x（�
 **本轮后板面**（指令比 rtcl/tclsh）：fib **0.91x**、fe 0.98x、dloop
 0.95x、oo2 **0.63x**、oovars **0.74x**、build ~0.72x；micro_base 1.16x、
 micro_incr 1.42x（派发地板，见 BASELINE 板点 4 节）。
+
+## 代码审计后续（2026-11-23 轮，specs/CODE-AUDIT-20261123.md）
+
+审计确认 30 余类脚本可触发的崩溃/挂起与 11 类静默错误，逐条清单与
+复现见 `specs/CODE-AUDIT-20261123.md`（编号 S/C/P）与
+`judge/crash-probes/`（门禁 `judge/crash-gate.sh`，提交前与
+judge/sweep 同跑）。下面只列**结构**动作：按类别消除，而不是逐点打补丁。
+
+- [ ] **M1 止血**（S1–S10）：12 个 panic 点——`&str` 按字节切片、Rust
+  格式化/时间库的边界、脚本可控尺寸的裸分配。全部是局部修复。
+- [ ] **M2 栈安全**（S11–S22）：唯一的守卫 `call_depth` 只数 proc/内建
+  调用。目标形态 = 一个 `StackGuard`：脚本驱动的重入（unknown 处理器、
+  ensemble 重分派、alias、trace 回调、嵌套 `[…]` 求值、`eval` 嵌套）汇
+  到同一检查点；解析/编译（expr 递归下降、`try_compile_sub`、正则
+  parser）各自带深度上限；**数据驱动**的递归（`serialize_list`/
+  `serialize_dict`、`drop_last_owner`、JSON 解码/编码、regexp dissect）
+  改显式栈迭代——它们没有"报错"的位置，只能不递归。递归上限按目标栈
+  校准（wasm 上 650–1000 层即 trap 并毒化实例）。
+- [ ] **M3 资源治理**（S21、S22、S28）：`InterpLimits { max_steps,
+  max_call_depth, max_value_bytes, max_list_elements }`，wasm 带默认值
+  并经 `RtclHandle` 暴露；脚本可控尺寸的分配一律走 `try_reserve` 并
+  返回 Tcl 错误（Rust 默认分配失败 = abort，`catch` 拦不住）。
+- [ ] **M4 静默错误**（C1–C11）：其中 C1 是结构性的，见下"op 码表"。
+- [ ] **M5 OS 面**（S31–S37）：exec 两路并发排空、后台 stderr drain、
+  失败路径 kill+wait；`close` 对连接中的 async socket 直接丢弃；
+  `file tempfile` 用 `create_new` + 0600；`file delete` 非 `-force`
+  只删空目录；`-async` fd 加 `SOCK_CLOEXEC`。
+- [ ] **M6 能力模型**（S23–S27）：真正的隐藏命令表（解析期拒绝，
+  `invokehidden` 才可调）+ per-instance 令牌（dynmod 分发校验）+
+  子解释器继承限额与宿主服务 + `exec` 入口检测半途状态并复位。
+- [ ] **工具化防线**：`judge/crash-gate.sh` 入门禁；`rtcl-vm` 开
+  clippy `unwrap_used` / `indexing_slicing` / `arithmetic_side_effects`
+  （先按文件棘轮，再全量）；`judge/panic-census.sh` 的计数只许降。
+
+### op 码表（ISA 方向，M4/C1 的结构性解法）
+
+现状：指令是 `Vec<OpCode>`——141 个变体的 Rust 枚举，最宽变体 5 个
+操作数，`size_of::<OpCode>() == 16`（`Pop`/`Dup` 也占 16 字节）。
+后果有四条，都能在审计里找到对应的缺陷：
+
+1. **操作数裸 `as u16` 收窄**（C1）：常量池/局部表/argc 超过 65535 即
+   静默截断；`validate.rs` 在运行期是死代码。
+2. **每个 op 前的两次分类 match**（`exec_inner` 的 `begin_cmd_site` 与
+   `top_op_class`）：带载荷的枚举无法转成下标，只能靠 match。
+3. **超指令的七处同步**：枚举变体、编译器发射、热通道臂或 `exec_op`
+   臂、`top_op_class` 臂、`begin_cmd_site` 臂、`unfused()` 臂、JIT
+   lower 臂——每加一个融合要改七处。
+4. **宽窄两套变体**（`PushConst`/`PushConstWide`）由枚举承担了本该
+   属于编码器的宽度选择。
+
+目标形态：
+
+```rust
+#[repr(u16)] enum Op { PushConst, LoadLocal, CmpSlotImmJumpFalse, /* … */ }  // 纯码，无载荷
+struct OpInfo {
+    name: &'static str,
+    flags: OpFlags,                    // PURE | HAS_SITE | TIER1 | JUMP | CALL
+    operands: [OpKind; 5],             // Const | Local | Slot | Imm | Site | Target | None
+    lowers_to: &'static [(Op, &'static [OperandMap])],   // 超指令的声明式展开
+}
+static OPS: [OpInfo; N];               // 唯一真源
+```
+
+- 指令流 = `op: u16` + 按 `OpKind` 选宽度的操作数（窄形默认、值放不下
+  时发宽形）——宽度选择回到编码器，C1 那类截断由构造消除。
+- `top_op_class` / `begin_cmd_site` 变成 `OPS[op].flags` 的位测试；
+  `unfused()`、反汇编、JIT lower 读 `lowers_to`；新增融合 = 加一行表
+  + 一个执行臂。
+- `validate` 改成编译期断言（debug/test 构建必跑）。
+
+**分两步，风险不同**：
+
+- 第一步（小、可先做）：只引入 `Op` + `OPS` 表与 `lowers_to`，指令
+  载荷仍留在枚举里，先把分类 match 和 `unfused()` 换成查表。
+- 第二步（重写级）：换紧凑指令流。直接性能收益**未测**——已知的是
+  派发税约 20ns/op（直接线程化可到 7ns，见 PRODUCTION.md §5），编码
+  本身占多少需要先 perf 制导；它的确定性收益在正确性与维护成本，
+  以及 JIT/AOT 缓存的线性解码。建议随 JIT 重启一起做，由 judge +
+  sweep 两个门禁兜底，不插在安全工作前面。
+
+### 其他结构项
+
+- **`Interp` 分解**：126 个字段；错误帧协议靠约 230 处手工保存/恢复
+  的标志位（C3/C4 的来源之一）。先把 `err_*` + `cur_cmd_*` + 词法标志
+  收进一个带 RAII 守卫的上下文结构，`top_slots` 的失效也走同一个入口。
+- **两套手工失效机制**（`cmd_generation` / `tier1_epoch`）合并为一个
+  带原因枚举的 `invalidate()`。
+- **数组容器**：`array size/exists/get` 现在按作用域变量总数扫描
+  （P5），需要 `base → 元素集合` 的索引。
+- **通道层**：同步空壳（P1/P9、S32）——缓冲读取 + `poll` 事件循环，
+  exec 统一到已有 `poll` 的 `HostExec` 路径。
+

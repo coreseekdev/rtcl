@@ -1,0 +1,7 @@
+# crash-probe: a08 mathop overflow
+source [file join [file dirname [info script]] _chk.tcl]
+chk div [catch {/ -9223372036854775808 -1} e] 0
+chk div-val $e 9223372036854775808
+chk plus [+ 9223372036854775807 1] 9223372036854775808
+chk minus [- -9223372036854775808 1] -9223372036854775809
+chk times [* 9223372036854775807 2] 18446744073709551614

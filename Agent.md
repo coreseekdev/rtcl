@@ -54,6 +54,13 @@ bash -c 'ulimit -v 8000000; /tmp/rtcl-master-wt/judge/sweep.sh'
   `ls -la target/release/rtcl` 看时间戳再信门。
 - **提交门槛**：judge 87/87 + sweep 0 + tests 1143/0 + wasm32 check
   四门全绿；提交信息带 `Co-Authored-By: Claude Code <noreply@anthropic.com>`。
+- **崩溃门禁**：`bash judge/crash-gate.sh`——`judge/crash-probes/` 里每个
+  探针钉住一个脚本可触发的崩溃/挂起/静默错误（记录见
+  `specs/CODE-AUDIT-20261123.md`），与 judge/sweep 同跑。再发现这类缺陷
+  时先加探针（基线必须先红）再修。
+- **sweep 的 `ulimit -v` 坑**：`ulimit -v 6000000` 下 wasmtime 的
+  `stub memory: mmap failed to reserve` 会让 rtcl-towasm 的 5 个测试假红
+  ——测试（非构建）阶段去掉上限，并用 `--no-fail-fast` 跑全。
 - **调试探针（eprintln/env 检查）绝不留在每 op 路径上**——一次 env 查找
   ×每 op = 8× 回退，且门禁不抓（相对回归），只有直接重测才暴露。
 

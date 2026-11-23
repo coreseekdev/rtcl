@@ -186,6 +186,83 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
 
+## 10vicesimusduodevicesimus. 2026-11-23 trv_p11 五处语义缺陷收口 + e8/e9 内层帧链式载体 + oo2 表述精确化（perf/wave2 @ c919738..）
+
+接续崩溃中断轮。前任工作区遗留 8 文件实现（含一处**方向性错误**
+——e8/e9 用 early-commit 形，被钉形否决后改链式载体重做）。终态：
+**probes active 437 全绿、known 11（trv_p11 仍归档，残差 1 行）、
+judge 88/88、workspace tests 1471/0**。代码两提交：7272638
+（trv_p11 五处）、192d698（e8/e9 链式载体）。详录见
+specs/DIVERGENCES.md 2026-11-23 节。
+
+### 1. trv_p11（7272638，主修）
+
+- ①② 冒号串语义：新 `split_ns_tail`/`join_var_key`（namespace.rs，
+  解析面分段：`::` 起整串冒号分隔、尾单冒号属名字、尾 `::` 串 =
+  空名）——canonical_global/canonical_key_for_ns/读父检查/写宿主
+  预检/var_exists/which -variable/upvar 宿主检查八处对齐。关键钉
+  形：`variable :` 的名字就是 `:`（键 `tnv:::`）；`::tnv:::` =
+  tnv 的空名变量；`::a::b:` = ns ::a 的名字 `b:`；`::::z` 前导吞
+  串 → 全局 z。
+- ③④ upvar 元素别名生命周期（proc.rs + mod.rs + vars.rs）：元素
+  形建链落**帧局部占位数组**（S1 基是帧局部标量建链即报 isn't
+  array / S2 缺基建占位 array exists=1 / S3 全局同名不顶替）；宿
+  主 unset 后读 no such variable、写 "upvar refers to element in
+  deleted array"、括号写 "variable isn't array"（NEEDARRAY 先于
+  dangling）。`UpvarLink::Dead` 增 `was_global` 字段——帧局部死
+  链读回退不得落 globals（占位 arr(1) vs 全局 arr(1) 穿透否决）。
+- ⑤ ns delete 内外区分（vars.rs `deaden_links_under(inside_tree)`
+  + namespace.rs 调用点）：树内删除走 teardown 延迟（帧语境种子
+  读仍通）；外部删除立即拆表 + install 期镜像清除（读/unset no
+  such variable、exists 0、写 dangling-namespace）。
+- 残差：探针仅 t2-vars 序行（auto_path/errorCode 转置）= oo2 族
+  ghost-insert 同源，**定调并入 oo2 不单独追**。探针仍归档
+  （known 11 不变），README/DIVERGENCES 已注记。
+
+### 2. e8/e9（192d698，cases 归档拆出转绿）
+
+`set x [[a]b]` 括号全闭合形——rtcl 缺替换词内层命令帧（词级
+defer 的 pending 被外层属主 defer 覆写静默丢失）。
+
+**方向性否决记录**：前任 early-commit 形（替换单元出口直接落账
+err_pending_unit_frame 门控提交）修复了文件级形态但**穿透
+catch/proc/while 边界**——tclsh 的内层单元出口帧只在**文件级退
+出**兑现（catch 形三帧不含替换帧、proc 边界只落 (procedure) 帧、
+while 边界只落 body 帧、flow 转换只有 converting 帧、depth-2
+`set x [[ [[a]b]c]d]` 全链五帧——九钉形实测）。本轮改
+`err_pending_chain` 链式载体：词级 defer / Sub 区 unwind 顶替时
+移链（err_pending_supersede），error_report 先链后顶逐帧落账；
+其余边界与 pending_top 同生死（catch/return/error 物化清空、
+harness 直落帧 ERR_ALREADY_LOGGED 单次消费清空、eval_isolated/
+trace save-restore 同步、decode_toplevel_flow flow 转换丢弃、
+jit_err_clear_pending 清空）。expr 抑制臂正交性保持
+（err_expr_origin 在 defer 臂消费、抑制 pending 不入链）。
+
+残差留档：tree-walk 引擎（--no-bytecode）flow 形 converting 帧
+读内层 "break"（tclsh = 外层 set 帧）——**既有缺陷与基线逐字同
+形非本轮引入**；默认 bytecode 引擎正确。重开条件：tree-walk
+flow defer 载荷对齐。
+
+### 3. oo2 表述精确化（纯文档）
+
+tcl_order "理论边界" → "**投入产出比**边界"（技术上可修、成本否
+决——每收口一行可能翻红别行、无限细分），DIVERGENCES 三处同步；
+auto_index 标注已修（2912c81）不变。
+
+### 坑（本轮实证）
+
+- 后台构建**尾随 `&` 会话回收**：`run_in_background` 里
+  `( ... ) & echo started` 的子进程随前台命令退出被回收——构建
+  半途而废且 task 通知误报完成，对照跑的是**旧二进制**（首次钉
+  形复测结果全错）。正解 = 整条命令后台化、日志落文件后
+  grep exit= 行确认。
+- python 批量 patch 的**子串包含陷阱**：48 空格缩进行包含 36 空
+  格 needle 作为子串，`str.count` 断言虚高——行级全等匹配替换。
+- 多文件 patch 后 grep 验证照旧执行（全部命中）。
+- 判定 tclsh 语义先收集**边界矩阵**再写代码：本轮先跑九钉形
+  （catch/proc/while/flow/depth-2/裸命令/expr/引号拼接/多词）钉
+  死"只在文件级退出兑现"，避免了按单钉形想当然的二次返工。
+
 ## 10vicesimusseptimusdecimus. 2026-11-22 globprobe 终局——parse_cmd_sub opener 栈，known 11（白盒对照 tclParse.c；perf/wave2）
 
 probes-known 最后一条 parse 深水（globprobe 引文终点）修复转绿移回

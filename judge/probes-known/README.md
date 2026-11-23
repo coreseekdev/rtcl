@@ -14,10 +14,10 @@
 | --- | --- | --- |
 | c5_dis / cmp_unsupported / cmp_unsupported2 | disassemble | 成功 case 的 ByteCode dump = rtcl 自有指令集格式，与 tclsh 内部指令文本逐字节不兼容（错误面已全对齐） |
 | dbg_basic | disassemble | tclsh 8.6.17 自身 SEGV（rc=139）——无有效 oracle |
-| cases / cases2 / probe_round3 | parse | rtcl 命令替换词惰性文本使 parse 期错误退化为执行期（帧链多一层、引文完整）；tclsh 前置整条命令 parse（单帧 + 出错点截断引文） |
-| oo2 | var/trace | r4 行 var 物化序（tcl_order 理论边界）——auto_index 首建已修（2026-11-22b 2912c81，桶位一致）；残差仅 e/errorCode ghost-insert 序一行 |
+| cases / cases2 / probe_round3 | parse | rtcl 命令替换词惰性文本使 parse 期错误退化为执行期（帧链多一层、引文完整）；tclsh 前置整条命令 parse（单帧 + 出错点截断引文）。历史 case 号 e8/e9（内层帧记账）已拆出收口（2026-11-23 192d698） |
+| oo2 | var/trace | r4 行 var 物化序（tcl_order **投入产出比**边界——技术上可修、成本否决）——auto_index 首建已修（2026-11-22b 2912c81，桶位一致）；残差仅 e/errorCode ghost-insert 序一行 |
 | probe7 | unicode | D-27【策略级】码元 vs 码点（len/index 对 astral 字符）+ `string byterange` 为 rtcl 有意扩展（STRING_EXTRA_SUBCMDS，8.6 无此子命令） |
-| trv_p11 | var/trace | 冒号串语义/tail/qual 部分行已修（8917651），残差行维持归档定调 |
+| trv_p11 | var/trace | 五处语义缺陷已修（2026-11-23 7272638：冒号串分段键/upvar 元素占位与 dangling/ns delete 内外区分）；残差仅 t2-vars 序行 = oo2 族 ghost-insert 同源（定调并入 oo2） |
 | utf_U_parsehex | unicode | D-27【策略级】：surrogate U+D842 在 tclsh 8.6 可存为单码元，rtcl（Rust char）替换为 U+FFFD |
 
 已修复移出（2026-11-22b，探针移回 judge/probes/）：trv_d13/trv_p10

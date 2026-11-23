@@ -8,6 +8,63 @@
 > （本节）。条目后括注的
 > spec [D-x] 是规格文件内的 spec-local 编号，以本台账为准。
 
+## 2026-11-23 trv_p11 五处语义缺陷收口 + e8/e9 内层帧链式载体（cases 拆出）+ oo2 表述精确化（judge 88/88；workspace tests 1471/0；probes active 437 全绿 + known 11 归档）
+
+三项任务（trv_p11 主修 / e8-e9 帧记账 / oo2 表述）。代码两提交：
+7272638（trv_p11）、192d698（e8/e9）。
+
+**trv_p11（仍归档，残差收窄到 1 行）**：五处真语义缺陷全数修复：
+
+- ①② 变量面冒号串语义：解析面新 split_ns_tail（分隔 = `::` 起
+  整串冒号、尾段单冒号属名字、尾 `::` 串 = 空名变量）+
+  join_var_key（键结构拼接）——canonical_global（前导整串吞
+  `::::z` → 全局 z）、canonical_key_for_ns（`set q::` 在 ns w7
+  建 w7::q 空名，键 `w7::q::`）、resolve/var_exists 读父检查、
+  set 写宿主预检、`namespace which -variable`（相对 `:` 的名字
+  就是 `:`——键 `tnv:::`、命中打印 `::tnv:::`；绝对 `::tnv:::`
+  = tnv 的空名变量）、upvar 宿主检查（旧 rsplit 对 `::t4:::`
+  算出 `::t4:` 恒 miss）。
+- ③④ upvar 数组元素别名生命周期（tclsh ObjMakeUpvar 帧局部
+  解析）：元素形建链落帧局部占位数组（基缺建占位 array exists
+  nosuch=1；基是帧局部标量建链即报 variable isn't array；全局
+  同名不顶替）；宿主 unset 后读 = no such variable、写 =
+  upvar refers to element in deleted array、括号写 = variable
+  isn't array。UpvarLink::Dead 增 was_global（帧局部死链读回退
+  不得落 globals）。
+- ⑤ ns delete 内外区分：deaden_links_under(inside_tree)——树内
+  删除走 teardown 延迟（帧语境种子读仍通，namespace-46.8 钉
+  形）；外部删除立即拆表 + install 期镜像清除（读/unset 报 no
+  such variable、exists 0、写保持 dangling-namespace）。
+
+残差：探针仅 t2-vars 序行 1 处 DIFF（`auto_path errorCode` vs
+`errorCode auto_path`）= oo2 族 ghost-insert 序同源，**定调并入
+oo2**（重开条件随 oo2：哈希桶链逐位重放），不单独追。单测
++12（vars.rs 冒号形/upvar 元素生命周期/内外删除双形）。
+
+**e8/e9（cases 归档拆出，转绿）**：`set x [[a]b]` 括号全闭合形
+——tclsh 词求值期内层命令 [a] 帧在列，rtcl 曾缺替换词内层命令
+帧（词级 defer 的 pending 被外层属主 defer 覆写时静默丢失）。
+修法 = err_pending_chain 链式载体：顶替时移链、error_report 文
+件级退出先链后顶逐帧落账；其余边界与 pending_top 同生死
+（catch/return/error 物化清空、harness 直落帧 ERR_ALREADY_LOGGED
+单次消费清空、eval_isolated/trace save-restore 同步、flow 转换
+丢弃）。tclsh 语义钉形（11 形双引擎逐字一致）：catch 形三帧
+不含替换帧、proc 体边界只落 (procedure) 帧、while 体边界只落
+body 帧、flow 转换只有 converting 帧、depth-2
+`set x [[ [[a]b]c]d]` 全链五帧。early-commit 形（单元出口直接
+落账）被 P4/P6/P9 钉形否决（穿透 catch 边界）。
+残差留档：tree-walk 引擎 flow 形 converting 帧读内层 "break"
+（tclsh = 外层 set 帧）——**既有缺陷与基线逐字同形，非本轮引
+入**；默认 bytecode 引擎正确。重开条件：tree-walk flow defer
+载荷对齐。cases/cases2/probe_round3 的 parse 架构残差不变
+（条目 14 维持）。
+
+**oo2 表述精确化**：tcl_order "理论边界" → "**投入产出比**边
+界"（技术上可修：按 tclsh 内部创建时序做 ghost insert 级重放；
+否决理由是成本——每收口一行可能翻红别行、无限细分——而非不可
+修）——2026-11-22b 节三处同步。auto_index 标注已修（2912c81）
+不变。
+
 ## 2026-11-22b known 16→12 深水修复轮（4 修复转绿出档 + 2 条残差收窄留档；judge 88/88；workspace tests 全绿；probes active 436 全绿 + known 12 归档）
 
 known 16 条中的 5 条深水修复（trv_d13/trv_p10、pidx、oo2、globprobe、
@@ -87,11 +144,16 @@ c5_dis/cmp_unsupported×2（disassemble 设计差异）、dbg_basic
 trv_p11、utf_U_parsehex（D-27 策略级）。
 **[更新 2026-11-22c]** globprobe 引文终点转绿（4，FIXED 见上），
 移回 judge/probes/（active 436→437，known 12→11）。
+**[更新 2026-11-23]** trv_p11 五处语义缺陷已修（7272638，见
+2026-11-23 节）——探针仍归档，残差仅 t2-vars 序行（oo2 族
+ghost-insert 同源，定调并入 oo2）。
 
 oo2 残差更新：auto_index 部分已修（3）；残差仅 r4 物化序一行——
 tclsh `clog e auto_path errorCode` vs rtcl `clog errorCode e
-auto_path`（同桶链 e/errorCode 的 ghost-insert 序，tcl_order 理论
-边界，2026-11-16 既有定调）。重开条件：哈希桶链逐位重放。
+auto_path`（同桶链 e/errorCode 的 ghost-insert 序，tcl_order
+**投入产出比**边界——技术上可修（模拟 tclsh 内部创建时序的 ghost
+insert 重放），否决理由 = 每收口一行可能翻红别行、无限细分的成本
+而非不可修，2026-11-16 既有定调）。重开条件：哈希桶链逐位重放。
 
 ## 2026-11-22 probes 36 DIFF 清账（19 修复转绿 + dbg_trace 探针修正 + 16 归档移档；judge 88/88；workspace tests 全绿；probes active 432 全绿 + known 16 归档）
 
@@ -154,6 +216,9 @@ lands" 头注释移除（errorInfo 批早已落地）。known 每项在本节有
    的分隔符是冒号串（≥2）——`namespace tail a:b` = `a:b`（单 `:`
    是名字字符）、`a:::` = 空。修复：命令层新 split_colon_pair
    （变量/命令解析面的 split_colon_run 不动）。
+   **[更新 2026-11-23]** 变量解析面对齐同款冒号串规则
+   （split_ns_tail/join_var_key，7272638）——trv_p11 余量见
+   2026-11-23 节。
 10. **dbg_trace 探针修正**（非 interp 面）：case trace-28.2/28.3 引用
     extract.py 未提取的 traceExecute proc（tclsh 在 enterstep 触发时
     `invalid command name` 终止、后续 case 无 oracle；rtcl enterstep
@@ -183,12 +248,20 @@ lands" 头注释移除（errorInfo 批早已落地）。known 每项在本节有
     after close-brace）退化为执行期——帧链多一层内层 catch 帧、外层
     引文完整；tclsh 前置整条命令 parse（单帧 + 出错点截断引文）。
     重开条件：替换词主动 parse（架构级）。
-15. **oo2**（var-order 理论边界 + init 机制）：r4 行的 info vars
-    物化序（tcl_order 理论边界，2026-11-16 轮既有定调）+ tclsh 的
-    auto_index 数组由 auto_load 机制在 unknown→auto_load 首建
-    （rtcl 探针路径未触发）。**[更新 2026-11-22b]** auto_index 首建
-    已修（2912c81，桶位与 tclsh 一致）；残差仅 r4 的 e/errorCode
-    ghost-insert 序一行，见 2026-11-22b 节。
+    **[更新 2026-11-23]** 历史归档 case 号 e8/e9（`set x [[a]b]`
+    内层帧记账）已从本条拆出单独收口（192d698，err_pending_chain
+    链式载体——见 2026-11-23 节）；本条残差 = parse 期错误退化
+    （架构级）不变，三探针 DIFF 形状逐字不变。
+15. **oo2**（var-order **投入产出比**边界；auto_index/init 机制部分
+    **[FIXED 2026-11-22b]** 2912c81）：r4 行的 info vars 物化序
+    （tcl_order 投入产出比边界——**技术上可修**：按 tclsh 内部创建
+    时序做 ghost insert 级重放，但每收口一行可能翻红别行、需无限
+    细分逐键建模，**否决理由是成本而非不可修**，2026-11-16 轮既有
+    定调）+ tclsh 的 auto_index 数组由 auto_load 机制在
+    unknown→auto_load 首建（rtcl 探针路径未触发）。
+    **[更新 2026-11-22b]** auto_index 首建已修（2912c81，桶位与
+    tclsh 一致）；残差仅 r4 的 e/errorCode ghost-insert 序一行，见
+    2026-11-22b 节。
 16. **pidx**（expr 深水残差）：`expr $foo([x"y])` 下标替换路径的词中
     引号（词中 `"` 是普通字符）与报错归属——tclsh 报
     `invalid command name "x"y"`，rtcl 报 missing close-bracket。
@@ -408,8 +481,10 @@ HANDOFF §10.1 组 4（dict 残差）+ 组 5（小尾巴）+ 2026-11-14 节 5 �
     auto_index、unknown→auto_load 首次运行创建（ai4/ai5/oo2 l7 二分
     实证：oo2 的触发点 = `fw g` forward 到 nosuchcmd 走 unknown）。
 22. oo2 r4 残差【部分收口】：info vars 序剩 2 位置差（tcl_rcFileName
-    桶位 + e/auto_path 转置）——tclsh 全局表序含无法以「最终活键重放」
-    表出的插入历史（ghost insert/unset 级），tcl_order 模型（d7cc38e）
+    桶位 + e/auto_path 转置）——tclsh 全局表序含「最终活键重放」
+    表不出的插入历史（ghost insert/unset 级；**技术上可修**——按
+    创建时序逐键 ghost-insert 重放，否决理由 = 每收口一行可能翻红
+    别行、无限细分的投入产出比），tcl_order 模型（d7cc38e）
     + 上述两项修复已收 ivars2/tclns，oo2 r4 单行残差如实记账，不追。
 
 **新固化**：judge/probes/smallface_p24.tcl（40+ 断言：prefix 12 形/

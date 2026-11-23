@@ -655,10 +655,13 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let other_var = args[i].as_str();
             let local_var = args[i + 1].as_str();
             let target_key = if target_ns == "::" {
-                // 根 ns 目标：同帧路径的规范化 + 死父 ns 检查。
+                // 根 ns 目标：同帧路径的规范化 + 死父 ns 检查（宿主 ns
+                // 按 tclsh 分段——尾 `::` 串 = 空名变量，宿主是 quals
+                // 路径本身，旧 rsplit 对 `::t4:::` 算出 `::t4:`）。
                 let key = other_var.strip_prefix("::").unwrap_or(other_var);
-                if let Some((p, _)) = key.rsplit_once("::") {
-                    let parent = format!("::{}", p);
+                let (quals, _) = crate::interp::commands::namespace::split_ns_tail(key);
+                if !quals.is_empty() {
+                    let parent = crate::interp::commands::namespace::normalise(quals);
                     if parent != "::" && !interp.namespaces.contains_key(&parent) {
                         set_error_code(
                             interp,
@@ -743,11 +746,13 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // 写路径按无 :: 的全局键路由（深水探针 DIFF-6：
                 // `upvar 0 ::a(e) x` 原落到 "::a(e)" 键，元素写丢失）。
                 let key = other_var.strip_prefix("::").unwrap_or(&other_var);
-                // 建链目标的父 ns 必须存在（tclsh：can't access
+                // 建链目标的宿主 ns 必须存在（tclsh：can't access
                 // "::d::v": parent namespace doesn't exist——深水探针
-                // DIFF-7：原对已删 ns 静默建链）。
-                if let Some((p, _)) = key.rsplit_once("::") {
-                    let parent = format!("::{}", p);
+                // DIFF-7：原对已删 ns 静默建链；宿主按 tclsh 分段，
+                // 尾 `::` 串 = 空名变量、宿主是 quals 路径）。
+                let (quals, _) = crate::interp::commands::namespace::split_ns_tail(key);
+                if !quals.is_empty() {
+                    let parent = crate::interp::commands::namespace::normalise(quals);
                     if parent != "::" && !interp.namespaces.contains_key(&parent) {
                         set_error_code(
                             interp,
@@ -775,8 +780,11 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // 元素路由全被绕过）。
                 match other_var.strip_prefix("::") {
                     Some(key) => {
-                        if let Some((p, _)) = key.rsplit_once("::") {
-                            let parent = format!("::{}", p);
+                        let (quals, _) =
+                            crate::interp::commands::namespace::split_ns_tail(key);
+                        if !quals.is_empty() {
+                            let parent =
+                                crate::interp::commands::namespace::normalise(quals);
                             if parent != "::" && !interp.namespaces.contains_key(&parent) {
                                 set_error_code(
                                     interp,
@@ -820,6 +828,29 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // frame when the linked name sits in its slot table.
         if let UpvarLink::Frame { frame_index, var_name } = &link {
             interp.degrade_frame_local(*frame_index, var_name);
+            // tclsh ObjMakeUpvar 的 otherVar 帧内解析（createPart1/2=1）：
+            // 元素形的基缺**帧局部**容器时建占位数组——容器存在、元素
+            // 未定义（S2 钉形：`upvar 0 nosuch(1) foo` → array exists
+            // nosuch=1、read foo=no such variable）；基是帧局部**标量**
+            // 则建链即报 `can't access "x(1)": variable isn't array`
+            // （S1 钉形）；全局同名不顶替（S3：链落帧局部占位）。宿主
+            // unset 后别名转 dangling（deaden_element_links → Dead），
+            // 写报 element in deleted array（var-1.17/trv_p11 ③④）。
+            if let Some(paren) = var_name.find('(') {
+                let base = var_name[..paren].to_string();
+                if let Some(f) = interp.frames.get_mut(*frame_index) {
+                    if f.locals.contains_key(&base) && !f.array_locals.contains(&base) {
+                        set_error_code(interp, &format!("TCL LOOKUP VARNAME {}", base));
+                        return Err(Error::runtime(
+                            format!("can't access \"{}\": variable isn't array", other_var),
+                            crate::error::ErrorCode::Generic,
+                        ));
+                    }
+                    if !f.array_locals.contains(&base) {
+                        f.array_locals.insert(base);
+                    }
+                }
+            }
         }
 
         // Self-reference, direct or through a link chain.

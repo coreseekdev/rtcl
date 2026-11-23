@@ -812,17 +812,16 @@ impl Interp {
         if rest.is_empty() {
             return None;
         }
-        // Colon runs collapse: `set ::a::::b` and `set ::a::b` are the same
-        // variable (tclsh 8.6.17).  Single colons are name characters.
-        let norm = super::commands::namespace::normalise(rest);
-        let mut key = norm.strip_prefix("::").unwrap_or(&norm).to_string();
-        if rest.ends_with(':') {
-            // A trailing `::` names the EMPTY variable in that namespace
-            // (`set ns::` reads ns's variable named ""); normalise would
-            // otherwise swallow it.
-            key.push_str("::");
-        }
-        Some(key)
+        // tclsh 前导规则：`::` 后**整串冒号**一并吞掉（`::::z` → 全局
+        // `z`——TclGetNamespaceForQualName 的 leading skip）；随后按
+        // 变量面分段（split_ns_tail）：分隔 = `::` 串、尾段单冒号属
+        // 名字（`::a::b:` → ns ::a 的 `b:`）、尾 `::` 串 = 空名变量
+        // （`::t4::` ≡ `::t4:::` → t4 的空名——双端实测钉形）。旧
+        // normalise+ends_with 修补对混合形（`::a::b:`）把空名错安到
+        // `::a::b` 上。
+        let rest = rest.trim_start_matches(':');
+        let (quals, tail) = super::commands::namespace::split_ns_tail(rest);
+        Some(super::commands::namespace::join_var_key(quals, tail))
     }
 
     /// Canonical key for a variable name reached at the global frame
@@ -851,7 +850,24 @@ impl Interp {
             return name.to_string();
         }
         let qualified = if name.contains("::") {
-            super::commands::namespace::qualify(ns, name)
+            // tclsh 分段结构拼接：quals 并入 ns 路径、tail 逐字（尾 `::`
+            // 串 = 空名变量——`set q::` 在 ns w7 建的是 w7::q 的空名，
+            // 键 `w7::q::`；qualify 的整体 normalise 会把尾段吞成
+            // `w7::q`）。
+            let (quals, tail) = super::commands::namespace::split_ns_tail(name);
+            let ns_path = if name.starts_with("::") {
+                super::commands::namespace::normalise(quals)
+            } else if quals.is_empty() {
+                ns.to_string()
+            } else {
+                super::commands::namespace::qualify(ns, quals)
+            };
+            let base = ns_path.strip_prefix("::").unwrap_or(&ns_path);
+            if base.is_empty() {
+                tail.to_string()
+            } else {
+                format!("{}::{}", base, tail)
+            }
         } else {
             format!("{}::{}", ns, name)
         };
@@ -882,10 +898,19 @@ impl Interp {
                             .and_then(|f| f.slot_value(var_name.as_str())
                                 .or_else(|| f.locals.get(var_name.as_str())))
                     }
-                    UpvarLink::Dead { target, .. } => self
-                        .globals
-                        .get(target.as_str())
-                        .or_else(|| frame.locals.get(name)),
+                    UpvarLink::Dead { target, was_global, .. } => {
+                        // 全局死链回退 globals（目标已 unset 的 `variable`
+                        // 链读穿全局）；帧局部死链**不得**回退——占位元素
+                        // 宿主已亡，同名全局元素不属于这条链（trv_p11
+                        // ③④：帧占位 arr(1) vs 全局 arr(1)=2）。
+                        if *was_global {
+                            self.globals
+                                .get(target.as_str())
+                                .or_else(|| frame.locals.get(name))
+                        } else {
+                            frame.locals.get(name)
+                        }
+                    }
                 };
             }
             // Slotted name: the slot is the canonical store (unset slots
@@ -1167,16 +1192,17 @@ impl Interp {
         // 删——后的帧视图对限定访问不可见，sd1-B/sd3 实证；裸名
         // keep-alive 链接不受影响）。
         if name.contains("::") {
+            // 宿主 ns 由 tclsh 分段给出（`::t4:::` 的宿主是 ::t4——尾
+            // 串冒号 = 空名变量；旧 rsplit_once 把宿主算成 `::t4:` 恒
+            // miss——读在查表前就报 no such variable，trv_p11 ②根因）。
             // 相对限定名的解析根是全局(tclsh:deep::r2 内 `$n::v` 读
-            // ::n::v 钉形)——父 ns 检查按原样名剥前导 ::,不拼 current
-            // ns(ns 语境裸名的 canonical 在 resolve_var/store_var 的
-            // 非 frame 分支处理)。
+            // ::n::v 钉形)——不拼 current ns(ns 语境裸名的 canonical
+            // 在 resolve_var/store_var 的非 frame 分支处理)。
             let key = name.strip_prefix("::").unwrap_or(name);
-            // 剥前导 :: 再取父（根 ns 下 canonical 原样返回 '::d::x'，
-            // 直接 rsplit 会拼出 '::::d'——gen_namespace-46.3 回归实证）。
-            if let Some((p, _)) = key.rsplit_once("::") {
-                let parent = format!("::{}", p);
-                if parent != "::" && !self.namespaces.contains_key(&parent) {
+            let (quals, _) = super::commands::namespace::split_ns_tail(key);
+            if !quals.is_empty() {
+                let containing = super::commands::namespace::normalise(quals);
+                if containing != "::" && !self.namespaces.contains_key(&containing) {
                     return Err(Error::runtime(
                         format!("can't read \"{}\": no such variable", name),
                         ErrorCode::NotFound,
@@ -1292,19 +1318,21 @@ impl Interp {
         if !super::util::has_ns_sep(var) {
             return Ok(());
         }
-        let full = super::commands::namespace::qualify(&self.current_namespace, var);
-        if full == "::" {
+        // 变量宿主 ns 按 tclsh 分段（split_ns_tail）：quals 为空 = 无
+        // ns 部件（单冒号名 `a:b` 是当前 ns 的普通名字）；否则 = 分段
+        // 的 quals 路径（尾 `::` 串 → 空名的宿主就是该 ns；尾单冒号
+        // 属名字、宿主在更浅一层——旧 ends_with(':') 二分把 `::a::b:`
+        // 的宿主错算成 `::a::b:`，trv_p11 ①族）。绝对名根全局、相对名
+        // 沿用现基（与 qualify 现行为一致——帧内相对限定名的全局根由
+        // store_var/resolve_var 承担，本预检语义不变）。
+        let (quals, _) = super::commands::namespace::split_ns_tail(var);
+        if quals.is_empty() {
             return Ok(());
         }
-        // Trailing run: the variable itself lives in `full`; otherwise the
-        // variable lives in full's parent.
-        let ns_to_check = if var.ends_with(':') {
-            full
+        let ns_to_check = if var.starts_with("::") {
+            super::commands::namespace::normalise(quals)
         } else {
-            match full.rsplit_once("::") {
-                Some((p, leaf)) if !leaf.is_empty() => Self::normalise_ns(p),
-                _ => return Ok(()),
-            }
+            super::commands::namespace::qualify(&self.current_namespace, quals)
         };
         if ns_to_check == "::" || self.namespaces.contains_key(&ns_to_check) {
             return Ok(());
@@ -1360,7 +1388,18 @@ impl Interp {
         }
         // A write through an alias whose target namespace/array was
         // destroyed errors (var-1.15/1.16/1.17); reads keep working.
+        // 括号形分流（E1/var-1.15 钉形）：死**元素**链上的括号写 =
+        // 别名被当数组名 → `variable isn't array`（NEEDARRAY 先于
+        // dangling——元素 Var 已随宿主消亡、别名退化为未定义标量）；
+        // 死 ns 变量链（元素/裸名）一律 dangling-namespace（Var 仍在、
+        // 宿主 ns 失效——tclsh 的 DANGLINGVAR 先于数组形态判定）。
         if let Some(elem) = self.dead_link_error(name) {
+            if elem && name.contains('(') {
+                return Err(Error::runtime(
+                    format!("can't set \"{}\": variable isn't array", name),
+                    ErrorCode::Generic,
+                ));
+            }
             let what = if elem {
                 "element in deleted array"
             } else {
@@ -1974,13 +2013,16 @@ impl Interp {
 
     pub fn var_exists(&self, name: &str) -> bool {
         // 限定名父 ns 不存在 → 不存在（D-2：同 get_var 守卫——tclsh
-        // `info exists e::y` 对已删 ns 恒 0，sd1-B/C/sd2 实证）。
+        // `info exists e::y` 对已删 ns 恒 0，sd1-B/C/sd2 实证）。宿主
+        // ns 按 tclsh 分段（`::t4:::` 的宿主是 ::t4——旧 rsplit 把
+        // verbatim 键的尾串切出 `::t4:` 恒 0，trv_p11 ①族）。
         if name.contains("::") {
             let key = self.canonical_global(name);
             let key = key.strip_prefix("::").unwrap_or(&key);
-            if let Some((p, _)) = key.rsplit_once("::") {
-                let parent = format!("::{}", p);
-                if parent != "::" && !self.namespaces.contains_key(&parent) {
+            let (quals, _) = super::commands::namespace::split_ns_tail(key);
+            if !quals.is_empty() {
+                let containing = super::commands::namespace::normalise(quals);
+                if containing != "::" && !self.namespaces.contains_key(&containing) {
                     return false;
                 }
             }
@@ -2294,12 +2336,14 @@ impl Interp {
                     {
                         *link = UpvarLink::Dead {
                             array: true,
+                            was_global: false,
                             target: var_name.clone(),
                         };
                     }
                     UpvarLink::Global(g) if scope_idx.is_none() && g.starts_with(&elem_prefix) => {
                         *link = UpvarLink::Dead {
                             array: true,
+                            was_global: true,
                             target: g.to_string(),
                         };
                     }
@@ -2350,7 +2394,7 @@ impl Interp {
         }
     }
 
-    pub(crate) fn deaden_links_under(&mut self, var_prefix: &str) {
+    pub(crate) fn deaden_links_under(&mut self, var_prefix: &str, inside_tree: bool) {
         let aliases: Vec<(String, String)> = self.flat_aliases.clone();
         for (k, t) in aliases {
             if t.starts_with(var_prefix) && !self.ns_variable_links.contains(&t) {
@@ -2362,17 +2406,50 @@ impl Interp {
         // variable).
         self.flat_aliases.retain(|(k, _)| !k.starts_with(var_prefix));
         // Frame links under the dying tree keep their value as a seeded
-        // local copy (writes still error — the links go dead below).
-        self.materialize_frame_links(var_prefix);
+        // local copy — **only for a delete initiated from inside the
+        // tree**: tclsh's teardown is then deferred (activationCount > 0
+        // — the var table outlives the delete for the frames inside),
+        // so reads through the link still resolve (namespace-46.8 S1 钉
+        // 形 `variable ::dn::v seed` + `namespace delete [namespace
+        // current]` → read seed)。An outside delete tears the table
+        // down immediately: no seed — reads through the alias fail
+        // (`can't read "fv": no such variable`、unset 同、exists 0——
+        // trv_p11 var-alias-after-del/W 钉形), writes keep the
+        // dangling-namespace guard. Writes error either way (the links
+        // go dead below).
+        if inside_tree {
+            self.materialize_frame_links(var_prefix);
+        }
         for f in self.frames.iter_mut() {
+            let dead: Vec<String> = f
+                .upvars
+                .iter()
+                .filter_map(|(n, l)| match l {
+                    UpvarLink::Global(g) => g.starts_with(var_prefix).then(|| n.to_string()),
+                    _ => None,
+                })
+                .collect();
             for link in f.upvars.values_mut() {
                 if let UpvarLink::Global(g) = link {
                     if g.starts_with(var_prefix) {
                         *link = UpvarLink::Dead {
                             array: false,
+                            was_global: true,
                             target: g.to_string(),
                         };
                     }
+                }
+            }
+            // An outside delete tears the table down immediately: the
+            // install-time mirror (cmd_variable's `info vars` placeholder,
+            // a copy of the target) is now stale — tclsh's alias reads
+            // THROUGH the link and the target is gone.  Drop the mirrors
+            // so read/unset/exists report the dead target (trv_p11 ⑤:
+            // `can't read/unset "fv": no such variable`、exists 0).
+            if !inside_tree {
+                for n in dead {
+                    f.locals.remove(&n);
+                    f.array_locals.remove(&n);
                 }
             }
         }
@@ -2867,6 +2944,205 @@ mod tests {
         assert_eq!(
             interp_eval("set created 5; catch {set ::errorCode} m; set m"),
             "can't read \"::errorCode\": no such variable"
+        );
+    }
+
+    // -- trailing-colon / colon-run variable names (tclsh 8.6.17,
+    //    trv_p11 ①②钉形：绝对名分段 = `::` 串分隔 + 尾串冒号空名 +
+    //    尾单冒号属名字；`variable :` 的名字就是 `:`) --
+
+    #[test]
+    fn test_trailing_run_names_empty_variable() {
+        // `::t4::` 与 `::t4:::` 同一变量：t4 的**空名**变量
+        // （info vars 列表里的 `{}` 条目）。
+        assert_eq!(
+            interp_eval("namespace eval t4 {}; set ::t4:: 5; list [set ::t4::] [set ::t4:::] [info exists ::t4:::]"),
+            "5 5 1"
+        );
+        assert_eq!(
+            interp_eval("namespace eval t5 {}; set ::t5::: 6; list [set ::t5::] [set ::t5:::]"),
+            "6 6"
+        );
+        assert_eq!(
+            // 空名变量在本 ns 的 info vars 里以 `{}` 条目现身。
+            interp_eval("namespace eval t6 {}; set ::t6:: 1; namespace eval t6 {lappend v [lindex [info vars] 0]; set v}"),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn test_colon_name_variable_is_plain_name() {
+        // `variable :`：名字是 `:`（var-7.13）——相对 `:` 可读写、which
+        // 打印 `::tnv:::`；绝对 `::tnv:::` 是 tnv 的空名变量（≠ `:`），
+        // tclsh 的解析/打印不闭环原样保留。
+        assert_eq!(
+            interp_eval(
+                "namespace eval tnv {variable : X1}; \
+                 list [namespace eval tnv {set :}] \
+                       [namespace eval tnv {info exists :}] \
+                       [namespace eval tnv {namespace which -variable :}]"
+            ),
+            "X1 1 ::tnv:::"
+        );
+        assert_eq!(
+            interp_eval("namespace eval tnv {variable : X1}; info exists ::tnv:::"),
+            "0"
+        );
+        assert_eq!(
+            interp_eval("namespace eval tnv {variable : X1}; namespace which -variable ::tnv:::"),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_single_trailing_colon_is_name_char() {
+        // `::a::b:`：ns ::a 的名字 `b:`（尾**单**冒号属名字）；它与
+        // `::a::b::`（::a::b 的空名）不是同一变量。
+        assert_eq!(
+            interp_eval(
+                "namespace eval a {}; set ::a::b: 7; \
+                 list [set ::a::b:] [info exists ::a::b:] [info exists ::a::b::]"
+            ),
+            "7 1 0"
+        );
+        // 名字中段单冒号同样是名字字符：`a:b`、`::d:e`。
+        assert_eq!(
+            interp_eval("set a:b 7; namespace which -variable a:b"),
+            "::a:b"
+        );
+        assert_eq!(
+            interp_eval("set ::d:e 8; list [set ::d:e] [namespace which -variable ::d:e]"),
+            "8 ::d:e"
+        );
+    }
+
+    #[test]
+    fn test_pure_colon_names_are_global_empty_variable() {
+        // `:::` 与 `::::` 都是全局 ns 的空名变量（同一键）。
+        assert_eq!(
+            interp_eval("set ::: 5; set :::: 6; list [set :::] [set ::::] [info exists {}]"),
+            "6 6 1"
+        );
+    }
+
+    #[test]
+    fn test_leading_run_skipped_to_global() {
+        // `::::z`：前导整串冒号吞掉 → 全局 `z`。
+        assert_eq!(
+            interp_eval("set ::::z 5; list [set ::z] [set ::::z]"),
+            "5 5"
+        );
+    }
+
+    #[test]
+    fn test_write_parent_check_with_trailing_shapes() {
+        // 写路径宿主检查：尾串冒号形查 quals 路径（`::nope2::` 报
+        // 宿主缺失）；尾单冒号形查更浅一层（`::a::b:` 只要求 ::a）。
+        assert_eq!(
+            eval_err("set ::nope2:: 5"),
+            "can't set \"::nope2::\": parent namespace doesn't exist"
+        );
+        assert_eq!(
+            eval_err("set ::nope3::x 5"),
+            "can't set \"::nope3::x\": parent namespace doesn't exist"
+        );
+        assert_eq!(interp_eval("namespace eval ok {}; set ::ok::leaf: 5; set ::ok::leaf:"), "5");
+        assert_eq!(
+            eval_err("namespace eval pns {}; namespace eval pns {set sub:: 1}"),
+            "can't set \"sub::\": parent namespace doesn't exist"
+        );
+    }
+
+    #[test]
+    fn test_relative_read_with_trailing_run_finds_ns_var() {
+        // ns 语境相对名：尾串冒号 = 空、名字逐字（canonical 拼接不吞
+        // 尾段）——ns eval 体里的 `set q:: 5` 建的是 w7::q 的空名变量
+        // （宿主 ns 必须已存在——tclsh 同）。`set w6::` 在全局对缺失
+        // ns 同报宿主缺失。
+        assert_eq!(
+            eval_err("namespace eval w7 {set q:: 5}"),
+            "can't set \"q::\": parent namespace doesn't exist"
+        );
+        assert_eq!(
+            interp_eval(
+                "namespace eval w7 {}; namespace eval w7::q {}; \
+                 namespace eval w7 {set q:: 5}; \
+                 list [set w7::q::] [info exists w7::q]"
+            ),
+            "5 0"
+        );
+        assert_eq!(
+            eval_err("set w6:: 5"),
+            "can't set \"w6::\": parent namespace doesn't exist"
+        );
+    }
+
+    // -- upvar 数组元素别名生命周期（tclsh 8.6.17，var-1.17/trv_p11
+    //    ③④钉形：upvar 0 元素形的链落**帧局部占位**、宿主 unset 后
+    //    别名转 dangling）--
+
+    #[test]
+    fn test_upvar_element_placeholder_and_dangling() {
+        assert_eq!(
+            interp_eval(
+                "set arr(1) 2; \
+                 proc pA {} { upvar 0 arr(1) foo; set r {}; \
+                     lappend r [catch {set foo} m] $m; \
+                     unset arr; \
+                     lappend r [catch {set foo 3} m2] $m2; \
+                     lappend r [catch {set foo(3) 3} m3] $m3; \
+                     lappend r [info exists foo]; set r }; pA"
+            ),
+            "1 {can't read \"foo\": no such variable} 1 {can't set \"foo\": upvar refers to element in deleted array} 1 {can't set \"foo(3)\": variable isn't array} 0"
+        );
+        // 全局 arr 不被帧占位顶替：pA 的 unset 只删帧局部占位。
+        assert_eq!(interp_eval("set arr(1) 2; proc pA {} {upvar 0 arr(1) foo; unset arr}; catch pA; set arr(1)"), "2");
+    }
+
+    #[test]
+    fn test_upvar_element_scalar_base_and_missing_base() {
+        // S1：基是帧局部标量 → 建链即报；S2：缺基建帧局部占位数组。
+        assert_eq!(
+            eval_err("proc pS {} {set x 5; upvar 0 x(1) foo}; pS"),
+            "can't access \"x(1)\": variable isn't array"
+        );
+        assert_eq!(
+            interp_eval(
+                "proc pM {} {upvar 0 nosuch(1) foo; list [array exists nosuch] [info exists foo]}; pM"
+            ),
+            "1 0"
+        );
+    }
+
+    #[test]
+    fn test_var_alias_after_outside_ns_delete() {
+        // trv_p11 ⑤（W/var-1.15 钉形）：外部删除 → 读/删 no such
+        // variable、exists 0、写 dangling-namespace。
+        assert_eq!(
+            interp_eval(
+                "namespace eval dn {variable fv 9}; \
+                 proc pV {} {variable ::dn::fv; set r {}; \
+                     lappend r [set fv]; namespace delete ::dn; \
+                     lappend r [catch {set fv} m1] $m1; \
+                     lappend r [catch {unset fv} m2] $m2; \
+                     lappend r [catch {set fv 7} m3] $m3; \
+                     lappend r [info exists fv]; set r }; pV"
+            ),
+            "9 1 {can't read \"fv\": no such variable} 1 {can't unset \"fv\": no such variable} 1 {can't set \"fv\": upvar refers to variable in deleted namespace} 0"
+        );
+    }
+
+    #[test]
+    fn test_var_alias_self_delete_still_reads() {
+        // namespace-46.8 形（S1）：在自己 ns 里删自己——teardown 延迟
+        // 语义（帧语境种子），读仍通。
+        assert_eq!(
+            interp_eval(
+                "namespace eval dn5 {variable fv2 9; proc p {} { \
+                     variable ::dn5::fv2 seed; namespace delete ::dn5; \
+                     list [set fv2] [info exists fv2] }; set r [p]; set r}"
+            ),
+            "seed 1"
         );
     }
 }

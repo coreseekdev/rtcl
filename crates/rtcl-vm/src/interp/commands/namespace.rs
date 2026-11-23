@@ -163,18 +163,38 @@ pub(crate) fn resolve_var_link(interp: &mut Interp, ns: &str, raw_name: &str) ->
             var_key(&format!("{}::", ns))
         }
     } else {
-        let mut key = var_key(&qualify(ns, raw_name));
-        if raw_name.ends_with(':') && !key.ends_with(':') {
-            key.push_str("::");
+        // 链接键 = 结构拼接：raw_name 按 tclsh 分段（split_ns_tail——
+        // `::` 串分隔、尾段单冒号属名字、尾 `::` 串 = 空名），quals 并
+        // 入 ns 路径、tail 逐字保留。`variable :` 的名字就是 `:`
+        // （var-7.13——ns tnv 键 `tnv:::`、相对 `:` 可读写回；绝对形
+        // `::tnv:::` 是 tnv 的**空名**变量，tclsh 的解析/打印本就
+        // 不闭环）；`variable ns::` 名字是空串（var-7.12——键 `ns::`）。
+        // 旧实现 qualify+ends_with 修补把 `:` 吞成空名（trv_p11 ①）。
+        let (quals, tail) = split_ns_tail(raw_name);
+        let ns_path = if quals.is_empty() {
+            ns.to_string()
+        } else {
+            qualify(ns, quals)
+        };
+        let base = ns_path.strip_prefix("::").unwrap_or(&ns_path);
+        if base.is_empty() {
+            tail.to_string()
+        } else {
+            format!("{}::{}", base, tail)
         }
-        key
     };
     let ns_part = if raw_name.is_empty() {
         ns.to_string()
-    } else if raw_name.ends_with("::") {
-        normalise(&format!("::{}", qualified))
     } else {
-        parent_of(&normalise(&format!("::{}", qualified)))
+        // 名字的宿主 ns：分段 quals 的路径并入当前 ns（与键的拼接同一
+        // 分段——旧 parent_of 走 normalise 的整名归一，尾串/单冒号形
+        // 畸变）。
+        let (quals, _) = split_ns_tail(raw_name);
+        if quals.is_empty() {
+            ns.to_string()
+        } else {
+            qualify(ns, quals)
+        }
     };
     if interp.var_link_cache.len() >= VAR_LINK_CACHE_MAX {
         interp.var_link_cache.clear();
@@ -512,8 +532,10 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let var_prefix = var_key(&prefix);
 
         // Aliases pointing into the dying tree go dead first: reads keep
-        // the seeded local copy, writes error (var-1.15/1.16).
-        interp.deaden_links_under(&var_prefix);
+        // the seeded local copy for an INSIDE-initiated delete (tclsh
+        // teardown deferral), an outside delete seeds nothing — reads
+        // through the alias fail (var-1.15/1.16/trv_p11 ⑤).
+        interp.deaden_links_under(&var_prefix, inside);
 
         // ── Variables go first (tclsh order) ──
         // Each variable is removed BEFORE its unset trace fires, and the
@@ -896,7 +918,33 @@ fn ns_which(interp: &Interp, args: &[Value]) -> Result<Value> {
             }
         }
         "variable" => {
-            let key = var_key(&qualified);
+            // 变量面的 tclsh 分段键（trv_p11 ①）：相对 `:` 在当前 ns 的
+            // 名字就是 `:`——键 `tnv:::`、命中打印 `::tnv:::`（fullName
+            // + 名字，**无归一化**——tclsh 的 which 打印与解析本就
+            // 不闭环）；绝对 `::tnv:::` 查的是 tnv 的**空名**变量（键
+            // `tnv::`，split_global 同一分段）。
+            let key = if name.starts_with("::") {
+                let rest = name.trim_start_matches(':');
+                let (q, t) = split_ns_tail(rest);
+                join_var_key(q, t)
+            } else if name.contains("::") {
+                let (q, t) = split_ns_tail(name);
+                let ns_path = if q.is_empty() {
+                    interp.current_namespace.to_string()
+                } else {
+                    qualify(&interp.current_namespace, q)
+                };
+                let base = ns_path.strip_prefix("::").unwrap_or(&ns_path);
+                if base.is_empty() {
+                    t.to_string()
+                } else {
+                    format!("{}::{}", base, t)
+                }
+            } else if interp.current_namespace.as_ref() == "::" {
+                name.to_string()
+            } else {
+                format!("{}::{}", &interp.current_namespace[2..], name)
+            };
             let declared = interp
                 .namespaces
                 .get(interp.current_namespace.as_ref())
@@ -906,9 +954,9 @@ fn ns_which(interp: &Interp, args: &[Value]) -> Result<Value> {
                 || interp.var_nuke_pending.contains(&key)
                 || declared
             {
-                Ok(Value::from_str(&qualified))
+                Ok(Value::from_str(&format!("::{}", key)))
             } else if interp.globals.contains_key(name) {
-                Ok(Value::from_str(&qualify("::", name)))
+                Ok(Value::from_str(&format!("::{}", name)))
             } else {
                 Ok(Value::empty())
             }
@@ -2197,6 +2245,64 @@ fn ns_child_prefix(ns: &str) -> String {
         "::".to_string()
     } else {
         format!("{}::", ns)
+    }
+}
+
+/// 变量/命令**解析面**的名字分段（tclsh TclGetNamespaceForQualName
+/// 8.6.17，源码 + 双端实测钉死）：分隔符 = `::` 起的**整串冒号**
+/// （后续单冒号一并吞掉——`a::::b` → `("a", "b")`）；尾段不以 `::`
+/// 串结尾（含**单冒号结尾**）→ 整段是 simple name（`a::b:` →
+/// `("a", "b:")`）；以 `::` 串结尾 → 尾段是 ns 部件、名字为**空串**
+/// （`t4:::` / `t4::` → `("t4", "")`——空名变量的绝对形，`info vars`
+/// 列表里的 `{}` 条目）。与命令层 `split_colon_pair`（8917651）同一
+/// 冒号串规则、不同消费形：本函数保留空尾段，供变量键 `ns::`+尾段
+/// 结构拼接（trv_p11 ①②）。
+pub(crate) fn split_ns_tail(rest: &str) -> (&str, &str) {
+    let b = rest.as_bytes();
+    let mut i = 0usize;
+    let mut run_start: Option<usize> = None;
+    while i + 1 < b.len() {
+        if b[i] == b':' && b[i + 1] == b':' {
+            let mut j = i + 2;
+            while j < b.len() && b[j] == b':' {
+                j += 1;
+            }
+            run_start = Some(i);
+            i = j;
+            if j >= b.len() {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    match run_start {
+        None => ("", rest),
+        Some(run_start) => {
+            let mut j = run_start + 2;
+            while j < b.len() && b[j] == b':' {
+                j += 1;
+            }
+            if j >= b.len() {
+                // 尾部整串冒号：ns 部件 + 空名。
+                (&rest[..run_start], "")
+            } else {
+                (&rest[..run_start], &rest[j..])
+            }
+        }
+    }
+}
+
+/// `(quals, tail)` → 全局变量表键：quals 归一化为 ns 路径（内部冒号
+/// 串收敛、无尾段可吞），全局 ns 的键 = 名字本身（无 `::` 前缀），
+/// 其余 = `ns 路径::` + tail **逐字**（tail 含单冒号/为空串都原样）。
+pub(crate) fn join_var_key(quals: &str, tail: &str) -> String {
+    let n = normalise(quals);
+    let s = n.strip_prefix("::").unwrap_or(&n);
+    if s.is_empty() {
+        tail.to_string()
+    } else {
+        format!("{}::{}", s, tail)
     }
 }
 

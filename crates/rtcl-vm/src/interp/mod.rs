@@ -83,7 +83,12 @@ pub(crate) enum UpvarLink {
     /// containing array was unset) while the alias was live.  Reads keep
     /// working against the alias's seeded local copy; writes error
     /// (tclsh 8.6.17).  `array` distinguishes the two error messages.
-    Dead { array: bool, target: String },
+    /// `was_global`: the target was a GLOBAL key (`::ns::v`/`g(e)`) —
+    /// the read fallback may consult `globals[target]`; a frame-local
+    /// dead target must NOT (a same-named global element would leak
+    /// through an alias that never pointed at it — trv_p11 upvar-elem
+    /// 的帧局部占位 `arr(1)` vs 全局 `arr(1)`).
+    Dead { array: bool, was_global: bool, target: String },
 }
 
 /// Frame upvar links.  `Rc<str>` keys: a prelinked method's link names
@@ -848,6 +853,28 @@ pub struct Interp {
     /// 显式携带（we5 钉形；JIT 路径的挂起帧无相对行，置 None 走
     /// err_line 旧口径）。
     pub(crate) err_pending_top: Option<(Rc<str>, usize, Option<usize>)>,
+    /// [`Interp::err_pending_top`] 被更外层 defer **顶替**时，原单元边界
+    /// 帧（内层替换单元的命令帧）的**链式载体**（e8/e9）：嵌套替换词
+    /// `set x [[ [[a]b]c]d]` 的每层单元出口帧按顶替序入链，顶层报告
+    /// （`error_report`）先链后顶逐帧落账（tclsh 文件级退出的逐单元
+    /// 日志——五帧序）；其余边界与 `pending_top` 同生死：catch 消费
+    /// 清空、harness 直落帧清空（ERR_ALREADY_LOGGED 单次消费的同款
+    /// 纪律）、eval_isolated/trace 回调 save-restore 同步、flow 转换
+    /// 丢弃（tclsh 的 `set x [break]` 不落替换帧）。
+    pub(crate) err_pending_chain: Vec<(Rc<str>, usize)>,
+    /// [`Interp::err_pending_top`] 的来源标记：true = 替换**单元边界**
+    /// 写入（bytecode 的 Sub 区弹出 / 词级 defer、tree-walk 的词级
+    /// defer）——该 pending 是内层单元的出口帧，可在下一个单元边界
+    /// 提交为 `invoked from within`（e8/e9 三帧 errorInfo 的中间帧）。
+    /// false = expr 抑制臂写入（字节码 Expr 区——tclsh 对替换源错误
+    /// 不落 `expr {...}` 帧，提交必须跳过）或 pending 已消费/为空。
+    pub(crate) err_pending_unit_frame: bool,
+    /// 本次错误源自**运行时 expr 求值器的括号操作数**（sticky——穿过
+    /// 嵌套单元机器直达词级 defer 消费点）：其 EvalScript defer 的
+    /// pending 是被 tclsh 抑制的 `expr {...}` 帧，不可提交（e8/e9 与
+    /// expr 帧抑制的正交性；expr.rs 两处括号臂置位、wordop-defer/
+    /// 新错误复位消费）。
+    pub(crate) err_expr_origin: bool,
     /// D-3 -errorstack：当前错误的 INNER 条目体（"returnImm x {}" /
     /// "invokeStk1 <cmdtext>"）；新错误在 harness 首帧处重建。
     pub(crate) err_inner: Option<String>,
@@ -1037,6 +1064,8 @@ impl Interp {
             cur_cmd_text: rtcl_parser::SrcSpan { start: 0, end: 0 },
             cur_source: Rc::from(""),
             err_from_subst: false,
+            err_pending_unit_frame: false,
+            err_expr_origin: false,
             lexical_body: false,
             in_file_script: false,
             file_script_armed: false,
@@ -1045,6 +1074,7 @@ impl Interp {
             top_slots: None,
             next_eval_lexical: false,
             err_pending_top: None,
+            err_pending_chain: Vec::new(),
             err_inner: None,
             err_pending_inner: None,
             err_calls: Vec::new(),
@@ -1326,6 +1356,7 @@ impl Interp {
     /// errorLine 只在日志事件处更新）。
     pub fn jit_err_set_pending(&mut self, text: &str, line: usize) {
         self.err_pending_top = Some((Rc::from(text), line, None));
+        self.err_pending_unit_frame = true;
     }
 
     /// 同上：行号直设（exit_frame 前置读取的口径）。
@@ -1344,6 +1375,8 @@ impl Interp {
     /// 被顶替）。
     pub fn jit_err_clear_pending(&mut self) {
         self.err_pending_top = None;
+        self.err_pending_unit_frame = false;
+        self.err_pending_chain.clear();
     }
 
     /// 同上：defer 帧在位查询——顶层 D-11 解码（decode_toplevel_flow）

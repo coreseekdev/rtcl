@@ -25,16 +25,44 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// 构建解释器：`net` feature 下注入 native 宿主服务（rtcl-native 的
 /// HostHttp 实现 + `__rtcl_http`/`__rtcl_http_cancel` 桥 + `http::*` 词表）。
-fn new_interp() -> Interp {
+/// The CLI's interpreter.  When a run ends — the script ran to its end,
+/// `exit`, or an error — its channels are *abandoned*, not closed: a
+/// closing pipe channel waits for its child, and leaving the process has
+/// no reason to (`set f [open "|sleep 3"]` at the end of a script used to
+/// hold the exit for those 3 seconds; tclsh's exit does not wait).  The
+/// child reads EOF, or takes SIGPIPE on its next write.  A plain
+/// interpreter dropped inside a live process still closes, and waits.
+struct Session(Interp);
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.0.abandon_channels();
+    }
+}
+
+impl std::ops::Deref for Session {
+    type Target = Interp;
+    fn deref(&self) -> &Interp {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Session {
+    fn deref_mut(&mut self) -> &mut Interp {
+        &mut self.0
+    }
+}
+
+fn new_interp() -> Session {
     #[cfg(feature = "net")]
     {
         let mut interp = Interp::new();
         rtcl_native::net::install(&mut interp);
-        interp
+        Session(interp)
     }
     #[cfg(not(feature = "net"))]
     {
-        Interp::new()
+        Session(Interp::new())
     }
 }
 
@@ -128,8 +156,9 @@ fn run_file(path: &PathBuf, quiet: bool) -> Result<(), String> {
         let e = interp.decode_toplevel_flow(e);
         if e.is_exit() {
             let code = repl::exit_code_of(&e);
-            // Run Drop (channel close / pipe wait / JIT teardown) before
-            // leaving; process::exit bypasses destructors.
+            // Run Drop (channel teardown / JIT teardown) before leaving;
+            // process::exit bypasses destructors.  The session's channels
+            // are abandoned on that drop: no wait for pipe children.
             drop(interp);
             std::process::exit(code);
         }

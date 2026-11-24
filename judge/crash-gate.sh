@@ -47,9 +47,19 @@ run_one() {
     local f=$1 eng=$2 max out rc t0 t1 pre=()
     max=$(budget_ms "$f"); max=${max:-20000}
     grep -q '^# gate: env-nonutf8' "$f" && pre=(env -i "PATH=$PATH" $'RTCL_BAD=\xff\xfe')
+    # Output goes to a file, not a command substitution: a child the
+    # script left running inherits the interpreter's stdout and stderr,
+    # and a `$(...)` reading those through a pipe only sees EOF once that
+    # child is gone — the clock would then time the child, not the probe
+    # (`exit` next to `open "|sleep 3"` measured 3s with the interpreter
+    # gone in 30ms).
+    local capture
+    capture=$(mktemp) || exit 2
     t0=$(date +%s%N)
-    out=$("${pre[@]}" bash -c "ulimit -v 3000000; ulimit -c 0; timeout 30 $RTCL $eng -f '$f'" 2>&1); rc=$?
+    "${pre[@]}" bash -c "ulimit -v 3000000; ulimit -c 0; timeout 30 $RTCL $eng -f '$f'" > "$capture" 2>&1; rc=$?
     t1=$(date +%s%N)
+    out=$(head -c 200000 "$capture")
+    rm -f "$capture"
     if [ "$rc" -eq 0 ] && [ $(( (t1 - t0) / 1000000 )) -le "$max" ] \
         && ! grep -qE 'panicked|stack overflow|memory allocation of' <<<"$out"; then
         return 0

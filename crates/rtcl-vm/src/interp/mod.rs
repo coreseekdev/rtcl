@@ -2462,6 +2462,17 @@ pub(crate) const CONST_POOL_BYTE_BUDGET: usize = 32 * 1024 * 1024;
 pub(crate) const LAMBDA_CACHE_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 pub(crate) const EXPR_CACHE_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 
+impl Interp {
+    /// Close every channel the way leaving the process should: without
+    /// waiting for a pipe child or a pending connection.  A host about to
+    /// exit calls this before dropping the interpreter; the plain `Drop`
+    /// still closes, and waits — an interpreter dropped inside a live
+    /// process must not leave children unreaped.
+    pub fn abandon_channels(&mut self) {
+        self.channels.abandon_all();
+    }
+}
+
 /// Dropping the last interpreter handle releases OS resources via field
 /// drops (ChannelTable's Drop closes files/pipes) and gives the optional
 /// JIT engine a chance to drop thread-local pools/modules keyed by this

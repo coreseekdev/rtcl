@@ -36,6 +36,13 @@ pub trait Channel: Send {
     /// 标记通道 EOF（`-eofchar` 命中——tclsh 的 eofchar 等价 EOF 位）。
     fn set_at_eof(&mut self) {}
     fn close(self: Box<Self>) -> io::Result<()>;
+    /// Close for good because the process is leaving. A real `close` may
+    /// wait — a pipe channel for its child, a socket for a pending
+    /// connection — and tclsh's `exit` waits for neither; channels for
+    /// which that matters override this.
+    fn close_at_exit(self: Box<Self>) -> io::Result<()> {
+        self.close()
+    }
     fn is_readable(&self) -> bool;
     fn is_writable(&self) -> bool;
     /// Truncate a seekable, writable channel (`chan truncate`). The default
@@ -1152,7 +1159,18 @@ impl Channel for TcpChannel {
     fn set_at_eof(&mut self) { self.eof = true; }
     fn close(mut self: Box<Self>) -> io::Result<()> {
         // 关通道外送连接期间的缓冲（tclsh close 前隐式 flush；flush 错误
-        // 在 close 面被吞——实测 async 死路 + 已缓冲 puts，close 仍成功）。
+        // 在 close 面被吞）。Nothing buffered → nothing to wait for: the
+        // pending connection is dropped and `close` returns at once, as in
+        // tclsh.  It used to wait for the connection here in both cases,
+        // and on a `-async` socket to an unreachable host that is the
+        // kernel's own connect timeout — minutes — for a `close` (tclsh:
+        // 0ms).  With output buffered a blocking channel does wait for the
+        // connection, in tclsh as here.
+        if !self.failed && self.connecting && self.out_buf.is_empty() {
+            self.failed = true;
+            self.connecting = false;
+            self.stream = None;
+        }
         if !self.failed && self.connecting {
             let _ = self.ensure_connected();
         }
@@ -1487,6 +1505,21 @@ impl ChannelTable {
     }
 
     pub fn close(&mut self, id: &str) -> io::Result<()> {
+        self.close_with(id, false)
+    }
+
+    /// Every channel, without the waits a real `close` performs — for
+    /// leaving the process (see [`Channel::close_at_exit`]). Explicit
+    /// `close` and plain interpreter disposal keep waiting: an interpreter
+    /// dropped in a live process must not leave pipe children unreaped.
+    pub fn abandon_all(&mut self) {
+        let ids: Vec<ChannelId> = self.channels.keys().cloned().collect();
+        for id in ids {
+            let _ = self.close_with(&id, true);
+        }
+    }
+
+    fn close_with(&mut self, id: &str, at_exit: bool) -> io::Result<()> {
         // tclsh：out-eofchar 在 close 时一次性写出（flush 后、底层关闭
         // 前；不是逐 puts/flush）——`fconfigure $f -eofchar {{} \x03}` +
         // puts "X" + close → "X\x03"。
@@ -1502,7 +1535,13 @@ impl ChannelTable {
         self.configs.remove(id);
         self.untrack(id);
         match self.channels.remove(id) {
-            Some(ch) => ch.close(),
+            Some(ch) => {
+                if at_exit {
+                    ch.close_at_exit()
+                } else {
+                    ch.close()
+                }
+            }
             None => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("can not find channel named \"{}\"", id),
@@ -1957,6 +1996,15 @@ impl Channel for PipeChannel {
         drop(self.writer.take());
         drop(self.reader.take());
         let _ = self.child.wait();
+        Ok(())
+    }
+    fn close_at_exit(mut self: Box<Self>) -> io::Result<()> {
+        // Leaving the process: drop the pipe ends — the child reads EOF,
+        // or takes SIGPIPE on its next write — and let its handle go
+        // without the wait above. tclsh's `exit` does not wait either
+        // (`set f [open "|sleep 3"]; exit 0` took 3 seconds here).
+        drop(self.writer.take());
+        drop(self.reader.take());
         Ok(())
     }
     fn is_readable(&self) -> bool { self.reader.is_some() }

@@ -100,7 +100,7 @@
 | # | 问题 | 位置 | 处置 |
 |---|---|---|---|
 | S31 | exec 三处死锁（stderr 超 64KiB 且 stdout 未关、`<<` 超管道容量、后台作业写大量 stderr）；`exit` 被存活的管道子进程阻塞 3 秒 | `commands/exec_cmd.rs` | 死锁三项已修（M5）；`exit` 阻塞见 S32 |
-| S32 | `close` 仍在连接的 `-async` socket 无限阻塞 | `channel.rs` | 未修 |
+| S32 | `close` 仍在连接的 `-async` socket 无限阻塞（内核自己的 connect 超时是分钟级）；`exit` 到来时存活的管道子进程把退出拖住（`set f [open "|sleep 3"]; exit 0` 要 3 秒） | `channel.rs`、`rtcl-cli/src/main.rs` | 已修（M5）：没有缓冲输出时 `close` 直接丢弃未完成的连接（tclsh 0ms；有缓冲输出且阻塞模式时 tclsh 自己也等连接，保持不变）。CLI 的每次运行结束（脚本跑完、`exit`、出错）都走 `Interp::abandon_channels`——不等管道子进程；嵌入宿主里的普通 `Drop` 仍然等（活着的进程里不该留下没收的子进程） |
 | S33 | exec 遇非 UTF-8 输出报错并留僵尸进程 | `commands/exec_cmd.rs` | 已修（M5）：非 UTF-8 逐字节映射成同值字符（同 tclsh）；不留僵尸——输出读不出来时 kill + 收尸，spawn 失败时把已启动的阶段分离、由下次 exec 收（tclsh 同） |
 | S34 | `file tempfile` 任意路径前缀、无 `O_EXCL`、0644 | `host.rs` | 未修 |
 | S35 | `file delete` 不带 `-force` 也递归删非空目录 | `commands/io.rs` | 未修 |
@@ -222,6 +222,12 @@
   `d01` 的预算放宽到 90 秒——它是编译上限的压力探针（超大单元走
   树引擎，负载高的机器上每个引擎 5–7 秒），不是挂起探针，20 秒
   默认预算在负载 20+ 时抖过。
+- M5 收尾：**crash-gate 110 次运行 110 过**——四类探针首次全绿
+  （基线 99 次 14 过）。顺带修了门禁的一处测量假象：输出原来用
+  `$(…)` 捕获，脚本留下的子进程继承了被捕获的 stdout/stderr，shell
+  要等它退出才读到 EOF，于是计的是子进程的命而不是探针的（`exit`
+  旁的 `open "|sleep 3"`：解释器 30ms 就退了，门禁量出 3 秒）。现在
+  输出落文件。
 - `judge/crash-wasm.mjs`：**35 项**全过（M3 时 27 项）。每项在自己的
   worker 线程里跑，15 秒无结果即判 `HANG` 并终止线程——原来遇到挂起类
   回归是门禁自己卡死（步数预算看不见解析器/检查器里的循环）。

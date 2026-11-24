@@ -51,7 +51,7 @@ const run = (h, code) => { try { return 'ok:' + JSON.stringify(String(h.exec(cod
       // trapped (wasm32 has no native clock) — the instance was gone.
       let seen = '';
       h.set_output_handler(t => { seen += String(t); });
-      const puts = run(h, 'set c [interp]; $c eval {puts childout}');
+      const puts = run(h, 'set c [interp create]; $c eval {puts childout}');
       const after = run(h, '$c eval {catch {after 10 {set ::z 1}; vwait ::z} m; set m}');
       const time = run(h, '$c eval {catch {time {expr 1+1}} m; set m}');
       r = (puts.startsWith('ok') && seen === 'childout\n' && !after.startsWith('TRAP') && time.startsWith('ok:')) ? 'ok|' + JSON.stringify(seen) : 'bad|' + puts + '|' + after + '|' + time + '|' + JSON.stringify(seen);
@@ -60,9 +60,9 @@ const run = (h, code) => { try { return 'ok:' + JSON.stringify(String(h.exec(cod
       // the budget was armed, or a grandchild, cannot run forever inside
       // interp eval.
       h.set_step_budget(200000);
-      const child = run(h, 'set c [interp]; catch {$c eval {while {1} {}}} m; set m');
+      const child = run(h, 'set c [interp create]; catch {$c eval {while {1} {}}} m; set m');
       h.set_step_budget(200000);
-      const grand = run(h, 'catch {$c eval {set g [interp]; $g eval {while {1} {}}}} m; set m');
+      const grand = run(h, 'catch {$c eval {set g [interp create]; $g eval {while {1} {}}}} m; set m');
       h.set_step_budget(0);
       const bounded = t => t.startsWith('ok:') && /step budget exceeded/.test(t);
       r = (bounded(child) && bounded(grand)) ? 'ok|bounded' : 'bad|' + child.slice(0, 60) + '|' + grand.slice(0, 60);
@@ -175,6 +175,26 @@ await check('silent: next outside a method',      'catch {::oo::Helpers::next} e
 // `interp alias {} name {} target prefix`: the alias came into being under
 // the target's name.
 await check('silent: interp alias with a prefix', 'proc t {a b} {list $a $b}; interp alias {} al {} t X; al Y', /ok:"X Y"/);
+
+// `interp hide`: gone from every table an invocation resolves through —
+// a body compiled before the hide included — until exposed again.
+await check('interp: a hidden command is not callable', 'interp create c; interp eval c {proc f {} {set x 1}}; interp hide c set; list [interp eval c {catch {f} e}] [interp invokehidden c set e] [interp hidden c] [interp eval c {info commands set}]', /ok:"1 \{invalid command name ..set..\} set ./);
+await check('interp: expose brings it back', 'interp create c; interp hide c set; interp expose c set myset; list [interp hidden c] [interp eval c {myset a 1}]', /ok:"\{\} 1"/);
+// A `-safe` interpreter: the commands that reach outside start hidden,
+// and its own `interp` lets none of them back.
+await check('interp: -safe hides and still computes', 'interp create s -safe; list [interp issafe s] [interp eval s {catch {interp hide {} clock} m o; dict get $o -errorcode}] [interp eval s {catch {interp invokehidden {} clock seconds} m o; dict get $o -errorcode}] [interp eval s {interp create k; interp issafe k}] [interp eval s {info exists env}] [interp eval s {expr 1 + 1}]', /ok:"1 \{TCL OPERATION INTERP UNSAFE\} \{TCL OPERATION INTERP UNSAFE\} 1 0 2"/);
+await check('interp: -safe cannot expose', 'interp create s -safe; interp eval s {interp create k; catch {interp expose k exec} m o; dict get $o -errorcode}', /TCL OPERATION INTERP UNSAFE/);
+// Aliases run their words in another interpreter; a loop of them is
+// refused as it is made, not run out.
+await check('interp: alias loop refused', 'interp create l4; interp alias l4 x {} y; catch {interp alias {} y l4 x} m o; dict get $o -errorcode', /TCL OPERATION INTERP ALIASLOOP/);
+await check('interp: self-target loop refused', 'catch {interp alias {} z {} z} m o; dict get $o -errorcode', /TCL OPERATION INTERP ALIASLOOP/);
+await check('interp: aliases between any two', 'interp create a; interp create b; interp alias a up {} set ::v; interp alias a side b set y; interp alias {} down a set q; list [interp eval a {up 7}] [interp eval a {side 5}] [down 3] [set ::v] [interp eval b {set y}] [interp eval a {set q}]', /ok:"7 5 3 7 5 3"/);
+await check('interp: alias into a grandchild', 'interp create s; interp eval s {interp create g}; interp alias {s g} ga {} set ::w 9; list [interp eval {s g} {ga}] [set ::w]', /ok:"9 9"/);
+await check('interp: target gone, alias gone', 'interp create a; interp create b; interp alias a t b set y 1; interp delete b; list [interp aliases a] [interp eval a {catch {t} m o; dict get $o -errorcode}]', /ok:"\{\} \{TCL LOOKUP COMMAND t\}"/);
+await check('interp: target error is the caller', 'interp create a; interp alias a e {} error deep; interp eval a {catch {e} m o; dict get $o -errorinfo}', /ok:"deep.n    invoked from within.n..e.."/);
+await check('interp: no delete while evaluated', 'interp create d; interp alias d w {} interp delete d; interp eval d w', /cannot delete interpreter/);
+await check('interp: renamed interpreter command', 'interp create s; rename s s2; list [s2 eval {expr 1 + 1}] [interp exists s] [interp delete s] [interp exists s]', /ok:"2 1 \{\} 0"/);
+await check('interp: eval of a missing one', 'catch {interp eval nope x} m o; dict get $o -errorcode', /TCL LOOKUP INTERP nope/);
 
 // A child interpreter starts from its parent: the host's console and
 // clock, and the limits (a counter of its own ran forever in a budget).

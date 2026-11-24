@@ -4836,6 +4836,11 @@ impl Interp {
         for k in self.ensembles.keys() {
             shadowed(k, false);
         }
+        // A hidden command must not be folded into compiled code either:
+        // the fold would keep `set` working after `interp hide … set`.
+        for k in self.hidden_cmds.keys() {
+            shadowed(k, false);
+        }
         out
     }
 

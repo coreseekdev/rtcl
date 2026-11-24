@@ -126,6 +126,9 @@ rename 遮蔽过程后旧名解析、`interp alias {} name {} target` 形式、
 只有约 1MiB，1000 层会栈溢出 trap 并让实例永久不可用，而不是 Tcl 的
 可捕获错误。宿主用 `RtclHandle::set_recursion_limit(n)` 调整；栈比
 主线程小的原生宿主用 `Interp::set_max_call_depth`（约 5000 字节/层）。
+这个 1000 的计数口径与 tclsh 不同：命令替换和 `if`/`foreach` 的体也各占
+一层，所以常见的 proc 递归实际能到约 496 层（`foreach` 体内递归约 330），
+tclsh 约 996——超限同样报 `too many nested evaluations`，不是崩溃。
 同理有硬上限的还有：表达式嵌套 250 层、命令替换嵌套 1000 层、正则
 分组嵌套 250 层与编译空间预算、JSON 嵌套 1000 层——超限一律报错。
 详见 `specs/CODE-AUDIT-20261123.md`。

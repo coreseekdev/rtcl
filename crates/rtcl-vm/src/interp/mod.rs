@@ -1045,12 +1045,38 @@ pub struct Interp {
     /// 调度即挂起、事件循环（update/vwait）泵送、回调收累计数。
     #[cfg(feature = "std")]
     pub(crate) copy_jobs: Vec<commands::chan_io::ChanCopyJob>,
-    /// Child interpreter table for `interp` command.
+    /// Child interpreter table for `interp` command, keyed by the
+    /// interpreter's name.  `None` while the interpreter is
+    /// being evaluated (`interp eval` takes it out so that it and its
+    /// parent are two separate values; the evaluating frame owns it) —
+    /// the name still exists meanwhile.
     #[cfg(feature = "std")]
-    pub(crate) child_interps: HashMap<String, Box<Interp>>,
-    /// Next child interpreter ID counter.
+    pub(crate) child_interps: HashMap<String, Option<Box<Interp>>>,
+    /// Commands `interp hide` took away.  Hidden means gone from every
+    /// table an invocation resolves through — a script in this
+    /// interpreter gets `invalid command name` — until `interp expose`
+    /// puts them back; only the master's `interp invokehidden` reaches
+    /// them meanwhile.  ([`Interp::hidden_commands`] is another thing:
+    /// a listing filter for host bridges, invokable as ever.)
+    pub(crate) hidden_cmds: HashMap<String, commands::interp_cmd::HiddenCmd>,
+    /// `interp create -safe`: the commands that could reach outside
+    /// this interpreter are hidden.
+    pub(crate) is_safe: bool,
+    /// Aliases whose words run in another interpreter (`interp alias
+    /// this name {} target …`): the command name and where the words run.
+    pub(crate) cross_aliases: HashMap<String, commands::interp_cmd::CrossAlias>,
+    /// The interpreter whose table this one is in — null for the one no
+    /// other holds.  A child lives inside its parent, so the pointer is
+    /// good for as long as this interpreter is.
     #[cfg(feature = "std")]
-    pub(crate) next_interp_id: u64,
+    pub(crate) owner: *mut Interp,
+    /// An alias renamed in this interpreter: the name it was made under
+    /// (which still names it, tclsh's alias token) → the key it is under.
+    pub(crate) alias_tokens: HashMap<String, String>,
+    /// The command of each child interpreter, by the name it goes by —
+    /// it follows a `rename` — to the interpreter's name in the table.
+    #[cfg(feature = "std")]
+    pub(crate) interp_path_names: HashMap<String, String>,
     /// One-shot variable-link list for the next `call_proc` frame: the OO
     /// method dispatcher hands its owner's `variable` declarations over
     /// and `call_proc` installs the links at frame setup — the same
@@ -1191,6 +1217,12 @@ impl Interp {
             current_namespace: Rc::from("::"),
             cmd_lookup_ns: None,
             cmd_lookup_in: None,
+            hidden_cmds: HashMap::new(),
+            is_safe: false,
+            cross_aliases: HashMap::new(),
+            owner: std::ptr::null_mut(),
+            alias_tokens: HashMap::new(),
+            interp_path_names: HashMap::new(),
             // No instance: a value no host hands out.
             host_instance_id: u64::MAX,
             ns_root: Rc::from("::"),
@@ -1248,7 +1280,6 @@ impl Interp {
             #[cfg(feature = "std")]
             child_interps: HashMap::new(),
             #[cfg(feature = "std")]
-            next_interp_id: 1,
             frame_level0_args: None,
             frame_prelink: None,
             oo: commands::oo::OoState::default(),
@@ -1404,7 +1435,7 @@ impl Interp {
         self.steps.set(0);
         self.max_steps = max;
         // The children share the counter; they get the new bound too.
-        for child in self.child_interps.values_mut() {
+        for child in self.child_interps.values_mut().flatten() {
             child.max_steps = max;
         }
     }
@@ -1422,7 +1453,7 @@ impl Interp {
     pub fn set_max_call_depth(&mut self, max: usize) {
         self.max_call_depth = max.max(1);
         // Children never get to recurse deeper than their parent.
-        for child in self.child_interps.values_mut() {
+        for child in self.child_interps.values_mut().flatten() {
             child.max_call_depth = self.max_call_depth;
         }
     }

@@ -348,11 +348,21 @@ judge/sweep 同跑）。下面只列**结构**动作：按类别消除，而不�
   失败路径 kill+wait；`close` 对连接中的 async socket 直接丢弃；
   `file tempfile` 用 `create_new` + 0600；`file delete` 非 `-force`
   只删空目录；`-async` fd 加 `SOCK_CLOEXEC`。
-- [ ] **M6 能力模型**（S23–S27）：真正的隐藏命令表（解析期拒绝，
-  `invokehidden` 才可调）+ per-instance 令牌（dynmod 分发校验）+
-  子解释器继承限额与宿主服务 + `exec` 入口检测半途状态并复位。
-- [ ] **工具化防线**：`judge/crash-gate.sh` 入门禁（已入：原生 108 次
-  运行、wasm `judge/crash-wasm.mjs` 35 项带 worker 看门狗）；**排查
+- [x] **M6 能力模型**（S24–S27）——已完成：`_js_dispatch` 按调用它的
+  解释器找回调（S24）；子解释器继承宿主的控制台与时钟、步数计数器
+  整个家族共用、递归上限不高于父（S25）；`interp` 命令族按 tclsh
+  `tclInterp.c` 重做——路径、`create ?-safe?`、`$path` 自身的命令、
+  hide/expose/hidden/invokehidden（S26、S27、C29），别名的目标可以是
+  父、自身或兄弟解释器，别名环在建立与 rename 时拒绝；安全解释器里
+  `hide/expose/invokehidden/marktrusted` 一律拒绝。门禁：探针 d21
+  （295 条断言，两引擎）、`crash-wasm.mjs` 52 项。
+  - [ ] 余项：S23（栈溢出后实例失效，未修）；`interp limit`、
+    `bgerror` 设置、`cancel`、`share`、`transfer` 未建；C32 宿主 exec
+    路径；C35–C39（见审计文档；C39 是有效递归深度只有 tclsh 的一半）。
+    原计划里的「`exec` 入口检测半途状态并复位」没有对应的缺陷：M5
+    重写后的 exec 没有跨调用的持久状态（d19 探针覆盖成功与失败交替）。
+- [ ] **工具化防线**：`judge/crash-gate.sh` 入门禁（已入：原生 114 次
+  运行、wasm `judge/crash-wasm.mjs` 52 项带 worker 看门狗）；**排查
   其余探针是否也在两个解释器上共同早退而空转**（`smallface_p24` 是）；`rtcl-vm` 开
   clippy `unwrap_used` / `indexing_slicing` / `arithmetic_side_effects`
   （先按文件棘轮，再全量）；`judge/panic-census.sh` 的计数只许降。

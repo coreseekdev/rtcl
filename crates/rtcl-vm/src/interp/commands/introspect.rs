@@ -102,9 +102,15 @@ pub fn cmd_alias(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 }
 
 /// Alias dispatch function — looks up the alias definition and calls the target.
-fn alias_dispatch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+pub(crate) fn alias_dispatch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let name = args[0].as_str();
-    let info = interp.aliases.get(name).cloned().ok_or_else(|| {
+    // Invoked under either spelling of its name (`x`, `::x`).
+    let info = interp
+        .aliases
+        .get(name)
+        .or_else(|| interp.aliases.get(&format!("::{}", name)))
+        .cloned()
+        .ok_or_else(|| {
         Error::runtime(format!("alias \"{}\" not found", name), ErrorCode::NotFound)
     })?;
 

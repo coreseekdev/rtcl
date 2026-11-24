@@ -28,7 +28,7 @@
 2. **没有资源治理层**。步数、内存、递归深度、时间默认无限或写死；
    分配失败走 Rust 的 abort 而不是 Tcl 错误（S21、S22、S28）。
 3. **没有能力模型**。危险命令只在编译期由 feature 裁剪，运行时无法
-   启停；没有 safe interp；dynmod 分派不校验实例身份（S24–S27）。
+   启停；没有 safe interp；dynmod 分派不校验实例身份（S24–S27——M6 已修）。
 4. **panic 无兜底，也没有压数量的防线**。全仓没有 `catch_unwind`，
    `judge/panic-census.sh` 统计生产路径 513 处 panic 点；没有 CI、
    没有 fuzz（S1–S10、S29、S30）。
@@ -89,8 +89,8 @@
 
 | # | 问题 | 位置 | 处置 |
 |---|---|---|---|
-| S26 | 没有 safe interp；`interp create -safe` 报错，子解释器带全部命令 | `commands/interp_cmd.rs` | 未修 |
-| S27 | `hide_command` 只从 `info commands` 隐身，脚本照常可调 | `interp/mod.rs` | 未修 |
+| S26 | 没有 safe interp；`interp create -safe` 报错，子解释器带全部命令 | `commands/interp_cmd.rs` | 已修（M6）：`interp` 命令族按 tclsh `tclInterp.c` 重做。路径是列表（`{a b}` 是 a 里的 b，空路径是当前解释器）；`interp create ?-safe? ?--? ?path?`（`-safe` 可在路径之后，默认名 `interp0`）、解释器自身的命令（`$path eval/hide/…`）、`delete/exists/slaves(children)/eval/issafe/recursionlimit/marktrusted/debug`。`-safe`：隐藏 tclsh 的清单加上 rtcl 自有的 `auto_*`、`job`、`wait`、`http`，去掉 `env`、`tcl_platform(os/osVersion/machine/user)`、库路径变量和三个标准通道，`clock` 改成指向父解释器的别名；安全解释器里的 `interp` 仍可用，但只能建安全子解释器，`hide/expose/invokehidden/marktrusted` 与改递归上限一律 `permission denied…` + `TCL OPERATION INTERP UNSAFE`。有意保留的差异：不删正在求值的解释器（或其下有正在求值的）；`interp limit`、`bgerror` 的设置、`cancel`、`share`、`transfer` 未建（明确报 not supported）。探针 d21（295 条断言，期望值即 tclsh 8.6.17 的输出）两引擎全过 |
+| S27 | `hide_command` 只从 `info commands` 隐身，脚本照常可调 | `interp/mod.rs` | 已修（M6）：`interp hide` 把命令从 `commands`/`procs`/`ensembles` 里真正拿走，按 token 放进 `hidden_cmds`，编译缓存同步失效——隐藏 `set` 之后，隐藏前编译的 proc、之后编译的 proc、顶层脚本都报 `invalid command name "set"`；只有 `interp invokehidden` 能调，`interp expose` 放回（可换名，重名报 `exposed command "x" already exists`）。`hide/expose/hidden/invokehidden` 的消息与 errorCode 逐项对齐 tclsh。宿主桥用的 `Interp::hide_command`（只影响列表）保留，文档写明它不是隔离手段 |
 | S28 | 步数预算默认无限，CLI 与 wasm 都没暴露；`timerate {} N`、`::tcl::unsupported::assemble` 可旁路 | `interp/mod.rs` | 已修（M3） |
 | S29 | 环境含非 UTF-8 变量时 `Interp::new()` panic | `interp/mod.rs` | 已修（M3） |
 | S30 | release `panic = "abort"`，全仓无 `catch_unwind` | `Cargo.toml` | 未修 |
@@ -141,12 +141,17 @@
 | C26 | （第二批）`::tcl::unsupported::assemble` 的 errorCode：`TCL OPERATION ASSEMBLE BADLABEL/BADINSTR` 或 NONE；tclsh 是 `TCL ASSEM BADSTACK`、`TCL ASSEM NOLABEL @x`、`TCL ASSEM DUPLABEL @x`、`TCL LOOKUP INDEX instruction <名>` | `commands/misc.rs` | 已修（M4） |
 | C27 | （第二批）expr 解析错误的 `-errorstack` 沿用上一个错误的条目（没有重置、INNER 没落） | `interp/eval.rs` `eval_expr` | 已修（M4） |
 | C28 | （第二批）proc 内 `namespace eval … { tailcall … }`：tclsh 报 `tailcall can only be called from a proc, lambda or method`，rtcl 照常执行 | `interp/call.rs` | 未修 |
-| C29 | （第二批）rtcl 没有默认 `bgerror` proc（tclsh 的 init.tcl 提供）；`interp` 命令是 jimtcl 模型——裸 `interp` 创建子解释器并返回 `interp#N` 句柄，没有 `interp create/slaves/eval/delete/exists/expose/hide/hidden/invokehidden/limit/recursionlimit`（与 S25/S26 同源） | `commands/interp_cmd.rs` | 未修：归入 M6 |
+| C29 | （第二批）rtcl 没有默认 `bgerror` proc（tclsh 的 init.tcl 提供）；`interp` 命令是 jimtcl 模型——裸 `interp` 创建子解释器并返回 `interp#N` 句柄，没有 `interp create/slaves/eval/delete/exists/expose/hide/hidden/invokehidden/limit/recursionlimit`（与 S25/S26 同源） | `commands/interp_cmd.rs` | 已修（M6）：`interp` 改为 tclsh 模型（见 S26）。别名 `interp alias 从 名 ?主路径? 目标 ?前缀…?` 的目标可以是父解释器（空路径）、自身或兄弟解释器，错误原样带回调用方（errorInfo 在调用处记 `invoked from within`）；跨解释器的别名环在建立与 `rename` 时拒绝（`cannot define or rename alias "x": would create a loop`）；删除目标解释器时一并删掉指向它的别名；解释器自己的命令被 rename 后仍可用。默认 `bgerror` proc 仍未提供（`::tcl::Bgerror` 在） |
 | C30 | （M5）exec 的错误语义与 tclsh 不同：子进程写了 stderr（未重定向、未 `-ignorestderr`）tclsh 让 exec **报错**、消息 = stdout + stderr（`catch {exec …} msg` 取 stderr 是 Tcl 惯用法），rtcl 把 stderr 打到自己的 stderr 并返回成功；失败消息多了 `(exit code N)`、stdout 与原因之间缺换行；被信号杀死 tclsh 报 `child killed: <描述>` + `CHILDKILLED pid SIGNAME {描述}`，rtcl 当成退出码 1；成功时 rtcl 把 `::errorCode` 清成 NONE（tclsh 不动）；重定向失败的消息与 `POSIX ENOENT …` errorCode 不同；非 UTF-8 字节 tclsh 逐个映射成同值的 Unicode 字符。语料与探针里没有任何 exec 调用，所以一直没被看见 | `commands/exec_cmd.rs` `cmd_exec` | 已修（M5）：按 `TclCleanupChildren` 与实测重写了原生路径的参数扫描、管道搭建与收尾（探针 d19，42 条断言在 tclsh 上同样全过）。一并对齐：`2>@1` 两流共用一根管道（保持写出顺序）、重定向在 spawn 之前按命令行顺序打开、目标可连写在操作符后（`2>/dev/null`）、CR LF 与孤立 CR 按换行处理、开关不接受缩写、各语法错误的 errorCode、子进程继承调用方的 stdin、中途失败时已启动的子进程分离而不是杀掉 |
 | C31 | （M5）`@通道` 重定向（`exec cmd 2>@ stderr`、`>@ $chan`、`<@ $chan`、`>>@`、`2>>@`、`>&@`）：tclsh 把通道的描述符传给子进程；rtcl 原来把这些词当普通参数传给命令（静默出错）。一度改成明确报错 | `commands/exec_cmd.rs`、`channel.rs` | 已修（M5）：`Channel::dup_for_child` 给出描述符的副本（文件、TCP、标准流、管道通道），文件通道的副本共享位置；未知通道 `can not find channel named` + `TCL LOOKUP CHANNEL`，方向不对 `channel "x" wasn't opened for writing/reading` + `TCL OPERATION EXEC BADCHAN`。已知差异：`>>@ chan` 时 tclsh 8.6.17 会**丢掉**子进程的输出，rtcl 追加在通道已有内容之后。带宿主 HostExec 的路径仍不支持（明确报错） |
 | C32 | （M5）带宿主 `HostExec` 的 exec 路径（`cmd_exec_host`，注入了宿主的 wasm 环境走它）仍是旧语义：stderr 不使 exec 失败、`(exit code N)`、成功时清 `::errorCode`、`bad switch` | `commands/exec_cmd.rs` `cmd_exec_host` | 未修 |
 | C33 | （M5）`file` 命令的零散缺口：`file attributes` 完全没有实现（`bad option "attributes"`）；`file normalize ~user` 不查用户（tclsh 报 `user "…" doesn't exist` / `TCL VALUE PATH NOUSER`，存在的用户展开到家目录）；`socket -server` 不支持（`server sockets are not supported in rtcl`） | `commands/io.rs`、`channel.rs` | 未修 |
 | C34 | （M5）`file rename` 跨文件系统直接失败（`Invalid cross-device link`；tclsh 复制后删除）。一并对齐了的：目标 是目录时移入其中、源不存在与已存在的消息和 `POSIX` 码、`mkdir`/`copy` 的消息（原来是 Rust 的 `No such file or directory (os error 2)` 且没有 errorCode） | `commands/io.rs` | 部分已修（M5）；跨文件系统未修 |
+| C35 | （M6）`tcl_hash`（Tcl 字符串哈希的移植）用普通 `+`：键长到 22 个字符即 u64 溢出。release 回绕（与 C 的无符号运算一致），debug 构建直接 panic——`array names env`、`unset env` 这类要给元素名排插入序的操作，在单元测试里一碰长环境变量名就崩 | `interp/tclhash.rs` | 已修（M6）：`wrapping_add` |
+| C36 | （M6）`exec` 不带参数报 `wrong # args: should be "exec exec ?switches? arg ?arg ...?"`（命令名重复，用法文本过时）；只有重定向、没有命令时报 `no command given`，tclsh 是 `illegal use of | or |& in command` + `TCL OPERATION EXEC PIPESYNTAX` | `commands/exec_cmd.rs` | 已修（M6，原生路径）；宿主路径未动（C32） |
+| C37 | （M6）`rename` 一个不存在的命令只报消息，不设 `::errorCode`（tclsh：`TCL LOOKUP COMMAND <名>`） | `commands/proc.rs` `cmd_rename` | 已修（M6） |
+| C39 | （M6，实测）有效递归深度只有 tclsh 的一半到三分之一：`interp recursionlimit` 报 1000，但 rtcl 的 proc 递归每层还把命令替换、`if`/`foreach` 体计入嵌套深度（tclsh 内联编译的都不计，只有 proc 调用计一层）。二分实测的最大深度，tclsh / rtcl：`A [expr {$n-1}]` 996 / 496，`return [B [expr …]]` 996 / 496，`foreach` 体内递归 996 / 330，`eval {E …}` 498 / 331（rtcl 两引擎一致）。经别名重入时两引擎不一样：`r 400` 字节码引擎通过，树引擎到上限 | `interp/eval.rs` `enter_nested`、`call.rs` | 未修（记录）：两个引擎都用 Rust 递归求命令替换，这个计数同时是栈溢出的防线；要对齐得先把嵌套上限与调用深度分开计量，并确认每层的栈用量 |
+| C38 | （M6，已知差异）别名目标的 wrong-args 消息里的命令名：tclsh 自己不一致（目标是父解释器时写别名名 `pc varName ?newValue?`，是兄弟解释器时写目标名 `set varName ?newValue?`），rtcl 一律写目标名；跨解释器别名的 `-errorstack`（TIP 356）INNER 条目与 tclsh 不同；安全解释器没有 `::tcl::mathfunc::min/max` 别名（rtcl 这两个是内建，`interp aliases` 只列 `clock`） | `commands/interp_cmd.rs` | 未修（记录） |
 | C13 | 修复过程中新查出：`json encode` 的 schema 文本按词递归（`list list list …` 重复几万次即栈溢出），JSON 解码的递归下降无深度上限 | `commands/json.rs` | 已修（M2）：文档与 schema 的嵌套上限 1000，超限报错 |
 
 ## P2：性能（`TODO.md` 未列，本机单次实测，只看量级）
@@ -232,6 +237,16 @@
   输出落文件。
 - M5 文件操作：S34–S37 全部修掉，新增 d20（33 条断言，tclsh 上同样
   全过）。crash-gate 至此 **112 次运行 112 过**。
+- M6（能力模型）：`interp` 命令族按 tclsh 源码（`tclInterp.c`）重做，
+  对照探针 315 行逐项与 tclsh 8.6.17 比过；剩余差异只有哈希表顺序、
+  rtcl 自带的命令集合和四处有意保留的差别（见 S26、C38）。探针 d21
+  （295 条断言，期望值由 `_gen_d21.tcl` 跑 tclsh 生成）使 crash-gate
+  到 **114 次运行 114 过**。单元测试顺带抓到 C35。
+- M6 收尾：`judge/crash-wasm.mjs` 39 → **52 项**全过（隐藏命令不可调、
+  `-safe` 的隐藏与拒绝、别名环被拒、任意两个解释器之间的别名、孙解释器
+  的别名、目标被删、错误原样带回调用方、求值中不可删、rename 后的
+  解释器命令）。原来用裸 `[interp]` 建子解释器的两项检查改用
+  `interp create`——裸 `interp` 现在是 tclsh 的 arity 错误。
 - M6（wasm 隔离）：`judge/crash-wasm.mjs` 35 → **39 项**全过（跨实例
   `_js_dispatch`、不可拼写的注册名、子解释器继承宿主服务且不 trap、
   步数预算覆盖子解释器）。

@@ -23,7 +23,9 @@ pub(crate) fn tcl_hash(key: &str) -> u64 {
     }
     let mut result = bytes[0] as u64;
     for &b in &bytes[1..] {
-        result += (result << 3) + b as u64;
+        // C's unsigned arithmetic wraps past 9^21: so does this (a plain
+        // `+` would panic on a key of 22 characters in a debug build).
+        result = result.wrapping_add(result.wrapping_shl(3).wrapping_add(b as u64));
     }
     result
 }

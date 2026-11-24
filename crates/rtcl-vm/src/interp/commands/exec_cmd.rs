@@ -382,9 +382,9 @@ pub(crate) fn raw_status(status: std::process::ExitStatus) -> i32 {
 pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     interp.reap_background_children();
     if args.len() < 2 {
-        return Err(Error::wrong_args_with_usage(
-            "exec", 2, args.len(), "exec ?switches? arg ?arg ...?",
-        ));
+        // Bare: the registry's usage text completes it (tclsh: `exec
+        // ?-option ...? arg ?arg ...?`).
+        return Err(Error::wrong_args(args[0].as_str(), 2, args.len()));
     }
 
     // Host-backed exec（rogo）：外部命令是 wasm，所有 I/O 走 fd 表。
@@ -422,9 +422,7 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     if i >= args.len() {
-        return Err(Error::wrong_args_with_usage(
-            "exec", 2, args.len(), "exec ?switches? arg ?arg ...?",
-        ));
+        return Err(Error::wrong_args(args[0].as_str(), 2, args.len()));
     }
 
     // Split the remaining arguments at pipe tokens ("|" and "|&") into stages.
@@ -608,7 +606,13 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     if stages.is_empty() {
-        return Err(exec_err_str("no command given"));
+        // Redirections, but no command anywhere (tclsh: the same error
+        // as a misplaced `|`).
+        return Err(exec_usage_error(
+            interp,
+            "illegal use of | or |& in command",
+            "TCL OPERATION EXEC PIPESYNTAX",
+        ));
     }
 
     // Every redirection is opened before any process starts, in

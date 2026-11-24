@@ -1047,14 +1047,17 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Command names resolve through the same fallback chain dispatch uses:
     // exact, namespace-qualified, then `::`-prefixed (tclsh: `rename
     // nb::pp nb::qq` finds the proc registered as `::nb::pp`).
-    let old_key = resolve_command_key(interp, &old_name)
-        .ok_or_else(|| {
-            // tclsh: can't rename "name": command doesn't exist
-            Error::runtime(
-                format!("can't rename \"{}\": command doesn't exist", old_name),
-                crate::error::ErrorCode::NotFound,
-            )
-        })?;
+    let old_key = resolve_command_key(interp, &old_name).ok_or_else(|| {
+        // tclsh: can't rename "name": command doesn't exist
+        super::list::set_error_code(
+            interp,
+            &format!("TCL LOOKUP COMMAND {}", old_name),
+        );
+        Error::runtime(
+            format!("can't rename \"{}\": command doesn't exist", old_name),
+            crate::error::ErrorCode::NotFound,
+        )
+    })?;
     let new_key = if new_name.is_empty() {
         String::new()
     } else if new_name.contains("::") || interp.current_namespace.as_ref() != "::" {
@@ -1143,6 +1146,13 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // Rename in builtins
     if let Some(func) = interp.commands.remove(&old_key) {
+        // An interpreter's command and an alias's record belong to the
+        // command, not to its name (tclsh): they move with it — or, for an
+        // alias, the rename is refused when it would close a loop.
+        if let Err(e) = super::interp_cmd::rename_bound(interp, &old_key, &new_key, func) {
+            interp.commands.insert(old_key.clone(), func);
+            return Err(e);
+        }
         let cat = interp.command_categories.remove(&old_key);
         let meta = interp.command_meta.remove(&old_key);
         if !new_key.is_empty() {
@@ -1219,6 +1229,11 @@ pub fn cmd_rename(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Ok(Value::empty());
     }
 
+    // tclsh: can't rename "name": command doesn't exist
+    super::list::set_error_code(
+        interp,
+        &format!("TCL LOOKUP COMMAND {}", crate::value::tcl_quote(&old_name)),
+    );
     Err(Error::runtime(
         format!("can't rename \"{}\": command doesn't exist", old_name),
         crate::error::ErrorCode::NotFound,

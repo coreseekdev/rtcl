@@ -75,6 +75,13 @@ Notes:
   dispatch bridge goes by the instance it runs on — it used to take the
   instance id as a script argument, and a script on one handle could call
   a callback registered on another (`judge/crash-wasm.mjs` has the check).
+- `interp create -safe` is tclsh's: in the child the commands that reach
+  outside (`open`, `file`, `socket`, `source`, …) are hidden, `env` and
+  the standard channels are gone, and the child's own `interp` cannot let
+  any of it back (`interp hide` / `expose` / `invokehidden` are refused).
+  It confines *a child interpreter's script*, inside one instance: the
+  limits above and the Worker advice below still apply — a trap raised
+  from a safe interpreter is a trap of the whole handle.
 - `register_command` defines a real Tcl `proc` wrapper, so `rename`,
   `info commands`, etc. behave naturally. The name must be one Tcl word:
   braces and backslashes in it are refused.

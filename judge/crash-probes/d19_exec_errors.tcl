@@ -96,6 +96,23 @@ chk lone-cr [exec sh -c {printf 'A\rB\n'}] {A
 B}
 chk bytes [lmap ch [split [exec sh -c {printf 'A\377B\200\303\264'}] ""] {format %x [scan $ch %c]}] {41 ff 42 80 f4}
 
+# @channel redirections: the child gets the channel's own descriptor
+set c [open $tmp.chan w]
+exec echo hi >@ $c
+close $c
+chk channel-out [exec cat $tmp.chan] hi
+chk channel-bad [T {exec echo hi >@ nosuchchan-rtcl}] {1 {can not find channel named "nosuchchan-rtcl"} {TCL LOOKUP CHANNEL nosuchchan-rtcl}}
+set c [open $tmp.chan r]
+chk channel-direction [T [list exec echo hi >@ $c]] [list 1 "channel \"$c\" wasn't opened for writing" {TCL OPERATION EXEC BADCHAN}]
+set c2 [open $tmp.chan w]
+chk channel-input [T [list exec cat <@ $c2]] [list 1 "channel \"$c2\" wasn't opened for reading" {TCL OPERATION EXEC BADCHAN}]
+close $c
+close $c2
+chk channel-last-word [T {exec echo hi >@}] {1 {can't specify ">@" as last word in command} {TCL OPERATION EXEC SYNTAX}}
+chk channel-stderr [lrange [T {exec sh -c {echo O; echo E >&2} 2>@ stderr}] 0 1] {0 O}
+chk channel-stdout [lrange [T {exec echo hi >@ stdout}] 0 1] {0 {}}
+file delete $tmp.chan
+
 # stdin: a file, a `<<` string, and the pipe from the previous stage
 set f [open $tmp.in w]
 puts -nonewline $f "l1\nl2\n"

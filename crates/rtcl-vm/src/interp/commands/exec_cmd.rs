@@ -439,7 +439,7 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     // The redirections in command-line order: tclsh opens them before it
     // starts any process.
-    let mut redirects: Vec<(Stream, bool, String)> = Vec::new();
+    let mut redirects: Vec<Redirect> = Vec::new();
     let syntax_error = |interp: &mut Interp, token: &str| {
         exec_usage_error(
             interp,
@@ -478,12 +478,50 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             i += 1;
             continue;
         };
-        if attached.starts_with('@') || op.ends_with('@') {
-            // TODO(M5-a3): tclsh passes the child the channel's descriptor.
-            return Err(exec_err_str(format!(
-                "redirection to a channel is not supported: \"{}\"",
-                token
-            )));
+        if op.ends_with('@') {
+            // The child gets the channel's own descriptor.
+            let name: String = if !attached.is_empty() {
+                attached.to_string()
+            } else {
+                match args.get(i + 1) {
+                    Some(t) => t.as_str().to_string(),
+                    None => {
+                        return Err(exec_usage_error(
+                            interp,
+                            format!("can't specify \"{}\" as last word in command", op),
+                            "TCL OPERATION EXEC SYNTAX",
+                        ));
+                    }
+                }
+            };
+            let append = op.starts_with(">>") || op == "2>>@" || op == ">>&@";
+            let mut to = |stream: Stream| Redirect {
+                stream,
+                append,
+                target: Target::Channel(name.clone()),
+            };
+            match op {
+                "<@" => {
+                    redirects.push(to(Stream::In));
+                    input_redirect = Some(InputRedirect::Channel);
+                }
+                ">@" | ">>@" => {
+                    redirects.push(to(Stream::Out));
+                    output_redirect = Some(OutputRedirect::Channel);
+                }
+                ">&@" | ">>&@" => {
+                    redirects.push(to(Stream::Out));
+                    redirects.push(to(Stream::Err));
+                    output_redirect = Some(OutputRedirect::Channel);
+                    stderr_redirect = Some(StderrRedirect::Channel);
+                }
+                _ => {
+                    redirects.push(to(Stream::Err));
+                    stderr_redirect = Some(StderrRedirect::Channel);
+                }
+            }
+            i += if attached.is_empty() { 2 } else { 1 };
+            continue;
         }
         if op == "2>@1" {
             // It has no target, and redirects the last stage's output:
@@ -513,7 +551,11 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
             }
         };
-        let to = |stream: Stream, append: bool, path: &str| (stream, append, path.to_string());
+        let to = |stream: Stream, append: bool, path: &str| Redirect {
+            stream,
+            append,
+            target: Target::File(path.to_string()),
+        };
         match op {
             "<" => {
                 redirects.push(to(Stream::In, false, &target));
@@ -573,33 +615,72 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // command-line order: the first that fails is the error, and nothing
     // has run yet.
     let (mut input_file, mut output_file, mut stderr_file) = (None, None, None);
-    for &(stream, append, ref path) in &redirects {
-        let writing = stream != Stream::In;
-        let opened = if !writing {
-            std::fs::File::open(path)
-        } else if append {
-            std::fs::OpenOptions::new().append(true).create(true).open(path)
-        } else {
-            std::fs::File::create(path)
-        };
-        let file = match opened {
-            Ok(f) => f,
-            Err(e) => {
-                return Err(super::io::posix_error(
-                    interp,
-                    format!(
-                        "couldn't {} file \"{}\"",
-                        if writing { "write" } else { "read" },
-                        path
-                    ),
-                    &e,
-                ));
+    // A redirection to a channel gives the child a duplicate of its
+    // descriptor (`exec … >@ stdout`, `<@ $chan`).
+    let (mut input_fd, mut output_fd, mut stderr_fd): (
+        Option<std::os::fd::OwnedFd>,
+        Option<std::os::fd::OwnedFd>,
+        Option<std::os::fd::OwnedFd>,
+    ) = (None, None, None);
+    for r in &redirects {
+        let writing = r.stream != Stream::In;
+        match &r.target {
+            Target::File(path) => {
+                let opened = if !writing {
+                    std::fs::File::open(path)
+                } else if r.append {
+                    std::fs::OpenOptions::new().append(true).create(true).open(path)
+                } else {
+                    std::fs::File::create(path)
+                };
+                let file = match opened {
+                    Ok(f) => f,
+                    Err(e) => {
+                        return Err(super::io::posix_error(
+                            interp,
+                            format!(
+                                "couldn't {} file \"{}\"",
+                                if writing { "write" } else { "read" },
+                                path
+                            ),
+                            &e,
+                        ));
+                    }
+                };
+                match r.stream {
+                    Stream::In => input_file = Some(file),
+                    Stream::Out => output_file = Some(file),
+                    Stream::Err => stderr_file = Some(file),
+                }
             }
-        };
-        match stream {
-            Stream::In => input_file = Some(file),
-            Stream::Out => output_file = Some(file),
-            Stream::Err => stderr_file = Some(file),
+            Target::Channel(name) => {
+                let fd = interp.channels.fd_for_child(name, writing);
+                let fd = match fd {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        return Err(match e.kind() {
+                            std::io::ErrorKind::NotFound => exec_usage_error(
+                                interp,
+                                e.to_string(),
+                                &format!("TCL LOOKUP CHANNEL {}", name),
+                            ),
+                            std::io::ErrorKind::PermissionDenied => {
+                                exec_usage_error(interp, e.to_string(), "TCL OPERATION EXEC BADCHAN")
+                            }
+                            _ => super::io::posix_error(
+                                interp,
+                                format!("couldn't duplicate the descriptor of channel \"{}\"", name),
+                                &e,
+                            ),
+                        });
+                    }
+                };
+                match r.stream {
+                    Stream::In => input_fd = Some(fd),
+                    Stream::Out => output_fd = Some(fd),
+                    Stream::Err => stderr_fd = Some(fd),
+                }
+            }
         }
     }
     fn clone_file(interp: &mut Interp, f: &std::fs::File) -> Result<std::fs::File> {
@@ -635,6 +716,8 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if stage_idx == 0 {
             if let Some(f) = input_file.take() {
                 cmd.stdin(f);
+            } else if let Some(fd) = input_fd.take() {
+                cmd.stdin(Stdio::from(fd));
             } else if matches!(input_redirect, Some(InputRedirect::String(_))) {
                 // Fed by a helper thread once the child exists.
                 cmd.stdin(Stdio::piped());
@@ -667,6 +750,8 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if let Some(e) = for_stderr {
                 cmd.stderr(e);
             }
+        } else if let Some(fd) = output_fd.take() {
+            cmd.stdout(Stdio::from(fd));
         } else if matches!(stderr_redirect, Some(StderrRedirect::ToStdout)) && !background {
             let (read_end, write_end) = pipe(interp)?;
             let for_stderr = clone_file(interp, &write_end)?;
@@ -682,6 +767,8 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if is_last && !matches!(stderr_redirect, Some(StderrRedirect::ToStdout)) {
             if let Some(f) = stderr_file.take() {
                 cmd.stderr(f);
+            } else if let Some(fd) = stderr_fd.take() {
+                cmd.stderr(Stdio::from(fd));
             } else if !ignore_stderr && !background {
                 cmd.stderr(Stdio::piped());
             }
@@ -807,17 +894,48 @@ enum Stream {
 enum InputRedirect {
     File(String),
     String(String),
+    /// `<@ chan`: the channel's descriptor.
+    Channel,
 }
 
 enum OutputRedirect {
     Truncate(String),
     Append(String),
+    /// `>@ chan` / `>>@ chan`: the channel's descriptor.  The child
+    /// writes where the channel would (`>>@` after what it holds — a
+    /// duplicate shares the file's position; tclsh 8.6.17 loses the
+    /// child's output on the `>>@` forms instead).
+    Channel,
 }
 
 enum StderrRedirect {
     Truncate(String),
     Append(String),
     ToStdout,
+    /// `2>@ chan`: the channel's descriptor.
+    Channel,
+}
+
+/// What a redirection names: a file, or a channel the child gets the
+/// descriptor of (`>@ chan`, `<@ chan`).
+enum Target {
+    File(String),
+    Channel(String),
+}
+
+struct Redirect {
+    stream: Stream,
+    append: bool,
+    target: Target,
+}
+
+/// The host-backed `exec` runs on the host's own descriptor table: an
+/// interpreter channel (`exec … >@ chan`) has nothing there to give.
+fn host_channel_redirect() -> Error {
+    Error::runtime(
+        "redirection to a channel is not supported by the host's exec",
+        ErrorCode::InvalidOp,
+    )
 }
 
 /// Host-backed `exec`：每个 stage 构建完整 fd 表；阶段间用 pipe 的子进程侧
@@ -1004,6 +1122,11 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Some(InputRedirect::String(s)) => {
                     Box::new(BytesFd::new(s.as_bytes().to_vec()))
                 }
+                // The host's descriptors are its own: an interpreter
+                // channel has no counterpart to hand over.
+                Some(InputRedirect::Channel) => {
+                    return Err(host_channel_redirect())
+                }
                 None => Box::new(NullFd),
             });
         } else {
@@ -1016,9 +1139,11 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 let mode = match r {
                     OutputRedirect::Truncate(_) => FdMode::Write,
                     OutputRedirect::Append(_) => FdMode::Append,
+                    OutputRedirect::Channel => return Err(host_channel_redirect()),
                 };
                 let path = match r {
                     OutputRedirect::Truncate(p) | OutputRedirect::Append(p) => p,
+                    OutputRedirect::Channel => unreachable!("refused above"),
                 };
                 Some(host_open(fs, path, mode)?)
             } else {
@@ -1050,6 +1175,7 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Some(StderrRedirect::Truncate(p)) => Some(host_open(fs, p, FdMode::Write)?),
                 Some(StderrRedirect::Append(p)) => Some(host_open(fs, p, FdMode::Append)?),
                 Some(StderrRedirect::ToStdout) => stdout_dup,
+                Some(StderrRedirect::Channel) => return Err(host_channel_redirect()),
                 None if ignore_stderr => Some(Box::new(NullFd)),
                 None => {
                     let (r, w) = host.pipe().map_err(exec_err_str)?;

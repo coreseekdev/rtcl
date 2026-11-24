@@ -43,6 +43,14 @@ pub trait Channel: Send {
     fn close_at_exit(self: Box<Self>) -> io::Result<()> {
         self.close()
     }
+    /// A descriptor a child process can use in place of this stream —
+    /// `exec … >@ chan` hands it to the child.  `None` for a channel that
+    /// has no descriptor to give (one over memory).
+    #[cfg(unix)]
+    fn dup_for_child(&mut self, write: bool) -> io::Result<Option<std::os::fd::OwnedFd>> {
+        let _ = write;
+        Ok(None)
+    }
     fn is_readable(&self) -> bool;
     fn is_writable(&self) -> bool;
     /// Truncate a seekable, writable channel (`chan truncate`). The default
@@ -795,6 +803,19 @@ fn parse_posix_access(mode: &str) -> Option<PosixAccess> {
 /// ENOTCONN、close 仍成功）。connecting 期间 puts 进 `out_buf`（tclsh
 /// 的用户态写缓冲，-buffering full），flush/关通道才外送。
 #[cfg(feature = "net")]
+/// A duplicate of a raw descriptor, as a handle of its own: what a child
+/// process is given for a channel (`exec … >@ chan`).
+#[cfg(unix)]
+fn dup_raw(fd: std::os::unix::io::RawFd) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let dup = unsafe { libc::dup(fd) };
+    if dup < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `dup` is a fresh descriptor, owned from here on.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) })
+}
+
 pub struct TcpChannel {
     stream: Option<std::net::TcpStream>,
     /// `-async`：connect 已发起、未补齐（poll/SO_ERROR 待定）。
@@ -1186,6 +1207,25 @@ impl Channel for TcpChannel {
         }
         Ok(())
     }
+    #[cfg(unix)]
+    fn dup_for_child(&mut self, _write: bool) -> io::Result<Option<std::os::fd::OwnedFd>> {
+        // A connecting socket is waited for here: the child writes to it.
+        self.ensure_connected()?;
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| io::Error::from_raw_os_error(107))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            dup_raw(stream.as_raw_fd()).map(Some)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = stream;
+            Ok(None)
+        }
+    }
     fn is_readable(&self) -> bool {
         true
     }
@@ -1511,6 +1551,42 @@ impl ChannelTable {
         self.channels.get(id).map(|ch| ch.as_ref())
     }
 
+    /// The descriptor `exec` hands a child for `>@ chan` / `<@ chan`
+    /// (tclsh `FileForRedirect` with `@`).  The channel's buffered output
+    /// is flushed first, so the child's writes follow it.  `NotFound` is
+    /// an unknown channel, `PermissionDenied` one not open in that
+    /// direction.
+    #[cfg(unix)]
+    pub fn fd_for_child(&mut self, id: &str, write: bool) -> io::Result<std::os::fd::OwnedFd> {
+        let ch = self.channels.get_mut(id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("can not find channel named \"{}\"", id),
+            )
+        })?;
+        if write && !ch.is_writable() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("channel \"{}\" wasn't opened for writing", id),
+            ));
+        }
+        if !write && !ch.is_readable() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("channel \"{}\" wasn't opened for reading", id),
+            ));
+        }
+        if write {
+            ch.flush()?;
+        }
+        ch.dup_for_child(write)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("channel \"{}\" has no descriptor to give", id),
+            )
+        })
+    }
+
     pub fn close(&mut self, id: &str) -> io::Result<()> {
         self.close_with(id, false)
     }
@@ -1702,6 +1778,18 @@ impl Channel for OsStdin {
     fn eof(&self) -> bool { self.at_eof }
     fn set_at_eof(&mut self) { self.at_eof = true; }
     fn close(self: Box<Self>) -> io::Result<()> { Ok(()) }
+    #[cfg(unix)]
+    fn dup_for_child(&mut self, _write: bool) -> io::Result<Option<std::os::fd::OwnedFd>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            dup_raw(io::stdin().as_raw_fd()).map(Some)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(None)
+        }
+    }
     fn is_readable(&self) -> bool { true }
     fn is_writable(&self) -> bool { false }
     fn channel_type(&self) -> &'static str { "tty" }
@@ -1733,6 +1821,18 @@ impl Channel for OsStdout {
     }
     fn eof(&self) -> bool { false }
     fn close(self: Box<Self>) -> io::Result<()> { Ok(()) }
+    #[cfg(unix)]
+    fn dup_for_child(&mut self, _write: bool) -> io::Result<Option<std::os::fd::OwnedFd>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            dup_raw(io::stdout().as_raw_fd()).map(Some)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(None)
+        }
+    }
     fn is_readable(&self) -> bool { false }
     fn is_writable(&self) -> bool { true }
     fn channel_type(&self) -> &'static str { "tty" }
@@ -1763,6 +1863,18 @@ impl Channel for OsStderr {
     }
     fn eof(&self) -> bool { false }
     fn close(self: Box<Self>) -> io::Result<()> { Ok(()) }
+    #[cfg(unix)]
+    fn dup_for_child(&mut self, _write: bool) -> io::Result<Option<std::os::fd::OwnedFd>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            dup_raw(io::stderr().as_raw_fd()).map(Some)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(None)
+        }
+    }
     fn is_readable(&self) -> bool { false }
     fn is_writable(&self) -> bool { true }
     fn channel_type(&self) -> &'static str { "tty" }
@@ -1905,6 +2017,26 @@ impl Channel for FileChannel {
     fn eof(&self) -> bool { self.at_eof }
     fn set_at_eof(&mut self) { self.at_eof = true; }
     fn close(self: Box<Self>) -> io::Result<()> { Ok(()) }
+    #[cfg(unix)]
+    fn dup_for_child(&mut self, _write: bool) -> io::Result<Option<std::os::fd::OwnedFd>> {
+        // A duplicate shares the file's position: what the child writes
+        // lands where this channel would write it.
+        let file = match &self.mode {
+            FileMode::Read(reader) => reader.get_ref(),
+            FileMode::Write(file) => file,
+            FileMode::ReadWrite(reader) => reader.get_ref(),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            dup_raw(file.as_raw_fd()).map(Some)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            Ok(None)
+        }
+    }
     fn is_readable(&self) -> bool {
         !matches!(self.mode, FileMode::Write(_))
     }
@@ -2013,6 +2145,29 @@ impl Channel for PipeChannel {
         drop(self.writer.take());
         drop(self.reader.take());
         Ok(())
+    }
+    #[cfg(unix)]
+    fn dup_for_child(&mut self, write: bool) -> io::Result<Option<std::os::fd::OwnedFd>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // EBADF is as close as this comes to "no such stream".
+            let fd = if write {
+                self.writer.as_ref().ok_or_else(|| io::Error::from_raw_os_error(9))?.as_raw_fd()
+            } else {
+                self.reader
+                    .as_ref()
+                    .ok_or_else(|| io::Error::from_raw_os_error(9))?
+                    .get_ref()
+                    .as_raw_fd()
+            };
+            dup_raw(fd).map(Some)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = write;
+            Ok(None)
+        }
     }
     fn is_readable(&self) -> bool { self.reader.is_some() }
     fn is_writable(&self) -> bool { self.writer.is_some() }

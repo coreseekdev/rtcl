@@ -23,6 +23,15 @@ pub type ChannelId = String;
 //  Channel trait
 // ═══════════════════════════════════════════════════════════════════════
 
+/// A duplicate of a raw descriptor, as a handle of its own: what a child
+/// process is given for a channel (`exec … >@ chan`).
+#[cfg(unix)]
+fn dup_raw(fd: std::os::unix::io::RawFd) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::BorrowedFd;
+    // SAFETY: every caller holds a descriptor it has open.
+    unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()
+}
+
 /// Trait object for an open channel.
 pub trait Channel: Send {
     fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize>;
@@ -803,19 +812,6 @@ fn parse_posix_access(mode: &str) -> Option<PosixAccess> {
 /// ENOTCONN、close 仍成功）。connecting 期间 puts 进 `out_buf`（tclsh
 /// 的用户态写缓冲，-buffering full），flush/关通道才外送。
 #[cfg(feature = "net")]
-/// A duplicate of a raw descriptor, as a handle of its own: what a child
-/// process is given for a channel (`exec … >@ chan`).
-#[cfg(unix)]
-fn dup_raw(fd: std::os::unix::io::RawFd) -> io::Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd;
-    let dup = unsafe { libc::dup(fd) };
-    if dup < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `dup` is a fresh descriptor, owned from here on.
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) })
-}
-
 pub struct TcpChannel {
     stream: Option<std::net::TcpStream>,
     /// `-async`：connect 已发起、未补齐（poll/SO_ERROR 待定）。

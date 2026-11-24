@@ -3591,7 +3591,7 @@ fn prefix_longest(interp: &mut Interp, invoked: &str, args: &[Value]) -> Result<
 /// empty table) — with the errorCode that goes with it
 /// (`TCL LOOKUP INDEX <message> <word>`); the caller decides whether to
 /// install that code.
-fn index_in_table(
+pub(crate) fn index_in_table(
     word: &str,
     table: &[String],
     message: &str,

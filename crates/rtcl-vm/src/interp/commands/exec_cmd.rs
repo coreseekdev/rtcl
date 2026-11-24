@@ -60,11 +60,156 @@ fn exec_err_str(msg: impl std::fmt::Display) -> Error {
     Error::runtime(msg.to_string(), ErrorCode::Io)
 }
 
-/// Stop and reap every child of a pipeline that failed after some stage
-/// had already been spawned. Dropping a `Child` neither kills nor waits:
-/// a redirection file that would not open, a spawn failure further down
-/// the pipe, or output that failed to arrive used to leave the earlier
-/// stages running and, once they exited, zombies.
+/// The redirection operator a word of `exec` begins with, and the rest of
+/// the word: tclsh's target may be attached (`>/dev/null`, `2>>file`,
+/// `<<value`) or come as the next word.  Longest operator first, so `>>`
+/// is not `>` writing to a file named `>x`.
+fn redirect_op(word: &str) -> Option<(&'static str, &str)> {
+    const OPS: [&str; 16] = [
+        "2>@1", "2>>@", "2>>", "2>@", "2>", "<<", ">>&@", ">>&", ">>@", ">>", ">&@", ">&", ">@",
+        ">", "<@", "<",
+    ];
+    OPS.iter()
+        .find_map(|op| word.strip_prefix(op).map(|rest| (*op, rest)))
+}
+
+/// A usage error of `exec`, with the errorCode tclsh raises it with.
+fn exec_usage_error(interp: &mut Interp, msg: impl Into<String>, code: &str) -> Error {
+    super::list::set_error_code(interp, code);
+    Error::runtime(msg.into(), ErrorCode::Generic)
+}
+
+/// A pipe as two files: for two streams that must share it (`2>@1`, `|&`)
+/// — with two `Stdio::piped()` the output would come out as all of one
+/// stream and then all of the other, not as written.
+#[cfg(unix)]
+fn pipe_files() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    use std::os::unix::io::FromRawFd;
+    let mut fds = [0; 2];
+    // SAFETY: `fds` holds the two ints `pipe` writes.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors are fresh and owned from here on.
+    unsafe { Ok((std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1]))) }
+}
+
+/// How a child finished, for `exec`'s report.
+enum ExitKind {
+    Ok,
+    Code(i32),
+    #[allow(dead_code)]
+    Signal(i32),
+}
+
+#[cfg(unix)]
+fn exit_kind(status: &std::process::ExitStatus) -> ExitKind {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(sig) = status.signal() {
+        return ExitKind::Signal(sig);
+    }
+    match status.code() {
+        Some(0) | None => ExitKind::Ok,
+        Some(c) => ExitKind::Code(c),
+    }
+}
+
+#[cfg(not(unix))]
+fn exit_kind(status: &std::process::ExitStatus) -> ExitKind {
+    match status.code() {
+        Some(0) | None => ExitKind::Ok,
+        Some(c) => ExitKind::Code(c),
+    }
+}
+
+/// A child's output as text, the way tclsh reads it: the pipe is a channel
+/// in the system encoding (UTF-8) with `auto` translation.  Valid UTF-8
+/// passes; every other byte is one character with the byte's value
+/// (`printf 'A\377B'` is `AÿB`); a CR LF pair and a lone CR are each one
+/// newline.
+fn tcl_output_text(bytes: Vec<u8>) -> String {
+    let bytes = if bytes.contains(&b'\r') {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\r' {
+                out.push(b'\n');
+                i += 1;
+                if i < bytes.len() && bytes[i] == b'\n' {
+                    i += 1;
+                }
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out
+    } else {
+        bytes
+    };
+    let mut text = String::with_capacity(bytes.len());
+    let mut rest = bytes.as_slice();
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                text.push_str(s);
+                return text;
+            }
+            Err(e) => {
+                let good = e.valid_up_to();
+                if let Ok(s) = std::str::from_utf8(&rest[..good]) {
+                    text.push_str(s);
+                }
+                text.push(char::from_u32(rest[good] as u32).unwrap_or('\u{fffd}'));
+                rest = &rest[good + 1..];
+            }
+        }
+    }
+}
+
+/// tclsh's signal report for a child that died from `sig`: the name and
+/// the description (Tcl_SignalId / Tcl_SignalMsg, as 8.6.17 gives them on
+/// Linux; the signals it does not know are `unknown signal`).
+#[cfg(unix)]
+fn signal_text(sig: i32) -> (&'static str, &'static str) {
+    match sig {
+        1 => ("SIGHUP", "hangup"),
+        2 => ("SIGINT", "interrupt"),
+        3 => ("SIGQUIT", "quit signal"),
+        4 => ("SIGILL", "illegal instruction"),
+        5 => ("SIGTRAP", "trace trap"),
+        6 => ("SIGABRT", "SIGABRT"),
+        7 => ("SIGBUS", "bus error"),
+        8 => ("SIGFPE", "floating-point exception"),
+        9 => ("SIGKILL", "kill signal"),
+        10 => ("SIGUSR1", "user-defined signal 1"),
+        11 => ("SIGSEGV", "segmentation violation"),
+        12 => ("SIGUSR2", "user-defined signal 2"),
+        13 => ("SIGPIPE", "write on pipe with no readers"),
+        14 => ("SIGALRM", "alarm clock"),
+        15 => ("SIGTERM", "software termination signal"),
+        24 => ("SIGXCPU", "exceeded CPU time limit"),
+        25 => ("SIGXFSZ", "exceeded file size limit"),
+        26 => ("SIGVTALRM", "virtual time alarm"),
+        27 => ("SIGPROF", "profiling alarm"),
+        29 => ("SIGIO", "input/output possible on file"),
+        30 => ("SIGPWR", "power-fail restart"),
+        31 => ("SIGSYS", "bad argument to system call"),
+        _ => ("unknown signal", "unknown signal"),
+    }
+}
+
+/// Hand the children of a pipeline that failed after some stage had
+/// already been spawned over to the background reaper.  Dropping a `Child`
+/// neither kills nor waits, so a child simply left behind is a zombie;
+/// tclsh neither kills nor blocks here either — it detaches them
+/// (`Tcl_DetachPids`) and the next exec reaps whatever has exited.
+fn detach_children(interp: &mut Interp, children: &mut Vec<std::process::Child>) {
+    interp.background_children.append(children);
+}
+
+/// Stop and reap every child of a pipeline whose output could not be
+/// read: they are still running against a pipe nobody will drain.
 fn kill_and_reap(children: &mut [std::process::Child]) {
     for child in children {
         let _ = child.kill();
@@ -148,42 +293,42 @@ fn drain_both(
     Ok((out, err))
 }
 
-/// Read a pipeline's captured output; a failure reaps the children first.
+/// Read a pipeline's captured output until the last child closes it; a
+/// failure reaps the children first.  `merged` is the read end of a pipe
+/// both streams share (`2>@1`), standing in for the child's stdout.
 fn collect_output(
+    interp: &mut Interp,
     children: &mut [std::process::Child],
+    merged: Option<std::fs::File>,
 ) -> std::result::Result<(String, String), Error> {
+    fn read_all<R: Read>(mut r: R) -> std::io::Result<Vec<u8>> {
+        let mut v = Vec::new();
+        r.read_to_end(&mut v)?;
+        Ok(v)
+    }
+    fn read_failed(
+        interp: &mut Interp,
+        children: &mut [std::process::Child],
+        e: std::io::Error,
+    ) -> Error {
+        kill_and_reap(children);
+        super::io::posix_error(interp, "couldn't read the command's output".to_string(), &e)
+    }
+    if let Some(f) = merged {
+        return read_all(f)
+            .map(|v| (tcl_output_text(v), String::new()))
+            .map_err(|e| read_failed(interp, children, e));
+    }
     let last = children.last_mut().unwrap();
-    let stdout = last.stdout.take();
-    let stderr = last.stderr.take();
-    let read = |mut s: std::process::ChildStdout| -> std::io::Result<Vec<u8>> {
-        let mut v = Vec::new();
-        s.read_to_end(&mut v)?;
-        Ok(v)
-    };
-    let read_err = |mut s: std::process::ChildStderr| -> std::io::Result<Vec<u8>> {
-        let mut v = Vec::new();
-        s.read_to_end(&mut v)?;
-        Ok(v)
-    };
-    let bytes = match (stdout, stderr) {
+    let bytes = match (last.stdout.take(), last.stderr.take()) {
         (Some(o), Some(e)) => drain_both(o, e),
-        (Some(o), None) => read(o).map(|v| (v, Vec::new())),
-        (None, Some(e)) => read_err(e).map(|v| (Vec::new(), v)),
+        (Some(o), None) => read_all(o).map(|v| (v, Vec::new())),
+        (None, Some(e)) => read_all(e).map(|v| (Vec::new(), v)),
         (None, None) => Ok((Vec::new(), Vec::new())),
     };
-    match bytes {
-        Ok((o, e)) => Ok((
-            // Tcl passes a child's bytes through; a non-UTF-8 byte is not
-            // a reason to fail the exec (`printf 'A\377B'` returned an
-            // error here, tclsh returns the text).
-            String::from_utf8_lossy(&o).into_owned(),
-            String::from_utf8_lossy(&e).into_owned(),
-        )),
-        Err(e) => {
-            kill_and_reap(children);
-            Err(exec_err(e))
-        }
-    }
+    bytes
+        .map(|(o, e)| (tcl_output_text(o), tcl_output_text(e)))
+        .map_err(|e| read_failed(interp, children, e))
 }
 
 /// `exec ?-ignorestderr? ?-keepnewline? ?--? cmd ?arg ...? ?| cmd ...? ?redirections?`
@@ -248,20 +393,32 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return cmd_exec_host(interp, args);
     }
 
-    // Parse switches
+    // Parse switches: exactly, and anything else is refused by tclsh's
+    // index-lookup error.
+    const SWITCHES: [&str; 3] = ["-ignorestderr", "-keepnewline", "--"];
+    let switch_table: Vec<String> = SWITCHES.iter().map(|o| o.to_string()).collect();
     let mut i = 1;
     let mut ignore_stderr = false;
     let mut keep_newline = false;
     while i < args.len() {
-        match args[i].as_str() {
-            "-ignorestderr" => { ignore_stderr = true; i += 1; }
-            "-keepnewline"  => { keep_newline = true;  i += 1; }
-            "--"            => { i += 1; break; }
-            s if s.starts_with('-') => {
-                return Err(exec_err_str(format!("bad switch \"{}\": must be -ignorestderr, -keepnewline, or --", s)));
-            }
-            _ => break,
+        let word = args[i].as_str();
+        if !word.starts_with('-') {
+            break;
         }
+        let which = super::misc::index_in_table(word, &switch_table, "option", true)
+            .map_err(|(e, code)| {
+                super::list::set_error_code(interp, &code);
+                e
+            })?;
+        match SWITCHES[which] {
+            "-ignorestderr" => ignore_stderr = true,
+            "-keepnewline" => keep_newline = true,
+            _ => {
+                i += 1;
+                break;
+            }
+        }
+        i += 1;
     }
 
     if i >= args.len() {
@@ -280,259 +437,277 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut stderr_redirect: Option<StderrRedirect> = None;
     let mut background = false;
 
+    // The redirections in command-line order: tclsh opens them before it
+    // starts any process.
+    let mut redirects: Vec<(Stream, bool, String)> = Vec::new();
+    let syntax_error = |interp: &mut Interp, token: &str| {
+        exec_usage_error(
+            interp,
+            format!("can't specify \"{}\" as last word in command", token),
+            "TCL OPERATION EXEC SYNTAX",
+        )
+    };
+
     while i < args.len() {
         let token = args[i].as_str();
         match token {
-            "|" => {
+            "|" | "|&" => {
                 if current_stage.is_empty() {
-                    return Err(exec_err_str("illegal use of | or |& in command"));
+                    return Err(exec_usage_error(
+                        interp,
+                        "illegal use of | or |& in command",
+                        "TCL OPERATION EXEC PIPESYNTAX",
+                    ));
                 }
                 stages.push(std::mem::take(&mut current_stage));
-                i += 1;
-            }
-            "|&" => {
-                if current_stage.is_empty() {
-                    return Err(exec_err_str("illegal use of | or |& in command"));
+                if token == "|&" {
+                    merge_stderr_in_pipe = true;
                 }
-                stages.push(std::mem::take(&mut current_stage));
-                merge_stderr_in_pipe = true;
                 i += 1;
-            }
-            "<" => {
-                if i + 1 >= args.len() { return Err(exec_err_str("can't specify \"<\" as last word in command")); }
-                input_redirect = Some(InputRedirect::File(args[i + 1].as_str().to_string()));
-                i += 2;
-            }
-            "<<" => {
-                if i + 1 >= args.len() { return Err(exec_err_str("can't specify \"<<\" as last word in command")); }
-                input_redirect = Some(InputRedirect::String(args[i + 1].as_str().to_string()));
-                i += 2;
-            }
-            ">" => {
-                if i + 1 >= args.len() { return Err(exec_err_str("can't specify \">\" as last word in command")); }
-                output_redirect = Some(OutputRedirect::Truncate(args[i + 1].as_str().to_string()));
-                i += 2;
-            }
-            ">>" => {
-                if i + 1 >= args.len() { return Err(exec_err_str("can't specify \">>\" as last word in command")); }
-                output_redirect = Some(OutputRedirect::Append(args[i + 1].as_str().to_string()));
-                i += 2;
-            }
-            "2>" => {
-                if i + 1 >= args.len() { return Err(exec_err_str("can't specify \"2>\" as last word in command")); }
-                stderr_redirect = Some(StderrRedirect::Truncate(args[i + 1].as_str().to_string()));
-                i += 2;
-            }
-            "2>>" => {
-                if i + 1 >= args.len() { return Err(exec_err_str("can't specify \"2>>\" as last word in command")); }
-                stderr_redirect = Some(StderrRedirect::Append(args[i + 1].as_str().to_string()));
-                i += 2;
-            }
-            "2>@1" => {
-                // Redirect stderr to stdout (merge)
-                stderr_redirect = Some(StderrRedirect::ToStdout);
-                i += 1;
-            }
-            ">&" | ">>&" => {
-                if i + 1 >= args.len() { return Err(exec_err_str(format!("can't specify \"{}\" as last word in command", token))); }
-                let path = args[i + 1].as_str().to_string();
-                if token == ">&" {
-                    output_redirect = Some(OutputRedirect::Truncate(path.clone()));
-                    stderr_redirect = Some(StderrRedirect::Truncate(path));
-                } else {
-                    output_redirect = Some(OutputRedirect::Append(path.clone()));
-                    stderr_redirect = Some(StderrRedirect::Append(path));
-                }
-                i += 2;
+                continue;
             }
             "&" if i + 1 == args.len() => {
                 background = true;
                 i += 1;
+                continue;
             }
-            _ => {
-                current_stage.push(token);
-                i += 1;
-            }
+            _ => {}
         }
+        let Some((op, attached)) = redirect_op(token) else {
+            current_stage.push(token);
+            i += 1;
+            continue;
+        };
+        if attached.starts_with('@') || op.ends_with('@') {
+            // TODO(M5-a3): tclsh passes the child the channel's descriptor.
+            return Err(exec_err_str(format!(
+                "redirection to a channel is not supported: \"{}\"",
+                token
+            )));
+        }
+        if op == "2>@1" {
+            // It has no target, and redirects the last stage's output:
+            // tclsh lets it only close the command.
+            if i + 1 != args.len() {
+                return Err(exec_usage_error(
+                    interp,
+                    "must specify \"2>@1\" as last word in command",
+                    "TCL OPERATION EXEC PIPESYNTAX",
+                ));
+            }
+            stderr_redirect = Some(StderrRedirect::ToStdout);
+            i += 1;
+            continue;
+        }
+        let target: String = if !attached.is_empty() {
+            attached.to_string()
+        } else {
+            match args.get(i + 1) {
+                Some(t) => t.as_str().to_string(),
+                None => {
+                    return Err(exec_usage_error(
+                        interp,
+                        format!("can't specify \"{}\" as last word in command", op),
+                        "TCL OPERATION EXEC SYNTAX",
+                    ));
+                }
+            }
+        };
+        let to = |stream: Stream, append: bool, path: &str| (stream, append, path.to_string());
+        match op {
+            "<" => {
+                redirects.push(to(Stream::In, false, &target));
+                input_redirect = Some(InputRedirect::File(target));
+            }
+            "<<" => input_redirect = Some(InputRedirect::String(target)),
+            ">" => {
+                redirects.push(to(Stream::Out, false, &target));
+                output_redirect = Some(OutputRedirect::Truncate(target));
+            }
+            ">>" => {
+                redirects.push(to(Stream::Out, true, &target));
+                output_redirect = Some(OutputRedirect::Append(target));
+            }
+            // `>& file` / `>>& file`: stderr goes to the same file.
+            ">&" => {
+                redirects.push(to(Stream::Out, false, &target));
+                redirects.push(to(Stream::Err, false, &target));
+                output_redirect = Some(OutputRedirect::Truncate(target.clone()));
+                stderr_redirect = Some(StderrRedirect::Truncate(target));
+            }
+            ">>&" => {
+                redirects.push(to(Stream::Out, true, &target));
+                redirects.push(to(Stream::Err, true, &target));
+                output_redirect = Some(OutputRedirect::Append(target.clone()));
+                stderr_redirect = Some(StderrRedirect::Append(target));
+            }
+            "2>" => {
+                redirects.push(to(Stream::Err, false, &target));
+                stderr_redirect = Some(StderrRedirect::Truncate(target));
+            }
+            "2>>" => {
+                redirects.push(to(Stream::Err, true, &target));
+                stderr_redirect = Some(StderrRedirect::Append(target));
+            }
+            _ => unreachable!("every operator is handled or refused above"),
+        }
+        i += if attached.is_empty() { 2 } else { 1 };
     }
 
     if !current_stage.is_empty() {
         stages.push(current_stage);
+    } else if !stages.is_empty() {
+        // A pipeline that ends in `|`.
+        return Err(exec_usage_error(
+            interp,
+            "illegal use of | or |& in command",
+            "TCL OPERATION EXEC PIPESYNTAX",
+        ));
     }
 
     if stages.is_empty() {
         return Err(exec_err_str("no command given"));
     }
 
+    // Every redirection is opened before any process starts, in
+    // command-line order: the first that fails is the error, and nothing
+    // has run yet.
+    let (mut input_file, mut output_file, mut stderr_file) = (None, None, None);
+    for &(stream, append, ref path) in &redirects {
+        let writing = stream != Stream::In;
+        let opened = if !writing {
+            std::fs::File::open(path)
+        } else if append {
+            std::fs::OpenOptions::new().append(true).create(true).open(path)
+        } else {
+            std::fs::File::create(path)
+        };
+        let file = match opened {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(super::io::posix_error(
+                    interp,
+                    format!(
+                        "couldn't {} file \"{}\"",
+                        if writing { "write" } else { "read" },
+                        path
+                    ),
+                    &e,
+                ));
+            }
+        };
+        match stream {
+            Stream::In => input_file = Some(file),
+            Stream::Out => output_file = Some(file),
+            Stream::Err => stderr_file = Some(file),
+        }
+    }
+    fn clone_file(interp: &mut Interp, f: &std::fs::File) -> Result<std::fs::File> {
+        f.try_clone().map_err(|e| {
+            super::io::posix_error(
+                interp,
+                "couldn't duplicate the file descriptor".to_string(),
+                &e,
+            )
+        })
+    }
+    fn pipe(interp: &mut Interp) -> Result<(std::fs::File, std::fs::File)> {
+        pipe_files()
+            .map_err(|e| super::io::posix_error(interp, "couldn't create pipe".to_string(), &e))
+    }
+
     // Build and execute the pipeline.
     let num_stages = stages.len();
-    let mut prev_stdout: Option<std::process::ChildStdout> = None;
+    // The read end of the pipe the next stage reads from.
+    let mut prev_stdout: Option<std::fs::File> = None;
     let mut children: Vec<std::process::Child> = Vec::new();
+    // `2>@1` without a file: one pipe carries both streams of the last
+    // stage, and this is its read end.
+    let mut merged_stdout: Option<std::fs::File> = None;
 
     for (stage_idx, stage_args) in stages.iter().enumerate() {
-        if stage_args.is_empty() {
-            return Err(exec_err_str("no command given"));
-        }
-
+        let is_last = stage_idx == num_stages - 1;
         let mut cmd = Command::new(stage_args[0]);
         cmd.args(&stage_args[1..]);
 
-        // stdin
+        // stdin: the caller's, unless redirected or fed by the previous
+        // stage (tclsh leaves a first stage on the caller's stdin).
         if stage_idx == 0 {
-            match &input_redirect {
-                Some(InputRedirect::File(path)) => {
-                    let f = std::fs::File::open(path).map_err(|e| {
-                        exec_err_str(format!("couldn't read file \"{}\": {}", path, e))
-                    });
-                    let f = match f {
-                        Ok(f) => f,
-                        Err(e) => {
-                            kill_and_reap(&mut children);
-                            return Err(e);
-                        }
-                    };
-                    cmd.stdin(f);
-                }
-                Some(InputRedirect::String(s)) => {
-                    // We'll need to pipe the string in via a spawned child's stdin
-                    // For now, use piped stdin and write to it below
-                    cmd.stdin(Stdio::piped());
-                    // Save the string — handled below
-                    let _ = s; // used after spawn
-                }
-                None => {
-                    cmd.stdin(Stdio::null());
-                }
+            if let Some(f) = input_file.take() {
+                cmd.stdin(f);
+            } else if matches!(input_redirect, Some(InputRedirect::String(_))) {
+                // Fed by a helper thread once the child exists.
+                cmd.stdin(Stdio::piped());
             }
-        } else if let Some(stdout) = prev_stdout.take() {
-            cmd.stdin(stdout);
+        } else if let Some(read_end) = prev_stdout.take() {
+            cmd.stdin(read_end);
         }
 
-        // stdout
-        let is_last = stage_idx == num_stages - 1;
-        if is_last && output_redirect.is_none() && !background {
-            cmd.stdout(Stdio::piped());
-        } else if is_last {
-            match &output_redirect {
-                Some(OutputRedirect::Truncate(path)) => {
-                    let f = std::fs::File::create(path).map_err(|e| {
-                        exec_err_str(format!("couldn't write file \"{}\": {}", path, e))
-                    });
-                    let f = match f {
-                        Ok(f) => f,
-                        Err(e) => {
-                            kill_and_reap(&mut children);
-                            return Err(e);
-                        }
-                    };
-                    cmd.stdout(f);
-                }
-                Some(OutputRedirect::Append(path)) => {
-                    let f = std::fs::OpenOptions::new().append(true).create(true).open(path).map_err(|e| {
-                        exec_err_str(format!("couldn't write file \"{}\": {}", path, e))
-                    });
-                    let f = match f {
-                        Ok(f) => f,
-                        Err(e) => {
-                            kill_and_reap(&mut children);
-                            return Err(e);
-                        }
-                    };
-                    cmd.stdout(f);
-                }
-                None => {
-                    // Background: the job's stdout stays the caller's
-                    // (tclsh: `exec sh -c {echo OUT} &` prints OUT).
-                    cmd.stdout(Stdio::inherit());
-                }
+        // stdout: captured, redirected, passed on — or, for a background
+        // job, the caller's own.
+        if !is_last {
+            let (read_end, write_end) = pipe(interp)?;
+            let for_stderr = if merge_stderr_in_pipe {
+                Some(clone_file(interp, &write_end)?)
+            } else {
+                None
+            };
+            cmd.stdout(write_end);
+            if let Some(e) = for_stderr {
+                cmd.stderr(e);
             }
-        } else {
+            prev_stdout = Some(read_end);
+        } else if let Some(f) = output_file.take() {
+            let for_stderr = if matches!(stderr_redirect, Some(StderrRedirect::ToStdout)) {
+                Some(clone_file(interp, &f)?)
+            } else {
+                None
+            };
+            cmd.stdout(f);
+            if let Some(e) = for_stderr {
+                cmd.stderr(e);
+            }
+        } else if matches!(stderr_redirect, Some(StderrRedirect::ToStdout)) && !background {
+            let (read_end, write_end) = pipe(interp)?;
+            let for_stderr = clone_file(interp, &write_end)?;
+            cmd.stdout(write_end);
+            cmd.stderr(for_stderr);
+            merged_stdout = Some(read_end);
+        } else if !background {
             cmd.stdout(Stdio::piped());
         }
 
-        // stderr
-        if is_last {
-            match &stderr_redirect {
-                Some(StderrRedirect::Truncate(path)) => {
-                    let f = std::fs::File::create(path).map_err(|e| {
-                        exec_err_str(format!("couldn't write file \"{}\": {}", path, e))
-                    });
-                    let f = match f {
-                        Ok(f) => f,
-                        Err(e) => {
-                            kill_and_reap(&mut children);
-                            return Err(e);
-                        }
-                    };
-                    cmd.stderr(f);
-                }
-                Some(StderrRedirect::Append(path)) => {
-                    let f = std::fs::OpenOptions::new().append(true).create(true).open(path).map_err(|e| {
-                        exec_err_str(format!("couldn't write file \"{}\": {}", path, e))
-                    });
-                    let f = match f {
-                        Ok(f) => f,
-                        Err(e) => {
-                            kill_and_reap(&mut children);
-                            return Err(e);
-                        }
-                    };
-                    cmd.stderr(f);
-                }
-                Some(StderrRedirect::ToStdout) => {
-                    if background {
-                        // The job's stdout is inherited (above): so is
-                        // its stderr.
-                        cmd.stderr(Stdio::inherit());
-                    } else {
-                        // 2>@1 — merge stderr into stdout pipe
-                        cmd.stderr(Stdio::piped()); // We'll read it separately and merge
-                    }
-                }
-                None if ignore_stderr => {
-                    cmd.stderr(Stdio::null());
-                }
-                None if background => {
-                    // A background job's stderr is not captured: a piped
-                    // stderr nobody reads blocks the job for good once it
-                    // has written a pipe's worth (`exec sh -c {… >&2} &`).
-                    // tclsh leaves it on the caller's stderr.
-                    cmd.stderr(Stdio::inherit());
-                }
-                None => {
-                    cmd.stderr(Stdio::piped());
-                }
+        // stderr: a file; the caller's for `-ignorestderr`, a background
+        // job or a stage whose stderr is not joined; captured otherwise.
+        if is_last && !matches!(stderr_redirect, Some(StderrRedirect::ToStdout)) {
+            if let Some(f) = stderr_file.take() {
+                cmd.stderr(f);
+            } else if !ignore_stderr && !background {
+                cmd.stderr(Stdio::piped());
             }
-        } else if merge_stderr_in_pipe {
-            // |& merges stderr into the pipe stdout
-            cmd.stderr(Stdio::piped());
-        } else {
-            cmd.stderr(Stdio::inherit());
         }
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                kill_and_reap(&mut children);
-                return Err(exec_err_str(format!(
-                    "couldn't execute \"{}\": {}",
-                    stage_args[0], e
-                )));
+                // The stages already running are left to finish on their
+                // own (tclsh detaches them); the next exec reaps them.
+                detach_children(interp, &mut children);
+                return Err(super::io::posix_error(
+                    interp,
+                    format!("couldn't execute \"{}\"", stage_args[0]),
+                    &e,
+                ));
             }
         };
 
-        // Handle <<string input for first stage
+        // `<<` input for the first stage.
         if stage_idx == 0 {
             if let Some(InputRedirect::String(s)) = &input_redirect {
                 if let Some(stdin) = child.stdin.take() {
                     feed_stdin(stdin, s.as_bytes().to_vec());
                 }
             }
-        }
-
-        // Capture stdout for piping to next stage
-        if !is_last {
-            prev_stdout = child.stdout.take();
         }
 
         children.push(child);
@@ -547,67 +722,84 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Ok(Value::from_str(&pids.join(" ")));
     }
 
-    // Collect output from the last child (both streams at once).
-    let last_pid = children.last().unwrap().id();
-    let (mut stdout_data, mut stderr_data) = collect_output(&mut children)?;
+    // Both streams at once, until the last child closes them.
+    let (data, err) = collect_output(interp, &mut children, merged_stdout)?;
 
-    // 2>@1: merge stderr into stdout
-    if matches!(stderr_redirect, Some(StderrRedirect::ToStdout)) {
-        stdout_data.push_str(&stderr_data);
-        stderr_data.clear();
-    }
-
-    // Wait for all children
-    let mut any_error = false;
-    let mut exit_code = 0i32;
+    // Wait for the children and classify each completion, in tclsh's
+    // order (TclCleanupChildren): a failing child's errorCode replaces
+    // the one before it; a child killed by a signal leaves the message, a
+    // non-zero exit only the fact that it happened.
+    let mut failed = false;
+    let mut abnormal_exit = false;
+    let mut error_code: Option<String> = None;
+    let mut reason = String::new();
     for child in children.iter_mut() {
-        match child.wait() {
-            Ok(status) => {
-                if !status.success() {
-                    any_error = true;
-                    exit_code = status.code().unwrap_or(1);
-                }
+        let pid = child.id();
+        let status = child.wait().map_err(|e| {
+            super::io::posix_error(
+                interp,
+                "error waiting for process to exit".to_string(),
+                &e,
+            )
+        })?;
+        match exit_kind(&status) {
+            ExitKind::Ok => {}
+            ExitKind::Code(code) => {
+                failed = true;
+                abnormal_exit = true;
+                error_code = Some(format!("CHILDSTATUS {} {}", pid, code));
             }
-            Err(e) => {
-                return Err(exec_err_str(format!("error waiting for process: {}", e)));
+            ExitKind::Signal(sig) => {
+                failed = true;
+                let (name, msg) = signal_text(sig);
+                error_code = Some(
+                    Value::from_list(&[
+                        Value::from_str("CHILDKILLED"),
+                        Value::from_str(&pid.to_string()),
+                        Value::from_str(name),
+                        Value::from_str(msg),
+                    ])
+                    .as_str()
+                    .to_string(),
+                );
+                reason = format!("child killed: {}\n", msg);
             }
         }
     }
 
-    // Strip trailing newline (unless -keepnewline)
-    if !keep_newline && stdout_data.ends_with('\n') {
-        stdout_data.pop();
-        if stdout_data.ends_with('\r') {
-            stdout_data.pop();
+    // The result is the output with one trailing newline gone (unless
+    // -keepnewline).  An error's message is the same text with the reason
+    // after it — or the captured stderr, which is the report of its own:
+    // a child that wrote to stderr failed the exec even when it exited 0.
+    let mut text = data;
+    if !err.is_empty() {
+        failed = true;
+        text.push_str(&err);
+    } else if abnormal_exit {
+        text.push_str("child process exited abnormally");
+    } else {
+        text.push_str(&reason);
+    }
+    if !keep_newline && text.ends_with('\n') {
+        text.pop();
+    }
+
+    if failed {
+        match error_code {
+            Some(code) => super::list::set_error_code(interp, &code),
+            None => super::list::set_error_code(interp, "NONE"),
         }
+        return Err(Error::runtime(text, ErrorCode::Generic));
     }
+    Ok(Value::from_str(&text))
+}
 
-    if any_error {
-        // Set $::errorCode like jimtcl: {CHILDSTATUS pid exitCode}
-        let error_code = format!("CHILDSTATUS {} {}", last_pid, exit_code);
-        let _ = interp.set_var("::errorCode", Value::from_str(&error_code));
-        interp.err_code_raised = true;
-
-        let mut msg = stderr_data.clone();
-        if msg.is_empty() {
-            msg = format!("child process exited abnormally (exit code {})", exit_code);
-        }
-        if msg.ends_with('\n') { msg.pop(); }
-        return Err(Error::runtime(
-            format!("{}{}", stdout_data, if msg.is_empty() { String::new() } else { msg }),
-            ErrorCode::Generic,
-        ));
-    }
-
-    // Set $::errorCode to NONE on success
-    let _ = interp.set_var("::errorCode", Value::from_str("NONE"));
-
-    if !stderr_data.is_empty() && !ignore_stderr {
-        // Tcl convention: non-zero stderr with zero exit = emit to stderr but still succeed
-        eprint!("{}", stderr_data);
-    }
-
-    Ok(Value::from_str(&stdout_data))
+/// Which of a child's streams a redirection names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    In,
+    Out,
+    Err,
 }
 
 // ── Redirect types ─────────────────────────────────────────────────────
@@ -1254,9 +1446,11 @@ mod tests {
     #[test]
     fn test_exec_errorcode_on_success() {
         let mut interp = Interp::new();
+        // A command that succeeds leaves ::errorCode as it found it.
+        interp.set_var("::errorCode", crate::value::Value::from_str("SENTINEL")).unwrap();
         interp.eval("exec true").unwrap();
         let ec = interp.get_var("::errorCode").unwrap();
-        assert_eq!(ec.as_str(), "NONE");
+        assert_eq!(ec.as_str(), "SENTINEL");
     }
 
     #[cfg(unix)]
@@ -1318,10 +1512,14 @@ mod tests {
     #[test]
     fn test_exec_bad_switch() {
         let mut interp = Interp::new();
-        let result = interp.eval("exec -badswitch echo hello");
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("bad switch"));
+        // tclsh refuses an unknown switch with its index-lookup error.
+        let r = interp
+            .eval("catch {exec -badswitch echo hello} m; list $m $::errorCode")
+            .unwrap();
+        assert_eq!(
+            r.as_str(),
+            "{bad option \"-badswitch\": must be -ignorestderr, -keepnewline, or --} {TCL LOOKUP INDEX option -badswitch}"
+        );
     }
 
     // ── exec pipe tests ────────────────────────────────────────────────────────

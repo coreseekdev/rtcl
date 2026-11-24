@@ -921,6 +921,13 @@ impl TcpChannel {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // Close this descriptor in children, as every descriptor Rust
+        // itself creates is: a raw `socket()` is not.  Without it an
+        // `exec` child inherits the connecting socket (and its pending
+        // connection) for as long as the child lives.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
         let rc = unsafe {
             match addr {
                 std::net::SocketAddr::V4(a) => {

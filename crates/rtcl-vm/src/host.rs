@@ -613,10 +613,13 @@ impl HostFs for NativeFs {
         }
     }
     fn delete(&mut self, path: &str) -> std::io::Result<()> {
-        if std::path::Path::new(path).is_dir() {
-            std::fs::remove_dir_all(path)
-        } else {
-            std::fs::remove_file(path)
+        // A symbolic link goes as itself: the thing it points at stays
+        // (tclsh deletes `lnk` to a directory without touching the
+        // directory).
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => std::fs::remove_file(path),
+            Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+            _ => std::fs::remove_file(path),
         }
     }
     fn rename(&mut self, src: &str, dst: &str) -> std::io::Result<()> {

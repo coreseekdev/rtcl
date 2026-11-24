@@ -102,10 +102,10 @@
 | S31 | exec 三处死锁（stderr 超 64KiB 且 stdout 未关、`<<` 超管道容量、后台作业写大量 stderr）；`exit` 被存活的管道子进程阻塞 3 秒 | `commands/exec_cmd.rs` | 死锁三项已修（M5）；`exit` 阻塞见 S32 |
 | S32 | `close` 仍在连接的 `-async` socket 无限阻塞（内核自己的 connect 超时是分钟级）；`exit` 到来时存活的管道子进程把退出拖住（`set f [open "|sleep 3"]; exit 0` 要 3 秒） | `channel.rs`、`rtcl-cli/src/main.rs` | 已修（M5）：没有缓冲输出时 `close` 直接丢弃未完成的连接（tclsh 0ms；有缓冲输出且阻塞模式时 tclsh 自己也等连接，保持不变）。CLI 的每次运行结束（脚本跑完、`exit`、出错）都走 `Interp::abandon_channels`——不等管道子进程；嵌入宿主里的普通 `Drop` 仍然等（活着的进程里不该留下没收的子进程） |
 | S33 | exec 遇非 UTF-8 输出报错并留僵尸进程 | `commands/exec_cmd.rs` | 已修（M5）：非 UTF-8 逐字节映射成同值字符（同 tclsh）；不留僵尸——输出读不出来时 kill + 收尸，spawn 失败时把已启动的阶段分离、由下次 exec 收（tclsh 同） |
-| S34 | `file tempfile` 任意路径前缀、无 `O_EXCL`、0644 | `host.rs` | 未修 |
-| S35 | `file delete` 不带 `-force` 也递归删非空目录 | `commands/io.rs` | 未修 |
-| S36 | `file normalize a/../x` 原样返回 | `commands/io.rs` | 未修 |
-| S37 | `-async` socket 的 fd 无 `CLOEXEC` | `channel.rs` | 未修 |
+| S34 | `file tempfile` 任意路径前缀、无 `O_EXCL`、0644 | `host.rs`、`commands/io.rs` | 已修（M5）：按 tclsh 8.6.17 重做——`O_EXCL` 创建、0600、返回读写通道、路径写进 `nameVar`；相对模板只取末尾放进临时目录（带目录部分的原样用）、`_` 加 6 位随机串插在扩展名之前 |
+| S35 | `file delete` 不带 `-force` 也递归删非空目录 | `commands/io.rs` | 已修（M5）：非空目录报 `error deleting "…": directory not empty`（`POSIX EEXIST`），内容不动；符号链接只删链接本身；不存在的路径不报错；未知选项是 tclsh 的 `bad option` |
+| S36 | `file normalize a/../x` 原样返回 | `commands/io.rs` | 已修（M5）：词法规范化（接上工作目录、消解 `.`/`..`、合并分隔符、`~` 展开），不查文件系统。`~user` 未实现（C33） |
+| S37 | `-async` socket 的 fd 无 `CLOEXEC` | `channel.rs` | 已修（M5）：裸 `socket()` 之后设 `FD_CLOEXEC`（A/B 实测：修复前 `exec` 子进程继承该描述符，修复后不继承） |
 | S38 | HTTP 客户端默认无超时、响应体无上限、无 URL 审查钩子（读码） | `rtcl-native/src/net.rs` | 未修 |
 | S39 | 变量表无密钥哈希，可预构造冲突键（风险低） | `interp/varmap.rs` | 未修 |
 | S40 | Tk：畸形 PNG、多字节颜色串、`image put -to` 负坐标 panic（读码，未运行） | `rtcl-tk-runtime/src/lib.rs` | 未修 |
@@ -145,6 +145,8 @@
 | C30 | （M5）exec 的错误语义与 tclsh 不同：子进程写了 stderr（未重定向、未 `-ignorestderr`）tclsh 让 exec **报错**、消息 = stdout + stderr（`catch {exec …} msg` 取 stderr 是 Tcl 惯用法），rtcl 把 stderr 打到自己的 stderr 并返回成功；失败消息多了 `(exit code N)`、stdout 与原因之间缺换行；被信号杀死 tclsh 报 `child killed: <描述>` + `CHILDKILLED pid SIGNAME {描述}`，rtcl 当成退出码 1；成功时 rtcl 把 `::errorCode` 清成 NONE（tclsh 不动）；重定向失败的消息与 `POSIX ENOENT …` errorCode 不同；非 UTF-8 字节 tclsh 逐个映射成同值的 Unicode 字符。语料与探针里没有任何 exec 调用，所以一直没被看见 | `commands/exec_cmd.rs` `cmd_exec` | 已修（M5）：按 `TclCleanupChildren` 与实测重写了原生路径的参数扫描、管道搭建与收尾（探针 d19，42 条断言在 tclsh 上同样全过）。一并对齐：`2>@1` 两流共用一根管道（保持写出顺序）、重定向在 spawn 之前按命令行顺序打开、目标可连写在操作符后（`2>/dev/null`）、CR LF 与孤立 CR 按换行处理、开关不接受缩写、各语法错误的 errorCode、子进程继承调用方的 stdin、中途失败时已启动的子进程分离而不是杀掉 |
 | C31 | （M5）`@通道` 重定向（`exec cmd 2>@ stderr`、`>@ $chan`、`<@ $chan`、`>>@`、`2>>@`）：tclsh 把通道的描述符传给子进程；rtcl 原来把这些词当普通参数传给命令（静默出错），现在明确报错 | `commands/exec_cmd.rs` | 未修：通道层需要先暴露描述符 |
 | C32 | （M5）带宿主 `HostExec` 的 exec 路径（`cmd_exec_host`，注入了宿主的 wasm 环境走它）仍是旧语义：stderr 不使 exec 失败、`(exit code N)`、成功时清 `::errorCode`、`bad switch` | `commands/exec_cmd.rs` `cmd_exec_host` | 未修 |
+| C33 | （M5）`file` 命令的零散缺口：`file attributes` 完全没有实现（`bad option "attributes"`）；`file normalize ~user` 不查用户（tclsh 报 `user "…" doesn't exist` / `TCL VALUE PATH NOUSER`，存在的用户展开到家目录）；`socket -server` 不支持（`server sockets are not supported in rtcl`） | `commands/io.rs`、`channel.rs` | 未修 |
+| C34 | （M5）`file rename` 跨文件系统直接失败（`Invalid cross-device link`；tclsh 复制后删除）。一并对齐了的：目标 是目录时移入其中、源不存在与已存在的消息和 `POSIX` 码、`mkdir`/`copy` 的消息（原来是 Rust 的 `No such file or directory (os error 2)` 且没有 errorCode） | `commands/io.rs` | 部分已修（M5）；跨文件系统未修 |
 | C13 | 修复过程中新查出：`json encode` 的 schema 文本按词递归（`list list list …` 重复几万次即栈溢出），JSON 解码的递归下降无深度上限 | `commands/json.rs` | 已修（M2）：文档与 schema 的嵌套上限 1000，超限报错 |
 
 ## P2：性能（`TODO.md` 未列，本机单次实测，只看量级）
@@ -228,6 +230,8 @@
   要等它退出才读到 EOF，于是计的是子进程的命而不是探针的（`exit`
   旁的 `open "|sleep 3"`：解释器 30ms 就退了，门禁量出 3 秒）。现在
   输出落文件。
+- M5 文件操作：S34–S37 全部修掉，新增 d20（33 条断言，tclsh 上同样
+  全过）。crash-gate 至此 **112 次运行 112 过**。
 - `judge/crash-wasm.mjs`：**35 项**全过（M3 时 27 项）。每项在自己的
   worker 线程里跑，15 秒无结果即判 `HANG` 并终止线程——原来遇到挂起类
   回归是门禁自己卡死（步数预算看不见解析器/检查器里的循环）。

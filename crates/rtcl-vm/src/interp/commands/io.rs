@@ -332,6 +332,16 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Subcommands that need no path argument
     match subcmd {
         "tempfile" => return file_tempfile(interp, args),
+        // Nothing named is nothing to delete (tclsh: no error).
+        "delete" if args.len() == 2 => return Ok(Value::empty()),
+        "rename" | "copy" if args.len() == 2 => {
+            return Err(Error::wrong_args_with_usage(
+                format!("file {}", args[1].as_str()),
+                3,
+                args.len(),
+                "?-option value ...? source ?source ...? target",
+            ));
+        }
         "separator" | "sep" => {
             return Ok(Value::from_str(std::path::MAIN_SEPARATOR_STR));
         }
@@ -429,10 +439,8 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::from_str(joined.to_str().unwrap_or("")))
         }
         "normalize" => {
-            let p = std::fs::canonicalize(path).unwrap_or_else(|_| {
-                std::path::PathBuf::from(path)
-            });
-            Ok(Value::from_str(&p.to_string_lossy()))
+            let cwd = interp.host_fs.pwd();
+            file_normalize(&cwd, path)
         }
 
         // ── metadata ────────────────────────────────────────────────
@@ -537,121 +545,142 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // file delete ?-force? ?--? path ...
             let mut force = false;
             let mut start = 2;
+            let options: Vec<String> = ["-force", "--"].iter().map(|o| o.to_string()).collect();
             while start < args.len() {
-                match args[start].as_str() {
-                    "-force" | "--force" => { force = true; start += 1; }
-                    "--" => { start += 1; break; }
-                    _ => break,
+                let word = args[start].as_str();
+                if !word.starts_with('-') {
+                    break;
+                }
+                match super::misc::index_in_table(word, &options, "option", false) {
+                    Ok(0) => {
+                        force = true;
+                        start += 1;
+                    }
+                    Ok(_) => {
+                        start += 1;
+                        break;
+                    }
+                    Err((e, code)) => {
+                        super::list::set_error_code(interp, &code);
+                        return Err(e);
+                    }
                 }
             }
             for j in start..args.len() {
                 let p = args[j].as_str();
-                if interp.host_fs.is_dir(p) {
-                    if force {
-                        let _ = interp.host_fs.delete(p);
-                    } else {
-                        // 目录的删除走 HostFs.delete（数据面）；非空
-                        // 目录的 remove_dir 语义由实现承载。
-                        interp.host_fs.delete(p).map_err(|e| {
-                            Error::runtime(
-                                format!("error deleting \"{}\": {}", p, e),
-                                crate::error::ErrorCode::Io,
-                            )
-                        })?;
-                    }
-                } else if interp.host_fs.exists(p) {
-                    interp.host_fs.delete(p).map_err(|e| {
-                        Error::runtime(
-                            format!("error deleting \"{}\": {}", p, e),
-                            crate::error::ErrorCode::Io,
-                        )
-                    })?;
+                // tclsh: a path that does not exist is no error.
+                if interp.host_fs.stat_full(p, false).is_err() {
+                    continue;
                 }
+                // Without -force a directory keeps its contents: a
+                // non-empty one is an error, nothing in it is touched.
+                // (The whole tree used to be removed.)
+                let is_link = interp.host_fs.read_link(p).is_ok();
+                if !force
+                    && !is_link
+                    && interp.host_fs.is_dir(p)
+                    && !interp.host_fs.list_dir(p).unwrap_or_default().is_empty()
+                {
+                    super::list::set_error_code(interp, "POSIX EEXIST {file already exists}");
+                    return Err(Error::runtime(
+                        format!("error deleting \"{}\": directory not empty", p),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+                interp.host_fs.delete(p).map_err(|e| {
+                    posix_error(interp, format!("error deleting \"{}\"", p), &e)
+                })?;
             }
             Ok(Value::empty())
         }
         "mkdir" => {
             for j in 2..args.len() {
                 let p = args[j].as_str();
-                interp.host_fs.mkdir(p, true).map_err(|e| {
-                    Error::runtime(
-                        format!("couldn't create directory \"{}\": {}", p, e),
-                        crate::error::ErrorCode::Io,
-                    )
-                })?;
+                interp
+                    .host_fs
+                    .mkdir(p, true)
+                    .map_err(|e| posix_error(interp, format!("can't create directory \"{}\"", p), &e))?;
             }
             Ok(Value::empty())
         }
         "rename" => {
-            // file rename ?-force? source target
-            let mut force = false;
-            let mut start = 2;
-            while start < args.len() {
-                match args[start].as_str() {
-                    "-force" | "--force" => { force = true; start += 1; }
-                    "--" => { start += 1; break; }
-                    _ => break,
-                }
-            }
+            // file rename ?-force? ?--? source target
+            let (force, start) = file_force_options(interp, args)?;
             if args.len() - start != 2 {
                 return Err(Error::wrong_args_with_usage(
-                    "file rename", 4, args.len(), "?-force? source target",
+                    "file rename",
+                    3,
+                    args.len(),
+                    "?-option value ...? source ?source ...? target",
                 ));
             }
             let src = args[start].as_str();
-            let dst = args[start + 1].as_str();
-            if !force && interp.host_fs.exists(dst) {
-                return Err(Error::runtime(
-                    format!(
-                        "error renaming \"{}\" to \"{}\": file already exists",
-                        src, dst
-                    ),
-                    crate::error::ErrorCode::Io,
+            // A directory as the target receives the source under its
+            // own name (tclsh: `file rename f dir` makes `dir/f`).
+            let given = args[start + 1].as_str();
+            let dst = if interp.host_fs.is_dir(given) {
+                format!(
+                    "{}/{}",
+                    given.trim_end_matches('/'),
+                    src.rsplit('/').next().unwrap_or(src)
+                )
+            } else {
+                given.to_string()
+            };
+            // tclsh names the source alone when the file is not there.
+            if interp.host_fs.stat_full(src, false).is_err() {
+                return Err(posix_error(
+                    interp,
+                    format!("error renaming \"{}\"", src),
+                    &std::io::Error::from_raw_os_error(libc_enoent()),
                 ));
             }
-            interp.host_fs.rename(src, dst).map_err(|e| {
-                Error::runtime(
-                    format!("couldn't rename \"{}\": {}", src, e),
-                    crate::error::ErrorCode::Io,
-                )
-            })?;
+            if !force && interp.host_fs.exists(&dst) {
+                super::list::set_error_code(interp, "POSIX EEXIST {file already exists}");
+                return Err(Error::runtime(
+                    format!("error renaming \"{}\" to \"{}\": file already exists", src, dst),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+            interp
+                .host_fs
+                .rename(src, &dst)
+                .map_err(|e| posix_error(interp, format!("error renaming \"{}\" to \"{}\"", src, dst), &e))?;
             Ok(Value::empty())
         }
         "copy" => {
-            // file copy ?-force? source target
-            let mut force = false;
-            let mut start = 2;
-            while start < args.len() {
-                match args[start].as_str() {
-                    "-force" | "--force" => { force = true; start += 1; }
-                    "--" => { start += 1; break; }
-                    _ => break,
-                }
-            }
+            // file copy ?-force? ?--? source target
+            let (force, start) = file_force_options(interp, args)?;
             if args.len() - start != 2 {
                 return Err(Error::wrong_args_with_usage(
-                    "file copy", 4, args.len(), "?-force? source target",
+                    "file copy",
+                    3,
+                    args.len(),
+                    "?-option value ...? source ?source ...? target",
                 ));
             }
             let src = args[start].as_str();
             let dst = args[start + 1].as_str();
+            if interp.host_fs.stat_full(src, false).is_err() {
+                return Err(posix_error(
+                    interp,
+                    format!("error copying \"{}\"", src),
+                    &std::io::Error::from_raw_os_error(libc_enoent()),
+                ));
+            }
             if !force && interp.host_fs.exists(dst) {
+                super::list::set_error_code(interp, "POSIX EEXIST {file already exists}");
                 return Err(Error::runtime(
                     // tclsh 消息形状（D-33）：error copying "src" to
                     // "dst": file already exists。
-                    format!(
-                        "error copying \"{}\" to \"{}\": file already exists",
-                        src, dst
-                    ),
-                    crate::error::ErrorCode::Io,
+                    format!("error copying \"{}\" to \"{}\": file already exists", src, dst),
+                    crate::error::ErrorCode::Generic,
                 ));
             }
-            interp.host_fs.copy(src, dst).map_err(|e| {
-                Error::runtime(
-                    format!("couldn't copy \"{}\": {}", src, e),
-                    crate::error::ErrorCode::Io,
-                )
-            })?;
+            interp
+                .host_fs
+                .copy(src, dst)
+                .map_err(|e| posix_error(interp, format!("error copying \"{}\" to \"{}\"", src, dst), &e))?;
             Ok(Value::empty())
         }
         "link" => {
@@ -718,17 +747,218 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
-/// Create a temporary file, return its path.
+/// `file tempfile ?nameVar? ?template?` — a fresh file and a read-write
+/// channel on it; `nameVar` gets the path (tclsh 8.6.17).
+///
+/// The file is created exclusively and readable by its owner only.  The
+/// name used to be `<prefix><nanosecond stamp>` created with plain
+/// `create`: anyone who could guess the stamp could plant a file there
+/// first (a symlink to something else) and have it written, and it was
+/// world-readable.
 #[cfg(feature = "file")]
 fn file_tempfile(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    let prefix = if args.len() >= 3 { args[2].as_str() } else { "tcl" };
-    let path = interp.host_fs.tempfile(prefix).map_err(|e| {
-        Error::runtime(
-            format!("couldn't create temp file: {}", e),
-            crate::error::ErrorCode::Io,
-        )
+    if args.len() > 4 {
+        return Err(Error::wrong_args_with_usage(
+            "file tempfile",
+            2,
+            args.len() - 1,
+            "?nameVar? ?template?",
+        ));
+    }
+    let mut path = std::path::PathBuf::new();
+    let template = args.get(3).map(|v| v.as_str());
+    let mut make_name = || match template {
+        None => std::env::temp_dir().join(format!("tcl_{}", random_suffix())),
+        Some(t) => tempfile_name(t),
+    };
+    let mut created = None;
+    // The name only has to vary: whether the file is this one is the
+    // file system's answer to an exclusive create.
+    for _ in 0..1000 {
+        let candidate = make_name();
+        let mut open = std::fs::OpenOptions::new();
+        open.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.mode(0o600);
+        }
+        match open.open(&candidate) {
+            Ok(f) => {
+                created = Some(f);
+                path = candidate;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(posix_error(
+                    interp,
+                    "can't create temporary file".to_string(),
+                    &e,
+                ));
+            }
+        }
+    }
+    let _ = created;
+    // Opened through the channel table, like any `open`: one place for
+    // the naming and the default configuration.
+    let id = interp.channels.open_file(&path.to_string_lossy(), "r+").map_err(|e| {
+        posix_error(interp, "can't create temporary file".to_string(), &e)
     })?;
-    Ok(Value::from_str(&path))
+    if let Some(var) = args.get(2) {
+        let var = var.as_str();
+        if !var.is_empty() {
+            interp.set_var(var, Value::from_str(&path.to_string_lossy()))?;
+        }
+    }
+    Ok(Value::from_str(&id))
+}
+
+/// tclsh's form of a temporary file's name.  A bare name goes into the
+/// temporary directory; a template with a directory part is taken as it
+/// stands (absolute, or against the current directory).  `_` and six
+/// random characters go before the extension — the template's own `X`s
+/// are not substituted (`pre` → `/tmp/pre_jojzKs`, `a.bXc.d` →
+/// `a.bXc_qdxLoE.d`).
+#[cfg(feature = "file")]
+fn tempfile_name(template: &str) -> std::path::PathBuf {
+    use std::path::Path;
+    let full = Path::new(template);
+    let full = if full.components().count() == 1 {
+        std::env::temp_dir().join(full)
+    } else {
+        full.to_path_buf()
+    };
+    let s = full.to_string_lossy();
+    let stem_end = s.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let split = s[stem_end..]
+        .rfind('.')
+        .filter(|&i| i > 0)
+        .map(|i| stem_end + i)
+        .unwrap_or(s.len());
+    std::path::PathBuf::from(format!(
+        "{}_{}{}",
+        &s[..split],
+        random_suffix(),
+        &s[split..]
+    ))
+}
+
+/// Six characters of `[A-Za-z0-9]`.  Uniqueness is the file system's to
+/// guarantee (the file is created exclusively); this only has to vary.
+#[cfg(feature = "file")]
+fn random_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let mut x = STATE.load(Ordering::Relaxed);
+    if x == 0 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        x = nanos ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x |= 1;
+    }
+    const ALPHABET: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut out = String::with_capacity(6);
+    for _ in 0..6 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.push(ALPHABET[(x % 62) as usize] as char);
+    }
+    STATE.store(x, Ordering::Relaxed);
+    out
+}
+
+/// tclsh's `file normalize`: lexical.  The path is made absolute against
+/// `cwd` (a leading `~` is the home directory), `.` and `..` are resolved
+/// and repeated separators collapsed — nothing is asked of the file
+/// system, so a path that does not exist normalizes too.  (`~user` is
+/// not expanded here.)
+#[cfg(feature = "file")]
+fn file_normalize(cwd: &str, path: &str) -> Result<Value> {
+    if path.is_empty() {
+        return Ok(Value::empty());
+    }
+    let mut path = path.to_string();
+    #[cfg(feature = "std")]
+    if let Some(rest) = path.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            if let Ok(home) = std::env::var("HOME") {
+                path = format!("{}{}", home.trim_end_matches('/'), rest);
+            }
+        }
+    }
+    let full = if path.starts_with('/') || cwd.is_empty() {
+        path
+    } else {
+        format!("{}/{}", cwd.trim_end_matches('/'), path)
+    };
+    let absolute = full.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for component in full.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if !parts.is_empty() && *parts.last().unwrap() != ".." {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    Ok(Value::from_str(&if absolute {
+        format!("/{}", joined)
+    } else {
+        joined
+    }))
+}
+
+/// The `-force` / `--` options of `file copy` and `file rename`, and
+/// where the paths start after them.
+#[cfg(feature = "file")]
+fn file_force_options(interp: &mut Interp, args: &[Value]) -> Result<(bool, usize)> {
+    let mut force = false;
+    let mut start = 2;
+    let options: Vec<String> = ["-force", "--"].iter().map(|o| o.to_string()).collect();
+    while start < args.len() {
+        let word = args[start].as_str();
+        if !word.starts_with('-') || word == "-" {
+            break;
+        }
+        match super::misc::index_in_table(word, &options, "option", false) {
+            Ok(0) => {
+                force = true;
+                start += 1;
+            }
+            Ok(_) => {
+                start += 1;
+                break;
+            }
+            Err((e, code)) => {
+                super::list::set_error_code(interp, &code);
+                return Err(e);
+            }
+        }
+    }
+    Ok((force, start))
+}
+
+/// `ENOENT` as an `io::Error`, without naming a libc.
+#[cfg(feature = "file")]
+fn libc_enoent() -> i32 {
+    #[cfg(unix)]
+    {
+        2
+    }
+    #[cfg(not(unix))]
+    {
+        2
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2109,9 +2339,14 @@ mod tests {
     #[test]
     fn test_file_tempfile() {
         let mut interp = Interp::new();
-        let result = interp.eval("file tempfile").unwrap();
-        let path = std::path::Path::new(result.as_str());
+        // A channel on the new file (tclsh); the path comes back in the
+        // variable given.
+        let channel = interp.eval("file tempfile _tmpname").unwrap();
+        assert!(interp.eval(&format!("fconfigure {}", channel.as_str())).is_ok());
+        let name = interp.get_var("_tmpname").unwrap().as_str().to_string();
+        let path = std::path::Path::new(&name);
         assert!(path.exists());
+        interp.eval(&format!("close {}", channel.as_str())).unwrap();
         cleanup(path);
     }
 

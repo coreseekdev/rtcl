@@ -52,6 +52,30 @@ pub fn compile_with_options(
     Ok((nfa::compile(&tree, effective.icase)?, effective))
 }
 
+thread_local! {
+    /// Set when a matcher gave up before it finished — the backtracker's
+    /// step and endpoint budgets, the capture dissection's depth limit.
+    /// What it returned is then not an answer, and the command layer
+    /// reports it rather than pass a partial result off as "no match"
+    /// (`regexp {a+()\1x}` on 2,000 characters used to return 0).
+    static OVER_BUDGET: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// A matcher ran out of budget (see [`OVER_BUDGET`]).
+pub(crate) fn over_budget() {
+    let _ = OVER_BUDGET.try_with(|f| f.set(true));
+}
+
+/// Whether a matcher ran out of budget since the last call; resets it.
+pub fn take_over_budget() -> bool {
+    OVER_BUDGET.with(|f| f.replace(false))
+}
+
+/// Whether a matcher ran out of budget (without resetting it).
+pub fn is_over_budget() -> bool {
+    OVER_BUDGET.with(|f| f.get())
+}
+
 /// 运行时选择。Spencer 移植已是默认引擎；`RTCL_REGEX_ENGINE=fast`
 ///（或 `0`/`off`）可退回旧的 fast/BT 路径（差分/应急用），
 /// `spencer`/`1` 显式选择新引擎。

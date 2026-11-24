@@ -683,6 +683,39 @@ fn probe_lexeme(rest: &[u8]) -> Option<Lx> {
 /// Scan a quoted string from its opening `"`.  Returns the index of the
 /// closing quote, or the scan error inside it.  Quoted strings process
 /// `$` references, `[` scripts, and backslash escapes.
+thread_local! {
+    /// Nesting open in the scanners below.
+    static SCAN_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Scanner nesting accepted: the evaluation-nesting limit the same text
+/// would hit when evaluated (the parser's own cap on `[` nesting).
+const SCAN_NEST_LIMIT: u32 = 1000;
+
+/// One nesting level of the mutually recursive scanners (a `[` inside a
+/// quoted word, a `$` inside a script, …). They are free functions over a
+/// byte slice, so the depth is thread-local. Each level is native
+/// recursion: `expr` with 16,000 nested `[` ran the stack out. Past the
+/// limit the scan fails with tclsh's evaluation-nesting error.
+fn scan_nested(
+    e: &[u8],
+    open: usize,
+    f: fn(&[u8], usize) -> Result<usize, ScanErr>,
+) -> Result<usize, ScanErr> {
+    let depth = SCAN_DEPTH.with(|d| d.get());
+    if depth >= SCAN_NEST_LIMIT {
+        return Err((
+            "too many nested evaluations (infinite loop?)".to_string(),
+            open,
+            1,
+        ));
+    }
+    SCAN_DEPTH.with(|d| d.set(depth + 1));
+    let r = f(e, open);
+    SCAN_DEPTH.with(|d| d.set(d.get() - 1));
+    r
+}
+
 fn scan_quoted(e: &[u8], open: usize) -> Result<usize, ScanErr> {
     let mut i = open + 1;
     while i < e.len() {
@@ -690,11 +723,11 @@ fn scan_quoted(e: &[u8], open: usize) -> Result<usize, ScanErr> {
             b'\\' => i += 2,
             b'"' => return Ok(i),
             b'[' => {
-                let end = scan_script(e, i)?;
+                let end = scan_nested(e, i, scan_script)?;
                 i = end + 1;
             }
             b'$' => {
-                let end = scan_variable(e, i)?;
+                let end = scan_nested(e, i, scan_variable)?;
                 i = end;
             }
             _ => i += 1,
@@ -758,13 +791,13 @@ fn scan_script(e: &[u8], open: usize) -> Result<usize, ScanErr> {
                 word_start = false;
             }
             b'[' => {
-                let end = scan_script(e, i)?;
+                let end = scan_nested(e, i, scan_script)?;
                 i = end + 1;
                 word_start = false;
             }
             b'"' | b'{' if word_start => {
                 let (closed, reason) = if e[i] == b'"' {
-                    (scan_quoted(e, i)?, "extra characters after close-quote")
+                    (scan_nested(e, i, scan_quoted)?, "extra characters after close-quote")
                 } else {
                     (scan_braced(e, i)?, "extra characters after close-brace")
                 };
@@ -787,7 +820,7 @@ fn scan_script(e: &[u8], open: usize) -> Result<usize, ScanErr> {
                 i = after;
             }
             b'$' => {
-                let end = scan_variable(e, i)?;
+                let end = scan_nested(e, i, scan_variable)?;
                 i = end;
                 word_start = false;
             }
@@ -832,11 +865,11 @@ fn scan_variable(e: &[u8], dollar: usize) -> Result<usize, ScanErr> {
                 b')' => return Ok(i + 1),
                 b'\\' => i += 2,
                 b'[' => {
-                    let end = scan_script(e, i)?;
+                    let end = scan_nested(e, i, scan_script)?;
                     i = end + 1;
                 }
                 b'$' => {
-                    let end = scan_variable(e, i)?;
+                    let end = scan_nested(e, i, scan_variable)?;
                     i = end;
                 }
                 _ => i += 1,

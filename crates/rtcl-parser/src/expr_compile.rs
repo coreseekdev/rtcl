@@ -60,7 +60,14 @@ pub fn try_compile_expr(
     if tokens.len() == 1 {
         return false;
     }
-    let mut parser = ExprCodegen { sink, tokens: &tokens, pos: 0, line, expr_base };
+    let mut parser = ExprCodegen {
+        sink,
+        tokens: &tokens,
+        pos: 0,
+        line,
+        expr_base,
+        nest: 0,
+    };
     if parser.parse_bitor().is_err() {
         return false;
     }
@@ -382,9 +389,23 @@ struct ExprCodegen<'a> {
     pos: usize,
     line: u32,
     expr_base: Option<u32>,
+    /// Levels of recursive descent open (see [`EXPR_NEST_LIMIT`]).
+    nest: u32,
 }
 
 type CResult = Result<(), ()>;
+
+/// Recursive-descent nesting an expression may have: parenthesized
+/// subexpressions, unary operators, `**` operands, function arguments.
+/// Each level is native recursion in both parsers — about 14 frames and
+/// 2KB of stack per paren at run time — so it has to be bounded: `expr`
+/// with 4,000 nested parens or 50,000 unary minus signs ran the stack out
+/// (tclsh's parser keeps a node stack and takes any depth). 250 leaves
+/// two orders of magnitude over real code and fits a 1MB wasm stack.
+/// Past it the compiler leaves the expression to the run-time evaluator,
+/// which reports the depth there — at call time, like any other
+/// expression error.
+pub const EXPR_NEST_LIMIT: u32 = 250;
 
 impl<'a> ExprCodegen<'a> {
     fn peek(&self) -> Option<&Token> {
@@ -404,6 +425,20 @@ impl<'a> ExprCodegen<'a> {
         } else {
             false
         }
+    }
+
+    /// Run `f` one nesting level deeper; past [`EXPR_NEST_LIMIT`] the
+    /// expression is not compiled (`Err(())`, the caller's fallback
+    /// signal). The level is left again however `f` returns.
+    fn nested(&mut self, f: impl FnOnce(&mut Self) -> CResult) -> CResult {
+        self.nest += 1;
+        if self.nest > EXPR_NEST_LIMIT {
+            self.nest -= 1;
+            return Err(());
+        }
+        let r = f(self);
+        self.nest -= 1;
+        r
     }
 
     // -- Precedence levels (lowest to highest) --
@@ -542,7 +577,7 @@ impl<'a> ExprCodegen<'a> {
     fn parse_power(&mut self) -> CResult {
         self.parse_unary()?;
         if self.match_tok(&Token::StarStar) {
-            self.parse_power()?; // right-associative
+            self.nested(|p| p.parse_power())?; // right-associative
             self.sink.emit(OpCode::Pow, self.line);
         }
         Ok(())
@@ -551,7 +586,7 @@ impl<'a> ExprCodegen<'a> {
     /// Unary: `-`, `+`, `!`, `~`
     fn parse_unary(&mut self) -> CResult {
         if self.match_tok(&Token::Minus) {
-            self.parse_unary()?;
+            self.nested(|p| p.parse_unary())?;
             self.sink.emit(OpCode::Neg, self.line);
             Ok(())
         } else if self.match_tok(&Token::Plus) {
@@ -561,11 +596,11 @@ impl<'a> ExprCodegen<'a> {
             // in the ISA: fall back to the runtime evaluator.
             Err(())
         } else if self.match_tok(&Token::Not) {
-            self.parse_unary()?;
+            self.nested(|p| p.parse_unary())?;
             self.sink.emit(OpCode::Not, self.line);
             Ok(())
         } else if self.match_tok(&Token::BitNot) {
-            self.parse_unary()?;
+            self.nested(|p| p.parse_unary())?;
             self.sink.emit(OpCode::BitNot, self.line);
             Ok(())
         } else {
@@ -592,7 +627,7 @@ impl<'a> ExprCodegen<'a> {
                 Ok(())
             }
             Some(Token::LParen) => {
-                self.parse_bitor()?;
+                self.nested(|p| p.parse_bitor())?;
                 if !self.match_tok(&Token::RParen) {
                     return Err(());
                 }

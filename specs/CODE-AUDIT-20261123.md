@@ -64,9 +64,9 @@
 |---|---|---|---|---|
 | S15 | 嵌套 list/dict 约 1.3 万层转字符串；16 万层的 list `unset` | `value.rs` `serialize_list` / `drop_last_owner` | 序列化与 Drop 都是原生递归；wasm 5000 层即中 | 已修（M2） |
 | S16 | `json decode` 约 1.5–2 万层嵌套 | `commands/json.rs` | 纯数据驱动，输入几十 KB；wasm 约 5000 层 | 已修（M2） |
-| S17 | `expr` 非花括号 4000 层括号、5 万个连续 `-` | `types/expr.rs`、`expr_check.rs`、`parser/src/expr_compile.rs` | 三套独立递归下降都无深度概念 | 未修 |
-| S18 | proc 内 2 万层嵌套 `[…]` | `parser/src/compiler.rs` | 不调用也崩 | 未修 |
-| S19 | 正则：6000 层嵌套括号；`((a{255}){255}){255}`；`(.*)x` 匹配 3 万字符 | `regexp-spencer` `parser.rs` / `captures.rs` | 后两项吃满近 3GB 后 abort | 未修 |
+| S17 | `expr` 非花括号 4000 层括号、5 万个连续 `-` | `types/expr.rs`、`expr_check.rs`、`parser/src/expr_compile.rs` | 三套独立递归下降都无深度概念 | 已修（M2） |
+| S18 | proc 内 2 万层嵌套 `[…]` | `parser/src/compiler.rs` | 不调用也崩 | 已修（M2） |
+| S19 | 正则：6000 层嵌套括号；`((a{255}){255}){255}`；`(.*)x` 匹配 3 万字符 | `regexp-spencer` `parser.rs` / `captures.rs` | 后两项吃满近 3GB 后 abort | 已修（M2） |
 | S20 | proc 递归 650–1000 层 | `interp/mod.rs` `max_call_depth` | 上限 1000 没按栈大小校准：wasm 必崩且毒化实例，原生栈 ≤3MB 也崩 | 未修 |
 | S21 | `lrepeat 4294967296 x`、`string repeat x 4294967296` | 同 S9 | 分配失败 = abort，不可 catch；tclsh 报 Tcl 错误 | 未修 |
 | S22 | `eval eval … 1` 嵌套 2000 层 | `interp/eval.rs` | 输入 1 万字节，报递归错误前已占 306MB | 未修 |
@@ -109,7 +109,7 @@
 | # | 现象 | 位置 | 处置 |
 |---|---|---|---|
 | C1 | 一个编译体内 ≥65536 个常量/局部变量/参数时操作数 `as u16` 截断；`p PARAM` 返回 `65535 65536` | `parser/src/compiler.rs`、`rtcl-ir/src/bytecode.rs` | 未修 |
-| C2 | 回溯预算耗尽后 `regexp {a+()\1x}` 对 2000 个 `a` 返回“不匹配” | `regexp-spencer/src/backtrack.rs` | 未修 |
+| C2 | 回溯预算耗尽后 `regexp {a+()\1x}` 对 2000 个 `a` 返回“不匹配” | `regexp-spencer/src/backtrack.rs` | 已修（M2） |
 | C3 | `set g 0; upvar 0 g q; set q 5` 之后 `$g` 仍是 0 | `interp/vm_exec.rs` 顶层槽边界 | 未修 |
 | C4 | 命令中途重定义后再注册的 write-trace 永不触发 | `interp/vm_exec.rs` tier1 重分派 | 未修 |
 | C5 | `+ 9223372036854775807 1` 得负数，`expr` 正确宽化 | `commands/misc.rs` | 已修（M1） |
@@ -120,6 +120,7 @@
 | C10 | 旧式八进制 ≥2^63 回绕；大写十六进制 bignum 判为非数字 | `value.rs`、`types/bignum.rs` | 已修（M1） |
 | C11 | `wait` 对已退出后台进程返回 127，`-nohang` 恒为 NONE | `commands/os.rs` | 未修 |
 | C12 | 修复过程中新查出：`set v 018; expr {$v + 0}` 得 18（tclsh 报 invalid octal）；超过 64 位的旧式八进制被当作十进制；带 bignum 操作数的浮点运算取错值。根因是 Tcl 整数字面量语法有**四套**各自独立的实现（`value.rs`、`bignum.rs`、`expr.rs` 两处、`list.rs`），对旧式八进制理解不一 | `types/bignum.rs` | 已修（M1）：合并为单一的 `bignum::parse_int`，四处改为调用它 |
+| C14 | 修复过程中新查出：**约 100 字符的正则**——25 层嵌套的 `{2}`——在解析阶段吃光 3GB 后 abort；tclsh 对同样模式 16ms 内报 `out of memory`。量词重写克隆操作数，嵌套量词让语法树每层翻倍，NFA 再按乘积展开 | `regexp-spencer/src/ast.rs`、`parser.rs` | 已修（M2）：每个节点带预估状态数，解析时超编译空间预算即拒绝（tclsh 的 `REG_ESPACE`）；组嵌套上限 250 |
 | C13 | 修复过程中新查出：`json encode` 的 schema 文本按词递归（`list list list …` 重复几万次即栈溢出），JSON 解码的递归下降无深度上限 | `commands/json.rs` | 已修（M2）：文档与 schema 的嵌套上限 1000，超限报错 |
 
 ## P2：性能（`TODO.md` 未列，本机单次实测，只看量级）
@@ -133,7 +134,8 @@
 | P5 | `array size` 按作用域变量总数计 | 2.6s | ≈0 | `commands/array.rs` |
 | P6 | 变量哈希不扩散，同前缀名退化 | 超线性 | 线性 | `interp/varmap.rs` |
 | P7 | 编译期 O(n²)（2 万个 `for`） | 4.6s | 0.10s | `parser/src/compiler.rs` |
-| P8 | 正则捕获组量词立方级；lookahead 慢约 9 倍；无已编译模式缓存 | 2.8s | 33ms | `regexp-spencer/src/captures.rs` |
+| P8 | 正则捕获组量词立方级；相邻变长捕获组 `(a+)(b+)` 是 O(n³)（400 字符单次 20ms、800 字符跑不完，基线版本 400 字符即挂死）；lookahead 慢约 9 倍；每次调用重新编译模式（无捕获 7–12µs、带捕获 12µs 对 tclsh 0.5µs） | 2.8s / 20ms / 12µs | 33ms / 7µs / 0.58µs | `regexp-spencer/src/captures.rs`、`commands/regexp_cmds.rs` |
+| P8a | （已修，M2）上行的前三项：定长操作数按算术数迭代；切分点由一次锚定 NFA 模拟给出而不是逐个盲试；定长部分只有一个候选切分点 | 20ms / 2.8s | 7µs / 33ms | 同上 |
 | P9 | 文件读取逐字节（32MB） | ≈0.6s | 58ms | `channel.rs` |
 | P10 | 树引擎对嵌套立方级，且无条件编译 | >10s | 0.2s | `interp/eval.rs` |
 | P11 | 每次创建子解释器约 460KB / 3.4ms | — | — | `commands/interp_cmd.rs` |
@@ -186,6 +188,11 @@
 - 对照基线：10 万层嵌套 list 的销毁 8–13ms → 4–5ms（迭代路径反而更快）；
   宽列表（200 万元素）与字符串列表的销毁无变化；1.6 万层嵌套 list 上
   25 个命令里基线有 17 个栈溢出，现全部正常返回。
+- 嵌套 `{2}` 量词正则（100 字符）：3GB 后 abort → 约 40ms 内报
+  `couldn't compile regular expression pattern: out of memory`（同 tclsh）。
+- 带捕获的匹配：20 万次 `regexp {(\w+)-(\d+)}` 1872ms → 2325ms（基线
+  每次较慢是另一形态）——单次 94µs → 12µs；`regexp -inline {(a+)(b+)}`
+  400 字符：基线跑不完 → 26µs/次；24 个对照用例结果与 tclsh 逐字一致。
 - 已知限制（与 tclsh 的对象模型相同，非本次引入）：嵌套 list 的字符串化
   是 O(n²) 内存——每层缓存自己的字符串。4 万层时 rtcl 峰值 3.2GB
   并正常完成；tclsh 涨到 17.5GB 后段错误。

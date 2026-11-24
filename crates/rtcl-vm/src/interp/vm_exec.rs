@@ -3476,7 +3476,12 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
         // ── Evaluation ──────────────────────────────────────────────────
         OpCode::EvalScript => {
             let script = st.pop_val();
-            match interp.eval(script.as_str()) {
+            // A nested eval of bracket text nests native frames without a
+            // proc call: one level of the nesting budget.
+            interp.enter_nested()?;
+            let nested = interp.eval(script.as_str());
+            interp.leave_nested();
+            match nested {
                 Ok(v) => st.stack.push(v),
                 Err(e) => {
                     // Word context: the nested eval logged its own frames;

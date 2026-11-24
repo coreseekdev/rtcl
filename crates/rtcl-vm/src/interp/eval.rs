@@ -1562,7 +1562,14 @@ impl Interp {
                 if same_unit && self.lexical_body {
                     self.next_eval_lexical = true;
                 }
+                // Evaluating the bracket's text nests without a proc call
+                // in between (the inner words are evaluated before the
+                // inner command dispatches): one level of the nesting
+                // budget, so that deep `[` nesting is an error, not a
+                // stack overflow.
+                self.enter_nested()?;
                 let r = self.eval(cmd);
+                self.leave_nested();
                 match r {
                     Ok(v) => Ok(v),
                     Err(e) => {

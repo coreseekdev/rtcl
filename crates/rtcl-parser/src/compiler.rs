@@ -73,6 +73,8 @@ pub struct Compiler {
     /// and cleared around nested loop compilations — their bodies' breaks
     /// and continues belong to the nested loop.
     in_next: bool,
+    /// Levels of `[...]` inlining open (see [`SUB_INLINE_NEST_LIMIT`]).
+    sub_depth: u32,
     /// True while compiling a *procedure body*: parameters are seeded into
     /// the locals table and plain-name variable reads/writes of table
     /// names compile to slot ops (`LoadLocal`/`StoreLocal`/`IncrLocal`).
@@ -93,6 +95,14 @@ pub struct Compiler {
     /// 通过消费门（gate: code.epoch == tier1_epoch）。
     skip_folds: Vec<String>,
 }
+
+/// Nested `[...]` words one unit inlines before deeper ones fall back to
+/// `EvalScript`. Inlining is native recursion in the compiler (a frame
+/// chain per level, plus a re-parse of the remaining text) — a proc body
+/// with 20,000 nested `[list [` used to abort at the `proc` definition.
+/// The parser caps a script at [`crate::rd::SUB_NEST_LIMIT`] levels, so the
+/// nested evals this leaves are at most that over this: a handful.
+const SUB_INLINE_NEST_LIMIT: u32 = 50;
 
 /// May a name of this shape live in a proc's compiled locals table?
 /// Slot names are plain: no `::` qualification, no array reference, and
@@ -170,6 +180,7 @@ impl Compiler {
         let mut c = Compiler {
             bytecode: ByteCode::new(),
             loops: Vec::new(),
+            sub_depth: 0,
             source: Rc::clone(&source),
             span_base: 0,
             line_base: 0,
@@ -524,6 +535,13 @@ impl Compiler {
     /// owns the exact semantics (parse errors with their own frames,
     /// transparent bodies, traces).
     fn try_compile_sub(&mut self, script: &str, cmd: &Command, word_idx: usize) -> bool {
+        // Each inlined bracket nests this compiler's own recursion (and
+        // re-parses the remaining text). Past the limit the word stays
+        // `EvalScript`; the nested eval bounds it from there (the parser
+        // has already capped what a script may contain).
+        if self.sub_depth >= SUB_INLINE_NEST_LIMIT {
+            return false;
+        }
         let Some(ws) = cmd.word_srcs.get(word_idx) else {
             return false;
         };
@@ -540,6 +558,7 @@ impl Compiler {
             return false;
         };
         let content_start = abs.start + 1;
+        self.sub_depth += 1;
         let saved = (self.span_base, self.line_base, self.line_ctx);
         self.span_base = content_start;
         // tclsh 在**编译 proc 体**里把括号内容内联进同一行表（行 = 单元
@@ -561,6 +580,7 @@ impl Compiler {
         self.span_base = saved.0;
         self.line_base = saved.1;
         self.line_ctx = saved.2;
+        self.sub_depth -= 1;
         true
     }
 

@@ -12,7 +12,10 @@ type Caps = Vec<Option<(usize, usize)>>;
 type State = (usize, Caps);
 
 const BUDGET: u64 = 2_000_000;
-const MAX_ENDS: usize = 512;
+/// States one node may hand on. Hitting it leaves the match unfinished
+/// (`super::over_budget`): at 512, `a+()\1x` over 2,000 characters lost
+/// the one endpoint that satisfies `x` and answered "no match".
+const MAX_ENDS: usize = 4096;
 
 struct Bt<'a> {
     prog: &'a Prog,
@@ -60,6 +63,7 @@ impl<'a> Bt<'a> {
         out: &mut Vec<State>,
     ) {
         if self.budget == 0 || out.len() >= MAX_ENDS {
+            super::over_budget();
             return;
         }
         self.budget -= 1;
@@ -99,6 +103,7 @@ impl<'a> Bt<'a> {
                 for b in branches {
                     self.node(b, pos, record, caps, out);
                     if self.budget == 0 || out.len() >= MAX_ENDS {
+                        super::over_budget();
                         return;
                     }
                 }
@@ -160,6 +165,7 @@ impl<'a> Bt<'a> {
                 let mut c = sc.clone();
                 self.node(p, *sp, record, &mut c, &mut next);
                 if self.budget == 0 || next.len() >= MAX_ENDS {
+                    super::over_budget();
                     break;
                 }
             }
@@ -204,6 +210,7 @@ impl<'a> Bt<'a> {
         out: &mut Vec<State>,
     ) {
         if self.budget == 0 || out.len() >= MAX_ENDS {
+            super::over_budget();
             return;
         }
         self.budget -= 1;
@@ -211,6 +218,36 @@ impl<'a> Bt<'a> {
             out.push((pos, caps.clone()));
         }
         if count >= maxc {
+            return;
+        }
+        // A fixed-length operand has exactly one endpoint per iteration
+        // (ast::fixed_len): iterate instead of recursing — the recursion
+        // was one level per character (`a+()\1x` over 40,000 characters
+        // ran the stack out).
+        if let Some(len) = super::ast::fixed_len(child).filter(|l| *l > 0) {
+            let mut p = pos;
+            let mut count = count;
+            let mut c = caps.clone();
+            while count < maxc && p + len <= self.text.len() {
+                if self.budget == 0 || out.len() >= MAX_ENDS {
+                    super::over_budget();
+                    break;
+                }
+                self.budget -= 1;
+                let mut one = Vec::new();
+                if record {
+                    zap(child, &mut c);
+                }
+                self.node(child, p, record, &mut c, &mut one);
+                let step = one.into_iter().find(|(e, _)| *e == p + len);
+                let Some((e, nc)) = step else { break };
+                p = e;
+                count += 1;
+                c = nc;
+                if count >= min {
+                    out.push((p, c.clone()));
+                }
+            }
             return;
         }
         let mut inner = Vec::new();

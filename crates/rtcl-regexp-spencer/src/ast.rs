@@ -125,11 +125,85 @@ pub enum AssertKind {
     NotWordB,
 }
 
+/// NFA states a compiled program may have — Spencer's compile-space limit
+/// (`REG_ESPACE`, "out of memory").
+///
+/// Bounded repeats unroll, multiplicatively when nested:
+/// `((a{255}){255}){255}` is 16.6 million states. And the quantifier
+/// rewrite clones its operand, so nested quantifiers double the tree per
+/// level: 25 nested `{2}` — a 100-character pattern — exhausted 3GB here
+/// (allocation failure, an abort) where tclsh answers `out of memory` in
+/// 16ms. Every node carries its [`Node::weight`] (saturating); the parser
+/// refuses a node past this before anything is built on it.
+pub const MAX_WEIGHT: u64 = 20_000;
+
+/// The number of characters a node consumes on every match, when that
+/// number is fixed: a character or class is 1, a concatenation the sum,
+/// an alternation only when all its branches agree, a repeat only when
+/// `min == max`. `None` for anything that can vary (open-ended repeats,
+/// backreferences). Zero-width nodes are 0.
+///
+/// A repeat whose operand has a fixed length needs no search: its
+/// iterations partition the span at multiples of that length, so the
+/// matchers count them instead of trying every endpoint and recursing
+/// per iteration (`(.*)x` over 30,000 characters recursed once per
+/// character and allocated an O(n) endpoint list at each level).
+pub fn fixed_len(n: &Node) -> Option<usize> {
+    use NodeKind::*;
+    match &n.kind {
+        Empty | Assert(_) | Look { .. } => Some(0),
+        Char(_) | Class(_) => Some(1),
+        Concat(parts) => parts.iter().try_fold(0usize, |a, p| a.checked_add(fixed_len(p)?)),
+        Alt(branches) => {
+            let first = fixed_len(&branches[0])?;
+            branches.iter().all(|b| fixed_len(b) == Some(first)).then_some(first)
+        }
+        Repeat { node, min, max } => {
+            if min == max && *max < DUPINF {
+                fixed_len(node)?.checked_mul(*min as usize)
+            } else {
+                None
+            }
+        }
+        Capture { node, .. } | NoRecord(node) => fixed_len(node),
+        Backref { .. } => None,
+    }
+}
+
 /// 树节点（`subre`）。
 #[derive(Clone, Debug)]
 pub struct Node {
     pub flags: Flags,
     pub kind: NodeKind,
+    /// States the NFA built from this node has (see [`MAX_WEIGHT`]).
+    /// Saturating: past the limit only "too large" matters.
+    pub weight: u64,
+}
+
+/// [`Node::weight`] of a node kind, from its children's weights.
+fn weight_of(kind: &NodeKind) -> u64 {
+    use NodeKind::*;
+    let sum = |ns: &[Node]| ns.iter().fold(0u64, |a, n| a.saturating_add(n.weight));
+    match kind {
+        Empty => 0,
+        Char(_) | Class(_) | Assert(_) | Backref { .. } => 1,
+        Concat(parts) => sum(parts),
+        Alt(branches) => sum(branches).saturating_add(1),
+        Repeat { node, min, max } => {
+            let w = node.weight;
+            if *max >= DUPINF {
+                // The loop plus `min` mandatory copies of the body.
+                w.saturating_mul(u64::from(*min)).saturating_add(w).saturating_add(2)
+            } else {
+                // `max` copies in a row, `(max - min)` of them skippable.
+                w.saturating_mul(u64::from(*max))
+                    .saturating_add(u64::from(max - min))
+                    .saturating_add(1)
+            }
+        }
+        Capture { node, .. } | NoRecord(node) => node.weight,
+        Look { node, .. } => node.weight.saturating_add(1),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -170,7 +244,7 @@ pub enum NodeKind {
 
 impl Node {
     pub fn new(kind: NodeKind, flags: Flags) -> Node {
-        Node { flags, kind }
+        Node { flags, weight: weight_of(&kind), kind }
     }
 
     pub fn empty() -> Node {

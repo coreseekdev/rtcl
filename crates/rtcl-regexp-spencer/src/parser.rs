@@ -69,7 +69,14 @@ pub struct Parser {
     /// ERE 的分组深度：POSIX ERE 里未匹配的 `)` 是普通字符
     /// （tclsh 8.6.17 实测），只有深度 > 0 时才结束分支。
     depth: usize,
+    /// Group nesting open in the recursive descent (see [`MAX_NEST`]).
+    nest: usize,
 }
+
+/// Group nesting the parser descends. Each level is native recursion —
+/// 6,000 nested `(` ran the stack out (tclsh answers `out of memory`) —
+/// and real patterns sit two orders of magnitude below this.
+const MAX_NEST: usize = 250;
 
 impl Parser {
     pub fn new(pattern: &str, opts: Options) -> Parser {
@@ -82,6 +89,7 @@ impl Parser {
             next_sub: 1,
             lacon: 0,
             depth: 0,
+            nest: 0,
         }
     }
 
@@ -97,6 +105,11 @@ impl Parser {
             return Ok((Node::concat(parts), opts));
         }
         let node = self.parse_alt()?;
+        // The quantifier checks bound multiplication; this bounds plain
+        // size (a megabyte pattern is a million states).
+        if node.weight > super::ast::MAX_WEIGHT {
+            return Err(Self::too_big());
+        }
         if self.i < self.chars.len() {
             // 顶层多余的 ')' 或未消费字符。
             return Err(Error::new(
@@ -132,6 +145,24 @@ impl Parser {
         } else {
             false
         }
+    }
+
+    /// tclsh's compile-space error: the pattern would need more NFA
+    /// states than [`super::ast::MAX_WEIGHT`].
+    fn too_big() -> Error {
+        Self::err("REG_ESPACE", "out of memory")
+    }
+
+    /// Parse one nesting level (a `(`…`)` group, a lookahead body). The
+    /// level is left again however the parse ends.
+    fn nested_alt(&mut self) -> Result<Node, Error> {
+        if self.nest >= MAX_NEST {
+            return Err(Self::too_big());
+        }
+        self.nest += 1;
+        let r = self.parse_alt();
+        self.nest -= 1;
+        r
     }
 
     fn err(code: &'static str, msg: &str) -> Error {
@@ -458,9 +489,16 @@ impl Parser {
                 max - 1
             };
             let prefix = Node::no_record(Node::repeat(atom.clone(), min - 1, pmax, qprefer));
+            if prefix.weight > super::ast::MAX_WEIGHT {
+                return Err(Self::too_big());
+            }
             return Ok(with_leading(leading, Node::concat(vec![prefix, atom])));
         }
-        Ok(with_leading(leading, Node::repeat(atom, min, max, qprefer)))
+        let repeated = Node::repeat(atom, min, max, qprefer);
+        if repeated.weight > super::ast::MAX_WEIGHT {
+            return Err(Self::too_big());
+        }
+        Ok(with_leading(leading, repeated))
     }
 
     /// `{m}` / `{m,}` / `{m,n}`；调用方已确认 `{` 后是数字。
@@ -674,7 +712,7 @@ impl Parser {
         let subno = self.next_sub;
         self.next_sub += 1;
         self.depth += 1;
-        let inner = self.parse_alt();
+        let inner = self.nested_alt();
         self.depth -= 1;
         let inner = inner?;
         if !self.eat(')') {
@@ -723,7 +761,7 @@ impl Parser {
             '(' => {
                 let subno = self.next_sub;
                 self.next_sub += 1;
-                let inner = self.parse_alt()?;
+                let inner = self.nested_alt()?;
                 if !(self.peek() == Some('\\') && self.at(1) == Some(')')) {
                     return Err(Self::err("REG_EPAREN", "parentheses () not balanced"));
                 }
@@ -777,7 +815,7 @@ impl Parser {
             match self.peek() {
                 Some(':') => {
                     self.i += 1;
-                    let inner = self.parse_alt()?;
+                    let inner = self.nested_alt()?;
                     if !self.eat(')') {
                         return Err(Self::err("REG_EPAREN", "parentheses () not balanced"));
                     }
@@ -794,7 +832,7 @@ impl Parser {
                     let negative = self.peek() == Some('!');
                     self.i += 1;
                     self.lacon += 1;
-                    let inner = self.parse_alt();
+                    let inner = self.nested_alt();
                     self.lacon -= 1;
                     let inner = inner?;
                     if !self.eat(')') {
@@ -811,7 +849,7 @@ impl Parser {
             if self.lacon > 0 {
                 // lookahead 内所有括号非捕获，且不占用组号（tclsh：
                 // `(?=(a))(a)` 的 (a) 仍是第 1 组）。
-                let inner = self.parse_alt()?;
+                let inner = self.nested_alt()?;
                 if !self.eat(')') {
                     return Err(Self::err("REG_EPAREN", "parentheses () not balanced"));
                 }
@@ -821,7 +859,7 @@ impl Parser {
             }
             let subno = self.next_sub;
             self.next_sub += 1;
-            let inner = self.parse_alt()?;
+            let inner = self.nested_alt()?;
             if !self.eat(')') {
                 return Err(Self::err("REG_EPAREN", "parentheses () not balanced"));
             }

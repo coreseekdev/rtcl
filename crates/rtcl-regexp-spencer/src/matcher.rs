@@ -440,6 +440,48 @@ pub(crate) fn matches_at(prog: &Prog, text: &[char], pos: usize, search_start: u
     false
 }
 
+/// End offsets `p` — ascending, `pos <= p <= limit` — at which `prog`
+/// has an anchored match of `text[pos..p)`: one NFA simulation. The
+/// capture dissection used to try every offset as a split point.
+pub(crate) fn prefix_ends(
+    prog: &Prog,
+    text: &[char],
+    pos: usize,
+    search_start: usize,
+    limit: usize,
+) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut sc = Scanner::new(prog, text, search_start);
+    let mut seeds = vec![(prog.start, 0usize)];
+    sc.closure(&seeds, pos);
+    if sc.cur.contains(&prog.accept) {
+        ends.push(pos);
+    }
+    let mut p = pos;
+    while p < limit && p < text.len() {
+        let ch = text[p];
+        seeds.clear();
+        for &s in &sc.cur {
+            for t in &prog.states[s].trans {
+                if let Trans::Char(set, to) = t {
+                    if set.matches(ch, prog.icase) {
+                        seeds.push((*to, 0));
+                    }
+                }
+            }
+        }
+        p += 1;
+        if seeds.is_empty() {
+            break;
+        }
+        sc.closure(&seeds, p);
+        if sc.cur.contains(&prog.accept) {
+            ends.push(p);
+        }
+    }
+    ends
+}
+
 struct Scanner<'a> {
     prog: &'a Prog,
     text: &'a [char],

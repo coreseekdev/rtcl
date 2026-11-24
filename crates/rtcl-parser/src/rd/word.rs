@@ -438,6 +438,16 @@ fn try_parse_var_index(cur: &mut Cursor) -> Option<String> {
 // Command substitution: [script]
 // ---------------------------------------------------------------------------
 
+/// Command-substitution nesting a script may contain: tclsh's evaluation
+/// nesting limit (it reports `too many nested evaluations` past it).
+///
+/// The whole chain below a bracket lies inside that bracket, so the
+/// outermost parse sees the full depth in one scan. Refusing it there —
+/// before any per-level re-parse (quadratic) or native recursion (the
+/// compiler inlining each level, the tree engine evaluating each level)
+/// runs — is what keeps `[list [list [ … 20,000 deep …` from aborting.
+pub(crate) const SUB_NEST_LIMIT: usize = 1000;
+
 /// Parse `[...]` and return the inner script text.
 ///
 /// Uses jimtcl-style `startofword` tracking so that `"` and `{` only
@@ -466,6 +476,16 @@ pub fn parse_cmd_sub(cur: &mut Cursor, _bracket_term: bool) -> ParseResult<Strin
     while !cur.at_end() && !openers.is_empty() {
         match cur.peek() {
             Token::LeftBracket => {
+                if openers.len() > SUB_NEST_LIMIT {
+                    return Err(ParseError {
+                        message: "too many nested evaluations (infinite loop?)".into(),
+                        line: cur.line(),
+                        column: 0,
+                        offset: cur.pos(),
+                        cmd_start: None,
+                        cmd_line: None,
+                    });
+                }
                 openers.push(cur.pos());
                 startofword = true;
                 cur.advance();

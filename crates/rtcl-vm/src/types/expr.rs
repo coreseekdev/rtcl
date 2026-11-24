@@ -137,7 +137,11 @@ struct ExprParser<'a> {
     /// a string literal inside them (`expr int(NaN)` errors inside int(),
     /// while a top-level `expr nan` is a domain error).
     func_arg_depth: u32,
+    /// Levels of recursive descent open (see [`EXPR_NEST_LIMIT`]).
+    nest_depth: u32,
 }
+
+use rtcl_parser::expr_compile::EXPR_NEST_LIMIT;
 
 impl<'a> ExprParser<'a> {
     fn new(expr: &str, interp: &'a mut Interp) -> Self {
@@ -146,7 +150,29 @@ impl<'a> ExprParser<'a> {
             pos: 0,
             interp,
             func_arg_depth: 0,
+            nest_depth: 0,
         }
+    }
+
+    /// Enter one nesting level that the caller leaves by hand.
+    fn enter(&mut self) -> Result<()> {
+        self.nest_depth += 1;
+        if self.nest_depth > EXPR_NEST_LIMIT {
+            self.nest_depth -= 1;
+            return Err(Error::Msg(format!(
+                "expression nested more than {EXPR_NEST_LIMIT} levels"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Run `f` one nesting level deeper, refusing past [`EXPR_NEST_LIMIT`].
+    /// The level is left again however `f` returns.
+    fn nested(&mut self, f: impl FnOnce(&mut Self) -> Result<Value>) -> Result<Value> {
+        self.enter()?;
+        let r = f(self);
+        self.nest_depth -= 1;
+        r
     }
 
     /// Ternary `?:` — lowest precedence. Lazy: only the taken branch is
@@ -423,7 +449,8 @@ impl<'a> ExprParser<'a> {
     fn parse_power(&mut self) -> Result<Value> {
         let base = self.parse_unary()?;
         if self.match_op("**") {
-            let exp = self.parse_power()?; // right-associative: recurse
+            // right-associative: recurse
+            let exp = self.nested(|p| p.parse_power())?;
             expr_ops::op_pow(base, exp)
         } else {
             Ok(base)
@@ -434,12 +461,12 @@ impl<'a> ExprParser<'a> {
     fn parse_unary(&mut self) -> Result<Value> {
         self.skip_whitespace();
         if self.match_op("!") {
-            let val = self.parse_unary()?;
+            let val = self.nested(|p| p.parse_unary())?;
             return expr_ops::op_not(&val);
         }
         if self.peek() == '~' {
             self.advance();
-            let val = self.parse_unary()?;
+            let val = self.nested(|p| p.parse_unary())?;
             return expr_ops::op_bitnot(&val);
         }
         if self.peek() == '-' && !self.is_at_end() {
@@ -474,7 +501,7 @@ impl<'a> ExprParser<'a> {
                     self.pos += 19;
                     return Ok(Value::from_int(i64::MIN));
                 }
-                let val = self.parse_unary()?;
+                let val = self.nested(|p| p.parse_unary())?;
                 // Integer operands stay integers (-2 -> -2); float operands
                 // stay floats (-2.0 -> -2.0).
                 return expr_ops::op_neg(&val);
@@ -483,7 +510,7 @@ impl<'a> ExprParser<'a> {
             self.pos = saved;
         }
         if self.match_op("+") {
-            return self.parse_unary();
+            return self.nested(|p| p.parse_unary());
         }
         self.parse_primary()
     }
@@ -494,7 +521,7 @@ impl<'a> ExprParser<'a> {
 
         // Parenthesized expression
         if self.match_op("(") {
-            let val = self.parse_ternary()?;
+            let val = self.nested(|p| p.parse_ternary())?;
             self.expect(")")?;
             return Ok(val);
         }
@@ -1119,6 +1146,7 @@ impl<'a> ExprParser<'a> {
             }
         }
         self.expect("(")?;
+        self.enter()?;
         let mut args = Vec::new();
         self.func_arg_depth += 1;
         let parsed = (|| -> Result<()> {
@@ -1133,6 +1161,7 @@ impl<'a> ExprParser<'a> {
             Ok(())
         })();
         self.func_arg_depth -= 1;
+        self.nest_depth -= 1;
         parsed?;
         self.expect(")")?;
 

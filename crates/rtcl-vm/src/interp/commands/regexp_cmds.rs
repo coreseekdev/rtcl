@@ -936,6 +936,24 @@ pub(crate) fn compile_engine(
     Ok(Engine { re, anch })
 }
 
+/// A matcher that ran out of its budget did not finish: report it instead
+/// of passing its partial answer off as a result (`regexp {a+()\1x}` over
+/// 2,000 characters used to answer 0 where the pattern matches).
+#[cfg(feature = "regexp-spencer")]
+fn check_match_finished(interp: &mut Interp) -> Result<()> {
+    if !super::regexp_spencer::take_over_budget() {
+        return Ok(());
+    }
+    super::list::set_error_code(
+        interp,
+        "REGEXP REG_ESPACE {regular expression match is too complex}",
+    );
+    Err(Error::runtime(
+        "regular expression match is too complex",
+        ErrorCode::Generic,
+    ))
+}
+
 /// Attempt one match at char index `p` of `full_string`; returns capture
 /// ranges in full-string byte offsets, group 0 first.
 #[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
@@ -1958,6 +1976,7 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         engine_attempt(&eng, full_string, p, ss, &mut char_cache)
     };
     let matches = collect_matches(full_string, attempt, char_len, effective_start, all, false);
+    check_match_finished(interp)?;
 
     // Build a per-match list element: the group's text, or its
     // inclusive `start end` index pair under -indices.
@@ -2129,6 +2148,7 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         engine_attempt(&eng, full_string, p, p, &mut char_cache)
     };
     let matches = collect_matches(full_string, attempt, char_len, char_start, all, true);
+    check_match_finished(interp)?;
 
     let mut result = String::from(&full_string[..byte_start]);
     let mut last = byte_start;

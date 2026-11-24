@@ -53,17 +53,17 @@
 | S8 | `unset ::tcl_version; info tclversion` | `commands/misc.rs` | map 下标缺键 | 已修（M1） |
 | S9 | `string repeat ab 9223372036854775807`、`lrepeat 9223372036854775807 x` | `string_cmds.rs` / `list.rs` | 乘积回绕后 capacity overflow | 已修（M1） |
 | S10 | `pack v 1 le 0 -1` | `commands/introspect.rs` | 负偏移转 usize，分配 2^61 字节 | 已修（M1） |
-| S11 | `namespace unknown ::nosuchhandler` 后调用未知命令 | `interp/eval.rs` | 处理器自指递归 | 未修 |
-| S12 | ensemble `-unknown` 映射到不存在的子命令 | `commands/namespace.rs` | 重分派不计深度 | 未修 |
-| S13 | `alias a a; a` | `commands/introspect.rs` | 直调函数指针绕过深度检查 | 未修 |
-| S14 | 一串 write-trace 互相写下一个变量 | `interp/vars.rs` `fire_traces_inner` | 仅 VM 引擎；树引擎正常报错 | 未修 |
+| S11 | `namespace unknown ::nosuchhandler` 后调用未知命令 | `interp/eval.rs` | 处理器自指递归 | 已修（M2） |
+| S12 | ensemble `-unknown` 映射到不存在的子命令 | `commands/namespace.rs` | 重分派不计深度 | 已修（M2） |
+| S13 | `alias a a; a` | `commands/introspect.rs` | 直调函数指针绕过深度检查 | 已修（M2） |
+| S14 | 一串 write-trace 互相写下一个变量 | `interp/vars.rs` `fire_traces_inner` | 仅 VM 引擎；树引擎正常报错 | 已修（M2） |
 
 ## P0：深度与大小无上限
 
 | # | 触发 | 位置 | 说明 | 处置 |
 |---|---|---|---|---|
-| S15 | 嵌套 list/dict 约 1.3 万层转字符串；16 万层的 list `unset` | `value.rs` `serialize_list` / `drop_last_owner` | 序列化与 Drop 都是原生递归；wasm 5000 层即中 | 未修 |
-| S16 | `json decode` 约 1.5–2 万层嵌套 | `commands/json.rs` | 纯数据驱动，输入几十 KB；wasm 约 5000 层 | 未修 |
+| S15 | 嵌套 list/dict 约 1.3 万层转字符串；16 万层的 list `unset` | `value.rs` `serialize_list` / `drop_last_owner` | 序列化与 Drop 都是原生递归；wasm 5000 层即中 | 已修（M2） |
+| S16 | `json decode` 约 1.5–2 万层嵌套 | `commands/json.rs` | 纯数据驱动，输入几十 KB；wasm 约 5000 层 | 已修（M2） |
 | S17 | `expr` 非花括号 4000 层括号、5 万个连续 `-` | `types/expr.rs`、`expr_check.rs`、`parser/src/expr_compile.rs` | 三套独立递归下降都无深度概念 | 未修 |
 | S18 | proc 内 2 万层嵌套 `[…]` | `parser/src/compiler.rs` | 不调用也崩 | 未修 |
 | S19 | 正则：6000 层嵌套括号；`((a{255}){255}){255}`；`(.*)x` 匹配 3 万字符 | `regexp-spencer` `parser.rs` / `captures.rs` | 后两项吃满近 3GB 后 abort | 未修 |
@@ -120,6 +120,7 @@
 | C10 | 旧式八进制 ≥2^63 回绕；大写十六进制 bignum 判为非数字 | `value.rs`、`types/bignum.rs` | 已修（M1） |
 | C11 | `wait` 对已退出后台进程返回 127，`-nohang` 恒为 NONE | `commands/os.rs` | 未修 |
 | C12 | 修复过程中新查出：`set v 018; expr {$v + 0}` 得 18（tclsh 报 invalid octal）；超过 64 位的旧式八进制被当作十进制；带 bignum 操作数的浮点运算取错值。根因是 Tcl 整数字面量语法有**四套**各自独立的实现（`value.rs`、`bignum.rs`、`expr.rs` 两处、`list.rs`），对旧式八进制理解不一 | `types/bignum.rs` | 已修（M1）：合并为单一的 `bignum::parse_int`，四处改为调用它 |
+| C13 | 修复过程中新查出：`json encode` 的 schema 文本按词递归（`list list list …` 重复几万次即栈溢出），JSON 解码的递归下降无深度上限 | `commands/json.rs` | 已修（M2）：文档与 schema 的嵌套上限 1000，超限报错 |
 
 ## P2：性能（`TODO.md` 未列，本机单次实测，只看量级）
 
@@ -181,7 +182,13 @@
   2026-11-23 的 errorInfo 提交；文档里的"sweep 0"在 `perf/wave2` 上
   已不成立。审计修复未增减该名单。
 - `judge/crash-gate.sh`：基线 99 次运行 14 过；M1 后 40 过
-  （a 类 24/24 全过）。
+  （a 类 24/24 全过）；M2a/M2b 后 60 过（b01–b10 全过）。
+- 对照基线：10 万层嵌套 list 的销毁 8–13ms → 4–5ms（迭代路径反而更快）；
+  宽列表（200 万元素）与字符串列表的销毁无变化；1.6 万层嵌套 list 上
+  25 个命令里基线有 17 个栈溢出，现全部正常返回。
+- 已知限制（与 tclsh 的对象模型相同，非本次引入）：嵌套 list 的字符串化
+  是 O(n²) 内存——每层缓存自己的字符串。4 万层时 rtcl 峰值 3.2GB
+  并正常完成；tclsh 涨到 17.5GB 后段错误。
 - 单元测试：`cargo test -p rtcl-vm -p rtcl-parser -p rtcl-ir -p rtcl-core`
   全绿。
 

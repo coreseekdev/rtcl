@@ -635,6 +635,15 @@ pub struct Interp {
     pub(crate) call_depth: usize,
     /// Maximum call depth.
     pub(crate) max_call_depth: usize,
+    /// Script-driven re-entry that nests native frames *without* a proc
+    /// call: an `unknown`-handler re-dispatch (namespace or ensemble), an
+    /// alias chain, a trace callback's evaluation. `call_depth` counts
+    /// proc calls and traced builtin dispatches only, so none of these
+    /// were bounded — a handler naming itself, `alias a a`, or a ring of
+    /// write traces each setting the next variable ran the native stack
+    /// out (abort; wasm: a trap that kills the instance). One shared
+    /// budget, sized like the recursion limit.
+    pub(crate) nest_depth: usize,
     /// Eval step budget (A1): commands dispatched since last arm; every
     /// command dispatch charges one step (interpreter `eval_command` and
     /// the VM funnels `invoke_command`/`call` alike — pure control flow
@@ -1114,6 +1123,7 @@ impl Interp {
             expr_check_cache: varmap::FxHashedMap::default(),
             call_depth: 0,
             max_call_depth: 1000,
+            nest_depth: 0,
             steps: 0,
             max_steps: None,
             result: Value::empty(),
@@ -1314,6 +1324,37 @@ impl Interp {
     /// 当前步数预算（None = 不限）。
     pub fn max_steps(&self) -> Option<u64> {
         self.max_steps
+    }
+
+    /// 递归/嵌套上限（缺省 1000）。同时约束 proc 递归（`call_depth`）
+    /// 与不经 proc 调用的脚本重入（[`Interp::nest_depth`]）。栈小的
+    /// 宿主（wasm 实例）应按栈预算下调。
+    pub fn set_max_call_depth(&mut self, max: usize) {
+        self.max_call_depth = max.max(1);
+    }
+
+    /// 当前递归/嵌套上限。
+    pub fn max_call_depth(&self) -> usize {
+        self.max_call_depth
+    }
+
+    /// 进入一层脚本重入（见 [`Interp::nest_depth`]）。每个
+    /// `enter_nested` 与同一路径上的 `leave_nested` 成对——中间的调用
+    /// 以 `Result` 返回（含 Suspend/exit flow），计数随栈展开恢复。
+    pub(crate) fn enter_nested(&mut self) -> std::result::Result<(), crate::error::Error> {
+        if self.nest_depth >= self.max_call_depth {
+            return Err(crate::error::Error::runtime(
+                "maximum recursion depth exceeded",
+                crate::error::ErrorCode::StackOverflow,
+            ));
+        }
+        self.nest_depth += 1;
+        Ok(())
+    }
+
+    /// 离开一层脚本重入。
+    pub(crate) fn leave_nested(&mut self) {
+        self.nest_depth = self.nest_depth.saturating_sub(1);
     }
 
     /// Tier1 折叠代（只读）。Tier1 命令（`set`/`if`/`while`/…，PR#2 起

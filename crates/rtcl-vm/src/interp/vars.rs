@@ -2207,7 +2207,12 @@ impl Interp {
         let q = |v: &str| Value::from_list(&[Value::from_str(v)]).as_str().to_string();
         for s in whole.into_iter().rev().chain(elems.into_iter().rev()) {
             let cmd = format!("{} {} {} {}", s, q(base), q(elem.unwrap_or("")), op);
-            self.eval(&cmd)?;
+            // The callback writes another traced variable, which fires
+            // again from inside this frame: one nesting level per fire.
+            self.enter_nested()?;
+            let r = self.eval(&cmd);
+            self.leave_nested();
+            r?;
         }
         Ok(fired)
     }

@@ -648,6 +648,13 @@ impl Drop for Value {
 impl Value {
     /// The last-owner arm of [`Drop`], outlined: free the payload (string
     /// buffer, list/dict vecs), then recycle the box itself.
+    ///
+    /// Teardown recurses natively while the nesting is shallow — that is
+    /// the fast path for the usual wide lists and costs no extra memory —
+    /// and switches to the iterative form ([`dismantle`]) past
+    /// [`DROP_RECURSION_LIMIT`] levels: the recursive glue nests once per
+    /// level, and 160,000 levels of `set l [list $l]` followed by
+    /// `unset l` ran the native stack out (tclsh frees a million).
     #[inline(never)]
     fn drop_last_owner(&mut self) {
         let bits = self.bits.get();
@@ -658,28 +665,98 @@ impl Value {
         }
         unsafe {
             let p = bits as *mut ValueInner;
-            std::ptr::drop_in_place(p);
-            let pushed = FREELIST.try_with(|fl| {
-                let mut fl = fl.0.borrow_mut();
-                if fl.len() < FREELIST_CAP {
-                    fl.push(NonNull::new_unchecked(p));
-                    true
-                } else {
-                    false
+            // `try_with`: at thread exit the counter is gone, and nothing
+            // may recurse then either.
+            let deep = DROP_DEPTH
+                .try_with(|d| {
+                    let depth = d.get();
+                    d.set(depth + 1);
+                    depth >= DROP_RECURSION_LIMIT
+                })
+                .unwrap_or(true);
+            if !deep {
+                std::ptr::drop_in_place(p);
+                let _ = DROP_DEPTH.try_with(|d| d.set(d.get() - 1));
+                recycle(p);
+                return;
+            }
+            let mut work: Vec<Value> = Vec::new();
+            dismantle(p, &mut work);
+            while let Some(mut child) = work.pop() {
+                // Neutralize the handle first: its box is about to be
+                // recycled, and the handle's own Drop must not touch it.
+                let cb = child.bits.replace(0);
+                if cb & 1 == 1 || cb == 0 {
+                    continue;
                 }
-            });
-            if pushed != Ok(true) {
-                // Freelist full — or already torn down at thread exit
-                // (try_with fails there): free the BOX for real.  The
-                // payload was already dropped above, so this must be a
-                // bare dealloc.
-                std::alloc::dealloc(
-                    p.cast::<u8>(),
-                    std::alloc::Layout::new::<ValueInner>(),
-                );
+                let q = cb as *mut ValueInner;
+                let n = (*q).rc.get();
+                if n > 1 {
+                    (*q).rc.set(n - 1);
+                    continue;
+                }
+                dismantle(q, &mut work);
             }
         }
     }
+}
+
+thread_local! {
+    /// Native depth of the recursive teardown in progress on this thread.
+    static DROP_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Native recursion allowed during teardown before the children start
+/// going to the work vector (see [`Value::drop_last_owner`]).
+const DROP_RECURSION_LIMIT: usize = 64;
+
+/// Return a dead box whose payload is already dropped to the free list,
+/// or to the allocator when the list is full (or already torn down at
+/// thread exit).
+unsafe fn recycle(p: *mut ValueInner) {
+    let pushed = FREELIST.try_with(|fl| {
+        let mut fl = fl.0.borrow_mut();
+        if fl.len() < FREELIST_CAP {
+            fl.push(NonNull::new_unchecked(p));
+            true
+        } else {
+            false
+        }
+    });
+    if pushed != Ok(true) {
+        // Freelist full — or already torn down at thread exit
+        // (try_with fails there): free the BOX for real. The payload was
+        // already dropped above, so this must be a bare dealloc —
+        // `drop(Box::from_raw(p))` would run drop_in_place a SECOND time
+        // (the double-free the gen_dict corpus once caught at the
+        // freelist-cap threshold).
+        std::alloc::dealloc(
+            p.cast::<u8>(),
+            std::alloc::Layout::new::<ValueInner>(),
+        );
+    }
+}
+
+/// The last owner of the box at `p` lets go, without recursing: move the
+/// box's list elements and dict values to `work` (the caller then gives
+/// each of them the same treatment), drop what is left of the payload,
+/// and recycle the box.
+///
+/// # Safety
+/// `p` is a live box whose refcount is 1; nobody else holds it.
+unsafe fn dismantle(p: *mut ValueInner, work: &mut Vec<Value>) {
+    // Children out first, so `drop_in_place` below never enters a
+    // `Vec<Value>`/dict drop that would recurse into them.
+    match &mut (*p).rep {
+        InternalRep::List(items) => work.append(&mut std::mem::take(items)),
+        InternalRep::Dict(map) => match std::mem::take(map) {
+            DictMap::Ordered(m) => work.extend(m.into_iter().map(|(_, v)| v)),
+            DictMap::Unordered(m) => work.extend(m.into_iter().map(|(_, v)| v)),
+        },
+        _ => {}
+    }
+    std::ptr::drop_in_place(p);
+    recycle(p);
 }
 
 impl fmt::Debug for Value {
@@ -899,9 +976,11 @@ impl Value {
         let bytes = inner.string.get_or_init(|| {
             match &inner.rep {
                 InternalRep::List(items) => {
+                    materialize_below(items.iter());
                     SmallVec::from_slice(serialize_list(items).as_bytes())
                 }
                 InternalRep::Dict(map) => {
+                    materialize_below(map.values());
                     SmallVec::from_slice(serialize_dict(map).as_bytes())
                 }
                 InternalRep::Int(n) => SmallVec::from_slice(format_int(*n).as_bytes()),
@@ -1418,6 +1497,78 @@ impl From<f64> for Value {
 }
 
 /// Serialize dict entries into a Tcl list string (key1 val1 key2 val2 ...).
+/// Materialize the string of every list/dict value below `children`,
+/// post-order, with an explicit stack, before the caller renders its own
+/// level.
+///
+/// `serialize_list` calls `as_str` on each element, so an unmaterialized
+/// nested list made that call recurse once per nesting level: about
+/// 14,000 levels of `set l [list $l]` followed by `string length $l` ran
+/// the native stack out (a wasm instance traps at ~5,000). When this
+/// returns, every descendant's string cell is set and the caller's own
+/// `as_str` renders exactly one level. Each level is visited once, the
+/// same work the recursive form did.
+fn materialize_below<'a>(children: impl Iterator<Item = &'a Value>) {
+    let mut stack: Vec<Frame<'a>> = Vec::new();
+    for child in children {
+        if let Some(frame) = pending_frame(child) {
+            stack.push(frame);
+        }
+    }
+    while let Some(frame) = stack.last_mut() {
+        let child = match frame.kids.next() {
+            Some(child) => child,
+            None => {
+                // Its children are done: this renders one level.
+                let done = stack.pop().expect("frame");
+                let _ = done.owner.as_str();
+                continue;
+            }
+        };
+        if let Some(frame) = pending_frame(child) {
+            stack.push(frame);
+        }
+    }
+}
+
+/// A value under materialization plus the iterator over its children.
+struct Frame<'a> {
+    owner: &'a Value,
+    kids: Kids<'a>,
+}
+
+enum Kids<'a> {
+    List(std::slice::Iter<'a, Value>),
+    Dict(DictValues<'a>),
+}
+
+impl<'a> Iterator for Kids<'a> {
+    type Item = &'a Value;
+    fn next(&mut self) -> Option<&'a Value> {
+        match self {
+            Kids::List(i) => i.next(),
+            Kids::Dict(i) => i.next(),
+        }
+    }
+}
+
+/// A list/dict value whose string is not built yet (it needs its children
+/// first); anything else needs no frame.
+fn pending_frame(v: &Value) -> Option<Frame<'_>> {
+    if v.is_imm() || v.is_unset() {
+        return None;
+    }
+    let inner = unsafe { v.heap_inner() };
+    if inner.string.get().is_some() {
+        return None;
+    }
+    match &inner.rep {
+        InternalRep::List(items) => Some(Frame { owner: v, kids: Kids::List(items.iter()) }),
+        InternalRep::Dict(map) => Some(Frame { owner: v, kids: Kids::Dict(map.values()) }),
+        _ => None,
+    }
+}
+
 fn serialize_dict(map: &DictMap) -> String {
     let items: Vec<Value> = map
         .iter()

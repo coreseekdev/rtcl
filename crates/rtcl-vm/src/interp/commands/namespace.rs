@@ -1935,7 +1935,13 @@ pub(crate) fn dispatch_ensemble(
                 let mut call: Vec<Value> = prefix.clone();
                 call.extend(params.iter().cloned());
                 call.extend(rest[1..].iter().cloned());
-                return ens_run(interp, &def.namespace, &call);
+                // The returned prefix can lead straight back to this
+                // ensemble with another missing subcommand: each hop is
+                // one nesting level.
+                interp.enter_nested()?;
+                let r = ens_run(interp, &def.namespace, &call);
+                interp.leave_nested();
+                return r;
             }
             Ok(_) => {
                 return Err(ens_miss_error(interp, &def, sub));

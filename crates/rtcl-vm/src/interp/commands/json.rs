@@ -87,7 +87,7 @@ pub fn cmd_json_encode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "str"
     };
 
-    let schema = parse_schema(schema_str);
+    let schema = parse_schema(schema_str)?;
     let mut buf = String::new();
     encode_value(value, &schema, &mut buf)?;
     Ok(Value::from_str(&buf))
@@ -97,15 +97,44 @@ pub fn cmd_json_encode(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 // JSON DECODER
 // ═══════════════════════════════════════════════════════════════
 
+/// Nesting limit for a decoded document and for encode schema text.
+/// Nesting is *data* on both paths: the recursive descents ran the native
+/// stack out at about 20,000 levels of `[` (a wasm instance traps far
+/// sooner) — the depth of the result itself is no longer a problem, its
+/// string form and teardown are iterative (value.rs).
+const MAX_JSON_DEPTH: usize = 1000;
+
 struct JsonParser<'a> {
     input: &'a [u8],
     pos: usize,
     build_schema: bool,
+    depth: usize,
 }
 
 impl<'a> JsonParser<'a> {
     fn new(s: &'a str, build_schema: bool) -> Self {
-        JsonParser { input: s.as_bytes(), pos: 0, build_schema }
+        JsonParser { input: s.as_bytes(), pos: 0, build_schema, depth: 0 }
+    }
+
+    /// One level of array/object nesting.
+    fn nested(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<(Value, String)>,
+    ) -> Result<(Value, String)> {
+        self.depth += 1;
+        if self.depth > MAX_JSON_DEPTH {
+            self.depth -= 1;
+            return Err(Error::runtime(
+                format!(
+                    "invalid JSON string: nested more than {} levels",
+                    MAX_JSON_DEPTH
+                ),
+                ErrorCode::InvalidOp,
+            ));
+        }
+        let r = f(self);
+        self.depth -= 1;
+        r
     }
 
     /// Return a schema string only when schema mode is active; empty otherwise.
@@ -142,8 +171,8 @@ impl<'a> JsonParser<'a> {
     fn parse_value(&mut self, null_val: &str, index_mode: bool) -> Result<(Value, String)> {
         self.skip_ws();
         match self.peek() {
-            Some(b'{') => self.parse_object(null_val, index_mode),
-            Some(b'[') => self.parse_array(null_val, index_mode),
+            Some(b'{') => self.nested(|p| p.parse_object(null_val, index_mode)),
+            Some(b'[') => self.nested(|p| p.parse_array(null_val, index_mode)),
             Some(b'"') => {
                 let s = self.parse_string()?;
                 Ok((Value::from_str(&s), self.schema("str")))
@@ -488,49 +517,69 @@ enum Schema {
     Mixed(Vec<Schema>),
 }
 
-/// Parse a schema string into a Schema tree.
-fn parse_schema(s: &str) -> Schema {
+/// Parse a schema string into a Schema tree. The text is script-supplied
+/// and `list` nests word by word (`list list list …`): each nesting level
+/// is one recursive call, bounded by [`MAX_JSON_DEPTH`].
+fn parse_schema(s: &str) -> Result<Schema> {
+    parse_schema_at(s, 0)
+}
+
+fn too_deep_schema() -> Error {
+    Error::runtime(
+        format!("json: schema nested more than {} levels", MAX_JSON_DEPTH),
+        ErrorCode::InvalidOp,
+    )
+}
+
+fn parse_schema_at(s: &str, depth: usize) -> Result<Schema> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(too_deep_schema());
+    }
     let s = s.trim();
-    if s.is_empty() || s == "str" { return Schema::Str; }
-    if s == "num" { return Schema::Num; }
-    if s == "bool" { return Schema::Bool; }
+    if s.is_empty() || s == "str" { return Ok(Schema::Str); }
+    if s == "num" { return Ok(Schema::Num); }
+    if s == "bool" { return Ok(Schema::Bool); }
 
     // Peel off leading keyword
     let (keyword, rest) = split_first_word(s);
     match keyword {
         "obj" => {
-            let fields = parse_schema_fields(rest);
-            Schema::Obj(fields)
+            let fields = parse_schema_fields(rest, depth)?;
+            Ok(Schema::Obj(fields))
         }
         "list" => {
             if rest.is_empty() {
-                Schema::List(Box::new(Schema::Str))
+                Ok(Schema::List(Box::new(Schema::Str)))
             } else {
-                Schema::List(Box::new(parse_schema(rest)))
+                Ok(Schema::List(Box::new(parse_schema_at(rest, depth + 1)?)))
             }
         }
         "mixed" => {
-            let parts = split_tcl_words(rest);
-            Schema::Mixed(parts.into_iter().map(|p| parse_schema(&p)).collect())
+            // Siblings, not nesting: each part restarts at the same depth.
+            let mut parts = Vec::new();
+            for p in split_tcl_words(rest) {
+                parts.push(parse_schema_at(&p, depth)?);
+            }
+            Ok(Schema::Mixed(parts))
         }
-        "str" => Schema::Str,
-        "num" => Schema::Num,
-        "bool" => Schema::Bool,
-        _ => Schema::Str,
+        "str" => Ok(Schema::Str),
+        "num" => Ok(Schema::Num),
+        "bool" => Ok(Schema::Bool),
+        _ => Ok(Schema::Str),
     }
 }
 
-fn parse_schema_fields(s: &str) -> Vec<(String, Schema)> {
+fn parse_schema_fields(s: &str, depth: usize) -> Result<Vec<(String, Schema)>> {
     let words = split_tcl_words(s);
     let mut fields = Vec::new();
     let mut i = 0;
     while i + 1 < words.len() {
         let name = words[i].clone();
-        let schema = parse_schema(&words[i + 1]);
+        let schema = parse_schema_at(&words[i + 1], depth)?;
         fields.push((name, schema));
         i += 2;
     }
-    fields
+    Ok(fields)
 }
 
 /// Split a string into first word and remainder.

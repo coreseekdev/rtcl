@@ -1343,7 +1343,12 @@ impl Interp {
                             .map(|w| Value::from_str(w.as_str()))
                             .collect();
                         call.extend(args.iter().cloned());
-                        return self.dispatch_values(&call);
+                        // The handler's first word may be unresolvable
+                        // again: each hop is one nesting level.
+                        self.enter_nested()?;
+                        let r = self.dispatch_values(&call);
+                        self.leave_nested();
+                        return r;
                     }
                 }
                 // Try "unknown" handler (if defined as a proc or ensemble);

@@ -59,6 +59,32 @@ pub fn cmd_alias(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let target_cmd = args[2].as_str().to_string();
     let prefix_args: Vec<String> = args[3..].iter().map(|a| a.as_str().to_string()).collect();
 
+    // tclsh rejects an alias whose target chain comes back to it
+    // (`cannot define or rename alias "a": would create a loop`). The
+    // dispatcher calls the target in place, so `alias a a` used to
+    // recurse until the native stack ran out. Existing chains are
+    // loop-free by this very check; the hop cap only bounds a walk over
+    // a table that predates it.
+    {
+        let mut t = target_cmd.clone();
+        for _ in 0..10_000 {
+            if t == new_name {
+                super::list::set_error_code(interp, "TCL OPERATION INTERP ALIASLOOP");
+                return Err(Error::runtime(
+                    format!(
+                        "cannot define or rename alias \"{}\": would create a loop",
+                        new_name
+                    ),
+                    ErrorCode::Generic,
+                ));
+            }
+            match interp.aliases.get(&t) {
+                Some(info) => t = info.target.clone(),
+                None => break,
+            }
+        }
+    }
+
     // Store the alias definition
     super::super::vm_exec::note_tier1_mutation(interp, &new_name);
     interp.aliases.insert(new_name.clone(), AliasInfo {
@@ -96,7 +122,12 @@ fn alias_dispatch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if let Some(proc_def) = interp.procs.get(&info.target).cloned() {
         interp.call_proc(&proc_def, &full_args, &info.target, None)
     } else if let Some(f) = interp.commands.get(&info.target).cloned() {
-        f(interp, &full_args)
+        // A target that is itself an alias re-enters this function with
+        // no proc call in between: one nesting level.
+        interp.enter_nested()?;
+        let r = f(interp, &full_args);
+        interp.leave_nested();
+        r
     } else {
         Err(Error::invalid_command(&info.target))
     }

@@ -1443,6 +1443,13 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
         if interp.tier1_epoch != code.epoch {
             if let Some(site) = begin_cmd_site(op) {
                 if let Some((unit, cmd_idx)) = redispatch_target(interp, code, site) {
+                    // The rest of the unit runs on the tree-walk, past
+                    // the per-op boundary checks below: hand it a clean
+                    // slate. With the slots still live its `set_var` took
+                    // the slot arm, which neither fires a write trace
+                    // registered after the bump nor honours an alias.
+                    interp.top_flush();
+                    interp.top_slots = None;
                     break interp.eval_commands_from(&unit, cmd_idx)?;
                 }
             }
@@ -3202,10 +3209,7 @@ fn op_begin_cmd(
     site_idx: u32,
 ) -> Result<()> {
     if interp.call_depth > interp.max_call_depth {
-        return Err(Error::runtime(
-            "maximum recursion depth exceeded",
-            crate::error::ErrorCode::StackOverflow,
-        ));
+        return Err(Error::recursion_limit());
     }
     let site = &code.sites[site_idx as usize];
     interp.cur_cmd_text = site.text;

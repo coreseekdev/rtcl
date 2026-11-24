@@ -2192,7 +2192,11 @@ pub fn cmd_assemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 raw.push(RawAsmIns::Label(assemble_operand(interp, &cmd.words[1])?));
             }
             other => {
-                set_error_code(interp, "TCL OPERATION ASSEMBLE BADINSTR");
+                // The instruction word through tclsh's index lookup.
+                set_error_code(
+                    interp,
+                    &format!("TCL LOOKUP INDEX instruction {}", crate::value::tcl_quote(other)),
+                );
                 return Err(Error::runtime(
                     format!(
                         "bad instruction \"{}\": must be {}",
@@ -2217,7 +2221,8 @@ pub fn cmd_assemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         for ins in raw.iter() {
             if let RawAsmIns::Label(name) = ins {
                 if !seen.insert(name.as_str()) {
-                    set_error_code(interp, "TCL OPERATION ASSEMBLE BADLABEL");
+                    // tclsh names the label in the code (TclAssembleObjCmd).
+                    set_error_code(interp, &format!("TCL ASSEM DUPLABEL {}", name));
                     return Err(Error::runtime(
                         format!("duplicate definition of label \"{}\"", name),
                         crate::error::ErrorCode::Generic,
@@ -2228,7 +2233,7 @@ pub fn cmd_assemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let mut resolve = |name: &str| -> Result<usize> {
         labels.get(name).copied().ok_or_else(|| {
-            set_error_code(interp, "TCL OPERATION ASSEMBLE BADLABEL");
+            set_error_code(interp, &format!("TCL ASSEM NOLABEL {}", name));
             Error::runtime(
                 format!("undefined label \"{}\"", name),
                 crate::error::ErrorCode::NotFound,
@@ -2403,10 +2408,13 @@ pub fn cmd_assemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     match stack.len() {
         0 => Ok(Value::empty()),
         1 => Ok(stack.remove(0)),
-        n => Err(Error::runtime(
-            format!("stack is unbalanced on exit from the code (depth={})", n),
-            crate::error::ErrorCode::Generic,
-        )),
+        n => {
+            set_error_code(interp, "TCL ASSEM BADSTACK");
+            Err(Error::runtime(
+                format!("stack is unbalanced on exit from the code (depth={})", n),
+                crate::error::ErrorCode::Generic,
+            ))
+        }
     }
 }
 
@@ -3576,40 +3584,88 @@ fn prefix_longest(interp: &mut Interp, invoked: &str, args: &[Value]) -> Result<
 
 /// `::tcl::prefix match ?options? table string` — 唯一前缀匹配
 /// （TclGetIndexFromObjList 面：-error/-exact/-message）。
+/// Tcl's index lookup (Tcl_GetIndexFromObjStruct), as a function of its
+/// inputs: an exact entry wins; a unique prefix is accepted unless
+/// `exact`.  A miss comes back as the error tclsh raises — `bad`/`ambiguous
+/// <message> "<word>": must be a, b, or c` (`no valid options` for an
+/// empty table) — with the errorCode that goes with it
+/// (`TCL LOOKUP INDEX <message> <word>`); the caller decides whether to
+/// install that code.
+fn index_in_table(
+    word: &str,
+    table: &[String],
+    message: &str,
+    exact: bool,
+) -> std::result::Result<usize, (Error, String)> {
+    if let Some(i) = table.iter().position(|t| t == word) {
+        return Ok(i);
+    }
+    let hits: Vec<usize> = table
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !exact && t.starts_with(word))
+        .map(|(i, _)| i)
+        .collect();
+    if hits.len() == 1 {
+        return Ok(hits[0]);
+    }
+    let kind = if hits.is_empty() { "bad" } else { "ambiguous" };
+    let e = if table.is_empty() {
+        tcl_err(format!(
+            "{} {} \"{}\": no valid options",
+            kind, message, word
+        ))
+    } else {
+        let must = match table.len() {
+            1 => table[0].clone(),
+            2 => format!("{} or {}", table[0], table[1]),
+            n => format!("{}, or {}", table[..n - 1].join(", "), table[n - 1]),
+        };
+        tcl_err(format!(
+            "{} {} \"{}\": must be {}",
+            kind, message, word, must
+        ))
+    };
+    Err((e, format!("TCL LOOKUP INDEX {} {}", message, crate::value::tcl_quote(word))))
+}
+
 fn prefix_match(interp: &mut Interp, invoked: &str, args: &[Value]) -> Result<Value> {
-    if args.is_empty() {
+    // tclsh PrefixMatchObjCmd: everything but the last two words is an
+    // option, the last two are the table and the word.
+    if args.len() < 2 {
         return Err(prefix_usage_error(interp, invoked, "?options? table string"));
     }
+    const OPTIONS: [&str; 3] = ["-error", "-exact", "-message"];
+    let option_table: Vec<String> = OPTIONS.iter().map(|o| o.to_string()).collect();
     let mut exact = false;
-    let mut message = "option".to_string();
+    let mut message = "option";
     let mut err_opts: Option<Vec<Value>> = None;
     let mut i = 0usize;
     while i + 2 < args.len() {
-        let opt = args[i].as_str();
-        match opt {
+        // The option words go through the same lookup: `-ex` is -exact,
+        // `-e` is ambiguous.
+        let which = index_in_table(args[i].as_str(), &option_table, "option", false)
+            .map_err(|(e, code)| {
+                set_error_code(interp, &code);
+                e
+            })?;
+        match OPTIONS[which] {
             "-exact" => exact = true,
             "-message" => {
                 if i + 3 >= args.len() {
                     set_error_code(interp, "TCL OPERATION NOARG");
-                    return Err(tcl_err(format!(
-                        "missing value for -message"
-                    )));
+                    return Err(tcl_err("missing value for -message".to_string()));
                 }
                 i += 1;
-                message = args[i].as_str().to_string();
+                message = args[i].as_str();
             }
-            "-error" => {
+            _ => {
                 if i + 3 >= args.len() {
                     set_error_code(interp, "TCL OPERATION NOARG");
-                    return Err(tcl_err(format!("missing value for -error")));
+                    return Err(tcl_err("missing value for -error".to_string()));
                 }
                 i += 1;
-                let items = args[i]
-                    .as_list()
-                    .ok_or_else(|| {
-                        set_error_code(interp, "TCL VALUE LIST");
-                        tcl_err(format!("invalid list \"{}\"", args[i].as_str()))
-                    })?;
+                let items = super::list::strict_list(interp, &args[i])?;
                 if items.len() % 2 != 0 {
                     set_error_code(interp, "TCL VALUE DICTIONARY");
                     return Err(tcl_err(
@@ -3618,74 +3674,39 @@ fn prefix_match(interp: &mut Interp, invoked: &str, args: &[Value]) -> Result<Va
                 }
                 err_opts = Some(items);
             }
-            other => {
-                set_error_code(interp, "TCL LOOKUP INDEX option");
-                return Err(tcl_err(format!(
-                    "bad option \"{}\": must be -error, -exact, or -message",
-                    other
-                )));
-            }
         }
         i += 1;
     }
-    if args.len() - i != 2 {
-        return Err(prefix_usage_error(interp, invoked, "?options? table string"));
-    }
-    let table = args[i]
-        .as_list()
-        .ok_or_else(|| {
-            set_error_code(interp, "TCL VALUE LIST");
-            tcl_err(format!("invalid list \"{}\"", args[i].as_str()))
-        })?;
-    let s = args[i + 1].as_str();
-    let mut hit: Option<Value> = None;
-    let mut ambiguous = false;
-    for (_, t) in table.iter().enumerate() {
-        let matched = if exact {
-            t.as_str() == s
-        } else {
-            t.as_str().starts_with(s)
-        };
-        if matched {
-            if hit.is_some() {
-                ambiguous = true;
-                break;
-            }
-            hit = Some(t.clone());
-        }
-    }
-    match hit {
-        Some(v) => Ok(v),
+    let table: Vec<String> = super::list::strict_list(interp, &args[i])?
+        .iter()
+        .map(|v| v.as_str().to_string())
+        .collect();
+    let word = args[i + 1].as_str();
+    // A miss with `-error` to hand is not this command's error to raise:
+    // its code stays as it was.
+    let miss = match index_in_table(word, &table, message, exact) {
+        Ok(idx) => return Ok(Value::from_str(&table[idx])),
+        Err(m) => m,
+    };
+    match err_opts {
         None => {
-            let kind = if ambiguous { "ambiguous" } else { "bad" };
-            set_error_code(interp, &format!("TCL LOOKUP INDEX {} {}", message, s));
-            let e = tcl_err(format!(
-                "{} option \"{}\": must be {}",
-                kind,
-                s,
-                table.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(", ")
-            ));
-            match err_opts {
-                None => Err(e),
-                Some(items) if items.is_empty() => {
-                    // -error {}：清结果、返 OK（tclsh ResetResult）。
-                    Ok(Value::empty())
-                }
-                Some(items) => {
-                    // -error dict：追加 -code <result> 后作为 return
-                    // options 载荷（Tcl_SetReturnOptions）。
-                    let mut d = items;
-                    d.push(Value::from_str("-code"));
-                    d.push(Value::from_int(1));
-                    Err(Error::ControlFlow {
-                        kind: crate::error::ControlFlow::Error,
-                        value: Some(Value::from_str(&e.message_text())),
-                        level: 1,
-                        error_info: None,
-                        error_code: Some(Value::from_list(&d).as_str().to_string()),
-                    })
-                }
-            }
+            set_error_code(interp, &miss.1);
+            Err(miss.0)
+        }
+        // `-error {}`: an empty result and ok.
+        Some(items) if items.is_empty() => Ok(Value::empty()),
+        // Otherwise the options are the completion's own, `-code` included:
+        // the lookup failed, so the code is the error it reported.
+        Some(mut items) => {
+            items.push(Value::from_str("-code"));
+            items.push(Value::from_int(1));
+            let ret_args = [
+                Value::from_str("return"),
+                Value::from_str("-options"),
+                Value::from_list(&items),
+                Value::from_str(&miss.0.message_text()),
+            ];
+            super::control::cmd_return(interp, &ret_args).map(|_| Value::empty())
         }
     }
 }
@@ -3710,8 +3731,8 @@ pub fn cmd_tcl_prefix(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 /// 后台错误默认处理器。rtcl 无事件泵后台错误队列——可调用面对齐：
 /// 元数/options 校验、非 error 码的消息换形、-errorcode/-errorinfo
-/// 副作用，bgerror 命令存在即调用（无 handler 时 tclsh 8.6.17 实测
-/// 静默返回）。
+/// 副作用，bgerror 命令存在即调用；handler 缺失或失败时向 stderr
+/// 报告并返回 ok。
 pub fn cmd_tcl_bgerror(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let invoked = args[0].as_str();
     if args.len() != 3 {
@@ -3770,10 +3791,55 @@ pub fn cmd_tcl_bgerror(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             );
         }
     }
-    // bgerror handler 存在即调用（TCL_EVAL_GLOBAL，允许异常完成）；
-    // 缺失时 tclsh 8.6.17 实测静默返回（stderr 无输出）。
-    let handler_args = [Value::from_str("bgerror"), msg];
-    let _ = interp.dispatch_values(&handler_args);
+    // The handler runs at the global level and may complete with any
+    // code.  When it fails, tclsh reports on stderr and returns ok: with
+    // no `bgerror` command at all, the restored ::errorInfo of the
+    // original error; with one that failed, the three-line report below
+    // (the handler's own error is what the interpreter is left holding).
+    // rtcl has no init.tcl, so the missing-handler case is the common one
+    // — it used to return silently, ::errorCode left naming the failure
+    // of the lookup itself.
+    // Read off the tables: a `get_var` of an unset variable raises, and
+    // that would install its own errorCode.
+    let saved_code = interp.globals.get("errorCode").cloned();
+    let saved_info = interp.globals.get("errorInfo").cloned();
+    let handler_args = [Value::from_str("bgerror"), msg.clone()];
+    let r = interp.dispatch_values(&handler_args);
+    if let Err(e) = &r {
+        if interp.err_is_error(e) {
+            if matches!(e, crate::error::Error::InvalidCommand { ref name } if name == "bgerror") {
+                let info = saved_info
+                    .as_ref()
+                    .map(|v| v.as_str().to_string())
+                    .unwrap_or_default();
+                for (name, key, saved) in [
+                    ("::errorCode", "errorCode", saved_code),
+                    ("::errorInfo", "errorInfo", saved_info),
+                ] {
+                    match saved {
+                        Some(v) => {
+                            let _ = interp.set_var(name, v);
+                        }
+                        // Only what the failed lookup left behind: unsetting
+                        // a variable that never existed is itself an error,
+                        // and raises that errorCode.
+                        None => {
+                            if interp.globals.contains_key(key) {
+                                let _ = interp.unset_var(name);
+                            }
+                        }
+                    }
+                }
+                let _ = interp.console.write_stderr(&format!("{}\n", info));
+            } else {
+                let _ = interp.console.write_stderr(&format!(
+                    "bgerror failed to handle background error.\n    Original error: {}\n    Error in bgerror: {}\n",
+                    msg.as_str(),
+                    e.message_text()
+                ));
+            }
+        }
+    }
     Ok(Value::empty())
 }
 

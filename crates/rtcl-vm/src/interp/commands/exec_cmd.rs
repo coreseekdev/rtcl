@@ -67,13 +67,45 @@ impl Interp {
         let mut i = 0;
         while i < self.background_children.len() {
             match self.background_children[i].try_wait() {
-                Ok(Some(_)) | Err(_) => {
+                Ok(Some(status)) => {
+                    let pid = self.background_children[i].id();
+                    self.note_child_status(pid, status);
+                    self.background_children.swap_remove(i);
+                }
+                Err(_) => {
                     self.background_children.swap_remove(i);
                 }
                 Ok(None) => i += 1,
             }
         }
     }
+
+    /// Remember a background child's exit status for a later `wait` —
+    /// the handle is dropped on reap, the status need not be.
+    pub(crate) fn note_child_status(
+        &mut self,
+        pid: u32,
+        status: std::process::ExitStatus,
+    ) {
+        if self.child_status.len() >= 4096 {
+            self.child_status.clear();
+        }
+        self.child_status.insert(pid, raw_status(status));
+    }
+}
+
+/// A process's exit status for `wait`: the exit code, or `128 + signal`
+/// when a signal ended it (the raw wait status would be the code in bits
+/// 8–15 — 768 for an exit of 3).
+#[cfg(unix)]
+pub(crate) fn raw_status(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status.code().or_else(|| status.signal().map(|s| 128 + s)).unwrap_or(0)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn raw_status(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or(0)
 }
 
 pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {

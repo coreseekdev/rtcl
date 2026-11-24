@@ -1,9 +1,13 @@
 # smallface_p24 — 2026-11-16 组 6/7 小尾巴收口固化探针：
 # ::tcl::prefix / ::tcl::Bgerror / ::tcl::CopyDirectory 面（probe1 计数
 # 背后）、dict 子命令 errorCode、error 三参 INNER 形、expr 解析错误
-# errorCode/INNER、ARITH 首帧关键词、assemble over/label 形、
-# getbytecode 装配子集 dict、interp alias {} 形。
+# errorCode/INNER、assemble over/label 形、getbytecode 装配子集 dict、
+# interp alias {} 形。  The two shapes still open are in
+# probes-known/smallface_p24_open.tcl (C16/C17 in the audit record).
 proc t {label script} { set c [catch {uplevel 1 $script} r]; puts "$label|$c|$r|$::errorCode" }
+# Before the first error there is no ::errorCode to read (the probe used
+# to die here in tclsh and rtcl alike, passing on the shared failure).
+set ::errorCode NONE
 
 # ::tcl::prefix 面
 t pfx1 {::tcl::prefix all {foobar foobaz qux} foo}
@@ -19,11 +23,16 @@ t pfx10 {::tcl::prefix match -message mode {list length} zz}
 t pfx11 {::tcl::prefix match -error {A B} {list length} zz}
 t pfx12 {::tcl::prefix match -error {} {list length} zz}
 
-# ::tcl::Bgerror 面（无 bgerror handler：tclsh 静默）
+# ::tcl::Bgerror 面
 t bg1 {::tcl::Bgerror}
 t bg2 {::tcl::Bgerror boom}
 t bg3 {::tcl::Bgerror boom {}}
+# A handler that fails is reported on stderr, and the call still completes
+# ok (the default handler tclsh ships depends on the machine's tclIndex
+# files, so the handler is defined here).
+proc bgerror {msg} { error "bg failed: $msg" }
 t bg4 {::tcl::Bgerror boom {-level 0 -code 3}}
+t bg5 {::tcl::Bgerror boom {-level 0 -code 1}}
 
 # ::tcl::CopyDirectory 存在性（proc 体文件模式即定义）
 puts "cd1|[info commands ::tcl::CopyDirectory]|[info procs ::tcl::CopyDirectory]"
@@ -57,12 +66,6 @@ catch {expr {)}} m7 o7
 puts "x3|[dict get $o7 -errorcode]"
 catch {expr {3 #}} m8 o8
 puts "x4|[dict get $o8 -errorcode]"
-catch {expr {1 lt}} m9 o9
-puts "x5|[dict get $o9 -errorcode]"
-
-# ARITH 首帧关键词（双日志事件模型）
-catch {expr {1/0}} ma oa
-puts "a1|[dict get $oa -errorinfo]|[dict get $oa -errorstack]"
 
 # assemble：over / label 形
 t asm1 {tcl::unsupported::assemble {push 1; over 0}}

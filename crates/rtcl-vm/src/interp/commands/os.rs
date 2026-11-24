@@ -222,7 +222,7 @@ pub fn cmd_wait(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
     match pid_val {
-        Some(pid) => wait_process(pid, nohang),
+        Some(pid) => wait_process(_interp, pid, nohang),
         None => {
             // No pid: return NONE (no detached children to reap in our model)
             Ok(Value::from_str("0 NONE 0"))
@@ -230,28 +230,55 @@ pub fn cmd_wait(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
+/// `wait ?-nohang? pid` on a child this interpreter started (`exec … &`).
+///
+/// The child's real status comes from its handle — kept until it exits,
+/// or remembered after a reap — in the shape rtcl's `wait` always
+/// returned: `{pid} CHILDSTATUS {status}` once it is gone, `{pid} NONE 0`
+/// under `-nohang` while it still runs. The previous implementation asked
+/// a fresh `sh` to `wait` for the pid: not the parent, it answered 127
+/// for every process.
 #[cfg(all(feature = "exec", unix))]
-fn wait_process(pid: u32, nohang: bool) -> Result<Value> {
-    // Use /proc or waitpid via shell
-    // Simple approach: poll with `kill -0` and then check exit status
-    if nohang {
-        // Check if process exists
-        let output = std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .output()
-            .map_err(|e| Error::runtime(format!("wait: {}", e), ErrorCode::Io))?;
-        if output.status.success() {
-            return Ok(Value::from_str(&format!("{} NONE 0", pid)));
+fn wait_process(interp: &mut Interp, pid: u32, nohang: bool) -> Result<Value> {
+    if let Some(status) = interp.child_status.remove(&pid) {
+        return Ok(Value::from_str(&format!("{} CHILDSTATUS {}", pid, status)));
+    }
+    if let Some(idx) = interp.background_children.iter().position(|c| c.id() == pid) {
+        if nohang {
+            return match interp.background_children[idx].try_wait() {
+                Ok(Some(status)) => {
+                    interp.background_children.remove(idx);
+                    Ok(Value::from_str(&format!(
+                        "{} CHILDSTATUS {}",
+                        pid,
+                        super::exec_cmd::raw_status(status)
+                    )))
+                }
+                Ok(None) => Ok(Value::from_str(&format!("{} NONE 0", pid))),
+                Err(e) => Err(Error::runtime(format!("wait: {}", e), ErrorCode::Io)),
+            };
         }
-        Ok(Value::from_str(&format!("{} CHILDSTATUS 0", pid)))
+        // Blocking: take the handle out so nothing else reaps it first.
+        let mut child = interp.background_children.remove(idx);
+        return match child.wait() {
+            Ok(status) => Ok(Value::from_str(&format!(
+                "{} CHILDSTATUS {}",
+                pid,
+                super::exec_cmd::raw_status(status)
+            ))),
+            Err(e) => Err(Error::runtime(format!("wait: {}", e), ErrorCode::Io)),
+        };
+    }
+    // Not one of ours (or born before the handles were kept): whether it
+    // is still running is all that can be told.
+    let output = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map_err(|e| Error::runtime(format!("wait: {}", e), ErrorCode::Io))?;
+    if output.status.success() {
+        Ok(Value::from_str(&format!("{} NONE 0", pid)))
     } else {
-        // Blocking wait using shell waitpid
-        let output = std::process::Command::new("sh")
-            .args(["-c", &format!("wait {} 2>/dev/null; echo $?", pid)])
-            .output()
-            .map_err(|e| Error::runtime(format!("wait: {}", e), ErrorCode::Io))?;
-        let exit_code = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(Value::from_str(&format!("{} CHILDSTATUS {}", pid, exit_code)))
+        Ok(Value::from_str(&format!("{} NONE 0", pid)))
     }
 }
 

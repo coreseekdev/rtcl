@@ -1,7 +1,23 @@
 # crash-probe: d14 wait
+# gate: skip-tree
 source [file join [file dirname [info script]] _chk.tcl]
-set p [exec sleep 0.3 &]
-after 800
-set r [catch {wait $p} e]
-chk rc $r 0
-chk status [lindex $e 1] 0
+# `wait` used to ask a fresh `sh` to wait for the pid — not the parent —
+# and reported 127 for every child. The status now comes from the handle:
+# {pid} CHILDSTATUS {status} once gone, {pid} NONE 0 under -nohang.
+set p [exec sh -c {exit 0} &]
+set e [wait $p]
+chk shape [lindex $e 1] CHILDSTATUS
+chk status [lindex $e 2] 0
+set p [exec sh -c {exit 3} &]
+set e [wait $p]
+chk nonzero [lindex $e 2] 3
+# Still running: -nohang reports it and leaves it alone.
+set p [exec sleep 2 &]
+set e [wait -nohang $p]
+chk nohang $e "$p NONE 0"
+# Reaped before `wait` asked (a later exec reaps finished children).
+set p [exec sh -c {exit 5} &]
+after 200
+catch {exec true}
+set e [wait $p]
+chk reaped [lindex $e 2] 5

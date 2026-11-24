@@ -23,6 +23,16 @@ pub fn cmd_interp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() >= 2 && args[1].as_str() == "alias" {
         return interp_alias_main(interp, args);
     }
+    // `interp aliases ?path?`: the aliases of the main interpreter (a
+    // path other than {} names an interpreter, and there is none to
+    // query — rtcl's children are reached through their handles).
+    if args.len() == 2 && args[1].as_str() == "aliases" {
+        let mut names: Vec<String> = interp.aliases.keys().cloned().collect();
+        names.sort();
+        return Ok(Value::from_list_cached(
+            names.iter().map(|n| Value::from_str(n)).collect(),
+        ));
+    }
     if args.len() > 1 {
         return Err(Error::wrong_args_with_usage(
             "interp", 1, args.len(),
@@ -64,6 +74,7 @@ fn interp_alias_main(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let slave_path = args[2].as_str();
     if !slave_path.is_empty() {
+        super::list::set_error_code(interp, &format!("TCL LOOKUP INTERP {}", slave_path));
         return Err(Error::runtime(
             format!("could not find interpreter \"{}\"", slave_path),
             ErrorCode::NotFound,
@@ -81,10 +92,8 @@ fn interp_alias_main(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 Ok(Value::from_list_cached(out))
             }
-            None => Err(Error::runtime(
-                format!("alias \"{}\" does not exist", slave_cmd),
-                ErrorCode::NotFound,
-            )),
+            // tclsh: the query of a name that is no alias is empty.
+            None => Ok(Value::empty()),
         }
     } else {
         // 创建形：`interp alias {} src {} target ?arg...?` == `alias src target ?arg...?`
@@ -96,14 +105,22 @@ fn interp_alias_main(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         let master_path = args[4].as_str();
         if !master_path.is_empty() {
+            super::list::set_error_code(interp, &format!("TCL LOOKUP INTERP {}", master_path));
             return Err(Error::runtime(
                 format!("could not find interpreter \"{}\"", master_path),
                 ErrorCode::NotFound,
             ));
         }
-        let mut alias_args: Vec<Value> = vec![args[3].clone(), args[5].clone()];
+        // `cmd_alias` reads args[0] as the command word, args[1] as the
+        // new alias and args[2] as its target.  Without the leading word
+        // it read the *target* as the alias's name — the alias came into
+        // being under the wrong name (shadowing the target's own when a
+        // prefix was given) and the alias asked for never existed.
+        let mut alias_args: Vec<Value> = vec![args[0].clone(), args[3].clone(), args[5].clone()];
         alias_args.extend(args[6..].iter().cloned());
-        super::introspect::cmd_alias(interp, &alias_args)
+        super::introspect::cmd_alias(interp, &alias_args)?;
+        // tclsh returns the alias's name.
+        Ok(args[3].clone())
     }
 }
 

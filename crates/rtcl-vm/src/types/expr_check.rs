@@ -67,7 +67,6 @@ enum Lx {
     Bareword,
     Invalid,
     Incomplete,
-    Comment,
     Start,
 }
 
@@ -203,9 +202,6 @@ pub fn check_expr(expr: &str) -> Result<(), String> {
             // term offset with no mark.
             Err((reason, term, inc)) => return Err(c.build(&reason, term, inc, false, None)),
         };
-        if lex0 == Lx::Comment {
-            continue;
-        }
         // Uncategorized error indicators dispatch before the categories.
         if lex0 == Lx::Invalid {
             let text = c.slice(start, start + scanned);
@@ -542,13 +538,6 @@ impl<'a> Checker<'a> {
                 Ok(end) => Ok((Lx::Variable, end - start, start)),
                 Err(err) => Err(err),
             },
-            b'#' => {
-                let mut i = 0;
-                while i < rest.len() && rest[i] != b'\n' {
-                    i += 1;
-                }
-                Ok((Lx::Comment, i, start))
-            }
             b'*' if rest.len() > 1 && rest[1] == b'*' => Ok((Lx::Expon, 2, start)),
             b'*' => Ok((Lx::Mult, 1, start)),
             b'=' if rest.len() > 1 && rest[1] == b'=' => Ok((Lx::Equal, 2, start)),

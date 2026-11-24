@@ -221,7 +221,11 @@ impl Compiler {
         c.bytecode.toplevel_slots = toplevel_slots;
         c.bytecode.peephole();
         c.bytecode.source = source;
-        c.bytecode.fallback = !c.bytecode.ops().iter().all(|op| matches!(op,
+        // An operand the opcodes cannot carry makes the ops above
+        // untrustworthy wherever it appears: the whole unit goes to the
+        // tree-walk, which has no such limits.
+        let overflow = c.bytecode.index_overflow();
+        c.bytecode.fallback = overflow || !c.bytecode.ops().iter().all(|op| matches!(op,
             OpCode::PushConst(_) | OpCode::PushConstWide(_) | OpCode::PushEmpty
             | OpCode::PushInt(_) | OpCode::PushFloat(_) | OpCode::PushTrue | OpCode::PushFalse
             | OpCode::Pop | OpCode::Dup
@@ -496,11 +500,25 @@ impl Compiler {
                 self.bytecode.emit(OpCode::EvalScript, line);
             }
             Word::Concat(parts) => {
-                let n = parts.len() as u16;
-                for p in parts {
-                    self.compile_word(p, line);
+                // `Concat(n)` counts with a u16: a longer word is joined
+                // in stretches (`n as u16` used to drop the rest).
+                const MAX_PARTS: usize = u16::MAX as usize;
+                let chunks: Vec<&[Word]> = if parts.len() <= MAX_PARTS {
+                    vec![parts.as_slice()]
+                } else {
+                    parts.chunks(MAX_PARTS).collect()
+                };
+                for chunk in &chunks {
+                    for p in chunk.iter() {
+                        self.compile_word(p, line);
+                    }
+                    if chunk.len() > 1 {
+                        self.bytecode.emit(OpCode::Concat(chunk.len() as u16), line);
+                    }
                 }
-                self.bytecode.emit(OpCode::Concat(n), line);
+                if chunks.len() > 1 {
+                    self.bytecode.emit(OpCode::Concat(chunks.len() as u16), line);
+                }
             }
             Word::Expand(inner) => {
                 self.compile_word(inner, line);
@@ -1149,6 +1167,16 @@ impl Compiler {
     // Tier 2 — Call (known built-in command, unified dispatch)
     // -----------------------------------------------------------------------
 
+    /// A command with more words than the `u16` argument count of
+    /// `Call`/`DynCall` carries (`list k k … ` with 70,001 words used to
+    /// call with `argc` wrapped to 4465 and read garbage off the stack):
+    /// the unit is flagged, and with it goes to the tree-walk.
+    fn note_argc_overflow(&mut self, cmd: &Command) {
+        if cmd.words.len() > u16::MAX as usize {
+            self.bytecode.mark_index_overflow();
+        }
+    }
+
     /// Compile as a Call (known built-in command by [`CmdId`]).
     fn compile_call(&mut self, cmd: &Command, name: &str) {
         let line = self.abs_line(cmd);
@@ -1157,6 +1185,7 @@ impl Compiler {
     }
 
     fn compile_call_by_id(&mut self, cmd: &Command, cmd_id: u16, line: u32) {
+        self.note_argc_overflow(cmd);
         let argc = cmd.words.len() as u16;
         let has_expand = cmd.words.iter().any(|w| matches!(w, Word::Expand(_)));
 
@@ -1186,6 +1215,7 @@ impl Compiler {
 
     fn compile_dyncall(&mut self, cmd: &Command) {
         let line = self.abs_line(cmd);
+        self.note_argc_overflow(cmd);
         let argc = cmd.words.len() as u16;
         let has_expand = cmd.words.iter().any(|w| matches!(w, Word::Expand(_)));
 

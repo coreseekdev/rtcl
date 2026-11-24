@@ -101,6 +101,12 @@ pub fn cmd_coroutine(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         interp.note_new_command(&resume_name);
     }
     interp.note_cmd_mutation();
+    // The resume command is a real command under that name: a coroutine
+    // called `set` shadows the builtin exactly like `proc set` does, so
+    // bodies compiled with an inlined `set` must stop trusting the fold
+    // (`coroutine set apply {{} {yield 99}}` then `proc p {} {set x 1}`
+    // still ran the builtin inline where tclsh reports the wrong # args).
+    super::super::vm_exec::note_tier1_mutation(interp, &resume_name);
 
     let mut invocation: Vec<Value> = vec![args[2].clone()];
     invocation.extend(args[3..].iter().cloned());

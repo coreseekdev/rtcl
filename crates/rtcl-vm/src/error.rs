@@ -135,6 +135,18 @@ impl Error {
         }
     }
 
+    /// The interpreter's call-depth limit — tclsh's `Tcl_LimitCheck`
+    /// (`too many nested evaluations (infinite loop?)`, errorCode
+    /// `TCL LIMIT STACK`).  One constructor for every engine: the engines
+    /// are kept byte-equal and this is the error a runaway recursion
+    /// meets.
+    pub fn recursion_limit() -> Self {
+        Error::runtime(
+            "too many nested evaluations (infinite loop?)",
+            ErrorCode::StackOverflow,
+        )
+    }
+
     /// Create an invalid command error
     pub fn invalid_command(name: impl Into<String>) -> Self {
         Error::InvalidCommand { name: name.into() }
@@ -514,6 +526,7 @@ impl Error {
             Error::Runtime { message: m, .. } if m.starts_with("wrong # args") => {
                 "TCL WRONGARGS".to_string()
             }
+            Error::Runtime { code: ErrorCode::StackOverflow, .. } => "TCL LIMIT STACK".to_string(),
             Error::Runtime { message: m, code: ErrorCode::Io }
                 if m.starts_with("can not find channel named \"") =>
             {

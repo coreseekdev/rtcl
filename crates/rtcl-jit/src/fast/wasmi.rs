@@ -384,7 +384,7 @@ fn fast_linker<C: wasmi::AsContextMut<Data = FastHost>>(store: &mut C, site_cach
                     Ok((val, rc)) => sh_rc_to_i64(&mut c.data_mut().sh, val, rc),
                     Err(_) => {
                         c.data_mut().sh.pending = Some(crate::exec::Pending {
-                            err: Error::runtime("maximum recursion depth exceeded", rtcl_core::error::ErrorCode::StackOverflow),
+                            err: Error::recursion_limit(),
                             from_eval: false,
                         });
                         abi::ERR_SENTINEL
@@ -786,10 +786,7 @@ fn execute_fast(
             Ok(pair) => pair,
             Err(_trap) => {
                 // wasm 栈溢出（深递归）——优雅映射
-                return Some(Err(Error::runtime(
-                    "maximum recursion depth exceeded",
-                    rtcl_core::error::ErrorCode::StackOverflow,
-                )));
+                return Some(Err(Error::recursion_limit()));
             }
         };
         let out = match rc {

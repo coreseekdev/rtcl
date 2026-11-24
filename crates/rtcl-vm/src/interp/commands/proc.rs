@@ -706,6 +706,13 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Some((_, t)) => *t = target_key,
                 None => interp.flat_aliases.push((alias_key, target_key)),
             }
+            // The top-level slot cache holds detached copies of the
+            // unit's globals; an eval-level alias redirects reads and
+            // writes of its name, which the slot ops bypass (`set g 0;
+            // upvar 0 g q; set q 5` left g at 0). Flush what the slots
+            // hold and drop them: nothing later in the unit uses a slot.
+            interp.top_flush();
+            interp.top_slots = None;
             i += 2;
         }
         return Ok(Value::empty());
@@ -1283,8 +1290,22 @@ pub(crate) fn move_alias_origins(interp: &mut Interp, old_key: &str, new_key: &s
 }
 
 /// Resolve a command name to its registered key, mirroring dispatch's
-/// fallback chain (exact → namespace-qualified → `::`-prefixed).
+/// fallback chain (namespace-qualified → exact → `::`-prefixed).
 pub(crate) fn resolve_command_key(interp: &Interp, name: &str) -> Option<String> {
+    // A simple name inside a namespace resolves there first — the order
+    // of `dispatch_values_inner`. Probing the exact key first found the
+    // bare-keyed global command: inside `namespace eval c` with both `h`
+    // and `c::h`, `rename h {}` removed the global one where tclsh
+    // removes `c::h` (and a `tailcall h` reached the global body).
+    let simple_in_ns = interp.current_namespace.as_ref() != "::"
+        && !name.starts_with("::")
+        && !name.contains("::");
+    if simple_in_ns {
+        let qualified = super::namespace::qualify(&interp.current_namespace, name);
+        if interp.procs.contains_key(&qualified) || interp.commands.contains_key(&qualified) {
+            return Some(qualified);
+        }
+    }
     if interp.procs.contains_key(name) || interp.commands.contains_key(name) {
         return Some(name.to_string());
     }
@@ -1321,11 +1342,15 @@ pub(crate) fn resolve_command_key(interp: &Interp, name: &str) -> Option<String>
             return Some(bare.to_string());
         }
     }
-    // Namespace ensembles resolve like commands for rename.
-    let mut keys: Vec<String> = vec![name.to_string()];
-    if interp.current_namespace.as_ref() != "::" && !name.starts_with("::") {
-        keys.push(super::namespace::qualify(&interp.current_namespace, name));
-    }
+    // Namespace ensembles resolve like commands for rename — same order.
+    let mut keys: Vec<String> = if simple_in_ns {
+        vec![
+            super::namespace::qualify(&interp.current_namespace, name),
+            name.to_string(),
+        ]
+    } else {
+        vec![name.to_string()]
+    };
     if !name.starts_with("::") {
         // A relative name from the global level names `::name`
         // (ensembles created with `-command ::foo`, renamed as `foo`).

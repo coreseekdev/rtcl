@@ -118,19 +118,13 @@ fn alias_dispatch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         full_args.push(a.clone());
     }
 
-    // Look up target: first check procs, then builtins
-    if let Some(proc_def) = interp.procs.get(&info.target).cloned() {
-        interp.call_proc(&proc_def, &full_args, &info.target, None)
-    } else if let Some(f) = interp.commands.get(&info.target).cloned() {
-        // A target that is itself an alias re-enters this function with
-        // no proc call in between: one nesting level.
-        interp.enter_nested()?;
-        let r = f(interp, &full_args);
-        interp.leave_nested();
-        r
-    } else {
-        Err(Error::invalid_command(&info.target))
-    }
+    // The target is looked up like any command word, here and now
+    // (tclsh: the alias's own command lookup): a proc under any spelling
+    // of its name (`::tgt`, `ns::tgt`), a built-in, an ensemble — or
+    // another alias, each hop one more dispatch, so the call depth bounds
+    // a chain on its own.  Probing the proc and builtin tables by the
+    // bare key found only the global bare-named ones.
+    interp.dispatch_values(&full_args)
 }
 
 // ---------- local ----------

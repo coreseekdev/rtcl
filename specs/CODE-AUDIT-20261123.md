@@ -79,6 +79,12 @@
 | S24 | 句柄 A 的脚本 `_js_dispatch 1 <名字>` 可调到只在句柄 B 注册的宿主回调并拿到返回值 | `rtcl-wasm/src/js_command.rs` | 未修 |
 | S25 | 子解释器不继承宿主服务：`$h eval {time …}` trap，`puts` 输出静默丢失 | `commands/interp_cmd.rs` | 未修 |
 
+## P0：脚本可触发的死循环（两引擎皆中）
+
+| # | 触发 | 位置 | 根因 | 处置 |
+|---|---|---|---|---|
+| S41 | `expr {3 #}`、`expr {#}`、`expr {1 + #}` | `types/expr_check.rs` `check_expr` | 检查器把 `#` 当注释扫掉后 `continue` 却不推进游标——表达式里出现 `#` 即 100% CPU 永不返回。tclsh 报 `invalid character "#"`（`TCL PARSE EXPR BADCHAR`）。wasm 上就是冻结的标签页，且步数预算看不见它 | 已修（M4） |
+
 ## P1：隔离与资源治理
 
 | # | 问题 | 位置 | 处置 |
@@ -108,19 +114,34 @@
 
 | # | 现象 | 位置 | 处置 |
 |---|---|---|---|
-| C1 | 一个编译体内 ≥65536 个常量/局部变量/参数时操作数 `as u16` 截断；`p PARAM` 返回 `65535 65536` | `parser/src/compiler.rs`、`rtcl-ir/src/bytecode.rs` | 未修 |
+| C1 | 一个编译体内 ≥65536 个常量/局部变量/参数时操作数 `as u16` 截断；`p PARAM` 返回 `65535 65536` | `parser/src/compiler.rs`、`rtcl-ir/src/bytecode.rs` | 已修（M4） |
 | C2 | 回溯预算耗尽后 `regexp {a+()\1x}` 对 2000 个 `a` 返回“不匹配” | `regexp-spencer/src/backtrack.rs` | 已修（M2） |
-| C3 | `set g 0; upvar 0 g q; set q 5` 之后 `$g` 仍是 0 | `interp/vm_exec.rs` 顶层槽边界 | 未修 |
-| C4 | 命令中途重定义后再注册的 write-trace 永不触发 | `interp/vm_exec.rs` tier1 重分派 | 未修 |
+| C3 | `set g 0; upvar 0 g q; set q 5` 之后 `$g` 仍是 0 | `interp/vm_exec.rs` 顶层槽边界 | 已修（M4） |
+| C4 | 命令中途重定义后再注册的 write-trace 永不触发 | `interp/vm_exec.rs` tier1 重分派 | 已修（M4） |
 | C5 | `+ 9223372036854775807 1` 得负数，`expr` 正确宽化 | `commands/misc.rs` | 已修（M1） |
-| C6 | `tailcall` 不做命名空间解析 | `interp/call.rs` | 未修 |
-| C7 | `coroutine set …` 覆盖内建后已编译 proc 仍用内联 `set` | `commands/coro.rs` | 未修 |
-| C8 | `oo::objdefine $o unexport m` 对继承方法无效 | `commands/oo.rs` | 未修 |
-| C9 | 析构器内 `C destroy` 使析构器被跑约 500 遍 | `commands/oo.rs` | 未修 |
+| C6 | `tailcall` 不做命名空间解析 | `interp/call.rs` | 已修（M4） |
+| C7 | `coroutine set …` 覆盖内建后已编译 proc 仍用内联 `set` | `commands/coro.rs` | 已修（M4） |
+| C8 | `oo::objdefine $o unexport m` 对继承方法无效 | `commands/oo.rs` | 已修（M4） |
+| C9 | 析构器内 `C destroy` 使析构器被跑约 500 遍 | `commands/oo.rs` | 已修（M4） |
 | C10 | 旧式八进制 ≥2^63 回绕；大写十六进制 bignum 判为非数字 | `value.rs`、`types/bignum.rs` | 已修（M1） |
-| C11 | `wait` 对已退出后台进程返回 127，`-nohang` 恒为 NONE | `commands/os.rs` | 未修 |
+| C11 | `wait` 对已退出后台进程返回 127，`-nohang` 恒为 NONE | `commands/os.rs` | 已修（M4） |
 | C12 | 修复过程中新查出：`set v 018; expr {$v + 0}` 得 18（tclsh 报 invalid octal）；超过 64 位的旧式八进制被当作十进制；带 bignum 操作数的浮点运算取错值。根因是 Tcl 整数字面量语法有**四套**各自独立的实现（`value.rs`、`bignum.rs`、`expr.rs` 两处、`list.rs`），对旧式八进制理解不一 | `types/bignum.rs` | 已修（M1）：合并为单一的 `bignum::parse_int`，四处改为调用它 |
+| C15 | 修复过程中新查出：命令名到注册键的解析（`rename`、执行 trace、`tailcall` 共用的 `resolve_command_key`）先查精确键再查当前命名空间，与真正的分派链顺序相反。命名空间里有同名命令时 `rename h {}` 删掉的是全局的 `h`（tclsh 删命名空间里的） | `commands/proc.rs` | 已修（M4）：顺序改为与分派链一致 |
 | C14 | 修复过程中新查出：**约 100 字符的正则**——25 层嵌套的 `{2}`——在解析阶段吃光 3GB 后 abort；tclsh 对同样模式 16ms 内报 `out of memory`。量词重写克隆操作数，嵌套量词让语法树每层翻倍，NFA 再按乘积展开 | `regexp-spencer/src/ast.rs`、`parser.rs` | 已修（M2）：每个节点带预估状态数，解析时超编译空间预算即拒绝（tclsh 的 `REG_ESPACE`）；组嵌套上限 250 |
+| C16 | （第二批）ARITH 错误的 expr 帧关键词：tclsh 对**只含字面量**的表达式（编译期折叠）记 `invoked from within`（`expr {1/0}`、`expr {1%0}`、`expr {0**-1}`），对有运行期值参与的记 `while executing`（`expr {1/$z}`、`expr {sqrt(-1)}`）。rtcl 字节码引擎恒为 `while executing`、树引擎恒为 `invoked from within`——**两个引擎彼此都不一致**；语料与 sweep 都没有覆盖 | `interp/vm_exec.rs`、`types/expr.rs` | 未修：暂存 `judge/probes-known/smallface_p24_open.tcl` |
+| C17 | （第二批）`lt`/`le`/`gt`/`ge` 被 rtcl 当作字符串比较运算符；tclsh 8.6 里它们不是运算符（`expr {1 lt 2}` → `invalid bareword "lt"`、`TCL PARSE EXPR BAREWORD`；只有 `eq`/`ne`/`in`/`ni`）。属于语言层面的取舍，需要决定对齐 8.6 还是 8.7+ | `types/expr_check.rs`、`parser/src/expr_compile.rs` | 未修：暂存同上 |
+| C18 | （第二批）读未定义变量的 errorCode：tclsh 在 proc 里（编译期局部槽）是 `TCL READ VARNAME`，顶层是 `TCL LOOKUP VARNAME <名>`；rtcl 一律 `TCL LOOKUP VARNAME <名>`，而它两个"不带名"的形态（proc 内 `catch {set y $nosuch}`、数组元素）又落错了位置。语料没有覆盖 | `error.rs` `tcl_error_code` 及各 raise 点 | 未修 |
+| C19 | （第二批）TclOO 的一批错误不带 errorCode：未知方法应为 `TCL LOOKUP METHOD <名>`（对象命令与 `my` 同）、`X does not refer to an object/class` 应为 `TCL LOOKUP OBJECT/CLASS X`、`can't create object …` 应为 `TCL OO OVERWRITE_OBJECT`、`superclass`/`mixin` 应为 `TCL LOOKUP CLASS`；方法之外调用 `next`/`self`/`nextto` 应报 `<命令> may only be called from inside a method` + `TCL OO CONTEXT_REQUIRED`（rtcl 报 `no next method implementation` 或 `invalid command name "self"`） | `commands/oo.rs` | 已修（M4）；`my <cloned> x` 等零散形态仍未对齐 |
+| C20 | （第二批）调用深度上限的错误：rtcl 报 `maximum recursion depth exceeded` 且 errorCode 留旧值；tclsh 8.6.17 是 `too many nested evaluations (infinite loop?)` + `TCL LIMIT STACK` | `error.rs` `recursion_limit` | 已修（M4）：七个 raise 点收拢为一个构造函数 |
+| C21 | （第二批）`interp alias {} 名 {} 目标 ?前缀…?` 转投 `alias` 时漏了命令词，**把目标名当成了新别名名**：`interp alias {} als {} tgt X` 建出的是名为 `tgt`、指向 `X` 的别名，`als` 不存在；查询未知名报错（tclsh 返回空）；`interp aliases` 不存在。别名目标只按裸键查表，`::tgt`、`ns::tgt`、ensemble 都 `invalid command name` | `commands/interp_cmd.rs`、`introspect.rs` | 已修（M4）：别名目标走统一分派链 |
+| C22 | （第二批）`tailcall` 到非 proc 目标：没有该命令的日志帧（`x3 / while executing "p1"`，缺 `while executing "error x3"`），词被换成解析后的键，`-errorstack` 的 INNER 形态错。按 tclsh 机制重做：命令名在**帧的命名空间**里解析（`lookupNsPtr`）、词原样分发、由分派器补日志事件（`TEOV_Error`）。A–O 十五种形态的 errorInfo 与 tclsh 一致 | `interp/call.rs`、`eval.rs` | 已修（M4） |
+| C23 | （第二批）`::oo::ObjN::my` 的全限定名只在"最内层帧在对象命名空间内"时可用，其余一律 `invalid command name`；tclsh 里它是对象的普通命令，任何作用域都能调（普通 proc、别的对象的方法里都不行） | `commands/oo.rs` | 已修（M4）：可见性 = 命令查找本身 |
+| C24 | （第二批）`::tcl::prefix match`：歧义前缀（`l` 对 `list`/`length`）静默取第一个；`-message` 不进消息；`-error` 被忽略；选项不接受缩写；空表与二项表的 `must be` 文案不同 | `commands/misc.rs` `prefix_match` | 已修（M4）：按 `Tcl_GetIndexFromObjStruct` + `PrefixMatchObjCmd` 重写，40 余个形态与 tclsh 一致 |
+| C25 | （第二批）`::tcl::Bgerror`：handler 失败时静默吞掉（tclsh 向 stderr 报三行），`::errorCode` 留下 `TCL LOOKUP COMMAND bgerror` | `commands/misc.rs` `cmd_tcl_bgerror` | 已修（M4） |
+| C26 | （第二批）`::tcl::unsupported::assemble` 的 errorCode：`TCL OPERATION ASSEMBLE BADLABEL/BADINSTR` 或 NONE；tclsh 是 `TCL ASSEM BADSTACK`、`TCL ASSEM NOLABEL @x`、`TCL ASSEM DUPLABEL @x`、`TCL LOOKUP INDEX instruction <名>` | `commands/misc.rs` | 已修（M4） |
+| C27 | （第二批）expr 解析错误的 `-errorstack` 沿用上一个错误的条目（没有重置、INNER 没落） | `interp/eval.rs` `eval_expr` | 已修（M4） |
+| C28 | （第二批）proc 内 `namespace eval … { tailcall … }`：tclsh 报 `tailcall can only be called from a proc, lambda or method`，rtcl 照常执行 | `interp/call.rs` | 未修 |
+| C29 | （第二批）rtcl 没有默认 `bgerror` proc（tclsh 的 init.tcl 提供）；`interp` 命令是 jimtcl 模型——裸 `interp` 创建子解释器并返回 `interp#N` 句柄，没有 `interp create/slaves/eval/delete/exists/expose/hide/hidden/invokehidden/limit/recursionlimit`（与 S25/S26 同源） | `commands/interp_cmd.rs` | 未修：归入 M6 |
 | C13 | 修复过程中新查出：`json encode` 的 schema 文本按词递归（`list list list …` 重复几万次即栈溢出），JSON 解码的递归下降无深度上限 | `commands/json.rs` | 已修（M2）：文档与 schema 的嵌套上限 1000，超限报错 |
 
 ## P2：性能（`TODO.md` 未列，本机单次实测，只看量级）
@@ -170,6 +191,10 @@
 5. **分派结构**：把每个 op 前的动态检查（epoch、顶层槽分类）换成
    编译期插入的显式 op 与入口检查；之后再把 `Vec<OpCode>` 换成数字
    码表 + 紧凑指令流（见 TODO「op 码表」）。
+7. **探针本身也会坏**：`judge/probes/smallface_p24.tcl` 开头就读未初始化
+   的 `::errorCode`，在 tclsh 和 rtcl 上都死在第一行——两个解释器报同一个
+   错即算"通过"。它钉着的 `::tcl::prefix`、ARITH 首帧、`interp alias`、
+   表达式里的 `#`（死循环）因此从未被检查过（见「第二批」）。
 
 ## 门禁基线（2026-11-24，HEAD c76ae3b 之上）
 
@@ -185,13 +210,23 @@
   已不成立。审计修复未增减该名单。
 - `judge/crash-gate.sh`：基线 99 次运行 14 过；M1 后 40 过
   （a 类 24/24 全过）；M2a/M2b 后 60 过（b01–b10 全过）；M2c/M2d 后
-  78 过（b 类 21 个全过）；M3 后 100 次运行 79 过（新增 a13）。
-  余下 c 类 5 个（原生 OS 面的挂起）与 d 类 11 个（静默错误）。
+  78 过（b 类 21 个全过）；M3 后 100 次运行 79 过（新增 a13）；M4
+  后 **108 次运行 103 过**——d 类 16 个全过，新增 c06（表达式里的
+  `#`）与 d15–d18（tailcall、`my` 可见性、`interp alias`、TclOO
+  errorCode）。余下 c 类 5 个（原生 OS 面的挂起，M5）。
+- `judge/crash-wasm.mjs`：**35 项**全过（M3 时 27 项）。每项在自己的
+  worker 线程里跑，15 秒无结果即判 `HANG` 并终止线程——原来遇到挂起类
+  回归是门禁自己卡死（步数预算看不见解析器/检查器里的循环）。
 - 对照基线：10 万层嵌套 list 的销毁 8–13ms → 4–5ms（迭代路径反而更快）；
   宽列表（200 万元素）与字符串列表的销毁无变化；1.6 万层嵌套 list 上
   25 个命令里基线有 17 个栈溢出，现全部正常返回。
 - 嵌套 `{2}` 量词正则（100 字符）：3GB 后 abort → 约 40ms 内报
   `couldn't compile regular expression pattern: out of memory`（同 tclsh）。
+- 编译：常量池加了哈希索引（原来每次插入线性扫描，7 万个字面量的
+  编译是二次方的）。单元里交给 u16 操作数的常量/局部槽/参数个数超过
+  65535 时整个单元回落树走（原来静默截断：`p PARAM` 返回
+  `65535 65536`）。已知限制：这种超大单元在树走上较慢（7 万条命令
+  约 4.5 秒）——操作数加宽形式属于 ISA 重写范围。
 - 带捕获的匹配：20 万次 `regexp {(\w+)-(\d+)}` 1872ms → 2325ms（基线
   每次较慢是另一形态）——单次 94µs → 12µs；`regexp -inline {(a+)(b+)}`
   400 字符：基线跑不完 → 26µs/次；24 个对照用例结果与 tclsh 逐字一致。
@@ -223,6 +258,48 @@
   原来绕过步数预算，现按迭代/指令计步。
 - 新门禁 `judge/crash-wasm.mjs`（Node 里对 wasm 产物跑同类缺陷，
   每项一个全新实例）：27 项全过；`crates/rtcl-wasm/test.js` 26/26。
+
+## 第二批（2026-11-24 夜）：门禁暴露的问题
+
+第一批 M4 的全量门禁抓到一个**自己引入的回归**：`judge/probes/oo17`
+（方法体内 `tailcall my go …` → `invalid command name "::oo::ObjN::my"`）。
+顺着它查出上面 C16–C29 一串既有缺陷。做法与第一批相同：先把 tclsh
+的行为和机制查清，再按机制实现，不迁就探针。
+
+- **依据是 tclsh 源码**（core-8-6-branch，只读）：`TclNRTailcallEval`
+  把命令词的**查找**放进 tailcall 所在帧的命名空间（`lookupNsPtr`），
+  词原样分发；`TEOV_Error` → `TclLogCommandInfo` 为按词调用的命令补
+  日志事件（词的 list 形式；errorInfo 为空时 `while executing`，否则
+  `invoked from within`；raise 点已记过则不记），同时重置
+  `-errorstack`。rtcl 对应为 `Interp::cmd_lookup_ns`（一次性查找
+  命名空间覆盖）+ `Interp::cmd_lookup_in`（运行中的命令是在哪个命名
+  空间被找到的——`my`、对象命令要再解析一次自己的词）+
+  `Interp::log_tailcalled`。
+- **`my` 的可见性**：rtcl 有一道"最内层帧在对象命名空间内"的守卫，
+  在 tclsh 里没有依据——6 个合法形态里基线错了 4 个。去掉后可见性 =
+  命令查找本身（`qualify(当前命名空间, 词)` 命中对象）。
+- **探针 `judge/probes/smallface_p24.tcl` 是死的**：第一行就读
+  `::errorCode`（尚未初始化），tclsh 与 rtcl 同样报错，于是"一致"。
+  修活后它逐项暴露了 C16–C17、C19、C21、C24–C27 与 S41；除 C16/C17
+  外全部当场修掉，这两项暂存
+  `judge/probes-known/smallface_p24_open.tcl`。
+- **工具教训**（与「判官为什么没抓到」同类）：用"两个解释器输出相同"
+  做门禁时，共同的早期失败等于空转。修活的探针现在 53 行、与 tclsh
+  逐字节一致。
+- **同类空转的规模（已排查，未修）**：`judge/probes/` 的 437 个探针里
+  有 57 个在 tclsh 上以未捕获错误结束，其中约 30 个在文件末尾之前就
+  中断——后面的用例在两个解释器上都没跑过（启发式统计，少数几项的
+  "后续行"其实是同一条多行命令的续行）。中断点最靠前的：
+  `trv_d22`（第 1/8 行）、`sub_inline_multiline`（1/3）、`ei1`（2/24，
+  15 行未执行）、`p32`（2/12）、`p29`（3/10）、`probe6`（10/28，
+  18 行未执行）、`oo19`（41/56，15 行）、`namespace_uplevel`（13/25，
+  12 行）；其余：`c5_l2`、`ens`、`globprobe`、`ix1`、`ix2`、
+  `oo1`、`oo8`、`p21`、`p25`、`p28`、`p47`、`p48`、`pidx`、`pidx2`、
+  `pidx4`、`r4reg2`、`scan_numeric2`、`scan_validator_edges`、
+  `trv_p1`、`utf_char_classes`、`namespace_varmodel`。逐个修活是独立
+  的一批工作——`smallface_p24` 修活一项就带出 7 类缺陷。
+- **已知未修并登记**：C16（且两引擎不一致——sweep 语料里加上 ARITH
+  形态就会红，需先修）、C17、C18、C28、C29。
 
 ## 已剔除 / 未能复现
 

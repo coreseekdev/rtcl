@@ -297,9 +297,6 @@ pub(crate) struct OoCallCache {
     pub typed: Value,
     pub method: Value,
     pub key: Rc<str>,
-    /// The object's namespace, captured at fill time — the `my` slot's
-    /// `frame_in_object_ns` guard needs it without re-probing the tables.
-    pub obj_ns: Option<Rc<str>>,
     pub method_rc: Rc<str>,
     pub chain: Rc<Vec<ChainEntry>>,
 }
@@ -308,6 +305,13 @@ pub(crate) struct OoCallCache {
 #[derive(Debug, Default)]
 pub(crate) struct OoState {
     pub next_obj_id: usize,
+    /// Objects and classes whose destruction is in progress. Destruction
+    /// cascades (a class onto its instances) and runs destructors before
+    /// the tables let go, so a destructor naming its own class re-entered
+    /// the same destruction once per instance until the recursion limit
+    /// (`oo::class create C {destructor {C destroy}}`); a second request
+    /// for a key in here does nothing.
+    pub destroying: std::collections::HashSet<String>,
     // Fx-hashed: these are probed by canonical object/class key on every
     // OO dispatch (`resolve_object_key`, `owner_variables`,
     // `object_ns_of`); std's SipHash was ~5% of the oo_bench2_vars
@@ -642,8 +646,23 @@ fn object_key_candidates(interp: &Interp, typed: &str) -> Vec<String> {
     if typed.starts_with("::") {
         vec![normalise(typed)]
     } else {
-        vec![qualify(&interp.current_namespace, typed), format!("::{}", typed)]
+        vec![qualify(lookup_ns(interp), typed), format!("::{}", typed)]
     }
+}
+
+/// The namespace a command word is being resolved in: the current one — or,
+/// for a `tailcall` target, the one its command was looked up in
+/// ([`Interp::cmd_lookup_in`]).  tclsh resolves a command once; the
+/// command then knows where it lives, however far the caller's namespace
+/// is from that.  The OO dispatchers resolve their word a second time
+/// (`my` for its object, the object commands for their key), and that
+/// second resolution belongs to the first one's namespace.
+#[inline]
+fn lookup_ns(interp: &Interp) -> &Rc<str> {
+    interp
+        .cmd_lookup_in
+        .as_ref()
+        .unwrap_or(&interp.current_namespace)
 }
 
 /// Resolve an as-typed name to an object/class key.
@@ -659,7 +678,7 @@ fn resolve_object_key(interp: &Interp, typed: &str) -> Option<Rc<str>> {
     // 64 namespaces, an inner one at 256 names.
     {
         let memo = interp.oo.key_memo.borrow();
-        if let Some(inner) = memo.get(interp.current_namespace.as_ref()) {
+        if let Some(inner) = memo.get(lookup_ns(interp).as_ref()) {
             if let Some((stamp, k)) = inner.get(typed) {
                 if *stamp == interp.oo.mutation_ctr {
                     return k.clone();
@@ -679,13 +698,11 @@ fn resolve_object_key(interp: &Interp, typed: &str) -> Option<Rc<str>> {
         let mut memo = interp.oo.key_memo.borrow_mut();
         const KEY_MEMO_NS_MAX: usize = 64;
         const KEY_MEMO_NAME_MAX: usize = 256;
-        if memo.len() >= KEY_MEMO_NS_MAX && !memo.contains_key(interp.current_namespace.as_ref())
-        {
+        let ns = lookup_ns(interp);
+        if memo.len() >= KEY_MEMO_NS_MAX && !memo.contains_key(ns.as_ref()) {
             memo.clear();
         }
-        let inner = memo
-            .entry(Rc::from(interp.current_namespace.as_ref()))
-            .or_default();
+        let inner = memo.entry(Rc::clone(ns)).or_default();
         if inner.len() >= KEY_MEMO_NAME_MAX {
             inner.clear();
         }
@@ -810,6 +827,12 @@ fn build_chain(interp: &Interp, key: &str, method: &str, include_private: bool) 
     let mut hidden: HashSet<String> = HashSet::new();
 
     if let Some(obj) = interp.oo.objects.get(key) {
+        // `oo::objdefine o unexport m` makes the method private to the
+        // object: an outside call does not find it, `my m` still does.
+        // The object's list feeds the same set the class-level `unexport`
+        // uses for the chain, and gates the object's own table too.
+        let obj_hides = |m: &str| !include_private && obj.hidden.iter().any(|h| h == m);
+        hidden.extend(obj.hidden.iter().filter(|_| !include_private).cloned());
         // tclsh 8.6.17 解析序（实测钉形）：**对象 mixin 先于对象自有
         // 方法**，再类链——`oo::objdefine o method m` 与 mixin 同名时
         // mixin 的 m 先跑，其 `next` 落到对象自有方法（随后类链）。
@@ -819,7 +842,7 @@ fn build_chain(interp: &Interp, key: &str, method: &str, include_private: bool) 
             }
         }
         if let Some((_, def)) = obj.methods.iter().find(|(n, _)| n == method) {
-            if def.exported || include_private {
+            if (def.exported || include_private) && !obj_hides(method) {
                 out.push(ChainEntry {
                     vars: Some(Rc::clone(&obj.variables)),
                     owner: Owner::Object,
@@ -990,16 +1013,6 @@ fn cleanup_active(interp: &mut Interp) {
     }
 }
 
-/// Is the innermost frame inside the object's namespace subtree?
-fn frame_in_object_ns(interp: &Interp, obj_ns: &str) -> bool {
-    let ns = interp
-        .frames
-        .last()
-        .and_then(|f| f.ns.clone())
-        .unwrap_or_else(|| interp.current_namespace.clone());
-    ns.as_ref() == obj_ns || ns.starts_with(&format!("{}::", obj_ns))
-}
-
 // ── messages ───────────────────────────────────────────────────────────
 
 fn render_or_list(items: &[String]) -> String {
@@ -1031,7 +1044,7 @@ fn render_or_list_oxford(items: &[String]) -> String {
 /// `<cloned>, a, destroy, eval, own, unknown, variable or varname`，
 /// 字节序排序）；外部调用只见导出方法 + destroy。
 fn unknown_method_error(
-    interp: &Interp,
+    interp: &mut Interp,
     key: &str,
     typed: &str,
     method: &str,
@@ -1076,6 +1089,9 @@ fn unknown_method_error(
         ));
     }
     let _ = typed;
+    // tclsh's core `unknown` method raises this error with that code —
+    // for an object command and for `my` alike, the name as typed.
+    super::list::set_error_code(interp, &format!("TCL LOOKUP METHOD {}", method));
     Error::Msg(format!(
         "unknown method \"{}\": must be {}",
         method,
@@ -1083,12 +1099,23 @@ fn unknown_method_error(
     ))
 }
 
-fn does_not_refer(kind_obj: bool, typed: &str) -> Error {
-    Error::Msg(if kind_obj {
-        format!("{} does not refer to an object", typed)
-    } else {
-        format!("{} does not refer to a class", typed)
-    })
+/// `X does not refer to an object` — or `… to a class` — with tclsh's
+/// errorCode (`TCL LOOKUP OBJECT X` / `TCL LOOKUP CLASS X`, the name as
+/// typed): every TclOO lookup failure raises both, whatever command it is
+/// that wanted the object.  A macro, not a function: it installs the code
+/// on the interpreter and hands back the error, and most callers are in a
+/// position to borrow neither twice.
+macro_rules! does_not_refer {
+    ($interp:expr, $kind_obj:expr, $typed:expr) => {{
+        let typed: &str = $typed;
+        if $kind_obj {
+            super::list::set_error_code($interp, &format!("TCL LOOKUP OBJECT {typed}"));
+            Error::Msg(format!("{} does not refer to an object", typed))
+        } else {
+            super::list::set_error_code($interp, &format!("TCL LOOKUP CLASS {typed}"));
+            Error::Msg(format!("{} does not refer to a class", typed))
+        }
+    }};
 }
 
 // ── method execution ───────────────────────────────────────────────────
@@ -1384,7 +1411,7 @@ fn object_ns_of(interp: &Interp, key: &str) -> Rc<str> {
 /// Is the entry still the resolution this invocation would recompute?
 fn cache_entry_live(interp: &Interp, c: &OoCallCache, typed_val: &Value, method_val: &Value) -> bool {
     c.stamp == interp.oo.mutation_ctr
-        && Rc::ptr_eq(&c.ns, &interp.current_namespace)
+        && Rc::ptr_eq(&c.ns, lookup_ns(interp))
         && c.typed.same_allocation(typed_val)
         && c.method.same_allocation(method_val)
 }
@@ -1410,18 +1437,16 @@ fn cache_entry(
     interp: &Interp,
     typed_val: &Value,
     method_val: &Value,
-    obj_ns: Option<Rc<str>>,
     key: &Rc<str>,
     method_rc: &Rc<str>,
     chain: &Rc<Vec<ChainEntry>>,
 ) -> OoCallCache {
     OoCallCache {
-        ns: Rc::clone(&interp.current_namespace),
+        ns: Rc::clone(lookup_ns(interp)),
         stamp: interp.oo.mutation_ctr,
         typed: typed_val.clone(),
         method: method_val.clone(),
         key: Rc::clone(key),
-        obj_ns,
         method_rc: Rc::clone(method_rc),
         chain: Rc::clone(chain),
     }
@@ -1531,18 +1556,10 @@ fn invoke_method(
     if include_private {
         let idx = (interp.oo.my_cache_next & 1) as usize;
         interp.oo.my_cache_next = (idx as u8 + 1) & 1;
-        let entry = cache_entry(
-            interp,
-            typed_val,
-            method_val,
-            Some(object_ns_of(interp, key)),
-            key,
-            &method_rc,
-            &chain,
-        );
+        let entry = cache_entry(interp, typed_val, method_val, key, &method_rc, &chain);
         interp.oo.my_cache[idx] = Some(entry);
     } else {
-        let entry = cache_entry(interp, typed_val, method_val, None, key, &method_rc, &chain);
+        let entry = cache_entry(interp, typed_val, method_val, key, &method_rc, &chain);
         interp.oo.obj_cache = Some(entry);
     }
     exec_chain_entry(interp, key, &method_rc, 0, &chain, call_args, typed, typed_val, true)
@@ -1659,23 +1676,17 @@ extern "Rust" fn cmd_oo_my(interp: &mut Interp, args: &[Value]) -> Result<Value>
     let typed = args[0].as_str();
     // Dispatcher cache, `my` slot: the typed word ("my"), the method word,
     // the namespace and the stamp pin the resolution (`qualify` + the
-    // `my_commands` probe) and the chain.  The frame guard still runs per
-    // call — it depends on the live frame stack.
+    // `my_commands` probe) and the chain.
     if args.len() >= 2 {
         if let Some(i) = my_cache_hit(interp, &args[0], &args[1]) {
-            let (key, method_rc, chain, obj_ns) = {
+            let (key, method_rc, chain) = {
                 let c = interp.oo.my_cache[i].as_ref().unwrap();
                 (
                     Rc::clone(&c.key),
                     Rc::clone(&c.method_rc),
                     Rc::clone(&c.chain),
-                    c.obj_ns.clone(),
                 )
             };
-            let obj_ns = obj_ns.unwrap_or_else(|| object_ns_of(interp, &key));
-            if !frame_in_object_ns(interp, &obj_ns) {
-                return Err(Error::invalid_command(typed));
-            }
             return exec_chain_entry(
                 interp,
                 &key,
@@ -1689,15 +1700,20 @@ extern "Rust" fn cmd_oo_my(interp: &mut Interp, args: &[Value]) -> Result<Value>
             );
         }
     }
-    let cmd_key = qualify(&interp.current_namespace, typed);
+    // Which `my` is at hand is a question of the word and the namespace
+    // it is looked up in, and nothing else: in tclsh `::oo::ObjN::my` is an
+    // ordinary command of the object's namespace — a qualified word names
+    // it from anywhere (a method of another object, a plain proc, the top
+    // level), a bare `my` only where that namespace is the current one
+    // (`namespace eval` into it included).  There is no test on the frame
+    // stack to add: a guard on the innermost frame rejected every
+    // qualified use, and with it `tailcall my …`, whose command runs once
+    // the method's frame is gone but is looked up in the frame's namespace.
+    let cmd_key = qualify(lookup_ns(interp), typed);
     let key: Rc<str> = match interp.oo.my_commands.get(&cmd_key) {
         Some(k) => Rc::from(k.as_str()),
         None => return Err(Error::invalid_command(typed)),
     };
-    let ns = object_ns_of(interp, &key);
-    if !frame_in_object_ns(interp, &ns) {
-        return Err(Error::invalid_command(typed));
-    }
     if args.len() < 2 {
         return Err(Error::wrong_args_with_usage("my", 2, args.len(), "method ?arg ...?"));
     }
@@ -1741,7 +1757,7 @@ extern "Rust" fn cmd_oo_self(interp: &mut Interp, args: &[Value]) -> Result<Valu
         // the same value `self object` yields (tclsh 8.6.17).
         return match top_active(interp) {
             Some(a) => Ok(Value::from_str(&a.obj)),
-            None => Err(Error::invalid_command("self")),
+            None => Err(context_required(interp, "self")),
         };
     }
     let word = args[1].as_str();
@@ -1768,7 +1784,7 @@ extern "Rust" fn cmd_oo_self(interp: &mut Interp, args: &[Value]) -> Result<Valu
     };
     let act = match top_active(interp) {
         Some(a) => a,
-        None => return Err(Error::invalid_command("self")),
+        None => return Err(context_required(interp, "self")),
     };
     match sub {
         "object" => Ok(Value::from_str(&act.obj)),
@@ -1821,10 +1837,7 @@ fn object_class_of(interp: &Interp, key: &str) -> String {
 extern "Rust" fn cmd_oo_next(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let act = match top_active(interp) {
         Some(a) => a,
-        None => {
-            set_tcloo_next_inner(interp);
-            return Err(Error::Msg("no next method implementation".to_string()));
-        }
+        None => return Err(context_required(interp, "next")),
     };
     let next_index = act.index + 1;
     if next_index >= act.chain.len() {
@@ -1900,16 +1913,13 @@ extern "Rust" fn cmd_oo_nextto(interp: &mut Interp, args: &[Value]) -> Result<Va
     }
     let act = match top_active(interp) {
         Some(a) => a,
-        None => {
-            set_tcloo_next_inner(interp);
-            return Err(Error::Msg("no next method implementation".to_string()));
-        }
+        None => return Err(context_required(interp, "nextto")),
     };
     // 目标类按对象键解析（tclsh nt2/nt3：语境外的 nextto 不可见——
     // 本命令仅在对象 ns path 上，方法体内可达）。
     let typed = args[1].as_str();
     let target = resolve_object_key(interp, typed)
-        .ok_or_else(|| does_not_refer(true, typed))?;
+        .ok_or_else(|| does_not_refer!(interp, true, typed))?;
     // 从当前实现的下一站起，找 owner == 目标类的首个链条目。
     let start = act.index + 1;
     let hit = act.chain[start..]
@@ -1960,6 +1970,16 @@ extern "Rust" fn cmd_oo_nextto(interp: &mut Interp, args: &[Value]) -> Result<Va
         }
     }
     r
+}
+
+/// `next`, `nextto` or `self` with no method around it (tclsh's
+/// `TclOOGetCallContext` finding none): the error names the command and
+/// raises `TCL OO CONTEXT_REQUIRED`.  A `tailcall` to one of them lands
+/// here — the tailcalled command runs once the method's frame is gone — as
+/// does a plain `::oo::Helpers::next` at the top level.
+fn context_required(interp: &mut Interp, cmd: &str) -> Error {
+    super::list::set_error_code(interp, "TCL OO CONTEXT_REQUIRED");
+    Error::Msg(format!("{cmd} may only be called from inside a method"))
 }
 
 /// next 自身分派失败时的 INNER（tclsh 的内部命令名，实测原样单词）。
@@ -2145,6 +2165,8 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
     let canonical = qualify(&interp.current_namespace, &name_typed);
     ensure_parent_namespaces(interp, &canonical);
     if command_exists_any(interp, &canonical) {
+        // tclsh raises this one with its own code (TclOOCreateObject).
+        super::list::set_error_code(interp, "TCL OO OVERWRITE_OBJECT");
         return Err(Error::Msg(format!(
             "can't create object \"{}\": command already exists with that name",
             name_typed
@@ -2346,6 +2368,19 @@ fn chain_contains(interp: &Interp, key: &str, class_key: &str) -> bool {
 /// chain contains them.  Destructor errors are raised *after* removal
 /// (tclsh: the object is gone either way).
 fn destroy_object(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value> {
+    if !interp.oo.classes.contains_key(key) && !interp.oo.objects.contains_key(key) {
+        return Ok(Value::empty());
+    }
+    // Already in progress: nothing to do (see [`OoState::destroying`]).
+    if !interp.oo.destroying.insert(key.to_string()) {
+        return Ok(Value::empty());
+    }
+    let r = destroy_object_inner(interp, key, keep_ns);
+    interp.oo.destroying.remove(key);
+    r
+}
+
+fn destroy_object_inner(interp: &mut Interp, key: &str, keep_ns: bool) -> Result<Value> {
     let is_class = interp.oo.classes.contains_key(key);
     let is_object = interp.oo.objects.contains_key(key);
     if !is_class && !is_object {
@@ -2462,8 +2497,8 @@ extern "Rust" fn cmd_oo_define(interp: &mut Interp, args: &[Value]) -> Result<Va
     let typed = args[1].as_str().to_string();
     let canonical = match resolve_object_key(interp, &typed) {
         Some(k) if interp.oo.classes.contains_key(k.as_ref()) => k,
-        Some(_) => return Err(does_not_refer(false, &typed)),
-        None => return Err(does_not_refer(true, &typed)),
+        Some(_) => return Err(does_not_refer!(interp, false, &typed)),
+        None => return Err(does_not_refer!(interp, true, &typed)),
     };
     if args.len() == 3 {
         let script = args[2].as_str().to_string();
@@ -2495,7 +2530,7 @@ extern "Rust" fn cmd_oo_objdefine(interp: &mut Interp, args: &[Value]) -> Result
     let typed = args[1].as_str().to_string();
     let canonical = match resolve_object_key(interp, &typed) {
         Some(k) => k,
-        None => return Err(does_not_refer(true, &typed)),
+        None => return Err(does_not_refer!(interp, true, &typed)),
     };
     if args.len() == 3 {
         let script = args[2].as_str().to_string();
@@ -2847,12 +2882,16 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                 let typed = arg.as_str();
                 let canonical = match resolve_object_key(interp, typed) {
                     Some(k) => k,
-                    None => return Err(does_not_refer(true, typed)),
+                    None => return Err(does_not_refer!(interp, true, typed)),
                 };
                 if !interp.oo.classes.contains_key(canonical.as_ref()) {
                     if canonical.as_ref() == def_target_name(&target) {
                         return Err(Error::Msg("may not mix a class into itself".to_string()));
                     }
+                    super::list::set_error_code(
+                        interp,
+                        &format!("TCL LOOKUP CLASS {}", typed),
+                    );
                     return Err(Error::Msg("may only mix in classes".to_string()));
                 }
                 if canonical.as_ref() == def_target_name(&target) {
@@ -2925,9 +2964,13 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                 let typed = arg.as_str();
                 let canonical = match resolve_object_key(interp, typed) {
                     Some(k) => k,
-                    None => return Err(does_not_refer(true, typed)),
+                    None => return Err(does_not_refer!(interp, true, typed)),
                 };
                 if !interp.oo.classes.contains_key(canonical.as_ref()) {
+                    super::list::set_error_code(
+                        interp,
+                        &format!("TCL LOOKUP CLASS {}", typed),
+                    );
                     return Err(Error::Msg("only a class can be a superclass".to_string()));
                 }
                 if canonical.as_ref() == target_name
@@ -3347,7 +3390,7 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     let src_typed = args[1].as_str().to_string();
     let src = match resolve_object_key(interp, &src_typed) {
         Some(k) if interp.oo.objects.contains_key(k.as_ref()) || interp.oo.classes.contains_key(k.as_ref()) => k,
-        _ => return Err(does_not_refer(true, &src_typed)),
+        _ => return Err(does_not_refer!(interp, true, &src_typed)),
     };
     let is_class_src = interp.oo.classes.contains_key(src.as_ref());
     let (target_typed, full, ns_override) = if args.len() == 4 {
@@ -3375,6 +3418,7 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     };
     ensure_parent_namespaces(interp, &full);
     if command_exists_any(interp, &full) {
+        super::list::set_error_code(interp, "TCL OO OVERWRITE_OBJECT");
         return Err(Error::Msg(format!(
             "can't create object \"{}\": command already exists with that name",
             target_typed
@@ -3481,10 +3525,10 @@ fn unknown_sub_error(word: &str, list: &[&str]) -> Error {
     ))
 }
 
-fn resolve_object_arg(interp: &Interp, typed: &str) -> std::result::Result<String, Error> {
+fn resolve_object_arg(interp: &mut Interp, typed: &str) -> std::result::Result<String, Error> {
     resolve_object_key(interp, typed)
         .map(|k| k.to_string())
-        .ok_or_else(|| does_not_refer(true, typed))
+        .ok_or_else(|| does_not_refer!(interp, true, typed))
 }
 
 fn methods_listing(
@@ -4074,7 +4118,7 @@ fn info_object(interp: &mut Interp, args: &[Value], prefix: &str) -> Result<Valu
                 ));
             }
             let key = resolve_object_key(interp, args[3].as_str())
-                .ok_or_else(|| does_not_refer(true, args[3].as_str()))?;
+                .ok_or_else(|| does_not_refer!(interp, true, args[3].as_str()))?;
             let items = interp
                 .oo
                 .objects
@@ -4101,7 +4145,7 @@ fn info_object(interp: &mut Interp, args: &[Value], prefix: &str) -> Result<Valu
                 // tclsh pairs the message with errorCode
                 // `TCL LOOKUP OBJECT <name>`.
                 super::list::set_error_code(interp, &format!("TCL LOOKUP OBJECT {}", typed));
-                does_not_refer(true, typed)
+                does_not_refer!(interp, true, typed)
             })?;
             Ok(call_chain_desc(interp, &key, args[4].as_str(), false))
         }
@@ -4115,7 +4159,7 @@ fn info_object(interp: &mut Interp, args: &[Value], prefix: &str) -> Result<Valu
                 ));
             }
             let key = resolve_object_key(interp, args[3].as_str())
-                .ok_or_else(|| does_not_refer(true, args[3].as_str()))?;
+                .ok_or_else(|| does_not_refer!(interp, true, args[3].as_str()))?;
             let name = args[4].as_str();
             match object_method_def(interp, &key, name) {
                 Some(def) if sub == "methodtype" => {
@@ -4137,7 +4181,7 @@ fn info_object(interp: &mut Interp, args: &[Value], prefix: &str) -> Result<Valu
                 ));
             }
             let key = resolve_object_key(interp, args[3].as_str())
-                .ok_or_else(|| does_not_refer(true, args[3].as_str()))?;
+                .ok_or_else(|| does_not_refer!(interp, true, args[3].as_str()))?;
             let name = args[4].as_str();
             match object_method_def(interp, &key, name) {
                 Some(def) => Ok(method_forward_words(&def)),
@@ -4148,16 +4192,16 @@ fn info_object(interp: &mut Interp, args: &[Value], prefix: &str) -> Result<Valu
     }
 }
 
-fn resolve_class_arg(interp: &Interp, typed: &str) -> std::result::Result<String, Error> {
+fn resolve_class_arg(interp: &mut Interp, typed: &str) -> std::result::Result<String, Error> {
     // (cold define-time path: the Rc key materializes to String here)
     let key = match resolve_object_key(interp, typed) {
         Some(k) => k,
-        None => return Err(does_not_refer(true, typed)),
+        None => return Err(does_not_refer!(interp, true, typed)),
     };
     if interp.oo.classes.contains_key(key.as_ref()) {
         Ok(key.to_string())
     } else {
-        Err(does_not_refer(false, typed))
+        Err(does_not_refer!(interp, false, typed))
     }
 }
 
@@ -4380,7 +4424,7 @@ fn info_class(interp: &mut Interp, args: &[Value], prefix: &str) -> Result<Value
             let typed = args[3].as_str();
             let key = resolve_object_key(interp, typed).ok_or_else(|| {
                 super::list::set_error_code(interp, &format!("TCL LOOKUP OBJECT {}", typed));
-                does_not_refer(true, typed)
+                does_not_refer!(interp, true, typed)
             })?;
             if !interp.oo.classes.contains_key(key.as_ref()) {
                 // Not-a-class: `TCL LOOKUP CLASS <name>` accompanies the

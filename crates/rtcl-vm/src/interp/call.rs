@@ -43,10 +43,7 @@ impl Interp {
         let prelink = self.frame_prelink.take();
         let mut prelink_done = prelink.is_none();
         if self.call_depth > self.max_call_depth {
-            return Err(Error::runtime(
-                "maximum recursion depth exceeded",
-                crate::error::ErrorCode::StackOverflow,
-            ));
+            return Err(Error::recursion_limit());
         }
         // The def's params/body/compiled are read through a reference for
         // the whole call; only a tail-call rebind needs an owned def (the
@@ -83,7 +80,9 @@ impl Interp {
         // tailcall 状态：重绑过目标（INNER 用目标调用词）与目标为内置
         // （错误在目标分派期，记 INNER 目标词）。
         let mut tailcall_rebound = false;
-        let mut tailcall_builtin_text: Option<String> = None;
+        // A `tailcall` to anything but a proc, waiting for the frame to
+        // go: the namespace its command is looked up in, and the words.
+        let mut tailcall_deferred: Option<(Rc<str>, Vec<Value>)> = None;
 
         // Execution traces (tclsh 8.6.17): `enter` fires before the frame
         // exists and its callback's error REPLACES this invocation
@@ -563,11 +562,23 @@ impl Interp {
                         break Ok(Value::empty());
                     }
                     let cmd_name = tc_args[0].clone();
-                    if let Some(new_proc) = self.procs.get(&cmd_name).cloned() {
+                    // Resolve the target like any invocation at this
+                    // point — in the namespace the tailcall runs in
+                    // (`tailcall p` inside `namespace eval a` reaches
+                    // `a::p`; the bare key lookup used below only ever saw
+                    // the global `p`).
+                    let tailcall_proc = tailcall_proc_target(self, &cmd_name);
+                    let target_key = tailcall_proc
+                        .as_ref()
+                        .map(|(_, k)| k.clone())
+                        .or_else(|| {
+                            super::commands::proc::resolve_command_key(self, &cmd_name)
+                        });
+                    if let Some((new_proc, key)) = tailcall_proc {
                         // Tail-call to another proc — reuse the frame (no depth increase)
                         current_statics = Rc::clone(&new_proc.statics);
                         tc_def = Some(new_proc);
-                        current_proc_name = Cow::Owned(cmd_name.clone());
+                        current_proc_name = Cow::Owned(key);
                         owned_args = Some(tc_args.into_iter().map(|s| Value::from_str(&s)).collect());
                         // 重绑后本帧的 level0 由绑定步骤改写为目标调用
                         // 词（CALL 条目跟随）。
@@ -578,9 +589,9 @@ impl Interp {
                         // entry pushed one — without the guard this would
                         // clobber the CALLER's context.
                         if traced_entry {
-                            let new_key =
-                                super::commands::proc::resolve_command_key(self, &cmd_name)
-                                    .unwrap_or_else(|| cmd_name.clone());
+                            let new_key = target_key
+                                .clone()
+                                .unwrap_or_else(|| cmd_name.clone());
                             if let Some(top) = self.exec_step_stack.last_mut() {
                                 *top = new_key;
                             }
@@ -590,14 +601,19 @@ impl Interp {
                         body_entered = false;
                         continue;
                     } else {
-                        // Target is a built-in — evaluate and return
+                        // Not a proc — a built-in, an ensemble, an alias,
+                        // or nothing that exists.  tclsh replaces this
+                        // frame with that call (TclNRTailcallEval): the
+                        // command is looked up in the namespace the
+                        // tailcall ran in, and the words run as written in
+                        // the caller's scope once the frame is gone —
+                        // dispatched after the epilogue below.  (`tailcall
+                        // set g 1` used to run `set` while the frame still
+                        // stood, writing a local that died with it.)
                         let tc_values: Vec<Value> =
                             tc_args.iter().map(|s| Value::from_str(s)).collect();
-                        // 内置目标的分派期错误：INNER 记目标调用词
-                        // （tclsh：`tailcall error x3` → `INNER {error x3}`）。
-                        tailcall_builtin_text =
-                            Some(Value::from_list(&tc_values).as_str().to_string());
-                        break self.invoke_builtin_or_eval(&tc_values);
+                        tailcall_deferred = Some((Rc::clone(&self.current_namespace), tc_values));
+                        break Ok(Value::empty());
                     }
                 }
                 other => break other,
@@ -646,12 +662,9 @@ impl Interp {
                 // D-3 -errorstack：CALL/UP 条目由每次**错误日志事件**
                 // （err_harness_frame）按当前活动帧追加，proc 出口不再
                 // 手推（tclsh 的 CALL 是 framePtr 的 objv，不是出口
-                // 点）。这里只处理 tailcall 的 INNER 特殊形。
-                if let Some(t) = &tailcall_builtin_text {
-                    // tailcall 内置目标：错误在目标分派期 → INNER 记
-                    // 目标调用词（tclsh `INNER {error x3}`）。
-                    self.err_pending_inner = Some(t.clone());
-                } else if !body_entered && tailcall_rebound {
+                // 点）。这里只处理 tailcall 目标绑定失败的 INNER 形
+                // （按词分派的目标自身的 INNER 由 log_tailcalled 记）。
+                if !body_entered && tailcall_rebound {
                     // tailcall 目标绑定失败：INNER = 目标调用词（无
                     // invokeStk1 词缀；tclsh 实测 `{f 9}`）。
                     self.err_pending_inner = Some(
@@ -867,6 +880,20 @@ impl Interp {
             }
         }
 
+        // The command a `tailcall` named when it named no proc, run where
+        // the frame stood: the caller's scope, the frame already gone, the
+        // command looked up where the tailcall ran (tclsh `lookupNsPtr`).
+        if let Some((ns, tc_values)) = tailcall_deferred {
+            self.cmd_lookup_ns = Some(ns);
+            let r = self.dispatch_values(&tc_values);
+            if let Err(e) = &r {
+                if self.err_is_error(e) {
+                    self.log_tailcalled(&tc_values, e);
+                }
+            }
+            return r;
+        }
+
         match final_result {
             Ok(v) => Ok(v),
             Err(e) => {
@@ -1040,25 +1067,84 @@ impl Interp {
         }
     }
 
-    /// Invoke a command from tail-call args. Tries builtins first, falls back to eval.
-    fn invoke_builtin_or_eval(&mut self, args: &[Value]) -> Result<Value> {
-        if args.is_empty() {
-            return Ok(Value::empty());
+    /// The log event of a command dispatched from words alone — a `tailcall`
+    /// target, once its frame is gone.  No script site records it, so the
+    /// dispatcher does (tclsh `TEOV_Error` → `TclLogCommandInfo`): the
+    /// words in list form; `while executing` while the errorInfo is still
+    /// empty, `invoked from within` once something deeper has logged,
+    /// nothing when the raise site logged for itself (an `error` with its
+    /// own `-errorinfo`, `err_skip_log`).  The event also starts a fresh
+    /// `-errorstack`: its INNER entry is the words unless the raise site
+    /// brought its own form (expr's `syntax`).
+    fn log_tailcalled(&mut self, words: &[Value], e: &Error) {
+        if self.err_skip_log {
+            return;
         }
-        let cmd_name = args[0].as_str();
-        if let Some(f) = self.commands.get(cmd_name).cloned() {
-            self.call_depth += 1;
-            let result = f(self, args);
-            self.call_depth -= 1;
-            self.fill_wrong_args(cmd_name, result)
-        } else {
-            // Fallback: build script string and eval。
-            // 同上：词序列化必须走规范 list 形式（含引号词才会往返），
-            // 否则拼出的脚本会把 `{"a":1}` 拆成碎的词。
-            let script = Value::from_list(args).as_str().to_string();
-            self.eval(&script)
+        let text = Value::from_list(words).as_str().to_string();
+        // A raise site that parked an INNER form of its own (expr's
+        // `syntax`) keeps it.  `returnImm` is the script form of
+        // `error`/`return`; invoked by words, the command is its own inner
+        // context (`INNER {error x3}`) — as is any command with nothing
+        // parked (`INNER {nosuch a b}`).
+        let raise_site_form = match self.err_pending_inner.as_deref() {
+            None => false,
+            Some(p) if p.starts_with("returnImm") => false,
+            Some(_) => true,
+        };
+        if !raise_site_form {
+            self.err_pending_inner = Some(text.clone());
+        }
+        // The keyword is tclsh's: the frame is the error's first
+        // (`while executing`) while the errorInfo holds no more than the
+        // message — an ARITH raise site reports the bare message and no
+        // frame of its own — and `invoked from within` once it holds more
+        // (an expr parse error's `(parsing expression …)` line, or frames
+        // logged in a body the command ran).
+        let msg = e.message_text();
+        self.err_while_exec = self.err_info.as_deref() == Some(msg.as_str());
+        // The parked form goes on the stack only when the raise site
+        // logged: the first frame of an error builds a fresh stack, an
+        // error logged deeper already carries the deeper entry.
+        std::mem::take(&mut self.err_force_inner);
+        self.err_force_inner = raise_site_form;
+        // tclsh counts the error line from the start of the command's own
+        // text, which here is the whole of it.
+        self.err_harness_frame_words(&e.message_text(), &text, 1, Some(words), None);
+        // The raise site's log is an event of its own in tclsh: its scope
+        // is on the stack once more.
+        if raise_site_form {
+            self.err_log_call();
+        }
+        // Nothing consumed them (the errorInfo was given): drop what this
+        // armed, so it cannot colour the next error.
+        self.err_force_inner = false;
+        self.err_while_exec = false;
+        self.err_pending_inner = None;
+    }
+}
+
+/// The proc a `tailcall` target names, with the key it is registered
+/// under — looked up in dispatch's order (`dispatch_values_inner`): a
+/// simple name inside a namespace resolves there before the bare-keyed
+/// global one. `resolve_command_key` probes the exact key first and so
+/// finds the global `p` first; inside `namespace eval a` with both `p`
+/// and `a::p` that dispatched the wrong proc. Targets this misses (an
+/// import alias, a built-in) take the ordinary dispatch path.
+fn tailcall_proc_target(interp: &Interp, name: &str) -> Option<(Rc<ProcDef>, String)> {
+    if interp.current_namespace.as_ref() != "::"
+        && !name.starts_with("::")
+        && !name.contains("::")
+    {
+        let qualified =
+            super::commands::namespace::qualify(&interp.current_namespace, name);
+        if let Some(p) = interp.procs.get(&qualified) {
+            return Some((Rc::clone(p), qualified));
         }
     }
+    interp
+        .procs
+        .get(name)
+        .map(|p| (Rc::clone(p), name.to_string()))
 }
 
 /// The namespace part of a qualified proc name: `::foo::p` → `::foo`,
@@ -1167,10 +1253,7 @@ impl Interp {
         // 一次 Rc<str> 堆分配即 ~40ns，fib A/B 实证）。
         let key: &str = name;
         if self.call_depth > self.max_call_depth {
-            return Some(Err(Error::runtime(
-                "maximum recursion depth exceeded",
-                crate::error::ErrorCode::StackOverflow,
-            )));
+            return Some(Err(Error::recursion_limit()));
         }
         self.call_depth += 1;
 

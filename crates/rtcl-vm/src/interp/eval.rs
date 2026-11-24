@@ -820,10 +820,7 @@ impl Interp {
         }
         self.charge_step()?;
         if self.call_depth > self.max_call_depth {
-            return Err(Error::runtime(
-                "maximum recursion depth exceeded",
-                crate::error::ErrorCode::StackOverflow,
-            ));
+            return Err(Error::recursion_limit());
         }
 
         // Evaluate all words, handling {*} expand.  A failure here
@@ -1059,6 +1056,63 @@ impl Interp {
         // installs (scan formats, exec, `error`) mark this flag, and a
         // `catch` later decides preserve-vs-derive from it.
         self.err_code_raised = false;
+
+        // tclsh's `lookupNsPtr` (TclNRTailcallEval → TEOV_LookupCmdFromObj):
+        // under an override the command *name* resolves in that namespace
+        // — the one the `tailcall` ran in — while everything the command
+        // then does sees the caller's.  The resolution chain below reads
+        // `current_namespace`, so the override swaps it for the lookup and
+        // the body hands it back before the command runs.
+        match self.cmd_lookup_ns.take() {
+            None => self.dispatch_values_body(args, None),
+            Some(ns) => {
+                let mut restore = Some(std::mem::replace(&mut self.current_namespace, ns));
+                let r = self.dispatch_values_body(args, Some(&mut restore));
+                // A dispatch that never reached a command (nothing found,
+                // or a handler that was itself not found) ends here.
+                self.end_command_lookup(&mut restore);
+                r
+            }
+        }
+    }
+
+    /// End the lookup phase of a lookup-override dispatch (see
+    /// [`Interp::cmd_lookup_ns`]): execution from here on is in the
+    /// caller's namespace again.  Yields the namespace the command was
+    /// looked up in when an override was in force.
+    fn end_command_lookup(&mut self, restore: &mut Option<Rc<str>>) -> Option<Rc<str>> {
+        restore.take().map(|saved| {
+            let lookup = std::mem::replace(&mut self.current_namespace, saved);
+            lookup
+        })
+    }
+
+    /// Run a builtin an override dispatch has resolved: while it runs,
+    /// [`Interp::cmd_lookup_in`] names the namespace its word was looked
+    /// up in, for the commands that resolve their word a second time.
+    fn invoke_looked_up(
+        &mut self,
+        looked_up_in: Option<Rc<str>>,
+        cmd_name: &str,
+        args: &[Value],
+        f: crate::command::CommandFunc,
+    ) -> Result<Value> {
+        match looked_up_in {
+            None => self.invoke_builtin_traced(cmd_name, args, f),
+            Some(ns) => {
+                let saved = self.cmd_lookup_in.replace(ns);
+                let r = self.invoke_builtin_traced(cmd_name, args, f);
+                self.cmd_lookup_in = saved;
+                r
+            }
+        }
+    }
+
+    fn dispatch_values_body(
+        &mut self,
+        args: &[Value],
+        mut restore: Option<&mut Option<Rc<str>>>,
+    ) -> Result<Value> {
         let cmd_name = args[0].as_str();
 
         // Resolution cache (tclsh's resolved command tokens): the probe
@@ -1069,7 +1123,11 @@ impl Interp {
         // fall straight through to the full chain.
         match self.cmd_cache_get(cmd_name) {
             Some(super::ResolvedCmd::Builtin(f)) => {
-                return self.invoke_builtin_traced(cmd_name, args, f);
+                let looked_up_in = match restore.as_deref_mut() {
+                    Some(r) => self.end_command_lookup(r),
+                    None => None,
+                };
+                return self.invoke_looked_up(looked_up_in, cmd_name, args, f);
             }
             Some(super::ResolvedCmd::Proc(key)) => {
                 // A generation-valid hit implies the key is still
@@ -1191,6 +1249,9 @@ impl Interp {
         if let Some((ens_key, ens_def)) =
             crate::interp::commands::namespace::find_ensemble(self, cmd_name)
         {
+            if let Some(r) = restore.as_deref_mut() {
+                self.end_command_lookup(r);
+            }
             return crate::interp::commands::namespace::dispatch_ensemble(
                 self, &ens_key, ens_def, args,
             );
@@ -1249,7 +1310,11 @@ impl Interp {
         match func {
             Some(f) => {
                 self.cmd_cache_put(cmd_name, super::ResolvedCmd::Builtin(f));
-                self.invoke_builtin_traced(cmd_name, args, f)
+                let looked_up_in = match restore.as_deref_mut() {
+                    Some(r) => self.end_command_lookup(r),
+                    None => None,
+                };
+                self.invoke_looked_up(looked_up_in, cmd_name, args, f)
             }
             None => {
                 // Expr functions double as commands: `::tcl::mathfunc::abs -0`
@@ -1634,6 +1699,13 @@ impl Interp {
             );
             self.err_pending_inner =
                 Some(format!("syntax {} {}", crate::value::tcl_quote(&msg), crate::value::tcl_quote(&opts)));
+            if tec.starts_with("TCL PARSE EXPR") {
+                // A parse error is a new error: the next log event starts
+                // a fresh -errorstack with that entry (tclsh
+                // TclErrorStackResetIf).  Without this the event appended
+                // the frame and left the previous error's stack standing.
+                self.err_force_inner = true;
+            }
         }
         r
     }

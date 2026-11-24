@@ -97,6 +97,18 @@ pub struct ForeachInfo {
 pub struct ByteCode {
     /// String constant pool — referenced by `PushConst`, `LoadGlobal`, etc.
     constants: Vec<String>,
+    /// `constants` by text → index. The pool used to be searched
+    /// linearly on every insert, which made a unit with many distinct
+    /// literals quadratic to compile (70,000 of them: seconds).
+    const_index: std::collections::HashMap<Box<str>, u32>,
+    /// An operand passed what the instruction set can carry — a constant
+    /// index handed to a `u16` opcode, a local slot past `u16::MAX`, an
+    /// argument count likewise.
+    /// The ops then hold truncated numbers, so the unit must not run
+    /// compiled: the compiler turns this into [`ByteCode::fallback`].
+    /// (`as u16` used to wrap silently instead: a body with 70,000
+    /// distinct literals read the wrong variable.)
+    index_overflow: bool,
     /// Instruction sequence.
     ops: Vec<OpCode>,
     /// Local variable names (index = slot number).
@@ -157,6 +169,8 @@ impl Default for ByteCode {
     fn default() -> Self {
         Self {
             constants: Vec::new(),
+            const_index: std::collections::HashMap::new(),
+            index_overflow: false,
             ops: Vec::new(),
             locals: Vec::new(),
             line_map: Vec::new(),
@@ -180,6 +194,8 @@ impl Clone for ByteCode {
     fn clone(&self) -> Self {
         Self {
             constants: self.constants.clone(),
+            const_index: self.const_index.clone(),
+            index_overflow: self.index_overflow,
             ops: self.ops.clone(),
             locals: self.locals.clone(),
             line_map: self.line_map.clone(),
@@ -265,22 +281,44 @@ impl ByteCode {
 
     /// Add a string to the constant pool and return its index.
     /// If the string already exists, reuse the existing index.
-    /// Returns `u16` for backward compatibility (panics if pool > u16::MAX).
+    ///
+    /// The `u16` form is what the name-keyed opcodes carry: past
+    /// `u16::MAX` the unit is flagged ([`ByteCode::index_overflow`]) and
+    /// the truncated index is never used — the unit does not run. The
+    /// flag is raised here, at the consumer, not in the pool: a large
+    /// pool is fine as long as it is only pushed ([`Self::emit_push_const`]
+    /// has a wide form), which is the shape of a big literal table.
     pub fn add_const(&mut self, s: &str) -> u16 {
         let idx = self.add_const_wide(s);
+        if idx > u32::from(u16::MAX) {
+            self.index_overflow = true;
+        }
         idx as u16
     }
 
     /// Add a string to the constant pool and return its wide (u32) index.
     /// If the string already exists, reuse the existing index.
     pub fn add_const_wide(&mut self, s: &str) -> u32 {
-        if let Some(idx) = self.constants.iter().position(|c| c == s) {
-            idx as u32
-        } else {
-            let idx = self.constants.len() as u32;
-            self.constants.push(s.to_string());
-            idx
+        if let Some(idx) = self.const_index.get(s) {
+            return *idx;
         }
+        let idx = self.constants.len() as u32;
+        self.constants.push(s.to_string());
+        self.const_index.insert(s.into(), idx);
+        idx
+    }
+
+    /// An operand the instruction set cannot carry (see
+    /// [`ByteCode::index_overflow`]); set by the pool and the locals table
+    /// themselves, and by a compiler hand-rolling a count.
+    pub fn mark_index_overflow(&mut self) {
+        self.index_overflow = true;
+    }
+
+    /// Whether any operand passed what the opcodes can carry: such a unit
+    /// must not run compiled.
+    pub fn index_overflow(&self) -> bool {
+        self.index_overflow
     }
 
     /// Emit a `PushConst` or `PushConstWide` instruction for the given string.
@@ -384,14 +422,23 @@ impl ByteCode {
     // -- locals --------------------------------------------------------------
 
     /// Register a local variable name and return its slot index.
+    ///
+    /// Slot operands are `u16`: once the table holds every addressable
+    /// slot it stops growing, the unit is flagged
+    /// ([`ByteCode::index_overflow`]) and `u16::MAX` comes back — never a
+    /// valid slot, and the unit never runs. (`idx as u16` used to wrap a
+    /// 70,000th local onto slot 4464.)
     pub fn add_local(&mut self, name: &str) -> u16 {
         if let Some(idx) = self.locals.iter().position(|n| n == name) {
-            idx as u16
-        } else {
-            let idx = self.locals.len() as u16;
-            self.locals.push(name.to_string());
-            idx
+            return idx as u16;
         }
+        if self.locals.len() >= u32::from(u16::MAX) as usize {
+            self.index_overflow = true;
+            return u16::MAX;
+        }
+        let idx = self.locals.len() as u16;
+        self.locals.push(name.to_string());
+        idx
     }
 
     /// Look up a local by name.

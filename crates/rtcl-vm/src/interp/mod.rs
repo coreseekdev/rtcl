@@ -691,6 +691,18 @@ pub struct Interp {
     /// `ns`/`call_ns` records.  Names built fresh (qualify, ns eval) move
     /// their String in via `Rc::from`, which reuses the allocation.
     pub(crate) current_namespace: Rc<str>,
+    /// tclsh's `lookupNsPtr`: the namespace the *next* command dispatch
+    /// resolves its command name in, instead of the current one.  Set by a
+    /// `tailcall` to anything but a proc (TclNRTailcallEval): the command
+    /// is looked up in the namespace of the frame the tailcall ran in and
+    /// runs in the caller's.  One dispatch consumes it.
+    pub(crate) cmd_lookup_ns: Option<Rc<str>>,
+    /// The namespace the command now running was looked up in, while that
+    /// is not the current one — i.e. during a command dispatched under
+    /// [`Self::cmd_lookup_ns`], after the swap ended.  A command that
+    /// resolves its own word again (`my`, the object commands) resolves it
+    /// here.
+    pub(crate) cmd_lookup_in: Option<Rc<str>>,
     /// The root namespace as a shared `Rc` — the namespace of every
     /// global-scope proc, handed out per call without allocating.
     pub(crate) ns_root: Rc<str>,
@@ -972,6 +984,10 @@ pub struct Interp {
     /// reaper model, on the event-loop tick / before the next spawn).
     #[cfg(feature = "exec")]
     pub(crate) background_children: Vec<std::process::Child>,
+    /// Exit status (raw) of background children already reaped before a
+    /// `wait` asked for them (exec/update/Drop reap finished children):
+    /// pid → raw status. Read by `wait`, cleared past a cap.
+    pub(crate) child_status: std::collections::HashMap<u32, i32>,
     /// 宿主控制台服务：无 `io` 特性构建里 `puts` 的 stdout/stderr 落点
     /// （原生 stdio，或 wasm 宿主注入的 JS 实现）。
     pub(crate) console: Box<dyn crate::host::HostConsole>,
@@ -1157,6 +1173,8 @@ impl Interp {
             #[cfg(feature = "package")]
             packages: HashMap::new(),
             current_namespace: Rc::from("::"),
+            cmd_lookup_ns: None,
+            cmd_lookup_in: None,
             ns_root: Rc::from("::"),
             namespaces: {
                 let mut ns = varmap::FxHashedMap::default();
@@ -1184,6 +1202,7 @@ impl Interp {
             channels: crate::channel::ChannelTable::new(),
             #[cfg(feature = "exec")]
             background_children: Vec::new(),
+            child_status: std::collections::HashMap::new(),
             console: {
                 #[cfg(feature = "std")]
                 let c: Box<dyn crate::host::HostConsole> = Box::new(crate::host::NativeConsole);
@@ -1372,10 +1391,7 @@ impl Interp {
     /// 以 `Result` 返回（含 Suspend/exit flow），计数随栈展开恢复。
     pub(crate) fn enter_nested(&mut self) -> std::result::Result<(), crate::error::Error> {
         if self.nest_depth >= self.max_call_depth {
-            return Err(crate::error::Error::runtime(
-                "maximum recursion depth exceeded",
-                crate::error::ErrorCode::StackOverflow,
-            ));
+            return Err(crate::error::Error::recursion_limit());
         }
         self.nest_depth += 1;
         Ok(())
@@ -1952,7 +1968,13 @@ mod tests {
         interp.set_max_call_depth(20);
         let r = interp.eval("proc f {n} {f $n}; f 1");
         let msg = format!("{}", r.expect_err("must hit the lowered limit"));
-        assert!(msg.contains("recursion"), "{msg}");
+        // tclsh's wording for its own limit (Tcl_LimitCheck) — and the
+        // errorCode a `catch` reports with it.
+        assert_eq!(msg, "too many nested evaluations (infinite loop?)");
+        let code = interp
+            .eval("catch {f 1} m; set ::errorCode")
+            .expect("the catch returns");
+        assert_eq!(code.as_str(), "TCL LIMIT STACK");
         interp.set_max_call_depth(0);
         assert_eq!(interp.max_call_depth(), 1, "a limit is never zero");
     }

@@ -320,9 +320,9 @@ micro_incr 1.42x（派发地板，见 BASELINE 板点 4 节）。
 `judge/crash-probes/`（门禁 `judge/crash-gate.sh`，提交前与
 judge/sweep 同跑）。下面只列**结构**动作：按类别消除，而不是逐点打补丁。
 
-- [ ] **M1 止血**（S1–S10）：12 个 panic 点——`&str` 按字节切片、Rust
+- [x] **M1 止血**（S1–S10，e513371）：12 个 panic 点——`&str` 按字节切片、Rust
   格式化/时间库的边界、脚本可控尺寸的裸分配。全部是局部修复。
-- [ ] **M2 栈安全**（S11–S22）：唯一的守卫 `call_depth` 只数 proc/内建
+- [x] **M2 栈安全**（S11–S22，c298b77、0725bd2）：唯一的守卫 `call_depth` 只数 proc/内建
   调用。目标形态 = 一个 `StackGuard`：脚本驱动的重入（unknown 处理器、
   ensemble 重分派、alias、trace 回调、嵌套 `[…]` 求值、`eval` 嵌套）汇
   到同一检查点；解析/编译（expr 递归下降、`try_compile_sub`、正则
@@ -330,11 +330,16 @@ judge/sweep 同跑）。下面只列**结构**动作：按类别消除，而不�
   `serialize_dict`、`drop_last_owner`、JSON 解码/编码、regexp dissect）
   改显式栈迭代——它们没有"报错"的位置，只能不递归。递归上限按目标栈
   校准（wasm 上 650–1000 层即 trap 并毒化实例）。
-- [ ] **M3 资源治理**（S21、S22、S28）：`InterpLimits { max_steps,
+- [x] **M3 资源治理**（S21、S22、S28，129966d）：`InterpLimits { max_steps,
   max_call_depth, max_value_bytes, max_list_elements }`，wasm 带默认值
   并经 `RtclHandle` 暴露；脚本可控尺寸的分配一律走 `try_reserve` 并
   返回 Tcl 错误（Rust 默认分配失败 = abort，`catch` 拦不住）。
-- [ ] **M4 静默错误**（C1–C11）：其中 C1 是结构性的，见下"op 码表"。
+- [x] **M4 静默错误**（C1–C15、C19–C27；两批，同一提交）：其中 C1 是
+  结构性的，见下"op 码表"。第二批由第一批的门禁暴露（回归 `oo17`
+  + 死探针 `smallface_p24`），顺带修掉 S41（表达式里的 `#` 死循环）。
+  - [ ] 余项：C16 ARITH 首帧关键词（**两引擎不一致**，sweep 未覆盖）、
+    C17 `lt/le/gt/ge` 运算符（语言层取舍）、C18 `READ/LOOKUP VARNAME`、
+    C28 `namespace eval` 内的 `tailcall`；C29 归入 M6。
 - [ ] **M5 OS 面**（S31–S37）：exec 两路并发排空、后台 stderr drain、
   失败路径 kill+wait；`close` 对连接中的 async socket 直接丢弃；
   `file tempfile` 用 `create_new` + 0600；`file delete` 非 `-force`
@@ -342,7 +347,9 @@ judge/sweep 同跑）。下面只列**结构**动作：按类别消除，而不�
 - [ ] **M6 能力模型**（S23–S27）：真正的隐藏命令表（解析期拒绝，
   `invokehidden` 才可调）+ per-instance 令牌（dynmod 分发校验）+
   子解释器继承限额与宿主服务 + `exec` 入口检测半途状态并复位。
-- [ ] **工具化防线**：`judge/crash-gate.sh` 入门禁；`rtcl-vm` 开
+- [ ] **工具化防线**：`judge/crash-gate.sh` 入门禁（已入：原生 108 次
+  运行、wasm `judge/crash-wasm.mjs` 35 项带 worker 看门狗）；**排查
+  其余探针是否也在两个解释器上共同早退而空转**（`smallface_p24` 是）；`rtcl-vm` 开
   clippy `unwrap_used` / `indexing_slicing` / `arithmetic_side_effects`
   （先按文件棘轮，再全量）；`judge/panic-census.sh` 的计数只许降。
 

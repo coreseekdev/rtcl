@@ -99,9 +99,9 @@
 
 | # | 问题 | 位置 | 处置 |
 |---|---|---|---|
-| S31 | exec 三处死锁（stderr 超 64KiB 且 stdout 未关、`<<` 超管道容量、后台作业写大量 stderr）；`exit` 被存活的管道子进程阻塞 3 秒 | `commands/exec_cmd.rs` | 未修 |
+| S31 | exec 三处死锁（stderr 超 64KiB 且 stdout 未关、`<<` 超管道容量、后台作业写大量 stderr）；`exit` 被存活的管道子进程阻塞 3 秒 | `commands/exec_cmd.rs` | 死锁三项已修（M5）；`exit` 阻塞见 S32 |
 | S32 | `close` 仍在连接的 `-async` socket 无限阻塞 | `channel.rs` | 未修 |
-| S33 | exec 遇非 UTF-8 输出报错并留僵尸进程 | `commands/exec_cmd.rs` | 未修 |
+| S33 | exec 遇非 UTF-8 输出报错并留僵尸进程 | `commands/exec_cmd.rs` | 已修（M5）：非 UTF-8 逐字节映射成同值字符（同 tclsh）；不留僵尸——输出读不出来时 kill + 收尸，spawn 失败时把已启动的阶段分离、由下次 exec 收（tclsh 同） |
 | S34 | `file tempfile` 任意路径前缀、无 `O_EXCL`、0644 | `host.rs` | 未修 |
 | S35 | `file delete` 不带 `-force` 也递归删非空目录 | `commands/io.rs` | 未修 |
 | S36 | `file normalize a/../x` 原样返回 | `commands/io.rs` | 未修 |
@@ -142,6 +142,9 @@
 | C27 | （第二批）expr 解析错误的 `-errorstack` 沿用上一个错误的条目（没有重置、INNER 没落） | `interp/eval.rs` `eval_expr` | 已修（M4） |
 | C28 | （第二批）proc 内 `namespace eval … { tailcall … }`：tclsh 报 `tailcall can only be called from a proc, lambda or method`，rtcl 照常执行 | `interp/call.rs` | 未修 |
 | C29 | （第二批）rtcl 没有默认 `bgerror` proc（tclsh 的 init.tcl 提供）；`interp` 命令是 jimtcl 模型——裸 `interp` 创建子解释器并返回 `interp#N` 句柄，没有 `interp create/slaves/eval/delete/exists/expose/hide/hidden/invokehidden/limit/recursionlimit`（与 S25/S26 同源） | `commands/interp_cmd.rs` | 未修：归入 M6 |
+| C30 | （M5）exec 的错误语义与 tclsh 不同：子进程写了 stderr（未重定向、未 `-ignorestderr`）tclsh 让 exec **报错**、消息 = stdout + stderr（`catch {exec …} msg` 取 stderr 是 Tcl 惯用法），rtcl 把 stderr 打到自己的 stderr 并返回成功；失败消息多了 `(exit code N)`、stdout 与原因之间缺换行；被信号杀死 tclsh 报 `child killed: <描述>` + `CHILDKILLED pid SIGNAME {描述}`，rtcl 当成退出码 1；成功时 rtcl 把 `::errorCode` 清成 NONE（tclsh 不动）；重定向失败的消息与 `POSIX ENOENT …` errorCode 不同；非 UTF-8 字节 tclsh 逐个映射成同值的 Unicode 字符。语料与探针里没有任何 exec 调用，所以一直没被看见 | `commands/exec_cmd.rs` `cmd_exec` | 已修（M5）：按 `TclCleanupChildren` 与实测重写了原生路径的参数扫描、管道搭建与收尾（探针 d19，42 条断言在 tclsh 上同样全过）。一并对齐：`2>@1` 两流共用一根管道（保持写出顺序）、重定向在 spawn 之前按命令行顺序打开、目标可连写在操作符后（`2>/dev/null`）、CR LF 与孤立 CR 按换行处理、开关不接受缩写、各语法错误的 errorCode、子进程继承调用方的 stdin、中途失败时已启动的子进程分离而不是杀掉 |
+| C31 | （M5）`@通道` 重定向（`exec cmd 2>@ stderr`、`>@ $chan`、`<@ $chan`、`>>@`、`2>>@`）：tclsh 把通道的描述符传给子进程；rtcl 原来把这些词当普通参数传给命令（静默出错），现在明确报错 | `commands/exec_cmd.rs` | 未修：通道层需要先暴露描述符 |
+| C32 | （M5）带宿主 `HostExec` 的 exec 路径（`cmd_exec_host`，注入了宿主的 wasm 环境走它）仍是旧语义：stderr 不使 exec 失败、`(exit code N)`、成功时清 `::errorCode`、`bad switch` | `commands/exec_cmd.rs` `cmd_exec_host` | 未修 |
 | C13 | 修复过程中新查出：`json encode` 的 schema 文本按词递归（`list list list …` 重复几万次即栈溢出），JSON 解码的递归下降无深度上限 | `commands/json.rs` | 已修（M2）：文档与 schema 的嵌套上限 1000，超限报错 |
 
 ## P2：性能（`TODO.md` 未列，本机单次实测，只看量级）
@@ -214,6 +217,11 @@
   后 **108 次运行 103 过**——d 类 16 个全过，新增 c06（表达式里的
   `#`）与 d15–d18（tailcall、`my` 可见性、`interp alias`、TclOO
   errorCode）。余下 c 类 5 个（原生 OS 面的挂起，M5）。
+- M5（exec）：c01–c03 转绿；c01 的期望从"不挂"改成 tclsh 的行为
+  （stderr 输出使 exec 报错）；新增 d19（exec 错误语义，42 条断言）。
+  `d01` 的预算放宽到 90 秒——它是编译上限的压力探针（超大单元走
+  树引擎，负载高的机器上每个引擎 5–7 秒），不是挂起探针，20 秒
+  默认预算在负载 20+ 时抖过。
 - `judge/crash-wasm.mjs`：**35 项**全过（M3 时 27 项）。每项在自己的
   worker 线程里跑，15 秒无结果即判 `HANG` 并终止线程——原来遇到挂起类
   回归是门禁自己卡死（步数预算看不见解析器/检查器里的循环）。

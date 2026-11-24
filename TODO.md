@@ -340,7 +340,8 @@ judge/sweep 同跑）。下面只列**结构**动作：按类别消除，而不�
   - [ ] 余项：C16 ARITH 首帧关键词（**两引擎不一致**，sweep 未覆盖）、
     C17 `lt/le/gt/ge` 运算符（语言层取舍）、C18 `READ/LOOKUP VARNAME`、
     C28 `namespace eval` 内的 `tailcall`；C29 归入 M6。
-- [ ] **M5 OS 面**（S31–S37）：exec 两路并发排空、后台 stderr drain、
+- [ ] **M5 OS 面**（S31–S37）——exec 已完成（S31 死锁、S33、C30；余 C31
+  `@通道` 重定向、C32 宿主 exec 路径）：exec 两路并发排空、后台 stderr drain、
   失败路径 kill+wait；`close` 对连接中的 async socket 直接丢弃；
   `file tempfile` 用 `create_new` + 0600；`file delete` 非 `-force`
   只删空目录；`-async` fd 加 `SOCK_CLOEXEC`。

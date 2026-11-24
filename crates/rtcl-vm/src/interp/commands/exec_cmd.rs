@@ -60,6 +60,132 @@ fn exec_err_str(msg: impl std::fmt::Display) -> Error {
     Error::runtime(msg.to_string(), ErrorCode::Io)
 }
 
+/// Stop and reap every child of a pipeline that failed after some stage
+/// had already been spawned. Dropping a `Child` neither kills nor waits:
+/// a redirection file that would not open, a spawn failure further down
+/// the pipe, or output that failed to arrive used to leave the earlier
+/// stages running and, once they exited, zombies.
+fn kill_and_reap(children: &mut [std::process::Child]) {
+    for child in children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Hand a `<<` string to the child from a helper thread. Written from the
+/// parent it filled the pipe (64KiB) and the parent — not yet reading the
+/// child's output — waited for it forever: `exec tr x y << [string
+/// repeat x 200000]` never returned.
+fn feed_stdin(mut stdin: std::process::ChildStdin, bytes: Vec<u8>) {
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let _ = stdin.write_all(&bytes);
+        // Dropping stdin closes the pipe, so the child reads EOF.
+    });
+}
+
+/// Read a child's stdout and stderr to EOF, both at once.
+///
+/// Draining stdout first and stderr after deadlocks as soon as the child
+/// writes more than a pipe's worth to stderr while its stdout is still
+/// open (the child blocks on stderr, the parent waits for stdout's EOF):
+/// `exec sh -c {echo OUT; head -c 66000 /dev/zero | tr '\0' E >&2}` hung.
+/// `poll(2)` on both descriptors, a non-blocking amount at a time.
+#[cfg(unix)]
+fn drain_both(
+    mut stdout: std::process::ChildStdout,
+    mut stderr: std::process::ChildStderr,
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut fds = [
+        libc::pollfd { fd: stdout.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: stderr.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+    ];
+    let mut buf = [0u8; 65536];
+    let mut open = 2usize;
+    while open > 0 {
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if rc < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        for (i, sink) in [(0usize, &mut out), (1usize, &mut err)] {
+            if fds[i].fd < 0 || fds[i].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+                continue;
+            }
+            let n = if i == 0 { stdout.read(&mut buf) } else { stderr.read(&mut buf) };
+            match n {
+                Ok(0) => {
+                    fds[i].fd = -1;
+                    open -= 1;
+                }
+                Ok(k) => sink.extend_from_slice(&buf[..k]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok((out, err))
+}
+
+/// Where `poll(2)` is not there: stdout, then stderr (the deadlock above
+/// stays possible on such a platform).
+#[cfg(not(unix))]
+fn drain_both(
+    mut stdout: std::process::ChildStdout,
+    mut stderr: std::process::ChildStderr,
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    stdout.read_to_end(&mut out)?;
+    stderr.read_to_end(&mut err)?;
+    Ok((out, err))
+}
+
+/// Read a pipeline's captured output; a failure reaps the children first.
+fn collect_output(
+    children: &mut [std::process::Child],
+) -> std::result::Result<(String, String), Error> {
+    let last = children.last_mut().unwrap();
+    let stdout = last.stdout.take();
+    let stderr = last.stderr.take();
+    let read = |mut s: std::process::ChildStdout| -> std::io::Result<Vec<u8>> {
+        let mut v = Vec::new();
+        s.read_to_end(&mut v)?;
+        Ok(v)
+    };
+    let read_err = |mut s: std::process::ChildStderr| -> std::io::Result<Vec<u8>> {
+        let mut v = Vec::new();
+        s.read_to_end(&mut v)?;
+        Ok(v)
+    };
+    let bytes = match (stdout, stderr) {
+        (Some(o), Some(e)) => drain_both(o, e),
+        (Some(o), None) => read(o).map(|v| (v, Vec::new())),
+        (None, Some(e)) => read_err(e).map(|v| (Vec::new(), v)),
+        (None, None) => Ok((Vec::new(), Vec::new())),
+    };
+    match bytes {
+        Ok((o, e)) => Ok((
+            // Tcl passes a child's bytes through; a non-UTF-8 byte is not
+            // a reason to fail the exec (`printf 'A\377B'` returned an
+            // error here, tclsh returns the text).
+            String::from_utf8_lossy(&o).into_owned(),
+            String::from_utf8_lossy(&e).into_owned(),
+        )),
+        Err(e) => {
+            kill_and_reap(children);
+            Err(exec_err(e))
+        }
+    }
+}
+
 /// `exec ?-ignorestderr? ?-keepnewline? ?--? cmd ?arg ...? ?| cmd ...? ?redirections?`
 impl Interp {
     /// Reap finished background `exec &` children without blocking.
@@ -257,7 +383,14 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Some(InputRedirect::File(path)) => {
                     let f = std::fs::File::open(path).map_err(|e| {
                         exec_err_str(format!("couldn't read file \"{}\": {}", path, e))
-                    })?;
+                    });
+                    let f = match f {
+                        Ok(f) => f,
+                        Err(e) => {
+                            kill_and_reap(&mut children);
+                            return Err(e);
+                        }
+                    };
                     cmd.stdin(f);
                 }
                 Some(InputRedirect::String(s)) => {
@@ -284,18 +417,33 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Some(OutputRedirect::Truncate(path)) => {
                     let f = std::fs::File::create(path).map_err(|e| {
                         exec_err_str(format!("couldn't write file \"{}\": {}", path, e))
-                    })?;
+                    });
+                    let f = match f {
+                        Ok(f) => f,
+                        Err(e) => {
+                            kill_and_reap(&mut children);
+                            return Err(e);
+                        }
+                    };
                     cmd.stdout(f);
                 }
                 Some(OutputRedirect::Append(path)) => {
                     let f = std::fs::OpenOptions::new().append(true).create(true).open(path).map_err(|e| {
                         exec_err_str(format!("couldn't write file \"{}\": {}", path, e))
-                    })?;
+                    });
+                    let f = match f {
+                        Ok(f) => f,
+                        Err(e) => {
+                            kill_and_reap(&mut children);
+                            return Err(e);
+                        }
+                    };
                     cmd.stdout(f);
                 }
                 None => {
-                    // background — discard
-                    cmd.stdout(Stdio::null());
+                    // Background: the job's stdout stays the caller's
+                    // (tclsh: `exec sh -c {echo OUT} &` prints OUT).
+                    cmd.stdout(Stdio::inherit());
                 }
             }
         } else {
@@ -308,21 +456,48 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Some(StderrRedirect::Truncate(path)) => {
                     let f = std::fs::File::create(path).map_err(|e| {
                         exec_err_str(format!("couldn't write file \"{}\": {}", path, e))
-                    })?;
+                    });
+                    let f = match f {
+                        Ok(f) => f,
+                        Err(e) => {
+                            kill_and_reap(&mut children);
+                            return Err(e);
+                        }
+                    };
                     cmd.stderr(f);
                 }
                 Some(StderrRedirect::Append(path)) => {
                     let f = std::fs::OpenOptions::new().append(true).create(true).open(path).map_err(|e| {
                         exec_err_str(format!("couldn't write file \"{}\": {}", path, e))
-                    })?;
+                    });
+                    let f = match f {
+                        Ok(f) => f,
+                        Err(e) => {
+                            kill_and_reap(&mut children);
+                            return Err(e);
+                        }
+                    };
                     cmd.stderr(f);
                 }
                 Some(StderrRedirect::ToStdout) => {
-                    // 2>@1 — merge stderr into stdout pipe
-                    cmd.stderr(Stdio::piped()); // We'll read it separately and merge
+                    if background {
+                        // The job's stdout is inherited (above): so is
+                        // its stderr.
+                        cmd.stderr(Stdio::inherit());
+                    } else {
+                        // 2>@1 — merge stderr into stdout pipe
+                        cmd.stderr(Stdio::piped()); // We'll read it separately and merge
+                    }
                 }
                 None if ignore_stderr => {
                     cmd.stderr(Stdio::null());
+                }
+                None if background => {
+                    // A background job's stderr is not captured: a piped
+                    // stderr nobody reads blocks the job for good once it
+                    // has written a pipe's worth (`exec sh -c {… >&2} &`).
+                    // tclsh leaves it on the caller's stderr.
+                    cmd.stderr(Stdio::inherit());
                 }
                 None => {
                     cmd.stderr(Stdio::piped());
@@ -335,17 +510,22 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             cmd.stderr(Stdio::inherit());
         }
 
-        let mut child = cmd.spawn().map_err(|e| {
-            exec_err_str(format!("couldn't execute \"{}\": {}", stage_args[0], e))
-        })?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                kill_and_reap(&mut children);
+                return Err(exec_err_str(format!(
+                    "couldn't execute \"{}\": {}",
+                    stage_args[0], e
+                )));
+            }
+        };
 
         // Handle <<string input for first stage
         if stage_idx == 0 {
-            if let Some(InputRedirect::String(ref s)) = input_redirect {
-                if let Some(mut stdin) = child.stdin.take() {
-                    use std::io::Write;
-                    let _ = stdin.write_all(s.as_bytes());
-                    // Drop stdin to close the pipe so the child can read EOF
+            if let Some(InputRedirect::String(s)) = &input_redirect {
+                if let Some(stdin) = child.stdin.take() {
+                    feed_stdin(stdin, s.as_bytes().to_vec());
                 }
             }
         }
@@ -367,18 +547,9 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Ok(Value::from_str(&pids.join(" ")));
     }
 
-    // Collect output from the last child
-    let last = children.last_mut().unwrap();
-    let last_pid = last.id();
-    let mut stdout_data = String::new();
-    if let Some(ref mut stdout) = last.stdout {
-        stdout.read_to_string(&mut stdout_data).map_err(exec_err)?;
-    }
-
-    let mut stderr_data = String::new();
-    if let Some(ref mut stderr) = last.stderr {
-        stderr.read_to_string(&mut stderr_data).map_err(exec_err)?;
-    }
+    // Collect output from the last child (both streams at once).
+    let last_pid = children.last().unwrap().id();
+    let (mut stdout_data, mut stderr_data) = collect_output(&mut children)?;
 
     // 2>@1: merge stderr into stdout
     if matches!(stderr_redirect, Some(StderrRedirect::ToStdout)) {

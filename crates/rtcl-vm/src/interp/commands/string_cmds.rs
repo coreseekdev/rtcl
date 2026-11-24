@@ -301,6 +301,98 @@ fn scan_tcl_double(s: &str) -> std::result::Result<(), usize> {
 
 /// (minimum, maximum, usage suffix) per subcommand, matching tclsh's own
 /// arity messages. `cat` accepts zero strings (min 2); compare/equal/is
+/// `string map`: one pass over `input`; at each position the first source
+/// that matches there wins (tclsh: the order of the map), otherwise one
+/// character is copied.  Byte-wise — a UTF-8 sequence only ever starts
+/// with a byte no other sequence contains, so no match can split one.
+fn string_map(input: &str, sources: &[&str], targets: &[&str]) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    // The untranslated run that ends at `i`.
+    let mut start = 0;
+    let mut i = 0;
+    // The bytes a source can start with: at any other byte there is no
+    // looking at the sources at all.
+    let mut firsts = [false; 256];
+    for from in sources.iter().filter(|from| !from.is_empty()) {
+        firsts[from.as_bytes()[0] as usize] = true;
+    }
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        let hit = if firsts[bytes[i] as usize] {
+            sources.iter().zip(targets).find_map(|(from, to)| {
+                (!from.is_empty() && rest.starts_with(from.as_bytes())).then_some((from.len(), *to))
+            })
+        } else {
+            None
+        };
+        match hit {
+            Some((len, to)) => {
+                out.push_str(&input[start..i]);
+                out.push_str(to);
+                i += len;
+                start = i;
+            }
+            None => i += utf8_char_len(bytes[i]),
+        }
+    }
+    out.push_str(&input[start..]);
+    out
+}
+
+/// The number of bytes of the UTF-8 character that starts with `lead`.
+fn utf8_char_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
+}
+
+/// A character's lowercase as tclsh compares it: the simple (one for one)
+/// mapping.  Rust's is the full one, which differs for the characters
+/// whose lowercase is several characters long — of those only LATIN
+/// CAPITAL LETTER I WITH DOT ABOVE has a simple mapping of its own.
+fn lower_char(c: char) -> char {
+    let mut lower = c.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(one), None) => one,
+        _ if c == '\u{0130}' => 'i',
+        _ => c,
+    }
+}
+
+/// `string map -nocase`: the same pass over lowercased characters; what is
+/// copied out comes from the original.
+fn string_map_nocase(input: &str, sources: &[&str], targets: &[&str]) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let lowered: Vec<char> = chars.iter().map(|c| lower_char(*c)).collect();
+    let sources: Vec<Vec<char>> = sources
+        .iter()
+        .map(|from| from.chars().map(lower_char).collect())
+        .collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let rest = &lowered[i..];
+        let hit = sources.iter().zip(targets).find_map(|(from, to)| {
+            (!from.is_empty() && rest.starts_with(from.as_slice())).then_some((from.len(), *to))
+        });
+        match hit {
+            Some((len, to)) => {
+                out.push_str(to);
+                i += len;
+            }
+            None => {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// parse trailing words as options, so they have no maximum here.
 fn string_subcmd_usage(sub: &str) -> Option<(usize, Option<usize>, &'static str)> {
     Some(match sub {
@@ -560,39 +652,21 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             } else {
                 (false, 2)
             };
-            let mapping = args[idx].as_list().unwrap_or_default();
+            // tclsh: the map has to be a list, with an even number of
+            // elements.
+            let mapping = super::list::strict_list(interp, &args[idx])?;
+            if mapping.len() % 2 != 0 {
+                super::list::set_error_code(interp, "TCL OPERATION MAP UNBALANCED");
+                return Err(Error::Msg("char map list unbalanced".to_string()));
+            }
+            let sources: Vec<&str> = (0..mapping.len() / 2).map(|k| mapping[2 * k].as_str()).collect();
+            let targets: Vec<&str> = (0..mapping.len() / 2).map(|k| mapping[2 * k + 1].as_str()).collect();
             let input = args[idx + 1].as_str();
-            if !mapping.len().is_multiple_of(2) {
-                return Err(Error::runtime("char map list unbalanced", crate::error::ErrorCode::InvalidOp));
-            }
-            let pairs: Vec<(String, String)> = mapping
-                .chunks(2)
-                .map(|c| (c[0].as_str().to_string(), c[1].as_str().to_string()))
-                .collect();
-            let mut result = String::new();
-            let chars: Vec<char> = input.chars().collect();
-            let mut i = 0;
-            while i < chars.len() {
-                let remaining: String = chars[i..].iter().collect();
-                let mut matched = false;
-                for (from, to) in &pairs {
-                    let matches = if nocase {
-                        remaining.to_lowercase().starts_with(&from.to_lowercase())
-                    } else {
-                        remaining.starts_with(from.as_str())
-                    };
-                    if matches && !from.is_empty() {
-                        result.push_str(to);
-                        i += from.chars().count();
-                        matched = true;
-                        break;
-                    }
-                }
-                if !matched {
-                    result.push(chars[i]);
-                    i += 1;
-                }
-            }
+            let result = if nocase {
+                string_map_nocase(input, &sources, &targets)
+            } else {
+                string_map(input, &sources, &targets)
+            };
             Ok(Value::from_str(&result))
         }
         "repeat" => {

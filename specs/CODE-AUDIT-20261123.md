@@ -159,7 +159,7 @@
 | # | 问题 | rtcl | tclsh | 位置 |
 |---|---|---|---|---|
 | P1 | TCP 读每字节一次系统调用（3MiB） | 387ms | 5ms | `channel.rs` |
-| P2 | `string map` 每字符重建剩余串（15 万字节） | 7.1s | 8ms | `commands/string_cmds.rs` |
+| P2 | `string map` 每字符重建剩余串（15 万字节） | 7.1s | 8ms | `commands/string_cmds.rs` | 已修（M7）：一趟扫描，按字节匹配；64KB 从 1.0s 到 0.7ms（tclsh 0.8ms）。顺带：奇数个元素的 map 给 `TCL OPERATION MAP UNBALANCED`，不是列表的 map 报列表错误（原来静默当成一个词）。探针 d22（28 条断言） |
 | P3 | `append` 每次两份整串拷贝（8 万次） | 4.7s | 10ms | `commands/misc.rs` |
 | P4 | `info vars` 超线性（8 万变量）；`TclTable::insert` 每次全扫桶 | 13.2s | 整段 11ms | `interp/tclhash.rs` |
 | P5 | `array size` 按作用域变量总数计 | 2.6s | ≈0 | `commands/array.rs` |

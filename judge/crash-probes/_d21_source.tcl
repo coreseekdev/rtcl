@@ -3,8 +3,23 @@
 #   T <tag> {<script>}            — here: code, result, errorCode
 #   C <tag> <path> {<script>}     — in a child: code, result, errorCode,
 #                                  errorInfo (through the helper P below)
-# `_gen_d21.tcl` runs every line under tclsh and writes the probe with
-# tclsh's outputs as the expected values.
+# `_gen.tcl` runs every line under tclsh and writes the probe with tclsh's
+# outputs as the expected values.
+#
+# The checks left unasserted, and why (each still runs: the later ones sit
+# on its state):
+# skip hash-table order
+# skip p-slaves h-hidden h-hidden-token h-hidden-after h-invoke-interp x-7 x-9
+# skip tclsh's `unknown` handler recurses to its limit once `set` is hidden; rtcl reports the command as unknown
+# skip h-hidden-set h-hidden-set-ec h-hide-interp h-compiled-after a-hidden-target a-call-into-hidden
+# skip rtcl deletes no interpreter that is, or holds one that is, being evaluated
+# skip d-inflight d-inflight2 a-renamed-slaves x-11 x-12 x-13
+# skip rtcl's own command set: auto_*, job, wait hidden in a safe interpreter; min/max are built in, not aliases
+# skip s-hidden-common s-aliases s-aliases-self s-hidden-self
+# skip the machine's files
+# skip s-open s-file s-source s-socket
+# skip the command a wrong-args message names for an alias (tclsh is not consistent itself), and TIP 356 stacks
+# skip a-parent-into-child-wa a-bad-target-arg a-error-stack
 proc P {script} {
     set c [catch {uplevel 1 $script} r o]
     set e [catch {dict get $o -errorcode} e]

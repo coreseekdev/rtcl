@@ -6,9 +6,9 @@
 # misaddressed and a loop of aliases across interpreters had no end.
 #
 # Expected values are tclsh 8.6.17's own outputs, check by check, in the
-# order the state is built: _gen_d21.tcl writes this file from
+# order the state is built: _gen.tcl writes this file from
 # _d21_source.tcl.  Where rtcl deliberately differs from tclsh the check
-# is left out (the generator's SKIP list names each):
+# is left out (the source's `# skip` lines name each):
 #   - rtcl sorts `interp slaves` / `interp hidden` (tclsh: hash order);
 #   - tclsh's `unknown` handler recurses to the limit once `set` is
 #     hidden in a child; rtcl says `invalid command name "set"`;
@@ -16,6 +16,7 @@
 #     evaluated;
 #   - rtcl's own command set: `auto_*`, `job`, `wait` hidden in a safe
 #     interpreter, `::tcl::mathfunc::min`/`max` built in, not aliases.
+
 source [file join [file dirname [info script]] _chk.tcl]
 proc T {script} {
     # A success leaves the previous error's errorCode standing: start
@@ -29,12 +30,7 @@ proc T {script} {
 proc U {script} {
     catch {uplevel 1 $script}
 }
-
 set ::errorCode NONE
-# The helper the checks inside a child go through (defined where it
-# is first used): code, result, the child's errorCode, its errorInfo
-# with newlines as ^.
-
 chk p-create [T {interp create}] {0 interp0 NONE}
 chk p-create2 [T {interp create}] {0 interp1 NONE}
 chk p-exists [T {list [interp exists] [interp exists interp0] [interp exists interp1] [interp exists nope] [interp exists {}]}] {0 {1 1 1 0 1} NONE}
@@ -406,4 +402,4 @@ U {interp exists e4}
 U {interp delete e4}
 chk x-14 [T {catch {w} m o; set m}] {0 4 NONE}
 
-# 335 lines, the chk ones are the checks.
+# 335 lines; the chk ones are the checks.

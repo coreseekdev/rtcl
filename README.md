@@ -105,6 +105,8 @@ cargo test --workspace                      # 全 workspace 测试
 ./judge/run.sh                              # 88 文件逐字节（judge(interp): 88/88）
 ./judge/sweep.sh                            # 双引擎差分 0 分歧
 ./judge/crash-gate.sh                       # 脚本可触发的崩溃/挂起/静默错误（judge/crash-probes/）
+# wasm 主目标：构建产物后跑同类缺陷（Node，每项一个全新实例）
+(cd crates/rtcl-wasm && ./build.sh) && node judge/crash-wasm.mjs
 # wasm 主目标：默认特性裁剪，零外部 C 依赖（iconv 不编入）
 cargo build -p rtcl-wasm --target wasm32-unknown-unknown
 # 关闭可选外部后端（iconv）的 native 构建也必须绿
@@ -118,6 +120,15 @@ cargo test -p rtcl-vm --no-default-features --features rtcl_std --lib
 5/4072 用例存在已知分歧（0.12%，全部记录于 docs/PRODUCTION.md）：
 rename 遮蔽过程后旧名解析、`interp alias {} name {} target` 形式、
 3 条错误信息帧计数微差。另有 36 项经裁定的扩展超出标准 Tcl。
+
+**递归/嵌套上限按平台定**（安全，不是语义分歧）：原生 1000（同 tclsh
+的 `recursionlimit`）；**wasm32 默认 150**——JS 引擎给 wasm 的调用栈
+只有约 1MiB，1000 层会栈溢出 trap 并让实例永久不可用，而不是 Tcl 的
+可捕获错误。宿主用 `RtclHandle::set_recursion_limit(n)` 调整；栈比
+主线程小的原生宿主用 `Interp::set_max_call_depth`（约 5000 字节/层）。
+同理有硬上限的还有：表达式嵌套 250 层、命令替换嵌套 1000 层、正则
+分组嵌套 250 层与编译空间预算、JSON 嵌套 1000 层——超限一律报错。
+详见 `specs/CODE-AUDIT-20261123.md`。
 
 ## 平台支持
 

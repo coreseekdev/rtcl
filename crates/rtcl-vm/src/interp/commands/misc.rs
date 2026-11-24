@@ -228,15 +228,17 @@ pub fn cmd_env(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         1 => {
             // Return flat list of all env vars: key val key val ...
             let mut list = Vec::new();
-            for (k, v) in std::env::vars() {
-                list.push(Value::from_str(&k));
-                list.push(Value::from_str(&v));
+            // `vars_os` / `var_os` + lossy: `std::env::vars` and
+            // `std::env::var` panic on a value that is not valid Unicode.
+            for (k, v) in std::env::vars_os() {
+                list.push(Value::from_str(&k.to_string_lossy()));
+                list.push(Value::from_str(&v.to_string_lossy()));
             }
             Ok(Value::from_list(&list))
         }
         2 => {
             let key = args[1].as_str();
-            match std::env::var(key) {
+            match std::env::var_os(key).map(|v| v.to_string_lossy().into_owned()).ok_or(()) {
                 Ok(val) => Ok(Value::from_str(&val)),
                 Err(_) => Err(Error::runtime(
                     format!("environment variable \"{}\" does not exist", key),
@@ -246,7 +248,7 @@ pub fn cmd_env(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         3 => {
             let key = args[1].as_str();
-            match std::env::var(key) {
+            match std::env::var_os(key).map(|v| v.to_string_lossy().into_owned()).ok_or(()) {
                 Ok(val) => Ok(Value::from_str(&val)),
                 Err(_) => Ok(args[2].clone()), // default
             }
@@ -2332,6 +2334,9 @@ pub fn cmd_assemble(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut catches: Vec<(usize, usize)> = Vec::new();
     let mut pc = 0usize;
     while pc < code.len() {
+        // A `nop`/`jump` loop invokes no command: without this it outran
+        // an armed step budget.
+        interp.charge_step()?;
         let cur = pc;
         pc += 1;
         match &code[cur] {

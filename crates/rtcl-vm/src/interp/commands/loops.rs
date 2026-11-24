@@ -518,22 +518,29 @@ pub fn cmd_timerate(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     let script = &args[1];
-    let duration_ms: u64 = if args.len() >= 3 {
-        args[2].as_int().unwrap_or(1000) as u64
-    } else {
-        1000
+    // A negative count is a caller error, not `as u64` wrapped into a
+    // deadline days away (`timerate {} -1` never returned).
+    let non_negative = |v: &Value, what: &str| -> Result<u64> {
+        match v.as_int() {
+            Some(n) if n >= 0 => Ok(n as u64),
+            _ => Err(Error::runtime(
+                format!("bad {what}: must be an integer >= 0"),
+                crate::error::ErrorCode::Generic,
+            )),
+        }
     };
-    let max_count: u64 = if args.len() >= 4 {
-        args[3].as_int().unwrap_or(u64::MAX as i64) as u64
-    } else {
-        u64::MAX
-    };
+    let duration_ms: u64 = if args.len() >= 3 { non_negative(&args[2], "duration")? } else { 1000 };
+    let max_count: u64 = if args.len() >= 4 { non_negative(&args[3], "maxcount")? } else { u64::MAX };
 
     let deadline_ms = interp.clock.now_ms() + duration_ms as f64;
     let start_ms = interp.clock.now_ms();
     let mut count: u64 = 0;
 
     while interp.clock.now_ms() < deadline_ms && count < max_count {
+        // An empty script dispatches nothing, so the per-command budget
+        // never saw these iterations (`timerate {} 100000000` outran an
+        // armed step budget).
+        interp.charge_step()?;
         let _ = interp.eval_body_value(script)?;
         count += 1;
     }

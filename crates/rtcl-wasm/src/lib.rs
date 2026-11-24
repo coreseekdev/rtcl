@@ -191,6 +191,27 @@ impl RtclHandle {
         rtcl_parser::is_complete(code)
     }
 
+    /// Arm a step budget: `exec` fails with "eval step budget exceeded"
+    /// (Tcl error code `TIMEOUT`) once a script has dispatched more than
+    /// `steps` commands, loop iterations and bracket evaluations. `0`
+    /// lifts the budget — the default, under which `while {1} {}` runs
+    /// for as long as the page lives. Re-arming restarts the count, so
+    /// hosts call it before each top-level `exec`. Waiting (`vwait`,
+    /// `update`, timers) does not spend steps.
+    pub fn set_step_budget(&mut self, steps: u32) {
+        self.interp.set_max_steps(if steps == 0 { None } else { Some(u64::from(steps)) });
+    }
+
+    /// Bound recursion and script re-entry: proc calls, and the re-entry
+    /// that happens without one (command substitution nesting, trace
+    /// callbacks, `unknown` handlers). The default is what fits the
+    /// instance's stack with margin — a deeper limit aborts with a stack
+    /// overflow instead of the Tcl error, and that leaves the instance
+    /// unusable. Lower it freely.
+    pub fn set_recursion_limit(&mut self, depth: u32) {
+        self.interp.set_max_call_depth(depth as usize);
+    }
+
     /// Route `puts` (stdout) output to a JavaScript callback.
     ///
     /// 注入 rtcl-core 的 `HostConsole` 宿主控制台服务：无 `io` 特性构建

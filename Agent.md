@@ -58,6 +58,13 @@ bash -c 'ulimit -v 8000000; /tmp/rtcl-master-wt/judge/sweep.sh'
   探针钉住一个脚本可触发的崩溃/挂起/静默错误（记录见
   `specs/CODE-AUDIT-20261123.md`），与 judge/sweep 同跑。再发现这类缺陷
   时先加探针（基线必须先红）再修。
+- **wasm 侧同类门禁**：`cd crates/rtcl-wasm && ./build.sh && cd ../..
+  && node judge/crash-wasm.mjs`——每项用全新实例（trap 之后实例不可
+  用）。动到递归/嵌套/限制、`rtcl-wasm/src`、或 `.cargo/config.toml`
+  的 wasm 段时必跑。
+- **wasm 的递归上限**：约束是 JS 引擎的调用栈（约 1MiB），不是线性
+  内存——`-zstack-size` 不解决问题。wasm32 默认上限 150 是实测校准
+  的（最坏形态 `apply` 套 `catch` 在 200 层溢出），别改回 1000。
 - **sweep 的 `ulimit -v` 坑**：`ulimit -v 6000000` 下 wasmtime 的
   `stub memory: mmap failed to reserve` 会让 rtcl-towasm 的 5 个测试假红
   ——测试（非构建）阶段去掉上限，并用 `--no-fail-fast` 跑全。

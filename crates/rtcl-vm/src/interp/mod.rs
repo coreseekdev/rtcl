@@ -446,6 +446,33 @@ pub(crate) struct TopSlots {
     pub aliased: Vec<bool>,
 }
 
+/// The recursion/nesting limit a fresh interpreter starts with, sized
+/// for the stack the platform gives it. Exceeding it must be Tcl's
+/// catchable error, never a stack overflow (abort; on wasm a trap that
+/// leaves the instance unusable).
+///
+/// - **native: 1000** (tclsh's `recursionlimit`). 999 levels need about
+///   4MB whatever the shape — a plain call, an `apply` inside `catch`,
+///   recursion inside `switch`, all the heavy constructs nested — so the
+///   default 8MB main-thread stack carries a 2x margin. A thread with a
+///   smaller stack needs [`Interp::set_max_call_depth`] (about 5000 bytes
+///   a level).
+/// - **wasm32: 150.** The engine's stack is about 1MiB (V8 carries wasm
+///   frames on the JS stack) and a level costs 1.4KB (a plain call, which
+///   overflowed at 736) to 5.2KB (`apply` inside `catch`, which overflowed
+///   at 200; measured in Node 22). With 1000 every recursion overflowed
+///   the stack before the limit was reached.
+///
+/// A depth count cannot see how heavy each level is; a host that knows
+/// its stack can set the limit to match.
+fn default_max_call_depth() -> usize {
+    if cfg!(target_arch = "wasm32") {
+        150
+    } else {
+        1000
+    }
+}
+
 pub struct Interp {
     /// Variables (global scope).
     pub(crate) globals: VarMap<Value>,
@@ -1122,7 +1149,7 @@ impl Interp {
             in_locals_unit: false,
             expr_check_cache: varmap::FxHashedMap::default(),
             call_depth: 0,
-            max_call_depth: 1000,
+            max_call_depth: default_max_call_depth(),
             nest_depth: 0,
             steps: 0,
             max_steps: None,
@@ -1326,9 +1353,11 @@ impl Interp {
         self.max_steps
     }
 
-    /// 递归/嵌套上限（缺省 1000）。同时约束 proc 递归（`call_depth`）
-    /// 与不经 proc 调用的脚本重入（[`Interp::nest_depth`]）。栈小的
-    /// 宿主（wasm 实例）应按栈预算下调。
+    /// 递归/嵌套上限。同时约束 proc 递归（`call_depth`）与不经 proc
+    /// 调用的脚本重入（[`Interp::nest_depth`]）。缺省值见
+    /// [`default_max_call_depth`]；栈比缺省假设小的宿主（非主线程、
+    /// 小栈的嵌入式线程）按栈预算下调，如
+    /// `set_max_call_depth(stack_bytes / 5000)`。
     pub fn set_max_call_depth(&mut self, max: usize) {
         self.max_call_depth = max.max(1);
     }
@@ -1597,10 +1626,14 @@ impl Interp {
     /// the :: replay; their relative order drives per-array replay.
     fn init_special_vars(&mut self) {
         // --- $env array (mirror OS environment; environ order) ---
+        // `vars_os`: `std::env::vars()` panics on a variable that is not
+        // valid Unicode, which made `Interp::new()` abort the host (one
+        // stray RTCL_BAD=\xff\xfe in the environment was enough); tclsh
+        // passes the bytes through. Lossy here (the string is Tcl text).
         #[cfg(feature = "env")]
-        for (key, val) in std::env::vars() {
-            let full = format!("env({})", key);
-            self.global_insert(full, Value::from_str(&val));
+        for (key, val) in std::env::vars_os() {
+            let full = format!("env({})", key.to_string_lossy());
+            self.global_insert(full, Value::from_str(&val.to_string_lossy()));
         }
 
         // --- $tcl_platform array (element order replays to tclsh's) ---
@@ -1880,6 +1913,48 @@ mod tests {
         interp.set_max_steps(Some(50));
         interp.eval("set m 0; while {$m < 10} {incr m}").unwrap();
         assert_eq!(interp.eval("set m").unwrap().as_str(), "10");
+    }
+
+    #[test]
+    fn step_budget_covers_loops_that_dispatch_nothing() {
+        // `timerate {} <ms>` iterates an empty script and an assemble
+        // `jump` loop runs instructions only: neither dispatches a
+        // command, so both used to outrun an armed budget.
+        let mut interp = Interp::new();
+        interp.set_max_steps(Some(1000));
+        let r = interp.eval("timerate {} 3600000");
+        let msg = format!("{}", r.expect_err("timerate iterations must charge steps"));
+        assert!(msg.contains("step budget"), "{msg}");
+        let mut interp = Interp::new();
+        interp.set_max_steps(Some(1000));
+        let r = interp.eval("::tcl::unsupported::assemble {label L; jump L}");
+        let msg = format!("{}", r.expect_err("assemble instructions must charge steps"));
+        assert!(msg.contains("step budget"), "{msg}");
+    }
+
+    #[test]
+    fn timerate_rejects_negative_counts() {
+        // `as u64` used to wrap a negative duration into a deadline days
+        // away.
+        let mut interp = Interp::new();
+        let r = interp.eval("timerate {} -1");
+        let msg = format!("{}", r.expect_err("negative duration"));
+        assert!(msg.contains("bad duration: must be an integer >= 0"), "{msg}");
+        let r = interp.eval("timerate {} 10 -5");
+        let msg = format!("{}", r.expect_err("negative maxcount"));
+        assert!(msg.contains("bad maxcount: must be an integer >= 0"), "{msg}");
+    }
+
+    #[test]
+    fn recursion_limit_is_configurable() {
+        let mut interp = Interp::new();
+        assert_eq!(interp.max_call_depth(), default_max_call_depth());
+        interp.set_max_call_depth(20);
+        let r = interp.eval("proc f {n} {f $n}; f 1");
+        let msg = format!("{}", r.expect_err("must hit the lowered limit"));
+        assert!(msg.contains("recursion"), "{msg}");
+        interp.set_max_call_depth(0);
+        assert_eq!(interp.max_call_depth(), 1, "a limit is never zero");
     }
 
     #[test]

@@ -49,6 +49,19 @@ rtcl.unregister_command('add');              // -> true
 // Route puts/stdout to a JS callback.
 rtcl.set_output_handler((s) => console.log('[tcl]', s));
 rtcl.exec('puts "hello"');                   // logs "hello"
+
+// Resource limits. Unbounded by default is Tcl semantics: `while {1} {}`
+// spins for as long as the page lives. A script from elsewhere gets a
+// budget — commands, loop iterations and bracket evaluations all count;
+// waiting (vwait, update, timers) does not:
+rtcl.set_step_budget(5_000_000);             // "eval step budget exceeded" past it
+rtcl.set_step_budget(0);                     // lift it again
+
+// Recursion and script re-entry depth. The default (150) is what fits
+// the ~1MiB stack the JS engine gives wasm; a deeper limit overflows
+// that stack instead of raising the Tcl error, and that leaves the
+// instance unusable:
+rtcl.set_recursion_limit(150);
 ```
 
 Notes:
@@ -61,3 +74,9 @@ Notes:
   see each other's commands.
 - `register_command` defines a real Tcl `proc` wrapper, so `rename`,
   `info commands`, etc. behave naturally.
+- A trap inside wasm (a stack overflow past the recursion limit, a bug)
+  is not an error the interpreter can raise: it throws a `RuntimeError` /
+  `RangeError` from `exec` and the handle cannot be used afterwards. Run
+  untrusted scripts in a Worker you can terminate, and set the limits
+  above. `judge/crash-wasm.mjs` pins the defects of this kind that were
+  found in the 2026-11-23 audit.

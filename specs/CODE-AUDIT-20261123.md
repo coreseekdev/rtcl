@@ -67,9 +67,9 @@
 | S17 | `expr` 非花括号 4000 层括号、5 万个连续 `-` | `types/expr.rs`、`expr_check.rs`、`parser/src/expr_compile.rs` | 三套独立递归下降都无深度概念 | 已修（M2） |
 | S18 | proc 内 2 万层嵌套 `[…]` | `parser/src/compiler.rs` | 不调用也崩 | 已修（M2） |
 | S19 | 正则：6000 层嵌套括号；`((a{255}){255}){255}`；`(.*)x` 匹配 3 万字符 | `regexp-spencer` `parser.rs` / `captures.rs` | 后两项吃满近 3GB 后 abort | 已修（M2） |
-| S20 | proc 递归 650–1000 层 | `interp/mod.rs` `max_call_depth` | 上限 1000 没按栈大小校准：wasm 必崩且毒化实例，原生栈 ≤3MB 也崩 | 未修 |
+| S20 | proc 递归 650–1000 层 | `interp/mod.rs` `max_call_depth` | 上限 1000 没按栈大小校准：wasm 必崩且毒化实例，原生栈 ≤3MB 也崩 | 已修（M3） |
 | S21 | `lrepeat 4294967296 x`、`string repeat x 4294967296` | 同 S9 | 分配失败 = abort，不可 catch；tclsh 报 Tcl 错误 | 未修 |
-| S22 | `eval eval … 1` 嵌套 2000 层 | `interp/eval.rs` | 输入 1 万字节，报递归错误前已占 306MB | 未修 |
+| S22 | `eval eval … 1` 嵌套 2000 层 | `interp/eval.rs` | 输入 1 万字节，报递归错误前已占 306MB | 已修（M3） |
 
 ## P0：wasm 专有（Node 22 + 11-20 产物实测）
 
@@ -85,8 +85,8 @@
 |---|---|---|---|
 | S26 | 没有 safe interp；`interp create -safe` 报错，子解释器带全部命令 | `commands/interp_cmd.rs` | 未修 |
 | S27 | `hide_command` 只从 `info commands` 隐身，脚本照常可调 | `interp/mod.rs` | 未修 |
-| S28 | 步数预算默认无限，CLI 与 wasm 都没暴露；`timerate {} N`、`::tcl::unsupported::assemble` 可旁路 | `interp/mod.rs` | 未修 |
-| S29 | 环境含非 UTF-8 变量时 `Interp::new()` panic | `interp/mod.rs` | 未修 |
+| S28 | 步数预算默认无限，CLI 与 wasm 都没暴露；`timerate {} N`、`::tcl::unsupported::assemble` 可旁路 | `interp/mod.rs` | 已修（M3） |
+| S29 | 环境含非 UTF-8 变量时 `Interp::new()` panic | `interp/mod.rs` | 已修（M3） |
 | S30 | release `panic = "abort"`，全仓无 `catch_unwind` | `Cargo.toml` | 未修 |
 
 ## P1：原生 OS 面的挂起与文件安全
@@ -184,7 +184,9 @@
   2026-11-23 的 errorInfo 提交；文档里的"sweep 0"在 `perf/wave2` 上
   已不成立。审计修复未增减该名单。
 - `judge/crash-gate.sh`：基线 99 次运行 14 过；M1 后 40 过
-  （a 类 24/24 全过）；M2a/M2b 后 60 过（b01–b10 全过）。
+  （a 类 24/24 全过）；M2a/M2b 后 60 过（b01–b10 全过）；M2c/M2d 后
+  78 过（b 类 21 个全过）；M3 后 100 次运行 79 过（新增 a13）。
+  余下 c 类 5 个（原生 OS 面的挂起）与 d 类 11 个（静默错误）。
 - 对照基线：10 万层嵌套 list 的销毁 8–13ms → 4–5ms（迭代路径反而更快）；
   宽列表（200 万元素）与字符串列表的销毁无变化；1.6 万层嵌套 list 上
   25 个命令里基线有 17 个栈溢出，现全部正常返回。
@@ -198,6 +200,29 @@
   并正常完成；tclsh 涨到 17.5GB 后段错误。
 - 单元测试：`cargo test -p rtcl-vm -p rtcl-parser -p rtcl-ir -p rtcl-core`
   全绿。
+
+## wasm 侧的实测与结论（M3，Node 22 / V8，2026-11-24）
+
+- **真正的栈约束是 JS 引擎的调用栈**（约 1MiB；V8 把 wasm 帧放在 JS
+  栈上），不是线性内存。加大 `-zstack-size` 不提高递归深度，只增加
+  线性内存——试过，已撤回。
+- 每层递归的栈耗量随调用形态变化：最简单的 proc 递归 736 层溢出
+  （约 1.4KB/层）；proc 内循环 664；`try`/`finally` 364–392；OO 方法
+  与 `uplevel` 420；`apply` 356；`catch` 嵌套 268–284；`switch` 内递归
+  252；`apply` 套在 `catch` 里 **200**（约 5.2KB/层）。原默认上限 1000
+  对每一种都越过栈。
+- 处置：**wasm32 的默认递归上限改为 150**（最坏实测形态的 1.3 倍
+  余量），原生保持 1000（各形态在 999 层都需要约 4MB 栈，默认 8MB
+  主线程栈有 2 倍余量；叠加全部重构造的形态也实测通过）。宿主可经
+  `RtclHandle::set_recursion_limit` / `Interp::set_max_call_depth` 调整；
+  **栈比主线程小的宿主（子线程、嵌入式小栈线程）必须按栈下调**。
+- 深度计数看不见每层的重量：按栈指针的实际余量做守卫是更稳的方案，
+  但 wasm32 上读不到引擎栈指针，只能计数。列为后续项。
+- `RtclHandle` 新增 `set_step_budget` / `set_recursion_limit`；
+  `timerate {} <ms>` 与 `::tcl::unsupported::assemble` 的空转循环
+  原来绕过步数预算，现按迭代/指令计步。
+- 新门禁 `judge/crash-wasm.mjs`（Node 里对 wasm 产物跑同类缺陷，
+  每项一个全新实例）：27 项全过；`crates/rtcl-wasm/test.js` 26/26。
 
 ## 已剔除 / 未能复现
 

@@ -19,6 +19,8 @@
 #   bash judge/crash-gate.sh            # all probes
 #   bash judge/crash-gate.sh b1 -v      # probes named b1*, show failures
 #   exit 0 iff every probe passes.
+# The wasm side has its own runner over the same classes of defect:
+#   node judge/crash-wasm.mjs           # after crates/rtcl-wasm/build.sh
 set -u
 cd "$(dirname "$0")/.."
 
@@ -37,11 +39,16 @@ done
 # counts as a hang, so a gate on "returns" also gates on "returns promptly".
 budget_ms() { grep -oE '^# gate: max-ms [0-9]+' "$1" | grep -oE '[0-9]+' || true; }
 
+# A probe may carry "# gate: env-nonutf8": it then runs in a scrubbed
+# environment holding one variable that is not valid Unicode — the state
+# has to exist before the interpreter is built, so no script can set it
+# up itself (a13: `Interp::new()` used to panic on it).
 run_one() {
-    local f=$1 eng=$2 max out rc t0 t1
+    local f=$1 eng=$2 max out rc t0 t1 pre=()
     max=$(budget_ms "$f"); max=${max:-20000}
+    grep -q '^# gate: env-nonutf8' "$f" && pre=(env -i "PATH=$PATH" $'RTCL_BAD=\xff\xfe')
     t0=$(date +%s%N)
-    out=$(bash -c "ulimit -v 3000000; ulimit -c 0; timeout 30 $RTCL $eng -f '$f'" 2>&1); rc=$?
+    out=$("${pre[@]}" bash -c "ulimit -v 3000000; ulimit -c 0; timeout 30 $RTCL $eng -f '$f'" 2>&1); rc=$?
     t1=$(date +%s%N)
     if [ "$rc" -eq 0 ] && [ $(( (t1 - t0) / 1000000 )) -le "$max" ] \
         && ! grep -qE 'panicked|stack overflow|memory allocation of' <<<"$out"; then

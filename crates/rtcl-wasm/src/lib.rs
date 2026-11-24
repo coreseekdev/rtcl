@@ -43,6 +43,9 @@ impl RtclHandle {
             interp: Interp::new(),
             id: js_command::next_interp_id(),
         };
+        // The interpreter carries its own instance id: the JS dispatch
+        // bridge finds its callbacks by it, not by anything a script says.
+        handle.interp.set_host_instance_id(handle.id);
         handle.interp.register_command("_js_dispatch", js_command::js_dispatch_cmd);
         handle.interp.set_clock(Box::new(clock::JsClock));
         // wasm32 JIT 接线（feature `jit`）：进程级 proc-body 钩子——
@@ -95,7 +98,11 @@ impl RtclHandle {
                 "reentrant registration during JIT call is not supported",
             ));
         }
-        js_command::register_js_command(&mut self.interp, self.id, name, callback);
+        if !js_command::register_js_command(&mut self.interp, self.id, name, callback) {
+            return Err(JsValue::from_str(
+                "register_command: the name cannot contain braces or backslashes",
+            ));
+        }
         Ok(())
     }
 
@@ -128,9 +135,12 @@ impl RtclHandle {
             // v2 前缀：dispatch 逐词透传（__dynmod: = v1 join 拆分，
             // 兼容旧宿主）。
             let internal = format!("__dynmodv2:{}:{}", name, fname);
-            js_command::register_js_command(&mut self.interp, self.id, &internal, func);
-            // Internal dispatch wrapper: invokable but invisible (it is
-            // not part of the Tcl surface; ::name::cmd is the public face).
+            // The wrapper is only ever invoked through the words below.
+            let _ = js_command::register_js_command(&mut self.interp, self.id, &internal, func);
+            // The internal wrapper is invokable but invisible: not part
+            // of the Tcl surface.  The dispatch words of the public face
+            // (`::name::cmd`, installed by `load`); the second is a slot
+            // the bridge ignores.
             self.interp.hide_command(&internal);
             commands.push((fname, vec![
                 "_js_dispatch".to_string(),

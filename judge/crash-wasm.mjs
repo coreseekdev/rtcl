@@ -45,6 +45,26 @@ const run = (h, code) => { try { return 'ok:' + JSON.stringify(String(h.exec(cod
     if (s.kind === 'cb-throw') {
       h.register_command('boom', () => { throw new Error('host failed'); });
       r = run(h, 'catch {boom} e; set e');
+    } else if (s.kind === 'cross-instance') {
+      // A second instance on the same page registers a callback; the
+      // first instance's script names that callback under every slot
+      // number the process hands out.  It used to reach it.
+      const b = new mod.RtclHandle();
+      b.register_command('secret_of_b', x => 'B-SECRET:' + x);
+      const own = String(b.exec('secret_of_b x'));
+      let leaked = null;
+      for (let slot = 0; slot < 8; slot++) {
+        try { leaked = String(h.exec('_js_dispatch ' + slot + ' secret_of_b x')); break; } catch (e) { /* not this instance's: expected */ }
+      }
+      r = (own === 'B-SECRET:x' && leaked === null) ? 'ok|isolated' : 'bad|own=' + own.slice(0, 20) + '|leaked=' + String(leaked).slice(0, 30);
+    } else if (s.kind === 'bad-name') {
+      // A name that cannot be spelled as one word is refused, not
+      // spliced into the wrapper's code.
+      let refused = 0;
+      for (const name of ['a{b', 'a}b', 'a\\b', '']) {
+        try { h.register_command(name, () => 'x'); } catch (e) { refused++; }
+      }
+      r = 'ok|' + refused;
     } else if (s.kind === 'cb-reenter') {
       let inner;
       h.set_output_handler(() => { try { h.exec('set ::n 1'); inner = 'allowed'; } catch (e) { inner = 'rejected'; } });
@@ -134,6 +154,11 @@ await check('silent: next outside a method',      'catch {::oo::Helpers::next} e
 // `interp alias {} name {} target prefix`: the alias came into being under
 // the target's name.
 await check('silent: interp alias with a prefix', 'proc t {a b} {list $a $b}; interp alias {} al {} t X; al Y', /ok:"X Y"/);
+
+// The dispatch bridge's slot number is not a capability: an instance
+// reaches its own callbacks and no others.
+await verify('isolation: _js_dispatch stays in its instance', { kind: 'cross-instance' }, /ok\|isolated/);
+await verify('isolation: unspellable command names refused', { kind: 'bad-name' }, /ok\|4/);
 
 await verify('api: set_step_budget trips on while', { budget: 200000, code: 'while {1} {}' }, /tcl/);
 await verify('api: budget 0 lifts it',              { budget: 200000, unbudget: true, code: 'set i 0; while {$i < 300000} {incr i}' }, /ok/);

@@ -703,6 +703,11 @@ pub struct Interp {
     /// resolves its own word again (`my`, the object commands) resolves it
     /// here.
     pub(crate) cmd_lookup_in: Option<Rc<str>>,
+    /// Which host instance this interpreter is, in the tables its host
+    /// keeps *outside* it (the wasm JS callback buckets).  Only the host
+    /// sets it; no script can — a dispatch bridge looks the bucket up by
+    /// this, never by an argument the script passed.
+    pub(crate) host_instance_id: u64,
     /// The root namespace as a shared `Rc` — the namespace of every
     /// global-scope proc, handed out per call without allocating.
     pub(crate) ns_root: Rc<str>,
@@ -1175,6 +1180,8 @@ impl Interp {
             current_namespace: Rc::from("::"),
             cmd_lookup_ns: None,
             cmd_lookup_in: None,
+            // No instance: a value no host hands out.
+            host_instance_id: u64::MAX,
             ns_root: Rc::from("::"),
             namespaces: {
                 let mut ns = varmap::FxHashedMap::default();
@@ -2463,6 +2470,18 @@ pub(crate) const LAMBDA_CACHE_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 pub(crate) const EXPR_CACHE_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 
 impl Interp {
+    /// Tell the interpreter which instance it is in its host's own
+    /// tables (see [`Interp::host_instance_id`]).
+    pub fn set_host_instance_id(&mut self, id: u64) {
+        self.host_instance_id = id;
+    }
+
+    /// The instance id the host gave this interpreter
+    /// ([`Interp::set_host_instance_id`]); `u64::MAX` when none.
+    pub fn host_instance_id(&self) -> u64 {
+        self.host_instance_id
+    }
+
     /// Close every channel the way leaving the process should: without
     /// waiting for a pipe child or a pending connection.  A host about to
     /// exit calls this before dropping the interpreter; the plain `Drop`

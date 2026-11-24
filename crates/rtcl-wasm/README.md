@@ -70,10 +70,14 @@ Notes:
   JS `String()` semantics (numbers, objects, null all work).
 - A JS exception becomes a Tcl error:
   `JS command 'name' error: <message>`.
-- Command registrations are scoped per `RtclHandle` — two interpreters never
-  see each other's commands.
+- Command registrations are scoped per `RtclHandle`: a script reaches the
+  callbacks registered on its own instance and no other. The internal
+  dispatch bridge goes by the instance it runs on — it used to take the
+  instance id as a script argument, and a script on one handle could call
+  a callback registered on another (`judge/crash-wasm.mjs` has the check).
 - `register_command` defines a real Tcl `proc` wrapper, so `rename`,
-  `info commands`, etc. behave naturally.
+  `info commands`, etc. behave naturally. The name must be one Tcl word:
+  braces and backslashes in it are refused.
 - A trap inside wasm (a stack overflow past the recursion limit, a bug)
   is not an error the interpreter can raise: it throws a `RuntimeError` /
   `RangeError` from `exec` and the handle cannot be used afterwards. Run

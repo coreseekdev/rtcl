@@ -76,7 +76,7 @@
 | # | 现象 | 位置 | 处置 |
 |---|---|---|---|
 | S23 | 栈溢出 trap 后整个实例永久失效：同实例 `new RtclHandle()` 也崩，GC 终结器再触发 trap 可杀死 Node 进程；panic 则使当前句柄永久失效 | `rtcl-wasm/src/lib.rs` `exec` | 未修 |
-| S24 | 句柄 A 的脚本 `_js_dispatch 1 <名字>` 可调到只在句柄 B 注册的宿主回调并拿到返回值 | `rtcl-wasm/src/js_command.rs` | 未修 |
+| S24 | 句柄 A 的脚本 `_js_dispatch 1 <名字>` 可调到只在句柄 B 注册的宿主回调并拿到返回值 | `rtcl-wasm/src/js_command.rs` | 已修（M6）：分发桥按**调用它的解释器**找回调桶（`Interp::host_instance_id`，由宿主设置、脚本改不了），脚本给的 id 一律忽略。A/B 实测：修复前 A 用槽位 1 拿到 B 的回调返回值，修复后全部槽位被拒。一并用花括号词包装注册名（原来把名字直接拼进 `proc` 的脚本体） |
 | S25 | 子解释器不继承宿主服务：`$h eval {time …}` trap，`puts` 输出静默丢失 | `commands/interp_cmd.rs` | 未修 |
 
 ## P0：脚本可触发的死循环（两引擎皆中）
@@ -232,6 +232,8 @@
   输出落文件。
 - M5 文件操作：S34–S37 全部修掉，新增 d20（33 条断言，tclsh 上同样
   全过）。crash-gate 至此 **112 次运行 112 过**。
+- M6（wasm 隔离）：`judge/crash-wasm.mjs` 35 → **37 项**全过（跨实例
+  `_js_dispatch`、不可拼写的注册名）。
 - `judge/crash-wasm.mjs`：**35 项**全过（M3 时 27 项）。每项在自己的
   worker 线程里跑，15 秒无结果即判 `HANG` 并终止线程——原来遇到挂起类
   回归是门禁自己卡死（步数预算看不见解析器/检查器里的循环）。

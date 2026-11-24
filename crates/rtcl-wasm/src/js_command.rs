@@ -5,7 +5,10 @@ use rtcl_core::Value;
 
 thread_local! {
     static NEXT_ID: Cell<u64> = const { Cell::new(0) };
-    /// JS callbacks bucketed per interpreter id — instances never see each other's commands.
+    /// JS callbacks bucketed per interpreter instance.  A dispatch reads
+    /// the bucket of the interpreter it runs on (`Interp::host_instance_id`)
+    /// — never one a script named: the id used to travel in the wrapper's
+    /// body, where any script could type another instance's.
     static JS_COMMANDS: RefCell<HashMap<u64, HashMap<String, js_sys::Function>>> =
         RefCell::new(HashMap::new());
 }
@@ -19,9 +22,13 @@ pub fn next_interp_id() -> u64 {
     })
 }
 
-/// Native command `_js_dispatch <interpId> <name> <args...>` — dispatches to the
-/// JS callback registered for `interpId`. The id is baked into the generated
-/// proc wrapper, so each interpreter only ever reaches its own bucket.
+/// Native command `_js_dispatch <slot> <name> <args...>` — dispatches to the
+/// JS callback registered for `name` on *this* interpreter.
+///
+/// `<slot>` is ignored: it held the interpreter id, and with it a script
+/// on one instance reached a callback registered on another
+/// (`_js_dispatch <other id> <name>` — the host's callbacks, with their
+/// return values). The bucket is now the calling interpreter's own.
 ///
 /// ⑧ 重入哨兵：JIT wasm 调用期间此入口**允许**进入（JS 命令作为叶子
 /// 调用是合法模式），但回调里对解释器的任何重入（`RtclHandle::exec`/
@@ -37,7 +44,7 @@ pub fn js_dispatch_cmd(_interp: &mut rtcl_core::Interp, args: &[Value]) -> rtcl_
         return Err(rtcl_core::error::Error::wrong_args("_js_dispatch", 3, args.len()));
     }
 
-    let interp_id: u64 = args[1].to_string().parse().unwrap_or(u64::MAX);
+    let interp_id = _interp.host_instance_id();
     let cmd_name = args[2].to_string();
 
     let callback = JS_COMMANDS.with(|cmds| {
@@ -111,8 +118,13 @@ pub fn js_error_message(e: &JsValue) -> String {
 }
 
 /// Register a JS callback under `interpId` and create a Tcl proc wrapper that
-/// dispatches back to this interpreter's bucket.
-pub fn register_js_command(interp: &mut rtcl_core::Interp, interp_id: u64, name: &str, func: js_sys::Function) {
+/// dispatches back to this interpreter's bucket.  `false` when `name`
+/// cannot be a command name (braces or backslashes in it: the wrapper
+/// spells the name in a braced word).
+pub fn register_js_command(interp: &mut rtcl_core::Interp, interp_id: u64, name: &str, func: js_sys::Function) -> bool {
+    if name.is_empty() || name.contains(['{', '}', '\\']) {
+        return false;
+    }
     JS_COMMANDS.with(|cmds| {
         cmds.borrow_mut()
             .entry(interp_id)
@@ -120,23 +132,28 @@ pub fn register_js_command(interp: &mut rtcl_core::Interp, interp_id: u64, name:
             .insert(name.to_string(), func);
     });
 
+    // The name goes into the script as one braced word: it is spelled
+    // verbatim, whatever else is in it.
     let wrapper = format!(
-        "proc {name} {{args}} {{ _js_dispatch {id} {name} {{*}}$args }}",
-        name = name,
-        id = interp_id,
+        "proc {{{name}}} {{args}} {{ _js_dispatch {id} {{{name}}} {{*}}$args }}",
+        id = interp_id
     );
     let _ = interp.eval(&wrapper);
+    true
 }
 
 /// Remove a JS callback and its Tcl proc wrapper. Returns true if it existed.
 pub fn unregister_js_command(interp: &mut rtcl_core::Interp, interp_id: u64, name: &str) -> bool {
+    if name.is_empty() || name.contains(['{', '}', '\\']) {
+        return false;
+    }
     let existed = JS_COMMANDS.with(|cmds| {
         cmds.borrow_mut().get_mut(&interp_id)
             .map(|b| b.remove(name).is_some())
             .unwrap_or(false)
     });
     // `rename <name> ""` deletes a proc in Tcl semantics.
-    let _ = interp.eval(&format!("rename {name} \"\""));
+    let _ = interp.eval(&format!("rename {{{name}}} \"\""));
     existed
 }
 

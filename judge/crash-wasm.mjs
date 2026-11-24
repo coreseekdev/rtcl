@@ -45,6 +45,27 @@ const run = (h, code) => { try { return 'ok:' + JSON.stringify(String(h.exec(cod
     if (s.kind === 'cb-throw') {
       h.register_command('boom', () => { throw new Error('host failed'); });
       r = run(h, 'catch {boom} e; set e');
+    } else if (s.kind === 'child-services') {
+      // A child interpreter used to come up on the native clock and
+      // console: its puts went nowhere and every after/vwait
+      // trapped (wasm32 has no native clock) — the instance was gone.
+      let seen = '';
+      h.set_output_handler(t => { seen += String(t); });
+      const puts = run(h, 'set c [interp]; $c eval {puts childout}');
+      const after = run(h, '$c eval {catch {after 10 {set ::z 1}; vwait ::z} m; set m}');
+      const time = run(h, '$c eval {catch {time {expr 1+1}} m; set m}');
+      r = (puts.startsWith('ok') && seen === 'childout\n' && !after.startsWith('TRAP') && time.startsWith('ok:')) ? 'ok|' + JSON.stringify(seen) : 'bad|' + puts + '|' + after + '|' + time + '|' + JSON.stringify(seen);
+    } else if (s.kind === 'child-budget') {
+      // The step budget bounds the whole family: a child created before
+      // the budget was armed, or a grandchild, cannot run forever inside
+      // interp eval.
+      h.set_step_budget(200000);
+      const child = run(h, 'set c [interp]; catch {$c eval {while {1} {}}} m; set m');
+      h.set_step_budget(200000);
+      const grand = run(h, 'catch {$c eval {set g [interp]; $g eval {while {1} {}}}} m; set m');
+      h.set_step_budget(0);
+      const bounded = t => t.startsWith('ok:') && /step budget exceeded/.test(t);
+      r = (bounded(child) && bounded(grand)) ? 'ok|bounded' : 'bad|' + child.slice(0, 60) + '|' + grand.slice(0, 60);
     } else if (s.kind === 'cross-instance') {
       // A second instance on the same page registers a callback; the
       // first instance's script names that callback under every slot
@@ -154,6 +175,11 @@ await check('silent: next outside a method',      'catch {::oo::Helpers::next} e
 // `interp alias {} name {} target prefix`: the alias came into being under
 // the target's name.
 await check('silent: interp alias with a prefix', 'proc t {a b} {list $a $b}; interp alias {} al {} t X; al Y', /ok:"X Y"/);
+
+// A child interpreter starts from its parent: the host's console and
+// clock, and the limits (a counter of its own ran forever in a budget).
+await verify('child: host services inherited, no trap', { kind: 'child-services' }, /ok\|"childout\\n"/);
+await verify('child: step budget covers the family', { kind: 'child-budget' }, /ok\|bounded/);
 
 // The dispatch bridge's slot number is not a capability: an instance
 // reaches its own callbacks and no others.

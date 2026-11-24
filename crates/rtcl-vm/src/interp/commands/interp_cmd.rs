@@ -44,8 +44,10 @@ pub fn cmd_interp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     interp.next_interp_id += 1;
     let handle = format!("interp#{}", id);
 
-    // Create a fresh child interpreter (full initialization including stdlib)
-    let child = Box::new(Interp::new());
+    // A fresh child interpreter; it starts with the parent's host
+    // services and limits.
+    let mut child = Box::new(Interp::new());
+    child.inherit_from(interp);
     interp.child_interps.insert(handle.clone(), child);
 
     // Register a command with the handle name that dispatches subcommands
@@ -185,6 +187,10 @@ fn interp_eval(interp: &mut Interp, handle: &str, args: &[Value]) -> Result<Valu
             ErrorCode::NotFound,
         ))?;
 
+    // The parent's limits as they are now — they may have been lowered
+    // since the child was created.
+    child.max_steps = interp.max_steps;
+    child.max_call_depth = interp.max_call_depth;
     match child.eval(&script) {
         Ok(val) => Ok(Value::from_str(val.as_str())),
         Err(e) => Err(Error::runtime(

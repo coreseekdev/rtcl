@@ -45,6 +45,7 @@ use alloc::collections::BTreeMap as HashMap;
 use alloc::collections::BTreeSet as HashSet;
 
 #[cfg(not(feature = "embedded"))]
+use std::cell::Cell;
 use std::rc::Rc;
 
 #[cfg(feature = "embedded")]
@@ -675,7 +676,12 @@ pub struct Interp {
     /// command dispatch charges one step (interpreter `eval_command` and
     /// the VM funnels `invoke_command`/`call` alike — pure control flow
     /// like `while {1} {}` is caught too).
-    pub(crate) steps: u64,
+    /// `Rc`: a child interpreter shares its parent's counter.  The budget
+    /// then bounds the work of the whole family — with a counter of its
+    /// own a child ran forever inside a budget the host had armed (one
+    /// created before arming inherited "unlimited", and nested
+    /// `interp eval` multiplied the budget by the family's size).
+    pub(crate) steps: Rc<Cell<u64>>,
     /// `None` = unlimited (default — zero behavior change); `Some(n)` =
     /// trip past n steps with `ErrorCode::Timeout`. Arming re-zeroes the
     /// counter (nesting-proof: the host arms before each top-level eval).
@@ -995,7 +1001,9 @@ pub struct Interp {
     pub(crate) child_status: std::collections::HashMap<u32, i32>,
     /// 宿主控制台服务：无 `io` 特性构建里 `puts` 的 stdout/stderr 落点
     /// （原生 stdio，或 wasm 宿主注入的 JS 实现）。
-    pub(crate) console: Box<dyn crate::host::HostConsole>,
+    /// `Rc`: a child interpreter shares its parent's (a child with the
+    /// default one dropped every `puts`).
+    pub(crate) console: Rc<dyn crate::host::HostConsole>,
     /// 宿主 HTTP 服务：`http::*` 词表层的 native 落点（缺省
     /// [`crate::host::NullHttp`]——请求即报"网络服务不可用"；rtcl-cli 的
     /// `net` feature 注入 reqwest 实现；wasm 走 JS 桥，不经此处）。
@@ -1010,8 +1018,11 @@ pub struct Interp {
     pub(crate) jobs: Option<Box<dyn crate::host::HostJobs>>,
     /// 时钟服务：`after`/`vwait`/`time` 的 now/sleep 落点
     /// （原生 `Instant`，或 wasm 宿主注入的 JS 实现）。
+    /// `Rc`: a child interpreter shares its parent's (a child with the
+    /// native one trapped on every `after`/`vwait`/`time` on a host that
+    /// has no native clock — wasm).
     #[cfg(feature = "std")]
-    pub(crate) clock: Box<dyn crate::host::HostClock>,
+    pub(crate) clock: Rc<dyn crate::host::HostClock>,
     /// Alias definitions (name → target + prefix args).
     pub(crate) aliases: HashMap<String, commands::introspect::AliasInfo>,
     /// Reference table for ref/getref/setref.
@@ -1172,7 +1183,7 @@ impl Interp {
             call_depth: 0,
             max_call_depth: default_max_call_depth(),
             nest_depth: 0,
-            steps: 0,
+            steps: Rc::new(Cell::new(0)),
             max_steps: None,
             result: Value::empty(),
             #[cfg(feature = "package")]
@@ -1212,9 +1223,9 @@ impl Interp {
             child_status: std::collections::HashMap::new(),
             console: {
                 #[cfg(feature = "std")]
-                let c: Box<dyn crate::host::HostConsole> = Box::new(crate::host::NativeConsole);
+                let c: Rc<dyn crate::host::HostConsole> = Rc::new(crate::host::NativeConsole);
                 #[cfg(not(feature = "std"))]
-                let c: Box<dyn crate::host::HostConsole> = Box::new(crate::host::NullConsole);
+                let c: Rc<dyn crate::host::HostConsole> = Rc::new(crate::host::NullConsole);
                 c
             },
             http: Box::new(crate::host::NullHttp),
@@ -1233,7 +1244,7 @@ impl Interp {
             #[cfg(feature = "std")]
             next_event_id: 1,
             #[cfg(feature = "std")]
-            clock: Box::new(crate::host::NativeClock),
+            clock: Rc::new(crate::host::NativeClock),
             #[cfg(feature = "std")]
             child_interps: HashMap::new(),
             #[cfg(feature = "std")]
@@ -1312,7 +1323,7 @@ impl Interp {
     /// 注入宿主控制台实现（wasm 宿主由此把 `puts` 的输出接到 JS 回调；
     /// 原生构建默认已是 [`crate::host::NativeConsole`]，无需调用）。
     pub fn set_console(&mut self, console: Box<dyn crate::host::HostConsole>) {
-        self.console = console;
+        self.console = Rc::from(console);
     }
 
     /// 注入宿主 HTTP 实现（native `net` feature 由 rtcl-cli 注入 reqwest
@@ -1362,16 +1373,40 @@ impl Interp {
     /// JS 时钟；原生构建默认已是 [`crate::host::NativeClock`]，无需调用）。
     #[cfg(feature = "std")]
     pub fn set_clock(&mut self, clock: Box<dyn crate::host::HostClock>) {
-        self.clock = clock;
+        self.clock = Rc::from(clock);
     }
+
+    /// Give a freshly built child interpreter what it starts with from
+    /// its parent: the host services (the console, the clock) and the
+    /// limits.  A child used to get the native ones — on a host that has
+    /// no native clock (wasm) every `after`/`vwait`/`time` in it trapped
+    /// and took the instance with it; with a host console its `puts`
+    /// went nowhere — and no step budget, so `interp eval child {while
+    /// {1} {}}` ran past the budget the host had armed.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub(crate) fn inherit_from(&mut self, parent: &Interp) {
+        self.console = Rc::clone(&parent.console);
+        #[cfg(feature = "std")]
+        {
+            self.clock = Rc::clone(&parent.clock);
+        }
+        self.steps = Rc::clone(&parent.steps);
+        self.max_steps = parent.max_steps;
+        self.max_call_depth = parent.max_call_depth;
+    }
+
 
     /// A1 eval 步数预算：武装 `Some(n)` = 每次 eval 的命令步数上限，
     /// 超限抛 `ErrorCode::Timeout`；`None` = 不限（缺省）。武装即清零
     /// 计数——宿主每次顶层 eval 前武装一次，嵌套 eval/命令替换不重置
     ///（预算跨嵌套累计，防 `while {1} {eval {...}}` 绕过）。
     pub fn set_max_steps(&mut self, max: Option<u64>) {
-        self.steps = 0;
+        self.steps.set(0);
         self.max_steps = max;
+        // The children share the counter; they get the new bound too.
+        for child in self.child_interps.values_mut() {
+            child.max_steps = max;
+        }
     }
 
     /// 当前步数预算（None = 不限）。
@@ -1386,6 +1421,10 @@ impl Interp {
     /// `set_max_call_depth(stack_bytes / 5000)`。
     pub fn set_max_call_depth(&mut self, max: usize) {
         self.max_call_depth = max.max(1);
+        // Children never get to recurse deeper than their parent.
+        for child in self.child_interps.values_mut() {
+            child.max_call_depth = self.max_call_depth;
+        }
     }
 
     /// 当前递归/嵌套上限。
@@ -1519,8 +1558,9 @@ impl Interp {
     ///（`invoke_command`/`call`）两条分派路都过这里。
     pub(crate) fn charge_step(&mut self) -> crate::error::Result<()> {
         if let Some(max) = self.max_steps {
-            self.steps = self.steps.saturating_add(1);
-            if self.steps > max {
+            let steps = self.steps.get().saturating_add(1);
+            self.steps.set(steps);
+            if steps > max {
                 return Err(crate::error::Error::runtime(
                     format!("eval step budget exceeded: {max}"),
                     crate::error::ErrorCode::Timeout,

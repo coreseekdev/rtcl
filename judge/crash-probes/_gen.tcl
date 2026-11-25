@@ -54,7 +54,9 @@ proc T {tag script} {
         lappend ::items "U [list $script]"
         return
     }
-    lappend ::items "chk $tag \[T [list $script]\] [list [list $c $r $ec]]"
+    # A tag is one word whatever is in it (a tag with a blank in it — an
+    # index with a blank — is still one tag).
+    lappend ::items "chk [list $tag] \[T [list $script]\] [list [list $c $r $ec]]"
 }
 proc C {tag path script} {
     set ::errorCode NONE
@@ -70,7 +72,7 @@ proc C {tag path script} {
         lappend ::items "U [list $script]"
         return
     }
-    lappend ::items "chk $tag \[T [list $script]\] [list [list $c $r $ec]]"
+    lappend ::items "chk [list $tag] \[T [list $script]\] [list [list $c $r $ec]]"
 }
 
 # The whole source runs, in order: the plain lines build the state the

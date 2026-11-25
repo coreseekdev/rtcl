@@ -620,13 +620,13 @@ fn literal_text(pattern: &str, nocase: bool, expanded: bool) -> Option<String> {
     plain.then(|| pattern.to_string())
 }
 
-/// Compiled engines by pattern and flags, the most recently used first.
-///
-/// tclsh keeps a pattern's compiled form in the pattern object itself; a
-/// rtcl `Value` has no place for it, and every `regexp`, `regsub`, `lsort
-/// -regexp` compiled its pattern again on each call — most of the cost of
-/// a call on a short string.  An engine depends on nothing but the pattern
-/// and the flags, so engines are shared by every interpreter of the thread.
+// Compiled engines by pattern and flags, the most recently used first.
+//
+// tclsh keeps a pattern's compiled form in the pattern object itself; a
+// rtcl `Value` has no place for it, and every `regexp`, `regsub`, `lsort
+// -regexp` compiled its pattern again on each call — most of the cost of
+// a call on a short string.  An engine depends on nothing but the pattern
+// and the flags, so engines are shared by every interpreter of the thread.
 #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 thread_local! {
     static ENGINES: std::cell::RefCell<Vec<(String, u8, std::rc::Rc<CachedEngine>)>> =
@@ -804,7 +804,7 @@ pub(crate) enum Engine {
 
 /// See [`Engine::Literal`].
 #[cfg(feature = "regexp")]
-struct LiteralPat {
+pub(crate) struct LiteralPat {
     text: String,
     icase: bool,
     fallback: Box<Engine>,

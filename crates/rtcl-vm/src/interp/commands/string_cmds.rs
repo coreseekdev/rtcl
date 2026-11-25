@@ -441,7 +441,7 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
 
     match subcmd.as_str() {
-        "length" => Ok(Value::from_int(str_val.chars().count() as i64)),
+        "length" => Ok(Value::from_int(char_count(str_val) as i64)),
         "bytelength" => Ok(Value::from_int(str_val.len() as i64)),
         "tolower" => string_case_range(interp, str_val, args, CaseMode::Lower),
         "toupper" => string_case_range(interp, str_val, args, CaseMode::Upper),
@@ -462,23 +462,25 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() != 5 {
                 return Err(Error::wrong_args("string range", 5, args.len()));
             }
-            let chars: Vec<char> = str_val.chars().collect();
-            let len = chars.len() as i64;
-            let start_raw = match parse_tcl_index(args[3].as_str(), chars.len()) {
+            let len = char_count(str_val);
+            let start_raw = match parse_tcl_index(args[3].as_str(), len) {
                 Some(v) => v,
                 None => return Err(bad_index(interp, args[3].as_str())),
             };
-            let end_raw = match parse_tcl_index(args[4].as_str(), chars.len()) {
+            let end_raw = match parse_tcl_index(args[4].as_str(), len) {
                 Some(v) => v,
                 None => return Err(bad_index(interp, args[4].as_str())),
             };
             // Tcl clamps: start < 0 → 0; end >= len → len-1; empty when
             // the range is backwards or starts past the end.
             let start = start_raw.max(0);
-            let end = end_raw.min(len - 1);
-            if start <= end && start < len {
-                let s: String = chars[start as usize..=end as usize].iter().collect();
-                Ok(Value::from_str(&s))
+            let end = end_raw.min(len as i64 - 1);
+            if start <= end && start < len as i64 {
+                Ok(Value::from_str(char_slice(
+                    str_val,
+                    start as usize,
+                    end as usize + 1,
+                )))
             } else {
                 Ok(Value::empty())
             }
@@ -487,14 +489,22 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() != 4 {
                 return Err(Error::wrong_args("string index", 4, args.len()));
             }
-            let chars: Vec<char> = str_val.chars().collect();
-            let len = chars.len();
-            match parse_tcl_index(args[3].as_str(), len) {
-                Some(idx) if idx >= 0 && (idx as usize) < len => {
-                    Ok(Value::from_str(&chars[idx as usize].to_string()))
+            // Only `end` needs the length; a number goes straight to its
+            // character.  (The whole string was collected first: every
+            // `string index` on a 24KB string cost 8µs.)
+            let index = args[3].as_str();
+            let len = || char_count(str_val);
+            match parse_tcl_index(index, if super::list::index_is_from_end(index) { len() } else { 0 }) {
+                Some(idx) if idx >= 0 => {
+                    let found = if str_val.is_ascii() {
+                        str_val.as_bytes().get(idx as usize).map(|b| *b as char)
+                    } else {
+                        str_val.chars().nth(idx as usize)
+                    };
+                    Ok(found.map_or_else(Value::empty, |c| Value::from_str(&c.to_string())))
                 }
                 Some(_) => Ok(Value::empty()),
-                None => Err(bad_index(interp, args[3].as_str())),
+                None => Err(bad_index(interp, index)),
             }
         }
         "equal" => {
@@ -592,19 +602,31 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // string first needleString haystackString ?startIndex?
             let needle = args[2].as_str();
             let haystack = args[3].as_str();
-            let hchars: Vec<char> = haystack.chars().collect();
+            let len = char_count(haystack);
             let start = if args.len() > 4 {
-                match parse_tcl_index(args[4].as_str(), hchars.len()) {
+                match parse_tcl_index(args[4].as_str(), len) {
                     Some(v) => v.max(0) as usize,
                     None => return Err(bad_index(interp, args[4].as_str())),
                 }
             } else {
                 0
             };
-            let pos = find_chars(&hchars, needle, start)
-                .map(|i| i as i64)
-                .unwrap_or(-1);
-            Ok(Value::from_int(pos))
+            // The library's search, over bytes: a match of a valid UTF-8
+            // needle lies on a character boundary, so the offset counts
+            // back to characters in one pass.  (The search compared a
+            // slice at every position, after collecting the text.)
+            let pos = if needle.is_empty()
+                || needle.len() > haystack.len()
+                || start > haystack.len() - needle.len()
+            {
+                None
+            } else {
+                let from = char_byte_offset(haystack, start);
+                haystack[from..]
+                    .find(needle)
+                    .map(|at| start + haystack[from..from + at].chars().count())
+            };
+            Ok(Value::from_int(pos.map_or(-1, |i| i as i64)))
         }
         "last" => {
             if args.len() < 4 {
@@ -613,22 +635,28 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // string last needleString haystackString ?lastIndex?
             let needle = args[2].as_str();
             let haystack = args[3].as_str();
-            let hchars: Vec<char> = haystack.chars().collect();
+            let len = char_count(haystack);
             // A match must end at or before lastIndex (default: end of string).
             let last = if args.len() > 4 {
-                match parse_tcl_index(args[4].as_str(), hchars.len()) {
+                match parse_tcl_index(args[4].as_str(), len) {
                     // Negative index: no character is at or before it.
                     Some(i) if i < 0 => return Ok(Value::from_int(-1)),
-                    Some(i) => (i as usize).min(hchars.len().saturating_sub(1)),
+                    Some(i) => (i as usize).min(len.saturating_sub(1)),
                     None => return Err(bad_index(interp, args[4].as_str())),
                 }
             } else {
-                hchars.len().saturating_sub(1)
+                len.saturating_sub(1)
             };
-            let pos = rfind_chars(&hchars, needle, last)
-                .map(|i| i as i64)
-                .unwrap_or(-1);
-            Ok(Value::from_int(pos))
+            let pos = if needle.is_empty() || needle.len() > haystack.len() {
+                None
+            } else {
+                // Up to and including the character `last`; see `first`.
+                let upto = char_byte_offset(haystack, last + 1);
+                haystack[..upto]
+                    .rfind(needle)
+                    .map(|at| haystack[..at].chars().count())
+            };
+            Ok(Value::from_int(pos.map_or(-1, |i| i as i64)))
         }
         "map" => {
             if args.len() < 4 || args.len() > 5 {
@@ -1001,33 +1029,33 @@ fn truncate_chars(s: &str, length: Option<usize>) -> String {
     }
 }
 
+/// The length of `s` in characters — its byte length where all its
+/// bytes are characters.
+fn char_count(s: &str) -> usize {
+    if s.is_ascii() {
+        s.len()
+    } else {
+        s.chars().count()
+    }
+}
+
+/// The byte offset of character `ci` (`s.len()` past the end).
+fn char_byte_offset(s: &str, ci: usize) -> usize {
+    if s.is_ascii() {
+        (ci).min(s.len())
+    } else {
+        s.char_indices().map(|(b, _)| b).nth(ci).unwrap_or(s.len())
+    }
+}
+
+/// `s` from character `start` up to (not including) character `end`.
+fn char_slice(s: &str, start: usize, end: usize) -> &str {
+    &s[char_byte_offset(s, start)..char_byte_offset(s, end)]
+}
+
 /// A word character: alphanumeric or underscore (jimtcl convention).
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
-}
-
-/// Find the first occurrence of `needle` in `haystack` at or after char index
-/// `start`. Returns the char index of the match. An empty needle never matches
-/// (Tcl returns -1).
-fn find_chars(haystack: &[char], needle: &str, start: usize) -> Option<usize> {
-    let nchars: Vec<char> = needle.chars().collect();
-    if nchars.is_empty() || start >= haystack.len() || nchars.len() > haystack.len() {
-        return None;
-    }
-    (start..=haystack.len() - nchars.len()).find(|&i| haystack[i..i + nchars.len()] == nchars[..])
-}
-
-/// Find the last occurrence of `needle` in `haystack` that ends at or before
-/// char index `last`. Returns the char index of the match start.
-fn rfind_chars(haystack: &[char], needle: &str, last: usize) -> Option<usize> {
-    let nchars: Vec<char> = needle.chars().collect();
-    if nchars.is_empty() || nchars.len() > haystack.len() {
-        return None;
-    }
-    let max_start = (last + 1).min(haystack.len()).checked_sub(nchars.len())?;
-    (0..=max_start)
-        .rev()
-        .find(|&i| haystack[i..i + nchars.len()] == nchars[..])
 }
 
 /// Tcl titlecase (UCS4ToTitle, tclUtf.c): only Ll characters with a simple

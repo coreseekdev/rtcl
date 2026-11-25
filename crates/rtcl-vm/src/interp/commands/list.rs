@@ -199,6 +199,12 @@ pub(crate) fn parse_tcl_index(s: &str, len: usize) -> Option<i64> {
     Some(wrap_i32(if rb[0] == b'+' { base + off } else { base - off }))
 }
 
+/// Whether a Tcl index is spelled from `end` — the one form whose value
+/// depends on the length it is resolved against.
+pub(crate) fn index_is_from_end(s: &str) -> bool {
+    trim_tcl_space(s).starts_with("end")
+}
+
 /// C `int` wraparound, which Tcl index arithmetic is subject to.
 fn wrap_i32(v: i64) -> i64 {
     v as i32 as i64

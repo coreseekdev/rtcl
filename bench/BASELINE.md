@@ -2701,3 +2701,45 @@ dict getdef（rtcl 多出的 8.7 特性）/errorstack+errorline+options 键序
 - 新增 `judge/crash-probes/d28_local_order.tcl`（两步流程生成），crash-gate
   126→**128/128**。judge 88/88、sweep 12 既有名单不新增、probes fail=122
   基线、workspace rc=0、vm-lib 两特性 rc=0。
+
+## T7 性能小项四连（task/t7 @ 96e81cd/acd9db6/3d2ffc3/2c68059，2026-11-26，子代理施工）
+
+### P5 array size/exists O(1)（96e81cd）
+- Interp/CallFrame 记 `elem_counts`（set_var 元素写两分支、unset 元素删、mark_array、
+  loc_remove_array、ns delete/oo destroy 直删、env/tcl_platform 播种维护）。
+- 8 万元素 300 次/段：`array size` 2,023,992→**248µs**（常数）；exists 未命中
+  3,221,210→261µs。tclsh9.1 的 array size 实测也非常数（8k 44µs/80k 449-1253µs）
+  ——rtcl 现在更快。
+
+### 数组元素读写零分配直取（acd9db6）
+- get_var/set_var/var_exists/incr_var_fast/cmd_append 五处数组分支加守卫径：平键
+  与给定名逐字相同（帧 array-local 或 :: 顶层全局）且无死链/平别名/ns 瞬态/无
+  trace → 一次哈希直取。语义先钉后动（judge/probes/t7_arr_elem.tcl 46 行，改造
+  前后对 tclsh9.1 逐字节一致）。
+- **顺带发现**：stdlib init 后 `ns_transient` 残留 `auto_execs_arr` 自映射一条
+  （预存泄漏）；粗粒度 is_empty() 守卫会永久失活——改按基名精确匹配。
+- 数字（50k-100k 次/段，比值=rtcl/tclsh9.1）：write 2.05x、read 2.02x、incr
+  **0.51x（反超）**、append 0.83x、read-50k 1.29x、write-new 2.09x、write-old
+  1.12x——全部 ≤2.1x（达标线 ≤3x）。
+
+### P15 string last 三处（3d2ffc3）
+- 完整反向候选走（rmemchr 按字反跳+字内精化；Horspool 移位表被暴力对照证伪——
+  覆盖论证只对前向成立，反向漏右端 1935/200000，已弃）+ SWAR 连续字节计数
+  （24KB 12µs→3.1µs）+ ASCII 分类三次扫合并。
+- last-miss-sp 11786→1275（**0.34x 反超**）；last-hit 1733→651（4.97×）、
+  last-hit-uni 7157→1629（11.16×）**未达标——架构下界**：hit 余量是 string
+  ensemble 分派底（0.23µs/次 vs tclsh 对象内缓存 0.1-0.2µs 全程），uni 余量是
+  字符长度无缓存（SWAR 3.1µs 是本机地板，5 种写法实测同）——根治 = Value 层
+  字符长度缓存（审计 §3.4 已记根因），立后续项，未盲修。
+
+### P6 变量表哈希塌缩（2c68059）——先量后修，实测成立且严重
+- Python 逐位复刻 VarHasher：6 万个 `k000000..kN` 只占 131072 桶的 **32 个**
+  （链长中位 1856）；端到端同前缀族比变长族慢 45%。此前"顺带好了"不成立。
+- `finish()` 加 murmur3 fmix64 雪崩（与 value.rs 字典键 FxHasher 既有修复同
+  处方）；修后四族全 4.8 万桶、链长≤6；6 万变量整表读回 -20~-40%，族间差
+  1.45x→1.09x。哈希值变 = 全部变量/命令表迭代序变——judge/probes/sweep/
+  tests 全绿实证迭代序对输出无承载（var_order 重放设计成立）。
+
+### 门禁（合并主树后复验 02:50）
+judge 88/88、crash-gate 128/128（d28 在内）、sweep 12 既有、probes **316**/122
+（t7_arr_elem 新探针入列，无新 DIFF）、workspace rc=0。

@@ -530,7 +530,8 @@ P1：TCP 读每字节一次系统调用，3MiB 要 387ms（tclsh 5ms）；P9：�
 读逐字节，32MB 要 0.6 秒（tclsh 58ms）。都在 `channel.rs`。验收：
 两个数字到 tclsh 的 3 倍以内，`judge/corpus` 里 io 相关的文件不变。
 
-**T7 小的性能项（事务；P6 先评审）**
+**T7 小的性能项（✅ 2026-11-26 完成，task/t7 四提交 96e81cd/acd9db6/3d2ffc3/2c68059；**P5 O(1)（比 tclsh9.1 还快）、数组元素读写全 ≤2.1x（incr 0.51x 反超）、P15 miss 反超 0.34x/hit 架构下界未达（需 Value 字符长度缓存）、P6 实测成立后修（murmur3 fmix64，6 万同前缀名 32 桶→4.8 万桶）；记录见 bench/BASELINE.md。**
+原任务书：**T7 小的性能项（事务；P6 先评审）**
 - P5：`array size`/`array exists` 扫整张变量表（8 万元素 0.8ms，
   tclsh 是常数），在 `commands/array.rs`。给数组记一个元素计数。
 - 数组元素的读写比 tclsh 慢 3–4 倍（`set_var`/`get_var` 的数组分支，

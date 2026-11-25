@@ -889,10 +889,35 @@ impl Interp {
                     self.arrays_env_only = false;
                 }
                 self.array_globals.insert(n.clone());
+                // (Re)creation starts the live element count at 0 (P5).
+                self.elem_counts.insert(n.clone(), 0);
             }
             VarLoc::Frame(i, n) => {
                 if let Some(f) = self.frames.get_mut(*i) {
                     f.array_locals.insert(n.clone());
+                    f.elem_counts.insert(n.clone(), 0);
+                }
+            }
+        }
+    }
+
+    /// Adjust the array at `loc`'s live element count by `delta` (P5:
+    /// `array size`/`array exists` read the count instead of filtering
+    /// the scope's whole table).  A no-op when no count is tracked —
+    /// the query then falls back to the scan, so an unmaintained entry
+    /// degrades performance, never correctness.
+    fn loc_elem_count_bump(&mut self, loc: &VarLoc, delta: i64) {
+        match loc {
+            VarLoc::Global(n) => {
+                if let Some(c) = self.elem_counts.get_mut(n) {
+                    *c = ((*c as i64) + delta).max(0) as usize;
+                }
+            }
+            VarLoc::Frame(i, n) => {
+                if let Some(f) = self.frames.get_mut(*i) {
+                    if let Some(c) = f.elem_counts.get_mut(n) {
+                        *c = ((*c as i64) + delta).max(0) as usize;
+                    }
                 }
             }
         }
@@ -916,6 +941,7 @@ impl Interp {
                 }
                 let base = loc.base_name().to_string();
                 self.array_globals.remove(&base);
+                self.elem_counts.remove(&base);
                 self.arrays_env_only = self
                     .array_globals
                     .iter()
@@ -935,6 +961,7 @@ impl Interp {
                     }
                     let base = loc.base_name().to_string();
                     f.array_locals.remove(&base);
+                    f.elem_counts.remove(&base);
                     f.locals.remove(&base);
                 }
             }
@@ -1598,6 +1625,7 @@ impl Interp {
                 if !existed {
                     // New element: element-set mutation invalidates searches.
                     self.bump_stamp(&loc);
+                    self.loc_elem_count_bump(&loc, 1);
                 }
             } else if self.loc_base_exists(&loc) {
                 let base = name.split('(').next().unwrap_or(name);
@@ -1617,6 +1645,7 @@ impl Interp {
                 self.loc_insert(&loc, base_key, Value::empty());
                 let key = loc.element_key(index);
                 self.loc_insert(&loc, key, value.clone());
+                self.loc_elem_count_bump(&loc, 1);
             }
             self.clear_phantom(&base, &idx);
             // Write traces fire after the write lands; a trace error is
@@ -2018,6 +2047,7 @@ impl Interp {
                 if self.loc_remove(&loc, &key) {
                     // Removed element: mutation invalidates searches.
                     self.bump_stamp(&loc);
+                    self.loc_elem_count_bump(&loc, -1);
                     self.clear_phantom(&base, &idx);
                     // Unset traces fire after deletion; errors are
                     // discarded (tclsh: the unset still succeeds).
@@ -2763,6 +2793,24 @@ impl Interp {
     /// replaying their subsequence reproduces tclsh's `array names`).
     pub(crate) fn array_element_names(&self, name: &str) -> Vec<String> {
         self.array_elements(name, true)
+    }
+
+    /// Live element count of the array at `name` (P5), kept per scope by
+    /// the element write/remove sites.  `None` when the name's count is
+    /// not tracked (no count entry — no array was ever created there, or
+    /// an element key slipped in without the marker machinery): callers
+    /// fall back to the table scan, so a hole degrades speed, not
+    /// correctness.
+    pub(crate) fn array_element_count(&self, name: &str) -> Option<usize> {
+        let (owner_fi, base) = self.array_owner(name);
+        match owner_fi {
+            Some(i) => self
+                .frames
+                .get(i)
+                .and_then(|f| f.elem_counts.get(&base))
+                .copied(),
+            None => self.elem_counts.get(&base).copied(),
+        }
     }
 
     /// The element keys of the array at `name` as the log has them: the

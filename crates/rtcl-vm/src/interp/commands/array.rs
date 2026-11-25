@@ -434,34 +434,27 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() != 3 {
                 return Err(usage("array", "size", "arrayName"));
             }
-            let (owner_fi, base) = interp.array_owner(array_name);
-            let prefix = format!("{}(", base);
-            let table = match owner_fi {
-                Some(i) => &interp.frames[i].locals,
-                None => &interp.globals,
-            };
-            let count = table
-                .keys()
-                .filter(|k| k.starts_with(&prefix) && k.ends_with(')'))
-                .count();
-            Ok(Value::from_int(count as i64))
+            // P5: the per-scope element count is maintained at the
+            // element write/remove sites (and seeded by `mark_array`,
+            // which `upvar`'s element links ride) — one hash probe
+            // instead of the old filter-scan of every key in the table.
+            // A name with no count entry has no array: 0.
+            Ok(Value::from_int(
+                interp.array_element_count(array_name).unwrap_or(0) as i64,
+            ))
         }
         "exists" => {
             if args.len() != 3 {
                 return Err(usage("array", "exists", "arrayName"));
             }
             // Semantic check: an array stays alive after its last element
-            // is unset (registry marker), a scalar is not an array.
-            let (owner_fi, base) = interp.array_owner(array_name);
-            let prefix = format!("{}(", base);
-            let table = match owner_fi {
-                Some(i) => &interp.frames[i].locals,
-                None => &interp.globals,
-            };
+            // is unset (registry marker), a scalar is not an array.  The
+            // element count answers the elements-exist case in O(1)
+            // (elements can only be created through the marked array
+            // write path, so a name with a count has — at most — those
+            // elements); an untracked name has no array.
             let exists = interp.is_array_semantic(array_name)
-                || table
-                    .keys()
-                    .any(|k| k.starts_with(&prefix) && k.ends_with(')'));
+                || interp.array_element_count(array_name).unwrap_or(0) > 0;
             Ok(Value::from_bool(exists))
         }
         "unset" => {

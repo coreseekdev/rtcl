@@ -129,6 +129,7 @@ impl Interp {
                 locals: VarMap::default(),
                 locals_order: Vec::new(),
                 array_locals: VarSet::default(),
+                elem_counts: VarMap::default(),
                 upvars: UpvarMap::default(),
                 ns: None,
                 call_ns: None,
@@ -266,6 +267,7 @@ impl Interp {
                     frame.locals.clear();
                     frame.locals_order.clear();
                     frame.array_locals.clear();
+                    frame.elem_counts.clear();
                     frame.upvars.clear();
                 }
                 // `info level 0` shows the invocation as dispatched: the
@@ -774,6 +776,7 @@ impl Interp {
                     frame.locals.clear();
                     frame.locals_order.clear();
                     frame.array_locals.clear();
+                    frame.elem_counts.clear();
                 }
                 // Trace callbacks must not disturb the error (if any) that is
                 // unwinding through this frame.
@@ -803,6 +806,7 @@ impl Interp {
         popped.locals.clear();
         popped.locals_order.clear();
         popped.array_locals.clear();
+        popped.elem_counts.clear();
         popped.upvars.clear();
         popped.local_procs.clear();
         popped.deferred_scripts.clear();
@@ -1279,6 +1283,7 @@ impl Interp {
                 locals: VarMap::default(),
                 locals_order: Vec::new(),
                 array_locals: VarSet::default(),
+                elem_counts: VarMap::default(),
                 upvars: UpvarMap::default(),
                 ns: None,
                 call_ns: None,
@@ -1542,6 +1547,7 @@ impl Interp {
                     frame.locals.clear();
                     frame.locals_order.clear();
                     frame.array_locals.clear();
+                    frame.elem_counts.clear();
                 }
                 let saved_info = self.err_info.take();
                 let saved_fresh = std::mem::take(&mut self.err_fresh);
@@ -1638,6 +1644,7 @@ impl Interp {
         popped.locals.clear();
         popped.locals_order.clear();
         popped.array_locals.clear();
+        popped.elem_counts.clear();
         popped.upvars.clear();
         popped.local_procs.clear();
         popped.deferred_scripts.clear();

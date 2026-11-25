@@ -270,7 +270,7 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // also seeds a real local: the tclsh link is a refcounted shared
         // Var, so the local keeps the value even if the namespace (and its
         // variable) is deleted while the proc runs (46.8).
-        if interp.frames.is_empty() {
+        if interp.var_frame_idx().is_none() {
             // At eval level tclsh's `variable` links the ns-eval varFrame
             // to the namespace Var: the variable stays readable for the
             // rest of the body even if the namespace deletes itself
@@ -1328,8 +1328,7 @@ fn ns_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let other = args[i].as_str();
         let my = args[i + 1].as_str();
         let target = var_key(&qualify(&nsq, other));
-        if !interp.frames.is_empty() {
-            let frame_idx = interp.frames.len() - 1;
+        if let Some(frame_idx) = interp.var_frame_idx() {
             interp.frames[frame_idx]
                 .upvars
                 .insert(Rc::from(my), crate::interp::UpvarLink::Global(Rc::from(target)));

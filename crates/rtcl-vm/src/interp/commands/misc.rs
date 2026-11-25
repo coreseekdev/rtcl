@@ -896,7 +896,10 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             //   - inside `namespace eval nn` → ::nn's table;
             //   - bare at global → ::'s table.
             interp.degrade_frame_all();
-            let in_ns = interp.frames.is_empty()
+            // Inside a `namespace eval` body there is no proc variable
+            // frame, even when a proc called it: the body's tables are
+            // listed (see `var_frame_idx`).
+            let in_ns = interp.var_frame_idx().is_none()
                 && interp.current_namespace.as_ref() != "::";
             let ns_prefix = if in_ns {
                 Some(format!("{}::", &interp.current_namespace[2..]))
@@ -941,8 +944,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     }
                     table_ns = Some(target_ns);
                 }
-            } else if !interp.frames.is_empty() {
-                let frame = interp.frames.last().unwrap();
+            } else if let Some(frame) = interp.var_frame() {
                 for k in frame.locals_order.iter() {
                     if !frame.locals.contains_key(k) || is_array_element_name(k) {
                         continue;
@@ -988,7 +990,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // ns 语境的全局 fallback 分段重放：当前表 hash 序在前、
             // :: 表 hash 序在后（tclsh InfoVarsCmd 的双表遍历序——
             // IVQ 钉形 A: `bb cc aa` + 全局段）。
-            let ordered_tails: Vec<&str> = if !interp.frames.is_empty() && !qualified {
+            let ordered_tails: Vec<&str> = if interp.var_frame().is_some() && !qualified {
                 entries.iter().map(|(_, t)| t.as_str()).collect()
             } else if let Some(split) = global_split {
                 let mut o = super::super::tclhash::tcl_order(
@@ -1290,7 +1292,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // Slot-compiled frames enumerate through the name-keyed store
             // (migrate first; later calls on the same frame skip through).
             interp.degrade_frame_all();
-            if let Some(frame) = interp.frames.last() {
+            if let Some(frame) = interp.var_frame() {
                 // Compiled procs keep locals in a linear array in table
                 // order (params first, then body locals) — `info locals`
                 // walks it in INSERTION order, not hash order.  A local

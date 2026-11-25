@@ -89,6 +89,16 @@ fn compact_order(order: &mut Vec<String>, live: &dyn Fn(&str) -> bool, frame: bo
     });
 }
 
+/// [`Interp::var_frame_idx`] over the frame stack and the number of open
+/// `namespace eval` bodies.
+fn scope_frame_idx(frames: &[Box<CallFrame>], ns_open: usize) -> Option<usize> {
+    let idx = frames.len().checked_sub(1)?;
+    match frames.get(idx) {
+        Some(f) if f.ns_depth >= ns_open => Some(idx),
+        _ => None,
+    }
+}
+
 /// Where a resolved variable lives, after following upvar links and
 /// `::`-qualification to its *owning* scope.
 #[derive(Debug, Clone)]
@@ -187,6 +197,36 @@ impl Interp {
         let Some(cell) = ts.values.get_mut(slot) else { return };
         if cell.is_unset() {
             *cell = value.clone();
+        }
+    }
+
+    /// The frame that bare-name variable operations act on, and its
+    /// index: the innermost proc frame — unless a `namespace eval` body is
+    /// open above it, which is `None`.  tclsh gives the body its own
+    /// variable frame (`TclPushStackFrame` on the namespace, not a call
+    /// frame): the proc's locals are not visible in the body, and a bare
+    /// name is the namespace's variable.  A frame's `ns_depth` records how
+    /// many bodies were open when it was pushed; one more open now means
+    /// the body is the innermost scope.  The proc frame still counts as a
+    /// call level for `info level` and `uplevel`, which keep reading
+    /// `frames` itself.
+    ///
+    /// This used to be `frames.last()` everywhere: a body evaluated from
+    /// inside a proc read and wrote the proc's locals —
+    /// `proc Q {} { set x secret; namespace eval n { set x 1 } }` left
+    /// `x` at 1 — and never saw the namespace's variables.
+    pub(crate) fn var_frame_idx(&self) -> Option<usize> {
+        scope_frame_idx(&self.frames, self.ns_stack.len())
+    }
+
+    pub(crate) fn var_frame(&self) -> Option<&CallFrame> {
+        self.var_frame_idx().map(|i| &*self.frames[i])
+    }
+
+    pub(crate) fn var_frame_mut(&mut self) -> Option<&mut CallFrame> {
+        match self.var_frame_idx() {
+            Some(i) => self.frames.get_mut(i).map(|f| &mut **f),
+            None => None,
         }
     }
 
@@ -581,7 +621,7 @@ impl Interp {
     /// [`Self::degrade_frame_all_at`] on the current frame (no-op at the
     /// global level).
     pub(crate) fn degrade_frame_all(&mut self) {
-        if let Some(i) = self.frames.len().checked_sub(1) {
+        if let Some(i) = self.var_frame_idx() {
             self.degrade_frame_all_at(i);
         }
     }
@@ -589,7 +629,7 @@ impl Interp {
     /// [`Self::degrade_frame_local`] on the current frame (no-op at the
     /// global level, where there is nothing to degrade).
     pub(crate) fn degrade_frame_local_here(&mut self, name: &str) {
-        if let Some(i) = self.frames.len().checked_sub(1) {
+        if let Some(i) = self.var_frame_idx() {
             self.degrade_frame_local(i, name);
         }
     }
@@ -603,7 +643,8 @@ impl Interp {
             // when a namespace body linked its bare `x`).
             return VarLoc::Global(gname);
         }
-        if let Some(frame) = self.frames.last() {
+        if let Some(idx) = self.var_frame_idx() {
+            let frame = &self.frames[idx];
             if let Some(link) = frame.upvars.get(name) {
                 return match link {
                     UpvarLink::Global(gname) => {
@@ -614,14 +655,22 @@ impl Interp {
                     }
                     // A dead link reads (and exists) against the alias's
                     // seeded local copy; writes are rejected in set_var.
-                    UpvarLink::Dead { .. } => {
-                        VarLoc::Frame(self.frames.len() - 1, name.to_string())
-                    }
+                    UpvarLink::Dead { .. } => VarLoc::Frame(idx, name.to_string()),
                 };
             }
-            return VarLoc::Frame(self.frames.len() - 1, name.to_string());
+            return VarLoc::Frame(idx, name.to_string());
         }
-        VarLoc::Global(self.redirect_flat(self.canonical_global(name)))
+        // No proc variable frame: the current namespace's table — unless
+        // the chain leads to the global's (the variable, or its entry, is
+        // there and the namespace has none of that name).  Everything
+        // that asks where a variable lives goes through here, so the
+        // array commands and the trace tables follow the chain too; they
+        // used to look under the namespace's own name and miss a global
+        // array or a global's traces.
+        match self.ns_chain_global(name) {
+            Some(gkey) => VarLoc::Global(gkey),
+            None => VarLoc::Global(self.redirect_flat(self.canonical_global(name))),
+        }
     }
 
     /// Follow an eval-level `upvar` alias (global level): the alias's flat
@@ -649,7 +698,7 @@ impl Interp {
     /// 当前 ns，B/F-fresh 形状）。proc 帧、限定名、根 ns、dead-alias
     /// 环境恒 None（现状行为不变）。
     fn ns_chain_global(&self, bare_name: &str) -> Option<String> {
-        if !self.frames.is_empty()
+        if self.var_frame_idx().is_some()
             || self.current_namespace.as_ref() == "::"
             || bare_name.contains("::")
             || !self.dead_flat.is_empty()
@@ -667,16 +716,82 @@ impl Interp {
             return None;
         }
         let gkey = self.redirect_flat(bare_name.to_string());
-        if self.globals.contains_key(gkey.as_str()) {
+        if self.global_entry_exists(&gkey) {
             return Some(gkey);
         }
         // A stale `variable` transient link (its namespace target was
         // unset) must not hide an existing global of the same bare name:
         // tclsh's fallback is by name, not through the dead link.
-        if gkey != bare_name && self.globals.contains_key(bare_name) {
+        if gkey != bare_name && self.global_entry_exists(bare_name) {
             return Some(bare_name.to_string());
         }
         None
+    }
+
+    /// Whether the :: table has an entry for the bare global `key`, with
+    /// a value or without.  One without a value is there from the moment
+    /// a trace is put on the variable ([`Interp::note_global_entry`]) or
+    /// the `variable` command declares it in `::`; tclsh keeps such a Var
+    /// undefined but present.  Only the namespace chain asks: reads and
+    /// `info exists` of a valueless entry still miss.
+    fn global_entry_exists(&self, key: &str) -> bool {
+        if self.globals.contains_key(key) {
+            return true;
+        }
+        if key.contains('(') || key.contains("::") {
+            return false;
+        }
+        self.phantom_globals.contains(key)
+            || self
+                .namespaces
+                .get("::")
+                .is_some_and(|i| i.variables.contains(key))
+    }
+
+    /// The :: table's key for a name that is a scalar of the global
+    /// namespace and is being looked at from outside any proc — `::x`, or
+    /// `x` at the top level — and `None` for every other name (a proc's
+    /// local, an element, another namespace's variable).
+    fn global_scalar_key<'a>(&self, name: &'a str) -> Option<&'a str> {
+        if name.contains('(') || self.var_frame_idx().is_some() {
+            return None;
+        }
+        if let Some(k) = name.strip_prefix("::") {
+            if k.contains("::") {
+                return None;
+            }
+            return Some(k);
+        }
+        if self.current_namespace.as_ref() == "::" {
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    /// Record an entry without a value in the :: table (see
+    /// [`Self::global_entry_exists`]) for a name looked at from outside
+    /// any proc.
+    pub(crate) fn note_global_entry(&mut self, name: &str) {
+        if let Some(key) = self.global_scalar_key(name) {
+            self.note_global_key(key);
+        }
+    }
+
+    /// The same for a key known to be a scalar of the :: table — the
+    /// target of a proc's `global` or `upvar #0` link.
+    pub(crate) fn note_global_key(&mut self, key: &str) {
+        if !key.contains('(') && !key.contains("::") && !self.globals.contains_key(key) {
+            self.phantom_globals.insert(key.to_string());
+        }
+    }
+
+    /// Drop such an entry: the variable was unset, or its last trace went
+    /// while it still had no value.
+    pub(crate) fn forget_global_entry(&mut self, name: &str) {
+        if let Some(key) = self.global_scalar_key(name) {
+            self.phantom_globals.remove(key);
+        }
     }
 
     /// Dead-link write check (tclsh 8.6.17): only WRITES through an alias
@@ -687,7 +802,7 @@ impl Interp {
         // Every `set_var` pays this first: nothing linked (the common
         // case) means nothing can be dead — skip the paren scan AND the
         // upvar hash probe entirely.
-        if let Some(frame) = self.frames.last() {
+        if let Some(frame) = self.var_frame() {
             if frame.upvars.is_empty() {
                 return None;
             }
@@ -912,7 +1027,7 @@ impl Interp {
         if let Some(gname) = Self::split_global(name) {
             return self.globals.get(gname.as_str());
         }
-        if let Some(frame) = self.frames.last() {
+        if let Some(frame) = self.var_frame() {
             if let Some(link) = frame.upvars.get(name) {
                 return match link {
                     // A `variable`-linked name whose namespace variable was
@@ -1007,7 +1122,7 @@ impl Interp {
             self.global_insert(gname, value);
             return;
         }
-        if self.frames.is_empty() {
+        if self.var_frame_idx().is_none() {
             // Bare names in a namespace eval body resolve current ns
             // first, then the global namespace: an existing global wins
             // even for writes (`set x 5` in `namespace eval C` writes the
@@ -1079,7 +1194,7 @@ impl Interp {
         if name.contains('(') {
             return true;
         }
-        if let Some(frame) = self.frames.last() {
+        if let Some(frame) = self.var_frame() {
             match frame.upvars.get(name) {
                 Some(UpvarLink::Global(g)) => g.contains('('),
                 _ => false,
@@ -1132,7 +1247,7 @@ impl Interp {
             self.globals.remove(gname.as_str());
             return;
         }
-        if self.frames.is_empty() {
+        if self.var_frame_idx().is_none() {
             let key = self.redirect_flat(self.canonical_global(name));
             self.globals.remove(key.as_str());
             // Unsetting also forgets the `variable` declaration (tclsh:
@@ -1247,7 +1362,7 @@ impl Interp {
         if let Some((array_name, index)) = split_array_ref(name) {
             let mut loc = self.resolve_loc(array_name);
             if !self.loc_is_array(&loc)
-                && self.frames.is_empty()
+                && self.var_frame_idx().is_none()
                 && self.current_namespace.as_ref() != "::"
                 && !array_name.contains("::")
             {
@@ -1287,7 +1402,7 @@ impl Interp {
             // (no upvars, no local arrays) then pays probes only for
             // `locals` itself.
             if !has_ns_sep(name) {
-                if let Some(frame) = self.frames.last() {
+                if let Some(frame) = self.var_frame() {
                     if frame.upvars.is_empty() || !frame.upvars.contains_key(name) {
                         // Slotted name: the slot is the canonical store (a
                         // table name is never in the map).  An empty cell is
@@ -1295,7 +1410,7 @@ impl Interp {
                         if let Some(i) = frame.slot_index_of(name) {
                             let sv = &frame.slots[i];
                             if sv.is_unset() {
-                                return Err(Error::var_not_found(name));
+                                return Err(Error::var_undefined(name));
                             }
                             return Ok(sv);
                         }
@@ -1330,9 +1445,55 @@ impl Interp {
                     ErrorCode::Generic,
                 ));
             }
-            self.resolve_var(name).ok_or_else(|| Error::var_not_found(name))
+            self.resolve_var(name).ok_or_else(|| self.read_error(name))
         }
     }
+
+    /// The error for a read that found no value: the same message either
+    /// way, another errorCode.  A variable whose entry is in its table
+    /// without a value is `TCL READ VARNAME` (tclsh finds the Var); a name
+    /// no table knows is `TCL LOOKUP VARNAME <name>`.
+    fn read_error(&self, name: &str) -> Error {
+        if self.has_valueless_entry(name) {
+            Error::var_undefined(name)
+        } else {
+            Error::var_not_found(name)
+        }
+    }
+
+    /// Does `name` have an entry in its table that holds no value — a
+    /// traced variable, the target of a link, a `variable` declaration
+    /// without one, a proc's compiled local before its first `set` or
+    /// after `unset`?  Such an entry is found (tclsh keeps an undefined
+    /// Var), which shows in the errorCode of a read or of an `unset`.
+    fn has_valueless_entry(&self, name: &str) -> bool {
+        if name.contains('(') {
+            false
+        } else if let Some(idx) = self.var_frame_idx() {
+            let frame = &self.frames[idx];
+            frame.is_compiled_local(name) || frame.upvars.contains_key(name)
+        } else if name.contains("::") {
+            // That namespace's own table.
+            Self::split_global(name).is_some_and(|key| {
+                key.contains("::")
+                    || self.phantom_globals.contains(&key)
+                    || self
+                        .namespaces
+                        .get("::")
+                        .is_some_and(|i| i.variables.contains(&key))
+            })
+        } else if self.current_namespace.as_ref() == "::" {
+            self.global_entry_exists(name)
+        } else {
+            // Inside a namespace: its table, else the chain's.
+            self.ns_var_declared(name)
+                || match self.ns_chain_global(name) {
+                    Some(gkey) => self.global_entry_exists(&gkey),
+                    None => false,
+                }
+        }
+    }
+
 
     /// tclsh: a WRITE to a namespace-qualified variable requires the
     /// variable's namespace to exist (`can't set "bogus::x": parent
@@ -1511,7 +1672,7 @@ impl Interp {
             // same trace firing).
             if !has_ns_sep(name) && self.dead_flat.is_empty() {
                 let mut wrote = false;
-                if let Some(frame) = self.frames.last_mut() {
+                if let Some(frame) = self.var_frame_mut() {
                     if (frame.upvars.is_empty() || !frame.upvars.contains_key(name))
                         && (frame.array_locals.is_empty() || !frame.array_locals.contains(name))
                     {
@@ -1640,7 +1801,13 @@ impl Interp {
                 // 非槽名 → 落下方全局路径
             }
         }
-        if let Some(frame) = self.frames.last_mut() {
+        // The predicate over the two fields, not [`Self::var_frame_idx`]:
+        // this function returns a reference into one table or the other,
+        // and a method call on the whole interpreter does not borrow that
+        // way.
+        let frame = scope_frame_idx(&self.frames, self.ns_stack.len())
+            .and_then(|i| self.frames.get_mut(i));
+        if let Some(frame) = frame {
             if !frame.upvars.is_empty() && frame.upvars.contains_key(name) {
                 return None;
             }
@@ -1701,7 +1868,7 @@ impl Interp {
 
         // (1) Proc level: only the `variable` command's namespace link.
         //     Unlinked proc locals are handled by var_slot_fast.
-        if let Some(frame) = self.frames.last() {
+        if let Some(frame) = self.var_frame() {
             let target = match frame.upvars.get(name) {
                 Some(UpvarLink::Global(g)) => g.to_string(),
                 _ => return None,
@@ -1720,7 +1887,7 @@ impl Interp {
             // hot `variable`+`dict set` loops).  Reads refresh from the
             // global (resolve_var consults the global first); the seed
             // only keeps a mid-proc-deleted namespace variable readable.
-            if let Some(frame) = self.frames.last_mut() {
+            if let Some(frame) = self.var_frame_mut() {
                 frame.locals.remove(name);
             }
             return self.globals.get_mut(key.as_str());
@@ -2005,9 +2172,14 @@ impl Interp {
                 if let VarLoc::Global(k) = &loc {
                     let k = k.clone();
                     self.drop_global_seeds(&k);
+                    // The entry goes with its traces (a traced variable
+                    // that was never set leaves the table).
+                    self.phantom_globals.remove(&k);
                 }
+                // The key from where the variable WAS: by name it would
+                // no longer resolve there (the chain needs the variable).
                 let sk = stamp_key(&loc);
-                let _ = self.fire_traces(&given, None, "unset");
+                let _ = self.fire_traces_key(&sk, &given, None, "unset", true);
                 self.var_traces.remove(&sk);
                 self.elem_traces.remove(&sk);
                 self.trace_phantoms.remove(&sk);
@@ -2023,15 +2195,34 @@ impl Interp {
                 // (`unset` on an untraced-existence variable still wipes
                 // its registrations — trace-14.17/14.19/33.1) AND fires
                 // the unset traces on the way (D-37⑤).
+                // An entry without a value was found — it goes with this
+                // `unset` — and tclsh's code is then the bare
+                // `TCL UNSET VARNAME`; a name no table knows is
+                // `TCL LOOKUP VARNAME <name>`.
+                let found_entry = self.has_valueless_entry(name);
                 let _ = self.fire_traces(&given, None, "unset");
                 let sk = stamp_key(&loc);
                 self.var_traces.remove(&sk);
                 self.elem_traces.remove(&sk);
                 self.trace_phantoms.remove(&sk);
-                crate::interp::commands::list::set_error_code(
-                    self,
-                    &format!("TCL LOOKUP VARNAME {}", name),
-                );
+                // The failed `unset` still takes the valueless entry with
+                // it, traces and declaration alike: the next read or
+                // `unset` of the name is a lookup failure.  By where the
+                // name resolved to, not by the name: the entry may be a
+                // global reached from inside a namespace body.
+                if let VarLoc::Global(k) = &loc {
+                    let k = k.clone();
+                    self.phantom_globals.remove(&k);
+                    if let Some(info) = self.namespaces.get_mut("::") {
+                        info.variables.remove(&k);
+                    }
+                }
+                let code = if found_entry {
+                    "TCL UNSET VARNAME".to_string()
+                } else {
+                    format!("TCL LOOKUP VARNAME {}", name)
+                };
+                crate::interp::commands::list::set_error_code(self, &code);
                 Err(Error::runtime(
                     format!("can't unset \"{}\": no such variable", name),
                     ErrorCode::NotFound,
@@ -2059,7 +2250,7 @@ impl Interp {
         if let Some((array_name, index)) = split_array_ref(name) {
             let mut loc = self.resolve_loc(array_name);
             if !self.loc_is_array(&loc)
-                && self.frames.is_empty()
+                && self.var_frame_idx().is_none()
                 && self.current_namespace.as_ref() != "::"
                 && !array_name.contains("::")
             {
@@ -2134,9 +2325,14 @@ impl Interp {
         // ::a` and `array get ::a` looked for `::a(` and found nothing.
         let (mut scope, mut base) = match Self::split_global(name) {
             Some(key) => (None, key),
-            None => match self.frames.last().map(|_| self.frames.len() - 1) {
+            None => match self.var_frame_idx() {
                 Some(frame) => (Some(frame), name.to_string()),
-                None => (None, self.canonical_global(name)),
+                // The namespace chain applies to arrays too.
+                None => (
+                    None,
+                    self.ns_chain_global(name)
+                        .unwrap_or_else(|| self.redirect_flat(self.canonical_global(name))),
+                ),
             },
         };
         // Follow upvar links transitively (with a hop bound so a link
@@ -2216,7 +2412,21 @@ impl Interp {
         op: &str,
         include_whole: bool,
     ) -> Result<bool> {
-        let key = self.array_stamp_key(base);
+        self.fire_traces_key(&self.array_stamp_key(base), base, elem, op, include_whole)
+    }
+
+    /// [`Self::fire_traces`] with the key of the variable's table given:
+    /// for a fire that comes after the variable itself is gone, when the
+    /// name would no longer resolve to it (an `unset` of a global from
+    /// inside a namespace body).
+    fn fire_traces_key(
+        &mut self,
+        key: &str,
+        base: &str,
+        elem: Option<&str>,
+        op: &str,
+        include_whole: bool,
+    ) -> Result<bool> {
         let guard = match elem {
             Some(e) => format!("E\x00{}\x00{}", key, e),
             None => format!("W\x00{}", key),
@@ -2224,7 +2434,7 @@ impl Interp {
         if !self.trace_active.insert(guard.clone()) {
             return Ok(false);
         }
-        let fired = self.fire_traces_inner(&key, base, elem, op, include_whole);
+        let fired = self.fire_traces_inner(key, base, elem, op, include_whole);
         self.trace_active.remove(&guard);
         fired
     }

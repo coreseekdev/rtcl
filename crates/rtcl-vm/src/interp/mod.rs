@@ -240,6 +240,13 @@ pub(crate) struct CallFrame {
     /// The compiled unit the slots belong to; its `locals()` table names
     /// slot i.  `Rc` — one bump per call, taken on degrade.
     pub slot_table: Option<Rc<ByteCode>>,
+    /// The proc's compiled-locals table, in slot mode and out of it
+    /// alike (it stays when the frame degrades).  It names the locals
+    /// tclsh's compiler gave a slot in its compiledLocals array: their
+    /// entry exists before the first `set` and after `unset`, and they
+    /// are listed before the locals made at run time.  `Rc` — one bump
+    /// per call.
+    pub compiled: Option<Rc<ByteCode>>,
     /// Deferred `tailcall` command, armed by the `tailcall` builtin and
     /// fired at frame exit — kept on the frame (not just the completion
     /// error) so a `catch` consuming the completion still lets it fire,
@@ -276,6 +283,14 @@ impl CallFrame {
             .locals()
             .iter()
             .position(|n| n == name)
+    }
+
+    /// Is `name` one of the proc's compiled locals (see
+    /// [`Self::compiled`])?  A linear scan, for the cold paths only.
+    pub(crate) fn is_compiled_local(&self, name: &str) -> bool {
+        self.compiled
+            .as_ref()
+            .is_some_and(|t| t.locals().iter().any(|l| l == name))
     }
 
     /// Current value of the named slot (`None` when unset or absent).
@@ -803,6 +818,13 @@ pub struct Interp {
     /// Eval-level aliases whose target was deleted (namespace removal):
     /// reads keep the redirect, writes error.
     pub(crate) dead_flat: Vec<String>,
+    /// Bare names of the :: table that hold no value but are there: a
+    /// trace was put on the variable, or a proc linked to it (`global x`,
+    /// `upvar #0 x y`).  tclsh keeps an undefined Var for each, and a
+    /// write to the bare name from inside a namespace body finds it — the
+    /// write lands on the global (and fires the trace) instead of making
+    /// the namespace's own variable.  See `Interp::global_entry_exists`.
+    pub(crate) phantom_globals: varmap::VarSet,
     /// Flat keys of variables a `variable` command declared at eval level
     /// (tclsh: the ns-eval varFrame holds a reference, so a namespace that
     /// deletes ITSELF leaves the declared variable readable for the rest
@@ -1144,6 +1166,7 @@ impl Interp {
             tier1_epoch: 0,
             flat_aliases: Vec::new(),
             dead_flat: Vec::new(),
+            phantom_globals: varmap::VarSet::default(),
             ns_variable_links: Vec::new(),
             ns_transient: Vec::new(),
             ns_eval_keep: Vec::new(),

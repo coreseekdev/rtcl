@@ -42,8 +42,17 @@ pub enum Error {
     /// `wrong # args: should be "cmd arg ..."` form (e.g. `if` clauses).
     WrongArgsMsg(String),
 
-    /// Variable not found
+    /// Variable not found: no table has an entry for the name.
     VarNotFound {
+        name: String,
+    },
+
+    /// A variable whose entry IS in its table but holds no value — a
+    /// traced one, the target of a link, a proc's compiled local before
+    /// its first `set` or after `unset`.  The message is the same as
+    /// [`Self::VarNotFound`]'s; tclsh found the Var, and says so in the
+    /// errorCode.
+    VarUndefined {
         name: String,
     },
 
@@ -201,6 +210,11 @@ impl Error {
     /// Create a variable not found error
     pub fn var_not_found(name: impl Into<String>) -> Self {
         Error::VarNotFound { name: name.into() }
+    }
+
+    /// See [`Error::VarUndefined`].
+    pub fn var_undefined(name: impl Into<String>) -> Self {
+        Error::VarUndefined { name: name.into() }
     }
 
     /// Create a type mismatch error
@@ -468,7 +482,7 @@ impl Error {
             Error::InvalidCommand { .. } => -2,
             Error::WrongNumArgs { .. } => -3,
             Error::WrongArgsMsg(_) => -3,
-            Error::VarNotFound { .. } => -4,
+            Error::VarNotFound { .. } | Error::VarUndefined { .. } => -4,
             Error::TypeMismatch { .. } => -5,
             Error::DivisionByZero => -6,
             Error::ControlFlow { kind, .. } => *kind as i32,
@@ -533,6 +547,9 @@ impl Error {
             Error::InvalidCommand { name } => {
                 format!("TCL LOOKUP COMMAND {}", crate::value::tcl_quote(name))
             }
+            // The message says "no such variable", but the entry is there:
+            // tclsh found the Var, which makes it a read, not a lookup.
+            Error::VarUndefined { .. } => "TCL READ VARNAME".to_string(),
             Error::VarNotFound { name } => {
                 // An element read of a wholly-missing array (`$zz(5)`)
                 // blames the base name: `TCL LOOKUP VARNAME zz`.
@@ -600,7 +617,7 @@ impl fmt::Display for Error {
                 }
             }
             Error::WrongArgsMsg(message) => write!(f, "{}", message),
-            Error::VarNotFound { name } => {
+            Error::VarNotFound { name } | Error::VarUndefined { name } => {
                 write!(f, "can't read \"{}\": no such variable", name)
             }
             Error::TypeMismatch { expected, actual } => {

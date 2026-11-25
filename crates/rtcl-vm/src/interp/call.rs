@@ -142,6 +142,7 @@ impl Interp {
                 has_aliased: false,
                 link_keys: Vec::new(),
                 slot_table: None,
+                compiled: None,
                 tailcall: None,
                 level0: Vec::new(),
                 ns_depth: 0,
@@ -219,7 +220,8 @@ impl Interp {
                         frame.link_keys.clear();
                         frame.has_aliased = false;
                     }
-                    frame.slot_table = Some(table);
+                    frame.slot_table = Some(Rc::clone(&table));
+                    frame.compiled = Some(table);
                     true
                 }
                 _ => {
@@ -231,6 +233,10 @@ impl Interp {
                         frame.link_keys.clear();
                     }
                     frame.slot_table = None;
+                    frame.compiled = match &def.compiled {
+                        Some(code) if !code.fallback => Some(Rc::clone(code)),
+                        _ => None,
+                    };
                     false
                 }
             };
@@ -802,6 +808,7 @@ impl Interp {
         popped.has_aliased = false;
         popped.link_keys.clear();
         popped.slot_table = None;
+        popped.compiled = None;
         // Kept (cleared, with capacity) — the pooled frame reuses the
         // buffer for its next invocation's `info level 0` words.
         popped.level0.clear();
@@ -1279,6 +1286,7 @@ impl Interp {
                 has_aliased: false,
                 link_keys: Vec::new(),
                 slot_table: None,
+                compiled: None,
                 tailcall: None,
                 level0: Vec::new(),
                 ns_depth: 0,
@@ -1305,12 +1313,17 @@ impl Interp {
                 let n = code.locals().len();
                 let frame = self.frames.last_mut().unwrap();
                 frame.slots.resize(n, Value::unset());
-                frame.slot_table = Some(table);
+                frame.slot_table = Some(Rc::clone(&table));
+                frame.compiled = Some(table);
                 true
             }
             _ => {
                 let frame = self.frames.last_mut().unwrap();
                 frame.slot_table = None;
+                frame.compiled = match &def.compiled {
+                    Some(code) if !code.fallback => Some(Rc::clone(code)),
+                    _ => None,
+                };
                 false
             }
         };
@@ -1628,6 +1641,7 @@ impl Interp {
         popped.has_aliased = false;
         popped.link_keys.clear();
         popped.slot_table = None;
+        popped.compiled = None;
         popped.level0.clear();
         if popped.tailcall.is_some() {
             popped.tailcall = None;

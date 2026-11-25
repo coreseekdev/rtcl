@@ -174,6 +174,10 @@ fn add_variable(interp: &mut Interp, rest: &[Value]) -> Result<Value> {
     } else {
         let key = interp.array_stamp_key(&name);
         interp.var_traces.entry(key).or_default().push(trace);
+        // The variable is in its table from now on, value or not (tclsh
+        // keeps the Var): a write to the bare name inside a namespace
+        // body lands on it.
+        interp.note_global_entry(&name);
     }
     Ok(Value::empty())
 }
@@ -206,6 +210,11 @@ fn remove_variable(interp: &mut Interp, rest: &[Value]) -> Result<Value> {
         let key = interp.array_stamp_key(&name);
         if let Some(v) = interp.var_traces.get_mut(&key) {
             remove_first_trace(v, &ops, &script);
+        }
+        // With its last trace gone, a variable that never had a value
+        // leaves the table again.
+        if !interp.var_traces.get(&key).is_some_and(|v| !v.is_empty()) {
+            interp.forget_global_entry(&name);
         }
     }
     Ok(Value::empty())

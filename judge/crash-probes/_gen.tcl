@@ -63,16 +63,14 @@ namespace eval ::refix {
         set block {}
         foreach line $lines {
             if {![llength $block]} {
-                if {[string match "chk *" $line]} {
-                    # `chk <tag> [T {script}] <want>`: the want is what
-                    # the script gives here.
-                    lassign [parts $line] tag call script
-                    set got [uplevel #0 "T $script"]
-                    lappend out "chk [list $tag] $call [list $got]"
+                if {[string match "source *" $line] || $line eq "" || [string match "#*" $line]} {
+                    # Copied, never run: the probe's own `source` line
+                    # would define the real `chk`.
+                    lappend out $line
                     continue
                 }
-                if {[string match "source *" $line] || $line eq "" || [string match "#*" $line]} {
-                    lappend out $line
+                if {[string match "chk *" $line] && [info complete $line]} {
+                    lappend out [checked $line]
                     continue
                 }
             }
@@ -80,8 +78,14 @@ namespace eval ::refix {
             if {![info complete [join $block \n]]} { continue }
             set body [join $block \n]
             set block {}
-            uplevel #0 $body
-            lappend out $body
+            if {[string match "chk *" $body]} {
+                # A check whose want runs over several lines (an
+                # errorInfo in it).
+                lappend out [checked $body]
+            } else {
+                uplevel #0 $body
+                lappend out $body
+            }
         }
         # Written through a sibling: a failure midway leaves the probe as
         # it was.
@@ -91,6 +95,14 @@ namespace eval ::refix {
         close $f
         file rename -force $tmp $probe
         puts "$probe: expected values rewritten from its own run under tclsh"
+    }
+
+    # `chk <tag> [T {script}] <want>`, with the want replaced by what the
+    # script gives here.
+    proc checked {line} {
+        lassign [parts $line] tag call script
+        set got [uplevel #0 "T $script"]
+        return "chk [list $tag] $call [list $got]"
     }
 }
 

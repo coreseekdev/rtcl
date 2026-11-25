@@ -648,16 +648,42 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // At the global level (no call frames) upvar still links two
     // variables — the link is an eval-level flat alias (var-3.10:
     // `namespace eval {} { variable bar 0; namespace eval foo { upvar
-    // bar bar } }` links foo::bar → bar).
-    if interp.frames.is_empty() {
+    // bar bar } }` links foo::bar → bar).  The scope is the innermost one
+    // without a proc variable frame — a body called from a proc too
+    // (`var_frame_idx`).
+    if interp.var_frame_idx().is_none() {
+        // The scope the level names: an open body's namespace, the global
+        // namespace — or a proc frame below the body.
+        let mut proc_target = false;
         let target_ns = match scope {
             TargetScope::Global | TargetScope::Bottom => "::".to_string(),
-            TargetScope::Idx(k) => interp.ns_stack[k].clone(),
+            TargetScope::Idx(k) => match upvar_target(interp, k) {
+                UpvarTarget::Frame(_) => {
+                    proc_target = true;
+                    "::".to_string()
+                }
+                UpvarTarget::GlobalNs => "::".to_string(),
+                UpvarTarget::Ns(ns) => ns.to_string(),
+            },
         };
         let mut i = start;
         while i + 1 < args.len() {
             let other_var = args[i].as_str();
             let local_var = args[i + 1].as_str();
+            // A link made from a namespace table cannot point at a
+            // procedure's variable: the variable dies with the proc's
+            // frame and the link would dangle.  A `::`-qualified name
+            // is a namespace's variable and links fine.
+            if proc_target && !other_var.starts_with("::") {
+                set_error_code(interp, "TCL UPVAR INVERTED");
+                return Err(Error::runtime(
+                    format!(
+                        "bad variable name \"{}\": can't create namespace variable that refers to procedure variable",
+                        local_var
+                    ),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
             let target_key = if target_ns == "::" {
                 // 根 ns 目标：同帧路径的规范化 + 死父 ns 检查（宿主 ns
                 // 按 tclsh 分段——尾 `::` 串 = 空名变量，宿主是 quals
@@ -701,6 +727,11 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(Error::Msg(
                     "can't upvar from variable to itself".to_string(),
                 ));
+            }
+            // The link puts its target in the table, value or not: a
+            // write to the bare name inside the body then finds it.
+            if target_ns == "::" {
+                interp.note_global_key(&target_key);
             }
             match interp
                 .flat_aliases
@@ -895,6 +926,10 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // frame's other slots keep their compiled fast path, and this
         // frame's own reads/writes of the alias re-resolve through the
         // upvar guards.
+        if let UpvarLink::Global(gname) = &link {
+            // The global has an entry from now on, value or not.
+            interp.note_global_key(gname);
+        }
         interp.degrade_frame_link(current_idx, &local_var, &link);
         let has_link = interp.frames[current_idx].upvars.contains_key(local_var.as_str());
         if !has_link
@@ -997,8 +1032,9 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Ok(Value::empty());
     }
 
-    // At global level, global is a no-op
-    if interp.frames.is_empty() {
+    // At global level, global is a no-op — inside a `namespace eval`
+    // body as well, called from a proc or not.
+    if interp.var_frame_idx().is_none() {
         return Ok(Value::empty());
     }
 
@@ -1026,6 +1062,8 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // re-resolve through the upvar guards, the way tclsh's linked
         // compiledLocal does.
         let glink = UpvarLink::Global(Rc::from(target.as_str()));
+        // The global has an entry from now on, value or not.
+        interp.note_global_key(&target);
         interp.degrade_frame_link(current_idx, &local, &glink);
         interp.frames[current_idx].upvars.insert(Rc::from(local.as_str()), glink);
         // The linked name lives in the proc's variable table (tclsh's

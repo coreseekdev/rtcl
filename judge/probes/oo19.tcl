@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行41：`puts \[list …\]` 方括号被反斜杠转义（笔误）→ puts 收到 9 个词 wrong # args，行42–56（K 类析构钉形）未跑
 # 1. memo hit path with variable declared
 oo::class create C {
     variable acc

@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行34解析：`t concat-brace-open {concat a {b{c}}` 外层大括号未闭合（missing close-brace），行35–37 未跑
 proc t {label script} { set c [catch {uplevel 1 $script} r]; puts "$label|$c|$r" }
 t idx-1plus1plus1 {string index abcdefgh 1+1+1}
 t idx-hexchain {string index abcdefgh 0x1+1}

@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行7（末行）解析：该行少写闭合 `}`（missing close-brace），末条检查从未打印
 proc t {e} {
     if {[catch {expr $e} m]} { puts "ERR <<$e>>\n   $m" } else { puts "OK  <<$e>>: $m" }
 }

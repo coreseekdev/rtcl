@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行23：ensemble -unknown 处理器返回的 "H:…" 被当命令名调用（invalid command name），L: 标记与行24 未跑
 namespace eval ns { namespace ensemble create -map {a a} -prefixes 0 }
 catch {ns zz} m; puts "A:$m"
 catch {ns a} m; puts "A2:$m"

@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行5解析：`t {…$foo(["abc{})}` 大括号失衡（missing close-brace），行6–9 未跑
 proc t {e} {
     if {[catch {expr $e} m]} { puts "ERR <<$e>>\n   $m" } else { puts "OK  <<$e>>: $m" }
 }

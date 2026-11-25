@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在末条检查行7：dict filter 的 script 体 `$v > 1 ? …` 按 Tcl 脚本求值（缺 expr{}）→ invalid command name "1"
 puts [dict map {k v} {a 1 b 2} {list $v $k}]
 puts [dict map {k v} {a 1 b 2} {list $k}]
 puts [dict map {k v} {a 1 b 2} {}]

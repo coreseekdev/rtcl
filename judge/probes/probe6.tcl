@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行10：`-failindex` 成功时不设变量，裸读 `$pos2` 报错（应 catch），行11–28 的 string 面未跑
 puts [info patchlevel]
 set ch [format %c 128336]
 puts "astral char len=[string length $ch] cp=[scan $ch %c]"

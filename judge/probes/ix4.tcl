@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行25解析：`t lst-dollar-brace {list {$a{b}}` 大括号未闭合（missing close-brace），行26 未跑
 proc t {label script} { set c [catch {uplevel 1 $script} r]; puts "$label|$c|$r" }
 t ov-4g {string index abcdefgh 4294967296}
 t ov-4gm {string index abcdefgh 4294967295}

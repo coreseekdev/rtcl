@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在末行19：`puts "R=[$__judge_r]"` 多一对括号把结果当命令调用（invalid command name "0 wolf {x Y read}"），R= 从未打印
 # case: trace-1.7 cmd=unset
 set __judge_c [catch {
     unset -nocomplain x

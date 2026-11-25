@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行7：`string match {a[} "a["` 残缺字符集报错，行8–13 未跑
 puts [string match {[a-z]*} "aa"]
 puts [string match {[a-z]*} "Ab"]
 puts [string match {[abc]x} "bx"]

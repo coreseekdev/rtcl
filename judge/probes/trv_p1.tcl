@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行11：`trace add variable x(0) write …` 而 x 是标量（can't trace "x(0)": variable isn't array），行12–16 未跑
 unset -nocomplain x
 trace add variable x write {traceTag 1}
 trace add variable x write traceProc

@@ -52,10 +52,6 @@ mod tty {
     }
 }
 
-fn exec_err(msg: std::io::Error) -> Error {
-    Error::runtime(msg.to_string(), ErrorCode::Io)
-}
-
 fn exec_err_str(msg: impl std::fmt::Display) -> Error {
     Error::runtime(msg.to_string(), ErrorCode::Io)
 }
@@ -431,20 +427,12 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut current_stage: Vec<&str> = Vec::new();
     let mut merge_stderr_in_pipe = false; // For "|&"
     let mut input_redirect: Option<InputRedirect> = None;
-    let mut output_redirect: Option<OutputRedirect> = None;
     let mut stderr_redirect: Option<StderrRedirect> = None;
     let mut background = false;
 
     // The redirections in command-line order: tclsh opens them before it
     // starts any process.
     let mut redirects: Vec<Redirect> = Vec::new();
-    let syntax_error = |interp: &mut Interp, token: &str| {
-        exec_usage_error(
-            interp,
-            format!("can't specify \"{}\" as last word in command", token),
-            "TCL OPERATION EXEC SYNTAX",
-        )
-    };
 
     while i < args.len() {
         let token = args[i].as_str();
@@ -493,7 +481,7 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
             };
             let append = op.starts_with(">>") || op == "2>>@" || op == ">>&@";
-            let mut to = |stream: Stream| Redirect {
+            let to = |stream: Stream| Redirect {
                 stream,
                 append,
                 target: Target::Channel(name.clone()),
@@ -505,12 +493,10 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 ">@" | ">>@" => {
                     redirects.push(to(Stream::Out));
-                    output_redirect = Some(OutputRedirect::Channel);
                 }
                 ">&@" | ">>&@" => {
                     redirects.push(to(Stream::Out));
                     redirects.push(to(Stream::Err));
-                    output_redirect = Some(OutputRedirect::Channel);
                     stderr_redirect = Some(StderrRedirect::Channel);
                 }
                 _ => {
@@ -562,23 +548,19 @@ pub fn cmd_exec(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             "<<" => input_redirect = Some(InputRedirect::String(target)),
             ">" => {
                 redirects.push(to(Stream::Out, false, &target));
-                output_redirect = Some(OutputRedirect::Truncate(target));
             }
             ">>" => {
                 redirects.push(to(Stream::Out, true, &target));
-                output_redirect = Some(OutputRedirect::Append(target));
             }
             // `>& file` / `>>& file`: stderr goes to the same file.
             ">&" => {
                 redirects.push(to(Stream::Out, false, &target));
                 redirects.push(to(Stream::Err, false, &target));
-                output_redirect = Some(OutputRedirect::Truncate(target.clone()));
                 stderr_redirect = Some(StderrRedirect::Truncate(target));
             }
             ">>&" => {
                 redirects.push(to(Stream::Out, true, &target));
                 redirects.push(to(Stream::Err, true, &target));
-                output_redirect = Some(OutputRedirect::Append(target.clone()));
                 stderr_redirect = Some(StderrRedirect::Append(target));
             }
             "2>" => {
@@ -905,11 +887,6 @@ enum InputRedirect {
 enum OutputRedirect {
     Truncate(String),
     Append(String),
-    /// `>@ chan` / `>>@ chan`: the channel's descriptor.  The child
-    /// writes where the channel would (`>>@` after what it holds — a
-    /// duplicate shares the file's position; tclsh 8.6.17 loses the
-    /// child's output on the `>>@` forms instead).
-    Channel,
 }
 
 enum StderrRedirect {
@@ -1143,11 +1120,9 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 let mode = match r {
                     OutputRedirect::Truncate(_) => FdMode::Write,
                     OutputRedirect::Append(_) => FdMode::Append,
-                    OutputRedirect::Channel => return Err(host_channel_redirect()),
                 };
                 let path = match r {
                     OutputRedirect::Truncate(p) | OutputRedirect::Append(p) => p,
-                    OutputRedirect::Channel => unreachable!("refused above"),
                 };
                 Some(host_open(fs, path, mode)?)
             } else {

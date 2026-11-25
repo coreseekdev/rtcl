@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行20解析：`t cx-invalid {concat a {b{c}}` 同上（missing close-brace），行21–31 未跑
 proc t {label script} { set c [catch {uplevel 1 $script} r]; puts "$label|$c|$r" }
 t n-008 {string index abcdefgh 008}
 t n-08 {string index abcdefgh 08}

@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在末行13：`info errorinfo` 两边都无此子命令（unknown subcommand "errorinfo"），errorInfo dump 未打印（前 12 行检查已打印）
 set L {}
 foreach i {1 2 3} {
     lappend L [expr {$i * 2}]

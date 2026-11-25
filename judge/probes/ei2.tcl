@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在末条检查行14：顶层 `info level 0` 报 bad level "0"（前段 B–H 已打印），F2 标记未打印
 namespace eval ee {
     puts "B:[info level 0]"
 }

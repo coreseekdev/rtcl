@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行3：`dict with d {error boom}` 体错误没 catch 直接杀死脚本（笔误），行4–10 未跑
 puts [catch {dict with nodict {zz}} m]; puts $m
 set d {a 1}
 dict with d {error boom}

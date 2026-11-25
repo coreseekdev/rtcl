@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行8：`switch a {a - - b …}` 7 元素不成对（extra switch pattern with no body），行9–11 的 errorInfo 钉形段未跑
 puts [switch abc a* {subst glob} abc {subst exact}]
 puts [catch {switch -glob x default {subst 1}} r]; puts $r
 puts [catch {switch -nocase x DEFAULT {subst 1}} r]; puts $r

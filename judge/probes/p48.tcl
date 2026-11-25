@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行35：`scan -12 {%2c%n} a b` 同 %c 带宽报错，行36–39 未跑（前 30 项检查已打印）
 proc t {fmt str} {
     set r [catch {scan $str $fmt} res]
     if {$r} { puts "$fmt|$str -> ERR $res" } else { puts "$fmt|$str -> $res" }

@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行35：同 p48 的 `scan … {%2c%n}` 报错（孪生文件），行36–39 未跑
 proc t {fmt str} {
     set r [catch {scan $str $fmt} res]
     if {$r} { puts "$fmt|$str -> ERR $res" } else { puts "$fmt|$str -> $res" }

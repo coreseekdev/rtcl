@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行22：裸 `export`（应为 namespace export）→ invalid command name "export"，行23–26 的 J–M 检查未跑
 namespace eval ns {
     namespace export x*
     proc x1 {} {}

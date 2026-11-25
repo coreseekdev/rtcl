@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行60：类定义脚本 method 定义挤同一行（wrong # args: should be "method name ?option? args body"），行61–65 未跑
 proc t {label script} { set c [catch {uplevel 1 $script} r]; puts "$label|$c|$r" }
 
 # constructor chain without next

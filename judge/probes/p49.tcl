@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行13：`scan abc {%*s} a` 报 variable is not assigned by any conversion specifiers，行14 未跑
 proc sh {s} { puts $s }
 set r [scan {a} {%[^b]%c} x y]; sh "hat: r=$r x=[info exists x] y=[info exists y]"
 set r [scan {aaa} {%2[^b]%c} x y]; sh "hat2: r=$r x=$x y=$y"

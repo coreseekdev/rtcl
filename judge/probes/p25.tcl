@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行7：`switch a {a - b -foo c {subst 3}}` 报错，行8–14 未跑
 puts [switch -exa Foo Foo {subst OK}]
 puts [catch {switch -q x a {subst 1}} m]; puts $m
 puts [catch {switch x} m]; puts $m

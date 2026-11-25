@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行2：顶层 `info level 0` 报 bad level "0"，行3–24 的检查全未跑
 # 1: info level 0 at global file scope
 puts "A:[info level 0]"
 # 2: inside ns eval braced script

@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行8：`scan abc {%2c%n} a b` %c 不许带宽（field width may not be specified in %c conversion），行9–19 未跑
 foreach f {{%} {%1$} {%1$d %2} {%5} {%ld} {%*} {%1$d %1$d} {%d } {%s %s} {x%o} {[} {[]} {[^]} {%[ab} {%hu d} {%2c} {%c2}} {
     set r [catch {scan abcdefgh $f v1 v2 v3} msg]
     set ec [catch {scan abcdefgh $f v1 v2 v3; set ec2 x} junk]

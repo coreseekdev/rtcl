@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：两边死在行96：类定义脚本里 constructor 与 method 挤同一行缺分隔（wrong # args: should be "constructor arguments body"），h3/h4 未跑
 proc t {label script} { set c [catch {uplevel 1 $script} r]; puts "$label|$c|$r" }
 
 t a1 {oo::object create o1}

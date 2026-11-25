@@ -1,3 +1,4 @@
+# 空转（T11b 普查 2026-11-26）：行3 `expr {3**268435455}` 两边都超 15s 挂死（超时），末行9 从未到达
 foreach e {268435456 268435455} {
     foreach b {3 0 1 -1 2} {
         if {[catch {expr {$b**$e}} r]} { puts "b=$b e=$e ERR: $r" } else { puts "b=$b e=$e OK: [string range $r 0 20]" }

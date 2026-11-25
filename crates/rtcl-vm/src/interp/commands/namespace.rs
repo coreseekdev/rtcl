@@ -312,18 +312,28 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // `info vars` lists linked variables — var-7.12's `{{}}`,
             // var-7.13's `:`): seed a placeholder when a copy exists to
             // mirror (an initial value, or the namespace variable is
-            // already set).  A bare declaration of a not-yet-set variable
-            // stays invisible (tclsh: `info exists` → 0).
+            // already set).  A bare declaration of a not-yet-set
+            // variable seeds no value (`info exists` → 0), but the link
+            // is a frame-table entry all the same — log it so the
+            // hash-order replay lists it.
             let seeded = match &init_value {
                 Some(val) => Some(val.clone()),
                 None => interp.globals.get(&*qualified).cloned(),
             };
-            if let Some(val) = seeded {
-                super::super::vars::frame_local_insert(
-                    &mut interp.frames[frame_idx],
-                    local_name,
-                    val,
-                );
+            match seeded {
+                Some(val) => {
+                    super::super::vars::frame_local_insert(
+                        &mut interp.frames[frame_idx],
+                        local_name.clone(),
+                        val,
+                    );
+                }
+                None => {
+                    super::super::vars::frame_log_link(
+                        &mut interp.frames[frame_idx],
+                        &local_name,
+                    );
+                }
             }
         }
     }

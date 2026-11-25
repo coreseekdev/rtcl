@@ -776,15 +776,6 @@ const INFO_CANONICAL_SUBCMDS: &[&str] = &[
     "sharedlibextension", "tclversion", "vars",
 ];
 
-/// Variable enumeration (`info vars/globals/locals`) lists variable names,
-/// not array elements: `set a(1) x` reports only `a` (tclsh 8.6.17).
-fn is_array_element_name(name: &str) -> bool {
-    name.rsplit("::")
-        .next()
-        .map(|last| last.contains('('))
-        .unwrap_or(false)
-}
-
 /// Resolve an `info` subcommand word: exact matches win (including the
 /// jimtflavored extras rtcl supports), otherwise a unique prefix of
 /// tclsh's canonical set resolves; anything else is tclsh's
@@ -895,7 +886,6 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             //   - inside a proc → the frame's table;
             //   - inside `namespace eval nn` → ::nn's table;
             //   - bare at global → ::'s table.
-            interp.degrade_frame_all();
             // Inside a `namespace eval` body there is no proc variable
             // frame, even when a proc called it: the body's tables are
             // listed (see `var_frame_idx`).
@@ -944,21 +934,15 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     }
                     table_ns = Some(target_ns);
                 }
-            } else if let Some(frame) = interp.var_frame() {
-                for k in frame.locals_order.iter() {
-                    if !frame.locals.contains_key(k) || is_array_element_name(k) {
-                        continue;
-                    }
-                    entries.push((k.clone(), k.clone()));
-                }
-                // `variable`/`global` links are link-only (no locals
-                // entry) but tclsh lists them while the target exists.
-                for name in frame.upvars.keys() {
-                    if !frame.locals.contains_key(&**name)
-                        && interp.get_var(name).is_ok()
-                    {
-                        entries.push((name.to_string(), name.to_string()));
-                    }
+            } else if interp.var_frame().is_some() {
+                // Compiled locals first (slot-table order, parameters
+                // first), then the frame's dynamic table in Tcl hash
+                // order; `global`/`upvar`/`variable` links are frame
+                // hash entries and list among the dynamic names (tclsh
+                // AppendLocals includeLinks=true).  Read straight off
+                // the slots — no degrade.
+                for name in interp.list_frame_locals(true) {
+                    entries.push((name.clone(), name));
                 }
             } else if let Some(pfx) = &ns_prefix {
                 // Namespace scope: that namespace's own table, then the
@@ -1289,49 +1273,21 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let pattern = if args.len() > 2 { Some(args[2].as_str()) } else { None };
-            // Slot-compiled frames enumerate through the name-keyed store
-            // (migrate first; later calls on the same frame skip through).
-            interp.degrade_frame_all();
-            if let Some(frame) = interp.var_frame() {
-                // Compiled procs keep locals in a linear array in table
-                // order (params first, then body locals) — `info locals`
-                // walks it in INSERTION order, not hash order.  A local
-                // made again after `unset` is in its old place, once (it
-                // was listed twice).
-                let mut seen: std::collections::HashSet<&str> =
-                    std::collections::HashSet::with_capacity(frame.locals.len());
-                // A live link (`upvar`, `global`, `variable`) is not a
-                // local of this frame (tclsh lists none of them here;
-                // `info vars` does).
-                let linked = |name: &str| {
-                    matches!(
-                        frame.upvars.get(name),
-                        Some(crate::interp::UpvarLink::Global(_))
-                            | Some(crate::interp::UpvarLink::Frame { .. })
-                    )
-                };
-                let names: Vec<String> = frame
-                    .locals_order
-                    .iter()
-                    .filter(|name| {
-                        frame.locals.contains_key(name.as_str())
-                            && !is_array_element_name(name)
-                            && !linked(name)
-                            && seen.insert(name.as_str())
-                    })
-                    .cloned()
-                    .collect();
-                let vars: Vec<Value> = names
-                    .into_iter()
-                    .filter(|name| {
-                        pattern.map(|p| super::super::glob_match(p, name)).unwrap_or(true)
-                    })
-                    .map(|name| Value::from_str(name.as_str()))
-                    .collect();
-                Ok(Value::from_list(&vars))
-            } else {
-                Ok(Value::from_str(""))
-            }
+            // tclsh's order (AppendLocals, includeLinks=false): the
+            // compiled locals first — in the slot table's order,
+            // parameters first — then the frame's dynamic table in Tcl
+            // hash order.  A link (`global`/`upvar`/`variable`) is not a
+            // local.  Read straight off the slots: the listing no longer
+            // degrades the frame to the name-keyed store.
+            let vars: Vec<Value> = interp
+                .list_frame_locals(false)
+                .into_iter()
+                .filter(|name| {
+                    pattern.map(|p| super::super::glob_match(p, name)).unwrap_or(true)
+                })
+                .map(|name| Value::from_str(&name))
+                .collect();
+            Ok(Value::from_list(&vars))
         }
         #[cfg(feature = "std")]
         "channels" => {
@@ -1488,15 +1444,11 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 depth - 1
             };
-            // Slot-compiled frames report locals through the name-keyed
-            // store — migrate the target frame first (any level).
-            interp.degrade_frame_all_at(level);
-            let vars: Vec<String> = if let Some(frame) = interp.frames.get(level) {
-                frame.locals.keys().cloned().collect()
-            } else {
-                Vec::new()
-            };
-            let var_list = vars.join(" ");
+            // Frame locals in tclsh order (compiled table first, then
+            // the hash-order dynamic names; links included), read
+            // straight off the slots — the listing no longer degrades
+            // the target frame.
+            let var_list = interp.list_frame_locals_at(level, true).join(" ");
             let result = format!("type proc level {} cmd {{}} locals {{{}}}", level, var_list);
             Ok(Value::from_str(&result))
         }

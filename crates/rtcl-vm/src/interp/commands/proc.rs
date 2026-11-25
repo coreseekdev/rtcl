@@ -920,24 +920,21 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
         // An existing local that is not itself an alias blocks the link;
         // replacing an existing alias is silent (upvar-6.1 re-links `x`
-        // once per loop iteration).  The alias name leaves the slot model
-        // first (links and slot cells don't alias; the exists check and
-        // every later write go through the map) — link-only aliasing: the
-        // frame's other slots keep their compiled fast path, and this
-        // frame's own reads/writes of the alias re-resolve through the
-        // upvar guards.
-        if let UpvarLink::Global(gname) = &link {
-            // The global has an entry from now on, value or not.
-            interp.note_global_key(gname);
-        }
-        interp.degrade_frame_link(current_idx, &local_var, &link);
+        // once per loop iteration).  Existence spans every store: the
+        // name-keyed map, an array container, and a defined slot (a
+        // `set x` before `global x` errors, tclsh TclPtrObjMakeUpvarIdx
+        // "variable already exists" — an undefined slot links fine).
+        // Checked BEFORE the link aliases the slot, so the error leaves
+        // the variable as it was.  The alias name leaves the slot model
+        // after the check (links and slot cells don't alias) —
+        // link-only aliasing: the frame's other slots keep their
+        // compiled fast path, and this frame's own reads/writes of the
+        // alias re-resolve through the upvar guards.
         let has_link = interp.frames[current_idx].upvars.contains_key(local_var.as_str());
         if !has_link
             && (interp.frames[current_idx].locals.contains_key(&local_var)
-                || interp
-                    .frames[current_idx]
-                    .array_locals
-                    .contains(&local_var))
+                || interp.frames[current_idx].array_locals.contains(&local_var)
+                || interp.frames[current_idx].slot_value(&local_var).is_some())
         {
             set_error_code(interp, "TCL UPVAR EXISTS");
             return Err(Error::Msg(format!(
@@ -945,6 +942,11 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 local_var
             )));
         }
+        if let UpvarLink::Global(gname) = &link {
+            // The global has an entry from now on, value or not.
+            interp.note_global_key(gname);
+        }
+        interp.degrade_frame_link(current_idx, &local_var, &link);
 
         interp.frames[current_idx]
             .upvars
@@ -974,9 +976,17 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             UpvarLink::Dead { .. } => None,
         };
         if let Some(v) = mirror {
-            super::super::vars::frame_local_insert(&mut interp.frames[current_idx], local_var, v);
+            super::super::vars::frame_local_insert(
+                &mut interp.frames[current_idx],
+                local_var.clone(),
+                v,
+            );
         } else {
             interp.frames[current_idx].locals.remove(&local_var);
+            // Nothing to mirror, but the link is a frame-table entry all
+            // the same (tclsh: `upvar #0 alsomissing y; info vars` lists
+            // y): log its creation for the hash-order replay.
+            super::super::vars::frame_log_link(&mut interp.frames[current_idx], &local_var);
         }
         i += 2;
     }
@@ -1062,16 +1072,45 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // re-resolve through the upvar guards, the way tclsh's linked
         // compiledLocal does.
         let glink = UpvarLink::Global(Rc::from(target.as_str()));
+        // A defined local (map entry, array container, or a defined
+        // slot — the compiler registers `global` names as locals, so a
+        // preceding `set x` lands in the slot) blocks the link, exactly
+        // like `upvar` (tclsh TclPtrObjMakeUpvarIdx "variable already
+        // exists").  Checked before the alias touches the slot.
+        let has_link = interp.frames[current_idx].upvars.contains_key(local.as_str());
+        if !has_link
+            && (interp.frames[current_idx].locals.contains_key(&local)
+                || interp.frames[current_idx].array_locals.contains(&local)
+                || interp.frames[current_idx].slot_value(&local).is_some())
+        {
+            set_error_code(interp, "TCL UPVAR EXISTS");
+            return Err(Error::Msg(format!(
+                "variable \"{}\" already exists",
+                local
+            )));
+        }
         // The global has an entry from now on, value or not.
         interp.note_global_key(&target);
         interp.degrade_frame_link(current_idx, &local, &glink);
         interp.frames[current_idx].upvars.insert(Rc::from(local.as_str()), glink);
         // The linked name lives in the proc's variable table (tclsh's
         // `info vars` lists it) — mirror the current value when one
-        // exists; reads/writes still go through the link.
-        if let Some(v) = interp.globals.get(&target) {
-            let v = v.clone();
-            super::super::vars::frame_local_insert(&mut interp.frames[current_idx], local, v);
+        // exists; reads/writes still go through the link.  With no
+        // value to mirror the link is still a table entry: log its
+        // creation so the hash-order replay lists it (tclsh:
+        // `global nosuch; info vars` lists nosuch).
+        match interp.globals.get(&target) {
+            Some(v) => {
+                let v = v.clone();
+                super::super::vars::frame_local_insert(
+                    &mut interp.frames[current_idx],
+                    local.clone(),
+                    v,
+                );
+            }
+            None => {
+                super::super::vars::frame_log_link(&mut interp.frames[current_idx], &local);
+            }
         }
     }
 

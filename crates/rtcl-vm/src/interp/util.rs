@@ -39,6 +39,15 @@ pub(crate) fn strip_paren(name: &str) -> &str {
     }
 }
 
+/// Variable enumeration (`info vars/globals/locals`) lists variable names,
+/// not array elements: `set a(1) x` reports only `a` (tclsh 8.6.17).
+pub(crate) fn is_array_element_name(name: &str) -> bool {
+    name.rsplit("::")
+        .next()
+        .map(|last| last.contains('('))
+        .unwrap_or(false)
+}
+
 /// Does `name` contain a `::` namespace separator?  The variable and
 /// dispatch fast paths ask this about every short name ("n", "acc",
 /// "fib"); a two-byte window scan avoids `str::contains`' substring

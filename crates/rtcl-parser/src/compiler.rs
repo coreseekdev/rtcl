@@ -150,6 +150,24 @@ pub fn slot_candidate(name: &str) -> bool {
     !name.is_empty() && !name.contains('(') && !name.contains("::")
 }
 
+/// The tail name a `global`/`variable`/`upvar` word links under: the part
+/// after the last `::` run (tclsh `IndexTailVarIfKnown`), when the word is
+/// a plain literal — `None` for anything dynamic or empty-tailed.
+fn link_tail(word: &Word) -> Option<String> {
+    let Word::Literal(name) = word else {
+        return None;
+    };
+    let tail = match name.rfind("::") {
+        Some(i) => &name[i + 2..],
+        None => name.as_str(),
+    };
+    if slot_candidate(tail) {
+        Some(tail.to_string())
+    } else {
+        None
+    }
+}
+
 /// Split a var-list literal into its variable names, conservatively:
 /// plain whitespace-separated tokens, each free of the characters that
 /// would make whitespace splitting disagree with Tcl's list parser
@@ -420,6 +438,67 @@ impl Compiler {
                 // creation, dynamic var) falls back to dispatching the real
                 // command with the assembled arguments.
                 "lappend" if cmd.words.len() == 3 => return self.compile_lappend(cmd),
+                // `global`/`variable`/`upvar` register their link names as
+                // compiled locals (tclsh compiles these commands to
+                // NSUPVAR/VARIABLE/UPVAR slot ops via
+                // IndexTailVarIfKnown / TclLocalScalarFromToken): the link
+                // then lists at its source position in the compiled
+                // section, never in the hash section.  All-or-nothing per
+                // command — any dynamic or non-slot-eligible name and
+                // NOTHING registers (tclsh bails the compile, the runtime
+                // command's links become frame-table hash entries).
+                // Execution stays the dispatched builtin.
+                "global" if self.in_proc_body() => {
+                    let tails: Vec<Option<String>> =
+                        cmd.words[1..].iter().map(link_tail).collect();
+                    if tails.iter().all(|t| t.is_some()) {
+                        for t in tails.into_iter().flatten() {
+                            self.bytecode.add_local(&t);
+                        }
+                    }
+                    return self.compile_dyncall(cmd);
+                }
+                "variable" if self.in_proc_body() => {
+                    let names: Vec<&Word> =
+                        cmd.words[1..].iter().step_by(2).collect();
+                    let tails: Vec<Option<String>> =
+                        names.iter().map(|w| link_tail(w)).collect();
+                    if tails.iter().all(|t| t.is_some()) {
+                        for t in tails.into_iter().flatten() {
+                            self.bytecode.add_local(&t);
+                        }
+                    }
+                    return self.compile_dyncall(cmd);
+                }
+                "upvar" if self.in_proc_body() => {
+                    // `upvar ?level? other local ?other local ...?` — the
+                    // first word is a level when it reads as one (integer
+                    // or `#int`, tclsh TclObjGetFrame); the locals are
+                    // then every second word after it.
+                    let mut start = 1usize;
+                    if let Some(Word::Literal(w0)) = cmd.words.get(1) {
+                        let is_level = w0.parse::<i64>().is_ok()
+                            || w0.strip_prefix('#')
+                                .map(|r| r.parse::<i64>().is_ok())
+                                .unwrap_or(false);
+                        if is_level {
+                            start = 2;
+                        }
+                    }
+                    let locals: Vec<&Word> = cmd.words[start..]
+                        .iter()
+                        .skip(1)
+                        .step_by(2)
+                        .collect();
+                    let tails: Vec<Option<String>> =
+                        locals.iter().map(|w| link_tail(w)).collect();
+                    if tails.iter().all(|t| t.is_some()) {
+                        for t in tails.into_iter().flatten() {
+                            self.bytecode.add_local(&t);
+                        }
+                    }
+                    return self.compile_dyncall(cmd);
+                }
                 "expr" => return self.compile_expr(cmd),
                 "incr" if cmd.words.len() >= 2 => return self.compile_incr(cmd),
                 "break" if cmd.words.len() == 1 => {
@@ -644,12 +723,31 @@ impl Compiler {
     // Tier 1 — control-flow commands (native opcodes, inline bodies)
     // -----------------------------------------------------------------------
 
+    /// Is this a proc body (tclsh's `EnvIsProc`)?  The link commands'
+    /// compile-time local registration only happens here — at the top
+    /// level there is no frame to link into.
+    fn in_proc_body(&self) -> bool {
+        self.locals_mode && !self.toplevel_slots
+    }
+
     /// `set varName value`
     fn compile_set(&mut self, cmd: &Command) {
         let line = self.abs_line(cmd);
         if let Word::Literal(name) = &cmd.words[1] {
-            self.compile_word_spanned(&cmd.words[2], line, cmd, 2);
-            self.emit_var_store(name, line);
+            // The target's slot registers BEFORE the value words are
+            // compiled (tclsh PushVarNameWord order — `set q $zzr` puts
+            // q ahead of zzr in the compiled-locals table, the order
+            // `info locals` lists them in).
+            self.note_array_base(name);
+            if self.locals_mode && slot_candidate(name) {
+                let slot = self.bytecode.add_local(name);
+                self.compile_word_spanned(&cmd.words[2], line, cmd, 2);
+                self.bytecode.emit(OpCode::StoreLocal(slot), line);
+            } else {
+                self.compile_word_spanned(&cmd.words[2], line, cmd, 2);
+                let idx = self.bytecode.add_const(name);
+                self.bytecode.emit(OpCode::StoreVar(idx), line);
+            }
         } else {
             // Dynamic var name — dispatch the real `set`
             self.compile_dyncall(cmd);
@@ -1105,14 +1203,28 @@ impl Compiler {
             // [SubEnd, Incr*Stack] into the statement tail.
             if cmd.words.len() == 3 {
                 if let Word::CommandSub(script) = &cmd.words[2] {
+                    // The target's slot registers BEFORE the bracket's
+                    // locals compile (tclsh PushVarNameWord order —
+                    // `incr zzi [set zzj 5]` lists zzi ahead of zzj in
+                    // the compiled-locals table).  try_compile_sub
+                    // validates before emitting, so a false return
+                    // leaves only the registration: the DynCall
+                    // fallback's name-path ops consult the same slot.
+                    self.note_array_base(var_name);
+                    let slot = if self.locals_mode && slot_candidate(var_name) {
+                        Some(self.bytecode.add_local(var_name))
+                    } else {
+                        None
+                    };
                     if self.try_compile_sub(script, cmd, 2) {
-                        self.note_array_base(var_name);
-                        if self.locals_mode && slot_candidate(var_name) {
-                            let slot = self.bytecode.add_local(var_name);
-                            self.bytecode.emit(OpCode::IncrLocalStack(slot), line);
-                        } else {
-                            let name_idx = self.bytecode.add_const(var_name);
-                            self.bytecode.emit(OpCode::IncrVarStack(name_idx), line);
+                        match slot {
+                            Some(slot) => {
+                                self.bytecode.emit(OpCode::IncrLocalStack(slot), line);
+                            }
+                            None => {
+                                let name_idx = self.bytecode.add_const(var_name);
+                                self.bytecode.emit(OpCode::IncrVarStack(name_idx), line);
+                            }
                         }
                         return;
                     }

@@ -4631,10 +4631,15 @@ mod slot_locals_tests {
             "set g 10; proc p {} { global g; incr g; return $g }; p; set g",
             "11",
         );
-        // A global'd name that was already written compiled: the degrade
-        // migrates the prior slot value into the link-visible store.
+        // A global'd name that was already written compiled: tclsh
+        // errors (`global` on a defined local, TclPtrObjMakeUpvarIdx's
+        // "variable already exists"); the undefined slot still links.
         assert_both(
-            "proc p {} { set g2 3; global g2; return $g2 }; p",
+            "proc p {} { set g2 3; global g2 }; catch {p} m; set m",
+            "variable \"g2\" already exists",
+        );
+        assert_both(
+            "proc p {} { global g3; set g3 3; return $g3 }; p",
             "3",
         );
     }

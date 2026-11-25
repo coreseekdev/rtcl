@@ -7,6 +7,8 @@
 bash judge/audit-cases/rr.sh judge/audit-cases/<脚本>.tcl
 ```
 
+`big-unit.sh` 自己生成脚本再跑，单独执行。
+
 `rr.sh` 用四个解释器各跑一遍，每个一行：`86` 是系统的 tclsh 8.6.17，
 `91` 是仓内构建的 tclsh 9.1.0（`.refer/tcl910/inst/bin/tclsh9.1`，
 **现在的 oracle**），`vm` 是 rtcl 字节码引擎，`tree` 是
@@ -19,5 +21,6 @@ bash judge/audit-cases/rr.sh judge/audit-cases/<脚本>.tcl
 | `locals-order.tcl` | C42 的余项 | proc 里 `info locals`/`info vars` 的顺序。两个 tclsh 一致，rtcl 两个引擎各不相同 |
 | `var-errorcodes.tcl` | C50、C51 | 29 种变量读写失败的 errorCode。rtcl 只在 `incr-read-trace-fail`、`lappend-read-trace-fail`、`unset-trace-fail2` 上与两个 tclsh 不同 |
 | `bench-ns-body.tcl` | P16 | 命名空间体里 1500 万次裸名读写。整段墙钟时间：tclsh 2.6–3.5 秒，rtcl 约 40 秒 |
+| `big-unit.sh` | C55、P7 | 同一条出错的命令放在脚本末尾，一次在字节码上限以内（5000 个 `for`），一次在上限以外（12000 个）。上限以外的那次 rtcl 静默改走树引擎，errorInfo 比 tclsh 多一层 |
 
 改名或新增脚本时更新这张表；编号以审计文档为准。

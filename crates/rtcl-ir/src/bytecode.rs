@@ -113,6 +113,13 @@ pub struct ByteCode {
     ops: Vec<OpCode>,
     /// Local variable names (index = slot number).
     locals: Vec<String>,
+    /// `locals` by text → slot. The table used to be searched linearly
+    /// on every registration (`iter().position`), which made a unit with
+    /// many distinct locals quadratic to compile (16,000 `set kN 1`
+    /// lines: ~90% of the whole run in the scan + memcmp). Insert order
+    /// of `locals` (the slot numbering contract) is unchanged; the map
+    /// only mirrors it.
+    local_index: std::collections::HashMap<Box<str>, u16>,
     /// Source line corresponding to each instruction (parallel to `ops`).
     line_map: Vec<u32>,
     /// foreach/lmap loop shapes, referenced by the `Foreach*` ops.
@@ -173,6 +180,7 @@ impl Default for ByteCode {
             index_overflow: false,
             ops: Vec::new(),
             locals: Vec::new(),
+            local_index: std::collections::HashMap::new(),
             line_map: Vec::new(),
             foreach_infos: Vec::new(),
             sites: Vec::new(),
@@ -198,6 +206,7 @@ impl Clone for ByteCode {
             index_overflow: self.index_overflow,
             ops: self.ops.clone(),
             locals: self.locals.clone(),
+            local_index: self.local_index.clone(),
             line_map: self.line_map.clone(),
             foreach_infos: self.foreach_infos.clone(),
             sites: self.sites.clone(),
@@ -265,6 +274,7 @@ impl ByteCode {
         for s in &self.locals {
             n += s.len() + 24;
         }
+        n += self.local_index.len() * 48;
         n += self.ops.len() * std::mem::size_of::<OpCode>();
         n += self.line_map.len() * std::mem::size_of::<u32>();
         n += self.sites.len() * std::mem::size_of::<CmdSite>();
@@ -429,8 +439,8 @@ impl ByteCode {
     /// valid slot, and the unit never runs. (`idx as u16` used to wrap a
     /// 70,000th local onto slot 4464.)
     pub fn add_local(&mut self, name: &str) -> u16 {
-        if let Some(idx) = self.locals.iter().position(|n| n == name) {
-            return idx as u16;
+        if let Some(&idx) = self.local_index.get(name) {
+            return idx;
         }
         if self.locals.len() >= u32::from(u16::MAX) as usize {
             self.index_overflow = true;
@@ -438,12 +448,13 @@ impl ByteCode {
         }
         let idx = self.locals.len() as u16;
         self.locals.push(name.to_string());
+        self.local_index.insert(name.into(), idx);
         idx
     }
 
     /// Look up a local by name.
     pub fn find_local(&self, name: &str) -> Option<u16> {
-        self.locals.iter().position(|n| n == name).map(|i| i as u16)
+        self.local_index.get(name).copied()
     }
 
     /// Read-only view of local names.
@@ -552,7 +563,16 @@ impl ByteCode {
         // comparison `cont < pc` keeps its verdict (the head index is
         // exactly the consumed op's index minus one, and both sides shift
         // with the same compaction).
-        let mut retargets: Vec<(u32, u32)> = Vec::new();
+        // Retarget map: consumed window tail index → fused head index.
+        // A HashMap, not a Vec of pairs: the apply pass below matches
+        // every target-carrying op against it, and both sides grow with
+        // the unit — a Vec made the apply pass O(targets x retargets)
+        // (4.7% of a 5000-loop unit's compile; quadratic form). `from`
+        // values are distinct per round (one fusion per consumed index,
+        // `i` advances past each window), so map lookup ≡ the old
+        // single-pass sequential match.
+        let mut retargets: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::new();
         let mut changed = false;
         let mut i = 0;
         while i + 1 < len {
@@ -751,7 +771,7 @@ impl ByteCode {
                     }
                 }
                 (OpCode::Jump(t), OpCode::NextMark) if *t as usize == i + 1 => {
-                    retargets.push(((i + 1) as u32, i as u32));
+                    retargets.insert((i + 1) as u32, i as u32);
                     Some((OpCode::SwapToNextMark, 2))
                 }
                 // The body-mark folding requires the body entry to be a
@@ -767,7 +787,7 @@ impl ByteCode {
                             Some(OpCode::BodyMark | OpCode::BodyMarkFramed)
                         ) =>
                 {
-                    retargets.push(((i + 1) as u32, i as u32));
+                    retargets.insert((i + 1) as u32, i as u32);
                     Some((OpCode::ForeachNextClose(*info, *body + 1), 2))
                 }
                 (OpCode::NextMark, OpCode::BeginCmd(site)) if !targets[i + 1] => {
@@ -823,42 +843,32 @@ impl ByteCode {
                     // by invariant rather than by reachability).
                     | OpCode::ForNextIncrLocal(_, _, _, t)
                     | OpCode::ForNextIncrVar(_, _, _, t) => {
-                        for &(from, to) in &retargets {
-                            if *t == from {
-                                *t = to;
-                            }
+                        if let Some(&to) = retargets.get(&*t) {
+                            *t = to;
                         }
                     }
                     OpCode::LoopEnter { cont, brk } => {
                         for f in [cont, brk] {
-                            for &(from, to) in &retargets {
-                                if *f == from {
-                                    *f = to;
-                                }
+                            if let Some(&to) = retargets.get(&*f) {
+                                *f = to;
                             }
                         }
                     }
                     OpCode::ForeachStart { next, end, .. } => {
                         for f in [next, end] {
-                            for &(from, to) in &retargets {
-                                if *f == from {
-                                    *f = to;
-                                }
+                            if let Some(&to) = retargets.get(&*f) {
+                                *f = to;
                             }
                         }
                     }
                     OpCode::ForeachNext { body, .. } => {
-                        for &(from, to) in &retargets {
-                            if *body == from {
-                                *body = to;
-                            }
+                        if let Some(&to) = retargets.get(&*body) {
+                            *body = to;
                         }
                     }
                     OpCode::ForeachNextClose(_, body) => {
-                        for &(from, to) in &retargets {
-                            if *body == from {
-                                *body = to;
-                            }
+                        if let Some(&to) = retargets.get(&*body) {
+                            *body = to;
                         }
                     }
                     _ => {}

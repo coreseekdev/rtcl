@@ -6,13 +6,20 @@
 ## 项目概况
 
 rtcl 是浏览器可嵌入的 Tcl 解释器（Rust），主目标为 **WASM VM**，
-同时对齐 tclsh 8.6.17 语义。**当前状态：生产可用**（见
-`docs/PRODUCTION.md`）。
+对标 **Tcl 9.1**（oracle：tclsh 9.1.0，官方 release
+[core-9-1-0](https://github.com/tcltk/tcl/releases/tag/core-9-1-0)）。
+judge/probes/extract 的 oracle 已默认指向仓内构建的
+`.refer/tcl910/inst/bin/tclsh9.1`；`JUDGE_ORACLE=tclsh` 可指回系统
+8.6.17 跑历史基线。**当前状态**：judge 88/88 语料文件对 9.1.0 逐字节
+一致；探针 312/437（125 项 8.6→9.1 语义差 = 迁移面，见 TODO.md
+「对标迁移」）。生产可用基线（对 8.6.17 建立）见 `docs/PRODUCTION.md`。
 
 ### 关键事实（动手前必读）
-- **判官**：`judge/run.sh` — 87 语料文件、4067/4072 用例与 tclsh 8.6.17
-  **逐字节**比对（stdout + 退出码 + errorInfo/errorCode）。语料由
-  tclsh 官方测试套件机械提取（`judge/extract/`）。
+- **判官**：`judge/run.sh` — 88 语料文件与 oracle（默认 tclsh9.1 =
+  9.1.0；`JUDGE_ORACLE` 可覆盖）**逐字节**比对（stdout + 退出码 +
+  errorInfo/errorCode）。语料由 8.6.17 官方测试套件机械提取
+  （`judge/extract/`，case 级 4067/4072 基线是对 8.6.17 建立的），
+  期望运行期求值，对任意 oracle 可运行。
 - **双引擎**：字节码 VM（`vm_exec.rs`，主）+ 树遍历（`loops.rs`/
   `eval.rs` 等，回退 + `RTCL_NO_BYTECODE`）。两引擎必须逐字节一致 —
   `judge/sweep.sh` 是差分门槛（0 分歧）。
@@ -52,7 +59,8 @@ bash -c 'ulimit -v 8000000; /tmp/rtcl-master-wt/judge/sweep.sh'
 - **陈旧二进制假绿**：`grep -cE "^error"` 有匹配时退出码为 0，`&&` 链
   会带陈旧二进制继续过门（一个会话里中过三次）。构建后
   `ls -la target/release/rtcl` 看时间戳再信门。
-- **提交门槛**：judge 87/87 + sweep 0 + tests 1143/0 + wasm32 check
+- **提交门槛**：judge 88/88（对 9.1.0 oracle；8.6 历史基线用
+  `JUDGE_ORACLE=tclsh`）+ sweep 0 + tests 1143/0 + wasm32 check
   四门全绿；提交信息带 `Co-Authored-By: Claude Code <noreply@anthropic.com>`。
 - **崩溃门禁**：`bash judge/crash-gate.sh`——`judge/crash-probes/` 里每个
   探针钉住一个脚本可触发的崩溃/挂起/静默错误（记录见

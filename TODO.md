@@ -4,6 +4,166 @@
 > 一项，在此勾销并在 BASELINE 记录实证数字；每新增一项，先在 BASELINE
 > 补分析与方案再入列。条目按预期收益排序。
 
+## 对标迁移（Tcl 9.1，2026-11-25 起）
+
+> 实证底账（2026-11-25）：oracle 切到 9.1.0 后，judge **88/88** 全绿、
+> 探针 **312/437**（125 项 DIFF = 迁移面）、命令清单差 **17 缺 1 多**
+> （`case` 多）。以下按工作组拆解；每项标注探针证据（`judge/probes/`
+> 文件名）。权威变更清单：9.0 vs 8.6 见 `.refer/tcl910/tcl90-changes.md`
+> （内嵌 9.0.0 段），9.1 vs 9.0 见 `.refer/tcl910/tcl9.1.0/changes.md`。
+> 每完成一项：对应探针转绿 + `judge/run.sh`（9.1 oracle）保持 88/88。
+
+- [x] **oracle 切换 8.6.17 → 9.1.0（2026-11-25 完成）**：对标版本改为
+  Tcl 9.1（官方 release
+  [core-9-1-0](https://github.com/tcltk/tcl/releases/tag/core-9-1-0)）。
+  `judge/run.sh`/`judge/probes.sh`/`judge/extract/extract.py` 的 oracle
+  默认仓内构建 `.refer/tcl910/inst/bin/tclsh9.1`；`JUDGE_ORACLE=tclsh`
+  可指回 8.6.17。
+
+### T1 数字与表达式（~25 个探针，最大簇）
+
+- [ ] **数字字面量 9 语法**：`0oNNN` 八进制、`0dNNN` 强制十进制、
+  `0NNN` **不再八进制**（按十进制）、`N_NNN` 下划线分隔。覆盖 expr
+  判定与 `string is integer`（bn2/bn3/bn4、expr_lead1/expr_lead2、
+  s_probe、cmp_string_index、format_grammarF）。
+- [ ] **整数任意精度默认**：`incr`/`int()` 溢出不回绕不截断
+  （bnprobe2、incr_widen：up→`9223372036854775808`）。
+- [ ] **`format` 32 位截断规则**：`%b/%d/%o/%x/%u` 无 size 修饰符一律
+  截 32 位（9.0 明文；p44/p45/p48、format_grammarE），`%L` 不再截
+  64 位；size 修饰符 `j/q/z/t` 补齐（9.0.1 completed）。
+- [ ] **`scan` 同套 32 位截断**（p51、scan_consumption/scan_numeric/
+  scan_numeric2/scan_overflow/scan_validation）。
+- [ ] **`format` 杂项**：`%#o` → `0o` 前缀、`%#x` 零值 C99 行为
+  （format_grammarC）；`%c` 码点上限错误文案（format_grammarD）；语法
+  错误口径 `format string ended in middle of field specifier` + EC
+  `TCL FORMAT INCOMPLETE`（format_grammar8/G/J）。
+- [ ] **expr 错误消息 9 口径**：`cannot use <fp/non-numeric> value
+  "<值>" as left/right operand of "<op>"`（bn6/bn7/bn9/bn10/bn12/
+  bn13/bn14、numcmp1、verify、expr_bracket_top）；boolean 文案
+  `expected boolean value but got a list`（p32/p33）。
+- [ ] **expr 新比较符 `lt/gt/le/ge`**（字符串比较）+ expr 内注释
+  （p11/p13；9.0 新特性清单）。
+- [ ] **mathfunc C99 全集**：`acosh/asinh/atanh/cbrt/copysign/dim/erf/
+  erfc/exp2/expm1/fma/gamma/ldexp/lgamma/log1p/log2/logb/nextafter/
+  remainder/signbit/trunc` + `isinf/isnan/isnormal/issubnormal/
+  isunordered`（info4）；新命令 `fpclassify/divmod/frexp/modf/remquo`。
+- [ ] **`::tcl::mathop` 补 `lt/le/gt/ge`**（p40/dict_p40）。
+
+### T2 索引与 64 位容量（TIP 626）
+
+- [ ] **索引解析放宽**：`string index/range`/`lindex` 等接受 64 位与
+  超大整数索引（越界返回空而非 `bad index` 报错）+ bad index 文案
+  （ix1/ix2/ix3/ix4/ix5）。
+
+### T3 encoding / Unicode / 通道（~20 个探针）
+
+- [ ] **`-encoding binary` 移除**：报错文案 `unknown encoding "binary":
+  No longer supported. please use either "-translation binary" or
+  "-encoding iso8859-1"`（chan_copy_modes/chan_eofchar）；确认
+  `identity` encoding 同步移除。
+- [ ] **fconfigure 选项面**：`-profile`（默认 strict）+ `-stat` 进
+  选项清单；写通道 `-eofchar` 移除；`-eofchar` 错误文案 `must be
+  non-NUL ASCII character`（chan_io_p7/p8/p9/p16/p22）。
+- [ ] **`chan` 子命令面**：`chan isbinary`；`chan pending` wrong-args
+  文案（chan_io_p3/p4）。
+- [ ] **`chan names` 排序与通道命名计数**：标准通道优先排序；fileN
+  计数口径（chan_names_order、chan_io_p15/p17/p18/p20、chan_seek_tell）。
+- [ ] **errorCode 统一 `TCL VALUE NUMBER`**（rtcl 现发 `TCL VALUE
+  INTEGER`；chan_io_p11/p23、incr_window_p02/p07/p27、smallface d2、
+  v_err）。
+- [ ] **rtcl-unicode 数据升级 Unicode 18.0**（9.1 bundled；Adlam 等
+  新 script 的 digit 类，probe5/probe6）。
+- [ ] **`string is dict`** + 字符类清单与 `ambiguous class` 文案
+  （probe5/probe9）。
+- [ ] **`source` 默认 UTF-8**（9.0 国际化线；rtcl 读脚本编码路径核对）。
+
+### T4 命令清单（17 缺 + 移除项 + 子命令面）
+
+- [ ] **列表族**：`lpop`/`lremove`/`ledit`/`lseq`（注意 9.1 TIP 746
+  已去掉 expr 行为）/`lfilter`。
+- [ ] **dict**：`dict getdef`/`dict getwithdefault`（dict_p42、
+  smallface_p24）。
+- [ ] **array**：`array default`（会改变 `append`/`incr`/`lappend`
+  行为——单独钉语义）/`array for`。
+- [ ] **file**：`file home`/`file tempdir`/`file tildeexpand`；`~`
+  不再自动展开（9.0 不兼容，路径各命令核对）。
+- [ ] **const 族**：`const` + `info constant`/`info consts`；`info
+  commandtype`（cmdtype）；`info line`（c5_l2/sub_inline_semantics
+  清单核对）。
+- [ ] **协程**：`coroinject`/`coroprobe`（替代 `::tcl::unsupported::inject`）。
+- [ ] **时间**：`timer`（单调钟、微秒）/`timerate`。
+- [ ] **`unicode`**（normalize：`tonfc/tonfd/tonfkc/tonfkd`）。
+- [ ] **`zipfs`**。
+- [ ] **`switch -integer`**（p25，9.1 新增）。
+- [ ] **新选项线**（探针未覆盖，按 9.1 文档钉）：`regsub -command`、
+  `lsearch -stride`、`clock add weekdays`、`clock scan -validate`、
+  `socket -nodelay/-keepalive`、`vwait` 新选项、`chan configure
+  -inputmode`、`encoding user`、`exec -encoding`、`subst
+  -backslashes/-commands/-variables`（9.1）、`info loaded ?prefix?`。
+- [ ] **utility 族**：`readFile`/`writeFile`/`foreachLine`、
+  `tcl::process`、`tcl::idna`、`tcl::build-info`、`package files`
+  （info2/tclns 清单核对）。
+- [ ] **移除项**：`case` 命令、`puts`/`read` 旧变体语法、`trace
+  variable|vdelete|vinfo`（9.0 明确移除清单；rtcl 现仍暴露 `case`）。
+- [ ] **`::tcl::` 命名空间命令集**（tclns：9.1 有 27 个，rtcl 23——
+  `build-info`/`process`/`InitAutoPath` 等）+ `::tcl::pkgconfig` 键集
+  （`dllfile,runtime` 等，pkgconfig_probe）。
+
+### T5 namespace / 变量模型（9.0 不兼容核心）
+
+- [ ] **未限定变量名当前 ns 优先、不回退全局**（namespace_varmodel/
+  namespace_varmodel2）。
+- [ ] **全局初始变量集与 `info vars` 可见性**：9.1 下空 ns eval 的
+  `info vars` 不含 tcl_* 系统变量（q114b/u72/p-uplevel-ns/trv_p8）。
+- [ ] **`errorCode`/`errorInfo` 初始不预置**（ec2）。
+- [ ] **变量 unset 重建/链接帧语义**（vm3/incr_frame）。
+- [ ] **`upvar` bad level 口径**（upvar_levels）。
+- [ ] **expr 数组下标解析**：`$foo("x)` 报 `invalid character in
+  array index`（pidx/pidx3）。
+
+### T6 TclOO（9.0/9.1 OO 扩展）
+
+- [ ] **private variables/methods、class variables/methods、abstract/
+  singleton classes、properties**（oo21 的 property 配置选项
+  `-prepend/-remove/-appendifnew/-set/-append/-clear`）；`method
+  ?option?`（`-export` 等，oo8/oo_dbg1）。
+- [ ] **`oo::class`/`oo::object` 子命令清单**：`properties`/
+  `creationid`/`isa`/`vars`（oo5）。
+- [ ] **对象编号计数口径**（oo1/oo3/oo4/oo7/oo8/oo9：`::oo::Obj20`
+  vs rtcl `::oo::Obj11`——9.1 启动预建对象多）——裁定对齐计数或
+  探针豁免。
+- [ ] **OO 错误文案**：`method name ?option? args body` 等。
+
+### T7 内部口径 / unsupported（低优先级）
+
+- [ ] **`tcl::unsupported::assemble` 指令集对 9.1**（TIP 720：新增
+  `swap/isEmpty/strge/strgt/strle/strlt/jumpTableNum/dictGetDef/
+  dictPut/dictRemove/tclooId`，移除 `land/lor/lshift`；cmp_assemble/
+  unsupported_assemble）。
+- [ ] **errorstack 词法**：`invokeStk1`（return_decode_matrix）。
+- [ ] **`binary format` 浮点 Inf/NaN 位保真**（pbr5：`7f800000` vs
+  rtcl `7f7fffff` 饱和）。
+- [ ] **regexp 编译错误文案**：`cannot compile regular expression
+  pattern`（9.1 用 cannot；rtcl 用 couldn't；p6/v_re/utf_char_classes）。
+- [ ] **`tcl_library` 等系统变量值语义**（cmp_globals：9.1 为
+  zipfs 布局——裁定 rtcl 保持自有布局还是模拟 zipfs 值）。
+
+### T8 待复核定性（已全部复核，2026-11-25）
+
+- [x] objmech —— 输出一致，误报/瞬态，不入表。
+- [x] cmp_string_index —— `string is integer` 数字字面量口径，归 T1。
+- [x] s_probe —— `string is integer 08/0o` 判定，归 T1。
+
+### T9 语料与工具链（迁移收尾）
+
+- [ ] **语料从 9.1 官方测试套件重提取**：`judge/extract/extract.py`
+  （自检 oracle 已默认 tclsh9.1），提取源指到 9.1.0 的 `tests/`
+  （zip 里已有），重跑提取重建 case 级 burndown。
+- [ ] **bench 基线对 tclsh 9.1 重测**（性能参照换版后 0.6-2.26× 数字
+  全部重标）。
+- [ ] **迁移完成后**：docs/PRODUCTION.md 差异分析改写为对 9.1；
+  `JUDGE_ORACLE=tclsh` 保留为 8.6 历史基线入口。
+
 ## 性能优化（剩余杠杆）
 
 - [x] **name-keyed 超指令（Round G，本批次提交）**：全局/eval 级循环的

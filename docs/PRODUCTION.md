@@ -1,5 +1,13 @@
 # rtcl 生产就绪状态 (2026-10-07)
 
+> **2026-11-25 对标更新**：项目对标版本由 tclsh 8.6.17 改为 **Tcl
+> 9.1.0**（官方 release [core-9-1-0](https://github.com/tcltk/tcl/releases/tag/core-9-1-0)，
+> 参考源码与本地构建见 `.refer/tcl910/`），judge/probes/extract 的
+> oracle 已切换（`JUDGE_ORACLE=tclsh` 可指回 8.6.17）。**实测**：judge
+> 88/88 语料文件对 9.1.0 逐字节一致；探针档案 312/437——125 项
+> 8.6→9.1 语义差是迁移面（见 TODO.md「对标迁移」）。本文余下的差异
+> 分析与判定数字是对历史 oracle tclsh 8.6.17 建立的事实记录。
+
 **判定：生产可用** — 浏览器 WASM VM 场景为主目标的嵌入式 Tcl 解释器。
 本文件整理与标准 tclsh 8.6.17 的差异分析、性能定位与部署状态。
 优化台账（含全部事故与方案）见 `bench/BASELINE.md`；架构综述见

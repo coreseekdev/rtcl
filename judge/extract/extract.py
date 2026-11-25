@@ -30,6 +30,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 TESTS = os.path.join(ROOT, ".refer", "tcl", "tests")
 OUT = os.path.join(ROOT, "judge", "corpus", "gen")
 STATS = os.path.join(ROOT, "judge", "extract", "stats.json")
+# 提取自检 oracle（2026-11-25 起默认 9.1.0）；JUDGE_ORACLE 可覆盖。
+ORACLE = os.environ.get("JUDGE_ORACLE") or os.path.join(
+    ROOT, ".refer", "tcl910", "inst", "bin", "tclsh9.1")
 
 # ---------------------------------------------------------------- tokenizer
 
@@ -359,7 +362,7 @@ def emit_file(cases):
     return "\n".join(out) + "\n"
 
 def run_oracle(path):
-    p = subprocess.run(["tclsh", path], capture_output=True)
+    p = subprocess.run([ORACLE, path], capture_output=True)
     out = p.stdout.decode("utf-8", errors="surrogateescape")
     return p.returncode, out.split("\n")
 

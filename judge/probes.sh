@@ -18,8 +18,11 @@ set -u
 cd "$(dirname "$0")/.."
 
 RTCL=./target/release/rtcl
-ORACLE=tclsh
+# oracle 迁移到 Tcl 9.1（2026-11-25）；JUDGE_ORACLE=tclsh 可指回 8.6.17。
+ORACLE="${JUDGE_ORACLE:-$PWD/.refer/tcl910/inst/bin/tclsh9.1}"
 [ ! -x "$RTCL" ] && { echo "probes: $RTCL not found; cargo build --release first" >&2; exit 2; }
+[ -x "$ORACLE" ] || ORACLE="$(command -v -- "$ORACLE" 2>/dev/null || true)"
+[ -z "$ORACLE" ] || [ ! -x "$ORACLE" ] && { echo "probes: oracle not found (JUDGE_ORACLE=${JUDGE_ORACLE:-<default>}); build .refer/tcl910 or set JUDGE_ORACLE" >&2; exit 2; }
 
 run_one() {
     local f=$1

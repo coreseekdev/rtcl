@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# judge: tclsh vs rtcl parity harness
+# judge: tclsh (oracle) vs rtcl parity harness
 #
 # Runs every script in judge/corpus/ under both tclsh (oracle) and rtcl,
 # then byte-diffs stdout + exit code. Exit 0 iff all scripts match.
+#
+# Oracle 是 Tcl 9.1（2026-11-25 起，对标 release core-9-1-0）：默认用
+# 仓内构建的 .refer/tcl910/inst/bin/tclsh9.1；JUDGE_ORACLE=tclsh 可指
+# 回系统 8.6.17 跑历史基线。语料本身提取自 8.6.17 官方测试套件，对
+# 任意 oracle 都可运行（期望在脚本内运行期求值）。
 #
 # Usage:
 #   judge/run.sh                 # full run, prints burndown table
@@ -19,7 +24,7 @@ cd "$(dirname "$0")/.."
 
 RTCL=./target/release/rtcl
 JITSH=./target/release/jitsh
-ORACLE=tclsh
+ORACLE="${JUDGE_ORACLE:-$PWD/.refer/tcl910/inst/bin/tclsh9.1}"
 VERBOSE=0
 ENGINE=interp
 if [ "${1:-}" = "--engine" ] && [ "${2:-}" = "jit" ]; then
@@ -30,6 +35,13 @@ fi
 
 if [ ! -x "$RTCL" ]; then
     echo "judge: $RTCL not found; run 'cargo build --release -p rtcl-cli' first" >&2
+    exit 2
+fi
+if [ ! -x "$ORACLE" ]; then
+    ORACLE="$(command -v -- "$ORACLE" 2>/dev/null || true)"
+fi
+if [ -z "$ORACLE" ] || [ ! -x "$ORACLE" ]; then
+    echo "judge: oracle not found (JUDGE_ORACLE=${JUDGE_ORACLE:-<default>}); build .refer/tcl910 or set JUDGE_ORACLE" >&2
     exit 2
 fi
 if [ "$ENGINE" = jit ] && [ ! -x "$JITSH" ]; then

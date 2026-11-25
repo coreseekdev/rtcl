@@ -1,14 +1,20 @@
 # rtcl — 浏览器可嵌入的 Tcl 解释器（Rust）
 
 轻量、跨平台的 Tcl 兼容解释器，主目标为 **浏览器 WASM VM**，同时覆盖
-原生嵌入式场景。与 tclsh 8.6.17 逐字节对齐（4067/4072 官方测试用例），
-性能关键路径已达到或超过 tclsh。生产就绪状态见
-[docs/PRODUCTION.md](docs/PRODUCTION.md)。
+原生嵌入式场景。**对标 Tcl 9.1**（oracle：tclsh 9.1.0，官方 release
+[core-9-1-0](https://github.com/tcltk/tcl/releases/tag/core-9-1-0)，
+参考源码与本地构建见 `.refer/tcl910/`）：判官 88/88 语料文件对 9.1.0
+逐字节一致；探针档案 312/437——125 项 8.6→9.1 语义差是迁移面（见
+TODO.md「对标迁移」）。历史 case 级基线 4067/4072 是对 tclsh 8.6.17
+建立的（`JUDGE_ORACLE=tclsh` 可复跑）。性能关键路径已达到或超过
+tclsh。生产就绪状态见 [docs/PRODUCTION.md](docs/PRODUCTION.md)。
 
 ## 特性
 
-- **Tcl 8.6 兼容**：37 个语料文件 + 4072 个官方测试提取用例逐字节判定；
-  语义全集含 namespace、TclOO、dict、expr 宽化、channel 等
+- **对标 Tcl 9.1（core-9-1-0）**：judge 88/88 语料文件对 tclsh 9.1.0
+  逐字节一致（语料提取自 8.6.17 官方测试套件，期望运行期求值）；
+  语义全集含 namespace、TclOO、dict、expr 宽化、channel 等；
+  探针级 125 项 9.1 语义差迁移中
 - **双引擎**：字节码 VM（主）+ 树遍历（语义回退），`judge/sweep.sh`
   双引擎差分 0 分歧
 - **WASM 主目标**：wasm-bindgen 绑定（exec / JS 命令注册 / puts 路由 /
@@ -156,7 +162,8 @@ tclsh 约 996——超限同样报 `too many nested evaluations`，不是崩溃�
 - 宽表编码优先用 Tcl `.enc` 表后端（与 tclsh 同一批文件：`encoding
   dirs` 默认 `$TCL_LIBRARY/encoding` 或 `/usr/share/tcltk/tcl8.6/encoding`；
   S/D/M/E 四种格式全支持，含 iso2022-*），表不可用时才回退 iconv/
-  字节直映。
+  字节直映。Tcl 9.1 的 `.enc` 文件仍在 `tcl_library/encoding`（格式未
+  变），默认路径随 9.1 对齐迁移一并切换。
 - `libc` 依赖只在 unix 且 `clock` 开启时引入；iconv 后端仅在
   `cfg(all(unix, feature = "iconv"))` 下编译（wasm 天然关闭）。
 - wasm32 构建（rtcl-wasm）用 `default-features = false` 的安全子集，

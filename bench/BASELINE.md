@@ -2681,3 +2681,23 @@ dict getdef（rtcl 多出的 8.7 特性）/errorstack+errorline+options 键序
   probes 315/122 不新增、quick-gates 全 rc=0、workspace exit 0。objsec 探针曾单轮
   123（墙钟秒数跨 1s 边界，负载 ~13 抖动；同二进制 3/3 复跑 MATCH + 修复前二进制
   复核 123 名单确认唯一波动）。
+
+## T3 info locals/vars 直列——降级税消除（task/t3 @ af0f95d，2026-11-26，子代理施工）
+
+- 语义：proc 里 `info locals`/`info vars`/`info frame` 改为按 tclsh 顺序直列
+  （编译段槽表序 + 哈希段 `tcl_order` 重放），`degrade_frame_all` 不再被列举
+  触发（函数成死代码，已删）。`rr.sh locals-order.tcl` 四方逐字节一致
+  （86=91=vm=tree）；另造 9 个对照脚本全对齐。
+- 连带语义修正（tclsh 钉形）：compile_set/compile_incr 目标槽先登记（原值词
+  先登记，编译段次序反）；`global`/`variable`/`upvar` 的字面参数按 tclsh 登记
+  为编译局部槽（NSUPVAR/VARIABLE/UPVAR 槽操作码，`info locals` 排除、`info
+  vars` 列）；`global`/`upvar` 对已有值局部报 `variable "x" already exists`。
+- 记档不修（边界）：unset-only/`catch {} var`/`dict set` 字面目标不登记编译
+  局部（需新编译形态）；append 未编译（T5 范围）。
+- 数字（bench/scripts/info_locals_bench.tcl，µs/iter，vs 39bf618）：
+  list 1.66→**0.52**（3.2×）；after（列举后槽热循环）9.44→**4.71**（2.0×，
+  ≈无列举底噪 4.53——降级税消除）；plain 4.60→4.53 不变。tclsh9.1 参照
+  list 0.17 / after 1.44 / plain 1.28。
+- 新增 `judge/crash-probes/d28_local_order.tcl`（两步流程生成），crash-gate
+  126→**128/128**。judge 88/88、sweep 12 既有名单不新增、probes fail=122
+  基线、workspace rc=0、vm-lib 两特性 rc=0。

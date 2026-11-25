@@ -483,7 +483,12 @@ judge/crash-probes/_gen.tcl <源> <探针>`，再同样加 `--refix <探针>`
 rtcl 两个引擎全过。注意这是 `judge/crash-probes/`，不是迁移清单里的
 `judge/probes/`。
 
-**T3 proc 里 `info locals`/`info vars`/`info frame` 的顺序（事务；编译
+**T3 proc 里 `info locals`/`info vars`/`info frame` 的顺序（✅ 2026-11-26 完成，
+task/t3 @ af0f95d；**四方逐字节一致、连带修正链接字面参数的编译局部登记与
+global/upvar 已有值报错、降级税消除（info locals 列举 3.2×、槽热循环 2.0×），
+记录见 bench/BASELINE.md 2026-11-26 T3 节；记档边界：unset-only/catch/dict set
+字面目标不登记，append 归 T5。**
+原任务书：**T3 proc 里 `info locals`/`info vars`/`info frame` 的顺序（事务；编译
 局部变量集合是否与 tclsh 相同要先核对）**
 复现 `judge/audit-cases/locals-order.tcl`：两个 tclsh 一致，rtcl 的
 两个引擎各不相同。tclsh 的顺序是先编译局部变量（按编译器给的槽位

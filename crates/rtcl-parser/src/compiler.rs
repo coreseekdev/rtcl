@@ -94,6 +94,43 @@ pub struct Compiler {
     /// 顶层/eval 单元恒空单——它们只在 epoch 0（遮蔽从未发生的世界）
     /// 通过消费门（gate: code.epoch == tier1_epoch）。
     skip_folds: Vec<String>,
+    /// 单元源码的前缀行号索引（编译入口一次 O(n)）：内联体的
+    /// `line_base` 重算从 O(off) 逐体重扫降到 O(log 行数) 查表。
+    /// `line_of` 与被替换的 `count_lines` 同值（见类型注释）——
+    /// 行号逐字节不变，只有扫描量变了。
+    line_index: LineIndex,
+}
+
+/// Unit source's line-start prefix index: byte offset of each 0-based
+/// line start (`starts[0] == 0`, `starts[k] == k-th `\n` position + 1`).
+///
+/// [`LineIndex::line_of`] reproduces the removed `count_lines(src, off)`
+/// (= newlines in `src[..off]`) exactly, for every `off <= src.len()` —
+/// it used to rescan the source prefix from byte 0 for every inlined
+/// body (`compile_body_inline`/`try_compile_sub`/`emit_sub`), making a
+/// unit with N bodies quadratic in source size to compile (perf:
+/// 5000 `for` x 2 bodies at 194KB = 85% of the whole run).
+struct LineIndex {
+    starts: Vec<u32>,
+}
+
+impl LineIndex {
+    fn build(src: &str) -> Self {
+        let mut starts = Vec::with_capacity(64);
+        starts.push(0u32);
+        for (i, &b) in src.as_bytes().iter().enumerate() {
+            if b == b'\n' {
+                starts.push(i as u32 + 1);
+            }
+        }
+        LineIndex { starts }
+    }
+
+    /// Newlines in `src[..off]` — the exact value `count_lines` returned.
+    fn line_of(&self, off: usize) -> u32 {
+        let off = u32::try_from(off).unwrap_or(u32::MAX);
+        self.starts.partition_point(|&s| s <= off) as u32 - 1
+    }
 }
 
 /// Nested `[...]` words one unit inlines before deeper ones fall back to
@@ -189,6 +226,7 @@ impl Compiler {
             locals_mode,
             toplevel_slots,
             skip_folds: skip_folds.to_vec(),
+            line_index: LineIndex::build(&source),
         };
         if locals_mode {
             // Track the slot-gate's param/table alignment here, where the
@@ -586,7 +624,7 @@ impl Compiler {
         //（嵌套独立单元继承的行上下文）两种语境都保持外层值——文件
         // 语境的嵌套体行号不随括号平移。
         if self.locals_mode && !self.toplevel_slots {
-            self.line_base = count_lines(&self.source, content_start as usize);
+            self.line_base = self.line_index.line_of(content_start as usize);
         }
         self.bytecode.emit(OpCode::SubMark, self.abs_line(cmd));
         if commands.is_empty() {
@@ -1286,7 +1324,7 @@ impl Compiler {
                             self.span_base + cmd.word_srcs[word_idx].start + 1;
                         let saved = (self.span_base, self.line_base, self.line_ctx);
                         self.span_base = body_start;
-                        self.line_base = count_lines(&self.source, body_start as usize);
+                        self.line_base = self.line_index.line_of(body_start as usize);
                         self.line_ctx = self.line_base;
                         self.compile_commands(&commands);
                         self.span_base = saved.0;
@@ -1394,7 +1432,7 @@ impl crate::expr_compile::ExprSink for Compiler {
         let saved = (self.span_base, self.line_base, self.line_ctx);
         self.span_base = abs_start;
         if self.locals_mode && !self.toplevel_slots {
-            self.line_base = count_lines(&self.source, abs_start as usize);
+            self.line_base = self.line_index.line_of(abs_start as usize);
         }
         self.bytecode.emit(OpCode::ExprMark, line);
         if commands.is_empty() {
@@ -1408,12 +1446,6 @@ impl crate::expr_compile::ExprSink for Compiler {
         self.line_ctx = saved.2;
         true
     }
-}
-
-/// Number of newlines before byte offset `off` — the 0-based index of the
-/// line holding `off` (Tcl lines are 1-based, so the line number is this + 1).
-fn count_lines(src: &str, off: usize) -> u32 {
-    src.as_bytes()[..off].iter().filter(|&&b| b == b'\n').count() as u32
 }
 
 // ---------------------------------------------------------------------------

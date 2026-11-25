@@ -2800,11 +2800,11 @@ fn op_cmp_vi_jump(
 }
 
 /// `lappend <name> <value>`'s shared body (the `LappendVar` arm and the
-/// `LappendVarVar` fusion): take → in-place append → store through
-/// `take_var_fast` (its own guards own traces/links/arrays/qualifiers), or
-/// the dispatched `cmd_lappend` with the assembled arguments for
-/// creation, strict parse and exact errors.  Returns the command's
-/// result — the caller pushes it or discards it.
+/// `LappendVarVar` fusion): the in-place append to the list the slot
+/// holds, through `var_slot_fast` (its own guards own
+/// traces/links/arrays/qualifiers), or the dispatched `cmd_lappend` with
+/// the assembled arguments for creation, strict parse and exact errors.
+/// Returns the command's result — the caller pushes it or discards it.
 #[inline]
 fn lappend_var_impl(
     interp: &mut Interp,
@@ -2813,17 +2813,11 @@ fn lappend_var_impl(
     value: Value,
 ) -> Result<Value> {
     let name = code.get_const(name_idx).unwrap_or("");
-    if let Some(mut v) = interp.take_var_fast(name) {
+    if let Some(v) = interp.var_slot_fast(name) {
         if let Some(items) = v.as_list_mut() {
             items.push(value);
-            let r = interp.set_var(name, v.clone());
-            // The take removed the variable; a failure here would silently
-            // drop it.  The guards (traces/links/arrays/qualifiers) make
-            // this unreachable — assert it stays that way.
-            debug_assert!(r.is_ok(), "lappend fast-path store failed for {name:?}");
-            return Ok(v);
+            return Ok(v.clone());
         }
-        interp.store_var(name, v);
     }
     let args = [
         Value::from_str("lappend"),
@@ -3356,8 +3350,8 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                     .unwrap_or_else(Value::empty);
                 st.stack.push(result);
             } else {
-                // 回落 = cmd_lappend 全语义（take_var_fast 全局直取 +
-                // set_var）——ts 激活时先全量同步（flush + invalidate）：
+                // 回落 = cmd_lappend 全语义（var_slot_fast 原地追加，
+                // 或 set_var）——ts 激活时先全量同步（flush + invalidate）：
                 // 槽 pending 值落全局（stale-base 写丢 lappend 的实证
                 // w2），失效后名路径纯全局运行。
                 if interp.top_slots.is_some() {
@@ -3377,11 +3371,11 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             }
         }
         OpCode::LappendVar(name_idx) => {
-            // Fast path: take -> append in place -> store (cmd_lappend's
+            // Fast path: append in place to the slot's list (cmd_lappend's
             // own fast body, minus the arg assembly + command prologue).
-            // take_var_fast owns every guard (traces, links, arrays, ns
-            // qualifiers); a non-list rep is restored and the full
-            // command runs (creation, strict parse, exact errors).
+            // var_slot_fast owns every guard (traces, links, arrays, ns
+            // qualifiers); anything else runs the full command (creation,
+            // strict parse, exact errors).
             let value = st.pop_val();
             let v = lappend_var_impl(interp, code, *name_idx, value)?;
             st.stack.push(v);

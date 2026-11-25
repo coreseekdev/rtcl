@@ -117,6 +117,21 @@ pub enum ControlFlow {
     Exit,
 }
 
+/// `TCL LOOKUP VARNAME <base>` for a `can't read "NAME"…` / `can't set
+/// "NAME"…` message: the name between the quotes, without an element
+/// part (`can't read "a(9)": no such variable` blames `a`).
+fn lookup_varname(message: &str) -> String {
+    match message.find('"') {
+        Some(q0) => {
+            let rest = &message[q0 + 1..];
+            let name = rest.split('"').next().unwrap_or(rest);
+            let base = name.split('(').next().unwrap_or(name);
+            format!("TCL LOOKUP VARNAME {}", base)
+        }
+        None => "NONE".to_string(),
+    }
+}
+
 impl Error {
     /// Create a syntax error
     pub fn syntax(msg: impl Into<String>, line: usize, col: usize) -> Self {
@@ -482,21 +497,38 @@ impl Error {
             Error::Runtime { message, .. } if message.starts_with("domain error") => {
                 "ARITH DOMAIN {domain error: argument not in valid range}".to_string()
             }
-            Error::Runtime { message, .. } if message.starts_with("can't read \"") => {
-                // tclsh read errors: a missing element in an existing
-                // array is bare `TCL READ VARNAME` (no name); a read
-                // against a non-array (`$b(0)`) or an array read as a
-                // scalar blames `TCL LOOKUP VARNAME` with the base name.
-                if message.contains("no such element in array") {
-                    "TCL READ VARNAME".to_string()
-                } else if let Some(q0) = message.find('"') {
-                    let rest = &message[q0 + 1..];
-                    let name = rest.split('"').next().unwrap_or(rest);
-                    let base = name.split('(').next().unwrap_or(name);
-                    format!("TCL LOOKUP VARNAME {}", base)
+            // tclsh's variable errors (tclVar.c): a variable that is not
+            // found, an array read as an element target (`$b(0)`), a
+            // dangling link or a missing namespace blame the base name —
+            // `TCL LOOKUP VARNAME <base>`; a variable that IS found but
+            // cannot be read or written (an array read as a scalar, a
+            // missing element, a trace that raised) is bare — `TCL READ
+            // VARNAME` / `TCL WRITE VARNAME`.  The write codes used to be
+            // left at whatever the previous error had put there.
+            Error::Runtime { message, .. }
+                if message.starts_with("can't read \"") && !message.contains("no such variable") =>
+            {
+                if message.ends_with(": variable isn't array") {
+                    lookup_varname(message)
                 } else {
-                    "NONE".to_string()
+                    "TCL READ VARNAME".to_string()
                 }
+            }
+            Error::Runtime { message, .. }
+                if message.starts_with("can't set \"")
+                    && !message.ends_with(": variable isn't array")
+                    && !message.ends_with(": parent namespace doesn't exist") =>
+            {
+                if message.ends_with(": upvar refers to element in deleted array") {
+                    "TCL LOOKUP ELEMENT".to_string()
+                } else if message.ends_with(": upvar refers to variable in deleted namespace") {
+                    lookup_varname(message)
+                } else {
+                    "TCL WRITE VARNAME".to_string()
+                }
+            }
+            Error::Runtime { message, .. } if message.starts_with("can't read \"") => {
+                lookup_varname(message)
             }
             Error::InvalidCommand { name } => {
                 format!("TCL LOOKUP COMMAND {}", crate::value::tcl_quote(name))

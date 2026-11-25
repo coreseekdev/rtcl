@@ -1605,21 +1605,40 @@ impl Interp {
         Ok(value)
     }
 
-    /// Take the variable's value out of its slot for in-place mutation
-    /// (tclsh: mutate the refcnt==1 object).  Returns `None` unless
-    /// every guard for the mutation fast path holds: unqualified scalar
-    /// name, no upvar/dead link, not an array, no variable traces
-    /// registered anywhere, and the variable currently exists.  The
-    /// caller MUST put a value back (e.g. via `set_var`, which fires the
-    /// write traces) before any user code runs — nothing observes the
-    /// empty window.
-    pub(crate) fn take_var_fast(&mut self, name: &str) -> Option<Value> {
+    /// The slot a change to the scalar `name` writes, for making the
+    /// change in place (tclsh: mutate the refcnt==1 object in the
+    /// variable's own table entry).  Returns `None` unless every guard
+    /// for the mutation fast path holds: unqualified scalar name, no
+    /// upvar/dead link, not an array, no variable traces registered
+    /// anywhere, and the variable currently exists.  Nothing is taken out
+    /// of a table — a value lifted out and put back used to leave a
+    /// second entry in the scope's insertion log, and a listing replays
+    /// a second entry as a variable made anew: it jumped to the head of
+    /// its bucket.
+    ///
+    /// The guards matter for more than speed: with a trace registered the
+    /// write has to fire it, and the callers fall back to the commands'
+    /// own paths, which go through `set_var`.
+    pub(crate) fn var_slot_fast(&mut self, name: &str) -> Option<&mut Value> {
         if has_ns_sep(name)
             || name.contains('(')
             || !self.var_traces.is_empty()
             || !self.dead_flat.is_empty()
         {
             return None;
+        }
+        // 顶层 slot 单元（C2'）：名路径——ts 权威。
+        if let Some(ts) = self.top_slots.as_mut() {
+            if self.frames.is_empty() && self.current_namespace.as_ref() == "::" {
+                if let Some(i) = ts.names.iter().position(|n| n == name) {
+                    if ts.aliased[i] {
+                        return None;
+                    }
+                    let cell = &mut ts.values[i];
+                    return if cell.is_unset() { None } else { Some(cell) };
+                }
+                // 非槽名 → 落下方全局路径
+            }
         }
         if let Some(frame) = self.frames.last_mut() {
             if !frame.upvars.is_empty() && frame.upvars.contains_key(name) {
@@ -1629,17 +1648,16 @@ impl Interp {
                 return None;
             }
             match frame.slot_index_of(name) {
-                // Slotted name: lift the value out of the cell; the caller
-                // puts the replacement back (slot-UNSET is the interim
-                // state, same as the map-remove window).
+                // Slotted name: the slot is the canonical store; an unset
+                // cell is the undefined variable.
                 Some(i) => {
                     let cell = frame.slots.get_mut(i)?;
                     if cell.is_unset() {
                         return None;
                     }
-                    Some(std::mem::replace(cell, Value::unset()))
+                    Some(cell)
                 }
-                None => frame.locals.remove(name),
+                None => frame.locals.get_mut(name),
             }
         } else {
             if self.current_namespace.as_ref() != "::"
@@ -1648,33 +1666,21 @@ impl Interp {
             {
                 return None;
             }
-            self.globals.remove(name)
+            self.globals.get_mut(name)
         }
     }
 
-    /// Take a value out of its store for in-place mutation when plain
-    /// frame-local travel won't do: the proc-level `variable` command
-    /// link (`UpvarLink::Global` — the alias a `variable` declaration
-    /// installs to the owning namespace's variable table), qualified
-    /// names (`::m …`), and bare/relative-qualified names at eval level
-    /// under the namespace's canonical write key.  Same contract and
-    /// guard spirit as `take_var_fast`: traces, dead links, element
-    /// names and array targets bail (the caller then takes the generic
-    /// path, which owns creations and every error text), and the caller
-    /// MUST put the value back with `set_var` on the ORIGINAL name —
-    /// which walks the same link/resolution — before any user code
-    /// runs.
+    /// [`Self::var_slot_fast`] where plain frame-local travel won't do:
+    /// the proc-level `variable` link (`UpvarLink::Global` — the alias a
+    /// `variable` declaration installs to the owning namespace's
+    /// variable), qualified names (`::m …`), and bare/relative-qualified
+    /// names at eval level under the namespace's canonical write key.
+    /// Same guards; nothing is taken out of a table (see
+    /// [`Self::var_slot_fast`]).
     ///
     /// The store keys here mirror `store_var`/`resolve_loc` exactly
-    /// (`redirect_flat` over the split/canonical forms), so the take and
-    /// the put-back can never have landed on different slots.
-    ///
-    /// `dict set`'s nested structural fast path uses this so
-    /// namespace/qualified model writers (`variable model`,
-    /// `dict set model …`; `dict set ::ui::model …`) stay O(1) per op
-    /// instead of paying the O(n) rebuild.  upvar-to-Frame and dead
-    /// links keep the old route.
-    pub(crate) fn take_var_fast_link(&mut self, name: &str) -> Option<Value> {
+    /// (`redirect_flat` over the split/canonical forms).
+    pub(crate) fn var_slot_fast_link(&mut self, name: &str) -> Option<&mut Value> {
         if name.contains('(')
             || !self.var_traces.is_empty()
             || !self.dead_flat.is_empty()
@@ -1684,20 +1690,17 @@ impl Interp {
 
         // (0) Leading-`::` names are frame-independent: even inside a
         //     proc they address the global table (resolve_loc's
-        //     split_global arm short-circuits the frame walk).  Same
-        //     key math, so take and put-back can't split.
+        //     split_global arm short-circuits the frame walk).
         if let Some(gname) = Self::split_global(name) {
             let key = gname;
-            if key.contains('(')
-                || (!self.arrays_env_only && self.array_globals.contains(key.as_str()))
-            {
+            if (!self.arrays_env_only && self.array_globals.contains(key.as_str())) {
                 return None;
             }
-            return self.globals.remove(key.as_str());
+            return self.globals.get_mut(key.as_str());
         }
 
         // (1) Proc level: only the `variable` command's namespace link.
-        //     Unlinked proc locals were handled by take_var_fast.
+        //     Unlinked proc locals are handled by var_slot_fast.
         if let Some(frame) = self.frames.last() {
             let target = match frame.upvars.get(name) {
                 Some(UpvarLink::Global(g)) => g.to_string(),
@@ -1705,42 +1708,87 @@ impl Interp {
             };
             // The link target is the owning namespace's qualified name;
             // keep the eval-level flat-alias redirect in step with
-            // resolve_var's read path (resolve_var: redirect_flat(gname)
-            // then globals).
+            // resolve_var's read path.
             let key = self.redirect_flat(target);
-            if key.contains('(')
-                || (!self.arrays_env_only && self.array_globals.contains(key.as_str()))
-            {
+            if (!self.arrays_env_only && self.array_globals.contains(key.as_str())) {
                 return None; // element/array target: scalar writes take the generic path
             }
             // Release the `variable` command's seeded local hold as well:
-            // the seed (namespace.rs `cmd_variable`) shares the same Value
-            // rep as the global, and leaving it in place pins the old rep
-            // so every in-place write COW-copies the whole dict (the
-            // O(n)-per-op hotspot in hot `variable`+`dict set` loops).
-            // Reads refresh from the global (resolve_var consults the
-            // global first); the seed only keeps a mid-proc-deleted
-            // namespace variable readable, and nothing observes the
-            // take→put window — the caller writes straight through with
-            // set_var on the original name before any user code can run.
+            // the seed shares the same Value rep as the global, and
+            // leaving it in place pins the old rep so every in-place
+            // write COW-copies the whole dict (the O(n)-per-op hotspot in
+            // hot `variable`+`dict set` loops).  Reads refresh from the
+            // global (resolve_var consults the global first); the seed
+            // only keeps a mid-proc-deleted namespace variable readable.
             if let Some(frame) = self.frames.last_mut() {
                 frame.locals.remove(name);
             }
-            return self.globals.remove(key.as_str());
+            return self.globals.get_mut(key.as_str());
         }
 
         // (2) Eval level: qualified (`::m`), relative-qualified (`sub::m`)
         //     and bare names all canonicalize to the namespace's
-        //     canonical WRITE key (store_var's eval arm: every write in a
-        //     namespace lands in that namespace's variable), through the
+        //     canonical WRITE key (store_var's eval arm), through the
         //     flat-alias redirect exactly as resolve_loc computes it.
         let key = self.redirect_flat(self.canonical_global(name));
-        if key.contains('(')
-            || (!self.arrays_env_only && self.array_globals.contains(key.as_str()))
-        {
+        if (!self.arrays_env_only && self.array_globals.contains(key.as_str())) {
             return None;
         }
-        self.globals.remove(key.as_str())
+        self.globals.get_mut(key.as_str())
+    }
+
+    /// Run `f` on the slot `dict set` changes in place — an ordinary
+    /// local or global, else through a `variable` link or a qualified
+    /// name (see [`Self::var_slot_fast`] and [`Self::var_slot_fast_link`])
+    /// — and return what it returned; `None` when no guard let the change
+    /// in place, or when `f` declined (it returns `None`).
+    pub(crate) fn with_dict_slot<R>(
+        &mut self,
+        name: &str,
+        f: impl FnOnce(&mut Value) -> Option<R>,
+    ) -> Option<R> {
+        let slot = self.var_slot_fast(name);
+        let slot = match slot {
+            Some(v) => v,
+            None => self.var_slot_fast_link(name)?,
+        };
+        f(slot)
+    }
+
+    /// The live keys of the :: table in Tcl hash-table order — bare
+    /// globals and namespace variables (`n::x`), array elements left out:
+    /// what `info globals` and `info vars` list from, and what the
+    /// element keys of an array ride along with.  The insertion log is
+    /// replayed keeping a key's LAST occurrence: in a Tcl hash table a
+    /// variable made again after a delete takes a new place (the head of
+    /// its bucket), unlike a plain re-set, which never touches the log.
+    pub(crate) fn global_var_order(&self) -> Vec<&str> {
+        let log = &self.var_order;
+        // An element key `n::a(k)` or `a(k)`: the array's name has a
+        // parenthesised tail.
+        let not_element = |k: &str| {
+            !k.rsplit("::").next().is_some_and(|last| last.contains('('))
+        };
+        if log.len() == self.globals.len() {
+            // No stale entry, so no duplicate either: the log is the table
+            // in insertion order, and no key needs a lookup.
+            return log
+                .iter()
+                .map(String::as_str)
+                .filter(|k| not_element(k))
+                .collect();
+        }
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(self.globals.len());
+        let mut order: Vec<&str> = Vec::with_capacity(self.globals.len());
+        for k in log.iter().rev() {
+            let k = k.as_str();
+            if not_element(k) && self.globals.contains_key(k) && seen.insert(k) {
+                order.push(k);
+            }
+        }
+        order.reverse();
+        order
     }
 
     /// `incr` fast path: read-modify-write an integer scalar in one slot
@@ -1838,60 +1886,7 @@ impl Interp {
     }
 
     fn incr_var_fast_impl(&mut self, name: &str, amount: i64) -> Option<Value> {
-        if has_ns_sep(name)
-            || name.contains('(')
-            || !self.var_traces.is_empty()
-            || !self.dead_flat.is_empty()
-        {
-            return None;
-        }
-        // 顶层 slot 单元（C2'）：名路径 incr——ts 权威 RMW。
-        if let Some(ts) = self.top_slots.as_mut() {
-            if self.frames.is_empty() && self.current_namespace.as_ref() == "::" {
-                if let Some(i) = ts.names.iter().position(|n| n == name) {
-                    if ts.aliased[i] {
-                        return None;
-                    }
-                    let cell = &mut ts.values[i];
-                    if cell.is_unset() {
-                        return None; // 真 incr 从 0 创建（cmd_incr → set_var ts 臂）
-                    }
-                    let current = cell.as_int()?;
-                    let next = current.checked_add(amount)?;
-                    cell.set_int_rep(next);
-                    return Some(cell.clone());
-                }
-                // 非槽名 → 落下方全局路径
-            }
-        }
-        let slot = if let Some(frame) = self.frames.last_mut() {
-            if !frame.upvars.is_empty() && frame.upvars.contains_key(name) {
-                return None;
-            }
-            if !frame.array_locals.is_empty() && frame.array_locals.contains(name) {
-                return None;
-            }
-            match frame.slot_index_of(name) {
-                // Slotted name: unset cell → the real `incr` creates it
-                // from 0 (its set_var consults the table again).
-                Some(i) => {
-                    let cell = frame.slots.get_mut(i)?;
-                    if cell.is_unset() {
-                        return None;
-                    }
-                    cell
-                }
-                None => frame.locals.get_mut(name)?,
-            }
-        } else {
-            if self.current_namespace.as_ref() != "::"
-                || !self.flat_aliases.is_empty()
-                || (!self.arrays_env_only && self.array_globals.contains(name))
-            {
-                return None;
-            }
-            self.globals.get_mut(name)?
-        };
+        let slot = self.var_slot_fast(name)?;
         let current = slot.as_int()?;
         // Overflow belongs to the real `incr` (ARITH IOVERFLOW error).
         let next = current.checked_add(amount)?;

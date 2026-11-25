@@ -817,6 +817,17 @@ impl Value {
             }))
     }
 
+    /// Create a value from an owned string — the buffer moves into the
+    /// value (`from_str` copies it).
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_string(s: String) -> Self {
+        Value::from_vptr(VPtr::new(ValueInner {
+                string: OnceCell::from(SmallVec::from_vec(s.into_bytes())),
+                rep: InternalRep::None,
+                rc: Cell::new(1),
+            }))
+    }
+
     /// Create a value from an integer
     pub fn from_int(n: i64) -> Self {
         // Immediate for the whole i63 range — clone/drop/compare without
@@ -1003,6 +1014,32 @@ impl Value {
         });
         // Safety: we always store valid UTF-8
         unsafe { core::str::from_utf8_unchecked(bytes) }
+    }
+
+    /// Append `text` to this value's string in place, and drop nothing
+    /// else: `false` when the value is anything but a plain string (an
+    /// integer, a list, …) or an immediate, and the caller must build the
+    /// new string some other way.  A value shared with other owners is
+    /// copied first, so the append never shows through to them (tclsh:
+    /// `Tcl_AppendToObj` on the variable's own object, a duplicate when
+    /// it is shared).  Appending in place is what keeps a loop of appends
+    /// linear: the variable's buffer grows instead of being rebuilt from
+    /// both halves on every call.
+    pub(crate) fn append_str_in_place(&mut self, text: &str) -> bool {
+        if self.is_imm() {
+            return false;
+        }
+        let inner = self.heap_make_mut();
+        if !matches!(inner.rep, InternalRep::None) {
+            return false;
+        }
+        // Materialised first: an empty string nobody has asked the bytes
+        // of has no buffer yet.
+        let _ = inner.string.get_or_init(SmallVec::new);
+        if let Some(bytes) = inner.string.get_mut() {
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        true
     }
 
     /// Ensure the string representation is materialized.
@@ -1468,7 +1505,7 @@ impl From<&str> for Value {
 
 impl From<String> for Value {
     fn from(s: String) -> Self {
-        Value::from_str(&s)
+        Value::from_string(s)
     }
 }
 

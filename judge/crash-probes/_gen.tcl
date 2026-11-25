@@ -15,6 +15,89 @@
 # so the head (what defect, what is left out and why) is written once.
 # The probe's own helpers (T, U, and P where a C check needs it) are
 # emitted after that head; see the d21 and d22 probes.
+#
+# A listing's order depends on how full the tables are, so a value
+# recorded while this script's helpers sit in the global table need not
+# hold in the probe, whose state is leaner.  After generating, run the
+# second mode: it writes every expected value over again from the probe's
+# OWN lines, run under a fresh tclsh —
+#   tclsh _gen.tcl --refix <probe.tcl>
+# Everything of this mode sits in its own namespace: nothing it keeps
+# may show up in a listing the probe asks for.
+namespace eval ::refix {
+    # The parts of a probe's check line: `chk`, then the tag, then the
+    # call `[T <script>]`, then the want.  The line is not a list (the
+    # call word has brackets in it).  The script is one word —
+    # brace-quoted, which `list` wrote balanced, or bare (`[T append]`).
+    proc parts {line} {
+        set t0 [string first "\[T " $line]
+        set b0 [expr {$t0 + 3}]
+        set n [string length $line]
+        if {[string index $line $b0] ne "\{"} {
+            set end [expr {[string first "\]" $line $b0] - 1}]
+        } else {
+            set depth 0
+            set i $b0
+            while {$i < $n} {
+                set c [string index $line $i]
+                if {$c eq "\\"} { incr i 2; continue }
+                if {$c eq "\{"} { incr depth }
+                if {$c eq "\}"} {
+                    incr depth -1
+                    if {$depth == 0} { break }
+                }
+                incr i
+            }
+            set end $i
+        }
+        set tag [lindex [string range $line 4 [expr {$t0 - 1}]] 0]
+        list $tag [string range $line $t0 [expr {$end + 1}]] \
+            [string range $line $b0 $end] [string range $line [expr {$end + 2}] end]
+    }
+
+    proc run {probe} {
+        set f [open $probe]
+        variable lines [split [read -nonewline $f] \n]
+        close $f
+        set out {}
+        set block {}
+        foreach line $lines {
+            if {![llength $block]} {
+                if {[string match "chk *" $line]} {
+                    # `chk <tag> [T {script}] <want>`: the want is what
+                    # the script gives here.
+                    lassign [parts $line] tag call script
+                    set got [uplevel #0 "T $script"]
+                    lappend out "chk [list $tag] $call [list $got]"
+                    continue
+                }
+                if {[string match "source *" $line] || $line eq "" || [string match "#*" $line]} {
+                    lappend out $line
+                    continue
+                }
+            }
+            lappend block $line
+            if {![info complete [join $block \n]]} { continue }
+            set body [join $block \n]
+            set block {}
+            uplevel #0 $body
+            lappend out $body
+        }
+        # Written through a sibling: a failure midway leaves the probe as
+        # it was.
+        set tmp "$probe.tmp"
+        set f [open $tmp w]
+        puts $f [join $out \n]
+        close $f
+        file rename -force $tmp $probe
+        puts "$probe: expected values rewritten from its own run under tclsh"
+    }
+}
+
+if {[lindex $argv 0] eq "--refix"} {
+    ::refix::run [file join [file dirname [info script]] [lindex $argv 1]]
+    exit 0
+}
 source [file join [file dirname [info script]] _chk.tcl]
 
 lassign $argv source_name probe_name

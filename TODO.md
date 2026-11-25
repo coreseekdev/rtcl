@@ -374,9 +374,21 @@ judge/sweep 同跑）。下面只列**结构**动作：按类别消除，而不�
     `regsub -all {}`）。
   - [x] P15 `string length`/`index`/`range`/`first`/`last`：24KB 的串上
     13–18µs → ≤1µs（探针 d25，209 条断言）。
-  - [ ] P3 `append`；数组读写；P7 编译期；P1/P9 通道缓冲读；P5
-    `array size`；C47 回引预算；P15 剩下的三处（`string last` 命中、
-    长模式未命中、非 ASCII 的字符计数）。
+  - [x] P3 `append`：proc 里 2 万次追加 49ms → 1.5ms（接到变量自己的
+    缓冲区上）；`lappend`、`dict set`、`incr` 的快路径同样改成就地改。
+    顺带修掉 C48（`unset` 后重建的全局变量在 `info globals` 里的位置）
+    和 C50（变量读写出错时的 errorCode）。探针 d26（79 条断言）。
+  - [ ] 数组读写；P7 编译期；P1/P9 通道缓冲读；P5 `array size`；C47
+    回引预算；P15 剩下的三处（`string last` 命中、长模式未命中、非
+    ASCII 的字符计数）。
+  - [ ] 这一批里对出来的新差异：
+    - [ ] C49：proc 里执行的 `namespace eval` 体读不到、写不进命名空间
+      的变量（两引擎）。常见写法（`variable x` 之后 `set x`）不触发。
+    - [ ] proc 里 `info locals` / `info vars` 的顺序：tclsh 是编译局部
+      变量在前、运行期建的在后并按哈希序，rtcl 按建名的先后；而且
+      每次调用都把整个帧降级成名键存储（之后这一帧都走慢路径）。
+    - [ ] C51：trace 与编译后的命令（`append` 每个值一次写 trace、读
+      trace 报错后 `incr`/`lappend` 的行为、`unset` trace 的 errorCode）。
 - [ ] **工具化防线**：`judge/crash-gate.sh` 入门禁（已入：原生 118 次
   运行、wasm `judge/crash-wasm.mjs` 52 项带 worker 看门狗）；**排查
   其余探针是否也在两个解释器上共同早退而空转**（`smallface_p24` 是）；`rtcl-vm` 开

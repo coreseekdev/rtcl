@@ -255,21 +255,23 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // `variable`, traced variables and arrays keep the
             // rebuilding path below — which owns the exact Tcl parse
             // errors ("missing value to go with key" et al.).
-            if let Some(mut v) = interp
-                .take_var_fast(var_name)
-                .or_else(|| interp.take_var_fast_link(var_name))
-            {
-                let keys: Vec<&str> = args[3..args.len() - 1]
-                    .iter()
-                    .map(|av| av.as_str())
-                    .collect();
-                if dict_set_inplace(&mut v, &keys, &args[args.len() - 1]) {
-                    return interp.set_var(var_name, v);
-                }
-                // Not every level is a dict rep: restore the taken value
-                // and rebuild through the slow path (parse_dict owns the
-                // same errors).
-                interp.store_var(var_name, v);
+            let updated = interp
+                .with_dict_slot(var_name, |v| {
+                    let keys: Vec<&str> = args[3..args.len() - 1]
+                        .iter()
+                        .map(|av| av.as_str())
+                        .collect();
+                    // Not every level is a dict rep: the variable is as it
+                    // was, and the rebuilding path parses its string (it
+                    // owns the same errors).
+                    Some(
+                        dict_set_inplace(v, &keys, &args[args.len() - 1])
+                            .then(|| v.clone()),
+                    )
+                })
+                .flatten();
+            if let Some(result) = updated {
+                return Ok(result);
             }
             let value = args[args.len() - 1].clone();
             let keys: Vec<&str> = args[3..args.len() - 1]
@@ -1564,7 +1566,7 @@ mod tests {
     #[test]
     fn test_dict_nested_set_via_variable_link() {
         // `variable m` inside a proc installs the namespace link; the
-        // in-place fast path follows it (take_var_fast_link, which also
+        // in-place fast path follows it (`var_slot_fast_link`, which also
         // drops the frame-local seed so the rep stays unshared): writes
         // land in the owning namespace's variable and reads refresh.
         // Output verified against tclsh 8.6.
@@ -1588,7 +1590,7 @@ mod tests {
     #[test]
     fn test_dict_nested_set_qualified_name() {
         // `dict set ::m …` inside a proc — the qualified name is
-        // frame-independent, so take_var_fast_link's split_global arm
+        // frame-independent, so `var_slot_fast_link`'s split_global arm
         // addresses the global store directly.  Output verified against
         // tclsh 8.6.
         let mut interp = Interp::new();

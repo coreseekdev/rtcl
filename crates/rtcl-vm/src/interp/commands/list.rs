@@ -267,26 +267,22 @@ pub fn cmd_lappend(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     let var_name = args[1].as_str();
     // Fast path: the variable already holds a list rep and every
-    // mutation guard holds — take the value out of its slot (sole
-    // owner), append in place through the COW rep, put it back.
-    // Amortised O(1); tclsh appends to the unshared list object the
-    // same way.  Creation, string-rep sources, links, arrays and
-    // traced variables keep the rebuilding path below.
+    // mutation guard holds (`var_slot_fast`: no link, array, trace or
+    // qualifier) — append in place to the list its slot holds, as tclsh
+    // appends to the unshared list object.  Amortised O(1), and nothing
+    // leaves a table (a value taken out and put back left a second entry
+    // in the insertion log, which moved the variable at the next
+    // listing).  Creation, string-rep sources, links, arrays and traced
+    // variables keep the rebuilding path below; so does a value that is
+    // not a list rep — the strict parse there owns its errors.
     if args.len() >= 3 {
-        // take_var_fast owns every guard (links, arrays, traces, ns
-        // qualifiers) and the old get_var pre-probe cost a full extra
-        // resolution per append; a non-list rep is restored and the slow
-        // path parses it, exactly as before.
-        if let Some(mut v) = interp.take_var_fast(var_name) {
+        if let Some(v) = interp.var_slot_fast(var_name) {
             if let Some(items) = v.as_list_mut() {
                 for arg in &args[2..] {
                     items.push(arg.clone());
                 }
-                return interp.set_var(var_name, v);
+                return Ok(v.clone());
             }
-            // Not a list rep: restore raw and rebuild through the slow
-            // path (the strict parse below owns the same errors).
-            interp.store_var(var_name, v);
         }
     }
     let mut list = match interp.get_var(var_name) {

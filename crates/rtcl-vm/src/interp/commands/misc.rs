@@ -914,12 +914,8 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // render qualified (tclsh: `info vars n::*` → `::n::v`).
             let qualified = qualified
                 || match_pat.map(|p| p.contains("::")).unwrap_or(false);
-            // An insertion log as long as the table has no stale entry:
-            // its entries are the live keys, and none needs a lookup (a
-            // lookup per entry was the whole cost of listing many
-            // variables: random access into a large table).
-            let log_is_exact = interp.var_order.len() == interp.globals.len();
-            let live = |k: &String| log_is_exact || interp.globals.contains_key(k.as_str());
+            // The :: table's keys in hash order (live, each once at its
+            // last occurrence — `global_var_order`).
             if qualified {
                 // Walk the pattern's `::` qualifiers to the target table.
                 let stripped = pattern.unwrap().trim_start_matches(':').to_string();
@@ -936,15 +932,12 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     } else {
                         format!("{}::", &target_ns[2..])
                     };
-                    for k in interp.var_order.iter() {
-                        if !live(k) || is_array_element_name(k) {
-                            continue;
-                        }
+                    for k in interp.global_var_order() {
                         let tail = match k.strip_prefix(prefix.as_str()) {
                             Some(t) if !t.contains("::") => t.to_string(),
                             _ => continue,
                         };
-                        entries.push((k.clone(), tail));
+                        entries.push((k.to_string(), tail));
                     }
                     table_ns = Some(target_ns);
                 }
@@ -970,26 +963,23 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // global :: table（tclsh InfoVarsCmd 的可见集合并——
                 // IVP 钉形 `argx a g1` 仅 proc 局部、IVQ 钉形 ns 体 =
                 // ns 表 + 全部全局裸名）。plain globals 列裸 tail。
-                for k in interp.var_order.iter() {
-                    if !live(k) || is_array_element_name(k) {
-                        continue;
-                    }
+                for k in interp.global_var_order() {
                     let tail = match k.strip_prefix(pfx.as_str()) {
                         Some(t) if !t.contains("::") => t.to_string(),
                         _ => continue,
                     };
-                    entries.push((k.clone(), tail));
+                    entries.push((k.to_string(), tail));
                 }
                 global_split = Some(entries.len());
-                for k in interp.var_order.iter() {
-                    if live(k) && !k.contains("::") && !is_array_element_name(k) {
-                        entries.push((k.clone(), k.clone()));
+                for k in interp.global_var_order() {
+                    if !k.contains("::") {
+                        entries.push((k.to_string(), k.to_string()));
                     }
                 }
             } else {
-                for k in interp.var_order.iter() {
-                    if live(k) && !k.contains("::") && !is_array_element_name(k) {
-                        entries.push((k.clone(), k.clone()));
+                for k in interp.global_var_order() {
+                    if !k.contains("::") {
+                        entries.push((k.to_string(), k.to_string()));
                     }
                 }
             }
@@ -1084,14 +1074,10 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // (bare names only — namespace variables are not globals,
             // tclsh: `info globals q::*` on a namespace var returns
             // empty).
-            // As above: with no stale entry in the log, no lookup.
-            let log_is_exact = interp.var_order.len() == interp.globals.len();
             let names: Vec<&str> = interp
-                .var_order
-                .iter()
-                .filter(|name| !name.contains("::") && !is_array_element_name(name))
-                .filter(|name| log_is_exact || interp.globals.contains_key(name.as_str()))
-                .map(String::as_str)
+                .global_var_order()
+                .into_iter()
+                .filter(|name| !name.contains("::"))
                 .collect();
             let vars: Vec<Value> = super::super::tclhash::tcl_order(names.iter().copied())
                 .into_iter()
@@ -2051,12 +2037,37 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() == 2 {
         return interp.get_var(var_name).cloned();
     }
-    let mut current = interp.get_var(var_name).ok().map(|v| v.as_str().to_string()).unwrap_or_default();
+    // Fast path: an ordinary local or global with no trace on it, already
+    // holding a plain string — append to its own buffer (tclsh appends
+    // to the variable's object).  The buffer grows, so a loop of appends
+    // is linear; rebuilding the string took two copies of the whole
+    // thing on every call.  Everything else takes the path below: the
+    // variable's creation and its errors, other representations (an
+    // integer, a list), links, arrays, and traced variables, whose write
+    // traces `set_var` fires.
+    if let Some(slot) = interp.var_slot_fast(var_name) {
+        let mut in_place = true;
+        for arg in &args[2..] {
+            if !slot.append_str_in_place(arg.as_str()) {
+                in_place = false;
+                break;
+            }
+        }
+        if in_place {
+            return Ok(slot.clone());
+        }
+        // A value that is not a plain string: what was appended so far
+        // is nothing (the first non-string value stopped the loop before
+        // any change), and the rebuild below reads it as it is.
+    }
+    let mut current = String::new();
+    if let Ok(old) = interp.get_var(var_name) {
+        current.push_str(old.as_str());
+    }
     for arg in &args[2..] {
         current.push_str(arg.as_str());
     }
-    let result = Value::from_str(&current);
-    interp.set_var(var_name, result.clone())
+    interp.set_var(var_name, Value::from_string(current))
 }
 
 /// `disassemble script` — compile and display the bytecode for a script.

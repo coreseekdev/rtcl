@@ -46,12 +46,18 @@ impl<'a> TclTable<'a> {
         Self { buckets: vec![Vec::new(); 4], rebuild: 12, entries: 0 }
     }
 
-    /// Insert in insertion order: existing keys keep their chain position.
+    /// Insert in insertion order.  A key the table already holds is one
+    /// that was deleted and made again (the callers pass each key once
+    /// per (re)creation — a plain re-set never reaches a table): it takes
+    /// a new place at the head of its bucket, as in Tcl, and the table is
+    /// no fuller than before, so the rebuild threshold is not consulted.
     fn insert(&mut self, key: &'a str) {
         let size = self.buckets.len() as u64;
         let idx = (tcl_hash(key) & (size - 1)) as usize;
         let bucket = &mut self.buckets[idx];
-        if bucket.iter().any(|k| *k == key) {
+        if let Some(pos) = bucket.iter().position(|k| *k == key) {
+            bucket.remove(pos);
+            bucket.insert(0, key);
             return;
         }
         bucket.insert(0, key);
@@ -79,8 +85,9 @@ impl<'a> TclTable<'a> {
 
 /// Replay the Tcl hash-table mechanics over `keys` in insertion order and
 /// return them in iteration order — the same strings, borrowed.  Keys must
-/// be live (callers filter deleted entries first); duplicates are ignored
-/// like re-sets in Tcl.
+/// be live (callers filter deleted entries first), each once per
+/// (re)creation: a key that appears again was deleted in between, and
+/// takes a new place.
 pub(crate) fn tcl_order<'a>(keys: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     let mut table = TclTable::new();
     for key in keys {

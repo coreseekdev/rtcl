@@ -160,6 +160,10 @@
 | C45 | （M7）`array names -regexp` 对每个元素重新编译一次模式，编译不过时静默返回空 | `commands/array.rs` | 已修（M7）：编译一次，报编译错误；数组不存在时不编译（同 tclsh）。`expr` 的 `=~` 也改走同一引擎 |
 | C46 | （M7）`regsub -all {} ab X` 给 `XaXbX`，tclsh 给 `XaXb`（tclsh 这条路径是「字符串映射」特例，空模式只在字符之间替换，末尾不替换） | `commands/regexp_cmds.rs` `cmd_regsub` | 已修（M7） |
 | C47 | （M7，已知差异）带回引的模式在约 1000 字符以上的文本上，回溯器走到步数预算就报 `REGEXP REG_ESPACE {regular expression match is too complex}`，tclsh 给出结果（`regexp {(x+)y\1}` 对 1030 个 x：tclsh 0）。预算换的是不挂死 | `rtcl-regexp-spencer/src/backtrack.rs` | 未修（记录） |
+| C48 | （M7）全局标量变量 `unset` 后再建，`info globals`/`info vars` 仍把它列在原位：tclsh 的哈希表重新插入时把它放到桶首，同桶里排在先建的变量前面（`A a B b` 四个变量，重建 `A` 后 tclsh 给 `A a b B`，rtcl 给 `a A b B`）。数组元素是对的，标量不对。另一面：`lappend`、`dict set` 的快路径把值从表里取出、改完再放回，会在插入日志里留下第二条 | `commands/misc.rs`、`interp/vars.rs`、`interp/tclhash.rs` | 已修（M7）：日志按每个键的最后一次出现重放，重放时再次出现的键挪到桶首；就地改动的几处改成直接拿变量所在的槽位，不再取出放回。探针 d26 |
+| C49 | 在 proc 里执行的 `namespace eval` 体，裸名变量的读写落在 proc 的帧上：命名空间里已有的变量读不到（`can't read "v": no such variable`），`set`/`append` 写进局部变量，proc 返回就没了。`proc Q {} { namespace eval n { set k 7 } }` 之后 `info exists n::k` 是 0（tclsh 1）；`variable` 链接过的名字不受影响，所以常见的 `variable x; set x …` 写法没暴露它 | `commands/namespace.rs` `ns_eval`、`interp/vars.rs` | 未修（记录）：tclsh 给体一个自己的变量帧，帧里的 proc 局部变量对体不可见；rtcl 只切换了当前命名空间 |
+| C50 | 变量读写失败时的 errorCode：读数组变量本体（`can't read "a": variable is array`）给 `TCL LOOKUP VARNAME a`，tclsh 给 `TCL READ VARNAME`；写数组变量本体（`set`/`append`/`lappend`/`incr`）、读 trace 报错、写 trace 报错时 errorCode 是上一个错误留下的或 NONE，tclsh 给 `TCL WRITE VARNAME` / `TCL READ VARNAME`。依赖 errorCode 分支的错误处理走错分支 | `error.rs` `tcl_error_code` | 已修（M7）：按消息形状给码。探针 d26（r2、t7） |
+| C51 | （M7，已知差异）trace 与编译后的命令：(1) tclsh 把简单词的 `append a x y z` 编译成每个值一次写，写 trace 触发三次，rtcl 一次；(2) 读 trace 报错时，tclsh 编译后的 `incr`/`lappend` 把变量当成未定义继续（返回 1 / `2`，结果码 0，errorCode 留下 `TCL READ VARNAME`），rtcl 的 `incr` 报错、`lappend` 不触发读 trace；(3) `unset` trace 报错后 tclsh 的 errorCode 是 `TCL UNSET VARNAME`，rtcl 给 `TCL LOOKUP ELEMENT 1`；数组写 trace 报错时 `-errorstack` 里 tclsh 记 `wa`，rtcl 记 `invokeStk1 wa` | `interp/vars.rs`、trace 分派 | 未修（记录） |
 | C13 | 修复过程中新查出：`json encode` 的 schema 文本按词递归（`list list list …` 重复几万次即栈溢出），JSON 解码的递归下降无深度上限 | `commands/json.rs` | 已修（M2）：文档与 schema 的嵌套上限 1000，超限报错 |
 
 ## P2：性能（`TODO.md` 未列，本机单次实测，只看量级）
@@ -168,7 +172,7 @@
 |---|---|---|---|---|
 | P1 | TCP 读每字节一次系统调用（3MiB） | 387ms | 5ms | `channel.rs` |
 | P2 | `string map` 每字符重建剩余串（15 万字节） | 7.1s | 8ms | `commands/string_cmds.rs` | 已修（M7）：一趟扫描，按字节匹配；64KB 从 1.0s 到 0.7ms（tclsh 0.8ms）。顺带：奇数个元素的 map 给 `TCL OPERATION MAP UNBALANCED`，不是列表的 map 报列表错误（原来静默当成一个词）。探针 d22（28 条断言） |
-| P3 | `append` 每次两份整串拷贝（8 万次） | 4.7s | 10ms | `commands/misc.rs` |
+| P3 | `append` 每次两份整串拷贝（8 万次） | 4.7s | 10ms | `commands/misc.rs` | 已修（M7）：变量里是普通字符串、没有 trace、没有链接时直接接到它自己的缓冲区上（值被别处共享时先复制一份，同 tclsh 对共享对象的做法）；其余情况走原来的路，只拷一次。proc 里 2 万次 `append s $i`：49ms → 1.5ms（tclsh 0.75–1.5ms），8 万次 `append s x`：81ms → 3.7ms（tclsh 1.6–3.3ms）。同一改法用在 `lappend`、`dict set`、`incr` 的快路径上（原来都是取出再放回）：`lappend` 0.86ms → 0.49ms。树引擎仍慢（2 万次 18ms，见 P10）。探针 d26（79 条断言） |
 | P4 | `info vars` 超线性（8 万变量）；`TclTable::insert` 每次全扫桶 | 13.2s | 整段 11ms | `interp/tclhash.rs` | 已修（M7）：`info vars` 对每个列出的名字再线性搜一遍条目表（平方），`info commands` 同一处；插入时不再全扫桶；顺序重放改为借用键（不再每个键拷三次）。`info vars` 4 万变量 0.9s → 约 0.02s |
 | P5 | `array size` 按作用域变量总数计 | 2.6s | ≈0 | `commands/array.rs` | 未修：`array size`/`exists` 仍扫整张变量表（8 万元素 0.8ms，tclsh 是常数） |
 | P14 | （M7）每个作用域的变量插入日志只增不减：循环里建了再删的变量永远留在日志里，内存和每次枚举的耗时都随之增长。三轮各 30 万次「建再删」后常驻 96MB（tclsh 5MB）；`array names` 对日志的每个条目做一次哈希查找，2 万元素 40ms、8 万元素 624ms | 96MB / 624ms | 5MB / 0.2ms | `interp/vars.rs` `var_order` | 已修（M7）：日志长到活跃键的两倍以上就收回到活跃键（全局表留最后一次出现，帧内的普通局部变量留第一次——对应 tclsh 的槽位序）；日志里没有失效条目时枚举直接顺着读，不做查找。7.8MB；2 万元素 1.1ms，8 万 5ms。探针 d23（45 条断言） |

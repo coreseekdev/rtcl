@@ -944,10 +944,35 @@ impl Interp {
                     self.arrays_env_only = false;
                 }
                 self.array_globals.insert(n.clone());
+                // (Re)creation starts the live element count at 0 (P5).
+                self.elem_counts.insert(n.clone(), 0);
             }
             VarLoc::Frame(i, n) => {
                 if let Some(f) = self.frames.get_mut(*i) {
                     f.array_locals.insert(n.clone());
+                    f.elem_counts.insert(n.clone(), 0);
+                }
+            }
+        }
+    }
+
+    /// Adjust the array at `loc`'s live element count by `delta` (P5:
+    /// `array size`/`array exists` read the count instead of filtering
+    /// the scope's whole table).  A no-op when no count is tracked —
+    /// the query then falls back to the scan, so an unmaintained entry
+    /// degrades performance, never correctness.
+    fn loc_elem_count_bump(&mut self, loc: &VarLoc, delta: i64) {
+        match loc {
+            VarLoc::Global(n) => {
+                if let Some(c) = self.elem_counts.get_mut(n) {
+                    *c = ((*c as i64) + delta).max(0) as usize;
+                }
+            }
+            VarLoc::Frame(i, n) => {
+                if let Some(f) = self.frames.get_mut(*i) {
+                    if let Some(c) = f.elem_counts.get_mut(n) {
+                        *c = ((*c as i64) + delta).max(0) as usize;
+                    }
                 }
             }
         }
@@ -971,6 +996,7 @@ impl Interp {
                 }
                 let base = loc.base_name().to_string();
                 self.array_globals.remove(&base);
+                self.elem_counts.remove(&base);
                 self.arrays_env_only = self
                     .array_globals
                     .iter()
@@ -990,6 +1016,7 @@ impl Interp {
                     }
                     let base = loc.base_name().to_string();
                     f.array_locals.remove(&base);
+                    f.elem_counts.remove(&base);
                     f.locals.remove(&base);
                 }
             }
@@ -1385,6 +1412,43 @@ impl Interp {
             }
         }
         if let Some((array_name, index)) = split_array_ref(name) {
+            // Fast path (T7 vars): a plain base+index whose flat element
+            // key IS the name as spelled — a frame array-local, or a
+            // global array at "::" — with nothing that reroutes
+            // resolution (dead marks, flat/ns aliases, ts slots are all
+            // handled above or guarded).  One hash probe, zero
+            // allocation; every guard miss keeps the full resolution
+            // below (same errors, same traces).
+            if self.dead_flat.iter().all(|k| k != array_name)
+                && self.flat_aliases.iter().all(|(k, _)| k != array_name)
+                && self.ns_transient.iter().all(|(k, _)| k != array_name)
+            {
+                if let Some(frame) = self.var_frame() {
+                    if frame.array_locals.contains(array_name)
+                        && (frame.upvars.is_empty()
+                            || !frame.upvars.contains_key(array_name))
+                    {
+                        return frame.locals.get(name).ok_or_else(|| {
+                            Error::runtime(
+                                format!(
+                                    "can't read \"{}\": no such element in array",
+                                    name
+                                ),
+                                ErrorCode::NotFound,
+                            )
+                        });
+                    }
+                } else if self.current_namespace.as_ref() == "::"
+                    && self.array_globals.contains(array_name)
+                {
+                    return self.globals.get(name).ok_or_else(|| {
+                        Error::runtime(
+                            format!("can't read \"{}\": no such element in array", name),
+                            ErrorCode::NotFound,
+                        )
+                    });
+                }
+            }
             let mut loc = self.resolve_loc(array_name);
             if !self.loc_is_array(&loc)
                 && self.var_frame_idx().is_none()
@@ -1629,18 +1693,76 @@ impl Interp {
         }
         self.check_parent_ns(name)?;
         if let Some((array_name, index)) = split_array_ref(name) {
-            // Array-ification of a slotted name migrates the frame back to
-            // the name-keyed store (element keys are flat map entries; the
-            // slot model has no element form).
-            self.degrade_frame_local_here(array_name);
             // 顶层 slot 单元（C2'）：ts 名数组化 → 槽标记 aliased（后续
             // 槽写回落名路径——`set x 7` 的 is-array 错误归属与 tclsh
-            // 一致；标记漏发会让槽写静默覆盖）。
+            // 一致；标记漏发会让槽写静默覆盖）。（快径同做——base 命中
+            // ts 名表才标，未命中零成本。）
             if let Some(ts) = self.top_slots.as_mut() {
                 if let Some(i) = ts.names.iter().position(|n| n == array_name) {
                     ts.aliased[i] = true;
                 }
             }
+            // Fast path (T7 vars): OVERWRITE of an existing element whose
+            // flat key is the name as spelled (frame array-local, or a
+            // global array at "::") — one get_mut probe, zero
+            // allocation.  Creation, rerouted resolution (links, dead
+            // marks, aliases) and the error shapes keep the full path
+            // below; degrade is a no-op here (the base already carries
+            // this scope's array marker, so its slot left the frame when
+            // the marker was set).
+            if self.dead_flat.iter().all(|k| k != array_name)
+                && self.flat_aliases.iter().all(|(k, _)| k != array_name)
+                && self.ns_transient.iter().all(|(k, _)| k != array_name)
+                && !has_ns_sep(name)
+            {
+                let mut wrote = false;
+                if let Some(frame) = self.var_frame_mut() {
+                    if frame.array_locals.contains(array_name)
+                        && (frame.upvars.is_empty()
+                            || !frame.upvars.contains_key(array_name))
+                    {
+                        if let Some(slot) = frame.locals.get_mut(name) {
+                            *slot = value.clone();
+                            wrote = true;
+                        }
+                    }
+                } else if self.current_namespace.as_ref() == "::"
+                    && self.array_globals.contains(array_name)
+                {
+                    if let Some(slot) = self.globals.get_mut(name) {
+                        *slot = value.clone();
+                        wrote = true;
+                    }
+                }
+                if wrote {
+                    // Phantom cleanup is a no-op on an empty map — skip
+                    // the stamp-key allocation with it (state identical).
+                    if !self.trace_phantoms.is_empty() {
+                        self.clear_phantom(array_name, index);
+                    }
+                    // Same tail as the slow path: traces fire after the
+                    // write; a fired write trace returns the variable's
+                    // new value (D-36).
+                    let fired = self.fire_traces(array_name, Some(index), "write").map_err(
+                        |e| {
+                            Error::runtime(
+                                format!("can't set \"{}\": {}", name, e),
+                                ErrorCode::Generic,
+                            )
+                        },
+                    )?;
+                    if fired {
+                        return Ok(
+                            self.get_var(name).map(|v| v.clone()).unwrap_or_default()
+                        );
+                    }
+                    return Ok(value);
+                }
+            }
+            // Array-ification of a slotted name migrates the frame back to
+            // the name-keyed store (element keys are flat map entries; the
+            // slot model has no element form).
+            self.degrade_frame_local_here(array_name);
             let base = array_name.to_string();
             let idx = index.to_string();
             // 数组基解析走 resolve_loc（Tcl 9：裸名只落当前 ns 的表，
@@ -1653,6 +1775,7 @@ impl Interp {
                 if !existed {
                     // New element: element-set mutation invalidates searches.
                     self.bump_stamp(&loc);
+                    self.loc_elem_count_bump(&loc, 1);
                 }
             } else if self.loc_base_exists(&loc) {
                 let base = name.split('(').next().unwrap_or(name);
@@ -1672,6 +1795,7 @@ impl Interp {
                 self.loc_insert(&loc, base_key, Value::empty());
                 let key = loc.element_key(index);
                 self.loc_insert(&loc, key, value.clone());
+                self.loc_elem_count_bump(&loc, 1);
             }
             self.clear_phantom(&base, &idx);
             // Write traces fire after the write lands; a trace error is
@@ -2054,6 +2178,50 @@ impl Interp {
     }
 
     fn incr_var_fast_impl(&mut self, name: &str, amount: i64) -> Option<Value> {
+        // T7 vars: element fast path — existing element, flat key is the
+        // name as spelled, no traces registered (the command's read is
+        // then silent either way), integer value.  Everything else
+        // (missing element, non-int current, overflow, links, namespaces)
+        // falls back to `incr` itself, which produces the same errors
+        // from the same read (cmd_incr's missing-element creation, TCL
+        // VALUE INTEGER, bignum widening all replay unchanged).
+        if let Some((array_name, index)) = split_array_ref(name) {
+            if has_ns_sep(name)
+                || !self.var_traces.is_empty()
+                || self.dead_flat.iter().any(|k| k == array_name)
+                || self.flat_aliases.iter().any(|(k, _)| k == array_name)
+                || self.ns_transient.iter().any(|(k, _)| k == array_name)
+            {
+                return None;
+            }
+            let next;
+            if let Some(frame) = self.var_frame_mut() {
+                if !(frame.array_locals.contains(array_name)
+                    && (frame.upvars.is_empty()
+                        || !frame.upvars.contains_key(array_name)))
+                {
+                    return None;
+                }
+                let cell = frame.locals.get_mut(name)?;
+                let current = cell.as_int()?;
+                next = current.checked_add(amount)?;
+                *cell = Value::from_int(next);
+            } else {
+                if self.current_namespace.as_ref() != "::"
+                    || !self.array_globals.contains(array_name)
+                {
+                    return None;
+                }
+                let cell = self.globals.get_mut(name)?;
+                let current = cell.as_int()?;
+                next = current.checked_add(amount)?;
+                *cell = Value::from_int(next);
+            }
+            if !self.trace_phantoms.is_empty() {
+                self.clear_phantom(array_name, index);
+            }
+            return Some(Value::from_int(next));
+        }
         let slot = self.var_slot_fast(name)?;
         let current = slot.as_int()?;
         // Overflow belongs to the real `incr` (ARITH IOVERFLOW error).
@@ -2073,6 +2241,7 @@ impl Interp {
                 if self.loc_remove(&loc, &key) {
                     // Removed element: mutation invalidates searches.
                     self.bump_stamp(&loc);
+                    self.loc_elem_count_bump(&loc, -1);
                     self.clear_phantom(&base, &idx);
                     // Unset traces fire after deletion; errors are
                     // discarded (tclsh: the unset still succeeds).
@@ -2233,6 +2402,27 @@ impl Interp {
             }
         }
         if let Some((array_name, index)) = split_array_ref(name) {
+            // Fast path (T7 vars): same flat-key-is-the-name guard set as
+            // get_var/set_var — one contains probe, zero allocation
+            // (this sits on `incr`'s hot path via cmd_incr).
+            if !has_ns_sep(name)
+                && self.dead_flat.iter().all(|k| k != array_name)
+                && self.flat_aliases.iter().all(|(k, _)| k != array_name)
+                && self.ns_transient.iter().all(|(k, _)| k != array_name)
+            {
+                if let Some(frame) = self.var_frame() {
+                    if frame.array_locals.contains(array_name)
+                        && (frame.upvars.is_empty()
+                            || !frame.upvars.contains_key(array_name))
+                    {
+                        return frame.locals.contains_key(name);
+                    }
+                } else if self.current_namespace.as_ref() == "::"
+                    && self.array_globals.contains(array_name)
+                {
+                    return self.globals.contains_key(name);
+                }
+            }
             // Tcl 9: a bare array base is the current namespace's own
             // (resolve_loc already lands there; no global fallback).
             let loc = self.resolve_loc(array_name);
@@ -2818,6 +3008,24 @@ impl Interp {
     /// replaying their subsequence reproduces tclsh's `array names`).
     pub(crate) fn array_element_names(&self, name: &str) -> Vec<String> {
         self.array_elements(name, true)
+    }
+
+    /// Live element count of the array at `name` (P5), kept per scope by
+    /// the element write/remove sites.  `None` when the name's count is
+    /// not tracked (no count entry — no array was ever created there, or
+    /// an element key slipped in without the marker machinery): callers
+    /// fall back to the table scan, so a hole degrades speed, not
+    /// correctness.
+    pub(crate) fn array_element_count(&self, name: &str) -> Option<usize> {
+        let (owner_fi, base) = self.array_owner(name);
+        match owner_fi {
+            Some(i) => self
+                .frames
+                .get(i)
+                .and_then(|f| f.elem_counts.get(&base))
+                .copied(),
+            None => self.elem_counts.get(&base).copied(),
+        }
     }
 
     /// The element keys of the array at `name` as the log has them: the

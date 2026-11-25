@@ -2014,6 +2014,50 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // is nothing (the first non-string value stopped the loop before
         // any change), and the rebuild below reads it as it is.
     }
+    // T7 vars: element fast path — an existing element whose flat key is
+    // the name as spelled (frame array-local, or a global array at "::"),
+    // no traces, holding a plain string: append to the cell's own buffer
+    // (the same rationale as the scalar path above; var_slot_fast skips
+    // element names outright).  Creation, non-string cells, links and
+    // namespaces take the generic rebuild below — same reads, same
+    // errors, same trace firing (none when no traces are registered).
+    if let Some((array_name, _)) = crate::interp::util::split_array_ref(var_name) {
+        if !crate::interp::util::has_ns_sep(var_name)
+            && interp.var_traces.is_empty()
+            && interp.dead_flat.iter().all(|k| k != array_name)
+            && interp.flat_aliases.iter().all(|(k, _)| k != array_name)
+            && interp.ns_transient.iter().all(|(k, _)| k != array_name)
+        {
+            let slot = if let Some(frame) = interp.var_frame_mut() {
+                if frame.array_locals.contains(array_name)
+                    && (frame.upvars.is_empty()
+                        || !frame.upvars.contains_key(array_name))
+                {
+                    frame.locals.get_mut(var_name)
+                } else {
+                    None
+                }
+            } else if interp.current_namespace.as_ref() == "::"
+                && interp.array_globals.contains(array_name)
+            {
+                interp.globals.get_mut(var_name)
+            } else {
+                None
+            };
+            if let Some(slot) = slot {
+                let mut in_place = true;
+                for arg in &args[2..] {
+                    if !slot.append_str_in_place(arg.as_str()) {
+                        in_place = false;
+                        break;
+                    }
+                }
+                if in_place {
+                    return Ok(slot.clone());
+                }
+            }
+        }
+    }
     let mut current = String::new();
     if let Ok(old) = interp.get_var(var_name) {
         current.push_str(old.as_str());

@@ -2106,6 +2106,11 @@ fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
             .iter()
             .all(|k| k == "env" || k == "tcl_platform");
     }
+    // P5: the destroyed namespace's arrays take their element counts with
+    // them (the element keys above were removed without the vars.rs path).
+    interp
+        .elem_counts
+        .retain(|k, _| !k.starts_with(&var_prefix));
     if !keep_ns {
         interp.namespaces.remove(ns);
     }

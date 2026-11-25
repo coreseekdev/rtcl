@@ -635,26 +635,36 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // string last needleString haystackString ?lastIndex?
             let needle = args[2].as_str();
             let haystack = args[3].as_str();
-            let len = char_count(haystack);
-            // A match must end at or before lastIndex (default: end of string).
-            let last = if args.len() > 4 {
+            // A match must end at or before lastIndex (default: end of
+            // string).  The char count is only needed for an explicit
+            // index (P15: char_count/char_byte_offset each re-scanned
+            // the string per call; the default path now scans nothing
+            // but the search itself).  For ASCII the char count IS the
+            // byte length and char indexes are byte offsets.
+            let upto = if args.len() > 4 {
+                let ascii = haystack.is_ascii();
+                let len = if ascii { haystack.len() } else { haystack.chars().count() };
                 match parse_tcl_index(args[4].as_str(), len) {
                     // Negative index: no character is at or before it.
                     Some(i) if i < 0 => return Ok(Value::from_int(-1)),
-                    Some(i) => (i as usize).min(len.saturating_sub(1)),
+                    Some(i) => {
+                        let last = (i as usize).min(len.saturating_sub(1));
+                        if ascii {
+                            (last + 1).min(len)
+                        } else {
+                            char_byte_offset(haystack, last + 1)
+                        }
+                    }
                     None => return Err(bad_index(interp, args[4].as_str())),
                 }
             } else {
-                len.saturating_sub(1)
+                // No index: the whole string (a byte offset).
+                haystack.len()
             };
             let pos = if needle.is_empty() || needle.len() > haystack.len() {
                 None
             } else {
-                // Up to and including the character `last`; see `first`.
-                let upto = char_byte_offset(haystack, last + 1);
-                haystack[..upto]
-                    .rfind(needle)
-                    .map(|at| haystack[..at].chars().count())
+                str_rfind(haystack, needle, upto).map(|at| char_index_of_byte(haystack, at))
             };
             Ok(Value::from_int(pos.map_or(-1, |i| i as i64)))
         }
@@ -1037,6 +1047,112 @@ fn char_count(s: &str) -> usize {
     } else {
         s.chars().count()
     }
+}
+
+/// UTF-8 continuation bytes (0x80..0xBF) in `bytes`, eight at a time:
+/// per u64 word, `(b ^ 0x80) & 0xC0 == 0` marks a continuation byte,
+/// and the strlen-style zero-byte mask `(w - 0x0101..) & !w & 0x8080..`
+/// marks exactly those (a borrow entering a non-zero byte keeps the
+/// marker clear: `y - 1 ≥ 0x80 ∧ y ≤ 0x7F` is impossible).
+fn count_continuations(bytes: &[u8]) -> usize {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const TOP2: u64 = 0xC0C0_C0C0_C0C0_C0C0;
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    let mut cont = 0usize;
+    for &c in chunks {
+        let word = u64::from_le_bytes(c);
+        let w = (word ^ HI) & TOP2;
+        cont += ((w.wrapping_sub(LO)) & !w & HI).count_ones() as usize;
+    }
+    for &b in rem {
+        cont += ((b & 0xC0) == 0x80) as usize;
+    }
+    cont
+}
+
+/// The character index of byte offset `at` (a char boundary) in `s`:
+/// the offset minus its UTF-8 continuation bytes.  An ASCII prefix has
+/// none — `is_ascii`'s word-at-a-time scan answers it outright — and a
+/// non-ASCII prefix takes the SWAR masked count; the old
+/// `chars().count()` decoded every character, so a late hit on a
+/// non-ASCII string re-walked the whole prefix per call (P15: `string
+/// last` 14µs vs tclsh 0.2 on 24KB).
+fn char_index_of_byte(s: &str, at: usize) -> usize {
+    let bytes = &s.as_bytes()[..at];
+    if bytes.is_ascii() {
+        return at;
+    }
+    at - count_continuations(bytes)
+}
+
+/// Reverse substring search over `hay[..end]` (`end` a char boundary):
+/// the last match's byte offset, or `None`.  A complete backward
+/// candidate walk: every match's final byte is the needle's final
+/// byte, so the candidates are exactly the positions of that byte, and
+/// each is verified whole — no shift heuristic, nothing skipped.  (A
+/// Horspool shift table is only proven for forward scans — its
+/// coverage argument fails for windows to the left of the current one,
+/// and a reverse variant missed rightmost matches in brute-force
+/// cross-checks.)  The standard library's reverse search (Two-Way)
+/// picks its skip byte by factorization, so a needle whose filter byte
+/// sits at every position of the text (spaces over space-free text)
+/// degenerates to a full comparison per position (P15: 47µs vs tclsh
+/// 14 on 24KB).  Byte-level matching is safe: a valid UTF-8 needle can
+/// only byte-match at a character boundary of the haystack (the same
+/// argument `first`'s byte search rides).
+fn str_rfind(hay: &str, needle: &str, end: usize) -> Option<usize> {
+    let n = needle.len();
+    let h = hay.as_bytes();
+    if n == 0 || n > end {
+        return None;
+    }
+    let last = needle.as_bytes()[n - 1];
+    let mut q = end;
+    loop {
+        // Backward scan for the next candidate's final byte in h[..q].
+        let found = rmemchr_byte(&h[..q], last)?;
+        let e = found + 1;
+        if e >= n && &h[e - n..e] == needle.as_bytes() {
+            return Some(e - n);
+        }
+        q = found;
+    }
+}
+
+/// Backward search for byte `b` in `bytes`: the index of its last
+/// occurrence, or `None`.  Word-at-a-time: `(w ^ broadcast)` has a zero
+/// byte exactly where `b` sat, and the strlen mask marks it; the walk
+/// is one u64 test per eight bytes (the plain `rposition` scalar walk
+/// cost ~0.4ns/byte — a 24KB miss scanned 10µs, P15's `string last`
+/// miss and early-hit shapes).
+fn rmemchr_byte(bytes: &[u8], b: u8) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let broadcast = LO.wrapping_mul(b as u64);
+    let (chunks, rem) = bytes.split_at(bytes.len() - bytes.len() % 8);
+    // The remainder sits above the chunked words — search it first.
+    if let Some(p) = rem.iter().rposition(|&c| c == b) {
+        return Some(chunks.len() + p);
+    }
+    let mut i = chunks.len();
+    while i >= 8 {
+        i -= 8;
+        let chunk = &chunks[i..i + 8];
+        let w = u64::from_le_bytes(chunk.try_into().unwrap()) ^ broadcast;
+        // The mask carries borrow false-marks (a 0x01 byte after a
+        // marked 0x00 reads 0xFF), so it is only a word REJECT — a
+        // flagged word is refined byte by byte, high to low.
+        let m = w.wrapping_sub(LO) & !w & HI;
+        if m != 0 {
+            for k in (0..8).rev() {
+                if chunk[k] == b {
+                    return Some(i + k);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The byte offset of character `ci` (`s.len()` past the end).

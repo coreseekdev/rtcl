@@ -452,6 +452,11 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             for k in dead_arrays {
                 interp.array_globals.remove(k.as_str());
             }
+            // P5: the dead namespace's arrays take their element counts
+            // with them (a recreated namespace re-counts from 0).
+            interp
+                .elem_counts
+                .retain(|k, _| !k.starts_with(flat_prefix.as_str()));
         }
     }
     if let Err(e) = &result {
@@ -587,6 +592,8 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.globals.remove(&k);
             }
             interp.array_globals.remove(&base);
+            // P5: the array's element count dies with its elements.
+            interp.elem_counts.remove(&base);
             interp.arrays_env_only = interp
                 .array_globals
                 .iter()

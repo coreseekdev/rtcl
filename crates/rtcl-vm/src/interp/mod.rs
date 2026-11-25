@@ -189,6 +189,12 @@ pub(crate) struct CallFrame {
     pub locals_order: Vec<String>,
     /// Names in `locals` that are arrays (scalar/array distinction).
     pub array_locals: VarSet,
+    /// Live element counts of this frame's arrays, keyed by the array's
+    /// base name (`array size`/`exists` read it instead of scanning every
+    /// local key).  Maintained at the element write/remove sites in
+    /// `vars.rs`; cleared with `array_locals` wherever a frame's maps are
+    /// emptied (pool return, tail-call rebind).
+    pub elem_counts: VarMap<usize>,
     pub upvars: UpvarMap,
     /// Namespace the running proc was defined in (tclsh: `namespace current`
     /// inside the proc resolves here).  Variable *reads* do NOT fall back to
@@ -504,6 +510,12 @@ pub struct Interp {
     /// mutation site maintains the flag (inserts of any other name
     /// clear it; removals recompute — both are cold paths).
     pub(crate) arrays_env_only: bool,
+    /// Live element counts of the global-scope arrays, keyed by the
+    /// array's base key (`array size`/`array exists` used to filter-scan
+    /// the whole global table per call — 80k elements ≈ ms).  Maintained
+    /// at the element write/remove sites (`vars.rs`) and at the direct
+    /// removal purges (namespace delete, oo destroy).
+    pub(crate) elem_counts: VarMap<usize>,
     /// Procedure call frames (empty at global level).  Boxed: a `CallFrame`
     /// is ~264 bytes and pool-pop/frame-push/frame-pop/pool-push moved the
     /// whole struct four times per call (a memcpy each — the fib profile's
@@ -1151,6 +1163,7 @@ impl Interp {
             globals: VarMap::default(),
             array_globals: VarSet::default(),
             arrays_env_only: true,
+            elem_counts: VarMap::default(),
             array_searches: HashMap::new(),
             array_stamps: HashMap::new(),
             array_generation: 0,
@@ -1748,9 +1761,12 @@ impl Interp {
         // stray RTCL_BAD=\xff\xfe in the environment was enough); tclsh
         // passes the bytes through. Lossy here (the string is Tcl text).
         #[cfg(feature = "env")]
+        let mut env_elems = 0usize;
+        #[cfg(feature = "env")]
         for (key, val) in std::env::vars_os() {
             let full = format!("env({})", key.to_string_lossy());
             self.global_insert(full, Value::from_str(&val.to_string_lossy()));
+            env_elems += 1;
         }
 
         // --- $tcl_platform array (element order replays to tclsh's) ---
@@ -1782,6 +1798,21 @@ impl Interp {
         self.array_globals.insert("tcl_platform".to_string());
         self.array_globals.insert("env".to_string());
         self.arrays_env_only = true;
+        // P5: seed the live element counts for the two startup arrays
+        // (their element keys were inserted above without the vars.rs
+        // element-write path).
+        #[cfg(feature = "env")]
+        {
+            self.elem_counts.insert("env".to_string(), env_elems);
+        }
+        {
+            let n = self
+                .globals
+                .keys()
+                .filter(|k| k.starts_with("tcl_platform(") && k.ends_with(')'))
+                .count();
+            self.elem_counts.insert("tcl_platform".to_string(), n);
+        }
 
         // --- :: var table in tclsh's iteration order ---
         // ::auto_index 惰性首建（2026-11-16 var-order 轮）：tclsh 文件

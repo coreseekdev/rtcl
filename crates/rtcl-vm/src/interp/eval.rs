@@ -512,17 +512,13 @@ impl Interp {
                     self.err_inner = Some(
                         self.err_pending_inner
                             .take()
+                            .map(|p| op_word_91(&p))
                             .or_else(|| inner_hint_text(hint, words, text))
                             .unwrap_or_else(|| match words {
                                 Some(w) if !w.is_empty() => {
-                                    let tag = if w.len() <= 255 {
-                                        "invokeStk1"
-                                    } else {
-                                        "invokeStk"
-                                    };
-                                    format!("{} {}", tag, Value::from_list(w).as_str())
+                                    format!("invokeStk {}", Value::from_list(w).as_str())
                                 }
-                                _ => format!("invokeStk1 {}", tcl_log_excerpt(text)),
+                                _ => format!("invokeStk {}", tcl_log_excerpt(text)),
                             }),
                     );
                 }
@@ -545,16 +541,15 @@ impl Interp {
                 self.err_inner = Some(
                     self.err_pending_inner
                         .take()
+                        .map(|p| op_word_91(&p))
                         .or_else(|| inner_hint_text(hint, words, text))
                         .unwrap_or_else(|| match words {
                             Some(w) if !w.is_empty() => {
-                                // tclsh：≤255 词用 invokeStk1（1 字节操作数），
-                                // 更多用 invokeStk（4 字节）。
-                                let tag =
-                                    if w.len() <= 255 { "invokeStk1" } else { "invokeStk" };
-                                format!("{} {}", tag, Value::from_list(w).as_str())
+                                // Tcl 9.1：invokeStk1（1 字节操作数）已弃用，
+                                // 新编译一律宽形 invokeStk。
+                                format!("invokeStk {}", Value::from_list(w).as_str())
                             }
-                            _ => format!("invokeStk1 {}", tcl_log_excerpt(text)),
+                            _ => format!("invokeStk {}", tcl_log_excerpt(text)),
                         }),
                 );
                 self.err_log_call();
@@ -2012,6 +2007,41 @@ fn ast_word_literal(w: &rtcl_parser::Word) -> bool {
 /// `regexp` 的 pattern 编译失败使用该形（编译器直接内联正则）。
 pub(crate) const INNER_RAW_WORDS: &str = "\u{0}raw-words";
 
+/// Tcl 9.1 的 INNER 操作码词形：窄形指令（1/4 字节操作数）已弃用，
+/// 新编译一律宽形，errorstack 词随指令形走（9.1 `tclCompile.c` 指令
+/// 表：`loadScalar1`→`loadScalar`、`storeScalar1`→`storeScalar`、
+/// `incrScalar1Imm`→`incrScalarImm`、`invokeStk1`→`invokeStk`；8.6
+/// 的词形随 8.6 编译器走）。只认已知的操作码词族——`syntax`/
+/// `returnImm`/命令词列表原样返回。
+fn op_word_91(w: &str) -> String {
+    const FAMILIES: &[&str] = &[
+        "loadScalar",
+        "loadArray",
+        "storeScalar",
+        "storeArray",
+        "incrScalar",
+        "incrArray",
+        "lappendScalar",
+        "lappendArray",
+        "unsetScalar",
+        "unsetArray",
+        "invokeStk",
+    ];
+    for f in FAMILIES {
+        let rest = match w.strip_prefix(f) {
+            Some(r) => r,
+            None => continue,
+        };
+        if rest == "1" || rest == "4" {
+            return f.to_string();
+        }
+        if rest == "1Imm" || rest == "4Imm" {
+            return format!("{}Imm", f);
+        }
+    }
+    w.to_string()
+}
+
 /// 从 hint 构造 INNER 串：RAW 哨兵展开为 `Value::from_list(words)`。
 fn inner_hint_text(
     hint: Option<&'static str>,
@@ -2023,7 +2053,7 @@ fn inner_hint_text(
             Some(w) if !w.is_empty() => Value::from_list(w).as_str().to_string(),
             _ => tcl_log_excerpt(text),
         }),
-        Some(h) => Some(h.to_string()),
+        Some(h) => Some(op_word_91(h)),
         None => None,
     }
 }

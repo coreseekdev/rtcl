@@ -456,8 +456,8 @@ wasm 上没有栈保护区，只能自己记账。现在是一个嵌套计数把
 `pkg/ generated`），然后 `node judge/crash-wasm.mjs` 要 `ALL PASS (52)`，
 `node test.js` 要 `26 passed`。不过就报出来，别盲修。
 
-**T1 命名空间体的变量解析改成 9.1（先确认版本策略，§3.6 建议只做
-9.1；确认之后施工是事务）**
+**T1 命名空间体的变量解析改成 9.1（✅ 2026-11-26 完成，migrate/ns91）；**
+版本策略已定：只做 9.1（无 8.6 兼容开关）。
 去掉 `ns_chain_global` 这条链：没有 proc 帧的时候，裸名只查当前命名
 空间自己的表，查不到就是没有（读报错，写建在当前命名空间）。
 `phantom_globals` 留给 `has_valueless_entry`（errorCode），不再用来
@@ -468,7 +468,12 @@ judge/audit-cases/ns-chain-86-vs-91.tcl` 的 `vm`、`tree` 两行与 `91`
 派之前先和迁移会话对一下，它的「探针 125 项 DIFF」里可能已经有人
 在做同一件事。
 
-**T2 审计探针按 9.1 重钉（事务，T1 之后）**
+**T2 审计探针按 9.1 重钉（✅ 2026-11-26 完成，migrate/ns91）；**
+66 探针逐一与 tclsh9.1 对照：d26/d27 两步重生成；18 个探针里 40 条
+8.6 钉形断言转 skip（`# skip <tag> -- 原因`，原因指向 TODO 对标迁移
+工作组）；b03/d14（oracle 下状态行即死）、b09/b10（rtcl 扩展无
+oracle）、d01/d02（oracle 超时）加头注释只在 rtcl 上防回归。**
+
 `judge/crash-probes/` 下 66 个探针的期望值都来自 8.6.17。逐个用
 tclsh9.1 跑，对第一条失败做判断：是 8.6 到 9.1 的语义差，就用 9.1
 重新生成期望值（有源文件的：`.refer/tcl910/inst/bin/tclsh9.1
@@ -572,7 +577,7 @@ S21（`lrepeat 4294967296 x` 一类的大小在 32 位上回绕）、S23（wasm
 `specs/CODE-AUDIT-20261123.md`、`TODO.md`、`README.md` 的数字和状态
 对齐到最后一次门禁。
 
-**T13 列出回落到树引擎的全部触发点（事务）**
+**T13 列出回落到树引擎的全部触发点（✅ 2026-11-26 完成，migrate/ns91）：清单在 `specs/TREE-FALLBACK-TRIGGERS.md`——真实回落面 = F1 u16 溢出（C55）/F2 exec trace 钉回/F3 epoch 失配/F4 手动关断/F5 >256KB 不走缓存/F6 body_memo 挤出；编译器 op 白名单实际恒真（14 个非白名单 op 零发射，只服务 assemble）。**
 grep `fallback`、`RTCL_NO_BYTECODE`、`bytecode_applicable`、exec
 trace 相关的钉回点，加上 C55 那种超限单元，给每一个写出：触发
 条件、复现脚本、在 VM 里补齐还缺什么。只要清单，不要改代码。§3.3

@@ -660,17 +660,14 @@ impl Interp {
             }
             return VarLoc::Frame(idx, name.to_string());
         }
-        // No proc variable frame: the current namespace's table — unless
-        // the chain leads to the global's (the variable, or its entry, is
-        // there and the namespace has none of that name).  Everything
-        // that asks where a variable lives goes through here, so the
-        // array commands and the trace tables follow the chain too; they
-        // used to look under the namespace's own name and miss a global
-        // array or a global's traces.
-        match self.ns_chain_global(name) {
-            Some(gkey) => VarLoc::Global(gkey),
-            None => VarLoc::Global(self.redirect_flat(self.canonical_global(name))),
-        }
+        // No proc variable frame: the current namespace's own table —
+        // Tcl 9 resolved the bare name with TCL_NAMESPACE_ONLY whenever
+        // the current namespace is not :: (tclVar.c
+        // TclLookupSimpleVar), so there is no fallback to the :: table.
+        // Everything that asks where a variable lives goes through
+        // here, so the array commands and the trace tables follow the
+        // same single rule.
+        VarLoc::Global(self.redirect_flat(self.canonical_global(name)))
     }
 
     /// Follow an eval-level `upvar` alias (global level): the alias's flat
@@ -690,50 +687,13 @@ impl Interp {
         key
     }
 
-    /// eval 级裸名链命中（名字解析专项 2026-11-03）：tclsh 的变量解析
-    /// 链两级——当前 ns 表 → 全局（**父 ns 不在链上**，nr2.tcl G/H
-    /// 实证）。当前 ns 的基名「存在」（globals 值或 `variable` 声明记
-    /// 录——valueless 声明也截链）→ None（写/删落当前 ns）；否则全局
-    /// 裸键存在 → Some(全局裸键)（写/删落全局）；否则 None（创建点 =
-    /// 当前 ns，B/F-fresh 形状）。proc 帧、限定名、根 ns、dead-alias
-    /// 环境恒 None（现状行为不变）。
-    fn ns_chain_global(&self, bare_name: &str) -> Option<String> {
-        if self.var_frame_idx().is_some()
-            || self.current_namespace.as_ref() == "::"
-            || bare_name.contains("::")
-            || !self.dead_flat.is_empty()
-        {
-            return None;
-        }
-        let ns_key = self.canonical_global(bare_name);
-        let ns_has = self.globals.contains_key(ns_key.as_str())
-            || self
-                .namespaces
-                .get(self.current_namespace.as_ref())
-                .map(|i| i.variables.contains(&ns_key))
-                .unwrap_or(false);
-        if ns_has {
-            return None;
-        }
-        let gkey = self.redirect_flat(bare_name.to_string());
-        if self.global_entry_exists(&gkey) {
-            return Some(gkey);
-        }
-        // A stale `variable` transient link (its namespace target was
-        // unset) must not hide an existing global of the same bare name:
-        // tclsh's fallback is by name, not through the dead link.
-        if gkey != bare_name && self.global_entry_exists(bare_name) {
-            return Some(bare_name.to_string());
-        }
-        None
-    }
-
     /// Whether the :: table has an entry for the bare global `key`, with
     /// a value or without.  One without a value is there from the moment
     /// a trace is put on the variable ([`Interp::note_global_entry`]) or
     /// the `variable` command declares it in `::`; tclsh keeps such a Var
-    /// undefined but present.  Only the namespace chain asks: reads and
-    /// `info exists` of a valueless entry still miss.
+    /// undefined but present.  Asked by the valueless-entry errorCode
+    /// probe for bare names at the :: level: reads and `info exists` of
+    /// a valueless entry still miss.
     fn global_entry_exists(&self, key: &str) -> bool {
         if self.globals.contains_key(key) {
             return true;
@@ -791,6 +751,40 @@ impl Interp {
     pub(crate) fn forget_global_entry(&mut self, name: &str) {
         if let Some(key) = self.global_scalar_key(name) {
             self.phantom_globals.remove(key);
+        }
+    }
+
+    /// tclsh：`global`/`upvar #0` 链接只在链接存活期间保住目标的未定义
+    /// Var——链接随帧消亡时，仍无值的目标连条目一起离表（d27 p21：proc
+    /// 返回后再读 `::gx` 是普通 LOOKUP miss，不是 READ）。帧弹出前对
+    /// 本帧的 Global 链接调用；仍被其他存活帧链接的目标留下。
+    pub(crate) fn drop_frame_global_links(&mut self, frame_idx: usize) {
+        let mut keys: Vec<String> = Vec::new();
+        if let Some(f) = self.frames.get(frame_idx) {
+            for link in f.upvars.values() {
+                if let UpvarLink::Global(g) = link {
+                    // 无值才谈得上瞬态条目；不在 phantom 表的键没有要
+                    // 清的东西（有值的变量本来就该留下）。
+                    if !self.globals.contains_key(g.as_ref())
+                        && self.phantom_globals.contains(g.as_ref())
+                        && !keys.iter().any(|k| k == g.as_ref())
+                    {
+                        keys.push(g.to_string());
+                    }
+                }
+            }
+        }
+        for k in keys {
+            let still_linked = self.frames.iter().enumerate().any(|(i, f)| {
+                i != frame_idx
+                    && f
+                        .upvars
+                        .values()
+                        .any(|l| matches!(l, UpvarLink::Global(g) if g.as_ref() == k.as_str()))
+            });
+            if !still_linked {
+                self.phantom_globals.remove(&k);
+            }
         }
     }
 
@@ -1075,34 +1069,15 @@ impl Interp {
                 .slot_value(name)
                 .or_else(|| frame.locals.get(name))
         } else {
-            // Outside procs an unqualified name resolves in the current
-            // namespace first, then the global namespace (tclsh 8.6.17:
-            // `set v` inside `namespace eval n` reads a `variable`-declared
-            // variable; plain global names still resolve).  Plain `set`/
-            // `unset` at that level always operate on the global table.  A
-            // bare-declared (valueless) name stops the chain: reads fail
-            // rather than falling through to the global variable.
-            if self.current_namespace.as_ref() != "::" {
-                let key = self.redirect_flat(self.canonical_global(name));
-                if let Some(v) = self.globals.get(key.as_str()) {
-                    return Some(v);
-                }
-                if self.ns_var_declared(name) {
-                    return None;
-                }
-            }
-            let redirected = self.redirect_flat(name.to_string());
-            if let Some(v) = self.globals.get(redirected.as_str()) {
-                return Some(v);
-            }
-            if redirected != name {
-                // A `variable` link whose target was unset: tclsh's bare
-                // name resolution falls through to the global namespace
-                // (`set x` in namespace eval after `unset x` reads the
-                // global x, when one exists).
-                return self.globals.get(name);
-            }
-            None
+            // Outside procs an unqualified name resolves ONLY in the
+            // current namespace's own table (Tcl 9: TclLookupSimpleVar
+            // passes TCL_NAMESPACE_ONLY whenever the current namespace
+            // is not :: — the :: table is no longer on the chain).  A
+            // valueless `variable` declaration reads as absent, and a
+            // same-named global is invisible from here (S7: reading a
+            // global-only name inside a namespace body errors).
+            let key = self.redirect_flat(self.canonical_global(name));
+            self.globals.get(key.as_str())
         }
     }
 
@@ -1123,17 +1098,11 @@ impl Interp {
             return;
         }
         if self.var_frame_idx().is_none() {
-            // Bare names in a namespace eval body resolve current ns
-            // first, then the global namespace: an existing global wins
-            // even for writes (`set x 5` in `namespace eval C` writes the
-            // global x), while an absent name is created in the current
-            // namespace (`variable y` + `set y 9` → ::n::y).
-            if !name.contains('(') && !name.contains("::") {
-                if let Some(gkey) = self.ns_chain_global(name) {
-                    self.global_insert(gkey, value);
-                    return;
-                }
-            }
+            // Bare names in a namespace eval body write the current
+            // namespace's own table (Tcl 9: no fallback to :: — an
+            // existing global of the same name is not written; S1
+            // `set g 2` in a body creates ::n::g).  A new name is
+            // created there too (`variable y` + `set y 9` → ::n::y).
             let key = self.redirect_flat(self.canonical_global(name));
             self.global_insert(key, value);
             return;
@@ -1251,8 +1220,9 @@ impl Interp {
             let key = self.redirect_flat(self.canonical_global(name));
             self.globals.remove(key.as_str());
             // Unsetting also forgets the `variable` declaration (tclsh:
-            // `namespace which -variable` afterwards is empty and reads
-            // fall through to the global namespace again).
+            // `namespace which -variable` afterwards is empty).  Tcl 9:
+            // a later read does NOT fall through to a same-named global
+            // — the name is simply absent from the namespace's table.
             if let Some(info) = self.namespaces.get_mut(self.current_namespace.as_ref()) {
                 info.variables.remove(&key);
             }
@@ -1485,12 +1455,9 @@ impl Interp {
         } else if self.current_namespace.as_ref() == "::" {
             self.global_entry_exists(name)
         } else {
-            // Inside a namespace: its table, else the chain's.
+            // Inside a namespace: only that namespace's own entries
+            // count (Tcl 9: the :: table is not on the chain).
             self.ns_var_declared(name)
-                || match self.ns_chain_global(name) {
-                    Some(gkey) => self.global_entry_exists(&gkey),
-                    None => false,
-                }
         }
     }
 
@@ -1621,13 +1588,9 @@ impl Interp {
             }
             let base = array_name.to_string();
             let idx = index.to_string();
-            let mut loc = self.resolve_loc(array_name);
-            // eval 级数组基链（tclsh L 形状）：当前 ns 基无 + 全局基有
-            // → 全局基（元素读写同链；全局基标量 → 既有 isn't-array
-            // 错误归属；全新名建当前 ns 数组不变）。
-            if let Some(gkey) = self.ns_chain_global(array_name) {
-                loc = VarLoc::Global(gkey);
-            }
+            // 数组基解析走 resolve_loc（Tcl 9：裸名只落当前 ns 的表，
+            // 不再链到全局；元素读写同键）。
+            let loc = self.resolve_loc(array_name);
             if self.loc_is_array(&loc) {
                 let key = loc.element_key(index);
                 let existed = self.loc_get(&loc, &key).is_some();
@@ -1714,25 +1677,8 @@ impl Interp {
                     return Ok(value);
                 }
             }
-            // eval 级裸名链（tclsh A 形状）：当前 ns 无此名 + 全局有 →
-            // 写全局（全局是数组 → is-array 错误归属照旧；valueless
-            // variable 声明截链）。
-            if let Some(gkey) = self.ns_chain_global(name) {
-                if self.loc_is_array(&VarLoc::Global(gkey.clone())) {
-                    return Err(Error::runtime(
-                        format!("can't set \"{}\": variable is array", name),
-                        ErrorCode::Generic,
-                    ));
-                }
-                self.global_insert(gkey, value.clone());
-                let fired = self.fire_traces(name, None, "write").map_err(|e| {
-                    Error::runtime(format!("can't set \"{}\": {}", name, e), ErrorCode::Generic)
-                })?;
-                if fired {
-                    return Ok(self.get_var(name).map(|v| v.clone()).unwrap_or_default());
-                }
-                return Ok(value);
-            }
+            // Tcl 9：裸名写只落当前 ns 的表（无全局链；同名全局不写、
+            // 其上的写 trace 也不触发——S9/S14）。落点由 resolve_loc 决定。
             let loc = self.resolve_loc(name);
             // 链接/别名目标为元素形式（深水 DIFF-6：upvar 0 ::a(e) x 的
             // 链接写原按裸键直插，数组标记/元素路由全失）——以限定元素
@@ -2065,12 +2011,8 @@ impl Interp {
         if let Some((array_name, index)) = split_array_ref(name) {
             let base = array_name.to_string();
             let idx = index.to_string();
-            let mut loc = self.resolve_loc(array_name);
-            // eval 级数组基链（tclsh E/L 同链）：当前 ns 基无 + 全局基
-            // 有 → 全局基上删（元素/整基同链）。
-            if let Some(gkey) = self.ns_chain_global(array_name) {
-                loc = VarLoc::Global(gkey);
-            }
+            // 数组基解析走 resolve_loc（Tcl 9：裸名只落当前 ns 的表）。
+            let loc = self.resolve_loc(array_name);
             if self.loc_is_array(&loc) {
                 let key = loc.element_key(index);
                 if self.loc_remove(&loc, &key) {
@@ -2126,14 +2068,8 @@ impl Interp {
             }
         } else {
             let given = name.to_string();
-            let mut loc = self.resolve_loc(name);
-            // eval 级裸名链（tclsh E 形状）：当前 ns 无此名 + 全局有 →
-            // 全局键上删。remove_var 的 ns 规范化会删当前 ns 键——链
-            // 命中由下方直删全局键。
-            let chained = self.ns_chain_global(name);
-            if let Some(gkey) = &chained {
-                loc = VarLoc::Global(gkey.clone());
-            }
+            // Tcl 9：裸名 unset 只看当前 ns 的表（无全局链）。
+            let loc = self.resolve_loc(name);
             if self.loc_is_array(&loc) {
                 // tclsh：整数组 unset 逐元素触发 {a k unset}（D-37③，
                 // per-Var 销毁序——元素 trace 先于整变量 trace）。元素名
@@ -2159,13 +2095,7 @@ impl Interp {
                 self.trace_phantoms.remove(&sk);
                 Ok(())
             } else if self.loc_base_exists(&loc) {
-                if let Some(gkey) = &chained {
-                    // 链命中：直删全局键（当前 ns 无此名，声明表无项可
-                    // 忘；remove_var 会按 ns 规范化删错键）。
-                    self.globals.remove(gkey.as_str());
-                } else {
-                    self.remove_var(name);
-                }
+                self.remove_var(name);
                 // set-old-7.7..7.9: removing the target retires every
                 // frame's seeded mirror (stale reads) while the links
                 // stay live so writes recreate the global.
@@ -2248,21 +2178,9 @@ impl Interp {
             }
         }
         if let Some((array_name, index)) = split_array_ref(name) {
-            let mut loc = self.resolve_loc(array_name);
-            if !self.loc_is_array(&loc)
-                && self.var_frame_idx().is_none()
-                && self.current_namespace.as_ref() != "::"
-                && !array_name.contains("::")
-            {
-                let alt = VarLoc::Global(format!(
-                    "{}::{}",
-                    &self.current_namespace[2..],
-                    array_name
-                ));
-                if self.loc_is_array(&alt) {
-                    loc = alt;
-                }
-            }
+            // Tcl 9: a bare array base is the current namespace's own
+            // (resolve_loc already lands there; no global fallback).
+            let loc = self.resolve_loc(array_name);
             if self.loc_is_array(&loc) {
                 let key = loc.element_key(index);
                 self.loc_get(&loc, &key).is_some()
@@ -2327,11 +2245,10 @@ impl Interp {
             Some(key) => (None, key),
             None => match self.var_frame_idx() {
                 Some(frame) => (Some(frame), name.to_string()),
-                // The namespace chain applies to arrays too.
+                // Tcl 9: a bare array name is the current namespace's.
                 None => (
                     None,
-                    self.ns_chain_global(name)
-                        .unwrap_or_else(|| self.redirect_flat(self.canonical_global(name))),
+                    self.redirect_flat(self.canonical_global(name)),
                 ),
             },
         };

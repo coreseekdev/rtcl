@@ -187,8 +187,8 @@ U ol
 namespace eval nso { variable A 1; variable a 1; variable B 1; variable b 1 }
 chk o10 [T {info vars nso::*}] {0 {::nso::a ::nso::A ::nso::b ::nso::B} NONE}
 namespace eval nso { unset A; set A 2 }
-chk o11 [T {info vars nso::*}] {0 {::nso::a ::nso::b ::nso::B} NONE}
-chk o12 [T {info vars ::nso::*}] {0 {::nso::a ::nso::b ::nso::B} NONE}
+chk o11 [T {info vars nso::*}] {0 {::nso::A ::nso::a ::nso::b ::nso::B} NONE}
+chk o12 [T {info vars ::nso::*}] {0 {::nso::A ::nso::a ::nso::b ::nso::B} NONE}
 U {namespace eval nso { info vars }}
 chk o14 [T {namespace eval nso { info vars A }}] {0 A NONE}
 set top ""

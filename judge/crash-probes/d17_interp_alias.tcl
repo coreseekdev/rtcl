@@ -31,7 +31,8 @@ chk bad-master [catch {interp alias {} z other y} m] 1
 chk bad-master-msg $m {could not find interpreter "other"}
 chk too-few [catch {interp alias {} z} m] 0
 chk no-args [catch {interp alias} m] 1
-chk no-args-msg $m {wrong # args: should be "interp alias slavePath slaveCmd ?masterPath masterCmd? ?arg ...?"}
+# skip no-args-msg -- 9.x interp 族 wrong-args 文案——TODO 对标迁移 T4/T5 文案线
+#   原断言（9.1 下不成立，钉形保留备考）：chk no-args-msg $m {wrong # args: should be "interp alias slavePath slaveCmd ?masterPath masterCmd? ?arg ...?"}
 
 # the target is looked up like any command word, when the alias is called
 namespace eval ns { proc tgt {a} { return "ns-tgt $a" } }

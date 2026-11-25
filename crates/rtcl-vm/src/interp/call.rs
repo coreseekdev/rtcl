@@ -796,6 +796,9 @@ impl Interp {
         // Pop the frame and leave the definition namespace; the emptied
         // frame goes to the pool for the next call (its maps keep their
         // allocation).  Pool depth is naturally bounded by recursion.
+        // The frame's `global`/`upvar #0` links die with it: their
+        // valueless phantom entries leave the table first (d27 p21).
+        self.drop_frame_global_links(self.frames.len() - 1);
         let mut popped = self.frames.pop().unwrap();
         popped.locals.clear();
         popped.locals_order.clear();
@@ -1629,6 +1632,8 @@ impl Interp {
     /// 精简帧出口的弹帧+池归还+trace 键清理（epilogue 共用；命名空间
     /// 恢复由调用方持有 prev_namespace）。
     fn jit_frame_epilogue_pop(&mut self, prev_namespace: Rc<str>) {
+        // The frame's `global`/`upvar #0` links die with it (d27 p21).
+        self.drop_frame_global_links(self.frames.len() - 1);
         let mut popped = self.frames.pop().unwrap();
         popped.locals.clear();
         popped.locals_order.clear();

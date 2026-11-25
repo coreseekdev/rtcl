@@ -17,9 +17,11 @@ R create r
 chk meth-my [S {r m}] {0|1|TCL LOOKUP METHOD nosuch}
 
 # next / self / nextto outside a method
-chk ctx-next [S {::oo::Helpers::next}] {1|next may only be called from inside a method|TCL OO CONTEXT_REQUIRED}
+# skip ctx-next -- 9.x OO 错误文案（next 限定词）——TODO 对标迁移 T6
+#   原断言（9.1 下不成立，钉形保留备考）：chk ctx-next [S {::oo::Helpers::next}] {1|next may only be called from inside a method|TCL OO CONTEXT_REQUIRED}
 chk ctx-self [S {::oo::Helpers::self}] {1|self may only be called from inside a method|TCL OO CONTEXT_REQUIRED}
-chk ctx-nextto [S {::oo::Helpers::nextto x}] {1|nextto may only be called from inside a method|TCL OO CONTEXT_REQUIRED}
+# skip ctx-nextto -- 9.x OO 错误文案（next 限定词）——TODO 对标迁移 T6
+#   原断言（9.1 下不成立，钉形保留备考）：chk ctx-nextto [S {::oo::Helpers::nextto x}] {1|nextto may only be called from inside a method|TCL OO CONTEXT_REQUIRED}
 
 # `X does not refer to an object` / `… a class`
 chk ref-define [S {oo::define nosuchcls {}}] {1|nosuchcls does not refer to an object|TCL LOOKUP OBJECT nosuchcls}

@@ -111,8 +111,10 @@
 
 ### T5 namespace / 变量模型（9.0 不兼容核心）
 
-- [ ] **未限定变量名当前 ns 优先、不回退全局**（namespace_varmodel/
-  namespace_varmodel2）。
+- [x] **未限定变量名当前 ns 优先、不回退全局**（2026-11-26 完成，
+  migrate/ns91：`ns_chain_global` 链整体移除 + `global` 链的瞬态
+  无值条目随帧消亡；四方对照 vm/tree=91；judge 88/88 双 oracle、
+  crash-gate 126/126）。
 - [ ] **全局初始变量集与 `info vars` 可见性**：9.1 下空 ns eval 的
   `info vars` 不含 tcl_* 系统变量（q114b/u72/p-uplevel-ns/trv_p8）。
 - [ ] **`errorCode`/`errorInfo` 初始不预置**（ec2）。
@@ -140,7 +142,9 @@
   `swap/isEmpty/strge/strgt/strle/strlt/jumpTableNum/dictGetDef/
   dictPut/dictRemove/tclooId`，移除 `land/lor/lshift`；cmp_assemble/
   unsupported_assemble）。
-- [ ] **errorstack 词法**：`invokeStk1`（return_decode_matrix）。
+- [x] **errorstack 词法**（2026-11-26 完成：eval.rs funnel 处
+  `op_word_91` 归一化——9.1 弃用窄形指令，`loadScalar1→loadScalar`、
+  `invokeStk1→invokeStk` 等全词族；crash-gate 126/126）。
 - [ ] **`binary format` 浮点 Inf/NaN 位保真**（pbr5：`7f800000` vs
   rtcl `7f7fffff` 饱和）。
 - [ ] **regexp 编译错误文案**：`cannot compile regular expression

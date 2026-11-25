@@ -1,5 +1,8 @@
 # crash-probe: d14 wait
 # gate: skip-tree
+# 9.1 注意：tclsh 9.1 的 `wait` 命令已移除/重做（oracle 下脚本本体报错），
+# 期望值只能来自 8.6.17 钉形。`wait` 的去留是迁移裁定项（TODO 对标迁移 T4
+# 移除项）；裁定前本探针只在 rtcl 上防回归。
 source [file join [file dirname [info script]] _chk.tcl]
 # `wait` used to ask a fresh `sh` to wait for the pid — not the parent —
 # and reported 127 for every child. The status now comes from the handle:

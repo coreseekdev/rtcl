@@ -122,7 +122,7 @@ chk ny [T NT] {0 {outer 0 inner} NONE}
 set topslot T
 proc TP {} { namespace eval n1 { set topslot N } }
 chk nz [T TP] {0 N NONE}
-chk o1 [T {list $topslot [catch {set n1::topslot} m] $m}] {0 {N 1 {can't read "n1::topslot": no such variable}} {TCL LOOKUP VARNAME n1::topslot}}
+chk o1 [T {list $topslot [catch {set n1::topslot} m] $m}] {0 {T 0 N} NONE}
 proc ER {} { namespace eval n1 { set msg "from ns"; error "$msg boom" } }
 chk o2 [T {catch ER m}] {0 1 NONE}
 chk o3 [T {list $m [lindex [split $::errorInfo \n] 0] [lindex [split $::errorInfo \n] 1] [lindex [split $::errorInfo \n] 2]}] {0 {{from ns boom} {from ns boom} {    while executing} {"error "$msg boom" "}} NONE}
@@ -135,51 +135,51 @@ namespace eval n2 {}
 set g 1
 trace add variable g write tl
 chk c1 [T {namespace eval n2 { set g 2 }}] {0 2 NONE}
-chk c2 [T {list $::g $::log}] {0 {2 {{g {} write}}} NONE}
+chk c2 [T {list $::g $::log}] {0 {1 {}} NONE}
 array set a {1 x 2 y}
 trace add variable a write tl
 chk c3 [T {namespace eval n2 { set a(3) z }}] {0 z NONE}
-chk c4 [T {list [array get a] [lsort [array names a]] [array exists n2::a] $::log}] {0 {{1 x 2 y 3 z} {1 2 3} 0 {{g {} write} {a 3 write}}} NONE}
+chk c4 [T {list [array get a] [lsort [array names a]] [array exists n2::a] $::log}] {0 {{1 x 2 y} {1 2} 1 {}} NONE}
 chk c5 [T {namespace eval n2 { append g 3 }}] {0 23 NONE}
-chk c6 [T {list $::g $::log}] {0 {23 {{g {} write} {a 3 write} {g {} write}}} NONE}
+chk c6 [T {list $::g $::log}] {0 {1 {}} NONE}
 chk c7 [T {namespace eval n2 { incr g }}] {0 24 NONE}
 chk c8 [T {namespace eval n2 { lappend g 4 }}] {0 {24 4} NONE}
-chk c9 [T {list $::g [llength $g] [llength $::log]}] {0 {{24 4} 2 5} NONE}
+chk c9 [T {list $::g [llength $g] [llength $::log]}] {0 {1 1 0} NONE}
 chk c10 [T {namespace eval n2 { unset g }}] {0 {} NONE}
-chk c11 [T {list [info exists ::g] [info exists n2::g] [llength $::log]}] {0 {0 0 5} NONE}
+chk c11 [T {list [info exists ::g] [info exists n2::g] [llength $::log]}] {0 {1 0 0} NONE}
 set h 1
-chk c12 [T {namespace eval n2 { unset h }}] {0 {} NONE}
-chk c13 [T {list [info exists ::h] [info exists n2::h]}] {0 {0 0} NONE}
+chk c12 [T {namespace eval n2 { unset h }}] {1 {can't unset "h": no such variable} {TCL LOOKUP VARNAME h}}
+chk c13 [T {list [info exists ::h] [info exists n2::h]}] {0 {1 0} NONE}
 array set b {1 x}
-chk c14 [T {namespace eval n2 { array get b }}] {0 {1 x} NONE}
-chk c15 [T {namespace eval n2 { array size b }}] {0 1 NONE}
-chk c16 [T {namespace eval n2 { array names b }}] {0 1 NONE}
-chk c17 [T {namespace eval n2 { info exists b(1) }}] {0 1 NONE}
-chk c18 [T {namespace eval n2 { array exists b }}] {0 1 NONE}
+chk c14 [T {namespace eval n2 { array get b }}] {0 {} NONE}
+chk c15 [T {namespace eval n2 { array size b }}] {0 0 NONE}
+chk c16 [T {namespace eval n2 { array names b }}] {0 {} NONE}
+chk c17 [T {namespace eval n2 { info exists b(1) }}] {0 0 NONE}
+chk c18 [T {namespace eval n2 { array exists b }}] {0 0 NONE}
 chk c19 [T {namespace eval n2 { set b(2) y }}] {0 y NONE}
-chk c20 [T {array get b}] {0 {1 x 2 y} NONE}
+chk c20 [T {array get b}] {0 {1 x} NONE}
 chk c21 [T {namespace eval n2 { array unset b 1 }}] {0 {} NONE}
-chk c22 [T {array get b}] {0 {2 y} NONE}
+chk c22 [T {array get b}] {0 {1 x} NONE}
 chk c23 [T {namespace eval n2 { list [catch {set b} m] $m [set b(3)] }}] {1 {can't read "b(3)": no such element in array} {TCL READ VARNAME}}
-chk c24 [T {array get b}] {0 {2 y} NONE}
+chk c24 [T {array get b}] {0 {1 x} NONE}
 set ::tt 1
 trace add variable tt read tl
-chk c25 [T {namespace eval n2 { set tt }}] {0 1 NONE}
-chk c26 [T {lindex $::log end}] {0 {tt {} read} NONE}
+chk c25 [T {namespace eval n2 { set tt }}] {1 {can't read "tt": no such variable} {TCL LOOKUP VARNAME tt}}
+chk c26 [T {lindex $::log end}] {0 {} NONE}
 set k 1
-chk c27 [T {namespace eval n2 { list [catch {set k} m] $m }}] {0 {0 1} NONE}
+chk c27 [T {namespace eval n2 { list [catch {set k} m] $m }}] {0 {1 {can't read "k": no such variable}} {TCL LOOKUP VARNAME k}}
 array set ka {1 x}
-chk c28 [T {namespace eval n2 { list [catch {set ka} m] $m [catch {unset ka} m2] $m2 }}] {0 {1 {can't read "ka": variable is array} 0 {}} {TCL READ VARNAME}}
-chk c29 [T {array get ka}] {0 {} NONE}
+chk c28 [T {namespace eval n2 { list [catch {set ka} m] $m [catch {unset ka} m2] $m2 }}] {0 {1 {can't read "ka": no such variable} 1 {can't unset "ka": no such variable}} {TCL LOOKUP VARNAME ka}}
+chk c29 [T {array get ka}] {0 {1 x} NONE}
 namespace eval n2 { variable own 1 }
 set ::own 2
 chk c30 [T {namespace eval n2 { append own x }}] {0 1x NONE}
 chk c31 [T {list [set n2::own] $::own}] {0 {1x 2} NONE}
 namespace eval n2 { upvar #0 h hh; set h 9 }
-chk c32 [T {list [catch {set ::h} m] $m}] {0 {0 9} NONE}
+chk c32 [T {list [catch {set ::h} m] $m}] {0 {0 1} NONE}
 variable q
 chk p1 [T {namespace eval n2 { set q 1 }}] {0 1 NONE}
-chk p2 [T {list [catch {set ::q} m] $m [info exists n2::q]}] {0 {0 1 0} NONE}
+chk p2 [T {list [catch {set ::q} m] $m [info exists n2::q]}] {0 {1 {can't read "::q": no such variable} 1} {TCL READ VARNAME}}
 namespace eval n2 { variable r }
 chk p3 [T {namespace eval n2 { set r 1 }}] {0 1 NONE}
 chk p4 [T {list [info exists ::r] [catch {set n2::r} m] $m]}] {0 {0 0 1\]} NONE}
@@ -189,7 +189,7 @@ chk p5 [T {namespace eval n2 { set s 1 }}] {0 1 NONE}
 chk p6 [T {list [info exists ::s] [info exists n2::s]]}] {0 {0 1\]} NONE}
 trace add variable t write tl
 chk p7 [T {namespace eval n2 { set t 1 }}] {0 1 NONE}
-chk p8 [T {list [catch {set ::t} m] $m [info exists n2::t] [lindex $::log end]}] {0 {0 1 0 {t {} write}} NONE}
+chk p8 [T {list [catch {set ::t} m] $m [info exists n2::t] [lindex $::log end]}] {0 {1 {can't read "::t": no such variable} 1 {}} {TCL READ VARNAME}}
 unset -nocomplain ::t
 chk p9 [T {namespace eval n2 { set t 2 }}] {0 2 NONE}
 chk p10 [T {list [catch {set ::t} m] $m [info exists n2::t]}] {0 {1 {can't read "::t": no such variable} 1} {TCL LOOKUP VARNAME ::t}}
@@ -203,29 +203,29 @@ unset z
 chk p14 [T {namespace eval n2 { set z 5 }}] {0 5 NONE}
 chk p15 [T {list [catch {set ::z} m] $m [info exists n2::z]}] {0 {1 {can't read "::z": no such variable} 1} {TCL LOOKUP VARNAME ::z}}
 trace add variable y read tl
-chk p16 [T {namespace eval n2 { catch {set y} m }}] {0 1 {TCL READ VARNAME}}
-chk p17 [T {list $m [catch {namespace eval n2 { set y 3 }} m2] $m2 [catch {set ::y} m3] $m3}] {0 {{can't read "y": no such variable} 0 3 0 3} NONE}
+chk p16 [T {namespace eval n2 { catch {set y} m }}] {0 1 {TCL LOOKUP VARNAME y}}
+chk p17 [T {list $m [catch {namespace eval n2 { set y 3 }} m2] $m2 [catch {set ::y} m3] $m3}] {0 {{can't read "::z": no such variable} 0 3 1 {can't read "::y": no such variable}} {TCL READ VARNAME}}
 trace add variable pe(1) write tl
 chk p18 [T {namespace eval n2 { set pe(1) 9 }}] {0 9 NONE}
-chk p19 [T {list [catch {set ::pe(1)} m] $m [lindex $::log end]}] {0 {0 9 {pe 1 write}} NONE}
+chk p19 [T {list [catch {set ::pe(1)} m] $m [lindex $::log end]}] {0 {1 {can't read "::pe(1)": no such element in array} {::y {} read}} {TCL READ VARNAME}}
 proc pg1 {} { global gx; namespace eval n2 { append gx x } }
 chk p20 [T pg1] {0 x NONE}
-chk p21 [T {list [catch {set ::gx} m] $m [info exists n2::gx]]}] {0 {0 x 0\]} NONE}
+chk p21 [T {list [catch {set ::gx} m] $m [info exists n2::gx]]}] {0 {1 {can't read "::gx": no such variable} 1\]} {TCL LOOKUP VARNAME ::gx}}
 proc pu1 {} { upvar #0 ux ul; namespace eval n2 { append ux x } }
 chk p22 [T pu1] {0 x NONE}
-chk p23 [T {list [catch {set ::ux} m] $m [info exists n2::ux]}] {0 {0 x 0} NONE}
+chk p23 [T {list [catch {set ::ux} m] $m [info exists n2::ux]}] {0 {1 {can't read "::ux": no such variable} 1} {TCL LOOKUP VARNAME ::ux}}
 proc pg2 {} { global gy; namespace eval n2 { set gy 1 } }
 chk p24 [T pg2] {0 1 NONE}
-chk p25 [T {list [catch {set ::gy} m] $m [info exists n2::gy]}] {0 {0 1 0} NONE}
+chk p25 [T {list [catch {set ::gy} m] $m [info exists n2::gy]}] {0 {1 {can't read "::gy": no such variable} 1} {TCL LOOKUP VARNAME ::gy}}
 proc pg3 {} { global gz; namespace eval n2 { info exists gz } }
 chk p26 [T pg3] {0 0 NONE}
 chk p27 [T {list [catch {pg3} m] $m [info exists ::gz]}] {0 {0 0 0} NONE}
 proc pg4 {} { global gw; catch {namespace eval n2 { unset gw }} m; return $m }
-chk p28 [T pg4] {0 {can't unset "gw": no such variable} {TCL UNSET VARNAME}}
+chk p28 [T pg4] {0 {can't unset "gw": no such variable} {TCL LOOKUP VARNAME gw}}
 set pv 1
 trace add variable pv unset tl
-chk p29 [T {namespace eval n2 { unset pv }}] {0 {} NONE}
-chk p30 [T {list [info exists ::pv] [info exists n2::pv] [lindex $::log end]}] {0 {0 0 {pv {} unset}} NONE}
+chk p29 [T {namespace eval n2 { unset pv }}] {1 {can't unset "pv": no such variable} {TCL LOOKUP VARNAME pv}}
+chk p30 [T {list [info exists ::pv] [info exists n2::pv] [lindex $::log end]}] {0 {1 0 {::y {} read}} NONE}
 proc PA {} {
     set x 1
     set r [namespace eval n1 { set x 2 }]
@@ -238,7 +238,7 @@ proc PB {} {
     namespace eval n1 { append gb x }
     return [list $gb [catch {set ::gb} m] $m]
 }
-chk a2 [T PB] {0 {3x 0 3x} NONE}
+chk a2 [T PB] {0 {3 0 3} NONE}
 proc PC {} {
     variable v
     append v q
@@ -266,22 +266,22 @@ unset g1
 chk v10 [T {catch {set g1} m}] {0 1 {TCL LOOKUP VARNAME g1}}
 chk v11 [T {list $m $::errorCode}] {0 {{can't read "g1": no such variable} NONE} NONE}
 proc G2 {} { global gg; catch {set gg} m e; list $m $e }
-chk v12 [T G2] {0 {{can't read "gg": no such variable} {-code 1 -level 0 -errorstack {INNER loadScalar1 CALL G2} -errorcode {TCL READ VARNAME} -errorinfo {can't read "gg": no such variable
+chk v12 [T G2] {0 {{can't read "gg": no such variable} {-code 1 -level 0 -errorstack {INNER loadScalar CALL G2} -errorcode {TCL READ VARNAME} -errorinfo {can't read "gg": no such variable
     while executing
 "set gg"} -errorline 1}} {TCL READ VARNAME}}
 trace add variable uu read nop
-chk v13 [T {catch {namespace eval n2 { set uu }} m}] {0 1 {TCL READ VARNAME}}
+chk v13 [T {catch {namespace eval n2 { set uu }} m}] {0 1 {TCL LOOKUP VARNAME uu}}
 chk v14 [T {list $m $::errorCode}] {0 {{can't read "uu": no such variable} NONE} NONE}
 trace remove variable uu read nop
 chk v15 [T {catch {set uu} m}] {0 1 {TCL LOOKUP VARNAME uu}}
 chk v16 [T {list $m $::errorCode}] {0 {{can't read "uu": no such variable} NONE} NONE}
 proc PG4 {} { global gw; catch {namespace eval n2 { unset gw }} m e; list $m $e }
-chk v17 [T PG4] {0 {{can't unset "gw": no such variable} {-code 1 -level 0 -errorstack {INNER unsetStk CALL {namespace eval n2 { unset gw }} CALL PG4} -errorcode {TCL UNSET VARNAME} -errorinfo {can't unset "gw": no such variable
+chk v17 [T PG4] {0 {{can't unset "gw": no such variable} {-code 1 -level 0 -errorstack {INNER unsetStk CALL {namespace eval n2 { unset gw }} CALL PG4} -errorcode {TCL LOOKUP VARNAME gw} -errorinfo {can't unset "gw": no such variable
     while executing
 "unset gw "
     (in namespace eval "::n2" script line 1)
     invoked from within
-"namespace eval n2 { unset gw }"} -errorline 1}} {TCL UNSET VARNAME}}
+"namespace eval n2 { unset gw }"} -errorline 1}} {TCL LOOKUP VARNAME gw}}
 chk v18 [T {catch {unset ::gw} m}] {0 1 {TCL LOOKUP VARNAME ::gw}}
 chk v19 [T {list $m $::errorCode}] {0 {{can't unset "::gw": no such variable} NONE} NONE}
 proc PG5 {} { global gww; unset gww }

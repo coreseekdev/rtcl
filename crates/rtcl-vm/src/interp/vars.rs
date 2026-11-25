@@ -4,7 +4,7 @@
 //! `Interp::globals`; inside a proc they use the current `CallFrame`'s
 //! locals (or follow upvar links to globals / other frames).
 
-use super::util::{has_ns_sep, split_array_ref};
+use super::util::{has_ns_sep, is_array_element_name, split_array_ref};
 use super::{tclhash, CallFrame, Interp, Rc, UpvarLink};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
@@ -22,7 +22,7 @@ impl Interp {
         // loop) is brought back to the live entries.
         if self.var_order.len() > 2 * self.globals.len() + 64 {
             let live = |k: &str| self.globals.contains_key(k);
-            compact_order(&mut self.var_order, &live, false);
+            compact_order(&mut self.var_order, &live);
         }
     }
 
@@ -41,13 +41,25 @@ pub(crate) fn frame_local_insert(f: &mut CallFrame, key: String, v: Value) {
     }
     if f.locals_order.len() > 2 * f.locals.len() + 64 {
         let live = |k: &str| f.locals.contains_key(k);
-        compact_order(&mut f.locals_order, &live, true);
+        compact_order(&mut f.locals_order, &live);
     }
 }
 
 /// Remove from a frame's locals (log entry goes stale, as above).
 pub(crate) fn frame_local_remove(f: &mut CallFrame, key: &str) -> Option<Value> {
     f.locals.remove(key)
+}
+
+/// Log a frame-table entry whose creation did not go through
+/// [`frame_local_insert`] — a `global`/`upvar`/`variable` link with
+/// nothing to mirror: tclsh's frame table holds the entry all the same
+/// (`global nosuch; info vars` lists nosuch), and the hash-order replay
+/// needs it in the creation sequence.  A name already logged keeps its
+/// entry (tclsh: a re-link keeps the table position).
+pub(crate) fn frame_log_link(f: &mut CallFrame, key: &str) {
+    if !f.locals_order.iter().any(|o| o == key) {
+        f.locals_order.push(key.to_string());
+    }
 }
 
 /// Bring an insertion log back to what the replay reads of it: the keys
@@ -57,23 +69,14 @@ pub(crate) fn frame_local_remove(f: &mut CallFrame, key: &str) -> Option<Value> 
 /// log without end, and every listing walked all of it.
 ///
 /// The entry kept is the last occurrence — a key made again after a
-/// delete takes a new place in the table — except a frame's plain locals
-/// with `frame` set: tclsh keeps those in the proc's own table of names,
-/// where a local made again takes its old place back, so the first
-/// occurrence is kept for them (an array's elements stay a hash table).
-fn compact_order(order: &mut Vec<String>, live: &dyn Fn(&str) -> bool, frame: bool) {
+/// delete takes a new place in the table.  A frame local too: the listing
+/// replays the creation sequence through the hash mechanics, so the
+/// recreated key must sit at its recreated place (a compiled local is not
+/// in this replay at all — it lists at its slot position).
+fn compact_order(order: &mut Vec<String>, live: &dyn Fn(&str) -> bool) {
     let mut seen: std::collections::HashSet<&str> =
         std::collections::HashSet::with_capacity(order.len());
     let mut keep = vec![false; order.len()];
-    if frame {
-        for (i, k) in order.iter().enumerate() {
-            let element = k.rsplit("::").next().is_some_and(|last| last.contains('('));
-            if !element && live(k) && seen.insert(k.as_str()) {
-                keep[i] = true;
-            }
-        }
-        seen.clear();
-    }
     // Walking back from the end, the first occurrence met is the last.
     for (i, k) in order.iter().enumerate().rev() {
         if live(k) && seen.insert(k.as_str()) {
@@ -580,50 +583,102 @@ impl Interp {
         };
     }
 
-    /// Whole-frame degrade of `frames[frame_idx]` — for sites that enumerate
-    /// the name-keyed store (`info vars`, `info locals`, `info frame`):
-    /// after this, `frame.locals` alone is a complete view again.
-    pub(crate) fn degrade_frame_all_at(&mut self, frame_idx: usize) {
-        let table = {
-            let f = match self.frames.get_mut(frame_idx) {
-                Some(f) => f,
-                None => return,
-            };
-            if f.slots.is_empty() {
-                return;
-            }
-            f.slot_table.take()
-        };
-        let f = &mut self.frames[frame_idx];
-        if let Some(table) = table {
-            // Which names the log already has (a search of the log per
-            // local made degrading a frame with many locals quadratic).
-            let mut logged: super::varmap::VarSet =
-                f.locals_order.iter().map(|o| o.as_str().to_string()).collect();
-            for (i, name) in table.locals().iter().enumerate() {
-                if let Some(cv) = f.slots.get_mut(i) {
-                    if !cv.is_unset() {
-                        let taken = std::mem::replace(cv, Value::unset());
-                        f.locals.insert(name.clone(), taken);
-                        if logged.insert(name.as_str().to_string()) {
-                            f.locals_order.push(name.as_str().to_string());
-                        }
-                    }
-                }
-            }
+    /// Frame-local names in tclsh's listing order, read straight off the
+    /// slot storage — the frame is NOT degraded (the old
+    /// `degrade_frame_all` on every listing demoted each proc frame that
+    /// ever asked for one to the name-keyed store for the rest of its
+    /// life, for nothing: the slots plus the compiled locals table are a
+    /// complete view on their own).
+    pub(crate) fn list_frame_locals(&self, include_links: bool) -> Vec<String> {
+        match self.var_frame_idx() {
+            Some(i) => self.list_frame_locals_at(i, include_links),
+            None => Vec::new(),
         }
-        f.slots.clear();
-        f.slot_aliased.clear();
-        f.link_keys.clear();
-        f.has_aliased = false;
     }
 
-    /// [`Self::degrade_frame_all_at`] on the current frame (no-op at the
-    /// global level).
-    pub(crate) fn degrade_frame_all(&mut self) {
-        if let Some(i) = self.var_frame_idx() {
-            self.degrade_frame_all_at(i);
+    /// [`Self::list_frame_locals`] for an arbitrary frame (`info frame`
+    /// takes a level).  The order is tclsh's `AppendLocals`: the compiled
+    /// locals first — in the slot table's order, parameters first, an
+    /// undefined one not listed — then the frame's dynamic (hash) table,
+    /// replayed through the Tcl hash mechanics over the creation log.
+    /// A `global`/`upvar`/`variable` link is a hash-table entry, so with
+    /// `include_links` it sorts among the dynamic names by hash — never
+    /// with the compiled section.
+    pub(crate) fn list_frame_locals_at(&self, idx: usize, include_links: bool) -> Vec<String> {
+        let Some(frame) = self.frames.get(idx) else {
+            return Vec::new();
+        };
+        // Any kind of upvar link is a link: `info locals` skips it
+        // (tclsh `TclIsVarLink`), `info vars`/`info frame` list it.
+        let linked = |name: &str| frame.upvars.contains_key(name);
+        let mut names: Vec<String> = Vec::new();
+        // 1. Compiled locals, in the slot table's order.  Listed while a
+        //    value is attached: the slot cell, an aliased slot's
+        //    name-keyed cell, an array container, or (in a non-slot
+        //    frame — tree walk, degraded unit) the plain map entry.
+        let compiled: &[String] = frame
+            .compiled
+            .as_ref()
+            .map(|t| t.locals())
+            .unwrap_or(&[]);
+        for (i, name) in compiled.iter().enumerate() {
+            if !include_links && linked(name) {
+                continue;
+            }
+            let exists = if frame.has_aliased
+                && frame.slot_aliased.get(i).copied().unwrap_or(false)
+            {
+                // Link-aliased slot: the cell moved to the name-keyed
+                // store (`degrade_frame_link_at`); the link itself is
+                // the existence (tclsh lists `global nosuch` with no
+                // value at all).
+                frame.locals.contains_key(name.as_str())
+                    || frame.upvars.contains_key(name.as_str())
+            } else {
+                match frame.slots.get(i) {
+                    Some(v) => !v.is_unset(),
+                    // Name-keyed frame (tree walk / degraded unit): the
+                    // map holds what exists, and a link exists by itself.
+                    None => {
+                        frame.locals.contains_key(name.as_str())
+                            || frame.array_locals.contains(name.as_str())
+                            || frame.upvars.contains_key(name.as_str())
+                    }
+                }
+            };
+            if exists {
+                names.push(name.clone());
+            }
         }
+        // 2. The frame's dynamic table: replay the creation log through
+        //    the Tcl hash mechanics.  Array elements live in their
+        //    array's own table, never in the frame's, and compiled-local
+        //    names list in the compiled section (a recreated one returns
+        //    to its old place) — both stay out of the replay, which must
+        //    otherwise see the same population tclsh's table held
+        //    (rebuild thresholds are entry-counted).  A link with
+        //    nothing to mirror is a table entry all the same (logged at
+        //    link time), and the link filter applies to the replayed
+        //    output, not to the replayed population.
+        let is_compiled: std::collections::HashSet<&str> =
+            compiled.iter().map(|s| s.as_str()).collect();
+        let in_table = |k: &str| {
+            frame.locals.contains_key(k) || frame.upvars.contains_key(k)
+        };
+        let dyn_keys: Vec<&str> = frame
+            .locals_order
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|k| {
+                !is_array_element_name(k) && !is_compiled.contains(k) && in_table(k)
+            })
+            .collect();
+        for k in tclhash::tcl_order(dyn_keys) {
+            if include_links || !linked(k) {
+                names.push(k.to_string());
+            }
+        }
+        names
     }
 
     /// [`Self::degrade_frame_local`] on the current frame (no-op at the

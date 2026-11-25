@@ -517,7 +517,10 @@ tclsh 是 `TCL UNSET VARNAME`，rtcl 是 `TCL LOOKUP ELEMENT 1`；数组
 写 trace 报错时 `-errorstack` 里 tclsh 记 `wa`，rtcl 记
 `invokeStk1 wa`。(1)(2) 要等 §3.2 的第三步。
 
-**T6 通道的缓冲读（事务）**
+**T6 通道的缓冲读（✅ 2026-11-26 完成，task/t6 @ f699214；**
+P9 文件读 396ms→36.7ms=1.38×、P1 TCP 597ms→5.6ms=1.17×（tclsh9.1 同窗）；
+遗留：gets 循环 2.6× 在命令层（TODO 性能段新项）、9.1 坏字节严格解码归迁移。**
+原任务书：**T6 通道的缓冲读（事务）**
 P1：TCP 读每字节一次系统调用，3MiB 要 387ms（tclsh 5ms）；P9：文件
 读逐字节，32MB 要 0.6 秒（tclsh 58ms）。都在 `channel.rs`。验收：
 两个数字到 tclsh 的 3 倍以内，`judge/corpus` 里 io 相关的文件不变。
@@ -534,7 +537,12 @@ P1：TCP 读每字节一次系统调用，3MiB 要 387ms（tclsh 5ms）；P9：�
 - P6：变量表的哈希不扩散，同前缀的名字退化（`interp/varmap.rs`）。
   先量出现在还成不成立。
 
-**T8 P7 编译期（事务：先定位热点）**
+**T8 P7 编译期（✅ 2026-11-26 定位+修复完成，task/p7-prof @ 4d9ba2a；**
+热点三连：count_lines 前缀重扫（O(字节²)，88%）/add_local 线性扫（90%）/
+fuse_pairs retarget 交叉积（4.7%）——LineIndex+HashMap 修掉，for5000 0.28s→
+0.01s（0.5× tclsh）、set16000 0.15s→0.01s（1×）；行号 22 形状电池逐字节不变；
+记录见 bench/BASELINE.md 2026-11-26 节。**
+原任务书：**T8 P7 编译期（事务：先定位热点）**
 2026-11-25 重量的结果：字节码上限以内，循环多的单元编译是超线性
 的——3000 个 `for` 0.18 秒，4000 个 0.28 秒，5000 个 0.47 秒（tclsh
 2 万个 0.10 秒）；不同变量名多的单元也是——16000 个 `set kN 1` 0.15

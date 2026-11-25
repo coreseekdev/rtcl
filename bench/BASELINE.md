@@ -2645,3 +2645,39 @@ dict getdef（rtcl 多出的 8.7 特性）/errorstack+errorline+options 键序
 # 门禁：judge 88/88×2、battery 43/43（+b34-b43 流/体帧固化）、fuzz
 # seed0 500 例 5 分歧（HEAD 41；残余见上）、workspace tests 1420/0、
 # roundtrip（jit-exec）5/5。
+
+## 审计后续轮 perf wave——T6 通道缓冲 + P7 编译期三连（f699214/4d9ba2a，2026-11-26，子代理施工）
+
+### T6 通道缓冲读（task/t6 @ f699214）
+- P9 文件 32MB `read`：396ms → **36.7ms**（tclsh9.1 同窗 26.6ms，**1.38×**；原 14.1×）。
+- P1 TCP 3MiB `read`：597ms → **5.6ms**（tclsh9.1 4.8ms，**1.17×**；原 127×）。
+- 做法：Channel trait 加 `fill_buf`/`buf_consume`（FileChannel/OsStdin/PipeChannel 委托
+  自身 BufReader；TcpChannel 自带 64KB in_buf）；read/gets 块快路径（utf-8/字节编码、
+  无 eofchar、管线无残留时整片扫描 EOL 翻译；片尾悬置 CR 不消费交慢路径裁决）；
+  chan copy 同编码整片快路。**试错教训**：cfg 级预读块会脱同步 tell/seek-Current/r+
+  写回卷（tell 25 vs 8 实测）——缓冲必须在通道内，不进 config。
+- 基准脚本入仓：`bench/scripts/channel_read_bench.sh` + file/tcp-server/tcp-client tcl。
+- 遗留：gets 循环 61 万行 920ms vs tclsh 345ms（2.6×）——瓶颈在每行 Value 装箱/
+  `set_var` 命令层，非通道层，未动（新台账项）；9.1 对坏字节 `read` 报严格 utf-8
+  错误（rtcl 仍 8.6 逐字节出字符）——归 TODO 对标迁移 encoding 面。
+
+### P7 编译期三连（task/p7-prof @ 4d9ba2a，先 perf 定位后修复）
+- 定位（perf 可用，paranoid=-1，样本 211–522/形状）：for 形 **88% 在 count_lines
+  前缀重扫**（每内联体从源码 0 字节重数换行 → O(字节²)，字节缩放实验锁死）；set
+  异名形 **90% 在 add_local 线性扫**（`add_const_wide` 早有索引、局部表漏了——同名
+  A/B 0.01s vs 异名 0.15s）；fuse_pairs retarget 交叉积 4.7%（修完 #1 后的主要超
+  线性项，一并修）。行号站点存储侧排除（emit 摊销 O(1)，profile 无热点）。
+- 修复：LineIndex O(n) 前缀表 + partition_point 二分（**22 形状行号电池修复前后
+  errorInfo 逐字节 diff 为空**，第一版把换行计数误当偏移被电池当场抓住）；add_local
+  加 `local_index: HashMap`（locals Vec 插入顺序不动——槽号契约）；retargets →
+  HashMap（from 值每窗口唯一，五臂 apply 语义不变）。
+- 数字（同窗 best-of-3，负载 4.4–8.6）：for5000 0.28s → **0.01–0.02s**（tclsh9.1
+  0.03–0.04s，~7× → **0.5×**）；set16000 异名 0.12–0.15s → **0.01–0.02s**（~11–15×
+  → **1×**）；字节缩放 108→222KB 修复后恒 0.01s，二次型消失。
+- 顺带定性：PARSE_CACHE_MAX_SCRIPT=256KB 封住大单元可观测窗口（for20000=764KB、
+  set30000=270KB 均走树，见 specs/TREE-FALLBACK-TRIGGERS.md F5）；body_inlinable
+  同体解析两遍（线性 ~0.7%，未动）。
+- 门禁：judge 88/88（9.1 oracle）、crash-gate 126/126、sweep 12 既有名单不新增、
+  probes 315/122 不新增、quick-gates 全 rc=0、workspace exit 0。objsec 探针曾单轮
+  123（墙钟秒数跨 1s 边界，负载 ~13 抖动；同二进制 3/3 复跑 MATCH + 修复前二进制
+  复核 123 名单确认唯一波动）。

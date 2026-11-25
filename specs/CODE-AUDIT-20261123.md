@@ -174,7 +174,7 @@
 
 | # | 问题 | rtcl | tclsh | 位置 |
 |---|---|---|---|---|
-| P1 | TCP 读每字节一次系统调用（3MiB） | 387ms | 5ms | `channel.rs` |
+| P1 | TCP 读每字节一次系统调用（3MiB） | 387ms | 5ms | `channel.rs` | 已修（2026-11-26，task/t6 @ f699214）：TcpChannel 64KB in_buf + read 块快路径；3MiB 597ms→5.6ms（tclsh9.1 同窗 4.8ms，1.17×） |
 | P2 | `string map` 每字符重建剩余串（15 万字节） | 7.1s | 8ms | `commands/string_cmds.rs` | 已修（M7）：一趟扫描，按字节匹配；64KB 从 1.0s 到 0.7ms（tclsh 0.8ms）。顺带：奇数个元素的 map 给 `TCL OPERATION MAP UNBALANCED`，不是列表的 map 报列表错误（原来静默当成一个词）。探针 d22（28 条断言） |
 | P3 | `append` 每次两份整串拷贝（8 万次） | 4.7s | 10ms | `commands/misc.rs` | 已修（M7）：变量里是普通字符串、没有 trace、没有链接时直接接到它自己的缓冲区上（值被别处共享时先复制一份，同 tclsh 对共享对象的做法）；其余情况走原来的路，只拷一次。proc 里 2 万次 `append s $i`：49ms → 1.5ms（tclsh 0.75–1.5ms），8 万次 `append s x`：81ms → 3.7ms（tclsh 1.6–3.3ms）。同一改法用在 `lappend`、`dict set`、`incr` 的快路径上（原来都是取出再放回）：`lappend` 0.86ms → 0.49ms。树引擎仍慢（2 万次 18ms，见 P10）。探针 d26（79 条断言） |
 | P4 | `info vars` 超线性（8 万变量）；`TclTable::insert` 每次全扫桶 | 13.2s | 整段 11ms | `interp/tclhash.rs` | 已修（M7）：`info vars` 对每个列出的名字再线性搜一遍条目表（平方），`info commands` 同一处；插入时不再全扫桶；顺序重放改为借用键（不再每个键拷三次）。`info vars` 4 万变量 0.9s → 约 0.02s |
@@ -183,10 +183,10 @@
 | P15 | （M7）`string length`/`index`/`range`/`first`/`last` 每次调用都把整串收集成 `Vec<char>` 再逐个比较：24KB 的串上 `string length` 2µs、`string index` 13–18µs、`string range` 14–25µs、`string first` 命中 13µs / 未命中 67µs（tclsh 0.1–0.3 / 7–8） | 13–18µs | 0.1–0.3µs | `commands/string_cmds.rs` | 已修（M7）：长度、下标、区间直接按字节走（ASCII 一步到位，非 ASCII 只走一段）；`first`/`last` 交给标准库的子串搜索，命中位置的字节偏移一次数回字符。24KB 上 `length`/`index` ≤1µs、`range` 1–3µs（tclsh 0.1–0.5），`first` 命中 1µs、未命中 8–10µs（tclsh 7–8）；非 ASCII 的 `index` 16µs → 1µs。还慢的：`string last` 命中 2µs（tclsh 0.1）；带空格的长模式在无空格文本上未命中 47µs（tclsh 14，标准库挑的过滤字节每个位置都命中）；非 ASCII 串上命中位置靠后时仍要数一遍字符（`u-last` 27–40µs，tclsh 0.2——没有缓存字符长度）。探针 d25（209 条断言） |
 | P16 | （M7）命名空间体里（没有 proc 帧）的裸名变量读写都走慢路径，每次六七次 `String` 分配：`judge/audit-cases/bench-ns-body.tcl` 里 1500 万次读写要 38–43 秒（tclsh 8.6 是 3.5 秒、9.1 是 2.6 秒），每次约 2.5µs；rtcl 在顶层是 0.19µs | 约 40s | 2.6s | `interp/vars.rs` `read_var_scalar_top`、`resolve_loc`、`canonical_global` | 未修：C54 把链去掉之后只剩一个键，可以给顶层的两条快路径加一条带命名空间前缀的分支 |
 | P6 | 变量哈希不扩散，同前缀名退化 | 超线性 | 线性 | `interp/varmap.rs` |
-| P7 | 编译期超线性。2026-11-25 重量：字节码上限以内，3000 个 `for` 0.18 秒、4000 个 0.28 秒、5000 个 0.47 秒（tclsh 2 万个 0.10 秒）；16000 个不同变量名的 `set` 0.15 秒（tclsh 0.02 秒）。再往上单元整个回落树引擎，不再编译（C55）。审计当天记的「2 万个 `for` 4.6 秒」现在量不到，是被回落挡掉的 | 0.47s | 0.03s | `parser/src/compiler.rs` | 未修：热点还没定位。码表第二步补了宽跳转之后这些单元会回到 VM 上编译，要先或在同时解决 |
+| P7 | 编译期超线性。2026-11-25 重量：字节码上限以内，3000 个 `for` 0.18 秒、4000 个 0.28 秒、5000 个 0.47 秒（tclsh 2 万个 0.10 秒）；16000 个不同变量名的 `set` 0.15 秒（tclsh 0.02 秒）。再往上单元整个回落树引擎，不再编译（C55）。审计当天记的「2 万个 `for` 4.6 秒」现在量不到，是被回落挡掉的 | 0.47s | 0.03s | `parser/src/compiler.rs` | 已修（2026-11-26，task/p7-prof @ 4d9ba2a）：热点三连 count_lines 前缀重扫/add_local 线性扫/fuse_pairs retarget 交叉积（perf 定位）；for5000 0.28s→0.01s（0.5× tclsh9.1）、set16000 0.15s→0.01s（1×）；行号 22 形状电池逐字节不变 |
 | P8 | 正则捕获组量词立方级；相邻变长捕获组 `(a+)(b+)` 是 O(n³)（400 字符单次 20ms、800 字符跑不完，基线版本 400 字符即挂死）；lookahead 慢约 9 倍；每次调用重新编译模式（无捕获 7–12µs、带捕获 12µs 对 tclsh 0.5µs） | 2.8s / 20ms / 12µs | 33ms / 7µs / 0.58µs | `regexp-spencer/src/captures.rs`、`commands/regexp_cmds.rs` |已修（M7，调用期开销）：(1) 模式每次调用都重新编译，现在是每线程 16 个引擎的缓存（`regexp`/`regsub`/`lsort`/`switch`/`array names` 共用），Spencer 的匹配器随引擎进池复用——它每次调用都要重建颜色表；(2) 纯文本模式直接做子串搜索（`regexp -nocase {ABC}` 每次 10.9µs → 0.2–0.3µs，tclsh 0.15–0.2）；(3) 长文本先只制表前 1024 个字符（`^abc` 对 40KB 每次 6.9µs → 0.15–0.3µs，tclsh 0.01）。`\d+` 5.9µs → 0.5–0.7µs（tclsh 0.3–0.4），带捕获 8.3µs → 0.7–0.9µs（tclsh 4.5–6.5）。探针 d24（153 条断言） |
 | P8a | （已修，M2）上行的前三项：定长操作数按算术数迭代；切分点由一次锚定 NFA 模拟给出而不是逐个盲试；定长部分只有一个候选切分点 | 20ms / 2.8s | 7µs / 33ms | 同上 |
-| P9 | 文件读取逐字节（32MB） | ≈0.6s | 58ms | `channel.rs` |
+| P9 | 文件读取逐字节（32MB） | ≈0.6s | 58ms | `channel.rs` | 已修（2026-11-26，task/t6 @ f699214）：FileChannel fill_buf + read/gets 块快路径；32MB 396ms→36.7ms（tclsh9.1 同窗 26.6ms，1.38×） |
 | P10 | 树引擎对嵌套立方级，且无条件编译 | >10s | 0.2s | `interp/eval.rs` |
 | P11 | 每次创建子解释器约 460KB / 3.4ms | — | — | `commands/interp_cmd.rs` |
 | P12 | JIT 每次命令分派按行号 memcpy；模块池满即全清（读码） | — | — | `rtcl-jit/src/exec.rs` |

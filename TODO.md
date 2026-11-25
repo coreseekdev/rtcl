@@ -76,6 +76,10 @@
 - [ ] **`string is dict`** + 字符类清单与 `ambiguous class` 文案
   （probe5/probe9）。
 - [ ] **`source` 默认 UTF-8**（9.0 国际化线；rtcl 读脚本编码路径核对）。
+- [ ] **通道读坏字节的 9.x 严格解码**：tclsh9.1 对 `read` 遇坏字节报
+  `error reading ...: invalid or incomplete multibyte or wide character`，
+  rtcl 仍按 8.6 逐字节出字符（T6 的 fuzz 差分实测，fuzz 比对已绕开）。
+  归本组 encoding 面。
 
 ### T4 命令清单（17 缺 + 移除项 + 子命令面）
 
@@ -208,6 +212,9 @@
   插入（IndexMap rehash/alloc，摊销固有）——进一步需下表的 VarMap 键表示层。
 - [x] **rtcl-vm 边界 unfused()**（Round P）：`execute()` 入口展开融合 op
   （与 JIT 同桥）；canonical 集之外的面（lappend 族）维持其既有显式拒绝。
+- [ ] **gets 循环 2.6×（T6 遗留，2026-11-26）**：61 万行 gets 920ms vs
+  tclsh 345ms——快慢路径已同速，瓶颈在每行 Value 装箱/`set_var` 命令层
+  （bench/scripts/channel_read_bench.sh）。
 - [ ] **OO 派发 per-call 字符串面（Round O 画像，oovars 0.69x）**：
   1. prelink 索引预计算：链 memo 构建时把 `(slot_idx, key, name)` 预先算好
      （编译体 locals 已知），每调用安装省去 `resolve_var_link` memo 探测 +

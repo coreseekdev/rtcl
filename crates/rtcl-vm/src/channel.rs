@@ -44,6 +44,15 @@ pub trait Channel: Send {
     fn eof(&self) -> bool;
     /// 标记通道 EOF（`-eofchar` 命中——tclsh 的 eofchar 等价 EOF 位）。
     fn set_at_eof(&mut self) {}
+    /// 块读快路径的填充-消费面（std `BufRead` 的通道版，P1/P9 缓冲读）。
+    /// `fill_buf` 返回当前可连续读取的字节（空切片 = 缓冲尽且底层读到
+    /// EOF，实现应自置 EOF 位）；`buf_consume(n)` 随后报告消费。两者
+    /// 之间位置语义（tell/seek/r+ 写回卷）由实现自身记账。默认不支持
+    /// （读管线回落逐字节 `read_bytes` 路径，语义不变）。
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "no buffered read"))
+    }
+    fn buf_consume(&mut self, _n: usize) {}
     fn close(self: Box<Self>) -> io::Result<()>;
     /// Close for good because the process is leaving. A real `close` may
     /// wait — a pipe channel for its child, a socket for a pending
@@ -161,9 +170,228 @@ pub(crate) fn channel_write_str_utf8_cfg(
     Ok(translated.len())
 }
 
+/// 一次系统调用读入的预读块大小（P1/P9：读按块走——`read`/`gets`/
+/// `chan copy` 与慢路径的 `read_byte` 都从块里取字节，块空才碰底层）。
+const READ_CHUNK: usize = 64 * 1024;
+
+/// 字节型编码（1 字节 = 1 字符，无解码状态）。
+fn is_byte_encoding(enc: &str) -> bool {
+    matches!(enc, "ascii" | "iso8859-1" | "identity" | "binary")
+}
+
+/// 读管线快路径前提：无 eofchar、无残留解码字符/回推字符/残字，
+/// 编码是 utf-8 或字节型。其余情况走原逐字符路径（语义不变）。
+fn fast_read_ok(cfg: &ChannelConfig, enc: &str) -> bool {
+    cfg.eofchar_in.is_none()
+        && cfg.read_pending.is_empty()
+        && cfg.read_chars.is_empty()
+        && cfg.read_bytes.is_empty()
+        && (enc == "utf-8" || is_byte_encoding(enc))
+}
+
+/// utf-8 头扫描：(有效前缀长, 坏段)。`None`：valid==len 即全有效，
+/// 否则尾部不完整（等更多字节或 EOF）；`Some(k)`：valid 后 k 字节判废。
+fn utf8_head(buf: &[u8]) -> (usize, Option<usize>) {
+    match std::str::from_utf8(buf) {
+        Ok(_) => (buf.len(), None),
+        Err(e) => (e.valid_up_to(), e.error_len()),
+    }
+}
+
+fn find_byte(s: &[u8], b: u8) -> Option<usize> {
+    s.iter().position(|&c| c == b)
+}
+
+/// 字节编码（binary/ascii/iso8859-1/identity）的字节→字符推入：ASCII
+/// 段整段推，高位字节逐个出字符（与慢路径 `b as char` 一致）。
+fn push_latin1(out: &mut String, bytes: &[u8]) {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] < 0x80 {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] < 0x80 {
+                j += 1;
+            }
+            // SAFETY: [i..j) 全是 ASCII。
+            out.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[i..j]) });
+            i = j;
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+}
+
+/// 文本段的容量裁剪与字符计数：返回 (消费字节数, 字符数)。`capped`
+/// 为 false（读到 EOF）不计数。utf-8 按字符边界裁；字节编码字节=字符。
+fn cap_segment(seg: &[u8], want: usize, capped: bool, utf8: bool) -> (usize, usize) {
+    if !capped {
+        return (seg.len(), 0);
+    }
+    if !utf8 {
+        let e = want.min(seg.len());
+        return (e, e);
+    }
+    // SAFETY: seg 是已验证的 UTF-8 前缀的子段。
+    let text = unsafe { std::str::from_utf8_unchecked(seg) };
+    let mut cnt = 0usize;
+    for (off, _) in text.char_indices() {
+        if cnt == want {
+            return (off, cnt);
+        }
+        cnt += 1;
+    }
+    (seg.len(), cnt)
+}
+
+/// 文本段推入（utf-8 原文整段直推；字节编码按字节值出字符）。
+fn emit_text(out: &mut String, bytes: &[u8], utf8: bool) {
+    if utf8 {
+        // SAFETY: bytes 是已验证 UTF-8 前缀的子段。
+        out.push_str(unsafe { std::str::from_utf8_unchecked(bytes) });
+    } else {
+        push_latin1(out, bytes);
+    }
+}
+
+/// 输入侧 EOL 翻译的块扫描（`read` 快路径）：把 `s`（已验证 UTF-8 或
+/// 字节编码原始字节）翻译后追加 `out`，至多 `max_chars` 字符（
+/// usize::MAX = 不限量）。返回 (消费字节数, 推入字符数)。
+///
+/// 翻译语义与原逐字符路径一致：Lf 原样；Cr 每个孤立 CR→LF；Auto
+/// CRLF→LF、孤立 CR→LF；CrLf CRLF→LF、孤立 CR 保留为 CR。
+///
+/// 悬置 CR：Auto/CrLf 片尾 CR 的裁决要下一字节——不消费该 CR（留在
+/// 实现缓冲里），调用方以返回值 `consumed < 片长` 检出并交慢路径
+/// 单步裁决。
+fn push_translated_text(
+    s: &[u8],
+    mode: TranslationMode,
+    max_chars: usize,
+    utf8: bool,
+    out: &mut String,
+) -> (usize, usize) {
+    let n = s.len();
+    let capped = max_chars != usize::MAX;
+    let mut i = 0usize;
+    let mut chars = 0usize;
+    while i < n && chars < max_chars {
+        // 内容段：Lf 整段（CR 不翻译）；其余到下一个 \r。
+        let seg_end = if mode == TranslationMode::Lf {
+            n
+        } else {
+            find_byte(&s[i..], b'\r').map_or(n, |k| i + k)
+        };
+        if seg_end > i {
+            // cap_segment 的偏移相对段首，换回绝对位。
+            let (rel_end, cnt) = cap_segment(&s[i..seg_end], max_chars - chars, capped, utf8);
+            emit_text(out, &s[i..i + rel_end], utf8);
+            i += rel_end;
+            chars += cnt;
+            if i >= seg_end || chars >= max_chars {
+                continue;
+            }
+        }
+        if i >= n || chars >= max_chars {
+            break;
+        }
+        // s[i] == b'\r'（Lf 的段是整段，到不了这里）。
+        if mode == TranslationMode::Cr {
+            out.push('\n');
+            i += 1;
+            chars += 1;
+            continue;
+        }
+        // Auto / CrLf。
+        if i + 1 < n {
+            let paired = s[i + 1] == b'\n';
+            out.push(if paired || mode == TranslationMode::Auto { '\n' } else { '\r' });
+            i += if paired { 2 } else { 1 };
+            chars += 1;
+        } else {
+            break; // 悬置：CR 留在实现缓冲里
+        }
+    }
+    (i, chars)
+}
+
+/// gets 的块扫描结果。
+enum LineScan {
+    /// 行界找到：行内容 `content` 字节，共消费 `consumed` 字节。
+    Hit { content: usize, consumed: usize },
+    /// 本段无行界可判：前 `content` 字节收作行内容（悬置尾 CR 不含）。
+    Content { content: usize },
+}
+
+/// gets 块扫描（原逐字符路径的行界语义）：Lf/Cr 单字节界；Auto 取首个
+/// LF 或 CR（CR 带后视配对 LF，配不上即孤立 CR 为界）；CrLf 只认 CRLF
+/// （孤 CR/孤 LF 是行内容）。片尾悬置 CR 不消费——调用方以 `Content`
+/// 检出并交慢路径单步裁决（真 EOF 的 CR 也由慢路径收束）。
+fn line_scan(s: &[u8], mode: TranslationMode) -> LineScan {
+    let n = s.len();
+    match mode {
+        TranslationMode::Lf => match find_byte(s, b'\n') {
+            Some(k) => LineScan::Hit { content: k, consumed: k + 1 },
+            None => LineScan::Content { content: n },
+        },
+        TranslationMode::Cr => match find_byte(s, b'\r') {
+            Some(k) => LineScan::Hit { content: k, consumed: k + 1 },
+            None => LineScan::Content { content: n },
+        },
+        TranslationMode::Auto => {
+            let lf = find_byte(s, b'\n');
+            let cr = find_byte(s, b'\r');
+            let cr_hit = |k: usize| {
+                if k + 1 < n {
+                    LineScan::Hit {
+                        content: k,
+                        consumed: if s[k + 1] == b'\n' { k + 2 } else { k + 1 },
+                    }
+                } else {
+                    LineScan::Content { content: k } // 悬置
+                }
+            };
+            match (lf, cr) {
+                (None, None) => LineScan::Content { content: n },
+                (Some(l), None) => LineScan::Hit { content: l, consumed: l + 1 },
+                (None, Some(k)) => cr_hit(k),
+                (Some(l), Some(k)) => {
+                    if k < l {
+                        cr_hit(k)
+                    } else {
+                        LineScan::Hit { content: l, consumed: l + 1 }
+                    }
+                }
+            }
+        }
+        TranslationMode::CrLf => {
+            // 只认 \r\n；孤 \r、孤 \n 都是行内容。
+            let mut i = 0usize;
+            while i < n {
+                if s[i] == b'\r' {
+                    if i + 1 < n {
+                        if s[i + 1] == b'\n' {
+                            return LineScan::Hit { content: i, consumed: i + 2 };
+                        }
+                        i += 1;
+                    } else {
+                        // 片尾 \r：悬置（CR 留在实现缓冲里）。
+                        return LineScan::Content { content: i };
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            LineScan::Content { content: n }
+        }
+    }
+}
+
 /// 字符级通道读取器：负责按 `-encoding` 增量解码 + 按
 /// `-translation`（输入侧）翻译 EOL。未成形的多字节尾巴、CR 前瞻
 /// 回推字符都持久化在 [`ChannelConfig`] 中（跨 read/gets 调用）。
+/// 底层字节经 [`Channel::fill_buf`] 块面供给（实现内部缓冲，一次
+/// 系统调用读一块；快路径整段扫描，慢路径逐字节从块里取）。
 struct ChannelReader<'a> {
     ch: &'a mut dyn Channel,
     cfg: &'a mut ChannelConfig,
@@ -175,9 +403,21 @@ impl<'a> ChannelReader<'a> {
     }
 
     fn read_byte(&mut self) -> io::Result<Option<u8>> {
-        let mut b = [0u8; 1];
-        let n = self.ch.read_bytes(&mut b)?;
-        Ok(if n == 0 { None } else { Some(b[0]) })
+        match self.ch.fill_buf() {
+            Ok(buf) if buf.is_empty() => Ok(None),
+            Ok(buf) => {
+                let b = buf[0];
+                self.ch.buf_consume(1);
+                Ok(Some(b))
+            }
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                // 无块面的实现：原逐字节路径。
+                let mut b = [0u8; 1];
+                let n = self.ch.read_bytes(&mut b)?;
+                Ok(if n == 0 { None } else { Some(b[0]) })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// 从字节尾巴里尝试解出一个字符；`None` = 需要更多字节。
@@ -352,6 +592,360 @@ impl<'a> ChannelReader<'a> {
             }
         }
     }
+
+    /// `read`（至多 `cap` 字符，usize::MAX = 到 EOF）的块读快路径。
+    /// 对 `fill_buf` 片整段翻译扫描；坏段/不完整尾/悬置 CR 逐字节回
+    /// 原路径（语义等价——快路径只消费与原路径产出一致的字节，其余
+    /// 原样留在实现缓冲里）。
+    fn text_read(&mut self, enc: &str, cap: usize) -> io::Result<String> {
+        let mut out = String::new();
+        let mut chars = 0usize;
+        let utf8 = self.cfg.encoding == "utf-8";
+        let mode = self.cfg.translation_in;
+        loop {
+            if chars >= cap {
+                break;
+            }
+            let avail = match self.ch.fill_buf() {
+                Ok(a) => a,
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                    // 无块面的实现：整段回逐字节路径。
+                    self.text_slow(enc, cap - chars, &mut out)?;
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            if avail.is_empty() {
+                break; // EOF（实现已置 EOF 位）
+            }
+            let (valid, bad) = if utf8 { utf8_head(avail) } else { (avail.len(), None) };
+            if valid > 0 {
+                let (consumed, pushed) =
+                    push_translated_text(&avail[..valid], mode, cap - chars, utf8, &mut out);
+                self.ch.buf_consume(consumed);
+                chars += pushed;
+                if chars >= cap {
+                    break;
+                }
+                if consumed < valid {
+                    // 片尾悬置 CR：慢路径单步裁决（真 EOF 也由它收束）。
+                    if self.text_slow(enc, 1, &mut out)? == 0 {
+                        break;
+                    }
+                    chars += 1;
+                }
+                // 慢路径 CR 前瞻可能回推了字符：排空后恢复快路径。
+                while !self.cfg.read_pending.is_empty() && chars < cap {
+                    chars += self.text_slow(enc, 1, &mut out)?;
+                }
+                continue;
+            }
+            match bad {
+                // 判废字节段：逐字节值出字符（与逐字节路径一致；段内
+                // 字节均 ≥ 0x80，无 EOL 翻译面）。
+                Some(k) => {
+                    for &b in &avail[..k] {
+                        out.push(b as char);
+                    }
+                    self.ch.buf_consume(k);
+                    chars += k;
+                }
+                // 不完整多字节尾巴：慢路径单步补读解出。
+                None if valid == 0 => {
+                    if self.text_slow(enc, 1, &mut out)? == 0 {
+                        break;
+                    }
+                    chars += 1;
+                }
+                None => unreachable!("valid==len 时不会进入此分支"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// 逐字符文本读的原路径（原 channel_read_chars_cfg/all 的循环）。
+    /// 追加至 `out`，至多 `cap` 字符。返回追加的字符数。
+    fn text_slow(&mut self, enc: &str, cap: usize, out: &mut String) -> io::Result<usize> {
+        let mut chars = 0usize;
+        while chars < cap {
+            match self.next_translated(enc)? {
+                Some(c) => {
+                    out.push(c);
+                    chars += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(chars)
+    }
+
+    /// gets 的块读快路径（前提见 fast_read_ok）。返回 None = EOF 且
+    /// 无任何内容（gets 报 -1）。
+    fn line_read(&mut self, enc: &str, mode: TranslationMode) -> io::Result<Option<String>> {
+        let mut out = String::new();
+        let mut saw = false;
+        let utf8 = self.cfg.encoding == "utf-8";
+        loop {
+            let avail = match self.ch.fill_buf() {
+                Ok(a) => a,
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => {
+                    self.line_slow(enc, mode, &mut out, &mut saw)?;
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            if avail.is_empty() {
+                break; // EOF（实现已置 EOF 位）
+            }
+            let (valid, bad) = if utf8 { utf8_head(avail) } else { (avail.len(), None) };
+            if valid > 0 {
+                match line_scan(&avail[..valid], mode) {
+                    LineScan::Hit { content, consumed } => {
+                        emit_text(&mut out, &avail[..content], utf8);
+                        self.ch.buf_consume(consumed);
+                        saw = true;
+                        return Ok(Some(out));
+                    }
+                    LineScan::Content { content } => {
+                        if content > 0 {
+                            emit_text(&mut out, &avail[..content], utf8);
+                            self.ch.buf_consume(content);
+                            saw = true;
+                            continue; // 片尾悬置 CR 或段尽：补读后重扫
+                        }
+                        // 片头即悬置 CR：慢路径单步裁决（行界或行内容）。
+                        if self.line_slow_step(enc, mode, &mut out, &mut saw)? {
+                            break;
+                        }
+                        // CrLf 孤 \r 会把后视字符回推进 pending——排空后
+                        // 才能恢复快路径（pending 必须先于实现缓冲消费）。
+                        while !self.cfg.read_pending.is_empty() {
+                            if self.line_slow_step(enc, mode, &mut out, &mut saw)? {
+                                return Ok(if saw { Some(out) } else { None });
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            match bad {
+                // 判废字节段：行内容按字节值出字符。
+                Some(k) => {
+                    for &b in &avail[..k] {
+                        out.push(b as char);
+                    }
+                    self.ch.buf_consume(k);
+                    saw = true;
+                }
+                // 不完整多字节尾巴：慢路径单步补读。
+                None if valid == 0 => {
+                    if self.line_slow_step(enc, mode, &mut out, &mut saw)? {
+                        break;
+                    }
+                    // 慢路径可能回推了后视字符（CrLf 孤 \r）——先排空。
+                    while !self.cfg.read_pending.is_empty() {
+                        if self.line_slow_step(enc, mode, &mut out, &mut saw)? {
+                            return Ok(if saw { Some(out) } else { None });
+                        }
+                    }
+                }
+                None => unreachable!("valid==len 时不会进入此分支"),
+            }
+        }
+        if !saw {
+            return Ok(None);
+        }
+        Ok(Some(out))
+    }
+
+    /// 逐字符 gets 的原路径（原 channel_read_line_cfg 的循环体）。
+    /// `out`/`saw` 由调用方带入（快路径先消费的前缀），累积后返回。
+    fn line_slow(
+        &mut self,
+        enc: &str,
+        mode: TranslationMode,
+        out: &mut String,
+        saw: &mut bool,
+    ) -> io::Result<()> {
+        while !self.line_slow_step(enc, mode, out, saw)? {}
+        Ok(())
+    }
+
+    /// gets 慢路径的单步（原循环体一轮）。返回 `true` = 行收束
+    /// （行界/EOF/eofchar），`false` = 消费了一个行内容字符。
+    fn line_slow_step(
+        &mut self,
+        enc: &str,
+        mode: TranslationMode,
+        out: &mut String,
+        saw: &mut bool,
+    ) -> io::Result<bool> {
+        let next = self.next_raw_or_pending(enc)?;
+        if let Some(c) = next {
+            if self.cfg.eofchar_in == Some(c) {
+                self.ch.set_at_eof();
+                if out.is_empty() {
+                    return Ok(true);
+                }
+                *saw = true;
+                return Ok(true);
+            }
+        }
+        match mode {
+            TranslationMode::Lf => match next {
+                Some('\n') => {
+                    *saw = true;
+                    Ok(true)
+                }
+                Some(c) => {
+                    *saw = true;
+                    out.push(c);
+                    Ok(false)
+                }
+                None => Ok(true),
+            },
+            TranslationMode::Cr => match next {
+                Some('\r') => {
+                    *saw = true;
+                    Ok(true)
+                }
+                Some(c) => {
+                    *saw = true;
+                    out.push(c);
+                    Ok(false)
+                }
+                None => Ok(true),
+            },
+            TranslationMode::CrLf => match next {
+                Some('\r') => {
+                    *saw = true;
+                    match self.next_raw_or_pending(enc)? {
+                        Some('\n') => Ok(true),
+                        // 孤 \r 是行内容（CrLf 只认 CRLF 为界）——行继续，
+                        // 后视字符回推（留在 pending，慢路径继续消费）。
+                        Some(other) => {
+                            out.push('\r');
+                            self.cfg.read_pending.push_back(other);
+                            Ok(false)
+                        }
+                        None => {
+                            out.push('\r');
+                            Ok(false)
+                        }
+                    }
+                }
+                Some(c) => {
+                    *saw = true;
+                    out.push(c);
+                    Ok(false)
+                }
+                None => Ok(true),
+            },
+            TranslationMode::Auto => match next {
+                Some('\r') => {
+                    *saw = true;
+                    if let Some(other) = self.next_raw_or_pending(enc)? {
+                        if other != '\n' {
+                            self.cfg.read_pending.push_back(other);
+                        }
+                    }
+                    Ok(true)
+                }
+                Some('\n') => {
+                    *saw = true;
+                    Ok(true)
+                }
+                Some(c) => {
+                    *saw = true;
+                    out.push(c);
+                    Ok(false)
+                }
+                None => Ok(true),
+            },
+        }
+    }
+
+    /// `chan copy` 字节快路（同编码字节直通，EOL 翻译在编码之下）的
+    /// 块读：至多 `max` 个翻译后字节。EOF 时显式置通道 EOF（原路径语义）。
+    /// 片尾悬置 CR 经 `held` 拆裁决（取走 CR 触发底层补读）。仅用于
+    /// 支持 `fill_buf` 的实现（入口已探测）。
+    fn bytes_read(&mut self, max: usize) -> io::Result<Vec<u8>> {
+        let mut out: Vec<u8> = Vec::new();
+        let mode = self.cfg.translation_in;
+        let mut held: Option<u8> = None;
+        loop {
+            if out.len() >= max {
+                break;
+            }
+            let avail = self.ch.fill_buf()?;
+            if avail.is_empty() {
+                // EOF：held CR 按孤立 CR 收束（原路径语义）。
+                if let Some(b) = held.take() {
+                    out.push(lone_cr_term(b, mode));
+                }
+                self.ch.set_at_eof();
+                break;
+            }
+            let n = avail.len();
+            let mut i = 0usize;
+            if let Some(b) = held.take() {
+                // held 只装片尾 CR。
+                if avail[0] == b'\n' {
+                    out.push(b'\n');
+                    i = 1;
+                } else {
+                    out.push(lone_cr_term(b, mode));
+                    // avail[0] 未消费，落入主扫描。
+                }
+            }
+            while i < n && out.len() < max {
+                let b = avail[i];
+                if b != b'\r' {
+                    out.push(b);
+                    i += 1;
+                    continue;
+                }
+                match mode {
+                    TranslationMode::Lf => {
+                        out.push(b);
+                        i += 1;
+                    }
+                    TranslationMode::Cr => {
+                        out.push(b'\n');
+                        i += 1;
+                    }
+                    TranslationMode::Auto | TranslationMode::CrLf => {
+                        if i + 1 < n {
+                            let paired = avail[i + 1] == b'\n';
+                            out.push(if paired || mode == TranslationMode::Auto { b'\n' } else { b'\r' });
+                            i += if paired { 2 } else { 1 };
+                        } else {
+                            break; // 片尾悬置 CR
+                        }
+                    }
+                }
+            }
+            self.ch.buf_consume(i);
+            if out.len() >= max {
+                break;
+            }
+            if i < n {
+                // 停在片尾 CR：取走（触发底层补读），下一轮配对裁决。
+                held = Some(self.read_byte()?.unwrap_or(b'\r'));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// 字节路径的孤立 CR 收束字节（Auto→LF、CrLf→CR、Cr→LF、Lf 原样）。
+fn lone_cr_term(b: u8, mode: TranslationMode) -> u8 {
+    match mode {
+        TranslationMode::Lf => b,
+        TranslationMode::Cr => b'\n',
+        TranslationMode::Auto => b'\n',
+        TranslationMode::CrLf => b'\r',
+    }
 }
 
 /// 按通道 `-encoding` 读 `count` 个**字符**（翻译后计数）。
@@ -370,17 +964,11 @@ pub(crate) fn channel_read_chars_cfg(
     }
     let enc = cfg.encoding.clone();
     let mut reader = ChannelReader::new(ch, cfg);
-    let mut out = String::new();
-    let mut chars = 0usize;
-    while chars < count {
-        match reader.next_translated(&enc)? {
-            Some(c) => {
-                out.push(c);
-                chars += 1;
-            }
-            None => break,
-        }
+    if fast_read_ok(reader.cfg, &enc) {
+        return reader.text_read(&enc, count);
     }
+    let mut out = String::new();
+    reader.text_slow(&enc, count, &mut out)?;
     Ok(out)
 }
 
@@ -406,83 +994,12 @@ pub(crate) fn channel_read_line_cfg(
     let enc = cfg.encoding.clone();
     let mode = cfg.translation_in;
     let mut reader = ChannelReader::new(ch, cfg);
+    if fast_read_ok(reader.cfg, &enc) {
+        return reader.line_read(&enc, mode);
+    }
     let mut out = String::new();
     let mut saw = false;
-    loop {
-        let next = reader.next_raw_or_pending(&enc)?;
-        if let Some(c) = next {
-            if reader.cfg.eofchar_in == Some(c) {
-                reader.ch.set_at_eof();
-                if out.is_empty() {
-                    return Ok(None);
-                }
-                saw = true;
-                break;
-            }
-        }
-        match mode {
-            TranslationMode::Lf => match next {
-                Some('\n') => {
-                    saw = true;
-                    break;
-                }
-                Some(c) => {
-                    saw = true;
-                    out.push(c);
-                }
-                None => break,
-            },
-            TranslationMode::Cr => match next {
-                Some('\r') => {
-                    saw = true;
-                    break;
-                }
-                Some(c) => {
-                    saw = true;
-                    out.push(c);
-                }
-                None => break,
-            },
-            TranslationMode::CrLf => match next {
-                Some('\r') => {
-                    saw = true;
-                    match reader.next_raw_or_pending(&enc)? {
-                        Some('\n') => break,
-                        Some(other) => {
-                            out.push('\r');
-                            reader.cfg.read_pending.push_back(other);
-                        }
-                        None => out.push('\r'),
-                    }
-                }
-                Some(c) => {
-                    saw = true;
-                    out.push(c);
-                }
-                None => break,
-            },
-            TranslationMode::Auto => match next {
-                Some('\r') => {
-                    saw = true;
-                    if let Some(other) = reader.next_raw_or_pending(&enc)? {
-                        if other != '\n' {
-                            reader.cfg.read_pending.push_back(other);
-                        }
-                    }
-                    break;
-                }
-                Some('\n') => {
-                    saw = true;
-                    break;
-                }
-                Some(c) => {
-                    saw = true;
-                    out.push(c);
-                }
-                None => break,
-            },
-        }
-    }
+    reader.line_slow(&enc, mode, &mut out, &mut saw)?;
     if !saw {
         return Ok(None);
     }
@@ -500,10 +1017,11 @@ pub(crate) fn channel_read_all_cfg(
     }
     let enc = cfg.encoding.clone();
     let mut reader = ChannelReader::new(ch, cfg);
-    let mut out = String::new();
-    while let Some(c) = reader.next_translated(&enc)? {
-        out.push(c);
+    if fast_read_ok(reader.cfg, &enc) {
+        return reader.text_read(&enc, usize::MAX);
     }
+    let mut out = String::new();
+    reader.text_slow(&enc, usize::MAX, &mut out)?;
     Ok(out)
 }
 
@@ -522,6 +1040,23 @@ pub(crate) fn channel_read_translated_bytes_cfg(
 ) -> io::Result<Vec<u8>> {
     if max == 0 || ch.eof() {
         return Ok(Vec::new());
+    }
+    // 快路径（前提同 fast_read_ok 的状态项）+ 实现支持块面：管线无
+    // 残留时整片扫描；否则走原逐字节路径（不动）。
+    if cfg.eofchar_in.is_none()
+        && cfg.read_chars.is_empty()
+        && cfg.read_pending.is_empty()
+        && cfg.read_bytes.is_empty()
+    {
+        let fast = match ch.fill_buf() {
+            Ok(_) => true,
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => false,
+            Err(e) => return Err(e),
+        };
+        if fast {
+            let mut reader = ChannelReader::new(ch, cfg);
+            return reader.bytes_read(max);
+        }
     }
     let mut out: Vec<u8> = Vec::new();
     // 1) 字符管线积压：按同编码回编（utf-8 é→c3a9 / latin1 é→e9）。
@@ -820,6 +1355,10 @@ pub struct TcpChannel {
     failed: bool,
     /// connecting 期间缓冲的写出（flush/关通道时外送）。
     out_buf: Vec<u8>,
+    /// 预读块（P1：读一次系统调用进来一块，`fill_buf`/`read_bytes`
+    /// 都从这里取；`in_pos` 是消费位）。
+    in_buf: Vec<u8>,
+    in_pos: usize,
     eof: bool,
 }
 
@@ -889,7 +1428,7 @@ pub(crate) fn sock_hostname(addr: &std::net::SocketAddr) -> String {
 #[cfg(feature = "net")]
 impl TcpChannel {
     pub fn new(stream: std::net::TcpStream) -> Self {
-        Self { stream: Some(stream), connecting: false, failed: false, out_buf: Vec::new(), eof: false }
+        Self { stream: Some(stream), connecting: false, failed: false, out_buf: Vec::new(), in_buf: Vec::new(), in_pos: 0, eof: false }
     }
 
     /// `-async`：先建 socket（非阻塞 connect 发起），句柄立即返回。
@@ -906,6 +1445,8 @@ impl TcpChannel {
                 connecting: true,
                 failed: false,
                 out_buf: Vec::new(),
+                in_buf: Vec::new(),
+                in_pos: 0,
                 eof: false,
             })
         }
@@ -1096,6 +1637,18 @@ impl TcpChannel {
 impl Channel for TcpChannel {
     fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.ensure_connected()?;
+        // 预读块优先（与 fill_buf 同一缓冲，顺序不能乱）。
+        if self.in_pos < self.in_buf.len() {
+            let avail = &self.in_buf[self.in_pos..];
+            let n = avail.len().min(buf.len());
+            buf[..n].copy_from_slice(&avail[..n]);
+            self.in_pos += n;
+            if self.in_pos >= self.in_buf.len() {
+                self.in_buf.clear();
+                self.in_pos = 0;
+            }
+            return Ok(n);
+        }
         let n = match io::Read::read(self.stream.as_mut().unwrap(), buf) {
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
@@ -1110,6 +1663,41 @@ impl Channel for TcpChannel {
             self.eof = true;
         }
         Ok(n)
+    }
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.ensure_connected()?;
+        if self.in_pos >= self.in_buf.len() {
+            self.in_buf.clear();
+            self.in_pos = 0;
+            self.in_buf.resize(READ_CHUNK, 0);
+            let n = match io::Read::read(self.stream.as_mut().unwrap(), &mut self.in_buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    self.in_buf.clear();
+                    if e.kind() == io::ErrorKind::ConnectionReset {
+                        // 对端关闭带未读数据 → RST 读作 EOF（tclsh 同）。
+                        self.eof = true;
+                        return Ok(&[]);
+                    }
+                    return Err(e);
+                }
+            };
+            self.in_buf.truncate(n);
+            if n == 0 {
+                self.eof = true;
+            }
+        }
+        Ok(&self.in_buf[self.in_pos..])
+    }
+    fn buf_consume(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.in_pos = (self.in_pos + n).min(self.in_buf.len());
+        if self.in_pos >= self.in_buf.len() {
+            self.in_buf.clear();
+            self.in_pos = 0;
+        }
     }
     fn read_line(&mut self) -> io::Result<Option<String>> {
         self.ensure_connected()?;
@@ -1773,6 +2361,18 @@ impl Channel for OsStdin {
     }
     fn eof(&self) -> bool { self.at_eof }
     fn set_at_eof(&mut self) { self.at_eof = true; }
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        let buf = self.reader.fill_buf()?;
+        if buf.is_empty() {
+            self.at_eof = true;
+        }
+        Ok(buf)
+    }
+    fn buf_consume(&mut self, n: usize) {
+        if n != 0 {
+            BufRead::consume(&mut self.reader, n);
+        }
+    }
     fn close(self: Box<Self>) -> io::Result<()> { Ok(()) }
     #[cfg(unix)]
     fn dup_for_child(&mut self, _write: bool) -> io::Result<Option<std::os::fd::OwnedFd>> {
@@ -2012,6 +2612,40 @@ impl Channel for FileChannel {
     }
     fn eof(&self) -> bool { self.at_eof }
     fn set_at_eof(&mut self) { self.at_eof = true; }
+    /// 块读快路径面：BufReader 自身的缓冲即预读块（fill_buf/consume
+    /// 不脱同步——tell/seek/r+ 写回卷的位置语义仍由 BufReader 记账）。
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        let r = match &mut self.mode {
+            FileMode::Read(r) => r,
+            FileMode::ReadWrite(r) => r,
+            FileMode::Write(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported, "channel wasn't opened for reading",
+                ))
+            }
+        };
+        let buf = r.fill_buf()?;
+        if buf.is_empty() {
+            self.at_eof = true;
+        }
+        Ok(buf)
+    }
+    fn buf_consume(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        match &mut self.mode {
+            FileMode::Read(r) => BufRead::consume(r, n),
+            // ReadWrite 的共享逻辑位随消费推进（与 read_bytes 记账同点）。
+            FileMode::ReadWrite(r) => {
+                BufRead::consume(r, n);
+                if let Some(pos) = self.rw_pos.as_mut() {
+                    *pos += n as u64;
+                }
+            }
+            FileMode::Write(_) => {}
+        }
+    }
     fn close(self: Box<Self>) -> io::Result<()> { Ok(()) }
     #[cfg(unix)]
     fn dup_for_child(&mut self, _write: bool) -> io::Result<Option<std::os::fd::OwnedFd>> {
@@ -2127,6 +2761,23 @@ impl Channel for PipeChannel {
     fn tell(&mut self) -> io::Result<u64> { self.seek(io::SeekFrom::Current(0)) }
     fn eof(&self) -> bool { self.at_eof }
     fn set_at_eof(&mut self) { self.at_eof = true; }
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        let r = self.reader.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Unsupported, "pipe channel not readable")
+        })?;
+        let buf = r.fill_buf()?;
+        if buf.is_empty() {
+            self.at_eof = true;
+        }
+        Ok(buf)
+    }
+    fn buf_consume(&mut self, n: usize) {
+        if n != 0 {
+            if let Some(r) = &mut self.reader {
+                BufRead::consume(r, n);
+            }
+        }
+    }
     fn close(mut self: Box<Self>) -> io::Result<()> {
         drop(self.writer.take());
         drop(self.reader.take());

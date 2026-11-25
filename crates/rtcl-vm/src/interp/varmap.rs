@@ -44,7 +44,23 @@ mod fx {
     impl Hasher for VarHasher {
         #[inline]
         fn finish(&self) -> u64 {
-            self.hash
+            // Murmur3 fmix64 avalanche (the same finalizer value.rs's
+            // dict-key FxHasher has run since its 300k-probe-chain
+            // incident).  The raw multiply-mix leaves the bucket index
+            // (HashMap's LOW bits) dependent only on the first ~2 bytes
+            // of a name: generated families that share a prefix and
+            // length — `k000000..kN` — collapsed into ~32 of 131072
+            // buckets (chains of 1800+) at 60k variables; the variable
+            // tables degenerated exactly like the dict tables did.  A
+            // bijection, so distinct names stay distinct; ~3 ops per
+            // finish, far under the probe chains it removes (P6).
+            let mut x = self.hash;
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+            x ^= x >> 33;
+            x
         }
 
         fn write(&mut self, bytes: &[u8]) {

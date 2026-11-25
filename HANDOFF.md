@@ -1,15 +1,18 @@
 # rtcl 工程 Handoff — 多轮修正 → JIT 全任务交接
 
-> **状态横幅（2026-10-07）**：语义修正与优化阶段已收敛——judge 87/87
-> 文件（case 级 4072/4072，原 5 例分歧已修复）、双引擎差分 0 分歧、
-> 性能微套件反超/持平 tclsh、生产就绪标记（见 `docs/PRODUCTION.md`）。
-> 当前待办见 `TODO.md`；性能台账见 `bench/BASELINE.md`；分歧台账见
-> `specs/DIVERGENCES.md`（已重建）。本文件 §1 基础设施/§2 方法论仍然
-> 有效；§3 以后的数字是 2026-10-03 的历史快照（当前数字以 PRODUCTION
+> **状态横幅（2026-11-25）**：对标版本改为 **Tcl 9.1.0**（oracle 是仓内
+> 构建的 `.refer/tcl910/inst/bin/tclsh9.1`；`JUDGE_ORACLE=tclsh` 指回
+> 8.6.17）。2026-11-23..25 做了一轮代码审计，按清单修了 22 个提交
+> （91bb15c..1da7ebe，`perf/wave2`，没有 push），清单与逐项状态在
+> `specs/CODE-AUDIT-20261123.md`；**没修完的任务见下面「审计后续轮」
+> 一节**（任务包、9.1 对这一轮的影响、坑）。迁移本身见 `TODO.md`
+> 「对标迁移」。当前待办见 `TODO.md`；性能台账见 `bench/BASELINE.md`；
+> 分歧台账见 `specs/DIVERGENCES.md`。本文件 §1 基础设施/§2 方法论
+> 仍然有效；§3–§6 的数字是 2026-10 的历史快照（当前数字以 PRODUCTION
 > 与 BASELINE 为准）；JIT 保持暂停（2026-10-17 内存管理/编译管线设计
 > 定稿 = 路线 C，见 `docs/JIT-WASM-GC.md`，实现仍暂停）。
 >
-> 最后更新：2026-10-17（横幅）；正文完成于 2026-10-03
+> 最后更新：2026-11-25（横幅与「审计后续轮」一节）；其余各节按各自日期。
 > 用途：任一 agent 读本文件即可接管全部剩余工作，无需对话历史。
 
 ## 0. 项目与仓库
@@ -19,6 +22,9 @@
 - crate 结构：`rtcl-parser`（递归下降解析 + ByteCode 编译）、`rtcl-ir`（OpCode 三层：primitive / `Call(CmdId)` 0..127 stdlib 128+ 扩展 / `DynCall`）、`rtcl-vm`（execute.rs dispatch 循环 + `VmContext` trait + Value/Error 唯一实现）、`rtcl-core`（Interp + 内建命令，`value.rs`/`error.rs` 只是 re-export）、`rtcl-cli`、`rtcl-wasm`、`rtcl-expect`、`rtcl-jit`（ByteCode → wasm 发射器，JIT M0 起）。
 - Tcl 官方源码（行为 oracle 的测试语料）：`/home/nzinfo/src.note/rtcl/.refer/tcl`（已 gitignore；如被删重新 `git clone --depth 1 https://github.com/tcltk/tcl.git .refer/tcl`）。
 - 系统 oracle：`/usr/bin/tclsh` = Tcl 8.6.17。**一切语义以 tclsh 实测为准，不凭记忆。**
+  **2026-11-25 起 oracle 是 Tcl 9.1.0**：仓内构建的
+  `.refer/tcl910/inst/bin/tclsh9.1`，源码在 `.refer/tcl910/tcl9.1.0/`；
+  8.6.17 只用来跑历史基线。
 
 ## 1. 基础设施（已建，勿重建）
 
@@ -167,7 +173,8 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 
 ## 共同上下文
 - 构建：cargo build --release -p rtcl-cli；快速验证：./target/release/rtcl -c '<script>'；
-  oracle：echo '<script>' | tclsh（Tcl 8.6.17），一切语义以 tclsh 实测为准。
+  oracle：echo '<script>' | .refer/tcl910/inst/bin/tclsh9.1（Tcl 9.1.0，2026-11-25 起），
+  一切语义以它实测为准；8.6.17 的 tclsh 只用来对照。
 - 分歧清单：specs/DIVERGENCES.md（[FIXED] 条目别动）；行为规格 specs/*.allium。
 - judge：./judge/run.sh；当前基线见 §3（修复前重新跑一遍取实时基线）。
   不要在并行构建负载下跑 judge（15s timeout 会抖动；先 cargo test 再 judge）。
@@ -185,6 +192,299 @@ Mono jiterpreter（Blazor，.NET 7+，运行时 IL→wasm→实例化，最直�
 ```
 
 文件互斥参考（按域）：string_cmds.rs / expr.rs+expr_funcs.rs / value.rs+list.rs / list_sort.rs / control.rs+loops.rs / error.rs(rtcl-vm+rtcl-core)+call.rs / namespace.rs / vars.rs+call.rs。两域需要同一文件时串行，不并行。
+
+## 审计后续轮. 2026-11-23..25 代码审计与修正——安全、静默出错、性能（perf/wave2 @ 91bb15c..1da7ebe）
+
+> **接管先读这一节。** 2026-11-23 对全仓做了一轮审计，清单在
+> `specs/CODE-AUDIT-20261123.md`：S1–S40 安全、C1–C54 静默出错、
+> P1–P16 性能，每行最后一列是状态。之后按清单修了 22 个提交，都在
+> `perf/wave2` 的本地分支上，**没有 push**。没修完的在 §4，分「可以直接
+> 派给事务性 agent」和「先要评审裁决」两类；§3 是评审要回答的问题。
+> 复现脚本在 `judge/audit-cases/`（先读那里的 README）。
+
+### 0. 现状（动手前重新核实，别直接信这里的数字）
+
+- **oracle 换成 Tcl 9.1.0**（2026-11-25，迁移会话做的）：
+  `judge/run.sh`、`judge/probes.sh` 默认用仓内构建的
+  `.refer/tcl910/inst/bin/tclsh9.1`；`JUDGE_ORACLE=tclsh` 指回系统的
+  8.6.17。**这一轮的 22 个提交都是对 8.6.17 做的**，探针 d20–d27 的
+  期望值取自 8.6.17。哪些在 9.1 下不再成立见 §2。
+- 门禁基线（1da7ebe，对 8.6.17 实测；对 9.1.0 另注）：judge 88/88
+  （两个 oracle 都是）；`bash judge/crash-gate.sh` 126 次运行 126 过；
+  `bash judge/probes.sh` 437/0，另有 12 项归档分歧（对 9.1.0 是
+  312/437——迁移会话的数字，清障归它）；`cargo test --workspace`
+  1481/0（63 个套件）；`bash judge/sweep.sh` 12 处 DIFF，是这轮开始前
+  就有的名单：ei_line_attribution、expr_bracket_control、
+  expr_bracket_errors2、expr_bracket_multiline、incr_window_p25_errline、
+  loop_body_err_line、loop_body_err_line3、loop_body_err_line4、
+  sub_inline_errors1、sub_inline_if_body、sub_inline_proc_frames、we5；
+  五种特性组合的 `cargo check` 与 wasm32 构建无错误。wasm 产物的检查
+  （`node judge/crash-wasm.mjs` 52 项、`node crates/rtcl-wasm/test.js`
+  26 项）最后一次跑是在 e46b3e7，**1da7ebe 没有重跑**（§4 T0）。
+- 构建与运行：`bash -c 'ulimit -v 3400000; cargo build --release -p
+  rtcl-cli -j 2'`；rtcl 跑脚本是 `target/release/rtcl -f 脚本`，tclsh 是
+  `tclsh 脚本`。
+- 工具都在 `target/audit/` 下，git-ignored，只在这台机器上。每个批次
+  的用法：
+
+  | 命令 | 作用 |
+  |---|---|
+  | `bash target/audit/quick-gates.sh <tag>` | judge、crash-gate、probes、rtcl-vm lib 测试（两种特性）、五种特性组合的 check、wasm32 构建。约 5 分钟，日志 `target/audit/quick-<tag>.log` |
+  | `bash target/audit/all-gates.sh <tag>` | 上面这些加 sweep 与 workspace 测试。约 25 分钟，放后台跑，日志 `target/audit/rest-<tag>.log`，末行是 `ALLDONE` |
+  | `cd crates/rtcl-wasm && bash build.sh`，再跑上面两条 `node` | 重建 wasm 产物（必须打印 `pkg/ generated`）并检查；提交前跑 |
+  | `bash target/audit/bench/run.sh <tcl>` | tclsh 8.6 与 rtcl 两个引擎并排的 µs/迭代、峰值 RSS |
+  | `bash target/audit/t/cmp.sh <名>` | `target/audit/t/<名>.tcl` 在 tclsh 8.6 与 rtcl 两个引擎下的输出 diff |
+  | `bash judge/audit-cases/rr.sh <tcl>` | 四个解释器（含 tclsh 9.1）各跑一遍，各一行。这个在仓库里 |
+
+  跑门禁期间不要改源码，也不要另起 cargo。机器负载常在 10–20（别人的
+  任务），计时要并排比；rtcl 的 `time` 报的是整数微秒，亚微秒的东西用
+  整段墙钟时间量。
+- 每个批次的顺序：改 → quick-gates → all-gates（后台）→ wasm 产物与
+  两项 node 检查 → 审计文档里那一行改状态 → 只 `git add` 自己改的路径 →
+  提交。提交信息是中文的 `type(scope): 摘要`，正文写改法和没动的地方，
+  `终态：` 一行列门禁数字，最后一行 `Co-Authored-By`。
+- **同一棵工作树里有别的会话。** 提交前先 `git status --short`，不属于
+  你的改动不要暂存。共享文件（比如 `TODO.md`）只暂存自己的 hunk：
+  `git diff FILE > p`，从 `p` 里删掉别人的 hunk，`git apply --cached p`。
+  写这一节的时候，迁移会话没提交的是：`Agent.md`、`README.md`、
+  `TODO.md` 顶部「对标迁移」、`docs/PRODUCTION.md`、`judge/extract/`、
+  `judge/run.sh`、`judge/probes.sh`。
+
+### 1. 已修（22 个提交，一个里程碑一到七个提交）
+
+- 门禁 `91bb15c`：`judge/crash-gate.sh` 与 `judge/crash-probes/`。每个
+  探针钉一个脚本可触发的崩溃、挂起或静默错误，期望值取自 tclsh，在
+  rtcl 的两个引擎上跑；`_` 开头的文件是工具和探针的源文件，门禁不跑。
+- M1 `e513371`：12 个脚本可触发的 panic；整数字面量的语法并成一份实现。
+- M2 `c298b77`、`0725bd2`：脚本重入统一成一个嵌套预算；值的字符串化
+  与销毁改成迭代；解析、编译、正则的深度与编译空间上限。
+- M3 `129966d`：wasm 的递归上限按实测校准（150），步数预算的旁路，
+  宿主限额接口，`judge/crash-wasm.mjs`。
+- M4 `47731f3`：静默错误两批——编译期边界、tailcall 按 tclsh 的机制
+  重做、OO 可见性与 errorCode、interp alias、`prefix match`、Bgerror，
+  以及 `expr` 里的 `#` 死循环。
+- M5 `00ce332`…`979606d`：exec 的挂起、僵尸进程、错误语义和
+  `@通道` 重定向；通道 close 与 exit 不再等没完的连接和管道子进程；
+  file 与 socket 的 CLOEXEC。
+- M6 `a1259cf`、`904a98c`、`752f5ba`：wasm 回调桥不再认脚本给的实例
+  id；子解释器继承宿主的服务与限额；`interp` 命令族按 `tclInterp.c`
+  重做（隐藏命令表、`-safe`、任意两个解释器之间的别名）。
+- M7 性能 `f8820d5`、`6e3e451`、`c159fa7`、`20f428b`、`e46b3e7`：
+  `string map` 一趟扫描（400KB 从跑不完到 2.7ms）；变量插入日志回收
+  （96MB → 7.8MB）与枚举去平方；正则引擎缓存、纯文本模式走搜索、
+  长文本先制表前 1024 个字符；`string length/index/range/first/last`
+  按字节走（24KB 上 13–18µs → ≤1µs）；`append` 接到变量自己的缓冲区
+  上（2 万次 49ms → 1.5ms），`lappend`/`dict set`/`incr` 的快路径改成
+  就地改。顺带修掉 C40–C46、C48、C50。
+- 变量作用域 `1da7ebe`：proc 里执行的 `namespace eval` 体有自己的
+  变量帧（C49）；命名空间到全局的链（C52）；有条目没值的变量
+  （C53、C18）。**这一笔是按 8.6 做的，9.1 下要改，见 §2。**
+
+### 2. Tcl 9.1 对这一轮的影响（派活前先看）
+
+**(a) 命名空间体里的裸名变量：8.6 回落到全局，9.1 不回落。**
+`judge/audit-cases/ns-chain-86-vs-91.tcl` 两个 tclsh 不一致的行（rtcl
+现在全部跟 8.6）：
+
+| 行 | 脚本 | 8.6.17 | 9.1.0 |
+|---|---|---|---|
+| S1 | `set g 1; namespace eval n { set g 2 }` | 写的是全局 `g` | 建的是 `n::g`，全局不变 |
+| S3 | 体里 `unset` 掉 `variable` 声明的变量，再 `set` 它 | 写全局 | 写 `n::` 的 |
+| S7 | 体里读一个只有全局才有的变量 | 读到 | `can't read "h": no such variable` |
+| S8 | 体里 `array get` 一个全局数组 | 给出元素 | 空 |
+| S9、S14 | 全局变量上有写 trace，体里用裸名写它 | 写全局，trace 触发 | 建 `n::` 的变量，trace 不触发 |
+| S11 | 体里既有 `variable` 声明又有同名全局 | 声明的读声明，别的读全局 | 别的读不到 |
+| S15 | proc 里 `global gx`，再到体里 `append gx x` | 写全局 `gx` | 写 `n::gx` |
+
+其余各行两个版本一致，其中 S5、S6 就是 C49（proc 里执行的体有自己的
+变量帧），修完两个版本都对。9.1 的规则在
+`.refer/tcl910/tcl9.1.0/generic/tclVar.c` 的 `TclLookupSimpleVar`：
+不在全局命名空间就加 `TCL_NAMESPACE_ONLY`。
+
+rtcl 里这条链是 `crates/rtcl-vm/src/interp/vars.rs` 的
+`ns_chain_global`，调用点在 `resolve_loc`、`resolve_var` 的无帧分支、
+`get_var`、`set_var`、`unset_var`、`var_exists`、`store_var`、
+`remove_var`、`array_owner`；`1da7ebe` 加的 `phantom_globals` 有一半
+是给这条链用的。改成 9.1 就是把这条链去掉（§4 T1），探针 d26 的
+o10–o14 和 d27 的第 2、3 节再按 9.1 重钉（§4 T2）。
+
+**(b) 复核过、不受影响的：**
+
+- 哈希表顺序。9.1.0 的 `tclHash.c` 里 `REBUILD_MULTIPLIER` 还是 3，
+  新条目插在桶首，重建时桶数乘 4，哈希函数没变；d23（45 条）在 9.1
+  下全过。`interp/tclhash.rs` 的重放不用动。
+- 变量读写出错的 errorCode（C50、C53、C18）。29 种里 9.1 与 8.6 只差
+  `incr-write-trace-fail` 一种：9.1 报 `expected integer but got a
+  list`、`TCL VALUE NUMBER`，是 9.x 数字解析的事，归迁移清单。
+- 审计探针在 9.1 下第一条不成立的断言（探针遇到第一条失败就退出，
+  后面可能还有）：d22、d23 全过；d20 `delete-nonempty`；d21 `c-e`
+  （`interp` 的子命令清单变了）；d24 `l55`（正则编译错误的措辞）；
+  d25 `idx-99999999999999999999`（下标超出机器整数）；d26 `o11`；
+  d27 `o1`。
+
+### 3. 需要评审或架构裁决的问题（拿到结论前不要开工）
+
+1. **版本策略**：只做 9.1，还是留一个 8.6 兼容开关？这决定 T1 的
+   形状。倾向是只做 9.1——两套变量解析长期并存的代价，比一次性对齐
+   大。
+2. **变量解析收敛**。名字到位置现在有好几套并行的机制：帧的槽、帧的
+   名字表、全局平表、`flat_aliases`、`ns_transient`、
+   `ns_variable_links`、`dead_flat`、`phantom_globals`。`ns_chain_global`
+   去掉以后应当收敛成一个解析函数，这是动 `vars.rs` 主干的机会。
+3. **指令集（码表）**。`OpCode` 是 141 个变体的枚举，`Vec<OpCode>`，
+   每条 16 字节；操作数是 u16，超了整个单元回落树走；`AppendVar`
+   定义了但没人发射；`append`/`lappend`/`incr` 没有像 tclsh 那样内联
+   编译，C51 的 (1)(2) 就是这么来的；P7 的编译期也在这一层。
+4. **树引擎的去留**。`--no-bytecode` 要求与字节码引擎逐字节一致，
+   但两边已经有不一致的地方（T3 的复现里两个引擎输出不同），嵌套
+   是立方级（P10）。
+5. **9.x 的整数语义**（任意精度）怎么落地。牵连 S21 一类的大小边界、
+   下标范围（d25 在 9.1 下第一条就断在这里）、`incr` 的报错措辞。
+6. **值模型**。值里没有缓存的字符长度，非 ASCII 的字符串操作比 tclsh
+   慢 10–250 倍（P15 剩下的三处是其中一部分）。
+
+### 4. 未完成的任务包
+
+标注：【事务】可以直接派；【先评审】要等 §3 或条目自己的结论。
+每包都过一遍 §0 的门禁顺序。
+
+**T0 wasm 产物检查（事务，十分钟，先做）**
+1da7ebe 没跑的两项：`cd crates/rtcl-wasm && bash build.sh`（要看到
+`pkg/ generated`），然后 `node judge/crash-wasm.mjs` 要 `ALL PASS (52)`，
+`node test.js` 要 `26 passed`。不过就报出来，别盲修。
+
+**T1 命名空间体的变量解析改成 9.1（先评审第 1 条；施工是事务）**
+去掉 `ns_chain_global` 这条链：没有 proc 帧的时候，裸名只查当前命名
+空间自己的表，查不到就是没有（读报错，写建在当前命名空间）。
+`phantom_globals` 留给 `has_valueless_entry`（errorCode），不再用来
+改写落点。验收：`bash judge/audit-cases/rr.sh
+judge/audit-cases/ns-chain-86-vs-91.tcl` 的 `vm`、`tree` 两行与 `91`
+一行相同；judge（9.1）88/88；`JUDGE_ORACLE=tclsh bash judge/run.sh`
+会掉文件，把掉的数量记进审计文档；crash-gate 在 T2 之后全过。
+派之前先和迁移会话对一下，它的「探针 125 项 DIFF」里可能已经有人
+在做同一件事。
+
+**T2 审计探针按 9.1 重钉（事务，T1 之后）**
+`judge/crash-probes/` 下 66 个探针的期望值都来自 8.6.17。逐个用
+tclsh9.1 跑，对第一条失败做判断：是 8.6 到 9.1 的语义差，就用 9.1
+重新生成期望值（有源文件的：`.refer/tcl910/inst/bin/tclsh9.1
+judge/crash-probes/_gen.tcl <源> <探针>`，再同样加 `--refix <探针>`
+跑一遍），或者用 `# skip 标签 -- 原因` 跳过；是 rtcl 相对 9.1 的缺陷，
+就修。验收：每个探针在 tclsh9.1 下要么全过，要么跳过的都有写明的原因；
+rtcl 两个引擎全过。注意这是 `judge/crash-probes/`，不是迁移清单里的
+`judge/probes/`。
+
+**T3 proc 里 `info locals`/`info vars`/`info frame` 的顺序（事务；编译
+局部变量集合是否与 tclsh 相同要先核对）**
+复现 `judge/audit-cases/locals-order.tcl`：两个 tclsh 一致，rtcl 的
+两个引擎各不相同。tclsh 的顺序是先编译局部变量（按编译器给的槽位
+顺序，参数在前；`info locals` 不列链接，`info vars` 列），后运行期
+建的名字（哈希顺序；删了重建的换新位置，编译局部变量回原位）。
+rtcl 现在每次调用都先 `degrade_frame_all()`——把整帧降成名字存储，
+之后这一帧一直走慢路径——再按建名的先后列。帧上现在有
+`CallFrame.compiled`（两个引擎都有），可以不降级直接列：槽按表顺序，
+其余名字的日志按 `tcl_order` 重放。
+
+**T4 命名空间体里的变量访问提速（事务，T1 之后做）**
+`judge/audit-cases/bench-ns-body.tcl`：1500 万次裸名读写，tclsh
+2.6–3.5 秒，rtcl 约 40 秒（每次约 2.5µs，rtcl 在顶层是 0.19µs）。
+原因是命名空间体里每一次读写都走慢路径：`current_namespace != "::"`
+让 `read_var_scalar_top`/`scalar_top_write_ok` 的守卫直接放弃，然后
+`canonical_global`、`redirect_flat`、`ns_var_declared` 各做一两次
+`String` 分配。T1 之后解析只剩一个键（`<ns>::<名字>`，在 `globals`
+里查一次），可以给这两个快路径加一条带命名空间前缀的分支：键在栈上
+拼，超长或名字带 `::`、`(` 就回落；读命中即返回，写只在键已存在时
+原地写，新建走慢路径。验收：这个基准到 tclsh 的 3 倍以内；顶层的
+`bench/run.sh` 不回退。
+
+**T5 C51：trace 与编译后的命令（先评审：三条各自怎么取舍）**
+复现 `judge/audit-cases/var-errorcodes.tcl`，两个 tclsh 在这三条上
+一致，和换 oracle 无关。(1) tclsh 把简单词的 `append a x y z` 编译成
+每个值一次写，写 trace 触发三次，rtcl 一次；(2) 读 trace 报错时，
+tclsh 编译后的 `incr`/`lappend` 把变量当成未定义继续（结果码 0，
+errorCode 留下 `TCL READ VARNAME`），rtcl 的 `incr` 报错、`lappend`
+不触发读 trace；(3) 元素的 unset trace 报过之后，`unset` 的 errorCode
+tclsh 是 `TCL UNSET VARNAME`，rtcl 是 `TCL LOOKUP ELEMENT 1`；数组
+写 trace 报错时 `-errorstack` 里 tclsh 记 `wa`，rtcl 记
+`invokeStk1 wa`。(1)(2) 跟第 3 节第 3 条连着。
+
+**T6 通道的缓冲读（事务）**
+P1：TCP 读每字节一次系统调用，3MiB 要 387ms（tclsh 5ms）；P9：文件
+读逐字节，32MB 要 0.6 秒（tclsh 58ms）。都在 `channel.rs`。验收：
+两个数字到 tclsh 的 3 倍以内，`judge/corpus` 里 io 相关的文件不变。
+
+**T7 小的性能项（事务；P6 先评审）**
+- P5：`array size`/`array exists` 扫整张变量表（8 万元素 0.8ms，
+  tclsh 是常数），在 `commands/array.rs`。给数组记一个元素计数。
+- 数组元素的读写比 tclsh 慢 3–4 倍（`set_var`/`get_var` 的数组分支，
+  `vars.rs`）。
+- P15 剩下的三处，在 `commands/string_cmds.rs`：`string last` 命中
+  2µs（tclsh 0.1）；带空格的长模式在没有空格的文本上未命中 47µs
+  （tclsh 14，标准库挑的过滤字节每个位置都命中）；非 ASCII 串上命中
+  位置靠后时还要数一遍字符。
+- P6：变量表的哈希不扩散，同前缀的名字退化（`interp/varmap.rs`）。
+  先量出现在还成不成立。
+
+**T8 P7 编译期（先定位，再决定是不是并进第 3 节第 3 条）**
+2 万个 `for` 的脚本编译要 4.6 秒（tclsh 0.10 秒）。常量池的线性扫描
+已经改掉了，剩下的还没定位。先用 `perf` 找出热点再说。
+
+**T9 语义遗留（逐条先评审）**
+C16（只含字面量的表达式算术出错时，`expr` 帧的关键词；暂存在
+`judge/probes-known/smallface_p24_open.tcl`）、C17（`lt`/`le`/`gt`/`ge`
+在 tclsh 里不是运算符，rtcl 当成字符串比较；9.1 下要重看）、C28
+（proc 里 `namespace eval … { tailcall … }` 的报错）、C32（带宿主
+`HostExec` 的 exec 路径还是旧语义）、C33（`file attributes` 没实现、
+`file normalize ~user` 不查用户）、C38（别名目标的 wrong-args 里的
+命令名，tclsh 自己就不一致）、C39（有效递归深度约 496 层，tclsh
+996：命令替换、`if`/`foreach` 的体都计进嵌套深度）、C47（带回引的
+模式在约 1000 字符以上的文本上走到步数预算）。
+
+**T10 安全遗留（逐条先评审；S39、S40 可以直接做）**
+S21（`lrepeat 4294967296 x` 一类的大小在 32 位上回绕）、S23（wasm
+栈溢出 trap 之后整个实例永久失效）、S30（`panic = "abort"`，全仓没有
+`catch_unwind`，要不要留一道防线）、S38（HTTP 客户端默认没有超时、
+响应体没有上限、没有 URL 审查钩子）、S39（变量表的哈希不带密钥，
+可以预构造冲突键，风险低）、S40（Tk：畸形 PNG、多字节颜色串、
+`image put -to` 负坐标会 panic，读码看到的，没运行过）。
+
+**T11 清理（事务）**
+- `commands/exec_cmd.rs` 里 M5 重写留下的死代码（`output_redirect`、
+  `syntax_error` 等，编译警告十来条）。
+- `judge/probes/` 里约 30 个探针在两个解释器上都提前死掉，等于空转：
+  逐个在 oracle 下跑，看它有没有走到最后一条检查。
+- `rtcl-vm` 开 clippy 的 `unwrap_used`/`indexing_slicing`/
+  `arithmetic_side_effects`，按文件棘轮。
+- 把 `target/audit/` 的门禁脚本搬进仓库，在 `Agent.md` 写明用法；
+  `Agent.md` 的提交门槛那一行还写着 sweep 0、tests 1143，是旧的。
+
+**T12 文档终态（事务，最后做）**
+`specs/CODE-AUDIT-20261123.md`、`TODO.md`、`README.md` 的数字和状态
+对齐到最后一次门禁。
+
+**没列成任务包的**：P10（树引擎）、P11（建子解释器 460KB/3.4ms）、
+P12（JIT，暂停）、P13（Tk），等第 3 节的结论。
+
+### 5. 坑（本轮实证）
+
+- **探针的期望值要用探针自己的行去取**。列表顺序取决于表有多满，
+  生成器运行时全局表里有它自己的变量，桶数不一样，记下来的顺序在
+  探针里不成立。生成是两步：`_gen.tcl <源> <探针>`，再
+  `_gen.tcl --refix <探针>`（另开一个干净的 tclsh 跑探针自己的行，
+  把期望值整个重写；期望值跨多行的也认）。跑生成器和 `--refix` 的
+  必须是当 oracle 的那个 tclsh。
+- 列表顺序这类不好移植的断言用 `# skip 标签 -- 原因`，原因要写。
+- 一个 proc 里读 `m`，后面的检查接着用 `$m`：检查之间是有状态的，
+  调顺序前先想清楚。
+- Python 批量改代码：`str.count` 断言会被子串骗过（缩进多的行包含
+  缩进少的 needle），用行级全等；按标记切片比按行号稳。
+- `cargo build … 2>&1 | grep …` 的返回码是 grep 的。看有没有 `^error`
+  行和 `Finished`，再看二进制的时间戳。
+- `target/audit/t/` 下的对照脚本：tclsh 是 `tclsh 脚本`，rtcl 是
+  `rtcl -f 脚本`，两边不一样。
+- 返回 `&mut` 的取槽函数不能连着调两次（借用检查）。用闭包把槽交给
+  调用方（`with_dict_slot`），或者只借某一个字段（`scope_frame_idx`）。
+- `_gen.tcl` 里带引号的 `{` 要写成 `\{`，否则整个 proc 解析不了。
 
 ## 10vicesimusduodevicesimus. 2026-11-23 trv_p11 五处语义缺陷收口 + e8/e9 内层帧链式载体 + oo2 表述精确化（perf/wave2 @ c919738..）
 

@@ -74,7 +74,10 @@ impl DfaScratch {
 
 impl Matcher {
     pub fn new(prog: &Prog) -> Matcher {
-        let dfa = if std::env::var_os("RTCL_SPENCER_NFA").is_some() {
+        // The switch is read once per process: looking it up is a walk
+        // over the environment, and this ran for every match.
+        static NFA_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dfa = if *NFA_ONLY.get_or_init(|| std::env::var_os("RTCL_SPENCER_NFA").is_some()) {
             None
         } else {
             DfaCache::new(prog)

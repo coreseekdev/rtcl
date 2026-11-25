@@ -245,7 +245,7 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     #[cfg(feature = "regexp")]
     let re = if mode == Mode::Regexp {
         Some(
-            super::regexp_cmds::compile_engine_tc(interp, pat_val.as_str(), nocase, false, false, false)
+            super::regexp_cmds::compile_engine_cached(interp, pat_val.as_str(), nocase, false, false, false)
                 .map_err(tcl_err)?,
         )
     } else {
@@ -452,7 +452,7 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         {
                             re.as_ref()
                                 .map(|eng| {
-                                    super::regexp_cmds::engine_is_match(eng, item.as_str())
+                                    eng.is_match(item.as_str())
                                 })
                                 .unwrap_or(false)
                         }

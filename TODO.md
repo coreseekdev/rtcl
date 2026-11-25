@@ -368,8 +368,12 @@ judge/sweep 同跑）。下面只列**结构**动作：按类别消除，而不�
     `info commands` 去掉平方项、`array names` 不再逐条查找；顺带修掉
     C40–C43（数组命令的绝对名字、`array statistics`、`info locals`、
     `apply` 的 errorCode）。
-  - [ ] P8 `regexp` 的模式缓存；`string index`；P7 编译期；P3 `append`；
-    数组读写；P1/P9 通道缓冲读；P5 `array size`。
+  - [x] P8 的调用期部分：模式编译缓存与匹配器池、纯文本模式走搜索、
+    长文本先制表前 1024 个字符；顺带修掉 C44–C46（`switch -regexp`
+    与 `regexp` 不是一个引擎、`array names -regexp` 逐元素编译、
+    `regsub -all {}`）。
+  - [ ] `string index`；P7 编译期；P3 `append`；数组读写；P1/P9 通道
+    缓冲读；P5 `array size`；C47 回引预算。
 - [ ] **工具化防线**：`judge/crash-gate.sh` 入门禁（已入：原生 118 次
   运行、wasm `judge/crash-wasm.mjs` 52 项带 worker 看门狗）；**排查
   其余探针是否也在两个解释器上共同早退而空转**（`smallface_p24` 是）；`rtcl-vm` 开

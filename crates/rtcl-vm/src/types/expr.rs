@@ -302,9 +302,18 @@ impl<'a> ExprParser<'a> {
                 let right = self.parse_relational()?;
                 #[cfg(feature = "regexp")]
                 {
-                    let matched = regex::Regex::new(right.as_str())
-                        .map(|re| re.is_match(left.as_str()))
-                        .unwrap_or(false);
+                    // The engine `regexp` matches by (tclsh has one); a
+                    // pattern it rejects matches nothing, as before.
+                    let matched = crate::interp::commands::regexp_cmds::compile_engine_cached(
+                        self.interp,
+                        right.as_str(),
+                        false,
+                        false,
+                        false,
+                        false,
+                    )
+                    .map(|engine| engine.is_match(left.as_str()))
+                    .unwrap_or(false);
                     left = Value::from_bool(matched);
                 }
                 #[cfg(not(feature = "regexp"))]

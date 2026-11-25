@@ -360,29 +360,54 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 "{}(",
                 interp.array_owner(array_name).1
             );
+            // A regular expression is compiled once, before the elements
+            // are looked at — tclsh does the same, and reports a bad
+            // pattern as its error.  It was compiled for every element,
+            // and a pattern that did not compile matched nothing, silently.
+            // Nothing to match against: no pattern is compiled, and a bad
+            // one is no error (tclsh answers for a missing array first).
+            #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+            let listed = {
+                let (owner_fi, base) = interp.array_owner(array_name);
+                let prefix = format!("{}(", base);
+                let table = match owner_fi {
+                    Some(i) => &interp.frames[i].locals,
+                    None => &interp.globals,
+                };
+                interp.is_array_semantic(array_name)
+                    || table.keys().any(|k| k.starts_with(&prefix) && k.ends_with(')'))
+            };
+            #[cfg(feature = "regexp")]
+            let regex_engine: Option<std::rc::Rc<super::regexp_cmds::CachedEngine>> =
+                match (mode, pattern) {
+                    ("regexp", Some(pat)) if listed => Some(
+                        super::regexp_cmds::compile_engine_cached(
+                            interp, pat, false, false, false, false,
+                        )
+                        .map_err(Error::Msg)?,
+                    ),
+                    _ => None,
+                };
+            #[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
+            let regex_engine: Option<regex_lite::Regex> = match (mode, pattern) {
+                ("regexp", Some(pat)) if listed => {
+                    Some(regex_lite::Regex::new(pat).map_err(|e| Error::Msg(e.to_string()))?)
+                }
+                _ => None,
+            };
             let matches_elem = |elem: &str| -> bool {
                 match pattern {
                     None => true,
                     Some(pat) => match mode {
                         "exact" => elem == pat,
                         "regexp" => {
-                            // Route through the shared engine: the regex
-                            // crate has no backreferences, so {^(.)\1}
-                            // compiled as an error here and every element
-                            // was dropped (set-old-8.52.1) while the
-                            // regexp command matched it fine via the
-                            // backtracking engine.
-                            #[cfg(feature = "regexp")]
+                            // The engine `regexp` matches by: the regex
+                            // crate had no backreferences, so {^(.)\1}
+                            // matched nothing here (set-old-8.52.1) while
+                            // `regexp` matched it.
+                            #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
                             {
-                                super::regexp_cmds::compile_engine(pat, false, false, false, false)
-                                    .map(|eng| super::regexp_cmds::engine_is_match(&eng, elem))
-                                    .unwrap_or(false)
-                            }
-                            #[cfg(all(feature = "regexp-lite", not(feature = "regexp")))]
-                            {
-                                regex_lite::Regex::new(pat)
-                                    .map(|re| re.is_match(elem))
-                                    .unwrap_or(false)
+                                regex_engine.as_ref().is_some_and(|engine| engine.is_match(elem))
                             }
                             #[cfg(not(any(feature = "regexp", feature = "regexp-lite")))]
                             {

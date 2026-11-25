@@ -156,6 +156,10 @@
 | C41 | （M7）`array statistics` 的桶数、直方图、平均查找距离是写死的假数（「N entries, N buckets，每个桶 1 个」） | `commands/array.rs` | 已修（M7）：按元素表的插入历史重放（tclsh 的 `Tcl_HashStats`）：删元素后桶数不缩、数组删掉重建从头算 |
 | C42 | （M7）`info locals`：unset 后重建的局部变量被列两次（tclsh 一次、在原位）；带 `args` 的 proc 把 `args` 列在最前（tclsh 在最后，即参数顺序）；`upvar`/`global`/`variable` 链接进来的名字被当成局部变量列出（tclsh 一个都不列，`info vars` 才列） | `commands/misc.rs`、`interp/call.rs` | 已修（M7） |
 | C43 | （M7）`apply` 的 lambda 第三个元素指向不存在的命名空间：消息对，没有 errorCode（tclsh `TCL LOOKUP NAMESPACE ::x`） | `commands/proc.rs` `cmd_apply` | 已修（M7） |
+| C44 | （M7）`switch -regexp` 用 `regex` crate 自己编译，和 `regexp` 不是同一个引擎：`\y`、`\m`、前瞻、回引永远不命中，编译不过的模式静默当成不命中（tclsh 报 `couldn't compile regular expression pattern: …`），`-indexvar` 给的是字节偏移（tclsh 是字符）；每次调用每个分支都重新编译 | `commands/control.rs` | 已修（M7）：走 `regexp` 的引擎与缓存 |
+| C45 | （M7）`array names -regexp` 对每个元素重新编译一次模式，编译不过时静默返回空 | `commands/array.rs` | 已修（M7）：编译一次，报编译错误；数组不存在时不编译（同 tclsh）。`expr` 的 `=~` 也改走同一引擎 |
+| C46 | （M7）`regsub -all {} ab X` 给 `XaXbX`，tclsh 给 `XaXb`（tclsh 这条路径是「字符串映射」特例，空模式只在字符之间替换，末尾不替换） | `commands/regexp_cmds.rs` `cmd_regsub` | 已修（M7） |
+| C47 | （M7，已知差异）带回引的模式在约 1000 字符以上的文本上，回溯器走到步数预算就报 `REGEXP REG_ESPACE {regular expression match is too complex}`，tclsh 给出结果（`regexp {(x+)y\1}` 对 1030 个 x：tclsh 0）。预算换的是不挂死 | `rtcl-regexp-spencer/src/backtrack.rs` | 未修（记录） |
 | C13 | 修复过程中新查出：`json encode` 的 schema 文本按词递归（`list list list …` 重复几万次即栈溢出），JSON 解码的递归下降无深度上限 | `commands/json.rs` | 已修（M2）：文档与 schema 的嵌套上限 1000，超限报错 |
 
 ## P2：性能（`TODO.md` 未列，本机单次实测，只看量级）
@@ -170,7 +174,7 @@
 | P14 | （M7）每个作用域的变量插入日志只增不减：循环里建了再删的变量永远留在日志里，内存和每次枚举的耗时都随之增长。三轮各 30 万次「建再删」后常驻 96MB（tclsh 5MB）；`array names` 对日志的每个条目做一次哈希查找，2 万元素 40ms、8 万元素 624ms | 96MB / 624ms | 5MB / 0.2ms | `interp/vars.rs` `var_order` | 已修（M7）：日志长到活跃键的两倍以上就收回到活跃键（全局表留最后一次出现，帧内的普通局部变量留第一次——对应 tclsh 的槽位序）；日志里没有失效条目时枚举直接顺着读，不做查找。7.8MB；2 万元素 1.1ms，8 万 5ms。探针 d23（45 条断言） |
 | P6 | 变量哈希不扩散，同前缀名退化 | 超线性 | 线性 | `interp/varmap.rs` |
 | P7 | 编译期 O(n²)（2 万个 `for`） | 4.6s | 0.10s | `parser/src/compiler.rs` |
-| P8 | 正则捕获组量词立方级；相邻变长捕获组 `(a+)(b+)` 是 O(n³)（400 字符单次 20ms、800 字符跑不完，基线版本 400 字符即挂死）；lookahead 慢约 9 倍；每次调用重新编译模式（无捕获 7–12µs、带捕获 12µs 对 tclsh 0.5µs） | 2.8s / 20ms / 12µs | 33ms / 7µs / 0.58µs | `regexp-spencer/src/captures.rs`、`commands/regexp_cmds.rs` |
+| P8 | 正则捕获组量词立方级；相邻变长捕获组 `(a+)(b+)` 是 O(n³)（400 字符单次 20ms、800 字符跑不完，基线版本 400 字符即挂死）；lookahead 慢约 9 倍；每次调用重新编译模式（无捕获 7–12µs、带捕获 12µs 对 tclsh 0.5µs） | 2.8s / 20ms / 12µs | 33ms / 7µs / 0.58µs | `regexp-spencer/src/captures.rs`、`commands/regexp_cmds.rs` |已修（M7，调用期开销）：(1) 模式每次调用都重新编译，现在是每线程 16 个引擎的缓存（`regexp`/`regsub`/`lsort`/`switch`/`array names` 共用），Spencer 的匹配器随引擎进池复用——它每次调用都要重建颜色表；(2) 纯文本模式直接做子串搜索（`regexp -nocase {ABC}` 每次 10.9µs → 0.2–0.3µs，tclsh 0.15–0.2）；(3) 长文本先只制表前 1024 个字符（`^abc` 对 40KB 每次 6.9µs → 0.15–0.3µs，tclsh 0.01）。`\d+` 5.9µs → 0.5–0.7µs（tclsh 0.3–0.4），带捕获 8.3µs → 0.7–0.9µs（tclsh 4.5–6.5）。探针 d24（153 条断言） |
 | P8a | （已修，M2）上行的前三项：定长操作数按算术数迭代；切分点由一次锚定 NFA 模拟给出而不是逐个盲试；定长部分只有一个候选切分点 | 20ms / 2.8s | 7µs / 33ms | 同上 |
 | P9 | 文件读取逐字节（32MB） | ≈0.6s | 58ms | `channel.rs` |
 | P10 | 树引擎对嵌套立方级，且无条件编译 | >10s | 0.2s | `interp/eval.rs` |

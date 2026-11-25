@@ -384,14 +384,17 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             MatchMode::Regexp => {
                 #[cfg(feature = "regexp")]
                 {
-                    let pat = if nocase {
-                        format!("(?i){}", pattern)
-                    } else {
-                        pattern.clone()
-                    };
-                    regex::Regex::new(&pat)
-                        .map(|re| re.is_match(&haystack))
-                        .unwrap_or(false)
+                    // The engine `regexp` matches by — tclsh has one.  A
+                    // pattern was compiled here on its own, with the
+                    // `regex` crate and on every call: differently from
+                    // `regexp` (`\y`, `\m`, lookaheads and
+                    // backreferences never matched, a pattern the crate
+                    // rejects never matched either) and slowly.
+                    let engine = super::regexp_cmds::compile_engine_cached(
+                        interp, pattern, nocase, false, false, false,
+                    )
+                    .map_err(Error::Msg)?;
+                    engine.is_match(&haystack)
                 }
                 #[cfg(not(feature = "regexp"))]
                 {
@@ -406,7 +409,18 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
         if matched {
             if mode == MatchMode::Regexp {
-                set_regexp_match_vars(interp, &matchvar, &indexvar, pattern, &haystack, nocase)?;
+                #[cfg(feature = "regexp")]
+                {
+                    let engine = super::regexp_cmds::compile_engine_cached(
+                        interp, pattern, nocase, false, false, false,
+                    )
+                    .map_err(Error::Msg)?;
+                    set_regexp_match_vars(interp, &matchvar, &indexvar, &engine, &haystack)?;
+                }
+                #[cfg(not(feature = "regexp"))]
+                {
+                    let _ = (&matchvar, &indexvar, &haystack, nocase);
+                }
             }
             // A "-" body falls through: take the next body position that is
             // not exactly "-", skipping over intervening patterns without
@@ -466,53 +480,29 @@ fn set_regexp_match_vars(
     interp: &mut Interp,
     matchvar: &Option<String>,
     indexvar: &Option<String>,
-    pattern: &str,
+    engine: &super::regexp_cmds::CachedEngine,
     haystack: &str,
-    nocase: bool,
 ) -> Result<()> {
     if matchvar.is_none() && indexvar.is_none() {
         return Ok(());
     }
-    let pat = if nocase {
-        format!("(?i){}", pattern)
-    } else {
-        pattern.to_string()
+    let Some(groups) = engine.first_match(haystack) else {
+        return Ok(());
     };
-    let re = match regex::Regex::new(&pat) {
-        Ok(re) => re,
-        Err(_) => return Ok(()),
-    };
-    if let Some(caps) = re.captures(haystack) {
-        // tclsh writes the indices list first, then the matches list — a
-        // failing second write leaves the first one in place (switch-13.6).
-        if let Some(name) = indexvar {
-            let items: Vec<Value> = (0..caps.len())
-                .map(|g| match caps.get(g) {
-                    Some(m) => Value::from_str(&format!("{} {}", m.start(), m.end() - 1)),
-                    None => Value::from_str("-1 -1"),
-                })
-                .collect();
-            interp.set_var(name, Value::from_list(&items))?;
-        }
-        if let Some(name) = matchvar {
-            let items: Vec<Value> = (0..caps.len())
-                .map(|g| Value::from_str(caps.get(g).map(|m| m.as_str()).unwrap_or("")))
-                .collect();
-            interp.set_var(name, Value::from_list(&items))?;
-        }
+    // tclsh writes the indices list first, then the matches list — a
+    // failing second write leaves the first one in place (switch-13.6).
+    if let Some(name) = indexvar {
+        interp.set_var(
+            name,
+            Value::from_list(&super::regexp_cmds::group_values(haystack, &groups, true)),
+        )?;
     }
-    Ok(())
-}
-
-#[cfg(not(feature = "regexp"))]
-fn set_regexp_match_vars(
-    _interp: &mut Interp,
-    _matchvar: &Option<String>,
-    _indexvar: &Option<String>,
-    _pattern: &str,
-    _haystack: &str,
-    _nocase: bool,
-) -> Result<()> {
+    if let Some(name) = matchvar {
+        interp.set_var(
+            name,
+            Value::from_list(&super::regexp_cmds::group_values(haystack, &groups, false)),
+        )?;
+    }
     Ok(())
 }
 

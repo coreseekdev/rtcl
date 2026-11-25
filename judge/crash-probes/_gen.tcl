@@ -6,9 +6,9 @@
 #   T <tag> {<script>}            — here: code, result, errorCode
 #   C <tag> <path> {<script>}     — in a child interpreter: code, result,
 #                                  the child's errorCode, its errorInfo
-#   # skip <tag> <tag> …          — these checks run (the later ones sit on
-#                                  their state) but are not asserted: what
-#                                  they produce is not a portable
+#   # skip <tag> <tag> … -- why   — these checks run (the later ones sit
+#                                  on their state) but are not asserted:
+#                                  what they produce is not a portable
 #                                  expectation, or rtcl differs on purpose
 #   plain lines                   — state; they go into the probe as they are
 # The probe keeps the comment block at the top of the file it replaces,
@@ -33,7 +33,12 @@ close $f
 set ::skip {}
 foreach line $lines {
     if {[string match "# skip *" $line]} {
-        foreach tag [lrange $line 2 end] { lappend ::skip $tag }
+        # `# skip tag tag … -- why`
+        set rest [string range $line 7 end]
+        set cut [string first " -- " $rest]
+        if {$cut >= 0} { set rest [string range $rest 0 [expr {$cut - 1}]] }
+        if {[catch {lrange $rest 0 end} tags]} { set tags $rest }
+        foreach tag $tags { lappend ::skip $tag }
     }
 }
 

@@ -548,6 +548,29 @@ pub(crate) fn compile_engine_tc(
     lineanchor: bool,
     linestop: bool,
 ) -> std::result::Result<Engine, String> {
+    // A pattern that is plain text is matched by a search (see
+    // [`Engine::Literal`]); everything below is for the rest.
+    #[cfg(feature = "regexp")]
+    if let Some(text) = literal_text(pattern, nocase, expanded) {
+        return Ok(Engine::Literal(Box::new(LiteralPat {
+            text,
+            icase: nocase,
+            fallback: Box::new(compile_real(interp, pattern, nocase, expanded, lineanchor, linestop)?),
+        })));
+    }
+    compile_real(interp, pattern, nocase, expanded, lineanchor, linestop)
+}
+
+/// [`compile_engine_tc`] for a pattern with syntax in it.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+fn compile_real(
+    interp: &mut Interp,
+    pattern: &str,
+    nocase: bool,
+    expanded: bool,
+    lineanchor: bool,
+    linestop: bool,
+) -> std::result::Result<Engine, String> {
     // M5：默认整条 regexp/regsub 路径走 Spencer 移植（其 parser 自带
     // tclsh 同源的校验与 REG_* 码）；lite 构建保持单一 regex_lite。
     #[cfg(all(feature = "regexp", feature = "regexp-spencer"))]
@@ -577,6 +600,140 @@ pub(crate) fn compile_engine_tc(
         ));
     }
     compile_engine(pattern, nocase, expanded, lineanchor, linestop)
+}
+
+/// The text a pattern that is plain text matches — or `None` for a
+/// pattern with any of the syntax in it.  With `-expanded`, blanks and
+/// `#` are not themselves; the case folding of a non-ASCII character is
+/// the engine's to do.
+#[cfg(feature = "regexp")]
+fn literal_text(pattern: &str, nocase: bool, expanded: bool) -> Option<String> {
+    if let Some(rest) = pattern.strip_prefix("***=") {
+        return Some(rest.to_string());
+    }
+    if expanded || (nocase && !pattern.is_ascii()) {
+        return None;
+    }
+    let plain = !pattern
+        .chars()
+        .any(|c| matches!(c, '\\' | '.' | '[' | ']' | '{' | '}' | '(' | ')' | '*' | '+' | '?' | '^' | '$' | '|'));
+    plain.then(|| pattern.to_string())
+}
+
+/// Compiled engines by pattern and flags, the most recently used first.
+///
+/// tclsh keeps a pattern's compiled form in the pattern object itself; a
+/// rtcl `Value` has no place for it, and every `regexp`, `regsub`, `lsort
+/// -regexp` compiled its pattern again on each call — most of the cost of
+/// a call on a short string.  An engine depends on nothing but the pattern
+/// and the flags, so engines are shared by every interpreter of the thread.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+thread_local! {
+    static ENGINES: std::cell::RefCell<Vec<(String, u8, std::rc::Rc<CachedEngine>)>> =
+        std::cell::RefCell::new(Vec::new());
+    /// The Spencer matchers, by the engine they were built for.  A
+    /// matcher carries the pattern's DFA colour table, which costs
+    /// microseconds to build — and was built for every single call.
+    #[cfg(all(feature = "regexp", feature = "regexp-spencer"))]
+    static MATCHERS: std::cell::RefCell<Vec<(u64, super::regexp_spencer::matcher::Matcher)>> =
+        std::cell::RefCell::new(Vec::new());
+    /// The next engine's number (odd, so never 0 after a wrap).
+    #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+    static NEXT_SERIAL: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// How many compiled engines, and matchers, are kept.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+const ENGINE_CACHE_SIZE: usize = 16;
+
+/// A compiled engine with the number that tells its matchers from
+/// another pattern's.  Numbers are never reused, so a matcher that
+/// outlived its engine in the pool matches no later engine.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+pub(crate) struct CachedEngine {
+    serial: u64,
+    engine: Engine,
+}
+
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+impl std::ops::Deref for CachedEngine {
+    type Target = Engine;
+
+    fn deref(&self) -> &Engine {
+        &self.engine
+    }
+}
+
+/// Take the matcher pooled for `serial`, if any.
+#[cfg(all(feature = "regexp", feature = "regexp-spencer"))]
+fn matcher_take(serial: Option<u64>) -> Option<super::regexp_spencer::matcher::Matcher> {
+    let serial = serial?;
+    MATCHERS.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let at = pool.iter().position(|(s, _)| *s == serial)?;
+        Some(pool.swap_remove(at).1)
+    })
+}
+
+/// Pool `matcher` for `serial` (the least recently taken one is dropped
+/// when the pool is full).
+#[cfg(all(feature = "regexp", feature = "regexp-spencer"))]
+fn matcher_give_back(serial: Option<u64>, matcher: super::regexp_spencer::matcher::Matcher) {
+    if let Some(serial) = serial {
+        MATCHERS.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() >= ENGINE_CACHE_SIZE {
+                pool.pop();
+            }
+            pool.push((serial, matcher));
+        });
+    }
+}
+
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+fn flag_bits(nocase: bool, expanded: bool, lineanchor: bool, linestop: bool) -> u8 {
+    (nocase as u8) | ((expanded as u8) << 1) | ((lineanchor as u8) << 2) | ((linestop as u8) << 3)
+}
+
+/// [`compile_engine_tc`] through the cache: the same errors, and on
+/// success a program that is reused while the pattern stays in use.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+pub(crate) fn compile_engine_cached(
+    interp: &mut Interp,
+    pattern: &str,
+    nocase: bool,
+    expanded: bool,
+    lineanchor: bool,
+    linestop: bool,
+) -> std::result::Result<std::rc::Rc<CachedEngine>, String> {
+    let flags = flag_bits(nocase, expanded, lineanchor, linestop);
+    let hit = ENGINES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let at = cache.iter().position(|(p, f, _)| *f == flags && p == pattern)?;
+        let hit = cache[at].2.clone();
+        // The most recently used first, and dropped last.
+        cache.swap(0, at);
+        Some(hit)
+    });
+    if let Some(hit) = hit {
+        return Ok(hit);
+    }
+    // Numbers start at 1: 0 is what a cache with no engine asks for.
+    let serial = NEXT_SERIAL.with(|n| {
+        let next = n.get().wrapping_add(1) | 1;
+        n.set(next);
+        next
+    });
+    let engine = std::rc::Rc::new(CachedEngine {
+        serial,
+        engine: compile_engine_tc(interp, pattern, nocase, expanded, lineanchor, linestop)?,
+    });
+    ENGINES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.insert(0, (pattern.to_string(), flags, engine.clone()));
+        cache.truncate(ENGINE_CACHE_SIZE);
+    });
+    Ok(engine)
 }
 
 /// 命令行开关 → Spencer `Options`。`-line` 同时置 nlanch/nlstop。
@@ -636,6 +793,49 @@ pub(crate) enum Engine {
     /// + `RTCL_REGEX_ENGINE=spencer` 灰度路由）。
     #[cfg(feature = "regexp-spencer")]
     Spencer(Box<super::regexp_spencer::Prog>),
+    /// A pattern that is plain text: matching it is looking for that
+    /// text.  The engine proper costs several microseconds a call on a
+    /// short string (a char table of the text, a matcher); a search costs
+    /// tens of nanoseconds.  `fallback` is the compiled engine, for the
+    /// one thing the search does not do — case-insensitive matching
+    /// against text that is not all ASCII.
+    Literal(Box<LiteralPat>),
+}
+
+/// See [`Engine::Literal`].
+#[cfg(feature = "regexp")]
+struct LiteralPat {
+    text: String,
+    icase: bool,
+    fallback: Box<Engine>,
+}
+
+/// The byte offset where `lit` matches in `hay`; `Err(())` when the match
+/// is the fallback engine's to find (a case-insensitive pattern against
+/// text that is not all ASCII).
+#[cfg(feature = "regexp")]
+fn literal_find(hay: &str, lit: &LiteralPat) -> Option<std::result::Result<usize, ()>> {
+    if !lit.icase {
+        return Some(Ok(hay.find(lit.text.as_str())?));
+    }
+    if !hay.is_ascii() {
+        return Some(Err(()));
+    }
+    let (h, n) = (hay.as_bytes(), lit.text.as_bytes());
+    // The empty text matches where the search starts.
+    if n.is_empty() {
+        return Some(Ok(0));
+    }
+    let first = n[0];
+    let mut from = 0;
+    while let Some(at) = h[from..].iter().position(|b| b.eq_ignore_ascii_case(&first)) {
+        let at = from + at;
+        if h[at..].len() >= n.len() && h[at..at + n.len()].eq_ignore_ascii_case(n) {
+            return Some(Ok(at));
+        }
+        from = at + 1;
+    }
+    None
 }
 
 /// Does the pattern use constructs whose membership follows tclsh's Unicode
@@ -734,7 +934,17 @@ pub(crate) struct CharCache {
     matcher: Option<super::regexp_spencer::matcher::Matcher>,
     /// 全串是否 ASCII（必需字符预过滤可用字节 memchr 快路径）。
     ascii: Option<bool>,
+    /// The engine this cache serves, in the matcher pool.
+    serial: Option<u64>,
+    /// Only the text's first characters are tabulated (see
+    /// [`CharCache::load`]); the byte after them is the table's last entry.
+    partial: bool,
 }
+
+/// How many characters of a long text are tabulated before it is known
+/// whether the match needs any more.
+#[cfg(all(feature = "regexp-spencer", feature = "regexp"))]
+const PREFIX_CHARS: usize = 1024;
 
 #[cfg(all(feature = "regexp-spencer", feature = "regexp"))]
 impl CharCache {
@@ -743,6 +953,57 @@ impl CharCache {
             text: None,
             matcher: None,
             ascii: None,
+            serial: None,
+            partial: false,
+        }
+    }
+
+    /// Tabulate `full` — or, when it is long, only its first characters:
+    /// an anchored or an early match never looks further, and tabulating
+    /// 40KB cost microseconds on every call.
+    fn load(&mut self, full: &str) {
+        let mut chars: Vec<char> = Vec::with_capacity(PREFIX_CHARS + 1);
+        let mut byte_at: Vec<usize> = Vec::with_capacity(PREFIX_CHARS + 2);
+        self.partial = false;
+        for (b, c) in full.char_indices() {
+            if chars.len() == PREFIX_CHARS {
+                self.partial = true;
+                break;
+            }
+            chars.push(c);
+            byte_at.push(b);
+        }
+        // The byte after the last character tabulated.
+        byte_at.push(match chars.last() {
+            Some(c) => byte_at[byte_at.len() - 1] + c.len_utf8(),
+            None => full.len(),
+        });
+        self.text = Some((chars, byte_at));
+    }
+
+    /// Tabulate all of `full`.
+    fn load_all(&mut self, full: &str) {
+        let chars: Vec<char> = full.chars().collect();
+        let mut byte_at: Vec<usize> = full.char_indices().map(|(b, _)| b).collect();
+        byte_at.push(full.len());
+        self.partial = false;
+        self.text = Some((chars, byte_at));
+    }
+
+    /// A cache for one call on `engine`: its matcher comes from the pool
+    /// and goes back there when the call is over.
+    pub(crate) fn for_engine(engine: &CachedEngine) -> CharCache {
+        let mut cache = CharCache::new();
+        cache.serial = Some(engine.serial);
+        cache
+    }
+}
+
+#[cfg(all(feature = "regexp-spencer", feature = "regexp"))]
+impl Drop for CharCache {
+    fn drop(&mut self) {
+        if let Some(matcher) = self.matcher.take() {
+            matcher_give_back(self.serial, matcher);
         }
     }
 }
@@ -755,6 +1016,95 @@ impl CharCache {
     pub(crate) fn new() -> CharCache {
         CharCache
     }
+
+    /// No matcher to pool here: the cache is a placeholder.
+    #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+    pub(crate) fn for_engine(_engine: &CachedEngine) -> CharCache {
+        CharCache
+    }
+}
+
+/// One match attempt of the Spencer program, on the text `cache`
+/// tabulated for it.
+#[cfg(feature = "regexp-spencer")]
+fn spencer_attempt(
+    prog: &super::regexp_spencer::Prog,
+    full_string: &str,
+    p: usize,
+    search_start: usize,
+    cache: &mut CharCache,
+) -> Option<GroupRanges> {
+    if cache.text.is_none() {
+        cache.load(full_string);
+    }
+    if cache.matcher.is_none() {
+        cache.matcher = Some(
+            matcher_take(cache.serial)
+                .unwrap_or_else(|| super::regexp_spencer::matcher::Matcher::new(prog)),
+        );
+    }
+    let (chars, byte_at) = cache.text.as_ref().unwrap();
+    // 必需字面预过滤：ASCII 非 -nocase 用 str::contains
+    // （memmem）；否则退回必需字符/折叠变体检查。
+    if cache.ascii.is_none() {
+        cache.ascii = Some(full_string.is_ascii());
+    }
+    let ascii = cache.ascii == Some(true);
+    let from = p.min(chars.len());
+    let mut filtered = false;
+    if !prog.icase {
+        if let Some(lit) = &prog.required_literal {
+            let found = if ascii {
+                full_string[byte_at[from]..].contains(lit.as_str())
+            } else {
+                let lc: Vec<char> = lit.chars().collect();
+                chars[from..]
+                    .windows(lc.len())
+                    .any(|w| w == lc.as_slice())
+            };
+            if !found {
+                return None;
+            }
+            filtered = true;
+        }
+    }
+    if !filtered {
+        if let Some(c) = prog.required_char {
+            let found = if ascii && c.is_ascii() {
+                let suffix = &full_string[byte_at[from]..];
+                let mut hit = suffix.contains(c);
+                if !hit && prog.icase {
+                    hit = suffix.contains(c.to_ascii_lowercase())
+                        || suffix.contains(c.to_ascii_uppercase());
+                }
+                hit
+            } else {
+                chars[from..].iter().any(|&ch| {
+                    ch == c
+                        || (prog.icase
+                            && (ch.to_lowercase().next() == Some(c)
+                                || ch.to_uppercase().next() == Some(c)))
+                })
+            };
+            if !found {
+                return None;
+            }
+        }
+    }
+    let matcher = cache.matcher.as_mut().unwrap();
+    // 无捕获组时跳过 dissect，只取整体 span（常见类/字面模式
+    // 的 -all 热路径）。
+    if prog.nsubs == 0 {
+        let m = matcher.find(prog, chars, p, search_start)?;
+        return Some(vec![Some((byte_at[m.start], byte_at[m.end]))]);
+    }
+    let caps = super::regexp_spencer::captures::exec_with(prog, chars, p, search_start, matcher)?;
+    Some(
+        caps.spans
+            .into_iter()
+            .map(|g| g.map(|(s, e)| (byte_at[s], byte_at[e])))
+            .collect(),
+    )
 }
 
 /// Attempt one match at char index `p` of `full_string`; returns capture
@@ -773,87 +1123,41 @@ pub(crate) fn engine_attempt(
     match eng {
         #[cfg(feature = "regexp-spencer")]
         Engine::Spencer(prog) => {
-            if cache.text.is_none() {
-                let chars: Vec<char> = full_string.chars().collect();
-                let mut byte_at: Vec<usize> = full_string
-                    .char_indices()
-                    .map(|(b, _)| b)
-                    .collect();
-                byte_at.push(full_string.len());
-                cache.text = Some((chars, byte_at));
+            // A search over the text's first characters can answer for the
+            // whole text only when nothing in the pattern looks past a
+            // match's end (a lookahead, a backreference).  With such a
+            // pattern the whole text is tabulated from the start.
+            let closed = prog.lacons.is_empty() && !prog.has_backref;
+            if cache.partial && !closed {
+                cache.load_all(full_string);
             }
-            if cache.matcher.is_none() {
-                cache.matcher =
-                    Some(super::regexp_spencer::matcher::Matcher::new(prog));
+            let found = spencer_attempt(prog, full_string, p, search_start, cache);
+            if !cache.partial {
+                return found;
             }
-            let (chars, byte_at) = cache.text.as_ref().unwrap();
-            // 必需字面预过滤：ASCII 非 -nocase 用 str::contains
-            // （memmem）；否则退回必需字符/折叠变体检查。
-            if cache.ascii.is_none() {
-                cache.ascii = Some(full_string.is_ascii());
+            // …and then only when the match ends well inside them.
+            let cut = cache.text.as_ref().map_or(0, |(_, byte_at)| byte_at[PREFIX_CHARS]);
+            let inside = found
+                .as_ref()
+                .and_then(|g| g.first().and_then(|range| *range))
+                .is_some_and(|(_, e)| e < cut);
+            if found.is_some() && inside {
+                return found;
             }
-            let ascii = cache.ascii == Some(true);
-            let from = p.min(chars.len());
-            let mut filtered = false;
-            if !prog.icase {
-                if let Some(lit) = &prog.required_literal {
-                    let found = if ascii {
-                        full_string[byte_at[from]..].contains(lit.as_str())
-                    } else {
-                        let lc: Vec<char> = lit.chars().collect();
-                        chars[from..]
-                            .windows(lc.len())
-                            .any(|w| w == lc.as_slice())
-                    };
-                    if !found {
-                        return None;
-                    }
-                    filtered = true;
-                }
+            // Looked for again in the whole text.  The first attempt goes
+            // whole — its running out of budget included: the attempt that
+            // counts is the one on the whole text.
+            let _ = super::regexp_spencer::take_over_budget();
+            cache.load_all(full_string);
+            spencer_attempt(prog, full_string, p, search_start, cache)
+        }
+        Engine::Literal(lit) => {
+            let off = char_to_byte(full_string, p);
+            match literal_find(&full_string[off..], lit) {
+                Some(Ok(at)) => Some(vec![Some((off + at, off + at + lit.text.len()))]),
+                Some(Err(())) => engine_attempt(&lit.fallback, full_string, p, search_start, cache),
+                None => None,
             }
-            if !filtered {
-                if let Some(c) = prog.required_char {
-                    let found = if ascii && c.is_ascii() {
-                        let suffix = &full_string[byte_at[from]..];
-                        let mut hit = suffix.contains(c);
-                        if !hit && prog.icase {
-                            hit = suffix.contains(c.to_ascii_lowercase())
-                                || suffix.contains(c.to_ascii_uppercase());
-                        }
-                        hit
-                    } else {
-                        chars[from..].iter().any(|&ch| {
-                            ch == c
-                                || (prog.icase
-                                    && (ch.to_lowercase().next() == Some(c)
-                                        || ch.to_uppercase().next() == Some(c)))
-                        })
-                    };
-                    if !found {
-                        return None;
-                    }
-                }
-            }
-            let matcher = cache.matcher.as_mut().unwrap();
-            // 无捕获组时跳过 dissect，只取整体 span（常见类/字面模式
-            // 的 -all 热路径）。
-            if prog.nsubs == 0 {
-                let m = matcher.find(prog, chars, p, search_start)?;
-                return Some(vec![Some((byte_at[m.start], byte_at[m.end]))]);
-            }
-            let caps = super::regexp_spencer::captures::exec_with(
-                prog,
-                chars,
-                p,
-                search_start,
-                matcher,
-            )?;
-            Some(
-                caps.spans
-                    .into_iter()
-                    .map(|g| g.map(|(s, e)| (byte_at[s], byte_at[e])))
-                    .collect(),
-            )
         }
         Engine::Full(prog) => {
             let off = char_to_byte(full_string, p);
@@ -891,6 +1195,11 @@ pub(crate) fn engine_is_match(eng: &Engine, s: &str) -> bool {
         Engine::Full(p) => super::regexp_bt::bt_is_match(p, s),
         #[cfg(feature = "regexp-spencer")]
         Engine::Spencer(p) => super::regexp_spencer::is_match(p, s, 0),
+        Engine::Literal(lit) => match literal_find(s, lit) {
+            Some(Ok(_)) => true,
+            Some(Err(())) => engine_is_match(&lit.fallback, s),
+            None => false,
+        },
     }
 }
 
@@ -901,6 +1210,7 @@ pub(crate) fn engine_group_count(eng: &Engine, pattern: &str) -> usize {
         Engine::Full(p) => p.ngroups,
         #[cfg(feature = "regexp-spencer")]
         Engine::Spencer(p) => p.nsubs,
+        Engine::Literal(_) => 0,
     }
 }
 
@@ -939,7 +1249,12 @@ pub(crate) fn compile_engine(
 /// A matcher that ran out of its budget did not finish: report it instead
 /// of passing its partial answer off as a result (`regexp {a+()\1x}` over
 /// 2,000 characters used to answer 0 where the pattern matches).
-#[cfg(feature = "regexp-spencer")]
+#[cfg(not(feature = "regexp-spencer"))]
+fn check_match_finished(_interp: &mut Interp) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(feature = "regexp-spencer", any(feature = "regexp", feature = "regexp-lite")))]
 fn check_match_finished(interp: &mut Interp) -> Result<()> {
     if !super::regexp_spencer::take_over_budget() {
         return Ok(());
@@ -1109,10 +1424,79 @@ fn parse_start_index(s: &str, len: usize) -> std::result::Result<usize, String> 
 #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
 /// Byte offset of char index `ci` (clamped to the string length).
 fn char_to_byte(s: &str, ci: usize) -> usize {
+    // Bytes are characters for most texts (the scan below walks up to
+    // the offset each time).
+    if s.is_ascii() {
+        return ci.min(s.len());
+    }
     s.char_indices()
         .nth(ci)
         .map(|(b, _)| b)
         .unwrap_or(s.len())
+}
+
+/// The length of `s` in characters.
+fn char_len(s: &str) -> usize {
+    if s.is_ascii() {
+        s.len()
+    } else {
+        s.chars().count()
+    }
+}
+
+/// What a match's groups read as: the texts, or (with `indices`) one
+/// `{start end}` pair of character indices per group, the end inclusive.
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+pub(crate) fn group_values(s: &str, groups: &GroupRanges, indices: bool) -> Vec<Value> {
+    groups
+        .iter()
+        .map(|g| match g {
+            Some((start, end)) if indices => Value::from_str(&format!(
+                "{} {}",
+                byte_to_char(s, *start),
+                byte_to_char(s, *end) as i64 - 1
+            )),
+            Some((start, end)) => Value::from_str(&s[*start..*end]),
+            None if indices => Value::from_str("-1 -1"),
+            None => Value::empty(),
+        })
+        .collect()
+}
+
+#[cfg(any(feature = "regexp", feature = "regexp-lite"))]
+impl CachedEngine {
+    /// Whether `engine` matches anywhere in `s` — through the pool, so
+    /// that a caller matching it item by item (`lsort -regexp`) does not
+    /// rebuild a matcher each time.
+    pub(crate) fn is_match(&self, s: &str) -> bool {
+        #[cfg(all(feature = "regexp", feature = "regexp-spencer"))]
+        if let Engine::Spencer(prog) = &self.engine {
+            let mut matcher = matcher_take(Some(self.serial))
+                .unwrap_or_else(|| super::regexp_spencer::matcher::Matcher::new(prog));
+            let found = matcher.find(prog, &s.chars().collect::<Vec<_>>(), 0, 0).is_some();
+            matcher_give_back(Some(self.serial), matcher);
+            return found;
+        }
+        #[cfg(feature = "regexp")]
+        {
+            engine_is_match(&self.engine, s)
+        }
+        #[cfg(not(feature = "regexp"))]
+        {
+            self.first_match(s).is_some()
+        }
+    }
+
+    /// The groups of the first match in `s`, as byte ranges into `s` —
+    /// for the callers outside the `regexp` command (`switch -regexp`),
+    /// so that they match by the same engine it does.
+    pub(crate) fn first_match(&self, s: &str) -> Option<GroupRanges> {
+        #[cfg(all(feature = "regexp-spencer", feature = "regexp"))]
+        let mut cache = CharCache::for_engine(self);
+        #[cfg(not(all(feature = "regexp-spencer", feature = "regexp")))]
+        let mut cache = CharCache::new();
+        engine_attempt(&self.engine, s, 0, 0, &mut cache)
+    }
 }
 
 #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
@@ -1950,14 +2334,14 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let full_string = args[i + 1].as_str();
     let var_args = &args[i + 2..];
 
-    let char_len = full_string.chars().count();
+    let char_len = char_len(full_string);
     let char_start = match &start_offset {
         Some(off_str) => parse_start_index(off_str, char_len)
             .map_err(|e| Error::runtime(e, ErrorCode::Generic))?,
         None => 0,
     };
 
-    let eng = compile_engine_tc(interp, pattern_str, nocase, expanded, lineanchor, linestop)
+    let eng = compile_engine_cached(interp, pattern_str, nocase, expanded, lineanchor, linestop)
         .map_err(|e| Error::runtime(e, ErrorCode::Generic))?;
 
     // `\A` 绑定每次尝试的搜索起点：非 -all 只尝试 -start（故
@@ -1968,7 +2352,7 @@ pub fn cmd_regexp(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let virtual_start = char_start > char_len;
     let effective_start = char_start.min(char_len);
     let index_delta = (char_start - effective_start) as i64;
-    let mut char_cache = CharCache::new();
+    let mut char_cache = CharCache::for_engine(&eng);
     let attempt = |p: usize| -> Option<GroupRanges> {
         // 越过串尾的 -start 把原偏移作为虚拟搜索起点（\A 命中串尾，
         // 词断言/^ 看不到串尾之前的字符）。
@@ -2126,7 +2510,7 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let sub_spec = args[i + 2].as_str();
     let var_name = args.get(i + 3).map(|a| a.as_str());
 
-    let char_len = full_string.chars().count();
+    let char_len = char_len(full_string);
     let char_start = match &start_offset {
         Some(off_str) => parse_start_index(off_str, char_len)
             .map_err(|e| Error::runtime(e, ErrorCode::Generic))?,
@@ -2134,8 +2518,34 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
     let byte_start = char_to_byte(full_string, char_start);
 
-    let eng = compile_engine_tc(interp, pattern_str, nocase, expanded, lineanchor, linestop)
+    let eng = compile_engine_cached(interp, pattern_str, nocase, expanded, lineanchor, linestop)
         .map_err(|e| Error::runtime(e, ErrorCode::Generic))?;
+
+    // tclsh: `regsub -all` from the start, with a substitution that has
+    // no `&` or `\` in it and a pattern that is plain text, goes by a
+    // string-map path — and for an empty pattern that path puts the
+    // substitution between the characters only, nothing after the last.
+    // The engine matches once more at the end (`XaXbX` for `ab`).
+    if all
+        && char_start == 0
+        && pattern_str.is_empty()
+        && !sub_spec.contains('&')
+        && !sub_spec.contains('\\')
+    {
+        let mut result =
+            String::with_capacity(full_string.len() + sub_spec.len() * full_string.len());
+        let mut count = 0i64;
+        for c in full_string.chars() {
+            result.push_str(sub_spec);
+            result.push(c);
+            count += 1;
+        }
+        if let Some(var) = var_name {
+            interp.set_var(var, Value::from_str(&result))?;
+            return Ok(Value::from_int(count));
+        }
+        return Ok(Value::from_str(&result));
+    }
 
     // Standard mode: Tcl substitution spec applied to the matches the
     // -start/-all scan yields.  regsub assigns varName unconditionally,
@@ -2143,7 +2553,7 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // `\A` 绑定每次尝试的搜索起点：非 -all 只尝试 -start（故
     // `-start 1 {\Aa} aba` → 0）；-all 每次向后推进时，新起点成为
     // 虚拟串首（tclsh 16.4：`regsub -all {\A(\w)}` 逐字符替换）。
-    let mut char_cache = CharCache::new();
+    let mut char_cache = CharCache::for_engine(&eng);
     let attempt = |p: usize| -> Option<GroupRanges> {
         engine_attempt(&eng, full_string, p, p, &mut char_cache)
     };

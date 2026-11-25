@@ -779,31 +779,23 @@ fn ns_children(interp: &Interp, args: &[Value]) -> Result<Value> {
             seen.insert(k.as_str(), i);
         }
     }
-    let pairs: Vec<(String, String)> = interp
+    // The live children's names in their namespace, in the order the
+    // namespaces came.
+    let tails: Vec<&str> = interp
         .ns_order
         .iter()
         .enumerate()
         .filter(|(i, k)| seen.get(k.as_str()) == Some(i))
-        .map(|(_, k)| {
-            let tail = k.strip_prefix(prefix.as_str()).unwrap_or(k).to_string();
-            (k.clone(), tail)
-        })
+        .map(|(_, k)| k.strip_prefix(prefix.as_str()).unwrap_or(k))
         .collect();
-    let tails: Vec<String> = pairs.iter().map(|(_, t)| t.clone()).collect();
-    let children = crate::interp::tclhash::tcl_order(&tails)
+    let children = crate::interp::tclhash::tcl_order(tails.iter().copied())
         .into_iter()
         .filter(|tail| {
             pattern
                 .map(|p| crate::interp::glob_match(p, tail))
                 .unwrap_or(true)
         })
-        .map(|tail| {
-            format!(
-                "{}{}",
-                prefix,
-                tail
-            )
-        })
+        .map(|tail| format!("{}{}", prefix, tail))
         .collect::<Vec<_>>();
     Ok(Value::from_str(&children.join(" ")))
 }

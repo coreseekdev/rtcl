@@ -720,29 +720,30 @@ fn list_commands_in(
     let mut push_matched = |keys: &[(String, String)], out: &mut Vec<Value>,
                             listed: &mut std::collections::HashSet<String>,
                             simple: Option<&String>, specific: bool| {
-        let tails: Vec<String> = keys.iter().map(|(_, t)| t.clone()).collect();
-        for tail in crate::interp::tclhash::tcl_order(&tails) {
+        // The fully-qualified key each tail came from — the first one, as
+        // a search of `keys` found it, but found once.
+        let mut first_of: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::with_capacity(keys.len());
+        for (full, tail) in keys {
+            first_of.entry(tail.as_str()).or_insert_with(|| full.as_str());
+        }
+        for tail in crate::interp::tclhash::tcl_order(keys.iter().map(|(_, t)| t.as_str())) {
             if let Some(sp) = simple {
-                if !super::super::glob_match(sp, &tail) {
+                if !super::super::glob_match(sp, tail) {
                     continue;
                 }
             }
-            if listed.insert(tail.clone()) {
+            if listed.insert(tail.to_string()) {
                 // `::`-bearing patterns render the fully-qualified key
                 // (tclsh's InfoCommandsCmd); bare patterns the tail.
                 let rendered = if specific {
-                    keys.iter()
-                        .find(|(_, t)| *t == tail)
-                        .map(|(full, _)| {
-                            if full.starts_with("::") {
-                                full.clone()
-                            } else {
-                                format!("::{}", full)
-                            }
-                        })
-                        .unwrap_or_else(|| tail.clone())
+                    match first_of.get(tail).copied() {
+                        Some(full) if full.starts_with("::") => full.to_string(),
+                        Some(full) => format!("::{}", full),
+                        None => tail.to_string(),
+                    }
                 } else {
-                    tail.clone()
+                    tail.to_string()
                 };
                 out.push(Value::from_str(&rendered));
             }
@@ -913,6 +914,12 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // render qualified (tclsh: `info vars n::*` → `::n::v`).
             let qualified = qualified
                 || match_pat.map(|p| p.contains("::")).unwrap_or(false);
+            // An insertion log as long as the table has no stale entry:
+            // its entries are the live keys, and none needs a lookup (a
+            // lookup per entry was the whole cost of listing many
+            // variables: random access into a large table).
+            let log_is_exact = interp.var_order.len() == interp.globals.len();
+            let live = |k: &String| log_is_exact || interp.globals.contains_key(k.as_str());
             if qualified {
                 // Walk the pattern's `::` qualifiers to the target table.
                 let stripped = pattern.unwrap().trim_start_matches(':').to_string();
@@ -930,9 +937,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         format!("{}::", &target_ns[2..])
                     };
                     for k in interp.var_order.iter() {
-                        if !interp.globals.contains_key(k.as_str())
-                            || is_array_element_name(k)
-                        {
+                        if !live(k) || is_array_element_name(k) {
                             continue;
                         }
                         let tail = match k.strip_prefix(prefix.as_str()) {
@@ -966,9 +971,7 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // IVP 钉形 `argx a g1` 仅 proc 局部、IVQ 钉形 ns 体 =
                 // ns 表 + 全部全局裸名）。plain globals 列裸 tail。
                 for k in interp.var_order.iter() {
-                    if !interp.globals.contains_key(k.as_str())
-                        || is_array_element_name(k)
-                    {
+                    if !live(k) || is_array_element_name(k) {
                         continue;
                     }
                     let tail = match k.strip_prefix(pfx.as_str()) {
@@ -979,19 +982,13 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 global_split = Some(entries.len());
                 for k in interp.var_order.iter() {
-                    if interp.globals.contains_key(k.as_str())
-                        && !k.contains("::")
-                        && !is_array_element_name(k)
-                    {
+                    if live(k) && !k.contains("::") && !is_array_element_name(k) {
                         entries.push((k.clone(), k.clone()));
                     }
                 }
             } else {
                 for k in interp.var_order.iter() {
-                    if interp.globals.contains_key(k.as_str())
-                        && !k.contains("::")
-                        && !is_array_element_name(k)
-                    {
+                    if live(k) && !k.contains("::") && !is_array_element_name(k) {
                         entries.push((k.clone(), k.clone()));
                     }
                 }
@@ -1001,39 +998,42 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // ns 语境的全局 fallback 分段重放：当前表 hash 序在前、
             // :: 表 hash 序在后（tclsh InfoVarsCmd 的双表遍历序——
             // IVQ 钉形 A: `bb cc aa` + 全局段）。
-            let ordered_tails = if !interp.frames.is_empty() && !qualified {
-                entries.iter().map(|(_, t)| t.clone()).collect()
+            let ordered_tails: Vec<&str> = if !interp.frames.is_empty() && !qualified {
+                entries.iter().map(|(_, t)| t.as_str()).collect()
             } else if let Some(split) = global_split {
-                let tails: Vec<String> =
-                    entries.iter().map(|(_, t)| t.clone()).collect();
-                let mut o = super::super::tclhash::tcl_order(&tails[..split]);
-                o.extend(super::super::tclhash::tcl_order(&tails[split..]));
+                let mut o = super::super::tclhash::tcl_order(
+                    entries[..split].iter().map(|(_, t)| t.as_str()),
+                );
+                o.extend(super::super::tclhash::tcl_order(
+                    entries[split..].iter().map(|(_, t)| t.as_str()),
+                ));
                 o
             } else {
-                let tails: Vec<String> =
-                    entries.iter().map(|(_, t)| t.clone()).collect();
-                super::super::tclhash::tcl_order(&tails)
+                super::super::tclhash::tcl_order(entries.iter().map(|(_, t)| t.as_str()))
             };
+            // The stored name each listed tail came from (the first entry
+            // with that tail, as a search of `entries` found it — for
+            // every tail, which made `info vars` quadratic).
+            let mut stored_of: std::collections::HashMap<&str, &str> =
+                std::collections::HashMap::with_capacity(entries.len());
+            for (stored, tail) in &entries {
+                stored_of.entry(tail.as_str()).or_insert_with(|| stored.as_str());
+            }
             let mut vars: Vec<Value> = Vec::new();
             let mut listed: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for tail in ordered_tails {
-                let (stored, _) = entries
-                    .iter()
-                    .find(|(_, t)| *t == tail)
-                    .cloned()
-                    .unwrap_or((tail.clone(), tail.clone()));
-                let name = stored.as_str();
-                let rel = match &ns_prefix {
+                let name = stored_of.get(tail).copied().unwrap_or(tail);
+                let rel: &str = match &ns_prefix {
                     Some(pfx) => match name.strip_prefix(pfx.as_str()) {
-                        Some(rest) if !rest.contains("::") => rest.to_string(),
-                        None if !name.contains("::") => name.to_string(),
+                        Some(rest) if !rest.contains("::") => rest,
+                        None if !name.contains("::") => name,
                         _ => continue,
                     },
-                    None => tail.clone(),
+                    None => tail,
                 };
                 if let Some(p) = match_pat {
-                    let hit = super::super::glob_match(p, &rel)
+                    let hit = super::super::glob_match(p, rel)
                         || (p.contains("::")
                             && (super::super::glob_match(p, name)
                                 || super::super::glob_match(p, &format!("::{}", name))));
@@ -1054,16 +1054,14 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 // Report qualified when the pattern asked for it, or
                 // when the variable belongs to another namespace.
-                let rendered = if qualified
-                    || (name.contains("::") && ns_prefix.is_none())
-                {
+                let rendered = if qualified || (name.contains("::") && ns_prefix.is_none()) {
                     if ns_prefix.is_some() && !name.contains("::") {
-                        rel.clone()
+                        rel.to_string()
                     } else {
                         format!("::{}", name)
                     }
                 } else {
-                    rel
+                    rel.to_string()
                 };
                 if listed.insert(rendered.clone()) {
                     vars.push(Value::from_str(&rendered));
@@ -1086,21 +1084,23 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // (bare names only — namespace variables are not globals,
             // tclsh: `info globals q::*` on a namespace var returns
             // empty).
-            let names: Vec<String> = interp
+            // As above: with no stale entry in the log, no lookup.
+            let log_is_exact = interp.var_order.len() == interp.globals.len();
+            let names: Vec<&str> = interp
                 .var_order
                 .iter()
                 .filter(|name| !name.contains("::") && !is_array_element_name(name))
-                .filter(|name| interp.globals.contains_key(name.as_str()))
-                .cloned()
+                .filter(|name| log_is_exact || interp.globals.contains_key(name.as_str()))
+                .map(String::as_str)
                 .collect();
-            let vars: Vec<Value> = super::super::tclhash::tcl_order(&names)
+            let vars: Vec<Value> = super::super::tclhash::tcl_order(names.iter().copied())
                 .into_iter()
                 .filter(|name| {
                     match_pat
                         .map(|p| super::super::glob_match(p, name))
                         .unwrap_or(true)
                 })
-                .map(|name| Value::from_str(name.as_str()))
+                .map(Value::from_str)
                 .collect();
             Ok(Value::from_list(&vars))
         }
@@ -1307,13 +1307,29 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if let Some(frame) = interp.frames.last() {
                 // Compiled procs keep locals in a linear array in table
                 // order (params first, then body locals) — `info locals`
-                // walks it in INSERTION order, not hash order.
+                // walks it in INSERTION order, not hash order.  A local
+                // made again after `unset` is in its old place, once (it
+                // was listed twice).
+                let mut seen: std::collections::HashSet<&str> =
+                    std::collections::HashSet::with_capacity(frame.locals.len());
+                // A live link (`upvar`, `global`, `variable`) is not a
+                // local of this frame (tclsh lists none of them here;
+                // `info vars` does).
+                let linked = |name: &str| {
+                    matches!(
+                        frame.upvars.get(name),
+                        Some(crate::interp::UpvarLink::Global(_))
+                            | Some(crate::interp::UpvarLink::Frame { .. })
+                    )
+                };
                 let names: Vec<String> = frame
                     .locals_order
                     .iter()
                     .filter(|name| {
                         frame.locals.contains_key(name.as_str())
                             && !is_array_element_name(name)
+                            && !linked(name)
+                            && seen.insert(name.as_str())
                     })
                     .cloned()
                     .collect();

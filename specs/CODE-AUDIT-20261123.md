@@ -152,6 +152,10 @@
 | C37 | （M6）`rename` 一个不存在的命令只报消息，不设 `::errorCode`（tclsh：`TCL LOOKUP COMMAND <名>`） | `commands/proc.rs` `cmd_rename` | 已修（M6） |
 | C39 | （M6，实测）有效递归深度只有 tclsh 的一半到三分之一：`interp recursionlimit` 报 1000，但 rtcl 的 proc 递归每层还把命令替换、`if`/`foreach` 体计入嵌套深度（tclsh 内联编译的都不计，只有 proc 调用计一层）。二分实测的最大深度，tclsh / rtcl：`A [expr {$n-1}]` 996 / 496，`return [B [expr …]]` 996 / 496，`foreach` 体内递归 996 / 330，`eval {E …}` 498 / 331（rtcl 两引擎一致）。经别名重入时两引擎不一样：`r 400` 字节码引擎通过，树引擎到上限 | `interp/eval.rs` `enter_nested`、`call.rs` | 未修（记录）：两个引擎都用 Rust 递归求命令替换，这个计数同时是栈溢出的防线；要对齐得先把嵌套上限与调用深度分开计量，并确认每层的栈用量 |
 | C38 | （M6，已知差异）别名目标的 wrong-args 消息里的命令名：tclsh 自己不一致（目标是父解释器时写别名名 `pc varName ?newValue?`，是兄弟解释器时写目标名 `set varName ?newValue?`），rtcl 一律写目标名；跨解释器别名的 `-errorstack`（TIP 356）INNER 条目与 tclsh 不同；安全解释器没有 `::tcl::mathfunc::min/max` 别名（rtcl 这两个是内建，`interp aliases` 只列 `clock`） | `commands/interp_cmd.rs` | 未修（记录） |
+| C40 | （M7）数组命令用绝对名字时落空：`array size ::a` 给 0、`array get ::a` 给空（tclsh 2 和 `1 x 2 y`）；proc 里 `array unset ::a 1` 什么也没删 | `interp/vars.rs` `array_owner` | 已修（M7）：`::a` 按全局表里的键解析 |
+| C41 | （M7）`array statistics` 的桶数、直方图、平均查找距离是写死的假数（「N entries, N buckets，每个桶 1 个」） | `commands/array.rs` | 已修（M7）：按元素表的插入历史重放（tclsh 的 `Tcl_HashStats`）：删元素后桶数不缩、数组删掉重建从头算 |
+| C42 | （M7）`info locals`：unset 后重建的局部变量被列两次（tclsh 一次、在原位）；带 `args` 的 proc 把 `args` 列在最前（tclsh 在最后，即参数顺序）；`upvar`/`global`/`variable` 链接进来的名字被当成局部变量列出（tclsh 一个都不列，`info vars` 才列） | `commands/misc.rs`、`interp/call.rs` | 已修（M7） |
+| C43 | （M7）`apply` 的 lambda 第三个元素指向不存在的命名空间：消息对，没有 errorCode（tclsh `TCL LOOKUP NAMESPACE ::x`） | `commands/proc.rs` `cmd_apply` | 已修（M7） |
 | C13 | 修复过程中新查出：`json encode` 的 schema 文本按词递归（`list list list …` 重复几万次即栈溢出），JSON 解码的递归下降无深度上限 | `commands/json.rs` | 已修（M2）：文档与 schema 的嵌套上限 1000，超限报错 |
 
 ## P2：性能（`TODO.md` 未列，本机单次实测，只看量级）
@@ -161,8 +165,9 @@
 | P1 | TCP 读每字节一次系统调用（3MiB） | 387ms | 5ms | `channel.rs` |
 | P2 | `string map` 每字符重建剩余串（15 万字节） | 7.1s | 8ms | `commands/string_cmds.rs` | 已修（M7）：一趟扫描，按字节匹配；64KB 从 1.0s 到 0.7ms（tclsh 0.8ms）。顺带：奇数个元素的 map 给 `TCL OPERATION MAP UNBALANCED`，不是列表的 map 报列表错误（原来静默当成一个词）。探针 d22（28 条断言） |
 | P3 | `append` 每次两份整串拷贝（8 万次） | 4.7s | 10ms | `commands/misc.rs` |
-| P4 | `info vars` 超线性（8 万变量）；`TclTable::insert` 每次全扫桶 | 13.2s | 整段 11ms | `interp/tclhash.rs` |
-| P5 | `array size` 按作用域变量总数计 | 2.6s | ≈0 | `commands/array.rs` |
+| P4 | `info vars` 超线性（8 万变量）；`TclTable::insert` 每次全扫桶 | 13.2s | 整段 11ms | `interp/tclhash.rs` | 已修（M7）：`info vars` 对每个列出的名字再线性搜一遍条目表（平方），`info commands` 同一处；插入时不再全扫桶；顺序重放改为借用键（不再每个键拷三次）。`info vars` 4 万变量 0.9s → 约 0.02s |
+| P5 | `array size` 按作用域变量总数计 | 2.6s | ≈0 | `commands/array.rs` | 未修：`array size`/`exists` 仍扫整张变量表（8 万元素 0.8ms，tclsh 是常数） |
+| P14 | （M7）每个作用域的变量插入日志只增不减：循环里建了再删的变量永远留在日志里，内存和每次枚举的耗时都随之增长。三轮各 30 万次「建再删」后常驻 96MB（tclsh 5MB）；`array names` 对日志的每个条目做一次哈希查找，2 万元素 40ms、8 万元素 624ms | 96MB / 624ms | 5MB / 0.2ms | `interp/vars.rs` `var_order` | 已修（M7）：日志长到活跃键的两倍以上就收回到活跃键（全局表留最后一次出现，帧内的普通局部变量留第一次——对应 tclsh 的槽位序）；日志里没有失效条目时枚举直接顺着读，不做查找。7.8MB；2 万元素 1.1ms，8 万 5ms。探针 d23（45 条断言） |
 | P6 | 变量哈希不扩散，同前缀名退化 | 超线性 | 线性 | `interp/varmap.rs` |
 | P7 | 编译期 O(n²)（2 万个 `for`） | 4.6s | 0.10s | `parser/src/compiler.rs` |
 | P8 | 正则捕获组量词立方级；相邻变长捕获组 `(a+)(b+)` 是 O(n³)（400 字符单次 20ms、800 字符跑不完，基线版本 400 字符即挂死）；lookahead 慢约 9 倍；每次调用重新编译模式（无捕获 7–12µs、带捕获 12µs 对 tclsh 0.5µs） | 2.8s / 20ms / 12µs | 33ms / 7µs / 0.58µs | `regexp-spencer/src/captures.rs`、`commands/regexp_cmds.rs` |
@@ -237,6 +242,12 @@
   输出落文件。
 - M5 文件操作：S34–S37 全部修掉，新增 d20（33 条断言，tclsh 上同样
   全过）。crash-gate 至此 **112 次运行 112 过**。
+- M7（性能）的量法：`target/audit/bench/` 下的微基准（循环、分配、变量、
+  正则、编译），tclsh 与两个引擎并排。字节码引擎在纯循环和 proc 调用上
+  与 tclsh 相当或更快（空 `for` 快 2.4 倍、`foreach` 快 3.5 倍），差距
+  集中在：`string map` 3345 倍（已修）、`info vars` 7633 倍（已修）、
+  固定模式的 `regexp` 198 倍、`string index` 51 倍、编译 30–66 倍、
+  数组读写 3–4 倍、`append` 3 倍；峰值内存 108MB 对 23MB。
 - M6（能力模型）：`interp` 命令族按 tclsh 源码（`tclInterp.c`）重做，
   对照探针 315 行逐项与 tclsh 8.6.17 比过；剩余差异只有哈希表顺序、
   rtcl 自带的命令集合和四处有意保留的差别（见 S26、C38）。探针 d21

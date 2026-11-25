@@ -260,6 +260,10 @@ pub fn cmd_apply(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let qualified =
             super::namespace::qualify(&interp.current_namespace, lambda[2].as_str());
         if !interp.namespaces.contains_key(&qualified) {
+            super::list::set_error_code(
+                interp,
+                &format!("TCL LOOKUP NAMESPACE {}", crate::value::tcl_quote(&qualified)),
+            );
             return Err(Error::runtime(
                 format!("namespace \"{}\" not found", qualified),
                 crate::error::ErrorCode::NotFound,

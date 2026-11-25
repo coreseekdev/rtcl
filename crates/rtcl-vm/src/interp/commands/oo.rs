@@ -3653,7 +3653,8 @@ fn class_methods_listing(
             .get(key)
             .map(|cl| cl.hidden.clone())
             .unwrap_or_default();
-        for name in crate::interp::tclhash::tcl_order(&own) {
+        for name in crate::interp::tclhash::tcl_order(own.iter().map(|n| n.as_str())) {
+            let name = name.to_string();
             let exported = interp
                 .oo
                 .classes

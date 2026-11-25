@@ -1497,28 +1497,19 @@ fn chan_names(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             });
         }
     }
-    let keys: Vec<String> = live.iter().map(|n| table_key(n).to_string()).collect();
-    let order = super::super::tclhash::tcl_order(&keys);
-    let names: Vec<Value> = order
+    let keys: Vec<&str> = live.iter().map(|n| table_key(n)).collect();
+    let names: Vec<Value> = super::super::tclhash::tcl_order(keys.iter().copied())
         .into_iter()
-        .filter(|key| {
-            let display = match key.as_str() {
-                "file0" => "stdin",
-                "file1" => "stdout",
-                "file2" => "stderr",
-                other => other,
-            };
+        .map(|key| match key {
+            "file0" => "stdin",
+            "file1" => "stdout",
+            "file2" => "stderr",
+            other => other,
+        })
+        .filter(|display| {
             pattern.map(|p| super::super::glob_match(p, display)).unwrap_or(true)
         })
-        .map(|key| {
-            let display = match key.as_str() {
-                "file0" => "stdin",
-                "file1" => "stdout",
-                "file2" => "stderr",
-                other => other,
-            };
-            Value::from_str(display)
-        })
+        .map(Value::from_str)
         .collect();
     Ok(Value::from_list(&names))
 }

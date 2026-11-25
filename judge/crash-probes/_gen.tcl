@@ -79,8 +79,12 @@ foreach line $lines {
     if {$in_proc} {
         if {$line eq "\}"} {
             set in_proc 0
-            if {!$::was_helper} { lappend ::items $::proc_block }
+            lappend ::proc_block $line
+            set body [join $::proc_block \n]
             unset ::proc_block
+            # Defined here too, for the checks that follow.
+            uplevel #0 $body
+            if {!$::was_helper} { lappend ::items $body }
         } elseif {$::was_helper} {
             append ::pbody $line \n
         } else {
@@ -89,6 +93,12 @@ foreach line $lines {
         continue
     }
     if {[string match "proc *" $line]} {
+        if {[info complete $line]} {
+            # A procedure defined on one line is an ordinary line.
+            uplevel #0 $line
+            lappend ::items $line
+            continue
+        }
         set in_proc 1
         set ::was_helper [string match "proc P {script} *" $line]
         set ::proc_block [list $line]

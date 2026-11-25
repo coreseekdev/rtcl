@@ -361,7 +361,16 @@ judge/sweep 同跑）。下面只列**结构**动作：按类别消除，而不�
     路径；C35–C39（见审计文档；C39 是有效递归深度只有 tclsh 的一半）。
     原计划里的「`exec` 入口检测半途状态并复位」没有对应的缺陷：M5
     重写后的 exec 没有跨调用的持久状态（d19 探针覆盖成功与失败交替）。
-- [ ] **工具化防线**：`judge/crash-gate.sh` 入门禁（已入：原生 114 次
+- [ ] **M7 性能**（审计文档 P1–P14，一项一个小提交，每项带前后
+  数字和一条探针）：
+  - [x] P2 `string map`：400KB 从一百秒跑不完到 2.7ms。
+  - [x] P4、P14：变量插入日志回收（96MB → 7.8MB）、`info vars` /
+    `info commands` 去掉平方项、`array names` 不再逐条查找；顺带修掉
+    C40–C43（数组命令的绝对名字、`array statistics`、`info locals`、
+    `apply` 的 errorCode）。
+  - [ ] P8 `regexp` 的模式缓存；`string index`；P7 编译期；P3 `append`；
+    数组读写；P1/P9 通道缓冲读；P5 `array size`。
+- [ ] **工具化防线**：`judge/crash-gate.sh` 入门禁（已入：原生 118 次
   运行、wasm `judge/crash-wasm.mjs` 52 项带 worker 看门狗）；**排查
   其余探针是否也在两个解释器上共同早退而空转**（`smallface_p24` 是）；`rtcl-vm` 开
   clippy `unwrap_used` / `indexing_slicing` / `arithmetic_side_effects`

@@ -18,6 +18,12 @@ impl Interp {
         if self.globals.insert(key.clone(), v).is_none() {
             self.var_order.push(key);
         }
+        // A log grown far past the table (variables made and unset in a
+        // loop) is brought back to the live entries.
+        if self.var_order.len() > 2 * self.globals.len() + 64 {
+            let live = |k: &str| self.globals.contains_key(k);
+            compact_order(&mut self.var_order, &live, false);
+        }
     }
 
     /// Remove from the global var table (log entry becomes stale; the
@@ -33,6 +39,10 @@ pub(crate) fn frame_local_insert(f: &mut CallFrame, key: String, v: Value) {
     if f.locals.insert(key.clone(), v).is_none() {
         f.locals_order.push(key);
     }
+    if f.locals_order.len() > 2 * f.locals.len() + 64 {
+        let live = |k: &str| f.locals.contains_key(k);
+        compact_order(&mut f.locals_order, &live, true);
+    }
 }
 
 /// Remove from a frame's locals (log entry goes stale, as above).
@@ -40,23 +50,43 @@ pub(crate) fn frame_local_remove(f: &mut CallFrame, key: &str) -> Option<Value> 
     f.locals.remove(key)
 }
 
-/// Replay the Tcl hash-order log (`order`) against the live key set
-/// (`live`): keep entries present in the table, dedup to the LAST
-/// occurrence (recreates), and replay the table mechanics.
-pub(crate) fn replay_order(order: &[String], live: impl Fn(&str) -> bool) -> Vec<String> {
-    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for (i, k) in order.iter().enumerate() {
-        if live(k) {
-            seen.insert(k.as_str(), i);
+/// Bring an insertion log back to what the replay reads of it: the keys
+/// still in the table, one entry each.  What remains replays to the same
+/// order; the stale entries and the other occurrences were skipped anyway.
+/// They were kept for ever: a loop making and unsetting variables grew the
+/// log without end, and every listing walked all of it.
+///
+/// The entry kept is the last occurrence — a key made again after a
+/// delete takes a new place in the table — except a frame's plain locals
+/// with `frame` set: tclsh keeps those in the proc's own table of names,
+/// where a local made again takes its old place back, so the first
+/// occurrence is kept for them (an array's elements stay a hash table).
+fn compact_order(order: &mut Vec<String>, live: &dyn Fn(&str) -> bool, frame: bool) {
+    let mut seen: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(order.len());
+    let mut keep = vec![false; order.len()];
+    if frame {
+        for (i, k) in order.iter().enumerate() {
+            let element = k.rsplit("::").next().is_some_and(|last| last.contains('('));
+            if !element && live(k) && seen.insert(k.as_str()) {
+                keep[i] = true;
+            }
+        }
+        seen.clear();
+    }
+    // Walking back from the end, the first occurrence met is the last.
+    for (i, k) in order.iter().enumerate().rev() {
+        if live(k) && seen.insert(k.as_str()) {
+            keep[i] = true;
         }
     }
-    let mut keys: Vec<String> = Vec::with_capacity(seen.len());
-    for (i, k) in order.iter().enumerate() {
-        if seen.get(k.as_str()) == Some(&i) {
-            keys.push(k.clone());
-        }
-    }
-    tclhash::tcl_order(&keys)
+    drop(seen);
+    let mut i = 0;
+    order.retain(|_| {
+        let k = keep[i];
+        i += 1;
+        k
+    });
 }
 
 /// Where a resolved variable lives, after following upvar links and
@@ -526,12 +556,16 @@ impl Interp {
         };
         let f = &mut self.frames[frame_idx];
         if let Some(table) = table {
+            // Which names the log already has (a search of the log per
+            // local made degrading a frame with many locals quadratic).
+            let mut logged: super::varmap::VarSet =
+                f.locals_order.iter().map(|o| o.as_str().to_string()).collect();
             for (i, name) in table.locals().iter().enumerate() {
                 if let Some(cv) = f.slots.get_mut(i) {
                     if !cv.is_unset() {
                         let taken = std::mem::replace(cv, Value::unset());
                         f.locals.insert(name.clone(), taken);
-                        if !f.locals_order.iter().any(|o| o == name.as_str()) {
+                        if logged.insert(name.as_str().to_string()) {
                             f.locals_order.push(name.as_str().to_string());
                         }
                     }
@@ -2085,6 +2119,14 @@ impl Interp {
         stamp_key(&self.resolve_loc(name))
     }
 
+    /// The element keys ever inserted into the array at `name` since its
+    /// (re)creation, for `array statistics`: tclsh's element table keeps
+    /// the buckets it grew into as elements were deleted, and starts over
+    /// when the array is unset and made again.
+    pub(crate) fn array_element_history(&self, name: &str) -> Vec<String> {
+        self.array_elements(name, false)
+    }
+
     /// Locate the scope that owns the array `name` refers to, following
     /// upvar links to the ultimate owner: returns `(frame_index, base)`
     /// where `frame_index = None` means the global table and `base` is
@@ -2092,10 +2134,15 @@ impl Interp {
     /// aliased target, ns-qualified).  Callers enumerate elements with
     /// `base(`-prefixed keys in the returned table.
     pub(crate) fn array_owner(&self, name: &str) -> (Option<usize>, String) {
-        let mut scope: Option<usize> = self.frames.last().map(|_| self.frames.len() - 1);
-        let mut base = match scope {
-            Some(_) => name.to_string(),
-            None => self.canonical_global(name),
+        // An absolute name (`::a`) is the global table's, under the key it
+        // goes by there — it used to be taken as spelled, so `array size
+        // ::a` and `array get ::a` looked for `::a(` and found nothing.
+        let (mut scope, mut base) = match Self::split_global(name) {
+            Some(key) => (None, key),
+            None => match self.frames.last().map(|_| self.frames.len() - 1) {
+                Some(frame) => (Some(frame), name.to_string()),
+                None => (None, self.canonical_global(name)),
+            },
         };
         // Follow upvar links transitively (with a hop bound so a link
         // cycle can't spin).
@@ -2593,33 +2640,80 @@ impl Interp {
     /// hash-table order (the element keys ride the scope's insertion log;
     /// replaying their subsequence reproduces tclsh's `array names`).
     pub(crate) fn array_element_names(&self, name: &str) -> Vec<String> {
+        self.array_elements(name, true)
+    }
+
+    /// The element keys of the array at `name` as the log has them: the
+    /// live ones, or with `live_only` off every key ever inserted — once,
+    /// at its last occurrence (what the table's size and bucket
+    /// statistics were built from; `array statistics`).
+    fn array_elements(&self, name: &str, live_only: bool) -> Vec<String> {
         let loc = self.resolve_loc(name);
         let prefix = format!("{}(", loc.base_name());
         let is_element = |k: &str| k.starts_with(&prefix) && k.ends_with(')');
-        // The element table hashes the element NAME (the "a(k)" key's
-        // tail), so the replay runs on stripped names.
-        let collect = |order: &[String], live: &dyn Fn(&str) -> bool| -> Vec<String> {
-            let mut seen: std::collections::HashMap<&str, usize> =
-                std::collections::HashMap::new();
-            for (i, k) in order.iter().enumerate() {
-                if is_element(k) && live(k) {
-                    seen.insert(k.as_str(), i);
+        // An element key `a(k)` without its `a(` and `)`.
+        fn stripped<'k>(k: &'k String, from: usize) -> &'k str {
+            &k[from..k.len() - 1]
+        }
+        // The element names are slices of the log's entries all the way
+        // through the replay; only the result owns them.
+        let collect = |order: &[String],
+                       live: &dyn Fn(&str) -> bool,
+                       live_count: usize|
+         -> Vec<String> {
+            // The history starts at the array's (re)creation: after the
+            // marker key's last entry (the marker is written when the
+            // array is made, never while it lives).
+            let order = if live_only {
+                order
+            } else {
+                let base = loc.base_name();
+                match order.iter().rposition(|k| k.as_str() == base) {
+                    Some(i) => &order[i + 1..],
+                    None => order,
                 }
-            }
-            let keys: Vec<String> = order
-                .iter()
-                .enumerate()
-                .filter(|(i, k)| seen.get(k.as_str()) == Some(i))
-                .map(|(_, k)| k[prefix.len()..k.len() - 1].to_string())
-                .collect();
-            tclhash::tcl_order(&keys)
+            };
+            let keys: Vec<&str> = if live_only && order.len() == live_count {
+                // Nothing stale in the log: every entry is a live key, once.
+                // (A lookup per entry instead was the whole cost of listing
+                // a large array: random access into a large table.)
+                order
+                    .iter()
+                    .filter(|k| is_element(k))
+                    .map(|k| stripped(k, prefix.len()))
+                    .collect()
+            } else {
+                let mut seen: super::varmap::FxHashedMap<&str, usize> =
+                    super::varmap::FxHashedMap::default();
+                for (i, k) in order.iter().enumerate() {
+                    if is_element(k) && (!live_only || live(k)) {
+                        seen.insert(k.as_str(), i);
+                    }
+                }
+                order
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, k)| seen.get(k.as_str()) == Some(i))
+                    .map(|(_, k)| stripped(k, prefix.len()))
+                    .collect()
+            };
+            tclhash::tcl_order(keys.iter().copied())
+                .into_iter()
+                .map(str::to_string)
+                .collect()
         };
         match &loc {
-            VarLoc::Global(_) => collect(&self.var_order, &|k| self.globals.contains_key(k)),
+            VarLoc::Global(_) => {
+                let n = self.globals.len();
+                collect(&self.var_order, &|k| self.globals.contains_key(k), n)
+            }
             VarLoc::Frame(i, _) => self
                 .frames
                 .get(*i)
-                .map(|f| collect(&f.locals_order, &|k| f.locals.contains_key(k)))
+                .map(|f| {
+                    let n = f.locals.len();
+                    collect(&f.locals_order, &|k| f.locals.contains_key(k), n)
+                })
                 .unwrap_or_default(),
         }
     }

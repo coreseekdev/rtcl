@@ -192,23 +192,48 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(usage("array", "statistics", "arrayName"));
             }
             require_array(interp, array_name)?;
-            let n = interp.array_element_names(array_name).len();
-            Ok(Value::from_str(&format!(
-                "{} entries in table, {} buckets\n\
-                 number of buckets with 0 entries: 0\n\
-                 number of buckets with 1 entries: {}\n\
-                 number of buckets with 2 entries: 0\n\
-                 number of buckets with 3 entries: 0\n\
-                 number of buckets with 4 entries: 0\n\
-                 number of buckets with 5 entries: 0\n\
-                 number of buckets with 6 entries: 0\n\
-                 number of buckets with 7 entries: 0\n\
-                 number of buckets with 8 entries: 0\n\
-                 number of buckets with 9 entries: 0\n\
-                 number of buckets with 10 or more entries: 0\n\
-                 average search distance for entry: 1.0",
-                n, n, n
-            )))
+            // tclsh reports the element table's own bucket statistics
+            // (Tcl_HashStats); they are replayed over the keys ever
+            // inserted, in order.  It printed a made-up table of one
+            // bucket per entry before.
+            let live = interp.array_element_names(array_name);
+            let history = interp.array_element_history(array_name);
+            // The buckets come from everything ever inserted; the chains
+            // hold what is still there.
+            let (buckets, _, _) = crate::interp::tclhash::tcl_table_stats(&history);
+            let mut chains = vec![0u64; buckets as usize];
+            for k in &live {
+                let idx = (crate::interp::tclhash::tcl_hash(k) & (buckets - 1)) as usize;
+                chains[idx] += 1;
+            }
+            let mut hist = [0u64; 11];
+            let mut distance = 0u64;
+            for c in chains {
+                hist[c.min(10) as usize] += 1;
+                distance += c * (c + 1) / 2;
+            }
+            let avg = if live.is_empty() {
+                0.0
+            } else {
+                distance as f64 / live.len() as f64
+            };
+            let mut report = format!("{} entries in table, {} buckets\n", live.len(), buckets);
+            for (n, count) in hist.iter().enumerate() {
+                if n == 10 {
+                    report.push_str(&format!(
+                        "number of buckets with 10 or more entries: {}\n",
+                        count
+                    ));
+                } else {
+                    report.push_str(&format!(
+                        "number of buckets with {} entries: {}\n",
+                        n, count
+                    ));
+                }
+            }
+            // (No newline after the last line, as tclsh prints it.)
+            report.push_str(&format!("average search distance for entry: {:.1}", avg));
+            Ok(Value::from_str(&report))
         }
         "set" => {
             if args.len() != 4 {
@@ -425,7 +450,7 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 Some(i) => &interp.frames[i].locals,
                 None => &interp.globals,
             };
-            let keys_to_remove: Vec<String> = table
+            let elements_to_remove: Vec<String> = table
                 .keys()
                 .filter(|k| {
                     if k.starts_with(&prefix) && k.ends_with(')') {
@@ -439,7 +464,7 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         false
                     }
                 })
-                .cloned()
+                .map(|k| k[prefix.len()..k.len() - 1].to_string())
                 .collect();
             if pattern.is_none() {
                 // tclsh：无 pattern 的 array unset = 整数组 unset——变量
@@ -449,8 +474,11 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 interp.unset_var(array_name)?;
                 return Ok(Value::empty());
             }
-            for k in keys_to_remove {
-                let _ = interp.unset_var(&k);
+            for elem in elements_to_remove {
+                // Through the name as given: `array unset ::a 1` inside a
+                // proc reached a local `a(1)` when the key was spelled
+                // for the owner's table, and unset nothing.
+                let _ = interp.unset_var(&format!("{}({})", array_name, elem));
             }
             Ok(Value::empty())
         }

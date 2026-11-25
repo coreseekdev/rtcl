@@ -383,8 +383,11 @@ impl Interp {
                     // `args` is the table's last entry — index
                     // `regular_params.len()` (params seeded in order, all
                     // candidates under the slot gate).
+                    // Its place in the frame's log is its slot's: the
+                    // table's last parameter.  (Logged here, it came
+                    // before the other parameters — `info locals` listed
+                    // `args` first; tclsh has it last.)
                     frame.slots[regular_params.len()] = Value::from_str(&list_str);
-                    frame.locals_order.push("args".to_string());
                 } else {
                     super::vars::frame_local_insert(frame, "args".to_string(), Value::from_str(&list_str));
                 }
@@ -1396,7 +1399,6 @@ impl Interp {
             let frame = self.frames.last_mut().unwrap();
             if slot_mode {
                 frame.slots[regular_params.len()] = Value::from_str(&list_str);
-                frame.locals_order.push("args".to_string());
             } else {
                 super::vars::frame_local_insert(frame, "args".to_string(), Value::from_str(&list_str));
             }

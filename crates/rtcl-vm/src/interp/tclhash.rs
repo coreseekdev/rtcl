@@ -30,33 +30,37 @@ pub(crate) fn tcl_hash(key: &str) -> u64 {
     result
 }
 
-/// One emulated Tcl string-key table.  Kept generic enough to also serve
-/// `dict info` (bucket statistics).
-struct TclTable {
-    buckets: Vec<Vec<String>>,
+/// One emulated Tcl string-key table.  The keys are borrowed: a listing
+/// has them already.  Kept generic enough to also serve `dict info`
+/// (bucket statistics).
+struct TclTable<'a> {
+    buckets: Vec<Vec<&'a str>>,
     rebuild: u64,
+    /// The entries in the table — counted as they come, not by walking
+    /// every bucket on each insert, which made building a table quadratic.
+    entries: u64,
 }
 
-impl TclTable {
+impl<'a> TclTable<'a> {
     fn new() -> Self {
-        Self { buckets: vec![Vec::new(); 4], rebuild: 12 }
+        Self { buckets: vec![Vec::new(); 4], rebuild: 12, entries: 0 }
     }
 
     /// Insert in insertion order: existing keys keep their chain position.
-    fn insert(&mut self, key: &str) {
+    fn insert(&mut self, key: &'a str) {
         let size = self.buckets.len() as u64;
         let idx = (tcl_hash(key) & (size - 1)) as usize;
         let bucket = &mut self.buckets[idx];
-        if bucket.iter().any(|k| k == key) {
+        if bucket.iter().any(|k| *k == key) {
             return;
         }
-        bucket.insert(0, key.to_string());
-        let entries: u64 = self.buckets.iter().map(|b| b.len() as u64).sum();
-        if entries >= self.rebuild {
+        bucket.insert(0, key);
+        self.entries += 1;
+        if self.entries >= self.rebuild {
             // Walk old buckets 0..N, each chain head→tail; prepend each
             // entry into the new table (tclHash.c RebuildTable).
-            let old: Vec<String> =
-                self.buckets.iter().flat_map(|b| b.iter().cloned()).collect();
+            let old: Vec<&'a str> =
+                self.buckets.iter().flat_map(|b| b.iter().copied()).collect();
             let new_size = size * 4;
             let mut fresh = vec![Vec::new(); new_size as usize];
             for k in old {
@@ -68,15 +72,16 @@ impl TclTable {
         }
     }
 
-    fn iteration_order(&self) -> Vec<String> {
-        self.buckets.iter().flatten().cloned().collect()
+    fn iteration_order(&self) -> Vec<&'a str> {
+        self.buckets.iter().flatten().copied().collect()
     }
 }
 
 /// Replay the Tcl hash-table mechanics over `keys` in insertion order and
-/// return them in iteration order.  Keys must be live (callers filter
-/// deleted entries first); duplicates are ignored like re-sets in Tcl.
-pub(crate) fn tcl_order(keys: &[String]) -> Vec<String> {
+/// return them in iteration order — the same strings, borrowed.  Keys must
+/// be live (callers filter deleted entries first); duplicates are ignored
+/// like re-sets in Tcl.
+pub(crate) fn tcl_order<'a>(keys: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     let mut table = TclTable::new();
     for key in keys {
         table.insert(key);
@@ -90,7 +95,7 @@ pub(crate) fn tcl_order(keys: &[String]) -> Vec<String> {
 pub(crate) fn tcl_table_stats(keys: &[String]) -> (u64, [u64; 11], f64) {
     let mut table = TclTable::new();
     for key in keys {
-        table.insert(key);
+        table.insert(key.as_str());
     }
     let mut hist = [0u64; 11];
     let mut entries = 0u64;
@@ -138,7 +143,7 @@ mod tests {
     fn matches_tclsh_array_names_order() {
         for (input, expected) in oracle_pairs() {
             let keys: Vec<String> = input.split_whitespace().map(String::from).collect();
-            let got = tcl_order(&keys).join(" ");
+            let got = tcl_order(keys.iter().map(|k| k.as_str())).join(" ");
             assert_eq!(got, expected, "input: {input}");
         }
     }

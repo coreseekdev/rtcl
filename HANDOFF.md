@@ -571,7 +571,8 @@ S21（`lrepeat 4294967296 x` 一类的大小在 32 位上回绕）、S23（wasm
 可以预构造冲突键，风险低）、S40（Tk：畸形 PNG、多字节颜色串、
 `image put -to` 负坐标会 panic，读码看到的，没运行过）。
 
-**T11 清理（事务）**
+**T11 清理（事务；✅ 2026-11-26 大部完成）**——门禁脚本入仓（judge/gates/，b9ef023）+ exec_cmd 死代码清除 + 空转探针普查记账（task/t11b @ 9951b16：42/437 空转已头注释、18 个候选判为有意钉形排除、exec_cmd unused 清零，rtcl-vm 警告 42→32）。**余项**：rtcl-vm 其余 ~30 条 unused 警告、clippy 棘轮（unwrap_used 等）；**objsec.tcl 墙钟探针 flake**（loop=[秒差]，空载 0s vs 1s 翻红，与改动无关——T11b 与 P7 两会话独立互证；建议加容差或归 known）。**
+原任务书：**T11 清理（事务）**
 - `commands/exec_cmd.rs` 里 M5 重写留下的死代码（`output_redirect`、
   `syntax_error` 等，编译警告十来条）。
 - `judge/probes/` 里约 30 个探针在两个解释器上都提前死掉，等于空转：

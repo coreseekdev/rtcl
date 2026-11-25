@@ -63,6 +63,14 @@ bash -c 'ulimit -v 6000000; cargo test --workspace -j 2'
   （`git worktree add ../rtcl-<名字> <分支>`），做完再合。提交前
   `git status --short`，不属于你的改动不要暂存；共享文件只挑自己的
   hunk（`git diff FILE > p` → 删别人的 → `git apply --cached p`）。
+- **worktree 硬链接克隆 target 的假新鲜陷阱**（2026-11-26 实证）：
+  `cp -al target` 克隆后多树并行构建，fingerprint 状态会被另一棵树
+  的构建经共享 inode 就地改写——cargo 报 `Finished 0.06s` 全 fresh
+  但 `target/release/rtcl` 时间戳还是旧的。**每次构建后核对二进制
+  时间戳**；没变就 `find crates -name lib.rs -path "*/src/*" -exec
+  touch {} + && touch crates/rtcl-cli/src/main.rs` 强制重建。新
+  worktree 首次构建前也可直接 `rm -rf target/release/.fingerprint`
+  一劳永逸（代价是多编译几秒）。
 - **判官/差分与构建绝不同时跑**（OOM）。
 - **陈旧二进制假绿**：`grep -cE "^error"` 有匹配时退出码为 0，`&&` 链
   会带陈旧二进制继续过门（一个会话里中过三次）。构建后

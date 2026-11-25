@@ -46,22 +46,34 @@ judge/probes/extract 的 oracle 已默认指向仓内构建的
 ```bash
 # 构建（内存上限必须带——机器会 OOM）
 bash -c 'ulimit -v 3400000; cargo build --release -j 2'
-# 测试（1143 个）
+# 测试（1481 个，63 套件）
 bash -c 'ulimit -v 6000000; cargo test --workspace -j 2'
-# 判官 + 差分（在 /tmp/rtcl-master-wt；二进制用 cp 同步——rsync 排除 target）
-cp target/release/rtcl /tmp/rtcl-master-wt/target/release/rtcl
-rsync -a --delete --exclude target --exclude .git ./ /tmp/rtcl-master-wt/
-bash -c 'ulimit -v 8000000; /tmp/rtcl-master-wt/judge/run.sh'
-bash -c 'ulimit -v 8000000; /tmp/rtcl-master-wt/judge/sweep.sh'
 ```
 
+- **门禁脚本已入仓**（原 target/audit/ 下的散件，worktree 相对路径，
+  任何 worktree 直接用；日志写 `<worktree>/target/audit/`）：
+  `bash judge/gates/quick-gates.sh <tag>`（judge、crash-gate、probes、
+  rtcl-vm lib 两种特性、五种特性组合 check、wasm32 构建，约 5 分钟，
+  日志 quick-<tag>.log）；`bash judge/gates/all-gates.sh <tag>`（上面
+  加 sweep 与 workspace 测试，约 25 分钟，放后台，末行 `ALLDONE`）；
+  `bash judge/gates/rest-gates.sh <tag>`（只 sweep + workspace 测试）；
+  `bash judge/gates/bench/run.sh <tcl>`（tclsh 与 rtcl 两引擎并排
+  µs/迭代 + 峰值 RSS；`BENCH_TCLSH` 可换 oracle）。
+- **多个会话共用仓库：每个 agent 一棵独立 worktree**
+  （`git worktree add ../rtcl-<名字> <分支>`），做完再合。提交前
+  `git status --short`，不属于你的改动不要暂存；共享文件只挑自己的
+  hunk（`git diff FILE > p` → 删别人的 → `git apply --cached p`）。
 - **判官/差分与构建绝不同时跑**（OOM）。
 - **陈旧二进制假绿**：`grep -cE "^error"` 有匹配时退出码为 0，`&&` 链
   会带陈旧二进制继续过门（一个会话里中过三次）。构建后
   `ls -la target/release/rtcl` 看时间戳再信门。
-- **提交门槛**：judge 88/88（对 9.1.0 oracle；8.6 历史基线用
-  `JUDGE_ORACLE=tclsh`）+ sweep 0 + tests 1143/0 + wasm32 check
-  四门全绿；提交信息带 `Co-Authored-By: Claude Code <noreply@anthropic.com>`。
+- **提交门槛**（2026-11-25 起，oracle = tclsh 9.1.0）：judge 88/88 +
+  crash-gate 全过 + sweep 不新增 DIFF（既有 12 处名单见 HANDOFF）+
+  tests 1481/0 + wasm32 构建无错误 + 动 wasm 面时 crash-wasm 52 与
+  node test 26 全过；probes 对 9.1 的 125 项 DIFF 是迁移清障账
+  （TODO.md「对标迁移」），不新增即可。提交信息
+  `type(scope): 中文摘要`，正文写改法与没动的地方、`终态：` 一行列
+  门禁数字，带 `Co-Authored-By: ZCode (GLM-5.4) <noreply@localhost>`。
 - **崩溃门禁**：`bash judge/crash-gate.sh`——`judge/crash-probes/` 里每个
   探针钉住一个脚本可触发的崩溃/挂起/静默错误（记录见
   `specs/CODE-AUDIT-20261123.md`），与 judge/sweep 同跑。再发现这类缺陷

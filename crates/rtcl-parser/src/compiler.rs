@@ -280,60 +280,16 @@ impl Compiler {
         // An operand the opcodes cannot carry makes the ops above
         // untrustworthy wherever it appears: the whole unit goes to the
         // tree-walk, which has no such limits.
+        //
+        // D2 第一步：白名单改读 [`rtcl_ir::opspec::OPS`] 的 `emittable`
+        // 行字段——「编译器可发射」是每 op 一行的码表元数据，不再各持
+        // 一份 match（旧的穷举-编译失败约束由 opspec 普查测试承接）。
         let overflow = c.bytecode.index_overflow();
-        c.bytecode.fallback = overflow || !c.bytecode.ops().iter().all(|op| matches!(op,
-            OpCode::PushConst(_) | OpCode::PushConstWide(_) | OpCode::PushEmpty
-            | OpCode::PushInt(_) | OpCode::PushFloat(_) | OpCode::PushTrue | OpCode::PushFalse
-            | OpCode::Pop | OpCode::Dup
-            | OpCode::LoadVar(_) | OpCode::StoreVar(_) | OpCode::StoreVarPop(_)
-            | OpCode::IncrVarPop(_, _)
-            | OpCode::LoadLocal(_) | OpCode::StoreLocal(_) | OpCode::StoreLocalPop(_)
-            | OpCode::IncrLocal(_, _)
-            | OpCode::IncrLocalPop(_, _)
-            | OpCode::IncrVar(_, _)
-            | OpCode::Concat(_) | OpCode::ExpandList | OpCode::ExpandMark
-            | OpCode::Jump(_) | OpCode::JumpTrue(_) | OpCode::JumpFalse(_)
-            | OpCode::LoopEnter { .. } | OpCode::LoopExit | OpCode::Break | OpCode::Continue
-            | OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. }
-            | OpCode::ForeachCollect | OpCode::ForeachEnd
-            | OpCode::LappendLocal(_) | OpCode::LappendVar(_) | OpCode::BodyMarkFramed
-            | OpCode::LappendSlotSlot(_, _) | OpCode::LappendVarVar(_, _)
-            | OpCode::AddSlotSlot(_, _) | OpCode::AddSlotImm(_, _)
-            | OpCode::CmpSlotSlot(_, _, _) | OpCode::CmpSlotImm(_, _, _)
-            | OpCode::CmpSlotSlotJumpTrue(_, _, _, _) | OpCode::CmpSlotSlotJumpFalse(_, _, _, _)
-            | OpCode::CmpSlotImmJumpTrue(_, _, _, _) | OpCode::CmpSlotImmJumpFalse(_, _, _, _)
-            | OpCode::AddVarVar(_, _) | OpCode::AddVarImm(_, _)
-            | OpCode::CmpVarVar(_, _, _) | OpCode::CmpVarImm(_, _, _)
-            | OpCode::CmpVarVarJumpTrue(_, _, _, _) | OpCode::CmpVarVarJumpFalse(_, _, _, _)
-            | OpCode::CmpVarImmJumpTrue(_, _, _, _) | OpCode::CmpVarImmJumpFalse(_, _, _, _)
-            | OpCode::Return | OpCode::Exit(_)
-            | OpCode::EvalScript | OpCode::EvalExpr
-            | OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Pow
-            | OpCode::Neg
-            | OpCode::Eq | OpCode::Ne | OpCode::Lt | OpCode::Gt | OpCode::Le | OpCode::Ge
-            | OpCode::StrEq | OpCode::StrNe
-            | OpCode::Not
-            | OpCode::BitAnd | OpCode::BitOr | OpCode::BitXor | OpCode::BitNot
-            | OpCode::Shl | OpCode::Shr
-            | OpCode::BeginCmd(_) | OpCode::BeginCmdSubMark(_) | OpCode::ExprMarkBeginCmd(_)
-            | OpCode::BeginCmdPushConst(_, _)
-            | OpCode::SubEndStoreLocalPop(_) | OpCode::SubEndStoreVarPop(_) | OpCode::SubEndReturn
-            | OpCode::SwapToNextMark | OpCode::NextMarkBeginCmd(_)
-            | OpCode::BeginCmdIncrLocalPop(_, _, _) | OpCode::BeginCmdIncrVarPop(_, _, _)
-            | OpCode::ForeachNextClose(_, _)
-            | OpCode::SlotSetAddSS { .. } | OpCode::VarSetAddVV { .. }
-            | OpCode::ForNextIncrLocal(_, _, _, _) | OpCode::ForNextIncrVar(_, _, _, _)
-            | OpCode::PushConstSubMark(_) | OpCode::SubMarkBeginCmd(_)
-            | OpCode::ExprMarkBeginPushConst(_, _)
-            | OpCode::SubSlotImm(_, _) | OpCode::SubSlotSlot(_, _)
-            | OpCode::SubEndDynCall(_) | OpCode::SubEndCall { .. } | OpCode::SubEndAdd
-            | OpCode::IncrVarStack(_) | OpCode::IncrLocalStack(_)
-            | OpCode::SubEndIncrVarStack(_) | OpCode::SubEndIncrLocalStack(_)
-            | OpCode::BodyMark | OpCode::NextMark
-            | OpCode::SubMark | OpCode::SubEnd | OpCode::ExprMark
-            | OpCode::Call { .. } | OpCode::CallExpand { .. }
-            | OpCode::DynCall { .. } | OpCode::DynCallExpand { .. }
-        ));
+        c.bytecode.fallback = overflow
+            || !c.bytecode
+                .ops()
+                .iter()
+                .all(|op| rtcl_ir::opspec::spec_of(op).emittable);
         c.bytecode
     }
 
@@ -1988,3 +1944,312 @@ mod tests {
 
 
 
+
+// D2 第一步：白名单金样——`emittable` 行字段（现读
+// rtcl_ir::opspec::OPS）对 pre-table 穷举 match 的逐 op 判定，census
+// 全 141 变体捕获于 D2 基线。任何漂移都是回落面（fallback）回归。
+#[cfg(test)]
+mod whitelist_golden {
+    use crate::OpCode as O;
+    use rtcl_ir::opspec::spec_of;
+
+    fn census() -> Vec<O> {
+        vec![
+            O::PushConst(7),
+            O::PushConstWide(70001),
+            O::PushEmpty,
+            O::PushInt(-5),
+            O::PushFloat(1.5),
+            O::PushTrue,
+            O::PushFalse,
+            O::Pop,
+            O::Dup,
+            O::LoadVar(11),
+            O::StoreVar(12),
+            O::StoreVarPop(13),
+            O::LoadLocal(14),
+            O::StoreLocal(15),
+            O::StoreLocalPop(16),
+            O::LoadArrayElem(17),
+            O::StoreArrayElem(18),
+            O::IncrVar(19, -20),
+            O::IncrVarPop(21, 22),
+            O::IncrLocal(23, -24),
+            O::IncrLocalPop(25, 26),
+            O::AppendVar(27),
+            O::UnsetVar(28),
+            O::VarExists(29),
+            O::PushFrame(30),
+            O::PopFrame,
+            O::UpVar { level: 31, src: 32, dst: 33 },
+            O::Global(34),
+            O::Jump(35),
+            O::JumpTrue(36),
+            O::JumpFalse(37),
+            O::LoopEnter { cont: 38, brk: 39 },
+            O::LoopExit,
+            O::ForeachStart { info: 40, next: 41, end: 42 },
+            O::ForeachNext { info: 43, body: 44 },
+            O::ForeachCollect,
+            O::ForeachEnd,
+            O::Break,
+            O::Continue,
+            O::Return,
+            O::ReturnCode(45),
+            O::Exit(3),
+            O::Add,
+            O::Sub,
+            O::LappendLocal(46),
+            O::LappendVar(47),
+            O::LappendVarVar(48, 49),
+            O::LappendSlotSlot(50, 51),
+            O::BodyMarkFramed,
+            O::AddSlotSlot(52, 53),
+            O::AddSlotImm(54, -55),
+            O::CmpSlotSlot(56, 57, 2),
+            O::CmpSlotImm(58, -59, 4),
+            O::AddVarVar(60, 61),
+            O::AddVarImm(62, -63),
+            O::CmpVarVar(64, 65, 1),
+            O::CmpVarImm(66, -67, 5),
+            O::CmpSlotSlotJumpTrue(68, 69, 3, 70),
+            O::CmpSlotSlotJumpFalse(71, 72, 0, 73),
+            O::CmpSlotImmJumpTrue(74, -75, 2, 76),
+            O::CmpSlotImmJumpFalse(77, -78, 4, 79),
+            O::CmpVarVarJumpTrue(80, 81, 1, 82),
+            O::CmpVarVarJumpFalse(83, 84, 5, 85),
+            O::CmpVarImmJumpTrue(86, -87, 0, 88),
+            O::CmpVarImmJumpFalse(89, -90, 3, 91),
+            O::Mul,
+            O::Div,
+            O::Mod,
+            O::Pow,
+            O::Neg,
+            O::Eq,
+            O::Ne,
+            O::Lt,
+            O::Gt,
+            O::Le,
+            O::Ge,
+            O::StrEq,
+            O::StrNe,
+            O::And,
+            O::Or,
+            O::Not,
+            O::BitAnd,
+            O::BitOr,
+            O::BitXor,
+            O::BitNot,
+            O::Shl,
+            O::Shr,
+            O::Concat(92),
+            O::MakeList(93),
+            O::ListAppend,
+            O::ListIndex,
+            O::ListLength,
+            O::StrLen,
+            O::StrIndex,
+            O::ExpandList,
+            O::ExpandMark,
+            O::Call { cmd_id: 94, argc: 95 },
+            O::CallExpand { cmd_id: 96, argc: 97 },
+            O::DynCall { argc: 98 },
+            O::DynCallExpand { argc: 99 },
+            O::CallProc { proc_id: 100, argc: 101 },
+            O::TailCallProc { proc_id: 102, argc: 103 },
+            O::EvalScript,
+            O::EvalExpr,
+            O::CatchStart(104),
+            O::CatchEnd,
+            O::Line(105),
+            O::BeginCmd(106),
+            O::BeginCmdSubMark(107),
+            O::ExprMarkBeginCmd(108),
+            O::BeginCmdPushConst(109, 110),
+            O::SubEndStoreLocalPop(111),
+            O::SubEndStoreVarPop(112),
+            O::SubEndReturn,
+            O::SwapToNextMark,
+            O::NextMarkBeginCmd(113),
+            O::BeginCmdIncrLocalPop(114, 115, -116),
+            O::BeginCmdIncrVarPop(117, 118, -119),
+            O::ForNextIncrLocal(120, 121, -122, 123),
+            O::ForNextIncrVar(124, 125, -126, 127),
+            O::ForeachNextClose(128, 129),
+            O::SlotSetAddSS { set_site: 130, expr_site: 131, a: 132, b: 133, dst: 134 },
+            O::VarSetAddVV { set_site: 135, expr_site: 136, a: 137, b: 138, dst: 139 },
+            O::PushConstSubMark(140),
+            O::SubMarkBeginCmd(141),
+            O::ExprMarkBeginPushConst(142, 143),
+            O::SubSlotImm(144, -145),
+            O::SubSlotSlot(146, 147),
+            O::SubEndDynCall(148),
+            O::SubEndCall { cmd_id: 149, argc: 150 },
+            O::SubEndAdd,
+            O::IncrVarStack(151),
+            O::SubEndIncrVarStack(152),
+            O::IncrLocalStack(153),
+            O::SubEndIncrLocalStack(154),
+            O::BodyMark,
+            O::NextMark,
+            O::SubMark,
+            O::SubEnd,
+            O::ExprMark,
+            O::Nop,
+        
+        ]
+    }
+
+    #[test]
+    fn whitelist_golden() {
+        let golden: &[&str] = &[
+            "WL|true|PUSH_CONST 7",
+            "WL|true|PUSH_CONST_WIDE [70001]",
+            "WL|true|PUSH_EMPTY",
+            "WL|true|PUSH_INT -5",
+            "WL|true|PUSH_FLOAT 1.5",
+            "WL|true|PUSH_TRUE",
+            "WL|true|PUSH_FALSE",
+            "WL|true|POP",
+            "WL|true|DUP",
+            "WL|true|LOAD_VAR 11",
+            "WL|true|STORE_VAR 12",
+            "WL|true|STORE_VAR_POP 13",
+            "WL|true|LOAD_LOCAL 14",
+            "WL|true|STORE_LOCAL 15",
+            "WL|true|STORE_LOCAL_POP 16",
+            "WL|false|LOAD_ARRAY_ELEM 17",
+            "WL|false|STORE_ARRAY_ELEM 18",
+            "WL|true|INCR_VAR 19 -20",
+            "WL|true|INCR_VAR_POP 21 22",
+            "WL|true|INCR_LOCAL 23 -24",
+            "WL|true|INCR_LOCAL_POP 25 26",
+            "WL|false|APPEND_VAR 27",
+            "WL|false|UNSET_VAR 28",
+            "WL|false|VAR_EXISTS 29",
+            "WL|false|PUSH_FRAME 30",
+            "WL|false|POP_FRAME",
+            "WL|false|UPVAR level=31 src=32 dst=33",
+            "WL|false|GLOBAL 34",
+            "WL|true|JUMP 35",
+            "WL|true|JUMP_TRUE 36",
+            "WL|true|JUMP_FALSE 37",
+            "WL|true|LOOP_ENTER cont=38 brk=39",
+            "WL|true|LOOP_EXIT",
+            "WL|true|FOREACH_START info=40 next=41 end=42",
+            "WL|true|FOREACH_NEXT info=43 body=44",
+            "WL|true|FOREACH_COLLECT",
+            "WL|true|FOREACH_END",
+            "WL|true|BREAK",
+            "WL|true|CONTINUE",
+            "WL|true|RETURN",
+            "WL|false|RETURN_CODE 45",
+            "WL|true|EXIT 3",
+            "WL|true|ADD",
+            "WL|true|SUB",
+            "WL|true|LAPPEND_L 46",
+            "WL|true|LAPPEND_V 47",
+            "WL|true|LAPPEND_VV 48 49",
+            "WL|true|LAPPEND_SS 50 51",
+            "WL|true|BODY_MARK_FRAMED",
+            "WL|true|ADD_SS 52 53",
+            "WL|true|ADD_SI 54 -55",
+            "WL|true|CMP_SS 56 57 cc=2",
+            "WL|true|CMP_SI 58 -59 cc=4",
+            "WL|true|ADD_VV 60 61",
+            "WL|true|ADD_VI 62 -63",
+            "WL|true|CMP_VV 64 65 cc=1",
+            "WL|true|CMP_VI 66 -67 cc=5",
+            "WL|true|CMP_SS_JT 68 69 cc=3 -> 70",
+            "WL|true|CMP_SS_JF 71 72 cc=0 -> 73",
+            "WL|true|CMP_SI_JT 74 -75 cc=2 -> 76",
+            "WL|true|CMP_SI_JF 77 -78 cc=4 -> 79",
+            "WL|true|CMP_VV_JT 80 81 cc=1 -> 82",
+            "WL|true|CMP_VV_JF 83 84 cc=5 -> 85",
+            "WL|true|CMP_VI_JT 86 -87 cc=0 -> 88",
+            "WL|true|CMP_VI_JF 89 -90 cc=3 -> 91",
+            "WL|true|MUL",
+            "WL|true|DIV",
+            "WL|true|MOD",
+            "WL|true|POW",
+            "WL|true|NEG",
+            "WL|true|EQ",
+            "WL|true|NE",
+            "WL|true|LT",
+            "WL|true|GT",
+            "WL|true|LE",
+            "WL|true|GE",
+            "WL|true|STR_EQ",
+            "WL|true|STR_NE",
+            "WL|false|AND",
+            "WL|false|OR",
+            "WL|true|NOT",
+            "WL|true|BIT_AND",
+            "WL|true|BIT_OR",
+            "WL|true|BIT_XOR",
+            "WL|true|BIT_NOT",
+            "WL|true|SHL",
+            "WL|true|SHR",
+            "WL|true|CONCAT 92",
+            "WL|false|MAKE_LIST 93",
+            "WL|false|LIST_APPEND",
+            "WL|false|LIST_INDEX",
+            "WL|false|LIST_LENGTH",
+            "WL|false|STR_LEN",
+            "WL|false|STR_INDEX",
+            "WL|true|EXPAND_LIST",
+            "WL|true|EXPAND_MARK",
+            "WL|true|CALL cmd=94 argc=95",
+            "WL|true|CALL_EXPAND cmd=96 argc=97",
+            "WL|true|DYNCALL argc=98",
+            "WL|true|DYNCALL_EXPAND argc=99",
+            "WL|false|CALL_PROC proc=100 argc=101",
+            "WL|false|TAIL_CALL_PROC proc=102 argc=103",
+            "WL|true|EVAL_SCRIPT",
+            "WL|true|EVAL_EXPR",
+            "WL|false|CATCH_START 104",
+            "WL|false|CATCH_END",
+            "WL|false|LINE 105",
+            "WL|true|BEGIN_CMD 106",
+            "WL|true|BEGIN_CMD_SUB 107",
+            "WL|true|EXPR_MARK_BEGIN 108",
+            "WL|true|BEGIN_CMD_PUSH_CONST 109 110",
+            "WL|true|SUB_END_STORE_L_POP 111",
+            "WL|true|SUB_END_STORE_V_POP 112",
+            "WL|true|SUB_END_RETURN",
+            "WL|true|SWAP_TO_NEXT_MARK",
+            "WL|true|NEXT_MARK_BEGIN_CMD 113",
+            "WL|true|BEGIN_CMD_INCR_L_POP 114 115 -116",
+            "WL|true|BEGIN_CMD_INCR_V_POP 117 118 -119",
+            "WL|true|FOR_NEXT_INCR_L 120 121 -122 -> 123",
+            "WL|true|FOR_NEXT_INCR_V 124 125 -126 -> 127",
+            "WL|true|FOREACH_NEXT_CLOSE 128 -> 129",
+            "WL|true|SET_SS_ADD 130 131 132 133 -> 134",
+            "WL|true|SET_VV_ADD 135 136 137 138 -> 139",
+            "WL|true|PUSH_CONST_SUB 140",
+            "WL|true|SUB_MARK_BEGIN 141",
+            "WL|true|EXPR_MARK_BEGIN_PUSH 142 143",
+            "WL|true|SUB_SI 144 -145",
+            "WL|true|SUB_SS 146 147",
+            "WL|true|SUB_END_DYNCALL 148",
+            "WL|true|SUB_END_CALL 149 150",
+            "WL|true|SUB_END_ADD",
+            "WL|true|INCR_V_STACK 151",
+            "WL|true|SUB_END_INCR_V_STACK 152",
+            "WL|true|INCR_L_STACK 153",
+            "WL|true|SUB_END_INCR_L_STACK 154",
+            "WL|true|BODY_MARK",
+            "WL|true|NEXT_MARK",
+            "WL|true|SUB_MARK",
+            "WL|true|SUB_END",
+            "WL|true|EXPR_MARK",
+            "WL|false|NOP",
+        ];
+        let census = census();
+        assert_eq!(census.len(), golden.len());
+        for (op, want) in census.iter().zip(golden) {
+            let got = format!("WL|{}|{}", spec_of(op).emittable, op);
+            assert_eq!(got, *want, "whitelist drifted for {}", op);
+        }
+    }
+}

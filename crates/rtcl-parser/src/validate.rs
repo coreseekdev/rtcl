@@ -29,7 +29,19 @@ impl fmt::Display for ValidationError {
 /// Validate a compiled [`ByteCode`] block and return all errors found.
 ///
 /// An empty `Vec` means the bytecode is well-formed.
+///
+/// D2 第一步：操作数检查改读 [`rtcl_ir::opspec::OPS`] 行——按行的
+/// 操作数种类走查（`Const16`/`Const32` 查常量池界、`Target32` 查跳转
+/// 界），不再各持一份 per-op match。与旧检查的差别（记账）：
+/// - 旧版只查 Jump/JumpTrue/JumpFalse/CatchStart/LoopEnter×2 及八条
+///   Cmp*Jump/ForNext* 的目标界；新版按种类覆盖全部 Target32 字段，
+///   追加覆盖 ForeachStart(next/end)、ForeachNext(body)、
+///   ForeachNextClose(body)——编译器产物这些目标恒在界内，只影响
+///   手组码的诊断面（更严，不是更松）。
+/// - 旧版 upvar src 的专项文案并入通用 `constant pool index` 文案。
 pub fn validate(code: &ByteCode) -> Vec<ValidationError> {
+    use rtcl_ir::opspec::{Opnd, OPS, decompose};
+
     let ops = code.ops();
     let len = ops.len();
     let pool_size = code.constants().len() as u16;
@@ -38,128 +50,52 @@ pub fn validate(code: &ByteCode) -> Vec<ValidationError> {
     let mut loop_depth: i32 = 0;
 
     for (pc, op) in ops.iter().enumerate() {
+        let (idx, fields) = decompose(op);
+        let spec = &OPS[idx as usize];
+        for (k, arg) in spec.args.iter().enumerate() {
+            match arg.kind {
+                Opnd::Const16 => {
+                    let v = fields[k] as u16;
+                    if v >= pool_size {
+                        errors.push(ValidationError {
+                            pc,
+                            message: format!(
+                                "constant pool index {} out of range (pool size {})",
+                                v, pool_size,
+                            ),
+                        });
+                    }
+                }
+                Opnd::Const32 => {
+                    let v = fields[k] as u32;
+                    if v >= pool_size_wide {
+                        errors.push(ValidationError {
+                            pc,
+                            message: format!(
+                                "wide constant pool index {} out of range (pool size {})",
+                                v, pool_size_wide,
+                            ),
+                        });
+                    }
+                }
+                Opnd::Target32 => {
+                    let t = fields[k] as u32 as usize;
+                    if t > len {
+                        errors.push(ValidationError {
+                            pc,
+                            message: format!(
+                                "jump target {} out of bounds (code length {})",
+                                t, len,
+                            ),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        // -- Loop nesting (structural, keyed on the pair's row names) ----
         match op {
-            // -- Constant-pool references ------------------------------------
-            OpCode::PushConst(idx)
-            | OpCode::LoadVar(idx)
-            | OpCode::StoreVar(idx)
-            | OpCode::StoreVarPop(idx)
-            | OpCode::LoadArrayElem(idx)
-            | OpCode::StoreArrayElem(idx)
-            | OpCode::AppendVar(idx)
-            | OpCode::UnsetVar(idx)
-            | OpCode::VarExists(idx)
-            | OpCode::Global(idx) => {
-                if *idx >= pool_size {
-                    errors.push(ValidationError {
-                        pc,
-                        message: format!(
-                            "constant pool index {} out of range (pool size {})",
-                            idx, pool_size,
-                        ),
-                    });
-                }
-            }
-            OpCode::PushConstWide(idx) => {
-                if *idx >= pool_size_wide {
-                    errors.push(ValidationError {
-                        pc,
-                        message: format!(
-                            "wide constant pool index {} out of range (pool size {})",
-                            idx, pool_size_wide,
-                        ),
-                    });
-                }
-            }
-            OpCode::IncrVar(idx, _) => {
-                if *idx >= pool_size {
-                    errors.push(ValidationError {
-                        pc,
-                        message: format!(
-                            "constant pool index {} out of range (pool size {})",
-                            idx, pool_size,
-                        ),
-                    });
-                }
-            }
-            OpCode::UpVar { src, .. } => {
-                if *src >= pool_size {
-                    errors.push(ValidationError {
-                        pc,
-                        message: format!(
-                            "upvar src constant pool index {} out of range",
-                            src,
-                        ),
-                    });
-                }
-            }
-
-            // -- Jump targets ------------------------------------------------
-            OpCode::Jump(target) | OpCode::JumpTrue(target) | OpCode::JumpFalse(target) => {
-                if *target as usize > len {
-                    errors.push(ValidationError {
-                        pc,
-                        message: format!(
-                            "jump target {} out of bounds (code length {})",
-                            target, len,
-                        ),
-                    });
-                }
-            }
-            OpCode::CmpSlotSlotJumpTrue(_, _, _, target)
-            | OpCode::CmpSlotSlotJumpFalse(_, _, _, target)
-            | OpCode::CmpSlotImmJumpTrue(_, _, _, target)
-            | OpCode::CmpSlotImmJumpFalse(_, _, _, target)
-            | OpCode::CmpVarVarJumpTrue(_, _, _, target)
-            | OpCode::CmpVarVarJumpFalse(_, _, _, target)
-            | OpCode::CmpVarImmJumpTrue(_, _, _, target)
-            | OpCode::CmpVarImmJumpFalse(_, _, _, target)
-            | OpCode::ForNextIncrLocal(_, _, _, target)
-            | OpCode::ForNextIncrVar(_, _, _, target) => {
-                if *target as usize > len {
-                    errors.push(ValidationError {
-                        pc,
-                        message: format!(
-                            "fused jump target {} out of bounds (code length {})",
-                            target, len,
-                        ),
-                    });
-                }
-            }
-            OpCode::CatchStart(target) => {
-                if *target as usize > len {
-                    errors.push(ValidationError {
-                        pc,
-                        message: format!(
-                            "catch target {} out of bounds (code length {})",
-                            target, len,
-                        ),
-                    });
-                }
-            }
-
-            // -- Loop nesting ------------------------------------------------
-            OpCode::LoopEnter { cont, brk } => {
-                loop_depth += 1;
-                if *cont as usize > len {
-                    errors.push(ValidationError {
-                        pc,
-                        message: format!(
-                            "LoopEnter continue target {} out of bounds",
-                            cont,
-                        ),
-                    });
-                }
-                if *brk as usize > len {
-                    errors.push(ValidationError {
-                        pc,
-                        message: format!(
-                            "LoopEnter break target {} out of bounds",
-                            brk,
-                        ),
-                    });
-                }
-            }
+            OpCode::LoopEnter { .. } => loop_depth += 1,
             OpCode::LoopExit => {
                 loop_depth -= 1;
                 if loop_depth < 0 {
@@ -176,8 +112,6 @@ pub fn validate(code: &ByteCode) -> Vec<ValidationError> {
                     // note rather than a hard error.  The VM will handle
                     // it by returning an Error.
                 }
-
-            // Everything else — no structural checks needed.
             _ => {}
         }
     }

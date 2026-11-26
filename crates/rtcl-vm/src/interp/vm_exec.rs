@@ -1203,19 +1203,15 @@ fn exec_bytecode_with(
 }
 
 /// BeginCmd 系 op（含全部 PR#2 融合形态）的 site 下标——命令边界。
+/// D2 第一步：成员判定与 site 提取改读 [`rtcl_ir::opspec::OPS`] 行
+/// （`site_open` = 字段 0 是 Site32 操作数），不再各持一份 match。
 fn begin_cmd_site(op: &OpCode) -> Option<u32> {
-    match op {
-        OpCode::BeginCmd(s)
-        | OpCode::ExprMarkBeginCmd(s)
-        | OpCode::BeginCmdPushConst(s, _)
-        | OpCode::NextMarkBeginCmd(s)
-        | OpCode::BeginCmdIncrLocalPop(s, ..)
-        | OpCode::BeginCmdIncrVarPop(s, ..)
-        | OpCode::SubMarkBeginCmd(s)
-        | OpCode::ExprMarkBeginPushConst(s, _)
-        | OpCode::ForNextIncrLocal(s, ..)
-        | OpCode::ForNextIncrVar(s, ..) => Some(*s),
-        _ => None,
+    let (idx, fields) = rtcl_ir::opspec::decompose(op);
+    let spec = &rtcl_ir::opspec::OPS[idx as usize];
+    if spec.site_open {
+        Some(fields[0] as u32)
+    } else {
+        None
     }
 }
 
@@ -1259,162 +1255,15 @@ fn redispatch_target(
 /// - FlushInvalidate(2)：可执行 Tcl 代码/按名写任意变量（分派、unset、
 ///   名写、数组化）——flush + 全槽失效（失效先于 op：名路径全部落
 ///   全局，嵌套树走查/分派体一致；槽读回落全局拉新）。
-/// 匹配穷举：新增 OpCode 变体在此编译失败 → 强制显式分类（优于静默
-/// fail-safe）。
+/// D2 第一步：分类改读 [`rtcl_ir::opspec::OPS`] 行（`top` 字段）——
+/// 每 op 的类别是码表元数据，此处的穷举 match（新增变体在此编译
+/// 失败的旧约束）由 opspec 普查测试（census 覆盖每行）承接。
 fn top_op_class(op: &OpCode) -> u8 {
-    match op {
-        // ── 名键读（FlushOnly）：flush 后全局完整 ──────────────────────
-        OpCode::EvalExpr { .. }
-        | OpCode::LoadVar(_)
-        | OpCode::LoadArrayElem(_)
-        | OpCode::VarExists(_)
-        | OpCode::AddVarVar(..)
-        | OpCode::AddVarImm(..)
-        | OpCode::CmpVarVar(..)
-        | OpCode::CmpVarImm(..)
-        | OpCode::CmpVarVarJumpTrue(..)
-        | OpCode::CmpVarVarJumpFalse(..)
-        | OpCode::CmpVarImmJumpTrue(..)
-        | OpCode::CmpVarImmJumpFalse(..) => 1,
-        // ── 分派/名写/作用域（FlushInvalidate）——显式列出仅为文档；
-        //    fail-safe 兜底同一类 ─────────────────────────────────────
-        OpCode::Call { .. }
-        | OpCode::DynCall { .. }
-        | OpCode::CallExpand { .. }
-        | OpCode::DynCallExpand { .. }
-        | OpCode::CallProc { .. }
-        | OpCode::TailCallProc { .. }
-        | OpCode::SubEndDynCall(..)
-        | OpCode::SubEndCall { .. }
-        | OpCode::EvalScript { .. }
-        | OpCode::CatchStart(_)
-        | OpCode::CatchEnd
-        | OpCode::UnsetVar(_)
-        | OpCode::StoreVar(_)
-        | OpCode::StoreVarPop(_)
-        | OpCode::SubEndStoreVarPop(_)
-        | OpCode::IncrVar(..)
-        | OpCode::IncrVarPop(..)
-        | OpCode::IncrVarStack(..)
-        | OpCode::SubEndIncrVarStack(..)
-        | OpCode::BeginCmdIncrVarPop(..)
-        | OpCode::ForNextIncrVar(..)
-        | OpCode::AppendVar(_)
-        | OpCode::LappendVar(_)
-        | OpCode::LappendVarVar(..)
-        | OpCode::StoreArrayElem(_)
-        | OpCode::VarSetAddVV { .. }
-        | OpCode::PushFrame(_)
-        | OpCode::PopFrame
-        | OpCode::UpVar { .. }
-        | OpCode::Global(_)
-        | OpCode::Exit(_)
-        | OpCode::ForeachStart { .. }
-        | OpCode::ForeachNext { .. }
-        | OpCode::ForeachNextClose(..)
-        | OpCode::ForeachCollect
-        | OpCode::ForeachEnd => 2,
-        // ── 纯 op（零全局触达）────────────────────────────────────────
-        // 栈/常量
-        OpCode::PushConst(_)
-        | OpCode::PushConstWide(_)
-        | OpCode::PushEmpty
-        | OpCode::PushInt(_)
-        | OpCode::PushFloat(_)
-        | OpCode::PushTrue
-        | OpCode::PushFalse
-        | OpCode::Pop
-        | OpCode::Dup
-        // 算术/比较/逻辑/位
-        | OpCode::Add
-        | OpCode::Sub
-        | OpCode::Mul
-        | OpCode::Div
-        | OpCode::Mod
-        | OpCode::Pow
-        | OpCode::Neg
-        | OpCode::Eq
-        | OpCode::Ne
-        | OpCode::Lt
-        | OpCode::Gt
-        | OpCode::Le
-        | OpCode::Ge
-        | OpCode::StrEq
-        | OpCode::StrNe
-        | OpCode::And
-        | OpCode::Or
-        | OpCode::Not
-        | OpCode::BitAnd
-        | OpCode::BitOr
-        | OpCode::BitXor
-        | OpCode::BitNot
-        | OpCode::Shl
-        | OpCode::Shr
-        // 栈上 list/str 原语
-        | OpCode::Concat(_)
-        | OpCode::MakeList(_)
-        | OpCode::ListAppend
-        | OpCode::ListIndex
-        | OpCode::ListLength
-        | OpCode::StrLen
-        | OpCode::StrIndex
-        | OpCode::ExpandList
-        | OpCode::ExpandMark
-        // 跳转/控制/信号（ unwind 出单元 → 退出 flush 兜底）
-        | OpCode::Jump(_)
-        | OpCode::JumpTrue(_)
-        | OpCode::JumpFalse(_)
-        | OpCode::LoopEnter { .. }
-        | OpCode::LoopExit
-        | OpCode::Break
-        | OpCode::Continue
-        | OpCode::Return
-        | OpCode::ReturnCode(_)
-        // 区域标记/元信息
-        | OpCode::BodyMark
-        | OpCode::BodyMarkFramed
-        | OpCode::NextMark
-        | OpCode::SubMark
-        | OpCode::SubEnd
-        | OpCode::ExprMark
-        | OpCode::SwapToNextMark
-        | OpCode::Line(_)
-        | OpCode::Nop
-        | OpCode::BeginCmd(_)
-        | OpCode::BeginCmdSubMark(_)
-        | OpCode::ExprMarkBeginCmd(_)
-        | OpCode::BeginCmdPushConst(..)
-        | OpCode::PushConstSubMark(_)
-        | OpCode::SubMarkBeginCmd(_)
-        | OpCode::ExprMarkBeginPushConst(..)
-        | OpCode::NextMarkBeginCmd(_)
-        // 槽 op（ts 权威读写；回落持 ts 臂）
-        | OpCode::LoadLocal(_)
-        | OpCode::StoreLocal(_)
-        | OpCode::StoreLocalPop(_)
-        | OpCode::IncrLocal(..)
-        | OpCode::IncrLocalPop(..)
-        | OpCode::IncrLocalStack(..)
-        | OpCode::SubEndIncrLocalStack(..)
-        | OpCode::LappendLocal(_)
-        | OpCode::LappendSlotSlot(..)
-        // 槽超算/融合
-        | OpCode::AddSlotSlot(..)
-        | OpCode::AddSlotImm(..)
-        | OpCode::SubSlotImm(..)
-        | OpCode::SubSlotSlot(..)
-        | OpCode::CmpSlotSlot(..)
-        | OpCode::CmpSlotImm(..)
-        | OpCode::CmpSlotSlotJumpTrue(..)
-        | OpCode::CmpSlotSlotJumpFalse(..)
-        | OpCode::CmpSlotImmJumpTrue(..)
-        | OpCode::CmpSlotImmJumpFalse(..)
-        | OpCode::SubEndStoreLocalPop(_)
-        | OpCode::SubEndAdd
-        | OpCode::SubEndReturn
-        | OpCode::BeginCmdIncrLocalPop(..)
-        | OpCode::ForNextIncrLocal(..)
-        | OpCode::SlotSetAddSS { .. } => 0,
+    use rtcl_ir::opspec::OpClass;
+    match rtcl_ir::opspec::spec_of(op).top {
+        OpClass::Pure => 0,
+        OpClass::FlushOnly => 1,
+        OpClass::FlushInvalidate => 2,
     }
 }
 
@@ -4866,5 +4715,323 @@ impl Interp {
             return Some((false, Ok(crate::value::Value::empty())));
         }
         Some((true, self.eval_commands_from(&unit, next)))
+    }
+}
+
+// D2 第一步：分类查表金样——`top_op_class`/`begin_cmd_site`（现读
+// rtcl_ir::opspec::OPS 行）对 pre-table match 的逐 op 输出（类别、是否
+// 命令边界、site 值），census 全 141 变体捕获于 D2 基线。注意金样里
+// BeginCmdSubMark/SlotSetAddSS/VarSetAddVV 携带 site 操作数但**不是**
+// 命令边界（旧 match 的精确形状，表按此复刻）。
+#[cfg(test)]
+mod classification_golden {
+    use super::{begin_cmd_site, top_op_class};
+    use rtcl_ir::OpCode as O;
+
+    fn census() -> Vec<O> {
+        vec![
+            O::PushConst(7),
+            O::PushConstWide(70001),
+            O::PushEmpty,
+            O::PushInt(-5),
+            O::PushFloat(1.5),
+            O::PushTrue,
+            O::PushFalse,
+            O::Pop,
+            O::Dup,
+            O::LoadVar(11),
+            O::StoreVar(12),
+            O::StoreVarPop(13),
+            O::LoadLocal(14),
+            O::StoreLocal(15),
+            O::StoreLocalPop(16),
+            O::LoadArrayElem(17),
+            O::StoreArrayElem(18),
+            O::IncrVar(19, -20),
+            O::IncrVarPop(21, 22),
+            O::IncrLocal(23, -24),
+            O::IncrLocalPop(25, 26),
+            O::AppendVar(27),
+            O::UnsetVar(28),
+            O::VarExists(29),
+            O::PushFrame(30),
+            O::PopFrame,
+            O::UpVar { level: 31, src: 32, dst: 33 },
+            O::Global(34),
+            O::Jump(35),
+            O::JumpTrue(36),
+            O::JumpFalse(37),
+            O::LoopEnter { cont: 38, brk: 39 },
+            O::LoopExit,
+            O::ForeachStart { info: 40, next: 41, end: 42 },
+            O::ForeachNext { info: 43, body: 44 },
+            O::ForeachCollect,
+            O::ForeachEnd,
+            O::Break,
+            O::Continue,
+            O::Return,
+            O::ReturnCode(45),
+            O::Exit(3),
+            O::Add,
+            O::Sub,
+            O::LappendLocal(46),
+            O::LappendVar(47),
+            O::LappendVarVar(48, 49),
+            O::LappendSlotSlot(50, 51),
+            O::BodyMarkFramed,
+            O::AddSlotSlot(52, 53),
+            O::AddSlotImm(54, -55),
+            O::CmpSlotSlot(56, 57, 2),
+            O::CmpSlotImm(58, -59, 4),
+            O::AddVarVar(60, 61),
+            O::AddVarImm(62, -63),
+            O::CmpVarVar(64, 65, 1),
+            O::CmpVarImm(66, -67, 5),
+            O::CmpSlotSlotJumpTrue(68, 69, 3, 70),
+            O::CmpSlotSlotJumpFalse(71, 72, 0, 73),
+            O::CmpSlotImmJumpTrue(74, -75, 2, 76),
+            O::CmpSlotImmJumpFalse(77, -78, 4, 79),
+            O::CmpVarVarJumpTrue(80, 81, 1, 82),
+            O::CmpVarVarJumpFalse(83, 84, 5, 85),
+            O::CmpVarImmJumpTrue(86, -87, 0, 88),
+            O::CmpVarImmJumpFalse(89, -90, 3, 91),
+            O::Mul,
+            O::Div,
+            O::Mod,
+            O::Pow,
+            O::Neg,
+            O::Eq,
+            O::Ne,
+            O::Lt,
+            O::Gt,
+            O::Le,
+            O::Ge,
+            O::StrEq,
+            O::StrNe,
+            O::And,
+            O::Or,
+            O::Not,
+            O::BitAnd,
+            O::BitOr,
+            O::BitXor,
+            O::BitNot,
+            O::Shl,
+            O::Shr,
+            O::Concat(92),
+            O::MakeList(93),
+            O::ListAppend,
+            O::ListIndex,
+            O::ListLength,
+            O::StrLen,
+            O::StrIndex,
+            O::ExpandList,
+            O::ExpandMark,
+            O::Call { cmd_id: 94, argc: 95 },
+            O::CallExpand { cmd_id: 96, argc: 97 },
+            O::DynCall { argc: 98 },
+            O::DynCallExpand { argc: 99 },
+            O::CallProc { proc_id: 100, argc: 101 },
+            O::TailCallProc { proc_id: 102, argc: 103 },
+            O::EvalScript,
+            O::EvalExpr,
+            O::CatchStart(104),
+            O::CatchEnd,
+            O::Line(105),
+            O::BeginCmd(106),
+            O::BeginCmdSubMark(107),
+            O::ExprMarkBeginCmd(108),
+            O::BeginCmdPushConst(109, 110),
+            O::SubEndStoreLocalPop(111),
+            O::SubEndStoreVarPop(112),
+            O::SubEndReturn,
+            O::SwapToNextMark,
+            O::NextMarkBeginCmd(113),
+            O::BeginCmdIncrLocalPop(114, 115, -116),
+            O::BeginCmdIncrVarPop(117, 118, -119),
+            O::ForNextIncrLocal(120, 121, -122, 123),
+            O::ForNextIncrVar(124, 125, -126, 127),
+            O::ForeachNextClose(128, 129),
+            O::SlotSetAddSS { set_site: 130, expr_site: 131, a: 132, b: 133, dst: 134 },
+            O::VarSetAddVV { set_site: 135, expr_site: 136, a: 137, b: 138, dst: 139 },
+            O::PushConstSubMark(140),
+            O::SubMarkBeginCmd(141),
+            O::ExprMarkBeginPushConst(142, 143),
+            O::SubSlotImm(144, -145),
+            O::SubSlotSlot(146, 147),
+            O::SubEndDynCall(148),
+            O::SubEndCall { cmd_id: 149, argc: 150 },
+            O::SubEndAdd,
+            O::IncrVarStack(151),
+            O::SubEndIncrVarStack(152),
+            O::IncrLocalStack(153),
+            O::SubEndIncrLocalStack(154),
+            O::BodyMark,
+            O::NextMark,
+            O::SubMark,
+            O::SubEnd,
+            O::ExprMark,
+            O::Nop,
+        
+        ]
+    }
+
+    #[test]
+    fn classification_golden() {
+        let golden: &[&str] = &[
+            "CLS|0|false|None|PUSH_CONST 7",
+            "CLS|0|false|None|PUSH_CONST_WIDE [70001]",
+            "CLS|0|false|None|PUSH_EMPTY",
+            "CLS|0|false|None|PUSH_INT -5",
+            "CLS|0|false|None|PUSH_FLOAT 1.5",
+            "CLS|0|false|None|PUSH_TRUE",
+            "CLS|0|false|None|PUSH_FALSE",
+            "CLS|0|false|None|POP",
+            "CLS|0|false|None|DUP",
+            "CLS|1|false|None|LOAD_VAR 11",
+            "CLS|2|false|None|STORE_VAR 12",
+            "CLS|2|false|None|STORE_VAR_POP 13",
+            "CLS|0|false|None|LOAD_LOCAL 14",
+            "CLS|0|false|None|STORE_LOCAL 15",
+            "CLS|0|false|None|STORE_LOCAL_POP 16",
+            "CLS|1|false|None|LOAD_ARRAY_ELEM 17",
+            "CLS|2|false|None|STORE_ARRAY_ELEM 18",
+            "CLS|2|false|None|INCR_VAR 19 -20",
+            "CLS|2|false|None|INCR_VAR_POP 21 22",
+            "CLS|0|false|None|INCR_LOCAL 23 -24",
+            "CLS|0|false|None|INCR_LOCAL_POP 25 26",
+            "CLS|2|false|None|APPEND_VAR 27",
+            "CLS|2|false|None|UNSET_VAR 28",
+            "CLS|1|false|None|VAR_EXISTS 29",
+            "CLS|2|false|None|PUSH_FRAME 30",
+            "CLS|2|false|None|POP_FRAME",
+            "CLS|2|false|None|UPVAR level=31 src=32 dst=33",
+            "CLS|2|false|None|GLOBAL 34",
+            "CLS|0|false|None|JUMP 35",
+            "CLS|0|false|None|JUMP_TRUE 36",
+            "CLS|0|false|None|JUMP_FALSE 37",
+            "CLS|0|false|None|LOOP_ENTER cont=38 brk=39",
+            "CLS|0|false|None|LOOP_EXIT",
+            "CLS|2|false|None|FOREACH_START info=40 next=41 end=42",
+            "CLS|2|false|None|FOREACH_NEXT info=43 body=44",
+            "CLS|2|false|None|FOREACH_COLLECT",
+            "CLS|2|false|None|FOREACH_END",
+            "CLS|0|false|None|BREAK",
+            "CLS|0|false|None|CONTINUE",
+            "CLS|0|false|None|RETURN",
+            "CLS|0|false|None|RETURN_CODE 45",
+            "CLS|2|false|None|EXIT 3",
+            "CLS|0|false|None|ADD",
+            "CLS|0|false|None|SUB",
+            "CLS|0|false|None|LAPPEND_L 46",
+            "CLS|2|false|None|LAPPEND_V 47",
+            "CLS|2|false|None|LAPPEND_VV 48 49",
+            "CLS|0|false|None|LAPPEND_SS 50 51",
+            "CLS|0|false|None|BODY_MARK_FRAMED",
+            "CLS|0|false|None|ADD_SS 52 53",
+            "CLS|0|false|None|ADD_SI 54 -55",
+            "CLS|0|false|None|CMP_SS 56 57 cc=2",
+            "CLS|0|false|None|CMP_SI 58 -59 cc=4",
+            "CLS|1|false|None|ADD_VV 60 61",
+            "CLS|1|false|None|ADD_VI 62 -63",
+            "CLS|1|false|None|CMP_VV 64 65 cc=1",
+            "CLS|1|false|None|CMP_VI 66 -67 cc=5",
+            "CLS|0|false|None|CMP_SS_JT 68 69 cc=3 -> 70",
+            "CLS|0|false|None|CMP_SS_JF 71 72 cc=0 -> 73",
+            "CLS|0|false|None|CMP_SI_JT 74 -75 cc=2 -> 76",
+            "CLS|0|false|None|CMP_SI_JF 77 -78 cc=4 -> 79",
+            "CLS|1|false|None|CMP_VV_JT 80 81 cc=1 -> 82",
+            "CLS|1|false|None|CMP_VV_JF 83 84 cc=5 -> 85",
+            "CLS|1|false|None|CMP_VI_JT 86 -87 cc=0 -> 88",
+            "CLS|1|false|None|CMP_VI_JF 89 -90 cc=3 -> 91",
+            "CLS|0|false|None|MUL",
+            "CLS|0|false|None|DIV",
+            "CLS|0|false|None|MOD",
+            "CLS|0|false|None|POW",
+            "CLS|0|false|None|NEG",
+            "CLS|0|false|None|EQ",
+            "CLS|0|false|None|NE",
+            "CLS|0|false|None|LT",
+            "CLS|0|false|None|GT",
+            "CLS|0|false|None|LE",
+            "CLS|0|false|None|GE",
+            "CLS|0|false|None|STR_EQ",
+            "CLS|0|false|None|STR_NE",
+            "CLS|0|false|None|AND",
+            "CLS|0|false|None|OR",
+            "CLS|0|false|None|NOT",
+            "CLS|0|false|None|BIT_AND",
+            "CLS|0|false|None|BIT_OR",
+            "CLS|0|false|None|BIT_XOR",
+            "CLS|0|false|None|BIT_NOT",
+            "CLS|0|false|None|SHL",
+            "CLS|0|false|None|SHR",
+            "CLS|0|false|None|CONCAT 92",
+            "CLS|0|false|None|MAKE_LIST 93",
+            "CLS|0|false|None|LIST_APPEND",
+            "CLS|0|false|None|LIST_INDEX",
+            "CLS|0|false|None|LIST_LENGTH",
+            "CLS|0|false|None|STR_LEN",
+            "CLS|0|false|None|STR_INDEX",
+            "CLS|0|false|None|EXPAND_LIST",
+            "CLS|0|false|None|EXPAND_MARK",
+            "CLS|2|false|None|CALL cmd=94 argc=95",
+            "CLS|2|false|None|CALL_EXPAND cmd=96 argc=97",
+            "CLS|2|false|None|DYNCALL argc=98",
+            "CLS|2|false|None|DYNCALL_EXPAND argc=99",
+            "CLS|2|false|None|CALL_PROC proc=100 argc=101",
+            "CLS|2|false|None|TAIL_CALL_PROC proc=102 argc=103",
+            "CLS|2|false|None|EVAL_SCRIPT",
+            "CLS|1|false|None|EVAL_EXPR",
+            "CLS|2|false|None|CATCH_START 104",
+            "CLS|2|false|None|CATCH_END",
+            "CLS|0|false|None|LINE 105",
+            "CLS|0|true|Some(106)|BEGIN_CMD 106",
+            "CLS|0|false|None|BEGIN_CMD_SUB 107",
+            "CLS|0|true|Some(108)|EXPR_MARK_BEGIN 108",
+            "CLS|0|true|Some(109)|BEGIN_CMD_PUSH_CONST 109 110",
+            "CLS|0|false|None|SUB_END_STORE_L_POP 111",
+            "CLS|2|false|None|SUB_END_STORE_V_POP 112",
+            "CLS|0|false|None|SUB_END_RETURN",
+            "CLS|0|false|None|SWAP_TO_NEXT_MARK",
+            "CLS|0|true|Some(113)|NEXT_MARK_BEGIN_CMD 113",
+            "CLS|0|true|Some(114)|BEGIN_CMD_INCR_L_POP 114 115 -116",
+            "CLS|2|true|Some(117)|BEGIN_CMD_INCR_V_POP 117 118 -119",
+            "CLS|0|true|Some(120)|FOR_NEXT_INCR_L 120 121 -122 -> 123",
+            "CLS|2|true|Some(124)|FOR_NEXT_INCR_V 124 125 -126 -> 127",
+            "CLS|2|false|None|FOREACH_NEXT_CLOSE 128 -> 129",
+            "CLS|0|false|None|SET_SS_ADD 130 131 132 133 -> 134",
+            "CLS|2|false|None|SET_VV_ADD 135 136 137 138 -> 139",
+            "CLS|0|false|None|PUSH_CONST_SUB 140",
+            "CLS|0|true|Some(141)|SUB_MARK_BEGIN 141",
+            "CLS|0|true|Some(142)|EXPR_MARK_BEGIN_PUSH 142 143",
+            "CLS|0|false|None|SUB_SI 144 -145",
+            "CLS|0|false|None|SUB_SS 146 147",
+            "CLS|2|false|None|SUB_END_DYNCALL 148",
+            "CLS|2|false|None|SUB_END_CALL 149 150",
+            "CLS|0|false|None|SUB_END_ADD",
+            "CLS|2|false|None|INCR_V_STACK 151",
+            "CLS|2|false|None|SUB_END_INCR_V_STACK 152",
+            "CLS|0|false|None|INCR_L_STACK 153",
+            "CLS|0|false|None|SUB_END_INCR_L_STACK 154",
+            "CLS|0|false|None|BODY_MARK",
+            "CLS|0|false|None|NEXT_MARK",
+            "CLS|0|false|None|SUB_MARK",
+            "CLS|0|false|None|SUB_END",
+            "CLS|0|false|None|EXPR_MARK",
+            "CLS|0|false|None|NOP",
+        ];
+        let census = census();
+        assert_eq!(census.len(), golden.len());
+        for (op, want) in census.iter().zip(golden) {
+            let site = begin_cmd_site(op);
+            let got = format!(
+                "CLS|{}|{}|{:?}|{}",
+                top_op_class(op),
+                site.is_some(),
+                site,
+                op
+            );
+            assert_eq!(got, *want, "classification drifted for {}", op);
+        }
     }
 }

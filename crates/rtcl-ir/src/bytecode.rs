@@ -5,6 +5,7 @@
 //! source-line mappings for diagnostics.
 
 use crate::opcode::OpCode;
+use crate::opspec;
 use core::fmt;
 use std::rc::Rc;
 
@@ -879,55 +880,10 @@ impl ByteCode {
     }
 
     /// Does the unit contain any fused superinstruction (see
-    /// [`Self::fuse_pairs`])?
+    /// [`Self::fuse_pairs`])?  D2 第一步：改读 [`opspec::OPS`] 的
+    /// `fused` 行字段（普查测试钉住与旧穷举逐 op 一致）。
     pub fn has_fused_ops(&self) -> bool {
-        self.ops.iter().any(|op| {
-            matches!(
-                op,
-                OpCode::CmpSlotSlotJumpTrue(..)
-                    | OpCode::CmpSlotSlotJumpFalse(..)
-                    | OpCode::CmpSlotImmJumpTrue(..)
-                    | OpCode::CmpSlotImmJumpFalse(..)
-                    | OpCode::CmpVarVarJumpTrue(..)
-                    | OpCode::CmpVarVarJumpFalse(..)
-                    | OpCode::CmpVarImmJumpTrue(..)
-                    | OpCode::CmpVarImmJumpFalse(..)
-                    | OpCode::LappendSlotSlot(..)
-                    | OpCode::LappendVarVar(..)
-                    | OpCode::IncrLocalPop(..)
-                    | OpCode::IncrVarPop(..)
-                    | OpCode::StoreLocalPop(..)
-                    | OpCode::CmpVarImm(..)
-                    | OpCode::CmpVarVar(..)
-                    | OpCode::AddVarImm(..)
-                    | OpCode::AddVarVar(..)
-                    | OpCode::BeginCmdSubMark(..)
-                    | OpCode::ExprMarkBeginCmd(..)
-                    | OpCode::BeginCmdPushConst(..)
-                    | OpCode::SubEndStoreLocalPop(..)
-                    | OpCode::SubEndStoreVarPop(..)
-                    | OpCode::SubEndReturn
-                    | OpCode::SwapToNextMark
-                    | OpCode::ForNextIncrLocal(..)
-                    | OpCode::ForNextIncrVar(..)
-                    | OpCode::NextMarkBeginCmd(..)
-                    | OpCode::BeginCmdIncrLocalPop(..)
-                    | OpCode::BeginCmdIncrVarPop(..)
-                    | OpCode::ForeachNextClose(..)
-                    | OpCode::SlotSetAddSS { .. }
-                    | OpCode::VarSetAddVV { .. }
-                    | OpCode::PushConstSubMark(..)
-                    | OpCode::SubMarkBeginCmd(..)
-                    | OpCode::ExprMarkBeginPushConst(..)
-                    | OpCode::SubSlotImm(..)
-                    | OpCode::SubSlotSlot(..)
-                    | OpCode::SubEndDynCall(..)
-                    | OpCode::SubEndCall { .. }
-                    | OpCode::SubEndAdd
-                    | OpCode::SubEndIncrVarStack(..)
-                    | OpCode::SubEndIncrLocalStack(..)
-            )
-        })
+        self.ops.iter().any(|op| opspec::spec_of(op).fused)
     }
 
     /// Expand every fused superinstruction back to its canonical window:
@@ -940,231 +896,6 @@ impl ByteCode {
     /// (the JIT's analysis boundary, `rtcl-vm`) call this once at their
     /// compile entry — see `docs/JIT-OPCODE-DELTA.md`.
     pub fn unfused(&self) -> ByteCode {
-        /// Expand one fused op into `out`; `false` = not fused (the
-        /// caller copies it verbatim).
-        fn expand_into(op: &OpCode, out: &mut Vec<OpCode>) -> bool {
-            match op {
-                OpCode::CmpSlotSlotJumpTrue(a, b, cc, t) => {
-                    out.push(OpCode::CmpSlotSlot(*a, *b, *cc));
-                    out.push(OpCode::JumpTrue(*t));
-                }
-                OpCode::CmpSlotSlotJumpFalse(a, b, cc, t) => {
-                    out.push(OpCode::CmpSlotSlot(*a, *b, *cc));
-                    out.push(OpCode::JumpFalse(*t));
-                }
-                OpCode::CmpSlotImmJumpTrue(a, k, cc, t) => {
-                    out.push(OpCode::CmpSlotImm(*a, *k, *cc));
-                    out.push(OpCode::JumpTrue(*t));
-                }
-                OpCode::CmpSlotImmJumpFalse(a, k, cc, t) => {
-                    out.push(OpCode::CmpSlotImm(*a, *k, *cc));
-                    out.push(OpCode::JumpFalse(*t));
-                }
-                // The name-keyed families predate the fusion only as raw
-                // windows — expand straight through (a jump fusion's
-                // canonical form is the four-op chain; re-fusing it via
-                // `fuse_pairs` is exact, see the round-trip test).
-                OpCode::CmpVarVarJumpTrue(a, b, cc, t) => {
-                    out.push(OpCode::LoadVar(*a));
-                    out.push(OpCode::LoadVar(*b));
-                    out.push(cmp_op_of(*cc));
-                    out.push(OpCode::JumpTrue(*t));
-                }
-                OpCode::CmpVarVarJumpFalse(a, b, cc, t) => {
-                    out.push(OpCode::LoadVar(*a));
-                    out.push(OpCode::LoadVar(*b));
-                    out.push(cmp_op_of(*cc));
-                    out.push(OpCode::JumpFalse(*t));
-                }
-                OpCode::CmpVarImmJumpTrue(a, k, cc, t) => {
-                    out.push(OpCode::LoadVar(*a));
-                    out.push(OpCode::PushInt(*k));
-                    out.push(cmp_op_of(*cc));
-                    out.push(OpCode::JumpTrue(*t));
-                }
-                OpCode::CmpVarImmJumpFalse(a, k, cc, t) => {
-                    out.push(OpCode::LoadVar(*a));
-                    out.push(OpCode::PushInt(*k));
-                    out.push(cmp_op_of(*cc));
-                    out.push(OpCode::JumpFalse(*t));
-                }
-                OpCode::LappendSlotSlot(src, dst) => {
-                    out.push(OpCode::LoadLocal(*src));
-                    out.push(OpCode::LappendLocal(*dst));
-                    out.push(OpCode::Pop);
-                }
-                OpCode::LappendVarVar(src, dst) => {
-                    out.push(OpCode::LoadVar(*src));
-                    out.push(OpCode::LappendVar(*dst));
-                    out.push(OpCode::Pop);
-                }
-                OpCode::IncrLocalPop(x, k) => {
-                    out.push(OpCode::IncrLocal(*x, *k));
-                    out.push(OpCode::Pop);
-                }
-                OpCode::IncrVarPop(x, k) => {
-                    out.push(OpCode::IncrVar(*x, *k));
-                    out.push(OpCode::Pop);
-                }
-                OpCode::StoreLocalPop(x) => {
-                    out.push(OpCode::StoreLocal(*x));
-                    out.push(OpCode::Pop);
-                }
-                OpCode::BeginCmdSubMark(site) => {
-                    out.push(OpCode::BeginCmd(*site));
-                    out.push(OpCode::SubMark);
-                }
-                OpCode::ExprMarkBeginCmd(site) => {
-                    out.push(OpCode::ExprMark);
-                    out.push(OpCode::BeginCmd(*site));
-                }
-                OpCode::BeginCmdPushConst(site, idx) => {
-                    out.push(OpCode::BeginCmd(*site));
-                    out.push(OpCode::PushConst(*idx));
-                }
-                OpCode::SubEndStoreLocalPop(slot) => {
-                    // Straight to the pre-fusion canonical form: a
-                    // `StoreLocalPop` here would still be a fused op the
-                    // boundary must not emit.
-                    out.push(OpCode::SubEnd);
-                    out.push(OpCode::StoreLocal(*slot));
-                    out.push(OpCode::Pop);
-                }
-                OpCode::SubEndStoreVarPop(idx) => {
-                    out.push(OpCode::SubEnd);
-                    out.push(OpCode::StoreVarPop(*idx));
-                }
-                OpCode::SubEndReturn => {
-                    out.push(OpCode::SubEnd);
-                    out.push(OpCode::Return);
-                }
-                OpCode::SwapToNextMark => {
-                    out.push(OpCode::Nop);
-                    out.push(OpCode::NextMark);
-                }
-                OpCode::ForNextIncrLocal(site, x, k, t) => {
-                    out.push(OpCode::Nop); // retired body-end trampoline Jump
-                    out.push(OpCode::NextMark);
-                    out.push(OpCode::BeginCmd(*site));
-                    out.push(OpCode::IncrLocal(*x, *k as i64));
-                    out.push(OpCode::Pop);
-                    out.push(OpCode::Jump(*t));
-                }
-                OpCode::ForNextIncrVar(site, x, k, t) => {
-                    out.push(OpCode::Nop);
-                    out.push(OpCode::NextMark);
-                    out.push(OpCode::BeginCmd(*site));
-                    out.push(OpCode::IncrVar(*x, *k as i64));
-                    out.push(OpCode::Pop);
-                    out.push(OpCode::Jump(*t));
-                }
-                OpCode::NextMarkBeginCmd(site) => {
-                    out.push(OpCode::NextMark);
-                    out.push(OpCode::BeginCmd(*site));
-                }
-                OpCode::BeginCmdIncrLocalPop(site, x, k) => {
-                    out.push(OpCode::BeginCmd(*site));
-                    out.push(OpCode::IncrLocal(*x, *k));
-                    out.push(OpCode::Pop);
-                }
-                OpCode::BeginCmdIncrVarPop(site, x, k) => {
-                    out.push(OpCode::BeginCmd(*site));
-                    out.push(OpCode::IncrVar(*x, *k));
-                    out.push(OpCode::Pop);
-                }
-                OpCode::ForeachNextClose(info, body) => {
-                    out.push(OpCode::Nop);
-                    out.push(OpCode::ForeachNext { info: *info, body: *body });
-                }
-                OpCode::SlotSetAddSS { set_site, expr_site, a, b, dst } => {
-                    out.push(OpCode::BeginCmd(*set_site));
-                    out.push(OpCode::SubMark);
-                    out.push(OpCode::BeginCmd(*expr_site));
-                    out.push(OpCode::AddSlotSlot(*a, *b));
-                    out.push(OpCode::SubEnd);
-                    out.push(OpCode::StoreLocal(*dst));
-                    out.push(OpCode::Pop);
-                }
-                OpCode::VarSetAddVV { set_site, expr_site, a, b, dst } => {
-                    out.push(OpCode::BeginCmd(*set_site));
-                    out.push(OpCode::SubMark);
-                    out.push(OpCode::BeginCmd(*expr_site));
-                    out.push(OpCode::LoadVar(*a));
-                    out.push(OpCode::LoadVar(*b));
-                    out.push(OpCode::Add);
-                    out.push(OpCode::SubEnd);
-                    out.push(OpCode::StoreVarPop(*dst));
-                }
-                OpCode::PushConstSubMark(i) => {
-                    out.push(OpCode::PushConst(*i));
-                    out.push(OpCode::SubMark);
-                }
-                OpCode::SubMarkBeginCmd(site) => {
-                    out.push(OpCode::SubMark);
-                    out.push(OpCode::BeginCmd(*site));
-                }
-                OpCode::ExprMarkBeginPushConst(site, i) => {
-                    out.push(OpCode::ExprMark);
-                    out.push(OpCode::BeginCmd(*site));
-                    out.push(OpCode::PushConst(*i));
-                }
-                OpCode::SubSlotImm(a, k) => {
-                    out.push(OpCode::LoadLocal(*a));
-                    out.push(OpCode::PushInt(*k));
-                    out.push(OpCode::Sub);
-                }
-                OpCode::SubSlotSlot(a, b) => {
-                    out.push(OpCode::LoadLocal(*a));
-                    out.push(OpCode::LoadLocal(*b));
-                    out.push(OpCode::Sub);
-                }
-                OpCode::SubEndDynCall(argc) => {
-                    out.push(OpCode::SubEnd);
-                    out.push(OpCode::DynCall { argc: *argc });
-                }
-                OpCode::SubEndCall { cmd_id, argc } => {
-                    out.push(OpCode::SubEnd);
-                    out.push(OpCode::Call { cmd_id: *cmd_id, argc: *argc });
-                }
-                OpCode::SubEndAdd => {
-                    out.push(OpCode::SubEnd);
-                    out.push(OpCode::Add);
-                }
-                OpCode::SubEndIncrVarStack(idx) => {
-                    out.push(OpCode::SubEnd);
-                    out.push(OpCode::IncrVarStack(*idx));
-                }
-                OpCode::SubEndIncrLocalStack(slot) => {
-                    out.push(OpCode::SubEnd);
-                    out.push(OpCode::IncrLocalStack(*slot));
-                }
-                // The name-keyed superinstructions themselves predate the
-                // fusion only as windows — expand them back too.
-                OpCode::CmpVarImm(a, k, cc) => {
-                    out.push(OpCode::LoadVar(*a));
-                    out.push(OpCode::PushInt(*k));
-                    out.push(cmp_op_of(*cc));
-                }
-                OpCode::CmpVarVar(a, b, cc) => {
-                    out.push(OpCode::LoadVar(*a));
-                    out.push(OpCode::LoadVar(*b));
-                    out.push(cmp_op_of(*cc));
-                }
-                OpCode::AddVarImm(a, k) => {
-                    out.push(OpCode::LoadVar(*a));
-                    out.push(OpCode::PushInt(*k));
-                    out.push(OpCode::Add);
-                }
-                OpCode::AddVarVar(a, b) => {
-                    out.push(OpCode::LoadVar(*a));
-                    out.push(OpCode::LoadVar(*b));
-                    out.push(OpCode::Add);
-                }
-                _ => return false,
-            }
-            true
-        }
-
         if !self.has_fused_ops() {
             return self.clone();
         }
@@ -1178,7 +909,7 @@ impl ByteCode {
             map.push(ops.len() as u32);
             let line = self.line_at(i);
             let before = ops.len();
-            if !expand_into(op, &mut ops) {
+            if !opspec::expand_into(op, &mut ops) {
                 ops.push(op.clone());
             }
             for _ in before..ops.len() {
@@ -1186,25 +917,22 @@ impl ByteCode {
             }
         }
         let n_ops = ops.len() as u32;
-        let remap = |t: &mut u32| {
-            *t = map.get(*t as usize).copied().unwrap_or(n_ops);
-        };
+        // D2 第一步：目标重定位改按行的 Target32 字段走查——重定位集合
+        // (Jump/JumpTrue/JumpFalse/CatchStart/LoopEnter×2/ForeachStart×2/
+        // ForeachNext) 与旧穷举完全一致（site/info 等非目标字段不碰）。
         for op in ops.iter_mut() {
-            match op {
-                OpCode::Jump(t)
-                | OpCode::JumpTrue(t)
-                | OpCode::JumpFalse(t)
-                | OpCode::CatchStart(t) => remap(t),
-                OpCode::LoopEnter { cont, brk } => {
-                    remap(cont);
-                    remap(brk);
+            let (idx, mut fields) = opspec::decompose(op);
+            let spec = &opspec::OPS[idx as usize];
+            let mut touched = false;
+            for (k, arg) in spec.args.iter().enumerate() {
+                if arg.kind == opspec::Opnd::Target32 {
+                    let t = fields[k] as u32;
+                    fields[k] = map.get(t as usize).copied().unwrap_or(n_ops) as u64;
+                    touched = true;
                 }
-                OpCode::ForeachStart { next, end, .. } => {
-                    remap(next);
-                    remap(end);
-                }
-                OpCode::ForeachNext { body, .. } => remap(body),
-                _ => {}
+            }
+            if touched {
+                *op = opspec::compose(idx, &fields).expect("target remap round-trip");
             }
         }
         ByteCode {
@@ -1798,3 +1526,534 @@ mod tests {
         assert_eq!(target as usize, code.ops().len() - 1);
     }
 }
+
+    /// D2 第一步：`unfused()`（表驱动展开）逐 op 金样——pre-table 实现
+    /// 的 fused 判定与展开序列（含展开后目标重定位），census 全 141 变
+    /// 体捕获于 D2 基线。任何漂移都是展开语义回归。
+    #[test]
+    fn unfused_expansion_golden() {
+        let census: Vec<OpCode> = vec![
+            OpCode::PushConst(7),
+            OpCode::PushConstWide(70001),
+            OpCode::PushEmpty,
+            OpCode::PushInt(-5),
+            OpCode::PushFloat(1.5),
+            OpCode::PushTrue,
+            OpCode::PushFalse,
+            OpCode::Pop,
+            OpCode::Dup,
+            OpCode::LoadVar(11),
+            OpCode::StoreVar(12),
+            OpCode::StoreVarPop(13),
+            OpCode::LoadLocal(14),
+            OpCode::StoreLocal(15),
+            OpCode::StoreLocalPop(16),
+            OpCode::LoadArrayElem(17),
+            OpCode::StoreArrayElem(18),
+            OpCode::IncrVar(19, -20),
+            OpCode::IncrVarPop(21, 22),
+            OpCode::IncrLocal(23, -24),
+            OpCode::IncrLocalPop(25, 26),
+            OpCode::AppendVar(27),
+            OpCode::UnsetVar(28),
+            OpCode::VarExists(29),
+            OpCode::PushFrame(30),
+            OpCode::PopFrame,
+            OpCode::UpVar { level: 31, src: 32, dst: 33 },
+            OpCode::Global(34),
+            OpCode::Jump(35),
+            OpCode::JumpTrue(36),
+            OpCode::JumpFalse(37),
+            OpCode::LoopEnter { cont: 38, brk: 39 },
+            OpCode::LoopExit,
+            OpCode::ForeachStart { info: 40, next: 41, end: 42 },
+            OpCode::ForeachNext { info: 43, body: 44 },
+            OpCode::ForeachCollect,
+            OpCode::ForeachEnd,
+            OpCode::Break,
+            OpCode::Continue,
+            OpCode::Return,
+            OpCode::ReturnCode(45),
+            OpCode::Exit(3),
+            OpCode::Add,
+            OpCode::Sub,
+            OpCode::LappendLocal(46),
+            OpCode::LappendVar(47),
+            OpCode::LappendVarVar(48, 49),
+            OpCode::LappendSlotSlot(50, 51),
+            OpCode::BodyMarkFramed,
+            OpCode::AddSlotSlot(52, 53),
+            OpCode::AddSlotImm(54, -55),
+            OpCode::CmpSlotSlot(56, 57, 2),
+            OpCode::CmpSlotImm(58, -59, 4),
+            OpCode::AddVarVar(60, 61),
+            OpCode::AddVarImm(62, -63),
+            OpCode::CmpVarVar(64, 65, 1),
+            OpCode::CmpVarImm(66, -67, 5),
+            OpCode::CmpSlotSlotJumpTrue(68, 69, 3, 70),
+            OpCode::CmpSlotSlotJumpFalse(71, 72, 0, 73),
+            OpCode::CmpSlotImmJumpTrue(74, -75, 2, 76),
+            OpCode::CmpSlotImmJumpFalse(77, -78, 4, 79),
+            OpCode::CmpVarVarJumpTrue(80, 81, 1, 82),
+            OpCode::CmpVarVarJumpFalse(83, 84, 5, 85),
+            OpCode::CmpVarImmJumpTrue(86, -87, 0, 88),
+            OpCode::CmpVarImmJumpFalse(89, -90, 3, 91),
+            OpCode::Mul,
+            OpCode::Div,
+            OpCode::Mod,
+            OpCode::Pow,
+            OpCode::Neg,
+            OpCode::Eq,
+            OpCode::Ne,
+            OpCode::Lt,
+            OpCode::Gt,
+            OpCode::Le,
+            OpCode::Ge,
+            OpCode::StrEq,
+            OpCode::StrNe,
+            OpCode::And,
+            OpCode::Or,
+            OpCode::Not,
+            OpCode::BitAnd,
+            OpCode::BitOr,
+            OpCode::BitXor,
+            OpCode::BitNot,
+            OpCode::Shl,
+            OpCode::Shr,
+            OpCode::Concat(92),
+            OpCode::MakeList(93),
+            OpCode::ListAppend,
+            OpCode::ListIndex,
+            OpCode::ListLength,
+            OpCode::StrLen,
+            OpCode::StrIndex,
+            OpCode::ExpandList,
+            OpCode::ExpandMark,
+            OpCode::Call { cmd_id: 94, argc: 95 },
+            OpCode::CallExpand { cmd_id: 96, argc: 97 },
+            OpCode::DynCall { argc: 98 },
+            OpCode::DynCallExpand { argc: 99 },
+            OpCode::CallProc { proc_id: 100, argc: 101 },
+            OpCode::TailCallProc { proc_id: 102, argc: 103 },
+            OpCode::EvalScript,
+            OpCode::EvalExpr,
+            OpCode::CatchStart(104),
+            OpCode::CatchEnd,
+            OpCode::Line(105),
+            OpCode::BeginCmd(106),
+            OpCode::BeginCmdSubMark(107),
+            OpCode::ExprMarkBeginCmd(108),
+            OpCode::BeginCmdPushConst(109, 110),
+            OpCode::SubEndStoreLocalPop(111),
+            OpCode::SubEndStoreVarPop(112),
+            OpCode::SubEndReturn,
+            OpCode::SwapToNextMark,
+            OpCode::NextMarkBeginCmd(113),
+            OpCode::BeginCmdIncrLocalPop(114, 115, -116),
+            OpCode::BeginCmdIncrVarPop(117, 118, -119),
+            OpCode::ForNextIncrLocal(120, 121, -122, 123),
+            OpCode::ForNextIncrVar(124, 125, -126, 127),
+            OpCode::ForeachNextClose(128, 129),
+            OpCode::SlotSetAddSS { set_site: 130, expr_site: 131, a: 132, b: 133, dst: 134 },
+            OpCode::VarSetAddVV { set_site: 135, expr_site: 136, a: 137, b: 138, dst: 139 },
+            OpCode::PushConstSubMark(140),
+            OpCode::SubMarkBeginCmd(141),
+            OpCode::ExprMarkBeginPushConst(142, 143),
+            OpCode::SubSlotImm(144, -145),
+            OpCode::SubSlotSlot(146, 147),
+            OpCode::SubEndDynCall(148),
+            OpCode::SubEndCall { cmd_id: 149, argc: 150 },
+            OpCode::SubEndAdd,
+            OpCode::IncrVarStack(151),
+            OpCode::SubEndIncrVarStack(152),
+            OpCode::IncrLocalStack(153),
+            OpCode::SubEndIncrLocalStack(154),
+            OpCode::BodyMark,
+            OpCode::NextMark,
+            OpCode::SubMark,
+            OpCode::SubEnd,
+            OpCode::ExprMark,
+            OpCode::Nop,
+        
+        ];
+        let golden: &[&str] = &[
+            "FUSED|false|PUSH_CONST 7",
+            "  EXP|0|PUSH_CONST 7",
+            "FUSED|false|PUSH_CONST_WIDE [70001]",
+            "  EXP|0|PUSH_CONST_WIDE [70001]",
+            "FUSED|false|PUSH_EMPTY",
+            "  EXP|0|PUSH_EMPTY",
+            "FUSED|false|PUSH_INT -5",
+            "  EXP|0|PUSH_INT -5",
+            "FUSED|false|PUSH_FLOAT 1.5",
+            "  EXP|0|PUSH_FLOAT 1.5",
+            "FUSED|false|PUSH_TRUE",
+            "  EXP|0|PUSH_TRUE",
+            "FUSED|false|PUSH_FALSE",
+            "  EXP|0|PUSH_FALSE",
+            "FUSED|false|POP",
+            "  EXP|0|POP",
+            "FUSED|false|DUP",
+            "  EXP|0|DUP",
+            "FUSED|false|LOAD_VAR 11",
+            "  EXP|0|LOAD_VAR 11",
+            "FUSED|false|STORE_VAR 12",
+            "  EXP|0|STORE_VAR 12",
+            "FUSED|false|STORE_VAR_POP 13",
+            "  EXP|0|STORE_VAR_POP 13",
+            "FUSED|false|LOAD_LOCAL 14",
+            "  EXP|0|LOAD_LOCAL 14",
+            "FUSED|false|STORE_LOCAL 15",
+            "  EXP|0|STORE_LOCAL 15",
+            "FUSED|true|STORE_LOCAL_POP 16",
+            "  EXP|0|STORE_LOCAL 16",
+            "  EXP|1|POP",
+            "FUSED|false|LOAD_ARRAY_ELEM 17",
+            "  EXP|0|LOAD_ARRAY_ELEM 17",
+            "FUSED|false|STORE_ARRAY_ELEM 18",
+            "  EXP|0|STORE_ARRAY_ELEM 18",
+            "FUSED|false|INCR_VAR 19 -20",
+            "  EXP|0|INCR_VAR 19 -20",
+            "FUSED|true|INCR_VAR_POP 21 22",
+            "  EXP|0|INCR_VAR 21 22",
+            "  EXP|1|POP",
+            "FUSED|false|INCR_LOCAL 23 -24",
+            "  EXP|0|INCR_LOCAL 23 -24",
+            "FUSED|true|INCR_LOCAL_POP 25 26",
+            "  EXP|0|INCR_LOCAL 25 26",
+            "  EXP|1|POP",
+            "FUSED|false|APPEND_VAR 27",
+            "  EXP|0|APPEND_VAR 27",
+            "FUSED|false|UNSET_VAR 28",
+            "  EXP|0|UNSET_VAR 28",
+            "FUSED|false|VAR_EXISTS 29",
+            "  EXP|0|VAR_EXISTS 29",
+            "FUSED|false|PUSH_FRAME 30",
+            "  EXP|0|PUSH_FRAME 30",
+            "FUSED|false|POP_FRAME",
+            "  EXP|0|POP_FRAME",
+            "FUSED|false|UPVAR level=31 src=32 dst=33",
+            "  EXP|0|UPVAR level=31 src=32 dst=33",
+            "FUSED|false|GLOBAL 34",
+            "  EXP|0|GLOBAL 34",
+            "FUSED|false|JUMP 35",
+            "  EXP|0|JUMP 35",
+            "FUSED|false|JUMP_TRUE 36",
+            "  EXP|0|JUMP_TRUE 36",
+            "FUSED|false|JUMP_FALSE 37",
+            "  EXP|0|JUMP_FALSE 37",
+            "FUSED|false|LOOP_ENTER cont=38 brk=39",
+            "  EXP|0|LOOP_ENTER cont=38 brk=39",
+            "FUSED|false|LOOP_EXIT",
+            "  EXP|0|LOOP_EXIT",
+            "FUSED|false|FOREACH_START info=40 next=41 end=42",
+            "  EXP|0|FOREACH_START info=40 next=41 end=42",
+            "FUSED|false|FOREACH_NEXT info=43 body=44",
+            "  EXP|0|FOREACH_NEXT info=43 body=44",
+            "FUSED|false|FOREACH_COLLECT",
+            "  EXP|0|FOREACH_COLLECT",
+            "FUSED|false|FOREACH_END",
+            "  EXP|0|FOREACH_END",
+            "FUSED|false|BREAK",
+            "  EXP|0|BREAK",
+            "FUSED|false|CONTINUE",
+            "  EXP|0|CONTINUE",
+            "FUSED|false|RETURN",
+            "  EXP|0|RETURN",
+            "FUSED|false|RETURN_CODE 45",
+            "  EXP|0|RETURN_CODE 45",
+            "FUSED|false|EXIT 3",
+            "  EXP|0|EXIT 3",
+            "FUSED|false|ADD",
+            "  EXP|0|ADD",
+            "FUSED|false|SUB",
+            "  EXP|0|SUB",
+            "FUSED|false|LAPPEND_L 46",
+            "  EXP|0|LAPPEND_L 46",
+            "FUSED|false|LAPPEND_V 47",
+            "  EXP|0|LAPPEND_V 47",
+            "FUSED|true|LAPPEND_VV 48 49",
+            "  EXP|0|LOAD_VAR 48",
+            "  EXP|1|LAPPEND_V 49",
+            "  EXP|2|POP",
+            "FUSED|true|LAPPEND_SS 50 51",
+            "  EXP|0|LOAD_LOCAL 50",
+            "  EXP|1|LAPPEND_L 51",
+            "  EXP|2|POP",
+            "FUSED|false|BODY_MARK_FRAMED",
+            "  EXP|0|BODY_MARK_FRAMED",
+            "FUSED|false|ADD_SS 52 53",
+            "  EXP|0|ADD_SS 52 53",
+            "FUSED|false|ADD_SI 54 -55",
+            "  EXP|0|ADD_SI 54 -55",
+            "FUSED|false|CMP_SS 56 57 cc=2",
+            "  EXP|0|CMP_SS 56 57 cc=2",
+            "FUSED|false|CMP_SI 58 -59 cc=4",
+            "  EXP|0|CMP_SI 58 -59 cc=4",
+            "FUSED|true|ADD_VV 60 61",
+            "  EXP|0|LOAD_VAR 60",
+            "  EXP|1|LOAD_VAR 61",
+            "  EXP|2|ADD",
+            "FUSED|true|ADD_VI 62 -63",
+            "  EXP|0|LOAD_VAR 62",
+            "  EXP|1|PUSH_INT -63",
+            "  EXP|2|ADD",
+            "FUSED|true|CMP_VV 64 65 cc=1",
+            "  EXP|0|LOAD_VAR 64",
+            "  EXP|1|LOAD_VAR 65",
+            "  EXP|2|GT",
+            "FUSED|true|CMP_VI 66 -67 cc=5",
+            "  EXP|0|LOAD_VAR 66",
+            "  EXP|1|PUSH_INT -67",
+            "  EXP|2|NE",
+            "FUSED|true|CMP_SS_JT 68 69 cc=3 -> 70",
+            "  EXP|0|CMP_SS 68 69 cc=3",
+            "  EXP|1|JUMP_TRUE 2",
+            "FUSED|true|CMP_SS_JF 71 72 cc=0 -> 73",
+            "  EXP|0|CMP_SS 71 72 cc=0",
+            "  EXP|1|JUMP_FALSE 2",
+            "FUSED|true|CMP_SI_JT 74 -75 cc=2 -> 76",
+            "  EXP|0|CMP_SI 74 -75 cc=2",
+            "  EXP|1|JUMP_TRUE 2",
+            "FUSED|true|CMP_SI_JF 77 -78 cc=4 -> 79",
+            "  EXP|0|CMP_SI 77 -78 cc=4",
+            "  EXP|1|JUMP_FALSE 2",
+            "FUSED|true|CMP_VV_JT 80 81 cc=1 -> 82",
+            "  EXP|0|LOAD_VAR 80",
+            "  EXP|1|LOAD_VAR 81",
+            "  EXP|2|GT",
+            "  EXP|3|JUMP_TRUE 4",
+            "FUSED|true|CMP_VV_JF 83 84 cc=5 -> 85",
+            "  EXP|0|LOAD_VAR 83",
+            "  EXP|1|LOAD_VAR 84",
+            "  EXP|2|NE",
+            "  EXP|3|JUMP_FALSE 4",
+            "FUSED|true|CMP_VI_JT 86 -87 cc=0 -> 88",
+            "  EXP|0|LOAD_VAR 86",
+            "  EXP|1|PUSH_INT -87",
+            "  EXP|2|LT",
+            "  EXP|3|JUMP_TRUE 4",
+            "FUSED|true|CMP_VI_JF 89 -90 cc=3 -> 91",
+            "  EXP|0|LOAD_VAR 89",
+            "  EXP|1|PUSH_INT -90",
+            "  EXP|2|GE",
+            "  EXP|3|JUMP_FALSE 4",
+            "FUSED|false|MUL",
+            "  EXP|0|MUL",
+            "FUSED|false|DIV",
+            "  EXP|0|DIV",
+            "FUSED|false|MOD",
+            "  EXP|0|MOD",
+            "FUSED|false|POW",
+            "  EXP|0|POW",
+            "FUSED|false|NEG",
+            "  EXP|0|NEG",
+            "FUSED|false|EQ",
+            "  EXP|0|EQ",
+            "FUSED|false|NE",
+            "  EXP|0|NE",
+            "FUSED|false|LT",
+            "  EXP|0|LT",
+            "FUSED|false|GT",
+            "  EXP|0|GT",
+            "FUSED|false|LE",
+            "  EXP|0|LE",
+            "FUSED|false|GE",
+            "  EXP|0|GE",
+            "FUSED|false|STR_EQ",
+            "  EXP|0|STR_EQ",
+            "FUSED|false|STR_NE",
+            "  EXP|0|STR_NE",
+            "FUSED|false|AND",
+            "  EXP|0|AND",
+            "FUSED|false|OR",
+            "  EXP|0|OR",
+            "FUSED|false|NOT",
+            "  EXP|0|NOT",
+            "FUSED|false|BIT_AND",
+            "  EXP|0|BIT_AND",
+            "FUSED|false|BIT_OR",
+            "  EXP|0|BIT_OR",
+            "FUSED|false|BIT_XOR",
+            "  EXP|0|BIT_XOR",
+            "FUSED|false|BIT_NOT",
+            "  EXP|0|BIT_NOT",
+            "FUSED|false|SHL",
+            "  EXP|0|SHL",
+            "FUSED|false|SHR",
+            "  EXP|0|SHR",
+            "FUSED|false|CONCAT 92",
+            "  EXP|0|CONCAT 92",
+            "FUSED|false|MAKE_LIST 93",
+            "  EXP|0|MAKE_LIST 93",
+            "FUSED|false|LIST_APPEND",
+            "  EXP|0|LIST_APPEND",
+            "FUSED|false|LIST_INDEX",
+            "  EXP|0|LIST_INDEX",
+            "FUSED|false|LIST_LENGTH",
+            "  EXP|0|LIST_LENGTH",
+            "FUSED|false|STR_LEN",
+            "  EXP|0|STR_LEN",
+            "FUSED|false|STR_INDEX",
+            "  EXP|0|STR_INDEX",
+            "FUSED|false|EXPAND_LIST",
+            "  EXP|0|EXPAND_LIST",
+            "FUSED|false|EXPAND_MARK",
+            "  EXP|0|EXPAND_MARK",
+            "FUSED|false|CALL cmd=94 argc=95",
+            "  EXP|0|CALL cmd=94 argc=95",
+            "FUSED|false|CALL_EXPAND cmd=96 argc=97",
+            "  EXP|0|CALL_EXPAND cmd=96 argc=97",
+            "FUSED|false|DYNCALL argc=98",
+            "  EXP|0|DYNCALL argc=98",
+            "FUSED|false|DYNCALL_EXPAND argc=99",
+            "  EXP|0|DYNCALL_EXPAND argc=99",
+            "FUSED|false|CALL_PROC proc=100 argc=101",
+            "  EXP|0|CALL_PROC proc=100 argc=101",
+            "FUSED|false|TAIL_CALL_PROC proc=102 argc=103",
+            "  EXP|0|TAIL_CALL_PROC proc=102 argc=103",
+            "FUSED|false|EVAL_SCRIPT",
+            "  EXP|0|EVAL_SCRIPT",
+            "FUSED|false|EVAL_EXPR",
+            "  EXP|0|EVAL_EXPR",
+            "FUSED|false|CATCH_START 104",
+            "  EXP|0|CATCH_START 104",
+            "FUSED|false|CATCH_END",
+            "  EXP|0|CATCH_END",
+            "FUSED|false|LINE 105",
+            "  EXP|0|LINE 105",
+            "FUSED|false|BEGIN_CMD 106",
+            "  EXP|0|BEGIN_CMD 106",
+            "FUSED|true|BEGIN_CMD_SUB 107",
+            "  EXP|0|BEGIN_CMD 107",
+            "  EXP|1|SUB_MARK",
+            "FUSED|true|EXPR_MARK_BEGIN 108",
+            "  EXP|0|EXPR_MARK",
+            "  EXP|1|BEGIN_CMD 108",
+            "FUSED|true|BEGIN_CMD_PUSH_CONST 109 110",
+            "  EXP|0|BEGIN_CMD 109",
+            "  EXP|1|PUSH_CONST 110",
+            "FUSED|true|SUB_END_STORE_L_POP 111",
+            "  EXP|0|SUB_END",
+            "  EXP|1|STORE_LOCAL 111",
+            "  EXP|2|POP",
+            "FUSED|true|SUB_END_STORE_V_POP 112",
+            "  EXP|0|SUB_END",
+            "  EXP|1|STORE_VAR_POP 112",
+            "FUSED|true|SUB_END_RETURN",
+            "  EXP|0|SUB_END",
+            "  EXP|1|RETURN",
+            "FUSED|true|SWAP_TO_NEXT_MARK",
+            "  EXP|0|NOP",
+            "  EXP|1|NEXT_MARK",
+            "FUSED|true|NEXT_MARK_BEGIN_CMD 113",
+            "  EXP|0|NEXT_MARK",
+            "  EXP|1|BEGIN_CMD 113",
+            "FUSED|true|BEGIN_CMD_INCR_L_POP 114 115 -116",
+            "  EXP|0|BEGIN_CMD 114",
+            "  EXP|1|INCR_LOCAL 115 -116",
+            "  EXP|2|POP",
+            "FUSED|true|BEGIN_CMD_INCR_V_POP 117 118 -119",
+            "  EXP|0|BEGIN_CMD 117",
+            "  EXP|1|INCR_VAR 118 -119",
+            "  EXP|2|POP",
+            "FUSED|true|FOR_NEXT_INCR_L 120 121 -122 -> 123",
+            "  EXP|0|NOP",
+            "  EXP|1|NEXT_MARK",
+            "  EXP|2|BEGIN_CMD 120",
+            "  EXP|3|INCR_LOCAL 121 -122",
+            "  EXP|4|POP",
+            "  EXP|5|JUMP 6",
+            "FUSED|true|FOR_NEXT_INCR_V 124 125 -126 -> 127",
+            "  EXP|0|NOP",
+            "  EXP|1|NEXT_MARK",
+            "  EXP|2|BEGIN_CMD 124",
+            "  EXP|3|INCR_VAR 125 -126",
+            "  EXP|4|POP",
+            "  EXP|5|JUMP 6",
+            "FUSED|true|FOREACH_NEXT_CLOSE 128 -> 129",
+            "  EXP|0|NOP",
+            "  EXP|1|FOREACH_NEXT info=128 body=2",
+            "FUSED|true|SET_SS_ADD 130 131 132 133 -> 134",
+            "  EXP|0|BEGIN_CMD 130",
+            "  EXP|1|SUB_MARK",
+            "  EXP|2|BEGIN_CMD 131",
+            "  EXP|3|ADD_SS 132 133",
+            "  EXP|4|SUB_END",
+            "  EXP|5|STORE_LOCAL 134",
+            "  EXP|6|POP",
+            "FUSED|true|SET_VV_ADD 135 136 137 138 -> 139",
+            "  EXP|0|BEGIN_CMD 135",
+            "  EXP|1|SUB_MARK",
+            "  EXP|2|BEGIN_CMD 136",
+            "  EXP|3|LOAD_VAR 137",
+            "  EXP|4|LOAD_VAR 138",
+            "  EXP|5|ADD",
+            "  EXP|6|SUB_END",
+            "  EXP|7|STORE_VAR_POP 139",
+            "FUSED|true|PUSH_CONST_SUB 140",
+            "  EXP|0|PUSH_CONST 140",
+            "  EXP|1|SUB_MARK",
+            "FUSED|true|SUB_MARK_BEGIN 141",
+            "  EXP|0|SUB_MARK",
+            "  EXP|1|BEGIN_CMD 141",
+            "FUSED|true|EXPR_MARK_BEGIN_PUSH 142 143",
+            "  EXP|0|EXPR_MARK",
+            "  EXP|1|BEGIN_CMD 142",
+            "  EXP|2|PUSH_CONST 143",
+            "FUSED|true|SUB_SI 144 -145",
+            "  EXP|0|LOAD_LOCAL 144",
+            "  EXP|1|PUSH_INT -145",
+            "  EXP|2|SUB",
+            "FUSED|true|SUB_SS 146 147",
+            "  EXP|0|LOAD_LOCAL 146",
+            "  EXP|1|LOAD_LOCAL 147",
+            "  EXP|2|SUB",
+            "FUSED|true|SUB_END_DYNCALL 148",
+            "  EXP|0|SUB_END",
+            "  EXP|1|DYNCALL argc=148",
+            "FUSED|true|SUB_END_CALL 149 150",
+            "  EXP|0|SUB_END",
+            "  EXP|1|CALL cmd=149 argc=150",
+            "FUSED|true|SUB_END_ADD",
+            "  EXP|0|SUB_END",
+            "  EXP|1|ADD",
+            "FUSED|false|INCR_V_STACK 151",
+            "  EXP|0|INCR_V_STACK 151",
+            "FUSED|true|SUB_END_INCR_V_STACK 152",
+            "  EXP|0|SUB_END",
+            "  EXP|1|INCR_V_STACK 152",
+            "FUSED|false|INCR_L_STACK 153",
+            "  EXP|0|INCR_L_STACK 153",
+            "FUSED|true|SUB_END_INCR_L_STACK 154",
+            "  EXP|0|SUB_END",
+            "  EXP|1|INCR_L_STACK 154",
+            "FUSED|false|BODY_MARK",
+            "  EXP|0|BODY_MARK",
+            "FUSED|false|NEXT_MARK",
+            "  EXP|0|NEXT_MARK",
+            "FUSED|false|SUB_MARK",
+            "  EXP|0|SUB_MARK",
+            "FUSED|false|SUB_END",
+            "  EXP|0|SUB_END",
+            "FUSED|false|EXPR_MARK",
+            "  EXP|0|EXPR_MARK",
+            "FUSED|false|NOP",
+            "  EXP|0|NOP",
+        ];
+        let mut lines: Vec<String> = Vec::new();
+        for op in census {
+            let mut c = ByteCode::new();
+            c.emit(op.clone(), 0);
+            lines.push(format!("FUSED|{}|{}", c.has_fused_ops(), op));
+            let u = c.unfused();
+            for (i, uo) in u.ops().iter().enumerate() {
+                lines.push(format!("  EXP|{}|{}", i, uo));
+            }
+        }
+        let want: Vec<&str> = golden.to_vec();
+        assert_eq!(lines.len(), want.len(), "golden line count drifted");
+        for (got, want) in lines.iter().zip(want) {
+            assert_eq!(got, want, "unfused expansion drifted");
+        }
+    }

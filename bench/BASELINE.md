@@ -2875,3 +2875,13 @@ B2（exec 宿主路径/file/HTTP/大小守卫）：见 BASELINE 2026-11-26 B2 �
   mathop 单操作数词形未钉、wasm crash-wasm 50/52（string repeat/
   lrepeat 2^32 TRAP 为 wave2 基线既有 S21 wasm 面，见 BASELINE B2 节
   与 TODO）。
+
+### D2 合并解回归与修复（vm_exec 递归门，2026-11-27）
+
+D2 合并（3545ffe）的 vm_exec 解取 D2 侧时回退了 B1 的 C39 递归门
+`>=`（D2 分支基线 b6e674c 早于 c4e4029）——递归边界晚一帧：c39
+probe VM=999 vs tree/oracle=998，sweep 13（12 既有 + 该探针）。已修
+复（`>=` 恢复，probe 双引擎 998 与 oracle 一致，sweep 回 12）。教训：
+跨分支合并解时，对含行为语义的小 hunk（门比较式）要逐个 diff 核对，
+不能只看冲突区域——自动合并也可能因基线差丢 hunk。objquad.tcl 墙钟
+断言同批容差化（与 objsec 同款）。

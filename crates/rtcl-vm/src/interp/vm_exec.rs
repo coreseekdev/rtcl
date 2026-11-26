@@ -3091,7 +3091,7 @@ fn op_begin_cmd(
     st: &mut VmState,
     site_idx: u32,
 ) -> Result<()> {
-    if interp.call_depth > interp.max_call_depth {
+    if interp.call_depth >= interp.max_call_depth {
         return Err(Error::recursion_limit());
     }
     let site = &code.sites[site_idx as usize];

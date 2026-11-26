@@ -165,6 +165,12 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "json::decode", func: json::cmd_json_decode,    cat: Extension, cmd_id: None, usage: "?-index? ?-null string? ?-schema? json-string", help: "Decode JSON to Tcl value" },
     #[cfg(feature = "json")]
     CmdEntry { name: "json::encode", func: json::cmd_json_encode,    cat: Extension, cmd_id: None, usage: "value ?schema?",             help: "Encode Tcl value to JSON" },
+    // ── 9.1 新增数学命令（TIP 521/745；tclBasic.c 的 builtin 注册面）──
+    CmdEntry { name: "divmod",     func: fpmath::cmd_divmod,     cat: Standard, cmd_id: None, usage: "dividend divisor", help: "Integer division: {quotient remainder} list" },
+    CmdEntry { name: "fpclassify", func: fpmath::cmd_fpclassify, cat: Standard, cmd_id: None, usage: "floatValue",       help: "Floating point classification word" },
+    CmdEntry { name: "frexp",      func: fpmath::cmd_frexp,      cat: Standard, cmd_id: None, usage: "floatValue",       help: "Split float into {fraction exponent}" },
+    CmdEntry { name: "modf",       func: fpmath::cmd_modf,       cat: Standard, cmd_id: None, usage: "floatValue",       help: "Split float into {integer fraction} parts" },
+    CmdEntry { name: "remquo",     func: fpmath::cmd_remquo,     cat: Standard, cmd_id: None, usage: "dividend divisor", help: "IEEE remainder and quadrant bits" },
 ];
 
 

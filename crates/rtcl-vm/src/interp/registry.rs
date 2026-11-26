@@ -89,6 +89,9 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "lassign",   func: list::cmd_lassign,       cat: Standard, cmd_id: Some(CmdId::Lassign   as u16),   usage: "list ?varName ...?",               help: "Assign list elements to variables" },
     CmdEntry { name: "lrepeat",   func: list::cmd_lrepeat,       cat: Standard, cmd_id: Some(CmdId::Lrepeat   as u16),   usage: "count ?value ...?",              help: "Build a list by repetition" },
     CmdEntry { name: "lreverse",  func: list::cmd_lreverse,      cat: Standard, cmd_id: Some(CmdId::Lreverse  as u16),   usage: "list",                             help: "Reverse a list" },
+    // lseq — TIP 746 (tclsh 9.1): pure numeric series; args decode per
+    // tclCmdIL.c Tcl_LseqObjCmd, math per tclArithSeries.c.
+    CmdEntry { name: "lseq",      func: list::cmd_lseq,          cat: Standard, cmd_id: None,                            usage: "start ?(..|to)? end ??by? step?",  help: "Build a numeric sequence" },
     CmdEntry { name: "concat",    func: list::cmd_concat,        cat: Standard, cmd_id: Some(CmdId::Concat    as u16),   usage: "?arg ...?",                        help: "Concatenate arguments" },
     CmdEntry { name: "split",     func: list::cmd_split,         cat: Standard, cmd_id: Some(CmdId::Split     as u16),   usage: "string ?splitChars?",              help: "Split a string into a list" },
     CmdEntry { name: "join",      func: list::cmd_join,          cat: Standard, cmd_id: Some(CmdId::Join      as u16),   usage: "list ?joinString?",                help: "Join list elements into a string" },

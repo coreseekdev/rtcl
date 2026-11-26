@@ -730,6 +730,494 @@ pub fn cmd_lfilter(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::from_list(&collected))
 }
 
+/// lseq — numeric series (tclsh 9.1, TIP 746: no expr evaluation; the
+/// arguments decode per tclCmdIL.c `Tcl_LseqObjCmd`'s arg_key state
+/// machine, the math per tclArithSeries.c).
+pub fn cmd_lseq(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    use crate::types::bignum::{int_rep, IntRep};
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Op {
+        Dots,
+        To,
+        Count,
+        By,
+    }
+    #[derive(Clone, Copy)]
+    enum Num {
+        Int(i64),
+        Big,
+        Dbl(f64),
+    }
+
+    let wrong = |interp: &mut Interp| -> Error {
+        set_error_code(interp, "TCL WRONGARGS");
+        wrong_args("lseq", "n ??op? n ??by? n??")
+    };
+    // Tcl_GetNumberFromObj's view of a value: integer (i64/big), double,
+    // or none. Booleans are not numbers here.
+    fn as_number(v: &Value) -> Option<Num> {
+        if let Some(rep) = int_rep(v) {
+            return Some(match rep {
+                IntRep::I64(i) => Num::Int(i),
+                IntRep::Big(_) => Num::Big,
+            });
+        }
+        v.as_float().map(Num::Dbl)
+    }
+    let num_as_f64 = |n: Num| -> f64 {
+        match n {
+            Num::Int(i) => i as f64,
+            Num::Big => f64::NAN, // bignum: unsupported (C errors via GetWideInt)
+            Num::Dbl(d) => d,
+        }
+    };
+
+    // ── Decode ──────────────────────────────────────────────────────────
+    if args.len() > 6 {
+        return Err(wrong(interp));
+    }
+    // allowedArgs bit flags, mirroring the C decode loop.
+    const NUMERIC: u8 = 1;
+    const RANGE_KW: u8 = 2;
+
+    let objc = args.len(); // includes "lseq"
+    let mut arg_key: u32 = 0;
+    let mut nums: Vec<(Value, Num)> = Vec::new(); // numeric args + kind
+    let mut op_values: Vec<Op> = Vec::new(); // keyword arg opcodes
+    let mut use_doubles = 0usize;
+    let mut rem_nums = 3i32;
+    let mut allowed = NUMERIC;
+
+    for i in 1..objc {
+        arg_key = arg_key.wrapping_mul(10);
+        let v = &args[i];
+        let is_last = i == objc - 1;
+        if allowed & NUMERIC != 0 {
+            if let Some(n) = as_number(v) {
+                rem_nums -= 1;
+                arg_key += 1;
+                allowed = RANGE_KW;
+                if rem_nums != 1 || (objc - 1 - i) != 2 {
+                    allowed |= NUMERIC;
+                }
+                if matches!(n, Num::Dbl(_)) {
+                    use_doubles += 1;
+                }
+                nums.push((v.clone(), n));
+                continue;
+            }
+        }
+        if allowed & RANGE_KW != 0 {
+            // tclsh's abbreviation lookup is not deterministic across
+            // invocation shapes (internal index-rep caching quirk); the
+            // manual and the corpus spell the operators out, so exact
+            // match only.
+            let op = match v.as_str() {
+                ".." => Some(Op::Dots),
+                "to" => Some(Op::To),
+                "count" => Some(Op::Count),
+                "by" => Some(Op::By),
+                _ => None,
+            };
+            if let Some(op) = op {
+                if is_last {
+                    return Err(tcl_err(format!("missing \"{}\" value.", v.as_str())));
+                }
+                arg_key += 2;
+                allowed = NUMERIC;
+                op_values.push(op);
+                continue;
+            }
+        }
+        if allowed & NUMERIC == 0 {
+            // NoneArg: report through the operation table (tclCmdIL.c
+            // calls Tcl_GetIndexFromObj with msg "operation").
+            set_error_code(interp, "TCL LOOKUP INDEX operation");
+            return Err(tcl_err(format!(
+                "bad operation \"{}\": must be .., to, count, or by",
+                v.as_str()
+            )));
+        }
+        // ErrArg: numeric was allowed but the value is not a number
+        // (Tcl_GetNumberFromObj's error, TCL VALUE NUMBER).
+        set_error_code(interp, "TCL VALUE NUMBER");
+        return Err(tcl_err(format!("expected number but got \"{}\"", v.as_str())));
+    }
+
+    // ── Shape dispatch (arg_key) ────────────────────────────────────────
+    let mut start: Option<Value> = None;
+    let mut end: Option<Value> = None;
+    let mut step: Option<Value> = None;
+    let mut count: Option<Value> = None;
+    let nth = |nums: &mut Vec<(Value, Num)>, i: usize| -> Option<Value> {
+        nums.get(i).map(|(v, _)| v.clone())
+    };
+    let num_at = |nums: &[(Value, Num)], v: &Option<Value>| -> Option<Num> {
+        let v = v.as_ref()?;
+        nums.iter().find(|(val, _)| val.same_allocation(v)).map(|(_, n)| *n)
+    };
+    match arg_key {
+        1 => {
+            // lseq n — integers only ("3.0" converts, "3.1" errors)
+            start = Some(Value::from_int(0));
+            count = nth(&mut nums, 0);
+            use_doubles = 0;
+        }
+        11 => {
+            start = nth(&mut nums, 0);
+            end = nth(&mut nums, 1);
+        }
+        111 => {
+            start = nth(&mut nums, 0);
+            end = nth(&mut nums, 1);
+            step = nth(&mut nums, 2);
+        }
+        121 => {
+            let first = nth(&mut nums, 0);
+            let third = nth(&mut nums, 1);
+            match op_values[0] {
+                Op::Dots | Op::To => {
+                    start = first;
+                    end = third;
+                }
+                Op::By => {
+                    start = Some(Value::from_int(0));
+                    count = first;
+                    step = third;
+                }
+                Op::Count => {
+                    start = first;
+                    count = third;
+                }
+            }
+        }
+        1211 => {
+            let first = nth(&mut nums, 0);
+            let third = nth(&mut nums, 1);
+            let fourth = nth(&mut nums, 2);
+            match op_values[0] {
+                Op::Dots | Op::To => {
+                    start = first;
+                    end = third;
+                    step = fourth;
+                }
+                Op::Count => {
+                    start = first;
+                    count = third;
+                    step = fourth;
+                }
+                _ => return Err(wrong(interp)),
+            }
+        }
+        1121 => {
+            start = nth(&mut nums, 0);
+            end = nth(&mut nums, 1);
+            let fourth = nth(&mut nums, 2);
+            if op_values[0] != Op::By {
+                return Err(wrong(interp));
+            }
+            step = fourth;
+        }
+        12121 => {
+            let first = nth(&mut nums, 0);
+            let third = nth(&mut nums, 1);
+            let fifth = nth(&mut nums, 2);
+            if op_values[1] != Op::By {
+                return Err(wrong(interp));
+            }
+            step = fifth;
+            match op_values[0] {
+                Op::Dots | Op::To => {
+                    start = first;
+                    end = third;
+                }
+                Op::Count => {
+                    start = first;
+                    count = third;
+                }
+                Op::By => return Err(wrong(interp)),
+            }
+        }
+        _ => return Err(wrong(interp)),
+    }
+
+    // ── Count conversion (tclCmdIL.c: integral double converts; anything
+    // else fails Tcl_GetWideIntFromObj) ─────────────────────────────────
+    let mut count_val: Option<i64> = None;
+    if let Some(cv) = &count {
+        let wide = |interp: &mut Interp, v: &Value| -> Error {
+            set_error_code(interp, "TCL VALUE INTEGER");
+            tcl_err(format!("expected integer but got \"{}\"", v.as_str()))
+        };
+        count_val = Some(match num_at(&nums, &count) {
+            Some(Num::Int(i)) => i,
+            Some(Num::Big) => return Err(wide(interp, cv)),
+            Some(Num::Dbl(d)) => {
+                use_doubles = use_doubles.saturating_sub(1);
+                if d.is_finite() && d.floor() == d && d >= -(2f64.powi(63)) && d < 2f64.powi(63) {
+                    d as i64
+                } else {
+                    return Err(wide(interp, cv));
+                }
+            }
+            None => return Err(wide(interp, cv)),
+        });
+    }
+
+    // ── Extract numbers (ExtractNumber) ─────────────────────────────────
+    let use_d = use_doubles != 0;
+    let as_wide = |interp: &mut Interp, n: Num, v: &Value| -> Result<i64> {
+        match n {
+            Num::Int(i) => Ok(i),
+            Num::Big | Num::Dbl(_) => {
+                // int mode: a double truncates; out of wide range or a
+                // bignum fails GetWideIntFromObj.
+                let d = num_as_f64(n);
+                if d.is_finite() && d >= -(2f64.powi(63)) && d < 2f64.powi(63) {
+                    Ok(d as i64)
+                } else {
+                    set_error_code(interp, "TCL VALUE INTEGER");
+                    Err(tcl_err(format!("expected integer but got \"{}\"", v.as_str())))
+                }
+            }
+        }
+    };
+    let (mut istart, mut iend, mut istep) = (0i64, 0i64, 1i64);
+    let (mut dstart, mut dend, mut dstep) = (0.0f64, 0.0f64, 1.0f64);
+    let start_obj = start.clone();
+    let end_obj = end.clone();
+    let step_obj = step.clone();
+    if let Some(sv) = &step {
+        let n = num_at(&nums, &step).unwrap_or(Num::Int(1));
+        if use_d {
+            dstep = num_as_f64(n);
+        } else {
+            istep = as_wide(interp, n, sv)?;
+        }
+    }
+    if let Some(sv) = &start {
+        let n = num_at(&nums, &start).unwrap_or(Num::Int(0));
+        if use_d {
+            dstart = num_as_f64(n);
+        } else {
+            istart = as_wide(interp, n, sv)?;
+        }
+    }
+    if let Some(ev) = &end {
+        let n = num_at(&nums, &end).unwrap_or(Num::Int(0));
+        if use_d {
+            dend = num_as_f64(n);
+        } else {
+            iend = as_wide(interp, n, ev)?;
+        }
+    }
+
+    // ── Precision (ObjPrecision: fraction digits of the arg text for
+    // doubles, 0 for ints and e-notation) ────────────────────────────────
+    fn obj_precision(v: &Value) -> u32 {
+        let s = v.as_str();
+        if s.contains('e') || s.contains('E') {
+            return 0;
+        }
+        match s.find('.') {
+            Some(pos) => (s.len() - pos - 1) as u32,
+            None => 0,
+        }
+    }
+    let prec_of = |v: &Option<Value>| -> u32 { v.as_ref().map(|v| obj_precision(v)).unwrap_or(0) };
+
+    // ── Series math helpers (tclArithSeries.c) ──────────────────────────
+    let arith_round = |d: f64, n: u32| -> f64 {
+        if n == 0 {
+            return d;
+        }
+        let scale = 10f64.powi(n as i32);
+        (d * scale).round() / scale
+    };
+    let arith_len_int = |start: i64, end: i64, step: i64| -> i64 {
+        if (step < 0 && end.wrapping_sub(start) > 0)
+            || (step > 0 && end.wrapping_sub(start) < 0)
+        {
+            return 0;
+        }
+        if step == 0 {
+            return 1;
+        }
+        let len = end.wrapping_sub(start).wrapping_div(step).wrapping_add(1);
+        if len < 0 {
+            0
+        } else {
+            len
+        }
+    };
+    let arith_len_dbl =
+        |mut start: f64, mut end: f64, mut step: f64, precision: u32| -> i64 {
+            if step == 0.0 {
+                return 1;
+            }
+            if precision > 0 {
+                let scale = 10f64.powi(precision as i32);
+                start *= scale;
+                end *= scale;
+                step *= scale;
+            }
+            end -= start;
+            const WIDE_MIN_F: f64 = -9223372036854775808.0;
+            const WIDE_MAX_F: f64 = 9223372036854775808.0;
+            if (WIDE_MIN_F..=WIDE_MAX_F).contains(&end)
+                && (WIDE_MIN_F..=WIDE_MAX_F).contains(&step)
+            {
+                let iend = if end < 0.0 {
+                    (end - 0.5) as i64
+                } else {
+                    (end + 0.5) as i64
+                };
+                let istep = if step < 0.0 {
+                    (step - 0.5) as i64
+                } else {
+                    (step + 0.5) as i64
+                };
+                if istep != 0 {
+                    let ilen = iend.wrapping_div(istep).wrapping_add(1);
+                    return if ilen < 0 { 0 } else { ilen };
+                }
+            }
+            let mut len = (end / step) + 1.0;
+            // TCL_SIZE_MAX (Tcl_Size = wide in 9.1); the C cast of a value
+            // beyond i64 range lands on i64::MIN (x86-64 cvttsd2si), which
+            // NewArithSeriesDbl then treats as empty (lseq 0 1e20 -> {}).
+            if len >= 1.8446744073709552e19 {
+                len = 1.8446744073709552e19;
+            }
+            if len <= 0.0 {
+                len = 1.0;
+            }
+            if len >= 9.223372036854776e18 {
+                i64::MIN
+            } else {
+                len as i64
+            }
+        };
+
+    // ── Length ──────────────────────────────────────────────────────────
+    let mut len: i64;
+    if end_obj.is_some() {
+        if step_obj.is_none() {
+            if use_d {
+                if dstart > dend {
+                    dstep = -1.0;
+                }
+            } else if istart > iend {
+                istep = -1;
+            }
+        }
+        if count_val.is_none() {
+            if use_d {
+                if dstart.is_infinite() || dend.is_infinite() {
+                    set_error_code(interp, "TCL MEMORY");
+                    return Err(tcl_err("max length of a Tcl list exceeded"));
+                }
+                if dstart.is_nan() || dend.is_nan() {
+                    set_error_code(interp, "ARITH DOMAIN non-numeric floating-point value");
+                    return Err(tcl_err(
+                        "cannot use non-numeric floating-point value \"NaN\" to estimate length of arith-series",
+                    ));
+                }
+                let precision = prec_of(&start_obj).max(prec_of(&end_obj)).max(prec_of(&step_obj));
+                len = arith_len_dbl(dstart, dend, dstep, precision);
+            } else {
+                len = arith_len_int(istart, iend, istep);
+            }
+        } else {
+            len = count_val.unwrap_or(1);
+        }
+    } else if use_d {
+        // count form: the computed end participates in nothing further,
+        // but its precision-matched value is what tclsh caches (kept for
+        // parity of the abstract series end).
+        let precision = prec_of(&start_obj).max(prec_of(&step_obj));
+        len = count_val.unwrap_or(1);
+        if len > 0 {
+            dend = arith_round(dstart + dstep * ((len - 1) as f64), precision);
+        }
+    } else {
+        len = count_val.unwrap_or(1);
+    }
+    if len < 0 {
+        len = 0;
+    }
+
+    // ── Validation (NewArithSeriesInt's overflow checks) ────────────────
+    let invalid = |interp: &mut Interp| -> Error {
+        set_error_code(interp, "ARITH DOMAIN invalid arithmetic series parameter values");
+        tcl_err("invalid arithmetic series parameter values")
+    };
+    if !use_d && len >= 1 {
+        let num_intervals = (len - 1) as u64;
+        let abs_step: u64 = if istep >= 0 {
+            istep as u64
+        } else if istep == i64::MIN {
+            1u64 << 63
+        } else {
+            (-(istep as i128)) as u64
+        };
+        if abs_step != 0 && (u64::MAX / abs_step) < num_intervals {
+            return Err(invalid(interp));
+        }
+        let product = (abs_step as i128) * (num_intervals as i128);
+        if istep > 0 && (istart as i128) > (i64::MAX as i128) - product {
+            return Err(invalid(interp));
+        }
+        if istep == i64::MIN && (num_intervals > 0 || istart < 0) {
+            return Err(invalid(interp));
+        }
+        if istep < 0 && istep != i64::MIN && (istart as i128) < (i64::MIN as i128) + product {
+            return Err(invalid(interp));
+        }
+    }
+    if use_d && len >= 1 {
+        let d = dstart + ((len - 1) as f64) * dstep;
+        if d.is_nan() {
+            set_error_code(interp, "ARITH DOMAIN domain error: argument not in valid range");
+            return Err(tcl_err("domain error: argument not in valid range"));
+        }
+    }
+
+    // ── Materialize (rtcl has no abstract series; the corpus exercises
+    // bounded series only.  A length beyond the list guard fails instead
+    // of OOMing.) ────────────────────────────────────────────────────────
+    if len > MAX_LIST_ELEMENTS as i64 {
+        set_error_code(interp, "TCL MEMORY");
+        return Err(tcl_err(format!(
+            "max length of a Tcl list ({} elements) exceeded",
+            MAX_LIST_ELEMENTS
+        )));
+    }
+    let n = len as usize;
+    let mut out = Vec::new();
+    out.try_reserve(n)
+        .map_err(|_| out_of_memory(interp, n * core::mem::size_of::<Value>()))?;
+    if use_d {
+        let precision = prec_of(&start_obj).max(prec_of(&end_obj)).max(prec_of(&step_obj));
+        for i in 0..n {
+            let d = if i == 0 {
+                dstart
+            } else {
+                dstart + (i as f64) * dstep
+            };
+            out.push(Value::from_float(arith_round(d, precision)));
+        }
+    } else {
+        for i in 0..n {
+            out.push(Value::from_int(
+                istart.wrapping_add((i as i64).wrapping_mul(istep)),
+            ));
+        }
+    }
+    Ok(Value::from_list(&out))
+}
+
 /// lset varName ?index ...? value
 /// Set an element in a list variable.
 pub fn cmd_lset(interp: &mut Interp, args: &[Value]) -> Result<Value> {

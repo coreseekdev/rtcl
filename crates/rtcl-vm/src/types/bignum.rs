@@ -106,7 +106,9 @@ pub fn parse_int(s: &str) -> Option<IntRep> {
     // `-9223372036854775808`: the magnitude is one past i64::MAX while the
     // signed value fits (only this boundary takes the allocation).
     if neg {
-        if let Ok(v) = format!("-{digits}").parse::<i64>() {
+        // from_str_radix, not a decimal parse — the `-0x8000000000000000`
+        // boundary used to read the hex digits as decimal (-8e15).
+        if let Ok(v) = i64::from_str_radix(&format!("-{digits}"), radix) {
             return Some(IntRep::I64(v));
         }
     }

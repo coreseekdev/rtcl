@@ -1327,7 +1327,7 @@ impl Interp {
             event_queue: Vec::new(),
             copy_jobs: Vec::new(),
             #[cfg(feature = "std")]
-            next_event_id: 1,
+            next_event_id: 0,  // tclsh 9.x: after/timer ids start at after#0 (8.6 was 1-based)
             #[cfg(feature = "std")]
             clock: Rc::new(crate::host::NativeClock),
             #[cfg(feature = "std")]

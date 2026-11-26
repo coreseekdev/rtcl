@@ -122,6 +122,9 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "time",      func: loops::cmd_time,         cat: Standard, cmd_id: Some(CmdId::Time      as u16),   usage: "command ?count?",                   help: "Measure script execution time" },
     CmdEntry { name: "trace",     func: trace::cmd_trace,        cat: Standard, cmd_id: None, usage: "option ?arg ...?", help: "Register variable/command/execution traces" },
     CmdEntry { name: "timerate",  func: loops::cmd_timerate,     cat: Standard, cmd_id: Some(CmdId::Timerate  as u16),   usage: "?-direct? ?-calibrate? ?-overhead double? command ?time ?max-count??",            help: "Measure script throughput" },
+    // timer — tclsh 9.1's monotonic microsecond timer ensemble
+    // (doc/timer.n; error faces pinned in judge/probes/timer91.tcl).
+    CmdEntry { name: "timer",     func: event::cmd_timer,        cat: Standard, cmd_id: None,                            usage: "subcommand ?arg ...?",             help: "Monotonic timer events" },
     CmdEntry { name: "namespace", func: oo::cmd_namespace_entry, cat: Language,  cmd_id: Some(CmdId::Namespace as u16),  usage: "subcommand ?arg ...?",             help: "Namespace operations" },
     CmdEntry { name: "variable",  func: namespace::cmd_variable,  cat: Language,  cmd_id: Some(CmdId::Variable as u16),  usage: "?name value ...? name ?value?",    help: "Declare namespace variable" },
     // ── Extension commands (always available) ──────────────────────────────

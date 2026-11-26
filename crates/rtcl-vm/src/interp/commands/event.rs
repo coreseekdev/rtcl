@@ -251,6 +251,10 @@ fn after_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         .strip_prefix("after#")
         .and_then(|s| s.parse::<u64>().ok())
         .ok_or_else(|| {
+            super::list::set_error_code(
+                interp,
+                &format!("TCL LOOKUP EVENT {}", target),
+            );
             Error::runtime(
                 format!("event \"{}\" doesn't exist", target),
                 ErrorCode::NotFound,
@@ -260,13 +264,15 @@ fn after_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let ev = interp
         .event_queue
         .iter()
-        .find(|ev| ev.id == id)
-        .ok_or_else(|| {
-            Error::runtime(
-                format!("event \"{}\" doesn't exist", target),
-                ErrorCode::NotFound,
-            )
-        })?;
+        .find(|ev| ev.id == id);
+    if ev.is_none() {
+        super::list::set_error_code(interp, &format!("TCL LOOKUP EVENT {}", target));
+        return Err(Error::runtime(
+            format!("event \"{}\" doesn't exist", target),
+            ErrorCode::NotFound,
+        ));
+    }
+    let ev = ev.unwrap();
 
     let kind = if ev.is_idle { "idle" } else { "timer" };
     Ok(Value::from_str(&format!("{} {}", ev.script, kind)))
@@ -635,5 +641,230 @@ mod tests {
         assert!(errors[0].contains("nosuchcmd"));
         // Later events still fire after an error
         assert_eq!(interp.eval("set survived").unwrap().as_str(), "1");
+    }
+}
+
+// ── timer — 9.1's monotonic microsecond timer ensemble (doc/timer.n,
+// tclTimer.c).  Built on the after event queue (millisecond resolution);
+// the error faces are pinned on the 9.1 oracle (judge/probes/timer91.tcl).
+
+const TIMER_UNITS: [&str; 6] = ["us", "microseconds", "milliseconds", "ms", "s", "seconds"];
+
+/// Unit -> microseconds (exact wins over unique prefix; bad/ambiguous
+/// report `bad unit ... must be us, microseconds, milliseconds, ms, s,
+/// or seconds`).
+fn timer_unit_us(interp: &mut Interp, word: &str) -> Result<u64> {
+    const UNIT_LIST: &str = "us, microseconds, milliseconds, ms, s, or seconds";
+    let resolved = if TIMER_UNITS.contains(&word) {
+        match word {
+            "us" | "microseconds" => 1u64,
+            "ms" | "milliseconds" => 1_000,
+            "s" | "seconds" => 1_000_000,
+            _ => unreachable!(),
+        }
+    } else {
+        let hits: Vec<&str> =
+            TIMER_UNITS.iter().copied().filter(|u| u.starts_with(word)).collect();
+        match hits.as_slice() {
+            [one] => match *one {
+                "us" | "microseconds" => 1u64,
+                "ms" | "milliseconds" => 1_000,
+                "s" | "seconds" => 1_000_000,
+                _ => unreachable!(),
+            },
+            _ => {
+                super::list::set_error_code(
+                    interp,
+                    &format!("TCL LOOKUP INDEX unit {}", word),
+                );
+                let kind = if hits.is_empty() { "bad" } else { "ambiguous" };
+                return Err(Error::runtime(
+                    format!("{} unit \"{}\": must be {}", kind, word, UNIT_LIST),
+                    ErrorCode::Generic,
+                ));
+            }
+        }
+    };
+    Ok(resolved)
+}
+
+/// `timer in|at time unit script` — the delay in microseconds, from an
+/// integer (`expected integer but got "2x"`).
+fn timer_delay_us(interp: &mut Interp, time: &str) -> Result<u64> {
+    use crate::types::bignum::{parse_int, IntRep};
+    match parse_int(time) {
+        Some(IntRep::I64(i)) if i >= 0 => Ok(i as u64),
+        Some(IntRep::I64(_)) => {
+            super::list::set_error_code(interp, "TCL OPERATION TIMER NEGARG");
+            Err(Error::runtime(
+                "bad argument \"time\": must be non-negative integer",
+                ErrorCode::Generic,
+            ))
+        }
+        _ => {
+            super::list::set_error_code(interp, "TCL VALUE NUMBER");
+            Err(Error::runtime(
+                format!("expected integer but got \"{}\"", time),
+                ErrorCode::Generic,
+            ))
+        }
+    }
+}
+
+pub fn cmd_timer(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        return Err(Error::wrong_args_with_usage(
+            "timer",
+            2,
+            args.len(),
+            "subcommand ?arg ...?",
+        ));
+    }
+    let raw = args[1].as_str();
+    const TIMER_SUBCMDS: [&str; 6] = ["at", "cancel", "idle", "in", "info", "sleep"];
+    let sub = if TIMER_SUBCMDS.contains(&raw) {
+        raw.to_string()
+    } else {
+        let hits: Vec<&str> =
+            TIMER_SUBCMDS.iter().copied().filter(|s| s.starts_with(raw)).collect();
+        match hits.as_slice() {
+            [one] => (*one).to_string(),
+            _ => {
+                super::list::set_error_code(
+                    interp,
+                    &format!("TCL LOOKUP SUBCOMMAND {}", raw),
+                );
+                return Err(Error::runtime(
+                    format!(
+                        "unknown or ambiguous subcommand \"{}\": must be at, cancel, idle, in, info, or sleep",
+                        raw
+                    ),
+                    ErrorCode::Generic,
+                ));
+            }
+        }
+    };
+
+    let rest = &args[2..];
+    match sub.as_str() {
+        // timer in time unit script / timer at time unit script
+        "in" | "at" => {
+            if rest.len() != 3 {
+                return Err(Error::wrong_args_with_usage(
+                    "timer",
+                    0,
+                    0,
+                    format!("{} time unit script", sub),
+                ));
+            }
+            let delay_us = timer_delay_us(interp, rest[0].as_str())?;
+            let unit_us = timer_unit_us(interp, rest[1].as_str())?;
+            let script = rest[2].as_str().to_string();
+            if sub == "in" {
+                let ms = delay_us.saturating_mul(unit_us).div_ceil(1_000);
+                let id = schedule_event(interp, ms, script, false);
+                Ok(Value::from_str(&format!("after#{}", id)))
+            } else {
+                // timer at: absolute monotonic microsecond time; fire as
+                // soon as now() >= time (past times fire on the next
+                // event pass).  ms rounding mirrors the `in` form.
+                let now_us = (now_ms(interp) as u64).saturating_mul(1_000);
+                let target_us = delay_us.saturating_mul(unit_us);
+                let delta_ms = target_us.saturating_sub(now_us).div_ceil(1_000);
+                let id = schedule_event(interp, delta_ms, script, false);
+                Ok(Value::from_str(&format!("after#{}", id)))
+            }
+        }
+        // timer sleep for|until time ?unit?
+        "sleep" => {
+            if rest.len() != 2 && rest.len() != 3 {
+                return Err(Error::wrong_args_with_usage(
+                    "timer",
+                    0,
+                    0,
+                    "sleep option time ?unit?",
+                ));
+            }
+            let mode = rest[0].as_str();
+            if mode != "for" && mode != "until" {
+                super::list::set_error_code(
+                    interp,
+                    &format!("TCL LOOKUP INDEX option {}", mode),
+                );
+                return Err(Error::runtime(
+                    format!("bad option \"{}\": must be for or until", mode),
+                    ErrorCode::Generic,
+                ));
+            }
+            let delay_us = timer_delay_us(interp, rest[1].as_str())?;
+            let unit_us = if rest.len() == 3 {
+                timer_unit_us(interp, rest[2].as_str())?
+            } else {
+                1_000
+            };
+            let total_us = delay_us.saturating_mul(unit_us);
+            if mode == "for" {
+                let ms = total_us.div_ceil(1_000);
+                interp
+                    .clock
+                    .sleep_ms(ms)
+                    .map_err(|e| Error::runtime(format!("timer: {e}"), ErrorCode::Generic))?;
+            } else {
+                let now_us = (now_ms(interp) as u64).saturating_mul(1_000);
+                let delta_ms = total_us.saturating_sub(now_us).div_ceil(1_000);
+                interp
+                    .clock
+                    .sleep_ms(delta_ms)
+                    .map_err(|e| Error::runtime(format!("timer: {e}"), ErrorCode::Generic))?;
+            }
+            Ok(Value::empty())
+        }
+        // timer cancel id|script — a miss is a silent no-op (pinned).
+        "cancel" => {
+            if rest.len() != 1 {
+                return Err(Error::wrong_args_with_usage(
+                    "timer",
+                    0,
+                    0,
+                    "cancel id|script",
+                ));
+            }
+            let cancel_args = [
+                Value::from_str("after"),
+                Value::from_str("cancel"),
+                rest[0].clone(),
+            ];
+            after_cancel(interp, &cancel_args)
+        }
+        // timer idle script
+        "idle" => {
+            if rest.len() != 1 {
+                return Err(Error::wrong_args_with_usage(
+                    "timer",
+                    0,
+                    0,
+                    "idle script",
+                ));
+            }
+            let id = schedule_event(interp, 0, rest[0].as_str().to_string(), true);
+            Ok(Value::from_str(&format!("after#{}", id)))
+        }
+        // timer info ?id?
+        "info" => {
+            if rest.len() > 1 {
+                return Err(Error::wrong_args_with_usage(
+                    "timer",
+                    0,
+                    0,
+                    "info ?id?",
+                ));
+            }
+            let mut info_args = vec![Value::from_str("after"), Value::from_str("info")];
+            if rest.len() == 1 {
+                info_args.push(rest[0].clone());
+            }
+            after_info(interp, &info_args)
+        }
+        _ => unreachable!("timer subcommand"),
     }
 }

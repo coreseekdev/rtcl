@@ -502,8 +502,11 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             for elem in elements_to_remove {
                 // Through the name as given: `array unset ::a 1` inside a
                 // proc reached a local `a(1)` when the key was spelled
-                // for the owner's table, and unset nothing.
-                let _ = interp.unset_var(&format!("{}({})", array_name, elem));
+                // for the owner's table, and unset nothing.  裸名形：
+                // 整数组扫描的元素 unset trace 的 name1 = 裸数组名
+                // （9.1 实测 {tb j unset}，与 unset tb(j) 直元素的
+                // {tb(j) j unset} 相对，C 阶段钉形）。
+                let _ = interp.unset_var_form(&format!("{}({})", array_name, elem), false);
             }
             Ok(Value::empty())
         }

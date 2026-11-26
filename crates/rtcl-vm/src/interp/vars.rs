@@ -2368,6 +2368,16 @@ impl Interp {
     }
 
     pub fn unset_var(&mut self, name: &str) -> Result<()> {
+        self.unset_var_form(name, true)
+    }
+
+    /// `elem_trace_full=false`：整数组 unset 的逐元素扫描（array
+    /// unset / unset 的数组整体路径）——元素 unset trace 的 name1 用裸
+    /// 数组名（9.1 实测：`array unset tb` 的 tb(j) trace 是
+    /// {tb j unset}，而 `unset tb(j)` 直接元素 unset 是
+    /// {tb(j) j unset}、`unset ::tc(k)` 是 {::tc(k) k unset}——name1 =
+    /// unset 写下的全名，C 阶段钉形）。
+    pub fn unset_var_form(&mut self, name: &str, elem_trace_full: bool) -> Result<()> {
         if let Some((array_name, index)) = split_array_ref(name) {
             let base = array_name.to_string();
             let idx = index.to_string();
@@ -2382,13 +2392,24 @@ impl Interp {
                     self.clear_phantom(&base, &idx);
                     // Unset traces fire after deletion; errors are
                     // discarded (tclsh: the unset still succeeds).
-                    let _ = self.fire_traces(&base, Some(&idx), "unset");
+                    // 9.1：元素 unset 的 name1 = unset 写下的全名
+                    // （ta(k) / ::ta(k)），n2 = 元素。
+                    let _ = if elem_trace_full {
+                        self.fire_traces_name1(&base, Some(&idx), "unset", name)
+                    } else {
+                        self.fire_traces(&base, Some(&idx), "unset")
+                    };
                     Ok(())
                 } else {
                     // tclsh：对缺失元素的 unset 仍触发 unset trace（且抹
-                    // 该元素的记录——trace-14.17 族，D-37⑤）。
+                    // 该元素的记录——trace-14.17 族，D-37⑤）。name1 形
+                    // 同上（全名 / 裸名按调用方）。
                     let sk = stamp_key(&loc);
-                    let _ = self.fire_traces(&base, Some(&idx), "unset");
+                    let _ = if elem_trace_full {
+                        self.fire_traces_name1(&base, Some(&idx), "unset", name)
+                    } else {
+                        self.fire_traces(&base, Some(&idx), "unset")
+                    };
                     if let Some(map) = self.elem_traces.get_mut(&sk) {
                         map.remove(&idx);
                         if map.is_empty() {
@@ -2470,7 +2491,7 @@ impl Interp {
                 // The key from where the variable WAS: by name it would
                 // no longer resolve there (the chain needs the variable).
                 let sk = stamp_key(&loc);
-                let _ = self.fire_traces_key(&sk, &given, None, "unset", true);
+                let _ = self.fire_traces_key(&sk, &given, None, "unset", true, None);
                 self.var_traces.remove(&sk);
                 self.elem_traces.remove(&sk);
                 self.trace_phantoms.remove(&sk);
@@ -2690,6 +2711,18 @@ impl Interp {
         self.fire_traces_impl(base, elem, op, true)
     }
 
+    /// [`Self::fire_traces`] with an explicit trace-callback name1
+    /// override（元素 unset 的全名形 ta(k)/::ta(k)，9.1 钉形）。
+    pub(crate) fn fire_traces_name1(
+        &mut self,
+        base: &str,
+        elem: Option<&str>,
+        op: &str,
+        name1: &str,
+    ) -> Result<bool> {
+        self.fire_traces_impl_name1(base, elem, op, true, name1)
+    }
+
     /// Element-only fire：不触发整变量组（tclsh 整数组 unset 的逐元素
     /// 扫描只发元素 Var 的 trace——2026-11-05 实测：trace on a(unset)
     /// 在 `array unset a`/`unset a` 时恰一次 {a {} unset}、来自末尾的
@@ -2711,7 +2744,25 @@ impl Interp {
         op: &str,
         include_whole: bool,
     ) -> Result<bool> {
-        self.fire_traces_key(&self.array_stamp_key(base), base, elem, op, include_whole)
+        self.fire_traces_key(&self.array_stamp_key(base), base, elem, op, include_whole, None)
+    }
+
+    fn fire_traces_impl_name1(
+        &mut self,
+        base: &str,
+        elem: Option<&str>,
+        op: &str,
+        include_whole: bool,
+        name1: &str,
+    ) -> Result<bool> {
+        self.fire_traces_key(
+            &self.array_stamp_key(base),
+            base,
+            elem,
+            op,
+            include_whole,
+            Some(name1),
+        )
     }
 
     /// [`Self::fire_traces`] with the key of the variable's table given:
@@ -2725,6 +2776,7 @@ impl Interp {
         elem: Option<&str>,
         op: &str,
         include_whole: bool,
+        name1: Option<&str>,
     ) -> Result<bool> {
         let guard = match elem {
             Some(e) => format!("E\x00{}\x00{}", key, e),
@@ -2733,7 +2785,7 @@ impl Interp {
         if !self.trace_active.insert(guard.clone()) {
             return Ok(false);
         }
-        let fired = self.fire_traces_inner(key, base, elem, op, include_whole);
+        let fired = self.fire_traces_inner(key, base, elem, op, include_whole, name1);
         self.trace_active.remove(&guard);
         fired
     }
@@ -2745,6 +2797,7 @@ impl Interp {
         elem: Option<&str>,
         op: &str,
         include_whole: bool,
+        name1: Option<&str>,
     ) -> Result<bool> {
         let (whole, elems) = self.collect_trace_scripts(key, elem, op);
         let whole: Vec<String> = if include_whole { whole } else { Vec::new() };
@@ -2754,10 +2807,12 @@ impl Interp {
         // the whole-variable group fires BEFORE the element group
         // (tclsh order A1E1, D-37).  The script string gets the args
         // appended (so scripts can end in `;#` to swallow them) and is
-        // evaluated as a script.
+        // evaluated as a script.  name1 override：元素 unset 的全名形
+        // （ta(k)/::ta(k)——unset 写下的名字，9.1 钉形）；缺省 = 裸基名。
+        let n1 = name1.unwrap_or(base);
         let q = |v: &str| Value::from_list(&[Value::from_str(v)]).as_str().to_string();
         for s in whole.into_iter().rev().chain(elems.into_iter().rev()) {
-            let cmd = format!("{} {} {} {}", s, q(base), q(elem.unwrap_or("")), op);
+            let cmd = format!("{} {} {} {}", s, q(n1), q(elem.unwrap_or("")), op);
             // The callback writes another traced variable, which fires
             // again from inside this frame: one nesting level per fire.
             self.enter_nested()?;

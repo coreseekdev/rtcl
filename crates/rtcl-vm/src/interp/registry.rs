@@ -93,6 +93,10 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "split",     func: list::cmd_split,         cat: Standard, cmd_id: Some(CmdId::Split     as u16),   usage: "string ?splitChars?",              help: "Split a string into a list" },
     CmdEntry { name: "join",      func: list::cmd_join,          cat: Standard, cmd_id: Some(CmdId::Join      as u16),   usage: "list ?joinString?",                help: "Join list elements into a string" },
     CmdEntry { name: "lmap",      func: list::cmd_lmap,          cat: Standard, cmd_id: Some(CmdId::Lmap      as u16),   usage: "varList list ?varList list ...? command", help: "Map over list elements" },
+    // lfilter — TIP 735 (tclsh 9.1): collect the first variable's value
+    // while the body result is a true boolean (doc/lfilter.n,
+    // tclCmdAH.c EachloopCmd TCL_EACH_FILTER).
+    CmdEntry { name: "lfilter",   func: list::cmd_lfilter,       cat: Standard, cmd_id: None,                            usage: "varList list ?varList list ...? command", help: "Select list elements by a boolean expression" },
     CmdEntry { name: "lset",      func: list::cmd_lset,          cat: Standard, cmd_id: Some(CmdId::Lset      as u16),   usage: "listVar ?index? ?index ...? value",        help: "Set a list element" },
     CmdEntry { name: "dict",      func: dict::cmd_dict,          cat: Standard, cmd_id: Some(CmdId::Dict      as u16),   usage: "subcommand ?arg ...?",             help: "Dictionary operations" },
     CmdEntry { name: "array",     func: array::cmd_array,        cat: Standard, cmd_id: Some(CmdId::Array     as u16),   usage: "subcommand ?arg ...?",   help: "Array operations" },
@@ -388,33 +392,45 @@ impl Interp {
         f
     }
 
-    /// tclsh 8.6.17's `::` command-table registration sequence, recovered
-    /// from tclBasic.c 8.6.17 + init.tcl + tclsh's stdin `history add`
-    /// auto-load, validated by replaying the Tcl hash-table mechanics
-    /// against the oracle's `info commands` (specs/tclhash/fit_model.py).
+    /// tclsh 9.1.0's `::` command-table registration sequence, recovered
+    /// from tclBasic.c 9.1.0 (builtInCmds[] generic core + OS interface,
+    /// ensembleCommands[], TclInterpInit) + init.tcl + tclsh's stdin
+    /// `history add` auto-load, validated by replaying the Tcl hash-table
+    /// mechanics against the oracle's `info commands` (specs/tclhash/
+    /// fit_model.py; the 9.1 replay reproduces the oracle listing
+    /// byte-for-byte once every name in this list is registered).
     /// `info commands`/`info procs` replay the iteration order from this
-    /// sequence, so it must match tclsh exactly.
+    /// sequence, so it must match tclsh exactly. 8.6.17's sequence (git
+    /// history) differed: `case` (removed in 9.1) sat after `gets`, and
+    /// the const/coroinject/coroprobe/divmod/fpclassify/frexp/ledit/
+    /// lfilter/lpop/lremove/lseq/modf/remquo/timer/unicode/zipfs/
+    /// timerate names were absent.
     const TCL_INIT_CMD_ORDER: &[&str] = &[
-        // builtInCmds[] — generic core (8.6.17)
-        "append", "apply", "break", "case", "catch", "concat", "continue",
-        "coroutine", "error", "eval", "expr", "for", "foreach", "format",
-        "global", "if", "incr", "join", "lappend", "lassign", "lindex",
-        "linsert", "list", "llength", "lmap", "lrange", "lrepeat",
-        "lreplace", "lreverse", "lsearch", "lset", "lsort", "package",
-        "proc", "regexp", "regsub", "rename", "return", "scan", "set",
-        "split", "subst", "switch", "tailcall", "throw", "trace", "try",
-        "unset", "uplevel", "upvar", "variable", "while", "yield",
-        "yieldto",
+        // builtInCmds[] — generic core (9.1.0, tclBasic.c registration order)
+        "append", "apply", "break", "catch", "concat", "const",
+        "continue", "coroinject", "coroprobe", "coroutine", "divmod",
+        "error", "eval", "expr", "for", "foreach", "format", "fpclassify",
+        "frexp", "global", "if", "incr", "join", "lappend", "lassign",
+        "ledit", "lfilter", "lindex", "linsert", "list", "llength",
+        "lmap", "lpop", "lrange", "lremove", "lrepeat", "lreplace",
+        "lreverse", "lsearch", "lseq", "lset", "lsort", "modf",
+        "package", "proc", "regexp", "regsub", "remquo", "rename",
+        "return", "scan", "set", "split", "subst", "switch", "tailcall",
+        "throw", "trace", "try", "unset", "uplevel", "upvar", "variable",
+        "while", "yield", "yieldto",
         // builtInCmds[] — OS interface
         "after", "cd", "close", "eof", "exec", "exit", "fblocked",
         "fconfigure", "fcopy", "fileevent", "flush", "gets", "glob",
         "load", "open", "pid", "puts", "pwd", "read", "seek", "socket",
-        "source", "tell", "time", "unload", "update", "vwait",
-        // ensembles (TclInit*Cmd) + TclClockInit
-        "array", "binary", "chan", "dict", "encoding", "file", "info",
-        "namespace", "string", "clock",
-        // TclInterpInit, TclZlibInit
-        "interp", "zlib",
+        "source", "tell", "time", "timerate", "unload", "update", "vwait",
+        // ensembleCommands[] — global-table ensembles (the ::tcl::* ones
+        // — binary encode/decode, ::tcl::prefix, ::tcl::process,
+        // ::tcl::unsupported::grapheme — register into namespace tables)
+        "array", "binary", "chan", "clock", "dict", "encoding", "file",
+        "info", "namespace", "string", "timer", "unicode", "zipfs",
+        "zlib",
+        // TclInterpInit
+        "interp",
         // init.tcl proc definitions (tclsh startup)
         "tclLog", "unknown", "auto_load", "auto_load_index",
         "auto_qualify", "auto_import", "auto_execok",

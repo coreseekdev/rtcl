@@ -532,7 +532,7 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // the same way inside proc bodies): frameless body errors, plain
     // var-writes, results collected.
     if interp.lexical_body && super::loops::foreach_inline_shape(interp, args) {
-        return super::loops::foreach_lexical(interp, args, true);
+        return super::loops::foreach_lexical(interp, args, super::loops::LoopKind::Lmap);
     }
 
     let body = &args[args.len() - 1];
@@ -611,6 +611,117 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 // failing command's frame and the lmap command's harness
                 // frame (probed: `("lmap" body line N)`, body-relative).
                 interp.err_exit_frame("\"lmap\" body");
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(Value::from_list(&collected))
+}
+
+/// lfilter varList list ?varList list ...? command — TIP 735 (tclsh 9.1).
+/// Like lmap, but collects the value of the FIRST variable of the FIRST
+/// varlist for every iteration whose body completes with a TRUE boolean
+/// (tclCmdAH.c `EachloopCmd(TCL_EACH_FILTER)` + `ForeachLoopStep`).
+pub fn cmd_lfilter(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 4 || !args.len().is_multiple_of(2) {
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lfilter", "varList list ?varList list ...? command"));
+    }
+
+    // Same compiled-shape gate as foreach/lmap (tclsh compiles lfilter
+    // inside proc bodies the same way — TclCompileLfilterCmd).
+    if interp.lexical_body && super::loops::foreach_inline_shape(interp, args) {
+        return super::loops::foreach_lexical(interp, args, super::loops::LoopKind::Lfilter);
+    }
+
+    let body = &args[args.len() - 1];
+    let mut collected: Vec<Value> = Vec::new();
+
+    struct VarGroup {
+        vars: Vec<String>,
+        data: Vec<Value>,
+    }
+    let mut groups: Vec<VarGroup> = Vec::new();
+    let mut i = 1;
+    while i < args.len() - 1 {
+        let var_list = strict_list(interp, &args[i])?;
+        if var_list.is_empty() {
+            set_error_code(interp, "TCL OPERATION LFILTER NEEDVARS");
+            return Err(tcl_err("lfilter varlist is empty"));
+        }
+        let vars: Vec<String> = var_list.iter().map(|v| v.as_str().to_string()).collect();
+        let data = strict_list(interp, &args[i + 1])?;
+        groups.push(VarGroup { vars, data });
+        i += 2;
+    }
+
+    let max_iters = groups.iter()
+        .map(|g| {
+            let n = g.vars.len().max(1);
+            g.data.len().div_ceil(n)
+        })
+        .max()
+        .unwrap_or(0);
+
+    for idx in 0..max_iters {
+        interp.charge_step()?;
+        // primeValueObj — the value assigned to the first variable of the
+        // first varlist, captured before the body runs (tclCmdAH.c).
+        let mut prime: Option<Value> = None;
+        for (gi, g) in groups.iter().enumerate() {
+            let n = g.vars.len();
+            for (vi, var) in g.vars.iter().enumerate() {
+                let data_idx = idx * n + vi;
+                let value = g.data.get(data_idx).cloned().unwrap_or_else(Value::empty);
+                if gi == 0 && vi == 0 {
+                    prime = Some(value.clone());
+                }
+                if let Err(e) = interp.set_var(var, value) {
+                    // Dispatched lfilter decorates a loop-variable write
+                    // failure like dispatched foreach/lmap.
+                    if interp.err_is_error(&e) {
+                        set_error_code(interp, "TCL WRITE VARNAME");
+                        if interp.err_info.is_none() {
+                            interp.err_info = Some(e.message_text());
+                        }
+                        if let Some(info) = &mut interp.err_info {
+                            info.push_str(&format!(
+                                "\n    (setting lfilter loop variable \"{}\")",
+                                var
+                            ));
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        // A `return -level 0 $v` completes as an ordinary command whose
+        // result is $v; the boolean decides collection, the loop keeps
+        // iterating (same shape as lmap's handling).
+        match interp.eval_body_value(body) {
+            Ok(v) => {
+                if let Some(p) = prime {
+                    match crate::types::expr_funcs::strict_bool(&v) {
+                        Ok(true) => collected.push(p),
+                        Ok(false) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Err(e) => {
+                if e.is_break() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    break;
+                }
+                if e.is_continue() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    continue;
+                }
+                // Dispatched lfilter adds its own body exit frame between
+                // the failing command's frame and the lfilter command's
+                // harness frame (tclCmdAH.c: `("lfilter" body line N)`).
+                interp.err_exit_frame("\"lfilter\" body");
                 return Err(e);
             }
         }

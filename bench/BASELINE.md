@@ -2838,3 +2838,40 @@ B2（exec 宿主路径/file/HTTP/大小守卫）：见 BASELINE 2026-11-26 B2 �
   bn2-bn4/ec2/expr_lead1-2/incr_frame/ix3/s_probe/v_err 等 10 个，零新
   增）、crash-gate 128/128、sweep 12 既有、rtcl-vm 870/0、workspace
   1496/0、wasm32 过。
+
+## B1 语义对齐批（task/b1-91align 13 提交，2026-11-26 合并，子代理施工）
+
+- **C16**：expr 折叠/运行期双日志模型（折叠常量子树错误 = `invoked
+  from within`、含运行期值 = `while executing`；布尔语境全常量才折叠）
+  + 9.1 词形（cannot use non-numeric string "a" as left/right operand
+  of "+"、cannot use a list、ARITH DOMAIN list、expected boolean →
+  TCL VALUE NUMBER、~4.0 报错）。实现：operand_class_error 统一 +
+  逐节点 runtime-events 折叠纯度 + 新 op `ExprFoldError`（载荷缩回池
+  索引，OpCode 回 ≤16B）+ 条件语境 `EvalExprCond`。探针
+  c16_expr_fold_frames 50 例双绿。连带修 3 处（词级错误出口泄漏
+  cur_source 跨单元越界 panic、Neg 臂 `?` 绕过命令帧、mathop 折叠起
+  点首非法操作数 left 归属）。
+- **C28**：ns-eval 体不是 proc 帧——`frame.ns_depth` 判定，tailcall
+  报 `tailcall can only be called from a proc, lambda or method` +
+  TCL TAILCALL ILLEGAL。探针 5 例。
+- **C38**：别名 wrong-args 命令名 9.1 统一为别名调用词；带前缀实参
+  到名字为止、无前缀带参数表；只改写 proc 目标（内建保自我用词）。
+  探针 13 例。
+- **C39**：循环体 builtin 分派不再占 call_depth（tclsh 内联体不是求
+  值层）；递归门 >→>=；**rtcl-cli 解释器挪 64MB 栈线程**（树走查每
+  层 Rust 栈 8-17KB，8MB 主线程在 ~998 层循环体递归即栈溢出）。
+  @limit 1000 完成 998 层 = 9.1 钉形。探针 5 例。wasm 150 校准与宿
+  主接口不变。
+- **C47**：回溯步数预算 2M→24M（覆盖 ~3300 字符回引扫描族，bail
+  ~2s 护栏保留）。探针 10 例。
+- **array unset** 不存在变量静默（9.1）；**trace 元素 unset name1**
+  = unset 写下的全名（ta(k)/::tc(k)），整数组扫描保持裸名。
+- 门禁（合并树）：judge **79/95**（gen_compExpr-old/gen_while-old/
+  gen_while 转绿；18 fail ⊂ 基线 21 无新增）、crash-gate 128/128、
+  probes **382/88**（净 fail -22：bn6/7/9/10/12/13/14、
+  expr_bracket_top、numcmp1、p32/p33、verify 等转绿 + 1 known 翻绿）、
+  sweep 12 既有、rtcl-vm 871/0、wasm build ✓（opt 2.32MB）。
+- 遗留登记：-errorstack INNER 的 runtime 操作数形（TIP 356 深水面）、
+  mathop 单操作数词形未钉、wasm crash-wasm 50/52（string repeat/
+  lrepeat 2^32 TRAP 为 wave2 基线既有 S21 wasm 面，见 BASELINE B2 节
+  与 TODO）。

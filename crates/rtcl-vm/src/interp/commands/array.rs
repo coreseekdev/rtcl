@@ -850,7 +850,8 @@ mod search_tests {
             ("catch {array names a b c d} m", "wrong # args: should be \"array names arrayName ?mode? ?pattern?\""),
             ("catch {array start a b} m", "wrong # args: should be \"array startsearch arrayName\""),
             ("catch {array start} m", "wrong # args: should be \"array startsearch arrayName\""),
-            ("catch {array d} m", "wrong # args: should be \"array donesearch arrayName searchId\""),
+            // `array d` 在 9.1 歧义（default/donesearch）——改为精确名
+            ("catch {array donesearch} m", "wrong # args: should be \"array donesearch arrayName searchId\""),
             ("catch {array e a b} m", "wrong # args: should be \"array exists arrayName\""),
             ("catch {array u a b c} m", "wrong # args: should be \"array unset arrayName ?pattern?\""),
         ];
@@ -871,7 +872,7 @@ mod search_tests {
             .to_string();
         assert_eq!(
             e,
-            "unknown or ambiguous subcommand \"sta\": must be anymore, donesearch, exists, get, names, nextelement, set, size, startsearch, statistics, or unset"
+            "unknown or ambiguous subcommand \"sta\": must be anymore, default, donesearch, exists, for, get, names, nextelement, set, size, startsearch, statistics, or unset"
         );
         let e = interp
             .eval("catch {array for a} m; set m")
@@ -880,7 +881,9 @@ mod search_tests {
             .to_string();
         assert_eq!(
             e,
-            "unknown or ambiguous subcommand \"for\": must be anymore, donesearch, exists, get, names, nextelement, set, size, startsearch, statistics, or unset"
+            // for 已是子命令：不再是歧义错误，而是 wrong # args
+            // （TIP 508 varlist-first 形，9.1/B3 钉形）
+            "wrong # args: should be \"array for {key value} arrayName script\""
         );
     }
 

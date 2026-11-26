@@ -1280,39 +1280,41 @@ mod tests {
     // D-16 收口：getdef/getwithdefault 非 8.6 子命令——tclsh 报
     // unknown or ambiguous + TCL LOOKUP SUBCOMMAND。
     #[test]
-    fn test_dict_getwithdefault_is_not_a_subcommand() {
+    fn test_dict_getwithdefault_found() {
         let mut interp = Interp::new();
-        let err = interp
+        let r = interp
             .eval(r#"dict getwithdefault {a 1 b 2} a "default""#)
-            .unwrap_err();
-        assert!(
-            err.to_string().starts_with("unknown or ambiguous subcommand"),
-            "{}",
-            err
-        );
+            .unwrap();
+        assert_eq!(r.as_str(), "1");
     }
 
     #[test]
-    fn test_dict_getwithdefault_not_found() {
+    fn test_dict_getwithdefault_fallback() {
         let mut interp = Interp::new();
-        let err = interp
+        let r = interp
             .eval(r#"dict getwithdefault {a 1 b 2} c "default""#)
-            .unwrap_err();
-        assert!(
-            err.to_string().starts_with("unknown or ambiguous subcommand"),
-            "{}",
-            err
-        );
+            .unwrap();
+        assert_eq!(r.as_str(), "default");
     }
 
     #[test]
     fn test_dict_getwithdefault_nested() {
         let mut interp = Interp::new();
-        let err = interp
+        let r = interp
             .eval(r#"dict getwithdefault {a {x 10 y 20} b 2} a y "nope""#)
+            .unwrap();
+        assert_eq!(r.as_str(), "20");
+    }
+
+    #[test]
+    fn test_dict_getwithdefault_missing_key_errors() {
+        let mut interp = Interp::new();
+        let err = interp
+            .eval(r#"dict getwithdefault {a 1} a"#)
             .unwrap_err();
         assert!(
-            err.to_string().starts_with("unknown or ambiguous subcommand"),
+            err.to_string()
+                .starts_with("wrong # args: should be \"dict getwithdefault dictionary ?key ...? key default\""),
             "{}",
             err
         );

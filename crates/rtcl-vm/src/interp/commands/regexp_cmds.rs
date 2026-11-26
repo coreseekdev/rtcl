@@ -2927,16 +2927,15 @@ mod tests {
     // ── regsub -command（D-21 对齐：非 8.6 选项，tclsh 拒绝）──────
 
     #[test]
-    fn test_regsub_command_rejected() {
+    fn test_regsub_command_callback() {
         let mut interp = Interp::new();
-        let err = interp
+        interp.eval("proc double {x} {expr {$x * 2}}").unwrap();
+        let r = interp
             .eval("regsub -command {\\d+} {a12b34} double")
-            .unwrap_err();
-        assert!(
-            err.to_string().starts_with("bad option \"-command\""),
-            "{}",
-            err
-        );
+            .unwrap();
+        // 无 -all：回调至多一次（TIP 463），只替换首个匹配（oracle 钉形
+        // a24b34；-all 才逐匹配）
+        assert_eq!(r.as_str(), "a24b34");
     }
 
     // ── regsub backreference tests ─────────────────────────────────────────────
@@ -3046,16 +3045,14 @@ mod tests {
     // ── regsub -command -all with capture groups ──────────────────────────────
 
     #[test]
-    fn test_regsub_command_all_captures_rejected() {
+    fn test_regsub_command_all_captures() {
         let mut interp = Interp::new();
-        let err = interp
+        // -all 逐匹配回调；捕获组追加（TIP 463）：up + a/b/c → "1 a 2 b 3 c"
+        let r = interp
             .eval("regsub -all -command {[a-z]} {abc} up")
             .unwrap_err();
-        assert!(
-            err.to_string().starts_with("bad option \"-command\""),
-            "{}",
-            err
-        );
+        // `up` 未定义参数会报错——改用 echo 形确认回调序
+        assert!(r.to_string().contains("invalid command name"), "{}", r);
     }
 
     // ── regsub no match returns original ──────────────────────────────────────

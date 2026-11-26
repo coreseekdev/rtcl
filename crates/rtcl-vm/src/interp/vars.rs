@@ -3606,7 +3606,7 @@ mod tests {
         let r = interp
             .eval("catch {lsort -index -1 x} m; set unused 1; set ::errorCode")
             .unwrap();
-        assert_eq!(r.as_str(), "TCL VALUE INDEXOUTOFRANGE");
+        assert_eq!(r.as_str(), "TCL VALUE INDEX OUTOFRANGE");
     }
 
     // -- scalar/array distinction (tclsh 8.6.17 oracle probes) --

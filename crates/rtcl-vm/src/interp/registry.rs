@@ -222,6 +222,12 @@ static CMD_TABLE_ENSEMBLE: &[CmdEntry] = &[
     CmdEntry { name: "::tcl::mathop::>=", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "Numeric >= chain (expr >=)" },
     CmdEntry { name: "::tcl::mathop::==", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "Numeric == chain (expr ==)" },
     CmdEntry { name: "::tcl::mathop::eq", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "String eq chain (expr eq)" },
+    // lt/le/gt/ge（9.0 新增，TIP 461）：纯字符串比较链，mathOpCmds[] 的
+    // 表尾四项。
+    CmdEntry { name: "::tcl::mathop::lt", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "String < chain (expr lt)" },
+    CmdEntry { name: "::tcl::mathop::le", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "String <= chain (expr le)" },
+    CmdEntry { name: "::tcl::mathop::gt", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "String > chain (expr gt)" },
+    CmdEntry { name: "::tcl::mathop::ge", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "String >= chain (expr ge)" },
     // ::tcl::pkgconfig — build-configuration query (tclPkgConfig.c parity);
     // keyed absolute so `::tcl::pkgconfig` resolves directly and the
     // relative `tcl::pkgconfig` falls through the `::`+name lookup.

@@ -903,7 +903,7 @@ fn scan_number(s: &[u8]) -> Option<(usize, bool)> {
         scan.stop,
         matches!(
             scan.payload,
-            crate::types::bignum::NumPayload::Float(_)
+            crate::types::bignum::NumPayload::Float { .. }
         ),
     ))
 }

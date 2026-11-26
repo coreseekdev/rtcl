@@ -1673,18 +1673,23 @@ fn parse_tcl_int_strict(s: &str) -> Option<i64> {
     if !scan.full {
         return None;
     }
-    let crate::types::bignum::NumPayload::Int(neg, digits, radix) = scan.payload else {
+    let crate::types::bignum::NumPayload::Int { radix, run } = scan.payload else {
         return None;
     };
-    if digits.is_empty() {
+    let digits = scan.int_digits(s.trim());
+    if digits.is_empty() || digits.bytes().all(|b| b == b'_') {
         return None;
     }
     let mut mag: u64 = 0;
-    for c in digits.bytes() {
-        let d = (c as char).to_digit(radix)?;
-        mag = mag.wrapping_mul(radix as u64).wrapping_add(d as u64);
+    for &c in digits.as_bytes() {
+        if c == b'_' {
+            continue;
+        }
+        mag = mag
+            .wrapping_mul(radix as u64)
+            .wrapping_add(crate::types::bignum::digit_value(c) as u64);
     }
-    Some(if neg {
+    Some(if scan.neg {
         (mag.wrapping_neg()) as i64
     } else {
         mag as i64
@@ -1701,18 +1706,23 @@ fn parse_tcl_int_ext(s: &str) -> Option<(bool, u128)> {
     if !scan.full {
         return None;
     }
-    let crate::types::bignum::NumPayload::Int(neg, digits, radix) = scan.payload else {
+    let crate::types::bignum::NumPayload::Int { radix, run } = scan.payload else {
         return None;
     };
-    if digits.is_empty() {
+    let digits = scan.int_digits(s.trim());
+    if digits.is_empty() || digits.bytes().all(|b| b == b'_') {
         return None;
     }
     let mut mag: u128 = 0;
-    for c in digits.bytes() {
-        let d = (c as char).to_digit(radix)?;
-        mag = mag.wrapping_mul(radix as u128).wrapping_add(d as u128);
+    for &c in digits.as_bytes() {
+        if c == b'_' {
+            continue;
+        }
+        mag = mag
+            .wrapping_mul(radix as u128)
+            .wrapping_add(crate::types::bignum::digit_value(c) as u128);
     }
-    Some((neg, mag))
+    Some((scan.neg, mag))
 }
 
 /// Format an integer conversion (`l` size) whose magnitude does not fit in

@@ -195,18 +195,22 @@ fn scan_tcl_integer(s: &str) -> std::result::Result<(bool, bool, u128), usize> {
     if !scan.full {
         return Err(char_at(scan.stop));
     }
-    let crate::types::bignum::NumPayload::Int(neg, digits, radix) = scan.payload else {
+    let crate::types::bignum::NumPayload::Int { radix, run } = scan.payload else {
         return Err(char_at(scan.stop));
     };
-    if digits.is_empty() {
+    let digits = scan.int_digits(s);
+    if digits.is_empty() || digits.bytes().all(|b| b == b'_') {
         // Prefix without digits (`0x`, `0d`): tclsh blames the prefix
         // character.
         return Err(char_at(scan.stop));
     }
     let mut mag: u128 = 0;
     let mut overflow = false;
-    for c in digits.chars() {
-        let d = (c as u8 - b'0') as u128;
+    for &c in digits.as_bytes() {
+        if c == b'_' {
+            continue;
+        }
+        let d = crate::types::bignum::digit_value(c) as u128;
         match mag.checked_mul(radix as u128).and_then(|m| m.checked_add(d)) {
             Some(v) => mag = v,
             None => overflow = true,
@@ -214,9 +218,9 @@ fn scan_tcl_integer(s: &str) -> std::result::Result<(bool, bool, u128), usize> {
     }
     if overflow {
         // Saturated: callers treat this as out of range (-1 failindex).
-        return Ok((true, neg, u128::MAX));
+        return Ok((true, scan.neg, u128::MAX));
     }
-    Ok((true, neg, mag))
+    Ok((true, scan.neg, mag))
 }
 
 /// Scan Tcl double syntax (9.1 grammar): Inf/NaN, any Tcl integer form,

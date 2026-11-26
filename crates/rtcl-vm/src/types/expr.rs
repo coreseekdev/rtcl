@@ -690,7 +690,7 @@ impl<'a> ExprParser<'a> {
             .map(|c| c.is_ascii_alphanumeric() || *c == '_')
             .unwrap_or(false);
         let number_text: String = self.chars[start..start + stop].iter().collect();
-        let value = self.number_value(&number_text, &scan.payload);
+        let value = self.number_value(&number_text, stop, &scan);
         self.pos = start + stop;
         if tail_is_bareword {
             // A bareword tail on a number (`3eq2` glues into the word
@@ -700,6 +700,16 @@ impl<'a> ExprParser<'a> {
             self.check_number_trail(&number_text)?;
         }
         value
+    }
+
+
+    /// The digit region of a scanned literal with `_` separators stripped.
+    fn strip_digit_separators(raw: &str, run: usize, stop: usize) -> String {
+        raw.as_bytes()[run..stop]
+            .iter()
+            .filter(|&&b| b != b'_')
+            .map(|&b| b as char)
+            .collect()
     }
 
     /// The alnum/underscore run at the cursor (a bareword token body).
@@ -715,7 +725,12 @@ impl<'a> ExprParser<'a> {
     /// text (`expr {017 eq 17}` is false — tclsh compares the literal as
     /// written; the top-level result still canonicalizes); oversized
     /// digits widen to an exact bignum in decimal form.
-    fn number_value(&self, raw: &str, payload: &super::bignum::NumPayload) -> Result<Value> {
+    fn number_value(
+        &self,
+        raw: &str,
+        stop: usize,
+        scan: &super::bignum::NumScan,
+    ) -> Result<Value> {
         // tclsh keeps the literal's own text as the int's string rep until
         // the top-level result canonicalizes: `expr {017 eq 17}`,
         // `{1_000 eq 1000}`, `{0x10 eq 16}` are all false (the raw form
@@ -730,28 +745,56 @@ impl<'a> ExprParser<'a> {
                 Value::from_str(raw)
             }
         };
-        Ok(match payload {
-            super::bignum::NumPayload::Int(neg, digits, radix) => {
-                let magnitude = |digits: &str, radix: u32| -> Option<i64> {
-                    let m = i64::from_str_radix(digits, radix).ok()?;
-                    if *neg {
-                        m.checked_neg()
-                    } else {
-                        Some(m)
+        Ok(match &scan.payload {
+            super::bignum::NumPayload::Int { radix, run } => {
+                // Accumulate the magnitude in u64, zero allocation; only
+                // past-u64 widths join the digits for a bignum.
+                let mut mag: u64 = 0;
+                let mut overflow = false;
+                for &b in raw.as_bytes()[*run..stop].iter() {
+                    if b == b'_' {
+                        continue;
                     }
-                };
-                if let Some(n) = magnitude(digits, *radix) {
-                    in_range_rep(n, raw)
-                } else if let Some(big) = num_bigint::BigInt::parse_bytes(digits.as_bytes(), *radix)
-                {
-                    let big = if *neg { -big } else { big };
-                    Value::from_str(&big.to_string())
-                } else {
-                    super::expr_funcs::float_value(f64::INFINITY)
+                    mag = match mag
+                        .checked_mul(*radix as u64)
+                        .and_then(|m| m.checked_add(super::bignum::digit_value(b) as u64))
+                    {
+                        Some(v) => v,
+                        None => {
+                            overflow = true;
+                            break;
+                        }
+                    };
+                }
+                if !overflow && mag <= i64::MAX as u64 {
+                    let n = if scan.neg {
+                        -(mag as i64)
+                    } else {
+                        mag as i64
+                    };
+                    return Ok(in_range_rep(n, raw));
+                }
+                if !overflow && scan.neg && mag == (i64::MAX as u64) + 1 {
+                    return Ok(in_range_rep(i64::MIN, raw));
+                }
+                // Oversized: the canonical decimal bignum replaces the
+                // text (int() widens silently).
+                let digits = Self::strip_digit_separators(raw, *run, stop);
+                match num_bigint::BigInt::parse_bytes(digits.as_bytes(), *radix) {
+                    Some(big) => {
+                        let big = if scan.neg { -big } else { big };
+                        Value::from_str(&big.to_string())
+                    }
+                    None => super::expr_funcs::float_value(f64::INFINITY),
                 }
             }
-            super::bignum::NumPayload::Float(text) => {
-                super::expr_funcs::float_value(text.parse().unwrap_or(f64::INFINITY))
+            super::bignum::NumPayload::Float { .. } => {
+                match super::bignum::float_text_from(raw, stop, &scan.payload, scan.neg)
+                    .and_then(|text| text.parse::<f64>().ok())
+                {
+                    Some(v) => super::expr_funcs::float_value(v),
+                    None => super::expr_funcs::float_value(f64::INFINITY),
+                }
             }
         })
     }

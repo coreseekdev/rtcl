@@ -80,34 +80,105 @@ pub fn parse_int(s: &str) -> Option<IntRep> {
     if !scan.full {
         return None;
     }
-    let (neg, mag_text, radix) = scan.into_int()?;
-    // i64 first; the magnitude is non-negative so the signed form cannot
-    // overflow. Past i64 the same digits widen to a bignum.
-    if let Ok(mag) = i64::from_str_radix(&mag_text, radix) {
-        return Some(IntRep::I64(if neg { -mag } else { mag }));
+    let (radix, run) = scan.into_int()?;
+    // Accumulate in u64 (covers every i64 magnitude plus the -2^63
+    // boundary) with zero allocation; only past-u64 widths join the
+    // digit region for a bignum.
+    let mut mag: u64 = 0;
+    let mut overflow = false;
+    for &b in s[run..scan.stop].as_bytes() {
+        if b == b'_' {
+            continue;
+        }
+        mag = match mag
+            .checked_mul(radix as u64)
+            .and_then(|m| m.checked_add(digit_value(b) as u64))
+        {
+            Some(v) => v,
+            None => {
+                overflow = true;
+                break;
+            }
+        };
     }
-    // `-9223372036854775808`: the magnitude is one past i64::MAX while
-    // the signed value fits (only this boundary takes the allocation).
-    if neg {
-        if let Ok(v) = format!("-{mag_text}").parse::<i64>() {
-            return Some(IntRep::I64(v));
+    if !overflow {
+        if mag <= i64::MAX as u64 {
+            return Some(IntRep::I64(if scan.neg { -(mag as i64) } else { mag as i64 }));
+        }
+        // `-9223372036854775808`: the magnitude is one past i64::MAX
+        // while the signed value fits.
+        if scan.neg && mag == (i64::MAX as u64) + 1 {
+            return Some(IntRep::I64(i64::MIN));
         }
     }
-    let mag = BigInt::parse_bytes(mag_text.as_bytes(), radix)?;
-    Some(IntRep::Big(if neg { -mag } else { mag }))
+    let digits = strip_separators(&s[run..scan.stop]);
+    let big = BigInt::parse_bytes(digits.as_bytes(), radix)?;
+    Some(IntRep::Big(if scan.neg { -big } else { big }))
+}
+
+/// Strip `_` separators from a validated digit region.
+fn strip_separators(digits: &str) -> String {
+    digits.bytes().filter(|&b| b != b'_').map(|b| b as char).collect()
+}
+
+/// Numeric value of a validated digit byte in the scan's radix (the
+/// scanner only admits digits of its radix, so `a-f` in radix 16 — the
+/// only letter case — is safe).
+pub fn digit_value(b: u8) -> u32 {
+    match b {
+        b'0'..=b'9' => (b - b'0') as u32,
+        b'a'..=b'f' => (b - b'a' + 10) as u32,
+        b'A'..=b'F' => (b - b'A' + 10) as u32,
+        _ => 0,
+    }
+}
+
+/// Integer-region magnitude as f64 (prefixed radixes convert exactly via
+/// u64, widening to a bignum conversion past that).
+fn int_span_to_f64(s: &str, neg: bool, radix: u32, run: usize, stop: usize) -> Option<f64> {
+    let mut mag: u64 = 0;
+    let mut overflow = false;
+    for &b in s[run..stop].as_bytes() {
+        if b == b'_' {
+            continue;
+        }
+        mag = match mag
+            .checked_mul(radix as u64)
+            .and_then(|m| m.checked_add(digit_value(b) as u64))
+        {
+            Some(v) => v,
+            None => {
+                overflow = true;
+                break;
+            }
+        };
+    }
+    let v = if overflow {
+        let digits = strip_separators(&s[run..stop]);
+        BigInt::parse_bytes(digits.as_bytes(), radix)?.to_f64()?
+    } else {
+        mag as f64
+    };
+    Some(if neg { -v } else { v })
 }
 
 /// The full-number float view of a string (9.1 grammar — underscores in
 /// mantissa/fraction/exponent, `0d` prefixes, decimal leading zeros;
 /// `1_0.5` is 10.5). `Inf`/`-Inf`/`NaN` are the caller's arm here.
 pub fn parse_float_str(s: &str) -> Option<f64> {
-    match scan_number(s, false)? {
-        NumScan { payload: NumPayload::Float(text), full: true, .. } => text.parse().ok(),
-        NumScan { payload: NumPayload::Int(neg, digits, radix), full: true, .. } => {
-            // Integer forms coerce to floats: `"0x10" + 0.5` is 16.5.
-            int_payload_to_f64(neg, &digits, radix)
+    let scan = scan_number(s, false)?;
+    if !scan.full {
+        return None;
+    }
+    match &scan.payload {
+        NumPayload::Float { .. } => {
+            let text = float_text_from(s, scan.stop, &scan.payload, scan.neg)?;
+            text.parse().ok()
         }
-        _ => None,
+        // Integer forms coerce to floats: `"0x10" + 0.5` is 16.5.
+        NumPayload::Int { radix, run } => {
+            int_span_to_f64(s, scan.neg, *radix, *run, scan.stop)
+        }
     }
 }
 
@@ -131,41 +202,88 @@ pub fn parse_float_str(s: &str) -> Option<f64> {
 pub struct NumScan {
     pub stop: usize,
     pub full: bool,
+    /// A leading `-` was consumed (always in the accepted region).
+    pub neg: bool,
     pub payload: NumPayload,
 }
 
+/// Number pieces as spans of the scanned input — the scanner never
+/// allocates; value builders join the digit runs only when a value is
+/// actually materialised (separators are skipped while accumulating).
 pub enum NumPayload {
-    /// `(negative, digits, radix)` with separators stripped and no sign.
-    Int(bool, String, u32),
-    /// Rust-parseable float text (separators stripped, sign kept).
-    Float(String),
+    /// Integer: radix + the digit region `s[run..stop)` (digits and `_`
+    /// separators, contiguous — prefixes excluded; sign is `scan.neg`).
+    Int { radix: u32, run: usize },
+    /// Float piece positions (byte indices): mantissa digits `s[f0..dot
+    /// or e or stop)`, fraction `s[dot+1..e or stop)`, exponent digits
+    /// `s[exp0..stop)` (sign in `exp_neg`); `f0 == dot` marks an empty
+    /// mantissa (".5").
+    Float {
+        f0: usize,
+        dot: Option<usize>,
+        e_at: Option<usize>,
+        exp0: Option<usize>,
+        exp_neg: bool,
+    },
 }
 
 impl NumScan {
-    /// The integer parts of the payload, or `None` for a float.
-    pub fn into_int(self) -> Option<(bool, String, u32)> {
+    /// The integer parts of the payload, or `None` for a float:
+    /// `(radix, digit-run start)`.
+    pub fn into_int(&self) -> Option<(u32, usize)> {
         match self.payload {
-            NumPayload::Int(neg, digits, radix) => Some((neg, digits, radix)),
-            NumPayload::Float(_) => None,
+            NumPayload::Int { radix, run } => Some((radix, run)),
+            NumPayload::Float { .. } => None,
         }
+    }
+
+    /// The integer digit region `s[run..stop)` — digits and `_`
+    /// separators, contiguous. Empty for a prefix without digits (`0x`).
+    pub fn int_digits<'a>(&self, s: &'a str) -> &'a str {
+        let run = match &self.payload {
+            NumPayload::Int { run, .. } => *run,
+            _ => self.stop,
+        };
+        &s[run..self.stop]
     }
 }
 
-fn int_payload_to_f64(neg: bool, digits: &str, radix: u32) -> Option<f64> {
-    if radix == 10 {
-        let mut text = String::with_capacity(digits.len() + 1);
-        if neg {
+/// The float's Rust-parseable text (separators stripped; mantissa "0"
+/// supplied where absent; dot-exponent junctions normalized — Rust
+/// rejects "3.e2", tclsh accepts it as 300.0).
+pub fn float_text_from(s: &str, stop: usize, p: &NumPayload, neg: bool) -> Option<String> {
+    let NumPayload::Float { f0, dot, e_at, exp0, exp_neg } = p else {
+        return None;
+    };
+    let e_end = e_at.unwrap_or(stop);
+    let mut text = String::with_capacity(stop + 8);
+    if neg {
+        text.push('-');
+    }
+    // Mantissa: empty only for a leading-dot float (".5") — f0 == dot.
+    if matches!(dot, Some(d) if *f0 == *d) {
+        text.push('0');
+    } else {
+        text.push_str(&s[*f0..dot.unwrap_or(e_end)].replace('_', ""));
+    }
+    if let Some(d) = dot {
+        text.push('.');
+        let frac = &s[d + 1..e_end];
+        if frac.is_empty() && e_at.is_some() {
+            // "3.e2" → "3.0e2" (a trailing dot alone parses in Rust).
+            text.push('0');
+        } else {
+            text.push_str(&frac.replace('_', ""));
+        }
+    }
+    if let (Some(_), Some(x0)) = (e_at, exp0) {
+        text.push('e');
+        if *exp_neg {
             text.push('-');
         }
-        text.push_str(digits);
-        return text.parse().ok();
+        text.push_str(&s[*x0..stop].replace('_', ""));
     }
-    let mag = if let Ok(v) = i64::from_str_radix(digits, radix) {
-        v as f64
-    } else {
-        BigInt::parse_bytes(digits.as_bytes(), radix)?.to_f64()?
-    };
-    Some(if neg { -mag } else { mag })
+    Some(text)
 }
 
 /// Tcl's whitespace set (`TclIsSpaceProc`).
@@ -223,8 +341,16 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
     // digit of the number when the parse is complete.
     let mut accept: Option<usize> = None;
     let mut neg = false;
-    let mut digits = String::new();
-    let mut float_text = String::new();
+    // Digit regions as positions (zero-allocation payload): the integer
+    // run start, the float piece positions. `d0` follows the current
+    // digit cursor — prefixes reset it, digits only ever extend to the
+    // cursor, so each region is contiguous to `stop`.
+    let mut d0: Option<usize> = None;
+    let mut f0: Option<usize> = None;
+    let mut dot: Option<usize> = None;
+    let mut e_at: Option<usize> = None;
+    let mut exp0: Option<usize> = None;
+    let mut exp_neg = false;
     // Position of the first float-making character ('.'/'e') consumed by
     // the scanner. A rejection rewinds to the accept point, and the form
     // is float only when the accepted region reaches past this mark
@@ -293,17 +419,28 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
             let stop = accept?;
             let is_float = matches!(float_at, Some(p) if accept.is_some_and(|a| a > p));
             let full = b[stop..].iter().all(|&c| is_tcl_ws(c));
+            // A prefix rewinds past its digits (`0x` → stop 1, digit run
+            // from 2) — clamp the spans to the accepted region.
             let payload = if is_float {
-                let mut text = String::with_capacity(float_text.len() + 1);
-                if neg {
-                    text.push('-');
+                NumPayload::Float {
+                    f0: f0.unwrap_or(stop).min(stop),
+                    dot: dot.map(|d| d.min(stop)),
+                    e_at: e_at.map(|e| e.min(stop)),
+                    exp0: exp0.map(|e| e.min(stop)),
+                    exp_neg,
                 }
-                text.push_str(&float_text);
-                NumPayload::Float(text)
             } else {
-                NumPayload::Int(neg, digits, radix)
+                NumPayload::Int {
+                    radix,
+                    run: d0.unwrap_or(stop).min(stop),
+                }
             };
-            return Some(NumScan { stop, full, payload });
+            return Some(NumScan {
+                stop,
+                full,
+                neg,
+                payload,
+            });
         }};
     }
 
@@ -330,22 +467,22 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
                 }
                 b'0' => {
                     accept = Some(i);
-                    digits.push(c as char);
-                    float_text.push(c as char);
+                    d0 = Some(i);
+                    f0 = Some(i);
                     state = Zero;
                 }
                 b'.' => {
                     // LEADING_RADIX_POINT never accepts; the fraction
                     // digits that may follow do.
                     float_at = Some(i);
-                    float_text.push('0');
-                    float_text.push('.');
+                    dot = Some(i);
+                    f0 = Some(i); // empty mantissa: f0 == dot
                     state = Lrp;
                 }
                 c if c.is_ascii_digit() => {
                     accept = Some(i);
-                    digits.push(c as char);
-                    float_text.push(c as char);
+                    d0 = Some(i);
+                    f0 = Some(i);
                     state = Dec;
                 }
                 _ => reject!(),
@@ -353,19 +490,20 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
             Signum => match c {
                 b'0' => {
                     accept = Some(i);
-                    digits.push(c as char);
-                    float_text.push(c as char);
+                    d0 = Some(i);
+                    f0 = Some(i);
                     state = Zero;
                 }
                 b'.' if !int_only => {
                     float_at = Some(i);
-                    float_text.push('.');
+                    dot = Some(i);
+                    f0 = Some(i);
                     state = Lrp;
                 }
                 c if c.is_ascii_digit() => {
                     accept = Some(i);
-                    digits.push(c as char);
-                    float_text.push(c as char);
+                    d0 = Some(i);
+                    f0 = Some(i);
                     state = Dec;
                 }
                 _ => reject!(),
@@ -375,27 +513,27 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
                 match c {
                     b'x' | b'X' => {
                         radix = 16;
-                        digits.clear();
-                        float_text.clear();
+                        d0 = Some(i + 1);
+                        f0 = Some(i + 1);
                         state = Hex0;
                     }
                     b'b' | b'B' => {
                         radix = 2;
-                        digits.clear();
-                        float_text.clear();
+                        d0 = Some(i + 1);
+                        f0 = Some(i + 1);
                         state = Bin0;
                     }
                     b'o' | b'O' => {
                         radix = 8;
-                        digits.clear();
-                        float_text.clear();
+                        d0 = Some(i + 1);
+                        f0 = Some(i + 1);
                         state = Oct0;
                     }
                     b'd' | b'D' => {
                         radix = 10;
                         int_only = true;
-                        digits.clear();
-                        float_text.clear();
+                        d0 = Some(i + 1);
+                        f0 = Some(i + 1);
                         // ZERO_D: the prefix character itself was never
                         // accepted (`0d` alone stops at index 1); the
                         // first digit falls straight through into DECIMAL
@@ -404,17 +542,15 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
                     }
                     b'.' if !int_only => {
                         float_at = Some(i);
-                        float_text.push('.');
+                        dot = Some(i);
                         state = Frac;
                     }
                     b'e' | b'E' if !int_only => {
                         float_at = Some(i);
-                        float_text.push('e');
+                        e_at = Some(i);
                         state = ExpStart;
                     }
                     c if c.is_ascii_digit() => {
-                        digits.push(c as char);
-                        float_text.push(c as char);
                         state = Dec;
                     }
                     _ => reject!(),
@@ -426,7 +562,6 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
                 }
                 match c {
                     c if c.is_ascii_digit() || matches!(c, b'a'..=b'f' | b'A'..=b'F') => {
-                        digits.push(c as char);
                         state = Hex;
                     }
                     _ => reject!(),
@@ -438,7 +573,6 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
                 }
                 match c {
                     c if (b'0'..=b'7').contains(&c) => {
-                        digits.push(c as char);
                         state = Oct;
                     }
                     _ => reject!(),
@@ -450,7 +584,6 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
                 }
                 match c {
                     b'0' | b'1' => {
-                        digits.push(c as char);
                         state = Bin;
                     }
                     _ => reject!(),
@@ -465,18 +598,15 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
                     state = Dec;
                 }
                 match c {
-                    c if c.is_ascii_digit() => {
-                        digits.push(c as char);
-                        float_text.push(c as char);
-                    }
+                    c if c.is_ascii_digit() => {}
                     b'.' if !int_only => {
                         float_at = Some(i);
-                        float_text.push('.');
+                        dot = Some(i);
                         state = Frac;
                     }
                     b'e' | b'E' if !int_only => {
                         float_at = Some(i);
-                        float_text.push('e');
+                        e_at = Some(i);
                         state = ExpStart;
                     }
                     _ => reject!(),
@@ -485,13 +615,10 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
             Frac => {
                 accept = Some(i);
                 match c {
-                    c if c.is_ascii_digit() => {
-                        digits.push(c as char);
-                        float_text.push(c as char);
-                    }
+                    c if c.is_ascii_digit() => {}
                     b'e' | b'E' => {
                         float_at = Some(i);
-                        float_text.push('e');
+                        e_at = Some(i);
                         state = ExpStart;
                     }
                     _ => reject!(),
@@ -501,30 +628,26 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
                 // LEADING_RADIX_POINT never sets an accept point: ".5_"
                 // fails as a whole, not as the prefix ".5".
                 c if c.is_ascii_digit() => {
-                    digits.push(c as char);
-                    float_text.push(c as char);
                     state = Frac;
                 }
                 _ => reject!(),
             },
             ExpStart => match c {
                 b'+' | b'-' => {
-                    float_text.push(c as char);
+                    exp_neg = c == b'-';
                     state = ExpSign;
                 }
                 // EXPONENT_START/EXPONENT_SIGNUM set no accept point:
                 // "1e2x" fails at the 'e' (index 1), not at the 'x'.
                 c if c.is_ascii_digit() => {
-                    digits.push(c as char);
-                    float_text.push(c as char);
+                    exp0 = Some(i);
                     state = Exp;
                 }
                 _ => reject!(),
             },
             ExpSign => match c {
                 c if c.is_ascii_digit() => {
-                    digits.push(c as char);
-                    float_text.push(c as char);
+                    exp0 = Some(i);
                     state = Exp;
                 }
                 _ => reject!(),
@@ -532,10 +655,7 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
             Exp => {
                 accept = Some(i);
                 match c {
-                    c if c.is_ascii_digit() => {
-                        digits.push(c as char);
-                        float_text.push(c as char);
-                    }
+                    c if c.is_ascii_digit() => {}
                     _ => reject!(),
                 }
             }
@@ -550,16 +670,25 @@ pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
     let is_float = matches!(float_at, Some(p) if accept.is_some_and(|a| a > p));
     let full = b[stop..].iter().all(|&c| is_tcl_ws(c));
     let payload = if is_float {
-        let mut text = String::with_capacity(float_text.len() + 1);
-        if neg {
-            text.push('-');
+        NumPayload::Float {
+            f0: f0.unwrap_or(stop).min(stop),
+            dot: dot.map(|d| d.min(stop)),
+            e_at: e_at.map(|e| e.min(stop)),
+            exp0: exp0.map(|e| e.min(stop)),
+            exp_neg,
         }
-        text.push_str(&float_text);
-        NumPayload::Float(text)
     } else {
-        NumPayload::Int(neg, digits, radix)
+        NumPayload::Int {
+            radix,
+            run: d0.unwrap_or(stop).min(stop),
+        }
     };
-    Some(NumScan { stop, full, payload })
+    Some(NumScan {
+        stop,
+        full,
+        neg,
+        payload,
+    })
 }
 
 /// tclCompExpr.c's radix hint on an invalid bareword: a token led by `0`

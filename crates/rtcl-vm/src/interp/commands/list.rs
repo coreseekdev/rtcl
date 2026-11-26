@@ -72,16 +72,31 @@ pub(crate) fn trim_tcl_space(s: &str) -> &str {
 /// index terms; a partial scan yields the accepted prefix.
 pub(crate) fn scan_tcl_int(s: &str) -> Option<(i64, usize)> {
     let scan = crate::types::bignum::scan_number(s, true)?;
-    let crate::types::bignum::NumPayload::Int(neg, digits, radix) = scan.payload else {
+    let crate::types::bignum::NumPayload::Int { radix, run } = scan.payload else {
         return None;
     };
-    if digits.is_empty() {
-        // Prefix without digits (`0x`, `0o8` never reaches here) — not a
-        // value; the caller reports a bad index for the partial text.
+    let digits = scan.int_digits(s);
+    if digits.is_empty() || digits.bytes().all(|b| b == b'_') {
+        // Prefix without digits (`0x`) — not a value; the caller reports
+        // a bad index for the partial text.
         return None;
     }
-    let val = i64::from_str_radix(&digits, radix).ok()?;
-    Some((if neg { -val } else { val }, scan.stop))
+    // Accumulate with checked math: an index magnitude past i64 is not a
+    // value here (from_str_radix overflowed the same way before).
+    let mut mag: u64 = 0;
+    for &b in digits.as_bytes() {
+        if b == b'_' {
+            continue;
+        }
+        mag = mag
+            .checked_mul(radix as u64)
+            .and_then(|m| m.checked_add(crate::types::bignum::digit_value(b) as u64))?;
+    }
+    if mag > i64::MAX as u64 {
+        return None;
+    }
+    let val = mag as i64;
+    Some((if scan.neg { -val } else { val }, scan.stop))
 }
 
 /// Tcl_GetInt semantics: the whole (whitespace-trimmed) string is an integer.

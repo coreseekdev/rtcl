@@ -556,7 +556,7 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // the same way inside proc bodies): frameless body errors, plain
     // var-writes, results collected.
     if interp.lexical_body && super::loops::foreach_inline_shape(interp, args) {
-        return super::loops::foreach_lexical(interp, args, true);
+        return super::loops::foreach_lexical(interp, args, super::loops::LoopKind::Lmap);
     }
 
     let body = &args[args.len() - 1];
@@ -641,6 +641,761 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     Ok(Value::from_list(&collected))
+}
+
+/// lfilter varList list ?varList list ...? command — TIP 735 (tclsh 9.1).
+/// Like lmap, but collects the value of the FIRST variable of the FIRST
+/// varlist for every iteration whose body completes with a TRUE boolean
+/// (tclCmdAH.c `EachloopCmd(TCL_EACH_FILTER)` + `ForeachLoopStep`).
+pub fn cmd_lfilter(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 4 || !args.len().is_multiple_of(2) {
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lfilter", "varList list ?varList list ...? command"));
+    }
+
+    // Same compiled-shape gate as foreach/lmap (tclsh compiles lfilter
+    // inside proc bodies the same way — TclCompileLfilterCmd).
+    if interp.lexical_body && super::loops::foreach_inline_shape(interp, args) {
+        return super::loops::foreach_lexical(interp, args, super::loops::LoopKind::Lfilter);
+    }
+
+    let body = &args[args.len() - 1];
+    let mut collected: Vec<Value> = Vec::new();
+
+    struct VarGroup {
+        vars: Vec<String>,
+        data: Vec<Value>,
+    }
+    let mut groups: Vec<VarGroup> = Vec::new();
+    let mut i = 1;
+    while i < args.len() - 1 {
+        let var_list = strict_list(interp, &args[i])?;
+        if var_list.is_empty() {
+            set_error_code(interp, "TCL OPERATION LFILTER NEEDVARS");
+            return Err(tcl_err("lfilter varlist is empty"));
+        }
+        let vars: Vec<String> = var_list.iter().map(|v| v.as_str().to_string()).collect();
+        let data = strict_list(interp, &args[i + 1])?;
+        groups.push(VarGroup { vars, data });
+        i += 2;
+    }
+
+    let max_iters = groups.iter()
+        .map(|g| {
+            let n = g.vars.len().max(1);
+            g.data.len().div_ceil(n)
+        })
+        .max()
+        .unwrap_or(0);
+
+    for idx in 0..max_iters {
+        interp.charge_step()?;
+        // primeValueObj — the value assigned to the first variable of the
+        // first varlist, captured before the body runs (tclCmdAH.c).
+        let mut prime: Option<Value> = None;
+        for (gi, g) in groups.iter().enumerate() {
+            let n = g.vars.len();
+            for (vi, var) in g.vars.iter().enumerate() {
+                let data_idx = idx * n + vi;
+                let value = g.data.get(data_idx).cloned().unwrap_or_else(Value::empty);
+                if gi == 0 && vi == 0 {
+                    prime = Some(value.clone());
+                }
+                if let Err(e) = interp.set_var(var, value) {
+                    // Dispatched lfilter decorates a loop-variable write
+                    // failure like dispatched foreach/lmap.
+                    if interp.err_is_error(&e) {
+                        set_error_code(interp, "TCL WRITE VARNAME");
+                        if interp.err_info.is_none() {
+                            interp.err_info = Some(e.message_text());
+                        }
+                        if let Some(info) = &mut interp.err_info {
+                            info.push_str(&format!(
+                                "\n    (setting lfilter loop variable \"{}\")",
+                                var
+                            ));
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        // A `return -level 0 $v` completes as an ordinary command whose
+        // result is $v; the boolean decides collection, the loop keeps
+        // iterating (same shape as lmap's handling).
+        match interp.eval_body_value(body) {
+            Ok(v) => {
+                if let Some(p) = prime {
+                    match crate::types::expr_funcs::strict_bool(&v) {
+                        Ok(true) => collected.push(p),
+                        Ok(false) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Err(e) => {
+                if e.is_break() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    break;
+                }
+                if e.is_continue() {
+                    if e.loop_level() > 1 { return Err(e.with_decremented_loop_level()); }
+                    continue;
+                }
+                // Dispatched lfilter adds its own body exit frame between
+                // the failing command's frame and the lfilter command's
+                // harness frame (tclCmdAH.c: `("lfilter" body line N)`).
+                interp.err_exit_frame("\"lfilter\" body");
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(Value::from_list(&collected))
+}
+
+/// lseq — numeric series (tclsh 9.1, TIP 746: no expr evaluation; the
+/// arguments decode per tclCmdIL.c `Tcl_LseqObjCmd`'s arg_key state
+/// machine, the math per tclArithSeries.c).
+pub fn cmd_lseq(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    use crate::types::bignum::{int_rep, IntRep};
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Op {
+        Dots,
+        To,
+        Count,
+        By,
+    }
+    #[derive(Clone, Copy)]
+    enum Num {
+        Int(i64),
+        Big,
+        Dbl(f64),
+    }
+
+    let wrong = |interp: &mut Interp| -> Error {
+        set_error_code(interp, "TCL WRONGARGS");
+        wrong_args("lseq", "n ??op? n ??by? n??")
+    };
+    // Tcl_GetNumberFromObj's view of a value: integer (i64/big), double,
+    // or none. Booleans are not numbers here.
+    fn as_number(v: &Value) -> Option<Num> {
+        if let Some(rep) = int_rep(v) {
+            return Some(match rep {
+                IntRep::I64(i) => Num::Int(i),
+                IntRep::Big(_) => Num::Big,
+            });
+        }
+        v.as_float().map(Num::Dbl)
+    }
+    let num_as_f64 = |n: Num| -> f64 {
+        match n {
+            Num::Int(i) => i as f64,
+            Num::Big => f64::NAN, // bignum: unsupported (C errors via GetWideInt)
+            Num::Dbl(d) => d,
+        }
+    };
+
+    // ── Decode ──────────────────────────────────────────────────────────
+    if args.len() > 6 {
+        return Err(wrong(interp));
+    }
+    // allowedArgs bit flags, mirroring the C decode loop.
+    const NUMERIC: u8 = 1;
+    const RANGE_KW: u8 = 2;
+
+    let objc = args.len(); // includes "lseq"
+    let mut arg_key: u32 = 0;
+    let mut nums: Vec<(Value, Num)> = Vec::new(); // numeric args + kind
+    let mut op_values: Vec<Op> = Vec::new(); // keyword arg opcodes
+    let mut use_doubles = 0usize;
+    let mut rem_nums = 3i32;
+    let mut allowed = NUMERIC;
+
+    for i in 1..objc {
+        arg_key = arg_key.wrapping_mul(10);
+        let v = &args[i];
+        let is_last = i == objc - 1;
+        if allowed & NUMERIC != 0 {
+            if let Some(n) = as_number(v) {
+                rem_nums -= 1;
+                arg_key += 1;
+                allowed = RANGE_KW;
+                if rem_nums != 1 || (objc - 1 - i) != 2 {
+                    allowed |= NUMERIC;
+                }
+                if matches!(n, Num::Dbl(_)) {
+                    use_doubles += 1;
+                }
+                nums.push((v.clone(), n));
+                continue;
+            }
+        }
+        if allowed & RANGE_KW != 0 {
+            // tclsh's abbreviation lookup is not deterministic across
+            // invocation shapes (internal index-rep caching quirk); the
+            // manual and the corpus spell the operators out, so exact
+            // match only.
+            let op = match v.as_str() {
+                ".." => Some(Op::Dots),
+                "to" => Some(Op::To),
+                "count" => Some(Op::Count),
+                "by" => Some(Op::By),
+                _ => None,
+            };
+            if let Some(op) = op {
+                if is_last {
+                    return Err(tcl_err(format!("missing \"{}\" value.", v.as_str())));
+                }
+                arg_key += 2;
+                allowed = NUMERIC;
+                op_values.push(op);
+                continue;
+            }
+        }
+        if allowed & NUMERIC == 0 {
+            // NoneArg: report through the operation table (tclCmdIL.c
+            // calls Tcl_GetIndexFromObj with msg "operation").
+            set_error_code(interp, "TCL LOOKUP INDEX operation");
+            return Err(tcl_err(format!(
+                "bad operation \"{}\": must be .., to, count, or by",
+                v.as_str()
+            )));
+        }
+        // ErrArg: numeric was allowed but the value is not a number
+        // (Tcl_GetNumberFromObj's error, TCL VALUE NUMBER).
+        set_error_code(interp, "TCL VALUE NUMBER");
+        return Err(tcl_err(format!("expected number but got \"{}\"", v.as_str())));
+    }
+
+    // ── Shape dispatch (arg_key) ────────────────────────────────────────
+    let mut start: Option<Value> = None;
+    let mut end: Option<Value> = None;
+    let mut step: Option<Value> = None;
+    let mut count: Option<Value> = None;
+    let nth = |nums: &mut Vec<(Value, Num)>, i: usize| -> Option<Value> {
+        nums.get(i).map(|(v, _)| v.clone())
+    };
+    let num_at = |nums: &[(Value, Num)], v: &Option<Value>| -> Option<Num> {
+        let v = v.as_ref()?;
+        nums.iter().find(|(val, _)| val.same_allocation(v)).map(|(_, n)| *n)
+    };
+    match arg_key {
+        1 => {
+            // lseq n — integers only ("3.0" converts, "3.1" errors)
+            start = Some(Value::from_int(0));
+            count = nth(&mut nums, 0);
+            use_doubles = 0;
+        }
+        11 => {
+            start = nth(&mut nums, 0);
+            end = nth(&mut nums, 1);
+        }
+        111 => {
+            start = nth(&mut nums, 0);
+            end = nth(&mut nums, 1);
+            step = nth(&mut nums, 2);
+        }
+        121 => {
+            let first = nth(&mut nums, 0);
+            let third = nth(&mut nums, 1);
+            match op_values[0] {
+                Op::Dots | Op::To => {
+                    start = first;
+                    end = third;
+                }
+                Op::By => {
+                    start = Some(Value::from_int(0));
+                    count = first;
+                    step = third;
+                }
+                Op::Count => {
+                    start = first;
+                    count = third;
+                }
+            }
+        }
+        1211 => {
+            let first = nth(&mut nums, 0);
+            let third = nth(&mut nums, 1);
+            let fourth = nth(&mut nums, 2);
+            match op_values[0] {
+                Op::Dots | Op::To => {
+                    start = first;
+                    end = third;
+                    step = fourth;
+                }
+                Op::Count => {
+                    start = first;
+                    count = third;
+                    step = fourth;
+                }
+                _ => return Err(wrong(interp)),
+            }
+        }
+        1121 => {
+            start = nth(&mut nums, 0);
+            end = nth(&mut nums, 1);
+            let fourth = nth(&mut nums, 2);
+            if op_values[0] != Op::By {
+                return Err(wrong(interp));
+            }
+            step = fourth;
+        }
+        12121 => {
+            let first = nth(&mut nums, 0);
+            let third = nth(&mut nums, 1);
+            let fifth = nth(&mut nums, 2);
+            if op_values[1] != Op::By {
+                return Err(wrong(interp));
+            }
+            step = fifth;
+            match op_values[0] {
+                Op::Dots | Op::To => {
+                    start = first;
+                    end = third;
+                }
+                Op::Count => {
+                    start = first;
+                    count = third;
+                }
+                Op::By => return Err(wrong(interp)),
+            }
+        }
+        _ => return Err(wrong(interp)),
+    }
+
+    // ── Count conversion (tclCmdIL.c: integral double converts; anything
+    // else fails Tcl_GetWideIntFromObj) ─────────────────────────────────
+    let mut count_val: Option<i64> = None;
+    if let Some(cv) = &count {
+        let wide = |interp: &mut Interp, v: &Value| -> Error {
+            set_error_code(interp, "TCL VALUE INTEGER");
+            tcl_err(format!("expected integer but got \"{}\"", v.as_str()))
+        };
+        count_val = Some(match num_at(&nums, &count) {
+            Some(Num::Int(i)) => i,
+            Some(Num::Big) => return Err(wide(interp, cv)),
+            Some(Num::Dbl(d)) => {
+                use_doubles = use_doubles.saturating_sub(1);
+                if d.is_finite() && d.floor() == d && d >= -(2f64.powi(63)) && d < 2f64.powi(63) {
+                    d as i64
+                } else {
+                    return Err(wide(interp, cv));
+                }
+            }
+            None => return Err(wide(interp, cv)),
+        });
+    }
+
+    // ── Extract numbers (ExtractNumber) ─────────────────────────────────
+    let use_d = use_doubles != 0;
+    let as_wide = |interp: &mut Interp, n: Num, v: &Value| -> Result<i64> {
+        match n {
+            Num::Int(i) => Ok(i),
+            Num::Big | Num::Dbl(_) => {
+                // int mode: a double truncates; out of wide range or a
+                // bignum fails GetWideIntFromObj.
+                let d = num_as_f64(n);
+                if d.is_finite() && d >= -(2f64.powi(63)) && d < 2f64.powi(63) {
+                    Ok(d as i64)
+                } else {
+                    set_error_code(interp, "TCL VALUE INTEGER");
+                    Err(tcl_err(format!("expected integer but got \"{}\"", v.as_str())))
+                }
+            }
+        }
+    };
+    let (mut istart, mut iend, mut istep) = (0i64, 0i64, 1i64);
+    let (mut dstart, mut dend, mut dstep) = (0.0f64, 0.0f64, 1.0f64);
+    let start_obj = start.clone();
+    let end_obj = end.clone();
+    let step_obj = step.clone();
+    if let Some(sv) = &step {
+        let n = num_at(&nums, &step).unwrap_or(Num::Int(1));
+        if use_d {
+            dstep = num_as_f64(n);
+        } else {
+            istep = as_wide(interp, n, sv)?;
+        }
+    }
+    if let Some(sv) = &start {
+        let n = num_at(&nums, &start).unwrap_or(Num::Int(0));
+        if use_d {
+            dstart = num_as_f64(n);
+        } else {
+            istart = as_wide(interp, n, sv)?;
+        }
+    }
+    if let Some(ev) = &end {
+        let n = num_at(&nums, &end).unwrap_or(Num::Int(0));
+        if use_d {
+            dend = num_as_f64(n);
+        } else {
+            iend = as_wide(interp, n, ev)?;
+        }
+    }
+
+    // ── Precision (ObjPrecision: fraction digits of the arg text for
+    // doubles, 0 for ints and e-notation) ────────────────────────────────
+    fn obj_precision(v: &Value) -> u32 {
+        let s = v.as_str();
+        if s.contains('e') || s.contains('E') {
+            return 0;
+        }
+        match s.find('.') {
+            Some(pos) => (s.len() - pos - 1) as u32,
+            None => 0,
+        }
+    }
+    let prec_of = |v: &Option<Value>| -> u32 { v.as_ref().map(|v| obj_precision(v)).unwrap_or(0) };
+
+    // ── Series math helpers (tclArithSeries.c) ──────────────────────────
+    let arith_round = |d: f64, n: u32| -> f64 {
+        if n == 0 {
+            return d;
+        }
+        let scale = 10f64.powi(n as i32);
+        (d * scale).round() / scale
+    };
+    let arith_len_int = |start: i64, end: i64, step: i64| -> i64 {
+        if (step < 0 && end.wrapping_sub(start) > 0)
+            || (step > 0 && end.wrapping_sub(start) < 0)
+        {
+            return 0;
+        }
+        if step == 0 {
+            return 1;
+        }
+        let len = end.wrapping_sub(start).wrapping_div(step).wrapping_add(1);
+        if len < 0 {
+            0
+        } else {
+            len
+        }
+    };
+    let arith_len_dbl =
+        |mut start: f64, mut end: f64, mut step: f64, precision: u32| -> i64 {
+            if step == 0.0 {
+                return 1;
+            }
+            if precision > 0 {
+                let scale = 10f64.powi(precision as i32);
+                start *= scale;
+                end *= scale;
+                step *= scale;
+            }
+            end -= start;
+            const WIDE_MIN_F: f64 = -9223372036854775808.0;
+            const WIDE_MAX_F: f64 = 9223372036854775808.0;
+            if (WIDE_MIN_F..=WIDE_MAX_F).contains(&end)
+                && (WIDE_MIN_F..=WIDE_MAX_F).contains(&step)
+            {
+                let iend = if end < 0.0 {
+                    (end - 0.5) as i64
+                } else {
+                    (end + 0.5) as i64
+                };
+                let istep = if step < 0.0 {
+                    (step - 0.5) as i64
+                } else {
+                    (step + 0.5) as i64
+                };
+                if istep != 0 {
+                    let ilen = iend.wrapping_div(istep).wrapping_add(1);
+                    return if ilen < 0 { 0 } else { ilen };
+                }
+            }
+            let mut len = (end / step) + 1.0;
+            // TCL_SIZE_MAX (Tcl_Size = wide in 9.1); the C cast of a value
+            // beyond i64 range lands on i64::MIN (x86-64 cvttsd2si), which
+            // NewArithSeriesDbl then treats as empty (lseq 0 1e20 -> {}).
+            if len >= 1.8446744073709552e19 {
+                len = 1.8446744073709552e19;
+            }
+            if len <= 0.0 {
+                len = 1.0;
+            }
+            if len >= 9.223372036854776e18 {
+                i64::MIN
+            } else {
+                len as i64
+            }
+        };
+
+    // ── Length ──────────────────────────────────────────────────────────
+    let mut len: i64;
+    if end_obj.is_some() {
+        if step_obj.is_none() {
+            if use_d {
+                if dstart > dend {
+                    dstep = -1.0;
+                }
+            } else if istart > iend {
+                istep = -1;
+            }
+        }
+        if count_val.is_none() {
+            if use_d {
+                if dstart.is_infinite() || dend.is_infinite() {
+                    set_error_code(interp, "TCL MEMORY");
+                    return Err(tcl_err("max length of a Tcl list exceeded"));
+                }
+                if dstart.is_nan() || dend.is_nan() {
+                    set_error_code(interp, "ARITH DOMAIN non-numeric floating-point value");
+                    return Err(tcl_err(
+                        "cannot use non-numeric floating-point value \"NaN\" to estimate length of arith-series",
+                    ));
+                }
+                let precision = prec_of(&start_obj).max(prec_of(&end_obj)).max(prec_of(&step_obj));
+                len = arith_len_dbl(dstart, dend, dstep, precision);
+            } else {
+                len = arith_len_int(istart, iend, istep);
+            }
+        } else {
+            len = count_val.unwrap_or(1);
+        }
+    } else if use_d {
+        // count form: the computed end participates in nothing further,
+        // but its precision-matched value is what tclsh caches (kept for
+        // parity of the abstract series end).
+        let precision = prec_of(&start_obj).max(prec_of(&step_obj));
+        len = count_val.unwrap_or(1);
+        if len > 0 {
+            dend = arith_round(dstart + dstep * ((len - 1) as f64), precision);
+        }
+    } else {
+        len = count_val.unwrap_or(1);
+    }
+    if len < 0 {
+        len = 0;
+    }
+
+    // ── Validation (NewArithSeriesInt's overflow checks) ────────────────
+    let invalid = |interp: &mut Interp| -> Error {
+        set_error_code(interp, "ARITH DOMAIN invalid arithmetic series parameter values");
+        tcl_err("invalid arithmetic series parameter values")
+    };
+    if !use_d && len >= 1 {
+        let num_intervals = (len - 1) as u64;
+        let abs_step: u64 = if istep >= 0 {
+            istep as u64
+        } else if istep == i64::MIN {
+            1u64 << 63
+        } else {
+            (-(istep as i128)) as u64
+        };
+        if abs_step != 0 && (u64::MAX / abs_step) < num_intervals {
+            return Err(invalid(interp));
+        }
+        let product = (abs_step as i128) * (num_intervals as i128);
+        if istep > 0 && (istart as i128) > (i64::MAX as i128) - product {
+            return Err(invalid(interp));
+        }
+        if istep == i64::MIN && (num_intervals > 0 || istart < 0) {
+            return Err(invalid(interp));
+        }
+        if istep < 0 && istep != i64::MIN && (istart as i128) < (i64::MIN as i128) + product {
+            return Err(invalid(interp));
+        }
+    }
+    if use_d && len >= 1 {
+        let d = dstart + ((len - 1) as f64) * dstep;
+        if d.is_nan() {
+            set_error_code(interp, "ARITH DOMAIN domain error: argument not in valid range");
+            return Err(tcl_err("domain error: argument not in valid range"));
+        }
+    }
+
+    // ── Materialize (rtcl has no abstract series; the corpus exercises
+    // bounded series only.  A length beyond the list guard fails instead
+    // of OOMing.) ────────────────────────────────────────────────────────
+    if len > MAX_LIST_ELEMENTS as i64 {
+        set_error_code(interp, "TCL MEMORY");
+        return Err(tcl_err(format!(
+            "max length of a Tcl list ({} elements) exceeded",
+            MAX_LIST_ELEMENTS
+        )));
+    }
+    let n = len as usize;
+    let mut out = Vec::new();
+    out.try_reserve(n)
+        .map_err(|_| out_of_memory(interp, n * core::mem::size_of::<Value>()))?;
+    if use_d {
+        let precision = prec_of(&start_obj).max(prec_of(&end_obj)).max(prec_of(&step_obj));
+        for i in 0..n {
+            let d = if i == 0 {
+                dstart
+            } else {
+                dstart + (i as f64) * dstep
+            };
+            out.push(Value::from_float(arith_round(d, precision)));
+        }
+    } else {
+        for i in 0..n {
+            out.push(Value::from_int(
+                istart.wrapping_add((i as i64).wrapping_mul(istep)),
+            ));
+        }
+    }
+    Ok(Value::from_list(&out))
+}
+
+/// lpop varName ?index ...? — remove and return an element (tclsh 9.1;
+/// tclCmdIL.c Tcl_LpopObjCmd: extraction via TclLindexFlat, removal via
+/// TclLsetFlat — an out-of-range index pops empty and then fails in the
+/// removal with `index "raw" out of range`).
+pub fn cmd_lpop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lpop", "listvar ?index?"));
+    }
+    let var_name = args[1].as_str().to_string();
+    let current = interp.get_var(&var_name)?.clone();
+    let list = strict_list(interp, &current)?;
+
+    // No index argument: pop the last element (an empty list reports the
+    // same error as an explicit "end").
+    let indices: Vec<Value> = if args.len() == 2 {
+        if list.is_empty() {
+            set_error_code(interp, "TCL VALUE INDEX OUTOFRANGE");
+            return Err(tcl_err("index \"end\" out of range"));
+        }
+        vec![Value::from_int(list.len() as i64 - 1)]
+    } else if args.len() == 3 {
+        // lindex-style: a single index argument that itself parses as a
+        // list is an index list; a malformed one is one index string.
+        match args[2].as_list() {
+            Some(l) => l.to_vec(),
+            None => vec![args[2].clone()],
+        }
+    } else {
+        args[2..].to_vec()
+    };
+
+    // Extract (lindex-flat semantics: out of range yields the empty
+    // string, malformed intermediates error from the strict list parse).
+    let extracted = lindex_flat(interp, &list, &indices)?;
+
+    // Remove (lset-flat semantics: out of range errors with the raw
+    // index spelling at the failing level).
+    let new_list = lremove_flat(interp, &list, &indices)?;
+    interp.set_var(&var_name, new_list)?;
+    Ok(extracted)
+}
+
+/// lindex-flat: navigate `indices` from `list`, lenient about
+/// out-of-range (empty result), strict about malformed intermediates.
+fn lindex_flat(interp: &mut Interp, list: &[Value], indices: &[Value]) -> Result<Value> {
+    let mut cur: Vec<Value> = list.to_vec();
+    let mut element: Option<Value> = None;
+    for idx in indices {
+        let s = idx.as_str();
+        let raw = parse_tcl_index(s, cur.len()).ok_or_else(|| bad_index(interp, s))?;
+        if raw < 0 || raw >= cur.len() as i64 {
+            element = Some(Value::empty());
+            // Further indices operate on the empty list (lindex keeps
+            // navigating; every remaining index is out of range).
+            cur = Vec::new();
+            continue;
+        }
+        let v = cur[raw as usize].clone();
+        element = Some(v.clone());
+        cur = strict_list(interp, &v)?;
+    }
+    Ok(element.unwrap_or_else(Value::empty))
+}
+
+/// lset-flat with a NULL value (removal): mirrors TclLsetFlat's errors —
+/// `index "raw" out of range` at the failing level, list-parse errors for
+/// malformed intermediates.
+fn lremove_flat(interp: &mut Interp, list: &[Value], indices: &[Value]) -> Result<Value> {
+    let idx_str = indices[0].as_str();
+    let raw = parse_tcl_index(idx_str, list.len()).ok_or_else(|| bad_index(interp, idx_str))?;
+    if raw < 0 || raw >= list.len() as i64 {
+        set_error_code(interp, "TCL VALUE INDEX OUTOFRANGE");
+        return Err(tcl_err(format!("index \"{}\" out of range", idx_str)));
+    }
+    let idx = raw as usize;
+    let mut new_list = list.to_vec();
+    if indices.len() == 1 {
+        new_list.remove(idx);
+    } else {
+        let sub = strict_list(interp, &new_list[idx])?;
+        let new_sub = lremove_flat(interp, &sub, &indices[1..])?;
+        new_list[idx] = new_sub;
+    }
+    Ok(Value::from_list(&new_list))
+}
+
+/// lremove list ?index ...? — remove elements by index, simultaneously
+/// (tclsh 9.1; tclCmdIL.c Tcl_LremoveObjCmd: indices sorted descending,
+/// duplicates and out-of-range values skipped).
+pub fn cmd_lremove(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lremove", "list ?index ...?"));
+    }
+    let list = strict_list(interp, &args[1])?;
+    if args.len() == 2 {
+        return Ok(args[1].clone());
+    }
+    let len = list.len();
+    let mut idxs: Vec<i64> = Vec::with_capacity(args.len() - 2);
+    for a in &args[2..] {
+        let s = a.as_str();
+        match parse_tcl_index(s, len) {
+            Some(r) => idxs.push(r),
+            None => return Err(bad_index(interp, s)),
+        }
+    }
+    idxs.sort_unstable_by(|a, b| b.cmp(a));
+    idxs.dedup();
+    let mut result = list.clone();
+    for &idx in &idxs {
+        if idx < 0 || idx >= len as i64 {
+            continue;
+        }
+        result.remove(idx as usize);
+    }
+    Ok(Value::from_list(&result))
+}
+
+/// ledit listVar first last ?element ...? — replace a range in a list
+/// variable (tclsh 9.1; tclCmdIL.c Tcl_LeditObjCmd: first clamped into
+/// [0, len], last clamped to < len, last < first is a pure insert).
+pub fn cmd_ledit(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 4 {
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("ledit", "listVar first last ?element ...?"));
+    }
+    let var_name = args[1].as_str().to_string();
+    let current = interp.get_var(&var_name)?.clone();
+    let list = strict_list(interp, &current)?;
+    let len = list.len();
+    let first_raw = match parse_tcl_index(args[2].as_str(), len) {
+        Some(r) => r,
+        None => return Err(bad_index(interp, args[2].as_str())),
+    };
+    let last_raw = match parse_tcl_index(args[3].as_str(), len) {
+        Some(r) => r,
+        None => return Err(bad_index(interp, args[3].as_str())),
+    };
+    let first = first_raw.clamp(0, len as i64) as usize;
+    let last = last_raw.min(len as i64 - 1);
+
+    let mut result = Vec::with_capacity(len + args.len() - 4);
+    result.extend(list[..first].iter().cloned());
+    result.extend(args[4..].iter().cloned());
+    if last >= first as i64 {
+        result.extend(list[(last + 1) as usize..].iter().cloned());
+    } else {
+        result.extend(list[first..].iter().cloned());
+    }
+    let result = Value::from_list(&result);
+    interp.set_var(&var_name, result.clone())?;
+    Ok(result)
 }
 
 /// lset varName ?index ...? value

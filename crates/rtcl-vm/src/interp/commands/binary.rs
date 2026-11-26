@@ -350,29 +350,32 @@ fn binary_format(args: &[Value]) -> Result<Value> {
             b'q' | b'Q' | b'd' | b'f' | b'r' | b'R' => {
                 let size: usize = if matches!(f.ch, b'd' | b'q' | b'Q') { 8 } else { 4 };
                 let big_endian = matches!(f.ch, b'Q' | b'R');
-                let values = format_float_values(args, &mut argi, f)?;
-                let total = size.saturating_mul(values.len());
+                let raw_values = select_numeric_args(args, &mut argi, f)?;
+                let total = size.saturating_mul(raw_values.len());
                 if pos.saturating_add(total) > MAXOBJ {
                     return Err(max_size_err());
                 }
                 let mut bytes = Vec::with_capacity(total);
-                for v in values {
-                    // tclsh clamps 4-byte fields to ±FLT_MAX (even ±Inf);
-                    // a plain cast would overflow to Inf.
+                for v in &raw_values {
+                    // 8 字节：f64 位模式原样。
                     let bits = if size == 8 {
-                        v.to_bits()
+                        match v.as_float() {
+                            Some(d) => d.to_bits(),
+                            None => return Err(expected_float(v)),
+                        }
                     } else {
-                        let fmax = f32::MAX as f64;
-                        let f = if v.is_nan() {
-                            f32::NAN
-                        } else if v > fmax {
-                            f32::MAX
-                        } else if v < -fmax {
-                            -f32::MAX
-                        } else {
-                            v as f32
-                        };
-                        f.to_bits() as u64
+                        // 9.1 口径（语料 binary-53.22/53.25 钉形）：f32 字段
+                        // 的窄化走值的**字符串表示**再按 f32 最近舍入解析
+                        // ——tclsh 的双精度以最短往返十进制承载，位级 cast
+                        // 会把恰在半点上的值给成 Inf 而非 FLT_MAX。解析失败
+                        // 回落位级 cast（Inf/NaN 字符串走 parse 一样到位）。
+                        match v.as_str().parse::<f32>() {
+                            Ok(f) => f.to_bits() as u64,
+                            Err(_) => match v.as_float() {
+                                Some(d) => (d as f32).to_bits() as u64,
+                                None => return Err(expected_float(v)),
+                            },
+                        }
                     };
                     for k in 0..size {
                         let shift = if big_endian { 8 * (size - 1 - k) } else { 8 * k };

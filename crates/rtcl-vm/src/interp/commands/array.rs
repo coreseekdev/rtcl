@@ -5,11 +5,13 @@ use crate::error::{Error, Result};
 use crate::interp::{glob_match, split_array_ref, ArraySearch, ArraySearchList, Interp};
 use crate::value::Value;
 
-/// tclsh 8.6.17's `array` subcommand list, in the order it prints on an
-/// unknown-or-ambiguous error.
+use super::list::{set_error_code, strict_list, tcl_err};
+
+/// tclsh 9.1.0's `array` subcommand list, in the order it prints on an
+/// unknown-or-ambiguous error (`default` and `for` are 9.x additions).
 const ARRAY_SUBCMDS: &[&str] = &[
-    "anymore", "donesearch", "exists", "get", "names", "nextelement", "set", "size",
-    "startsearch", "statistics", "unset",
+    "anymore", "default", "donesearch", "exists", "for", "get", "names", "nextelement",
+    "set", "size", "startsearch", "statistics", "unset",
 ];
 
 /// Exact matches win; otherwise a unique prefix resolves, and anything
@@ -41,14 +43,12 @@ fn usage(cmd: &str, sub: &str, usage: &str) -> Error {
 }
 
 /// Search commands require an actual array (missing or scalar both error).
-fn require_array(interp: &Interp, array_name: &str) -> Result<()> {
+fn require_array(interp: &mut Interp, array_name: &str) -> Result<()> {
     if interp.is_array_semantic(array_name) {
         Ok(())
     } else {
-        Err(Error::runtime(
-            format!("\"{}\" isn't an array", array_name),
-            crate::error::ErrorCode::Generic,
-        ))
+        set_error_code(interp, &format!("TCL LOOKUP ARRAY {}", array_name));
+        Err(tcl_err(format!("\"{}\" isn't an array", array_name)))
     }
 }
 
@@ -442,6 +442,191 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             Ok(Value::from_int(
                 interp.array_element_count(array_name).unwrap_or(0) as i64,
             ))
+        }
+        // array default ?option? arrayName ?value? — TIP 508 (tclsh 9.1,
+        // tclVar.c ArrayDefaultSubcmds).  The error faces pinned on the
+        // 9.1 oracle (probe arrayconst91.tcl): wrong-args at the `default`
+        // level report `array default option arrayName ?value?`; the
+        // per-option ones the ::tcl::array::default path; a default-set
+        // on a non-array creates the empty array (so `set` on a scalar is
+        // the can't-set-is-array error).
+        "default" => {
+            if args.len() < 3 {
+                set_error_code(interp, "TCL WRONGARGS");
+                return Err(Error::wrong_args_with_usage(
+                    "array",
+                    3,
+                    args.len(),
+                    "default option arrayName ?value?",
+                ));
+            }
+            // Three words (no option value pair): the `default`-level
+            // usage text wins (pinned: `array default set` -> `array
+            // default option arrayName ?value?`).
+            if args.len() < 4 {
+                set_error_code(interp, "TCL WRONGARGS");
+                return Err(Error::wrong_args_with_usage(
+                    "array",
+                    3,
+                    args.len(),
+                    "default option arrayName ?value?",
+                ));
+            }
+            let option = args[2].as_str();
+            let opts = ["get", "set", "exists", "unset"];
+            let dopt = if opts.contains(&option) {
+                option.to_string()
+            } else {
+                let matches: Vec<&str> =
+                    opts.iter().copied().filter(|s| s.starts_with(option)).collect();
+                match matches.as_slice() {
+                    [one] => (*one).to_string(),
+                    _ => {
+                        set_error_code(
+                            interp,
+                            &format!("TCL LOOKUP INDEX option {}", option),
+                        );
+                        return Err(tcl_err(format!(
+                            "bad option \"{}\": must be get, set, exists, or unset",
+                            option
+                        )));
+                    }
+                }
+            };
+            let name = if args.len() > 3 { args[3].as_str() } else { "" };
+            match (dopt.as_str(), args.len()) {
+                ("exists", 4) => {
+                    // A non-existent name is plain 0 (even though a
+                    // default for it could not exist either); an existing
+                    // non-array errors with the ::tcl::array::default
+                    // usage.
+                    if !interp.var_exists_quiet(name) {
+                        return Ok(Value::from_bool(false));
+                    }
+                    if !interp.is_array_semantic(name) {
+                        set_error_code(interp, "TCL WRONGARGS");
+                        return Err(Error::wrong_args_with_usage(
+                            "array",
+                            0,
+                            0,
+                            "::tcl::array::default exists arrayName",
+                        ));
+                    }
+                    Ok(Value::from_bool(
+                        interp.array_default_of(name).is_some(),
+                    ))
+                }
+                ("get", 4) => {
+                    require_array(interp, name)?;
+                    match interp.array_default_of(name) {
+                        Some(v) => Ok(v),
+                        None => {
+                            set_error_code(interp, "TCL READ ARRAY DEFAULT");
+                            Err(tcl_err("array has no default value"))
+                        }
+                    }
+                }
+                ("set", 5) => {
+                    if interp.var_exists_quiet(name) && !interp.is_array_semantic(name) {
+                        set_error_code(interp, "TCL WRITE VARNAME");
+                        return Err(tcl_err(format!(
+                            "can't set \"{}\": variable is array",
+                            name
+                        )));
+                    }
+                    if !interp.is_array_semantic(name) {
+                        // Creation: mark the array and register an empty
+                        // element count, like an element write would.
+                        interp.mark_array(name)?;
+                    }
+                    interp.set_array_default(name, args[4].clone());
+                    Ok(Value::empty())
+                }
+                ("unset", 4) => {
+                    if !interp.var_exists_quiet(name) {
+                        return Ok(Value::empty());
+                    }
+                    require_array(interp, name)?;
+                    interp.unset_array_default(name);
+                    Ok(Value::empty())
+                }
+                (opt, _) => {
+                    // Per-option arity errors use the resolved
+                    // ::tcl::array::default path (pinned: `array default
+                    // exists a b` -> `wrong # args: should be
+                    // "::tcl::array::default exists arrayName"`).
+                    set_error_code(interp, "TCL WRONGARGS");
+                    Err(Error::Msg(format!(
+                        "wrong # args: should be \"::tcl::array::default {} arrayName\"",
+                        opt
+                    )))
+                }
+            }
+        }
+        // array for {keyVar valueVar} arrayName body — 9.0 (tclVar.c
+        // ArrayForNRCmd + ArrayForLoopCallback): body errors decorate
+        // `("array for" body line N)`; a content change mid-iteration
+        // errors `array changed during iteration` (TCL READ array for).
+        "for" => {
+            if args.len() != 5 {
+                set_error_code(interp, "TCL WRONGARGS");
+                return Err(Error::wrong_args_with_usage(
+                    "array",
+                    3,
+                    args.len(),
+                    "for {key value} arrayName script",
+                ));
+            }
+            let var_list = strict_list(interp, &args[2])?;
+            if var_list.len() != 2 {
+                set_error_code(interp, "TCL SYNTAX array for");
+                return Err(tcl_err("must have two variable names"));
+            }
+            let array_name2 = args[3].as_str();
+            require_array(interp, array_name2)?;
+            let keys = interp.array_element_names(array_name2);
+            let stamp = interp.array_stamp(array_name2);
+            for key in &keys {
+                interp.charge_step()?;
+                // The value read goes through the element read path (a
+                // default-answer array reads defaults; a vanished element
+                // errors).
+                let value = interp
+                    .get_var(&format!("{}({})", array_name2, key))
+                    .cloned();
+                let value = match value {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                interp.set_var(var_list[0].as_str(), Value::from_str(key))?;
+                interp.set_var(var_list[1].as_str(), value)?;
+                match interp.eval_body_value(&args[4]) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        if e.is_break() {
+                            if e.loop_level() > 1 {
+                                return Err(e.with_decremented_loop_level());
+                            }
+                            return Ok(Value::empty());
+                        }
+                        if e.is_continue() {
+                            if e.loop_level() > 1 {
+                                return Err(e.with_decremented_loop_level());
+                            }
+                            continue;
+                        }
+                        if interp.err_is_error(&e) {
+                            interp.err_exit_frame("\"array for\" body");
+                        }
+                        return Err(e);
+                    }
+                }
+                if interp.array_stamp(array_name2) != stamp {
+                    set_error_code(interp, "TCL READ array for");
+                    return Err(tcl_err("array changed during iteration"));
+                }
+            }
+            Ok(Value::empty())
         }
         "exists" => {
             if args.len() != 3 {

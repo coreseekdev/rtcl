@@ -312,6 +312,24 @@ impl Interp {
     /// takes the name path.  Takes the value by reference: the refcount
     /// bump happens only on the write, so a caller whose fallback consumes
     /// the value pays nothing extra on the attempt.
+    /// Whether the compiled local at `slot` is const-marked in the
+    /// current frame (the VM's slot stores route such writes to `set_var`,
+    /// whose guard owns the can't-set error).  `None` consts — the common
+    /// frame — pays one Option probe.
+    pub(crate) fn frame_local_is_const(
+        &self,
+        slot: usize,
+        code: &rtcl_parser::ByteCode,
+    ) -> bool {
+        let Some(cs) = self.frames.last().and_then(|f| f.consts.as_ref()) else {
+            return false;
+        };
+        code.locals()
+            .get(slot)
+            .map(|n| cs.iter().any(|c| c == n))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn frame_slot_write(&mut self, slot: usize, value: &Value) -> bool {
         // 顶层 slot 单元（C2'）：ts 写（数组化槽 → 名路径，is-array
         // 错误归属全链）。
@@ -1048,6 +1066,11 @@ impl Interp {
                 let base = loc.base_name().to_string();
                 self.array_globals.remove(&base);
                 self.elem_counts.remove(&base);
+                // A deleted array's default dies with it (probe: unset
+                // then recreate -> no default).
+                if !self.array_defaults.is_empty() {
+                    self.array_defaults.remove(&stamp_key(loc));
+                }
                 self.arrays_env_only = self
                     .array_globals
                     .iter()
@@ -1069,6 +1092,9 @@ impl Interp {
                     f.array_locals.remove(&base);
                     f.elem_counts.remove(&base);
                     f.locals.remove(&base);
+                }
+                if !self.array_defaults.is_empty() {
+                    self.array_defaults.remove(&stamp_key(loc));
                 }
             }
         }
@@ -1169,7 +1195,11 @@ impl Interp {
                     UpvarLink::Frame { frame_index, var_name } => {
                         // Link installation degrades the target frame, so
                         // the map probe is the live path; the slot consult
-                        // is defense in depth.
+                        // is defense in depth.  An ELEMENT link's miss is
+                        // answered by the host array's default — but only
+                        // on reads (get_var); var_exists must stay 0 (the
+                        // default never materializes), so the fallback
+                        // lives in get_var's tail, not here.
                         self.frames.get(*frame_index)
                             .and_then(|f| f.slot_value(var_name.as_str())
                                 .or_else(|| f.locals.get(var_name.as_str())))
@@ -1494,25 +1524,37 @@ impl Interp {
                         && (frame.upvars.is_empty()
                             || !frame.upvars.contains_key(array_name))
                     {
-                        return frame.locals.get(name).ok_or_else(|| {
-                            Error::runtime(
-                                format!(
-                                    "can't read \"{}\": no such element in array",
-                                    name
-                                ),
-                                ErrorCode::NotFound,
-                            )
-                        });
+                        // array default（TIP 508）：元素**缺**且宿主数
+                        // 组带默认值 -> 返回默认（不物化：info exists/
+                        // array size 不动；append/incr/lappend 的读同获
+                        // 默认）。已有元素永远优先。
+                        if let Some(v) = frame.locals.get(name) {
+                            return Ok(v);
+                        }
+                        if let Some(dv) = self.array_default_ref(array_name) {
+                            return Ok(dv);
+                        }
+                        return Err(Error::runtime(
+                            format!(
+                                "can't read \"{}\": no such element in array",
+                                name
+                            ),
+                            ErrorCode::NotFound,
+                        ));
                     }
                 } else if self.current_namespace.as_ref() == "::"
                     && self.array_globals.contains(array_name)
                 {
-                    return self.globals.get(name).ok_or_else(|| {
-                        Error::runtime(
-                            format!("can't read \"{}\": no such element in array", name),
-                            ErrorCode::NotFound,
-                        )
-                    });
+                    if let Some(v) = self.globals.get(name) {
+                        return Ok(v);
+                    }
+                    if let Some(dv) = self.array_default_ref(array_name) {
+                        return Ok(dv);
+                    }
+                    return Err(Error::runtime(
+                        format!("can't read \"{}\": no such element in array", name),
+                        ErrorCode::NotFound,
+                    ));
                 } else if self.current_namespace.as_ref() != "::"
                     && !has_ns_sep(array_name)
                     && self.flat_aliases.is_empty()
@@ -1532,15 +1574,19 @@ impl Interp {
                         if self.dead_flat.iter().all(|k| k != host)
                             && self.array_globals.contains(host)
                         {
-                            return self.globals.get(elem).ok_or_else(|| {
-                                Error::runtime(
-                                    format!(
-                                        "can't read \"{}\": no such element in array",
-                                        name
-                                    ),
-                                    ErrorCode::NotFound,
-                                )
-                            });
+                            if let Some(v) = self.globals.get(elem) {
+                                return Ok(v);
+                            }
+                            if let Some(dv) = self.array_default_ref(host) {
+                                return Ok(dv);
+                            }
+                            return Err(Error::runtime(
+                                format!(
+                                    "can't read \"{}\": no such element in array",
+                                    name
+                                ),
+                                ErrorCode::NotFound,
+                            ));
                         }
                     }
                 }
@@ -1551,12 +1597,19 @@ impl Interp {
             // 同名全局数组在体里不可见（tclVar.c：TCL_NAMESPACE_ONLY）。
             if self.loc_is_array(&loc) {
                 let key = loc.element_key(index);
-                self.loc_get(&loc, &key).ok_or_else(|| {
-                    Error::runtime(
+                if self.loc_get(&loc, &key).is_none() {
+                    // Element miss: the host array's default answers the
+                    // read (owned ref into the defaults table — a borrow
+                    // of self, same shape as the table entries).
+                    if let Some(dv) = self.array_default_ref(array_name) {
+                        return Ok(dv);
+                    }
+                    return Err(Error::runtime(
                         format!("can't read \"{}\": no such element in array", name),
                         ErrorCode::NotFound,
-                    )
-                })
+                    ));
+                }
+                return Ok(self.loc_get(&loc, &key).unwrap());
             } else if self.loc_base_exists(&loc) {
                 Err(Error::runtime(
                     format!("can't read \"{}\": variable isn't array", name),
@@ -1641,7 +1694,33 @@ impl Interp {
                     ErrorCode::Generic,
                 ));
             }
-            self.resolve_var(name).ok_or_else(|| self.read_error(name))
+            match self.resolve_var(name) {
+                Some(v) => Ok(v),
+                None => {
+                    // An element LINK's miss (`upvar ary(c) c`) reads the
+                    // host array's default; the link target is the flat
+                    // element name (var-24.15).
+                    if let Some(frame) = self.var_frame() {
+                        if let Some(link) = frame.upvars.get(name) {
+                            let target = match link {
+                                UpvarLink::Frame { var_name, .. } => {
+                                    Some(var_name.to_string())
+                                }
+                                UpvarLink::Global(g) => Some(g.to_string()),
+                                _ => None,
+                            };
+                            if let Some(t) = target {
+                                if let Some((base, _)) = split_array_ref(&t) {
+                                    if let Some(dv) = self.array_default_ref(base) {
+                                        return Ok(dv);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(self.read_error(name))
+                }
+            }
         }
     }
 
@@ -1737,6 +1816,10 @@ impl Interp {
 
     pub fn set_var(&mut self, name: &str, value: Value) -> Result<Value> {
         crate::interp::dbgtrace::event("set_var", name);
+        // const 守卫（9.1 VAR_CONSTANT）：先于一切路径（ts 槽写也算写）。
+        if let Some(e) = self.const_write_err(name) {
+            return Err(e);
+        }
         // 顶层 slot 单元（C2'）：ts 分支——标量写 / 数组-标量归属 /
         // ::-leaf 写（顶层槽 = 全局）。
         if let Some(ts) = self.top_slots.as_mut() {
@@ -2298,6 +2381,11 @@ impl Interp {
         code: &rtcl_parser::ByteCode,
     ) -> Result<Value> {
         let name = || code.locals().get(slot).map(String::as_str).unwrap_or("");
+        if self.frame_local_is_const(slot, code) {
+            self.err_code_raised = false;
+            let args = [Value::from_str("incr"), Value::from_str(name()), amount_v];
+            return super::commands::misc::cmd_incr(self, &args);
+        }
         if let Some(k) = amount_v.as_int() {
             if let Some(v) = self.frame_slot_incr(slot, k) {
                 return Ok(v);
@@ -2314,6 +2402,15 @@ impl Interp {
     }
 
     fn incr_var_fast_impl(&mut self, name: &str, amount: i64) -> Option<Value> {
+        // const 标记名走真 incr（cmd_incr 顶部的 const 守卫持有其错误形）。
+        if !self.const_globals.is_empty() && self.const_globals.iter().any(|c| c == name) {
+            return None;
+        }
+        if let Some(f) = self.frames.last() {
+            if f.consts.is_some() && f.consts.as_ref().unwrap().iter().any(|c| c == name) {
+                return None;
+            }
+        }
         // T7 vars: element fast path — existing element, flat key is the
         // name as spelled, no traces registered (the command's read is
         // then silent either way), integer value.  Everything else
@@ -2368,6 +2465,10 @@ impl Interp {
     }
 
     pub fn unset_var(&mut self, name: &str) -> Result<()> {
+        // const 守卫（tclVar.c 2547：unset 路径的 ISCONST）。
+        if let Some(e) = self.const_unset_err(name) {
+            return Err(e);
+        }
         if let Some((array_name, index)) = split_array_ref(name) {
             let base = array_name.to_string();
             let idx = index.to_string();
@@ -2594,6 +2695,13 @@ impl Interp {
     }
 
     /// Is `name` (whole-name form) an array in the scope that owns it?
+    /// Quiet existence check (scalar or array; no read traces fired) —
+    /// the `array default` subcommands' name probe.
+    pub(crate) fn var_exists_quiet(&self, name: &str) -> bool {
+        let loc = self.resolve_loc(name);
+        self.loc_base_exists(&loc)
+    }
+
     pub(crate) fn is_array_semantic(&self, name: &str) -> bool {
         let loc = self.resolve_loc(name);
         self.loc_is_array(&loc)
@@ -2603,6 +2711,86 @@ impl Interp {
     /// search lists and mutation stamps.
     pub(crate) fn array_stamp_key(&self, name: &str) -> String {
         stamp_key(&self.resolve_loc(name))
+    }
+
+    /// The `array default` value of the array `name` resolves to (TIP
+    /// 508).  Consulted on element-miss reads only — the default is
+    /// never materialized, so `info exists`/`array size` stay untouched.
+    pub(crate) fn array_default_ref(&self, base: &str) -> Option<&Value> {
+        if self.array_defaults.is_empty() {
+            return None;
+        }
+        self.array_defaults.get(&stamp_key(&self.resolve_loc(base)))
+    }
+
+    pub(crate) fn array_default_of(&self, base: &str) -> Option<Value> {
+        self.array_default_ref(base).cloned()
+    }
+
+    pub(crate) fn set_array_default(&mut self, base: &str, value: Value) {
+        self.array_defaults
+            .insert(stamp_key(&self.resolve_loc(base)), value);
+    }
+
+    pub(crate) fn unset_array_default(&mut self, base: &str) {
+        if !self.array_defaults.is_empty() {
+            self.array_defaults.remove(&stamp_key(&self.resolve_loc(base)));
+        }
+    }
+
+    /// Whether `name` is const-marked in the scope a write would land in
+    /// (frame-scoped marks or the global set).  Frames without declared
+    /// constants (`consts == None`) and an empty global set pay one
+    /// branch each.
+    pub(crate) fn is_const_marked(&self, name: &str) -> bool {
+        if !self.const_globals.is_empty() && self.const_globals.iter().any(|c| c == name) {
+            return true;
+        }
+        if let Some(frame) = self.var_frame() {
+            if let Some(consts) = &frame.consts {
+                return consts.iter().any(|c| c == name);
+            }
+        }
+        false
+    }
+
+    /// A write (`set`/`append`/`lappend`) onto a constant variable's
+    /// error (tclsh tclVar.c ISCONST via the "set" path).
+    pub(crate) fn const_write_err(&mut self, name: &str) -> Option<Error> {
+        if self.is_const_marked(name) {
+            crate::interp::commands::list::set_error_code(self, "TCL WRITE VARNAME");
+            return Some(Error::runtime(
+                format!("can't set \"{}\": variable is a constant", name),
+                ErrorCode::Generic,
+            ));
+        }
+        None
+    }
+
+    /// `unset` onto a constant variable (tclVar.c line 2547: the "unset"
+    /// path reports ISCONST with TCL UNSET CONST).
+    pub(crate) fn const_unset_err(&mut self, name: &str) -> Option<Error> {
+        if self.is_const_marked(name) {
+            crate::interp::commands::list::set_error_code(self, "TCL UNSET CONST");
+            return Some(Error::runtime(
+                format!("can't unset \"{}\": variable is a constant", name),
+                ErrorCode::Generic,
+            ));
+        }
+        None
+    }
+
+    /// `incr` onto a constant variable (tclVar.c line 2310: the "incr"
+    /// path reports ISCONST with TCL WRITE CONST).
+    pub(crate) fn const_incr_err(&mut self, name: &str) -> Option<Error> {
+        if self.is_const_marked(name) {
+            crate::interp::commands::list::set_error_code(self, "TCL WRITE CONST");
+            return Some(Error::runtime(
+                format!("can't incr \"{}\": variable is a constant", name),
+                ErrorCode::Generic,
+            ));
+        }
+        None
     }
 
     /// The element keys ever inserted into the array at `name` since its
@@ -3126,6 +3314,10 @@ impl Interp {
             || !self.dead_flat.is_empty()
             || !self.frames.is_empty()
         {
+            return false;
+        }
+        // const 标记名走 set_var（其顶部守卫持有 can't set 错误形）。
+        if !self.const_globals.is_empty() && self.const_globals.iter().any(|c| c == name) {
             return false;
         }
         if self.current_namespace.as_ref() == "::" {

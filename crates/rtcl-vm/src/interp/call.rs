@@ -129,6 +129,7 @@ impl Interp {
                 locals: VarMap::default(),
                 locals_order: Vec::new(),
                 array_locals: VarSet::default(),
+                consts: None,
                 elem_counts: VarMap::default(),
                 upvars: UpvarMap::default(),
                 ns: None,
@@ -268,6 +269,7 @@ impl Interp {
                     frame.locals_order.clear();
                     frame.array_locals.clear();
                     frame.elem_counts.clear();
+                    frame.consts = None;
                     frame.upvars.clear();
                 }
                 // `info level 0` shows the invocation as dispatched: the
@@ -777,6 +779,7 @@ impl Interp {
                     frame.locals_order.clear();
                     frame.array_locals.clear();
                     frame.elem_counts.clear();
+                    frame.consts = None;
                 }
                 // Trace callbacks must not disturb the error (if any) that is
                 // unwinding through this frame.
@@ -802,11 +805,20 @@ impl Interp {
         // The frame's `global`/`upvar #0` links die with it: their
         // valueless phantom entries leave the table first (d27 p21).
         self.drop_frame_global_links(self.frames.len() - 1);
+        let popped_idx = self.frames.len();
         let mut popped = self.frames.pop().unwrap();
+        // Frame-scoped `array default` entries die with the frame (their
+        // stamp keys embed the frame index; a recycled frame must not
+        // inherit them).
+        if !self.array_defaults.is_empty() {
+            let prefix = format!("F{}:", popped_idx);
+            self.array_defaults.retain(|k, _| !k.starts_with(&prefix));
+        }
         popped.locals.clear();
         popped.locals_order.clear();
         popped.array_locals.clear();
         popped.elem_counts.clear();
+        popped.consts = None;
         popped.upvars.clear();
         popped.local_procs.clear();
         popped.deferred_scripts.clear();
@@ -1283,6 +1295,7 @@ impl Interp {
                 locals: VarMap::default(),
                 locals_order: Vec::new(),
                 array_locals: VarSet::default(),
+                consts: None,
                 elem_counts: VarMap::default(),
                 upvars: UpvarMap::default(),
                 ns: None,
@@ -1548,6 +1561,7 @@ impl Interp {
                     frame.locals_order.clear();
                     frame.array_locals.clear();
                     frame.elem_counts.clear();
+                    frame.consts = None;
                 }
                 let saved_info = self.err_info.take();
                 let saved_fresh = std::mem::take(&mut self.err_fresh);
@@ -1640,11 +1654,20 @@ impl Interp {
     fn jit_frame_epilogue_pop(&mut self, prev_namespace: Rc<str>) {
         // The frame's `global`/`upvar #0` links die with it (d27 p21).
         self.drop_frame_global_links(self.frames.len() - 1);
+        let popped_idx = self.frames.len();
         let mut popped = self.frames.pop().unwrap();
+        // Frame-scoped `array default` entries die with the frame (their
+        // stamp keys embed the frame index; a recycled frame must not
+        // inherit them).
+        if !self.array_defaults.is_empty() {
+            let prefix = format!("F{}:", popped_idx);
+            self.array_defaults.retain(|k, _| !k.starts_with(&prefix));
+        }
         popped.locals.clear();
         popped.locals_order.clear();
         popped.array_locals.clear();
         popped.elem_counts.clear();
+        popped.consts = None;
         popped.upvars.clear();
         popped.local_procs.clear();
         popped.deferred_scripts.clear();

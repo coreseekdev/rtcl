@@ -189,7 +189,7 @@ impl Parser {
                     self.i += 4;
                 }
                 _ => {
-                    return Err(Self::err("REG_BADRPT", "quantifier operand invalid"));
+                    return Err(Self::err("REG_BADRPT", "invalid quantifier operand"));
                 }
             }
         }
@@ -384,7 +384,7 @@ impl Parser {
                 super::ast::NodeKind::Assert(_) | super::ast::NodeKind::Look { .. }
             )
         {
-            return Err(Self::err("REG_BADRPT", "quantifier operand invalid"));
+            return Err(Self::err("REG_BADRPT", "invalid quantifier operand"));
         }
         let (min, max, qprefer) = match mode {
             Mode::Bre => {
@@ -464,7 +464,7 @@ impl Parser {
             }
         };
         if consecutive {
-            return Err(Self::err("REG_BADRPT", "quantifier operand invalid"));
+            return Err(Self::err("REG_BADRPT", "invalid quantifier operand"));
         }
         if let super::ast::NodeKind::Backref {
             subno,
@@ -632,9 +632,9 @@ impl Parser {
                 self.i += 1;
                 self.parse_escape_atom()
             }
-            '*' | '+' | '?' => Err(Self::err("REG_BADRPT", "quantifier operand invalid")),
+            '*' | '+' | '?' => Err(Self::err("REG_BADRPT", "invalid quantifier operand")),
             '{' if self.at(1).map(|c| c.is_ascii_digit()).unwrap_or(false) => {
-                Err(Self::err("REG_BADRPT", "quantifier operand invalid"))
+                Err(Self::err("REG_BADRPT", "invalid quantifier operand"))
             }
             ')' => Err(Self::err("REG_EPAREN", "parentheses () not balanced")),
             _ => {
@@ -673,9 +673,9 @@ impl Parser {
                 self.i += 1;
                 self.parse_quote_escape()
             }
-            '*' | '+' | '?' => Err(Self::err("REG_BADRPT", "quantifier operand invalid")),
+            '*' | '+' | '?' => Err(Self::err("REG_BADRPT", "invalid quantifier operand")),
             '{' if self.at(1).map(|c| c.is_ascii_digit()).unwrap_or(false) => {
-                Err(Self::err("REG_BADRPT", "quantifier operand invalid"))
+                Err(Self::err("REG_BADRPT", "invalid quantifier operand"))
             }
             ')' if self.depth == 0 => {
                 // POSIX ERE：没有对应 `(` 的 `)` 是普通字符。
@@ -707,7 +707,7 @@ impl Parser {
         // ERE 没有 `(?:` / `(?=` / `(?i` 等扩展：`?` 紧跟 `(` 是
         // 没有操作数的量词（tclsh 报 quantifier operand invalid）。
         if self.peek() == Some('?') {
-            return Err(Self::err("REG_BADRPT", "quantifier operand invalid"));
+            return Err(Self::err("REG_BADRPT", "invalid quantifier operand"));
         }
         let subno = self.next_sub;
         self.next_sub += 1;
@@ -802,7 +802,7 @@ impl Parser {
             '<' => Ok(Node::assert(AssertKind::WordStart)),
             '>' => Ok(Node::assert(AssertKind::WordEnd)),
             // `\{` 在原子位置没有可量化的对象。
-            '{' => Err(Self::err("REG_BADRPT", "quantifier operand invalid")),
+            '{' => Err(Self::err("REG_BADRPT", "invalid quantifier operand")),
             // 其余 `\x` 一律是字面 x（`\d`→d、`\n`→n、`\}`→}）。
             _ => Ok(Node::char(e as u32)),
         }
@@ -840,10 +840,10 @@ impl Parser {
                     }
                     Ok(Node::look(negative, inner))
                 }
-                Some('<') => Err(Self::err("REG_BADRPT", "quantifier operand invalid")),
+                Some('<') => Err(Self::err("REG_BADRPT", "invalid quantifier operand")),
                 // `(?` 出现在 pattern 中间（或 `(?-i)` 这类不是内嵌
                 // 选项的写法）时，tclsh 把它当缺操作数的量词。
-                _ => Err(Self::err("REG_BADRPT", "quantifier operand invalid")),
+                _ => Err(Self::err("REG_BADRPT", "invalid quantifier operand")),
             }
         } else {
             if self.lacon > 0 {
